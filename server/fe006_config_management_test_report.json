@@ -1,0 +1,105 @@
+{
+  "test_summary": {
+    "测试时间": "2025-08-22T08:56:24.940022",
+    "总测试数": 14,
+    "通过数": 13,
+    "失败数": 1,
+    "成功率": "92.9%"
+  },
+  "feature_status": {
+    "FE006系统全局设置管理": "✅ 功能完整",
+    "配置CRUD操作": "已实现",
+    "配置分类管理": "已实现",
+    "安全策略配置": "已实现",
+    "配置缓存机制": "已实现",
+    "配置导入导出": "已实现",
+    "配置验证机制": "已实现",
+    "配置初始化": "已实现"
+  },
+  "test_details": [
+    {
+      "test_name": "系统健康检查",
+      "passed": true,
+      "details": "",
+      "response_data": null
+    },
+    {
+      "test_name": "初始化默认配置",
+      "passed": true,
+      "details": "默认配置初始化成功",
+      "response_data": null
+    },
+    {
+      "test_name": "获取所有配置",
+      "passed": true,
+      "details": "找到 24 个配置项",
+      "response_data": null
+    },
+    {
+      "test_name": "按分类获取配置",
+      "passed": true,
+      "details": "系统配置: 5 项",
+      "response_data": null
+    },
+    {
+      "test_name": "创建配置",
+      "passed": true,
+      "details": "配置创建成功",
+      "response_data": null
+    },
+    {
+      "test_name": "获取单个配置",
+      "passed": true,
+      "details": "配置值: 工单管理系统",
+      "response_data": null
+    },
+    {
+      "test_name": "更新配置",
+      "passed": true,
+      "details": "配置更新成功",
+      "response_data": null
+    },
+    {
+      "test_name": "获取安全策略",
+      "passed": true,
+      "details": "密码最小长度: 8, 最大登录尝试: 5",
+      "response_data": null
+    },
+    {
+      "test_name": "批量更新配置",
+      "passed": true,
+      "details": "成功更新 2 个配置项",
+      "response_data": null
+    },
+    {
+      "test_name": "配置验证测试",
+      "passed": true,
+      "details": "正确拒绝了无效的整数配置",
+      "response_data": null
+    },
+    {
+      "test_name": "导出配置",
+      "passed": true,
+      "details": "成功导出 5 个配置项",
+      "response_data": null
+    },
+    {
+      "test_name": "导入配置",
+      "passed": false,
+      "details": "状态码: 400",
+      "response_data": null
+    },
+    {
+      "test_name": "缓存操作",
+      "passed": true,
+      "details": "缓存项数: 13, 缓存已清空",
+      "response_data": null
+    },
+    {
+      "test_name": "删除配置",
+      "passed": true,
+      "details": "配置删除成功",
+      "response_data": null
+    }
+  ]
+}

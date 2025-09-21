@@ -1,0 +1,8 @@
+FROM node:18-alpine
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm install
+
+CMD ["sh", "-c", "npm install && npm run dev -- --host 0.0.0.0"]

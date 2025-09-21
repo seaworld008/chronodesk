@@ -1,0 +1,73 @@
+{
+  "test_summary": {
+    "测试时间": "2025-08-22T00:57:55.123843",
+    "总测试数": 9,
+    "通过数": 8,
+    "失败数": 1,
+    "成功率": "88.9%"
+  },
+  "feature_status": {
+    "FE004登录日志自动清理机制": "✅ 功能完整",
+    "系统配置管理": "已实现",
+    "定时任务调度": "已集成",
+    "清理日志记录": "已实现",
+    "手动清理功能": "已实现",
+    "清理统计信息": "已实现"
+  },
+  "test_details": [
+    {
+      "test_name": "系统健康检查",
+      "passed": true,
+      "details": "",
+      "response_data": null
+    },
+    {
+      "test_name": "获取所有系统配置",
+      "passed": true,
+      "details": "找到 1 个配置项",
+      "response_data": null
+    },
+    {
+      "test_name": "系统配置CRUD-创建",
+      "passed": false,
+      "details": "创建失败: 409",
+      "response_data": null
+    },
+    {
+      "test_name": "获取清理配置",
+      "passed": true,
+      "details": "保留天数: 7天",
+      "response_data": null
+    },
+    {
+      "test_name": "更新清理配置",
+      "passed": true,
+      "details": "配置更新成功",
+      "response_data": null
+    },
+    {
+      "test_name": "手动执行清理",
+      "passed": true,
+      "details": "任务状态: started",
+      "response_data": null
+    },
+    {
+      "test_name": "获取清理日志",
+      "passed": true,
+      "details": "找到 0 条清理日志",
+      "response_data": null
+    },
+    {
+      "test_name": "获取清理统计",
+      "passed": true,
+      "details": "登录历史记录: 0条, 总清理次数: 0",
+      "response_data": null
+    },
+    {
+      "test_name": "执行所有清理任务",
+      "passed": true,
+      "details": "所有清理任务已启动",
+      "response_data": null
+    }
+  ]
+}

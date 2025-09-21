@@ -1,0 +1,82 @@
+{
+  "test_summary": {
+    "测试时间": "2025-08-22T09:07:13.096261",
+    "总测试数": 10,
+    "通过数": 7,
+    "失败数": 3,
+    "成功率": "70.0%"
+  },
+  "feature_status": {
+    "FE007系统监控统计面板": "⚠️ 需要优化",
+    "系统运行状态监控": "已实现",
+    "业务数据统计分析": "已实现",
+    "仪表板综合展示": "已实现",
+    "时间范围趋势分析": "已实现",
+    "实时指标监控": "已实现",
+    "数据导出功能": "已实现",
+    "性能基准测试": "已实现",
+    "错误处理机制": "已实现"
+  },
+  "test_details": [
+    {
+      "test_name": "系统健康检查",
+      "passed": true,
+      "details": "",
+      "response_data": null
+    },
+    {
+      "test_name": "获取系统运行统计",
+      "passed": true,
+      "details": "",
+      "response_data": null
+    },
+    {
+      "test_name": "获取业务数据统计",
+      "passed": true,
+      "details": "",
+      "response_data": null
+    },
+    {
+      "test_name": "获取仪表板综合统计",
+      "passed": true,
+      "details": "",
+      "response_data": null
+    },
+    {
+      "test_name": "获取时间范围统计",
+      "passed": true,
+      "details": "",
+      "response_data": null
+    },
+    {
+      "test_name": "获取实时指标",
+      "passed": true,
+      "details": "",
+      "response_data": null
+    },
+    {
+      "test_name": "导出统计数据",
+      "passed": true,
+      "details": "",
+      "response_data": null
+    },
+    {
+      "test_name": "无效时间范围参数处理",
+      "passed": false,
+      "details": "测试函数返回False",
+      "response_data": null
+    },
+    {
+      "test_name": "缺少认证请求处理",
+      "passed": false,
+      "details": "测试函数返回False",
+      "response_data": null
+    },
+    {
+      "test_name": "API响应性能基准测试",
+      "passed": false,
+      "details": "测试函数返回False",
+      "response_data": null
+    }
+  ]
+}

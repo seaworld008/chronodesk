@@ -1,0 +1,99 @@
+version: '3.8'
+
+services:
+  # PostgreSQL 数据库
+  postgres:
+    image: postgres:15-alpine
+    container_name: ticket-postgres
+    environment:
+      POSTGRES_DB: ticket_system
+      POSTGRES_USER: ticket_user
+      POSTGRES_PASSWORD: ticket_password
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - ticket-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ticket_user -d ticket_system"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis 缓存
+  redis:
+    image: redis:7-alpine
+    container_name: ticket-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - ticket-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 后端服务 (开发环境)
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile.dev
+    container_name: ticket-server
+    ports:
+      - "8081:8081"
+    environment:
+      - GIN_MODE=debug
+      - PORT=8081
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=ticket_user
+      - DB_PASSWORD=ticket_password
+      - DB_NAME=ticket_system
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - JWT_SECRET=your-super-secret-jwt-key-change-in-production
+    volumes:
+      - ./server:/app
+      - /app/tmp
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ticket-network
+    restart: unless-stopped
+
+  # 前端服务 (开发环境)
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile.dev
+    container_name: ticket-web
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://server:8081/api
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+    depends_on:
+      - server
+    networks:
+      - ticket-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  ticket-network:
+    driver: bridge
