@@ -157,7 +157,6 @@ const UserCreateToolbar = () => (
         <SaveButton 
             label="创建用户"
             variant="contained"
-            alwaysEnable
         />
         <Typography variant="body2" color="text.secondary">
             * 标记的字段为必填项

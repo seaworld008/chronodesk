@@ -16,8 +16,7 @@ import {
     BooleanInput,
     TextInput,
     TopToolbar,
-    BulkUpdateButton,
-    BulkDeleteButton,
+    BulkDeleteWithConfirmButton,
     WrapperField,
     useRecordContext,
 } from 'react-admin';
@@ -32,6 +31,7 @@ import {
     Timer,
 } from '@mui/icons-material';
 import TicketWorkflowActions from './TicketWorkflowActions';
+import TicketBulkUpdateButton from './TicketBulkUpdateButton';
 import { parseTagsToArray } from './tagUtils';
 import { Ticket } from '@/types';
 
@@ -303,8 +303,8 @@ const TicketListActions = () => (
  */
 const TicketBulkActionButtons = () => (
     <>
-        <BulkUpdateButton label="批量更新" />
-        <BulkDeleteButton label="批量删除" />
+        <TicketBulkUpdateButton />
+        <BulkDeleteWithConfirmButton label="批量删除" />
     </>
 );
 

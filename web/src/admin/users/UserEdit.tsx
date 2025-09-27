@@ -190,7 +190,6 @@ const UserEditToolbar = () => (
         <SaveButton 
             label="保存更改"
             variant="contained"
-            alwaysEnable
         />
         <Typography variant="body2" color="text.secondary">
             * 标记的字段为必填项

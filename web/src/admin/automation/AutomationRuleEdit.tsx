@@ -4,7 +4,7 @@ import AutomationRuleForm, { buildTransform } from './AutomationRuleForm'
 
 const RuleEditToolbar: React.FC = () => (
   <Toolbar>
-    <SaveButton alwaysEnable />
+    <SaveButton />
     <DeleteButton redirect="list" mutationMode="pessimistic" />
   </Toolbar>
 )

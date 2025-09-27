@@ -86,16 +86,51 @@ export const dataProvider: DataProvider = {
     getList: async (resource, params) => {
         const { page, perPage } = params.pagination || { page: 1, perPage: 10 };
         const { field, order } = params.sort || { field: 'id', order: 'ASC' };
-        
+
         // 构建查询参数 - 适配Go API格式
         const query: Record<string, unknown> = {
             page,
             page_size: perPage,
         };
 
+        // 复制过滤器，后续会删除已映射的字段
+        const rawFilter = (params.filter ?? {}) as Record<string, unknown>;
+        const filter: Record<string, unknown> = { ...rawFilter };
+
+        const normalizeBoolean = (value: unknown): undefined | boolean => {
+            if (typeof value === 'boolean') return value;
+            if (typeof value === 'string' && value.trim() !== '') {
+                if (value === 'true') return true;
+                if (value === 'false') return false;
+            }
+            return undefined;
+        };
+
+        const extractSearchValue = () => {
+            const value = (filter.q as string | undefined) ?? (filter.search as string | undefined);
+            if (typeof value === 'string' && value.trim() !== '') {
+                delete filter.q;
+                delete filter.search;
+                return value.trim();
+            }
+            return undefined;
+        };
+
         // 添加排序参数
         if (field && order) {
-            query.sort = convertSortToGoFormat({ field, order });
+            const normalizedOrder = order.toLowerCase() === 'asc' ? 'asc' : 'desc';
+
+            if (resource === 'automation-logs' || resource === 'automation-rules' || resource === 'notifications') {
+                query.sort = convertSortToGoFormat({ field, order });
+            } else if (resource === 'tickets') {
+                query.sort_by = field;
+                query.sort_order = normalizedOrder;
+            } else if (resource === 'users' || resource === 'admin/users') {
+                query.order_by = field;
+                query.order = normalizedOrder;
+            } else {
+                query.sort = convertSortToGoFormat({ field, order });
+            }
         }
 
         // 添加过滤参数
@@ -133,8 +168,75 @@ export const dataProvider: DataProvider = {
             if (searchValue) {
                 query.search = searchValue
             }
-        } else if (params.filter && Object.keys(params.filter).length > 0) {
-            query.filter = convertFilterToGoFormat(params.filter as Record<string, unknown>);
+        } else {
+            if (resource === 'tickets') {
+                const searchValue = extractSearchValue();
+                if (searchValue) {
+                    query.search = searchValue;
+                }
+
+                if (filter.status) {
+                    query.status = filter.status;
+                    delete filter.status;
+                }
+                if (filter.priority) {
+                    query.priority = filter.priority;
+                    delete filter.priority;
+                }
+                if (filter.type) {
+                    query.type = filter.type;
+                    delete filter.type;
+                }
+                if (filter.assigned_to_id) {
+                    query.assigned_to = filter.assigned_to_id;
+                    delete filter.assigned_to_id;
+                }
+                if (filter.created_by_id) {
+                    query.created_by = filter.created_by_id;
+                    delete filter.created_by_id;
+                }
+                const slaBreached = normalizeBoolean(filter.sla_breached);
+                if (typeof slaBreached !== 'undefined') {
+                    query.sla_breached = slaBreached;
+                    delete filter.sla_breached;
+                }
+                const isOverdue = normalizeBoolean(filter.is_overdue);
+                if (typeof isOverdue !== 'undefined') {
+                    query.is_overdue = isOverdue;
+                    delete filter.is_overdue;
+                }
+                const unassigned = normalizeBoolean(filter.unassigned);
+                if (typeof unassigned !== 'undefined') {
+                    query.unassigned = unassigned;
+                    delete filter.unassigned;
+                }
+            } else if (resource === 'users' || resource === 'admin/users') {
+                const searchValue = extractSearchValue();
+                if (searchValue) {
+                    query.search = searchValue;
+                }
+                if (filter.role) {
+                    query.role = filter.role;
+                    delete filter.role;
+                }
+                if (filter.status) {
+                    query.status = filter.status;
+                    delete filter.status;
+                }
+            } else if (resource === 'notifications') {
+                const searchValue = extractSearchValue();
+                if (searchValue) {
+                    filter.q = searchValue;
+                }
+            }
+
+            const cleanedFilter = Object.fromEntries(
+                Object.entries(filter).filter(([, value]) => value !== undefined && value !== null && value !== '')
+            );
+
+            if (Object.keys(cleanedFilter).length > 0) {
+                query.filter = convertFilterToGoFormat(cleanedFilter);
+            }
         }
 
         // 特殊处理不同资源的API路径
@@ -376,12 +478,17 @@ export const dataProvider: DataProvider = {
     updateMany: async (resource, params) => {
         // 如果后端支持批量更新
         if (resource === 'tickets') {
+            const updates = params.data ?? {};
+            if (!updates || Object.keys(updates).length === 0) {
+                throw new HttpError('请先选择需要更新的字段', 400);
+            }
+
             const url = `${apiUrl}/tickets/bulk-update`;
             await httpClient(url, {
                 method: 'POST',
                 body: JSON.stringify({
-                    ids: params.ids,
-                    data: params.data,
+                    ticket_ids: params.ids,
+                    updates,
                 }),
             });
             return { data: params.ids };

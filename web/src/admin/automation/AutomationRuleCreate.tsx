@@ -10,7 +10,7 @@ const CreateActions: React.FC = () => (
 
 const AutomationRuleCreate: React.FC = (props) => (
   <Create {...props} transform={buildTransform()} actions={<CreateActions />}>
-    <AutomationRuleForm toolbar={<Toolbar><SaveButton alwaysEnable /></Toolbar>} />
+    <AutomationRuleForm toolbar={<Toolbar><SaveButton /></Toolbar>} />
   </Create>
 )
 

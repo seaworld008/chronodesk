@@ -45,6 +45,7 @@ import {
 // System Settings Components
 import { SimpleWorkingSystemSettings, EmailSettings, WebhookSettings, SystemSettings } from './admin/settings';
 import { CustomLayout as Layout } from './layout/CustomLayout';
+import { CustomAppBar } from './layout/CustomAppBar';
 import LoginPage from './components/auth/LoginPage';
 import TrustedDevices from './admin/security/TrustedDevices';
 
@@ -112,7 +113,7 @@ const CustomMenu: React.FC = () => (
  * 自定义布局组件
  */
 const LayoutWithMenu: React.FC<LayoutProps> = (props) => (
-    <Layout {...props} menu={CustomMenu} />
+    <Layout {...props} menu={CustomMenu} appBar={CustomAppBar} />
 );
 
 /**
