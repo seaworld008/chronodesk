@@ -66,13 +66,12 @@ docker-compose up -d           # 启动 PostgreSQL + Redis + 后端 + 前端
 - PID 文件：`pids/backend.pid`、`pids/frontend.pid`
 
 ## 6. 测试与质量
-- Go 单元测试：`cd server && go test ./...`
-- 前端 Lint：`cd web && npm run lint`
-  - ⚠️ 当前仍存在 ~70 条 ESLint 报错（`no-explicit-any`、未使用变量等），计划逐步清理。
-- Python/pytest 冒烟：
-  - 先安装依赖：`pip install -r server/requirements-test.txt`
-  - 一键运行核心后端冒烟涵盖认证、自动化、系统配置：`make smoke`（生成 HTML 报告于 `server/reports/`）
-  - 也可按需运行单独套件：`cd server && pytest tests/auth -v`、`tests/automation -v`、`tests/system -v`
+完整执行顺序及命令记录在 [测试与质量控制指南](docs/testing_guide.md)。常用入口：
+
+- **后端单测**：`cd server && go test ./...`
+- **前端 Lint**：`cd web && npm run lint`（历史告警待逐步清理）
+- **Pytest 冒烟**：`cd server && make smoke`（报告位于 `server/reports/`）
+- **集成脚本**：`./test_integration.sh`、`server/test_notification_system.sh`
 
 ## 7. 账号与权限
 ### 7.1 默认/种子账号

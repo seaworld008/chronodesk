@@ -29,7 +29,7 @@
 - Use short imperative Conventional Commit subjects (`feat: add ticket SLA breaches`, `fix: prevent nil redis client`).
 - Keep one logical change per PR and squash noisy WIP commits locally.
 - PR descriptions should state motivation, affected surfaces (`server`, `web`), and the checks you ran.
-- Attach screenshots or sample payloads for UI/API changes and link the relevant ticket from `TASK_TRACKER.json`.
+- Attach screenshots or sample payloads for UI/API changes and link the relevant ticket from `docs/planning/TASK_TRACKER.json`.
 
 ## Security & Configuration Tips
 - Default ports: API `:8081`, web dev `:3000`; adjust `web/vite.config.ts` and `.env` together if you relocate services.
