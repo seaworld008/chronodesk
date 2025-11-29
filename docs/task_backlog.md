@@ -6,7 +6,7 @@
 - [x] **FE-LINT-01**：清理 `web/src/admin/automation/**/*` 中的 `any` 与未使用变量，保证 `npm run lint` 通过。
 - [x] **FE-LINT-02**：为 `AutomationLogList` 等组件添加类型定义与错误处理，替换占位 `any`。
 - [x] **FE-LINT-03**：处理 `settings/EmailSettings.tsx`、`settings/SystemSettings.tsx`、`settings/WebhookSettings.tsx` 中的依赖警告（缺少 deps、未使用变量）。
-- [ ] **FE-LINT-04**：将 `make test-web` 更新为执行 `npm run lint`，并在 README 中同步说明。
+- [x] **FE-LINT-04**：将 `make test-web` 更新为执行 `npm run lint`，并在 README/文档中同步说明。（2025-11-14）
 - [x] **FE-LINT-05**：清理 `web/src/admin/users/**/*` 中的 `any` 与未使用导入。
 - [x] **FE-LINT-06**：类型化 `web/src/layout/CustomLayout.tsx` 及其 props。
 - [x] **FE-LINT-07**：为 `web/src/lib/apiClient.ts` 补充请求/响应泛型，移除 `any`。

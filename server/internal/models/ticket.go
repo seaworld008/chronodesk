@@ -66,10 +66,10 @@ type Ticket struct {
 	Description  string `json:"description" gorm:"type:text" validate:"required"`
 
 	// 分类信息
-	Type     TicketType     `json:"type" gorm:"size:20;not null;default:'request'" validate:"required,oneof=incident request problem change complaint consultation"`
-	Priority TicketPriority `json:"priority" gorm:"size:20;not null;default:'normal'" validate:"required,oneof=low normal high urgent critical"`
-	Status   TicketStatus   `json:"status" gorm:"size:20;not null;default:'open'" validate:"required,oneof=open in_progress pending resolved closed cancelled"`
-	Source   TicketSource   `json:"source" gorm:"size:20;not null;default:'web'" validate:"required,oneof=web email phone chat api mobile"`
+	Type     TicketType     `json:"type" gorm:"size:20;not null;default:'request';index" validate:"required,oneof=incident request problem change complaint consultation"`
+	Priority TicketPriority `json:"priority" gorm:"size:20;not null;default:'normal';index" validate:"required,oneof=low normal high urgent critical"`
+	Status   TicketStatus   `json:"status" gorm:"size:20;not null;default:'open';index" validate:"required,oneof=open in_progress pending resolved closed cancelled"`
+	Source   TicketSource   `json:"source" gorm:"size:20;not null;default:'web';index" validate:"required,oneof=web email phone chat api mobile"`
 
 	// 用户关联
 	CreatedByID  uint  `json:"created_by_id" gorm:"not null;index"`

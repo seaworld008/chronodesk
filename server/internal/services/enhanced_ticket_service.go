@@ -6,13 +6,14 @@ import (
 	"log"
 	"time"
 
-	"gorm.io/gorm"
 	"gongdan-system/internal/models"
+
+	"gorm.io/gorm"
 )
 
 // EnhancedTicketService 增强的工单服务，集成通知功能
 type EnhancedTicketService struct {
-	*TicketService              // 嵌入原有服务
+	*TicketService      // 嵌入原有服务
 	notificationService *NotificationService
 }
 
@@ -38,11 +39,11 @@ func (s *EnhancedTicketService) CreateTicketWithNotification(ctx context.Context
 	// 异步发送通知
 	go func() {
 		event := &NotificationEvent{
-			Type:        models.WebhookEventTicketCreated,
-			ResourceID:  ticket.ID,
+			Type:         models.WebhookEventTicketCreated,
+			ResourceID:   ticket.ID,
 			ResourceType: "ticket",
-			Title:       fmt.Sprintf("新工单: %s", ticket.Title),
-			Description: fmt.Sprintf("用户 %s 创建了新工单", ticket.CreatedBy.Username),
+			Title:        fmt.Sprintf("新工单: %s", ticket.Title),
+			Description:  fmt.Sprintf("用户 %s 创建了新工单", ticket.CreatedBy.Username),
 			Data: map[string]interface{}{
 				"ticket_number": ticket.TicketNumber,
 				"title":         ticket.Title,
@@ -100,16 +101,16 @@ func (s *EnhancedTicketService) AssignTicketWithNotification(ctx context.Context
 		}
 
 		event := &NotificationEvent{
-			Type:        models.WebhookEventTicketAssigned,
-			ResourceID:  ticket.ID,
+			Type:         models.WebhookEventTicketAssigned,
+			ResourceID:   ticket.ID,
 			ResourceType: "ticket",
-			Title:       fmt.Sprintf("工单分配: %s", ticket.Title),
-			Description: fmt.Sprintf("工单已分配给 %s", assigneeName),
+			Title:        fmt.Sprintf("工单分配: %s", ticket.Title),
+			Description:  fmt.Sprintf("工单已分配给 %s", assigneeName),
 			Data: map[string]interface{}{
-				"ticket_number":   ticket.TicketNumber,
-				"title":           ticket.Title,
-				"assignee":        assigneeName,
-				"assignee_email":  assigneeEmail,
+				"ticket_number":  ticket.TicketNumber,
+				"title":          ticket.Title,
+				"assignee":       assigneeName,
+				"assignee_email": assigneeEmail,
 				"previous_assignee": func() string {
 					if oldTicket.AssignedTo != nil {
 						return oldTicket.AssignedTo.Username
@@ -159,11 +160,11 @@ func (s *EnhancedTicketService) UpdateTicketWithNotification(ctx context.Context
 		case models.TicketStatusResolved:
 			eventType = models.WebhookEventTicketResolved
 			title = fmt.Sprintf("工单解决: %s", ticket.Title)
-			description = fmt.Sprintf("工单状态已更新为: 已解决")
+			description = "工单状态已更新为: 已解决"
 		case models.TicketStatusClosed:
 			eventType = models.WebhookEventTicketClosed
 			title = fmt.Sprintf("工单关闭: %s", ticket.Title)
-			description = fmt.Sprintf("工单状态已更新为: 已关闭")
+			description = "工单状态已更新为: 已关闭"
 		default:
 			eventType = models.WebhookEventTicketUpdated
 			title = fmt.Sprintf("工单更新: %s", ticket.Title)
@@ -182,11 +183,11 @@ func (s *EnhancedTicketService) UpdateTicketWithNotification(ctx context.Context
 	// 异步发送通知
 	go func() {
 		event := &NotificationEvent{
-			Type:        eventType,
-			ResourceID:  ticket.ID,
+			Type:         eventType,
+			ResourceID:   ticket.ID,
 			ResourceType: "ticket",
-			Title:       title,
-			Description: description,
+			Title:        title,
+			Description:  description,
 			Data: map[string]interface{}{
 				"ticket_number": ticket.TicketNumber,
 				"title":         ticket.Title,
@@ -227,11 +228,11 @@ func (s *EnhancedTicketService) SendCommentNotification(ctx context.Context, com
 	// 异步发送通知
 	go func() {
 		event := &NotificationEvent{
-			Type:        models.WebhookEventTicketComment,
-			ResourceID:  ticket.ID,
+			Type:         models.WebhookEventTicketComment,
+			ResourceID:   ticket.ID,
 			ResourceType: "ticket",
-			Title:       fmt.Sprintf("新评论: %s", ticket.Title),
-			Description: fmt.Sprintf("%s 在工单上添加了评论", user.Username),
+			Title:        fmt.Sprintf("新评论: %s", ticket.Title),
+			Description:  fmt.Sprintf("%s 在工单上添加了评论", user.Username),
 			Data: map[string]interface{}{
 				"ticket_number":  ticket.TicketNumber,
 				"title":          ticket.Title,
@@ -268,11 +269,11 @@ func (s *EnhancedTicketService) SendEscalationNotification(ctx context.Context, 
 	// 异步发送通知
 	go func() {
 		event := &NotificationEvent{
-			Type:        models.WebhookEventTicketEscalated,
-			ResourceID:  ticket.ID,
+			Type:         models.WebhookEventTicketEscalated,
+			ResourceID:   ticket.ID,
 			ResourceType: "ticket",
-			Title:       fmt.Sprintf("工单升级: %s", ticket.Title),
-			Description: fmt.Sprintf("工单因为 %s 被升级处理", reason),
+			Title:        fmt.Sprintf("工单升级: %s", ticket.Title),
+			Description:  fmt.Sprintf("工单因为 %s 被升级处理", reason),
 			Data: map[string]interface{}{
 				"ticket_number": ticket.TicketNumber,
 				"title":         ticket.Title,
@@ -304,11 +305,11 @@ func (s *EnhancedTicketService) SendEscalationNotification(ctx context.Context, 
 // SendSystemAlert 发送系统告警通知
 func (s *EnhancedTicketService) SendSystemAlert(ctx context.Context, alertType, title, message string) error {
 	event := &NotificationEvent{
-		Type:        models.WebhookEventSystemAlert,
-		ResourceID:  0, // 系统级别事件
+		Type:         models.WebhookEventSystemAlert,
+		ResourceID:   0, // 系统级别事件
 		ResourceType: "system",
-		Title:       fmt.Sprintf("系统告警: %s", title),
-		Description: message,
+		Title:        fmt.Sprintf("系统告警: %s", title),
+		Description:  message,
 		Data: map[string]interface{}{
 			"alert_type": alertType,
 			"severity":   "warning",
@@ -340,11 +341,11 @@ func (ni *NotificationIntegration) OnTicketCreated(ticket *models.Ticket, userID
 		ni.service.db.Preload("CreatedBy").Preload("Category").First(ticket, ticket.ID)
 
 		event := &NotificationEvent{
-			Type:        models.WebhookEventTicketCreated,
-			ResourceID:  ticket.ID,
+			Type:         models.WebhookEventTicketCreated,
+			ResourceID:   ticket.ID,
 			ResourceType: "ticket",
-			Title:       fmt.Sprintf("新工单: %s", ticket.Title),
-			Description: fmt.Sprintf("用户 %s 创建了新工单", ticket.CreatedBy.Username),
+			Title:        fmt.Sprintf("新工单: %s", ticket.Title),
+			Description:  fmt.Sprintf("用户 %s 创建了新工单", ticket.CreatedBy.Username),
 			Data: map[string]interface{}{
 				"ticket_number": ticket.TicketNumber,
 				"title":         ticket.Title,
@@ -381,11 +382,11 @@ func (ni *NotificationIntegration) OnTicketStatusChanged(ticket *models.Ticket, 
 		}
 
 		event := &NotificationEvent{
-			Type:        eventType,
-			ResourceID:  ticket.ID,
+			Type:         eventType,
+			ResourceID:   ticket.ID,
 			ResourceType: "ticket",
-			Title:       fmt.Sprintf("工单状态更新: %s", ticket.Title),
-			Description: description,
+			Title:        fmt.Sprintf("工单状态更新: %s", ticket.Title),
+			Description:  description,
 			Data: map[string]interface{}{
 				"ticket_number": ticket.TicketNumber,
 				"title":         ticket.Title,

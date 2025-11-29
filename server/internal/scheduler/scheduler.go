@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/robfig/cron/v3"
-	"gorm.io/gorm"
 	"gongdan-system/internal/services"
+	"gorm.io/gorm"
 )
 
 // JobFunc 定时任务函数类型
@@ -67,7 +67,8 @@ type Scheduler struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	cleanupSvc *services.CleanupService
-	
+	startTime  time.Time
+
 	// 任务状态跟踪
 	mu         sync.RWMutex
 	running    map[string]bool
@@ -81,14 +82,14 @@ type Scheduler struct {
 func NewScheduler(db *gorm.DB) *Scheduler {
 	ctx, cancel := context.WithCancel(context.Background())
 	logger := log.New(log.Writer(), "[SCHEDULER] ", log.LstdFlags)
-	
+
 	// 配置cron选项：包含秒字段，启用恢复机制和详细日志
 	cronOptions := []cron.Option{
 		cron.WithSeconds(),
 		cron.WithChain(cron.Recover(cron.VerbosePrintfLogger(logger))),
 		cron.WithLogger(cron.VerbosePrintfLogger(logger)),
 	}
-	
+
 	return &Scheduler{
 		cron:       cron.New(cronOptions...),
 		jobs:       make(map[string]Job),
@@ -109,12 +110,12 @@ func NewScheduler(db *gorm.DB) *Scheduler {
 func (s *Scheduler) RegisterJob(job Job) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	jobName := job.Name()
 	if _, exists := s.jobs[jobName]; exists {
 		return fmt.Errorf("job %s already registered", jobName)
 	}
-	
+
 	// 注册cron任务
 	_, err := s.cron.AddFunc(job.Schedule(), func() {
 		s.executeJob(job)
@@ -122,12 +123,12 @@ func (s *Scheduler) RegisterJob(job Job) error {
 	if err != nil {
 		return fmt.Errorf("failed to register cron job %s: %v", jobName, err)
 	}
-	
+
 	s.jobs[jobName] = job
 	s.running[jobName] = false
 	s.runCount[jobName] = 0
 	s.errorCount[jobName] = 0
-	
+
 	s.logger.Printf("Registered job: %s with schedule: %s", jobName, job.Schedule())
 	return nil
 }
@@ -136,7 +137,7 @@ func (s *Scheduler) RegisterJob(job Job) error {
 func (s *Scheduler) RemoveJob(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	delete(s.jobs, name)
 	log.Printf("Removed job: %s", name)
 }
@@ -144,7 +145,7 @@ func (s *Scheduler) RemoveJob(name string) {
 // executeJob 执行任务
 func (s *Scheduler) executeJob(job Job) {
 	jobName := job.Name()
-	
+
 	// 防止任务重复执行
 	s.mu.Lock()
 	if s.running[jobName] {
@@ -154,14 +155,14 @@ func (s *Scheduler) executeJob(job Job) {
 	}
 	s.running[jobName] = true
 	s.mu.Unlock()
-	
+
 	// 记录任务开始时间
 	startTime := time.Now()
 	s.logger.Printf("Running job: %s", jobName)
-	
+
 	// 执行任务
 	err := job.Run(s.ctx)
-	
+
 	// 更新任务状态
 	s.mu.Lock()
 	s.running[jobName] = false
@@ -183,7 +184,13 @@ func (s *Scheduler) executeJob(job Job) {
 // Start 启动调度器
 func (s *Scheduler) Start() {
 	s.logger.Printf("🚀 启动任务调度器...")
-	
+
+	s.mu.Lock()
+	if s.startTime.IsZero() {
+		s.startTime = time.Now()
+	}
+	s.mu.Unlock()
+
 	// 初始化默认清理配置
 	if err := s.cleanupSvc.InitializeDefaultConfig(s.ctx); err != nil {
 		s.logger.Printf("⚠️  警告: 无法初始化默认清理配置: %v", err)
@@ -199,7 +206,7 @@ func (s *Scheduler) Start() {
 		"login_history",
 		s.cleanupSvc,
 	)
-	
+
 	if err := s.RegisterJob(cleanupJob); err != nil {
 		s.logger.Printf("❌ 添加清理任务失败: %v", err)
 	}
@@ -213,7 +220,7 @@ func (s *Scheduler) Start() {
 func (s *Scheduler) Stop() {
 	s.logger.Printf("停止调度器...")
 	s.cancel()
-	
+
 	// 停止cron调度器，等待正在执行的任务完成
 	ctx := s.cron.Stop()
 	select {
@@ -224,18 +231,16 @@ func (s *Scheduler) Stop() {
 	}
 }
 
-
-
 // GetJobStatus 获取指定任务状态
 func (s *Scheduler) GetJobStatus(jobName string) *JobStatus {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	
+
 	job, exists := s.jobs[jobName]
 	if !exists {
 		return nil
 	}
-	
+
 	return &JobStatus{
 		Name:        jobName,
 		Schedule:    job.Schedule(),
@@ -254,29 +259,29 @@ func (s *Scheduler) GetJobStatus(jobName string) *JobStatus {
 func (s *Scheduler) GetAllJobStatus() []*JobStatus {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	
+
 	statuses := make([]*JobStatus, 0, len(s.jobs))
 	for jobName := range s.jobs {
 		if status := s.GetJobStatus(jobName); status != nil {
 			statuses = append(statuses, status)
 		}
 	}
-	
+
 	return statuses
 }
 
 // JobStatus 任务状态
 type JobStatus struct {
-	Name        string     `json:"name"`
-	Schedule    string     `json:"schedule"`
-	IsRunning   bool       `json:"is_running"`
-	LastRun     time.Time  `json:"last_run"`
-	LastError   error      `json:"last_error,omitempty"`
-	RunCount    int64      `json:"run_count"`
-	ErrorCount  int64      `json:"error_count"`
-	NextRun     time.Time  `json:"next_run"`
-	Status      string     `json:"status"`
-	Description string     `json:"description"`
+	Name        string    `json:"name"`
+	Schedule    string    `json:"schedule"`
+	IsRunning   bool      `json:"is_running"`
+	LastRun     time.Time `json:"last_run"`
+	LastError   error     `json:"last_error,omitempty"`
+	RunCount    int64     `json:"run_count"`
+	ErrorCount  int64     `json:"error_count"`
+	NextRun     time.Time `json:"next_run"`
+	Status      string    `json:"status"`
+	Description string    `json:"description"`
 }
 
 // getNextRunTime 计算下次运行时间
@@ -287,7 +292,7 @@ func (s *Scheduler) getNextRunTime(job Job) time.Time {
 	if err != nil {
 		return time.Time{}
 	}
-	
+
 	return schedule.Next(time.Now())
 }
 
@@ -296,15 +301,15 @@ func (s *Scheduler) getJobStatusString(jobName string) string {
 	if s.running[jobName] {
 		return "running"
 	}
-	
+
 	if err := s.lastError[jobName]; err != nil {
 		return "error"
 	}
-	
+
 	if !s.lastRun[jobName].IsZero() {
 		return "success"
 	}
-	
+
 	return "pending"
 }
 
@@ -313,11 +318,11 @@ func (s *Scheduler) RunJobManually(jobName string) error {
 	s.mu.RLock()
 	job, exists := s.jobs[jobName]
 	s.mu.RUnlock()
-	
+
 	if !exists {
 		return fmt.Errorf("job %s not found", jobName)
 	}
-	
+
 	// 在新的goroutine中执行任务
 	go s.executeJob(job)
 	return nil
@@ -327,28 +332,35 @@ func (s *Scheduler) RunJobManually(jobName string) error {
 func (s *Scheduler) GetSchedulerStats() *SchedulerStats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	
+
+	uptime := time.Duration(0)
+	lastActivity := time.Time{}
+	if !s.startTime.IsZero() {
+		uptime = time.Since(s.startTime)
+		lastActivity = s.startTime
+	}
+
 	stats := &SchedulerStats{
 		TotalJobs:    len(s.jobs),
 		RunningJobs:  0,
 		TotalRuns:    0,
 		TotalErrors:  0,
-		Uptime:       time.Since(time.Now()), // 这里需要记录启动时间
-		LastActivity: time.Time{},
+		Uptime:       uptime,
+		LastActivity: lastActivity,
 	}
-	
+
 	for jobName := range s.jobs {
 		if s.running[jobName] {
 			stats.RunningJobs++
 		}
 		stats.TotalRuns += s.runCount[jobName]
 		stats.TotalErrors += s.errorCount[jobName]
-		
+
 		if lastRun := s.lastRun[jobName]; lastRun.After(stats.LastActivity) {
 			stats.LastActivity = lastRun
 		}
 	}
-	
+
 	return stats
 }
 
@@ -366,7 +378,7 @@ type SchedulerStats struct {
 func (s *Scheduler) IsHealthy() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	
+
 	// 检查是否有任务超过预期时间还在运行
 	for jobName, isRunning := range s.running {
 		if isRunning {
@@ -377,6 +389,6 @@ func (s *Scheduler) IsHealthy() bool {
 			}
 		}
 	}
-	
+
 	return true
 }

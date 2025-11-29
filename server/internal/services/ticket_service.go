@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"gongdan-system/internal/models"
+
 	"gorm.io/gorm"
 )
 
@@ -772,7 +773,12 @@ func (s *TicketService) GetTicketStatistics(userID uint, role string) (*TicketSt
 		Count  int64
 	}{}
 
-	if err := s.db.Model(&models.Ticket{}).
+	statusQuery := s.db.Model(&models.Ticket{})
+	if role == "agent" {
+		statusQuery = statusQuery.Where("assigned_to_id = ?", userID)
+	}
+
+	if err := statusQuery.
 		Select("status, count(*) as count").
 		Group("status").
 		Find(&statusCounts).Error; err != nil {
@@ -825,7 +831,13 @@ func (s *TicketService) GetTicketStatistics(userID uint, role string) (*TicketSt
 		Priority string
 		Count    int64
 	}{}
-	if err := s.db.Model(&models.Ticket{}).
+
+	priorityQuery := s.db.Model(&models.Ticket{})
+	if role == "agent" {
+		priorityQuery = priorityQuery.Where("assigned_to_id = ?", userID)
+	}
+
+	if err := priorityQuery.
 		Select("priority, count(*) as count").
 		Group("priority").
 		Find(&priorityCounts).Error; err == nil {

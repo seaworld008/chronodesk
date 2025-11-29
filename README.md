@@ -130,7 +130,7 @@ curl -H 'Authorization: Bearer <token>' "http://localhost:8081/api/admin/audit-l
 - 可信设备记忆 / 登录审计已上线，可通过 `/api/user/trusted-devices` 自助查看与撤销；后续可根据需要加入后台 TTL/配额配置。
 - WebSocket 仅搭建骨架，未实现未读数/消息确认。
 - 多数 GORM 模型的 JSON 字段尚未反序列化，后续可引入自定义类型增强校验。
-- 前端 ESLint 未通过；`make test-web` 仍为空实现，建议接入 lint/UT。
+- 前端 ESLint 仍有遗留问题，但已可通过 `make test-web` 直接执行 `npm run lint`，请在提交前确保无新增告警。
 
 ## 10. 参考资料
 - [项目总览 · 架构/模块/API/待办](docs/project_overview.md)

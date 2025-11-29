@@ -6,8 +6,9 @@ import (
 	"log"
 	"time"
 
-	"gorm.io/gorm"
 	"gongdan-system/internal/models"
+
+	"gorm.io/gorm"
 )
 
 // EscalationService 升级服务
@@ -26,14 +27,14 @@ func NewEscalationService(db *gorm.DB) *EscalationService {
 
 // TicketSLAStatus SLA状态结构
 type TicketSLAStatus struct {
-	TicketID              uint      `json:"ticket_id"`
-	ResponseDeadline      time.Time `json:"response_deadline"`
-	ResolutionDeadline    time.Time `json:"resolution_deadline"`
-	IsResponseOverdue     bool      `json:"is_response_overdue"`
-	IsResolutionOverdue   bool      `json:"is_resolution_overdue"`
-	ResponseOverdueMinutes int64    `json:"response_overdue_minutes"`
-	ResolutionOverdueMinutes int64  `json:"resolution_overdue_minutes"`
-	SLAConfig             *models.SLAConfig `json:"sla_config,omitempty"`
+	TicketID                 uint              `json:"ticket_id"`
+	ResponseDeadline         time.Time         `json:"response_deadline"`
+	ResolutionDeadline       time.Time         `json:"resolution_deadline"`
+	IsResponseOverdue        bool              `json:"is_response_overdue"`
+	IsResolutionOverdue      bool              `json:"is_resolution_overdue"`
+	ResponseOverdueMinutes   int64             `json:"response_overdue_minutes"`
+	ResolutionOverdueMinutes int64             `json:"resolution_overdue_minutes"`
+	SLAConfig                *models.SLAConfig `json:"sla_config,omitempty"`
 }
 
 // CheckSLAViolations 检查SLA违规
@@ -86,7 +87,7 @@ func (s *EscalationService) CheckTicketSLA(ctx context.Context, ticket *models.T
 		TicketID:           ticket.ID,
 		ResponseDeadline:   responseDeadline,
 		ResolutionDeadline: resolutionDeadline,
-		SLAConfig:         slaConfig,
+		SLAConfig:          slaConfig,
 	}
 
 	// 检查响应超时
@@ -285,7 +286,7 @@ func (s *EscalationService) updateSLAStats(ctx context.Context, slaConfigID uint
 // recordSLAViolation 记录SLA违规
 func (s *EscalationService) recordSLAViolation(ctx context.Context, ticket *models.Ticket, status *TicketSLAStatus) error {
 	// 这里可以记录到专门的SLA违规日志表
-	log.Printf("记录SLA违规：工单 %d，响应超时: %v，解决超时: %v", 
+	log.Printf("记录SLA违规：工单 %d，响应超时: %v，解决超时: %v",
 		ticket.ID, status.IsResponseOverdue, status.IsResolutionOverdue)
 	return nil
 }
@@ -312,8 +313,8 @@ func (s *EscalationService) GetSLADashboard(ctx context.Context) (map[string]int
 
 		configStats = append(configStats, map[string]interface{}{
 			"config_id":       config.ID,
-			"name":           config.Name,
-			"applied_count":  config.AppliedCount,
+			"name":            config.Name,
+			"applied_count":   config.AppliedCount,
 			"violation_count": config.ViolationCount,
 			"compliance_rate": config.ComplianceRate,
 		})
@@ -365,13 +366,10 @@ func (s *EscalationService) ScheduleSLACheck() {
 	ticker := time.NewTicker(15 * time.Minute) // 每15分钟检查一次
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ticker.C:
-			ctx := context.Background()
-			if err := s.CheckSLAViolations(ctx); err != nil {
-				log.Printf("SLA检查失败: %v", err)
-			}
+	for range ticker.C {
+		ctx := context.Background()
+		if err := s.CheckSLAViolations(ctx); err != nil {
+			log.Printf("SLA检查失败: %v", err)
 		}
 	}
 }

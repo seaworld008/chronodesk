@@ -66,34 +66,40 @@ type TimeRange = 'today' | 'yesterday' | '7d' | '30d'
 
 const containerSx = {
   width: '100%',
-  px: { xs: 2, md: 3, lg: 4, xl: 6 },
-  py: { xs: 2, md: 3, lg: 4 },
+  px: { xs: 2, md: 4, lg: 6 },
+  py: { xs: 3, md: 5 },
   backgroundColor: 'transparent',
 }
 
 const cardBaseSx = {
   height: '100%',
-  borderRadius: 2,
-  boxShadow: 3,
+  borderRadius: 4,
+  boxShadow: '0 4px 20px rgba(0,0,0,0.05)',
   display: 'flex',
   flexDirection: 'column' as const,
   justifyContent: 'space-between',
   backgroundImage: 'none',
+  transition: 'transform 0.2s, box-shadow 0.2s',
+  '&:hover': {
+    transform: 'translateY(-2px)',
+    boxShadow: '0 8px 24px rgba(0,0,0,0.08)',
+  },
 }
 
 const kpiCardSx = {
   ...cardBaseSx,
-  minHeight: { xs: 'auto', md: 128 },
+  minHeight: { xs: 'auto', md: 140 },
+  background: 'linear-gradient(135deg, #ffffff 0%, #f8fafc 100%)',
 }
 
 const infoCardSx = {
   ...cardBaseSx,
-  minHeight: { xs: 'auto', md: 150 },
+  minHeight: { xs: 'auto', md: 180 },
 }
 
 const bottomCardSx = {
   ...cardBaseSx,
-  minHeight: { xs: 'auto', md: 420 },
+  minHeight: { xs: 'auto', md: 450 },
 }
 
 const scrollSectionSx = {
@@ -102,18 +108,19 @@ const scrollSectionSx = {
   pr: { xs: 0, md: 1 },
 }
 
-  const rowSx = {
-    display: 'grid',
-    gridTemplateColumns: '1fr auto',
+const rowSx = {
+  display: 'grid',
+  gridTemplateColumns: '1fr auto',
   alignItems: 'center',
   gap: 1.5,
-  py: 1,
-  borderBottom: '1px dashed rgba(15, 23, 42, 0.08)',
+  py: 1.5,
+  borderBottom: '1px dashed rgba(15, 23, 42, 0.06)',
   '&:last-of-type': { borderBottom: 'none' },
   '& .title': {
     overflow: 'hidden',
     whiteSpace: 'nowrap' as const,
     textOverflow: 'ellipsis',
+    fontWeight: 500,
   },
   '& .status': {
     justifySelf: 'flex-end',
@@ -389,7 +396,7 @@ export const TicketDashboard: React.FC = () => {
         <List dense disablePadding sx={{ m: 0 }}>
           {items.slice(0, 6).map((ticket) => (
             <ListItem disablePadding key={ticket.id}>
-            <ListItemButton onClick={() => handleNavigateToTicketDetail(ticket.id)}>
+              <ListItemButton onClick={() => handleNavigateToTicketDetail(ticket.id)}>
                 <ListItemIcon sx={{ minWidth: 32 }}>
                   {ticket.is_overdue ? (
                     <Warning color="error" />
@@ -443,11 +450,16 @@ export const TicketDashboard: React.FC = () => {
           spacing={2}
         >
           <Box>
-            <Typography variant="h4" fontWeight={600} gutterBottom>
+            <Typography variant="h4" fontWeight={700} gutterBottom sx={{
+              background: 'linear-gradient(45deg, #2563eb 30%, #4f46e5 90%)',
+              WebkitBackgroundClip: 'text',
+              WebkitTextFillColor: 'transparent',
+              mb: 1
+            }}>
               工单运营总览
             </Typography>
-            <Typography variant="body2" color="text.secondary">
-              快速掌握工单态势、风险指标与团队动作，所有筛选与工单列表保持联动。
+            <Typography variant="body1" color="text.secondary" sx={{ maxWidth: 600 }}>
+              实时监控工单状态、SLA 达标率及团队绩效，助力高效运营决策。
             </Typography>
           </Box>
           <Stack direction="row" spacing={1} flexWrap="wrap" alignItems="center" justifyContent="flex-end">
@@ -479,19 +491,49 @@ export const TicketDashboard: React.FC = () => {
 
         <RatioRow ratios={kpiRatios} gap={2} breakAt="md" alignItems="stretch">
           {kpis.map((item) => (
-            <Card key={item.label} sx={kpiCardSx}>
+            <Card key={item.label} sx={{
+              ...kpiCardSx,
+              position: 'relative',
+              overflow: 'hidden',
+              '&::after': {
+                content: '""',
+                position: 'absolute',
+                top: 0,
+                right: 0,
+                width: '100px',
+                height: '100%',
+                background: `linear-gradient(90deg, transparent, ${alpha(theme.palette.primary.main, 0.05)})`,
+                transform: 'skewX(-20deg) translateX(50%)',
+              }
+            }}>
               <CardContent>
                 {loading ? (
                   <Skeleton variant="rounded" height={72} />
                 ) : (
-                  <Stack spacing={1.5} alignItems="flex-start">
-                    <Typography variant="h3" color={item.color}>
-                      {item.value}
+                  <Stack spacing={2} alignItems="flex-start">
+                    <Typography variant="h3" fontWeight={700} sx={{ color: item.color }}>
+                      {item.value.toLocaleString()}
                     </Typography>
-                    <Typography variant="body2" color="text.secondary">
-                      {item.label}
-                    </Typography>
-                    <Chip size="small" label={item.helper} onClick={item.onClick} />
+                    <Box>
+                      <Typography variant="subtitle2" color="text.secondary" fontWeight={600}>
+                        {item.label}
+                      </Typography>
+                      <Chip
+                        size="small"
+                        label={item.helper}
+                        onClick={item.onClick}
+                        sx={{
+                          mt: 1,
+                          height: 24,
+                          fontSize: '0.75rem',
+                          backgroundColor: alpha(theme.palette.primary.main, 0.08),
+                          color: 'primary.main',
+                          '&:hover': {
+                            backgroundColor: alpha(theme.palette.primary.main, 0.15),
+                          }
+                        }}
+                      />
+                    </Box>
                   </Stack>
                 )}
               </CardContent>
@@ -509,18 +551,18 @@ export const TicketDashboard: React.FC = () => {
                 {loading
                   ? [...Array(4)].map((_, index) => <Skeleton key={index} variant="rounded" height={28} />)
                   : statusDistribution.map((item) => (
-                      <Box key={item.label} sx={{ cursor: 'pointer' }} onClick={() => handleNavigateToTickets(item.filter)}>
-                        <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 0.5 }}>
-                          <Typography variant="body2" color="text.secondary">
-                            {item.label}
-                          </Typography>
-                          <Typography variant="body2" color="text.primary">
-                            {item.value}（{item.percent}%）
-                          </Typography>
-                        </Stack>
-                        <LinearProgress variant="determinate" value={item.percent} color={item.color} sx={{ height: 8, borderRadius: 5 }} />
-                      </Box>
-                    ))}
+                    <Box key={item.label} sx={{ cursor: 'pointer' }} onClick={() => handleNavigateToTickets(item.filter)}>
+                      <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 0.5 }}>
+                        <Typography variant="body2" color="text.secondary">
+                          {item.label}
+                        </Typography>
+                        <Typography variant="body2" color="text.primary">
+                          {item.value}（{item.percent}%）
+                        </Typography>
+                      </Stack>
+                      <LinearProgress variant="determinate" value={item.percent} color={item.color} sx={{ height: 8, borderRadius: 5 }} />
+                    </Box>
+                  ))}
               </Stack>
             </CardContent>
           </Card>

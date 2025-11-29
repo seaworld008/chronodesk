@@ -40,7 +40,8 @@ test-server:
 	cd server && go test ./...
 
 test-web:
-	@echo "Skipping web checks (not configured)"
+	@echo "Running web lint..."
+	cd web && npm run lint
 
 smoke:
 	@echo "Running API smoke suites..."

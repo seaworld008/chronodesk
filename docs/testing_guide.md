@@ -15,7 +15,7 @@
    - `cd server && make vet`
 
 ## 3. 前端检查
-- Lint：`cd web && npm run lint`
+- Lint：`make test-web`（等价于 `cd web && npm run lint`，会复用前端 Lint 规则）
 - （可选）构建：`cd web && npm run build`
 
 > 注意：当前 ESLint 仍存在若干历史问题，若未修改相关文件可在提交说明中注明。

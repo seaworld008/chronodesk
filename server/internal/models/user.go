@@ -46,8 +46,8 @@ type User struct {
 	Language    string `json:"language" gorm:"size:10;default:'zh-CN'"`
 
 	// 角色和权限
-	Role        UserRole   `json:"role" gorm:"size:20;not null;default:'customer'" validate:"required,oneof=admin agent customer supervisor"`
-	Status      UserStatus `json:"status" gorm:"size:20;not null;default:'inactive'" validate:"required,oneof=active inactive suspended deleted"`
+	Role        UserRole   `json:"role" gorm:"size:20;not null;default:'customer';index" validate:"required,oneof=admin agent customer supervisor"`
+	Status      UserStatus `json:"status" gorm:"size:20;not null;default:'inactive';index" validate:"required,oneof=active inactive suspended deleted"`
 	Permissions string     `json:"permissions" gorm:"type:text"` // JSON格式存储权限列表
 
 	// 认证相关

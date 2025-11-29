@@ -148,7 +148,7 @@ cp server/.env.example server/.env
 
 ## 8. 运维与脚本
 - **dev.sh**：`start` / `stop` / `restart` / `status`，默认清理 `3000-3005`、`8080-8081` 端口并持久化 PID。
-- **Makefile**：封装 build/test/docker/migrate；`test-web` 暂为空操作，可在未来指向 `npm run lint`。
+- **Makefile**：封装 build/test/docker/migrate；`test-web` 已代理执行 `npm run lint` 以复用前端 Lint 流程。
 - **docker-compose.yml**：启动 Postgres、Redis、后端、前端容器，适合作为本地一体化环境基础。
 - **日志位置**：
   - 后端：`backend.log`
@@ -163,7 +163,7 @@ cp server/.env.example server/.env
 
 ## 10. 下一步建议
 1. **补齐安全链路**：完善 OTP 设备记忆及登录审计，拓展 JWT 配置管理。
-2. **清理前端 Lint**：统一类型定义，移除遗留 `any` 与无用变量，同时让 `make test-web` 实际运行 lint。
+2. **清理前端 Lint**：统一类型定义，移除遗留 `any` 与无用变量，借助 `make test-web`（`npm run lint`）作为统一入口。
 3. **自动化增强**：补充 SLA 工作时间计算、执行动作落库，自动化日志页可增加详情抽屉。
 4. **WebSocket 落地**：实现未读数统计、消息确认，与通知中心打通。
 5. **文档自动生成**：结合 `swag` 生成 Swagger，保持 `API_DOCUMENTATION.md` 与代码同步更新。
