@@ -134,8 +134,8 @@ const transformTicketCreate = (data: TicketCreateFormValues): Record<string, unk
  */
 const TicketCreateToolbar = () => (
     <Box sx={{ display: 'flex', justifyContent: 'space-between', p: 2 }}>
-        <SaveButton 
-            label="创建工单" 
+        <SaveButton
+            label="创建工单"
             variant="contained"
             size="large"
         />
@@ -158,29 +158,40 @@ const TicketCreate: React.FC = () => {
     return (
         <Box sx={{ p: 3 }}>
             <BackButton />
-            <Alert severity="info" sx={{ mb: 3 }}>
-                <AlertTitle>创建新工单</AlertTitle>
+            <Alert severity="info" sx={{
+                mb: 3,
+                borderRadius: 2,
+                backgroundColor: '#eff6ff',
+                color: '#1e40af',
+                border: '1px solid #dbeafe',
+                '& .MuiAlert-icon': { color: '#2563eb' }
+            }}>
+                <AlertTitle sx={{ fontWeight: 600 }}>创建新工单</AlertTitle>
                 <Typography variant="body2">
                     请填写工单的详细信息。工单创建后将自动分配给指定的负责人。
                 </Typography>
             </Alert>
 
-            <Create 
+            <Create
                 actions={<TicketCreateActions />}
                 title="创建新工单"
                 mutationMode="pessimistic"
                 redirect="show"
                 transform={transformTicketCreate}
             >
-                <TabbedForm 
-                    toolbar={<TicketCreateToolbar />} 
+                <TabbedForm
+                    toolbar={<TicketCreateToolbar />}
                     syncWithLocation={false}
                     defaultValues={defaultValues}
                 >
                     {/* 基本信息 */}
                     <FormTab label="基本信息" path="">
-                        <Card>
-                            <CardHeader title="工单基本信息" />
+                        <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
+                            <CardHeader
+                                title="工单基本信息"
+                                titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
+                            />
                             <CardContent>
                                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                                     <TextInput
@@ -191,7 +202,7 @@ const TicketCreate: React.FC = () => {
                                         required
                                         helperText="简洁明了地描述问题或需求，将作为工单的主要标识"
                                     />
-                                    
+
                                     <TextInput
                                         source="description"
                                         label="详细描述"
@@ -242,18 +253,18 @@ const TicketCreate: React.FC = () => {
                                     </Box>
 
                                     <ReferenceInput source="assignee_id" reference="users" label="分配给">
-                                        <AutocompleteInput 
+                                        <AutocompleteInput
                                             optionText={(choice) => `${choice.username} (${choice.first_name} ${choice.last_name})`}
                                             fullWidth
                                             helperText="选择负责处理此工单的人员"
                                         />
                                     </ReferenceInput>
 
-                                    <TextInput 
-                                        source="tags" 
-                                        label="标签" 
-                                        fullWidth 
-                                        helperText="用逗号分隔多个标签，便于分类和搜索" 
+                                    <TextInput
+                                        source="tags"
+                                        label="标签"
+                                        fullWidth
+                                        helperText="用逗号分隔多个标签，便于分类和搜索"
                                         format={formatTagsInputValue}
                                     />
                                 </Box>
@@ -263,12 +274,16 @@ const TicketCreate: React.FC = () => {
 
                     {/* 分类信息 */}
                     <FormTab label="分类与类型" path="category">
-                        <Card>
-                            <CardHeader title="工单分类" />
+                        <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
+                            <CardHeader
+                                title="工单分类"
+                                titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
+                            />
                             <CardContent>
                                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                                     <ReferenceInput source="category_id" reference="categories" label="工单类别" >
-                                        <AutocompleteInput 
+                                        <AutocompleteInput
                                             optionText="name"
                                             fullWidth
                                             helperText="选择工单所属的主要类别"
@@ -286,7 +301,7 @@ const TicketCreate: React.FC = () => {
                                     />
 
                                     <ReferenceInput source="product_id" reference="products" label="相关产品">
-                                        <AutocompleteInput 
+                                        <AutocompleteInput
                                             optionText="name"
                                             fullWidth
                                             helperText="选择此工单相关的产品或服务"
@@ -306,8 +321,12 @@ const TicketCreate: React.FC = () => {
 
                     {/* 时间与SLA */}
                     <FormTab label="时间管理" path="timeline">
-                        <Card>
-                            <CardHeader title="时间与SLA设置" />
+                        <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
+                            <CardHeader
+                                title="时间与SLA设置"
+                                titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
+                            />
                             <CardContent>
                                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                                     <DateTimeInput
@@ -347,8 +366,12 @@ const TicketCreate: React.FC = () => {
 
                     {/* 附加信息 */}
                     <FormTab label="附加设置" path="advanced">
-                        <Card>
-                            <CardHeader title="高级设置" />
+                        <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
+                            <CardHeader
+                                title="高级设置"
+                                titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
+                            />
                             <CardContent>
                                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                                     <BooleanInput
@@ -371,7 +394,7 @@ const TicketCreate: React.FC = () => {
                                     />
 
                                     <ReferenceInput source="parent_ticket_id" reference="tickets" label="父工单">
-                                        <AutocompleteInput 
+                                        <AutocompleteInput
                                             optionText="title"
                                             fullWidth
                                             helperText="如果这是子工单，选择对应的父工单"

@@ -111,42 +111,47 @@ const RoleChip: React.FC = () => {
             case 'admin':
                 return {
                     label: '管理员',
-                    color: '#dc2626',
-                    backgroundColor: '#fef2f2',
+                    color: '#b91c1c',
+                    backgroundColor: '#fee2e2',
+                    border: '1px solid #fecaca',
                     icon: <AdminIcon sx={{ fontSize: '0.8rem' }} />
                 };
             case 'agent':
                 return {
                     label: '客服代理',
-                    color: '#2563eb',
-                    backgroundColor: '#eff6ff',
+                    color: '#1d4ed8',
+                    backgroundColor: '#dbeafe',
+                    border: '1px solid #bfdbfe',
                     icon: <SupportIcon sx={{ fontSize: '0.8rem' }} />
                 };
             case 'supervisor':
                 return {
                     label: '主管',
-                    color: '#7c3aed',
+                    color: '#7e22ce',
                     backgroundColor: '#f3e8ff',
+                    border: '1px solid #d8b4fe',
                     icon: <SupervisorIcon sx={{ fontSize: '0.8rem' }} />
                 };
             case 'customer':
                 return {
                     label: '客户',
-                    color: '#059669',
-                    backgroundColor: '#f0fdf4',
+                    color: '#15803d',
+                    backgroundColor: '#dcfce7',
+                    border: '1px solid #bbf7d0',
                     icon: <CustomerIcon sx={{ fontSize: '0.8rem' }} />
                 };
             default:
                 return {
                     label: '未知',
-                    color: '#64748b',
-                    backgroundColor: '#f8fafc',
+                    color: '#374151',
+                    backgroundColor: '#f3f4f6',
+                    border: '1px solid #e5e7eb',
                     icon: <PersonIcon sx={{ fontSize: '0.8rem' }} />
                 };
         }
     };
 
-    const { label, color, backgroundColor, icon } = getRoleConfig(record.role);
+    const { label, color, backgroundColor, border, icon } = getRoleConfig(record.role);
 
     return (
         <Chip
@@ -156,8 +161,10 @@ const RoleChip: React.FC = () => {
             sx={{
                 color,
                 backgroundColor,
-                fontWeight: 500,
+                border,
+                fontWeight: 600,
                 fontSize: '0.75rem',
+                height: 24,
                 '& .MuiChip-icon': { color },
             }}
         />
@@ -360,8 +367,41 @@ const UserList: React.FC = () => {
                 bulkActionButtons={<UserBulkActionButtons />}
                 sx={{
                     '& .RaDatagrid-table': {
-                        '& .RaDatagrid-tbody .RaDatagrid-row:hover': {
-                            backgroundColor: '#f8fafc',
+                        borderCollapse: 'separate',
+                        borderSpacing: '0 8px',
+                        backgroundColor: 'transparent',
+                        '& .RaDatagrid-headerCell': {
+                            backgroundColor: 'transparent',
+                            color: 'text.secondary',
+                            fontWeight: 600,
+                            borderBottom: 'none',
+                        },
+                        '& .RaDatagrid-tbody': {
+                            '& .RaDatagrid-row': {
+                                backgroundColor: '#ffffff',
+                                borderRadius: 2,
+                                boxShadow: '0 2px 4px rgba(0,0,0,0.02)',
+                                transition: 'transform 0.2s, box-shadow 0.2s',
+                                '&:hover': {
+                                    transform: 'translateY(-2px)',
+                                    boxShadow: '0 4px 12px rgba(0,0,0,0.05)',
+                                    backgroundColor: '#ffffff',
+                                },
+                                '& .RaDatagrid-rowCell': {
+                                    borderTop: '1px solid #f1f5f9',
+                                    borderBottom: '1px solid #f1f5f9',
+                                    '&:first-of-type': {
+                                        borderLeft: '1px solid #f1f5f9',
+                                        borderTopLeftRadius: 8,
+                                        borderBottomLeftRadius: 8,
+                                    },
+                                    '&:last-child': {
+                                        borderRight: '1px solid #f1f5f9',
+                                        borderTopRightRadius: 8,
+                                        borderBottomRightRadius: 8,
+                                    },
+                                },
+                            },
                         },
                     },
                 }}
@@ -387,14 +427,14 @@ const UserList: React.FC = () => {
                 </WrapperField>
 
                 {/* 时区和语言 */}
-                <TextField 
-                    source="timezone" 
+                <TextField
+                    source="timezone"
                     label="时区"
                     sx={{ minWidth: '120px' }}
                 />
-                
-                <TextField 
-                    source="language" 
+
+                <TextField
+                    source="language"
                     label="语言"
                     sx={{ minWidth: '80px' }}
                 />
@@ -405,8 +445,8 @@ const UserList: React.FC = () => {
                 </WrapperField>
 
                 {/* 注册时间 */}
-                <DateField 
-                    source="created_at" 
+                <DateField
+                    source="created_at"
                     label="注册时间"
                     showTime
                     locales="zh-CN"
@@ -420,8 +460,8 @@ const UserList: React.FC = () => {
                 />
 
                 {/* 邮箱验证状态 */}
-                <BooleanField 
-                    source="email_verified" 
+                <BooleanField
+                    source="email_verified"
                     label="邮箱已验证"
                     TrueIcon={ActiveIcon}
                     FalseIcon={InactiveIcon}

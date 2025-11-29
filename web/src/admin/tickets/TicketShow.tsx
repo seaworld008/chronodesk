@@ -113,29 +113,35 @@ const TicketHeader: React.FC = () => {
     const priorityName = priorityChoices.find(p => p.id === record.priority)?.name || record.priority;
 
     return (
-        <Card sx={{ mb: 3 }}>
+        <Card sx={{ mb: 3, borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)', overflow: 'visible' }}>
             <CardHeader
                 title={
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap' }}>
-                        <Typography variant="h5" component="h1" fontWeight={600}>
+                        <Typography variant="h5" component="h1" fontWeight={700} sx={{
+                            background: 'linear-gradient(45deg, #1e293b 30%, #334155 90%)',
+                            WebkitBackgroundClip: 'text',
+                            WebkitTextFillColor: 'transparent',
+                        }}>
                             {record.title}
                         </Typography>
                         <Chip
                             label={`#${record.ticket_number}`}
                             color="primary"
-                            variant="outlined"
+                            variant="filled"
                             size="small"
+                            sx={{ fontWeight: 600, borderRadius: 1 }}
                         />
                     </Box>
                 }
                 subheader={
-                    <Stack direction="row" spacing={1} sx={{ mt: 1 }}>
-                        <Chip label={statusName} color={getStatusColor(record.status)} size="small" />
+                    <Stack direction="row" spacing={1} sx={{ mt: 1.5 }}>
+                        <Chip label={statusName} color={getStatusColor(record.status)} size="small" sx={{ fontWeight: 500 }} />
                         <Chip
                             label={priorityName}
                             color={getPriorityColor(record.priority)}
                             icon={<PriorityIcon />}
                             size="small"
+                            sx={{ fontWeight: 500 }}
                         />
                         {record.sla_breached && (
                             <Chip
@@ -143,10 +149,16 @@ const TicketHeader: React.FC = () => {
                                 color="error"
                                 icon={<WarningIcon />}
                                 size="small"
+                                sx={{ fontWeight: 500 }}
                             />
                         )}
                     </Stack>
                 }
+                sx={{
+                    p: 3,
+                    background: 'linear-gradient(to right, #ffffff, #f8fafc)',
+                    borderBottom: '1px solid #f1f5f9'
+                }}
             />
         </Card>
     );
@@ -160,10 +172,12 @@ const CustomerInfoCard: React.FC = () => {
     if (!record) return null;
 
     return (
-        <Card>
+        <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
             <CardHeader
                 title="客户信息"
+                titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
                 avatar={<PersonIcon color="primary" />}
+                sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
             />
             <CardContent>
                 <Stack spacing={2}>
@@ -175,7 +189,7 @@ const CustomerInfoCard: React.FC = () => {
                             {record.customer_name || '未提供'}
                         </Typography>
                     </Box>
-                    
+
                     {record.customer_email && (
                         <Box>
                             <Typography variant="subtitle2" color="text.secondary">
@@ -189,7 +203,7 @@ const CustomerInfoCard: React.FC = () => {
                             </Box>
                         </Box>
                     )}
-                    
+
                     {record.customer_phone && (
                         <Box>
                             <Typography variant="subtitle2" color="text.secondary">
@@ -240,10 +254,12 @@ const TimeTrackingCard: React.FC = () => {
     if (!record) return null;
 
     return (
-        <Card>
+        <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
             <CardHeader
                 title="时间跟踪"
+                titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
                 avatar={<TimeIcon color="primary" />}
+                sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
             />
             <CardContent>
                 <Stack spacing={2}>
@@ -255,13 +271,13 @@ const TimeTrackingCard: React.FC = () => {
                             {new Date(record.created_at).toLocaleString('zh-CN')}
                         </Typography>
                     </Box>
-                    
+
                     {record.due_date && (
                         <Box>
                             <Typography variant="subtitle2" color="text.secondary">
                                 截止时间
                             </Typography>
-                            <Typography 
+                            <Typography
                                 variant="body1"
                                 color={new Date(record.due_date) < new Date() && !record.closed_at ? 'error' : 'text.primary'}
                             >
@@ -270,7 +286,7 @@ const TimeTrackingCard: React.FC = () => {
                             </Typography>
                         </Box>
                     )}
-                    
+
                     {record.first_reply_at && (
                         <Box>
                             <Typography variant="subtitle2" color="text.secondary">
@@ -281,7 +297,7 @@ const TimeTrackingCard: React.FC = () => {
                             </Typography>
                         </Box>
                     )}
-                    
+
                     {record.resolved_at && (
                         <Box>
                             <Typography variant="subtitle2" color="text.secondary">
@@ -292,7 +308,7 @@ const TimeTrackingCard: React.FC = () => {
                             </Typography>
                         </Box>
                     )}
-                    
+
                     {record.closed_at && (
                         <Box>
                             <Typography variant="subtitle2" color="text.secondary">
@@ -321,10 +337,12 @@ const SLAInfoCard: React.FC = () => {
     }
 
     return (
-        <Card>
+        <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
             <CardHeader
                 title="SLA信息"
+                titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
                 avatar={<ScheduleIcon color="primary" />}
+                sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
             />
             <CardContent>
                 <Stack spacing={2}>
@@ -333,13 +351,13 @@ const SLAInfoCard: React.FC = () => {
                             SLA已违反
                         </Alert>
                     )}
-                    
+
                     {record.sla_due_date && (
                         <Box>
                             <Typography variant="subtitle2" color="text.secondary">
                                 SLA截止时间
                             </Typography>
-                            <Typography 
+                            <Typography
                                 variant="body1"
                                 color={record.sla_breached ? 'error' : 'text.primary'}
                             >
@@ -347,7 +365,7 @@ const SLAInfoCard: React.FC = () => {
                             </Typography>
                         </Box>
                     )}
-                    
+
                     {record.response_time && (
                         <Box>
                             <Typography variant="subtitle2" color="text.secondary">
@@ -358,7 +376,7 @@ const SLAInfoCard: React.FC = () => {
                             </Typography>
                         </Box>
                     )}
-                    
+
                     {record.resolution_time && (
                         <Box>
                             <Typography variant="subtitle2" color="text.secondary">
@@ -397,7 +415,7 @@ const TicketShow: React.FC = () => {
                 <Box sx={{ px: 3 }}>
                     <BackButton />
                 </Box>
-                
+
                 <TabbedShowLayout>
                     {/* 基本信息 */}
                     <Tab label="基本信息">
@@ -405,16 +423,24 @@ const TicketShow: React.FC = () => {
                             <Box sx={{ flex: 2, minWidth: '500px' }}>
                                 <Stack spacing={3}>
                                     {/* 工单描述 */}
-                                    <Card>
-                                        <CardHeader title="工单描述" />
+                                    <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
+                                        <CardHeader
+                                            title="工单描述"
+                                            titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                            sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
+                                        />
                                         <CardContent>
                                             <RichTextField source="description" />
                                         </CardContent>
                                     </Card>
-                                    
+
                                     {/* 基本信息 */}
-                                    <Card>
-                                        <CardHeader title="基本信息" />
+                                    <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
+                                        <CardHeader
+                                            title="基本信息"
+                                            titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                            sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
+                                        />
                                         <CardContent>
                                             <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
@@ -423,14 +449,14 @@ const TicketShow: React.FC = () => {
                                                     </Typography>
                                                     <SelectField source="type" choices={typeChoices} />
                                                 </Box>
-                                                
+
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
                                                     <Typography variant="subtitle2" color="text.secondary">
                                                         来源
                                                     </Typography>
                                                     <SelectField source="source" choices={sourceChoices} />
                                                 </Box>
-                                                
+
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
                                                     <Typography variant="subtitle2" color="text.secondary">
                                                         创建人
@@ -439,7 +465,7 @@ const TicketShow: React.FC = () => {
                                                         <TextField source="username" />
                                                     </ReferenceField>
                                                 </Box>
-                                                
+
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
                                                     <Typography variant="subtitle2" color="text.secondary">
                                                         分配给
@@ -448,7 +474,7 @@ const TicketShow: React.FC = () => {
                                                         <TextField source="username" />
                                                     </ReferenceField>
                                                 </Box>
-                                                
+
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
                                                     <Typography variant="subtitle2" color="text.secondary">
                                                         分类
@@ -464,7 +490,7 @@ const TicketShow: React.FC = () => {
                                     </Card>
                                 </Stack>
                             </Box>
-                            
+
                             <Box sx={{ flex: 1, minWidth: '300px' }}>
                                 <Stack spacing={3}>
                                     <CustomerInfoCard />
@@ -474,7 +500,7 @@ const TicketShow: React.FC = () => {
                             </Box>
                         </Box>
                     </Tab>
-                    
+
                     {/* 评论历史 */}
                     <Tab label="评论历史">
                         <ReferenceManyField
@@ -484,22 +510,64 @@ const TicketShow: React.FC = () => {
                             perPage={20}
                             sort={{ field: 'created_at', order: 'DESC' }}
                         >
-                            <Datagrid bulkActionButtons={false}>
+                            <Datagrid
+                                bulkActionButtons={false}
+                                sx={{
+                                    '& .RaDatagrid-table': {
+                                        borderCollapse: 'separate',
+                                        borderSpacing: '0 8px',
+                                        backgroundColor: 'transparent',
+                                        '& .RaDatagrid-headerCell': {
+                                            backgroundColor: 'transparent',
+                                            color: 'text.secondary',
+                                            fontWeight: 600,
+                                            borderBottom: 'none',
+                                        },
+                                        '& .RaDatagrid-tbody': {
+                                            '& .RaDatagrid-row': {
+                                                backgroundColor: '#ffffff',
+                                                borderRadius: 2,
+                                                boxShadow: '0 2px 4px rgba(0,0,0,0.02)',
+                                                transition: 'transform 0.2s, box-shadow 0.2s',
+                                                '&:hover': {
+                                                    transform: 'translateY(-2px)',
+                                                    boxShadow: '0 4px 12px rgba(0,0,0,0.05)',
+                                                    backgroundColor: '#ffffff',
+                                                },
+                                                '& .RaDatagrid-rowCell': {
+                                                    borderTop: '1px solid #f1f5f9',
+                                                    borderBottom: '1px solid #f1f5f9',
+                                                    '&:first-of-type': {
+                                                        borderLeft: '1px solid #f1f5f9',
+                                                        borderTopLeftRadius: 8,
+                                                        borderBottomLeftRadius: 8,
+                                                    },
+                                                    '&:last-child': {
+                                                        borderRight: '1px solid #f1f5f9',
+                                                        borderTopRightRadius: 8,
+                                                        borderBottomRightRadius: 8,
+                                                    },
+                                                },
+                                            },
+                                        },
+                                    },
+                                }}
+                            >
                                 <TextField source="content" label="内容" />
                                 <ReferenceField source="user_id" reference="users" label="用户">
                                     <TextField source="username" />
                                 </ReferenceField>
-                                <DateField 
-                                    source="created_at" 
-                                    label="创建时间" 
-                                    showTime 
+                                <DateField
+                                    source="created_at"
+                                    label="创建时间"
+                                    showTime
                                     locales="zh-CN"
                                 />
                                 <BooleanField source="is_internal" label="内部评论" />
                             </Datagrid>
                         </ReferenceManyField>
                     </Tab>
-                    
+
                     {/* 历史记录 */}
                     <Tab label="历史记录">
                         <ReferenceManyField
@@ -509,7 +577,49 @@ const TicketShow: React.FC = () => {
                             perPage={20}
                             sort={{ field: 'created_at', order: 'DESC' }}
                         >
-                            <Datagrid bulkActionButtons={false}>
+                            <Datagrid
+                                bulkActionButtons={false}
+                                sx={{
+                                    '& .RaDatagrid-table': {
+                                        borderCollapse: 'separate',
+                                        borderSpacing: '0 8px',
+                                        backgroundColor: 'transparent',
+                                        '& .RaDatagrid-headerCell': {
+                                            backgroundColor: 'transparent',
+                                            color: 'text.secondary',
+                                            fontWeight: 600,
+                                            borderBottom: 'none',
+                                        },
+                                        '& .RaDatagrid-tbody': {
+                                            '& .RaDatagrid-row': {
+                                                backgroundColor: '#ffffff',
+                                                borderRadius: 2,
+                                                boxShadow: '0 2px 4px rgba(0,0,0,0.02)',
+                                                transition: 'transform 0.2s, box-shadow 0.2s',
+                                                '&:hover': {
+                                                    transform: 'translateY(-2px)',
+                                                    boxShadow: '0 4px 12px rgba(0,0,0,0.05)',
+                                                    backgroundColor: '#ffffff',
+                                                },
+                                                '& .RaDatagrid-rowCell': {
+                                                    borderTop: '1px solid #f1f5f9',
+                                                    borderBottom: '1px solid #f1f5f9',
+                                                    '&:first-of-type': {
+                                                        borderLeft: '1px solid #f1f5f9',
+                                                        borderTopLeftRadius: 8,
+                                                        borderBottomLeftRadius: 8,
+                                                    },
+                                                    '&:last-child': {
+                                                        borderRight: '1px solid #f1f5f9',
+                                                        borderTopRightRadius: 8,
+                                                        borderBottomRightRadius: 8,
+                                                    },
+                                                },
+                                            },
+                                        },
+                                    },
+                                }}
+                            >
                                 <TextField source="action" label="操作" />
                                 <TextField source="field_name" label="字段" />
                                 <TextField source="old_value" label="原值" />
@@ -517,16 +627,16 @@ const TicketShow: React.FC = () => {
                                 <ReferenceField source="user_id" reference="users" label="用户">
                                     <TextField source="username" />
                                 </ReferenceField>
-                                <DateField 
-                                    source="created_at" 
-                                    label="时间" 
-                                    showTime 
+                                <DateField
+                                    source="created_at"
+                                    label="时间"
+                                    showTime
                                     locales="zh-CN"
                                 />
                             </Datagrid>
                         </ReferenceManyField>
                     </Tab>
-                    
+
                     {/* 附加信息 */}
                     <Tab label="附加信息">
                         <SimpleShowLayout>

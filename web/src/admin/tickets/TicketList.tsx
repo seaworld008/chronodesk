@@ -82,23 +82,23 @@ const StatusChip: React.FC = () => {
     const getStatusColor = (status: string) => {
         switch (status) {
             case 'open':
-                return { color: '#2563eb', backgroundColor: '#eff6ff' }; // blue
+                return { color: '#1d4ed8', backgroundColor: '#dbeafe', border: '1px solid #bfdbfe' }; // blue-700, blue-100
             case 'in_progress':
-                return { color: '#d97706', backgroundColor: '#fefce8' }; // yellow
+                return { color: '#b45309', backgroundColor: '#fef3c7', border: '1px solid #fde68a' }; // amber-700, amber-100
             case 'pending':
-                return { color: '#7c3aed', backgroundColor: '#f3e8ff' }; // purple
+                return { color: '#7e22ce', backgroundColor: '#f3e8ff', border: '1px solid #d8b4fe' }; // purple-700, purple-100
             case 'resolved':
-                return { color: '#059669', backgroundColor: '#f0fdf4' }; // green
+                return { color: '#15803d', backgroundColor: '#dcfce7', border: '1px solid #bbf7d0' }; // green-700, green-100
             case 'closed':
-                return { color: '#64748b', backgroundColor: '#f8fafc' }; // gray
+                return { color: '#374151', backgroundColor: '#f3f4f6', border: '1px solid #e5e7eb' }; // gray-700, gray-100
             case 'cancelled':
-                return { color: '#dc2626', backgroundColor: '#fef2f2' }; // red
+                return { color: '#b91c1c', backgroundColor: '#fee2e2', border: '1px solid #fecaca' }; // red-700, red-100
             default:
-                return { color: '#64748b', backgroundColor: '#f8fafc' };
+                return { color: '#374151', backgroundColor: '#f3f4f6', border: '1px solid #e5e7eb' };
         }
     };
 
-    const { color, backgroundColor } = getStatusColor(record.status);
+    const { color, backgroundColor, border } = getStatusColor(record.status);
     const statusName = statusChoices.find(s => s.id === record.status)?.name || record.status;
 
     return (
@@ -108,8 +108,10 @@ const StatusChip: React.FC = () => {
             sx={{
                 color,
                 backgroundColor,
-                fontWeight: 500,
+                border,
+                fontWeight: 600,
                 fontSize: '0.75rem',
+                height: 24,
             }}
         />
     );
@@ -323,8 +325,41 @@ const TicketList: React.FC = () => {
                 }
                 sx={{
                     '& .RaDatagrid-table': {
-                        '& .RaDatagrid-tbody .RaDatagrid-row:hover': {
-                            backgroundColor: '#f8fafc',
+                        borderCollapse: 'separate',
+                        borderSpacing: '0 8px',
+                        backgroundColor: 'transparent',
+                        '& .RaDatagrid-headerCell': {
+                            backgroundColor: 'transparent',
+                            color: 'text.secondary',
+                            fontWeight: 600,
+                            borderBottom: 'none',
+                        },
+                        '& .RaDatagrid-tbody': {
+                            '& .RaDatagrid-row': {
+                                backgroundColor: '#ffffff',
+                                borderRadius: 2,
+                                boxShadow: '0 2px 4px rgba(0,0,0,0.02)',
+                                transition: 'transform 0.2s, box-shadow 0.2s',
+                                '&:hover': {
+                                    transform: 'translateY(-2px)',
+                                    boxShadow: '0 4px 12px rgba(0,0,0,0.05)',
+                                    backgroundColor: '#ffffff',
+                                },
+                                '& .RaDatagrid-rowCell': {
+                                    borderTop: '1px solid #f1f5f9',
+                                    borderBottom: '1px solid #f1f5f9',
+                                    '&:first-of-type': {
+                                        borderLeft: '1px solid #f1f5f9',
+                                        borderTopLeftRadius: 8,
+                                        borderBottomLeftRadius: 8,
+                                    },
+                                    '&:last-child': {
+                                        borderRight: '1px solid #f1f5f9',
+                                        borderTopRightRadius: 8,
+                                        borderBottomRightRadius: 8,
+                                    },
+                                },
+                            },
                         },
                     },
                 }}
@@ -335,10 +370,10 @@ const TicketList: React.FC = () => {
                 </WrapperField>
 
                 {/* 标题 */}
-                <TextField 
-                    source="title" 
+                <TextField
+                    source="title"
                     label="标题"
-                    sx={{ 
+                    sx={{
                         maxWidth: '300px',
                         '& .MuiTableCell-root': {
                             maxWidth: '300px',
@@ -360,9 +395,9 @@ const TicketList: React.FC = () => {
                 </WrapperField>
 
                 {/* 类型 */}
-                <SelectField 
-                    source="type" 
-                    label="类型" 
+                <SelectField
+                    source="type"
+                    label="类型"
                     choices={typeChoices}
                     sx={{ minWidth: '80px' }}
                 />
@@ -388,8 +423,8 @@ const TicketList: React.FC = () => {
                 </WrapperField>
 
                 {/* 创建时间 */}
-                <DateField 
-                    source="created_at" 
+                <DateField
+                    source="created_at"
                     label="创建时间"
                     showTime
                     locales="zh-CN"
@@ -403,8 +438,8 @@ const TicketList: React.FC = () => {
                 />
 
                 {/* 截止时间 */}
-                <DateField 
-                    source="due_date" 
+                <DateField
+                    source="due_date"
                     label="截止时间"
                     emptyText="无"
                     showTime
