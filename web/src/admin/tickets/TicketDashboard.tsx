@@ -12,11 +12,8 @@ import {
   Card,
   CardContent,
   Chip,
-  LinearProgress,
   List,
-  ListItem,
   ListItemButton,
-  ListItemIcon,
   ListItemText,
   Skeleton,
   Stack,
@@ -25,12 +22,28 @@ import {
   Typography,
   useTheme,
   type ChipProps,
+  Avatar,
+  ListItemAvatar,
+  Divider,
 } from '@mui/material'
 import { Title } from 'react-admin'
 import { usePermissions } from 'react-admin'
 import { useNavigate } from 'react-router-dom'
 import { alpha } from '@mui/material/styles'
 import { RatioRow } from '@/components/layout/RatioRow'
+import {
+  PieChart,
+  Pie,
+  Cell,
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+  Sector,
+} from 'recharts'
 
 interface TicketStats {
   total: number
@@ -94,7 +107,7 @@ const kpiCardSx = {
 
 const infoCardSx = {
   ...cardBaseSx,
-  minHeight: { xs: 'auto', md: 180 },
+  minHeight: { xs: 'auto', md: 300 }, // Increased height for charts
 }
 
 const bottomCardSx = {
@@ -129,8 +142,24 @@ const rowSx = {
 }
 
 const SMALL_CARD_RATIOS: number[] = [1, 1, 1]
-const BOTTOM_SECTION_RATIOS: number[] = [1, 1]
 const DYNAMIC_SECTION_RATIOS: number[] = [1, 1]
+
+const renderActiveShape = (props: any) => {
+  const { cx, cy, innerRadius, outerRadius, startAngle, endAngle, fill } = props
+  return (
+    <g>
+      <Sector
+        cx={cx}
+        cy={cy}
+        innerRadius={innerRadius}
+        outerRadius={outerRadius + 6}
+        startAngle={startAngle}
+        endAngle={endAngle}
+        fill={fill}
+      />
+    </g>
+  )
+}
 
 export const TicketDashboard: React.FC = () => {
   const { permissions } = usePermissions()
@@ -156,6 +185,11 @@ export const TicketDashboard: React.FC = () => {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
+  const [activeIndex, setActiveIndex] = useState(0)
+
+  const onPieEnter = useCallback((_: any, index: number) => {
+    setActiveIndex(index)
+  }, [])
 
   const isAgent = permissions?.role === 'agent'
 
@@ -259,19 +293,15 @@ export const TicketDashboard: React.FC = () => {
     }
   }
 
-  const statusDistribution = useMemo(() => {
-    const { total, open, in_progress, pending, resolved } = stats
-    const entries = [
-      { label: '待处理', value: open, color: 'warning' as const, filter: { status: 'open' } },
-      { label: '处理中', value: in_progress, color: 'primary' as const, filter: { status: 'in_progress' } },
-      { label: '等待中', value: pending, color: 'secondary' as const, filter: { status: 'pending' } },
-      { label: '已解决', value: resolved, color: 'success' as const, filter: { status: 'resolved' } },
-    ]
-    return entries.map((item) => ({
-      ...item,
-      percent: total > 0 ? Math.round((item.value / total) * 100) : 0,
-    }))
-  }, [stats])
+  const statusData = useMemo(() => {
+    const { open, in_progress, pending, resolved } = stats
+    return [
+      { name: '待处理', value: open, color: theme.palette.warning.main },
+      { name: '处理中', value: in_progress, color: theme.palette.primary.main },
+      { name: '等待中', value: pending, color: theme.palette.secondary.main },
+      { name: '已解决', value: resolved, color: theme.palette.success.main },
+    ].filter(item => item.value > 0)
+  }, [stats, theme])
 
   const kpis = useMemo(
     () => [
@@ -324,50 +354,34 @@ export const TicketDashboard: React.FC = () => {
   const kpiRatios = useMemo(() => Array(kpis.length).fill(1), [kpis.length])
 
   const snapshotMetrics = useMemo(() => {
-    const items = [
+    return [
       {
         label: '今日新增',
         value: stats.today_created ?? 0,
-        color: theme.palette.primary.main,
+        fill: theme.palette.primary.main,
       },
       {
         label: '今日解决',
         value: stats.today_resolved ?? 0,
-        color: theme.palette.success.main,
+        fill: theme.palette.success.main,
       },
       {
-        label: '待回复 24 小时',
+        label: '待回复(24h)',
         value: stats.pending ?? 0,
-        color: theme.palette.warning.main,
+        fill: theme.palette.warning.main,
       },
       {
-        label: '首次响应 (分)',
+        label: '首次响应(分)',
         value: stats.avg_first_response_minutes ?? 0,
-        color: theme.palette.info.main,
+        fill: theme.palette.info.main,
       },
       {
-        label: '解决平均 (分)',
+        label: '平均解决(分)',
         value: stats.avg_resolution_minutes ?? 0,
-        color: theme.palette.secondary.main,
+        fill: theme.palette.secondary.main,
       },
     ]
-
-    return items.map((metric) => {
-      const numericValue = Number.isFinite(metric.value) ? metric.value : 0
-      return {
-        ...metric,
-        value: numericValue,
-        displayValue: numericValue.toLocaleString(),
-        gradient: `linear-gradient(180deg, ${alpha(metric.color, 0.45)} 0%, ${alpha(metric.color, 0.9)} 100%)`,
-        shadow: `0 14px 32px ${alpha(metric.color, 0.24)}`,
-      }
-    })
   }, [stats, theme])
-
-  const snapshotMax = useMemo(
-    () => Math.max(...snapshotMetrics.map((metric) => metric.value), 1),
-    [snapshotMetrics]
-  )
 
   const renderTicketColumn = (
     title: string,
@@ -375,9 +389,10 @@ export const TicketDashboard: React.FC = () => {
     emptyLabel: string,
     filter?: Record<string, unknown>
   ) => (
-    <Stack spacing={1.5} sx={{ minHeight: 0 }}>
+    <Stack spacing={2} sx={{ minHeight: 0 }}>
       <Stack direction="row" justifyContent="space-between" alignItems="center">
-        <Typography variant="subtitle1" fontWeight={600}>
+        <Typography variant="subtitle1" fontWeight={600} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <Box sx={{ width: 4, height: 16, bgcolor: 'primary.main', borderRadius: 1 }} />
           {title}
         </Typography>
         {items.length > 0 && filter && (
@@ -389,52 +404,80 @@ export const TicketDashboard: React.FC = () => {
       {loading ? (
         <Stack spacing={1}>
           {[...Array(4)].map((_, index) => (
-            <Skeleton key={index} variant="rounded" height={44} />
+            <Skeleton key={index} variant="rounded" height={60} />
           ))}
         </Stack>
       ) : items.length > 0 ? (
-        <List dense disablePadding sx={{ m: 0 }}>
-          {items.slice(0, 6).map((ticket) => (
-            <ListItem disablePadding key={ticket.id}>
-              <ListItemButton onClick={() => handleNavigateToTicketDetail(ticket.id)}>
-                <ListItemIcon sx={{ minWidth: 32 }}>
-                  {ticket.is_overdue ? (
-                    <Warning color="error" />
-                  ) : ticket.sla_breached ? (
-                    <Timer color="error" />
-                  ) : (
-                    <Assignment color="primary" />
-                  )}
-                </ListItemIcon>
+        <List disablePadding sx={{ width: '100%', bgcolor: 'background.paper' }}>
+          {items.slice(0, 5).map((ticket, index) => (
+            <React.Fragment key={ticket.id}>
+              <ListItemButton
+                alignItems="flex-start"
+                onClick={() => handleNavigateToTicketDetail(ticket.id)}
+                sx={{
+                  borderRadius: 2,
+                  px: 1,
+                  py: 1.5,
+                  mb: 0.5,
+                  '&:hover': { bgcolor: alpha(theme.palette.primary.main, 0.04) }
+                }}
+              >
+                <ListItemAvatar sx={{ minWidth: 48, mt: 0 }}>
+                  <Avatar sx={{
+                    width: 36, height: 36,
+                    bgcolor: ticket.is_overdue || ticket.sla_breached
+                      ? alpha(theme.palette.error.main, 0.1)
+                      : alpha(theme.palette.primary.main, 0.1),
+                    color: ticket.is_overdue || ticket.sla_breached
+                      ? 'error.main'
+                      : 'primary.main'
+                  }}>
+                    {ticket.is_overdue ? <Warning fontSize="small" /> :
+                      ticket.sla_breached ? <Timer fontSize="small" /> :
+                        <Assignment fontSize="small" />}
+                  </Avatar>
+                </ListItemAvatar>
                 <ListItemText
                   primary={
-                    <Stack direction="row" spacing={1} alignItems="center" sx={{ overflow: 'hidden' }}>
-                      <Typography variant="body2" fontWeight={600} className="title" noWrap>
+                    <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                      <Typography variant="subtitle2" fontWeight={600} noWrap sx={{ maxWidth: '70%' }}>
                         {ticket.title}
                       </Typography>
-                      <Chip size="small" label={ticket.priority} color={getPriorityColor(ticket.priority)} />
                       <Chip
                         size="small"
-                        variant="outlined"
                         label={ticket.status}
                         color={getStatusColor(ticket.status)}
+                        sx={{ height: 20, fontSize: '0.7rem', fontWeight: 500 }}
                       />
                     </Stack>
                   }
                   secondary={
-                    <Typography variant="caption" color="text.secondary" noWrap>
-                      #{ticket.ticket_number} · {ticket.customer_name || '匿名用户'} · {new Date(ticket.created_at).toLocaleString()}
-                    </Typography>
+                    <Stack direction="row" alignItems="center" spacing={1} sx={{ mt: 0.5 }} component="span">
+                      <Typography variant="caption" color="text.secondary" sx={{ fontFamily: 'monospace' }}>
+                        #{ticket.ticket_number}
+                      </Typography>
+                      <Typography variant="caption" color="text.disabled">•</Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {ticket.customer_name || '匿名'}
+                      </Typography>
+                      <Typography variant="caption" color="text.disabled">•</Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {ticket.priority}
+                      </Typography>
+                    </Stack>
                   }
                 />
               </ListItemButton>
-            </ListItem>
+              {index < items.slice(0, 5).length - 1 && <Divider variant="inset" component="li" sx={{ ml: 7 }} />}
+            </React.Fragment>
           ))}
         </List>
       ) : (
-        <Typography variant="body2" color="text.secondary" textAlign="center">
-          {emptyLabel}
-        </Typography>
+        <Box sx={{ py: 4, display: 'flex', justifyContent: 'center', opacity: 0.6 }}>
+          <Typography variant="body2" color="text.secondary">
+            {emptyLabel}
+          </Typography>
+        </Box>
       )}
     </Stack>
   )
@@ -543,27 +586,48 @@ export const TicketDashboard: React.FC = () => {
 
         <RatioRow ratios={SMALL_CARD_RATIOS} gap={2} breakAt="md" alignItems="stretch">
           <Card sx={infoCardSx}>
-            <CardContent sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-              <Typography variant="subtitle1" fontWeight={600}>
+            <CardContent sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+              <Typography variant="subtitle1" fontWeight={600} gutterBottom>
                 状态分布
               </Typography>
-              <Stack spacing={1.5}>
-                {loading
-                  ? [...Array(4)].map((_, index) => <Skeleton key={index} variant="rounded" height={28} />)
-                  : statusDistribution.map((item) => (
-                    <Box key={item.label} sx={{ cursor: 'pointer' }} onClick={() => handleNavigateToTickets(item.filter)}>
-                      <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 0.5 }}>
-                        <Typography variant="body2" color="text.secondary">
-                          {item.label}
-                        </Typography>
-                        <Typography variant="body2" color="text.primary">
-                          {item.value}（{item.percent}%）
-                        </Typography>
-                      </Stack>
-                      <LinearProgress variant="determinate" value={item.percent} color={item.color} sx={{ height: 8, borderRadius: 5 }} />
-                    </Box>
-                  ))}
-              </Stack>
+              <Box sx={{ flex: 1, minHeight: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                {loading ? (
+                  <Skeleton variant="circular" width={180} height={180} />
+                ) : statusData.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie
+                        data={statusData}
+                        cx="50%"
+                        cy="50%"
+                        innerRadius={45}
+                        outerRadius={70}
+                        paddingAngle={5}
+                        dataKey="value"
+                        labelLine={true}
+                        activeIndex={activeIndex}
+                        activeShape={renderActiveShape}
+                        onMouseEnter={onPieEnter}
+                        label={({ name, value, percent, cx, x, y }: any) => {
+                          return (
+                            <text x={x} y={y} fill="#666" textAnchor={x > cx ? 'start' : 'end'} dominantBaseline="central">
+                              <tspan x={x} dy="-0.5em" fontSize="10" fontWeight="bold">{name}</tspan>
+                              <tspan x={x} dy="1.2em" fontSize="10">{value} ({(percent * 100).toFixed(0)}%)</tspan>
+                            </text>
+                          );
+                        }}
+                      >
+                        {statusData.map((entry, index) => (
+                          <Cell key={`cell-${index}`} fill={entry.color} />
+                        ))}
+                      </Pie>
+                      <Tooltip />
+                    </PieChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <Typography color="text.secondary">暂无数据</Typography>
+                )}
+              </Box>
             </CardContent>
           </Card>
 
@@ -641,106 +705,58 @@ export const TicketDashboard: React.FC = () => {
           </Card>
         </RatioRow>
 
-        <RatioRow ratios={BOTTOM_SECTION_RATIOS} gap={2} breakAt="md" alignItems="stretch">
-          <Card sx={bottomCardSx}>
-            <CardContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, flex: 1 }}>
-              <Typography variant="h6" fontWeight={600}>
-                运营快照
-              </Typography>
-              {loading ? (
-                <Stack spacing={1.5}>
-                  <Skeleton variant="rounded" height={200} />
-                  <Skeleton variant="rounded" width="40%" height={36} />
-                </Stack>
-              ) : (
-                <Box sx={{ ...scrollSectionSx, display: 'flex', flexDirection: 'column', gap: 2 }}>
-                  <Box
-                    role="img"
-                    aria-label="运营快照指标柱状图"
-                    sx={{
-                      flex: 1,
-                      display: 'flex',
-                      alignItems: 'flex-end',
-                      justifyContent: 'space-between',
-                      gap: { xs: 1.5, sm: 2.5, md: 3 },
-                      minHeight: { xs: 160, sm: 210 },
-                      pb: 1,
-                    }}
-                  >
-                    {snapshotMetrics.map((metric) => {
-                      const heightPercent = snapshotMax > 0 ? Math.round((metric.value / snapshotMax) * 100) : 0
-                      const computedHeight = metric.value > 0 ? Math.max(heightPercent, 12) : 0
-                      return (
-                        <Stack key={metric.label} spacing={1} alignItems="center" sx={{ flex: 1, minWidth: 0 }}>
-                          <Typography variant="body2" fontWeight={600} color="text.primary">
-                            {metric.displayValue}
-                          </Typography>
-                          <Box
-                            sx={{
-                              width: '100%',
-                              maxWidth: 80,
-                              height: { xs: 140, sm: 200 },
-                              display: 'flex',
-                              alignItems: 'flex-end',
-                              justifyContent: 'center',
-                            }}
-                          >
-                            <Box
-                              aria-hidden
-                              sx={{
-                                width: '65%',
-                                minWidth: 32,
-                                height: `${computedHeight}%`,
-                                minHeight: metric.value > 0 ? '16px' : 0,
-                                borderRadius: 3,
-                                background: metric.gradient,
-                                boxShadow: metric.shadow,
-                                transition: 'height 0.4s ease',
-                              }}
-                            />
-                          </Box>
-                          <Typography variant="caption" color="text.secondary" textAlign="center" sx={{ maxWidth: 96 }}>
-                            {metric.label}
-                          </Typography>
-                        </Stack>
-                      )
-                    })}
-                  </Box>
-                  <Button
-                    variant="outlined"
-                    size="small"
-                    onClick={() => navigate('/automation-rules')}
-                    sx={{ alignSelf: 'flex-start' }}
-                  >
-                    查看自动化执行
-                  </Button>
-                </Box>
-              )}
-            </CardContent>
-          </Card>
+        <Card sx={{ ...bottomCardSx, minHeight: 400 }}>
+          <CardContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, flex: 1 }}>
+            <Typography variant="h6" fontWeight={600}>
+              运营快照
+            </Typography>
+            {loading ? (
+              <Stack spacing={1.5}>
+                <Skeleton variant="rounded" height={200} />
+              </Stack>
+            ) : <Box sx={{ ...scrollSectionSx, height: 300, width: '100%' }}>
+              <ResponsiveContainer width="100%" height={300}>
+                <BarChart data={snapshotMetrics} margin={{ top: 20, right: 30, left: 0, bottom: 5 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                  <XAxis dataKey="label" fontSize={12} tick={{ fill: theme.palette.text.secondary }} />
+                  <YAxis fontSize={12} tick={{ fill: theme.palette.text.secondary }} />
+                  <Tooltip
+                    cursor={{ fill: 'rgba(0,0,0,0.05)' }}
+                    contentStyle={{ borderRadius: 8, border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}
+                  />
+                  <Bar dataKey="value" name="数值" radius={[8, 8, 0, 0]} barSize={32}>
+                    {snapshotMetrics.map((entry, index) => (
+                      <Cell key={`cell-${index}`} fill={entry.fill} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </Box>
+            }
+          </CardContent>
+        </Card>
 
-          <Card sx={bottomCardSx}>
-            <CardContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, flex: 1 }}>
-              <Typography variant="h6" fontWeight={600}>
-                工单动态
-              </Typography>
-              <RatioRow ratios={DYNAMIC_SECTION_RATIOS} gap={2} breakAt="sm" sx={scrollSectionSx}>
-                {renderTicketColumn('紧急工单', urgentTickets, '暂无紧急工单', {
-                  priority: ['urgent', 'critical'],
-                  status: ['open', 'in_progress'],
-                })}
-                {renderTicketColumn(
-                  isAgent ? '我的最新工单' : '最新工单',
-                  isAgent ? myTickets : recentTickets,
-                  '暂无工单',
-                  {
-                    ...(isAgent ? { assigned_to_me: true } : {}),
-                  }
-                )}
-              </RatioRow>
-            </CardContent>
-          </Card>
-        </RatioRow>
+        <Card sx={{ ...bottomCardSx, minHeight: 'auto' }}>
+          <CardContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, flex: 1 }}>
+            <Typography variant="h6" fontWeight={600}>
+              工单动态
+            </Typography>
+            <RatioRow ratios={DYNAMIC_SECTION_RATIOS} gap={4} breakAt="sm" sx={scrollSectionSx}>
+              {renderTicketColumn('紧急工单', urgentTickets, '暂无紧急工单', {
+                priority: ['urgent', 'critical'],
+                status: ['open', 'in_progress'],
+              })}
+              {renderTicketColumn(
+                isAgent ? '我的最新工单' : '最新工单',
+                isAgent ? myTickets : recentTickets,
+                '暂无工单',
+                {
+                  ...(isAgent ? { assigned_to_me: true } : {}),
+                }
+              )}
+            </RatioRow>
+          </CardContent>
+        </Card>
       </Stack>
     </Box>
   )

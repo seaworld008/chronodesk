@@ -184,16 +184,9 @@ const CustomerInfo: React.FC = () => {
     if (!record) return null;
 
     return (
-        <Box>
-            <Typography variant="body2" fontWeight={500}>
-                {record.customer_name || '未知客户'}
-            </Typography>
-            {record.customer_email && (
-                <Typography variant="caption" color="text.secondary">
-                    {record.customer_email}
-                </Typography>
-            )}
-        </Box>
+        <Typography variant="body2" noWrap sx={{ maxWidth: 120 }} title={record.customer_name || '未知客户'}>
+            {record.customer_name || '未知客户'}
+        </Typography>
     );
 };
 
@@ -325,47 +318,45 @@ const TicketList: React.FC = () => {
                 }
                 sx={{
                     '& .RaDatagrid-table': {
-                        borderCollapse: 'separate',
-                        borderSpacing: '0 8px',
-                        backgroundColor: 'transparent',
+                        tableLayout: 'fixed',
+                        borderCollapse: 'collapse',
                         '& .RaDatagrid-headerCell': {
-                            backgroundColor: 'transparent',
+                            backgroundColor: '#f8fafc',
                             color: 'text.secondary',
                             fontWeight: 600,
-                            borderBottom: 'none',
+                            fontSize: '0.8rem',
+                            padding: '8px 12px',
+                            whiteSpace: 'nowrap',
+                            borderBottom: '2px solid #e2e8f0',
                         },
-                        '& .RaDatagrid-tbody': {
-                            '& .RaDatagrid-row': {
-                                backgroundColor: '#ffffff',
-                                borderRadius: 2,
-                                boxShadow: '0 2px 4px rgba(0,0,0,0.02)',
-                                transition: 'transform 0.2s, box-shadow 0.2s',
-                                '&:hover': {
-                                    transform: 'translateY(-2px)',
-                                    boxShadow: '0 4px 12px rgba(0,0,0,0.05)',
-                                    backgroundColor: '#ffffff',
-                                },
-                                '& .RaDatagrid-rowCell': {
-                                    borderTop: '1px solid #f1f5f9',
-                                    borderBottom: '1px solid #f1f5f9',
-                                    '&:first-of-type': {
-                                        borderLeft: '1px solid #f1f5f9',
-                                        borderTopLeftRadius: 8,
-                                        borderBottomLeftRadius: 8,
-                                    },
-                                    '&:last-child': {
-                                        borderRight: '1px solid #f1f5f9',
-                                        borderTopRightRadius: 8,
-                                        borderBottomRightRadius: 8,
-                                    },
-                                },
+                        '& .RaDatagrid-rowCell': {
+                            padding: '8px 12px',
+                            fontSize: '0.85rem',
+                            borderBottom: '1px solid #f1f5f9',
+                            verticalAlign: 'middle',
+                        },
+                        '& .RaDatagrid-row': {
+                            '&:hover': {
+                                backgroundColor: '#f8fafc',
                             },
                         },
+                        // 列宽控制
+                        '& .RaDatagrid-headerCell:nth-of-type(2), & .RaDatagrid-rowCell:nth-of-type(2)': { width: 130 }, // 编号
+                        '& .RaDatagrid-headerCell:nth-of-type(3), & .RaDatagrid-rowCell:nth-of-type(3)': { width: 180, maxWidth: 180 }, // 标题
+                        '& .RaDatagrid-headerCell:nth-of-type(4), & .RaDatagrid-rowCell:nth-of-type(4)': { width: 75 }, // 状态
+                        '& .RaDatagrid-headerCell:nth-of-type(5), & .RaDatagrid-rowCell:nth-of-type(5)': { width: 85 }, // 优先级
+                        '& .RaDatagrid-headerCell:nth-of-type(6), & .RaDatagrid-rowCell:nth-of-type(6)': { width: 55 }, // 类型
+                        '& .RaDatagrid-headerCell:nth-of-type(7), & .RaDatagrid-rowCell:nth-of-type(7)': { width: 75 }, // 创建人
+                        '& .RaDatagrid-headerCell:nth-of-type(8), & .RaDatagrid-rowCell:nth-of-type(8)': { width: 75 }, // 分配给
+                        '& .RaDatagrid-headerCell:nth-of-type(9), & .RaDatagrid-rowCell:nth-of-type(9)': { width: 90 }, // 客户
+                        '& .RaDatagrid-headerCell:nth-of-type(10), & .RaDatagrid-rowCell:nth-of-type(10)': { width: 70 }, // SLA
+                        '& .RaDatagrid-headerCell:nth-of-type(11), & .RaDatagrid-rowCell:nth-of-type(11)': { width: 95 }, // 创建
+                        '& .RaDatagrid-headerCell:nth-of-type(12), & .RaDatagrid-rowCell:nth-of-type(12)': { width: 95 }, // 截止
                     },
                 }}
             >
                 {/* 工单编号 */}
-                <WrapperField label="工单编号" sortBy="ticket_number">
+                <WrapperField label="编号" sortBy="ticket_number">
                     <TicketNumber />
                 </WrapperField>
 
@@ -374,9 +365,8 @@ const TicketList: React.FC = () => {
                     source="title"
                     label="标题"
                     sx={{
-                        maxWidth: '300px',
-                        '& .MuiTableCell-root': {
-                            maxWidth: '300px',
+                        '& span': {
+                            display: 'block',
                             overflow: 'hidden',
                             textOverflow: 'ellipsis',
                             whiteSpace: 'nowrap',
@@ -399,7 +389,6 @@ const TicketList: React.FC = () => {
                     source="type"
                     label="类型"
                     choices={typeChoices}
-                    sx={{ minWidth: '80px' }}
                 />
 
                 {/* 创建人 */}
@@ -408,7 +397,7 @@ const TicketList: React.FC = () => {
                 </ReferenceField>
 
                 {/* 分配给 */}
-                <ReferenceField source="assigned_to_id" reference="users" label="分配给" emptyText="未分配">
+                <ReferenceField source="assigned_to_id" reference="users" label="分配给" emptyText="-">
                     <TextField source="username" />
                 </ReferenceField>
 
@@ -425,38 +414,26 @@ const TicketList: React.FC = () => {
                 {/* 创建时间 */}
                 <DateField
                     source="created_at"
-                    label="创建时间"
+                    label="创建"
                     showTime
                     locales="zh-CN"
-                    options={{
-                        year: 'numeric',
-                        month: 'short',
-                        day: 'numeric',
-                        hour: '2-digit',
-                        minute: '2-digit',
-                    }}
+                    options={{ month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }}
                 />
 
                 {/* 截止时间 */}
                 <DateField
                     source="due_date"
-                    label="截止时间"
-                    emptyText="无"
+                    label="截止"
+                    emptyText="-"
                     showTime
                     locales="zh-CN"
-                    options={{
-                        year: 'numeric',
-                        month: 'short',
-                        day: 'numeric',
-                        hour: '2-digit',
-                        minute: '2-digit',
-                    }}
+                    options={{ month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }}
                 />
 
                 {/* 操作按钮 */}
-                <Stack direction="row" spacing={1}>
-                    <ShowButton label="查看" />
-                    <EditButton label="编辑" />
+                <Stack direction="row" spacing={0.5}>
+                    <ShowButton label="" />
+                    <EditButton label="" />
                 </Stack>
             </Datagrid>
         </List>

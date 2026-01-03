@@ -1,50 +1,50 @@
 package models
 
-import "testing"
+import (
+	"testing"
 
-func TestParseStringSliceFromJSON(t *testing.T) {
-	cases := []struct {
-		name     string
-		input    string
-		expected []string
-	}{
-		{"empty string", "", []string{}},
-		{"invalid json", "not-json", []string{}},
-		{"json array", `["alpha", "beta", "gamma"]`, []string{"alpha", "beta", "gamma"}},
-		{"with whitespace", `[" alpha ", "", "beta"]`, []string{"alpha", "beta"}},
+	"gorm.io/datatypes"
+)
+
+func TestTicketToResponseTags(t *testing.T) {
+	ticket := &Ticket{
+		Tags: datatypes.JSONSlice[string]{"alpha", "beta", "gamma"},
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := parseStringSliceFromJSON(tc.input)
-			if len(got) != len(tc.expected) {
-				t.Fatalf("expected length %d, got %d", len(tc.expected), len(got))
-			}
-			for i, expected := range tc.expected {
-				if got[i] != expected {
-					t.Fatalf("expected %q at index %d, got %q", expected, i, got[i])
-				}
-			}
-		})
+	response := ticket.ToResponse()
+	if len(response.Tags) != 3 {
+		t.Fatalf("expected 3 tags, got %d", len(response.Tags))
+	}
+	if response.Tags[0] != "alpha" || response.Tags[1] != "beta" || response.Tags[2] != "gamma" {
+		t.Fatalf("unexpected tags: %v", response.Tags)
 	}
 }
 
-func TestParseCustomFieldsFromJSON(t *testing.T) {
-	input := `{"foo":"bar","count":10}`
-	result := parseCustomFieldsFromJSON(input)
-
-	if result["foo"] != "bar" {
-		t.Fatalf("expected foo=bar, got %v", result["foo"])
+func TestTicketToResponseCustomFields(t *testing.T) {
+	ticket := &Ticket{
+		CustomFields: datatypes.NewJSONType(map[string]any{
+			"foo":   "bar",
+			"count": float64(10),
+		}),
 	}
 
-	if result["count"].(float64) != 10 {
-		t.Fatalf("expected count=10, got %v", result["count"])
+	response := ticket.ToResponse()
+	if response.CustomFields["foo"] != "bar" {
+		t.Fatalf("expected foo=bar, got %v", response.CustomFields["foo"])
+	}
+	if response.CustomFields["count"].(float64) != 10 {
+		t.Fatalf("expected count=10, got %v", response.CustomFields["count"])
 	}
 }
 
-func TestParseCustomFieldsHandlesInvalidJSON(t *testing.T) {
-	result := parseCustomFieldsFromJSON("not-json")
-	if len(result) != 0 {
-		t.Fatalf("expected empty map, got %v", result)
+func TestTicketToResponseEmptyFields(t *testing.T) {
+	ticket := &Ticket{}
+	response := ticket.ToResponse()
+
+	if response.Tags != nil && len(response.Tags) != 0 {
+		t.Fatalf("expected empty tags, got %v", response.Tags)
+	}
+	if response.CustomFields == nil {
+		// This is expected behavior - empty JSONType returns nil map
 	}
 }

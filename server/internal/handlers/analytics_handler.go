@@ -7,18 +7,21 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"gongdan-system/internal/middleware"
 	"gongdan-system/internal/services"
 )
 
 // AnalyticsHandler 分析统计处理器
 type AnalyticsHandler struct {
 	analyticsService *services.AnalyticsService
+	response         *middleware.ResponseHelper
 }
 
 // NewAnalyticsHandler 创建分析处理器
 func NewAnalyticsHandler(db *gorm.DB) *AnalyticsHandler {
 	return &AnalyticsHandler{
 		analyticsService: services.NewAnalyticsService(db),
+		response:         middleware.NewResponseHelper(),
 	}
 }
 
@@ -34,19 +37,11 @@ func NewAnalyticsHandler(db *gorm.DB) *AnalyticsHandler {
 func (h *AnalyticsHandler) GetSystemStats(c *gin.Context) {
 	stats, err := h.analyticsService.GetSystemStats()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "获取系统统计失败",
-			"error":   err.Error(),
-		})
+		h.response.InternalServerError(c, "获取系统统计失败: "+err.Error())
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "获取系统统计成功",
-		"data":    stats,
-	})
+	h.response.Success(c, stats, "获取系统统计成功")
 }
 
 // GetBusinessStats 获取业务数据统计
@@ -61,19 +56,11 @@ func (h *AnalyticsHandler) GetSystemStats(c *gin.Context) {
 func (h *AnalyticsHandler) GetBusinessStats(c *gin.Context) {
 	stats, err := h.analyticsService.GetBusinessStats(c.Request.Context())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "获取业务统计失败",
-			"error":   err.Error(),
-		})
+		h.response.InternalServerError(c, "获取业务统计失败: "+err.Error())
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "获取业务统计成功",
-		"data":    stats,
-	})
+	h.response.Success(c, stats, "获取业务统计成功")
 }
 
 // GetDashboardStats 获取仪表板综合统计
@@ -89,36 +76,24 @@ func (h *AnalyticsHandler) GetDashboardStats(c *gin.Context) {
 	// 获取系统统计
 	systemStats, err := h.analyticsService.GetSystemStats()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "获取系统统计失败",
-			"error":   err.Error(),
-		})
+		h.response.InternalServerError(c, "获取系统统计失败: "+err.Error())
 		return
 	}
 
 	// 获取业务统计
 	businessStats, err := h.analyticsService.GetBusinessStats(c.Request.Context())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "获取业务统计失败",
-			"error":   err.Error(),
-		})
+		h.response.InternalServerError(c, "获取业务统计失败: "+err.Error())
 		return
 	}
 
 	// 获取最近7天的趋势数据
 	endDate := time.Now()
 	startDate := endDate.AddDate(0, 0, -7)
-	
+
 	timeRangeStats, err := h.analyticsService.GetTimeRangeStats(c.Request.Context(), startDate, endDate)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "获取趋势数据失败",
-			"error":   err.Error(),
-		})
+		h.response.InternalServerError(c, "获取趋势数据失败: "+err.Error())
 		return
 	}
 
@@ -129,11 +104,7 @@ func (h *AnalyticsHandler) GetDashboardStats(c *gin.Context) {
 		"generated_at":     time.Now(),
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "获取仪表板统计成功",
-		"data":    dashboardData,
-	})
+	h.response.Success(c, dashboardData, "获取仪表板统计成功")
 }
 
 // GetTimeRangeStats 获取指定时间范围统计
@@ -153,30 +124,19 @@ func (h *AnalyticsHandler) GetTimeRangeStats(c *gin.Context) {
 	endDateStr := c.Query("end_date")
 
 	if startDateStr == "" || endDateStr == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "请提供开始日期和结束日期",
-		})
+		h.response.BadRequest(c, "请提供开始日期和结束日期")
 		return
 	}
 
 	startDate, err := time.Parse("2006-01-02", startDateStr)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "开始日期格式错误，应为 YYYY-MM-DD",
-			"error":   err.Error(),
-		})
+		h.response.BadRequest(c, "开始日期格式错误，应为 YYYY-MM-DD")
 		return
 	}
 
 	endDate, err := time.Parse("2006-01-02", endDateStr)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "结束日期格式错误，应为 YYYY-MM-DD",
-			"error":   err.Error(),
-		})
+		h.response.BadRequest(c, "结束日期格式错误，应为 YYYY-MM-DD")
 		return
 	}
 
@@ -185,19 +145,11 @@ func (h *AnalyticsHandler) GetTimeRangeStats(c *gin.Context) {
 
 	stats, err := h.analyticsService.GetTimeRangeStats(c.Request.Context(), startDate, endDate)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "获取时间范围统计失败",
-			"error":   err.Error(),
-		})
+		h.response.InternalServerError(c, "获取时间范围统计失败: "+err.Error())
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "获取时间范围统计成功",
-		"data":    stats,
-	})
+	h.response.Success(c, stats, "获取时间范围统计成功")
 }
 
 // GetHealthCheck 系统健康检查
@@ -220,11 +172,7 @@ func (h *AnalyticsHandler) GetHealthCheck(c *gin.Context) {
 	if err != nil {
 		health["status"] = "unhealthy"
 		health["database"] = "connection_failed"
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"success": false,
-			"message": "系统不健康",
-			"data":    health,
-		})
+		h.response.Error(c, http.StatusServiceUnavailable, "系统不健康", health)
 		return
 	}
 
@@ -232,11 +180,7 @@ func (h *AnalyticsHandler) GetHealthCheck(c *gin.Context) {
 	if err != nil {
 		health["status"] = "unhealthy"
 		health["database"] = "ping_failed"
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"success": false,
-			"message": "数据库连接失败",
-			"data":    health,
-		})
+		h.response.Error(c, http.StatusServiceUnavailable, "数据库连接失败", health)
 		return
 	}
 
@@ -265,16 +209,11 @@ func (h *AnalyticsHandler) GetHealthCheck(c *gin.Context) {
 		}
 	}
 
-	status := http.StatusOK
 	if health["status"] == "unhealthy" {
-		status = http.StatusServiceUnavailable
+		h.response.Error(c, http.StatusServiceUnavailable, "健康检查完成", health)
+		return
 	}
-
-	c.JSON(status, gin.H{
-		"success": health["status"] != "unhealthy",
-		"message": "健康检查完成",
-		"data":    health,
-	})
+	h.response.Success(c, health, "健康检查完成")
 }
 
 // ExportStats 导出统计数据
@@ -301,21 +240,13 @@ func (h *AnalyticsHandler) ExportStats(c *gin.Context) {
 	if startDateStr != "" && endDateStr != "" {
 		start, err := time.Parse("2006-01-02", startDateStr)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"success": false,
-				"message": "开始日期格式错误，应为 YYYY-MM-DD",
-				"error":   err.Error(),
-			})
+			h.response.BadRequest(c, "开始日期格式错误，应为 YYYY-MM-DD")
 			return
 		}
 
 		end, err := time.Parse("2006-01-02", endDateStr)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"success": false,
-				"message": "结束日期格式错误，应为 YYYY-MM-DD",
-				"error":   err.Error(),
-			})
+			h.response.BadRequest(c, "结束日期格式错误，应为 YYYY-MM-DD")
 			return
 		}
 
@@ -328,11 +259,7 @@ func (h *AnalyticsHandler) ExportStats(c *gin.Context) {
 
 	data, err := h.analyticsService.ExportStats(c.Request.Context(), format, startDate, endDate)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "导出统计数据失败",
-			"error":   err.Error(),
-		})
+		h.response.InternalServerError(c, "导出统计数据失败: "+err.Error())
 		return
 	}
 
@@ -356,11 +283,7 @@ func (h *AnalyticsHandler) ExportStats(c *gin.Context) {
 func (h *AnalyticsHandler) GetRealtimeMetrics(c *gin.Context) {
 	systemStats, err := h.analyticsService.GetSystemStats()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "获取实时指标失败",
-			"error":   err.Error(),
-		})
+		h.response.InternalServerError(c, "获取实时指标失败: "+err.Error())
 		return
 	}
 
@@ -368,32 +291,27 @@ func (h *AnalyticsHandler) GetRealtimeMetrics(c *gin.Context) {
 	realtimeMetrics := gin.H{
 		"timestamp": time.Now(),
 		"system": gin.H{
-			"cpu_count":    systemStats.CPUCount,
-			"goroutines":   systemStats.GoRoutines,
-			"cgo_calls":    systemStats.CGOCalls,
+			"cpu_count":  systemStats.CPUCount,
+			"goroutines": systemStats.GoRoutines,
+			"cgo_calls":  systemStats.CGOCalls,
 			"memory_usage": gin.H{
-				"heap_alloc_mb":    float64(systemStats.MemStats.HeapAlloc) / 1024 / 1024,
-				"heap_sys_mb":      float64(systemStats.MemStats.HeapSys) / 1024 / 1024,
-				"heap_inuse_mb":    float64(systemStats.MemStats.HeapInuse) / 1024 / 1024,
-				"heap_objects":     systemStats.MemStats.HeapObjects,
-				"stack_inuse_mb":   float64(systemStats.MemStats.StackInuse) / 1024 / 1024,
-				"sys_mb":           float64(systemStats.MemStats.Sys) / 1024 / 1024,
+				"heap_alloc_mb":      float64(systemStats.MemStats.HeapAlloc) / 1024 / 1024,
+				"heap_sys_mb":        float64(systemStats.MemStats.HeapSys) / 1024 / 1024,
+				"heap_inuse_mb":      float64(systemStats.MemStats.HeapInuse) / 1024 / 1024,
+				"heap_objects":       systemStats.MemStats.HeapObjects,
+				"stack_inuse_mb":     float64(systemStats.MemStats.StackInuse) / 1024 / 1024,
+				"sys_mb":             float64(systemStats.MemStats.Sys) / 1024 / 1024,
 				"heap_usage_percent": float64(systemStats.MemStats.HeapAlloc) / float64(systemStats.MemStats.HeapSys) * 100,
 			},
 			"gc": gin.H{
-				"num_gc":           systemStats.GCStats.NumGC,
-				"num_forced_gc":    systemStats.GCStats.NumForcedGC,
-				"gc_cpu_fraction":  systemStats.GCStats.GCCPUFraction,
-				"last_gc":          systemStats.GCStats.LastGC,
-				"pause_total_ms":   float64(systemStats.GCStats.PauseTotal.Nanoseconds()) / 1000000,
+				"num_gc":          systemStats.GCStats.NumGC,
+				"num_forced_gc":   systemStats.GCStats.NumForcedGC,
+				"gc_cpu_fraction": systemStats.GCStats.GCCPUFraction,
+				"last_gc":         systemStats.GCStats.LastGC,
+				"pause_total_ms":  float64(systemStats.GCStats.PauseTotal.Nanoseconds()) / 1000000,
 			},
 		},
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "获取实时指标成功",
-		"data":    realtimeMetrics,
-	})
+	h.response.Success(c, realtimeMetrics, "获取实时指标成功")
 }
-

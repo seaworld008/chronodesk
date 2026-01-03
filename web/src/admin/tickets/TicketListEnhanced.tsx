@@ -1,7 +1,7 @@
 import React from 'react';
 import {
     List,
-    Datagrid,
+    DatagridConfigurable,
     TextField,
     DateField,
     ReferenceField,
@@ -12,15 +12,19 @@ import {
     ExportButton,
     SearchInput,
     SelectInput,
+    SelectField,
     DateInput,
     BooleanInput,
     TextInput,
     TopToolbar,
     BulkDeleteWithConfirmButton,
     WrapperField,
+    SelectColumnsButton,
     useRecordContext,
+    useNotify,
+    useRefresh,
 } from 'react-admin';
-import { Box, Chip, Typography, Tooltip, type ChipProps } from '@mui/material';
+import { Box, Chip, Typography, Tooltip, IconButton, type ChipProps } from '@mui/material';
 import {
     Assignment,
     TrendingUp,
@@ -29,8 +33,10 @@ import {
     PriorityHigh,
     CheckCircle,
     Timer,
+    PersonAdd,
+    ArrowUpward,
+    SwapHoriz,
 } from '@mui/icons-material';
-import TicketWorkflowActions from './TicketWorkflowActions';
 import TicketBulkUpdateButton from './TicketBulkUpdateButton';
 import { parseTagsToArray } from './tagUtils';
 import { Ticket } from '@/types';
@@ -75,31 +81,77 @@ const EnhancedPriorityField: React.FC = () => {
     const record = useRecordContext<Ticket>();
     if (!record) return null;
 
-    const getPriorityConfig = (priority: string): PriorityConfig => {
+    const getPriorityConfig = (priority: string) => {
         switch (priority) {
             case 'critical':
-                return { color: 'error', icon: <Warning />, bgColor: '#ffebee' };
+                // 深红背景，白字
+                return {
+                    bgColor: '#d32f2f',
+                    color: '#ffffff',
+                    icon: <Warning sx={{ color: '#ffffff !important' }} />
+                };
             case 'urgent':
-                return { color: 'error', icon: <PriorityHigh />, bgColor: '#fff3e0' };
+                // 深橙背景，白字
+                return {
+                    bgColor: '#ed6c02',
+                    color: '#ffffff',
+                    icon: <PriorityHigh sx={{ color: '#ffffff !important' }} />
+                };
             case 'high':
-                return { color: 'warning', icon: <TrendingUp />, bgColor: '#fff8e1' };
+                // 琥珀色背景，深灰字
+                return {
+                    bgColor: '#ffca28',
+                    color: '#263238',
+                    icon: <TrendingUp sx={{ color: '#263238 !important' }} />
+                };
             case 'normal':
-                return { color: 'primary', icon: <Assignment />, bgColor: '#e3f2fd' };
+                // 浅蓝背景，蓝字（保持清爽）
+                return {
+                    bgColor: '#e3f2fd',
+                    color: '#1565c0',
+                    icon: <Assignment sx={{ color: '#1565c0 !important' }} />
+                };
             case 'low':
-                return { color: 'default', icon: <CheckCircle />, bgColor: '#f5f5f5' };
+                // 浅灰背景，灰字
+                return {
+                    bgColor: '#f5f5f5',
+                    color: '#616161',
+                    icon: <CheckCircle sx={{ color: '#616161 !important' }} />
+                };
             default:
-                return { color: 'default', icon: <Assignment />, bgColor: '#f5f5f5' };
+                return {
+                    bgColor: '#f5f5f5',
+                    color: '#757575',
+                    icon: <Assignment />
+                };
         }
     };
 
-    const { color, icon, bgColor } = getPriorityConfig(record.priority);
+    const config = getPriorityConfig(record.priority);
     const label = priorityChoices.find((p) => p.id === record.priority)?.name || record.priority;
 
     return (
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-            {icon}
-            <Chip label={label} color={color} size="small" sx={{ backgroundColor: bgColor, fontWeight: 500 }} />
-        </Box>
+        <Chip
+            icon={config.icon}
+            label={label}
+            size="small"
+            sx={{
+                backgroundColor: config.bgColor,
+                color: config.color,
+                fontWeight: 'bold',
+                borderRadius: '6px', // Slightly rounded square
+                height: '24px',
+                '& .MuiChip-label': {
+                    paddingLeft: '8px',
+                    paddingRight: '8px',
+                },
+                '& .MuiChip-icon': {
+                    color: 'inherit',
+                    marginLeft: '4px',
+                },
+                boxShadow: record.priority === 'critical' ? '0 2px 4px rgba(211, 47, 47, 0.2)' : 'none',
+            }}
+        />
     );
 };
 
@@ -150,13 +202,8 @@ const EnhancedStatusField: React.FC = () => {
     const { color, label } = getStatusConfig(record.status);
 
     return (
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
             <Chip label={label} color={color} size="small" variant="filled" />
-            {record.is_overdue && (
-                <Tooltip title="工单已逾期">
-                    <Timer color="error" fontSize="small" />
-                </Tooltip>
-            )}
             {record.sla_breached && (
                 <Tooltip title="SLA已违约">
                     <Warning color="error" fontSize="small" />
@@ -174,17 +221,14 @@ const TicketTitleField: React.FC = () => {
     if (!record) return null;
 
     return (
-        <Box sx={{ maxWidth: 300 }}>
-            <Typography variant="body2" fontWeight={600} sx={{ mb: 0.5 }}>
+        <Box sx={{ minWidth: 0 }}>
+            <Typography variant="caption" color="primary" fontWeight={600}>
                 #{record.ticket_number}
             </Typography>
-            <Typography 
-                variant="body2" 
-                sx={{
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
-                }}
+            <Typography
+                variant="body2"
+                noWrap
+                sx={{ maxWidth: 180 }}
                 title={record.title}
             >
                 {record.title}
@@ -259,7 +303,7 @@ const SLAStatusField: React.FC = () => {
     }
 
     const color = hoursLeft <= 4 ? 'error' : hoursLeft <= 8 ? 'warning' : 'success';
-    
+
     return (
         <Chip
             label={`${hoursLeft}小时内`}
@@ -267,6 +311,71 @@ const SLAStatusField: React.FC = () => {
             size="small"
             icon={<Schedule />}
         />
+    );
+};
+
+/**
+ * 快捷操作按钮组件
+ */
+const QuickActionsField: React.FC = () => {
+    const record = useRecordContext<Ticket>();
+    const notify = useNotify();
+    const refresh = useRefresh();
+
+    if (!record) return null;
+
+    const handleAssign = async (e: React.MouseEvent) => {
+        e.stopPropagation();
+        // TODO: 弹出分配对话框
+        notify('分配功能开发中', { type: 'info' });
+    };
+
+    const handleEscalate = async (e: React.MouseEvent) => {
+        e.stopPropagation();
+        try {
+            const response = await fetch(`/api/tickets/${record.id}/escalate`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${localStorage.getItem('token')}`
+                },
+                body: JSON.stringify({ reason: '快捷升级' })
+            });
+            if (response.ok) {
+                notify('工单已升级', { type: 'success' });
+                refresh();
+            }
+        } catch {
+            notify('升级失败', { type: 'error' });
+        }
+    };
+
+    const handleStatusChange = async (e: React.MouseEvent) => {
+        e.stopPropagation();
+        // TODO: 弹出状态变更对话框
+        notify('状态变更功能开发中', { type: 'info' });
+    };
+
+    return (
+        <Box sx={{ display: 'flex', gap: 0.25, alignItems: 'center' }}>
+            <Tooltip title="分配工单">
+                <IconButton size="small" onClick={handleAssign} color="primary">
+                    <PersonAdd fontSize="small" />
+                </IconButton>
+            </Tooltip>
+            <Tooltip title="升级工单">
+                <IconButton size="small" onClick={handleEscalate} color="warning">
+                    <ArrowUpward fontSize="small" />
+                </IconButton>
+            </Tooltip>
+            <Tooltip title="状态变更">
+                <IconButton size="small" onClick={handleStatusChange} color="success">
+                    <SwapHoriz fontSize="small" />
+                </IconButton>
+            </Tooltip>
+            <ShowButton label="" />
+            <EditButton label="" />
+        </Box>
     );
 };
 
@@ -292,6 +401,7 @@ const TicketFilters = [
  */
 const TicketListActions = () => (
     <TopToolbar>
+        <SelectColumnsButton />
         <FilterButton />
         <CreateButton label="创建工单" />
         <ExportButton label="导出" />
@@ -304,7 +414,7 @@ const TicketListActions = () => (
 const TicketBulkActionButtons = () => (
     <>
         <TicketBulkUpdateButton />
-        <BulkDeleteWithConfirmButton label="批量删除" />
+        <BulkDeleteWithConfirmButton label="批量删除" mutationMode="pessimistic" />
     </>
 );
 
@@ -337,28 +447,50 @@ const TicketListEnhanced: React.FC = () => {
             sort={{ field: 'created_at', order: 'DESC' }}
             title="工单管理"
         >
-            <Datagrid
+            <DatagridConfigurable
                 bulkActionButtons={<TicketBulkActionButtons />}
+                rowClick="show"
                 sx={{
                     '& .RaDatagrid-table': {
-                        '& .RaDatagrid-tbody .RaDatagrid-row': {
+                        tableLayout: 'auto',
+                        width: '100%',
+                        borderCollapse: 'separate',
+                        '& .RaDatagrid-headerCell': {
+                            backgroundColor: '#f8fafc',
+                            fontWeight: 600,
+                            fontSize: '0.8rem',
+                            padding: '12px 8px',
+                            whiteSpace: 'nowrap',
+                            borderBottom: '2px solid #e2e8f0',
+                            verticalAlign: 'middle',
+                            position: 'relative',
+                            resize: 'horizontal',
+                            overflow: 'hidden',
                             '&:hover': {
-                                backgroundColor: '#f8fafc',
-                            },
-                            // 高亮紧急工单
-                            '&[data-record-priority="urgent"], &[data-record-priority="critical"]': {
-                                backgroundColor: '#fef2f2',
-                                '&:hover': {
-                                    backgroundColor: '#fecaca',
-                                },
-                            },
-                            // 高亮逾期工单
-                            '&[data-record-is_overdue="true"]': {
-                                backgroundColor: '#fff7ed',
-                                '&:hover': {
-                                    backgroundColor: '#fed7aa',
-                                },
-                            },
+                                backgroundColor: '#f1f5f9',
+                            }
+                        },
+                        '& .RaDatagrid-rowCell': {
+                            padding: '8px',
+                            fontSize: '0.85rem',
+                            borderBottom: '1px solid #f1f5f9',
+                            verticalAlign: 'middle',
+                        },
+                        '& .RaDatagrid-row:hover': {
+                            backgroundColor: '#f8fafc',
+                        },
+                        // 勾选框列固定宽度
+                        '& .RaDatagrid-headerCell:first-of-type, & .RaDatagrid-rowCell:first-of-type': {
+                            width: 48,
+                            minWidth: 48,
+                            maxWidth: 48,
+                            resize: 'none',
+                        },
+                        // 工单信息列
+                        '& .RaDatagrid-headerCell:nth-of-type(2), & .RaDatagrid-rowCell:nth-of-type(2)': {
+                            minWidth: 160,
+                            maxWidth: 300,
+                            // 移除 maxWidth 限制或者设大一点以便调整
                         },
                     },
                 }}
@@ -379,7 +511,7 @@ const TicketListEnhanced: React.FC = () => {
                 </WrapperField>
 
                 {/* 类型 */}
-                <TextField source="type" label="类型" />
+                <SelectField source="type" label="类型" choices={typeChoices} />
 
                 {/* 标签 */}
                 <WrapperField label="标签">
@@ -400,9 +532,9 @@ const TicketListEnhanced: React.FC = () => {
                 </WrapperField>
 
                 {/* 分类 */}
-                <ReferenceField 
-                    source="category_id" 
-                    reference="categories" 
+                <ReferenceField
+                    source="category_id"
+                    reference="categories"
                     label="分类"
                     emptyText="--"
                 >
@@ -410,42 +542,28 @@ const TicketListEnhanced: React.FC = () => {
                 </ReferenceField>
 
                 {/* 创建时间 */}
-                <DateField 
-                    source="created_at" 
-                    label="创建时间"
+                <DateField
+                    source="created_at"
+                    label="创建"
                     showTime
                     locales="zh-CN"
-                    options={{
-                        month: 'short',
-                        day: 'numeric',
-                        hour: '2-digit',
-                        minute: '2-digit',
-                    }}
+                    options={{ month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }}
                 />
 
                 {/* 截止时间 */}
-                <DateField 
-                    source="due_date" 
-                    label="截止时间"
-                    emptyText="--"
+                <DateField
+                    source="due_date"
+                    label="截止"
+                    emptyText="-"
                     locales="zh-CN"
-                    options={{
-                        month: 'short',
-                        day: 'numeric',
-                        hour: '2-digit',
-                        minute: '2-digit',
-                    }}
+                    options={{ month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }}
                 />
 
-                {/* 工作流操作 */}
+                {/* 操作 */}
                 <WrapperField label="操作">
-                    <Box sx={{ display: 'flex', gap: 0.5 }}>
-                        <TicketWorkflowActions />
-                        <ShowButton label="" />
-                        <EditButton label="" />
-                    </Box>
+                    <QuickActionsField />
                 </WrapperField>
-            </Datagrid>
+            </DatagridConfigurable>
         </List>
     );
 };

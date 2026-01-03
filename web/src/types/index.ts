@@ -108,6 +108,7 @@ export interface Ticket {
   closed_at?: string
   first_reply_at?: string
   sla_breached?: boolean
+  is_overdue?: boolean
   sla_due_date?: string
   response_time?: number
   resolution_time?: number
@@ -312,7 +313,7 @@ export interface TicketStats {
 }
 
 // 工单历史记录类型
-export type HistoryAction = 
+export type HistoryAction =
   | 'create'
   | 'update'
   | 'status_change'

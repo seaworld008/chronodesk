@@ -1,9 +1,9 @@
 package models
 
 import (
-	"encoding/json"
-	"strings"
 	"time"
+
+	"gorm.io/datatypes"
 )
 
 // TicketStatus 工单状态枚举
@@ -78,11 +78,11 @@ type Ticket struct {
 	AssignedTo   *User `json:"assigned_to,omitempty" gorm:"foreignKey:AssignedToID"`
 
 	// 分类和标签
-	CategoryID    *uint     `json:"category_id,omitempty" gorm:"index"`
-	Category      *Category `json:"category,omitempty" gorm:"foreignKey:CategoryID"`
-	SubcategoryID *uint     `json:"subcategory_id,omitempty" gorm:"index"`
-	Subcategory   *Category `json:"subcategory,omitempty" gorm:"foreignKey:SubcategoryID"`
-	Tags          string    `json:"tags" gorm:"type:text"` // JSON格式存储标签列表
+	CategoryID    *uint                       `json:"category_id,omitempty" gorm:"index"`
+	Category      *Category                   `json:"category,omitempty" gorm:"foreignKey:CategoryID"`
+	SubcategoryID *uint                       `json:"subcategory_id,omitempty" gorm:"index"`
+	Subcategory   *Category                   `json:"subcategory,omitempty" gorm:"foreignKey:SubcategoryID"`
+	Tags          datatypes.JSONSlice[string] `json:"tags" gorm:"type:jsonb"` // JSONB格式存储标签列表
 
 	// 时间跟踪
 	DueDate      *time.Time `json:"due_date,omitempty"`
@@ -102,9 +102,9 @@ type Ticket struct {
 	CustomerName  string `json:"customer_name" gorm:"size:100"`
 
 	// 附加信息
-	Attachments   string `json:"attachments" gorm:"type:text"`    // JSON格式存储附件列表
-	CustomFields  string `json:"custom_fields" gorm:"type:text"`  // JSON格式存储自定义字段
-	InternalNotes string `json:"internal_notes" gorm:"type:text"` // 内部备注
+	Attachments   datatypes.JSONSlice[string]        `json:"attachments" gorm:"type:jsonb"`   // JSONB格式存储附件列表
+	CustomFields  datatypes.JSONType[map[string]any] `json:"custom_fields" gorm:"type:jsonb"` // JSONB格式存储自定义字段
+	InternalNotes string                             `json:"internal_notes" gorm:"type:text"` // 内部备注
 
 	// 统计信息
 	ViewCount     int    `json:"view_count" gorm:"default:0"`
@@ -302,44 +302,10 @@ func (t *Ticket) ToResponse() *TicketResponse {
 		response.Subcategory = t.Subcategory.ToResponse()
 	}
 
-	// 解析JSON字段
-	response.Tags = parseStringSliceFromJSON(t.Tags)
-	response.Attachments = parseStringSliceFromJSON(t.Attachments)
-	response.CustomFields = parseCustomFieldsFromJSON(t.CustomFields)
+	// 直接使用JSONB类型字段（无需手动解析）
+	response.Tags = t.Tags
+	response.Attachments = t.Attachments
+	response.CustomFields = t.CustomFields.Data()
 
 	return response
-}
-
-func parseStringSliceFromJSON(raw string) []string {
-	if strings.TrimSpace(raw) == "" {
-		return []string{}
-	}
-
-	var values []string
-	if err := json.Unmarshal([]byte(raw), &values); err != nil {
-		return []string{}
-	}
-
-	result := make([]string, 0, len(values))
-	for _, item := range values {
-		trimmed := strings.TrimSpace(item)
-		if trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-
-	return result
-}
-
-func parseCustomFieldsFromJSON(raw string) map[string]interface{} {
-	if strings.TrimSpace(raw) == "" {
-		return map[string]interface{}{}
-	}
-
-	var data map[string]interface{}
-	if err := json.Unmarshal([]byte(raw), &data); err != nil {
-		return map[string]interface{}{}
-	}
-
-	return data
 }

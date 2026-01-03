@@ -12,6 +12,7 @@ import (
 
 	"gongdan-system/internal/models"
 
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -229,20 +230,6 @@ func (s *TicketService) GetTicket(ctx context.Context, id uint) (*models.Ticket,
 
 // CreateTicket creates a new ticket
 func (s *TicketService) CreateTicket(ctx context.Context, req *models.TicketCreateRequest, userID uint) (*models.Ticket, error) {
-	// Convert tags to JSON string
-	tagsJSON := ""
-	if len(req.Tags) > 0 {
-		tagsBytes, _ := json.Marshal(req.Tags)
-		tagsJSON = string(tagsBytes)
-	}
-
-	// Convert custom fields to JSON string
-	customFieldsJSON := ""
-	if req.CustomFields != nil {
-		customFieldsBytes, _ := json.Marshal(req.CustomFields)
-		customFieldsJSON = string(customFieldsBytes)
-	}
-
 	// Generate unique ticket number
 	ticketNumber := s.generateTicketNumber()
 
@@ -262,13 +249,17 @@ func (s *TicketService) CreateTicket(ctx context.Context, req *models.TicketCrea
 		Type:          req.Type,
 		Source:        req.Source,
 		CreatedByID:   userID,
-		Tags:          tagsJSON,
-		CustomFields:  customFieldsJSON,
+		Tags:          datatypes.JSONSlice[string](req.Tags), // 转换类型，GORM自动处理JSONB序列化
 		CustomerEmail: req.CustomerEmail,
 		CustomerPhone: req.CustomerPhone,
 		CustomerName:  req.CustomerName,
 		CreatedAt:     now,
 		UpdatedAt:     now,
+	}
+
+	// 设置 CustomFields
+	if req.CustomFields != nil {
+		ticket.CustomFields = datatypes.NewJSONType(req.CustomFields.ToMap())
 	}
 
 	if status == models.TicketStatusResolved && ticket.ResolvedAt == nil {
@@ -457,12 +448,10 @@ func (s *TicketService) UpdateTicket(ctx context.Context, id uint, req *models.T
 		ticket.DueDate = req.DueDate
 	}
 	if req.Tags != nil {
-		tagsBytes, _ := json.Marshal(req.Tags)
-		ticket.Tags = string(tagsBytes)
+		ticket.Tags = datatypes.JSONSlice[string](req.Tags) // 转换类型
 	}
 	if req.CustomFields != nil {
-		customFieldsBytes, _ := json.Marshal(req.CustomFields)
-		ticket.CustomFields = string(customFieldsBytes)
+		ticket.CustomFields = datatypes.NewJSONType(req.CustomFields.ToMap())
 	}
 
 	ticket.UpdatedAt = time.Now()
