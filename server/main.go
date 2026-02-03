@@ -298,27 +298,10 @@ func main() {
 	if cfg.JWT.Secret != "" {
 		middlewareConfig.JWT.SecretKey = cfg.JWT.Secret
 	}
+	middlewareConfig.CORS = buildCORSConfig(cfg)
 
 	// 应用基础中间件（不包含JWT）
-	r.Use(gin.Logger())
-	r.Use(gin.Recovery())
-
-	// 添加CORS中间件
-	r.Use(func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Origin, Content-Length, Content-Type, Authorization, Accept, Accept-Encoding, Accept-Language, X-Requested-With, X-CSRF-Token, X-Request-ID")
-		c.Header("Access-Control-Allow-Credentials", "true")
-		c.Header("Access-Control-Expose-Headers", "Content-Length, X-Request-ID, X-Response-Time")
-		c.Header("Access-Control-Max-Age", "86400")
-
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(http.StatusNoContent)
-			return
-		}
-
-		c.Next()
-	})
+	r.Use(middleware.WrapGinMiddlewares(middleware.SetupMiddlewares(middlewareConfig))...)
 
 	// 健康检查端点
 	r.GET("/healthz", func(c *gin.Context) {
@@ -717,4 +700,28 @@ func getTicketStatsCacheTTL() time.Duration {
 		}
 	}
 	return ttl
+}
+
+func buildCORSConfig(cfg *config.Config) *middleware.CORSConfig {
+	corsConfig := &middleware.CORSConfig{
+		AllowOrigins:     cfg.CORS.AllowedOrigins,
+		AllowMethods:     cfg.CORS.AllowedMethods,
+		AllowHeaders:     cfg.CORS.AllowedHeaders,
+		ExposeHeaders:    []string{"Content-Length", "X-Request-ID", "X-Response-Time"},
+		AllowCredentials: true,
+		MaxAge:           86400,
+	}
+	if cfg.Server.Environment != "production" || containsOrigin(cfg.CORS.AllowedOrigins, "*") {
+		corsConfig.AllowAllOrigins = true
+	}
+	return corsConfig
+}
+
+func containsOrigin(origins []string, target string) bool {
+	for _, origin := range origins {
+		if strings.TrimSpace(origin) == target {
+			return true
+		}
+	}
+	return false
 }
