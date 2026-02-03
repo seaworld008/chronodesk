@@ -65,6 +65,7 @@ const EmailSettings: React.FC = () => {
   const [config, setConfig] = useState<EmailForm | null>(null)
   const [originalConfig, setOriginalConfig] = useState<EmailForm | null>(null)
   const [testForm, setTestForm] = useState<TestForm>(defaultTestForm)
+  const shouldSkipSMTPTest = import.meta.env.DEV || import.meta.env.VITE_DEV_MODE === 'true'
 
   const extractErrorMessage = useCallback((error: unknown, fallback: string) => {
     if (error instanceof Error) {
@@ -115,6 +116,7 @@ const EmailSettings: React.FC = () => {
         welcome_email_template: config.welcome_email_template,
         otp_email_subject: config.otp_email_subject,
         otp_email_template: config.otp_email_template,
+        skip_smtp_test: shouldSkipSMTPTest,
       }
 
       if (config.smtp_password && config.smtp_password.trim() !== '') {

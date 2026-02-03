@@ -86,6 +86,7 @@ type EmailConfigUpdateRequest struct {
 	WelcomeEmailTemplate     *string `json:"welcome_email_template"`
 	OTPEmailSubject          *string `json:"otp_email_subject"`
 	OTPEmailTemplate         *string `json:"otp_email_template"`
+	SkipSMTPTest             *bool   `json:"skip_smtp_test"`
 }
 
 // EmailConfigResponse 邮箱配置响应

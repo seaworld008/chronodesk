@@ -109,9 +109,12 @@ func (s *EmailConfigService) UpdateEmailConfig(ctx context.Context, req *models.
 			return nil, errors.New("SMTP配置不完整，无法启用邮箱验证")
 		}
 
-		// 测试SMTP连接
-		if err := s.testSMTPConnection(config); err != nil {
-			return nil, fmt.Errorf("SMTP连接测试失败: %w", err)
+		skipSMTPTest := req.SkipSMTPTest != nil && *req.SkipSMTPTest
+		if !skipSMTPTest {
+			// 测试SMTP连接
+			if err := s.testSMTPConnection(config); err != nil {
+				return nil, fmt.Errorf("SMTP连接测试失败: %w", err)
+			}
 		}
 	}
 
