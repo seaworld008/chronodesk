@@ -768,73 +768,55 @@ func (s *TicketService) GetTicketStatistics(userID uint, role string) (*TicketSt
 		ByCategory: make(map[string]int64),
 	}
 
+	now := time.Now()
 	query := s.db.Model(&models.Ticket{})
-
 	if role == "agent" {
 		query = query.Where("assigned_to_id = ?", userID)
 	}
 
-	if err := query.Count(&stats.Total).Error; err != nil {
-		return nil, fmt.Errorf("failed to count total tickets: %w", err)
+	var aggregated struct {
+		Total        int64
+		Open         int64
+		InProgress   int64
+		Pending      int64
+		Resolved     int64
+		Closed       int64
+		Overdue      int64
+		Unassigned   int64
+		HighPriority int64
+		SLABreached  int64
+		Escalated    int64
 	}
 
-	statusCounts := []struct {
-		Status string
-		Count  int64
-	}{}
+	if err := query.Select(`
+		COUNT(*) AS total,
+		SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open,
+		SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) AS in_progress,
+		SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+		SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) AS resolved,
+		SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed,
+		SUM(CASE WHEN due_date < ? AND status NOT IN ('resolved','closed') THEN 1 ELSE 0 END) AS overdue,
+		SUM(CASE WHEN assigned_to_id IS NULL THEN 1 ELSE 0 END) AS unassigned,
+		SUM(CASE WHEN priority IN ('high','urgent') THEN 1 ELSE 0 END) AS high_priority,
+		SUM(CASE WHEN sla_breached = true THEN 1 ELSE 0 END) AS sla_breached,
+		SUM(CASE WHEN is_escalated = true THEN 1 ELSE 0 END) AS escalated
+	`, now).Scan(&aggregated).Error; err != nil {
+		return nil, fmt.Errorf("failed to aggregate ticket statistics: %w", err)
+	}
 
-	statusQuery := s.db.Model(&models.Ticket{})
+	stats.Total = aggregated.Total
+	stats.Open = aggregated.Open
+	stats.InProgress = aggregated.InProgress
+	stats.Pending = aggregated.Pending
+	stats.Resolved = aggregated.Resolved
+	stats.Closed = aggregated.Closed
+	stats.Overdue = aggregated.Overdue
+	stats.Unassigned = aggregated.Unassigned
+	stats.HighPriority = aggregated.HighPriority
+	stats.SLABreached = aggregated.SLABreached
+	stats.Escalated = aggregated.Escalated
 	if role == "agent" {
-		statusQuery = statusQuery.Where("assigned_to_id = ?", userID)
-	}
-
-	if err := statusQuery.
-		Select("status, count(*) as count").
-		Group("status").
-		Find(&statusCounts).Error; err != nil {
-		return nil, fmt.Errorf("failed to get status statistics: %w", err)
-	}
-
-	for _, sc := range statusCounts {
-		switch sc.Status {
-		case "open":
-			stats.Open = sc.Count
-		case "in_progress":
-			stats.InProgress = sc.Count
-		case "pending":
-			stats.Pending = sc.Count
-		case "resolved":
-			stats.Resolved = sc.Count
-		case "closed":
-			stats.Closed = sc.Count
-		}
-	}
-
-	now := time.Now()
-	if err := s.db.Model(&models.Ticket{}).
-		Where("due_date < ? AND status NOT IN (?, ?)", now, models.TicketStatusResolved, models.TicketStatusClosed).
-		Count(&stats.Overdue).Error; err != nil {
-		return nil, fmt.Errorf("failed to count overdue tickets: %w", err)
-	}
-
-	if err := s.db.Model(&models.Ticket{}).
-		Where("assigned_to_id IS NULL").
-		Count(&stats.Unassigned).Error; err != nil {
-		return nil, fmt.Errorf("failed to count unassigned tickets: %w", err)
-	}
-
-	if err := s.db.Model(&models.Ticket{}).
-		Where("priority IN (?, ?)", models.TicketPriorityHigh, models.TicketPriorityUrgent).
-		Count(&stats.HighPriority).Error; err != nil {
-		return nil, fmt.Errorf("failed to count high priority tickets: %w", err)
-	}
-
-	if role == "agent" {
-		if err := s.db.Model(&models.Ticket{}).
-			Where("assigned_to_id = ?", userID).
-			Count(&stats.MyTickets).Error; err != nil {
-			return nil, fmt.Errorf("failed to count my tickets: %w", err)
-		}
+		stats.MyTickets = stats.Total
 	}
 
 	priorityCounts := []struct {
