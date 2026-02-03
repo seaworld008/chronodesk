@@ -5,7 +5,6 @@ import (
     "testing"
     "time"
 
-    "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 
     "gongdan-system/internal/models"
@@ -14,16 +13,7 @@ import (
 func setupFilterTestDB(t *testing.T) *gorm.DB {
     t.Helper()
 
-    db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-    if err != nil {
-        t.Fatalf("failed to open sqlite db: %v", err)
-    }
-
-    sqlDB, err := db.DB()
-    if err != nil {
-        t.Fatalf("failed to get sql db: %v", err)
-    }
-    sqlDB.SetMaxOpenConns(1)
+    db := openTestDB(t)
 
     if err := db.AutoMigrate(&models.User{}, &models.Ticket{}, &models.TicketComment{}); err != nil {
         t.Fatalf("failed to migrate: %v", err)

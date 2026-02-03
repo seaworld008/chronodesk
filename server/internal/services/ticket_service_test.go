@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"gongdan-system/internal/models"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
@@ -14,10 +13,7 @@ import (
 func setupTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("failed to open sqlite memory db: %v", err)
-	}
+	db := openTestDB(t)
 
 	if err := db.AutoMigrate(&models.User{}, &models.Ticket{}, &models.TicketComment{}); err != nil {
 		t.Fatalf("failed to migrate schemas: %v", err)

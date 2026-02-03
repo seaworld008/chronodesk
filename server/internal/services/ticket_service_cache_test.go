@@ -6,7 +6,6 @@ import (
     "testing"
     "time"
 
-    "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 
     "gongdan-system/internal/models"
@@ -71,10 +70,7 @@ var _ StatsCache = (*fakeRedis)(nil)
 func setupCacheTestDB(t *testing.T) *gorm.DB {
     t.Helper()
 
-    db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-    if err != nil {
-        t.Fatalf("failed to open sqlite db: %v", err)
-    }
+    db := openTestDB(t)
 
     if err := db.AutoMigrate(&models.User{}, &models.Ticket{}, &models.TicketComment{}); err != nil {
         t.Fatalf("failed to migrate: %v", err)
