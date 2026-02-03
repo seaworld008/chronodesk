@@ -62,6 +62,9 @@ type TicketFilters struct {
 	Tags       []string
 	AssigneeID *uint
 	CreatorID  *uint
+	SLABreached *bool
+	IsOverdue   *bool
+	Unassigned  *bool
 	Search     string
 	Page       int
 	Limit      int
@@ -160,6 +163,24 @@ func (s *TicketService) GetTickets(ctx context.Context, filters TicketFilters) (
 				continue
 			}
 			query = query.Where("tags::jsonb ? ?", trimmed)
+		}
+	}
+	if filters.SLABreached != nil {
+		query = query.Where("sla_breached = ?", *filters.SLABreached)
+	}
+	if filters.IsOverdue != nil {
+		now := time.Now()
+		if *filters.IsOverdue {
+			query = query.Where("due_date < ? AND status NOT IN (?, ?)", now, models.TicketStatusResolved, models.TicketStatusClosed)
+		} else {
+			query = query.Where("(due_date IS NULL OR due_date >= ?) OR status IN (?, ?)", now, models.TicketStatusResolved, models.TicketStatusClosed)
+		}
+	}
+	if filters.Unassigned != nil {
+		if *filters.Unassigned {
+			query = query.Where("assigned_to_id IS NULL")
+		} else {
+			query = query.Where("assigned_to_id IS NOT NULL")
 		}
 	}
 

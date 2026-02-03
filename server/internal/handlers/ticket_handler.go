@@ -42,6 +42,9 @@ func (h *TicketHandler) GetTickets(c *gin.Context) {
 	search := c.Query("search")
 	sortBy := c.DefaultQuery("sort_by", "created_at")
 	sortOrder := c.DefaultQuery("sort_order", "desc")
+	slaBreached := strings.TrimSpace(c.Query("sla_breached"))
+	isOverdue := strings.TrimSpace(c.Query("is_overdue"))
+	unassigned := strings.TrimSpace(c.Query("unassigned"))
 
 	var tagsFilter []string
 
@@ -77,6 +80,22 @@ func (h *TicketHandler) GetTickets(c *gin.Context) {
 			if len(tagsFilter) == 0 {
 				tagsFilter = extractFilterStrings(filterMap["tag"])
 			}
+
+			if slaBreached == "" {
+				if value, ok := parseFilterBool(filterMap["sla_breached"]); ok {
+					slaBreached = strconv.FormatBool(value)
+				}
+			}
+			if isOverdue == "" {
+				if value, ok := parseFilterBool(filterMap["is_overdue"]); ok {
+					isOverdue = strconv.FormatBool(value)
+				}
+			}
+			if unassigned == "" {
+				if value, ok := parseFilterBool(filterMap["unassigned"]); ok {
+					unassigned = strconv.FormatBool(value)
+				}
+			}
 		}
 	}
 
@@ -91,6 +110,15 @@ func (h *TicketHandler) GetTickets(c *gin.Context) {
 		Tags:      tagsFilter,
 		SortBy:    sortBy,
 		SortOrder: sortOrder,
+	}
+	if parsed, ok := parseBoolPtr(slaBreached); ok {
+		filters.SLABreached = parsed
+	}
+	if parsed, ok := parseBoolPtr(isOverdue); ok {
+		filters.IsOverdue = parsed
+	}
+	if parsed, ok := parseBoolPtr(unassigned); ok {
+		filters.Unassigned = parsed
 	}
 
 	if assignedTo != "" {
@@ -154,6 +182,35 @@ func extractFilterStrings(value interface{}) []string {
 		return result
 	default:
 		return nil
+	}
+}
+
+func parseBoolPtr(value string) (*bool, bool) {
+	if value == "" {
+		return nil, false
+	}
+	parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+	if err != nil {
+		return nil, false
+	}
+	return &parsed, true
+}
+
+func parseFilterBool(value interface{}) (bool, bool) {
+	if value == nil {
+		return false, false
+	}
+	switch v := value.(type) {
+	case bool:
+		return v, true
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(v))
+		if err != nil {
+			return false, false
+		}
+		return parsed, true
+	default:
+		return false, false
 	}
 }
 
