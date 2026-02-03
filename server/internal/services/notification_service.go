@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -49,6 +50,7 @@ type NotificationService struct {
 	db                      *gorm.DB
 	client                  *http.Client
 	emailNotificationService EmailNotificationServiceInterface
+	webhookMaxConcurrent    int
 }
 
 // NewNotificationService 创建通知服务实例
@@ -58,6 +60,7 @@ func NewNotificationService(db *gorm.DB) *NotificationService {
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		webhookMaxConcurrent: getWebhookMaxConcurrent(),
 	}
 }
 
@@ -94,10 +97,27 @@ func (ns *NotificationService) SendNotification(ctx context.Context, event *Noti
 
 	// 2. 并发发送通知
 	errChan := make(chan error, len(configs))
+	maxConcurrent := ns.webhookMaxConcurrent
+	if maxConcurrent <= 0 {
+		maxConcurrent = 5
+	}
+	sem := make(chan struct{}, maxConcurrent)
 	
 	for _, config := range configs {
+		sem <- struct{}{}
 		go func(cfg *models.WebhookConfig) {
-			if err := ns.sendWebhook(ctx, cfg, event); err != nil {
+			defer func() { <-sem }()
+			retries := cfg.RetryCount + 1
+			if retries < 1 {
+				retries = 1
+			}
+			baseInterval := time.Duration(cfg.RetryInterval) * time.Second
+			if baseInterval <= 0 {
+				baseInterval = time.Second
+			}
+			if err := runWithRetry(func() error {
+				return ns.sendWebhook(ctx, cfg, event)
+			}, retries, baseInterval); err != nil {
 				errChan <- fmt.Errorf("webhook %s 发送失败: %w", cfg.Name, err)
 			} else {
 				errChan <- nil
@@ -118,6 +138,32 @@ func (ns *NotificationService) SendNotification(ctx context.Context, event *Noti
 	}
 
 	return nil
+}
+
+func runWithRetry(send func() error, maxAttempts int, baseInterval time.Duration) error {
+	var err error
+	if maxAttempts <= 0 {
+		return send()
+	}
+	for i := 0; i < maxAttempts; i++ {
+		err = send()
+		if err == nil {
+			return nil
+		}
+		if i < maxAttempts-1 && baseInterval > 0 {
+			time.Sleep(baseInterval * time.Duration(1<<i))
+		}
+	}
+	return err
+}
+
+func getWebhookMaxConcurrent() int {
+	if raw := os.Getenv("WEBHOOK_MAX_CONCURRENT"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return 5
 }
 
 // getActiveWebhooks 获取活跃的webhook配置
