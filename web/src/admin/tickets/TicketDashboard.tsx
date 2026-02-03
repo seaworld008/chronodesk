@@ -144,7 +144,26 @@ const rowSx = {
 const SMALL_CARD_RATIOS: number[] = [1, 1, 1]
 const DYNAMIC_SECTION_RATIOS: number[] = [1, 1]
 
-const renderActiveShape = (props: any) => {
+type PieActiveShapeProps = {
+  cx: number
+  cy: number
+  innerRadius: number
+  outerRadius: number
+  startAngle: number
+  endAngle: number
+  fill?: string
+}
+
+type PieLabelProps = {
+  name: string
+  value: number
+  percent: number
+  cx: number
+  x: number
+  y: number
+}
+
+const renderActiveShape = (props: PieActiveShapeProps) => {
   const { cx, cy, innerRadius, outerRadius, startAngle, endAngle, fill } = props
   return (
     <g>
@@ -187,7 +206,7 @@ export const TicketDashboard: React.FC = () => {
   const [refreshKey, setRefreshKey] = useState(0)
   const [activeIndex, setActiveIndex] = useState(0)
 
-  const onPieEnter = useCallback((_: any, index: number) => {
+  const onPieEnter = useCallback((_: unknown, index: number) => {
     setActiveIndex(index)
   }, [])
 
@@ -262,20 +281,6 @@ export const TicketDashboard: React.FC = () => {
     },
     [navigate]
   )
-
-  const getPriorityColor = (priority: string): ChipProps['color'] => {
-    switch (priority) {
-      case 'critical':
-      case 'urgent':
-        return 'error'
-      case 'high':
-        return 'warning'
-      case 'normal':
-        return 'primary'
-      default:
-        return 'default'
-    }
-  }
 
   const getStatusColor = (status: string): ChipProps['color'] => {
     switch (status) {
@@ -608,7 +613,7 @@ export const TicketDashboard: React.FC = () => {
                         activeIndex={activeIndex}
                         activeShape={renderActiveShape}
                         onMouseEnter={onPieEnter}
-                        label={({ name, value, percent, cx, x, y }: any) => {
+                        label={({ name, value, percent, cx, x, y }: PieLabelProps) => {
                           return (
                             <text x={x} y={y} fill="#666" textAnchor={x > cx ? 'start' : 'end'} dominantBaseline="central">
                               <tspan x={x} dy="-0.5em" fontSize="10" fontWeight="bold">{name}</tspan>

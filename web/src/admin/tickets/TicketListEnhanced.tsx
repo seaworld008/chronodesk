@@ -41,12 +41,6 @@ import TicketBulkUpdateButton from './TicketBulkUpdateButton';
 import { parseTagsToArray } from './tagUtils';
 import { Ticket } from '@/types';
 
-type PriorityConfig = {
-    color: ChipProps['color'];
-    icon: React.ReactNode;
-    bgColor: string;
-};
-
 // 过滤器选项
 const statusChoices = [
     { id: 'open', name: '待处理' },
