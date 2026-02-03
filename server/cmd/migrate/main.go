@@ -181,6 +181,9 @@ func createIndexes(db *gorm.DB) error {
 		Name  string
 		SQL   string
 	}{
+		// Extensions
+		{"extensions", "ext_pg_trgm", "CREATE EXTENSION IF NOT EXISTS pg_trgm"},
+
 		// User indexes
 		{"users", "idx_users_email", "CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)"},
 		{"users", "idx_users_role", "CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)"},
@@ -197,6 +200,9 @@ func createIndexes(db *gorm.DB) error {
 		{"tickets", "idx_tickets_assigned_to", "CREATE INDEX IF NOT EXISTS idx_tickets_assigned_to ON tickets(assigned_to_id)"},
 		{"tickets", "idx_tickets_category", "CREATE INDEX IF NOT EXISTS idx_tickets_category ON tickets(category_id)"},
 		{"tickets", "idx_tickets_created_at", "CREATE INDEX IF NOT EXISTS idx_tickets_created_at ON tickets(created_at DESC)"},
+		{"tickets", "idx_tickets_title_trgm", "CREATE INDEX IF NOT EXISTS idx_tickets_title_trgm ON tickets USING gin (title gin_trgm_ops)"},
+		{"tickets", "idx_tickets_description_trgm", "CREATE INDEX IF NOT EXISTS idx_tickets_description_trgm ON tickets USING gin (description gin_trgm_ops)"},
+		{"tickets", "idx_tickets_tags_gin", "CREATE INDEX IF NOT EXISTS idx_tickets_tags_gin ON tickets USING gin (tags)"},
 
 		// Composite indexes for common queries
 		{"tickets", "idx_tickets_status_priority", "CREATE INDEX IF NOT EXISTS idx_tickets_status_priority ON tickets(status, priority)"},

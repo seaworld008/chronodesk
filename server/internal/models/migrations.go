@@ -550,6 +550,10 @@ CREATE INDEX IF NOT EXISTS idx_otp_codes_user_type_status ON otp_codes(user_id, 
 CREATE INDEX IF NOT EXISTS idx_otp_codes_expires_status ON otp_codes(expires_at, status);
 
 -- 全文搜索索引
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX IF NOT EXISTS idx_tickets_title_trgm ON tickets USING gin (title gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_tickets_description_trgm ON tickets USING gin (description gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_tickets_tags_gin ON tickets USING gin (tags);
 CREATE INDEX IF NOT EXISTS idx_tickets_title_gin ON tickets USING gin(to_tsvector('english', title));
 CREATE INDEX IF NOT EXISTS idx_tickets_description_gin ON tickets USING gin(to_tsvector('english', description));
 CREATE INDEX IF NOT EXISTS idx_ticket_comments_content_gin ON ticket_comments USING gin(to_tsvector('english', content));
