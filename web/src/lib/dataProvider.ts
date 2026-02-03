@@ -81,6 +81,58 @@ const handleHttpError = (error: unknown): never => {
     throw new HttpError(message, 500, {})
 }
 
+const extractResponseData = (json: unknown): unknown => {
+    if (isRecord(json)) {
+        if (json.code === 0 && 'data' in json) {
+            return json.data
+        }
+        if ('data' in json) {
+            return json.data
+        }
+    }
+    return json
+}
+
+const parseListResponse = (resource: string, json: unknown, headers: Headers) => {
+    if (isRecord(json) && resource === 'automation-logs' && isRecord(json.data) && Array.isArray(json.data.logs)) {
+        const data = json.data.logs
+        const total = (json.data.total as number | undefined) ?? data.length
+        return { data, total }
+    }
+
+    if (isRecord(json) && resource === 'automation-rules' && isRecord(json.data) && Array.isArray(json.data.rules)) {
+        const data = json.data.rules
+        const total = (json.data.total as number | undefined) ?? data.length
+        return { data, total }
+    }
+
+    const payload = extractResponseData(json)
+
+    if (isRecord(payload) && Array.isArray(payload.items)) {
+        const data = payload.items
+        const total =
+            (payload.total as number | undefined) ||
+            (payload.count as number | undefined) ||
+            data.length
+        return { data, total }
+    }
+
+    if (Array.isArray(payload)) {
+        const data = payload
+        const total =
+            (isRecord(json) ? (json.total as number | undefined) || (json.count as number | undefined) : undefined) ??
+            getTotalFromHeaders(headers, data.length)
+        return { data, total }
+    }
+
+    if (isRecord(payload)) {
+        return { data: [payload], total: 1 }
+    }
+
+    console.warn(`Unexpected response format for resource ${resource}:`, json)
+    return { data: [], total: 0 }
+}
+
 export const dataProvider: DataProvider = {
     // 获取资源列表
     getList: async (resource, params) => {
@@ -258,49 +310,7 @@ export const dataProvider: DataProvider = {
         const url = `${apiUrl}/${apiPath}?${queryString.stringify(query)}`;
         const { json, headers } = await httpClient(url);
 
-        // 处理不同的响应格式
-        let data: unknown[] = [];
-        let total = 0;
-
-        if (isRecord(json) && resource === 'automation-logs' && isRecord(json.data) && Array.isArray(json.data.logs)) {
-            data = json.data.logs;
-            total = (json.data.total as number | undefined) ?? data.length;
-        } else if (isRecord(json) && resource === 'automation-rules' && isRecord(json.data) && Array.isArray(json.data.rules)) {
-            data = json.data.rules;
-            total = (json.data.total as number | undefined) ?? data.length;
-        } else if (isRecord(json) && json.code === 0 && json.data) {
-            // Go API标准响应格式: {code: 0, data: {items: [...], total: number}}
-            if (isRecord(json.data) && Array.isArray(json.data.items)) {
-                data = json.data.items;
-                total = (json.data.total as number | undefined) || (json.data.count as number | undefined) || data.length;
-            } else if (Array.isArray(json.data)) {
-                // 直接数组在data字段中: {code: 0, data: [...]}
-                data = json.data;
-                total = (json.total as number | undefined) || (json.count as number | undefined) || data.length;
-            } else {
-                // 其他嵌套格式
-                data = [json.data];
-                total = 1;
-            }
-        } else if (isRecord(json) && json.data && Array.isArray(json.data)) {
-            // 旧格式支持: {data: [...], total: number}
-            data = json.data;
-            total = (json.total as number | undefined) || (json.count as number | undefined) || data.length;
-        } else if (Array.isArray(json)) {
-            // 直接数组格式
-            data = json;
-            total = getTotalFromHeaders(headers, data.length);
-        } else {
-            // 其他格式的错误处理
-            console.warn(`Unexpected response format for resource ${resource}:`, json);
-            data = [];
-            total = 0;
-        }
-
-        return {
-            data,
-            total,
-        };
+        return parseListResponse(resource, json, headers);
     },
 
     // 获取单个资源
@@ -315,13 +325,7 @@ export const dataProvider: DataProvider = {
         const url = `${apiUrl}/${apiPath}/${params.id}`;
         const { json } = await httpClient(url);
         
-        // 处理不同响应格式
-        if (json.code === 0 && json.data) {
-            return { data: json.data };
-        } else if (json.data) {
-            return { data: json.data };
-        }
-        return { data: json };
+        return { data: extractResponseData(json) };
     },
 
     // 获取多个资源
@@ -341,22 +345,17 @@ export const dataProvider: DataProvider = {
         const url = `${apiUrl}/${apiPath}?${queryString.stringify(query)}`;
         const { json } = await httpClient(url);
         
-        let data = [];
-        if (json.code === 0 && json.data) {
-            if (json.data.items && Array.isArray(json.data.items)) {
-                data = json.data.items;
-            } else if (Array.isArray(json.data)) {
-                data = json.data;
-            } else {
-                data = [json.data];
-            }
-        } else if (json.data && Array.isArray(json.data)) {
-            data = json.data;
-        } else if (Array.isArray(json)) {
-            data = json;
+        const payload = extractResponseData(json);
+        if (isRecord(payload) && Array.isArray(payload.items)) {
+            return { data: payload.items };
         }
-
-        return { data };
+        if (Array.isArray(payload)) {
+            return { data: payload };
+        }
+        if (isRecord(payload)) {
+            return { data: [payload] };
+        }
+        return { data: [] };
     },
 
     // 获取引用资源
@@ -390,34 +389,7 @@ export const dataProvider: DataProvider = {
         const url = `${apiUrl}/${apiPath}?${queryString.stringify(query)}`;
         const { json, headers } = await httpClient(url);
 
-        let data = [];
-        let total = 0;
-
-        if (json.code === 0 && json.data) {
-            // Go API标准响应格式: {code: 0, data: {items: [...], total: number}}
-            if (json.data.items && Array.isArray(json.data.items)) {
-                data = json.data.items;
-                total = json.data.total || json.data.count || data.length;
-            } else if (Array.isArray(json.data)) {
-                // 直接数组在data字段中: {code: 0, data: [...]}
-                data = json.data;
-                total = json.total || json.count || data.length;
-            } else {
-                // 其他嵌套格式
-                data = [json.data];
-                total = 1;
-            }
-        } else if (json.data && Array.isArray(json.data)) {
-            // 旧格式支持: {data: [...], total: number}
-            data = json.data;
-            total = json.total || json.count || data.length;
-        } else if (Array.isArray(json)) {
-            // 直接数组格式
-            data = json;
-            total = getTotalFromHeaders(headers, data.length);
-        }
-
-        return { data, total };
+        return parseListResponse(resource, json, headers);
     },
 
     // 创建资源
@@ -435,13 +407,7 @@ export const dataProvider: DataProvider = {
                 body: JSON.stringify(params.data),
             });
 
-            if (isRecord(json) && json.code === 0 && json.data) {
-                return { data: json.data };
-            }
-            if (isRecord(json) && json.data) {
-                return { data: json.data };
-            }
-            return { data: json };
+            return { data: extractResponseData(json) };
         } catch (error: unknown) {
             handleHttpError(error)
         }
@@ -462,13 +428,7 @@ export const dataProvider: DataProvider = {
                 body: JSON.stringify(params.data),
             });
 
-            if (isRecord(json) && json.code === 0 && json.data) {
-                return { data: json.data };
-            }
-            if (isRecord(json) && json.data) {
-                return { data: json.data };
-            }
-            return { data: json };
+            return { data: extractResponseData(json) };
         } catch (error: unknown) {
             handleHttpError(error)
         }
