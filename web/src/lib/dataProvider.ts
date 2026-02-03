@@ -397,6 +397,10 @@ export const dataProvider: DataProvider = {
         let apiPath = resource;
         if (resource === 'users' || resource === 'user') {
             apiPath = 'admin/users';
+        } else if (resource === 'automation-rules') {
+            apiPath = 'admin/automation/rules';
+        } else if (resource === 'automation-logs') {
+            apiPath = 'admin/automation/logs';
         }
 
         const url = `${apiUrl}/${apiPath}`;
@@ -418,6 +422,10 @@ export const dataProvider: DataProvider = {
         let apiPath = resource;
         if (resource === 'users' || resource === 'user') {
             apiPath = 'admin/users';
+        } else if (resource === 'automation-rules') {
+            apiPath = 'admin/automation/rules';
+        } else if (resource === 'automation-logs') {
+            apiPath = 'admin/automation/logs';
         }
 
         const url = `${apiUrl}/${apiPath}/${params.id}`;
@@ -455,9 +463,18 @@ export const dataProvider: DataProvider = {
         }
 
         // 否则逐个更新
+        let apiPath = resource;
+        if (resource === 'users' || resource === 'user') {
+            apiPath = 'admin/users';
+        } else if (resource === 'automation-rules') {
+            apiPath = 'admin/automation/rules';
+        } else if (resource === 'automation-logs') {
+            apiPath = 'admin/automation/logs';
+        }
+
         await Promise.all(
             params.ids.map(id =>
-                httpClient(`${apiUrl}/${resource}/${id}`, {
+                httpClient(`${apiUrl}/${apiPath}/${id}`, {
                     method: 'PUT',
                     body: JSON.stringify(params.data),
                 })
@@ -472,6 +489,10 @@ export const dataProvider: DataProvider = {
         let apiPath = resource;
         if (resource === 'users' || resource === 'user') {
             apiPath = 'admin/users';
+        } else if (resource === 'automation-rules') {
+            apiPath = 'admin/automation/rules';
+        } else if (resource === 'automation-logs') {
+            apiPath = 'admin/automation/logs';
         }
 
         const url = `${apiUrl}/${apiPath}/${params.id}`;
@@ -500,9 +521,18 @@ export const dataProvider: DataProvider = {
         }
 
         // 否则逐个删除
+        let apiPath = resource;
+        if (resource === 'users' || resource === 'user') {
+            apiPath = 'admin/users';
+        } else if (resource === 'automation-rules') {
+            apiPath = 'admin/automation/rules';
+        } else if (resource === 'automation-logs') {
+            apiPath = 'admin/automation/logs';
+        }
+
         await Promise.all(
             params.ids.map(id =>
-                httpClient(`${apiUrl}/${resource}/${id}`, {
+                httpClient(`${apiUrl}/${apiPath}/${id}`, {
                     method: 'DELETE',
                 })
             )

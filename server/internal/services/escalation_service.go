@@ -109,7 +109,7 @@ func (s *EscalationService) CheckTicketSLA(ctx context.Context, ticket *models.T
 func (s *EscalationService) hasFirstResponse(ctx context.Context, ticketID uint) bool {
 	var count int64
 	s.db.WithContext(ctx).Model(&models.TicketComment{}).
-		Where("ticket_id = ? AND is_system = ?", ticketID, false).
+		Where("ticket_id = ? AND type != ?", ticketID, models.CommentTypeSystem).
 		Count(&count)
 	return count > 0
 }

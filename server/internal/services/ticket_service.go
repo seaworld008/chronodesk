@@ -1104,11 +1104,24 @@ func (s *TicketService) DeleteTicket(ctx context.Context, id uint, userID uint, 
 		}
 	}
 
-	if err := s.db.WithContext(ctx).Delete(ticket).Error; err != nil {
-		return fmt.Errorf("failed to delete ticket: %w", err)
-	}
-
-	return nil
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("related_ticket_id = ?", id).Delete(&models.Notification{}).Error; err != nil {
+			return fmt.Errorf("failed to delete ticket notifications: %w", err)
+		}
+		if err := tx.Where("ticket_id = ?", id).Delete(&models.TicketHistory{}).Error; err != nil {
+			return fmt.Errorf("failed to delete ticket histories: %w", err)
+		}
+		if err := tx.Where("ticket_id = ?", id).Delete(&models.TicketAttachment{}).Error; err != nil {
+			return fmt.Errorf("failed to delete ticket attachments: %w", err)
+		}
+		if err := tx.Where("ticket_id = ?", id).Delete(&models.TicketComment{}).Error; err != nil {
+			return fmt.Errorf("failed to delete ticket comments: %w", err)
+		}
+		if err := tx.Delete(ticket).Error; err != nil {
+			return fmt.Errorf("failed to delete ticket: %w", err)
+		}
+		return nil
+	})
 }
 
 func isElevatedRole(role string) bool {
