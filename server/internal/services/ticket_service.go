@@ -44,6 +44,14 @@ type TicketServiceInterface interface {
 type TicketService struct {
 	db                  *gorm.DB
 	notificationService NotificationServiceInterface
+	statsCache          StatsCache
+	statsCacheTTL       time.Duration
+}
+
+// StatsCache defines the minimal cache interface used by ticket statistics.
+type StatsCache interface {
+	Get(ctx context.Context, key string) (string, error)
+	Set(ctx context.Context, key string, value interface{}, expiration time.Duration) error
 }
 
 // NewTicketService creates a new ticket service
@@ -52,6 +60,19 @@ func NewTicketService(db *gorm.DB) TicketServiceInterface {
 		db:                  db,
 		notificationService: NewNotificationService(db),
 	}
+}
+
+// NewTicketServiceWithCache creates a new ticket service with stats cache enabled.
+func NewTicketServiceWithCache(db *gorm.DB, cache StatsCache, ttl time.Duration) TicketServiceInterface {
+	service := &TicketService{
+		db:                  db,
+		notificationService: NewNotificationService(db),
+	}
+	if cache != nil && ttl > 0 {
+		service.statsCache = cache
+		service.statsCacheTTL = ttl
+	}
+	return service
 }
 
 // TicketFilters represents filters for ticket queries
@@ -763,6 +784,23 @@ func (s *TicketService) UpdateTicketStatus(ticketID uint, status string, userID 
 
 // GetTicketStatistics returns enhanced statistics for dashboard
 func (s *TicketService) GetTicketStatistics(userID uint, role string) (*TicketStatisticsResponse, error) {
+	cacheKey := ""
+	if s.statsCache != nil && s.statsCacheTTL > 0 {
+		cacheKey = fmt.Sprintf("ticket_stats:%s:%d", role, userID)
+		if cached, err := s.statsCache.Get(context.Background(), cacheKey); err == nil && cached != "" {
+			var cachedStats TicketStatisticsResponse
+			if err := json.Unmarshal([]byte(cached), &cachedStats); err == nil {
+				if cachedStats.ByPriority == nil {
+					cachedStats.ByPriority = make(map[string]int64)
+				}
+				if cachedStats.ByCategory == nil {
+					cachedStats.ByCategory = make(map[string]int64)
+				}
+				return &cachedStats, nil
+			}
+		}
+	}
+
 	stats := &TicketStatisticsResponse{
 		ByPriority: make(map[string]int64),
 		ByCategory: make(map[string]int64),
@@ -835,6 +873,12 @@ func (s *TicketService) GetTicketStatistics(userID uint, role string) (*TicketSt
 		Find(&priorityCounts).Error; err == nil {
 		for _, pc := range priorityCounts {
 			stats.ByPriority[pc.Priority] = pc.Count
+		}
+	}
+
+	if cacheKey != "" {
+		if payload, err := json.Marshal(stats); err == nil {
+			_ = s.statsCache.Set(context.Background(), cacheKey, string(payload), s.statsCacheTTL)
 		}
 	}
 

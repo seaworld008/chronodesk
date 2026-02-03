@@ -380,7 +380,8 @@ func main() {
 		tickets := api.Group("/tickets")
 		{
 			// 创建工单服务和处理器
-			ticketService := services.NewTicketService(db.DB)
+			cacheTTL := getTicketStatsCacheTTL()
+			ticketService := services.NewTicketServiceWithCache(db.DB, db.Redis, cacheTTL)
 			ticketHandler := handlers.NewTicketHandler(ticketService)
 			workflowHandler := handlers.NewTicketWorkflowHandler(ticketService)
 
@@ -705,4 +706,14 @@ func main() {
 	if err := r.Run(port); err != nil {
 		log.Fatal("Failed to start server:", err)
 	}
+}
+
+func getTicketStatsCacheTTL() time.Duration {
+	ttl := 30 * time.Second
+	if raw := os.Getenv("TICKET_STATS_CACHE_TTL"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil {
+			ttl = parsed
+		}
+	}
+	return ttl
 }
