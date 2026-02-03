@@ -4,10 +4,11 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 )
 
 const (
@@ -28,10 +29,71 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		// Allow all origins for development
-		// TODO: Implement proper origin checking for production
-		return true
+		return originAllowed(r.Header.Get("Origin"), wsAllowedOrigins, wsAllowAllOrigins)
 	},
+}
+
+var wsAllowedOrigins []string
+var wsAllowAllOrigins bool
+
+// ConfigureOriginCheck sets websocket origin whitelist behavior.
+func ConfigureOriginCheck(allowed []string, allowAll bool) {
+	wsAllowedOrigins = allowed
+	wsAllowAllOrigins = allowAll
+}
+
+func originAllowed(origin string, allowed []string, allowAll bool) bool {
+	if allowAll {
+		return true
+	}
+	if origin == "" {
+		return false
+	}
+	for _, allowedOrigin := range allowed {
+		if allowedOrigin == "*" || allowedOrigin == origin {
+			return true
+		}
+		if matchWildcard(allowedOrigin, origin) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchWildcard(pattern, value string) bool {
+	if pattern == "*" {
+		return true
+	}
+	if !strings.Contains(pattern, "*") {
+		return pattern == value
+	}
+
+	parts := strings.Split(pattern, "*")
+	if len(parts) == 0 {
+		return false
+	}
+
+	if !strings.HasPrefix(value, parts[0]) {
+		return false
+	}
+	if !strings.HasSuffix(value, parts[len(parts)-1]) {
+		return false
+	}
+
+	index := len(parts[0])
+	for i := 1; i < len(parts)-1; i++ {
+		part := parts[i]
+		if part == "" {
+			continue
+		}
+		next := strings.Index(value[index:], part)
+		if next == -1 {
+			return false
+		}
+		index += next + len(part)
+	}
+
+	return true
 }
 
 // Client is a middleman between the websocket connection and the hub.

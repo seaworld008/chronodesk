@@ -569,6 +569,7 @@ func main() {
 		notificationHandler := handlers.NewNotificationHandler(notificationService)
 
 		// 初始化 WebSocket Hub 和 WebSocket 通知服务
+		websocketPkg.ConfigureOriginCheck(cfg.CORS.AllowedOrigins, cfg.Server.Environment != "production")
 		wsHub := websocketPkg.NewHub()
 		wsNotificationService := websocketPkg.NewNotificationWebSocketService(wsHub)
 
