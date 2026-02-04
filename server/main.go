@@ -392,6 +392,7 @@ func main() {
 
 		// 管理员通知管理路由
 		admin.POST("/notifications", notificationHandler.CreateNotification) // 创建通知（管理员）
+		admin.DELETE("/notifications/:id", notificationHandler.DeleteNotification) // 删除通知（管理员）
 
 		// 通知系统路由（需要认证）
 		notifications := api.Group("/notifications")

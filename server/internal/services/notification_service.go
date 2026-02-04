@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,6 +28,7 @@ type NotificationServiceInterface interface {
 	// 通知管理相关方法
 	CreateNotification(ctx context.Context, req *models.NotificationCreateRequest) (*models.Notification, error)
 	GetNotifications(ctx context.Context, filter *models.NotificationFilter) ([]*models.Notification, int64, error)
+	DeleteNotification(ctx context.Context, notificationID uint) error
 	MarkAsRead(ctx context.Context, notificationID uint, userID uint) error
 	MarkAllAsRead(ctx context.Context, userID uint) error
 	GetUnreadCount(ctx context.Context, userID uint) (int64, error)
@@ -135,6 +137,23 @@ func (ns *NotificationService) SendNotification(ctx context.Context, event *Noti
 
 	if len(errors) > 0 {
 		return fmt.Errorf("部分webhook发送失败: %s", strings.Join(errors, "; "))
+	}
+
+	return nil
+}
+
+// DeleteNotification 删除通知
+func (ns *NotificationService) DeleteNotification(ctx context.Context, notificationID uint) error {
+	var notification models.Notification
+	if err := ns.db.WithContext(ctx).First(&notification, notificationID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("notification not found")
+		}
+		return fmt.Errorf("failed to find notification: %w", err)
+	}
+
+	if err := ns.db.WithContext(ctx).Delete(&notification).Error; err != nil {
+		return fmt.Errorf("failed to delete notification: %w", err)
 	}
 
 	return nil

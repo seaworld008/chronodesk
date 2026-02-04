@@ -509,6 +509,26 @@ func (h *NotificationHandler) CreateNotification(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"data": notification.ToResponse()})
 }
 
+// DeleteNotification 删除通知 (管理员接口)
+func (h *NotificationHandler) DeleteNotification(c *gin.Context) {
+	notificationID, err := strconv.ParseUint(c.Param("id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的通知ID"})
+		return
+	}
+
+	if err := h.notificationService.DeleteNotification(c.Request.Context(), uint(notificationID)); err != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, gin.H{"error": "删除通知失败", "details": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "删除通知成功"})
+}
+
 // GetNotificationPreferences 获取用户通知偏好设置
 func (h *NotificationHandler) GetNotificationPreferences(c *gin.Context) {
 	userID, exists := c.Get("user_id")
