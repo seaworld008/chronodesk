@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { cleanupE2EData, loginViaUI } from './helpers/testData';
+import { loginViaUI } from './helpers/testData';
 
 /**
  * ChronoDesk Ticket Workflow E2E Tests
@@ -20,10 +20,6 @@ test.describe('Authentication', () => {
 });
 
 test.describe('Ticket Management', () => {
-    test.afterAll(async ({ request }) => {
-        await cleanupE2EData(request);
-    });
-
     test.beforeEach(async ({ page }) => {
         await loginViaUI(page, TEST_USER);
     });

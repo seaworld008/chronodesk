@@ -8,7 +8,11 @@ const TEST_USER = {
 
 test.describe('Automation Rules', () => {
     test.afterAll(async ({ request }) => {
-        await cleanupE2EData(request);
+        await cleanupE2EData(request, {
+            tickets: false,
+            notifications: false,
+            emailConfig: false,
+        });
     });
 
     test('should create an automation rule', async ({ page }) => {

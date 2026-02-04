@@ -8,7 +8,12 @@ const TEST_USER = {
 
 test.describe('Email Settings', () => {
     test.afterAll(async ({ request }) => {
-        await cleanupE2EData(request);
+        await cleanupE2EData(request, {
+            tickets: false,
+            automationRules: false,
+            notifications: false,
+            users: false,
+        });
     });
 
     test('should save email config with test data', async ({ page }) => {

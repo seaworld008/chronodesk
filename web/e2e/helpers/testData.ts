@@ -140,6 +140,21 @@ export const deleteNotification = async (request: APIRequestContext, id: number)
     await apiRequest(request, token, `/api/admin/notifications/${id}`, { method: 'DELETE' });
 };
 
+export const deleteTicketByTitle = async (request: APIRequestContext, title: string) => {
+    const token = await getAdminToken(request);
+    const response = await apiRequest<Record<string, unknown>>(
+        request,
+        token,
+        `/api/tickets?search=${encodeURIComponent(title)}&page=1&page_size=20`,
+    );
+    const tickets = extractItems<Record<string, unknown>>(response);
+    const target = tickets.find((ticket) => ticket.title === title);
+    if (!target) {
+        return;
+    }
+    await apiRequest(request, token, `/api/tickets/${target.id}`, { method: 'DELETE' });
+};
+
 const deleteAutomationRules = async (request: APIRequestContext, token: string) => {
     const response = await apiRequest<Record<string, unknown>>(
         request,
@@ -221,11 +236,39 @@ const resetEmailConfig = async (request: APIRequestContext, token: string) => {
     });
 };
 
-export const cleanupE2EData = async (request: APIRequestContext) => {
+type CleanupOptions = {
+    automationRules?: boolean;
+    tickets?: boolean;
+    notifications?: boolean;
+    users?: boolean;
+    emailConfig?: boolean;
+};
+
+const defaultCleanupOptions: Required<CleanupOptions> = {
+    automationRules: true,
+    tickets: true,
+    notifications: true,
+    users: true,
+    emailConfig: true,
+};
+
+export const cleanupE2EData = async (request: APIRequestContext, options: CleanupOptions = {}) => {
     const token = await getAdminToken(request);
-    await deleteAutomationRules(request, token);
-    await deleteTickets(request, token);
-    await deleteNotifications(request, token);
-    await deleteTestUsers(request, token);
-    await resetEmailConfig(request, token);
+    const config = { ...defaultCleanupOptions, ...options };
+
+    if (config.automationRules) {
+        await deleteAutomationRules(request, token);
+    }
+    if (config.tickets) {
+        await deleteTickets(request, token);
+    }
+    if (config.notifications) {
+        await deleteNotifications(request, token);
+    }
+    if (config.users) {
+        await deleteTestUsers(request, token);
+    }
+    if (config.emailConfig) {
+        await resetEmailConfig(request, token);
+    }
 };
