@@ -1,21 +1,18 @@
 import { test, expect } from '@playwright/test';
+import { cleanupE2EData, E2E_PREFIX, loginViaUI } from './helpers/testData';
 
 const TEST_USER = {
     email: 'admin@example.com',
     password: 'Admin123!',
 };
 
-const login = async (page: import('@playwright/test').Page) => {
-    await page.goto('/#/login');
-    await page.getByLabel('邮箱').fill(TEST_USER.email);
-    await page.getByLabel('密码').fill(TEST_USER.password);
-    await page.getByRole('button', { name: '登录系统' }).click();
-    await page.getByRole('menuitem', { name: '工单管理' }).waitFor({ timeout: 15000 });
-};
-
 test.describe('Email Settings', () => {
+    test.afterAll(async ({ request }) => {
+        await cleanupE2EData(request);
+    });
+
     test('should save email config with test data', async ({ page }) => {
-        await login(page);
+        await loginViaUI(page, TEST_USER);
 
         await page.goto('/#/email-settings');
 
@@ -30,7 +27,7 @@ test.describe('Email Settings', () => {
         await page.getByLabel('SMTP 用户名').fill(`test_user_${suffix}`);
         await page.getByLabel('SMTP 密码 (留空则不修改)').fill('test_pass_20260203');
         await page.getByLabel('发件人邮箱').fill('test@example.com');
-        await page.getByLabel('发件人名称').fill(`工单系统E2E-${suffix}`);
+        await page.getByLabel('发件人名称').fill(`${E2E_PREFIX}工单系统-${suffix}`);
 
         await page.getByRole('button', { name: '保存配置' }).click();
 

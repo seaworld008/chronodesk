@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { cleanupE2EData, loginViaUI } from './helpers/testData';
 
 /**
  * ChronoDesk Ticket Workflow E2E Tests
@@ -7,7 +8,6 @@ import { test, expect } from '@playwright/test';
  * Requires the backend and frontend to be running.
  */
 
-// Test data
 const TEST_USER = {
     email: 'admin@example.com',
     password: 'Admin123!',
@@ -15,24 +15,17 @@ const TEST_USER = {
 
 test.describe('Authentication', () => {
     test('should allow user to login', async ({ page }) => {
-        await page.goto('/#/login');
-
-        await page.getByLabel('邮箱').fill(TEST_USER.email);
-        await page.getByLabel('密码').fill(TEST_USER.password);
-
-        await page.getByRole('button', { name: '登录系统' }).click();
-        await page.getByRole('menuitem', { name: '工单管理' }).waitFor({ timeout: 15000 });
+        await loginViaUI(page, TEST_USER);
     });
 });
 
 test.describe('Ticket Management', () => {
+    test.afterAll(async ({ request }) => {
+        await cleanupE2EData(request);
+    });
+
     test.beforeEach(async ({ page }) => {
-        // Login before each test
-        await page.goto('/#/login');
-        await page.getByLabel('邮箱').fill(TEST_USER.email);
-        await page.getByLabel('密码').fill(TEST_USER.password);
-        await page.getByRole('button', { name: '登录系统' }).click();
-        await page.getByRole('menuitem', { name: '工单管理' }).waitFor({ timeout: 15000 });
+        await loginViaUI(page, TEST_USER);
     });
 
     test('should display ticket list', async ({ page }) => {
@@ -60,11 +53,7 @@ test.describe('Ticket Management', () => {
 
 test.describe('Navigation', () => {
     test.beforeEach(async ({ page }) => {
-        await page.goto('/#/login');
-        await page.getByLabel('邮箱').fill(TEST_USER.email);
-        await page.getByLabel('密码').fill(TEST_USER.password);
-        await page.getByRole('button', { name: '登录系统' }).click();
-        await page.getByRole('menuitem', { name: '工单管理' }).waitFor({ timeout: 15000 });
+        await loginViaUI(page, TEST_USER);
     });
 
     test('should navigate to users page', async ({ page }) => {

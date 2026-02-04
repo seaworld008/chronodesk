@@ -1,26 +1,24 @@
 import { test, expect } from '@playwright/test';
+import { cleanupE2EData, E2E_PREFIX, loginViaUI } from './helpers/testData';
 
 const TEST_USER = {
     email: 'admin@example.com',
     password: 'Admin123!',
 };
 
-const login = async (page: import('@playwright/test').Page) => {
-    await page.goto('/#/login');
-    await page.getByLabel('邮箱').fill(TEST_USER.email);
-    await page.getByLabel('密码').fill(TEST_USER.password);
-    await page.getByRole('button', { name: '登录系统' }).click();
-    await page.getByRole('menuitem', { name: '工单管理' }).waitFor({ timeout: 15000 });
-};
-
 test.describe('Automation Rules', () => {
+    test.afterAll(async ({ request }) => {
+        await cleanupE2EData(request);
+    });
+
     test('should create an automation rule', async ({ page }) => {
-        await login(page);
+        await loginViaUI(page, TEST_USER);
 
         await page.goto('/#/automation-rules');
         await page.getByRole('link', { name: /create/i }).click();
 
-        await page.getByLabel('名称').fill('E2E 自动化规则 20260203');
+        const ruleName = `${E2E_PREFIX}自动化规则-${Date.now()}`;
+        await page.getByLabel('名称').fill(ruleName);
         await page.getByLabel('描述').fill('Playwright E2E 创建自动化规则');
 
         await page.getByLabel('规则类型').click();
@@ -35,6 +33,6 @@ test.describe('Automation Rules', () => {
         await page.getByRole('button', { name: 'Save' }).click();
 
         await expect(page).toHaveURL(/#\/automation-rules/);
-        await expect(page.getByText('E2E 自动化规则 20260203')).toBeVisible({ timeout: 10000 });
+        await expect(page.getByText(ruleName)).toBeVisible({ timeout: 10000 });
     });
 });
