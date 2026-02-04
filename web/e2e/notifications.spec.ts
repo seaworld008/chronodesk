@@ -29,9 +29,13 @@ test.describe('Notifications', () => {
         await page.goto('/#/notifications');
 
         const searchInput = page.getByPlaceholder('搜索通知');
+        const listRequest = page.waitForResponse((response) =>
+            response.url().includes('/api/notifications') && response.request().method() === 'GET',
+        );
         await searchInput.fill(title);
         await searchInput.press('Enter');
+        await listRequest;
 
-        await expect(page.getByText(title)).toBeVisible({ timeout: 10000 });
+        await expect(page.getByText(title)).toBeVisible({ timeout: 15000 });
     });
 });

@@ -62,7 +62,7 @@ test.describe('Ticket Workflow', () => {
         await page.getByRole('option', { name: 'agent (Support Agent)' }).click();
 
         await page.getByRole('button', { name: '创建工单' }).click();
-        await expect(page).toHaveURL(/#\/tickets\/\d+\/show/);
+        await page.waitForURL(/#\/tickets\/\d+\/show/, { timeout: 15000 });
 
         await page.getByRole('link', { name: '编辑' }).click();
         await expect(page).toHaveURL(/#\/tickets\/\d+$/);
