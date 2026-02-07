@@ -13,7 +13,7 @@
 - ✅ 解决字段与方法名冲突
 
 ### 2. API文档创建
-- ✅ 创建完整的API接口文档 (`API_DOCUMENTATION.md`)
+- ✅ 创建完整的API接口文档（现已归档到 `docs/reference/API_DOCUMENTATION.md`）
 - ✅ 更新端口配置为8081
 - ✅ 包含所有主要端点的详细说明
 - ✅ 提供请求/响应示例和错误处理
@@ -150,7 +150,7 @@ pytest test_comprehensive_api.py --html=reports/api_test_report.html
 │   │   └── database/               # 数据库操作
 │   ├── cmd/migrate/                # 数据库迁移
 │   ├── test_comprehensive_api.py   # API测试
-│   ├── API_DOCUMENTATION.md        # API文档
+│   ├── API_DOCUMENTATION.md        # 后端侧API文档
 │   └── main.go                     # 应用入口
 ├── web/                            # React前端
 │   ├── src/                        # 源代码
@@ -158,7 +158,7 @@ pytest test_comprehensive_api.py --html=reports/api_test_report.html
 │   │   ├── admin/                  # 管理界面
 │   │   └── components/             # 组件库
 │   └── dist/                       # 构建产物
-└── PROJECT_COMPLETION_SUMMARY.md   # 项目总结
+└── docs/planning/PROJECT_COMPLETION_SUMMARY.md   # 项目总结
 ```
 
 ## 🎯 项目特色
