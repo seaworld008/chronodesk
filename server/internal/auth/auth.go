@@ -205,6 +205,14 @@ type ForgotPasswordRequest struct {
 type ResetPasswordRequest struct {
 	Token       string `json:"token" validate:"required"`
 	NewPassword string `json:"new_password" validate:"required,min=8"`
+	Password    string `json:"password,omitempty" validate:"omitempty,min=8"`
+}
+
+func (r *ResetPasswordRequest) EffectivePassword() string {
+	if strings.TrimSpace(r.NewPassword) != "" {
+		return r.NewPassword
+	}
+	return r.Password
 }
 
 // ResendVerificationRequest 重发验证邮件请求

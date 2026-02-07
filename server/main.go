@@ -204,7 +204,8 @@ func main() {
 			tickets.GET("/:id", ticketHandler.GetTicket)                    // 获取单个工单
 			tickets.POST("", ticketHandler.CreateTicket)                    // 创建工单
 			tickets.PUT("/:id", ticketHandler.UpdateTicket)                 // 更新工单
-				tickets.DELETE("/:id", ticketHandler.DeleteTicket)              // 删除工单
+			tickets.DELETE("/bulk-delete", ticketHandler.BulkDeleteTickets) // 批量删除工单
+			tickets.DELETE("/:id", ticketHandler.DeleteTicket)              // 删除工单
 
 			// 工作流相关路由
 			tickets.POST("/:id/assign", workflowHandler.AssignTicket)       // 分配工单
