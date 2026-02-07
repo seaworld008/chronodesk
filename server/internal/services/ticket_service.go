@@ -48,6 +48,17 @@ type TicketService struct {
 	statsCacheTTL       time.Duration
 }
 
+var ticketSortableColumns = map[string]string{
+	"id":            "id",
+	"ticket_number": "ticket_number",
+	"title":         "title",
+	"status":        "status",
+	"priority":      "priority",
+	"due_date":      "due_date",
+	"created_at":    "created_at",
+	"updated_at":    "updated_at",
+}
+
 // StatsCache defines the minimal cache interface used by ticket statistics.
 type StatsCache interface {
 	Get(ctx context.Context, key string) (string, error)
@@ -77,20 +88,20 @@ func NewTicketServiceWithCache(db *gorm.DB, cache StatsCache, ttl time.Duration)
 
 // TicketFilters represents filters for ticket queries
 type TicketFilters struct {
-	Status     string
-	Priority   string
-	Type       string
-	Tags       []string
-	AssigneeID *uint
-	CreatorID  *uint
+	Status      string
+	Priority    string
+	Type        string
+	Tags        []string
+	AssigneeID  *uint
+	CreatorID   *uint
 	SLABreached *bool
 	IsOverdue   *bool
 	Unassigned  *bool
-	Search     string
-	Page       int
-	Limit      int
-	SortBy     string
-	SortOrder  string
+	Search      string
+	Page        int
+	Limit       int
+	SortBy      string
+	SortOrder   string
 }
 
 // TicketStats represents ticket statistics
@@ -216,15 +227,8 @@ func (s *TicketService) GetTickets(ctx context.Context, filters TicketFilters) (
 		query = query.Offset(offset).Limit(filters.Limit)
 	}
 
-	// Apply sorting
-	sortBy := "created_at"
-	sortOrder := "DESC"
-	if filters.SortBy != "" {
-		sortBy = filters.SortBy
-	}
-	if filters.SortOrder != "" {
-		sortOrder = filters.SortOrder
-	}
+	// Apply sorting (whitelist)
+	sortBy, sortOrder := sanitizeTicketSort(filters.SortBy, filters.SortOrder)
 	query = query.Order(fmt.Sprintf("%s %s", sortBy, sortOrder))
 
 	// Preload associations
@@ -247,6 +251,25 @@ func splitCommaSeparated(value string) []string {
 		}
 	}
 	return result
+}
+
+func sanitizeTicketSort(sortBy, sortOrder string) (string, string) {
+	column := "created_at"
+	if requested := strings.ToLower(strings.TrimSpace(sortBy)); requested != "" {
+		if whitelisted, ok := ticketSortableColumns[requested]; ok {
+			column = whitelisted
+		}
+	}
+
+	direction := "DESC"
+	switch strings.ToLower(strings.TrimSpace(sortOrder)) {
+	case "asc":
+		direction = "ASC"
+	case "desc":
+		direction = "DESC"
+	}
+
+	return column, direction
 }
 
 // GetTicket retrieves a single ticket by ID

@@ -64,6 +64,7 @@ type RedisConfig struct {
 // JWTConfig JWT配置
 type JWTConfig struct {
 	Secret           string        `json:"secret"`
+	RefreshSecret    string        `json:"refresh_secret"`
 	ExpiresIn        time.Duration `json:"expires_in"`
 	RefreshExpiresIn time.Duration `json:"refresh_expires_in"`
 }
@@ -165,6 +166,7 @@ func Load() (*Config, error) {
 		},
 		JWT: JWTConfig{
 			Secret:           getEnv("JWT_SECRET", "your-super-secret-jwt-key-change-in-production"),
+			RefreshSecret:    getEnv("JWT_REFRESH_SECRET", "your-super-secret-jwt-refresh-key-change-in-production"),
 			ExpiresIn:        getEnvAsDuration("JWT_EXPIRES_IN", 24*time.Hour),
 			RefreshExpiresIn: getEnvAsDuration("JWT_REFRESH_EXPIRES_IN", 168*time.Hour),
 		},
@@ -223,6 +225,9 @@ func (c *Config) Validate() error {
 	// 验证必需的配置项
 	if c.JWT.Secret == "your-super-secret-jwt-key-change-in-production" && c.Server.Environment == "production" {
 		return fmt.Errorf("JWT secret must be changed in production environment")
+	}
+	if c.JWT.RefreshSecret == "your-super-secret-jwt-refresh-key-change-in-production" && c.Server.Environment == "production" {
+		return fmt.Errorf("JWT refresh secret must be changed in production environment")
 	}
 
 	if c.Database.Host == "" {

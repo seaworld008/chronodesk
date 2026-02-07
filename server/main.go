@@ -86,7 +86,7 @@ func main() {
 	}
 
 	// 初始化认证模块
-	authModule, err := auth.NewAuthModule(db.DB)
+	authModule, err := auth.NewAuthModule(db.DB, cfg)
 	if err != nil {
 		log.Fatal("Failed to initialize auth module:", err)
 	}
@@ -200,11 +200,11 @@ func main() {
 			tickets.Use(ginAdapter(authModule.Handler.RequireAuth))
 
 			// 基础工单CRUD路由
-			tickets.GET("", ticketHandler.GetTickets)          // 获取工单列表
-			tickets.GET("/:id", ticketHandler.GetTicket)       // 获取单个工单
-			tickets.POST("", ticketHandler.CreateTicket)       // 创建工单
-			tickets.PUT("/:id", ticketHandler.UpdateTicket)    // 更新工单
-			tickets.DELETE("/:id", ticketHandler.DeleteTicket) // 删除工单
+			tickets.GET("", ticketHandler.GetTickets)                       // 获取工单列表
+			tickets.GET("/:id", ticketHandler.GetTicket)                    // 获取单个工单
+			tickets.POST("", ticketHandler.CreateTicket)                    // 创建工单
+			tickets.PUT("/:id", ticketHandler.UpdateTicket)                 // 更新工单
+				tickets.DELETE("/:id", ticketHandler.DeleteTicket)              // 删除工单
 
 			// 工作流相关路由
 			tickets.POST("/:id/assign", workflowHandler.AssignTicket)       // 分配工单
@@ -391,7 +391,7 @@ func main() {
 		websocketPkg.SetGlobalNotificationService(wsNotificationService)
 
 		// 管理员通知管理路由
-		admin.POST("/notifications", notificationHandler.CreateNotification) // 创建通知（管理员）
+		admin.POST("/notifications", notificationHandler.CreateNotification)       // 创建通知（管理员）
 		admin.DELETE("/notifications/:id", notificationHandler.DeleteNotification) // 删除通知（管理员）
 
 		// 通知系统路由（需要认证）

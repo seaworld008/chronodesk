@@ -3,12 +3,15 @@ package auth
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 	"unicode"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 // SimplePasswordService 简单密码服务实现
@@ -37,14 +40,12 @@ func (s *SimplePasswordService) HashPassword(password string) (string, error) {
 		return "", errors.New("password cannot be empty")
 	}
 
-	// 使用 SHA256 + 盐值进行哈希
-	hasher := sha256.New()
-	hasher.Write([]byte(s.salt))
-	hasher.Write([]byte(password))
-	hasher.Write([]byte(s.salt)) // 双重盐值
-	hash := hasher.Sum(nil)
+	hashed, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", fmt.Errorf("failed to hash password: %w", err)
+	}
 
-	return hex.EncodeToString(hash), nil
+	return string(hashed), nil
 }
 
 // VerifyPassword 验证密码
@@ -53,18 +54,29 @@ func (s *SimplePasswordService) VerifyPassword(hashedPassword, password string) 
 		return errors.New("password and hash cannot be empty")
 	}
 
-	// 计算输入密码的哈希
-	computedHash, err := s.HashPassword(password)
-	if err != nil {
-		return err
+	// bcrypt hash
+	if strings.HasPrefix(hashedPassword, "$2") {
+		if err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password)); err != nil {
+			return errors.New("password verification failed")
+		}
+		return nil
 	}
 
-	// 比较哈希值
-	if computedHash != hashedPassword {
+	// legacy SHA256 hash fallback for migration period
+	computedHash := s.legacySHA256Hash(password)
+	if subtle.ConstantTimeCompare([]byte(computedHash), []byte(hashedPassword)) != 1 {
 		return errors.New("password verification failed")
 	}
 
 	return nil
+}
+
+func (s *SimplePasswordService) legacySHA256Hash(password string) string {
+	hasher := sha256.New()
+	hasher.Write([]byte(s.salt))
+	hasher.Write([]byte(password))
+	hasher.Write([]byte(s.salt))
+	return hex.EncodeToString(hasher.Sum(nil))
 }
 
 // ValidatePassword 验证密码强度
