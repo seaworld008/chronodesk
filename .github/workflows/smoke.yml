@@ -9,6 +9,9 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      TEST_ADMIN_EMAIL: admin@example.com
+      TEST_ADMIN_PASSWORD: Admin123!
 
     steps:
       - name: Checkout repository
@@ -51,6 +54,17 @@ jobs:
             docker-compose logs --no-color server || true
           fi
           exit 1
+
+      - name: Run database migrations
+        run: |
+          if docker compose version >/dev/null 2>&1; then
+            docker compose exec -T server go run cmd/migrate/main.go -seed
+          elif command -v docker-compose >/dev/null 2>&1; then
+            docker-compose exec -T server go run cmd/migrate/main.go -seed
+          else
+            echo "Compose command not found for migration"
+            exit 127
+          fi
 
       - name: Run smoke tests
         run: make smoke
