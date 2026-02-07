@@ -36,18 +36,33 @@ jobs:
       - name: Wait for API
         run: |
           for i in {1..30}; do
-            if curl -sSf http://localhost:8081/healthz >/dev/null; then
-              echo "API is ready";
+            payload=$(curl -s http://localhost:8081/healthz || true)
+            if echo "$payload" | grep -q '"database":"ok"'; then
+              echo "API and database are ready";
               exit 0;
             fi;
-            echo "Waiting for API...";
+            echo "Waiting for API/DB... payload: ${payload}";
             sleep 5;
           done;
-          echo "API did not become ready in time";
+          echo "API/database did not become ready in time";
+          if docker compose version >/dev/null 2>&1; then
+            docker compose logs --no-color server || true
+          elif command -v docker-compose >/dev/null 2>&1; then
+            docker-compose logs --no-color server || true
+          fi
           exit 1
 
       - name: Run smoke tests
         run: make smoke
+
+      - name: Dump server logs on failure
+        if: failure()
+        run: |
+          if docker compose version >/dev/null 2>&1; then
+            docker compose logs --no-color server || true
+          elif command -v docker-compose >/dev/null 2>&1; then
+            docker-compose logs --no-color server || true
+          fi
 
       - name: Upload smoke reports
         if: always()

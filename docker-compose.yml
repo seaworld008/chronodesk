@@ -49,6 +49,7 @@ services:
     environment:
       - GIN_MODE=debug
       - PORT=8081
+      - DATABASE_URL=postgres://ticket_user:ticket_password@postgres:5432/ticket_system?sslmode=disable
       - DB_HOST=postgres
       - DB_PORT=5432
       - DB_USER=ticket_user
