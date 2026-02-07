@@ -480,6 +480,73 @@ func (h *TicketHandler) BulkUpdateTickets(c *gin.Context) {
 	h.response.Success(c, nil, "Tickets updated successfully")
 }
 
+// BulkDeleteTickets 批量删除工单
+func (h *TicketHandler) BulkDeleteTickets(c *gin.Context) {
+	ctx := context.Background()
+
+	var req struct {
+		IDs []uint `json:"ids" binding:"required,min=1"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		h.response.Error(c, http.StatusBadRequest, "invalid_request", "Invalid request format: "+err.Error())
+		return
+	}
+
+	userIDValue, exists := c.Get("user_id")
+	if !exists {
+		h.response.Error(c, http.StatusUnauthorized, "unauthorized", "User not authenticated")
+		return
+	}
+	userID, ok := userIDValue.(uint)
+	if !ok {
+		h.response.InternalServerError(c, "无效的用户ID")
+		return
+	}
+
+	userRoleValue, roleExists := c.Get("user_role")
+	if !roleExists {
+		h.response.Forbidden(c, "缺少用户角色信息")
+		return
+	}
+	userRole, ok := userRoleValue.(string)
+	if !ok {
+		h.response.InternalServerError(c, "无效的角色类型")
+		return
+	}
+
+	deletedIDs := make([]uint, 0, len(req.IDs))
+	failedIDs := make([]uint, 0)
+	failedReasons := make(map[string]string)
+
+	for _, ticketID := range req.IDs {
+		if err := h.ticketService.DeleteTicket(ctx, ticketID, userID, userRole); err != nil {
+			failedIDs = append(failedIDs, ticketID)
+			failedReasons[strconv.FormatUint(uint64(ticketID), 10)] = err.Error()
+			continue
+		}
+		deletedIDs = append(deletedIDs, ticketID)
+	}
+
+	result := map[string]interface{}{
+		"deleted_ids": deletedIDs,
+		"failed_ids":  failedIDs,
+	}
+	if len(failedReasons) > 0 {
+		result["failed_reasons"] = failedReasons
+	}
+
+	if len(failedIDs) > 0 && len(deletedIDs) == 0 {
+		h.response.Error(c, http.StatusBadRequest, "bulk_delete_failed", result)
+		return
+	}
+	if len(failedIDs) > 0 {
+		h.response.Success(c, result, "部分工单删除失败")
+		return
+	}
+
+	h.response.Success(c, result, "工单批量删除成功")
+}
+
 // GetTicketHistory 获取工单历史记录
 func (h *TicketHandler) GetTicketHistory(c *gin.Context) {
 	// 获取工单ID

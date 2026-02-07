@@ -457,7 +457,16 @@ func (h *AuthHandler) ResetPassword(c HTTPContext) {
 	}
 
 	ctx := context.Background()
-	err := h.authService.ResetPassword(ctx, req.Token, req.NewPassword)
+	password := req.EffectivePassword()
+	if strings.TrimSpace(password) == "" {
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error:   "validation_error",
+			Message: "New password is required",
+		})
+		return
+	}
+
+	err := h.authService.ResetPassword(ctx, req.Token, password)
 	if err != nil {
 		h.logger.Error("Failed to reset password", "error", err)
 		if err == ErrInvalidToken {

@@ -323,7 +323,7 @@ export const authProvider: AuthProvider = {
     resetPassword: async ({ token, password }: { token: string; password: string }) => {
         const request = new Request(buildUrl('/auth/reset-password'), {
             method: 'POST',
-            body: JSON.stringify({ token, password }),
+            body: JSON.stringify({ token, new_password: password }),
             headers: new Headers({ 'Content-Type': 'application/json' }),
         });
 

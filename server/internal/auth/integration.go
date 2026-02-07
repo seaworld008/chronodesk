@@ -1,8 +1,10 @@
 package auth
 
 import (
+	"errors"
 	"time"
 
+	appconfig "gongdan-system/internal/config"
 	"gongdan-system/internal/services"
 	"gorm.io/gorm"
 )
@@ -15,20 +17,24 @@ type AuthModule struct {
 }
 
 // NewAuthModule 创建认证模块
-func NewAuthModule(db *gorm.DB) (*AuthModule, error) {
+func NewAuthModule(db *gorm.DB, cfg *appconfig.Config) (*AuthModule, error) {
+	if cfg == nil {
+		return nil, errors.New("config is required")
+	}
+
 	// 创建配置
 	config := &AuthConfig{
-		JWTSecret:                "your-jwt-secret-key-change-in-production",
-		JWTRefreshSecret:         "your-jwt-refresh-secret-key-change-in-production",
-		AccessTokenExpire:        15 * time.Minute,
-		RefreshTokenExpire:       7 * 24 * time.Hour,
+		JWTSecret:                cfg.JWT.Secret,
+		JWTRefreshSecret:         cfg.JWT.RefreshSecret,
+		AccessTokenExpire:        cfg.JWT.ExpiresIn,
+		RefreshTokenExpire:       cfg.JWT.RefreshExpiresIn,
 		EmailVerificationExpire:  24 * time.Hour,
 		PasswordResetExpire:      1 * time.Hour,
 		OTPExpire:                5 * time.Minute,
 		MaxFailedLogins:          5,
 		LockoutDuration:          30 * time.Minute,
 		PasswordMinLength:        8,
-		RequireEmailVerification: false, // 开发环境设为false
+		RequireEmailVerification: false,
 		EnableOTP:                true,
 		EnableRegistration:       true,
 	}

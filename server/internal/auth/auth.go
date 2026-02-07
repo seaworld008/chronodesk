@@ -205,6 +205,14 @@ type ForgotPasswordRequest struct {
 type ResetPasswordRequest struct {
 	Token       string `json:"token" validate:"required"`
 	NewPassword string `json:"new_password" validate:"required,min=8"`
+	Password    string `json:"password,omitempty" validate:"omitempty,min=8"`
+}
+
+func (r *ResetPasswordRequest) EffectivePassword() string {
+	if strings.TrimSpace(r.NewPassword) != "" {
+		return r.NewPassword
+	}
+	return r.Password
 }
 
 // ResendVerificationRequest 重发验证邮件请求
@@ -686,6 +694,20 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 		s.recordLoginAttempt(ctx, &user.ID, req.Email, ipAddress, userAgent, false, "invalid password")
 		s.recordLoginHistoryFailure(ctx, user, ipAddress, userAgent, method, "invalid password", models.LoginStatusFailed)
 		return nil, ErrInvalidCredentials
+	}
+
+	// 密码校验成功后，若仍是历史哈希格式则静默升级为bcrypt。
+	if !strings.HasPrefix(user.PasswordHash, "$2") {
+		if upgradedHash, hashErr := s.passwordService.HashPassword(req.Password); hashErr != nil {
+			fmt.Printf("Warning: failed to upgrade legacy password hash for user %d: %v\n", user.ID, hashErr)
+		} else {
+			originalHash := user.PasswordHash
+			user.PasswordHash = upgradedHash
+			if err := s.userRepo.Update(ctx, user); err != nil {
+				user.PasswordHash = originalHash
+				fmt.Printf("Warning: failed to persist upgraded password hash for user %d: %v\n", user.ID, err)
+			}
+		}
 	}
 
 	// 检查是否需要OTP验证
@@ -1240,6 +1262,9 @@ func (s *AuthService) VerifyOTP(ctx context.Context, userID uint, code string) e
 
 	// 检查备用码
 	if s.verifyBackupCode(user, code) {
+		if err := s.userRepo.Update(ctx, user); err != nil {
+			return fmt.Errorf("failed to persist backup code usage: %w", err)
+		}
 		return nil
 	}
 
