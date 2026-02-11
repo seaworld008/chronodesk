@@ -386,27 +386,126 @@ func NewGormProfileRepository(db *gorm.DB) ProfileRepository {
 
 // Create 创建用户资料
 func (r *GormProfileRepository) Create(ctx context.Context, profile *UserProfile) error {
-	return r.db.WithContext(ctx).Create(profile).Error
+	modelProfile := &models.UserProfile{
+		UserID:   profile.UserID,
+		Avatar:   profile.Avatar,
+		Phone:    profile.Phone,
+		Timezone: profile.Timezone,
+		Language: profile.Language,
+	}
+	if modelProfile.Timezone == "" {
+		modelProfile.Timezone = "Asia/Shanghai"
+	}
+	if modelProfile.Language == "" {
+		modelProfile.Language = "zh-CN"
+	}
+
+	if err := r.db.WithContext(ctx).Create(modelProfile).Error; err != nil {
+		return err
+	}
+
+	profile.ID = modelProfile.ID
+	profile.CreatedAt = modelProfile.CreatedAt
+	profile.UpdatedAt = modelProfile.UpdatedAt
+
+	return r.syncUserFields(ctx, profile)
 }
 
 // GetByUserID 根据用户ID获取资料
 func (r *GormProfileRepository) GetByUserID(ctx context.Context, userID uint) (*UserProfile, error) {
-	var profile UserProfile
-	err := r.db.WithContext(ctx).Where("user_id = ?", userID).First(&profile).Error
-	if err != nil {
+	var modelProfile models.UserProfile
+	if err := r.db.WithContext(ctx).Where("user_id = ?", userID).First(&modelProfile).Error; err != nil {
 		return nil, err
 	}
-	return &profile, nil
+
+	var user models.User
+	if err := r.db.WithContext(ctx).Select("id, first_name, last_name, display_name, department, job_title").
+		Where("id = ?", userID).
+		First(&user).Error; err != nil {
+		return nil, err
+	}
+
+	displayName := user.DisplayName
+	if displayName == "" {
+		displayName = profileDisplayName(user.FirstName, user.LastName)
+	}
+
+	return &UserProfile{
+		ID:          modelProfile.ID,
+		UserID:      modelProfile.UserID,
+		FirstName:   user.FirstName,
+		LastName:    user.LastName,
+		DisplayName: displayName,
+		Avatar:      modelProfile.Avatar,
+		Phone:       modelProfile.Phone,
+		Department:  user.Department,
+		Position:    user.JobTitle,
+		Timezone:    modelProfile.Timezone,
+		Language:    modelProfile.Language,
+		CreatedAt:   modelProfile.CreatedAt,
+		UpdatedAt:   modelProfile.UpdatedAt,
+	}, nil
 }
 
 // Update 更新用户资料
 func (r *GormProfileRepository) Update(ctx context.Context, profile *UserProfile) error {
-	return r.db.WithContext(ctx).Save(profile).Error
+	var modelProfile models.UserProfile
+	err := r.db.WithContext(ctx).Where("user_id = ?", profile.UserID).First(&modelProfile).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		modelProfile = models.UserProfile{
+			UserID: profile.UserID,
+		}
+	} else if err != nil {
+		return err
+	}
+
+	modelProfile.Avatar = profile.Avatar
+	modelProfile.Phone = profile.Phone
+	if profile.Timezone != "" {
+		modelProfile.Timezone = profile.Timezone
+	}
+	if profile.Language != "" {
+		modelProfile.Language = profile.Language
+	}
+
+	if err := r.db.WithContext(ctx).Save(&modelProfile).Error; err != nil {
+		return err
+	}
+
+	profile.ID = modelProfile.ID
+	profile.CreatedAt = modelProfile.CreatedAt
+	profile.UpdatedAt = modelProfile.UpdatedAt
+
+	return r.syncUserFields(ctx, profile)
 }
 
 // Delete 删除用户资料
 func (r *GormProfileRepository) Delete(ctx context.Context, userID uint) error {
-	return r.db.WithContext(ctx).Where("user_id = ?", userID).Delete(&UserProfile{}).Error
+	return r.db.WithContext(ctx).Where("user_id = ?", userID).Delete(&models.UserProfile{}).Error
+}
+
+func (r *GormProfileRepository) syncUserFields(ctx context.Context, profile *UserProfile) error {
+	updates := map[string]interface{}{
+		"first_name":   profile.FirstName,
+		"last_name":    profile.LastName,
+		"display_name": profile.DisplayName,
+		"department":   profile.Department,
+		"job_title":    profile.Position,
+	}
+	return r.db.WithContext(ctx).Model(&models.User{}).Where("id = ?", profile.UserID).Updates(updates).Error
+}
+
+func profileDisplayName(firstName, lastName string) string {
+	if firstName == "" && lastName == "" {
+		return ""
+	}
+	if firstName == "" {
+		return lastName
+	}
+	if lastName == "" {
+		return firstName
+	}
+	return firstName + " " + lastName
 }
 
 // Create 创建登录尝试记录
