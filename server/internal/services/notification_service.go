@@ -16,15 +16,15 @@ import (
 	"strings"
 	"time"
 
-	"gorm.io/gorm"
 	"gongdan-system/internal/models"
+	"gorm.io/gorm"
 )
 
 // NotificationServiceInterface 通知服务接口
 type NotificationServiceInterface interface {
 	// Webhook相关方法 (现有功能)
 	SendNotification(ctx context.Context, event *NotificationEvent) error
-	
+
 	// 通知管理相关方法
 	CreateNotification(ctx context.Context, req *models.NotificationCreateRequest) (*models.Notification, error)
 	GetNotifications(ctx context.Context, filter *models.NotificationFilter) ([]*models.Notification, int64, error)
@@ -32,15 +32,15 @@ type NotificationServiceInterface interface {
 	MarkAsRead(ctx context.Context, notificationID uint, userID uint) error
 	MarkAllAsRead(ctx context.Context, userID uint) error
 	GetUnreadCount(ctx context.Context, userID uint) (int64, error)
-	
+
 	// 通知偏好设置
 	GetNotificationPreferences(ctx context.Context, userID uint) ([]*models.NotificationPreference, error)
 	UpdateNotificationPreferences(ctx context.Context, userID uint, preferences []models.NotificationPreference) error
-	
+
 	// 自动通知生成
 	NotifyTicketStatusChanged(ctx context.Context, ticket *models.Ticket, oldStatus models.TicketStatus, userID uint) error
 	NotifyTicketAssigned(ctx context.Context, ticket *models.Ticket, userID uint) error
-	
+
 	// 邮件通知相关方法
 	ProcessPendingEmailNotifications(ctx context.Context) error
 	RetryFailedEmailNotifications(ctx context.Context) error
@@ -49,10 +49,11 @@ type NotificationServiceInterface interface {
 
 // NotificationService 通知服务
 type NotificationService struct {
-	db                      *gorm.DB
-	client                  *http.Client
+	db                       *gorm.DB
+	client                   *http.Client
 	emailNotificationService EmailNotificationServiceInterface
-	webhookMaxConcurrent    int
+	webhookMaxConcurrent     int
+	environment              string
 }
 
 // NewNotificationService 创建通知服务实例
@@ -63,6 +64,7 @@ func NewNotificationService(db *gorm.DB) *NotificationService {
 			Timeout: 30 * time.Second,
 		},
 		webhookMaxConcurrent: getWebhookMaxConcurrent(),
+		environment:          getRuntimeEnvironment(),
 	}
 }
 
@@ -73,15 +75,15 @@ func (ns *NotificationService) SetEmailNotificationService(emailService EmailNot
 
 // NotificationEvent 通知事件
 type NotificationEvent struct {
-	Type       models.WebhookEventType `json:"type"`
-	ResourceID uint                    `json:"resource_id"`
-	ResourceType string                `json:"resource_type"`
-	Title      string                  `json:"title"`
-	Description string                 `json:"description"`
-	Data       map[string]interface{}  `json:"data"`
-	Metadata   map[string]string       `json:"metadata"`
-	Timestamp  time.Time               `json:"timestamp"`
-	UserID     *uint                   `json:"user_id,omitempty"`
+	Type         models.WebhookEventType `json:"type"`
+	ResourceID   uint                    `json:"resource_id"`
+	ResourceType string                  `json:"resource_type"`
+	Title        string                  `json:"title"`
+	Description  string                  `json:"description"`
+	Data         map[string]interface{}  `json:"data"`
+	Metadata     map[string]string       `json:"metadata"`
+	Timestamp    time.Time               `json:"timestamp"`
+	UserID       *uint                   `json:"user_id,omitempty"`
 }
 
 // SendNotification 发送通知
@@ -104,7 +106,7 @@ func (ns *NotificationService) SendNotification(ctx context.Context, event *Noti
 		maxConcurrent = 5
 	}
 	sem := make(chan struct{}, maxConcurrent)
-	
+
 	for _, config := range configs {
 		sem <- struct{}{}
 		go func(cfg *models.WebhookConfig) {
@@ -185,10 +187,18 @@ func getWebhookMaxConcurrent() int {
 	return 5
 }
 
+func getRuntimeEnvironment() string {
+	env := strings.TrimSpace(os.Getenv("ENVIRONMENT"))
+	if env == "" {
+		return "development"
+	}
+	return env
+}
+
 // getActiveWebhooks 获取活跃的webhook配置
 func (ns *NotificationService) getActiveWebhooks(eventType models.WebhookEventType) ([]*models.WebhookConfig, error) {
 	var configs []*models.WebhookConfig
-	
+
 	// 查询活跃状态的webhook配置
 	if err := ns.db.Where("status = ?", models.WebhookStatusActive).
 		Find(&configs).Error; err != nil {
@@ -209,7 +219,7 @@ func (ns *NotificationService) getActiveWebhooks(eventType models.WebhookEventTy
 // sendWebhook 发送单个webhook
 func (ns *NotificationService) sendWebhook(ctx context.Context, config *models.WebhookConfig, event *NotificationEvent) error {
 	startTime := time.Now()
-	
+
 	// 创建日志记录
 	log := &models.WebhookLog{
 		ConfigID:     config.ID,
@@ -218,7 +228,7 @@ func (ns *NotificationService) sendWebhook(ctx context.Context, config *models.W
 		ResourceType: event.ResourceType,
 		Status:       "pending",
 		MaxRetries:   config.RetryCount,
-		Environment:  "development", // TODO: 从配置获取
+		Environment:  ns.environment,
 	}
 
 	// 序列化事件数据
@@ -258,7 +268,7 @@ func (ns *NotificationService) sendWebhook(ctx context.Context, config *models.W
 
 	// 设置请求头
 	ns.setRequestHeaders(req, config, requestBody)
-	
+
 	// 记录请求头
 	headerBytes, _ := json.Marshal(req.Header)
 	log.RequestHeaders = string(headerBytes)
@@ -287,16 +297,16 @@ func (ns *NotificationService) sendWebhook(ctx context.Context, config *models.W
 	// 判断请求是否成功
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		log.Status = "success"
-		
+
 		// 更新配置统计
 		ns.updateConfigStats(config.ID, true, nil)
 	} else {
 		log.Status = "failed"
 		log.ErrorMessage = fmt.Sprintf("HTTP错误: %d %s", resp.StatusCode, string(respBody))
-		
+
 		// 更新配置统计
 		ns.updateConfigStats(config.ID, false, fmt.Errorf("HTTP %d", resp.StatusCode))
-		
+
 		// 如果需要重试，设置重试时间
 		if log.RetryCount < log.MaxRetries {
 			nextRetry := time.Now().Add(time.Duration(config.RetryInterval) * time.Second)
@@ -330,7 +340,7 @@ func (ns *NotificationService) generateMessage(config *models.WebhookConfig, eve
 func (ns *NotificationService) renderTemplate(template string, event *NotificationEvent) (string, error) {
 	// 简单的模板变量替换
 	message := template
-	
+
 	// 替换基本变量
 	replacements := map[string]string{
 		"{{title}}":       event.Title,
@@ -362,7 +372,7 @@ func (ns *NotificationService) getDefaultMessage(provider models.WebhookProvider
 	case models.WebhookProviderLark:
 		return ns.getLarkMessage(event)
 	default:
-		return fmt.Sprintf("**%s**\n\n%s\n\n时间: %s", 
+		return fmt.Sprintf("**%s**\n\n%s\n\n时间: %s",
 			event.Title, event.Description, event.Timestamp.Format("2006-01-02 15:04:05"))
 	}
 }
@@ -391,7 +401,7 @@ func (ns *NotificationService) getWeChatMessage(event *NotificationEvent) string
 
 **工单编号**: %v
 **时间**: %s
-**类型**: %s`, 
+**类型**: %s`,
 		statusEmoji, event.Title, event.Description,
 		event.Data["ticket_number"], event.Timestamp.Format("2006-01-02 15:04:05"),
 		string(event.Type))
@@ -405,7 +415,7 @@ func (ns *NotificationService) getDingTalkMessage(event *NotificationEvent) stri
 
 - **工单编号**: %v
 - **时间**: %s
-- **类型**: %s`, 
+- **类型**: %s`,
 		event.Title, event.Description,
 		event.Data["ticket_number"], event.Timestamp.Format("2006-01-02 15:04:05"),
 		string(event.Type))
@@ -420,7 +430,7 @@ func (ns *NotificationService) getLarkMessage(event *NotificationEvent) string {
 **详细信息**:
 - 工单编号: %v
 - 时间: %s  
-- 类型: %s`, 
+- 类型: %s`,
 		event.Title, event.Description,
 		event.Data["ticket_number"], event.Timestamp.Format("2006-01-02 15:04:05"),
 		string(event.Type))
@@ -443,7 +453,7 @@ func (ns *NotificationService) buildRequestBody(config *models.WebhookConfig, me
 	default:
 		// 自定义webhook，使用通用格式
 		return json.Marshal(map[string]interface{}{
-			"text": message,
+			"text":      message,
 			"timestamp": time.Now().Unix(),
 		})
 	}
@@ -489,7 +499,7 @@ func (ns *NotificationService) setRequestHeaders(req *http.Request, config *mode
 	if config.Provider == models.WebhookProviderDingTalk && config.Secret != "" {
 		timestamp := time.Now().UnixMilli()
 		sign := ns.generateDingTalkSign(timestamp, config.Secret)
-		
+
 		// 将签名添加到URL参数中
 		originalURL := req.URL.String()
 		if strings.Contains(originalURL, "?") {
@@ -528,7 +538,7 @@ func (ns *NotificationService) generateLarkSign(timestamp, secret string) string
 func (ns *NotificationService) updateConfigStats(configID uint, success bool, err error) {
 	updates := map[string]interface{}{
 		"last_triggered_at": time.Now(),
-		"total_sent":       gorm.Expr("total_sent + 1"),
+		"total_sent":        gorm.Expr("total_sent + 1"),
 	}
 
 	if success {
@@ -563,14 +573,14 @@ func (ns *NotificationService) TestWebhook(ctx context.Context, configID uint) e
 
 	// 创建测试事件
 	testEvent := &NotificationEvent{
-		Type:        models.WebhookEventSystemAlert,
-		ResourceID:  0,
+		Type:         models.WebhookEventSystemAlert,
+		ResourceID:   0,
 		ResourceType: "test",
-		Title:       "Webhook测试通知",
-		Description: "这是一个测试消息，用于验证Webhook配置是否正常工作。",
+		Title:        "Webhook测试通知",
+		Description:  "这是一个测试消息，用于验证Webhook配置是否正常工作。",
 		Data: map[string]interface{}{
 			"ticket_number": "TEST-001",
-			"test": true,
+			"test":          true,
 		},
 		Metadata: map[string]string{
 			"source": "webhook_test",
@@ -584,9 +594,9 @@ func (ns *NotificationService) TestWebhook(ctx context.Context, configID uint) e
 // RetryFailedWebhooks 重试失败的webhook
 func (ns *NotificationService) RetryFailedWebhooks(ctx context.Context) error {
 	var logs []models.WebhookLog
-	
+
 	// 查找需要重试的日志
-	if err := ns.db.Where("status = ? AND next_retry_at IS NOT NULL AND next_retry_at <= ? AND retry_count < max_retries", 
+	if err := ns.db.Where("status = ? AND next_retry_at IS NOT NULL AND next_retry_at <= ? AND retry_count < max_retries",
 		"retrying", time.Now()).
 		Preload("Config").
 		Find(&logs).Error; err != nil {
@@ -678,90 +688,90 @@ func (ns *NotificationService) CreateNotification(ctx context.Context, req *mode
 
 // GetNotifications 获取通知列表
 func (ns *NotificationService) GetNotifications(ctx context.Context, filter *models.NotificationFilter) ([]*models.Notification, int64, error) {
-    baseQuery := ns.db.WithContext(ctx).Model(&models.Notification{})
+	baseQuery := ns.db.WithContext(ctx).Model(&models.Notification{})
 
-    // 应用过滤条件
-    if filter.RecipientID != nil {
-        baseQuery = baseQuery.Where("recipient_id = ?", *filter.RecipientID)
-    }
-    if filter.SenderID != nil {
-        baseQuery = baseQuery.Where("sender_id = ?", *filter.SenderID)
-    }
-    if len(filter.Types) > 0 {
-        baseQuery = baseQuery.Where("type IN ?", filter.Types)
-    }
-    if len(filter.Priorities) > 0 {
-        baseQuery = baseQuery.Where("priority IN ?", filter.Priorities)
-    }
-    if len(filter.Channels) > 0 {
-        baseQuery = baseQuery.Where("channel IN ?", filter.Channels)
-    }
-    if filter.IsRead != nil {
-        baseQuery = baseQuery.Where("is_read = ?", *filter.IsRead)
-    }
-    if filter.IsSent != nil {
-        baseQuery = baseQuery.Where("is_sent = ?", *filter.IsSent)
-    }
-    if filter.IsDelivered != nil {
-        baseQuery = baseQuery.Where("is_delivered = ?", *filter.IsDelivered)
-    }
-    if filter.RelatedType != "" {
-        baseQuery = baseQuery.Where("related_type = ?", filter.RelatedType)
-    }
-    if filter.RelatedID != nil {
-        baseQuery = baseQuery.Where("related_id = ?", *filter.RelatedID)
-    }
-    if filter.RelatedTicketID != nil {
-        baseQuery = baseQuery.Where("related_ticket_id = ?", *filter.RelatedTicketID)
-    }
-    if filter.CreatedAfter != nil {
-        baseQuery = baseQuery.Where("created_at >= ?", *filter.CreatedAfter)
-    }
-    if filter.CreatedBefore != nil {
-        baseQuery = baseQuery.Where("created_at <= ?", *filter.CreatedBefore)
-    }
-    if filter.Query != "" {
-        keyword := fmt.Sprintf("%%%s%%", filter.Query)
-        baseQuery = baseQuery.Where("title ILIKE ? OR content ILIKE ?", keyword, keyword)
-    }
+	// 应用过滤条件
+	if filter.RecipientID != nil {
+		baseQuery = baseQuery.Where("recipient_id = ?", *filter.RecipientID)
+	}
+	if filter.SenderID != nil {
+		baseQuery = baseQuery.Where("sender_id = ?", *filter.SenderID)
+	}
+	if len(filter.Types) > 0 {
+		baseQuery = baseQuery.Where("type IN ?", filter.Types)
+	}
+	if len(filter.Priorities) > 0 {
+		baseQuery = baseQuery.Where("priority IN ?", filter.Priorities)
+	}
+	if len(filter.Channels) > 0 {
+		baseQuery = baseQuery.Where("channel IN ?", filter.Channels)
+	}
+	if filter.IsRead != nil {
+		baseQuery = baseQuery.Where("is_read = ?", *filter.IsRead)
+	}
+	if filter.IsSent != nil {
+		baseQuery = baseQuery.Where("is_sent = ?", *filter.IsSent)
+	}
+	if filter.IsDelivered != nil {
+		baseQuery = baseQuery.Where("is_delivered = ?", *filter.IsDelivered)
+	}
+	if filter.RelatedType != "" {
+		baseQuery = baseQuery.Where("related_type = ?", filter.RelatedType)
+	}
+	if filter.RelatedID != nil {
+		baseQuery = baseQuery.Where("related_id = ?", *filter.RelatedID)
+	}
+	if filter.RelatedTicketID != nil {
+		baseQuery = baseQuery.Where("related_ticket_id = ?", *filter.RelatedTicketID)
+	}
+	if filter.CreatedAfter != nil {
+		baseQuery = baseQuery.Where("created_at >= ?", *filter.CreatedAfter)
+	}
+	if filter.CreatedBefore != nil {
+		baseQuery = baseQuery.Where("created_at <= ?", *filter.CreatedBefore)
+	}
+	if filter.Query != "" {
+		keyword := fmt.Sprintf("%%%s%%", filter.Query)
+		baseQuery = baseQuery.Where("title ILIKE ? OR content ILIKE ?", keyword, keyword)
+	}
 
-    // 统计总数
-    var total int64
-    if err := baseQuery.Count(&total).Error; err != nil {
-        return nil, 0, fmt.Errorf("统计通知数量失败: %w", err)
-    }
+	// 统计总数
+	var total int64
+	if err := baseQuery.Count(&total).Error; err != nil {
+		return nil, 0, fmt.Errorf("统计通知数量失败: %w", err)
+	}
 
-    // 构建数据查询
-    dataQuery := baseQuery.Session(&gorm.Session{NewDB: true})
+	// 构建数据查询
+	dataQuery := baseQuery.Session(&gorm.Session{NewDB: true})
 
-    // 排序
-    orderBy := "created_at"
-    orderDir := "desc"
-    if filter.OrderBy != "" {
-        orderBy = filter.OrderBy
-    }
-    if filter.OrderDir != "" {
-        orderDir = filter.OrderDir
-    }
-    dataQuery = dataQuery.Order(fmt.Sprintf("%s %s", orderBy, orderDir))
+	// 排序
+	orderBy := "created_at"
+	orderDir := "desc"
+	if filter.OrderBy != "" {
+		orderBy = filter.OrderBy
+	}
+	if filter.OrderDir != "" {
+		orderDir = filter.OrderDir
+	}
+	dataQuery = dataQuery.Order(fmt.Sprintf("%s %s", orderBy, orderDir))
 
-    // 分页
-    if filter.Limit > 0 {
-        dataQuery = dataQuery.Limit(filter.Limit)
-    }
-    if filter.Offset > 0 {
-        dataQuery = dataQuery.Offset(filter.Offset)
-    }
+	// 分页
+	if filter.Limit > 0 {
+		dataQuery = dataQuery.Limit(filter.Limit)
+	}
+	if filter.Offset > 0 {
+		dataQuery = dataQuery.Offset(filter.Offset)
+	}
 
-    // 预加载关联数据
-    dataQuery = dataQuery.Preload("Recipient").Preload("Sender").Preload("RelatedTicket")
+	// 预加载关联数据
+	dataQuery = dataQuery.Preload("Recipient").Preload("Sender").Preload("RelatedTicket")
 
-    var notifications []*models.Notification
-    if err := dataQuery.Find(&notifications).Error; err != nil {
-        return nil, 0, fmt.Errorf("获取通知列表失败: %w", err)
-    }
+	var notifications []*models.Notification
+	if err := dataQuery.Find(&notifications).Error; err != nil {
+		return nil, 0, fmt.Errorf("获取通知列表失败: %w", err)
+	}
 
-    return notifications, total, nil
+	return notifications, total, nil
 }
 
 // MarkAsRead 标记通知为已读
@@ -879,9 +889,9 @@ func (ns *NotificationService) NotifyTicketStatusChanged(ctx context.Context, ti
 			RelatedTicketID: &ticket.ID,
 			ActionURL:       fmt.Sprintf("/tickets/%d", ticket.ID),
 			Metadata: map[string]interface{}{
-				"old_status":     string(oldStatus),
-				"new_status":     string(ticket.Status),
-				"ticket_number":  ticket.TicketNumber,
+				"old_status":    string(oldStatus),
+				"new_status":    string(ticket.Status),
+				"ticket_number": ticket.TicketNumber,
 			},
 		}
 
@@ -931,7 +941,7 @@ func (ns *NotificationService) ProcessPendingEmailNotifications(ctx context.Cont
 
 	// 查询待发送的邮件通知
 	var notifications []*models.Notification
-	err := ns.db.Where("channel = ? AND is_sent = false AND (scheduled_at IS NULL OR scheduled_at <= ?)", 
+	err := ns.db.Where("channel = ? AND is_sent = false AND (scheduled_at IS NULL OR scheduled_at <= ?)",
 		models.NotificationChannelEmail, time.Now()).
 		Preload("Recipient").
 		Preload("Sender").

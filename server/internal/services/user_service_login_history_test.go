@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -158,5 +159,107 @@ func TestGetLoginHistoryFilters(t *testing.T) {
 	}
 	if records[0].SessionID != "sess-1" {
 		t.Fatalf("expected session sess-1, got %s", records[0].SessionID)
+	}
+}
+
+func TestGetLoginHistory_InvalidOrderByFallsBackToDefault(t *testing.T) {
+	db := setupUserServiceLoginHistoryDB(t)
+	svc := NewUserService(db)
+
+	userID := seedUserForLoginHistory(t, db, "sort@example.com")
+	now := time.Now()
+	oldLogin := now.Add(-3 * time.Hour)
+	newLogin := now.Add(-1 * time.Hour)
+
+	fixtures := []models.LoginHistory{
+		{
+			UserID:      userID,
+			Username:    "sort-user",
+			Email:       "sort@example.com",
+			IPAddress:   "10.0.0.11",
+			LoginTime:   oldLogin,
+			LoginStatus: models.LoginStatusSuccess,
+			DeviceType:  "desktop",
+			LoginMethod: "password",
+			SessionID:   "sort-sess-old",
+			IsActive:    true,
+		},
+		{
+			UserID:      userID,
+			Username:    "sort-user",
+			Email:       "sort@example.com",
+			IPAddress:   "10.0.0.12",
+			LoginTime:   newLogin,
+			LoginStatus: models.LoginStatusSuccess,
+			DeviceType:  "desktop",
+			LoginMethod: "password",
+			SessionID:   "sort-sess-new",
+			IsActive:    true,
+		},
+	}
+	if err := db.Create(&fixtures).Error; err != nil {
+		t.Fatalf("failed to seed login history: %v", err)
+	}
+
+	req := &models.LoginHistoryRequest{
+		Page:     1,
+		PageSize: 10,
+		OrderBy:  "login_time; DROP TABLE login_histories;--",
+		Order:    "ASC INVALID",
+	}
+	records, _, err := svc.GetLoginHistory(context.Background(), userID, req)
+	if err != nil {
+		t.Fatalf("GetLoginHistory returned error: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(records))
+	}
+	if records[0].SessionID != "sort-sess-new" {
+		t.Fatalf("expected fallback default order by latest login_time first, got %s", records[0].SessionID)
+	}
+}
+
+func TestDeleteLoginSession(t *testing.T) {
+	db := setupUserServiceLoginHistoryDB(t)
+	svc := NewUserService(db)
+
+	ownerID := seedUserForLoginHistory(t, db, "owner@example.com")
+	otherID := seedUserForLoginHistory(t, db, "other-owner@example.com")
+
+	loginTime := time.Now().Add(-30 * time.Minute)
+	session := &models.LoginHistory{
+		UserID:      ownerID,
+		Username:    "owner",
+		Email:       "owner@example.com",
+		IPAddress:   "127.0.0.1",
+		LoginTime:   loginTime,
+		LoginStatus: models.LoginStatusSuccess,
+		DeviceType:  "desktop",
+		LoginMethod: "password",
+		SessionID:   "owner-session",
+		IsActive:    true,
+	}
+	if err := db.Create(session).Error; err != nil {
+		t.Fatalf("failed to create login history: %v", err)
+	}
+
+	if err := svc.DeleteLoginSession(context.Background(), ownerID, session.ID); err != nil {
+		t.Fatalf("DeleteLoginSession returned error: %v", err)
+	}
+
+	var refreshed models.LoginHistory
+	if err := db.First(&refreshed, session.ID).Error; err != nil {
+		t.Fatalf("failed to fetch login history: %v", err)
+	}
+	if refreshed.IsActive {
+		t.Fatalf("expected session to be inactive after delete")
+	}
+	if refreshed.LogoutTime == nil {
+		t.Fatalf("expected logout_time to be set")
+	}
+
+	err := svc.DeleteLoginSession(context.Background(), otherID, session.ID)
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("expected gorm.ErrRecordNotFound for cross-user delete, got %v", err)
 	}
 }

@@ -536,7 +536,7 @@ func (h *UserHandler) DeleteLoginSession(c *gin.Context) {
 	}
 
 	historyIDStr := c.Param("id")
-	_, err := strconv.ParseUint(historyIDStr, 10, 32)
+	historyIDValue, err := strconv.ParseUint(historyIDStr, 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, ApiResponse{
 			Code: 1,
@@ -546,8 +546,23 @@ func (h *UserHandler) DeleteLoginSession(c *gin.Context) {
 		return
 	}
 
-	// TODO: 实现删除登录会话的逻辑
-	// 这里需要调用用户服务的方法来删除指定会话
+	historyID := uint(historyIDValue)
+	if err := h.userService.DeleteLoginSession(c.Request.Context(), userID, historyID); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, ApiResponse{
+				Code: 1,
+				Msg:  "会话不存在",
+				Data: nil,
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, ApiResponse{
+			Code: 1,
+			Msg:  "删除会话失败",
+			Data: nil,
+		})
+		return
+	}
 
 	c.JSON(http.StatusOK, ApiResponse{
 		Code: 0,

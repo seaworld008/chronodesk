@@ -390,6 +390,12 @@ func main() {
 
 		// 设置全局WebSocket通知服务以供hook使用
 		websocketPkg.SetGlobalNotificationService(wsNotificationService)
+		websocketPkg.SetNotificationReadHandler(func(ctx context.Context, userID uint, notificationID uint) (int64, error) {
+			if err := notificationService.MarkAsRead(ctx, notificationID, userID); err != nil {
+				return 0, err
+			}
+			return notificationService.GetUnreadCount(ctx, userID)
+		})
 
 		// 管理员通知管理路由
 		admin.POST("/notifications", notificationHandler.CreateNotification)       // 创建通知（管理员）

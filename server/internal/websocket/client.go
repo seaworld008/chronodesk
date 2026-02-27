@@ -1,6 +1,7 @@
 package websocket
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -131,14 +132,14 @@ func (c *Client) readPump() {
 		c.hub.unregister <- c
 		c.conn.Close()
 	}()
-	
+
 	c.conn.SetReadLimit(maxMessageSize)
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(string) error {
 		c.conn.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
-	
+
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
@@ -147,7 +148,7 @@ func (c *Client) readPump() {
 			}
 			break
 		}
-		
+
 		// Handle incoming messages from client
 		c.handleMessage(message)
 	}
@@ -164,7 +165,7 @@ func (c *Client) writePump() {
 		ticker.Stop()
 		c.conn.Close()
 	}()
-	
+
 	for {
 		select {
 		case message, ok := <-c.send:
@@ -191,7 +192,7 @@ func (c *Client) writePump() {
 			if err := w.Close(); err != nil {
 				return
 			}
-			
+
 		case <-ticker.C:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
@@ -233,7 +234,7 @@ func (c *Client) sendPong() {
 		"type":      "pong",
 		"timestamp": time.Now().Unix(),
 	}
-	
+
 	responseBytes, _ := json.Marshal(response)
 	select {
 	case c.send <- responseBytes:
@@ -248,8 +249,9 @@ func (c *Client) handleMarkRead(msg map[string]interface{}) {
 	if idFloat, ok := msg["notification_id"].(float64); ok {
 		notificationID := uint(idFloat)
 		log.Printf("Client %d wants to mark notification %d as read", c.UserID, notificationID)
-		// TODO: Implement actual mark as read functionality
-		// This would call the notification service to mark the notification as read
+		if err := MarkNotificationAsReadHook(context.Background(), c.UserID, notificationID); err != nil {
+			log.Printf("Failed to mark notification %d as read for user %d: %v", notificationID, c.UserID, err)
+		}
 	}
 }
 
@@ -261,7 +263,7 @@ func ServeWS(hub *Hub, c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
 	}
-	
+
 	userID, ok := userIDInterface.(uint)
 	if !ok {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid user ID"})
@@ -273,7 +275,7 @@ func ServeWS(hub *Hub, c *gin.Context) {
 		log.Printf("WebSocket upgrade failed: %v", err)
 		return
 	}
-	
+
 	client := NewClient(hub, conn, userID)
 	client.hub.register <- client
 

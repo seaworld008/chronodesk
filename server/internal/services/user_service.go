@@ -18,6 +18,17 @@ type UserService struct {
 	db *gorm.DB
 }
 
+var loginHistorySortableColumns = map[string]string{
+	"login_time":   "login_time",
+	"created_at":   "created_at",
+	"updated_at":   "updated_at",
+	"ip_address":   "ip_address",
+	"device_type":  "device_type",
+	"login_method": "login_method",
+	"login_status": "login_status",
+	"is_active":    "is_active",
+}
+
 // NewUserService 创建用户服务
 func NewUserService(db *gorm.DB) *UserService {
 	return &UserService{
@@ -184,17 +195,8 @@ func (s *UserService) GetLoginHistory(ctx context.Context, userID uint, req *mod
 		return nil, 0, fmt.Errorf("failed to count login history: %w", err)
 	}
 
-	// 排序
-	orderBy := "login_time"
-	if req.OrderBy != "" {
-		orderBy = req.OrderBy
-	}
-
-	order := "DESC"
-	if req.Order != "" {
-		order = strings.ToUpper(req.Order)
-	}
-
+	// 排序（白名单）
+	orderBy, order := sanitizeLoginHistoryOrder(req.OrderBy, req.Order)
 	query = query.Order(fmt.Sprintf("%s %s", orderBy, order))
 
 	// 分页
@@ -309,6 +311,41 @@ func (s *UserService) RecordLogout(ctx context.Context, userID uint, sessionID s
 
 	if err := s.db.WithContext(ctx).Model(&loginHistory).Updates(updates).Error; err != nil {
 		return fmt.Errorf("failed to update logout time: %w", err)
+	}
+
+	return nil
+}
+
+// DeleteLoginSession 删除指定用户的登录会话（用于踢设备下线）
+func (s *UserService) DeleteLoginSession(ctx context.Context, userID uint, historyID uint) error {
+	var loginHistory models.LoginHistory
+	err := s.db.WithContext(ctx).
+		Where("id = ? AND user_id = ?", historyID, userID).
+		First(&loginHistory).Error
+	if err != nil {
+		return fmt.Errorf("failed to find login session: %w", err)
+	}
+
+	if !loginHistory.IsActive {
+		return nil
+	}
+
+	now := time.Now()
+	updates := map[string]interface{}{
+		"is_active": false,
+	}
+	if loginHistory.LogoutTime == nil {
+		updates["logout_time"] = &now
+	}
+	if !loginHistory.LoginTime.IsZero() {
+		updates["session_duration"] = int64(now.Sub(loginHistory.LoginTime).Seconds())
+	}
+
+	if err := s.db.WithContext(ctx).
+		Model(&models.LoginHistory{}).
+		Where("id = ?", loginHistory.ID).
+		Updates(updates).Error; err != nil {
+		return fmt.Errorf("failed to deactivate login session: %w", err)
 	}
 
 	return nil
@@ -518,6 +555,25 @@ func parseUserAgent(userAgent string) *DeviceInfo {
 	}
 
 	return deviceInfo
+}
+
+func sanitizeLoginHistoryOrder(orderBy, order string) (string, string) {
+	column := "login_time"
+	if requested := strings.ToLower(strings.TrimSpace(orderBy)); requested != "" {
+		if whitelisted, ok := loginHistorySortableColumns[requested]; ok {
+			column = whitelisted
+		}
+	}
+
+	direction := "DESC"
+	switch strings.ToLower(strings.TrimSpace(order)) {
+	case "asc":
+		direction = "ASC"
+	case "desc":
+		direction = "DESC"
+	}
+
+	return column, direction
 }
 
 // 请求和响应结构体
