@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -423,8 +424,8 @@ func (s *AutomationService) executeAssignAction(ctx context.Context, action *mod
 
 	// 更新工单分配
 	updates := map[string]interface{}{
-		"assigned_user_id": userID,
-		"updated_at":       time.Now(),
+		"assigned_to_id": userID,
+		"updated_at":     time.Now(),
 	}
 
 	return s.db.WithContext(ctx).Model(ticket).Updates(updates).Error
@@ -437,18 +438,8 @@ func (s *AutomationService) executeSetPriorityAction(ctx context.Context, action
 		return fmt.Errorf("priority parameter required")
 	}
 
-	priority := fmt.Sprintf("%v", priorityParam)
-	validPriorities := []string{"low", "normal", "high", "critical"}
-
-	found := false
-	for _, p := range validPriorities {
-		if p == priority {
-			found = true
-			break
-		}
-	}
-
-	if !found {
+	priority := models.TicketPriority(fmt.Sprintf("%v", priorityParam))
+	if !priority.IsValid() {
 		return fmt.Errorf("invalid priority: %s", priority)
 	}
 
@@ -467,24 +458,27 @@ func (s *AutomationService) executeSetStatusAction(ctx context.Context, action *
 		return fmt.Errorf("status parameter required")
 	}
 
-	status := fmt.Sprintf("%v", statusParam)
-	validStatuses := []string{"open", "in_progress", "resolved", "closed"}
-
-	found := false
-	for _, s := range validStatuses {
-		if s == status {
-			found = true
-			break
-		}
-	}
-
-	if !found {
+	status := models.TicketStatus(fmt.Sprintf("%v", statusParam))
+	if !status.IsValid() {
 		return fmt.Errorf("invalid status: %s", status)
+	}
+	if !ticket.Status.CanTransitionTo(status) {
+		return fmt.Errorf("%w: %s to %s", ErrInvalidTicketTransition, ticket.Status, status)
 	}
 
 	updates := map[string]interface{}{
 		"status":     status,
 		"updated_at": time.Now(),
+	}
+	now := time.Now()
+	switch status {
+	case models.TicketStatusResolved:
+		updates["resolved_at"] = now
+	case models.TicketStatusClosed:
+		updates["closed_at"] = now
+	case models.TicketStatusOpen:
+		updates["resolved_at"] = nil
+		updates["closed_at"] = nil
 	}
 
 	return s.db.WithContext(ctx).Model(ticket).Updates(updates).Error
@@ -533,10 +527,16 @@ func (s *AutomationService) executeEscalateAction(ctx context.Context, action *m
 		return fmt.Errorf("invalid manager_id: %w", err)
 	}
 
+	var manager models.User
+	if err := s.db.WithContext(ctx).First(&manager, managerID).Error; err != nil {
+		return fmt.Errorf("manager not found: %w", err)
+	}
+
 	updates := map[string]interface{}{
-		"assigned_user_id": managerID,
-		"priority":         "high", // 升级时提高优先级
-		"updated_at":       time.Now(),
+		"assigned_to_id": managerID,
+		"priority":       models.TicketPriorityHigh,
+		"is_escalated":   true,
+		"updated_at":     time.Now(),
 	}
 
 	return s.db.WithContext(ctx).Model(ticket).Updates(updates).Error
@@ -546,16 +546,31 @@ func (s *AutomationService) executeEscalateAction(ctx context.Context, action *m
 func (s *AutomationService) toUint(value interface{}) (uint, error) {
 	switch v := value.(type) {
 	case float64:
+		if v <= 0 || math.Trunc(v) != v || v > float64(^uint(0)) {
+			return 0, fmt.Errorf("value must be a positive integer")
+		}
 		return uint(v), nil
 	case int:
+		if v <= 0 {
+			return 0, fmt.Errorf("value must be positive")
+		}
 		return uint(v), nil
 	case int64:
+		if v <= 0 || uint64(v) > uint64(^uint(0)) {
+			return 0, fmt.Errorf("value must be a positive platform-sized integer")
+		}
 		return uint(v), nil
 	case uint:
+		if v == 0 {
+			return 0, fmt.Errorf("value must be positive")
+		}
 		return v, nil
 	case string:
-		i, err := strconv.ParseUint(v, 10, 32)
-		return uint(i), err
+		i, err := strconv.ParseUint(v, 10, strconv.IntSize)
+		if err != nil || i == 0 {
+			return 0, fmt.Errorf("value must be a positive integer")
+		}
+		return uint(i), nil
 	default:
 		return 0, fmt.Errorf("cannot convert to uint")
 	}
@@ -974,16 +989,30 @@ func (s *AutomationService) BatchUpdateTickets(ctx context.Context, ticketIDs []
 
 	// 验证更新字段
 	allowedFields := map[string]bool{
-		"status":           true,
-		"priority":         true,
-		"assigned_user_id": true,
-		"type":             true,
+		"status":         true,
+		"priority":       true,
+		"assigned_to_id": true,
+		"type":           true,
 	}
 
 	validUpdates := make(map[string]interface{})
 	for key, value := range updates {
 		if !allowedFields[key] {
 			return fmt.Errorf("field %s is not allowed for batch update", key)
+		}
+		switch key {
+		case "status":
+			if !models.TicketStatus(fmt.Sprintf("%v", value)).IsValid() {
+				return fmt.Errorf("invalid status: %v", value)
+			}
+		case "priority":
+			if !models.TicketPriority(fmt.Sprintf("%v", value)).IsValid() {
+				return fmt.Errorf("invalid priority: %v", value)
+			}
+		case "type":
+			if !models.TicketType(fmt.Sprintf("%v", value)).IsValid() {
+				return fmt.Errorf("invalid ticket type: %v", value)
+			}
 		}
 		validUpdates[key] = value
 	}
@@ -1004,8 +1033,8 @@ func (s *AutomationService) BatchAssignTickets(ctx context.Context, ticketIDs []
 	}
 
 	updates := map[string]interface{}{
-		"assigned_user_id": userID,
-		"updated_at":       time.Now(),
+		"assigned_to_id": userID,
+		"updated_at":     time.Now(),
 	}
 
 	return s.BatchUpdateTickets(ctx, ticketIDs, updates)
@@ -1016,32 +1045,38 @@ func (s *AutomationService) ClassifyTicket(ctx context.Context, ticket *models.T
 	// 基于关键词的简单分类逻辑
 	content := strings.ToLower(ticket.Title + " " + ticket.Description)
 
-	// 定义分类规则
-	classificationRules := map[string][]string{
-		"bug":     {"bug", "error", "issue", "problem", "crash", "fail"},
-		"feature": {"feature", "enhancement", "improvement", "add", "new"},
-		"support": {"help", "support", "question", "how to", "guidance"},
-		"urgent":  {"urgent", "critical", "emergency", "asap", "immediately"},
+	updates := map[string]interface{}{}
+	if containsAnyKeyword(content, []string{"urgent", "critical", "emergency", "asap", "immediately"}) {
+		updates["priority"] = models.TicketPriorityHigh
 	}
 
-	// 应用分类规则
-	for category, keywords := range classificationRules {
-		for _, keyword := range keywords {
-			if strings.Contains(content, keyword) {
-				// 更新工单类型或添加标签
-				updates := map[string]interface{}{
-					"type":       category,
-					"updated_at": time.Now(),
-				}
-
-				if category == "urgent" {
-					updates["priority"] = "high"
-				}
-
-				return s.db.WithContext(ctx).Model(ticket).Updates(updates).Error
-			}
+	classificationRules := []struct {
+		ticketType models.TicketType
+		keywords   []string
+	}{
+		{models.TicketTypeIncident, []string{"bug", "error", "issue", "problem", "crash", "fail"}},
+		{models.TicketTypeRequest, []string{"feature", "enhancement", "improvement", "add", "new"}},
+		{models.TicketTypeConsultation, []string{"help", "support", "question", "how to", "guidance"}},
+	}
+	for _, rule := range classificationRules {
+		if containsAnyKeyword(content, rule.keywords) {
+			updates["type"] = rule.ticketType
+			break
 		}
 	}
 
-	return nil
+	if len(updates) == 0 {
+		return nil
+	}
+	updates["updated_at"] = time.Now()
+	return s.db.WithContext(ctx).Model(ticket).Updates(updates).Error
+}
+
+func containsAnyKeyword(content string, keywords []string) bool {
+	for _, keyword := range keywords {
+		if strings.Contains(content, keyword) {
+			return true
+		}
+	}
+	return false
 }

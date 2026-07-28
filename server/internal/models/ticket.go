@@ -18,6 +18,43 @@ const (
 	TicketStatusCancelled  TicketStatus = "cancelled"   // 已取消
 )
 
+// IsValid reports whether the status is part of the persisted ticket state model.
+func (s TicketStatus) IsValid() bool {
+	switch s {
+	case TicketStatusOpen,
+		TicketStatusInProgress,
+		TicketStatusPending,
+		TicketStatusResolved,
+		TicketStatusClosed,
+		TicketStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// CanTransitionTo centralizes the ticket lifecycle used by API and UI workflows.
+func (s TicketStatus) CanTransitionTo(next TicketStatus) bool {
+	if s == next {
+		return true
+	}
+
+	switch s {
+	case TicketStatusOpen:
+		return next == TicketStatusInProgress || next == TicketStatusPending || next == TicketStatusResolved || next == TicketStatusCancelled
+	case TicketStatusInProgress:
+		return next == TicketStatusPending || next == TicketStatusResolved || next == TicketStatusCancelled
+	case TicketStatusPending:
+		return next == TicketStatusInProgress || next == TicketStatusResolved || next == TicketStatusCancelled
+	case TicketStatusResolved:
+		return next == TicketStatusClosed || next == TicketStatusOpen
+	case TicketStatusCancelled:
+		return next == TicketStatusOpen
+	default:
+		return false
+	}
+}
+
 // TicketPriority 工单优先级枚举
 type TicketPriority string
 
@@ -28,6 +65,20 @@ const (
 	TicketPriorityUrgent   TicketPriority = "urgent"   // 紧急
 	TicketPriorityCritical TicketPriority = "critical" // 严重
 )
+
+// IsValid reports whether the priority is part of the persisted ticket model.
+func (p TicketPriority) IsValid() bool {
+	switch p {
+	case TicketPriorityLow,
+		TicketPriorityNormal,
+		TicketPriorityHigh,
+		TicketPriorityUrgent,
+		TicketPriorityCritical:
+		return true
+	default:
+		return false
+	}
+}
 
 // TicketType 工单类型枚举
 type TicketType string
@@ -40,6 +91,21 @@ const (
 	TicketTypeComplaint    TicketType = "complaint"    // 投诉
 	TicketTypeConsultation TicketType = "consultation" // 咨询
 )
+
+// IsValid reports whether the type is part of the persisted ticket model.
+func (t TicketType) IsValid() bool {
+	switch t {
+	case TicketTypeIncident,
+		TicketTypeRequest,
+		TicketTypeProblem,
+		TicketTypeChange,
+		TicketTypeComplaint,
+		TicketTypeConsultation:
+		return true
+	default:
+		return false
+	}
+}
 
 // TicketSource 工单来源枚举
 type TicketSource string
@@ -172,18 +238,18 @@ func (t *Ticket) CanBeClosed() bool {
 
 // TicketCreateRequest 工单创建请求
 type TicketCreateRequest struct {
-	Title         string         `json:"title" validate:"required,max=255"`
-	Description   string         `json:"description" validate:"required"`
-	Type          TicketType     `json:"type" validate:"required,oneof=incident request problem change complaint consultation"`
-	Priority      TicketPriority `json:"priority" validate:"required,oneof=low normal high urgent critical"`
-	Status        *TicketStatus  `json:"status" validate:"omitempty,oneof=open in_progress pending resolved closed cancelled"`
-	Source        TicketSource   `json:"source" validate:"required,oneof=web email phone chat api mobile"`
+	Title         string         `json:"title" binding:"required,max=255"`
+	Description   string         `json:"description" binding:"required,max=10000"`
+	Type          TicketType     `json:"type" binding:"required,oneof=incident request problem change complaint consultation"`
+	Priority      TicketPriority `json:"priority" binding:"required,oneof=low normal high urgent critical"`
+	Status        *TicketStatus  `json:"status" binding:"omitempty,oneof=open in_progress pending resolved closed cancelled"`
+	Source        TicketSource   `json:"source" binding:"required,oneof=web email phone chat api mobile"`
 	AssignedToID  *uint          `json:"assigned_to_id"`
 	CategoryID    *uint          `json:"category_id"`
 	SubcategoryID *uint          `json:"subcategory_id"`
 	Tags          StringList     `json:"tags"`
 	DueDate       *time.Time     `json:"due_date"`
-	CustomerEmail string         `json:"customer_email" validate:"omitempty,email"`
+	CustomerEmail string         `json:"customer_email" binding:"omitempty,email"`
 	CustomerPhone string         `json:"customer_phone"`
 	CustomerName  string         `json:"customer_name"`
 	Attachments   []string       `json:"attachments"`
@@ -192,22 +258,22 @@ type TicketCreateRequest struct {
 
 // TicketUpdateRequest 工单更新请求
 type TicketUpdateRequest struct {
-	Title         *string         `json:"title" validate:"omitempty,max=255"`
-	Description   *string         `json:"description"`
-	Type          *TicketType     `json:"type" validate:"omitempty,oneof=incident request problem change complaint consultation"`
-	Priority      *TicketPriority `json:"priority" validate:"omitempty,oneof=low normal high urgent critical"`
-	Status        *TicketStatus   `json:"status" validate:"omitempty,oneof=open in_progress pending resolved closed cancelled"`
-	Source        *TicketSource   `json:"source" validate:"omitempty,oneof=web email phone chat api mobile"`
+	Title         *string         `json:"title" binding:"omitempty,min=1,max=255"`
+	Description   *string         `json:"description" binding:"omitempty,min=1,max=10000"`
+	Type          *TicketType     `json:"type" binding:"omitempty,oneof=incident request problem change complaint consultation"`
+	Priority      *TicketPriority `json:"priority" binding:"omitempty,oneof=low normal high urgent critical"`
+	Status        *TicketStatus   `json:"status" binding:"omitempty,oneof=open in_progress pending resolved closed cancelled"`
+	Source        *TicketSource   `json:"source" binding:"omitempty,oneof=web email phone chat api mobile"`
 	AssignedToID  *uint           `json:"assigned_to_id"`
 	CategoryID    *uint           `json:"category_id"`
 	SubcategoryID *uint           `json:"subcategory_id"`
 	Tags          StringList      `json:"tags"`
 	DueDate       *time.Time      `json:"due_date"`
-	CustomerEmail *string         `json:"customer_email" validate:"omitempty,email"`
+	CustomerEmail *string         `json:"customer_email"`
 	CustomerPhone *string         `json:"customer_phone"`
 	CustomerName  *string         `json:"customer_name"`
 	InternalNotes *string         `json:"internal_notes"`
-	Rating        *int            `json:"rating" validate:"omitempty,min=1,max=5"`
+	Rating        *int            `json:"rating" binding:"omitempty,min=1,max=5"`
 	RatingComment *string         `json:"rating_comment"`
 	CustomFields  *JSONMap        `json:"custom_fields"`
 }

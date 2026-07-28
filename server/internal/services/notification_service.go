@@ -670,8 +670,8 @@ func (ns *NotificationService) CreateNotification(ctx context.Context, req *mode
 	// 如果是邮件通知，异步发送邮件
 	if notification.Channel == models.NotificationChannelEmail && ns.emailNotificationService != nil {
 		go func() {
-			// 创建一个新的上下文用于后台任务
-			bgCtx := context.Background()
+			bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
 			if err := ns.emailNotificationService.SendEmailNotification(bgCtx, notification); err != nil {
 				// 记录错误，但不影响主流程
 				fmt.Printf("发送邮件通知失败 (ID: %d): %v\n", notification.ID, err)

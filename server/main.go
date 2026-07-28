@@ -133,14 +133,18 @@ func main() {
 
 	// 健康检查端点
 	r.GET("/healthz", func(c *gin.Context) {
-		// 检查数据库连接
 		dbStatus := "ok"
+		status := "ok"
+		statusCode := http.StatusOK
 		if err := db.HealthCheck(); err != nil {
-			dbStatus = "error: " + err.Error()
+			log.Printf("Database health check failed: %v", err)
+			dbStatus = "error"
+			status = "unhealthy"
+			statusCode = http.StatusServiceUnavailable
 		}
 
-		c.JSON(http.StatusOK, gin.H{
-			"status":   "ok",
+		c.JSON(statusCode, gin.H{
+			"status":   status,
 			"message":  "Ticket System API is running",
 			"version":  "1.0.0",
 			"database": dbStatus,
@@ -449,64 +453,69 @@ func main() {
 			webhooks.GET("/:id/stats", webhookHandler.GetWebhookStats) // 获取webhook统计
 		}
 
-		// Redis 连接测试端点
-		api.GET("/redis/test", func(c *gin.Context) {
-			if db.Redis == nil {
-				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"status":  "error",
-					"message": "Redis client not initialized",
+		// Redis 连接测试端点（仅管理员）
+		api.GET(
+			"/redis/test",
+			ginAdapter(authModule.Handler.RequireAuth),
+			ginAdapter(authModule.Handler.RequireRole(auth.RoleAdmin)),
+			func(c *gin.Context) {
+				if db.Redis == nil {
+					c.JSON(http.StatusServiceUnavailable, gin.H{
+						"status":  "error",
+						"message": "Redis client not initialized",
+					})
+					return
+				}
+
+				// 测试 Redis 连接
+				ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+				defer cancel()
+
+				// 执行 PING 命令
+				err := db.Redis.Ping(ctx)
+				if err != nil {
+					c.JSON(http.StatusServiceUnavailable, gin.H{
+						"status":  "error",
+						"message": "Redis ping failed",
+						"error":   err.Error(),
+					})
+					return
+				}
+
+				// 测试 SET/GET 操作
+				testKey := "test:connection"
+				testValue := "redis_working"
+
+				err = db.Redis.Set(ctx, testKey, testValue, 10*time.Second)
+				if err != nil {
+					c.JSON(http.StatusServiceUnavailable, gin.H{
+						"status":  "error",
+						"message": "Redis SET operation failed",
+						"error":   err.Error(),
+					})
+					return
+				}
+
+				getValue, err := db.Redis.Get(ctx, testKey)
+				if err != nil {
+					c.JSON(http.StatusServiceUnavailable, gin.H{
+						"status":  "error",
+						"message": "Redis GET operation failed",
+						"error":   err.Error(),
+					})
+					return
+				}
+
+				// 清理测试数据
+				db.Redis.Del(ctx, testKey)
+
+				c.JSON(http.StatusOK, gin.H{
+					"status":     "ok",
+					"message":    "Redis connection successful",
+					"test_value": getValue,
 				})
-				return
-			}
-
-			// 测试 Redis 连接
-			ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-			defer cancel()
-
-			// 执行 PING 命令
-			err := db.Redis.Ping(ctx)
-			if err != nil {
-				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"status":  "error",
-					"message": "Redis ping failed",
-					"error":   err.Error(),
-				})
-				return
-			}
-
-			// 测试 SET/GET 操作
-			testKey := "test:connection"
-			testValue := "redis_working"
-
-			err = db.Redis.Set(ctx, testKey, testValue, 10*time.Second)
-			if err != nil {
-				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"status":  "error",
-					"message": "Redis SET operation failed",
-					"error":   err.Error(),
-				})
-				return
-			}
-
-			getValue, err := db.Redis.Get(ctx, testKey)
-			if err != nil {
-				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"status":  "error",
-					"message": "Redis GET operation failed",
-					"error":   err.Error(),
-				})
-				return
-			}
-
-			// 清理测试数据
-			db.Redis.Del(ctx, testKey)
-
-			c.JSON(http.StatusOK, gin.H{
-				"status":     "ok",
-				"message":    "Redis connection successful",
-				"test_value": getValue,
-			})
-		})
+			},
+		)
 	}
 
 	// 启动服务器

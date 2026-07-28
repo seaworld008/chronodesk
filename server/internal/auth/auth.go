@@ -192,20 +192,20 @@ type RefreshTokenRequest struct {
 
 // ChangePasswordRequest 修改密码请求
 type ChangePasswordRequest struct {
-	CurrentPassword string `json:"current_password" validate:"required"`
-	NewPassword     string `json:"new_password" validate:"required,min=8"`
+	CurrentPassword string `json:"current_password" binding:"required"`
+	NewPassword     string `json:"new_password" binding:"required,min=8"`
 }
 
 // ForgotPasswordRequest 忘记密码请求
 type ForgotPasswordRequest struct {
-	Email string `json:"email" validate:"required,email"`
+	Email string `json:"email" binding:"required,email"`
 }
 
 // ResetPasswordRequest 重置密码请求
 type ResetPasswordRequest struct {
-	Token       string `json:"token" validate:"required"`
-	NewPassword string `json:"new_password" validate:"required,min=8"`
-	Password    string `json:"password,omitempty" validate:"omitempty,min=8"`
+	Token       string `json:"token" binding:"required"`
+	NewPassword string `json:"new_password" binding:"omitempty,min=8"`
+	Password    string `json:"password,omitempty" binding:"omitempty,min=8"`
 }
 
 func (r *ResetPasswordRequest) EffectivePassword() string {
@@ -217,7 +217,7 @@ func (r *ResetPasswordRequest) EffectivePassword() string {
 
 // ResendVerificationRequest 重发验证邮件请求
 type ResendVerificationRequest struct {
-	Email string `json:"email" validate:"required,email"`
+	Email string `json:"email" binding:"required,email"`
 }
 
 // UpdateProfileRequest 更新用户资料请求

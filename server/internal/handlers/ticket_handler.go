@@ -1,9 +1,10 @@
 package handlers
 
 import (
-	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/mail"
 	"strconv"
 	"strings"
 
@@ -29,11 +30,16 @@ func NewTicketHandler(ticketService services.TicketServiceInterface) *TicketHand
 
 // GetTickets 获取工单列表
 func (h *TicketHandler) GetTickets(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	// 解析查询参数
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	pageSizeRaw := c.Query("page_size")
+	if pageSizeRaw == "" {
+		pageSizeRaw = c.DefaultQuery("limit", "20")
+	}
+	pageSize, _ := strconv.Atoi(pageSizeRaw)
+	page, pageSize = normalizePagination(page, pageSize, 100)
 	status := strings.TrimSpace(c.Query("status"))
 	priority := strings.TrimSpace(c.Query("priority"))
 	ticketType := c.Query("type")
@@ -45,6 +51,7 @@ func (h *TicketHandler) GetTickets(c *gin.Context) {
 	slaBreached := strings.TrimSpace(c.Query("sla_breached"))
 	isOverdue := strings.TrimSpace(c.Query("is_overdue"))
 	unassigned := strings.TrimSpace(c.Query("unassigned"))
+	assignedToMe := strings.TrimSpace(c.Query("assigned_to_me"))
 
 	var tagsFilter []string
 
@@ -125,6 +132,13 @@ func (h *TicketHandler) GetTickets(c *gin.Context) {
 		if assignedToID, err := strconv.ParseUint(assignedTo, 10, 32); err == nil {
 			id := uint(assignedToID)
 			filters.AssigneeID = &id
+		}
+	}
+	if parsed, ok := parseBoolPtr(assignedToMe); ok && *parsed {
+		if userID, exists := c.Get("user_id"); exists {
+			if id, valid := userID.(uint); valid {
+				filters.AssigneeID = &id
+			}
 		}
 	}
 
@@ -216,7 +230,7 @@ func parseFilterBool(value interface{}) (bool, bool) {
 
 // GetTicket 获取单个工单
 func (h *TicketHandler) GetTicket(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	// 解析工单ID
 	idStr := c.Param("id")
@@ -242,7 +256,7 @@ func (h *TicketHandler) GetTicket(c *gin.Context) {
 
 // CreateTicket 创建工单
 func (h *TicketHandler) CreateTicket(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	// 解析请求体
 	var req models.TicketCreateRequest
@@ -270,7 +284,7 @@ func (h *TicketHandler) CreateTicket(c *gin.Context) {
 
 // UpdateTicket 更新工单
 func (h *TicketHandler) UpdateTicket(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	// 解析工单ID
 	idStr := c.Param("id")
@@ -286,6 +300,13 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 		h.response.BadRequest(c, "请求格式错误: "+err.Error())
 		return
 	}
+	if req.CustomerEmail != nil && *req.CustomerEmail != "" {
+		address, err := mail.ParseAddress(*req.CustomerEmail)
+		if err != nil || address.Address != *req.CustomerEmail {
+			h.response.BadRequest(c, "客户邮箱格式错误")
+			return
+		}
+	}
 
 	// 获取当前用户ID
 	userID, exists := c.Get("user_id")
@@ -297,6 +318,10 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 	// 更新工单
 	ticket, err := h.ticketService.UpdateTicket(ctx, uint(id), &req, userID.(uint))
 	if err != nil {
+		if errors.Is(err, services.ErrInvalidTicketTransition) {
+			h.response.BadRequest(c, err.Error())
+			return
+		}
 		if err.Error() == "ticket not found" {
 			h.response.NotFound(c, "工单不存在")
 			return
@@ -310,7 +335,7 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 
 // DeleteTicket 删除工单
 func (h *TicketHandler) DeleteTicket(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	// 解析工单ID
 	idStr := c.Param("id")
@@ -407,7 +432,7 @@ func (h *TicketHandler) AssignTicket(c *gin.Context) {
 
 // GetTicketStats 获取工单统计
 func (h *TicketHandler) GetTicketStats(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	// 获取当前用户ID
 	userID, exists := c.Get("user_id")
@@ -428,11 +453,11 @@ func (h *TicketHandler) GetTicketStats(c *gin.Context) {
 
 // BulkUpdateTickets 批量更新工单
 func (h *TicketHandler) BulkUpdateTickets(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	// 解析请求体
 	var req struct {
-		TicketIDs []uint                     `json:"ticket_ids" binding:"required"`
+		TicketIDs []uint                     `json:"ticket_ids" binding:"required,min=1,max=100,unique,dive,gt=0"`
 		Updates   models.TicketUpdateRequest `json:"updates" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -473,6 +498,10 @@ func (h *TicketHandler) BulkUpdateTickets(c *gin.Context) {
 	// 批量更新工单
 	err := h.ticketService.BulkUpdateTickets(ctx, bulkReq, userID.(uint))
 	if err != nil {
+		if errors.Is(err, services.ErrInvalidTicketTransition) {
+			h.response.Error(c, http.StatusBadRequest, "invalid_status_transition", err.Error())
+			return
+		}
 		h.response.Error(c, http.StatusInternalServerError, "bulk_update_failed", "Failed to bulk update tickets: "+err.Error())
 		return
 	}
@@ -482,10 +511,10 @@ func (h *TicketHandler) BulkUpdateTickets(c *gin.Context) {
 
 // BulkDeleteTickets 批量删除工单
 func (h *TicketHandler) BulkDeleteTickets(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	var req struct {
-		IDs []uint `json:"ids" binding:"required,min=1"`
+		IDs []uint `json:"ids" binding:"required,min=1,max=100,unique,dive,gt=0"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.response.Error(c, http.StatusBadRequest, "invalid_request", "Invalid request format: "+err.Error())
@@ -551,22 +580,24 @@ func (h *TicketHandler) BulkDeleteTickets(c *gin.Context) {
 func (h *TicketHandler) GetTicketHistory(c *gin.Context) {
 	// 获取工单ID
 	ticketIDStr := c.Param("id")
-	ticketID, err := strconv.Atoi(ticketIDStr)
+	ticketIDValue, err := strconv.ParseUint(ticketIDStr, 10, strconv.IntSize)
 	if err != nil {
 		h.response.Error(c, http.StatusBadRequest, "invalid_ticket_id", "Invalid ticket ID format")
 		return
 	}
+	ticketID := uint(ticketIDValue)
 
 	// 解析查询参数
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "50"))
+	page, pageSize = normalizePagination(page, pageSize, 100)
 	actionsStr := c.Query("actions")
 	isVisibleStr := c.Query("is_visible")
 	isSystemStr := c.Query("is_system")
 
 	// 构建历史记录过滤器
 	filters := &models.HistoryFilter{
-		TicketID: uint64ToUintPtr(uint64(ticketID)),
+		TicketID: &ticketID,
 		Limit:    pageSize,
 		Offset:   (page - 1) * pageSize,
 		OrderBy:  "created_at",
@@ -590,7 +621,7 @@ func (h *TicketHandler) GetTicketHistory(c *gin.Context) {
 	}
 
 	// 获取历史记录
-	histories, _, err := h.ticketService.GetTicketHistory(uint(ticketID))
+	histories, _, err := h.ticketService.GetTicketHistory(ticketID)
 	if err != nil {
 		h.response.Error(c, http.StatusInternalServerError, "get_history_failed", "Failed to get ticket history: "+err.Error())
 		return
@@ -605,8 +636,15 @@ func (h *TicketHandler) GetTicketHistory(c *gin.Context) {
 	h.response.Success(c, responses, "获取工单历史记录成功")
 }
 
-// 辅助函数：将uint64转换为*uint
-func uint64ToUintPtr(val uint64) *uint {
-	uintVal := uint(val)
-	return &uintVal
+func normalizePagination(page, pageSize, maxPageSize int) (int, int) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > maxPageSize {
+		pageSize = maxPageSize
+	}
+	return page, pageSize
 }

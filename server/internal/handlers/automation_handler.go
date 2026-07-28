@@ -738,7 +738,7 @@ func (h *AutomationHandler) UseQuickReply(c *gin.Context) {
 // @Router /api/admin/automation/batch/update [post]
 func (h *AutomationHandler) BatchUpdateTickets(c *gin.Context) {
 	var req struct {
-		TicketIDs []uint                 `json:"ticket_ids" binding:"required"`
+		TicketIDs []uint                 `json:"ticket_ids" binding:"required,min=1,max=100,unique,dive,gt=0"`
 		Updates   map[string]interface{} `json:"updates" binding:"required"`
 	}
 
@@ -781,7 +781,7 @@ func (h *AutomationHandler) BatchUpdateTickets(c *gin.Context) {
 // @Router /api/admin/automation/batch/assign [post]
 func (h *AutomationHandler) BatchAssignTickets(c *gin.Context) {
 	var req struct {
-		TicketIDs []uint `json:"ticket_ids" binding:"required"`
+		TicketIDs []uint `json:"ticket_ids" binding:"required,min=1,max=100,unique,dive,gt=0"`
 		UserID    uint   `json:"user_id" binding:"required"`
 	}
 

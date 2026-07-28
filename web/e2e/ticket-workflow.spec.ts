@@ -43,19 +43,13 @@ test.describe('Ticket Workflow', () => {
 
         await loginViaUI(page, TEST_USER);
         await page.goto('/#/tickets');
-
-        const createLink = page.locator('a[href*="tickets/create"]').first();
-        if (await createLink.count()) {
-            await createLink.click();
-        } else {
-            await page.getByLabel('Create').click();
-        }
+        await page.getByRole('link', { name: '创建工单' }).click();
 
         await expect(page).toHaveURL(/#\/tickets\/create/);
         await page.getByLabel('工单标题').fill(title);
         await page.getByLabel('详细描述').fill(description);
 
-        const assigneeInput = page.locator('input[name="assignee_id"]');
+        const assigneeInput = page.locator('input[name="assigned_to_id"]');
         await assigneeInput.scrollIntoViewIfNeeded();
         await assigneeInput.click();
         await assigneeInput.fill('agent');

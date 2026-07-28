@@ -119,6 +119,10 @@ func (s *SimpleOTPService) GenerateBackupCodes() ([]string, error) {
 
 // generateCodeAtTime 在指定时间生成OTP代码
 func (s *SimpleOTPService) generateCodeAtTime(secret string, timestamp int64) (string, error) {
+	if timestamp < 0 {
+		return "", fmt.Errorf("timestamp cannot be negative")
+	}
+
 	// 解码Base32密钥
 	key, err := base32.StdEncoding.DecodeString(strings.ToUpper(secret))
 	if err != nil {

@@ -64,8 +64,8 @@ export interface AuthResponse {
 
 // 工单相关类型  
 export type TicketStatus = 'open' | 'in_progress' | 'pending' | 'resolved' | 'closed' | 'cancelled'
-export type TicketPriority = 'low' | 'normal' | 'medium' | 'high' | 'urgent' | 'critical'
-export type TicketType = 'incident' | 'request' | 'problem' | 'change' | 'complaint' | 'consultation' | 'bug' | 'feature'
+export type TicketPriority = 'low' | 'normal' | 'high' | 'urgent' | 'critical'
+export type TicketType = 'incident' | 'request' | 'problem' | 'change' | 'complaint' | 'consultation'
 export type TicketSource = 'web' | 'email' | 'phone' | 'chat' | 'api' | 'mobile'
 export type UserRole = 'admin' | 'agent' | 'customer' | 'supervisor'
 

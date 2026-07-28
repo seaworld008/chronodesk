@@ -31,6 +31,7 @@ import { usePermissions } from 'react-admin'
 import { useNavigate } from 'react-router-dom'
 import { alpha } from '@mui/material/styles'
 import { RatioRow } from '@/components/layout/RatioRow'
+import { API_BASE } from '@/lib/apiClient'
 import {
   PieChart,
   Pie,
@@ -224,16 +225,21 @@ export const TicketDashboard: React.FC = () => {
         const query = `range=${timeRange}`
 
         const [statsRes, urgentRes, recentRes, myRes] = await Promise.all([
-          fetch(`/api/tickets/stats?${query}`, { headers, signal: controller.signal }),
-          fetch(`/api/tickets?priority=urgent,critical&status=open,in_progress&limit=10&${query}`, {
+          fetch(`${API_BASE}/tickets/stats?${query}`, { headers, signal: controller.signal }),
+          fetch(`${API_BASE}/tickets?priority=urgent,critical&status=open,in_progress&page_size=10&${query}`, {
             headers,
             signal: controller.signal,
           }),
-          fetch(`/api/tickets?limit=10&sort=created_at:desc&${query}`, { headers, signal: controller.signal }),
+          fetch(`${API_BASE}/tickets?page_size=10&sort_by=created_at&sort_order=desc&${query}`, { headers, signal: controller.signal }),
           isAgent
-            ? fetch(`/api/tickets?assigned_to_me=true&limit=10&${query}`, { headers, signal: controller.signal })
+            ? fetch(`${API_BASE}/tickets/my-tickets?limit=10&${query}`, { headers, signal: controller.signal })
             : Promise.resolve(null),
         ])
+
+        const responses = [statsRes, urgentRes, recentRes, ...(myRes ? [myRes] : [])]
+        if (responses.some((response) => !response.ok)) {
+          throw new Error('仪表盘数据请求失败')
+        }
 
         const statsJson = statsRes ? await statsRes.json() : {}
         setStats((prev) => ({ ...prev, ...(statsJson?.data ?? statsJson ?? {}) }))

@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -110,6 +111,9 @@ type Client struct {
 
 	// Hub reference
 	hub *Hub
+
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // NewClient creates a new WebSocket client
@@ -119,7 +123,17 @@ func NewClient(hub *Hub, conn *websocket.Conn, userID uint) *Client {
 		conn:   conn,
 		send:   make(chan []byte, 256),
 		UserID: userID,
+		done:   make(chan struct{}),
 	}
+}
+
+func (c *Client) close() {
+	c.closeOnce.Do(func() {
+		close(c.done)
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
+	})
 }
 
 // readPump pumps messages from the websocket connection to the hub.
@@ -130,7 +144,7 @@ func NewClient(hub *Hub, conn *websocket.Conn, userID uint) *Client {
 func (c *Client) readPump() {
 	defer func() {
 		c.hub.unregister <- c
-		c.conn.Close()
+		c.close()
 	}()
 
 	c.conn.SetReadLimit(maxMessageSize)
@@ -163,11 +177,13 @@ func (c *Client) writePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
-		c.conn.Close()
+		c.close()
 	}()
 
 	for {
 		select {
+		case <-c.done:
+			return
 		case message, ok := <-c.send:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
@@ -237,9 +253,11 @@ func (c *Client) sendPong() {
 
 	responseBytes, _ := json.Marshal(response)
 	select {
+	case <-c.done:
+		return
 	case c.send <- responseBytes:
 	default:
-		close(c.send)
+		c.close()
 	}
 }
 

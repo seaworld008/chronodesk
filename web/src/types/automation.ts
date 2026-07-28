@@ -32,7 +32,7 @@ export interface AutomationRuleAction {
   params?: Record<string, unknown>
 }
 
-export interface AutomationLogActionExecution extends AutomationRuleAction {}
+export type AutomationLogActionExecution = AutomationRuleAction
 
 export interface AutomationLog {
   id: number

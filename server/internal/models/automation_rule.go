@@ -16,7 +16,7 @@ type AutomationRule struct {
 	Description string `json:"description" gorm:"type:text"`
 	RuleType    string `json:"rule_type" gorm:"size:50;not null;index"` // assignment, classification, escalation, sla
 	IsActive    bool   `json:"is_active" gorm:"default:true;index"`
-	Priority    int    `json:"priority" gorm:"default:1;index"`         // 规则优先级，数字越小优先级越高
+	Priority    int    `json:"priority" gorm:"default:1;index"` // 规则优先级，数字越小优先级越高
 
 	// 触发条件
 	TriggerEvent string `json:"trigger_event" gorm:"size:50;not null"` // ticket.created, ticket.updated, ticket.timeout
@@ -26,11 +26,11 @@ type AutomationRule struct {
 	Actions string `json:"actions" gorm:"type:json"` // JSON格式的动作配置
 
 	// 执行统计
-	ExecutionCount   int64     `json:"execution_count" gorm:"default:0"`
-	LastExecutedAt   *time.Time `json:"last_executed_at,omitempty"`
-	SuccessCount     int64     `json:"success_count" gorm:"default:0"`
-	FailureCount     int64     `json:"failure_count" gorm:"default:0"`
-	AverageExecTime  int64     `json:"average_exec_time" gorm:"default:0"` // 毫秒
+	ExecutionCount  int64      `json:"execution_count" gorm:"default:0"`
+	LastExecutedAt  *time.Time `json:"last_executed_at,omitempty"`
+	SuccessCount    int64      `json:"success_count" gorm:"default:0"`
+	FailureCount    int64      `json:"failure_count" gorm:"default:0"`
+	AverageExecTime int64      `json:"average_exec_time" gorm:"default:0"` // 毫秒
 
 	// 创建和更新者
 	CreatedBy   uint  `json:"created_by" gorm:"index"`
@@ -63,7 +63,7 @@ func (ar *AutomationRule) GetConditions() ([]RuleCondition, error) {
 	if ar.Conditions == "" {
 		return []RuleCondition{}, nil
 	}
-	
+
 	var conditions []RuleCondition
 	err := json.Unmarshal([]byte(ar.Conditions), &conditions)
 	return conditions, err
@@ -84,7 +84,7 @@ func (ar *AutomationRule) GetActions() ([]RuleAction, error) {
 	if ar.Actions == "" {
 		return []RuleAction{}, nil
 	}
-	
+
 	var actions []RuleAction
 	err := json.Unmarshal([]byte(ar.Actions), &actions)
 	return actions, err
@@ -105,13 +105,13 @@ func (ar *AutomationRule) UpdateExecutionStats(success bool, execTime time.Durat
 	ar.ExecutionCount++
 	now := time.Now()
 	ar.LastExecutedAt = &now
-	
+
 	if success {
 		ar.SuccessCount++
 	} else {
 		ar.FailureCount++
 	}
-	
+
 	// 计算平均执行时间
 	execMs := execTime.Milliseconds()
 	if ar.ExecutionCount == 1 {
@@ -134,26 +134,26 @@ type SLAConfig struct {
 	IsDefault   bool   `json:"is_default" gorm:"default:false;index"`
 
 	// 适用条件
-	TicketType     *string `json:"ticket_type,omitempty" gorm:"size:50"`   // 适用的工单类型
-	Priority       *string `json:"priority,omitempty" gorm:"size:20"`      // 适用的优先级
-	Category       *string `json:"category,omitempty" gorm:"size:50"`      // 适用的分类
+	TicketType     *string `json:"ticket_type,omitempty" gorm:"size:50"`    // 适用的工单类型
+	Priority       *string `json:"priority,omitempty" gorm:"size:20"`       // 适用的优先级
+	Category       *string `json:"category,omitempty" gorm:"size:50"`       // 适用的分类
 	AssignedUserID *uint   `json:"assigned_user_id,omitempty" gorm:"index"` // 适用的处理人
-	
+
 	// SLA时限 (分钟)
 	ResponseTime   int `json:"response_time" gorm:"not null"`   // 首次响应时限
 	ResolutionTime int `json:"resolution_time" gorm:"not null"` // 解决时限
-	
+
 	// 工作时间配置
 	WorkingHours    string `json:"working_hours" gorm:"type:json"` // 工作时间配置JSON
 	ExcludeWeekends bool   `json:"exclude_weekends" gorm:"default:true"`
 	ExcludeHolidays bool   `json:"exclude_holidays" gorm:"default:true"`
-	
+
 	// 升级规则
 	EscalationRules string `json:"escalation_rules" gorm:"type:json"` // 升级规则JSON
 
 	// 统计信息
-	AppliedCount int64 `json:"applied_count" gorm:"default:0"`
-	ViolationCount int64 `json:"violation_count" gorm:"default:0"`
+	AppliedCount   int64   `json:"applied_count" gorm:"default:0"`
+	ViolationCount int64   `json:"violation_count" gorm:"default:0"`
 	ComplianceRate float64 `json:"compliance_rate" gorm:"default:0"`
 }
 
@@ -200,7 +200,7 @@ func (sla *SLAConfig) GetWorkingHours() (*WorkingHours, error) {
 			Sunday:    TimeRange{Start: "", End: ""},
 		}, nil
 	}
-	
+
 	var hours WorkingHours
 	err := json.Unmarshal([]byte(sla.WorkingHours), &hours)
 	return &hours, err
@@ -211,7 +211,7 @@ func (sla *SLAConfig) GetEscalationRules() ([]EscalationRule, error) {
 	if sla.EscalationRules == "" {
 		return []EscalationRule{}, nil
 	}
-	
+
 	var rules []EscalationRule
 	err := json.Unmarshal([]byte(sla.EscalationRules), &rules)
 	return rules, err
@@ -232,20 +232,20 @@ type TicketTemplate struct {
 	// 模板内容
 	TitleTemplate   string `json:"title_template" gorm:"size:200"`
 	ContentTemplate string `json:"content_template" gorm:"type:text"`
-	
+
 	// 默认设置
-	DefaultType     string  `json:"default_type" gorm:"size:50"`
-	DefaultPriority string  `json:"default_priority" gorm:"size:20"`
-	DefaultStatus   string  `json:"default_status" gorm:"size:20"`
-	AssignToUserID  *uint   `json:"assign_to_user_id,omitempty" gorm:"index"`
-	AssignToUser    *User   `json:"assign_to_user,omitempty" gorm:"foreignKey:AssignToUserID"`
-	
+	DefaultType     string `json:"default_type" gorm:"size:50"`
+	DefaultPriority string `json:"default_priority" gorm:"size:20"`
+	DefaultStatus   string `json:"default_status" gorm:"size:20"`
+	AssignToUserID  *uint  `json:"assign_to_user_id,omitempty" gorm:"index"`
+	AssignToUser    *User  `json:"assign_to_user,omitempty" gorm:"foreignKey:AssignToUserID"`
+
 	// 自定义字段
 	CustomFields string `json:"custom_fields" gorm:"type:json"` // 自定义字段配置
 
 	// 使用统计
 	UsageCount int64 `json:"usage_count" gorm:"default:0"`
-	
+
 	// 创建者
 	CreatedBy   uint  `json:"created_by" gorm:"index"`
 	CreatedUser *User `json:"created_user,omitempty" gorm:"foreignKey:CreatedBy"`
@@ -258,12 +258,12 @@ func (TicketTemplate) TableName() string {
 
 // CustomField 自定义字段定义
 type CustomField struct {
-	Name        string      `json:"name"`
-	Type        string      `json:"type"`        // text, textarea, select, checkbox, date
-	Label       string      `json:"label"`
-	Required    bool        `json:"required"`
+	Name         string      `json:"name"`
+	Type         string      `json:"type"` // text, textarea, select, checkbox, date
+	Label        string      `json:"label"`
+	Required     bool        `json:"required"`
 	DefaultValue interface{} `json:"default_value,omitempty"`
-	Options     []string    `json:"options,omitempty"` // for select type
+	Options      []string    `json:"options,omitempty"` // for select type
 }
 
 // GetCustomFields 获取自定义字段
@@ -271,7 +271,7 @@ func (tt *TicketTemplate) GetCustomFields() ([]CustomField, error) {
 	if tt.CustomFields == "" {
 		return []CustomField{}, nil
 	}
-	
+
 	var fields []CustomField
 	err := json.Unmarshal([]byte(tt.CustomFields), &fields)
 	return fields, err
@@ -283,18 +283,18 @@ type AutomationLog struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 
 	// 关联信息
-	RuleID       uint             `json:"rule_id" gorm:"index"`
-	Rule         *AutomationRule  `json:"rule,omitempty" gorm:"foreignKey:RuleID"`
-	TicketID     uint             `json:"ticket_id" gorm:"index"`
-	Ticket       *Ticket          `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
+	RuleID   uint            `json:"rule_id" gorm:"index"`
+	Rule     *AutomationRule `json:"rule,omitempty" gorm:"foreignKey:RuleID"`
+	TicketID uint            `json:"ticket_id" gorm:"index"`
+	Ticket   *Ticket         `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
 
 	// 执行信息
-	TriggerEvent string    `json:"trigger_event" gorm:"size:50"`
-	ExecutedAt   time.Time `json:"executed_at" gorm:"not null"`
-	Success      bool      `json:"success" gorm:"index"`
-	ErrorMessage string    `json:"error_message,omitempty" gorm:"type:text"`
-	ExecutionTime int64    `json:"execution_time"` // 毫秒
-	
+	TriggerEvent  string    `json:"trigger_event" gorm:"size:50"`
+	ExecutedAt    time.Time `json:"executed_at" gorm:"not null"`
+	Success       bool      `json:"success" gorm:"index"`
+	ErrorMessage  string    `json:"error_message,omitempty" gorm:"type:text"`
+	ExecutionTime int64     `json:"execution_time"` // 毫秒
+
 	// 执行结果
 	ActionsExecuted string `json:"actions_executed" gorm:"type:json"` // 执行的动作列表
 	Changes         string `json:"changes" gorm:"type:json"`          // 产生的变更
@@ -312,15 +312,15 @@ type QuickReply struct {
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
 	// 基本信息
-	Name        string `json:"name" gorm:"size:100;not null"`
-	Category    string `json:"category" gorm:"size:50;index"`
-	Content     string `json:"content" gorm:"type:text;not null"`
-	Tags        string `json:"tags" gorm:"size:200"`    // 标签，逗号分隔
-	IsPublic    bool   `json:"is_public" gorm:"default:false;index"`
-	
+	Name     string `json:"name" gorm:"size:100;not null"`
+	Category string `json:"category" gorm:"size:50;index"`
+	Content  string `json:"content" gorm:"type:text;not null"`
+	Tags     string `json:"tags" gorm:"size:200"` // 标签，逗号分隔
+	IsPublic bool   `json:"is_public" gorm:"default:false;index"`
+
 	// 使用统计
 	UsageCount int64 `json:"usage_count" gorm:"default:0"`
-	
+
 	// 创建者
 	CreatedBy   uint  `json:"created_by" gorm:"index"`
 	CreatedUser *User `json:"created_user,omitempty" gorm:"foreignKey:CreatedBy"`
@@ -333,51 +333,51 @@ func (QuickReply) TableName() string {
 
 // 请求和响应结构
 type AutomationRuleRequest struct {
-	Name         string          `json:"name" validate:"required,max=100"`
-	Description  string          `json:"description" validate:"max=500"`
-	RuleType     string          `json:"rule_type" validate:"required,oneof=assignment classification escalation sla"`
+	Name         string          `json:"name" binding:"required,max=100"`
+	Description  string          `json:"description" binding:"max=500"`
+	RuleType     string          `json:"rule_type" binding:"required,oneof=assignment classification escalation sla"`
 	IsActive     *bool           `json:"is_active,omitempty"`
-	Priority     *int            `json:"priority,omitempty" validate:"omitempty,min=1,max=100"`
-	TriggerEvent string          `json:"trigger_event" validate:"required"`
+	Priority     *int            `json:"priority,omitempty" binding:"omitempty,min=1,max=100"`
+	TriggerEvent string          `json:"trigger_event" binding:"required"`
 	Conditions   []RuleCondition `json:"conditions"`
 	Actions      []RuleAction    `json:"actions"`
 }
 
 type SLAConfigRequest struct {
-	Name            string             `json:"name" validate:"required,max=100"`
-	Description     string             `json:"description" validate:"max=500"`
-	IsActive        *bool              `json:"is_active,omitempty"`
-	IsDefault       *bool              `json:"is_default,omitempty"`
-	TicketType      *string            `json:"ticket_type,omitempty"`
-	Priority        *string            `json:"priority,omitempty"`
-	Category        *string            `json:"category,omitempty"`
-	AssignedUserID  *uint              `json:"assigned_user_id,omitempty"`
-	ResponseTime    int                `json:"response_time" validate:"required,min=1"`
-	ResolutionTime  int                `json:"resolution_time" validate:"required,min=1"`
-	WorkingHours    *WorkingHours      `json:"working_hours,omitempty"`
-	ExcludeWeekends *bool              `json:"exclude_weekends,omitempty"`
-	ExcludeHolidays *bool              `json:"exclude_holidays,omitempty"`
-	EscalationRules []EscalationRule   `json:"escalation_rules,omitempty"`
+	Name            string           `json:"name" binding:"required,max=100"`
+	Description     string           `json:"description" binding:"max=500"`
+	IsActive        *bool            `json:"is_active,omitempty"`
+	IsDefault       *bool            `json:"is_default,omitempty"`
+	TicketType      *string          `json:"ticket_type,omitempty"`
+	Priority        *string          `json:"priority,omitempty"`
+	Category        *string          `json:"category,omitempty"`
+	AssignedUserID  *uint            `json:"assigned_user_id,omitempty"`
+	ResponseTime    int              `json:"response_time" binding:"required,min=1"`
+	ResolutionTime  int              `json:"resolution_time" binding:"required,min=1"`
+	WorkingHours    *WorkingHours    `json:"working_hours,omitempty"`
+	ExcludeWeekends *bool            `json:"exclude_weekends,omitempty"`
+	ExcludeHolidays *bool            `json:"exclude_holidays,omitempty"`
+	EscalationRules []EscalationRule `json:"escalation_rules,omitempty"`
 }
 
 type TicketTemplateRequest struct {
-	Name            string        `json:"name" validate:"required,max=100"`
-	Description     string        `json:"description" validate:"max=500"`
-	Category        string        `json:"category" validate:"required,max=50"`
+	Name            string        `json:"name" binding:"required,max=100"`
+	Description     string        `json:"description" binding:"max=500"`
+	Category        string        `json:"category" binding:"required,max=50"`
 	IsActive        *bool         `json:"is_active,omitempty"`
-	TitleTemplate   string        `json:"title_template" validate:"max=200"`
+	TitleTemplate   string        `json:"title_template" binding:"max=200"`
 	ContentTemplate string        `json:"content_template"`
-	DefaultType     string        `json:"default_type" validate:"max=50"`
-	DefaultPriority string        `json:"default_priority" validate:"max=20"`
-	DefaultStatus   string        `json:"default_status" validate:"max=20"`
+	DefaultType     string        `json:"default_type" binding:"max=50"`
+	DefaultPriority string        `json:"default_priority" binding:"max=20"`
+	DefaultStatus   string        `json:"default_status" binding:"max=20"`
 	AssignToUserID  *uint         `json:"assign_to_user_id,omitempty"`
 	CustomFields    []CustomField `json:"custom_fields,omitempty"`
 }
 
 type QuickReplyRequest struct {
-	Name     string `json:"name" validate:"required,max=100"`
-	Category string `json:"category" validate:"max=50"`
-	Content  string `json:"content" validate:"required"`
-	Tags     string `json:"tags" validate:"max=200"`
+	Name     string `json:"name" binding:"required,max=100"`
+	Category string `json:"category" binding:"max=50"`
+	Content  string `json:"content" binding:"required"`
+	Tags     string `json:"tags" binding:"max=200"`
 	IsPublic *bool  `json:"is_public,omitempty"`
 }

@@ -94,7 +94,7 @@ func main() {
 	if seedData {
 		log.Println("🌱 Seeding initial data...")
 		if err := seedInitialData(db); err != nil {
-			log.Printf("Warning: Seeding failed: %v", err)
+			log.Fatalf("Seeding failed: %v", err)
 		}
 	}
 
@@ -297,11 +297,24 @@ func dropAllTables(db *gorm.DB) {
 
 // seedInitialData 种子数据
 func seedInitialData(db *gorm.DB) error {
+	adminPassword := os.Getenv("ADMIN_PASSWORD")
+	if adminPassword == "" {
+		return fmt.Errorf("ADMIN_PASSWORD is required when seeding the initial administrator")
+	}
+	passwordHash, err := auth.NewSimplePasswordService(8, "").HashPassword(adminPassword)
+	if err != nil {
+		return fmt.Errorf("failed to hash initial administrator password: %w", err)
+	}
+	adminEmail := os.Getenv("ADMIN_EMAIL")
+	if adminEmail == "" {
+		adminEmail = "admin@example.com"
+	}
+
 	// 创建默认管理员
 	adminUser := &models.User{
 		Username:      "admin",
-		Email:         "admin@example.com",
-		PasswordHash:  "$2a$10$rVmJHLHE3kD1VGpGO8pQhOxKRWBqH5lXXxYXxLV3HHWP1dWw.qEa", // password: Admin123!
+		Email:         adminEmail,
+		PasswordHash:  passwordHash,
 		FirstName:     "System",
 		LastName:      "Administrator",
 		Role:          models.RoleAdmin,
@@ -311,7 +324,7 @@ func seedInitialData(db *gorm.DB) error {
 		JobTitle:      "System Administrator",
 	}
 
-	if err := db.FirstOrCreate(adminUser, models.User{Email: "admin@example.com"}).Error; err != nil {
+	if err := db.FirstOrCreate(adminUser, models.User{Email: adminEmail}).Error; err != nil {
 		return fmt.Errorf("failed to create admin user: %w", err)
 	}
 

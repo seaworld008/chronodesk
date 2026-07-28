@@ -24,16 +24,17 @@ import {
     CheckCircle,
 } from '@mui/icons-material';
 import { useRecordContext, useNotify, useRefresh, ReferenceInput, AutocompleteInput } from 'react-admin';
-import { Ticket, TicketStatus } from '@/types';
+import { Ticket, TicketPriority, TicketStatus } from '@/types';
+import { apiFetch } from '@/lib/apiClient';
 
 // 工单状态流转定义
-const TICKET_WORKFLOWS = {
-    open: ['in_progress', 'pending', 'cancelled'],
+const TICKET_WORKFLOWS: Record<TicketStatus, TicketStatus[]> = {
+    open: ['in_progress', 'pending', 'resolved', 'cancelled'],
     in_progress: ['pending', 'resolved', 'cancelled'],
     pending: ['in_progress', 'resolved', 'cancelled'], 
-    resolved: ['closed', 'reopened'],
+    resolved: ['closed', 'open'],
     closed: [],
-    cancelled: ['reopened']
+    cancelled: ['open']
 };
 
 // 状态中文映射
@@ -43,16 +44,16 @@ const STATUS_LABELS = {
     pending: '等待中',
     resolved: '已解决',
     closed: '已关闭',
-    cancelled: '已取消',
-    reopened: '重新打开'
+    cancelled: '已取消'
 };
 
 // 优先级升级规则
-const PRIORITY_ESCALATION = {
+const PRIORITY_ESCALATION: Record<TicketPriority, TicketPriority> = {
     low: 'normal',
     normal: 'high', 
     high: 'urgent',
-    urgent: 'critical'
+    urgent: 'critical',
+    critical: 'critical'
 };
 
 interface WorkflowAction {
@@ -157,7 +158,7 @@ const TicketWorkflowActions: React.FC = () => {
                 case 'escalate':
                     endpoint = `/tickets/${record.id}/escalate`;
                     payload.reason = escalationReason;
-                    payload.priority = PRIORITY_ESCALATION[record.priority as keyof typeof PRIORITY_ESCALATION];
+                    payload.escalate_to_id = assigneeId;
                     break;
                 
                 case 'status_change':
@@ -166,24 +167,15 @@ const TicketWorkflowActions: React.FC = () => {
                     break;
             }
 
-            // 调用后端 API（这里需要根据实际后端实现调整）
-            const response = await fetch(`/api${endpoint}`, {
+            await apiFetch(endpoint, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${localStorage.getItem('token')}`
-                },
                 body: JSON.stringify(payload)
             });
 
-            if (response.ok) {
-                notify(`工单${currentAction.label}成功`, { type: 'success' });
-                refresh();
-                setDialogOpen(false);
-                resetForm();
-            } else {
-                throw new Error('操作失败');
-            }
+            notify(`工单${currentAction.label}成功`, { type: 'success' });
+            refresh();
+            setDialogOpen(false);
+            resetForm();
         } catch (error) {
             const message = error instanceof Error ? error.message : `工单${currentAction.label}失败`;
             notify(message, { type: 'error' });
@@ -312,6 +304,16 @@ const TicketWorkflowActions: React.FC = () => {
                                 onChange={(e) => setEscalationReason(e.target.value)}
                                 required
                             />
+                            <ReferenceInput
+                                source="escalate_to_id"
+                                reference="users"
+                                label="升级给"
+                            >
+                                <AutocompleteInput
+                                    optionText={(user) => `${user.username} (${user.first_name} ${user.last_name})`}
+                                    onChange={(value) => setAssigneeId(value)}
+                                />
+                            </ReferenceInput>
                             <Box>
                                 <strong>优先级将从 {record.priority} 升级为 {PRIORITY_ESCALATION[record.priority as keyof typeof PRIORITY_ESCALATION]}</strong>
                             </Box>
@@ -329,7 +331,7 @@ const TicketWorkflowActions: React.FC = () => {
                                     value={newStatus}
                                     onChange={(e) => setNewStatus(e.target.value)}
                                 >
-                                    {TICKET_WORKFLOWS[record.status as keyof typeof TICKET_WORKFLOWS].map(status => (
+                                    {TICKET_WORKFLOWS[record.status].map(status => (
                                         <MenuItem key={status} value={status}>
                                             {STATUS_LABELS[status as keyof typeof STATUS_LABELS]}
                                         </MenuItem>
@@ -371,7 +373,7 @@ const TicketWorkflowActions: React.FC = () => {
                         disabled={
                             (currentAction?.type === 'assign' && !assigneeId) ||
                             (currentAction?.type === 'transfer' && (!transferDepartment || !assigneeId)) ||
-                            (currentAction?.type === 'escalate' && !escalationReason) ||
+                            (currentAction?.type === 'escalate' && (!escalationReason || !assigneeId)) ||
                             (currentAction?.type === 'status_change' && !newStatus)
                         }
                     >

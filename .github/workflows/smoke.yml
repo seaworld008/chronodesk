@@ -12,6 +12,8 @@ jobs:
     env:
       TEST_ADMIN_EMAIL: admin@example.com
       TEST_ADMIN_PASSWORD: Admin123!
+      ADMIN_EMAIL: admin@example.com
+      ADMIN_PASSWORD: Admin123!
 
     steps:
       - name: Checkout repository

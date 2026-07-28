@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"gongdan-system/internal/models"
 	"gorm.io/gorm"
@@ -15,7 +16,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 
 	db := openTestDB(t)
 
-	if err := db.AutoMigrate(&models.User{}, &models.Ticket{}, &models.TicketComment{}); err != nil {
+	if err := db.AutoMigrate(&models.User{}, &models.Ticket{}, &models.TicketComment{}, &models.TicketHistory{}); err != nil {
 		t.Fatalf("failed to migrate schemas: %v", err)
 	}
 
@@ -147,5 +148,98 @@ func TestSplitCommaSeparated(t *testing.T) {
 		if fmt.Sprint(got) != fmt.Sprint(tc.expected) {
 			t.Fatalf("splitCommaSeparated(%q) = %v, expected %v", tc.input, got, tc.expected)
 		}
+	}
+}
+
+func TestEscalateTicketMarksTicketAsEscalated(t *testing.T) {
+	db := setupTestDB(t)
+	var ticket models.Ticket
+	if err := db.Where("ticket_number = ?", "T-001").First(&ticket).Error; err != nil {
+		t.Fatalf("failed to load ticket: %v", err)
+	}
+
+	manager := models.User{
+		Username:     "manager",
+		Email:        "manager@example.com",
+		PasswordHash: "hashed",
+		Role:         models.RoleAdmin,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&manager).Error; err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+
+	svc := NewTicketService(db)
+	updated, err := svc.EscalateTicket(ticket.ID, manager.ID, ticket.CreatedByID, "SLA breach", "please review")
+	if err != nil {
+		t.Fatalf("EscalateTicket returned error: %v", err)
+	}
+	if !updated.IsEscalated {
+		t.Fatal("expected escalated ticket to set is_escalated")
+	}
+}
+
+func TestReopenTicketClearsCompletionTimestamps(t *testing.T) {
+	db := setupTestDB(t)
+	var ticket models.Ticket
+	if err := db.Where("ticket_number = ?", "T-004").First(&ticket).Error; err != nil {
+		t.Fatalf("failed to load resolved ticket: %v", err)
+	}
+
+	completedAt := time.Now().Add(-time.Hour)
+	if err := db.Model(&ticket).Updates(map[string]interface{}{
+		"resolved_at": completedAt,
+		"closed_at":   completedAt,
+	}).Error; err != nil {
+		t.Fatalf("failed to seed completion timestamps: %v", err)
+	}
+
+	svc := NewTicketService(db)
+	reopened, err := svc.UpdateTicketStatus(ticket.ID, string(models.TicketStatusOpen), ticket.CreatedByID, "reopen", "")
+	if err != nil {
+		t.Fatalf("UpdateTicketStatus returned error: %v", err)
+	}
+	if reopened.ResolvedAt != nil || reopened.ClosedAt != nil {
+		t.Fatalf("reopened ticket must clear completion timestamps, got resolved_at=%v closed_at=%v", reopened.ResolvedAt, reopened.ClosedAt)
+	}
+}
+
+func TestCreateTicketDerivesSLADeadlineFromCategory(t *testing.T) {
+	db := setupFilterTestDB(t)
+	creator := seedUser(t, db, "sla-create-user")
+	slaHours := 6
+	category := models.Category{
+		Name:      "Create SLA category",
+		Slug:      "create-sla-category",
+		Type:      models.CategoryTypeSupport,
+		Status:    models.CategoryStatusActive,
+		SLAHours:  &slaHours,
+		CreatedBy: creator.ID,
+	}
+	if err := db.Create(&category).Error; err != nil {
+		t.Fatalf("failed to create category: %v", err)
+	}
+
+	startedAt := time.Now()
+	svc := NewTicketService(db)
+	ticket, err := svc.CreateTicket(context.Background(), &models.TicketCreateRequest{
+		Title:       "SLA-backed ticket",
+		Description: "deadline should be derived",
+		Type:        models.TicketTypeRequest,
+		Priority:    models.TicketPriorityNormal,
+		Source:      models.TicketSourceWeb,
+		CategoryID:  &category.ID,
+	}, creator.ID)
+	if err != nil {
+		t.Fatalf("CreateTicket returned error: %v", err)
+	}
+	if ticket.SLADueDate == nil {
+		t.Fatal("expected SLA deadline from category")
+	}
+
+	earliest := startedAt.Add(time.Duration(slaHours) * time.Hour)
+	latest := time.Now().Add(time.Duration(slaHours) * time.Hour)
+	if ticket.SLADueDate.Before(earliest) || ticket.SLADueDate.After(latest) {
+		t.Fatalf("unexpected SLA deadline %v, expected between %v and %v", ticket.SLADueDate, earliest, latest)
 	}
 }
