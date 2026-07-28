@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # PostgreSQL 数据库
   postgres:
@@ -58,9 +56,8 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - JWT_SECRET=your-super-secret-jwt-key-change-in-production
-    volumes:
-      - ./server:/app
-      - /app/tmp
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-admin@example.com}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-Admin123!}
     depends_on:
       postgres:
         condition: service_healthy
@@ -79,10 +76,8 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - VITE_API_URL=http://server:8081/api
-    volumes:
-      - ./web:/app
-      - /app/node_modules
+      - VITE_API_URL=/api
+      - VITE_PROXY_TARGET=http://server:8081
     depends_on:
       - server
     networks:

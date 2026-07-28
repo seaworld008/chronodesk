@@ -1,0 +1,11 @@
+.env
+.git
+bin/
+main
+server
+gongdan-system
+ticket-system
+__pycache__/
+*.py[cod]
+htmlcov/
+reports/
