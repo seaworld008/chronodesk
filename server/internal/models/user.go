@@ -143,33 +143,33 @@ func (u *User) IsSupervisor() bool {
 
 // UserCreateRequest 用户创建请求
 type UserCreateRequest struct {
-	Username    string   `json:"username" validate:"required,min=3,max=50"`
-	Email       string   `json:"email" validate:"required,email"`
-	Phone       string   `json:"phone" validate:"omitempty,e164"`
-	Password    string   `json:"password" validate:"required,min=8,max=128"`
-	FirstName   string   `json:"first_name" validate:"omitempty,max=50"`
-	LastName    string   `json:"last_name" validate:"omitempty,max=50"`
-	DisplayName string   `json:"display_name" validate:"omitempty,max=100"`
-	Role        UserRole `json:"role" validate:"required,oneof=admin agent customer supervisor"`
-	Department  string   `json:"department" validate:"omitempty,max=100"`
-	JobTitle    string   `json:"job_title" validate:"omitempty,max=100"`
+	Username    string   `json:"username" binding:"required,min=3,max=50"`
+	Email       string   `json:"email" binding:"required,email"`
+	Phone       string   `json:"phone" binding:"omitempty,e164"`
+	Password    string   `json:"password" binding:"required,min=8,max=128"`
+	FirstName   string   `json:"first_name" binding:"omitempty,max=50"`
+	LastName    string   `json:"last_name" binding:"omitempty,max=50"`
+	DisplayName string   `json:"display_name" binding:"omitempty,max=100"`
+	Role        UserRole `json:"role" binding:"required,oneof=admin agent customer supervisor"`
+	Department  string   `json:"department" binding:"omitempty,max=100"`
+	JobTitle    string   `json:"job_title" binding:"omitempty,max=100"`
 	ManagerID   *uint    `json:"manager_id"`
 }
 
 // UserUpdateRequest 用户更新请求
 type UserUpdateRequest struct {
-	Email       *string     `json:"email" validate:"omitempty,email"`
-	Phone       *string     `json:"phone" validate:"omitempty,e164"`
-	FirstName   *string     `json:"first_name" validate:"omitempty,max=50"`
-	LastName    *string     `json:"last_name" validate:"omitempty,max=50"`
-	DisplayName *string     `json:"display_name" validate:"omitempty,max=100"`
+	Email       *string     `json:"email" binding:"omitempty,email"`
+	Phone       *string     `json:"phone" binding:"omitempty,e164"`
+	FirstName   *string     `json:"first_name" binding:"omitempty,max=50"`
+	LastName    *string     `json:"last_name" binding:"omitempty,max=50"`
+	DisplayName *string     `json:"display_name" binding:"omitempty,max=100"`
 	Avatar      *string     `json:"avatar"`
-	Timezone    *string     `json:"timezone" validate:"omitempty,max=50"`
-	Language    *string     `json:"language" validate:"omitempty,max=10"`
-	Role        *UserRole   `json:"role" validate:"omitempty,oneof=admin agent customer supervisor"`
-	Status      *UserStatus `json:"status" validate:"omitempty,oneof=active inactive suspended deleted"`
-	Department  *string     `json:"department" validate:"omitempty,max=100"`
-	JobTitle    *string     `json:"job_title" validate:"omitempty,max=100"`
+	Timezone    *string     `json:"timezone" binding:"omitempty,max=50"`
+	Language    *string     `json:"language" binding:"omitempty,max=10"`
+	Role        *UserRole   `json:"role" binding:"omitempty,oneof=admin agent customer supervisor"`
+	Status      *UserStatus `json:"status" binding:"omitempty,oneof=active inactive suspended deleted"`
+	Department  *string     `json:"department" binding:"omitempty,max=100"`
+	JobTitle    *string     `json:"job_title" binding:"omitempty,max=100"`
 	ManagerID   *uint       `json:"manager_id"`
 }
 

@@ -22,7 +22,7 @@ import {
     SelectColumnsButton,
     useRecordContext,
     useNotify,
-    useRefresh,
+    useRedirect,
 } from 'react-admin';
 import { Box, Chip, Typography, Tooltip, IconButton, type ChipProps } from '@mui/material';
 import {
@@ -314,7 +314,7 @@ const SLAStatusField: React.FC = () => {
 const QuickActionsField: React.FC = () => {
     const record = useRecordContext<Ticket>();
     const notify = useNotify();
-    const refresh = useRefresh();
+    const redirect = useRedirect();
 
     if (!record) return null;
 
@@ -326,22 +326,8 @@ const QuickActionsField: React.FC = () => {
 
     const handleEscalate = async (e: React.MouseEvent) => {
         e.stopPropagation();
-        try {
-            const response = await fetch(`/api/tickets/${record.id}/escalate`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${localStorage.getItem('token')}`
-                },
-                body: JSON.stringify({ reason: '快捷升级' })
-            });
-            if (response.ok) {
-                notify('工单已升级', { type: 'success' });
-                refresh();
-            }
-        } catch {
-            notify('升级失败', { type: 'error' });
-        }
+        notify('请在工单详情中选择升级对象', { type: 'info' });
+        redirect('show', 'tickets', record.id);
     };
 
     const handleStatusChange = async (e: React.MouseEvent) => {
@@ -424,6 +410,7 @@ const TicketListEmpty = () => (
         <Typography variant="body1" color="text.secondary">
             创建第一个工单开始管理客户请求
         </Typography>
+        <CreateButton label="创建工单" sx={{ mt: 2 }} />
     </Box>
 );
 

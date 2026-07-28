@@ -140,6 +140,27 @@ export const deleteNotification = async (request: APIRequestContext, id: number)
     await apiRequest(request, token, `/api/admin/notifications/${id}`, { method: 'DELETE' });
 };
 
+export const createTicket = async (request: APIRequestContext, title: string) => {
+    const token = await getAdminToken(request);
+    const response = await apiRequest<Record<string, unknown>>(request, token, '/api/tickets', {
+        method: 'POST',
+        data: {
+            title,
+            description: `${title} 自动化测试描述`,
+            type: 'request',
+            priority: 'normal',
+            source: 'web',
+        },
+    });
+    const data = (response.data as Record<string, unknown>) ?? {};
+    return data.id as number;
+};
+
+export const deleteTicket = async (request: APIRequestContext, id: number) => {
+    const token = await getAdminToken(request);
+    await apiRequest(request, token, `/api/tickets/${id}`, { method: 'DELETE' });
+};
+
 export const deleteTicketByTitle = async (request: APIRequestContext, title: string) => {
     const token = await getAdminToken(request);
     const response = await apiRequest<Record<string, unknown>>(

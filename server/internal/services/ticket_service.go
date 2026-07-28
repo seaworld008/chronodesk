@@ -2,10 +2,10 @@ package services
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +15,8 @@ import (
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
+
+var ErrInvalidTicketTransition = errors.New("invalid ticket status transition")
 
 // TicketServiceInterface defines the interface for ticket service
 type TicketServiceInterface interface {
@@ -342,6 +344,14 @@ func (s *TicketService) CreateTicket(ctx context.Context, req *models.TicketCrea
 	// Set category if provided
 	if req.CategoryID != nil {
 		ticket.CategoryID = req.CategoryID
+		var category models.Category
+		if err := s.db.WithContext(ctx).Select("id", "sla_hours").First(&category, *req.CategoryID).Error; err != nil {
+			return nil, fmt.Errorf("failed to load ticket category: %w", err)
+		}
+		if category.SLAHours != nil && *category.SLAHours > 0 {
+			slaDueDate := now.Add(time.Duration(*category.SLAHours) * time.Hour)
+			ticket.SLADueDate = &slaDueDate
+		}
 	}
 
 	// Set subcategory if provided
@@ -400,6 +410,9 @@ func (s *TicketService) UpdateTicket(ctx context.Context, id uint, req *models.T
 	}
 
 	if req.Status != nil && models.TicketStatus(*req.Status) != ticket.Status {
+		if !ticket.Status.CanTransitionTo(*req.Status) {
+			return nil, fmt.Errorf("%w: %s to %s", ErrInvalidTicketTransition, ticket.Status, *req.Status)
+		}
 		oldStatus := string(ticket.Status)
 		newStatus := string(*req.Status)
 		historyRecords = append(historyRecords, &models.TicketHistoryCreateRequest{
@@ -413,14 +426,7 @@ func (s *TicketService) UpdateTicket(ctx context.Context, id uint, req *models.T
 		})
 		ticket.Status = models.TicketStatus(*req.Status)
 
-		// 设置特殊时间戳
-		now := time.Now()
-		if *req.Status == "resolved" && ticket.ResolvedAt == nil {
-			ticket.ResolvedAt = &now
-		}
-		if *req.Status == "closed" && ticket.ClosedAt == nil {
-			ticket.ClosedAt = &now
-		}
+		applyTicketStatusTimestamps(&ticket, *req.Status, time.Now())
 	}
 
 	if req.Priority != nil && models.TicketPriority(*req.Priority) != ticket.Priority {
@@ -699,10 +705,16 @@ func (s *TicketService) EscalateTicket(ticketID uint, escalateToID uint, userID 
 	oldPriority := ticket.Priority
 
 	ticket.AssignedToID = &escalateToID
-	if ticket.Priority == models.TicketPriorityLow || ticket.Priority == models.TicketPriorityNormal {
+	ticket.IsEscalated = true
+	switch ticket.Priority {
+	case models.TicketPriorityLow:
+		ticket.Priority = models.TicketPriorityNormal
+	case models.TicketPriorityNormal:
 		ticket.Priority = models.TicketPriorityHigh
-	} else if ticket.Priority == models.TicketPriorityHigh {
+	case models.TicketPriorityHigh:
 		ticket.Priority = models.TicketPriorityUrgent
+	case models.TicketPriorityUrgent:
+		ticket.Priority = models.TicketPriorityCritical
 	}
 	ticket.UpdatedAt = time.Now()
 
@@ -750,17 +762,19 @@ func (s *TicketService) UpdateTicketStatus(ticketID uint, status string, userID 
 		return nil, err
 	}
 
+	nextStatus := models.TicketStatus(status)
+	if !nextStatus.IsValid() || !ticket.Status.CanTransitionTo(nextStatus) {
+		return nil, fmt.Errorf("%w: %s to %s", ErrInvalidTicketTransition, ticket.Status, nextStatus)
+	}
+	if ticket.Status == nextStatus {
+		return ticket, nil
+	}
+
 	oldStatus := ticket.Status
-	ticket.Status = models.TicketStatus(status)
+	ticket.Status = nextStatus
 	ticket.UpdatedAt = time.Now()
 
-	now := time.Now()
-	if status == "resolved" && ticket.ResolvedAt == nil {
-		ticket.ResolvedAt = &now
-	}
-	if status == "closed" && ticket.ClosedAt == nil {
-		ticket.ClosedAt = &now
-	}
+	applyTicketStatusTimestamps(ticket, nextStatus, time.Now())
 
 	err = s.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Save(ticket).Error; err != nil {
@@ -1009,10 +1023,15 @@ func (s *TicketService) GetSLABreachedTickets(userID uint, role string) ([]*mode
 	var tickets []*models.Ticket
 	var total int64
 
+	now := time.Now()
 	query := s.db.Model(&models.Ticket{}).
-		Joins("JOIN categories c ON tickets.category_id = c.id").
-		Where("tickets.created_at + INTERVAL c.sla_hours HOUR < NOW() AND tickets.status NOT IN (?, ?)",
-			models.TicketStatusResolved, models.TicketStatusClosed)
+		Where(
+			"(tickets.sla_breached = ? OR (tickets.sla_due_date IS NOT NULL AND tickets.sla_due_date < ?)) AND tickets.status NOT IN (?, ?)",
+			true,
+			now,
+			models.TicketStatusResolved,
+			models.TicketStatusClosed,
+		)
 
 	if role == "agent" {
 		query = query.Where("tickets.assigned_to_id = ?", userID)
@@ -1202,9 +1221,37 @@ func (s *TicketService) BulkUpdateTickets(ctx context.Context, req *BulkUpdateRe
 	updates := make(map[string]interface{})
 
 	if req.Status != nil {
+		nextStatus := models.TicketStatus(*req.Status)
+		if !nextStatus.IsValid() {
+			return fmt.Errorf("invalid ticket status: %s", *req.Status)
+		}
+		var tickets []models.Ticket
+		if err := s.db.WithContext(ctx).Select("id", "status").Where("id IN ?", req.TicketIDs).Find(&tickets).Error; err != nil {
+			return fmt.Errorf("failed to validate ticket status transitions: %w", err)
+		}
+		if len(tickets) != len(req.TicketIDs) {
+			return fmt.Errorf("one or more tickets were not found")
+		}
+		for _, ticket := range tickets {
+			if !ticket.Status.CanTransitionTo(nextStatus) {
+				return fmt.Errorf("%w: ticket %d from %s to %s", ErrInvalidTicketTransition, ticket.ID, ticket.Status, nextStatus)
+			}
+		}
 		updates["status"] = *req.Status
+		switch nextStatus {
+		case models.TicketStatusResolved:
+			updates["resolved_at"] = gorm.Expr("COALESCE(resolved_at, ?)", time.Now())
+		case models.TicketStatusClosed:
+			updates["closed_at"] = gorm.Expr("COALESCE(closed_at, ?)", time.Now())
+		case models.TicketStatusOpen:
+			updates["resolved_at"] = nil
+			updates["closed_at"] = nil
+		}
 	}
 	if req.Priority != nil {
+		if !models.TicketPriority(*req.Priority).IsValid() {
+			return fmt.Errorf("invalid ticket priority: %s", *req.Priority)
+		}
 		updates["priority"] = *req.Priority
 	}
 	if req.AssignedToID != nil {
@@ -1293,6 +1340,22 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
+func applyTicketStatusTimestamps(ticket *models.Ticket, status models.TicketStatus, now time.Time) {
+	switch status {
+	case models.TicketStatusResolved:
+		if ticket.ResolvedAt == nil {
+			ticket.ResolvedAt = &now
+		}
+	case models.TicketStatusClosed:
+		if ticket.ClosedAt == nil {
+			ticket.ClosedAt = &now
+		}
+	case models.TicketStatusOpen:
+		ticket.ResolvedAt = nil
+		ticket.ClosedAt = nil
+	}
+}
+
 // getStatusLabel returns Chinese label for status
 func getStatusLabel(status string) string {
 	labels := map[string]string{
@@ -1344,7 +1407,9 @@ func getSourceLabel(source string) string {
 // generateTicketNumber generates a unique ticket number
 func (s *TicketService) generateTicketNumber() string {
 	now := time.Now()
-	// Format: TK-YYYYMMDD-HHMMSS-RRR (RRR is random 3-digit number)
-	randomNum := rand.Intn(1000)
-	return fmt.Sprintf("TK-%s-%03d", now.Format("20060102-150405"), randomNum)
+	randomSuffix := make([]byte, 6)
+	if _, err := cryptorand.Read(randomSuffix); err != nil {
+		return fmt.Sprintf("TK-%s-%d", now.Format("20060102-150405"), now.UnixNano())
+	}
+	return fmt.Sprintf("TK-%s-%x", now.Format("20060102-150405"), randomSuffix)
 }

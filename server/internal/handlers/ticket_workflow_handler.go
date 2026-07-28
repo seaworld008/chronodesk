@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -20,38 +21,38 @@ func NewTicketWorkflowHandler(ticketService services.TicketServiceInterface) *Ti
 
 type AssignRequest struct {
 	AssignedToID uint   `json:"assigned_to_id" binding:"required"`
-	Comment      string `json:"comment"`
+	Comment      string `json:"comment" binding:"max=2000"`
 }
 
 type TransferRequest struct {
 	AssignedToID   uint   `json:"assigned_to_id" binding:"required"`
-	Department     string `json:"department"`
-	Comment        string `json:"comment"`
-	TransferReason string `json:"transfer_reason"`
+	Department     string `json:"department" binding:"max=100"`
+	Comment        string `json:"comment" binding:"max=2000"`
+	TransferReason string `json:"transfer_reason" binding:"max=500"`
 }
 
 type EscalationRequest struct {
-	Reason       string `json:"reason" binding:"required"`
+	Reason       string `json:"reason" binding:"required,max=500"`
 	EscalateToID uint   `json:"escalate_to_id" binding:"required"`
-	Comment      string `json:"comment"`
+	Comment      string `json:"comment" binding:"max=2000"`
 }
 
 type StatusUpdateRequest struct {
-	Status          string `json:"status" binding:"required"`
-	Comment         string `json:"comment"`
-	ResolutionNotes string `json:"resolution_notes"`
+	Status          string `json:"status" binding:"required,oneof=open in_progress pending resolved closed cancelled"`
+	Comment         string `json:"comment" binding:"max=2000"`
+	ResolutionNotes string `json:"resolution_notes" binding:"max=10000"`
 }
 
 type BulkAssignRequest struct {
-	TicketIDs    []uint `json:"ticket_ids" binding:"required"`
+	TicketIDs    []uint `json:"ticket_ids" binding:"required,min=1,max=100,unique,dive,gt=0"`
 	AssignedToID uint   `json:"assigned_to_id" binding:"required"`
-	Comment      string `json:"comment"`
+	Comment      string `json:"comment" binding:"max=2000"`
 }
 
 type BulkStatusRequest struct {
-	TicketIDs []uint `json:"ticket_ids" binding:"required"`
-	Status    string `json:"status" binding:"required"`
-	Comment   string `json:"comment"`
+	TicketIDs []uint `json:"ticket_ids" binding:"required,min=1,max=100,unique,dive,gt=0"`
+	Status    string `json:"status" binding:"required,oneof=open in_progress pending resolved closed cancelled"`
+	Comment   string `json:"comment" binding:"max=2000"`
 }
 
 func (h *TicketWorkflowHandler) AssignTicket(c *gin.Context) {
@@ -191,6 +192,14 @@ func (h *TicketWorkflowHandler) UpdateTicketStatus(c *gin.Context) {
 	userID := c.GetUint("user_id")
 	ticket, err := h.ticketService.UpdateTicketStatus(uint(ticketID), req.Status, userID, req.Comment, req.ResolutionNotes)
 	if err != nil {
+		if errors.Is(err, services.ErrInvalidTicketTransition) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"message": "无效的状态流转",
+				"error":   err.Error(),
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "状态更新失败",
@@ -208,7 +217,7 @@ func (h *TicketWorkflowHandler) UpdateTicketStatus(c *gin.Context) {
 
 func (h *TicketWorkflowHandler) GetTicketStats(c *gin.Context) {
 	userID := c.GetUint("user_id")
-	role := c.GetString("role")
+	role := c.GetString("user_role")
 
 	stats, err := h.ticketService.GetTicketStatistics(userID, role)
 	if err != nil {
@@ -235,6 +244,7 @@ func (h *TicketWorkflowHandler) GetMyTickets(c *gin.Context) {
 			limit = parsed
 		}
 	}
+	_, limit = normalizePagination(1, limit, 100)
 
 	status := c.Query("status")
 	priority := c.Query("priority")
@@ -263,6 +273,7 @@ func (h *TicketWorkflowHandler) GetUnassignedTickets(c *gin.Context) {
 			limit = parsed
 		}
 	}
+	_, limit = normalizePagination(1, limit, 100)
 
 	priority := c.Query("priority")
 	categoryID := c.Query("category_id")
@@ -286,7 +297,7 @@ func (h *TicketWorkflowHandler) GetUnassignedTickets(c *gin.Context) {
 
 func (h *TicketWorkflowHandler) GetOverdueTickets(c *gin.Context) {
 	userID := c.GetUint("user_id")
-	role := c.GetString("role")
+	role := c.GetString("user_role")
 
 	tickets, total, err := h.ticketService.GetOverdueTickets(userID, role)
 	if err != nil {
@@ -307,7 +318,7 @@ func (h *TicketWorkflowHandler) GetOverdueTickets(c *gin.Context) {
 
 func (h *TicketWorkflowHandler) GetSLABreachedTickets(c *gin.Context) {
 	userID := c.GetUint("user_id")
-	role := c.GetString("role")
+	role := c.GetString("user_role")
 
 	tickets, total, err := h.ticketService.GetSLABreachedTickets(userID, role)
 	if err != nil {

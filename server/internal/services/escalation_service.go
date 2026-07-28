@@ -118,6 +118,14 @@ func (s *EscalationService) hasFirstResponse(ctx context.Context, ticketID uint)
 func (s *EscalationService) HandleSLAViolation(ctx context.Context, ticket *models.Ticket, status *TicketSLAStatus) error {
 	log.Printf("处理工单 %d 的SLA违规", ticket.ID)
 
+	if err := s.db.WithContext(ctx).Model(ticket).Updates(map[string]interface{}{
+		"sla_breached": true,
+		"sla_due_date": status.ResolutionDeadline,
+		"updated_at":   time.Now(),
+	}).Error; err != nil {
+		return fmt.Errorf("failed to mark SLA breach: %w", err)
+	}
+
 	// 获取升级规则
 	escalationRules, err := status.SLAConfig.GetEscalationRules()
 	if err != nil {
@@ -183,6 +191,7 @@ func (s *EscalationService) escalateToManager(ctx context.Context, ticket *model
 	updates := map[string]interface{}{
 		"assigned_to_id": *managerID,
 		"priority":       "high",
+		"is_escalated":   true,
 		"updated_at":     time.Now(),
 	}
 

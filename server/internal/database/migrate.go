@@ -177,11 +177,23 @@ func SeedData(db *gorm.DB) error {
 	db.Model(&models.User{}).Where("role = ?", models.RoleAdmin).Count(&adminCount)
 
 	if adminCount == 0 {
-		// 创建默认管理员用户
+		adminPassword := os.Getenv("ADMIN_PASSWORD")
+		if adminPassword == "" {
+			return fmt.Errorf("ADMIN_PASSWORD is required when seeding the initial administrator")
+		}
+		passwordHash, err := auth.NewSimplePasswordService(8, "").HashPassword(adminPassword)
+		if err != nil {
+			return fmt.Errorf("failed to hash initial administrator password: %w", err)
+		}
+		adminEmail := os.Getenv("ADMIN_EMAIL")
+		if adminEmail == "" {
+			adminEmail = "admin@example.com"
+		}
+
 		adminUser = models.User{
 			Username:      "admin",
-			Email:         "admin@example.com",
-			PasswordHash:  "$2a$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi", // password
+			Email:         adminEmail,
+			PasswordHash:  passwordHash,
 			FirstName:     "System",
 			LastName:      "Administrator",
 			Role:          models.RoleAdmin,
@@ -194,7 +206,7 @@ func SeedData(db *gorm.DB) error {
 		if err := db.Create(&adminUser).Error; err != nil {
 			return fmt.Errorf("failed to create admin user: %w", err)
 		}
-		log.Println("Created default admin user (username: admin, password: password)")
+		log.Printf("Created initial administrator (username: admin, email: %s)", adminEmail)
 	} else {
 		// 获取现有的管理员用户
 		if err := db.Where("role = ?", models.RoleAdmin).First(&adminUser).Error; err != nil {

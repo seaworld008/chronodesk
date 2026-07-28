@@ -57,13 +57,13 @@ func (ec *EmailConfig) CanSendEmail() bool {
 // EmailConfigCreateRequest 创建邮箱配置请求
 type EmailConfigCreateRequest struct {
 	EmailVerificationEnabled bool   `json:"email_verification_enabled"`
-	SMTPHost                 string `json:"smtp_host" validate:"required_if=EmailVerificationEnabled true,omitempty,hostname"`
-	SMTPPort                 int    `json:"smtp_port" validate:"required_if=EmailVerificationEnabled true,omitempty,min=1,max=65535"`
-	SMTPUsername             string `json:"smtp_username" validate:"required_if=EmailVerificationEnabled true"`
-	SMTPPassword             string `json:"smtp_password" validate:"required_if=EmailVerificationEnabled true"`
+	SMTPHost                 string `json:"smtp_host" binding:"required_if=EmailVerificationEnabled true,omitempty,hostname"`
+	SMTPPort                 int    `json:"smtp_port" binding:"required_if=EmailVerificationEnabled true,omitempty,min=1,max=65535"`
+	SMTPUsername             string `json:"smtp_username" binding:"required_if=EmailVerificationEnabled true"`
+	SMTPPassword             string `json:"smtp_password" binding:"required_if=EmailVerificationEnabled true"`
 	SMTPUseTLS               bool   `json:"smtp_use_tls"`
 	SMTPUseSSL               bool   `json:"smtp_use_ssl"`
-	FromEmail                string `json:"from_email" validate:"required_if=EmailVerificationEnabled true,omitempty,email"`
+	FromEmail                string `json:"from_email" binding:"required_if=EmailVerificationEnabled true,omitempty,email"`
 	FromName                 string `json:"from_name"`
 	WelcomeEmailSubject      string `json:"welcome_email_subject"`
 	WelcomeEmailTemplate     string `json:"welcome_email_template"`
@@ -74,13 +74,13 @@ type EmailConfigCreateRequest struct {
 // EmailConfigUpdateRequest 更新邮箱配置请求
 type EmailConfigUpdateRequest struct {
 	EmailVerificationEnabled *bool   `json:"email_verification_enabled"`
-	SMTPHost                 *string `json:"smtp_host" validate:"omitempty,hostname"`
-	SMTPPort                 *int    `json:"smtp_port" validate:"omitempty,min=1,max=65535"`
+	SMTPHost                 *string `json:"smtp_host"`
+	SMTPPort                 *int    `json:"smtp_port" binding:"omitempty,min=1,max=65535"`
 	SMTPUsername             *string `json:"smtp_username"`
 	SMTPPassword             *string `json:"smtp_password"`
 	SMTPUseTLS               *bool   `json:"smtp_use_tls"`
 	SMTPUseSSL               *bool   `json:"smtp_use_ssl"`
-	FromEmail                *string `json:"from_email" validate:"omitempty,email"`
+	FromEmail                *string `json:"from_email"`
 	FromName                 *string `json:"from_name"`
 	WelcomeEmailSubject      *string `json:"welcome_email_subject"`
 	WelcomeEmailTemplate     *string `json:"welcome_email_template"`
@@ -139,7 +139,7 @@ func (ec *EmailConfig) ToResponse() *EmailConfigResponse {
 
 // EmailTestRequest 邮件测试请求
 type EmailTestRequest struct {
-	ToEmail string `json:"to_email" validate:"required,email"`
-	Subject string `json:"subject" validate:"required"`
-	Content string `json:"content" validate:"required"`
+	ToEmail string `json:"to_email" binding:"required,email"`
+	Subject string `json:"subject" binding:"required"`
+	Content string `json:"content" binding:"required"`
 }

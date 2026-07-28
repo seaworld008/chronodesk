@@ -1,14 +1,16 @@
 package handlers
 
 import (
-	"context"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-playground/validator/v10"
 	"gongdan-system/internal/middleware"
 	"gongdan-system/internal/models"
 	"gongdan-system/internal/services"
 )
+
+var emailConfigValidator = validator.New()
 
 // EmailConfigHandler 邮箱配置处理器
 type EmailConfigHandler struct {
@@ -37,7 +39,7 @@ func NewEmailConfigHandler(emailConfigService services.EmailConfigServiceInterfa
 // @Failure 500 {object} ErrorResponse
 // @Router /api/admin/email-config [get]
 func (h *EmailConfigHandler) GetEmailConfig(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	// 获取邮箱配置
 	config, err := h.emailConfigService.GetEmailConfig(ctx)
@@ -64,7 +66,7 @@ func (h *EmailConfigHandler) GetEmailConfig(c *gin.Context) {
 // @Failure 500 {object} ErrorResponse
 // @Router /api/admin/email-config [put]
 func (h *EmailConfigHandler) UpdateEmailConfig(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	// 获取用户ID
 	userID, exists := c.Get("user_id")
@@ -78,6 +80,18 @@ func (h *EmailConfigHandler) UpdateEmailConfig(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.response.Error(c, http.StatusBadRequest, "invalid_request", "请求参数无效: "+err.Error())
 		return
+	}
+	if req.SMTPHost != nil && *req.SMTPHost != "" {
+		if err := emailConfigValidator.Var(*req.SMTPHost, "hostname"); err != nil {
+			h.response.Error(c, http.StatusBadRequest, "invalid_request", "SMTP 主机名格式无效")
+			return
+		}
+	}
+	if req.FromEmail != nil && *req.FromEmail != "" {
+		if err := emailConfigValidator.Var(*req.FromEmail, "email"); err != nil {
+			h.response.Error(c, http.StatusBadRequest, "invalid_request", "发件人邮箱格式无效")
+			return
+		}
 	}
 
 	// 更新邮箱配置
@@ -105,7 +119,7 @@ func (h *EmailConfigHandler) UpdateEmailConfig(c *gin.Context) {
 // @Failure 500 {object} ErrorResponse
 // @Router /api/admin/email-config/test [post]
 func (h *EmailConfigHandler) TestEmailConnection(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	// 解析请求体
 	var req models.EmailTestRequest
@@ -134,7 +148,7 @@ func (h *EmailConfigHandler) TestEmailConnection(c *gin.Context) {
 // @Failure 500 {object} ErrorResponse
 // @Router /api/email-status [get]
 func (h *EmailConfigHandler) GetEmailStatus(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	// 检查邮箱验证是否启用
 	enabled, err := h.emailConfigService.IsEmailVerificationEnabled(ctx)

@@ -262,6 +262,11 @@ export const dataProvider: DataProvider = {
                     query.unassigned = unassigned;
                     delete filter.unassigned;
                 }
+                const assignedToMe = normalizeBoolean(filter.assigned_to_me);
+                if (typeof assignedToMe !== 'undefined') {
+                    query.assigned_to_me = assignedToMe;
+                    delete filter.assigned_to_me;
+                }
             } else if (resource === 'users' || resource === 'admin/users') {
                 const searchValue = extractSearchValue();
                 if (searchValue) {

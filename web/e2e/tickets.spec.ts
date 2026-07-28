@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { loginViaUI } from './helpers/testData';
+import { createTicket, deleteTicket, E2E_PREFIX, loginViaUI } from './helpers/testData';
 
 /**
  * ChronoDesk Ticket Workflow E2E Tests
@@ -20,6 +20,16 @@ test.describe('Authentication', () => {
 });
 
 test.describe('Ticket Management', () => {
+    let ticketId: number;
+
+    test.beforeAll(async ({ request }) => {
+        ticketId = await createTicket(request, `${E2E_PREFIX}基础工单-${Date.now()}`);
+    });
+
+    test.afterAll(async ({ request }) => {
+        await deleteTicket(request, ticketId);
+    });
+
     test.beforeEach(async ({ page }) => {
         await loginViaUI(page, TEST_USER);
     });
@@ -31,12 +41,7 @@ test.describe('Ticket Management', () => {
 
     test('should open create ticket form', async ({ page }) => {
         await page.goto('/#/tickets');
-        const createLink = page.locator('a[href*="tickets/create"]').first();
-        if (await createLink.count()) {
-            await createLink.click();
-        } else {
-            await page.getByLabel('Create').click();
-        }
+        await page.getByRole('link', { name: '创建工单' }).click();
         await expect(page).toHaveURL(/#\/tickets\/create/);
     });
 

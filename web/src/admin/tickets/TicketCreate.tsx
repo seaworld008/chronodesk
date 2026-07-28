@@ -252,7 +252,7 @@ const TicketCreate: React.FC = () => {
                                         </Box>
                                     </Box>
 
-                                    <ReferenceInput source="assignee_id" reference="users" label="分配给">
+                                    <ReferenceInput source="assigned_to_id" reference="users" label="分配给">
                                         <AutocompleteInput
                                             optionText={(choice) => `${choice.username} (${choice.first_name} ${choice.last_name})`}
                                             fullWidth

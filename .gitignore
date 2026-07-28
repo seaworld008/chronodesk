@@ -135,9 +135,15 @@ temp/
 build/
 dist/
 out/
+server/bin/
+server/main
+server/server
+server/gongdan-system
+server/ticket-system
 
-# Docker
-.dockerignore
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
 
 # Backup files
 *.bak

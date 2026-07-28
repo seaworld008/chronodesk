@@ -42,29 +42,31 @@ func (h *Hub) Run() {
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = true
+			clientCount := len(h.clients)
 			h.mu.Unlock()
-			log.Printf("WebSocket client connected, user: %d, total: %d", client.UserID, len(h.clients))
+			log.Printf("WebSocket client connected, user: %d, total: %d", client.UserID, clientCount)
 
 		case client := <-h.unregister:
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
-				close(client.send)
-				log.Printf("WebSocket client disconnected, user: %d, total: %d", client.UserID, len(h.clients))
 			}
+			clientCount := len(h.clients)
 			h.mu.Unlock()
+			client.close()
+			log.Printf("WebSocket client disconnected, user: %d, total: %d", client.UserID, clientCount)
 
 		case message := <-h.broadcast:
-			h.mu.RLock()
+			h.mu.Lock()
 			for client := range h.clients {
 				select {
 				case client.send <- message:
 				default:
-					close(client.send)
 					delete(h.clients, client)
+					client.close()
 				}
 			}
-			h.mu.RUnlock()
+			h.mu.Unlock()
 		}
 	}
 }
@@ -72,8 +74,8 @@ func (h *Hub) Run() {
 // BroadcastToUser sends a message to a specific user
 func (h *Hub) BroadcastToUser(userID uint, messageType string, data interface{}) {
 	message := map[string]interface{}{
-		"type": messageType,
-		"data": data,
+		"type":      messageType,
+		"data":      data,
 		"timestamp": getTimestamp(),
 	}
 
@@ -83,16 +85,16 @@ func (h *Hub) BroadcastToUser(userID uint, messageType string, data interface{})
 		return
 	}
 
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
 	for client := range h.clients {
 		if client.UserID == userID {
 			select {
 			case client.send <- messageBytes:
 			default:
-				close(client.send)
 				delete(h.clients, client)
+				client.close()
 			}
 		}
 	}
@@ -101,8 +103,8 @@ func (h *Hub) BroadcastToUser(userID uint, messageType string, data interface{})
 // BroadcastToAll sends a message to all connected clients
 func (h *Hub) BroadcastToAll(messageType string, data interface{}) {
 	message := map[string]interface{}{
-		"type": messageType,
-		"data": data,
+		"type":      messageType,
+		"data":      data,
 		"timestamp": getTimestamp(),
 	}
 
@@ -119,17 +121,17 @@ func (h *Hub) BroadcastToAll(messageType string, data interface{}) {
 func (h *Hub) GetConnectedUsers() []uint {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	
+
 	userSet := make(map[uint]bool)
 	for client := range h.clients {
 		userSet[client.UserID] = true
 	}
-	
+
 	users := make([]uint, 0, len(userSet))
 	for userID := range userSet {
 		users = append(users, userID)
 	}
-	
+
 	return users
 }
 
@@ -137,13 +139,13 @@ func (h *Hub) GetConnectedUsers() []uint {
 func (h *Hub) IsUserOnline(userID uint) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	
+
 	for client := range h.clients {
 		if client.UserID == userID {
 			return true
 		}
 	}
-	
+
 	return false
 }
 

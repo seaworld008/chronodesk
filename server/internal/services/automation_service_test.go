@@ -5,19 +5,15 @@ import (
 	"testing"
 
 	"gongdan-system/internal/models"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
 func setupAutomationServiceTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("failed to open sqlite memory db: %v", err)
-	}
+	db := openTestDB(t)
 
-	if err := db.AutoMigrate(&models.AutomationRule{}); err != nil {
+	if err := db.AutoMigrate(&models.User{}, &models.Ticket{}, &models.AutomationRule{}); err != nil {
 		t.Fatalf("failed to migrate automation rule schema: %v", err)
 	}
 
@@ -65,6 +61,111 @@ func setupAutomationServiceTestDB(t *testing.T) *gorm.DB {
 	}
 
 	return db
+}
+
+func TestAutomationAssignmentUsesTicketAssigneeColumn(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.User{}, &models.Ticket{}); err != nil {
+		t.Fatalf("failed to migrate schemas: %v", err)
+	}
+
+	user := models.User{
+		Username:     "automation-assignee",
+		Email:        "automation-assignee@example.com",
+		PasswordHash: "hashed",
+		Role:         models.RoleAgent,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+	ticket := models.Ticket{
+		TicketNumber: "AUTO-001",
+		Title:        "Automation assignment",
+		Description:  "desc",
+		Status:       models.TicketStatusOpen,
+		Priority:     models.TicketPriorityNormal,
+		Type:         models.TicketTypeRequest,
+		Source:       models.TicketSourceWeb,
+		CreatedByID:  user.ID,
+	}
+	if err := db.Create(&ticket).Error; err != nil {
+		t.Fatalf("failed to create ticket: %v", err)
+	}
+
+	svc := NewAutomationService(db)
+	action := &models.RuleAction{
+		Type:   "assign",
+		Params: map[string]interface{}{"user_id": float64(user.ID)},
+	}
+	if err := svc.executeAssignAction(context.Background(), action, &ticket); err != nil {
+		t.Fatalf("executeAssignAction returned error: %v", err)
+	}
+
+	var updated models.Ticket
+	if err := db.First(&updated, ticket.ID).Error; err != nil {
+		t.Fatalf("failed to reload ticket: %v", err)
+	}
+	if updated.AssignedToID == nil || *updated.AssignedToID != user.ID {
+		t.Fatalf("expected assigned_to_id=%d, got %v", user.ID, updated.AssignedToID)
+	}
+}
+
+func TestAutomationToUintRejectsUnsafeValues(t *testing.T) {
+	svc := &AutomationService{}
+	invalid := []interface{}{-1, int64(-1), float64(-1), float64(1.5), uint(0)}
+
+	for _, value := range invalid {
+		if _, err := svc.toUint(value); err == nil {
+			t.Fatalf("expected value %v (%T) to be rejected", value, value)
+		}
+	}
+}
+
+func TestClassifyTicketPersistsCanonicalType(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.User{}, &models.Ticket{}); err != nil {
+		t.Fatalf("failed to migrate schemas: %v", err)
+	}
+	user := models.User{
+		Username:     "automation-classifier",
+		Email:        "automation-classifier@example.com",
+		PasswordHash: "hashed",
+		Role:         models.RoleAgent,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+	ticket := models.Ticket{
+		TicketNumber: "AUTO-CLASSIFY-001",
+		Title:        "Urgent crash in checkout",
+		Description:  "customers see an error",
+		Status:       models.TicketStatusOpen,
+		Priority:     models.TicketPriorityNormal,
+		Type:         models.TicketTypeRequest,
+		Source:       models.TicketSourceWeb,
+		CreatedByID:  user.ID,
+	}
+	if err := db.Create(&ticket).Error; err != nil {
+		t.Fatalf("failed to create ticket: %v", err)
+	}
+
+	svc := NewAutomationService(db)
+	if err := svc.ClassifyTicket(context.Background(), &ticket); err != nil {
+		t.Fatalf("ClassifyTicket returned error: %v", err)
+	}
+
+	var updated models.Ticket
+	if err := db.First(&updated, ticket.ID).Error; err != nil {
+		t.Fatalf("failed to reload ticket: %v", err)
+	}
+	if updated.Type != models.TicketTypeIncident {
+		t.Fatalf("expected incident type, got %s", updated.Type)
+	}
+	if updated.Priority != models.TicketPriorityHigh {
+		t.Fatalf("expected high priority, got %s", updated.Priority)
+	}
 }
 
 func TestAutomationServiceGetRulesFilters(t *testing.T) {

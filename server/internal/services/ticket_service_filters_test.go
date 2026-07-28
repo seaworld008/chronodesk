@@ -15,7 +15,7 @@ func setupFilterTestDB(t *testing.T) *gorm.DB {
 
 	db := openTestDB(t)
 
-	if err := db.AutoMigrate(&models.User{}, &models.Ticket{}, &models.TicketComment{}); err != nil {
+	if err := db.AutoMigrate(&models.User{}, &models.Category{}, &models.Ticket{}, &models.TicketComment{}); err != nil {
 		t.Fatalf("failed to migrate: %v", err)
 	}
 
@@ -176,6 +176,76 @@ func TestGetTickets_SortFieldInjectionFallsBackToCreatedAt(t *testing.T) {
 	// Invalid sort field should fall back to created_at DESC.
 	if tickets[0].ID != newer.ID {
 		t.Fatalf("expected newest ticket first after fallback sort, got first id=%d want=%d (older id=%d)", tickets[0].ID, newer.ID, older.ID)
+	}
+}
+
+func TestGetSLABreachedTicketsUsesStoredDeadlineAndFlag(t *testing.T) {
+	db := setupFilterTestDB(t)
+	creator := seedUser(t, db, "sla-creator")
+	assignee := seedUser(t, db, "sla-assignee")
+	slaHours := 4
+	category := models.Category{
+		Name:      "SLA category",
+		Slug:      "sla-category",
+		Type:      models.CategoryTypeSupport,
+		Status:    models.CategoryStatusActive,
+		SLAHours:  &slaHours,
+		CreatedBy: creator.ID,
+	}
+	if err := db.Create(&category).Error; err != nil {
+		t.Fatalf("failed to create SLA category: %v", err)
+	}
+
+	past := time.Now().Add(-time.Hour)
+	future := time.Now().Add(time.Hour)
+	seedTicket(t, db, models.Ticket{
+		TicketNumber: "SLA-001",
+		Title:        "Expired SLA deadline",
+		Description:  "desc",
+		Status:       models.TicketStatusOpen,
+		Priority:     models.TicketPriorityHigh,
+		Type:         models.TicketTypeRequest,
+		Source:       models.TicketSourceWeb,
+		CreatedByID:  creator.ID,
+		AssignedToID: &assignee.ID,
+		CategoryID:   &category.ID,
+		SLADueDate:   &past,
+	})
+	seedTicket(t, db, models.Ticket{
+		TicketNumber: "SLA-002",
+		Title:        "Explicit SLA breach",
+		Description:  "desc",
+		Status:       models.TicketStatusInProgress,
+		Priority:     models.TicketPriorityUrgent,
+		Type:         models.TicketTypeIncident,
+		Source:       models.TicketSourceWeb,
+		CreatedByID:  creator.ID,
+		AssignedToID: &assignee.ID,
+		CategoryID:   &category.ID,
+		SLABreached:  true,
+		SLADueDate:   &future,
+	})
+	seedTicket(t, db, models.Ticket{
+		TicketNumber: "SLA-003",
+		Title:        "Resolved breach",
+		Description:  "desc",
+		Status:       models.TicketStatusResolved,
+		Priority:     models.TicketPriorityNormal,
+		Type:         models.TicketTypeRequest,
+		Source:       models.TicketSourceWeb,
+		CreatedByID:  creator.ID,
+		AssignedToID: &assignee.ID,
+		CategoryID:   &category.ID,
+		SLABreached:  true,
+	})
+
+	svc := NewTicketService(db)
+	tickets, total, err := svc.GetSLABreachedTickets(assignee.ID, "agent")
+	if err != nil {
+		t.Fatalf("GetSLABreachedTickets returned error: %v", err)
+	}
+	if total != 2 || len(tickets) != 2 {
+		t.Fatalf("expected 2 active SLA breaches, got total=%d len=%d", total, len(tickets))
 	}
 }
 
