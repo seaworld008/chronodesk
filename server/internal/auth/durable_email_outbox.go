@@ -11,6 +11,7 @@ import (
 
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 	"gorm.io/gorm"
@@ -660,9 +661,9 @@ func parseEmailDestinationID(destination, prefix string) (uint, error) {
 	if !found || raw == "" || strings.Contains(raw, ":") {
 		return 0, errors.New("invalid authentication email Outbox destination")
 	}
-	value, err := strconv.ParseUint(raw, 10, 64)
-	if err != nil || value == 0 {
+	value, err := safeconv.ParsePositiveUint(raw)
+	if err != nil {
 		return 0, errors.New("invalid authentication email Outbox record ID")
 	}
-	return uint(value), nil
+	return value, nil
 }

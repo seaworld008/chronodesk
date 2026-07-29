@@ -11,6 +11,7 @@ import (
 
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 )
 
 // AssignTicketCommand is the protocol-neutral Assignment command. Assignee nil
@@ -297,11 +298,11 @@ func (s *AgentNativeService) AssignTicket(
 		"reason":    strings.TrimSpace(command.Reason),
 	}
 	if command.Assignee != nil && command.Assignee.Type == models.ActorTypeHuman {
-		assigneeID, parseErr := strconv.ParseUint(command.Assignee.ID, 10, 64)
-		if parseErr != nil || assigneeID == 0 {
+		assigneeID, parseErr := safeconv.ParsePositiveUint(command.Assignee.ID)
+		if parseErr != nil {
 			return nil, fmt.Errorf("%w: human assignee id must be a user id", ErrInvalidAssignee)
 		}
-		eventData["assigned_to_id"] = uint(assigneeID)
+		eventData["assigned_to_id"] = assigneeID
 	}
 	return s.UpdateTicketVersion(ctx, VersionedTicketUpdateInput{
 		TicketID:                 command.TicketID,
@@ -416,11 +417,11 @@ func (s *AgentNativeService) EscalateTicket(
 		eventData["assignment_policy_decision_id"] = assignmentDecisionID
 	}
 	if command.Assignee != nil && command.Assignee.Type == models.ActorTypeHuman {
-		assigneeID, parseErr := strconv.ParseUint(command.Assignee.ID, 10, 64)
-		if parseErr != nil || assigneeID == 0 {
+		assigneeID, parseErr := safeconv.ParsePositiveUint(command.Assignee.ID)
+		if parseErr != nil {
 			return nil, fmt.Errorf("%w: human assignee id must be a user id", ErrInvalidAssignee)
 		}
-		eventData["assigned_to_id"] = uint(assigneeID)
+		eventData["assigned_to_id"] = assigneeID
 	}
 	return s.UpdateTicketVersion(ctx, VersionedTicketUpdateInput{
 		TicketID:                      command.TicketID,
@@ -497,8 +498,8 @@ func ticketUpdateNotificationTargets(
 	}
 	actorID := uint(0)
 	if actor.Type == models.ActorTypeHuman {
-		if parsed, err := strconv.ParseUint(actor.ID, 10, 64); err == nil {
-			actorID = uint(parsed)
+		if parsed, err := safeconv.ParsePositiveUint(actor.ID); err == nil {
+			actorID = parsed
 		}
 	}
 	targets := make([]OutboxTarget, 0, 3)

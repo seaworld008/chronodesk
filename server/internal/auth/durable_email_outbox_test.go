@@ -11,6 +11,7 @@ import (
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/security"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -73,6 +74,19 @@ func seedAuthEmailOutboxUser(t *testing.T, db *gorm.DB) models.User {
 		t.Fatal(err)
 	}
 	return user
+}
+
+func TestParseEmailDestinationIDRejectsNativeUintNarrowing(t *testing.T) {
+	prefix := services.AuthWelcomeEmailDestinationPrefix
+	if _, err := parseEmailDestinationID(prefix+"0", prefix); err == nil {
+		t.Fatal("parseEmailDestinationID() accepted zero")
+	}
+	if _, err := parseEmailDestinationID(prefix+"18446744073709551616", prefix); err == nil {
+		t.Fatal("parseEmailDestinationID() accepted uint64 overflow")
+	}
+	if got, err := parseEmailDestinationID(prefix+"42", prefix); err != nil || got != 42 {
+		t.Fatalf("parseEmailDestinationID() = (%d, %v), want (42, nil)", got, err)
+	}
 }
 
 func TestAuthEmailIntentsCommitWithEncryptedOneTimeCredential(t *testing.T) {

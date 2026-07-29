@@ -19,13 +19,7 @@ func ParseUint(value string) (uint, error) {
 	if err != nil {
 		return 0, err
 	}
-	// Compare against the destination type's actual maximum before casting.
-	// Keeping the proof independent of strconv.IntSize also makes the
-	// invariant visible to static analyzers on every target architecture.
-	if parsed > uint64(^uint(0)) {
-		return 0, ErrIntegerOutOfRange
-	}
-	return uint(parsed), nil
+	return Uint(parsed)
 }
 
 // ParsePositiveUint parses a non-zero base-10 value at the platform uint width.
@@ -42,7 +36,10 @@ func ParsePositiveUint(value string) (uint, error) {
 
 // Uint converts a uint64 only after proving that it fits the platform uint.
 func Uint(value uint64) (uint, error) {
-	if value > uint64(^uint(0)) {
+	// math.MaxUint is an untyped constant whose value follows the target
+	// architecture. Comparing before the conversion is therefore valid on
+	// both 32-bit and 64-bit builds, without relying on a cast-derived bound.
+	if value > math.MaxUint {
 		return 0, ErrIntegerOutOfRange
 	}
 	return uint(value), nil
