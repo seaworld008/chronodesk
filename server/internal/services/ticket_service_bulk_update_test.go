@@ -16,8 +16,8 @@ import (
 
 func TestBulkUpdateTicketsWritesVersionedAuditAndOutboxAtomically(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	actor := seedCompatibilityUser(t, db, "bulk-actor")
-	assignee := seedCompatibilityUser(t, db, "bulk-assignee")
+	actor := seedActorUser(t, db, "bulk-actor")
+	assignee := seedActorUser(t, db, "bulk-assignee")
 	first := seedNativeTicket(t, db, actor.ID, "BULK-NATIVE-1")
 	second := seedNativeTicket(t, db, actor.ID, "BULK-NATIVE-2")
 	native := NewAgentNativeService(db)
@@ -25,8 +25,11 @@ func TestBulkUpdateTicketsWritesVersionedAuditAndOutboxAtomically(t *testing.T) 
 
 	status := string(models.TicketStatusInProgress)
 	priority := string(models.TicketPriorityHigh)
-	err := service.BulkUpdateTickets(context.Background(), &BulkUpdateRequest{
-		TicketIDs:    []uint{second.ID, first.ID},
+	result, err := service.BulkUpdateTickets(context.Background(), &BulkUpdateRequest{
+		Tickets: []TicketVersionPrecondition{
+			{ID: second.ID, Version: second.Version},
+			{ID: first.ID, Version: first.Version},
+		},
 		Status:       &status,
 		Priority:     &priority,
 		AssignedToID: &assignee.ID,
@@ -35,6 +38,9 @@ func TestBulkUpdateTicketsWritesVersionedAuditAndOutboxAtomically(t *testing.T) 
 	}, actor.ID)
 	if err != nil {
 		t.Fatalf("bulk update: %v", err)
+	}
+	if len(result.Tickets) != 2 {
+		t.Fatalf("bulk receipts = %#v", result.Tickets)
 	}
 
 	for _, ticketID := range []uint{first.ID, second.ID} {
@@ -83,15 +89,19 @@ func TestBulkUpdateTicketsWritesVersionedAuditAndOutboxAtomically(t *testing.T) 
 			Count(&deliveryCount).Error; err != nil {
 			t.Fatalf("count ticket %d Outbox: %v", ticketID, err)
 		}
-		if deliveryCount != 1 {
-			t.Fatalf("ticket %d Outbox deliveries=%d, want 1", ticketID, deliveryCount)
+		if deliveryCount != 3 {
+			t.Fatalf(
+				"ticket %d Outbox deliveries=%d, want default event plus assignment and status notifications",
+				ticketID,
+				deliveryCount,
+			)
 		}
 	}
 }
 
 func TestBulkUpdateTicketsRollsBackEveryTicketWhenLatestTransitionIsInvalid(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	actor := seedCompatibilityUser(t, db, "bulk-rollback")
+	actor := seedActorUser(t, db, "bulk-rollback")
 	first := seedNativeTicket(t, db, actor.ID, "BULK-ROLLBACK-1")
 	second := seedNativeTicket(t, db, actor.ID, "BULK-ROLLBACK-2")
 	if err := db.Model(&models.Ticket{}).
@@ -103,10 +113,13 @@ func TestBulkUpdateTicketsRollsBackEveryTicketWhenLatestTransitionIsInvalid(t *t
 	status := string(models.TicketStatusInProgress)
 	priority := string(models.TicketPriorityHigh)
 
-	err := service.BulkUpdateTickets(context.Background(), &BulkUpdateRequest{
-		TicketIDs: []uint{first.ID, second.ID},
-		Status:    &status,
-		Priority:  &priority,
+	_, err := service.BulkUpdateTickets(context.Background(), &BulkUpdateRequest{
+		Tickets: []TicketVersionPrecondition{
+			{ID: first.ID, Version: first.Version},
+			{ID: second.ID, Version: second.Version},
+		},
+		Status:   &status,
+		Priority: &priority,
 	}, actor.ID)
 	if !errors.Is(err, ErrInvalidTicketTransition) {
 		t.Fatalf("expected latest-state transition error, got %v", err)
@@ -144,7 +157,7 @@ func TestBulkUpdateTicketsRollsBackEveryTicketWhenLatestTransitionIsInvalid(t *t
 
 func TestBulkUpdateTicketsDoesNotOverwriteAgentCommitBetweenReadAndCAS(t *testing.T) {
 	db := openBulkConcurrencyTestDB(t)
-	actor := seedCompatibilityUser(t, db, "bulk-concurrent")
+	actor := seedActorUser(t, db, "bulk-concurrent")
 	ticket := seedNativeTicket(t, db, actor.ID, "BULK-CONCURRENT-1")
 	native := NewAgentNativeService(db)
 	service := &TicketService{db: db, agentNative: native}
@@ -182,9 +195,9 @@ func TestBulkUpdateTicketsDoesNotOverwriteAgentCommitBetweenReadAndCAS(t *testin
 	}()
 
 	priority := string(models.TicketPriorityHigh)
-	err := service.BulkUpdateTickets(context.Background(), &BulkUpdateRequest{
-		TicketIDs: []uint{ticket.ID},
-		Priority:  &priority,
+	_, err := service.BulkUpdateTickets(context.Background(), &BulkUpdateRequest{
+		Tickets:  []TicketVersionPrecondition{{ID: ticket.ID, Version: ticket.Version}},
+		Priority: &priority,
 	}, actor.ID)
 	if err == nil {
 		t.Fatal("bulk update should fail when an Agent commits between read and CAS")

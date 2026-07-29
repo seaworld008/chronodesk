@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"strconv"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/auth"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
 )
@@ -85,8 +87,18 @@ func (g *SampleDataGenerator) createSampleUsers() error {
 		{"demo_user3", "user3@sample.com", "赵", "设计", models.RoleCustomer, "设计部", "UI设计师"},
 	}
 
-	// 统一密码哈希 (DemoPass123!)
-	passwordHash := "$2a$12$rMd8z8Z7Zq4wX.yN3jCNNO2rT1qJxJ5Lw4E3X9dP8kL6vN8pQ2eGu"
+	// 演示账号只允许由显式开发命令创建，仍使用运行时支持的当前哈希格式。
+	passwordService, err := auth.NewSimplePasswordService(auth.PasswordServiceConfig{
+		MinLength:  8,
+		BcryptCost: auth.DefaultBcryptCost,
+	})
+	if err != nil {
+		return fmt.Errorf("初始化示例用户密码服务失败: %w", err)
+	}
+	passwordHash, err := passwordService.HashPassword("DemoPass123!")
+	if err != nil {
+		return fmt.Errorf("生成示例用户密码哈希失败: %w", err)
+	}
 
 	for _, userData := range sampleUsers {
 		user := &models.User{
@@ -294,11 +306,11 @@ func (g *SampleDataGenerator) createSampleTickets() error {
 		},
 	}
 
-	rand.Seed(time.Now().UnixNano())
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	for i, template := range ticketTemplates {
 		// 随机选择分类
-		categoryIndex := rand.Intn(len(categories))
+		categoryIndex := rng.Intn(len(categories))
 		category := categories[categoryIndex]
 
 		// 获取创建者
@@ -311,28 +323,32 @@ func (g *SampleDataGenerator) createSampleTickets() error {
 		ticketNumber := fmt.Sprintf("TK%s%03d", time.Now().Format("20060102"), i+1)
 
 		ticket := models.Ticket{
-			TicketNumber: ticketNumber,
-			Title:        template.Title,
-			Description:  template.Description,
-			Type:         template.Type,
-			Priority:     template.Priority,
-			Status:       template.Status,
-			Source:       template.Source,
-			CreatedByID:  creator.ID,
-			CategoryID:   &category.ID,
-			CreatedAt:    time.Now().Add(-time.Duration(rand.Intn(72)) * time.Hour), // 随机过去3天内创建
+			TicketNumber:       ticketNumber,
+			Title:              template.Title,
+			Description:        template.Description,
+			Type:               template.Type,
+			Priority:           template.Priority,
+			Status:             template.Status,
+			Source:             template.Source,
+			CreatedByID:        &creator.ID,
+			CreatedByActorType: models.ActorTypeHuman,
+			CreatedByActorID:   strconv.FormatUint(uint64(creator.ID), 10),
+			CategoryID:         &category.ID,
+			CreatedAt:          time.Now().Add(-time.Duration(rng.Intn(72)) * time.Hour), // 随机过去3天内创建
 		}
 
 		// 设置分配者（如果指定）
 		if template.AssigneeKey != "" {
 			if assignee, exists := g.users[template.AssigneeKey]; exists {
 				ticket.AssignedToID = &assignee.ID
+				ticket.AssignedToActorType = models.ActorTypeHuman
+				ticket.AssignedToActorID = strconv.FormatUint(uint64(assignee.ID), 10)
 			}
 		}
 
 		// 为已解决的工单设置解决时间
 		if ticket.Status == models.TicketStatusResolved {
-			resolvedTime := ticket.CreatedAt.Add(time.Duration(rand.Intn(48)) * time.Hour)
+			resolvedTime := ticket.CreatedAt.Add(time.Duration(rng.Intn(48)) * time.Hour)
 			ticket.ResolvedAt = &resolvedTime
 		}
 
@@ -382,16 +398,16 @@ func (g *SampleDataGenerator) createSampleComments() error {
 		"这是一个示例评论：已按照用户要求完成配置，相关权限已生效，请查收。",
 	}
 
-	rand.Seed(time.Now().UnixNano())
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	createdComments := 0
 
 	for _, ticket := range tickets {
 		// 为每个工单随机创建1-3个评论
-		commentCount := rand.Intn(3) + 1
+		commentCount := rng.Intn(3) + 1
 
 		for i := 0; i < commentCount; i++ {
 			// 随机选择评论模板
-			template := commentTemplates[rand.Intn(len(commentTemplates))]
+			template := commentTemplates[rng.Intn(len(commentTemplates))]
 
 			// 随机选择评论者（优先分配者，否则随机选择）
 			var commenterID uint
@@ -403,21 +419,23 @@ func (g *SampleDataGenerator) createSampleComments() error {
 				for email := range g.users {
 					userEmails = append(userEmails, email)
 				}
-				randomEmail := userEmails[rand.Intn(len(userEmails))]
+				randomEmail := userEmails[rng.Intn(len(userEmails))]
 				commenterID = g.users[randomEmail].ID
 			}
 
+			ageHours := max(1, int(time.Since(ticket.CreatedAt).Hours()))
 			comment := models.TicketComment{
 				TicketID:  ticket.ID,
-				UserID:    commenterID,
+				UserID:    &commenterID,
+				ActorType: models.ActorTypeHuman,
+				ActorID:   strconv.FormatUint(uint64(commenterID), 10),
 				Content:   template,
 				Type:      models.CommentTypePublic,
-				CreatedAt: ticket.CreatedAt.Add(time.Duration(rand.Intn(24*int(time.Since(ticket.CreatedAt).Hours()))) * time.Hour),
+				CreatedAt: ticket.CreatedAt.Add(time.Duration(rng.Intn(ageHours+1)) * time.Hour),
 			}
 
 			if err := g.db.Create(&comment).Error; err != nil {
-				log.Printf("创建评论失败: %v", err)
-				continue
+				return fmt.Errorf("创建示例评论失败: %w", err)
 			}
 
 			createdComments++
@@ -461,10 +479,13 @@ func (g *SampleDataGenerator) createSampleHistory() error {
 		histories := []models.TicketHistory{
 			{
 				TicketID:    ticket.ID,
-				UserID:      &ticket.CreatedByID,
+				UserID:      ticket.CreatedByID,
+				ActorType:   models.ActorTypeHuman,
+				ActorID:     strconv.FormatUint(uint64(*ticket.CreatedByID), 10),
 				Action:      models.HistoryActionCreate,
 				Description: "工单创建示例记录",
 				CreatedAt:   ticket.CreatedAt,
+				Provenance:  models.TicketHistoryProvenanceImported,
 			},
 		}
 
@@ -473,9 +494,12 @@ func (g *SampleDataGenerator) createSampleHistory() error {
 			histories = append(histories, models.TicketHistory{
 				TicketID:    ticket.ID,
 				UserID:      ticket.AssignedToID,
+				ActorType:   models.ActorTypeHuman,
+				ActorID:     strconv.FormatUint(uint64(*ticket.AssignedToID), 10),
 				Action:      models.HistoryActionAssign,
 				Description: "工单分配示例记录：已分配给技术支持团队",
 				CreatedAt:   ticket.CreatedAt.Add(30 * time.Minute),
+				Provenance:  models.TicketHistoryProvenanceImported,
 			})
 		}
 
@@ -499,7 +523,7 @@ func (g *SampleDataGenerator) createSampleHistory() error {
 				description = "工单关闭示例记录：工单已关闭，用户确认问题已解决"
 			}
 
-			var userID *uint = &ticket.CreatedByID
+			userID := ticket.CreatedByID
 			if ticket.AssignedToID != nil {
 				userID = ticket.AssignedToID
 			}
@@ -507,52 +531,24 @@ func (g *SampleDataGenerator) createSampleHistory() error {
 			histories = append(histories, models.TicketHistory{
 				TicketID:    ticket.ID,
 				UserID:      userID,
+				ActorType:   models.ActorTypeHuman,
+				ActorID:     strconv.FormatUint(uint64(*userID), 10),
 				Action:      actionType,
 				Description: description,
 				CreatedAt:   ticket.CreatedAt.Add(2 * time.Hour),
+				Provenance:  models.TicketHistoryProvenanceImported,
 			})
 		}
 
 		// 批量创建历史记录
 		for _, history := range histories {
 			if err := g.db.Create(&history).Error; err != nil {
-				log.Printf("创建历史记录失败: %v", err)
-				continue
+				return fmt.Errorf("创建示例历史记录失败: %w", err)
 			}
 			createdHistory++
 		}
 	}
 
 	log.Printf("✅ 创建了 %d 个示例历史记录", createdHistory)
-	return nil
-}
-
-// CleanupSampleData 清理示例数据（开发调试用）
-func (g *SampleDataGenerator) CleanupSampleData() error {
-	log.Println("🗑️ 清理示例数据...")
-
-	// 按相反顺序删除数据以维护外键约束
-	tables := []struct {
-		model interface{}
-		where string
-	}{
-		{&models.TicketHistory{}, "description LIKE '%示例%'"},
-		{&models.TicketComment{}, "content LIKE '%这是一个示例%'"},
-		{&models.Ticket{}, "title LIKE '%示例%'"},
-		{&models.Category{}, "name LIKE '%示例%'"},
-		{&models.User{}, "email LIKE '%@sample.com'"},
-	}
-
-	for _, table := range tables {
-		result := g.db.Where(table.where).Delete(table.model)
-		if result.Error != nil {
-			return fmt.Errorf("清理数据失败: %w", result.Error)
-		}
-		if result.RowsAffected > 0 {
-			log.Printf("✓ 清理了 %d 条记录", result.RowsAffected)
-		}
-	}
-
-	log.Println("✅ 示例数据清理完成")
 	return nil
 }

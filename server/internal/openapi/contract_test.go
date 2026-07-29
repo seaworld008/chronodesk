@@ -59,6 +59,9 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 		"/capabilities",
 		"/tickets",
 		"/tickets/{ticketId}",
+		"/tickets/{ticketId}/commands/assign",
+		"/tickets/{ticketId}/commands/transition",
+		"/tickets/{ticketId}/commands/escalate",
 		"/events",
 		"/oauth/token",
 		"/.well-known/oauth-protected-resource/mcp",
@@ -77,6 +80,22 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 
 	assertHeaderRefs(t, paths, "/tickets", "post", "IdempotencyKey")
 	assertHeaderRefs(t, paths, "/tickets/{ticketId}", "patch", "IfMatch", "IdempotencyKey", "TicketLease")
+	for _, path := range []string{
+		"/tickets/{ticketId}/commands/assign",
+		"/tickets/{ticketId}/commands/transition",
+		"/tickets/{ticketId}/commands/escalate",
+	} {
+		assertHeaderRefs(
+			t,
+			paths,
+			path,
+			"post",
+			"IfMatch",
+			"IdempotencyKey",
+			"TicketLease",
+			"CommandCorrelationId",
+		)
+	}
 	assertHeaderRefs(t, paths, "/tickets/{ticketId}/comments", "post", "IfMatch", "IdempotencyKey", "TicketLease")
 	assertHeaderRefs(t, paths, "/tickets/{ticketId}/attachments", "post", "IfMatch", "IdempotencyKey", "TicketLease")
 	assertHeaderRefs(t, paths, "/tickets/{ticketId}/claim", "post", "IfMatch", "IdempotencyKey")
@@ -84,9 +103,22 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 	assertHeaderRefs(t, paths, "/leases/{leaseId}", "delete", "IdempotencyKey")
 
 	patch := contractOperation(t, paths, "/tickets/{ticketId}", "patch")
-	for _, scope := range []string{"tickets:update", "tickets:assign", "tickets:transition"} {
-		if !hasOAuthScopeAlternative(patch, scope) {
-			t.Errorf("ticket patch security has no OAuth alternative for %s", scope)
+	if !hasOAuthScopeAlternative(patch, "tickets:update") {
+		t.Error("ordinary ticket patch has no tickets:update scope")
+	}
+	for _, forbiddenScope := range []string{"tickets:assign", "tickets:transition"} {
+		if hasOAuthScopeAlternative(patch, forbiddenScope) {
+			t.Errorf("ordinary ticket patch still advertises %s", forbiddenScope)
+		}
+	}
+	for path, scope := range map[string]string{
+		"/tickets/{ticketId}/commands/assign":     "tickets:assign",
+		"/tickets/{ticketId}/commands/transition": "tickets:transition",
+		"/tickets/{ticketId}/commands/escalate":   "tickets:transition",
+	} {
+		command := contractOperation(t, paths, path, "post")
+		if !hasOAuthScopeAlternative(command, scope) {
+			t.Errorf("%s has no %s scope", path, scope)
 		}
 	}
 
@@ -141,6 +173,81 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 		{path: "/admin/outbox/{deliveryId}/replay", method: "post", status: "202", schemaName: "ReplayEnvelope"},
 	}
 	schemas := contractMap(t, components["schemas"], "components.schemas")
+	for _, schemaName := range []string{"Ticket", "TicketCreate", "TicketFieldPatch", "Comment", "CommentCreate"} {
+		schema := contractMap(t, schemas[schemaName], "components.schemas."+schemaName)
+		properties := contractMap(t, schema["properties"], "components.schemas."+schemaName+".properties")
+		if _, exists := properties["attachments"]; exists {
+			t.Errorf("%s exposes removed legacy attachment array", schemaName)
+		}
+		if _, exists := properties["attachment_ids"]; exists {
+			t.Errorf("%s exposes unsupported attachment association input", schemaName)
+		}
+	}
+	for _, removed := range []string{"TicketAssignmentPatch", "TicketTransitionPatch"} {
+		if _, exists := schemas[removed]; exists {
+			t.Errorf("legacy mixed-patch schema %s still exists", removed)
+		}
+	}
+	for _, schemaName := range []string{
+		"TicketFieldPatch",
+		"TicketAssignCommand",
+		"TicketTransitionCommand",
+		"TicketEscalateCommand",
+		"AssignableActorRef",
+	} {
+		schema := contractMap(t, schemas[schemaName], "components.schemas."+schemaName)
+		if schema["additionalProperties"] != false {
+			t.Errorf("ticket command schema %s is not closed", schemaName)
+		}
+	}
+	for schemaName, requiredFields := range map[string][]string{
+		"TicketAssignCommand":     {"assignee", "reason"},
+		"TicketTransitionCommand": {"status", "reason"},
+		"TicketEscalateCommand":   {"reason"},
+	} {
+		schema := contractMap(t, schemas[schemaName], "components.schemas."+schemaName)
+		for _, field := range requiredFields {
+			if !contractSliceContains(schema["required"], field) {
+				t.Errorf("%s does not require %s", schemaName, field)
+			}
+		}
+		properties := contractMap(
+			t,
+			schema["properties"],
+			"components.schemas."+schemaName+".properties",
+		)
+		reason := contractMap(
+			t,
+			properties["reason"],
+			"components.schemas."+schemaName+".properties.reason",
+		)
+		if reason["minLength"] != 1 || reason["maxLength"] != 1000 {
+			t.Errorf(
+				"%s reason bounds = [%v,%v], want [1,1000]",
+				schemaName,
+				reason["minLength"],
+				reason["maxLength"],
+			)
+		}
+	}
+	ordinaryPatch := contractMap(t, schemas["TicketFieldPatch"], "components.schemas.TicketFieldPatch")
+	ordinaryProperties := contractMap(t, ordinaryPatch["properties"], "TicketFieldPatch.properties")
+	for _, forbidden := range []string{
+		"status",
+		"is_escalated",
+		"source",
+		"trust_level",
+		"sla_breached",
+		"sla_due_date",
+		"assigned_to_id",
+		"assigned_to_actor_type",
+		"assigned_to_actor_id",
+		"assigned_to_service_principal_id",
+	} {
+		if _, exists := ordinaryProperties[forbidden]; exists {
+			t.Errorf("ordinary ticket patch exposes command/control field %s", forbidden)
+		}
+	}
 	receiptSchemas := make(map[string]bool)
 	declaredAdminWrites := make(map[string]bool, len(adminWriteSchemas))
 	for _, expected := range adminWriteSchemas {
@@ -719,55 +826,18 @@ func assertMCP20260728Contract(
 			t.Errorf("POST /mcp request example %s does not identify its Mcp-Name binding", name)
 		}
 	}
-	cancelledExample := contractMap(
-		t,
-		requestExamples["cancelledNotification"],
-		"POST /mcp cancelled notification example",
-	)
-	cancelledValue := contractMap(
-		t,
-		cancelledExample["value"],
-		"POST /mcp cancelled notification value",
-	)
-	if cancelledValue["method"] != "notifications/cancelled" {
-		t.Errorf("cancelled notification method = %v", cancelledValue["method"])
-	}
-	if _, hasID := cancelledValue["id"]; hasID {
-		t.Error("cancelled notification example must not contain an id")
+	if _, exists := requestExamples["cancelledNotification"]; exists {
+		t.Error("POST /mcp must not advertise a client notification example")
 	}
 
 	modernRequest := contractMap(t, schemas["MCP20260728Request"], "components.schemas.MCP20260728Request")
-	requestAlternatives, ok := modernRequest["oneOf"].([]any)
-	if !ok || len(requestAlternatives) != 2 {
-		t.Fatalf("MCP request schema alternatives = %#v, want request and notification", modernRequest["oneOf"])
-	}
-	expectedAlternatives := map[string]bool{
-		"#/components/schemas/MCP20260728CallRequest":           false,
-		"#/components/schemas/MCP20260728CancelledNotification": false,
-	}
-	for _, rawAlternative := range requestAlternatives {
-		alternative := contractMap(t, rawAlternative, "MCP20260728Request alternative")
-		ref, _ := alternative["$ref"].(string)
-		if _, expected := expectedAlternatives[ref]; !expected {
-			t.Errorf("unexpected MCP request alternative %q", ref)
-			continue
-		}
-		expectedAlternatives[ref] = true
-	}
-	for ref, present := range expectedAlternatives {
-		if !present {
-			t.Errorf("MCP request alternative %s is missing", ref)
-		}
-	}
-
-	callRequest := contractMap(t, schemas["MCP20260728CallRequest"], "components.schemas.MCP20260728CallRequest")
 	for _, field := range []string{"jsonrpc", "id", "method", "params"} {
-		if !contractSliceContains(callRequest["required"], field) {
-			t.Errorf("MCP call request does not require %s", field)
+		if !contractSliceContains(modernRequest["required"], field) {
+			t.Errorf("MCP request does not require %s", field)
 		}
 	}
-	callProperties := contractMap(t, callRequest["properties"], "MCP20260728CallRequest.properties")
-	paramsRef := contractMap(t, callProperties["params"], "MCP20260728CallRequest.params")
+	callProperties := contractMap(t, modernRequest["properties"], "MCP20260728Request.properties")
+	paramsRef := contractMap(t, callProperties["params"], "MCP20260728Request.params")
 	if got := paramsRef["$ref"]; got != "#/components/schemas/MCP20260728CallParams" {
 		t.Errorf("MCP call params schema = %v", got)
 	}
@@ -794,7 +864,7 @@ func assertMCP20260728Contract(
 			resourceSubscriptions["uniqueItems"],
 		)
 	}
-	method := contractMap(t, callProperties["method"], "MCP20260728CallRequest.method")
+	method := contractMap(t, callProperties["method"], "MCP20260728Request.method")
 	for _, methodName := range []string{
 		"server/discover",
 		"tools/call",
@@ -809,29 +879,13 @@ func assertMCP20260728Contract(
 		t.Error("MCP call request must not include notifications/cancelled")
 	}
 
-	cancelled := contractMap(
-		t,
-		schemas["MCP20260728CancelledNotification"],
-		"components.schemas.MCP20260728CancelledNotification",
-	)
-	if contractSliceContains(cancelled["required"], "id") {
-		t.Error("MCP cancelled notification must not require an id")
-	}
-	cancelledProperties := contractMap(
-		t,
-		cancelled["properties"],
-		"MCP20260728CancelledNotification.properties",
-	)
-	if _, exposesID := cancelledProperties["id"]; exposesID {
-		t.Error("MCP cancelled notification must forbid id by omitting it from a closed schema")
-	}
-	cancelledMethod := contractMap(
-		t,
-		cancelledProperties["method"],
-		"MCP20260728CancelledNotification.method",
-	)
-	if got := cancelledMethod["const"]; got != "notifications/cancelled" {
-		t.Errorf("MCP cancelled notification method = %v", got)
+	for _, removedSchema := range []string{
+		"MCP20260728CallRequest",
+		"MCP20260728CancelledNotification",
+	} {
+		if _, exists := schemas[removedSchema]; exists {
+			t.Errorf("removed MCP compatibility schema %s still exists", removedSchema)
+		}
 	}
 
 	meta := contractMap(t, schemas["MCPRequestMeta"], "components.schemas.MCPRequestMeta")
@@ -897,23 +951,19 @@ func assertMCP20260728Contract(
 	if len(serverOAuthSettings) != 0 {
 		t.Errorf("MCP discover OAuth client credentials settings = %#v, want {}", serverOAuthSettings)
 	}
-	for _, status := range []string{"200", "202", "400", "401", "403", "404", "405", "413", "415", "429"} {
+	for _, status := range []string{"200", "400", "401", "403", "404", "405", "413", "415", "429"} {
 		if _, exists := responses[status]; !exists {
 			t.Errorf("POST /mcp response %s is missing", status)
 		}
 	}
-	for _, legacyStatus := range []string{"204"} {
+	for _, legacyStatus := range []string{"202", "204"} {
 		if _, exists := responses[legacyStatus]; exists {
 			t.Errorf("POST /mcp still declares legacy response %s", legacyStatus)
 		}
 	}
-	acceptedNotification := contractMap(t, responses["202"], "POST /mcp response 202")
-	if _, hasContent := acceptedNotification["content"]; hasContent {
-		t.Error("POST /mcp notification 202 must have an empty response body")
-	}
 	badRequest := contractMap(t, responses["400"], "POST /mcp response 400")
 	badRequestDescription := fmt.Sprint(badRequest["description"])
-	for _, distinction := range []string{"official Go SDK", "text/plain", "application/json", "no JSON-RPC envelope"} {
+	for _, distinction := range []string{"official Go SDK", "text/plain", "application/json", "no JSON-RPC envelope", "client-to-server notifications"} {
 		if !strings.Contains(badRequestDescription, distinction) {
 			t.Errorf("POST /mcp response 400 does not document %q distinction", distinction)
 		}
@@ -925,6 +975,7 @@ func assertMCP20260728Contract(
 		"missingHeader":             -32020,
 		"missingClientCapabilities": -32021,
 		"unsupportedVersion":        -32022,
+		"clientNotification":        -32600,
 	} {
 		example := contractMap(t, badRequestExamples[name], "POST /mcp response 400 example "+name)
 		value := contractMap(t, example["value"], "POST /mcp response 400 example value "+name)

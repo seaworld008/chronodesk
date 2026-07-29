@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
@@ -37,7 +38,7 @@ func TestHasFirstResponseIgnoresSystemComments(t *testing.T) {
 		Status:       models.TicketStatusOpen,
 		Type:         models.TicketTypeRequest,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  user.ID,
+		CreatedByID:  &user.ID,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatalf("failed to seed ticket: %v", err)
@@ -45,7 +46,8 @@ func TestHasFirstResponseIgnoresSystemComments(t *testing.T) {
 
 	systemComment := models.TicketComment{
 		TicketID:    ticket.ID,
-		UserID:      user.ID,
+		ActorType:   models.ActorTypeSystem,
+		ActorID:     "test-system",
 		Content:     "system note",
 		ContentType: "text",
 		Type:        models.CommentTypeSystem,
@@ -63,7 +65,9 @@ func TestHasFirstResponseIgnoresSystemComments(t *testing.T) {
 
 	publicComment := models.TicketComment{
 		TicketID:    ticket.ID,
-		UserID:      user.ID,
+		UserID:      &user.ID,
+		ActorType:   models.ActorTypeHuman,
+		ActorID:     models.HumanActor(user.ID).ID,
 		Content:     "public response",
 		ContentType: "text",
 		Type:        models.CommentTypePublic,
@@ -128,14 +132,13 @@ func TestSLAViolationUsesNativeCommandsAndIsStableAcrossScans(t *testing.T) {
 		Priority:     models.TicketPriorityLow,
 		Status:       models.TicketStatusOpen,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  systemUser.ID,
+		CreatedByID:  &systemUser.ID,
 		Version:      1,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
 	}
 	native := NewAgentNativeService(db, AgentNativeOptions{
-		SystemCompatibilityUserID: systemUser.ID,
 		DefaultOutboxTargets: []OutboxTarget{{
 			Type: "event_stream", ID: "default", MaxAttempts: 8,
 		}},
@@ -183,7 +186,7 @@ func TestSLAViolationUsesNativeCommandsAndIsStableAcrossScans(t *testing.T) {
 		if comment.ActorType != models.ActorTypeSystem ||
 			comment.ActorID != slaMonitorActorID ||
 			comment.Type != models.CommentTypeSystem ||
-			comment.UserID != systemUser.ID {
+			comment.UserID != nil {
 			t.Fatalf("comment bypassed native actor provenance: %+v", comment)
 		}
 	}
@@ -239,12 +242,28 @@ func TestSLAViolationUsesNativeCommandsAndIsStableAcrossScans(t *testing.T) {
 	if err := db.Model(&models.IdempotencyRecord{}).Count(&idempotencyCount).Error; err != nil {
 		t.Fatal(err)
 	}
-	if historyCount != 6 || outboxCount != 7 || idempotencyCount != 7 {
+	if historyCount != 6 || outboxCount != 8 || idempotencyCount != 7 {
 		t.Fatalf(
 			"native audit graph mismatch: history=%d outbox=%d idempotency=%d",
 			historyCount,
 			outboxCount,
 			idempotencyCount,
+		)
+	}
+	var assignmentNotificationCount int64
+	if err := db.Model(&models.OutboxDelivery{}).
+		Where(
+			"destination_type = ? AND destination_id = ?",
+			NotificationOutboxDestination,
+			fmt.Sprintf("%s:%d", models.NotificationTypeTicketAssigned, manager.ID),
+		).
+		Count(&assignmentNotificationCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if assignmentNotificationCount != 1 {
+		t.Fatalf(
+			"SLA manager assignment notifications=%d, want one durable notification delivery",
+			assignmentNotificationCount,
 		)
 	}
 	if err := db.First(&config, config.ID).Error; err != nil {
@@ -275,7 +294,7 @@ func TestSLAViolationUsesNativeCommandsAndIsStableAcrossScans(t *testing.T) {
 	_ = db.Model(&models.OutboxDelivery{}).Count(&repeatedOutbox).Error
 	_ = db.Model(&models.IdempotencyRecord{}).Count(&repeatedIdempotency).Error
 	if repeatedComments != 3 || repeatedEvents != 6 || repeatedHistory != 6 ||
-		repeatedOutbox != 7 || repeatedIdempotency != 7 {
+		repeatedOutbox != 8 || repeatedIdempotency != 7 {
 		t.Fatalf(
 			"repeated scan duplicated side effects: comments=%d events=%d history=%d outbox=%d idempotency=%d",
 			repeatedComments,
@@ -329,14 +348,13 @@ func TestSLARuleCanTriggerAfterBreachWasAlreadyRecorded(t *testing.T) {
 		TicketNumber: "SLA-THRESHOLD-001", Title: "threshold", Description: "threshold",
 		Type: models.TicketTypeRequest, Priority: models.TicketPriorityNormal,
 		Status: models.TicketStatusOpen, Source: models.TicketSourceWeb,
-		CreatedByID: user.ID, Version: 1,
+		CreatedByID: &user.ID, Version: 1,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
 	}
 	native := NewAgentNativeService(db, AgentNativeOptions{
-		SystemCompatibilityUserID: user.ID,
-		DefaultOutboxTargets:      []OutboxTarget{{Type: "event_stream", ID: "default"}},
+		DefaultOutboxTargets: []OutboxTarget{{Type: "event_stream", ID: "default"}},
 	})
 	service := NewEscalationService(db)
 	service.SetAgentNativeService(native)
@@ -427,14 +445,13 @@ func TestSLABreachOutboxRecoversFromSnapshotAfterStateAndConfigChange(t *testing
 		Priority:     models.TicketPriorityNormal,
 		Status:       models.TicketStatusOpen,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  systemUser.ID,
+		CreatedByID:  &systemUser.ID,
 		Version:      1,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
 	}
 	native := NewAgentNativeService(db, AgentNativeOptions{
-		SystemCompatibilityUserID: systemUser.ID,
 		DefaultOutboxTargets: []OutboxTarget{{
 			Type: "event_stream", ID: "default", MaxAttempts: 8,
 		}},
@@ -629,7 +646,7 @@ func TestSLAViolationRequiresNativeServiceAndSLAFieldsAreSystemControlled(t *tes
 		TicketNumber: "SLA-GUARD-001", Title: "guard", Description: "guard",
 		Type: models.TicketTypeRequest, Priority: models.TicketPriorityNormal,
 		Status: models.TicketStatusOpen, Source: models.TicketSourceWeb,
-		CreatedByID: user.ID, Version: 1,
+		CreatedByID: &user.ID, Version: 1,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
@@ -654,7 +671,7 @@ func TestSLAViolationRequiresNativeServiceAndSLAFieldsAreSystemControlled(t *tes
 		t.Fatalf("legacy path mutated ticket: %+v", unchanged)
 	}
 
-	native := NewAgentNativeService(db, AgentNativeOptions{SystemCompatibilityUserID: user.ID})
+	native := NewAgentNativeService(db)
 	_, err := native.UpdateTicketVersion(context.Background(), VersionedTicketUpdateInput{
 		TicketID:        ticket.ID,
 		ExpectedVersion: 1,

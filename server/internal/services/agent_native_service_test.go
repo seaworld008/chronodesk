@@ -42,7 +42,22 @@ func openAgentNativeTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
-func seedCompatibilityUser(t *testing.T, db *gorm.DB, suffix string) models.User {
+func assertTicketHistoryEventLink(
+	t *testing.T,
+	history *models.TicketHistory,
+	event *models.DomainEvent,
+) {
+	t.Helper()
+	if history.EventID == nil ||
+		event == nil ||
+		*history.EventID != event.ID ||
+		history.ResourceVersion != event.ResourceVersion ||
+		history.Provenance != models.TicketHistoryProvenanceDomainEvent {
+		t.Fatalf("history is not linked to its persisted domain event: history=%+v event=%+v", history, event)
+	}
+}
+
+func seedActorUser(t *testing.T, db *gorm.DB, suffix string) models.User {
 	t.Helper()
 	user := models.User{
 		Username:     "compat-" + suffix,
@@ -52,7 +67,7 @@ func seedCompatibilityUser(t *testing.T, db *gorm.DB, suffix string) models.User
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
-		t.Fatalf("failed to seed compatibility user: %v", err)
+		t.Fatalf("failed to seed actor user: %v", err)
 	}
 	return user
 }
@@ -66,9 +81,8 @@ func createNativePrincipal(
 ) *models.ServicePrincipal {
 	t.Helper()
 	principal, err := service.CreateServicePrincipal(context.Background(), CreateServicePrincipalInput{
-		Name:                name,
-		Scopes:              scopes,
-		CompatibilityUserID: &userID,
+		Name:   name,
+		Scopes: scopes,
 	})
 	if err != nil {
 		t.Fatalf("failed to create service principal: %v", err)
@@ -88,7 +102,7 @@ func seedNativeTicket(t *testing.T, db *gorm.DB, userID uint, number string) mod
 		Source:             models.TicketSourceAgent,
 		Version:            1,
 		TrustLevel:         models.TicketTrustLevelUntrusted,
-		CreatedByID:        userID,
+		CreatedByID:        &userID,
 		CreatedByActorType: models.ActorTypeHuman,
 		CreatedByActorID:   models.HumanActor(userID).ID,
 	}
@@ -100,7 +114,7 @@ func seedNativeTicket(t *testing.T, db *gorm.DB, userID uint, number string) mod
 
 func TestAgentNativeCredentialHashValidationAndRevocation(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "credential")
+	user := seedActorUser(t, db, "credential")
 	service := NewAgentNativeService(db, AgentNativeOptions{CredentialPepper: []byte("test-pepper")})
 	principal := createNativePrincipal(t, service, user.ID, "credential-agent", models.ScopeTicketsRead)
 
@@ -163,7 +177,7 @@ func TestAgentNativeCredentialHashValidationAndRevocation(t *testing.T) {
 
 func TestAgentNativePolicyScopeDenyAndRiskyExplicitAllow(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "policy")
+	user := seedActorUser(t, db, "policy")
 	service := NewAgentNativeService(db)
 	principal := createNativePrincipal(
 		t,
@@ -269,7 +283,7 @@ func TestAgentNativePolicyScopeDenyAndRiskyExplicitAllow(t *testing.T) {
 
 func TestAgentNativeAutomationLoopDetection(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "loop")
+	user := seedActorUser(t, db, "loop")
 	now := time.Date(2026, 7, 28, 14, 0, 0, 0, time.UTC)
 	service := NewAgentNativeService(db, AgentNativeOptions{
 		LoopThreshold: 2,
@@ -317,15 +331,13 @@ func TestAgentNativeAutomationLoopDetection(t *testing.T) {
 
 func TestAgentNativeExecutionRateAndConcurrencyLimits(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "limits")
 	now := time.Date(2026, 7, 28, 13, 0, 0, 0, time.UTC)
 	service := NewAgentNativeService(db, AgentNativeOptions{Now: func() time.Time { return now }})
 	concurrentPrincipal, err := service.CreateServicePrincipal(context.Background(), CreateServicePrincipalInput{
-		Name:                "concurrency-agent",
-		Scopes:              []string{models.ScopeTicketsRead},
-		RateLimitPerMinute:  10,
-		ConcurrentLimit:     1,
-		CompatibilityUserID: &user.ID,
+		Name:               "concurrency-agent",
+		Scopes:             []string{models.ScopeTicketsRead},
+		RateLimitPerMinute: 10,
+		ConcurrentLimit:    1,
 	})
 	if err != nil {
 		t.Fatalf("create concurrency principal: %v", err)
@@ -345,11 +357,10 @@ func TestAgentNativeExecutionRateAndConcurrencyLimits(t *testing.T) {
 	}
 
 	ratePrincipal, err := service.CreateServicePrincipal(context.Background(), CreateServicePrincipalInput{
-		Name:                "rate-agent",
-		Scopes:              []string{models.ScopeTicketsRead},
-		RateLimitPerMinute:  1,
-		ConcurrentLimit:     5,
-		CompatibilityUserID: &user.ID,
+		Name:               "rate-agent",
+		Scopes:             []string{models.ScopeTicketsRead},
+		RateLimitPerMinute: 1,
+		ConcurrentLimit:    5,
 	})
 	if err != nil {
 		t.Fatalf("create rate principal: %v", err)
@@ -372,15 +383,13 @@ func TestAgentNativeExecutionRateAndConcurrencyLimits(t *testing.T) {
 
 func TestAgentNativeExecutionConcurrencyPersistsAcrossRateWindows(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "cross-window-concurrency")
 	now := time.Date(2026, 7, 28, 13, 0, 0, 0, time.UTC)
 	service := NewAgentNativeService(db, AgentNativeOptions{Now: func() time.Time { return now }})
 	principal, err := service.CreateServicePrincipal(context.Background(), CreateServicePrincipalInput{
-		Name:                "cross-window-concurrency-agent",
-		Scopes:              []string{models.ScopeTicketsRead},
-		RateLimitPerMinute:  10,
-		ConcurrentLimit:     1,
-		CompatibilityUserID: &user.ID,
+		Name:               "cross-window-concurrency-agent",
+		Scopes:             []string{models.ScopeTicketsRead},
+		RateLimitPerMinute: 10,
+		ConcurrentLimit:    1,
 	})
 	if err != nil {
 		t.Fatalf("create principal: %v", err)
@@ -417,14 +426,12 @@ func TestAgentNativeExecutionConcurrencyPersistsAcrossRateWindows(t *testing.T) 
 
 func TestAgentNativeExecutionReleaseIsConcurrentAndIdempotent(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "concurrent-release")
 	service := NewAgentNativeService(db)
 	principal, err := service.CreateServicePrincipal(context.Background(), CreateServicePrincipalInput{
-		Name:                "concurrent-release-agent",
-		Scopes:              []string{models.ScopeTicketsRead},
-		RateLimitPerMinute:  100,
-		ConcurrentLimit:     1,
-		CompatibilityUserID: &user.ID,
+		Name:               "concurrent-release-agent",
+		Scopes:             []string{models.ScopeTicketsRead},
+		RateLimitPerMinute: 100,
+		ConcurrentLimit:    1,
 	})
 	if err != nil {
 		t.Fatalf("create principal: %v", err)
@@ -456,7 +463,7 @@ func TestAgentNativeExecutionReleaseIsConcurrentAndIdempotent(t *testing.T) {
 
 func TestAgentNativeExecutionPrunesExpiredRateWindows(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "rate-window-cleanup")
+	user := seedActorUser(t, db, "rate-window-cleanup")
 	now := time.Date(2026, 7, 28, 13, 0, 0, 0, time.UTC)
 	service := NewAgentNativeService(db, AgentNativeOptions{Now: func() time.Time { return now }})
 	first := createNativePrincipal(t, service, user.ID, "stale-rate-window", models.ScopeTicketsRead)
@@ -554,7 +561,7 @@ func TestTicketChangeAuthorizationContractRejectsScopeConfusion(t *testing.T) {
 
 func TestAgentNativeRejectsServicePrincipalProvenanceEscalation(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "provenance")
+	user := seedActorUser(t, db, "provenance")
 	service := NewAgentNativeService(db)
 	principal := createNativePrincipal(
 		t,
@@ -585,7 +592,7 @@ func TestAgentNativeRejectsServicePrincipalProvenanceEscalation(t *testing.T) {
 
 func TestAgentNativeIntakeCannotSmuggleAssignmentOrTransition(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "intake-scope")
+	user := seedActorUser(t, db, "intake-scope")
 	service := NewAgentNativeService(db)
 	principal := createNativePrincipal(
 		t,
@@ -665,6 +672,18 @@ func TestAgentNativeIdempotencyReserveCompleteReplayAndConflict(t *testing.T) {
 		time.Hour,
 	); !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatalf("expected request hash conflict, got %v", err)
+	}
+}
+
+func TestUniqueConstraintDetectionHandlesTranslatedGORMError(t *testing.T) {
+	if !isUniqueConstraintError(gorm.ErrDuplicatedKey) {
+		t.Fatal("translated GORM duplicate-key error must enter idempotent replay path")
+	}
+	if isUniqueConstraintError(errors.New("duplicated key not allowed")) {
+		t.Fatal("untyped duplicate-key text must not bypass constraint verification")
+	}
+	if isUniqueConstraintError(errors.New("database unavailable")) {
+		t.Fatal("non-unique database error must not be treated as an idempotent replay")
 	}
 }
 
@@ -891,7 +910,7 @@ func TestAgentNativeFailIdempotencyUsesCleanupContextAfterCancellation(t *testin
 
 func TestAgentNativeTicketCreateCommitsHistoryEventOutboxAndIdempotency(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "create")
+	user := seedActorUser(t, db, "create")
 	service := NewAgentNativeService(db)
 	principal := createNativePrincipal(t, service, user.ID, "create-agent", models.ScopeTicketsCreate)
 	actor := models.ServicePrincipalActor(principal.ID)
@@ -927,12 +946,12 @@ func TestAgentNativeTicketCreateCommitsHistoryEventOutboxAndIdempotency(t *testi
 		t.Fatalf("create native ticket: %v", err)
 	}
 	if result.Ticket.Version != 1 ||
-		result.Ticket.CreatedByID != user.ID ||
+		result.Ticket.CreatedByID != nil ||
 		result.Ticket.CreatedByActorType != models.ActorTypeServicePrincipal ||
 		result.Ticket.CreatedByActorID != principal.ID ||
 		result.Ticket.CreatedByServicePrincipalID == nil ||
 		*result.Ticket.CreatedByServicePrincipalID != principal.ID {
-		t.Fatalf("native creator compatibility fields are incorrect: %+v", result.Ticket)
+		t.Fatalf("native creator projections are incorrect: %+v", result.Ticket)
 	}
 	if result.Ticket.AgentContext.Data().Goal != "restore service" ||
 		result.Receipt.EventID != result.Event.ID ||
@@ -953,6 +972,11 @@ func TestAgentNativeTicketCreateCommitsHistoryEventOutboxAndIdempotency(t *testi
 	if historyCount != 1 || deliveryCount != 1 {
 		t.Fatalf("history/event/outbox must commit together: history=%d delivery=%d", historyCount, deliveryCount)
 	}
+	var createHistory models.TicketHistory
+	if err := db.Where("ticket_id = ?", result.Ticket.ID).First(&createHistory).Error; err != nil {
+		t.Fatalf("load create history: %v", err)
+	}
+	assertTicketHistoryEventLink(t, &createHistory, result.Event)
 	replayed, err := service.ReserveIdempotency(
 		context.Background(),
 		actor,
@@ -996,7 +1020,7 @@ func TestAgentNativeEventOutboxRollbackRetryAndRecovery(t *testing.T) {
 		t.Fatalf("event and outbox must roll back together: events=%d deliveries=%d", eventCount, deliveryCount)
 	}
 
-	event, err := service.CreateDomainEvent(context.Background(), DomainEventInput{
+	event, err := service.createDomainEvent(context.Background(), DomainEventInput{
 		Type:            "io.chronodesk.ticket.test.v1",
 		Subject:         "ticket/1",
 		Actor:           models.SystemActor("test"),
@@ -1044,7 +1068,7 @@ func TestAgentNativeEventOutboxRollbackRetryAndRecovery(t *testing.T) {
 
 func TestServicePrincipalWebhookFanoutRequiresSeparateExplicitPolicy(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "external-notification")
+	user := seedActorUser(t, db, "external-notification")
 	service := NewAgentNativeService(db, AgentNativeOptions{
 		DefaultOutboxTargets: []OutboxTarget{
 			{Type: "event_stream", ID: "default"},
@@ -1187,7 +1211,7 @@ func TestCloudEventWireUsesCompliantScalarExtensions(t *testing.T) {
 func TestProcessOutboxBatchStartsIndependentDeliveriesConcurrently(t *testing.T) {
 	db := openAgentNativeTestDB(t)
 	service := NewAgentNativeService(db)
-	_, err := service.CreateDomainEvent(context.Background(), DomainEventInput{
+	_, err := service.createDomainEvent(context.Background(), DomainEventInput{
 		Type:            "io.chronodesk.ticket.test.v1",
 		Subject:         "ticket/1",
 		Actor:           models.SystemActor("test"),
@@ -1254,7 +1278,7 @@ func TestProcessOutboxBatchStartsIndependentDeliveriesConcurrently(t *testing.T)
 
 func TestAgentNativeLeaseVersionConflictAndIdempotentUpdate(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "lease")
+	user := seedActorUser(t, db, "lease")
 	service := NewAgentNativeService(db)
 	first := createNativePrincipal(
 		t,
@@ -1269,11 +1293,11 @@ func TestAgentNativeLeaseVersionConflictAndIdempotentUpdate(t *testing.T) {
 	firstActor := models.ServicePrincipalActor(first.ID)
 	secondActor := models.ServicePrincipalActor(second.ID)
 
-	lease, err := service.ClaimTicketLease(context.Background(), ticket.ID, firstActor, 1, time.Minute)
+	lease, err := service.claimTicketLease(context.Background(), ticket.ID, firstActor, 1, time.Minute)
 	if err != nil {
 		t.Fatalf("claim first lease: %v", err)
 	}
-	if _, err := service.ClaimTicketLease(context.Background(), ticket.ID, secondActor, 1, time.Minute); !errors.Is(err, ErrLeaseConflict) {
+	if _, err := service.claimTicketLease(context.Background(), ticket.ID, secondActor, 1, time.Minute); !errors.Is(err, ErrLeaseConflict) {
 		t.Fatalf("expected competing lease conflict, got %v", err)
 	}
 	reservation, err := service.ReserveIdempotency(
@@ -1319,6 +1343,7 @@ func TestAgentNativeLeaseVersionConflictAndIdempotentUpdate(t *testing.T) {
 	if details.Changes["title"].Old != "Original title" || details.Changes["title"].New != "Updated" {
 		t.Fatalf("history must persist the change set: %+v", details.Changes)
 	}
+	assertTicketHistoryEventLink(t, &history, updated.Event)
 	if _, err := service.UpdateTicketVersion(context.Background(), VersionedTicketUpdateInput{
 		TicketID:        ticket.ID,
 		ExpectedVersion: 2,
@@ -1339,13 +1364,13 @@ func TestAgentNativeLeaseVersionConflictAndIdempotentUpdate(t *testing.T) {
 	}); !errors.Is(err, ErrVersionConflict) {
 		t.Fatalf("expected stale version conflict, got %v", err)
 	}
-	if _, err := service.HeartbeatTicketLease(context.Background(), lease.ID, firstActor, 2, time.Minute); err != nil {
+	if _, err := service.heartbeatTicketLease(context.Background(), lease.ID, firstActor, 2, time.Minute); err != nil {
 		t.Fatalf("heartbeat updated lease: %v", err)
 	}
-	if err := service.ReleaseTicketLease(context.Background(), lease.ID, firstActor, "done"); err != nil {
+	if err := service.releaseTicketLease(context.Background(), lease.ID, firstActor, "done"); err != nil {
 		t.Fatalf("release lease: %v", err)
 	}
-	if _, err := service.ClaimTicketLease(context.Background(), ticket.ID, secondActor, 2, time.Minute); err != nil {
+	if _, err := service.claimTicketLease(context.Background(), ticket.ID, secondActor, 2, time.Minute); err != nil {
 		t.Fatalf("second actor should claim released lease: %v", err)
 	}
 	replayed, err := service.ReserveIdempotency(
@@ -1363,7 +1388,7 @@ func TestAgentNativeLeaseVersionConflictAndIdempotentUpdate(t *testing.T) {
 
 func TestAgentNativeLeaseCommandsAreAtomicWithEventOutboxAndIdempotency(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "lease-command")
+	user := seedActorUser(t, db, "lease-command")
 	now := time.Date(2026, 7, 28, 15, 0, 0, 0, time.UTC)
 	service := NewAgentNativeService(db, AgentNativeOptions{Now: func() time.Time { return now }})
 	principal := createNativePrincipal(t, service, user.ID, "lease-command-agent", models.ScopeTasksManage)
@@ -1549,12 +1574,12 @@ func TestAgentNativeLeaseCommandsAreAtomicWithEventOutboxAndIdempotency(t *testi
 
 func TestAgentNativeCommentActorEventAndIdempotency(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "comment")
+	user := seedActorUser(t, db, "comment")
 	service := NewAgentNativeService(db)
 	principal := createNativePrincipal(t, service, user.ID, "comment-agent", models.ScopeCommentsWrite)
 	ticket := seedNativeTicket(t, db, user.ID, "AI-COMMENT-001")
 	actor := models.ServicePrincipalActor(principal.ID)
-	lease, err := service.ClaimTicketLease(context.Background(), ticket.ID, actor, 1, time.Minute)
+	lease, err := service.claimTicketLease(context.Background(), ticket.ID, actor, 1, time.Minute)
 	if err != nil {
 		t.Fatalf("claim comment lease: %v", err)
 	}
@@ -1594,6 +1619,7 @@ func TestAgentNativeCommentActorEventAndIdempotency(t *testing.T) {
 	if history.Actor() != actor || history.IsVisible {
 		t.Fatalf("internal Agent comment history actor/visibility incorrect: %+v", history)
 	}
+	assertTicketHistoryEventLink(t, &history, result.Event)
 	var record models.IdempotencyRecord
 	if err := db.First(&record, "id = ?", reservation.Record.ID).Error; err != nil {
 		t.Fatalf("load idempotency record: %v", err)
@@ -1607,7 +1633,7 @@ func TestAgentNativeCommentActorEventAndIdempotency(t *testing.T) {
 
 func TestAgentNativeServicePrincipalCommentAndAttachmentLeaseEnforcement(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "write-lease")
+	user := seedActorUser(t, db, "write-lease")
 	now := time.Date(2026, 7, 29, 9, 0, 0, 0, time.UTC)
 	storage, err := NewLocalAttachmentStorage(t.TempDir())
 	if err != nil {
@@ -1665,7 +1691,7 @@ func TestAgentNativeServicePrincipalCommentAndAttachmentLeaseEnforcement(t *test
 	}
 
 	commentOtherLease := seedNativeTicket(t, db, user.ID, "AI-COMMENT-LEASE-OTHER")
-	otherCommentLease, err := service.ClaimTicketLease(
+	otherCommentLease, err := service.claimTicketLease(
 		context.Background(),
 		commentOtherLease.ID,
 		otherActor,
@@ -1679,7 +1705,7 @@ func TestAgentNativeServicePrincipalCommentAndAttachmentLeaseEnforcement(t *test
 		t.Fatalf("comment with another holder's lease must fail, got %v", err)
 	}
 	attachmentOtherLease := seedNativeTicket(t, db, user.ID, "AI-ATTACH-LEASE-OTHER")
-	otherAttachmentLease, err := service.ClaimTicketLease(
+	otherAttachmentLease, err := service.claimTicketLease(
 		context.Background(),
 		attachmentOtherLease.ID,
 		otherActor,
@@ -1694,7 +1720,7 @@ func TestAgentNativeServicePrincipalCommentAndAttachmentLeaseEnforcement(t *test
 	}
 
 	commentExpiredLease := seedNativeTicket(t, db, user.ID, "AI-COMMENT-LEASE-EXPIRED")
-	expiredCommentLease, err := service.ClaimTicketLease(
+	expiredCommentLease, err := service.claimTicketLease(
 		context.Background(),
 		commentExpiredLease.ID,
 		actor,
@@ -1713,7 +1739,7 @@ func TestAgentNativeServicePrincipalCommentAndAttachmentLeaseEnforcement(t *test
 		t.Fatalf("comment with expired lease must fail, got %v", err)
 	}
 	attachmentExpiredLease := seedNativeTicket(t, db, user.ID, "AI-ATTACH-LEASE-EXPIRED")
-	expiredAttachmentLease, err := service.ClaimTicketLease(
+	expiredAttachmentLease, err := service.claimTicketLease(
 		context.Background(),
 		attachmentExpiredLease.ID,
 		actor,
@@ -1733,7 +1759,7 @@ func TestAgentNativeServicePrincipalCommentAndAttachmentLeaseEnforcement(t *test
 	}
 
 	commentLeaseTicket := seedNativeTicket(t, db, user.ID, "AI-COMMENT-LEASE-SOURCE")
-	crossTicketLease, err := service.ClaimTicketLease(
+	crossTicketLease, err := service.claimTicketLease(
 		context.Background(),
 		commentLeaseTicket.ID,
 		actor,
@@ -1749,7 +1775,7 @@ func TestAgentNativeServicePrincipalCommentAndAttachmentLeaseEnforcement(t *test
 	}
 
 	attachmentStaleLease := seedNativeTicket(t, db, user.ID, "AI-ATTACH-LEASE-STALE")
-	staleAttachmentLease, err := service.ClaimTicketLease(
+	staleAttachmentLease, err := service.claimTicketLease(
 		context.Background(),
 		attachmentStaleLease.ID,
 		actor,
@@ -1769,7 +1795,7 @@ func TestAgentNativeServicePrincipalCommentAndAttachmentLeaseEnforcement(t *test
 	}
 
 	commentValidLease := seedNativeTicket(t, db, user.ID, "AI-COMMENT-LEASE-VALID")
-	validCommentLease, err := service.ClaimTicketLease(
+	validCommentLease, err := service.claimTicketLease(
 		context.Background(),
 		commentValidLease.ID,
 		actor,
@@ -1791,7 +1817,7 @@ func TestAgentNativeServicePrincipalCommentAndAttachmentLeaseEnforcement(t *test
 	}
 
 	attachmentValidLease := seedNativeTicket(t, db, user.ID, "AI-ATTACH-LEASE-VALID")
-	validAttachmentLease, err := service.ClaimTicketLease(
+	validAttachmentLease, err := service.claimTicketLease(
 		context.Background(),
 		attachmentValidLease.ID,
 		actor,
@@ -1815,14 +1841,13 @@ func TestAgentNativeServicePrincipalCommentAndAttachmentLeaseEnforcement(t *test
 
 func TestAgentNativeHumanAndSystemCommentAndAttachmentWritesRemainLeaseOptional(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "lease-optional")
+	user := seedActorUser(t, db, "lease-optional")
 	storage, err := NewLocalAttachmentStorage(t.TempDir())
 	if err != nil {
 		t.Fatalf("create local storage: %v", err)
 	}
 	service := NewAgentNativeService(db, AgentNativeOptions{
-		AttachmentStorage:         storage,
-		SystemCompatibilityUserID: user.ID,
+		AttachmentStorage: storage,
 	})
 	actors := []struct {
 		name  string
@@ -1861,7 +1886,7 @@ func TestAgentNativeHumanAndSystemCommentAndAttachmentWritesRemainLeaseOptional(
 
 func TestAgentNativeLocalAttachmentSecurityHashScanAndLimit(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "attachment")
+	user := seedActorUser(t, db, "attachment")
 	storage, err := NewLocalAttachmentStorage(t.TempDir())
 	if err != nil {
 		t.Fatalf("create local storage: %v", err)
@@ -1873,7 +1898,7 @@ func TestAgentNativeLocalAttachmentSecurityHashScanAndLimit(t *testing.T) {
 	principal := createNativePrincipal(t, service, user.ID, "attachment-agent", models.ScopeAttachmentsWrite)
 	ticket := seedNativeTicket(t, db, user.ID, "AI-ATTACH-001")
 	actor := models.ServicePrincipalActor(principal.ID)
-	lease, err := service.ClaimTicketLease(context.Background(), ticket.ID, actor, 1, time.Minute)
+	lease, err := service.claimTicketLease(context.Background(), ticket.ID, actor, 1, time.Minute)
 	if err != nil {
 		t.Fatalf("claim attachment lease: %v", err)
 	}
@@ -1918,6 +1943,11 @@ func TestAgentNativeLocalAttachmentSecurityHashScanAndLimit(t *testing.T) {
 		len(completed.ResourceSnapshot) == 0 {
 		t.Fatalf("attachment command did not complete idempotency atomically: %+v", completed)
 	}
+	var attachmentHistory models.TicketHistory
+	if err := db.Where("attachment_id = ?", result.Attachment.ID).First(&attachmentHistory).Error; err != nil {
+		t.Fatalf("load attachment history: %v", err)
+	}
+	assertTicketHistoryEventLink(t, &attachmentHistory, result.Event)
 	if _, _, err := service.OpenAttachment(context.Background(), result.Attachment.ID); !errors.Is(err, ErrAttachmentNotClean) {
 		t.Fatalf("pending attachment must not be downloadable, got %v", err)
 	}
@@ -1936,6 +1966,21 @@ func TestAgentNativeLocalAttachmentSecurityHashScanAndLimit(t *testing.T) {
 
 	var before int64
 	_ = db.Model(&models.TicketAttachment{}).Count(&before).Error
+	if _, err := service.StoreAttachment(context.Background(), NativeAttachmentInput{
+		TicketID:        ticket.ID,
+		ExpectedVersion: 2,
+		LeaseID:         lease.ID,
+		Actor:           actor,
+		OriginalName:    "empty.txt",
+		Reader:          bytes.NewReader(nil),
+	}); !errors.Is(err, ErrInvalidAttachment) {
+		t.Fatalf("expected empty attachment rejection, got %v", err)
+	}
+	var afterEmpty int64
+	_ = db.Model(&models.TicketAttachment{}).Count(&afterEmpty).Error
+	if afterEmpty != before {
+		t.Fatalf("empty attachment must not create a database record: before=%d after=%d", before, afterEmpty)
+	}
 	if _, err := service.StoreAttachment(context.Background(), NativeAttachmentInput{
 		TicketID:        ticket.ID,
 		ExpectedVersion: 2,

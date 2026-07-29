@@ -115,11 +115,12 @@ type AnalyticsTicketStats struct {
 
 // UserStats 用户统计
 type UserStats struct {
-	Total     int64 `json:"total"`
-	Active    int64 `json:"active"` // 活跃用户(最近30天有活动)
-	Admins    int64 `json:"admins"`
-	Agents    int64 `json:"agents"`
-	Customers int64 `json:"customers"`
+	Total       int64 `json:"total"`
+	Active      int64 `json:"active"` // 活跃用户(最近30天有活动)
+	Admins      int64 `json:"admins"`
+	Supervisors int64 `json:"supervisors"`
+	Agents      int64 `json:"agents"`
+	Customers   int64 `json:"customers"`
 
 	// 登录统计
 	TodayLogins int64 `json:"today_logins"`
@@ -395,11 +396,13 @@ func (s *AnalyticsService) getUserStats(ctx context.Context) (*UserStats, error)
 
 	for _, rc := range roleCounts {
 		switch rc.Role {
-		case "admin":
+		case string(models.RoleAdmin):
 			stats.Admins = rc.Count
-		case "agent":
+		case string(models.RoleSupervisor):
+			stats.Supervisors = rc.Count
+		case string(models.RoleAgent):
 			stats.Agents = rc.Count
-		case "user":
+		case string(models.RoleCustomer):
 			stats.Customers = rc.Count
 		}
 	}
@@ -603,11 +606,6 @@ func (s *AnalyticsService) getDailyCommentTrend(ctx context.Context, startDate, 
 	}
 
 	return trend, nil
-}
-
-// GetDB 获取数据库实例(用于健康检查等)
-func (s *AnalyticsService) GetDB() *gorm.DB {
-	return s.db
 }
 
 // ExportStats 导出统计数据

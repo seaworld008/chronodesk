@@ -45,17 +45,17 @@ func TestHealthCheckRequiresPostgreSQLAndRedis(t *testing.T) {
 		{
 			name:     "missing PostgreSQL",
 			database: &Database{Redis: &healthRedis{}},
-			wantErr:  "PostgreSQL client is not initialized",
+			wantErr:  "postgresql client is not initialized",
 		},
 		{
 			name:     "missing Redis",
 			database: &Database{DB: db},
-			wantErr:  "Redis client is not initialized",
+			wantErr:  "redis client is not initialized",
 		},
 		{
 			name:     "Redis unavailable",
 			database: &Database{DB: db, Redis: &healthRedis{pingErr: errors.New("unavailable")}},
-			wantErr:  "Redis ping failed",
+			wantErr:  "redis ping failed",
 		},
 		{
 			name:     "all dependencies healthy",

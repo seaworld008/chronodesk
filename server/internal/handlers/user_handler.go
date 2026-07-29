@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/seaworld008/chronodesk/server/internal/auth"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 	"gorm.io/gorm"
@@ -40,97 +39,6 @@ func NewUserHandler(userService *services.UserService, trustedDeviceService *ser
 	}
 }
 
-// GetProfile 获取用户个人资料
-// @Summary 获取用户个人资料
-// @Description 获取当前用户的详细个人资料信息
-// @Tags 用户管理
-// @Accept json
-// @Produce json
-// @Security ApiKeyAuth
-// @Success 200 {object} ApiResponse{data=models.User}
-// @Failure 401 {object} ApiResponse
-// @Failure 404 {object} ApiResponse
-// @Failure 500 {object} ApiResponse
-// @Router /api/user/profile [get]
-func (h *UserHandler) GetProfile(c *gin.Context) {
-	userID := getUserIDFromContext(c)
-	if userID == 0 {
-		c.JSON(http.StatusUnauthorized, ApiResponse{
-			Code: 1,
-			Msg:  "用户未认证",
-			Data: nil,
-		})
-		return
-	}
-
-	user, err := h.userService.GetUserProfile(c.Request.Context(), userID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, ApiResponse{
-			Code: 1,
-			Msg:  "用户信息未找到",
-			Data: nil,
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, ApiResponse{
-		Code: 0,
-		Msg:  "获取用户信息成功",
-		Data: user.ToResponse(),
-	})
-}
-
-// UpdateProfile 更新用户个人资料
-// @Summary 更新用户个人资料
-// @Description 更新当前用户的个人资料信息
-// @Tags 用户管理
-// @Accept json
-// @Produce json
-// @Security ApiKeyAuth
-// @Param request body models.UserUpdateRequest true "更新用户资料请求"
-// @Success 200 {object} ApiResponse
-// @Failure 400 {object} ApiResponse
-// @Failure 401 {object} ApiResponse
-// @Failure 500 {object} ApiResponse
-// @Router /api/user/profile [put]
-func (h *UserHandler) UpdateProfile(c *gin.Context) {
-	userID := getUserIDFromContext(c)
-	if userID == 0 {
-		c.JSON(http.StatusUnauthorized, ApiResponse{
-			Code: 1,
-			Msg:  "用户未认证",
-			Data: nil,
-		})
-		return
-	}
-
-	var req models.UserUpdateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ApiResponse{
-			Code: 1,
-			Msg:  "请求参数错误",
-			Data: nil,
-		})
-		return
-	}
-
-	err := h.userService.UpdateUserProfile(c.Request.Context(), userID, &req)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, ApiResponse{
-			Code: 1,
-			Msg:  "更新用户信息失败: " + err.Error(),
-			Data: nil,
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, ApiResponse{
-		Code: 0,
-		Msg:  "用户信息更新成功",
-		Data: nil,
-	})
-}
-
 // GetTrustedDevices 获取用户的可信设备列表
 func (h *UserHandler) GetTrustedDevices(c *gin.Context) {
 	userID := getUserIDFromContext(c)
@@ -154,10 +62,11 @@ func (h *UserHandler) GetTrustedDevices(c *gin.Context) {
 
 	devices, err := h.trustedDeviceService.ListTrustedDevices(c.Request.Context(), userID)
 	if err != nil {
+		logHandlerFailure(c, "user.list_trusted_devices", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
 			Msg:  "获取可信设备失败",
-			Data: err.Error(),
+			Data: nil,
 		})
 		return
 	}
@@ -226,10 +135,11 @@ func (h *UserHandler) RevokeTrustedDevice(c *gin.Context) {
 			})
 			return
 		}
+		logHandlerFailure(c, "user.revoke_trusted_device", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
 			Msg:  "撤销可信设备失败",
-			Data: err.Error(),
+			Data: nil,
 		})
 		return
 	}
@@ -237,93 +147,6 @@ func (h *UserHandler) RevokeTrustedDevice(c *gin.Context) {
 	c.JSON(http.StatusOK, ApiResponse{
 		Code: 0,
 		Msg:  "已撤销可信设备",
-		Data: nil,
-	})
-}
-
-// ChangePassword 修改密码
-// @Summary 修改用户密码
-// @Description 修改当前用户的登录密码
-// @Tags 用户管理
-// @Accept json
-// @Produce json
-// @Security ApiKeyAuth
-// @Param request body ChangePasswordRequest true "修改密码请求"
-// @Success 200 {object} ApiResponse
-// @Failure 400 {object} ApiResponse
-// @Failure 401 {object} ApiResponse
-// @Failure 500 {object} ApiResponse
-// @Router /api/user/password [put]
-func (h *UserHandler) ChangePassword(c *gin.Context) {
-	userID := getUserIDFromContext(c)
-	if userID == 0 {
-		c.JSON(http.StatusUnauthorized, ApiResponse{
-			Code: 1,
-			Msg:  "用户未认证",
-			Data: nil,
-		})
-		return
-	}
-
-	var req ChangePasswordRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ApiResponse{
-			Code: 1,
-			Msg:  "请求参数错误",
-			Data: nil,
-		})
-		return
-	}
-
-	// 验证输入
-	if req.CurrentPassword == "" || req.NewPassword == "" || req.ConfirmPassword == "" {
-		c.JSON(http.StatusBadRequest, ApiResponse{
-			Code: 1,
-			Msg:  "密码不能为空",
-			Data: nil,
-		})
-		return
-	}
-
-	if req.NewPassword != req.ConfirmPassword {
-		c.JSON(http.StatusBadRequest, ApiResponse{
-			Code: 1,
-			Msg:  "新密码和确认密码不匹配",
-			Data: nil,
-		})
-		return
-	}
-
-	if len(req.NewPassword) < 8 {
-		c.JSON(http.StatusBadRequest, ApiResponse{
-			Code: 1,
-			Msg:  "密码长度至少8位",
-			Data: nil,
-		})
-		return
-	}
-
-	err := h.userService.ChangePassword(c.Request.Context(), userID, req.CurrentPassword, req.NewPassword)
-	if err != nil {
-		if err == auth.ErrInvalidCredentials {
-			c.JSON(http.StatusBadRequest, ApiResponse{
-				Code: 1,
-				Msg:  "当前密码错误",
-				Data: nil,
-			})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, ApiResponse{
-			Code: 1,
-			Msg:  "密码修改失败: " + err.Error(),
-			Data: nil,
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, ApiResponse{
-		Code: 0,
-		Msg:  "密码修改成功",
 		Data: nil,
 	})
 }
@@ -385,9 +208,10 @@ func (h *UserHandler) GetLoginHistory(c *gin.Context) {
 
 	histories, total, err := h.userService.GetLoginHistory(c.Request.Context(), userID, &req)
 	if err != nil {
+		logHandlerFailure(c, "user.get_login_history", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
-			Msg:  "获取登录历史失败: " + err.Error(),
+			Msg:  "获取登录历史失败",
 			Data: nil,
 		})
 		return
@@ -431,9 +255,10 @@ func (h *UserHandler) GetStats(c *gin.Context) {
 
 	stats, err := h.userService.GetUserStats(c.Request.Context(), userID)
 	if err != nil {
+		logHandlerFailure(c, "user.get_statistics", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
-			Msg:  "获取用户统计信息失败: " + err.Error(),
+			Msg:  "获取用户统计信息失败",
 			Data: nil,
 		})
 		return
@@ -507,6 +332,7 @@ func (h *UserHandler) UploadAvatar(c *gin.Context) {
 			})
 			return
 		}
+		logHandlerFailure(c, "user.upload_avatar", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
 			Msg:  "头像上传失败，请稍后重试",
@@ -551,6 +377,9 @@ func (h *UserHandler) GetAvatar(c *gin.Context) {
 
 	payload, err := io.ReadAll(io.LimitReader(reader, 2*1024*1024+1))
 	if err != nil || len(payload) > 2*1024*1024 {
+		if err != nil {
+			logHandlerFailure(c, "user.read_avatar", err)
+		}
 		c.Status(http.StatusInternalServerError)
 		return
 	}
@@ -606,6 +435,7 @@ func (h *UserHandler) DeleteLoginSession(c *gin.Context) {
 			})
 			return
 		}
+		logHandlerFailure(c, "user.delete_login_session", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
 			Msg:  "删除会话失败",
@@ -636,15 +466,6 @@ func getUserIDFromContext(c *gin.Context) uint {
 	}
 
 	return userIDUint
-}
-
-// 请求和响应结构体
-
-// ChangePasswordRequest 修改密码请求
-type ChangePasswordRequest struct {
-	CurrentPassword string `json:"current_password" binding:"required" example:"oldpassword123"`
-	NewPassword     string `json:"new_password" binding:"required,min=8" example:"newpassword123"`
-	ConfirmPassword string `json:"confirm_password" binding:"required" example:"newpassword123"`
 }
 
 // UploadAvatarResponse 上传头像响应

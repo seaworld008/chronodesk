@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,7 +16,7 @@ import (
 
 // CategoryHandler exposes the read-only category catalogue used by ticket
 // forms and reference fields. Category administration remains outside this
-// compatibility API.
+// human-facing API.
 type CategoryHandler struct {
 	db *gorm.DB
 }
@@ -91,6 +92,7 @@ func (h *CategoryHandler) List(c *gin.Context) {
 
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
+		logHandlerFailure(c, "category.count", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code": 1,
 			"msg":  "统计分类数量失败",
@@ -104,6 +106,7 @@ func (h *CategoryHandler) List(c *gin.Context) {
 		Limit(pageSize).
 		Offset((page - 1) * pageSize).
 		Find(&categories).Error; err != nil {
+		logHandlerFailure(c, "category.list", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code": 1,
 			"msg":  "获取分类列表失败",
@@ -133,13 +136,14 @@ func (h *CategoryHandler) Get(c *gin.Context) {
 
 	var category models.Category
 	if err := h.visibleQuery(c).First(&category, id).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{
 				"code": 1,
 				"msg":  "未找到分类",
 			})
 			return
 		}
+		logHandlerFailure(c, "category.get", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code": 1,
 			"msg":  "获取分类失败",
@@ -154,11 +158,11 @@ func (h *CategoryHandler) Get(c *gin.Context) {
 }
 
 func (h *CategoryHandler) visibleQuery(c *gin.Context) *gorm.DB {
-	query := h.db.Model(&models.Category{})
+	query := h.db.WithContext(c.Request.Context()).Model(&models.Category{})
 	role, _ := c.Get("user_role")
 	roleName, _ := role.(string)
 	switch roleName {
-	case string(models.RoleAdmin), string(models.RoleSuperUser):
+	case string(models.RoleAdmin):
 		return query
 	default:
 		return query.Where("status = ? AND is_public = ?", models.CategoryStatusActive, true)

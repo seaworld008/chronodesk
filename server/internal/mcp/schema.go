@@ -32,10 +32,6 @@ func objectSchema(properties map[string]any, required ...string) schema {
 	return result
 }
 
-func stringSchema(description string) schema {
-	return schema{"type": "string", "description": description}
-}
-
 func integerSchema(description string, minimum float64) schema {
 	return schema{"type": "integer", "minimum": minimum, "description": description}
 }

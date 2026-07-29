@@ -54,26 +54,3 @@ type TicketTag struct {
 func (TicketTag) TableName() string {
 	return "ticket_tags"
 }
-
-// TicketTagMapping 工单与标签的关联表
-type TicketTagMapping struct {
-	ID        uint      `json:"id" gorm:"primaryKey;autoIncrement"`
-	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
-
-	TicketID uint    `json:"ticket_id" gorm:"not null;index:idx_ticket_tag,unique"`
-	Ticket   *Ticket `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
-
-	TagID uint       `json:"tag_id" gorm:"not null;index:idx_ticket_tag,unique"`
-	Tag   *TicketTag `json:"tag,omitempty" gorm:"foreignKey:TagID"`
-
-	AddedBy uint  `json:"added_by" gorm:"index"`
-	Adder   *User `json:"adder,omitempty" gorm:"foreignKey:AddedBy"`
-
-	IsAuto bool   `json:"is_auto" gorm:"default:false"` // 是否自动添加
-	Reason string `json:"reason" gorm:"size:255"`       // 添加原因
-}
-
-// TableName 指定表名
-func (TicketTagMapping) TableName() string {
-	return "ticket_tag_mappings"
-}

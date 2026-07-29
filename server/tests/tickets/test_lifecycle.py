@@ -5,10 +5,10 @@ Covers create -> update -> assign -> status changes -> notifications.
 
 from __future__ import annotations
 
-import json
 import secrets
 import time
-from typing import Any, Dict, Iterator, List, Set
+from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
@@ -19,7 +19,8 @@ from tests.utils import APIClient
 @pytest.mark.integration
 class TestTicketLifecycle:
     @pytest.fixture(scope="class")
-    def ticket_payload(self) -> Dict[str, object]:
+    @classmethod
+    def ticket_payload(cls) -> dict[str, object]:
         unique_suffix = int(time.time())
         return {
             "title": f"Auto Test Ticket {unique_suffix}",
@@ -29,8 +30,11 @@ class TestTicketLifecycle:
             "source": "api",
         }
 
-    def _fetch_notification_ids(self, client: APIClient, limit: int = 50) -> Set[int]:
-        response = client.get_json("/notifications", params={"limit": limit})
+    def _fetch_notification_ids(self, client: APIClient, limit: int = 50) -> set[int]:
+        response = client.get_json(
+            "/notifications",
+            params={"page": 1, "page_size": limit},
+        )
         assert response.status_code == 200, response.text
         payload = response.json()
         assert payload.get("code") == 0, payload
@@ -42,18 +46,18 @@ class TestTicketLifecycle:
         client: APIClient,
         ticket_id: int,
         *,
-        expected_counts: Dict[str, int],
+        expected_counts: dict[str, int],
         attempts: int = 45,
         delay: float = 1.0,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Poll the recipient's inbox until every expected Outbox item arrives."""
 
         for _ in range(attempts):
             response = client.get_json(
                 "/notifications",
                 params={
-                    "limit": 50,
-                    "filter": json.dumps({"related_ticket_id": ticket_id}),
+                    "page": 1,
+                    "page_size": 50,
                 },
             )
             assert response.status_code == 200, response.text
@@ -61,15 +65,19 @@ class TestTicketLifecycle:
             assert payload.get("code") == 0, payload
 
             items = payload.get("data", {}).get("items", [])
-            linked: List[Dict[str, Any]] = []
+            linked: list[dict[str, Any]] = []
             for item in items:
                 related_ticket = item.get("related_ticket") or {}
                 related_ticket_id = item.get("related_ticket_id")
-                if related_ticket.get("id") == ticket_id or related_ticket_id == ticket_id:
+                if (
+                    related_ticket.get("id") == ticket_id
+                    or related_ticket_id == ticket_id
+                ):
                     linked.append(item)
 
             if all(
-                sum(1 for item in linked if item.get("type") == notification_type) >= count
+                sum(1 for item in linked if item.get("type") == notification_type)
+                >= count
                 for notification_type, count in expected_counts.items()
             ):
                 return linked
@@ -80,7 +88,7 @@ class TestTicketLifecycle:
             f"未在通知列表中收到工单 {ticket_id} 的全部异步通知：{expected_counts}"
         )
 
-    def _fetch_ticket(self, client: APIClient, ticket_id: int) -> Dict[str, object]:
+    def _fetch_ticket(self, client: APIClient, ticket_id: int) -> dict[str, object]:
         response = client.get_json(f"/tickets/{ticket_id}")
         assert response.status_code == 200, response.text
         payload = response.json()
@@ -92,7 +100,7 @@ class TestTicketLifecycle:
         self,
         api_client: APIClient,
         admin_api: APIClient,
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> Iterator[dict[str, Any]]:
         """Create an isolated assignee and authenticate as that exact recipient."""
 
         suffix = time.time_ns()
@@ -114,7 +122,7 @@ class TestTicketLifecycle:
         assert response.status_code == 201, response.text
         body = response.json()
         assert body.get("code") == 0, body
-        agent: Dict[str, Any] = body["data"]
+        agent: dict[str, Any] = body["data"]
 
         verification = admin_api.put_json(
             f"/admin/users/{agent['id']}",
@@ -145,29 +153,31 @@ class TestTicketLifecycle:
     def created_ticket_ids(
         self,
         admin_api: APIClient,
-        secondary_agent: Dict[str, Any],
-    ) -> Iterator[List[int]]:
+        secondary_agent: dict[str, Any],
+    ) -> Iterator[list[int]]:
         """Always remove test tickets before the temporary assignee is deleted."""
 
         del secondary_agent
-        ticket_ids: List[int] = []
+        ticket_ids: list[int] = []
         try:
             yield ticket_ids
         finally:
             for ticket_id in reversed(ticket_ids):
-                cleanup = admin_api.delete(f"/tickets/{ticket_id}")
+                cleanup = admin_api.delete_ticket(ticket_id)
                 assert cleanup.status_code in (200, 204, 404), cleanup.text
 
     def test_full_lifecycle(
         self,
         admin_api: APIClient,
-        admin_tokens: Dict[str, object],
-        ticket_payload: Dict[str, object],
-        secondary_agent: Dict[str, Any],
-        created_ticket_ids: List[int],
+        admin_tokens: dict[str, object],
+        ticket_payload: dict[str, object],
+        secondary_agent: dict[str, Any],
+        created_ticket_ids: list[int],
     ) -> None:
         agent_api = secondary_agent["api"]
-        existing_agent_notifications = self._fetch_notification_ids(agent_api, limit=100)
+        existing_agent_notifications = self._fetch_notification_ids(
+            agent_api, limit=100
+        )
 
         # 1. Create ticket
         create_resp = admin_api.post_json("/tickets", ticket_payload)
@@ -187,7 +197,7 @@ class TestTicketLifecycle:
             "description": "Updated description via automated test.",
             "priority": "high",
         }
-        update_resp = admin_api.put_json(f"/tickets/{ticket_id}", update_payload)
+        update_resp = admin_api.put_ticket(ticket_id, update_payload)
         assert update_resp.status_code in (200, 201), update_resp.text
         update_body = update_resp.json()
         assert update_body.get("code") == 0, update_body
@@ -203,7 +213,11 @@ class TestTicketLifecycle:
         agent_id = secondary_agent["id"]
         assign_comment = "Assigning to automation agent for triage"
         assign_payload = {"assigned_to_id": agent_id, "comment": assign_comment}
-        assign_resp = admin_api.post_json(f"/tickets/{ticket_id}/assign", assign_payload)
+        assign_resp = admin_api.post_ticket_command(
+            ticket_id,
+            "assign",
+            assign_payload,
+        )
         assert assign_resp.status_code == 200, assign_resp.text
         assign_body = assign_resp.json()
         assert assign_body.get("success") is True, assign_body
@@ -216,7 +230,11 @@ class TestTicketLifecycle:
         # 4. Move to in_progress with comment
         progress_comment = "Work started"
         progress_payload = {"status": "in_progress", "comment": progress_comment}
-        progress_resp = admin_api.post_json(f"/tickets/{ticket_id}/status", progress_payload)
+        progress_resp = admin_api.post_ticket_command(
+            ticket_id,
+            "status",
+            progress_payload,
+        )
         assert progress_resp.status_code == 200, progress_resp.text
         progress_body = progress_resp.json()
         assert progress_body.get("success") is True, progress_body
@@ -229,7 +247,11 @@ class TestTicketLifecycle:
             "comment": resolution_comment,
             "resolution_notes": "Automated resolution notes",
         }
-        resolve_resp = admin_api.post_json(f"/tickets/{ticket_id}/status", resolve_payload)
+        resolve_resp = admin_api.post_ticket_command(
+            ticket_id,
+            "status",
+            resolve_payload,
+        )
         assert resolve_resp.status_code == 200, resolve_resp.text
         resolve_body = resolve_resp.json()
         assert resolve_body.get("success") is True, resolve_body
@@ -244,18 +266,32 @@ class TestTicketLifecycle:
         history_body = history_resp.json()
         # workflow handler returns {success: bool, data: [...]}
         assert history_body.get("success") is True, history_body
-        history_events: List[Dict[str, object]] = history_body.get("data", [])
+        history_events: list[dict[str, object]] = history_body.get("data", [])
         actions = {event.get("action") for event in history_events}
         assert {"assign", "status_change"}.issubset(actions), "缺少关键工单历史记录"
 
-        assign_history = next((event for event in history_events if event.get("action") == "assign"), None)
+        assign_history = next(
+            (event for event in history_events if event.get("action") == "assign"), None
+        )
         assert assign_history is not None, "分配历史缺失"
-        assert assign_comment in assign_history.get("description", ""), "分配历史未包含备注"
+        assert assign_comment in assign_history.get("description", ""), (
+            "分配历史未包含备注"
+        )
 
-        status_descriptions = [event.get("description", "") for event in history_events if event.get("action") == "status_change"]
-        assert any(progress_comment in desc for desc in status_descriptions), "进度状态历史未包含备注"
-        assert any(resolution_comment in desc for desc in status_descriptions), "解决状态历史未包含备注"
-        assert any("Automated resolution notes" in desc for desc in status_descriptions), "解决历史未包含解决方案"
+        status_descriptions = [
+            event.get("description", "")
+            for event in history_events
+            if event.get("action") == "status_change"
+        ]
+        assert any(progress_comment in desc for desc in status_descriptions), (
+            "进度状态历史未包含备注"
+        )
+        assert any(resolution_comment in desc for desc in status_descriptions), (
+            "解决状态历史未包含备注"
+        )
+        assert any(
+            "Automated resolution notes" in desc for desc in status_descriptions
+        ), "解决历史未包含解决方案"
 
         # 7. Verify the asynchronous Outbox delivery through the actual recipient.
         # `/notifications` is deliberately object-scoped, so an administrator's
@@ -298,7 +334,7 @@ class TestTicketLifecycle:
         )
 
         # 8. Cleanup - delete ticket
-        delete_resp = admin_api.delete(f"/tickets/{ticket_id}")
+        delete_resp = admin_api.delete_ticket(ticket_id)
         assert delete_resp.status_code in (200, 204), delete_resp.text
         if delete_resp.status_code == 200:
             delete_body = delete_resp.json()

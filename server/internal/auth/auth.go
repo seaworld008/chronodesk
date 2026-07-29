@@ -19,16 +19,20 @@ import (
 
 // 错误定义
 var (
-	ErrInvalidCredentials = errors.New("invalid credentials")
-	ErrUserNotFound       = errors.New("user not found")
-	ErrUserExists         = errors.New("user already exists")
-	ErrInvalidToken       = errors.New("invalid token")
-	ErrTokenExpired       = errors.New("token expired")
-	ErrInvalidOTP         = errors.New("invalid OTP")
-	ErrOTPExpired         = errors.New("OTP expired")
-	ErrEmailNotVerified   = errors.New("email not verified")
-	ErrAccountLocked      = errors.New("account locked")
-	ErrPasswordTooWeak    = errors.New("password too weak")
+	ErrInvalidCredentials  = errors.New("invalid credentials")
+	ErrUserNotFound        = errors.New("user not found")
+	ErrUserExists          = errors.New("user already exists")
+	ErrInvalidToken        = errors.New("invalid token")
+	ErrTokenExpired        = errors.New("token expired")
+	ErrInvalidOTP          = errors.New("invalid OTP")
+	ErrOTPExpired          = errors.New("OTP expired")
+	ErrEmailNotVerified    = errors.New("email not verified")
+	ErrAccountLocked       = errors.New("account locked")
+	ErrAccountInactive     = errors.New("account is inactive")
+	ErrAccountSuspended    = errors.New("account is suspended")
+	ErrAccountDeleted      = errors.New("account is deleted")
+	ErrInvalidAccountState = errors.New("invalid account state")
+	ErrPasswordTooWeak     = errors.New("password too weak")
 )
 
 var (
@@ -36,26 +40,25 @@ var (
 	defaultTrustedDeviceMaxPerUser = 5
 )
 
-// UserRole 用户角色枚举
-type UserRole string
+// UserRole 与领域用户模型共享同一组人类角色，避免认证与业务授权漂移。
+type UserRole = models.UserRole
 
 const (
-	RoleUser       UserRole = "user"
-	RoleCustomer   UserRole = "customer"
-	RoleAgent      UserRole = "agent"
-	RoleSupervisor UserRole = "supervisor"
-	RoleAdmin      UserRole = "admin"
-	RoleSuperUser  UserRole = "superuser"
+	RoleCustomer   = models.RoleCustomer
+	RoleAgent      = models.RoleAgent
+	RoleSupervisor = models.RoleSupervisor
+	RoleAdmin      = models.RoleAdmin
 )
 
-// UserStatus 用户状态枚举
-type UserStatus string
+// UserStatus 与领域用户模型共享同一组持久化状态。临时锁定只由
+// LockedUntil 表达，不再伪造一个无法写入数据库的 locked 状态。
+type UserStatus = models.UserStatus
 
 const (
-	StatusActive    UserStatus = "active"
-	StatusInactive  UserStatus = "inactive"
-	StatusLocked    UserStatus = "locked"
-	StatusSuspended UserStatus = "suspended"
+	StatusActive    = models.UserStatusActive
+	StatusInactive  = models.UserStatusInactive
+	StatusSuspended = models.UserStatusSuspended
+	StatusDeleted   = models.UserStatusDeleted
 )
 
 // User 用户模型
@@ -64,7 +67,7 @@ type User struct {
 	Username          string         `json:"username" gorm:"uniqueIndex;not null"`
 	Email             string         `json:"email" gorm:"uniqueIndex;not null"`
 	PasswordHash      string         `json:"-" gorm:"not null"`
-	Role              UserRole       `json:"role" gorm:"default:'user'"`
+	Role              UserRole       `json:"role" gorm:"default:'customer'"`
 	Status            UserStatus     `json:"status" gorm:"default:'active'"`
 	EmailVerified     bool           `json:"email_verified" gorm:"default:false"`
 	EmailVerifiedAt   *time.Time     `json:"email_verified_at"`
@@ -113,45 +116,51 @@ type LoginAttempt struct {
 
 // RefreshToken 刷新令牌
 type RefreshToken struct {
-	ID        uint        `json:"id" gorm:"primaryKey"`
-	UserID    uint        `json:"user_id" gorm:"not null;index:idx_refresh_tokens_session_active,priority:1"`
-	Token     string      `json:"-" gorm:"uniqueIndex;not null"`
-	SessionID string      `json:"session_id" gorm:"size:128;not null;index;index:idx_refresh_tokens_session_active,priority:2"`
-	ExpiresAt time.Time   `json:"expires_at" gorm:"index:idx_refresh_tokens_session_active,priority:4"`
-	Revoked   bool        `json:"revoked" gorm:"default:false;index:idx_refresh_tokens_session_active,priority:3"`
-	RevokedAt *time.Time  `json:"revoked_at"`
-	IPAddress string      `json:"ip_address"`
-	UserAgent string      `json:"user_agent"`
-	CreatedAt time.Time   `json:"created_at"`
-	User      models.User `json:"user" gorm:"foreignKey:UserID"`
+	ID              uint        `json:"id" gorm:"primaryKey"`
+	UserID          uint        `json:"user_id" gorm:"not null;index:idx_refresh_tokens_session_active,priority:1"`
+	Token           string      `json:"-" gorm:"uniqueIndex;not null"`
+	SessionID       string      `json:"session_id" gorm:"size:128;not null;index;index:idx_refresh_tokens_session_active,priority:2"`
+	ExpiresAt       time.Time   `json:"expires_at" gorm:"index:idx_refresh_tokens_session_active,priority:4"`
+	Revoked         bool        `json:"revoked" gorm:"default:false;index:idx_refresh_tokens_session_active,priority:3"`
+	RevokedAt       *time.Time  `json:"revoked_at"`
+	RotatedAt       *time.Time  `json:"-" gorm:"index"`
+	ReplacedByToken string      `json:"-" gorm:"size:64"`
+	IPAddress       string      `json:"ip_address"`
+	UserAgent       string      `json:"user_agent"`
+	CreatedAt       time.Time   `json:"created_at"`
+	User            models.User `json:"user" gorm:"foreignKey:UserID"`
 }
 
 // EmailVerification 邮箱验证
 type EmailVerification struct {
-	ID        uint        `json:"id" gorm:"primaryKey"`
-	UserID    uint        `json:"user_id" gorm:"not null;index"`
-	Email     string      `json:"email" gorm:"size:255;not null"`
-	Token     string      `json:"-" gorm:"size:255;not null;uniqueIndex"`
-	Used      bool        `json:"used" gorm:"default:false"`
-	ExpiresAt time.Time   `json:"expires_at" gorm:"not null"`
-	UsedAt    *time.Time  `json:"used_at"`
-	CreatedAt time.Time   `json:"created_at"`
-	UpdatedAt time.Time   `json:"updated_at"`
-	User      models.User `json:"user" gorm:"foreignKey:UserID"`
+	ID               uint        `json:"id" gorm:"primaryKey"`
+	UserID           uint        `json:"user_id" gorm:"not null;index"`
+	Email            string      `json:"email" gorm:"size:255;not null"`
+	Token            string      `json:"-" gorm:"size:255;not null;uniqueIndex"`
+	DeliverySecret   string      `json:"-" gorm:"type:text"`
+	EmailDeliveredAt *time.Time  `json:"-"`
+	Used             bool        `json:"used" gorm:"default:false"`
+	ExpiresAt        time.Time   `json:"expires_at" gorm:"not null"`
+	UsedAt           *time.Time  `json:"used_at"`
+	CreatedAt        time.Time   `json:"created_at"`
+	UpdatedAt        time.Time   `json:"updated_at"`
+	User             models.User `json:"user" gorm:"foreignKey:UserID"`
 }
 
 // PasswordReset 密码重置
 type PasswordReset struct {
-	ID        uint        `json:"id" gorm:"primaryKey"`
-	UserID    uint        `json:"user_id" gorm:"not null;index"`
-	Email     string      `json:"email" gorm:"size:255;not null"`
-	Token     string      `json:"-" gorm:"size:255;not null;uniqueIndex"`
-	Used      bool        `json:"used" gorm:"default:false"`
-	ExpiresAt time.Time   `json:"expires_at" gorm:"not null"`
-	UsedAt    *time.Time  `json:"used_at"`
-	CreatedAt time.Time   `json:"created_at"`
-	UpdatedAt time.Time   `json:"updated_at"`
-	User      models.User `json:"user" gorm:"foreignKey:UserID"`
+	ID               uint        `json:"id" gorm:"primaryKey"`
+	UserID           uint        `json:"user_id" gorm:"not null;index"`
+	Email            string      `json:"email" gorm:"size:255;not null"`
+	Token            string      `json:"-" gorm:"size:255;not null;uniqueIndex"`
+	DeliverySecret   string      `json:"-" gorm:"type:text"`
+	EmailDeliveredAt *time.Time  `json:"-"`
+	Used             bool        `json:"used" gorm:"default:false"`
+	ExpiresAt        time.Time   `json:"expires_at" gorm:"not null"`
+	UsedAt           *time.Time  `json:"used_at"`
+	CreatedAt        time.Time   `json:"created_at"`
+	UpdatedAt        time.Time   `json:"updated_at"`
+	User             models.User `json:"user" gorm:"foreignKey:UserID"`
 }
 
 // OTPCode OTP验证码
@@ -284,8 +293,12 @@ type UserRepository interface {
 	UpdateLastLogin(ctx context.Context, userID uint, loginTime time.Time) error
 	IncrementFailedLogin(ctx context.Context, userID uint) error
 	ResetFailedLogin(ctx context.Context, userID uint) error
-	LockUser(ctx context.Context, userID uint, until time.Time) error
-	UnlockUser(ctx context.Context, userID uint) error
+	ChangePasswordAndRevokeSessions(
+		ctx context.Context,
+		userID uint,
+		passwordHash string,
+		changedAt time.Time,
+	) error
 	ConfigureOTP(ctx context.Context, userID uint, secret, backupCodeHashes string, enabled bool) error
 	ReplaceBackupCodes(ctx context.Context, userID uint, backupCodeHashes string) error
 	ConsumeBackupCode(ctx context.Context, userID uint, code string) (bool, error)
@@ -305,10 +318,18 @@ type TokenRepository interface {
 	CreateRefreshToken(ctx context.Context, token *RefreshToken) error
 	// 根据令牌获取
 	GetRefreshToken(ctx context.Context, token string) (*RefreshToken, error)
+	// 获取可轮换令牌；刚完成轮换的旧令牌会在短暂恢复窗口内返回，
+	// 以便客户端在响应丢失后安全重放同一个结果。
+	GetRefreshTokenForRotation(ctx context.Context, token string) (*RefreshToken, error)
 	// 撤销令牌
 	RevokeRefreshToken(ctx context.Context, token string) error
 	// 原子轮换刷新令牌：旧令牌条件撤销与新令牌创建同事务提交
-	RotateRefreshToken(ctx context.Context, currentToken string, replacement *RefreshToken) error
+	RotateRefreshToken(
+		ctx context.Context,
+		currentToken string,
+		replacement *RefreshToken,
+		rotatedAt time.Time,
+	) error
 	// 撤销用户所有令牌
 	RevokeAllUserTokens(ctx context.Context, userID uint) error
 	// 撤销一个登录会话的全部刷新令牌，使该会话签发的访问令牌立即失效
@@ -373,7 +394,6 @@ type EmailService interface {
 	SendVerificationEmail(ctx context.Context, email, token string) error
 	SendPasswordResetEmail(ctx context.Context, email, token string) error
 	SendWelcomeEmail(ctx context.Context, email, username string) error
-	SendOTPEmail(ctx context.Context, email, code string) error
 }
 
 // OTPService OTP服务接口
@@ -396,7 +416,6 @@ type PasswordService interface {
 // EmailConfigService 邮箱配置服务接口
 type EmailConfigService interface {
 	IsEmailVerificationEnabled(ctx context.Context) (bool, error)
-	CanSendEmail(ctx context.Context) (bool, error)
 }
 
 // AuthServiceInterface 认证服务接口
@@ -438,16 +457,24 @@ type AuthService struct {
 	userRepo           UserRepository
 	profileRepo        ProfileRepository
 	tokenRepo          TokenRepository
+	emailOutboxRepo    AuthEmailOutboxRepository
 	loginAttemptRepo   LoginAttemptRepository
 	loginHistoryRepo   LoginHistoryRepository
 	trustedDeviceRepo  TrustedDeviceRepository
 	configService      *services.ConfigService
-	emailService       EmailService
 	emailConfigService EmailConfigService
 	otpService         OTPService
 	passwordService    PasswordService
 	jwtManager         JWTManager
 	config             *AuthConfig
+}
+
+type AuthServiceOption func(*AuthService)
+
+func WithAuthEmailOutboxRepository(repository AuthEmailOutboxRepository) AuthServiceOption {
+	return func(service *AuthService) {
+		service.emailOutboxRepo = repository
+	}
 }
 
 // AuthConfig 认证配置
@@ -470,6 +497,12 @@ type AuthConfig struct {
 // JWTManager JWT管理器接口
 type JWTManager interface {
 	GenerateTokenPair(userID uint, role UserRole, sessionID string) (accessToken, refreshToken string, err error)
+	GenerateRefreshTokenPair(
+		userID uint,
+		role UserRole,
+		sessionID, rotationSeed string,
+		issuedAt time.Time,
+	) (accessToken, refreshToken string, err error)
 	VerifyAccessToken(token string) (*Claims, error)
 	VerifyRefreshToken(token string) (*Claims, error)
 	ParseTokenClaims(token string) (*Claims, error)
@@ -495,14 +528,14 @@ func NewAuthService(
 	loginHistoryRepo LoginHistoryRepository,
 	trustedDeviceRepo TrustedDeviceRepository,
 	configService *services.ConfigService,
-	emailService EmailService,
 	emailConfigService EmailConfigService,
 	otpService OTPService,
 	passwordService PasswordService,
 	jwtManager JWTManager,
 	config *AuthConfig,
+	options ...AuthServiceOption,
 ) *AuthService {
-	return &AuthService{
+	service := &AuthService{
 		userRepo:           userRepo,
 		profileRepo:        profileRepo,
 		tokenRepo:          tokenRepo,
@@ -510,13 +543,18 @@ func NewAuthService(
 		loginHistoryRepo:   loginHistoryRepo,
 		trustedDeviceRepo:  trustedDeviceRepo,
 		configService:      configService,
-		emailService:       emailService,
 		emailConfigService: emailConfigService,
 		otpService:         otpService,
 		passwordService:    passwordService,
 		jwtManager:         jwtManager,
 		config:             config,
 	}
+	for _, option := range options {
+		if option != nil {
+			option(service)
+		}
+	}
+	return service
 }
 
 // Register 用户注册
@@ -563,7 +601,7 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 		Username:          req.Username,
 		Email:             req.Email,
 		PasswordHash:      hashedPassword,
-		Role:              RoleUser,
+		Role:              RoleCustomer,
 		Status:            StatusActive,
 		EmailVerified:     !emailVerificationEnabled,
 		PasswordChangedAt: timePtr(time.Now()),
@@ -571,10 +609,6 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 
 	if !emailVerificationEnabled {
 		user.EmailVerifiedAt = timePtr(time.Now())
-	}
-
-	if err := s.userRepo.Create(ctx, user); err != nil {
-		return nil, fmt.Errorf("failed to create user: %w", err)
 	}
 
 	// 创建用户资料
@@ -588,35 +622,23 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 		Timezone:    "UTC",
 		Language:    "en",
 	}
-
-	if err := s.profileRepo.Create(ctx, profile); err != nil {
-		return nil, fmt.Errorf("failed to create user profile: %w", err)
-	}
-
-	// 记录登录尝试
-	s.recordLoginAttempt(ctx, &user.ID, req.Email, ipAddress, userAgent, true, "")
-
-	// 发送验证邮件（仅当邮箱验证启用且可以发送邮件时）
+	var verification *EmailVerification
 	if emailVerificationEnabled {
-		canSendEmail, err := s.emailConfigService.CanSendEmail(ctx)
-		if err != nil || !canSendEmail {
-			// 如果无法发送邮件，记录错误但不阻止注册
-			fmt.Printf("Email verification is enabled but cannot send email: %v\n", err)
-		} else {
-			if err := s.sendEmailVerification(ctx, user); err != nil {
-				// 不阻止注册，只记录错误
-				fmt.Printf("Failed to send verification email: %v\n", err)
-			}
+		token, err := generateSecureToken(32)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate email verification token: %w", err)
+		}
+		verification = &EmailVerification{
+			Email:     user.Email,
+			Token:     token,
+			ExpiresAt: time.Now().Add(s.config.EmailVerificationExpire),
 		}
 	}
-
-	// 发送欢迎邮件（仅当可以发送邮件时）
-	canSendEmail, err := s.emailConfigService.CanSendEmail(ctx)
-	if err == nil && canSendEmail {
-		if err := s.emailService.SendWelcomeEmail(ctx, user.Email, user.Username); err != nil {
-			// 不阻止注册，只记录错误
-			fmt.Printf("Failed to send welcome email: %v\n", err)
-		}
+	if s.emailOutboxRepo == nil {
+		return nil, errors.New("durable authentication email Outbox is unavailable")
+	}
+	if err := s.emailOutboxRepo.Register(ctx, user, profile, verification); err != nil {
+		return nil, fmt.Errorf("failed to register user: %w", err)
 	}
 
 	// 如果需要邮箱验证，返回用户信息但不生成令牌
@@ -669,14 +691,41 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, userAgent string) (*AuthResponse, error) {
 	// 检查最近的失败登录次数
 	if err := s.checkLoginAttempts(ctx, req.Email); err != nil {
-		s.recordLoginAttempt(ctx, nil, req.Email, ipAddress, userAgent, false, err.Error())
+		if auditErr := s.recordLoginAttempt(
+			ctx,
+			nil,
+			req.Email,
+			ipAddress,
+			userAgent,
+			false,
+			"login attempt rejected",
+		); auditErr != nil {
+			return nil, fmt.Errorf("failed to persist rejected login audit: %w", auditErr)
+		}
 		return nil, err
 	}
 
 	// 获取用户
 	user, err := s.userRepo.GetByEmail(ctx, req.Email)
 	if err != nil {
-		s.recordLoginAttempt(ctx, nil, req.Email, ipAddress, userAgent, false, "user not found")
+		auditReason := "principal lookup unavailable"
+		if errors.Is(err, ErrUserNotFound) {
+			auditReason = "user not found"
+		}
+		if auditErr := s.recordLoginAttempt(
+			ctx,
+			nil,
+			req.Email,
+			ipAddress,
+			userAgent,
+			false,
+			auditReason,
+		); auditErr != nil {
+			return nil, fmt.Errorf("failed to persist unknown-user login audit: %w", auditErr)
+		}
+		if !errors.Is(err, ErrUserNotFound) {
+			return nil, fmt.Errorf("failed to load authentication principal: %w", err)
+		}
 		return nil, ErrInvalidCredentials
 	}
 
@@ -707,17 +756,59 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 	// 检查账户状态
 	if statusErr := s.checkUserStatus(ctx, user); statusErr != nil {
 		method := determineLoginMethod(user, req, deviceTrusted, otpValidated)
-		s.recordLoginAttempt(ctx, &user.ID, req.Email, ipAddress, userAgent, false, statusErr.Error())
-		s.recordLoginHistoryFailure(ctx, user, ipAddress, userAgent, method, statusErr.Error(), loginStatusFromError(statusErr))
+		if err := s.recordLoginAttempt(
+			ctx,
+			&user.ID,
+			req.Email,
+			ipAddress,
+			userAgent,
+			false,
+			authLogReason(statusErr),
+		); err != nil {
+			return nil, fmt.Errorf("failed to persist account-state login audit: %w", err)
+		}
+		if err := s.recordLoginHistoryFailure(
+			ctx,
+			user,
+			ipAddress,
+			userAgent,
+			method,
+			authLogReason(statusErr),
+			loginStatusFromError(statusErr),
+		); err != nil {
+			return nil, fmt.Errorf("failed to persist account-state login history: %w", err)
+		}
 		return nil, statusErr
 	}
 
 	// 验证密码
 	if err := s.passwordService.VerifyPassword(user.PasswordHash, req.Password); err != nil {
 		method := determineLoginMethod(user, req, deviceTrusted, otpValidated)
-		s.userRepo.IncrementFailedLogin(ctx, user.ID)
-		s.recordLoginAttempt(ctx, &user.ID, req.Email, ipAddress, userAgent, false, "invalid password")
-		s.recordLoginHistoryFailure(ctx, user, ipAddress, userAgent, method, "invalid password", models.LoginStatusFailed)
+		if incrementErr := s.userRepo.IncrementFailedLogin(ctx, user.ID); incrementErr != nil {
+			return nil, fmt.Errorf("failed to persist failed-login counter: %w", incrementErr)
+		}
+		if auditErr := s.recordLoginAttempt(
+			ctx,
+			&user.ID,
+			req.Email,
+			ipAddress,
+			userAgent,
+			false,
+			"invalid password",
+		); auditErr != nil {
+			return nil, fmt.Errorf("failed to persist password-failure audit: %w", auditErr)
+		}
+		if historyErr := s.recordLoginHistoryFailure(
+			ctx,
+			user,
+			ipAddress,
+			userAgent,
+			method,
+			"invalid password",
+			models.LoginStatusFailed,
+		); historyErr != nil {
+			return nil, fmt.Errorf("failed to persist password-failure history: %w", historyErr)
+		}
 		return nil, ErrInvalidCredentials
 	}
 
@@ -725,8 +816,28 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 	if user.OTPEnabled && !deviceTrusted {
 		if req.OTPCode == "" {
 			method := determineLoginMethod(user, req, deviceTrusted, otpValidated)
-			s.recordLoginAttempt(ctx, &user.ID, req.Email, ipAddress, userAgent, false, "otp required")
-			s.recordLoginHistoryFailure(ctx, user, ipAddress, userAgent, method, "otp required", models.LoginStatusFailed)
+			if err := s.recordLoginAttempt(
+				ctx,
+				&user.ID,
+				req.Email,
+				ipAddress,
+				userAgent,
+				false,
+				"otp required",
+			); err != nil {
+				return nil, fmt.Errorf("failed to persist OTP-required audit: %w", err)
+			}
+			if err := s.recordLoginHistoryFailure(
+				ctx,
+				user,
+				ipAddress,
+				userAgent,
+				method,
+				"otp required",
+				models.LoginStatusFailed,
+			); err != nil {
+				return nil, fmt.Errorf("failed to persist OTP-required history: %w", err)
+			}
 			return nil, errors.New("OTP code required")
 		}
 
@@ -738,8 +849,28 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 			}
 			if !consumed {
 				method := determineLoginMethod(user, req, deviceTrusted, false)
-				s.recordLoginAttempt(ctx, &user.ID, req.Email, ipAddress, userAgent, false, "invalid OTP")
-				s.recordLoginHistoryFailure(ctx, user, ipAddress, userAgent, method, "invalid OTP", models.LoginStatusFailed)
+				if err := s.recordLoginAttempt(
+					ctx,
+					&user.ID,
+					req.Email,
+					ipAddress,
+					userAgent,
+					false,
+					"invalid OTP",
+				); err != nil {
+					return nil, fmt.Errorf("failed to persist invalid-OTP audit: %w", err)
+				}
+				if err := s.recordLoginHistoryFailure(
+					ctx,
+					user,
+					ipAddress,
+					userAgent,
+					method,
+					"invalid OTP",
+					models.LoginStatusFailed,
+				); err != nil {
+					return nil, fmt.Errorf("failed to persist invalid-OTP history: %w", err)
+				}
 				return nil, ErrInvalidOTP
 			}
 			otpValidated = true
@@ -751,16 +882,30 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 	profile, _ := s.profileRepo.GetByUserID(ctx, user.ID)
 
 	// 重置失败登录计数
-	s.userRepo.ResetFailedLogin(ctx, user.ID)
+	if err := s.userRepo.ResetFailedLogin(ctx, user.ID); err != nil {
+		return nil, fmt.Errorf("failed to reset failed-login counter: %w", err)
+	}
 
 	// 更新最后登录时间
 	now := time.Now()
 	trustedDeviceTTL := s.getTrustedDeviceTTL()
 	maxTrustedDevices := s.getTrustedDeviceLimit()
-	s.userRepo.UpdateLastLogin(ctx, user.ID, now)
+	if err := s.userRepo.UpdateLastLogin(ctx, user.ID, now); err != nil {
+		return nil, fmt.Errorf("failed to update last login: %w", err)
+	}
 
 	// 记录成功登录
-	s.recordLoginAttempt(ctx, &user.ID, req.Email, ipAddress, userAgent, true, "")
+	if err := s.recordLoginAttempt(
+		ctx,
+		&user.ID,
+		req.Email,
+		ipAddress,
+		userAgent,
+		true,
+		"",
+	); err != nil {
+		return nil, fmt.Errorf("failed to persist successful login audit: %w", err)
+	}
 
 	sessionID, err := GenerateSecureToken(16)
 	if err != nil {
@@ -847,15 +992,28 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 
 // RefreshToken 刷新令牌
 func (s *AuthService) RefreshToken(ctx context.Context, req *RefreshTokenRequest, ipAddress, userAgent string) (*AuthResponse, error) {
+	return s.refreshToken(ctx, req, ipAddress, userAgent, true)
+}
+
+func (s *AuthService) refreshToken(
+	ctx context.Context,
+	req *RefreshTokenRequest,
+	ipAddress, userAgent string,
+	allowConcurrentReplay bool,
+) (*AuthResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// 验证刷新令牌
 	claims, err := s.jwtManager.VerifyRefreshToken(req.RefreshToken)
 	if err != nil {
 		return nil, ErrInvalidToken
 	}
 
-	// 检查令牌是否在数据库中
-	tokenRecord, err := s.tokenRepo.GetRefreshToken(ctx, req.RefreshToken)
-	if err != nil || tokenRecord.Revoked {
+	// 刚完成轮换的旧令牌在短暂恢复窗口内仍可重放相同结果。数据库只
+	// 保存替代令牌摘要和轮换时间，绝不保存可用的 bearer 明文。
+	tokenRecord, err := s.tokenRepo.GetRefreshTokenForRotation(ctx, req.RefreshToken)
+	if err != nil {
 		return nil, ErrInvalidToken
 	}
 	sessionID := tokenRecord.SessionID
@@ -880,6 +1038,10 @@ func (s *AuthService) RefreshToken(ctx context.Context, req *RefreshTokenRequest
 	if err := s.checkUserStatus(ctx, user); err != nil {
 		return nil, err
 	}
+	if !user.Role.IsValid() || user.Role != claims.Role {
+		_ = s.tokenRepo.RevokeSession(ctx, tokenRecord.UserID, sessionID)
+		return nil, ErrInvalidToken
+	}
 	// 密码变更会使此前签发的所有凭据失效。这里使用数据库中刷新令牌的
 	// 高精度创建时间，而不是只有秒精度的 JWT iat，避免同一秒内修改密码
 	// 时旧刷新令牌重新签发可用的访问令牌。
@@ -888,35 +1050,80 @@ func (s *AuthService) RefreshToken(ctx context.Context, req *RefreshTokenRequest
 		return nil, ErrInvalidToken
 	}
 
-	// 生成新的令牌对
-	accessToken, refreshToken, err := s.jwtManager.GenerateTokenPair(user.ID, user.Role, sessionID)
+	issuedAt := time.Now().UTC().Truncate(time.Second)
+	if tokenRecord.Revoked {
+		if tokenRecord.RotatedAt == nil ||
+			time.Since(*tokenRecord.RotatedAt) < 0 ||
+			time.Since(*tokenRecord.RotatedAt) > refreshRotationReplayWindow {
+			return nil, ErrInvalidToken
+		}
+		issuedAt = tokenRecord.RotatedAt.UTC().Truncate(time.Second)
+	}
+
+	accessToken, refreshToken, err := s.jwtManager.GenerateRefreshTokenPair(
+		user.ID,
+		user.Role,
+		sessionID,
+		req.RefreshToken,
+		issuedAt,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate tokens: %w", err)
 	}
 
-	// 旧令牌条件撤销与新令牌创建必须同事务提交，确保并发轮换只有一个成功。
-	replacement, err := s.newRefreshTokenRecord(
-		user.ID,
-		refreshToken,
-		sessionID,
-		ipAddress,
-		userAgent,
-	)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.tokenRepo.RotateRefreshToken(ctx, req.RefreshToken, replacement); err != nil {
-		return nil, fmt.Errorf("failed to rotate refresh token: %w", err)
+	if tokenRecord.Revoked {
+		if tokenRecord.ReplacedByToken != bearerTokenDigest("refresh-token", refreshToken) {
+			return nil, ErrInvalidToken
+		}
+	} else {
+		// Check cancellation immediately before the irreversible transaction.
+		// Cancellation during the transaction is also observed by GORM and rolls
+		// both the revocation and replacement insertion back.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		replacement, err := s.newRefreshTokenRecordAt(
+			user.ID,
+			refreshToken,
+			sessionID,
+			ipAddress,
+			userAgent,
+			issuedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.tokenRepo.RotateRefreshToken(
+			ctx,
+			req.RefreshToken,
+			replacement,
+			issuedAt,
+		); err != nil {
+			if allowConcurrentReplay && errors.Is(err, ErrInvalidToken) && ctx.Err() == nil {
+				// Another request may have won the conditional rotation. Reload
+				// its persisted timestamp and reproduce the exact same pair.
+				return s.refreshToken(ctx, req, ipAddress, userAgent, false)
+			}
+			return nil, fmt.Errorf("failed to rotate refresh token: %w", err)
+		}
 	}
 
 	if s.loginHistoryRepo != nil && sessionID != "" {
 		if err := s.loginHistoryRepo.RefreshSession(ctx, user.ID, sessionID, ipAddress, userAgent, time.Now()); err != nil {
-			fmt.Printf("Warning: failed to refresh login session: %v\n", err)
+			return nil, fmt.Errorf("failed to persist refresh session audit: %w", err)
 		}
+	} else {
+		return nil, errors.New("login session repository is unavailable")
 	}
 
 	// 获取用户资料
-	profile, _ := s.profileRepo.GetByUserID(ctx, user.ID)
+	if s.profileRepo == nil {
+		return nil, errors.New("authentication profile repository is unavailable")
+	}
+	profile, profileErr := s.profileRepo.GetByUserID(ctx, user.ID)
+	if profileErr != nil && !errors.Is(profileErr, gorm.ErrRecordNotFound) {
+		return nil, fmt.Errorf("failed to load authentication profile: %w", profileErr)
+	}
 
 	return &AuthResponse{
 		User:         s.buildUserInfo(user, profile),
@@ -995,20 +1202,17 @@ func (s *AuthService) ForgotPassword(ctx context.Context, email string) error {
 	// 创建密码重置记录
 	reset := &PasswordReset{
 		UserID:    user.ID,
-		Email:     email,
+		Email:     user.Email,
 		Token:     token,
 		ExpiresAt: time.Now().Add(s.config.PasswordResetExpire),
 	}
 
-	err = s.tokenRepo.CreatePasswordReset(ctx, reset)
+	if s.emailOutboxRepo == nil {
+		return errors.New("durable authentication email Outbox is unavailable")
+	}
+	err = s.emailOutboxRepo.QueuePasswordReset(ctx, reset)
 	if err != nil {
 		return fmt.Errorf("failed to create password reset: %w", err)
-	}
-
-	// 发送重置邮件
-	err = s.emailService.SendPasswordResetEmail(ctx, email, token)
-	if err != nil {
-		return fmt.Errorf("failed to send reset email: %w", err)
 	}
 
 	return nil
@@ -1056,32 +1260,17 @@ func (s *AuthService) ResetPassword(ctx context.Context, token, newPassword stri
 
 // VerifyEmail 验证邮箱
 func (s *AuthService) VerifyEmail(ctx context.Context, token string) error {
-	// 验证令牌
-	verification, err := s.tokenRepo.GetEmailVerification(ctx, token)
-	if err != nil {
-		return ErrInvalidToken
+	if s.emailOutboxRepo == nil {
+		return errors.New("durable authentication email Outbox is unavailable")
 	}
 
-	if verification.Used || time.Now().After(verification.ExpiresAt) {
-		return ErrInvalidToken
-	}
-
-	// 获取用户
-	user, err := s.userRepo.GetByID(ctx, verification.UserID)
-	if err != nil {
-		return fmt.Errorf("failed to get user: %w", err)
-	}
-
-	// 条件消费令牌与更新用户状态在同一事务中完成。
-	if _, err := s.tokenRepo.VerifyEmailWithToken(ctx, token, time.Now()); err != nil {
+	// 条件消费令牌、更新用户状态与欢迎邮件意图在同一事务中完成。
+	if _, err := s.emailOutboxRepo.VerifyEmailAndQueueWelcome(ctx, token, time.Now()); err != nil {
 		if errors.Is(err, ErrInvalidToken) {
 			return ErrInvalidToken
 		}
 		return fmt.Errorf("failed to verify email: %w", err)
 	}
-
-	// 发送欢迎邮件
-	_ = s.emailService.SendWelcomeEmail(ctx, user.Email, user.Username)
 
 	return nil
 }
@@ -1091,18 +1280,30 @@ func (s *AuthService) ResendVerification(ctx context.Context, email string) erro
 	// 查找用户
 	user, err := s.userRepo.GetByEmail(ctx, email)
 	if err != nil {
-		return ErrUserNotFound
+		// 防止通过响应差异枚举已注册邮箱。
+		return nil
 	}
 
 	// 检查是否已验证
 	if user.EmailVerified {
-		return fmt.Errorf("email already verified")
+		return nil
 	}
 
-	// 发送验证邮件
-	err = s.sendEmailVerification(ctx, user)
+	token, err := generateSecureToken(32)
 	if err != nil {
-		return fmt.Errorf("failed to send verification email: %w", err)
+		return fmt.Errorf("failed to generate email verification token: %w", err)
+	}
+	verification := &EmailVerification{
+		UserID:    user.ID,
+		Email:     user.Email,
+		Token:     token,
+		ExpiresAt: time.Now().Add(s.config.EmailVerificationExpire),
+	}
+	if s.emailOutboxRepo == nil {
+		return errors.New("durable authentication email Outbox is unavailable")
+	}
+	if err := s.emailOutboxRepo.QueueEmailVerification(ctx, verification, "resend"); err != nil {
+		return fmt.Errorf("failed to queue verification email: %w", err)
 	}
 
 	return nil
@@ -1175,18 +1376,14 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID uint, currentPa
 		return fmt.Errorf("failed to hash password: %w", err)
 	}
 
-	// 更新用户密码
-	user.PasswordHash = hashedPassword
-	user.PasswordChangedAt = timePtr(time.Now())
-
-	err = s.userRepo.Update(ctx, user)
-	if err != nil {
-		return fmt.Errorf("failed to update user: %w", err)
-	}
-
-	// 撤销所有刷新令牌（强制重新登录）
-	if err := s.tokenRepo.RevokeAllUserTokens(ctx, user.ID); err != nil {
-		return fmt.Errorf("failed to revoke login sessions: %w", err)
+	changedAt := time.Now()
+	if err := s.userRepo.ChangePasswordAndRevokeSessions(
+		ctx,
+		user.ID,
+		hashedPassword,
+		changedAt,
+	); err != nil {
+		return fmt.Errorf("failed to change password and revoke sessions: %w", err)
 	}
 
 	return nil
@@ -1340,6 +1537,9 @@ func (s *AuthService) GenerateBackupCodes(ctx context.Context, userID uint) ([]s
 // 辅助方法
 
 func (s *AuthService) checkLoginAttempts(ctx context.Context, email string) error {
+	if s.loginAttemptRepo == nil {
+		return errors.New("login attempt repository is unavailable")
+	}
 	since := time.Now().Add(-time.Hour) // 检查最近1小时的尝试
 	failedCount, err := s.loginAttemptRepo.GetRecentFailedAttempts(ctx, email, since)
 	if err != nil {
@@ -1354,18 +1554,8 @@ func (s *AuthService) checkLoginAttempts(ctx context.Context, email string) erro
 }
 
 func (s *AuthService) checkUserStatus(ctx context.Context, user *User) error {
-	switch user.Status {
-	case StatusInactive:
-		return errors.New("account is inactive")
-	case StatusSuspended:
-		return errors.New("account is suspended")
-	case StatusLocked:
-		if user.LockedUntil != nil && time.Now().Before(*user.LockedUntil) {
-			return ErrAccountLocked
-		}
-		// 自动解锁
-		user.Status = StatusActive
-		user.LockedUntil = nil
+	if err := validateUserAccessState(user, time.Now()); err != nil {
+		return err
 	}
 
 	// 动态获取邮箱验证配置
@@ -1382,7 +1572,39 @@ func (s *AuthService) checkUserStatus(ctx context.Context, user *User) error {
 	return nil
 }
 
-func (s *AuthService) recordLoginAttempt(ctx context.Context, userID *uint, email, ipAddress, userAgent string, success bool, failReason string) {
+func validateUserAccessState(user *User, now time.Time) error {
+	if user == nil {
+		return ErrUserNotFound
+	}
+
+	switch user.Status {
+	case StatusActive:
+	case StatusInactive:
+		return ErrAccountInactive
+	case StatusSuspended:
+		return ErrAccountSuspended
+	case StatusDeleted:
+		return ErrAccountDeleted
+	default:
+		return ErrInvalidAccountState
+	}
+
+	if user.isLockedAt(now) {
+		return ErrAccountLocked
+	}
+	return nil
+}
+
+func (s *AuthService) recordLoginAttempt(
+	ctx context.Context,
+	userID *uint,
+	email, ipAddress, userAgent string,
+	success bool,
+	failReason string,
+) error {
+	if s.loginAttemptRepo == nil {
+		return errors.New("login attempt repository is unavailable")
+	}
 	attempt := &LoginAttempt{
 		UserID:     userID,
 		Email:      email,
@@ -1391,7 +1613,7 @@ func (s *AuthService) recordLoginAttempt(ctx context.Context, userID *uint, emai
 		Success:    success,
 		FailReason: failReason,
 	}
-	s.loginAttemptRepo.Create(ctx, attempt)
+	return s.loginAttemptRepo.Create(ctx, attempt)
 }
 
 func (s *AuthService) saveRefreshToken(ctx context.Context, userID uint, token, sessionID, ipAddress, userAgent string) error {
@@ -1412,38 +1634,34 @@ func (s *AuthService) newRefreshTokenRecord(
 	userID uint,
 	token, sessionID, ipAddress, userAgent string,
 ) (*RefreshToken, error) {
+	return s.newRefreshTokenRecordAt(
+		userID,
+		token,
+		sessionID,
+		ipAddress,
+		userAgent,
+		time.Now(),
+	)
+}
+
+func (s *AuthService) newRefreshTokenRecordAt(
+	userID uint,
+	token, sessionID, ipAddress, userAgent string,
+	issuedAt time.Time,
+) (*RefreshToken, error) {
 	sessionID = strings.TrimSpace(sessionID)
-	if userID == 0 || sessionID == "" || len(sessionID) > 128 {
+	if userID == 0 || sessionID == "" || len(sessionID) > 128 || issuedAt.IsZero() {
 		return nil, errors.New("valid user and session identifiers are required")
 	}
 	return &RefreshToken{
 		UserID:    userID,
 		Token:     token,
 		SessionID: sessionID,
-		ExpiresAt: time.Now().Add(s.config.RefreshTokenExpire),
+		ExpiresAt: issuedAt.Add(s.config.RefreshTokenExpire),
 		IPAddress: ipAddress,
 		UserAgent: userAgent,
+		CreatedAt: issuedAt,
 	}, nil
-}
-
-func (s *AuthService) sendEmailVerification(ctx context.Context, user *User) error {
-	token, err := generateSecureToken(32)
-	if err != nil {
-		return err
-	}
-
-	verification := &EmailVerification{
-		UserID:    user.ID,
-		Email:     user.Email,
-		Token:     token,
-		ExpiresAt: time.Now().Add(s.config.EmailVerificationExpire),
-	}
-
-	if err := s.tokenRepo.CreateEmailVerification(ctx, verification); err != nil {
-		return err
-	}
-
-	return s.emailService.SendVerificationEmail(ctx, user.Email, token)
 }
 
 func (s *AuthService) recordLoginHistorySuccess(
@@ -1451,7 +1669,7 @@ func (s *AuthService) recordLoginHistorySuccess(
 	user *User,
 	ipAddress, userAgent, sessionID string,
 	loginTime time.Time,
-	method string,
+	method models.LoginMethod,
 ) error {
 	if s.loginHistoryRepo == nil || user == nil {
 		return errors.New("login session repository is unavailable")
@@ -1479,9 +1697,16 @@ func (s *AuthService) recordLoginHistorySuccess(
 	return s.loginHistoryRepo.Create(ctx, history)
 }
 
-func (s *AuthService) recordLoginHistoryFailure(ctx context.Context, user *User, ipAddress, userAgent, method string, reason string, status models.LoginStatus) {
+func (s *AuthService) recordLoginHistoryFailure(
+	ctx context.Context,
+	user *User,
+	ipAddress, userAgent string,
+	method models.LoginMethod,
+	reason string,
+	status models.LoginStatus,
+) error {
 	if s.loginHistoryRepo == nil || user == nil {
-		return
+		return errors.New("login session repository is unavailable")
 	}
 
 	loginTime := time.Now()
@@ -1504,9 +1729,7 @@ func (s *AuthService) recordLoginHistoryFailure(ctx context.Context, user *User,
 		IsActive:        false,
 	}
 
-	if err := s.loginHistoryRepo.Create(ctx, history); err != nil {
-		fmt.Printf("Warning: failed to record failed login history: %v\n", err)
-	}
+	return s.loginHistoryRepo.Create(ctx, history)
 }
 
 func loginStatusFromError(err error) models.LoginStatus {
@@ -1520,22 +1743,22 @@ func loginStatusFromError(err error) models.LoginStatus {
 	}
 }
 
-func determineLoginMethod(user *User, req *LoginRequest, deviceTrusted bool, otpValidated bool) string {
+func determineLoginMethod(user *User, req *LoginRequest, deviceTrusted bool, otpValidated bool) models.LoginMethod {
 	if deviceTrusted {
-		return "password+trusted"
+		return models.LoginMethodPasswordTrusted
 	}
 
 	if user != nil && user.OTPEnabled {
 		if otpValidated {
-			return "password+otp"
+			return models.LoginMethodPasswordOTP
 		}
 		if req != nil && req.OTPCode != "" {
-			return "password+otp"
+			return models.LoginMethodPasswordOTP
 		}
-		return "password+otp_required"
+		return models.LoginMethodOTPRequired
 	}
 
-	return "password"
+	return models.LoginMethodPassword
 }
 
 func extractDeviceContext(userAgent string) (deviceType, operatingSystem, browser string) {
@@ -1711,35 +1934,13 @@ func timePtr(t time.Time) *time.Time {
 	return &t
 }
 
-// ValidateRole 验证角色是否有效
-func ValidateRole(role string) bool {
-	switch UserRole(role) {
-	case RoleUser, RoleCustomer, RoleAgent, RoleSupervisor, RoleAdmin, RoleSuperUser:
-		return true
-	default:
-		return false
-	}
-}
-
-// ValidateStatus 验证状态是否有效
-func ValidateStatus(status string) bool {
-	switch UserStatus(status) {
-	case StatusActive, StatusInactive, StatusLocked, StatusSuspended:
-		return true
-	default:
-		return false
-	}
-}
-
 // HasPermission 检查用户是否有指定权限
 func (u *User) HasPermission(requiredRole UserRole) bool {
 	roleHierarchy := map[UserRole]int{
-		RoleUser:       1,
 		RoleCustomer:   1,
 		RoleAgent:      2,
 		RoleSupervisor: 3,
-		RoleAdmin:      3,
-		RoleSuperUser:  4,
+		RoleAdmin:      4,
 	}
 
 	userLevel, exists := roleHierarchy[u.Role]
@@ -1762,13 +1963,11 @@ func (u *User) IsActive() bool {
 
 // IsLocked 检查用户是否被锁定
 func (u *User) IsLocked() bool {
-	if u.Status == StatusLocked {
-		if u.LockedUntil == nil {
-			return true
-		}
-		return time.Now().Before(*u.LockedUntil)
-	}
-	return false
+	return u.isLockedAt(time.Now())
+}
+
+func (u *User) isLockedAt(now time.Time) bool {
+	return u != nil && u.LockedUntil != nil && u.LockedUntil.After(now)
 }
 
 // GetDisplayName 获取用户显示名称

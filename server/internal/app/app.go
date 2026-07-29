@@ -9,11 +9,11 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/joho/godotenv"
 	"github.com/seaworld008/chronodesk/server/internal/a2a"
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
 	"github.com/seaworld008/chronodesk/server/internal/agentplatform"
@@ -48,11 +48,6 @@ func Run() error {
 		syscall.SIGTERM,
 	)
 	defer stopApp()
-
-	// 加载环境变量
-	if err := godotenv.Load(); err != nil {
-		log.Println("Warning: .env file not found")
-	}
 
 	// 加载配置
 	cfg, err := config.Load()
@@ -138,7 +133,6 @@ func Run() error {
 		DefaultCredentialTTL:             cfg.Agent.CredentialTTL,
 		AttachmentStorage:                attachmentStorage,
 		AttachmentMaxBytes:               cfg.Agent.MaxAttachmentBytes,
-		SystemCompatibilityUserID:        cfg.Agent.CompatibilityUserID,
 		LoopThreshold:                    cfg.Agent.LoopThreshold,
 		LoopWindow:                       cfg.Agent.LoopWindow,
 		ExecutionGuard:                   executionGuard,
@@ -152,7 +146,17 @@ func Run() error {
 	if err := nativeService.ValidateExecutionGuardConfiguration(); err != nil {
 		log.Fatal("Distributed Agent execution guard validation failed: ", err)
 	}
-	runtimeControl := agentplatform.NewRuntimeControl(nativeService, cfg.Agent.GlobalReadOnly, db.DB)
+	runtimeControlContext, cancelRuntimeControl := context.WithTimeout(appContext, 5*time.Second)
+	runtimeControl, err := agentplatform.NewRuntimeControl(
+		runtimeControlContext,
+		nativeService,
+		db.DB,
+		cfg.Agent.GlobalReadOnly,
+	)
+	cancelRuntimeControl()
+	if err != nil {
+		log.Fatal("Failed to load persisted Agent safety controls: ", err)
+	}
 	credentialStore := agentplatform.NewCredentialStore(nativeService)
 	mcpTokens := agentauth.NewManager(
 		cfg.Agent.JWTSecret,
@@ -206,8 +210,16 @@ func Run() error {
 	mcpPublisher := &agentplatform.MCPResourcePublisher{Server: mcpServer, DB: db.DB}
 
 	agentBackground, stopAgentBackground := context.WithCancel(appContext)
-	defer stopAgentBackground()
-	go runtimeControl.Run(agentBackground, 2*time.Second)
+	var agentWorkers sync.WaitGroup
+	defer func() {
+		stopAgentBackground()
+		agentWorkers.Wait()
+	}()
+	agentWorkers.Add(1)
+	go func() {
+		defer agentWorkers.Done()
+		runtimeControl.Run(agentBackground, 2*time.Second)
+	}()
 	a2aStore := a2a.NewGormStoreWithProtector(db.DB, secretProtector)
 	a2aBackend, err := agentplatform.NewA2ABackend(db.DB, nativeService)
 	if err != nil {
@@ -216,6 +228,13 @@ func Run() error {
 	a2aPushDispatcher, err := agentplatform.NewA2AOutboxPushDispatcher(db.DB, nativeService, 8)
 	if err != nil {
 		log.Fatal("Failed to initialize A2A push dispatcher:", err)
+	}
+	a2aStreamLimiter, err := agentplatform.NewA2AStreamLimiter(
+		nativeService,
+		cfg.RateLimit.Requests,
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize A2A stream limiter:", err)
 	}
 	a2aServer, err := a2a.NewServer(a2aStore, a2aBackend, a2a.ServerOptions{
 		CardOptions: a2a.CardOptions{
@@ -233,11 +252,15 @@ func Run() error {
 			TaskListAuthorizer: agentplatform.NewA2ATaskListAuthorizer(nativeService),
 			BackgroundContext:  agentBackground,
 		},
+		StreamLimiter: a2aStreamLimiter,
 	})
 	if err != nil {
 		log.Fatal("Failed to initialize A2A server:", err)
 	}
 	adminAuditService := services.NewAdminAuditService(db.DB)
+	automationService := services.NewAutomationServiceWithAgentNative(db.DB, nativeService)
+	slaEscalationConsumer := services.NewEscalationService(db.DB)
+	slaEscalationConsumer.SetAgentNativeService(nativeService)
 
 	// 初始化清理服务和调度器
 	log.Println("Initializing cleanup service and scheduler...")
@@ -281,17 +304,26 @@ func Run() error {
 
 	middlewareConfig.CORS = buildCORSConfig(cfg)
 	// 限流只应用于真实的凭据写接口与已认证业务接口。健康检查、协议发现、
-	// OpenAPI 和静态资源不得共享一个进程内 IP 桶。
-	middlewareConfig.RateLimit = nil
-	anonymousLimiter, err := middleware.NewRedisSlidingWindow(
+	// OpenAPI 和静态资源不安装进程内兜底桶。
+	anonymousIdentityLimiter, err := middleware.NewRedisSlidingWindow(
 		db.Redis,
 		[]byte(cfg.Agent.CredentialPepper),
-		cfg.RateLimit.AnonymousRequests,
+		cfg.RateLimit.AnonymousIdentityRequests,
 		cfg.RateLimit.AnonymousWindow,
 		2*time.Second,
 	)
 	if err != nil {
-		log.Fatal("Failed to initialize anonymous Redis rate limiter: ", err)
+		log.Fatal("Failed to initialize anonymous identity Redis rate limiter: ", err)
+	}
+	anonymousIPLimiter, err := middleware.NewRedisSlidingWindow(
+		db.Redis,
+		[]byte(cfg.Agent.CredentialPepper),
+		cfg.RateLimit.AnonymousIPRequests,
+		cfg.RateLimit.AnonymousWindow,
+		2*time.Second,
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize anonymous IP Redis rate limiter: ", err)
 	}
 	authenticatedLimiter, err := middleware.NewRedisSlidingWindow(
 		db.Redis,
@@ -303,9 +335,14 @@ func Run() error {
 	if err != nil {
 		log.Fatal("Failed to initialize authenticated Redis rate limiter: ", err)
 	}
-	anonymousWriteRateLimit := middleware.WrapGinMiddleware(middleware.RateLimit(&middleware.RateLimitConfig{
-		Limiter: anonymousLimiter,
-		KeyFunc: middleware.AnonymousWriteRouteKeyFunc,
+	anonymousIdentityRateLimit := middleware.WrapGinMiddleware(middleware.RateLimit(&middleware.RateLimitConfig{
+		Limiter: anonymousIdentityLimiter,
+		KeyFunc: middleware.AnonymousCredentialKeyFunc,
+		Headers: true,
+	}))
+	anonymousIPRateLimit := middleware.WrapGinMiddleware(middleware.RateLimit(&middleware.RateLimitConfig{
+		Limiter: anonymousIPLimiter,
+		KeyFunc: middleware.AnonymousIPRouteKeyFunc,
 		Headers: true,
 	}))
 	authenticatedRateLimit := middleware.WrapGinMiddleware(middleware.RateLimit(&middleware.RateLimitConfig{
@@ -313,13 +350,34 @@ func Run() error {
 		KeyFunc: middleware.AuthenticatedUserRouteKeyFunc,
 		Headers: true,
 	}))
-	// ChronoDesk business APIs authenticate explicit Authorization credentials.
-	// The only ambient cookie is a SameSite=Strict, HttpOnly trusted-device
-	// second-factor credential; it cannot authenticate a request without the
-	// user's password. Cookie-based CSRF validation on all writes would therefore
-	// block legitimate OAuth, REST, MCP and A2A calls without adding protection.
-	middlewareConfig.CSRF = nil
-
+	a2aRateLimitError := func(ctx middleware.HTTPContext) {
+		ginContext, ok := ctx.(*middleware.GinHTTPContext)
+		if !ok {
+			ctx.JSON(http.StatusTooManyRequests, map[string]any{
+				"jsonrpc": "2.0",
+				"id":      nil,
+				"error": map[string]any{
+					"code":    -32010,
+					"message": "A2A 请求过于频繁，请稍后重试",
+					"data":    map[string]any{"reason": "RATE_LIMIT_EXCEEDED"},
+				},
+			})
+			return
+		}
+		a2a.WriteRateLimitError(ginContext.Context)
+	}
+	a2aPrincipalRateLimit := middleware.WrapGinMiddleware(middleware.RateLimit(&middleware.RateLimitConfig{
+		Limiter:      authenticatedLimiter,
+		KeyFunc:      middleware.MachineIdentityRouteKeyFunc(agentauth.ContextPrincipalID, "service_principal"),
+		ErrorHandler: a2aRateLimitError,
+		Headers:      true,
+	}))
+	a2aCredentialRateLimit := middleware.WrapGinMiddleware(middleware.RateLimit(&middleware.RateLimitConfig{
+		Limiter:      authenticatedLimiter,
+		KeyFunc:      middleware.MachineIdentityRouteKeyFunc(agentauth.ContextCredentialID, "credential"),
+		ErrorHandler: a2aRateLimitError,
+		Headers:      true,
+	}))
 	// 应用基础中间件（不包含JWT）
 	r.Use(middleware.WrapGinMiddlewares(middleware.SetupMiddlewares(middlewareConfig))...)
 
@@ -327,7 +385,9 @@ func Run() error {
 	r.GET("/healthz", func(c *gin.Context) {
 		postgresStatus := "ok"
 		redisStatus := "ok"
+		agentControlStatus := "ok"
 		status := "ok"
+		message := "ChronoDesk API 正常运行"
 		statusCode := http.StatusOK
 		healthContext, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 		defer cancel()
@@ -343,18 +403,27 @@ func Run() error {
 			status = "unhealthy"
 			statusCode = http.StatusServiceUnavailable
 		}
+		if !runtimeControl.Healthy() {
+			agentControlStatus = "error"
+			status = "unhealthy"
+			statusCode = http.StatusServiceUnavailable
+		}
+		if status != "ok" {
+			message = "ChronoDesk 必要依赖未就绪"
+		}
 
 		c.JSON(statusCode, gin.H{
 			"status":  status,
-			"message": "ChronoDesk API 正常运行",
+			"message": message,
 			"version": cfg.App.Version,
 			"build": gin.H{
 				"commit": version.Commit,
 				"date":   version.BuildDate,
 			},
 			"dependencies": gin.H{
-				"postgresql": postgresStatus,
-				"redis":      redisStatus,
+				"postgresql":    postgresStatus,
+				"redis":         redisStatus,
+				"agent_control": agentControlStatus,
 			},
 		})
 	})
@@ -367,17 +436,18 @@ func Run() error {
 		a2a.RPCPath,
 		a2aTokens.Middleware(models.ScopeTasksManage),
 		agentplatform.BindA2AIdentity(),
+		a2aPrincipalRateLimit,
+		a2aCredentialRateLimit,
 		agentplatform.A2ARequestPolicyMiddleware(nativeService, a2aServer.Service()),
 		a2aServer.RPCHandler(),
 	)
 
-	// /api/v1 是面向 Agent 的稳定机器契约；现有 /api 继续作为兼容层。
+	// /api/v1 是面向 Agent 的稳定机器契约；/api 是浏览器管理端的人类 REST 接口。
 	apiV1 := r.Group("/api/v1")
 	agentAPI := agentplatform.NewAPIHandler(
 		db.DB,
 		nativeService,
 		apiTokens,
-		cfg.Agent.CompatibilityUserID,
 		cfg.Agent.MaxAttachmentBytes,
 		mcpPublisher,
 	)
@@ -387,7 +457,6 @@ func Run() error {
 		nativeService,
 		runtimeControl,
 		cfg.Agent.CredentialTTL,
-		cfg.Agent.CompatibilityUserID,
 		[]byte(cfg.Agent.CredentialPepper),
 	)
 	agentAdminRoutes := apiV1.Group("/admin")
@@ -400,21 +469,11 @@ func Run() error {
 	// API 路由组
 	api := r.Group("/api")
 	{
-		api.GET("/ping", func(c *gin.Context) {
-			c.JSON(http.StatusOK, gin.H{
-				"message": "pong",
-			})
-		})
-
-		// 健康检查端点（公开）
-		analyticsHandler := handlers.NewAnalyticsHandler(db.DB, cfg.App.Version)
-		api.GET("/health", analyticsHandler.GetHealthCheck)
-
 		// 认证路由
 		authGroup := api.Group("/auth")
 		{
 			publicWrites := authGroup.Group("/")
-			publicWrites.Use(anonymousWriteRateLimit)
+			publicWrites.Use(anonymousIPRateLimit, anonymousIdentityRateLimit)
 			publicWrites.POST("/register", ginAdapter(authModule.Handler.Register))
 			publicWrites.POST("/login", ginAdapter(authModule.Handler.Login))
 			publicWrites.POST("/logout", ginAdapter(authModule.Handler.Logout))
@@ -430,7 +489,6 @@ func Run() error {
 			authenticated.Use(authenticatedRateLimit)
 			{
 				authenticated.GET("/me", ginAdapter(authModule.Handler.GetProfile))
-				authenticated.GET("/profile", ginAdapter(authModule.Handler.GetProfile))
 				authenticated.PUT("/profile", ginAdapter(authModule.Handler.UpdateProfile))
 				authenticated.POST("/change-password", ginAdapter(authModule.Handler.ChangePassword))
 				authenticated.POST("/logout-all", ginAdapter(authModule.Handler.LogoutAll))
@@ -464,12 +522,15 @@ func Run() error {
 		{
 			// 创建工单服务和处理器
 			cacheTTL := getTicketStatsCacheTTL()
-			ticketService := services.NewTicketServiceWithAgentNative(
+			ticketService, err := services.NewTicketService(
 				db.DB,
+				nativeService,
 				db.Redis,
 				cacheTTL,
-				nativeService,
 			)
+			if err != nil {
+				log.Fatal("Failed to initialize Human ticket service: ", err)
+			}
 			ticketHandler := handlers.NewTicketHandler(ticketService)
 			workflowHandler := handlers.NewTicketWorkflowHandler(ticketService)
 			contentHandler := handlers.NewTicketContentHandler(
@@ -506,10 +567,8 @@ func Run() error {
 			tickets.GET("/overdue", workflowHandler.GetOverdueTickets)        // 获取逾期工单
 			tickets.GET("/sla-breach", workflowHandler.GetSLABreachedTickets) // 获取SLA违约工单
 
-			// 批量操作路由
-			tickets.POST("/bulk-assign", workflowHandler.BulkAssignTickets) // 批量分配
-			tickets.POST("/bulk-status", workflowHandler.BulkUpdateStatus)  // 批量状态更新
-			tickets.POST("/bulk-update", ticketHandler.BulkUpdateTickets)   // 原有批量更新
+			// 统一批量更新入口
+			tickets.POST("/bulk-update", ticketHandler.BulkUpdateTickets)
 		}
 
 		// 邮箱配置路由
@@ -518,9 +577,6 @@ func Run() error {
 			secretProtector,
 		)
 		emailConfigHandler := handlers.NewEmailConfigHandler(emailConfigService)
-
-		// 公开的邮箱状态查询端点
-		api.GET("/email-status", emailConfigHandler.GetEmailStatus)
 
 		// 用户个人中心路由（需要认证）
 		userService := services.NewUserService(db.DB)
@@ -534,9 +590,6 @@ func Run() error {
 		user.Use(ginAdapter(authModule.Handler.RequireAuth))
 		user.Use(authenticatedRateLimit)
 		{
-			user.GET("/profile", userHandler.GetProfile)
-			user.PUT("/profile", userHandler.UpdateProfile)
-			user.PUT("/password", userHandler.ChangePassword)
 			user.GET("/login-history", userHandler.GetLoginHistory)
 			user.GET("/stats", userHandler.GetStats)
 			user.POST("/avatar", userHandler.UploadAvatar)
@@ -569,8 +622,6 @@ func Run() error {
 			admin.PUT("/users/:id", adminUserHandler.UpdateUser)
 			admin.DELETE("/users/:id", adminUserHandler.DeleteUser)
 			admin.POST("/users/:id/reset-password", adminUserHandler.ResetUserPassword)
-			admin.POST("/users/:id/toggle-status", adminUserHandler.ToggleUserStatus)
-			admin.POST("/users/batch-delete", adminUserHandler.BatchDeleteUsers)
 			admin.GET("/audit-logs", adminAuditHandler.GetAuditLogs)
 
 			// 系统配置和清理管理路由
@@ -594,7 +645,7 @@ func Run() error {
 			}
 
 			// 系统监控统计管理路由
-			analyticsHandler := handlers.NewAnalyticsHandler(db.DB, cfg.App.Version)
+			analyticsHandler := handlers.NewAnalyticsHandler(db.DB)
 			analytics := admin.Group("/analytics")
 			{
 				analytics.GET("/system", analyticsHandler.GetSystemStats)       // 获取系统运行状态
@@ -606,7 +657,13 @@ func Run() error {
 			}
 
 			// FE008 自动化流程管理路由
-			automationHandler := handlers.NewAutomationHandler(db.DB, schedulerService, nativeService)
+			automationHandler, err := handlers.NewAutomationHandler(
+				automationService,
+				schedulerService,
+			)
+			if err != nil {
+				log.Fatal("Failed to initialize automation handler: ", err)
+			}
 			automation := admin.Group("/automation")
 			{
 				// 自动化规则管理
@@ -645,13 +702,6 @@ func Run() error {
 					quickReplies.GET("", automationHandler.GetQuickReplies)        // 获取快速回复列表
 					quickReplies.POST("/:id/use", automationHandler.UseQuickReply) // 使用快速回复
 				}
-
-				// 批量操作
-				batch := automation.Group("/batch")
-				{
-					batch.POST("/update", automationHandler.BatchUpdateTickets) // 批量更新工单
-					batch.POST("/assign", automationHandler.BatchAssignTickets) // 批量分配工单
-				}
 			}
 		}
 
@@ -670,20 +720,25 @@ func Run() error {
 		// 将邮件通知服务注入到通知服务中
 		notificationService.SetEmailNotificationService(emailNotificationService)
 		outboxDeliverer, err := agentplatform.NewNativeOutboxDeliverer(
-			db.DB,
-			notificationService,
-			mcpPublisher,
-			services.NewAutomationServiceWithAgentNative(db.DB, nativeService),
+			agentplatform.NativeOutboxDelivererOptions{
+				DB:                db.DB,
+				Notifications:     notificationService,
+				Publisher:         mcpPublisher,
+				Automation:        automationService,
+				SLAEscalation:     slaEscalationConsumer,
+				AttachmentStorage: attachmentStorage,
+				AuthEmails:        authModule.EmailOutboxConsumer,
+				SecretProtector:   secretProtector,
+			},
 		)
 		if err != nil {
 			log.Fatal("Failed to initialize Agent Outbox deliverer:", err)
 		}
-		outboxDeliverer.SetAttachmentStorage(attachmentStorage)
-		outboxDeliverer.SetSecretProtector(secretProtector)
-		slaEscalationConsumer := services.NewEscalationService(db.DB)
-		slaEscalationConsumer.SetAgentNativeService(nativeService)
-		outboxDeliverer.SetSLAEscalationConsumer(slaEscalationConsumer)
-		go runAgentOutboxWorker(agentBackground, nativeService, outboxDeliverer)
+		agentWorkers.Add(1)
+		go func() {
+			defer agentWorkers.Done()
+			runAgentOutboxWorker(agentBackground, nativeService, outboxDeliverer)
+		}()
 
 		notificationHandler := handlers.NewNotificationHandler(notificationService)
 
@@ -692,8 +747,11 @@ func Run() error {
 		wsHub := websocketPkg.NewHub()
 		wsNotificationService := websocketPkg.NewNotificationWebSocketService(wsHub)
 
-		// 启动 WebSocket Hub（在后台运行）
-		go wsHub.Run()
+		agentWorkers.Add(1)
+		go func() {
+			defer agentWorkers.Done()
+			wsHub.Run(agentBackground)
+		}()
 
 		// 设置全局WebSocket通知服务以供hook使用
 		websocketPkg.SetGlobalNotificationService(wsNotificationService)
@@ -755,39 +813,6 @@ func Run() error {
 			webhooks.GET("/:id/stats", webhookHandler.GetWebhookStats) // 获取webhook统计
 		}
 
-		// Redis 连接测试端点（仅管理员）
-		api.GET(
-			"/redis/test",
-			ginAdapter(authModule.Handler.RequireAuth),
-			authenticatedRateLimit,
-			ginAdapter(authModule.Handler.RequireRole(auth.RoleAdmin)),
-			func(c *gin.Context) {
-				if db.Redis == nil {
-					c.JSON(http.StatusServiceUnavailable, gin.H{
-						"status":  "error",
-						"message": "Redis 客户端未初始化",
-					})
-					return
-				}
-
-				// 健康检查必须只读。固定 SET/DEL 测试键可能覆盖生产数据，
-				// 并会在超时或进程退出时留下脏数据。
-				ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-				defer cancel()
-				if err := db.Redis.Ping(ctx); err != nil {
-					c.JSON(http.StatusServiceUnavailable, gin.H{
-						"status":  "error",
-						"message": "Redis 连接检查失败",
-					})
-					return
-				}
-
-				c.JSON(http.StatusOK, gin.H{
-					"status":  "ok",
-					"message": "Redis 连接正常",
-				})
-			},
-		)
 	}
 
 	// 启动服务器

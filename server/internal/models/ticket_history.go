@@ -28,6 +28,18 @@ const (
 	HistoryActionSystem         HistoryAction = "system"          // 系统操作
 )
 
+// TicketHistoryProvenance describes how a history record is linked to the
+// immutable domain event stream. Only domain_event records may carry EventID
+// and ResourceVersion. pre_event and imported records deliberately remain
+// unlinked because their event identity cannot be proven.
+type TicketHistoryProvenance string
+
+const (
+	TicketHistoryProvenanceDomainEvent TicketHistoryProvenance = "domain_event"
+	TicketHistoryProvenancePreEvent    TicketHistoryProvenance = "pre_event"
+	TicketHistoryProvenanceImported    TicketHistoryProvenance = "imported"
+)
+
 // TicketHistory 工单历史记录模型
 type TicketHistory struct {
 	ID        uint      `json:"id" gorm:"primaryKey;autoIncrement"`
@@ -35,14 +47,18 @@ type TicketHistory struct {
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
 	// 关联信息
-	TicketID           uint              `json:"ticket_id" gorm:"not null;index"`
-	Ticket             *Ticket           `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
-	UserID             *uint             `json:"user_id" gorm:"index"` // 可为空，系统操作时为空
-	User               *User             `json:"user,omitempty" gorm:"foreignKey:UserID"`
-	ActorType          ActorType         `json:"actor_type" gorm:"size:32;not null;default:'human';index"`
-	ActorID            string            `json:"actor_id" gorm:"size:128;index"`
-	ServicePrincipalID *string           `json:"service_principal_id,omitempty" gorm:"size:36;index"`
-	ServicePrincipal   *ServicePrincipal `json:"service_principal,omitempty" gorm:"foreignKey:ServicePrincipalID"`
+	TicketID           uint                    `json:"ticket_id" gorm:"not null;index"`
+	Ticket             *Ticket                 `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
+	UserID             *uint                   `json:"user_id" gorm:"index"` // 可为空，系统操作时为空
+	User               *User                   `json:"user,omitempty" gorm:"foreignKey:UserID"`
+	ActorType          ActorType               `json:"actor_type" gorm:"size:32;not null;default:'human';index"`
+	ActorID            string                  `json:"actor_id" gorm:"size:128;index"`
+	ServicePrincipalID *string                 `json:"service_principal_id,omitempty" gorm:"size:36;index"`
+	ServicePrincipal   *ServicePrincipal       `json:"service_principal,omitempty" gorm:"foreignKey:ServicePrincipalID"`
+	EventID            *string                 `json:"event_id,omitempty" gorm:"size:36;index"`
+	Event              *DomainEvent            `json:"-" gorm:"foreignKey:EventID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
+	ResourceVersion    uint64                  `json:"resource_version" gorm:"not null;default:0"`
+	Provenance         TicketHistoryProvenance `json:"provenance" gorm:"size:32;not null;default:'pre_event';index"`
 
 	// 操作信息
 	Action      HistoryAction `json:"action" gorm:"size:50;not null;index" validate:"required"`
@@ -81,45 +97,10 @@ func (TicketHistory) TableName() string {
 	return "ticket_histories"
 }
 
-// IsUserAction 检查是否为用户操作
-func (th *TicketHistory) IsUserAction() bool {
-	return th.Actor().Type != ActorTypeSystem && !th.IsSystem
-}
-
-// IsSystemAction 检查是否为系统操作
-func (th *TicketHistory) IsSystemAction() bool {
-	return th.IsSystem || th.Actor().Type == ActorTypeSystem
-}
-
-// Actor returns the authoritative actor with a backwards-compatible fallback.
+// Actor returns the authoritative ActorRef. Migration and database constraints
+// guarantee that it is complete and consistent with its optional projections.
 func (th *TicketHistory) Actor() ActorRef {
-	if th.ActorType != "" && th.ActorID != "" {
-		return ActorRef{Type: th.ActorType, ID: th.ActorID}
-	}
-	if th.UserID != nil {
-		return HumanActor(*th.UserID)
-	}
-	return SystemActor("legacy")
-}
-
-// IsStatusChange 检查是否为状态变更
-func (th *TicketHistory) IsStatusChange() bool {
-	return th.Action == HistoryActionStatusChange
-}
-
-// IsPriorityChange 检查是否为优先级变更
-func (th *TicketHistory) IsPriorityChange() bool {
-	return th.Action == HistoryActionPriorityChange
-}
-
-// IsAssignmentChange 检查是否为分配变更
-func (th *TicketHistory) IsAssignmentChange() bool {
-	return th.Action == HistoryActionAssign || th.Action == HistoryActionUnassign
-}
-
-// HasFieldChange 检查是否有字段变更
-func (th *TicketHistory) HasFieldChange() bool {
-	return th.FieldName != "" && (th.OldValue != "" || th.NewValue != "")
+	return ActorRef{Type: th.ActorType, ID: th.ActorID}
 }
 
 // GetDurationString 获取持续时间字符串
@@ -155,6 +136,9 @@ type TicketHistoryResponse struct {
 	User             *UserSummary             `json:"user,omitempty"`
 	Actor            ActorRef                 `json:"actor"`
 	ServicePrincipal *ServicePrincipalSummary `json:"service_principal,omitempty"`
+	EventID          *string                  `json:"event_id,omitempty"`
+	ResourceVersion  uint64                   `json:"resource_version"`
+	Provenance       TicketHistoryProvenance  `json:"provenance"`
 	Action           HistoryAction            `json:"action"`
 	Description      string                   `json:"description"`
 	Details          map[string]interface{}   `json:"details"`
@@ -181,6 +165,9 @@ func (th *TicketHistory) ToResponse() *TicketHistoryResponse {
 		TicketID:         th.TicketID,
 		Actor:            th.Actor(),
 		ServicePrincipal: th.ServicePrincipal.ToSummary(),
+		EventID:          th.EventID,
+		ResourceVersion:  th.ResourceVersion,
+		Provenance:       th.Provenance,
 		Action:           th.Action,
 		Description:      th.Description,
 		FieldName:        th.FieldName,

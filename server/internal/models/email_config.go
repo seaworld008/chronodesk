@@ -1,6 +1,7 @@
 package models
 
 import (
+	"strings"
 	"time"
 )
 
@@ -25,12 +26,12 @@ type EmailConfig struct {
 
 	// 邮件发送配置
 	FromEmail string `json:"from_email" gorm:"size:255"`
-	FromName  string `json:"from_name" gorm:"size:255;default:'工单系统'"`
+	FromName  string `json:"from_name" gorm:"size:255;default:'ChronoDesk'"`
 
 	// 邮件模板配置
-	WelcomeEmailSubject  string `json:"welcome_email_subject" gorm:"size:255;default:'欢迎注册工单系统'"`
+	WelcomeEmailSubject  string `json:"welcome_email_subject" gorm:"size:255;default:'欢迎使用 ChronoDesk'"`
 	WelcomeEmailTemplate string `json:"welcome_email_template" gorm:"type:text"`
-	OTPEmailSubject      string `json:"otp_email_subject" gorm:"size:255;default:'邮箱验证码'"`
+	OTPEmailSubject      string `json:"otp_email_subject" gorm:"size:255;default:'ChronoDesk 邮箱验证码'"`
 	OTPEmailTemplate     string `json:"otp_email_template" gorm:"type:text"`
 
 	// 配置状态
@@ -41,6 +42,42 @@ type EmailConfig struct {
 	UpdatedBy   *User `json:"updated_by,omitempty" gorm:"foreignKey:UpdatedByID"`
 }
 
+// DefaultEmailConfig returns the read-only projection used before an
+// administrator explicitly saves SMTP settings. Callers decide whether and
+// where to persist it; read paths must not create database rows.
+func DefaultEmailConfig() *EmailConfig {
+	return &EmailConfig{
+		EmailVerificationEnabled: false,
+		SMTPPort:                 587,
+		SMTPUseTLS:               true,
+		SMTPUseSSL:               false,
+		FromName:                 "ChronoDesk",
+		WelcomeEmailSubject:      "欢迎使用 ChronoDesk",
+		OTPEmailSubject:          "ChronoDesk 邮箱验证码",
+		WelcomeEmailTemplate: `亲爱的 {{.Username}}，
+
+欢迎使用 ChronoDesk！
+
+您的账户已成功创建。您现在可以登录系统并开始使用我们的服务。
+
+如果您有任何问题，请随时联系我们的支持团队。
+
+祝好，
+ChronoDesk 团队`,
+		OTPEmailTemplate: `亲爱的用户，
+
+您的邮箱验证码是：{{.OTP}}
+
+此验证码将在10分钟后过期，请及时使用。
+
+如果您没有请求此验证码，请忽略此邮件。
+
+祝好，
+ChronoDesk 团队`,
+		IsActive: true,
+	}
+}
+
 // TableName 指定表名
 func (EmailConfig) TableName() string {
 	return "email_configs"
@@ -48,12 +85,17 @@ func (EmailConfig) TableName() string {
 
 // IsConfigured 检查SMTP是否已配置
 func (ec *EmailConfig) IsConfigured() bool {
-	return ec.SMTPHost != "" && ec.SMTPUsername != "" && ec.SMTPPassword != "" && ec.FromEmail != ""
+	return strings.TrimSpace(ec.SMTPHost) != "" &&
+		ec.SMTPPort >= 1 &&
+		ec.SMTPPort <= 65535 &&
+		strings.TrimSpace(ec.SMTPUsername) != "" &&
+		ec.SMTPPassword != "" &&
+		strings.TrimSpace(ec.FromEmail) != ""
 }
 
 // CanSendEmail 检查是否可以发送邮件
 func (ec *EmailConfig) CanSendEmail() bool {
-	return ec.EmailVerificationEnabled && ec.IsConfigured() && ec.IsActive
+	return ec.IsConfigured() && ec.IsActive
 }
 
 // EmailConfigCreateRequest 创建邮箱配置请求

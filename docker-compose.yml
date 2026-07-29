@@ -36,6 +36,10 @@ services:
     build:
       context: ./server
       dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION:-0.1.0}
+        COMMIT: ${COMMIT:-development}
+        BUILD_DATE: ${BUILD_DATE:-development}
     ports:
       - "8081:8081"
     environment:
@@ -50,8 +54,12 @@ services:
       - DB_USER=chronodesk
       - DB_PASSWORD=chronodesk_dev_only
       - DB_NAME=chronodesk
+      # 仅限隔离的 Compose 开发网络；共享/生产 PostgreSQL 必须使用 TLS。
+      - POSTGRES_ALLOW_INSECURE=true
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - REDIS_URL=redis://redis:6379
+      - REDIS_ALLOW_INSECURE=true
       - JWT_SECRET=your-super-secret-jwt-key-change-in-production
       - AGENT_JWT_SECRET=development-agent-jwt-secret-not-for-production-2026
       - AGENT_CREDENTIAL_PEPPER=development-agent-credential-pepper-not-for-production-2026
@@ -62,6 +70,16 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    volumes:
+      - attachment_data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
     healthcheck:
       test: ["CMD", "wget", "-q", "-T", "5", "-O", "/dev/null", "http://127.0.0.1:8081/healthz"]
       interval: 10s
@@ -83,10 +101,34 @@ services:
     depends_on:
       server:
         condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+      - /app/node_modules/.vite:rw,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=0700
+      - /app/node_modules/.vite-temp:rw,nosuid,nodev,size=32m,uid=1000,gid=1000,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
     restart: unless-stopped
 
 volumes:
   postgres_data:
     driver: local
   redis_data:
+    driver: local
+  attachment_data:
     driver: local

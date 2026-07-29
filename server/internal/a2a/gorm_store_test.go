@@ -26,7 +26,7 @@ func TestGormStorePersistsTaskGraphAndReplayLog(t *testing.T) {
 	}
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
-	store := NewGormStore(db)
+	store := NewGormStoreWithProtector(db, nil)
 	if err := store.AutoMigrate(); err != nil {
 		t.Fatalf("migrate A2A models: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestGormStorePersistsTaskGraphAndReplayLog(t *testing.T) {
 		t.Fatalf("expected completed task, got %s", task.Status.State)
 	}
 
-	reloadedStore := NewGormStore(db)
+	reloadedStore := NewGormStoreWithProtector(db, nil)
 	reloaded, err := reloadedStore.GetTask(context.Background(), task.ID)
 	if err != nil {
 		t.Fatalf("reload task: %v", err)
@@ -130,11 +130,11 @@ func TestGormExecutionClaimIsExclusiveAcrossServicesAndRenews(t *testing.T) {
 	}
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
-	storeOne := NewGormStore(db)
+	storeOne := NewGormStoreWithProtector(db, nil)
 	if err := storeOne.AutoMigrate(); err != nil {
 		t.Fatal(err)
 	}
-	storeTwo := NewGormStore(db)
+	storeTwo := NewGormStoreWithProtector(db, nil)
 
 	var executions atomic.Int32
 	var cancellations atomic.Int32
@@ -255,7 +255,7 @@ func TestGormExpiredExecutionClaimCanRecoverAfterCrash(t *testing.T) {
 	}
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
-	store := NewGormStore(db)
+	store := NewGormStoreWithProtector(db, nil)
 	if err := store.AutoMigrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +344,7 @@ func TestExpiredExecutionClaimCannotFenceTaskMutation(t *testing.T) {
 				}
 				sqlDB.SetMaxOpenConns(1)
 				t.Cleanup(func() { _ = sqlDB.Close() })
-				store := NewGormStore(db)
+				store := NewGormStoreWithProtector(db, nil)
 				if err := store.AutoMigrate(); err != nil {
 					t.Fatal(err)
 				}
@@ -424,7 +424,7 @@ func TestGormExecutionClaimUsesDatabaseClockForFencing(t *testing.T) {
 	}
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
-	store := NewGormStore(db)
+	store := NewGormStoreWithProtector(db, nil)
 	if err := store.AutoMigrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -493,11 +493,11 @@ func TestGormCancellationStopsRemoteExecutionRenewal(t *testing.T) {
 	}
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
-	storeOne := NewGormStore(db)
+	storeOne := NewGormStoreWithProtector(db, nil)
 	if err := storeOne.AutoMigrate(); err != nil {
 		t.Fatal(err)
 	}
-	storeTwo := NewGormStore(db)
+	storeTwo := NewGormStoreWithProtector(db, nil)
 	started := make(chan struct{})
 	canceled := make(chan struct{})
 	backend := BackendFuncs{
@@ -605,7 +605,7 @@ func TestGormPushEventsCarryCommittedTaskResourceVersion(t *testing.T) {
 	}
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
-	store := NewGormStore(db)
+	store := NewGormStoreWithProtector(db, nil)
 	if err := store.AutoMigrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -740,7 +740,7 @@ func TestGormTaskMutationRollsBackWithEventAndPushFailure(t *testing.T) {
 	}
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
-	store := NewGormStore(db)
+	store := NewGormStoreWithProtector(db, nil)
 	if err := store.AutoMigrate(); err != nil {
 		t.Fatalf("migrate A2A models: %v", err)
 	}

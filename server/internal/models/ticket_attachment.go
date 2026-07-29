@@ -39,7 +39,7 @@ type TicketAttachment struct {
 	CommentID *uint          `json:"comment_id,omitempty" gorm:"index"`
 	Comment   *TicketComment `json:"comment,omitempty" gorm:"foreignKey:CommentID"`
 
-	UploadedBy         uint              `json:"uploaded_by" gorm:"not null;index"`
+	UploadedBy         *uint             `json:"uploaded_by,omitempty" gorm:"index"`
 	Uploader           *User             `json:"uploader,omitempty" gorm:"foreignKey:UploadedBy"`
 	ActorType          ActorType         `json:"actor_type" gorm:"size:32;not null;default:'human';index"`
 	ActorID            string            `json:"actor_id" gorm:"size:128;index"`
@@ -89,10 +89,7 @@ func (TicketAttachment) TableName() string {
 }
 
 func (a *TicketAttachment) Actor() ActorRef {
-	if a.ActorType != "" && a.ActorID != "" {
-		return ActorRef{Type: a.ActorType, ID: a.ActorID}
-	}
-	return HumanActor(a.UploadedBy)
+	return ActorRef{Type: a.ActorType, ID: a.ActorID}
 }
 
 // TicketAttachmentResponse intentionally omits storage paths, provider URLs,
@@ -103,7 +100,7 @@ type TicketAttachmentResponse struct {
 	UpdatedAt          time.Time       `json:"updated_at"`
 	TicketID           uint            `json:"ticket_id"`
 	CommentID          *uint           `json:"comment_id,omitempty"`
-	UploadedBy         uint            `json:"uploaded_by"`
+	UploadedBy         *uint           `json:"uploaded_by,omitempty"`
 	ActorType          ActorType       `json:"actor_type"`
 	ActorID            string          `json:"actor_id"`
 	ServicePrincipalID *string         `json:"service_principal_id,omitempty"`

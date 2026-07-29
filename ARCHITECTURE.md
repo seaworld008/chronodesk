@@ -57,9 +57,11 @@ flowchart LR
 ├── server/
 │   ├── cmd/chronodesk/       # minimal executable entry
 │   ├── cmd/migrate/          # explicit schema/seed command
+│   ├── cmd/credential-maintain/ # validate, rotate, or quarantine credentials
 │   └── internal/
 │       ├── app/              # composition root and lifecycle
 │       ├── agentcontract/    # protocol-neutral scopes and machine contracts
+│       ├── eventcontract/    # canonical CloudEvent type catalog
 │       ├── services/         # domain/application rules
 │       ├── models/           # persistence records and Actor value types
 │       ├── handlers/         # human REST Adapters

@@ -216,17 +216,17 @@ func schedulerRedisInteger(value interface{}) (int64, error) {
 	case uint64:
 		const maxInt64 = uint64(1<<63 - 1)
 		if typed > maxInt64 {
-			return 0, errors.New("Redis integer overflows int64")
+			return 0, errors.New("redis integer overflows int64")
 		}
 		return int64(typed), nil
 	case float64:
 		if typed != float64(int64(typed)) {
-			return 0, errors.New("Redis number is not an integer")
+			return 0, errors.New("redis number is not an integer")
 		}
 		return int64(typed), nil
 	case string:
 		return strconv.ParseInt(typed, 10, 64)
 	default:
-		return 0, fmt.Errorf("unsupported Redis integer type %T", value)
+		return 0, fmt.Errorf("unsupported redis integer type %T", value)
 	}
 }

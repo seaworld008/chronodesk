@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 
 	"gorm.io/gorm"
@@ -29,7 +30,7 @@ const (
 	slaMonitorActorID              = "sla-monitor"
 	slaReservationTTL              = 5 * time.Minute
 	slaCompletedRetentionTTL       = 10 * 365 * 24 * time.Hour
-	SLABreachEventType             = "io.chronodesk.ticket.sla.breached.v1"
+	SLABreachEventType             = eventcontract.TicketSLABreachedEventType
 	SLAEscalationOutboxDestination = "sla_escalation"
 	slaEscalationDestinationID     = "breach"
 )
@@ -292,15 +293,6 @@ func (s *EscalationService) executeSLAEscalationSnapshot(
 	return errors.Join(executionErrors...)
 }
 
-// executeEscalationRule 执行升级规则
-func (s *EscalationService) executeEscalationRule(ctx context.Context, ticket *models.Ticket, rule *models.EscalationRule, overdueMinutes int64) error {
-	if ticket == nil {
-		return errors.New("ticket is required")
-	}
-	execution := legacySLAExecutionContext(ticket)
-	return s.executeEscalationRuleNative(ctx, ticket.ID, rule, overdueMinutes, execution)
-}
-
 func (s *EscalationService) executeEscalationRuleNative(
 	ctx context.Context,
 	ticketID uint,
@@ -326,24 +318,6 @@ func (s *EscalationService) executeEscalationRuleNative(
 	}
 }
 
-// escalateToManager 升级给管理员
-func (s *EscalationService) escalateToManager(ctx context.Context, ticket *models.Ticket, managerID *uint, overdueMinutes int64) error {
-	if ticket == nil {
-		return errors.New("ticket is required")
-	}
-	rule := &models.EscalationRule{
-		Action:       "escalate_to_manager",
-		TargetUserID: managerID,
-	}
-	return s.escalateToManagerNative(
-		ctx,
-		ticket.ID,
-		rule,
-		overdueMinutes,
-		legacySLAExecutionContext(ticket),
-	)
-}
-
 func (s *EscalationService) escalateToManagerNative(
 	ctx context.Context,
 	ticketID uint,
@@ -366,7 +340,7 @@ func (s *EscalationService) escalateToManagerNative(
 		execution,
 		ruleID,
 		"manager-update",
-		"io.chronodesk.ticket.escalated.v1",
+		eventcontract.TicketEscalatedEventType,
 		map[string]any{
 			"sla_rule_action":    rule.Action,
 			"sla_rule_threshold": rule.TriggerMinutes,
@@ -415,18 +389,6 @@ func (s *EscalationService) escalateToManagerNative(
 	)
 }
 
-// notifyAdmin 通知管理员
-func (s *EscalationService) notifyAdmin(ctx context.Context, ticket *models.Ticket, notifyUsers []uint, overdueMinutes int64) error {
-	if ticket == nil {
-		return errors.New("ticket is required")
-	}
-	rule := &models.EscalationRule{
-		Action:      "notify_admin",
-		NotifyUsers: append([]uint(nil), notifyUsers...),
-	}
-	return s.notifyAdminNative(ctx, ticket.ID, rule, legacySLAExecutionContext(ticket))
-}
-
 func (s *EscalationService) notifyAdminNative(
 	ctx context.Context,
 	ticketID uint,
@@ -445,15 +407,6 @@ func (s *EscalationService) notifyAdminNative(
 	)
 }
 
-// increasePriority 提升优先级
-func (s *EscalationService) increasePriority(ctx context.Context, ticket *models.Ticket) error {
-	if ticket == nil {
-		return errors.New("ticket is required")
-	}
-	rule := &models.EscalationRule{Action: "change_priority"}
-	return s.increasePriorityNative(ctx, ticket.ID, rule, legacySLAExecutionContext(ticket))
-}
-
 func (s *EscalationService) increasePriorityNative(
 	ctx context.Context,
 	ticketID uint,
@@ -467,7 +420,7 @@ func (s *EscalationService) increasePriorityNative(
 		execution,
 		ruleID,
 		"priority-update",
-		"io.chronodesk.ticket.updated.v1",
+		eventcontract.TicketUpdatedEventType,
 		map[string]any{
 			"sla_rule_action":    rule.Action,
 			"sla_rule_threshold": rule.TriggerMinutes,
@@ -582,15 +535,10 @@ func (s *EscalationService) executeSLAComment(
 	if err := s.db.WithContext(ctx).First(&current, ticketID).Error; err != nil {
 		return s.failSLAReservation(ctx, reservation.Record.ID, err)
 	}
-	compatibilityUserID := uint(0)
-	if s.agentNative.systemCompatibilityUserID == 0 {
-		compatibilityUserID = current.CreatedByID
-	}
 	_, err = s.agentNative.CreateComment(ctx, NativeCommentInput{
 		TicketID:                 ticketID,
 		ExpectedVersion:          current.Version,
 		Actor:                    models.SystemActor(slaMonitorActorID),
-		CompatibilityUserID:      compatibilityUserID,
 		SourceProtocol:           "scheduler",
 		Content:                  content,
 		ContentType:              "text",
@@ -715,28 +663,6 @@ func newSLAExecutionContext(
 		CorrelationID: occurrenceID,
 		CausationID:   "",
 	}, nil
-}
-
-func legacySLAExecutionContext(ticket *models.Ticket) *slaExecutionContext {
-	deadline := ""
-	if ticket != nil && ticket.SLADueDate != nil {
-		deadline = ticket.SLADueDate.UTC().Format(time.RFC3339Nano)
-	}
-	ticketID := uint(0)
-	if ticket != nil {
-		ticketID = ticket.ID
-	}
-	digest := stableSLAHash(map[string]any{
-		"ticket_id": ticketID,
-		"deadline":  deadline,
-	})
-	occurrenceID := fmt.Sprintf("sla:%d:%s", ticketID, digest[:24])
-	return &slaExecutionContext{
-		OccurrenceID:  occurrenceID,
-		TraceID:       occurrenceID,
-		CorrelationID: occurrenceID,
-		CausationID:   "",
-	}
 }
 
 func (s *EscalationService) markSLABreach(

@@ -11,6 +11,9 @@ ChronoDesk 只保留一个结构迁移入口：`cmd/migrate`。该命令基于�
 3. `DATABASE_URL`
 
 也可以通过 `-dsn` 显式传入连接字符串。生产环境应使用密钥管理系统注入连接信息，不要把凭据写入仓库或命令历史。
+非回环 PostgreSQL 必须使用不会降级为明文的 TLS 模式（`sslmode=require`、
+`verify-ca` 或 `verify-full`）。`POSTGRES_ALLOW_INSECURE=true` 只允许用于隔离的
+一次性开发网络，禁止在共享或生产环境设置。
 
 ## 常用命令
 
@@ -26,6 +29,9 @@ cd server && go run ./cmd/migrate -v
 # 显式初始化业务种子数据
 cd server && go run ./cmd/migrate -seed
 
+# 仅在开发环境显式增加演示账号与工单
+cd server && ENVIRONMENT=development go run ./cmd/migrate -seed -sample-data
+
 # 为高延迟云数据库提高总超时
 cd server && go run ./cmd/migrate -timeout 10m
 
@@ -38,8 +44,13 @@ cd server && go run ./cmd/migrate -timeout 10m -resume-from-model 15
 ```bash
 make -C server migrate
 make -C server migrate-seed
+make -C server migrate-sample
 make -C server migrate-verbose
 ```
+
+`-seed` 只初始化管理员与默认分类，并在一个事务内完成；任一步失败都会整体
+回滚。演示数据必须额外传入 `-sample-data`，且仅接受
+`ENVIRONMENT=development`。
 
 `-resume-from-model` 只用于一次迁移在模型扫描阶段因网络超时中断的情况。已完成的单模型迁移会独立提交；续跑仍会执行全部索引与 Schema 校验。
 
@@ -69,15 +80,28 @@ cd server && AUTO_MIGRATE=true go run ./cmd/chronodesk
 
 生产发布建议把迁移作为独立部署步骤，并在应用实例启动时保持 `AUTO_MIGRATE=false`，避免多个实例同时执行 DDL。
 
-## 凭据加密迁移
+## 事件契约迁移门禁
 
-数据库结构迁移不会自动改写历史明文凭据。凭据加密使用独立、显式的一次性命令：
+标准迁移会同步升级自动化规则和 Webhook 中保存的历史事件名称。该数据迁移与
+结构迁移使用同一事务边界，重复执行不会产生额外变化。已知旧名称会转换为当前
+完整 CloudEvent 类型，并在需要时补充状态筛选；未知名称、无法解析的 JSON 或
+无法映射为真实当前事件的历史 Webhook 日志会令迁移失败并完整回滚。
+
+发生这类失败时，应先备份并审查报错记录。不要直接改成宽泛事件或删除审计
+日志；确认业务语义后再进行一次性数据修复，然后重跑标准迁移。
+
+## 凭据存储维护
+
+数据库结构迁移不会改写凭据。ChronoDesk 只接受当前 `cdsec` 信封、bcrypt
+密码/备用码哈希和域分离 token 摘要；维护命令不会摄入历史明文。
 
 ```bash
-cd server && go run ./cmd/secret-migrate -validate-only
-cd server && go run ./cmd/secret-migrate
-cd server && go run ./cmd/secret-migrate -validate-only
+make credential-validate
+make credential-rotate
+make credential-validate
 ```
 
-先验证、再迁移、最后再次验证。详情见
+`credential-rotate` 只重新封装已认证的当前格式密文，遇到明文或畸形信封会
+回滚并失败。若验证发现不支持的密码哈希，执行
+`make credential-quarantine` 隔离账号，完成正常密码重置并审查后再重新启用。详情见
 [数据库静态加密](../reference/DATA_AT_REST_ENCRYPTION.md)。

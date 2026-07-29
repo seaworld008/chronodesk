@@ -48,7 +48,7 @@ func TestTaskOwnerIsolationAcrossStores(t *testing.T) {
 			}
 			sqlDB.SetMaxOpenConns(1)
 			t.Cleanup(func() { _ = sqlDB.Close() })
-			store := NewGormStore(db)
+			store := NewGormStoreWithProtector(db, nil)
 			if err := store.AutoMigrate(); err != nil {
 				t.Fatalf("migrate A2A models: %v", err)
 			}

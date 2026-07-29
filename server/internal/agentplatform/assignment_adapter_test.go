@@ -172,10 +172,6 @@ func TestMCPAndA2AAssignmentPersistIdenticalCanonicalValues(t *testing.T) {
 			name:     "active service principal",
 			assignee: models.ServicePrincipalActor(target.ID),
 		},
-		{
-			name:     "system clears compatibility fields",
-			assignee: models.SystemActor("scheduler"),
-		},
 	}
 	for index, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -243,10 +239,6 @@ func TestMCPAndA2AAssignmentPersistIdenticalCanonicalValues(t *testing.T) {
 			if mcpValues.ActorType != test.assignee.Type || mcpValues.ActorID != test.assignee.ID {
 				t.Fatalf("canonical actor was not persisted: %#v", mcpValues)
 			}
-			if test.assignee.Type == models.ActorTypeSystem &&
-				(mcpValues.CompatibilityUserID != nil || mcpValues.ServicePrincipalID != nil) {
-				t.Fatalf("system assignment retained compatibility values: %#v", mcpValues)
-			}
 		})
 	}
 }
@@ -260,8 +252,7 @@ func createAssignmentTargetPrincipal(
 	principal, err := fixture.service.CreateServicePrincipal(
 		context.Background(),
 		services.CreateServicePrincipalInput{
-			Name:                "assignment-target-" + suffix,
-			CompatibilityUserID: &fixture.user.ID,
+			Name: "assignment-target-" + suffix,
 		},
 	)
 	if err != nil {
@@ -293,17 +284,17 @@ func seedAssignmentLease(
 }
 
 type assignmentValues struct {
-	ActorType           models.ActorType
-	ActorID             string
-	CompatibilityUserID *uint
-	ServicePrincipalID  *string
+	ActorType          models.ActorType
+	ActorID            string
+	HumanUserID        *uint
+	ServicePrincipalID *string
 }
 
 func ticketAssignmentValues(ticket models.Ticket) assignmentValues {
 	return assignmentValues{
-		ActorType:           ticket.AssignedToActorType,
-		ActorID:             ticket.AssignedToActorID,
-		CompatibilityUserID: ticket.AssignedToID,
-		ServicePrincipalID:  ticket.AssignedToServicePrincipalID,
+		ActorType:          ticket.AssignedToActorType,
+		ActorID:            ticket.AssignedToActorID,
+		HumanUserID:        ticket.AssignedToID,
+		ServicePrincipalID: ticket.AssignedToServicePrincipalID,
 	}
 }

@@ -73,3 +73,38 @@ func TestEmailNotificationMessageRejectsHeaderInjection(t *testing.T) {
 		t.Fatal("expected injected subject to be rejected")
 	}
 }
+
+func TestEmailNotificationTemplatesUseCurrentBrand(t *testing.T) {
+	service := &EmailNotificationService{}
+	templates := []string{
+		service.getTicketAssignedHTMLTemplate(),
+		service.getTicketStatusChangedHTMLTemplate(),
+		service.getTicketCommentedHTMLTemplate(),
+		service.getTicketCreatedHTMLTemplate(),
+		service.getTicketOverdueHTMLTemplate(),
+		service.getSystemMaintenanceHTMLTemplate(),
+		service.getSystemAlertHTMLTemplate(),
+		service.getDefaultHTMLTemplate(),
+		service.getTicketAssignedTextTemplate(),
+		service.getTicketStatusChangedTextTemplate(),
+		service.getTicketCommentedTextTemplate(),
+		service.getTicketCreatedTextTemplate(),
+		service.getTicketOverdueTextTemplate(),
+		service.getSystemMaintenanceTextTemplate(),
+		service.getSystemAlertTextTemplate(),
+		service.getDefaultTextTemplate(),
+	}
+	for index, template := range templates {
+		if !strings.Contains(template, "ChronoDesk") {
+			t.Errorf("模板 %d 缺少 ChronoDesk 品牌", index)
+		}
+		for _, legacy := range []string{
+			"\u00a9 2024 \u5de5\u5355\u7cfb\u7edf",
+			"\n\u5de5\u5355\u7cfb\u7edf`",
+		} {
+			if strings.Contains(template, legacy) {
+				t.Errorf("模板 %d 仍包含旧品牌 %q", index, legacy)
+			}
+		}
+	}
+}

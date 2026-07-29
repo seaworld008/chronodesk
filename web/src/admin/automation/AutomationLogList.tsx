@@ -127,6 +127,7 @@ const AutomationLogList: React.FC = () => (
     <EnterpriseDatagrid
       tableId="automation.logs"
       columns={automationLogColumns}
+      aria-label="自动化日志列表"
       bulkActionButtons={false}
       rowClick={false}
     >

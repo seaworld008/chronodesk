@@ -34,6 +34,12 @@ func (r *GormUserRepository) Create(ctx context.Context, user *User) error {
 	if user == nil {
 		return ErrUserNotFound
 	}
+	if !user.Role.IsValid() {
+		return errors.New("invalid human role")
+	}
+	if !isValidUserStatus(user.Status) {
+		return ErrInvalidAccountState
+	}
 	if !user.OTPEnabled && (user.OTPSecret != "" || user.BackupCodes != "") {
 		return errors.New("disabled OTP cannot retain credentials")
 	}
@@ -43,7 +49,7 @@ func (r *GormUserRepository) Create(ctx context.Context, user *User) error {
 		Email:            user.Email,
 		PasswordHash:     user.PasswordHash,
 		Role:             models.UserRole(user.Role),
-		Status:           convertUserStatus(user.Status),
+		Status:           user.Status,
 		EmailVerified:    user.EmailVerified,
 		EmailVerifiedAt:  user.EmailVerifiedAt,
 		LastLoginAt:      user.LastLoginAt,
@@ -125,13 +131,19 @@ func (r *GormUserRepository) Update(ctx context.Context, user *User) error {
 	if user == nil || user.ID == 0 {
 		return ErrUserNotFound
 	}
+	if !user.Role.IsValid() {
+		return errors.New("invalid human role")
+	}
+	if !isValidUserStatus(user.Status) {
+		return ErrInvalidAccountState
+	}
 	// OTP凭据只允许通过专用方法写入，避免普通用户更新把已消费的备用码恢复。
 	updates := map[string]interface{}{
 		"username":          user.Username,
 		"email":             user.Email,
 		"password_hash":     user.PasswordHash,
 		"role":              models.UserRole(user.Role),
-		"status":            convertUserStatus(user.Status),
+		"status":            user.Status,
 		"email_verified":    user.EmailVerified,
 		"email_verified_at": user.EmailVerifiedAt,
 		"last_login_at":     user.LastLoginAt,
@@ -202,19 +214,66 @@ func (r *GormUserRepository) IncrementFailedLogin(ctx context.Context, userID ui
 	return r.db.WithContext(ctx).Model(&models.User{}).Where("id = ?", userID).UpdateColumn("login_attempts", gorm.Expr("login_attempts + ?", 1)).Error
 }
 
-// ResetFailedLogin 重置失败登录次数
+// ResetFailedLogin 重置失败登录次数，并清除已过期后成功登录的锁定时间。
 func (r *GormUserRepository) ResetFailedLogin(ctx context.Context, userID uint) error {
-	return r.db.WithContext(ctx).Model(&models.User{}).Where("id = ?", userID).Update("login_attempts", 0).Error
+	return r.db.WithContext(ctx).Model(&models.User{}).
+		Where("id = ?", userID).
+		Updates(map[string]interface{}{
+			"login_attempts": 0,
+			"locked_until": gorm.Expr(
+				"CASE WHEN locked_until <= ? THEN NULL ELSE locked_until END",
+				time.Now(),
+			),
+		}).Error
 }
 
-// LockUser 锁定用户
-func (r *GormUserRepository) LockUser(ctx context.Context, userID uint, until time.Time) error {
-	return r.db.WithContext(ctx).Model(&models.User{}).Where("id = ?", userID).Update("locked_until", until).Error
-}
-
-// UnlockUser 解锁用户
-func (r *GormUserRepository) UnlockUser(ctx context.Context, userID uint) error {
-	return r.db.WithContext(ctx).Model(&models.User{}).Where("id = ?", userID).Update("locked_until", nil).Error
+// ChangePasswordAndRevokeSessions atomically changes the password and
+// invalidates every active human session. A failure in any statement rolls the
+// password update back, so callers never observe a new password with old
+// sessions still usable.
+func (r *GormUserRepository) ChangePasswordAndRevokeSessions(
+	ctx context.Context,
+	userID uint,
+	passwordHash string,
+	changedAt time.Time,
+) error {
+	if userID == 0 {
+		return ErrUserNotFound
+	}
+	if strings.TrimSpace(passwordHash) == "" || changedAt.IsZero() {
+		return errors.New("password hash and change time are required")
+	}
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&models.User{}).
+			Where("id = ?", userID).
+			Updates(map[string]interface{}{
+				"password_hash":     passwordHash,
+				"password_reset_at": &changedAt,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrUserNotFound
+		}
+		if err := tx.Model(&RefreshToken{}).
+			Where("user_id = ? AND revoked = ?", userID, false).
+			Updates(map[string]interface{}{
+				"revoked":    true,
+				"revoked_at": &changedAt,
+			}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&models.LoginHistory{}).
+			Where("user_id = ? AND is_active = ?", userID, true).
+			Updates(map[string]interface{}{
+				"is_active":        false,
+				"logout_time":      changedAt,
+				"last_activity_at": changedAt,
+				"login_status":     models.LoginStatusExpired,
+				"failure_reason":   "password_changed",
+			}).Error
+	})
 }
 
 func (r *GormUserRepository) ConfigureOTP(
@@ -342,24 +401,23 @@ func (r *GormUserRepository) ConsumeBackupCode(
 	return false, nil
 }
 
-// 辅助函数：转换用户状态
-func convertUserStatus(status UserStatus) models.UserStatus {
+func isValidUserStatus(status UserStatus) bool {
 	switch status {
-	case StatusActive:
-		return models.UserStatusActive
-	case StatusInactive:
-		return models.UserStatusInactive
-	case StatusLocked:
-		return models.UserStatusSuspended
-	case StatusSuspended:
-		return models.UserStatusSuspended
+	case StatusActive, StatusInactive, StatusSuspended, StatusDeleted:
+		return true
 	default:
-		return models.UserStatusInactive
+		return false
 	}
 }
 
 // 辅助函数：转换为认证用户模型
 func (r *GormUserRepository) convertToAuthUser(modelUser *models.User) (*User, error) {
+	if modelUser == nil {
+		return nil, ErrUserNotFound
+	}
+	if !isValidUserStatus(modelUser.Status) {
+		return nil, ErrInvalidAccountState
+	}
 	otpSecret, err := security.RevealOptional(
 		r.protector,
 		modelUser.TwoFactorSecret,
@@ -377,7 +435,7 @@ func (r *GormUserRepository) convertToAuthUser(modelUser *models.User) (*User, e
 		Email:             modelUser.Email,
 		PasswordHash:      modelUser.PasswordHash,
 		Role:              UserRole(modelUser.Role),
-		Status:            convertFromUserStatus(modelUser.Status),
+		Status:            modelUser.Status,
 		EmailVerified:     modelUser.EmailVerified,
 		EmailVerifiedAt:   modelUser.EmailVerifiedAt,
 		LastLoginAt:       modelUser.LastLoginAt,
@@ -390,22 +448,6 @@ func (r *GormUserRepository) convertToAuthUser(modelUser *models.User) (*User, e
 		CreatedAt:         modelUser.CreatedAt,
 		UpdatedAt:         modelUser.UpdatedAt,
 	}, nil
-}
-
-// 辅助函数：从models.UserStatus转换
-func convertFromUserStatus(status models.UserStatus) UserStatus {
-	switch status {
-	case models.UserStatusActive:
-		return StatusActive
-	case models.UserStatusInactive:
-		return StatusInactive
-	case models.UserStatusSuspended:
-		return StatusSuspended
-	case models.UserStatusDeleted:
-		return StatusSuspended
-	default:
-		return StatusInactive
-	}
 }
 
 // GormTokenRepository GORM令牌仓库实现
@@ -454,6 +496,37 @@ func (r *GormTokenRepository) GetRefreshToken(ctx context.Context, token string)
 	return &refreshToken, nil
 }
 
+const refreshRotationReplayWindow = 30 * time.Second
+
+func (r *GormTokenRepository) GetRefreshTokenForRotation(
+	ctx context.Context,
+	token string,
+) (*RefreshToken, error) {
+	var refreshToken RefreshToken
+	now := time.Now().UTC()
+	if err := r.db.WithContext(ctx).
+		Where(
+			`token = ? AND expires_at > ? AND (
+				revoked = ? OR (
+					revoked = ? AND rotated_at IS NOT NULL AND rotated_at > ?
+					AND replaced_by_token <> ''
+				)
+			)`,
+			bearerTokenDigest("refresh-token", token),
+			now,
+			false,
+			true,
+			now.Add(-refreshRotationReplayWindow),
+		).
+		First(&refreshToken).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrInvalidToken
+		}
+		return nil, err
+	}
+	return &refreshToken, nil
+}
+
 // RevokeRefreshToken 撤销刷新令牌
 func (r *GormTokenRepository) RevokeRefreshToken(ctx context.Context, token string) error {
 	now := time.Now()
@@ -481,37 +554,48 @@ func (r *GormTokenRepository) RotateRefreshToken(
 	ctx context.Context,
 	currentToken string,
 	replacement *RefreshToken,
+	rotatedAt time.Time,
 ) error {
 	if strings.TrimSpace(currentToken) == "" ||
 		replacement == nil ||
 		strings.TrimSpace(replacement.Token) == "" ||
 		replacement.UserID == 0 ||
-		strings.TrimSpace(replacement.SessionID) == "" {
+		strings.TrimSpace(replacement.SessionID) == "" ||
+		rotatedAt.IsZero() {
 		return ErrInvalidToken
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	storedReplacement := *replacement
 	storedReplacement.ID = 0
 	storedReplacement.Token = bearerTokenDigest("refresh-token", replacement.Token)
-	now := time.Now()
+	rotatedAt = rotatedAt.UTC().Truncate(time.Second)
+	storedReplacement.CreatedAt = rotatedAt
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&RefreshToken{}).
 			Where(
 				"token = ? AND revoked = ? AND expires_at > ? AND user_id = ? AND session_id = ?",
 				bearerTokenDigest("refresh-token", currentToken),
 				false,
-				now,
+				rotatedAt,
 				replacement.UserID,
 				replacement.SessionID,
 			).
 			Updates(map[string]interface{}{
-				"revoked":    true,
-				"revoked_at": &now,
+				"revoked":           true,
+				"revoked_at":        &rotatedAt,
+				"rotated_at":        &rotatedAt,
+				"replaced_by_token": storedReplacement.Token,
 			})
 		if result.Error != nil {
 			return result.Error
 		}
 		if result.RowsAffected != 1 {
 			return ErrInvalidToken
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		return tx.Create(&storedReplacement).Error
 	})
@@ -658,8 +742,9 @@ func (r *GormTokenRepository) UseEmailVerification(ctx context.Context, token st
 			now,
 		).
 		Updates(map[string]interface{}{
-			"used":    true,
-			"used_at": &now,
+			"used":            true,
+			"used_at":         &now,
+			"delivery_secret": "",
 		})
 	if result.Error != nil {
 		return result.Error
@@ -698,8 +783,9 @@ func (r *GormTokenRepository) VerifyEmailWithToken(
 				verifiedAt,
 			).
 			Updates(map[string]interface{}{
-				"used":    true,
-				"used_at": &verifiedAt,
+				"used":            true,
+				"used_at":         &verifiedAt,
+				"delivery_secret": "",
 			})
 		if result.Error != nil {
 			return result.Error
@@ -768,8 +854,9 @@ func (r *GormTokenRepository) UsePasswordReset(ctx context.Context, token string
 			now,
 		).
 		Updates(map[string]interface{}{
-			"used":    true,
-			"used_at": &now,
+			"used":            true,
+			"used_at":         &now,
+			"delivery_secret": "",
 		})
 	if result.Error != nil {
 		return result.Error
@@ -811,8 +898,9 @@ func (r *GormTokenRepository) ResetPasswordWithToken(
 				changedAt,
 			).
 			Updates(map[string]interface{}{
-				"used":    true,
-				"used_at": &changedAt,
+				"used":            true,
+				"used_at":         &changedAt,
+				"delivery_secret": "",
 			})
 		if result.Error != nil {
 			return result.Error

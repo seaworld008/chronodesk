@@ -2,10 +2,13 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"testing"
+	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
 )
@@ -24,7 +27,7 @@ func setupAutomationServiceTestDB(t *testing.T) *gorm.DB {
 			Name:         "高优先级分配",
 			Description:  "创建后自动分配高优先级工单",
 			RuleType:     "assignment",
-			TriggerEvent: "ticket.created",
+			TriggerEvent: eventcontract.TicketCreatedEventType,
 			IsActive:     true,
 			Priority:     1,
 		},
@@ -32,7 +35,7 @@ func setupAutomationServiceTestDB(t *testing.T) *gorm.DB {
 			Name:         "SLA 升级",
 			Description:  "检查工单超时触发升级",
 			RuleType:     "sla",
-			TriggerEvent: "scheduled_check",
+			TriggerEvent: eventcontract.AutomationScheduledCheckEventType,
 			IsActive:     true,
 			Priority:     2,
 		},
@@ -40,7 +43,7 @@ func setupAutomationServiceTestDB(t *testing.T) *gorm.DB {
 			Name:         "关闭提醒",
 			Description:  "关闭后发送提醒",
 			RuleType:     "notification",
-			TriggerEvent: "ticket.closed",
+			TriggerEvent: eventcontract.TicketTransitionedEventType,
 			IsActive:     false,
 			Priority:     3,
 		},
@@ -86,7 +89,7 @@ func TestCreateAutomationRuleDefaultsToInactive(t *testing.T) {
 		&models.AutomationRuleRequest{
 			Name:         "safe inactive rule",
 			RuleType:     "assignment",
-			TriggerEvent: "ticket.created",
+			TriggerEvent: eventcontract.TicketCreatedEventType,
 		},
 		user.ID,
 	)
@@ -98,58 +101,151 @@ func TestCreateAutomationRuleDefaultsToInactive(t *testing.T) {
 	}
 }
 
-func TestAutomationAssignmentUsesTicketAssigneeColumn(t *testing.T) {
+func TestDeleteAutomationRuleRetainsExecutionAuditLog(t *testing.T) {
 	db := openTestDB(t)
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.Ticket{},
-		&models.TicketHistory{},
-		&models.DomainEvent{},
-		&models.OutboxDelivery{},
-		&models.IdempotencyRecord{},
+		&models.AutomationRule{},
+		&models.AutomationLog{},
 	); err != nil {
-		t.Fatalf("failed to migrate schemas: %v", err)
+		t.Fatalf("migrate automation audit schemas: %v", err)
+	}
+	user := models.User{
+		Username: "automation-delete-author", Email: "automation-delete@example.com",
+		PasswordHash: "hashed", Role: models.RoleAdmin, Status: models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	ticket := models.Ticket{
+		TicketNumber: "AUTOMATION-DELETE-1",
+		Title:        "Retain automation audit",
+		Description:  "Retain automation audit",
+		Type:         models.TicketTypeRequest,
+		Priority:     models.TicketPriorityNormal,
+		Status:       models.TicketStatusOpen,
+		Source:       models.TicketSourceWeb,
+		CreatedByID:  &user.ID,
+		Version:      1,
+	}
+	if err := db.Create(&ticket).Error; err != nil {
+		t.Fatal(err)
+	}
+	rule := models.AutomationRule{
+		Name:         "soft delete rule",
+		RuleType:     "assignment",
+		TriggerEvent: eventcontract.TicketCreatedEventType,
+		CreatedBy:    user.ID,
+	}
+	if err := db.Create(&rule).Error; err != nil {
+		t.Fatal(err)
+	}
+	execution := models.AutomationLog{
+		RuleID:       rule.ID,
+		TicketID:     ticket.ID,
+		TriggerEvent: rule.TriggerEvent,
+		ExecutedAt:   time.Now(),
+		Success:      true,
+	}
+	if err := db.Create(&execution).Error; err != nil {
+		t.Fatal(err)
 	}
 
+	if err := NewAutomationService(db).DeleteRule(context.Background(), rule.ID); err != nil {
+		t.Fatalf("DeleteRule() error = %v", err)
+	}
+	var visibleRules int64
+	if err := db.Model(&models.AutomationRule{}).
+		Where("id = ?", rule.ID).
+		Count(&visibleRules).Error; err != nil {
+		t.Fatal(err)
+	}
+	if visibleRules != 0 {
+		t.Fatalf("deleted rule remains visible: count=%d", visibleRules)
+	}
+	var deletedRule models.AutomationRule
+	if err := db.Unscoped().First(&deletedRule, rule.ID).Error; err != nil {
+		t.Fatalf("deleted rule audit anchor is missing: %v", err)
+	}
+	if !deletedRule.DeletedAt.Valid {
+		t.Fatal("rule deletion did not retain a soft-deleted audit anchor")
+	}
+	var logCount int64
+	if err := db.Model(&models.AutomationLog{}).
+		Where("id = ? AND rule_id = ?", execution.ID, rule.ID).
+		Count(&logCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if logCount != 1 {
+		t.Fatalf("rule deletion retained %d audit logs, want 1", logCount)
+	}
+}
+
+func TestAutomationRuleWritesRequireCurrentCloudEventTypes(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.User{}, &models.AutomationRule{}); err != nil {
+		t.Fatal(err)
+	}
 	user := models.User{
-		Username:     "automation-assignee",
-		Email:        "automation-assignee@example.com",
+		Username:     "automation-contract-author",
+		Email:        "automation-contract-author@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAgent,
+		Role:         models.RoleAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
-		t.Fatalf("failed to create user: %v", err)
+		t.Fatal(err)
 	}
-	ticket := models.Ticket{
-		TicketNumber: "AUTO-001",
-		Title:        "Automation assignment",
-		Description:  "desc",
-		Status:       models.TicketStatusOpen,
-		Priority:     models.TicketPriorityNormal,
-		Type:         models.TicketTypeRequest,
-		Source:       models.TicketSourceWeb,
-		CreatedByID:  user.ID,
-	}
-	if err := db.Create(&ticket).Error; err != nil {
-		t.Fatalf("failed to create ticket: %v", err)
+	service := NewAutomationService(db)
+
+	if _, err := service.CreateRule(
+		context.Background(),
+		&models.AutomationRuleRequest{
+			Name:         "legacy trigger",
+			RuleType:     "assignment",
+			TriggerEvent: "ticket.created",
+		},
+		user.ID,
+	); !errors.Is(err, ErrInvalidAutomationTriggerType) {
+		t.Fatalf("legacy create error = %v, want invalid trigger type", err)
 	}
 
-	svc := NewAutomationService(db)
-	action := &models.RuleAction{
-		Type:   "assign",
-		Params: map[string]interface{}{"user_id": float64(user.ID)},
+	rule, err := service.CreateRule(
+		context.Background(),
+		&models.AutomationRuleRequest{
+			Name:         "current trigger",
+			RuleType:     "assignment",
+			TriggerEvent: eventcontract.TicketCreatedEventType,
+		},
+		user.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := svc.executeAssignAction(context.Background(), action, &ticket); err != nil {
-		t.Fatalf("executeAssignAction returned error: %v", err)
+	if err := service.UpdateRule(
+		context.Background(),
+		rule.ID,
+		&models.AutomationRuleRequest{
+			Name:         rule.Name,
+			RuleType:     rule.RuleType,
+			TriggerEvent: "ticket.updated",
+		},
+		user.ID,
+	); !errors.Is(err, ErrInvalidAutomationTriggerType) {
+		t.Fatalf("legacy update error = %v, want invalid trigger type", err)
 	}
-
-	var updated models.Ticket
-	if err := db.First(&updated, ticket.ID).Error; err != nil {
-		t.Fatalf("failed to reload ticket: %v", err)
-	}
-	if updated.AssignedToID == nil || *updated.AssignedToID != user.ID {
-		t.Fatalf("expected assigned_to_id=%d, got %v", user.ID, updated.AssignedToID)
+	if err := service.UpdateRule(
+		context.Background(),
+		rule.ID,
+		&models.AutomationRuleRequest{
+			Name:         rule.Name,
+			RuleType:     rule.RuleType,
+			TriggerEvent: eventcontract.TicketUpdatedEventType,
+		},
+		user.ID,
+	); err != nil {
+		t.Fatalf("current update failed: %v", err)
 	}
 }
 
@@ -205,7 +301,7 @@ func TestClassifyTicketPersistsCanonicalType(t *testing.T) {
 		Priority:     models.TicketPriorityNormal,
 		Type:         models.TicketTypeRequest,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  user.ID,
+		CreatedByID:  &user.ID,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatalf("failed to create ticket: %v", err)
@@ -257,12 +353,20 @@ func TestAutomationServiceGetRulesFilters(t *testing.T) {
 	}
 
 	// filter by trigger event
-	rules, total, err = svc.GetRules(ctx, "", "scheduled_check", nil, "", 1, 10)
+	rules, total, err = svc.GetRules(
+		ctx,
+		"",
+		eventcontract.AutomationScheduledCheckEventType,
+		nil,
+		"",
+		1,
+		10,
+	)
 	if err != nil {
 		t.Fatalf("GetRules returned error: %v", err)
 	}
 	if total != 1 || len(rules) != 1 {
-		t.Fatalf("expected 1 scheduled_check rule, got total=%d len=%d", total, len(rules))
+		t.Fatalf("expected 1 scheduled CloudEvent rule, got total=%d len=%d", total, len(rules))
 	}
 
 	// filter by active flag

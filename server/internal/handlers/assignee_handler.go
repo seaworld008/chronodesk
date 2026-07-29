@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -78,6 +79,7 @@ func (h *AssigneeHandler) List(c *gin.Context) {
 
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
+		logHandlerFailure(c, "assignee.count", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 1, "msg": "统计处理人数量失败"})
 		return
 	}
@@ -90,6 +92,7 @@ func (h *AssigneeHandler) List(c *gin.Context) {
 		Limit(pageSize).
 		Offset((page - 1) * pageSize).
 		Find(&users).Error; err != nil {
+		logHandlerFailure(c, "assignee.list", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 1, "msg": "获取处理人列表失败"})
 		return
 	}
@@ -118,10 +121,11 @@ func (h *AssigneeHandler) Get(c *gin.Context) {
 
 	var user models.User
 	if err := h.assignableQuery(c).First(&user, id).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"code": 1, "msg": "未找到可分配的处理人"})
 			return
 		}
+		logHandlerFailure(c, "assignee.get", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 1, "msg": "获取处理人失败"})
 		return
 	}
@@ -136,7 +140,6 @@ func (h *AssigneeHandler) assignableQuery(c *gin.Context) *gorm.DB {
 			models.RoleAgent,
 			models.RoleSupervisor,
 			models.RoleAdmin,
-			models.RoleSuperUser,
 		})
 }
 
@@ -155,8 +158,7 @@ func canAssignTickets(role string) bool {
 	switch strings.ToLower(strings.TrimSpace(role)) {
 	case string(models.RoleAgent),
 		string(models.RoleSupervisor),
-		string(models.RoleAdmin),
-		string(models.RoleSuperUser):
+		string(models.RoleAdmin):
 		return true
 	default:
 		return false

@@ -33,31 +33,40 @@ CHRONODESK_DATA_ENCRYPTION_KEYS='{"dek-2026-07":"<32-byte-base64-key>"}'
 
 如果专用 keyring 只配置了一半或格式错误，系统立即失败，不会回退到派生 key。派生路径同样要求 Pepper 至少 32 字节；缺失或过短时启动失败。
 
-## 首次迁移
+## 当前格式验证
 
-运行数据库结构迁移后，先备份数据库，再显式执行：
+运行数据库结构迁移后，显式执行只读验证：
 
 ```bash
 cd server
-go run ./cmd/secret-migrate
-go run ./cmd/secret-migrate -validate-only
+go run ./cmd/credential-maintain -validate-only
 ```
 
-同一命令会在一个外层事务中迁移长期数据库凭据与认证凭据，并在完成后同时执行
-`security.ValidateDatabaseSecrets` 和 `auth.ValidateAuthCredentialStorage`。
-正常服务启动只执行这两类验证，不会自动接受或迁移旧明文：发现明文、旧
-SHA-256 密码哈希、密文篡改、错误 AAD、缺失 key ID 或错误密钥时会立即失败。
-旧 SHA-256 密码不可安全反推，必须由管理员先重置为 bcrypt。
+命令和正常服务启动都会执行 `security.ValidateDatabaseSecrets` 与
+`auth.ValidateAuthCredentialStorage`。系统不会自动接受或转换明文：发现
+明文、不支持的密码哈希、密文篡改、错误 AAD、缺失 key ID 或错误密钥时立即
+失败。部署前必须从可信备份恢复当前格式，或撤销并重新签发相关凭据。
+
+不支持的密码哈希不可安全反推，可由管理员显式执行：
+
+```bash
+go run ./cmd/credential-maintain -quarantine
+```
+
+该操作用随机 bcrypt 材料替换不可验证的哈希、撤销会话并暂停活跃账号；管理员
+必须完成正常密码重置，并在审查后显式重新启用账号。
 
 ## 轮换
 
 1. 生成新的 32 字节随机密钥并加入 keyring；
 2. 将新的 key ID 设为 primary，旧 key 暂时保留；
-3. 执行 `go run ./cmd/secret-migrate`，将旧密文重新封装为新 key；
-4. 执行 `-validate-only` 并重启所有实例；
+3. 执行 `go run ./cmd/credential-maintain -rotate`，将已认证的当前格式密文
+   重新封装为新 key；
+4. 执行 `go run ./cmd/credential-maintain -validate-only` 并重启所有实例；
 5. 确认所有实例均已加载新配置后再移除旧 key。
 
-迁移日志只包含加密、轮换和验证的记录数量，不输出任何凭据或密文。
+轮换事务遇到明文或畸形信封会完整回滚。维护日志只包含轮换和验证数量，不输出
+任何凭据或密文。
 
 ## Webhook 与 Push 投递
 

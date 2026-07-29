@@ -101,7 +101,7 @@ func TestGormPushStoreRejectsLegacyPlaintext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := NewGormStore(db)
+	store := NewGormStoreWithProtector(db, nil)
 	if err := store.AutoMigrate(); err != nil {
 		t.Fatal(err)
 	}

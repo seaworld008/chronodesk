@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"github.com/seaworld008/chronodesk/server/internal/security"
@@ -40,8 +41,6 @@ type NotificationServiceInterface interface {
 	UpdateNotificationPreferences(ctx context.Context, userID uint, preferences []models.NotificationPreference) error
 
 	// 邮件通知相关方法
-	ProcessPendingEmailNotifications(ctx context.Context) error
-	RetryFailedEmailNotifications(ctx context.Context) error
 	SetEmailNotificationService(emailService EmailNotificationServiceInterface)
 }
 
@@ -149,7 +148,9 @@ func TicketStatusNotificationOutboxTargets(
 	if ticket.AssignedToID != nil {
 		add(*ticket.AssignedToID)
 	}
-	add(ticket.CreatedByID)
+	if ticket.CreatedByID != nil {
+		add(*ticket.CreatedByID)
+	}
 
 	targets := make([]OutboxTarget, 0, len(recipients))
 	for _, recipientID := range recipients {
@@ -174,12 +175,6 @@ func newTicketNotificationOutboxTarget(
 		),
 		MaxAttempts: notificationOutboxMaxAttempts,
 	}
-}
-
-// NewNotificationService 创建通知服务实例
-func NewNotificationService(db *gorm.DB) *NotificationService {
-	protector, _ := security.LoadDeploymentKeyringFromEnvironment()
-	return NewNotificationServiceWithProtector(db, protector)
 }
 
 // NewNotificationServiceWithProtector injects the at-rest encryption keyring.
@@ -215,15 +210,16 @@ func (ns *NotificationService) SetEmailNotificationService(emailService EmailNot
 
 // NotificationEvent 通知事件
 type NotificationEvent struct {
-	Type         models.WebhookEventType `json:"type"`
-	ResourceID   uint                    `json:"resource_id"`
-	ResourceType string                  `json:"resource_type"`
-	Title        string                  `json:"title"`
-	Description  string                  `json:"description"`
-	Data         map[string]interface{}  `json:"data"`
-	Metadata     map[string]string       `json:"metadata"`
-	Timestamp    time.Time               `json:"timestamp"`
-	UserID       *uint                   `json:"user_id,omitempty"`
+	Type             models.WebhookEventType `json:"type"`
+	TransitionStatus models.TicketStatus     `json:"transition_status,omitempty"`
+	ResourceID       uint                    `json:"resource_id"`
+	ResourceType     string                  `json:"resource_type"`
+	Title            string                  `json:"title"`
+	Description      string                  `json:"description"`
+	Data             map[string]interface{}  `json:"data"`
+	Metadata         map[string]string       `json:"metadata"`
+	Timestamp        time.Time               `json:"timestamp"`
+	UserID           *uint                   `json:"user_id,omitempty"`
 }
 
 // DeleteNotification 删除通知
@@ -255,6 +251,7 @@ func getRuntimeEnvironment() string {
 func (ns *NotificationService) getActiveWebhooks(
 	ctx context.Context,
 	eventType models.WebhookEventType,
+	transitionStatus models.TicketStatus,
 ) ([]*models.WebhookConfig, error) {
 	var configs []*models.WebhookConfig
 
@@ -267,12 +264,13 @@ func (ns *NotificationService) getActiveWebhooks(
 	// 过滤支持该事件类型的配置
 	var filtered []*models.WebhookConfig
 	for _, config := range configs {
+		if !config.MatchesEvent(eventType, transitionStatus) {
+			continue
+		}
 		if err := ns.revealWebhookSecrets(config); err != nil {
 			return nil, fmt.Errorf("无法读取webhook凭据: %w", err)
 		}
-		if config.IsEventEnabled(eventType) {
-			filtered = append(filtered, config)
-		}
+		filtered = append(filtered, config)
 	}
 
 	return filtered, nil
@@ -290,8 +288,9 @@ type WebhookOutboxTarget struct {
 func (ns *NotificationService) ListWebhookOutboxTargets(
 	ctx context.Context,
 	eventType models.WebhookEventType,
+	transitionStatus models.TicketStatus,
 ) ([]WebhookOutboxTarget, error) {
-	configs, err := ns.getActiveWebhooks(ctx, eventType)
+	configs, err := ns.getActiveWebhooks(ctx, eventType, transitionStatus)
 	if err != nil {
 		return nil, err
 	}
@@ -337,7 +336,7 @@ func (ns *NotificationService) SendWebhookOutboxAttempt(
 	if err := ns.revealWebhookSecrets(&config); err != nil {
 		return fmt.Errorf("无法读取webhook凭据: %w", err)
 	}
-	if !config.IsEventEnabled(event.Type) {
+	if !config.MatchesEvent(event.Type, event.TransitionStatus) {
 		return nil
 	}
 	timeout := ns.outboxWebhookTimeout
@@ -513,7 +512,7 @@ func (ns *NotificationService) renderTemplate(template string, event *Notificati
 		"{{title}}":       event.Title,
 		"{{description}}": event.Description,
 		"{{type}}":        string(event.Type),
-		"{{resource_id}}": strconv.Itoa(int(event.ResourceID)),
+		"{{resource_id}}": strconv.FormatUint(uint64(event.ResourceID), 10),
 		"{{timestamp}}":   event.Timestamp.Format("2006-01-02 15:04:05"),
 	}
 
@@ -552,11 +551,16 @@ func (ns *NotificationService) getWeChatMessage(event *NotificationEvent) string
 		statusEmoji = "🎫"
 	case models.WebhookEventTicketAssigned:
 		statusEmoji = "👤"
-	case models.WebhookEventTicketResolved:
-		statusEmoji = "✅"
-	case models.WebhookEventTicketClosed:
-		statusEmoji = "🔒"
-	case models.WebhookEventSystemAlert:
+	case models.WebhookEventTicketTransitioned:
+		switch event.TransitionStatus {
+		case models.TicketStatusResolved:
+			statusEmoji = "✅"
+		case models.TicketStatusClosed:
+			statusEmoji = "🔒"
+		default:
+			statusEmoji = "🔄"
+		}
+	case models.WebhookEventTicketSLABreached, models.WebhookEventSystemAlert:
 		statusEmoji = "⚠️"
 	default:
 		statusEmoji = "📋"
@@ -633,6 +637,12 @@ func (ns *NotificationService) buildRequestBodyForEvent(
 		}
 		if event != nil {
 			payload["timestamp"] = event.Timestamp.UTC().Unix()
+			payload["event_type"] = event.Type
+			payload["resource_id"] = event.ResourceID
+			payload["resource_type"] = event.ResourceType
+			if event.TransitionStatus != "" {
+				payload["transition_status"] = event.TransitionStatus
+			}
 			if eventID := strings.TrimSpace(event.Metadata["event_id"]); eventID != "" {
 				payload["event_id"] = eventID
 			}
@@ -659,7 +669,7 @@ func (ns *NotificationService) buildDingTalkBody(message string) ([]byte, error)
 	return json.Marshal(map[string]interface{}{
 		"msgtype": "markdown",
 		"markdown": map[string]interface{}{
-			"title": "工单系统通知",
+			"title": "ChronoDesk 通知",
 			"text":  message,
 		},
 	})
@@ -678,7 +688,7 @@ func (ns *NotificationService) buildLarkBody(message string) ([]byte, error) {
 // setRequestHeaders 设置请求头
 func (ns *NotificationService) setRequestHeaders(req *http.Request, config *models.WebhookConfig, body []byte) {
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "TicketSystem-Webhook/1.0")
+	req.Header.Set("User-Agent", "ChronoDesk-Webhook/1.0")
 	if config.AccessToken != "" && !strings.ContainsAny(config.AccessToken, "\r\n") {
 		req.Header.Set("Authorization", "Bearer "+config.AccessToken)
 	}
@@ -702,7 +712,7 @@ func (ns *NotificationService) setRequestHeaders(req *http.Request, config *mode
 		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 		sign := ns.generateLarkSign(timestamp, config.Secret)
 		req.Header.Set("X-Lark-Request-Timestamp", timestamp)
-		req.Header.Set("X-Lark-Request-Nonce", "ticket-system")
+		req.Header.Set("X-Lark-Request-Nonce", "chronodesk")
 		req.Header.Set("X-Lark-Signature", sign)
 	}
 }
@@ -791,7 +801,7 @@ func (ns *NotificationService) generateDingTalkSign(timestamp int64, secret stri
 
 // generateLarkSign 生成飞书签名
 func (ns *NotificationService) generateLarkSign(timestamp, secret string) string {
-	stringToSign := timestamp + "\n" + "ticket-system" + "\n" + secret
+	stringToSign := timestamp + "\n" + "chronodesk" + "\n" + secret
 	h := hmac.New(sha256.New, []byte(stringToSign))
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
@@ -890,6 +900,9 @@ func (ns *NotificationService) revealWebhookSecrets(config *models.WebhookConfig
 
 // CreateNotification 创建通知
 func (ns *NotificationService) CreateNotification(ctx context.Context, req *models.NotificationCreateRequest) (*models.Notification, error) {
+	if req == nil {
+		return nil, errors.New("通知请求不能为空")
+	}
 	notification := &models.Notification{
 		Type:            req.Type,
 		Title:           req.Title,
@@ -922,20 +935,36 @@ func (ns *NotificationService) CreateNotification(ctx context.Context, req *mode
 		}
 	}
 
-	if err := ns.db.Create(notification).Error; err != nil {
+	err := ns.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(notification).Error; err != nil {
+			return err
+		}
+		if notification.Channel != models.NotificationChannelEmail {
+			return nil
+		}
+		availableAt := time.Time{}
+		if notification.ScheduledAt != nil {
+			availableAt = *notification.ScheduledAt
+		}
+		_, err := AppendEmailOutboxTx(ctx, tx, EmailOutboxEventInput{
+			ID:      NotificationEmailEventID(notification.ID),
+			Source:  "urn:chronodesk:notifications",
+			Type:    eventcontract.NotificationEmailRequestedEventType,
+			Subject: fmt.Sprintf("notification/%d", notification.ID),
+			Actor:   models.SystemActor("notification-service"),
+			Data: EmailIntentReference{
+				UserID:           notification.RecipientID,
+				NotificationID:   notification.ID,
+				NotificationType: string(notification.Type),
+			},
+			DestinationID: NotificationEmailDestinationPrefix +
+				strconv.FormatUint(uint64(notification.ID), 10),
+			AvailableAt: availableAt,
+		})
+		return err
+	})
+	if err != nil {
 		return nil, fmt.Errorf("创建通知失败: %w", err)
-	}
-
-	// 如果是邮件通知，异步发送邮件
-	if notification.Channel == models.NotificationChannelEmail && ns.emailNotificationService != nil {
-		go func() {
-			bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-			defer cancel()
-			if err := ns.emailNotificationService.SendEmailNotification(bgCtx, notification); err != nil {
-				// 记录错误，但不影响主流程
-				fmt.Printf("发送邮件通知失败 (ID: %d): %v\n", notification.ID, err)
-			}
-		}()
 	}
 
 	// 性能优化：跳过预加载相关数据以提高创建速度
@@ -943,6 +972,68 @@ func (ns *NotificationService) CreateNotification(ctx context.Context, req *mode
 	// ns.db.Preload("Recipient").Preload("Sender").Preload("RelatedTicket").First(notification, notification.ID)
 
 	return notification, nil
+}
+
+// DeliverEmailNotificationOutbox validates the immutable event reference and
+// performs one bounded email attempt. Notification.IsSent is the durable
+// replay receipt if a process stops after SMTP but before Outbox acknowledgement.
+func (ns *NotificationService) DeliverEmailNotificationOutbox(
+	ctx context.Context,
+	event CloudEventEnvelope,
+	destinationID string,
+) error {
+	if ns == nil || ns.db == nil {
+		return errors.New("邮件通知服务不可用")
+	}
+	rawID, found := strings.CutPrefix(
+		destinationID,
+		NotificationEmailDestinationPrefix,
+	)
+	if !found || rawID == "" || strings.Contains(rawID, ":") {
+		return errors.New("邮件通知 Outbox 目标无效")
+	}
+	notificationID, err := safeconv.ParsePositiveUint(rawID)
+	if err != nil {
+		return errors.New("邮件通知 Outbox 记录 ID 无效")
+	}
+	var reference EmailIntentReference
+	if event.Type != eventcontract.NotificationEmailRequestedEventType ||
+		json.Unmarshal(event.Data, &reference) != nil ||
+		reference.NotificationID != notificationID ||
+		reference.UserID == 0 {
+		return errors.New("邮件通知 Outbox 事件引用不一致")
+	}
+
+	var notification models.Notification
+	if err := ns.db.WithContext(ctx).First(&notification, notificationID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		return fmt.Errorf("读取邮件通知失败: %w", err)
+	}
+	if notification.Channel != models.NotificationChannelEmail ||
+		notification.RecipientID != reference.UserID ||
+		string(notification.Type) != reference.NotificationType {
+		return errors.New("邮件通知 Outbox 业务引用不一致")
+	}
+	if notification.IsSent {
+		return nil
+	}
+	now := time.Now()
+	if notification.ExpiresAt != nil && !notification.ExpiresAt.After(now) {
+		notification.DeliveryStatus = "skipped_expired"
+		return ns.db.WithContext(ctx).Save(&notification).Error
+	}
+	if notification.ScheduledAt != nil && notification.ScheduledAt.After(now) {
+		return errors.New("邮件通知尚未到计划发送时间")
+	}
+	if ns.emailNotificationService == nil {
+		return errors.New("邮件通知发送器未初始化")
+	}
+	return ns.emailNotificationService.SendEmailNotificationOutboxAttempt(
+		ctx,
+		&notification,
+	)
 }
 
 // GetNotifications 获取通知列表
@@ -1163,22 +1254,24 @@ func (ns *NotificationService) DeliverTicketNotificationOutbox(
 	if event.ID == "" {
 		return nil, false, errors.New("notification CloudEvent ID is required")
 	}
-	if event.ActorType != models.ActorTypeHuman {
-		return nil, false, fmt.Errorf(
-			"notification Outbox requires a human actor, got %q",
-			event.ActorType,
-		)
+	eventActor := models.ActorRef{Type: event.ActorType, ID: event.ActorID}
+	if err := eventActor.Validate(); err != nil {
+		return nil, false, fmt.Errorf("notification CloudEvent has an invalid actor: %w", err)
 	}
-	senderID, err := safeconv.ParsePositiveUint(event.ActorID)
-	if err != nil {
-		return nil, false, errors.New("notification CloudEvent has an invalid human actor")
+	var senderID *uint
+	if event.ActorType == models.ActorTypeHuman {
+		humanID, err := safeconv.ParsePositiveUint(event.ActorID)
+		if err != nil {
+			return nil, false, errors.New("notification CloudEvent has an invalid human actor")
+		}
+		senderID = &humanID
 	}
 
 	notificationType, recipientID, err := parseTicketNotificationDestination(destinationID)
 	if err != nil {
 		return nil, false, err
 	}
-	if recipientID == senderID {
+	if senderID != nil && recipientID == *senderID {
 		return nil, false, errors.New("notification recipient must differ from the actor")
 	}
 
@@ -1197,7 +1290,7 @@ func (ns *NotificationService) DeliverTicketNotificationOutbox(
 		Priority:        models.NotificationPriorityNormal,
 		Channel:         models.NotificationChannelInApp,
 		RecipientID:     recipientID,
-		SenderID:        &senderID,
+		SenderID:        senderID,
 		RelatedType:     "ticket",
 		RelatedID:       &data.TicketID,
 		RelatedTicketID: &data.TicketID,
@@ -1207,6 +1300,7 @@ func (ns *NotificationService) DeliverTicketNotificationOutbox(
 		"source_event_id":  event.ID,
 		"ticket_number":    data.TicketNumber,
 		"resource_version": event.ResourceVersion,
+		"actor":            eventActor,
 	}
 	var ticketCount int64
 	if err := ns.db.WithContext(ctx).
@@ -1226,8 +1320,8 @@ func (ns *NotificationService) DeliverTicketNotificationOutbox(
 
 	switch notificationType {
 	case models.NotificationTypeTicketAssigned:
-		if event.Type != "io.chronodesk.ticket.assigned.v1" &&
-			event.Type != "io.chronodesk.ticket.updated.v1" {
+		if event.Type != eventcontract.TicketAssignedEventType &&
+			event.Type != eventcontract.TicketUpdatedEventType {
 			return nil, false, fmt.Errorf(
 				"ticket assignment notification does not support event %q",
 				event.Type,
@@ -1247,8 +1341,8 @@ func (ns *NotificationService) DeliverTicketNotificationOutbox(
 		notification.Priority = models.NotificationPriorityHigh
 		metadata["priority"] = string(data.TicketPriority)
 	case models.NotificationTypeTicketStatusChanged:
-		if event.Type != "io.chronodesk.ticket.transitioned.v1" &&
-			event.Type != "io.chronodesk.ticket.updated.v1" {
+		if event.Type != eventcontract.TicketTransitionedEventType &&
+			event.Type != eventcontract.TicketUpdatedEventType {
 			return nil, false, fmt.Errorf(
 				"ticket status notification does not support event %q",
 				event.Type,
@@ -1352,95 +1446,4 @@ func truncateNotificationTitle(value string, maxRunes int) string {
 		return string(runes[:maxRunes])
 	}
 	return string(runes[:maxRunes-3]) + "..."
-}
-
-// === 邮件通知处理方法 ===
-
-// ProcessPendingEmailNotifications 处理待发送的邮件通知
-func (ns *NotificationService) ProcessPendingEmailNotifications(ctx context.Context) error {
-	if ns.emailNotificationService == nil {
-		return fmt.Errorf("邮件通知服务未初始化")
-	}
-
-	// 查询待发送的邮件通知
-	var notifications []*models.Notification
-	err := ns.db.Where("channel = ? AND is_sent = false AND (scheduled_at IS NULL OR scheduled_at <= ?)",
-		models.NotificationChannelEmail, time.Now()).
-		Preload("Recipient").
-		Preload("Sender").
-		Preload("RelatedTicket").
-		Find(&notifications).Error
-
-	if err != nil {
-		return fmt.Errorf("查询待发送邮件通知失败: %w", err)
-	}
-
-	if len(notifications) == 0 {
-		return nil
-	}
-
-	successCount := 0
-	failedCount := 0
-
-	for _, notification := range notifications {
-		if err := ns.emailNotificationService.SendEmailNotification(ctx, notification); err != nil {
-			failedCount++
-			fmt.Printf("发送邮件通知失败 (ID: %d): %v\n", notification.ID, err)
-			continue
-		}
-		successCount++
-	}
-
-	fmt.Printf("邮件通知处理完成: 成功 %d, 失败 %d\n", successCount, failedCount)
-
-	if failedCount > 0 {
-		return fmt.Errorf("部分邮件发送失败: 成功 %d, 失败 %d", successCount, failedCount)
-	}
-
-	return nil
-}
-
-// RetryFailedEmailNotifications 重试失败的邮件通知
-func (ns *NotificationService) RetryFailedEmailNotifications(ctx context.Context) error {
-	if ns.emailNotificationService == nil {
-		return fmt.Errorf("邮件通知服务未初始化")
-	}
-
-	// 查询需要重试的邮件通知
-	var notifications []*models.Notification
-	err := ns.db.Where(
-		"channel = ? AND is_sent = false AND delivery_status = ? AND next_retry_at IS NOT NULL AND next_retry_at <= ? AND retry_count < max_retries",
-		models.NotificationChannelEmail, "failed", time.Now()).
-		Preload("Recipient").
-		Preload("Sender").
-		Preload("RelatedTicket").
-		Find(&notifications).Error
-
-	if err != nil {
-		return fmt.Errorf("查询重试邮件通知失败: %w", err)
-	}
-
-	if len(notifications) == 0 {
-		return nil
-	}
-
-	successCount := 0
-	failedCount := 0
-
-	for _, notification := range notifications {
-		if err := ns.emailNotificationService.SendEmailNotification(ctx, notification); err != nil {
-			failedCount++
-			fmt.Printf("重试发送邮件通知失败 (ID: %d): %v\n", notification.ID, err)
-			continue
-		}
-		successCount++
-	}
-
-	fmt.Printf("邮件通知重试完成: 成功 %d, 失败 %d\n", successCount, failedCount)
-
-	if failedCount > 0 {
-		return fmt.Errorf("部分邮件重试失败: 成功 %d, 失败 %d", successCount, failedCount)
-	}
-
-	return nil
 }

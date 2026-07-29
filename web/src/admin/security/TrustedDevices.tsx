@@ -7,11 +7,16 @@ import {
     CardHeader,
     Chip,
     CircularProgress,
+    Dialog,
+    DialogActions,
+    DialogContent,
+    DialogTitle,
     Stack,
     Typography,
 } from '@mui/material'
 import SecurityIcon from '@mui/icons-material/Security'
 import { useNotify } from 'react-admin'
+import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
 
 interface TrustedDevice {
     id: number
@@ -24,9 +29,6 @@ interface TrustedDevice {
     created_at: string
     updated_at: string
 }
-
-const apiBase = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
-const buildUrl = (path: string) => `${apiBase}${path.startsWith('/') ? path : `/${path}`}`
 
 const formatDateTime = (value: string) => {
     if (!value) return '—'
@@ -42,24 +44,14 @@ const TrustedDevices = () => {
     const [devices, setDevices] = useState<TrustedDevice[]>([])
     const [loading, setLoading] = useState(true)
     const [refreshFlag, setRefreshFlag] = useState(0)
+    const [revokeTarget, setRevokeTarget] = useState<TrustedDevice | null>(null)
+    const [revoking, setRevoking] = useState(false)
 
     const fetchDevices = useCallback(async () => {
-        const token = localStorage.getItem('token')
-        if (!token) {
-            return
-        }
         setLoading(true)
         try {
-            const response = await fetch(buildUrl('/user/trusted-devices'), {
-                headers: {
-                    Authorization: `Bearer ${token}`,
-                },
-            })
-            if (!response.ok) {
-                throw new Error('无法获取可信设备列表')
-            }
-            const result = await response.json()
-            setDevices(result.data ?? [])
+            const result = await apiFetch<TrustedDevice[]>('/user/trusted-devices')
+            setDevices(result ?? [])
         } catch (error) {
             console.error(error)
             notify('获取可信设备失败，请稍后重试', { type: 'warning' })
@@ -72,31 +64,21 @@ const TrustedDevices = () => {
         fetchDevices()
     }, [fetchDevices, refreshFlag])
 
-    const handleRevoke = async (deviceId: number) => {
-        if (!window.confirm('撤销后该设备需要重新验证身份，确定继续吗？')) {
-            return
-        }
-        const token = localStorage.getItem('token')
-        if (!token) {
-            notify('未检测到登录令牌，请重新登录', { type: 'warning' })
-            return
-        }
+    const handleRevoke = async () => {
+        if (!revokeTarget) return
+        setRevoking(true)
         try {
-            const response = await fetch(buildUrl(`/user/trusted-devices/${deviceId}`), {
+            await apiFetch(`/user/trusted-devices/${revokeTarget.id}`, {
                 method: 'DELETE',
-                headers: {
-                    Authorization: `Bearer ${token}`,
-                },
             })
-            if (!response.ok) {
-                const payload = await response.json().catch(() => ({}))
-                throw new Error(payload?.msg || '撤销失败')
-            }
             notify('设备已撤销', { type: 'info' })
+            setRevokeTarget(null)
             setRefreshFlag((flag) => flag + 1)
         } catch (error) {
             console.error(error)
-            notify(error instanceof Error ? error.message : '撤销失败', { type: 'warning' })
+            notify(localizedUnknownErrorMessage(error, '撤销失败'), { type: 'warning' })
+        } finally {
+            setRevoking(false)
         }
     }
 
@@ -135,7 +117,12 @@ const TrustedDevices = () => {
                     ) : (
                         <Stack spacing={2.5}>
                             {devices.map((device) => (
-                                <Card key={device.id} variant="outlined">
+                                <Card
+                                    key={device.id}
+                                    variant="outlined"
+                                    role="region"
+                                    aria-label={`可信设备：${device.device_name || '未命名设备'}`}
+                                >
                                     <CardContent>
                                         <Stack spacing={1.2}>
                                             <Typography variant="h6">{device.device_name || '未命名设备'}</Typography>
@@ -157,7 +144,7 @@ const TrustedDevices = () => {
                                                     <Button
                                                         variant="outlined"
                                                         color="error"
-                                                        onClick={() => handleRevoke(device.id)}
+                                                        onClick={() => setRevokeTarget(device)}
                                                     >
                                                         撤销该设备
                                                     </Button>
@@ -171,6 +158,32 @@ const TrustedDevices = () => {
                     )}
                 </CardContent>
             </Card>
+            <Dialog
+                open={Boolean(revokeTarget)}
+                onClose={() => {
+                    if (!revoking) setRevokeTarget(null)
+                }}
+                maxWidth="xs"
+                fullWidth
+            >
+                <DialogTitle>撤销可信设备</DialogTitle>
+                <DialogContent>
+                    撤销“{revokeTarget?.device_name || '未命名设备'}”后，该设备需要重新验证身份。确定继续吗？
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => setRevokeTarget(null)} disabled={revoking}>
+                        取消
+                    </Button>
+                    <Button
+                        color="error"
+                        variant="contained"
+                        onClick={() => void handleRevoke()}
+                        disabled={revoking}
+                    >
+                        {revoking ? '撤销中…' : '确认撤销'}
+                    </Button>
+                </DialogActions>
+            </Dialog>
         </Box>
     );
 }

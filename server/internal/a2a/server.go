@@ -3,12 +3,14 @@ package a2a
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"mime"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,15 +23,31 @@ type ServerOptions struct {
 	ExtendedCard   *AgentCard
 	CardOptions    CardOptions
 	ServiceOptions ServiceOptions
+	StreamLimiter  StreamLimiter
 	Heartbeat      time.Duration
 }
 
+// StreamLimiter reserves capacity for one long-lived A2A SSE response. The
+// production adapter uses Redis-backed global, principal and credential
+// quotas. The release function must be idempotent because transport shutdown
+// and handler cleanup can race.
+type StreamLimiter interface {
+	Acquire(context.Context) (func(), error)
+}
+
+type StreamLimiterFunc func(context.Context) (func(), error)
+
+func (f StreamLimiterFunc) Acquire(ctx context.Context) (func(), error) {
+	return f(ctx)
+}
+
 type Server struct {
-	service      *Service
-	card         AgentCard
-	extendedCard *AgentCard
-	cardDoc      cardDocument
-	heartbeat    time.Duration
+	service       *Service
+	card          AgentCard
+	extendedCard  *AgentCard
+	cardDoc       cardDocument
+	streamLimiter StreamLimiter
+	heartbeat     time.Duration
 }
 
 func NewServer(store Store, backend Backend, opts ServerOptions) (*Server, error) {
@@ -56,20 +74,17 @@ func NewServer(store Store, backend Backend, opts ServerOptions) (*Server, error
 		card.DefaultOutputModes...,
 	)
 	return &Server{
-		service:      NewService(store, backend, opts.ServiceOptions),
-		card:         card,
-		extendedCard: cloneAgentCard(opts.ExtendedCard),
-		cardDoc:      cardDoc,
-		heartbeat:    opts.Heartbeat,
+		service:       NewService(store, backend, opts.ServiceOptions),
+		card:          card,
+		extendedCard:  cloneAgentCard(opts.ExtendedCard),
+		cardDoc:       cardDoc,
+		streamLimiter: opts.StreamLimiter,
+		heartbeat:     opts.Heartbeat,
 	}, nil
 }
 
 func (s *Server) Service() *Service {
 	return s.service
-}
-
-func (s *Server) AgentCard() AgentCard {
-	return s.card
 }
 
 // CardHandler exposes the public discovery document independently so callers
@@ -82,14 +97,6 @@ func (s *Server) CardHandler() gin.HandlerFunc {
 // OAuth and scope middleware only to A2A operations.
 func (s *Server) RPCHandler() gin.HandlerFunc {
 	return s.HandleJSONRPC
-}
-
-// RegisterRoutes mounts both A2A endpoints on a Gin engine or group.
-// Authentication/scope middleware should be applied by the caller to /a2a/v1;
-// the well-known Agent Card is intentionally public.
-func (s *Server) RegisterRoutes(routes gin.IRoutes) {
-	routes.GET(AgentCardPath, s.CardHandler())
-	routes.POST(RPCPath, s.RPCHandler())
 }
 
 func (s *Server) HandleJSONRPC(c *gin.Context) {
@@ -237,6 +244,12 @@ func (s *Server) handleSendStream(c *gin.Context, request JSONRPCRequest) {
 		s.writeServiceError(c, request.ID, err)
 		return
 	}
+	release, err := s.acquireStream(c.Request.Context())
+	if err != nil {
+		s.writeServiceError(c, request.ID, err)
+		return
+	}
+	defer release()
 	task, replayed, err := s.service.StartMessageOnce(c.Request.Context(), params)
 	if err != nil {
 		s.writeServiceError(c, request.ID, err)
@@ -276,6 +289,12 @@ func (s *Server) handleSubscribe(c *gin.Context, request JSONRPCRequest) {
 		s.writeServiceError(c, request.ID, errors.New("id is required"))
 		return
 	}
+	release, err := s.acquireStream(c.Request.Context())
+	if err != nil {
+		s.writeServiceError(c, request.ID, err)
+		return
+	}
+	defer release()
 	task, err := s.service.GetTask(c.Request.Context(), GetTaskParams{ID: params.ID})
 	if err != nil {
 		s.writeServiceError(c, request.ID, err)
@@ -293,6 +312,23 @@ func (s *Server) handleSubscribe(c *gin.Context, request JSONRPCRequest) {
 		return
 	}
 	s.streamEvents(c, request.ID, task, replay, live, true)
+}
+
+func (s *Server) acquireStream(ctx context.Context) (func(), error) {
+	if s.streamLimiter == nil {
+		return nil, ErrStreamControlUnavailable
+	}
+	release, err := s.streamLimiter.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if release == nil {
+		return nil, ErrStreamControlUnavailable
+	}
+	var once sync.Once
+	return func() {
+		once.Do(release)
+	}, nil
 }
 
 func (s *Server) streamEvents(
@@ -441,6 +477,26 @@ func (s *Server) writeServiceError(c *gin.Context, id json.RawMessage, err error
 		s.writeError(c, id, -32007, "The extended Agent Card is not configured", "EXTENDED_AGENT_CARD_NOT_CONFIGURED", nil)
 	case errors.Is(err, ErrInvalidPageToken), errors.Is(err, ErrInvalidEventCursor):
 		s.writeError(c, id, -32602, "Invalid parameters", "INVALID_PARAMS", nil)
+	case errors.Is(err, ErrStreamQuotaExceeded):
+		writeJSONRPCErrorStatus(
+			c,
+			http.StatusTooManyRequests,
+			id,
+			-32010,
+			"A2A 长连接配额已满，请稍后重试",
+			"STREAM_QUOTA_EXCEEDED",
+			nil,
+		)
+	case errors.Is(err, ErrStreamControlUnavailable):
+		writeJSONRPCErrorStatus(
+			c,
+			http.StatusServiceUnavailable,
+			id,
+			-32011,
+			"A2A 资源控制暂时不可用",
+			"RESOURCE_CONTROL_UNAVAILABLE",
+			nil,
+		)
 	default:
 		var paramsError *paramsDecodeError
 		if errors.As(err, &paramsError) || isClientInputError(err) {
@@ -481,14 +537,52 @@ func cloneAgentCard(card *AgentCard) *AgentCard {
 }
 
 func (s *Server) writeError(c *gin.Context, id json.RawMessage, code int, message, reason string, metadata map[string]string) {
+	writeJSONRPCErrorStatus(c, http.StatusOK, id, code, message, reason, metadata)
+}
+
+func writeJSONRPCErrorStatus(
+	c *gin.Context,
+	status int,
+	id json.RawMessage,
+	code int,
+	message string,
+	reason string,
+	metadata map[string]string,
+) {
 	if len(bytes.TrimSpace(id)) == 0 {
 		id = json.RawMessage("null")
 	}
-	c.JSON(http.StatusOK, JSONRPCResponse{
+	c.JSON(status, JSONRPCResponse{
 		JSONRPC: JSONRPCVersion,
 		ID:      id,
 		Error:   rpcError(code, message, reason, metadata),
 	})
+}
+
+// WriteRateLimitError preserves the JSON-RPC request ID when the shared Redis
+// HTTP limiter rejects an authenticated A2A request before protocol dispatch.
+// It never reflects request parameters or identity values.
+func WriteRateLimitError(c *gin.Context) {
+	id := json.RawMessage("null")
+	if c != nil && c.Request != nil && c.Request.Body != nil {
+		body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxRPCBodyBytes+1))
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
+		if err == nil && len(body) <= maxRPCBodyBytes {
+			if request, decodeErr := DecodeJSONRPCRequest(body); decodeErr == nil &&
+				len(bytes.TrimSpace(request.ID)) > 0 {
+				id = request.ID
+			}
+		}
+	}
+	writeJSONRPCErrorStatus(
+		c,
+		http.StatusTooManyRequests,
+		id,
+		-32010,
+		"A2A 请求过于频繁，请稍后重试",
+		"RATE_LIMIT_EXCEEDED",
+		nil,
+	)
 }
 
 func rpcError(code int, message, reason string, metadata map[string]string) *JSONRPCError {

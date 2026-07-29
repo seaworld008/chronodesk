@@ -196,7 +196,7 @@ func (c *HTTPRedisClient) Eval(
 	if len(keys) > maxHTTPRedisCommandArguments-2 ||
 		len(args) > maxHTTPRedisCommandArguments-2-len(keys) {
 		return nil, fmt.Errorf(
-			"Redis EVAL exceeds the %d argument limit",
+			"redis EVAL exceeds the %d argument limit",
 			maxHTTPRedisCommandArguments,
 		)
 	}
@@ -225,7 +225,7 @@ func (c *HTTPRedisClient) Close() error {
 func (c *HTTPRedisClient) executeCommand(ctx context.Context, command string, args ...interface{}) (*HTTPRedisResponse, error) {
 	if len(args) > maxHTTPRedisCommandArguments-1 {
 		return nil, fmt.Errorf(
-			"Redis command exceeds the %d argument limit",
+			"redis command exceeds the %d argument limit",
 			maxHTTPRedisCommandArguments,
 		)
 	}
@@ -268,12 +268,12 @@ func (c *HTTPRedisClient) makeRequest(ctx context.Context, method, path string, 
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 	if len(respBody) > maxHTTPRedisResponseBytes {
-		return nil, fmt.Errorf("HTTP Redis response exceeded %d bytes", maxHTTPRedisResponseBytes)
+		return nil, fmt.Errorf("HTTP redis response exceeded %d bytes", maxHTTPRedisResponseBytes)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		// 不把不可信的上游响应体拼进日志或 API 错误。
-		return nil, fmt.Errorf("HTTP Redis request failed with status %d", resp.StatusCode)
+		return nil, fmt.Errorf("HTTP redis request failed with status %d", resp.StatusCode)
 	}
 
 	var result HTTPRedisResponse
@@ -282,7 +282,7 @@ func (c *HTTPRedisClient) makeRequest(ctx context.Context, method, path string, 
 	}
 
 	if result.Error != "" {
-		return nil, fmt.Errorf("Redis error: %s", result.Error)
+		return nil, fmt.Errorf("redis error: %s", result.Error)
 	}
 
 	return &result, nil

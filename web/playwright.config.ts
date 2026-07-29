@@ -1,4 +1,30 @@
 import { defineConfig, devices } from '@playwright/test';
+import {
+    assertDestructiveE2EAllowed,
+    isLoopbackE2E,
+    testBaseURL,
+} from './e2e/helpers/safety';
+
+const configuredBaseURL = testBaseURL();
+if (
+    !['http:', 'https:'].includes(configuredBaseURL.protocol) ||
+    configuredBaseURL.username ||
+    configuredBaseURL.password ||
+    configuredBaseURL.search ||
+    configuredBaseURL.hash ||
+    configuredBaseURL.pathname.replace(/\/+$/u, '') !== ''
+) {
+    throw new Error(
+        'TEST_BASE_URL 必须是无凭据、路径、查询参数和片段的 http(s) origin。',
+    );
+}
+assertDestructiveE2EAllowed('启动 Playwright 写测试会话');
+
+const isPublishingCI =
+    process.env.CI === 'true' || process.env.CI === '1';
+const shouldStartLocalServer =
+    isLoopbackE2E() &&
+    configuredBaseURL.port === '3000';
 
 /**
  * ChronoDesk E2E Test Configuration
@@ -9,20 +35,24 @@ export default defineConfig({
     // E2E 场景会修改共享的管理员账号、系统配置和测试数据。
     // 固定单 worker 可避免并行登录触发认证限流，也避免清理阶段互相删除数据。
     fullyParallel: false,
-    forbidOnly: !!process.env.CI,
-    retries: process.env.CI ? 2 : 0,
+    forbidOnly: isPublishingCI,
+    retries: isPublishingCI ? 2 : 0,
     workers: 1,
-    reporter: 'html',
+    // 发布 CI 只输出凭据安全的行报告，不生成可上传的浏览器状态快照。
+    reporter: isPublishingCI
+        ? 'line'
+        : [['html', { open: 'never' }]],
 
     use: {
         // Base URL for all tests
-        baseURL: process.env.TEST_BASE_URL || 'http://localhost:3000',
+        baseURL: configuredBaseURL.origin,
 
-        // Collect trace on retry
-        trace: 'on-first-retry',
+        // Trace/video can capture Authorization headers and browser storage.
+        trace: 'off',
+        video: 'off',
 
-        // Screenshots on failure
-        screenshot: 'only-on-failure',
+        // CI failure pages can contain passwords, OTPs, backup codes or secrets.
+        screenshot: isPublishingCI ? 'off' : 'only-on-failure',
     },
 
     projects: [
@@ -33,11 +63,14 @@ export default defineConfig({
     ],
 
     // Local dev server
-    webServer: {
-        command: 'npm run dev',
-        url: 'http://localhost:3000',
-        reuseExistingServer:
-            process.env.PLAYWRIGHT_REUSE_SERVER === '1' || !process.env.CI,
-        timeout: 120 * 1000,
-    },
+    webServer: shouldStartLocalServer
+        ? {
+              command: 'npm run dev',
+              url: configuredBaseURL.origin,
+              reuseExistingServer:
+                  process.env.PLAYWRIGHT_REUSE_SERVER === '1' ||
+                  !isPublishingCI,
+              timeout: 120 * 1000,
+          }
+        : undefined,
 });

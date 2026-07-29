@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/smtp"
 	"strconv"
 
 	"github.com/seaworld008/chronodesk/server/internal/mailer"
@@ -27,12 +26,6 @@ type EmailConfigServiceInterface interface {
 type EmailConfigService struct {
 	db        *gorm.DB
 	protector security.Protector
-}
-
-// NewEmailConfigService creates a new email config service
-func NewEmailConfigService(db *gorm.DB) EmailConfigServiceInterface {
-	protector, _ := security.LoadDeploymentKeyringFromEnvironment()
-	return NewEmailConfigServiceWithProtector(db, protector)
 }
 
 // NewEmailConfigServiceWithProtector injects the application data-encryption
@@ -59,8 +52,9 @@ func (s *EmailConfigService) GetEmailConfig(ctx context.Context) (*models.EmailC
 
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			// 如果没有配置，创建默认配置
-			return s.createDefaultConfig(ctx)
+			// 读取配置不得产生写入副作用。首次显式保存会在事务内创建记录，
+			// 取得主键后再以记录专属 AAD 加密 SMTP 密码。
+			return models.DefaultEmailConfig(), nil
 		}
 		return nil, fmt.Errorf("failed to get email config: %w", err)
 	}
@@ -138,6 +132,9 @@ func (s *EmailConfigService) UpdateEmailConfig(ctx context.Context, req *models.
 	}
 
 	config.UpdatedByID = &userID
+	if config.SMTPUseTLS && config.SMTPUseSSL {
+		return nil, errors.New("SMTP STARTTLS与隐式TLS不能同时启用")
+	}
 
 	// 如果启用了邮箱验证，验证SMTP配置
 	if config.EmailVerificationEnabled {
@@ -148,25 +145,43 @@ func (s *EmailConfigService) UpdateEmailConfig(ctx context.Context, req *models.
 		skipSMTPTest := req.SkipSMTPTest != nil && *req.SkipSMTPTest
 		if !skipSMTPTest {
 			// 测试SMTP连接
-			if err := s.testSMTPConnection(config); err != nil {
+			if err := s.testSMTPConnection(ctx, config); err != nil {
 				return nil, fmt.Errorf("SMTP连接测试失败: %w", err)
 			}
 		}
 	}
 
-	// 只将密文副本持久化；返回给调用方的运行时对象继续保留明文，以便
-	// 立即执行连接测试或发信。
-	persisted := *config
-	persisted.SMTPPassword, err = security.ProtectOptional(
-		s.protector,
-		config.SMTPPassword,
-		emailSMTPPasswordAAD(config.ID),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("无法加密SMTP凭据: %w", err)
-	}
-	if err := s.db.WithContext(ctx).Save(&persisted).Error; err != nil {
-		return nil, fmt.Errorf("failed to update email config: %w", err)
+	// 只将密文副本持久化；返回给调用方的运行时对象继续保留明文。首次
+	// 保存先在同一事务中插入不含密码的记录以取得主键，再用该主键生成
+	// record-specific AAD，避免生成无法在重启后解密的 ID=0 密文。
+	var persisted models.EmailConfig
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		persisted = *config
+		if persisted.ID == 0 {
+			plaintextPassword := persisted.SMTPPassword
+			persisted.SMTPPassword = ""
+			if err := tx.Create(&persisted).Error; err != nil {
+				return fmt.Errorf("创建邮箱配置失败: %w", err)
+			}
+			persisted.SMTPPassword = plaintextPassword
+			config.ID = persisted.ID
+			config.CreatedAt = persisted.CreatedAt
+		}
+		protectedPassword, protectErr := security.ProtectOptional(
+			s.protector,
+			config.SMTPPassword,
+			emailSMTPPasswordAAD(persisted.ID),
+		)
+		if protectErr != nil {
+			return fmt.Errorf("无法加密SMTP凭据: %w", protectErr)
+		}
+		persisted.SMTPPassword = protectedPassword
+		if err := tx.Save(&persisted).Error; err != nil {
+			return fmt.Errorf("更新邮箱配置失败: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	config.CreatedAt = persisted.CreatedAt
 	config.UpdatedAt = persisted.UpdatedAt
@@ -186,12 +201,12 @@ func (s *EmailConfigService) TestEmailConnection(ctx context.Context, req *model
 	}
 
 	// 测试连接
-	if err := s.testSMTPConnection(config); err != nil {
+	if err := s.testSMTPConnection(ctx, config); err != nil {
 		return err
 	}
 
 	// 发送测试邮件
-	return s.sendTestEmail(config, req)
+	return s.sendTestEmail(ctx, config, req)
 }
 
 // IsEmailVerificationEnabled checks if email verification is enabled
@@ -222,29 +237,7 @@ func (s *EmailConfigService) GetSMTPConfig(ctx context.Context) (*models.EmailCo
 	}
 
 	if !config.CanSendEmail() {
-		return nil, errors.New("邮箱验证未启用或SMTP配置不完整")
-	}
-
-	return config, nil
-}
-
-// createDefaultConfig creates a default email configuration
-func (s *EmailConfigService) createDefaultConfig(ctx context.Context) (*models.EmailConfig, error) {
-	config := &models.EmailConfig{
-		EmailVerificationEnabled: false,
-		SMTPPort:                 587,
-		SMTPUseTLS:               true,
-		SMTPUseSSL:               false,
-		FromName:                 "工单系统",
-		WelcomeEmailSubject:      "欢迎注册工单系统",
-		OTPEmailSubject:          "邮箱验证码",
-		WelcomeEmailTemplate:     s.getDefaultWelcomeTemplate(),
-		OTPEmailTemplate:         s.getDefaultOTPTemplate(),
-		IsActive:                 true,
-	}
-
-	if err := s.db.WithContext(ctx).Create(config).Error; err != nil {
-		return nil, fmt.Errorf("failed to create default email config: %w", err)
+		return nil, errors.New("SMTP配置未启用或不完整")
 	}
 
 	return config, nil
@@ -275,36 +268,29 @@ func emailSMTPPasswordAAD(configID uint) []byte {
 }
 
 // testSMTPConnection tests the SMTP connection
-func (s *EmailConfigService) testSMTPConnection(config *models.EmailConfig) error {
-	addr := fmt.Sprintf("%s:%d", config.SMTPHost, config.SMTPPort)
-
-	// 创建认证
-	auth := smtp.PlainAuth("", config.SMTPUsername, config.SMTPPassword, config.SMTPHost)
-
-	// 测试连接
-	client, err := smtp.Dial(addr)
+func (s *EmailConfigService) testSMTPConnection(
+	ctx context.Context,
+	config *models.EmailConfig,
+) error {
+	transport, err := smtpTransportForEmailConfig(config)
 	if err != nil {
-		return fmt.Errorf("无法连接到SMTP服务器: %w", err)
+		return err
 	}
-	defer client.Close()
-
-	// 如果使用TLS
-	if config.SMTPUseTLS {
-		if err := client.StartTLS(nil); err != nil {
-			return fmt.Errorf("TLS连接失败: %w", err)
-		}
+	if err := transport.TestConnection(ctx); err != nil {
+		return fmt.Errorf("SMTP连接测试失败: %w", err)
 	}
-
-	// 测试认证
-	if err := client.Auth(auth); err != nil {
-		return fmt.Errorf("SMTP认证失败: %w", err)
-	}
-
 	return nil
 }
 
 // sendTestEmail sends a test email
-func (s *EmailConfigService) sendTestEmail(config *models.EmailConfig, req *models.EmailTestRequest) error {
+func (s *EmailConfigService) sendTestEmail(
+	ctx context.Context,
+	config *models.EmailConfig,
+	req *models.EmailTestRequest,
+) error {
+	if req == nil {
+		return errors.New("测试邮件参数不能为空")
+	}
 	recipient, err := mailer.CanonicalMailbox(req.ToEmail)
 	if err != nil {
 		return fmt.Errorf("收件邮箱无效: %w", err)
@@ -313,9 +299,6 @@ func (s *EmailConfigService) sendTestEmail(config *models.EmailConfig, req *mode
 	if err != nil {
 		return fmt.Errorf("发件邮箱无效: %w", err)
 	}
-	addr := fmt.Sprintf("%s:%d", config.SMTPHost, config.SMTPPort)
-	auth := smtp.PlainAuth("", config.SMTPUsername, config.SMTPPassword, config.SMTPHost)
-
 	// 测试内容是纯文本数据；MIME构建器负责严格的头校验与正文传输编码。
 	msg, err := mailer.BuildTextMessage(
 		sender,
@@ -327,39 +310,33 @@ func (s *EmailConfigService) sendTestEmail(config *models.EmailConfig, req *mode
 		return fmt.Errorf("构建测试邮件失败: %w", err)
 	}
 
-	// 发送邮件
-	err = smtp.SendMail(addr, auth, sender, []string{recipient}, msg)
+	transport, err := smtpTransportForEmailConfig(config)
 	if err != nil {
+		return err
+	}
+	if err := transport.Send(ctx, sender, []string{recipient}, msg); err != nil {
 		return fmt.Errorf("发送测试邮件失败: %w", err)
 	}
 
 	return nil
 }
 
-// getDefaultWelcomeTemplate returns the default welcome email template
-func (s *EmailConfigService) getDefaultWelcomeTemplate() string {
-	return `亲爱的 {{.Username}}，
-
-欢迎注册工单系统！
-
-您的账户已成功创建。您现在可以登录系统并开始使用我们的服务。
-
-如果您有任何问题，请随时联系我们的支持团队。
-
-祝好，
-工单系统团队`
-}
-
-// getDefaultOTPTemplate returns the default OTP email template
-func (s *EmailConfigService) getDefaultOTPTemplate() string {
-	return `亲爱的用户，
-
-您的邮箱验证码是：{{.OTP}}
-
-此验证码将在10分钟后过期，请及时使用。
-
-如果您没有请求此验证码，请忽略此邮件。
-
-祝好，
-工单系统团队`
+func smtpTransportForEmailConfig(
+	config *models.EmailConfig,
+) (*mailer.SMTPTransport, error) {
+	if config == nil {
+		return nil, errors.New("SMTP配置不能为空")
+	}
+	transport, err := mailer.NewSMTPTransport(mailer.SMTPTransportConfig{
+		Host:           config.SMTPHost,
+		Port:           config.SMTPPort,
+		Username:       config.SMTPUsername,
+		Password:       config.SMTPPassword,
+		UseSTARTTLS:    config.SMTPUseTLS,
+		UseImplicitTLS: config.SMTPUseSSL,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("SMTP配置无效: %w", err)
+	}
+	return transport, nil
 }

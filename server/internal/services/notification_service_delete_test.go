@@ -36,7 +36,7 @@ func TestDeleteNotification(t *testing.T) {
 		t.Fatalf("create notification: %v", err)
 	}
 
-	service := NewNotificationService(db)
+	service := NewNotificationServiceWithProtector(db, nil)
 	if err := service.DeleteNotification(context.Background(), notification.ID); err != nil {
 		t.Fatalf("delete notification: %v", err)
 	}

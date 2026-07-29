@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -77,7 +78,7 @@ func newMCPAdapterFixture(t *testing.T) *mcpAdapterFixture {
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
-		t.Fatalf("seed compatibility user: %v", err)
+		t.Fatalf("seed actor user: %v", err)
 	}
 	storage, err := services.NewLocalAttachmentStorage(t.TempDir())
 	if err != nil {
@@ -89,11 +90,10 @@ func newMCPAdapterFixture(t *testing.T) *mcpAdapterFixture {
 	})
 	scopes := append([]string(nil), models.SupportedAgentScopes...)
 	principal, err := service.CreateServicePrincipal(context.Background(), services.CreateServicePrincipalInput{
-		Name:                fmt.Sprintf("mcp-agent-%d", mcpAdapterTestSequence.Load()),
-		Scopes:              scopes,
-		RateLimitPerMinute:  500,
-		ConcurrentLimit:     8,
-		CompatibilityUserID: &user.ID,
+		Name:               fmt.Sprintf("mcp-agent-%d", mcpAdapterTestSequence.Load()),
+		Scopes:             scopes,
+		RateLimitPerMinute: 500,
+		ConcurrentLimit:    8,
 	})
 	if err != nil {
 		t.Fatalf("create principal: %v", err)
@@ -163,7 +163,7 @@ func (f *mcpAdapterFixture) seedTicket(t *testing.T, number, queue string) model
 		Source:             models.TicketSourceAgent,
 		Version:            1,
 		TrustLevel:         models.TicketTrustLevelUntrusted,
-		CreatedByID:        f.user.ID,
+		CreatedByID:        &f.user.ID,
 		CreatedByActorType: models.ActorTypeHuman,
 		CreatedByActorID:   strconv.FormatUint(uint64(f.user.ID), 10),
 	}
@@ -181,11 +181,140 @@ func (f *mcpAdapterFixture) seedTicket(t *testing.T, number, queue string) model
 		Action:      models.HistoryActionCreate,
 		Description: "created",
 		IsVisible:   true,
+		Provenance:  models.TicketHistoryProvenancePreEvent,
 	}
 	if err := f.db.Create(&history).Error; err != nil {
 		t.Fatalf("seed history: %v", err)
 	}
 	return ticket
+}
+
+func TestTicketAssignedActorRejectsIncompleteAndContradictoryProjections(t *testing.T) {
+	humanID := uint(17)
+	otherHumanID := uint(23)
+	servicePrincipalID := "11111111-1111-4111-8111-111111111111"
+	tests := []struct {
+		name       string
+		ticket     models.Ticket
+		wantActor  *models.ActorRef
+		wantReason string
+	}{
+		{
+			name:   "unassigned",
+			ticket: models.Ticket{ID: 1},
+		},
+		{
+			name: "complete human actor",
+			ticket: models.Ticket{
+				ID:                           2,
+				AssignedToActorType:          models.ActorTypeHuman,
+				AssignedToActorID:            strconv.FormatUint(uint64(humanID), 10),
+				AssignedToID:                 &humanID,
+				AssignedToServicePrincipalID: nil,
+			},
+			wantActor: func() *models.ActorRef {
+				actor := models.HumanActor(humanID)
+				return &actor
+			}(),
+		},
+		{
+			name: "legacy human projection without actor",
+			ticket: models.Ticket{
+				ID:           3,
+				AssignedToID: &humanID,
+			},
+			wantReason: "missing_actor",
+		},
+		{
+			name: "actor type only",
+			ticket: models.Ticket{
+				ID:                  4,
+				AssignedToActorType: models.ActorTypeHuman,
+			},
+			wantReason: "incomplete_actor",
+		},
+		{
+			name: "actor id only",
+			ticket: models.Ticket{
+				ID:                5,
+				AssignedToActorID: strconv.FormatUint(uint64(humanID), 10),
+			},
+			wantReason: "incomplete_actor",
+		},
+		{
+			name: "human projection disagrees with actor",
+			ticket: models.Ticket{
+				ID:                  6,
+				AssignedToActorType: models.ActorTypeHuman,
+				AssignedToActorID:   strconv.FormatUint(uint64(humanID), 10),
+				AssignedToID:        &otherHumanID,
+			},
+			wantReason: "projection_mismatch",
+		},
+		{
+			name: "service principal carries human projection",
+			ticket: models.Ticket{
+				ID:                           7,
+				AssignedToActorType:          models.ActorTypeServicePrincipal,
+				AssignedToActorID:            servicePrincipalID,
+				AssignedToID:                 &humanID,
+				AssignedToServicePrincipalID: &servicePrincipalID,
+			},
+			wantReason: "projection_mismatch",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			actor, err := ticketAssignedActor(&test.ticket)
+			if test.wantReason == "" {
+				if err != nil || !reflect.DeepEqual(actor, test.wantActor) {
+					t.Fatalf("actor=%+v err=%v, want actor=%+v", actor, err, test.wantActor)
+				}
+				return
+			}
+			var failure *mcp.BackendError
+			if !errors.As(err, &failure) ||
+				failure.Code != "data_integrity_error" ||
+				failure.Details["reason_code"] != test.wantReason {
+				t.Fatalf("error=%#v, want data_integrity_error/%s", err, test.wantReason)
+			}
+		})
+	}
+}
+
+func TestMCPAdapterReturnsStableIntegrityErrorForLegacyAssignmentProjection(t *testing.T) {
+	fixture := newMCPAdapterFixture(t)
+	ticket := fixture.seedTicket(t, "MCP-INTEGRITY-001", "triage")
+	if err := fixture.db.Model(&models.Ticket{}).
+		Where("id = ?", ticket.ID).
+		Updates(map[string]any{
+			"assigned_to_id":         fixture.user.ID,
+			"assigned_to_actor_type": "",
+			"assigned_to_actor_id":   "",
+		}).Error; err != nil {
+		t.Fatalf("corrupt assignment projection: %v", err)
+	}
+
+	for _, call := range []struct {
+		name      string
+		arguments map[string]any
+	}{
+		{name: "ticket_get", arguments: map[string]any{"ticket_id": int64(ticket.ID)}},
+		{name: "ticket_list", arguments: map[string]any{"search": ticket.TicketNumber}},
+	} {
+		t.Run(call.name, func(t *testing.T) {
+			_, err := fixture.adapter.CallTool(context.Background(), fixture.actor, call.name, call.arguments)
+			var failure *mcp.BackendError
+			if !errors.As(err, &failure) ||
+				failure.Code != "data_integrity_error" ||
+				failure.Message != "ticket assignment data is inconsistent" ||
+				failure.Details["reason_code"] != "missing_actor" ||
+				failure.Details["field"] != "assigned_to_actor" {
+				t.Fatalf("error=%#v", err)
+			}
+		})
+	}
 }
 
 func TestMCPAdapterAuthenticationQueriesResourcesAndPolicy(t *testing.T) {
@@ -261,8 +390,14 @@ func TestMCPAdapterAuthenticationQueriesResourcesAndPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ticket_history: %v", err)
 	}
-	if len(historyResult["items"].([]map[string]any)) != 1 {
+	historyItems := historyResult["items"].([]map[string]any)
+	if len(historyItems) != 1 {
 		t.Fatalf("ticket history result: %#v", historyResult)
+	}
+	if historyItems[0]["event_id"] != nil ||
+		historyItems[0]["resource_version"] != uint64(0) ||
+		historyItems[0]["provenance"] != string(models.TicketHistoryProvenancePreEvent) {
+		t.Fatalf("pre-event history must not expose a synthetic event link: %#v", historyItems[0])
 	}
 
 	for _, uri := range []string{
@@ -628,7 +763,7 @@ func TestMCPAdapterAllToolsLifecycleAndIdempotency(t *testing.T) {
 			"type": string(models.ActorTypeHuman),
 			"id":   strconv.FormatUint(uint64(fixture.user.ID), 10),
 		},
-		"reason":          "assign compatibility agent",
+		"reason":          "assign human operator",
 		"idempotency_key": "assign-lifecycle-0001",
 	})
 	assertReceiptShape(t, assignResult)
@@ -688,8 +823,17 @@ func TestMCPAdapterAllToolsLifecycleAndIdempotency(t *testing.T) {
 		"ticket_id": int64(ticketID),
 		"limit":     int64(100),
 	})
-	if len(historyResult["items"].([]map[string]any)) < 5 {
+	historyItems := historyResult["items"].([]map[string]any)
+	if len(historyItems) < 5 {
 		t.Fatalf("history result: %#v", historyResult)
+	}
+	for _, item := range historyItems {
+		eventID, ok := item["event_id"].(string)
+		if !ok || eventID == "" ||
+			item["provenance"] != string(models.TicketHistoryProvenanceDomainEvent) ||
+			item["resource_version"] == uint64(0) {
+			t.Fatalf("native history must expose its persisted event link: %#v", item)
+		}
 	}
 	actionResult := callMCPTool(t, fixture, "action_check", map[string]any{
 		"action":    "ticket_transition",
@@ -875,7 +1019,7 @@ func TestMCPAdapterListTicketsUsesBoundedPolicyBatchAndRawCursor(t *testing.T) {
 			Source:             models.TicketSourceAgent,
 			Version:            1,
 			TrustLevel:         models.TicketTrustLevelUntrusted,
-			CreatedByID:        fixture.user.ID,
+			CreatedByID:        &fixture.user.ID,
 			CreatedByActorType: models.ActorTypeHuman,
 			CreatedByActorID:   strconv.FormatUint(uint64(fixture.user.ID), 10),
 		}

@@ -6,7 +6,6 @@ import {
     FunctionField,
     EditButton,
     ShowButton,
-    BulkDeleteWithConfirmButton,
     CreateButton,
     ExportButton,
     FilterButton,
@@ -36,6 +35,7 @@ import {
 } from '@mui/icons-material';
 import {
     EnterpriseDatagrid,
+    InlineDetails,
     TruncatedText,
     type ResizableColumn,
 } from '@/components/tables/EnterpriseTable';
@@ -46,6 +46,7 @@ import {
     normalizeUserRole,
     userRoleChoices,
 } from '@/lib/accessControl';
+import { FocusSafeBulkDeleteWithConfirmButton } from '@/components/actions/FocusSafeDeleteButtons';
 
 // 用户状态选项
 const statusChoices = [
@@ -86,6 +87,10 @@ const UserAvatar: React.FC = () => {
     };
 
     const initials = getInitials(record.first_name, record.last_name, record.username);
+    const displayName =
+        record.display_name ||
+        `${record.first_name || ''} ${record.last_name || ''}`.trim() ||
+        record.username;
 
     return (
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
@@ -100,17 +105,11 @@ const UserAvatar: React.FC = () => {
             >
                 {initials}
             </Avatar>
-            <Box>
-                <TruncatedText
-                    title={record.display_name || `${record.first_name || ''} ${record.last_name || ''}`.trim() || record.username}
-                    fontWeight={600}
-                >
-                    {record.display_name || `${record.first_name || ''} ${record.last_name || ''}`.trim() || record.username}
-                </TruncatedText>
-                <TruncatedText title={`@${record.username}`} color="text.secondary">
-                    @{record.username}
-                </TruncatedText>
-            </Box>
+            <InlineDetails
+                primary={displayName}
+                secondary={`@${record.username}`}
+                title={`${displayName} · @${record.username}`}
+            />
         </Box>
     );
 };
@@ -127,7 +126,6 @@ const RoleChip: React.FC = () => {
 
         switch (normalizeUserRole(role)) {
             case 'admin':
-            case 'superuser':
                 return {
                     label,
                     color: '#b91c1c',
@@ -152,7 +150,6 @@ const RoleChip: React.FC = () => {
                     icon: <SupervisorIcon sx={{ fontSize: '0.8rem' }} />
                 };
             case 'customer':
-            case 'user':
                 return {
                     label,
                     color: '#15803d',
@@ -263,17 +260,14 @@ const ContactInfo: React.FC = () => {
     const record = useRecordContext();
     if (!record) return null;
 
+    const summary = record.phone ? `${record.email} · ${record.phone}` : record.email;
     return (
-        <Box>
-            <TruncatedText title={record.email} fontWeight={500}>
-                {record.email}
-            </TruncatedText>
-            {record.phone && (
-                <TruncatedText title={record.phone} color="text.secondary">
-                    {record.phone}
-                </TruncatedText>
-            )}
-        </Box>
+        <InlineDetails
+            primary={record.email}
+            secondary={record.phone}
+            title={summary}
+            primaryFontWeight={500}
+        />
     );
 };
 
@@ -375,7 +369,7 @@ const UserEmpty = () => (
  */
 const UserBulkActionButtons = () => (
     <>
-        <BulkDeleteWithConfirmButton label="批量删除" mutationMode="pessimistic" />
+        <FocusSafeBulkDeleteWithConfirmButton label="批量删除" mutationMode="pessimistic" />
     </>
 );
 
@@ -395,6 +389,7 @@ const UserList: React.FC = () => {
             <EnterpriseDatagrid
                 tableId="users.main"
                 columns={userColumns}
+                aria-label="用户列表"
                 rowClick="show"
                 bulkActionButtons={<UserBulkActionButtons />}
                 sx={{

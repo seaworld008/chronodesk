@@ -210,7 +210,7 @@ func (b *ReadPolicyBatch) recordDecision(
 	summaryContext map[string]any,
 	allowed bool,
 ) (*models.PolicyDecision, error) {
-	decisionContext := make(map[string]any, len(b.summary.Context)+len(summaryContext))
+	decisionContext := make(map[string]any)
 	for key, value := range b.summary.Context {
 		decisionContext[key] = value
 	}

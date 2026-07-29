@@ -32,7 +32,7 @@ func TestTicketEmbeddedHumanIdentityOmitsAccountAndContactData(t *testing.T) {
 		TwoFactorEnabled: true, LastLoginAt: &lastLogin,
 	}
 	ticket := (&Ticket{
-		ID: 1, CreatedByID: user.ID, CreatedBy: user, AssignedToID: &user.ID, AssignedTo: user,
+		ID: 1, CreatedByID: &user.ID, CreatedBy: user, AssignedToID: &user.ID, AssignedTo: user,
 	}).ToResponse()
 
 	text := assertEmbeddedIdentityIsMinimal(
@@ -58,7 +58,7 @@ func TestBusinessRecordsEmbedOnlyServicePrincipalSummary(t *testing.T) {
 		RateLimitPerMinute: 999, ConcurrentLimit: 888, EmergencyDisabled: true,
 	}
 	comment := (&TicketComment{
-		UserID: 1, ActorType: ActorTypeServicePrincipal, ActorID: principal.ID,
+		ActorType: ActorTypeServicePrincipal, ActorID: principal.ID,
 		ServicePrincipal: principal, Content: "ok", Type: CommentTypeInternal,
 	}).ToResponse()
 

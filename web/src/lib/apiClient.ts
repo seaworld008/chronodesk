@@ -31,6 +31,7 @@ const problemMessages: Record<string, string> = {
   principal_read_only: '该智能体当前处于只读模式',
   read_only: '当前处于只读模式，写操作已被拒绝',
   not_found: '请求的资源不存在或当前账号无权访问',
+  precondition_required: '数据版本信息缺失，请刷新后重试',
   version_conflict: '数据已被其他操作更新，请刷新后重试',
   lease_conflict: '工单租约已失效或由其他智能体持有',
   lease_expired: '工单租约已过期，请重新领取',
@@ -49,6 +50,19 @@ const problemMessages: Record<string, string> = {
 }
 
 export const containsChineseText = (value: string) => /[\u3400-\u9fff]/u.test(value)
+
+export const localizedUnknownErrorMessage = (
+  error: unknown,
+  fallback = '操作失败，请检查网络后重试',
+) => {
+  if (error instanceof DOMException && error.name === 'AbortError') {
+    return '请求已取消'
+  }
+  if (error instanceof Error && containsChineseText(error.message)) {
+    return error.message
+  }
+  return fallback
+}
 
 export const localizedApiErrorMessage = (
   payload: unknown,
@@ -113,10 +127,15 @@ export async function apiFetch<T = unknown>(path: string, options: ApiOptions = 
     headers.set('Authorization', `Bearer ${token}`)
   }
 
-  const response = await fetch(toUrl(path), {
-    ...options,
-    headers,
-  })
+  let response: Response
+  try {
+    response = await fetch(toUrl(path), {
+      ...options,
+      headers,
+    })
+  } catch (error) {
+    throw new Error(localizedUnknownErrorMessage(error, '网络连接失败，请检查网络后重试'))
+  }
 
   if (options.rawResponse) {
     return response as unknown as T

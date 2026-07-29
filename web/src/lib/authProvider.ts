@@ -1,5 +1,9 @@
 import { AuthProvider, UserIdentity } from 'react-admin'
-import { containsChineseText, localizedApiErrorMessage } from './apiClient'
+import {
+    containsChineseText,
+    localizedApiErrorMessage,
+    localizedUnknownErrorMessage,
+} from './apiClient'
 import {
     isAdministrativeRole,
     isAgentRole,
@@ -13,10 +17,6 @@ const buildUrl = (path: string) => `${apiBase}${path.startsWith('/') ? path : `/
 
 const rememberDevicePreferenceKey = 'rememberDevicePreference'
 
-// 旧版本曾把可信设备凭据写入 localStorage。启动时主动清除残留值；
-// 新版本只允许服务端通过 HttpOnly Cookie 管理该凭据。
-localStorage.removeItem('trustedDeviceToken')
-
 type LoginParams = {
     username: string
     password: string
@@ -24,6 +24,18 @@ type LoginParams = {
     rememberDevice?: boolean
     otpCode?: string
     deviceName?: string
+}
+
+const safeFetch = async (
+    input: RequestInfo | URL,
+    init: RequestInit | undefined,
+    fallback: string,
+) => {
+    try {
+        return await fetch(input, init)
+    } catch (error) {
+        throw new Error(localizedUnknownErrorMessage(error, fallback))
+    }
 }
 
 /**
@@ -55,12 +67,12 @@ export const authProvider: AuthProvider = {
         localStorage.setItem(rememberDevicePreferenceKey, shouldRememberDevice ? 'true' : 'false')
 
         try {
-            const response = await fetch(buildUrl('/auth/login'), {
+            const response = await safeFetch(buildUrl('/auth/login'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 credentials: 'include',
                 body: JSON.stringify(payload),
-            })
+            }, '网络连接失败，无法登录')
 
             const result = await response.json().catch(() => ({}))
 
@@ -116,7 +128,7 @@ export const authProvider: AuthProvider = {
             const refreshToken = localStorage.getItem('refreshToken')
             if (token) {
                 // 调用后端注销API
-                await fetch(buildUrl('/auth/logout'), {
+                await safeFetch(buildUrl('/auth/logout'), {
                     method: 'POST',
                     credentials: 'include',
                     headers: {
@@ -126,7 +138,7 @@ export const authProvider: AuthProvider = {
                     body: refreshToken
                         ? JSON.stringify({ refresh_token: refreshToken })
                         : undefined,
-                })
+                }, '退出登录请求失败')
             }
         } catch (error) {
             console.error('退出登录接口调用失败：', error)
@@ -170,13 +182,13 @@ export const authProvider: AuthProvider = {
             const refreshToken = localStorage.getItem('refreshToken')
             if (refreshToken) {
                 try {
-                    const response = await fetch(buildUrl('/auth/refresh'), {
+                    const response = await safeFetch(buildUrl('/auth/refresh'), {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
                         },
                         body: JSON.stringify({ refresh_token: refreshToken }),
-                    })
+                    }, '登录状态刷新失败')
 
                     if (response.ok) {
                         const auth = await response.json()
@@ -250,11 +262,11 @@ export const authProvider: AuthProvider = {
             }
 
             // 如果本地没有，从API获取
-            const response = await fetch(buildUrl('/auth/me'), {
+            const response = await safeFetch(buildUrl('/auth/me'), {
                 headers: new Headers({
                     Authorization: `Bearer ${token}`,
                 }),
-            })
+            }, '获取当前用户身份失败')
 
             if (!response.ok) {
                 throw new Error('获取当前用户身份失败')
@@ -348,7 +360,7 @@ export const authProvider: AuthProvider = {
             headers: new Headers({ 'Content-Type': 'application/json' }),
         });
 
-        const response = await fetch(request);
+        const response = await safeFetch(request, undefined, '发送密码重置请求失败');
         if (response.status < 200 || response.status >= 300) {
             const error = await response.json().catch(() => null);
             throw new Error(localizedApiErrorMessage(error, response.status, '发送密码重置请求失败'));
@@ -365,7 +377,7 @@ export const authProvider: AuthProvider = {
             headers: new Headers({ 'Content-Type': 'application/json' }),
         });
 
-        const response = await fetch(request);
+        const response = await safeFetch(request, undefined, '重置密码失败');
         if (response.status < 200 || response.status >= 300) {
             const error = await response.json().catch(() => null);
             throw new Error(localizedApiErrorMessage(error, response.status, '重置密码失败'));
@@ -374,5 +386,3 @@ export const authProvider: AuthProvider = {
         return Promise.resolve();
     },
 };
-
-export default authProvider;

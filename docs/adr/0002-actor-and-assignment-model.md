@@ -15,18 +15,19 @@ All writes use `ActorRef` with `human`, `service_principal`, or `system`.
 Assignment is validated by one domain Module before a versioned Ticket update.
 Protocol Adapters only decode transport values and translate stable errors.
 
-Compatibility user columns remain a persistence bridge. The Actor fields are
-authoritative for audit and Agent identity.
+Nullable human and service-principal foreign keys are query projections. The
+Actor fields are authoritative for audit and Agent identity.
 
 ## Consequences
 
 - MCP and A2A accept and reject the same assignees.
-- Service Principal status, emergency stop, and compatibility mapping are
-  checked once.
+- Service Principal status, emergency stop, and Actor projection are checked
+  once.
+- `system` may author a write but cannot become the Ticket assignee.
 - Deleting a protocol Adapter cannot delete Assignment rules.
 
 ## Verification
 
 Domain and cross-protocol tests cover missing humans, disabled or
-emergency-disabled Service Principals, system Assignment, and successful change
-sets.
+emergency-disabled Service Principals, rejected system assignees, released
+Assignments, and successful change sets.

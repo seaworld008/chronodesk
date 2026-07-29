@@ -16,7 +16,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/seaworld008/chronodesk/server/internal/models"
-	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
@@ -67,120 +66,6 @@ func (s *UserService) SetAvatarStorage(storage AttachmentStorage, maxBytes int64
 	if maxBytes > 0 {
 		s.avatarMaxBytes = maxBytes
 	}
-}
-
-// GetUserProfile 获取用户详细信息
-func (s *UserService) GetUserProfile(ctx context.Context, userID uint) (*models.User, error) {
-	var user models.User
-	err := s.db.WithContext(ctx).
-		Preload("Manager").
-		First(&user, userID).Error
-	if err != nil {
-		return nil, fmt.Errorf("failed to get user profile: %w", err)
-	}
-
-	return &user, nil
-}
-
-// UpdateUserProfile 更新用户个人资料
-func (s *UserService) UpdateUserProfile(ctx context.Context, userID uint, req *models.UserUpdateRequest) error {
-	user := &models.User{}
-	if err := s.db.WithContext(ctx).First(user, userID).Error; err != nil {
-		return fmt.Errorf("user not found: %w", err)
-	}
-
-	// 构建更新数据
-	updates := make(map[string]interface{})
-
-	if req.Email != nil {
-		// 检查邮箱是否被其他用户使用
-		var count int64
-		s.db.Model(&models.User{}).Where("email = ? AND id != ?", *req.Email, userID).Count(&count)
-		if count > 0 {
-			return fmt.Errorf("email already exists")
-		}
-		updates["email"] = *req.Email
-		updates["email_verified"] = false // 邮箱变更需要重新验证
-	}
-
-	if req.Phone != nil {
-		updates["phone"] = *req.Phone
-		updates["phone_verified"] = false // 手机变更需要重新验证
-	}
-
-	if req.FirstName != nil {
-		updates["first_name"] = *req.FirstName
-	}
-
-	if req.LastName != nil {
-		updates["last_name"] = *req.LastName
-	}
-
-	if req.DisplayName != nil {
-		updates["display_name"] = *req.DisplayName
-	}
-
-	if req.Avatar != nil {
-		updates["avatar"] = *req.Avatar
-	}
-
-	if req.Timezone != nil {
-		updates["timezone"] = *req.Timezone
-	}
-
-	if req.Language != nil {
-		updates["language"] = *req.Language
-	}
-
-	if req.Department != nil {
-		updates["department"] = *req.Department
-	}
-
-	if req.JobTitle != nil {
-		updates["job_title"] = *req.JobTitle
-	}
-
-	if req.ManagerID != nil {
-		updates["manager_id"] = *req.ManagerID
-	}
-
-	// 执行更新
-	if len(updates) > 0 {
-		if err := s.db.WithContext(ctx).Model(user).Updates(updates).Error; err != nil {
-			return fmt.Errorf("failed to update user profile: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// ChangePassword 修改用户密码
-func (s *UserService) ChangePassword(ctx context.Context, userID uint, currentPassword, newPassword string) error {
-	user := &models.User{}
-	if err := s.db.WithContext(ctx).First(user, userID).Error; err != nil {
-		return fmt.Errorf("user not found: %w", err)
-	}
-
-	// 验证当前密码
-	if !s.verifyPassword(user.PasswordHash, currentPassword) {
-		return fmt.Errorf("invalid current password")
-	}
-
-	// 加密新密码
-	hashedPassword, err := s.hashPassword(newPassword)
-	if err != nil {
-		return fmt.Errorf("failed to hash new password: %w", err)
-	}
-
-	// 更新密码
-	if err := s.db.WithContext(ctx).Model(user).Update("password_hash", hashedPassword).Error; err != nil {
-		return fmt.Errorf("failed to update password: %w", err)
-	}
-
-	// 记录密码修改历史（可选）
-	s.recordPasswordChange(ctx, userID)
-
-	return nil
 }
 
 // GetLoginHistory 获取用户登录历史
@@ -258,95 +143,6 @@ func (s *UserService) GetLoginHistory(ctx context.Context, userID uint, req *mod
 	}
 
 	return responses, total, nil
-}
-
-// RecordLogin 记录用户登录
-func (s *UserService) RecordLogin(ctx context.Context, userID uint, req *RecordLoginRequest) error {
-	user := &models.User{}
-	if err := s.db.WithContext(ctx).First(user, userID).Error; err != nil {
-		return fmt.Errorf("user not found: %w", err)
-	}
-
-	// 解析设备信息
-	deviceInfo := parseUserAgent(req.UserAgent)
-
-	loginHistory := &models.LoginHistory{
-		UserID:      userID,
-		Username:    user.Username,
-		Email:       user.Email,
-		IPAddress:   req.IPAddress,
-		UserAgent:   req.UserAgent,
-		LoginTime:   time.Now(),
-		SessionID:   req.SessionID,
-		LoginStatus: models.LoginStatusSuccess,
-		LoginMethod: req.LoginMethod,
-
-		// 设备信息
-		DeviceType:      deviceInfo.DeviceType,
-		OperatingSystem: deviceInfo.OperatingSystem,
-		Browser:         deviceInfo.Browser,
-
-		// 地理位置信息（如果有）
-		Country:  req.Country,
-		Region:   req.Region,
-		City:     req.City,
-		Timezone: req.Timezone,
-
-		IsActive: true,
-	}
-
-	if err := s.db.WithContext(ctx).Create(loginHistory).Error; err != nil {
-		return fmt.Errorf("failed to record login: %w", err)
-	}
-
-	// 更新用户最后登录信息
-	now := time.Now()
-	updates := map[string]interface{}{
-		"last_login_at": &now,
-		"last_login_ip": req.IPAddress,
-	}
-
-	if err := s.db.WithContext(ctx).Model(user).Updates(updates).Error; err != nil {
-		// 记录日志但不返回错误
-		fmt.Printf("Warning: failed to update user last login info: %v\n", err)
-	}
-
-	return nil
-}
-
-// RecordLogout 记录用户退出登录
-func (s *UserService) RecordLogout(ctx context.Context, userID uint, sessionID string) error {
-	now := time.Now()
-
-	// 查找活跃的登录会话
-	var loginHistory models.LoginHistory
-	err := s.db.WithContext(ctx).
-		Where("user_id = ? AND session_id = ? AND is_active = ?", userID, sessionID, true).
-		First(&loginHistory).Error
-
-	if err != nil {
-		if err == gorm.ErrRecordNotFound {
-			// 会话未找到，可能已经过期或清理
-			return nil
-		}
-		return fmt.Errorf("failed to find login session: %w", err)
-	}
-
-	// 计算会话持续时间
-	sessionDuration := int64(now.Sub(loginHistory.LoginTime).Seconds())
-
-	// 更新登录记录
-	updates := map[string]interface{}{
-		"logout_time":      &now,
-		"session_duration": sessionDuration,
-		"is_active":        false,
-	}
-
-	if err := s.db.WithContext(ctx).Model(&loginHistory).Updates(updates).Error; err != nil {
-		return fmt.Errorf("failed to update logout time: %w", err)
-	}
-
-	return nil
 }
 
 // DeleteLoginSession 删除指定用户的登录会话（用于踢设备下线）
@@ -618,16 +414,6 @@ func avatarStorageKey(avatarURL string) (string, bool) {
 	return "avatars/" + cleaned, true
 }
 
-// recordPasswordChange 记录密码修改（内部方法）
-func (s *UserService) recordPasswordChange(ctx context.Context, userID uint) {
-	// 可以在这里记录密码修改历史
-	// 例如：更新密码修改时间、记录安全日志等
-	now := time.Now()
-	s.db.WithContext(ctx).Model(&models.User{}).
-		Where("id = ?", userID).
-		Update("password_reset_at", &now)
-}
-
 // calculateSecurityScore 计算安全评分
 func (s *UserService) calculateSecurityScore(user *models.User, stats *models.UserProfileStats) int {
 	score := 0
@@ -663,52 +449,6 @@ func (s *UserService) calculateSecurityScore(user *models.User, stats *models.Us
 	return score
 }
 
-// parseUserAgent 解析User-Agent字符串
-func parseUserAgent(userAgent string) *DeviceInfo {
-	deviceInfo := &DeviceInfo{
-		DeviceType:      "desktop",
-		OperatingSystem: "Unknown",
-		Browser:         "Unknown",
-	}
-
-	userAgent = strings.ToLower(userAgent)
-
-	// 检测设备类型
-	if strings.Contains(userAgent, "mobile") || strings.Contains(userAgent, "android") || strings.Contains(userAgent, "iphone") {
-		deviceInfo.DeviceType = "mobile"
-	} else if strings.Contains(userAgent, "tablet") || strings.Contains(userAgent, "ipad") {
-		deviceInfo.DeviceType = "tablet"
-	}
-
-	// 检测操作系统
-	if strings.Contains(userAgent, "windows") {
-		deviceInfo.OperatingSystem = "Windows"
-	} else if strings.Contains(userAgent, "macintosh") || strings.Contains(userAgent, "mac os") {
-		deviceInfo.OperatingSystem = "macOS"
-	} else if strings.Contains(userAgent, "linux") {
-		deviceInfo.OperatingSystem = "Linux"
-	} else if strings.Contains(userAgent, "android") {
-		deviceInfo.OperatingSystem = "Android"
-	} else if strings.Contains(userAgent, "ios") || strings.Contains(userAgent, "iphone") || strings.Contains(userAgent, "ipad") {
-		deviceInfo.OperatingSystem = "iOS"
-	}
-
-	// 检测浏览器
-	if strings.Contains(userAgent, "chrome") {
-		deviceInfo.Browser = "Chrome"
-	} else if strings.Contains(userAgent, "firefox") {
-		deviceInfo.Browser = "Firefox"
-	} else if strings.Contains(userAgent, "safari") && !strings.Contains(userAgent, "chrome") {
-		deviceInfo.Browser = "Safari"
-	} else if strings.Contains(userAgent, "edge") {
-		deviceInfo.Browser = "Edge"
-	} else if strings.Contains(userAgent, "opera") {
-		deviceInfo.Browser = "Opera"
-	}
-
-	return deviceInfo
-}
-
 func sanitizeLoginHistoryOrder(orderBy, order string) (string, string) {
 	column := "login_time"
 	if requested := strings.ToLower(strings.TrimSpace(orderBy)); requested != "" {
@@ -726,44 +466,4 @@ func sanitizeLoginHistoryOrder(orderBy, order string) (string, string) {
 	}
 
 	return column, direction
-}
-
-// 请求和响应结构体
-
-// RecordLoginRequest 记录登录请求
-type RecordLoginRequest struct {
-	IPAddress   string `json:"ip_address"`
-	UserAgent   string `json:"user_agent"`
-	SessionID   string `json:"session_id"`
-	LoginMethod string `json:"login_method"`
-
-	// 地理位置信息（可选）
-	Country  string `json:"country,omitempty"`
-	Region   string `json:"region,omitempty"`
-	City     string `json:"city,omitempty"`
-	Timezone string `json:"timezone,omitempty"`
-}
-
-// DeviceInfo 设备信息
-type DeviceInfo struct {
-	DeviceType      string `json:"device_type"`
-	OperatingSystem string `json:"operating_system"`
-	Browser         string `json:"browser"`
-}
-
-// 密码处理方法
-
-// hashPassword 加密密码
-func (s *UserService) hashPassword(password string) (string, error) {
-	hashedBytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		return "", err
-	}
-	return string(hashedBytes), nil
-}
-
-// verifyPassword 验证密码
-func (s *UserService) verifyPassword(hashedPassword, password string) bool {
-	err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password))
-	return err == nil
 }

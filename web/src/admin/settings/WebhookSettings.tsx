@@ -9,6 +9,7 @@ import {
   DialogContent,
   DialogTitle,
   FormControl,
+  FormControlLabel,
   Grid,
   IconButton,
   InputLabel,
@@ -35,9 +36,10 @@ import {
   Refresh as RefreshIcon,
 } from '@mui/icons-material'
 import { useNotify } from 'react-admin'
-import { apiFetch } from '@/lib/apiClient'
+import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
 import BackButton from '../common/BackButton'
 import {
+  InlineDetails,
   ResizableMuiTable,
   TruncatedText,
   type ResizableColumn,
@@ -61,6 +63,9 @@ interface WebhookConfig {
   webhook_url: string
   status: string
   enabled_events_list?: string[]
+  filter_rules_obj?: {
+    transition_statuses?: string[]
+  }
   message_format?: string
   retry_count: number
   retry_interval: number
@@ -94,6 +99,7 @@ interface WebhookForm {
   secret?: string
   access_token?: string
   enabled_events: string[]
+  transition_statuses: string[]
   message_format: string
   retry_count: number
   retry_interval: number
@@ -113,33 +119,61 @@ const providerOptions = [
   { value: 'custom', label: '自定义', hint: '自定义 HTTP 服务，支持自定义请求头。' },
 ]
 
+const ticketTransitionedEvent = 'io.chronodesk.ticket.transitioned.v1'
+
 const eventOptions = [
-  'ticket.created',
-  'ticket.assigned',
-  'ticket.updated',
-  'ticket.resolved',
-  'ticket.closed',
-  'ticket.comment',
-  'ticket.escalated',
-  'automation.notification',
-  'user.registered',
-  'system.alert',
-]
+  'io.chronodesk.ticket.created.v1',
+  'io.chronodesk.ticket.updated.v1',
+  'io.chronodesk.ticket.assigned.v1',
+  ticketTransitionedEvent,
+  'io.chronodesk.ticket.escalated.v1',
+  'io.chronodesk.ticket.comment.created.v1',
+  'io.chronodesk.ticket.attachment.created.v1',
+  'io.chronodesk.ticket.sla.breached.v1',
+  'io.chronodesk.ticket.deleted.v1',
+  'io.chronodesk.automation.notification.requested.v1',
+  'io.chronodesk.system.alert.v1',
+] as const
 
 const eventLabels: Record<string, string> = {
-  'ticket.created': '工单创建',
-  'ticket.assigned': '工单分配',
-  'ticket.updated': '工单更新',
-  'ticket.resolved': '工单解决',
-  'ticket.closed': '工单关闭',
-  'ticket.comment': '工单评论',
-  'ticket.escalated': '工单升级',
-  'automation.notification': '自动化通知',
-  'user.registered': '用户注册',
-  'system.alert': '系统警报',
+  'io.chronodesk.ticket.created.v1': '工单创建',
+  'io.chronodesk.ticket.updated.v1': '工单内容更新',
+  'io.chronodesk.ticket.assigned.v1': '工单分配',
+  [ticketTransitionedEvent]: '工单状态流转',
+  'io.chronodesk.ticket.escalated.v1': '工单升级',
+  'io.chronodesk.ticket.comment.created.v1': '工单评论新增',
+  'io.chronodesk.ticket.attachment.created.v1': '工单附件新增',
+  'io.chronodesk.ticket.sla.breached.v1': 'SLA 违约',
+  'io.chronodesk.ticket.deleted.v1': '工单删除',
+  'io.chronodesk.automation.notification.requested.v1': '自动化通知请求',
+  'io.chronodesk.system.alert.v1': '系统警报',
 }
 
-const eventLabel = (event: string) => eventLabels[event] ?? '自定义事件'
+const eventLabel = (event: string) => eventLabels[event] ?? '不受支持的事件'
+
+const transitionStatusOptions = [
+  { value: 'open', label: '待处理' },
+  { value: 'in_progress', label: '处理中' },
+  { value: 'pending', label: '挂起' },
+  { value: 'resolved', label: '已解决' },
+  { value: 'closed', label: '已关闭' },
+  { value: 'cancelled', label: '已取消' },
+]
+
+const transitionStatusLabel = (status: string) =>
+  transitionStatusOptions.find((item) => item.value === status)?.label ?? '未知状态'
+
+const webhookEventSummary = (webhook: WebhookConfig) => {
+  const statuses = webhook.filter_rules_obj?.transition_statuses ?? []
+  return (webhook.enabled_events_list ?? [])
+    .map((event) => {
+      if (event !== ticketTransitionedEvent || statuses.length === 0) {
+        return eventLabel(event)
+      }
+      return `${eventLabel(event)}（${statuses.map(transitionStatusLabel).join('、')}）`
+    })
+    .join('、')
+}
 
 const statusOptions = [
   { value: 'active', label: '启用' },
@@ -155,7 +189,8 @@ const defaultForm: WebhookForm = {
   webhook_url: '',
   secret: '',
   access_token: '',
-  enabled_events: ['ticket.created'],
+  enabled_events: ['io.chronodesk.ticket.created.v1'],
+  transition_statuses: [],
   message_format: 'markdown',
   retry_count: 3,
   retry_interval: 60,
@@ -166,6 +201,13 @@ const defaultForm: WebhookForm = {
   status: 'inactive',
 }
 
+const webhookFormFieldIDs = {
+  status: 'webhook-status',
+  provider: 'webhook-provider',
+  enabledEvents: 'webhook-enabled-events',
+  transitionStatuses: 'webhook-transition-statuses',
+} as const
+
 const statusColor = {
   active: 'success',
   inactive: 'default',
@@ -174,6 +216,11 @@ const statusColor = {
 } as const
 
 type FormErrors = Record<string, string>
+type PendingWebhookAction = {
+  kind: 'delete' | 'test'
+  id: number
+  name: string
+}
 
 const WebhookSettings: React.FC = () => {
   const notify = useNotify()
@@ -185,12 +232,10 @@ const WebhookSettings: React.FC = () => {
   const [errors, setErrors] = useState<FormErrors>({})
   const [testId, setTestId] = useState<number | null>(null)
   const [saving, setSaving] = useState(false)
+  const [pendingAction, setPendingAction] = useState<PendingWebhookAction | null>(null)
 
   const extractErrorMessage = useCallback((error: unknown, fallback: string) => {
-    if (error instanceof Error) {
-      return error.message
-    }
-    return fallback
+    return localizedUnknownErrorMessage(error, fallback)
   }, [])
 
   const fetchWebhooks = useCallback(async () => {
@@ -226,6 +271,7 @@ const WebhookSettings: React.FC = () => {
       secret: webhook.secret || '',
       access_token: webhook.access_token || '',
       enabled_events: webhook.enabled_events_list ?? [],
+      transition_statuses: webhook.filter_rules_obj?.transition_statuses ?? [],
       message_format: webhook.message_format || 'markdown',
       retry_count: webhook.retry_count,
       retry_interval: webhook.retry_interval,
@@ -253,7 +299,19 @@ const WebhookSettings: React.FC = () => {
 
   const handleEventsChange = (event: SelectChangeEvent<string[]>) => {
     const value = typeof event.target.value === 'string' ? event.target.value.split(',') : event.target.value
-    handleFormChange('enabled_events', value)
+    setForm((previous) => ({
+      ...previous,
+      enabled_events: value,
+      transition_statuses: value.includes(ticketTransitionedEvent)
+        ? previous.transition_statuses
+        : [],
+    }))
+    setErrors((previous) => ({ ...previous, enabled_events: '' }))
+  }
+
+  const handleTransitionStatusesChange = (event: SelectChangeEvent<string[]>) => {
+    const value = typeof event.target.value === 'string' ? event.target.value.split(',') : event.target.value
+    handleFormChange('transition_statuses', value)
   }
 
   const validate = (): boolean => {
@@ -263,8 +321,8 @@ const WebhookSettings: React.FC = () => {
     }
     if (!form.webhook_url.trim()) {
       next.webhook_url = '请输入Webhook URL'
-    } else if (!/^https?:\/\//i.test(form.webhook_url)) {
-      next.webhook_url = 'URL 需以 http/https 开头'
+    } else if (!/^https:\/\//i.test(form.webhook_url)) {
+      next.webhook_url = 'Webhook 地址必须使用公网 HTTPS'
     }
     if (form.enabled_events.length === 0) {
       next.enabled_events = '至少选择一个订阅事件'
@@ -295,6 +353,11 @@ const WebhookSettings: React.FC = () => {
       provider: form.provider,
       webhook_url: form.webhook_url.trim(),
       enabled_events: form.enabled_events,
+      filter_rules: {
+        transition_statuses: form.enabled_events.includes(ticketTransitionedEvent)
+          ? form.transition_statuses
+          : [],
+      },
       message_format: form.message_format.trim(),
       retry_count: Number(form.retry_count || 0),
       retry_interval: Number(form.retry_interval || 0),
@@ -343,8 +406,7 @@ const WebhookSettings: React.FC = () => {
     }
   }
 
-  const handleDelete = async (id: number) => {
-    if (!window.confirm('确定要删除该 Webhook 吗？')) return
+  const executeDelete = async (id: number) => {
     try {
       await apiFetch(`/webhooks/${id}`, { method: 'DELETE' })
       notify('删除成功', { type: 'success' })
@@ -354,8 +416,7 @@ const WebhookSettings: React.FC = () => {
     }
   }
 
-  const handleTest = async (id: number) => {
-    if (!window.confirm('测试将立即向该 Webhook 地址发送一条真实请求，确定继续吗？')) return
+  const executeTest = async (id: number) => {
     setTestId(id)
     try {
       await apiFetch(`/webhooks/${id}/test`, { method: 'POST' })
@@ -365,6 +426,17 @@ const WebhookSettings: React.FC = () => {
     } finally {
       setTestId(null)
     }
+  }
+
+  const confirmPendingAction = async () => {
+    const action = pendingAction
+    if (!action) return
+    setPendingAction(null)
+    if (action.kind === 'delete') {
+      await executeDelete(action.id)
+      return
+    }
+    await executeTest(action.id)
   }
 
   const providerHint = useMemo(() => {
@@ -408,7 +480,12 @@ const WebhookSettings: React.FC = () => {
         </Stack>
       </Stack>
       <TableContainer component={Paper}>
-        <ResizableMuiTable tableId="settings.webhooks" columns={webhookColumns} size="small">
+        <ResizableMuiTable
+          tableId="settings.webhooks"
+          columns={webhookColumns}
+          size="small"
+          aria-label="Webhook 配置列表"
+        >
           <TableHead>
             <TableRow>
               <TableCell>名称</TableCell>
@@ -431,10 +508,11 @@ const WebhookSettings: React.FC = () => {
             {items.map((item) => (
               <TableRow key={item.id} hover>
                 <TableCell>
-                  <TruncatedText title={item.name} fontWeight={600}>{item.name}</TruncatedText>
-                  <TruncatedText title={item.description || '—'} color="text.secondary">
-                    {item.description || '—'}
-                  </TruncatedText>
+                  <InlineDetails
+                    primary={item.name}
+                    secondary={item.description || '—'}
+                    title={`${item.name} · ${item.description || '—'}`}
+                  />
                 </TableCell>
                 <TableCell>
                   <Tooltip title={`提供商代码：${item.provider}`}>
@@ -451,28 +529,22 @@ const WebhookSettings: React.FC = () => {
                   </Tooltip>
                 </TableCell>
                 <TableCell>
-                  {(item.enabled_events_list ?? []).slice(0, 3).map((evt) => (
-                    <Tooltip key={`${item.id}-${evt}`} title={`事件代码：${evt}`}>
-                      <Chip label={eventLabel(evt)} size="small" sx={{ mr: 0.5, mb: 0.5 }} />
-                    </Tooltip>
-                  ))}
-                  {(item.enabled_events_list ?? []).length > 3 ? '…' : null}
+                  <TruncatedText
+                    title={(item.enabled_events_list ?? []).join('、') || '未订阅事件'}
+                  >
+                    {webhookEventSummary(item) || '未订阅事件'}
+                  </TruncatedText>
                 </TableCell>
                 <TableCell>
-                  <Typography variant="body2">总计 {item.total_sent}</Typography>
-                  <Typography variant="caption" sx={{
-                    color: "success.main"
-                  }}>成功 {item.total_success}</Typography>
-                  <Typography
-                    variant="caption"
-                    sx={{
-                      color: "error.main",
-                      ml: 1
-                    }}>失败 {item.total_failed}</Typography>
+                  <TruncatedText
+                    title={`总计 ${item.total_sent} · 成功 ${item.total_success} · 失败 ${item.total_failed}`}
+                  >
+                    总计 {item.total_sent} · 成功 {item.total_success} · 失败 {item.total_failed}
+                  </TruncatedText>
                 </TableCell>
                 <TableCell>
                   <Typography variant="body2">
-                    {item.last_success_at ? new Date(item.last_success_at).toLocaleString() : '—'}
+                    {item.last_success_at ? new Date(item.last_success_at).toLocaleString('zh-CN') : '—'}
                   </Typography>
                 </TableCell>
                 <TableCell align="right">
@@ -483,7 +555,11 @@ const WebhookSettings: React.FC = () => {
                       size="small"
                       aria-label={`测试 Webhook：${item.name}`}
                       title="发送测试请求"
-                      onClick={() => handleTest(item.id)}
+                      onClick={() => setPendingAction({
+                        kind: 'test',
+                        id: item.id,
+                        name: item.name,
+                      })}
                       disabled={testId === item.id}
                     >
                       {testId === item.id ? <CircularProgress size={16} /> : <TestIcon fontSize="small" />}
@@ -500,7 +576,11 @@ const WebhookSettings: React.FC = () => {
                       size="small"
                       aria-label={`删除 Webhook：${item.name}`}
                       title="删除 Webhook"
-                      onClick={() => handleDelete(item.id)}
+                      onClick={() => setPendingAction({
+                        kind: 'delete',
+                        id: item.id,
+                        name: item.name,
+                      })}
                     >
                       <DeleteIcon fontSize="small" />
                     </IconButton>
@@ -535,8 +615,10 @@ const WebhookSettings: React.FC = () => {
                 md: 6
               }}>
               <FormControl fullWidth error={Boolean(errors.status)}>
-                <InputLabel>状态</InputLabel>
+                <InputLabel id={`${webhookFormFieldIDs.status}-label`}>状态</InputLabel>
                 <Select
+                  id={webhookFormFieldIDs.status}
+                  labelId={`${webhookFormFieldIDs.status}-label`}
                   label="状态"
                   value={form.status}
                   onChange={(e) => handleFormChange('status', e.target.value)}
@@ -564,8 +646,10 @@ const WebhookSettings: React.FC = () => {
                 md: 6
               }}>
               <FormControl fullWidth>
-                <InputLabel>提供商</InputLabel>
+                <InputLabel id={`${webhookFormFieldIDs.provider}-label`}>提供商</InputLabel>
                 <Select
+                  id={webhookFormFieldIDs.provider}
+                  labelId={`${webhookFormFieldIDs.provider}-label`}
                   label="提供商"
                   value={form.provider}
                   onChange={(e) => handleFormChange('provider', e.target.value)}
@@ -626,8 +710,10 @@ const WebhookSettings: React.FC = () => {
             </Grid>
             <Grid size={12}>
               <FormControl fullWidth error={Boolean(errors.enabled_events)}>
-                <InputLabel>订阅事件</InputLabel>
+                <InputLabel id={`${webhookFormFieldIDs.enabledEvents}-label`}>订阅事件</InputLabel>
                 <Select
+                  id={webhookFormFieldIDs.enabledEvents}
+                  labelId={`${webhookFormFieldIDs.enabledEvents}-label`}
                   label="订阅事件"
                   multiple
                   value={form.enabled_events}
@@ -641,10 +727,44 @@ const WebhookSettings: React.FC = () => {
                   ))}
                 </Select>
                 <Typography variant="caption" color={errors.enabled_events ? 'error' : 'text.secondary'}>
-                  {errors.enabled_events || 'Webhook 将在所选事件发生时触发'}
+                  {errors.enabled_events || '仅支持当前完整 CloudEvent 类型；事件标识会原样写入投递日志和请求体。'}
                 </Typography>
               </FormControl>
             </Grid>
+            {form.enabled_events.includes(ticketTransitionedEvent) && (
+              <Grid size={12}>
+                <FormControl fullWidth>
+                  <InputLabel id={`${webhookFormFieldIDs.transitionStatuses}-label`}>
+                    状态流转筛选
+                  </InputLabel>
+                  <Select
+                    id={webhookFormFieldIDs.transitionStatuses}
+                    labelId={`${webhookFormFieldIDs.transitionStatuses}-label`}
+                    label="状态流转筛选"
+                    multiple
+                    value={form.transition_statuses}
+                    onChange={handleTransitionStatusesChange}
+                    renderValue={(selected) =>
+                      selected.length > 0
+                        ? selected.map(transitionStatusLabel).join('、')
+                        : '全部状态'
+                    }
+                  >
+                    {transitionStatusOptions.map((status) => (
+                      <MenuItem key={status.value} value={status.value}>
+                        {status.label}（{status.value}）
+                      </MenuItem>
+                    ))}
+                  </Select>
+                  <Typography variant="caption" color="text.secondary">
+                    留空表示订阅全部状态流转。若只关心已解决或已关闭，请在此明确选择，事件类型仍为
+                    {' '}
+                    {ticketTransitionedEvent}
+                    。
+                  </Typography>
+                </FormControl>
+              </Grid>
+            )}
             <Grid
               size={{
                 xs: 12,
@@ -663,15 +783,16 @@ const WebhookSettings: React.FC = () => {
                 xs: 12,
                 md: 2
               }}>
-              <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
-                <Switch
-                  checked={form.is_async}
-                  onChange={(e) => handleFormChange('is_async', e.target.checked)}
-                />
-                <Typography variant="body2" sx={{ ml: 1 }}>
-                  异步发送
-                </Typography>
-              </Box>
+              <FormControlLabel
+                sx={{ height: '100%', m: 0 }}
+                control={(
+                  <Switch
+                    checked={form.is_async}
+                    onChange={(e) => handleFormChange('is_async', e.target.checked)}
+                  />
+                )}
+                label="异步发送"
+              />
             </Grid>
             <Grid
               size={{
@@ -754,6 +875,31 @@ const WebhookSettings: React.FC = () => {
           <Button onClick={closeForm}>取消</Button>
           <Button onClick={handleSave} variant="contained" disabled={saving}>
             {saving ? '保存中…' : '保存'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        open={Boolean(pendingAction)}
+        onClose={() => setPendingAction(null)}
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle>
+          {pendingAction?.kind === 'delete' ? '删除 Webhook' : '测试 Webhook'}
+        </DialogTitle>
+        <DialogContent>
+          {pendingAction?.kind === 'delete'
+            ? `确定删除“${pendingAction.name}”吗？删除后将停止对应事件投递。`
+            : `测试将立即向“${pendingAction?.name || ''}”配置的地址发送一条真实请求，确定继续吗？`}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPendingAction(null)}>取消</Button>
+          <Button
+            color={pendingAction?.kind === 'delete' ? 'error' : 'primary'}
+            variant="contained"
+            onClick={() => void confirmPendingAction()}
+          >
+            {pendingAction?.kind === 'delete' ? '确认删除' : '确认发送测试'}
           </Button>
         </DialogActions>
       </Dialog>

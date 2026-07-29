@@ -9,7 +9,6 @@ import {
     useRecordContext,
     TopToolbar,
     EditButton,
-    DeleteButton,
     ListButton,
     TabbedShowLayout,
     Tab,
@@ -17,6 +16,7 @@ import {
     NumberField,
     FunctionField,
 } from 'react-admin';
+import { FocusSafeDeleteButton } from '@/components/actions/FocusSafeDeleteButtons';
 import {
     Box,
     Typography,
@@ -108,14 +108,12 @@ const UserHeader: React.FC = () => {
     const getRoleConfig = (role: User['role']): ChipConfig => {
         switch (normalizeUserRole(role)) {
             case 'admin':
-            case 'superuser':
                 return { color: 'error', icon: <AdminIcon /> };
             case 'agent':
                 return { color: 'primary', icon: <SupportIcon /> };
             case 'supervisor':
                 return { color: 'secondary', icon: <SupervisorIcon /> };
             case 'customer':
-            case 'user':
                 return { color: 'success', icon: <CustomerIcon /> };
             default:
                 return { color: 'default', icon: <PersonIcon /> };
@@ -418,7 +416,7 @@ const UserShowActions = () => (
     <TopToolbar>
         <ListButton label="返回列表" />
         <EditButton label="编辑" />
-        <DeleteButton label="删除" mutationMode="pessimistic" />
+        <FocusSafeDeleteButton label="删除" mutationMode="pessimistic" />
     </TopToolbar>
 );
 
@@ -552,6 +550,7 @@ const UserShow: React.FC = () => {
                             <EnterpriseDatagrid
                                 tableId="users.show.created-tickets"
                                 columns={relatedTicketColumns}
+                                aria-label="该用户创建的工单列表"
                                 bulkActionButtons={false}
                             >
                                 <TextField source="ticket_number" label="工单编号" />
@@ -597,6 +596,7 @@ const UserShow: React.FC = () => {
                                 <EnterpriseDatagrid
                                     tableId="users.show.assigned-tickets"
                                     columns={relatedTicketColumns}
+                                    aria-label="该用户负责的工单列表"
                                     bulkActionButtons={false}
                                 >
                                     <TextField source="ticket_number" label="工单编号" />

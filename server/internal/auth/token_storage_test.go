@@ -41,7 +41,7 @@ func newTokenStorageTestRepository(t *testing.T) (*gorm.DB, TokenRepository, Use
 		Username:     "token-storage-user",
 		Email:        "token-storage@example.test",
 		PasswordHash: "not-a-real-password",
-		Role:         models.RoleUser,
+		Role:         models.RoleCustomer,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&modelUser).Error; err != nil {
@@ -52,7 +52,7 @@ func newTokenStorageTestRepository(t *testing.T) (*gorm.DB, TokenRepository, Use
 		Username:     modelUser.Username,
 		Email:        modelUser.Email,
 		PasswordHash: modelUser.PasswordHash,
-		Role:         RoleUser,
+		Role:         RoleCustomer,
 		Status:       StatusActive,
 	}
 	return db, NewGormTokenRepository(db), user
@@ -239,7 +239,7 @@ func TestRefreshRotationIsAtomicAndSingleWinner(t *testing.T) {
 			err := repository.RotateRefreshToken(ctx, current, &RefreshToken{
 				UserID: user.ID, Token: next, SessionID: "rotation-session",
 				ExpiresAt: time.Now().Add(time.Hour),
-			})
+			}, time.Now())
 			outcomes <- outcome{token: next, err: err}
 		}(i)
 	}
@@ -286,7 +286,7 @@ func TestRefreshRotationRollsBackWhenReplacementCannotBeStored(t *testing.T) {
 	if err := repository.RotateRefreshToken(ctx, current, &RefreshToken{
 		UserID: user.ID, Token: duplicate, SessionID: "rollback-session",
 		ExpiresAt: time.Now().Add(time.Hour),
-	}); err == nil {
+	}, time.Now()); err == nil {
 		t.Fatal("rotation unexpectedly stored a duplicate replacement")
 	}
 	if _, err := repository.GetRefreshToken(ctx, current); err != nil {

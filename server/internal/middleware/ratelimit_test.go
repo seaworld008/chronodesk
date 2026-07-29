@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,89 @@ type testRedisRateExecutor struct {
 	keys   []string
 	args   []interface{}
 	script string
+}
+
+// testSlidingWindow is a deterministic in-process RateLimiter used only to
+// exercise middleware header and concurrency behavior. Production composition
+// uses RedisSlidingWindow exclusively.
+type testSlidingWindow struct {
+	mu      sync.Mutex
+	windows map[string][]time.Time
+	limit   int
+	window  time.Duration
+}
+
+func newTestSlidingWindow(limit int, window time.Duration) *testSlidingWindow {
+	if limit <= 0 {
+		panic("test sliding window limit must be positive")
+	}
+	if window <= 0 {
+		panic("test sliding window duration must be positive")
+	}
+	return &testSlidingWindow{
+		windows: make(map[string][]time.Time),
+		limit:   limit,
+		window:  window,
+	}
+}
+
+func (limiter *testSlidingWindow) Allow(key string) bool {
+	return limiter.AllowN(key, 1)
+}
+
+func (limiter *testSlidingWindow) AllowN(key string, count int) bool {
+	if count <= 0 {
+		return false
+	}
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	now := time.Now()
+	limiter.removeExpired(key, now)
+	if len(limiter.windows[key])+count > limiter.limit {
+		return false
+	}
+	for range count {
+		limiter.windows[key] = append(limiter.windows[key], now)
+	}
+	return true
+}
+
+func (limiter *testSlidingWindow) Limit() int {
+	return limiter.limit
+}
+
+func (limiter *testSlidingWindow) Remaining(key string) int {
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	limiter.removeExpired(key, time.Now())
+	return limiter.limit - len(limiter.windows[key])
+}
+
+func (limiter *testSlidingWindow) Reset(key string) time.Time {
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	now := time.Now()
+	limiter.removeExpired(key, now)
+	if len(limiter.windows[key]) == 0 {
+		return now
+	}
+	return limiter.windows[key][0].Add(limiter.window)
+}
+
+func (limiter *testSlidingWindow) removeExpired(key string, now time.Time) {
+	cutoff := now.Add(-limiter.window)
+	requests := limiter.windows[key]
+	valid := requests[:0]
+	for _, requestTime := range requests {
+		if requestTime.After(cutoff) {
+			valid = append(valid, requestTime)
+		}
+	}
+	if len(valid) == 0 {
+		delete(limiter.windows, key)
+		return
+	}
+	limiter.windows[key] = valid
 }
 
 func (executor *testRedisRateExecutor) Eval(
@@ -82,8 +166,62 @@ func TestUserRouteKeySeparatesUsersAndUsesRoutePattern(t *testing.T) {
 	}
 }
 
+func TestAnonymousCredentialKeySeparatesIdentityAndPreservesRequestBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	if err := engine.SetTrustedProxies(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var identityKeys, ipKeys, emails []string
+	engine.POST("/api/auth/login", func(c *gin.Context) {
+		context := NewGinHTTPContext(c)
+		identityKeys = append(identityKeys, AnonymousCredentialKeyFunc(context))
+		ipKeys = append(ipKeys, AnonymousIPRouteKeyFunc(context))
+		var payload struct {
+			Email string `json:"email"`
+		}
+		if err := c.ShouldBindJSON(&payload); err != nil {
+			t.Fatalf("request body was not preserved: %v", err)
+		}
+		emails = append(emails, payload.Email)
+		c.Status(204)
+	})
+
+	for _, email := range []string{
+		" Employee@Example.COM ",
+		"employee@example.com",
+		"other@example.com",
+	} {
+		request := httptest.NewRequest(
+			"POST",
+			"/api/auth/login",
+			strings.NewReader(`{"email":`+strconv.Quote(email)+`,"password":"secret"}`),
+		)
+		request.Header.Set("Content-Type", "application/json")
+		request.RemoteAddr = "192.0.2.10:4321"
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		if response.Code != 204 {
+			t.Fatalf("login key probe status = %d", response.Code)
+		}
+	}
+
+	if len(identityKeys) != 3 ||
+		identityKeys[0] != identityKeys[1] ||
+		identityKeys[0] == identityKeys[2] {
+		t.Fatalf("identity keys = %#v", identityKeys)
+	}
+	if len(ipKeys) != 3 || ipKeys[0] != ipKeys[1] || ipKeys[1] != ipKeys[2] {
+		t.Fatalf("IP route keys = %#v", ipKeys)
+	}
+	if len(emails) != 3 || emails[0] != " Employee@Example.COM " {
+		t.Fatalf("preserved emails = %#v", emails)
+	}
+}
+
 func TestSlidingWindowConcurrentInspectionIsRaceSafe(t *testing.T) {
-	limiter := NewSlidingWindow(5000, time.Minute)
+	limiter := newTestSlidingWindow(5000, time.Minute)
 	const workers = 32
 	var wait sync.WaitGroup
 	wait.Add(workers)
@@ -105,10 +243,8 @@ func TestInvalidRateLimiterConstructionFailsFast(t *testing.T) {
 		name string
 		run  func()
 	}{
-		{name: "token capacity", run: func() { NewTokenBucket(0, 1, time.Minute) }},
-		{name: "token refill", run: func() { NewTokenBucket(1, 0, time.Minute) }},
-		{name: "sliding limit", run: func() { NewSlidingWindow(0, time.Minute) }},
-		{name: "sliding window", run: func() { NewSlidingWindow(1, 0) }},
+		{name: "sliding limit", run: func() { newTestSlidingWindow(0, time.Minute) }},
+		{name: "sliding window", run: func() { newTestSlidingWindow(1, 0) }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -222,6 +358,43 @@ func TestRedisSlidingWindowFailsClosedOnOutOfRangeMetadata(t *testing.T) {
 				t.Fatal("malformed Redis metadata must advertise zero remaining")
 			}
 		})
+	}
+}
+
+func TestRateLimitEmitsOnlyRFC9333Headers(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.Use(WrapGinMiddleware(RateLimit(&RateLimitConfig{
+		Limiter: newTestSlidingWindow(2, time.Minute),
+		KeyFunc: func(HTTPContext) string { return "shared" },
+		Headers: true,
+	})))
+	engine.GET("/tickets", func(c *gin.Context) {
+		c.Status(204)
+	})
+
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest("GET", "/tickets", nil))
+
+	if got := response.Header().Get("RateLimit-Limit"); got != "2" {
+		t.Fatalf("RateLimit-Limit = %q, want 2", got)
+	}
+	if got := response.Header().Get("RateLimit-Remaining"); got != "1" {
+		t.Fatalf("RateLimit-Remaining = %q, want 1", got)
+	}
+	reset, err := strconv.ParseInt(response.Header().Get("RateLimit-Reset"), 10, 64)
+	if err != nil || reset <= 0 {
+		t.Fatalf("RateLimit-Reset must be a positive delta in seconds: value=%q err=%v",
+			response.Header().Get("RateLimit-Reset"), err)
+	}
+	for _, removed := range []string{
+		"X-RateLimit-Remaining",
+		"X-RateLimit-Reset",
+		"X-RateLimit-Reset-After",
+	} {
+		if got := response.Header().Get(removed); got != "" {
+			t.Fatalf("removed compatibility header %s is still emitted: %q", removed, got)
+		}
 	}
 }
 

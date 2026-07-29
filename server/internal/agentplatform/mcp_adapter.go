@@ -3,7 +3,6 @@ package agentplatform
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -541,49 +540,43 @@ func (a *MCPAdapter) assignTicket(
 		Type: models.ActorType(argumentString(assigneeValue, "type")),
 		ID:   argumentString(assigneeValue, "id"),
 	}
-	changes, err := a.service.ResolveTicketAssignmentChanges(ctx, assignee)
-	if err != nil {
+	// Validate the target before reserving an idempotency record so malformed
+	// Assignment input keeps its stable input/not-found/policy error contract.
+	// AssignTicket resolves it again inside the write command to close the
+	// validation/write race.
+	if _, err := a.service.ResolveTicketAssignmentChanges(ctx, &assignee); err != nil {
 		return nil, backendError(err)
-	}
-	decision, err := a.checkPolicy(ctx, principal, policyRequest{
-		scope:        models.ScopeTicketsAssign,
-		action:       "ticket.assign",
-		resourceType: "ticket",
-		resourceID:   strconv.FormatUint(uint64(ticketID), 10),
-		write:        true,
-		risky:        true,
-		digest:       requestDigest(arguments),
-		context:      map[string]any{"assignee_type": assignee.Type, "assignee_id": assignee.ID},
-	})
-	if err != nil {
-		return nil, err
 	}
 	reservation, err := a.reserveIdempotency(ctx, principal, "ticket.assign", arguments)
 	if err != nil {
 		return nil, err
 	}
 	if reservation.Replayed {
+		if _, err := a.checkPolicy(ctx, principal, policyRequest{
+			scope:        models.ScopeTicketsAssign,
+			action:       "ticket.assign",
+			resourceType: "ticket",
+			resourceID:   strconv.FormatUint(uint64(ticketID), 10),
+			write:        true,
+			risky:        true,
+			digest:       requestDigest(arguments),
+			context:      map[string]any{"assignee_type": assignee.Type, "assignee_id": assignee.ID},
+		}); err != nil {
+			return nil, err
+		}
 		return replayReceipt(reservation.Record)
 	}
-	result, err := a.service.UpdateTicketVersion(ctx, services.VersionedTicketUpdateInput{
+	result, err := a.service.AssignTicket(ctx, services.AssignTicketCommand{
 		TicketID:            ticketID,
 		ExpectedVersion:     expectedVersion,
 		LeaseID:             leaseID,
 		Actor:               principalActor(principal),
+		Assignee:            &assignee,
 		CredentialID:        principal.CredentialID,
-		PolicyDecisionID:    decision.ID,
-		RequiredScope:       models.ScopeTicketsAssign,
-		Action:              "ticket.assign",
 		SourceProtocol:      mcpSourceProtocol,
-		Changes:             changes,
-		IsRisky:             true,
+		RequestDigest:       requestDigest(arguments),
+		Reason:              argumentString(arguments, "reason"),
 		IdempotencyRecordID: reservation.Record.ID,
-		EventType:           "io.chronodesk.ticket.assigned.v1",
-		EventData: map[string]any{
-			"ticket_id": ticketID,
-			"assignee":  assignee,
-			"reason":    argumentString(arguments, "reason"),
-		},
 	})
 	if err != nil {
 		a.failReservation(ctx, reservation, err)
@@ -606,45 +599,36 @@ func (a *MCPAdapter) transitionTicket(
 	if !status.IsValid() {
 		return nil, invalidArgument("invalid status")
 	}
-	decision, err := a.checkPolicy(ctx, principal, policyRequest{
-		scope:        models.ScopeTicketsTransition,
-		action:       "ticket.transition",
-		resourceType: "ticket",
-		resourceID:   strconv.FormatUint(uint64(ticketID), 10),
-		write:        true,
-		risky:        true,
-		digest:       requestDigest(arguments),
-		context:      map[string]any{"target_status": status},
-	})
-	if err != nil {
-		return nil, err
-	}
 	reservation, err := a.reserveIdempotency(ctx, principal, "ticket.transition", arguments)
 	if err != nil {
 		return nil, err
 	}
 	if reservation.Replayed {
+		if _, err := a.checkPolicy(ctx, principal, policyRequest{
+			scope:        models.ScopeTicketsTransition,
+			action:       "ticket.transition",
+			resourceType: "ticket",
+			resourceID:   strconv.FormatUint(uint64(ticketID), 10),
+			write:        true,
+			risky:        true,
+			digest:       requestDigest(arguments),
+			context:      map[string]any{"target_status": status},
+		}); err != nil {
+			return nil, err
+		}
 		return replayReceipt(reservation.Record)
 	}
-	result, err := a.service.UpdateTicketVersion(ctx, services.VersionedTicketUpdateInput{
+	result, err := a.service.TransitionTicket(ctx, services.TransitionTicketCommand{
 		TicketID:            ticketID,
 		ExpectedVersion:     expectedVersion,
 		LeaseID:             leaseID,
 		Actor:               principalActor(principal),
+		Status:              status,
 		CredentialID:        principal.CredentialID,
-		PolicyDecisionID:    decision.ID,
-		RequiredScope:       models.ScopeTicketsTransition,
-		Action:              "ticket.transition",
 		SourceProtocol:      mcpSourceProtocol,
-		Changes:             map[string]any{"status": status},
-		IsRisky:             true,
+		RequestDigest:       requestDigest(arguments),
+		Reason:              argumentString(arguments, "reason"),
 		IdempotencyRecordID: reservation.Record.ID,
-		EventType:           "io.chronodesk.ticket.transitioned.v1",
-		EventData: map[string]any{
-			"ticket_id": ticketID,
-			"status":    status,
-			"reason":    argumentString(arguments, "reason"),
-		},
 	})
 	if err != nil {
 		a.failReservation(ctx, reservation, err)
@@ -1179,7 +1163,11 @@ func (a *MCPAdapter) listTickets(
 			return nil, backendError(checkErr)
 		}
 		if allowed {
-			items = append(items, ticketSummary(ticket))
+			summary, summaryErr := ticketSummary(ticket)
+			if summaryErr != nil {
+				return nil, summaryErr
+			}
+			items = append(items, summary)
 		}
 	}
 
@@ -1238,7 +1226,7 @@ func (a *MCPAdapter) getTicketByID(
 	if err := a.db.WithContext(ctx).First(&ticket, ticketID).Error; err != nil {
 		return nil, backendError(err)
 	}
-	return ticketDetail(&ticket), nil
+	return ticketDetail(&ticket)
 }
 
 func (a *MCPAdapter) ticketHistory(
@@ -1273,7 +1261,7 @@ func (a *MCPAdapter) historyByTicket(
 		return nil, err
 	}
 	var ticket models.Ticket
-	if err := a.db.WithContext(ctx).Select("id", "version").First(&ticket, ticketID).Error; err != nil {
+	if err := a.db.WithContext(ctx).Select("id").First(&ticket, ticketID).Error; err != nil {
 		return nil, backendError(err)
 	}
 	cursor, err := decodeMCPQueryCursor(cursorValue)
@@ -1281,6 +1269,7 @@ func (a *MCPAdapter) historyByTicket(
 		return nil, err
 	}
 	query := a.db.WithContext(ctx).
+		Preload("Event").
 		Where("ticket_id = ?", ticketID).
 		Order("id DESC")
 	if !cursor.CreatedAt.IsZero() {
@@ -1299,16 +1288,13 @@ func (a *MCPAdapter) historyByTicket(
 		histories = histories[:limit]
 	}
 
-	var events []models.DomainEvent
-	if err := a.db.WithContext(ctx).
-		Where("subject = ?", fmt.Sprintf("ticket/%d", ticketID)).
-		Order("time ASC").
-		Find(&events).Error; err != nil {
-		return nil, backendError(err)
-	}
 	items := make([]map[string]any, 0, len(histories))
 	for i := range histories {
-		items = append(items, historyItem(&histories[i], events, ticket.Version))
+		item, err := historyItem(&histories[i])
+		if err != nil {
+			return nil, backendError(err)
+		}
+		items = append(items, item)
 	}
 	result := map[string]any{"items": items}
 	if hasMore && len(histories) > 0 {
@@ -1721,7 +1707,7 @@ func policySpecForMCPAction(action string) policySpec {
 	return specs[action]
 }
 
-func ticketSummary(ticket *models.Ticket) map[string]any {
+func ticketSummary(ticket *models.Ticket) (map[string]any, error) {
 	result := map[string]any{
 		"id":            ticket.ID,
 		"version":       ticket.Version,
@@ -1734,14 +1720,21 @@ func ticketSummary(ticket *models.Ticket) map[string]any {
 		"created_at":    ticket.CreatedAt.UTC().Format(time.RFC3339Nano),
 		"updated_at":    ticket.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	}
-	if assigned := ticketAssignedActor(ticket); assigned != nil {
+	assigned, err := ticketAssignedActor(ticket)
+	if err != nil {
+		return nil, err
+	}
+	if assigned != nil {
 		result["assigned_to"] = actorMap(*assigned)
 	}
-	return result
+	return result, nil
 }
 
-func ticketDetail(ticket *models.Ticket) map[string]any {
-	result := ticketSummary(ticket)
+func ticketDetail(ticket *models.Ticket) (map[string]any, error) {
+	result, err := ticketSummary(ticket)
+	if err != nil {
+		return nil, err
+	}
 	result["description"] = ticket.Description
 	result["source"] = string(ticket.Source)
 	result["created_by"] = actorMap(ticketCreatorActor(ticket))
@@ -1765,26 +1758,62 @@ func ticketDetail(ticket *models.Ticket) map[string]any {
 	if ticket.DueDate != nil {
 		result["due_at"] = ticket.DueDate.UTC().Format(time.RFC3339Nano)
 	}
-	return result
+	return result, nil
 }
 
 func ticketCreatorActor(ticket *models.Ticket) models.ActorRef {
-	if ticket.CreatedByActorType != "" && ticket.CreatedByActorID != "" {
-		return models.ActorRef{Type: ticket.CreatedByActorType, ID: ticket.CreatedByActorID}
-	}
-	return models.HumanActor(ticket.CreatedByID)
+	return models.ActorRef{Type: ticket.CreatedByActorType, ID: ticket.CreatedByActorID}
 }
 
-func ticketAssignedActor(ticket *models.Ticket) *models.ActorRef {
-	if ticket.AssignedToActorType != "" && ticket.AssignedToActorID != "" {
-		actor := models.ActorRef{Type: ticket.AssignedToActorType, ID: ticket.AssignedToActorID}
-		return &actor
+func ticketAssignedActor(ticket *models.Ticket) (*models.ActorRef, error) {
+	actorType := strings.TrimSpace(string(ticket.AssignedToActorType))
+	actorID := strings.TrimSpace(ticket.AssignedToActorID)
+	hasActorType := actorType != ""
+	hasActorID := actorID != ""
+	hasHumanProjection := ticket.AssignedToID != nil
+	hasServicePrincipalProjection := ticket.AssignedToServicePrincipalID != nil
+
+	if !hasActorType && !hasActorID {
+		if hasHumanProjection || hasServicePrincipalProjection {
+			return nil, ticketAssignmentIntegrityError(ticket.ID, "missing_actor")
+		}
+		return nil, nil
 	}
-	if ticket.AssignedToID != nil {
-		actor := models.HumanActor(*ticket.AssignedToID)
-		return &actor
+	if !hasActorType || !hasActorID {
+		return nil, ticketAssignmentIntegrityError(ticket.ID, "incomplete_actor")
 	}
-	return nil
+	if actorType != string(ticket.AssignedToActorType) || actorID != ticket.AssignedToActorID {
+		return nil, ticketAssignmentIntegrityError(ticket.ID, "invalid_actor")
+	}
+
+	actor := models.ActorRef{Type: ticket.AssignedToActorType, ID: actorID}
+	if err := actor.Validate(); err != nil {
+		return nil, ticketAssignmentIntegrityError(ticket.ID, "invalid_actor")
+	}
+	switch actor.Type {
+	case models.ActorTypeHuman:
+		if _, err := safeconv.ParsePositiveUint(actor.ID); err != nil ||
+			hasServicePrincipalProjection {
+			return nil, ticketAssignmentIntegrityError(ticket.ID, "projection_mismatch")
+		}
+		if hasHumanProjection &&
+			strconv.FormatUint(uint64(*ticket.AssignedToID), 10) != actor.ID {
+			return nil, ticketAssignmentIntegrityError(ticket.ID, "projection_mismatch")
+		}
+	case models.ActorTypeServicePrincipal:
+		if hasHumanProjection {
+			return nil, ticketAssignmentIntegrityError(ticket.ID, "projection_mismatch")
+		}
+		if hasServicePrincipalProjection &&
+			strings.TrimSpace(*ticket.AssignedToServicePrincipalID) != actor.ID {
+			return nil, ticketAssignmentIntegrityError(ticket.ID, "projection_mismatch")
+		}
+	case models.ActorTypeSystem:
+		if hasHumanProjection || hasServicePrincipalProjection {
+			return nil, ticketAssignmentIntegrityError(ticket.ID, "projection_mismatch")
+		}
+	}
+	return &actor, nil
 }
 
 func actorMap(actor models.ActorRef) map[string]any {
@@ -1800,20 +1829,30 @@ func ticketQueue(ticket *models.Ticket) string {
 	return "default"
 }
 
-func historyItem(
-	history *models.TicketHistory,
-	events []models.DomainEvent,
-	fallbackVersion uint64,
-) map[string]any {
-	event := closestHistoryEvent(history, events)
-	eventID := fmt.Sprintf("legacy-history-%d", history.ID)
-	version := fallbackVersion
-	if event != nil {
-		eventID = event.ID
-		version = event.ResourceVersion
-	}
-	if version == 0 {
-		version = 1
+func historyItem(history *models.TicketHistory) (map[string]any, error) {
+	var eventID any
+	actor := history.Actor()
+	switch history.Provenance {
+	case models.TicketHistoryProvenanceDomainEvent:
+		if history.EventID == nil ||
+			strings.TrimSpace(*history.EventID) == "" ||
+			history.ResourceVersion == 0 ||
+			history.Event == nil ||
+			history.Event.ID != *history.EventID ||
+			history.Event.ResourceVersion != history.ResourceVersion ||
+			history.Event.Subject != fmt.Sprintf("ticket/%d", history.TicketID) ||
+			history.Event.ActorType != actor.Type ||
+			history.Event.ActorID != actor.ID {
+			return nil, fmt.Errorf("history %d has an invalid domain event link", history.ID)
+		}
+		eventID = *history.EventID
+	case models.TicketHistoryProvenancePreEvent, models.TicketHistoryProvenanceImported:
+		if history.EventID != nil || history.ResourceVersion != 0 {
+			return nil, fmt.Errorf("history %d has inconsistent unlinked provenance", history.ID)
+		}
+		eventID = nil
+	default:
+		return nil, fmt.Errorf("history %d has unknown provenance %q", history.ID, history.Provenance)
 	}
 	changedFields := []string{}
 	if history.FieldName != "" {
@@ -1833,56 +1872,15 @@ func historyItem(
 	return map[string]any{
 		"id":               history.ID,
 		"ticket_id":        history.TicketID,
-		"actor":            actorMap(history.Actor()),
+		"actor":            actorMap(actor),
 		"action":           string(history.Action),
 		"changed_fields":   changedFields,
 		"reason":           history.Description,
 		"event_id":         eventID,
-		"resource_version": version,
+		"resource_version": history.ResourceVersion,
+		"provenance":       string(history.Provenance),
 		"created_at":       history.CreatedAt.UTC().Format(time.RFC3339Nano),
-	}
-}
-
-func closestHistoryEvent(history *models.TicketHistory, events []models.DomainEvent) *models.DomainEvent {
-	var best *models.DomainEvent
-	var bestDistance time.Duration
-	for i := range events {
-		event := &events[i]
-		if !historyEventTypeMatches(history.Action, event.Type) {
-			continue
-		}
-		distance := event.Time.Sub(history.CreatedAt)
-		if distance < 0 {
-			distance = -distance
-		}
-		if best == nil || distance < bestDistance {
-			best = event
-			bestDistance = distance
-		}
-	}
-	return best
-}
-
-func historyEventTypeMatches(action models.HistoryAction, eventType string) bool {
-	switch action {
-	case models.HistoryActionCreate:
-		return strings.Contains(eventType, ".ticket.created.")
-	case models.HistoryActionComment:
-		return strings.Contains(eventType, ".comment.created.")
-	case models.HistoryActionAttachment:
-		return strings.Contains(eventType, ".attachment.created.")
-	case models.HistoryActionAssign, models.HistoryActionUnassign:
-		return strings.Contains(eventType, ".ticket.assigned.") ||
-			strings.Contains(eventType, ".ticket.updated.")
-	case models.HistoryActionStatusChange,
-		models.HistoryActionClose,
-		models.HistoryActionReopen,
-		models.HistoryActionResolve:
-		return strings.Contains(eventType, ".ticket.transitioned.") ||
-			strings.Contains(eventType, ".ticket.updated.")
-	default:
-		return strings.Contains(eventType, ".ticket.updated.")
-	}
+	}, nil
 }
 
 func validateMCPPrincipal(principal mcp.Principal) error {
@@ -2107,6 +2105,19 @@ func invalidParams(message, field string) *mcp.BackendError {
 	}
 }
 
+func ticketAssignmentIntegrityError(ticketID uint, reasonCode string) *mcp.BackendError {
+	return &mcp.BackendError{
+		Code:    "data_integrity_error",
+		Message: "ticket assignment data is inconsistent",
+		Details: map[string]any{
+			"resource_type": "ticket",
+			"resource_id":   strconv.FormatUint(uint64(ticketID), 10),
+			"field":         "assigned_to_actor",
+			"reason_code":   reasonCode,
+		},
+	}
+}
+
 func backendPolicyError(err error, decision *models.PolicyDecision) *mcp.BackendError {
 	failure := backendError(err)
 	if decision != nil {
@@ -2158,6 +2169,7 @@ func backendError(err error) *mcp.BackendError {
 		code, message = "idempotency_conflict", "idempotency key conflicts with another request"
 	case errors.Is(err, services.ErrAttachmentTooLarge),
 		errors.Is(err, services.ErrAttachmentNotClean),
+		errors.Is(err, services.ErrInvalidAttachment),
 		errors.Is(err, services.ErrInvalidAttachmentName),
 		errors.Is(err, services.ErrAttachmentStorageMissing):
 		code, message = "attachment_rejected", "attachment was rejected"
@@ -2178,21 +2190,6 @@ func isServicePolicyError(err error) bool {
 		errors.Is(err, services.ErrReadOnlyMode) ||
 		errors.Is(err, services.ErrPrincipalDisabled) ||
 		errors.Is(err, services.ErrPrincipalExpired)
-}
-
-func randomMCPID() string {
-	value := make([]byte, 16)
-	if _, err := rand.Read(value); err != nil {
-		return fmt.Sprintf("mcp-%d", time.Now().UnixNano())
-	}
-	return fmt.Sprintf(
-		"%x-%x-%x-%x-%x",
-		value[0:4],
-		value[4:6],
-		value[6:8],
-		value[8:10],
-		value[10:16],
-	)
 }
 
 func decodeBase64Attachment(encoded, expectedSHA string) ([]byte, error) {

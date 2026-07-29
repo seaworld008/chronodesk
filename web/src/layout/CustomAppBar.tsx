@@ -10,5 +10,3 @@ const CustomUserMenu: React.FC = () => (
 export const CustomAppBar: React.FC<AppBarProps> = (props) => (
   <AppBar {...props} userMenu={<CustomUserMenu />} />
 )
-
-export default CustomAppBar

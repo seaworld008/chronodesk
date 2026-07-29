@@ -12,8 +12,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
+	"github.com/seaworld008/chronodesk/server/internal/httpcontract"
 	"github.com/seaworld008/chronodesk/server/internal/mcp"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/observability"
@@ -28,19 +30,17 @@ type ResourcePublisher interface {
 }
 
 type APIHandler struct {
-	db                  *gorm.DB
-	native              *services.AgentNativeService
-	tokens              *agentauth.Manager
-	compatibilityUserID uint
-	maxAttachmentBytes  int64
-	publisher           ResourcePublisher
+	db                 *gorm.DB
+	native             *services.AgentNativeService
+	tokens             *agentauth.Manager
+	maxAttachmentBytes int64
+	publisher          ResourcePublisher
 }
 
 func NewAPIHandler(
 	db *gorm.DB,
 	native *services.AgentNativeService,
 	tokens *agentauth.Manager,
-	compatibilityUserID uint,
 	maxAttachmentBytes int64,
 	publisher ResourcePublisher,
 ) *APIHandler {
@@ -48,12 +48,11 @@ func NewAPIHandler(
 		maxAttachmentBytes = 10 << 20
 	}
 	return &APIHandler{
-		db:                  db,
-		native:              native,
-		tokens:              tokens,
-		compatibilityUserID: compatibilityUserID,
-		maxAttachmentBytes:  maxAttachmentBytes,
-		publisher:           publisher,
+		db:                 db,
+		native:             native,
+		tokens:             tokens,
+		maxAttachmentBytes: maxAttachmentBytes,
+		publisher:          publisher,
 	}
 }
 
@@ -62,10 +61,10 @@ func (h *APIHandler) RegisterRoutes(api *gin.RouterGroup) {
 	api.GET("/tickets", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.ListTickets)
 	api.POST("/tickets", h.tokens.Middleware(models.ScopeTicketsCreate), h.executionLimit(), h.CreateTicket)
 	api.GET("/tickets/:id", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.GetTicket)
-	// Ticket patches select their scope from the command shape. A transition,
-	// assignment and ordinary field update are intentionally separate commands
-	// so a broad merge patch cannot smuggle a risky action through tickets:update.
-	api.PATCH("/tickets/:id", h.tokens.Middleware(), h.executionLimit(), h.UpdateTicket)
+	api.PATCH("/tickets/:id", h.tokens.Middleware(models.ScopeTicketsUpdate), h.executionLimit(), h.UpdateTicket)
+	api.POST("/tickets/:id/commands/assign", h.tokens.Middleware(models.ScopeTicketsAssign), h.executionLimit(), h.AssignTicket)
+	api.POST("/tickets/:id/commands/transition", h.tokens.Middleware(models.ScopeTicketsTransition), h.executionLimit(), h.TransitionTicket)
+	api.POST("/tickets/:id/commands/escalate", h.tokens.Middleware(models.ScopeTicketsTransition), h.executionLimit(), h.EscalateTicket)
 	api.GET("/tickets/:id/history", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.GetHistory)
 	api.GET("/tickets/:id/comments", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.ListComments)
 	api.POST("/tickets/:id/comments", h.tokens.Middleware(models.ScopeCommentsWrite), h.executionLimit(), h.CreateComment)
@@ -245,7 +244,7 @@ func (h *APIHandler) GetTicket(c *gin.Context) {
 	if !ok {
 		return
 	}
-	c.Header("ETag", FormatETag(ticket.Version))
+	c.Header("ETag", httpcontract.FormatETag(ticket.Version))
 	WriteData(c, http.StatusOK, ticket.ToResponse(), Meta{})
 }
 
@@ -306,7 +305,6 @@ func (h *APIHandler) CreateTicket(c *gin.Context) {
 			DueDate:      request.DueDate,
 		},
 		Actor:               actor,
-		CompatibilityUserID: h.compatibilityUserID,
 		CredentialID:        principal.CredentialID,
 		SourceProtocol:      "rest",
 		RequestDigest:       digestBytes(fingerprint),
@@ -321,7 +319,7 @@ func (h *APIHandler) CreateTicket(c *gin.Context) {
 		return
 	}
 	h.publishTicket(result.Ticket.ID)
-	c.Header("ETag", FormatETag(result.Ticket.Version))
+	c.Header("ETag", httpcontract.FormatETag(result.Ticket.Version))
 	WriteReceipt(c, http.StatusCreated, result.Ticket.ToResponse(), receiptFromService(result.Receipt))
 }
 
@@ -334,7 +332,7 @@ func (h *APIHandler) UpdateTicket(c *gin.Context) {
 	if !ok {
 		return
 	}
-	expectedVersion, err := ParseIfMatch(c.GetHeader("If-Match"))
+	expectedVersion, err := httpcontract.ParseIfMatch(c.GetHeader("If-Match"))
 	if err != nil {
 		WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
 		return
@@ -347,27 +345,15 @@ func (h *APIHandler) UpdateTicket(c *gin.Context) {
 	if !ok {
 		return
 	}
-	var changes map[string]any
-	if err := decodeStrictJSON(body, &changes); err != nil || len(changes) == 0 {
-		WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, "A non-empty JSON merge patch is required", false)
-		return
-	}
-	requiredScope, action, risky, err := classifyTicketPatch(changes)
+	changes, err := decodeOrdinaryTicketPatch(body)
 	if err != nil {
 		WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
 		return
 	}
-	if !agentauth.HasScopes(c, requiredScope) {
-		WriteProblem(
-			c,
-			http.StatusForbidden,
-			ProblemInsufficientScope,
-			fmt.Sprintf("The access token does not grant %s", requiredScope),
-			false,
-		)
+	leaseID, ok := requireTicketLeaseHeader(c)
+	if !ok {
 		return
 	}
-	leaseID := strings.TrimSpace(c.GetHeader("X-Ticket-Lease"))
 	fingerprint := commandFingerprint(
 		http.MethodPatch,
 		fmt.Sprintf("/api/v1/tickets/%d", ticketID),
@@ -377,7 +363,7 @@ func (h *APIHandler) UpdateTicket(c *gin.Context) {
 	)
 	actor := models.ServicePrincipalActor(principal.ID)
 	reservation, err := h.native.ReserveIdempotency(
-		c.Request.Context(), actor, action, key, fingerprint, 24*time.Hour,
+		c.Request.Context(), actor, "ticket.update", key, fingerprint, 24*time.Hour,
 	)
 	if err != nil {
 		h.writeNativeError(c, err)
@@ -387,11 +373,11 @@ func (h *APIHandler) UpdateTicket(c *gin.Context) {
 		if !h.authorizeReplay(
 			c,
 			principal,
-			requiredScope,
-			action,
+			models.ScopeTicketsUpdate,
+			"ticket.update",
 			strconv.FormatUint(uint64(ticketID), 10),
 			true,
-			risky,
+			false,
 		) {
 			return
 		}
@@ -403,14 +389,13 @@ func (h *APIHandler) UpdateTicket(c *gin.Context) {
 		ExpectedVersion:     expectedVersion,
 		LeaseID:             leaseID,
 		Actor:               actor,
-		CompatibilityUserID: h.compatibilityUserID,
 		CredentialID:        principal.CredentialID,
 		SourceProtocol:      "rest",
 		RequestDigest:       digestBytes(fingerprint),
 		Changes:             changes,
-		RequiredScope:       requiredScope,
-		Action:              action,
-		IsRisky:             risky,
+		RequiredScope:       models.ScopeTicketsUpdate,
+		Action:              "ticket.update",
+		IsRisky:             false,
 		TraceID:             RequestID(c),
 		CorrelationID:       c.GetHeader("X-Correlation-ID"),
 		IdempotencyRecordID: reservation.Record.ID,
@@ -421,8 +406,344 @@ func (h *APIHandler) UpdateTicket(c *gin.Context) {
 		return
 	}
 	h.publishTicket(ticketID)
-	c.Header("ETag", FormatETag(result.Ticket.Version))
+	c.Header("ETag", httpcontract.FormatETag(result.Ticket.Version))
 	WriteReceipt(c, http.StatusOK, result.Ticket.ToResponse(), receiptFromService(result.Receipt))
+}
+
+type ticketCommandRequestContext struct {
+	principal       authenticatedPrincipal
+	ticketID        uint
+	expectedVersion uint64
+	idempotencyKey  string
+	leaseID         string
+	correlationID   string
+	body            []byte
+}
+
+func (h *APIHandler) prepareTicketCommand(
+	c *gin.Context,
+) (ticketCommandRequestContext, bool) {
+	principal, ok := h.principal(c)
+	if !ok {
+		return ticketCommandRequestContext{}, false
+	}
+	ticketID, ok := parsePathUint(c, "id")
+	if !ok {
+		return ticketCommandRequestContext{}, false
+	}
+	expectedVersion, err := httpcontract.ParseIfMatch(c.GetHeader("If-Match"))
+	if err != nil {
+		WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
+		return ticketCommandRequestContext{}, false
+	}
+	idempotencyKey, ok := RequireIdempotencyKey(c)
+	if !ok {
+		return ticketCommandRequestContext{}, false
+	}
+	leaseID, ok := requireTicketLeaseHeader(c)
+	if !ok {
+		return ticketCommandRequestContext{}, false
+	}
+	correlationID, ok := requireCommandCorrelationID(c)
+	if !ok {
+		return ticketCommandRequestContext{}, false
+	}
+	body, ok := readJSONBody(c, 64<<10)
+	if !ok {
+		return ticketCommandRequestContext{}, false
+	}
+	return ticketCommandRequestContext{
+		principal:       principal,
+		ticketID:        ticketID,
+		expectedVersion: expectedVersion,
+		idempotencyKey:  idempotencyKey,
+		leaseID:         leaseID,
+		correlationID:   correlationID,
+		body:            body,
+	}, true
+}
+
+func (h *APIHandler) AssignTicket(c *gin.Context) {
+	commandRequest, ok := h.prepareTicketCommand(c)
+	if !ok {
+		return
+	}
+	request, err := decodeTicketAssignmentCommand(commandRequest.body)
+	if err != nil {
+		WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
+		return
+	}
+
+	path := fmt.Sprintf(
+		"/api/v1/tickets/%d/commands/assign",
+		commandRequest.ticketID,
+	)
+	fingerprint := commandFingerprint(
+		http.MethodPost,
+		path,
+		commandRequest.expectedVersion,
+		commandRequest.leaseID,
+		commandRequest.body,
+	)
+	actor := models.ServicePrincipalActor(commandRequest.principal.ID)
+	reservation, err := h.native.ReserveIdempotency(
+		c.Request.Context(),
+		actor,
+		"ticket.assign",
+		commandRequest.idempotencyKey,
+		fingerprint,
+		24*time.Hour,
+	)
+	if err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
+	if reservation.Replayed {
+		if !h.authorizeReplay(
+			c,
+			commandRequest.principal,
+			models.ScopeTicketsAssign,
+			"ticket.assign",
+			strconv.FormatUint(uint64(commandRequest.ticketID), 10),
+			true,
+			true,
+		) {
+			return
+		}
+		h.writeReplayedTicket(c, reservation.Record, http.StatusOK)
+		return
+	}
+
+	result, err := h.native.AssignTicket(
+		c.Request.Context(),
+		services.AssignTicketCommand{
+			TicketID:            commandRequest.ticketID,
+			ExpectedVersion:     commandRequest.expectedVersion,
+			LeaseID:             commandRequest.leaseID,
+			Actor:               actor,
+			Assignee:            request.Assignee,
+			CredentialID:        commandRequest.principal.CredentialID,
+			SourceProtocol:      "rest",
+			RequestDigest:       digestBytes(fingerprint),
+			Reason:              request.Reason,
+			TraceID:             RequestID(c),
+			CorrelationID:       commandRequest.correlationID,
+			IdempotencyRecordID: reservation.Record.ID,
+		},
+	)
+	if err != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(err),
+		)
+		h.writeNativeError(c, err)
+		return
+	}
+	h.writeTicketCommandResult(c, commandRequest.ticketID, result)
+}
+
+func (h *APIHandler) TransitionTicket(c *gin.Context) {
+	commandRequest, ok := h.prepareTicketCommand(c)
+	if !ok {
+		return
+	}
+	request, err := decodeTicketTransitionCommand(commandRequest.body)
+	if err != nil {
+		WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
+		return
+	}
+
+	path := fmt.Sprintf(
+		"/api/v1/tickets/%d/commands/transition",
+		commandRequest.ticketID,
+	)
+	fingerprint := commandFingerprint(
+		http.MethodPost,
+		path,
+		commandRequest.expectedVersion,
+		commandRequest.leaseID,
+		commandRequest.body,
+	)
+	actor := models.ServicePrincipalActor(commandRequest.principal.ID)
+	reservation, err := h.native.ReserveIdempotency(
+		c.Request.Context(),
+		actor,
+		"ticket.transition",
+		commandRequest.idempotencyKey,
+		fingerprint,
+		24*time.Hour,
+	)
+	if err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
+	if reservation.Replayed {
+		if !h.authorizeReplay(
+			c,
+			commandRequest.principal,
+			models.ScopeTicketsTransition,
+			"ticket.transition",
+			strconv.FormatUint(uint64(commandRequest.ticketID), 10),
+			true,
+			true,
+		) {
+			return
+		}
+		h.writeReplayedTicket(c, reservation.Record, http.StatusOK)
+		return
+	}
+
+	result, err := h.native.TransitionTicket(
+		c.Request.Context(),
+		services.TransitionTicketCommand{
+			TicketID:            commandRequest.ticketID,
+			ExpectedVersion:     commandRequest.expectedVersion,
+			LeaseID:             commandRequest.leaseID,
+			Actor:               actor,
+			Status:              request.Status,
+			CredentialID:        commandRequest.principal.CredentialID,
+			SourceProtocol:      "rest",
+			RequestDigest:       digestBytes(fingerprint),
+			Reason:              request.Reason,
+			TraceID:             RequestID(c),
+			CorrelationID:       commandRequest.correlationID,
+			IdempotencyRecordID: reservation.Record.ID,
+		},
+	)
+	if err != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(err),
+		)
+		h.writeNativeError(c, err)
+		return
+	}
+	h.writeTicketCommandResult(c, commandRequest.ticketID, result)
+}
+
+func (h *APIHandler) EscalateTicket(c *gin.Context) {
+	commandRequest, ok := h.prepareTicketCommand(c)
+	if !ok {
+		return
+	}
+	request, err := decodeTicketEscalationCommand(commandRequest.body)
+	if err != nil {
+		WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
+		return
+	}
+	if request.Assignee != nil &&
+		!agentauth.HasScopes(c, models.ScopeTicketsAssign) {
+		WriteProblem(
+			c,
+			http.StatusForbidden,
+			ProblemInsufficientScope,
+			"The access token does not grant tickets:assign",
+			false,
+		)
+		return
+	}
+
+	path := fmt.Sprintf(
+		"/api/v1/tickets/%d/commands/escalate",
+		commandRequest.ticketID,
+	)
+	fingerprint := commandFingerprint(
+		http.MethodPost,
+		path,
+		commandRequest.expectedVersion,
+		commandRequest.leaseID,
+		commandRequest.body,
+	)
+	actor := models.ServicePrincipalActor(commandRequest.principal.ID)
+	reservation, err := h.native.ReserveIdempotency(
+		c.Request.Context(),
+		actor,
+		"ticket.escalate",
+		commandRequest.idempotencyKey,
+		fingerprint,
+		24*time.Hour,
+	)
+	if err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
+	if reservation.Replayed {
+		resourceID := strconv.FormatUint(uint64(commandRequest.ticketID), 10)
+		if !h.authorizeReplay(
+			c,
+			commandRequest.principal,
+			models.ScopeTicketsTransition,
+			"ticket.escalate",
+			resourceID,
+			true,
+			true,
+		) {
+			return
+		}
+		if request.Assignee != nil &&
+			!h.authorizeReplay(
+				c,
+				commandRequest.principal,
+				models.ScopeTicketsAssign,
+				"ticket.assign",
+				resourceID,
+				true,
+				true,
+			) {
+			return
+		}
+		h.writeReplayedTicket(c, reservation.Record, http.StatusOK)
+		return
+	}
+
+	result, err := h.native.EscalateTicket(
+		c.Request.Context(),
+		services.EscalateTicketCommand{
+			TicketID:                   commandRequest.ticketID,
+			ExpectedVersion:            commandRequest.expectedVersion,
+			LeaseID:                    commandRequest.leaseID,
+			Actor:                      actor,
+			Priority:                   request.Priority,
+			Assignee:                   request.Assignee,
+			CredentialID:               commandRequest.principal.CredentialID,
+			SourceProtocol:             "rest",
+			RequestDigest:              digestBytes(fingerprint),
+			Reason:                     request.Reason,
+			TraceID:                    RequestID(c),
+			CorrelationID:              commandRequest.correlationID,
+			IdempotencyRecordID:        reservation.Record.ID,
+			IdempotencyCompletionTTL:   24 * time.Hour,
+			TransitionPolicyDecisionID: "",
+			AssignmentPolicyDecisionID: "",
+		},
+	)
+	if err != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(err),
+		)
+		h.writeNativeError(c, err)
+		return
+	}
+	h.writeTicketCommandResult(c, commandRequest.ticketID, result)
+}
+
+func (h *APIHandler) writeTicketCommandResult(
+	c *gin.Context,
+	ticketID uint,
+	result *services.VersionedTicketUpdateResult,
+) {
+	h.publishTicket(ticketID)
+	c.Header("ETag", httpcontract.FormatETag(result.Ticket.Version))
+	WriteReceipt(
+		c,
+		http.StatusOK,
+		result.Ticket.ToResponse(),
+		receiptFromService(result.Receipt),
+	)
 }
 
 func (h *APIHandler) ClaimTicket(c *gin.Context) {
@@ -434,7 +755,7 @@ func (h *APIHandler) ClaimTicket(c *gin.Context) {
 	if !ok {
 		return
 	}
-	expectedVersion, err := ParseIfMatch(c.GetHeader("If-Match"))
+	expectedVersion, err := httpcontract.ParseIfMatch(c.GetHeader("If-Match"))
 	if err != nil {
 		WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
 		return
@@ -515,7 +836,7 @@ func (h *APIHandler) HeartbeatLease(c *gin.Context) {
 	if !ok {
 		return
 	}
-	expectedVersion, err := ParseIfMatch(c.GetHeader("If-Match"))
+	expectedVersion, err := httpcontract.ParseIfMatch(c.GetHeader("If-Match"))
 	if err != nil {
 		WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
 		return
@@ -667,7 +988,7 @@ func (h *APIHandler) CreateComment(c *gin.Context) {
 	if !ok {
 		return
 	}
-	expectedVersion, err := ParseIfMatch(c.GetHeader("If-Match"))
+	expectedVersion, err := httpcontract.ParseIfMatch(c.GetHeader("If-Match"))
 	if err != nil {
 		WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
 		return
@@ -731,7 +1052,6 @@ func (h *APIHandler) CreateComment(c *gin.Context) {
 		ExpectedVersion:     expectedVersion,
 		LeaseID:             leaseID,
 		Actor:               actor,
-		CompatibilityUserID: h.compatibilityUserID,
 		CredentialID:        principal.CredentialID,
 		SourceProtocol:      "rest",
 		RequestDigest:       digestBytes(fingerprint),
@@ -750,7 +1070,7 @@ func (h *APIHandler) CreateComment(c *gin.Context) {
 		return
 	}
 	h.publishTicket(ticketID)
-	c.Header("ETag", FormatETag(result.Receipt.ResourceVersion))
+	c.Header("ETag", httpcontract.FormatETag(result.Receipt.ResourceVersion))
 	WriteReceipt(c, http.StatusCreated, result.Comment.ToResponse(), receiptFromService(result.Receipt))
 }
 
@@ -763,7 +1083,7 @@ func (h *APIHandler) StoreAttachment(c *gin.Context) {
 	if !ok {
 		return
 	}
-	expectedVersion, err := ParseIfMatch(c.GetHeader("If-Match"))
+	expectedVersion, err := httpcontract.ParseIfMatch(c.GetHeader("If-Match"))
 	if err != nil {
 		WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
 		return
@@ -840,7 +1160,6 @@ func (h *APIHandler) StoreAttachment(c *gin.Context) {
 		ExpectedVersion:     expectedVersion,
 		LeaseID:             leaseID,
 		Actor:               actor,
-		CompatibilityUserID: h.compatibilityUserID,
 		CredentialID:        principal.CredentialID,
 		SourceProtocol:      "rest",
 		RequestDigest:       digestBytes(fingerprint),
@@ -858,7 +1177,7 @@ func (h *APIHandler) StoreAttachment(c *gin.Context) {
 		return
 	}
 	h.publishTicket(ticketID)
-	c.Header("ETag", FormatETag(result.Receipt.ResourceVersion))
+	c.Header("ETag", httpcontract.FormatETag(result.Receipt.ResourceVersion))
 	WriteReceipt(c, http.StatusCreated, result.Attachment.ToResponse(), receiptFromService(result.Receipt))
 }
 
@@ -1200,46 +1519,290 @@ func (h *APIHandler) loadAuthorizedTicketFor(
 	return &ticket, true
 }
 
-func classifyTicketPatch(changes map[string]any) (scope, action string, risky bool, err error) {
-	const (
-		updateKind = "update"
-		assignKind = "assign"
-		statusKind = "transition"
-	)
-	kind := ""
-	for rawField := range changes {
-		field := strings.ToLower(strings.TrimSpace(rawField))
-		if field == "source" || field == "trust_level" {
-			return "", "", false, fmt.Errorf("%s is server-controlled and cannot be changed by an Agent", field)
-		}
-		fieldKind := updateKind
+func decodeOrdinaryTicketPatch(body []byte) (map[string]any, error) {
+	var fields map[string]json.RawMessage
+	if err := decodeStrictJSON(body, &fields); err != nil {
+		return nil, fmt.Errorf("invalid ticket update: %w", err)
+	}
+	if len(fields) == 0 {
+		return nil, errors.New("a non-empty ordinary ticket update is required")
+	}
+
+	changes := make(map[string]any, len(fields))
+	for field, rawValue := range fields {
+		var (
+			value any
+			err   error
+		)
 		switch field {
-		case "status":
-			fieldKind = statusKind
-		case "assigned_to_id",
-			"assigned_to_actor_type",
-			"assigned_to_actor_id",
-			"assigned_to_service_principal_id":
-			fieldKind = assignKind
-		}
-		if kind == "" {
-			kind = fieldKind
-			continue
-		}
-		if kind != fieldKind {
-			return "", "", false, errors.New(
-				"ordinary updates, assignments and transitions must be sent as separate commands",
+		case "title":
+			value, err = decodeBoundedString(rawValue, field, 1, 255)
+		case "description":
+			value, err = decodeBoundedString(rawValue, field, 1, 10000)
+		case "type":
+			var ticketType models.TicketType
+			ticketType, err = decodeNonNullJSON[models.TicketType](rawValue, field)
+			if err == nil && !ticketType.IsValid() {
+				err = fmt.Errorf("%s is not a supported ticket type", field)
+			}
+			value = ticketType
+		case "priority":
+			var priority models.TicketPriority
+			priority, err = decodeNonNullJSON[models.TicketPriority](rawValue, field)
+			if err == nil && !priority.IsValid() {
+				err = fmt.Errorf("%s is not a supported ticket priority", field)
+			}
+			value = priority
+		case "category_id", "subcategory_id":
+			value, err = decodeNullablePositiveUint(rawValue, field)
+		case "tags":
+			var tags []string
+			tags, err = decodeNonNullJSON[[]string](rawValue, field)
+			if err == nil {
+				for _, tag := range tags {
+					if utf8.RuneCountInString(tag) == 0 ||
+						utf8.RuneCountInString(tag) > 64 {
+						err = fmt.Errorf("%s entries must contain 1 to 64 characters", field)
+						break
+					}
+				}
+			}
+			value = tags
+		case "due_date":
+			var dueDate *time.Time
+			dueDate, err = decodeNullableJSON[time.Time](rawValue, field)
+			if dueDate == nil {
+				value = nil
+			} else {
+				value = *dueDate
+			}
+		case "customer_email":
+			value, err = decodeBoundedString(rawValue, field, 0, 100)
+		case "customer_phone":
+			value, err = decodeBoundedString(rawValue, field, 0, 20)
+		case "customer_name":
+			value, err = decodeBoundedString(rawValue, field, 0, 100)
+		case "internal_notes":
+			value, err = decodeBoundedString(rawValue, field, 0, 10000)
+		case "custom_fields":
+			value, err = decodeNonNullJSON[map[string]any](rawValue, field)
+		case "agent_context":
+			value, err = decodeNonNullJSON[models.AgentContext](rawValue, field)
+		default:
+			return nil, fmt.Errorf(
+				"%s is not allowed in an ordinary ticket update; use an explicit command",
+				field,
 			)
 		}
+		if err != nil {
+			return nil, err
+		}
+		changes[field] = value
 	}
-	switch kind {
-	case statusKind:
-		return models.ScopeTicketsTransition, "ticket.transition", true, nil
-	case assignKind:
-		return models.ScopeTicketsAssign, "ticket.assign", true, nil
-	default:
-		return models.ScopeTicketsUpdate, "ticket.update", false, nil
+	return changes, nil
+}
+
+func decodeNonNullJSON[T any](raw json.RawMessage, field string) (T, error) {
+	var value T
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return value, fmt.Errorf("%s cannot be null", field)
 	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return value, fmt.Errorf("invalid %s: %w", field, err)
+	}
+	return value, nil
+}
+
+func decodeNullableJSON[T any](raw json.RawMessage, field string) (*T, error) {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, nil
+	}
+	value, err := decodeNonNullJSON[T](raw, field)
+	if err != nil {
+		return nil, err
+	}
+	return &value, nil
+}
+
+func decodeNullablePositiveUint(raw json.RawMessage, field string) (any, error) {
+	value, err := decodeNullableJSON[uint](raw, field)
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	if *value == 0 {
+		return nil, fmt.Errorf("%s must be a positive integer or null", field)
+	}
+	return *value, nil
+}
+
+func decodeBoundedString(
+	raw json.RawMessage,
+	field string,
+	minimum int,
+	maximum int,
+) (string, error) {
+	value, err := decodeNonNullJSON[string](raw, field)
+	if err != nil {
+		return "", err
+	}
+	length := utf8.RuneCountInString(value)
+	if length < minimum || length > maximum {
+		return "", fmt.Errorf(
+			"%s must contain between %d and %d characters",
+			field,
+			minimum,
+			maximum,
+		)
+	}
+	return value, nil
+}
+
+type ticketTransitionCommandRequest struct {
+	Status models.TicketStatus `json:"status"`
+	Reason string              `json:"reason"`
+}
+
+type ticketAssignmentCommandRequest struct {
+	Assignee *models.ActorRef
+	Reason   string
+}
+
+type ticketEscalationCommandRequest struct {
+	Reason   string
+	Priority *models.TicketPriority
+	Assignee *models.ActorRef
+}
+
+func decodeTicketAssignmentCommand(
+	body []byte,
+) (ticketAssignmentCommandRequest, error) {
+	var request struct {
+		Assignee json.RawMessage `json:"assignee"`
+		Reason   string          `json:"reason"`
+	}
+	if err := decodeStrictJSON(body, &request); err != nil {
+		return ticketAssignmentCommandRequest{}, fmt.Errorf(
+			"invalid assignment command: %w",
+			err,
+		)
+	}
+	if len(request.Assignee) == 0 {
+		return ticketAssignmentCommandRequest{}, errors.New(
+			"assignee is required and may be an ActorRef or null",
+		)
+	}
+	reason, err := validateCommandReason(request.Reason)
+	if err != nil {
+		return ticketAssignmentCommandRequest{}, err
+	}
+	if bytes.Equal(bytes.TrimSpace(request.Assignee), []byte("null")) {
+		return ticketAssignmentCommandRequest{Reason: reason}, nil
+	}
+	assignee, err := decodeAssignableActorRef(request.Assignee)
+	if err != nil {
+		return ticketAssignmentCommandRequest{}, err
+	}
+	return ticketAssignmentCommandRequest{
+		Assignee: &assignee,
+		Reason:   reason,
+	}, nil
+}
+
+func decodeTicketTransitionCommand(
+	body []byte,
+) (ticketTransitionCommandRequest, error) {
+	var request ticketTransitionCommandRequest
+	if err := decodeStrictJSON(body, &request); err != nil {
+		return request, fmt.Errorf("invalid transition command: %w", err)
+	}
+	if !request.Status.IsValid() {
+		return request, fmt.Errorf("status is not a supported ticket status")
+	}
+	reason, err := validateCommandReason(request.Reason)
+	if err != nil {
+		return request, err
+	}
+	request.Reason = reason
+	return request, nil
+}
+
+func decodeTicketEscalationCommand(
+	body []byte,
+) (ticketEscalationCommandRequest, error) {
+	var raw struct {
+		Reason   string          `json:"reason"`
+		Priority json.RawMessage `json:"priority"`
+		Assignee json.RawMessage `json:"assignee"`
+	}
+	if err := decodeStrictJSON(body, &raw); err != nil {
+		return ticketEscalationCommandRequest{}, fmt.Errorf(
+			"invalid escalation command: %w",
+			err,
+		)
+	}
+	reason, err := validateCommandReason(raw.Reason)
+	if err != nil {
+		return ticketEscalationCommandRequest{}, err
+	}
+	request := ticketEscalationCommandRequest{Reason: reason}
+	if len(raw.Priority) > 0 {
+		priority, decodeErr := decodeNonNullJSON[models.TicketPriority](
+			raw.Priority,
+			"priority",
+		)
+		if decodeErr != nil {
+			return ticketEscalationCommandRequest{}, decodeErr
+		}
+		if !priority.IsValid() {
+			return ticketEscalationCommandRequest{}, errors.New(
+				"priority is not a supported ticket priority",
+			)
+		}
+		request.Priority = &priority
+	}
+	if len(raw.Assignee) > 0 {
+		assignee, decodeErr := decodeAssignableActorRef(raw.Assignee)
+		if decodeErr != nil {
+			return ticketEscalationCommandRequest{}, decodeErr
+		}
+		request.Assignee = &assignee
+	}
+	return request, nil
+}
+
+func decodeAssignableActorRef(raw json.RawMessage) (models.ActorRef, error) {
+	var assignee models.ActorRef
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return assignee, errors.New("assignee cannot be null in this command")
+	}
+	if err := decodeStrictJSON(raw, &assignee); err != nil {
+		return assignee, fmt.Errorf("invalid assignee: %w", err)
+	}
+	if err := assignee.Validate(); err != nil {
+		return assignee, fmt.Errorf("invalid assignee: %w", err)
+	}
+	if assignee.Type != models.ActorTypeHuman &&
+		assignee.Type != models.ActorTypeServicePrincipal {
+		return assignee, errors.New(
+			"assignee type must be human or service_principal",
+		)
+	}
+	if assignee.ID != strings.TrimSpace(assignee.ID) {
+		return assignee, errors.New("assignee id cannot contain surrounding whitespace")
+	}
+	return assignee, nil
+}
+
+func validateCommandReason(reason string) (string, error) {
+	reason = strings.TrimSpace(reason)
+	length := utf8.RuneCountInString(reason)
+	if length < 1 || length > 1000 {
+		return "", errors.New("reason must contain between 1 and 1000 characters")
+	}
+	return reason, nil
 }
 
 func (h *APIHandler) writeReplayedTicket(c *gin.Context, record *models.IdempotencyRecord, status int) {
@@ -1248,7 +1811,7 @@ func (h *APIHandler) writeReplayedTicket(c *gin.Context, record *models.Idempote
 	if len(record.ResourceSnapshot) > 0 {
 		var snapshot models.TicketResponse
 		if json.Unmarshal(record.ResourceSnapshot, &snapshot) == nil && snapshot.ID > 0 {
-			c.Header("ETag", FormatETag(receipt.ResourceVersion))
+			c.Header("ETag", httpcontract.FormatETag(receipt.ResourceVersion))
 			WriteReceipt(c, status, &snapshot, receipt)
 			return
 		}
@@ -1263,7 +1826,7 @@ func (h *APIHandler) writeReplayedTicket(c *gin.Context, record *models.Idempote
 		h.writeIdempotentBody(c, record)
 		return
 	}
-	c.Header("ETag", FormatETag(ticket.Version))
+	c.Header("ETag", httpcontract.FormatETag(ticket.Version))
 	WriteReceipt(c, status, ticket.ToResponse(), receipt)
 }
 
@@ -1289,7 +1852,7 @@ func (h *APIHandler) writeReplayedComment(c *gin.Context, record *models.Idempot
 	if len(record.ResourceSnapshot) > 0 {
 		var snapshot models.TicketComment
 		if json.Unmarshal(record.ResourceSnapshot, &snapshot) == nil && snapshot.ID > 0 {
-			c.Header("ETag", FormatETag(receipt.ResourceVersion))
+			c.Header("ETag", httpcontract.FormatETag(receipt.ResourceVersion))
 			WriteReceipt(c, record.ResponseCode, snapshot.ToResponse(), receipt)
 			return
 		}
@@ -1307,7 +1870,7 @@ func (h *APIHandler) writeReplayedComment(c *gin.Context, record *models.Idempot
 		h.writeIdempotentBody(c, record)
 		return
 	}
-	c.Header("ETag", FormatETag(receipt.ResourceVersion))
+	c.Header("ETag", httpcontract.FormatETag(receipt.ResourceVersion))
 	WriteReceipt(c, record.ResponseCode, comment.ToResponse(), receipt)
 }
 
@@ -1327,7 +1890,7 @@ func (h *APIHandler) writeReplayedAttachment(c *gin.Context, record *models.Idem
 	if len(record.ResourceSnapshot) > 0 {
 		var snapshot models.TicketAttachment
 		if json.Unmarshal(record.ResourceSnapshot, &snapshot) == nil && snapshot.ID > 0 {
-			c.Header("ETag", FormatETag(receipt.ResourceVersion))
+			c.Header("ETag", httpcontract.FormatETag(receipt.ResourceVersion))
 			WriteReceipt(c, record.ResponseCode, snapshot.ToResponse(), receipt)
 			return
 		}
@@ -1342,7 +1905,7 @@ func (h *APIHandler) writeReplayedAttachment(c *gin.Context, record *models.Idem
 		h.writeIdempotentBody(c, record)
 		return
 	}
-	c.Header("ETag", FormatETag(receipt.ResourceVersion))
+	c.Header("ETag", httpcontract.FormatETag(receipt.ResourceVersion))
 	WriteReceipt(c, record.ResponseCode, attachment.ToResponse(), receipt)
 }
 
@@ -1401,6 +1964,8 @@ func writeNativeProblem(c *gin.Context, err error) {
 		status, code = http.StatusConflict, ProblemIdempotencyConflict
 	case errors.Is(err, services.ErrOutboxReplayConflict):
 		status, code = http.StatusConflict, ProblemOutboxConflict
+	case errors.Is(err, services.ErrInvalidAttachment):
+		status, code = http.StatusBadRequest, ProblemAttachmentRejected
 	case errors.Is(err, services.ErrAttachmentTooLarge), errors.Is(err, services.ErrAttachmentNotClean), errors.Is(err, services.ErrInvalidAttachmentName):
 		status, code = http.StatusUnprocessableEntity, ProblemAttachmentRejected
 	default:
@@ -1496,4 +2061,19 @@ func requireTicketLeaseHeader(c *gin.Context) (string, bool) {
 		return "", false
 	}
 	return leaseID, true
+}
+
+func requireCommandCorrelationID(c *gin.Context) (string, bool) {
+	correlationID := strings.TrimSpace(c.GetHeader("X-Correlation-ID"))
+	if correlationID == "" || utf8.RuneCountInString(correlationID) > 255 {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			"X-Correlation-ID must contain between 1 and 255 characters",
+			false,
+		)
+		return "", false
+	}
+	return correlationID, true
 }

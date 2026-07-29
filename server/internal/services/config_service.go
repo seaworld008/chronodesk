@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/observability"
@@ -84,57 +85,27 @@ func NewConfigService(db *gorm.DB) *ConfigService {
 func (s *ConfigService) InitDefaultConfigs() error {
 	log.Println("🔧 初始化系统默认配置...")
 
-	defaultConfigs := []models.SystemConfig{
-		// 系统基础信息
-		{Key: KeySystemName, Value: "ChronoDesk", ValueType: "string", Description: "系统名称", Category: CategorySystem, Group: "basic"},
-		{Key: KeySystemVersion, Value: version.Version, ValueType: "string", Description: "系统版本", Category: CategorySystem, Group: "basic"},
-		{Key: KeySystemDescription, Value: "AI Agent 原生工单自动化平台", ValueType: "string", Description: "系统描述", Category: CategorySystem, Group: "basic"},
-		{Key: KeySystemTimezone, Value: "Asia/Shanghai", ValueType: "string", Description: "系统时区", Category: CategorySystem, Group: "basic"},
-
-		// 安全策略
-		{Key: KeyPasswordMinLength, Value: "8", ValueType: "int", Description: "密码最小长度", Category: CategorySecurity, Group: "password"},
-		{Key: KeyPasswordRequireUpper, Value: "true", ValueType: "bool", Description: "密码需要大写字母", Category: CategorySecurity, Group: "password"},
-		{Key: KeyPasswordRequireLower, Value: "true", ValueType: "bool", Description: "密码需要小写字母", Category: CategorySecurity, Group: "password"},
-		{Key: KeyPasswordRequireDigit, Value: "true", ValueType: "bool", Description: "密码需要数字", Category: CategorySecurity, Group: "password"},
-		{Key: KeyPasswordRequireSymbol, Value: "false", ValueType: "bool", Description: "密码需要特殊字符", Category: CategorySecurity, Group: "password"},
-		{Key: KeyMaxLoginAttempts, Value: "5", ValueType: "int", Description: "最大登录尝试次数", Category: CategorySecurity, Group: "login"},
-		{Key: KeyLoginLockDuration, Value: "300", ValueType: "int", Description: "登录锁定时长(秒)", Category: CategorySecurity, Group: "login"},
-		{Key: KeySessionTimeout, Value: "3600", ValueType: "int", Description: "会话超时时长(秒)", Category: CategorySecurity, Group: "session"},
-		{Key: KeyTwoFactorRequired, Value: "false", ValueType: "bool", Description: "是否强制双因子认证", Category: CategorySecurity, Group: "auth"},
-		{Key: KeyTrustedDeviceTTLHours, Value: "720", ValueType: "int", Description: "可信设备有效期(小时)", Category: CategorySecurity, Group: "trusted_device"},
-		{Key: KeyTrustedDeviceMaxPerUser, Value: "5", ValueType: "int", Description: "每个用户允许的可信设备数量", Category: CategorySecurity, Group: "trusted_device"},
-
-		// 工单默认配置
-		{Key: KeyTicketDefaultPriority, Value: "normal", ValueType: "string", Description: "工单默认优先级", Category: CategoryTicket, Group: "defaults"},
-		{Key: KeyTicketDefaultType, Value: "general", ValueType: "string", Description: "工单默认类型", Category: CategoryTicket, Group: "defaults"},
-		{Key: KeyTicketAutoAssign, Value: "false", ValueType: "bool", Description: "是否自动分配工单", Category: CategoryTicket, Group: "workflow"},
-		{Key: KeyTicketSLAEnabled, Value: "true", ValueType: "bool", Description: "是否启用SLA", Category: CategoryTicket, Group: "workflow"},
-
-		// 系统通知
-		{Key: KeyNotifyEmailEnabled, Value: "true", ValueType: "bool", Description: "启用邮件通知", Category: CategoryNotify, Group: "channels"},
-		{Key: KeyNotifyWebSocketEnabled, Value: "true", ValueType: "bool", Description: "启用WebSocket通知", Category: CategoryNotify, Group: "channels"},
-		{Key: KeyNotifyInAppEnabled, Value: "true", ValueType: "bool", Description: "启用应用内通知", Category: CategoryNotify, Group: "channels"},
-	}
-
-	for _, config := range defaultConfigs {
-		// 检查配置是否已存在
-		var existing models.SystemConfig
-		if err := s.db.Where("key = ?", config.Key).First(&existing).Error; err != nil {
-			if err == gorm.ErrRecordNotFound {
-				// 配置不存在，创建新的
-				if err := s.db.Create(&config).Error; err != nil {
-					log.Printf(
-						"❌ 创建默认配置失败：key=%s reason=persistence_error",
-						observability.SafeLogValue(config.Key),
-					)
-					return err
-				}
-				s.logConfigChange(config.Key, config.Value, "DEFAULT_CREATE")
-			} else {
-				log.Print("❌ 查询默认配置失败：reason=persistence_error")
-				return err
+	created := make([]models.SystemConfig, 0)
+	if err := s.db.Transaction(func(tx *gorm.DB) error {
+		for _, config := range models.DefaultSystemConfigs(version.Version) {
+			result := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "key"}},
+				DoNothing: true,
+			}).Create(&config)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 1 {
+				created = append(created, config)
 			}
 		}
+		return nil
+	}); err != nil {
+		log.Print("❌ 创建默认配置失败：reason=persistence_error")
+		return err
+	}
+	for _, config := range created {
+		s.logConfigChange(config.Key, config.Value, "DEFAULT_CREATE")
 	}
 
 	log.Println("✅ 系统默认配置初始化完成")

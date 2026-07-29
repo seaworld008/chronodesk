@@ -494,14 +494,20 @@ func attachmentSchema() schema {
 
 func historyEntrySchema() schema {
 	return objectSchema(map[string]any{
-		"id":               integerSchema("History record identifier.", 1),
-		"ticket_id":        integerSchema("Ticket identifier.", 1),
-		"actor":            actorRefSchema(),
-		"action":           boundedString("Stable action name.", 1, 128),
-		"changed_fields":   arraySchema("Changed fields.", boundedString("Field name.", 1, 128)),
-		"reason":           boundedString("Short auditable reason.", 0, 2000),
-		"event_id":         boundedString("Domain event identifier.", 1, 255),
-		"resource_version": integerSchema("Resource version after this action.", 1),
+		"id":             integerSchema("History record identifier.", 1),
+		"ticket_id":      integerSchema("Ticket identifier.", 1),
+		"actor":          actorRefSchema(),
+		"action":         boundedString("Stable action name.", 1, 128),
+		"changed_fields": arraySchema("Changed fields.", boundedString("Field name.", 1, 128)),
+		"reason":         boundedString("Short auditable reason.", 0, 2000),
+		"event_id": schema{
+			"type":        []string{"string", "null"},
+			"description": "Domain event identifier, or null for auditable pre-event/imported history.",
+			"minLength":   float64(1),
+			"maxLength":   float64(255),
+		},
+		"resource_version": integerSchema("Resource version after this action; zero means no provable event link.", 0),
+		"provenance":       enumSchema("History-to-event provenance.", "domain_event", "pre_event", "imported"),
 		"created_at":       timestampSchema("Action timestamp."),
-	}, "id", "ticket_id", "actor", "action", "changed_fields", "event_id", "resource_version", "created_at")
+	}, "id", "ticket_id", "actor", "action", "changed_fields", "event_id", "resource_version", "provenance", "created_at")
 }

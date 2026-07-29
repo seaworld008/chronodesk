@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/httpcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
@@ -20,6 +21,23 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+func newTestRuntimeControl(
+	t *testing.T,
+	db *gorm.DB,
+	native *services.AgentNativeService,
+	readOnly bool,
+) *RuntimeControl {
+	t.Helper()
+	if native == nil {
+		native = services.NewAgentNativeService(db, services.AgentNativeOptions{})
+	}
+	control, err := NewRuntimeControl(context.Background(), native, db, readOnly)
+	if err != nil {
+		t.Fatalf("NewRuntimeControl() error = %v", err)
+	}
+	return control
+}
 
 func TestRuntimeSafetyControlsSurviveRestart(t *testing.T) {
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
@@ -30,20 +48,102 @@ func TestRuntimeSafetyControlsSurviveRestart(t *testing.T) {
 	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
 		t.Fatal(err)
 	}
-	first := NewRuntimeControl(nil, false, db)
-	if err := first.PersistReadOnly(context.Background(), true, 0); err != nil {
+	first := newTestRuntimeControl(t, db, nil, false)
+	if err := first.persistOnDB(context.Background(), db, agentReadOnlyConfigKey, true, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := first.PersistEmergencyStop(context.Background(), true, 0); err != nil {
+	first.SetReadOnly(true)
+	if err := first.persistOnDB(context.Background(), db, agentEmergencyConfigKey, true, 0); err != nil {
 		t.Fatal(err)
 	}
+	first.SetEmergencyStop(true)
 
-	restarted := NewRuntimeControl(nil, false, db)
+	restarted := newTestRuntimeControl(t, db, nil, false)
 	if !restarted.ReadOnly() || !restarted.EmergencyStop() {
 		t.Fatalf(
 			"persisted controls were lost: read_only=%v emergency=%v",
 			restarted.ReadOnly(),
 			restarted.EmergencyStop(),
+		)
+	}
+}
+
+func TestRuntimeSafetyControlStartupFailsClosedWhenPersistenceIsUnavailable(t *testing.T) {
+	db, err := gorm.Open(
+		sqlite.Open("file:runtime_control_startup_failure?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	native := services.NewAgentNativeService(db, services.AgentNativeOptions{})
+	control, err := NewRuntimeControl(context.Background(), native, db, false)
+	if err == nil || control != nil {
+		t.Fatalf(
+			"NewRuntimeControl() = (%v, %v), want nil control and persistence error",
+			control,
+			err,
+		)
+	}
+}
+
+func TestRuntimeSafetyControlRefreshFailureStopsWritesUntilRecovery(t *testing.T) {
+	db, err := gorm.Open(
+		sqlite.Open("file:runtime_control_refresh_failure?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	native := services.NewAgentNativeService(db, services.AgentNativeOptions{})
+	control := newTestRuntimeControl(t, db, native, false)
+	if !control.Healthy() || control.EmergencyStop() {
+		t.Fatalf(
+			"initial runtime control state unhealthy: healthy=%v emergency=%v",
+			control.Healthy(),
+			control.EmergencyStop(),
+		)
+	}
+
+	if err := db.Migrator().DropTable(&models.SystemConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Refresh(context.Background()); err == nil {
+		t.Fatal("refresh unexpectedly succeeded without persistence table")
+	}
+	if control.Healthy() || !control.EmergencyStop() {
+		t.Fatalf(
+			"refresh failure did not fail closed: healthy=%v emergency=%v",
+			control.Healthy(),
+			control.EmergencyStop(),
+		)
+	}
+
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh after persistence recovery: %v", err)
+	}
+	if !control.Healthy() || control.EmergencyStop() || control.ReadOnly() {
+		t.Fatalf(
+			"runtime control did not recover persisted defaults: healthy=%v emergency=%v read_only=%v",
+			control.Healthy(),
+			control.EmergencyStop(),
+			control.ReadOnly(),
 		)
 	}
 }
@@ -91,13 +191,12 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 	native := services.NewAgentNativeService(db, services.AgentNativeOptions{
 		CredentialPepper: []byte("admin-handler-test-pepper"),
 	})
-	control := NewRuntimeControl(native, false, db)
+	control := newTestRuntimeControl(t, db, native, false)
 	handler := NewAdminHandler(
 		db,
 		native,
 		control,
 		time.Hour,
-		0,
 		[]byte("admin-handler-stable-replay-encryption-key"),
 	)
 	router := gin.New()
@@ -128,7 +227,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		request.Header.Set("X-Request-ID", fmt.Sprintf("admin-request-%d", requestCounter))
 		request.Header.Set("Idempotency-Key", fmt.Sprintf("admin-test-key-%04d", requestCounter))
 		if expectedVersion > 0 {
-			request.Header.Set("If-Match", FormatETag(expectedVersion))
+			request.Header.Set("If-Match", httpcontract.FormatETag(expectedVersion))
 		}
 		router.ServeHTTP(recorder, request)
 		if recorder.Code != wantStatus {
@@ -152,13 +251,13 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		if receipt.PolicyDecisionID != "" {
 			tt.Fatalf("%s %s human admin receipt unexpectedly has policy decision %q", method, path, receipt.PolicyDecisionID)
 		}
-		if recorder.Header().Get("ETag") != FormatETag(receipt.ResourceVersion) {
+		if recorder.Header().Get("ETag") != httpcontract.FormatETag(receipt.ResourceVersion) {
 			tt.Fatalf(
 				"%s %s ETag=%q, want %q",
 				method,
 				path,
 				recorder.Header().Get("ETag"),
-				FormatETag(receipt.ResourceVersion),
+				httpcontract.FormatETag(receipt.ResourceVersion),
 			)
 		}
 		var event models.DomainEvent
@@ -329,7 +428,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		Source:             models.TicketSourceAgent,
 		Version:            1,
 		TrustLevel:         models.TicketTrustLevelSystem,
-		CreatedByID:        admin.ID,
+		CreatedByID:        &admin.ID,
 		CreatedByActorType: models.ActorTypeHuman,
 		CreatedByActorID:   strconv.FormatUint(uint64(admin.ID), 10),
 	}
@@ -338,7 +437,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 	}
 	attachment := models.TicketAttachment{
 		TicketID:     ticket.ID,
-		UploadedBy:   admin.ID,
+		UploadedBy:   &admin.ID,
 		ActorType:    models.ActorTypeHuman,
 		ActorID:      strconv.FormatUint(uint64(admin.ID), 10),
 		FileName:     "attachment.txt",
@@ -406,6 +505,15 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		}
 	})
 
+	const legacyOutboxToken = "legacy-outbox-query-token"
+	if err := db.Model(&models.OutboxDelivery{}).
+		Where("id = ?", replayDelivery.ID).
+		Update(
+			"last_error",
+			"https://push.example.test/a2a?access_token="+legacyOutboxToken,
+		).Error; err != nil {
+		t.Fatal(err)
+	}
 	overviewRecorder := httptest.NewRecorder()
 	overviewRequest := httptest.NewRequest(
 		http.MethodGet,
@@ -427,6 +535,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 			Outbox []struct {
 				ID              string `json:"id"`
 				ResourceVersion uint64 `json:"resource_version"`
+				LastError       string `json:"last_error"`
 			} `json:"outbox"`
 			Attachments []struct {
 				ID              uint   `json:"id"`
@@ -457,6 +566,10 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 	for _, row := range overviewEnvelope.Data.Outbox {
 		if row.ID == replayDelivery.ID {
 			deliveryFound, deliveryVersion = true, row.ResourceVersion
+			if strings.Contains(row.LastError, legacyOutboxToken) ||
+				strings.Contains(row.LastError, "https://push.example.test") {
+				t.Fatalf("administrator Outbox response leaked callback URL: %q", row.LastError)
+			}
 		}
 	}
 	for _, row := range overviewEnvelope.Data.Attachments {
@@ -560,6 +673,7 @@ func newAdminContractFixture(t *testing.T) *adminContractFixture {
 		CredentialPepper: []byte("admin-contract-credential-pepper"),
 	})
 	router := newAdminContractRouter(
+		t,
 		db,
 		native,
 		admin,
@@ -569,6 +683,7 @@ func newAdminContractFixture(t *testing.T) *adminContractFixture {
 }
 
 func newAdminContractRouter(
+	t *testing.T,
 	db *gorm.DB,
 	native *services.AgentNativeService,
 	admin models.User,
@@ -577,9 +692,8 @@ func newAdminContractRouter(
 	handler := NewAdminHandler(
 		db,
 		native,
-		NewRuntimeControl(native, false, db),
+		newTestRuntimeControl(t, db, native, false),
 		time.Hour,
-		0,
 		replayKey,
 	)
 	router := gin.New()
@@ -651,7 +765,7 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 				endpoint.path,
 				endpoint.body,
 				"",
-				FormatETag(1),
+				httpcontract.FormatETag(1),
 				"missing-idempotency",
 			)
 			if response.Code != http.StatusBadRequest ||
@@ -705,7 +819,7 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 	if first.Code != http.StatusCreated {
 		t.Fatalf("create status=%d body=%s", first.Code, first.Body.String())
 	}
-	if first.Header().Get("ETag") != FormatETag(1) ||
+	if first.Header().Get("ETag") != httpcontract.FormatETag(1) ||
 		first.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("create response headers=%v", first.Header())
 	}
@@ -732,6 +846,7 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	wrongKeyRouter := newAdminContractRouter(
+		t,
 		fixture.db,
 		fixture.native,
 		fixture.admin,
@@ -755,6 +870,7 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 		)
 	}
 	restartedRouter := newAdminContractRouter(
+		t,
 		fixture.db,
 		fixture.native,
 		fixture.admin,
@@ -834,10 +950,10 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 		statusPath,
 		`{"read_only":true}`,
 		statusKey,
-		FormatETag(1),
+		httpcontract.FormatETag(1),
 		"status-first",
 	)
-	if statusFirst.Code != http.StatusOK || statusFirst.Header().Get("ETag") != FormatETag(2) {
+	if statusFirst.Code != http.StatusOK || statusFirst.Header().Get("ETag") != httpcontract.FormatETag(2) {
 		t.Fatalf("status update code=%d headers=%v body=%s", statusFirst.Code, statusFirst.Header(), statusFirst.Body.String())
 	}
 	statusReplay := performAdminContractRequest(
@@ -846,12 +962,12 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 		statusPath,
 		`{"read_only":true}`,
 		statusKey,
-		FormatETag(1),
+		httpcontract.FormatETag(1),
 		"status-retry",
 	)
 	if statusReplay.Code != statusFirst.Code ||
 		statusReplay.Body.String() != statusFirst.Body.String() ||
-		statusReplay.Header().Get("ETag") != FormatETag(2) {
+		statusReplay.Header().Get("ETag") != httpcontract.FormatETag(2) {
 		t.Fatalf("status replay differs: first=%s replay=%s", statusFirst.Body.String(), statusReplay.Body.String())
 	}
 	stale := performAdminContractRequest(
@@ -860,11 +976,11 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 		statusPath,
 		`{"emergency_disabled":true}`,
 		"stale-version-command",
-		FormatETag(1),
+		httpcontract.FormatETag(1),
 		"status-stale",
 	)
 	if stale.Code != http.StatusConflict ||
-		stale.Header().Get("ETag") != FormatETag(2) ||
+		stale.Header().Get("ETag") != httpcontract.FormatETag(2) ||
 		!strings.Contains(stale.Body.String(), ProblemVersionConflict) {
 		t.Fatalf("stale command status=%d headers=%v body=%s", stale.Code, stale.Header(), stale.Body.String())
 	}
@@ -897,7 +1013,7 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 		statusPath,
 		`{"read_only":false}`,
 		processingKey,
-		FormatETag(2),
+		httpcontract.FormatETag(2),
 		"status-processing",
 	)
 	if processing.Code != http.StatusConflict ||
@@ -913,10 +1029,10 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 		rotatePath,
 		"",
 		rotateKey,
-		FormatETag(2),
+		httpcontract.FormatETag(2),
 		"rotate-first",
 	)
-	if rotated.Code != http.StatusOK || rotated.Header().Get("ETag") != FormatETag(3) {
+	if rotated.Code != http.StatusOK || rotated.Header().Get("ETag") != httpcontract.FormatETag(3) {
 		t.Fatalf("rotate status=%d headers=%v body=%s", rotated.Code, rotated.Header(), rotated.Body.String())
 	}
 	var rotationCredentialsBefore int64
@@ -929,7 +1045,7 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 		rotatePath,
 		"",
 		rotateKey,
-		FormatETag(2),
+		httpcontract.FormatETag(2),
 		"rotate-retry",
 	)
 	if rotationReplay.Code != rotated.Code || rotationReplay.Body.String() != rotated.Body.String() {
@@ -984,7 +1100,7 @@ func TestAdminResourceCASAllowsOnlyOneConcurrentWriter(t *testing.T) {
 				path,
 				input.body,
 				input.key,
-				FormatETag(1),
+				httpcontract.FormatETag(1),
 				input.key,
 			)
 			responses <- response{
@@ -1003,12 +1119,12 @@ func TestAdminResourceCASAllowsOnlyOneConcurrentWriter(t *testing.T) {
 		switch result.code {
 		case http.StatusOK:
 			successes++
-			if result.etag != FormatETag(2) {
+			if result.etag != httpcontract.FormatETag(2) {
 				t.Fatalf("successful CAS ETag=%q body=%s", result.etag, result.body)
 			}
 		case http.StatusConflict:
 			conflicts++
-			if result.etag != FormatETag(2) ||
+			if result.etag != httpcontract.FormatETag(2) ||
 				!strings.Contains(result.body, ProblemVersionConflict) {
 				t.Fatalf("conflicting CAS ETag=%q body=%s", result.etag, result.body)
 			}
@@ -1083,13 +1199,12 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 			ID:   "",
 		}},
 	})
-	control := NewRuntimeControl(failing, false, db)
+	control := newTestRuntimeControl(t, db, failing, false)
 	handler := NewAdminHandler(
 		db,
 		failing,
 		control,
 		time.Hour,
-		0,
 		[]byte("rollback-stable-replay-encryption-key"),
 	)
 	router := gin.New()
@@ -1110,7 +1225,7 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Idempotency-Key", fmt.Sprintf("rollback-key-%04d", failedRequestCounter))
 		if expectedVersion > 0 {
-			request.Header.Set("If-Match", FormatETag(expectedVersion))
+			request.Header.Set("If-Match", httpcontract.FormatETag(expectedVersion))
 		}
 		router.ServeHTTP(recorder, request)
 		if recorder.Code != http.StatusInternalServerError {
@@ -1274,7 +1389,7 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 		Source:             models.TicketSourceAgent,
 		Version:            1,
 		TrustLevel:         models.TicketTrustLevelSystem,
-		CreatedByID:        admin.ID,
+		CreatedByID:        &admin.ID,
 		CreatedByActorType: models.ActorTypeHuman,
 		CreatedByActorID:   strconv.FormatUint(uint64(admin.ID), 10),
 	}
@@ -1283,7 +1398,7 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 	}
 	attachment := models.TicketAttachment{
 		TicketID:     ticket.ID,
-		UploadedBy:   admin.ID,
+		UploadedBy:   &admin.ID,
 		ActorType:    models.ActorTypeHuman,
 		ActorID:      strconv.FormatUint(uint64(admin.ID), 10),
 		FileName:     "rollback.txt",
@@ -1313,7 +1428,7 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 	}
 
 	publishedAt := time.Now().UTC().Add(-time.Minute)
-	event, err := healthy.CreateDomainEvent(context.Background(), services.DomainEventInput{
+	event, err := appendTestDomainEvent(context.Background(), healthy, services.DomainEventInput{
 		Type:            "io.chronodesk.test.rollback.v1",
 		Subject:         "rollback/source",
 		Actor:           models.SystemActor("rollback-test"),

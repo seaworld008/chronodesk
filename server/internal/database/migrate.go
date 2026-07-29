@@ -11,7 +11,9 @@ import (
 
 	"github.com/seaworld008/chronodesk/server/internal/auth"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/version"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // ValidateRuntimeSchema verifies additive migrations that the running binary
@@ -25,7 +27,13 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 
 	requirements := runtimeSchemaRequirements()
 	if db.Dialector.Name() == "postgres" {
-		return validatePostgresRuntimeSchema(db, requirements)
+		if err := validatePostgresRuntimeSchema(db, requirements); err != nil {
+			return err
+		}
+		if err := validatePostgresLoginHistoryMethodContract(db); err != nil {
+			return err
+		}
+		return validatePostgresA2AIdentifierContract(db)
 	}
 
 	var missing []string
@@ -126,10 +134,25 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 		{&models.User{}, "users", []string{
 			"id", "role", "status", "password_hash", "password_reset_at",
 			"two_factor_enabled", "two_factor_secret", "backup_codes",
+			"welcome_email_delivered_at",
 		}},
-		{&auth.RefreshToken{}, "refresh_tokens", []string{"user_id", "session_id", "expires_at", "revoked"}},
-		{&auth.EmailVerification{}, "email_verifications", []string{"user_id", "token", "used", "expires_at", "used_at"}},
-		{&auth.PasswordReset{}, "password_resets", []string{"user_id", "token", "used", "expires_at", "used_at"}},
+		{&models.UserProfile{}, "user_profiles", []string{"user_id"}},
+		{&models.EmailConfig{}, "email_configs", []string{
+			"email_verification_enabled", "smtp_host", "smtp_port",
+			"smtp_username", "smtp_password", "from_email", "is_active",
+		}},
+		{&auth.RefreshToken{}, "refresh_tokens", []string{
+			"user_id", "session_id", "expires_at", "revoked", "rotated_at",
+			"replaced_by_token",
+		}},
+		{&auth.EmailVerification{}, "email_verifications", []string{
+			"user_id", "token", "delivery_secret", "email_delivered_at",
+			"used", "expires_at", "used_at",
+		}},
+		{&auth.PasswordReset{}, "password_resets", []string{
+			"user_id", "token", "delivery_secret", "email_delivered_at",
+			"used", "expires_at", "used_at",
+		}},
 		{&auth.OTPCode{}, "otp_codes", []string{"user_id", "code", "type", "expires_at", "used", "used_at"}},
 		{&models.LoginHistory{}, "login_histories", []string{"user_id", "session_id", "is_active"}},
 		{&models.ServicePrincipal{}, "service_principals", []string{"id", "status", "scopes", "read_only", "emergency_disabled", "expires_at"}},
@@ -149,7 +172,10 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 			"ticket_id", "actor_type", "actor_id", "service_principal_id",
 			"storage_path", "hash", "virus_scan",
 		}},
-		{&models.TicketHistory{}, "ticket_histories", []string{"ticket_id", "actor_type", "actor_id", "service_principal_id", "action", "details"}},
+		{&models.TicketHistory{}, "ticket_histories", []string{
+			"ticket_id", "actor_type", "actor_id", "service_principal_id",
+			"event_id", "resource_version", "provenance", "action", "details",
+		}},
 		{&models.TicketLease{}, "ticket_leases", []string{"ticket_id", "holder_actor_type", "holder_actor_id", "ticket_version", "expires_at", "released_at"}},
 		{&models.DomainEvent{}, "domain_events", []string{
 			"spec_version", "source", "type", "subject", "time", "data",
@@ -172,20 +198,12 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 	}
 }
 
-// AutoMigrate 自动迁移所有模型
-func AutoMigrate(db *gorm.DB) error {
-	return autoMigrateFromModel(db, 1)
-}
-
 func autoMigrateFromModel(db *gorm.DB, firstModel int) error {
 	log.Println("Starting database migration...")
 
 	migrationModels := schemaMigrationModels()
-	if firstModel < 1 || firstModel > len(migrationModels)+1 {
-		return fmt.Errorf(
-			"first migration model must be between 1 and %d",
-			len(migrationModels)+1,
-		)
+	if err := validateMigrationResumePoint(firstModel, len(migrationModels)); err != nil {
+		return err
 	}
 	// 每个模型独立提交并记录进度。高延迟云数据库的元数据查询较多，
 	// 分段后失败可安全重跑，也能精确定位慢表，而不是出现无输出的长等待。
@@ -206,6 +224,41 @@ func autoMigrateFromModel(db *gorm.DB, firstModel int) error {
 
 	log.Println("Database migration completed successfully")
 	return nil
+}
+
+func validateMigrationResumePoint(firstModel, modelCount int) error {
+	if firstModel < 1 || firstModel > modelCount+1 {
+		return fmt.Errorf(
+			"first migration model must be between 1 and %d",
+			modelCount+1,
+		)
+	}
+	return nil
+}
+
+// migrateLegacyHumanRoles upgrades the two historical human-role aliases
+// before AutoMigrate installs the closed role constraint. It intentionally
+// runs even for resumed migrations because an operator may resume after the
+// user model while still pointing at legacy data.
+func migrateLegacyHumanRoles(db *gorm.DB) error {
+	if !db.Migrator().HasTable(&models.User{}) ||
+		!db.Migrator().HasColumn(&models.User{}, "role") {
+		return nil
+	}
+
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Table("users").
+			Where("role = ?", "user").
+			Update("role", models.RoleCustomer).Error; err != nil {
+			return fmt.Errorf("migrate legacy customer role: %w", err)
+		}
+		if err := tx.Table("users").
+			Where("role = ?", "superuser").
+			Update("role", models.RoleAdmin).Error; err != nil {
+			return fmt.Errorf("migrate legacy administrator role: %w", err)
+		}
+		return nil
+	})
 }
 
 // migrateOneModel isolates an upstream GORM PostgreSQL migrator defect where a
@@ -455,21 +508,51 @@ $$;`
 	return nil
 }
 
-// SeedData 初始化种子数据
-func SeedData(db *gorm.DB) error {
-	log.Println("Seeding initial data...")
+// SeedOptions makes optional demonstration records an explicit operator
+// decision. Schema migration never calls this path.
+type SeedOptions struct {
+	IncludeSampleData bool
+}
 
+// SeedData initializes the bootstrap administrator and default categories in a
+// single transaction. A failure at any stage rolls back every seed mutation.
+func SeedData(db *gorm.DB, options SeedOptions) error {
+	if db == nil {
+		return errors.New("seed database is required")
+	}
+	log.Println("Seeding initial data...")
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := seedInitialData(tx, options); err != nil {
+			return err
+		}
+		log.Println("Initial data seeding completed")
+		return nil
+	})
+}
+
+func seedInitialData(db *gorm.DB, options SeedOptions) error {
 	// 检查是否已有管理员用户
 	var adminUser models.User
 	var adminCount int64
-	db.Model(&models.User{}).Where("role = ?", models.RoleAdmin).Count(&adminCount)
+	if err := db.Model(&models.User{}).
+		Where("role = ?", models.RoleAdmin).
+		Count(&adminCount).Error; err != nil {
+		return fmt.Errorf("failed to check initial administrator: %w", err)
+	}
 
 	if adminCount == 0 {
 		adminPassword := os.Getenv("ADMIN_PASSWORD")
 		if adminPassword == "" {
 			return fmt.Errorf("ADMIN_PASSWORD is required when seeding the initial administrator")
 		}
-		passwordHash, err := auth.NewSimplePasswordService(8, "").HashPassword(adminPassword)
+		passwordService, err := auth.NewSimplePasswordService(auth.PasswordServiceConfig{
+			MinLength:  8,
+			BcryptCost: auth.DefaultBcryptCost,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to initialize initial administrator password service: %w", err)
+		}
+		passwordHash, err := passwordService.HashPassword(adminPassword)
 		if err != nil {
 			return fmt.Errorf("failed to hash initial administrator password: %w", err)
 		}
@@ -504,7 +587,9 @@ func SeedData(db *gorm.DB) error {
 
 	// 检查是否已有默认分类
 	var categoryCount int64
-	db.Model(&models.Category{}).Count(&categoryCount)
+	if err := db.Model(&models.Category{}).Count(&categoryCount).Error; err != nil {
+		return fmt.Errorf("failed to check default categories: %w", err)
+	}
 
 	if categoryCount == 0 {
 		// 创建默认分类，使用管理员用户ID作为创建者
@@ -558,26 +643,45 @@ func SeedData(db *gorm.DB) error {
 		}
 		log.Println("Created default categories")
 	}
-
-	// 生成示例数据（仅在开发环境）
-	if err := generateSampleDataIfNeeded(db); err != nil {
-		log.Printf("Warning: Failed to generate sample data: %v", err)
-		// 不阻断迁移过程，仅记录警告
+	for _, defaultConfig := range models.DefaultSystemConfigs(version.Version) {
+		result := db.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "key"}},
+			DoNothing: true,
+		}).Create(&defaultConfig)
+		if result.Error != nil {
+			return fmt.Errorf(
+				"failed to create required system config %s: %w",
+				defaultConfig.Key,
+				result.Error,
+			)
+		}
+	}
+	var emailConfigCount int64
+	if err := db.Model(&models.EmailConfig{}).Count(&emailConfigCount).Error; err != nil {
+		return fmt.Errorf("failed to check default email configuration: %w", err)
+	}
+	if emailConfigCount == 0 {
+		if err := db.Create(models.DefaultEmailConfig()).Error; err != nil {
+			return fmt.Errorf("failed to create default email configuration: %w", err)
+		}
 	}
 
-	log.Println("Initial data seeding completed")
+	if options.IncludeSampleData {
+		if os.Getenv("ENVIRONMENT") != "development" {
+			return errors.New(
+				"sample data is only allowed when ENVIRONMENT=development",
+			)
+		}
+		if err := generateSampleDataIfNeeded(db); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-// generateSampleDataIfNeeded 在需要时生成示例数据
+// generateSampleDataIfNeeded generates optional demonstration records. The
+// caller has already enforced the explicit development-only gate.
 func generateSampleDataIfNeeded(db *gorm.DB) error {
-	// 检查环境变量，仅在开发环境生成示例数据
-	environment := os.Getenv("ENVIRONMENT")
-	if environment == "production" {
-		log.Println("Production environment detected, skipping sample data generation")
-		return nil
-	}
-
 	// 检查是否已有示例数据
 	var sampleTicketCount int64
 	if err := db.Model(&models.Ticket{}).Where("title LIKE ?", "%示例%").Count(&sampleTicketCount).Error; err != nil {
@@ -624,25 +728,72 @@ func RunMigrationsFromModel(ctx context.Context, db *gorm.DB, firstModel int) er
 	if db == nil {
 		return errors.New("migration database is required")
 	}
+	if db.Config == nil || db.Statement == nil {
+		return errors.New("migration database is not initialized")
+	}
 	db = db.WithContext(ctx)
 	log.Println("Running database migrations...")
 
-	// 1. 自动迁移模型
+	if err := validateMigrationResumePoint(firstModel, len(schemaMigrationModels())); err != nil {
+		return err
+	}
+
+	// 1. 先迁移历史角色值，确保随后建立封闭枚举约束时不会被旧数据阻断。
+	if err := migrateLegacyHumanRoles(db); err != nil {
+		return fmt.Errorf("human-role migration failed: %w", err)
+	}
+
+	// 2. 在 AutoMigrate 收紧 NOT NULL/CHECK 之前先清理并扩展旧登录审计列。
+	if err := MigrateLoginHistoryMethodContract(db); err != nil {
+		return fmt.Errorf("login history method migration failed: %w", err)
+	}
+
+	// 3. 自动迁移模型
 	if err := autoMigrateFromModel(db, firstModel); err != nil {
 		return fmt.Errorf("auto migration failed: %w", err)
 	}
 
-	// 2. 收口删除语义明确的外键策略
+	// 4. 显式扩展外部 A2A 标识符；GORM 不会可靠修改已有 VARCHAR 长度。
+	if err := MigrateA2AIdentifierContract(db); err != nil {
+		return fmt.Errorf("A2A identifier migration failed: %w", err)
+	}
+
+	// 5. 将自动化规则持久契约收敛到当前 CloudEvent 类型。
+	if err := MigrateAutomationRuleTriggerEvents(db); err != nil {
+		return fmt.Errorf("automation trigger migration failed: %w", err)
+	}
+
+	// 6. 将 Webhook 订阅与投递日志迁移为完整的 canonical CloudEvent 类型。
+	if err := MigrateWebhookEventTaxonomy(db); err != nil {
+		return fmt.Errorf("webhook event taxonomy migration failed: %w", err)
+	}
+
+	// 7. 回填并约束权威 ActorRef，移除服务主体对人类账号的投影依赖。
+	if err := MigrateActorProjections(db); err != nil {
+		return fmt.Errorf("actor projection migration failed: %w", err)
+	}
+
+	// 8. 验证旧附件投影为空后删除，正式附件表成为唯一持久模型。
+	if err := MigrateAttachmentProjections(db); err != nil {
+		return fmt.Errorf("attachment projection migration failed: %w", err)
+	}
+
+	// 9. 只使用可证明的语义证据关联历史记录与不可变领域事件。
+	if err := MigrateTicketHistoryEventLinks(db); err != nil {
+		return fmt.Errorf("ticket history event-link migration failed: %w", err)
+	}
+
+	// 10. 收口删除语义明确的外键策略
 	if err := EnsureForeignKeyPolicies(db); err != nil {
 		return fmt.Errorf("foreign-key policy migration failed: %w", err)
 	}
 
-	// 3. 创建额外索引
+	// 11. 创建额外索引
 	if err := CreateIndexes(db); err != nil {
 		return fmt.Errorf("index creation failed: %w", err)
 	}
 
-	// 4. 验证运行时所需的关键表和列真实存在
+	// 12. 验证运行时所需的关键表和列真实存在
 	if err := ValidateRuntimeSchema(db); err != nil {
 		return fmt.Errorf("runtime schema validation failed: %w", err)
 	}

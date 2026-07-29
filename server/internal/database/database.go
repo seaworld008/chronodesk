@@ -2,9 +2,12 @@ package database
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -138,6 +141,12 @@ func connectPostgreSQL(cfg *config.Config) (*gorm.DB, error) {
 			cfg.Database.Timezone,
 		)
 	}
+	if err := ValidatePostgresTransport(
+		dsn,
+		os.Getenv("POSTGRES_ALLOW_INSECURE") == "true",
+	); err != nil {
+		return nil, err
+	}
 
 	// 配置 GORM 日志
 	var logLevel logger.LogLevel
@@ -149,7 +158,8 @@ func connectPostgreSQL(cfg *config.Config) (*gorm.DB, error) {
 
 	// 连接数据库
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
-		Logger: logger.Default.LogMode(logLevel),
+		Logger:         logger.Default.LogMode(logLevel),
+		TranslateError: true,
 	})
 	if err != nil {
 		return nil, err
@@ -171,22 +181,31 @@ func connectPostgreSQL(cfg *config.Config) (*gorm.DB, error) {
 
 // connectRedis 连接 Redis
 func connectRedis(cfg *config.Config) (RedisInterface, error) {
-	// 首先尝试HTTP REST API连接（推荐用于Upstash）
-	if httpClient, err := NewHTTPRedisClient(); err == nil {
+	restURL := strings.TrimSpace(os.Getenv("KV_REST_API_URL"))
+	restToken := strings.TrimSpace(os.Getenv("KV_REST_API_TOKEN"))
+	if restURL != "" || restToken != "" {
+		httpClient, err := NewHTTPRedisClient()
+		if err != nil {
+			return nil, fmt.Errorf("invalid explicit Redis REST configuration: %w", err)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		pingErr := httpClient.Ping(ctx)
 		cancel()
-
-		if pingErr == nil {
-			log.Print("Redis HTTP REST API 连接成功")
-			return httpClient, nil
+		if pingErr != nil {
+			_ = httpClient.Close()
+			return nil, fmt.Errorf("explicit Redis REST endpoint is unavailable: %w", pingErr)
 		}
-		_ = httpClient.Close()
-		log.Printf("Redis HTTP REST API 连接失败：%v", pingErr)
+		log.Print("Redis HTTP REST API 连接成功")
+		return httpClient, nil
 	}
 
-	// 如果HTTP连接失败，尝试TCP连接
 	if redisURL := getEnv("REDIS_URL", ""); redisURL != "" {
+		if err := validateRedisTCPURL(
+			redisURL,
+			os.Getenv("REDIS_ALLOW_INSECURE") == "true",
+		); err != nil {
+			return nil, err
+		}
 		opt, err := redis.ParseURL(redisURL)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse Redis URL: %w", err)
@@ -208,14 +227,19 @@ func connectRedis(cfg *config.Config) (RedisInterface, error) {
 		if err := tcpClient.Ping(ctx); err != nil {
 			_ = tcpClient.Close()
 			log.Printf("Redis TCP 连接失败：%v", err)
-			return nil, fmt.Errorf("Redis ping failed: %w", err)
+			return nil, fmt.Errorf("redis ping failed: %w", err)
 		}
 
 		log.Print("Redis TCP 连接成功")
 		return tcpClient, nil
 	}
 
-	// 使用传统的 host:port 配置
+	if !isHTTPRedisLoopback(cfg.Redis.Host) &&
+		os.Getenv("REDIS_ALLOW_INSECURE") != "true" {
+		return nil, errors.New(
+			"remote plaintext Redis is forbidden; configure REDIS_URL with rediss://",
+		)
+	}
 	rdb := redis.NewClient(&redis.Options{
 		Addr:            fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port),
 		Password:        cfg.Redis.Password,
@@ -233,10 +257,30 @@ func connectRedis(cfg *config.Config) (RedisInterface, error) {
 	tcpClient := NewTCPRedisClient(rdb)
 	if err := tcpClient.Ping(ctx); err != nil {
 		_ = tcpClient.Close()
-		return nil, fmt.Errorf("Redis ping failed: %w", err)
+		return nil, fmt.Errorf("redis ping failed: %w", err)
 	}
 
 	return tcpClient, nil
+}
+
+func validateRedisTCPURL(rawURL string, allowInsecure bool) error {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || !parsed.IsAbs() || parsed.Hostname() == "" {
+		return errors.New("REDIS_URL must be an absolute Redis URL")
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "rediss":
+		return nil
+	case "redis":
+		if isHTTPRedisLoopback(parsed.Hostname()) || allowInsecure {
+			return nil
+		}
+		return errors.New(
+			"remote REDIS_URL must use rediss:// unless REDIS_ALLOW_INSECURE=true",
+		)
+	default:
+		return errors.New("REDIS_URL must use redis:// or rediss://")
+	}
 }
 
 // Close 关闭数据库连接
@@ -284,14 +328,14 @@ func (d *Database) HealthCheck() error {
 // caller's deadline.
 func (d *Database) PostgreSQLHealthCheck(ctx context.Context) error {
 	if d == nil || d.DB == nil {
-		return fmt.Errorf("PostgreSQL client is not initialized")
+		return fmt.Errorf("postgresql client is not initialized")
 	}
 	sqlDB, err := d.DB.DB()
 	if err != nil {
 		return fmt.Errorf("failed to get sql.DB: %w", err)
 	}
 	if err := sqlDB.PingContext(ctx); err != nil {
-		return fmt.Errorf("PostgreSQL ping failed: %w", err)
+		return fmt.Errorf("postgresql ping failed: %w", err)
 	}
 	return nil
 }
@@ -300,13 +344,13 @@ func (d *Database) PostgreSQLHealthCheck(ctx context.Context) error {
 // readiness dependency, not an optional cache.
 func (d *Database) RedisHealthCheck(ctx context.Context) error {
 	if d == nil {
-		return fmt.Errorf("Redis client is not initialized")
+		return fmt.Errorf("redis client is not initialized")
 	}
 	if d.Redis == nil {
-		return fmt.Errorf("Redis client is not initialized")
+		return fmt.Errorf("redis client is not initialized")
 	}
 	if err := d.Redis.Ping(ctx); err != nil {
-		return fmt.Errorf("Redis ping failed: %w", err)
+		return fmt.Errorf("redis ping failed: %w", err)
 	}
 
 	return nil

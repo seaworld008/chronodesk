@@ -34,9 +34,8 @@ type a2aCommandReservationContextKey struct{}
 // A2AExecutionIdentity is a trusted authentication snapshot. It must come from
 // middleware or server configuration, never from A2A message metadata.
 type A2AExecutionIdentity struct {
-	Actor               models.ActorRef
-	CredentialID        string
-	CompatibilityUserID uint
+	Actor        models.ActorRef
+	CredentialID string
 }
 
 type a2aIdentityContextKey struct{}
@@ -74,6 +73,52 @@ func BindA2AIdentity() gin.HandlerFunc {
 		})
 		c.Request = c.Request.WithContext(ctx)
 		c.Next()
+	}
+}
+
+// A2AStreamLimiter adapts the protocol-neutral Redis execution guard to A2A
+// long-lived responses. Identity comes only from the verified OAuth request
+// context; message metadata and remote IP addresses are never quota keys.
+type A2AStreamLimiter struct {
+	native      *services.AgentNativeService
+	globalLimit int
+}
+
+func NewA2AStreamLimiter(
+	native *services.AgentNativeService,
+	globalLimit int,
+) (*A2AStreamLimiter, error) {
+	if native == nil || globalLimit <= 0 {
+		return nil, errors.New("A2A stream limiter requires Agent service and a positive global limit")
+	}
+	return &A2AStreamLimiter{native: native, globalLimit: globalLimit}, nil
+}
+
+func (l *A2AStreamLimiter) Acquire(ctx context.Context) (func(), error) {
+	identity, ok := A2AExecutionIdentityFromContext(ctx)
+	if !ok ||
+		identity.Actor.Type != models.ActorTypeServicePrincipal ||
+		strings.TrimSpace(identity.Actor.ID) == "" ||
+		strings.TrimSpace(identity.CredentialID) == "" {
+		return nil, a2a.ErrStreamControlUnavailable
+	}
+	release, err := l.native.AcquireAgentStream(
+		ctx,
+		a2aSourceProtocol,
+		identity.Actor.ID,
+		identity.CredentialID,
+		l.globalLimit,
+	)
+	switch {
+	case err == nil:
+		return release, nil
+	case errors.Is(err, services.ErrConcurrencyLimit),
+		errors.Is(err, services.ErrRateLimited):
+		return nil, a2a.ErrStreamQuotaExceeded
+	case errors.Is(err, services.ErrExecutionGuardUnavailable):
+		return nil, a2a.ErrStreamControlUnavailable
+	default:
+		return nil, err
 	}
 }
 
@@ -175,16 +220,6 @@ func A2ARequestPolicyMiddleware(
 
 type A2AIdentityResolver interface {
 	ResolveA2AIdentity(ctx context.Context, task a2a.Task, message a2a.Message) (A2AExecutionIdentity, error)
-}
-
-type A2AIdentityResolverFunc func(context.Context, a2a.Task, a2a.Message) (A2AExecutionIdentity, error)
-
-func (f A2AIdentityResolverFunc) ResolveA2AIdentity(
-	ctx context.Context,
-	task a2a.Task,
-	message a2a.Message,
-) (A2AExecutionIdentity, error) {
-	return f(ctx, task, message)
 }
 
 type ContextA2AIdentityResolver struct{}
@@ -293,7 +328,15 @@ func (b *A2ABackend) Process(
 		if err := b.authorizeA2AReplay(ctx, task, identity, skill, payload); err != nil {
 			return b.reportDomainError(ctx, reporter, err)
 		}
-		return reportA2AIdempotentReplay(ctx, reporter, task, skill, replayed)
+		return b.reportA2AIdempotentReplay(
+			ctx,
+			reporter,
+			task,
+			identity,
+			skill,
+			payload,
+			replayed,
+		)
 	}
 	if reservation.ID != "" {
 		ctx = context.WithValue(ctx, a2aCommandReservationContextKey{}, reservation)
@@ -536,7 +579,6 @@ func (b *A2ABackend) ticketIntake(
 	result, err := b.native.CreateNativeTicket(ctx, services.NativeTicketCreateInput{
 		Request:             request,
 		Actor:               identity.Actor,
-		CompatibilityUserID: identity.CompatibilityUserID,
 		CredentialID:        identity.CredentialID,
 		SourceProtocol:      a2aSourceProtocol,
 		RequestDigest:       reservation.RequestDigest,
@@ -548,10 +590,47 @@ func (b *A2ABackend) ticketIntake(
 	if err != nil {
 		return err
 	}
-	return reportA2AResult(ctx, reporter, task, "ticket-intake", map[string]any{
-		"ticket":  result.Ticket.ToResponse(),
-		"receipt": result.Receipt,
+	response := map[string]any{"receipt": result.Receipt}
+	if b.mayReturnA2ATicketSnapshot(
+		ctx,
+		task,
+		identity,
+		result.Ticket.ID,
+	) {
+		response["ticket"] = result.Ticket.ToResponse()
+	}
+	return reportA2AResult(ctx, reporter, task, "ticket-intake", response)
+}
+
+func (b *A2ABackend) mayReturnA2ATicketSnapshot(
+	ctx context.Context,
+	task a2a.Task,
+	identity A2AExecutionIdentity,
+	ticketID uint,
+) bool {
+	if identity.Actor.Type != models.ActorTypeServicePrincipal {
+		return true
+	}
+	if ticketID == 0 {
+		return false
+	}
+	_, err := b.native.CheckAction(ctx, services.PolicyCheckInput{
+		ServicePrincipalID: identity.Actor.ID,
+		CredentialID:       identity.CredentialID,
+		Scope:              models.ScopeTicketsRead,
+		Action:             "ticket.read",
+		ResourceType:       "ticket",
+		ResourceID:         strconv.FormatUint(uint64(ticketID), 10),
+		SourceProtocol:     a2aSourceProtocol,
+		Context: map[string]any{
+			"a2a_task_id":      task.ID,
+			"a2a_context_id":   task.ContextID,
+			"response_payload": true,
+		},
 	})
+	// Creation already committed. A denied or unavailable read policy returns
+	// only the operation receipt, never the protected Ticket snapshot.
+	return err == nil
 }
 
 type ticketQueryCommand struct {
@@ -705,46 +784,58 @@ func (b *A2ABackend) ticketWork(
 		if command.ExpectedVersion == 0 || command.LeaseID == "" || !command.Status.IsValid() {
 			return requireA2AFields("expected_version", "lease_id", "status")
 		}
-		return b.updateTicket(ctx, task, message, identity, reporter, services.VersionedTicketUpdateInput{
-			TicketID:        command.TicketID,
-			ExpectedVersion: command.ExpectedVersion,
-			LeaseID:         command.LeaseID,
-			RequiredScope:   models.ScopeTicketsTransition,
-			Action:          "ticket.transition",
-			Changes:         map[string]any{"status": command.Status},
-			EventType:       "io.chronodesk.ticket.transitioned.v1",
-			EventData: map[string]any{
-				"a2a_task_id":    task.ID,
-				"a2a_context_id": task.ContextID,
-				"status":         command.Status,
-				"reason":         command.Reason,
-			},
-			IsRisky: true,
-		}, "transition")
+		reservation := a2aReservationFromContext(ctx)
+		result, err := b.native.TransitionTicket(ctx, services.TransitionTicketCommand{
+			TicketID:            command.TicketID,
+			ExpectedVersion:     command.ExpectedVersion,
+			LeaseID:             command.LeaseID,
+			Actor:               identity.Actor,
+			Status:              command.Status,
+			CredentialID:        identity.CredentialID,
+			SourceProtocol:      a2aSourceProtocol,
+			RequestDigest:       reservation.RequestDigest,
+			Reason:              command.Reason,
+			TraceID:             task.ID,
+			CorrelationID:       task.ContextID,
+			CausationID:         message.MessageID,
+			IdempotencyRecordID: reservation.ID,
+		})
+		if err != nil {
+			return err
+		}
+		return reportA2AResult(ctx, reporter, task, "ticket-work", map[string]any{
+			"operation": "transition",
+			"ticket":    result.Ticket.ToResponse(),
+			"receipt":   result.Receipt,
+		})
 	case "assign":
 		if command.ExpectedVersion == 0 || command.LeaseID == "" || command.Assignee == nil {
 			return requireA2AFields("expected_version", "lease_id", "assignee")
 		}
-		changes, err := b.native.ResolveTicketAssignmentChanges(ctx, *command.Assignee)
+		reservation := a2aReservationFromContext(ctx)
+		result, err := b.native.AssignTicket(ctx, services.AssignTicketCommand{
+			TicketID:            command.TicketID,
+			ExpectedVersion:     command.ExpectedVersion,
+			LeaseID:             command.LeaseID,
+			Actor:               identity.Actor,
+			Assignee:            command.Assignee,
+			CredentialID:        identity.CredentialID,
+			SourceProtocol:      a2aSourceProtocol,
+			RequestDigest:       reservation.RequestDigest,
+			Reason:              command.Reason,
+			TraceID:             task.ID,
+			CorrelationID:       task.ContextID,
+			CausationID:         message.MessageID,
+			IdempotencyRecordID: reservation.ID,
+		})
 		if err != nil {
 			return err
 		}
-		return b.updateTicket(ctx, task, message, identity, reporter, services.VersionedTicketUpdateInput{
-			TicketID:        command.TicketID,
-			ExpectedVersion: command.ExpectedVersion,
-			LeaseID:         command.LeaseID,
-			RequiredScope:   models.ScopeTicketsAssign,
-			Action:          "ticket.assign",
-			Changes:         changes,
-			EventType:       "io.chronodesk.ticket.assigned.v1",
-			EventData: map[string]any{
-				"a2a_task_id":    task.ID,
-				"a2a_context_id": task.ContextID,
-				"assignee":       command.Assignee,
-				"reason":         command.Reason,
-			},
-			IsRisky: true,
-		}, "assign")
+		return reportA2AResult(ctx, reporter, task, "ticket-work", map[string]any{
+			"operation": "assign",
+			"ticket":    result.Ticket.ToResponse(),
+			"receipt":   result.Receipt,
+		})
 	default:
 		return requireA2AFields("operation: claim, release, update, transition, or assign")
 	}
@@ -760,7 +851,6 @@ func (b *A2ABackend) updateTicket(
 	operation string,
 ) error {
 	input.Actor = identity.Actor
-	input.CompatibilityUserID = identity.CompatibilityUserID
 	input.CredentialID = identity.CredentialID
 	input.SourceProtocol = a2aSourceProtocol
 	input.TraceID = task.ID
@@ -788,7 +878,6 @@ type ticketCommentCommand struct {
 	ContentType     string             `json:"content_type,omitempty"`
 	Type            models.CommentType `json:"type,omitempty"`
 	ParentID        *uint              `json:"parent_id,omitempty"`
-	AttachmentIDs   []string           `json:"attachment_ids,omitempty"`
 	TimeSpent       *int               `json:"time_spent,omitempty"`
 	BillableTime    *int               `json:"billable_time,omitempty"`
 	WorkType        string             `json:"work_type,omitempty"`
@@ -826,7 +915,6 @@ func (b *A2ABackend) ticketComment(
 		ExpectedVersion:     command.ExpectedVersion,
 		LeaseID:             command.LeaseID,
 		Actor:               identity.Actor,
-		CompatibilityUserID: identity.CompatibilityUserID,
 		CredentialID:        identity.CredentialID,
 		SourceProtocol:      a2aSourceProtocol,
 		RequestDigest:       reservation.RequestDigest,
@@ -834,7 +922,6 @@ func (b *A2ABackend) ticketComment(
 		ContentType:         command.ContentType,
 		Type:                command.Type,
 		ParentID:            command.ParentID,
-		AttachmentIDs:       command.AttachmentIDs,
 		TimeSpent:           command.TimeSpent,
 		BillableTime:        command.BillableTime,
 		WorkType:            command.WorkType,
@@ -879,37 +966,27 @@ func (b *A2ABackend) ticketEscalation(
 		strings.TrimSpace(command.Reason) == "" {
 		return requireA2AFields("ticket_id", "expected_version", "lease_id", "reason")
 	}
-	changes := map[string]any{"is_escalated": true}
+	var priority *models.TicketPriority
 	if command.Priority != "" {
 		if !command.Priority.IsValid() {
 			return requireA2AFields("valid priority")
 		}
-		changes["priority"] = command.Priority
+		priority = &command.Priority
 	}
 	reservation := a2aReservationFromContext(ctx)
-	result, err := b.native.UpdateTicketVersion(ctx, services.VersionedTicketUpdateInput{
+	result, err := b.native.EscalateTicket(ctx, services.EscalateTicketCommand{
 		TicketID:            command.TicketID,
 		ExpectedVersion:     command.ExpectedVersion,
 		LeaseID:             command.LeaseID,
 		Actor:               identity.Actor,
-		CompatibilityUserID: identity.CompatibilityUserID,
+		Priority:            priority,
 		CredentialID:        identity.CredentialID,
-		RequiredScope:       models.ScopeTicketsTransition,
-		Action:              "ticket.escalate",
 		SourceProtocol:      a2aSourceProtocol,
 		RequestDigest:       reservation.RequestDigest,
-		Changes:             changes,
-		EventType:           "io.chronodesk.ticket.escalated.v1",
-		EventData: map[string]any{
-			"a2a_task_id":    task.ID,
-			"a2a_context_id": task.ContextID,
-			"reason":         command.Reason,
-			"priority":       command.Priority,
-		},
+		Reason:              command.Reason,
 		TraceID:             task.ID,
 		CorrelationID:       task.ContextID,
 		CausationID:         message.MessageID,
-		IsRisky:             true,
 		IdempotencyRecordID: reservation.ID,
 	})
 	if err != nil {
@@ -919,40 +996,6 @@ func (b *A2ABackend) ticketEscalation(
 		"ticket":  result.Ticket.ToResponse(),
 		"receipt": result.Receipt,
 	})
-}
-
-func (b *A2ABackend) checkPolicy(
-	ctx context.Context,
-	task a2a.Task,
-	identity A2AExecutionIdentity,
-	scope string,
-	action string,
-	ticketID uint,
-	isWrite bool,
-	isRisky bool,
-) (string, error) {
-	if identity.Actor.Type != models.ActorTypeServicePrincipal {
-		return "", nil
-	}
-	decision, err := b.native.CheckAction(ctx, services.PolicyCheckInput{
-		ServicePrincipalID: identity.Actor.ID,
-		CredentialID:       identity.CredentialID,
-		Scope:              scope,
-		Action:             action,
-		ResourceType:       "ticket",
-		ResourceID:         strconv.FormatUint(uint64(ticketID), 10),
-		IsWrite:            isWrite,
-		IsRisky:            isRisky,
-		SourceProtocol:     a2aSourceProtocol,
-		Context: map[string]any{
-			"a2a_task_id":    task.ID,
-			"a2a_context_id": task.ContextID,
-		},
-	})
-	if err != nil {
-		return "", err
-	}
-	return decision.ID, nil
 }
 
 func (b *A2ABackend) authorizeA2AReplay(
@@ -1014,11 +1057,13 @@ func (b *A2ABackend) authorizeA2AReplay(
 	return err
 }
 
-func reportA2AIdempotentReplay(
+func (b *A2ABackend) reportA2AIdempotentReplay(
 	ctx context.Context,
 	reporter a2a.Reporter,
 	task a2a.Task,
+	identity A2AExecutionIdentity,
 	skill string,
+	payload map[string]any,
 	record *models.IdempotencyRecord,
 ) error {
 	if record == nil || len(record.ResponseBody) == 0 {
@@ -1032,14 +1077,89 @@ func reportA2AIdempotentReplay(
 		"replayed": true,
 		"receipt":  receipt,
 	}
+	var linkedTicketID uint
 	if len(record.ResourceSnapshot) > 0 {
+		mayReturn, ticketID := b.mayReturnA2AReplaySnapshot(
+			ctx,
+			task,
+			identity,
+			skill,
+			payload,
+			receipt,
+		)
+		if !mayReturn {
+			return reportA2AResult(ctx, reporter, task, skill, result)
+		}
 		var snapshot any
 		if err := json.Unmarshal(record.ResourceSnapshot, &snapshot); err != nil {
 			return err
 		}
 		result["resource"] = snapshot
+		if ticketID != 0 {
+			if a2aReplaySnapshotIsTicket(skill, payload) {
+				result["resourceType"] = "ticket"
+				result["receipt"] = a2aReplayReceipt{
+					OperationReceipt: receipt,
+					ResourceType:     "ticket",
+				}
+			}
+			linkedTicketID = ticketID
+		}
 	}
-	return reportA2AResult(ctx, reporter, task, skill, result)
+	return reportA2AResultWithTicketLink(
+		ctx,
+		reporter,
+		task,
+		skill,
+		result,
+		linkedTicketID,
+	)
+}
+
+func (b *A2ABackend) mayReturnA2AReplaySnapshot(
+	ctx context.Context,
+	task a2a.Task,
+	identity A2AExecutionIdentity,
+	skill string,
+	payload map[string]any,
+	receipt services.OperationReceipt,
+) (bool, uint) {
+	ticketID, ok := a2aReplayTicketID(skill, payload, receipt)
+	if identity.Actor.Type != models.ActorTypeServicePrincipal {
+		return true, ticketID
+	}
+	if !ok {
+		return false, 0
+	}
+	return b.mayReturnA2ATicketSnapshot(ctx, task, identity, ticketID), ticketID
+}
+
+func a2aReplayTicketID(
+	skill string,
+	payload map[string]any,
+	receipt services.OperationReceipt,
+) (uint, bool) {
+	if skill == "ticket-intake" {
+		return a2aTicketIDValue(receipt.ResourceID)
+	}
+	return a2aTicketIDValue(payload["ticket_id"])
+}
+
+type a2aReplayReceipt struct {
+	services.OperationReceipt
+	ResourceType string `json:"resource_type,omitempty"`
+}
+
+func a2aReplaySnapshotIsTicket(skill string, payload map[string]any) bool {
+	switch skill {
+	case "ticket-intake", "ticket-escalation":
+		return true
+	case "ticket-work":
+		operation := strings.ToLower(strings.TrimSpace(fmt.Sprint(payload["operation"])))
+		return operation == "update" || operation == "transition" || operation == "assign"
+	default:
+		return false
+	}
 }
 
 func (b *A2ABackend) reportDomainError(ctx context.Context, reporter a2a.Reporter, err error) error {
@@ -1160,6 +1280,17 @@ func reportA2AResult(
 	skill string,
 	result any,
 ) error {
+	return reportA2AResultWithTicketLink(ctx, reporter, task, skill, result, 0)
+}
+
+func reportA2AResultWithTicketLink(
+	ctx context.Context,
+	reporter a2a.Reporter,
+	task a2a.Task,
+	skill string,
+	result any,
+	ticketID uint,
+) error {
 	data, err := json.Marshal(map[string]any{
 		"skill":     skill,
 		"taskId":    task.ID,
@@ -1170,20 +1301,32 @@ func reportA2AResult(
 	if err != nil {
 		return err
 	}
+	partMetadata := map[string]any{"untrustedContent": true}
+	artifactMetadata := map[string]any{
+		"a2aTaskId":        task.ID,
+		"a2aContextId":     task.ContextID,
+		"untrustedContent": true,
+	}
+	reportMetadata := map[string]any{"skill": skill}
+	if ticketID != 0 {
+		resource := map[string]any{
+			"type": "ticket",
+			"id":   ticketID,
+		}
+		partMetadata["resource"] = resource
+		artifactMetadata["resource"] = resource
+		reportMetadata["resource"] = resource
+	}
 	return reporter.AddArtifact(ctx, a2a.Artifact{
 		ArtifactID: skill + "-" + task.ID,
 		Name:       skill + " result",
 		Parts: []a2a.Part{{
 			Data:      json.RawMessage(data),
 			MediaType: "application/json",
-			Metadata:  map[string]any{"untrustedContent": true},
+			Metadata:  partMetadata,
 		}},
-		Metadata: map[string]any{
-			"a2aTaskId":        task.ID,
-			"a2aContextId":     task.ContextID,
-			"untrustedContent": true,
-		},
-	}, false, true, map[string]any{"skill": skill})
+		Metadata: artifactMetadata,
+	}, false, true, reportMetadata)
 }
 
 func decodeA2ACommand(payload map[string]any, target any) error {

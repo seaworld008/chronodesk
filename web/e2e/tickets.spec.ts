@@ -3,9 +3,11 @@ import {
     authenticatePage,
     createTicket,
     deleteTicket,
-    E2E_PREFIX,
+    E2E_MARKER,
     loginViaUI,
 } from './helpers/testData';
+import { monitorBrowserHealth } from './helpers/browserAudit';
+import { assertDestructiveE2EAllowed } from './helpers/safety';
 
 /**
  * ChronoDesk Ticket Workflow E2E Tests
@@ -27,9 +29,11 @@ test.describe('Authentication', () => {
 
 test.describe('Ticket Management', () => {
     let ticketId: number;
+    const ticketTitle = `${E2E_MARKER}基础工单`;
 
     test.beforeAll(async ({ request }) => {
-        ticketId = await createTicket(request, `${E2E_PREFIX}基础工单-${Date.now()}`);
+        assertDestructiveE2EAllowed('基础工单管理 E2E');
+        ticketId = await createTicket(request, ticketTitle);
     });
 
     test.afterAll(async ({ request }) => {
@@ -42,10 +46,26 @@ test.describe('Ticket Management', () => {
 
     test('should display ticket list', async ({ page }) => {
         await page.goto('/#/tickets');
-        const ticketInfoHeader = page
-            .getByRole('columnheader')
-            .filter({ hasText: '工单信息' });
+        const table = page.getByRole('table', {
+            name: '工单列表',
+            exact: true,
+        });
+        const ticketInfoHeader = table.getByRole('columnheader', {
+            name: /^“工单信息”/u,
+        });
         await expect(ticketInfoHeader).toBeVisible({ timeout: 10000 });
+        const search = page.getByPlaceholder('搜索工单');
+        await search.fill(ticketTitle);
+        await search.press('Enter');
+        const createdRow = page.getByRole('row', {
+            name: new RegExp(ticketTitle),
+        });
+        await expect(createdRow).toBeVisible({ timeout: 10_000 });
+        await expect(
+            createdRow.getByRole('cell', {
+                name: new RegExp(ticketTitle, 'u'),
+            }),
+        ).toBeVisible();
     });
 
     test('should open create ticket form', async ({ page }) => {
@@ -55,9 +75,32 @@ test.describe('Ticket Management', () => {
     });
 
     test('should view ticket details', async ({ page }) => {
+        const health = monitorBrowserHealth(page);
         await page.goto('/#/tickets');
-        await page.locator('a[href*="/show"]').first().click();
-        await expect(page).toHaveURL(/#\/tickets\/\d+\/show/);
+        const search = page.getByPlaceholder('搜索工单');
+        await search.fill(ticketTitle);
+        await search.press('Enter');
+        const createdRow = page.getByRole('row', {
+            name: new RegExp(ticketTitle),
+        });
+        await expect(createdRow).toBeVisible({ timeout: 10_000 });
+        await createdRow
+            .getByRole('link', { name: '查看', exact: true })
+            .click();
+        await expect(page).toHaveURL(
+            new RegExp(`#\\/tickets\\/${ticketId}\\/show$`),
+        );
+        await page.getByRole('button', { name: '删除', exact: true }).click();
+        const confirmation = page.getByRole('dialog', {
+            name: new RegExp(`删除工单 ${ticketTitle}`, 'u'),
+        });
+        await expect(confirmation).toBeVisible();
+        await expect(
+            confirmation.getByRole('button', { name: '确认' }),
+        ).toBeFocused();
+        await confirmation.getByRole('button', { name: '取消' }).click();
+        await expect(confirmation).toBeHidden();
+        health.assertClean();
     });
 });
 

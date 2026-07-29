@@ -38,7 +38,7 @@
 
 ## 测试证据
 
-- [Agent 原生化完整测试报告](testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-29.md)
+- [Agent 原生化完整测试报告](testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-30.md)
 
 ## 维护规则
 

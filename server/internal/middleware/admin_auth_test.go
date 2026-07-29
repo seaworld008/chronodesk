@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -13,12 +14,27 @@ import (
 )
 
 type recordingAdminAuditService struct {
-	records []*services.AdminAuditRecord
+	records       []*services.AdminAuditRecord
+	recordErr     error
+	finalizeErr   error
+	finalizeCalls int
 }
 
 func (s *recordingAdminAuditService) Record(_ context.Context, record *services.AdminAuditRecord) error {
+	if s.recordErr != nil {
+		return s.recordErr
+	}
+	record.ID = uint(len(s.records) + 1)
 	s.records = append(s.records, record)
 	return nil
+}
+
+func (s *recordingAdminAuditService) Finalize(
+	_ context.Context,
+	_ *services.AdminAuditRecord,
+) error {
+	s.finalizeCalls++
+	return s.finalizeErr
 }
 
 func (*recordingAdminAuditService) List(
@@ -84,6 +100,9 @@ func TestLogAdminOperationRecordsV1AgentManagementWrite(t *testing.T) {
 	if len(audit.records) != 1 {
 		t.Fatalf("audit records = %d, want 1", len(audit.records))
 	}
+	if audit.finalizeCalls != 1 {
+		t.Fatalf("audit finalize calls = %d, want 1", audit.finalizeCalls)
+	}
 	record := audit.records[0]
 	if record.Path != "/api/v1/admin/service-principals" ||
 		record.Method != http.MethodPost ||
@@ -94,5 +113,110 @@ func TestLogAdminOperationRecordsV1AgentManagementWrite(t *testing.T) {
 	}
 	if record.Query != "client_secret=%5BREDACTED%5D&view=compact" {
 		t.Fatalf("audit query was not safely redacted: %q", record.Query)
+	}
+}
+
+func TestAdminWriteFailsClosedBeforeHandlerWhenAuditAnchorCannotPersist(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	audit := &recordingAdminAuditService{recordErr: errors.New("database unavailable")}
+	handlerCalled := false
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", uint(7))
+		c.Set("user_role", "admin")
+		c.Next()
+	})
+	router.Use(LogAdminOperation(audit))
+	router.POST("/api/admin/users", func(c *gin.Context) {
+		handlerCalled = true
+		c.Status(http.StatusCreated)
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/admin/users", nil)
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if handlerCalled {
+		t.Fatal("admin handler ran without a durable audit anchor")
+	}
+	if len(audit.records) != 0 || audit.finalizeCalls != 0 {
+		t.Fatalf(
+			"audit lifecycle = records:%d finalizations:%d, want 0/0",
+			len(audit.records),
+			audit.finalizeCalls,
+		)
+	}
+}
+
+func TestAdminWriteRetainsPendingAnchorWhenFinalizationFails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	audit := &recordingAdminAuditService{finalizeErr: errors.New("database unavailable")}
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", uint(7))
+		c.Set("user_role", "admin")
+		c.Next()
+	})
+	router.Use(LogAdminOperation(audit))
+	router.POST("/api/admin/users", func(c *gin.Context) {
+		c.Status(http.StatusCreated)
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/admin/users", nil)
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusCreated)
+	}
+	if len(audit.records) != 1 || audit.records[0].ID == 0 {
+		t.Fatalf("durable audit anchor missing: %+v", audit.records)
+	}
+	if audit.finalizeCalls != 1 {
+		t.Fatalf("audit finalize calls = %d, want 1", audit.finalizeCalls)
+	}
+}
+
+func TestAdminWritePanicFinalizesDurableAuditAsError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	audit := &recordingAdminAuditService{}
+	router := gin.New()
+	router.Use(WrapGinMiddleware(RecoveryMiddleware(&RecoveryConfig{
+		Logger:            NewSimpleLogger(nil, LogLevelError),
+		EnableStackTrace:  false,
+		DisablePrintStack: true,
+	})))
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", uint(7))
+		c.Set("user_role", "admin")
+		c.Next()
+	})
+	router.Use(LogAdminOperation(audit))
+	router.POST("/api/admin/users", func(*gin.Context) {
+		panic("handler panic")
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/admin/users", nil)
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(audit.records) != 1 || audit.finalizeCalls != 1 {
+		t.Fatalf(
+			"audit lifecycle = records:%d finalizations:%d, want 1/1",
+			len(audit.records),
+			audit.finalizeCalls,
+		)
+	}
+	record := audit.records[0]
+	if record.Result != "error" ||
+		record.StatusCode != http.StatusInternalServerError ||
+		record.Notes != "管理员写操作异常终止" {
+		t.Fatalf("panic audit was not finalized as an error: %+v", record)
 	}
 }

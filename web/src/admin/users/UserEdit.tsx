@@ -11,12 +11,12 @@ import {
     TopToolbar,
     ListButton,
     ShowButton,
-    DeleteButton,
     SaveButton,
     TabbedForm,
     FormTab,
     useRecordContext,
 } from 'react-admin';
+import { FocusSafeDeleteButton } from '@/components/actions/FocusSafeDeleteButtons';
 import {
     Box,
     Typography,
@@ -144,9 +144,6 @@ const RoleChangeWarning: React.FC = () => (
                 <strong>管理员</strong>：拥有系统完全控制权限
             </Typography>
             <Typography component="li" variant="body2">
-                <strong>超级管理员</strong>：兼容角色，按管理员权限处理
-            </Typography>
-            <Typography component="li" variant="body2">
                 <strong>主管</strong>：可管理团队和工单分配
             </Typography>
             <Typography component="li" variant="body2">
@@ -154,9 +151,6 @@ const RoleChangeWarning: React.FC = () => (
             </Typography>
             <Typography component="li" variant="body2">
                 <strong>客户</strong>：只能查看和创建自己的工单
-            </Typography>
-            <Typography component="li" variant="body2">
-                <strong>普通用户（兼容角色）</strong>：按客户权限处理
             </Typography>
         </Box>
     </Alert>
@@ -181,7 +175,7 @@ const UserEditActions = () => (
     <TopToolbar>
         <ListButton label="返回列表" />
         <ShowButton label="查看详情" />
-        <DeleteButton label="删除" mutationMode="pessimistic" />
+            <FocusSafeDeleteButton label="删除" mutationMode="pessimistic" />
     </TopToolbar>
 );
 

@@ -1,6 +1,7 @@
 package websocket
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"sync"
@@ -12,9 +13,6 @@ type Hub struct {
 	// Registered clients.
 	clients map[*Client]bool
 
-	// Inbound messages from the clients.
-	broadcast chan []byte
-
 	// Register requests from the clients.
 	register chan *Client
 
@@ -23,22 +21,31 @@ type Hub struct {
 
 	// Mutex for thread-safe operations
 	mu sync.RWMutex
+
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
 // NewHub creates a new WebSocket hub
 func NewHub() *Hub {
 	return &Hub{
-		broadcast:  make(chan []byte),
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		clients:    make(map[*Client]bool),
+		done:       make(chan struct{}),
 	}
 }
 
 // Run starts the hub
-func (h *Hub) Run() {
+func (h *Hub) Run(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	defer h.stop()
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = true
@@ -48,31 +55,52 @@ func (h *Hub) Run() {
 
 		case client := <-h.unregister:
 			h.mu.Lock()
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-			}
+			delete(h.clients, client)
 			clientCount := len(h.clients)
 			h.mu.Unlock()
 			client.close()
 			log.Printf("WebSocket client disconnected, user: %d, total: %d", client.UserID, clientCount)
 
-		case message := <-h.broadcast:
-			h.mu.Lock()
-			for client := range h.clients {
-				select {
-				case client.send <- message:
-				default:
-					delete(h.clients, client)
-					client.close()
-				}
-			}
-			h.mu.Unlock()
 		}
+	}
+}
+
+func (h *Hub) stop() {
+	h.stopOnce.Do(func() {
+		close(h.done)
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		for client := range h.clients {
+			delete(h.clients, client)
+			client.close()
+		}
+	})
+}
+
+func (h *Hub) registerClient(client *Client) bool {
+	select {
+	case <-h.done:
+		return false
+	case h.register <- client:
+		return true
+	}
+}
+
+func (h *Hub) unregisterClient(client *Client) {
+	select {
+	case <-h.done:
+		client.close()
+	case h.unregister <- client:
 	}
 }
 
 // BroadcastToUser sends a message to a specific user
 func (h *Hub) BroadcastToUser(userID uint, messageType string, data interface{}) {
+	select {
+	case <-h.done:
+		return
+	default:
+	}
 	message := map[string]interface{}{
 		"type":      messageType,
 		"data":      data,
@@ -100,41 +128,6 @@ func (h *Hub) BroadcastToUser(userID uint, messageType string, data interface{})
 	}
 }
 
-// BroadcastToAll sends a message to all connected clients
-func (h *Hub) BroadcastToAll(messageType string, data interface{}) {
-	message := map[string]interface{}{
-		"type":      messageType,
-		"data":      data,
-		"timestamp": getTimestamp(),
-	}
-
-	messageBytes, err := json.Marshal(message)
-	if err != nil {
-		log.Printf("Error marshaling message: %v", err)
-		return
-	}
-
-	h.broadcast <- messageBytes
-}
-
-// GetConnectedUsers returns the list of connected user IDs
-func (h *Hub) GetConnectedUsers() []uint {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	userSet := make(map[uint]bool)
-	for client := range h.clients {
-		userSet[client.UserID] = true
-	}
-
-	users := make([]uint, 0, len(userSet))
-	for userID := range userSet {
-		users = append(users, userID)
-	}
-
-	return users
-}
-
 // IsUserOnline checks if a user is currently connected
 func (h *Hub) IsUserOnline(userID uint) bool {
 	h.mu.RLock()
@@ -148,14 +141,6 @@ func (h *Hub) IsUserOnline(userID uint) bool {
 
 	return false
 }
-
-// GetClientCount returns the total number of connected clients
-func (h *Hub) GetClientCount() int {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return len(h.clients)
-}
-
 func getTimestamp() int64 {
 	return time.Now().Unix()
 }

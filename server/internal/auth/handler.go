@@ -17,11 +17,17 @@ type AuthHandler struct {
 	authService               *AuthService
 	logger                    Logger
 	secureTrustedDeviceCookie bool
+	requestTimeout            time.Duration
 }
 
 const (
 	trustedDeviceCookieName = "chronodesk_trusted_device"
 	trustedDeviceCookiePath = "/api/auth/login"
+	// statusClientClosedRequest follows the established reverse-proxy convention
+	// for a request whose client has already canceled its context. net/http does
+	// not define this non-standard status, so keep it local to the HTTP adapter.
+	statusClientClosedRequest = 499
+	defaultAuthRequestTimeout = 10 * time.Second
 )
 
 // AuthHandlerOption 配置认证 HTTP 适配器。
@@ -88,6 +94,10 @@ func authLogReason(err error) string {
 	switch {
 	case err == nil:
 		return "none"
+	case errors.Is(err, context.Canceled):
+		return "request_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "request_deadline_exceeded"
 	case errors.Is(err, ErrInvalidCredentials):
 		return "invalid_credentials"
 	case errors.Is(err, ErrUserNotFound):
@@ -113,14 +123,87 @@ func authLogReason(err error) string {
 	}
 }
 
+// abortTerminatedReadRequest handles only errors caused by this request's own
+// canceled context. A database error that merely races with cancellation, or a
+// write request, must continue through the normal fail-closed 503 path.
+func (h *AuthHandler) abortTerminatedReadRequest(c HTTPContext, err error) bool {
+	if c == nil || err == nil {
+		return false
+	}
+	request := c.Request()
+	if request == nil {
+		return false
+	}
+	switch request.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+	default:
+		return false
+	}
+
+	contextErr := request.Context().Err()
+	status := 0
+	reason := ""
+	switch {
+	case errors.Is(contextErr, context.Canceled) && errors.Is(err, context.Canceled):
+		status = statusClientClosedRequest
+		reason = "request_canceled"
+	case errors.Is(contextErr, context.DeadlineExceeded) && errors.Is(err, context.DeadlineExceeded):
+		status = http.StatusRequestTimeout
+		reason = "request_deadline_exceeded"
+	default:
+		return false
+	}
+
+	h.logger.Debug(
+		"Authentication request ended before revalidation completed",
+		"request_id", authLogRequestID(c),
+		"reason", reason,
+	)
+	if !authResponseWritten(c) {
+		// Record a meaningful terminal status without attempting a JSON body on
+		// a connection whose request context is already done.
+		c.Status(status)
+	}
+	c.Abort()
+	return true
+}
+
+func authResponseWritten(c HTTPContext) bool {
+	ginContext, ok := c.(*GinHTTPContext)
+	return ok && ginContext.ginCtx.Writer.Written()
+}
+
+func (h *AuthHandler) boundedRequestContext(
+	c HTTPContext,
+) (context.Context, context.CancelFunc, bool) {
+	if c == nil || c.Request() == nil {
+		h.logger.Error("Authentication request context is unavailable")
+		if c != nil {
+			c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+				Error:   "authentication_unavailable",
+				Message: "认证服务暂时不可用",
+			})
+			c.Abort()
+		}
+		return nil, func() {}, false
+	}
+	timeout := h.requestTimeout
+	if timeout <= 0 {
+		timeout = defaultAuthRequestTimeout
+	}
+	ctx, cancel := context.WithTimeout(c.Request().Context(), timeout)
+	return ctx, cancel, true
+}
+
 // NewAuthHandler 创建认证处理器
 func NewAuthHandler(authService *AuthService, logger Logger, options ...AuthHandlerOption) *AuthHandler {
 	if logger == nil {
 		logger = &SimpleLogger{}
 	}
 	handler := &AuthHandler{
-		authService: authService,
-		logger:      logger,
+		authService:    authService,
+		logger:         logger,
+		requestTimeout: defaultAuthRequestTimeout,
 	}
 	for _, option := range options {
 		if option != nil {
@@ -195,7 +278,11 @@ func (h *AuthHandler) Register(c HTTPContext) {
 	userAgent := c.UserAgent()
 
 	// 调用认证服务
-	ctx := context.Background()
+	ctx, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
+	}
+	defer cancel()
 	resp, err := h.authService.Register(ctx, &req, ipAddress, userAgent)
 	if err != nil {
 		h.logger.Error(
@@ -279,7 +366,11 @@ func (h *AuthHandler) Login(c HTTPContext) {
 	userAgent := c.UserAgent()
 
 	// 调用认证服务
-	ctx := context.Background()
+	ctx, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
+	}
+	defer cancel()
 	resp, err := h.authService.Login(ctx, &req, ipAddress, userAgent)
 	if err != nil {
 		if req.DeviceToken != "" &&
@@ -293,21 +384,24 @@ func (h *AuthHandler) Login(c HTTPContext) {
 		)
 
 		message := "登录失败"
-		status := http.StatusUnauthorized
+		status := http.StatusServiceUnavailable
 
-		switch err {
-		case ErrInvalidCredentials:
+		switch {
+		case errors.Is(err, ErrInvalidCredentials):
 			message = "邮箱或密码错误"
-		case ErrUserNotFound:
+			status = http.StatusUnauthorized
+		case errors.Is(err, ErrUserNotFound):
 			message = "邮箱或密码错误"
-		case ErrAccountLocked:
+			status = http.StatusUnauthorized
+		case errors.Is(err, ErrAccountLocked):
 			message = "账号已锁定"
 			status = http.StatusForbidden
-		case ErrEmailNotVerified:
+		case errors.Is(err, ErrEmailNotVerified):
 			message = "邮箱尚未验证"
 			status = http.StatusForbidden
-		case ErrInvalidOTP:
+		case errors.Is(err, ErrInvalidOTP):
 			message = "OTP 验证码错误"
+			status = http.StatusUnauthorized
 		default:
 			if strings.Contains(err.Error(), "OTP") {
 				message = "请输入 OTP 验证码"
@@ -381,7 +475,11 @@ func (h *AuthHandler) RefreshToken(c HTTPContext) {
 	userAgent := c.UserAgent()
 
 	// 调用认证服务
-	ctx := context.Background()
+	ctx, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
+	}
+	defer cancel()
 	resp, err := h.authService.RefreshToken(ctx, &req, ipAddress, userAgent)
 	if err != nil {
 		h.logger.Error(
@@ -392,18 +490,25 @@ func (h *AuthHandler) RefreshToken(c HTTPContext) {
 
 		code := "refresh_failed"
 		message := "刷新登录令牌失败"
-		status := http.StatusUnauthorized
+		status := http.StatusServiceUnavailable
 
-		switch err {
-		case ErrInvalidToken:
+		switch {
+		case errors.Is(err, ErrInvalidToken):
 			code = "invalid_token"
 			message = "刷新令牌无效"
-		case ErrTokenExpired:
+			status = http.StatusUnauthorized
+		case errors.Is(err, ErrTokenExpired):
 			code = "token_expired"
 			message = "刷新令牌已过期"
-		case ErrUserNotFound:
+			status = http.StatusUnauthorized
+		case errors.Is(err, ErrUserNotFound):
 			code = "user_not_found"
 			message = "未找到用户"
+			status = http.StatusUnauthorized
+		case errors.Is(err, context.DeadlineExceeded):
+			code = "request_timeout"
+			message = "认证请求超时，请重试"
+			status = http.StatusRequestTimeout
 		}
 
 		c.JSON(status, ErrorResponse{
@@ -444,10 +549,11 @@ func (h *AuthHandler) Logout(c HTTPContext) {
 		}
 	}
 
-	ctx := context.Background()
-	if request := c.Request(); request != nil {
-		ctx = request.Context()
+	ctx, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
 	}
+	defer cancel()
 	if err := h.authService.Logout(ctx, refreshToken); err != nil {
 		h.logger.Error(
 			"Logout failed",
@@ -493,10 +599,11 @@ func (h *AuthHandler) LogoutAll(c HTTPContext) {
 		return
 	}
 
-	ctx := context.Background()
-	if request := c.Request(); request != nil {
-		ctx = request.Context()
+	ctx, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
 	}
+	defer cancel()
 	if err := h.authService.LogoutAll(ctx, userIDUint); err != nil {
 		h.logger.Error(
 			"Logout all failed",
@@ -588,7 +695,11 @@ func (h *AuthHandler) GetProfile(c HTTPContext) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
+	}
+	defer cancel()
 	user, err := h.authService.userRepo.GetByID(ctx, userIDUint)
 	if err != nil {
 		h.logger.Error(
@@ -614,14 +725,6 @@ func (h *AuthHandler) GetProfile(c HTTPContext) {
 	})
 }
 
-// Health 健康检查
-func (h *AuthHandler) Health(c HTTPContext) {
-	c.JSON(http.StatusOK, SuccessResponse{
-		Success: true,
-		Message: "认证服务运行正常",
-	})
-}
-
 // ForgotPassword 忘记密码
 func (h *AuthHandler) ForgotPassword(c HTTPContext) {
 	var req ForgotPasswordRequest
@@ -638,7 +741,11 @@ func (h *AuthHandler) ForgotPassword(c HTTPContext) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
+	}
+	defer cancel()
 	err := h.authService.ForgotPassword(ctx, req.Email)
 	if err != nil {
 		h.logger.Error(
@@ -675,7 +782,11 @@ func (h *AuthHandler) ResetPassword(c HTTPContext) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
+	}
+	defer cancel()
 	err := h.authService.ResetPassword(ctx, req.Token, req.NewPassword)
 	if err != nil {
 		h.logger.Error(
@@ -714,7 +825,11 @@ func (h *AuthHandler) VerifyEmail(c HTTPContext) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
+	}
+	defer cancel()
 	err := h.authService.VerifyEmail(ctx, token)
 	if err != nil {
 		h.logger.Error(
@@ -758,7 +873,11 @@ func (h *AuthHandler) ResendVerification(c HTTPContext) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
+	}
+	defer cancel()
 	err := h.authService.ResendVerification(ctx, req.Email)
 	if err != nil {
 		h.logger.Error(
@@ -810,7 +929,11 @@ func (h *AuthHandler) UpdateProfile(c HTTPContext) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
+	}
+	defer cancel()
 	err = h.authService.UpdateProfile(ctx, userInfo.ID, &req)
 	if err != nil {
 		h.logger.Error(
@@ -863,7 +986,11 @@ func (h *AuthHandler) ChangePassword(c HTTPContext) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
+	}
+	defer cancel()
 	err = h.authService.ChangePassword(ctx, userInfo.ID, req.CurrentPassword, req.NewPassword)
 	if err != nil {
 		h.logger.Error(
@@ -918,10 +1045,11 @@ func (h *AuthHandler) EnableOTP(c HTTPContext) {
 		return
 	}
 
-	ctx := c.Request().Context()
-	if ctx == nil {
-		ctx = context.Background()
+	ctx, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
 	}
+	defer cancel()
 
 	otpSetup, err := h.authService.EnableOTP(ctx, userInfo.ID, req.Password)
 	if err != nil {
@@ -987,10 +1115,11 @@ func (h *AuthHandler) DisableOTP(c HTTPContext) {
 		return
 	}
 
-	ctx := c.Request().Context()
-	if ctx == nil {
-		ctx = context.Background()
+	ctx, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
 	}
+	defer cancel()
 
 	if err := h.authService.DisableOTP(ctx, userInfo.ID, req.Password); err != nil {
 		h.logger.Error(
@@ -1046,10 +1175,11 @@ func (h *AuthHandler) VerifyOTP(c HTTPContext) {
 		return
 	}
 
-	ctx := c.Request().Context()
-	if ctx == nil {
-		ctx = context.Background()
+	ctx, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
 	}
+	defer cancel()
 
 	if err := h.authService.VerifyOTP(ctx, userInfo.ID, req.Code); err != nil {
 		h.logger.Error(
@@ -1093,10 +1223,11 @@ func (h *AuthHandler) GenerateBackupCodes(c HTTPContext) {
 		return
 	}
 
-	ctx := c.Request().Context()
-	if ctx == nil {
-		ctx = context.Background()
+	ctx, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
 	}
+	defer cancel()
 
 	codes, err := h.authService.GenerateBackupCodes(ctx, userInfo.ID)
 	if err != nil {
@@ -1270,12 +1401,16 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 		return
 	}
 
-	requestContext := context.Background()
-	if request := c.Request(); request != nil {
-		requestContext = request.Context()
+	requestContext, cancel, ok := h.boundedRequestContext(c)
+	if !ok {
+		return
 	}
+	defer cancel()
 	currentUser, err := h.authService.userRepo.GetByID(requestContext, claims.UserID)
 	if err != nil {
+		if h.abortTerminatedReadRequest(c, err) {
+			return
+		}
 		if errors.Is(err, ErrUserNotFound) {
 			h.logger.Warn(
 				"Access token principal is no longer available",
@@ -1300,16 +1435,39 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 		c.Abort()
 		return
 	}
-	if currentUser.Status != StatusActive {
+	if stateErr := validateUserAccessState(currentUser, time.Now()); stateErr != nil {
 		h.logger.Warn(
 			"Access token principal is not active",
 			"request_id", authLogRequestID(c),
 			"user_id", authLogUserID(currentUser.ID),
 			"status", observability.SafeLogValue(string(currentUser.Status)),
 		)
+		errorCode := "account_inactive"
+		message := "账号当前不可用，请重新登录或联系管理员"
+		if errors.Is(stateErr, ErrAccountLocked) {
+			errorCode = "account_locked"
+			message = "账号已锁定，请稍后重试"
+		} else if errors.Is(stateErr, ErrInvalidAccountState) {
+			errorCode = "invalid_token"
+			message = "访问令牌对应的账号状态无效"
+		}
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
-			Error:   "account_inactive",
-			Message: "账号当前不可用，请重新登录或联系管理员",
+			Error:   errorCode,
+			Message: message,
+		})
+		c.Abort()
+		return
+	}
+	if !currentUser.Role.IsValid() {
+		h.logger.Warn(
+			"Access token principal has an invalid role",
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(currentUser.ID),
+			"reason", "invalid_human_role",
+		)
+		c.JSON(http.StatusUnauthorized, ErrorResponse{
+			Error:   "invalid_token",
+			Message: "访问令牌对应的账号角色无效",
 		})
 		c.Abort()
 		return
@@ -1359,6 +1517,9 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 		claims.SessionID,
 	)
 	if err != nil {
+		if h.abortTerminatedReadRequest(c, err) {
+			return
+		}
 		h.logger.Error(
 			"Failed to revalidate access token session",
 			"request_id", authLogRequestID(c),
@@ -1442,23 +1603,4 @@ func (h *AuthHandler) RequireRole(requiredRole UserRole) func(HTTPContext) {
 		// 继续处理
 		c.Next()
 	}
-}
-
-// ParseUserID 解析用户ID参数
-func ParseUserID(c HTTPContext) (uint, error) {
-	userIDStr := c.GetParam("id")
-	if userIDStr == "" {
-		userIDStr = c.GetQuery("user_id")
-	}
-
-	if userIDStr == "" {
-		return 0, fmt.Errorf("user ID is required")
-	}
-
-	userID, err := strconv.ParseUint(userIDStr, 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("invalid user ID format")
-	}
-
-	return uint(userID), nil
 }

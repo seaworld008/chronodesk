@@ -97,6 +97,67 @@ const extractResponseData = (json: unknown): unknown => {
 
 const extractTypedResponseData = <T>(json: unknown): T => extractResponseData(json) as T
 
+const ticketVersionFromUpdate = (
+    previousData: unknown,
+    data: unknown,
+): number => {
+    const candidates = [previousData, data]
+    for (const candidate of candidates) {
+        if (!isRecord(candidate)) continue
+        const version = candidate.version
+        if (
+            typeof version === 'number' &&
+            Number.isSafeInteger(version) &&
+            version > 0
+        ) {
+            return version
+        }
+    }
+    throw new HttpError(
+        '工单版本信息缺失，请刷新页面后重试',
+        428,
+        { code: 'precondition_required' },
+    )
+}
+
+const ticketIfMatchHeaders = (version: number): Headers => {
+    const headers = new Headers()
+    headers.set('If-Match', `"v${version}"`)
+    return headers
+}
+
+const ticketVersionCache = new Map<string, number>()
+
+const rememberTicketVersions = (records: unknown[]): void => {
+    for (const record of records) {
+        if (!isRecord(record)) continue
+        const { id, version } = record
+        if (
+            (typeof id === 'number' || typeof id === 'string') &&
+            typeof version === 'number' &&
+            Number.isSafeInteger(version) &&
+            version > 0
+        ) {
+            ticketVersionCache.set(String(id), version)
+        }
+    }
+}
+
+const ticketPreconditions = (
+    ids: readonly (string | number)[],
+): Array<{ id: string | number; version: number }> =>
+    ids.map((id) => {
+        const version = ticketVersionCache.get(String(id))
+        if (version === undefined) {
+            throw new HttpError(
+                `工单 ${id} 的版本信息缺失，请刷新列表后重试`,
+                428,
+                { code: 'precondition_required', resource_id: id },
+            )
+        }
+        return { id, version }
+    })
+
 const parseListResponse = (resource: string, json: unknown, headers: Headers) => {
     if (isRecord(json) && resource === 'automation-logs' && isRecord(json.data) && Array.isArray(json.data.logs)) {
         const data = json.data.logs
@@ -243,6 +304,10 @@ export const dataProvider: DataProvider = {
                     query.type = filter.type;
                     delete filter.type;
                 }
+                if (filter.source) {
+                    query.source = filter.source;
+                    delete filter.source;
+                }
                 if (filter.assigned_to_id) {
                     query.assigned_to = filter.assigned_to_id;
                     delete filter.assigned_to_id;
@@ -313,7 +378,11 @@ export const dataProvider: DataProvider = {
         const url = `${apiUrl}/${apiPath}?${queryString.stringify(query)}`;
         const { json, headers } = await httpClient(url);
 
-        return parseListResponse(resource, json, headers);
+        const result = parseListResponse(resource, json, headers);
+        if (resource === 'tickets') {
+            rememberTicketVersions(result.data);
+        }
+        return result;
     },
 
     // 获取单个资源
@@ -327,7 +396,10 @@ export const dataProvider: DataProvider = {
 
         const url = `${apiUrl}/${apiPath}/${params.id}`;
         const { json } = await httpClient(url);
-        
+        const data = extractResponseData(json);
+        if (resource === 'tickets') {
+            rememberTicketVersions([data]);
+        }
         return { data: extractTypedResponseData(json) };
     },
 
@@ -358,12 +430,15 @@ export const dataProvider: DataProvider = {
         
         const payload = extractResponseData(json);
         if (isRecord(payload) && Array.isArray(payload.items)) {
+            if (resource === 'tickets') rememberTicketVersions(payload.items);
             return { data: payload.items };
         }
         if (Array.isArray(payload)) {
+            if (resource === 'tickets') rememberTicketVersions(payload);
             return { data: payload };
         }
         if (isRecord(payload)) {
+            if (resource === 'tickets') rememberTicketVersions([payload]);
             return { data: [payload] };
         }
         return { data: [] };
@@ -432,7 +507,10 @@ export const dataProvider: DataProvider = {
                 method: 'POST',
                 body: JSON.stringify(params.data),
             });
-
+            const data = extractResponseData(json);
+            if (resource === 'tickets') {
+                rememberTicketVersions([data]);
+            }
             return { data: extractTypedResponseData(json) };
         } catch (error: unknown) {
             return handleHttpError(error)
@@ -453,11 +531,20 @@ export const dataProvider: DataProvider = {
         const url = `${apiUrl}/${apiPath}/${params.id}`;
         
         try {
+            const headers = resource === 'tickets'
+                ? ticketIfMatchHeaders(
+                    ticketVersionFromUpdate(params.previousData, params.data),
+                )
+                : undefined
             const { json } = await httpClient(url, {
                 method: 'PUT',
                 body: JSON.stringify(params.data),
+                headers,
             });
-
+            const data = extractResponseData(json);
+            if (resource === 'tickets') {
+                rememberTicketVersions([data]);
+            }
             return { data: extractTypedResponseData(json) };
         } catch (error: unknown) {
             return handleHttpError(error)
@@ -474,13 +561,17 @@ export const dataProvider: DataProvider = {
             }
 
             const url = `${apiUrl}/tickets/bulk-update`;
-            await httpClient(url, {
+            const { json } = await httpClient(url, {
                 method: 'POST',
                 body: JSON.stringify({
-                    ticket_ids: params.ids,
+                    tickets: ticketPreconditions(params.ids),
                     updates,
                 }),
             });
+            const payload = extractResponseData(json);
+            if (isRecord(payload) && Array.isArray(payload.tickets)) {
+                rememberTicketVersions(payload.tickets);
+            }
             return { data: params.ids };
         }
 
@@ -518,10 +609,30 @@ export const dataProvider: DataProvider = {
         }
 
         const url = `${apiUrl}/${apiPath}/${params.id}`;
+        const cachedVersion = resource === 'tickets'
+            ? ticketVersionCache.get(String(params.id))
+            : undefined
+        const headers = resource === 'tickets'
+            ? ticketIfMatchHeaders(
+                ticketVersionFromUpdate(
+                    params.previousData,
+                    cachedVersion === undefined
+                        ? undefined
+                        : { version: cachedVersion },
+                ),
+            )
+            : undefined
         const { json } = await httpClient(url, {
             method: 'DELETE',
+            headers,
         });
 
+        if (resource === 'tickets') {
+            ticketVersionCache.delete(String(params.id))
+            return {
+                data: params.previousData ?? { id: params.id },
+            }
+        }
         if (json.code === 0 && json.data) {
             return { data: json.data };
         } else if (json.data) {
@@ -535,11 +646,32 @@ export const dataProvider: DataProvider = {
         // 如果后端支持批量删除
         if (resource === 'tickets') {
             const url = `${apiUrl}/tickets/bulk-delete`;
-            await httpClient(url, {
+            const { json } = await httpClient(url, {
                 method: 'DELETE',
-                body: JSON.stringify({ ids: params.ids }),
+                body: JSON.stringify({
+                    tickets: ticketPreconditions(params.ids),
+                }),
             });
-            return { data: params.ids };
+            const payload = extractResponseData(json)
+            const deletedIds = isRecord(payload) && Array.isArray(payload.deleted_ids)
+                ? payload.deleted_ids
+                : []
+            const failedIds = isRecord(payload) && Array.isArray(payload.failed_ids)
+                ? payload.failed_ids
+                : []
+            for (const id of deletedIds) {
+                ticketVersionCache.delete(String(id))
+            }
+            if (failedIds.length > 0) {
+                throw new HttpError(
+                    deletedIds.length > 0
+                        ? '部分工单因版本冲突或权限变化未能删除，列表已刷新'
+                        : '工单删除失败，请刷新列表后重试',
+                    409,
+                    payload,
+                )
+            }
+            return { data: deletedIds };
         }
 
         // 否则逐个删除
@@ -563,5 +695,3 @@ export const dataProvider: DataProvider = {
         return { data: params.ids };
     },
 };
-
-export default dataProvider;

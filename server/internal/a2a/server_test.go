@@ -16,10 +16,15 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func registerTestServerRoutes(routes gin.IRoutes, server *Server) {
+	routes.GET(AgentCardPath, server.CardHandler())
+	routes.POST(RPCPath, server.RPCHandler())
+}
+
 func TestAgentCardSupportsDiscoveryAndConditionalGET(t *testing.T) {
 	server := newTestServer(t, BackendFuncs{})
 	router := gin.New()
-	server.RegisterRoutes(router)
+	registerTestServerRoutes(router, server)
 
 	first := httptest.NewRecorder()
 	router.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/.well-known/agent-card.json", nil))
@@ -120,7 +125,7 @@ func TestJSONRPCTaskLifecycleUsesA2A10Methods(t *testing.T) {
 	}
 	server := newTestServer(t, backend)
 	router := gin.New()
-	server.RegisterRoutes(router)
+	registerTestServerRoutes(router, server)
 
 	ticketID := uint(42)
 	send := rpcCall(t, router, "SendMessage", map[string]any{
@@ -204,7 +209,7 @@ func TestA2A10WireObjectsUseCanonicalClosedFieldSets(t *testing.T) {
 		},
 	})
 	router := gin.New()
-	server.RegisterRoutes(router)
+	registerTestServerRoutes(router, server)
 
 	send := rpcCall(t, router, "SendMessage", map[string]any{
 		"message": validInboundMessageParams("canonical-wire-task"),
@@ -282,7 +287,7 @@ func TestJSONRPCRejectsNonCanonicalParameterFieldsBeforeDispatch(t *testing.T) {
 		},
 	})
 	router := gin.New()
-	server.RegisterRoutes(router)
+	registerTestServerRoutes(router, server)
 
 	tests := []struct {
 		name   string
@@ -359,7 +364,7 @@ func TestJSONRPCIgnoresForwardCompatibleUnknownFieldsWithoutReflectingThem(t *te
 		},
 	})
 	router := gin.New()
-	server.RegisterRoutes(router)
+	registerTestServerRoutes(router, server)
 
 	response := rpcCall(t, router, "SendMessage", map[string]any{
 		"message": map[string]any{
@@ -407,7 +412,7 @@ func TestInputRequiredIsAnA2AStateOnly(t *testing.T) {
 	}
 	server := newTestServer(t, backend)
 	router := gin.New()
-	server.RegisterRoutes(router)
+	registerTestServerRoutes(router, server)
 
 	send := rpcCall(t, router, "SendMessage", map[string]any{
 		"message": map[string]any{
@@ -464,7 +469,7 @@ func TestStreamingContinuationResubmitsAndIgnoresHistoricalInterruptedEvent(t *t
 	}
 	server := newTestServer(t, backend)
 	router := gin.New()
-	server.RegisterRoutes(router)
+	registerTestServerRoutes(router, server)
 
 	first := rpcCall(t, router, "SendMessage", map[string]any{
 		"message": map[string]any{
@@ -544,7 +549,7 @@ func TestStreamingReplayUsesLastEventID(t *testing.T) {
 	}
 	server := newTestServer(t, backend)
 	router := gin.New()
-	server.RegisterRoutes(router)
+	registerTestServerRoutes(router, server)
 
 	streamBody := rpcBody(t, "SendStreamingMessage", map[string]any{
 		"message": map[string]any{
@@ -607,7 +612,7 @@ func TestStreamingIdempotentReplayOfTerminalTaskReturnsSnapshot(t *testing.T) {
 		},
 	})
 	router := gin.New()
-	server.RegisterRoutes(router)
+	registerTestServerRoutes(router, server)
 
 	params := map[string]any{
 		"message": validInboundMessageParams("terminal-stream-replay"),
@@ -676,7 +681,7 @@ func TestSubscribeToTerminalTaskReturnsUnsupportedOperation(t *testing.T) {
 		},
 	})
 	router := gin.New()
-	server.RegisterRoutes(router)
+	registerTestServerRoutes(router, server)
 
 	send := rpcCall(t, router, "SendMessage", map[string]any{
 		"message": validInboundMessageParams("terminal-subscribe"),
@@ -701,7 +706,7 @@ func TestSubscribeToTerminalTaskReturnsUnsupportedOperation(t *testing.T) {
 func TestPushNotificationConfigurationIsValidatedAndRedacted(t *testing.T) {
 	server := newTestServer(t, BackendFuncs{})
 	router := gin.New()
-	server.RegisterRoutes(router)
+	registerTestServerRoutes(router, server)
 
 	send := rpcCall(t, router, "SendMessage", map[string]any{
 		"message": map[string]any{
@@ -777,7 +782,7 @@ func TestTaskTransitionMatrix(t *testing.T) {
 func TestJSONRPCValidationAndVersionErrors(t *testing.T) {
 	server := newTestServer(t, BackendFuncs{})
 	router := gin.New()
-	server.RegisterRoutes(router)
+	registerTestServerRoutes(router, server)
 
 	malformedRequest := httptest.NewRequest(http.MethodPost, RPCPath, strings.NewReader(`{"jsonrpc":`))
 	malformedRequest.Header.Set("Content-Type", "application/json")
@@ -920,7 +925,7 @@ func TestJSONRPCValidationAndVersionErrors(t *testing.T) {
 func TestA2AVersionQueryParameterAndConflict(t *testing.T) {
 	server := newTestServer(t, BackendFuncs{})
 	router := gin.New()
-	server.RegisterRoutes(router)
+	registerTestServerRoutes(router, server)
 
 	queryRequest := httptest.NewRequest(
 		http.MethodPost,
@@ -960,7 +965,7 @@ func TestGetExtendedAgentCardUsesCanonicalErrors(t *testing.T) {
 	t.Run("capability not declared", func(t *testing.T) {
 		server := newTestServer(t, BackendFuncs{})
 		router := gin.New()
-		server.RegisterRoutes(router)
+		registerTestServerRoutes(router, server)
 		response := rpcCall(t, router, "GetExtendedAgentCard", map[string]any{})
 		if response.Error == nil || response.Error.Code != -32004 {
 			t.Fatalf("expected UnsupportedOperationError, got %#v", response.Error)
@@ -979,7 +984,7 @@ func TestGetExtendedAgentCardUsesCanonicalErrors(t *testing.T) {
 			t.Fatal(err)
 		}
 		router := gin.New()
-		server.RegisterRoutes(router)
+		registerTestServerRoutes(router, server)
 		response := rpcCall(t, router, "GetExtendedAgentCard", map[string]any{})
 		if response.Error == nil || response.Error.Code != -32007 {
 			t.Fatalf(
@@ -1004,7 +1009,7 @@ func TestUnavailablePushCapabilityUsesCanonicalError(t *testing.T) {
 		t.Fatal(err)
 	}
 	router := gin.New()
-	server.RegisterRoutes(router)
+	registerTestServerRoutes(router, server)
 
 	response := rpcCall(
 		t,
@@ -1032,7 +1037,7 @@ func TestUnavailablePushCapabilityUsesCanonicalError(t *testing.T) {
 func TestUnsupportedMessageAndOutputMediaTypesUseCanonicalError(t *testing.T) {
 	server := newTestServer(t, BackendFuncs{})
 	router := gin.New()
-	server.RegisterRoutes(router)
+	registerTestServerRoutes(router, server)
 
 	tests := []struct {
 		name   string
@@ -1215,6 +1220,9 @@ func newTestServer(t *testing.T, backend Backend) *Server {
 			Now:            now,
 			PushDispatcher: noopTestPushDispatcher{},
 		},
+		StreamLimiter: StreamLimiterFunc(func(context.Context) (func(), error) {
+			return func() {}, nil
+		}),
 		Heartbeat: time.Hour,
 	})
 	if err != nil {

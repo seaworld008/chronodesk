@@ -33,7 +33,7 @@ import {
     useRefresh,
 } from 'react-admin';
 import { Ticket, TicketPriority, TicketStatus } from '@/types';
-import { apiFetch } from '@/lib/apiClient';
+import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient';
 import { canMutateTicket, type TicketRolePermissions } from './ticketAccess';
 
 // 工单状态流转定义
@@ -180,6 +180,9 @@ const TicketWorkflowActions: React.FC = () => {
         if (!currentAction || !record) return;
 
         try {
+            if (!Number.isSafeInteger(record.version) || record.version <= 0) {
+                throw new Error('工单版本信息缺失，请刷新页面后重试');
+            }
             let endpoint = '';
             const payload: Record<string, unknown> = { comment };
 
@@ -209,7 +212,10 @@ const TicketWorkflowActions: React.FC = () => {
 
             await apiFetch(endpoint, {
                 method: 'POST',
-                body: JSON.stringify(payload)
+                body: JSON.stringify(payload),
+                headers: {
+                    'If-Match': `"v${record.version}"`,
+                },
             });
 
             notify(`工单${currentAction.label}成功`, { type: 'success' });
@@ -217,7 +223,10 @@ const TicketWorkflowActions: React.FC = () => {
             setDialogOpen(false);
             resetForm();
         } catch (error) {
-            const message = error instanceof Error ? error.message : `工单${currentAction.label}失败`;
+            const message = localizedUnknownErrorMessage(
+                error,
+                `工单${currentAction.label}失败`,
+            );
             notify(message, { type: 'error' });
         }
     };

@@ -43,8 +43,9 @@ import {
   SmartToy as AgentIcon,
   StopCircle as StopIcon,
 } from '@mui/icons-material'
-import { apiFetch } from '../../lib/apiClient'
+import { apiFetch, localizedUnknownErrorMessage } from '../../lib/apiClient'
 import {
+  InlineDetails,
   ResizableMuiTable,
   TruncatedText,
   type ResizableColumn,
@@ -510,7 +511,7 @@ const AgentControlCenter: React.FC = () => {
       setSnapshot(normalized)
       return normalized
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : '智能体控制面加载失败')
+      setError(localizedUnknownErrorMessage(requestError, '智能体控制面加载失败'))
       return null
     } finally {
       setLoading(false)
@@ -554,7 +555,7 @@ const AgentControlCenter: React.FC = () => {
       notify('服务主体已创建，请立即保存一次性密钥', { type: 'success' })
       await loadSnapshot()
     } catch (requestError) {
-      notify(requestError instanceof Error ? requestError.message : '创建失败', { type: 'error' })
+      notify(localizedUnknownErrorMessage(requestError, '创建失败'), { type: 'error' })
     } finally {
       setSubmitting(false)
     }
@@ -572,7 +573,7 @@ const AgentControlCenter: React.FC = () => {
       notify('凭据已轮换，旧凭据已撤销', { type: 'success' })
       await loadSnapshot()
     } catch (requestError) {
-      notify(requestError instanceof Error ? requestError.message : '凭据轮换失败', { type: 'error' })
+      notify(localizedUnknownErrorMessage(requestError, '凭据轮换失败'), { type: 'error' })
     } finally {
       setSubmitting(false)
     }
@@ -588,7 +589,7 @@ const AgentControlCenter: React.FC = () => {
       notify(nextStatus === 'active' ? '智能体已启用' : '智能体已停用', { type: 'success' })
       await loadSnapshot()
     } catch (requestError) {
-      notify(requestError instanceof Error ? requestError.message : '状态更新失败', { type: 'error' })
+      notify(localizedUnknownErrorMessage(requestError, '状态更新失败'), { type: 'error' })
     }
   }
 
@@ -605,7 +606,7 @@ const AgentControlCenter: React.FC = () => {
       })
       await loadSnapshot()
     } catch (requestError) {
-      notify(requestError instanceof Error ? requestError.message : '全局模式更新失败', { type: 'error' })
+      notify(localizedUnknownErrorMessage(requestError, '全局模式更新失败'), { type: 'error' })
     }
   }
 
@@ -622,7 +623,7 @@ const AgentControlCenter: React.FC = () => {
       })
       await loadSnapshot()
     } catch (requestError) {
-      notify(requestError instanceof Error ? requestError.message : '紧急停止更新失败', { type: 'error' })
+      notify(localizedUnknownErrorMessage(requestError, '紧急停止更新失败'), { type: 'error' })
     }
   }
 
@@ -637,7 +638,7 @@ const AgentControlCenter: React.FC = () => {
       })
       await loadSnapshot()
     } catch (requestError) {
-      notify(requestError instanceof Error ? requestError.message : '智能体熔断更新失败', { type: 'error' })
+      notify(localizedUnknownErrorMessage(requestError, '智能体熔断更新失败'), { type: 'error' })
     }
   }
 
@@ -648,7 +649,7 @@ const AgentControlCenter: React.FC = () => {
       const result = await apiFetch<AgentPolicy[]>(`/v1/admin/service-principals/${principal.id}/policies`)
       setPolicies(result ?? [])
     } catch (requestError) {
-      notify(requestError instanceof Error ? requestError.message : '策略加载失败', { type: 'error' })
+      notify(localizedUnknownErrorMessage(requestError, '策略加载失败'), { type: 'error' })
     }
   }
 
@@ -668,7 +669,7 @@ const AgentControlCenter: React.FC = () => {
       if (refreshedPrincipal) setPolicyPrincipal(refreshedPrincipal)
       notify('策略已创建', { type: 'success' })
     } catch (requestError) {
-      notify(requestError instanceof Error ? requestError.message : '策略创建失败', { type: 'error' })
+      notify(localizedUnknownErrorMessage(requestError, '策略创建失败'), { type: 'error' })
     } finally {
       setSubmitting(false)
     }
@@ -683,7 +684,7 @@ const AgentControlCenter: React.FC = () => {
       setPolicies(policies.map((item) => (item.id === policy.id ? { ...item, is_active: false } : item)))
       notify('策略已停用', { type: 'success' })
     } catch (requestError) {
-      notify(requestError instanceof Error ? requestError.message : '策略停用失败', { type: 'error' })
+      notify(localizedUnknownErrorMessage(requestError, '策略停用失败'), { type: 'error' })
     }
   }
 
@@ -697,7 +698,7 @@ const AgentControlCenter: React.FC = () => {
       notify('工单租约已强制释放', { type: 'success' })
       await loadSnapshot()
     } catch (requestError) {
-      notify(requestError instanceof Error ? requestError.message : '租约释放失败', { type: 'error' })
+      notify(localizedUnknownErrorMessage(requestError, '租约释放失败'), { type: 'error' })
     }
   }
 
@@ -711,7 +712,7 @@ const AgentControlCenter: React.FC = () => {
       notify('事件投递已重新排队', { type: 'success' })
       await loadSnapshot()
     } catch (requestError) {
-      notify(requestError instanceof Error ? requestError.message : '事件投递回放失败', { type: 'error' })
+      notify(localizedUnknownErrorMessage(requestError, '事件投递回放失败'), { type: 'error' })
     }
   }
 
@@ -1009,12 +1010,11 @@ const AgentControlCenter: React.FC = () => {
                     {(snapshot?.principals ?? []).map((principal) => (
                       <TableRow key={principal.id} hover>
                         <TableCell>
-                          <TruncatedText title={principal.name} fontWeight={600}>
-                            {principal.name}
-                          </TruncatedText>
-                          <TruncatedText title={principal.client_id} color="text.secondary">
-                            {principal.client_id}
-                          </TruncatedText>
+                          <InlineDetails
+                            primary={principal.name}
+                            secondary={principal.client_id}
+                            title={`${principal.name} · ${principal.client_id}`}
+                          />
                         </TableCell>
                         <TableCell>
                           <Stack direction="row" spacing={0.5}>
@@ -1046,12 +1046,12 @@ const AgentControlCenter: React.FC = () => {
                           </Stack>
                         </TableCell>
                         <TableCell>
-                          <Typography variant="body2">{principal.rate_limit}/分钟</Typography>
-                          <Typography variant="caption" sx={{
-                            color: "text.secondary"
-                          }}>
-                            并发 {principal.concurrency_limit}
-                          </Typography>
+                          <InlineDetails
+                            primary={`${principal.rate_limit}/分钟`}
+                            secondary={`并发 ${principal.concurrency_limit}`}
+                            title={`速率限制：${principal.rate_limit}/分钟 · 并发限制：${principal.concurrency_limit}`}
+                            primaryFontWeight={400}
+                          />
                         </TableCell>
                         <TableCell>{formatDate(principal.last_used_at)}</TableCell>
                         <TableCell align="right">
@@ -1251,20 +1251,20 @@ const AgentControlCenter: React.FC = () => {
                       <TableRow key={decision.id} hover>
                         <TableCell>{formatDate(decision.created_at)}</TableCell>
                         <TableCell>
-                          <TruncatedText title={`操作者 ID：${decision.actor_id}`}>
-                            操作者：{decision.actor_id}
-                          </TruncatedText>
-                          <TruncatedText title={decision.credential_id || '—'} color="text.secondary">
-                            凭据：{decision.credential_id || '—'}
-                          </TruncatedText>
+                          <InlineDetails
+                            primary={`操作者：${decision.actor_id}`}
+                            secondary={`凭据：${decision.credential_id || '—'}`}
+                            title={`操作者 ID：${decision.actor_id} · 凭据 ID：${decision.credential_id || '—'}`}
+                            primaryFontWeight={400}
+                          />
                         </TableCell>
                         <TableCell>
-                          <TruncatedText title={`权限代码：${decision.scope}`}>
-                            权限：{scopeLabel(decision.scope)}
-                          </TruncatedText>
-                          <TruncatedText title={`操作代码：${decision.action}`} color="text.secondary">
-                            操作：{actionLabel(decision.action)}
-                          </TruncatedText>
+                          <InlineDetails
+                            primary={`权限：${scopeLabel(decision.scope)}`}
+                            secondary={`操作：${actionLabel(decision.action)}`}
+                            title={`权限代码：${decision.scope} · 操作代码：${decision.action}`}
+                            primaryFontWeight={400}
+                          />
                         </TableCell>
                         <TableCell>
                           <TruncatedText title={`资源代码：${decision.resource_type}:${decision.resource_id || '*'}`}>
@@ -1277,7 +1277,11 @@ const AgentControlCenter: React.FC = () => {
                           </TruncatedText>
                         </TableCell>
                         <TableCell>
-                          <Stack spacing={0.25} sx={{ alignItems: 'flex-start', minWidth: 0 }}>
+                          <Stack
+                            direction="row"
+                            spacing={0.75}
+                            sx={{ alignItems: 'center', minWidth: 0, flexWrap: 'nowrap' }}
+                          >
                             <Tooltip title={`策略原因代码：${decision.reason_code || '—'}`}>
                               <Chip
                                 size="small"

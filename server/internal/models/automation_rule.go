@@ -3,13 +3,16 @@ package models
 import (
 	"encoding/json"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // AutomationRule 自动化规则模型
 type AutomationRule struct {
-	ID        uint      `json:"id" gorm:"primaryKey;autoIncrement"`
-	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
-	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
+	ID        uint           `json:"id" gorm:"primaryKey;autoIncrement"`
+	CreatedAt time.Time      `json:"created_at" gorm:"autoCreateTime"`
+	UpdatedAt time.Time      `json:"updated_at" gorm:"autoUpdateTime"`
+	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
 
 	// 基本信息
 	Name        string `json:"name" gorm:"size:100;not null"`
@@ -19,7 +22,7 @@ type AutomationRule struct {
 	Priority    int    `json:"priority" gorm:"default:1;index"` // 规则优先级，数字越小优先级越高
 
 	// 触发条件
-	TriggerEvent string `json:"trigger_event" gorm:"size:50;not null"` // ticket.created, ticket.updated, ticket.timeout
+	TriggerEvent string `json:"trigger_event" gorm:"size:50;not null"` // exact current CloudEvent type
 	Conditions   string `json:"conditions" gorm:"type:json"`           // JSON格式的条件配置
 
 	// 执行动作
@@ -172,7 +175,7 @@ type WorkingHours struct {
 	Saturday  TimeRange `json:"saturday"`
 	Sunday    TimeRange `json:"sunday"`
 	// Timezone is an IANA zone such as Asia/Shanghai. Blank keeps the ticket's
-	// timestamp zone for backwards compatibility.
+	// timestamp zone, which is the natural default for ticket-local SLA rules.
 	Timezone string `json:"timezone,omitempty"`
 	// Holidays contains explicit local calendar dates in YYYY-MM-DD format.
 	// They are applied only when ExcludeHolidays is enabled on the SLA config.
@@ -320,7 +323,7 @@ type AutomationLog struct {
 	Ticket   *Ticket         `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
 
 	// 执行信息
-	TriggerEvent  string    `json:"trigger_event" gorm:"size:50"`
+	TriggerEvent  string    `json:"trigger_event" gorm:"size:50"` // exact CloudEvent type at execution
 	ExecutedAt    time.Time `json:"executed_at" gorm:"not null"`
 	Success       bool      `json:"success" gorm:"index"`
 	ErrorMessage  string    `json:"error_message,omitempty" gorm:"type:text"`

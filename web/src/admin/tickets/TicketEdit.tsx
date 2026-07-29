@@ -12,7 +12,6 @@ import {
     TopToolbar,
     ListButton,
     ShowButton,
-    DeleteButton,
     SaveButton,
     TabbedForm,
     FormTab,
@@ -33,7 +32,6 @@ import { minCharacters, maxCharacters } from '@/lib/validators';
 import {
     formatTagsInputValue,
     normalizeTagsForSubmit,
-    normalizeStringArrayForSubmit,
     normalizeCustomFieldsForSubmit,
 } from './tagUtils';
 import BackButton from '../common/BackButton';
@@ -44,10 +42,10 @@ import {
     type TicketAccessRecord,
     type TicketRolePermissions,
 } from './ticketAccess';
+import { FocusSafeDeleteButton } from '@/components/actions/FocusSafeDeleteButtons';
 
 type TicketEditFormValues = UpdateTicketRequest & {
     tags?: unknown;
-    attachments?: unknown;
     custom_fields?: unknown;
     [key: string]: unknown;
 };
@@ -60,13 +58,6 @@ const transformTicketUpdate = (data: TicketEditFormValues): Record<string, unkno
         payload.tags = normalizedTags;
     } else {
         delete payload.tags;
-    }
-
-    const normalizedAttachments = normalizeStringArrayForSubmit(data.attachments);
-    if (typeof normalizedAttachments !== 'undefined') {
-        payload.attachments = normalizedAttachments;
-    } else {
-        delete payload.attachments;
     }
 
     const normalizedCustomFields = normalizeCustomFieldsForSubmit(data.custom_fields);
@@ -136,7 +127,7 @@ const TicketEditActions = () => {
             <ShowButton label="查看详情" />
             <ListButton label="返回列表" />
             {canDeleteTicket(permissions?.role) && (
-                <DeleteButton label="删除" mutationMode="pessimistic" />
+                <FocusSafeDeleteButton label="删除" mutationMode="pessimistic" />
             )}
         </TopToolbar>
     );

@@ -1,4 +1,4 @@
-export interface AutomationRuleSummary {
+interface AutomationRuleSummary {
   id: number
   name: string
   description?: string
@@ -13,7 +13,7 @@ export interface AutomationRuleSummary {
   created_at?: string
 }
 
-export interface AutomationTicketSummary {
+interface AutomationTicketSummary {
   id: number
   ticket_number?: string
   title?: string

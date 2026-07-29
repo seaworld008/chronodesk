@@ -9,26 +9,19 @@ import (
 
 	"github.com/seaworld008/chronodesk/server/internal/middleware"
 	"github.com/seaworld008/chronodesk/server/internal/services"
-	"github.com/seaworld008/chronodesk/server/internal/version"
 )
 
 // AnalyticsHandler 分析统计处理器
 type AnalyticsHandler struct {
 	analyticsService *services.AnalyticsService
 	response         *middleware.ResponseHelper
-	appVersion       string
 }
 
 // NewAnalyticsHandler 创建分析处理器
-func NewAnalyticsHandler(db *gorm.DB, appVersion ...string) *AnalyticsHandler {
-	appVersionValue := version.Version
-	if len(appVersion) > 0 && appVersion[0] != "" {
-		appVersionValue = appVersion[0]
-	}
+func NewAnalyticsHandler(db *gorm.DB) *AnalyticsHandler {
 	return &AnalyticsHandler{
 		analyticsService: services.NewAnalyticsService(db),
 		response:         middleware.NewResponseHelper(),
-		appVersion:       appVersionValue,
 	}
 }
 
@@ -44,7 +37,8 @@ func NewAnalyticsHandler(db *gorm.DB, appVersion ...string) *AnalyticsHandler {
 func (h *AnalyticsHandler) GetSystemStats(c *gin.Context) {
 	stats, err := h.analyticsService.GetSystemStats()
 	if err != nil {
-		h.response.InternalServerError(c, "获取系统统计失败: "+err.Error())
+		logHandlerFailure(c, "analytics.get_system_stats", err)
+		h.response.InternalServerError(c, "获取系统统计失败")
 		return
 	}
 
@@ -63,7 +57,8 @@ func (h *AnalyticsHandler) GetSystemStats(c *gin.Context) {
 func (h *AnalyticsHandler) GetBusinessStats(c *gin.Context) {
 	stats, err := h.analyticsService.GetBusinessStats(c.Request.Context())
 	if err != nil {
-		h.response.InternalServerError(c, "获取业务统计失败: "+err.Error())
+		logHandlerFailure(c, "analytics.get_business_stats", err)
+		h.response.InternalServerError(c, "获取业务统计失败")
 		return
 	}
 
@@ -83,14 +78,16 @@ func (h *AnalyticsHandler) GetDashboardStats(c *gin.Context) {
 	// 获取系统统计
 	systemStats, err := h.analyticsService.GetSystemStats()
 	if err != nil {
-		h.response.InternalServerError(c, "获取系统统计失败: "+err.Error())
+		logHandlerFailure(c, "analytics.dashboard_system_stats", err)
+		h.response.InternalServerError(c, "获取系统统计失败")
 		return
 	}
 
 	// 获取业务统计
 	businessStats, err := h.analyticsService.GetBusinessStats(c.Request.Context())
 	if err != nil {
-		h.response.InternalServerError(c, "获取业务统计失败: "+err.Error())
+		logHandlerFailure(c, "analytics.dashboard_business_stats", err)
+		h.response.InternalServerError(c, "获取业务统计失败")
 		return
 	}
 
@@ -100,7 +97,8 @@ func (h *AnalyticsHandler) GetDashboardStats(c *gin.Context) {
 
 	timeRangeStats, err := h.analyticsService.GetTimeRangeStats(c.Request.Context(), startDate, endDate)
 	if err != nil {
-		h.response.InternalServerError(c, "获取趋势数据失败: "+err.Error())
+		logHandlerFailure(c, "analytics.dashboard_trend_stats", err)
+		h.response.InternalServerError(c, "获取趋势数据失败")
 		return
 	}
 
@@ -152,75 +150,12 @@ func (h *AnalyticsHandler) GetTimeRangeStats(c *gin.Context) {
 
 	stats, err := h.analyticsService.GetTimeRangeStats(c.Request.Context(), startDate, endDate)
 	if err != nil {
-		h.response.InternalServerError(c, "获取时间范围统计失败: "+err.Error())
+		logHandlerFailure(c, "analytics.get_time_range_stats", err)
+		h.response.InternalServerError(c, "获取时间范围统计失败")
 		return
 	}
 
 	h.response.Success(c, stats, "获取时间范围统计成功")
-}
-
-// GetHealthCheck 系统健康检查
-// @Summary 系统健康检查
-// @Description 检查系统各组件的健康状态
-// @Tags 系统监控
-// @Success 200 {object} map[string]interface{} "成功"
-// @Failure 503 {object} map[string]interface{} "服务不可用"
-// @Router /api/health [get]
-func (h *AnalyticsHandler) GetHealthCheck(c *gin.Context) {
-	health := gin.H{
-		"status":      "healthy",
-		"timestamp":   time.Now(),
-		"version":     h.appVersion,
-		"environment": gin.Mode(),
-	}
-
-	// 检查数据库连接
-	sqlDB, err := h.analyticsService.GetDB().DB()
-	if err != nil {
-		health["status"] = "unhealthy"
-		health["database"] = "connection_failed"
-		h.response.Error(c, http.StatusServiceUnavailable, "系统不健康", health)
-		return
-	}
-
-	err = sqlDB.Ping()
-	if err != nil {
-		health["status"] = "unhealthy"
-		health["database"] = "ping_failed"
-		h.response.Error(c, http.StatusServiceUnavailable, "数据库连接失败", health)
-		return
-	}
-
-	health["database"] = "connected"
-
-	// 检查系统资源
-	systemStats, err := h.analyticsService.GetSystemStats()
-	if err == nil {
-		health["memory_usage"] = gin.H{
-			"heap_alloc_mb": float64(systemStats.MemStats.HeapAlloc) / 1024 / 1024,
-			"sys_mb":        float64(systemStats.MemStats.Sys) / 1024 / 1024,
-		}
-		health["goroutines"] = systemStats.GoRoutines
-
-		// 内存使用率检查
-		heapUsagePercent := float64(systemStats.MemStats.HeapAlloc) / float64(systemStats.MemStats.Sys) * 100
-		if heapUsagePercent > 90 {
-			health["status"] = "warning"
-			health["warning"] = "high_memory_usage"
-		}
-
-		// Goroutine数量检查
-		if systemStats.GoRoutines > 10000 {
-			health["status"] = "warning"
-			health["warning"] = "high_goroutine_count"
-		}
-	}
-
-	if health["status"] == "unhealthy" {
-		h.response.Error(c, http.StatusServiceUnavailable, "健康检查完成", health)
-		return
-	}
-	h.response.Success(c, health, "健康检查完成")
 }
 
 // ExportStats 导出统计数据
@@ -266,7 +201,8 @@ func (h *AnalyticsHandler) ExportStats(c *gin.Context) {
 
 	data, err := h.analyticsService.ExportStats(c.Request.Context(), format, startDate, endDate)
 	if err != nil {
-		h.response.InternalServerError(c, "导出统计数据失败: "+err.Error())
+		logHandlerFailure(c, "analytics.export_stats", err)
+		h.response.InternalServerError(c, "导出统计数据失败")
 		return
 	}
 
@@ -290,7 +226,8 @@ func (h *AnalyticsHandler) ExportStats(c *gin.Context) {
 func (h *AnalyticsHandler) GetRealtimeMetrics(c *gin.Context) {
 	systemStats, err := h.analyticsService.GetSystemStats()
 	if err != nil {
-		h.response.InternalServerError(c, "获取实时指标失败: "+err.Error())
+		logHandlerFailure(c, "analytics.get_realtime_metrics", err)
+		h.response.InternalServerError(c, "获取实时指标失败")
 		return
 	}
 

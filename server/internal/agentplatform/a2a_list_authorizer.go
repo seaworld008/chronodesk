@@ -208,6 +208,9 @@ func a2aTaskSnapshotTicketIDs(task a2a.Task) []uint {
 func collectA2ATicketSnapshotIDs(value any, seen map[uint]struct{}) {
 	switch typed := value.(type) {
 	case map[string]any:
+		if ticketID, ok := typedA2ATicketResourceID(typed); ok {
+			seen[ticketID] = struct{}{}
+		}
 		for key, nested := range typed {
 			normalized := strings.ToLower(strings.ReplaceAll(key, "_", ""))
 			if normalized == "ticketid" {
@@ -229,6 +232,47 @@ func collectA2ATicketSnapshotIDs(value any, seen map[uint]struct{}) {
 			collectA2ATicketSnapshotIDs(nested, seen)
 		}
 	}
+}
+
+func typedA2ATicketResourceID(value map[string]any) (uint, bool) {
+	resourceType, exists := normalizedA2AMapValue(value, "resourcetype")
+	if !exists {
+		resourceType, _ = normalizedA2AMapValue(value, "type")
+	}
+	resourceTypeText, ok := resourceType.(string)
+	if !ok || !strings.EqualFold(strings.TrimSpace(resourceTypeText), "ticket") {
+		return 0, false
+	}
+	for _, key := range []string{"id", "resourceid"} {
+		if candidate, exists := normalizedA2AMapValue(value, key); exists {
+			if ticketID, valid := a2aTicketIDValue(candidate); valid {
+				return ticketID, true
+			}
+		}
+	}
+	resource, ok := normalizedA2AMapValue(value, "resource")
+	if !ok {
+		return 0, false
+	}
+	resourceMap, ok := resource.(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	candidate, ok := normalizedA2AMapValue(resourceMap, "id")
+	if !ok {
+		return 0, false
+	}
+	return a2aTicketIDValue(candidate)
+}
+
+func normalizedA2AMapValue(value map[string]any, normalizedKey string) (any, bool) {
+	for key, candidate := range value {
+		normalized := strings.ToLower(strings.ReplaceAll(key, "_", ""))
+		if normalized == normalizedKey {
+			return candidate, true
+		}
+	}
+	return nil, false
 }
 
 func a2aTicketIDValue(value any) (uint, bool) {

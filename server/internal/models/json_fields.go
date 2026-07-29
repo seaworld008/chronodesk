@@ -5,10 +5,10 @@ import (
 	"strings"
 )
 
-// decodeJSONField keeps legacy text-backed JSON columns from leaking their
-// storage representation into API responses. Write paths already persist
-// valid JSON; blank or corrupt legacy values degrade to an explicit empty
-// collection so machine clients receive a stable schema instead of null.
+// decodeJSONField keeps text-backed JSON storage from leaking into API
+// responses. Write paths persist valid JSON; blank or corrupt values degrade
+// to an explicit empty collection so machine clients receive a stable schema
+// instead of null.
 func decodeJSONField[T any](raw string, empty T) T {
 	if strings.TrimSpace(raw) == "" {
 		return empty

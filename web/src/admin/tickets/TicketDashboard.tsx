@@ -31,7 +31,7 @@ import { usePermissions } from 'react-admin'
 import { useNavigate } from 'react-router-dom'
 import { alpha } from '@mui/material/styles'
 import { RatioRow } from '@/components/layout/RatioRow'
-import { API_BASE } from '@/lib/apiClient'
+import { API_BASE, localizedUnknownErrorMessage } from '@/lib/apiClient'
 import { isAgentRole, type RolePermissions } from '@/lib/accessControl'
 import {
   PieChart,
@@ -191,7 +191,7 @@ const renderActiveShape = (props: PieActiveShapeProps) => {
   )
 }
 
-export const TicketDashboard: React.FC = () => {
+const TicketDashboard: React.FC = () => {
   const { permissions } = usePermissions<RolePermissions>()
   const navigate = useNavigate()
   const theme = useTheme()
@@ -262,7 +262,7 @@ export const TicketDashboard: React.FC = () => {
         if (err instanceof DOMException && err.name === 'AbortError') {
           return
         }
-        const message = err instanceof Error ? err.message : '仪表盘数据加载失败'
+        const message = localizedUnknownErrorMessage(err, '仪表盘数据加载失败')
         setError(message)
       } finally {
         if (!controller.signal.aborted) {
@@ -640,7 +640,7 @@ export const TicketDashboard: React.FC = () => {
                         fontWeight: 700,
                         color: item.color
                       }}>
-                      {item.value.toLocaleString()}
+                      {item.value.toLocaleString('zh-CN')}
                     </Typography>
                     <Box>
                       <Typography

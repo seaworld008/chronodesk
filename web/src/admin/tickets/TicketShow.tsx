@@ -11,7 +11,6 @@ import {
     useRecordContext,
     TopToolbar,
     EditButton,
-    DeleteButton,
     ListButton,
     TabbedShowLayout,
     Tab,
@@ -56,6 +55,7 @@ import {
     TruncatedText,
     type ResizableColumn,
 } from '@/components/tables/EnterpriseTable';
+import { FocusSafeDeleteButton } from '@/components/actions/FocusSafeDeleteButtons';
 
 const ticketHistoryColumns: ResizableColumn[] = [
     { key: 'action', defaultWidth: 180, minWidth: 128, maxWidth: 320 },
@@ -576,7 +576,7 @@ const TicketShowActions = () => {
             <ListButton label="返回列表" />
             {canMutate && <EditButton label="编辑" />}
             {canDeleteTicket(permissions?.role) && (
-                <DeleteButton label="删除" mutationMode="pessimistic" />
+                <FocusSafeDeleteButton label="删除" mutationMode="pessimistic" />
             )}
         </TopToolbar>
     );
@@ -705,6 +705,7 @@ const TicketShow: React.FC = () => {
                             <EnterpriseDatagrid
                                 tableId="tickets.show.history"
                                 columns={ticketHistoryColumns}
+                                aria-label="工单历史列表"
                                 bulkActionButtons={false}
                                 sx={{
                                     '& .RaDatagrid-table': {

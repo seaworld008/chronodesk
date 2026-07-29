@@ -64,6 +64,29 @@ func TestWriteNativeProblemLogsOnlySafeCorrelationMetadata(t *testing.T) {
 	}
 }
 
+func TestWriteNativeProblemRejectsEmptyAttachmentWithStableContract(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Set("request_id", "attachment-empty")
+
+	writeNativeProblem(context, services.ErrInvalidAttachment)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+	var problem Problem
+	if err := json.Unmarshal(recorder.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("decode problem response: %v", err)
+	}
+	if problem.Code != ProblemAttachmentRejected ||
+		problem.Status != http.StatusBadRequest ||
+		problem.Retryable {
+		t.Fatalf("unexpected empty attachment problem: %+v", problem)
+	}
+}
+
 func TestListTicketsFiltersEachResourcePolicy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
@@ -90,9 +113,8 @@ func TestListTicketsFiltersEachResourcePolicy(t *testing.T) {
 	}
 	native := services.NewAgentNativeService(db)
 	principal, err := native.CreateServicePrincipal(context.Background(), services.CreateServicePrincipalInput{
-		Name:                "visibility-agent",
-		Scopes:              []string{models.ScopeTicketsRead},
-		CompatibilityUserID: &user.ID,
+		Name:   "visibility-agent",
+		Scopes: []string{models.ScopeTicketsRead},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -106,13 +128,13 @@ func TestListTicketsFiltersEachResourcePolicy(t *testing.T) {
 			TicketNumber: "VISIBLE-1", Title: "visible", Description: "visible",
 			Type: models.TicketTypeRequest, Priority: models.TicketPriorityNormal,
 			Status: models.TicketStatusOpen, Source: models.TicketSourceAgent,
-			CreatedByID: user.ID, Version: 1,
+			CreatedByID: &user.ID, Version: 1,
 		},
 		{
 			TicketNumber: "HIDDEN-2", Title: "hidden", Description: "hidden",
 			Type: models.TicketTypeRequest, Priority: models.TicketPriorityNormal,
 			Status: models.TicketStatusOpen, Source: models.TicketSourceAgent,
-			CreatedByID: user.ID, Version: 1,
+			CreatedByID: &user.ID, Version: 1,
 		},
 	}
 	if err := db.Create(&tickets).Error; err != nil {
@@ -180,9 +202,8 @@ func TestListTicketsUsesBoundedPolicyBatchAndAdvancingCandidateCursor(t *testing
 	}
 	native := services.NewAgentNativeService(db)
 	principal, err := native.CreateServicePrincipal(context.Background(), services.CreateServicePrincipalInput{
-		Name:                "bounded-ticket-agent",
-		Scopes:              []string{models.ScopeTicketsRead},
-		CompatibilityUserID: &user.ID,
+		Name:   "bounded-ticket-agent",
+		Scopes: []string{models.ScopeTicketsRead},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -215,7 +236,7 @@ func TestListTicketsUsesBoundedPolicyBatchAndAdvancingCandidateCursor(t *testing
 			Priority:     models.TicketPriorityNormal,
 			Status:       models.TicketStatusOpen,
 			Source:       models.TicketSourceAgent,
-			CreatedByID:  user.ID,
+			CreatedByID:  &user.ID,
 			Version:      1,
 		}
 	}
@@ -565,72 +586,176 @@ func TestListEventsRequiresEventAndLinkedTicketAuthorization(t *testing.T) {
 	}
 }
 
-func TestClassifyTicketPatchUsesLeastPrivilegeScope(t *testing.T) {
+func TestDecodeOrdinaryTicketPatchRejectsCommandAndControlFields(t *testing.T) {
 	tests := []struct {
-		name       string
-		changes    map[string]any
-		wantScope  string
-		wantAction string
-		wantRisky  bool
-		wantErr    bool
+		name      string
+		body      string
+		wantKeys  []string
+		wantError string
 	}{
 		{
-			name:       "ordinary update",
-			changes:    map[string]any{"title": "updated"},
-			wantScope:  models.ScopeTicketsUpdate,
-			wantAction: "ticket.update",
+			name:     "ordinary update",
+			body:     `{"title":"updated","priority":"high","category_id":null}`,
+			wantKeys: []string{"title", "priority", "category_id"},
 		},
 		{
-			name:       "transition",
-			changes:    map[string]any{"status": models.TicketStatusInProgress},
-			wantScope:  models.ScopeTicketsTransition,
-			wantAction: "ticket.transition",
-			wantRisky:  true,
+			name:      "status requires transition command",
+			body:      `{"status":"in_progress"}`,
+			wantError: "explicit command",
 		},
 		{
-			name:       "assignment",
-			changes:    map[string]any{"assigned_to_service_principal_id": "sp-1"},
-			wantScope:  models.ScopeTicketsAssign,
-			wantAction: "ticket.assign",
-			wantRisky:  true,
+			name:      "escalation requires escalation command",
+			body:      `{"is_escalated":true}`,
+			wantError: "explicit command",
 		},
 		{
-			name:    "mixed command",
-			changes: map[string]any{"title": "updated", "status": models.TicketStatusPending},
-			wantErr: true,
+			name:      "source is server controlled",
+			body:      `{"source":"agent"}`,
+			wantError: "explicit command",
 		},
 		{
-			name:    "server controlled trust",
-			changes: map[string]any{"trust_level": models.TicketTrustLevelTrusted},
-			wantErr: true,
+			name:      "trust is server controlled",
+			body:      `{"trust_level":"trusted"}`,
+			wantError: "explicit command",
+		},
+		{
+			name:      "SLA state is server controlled",
+			body:      `{"sla_breached":true}`,
+			wantError: "explicit command",
+		},
+		{
+			name:      "assignment projection is forbidden",
+			body:      `{"assigned_to_actor_type":"human"}`,
+			wantError: "explicit command",
+		},
+		{
+			name:      "unknown field is rejected",
+			body:      `{"future_field":true}`,
+			wantError: "explicit command",
+		},
+		{
+			name:      "invalid enum is rejected",
+			body:      `{"priority":"impossible"}`,
+			wantError: "supported ticket priority",
+		},
+		{
+			name:      "empty patch is rejected",
+			body:      `{}`,
+			wantError: "non-empty",
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			scope, action, risky, err := classifyTicketPatch(tt.changes)
-			if tt.wantErr {
-				if err == nil {
-					t.Fatal("expected an error")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			changes, err := decodeOrdinaryTicketPatch([]byte(test.body))
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("error = %v, want containing %q", err, test.wantError)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("classifyTicketPatch() error = %v", err)
+				t.Fatalf("decode ordinary ticket patch: %v", err)
 			}
-			if scope != tt.wantScope || action != tt.wantAction || risky != tt.wantRisky {
-				t.Fatalf(
-					"classifyTicketPatch() = (%q, %q, %v), want (%q, %q, %v)",
-					scope,
-					action,
-					risky,
-					tt.wantScope,
-					tt.wantAction,
-					tt.wantRisky,
-				)
+			if len(changes) != len(test.wantKeys) {
+				t.Fatalf("changes = %#v, want keys %v", changes, test.wantKeys)
+			}
+			for _, key := range test.wantKeys {
+				if _, exists := changes[key]; !exists {
+					t.Errorf("ordinary update omitted %s: %#v", key, changes)
+				}
 			}
 		})
 	}
+}
+
+func TestDecodeTicketCommandsUseClosedAuditableBodies(t *testing.T) {
+	t.Run("assign actor", func(t *testing.T) {
+		request, err := decodeTicketAssignmentCommand([]byte(
+			`{"assignee":{"type":"human","id":"42"},"reason":"队列技能匹配"}`,
+		))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if request.Assignee == nil ||
+			request.Assignee.Type != models.ActorTypeHuman ||
+			request.Assignee.ID != "42" ||
+			request.Reason != "队列技能匹配" {
+			t.Fatalf("unexpected assignment command: %#v", request)
+		}
+	})
+	t.Run("release assignment", func(t *testing.T) {
+		request, err := decodeTicketAssignmentCommand([]byte(
+			`{"assignee":null,"reason":"当前处理者结束轮值"}`,
+		))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if request.Assignee != nil || request.Reason == "" {
+			t.Fatalf("unexpected release command: %#v", request)
+		}
+	})
+	t.Run("assign requires reason", func(t *testing.T) {
+		if _, err := decodeTicketAssignmentCommand([]byte(
+			`{"assignee":{"type":"human","id":"42"}}`,
+		)); err == nil || !strings.Contains(err.Error(), "reason") {
+			t.Fatalf("error = %v, want required reason", err)
+		}
+	})
+	t.Run("system cannot be assigned", func(t *testing.T) {
+		if _, err := decodeTicketAssignmentCommand([]byte(
+			`{"assignee":{"type":"system","id":"scheduler"},"reason":"invalid"}`,
+		)); err == nil || !strings.Contains(err.Error(), "human or service_principal") {
+			t.Fatalf("error = %v, want public ActorRef rejection", err)
+		}
+	})
+	t.Run("assignment projection cannot be mixed", func(t *testing.T) {
+		if _, err := decodeTicketAssignmentCommand([]byte(
+			`{"assignee":null,"reason":"release","assigned_to_id":42}`,
+		)); err == nil || !strings.Contains(err.Error(), "unknown field") {
+			t.Fatalf("error = %v, want unknown field rejection", err)
+		}
+	})
+	t.Run("transition", func(t *testing.T) {
+		request, err := decodeTicketTransitionCommand([]byte(
+			`{"status":"in_progress","reason":"已确认告警"}`,
+		))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if request.Status != models.TicketStatusInProgress ||
+			request.Reason != "已确认告警" {
+			t.Fatalf("unexpected transition command: %#v", request)
+		}
+	})
+	t.Run("transition rejects ordinary update", func(t *testing.T) {
+		if _, err := decodeTicketTransitionCommand([]byte(
+			`{"status":"in_progress","reason":"start","priority":"high"}`,
+		)); err == nil || !strings.Contains(err.Error(), "unknown field") {
+			t.Fatalf("error = %v, want unknown field rejection", err)
+		}
+	})
+	t.Run("escalation", func(t *testing.T) {
+		request, err := decodeTicketEscalationCommand([]byte(
+			`{"reason":"超过升级阈值","priority":"urgent","assignee":{"type":"service_principal","id":"sp-1"}}`,
+		))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if request.Priority == nil ||
+			*request.Priority != models.TicketPriorityUrgent ||
+			request.Assignee == nil ||
+			request.Assignee.Type != models.ActorTypeServicePrincipal {
+			t.Fatalf("unexpected escalation command: %#v", request)
+		}
+	})
+	t.Run("escalation rejects null assignee", func(t *testing.T) {
+		if _, err := decodeTicketEscalationCommand([]byte(
+			`{"reason":"超过升级阈值","assignee":null}`,
+		)); err == nil || !strings.Contains(err.Error(), "cannot be null") {
+			t.Fatalf("error = %v, want null rejection", err)
+		}
+	})
 }
 
 func TestAgentCommentAndAttachmentEndpointsRequireTicketLeaseHeader(t *testing.T) {
@@ -719,9 +844,8 @@ func TestAPIHandlerRegistersAndServesLeaseCommandRoutes(t *testing.T) {
 	}
 	native := services.NewAgentNativeService(db)
 	principal, err := native.CreateServicePrincipal(context.Background(), services.CreateServicePrincipalInput{
-		Name:                "lease-route-agent",
-		Scopes:              []string{models.ScopeTasksManage},
-		CompatibilityUserID: &user.ID,
+		Name:   "lease-route-agent",
+		Scopes: []string{models.ScopeTasksManage},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -738,7 +862,7 @@ func TestAPIHandlerRegistersAndServesLeaseCommandRoutes(t *testing.T) {
 		Priority:     models.TicketPriorityNormal,
 		Status:       models.TicketStatusOpen,
 		Source:       models.TicketSourceAgent,
-		CreatedByID:  user.ID,
+		CreatedByID:  &user.ID,
 		Version:      1,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
@@ -757,7 +881,7 @@ func TestAPIHandlerRegistersAndServesLeaseCommandRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewAPIHandler(db, native, tokens, user.ID, 1<<20, nil)
+	handler := NewAPIHandler(db, native, tokens, 1<<20, nil)
 	router := gin.New()
 	handler.RegisterRoutes(router.Group("/api/v1"))
 
@@ -872,13 +996,13 @@ func TestIdempotentCommentReplayMatchesInitialEnvelope(t *testing.T) {
 		TicketNumber: "REPLAY-1", Title: "ticket", Description: "description",
 		Type: models.TicketTypeRequest, Priority: models.TicketPriorityNormal,
 		Status: models.TicketStatusOpen, Source: models.TicketSourceAgent,
-		CreatedByID: user.ID, Version: 2,
+		CreatedByID: &user.ID, Version: 2,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
 	}
 	comment := models.TicketComment{
-		TicketID: ticket.ID, UserID: user.ID, ActorType: models.ActorTypeHuman,
+		TicketID: ticket.ID, UserID: &user.ID, ActorType: models.ActorTypeHuman,
 		ActorID: models.HumanActor(user.ID).ID, Content: "result", ContentType: "text",
 		Type: models.CommentTypeInternal,
 	}

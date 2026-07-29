@@ -20,11 +20,6 @@ type GormStore struct {
 	protector security.Protector
 }
 
-func NewGormStore(db *gorm.DB) *GormStore {
-	protector, _ := security.LoadDeploymentKeyringFromEnvironment()
-	return NewGormStoreWithProtector(db, protector)
-}
-
 // NewGormStoreWithProtector injects the data-encryption keyring used by A2A
 // push credentials. A nil protector is fail-closed when a secret is present.
 func NewGormStoreWithProtector(db *gorm.DB, protector security.Protector) *GormStore {

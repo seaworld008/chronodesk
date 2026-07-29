@@ -208,6 +208,21 @@ func classifyA2APolicies(t *testing.T, method string, params any) []a2a.RequestP
 }
 
 func newA2AAdapterFixture(t *testing.T) a2aAdapterFixture {
+	return newA2AAdapterFixtureWithScopes(t, []string{
+		models.ScopeTicketsRead,
+		models.ScopeTicketsCreate,
+		models.ScopeTicketsUpdate,
+		models.ScopeTicketsAssign,
+		models.ScopeTicketsTransition,
+		models.ScopeCommentsWrite,
+		models.ScopeTasksManage,
+	})
+}
+
+func newA2AAdapterFixtureWithScopes(
+	t *testing.T,
+	scopes []string,
+) a2aAdapterFixture {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {
@@ -245,21 +260,12 @@ func newA2AAdapterFixture(t *testing.T) a2aAdapterFixture {
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
-		t.Fatalf("create compatibility user: %v", err)
+		t.Fatalf("create actor user: %v", err)
 	}
 	native := services.NewAgentNativeService(db)
 	principal, err := native.CreateServicePrincipal(context.Background(), services.CreateServicePrincipalInput{
-		Name: "a2a-adapter-agent",
-		Scopes: []string{
-			models.ScopeTicketsRead,
-			models.ScopeTicketsCreate,
-			models.ScopeTicketsUpdate,
-			models.ScopeTicketsAssign,
-			models.ScopeTicketsTransition,
-			models.ScopeCommentsWrite,
-			models.ScopeTasksManage,
-		},
-		CompatibilityUserID: &user.ID,
+		Name:   "a2a-adapter-agent",
+		Scopes: scopes,
 	})
 	if err != nil {
 		t.Fatalf("create service principal: %v", err)
@@ -442,6 +448,265 @@ func TestA2ATaskSnapshotAuthorizerRechecksRevokedTicketReadScope(t *testing.T) {
 	}
 }
 
+func TestA2ARecoveredTicketSnapshotsAreHiddenAfterScopeRevocation(t *testing.T) {
+	tests := []struct {
+		name  string
+		skill string
+		input func(uint) map[string]any
+	}{
+		{
+			name:  "ticket-work update",
+			skill: "ticket-work",
+			input: func(ticketID uint) map[string]any {
+				return map[string]any{
+					"operation":        "update",
+					"ticket_id":        ticketID,
+					"expected_version": 1,
+					"lease_id":         "lease-recovery-update",
+					"changes": map[string]any{
+						"title": "Recovered update snapshot",
+					},
+				}
+			},
+		},
+		{
+			name:  "ticket escalation",
+			skill: "ticket-escalation",
+			input: func(ticketID uint) map[string]any {
+				return map[string]any{
+					"ticket_id":        ticketID,
+					"expected_version": 2,
+					"lease_id":         "lease-recovery-escalation",
+					"reason":           "Recovered escalation snapshot",
+					"priority":         "urgent",
+				}
+			},
+		},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newA2AAdapterFixture(t)
+			ticketID := uint(1200 + index)
+			if test.skill == "ticket-escalation" {
+				if _, err := fixture.native.CreateAgentPolicy(
+					context.Background(),
+					services.CreateAgentPolicyInput{
+						ServicePrincipalID: fixture.principal.ID,
+						Name:               "allow recovered escalation",
+						Effect:             models.AgentPolicyEffectAllow,
+						Scope:              models.ScopeTicketsTransition,
+						Action:             "ticket.escalate",
+						ResourceType:       "ticket",
+						ResourceID:         strconv.FormatUint(uint64(ticketID), 10),
+						Priority:           100,
+					},
+				); err != nil {
+					t.Fatalf("create escalation replay policy: %v", err)
+				}
+			}
+			task, artifact := completedA2AReplayArtifact(
+				t,
+				fixture,
+				test.skill,
+				test.input(ticketID),
+				ticketID,
+			)
+			now := time.Now().UTC()
+			task.Status = a2a.TaskStatus{
+				State:     a2a.TaskStateCompleted,
+				Timestamp: now,
+			}
+			task.StatusHistory = []a2a.TaskStatus{task.Status}
+			task.Artifacts = []a2a.Artifact{artifact}
+			task.CreatedAt = now
+			task.LastModified = now
+			task.LinkedTicketID = nil
+
+			store := a2a.NewGormStoreWithProtector(fixture.db, nil)
+			if err := store.AutoMigrate(); err != nil {
+				t.Fatalf("migrate A2A Task store: %v", err)
+			}
+			credentialID := a2aFixtureCredentialID(t, fixture)
+			ctx := WithA2AExecutionIdentity(
+				context.Background(),
+				A2AExecutionIdentity{
+					Actor:        models.ServicePrincipalActor(fixture.principal.ID),
+					CredentialID: credentialID,
+				},
+			)
+			ctx = a2a.WithTaskOwner(ctx, a2a.TaskOwner{
+				ActorType:    string(models.ActorTypeServicePrincipal),
+				ActorID:      fixture.principal.ID,
+				CredentialID: credentialID,
+			})
+			if err := store.CreateTask(ctx, task); err != nil {
+				t.Fatalf("persist recovered Task snapshot: %v", err)
+			}
+			persisted, err := store.GetTask(ctx, task.ID)
+			if err != nil {
+				t.Fatalf("reload recovered Task snapshot: %v", err)
+			}
+			if persisted.LinkedTicketID != nil {
+				t.Fatalf("test requires no linkedTicketId, got %v", *persisted.LinkedTicketID)
+			}
+			ticketIDs := a2aTaskSnapshotTicketIDs(persisted)
+			if len(ticketIDs) != 1 || ticketIDs[0] != ticketID {
+				t.Fatalf("persisted replay resource link=%v, want [%d]", ticketIDs, ticketID)
+			}
+
+			service := a2a.NewService(store, nil, a2a.ServiceOptions{
+				TaskListAuthorizer: NewA2ATaskListAuthorizer(fixture.native),
+			})
+			if _, err := service.GetTask(ctx, a2a.GetTaskParams{ID: task.ID}); err != nil {
+				t.Fatalf("read recovered Task before revocation: %v", err)
+			}
+			before, err := service.ListTasks(ctx, a2a.ListTasksParams{
+				PageSize:         20,
+				IncludeArtifacts: true,
+			})
+			if err != nil || len(before.Tasks) != 1 {
+				t.Fatalf("list recovered Task before revocation: result=%+v err=%v", before, err)
+			}
+
+			scopeJSON, err := json.Marshal([]string{models.ScopeTasksManage})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.db.Model(&models.ServicePrincipal{}).
+				Where("id = ?", fixture.principal.ID).
+				Update("scopes", datatypes.JSON(scopeJSON)).Error; err != nil {
+				t.Fatalf("revoke Ticket scopes: %v", err)
+			}
+			if taskSnapshot, err := service.GetTask(
+				ctx,
+				a2a.GetTaskParams{ID: task.ID},
+			); err == nil {
+				t.Fatalf("GetTask leaked revoked recovered snapshot: %+v", taskSnapshot)
+			}
+			after, err := service.ListTasks(ctx, a2a.ListTasksParams{
+				PageSize:         20,
+				IncludeArtifacts: true,
+			})
+			if err != nil {
+				t.Fatalf("ListTasks after Ticket scope revocation: %v", err)
+			}
+			if len(after.Tasks) != 0 || after.TotalSize != 0 {
+				t.Fatalf("ListTasks leaked revoked recovered snapshot: %+v", after)
+			}
+		})
+	}
+}
+
+func completedA2AReplayArtifact(
+	t *testing.T,
+	fixture a2aAdapterFixture,
+	skill string,
+	input map[string]any,
+	ticketID uint,
+) (a2a.Task, a2a.Artifact) {
+	t.Helper()
+	task := a2a.Task{
+		ID:        "task-recovered-" + skill,
+		ContextID: "context-recovered-" + skill,
+	}
+	message := structuredA2AMessage(t, skill, input)
+	identity, err := fixture.backend.identity.ResolveA2AIdentity(
+		context.Background(),
+		task,
+		message,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedSkill, payload, invalid := structuredA2ACommand(task, message)
+	if invalid != nil {
+		t.Fatalf("parse replay command: %v", invalid)
+	}
+	reservation, replayed, err := fixture.backend.reserveA2ACommand(
+		context.Background(),
+		task,
+		message,
+		identity,
+		parsedSkill,
+		payload,
+	)
+	if err != nil || reservation.ID == "" || replayed != nil {
+		t.Fatalf(
+			"reserve simulated completed command: reservation=%+v replay=%+v err=%v",
+			reservation,
+			replayed,
+			err,
+		)
+	}
+	receipt := services.OperationReceipt{
+		OperationID:     "operation-recovered-" + skill,
+		ResourceID:      strconv.FormatUint(uint64(ticketID), 10),
+		ResourceVersion: 3,
+		EventID:         "event-recovered-" + skill,
+		ChangedFields:   []string{"ticket"},
+	}
+	receiptBody, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotBody, err := json.Marshal(map[string]any{
+		"id":          ticketID,
+		"title":       "Persisted recovered Ticket snapshot",
+		"description": "This snapshot must remain protected after scope revocation.",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completedAt := time.Now().UTC()
+	if err := fixture.db.Model(&models.IdempotencyRecord{}).
+		Where("id = ?", reservation.ID).
+		Updates(map[string]any{
+			"state":             models.IdempotencyStateCompleted,
+			"response_code":     http.StatusOK,
+			"response_body":     datatypes.JSON(receiptBody),
+			"resource_snapshot": datatypes.JSON(snapshotBody),
+			"resource_id":       receipt.ResourceID,
+			"event_id":          receipt.EventID,
+			"completed_at":      completedAt,
+			"updated_at":        completedAt,
+		}).Error; err != nil {
+		t.Fatalf("complete simulated crashed command: %v", err)
+	}
+	reporter := &recordingA2AReporter{}
+	if err := fixture.backend.Process(
+		context.Background(),
+		task,
+		message,
+		reporter,
+	); err != nil {
+		t.Fatalf("recover completed %s command: %v", skill, err)
+	}
+	if len(reporter.artifacts) != 1 {
+		t.Fatalf("recovered %s artifacts=%#v", skill, reporter.artifacts)
+	}
+	var replayPayload struct {
+		Result map[string]json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(reporter.artifacts[0].Parts[0].Data, &replayPayload); err != nil {
+		t.Fatalf("decode recovered %s artifact: %v", skill, err)
+	}
+	if string(replayPayload.Result["replayed"]) != "true" ||
+		string(replayPayload.Result["resourceType"]) != `"ticket"` {
+		t.Fatalf("recovered %s artifact lacks typed resource: %s", skill, reporter.artifacts[0].Parts[0].Data)
+	}
+	var replayReceipt map[string]json.RawMessage
+	if err := json.Unmarshal(replayPayload.Result["receipt"], &replayReceipt); err != nil {
+		t.Fatalf("decode recovered %s receipt: %v", skill, err)
+	}
+	if string(replayReceipt["resource_type"]) != `"ticket"` {
+		t.Fatalf("recovered %s receipt lacks Ticket resource type: %s", skill, replayPayload.Result["receipt"])
+	}
+	if _, exists := replayPayload.Result["resource"]; !exists {
+		t.Fatalf("recovered %s artifact omitted resource snapshot: %s", skill, reporter.artifacts[0].Parts[0].Data)
+	}
+	return task, reporter.artifacts[0]
+}
+
 func TestA2APolicyMiddlewareAliasCannotBypassSendDenyWithAllowedPush(t *testing.T) {
 	fixture := newA2AAdapterFixture(t)
 	for _, policy := range []services.CreateAgentPolicyInput{
@@ -585,15 +850,17 @@ func TestA2ABackendRequiresStructuredInputAndNeverInfersText(t *testing.T) {
 func TestA2ATicketCommentRequiresExplicitLeaseID(t *testing.T) {
 	fixture := newA2AAdapterFixture(t)
 	ticket := models.Ticket{
-		TicketNumber: "A2A-COMMENT-LEASE-1",
-		Title:        "Lease-protected comment",
-		Description:  "Agent comments require an explicit lease.",
-		Type:         models.TicketTypeRequest,
-		Priority:     models.TicketPriorityNormal,
-		Status:       models.TicketStatusOpen,
-		Source:       models.TicketSourceAgent,
-		Version:      1,
-		CreatedByID:  fixture.user.ID,
+		TicketNumber:       "A2A-COMMENT-LEASE-1",
+		Title:              "Lease-protected comment",
+		Description:        "Agent comments require an explicit lease.",
+		Type:               models.TicketTypeRequest,
+		Priority:           models.TicketPriorityNormal,
+		Status:             models.TicketStatusOpen,
+		Source:             models.TicketSourceAgent,
+		Version:            1,
+		CreatedByID:        &fixture.user.ID,
+		CreatedByActorType: models.ActorTypeHuman,
+		CreatedByActorID:   strconv.FormatUint(uint64(fixture.user.ID), 10),
 	}
 	if err := fixture.db.Create(&ticket).Error; err != nil {
 		t.Fatalf("create ticket: %v", err)
@@ -668,6 +935,204 @@ func TestA2ABackendReplaysMessageIdWithoutDuplicateTicket(t *testing.T) {
 	}
 	if len(second.artifacts) != 1 || !strings.Contains(string(second.artifacts[0].Parts[0].Data), `"replayed":true`) {
 		t.Fatalf("retry did not return a structured replay artifact: %#v", second.artifacts)
+	}
+	var replayPayload struct {
+		Result map[string]json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(second.artifacts[0].Parts[0].Data, &replayPayload); err != nil {
+		t.Fatalf("decode replay artifact: %v", err)
+	}
+	if _, exists := replayPayload.Result["resource"]; !exists {
+		t.Fatalf("read-authorized replay omitted persisted ticket snapshot: %s", second.artifacts[0].Parts[0].Data)
+	}
+}
+
+func TestA2ATicketIntakeWithoutReadScopeReturnsReceiptOnly(t *testing.T) {
+	fixture := newA2AAdapterFixtureWithScopes(t, []string{
+		models.ScopeTicketsCreate,
+		models.ScopeTasksManage,
+	})
+	task := a2a.Task{
+		ID:        "task-create-without-read",
+		ContextID: "context-create-without-read",
+	}
+	reporter := &recordingA2AReporter{}
+	err := fixture.backend.Process(
+		context.Background(),
+		task,
+		structuredA2AMessage(t, "ticket-intake", map[string]any{
+			"title":       "Receipt-only ticket",
+			"description": "Create scope must not imply read scope.",
+			"type":        "request",
+			"priority":    "normal",
+		}),
+		reporter,
+	)
+	if err != nil {
+		t.Fatalf("ticket intake: %v", err)
+	}
+	if len(reporter.artifacts) != 1 ||
+		len(reporter.artifacts[0].Parts) != 1 {
+		t.Fatalf("unexpected receipt artifact: %#v", reporter.artifacts)
+	}
+	var payload struct {
+		Result map[string]json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(reporter.artifacts[0].Parts[0].Data, &payload); err != nil {
+		t.Fatalf("decode receipt artifact: %v", err)
+	}
+	if _, exists := payload.Result["receipt"]; !exists {
+		t.Fatalf("receipt-only response omitted operation receipt: %s", reporter.artifacts[0].Parts[0].Data)
+	}
+	if _, exists := payload.Result["ticket"]; exists {
+		t.Fatalf("create-only principal received protected ticket snapshot: %s", reporter.artifacts[0].Parts[0].Data)
+	}
+	var tickets int64
+	if err := fixture.db.Model(&models.Ticket{}).Count(&tickets).Error; err != nil {
+		t.Fatal(err)
+	}
+	if tickets != 1 {
+		t.Fatalf("ticket intake created %d tickets, want one", tickets)
+	}
+}
+
+func TestA2ATicketIntakeReplayRechecksObjectReadPolicy(t *testing.T) {
+	fixture := newA2AAdapterFixture(t)
+	task := a2a.Task{
+		ID:        "task-replay-read-policy",
+		ContextID: "context-replay-read-policy",
+	}
+	message := structuredA2AMessage(t, "ticket-intake", map[string]any{
+		"title":       "Replay policy ticket",
+		"description": "The persisted snapshot must be authorized again.",
+		"type":        "request",
+		"priority":    "normal",
+	})
+	if err := fixture.backend.Process(
+		context.Background(),
+		task,
+		message,
+		&recordingA2AReporter{},
+	); err != nil {
+		t.Fatalf("initial ticket intake: %v", err)
+	}
+	var ticket models.Ticket
+	if err := fixture.db.First(&ticket).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.native.CreateAgentPolicy(
+		context.Background(),
+		services.CreateAgentPolicyInput{
+			ServicePrincipalID: fixture.principal.ID,
+			Name:               "deny replayed ticket snapshot",
+			Effect:             models.AgentPolicyEffectDeny,
+			Scope:              models.ScopeTicketsRead,
+			Action:             "ticket.read",
+			ResourceType:       "ticket",
+			ResourceID:         strconv.FormatUint(uint64(ticket.ID), 10),
+			Priority:           100,
+		},
+	); err != nil {
+		t.Fatalf("create object read deny: %v", err)
+	}
+
+	replayed := &recordingA2AReporter{}
+	if err := fixture.backend.Process(
+		context.Background(),
+		task,
+		message,
+		replayed,
+	); err != nil {
+		t.Fatalf("replay ticket intake: %v", err)
+	}
+	if len(replayed.artifacts) != 1 || len(replayed.artifacts[0].Parts) != 1 {
+		t.Fatalf("unexpected replay artifact: %#v", replayed.artifacts)
+	}
+	var payload struct {
+		Result map[string]json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(replayed.artifacts[0].Parts[0].Data, &payload); err != nil {
+		t.Fatalf("decode replay artifact: %v", err)
+	}
+	if _, exists := payload.Result["receipt"]; !exists {
+		t.Fatalf("policy-filtered replay omitted operation receipt: %s", replayed.artifacts[0].Parts[0].Data)
+	}
+	if string(payload.Result["replayed"]) != "true" {
+		t.Fatalf("response is not marked as replayed: %s", replayed.artifacts[0].Parts[0].Data)
+	}
+	if _, exists := payload.Result["resource"]; exists {
+		t.Fatalf("object read deny leaked persisted ticket snapshot: %s", replayed.artifacts[0].Parts[0].Data)
+	}
+}
+
+func TestA2ATicketIntakeCreateOnlyRecoversAfterArtifactFailure(t *testing.T) {
+	fixture := newA2AAdapterFixtureWithScopes(t, []string{
+		models.ScopeTicketsCreate,
+		models.ScopeTasksManage,
+	})
+	task := a2a.Task{
+		ID:        "task-create-only-crash-recovery",
+		ContextID: "context-create-only-crash-recovery",
+	}
+	message := structuredA2AMessage(t, "ticket-intake", map[string]any{
+		"title":       "Crash recovery ticket",
+		"description": "The write committed before the response artifact failed.",
+		"type":        "request",
+		"priority":    "normal",
+	})
+	artifactFailure := errors.New("simulated artifact persistence failure")
+	err := fixture.backend.Process(
+		context.Background(),
+		task,
+		message,
+		&recordingA2AReporter{artifactErr: artifactFailure},
+	)
+	if !errors.Is(err, artifactFailure) {
+		t.Fatalf("initial artifact failure error=%v, want %v", err, artifactFailure)
+	}
+	var record models.IdempotencyRecord
+	if err := fixture.db.
+		Where("actor_id = ? AND key = ?", fixture.principal.ID, message.MessageID).
+		First(&record).Error; err != nil {
+		t.Fatal(err)
+	}
+	if record.State != models.IdempotencyStateCompleted || len(record.ResourceSnapshot) == 0 {
+		t.Fatalf("committed intake did not retain recoverable idempotency result: %+v", record)
+	}
+
+	recovered := &recordingA2AReporter{}
+	if err := fixture.backend.Process(
+		context.Background(),
+		task,
+		message,
+		recovered,
+	); err != nil {
+		t.Fatalf("recover committed ticket intake: %v", err)
+	}
+	if len(recovered.artifacts) != 1 || len(recovered.artifacts[0].Parts) != 1 {
+		t.Fatalf("unexpected recovery artifact: %#v", recovered.artifacts)
+	}
+	var payload struct {
+		Result map[string]json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(recovered.artifacts[0].Parts[0].Data, &payload); err != nil {
+		t.Fatalf("decode recovery artifact: %v", err)
+	}
+	if _, exists := payload.Result["receipt"]; !exists {
+		t.Fatalf("create-only recovery omitted operation receipt: %s", recovered.artifacts[0].Parts[0].Data)
+	}
+	if string(payload.Result["replayed"]) != "true" {
+		t.Fatalf("recovery is not marked as replayed: %s", recovered.artifacts[0].Parts[0].Data)
+	}
+	if _, exists := payload.Result["resource"]; exists {
+		t.Fatalf("create-only recovery leaked persisted ticket snapshot: %s", recovered.artifacts[0].Parts[0].Data)
+	}
+	var tickets int64
+	if err := fixture.db.Model(&models.Ticket{}).Count(&tickets).Error; err != nil {
+		t.Fatal(err)
+	}
+	if tickets != 1 {
+		t.Fatalf("crash recovery created %d tickets, want one", tickets)
 	}
 }
 
@@ -785,10 +1250,10 @@ func TestA2ABackendMapsTicketSkillsToNativeLifecycle(t *testing.T) {
 	}
 	if ticket.CreatedByActorType != models.ActorTypeServicePrincipal ||
 		ticket.CreatedByActorID != fixture.principal.ID ||
-		ticket.CreatedByID != fixture.user.ID ||
+		ticket.CreatedByID != nil ||
 		ticket.Source != models.TicketSourceAgent ||
 		ticket.TrustLevel != models.TicketTrustLevelUntrusted {
-		t.Fatalf("ticket provenance is incorrect: %+v", ticket)
+		t.Fatalf("service-principal ticket provenance is incorrect: %+v", ticket)
 	}
 	var createEvent models.DomainEvent
 	if err := fixture.db.
@@ -1054,7 +1519,7 @@ func (failingTransactionalPushDispatcher) EnqueueTx(
 
 func TestA2ATaskEventRollsBackWhenPushOutboxCannotBeCreated(t *testing.T) {
 	fixture := newA2AAdapterFixture(t)
-	store := a2a.NewGormStore(fixture.db)
+	store := a2a.NewGormStoreWithProtector(fixture.db, nil)
 	if err := store.AutoMigrate(); err != nil {
 		t.Fatal(err)
 	}
@@ -1128,6 +1593,7 @@ type recordingA2AReporter struct {
 	statuses       []a2a.TaskState
 	statusMessages []*a2a.Message
 	artifacts      []a2a.Artifact
+	artifactErr    error
 }
 
 func (r *recordingA2AReporter) SetStatus(
@@ -1151,6 +1617,9 @@ func (r *recordingA2AReporter) AddArtifact(
 ) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.artifactErr != nil {
+		return r.artifactErr
+	}
 	r.artifacts = append(r.artifacts, artifact)
 	return nil
 }

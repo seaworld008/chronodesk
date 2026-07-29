@@ -6,8 +6,6 @@ import (
 	"testing"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
-
-	"gorm.io/gorm"
 )
 
 func TestHumanTicketCASCannotOverwriteConcurrentAgentVersion(t *testing.T) {
@@ -26,7 +24,7 @@ func TestHumanTicketCASCannotOverwriteConcurrentAgentVersion(t *testing.T) {
 		TicketNumber: "CAS-1", Title: "original", Description: "description",
 		Type: models.TicketTypeRequest, Priority: models.TicketPriorityNormal,
 		Status: models.TicketStatusOpen, Source: models.TicketSourceWeb,
-		CreatedByID: user.ID, Version: 1,
+		CreatedByID: &user.ID, Version: 1,
 	}
 	if err := db.Create(&stale).Error; err != nil {
 		t.Fatal(err)
@@ -38,9 +36,15 @@ func TestHumanTicketCASCannotOverwriteConcurrentAgentVersion(t *testing.T) {
 	}
 	stale.Priority = models.TicketPriorityHigh
 	stale.Version = 2
-	err := db.Transaction(func(tx *gorm.DB) error {
-		return saveTicketCAS(tx, &stale, 1)
-	})
+	_, err := NewAgentNativeService(db).UpdateTicketVersion(
+		context.Background(),
+		VersionedTicketUpdateInput{
+			TicketID:        stale.ID,
+			ExpectedVersion: 1,
+			Actor:           models.SystemActor("cas-test"),
+			Changes:         map[string]any{"priority": models.TicketPriorityHigh},
+		},
+	)
 	if !errors.Is(err, ErrVersionConflict) {
 		t.Fatalf("stale human snapshot should conflict, got %v", err)
 	}
@@ -74,7 +78,7 @@ func TestHumanTicketLifecycleUsesNativeEventOutboxTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	native := NewAgentNativeService(db)
-	service := NewTicketServiceWithAgentNative(db, nil, 0, native)
+	service := newTicketServiceWithDependenciesForTest(t, db, native, nil, 0)
 	ticket, err := service.CreateTicket(context.Background(), &models.TicketCreateRequest{
 		Title: "Human lifecycle", Description: "untrusted",
 		Type: models.TicketTypeRequest, Priority: models.TicketPriorityNormal,
@@ -88,11 +92,12 @@ func TestHumanTicketLifecycleUsesNativeEventOutboxTransaction(t *testing.T) {
 	}
 
 	title := "Human lifecycle updated"
-	updated, err := service.UpdateTicket(
+	updated, err := service.UpdateTicketExpectedVersion(
 		context.Background(),
 		ticket.ID,
 		&models.TicketUpdateRequest{Title: &title},
 		user.ID,
+		ticket.Version,
 	)
 	if err != nil {
 		t.Fatalf("update ticket: %v", err)
@@ -116,6 +121,16 @@ func TestHumanTicketLifecycleUsesNativeEventOutboxTransaction(t *testing.T) {
 			event.DataSchema == "" {
 			t.Fatalf("event lacks human audit or schema: %#v", event)
 		}
+	}
+	var histories []models.TicketHistory
+	if err := db.Where("ticket_id = ?", ticket.ID).Order("id ASC").Find(&histories).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(histories) != len(events) {
+		t.Fatalf("history count = %d, want %d", len(histories), len(events))
+	}
+	for index := range histories {
+		assertTicketHistoryEventLink(t, &histories[index], &events[index])
 	}
 	var deliveryCount int64
 	if err := db.Model(&models.OutboxDelivery{}).Count(&deliveryCount).Error; err != nil {

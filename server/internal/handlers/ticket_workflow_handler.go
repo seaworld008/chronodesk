@@ -44,18 +44,6 @@ type StatusUpdateRequest struct {
 	ResolutionNotes string `json:"resolution_notes" binding:"max=10000"`
 }
 
-type BulkAssignRequest struct {
-	TicketIDs    []uint `json:"ticket_ids" binding:"required,min=1,max=100,unique,dive,gt=0"`
-	AssignedToID uint   `json:"assigned_to_id" binding:"required"`
-	Comment      string `json:"comment" binding:"max=2000"`
-}
-
-type BulkStatusRequest struct {
-	TicketIDs []uint `json:"ticket_ids" binding:"required,min=1,max=100,unique,dive,gt=0"`
-	Status    string `json:"status" binding:"required,oneof=open in_progress pending resolved closed cancelled"`
-	Comment   string `json:"comment" binding:"max=2000"`
-}
-
 func (h *TicketWorkflowHandler) AssignTicket(c *gin.Context) {
 	ticketID, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {
@@ -71,44 +59,45 @@ func (h *TicketWorkflowHandler) AssignTicket(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数无效",
-			"error":   err.Error(),
+			"error":   "invalid_request",
 		})
 		return
 	}
-	authorizedTicket, err := authorizeTicket(c.Request.Context(), c, h.ticketService, uint(ticketID), ticketAccessWorkflow)
+	_, err = authorizeTicket(c.Request.Context(), c, h.ticketService, uint(ticketID), ticketAccessWorkflow)
 	if err != nil {
 		if !writeTicketAuthorizationError(c, err) {
 			c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "工单不存在"})
 		}
 		return
 	}
-	versionedService, ok := h.ticketService.(TicketVersionedService)
+	expectedVersion, ok := requireTicketIfMatch(c)
 	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "code": "version_guard_unavailable", "message": "工单服务未启用授权版本校验"})
 		return
 	}
-
 	userID := c.GetUint("user_id")
-	ticket, err := versionedService.AssignTicketExpectedVersion(
+	ticket, err := h.ticketService.AssignTicketExpectedVersion(
+		c.Request.Context(),
 		uint(ticketID),
 		req.AssignedToID,
 		userID,
 		req.Comment,
-		authorizedTicket.Version,
+		expectedVersion,
 	)
 	if err != nil {
 		if errors.Is(err, services.ErrVersionConflict) {
-			c.JSON(http.StatusConflict, gin.H{"success": false, "code": "version_conflict", "message": "工单已被并发更新"})
+			writeTicketVersionConflict(c)
 			return
 		}
+		logHandlerFailure(c, "ticket_workflow.assign", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "工单分配失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
 
+	setTicketETag(c, ticket.Version)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data":    ticketResponseForRole(ticket, normalizedUserRole(c)),
@@ -131,45 +120,46 @@ func (h *TicketWorkflowHandler) TransferTicket(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数无效",
-			"error":   err.Error(),
+			"error":   "invalid_request",
 		})
 		return
 	}
-	authorizedTicket, err := authorizeTicket(c.Request.Context(), c, h.ticketService, uint(ticketID), ticketAccessWorkflow)
+	_, err = authorizeTicket(c.Request.Context(), c, h.ticketService, uint(ticketID), ticketAccessWorkflow)
 	if err != nil {
 		if !writeTicketAuthorizationError(c, err) {
 			c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "工单不存在"})
 		}
 		return
 	}
-	versionedService, ok := h.ticketService.(TicketVersionedService)
+	expectedVersion, ok := requireTicketIfMatch(c)
 	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "code": "version_guard_unavailable", "message": "工单服务未启用授权版本校验"})
 		return
 	}
-
 	userID := c.GetUint("user_id")
-	ticket, err := versionedService.TransferTicketExpectedVersion(
+	ticket, err := h.ticketService.TransferTicketExpectedVersion(
+		c.Request.Context(),
 		uint(ticketID),
 		req.AssignedToID,
 		userID,
 		req.Comment,
 		req.TransferReason,
-		authorizedTicket.Version,
+		expectedVersion,
 	)
 	if err != nil {
 		if errors.Is(err, services.ErrVersionConflict) {
-			c.JSON(http.StatusConflict, gin.H{"success": false, "code": "version_conflict", "message": "工单已被并发更新"})
+			writeTicketVersionConflict(c)
 			return
 		}
+		logHandlerFailure(c, "ticket_workflow.transfer", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "工单转移失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
 
+	setTicketETag(c, ticket.Version)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data":    ticketResponseForRole(ticket, normalizedUserRole(c)),
@@ -192,45 +182,46 @@ func (h *TicketWorkflowHandler) EscalateTicket(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数无效",
-			"error":   err.Error(),
+			"error":   "invalid_request",
 		})
 		return
 	}
-	authorizedTicket, err := authorizeTicket(c.Request.Context(), c, h.ticketService, uint(ticketID), ticketAccessWorkflow)
+	_, err = authorizeTicket(c.Request.Context(), c, h.ticketService, uint(ticketID), ticketAccessWorkflow)
 	if err != nil {
 		if !writeTicketAuthorizationError(c, err) {
 			c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "工单不存在"})
 		}
 		return
 	}
-	versionedService, ok := h.ticketService.(TicketVersionedService)
+	expectedVersion, ok := requireTicketIfMatch(c)
 	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "code": "version_guard_unavailable", "message": "工单服务未启用授权版本校验"})
 		return
 	}
-
 	userID := c.GetUint("user_id")
-	ticket, err := versionedService.EscalateTicketExpectedVersion(
+	ticket, err := h.ticketService.EscalateTicketExpectedVersion(
+		c.Request.Context(),
 		uint(ticketID),
 		req.EscalateToID,
 		userID,
 		req.Reason,
 		req.Comment,
-		authorizedTicket.Version,
+		expectedVersion,
 	)
 	if err != nil {
 		if errors.Is(err, services.ErrVersionConflict) {
-			c.JSON(http.StatusConflict, gin.H{"success": false, "code": "version_conflict", "message": "工单已被并发更新"})
+			writeTicketVersionConflict(c)
 			return
 		}
+		logHandlerFailure(c, "ticket_workflow.escalate", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "工单升级失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
 
+	setTicketETag(c, ticket.Version)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data":    ticketResponseForRole(ticket, normalizedUserRole(c)),
@@ -253,53 +244,67 @@ func (h *TicketWorkflowHandler) UpdateTicketStatus(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数无效",
-			"error":   err.Error(),
+			"error":   "invalid_request",
 		})
 		return
 	}
-	authorizedTicket, err := authorizeTicket(c.Request.Context(), c, h.ticketService, uint(ticketID), ticketAccessWorkflow)
+	currentTicket, err := authorizeTicket(c.Request.Context(), c, h.ticketService, uint(ticketID), ticketAccessWorkflow)
 	if err != nil {
 		if !writeTicketAuthorizationError(c, err) {
 			c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "工单不存在"})
 		}
 		return
 	}
-	versionedService, ok := h.ticketService.(TicketVersionedService)
+	expectedVersion, ok := requireTicketIfMatch(c)
 	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "code": "version_guard_unavailable", "message": "工单服务未启用授权版本校验"})
 		return
 	}
-
 	userID := c.GetUint("user_id")
-	ticket, err := versionedService.UpdateTicketStatusExpectedVersion(
+	ticket, err := h.ticketService.UpdateTicketStatusExpectedVersion(
+		c.Request.Context(),
 		uint(ticketID),
 		req.Status,
 		userID,
 		req.Comment,
 		req.ResolutionNotes,
-		authorizedTicket.Version,
+		expectedVersion,
 	)
 	if err != nil {
 		if errors.Is(err, services.ErrVersionConflict) {
-			c.JSON(http.StatusConflict, gin.H{"success": false, "code": "version_conflict", "message": "工单已被并发更新"})
+			writeTicketVersionConflict(c)
 			return
 		}
 		if errors.Is(err, services.ErrInvalidTicketTransition) {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"success": false,
-				"message": "无效的状态流转",
-				"error":   err.Error(),
-			})
+			allowed := currentTicket.Status.AllowedTransitions()
+			allowedValues := make([]string, len(allowed))
+			for index, status := range allowed {
+				allowedValues[index] = string(status)
+			}
+			writeHumanTicketProblem(
+				c,
+				http.StatusConflict,
+				"invalid_status_transition",
+				"工单状态流转冲突",
+				"当前工单状态不允许执行该流转",
+				false,
+				map[string]any{
+					"current_status":        currentTicket.Status,
+					"requested_status":      req.Status,
+					"allowed_next_statuses": allowedValues,
+				},
+			)
 			return
 		}
+		logHandlerFailure(c, "ticket_workflow.update_status", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "状态更新失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
 
+	setTicketETag(c, ticket.Version)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data":    ticketResponseForRole(ticket, normalizedUserRole(c)),
@@ -313,10 +318,11 @@ func (h *TicketWorkflowHandler) GetTicketStats(c *gin.Context) {
 
 	stats, err := h.ticketService.GetTicketStatistics(userID, role)
 	if err != nil {
+		logHandlerFailure(c, "ticket_workflow.get_statistics", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "获取统计数据失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -367,10 +373,11 @@ func (h *TicketWorkflowHandler) GetMyTickets(c *gin.Context) {
 		return
 	}
 	if err != nil {
+		logHandlerFailure(c, "ticket_workflow.get_my_tickets", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "获取我的工单失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -404,10 +411,11 @@ func (h *TicketWorkflowHandler) GetUnassignedTickets(c *gin.Context) {
 
 	tickets, total, err := h.ticketService.GetUnassignedTickets(priority, categoryID, limit)
 	if err != nil {
+		logHandlerFailure(c, "ticket_workflow.get_unassigned_tickets", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "获取未分配工单失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -425,10 +433,11 @@ func (h *TicketWorkflowHandler) GetOverdueTickets(c *gin.Context) {
 
 	tickets, total, err := h.ticketService.GetOverdueTickets(userID, role)
 	if err != nil {
+		logHandlerFailure(c, "ticket_workflow.get_overdue_tickets", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "获取逾期工单失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -446,10 +455,11 @@ func (h *TicketWorkflowHandler) GetSLABreachedTickets(c *gin.Context) {
 
 	tickets, total, err := h.ticketService.GetSLABreachedTickets(userID, role)
 	if err != nil {
+		logHandlerFailure(c, "ticket_workflow.get_sla_breached_tickets", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "获取SLA违约工单失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -458,72 +468,6 @@ func (h *TicketWorkflowHandler) GetSLABreachedTickets(c *gin.Context) {
 		"success": true,
 		"data":    ticketListResponseForRole(tickets, role),
 		"total":   total,
-	})
-}
-
-func (h *TicketWorkflowHandler) BulkAssignTickets(c *gin.Context) {
-	if !isPrivilegedRole(normalizedUserRole(c)) {
-		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "仅管理员或主管可以批量分配"})
-		return
-	}
-	var req BulkAssignRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "请求参数无效",
-			"error":   err.Error(),
-		})
-		return
-	}
-
-	userID := c.GetUint("user_id")
-	result, err := h.ticketService.BulkAssignTickets(req.TicketIDs, req.AssignedToID, userID, req.Comment)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "批量分配失败",
-			"error":   err.Error(),
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    result,
-		"message": "批量分配完成",
-	})
-}
-
-func (h *TicketWorkflowHandler) BulkUpdateStatus(c *gin.Context) {
-	if !isPrivilegedRole(normalizedUserRole(c)) {
-		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "仅管理员或主管可以批量更新状态"})
-		return
-	}
-	var req BulkStatusRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "请求参数无效",
-			"error":   err.Error(),
-		})
-		return
-	}
-
-	userID := c.GetUint("user_id")
-	result, err := h.ticketService.BulkUpdateStatus(req.TicketIDs, req.Status, userID, req.Comment)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "批量状态更新失败",
-			"error":   err.Error(),
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    result,
-		"message": "批量状态更新完成",
 	})
 }
 
@@ -543,22 +487,22 @@ func (h *TicketWorkflowHandler) GetTicketHistory(c *gin.Context) {
 		return
 	}
 
-	history, total, err := h.ticketService.GetTicketHistory(uint(ticketID))
+	history, _, err := h.ticketService.GetTicketHistory(uint(ticketID))
 	if err != nil {
+		logHandlerFailure(c, "ticket_workflow.get_history", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "获取工单历史失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
 	customer := isCustomerRole(normalizedUserRole(c))
 	responses := ticketHistoryResponses(history, customer)
-	total = int64(len(responses))
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data":    responses,
-		"total":   total,
+		"total":   len(responses),
 	})
 }

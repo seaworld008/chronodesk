@@ -24,9 +24,11 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
@@ -56,7 +58,9 @@ var (
 	ErrAttachmentStorageMissing  = errors.New("attachment storage is not configured")
 	ErrAttachmentTooLarge        = errors.New("attachment exceeds size limit")
 	ErrAttachmentNotClean        = errors.New("attachment is not cleared for download")
+	ErrInvalidAttachment         = errors.New("invalid attachment")
 	ErrInvalidAttachmentName     = errors.New("invalid attachment name")
+	ErrInvalidComment            = errors.New("invalid comment")
 	ErrInvalidAttachmentCleanup  = errors.New("invalid attachment cleanup destination")
 	ErrOutboxLockLost            = errors.New("outbox delivery lock lost")
 	ErrOutboxReplayConflict      = errors.New("outbox delivery is actively being processed")
@@ -134,8 +138,12 @@ func AgentNativeErrorCode(err error) string {
 		return "attachment_too_large"
 	case errors.Is(err, ErrAttachmentNotClean):
 		return "attachment_not_clean"
+	case errors.Is(err, ErrInvalidAttachment):
+		return "invalid_attachment"
 	case errors.Is(err, ErrInvalidAttachmentName):
 		return "invalid_attachment_name"
+	case errors.Is(err, ErrInvalidComment):
+		return "invalid_comment"
 	case errors.Is(err, ErrOutboxReplayConflict):
 		return "outbox_replay_conflict"
 	case errors.Is(err, gorm.ErrRecordNotFound):
@@ -224,7 +232,9 @@ type AgentNativeOptions struct {
 	IdempotencyProcessingLease time.Duration
 	AttachmentStorage          AttachmentStorage
 	AttachmentMaxBytes         int64
-	SystemCompatibilityUserID  uint
+	OutboxLockTTL              time.Duration
+	OutboxDeliveryTimeout      time.Duration
+	OutboxDeliveryConcurrency  int
 	LoopThreshold              int
 	LoopWindow                 time.Duration
 	ExecutionGuard             AgentExecutionGuard
@@ -249,7 +259,9 @@ type AgentNativeService struct {
 	idempotencyProcessingLease time.Duration
 	attachmentStorage          AttachmentStorage
 	attachmentMaxBytes         int64
-	systemCompatibilityUserID  uint
+	outboxLockTTL              time.Duration
+	outboxDeliveryTimeout      time.Duration
+	outboxDeliverySlots        chan struct{}
 	loopThreshold              int
 	loopWindow                 time.Duration
 	executionGuard             AgentExecutionGuard
@@ -318,6 +330,18 @@ func NewAgentNativeService(db *gorm.DB, provided ...AgentNativeOptions) *AgentNa
 	if options.AttachmentMaxBytes <= 0 {
 		options.AttachmentMaxBytes = 25 << 20
 	}
+	if options.OutboxLockTTL <= 0 {
+		options.OutboxLockTTL = 2 * time.Minute
+	}
+	if options.OutboxDeliveryTimeout <= 0 {
+		options.OutboxDeliveryTimeout = 30 * time.Second
+	}
+	if options.OutboxDeliveryTimeout >= options.OutboxLockTTL {
+		options.OutboxDeliveryTimeout = options.OutboxLockTTL / 2
+	}
+	if options.OutboxDeliveryConcurrency <= 0 {
+		options.OutboxDeliveryConcurrency = 8
+	}
 	if options.LoopThreshold <= 0 {
 		options.LoopThreshold = 20
 	}
@@ -346,7 +370,9 @@ func NewAgentNativeService(db *gorm.DB, provided ...AgentNativeOptions) *AgentNa
 		idempotencyProcessingLease: options.IdempotencyProcessingLease,
 		attachmentStorage:          options.AttachmentStorage,
 		attachmentMaxBytes:         options.AttachmentMaxBytes,
-		systemCompatibilityUserID:  options.SystemCompatibilityUserID,
+		outboxLockTTL:              options.OutboxLockTTL,
+		outboxDeliveryTimeout:      options.OutboxDeliveryTimeout,
+		outboxDeliverySlots:        make(chan struct{}, options.OutboxDeliveryConcurrency),
 		loopThreshold:              options.LoopThreshold,
 		loopWindow:                 options.LoopWindow,
 		executionGuard:             options.ExecutionGuard,
@@ -365,15 +391,14 @@ func (s *AgentNativeService) SetGlobalReadOnly(enabled bool) {
 }
 
 type CreateServicePrincipalInput struct {
-	Name                string
-	Description         string
-	Scopes              []string
-	RateLimitPerMinute  int
-	ConcurrentLimit     int
-	ExpiresAt           *time.Time
-	ReadOnly            bool
-	CompatibilityUserID *uint
-	CreatedByID         *uint
+	Name               string
+	Description        string
+	Scopes             []string
+	RateLimitPerMinute int
+	ConcurrentLimit    int
+	ExpiresAt          *time.Time
+	ReadOnly           bool
+	CreatedByID        *uint
 }
 
 func (s *AgentNativeService) CreateServicePrincipal(ctx context.Context, input CreateServicePrincipalInput) (*models.ServicePrincipal, error) {
@@ -395,29 +420,17 @@ func (s *AgentNativeService) CreateServicePrincipal(ctx context.Context, input C
 	if input.ConcurrentLimit <= 0 {
 		input.ConcurrentLimit = 4
 	}
-	if input.CompatibilityUserID != nil {
-		var count int64
-		if err := s.dbForContext(ctx).Model(&models.User{}).
-			Where("id = ?", *input.CompatibilityUserID).
-			Count(&count).Error; err != nil {
-			return nil, fmt.Errorf("validate compatibility user: %w", err)
-		}
-		if count != 1 {
-			return nil, fmt.Errorf("compatibility user %d not found", *input.CompatibilityUserID)
-		}
-	}
 	principal := &models.ServicePrincipal{
-		ID:                  newNativeID(),
-		Name:                name,
-		Description:         strings.TrimSpace(input.Description),
-		Status:              models.ServicePrincipalStatusActive,
-		Scopes:              datatypes.JSON(scopeJSON),
-		RateLimitPerMinute:  input.RateLimitPerMinute,
-		ConcurrentLimit:     input.ConcurrentLimit,
-		ExpiresAt:           input.ExpiresAt,
-		ReadOnly:            input.ReadOnly,
-		CompatibilityUserID: input.CompatibilityUserID,
-		CreatedByID:         input.CreatedByID,
+		ID:                 newNativeID(),
+		Name:               name,
+		Description:        strings.TrimSpace(input.Description),
+		Status:             models.ServicePrincipalStatusActive,
+		Scopes:             datatypes.JSON(scopeJSON),
+		RateLimitPerMinute: input.RateLimitPerMinute,
+		ConcurrentLimit:    input.ConcurrentLimit,
+		ExpiresAt:          input.ExpiresAt,
+		ReadOnly:           input.ReadOnly,
+		CreatedByID:        input.CreatedByID,
 	}
 	if err := s.dbForContext(ctx).Create(principal).Error; err != nil {
 		return nil, fmt.Errorf("create service principal: %w", err)
@@ -1075,11 +1088,110 @@ func (s *AgentNativeService) AcquireAgentExecution(ctx context.Context, principa
 	if !s.executionGuardReady() {
 		return nil, ErrExecutionGuardUnavailable
 	}
+	return s.acquireAgentExecutionSubject(
+		ctx,
+		principalID,
+		principal.RateLimitPerMinute,
+		principal.ConcurrentLimit,
+		s.executionLeaseTTL,
+	)
+}
+
+// AcquireAgentStream reserves distributed, concurrency-only capacity for a
+// long-lived machine-protocol stream. Global, service-principal and credential
+// limits share the same Redis execution guard as Agent commands, but use
+// isolated subject keys so an open SSE connection does not consume the
+// command execution slot used by its asynchronous backend work.
+func (s *AgentNativeService) AcquireAgentStream(
+	ctx context.Context,
+	streamType string,
+	principalID string,
+	credentialID string,
+	globalLimit int,
+) (func(), error) {
+	streamType = strings.TrimSpace(streamType)
+	principalID = strings.TrimSpace(principalID)
+	credentialID = strings.TrimSpace(credentialID)
+	if streamType == "" || principalID == "" || credentialID == "" || globalLimit <= 0 {
+		return nil, ErrInvalidCredential
+	}
+	if err := s.ValidateCredentialReference(ctx, principalID, credentialID); err != nil {
+		return nil, err
+	}
+	principal, err := s.getUsablePrincipal(ctx, principalID)
+	if err != nil {
+		return nil, err
+	}
+	if s.globalEmergencyStop.Load() {
+		return nil, ErrGlobalEmergencyStop
+	}
+	if !s.executionGuardReady() {
+		return nil, ErrExecutionGuardUnavailable
+	}
+
+	ttl := s.executionLeaseTTL
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining < time.Second {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, context.DeadlineExceeded
+		}
+		// OAuth middleware cancels the stream at token expiry. Keep the Redis
+		// lease marginally longer so it never expires while the socket remains
+		// admitted.
+		ttl = remaining + time.Second
+	}
+
+	type streamDimension struct {
+		subject string
+		limit   int
+	}
+	dimensions := []streamDimension{
+		{subject: "stream:" + streamType + ":global", limit: globalLimit},
+		{subject: "stream:" + streamType + ":principal:" + principalID, limit: principal.ConcurrentLimit},
+		{subject: "stream:" + streamType + ":credential:" + principalID + ":" + credentialID, limit: principal.ConcurrentLimit},
+	}
+	releases := make([]func(), 0, len(dimensions))
+	releaseAll := func() {
+		for index := len(releases) - 1; index >= 0; index-- {
+			releases[index]()
+		}
+	}
+	for _, dimension := range dimensions {
+		release, acquireErr := s.acquireAgentExecutionSubject(
+			ctx,
+			dimension.subject,
+			0,
+			dimension.limit,
+			ttl,
+		)
+		if acquireErr != nil {
+			releaseAll()
+			return nil, acquireErr
+		}
+		releases = append(releases, release)
+	}
+
+	var once sync.Once
+	return func() {
+		once.Do(releaseAll)
+	}, nil
+}
+
+func (s *AgentNativeService) acquireAgentExecutionSubject(
+	ctx context.Context,
+	subjectID string,
+	rateLimit int,
+	concurrencyLimit int,
+	concurrencyTTL time.Duration,
+) (func(), error) {
 	permit, err := s.executionGuard.Acquire(ctx, AgentExecutionGuardRequest{
-		PrincipalID:       principalID,
-		RateLimit:         principal.RateLimitPerMinute,
-		ConcurrencyLimit:  principal.ConcurrentLimit,
-		ConcurrencyTTL:    s.executionLeaseTTL,
+		SubjectID:         subjectID,
+		RateLimit:         rateLimit,
+		ConcurrencyLimit:  concurrencyLimit,
+		ConcurrencyTTL:    concurrencyTTL,
 		ObservedAtForTest: s.now(),
 	})
 	if err != nil {
@@ -1619,28 +1731,23 @@ func (s *AgentNativeService) AppendDomainEventWithAdditionalTargetsTx(
 	input DomainEventInput,
 	additionalTargets []OutboxTarget,
 ) (*models.DomainEvent, error) {
-	targets := make(
-		[]OutboxTarget,
-		0,
-		len(s.defaultOutboxTargets)+len(additionalTargets),
-	)
-	targets = append(targets, s.defaultOutboxTargets...)
-	targets = append(targets, additionalTargets...)
+	targets := make([]OutboxTarget, 0, len(s.defaultOutboxTargets)+len(additionalTargets))
+	seen := make(map[string]struct{}, cap(targets))
+	appendUnique := func(target OutboxTarget) {
+		key := strings.TrimSpace(target.Type) + "\x00" + strings.TrimSpace(target.ID)
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		targets = append(targets, target)
+	}
+	for _, target := range s.defaultOutboxTargets {
+		appendUnique(target)
+	}
+	for _, target := range additionalTargets {
+		appendUnique(target)
+	}
 	return s.AppendDomainEventTx(ctx, tx, input, targets)
-}
-
-func (s *AgentNativeService) CreateDomainEvent(
-	ctx context.Context,
-	input DomainEventInput,
-	targets []OutboxTarget,
-) (*models.DomainEvent, error) {
-	var event *models.DomainEvent
-	err := s.InTransaction(ctx, func(txCtx context.Context, tx *gorm.DB) error {
-		var err error
-		event, err = s.AppendDomainEventTx(txCtx, tx, input, targets)
-		return err
-	})
-	return event, err
 }
 
 func (s *AgentNativeService) ClaimPendingOutbox(
@@ -1774,10 +1881,7 @@ func (s *AgentNativeService) MarkOutboxFailed(ctx context.Context, deliveryID, w
 	}
 	message := ""
 	if deliveryErr != nil {
-		message = deliveryErr.Error()
-		if len(message) > 4000 {
-			message = message[:4000]
-		}
+		message = scrubOutboxFailure(deliveryErr)
 	}
 	now := s.now()
 	result := s.db.WithContext(ctx).Model(&models.OutboxDelivery{}).
@@ -1868,53 +1972,94 @@ func (s *AgentNativeService) ProcessOutboxBatch(
 	if deliverer == nil {
 		return result, fmt.Errorf("outbox deliverer is required")
 	}
-	deliveries, err := s.ClaimPendingOutbox(ctx, workerID, limit, 2*time.Minute)
+	deliveries, err := s.ClaimPendingOutbox(
+		ctx,
+		workerID,
+		limit,
+		s.outboxLockTTL,
+	)
 	if err != nil {
 		return result, err
 	}
 	result.Claimed = len(deliveries)
+	if len(deliveries) == 0 {
+		return result, nil
+	}
+
 	var batchErrors []error
 	type deliveryAttempt struct {
 		delivery *models.OutboxDelivery
 		err      error
 	}
+	type deliveryJob struct {
+		delivery *models.OutboxDelivery
+		deadline time.Time
+	}
+
+	workerCount := cap(s.outboxDeliverySlots)
+	if workerCount > len(deliveries) {
+		workerCount = len(deliveries)
+	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	jobs := make(chan deliveryJob, len(deliveries))
 	attempts := make(chan deliveryAttempt, len(deliveries))
 	for _, delivery := range deliveries {
-		delivery := delivery
+		jobs <- deliveryJob{
+			delivery: delivery,
+			// Every claimed delivery receives the same full bounded window.
+			// A non-cooperative black-hole attempt therefore cannot make queued
+			// work extend the batch by another timeout per item.
+			deadline: time.Now().Add(s.outboxDeliveryTimeout),
+		}
+	}
+	close(jobs)
+
+	for range workerCount {
 		go func() {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				attempts <- deliveryAttempt{delivery: delivery, err: ctxErr}
-				return
-			}
-			if delivery.Event == nil {
+			for job := range jobs {
 				attempts <- deliveryAttempt{
-					delivery: delivery,
-					err:      fmt.Errorf("domain event %s is missing", delivery.EventID),
+					delivery: job.delivery,
+					err: s.performOutboxDeliveryAttempt(
+						ctx,
+						job.deadline,
+						deliverer,
+						job.delivery,
+					),
 				}
-				return
-			}
-			attempts <- deliveryAttempt{
-				delivery: delivery,
-				err:      deliverer.Deliver(ctx, delivery, CloudEventFromModel(delivery.Event)),
 			}
 		}()
 	}
+
 	for range deliveries {
 		attempt := <-attempts
+		finalizeCtx, cancelFinalize := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			5*time.Second,
+		)
 		if attempt.err == nil {
-			if markErr := s.MarkOutboxDelivered(ctx, attempt.delivery.ID, workerID); markErr != nil {
+			markErr := s.MarkOutboxDelivered(
+				finalizeCtx,
+				attempt.delivery.ID,
+				workerID,
+			)
+			cancelFinalize()
+			if markErr != nil {
 				batchErrors = append(batchErrors, markErr)
 				continue
 			}
 			result.Delivered++
 			continue
 		}
-		if markErr := s.MarkOutboxFailed(
-			ctx,
+		markErr := s.MarkOutboxFailed(
+			finalizeCtx,
 			attempt.delivery.ID,
 			workerID,
 			attempt.err,
-		); markErr != nil {
+		)
+		cancelFinalize()
+		if markErr != nil {
 			batchErrors = append(batchErrors, markErr)
 			continue
 		}
@@ -1926,27 +2071,55 @@ func (s *AgentNativeService) ProcessOutboxBatch(
 	return result, errors.Join(batchErrors...)
 }
 
-func (s *AgentNativeService) RunOutboxWorker(
-	ctx context.Context,
-	workerID string,
-	interval time.Duration,
-	limit int,
+func (s *AgentNativeService) performOutboxDeliveryAttempt(
+	parent context.Context,
+	deadline time.Time,
 	deliverer OutboxDeliverer,
+	delivery *models.OutboxDelivery,
 ) error {
-	if interval <= 0 {
-		interval = time.Second
+	if delivery == nil {
+		return errors.New("outbox delivery is missing")
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		if _, err := s.ProcessOutboxBatch(ctx, workerID, limit, deliverer); err != nil && !errors.Is(err, context.Canceled) {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
+	if delivery.Event == nil {
+		return fmt.Errorf("domain event %s is missing", delivery.EventID)
+	}
+	attemptCtx, cancel := context.WithDeadline(parent, deadline)
+	defer cancel()
+	if err := attemptCtx.Err(); err != nil {
+		return err
+	}
+
+	select {
+	case s.outboxDeliverySlots <- struct{}{}:
+	case <-attemptCtx.Done():
+		return fmt.Errorf("outbox delivery slot unavailable: %w", attemptCtx.Err())
+	}
+
+	outcome := make(chan error, 1)
+	go func() {
+		defer func() {
+			<-s.outboxDeliverySlots
+			if recover() != nil {
+				// Panic payloads can contain sensitive adapter state and must
+				// not be persisted in Outbox error details.
+				outcome <- errors.New("outbox deliverer panicked")
+			}
+		}()
+		outcome <- deliverer.Deliver(
+			attemptCtx,
+			delivery,
+			CloudEventFromModel(delivery.Event),
+		)
+	}()
+
+	select {
+	case err := <-outcome:
+		return err
+	case <-attemptCtx.Done():
+		// The downstream outcome is unknown near a timeout. SMTP/webhook
+		// protocols do not provide exactly-once semantics; the bounded slot is
+		// released only if the adapter eventually returns.
+		return fmt.Errorf("outbox delivery attempt timed out: %w", attemptCtx.Err())
 	}
 }
 
@@ -1958,16 +2131,6 @@ func (s *AgentNativeService) normalizeLeaseTTL(ttl time.Duration) (time.Duration
 		return 0, fmt.Errorf("lease ttl must be between 10s and %s", s.maxLeaseTTL)
 	}
 	return ttl, nil
-}
-
-func (s *AgentNativeService) ClaimTicketLease(
-	ctx context.Context,
-	ticketID uint,
-	actor models.ActorRef,
-	expectedVersion uint64,
-	ttl time.Duration,
-) (*models.TicketLease, error) {
-	return s.claimTicketLeaseOnDB(ctx, s.db, ticketID, actor, expectedVersion, ttl)
 }
 
 func (s *AgentNativeService) claimTicketLeaseOnDB(
@@ -2095,16 +2258,6 @@ func (s *AgentNativeService) claimTicketLeaseOnDB(
 	return claimed, nil
 }
 
-func (s *AgentNativeService) HeartbeatTicketLease(
-	ctx context.Context,
-	leaseID string,
-	actor models.ActorRef,
-	expectedVersion uint64,
-	ttl time.Duration,
-) (*models.TicketLease, error) {
-	return s.heartbeatTicketLeaseOnDB(ctx, s.db, leaseID, actor, expectedVersion, ttl)
-}
-
 func (s *AgentNativeService) heartbeatTicketLeaseOnDB(
 	ctx context.Context,
 	db *gorm.DB,
@@ -2160,15 +2313,6 @@ func (s *AgentNativeService) heartbeatTicketLeaseOnDB(
 		return nil, err
 	}
 	return &lease, nil
-}
-
-func (s *AgentNativeService) ReleaseTicketLease(
-	ctx context.Context,
-	leaseID string,
-	actor models.ActorRef,
-	reason string,
-) error {
-	return s.releaseTicketLeaseOnDB(ctx, s.db, leaseID, actor, reason)
 }
 
 func (s *AgentNativeService) releaseTicketLeaseOnDB(
@@ -2301,7 +2445,7 @@ func (s *AgentNativeService) ClaimTicketLeaseCommand(
 		if claimErr != nil {
 			return claimErr
 		}
-		event, claimErr = s.AppendDomainEventTx(ctx, tx, DomainEventInput{
+		event, claimErr = s.AppendDomainEventWithAdditionalTargetsTx(ctx, tx, DomainEventInput{
 			Type:            "io.chronodesk.ticket.lease.claimed.v1",
 			Subject:         fmt.Sprintf("ticket/%d", lease.TicketID),
 			Actor:           input.Actor,
@@ -2386,7 +2530,7 @@ func (s *AgentNativeService) HeartbeatTicketLeaseCommand(
 		if heartbeatErr != nil {
 			return heartbeatErr
 		}
-		event, heartbeatErr = s.AppendDomainEventTx(ctx, tx, DomainEventInput{
+		event, heartbeatErr = s.AppendDomainEventWithAdditionalTargetsTx(ctx, tx, DomainEventInput{
 			Type:            "io.chronodesk.ticket.lease.heartbeat.v1",
 			Subject:         fmt.Sprintf("ticket/%d", lease.TicketID),
 			Actor:           input.Actor,
@@ -2469,7 +2613,7 @@ func (s *AgentNativeService) ReleaseTicketLeaseCommand(
 		lease.ReleasedAt = &now
 		lease.ReleaseReason = truncateText(input.Reason, 255)
 		var appendErr error
-		event, appendErr = s.AppendDomainEventTx(ctx, tx, DomainEventInput{
+		event, appendErr = s.AppendDomainEventWithAdditionalTargetsTx(ctx, tx, DomainEventInput{
 			Type:            "io.chronodesk.ticket.lease.released.v1",
 			Subject:         fmt.Sprintf("ticket/%d", lease.TicketID),
 			Actor:           input.Actor,
@@ -2582,22 +2726,6 @@ func leaseSnapshot(lease *models.TicketLease) map[string]any {
 	}
 }
 
-func (s *AgentNativeService) ValidateTicketLease(
-	ctx context.Context,
-	leaseID string,
-	ticketID uint,
-	actor models.ActorRef,
-	expectedVersion uint64,
-) (*models.TicketLease, error) {
-	var lease *models.TicketLease
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var err error
-		lease, err = s.validateTicketLeaseTx(tx.WithContext(ctx), leaseID, ticketID, actor, expectedVersion)
-		return err
-	})
-	return lease, err
-}
-
 func (s *AgentNativeService) validateTicketLeaseTx(
 	tx *gorm.DB,
 	leaseID string,
@@ -2633,11 +2761,43 @@ type OperationReceipt struct {
 	PolicyDecisionID string   `json:"policy_decision_id,omitempty"`
 }
 
+func linkTicketHistoryToDomainEvent(
+	history *models.TicketHistory,
+	event *models.DomainEvent,
+) error {
+	if history == nil || event == nil || event.ID == "" || event.ResourceVersion == 0 {
+		return fmt.Errorf("ticket history requires a persisted domain event")
+	}
+	expectedSubject := fmt.Sprintf("ticket/%d", history.TicketID)
+	if event.Subject != expectedSubject {
+		return fmt.Errorf(
+			"ticket history event subject mismatch: expected %q, got %q",
+			expectedSubject,
+			event.Subject,
+		)
+	}
+	actor := history.Actor()
+	if event.ActorType != actor.Type || event.ActorID != actor.ID {
+		return fmt.Errorf(
+			"ticket history event actor mismatch: expected %s/%s, got %s/%s",
+			actor.Type,
+			actor.ID,
+			event.ActorType,
+			event.ActorID,
+		)
+	}
+	eventID := event.ID
+	history.EventID = &eventID
+	history.ResourceVersion = event.ResourceVersion
+	history.Provenance = models.TicketHistoryProvenanceDomainEvent
+	return nil
+}
+
 type NativeTicketCreateInput struct {
 	Request             models.TicketCreateRequest
+	TicketNumber        string
 	Actor               models.ActorRef
 	AssignedActor       *models.ActorRef
-	CompatibilityUserID uint
 	CredentialID        string
 	PolicyDecisionID    string
 	SourceProtocol      string
@@ -2655,8 +2815,8 @@ type NativeTicketCreateResult struct {
 	Receipt OperationReceipt    `json:"receipt"`
 }
 
-// CreateNativeTicket is the transaction-safe ticket entry point used by
-// machine protocols. The legacy TicketService remains available to old routes.
+// CreateNativeTicket is the transaction-safe Ticket intake command shared by
+// human and machine protocol Adapters.
 func (s *AgentNativeService) CreateNativeTicket(
 	ctx context.Context,
 	input NativeTicketCreateInput,
@@ -2687,14 +2847,24 @@ func (s *AgentNativeService) CreateNativeTicket(
 	} else if !validTrustLevel(input.TrustLevel) {
 		return nil, fmt.Errorf("invalid ticket trust level %q", input.TrustLevel)
 	}
-	if input.AssignedActor != nil {
-		if err := input.AssignedActor.Validate(); err != nil {
-			return nil, fmt.Errorf("%w: invalid assigned actor: %v", ErrInvalidActor, err)
-		}
+	assignedActor := input.AssignedActor
+	if assignedActor == nil && input.Request.AssignedToID != nil {
+		human := models.HumanActor(*input.Request.AssignedToID)
+		assignedActor = &human
+	}
+	if assignedActor != nil &&
+		input.Request.AssignedToID != nil &&
+		(assignedActor.Type != models.ActorTypeHuman ||
+			assignedActor.ID != models.HumanActor(*input.Request.AssignedToID).ID) {
+		return nil, fmt.Errorf("%w: assigned actor conflicts with assigned_to_id", ErrInvalidAssignee)
+	}
+	assignmentChanges, err := s.ResolveTicketAssignmentChanges(ctx, assignedActor)
+	if err != nil {
+		return nil, err
 	}
 	if input.Actor.Type == models.ActorTypeServicePrincipal {
 		if status != models.TicketStatusOpen ||
-			input.AssignedActor != nil ||
+			assignedActor != nil ||
 			input.Request.AssignedToID != nil {
 			return nil, fmt.Errorf(
 				"%w: Agent intake cannot assign or transition a ticket; use a separately authorized command",
@@ -2748,12 +2918,17 @@ func (s *AgentNativeService) CreateNativeTicket(
 	if err != nil {
 		return nil, err
 	}
-	legacyUserID, err := s.compatibilityUserID(ctx, input.Actor, input.CompatibilityUserID)
+	humanUserID, err := s.humanUserProjection(ctx, input.Actor)
 	if err != nil {
 		return nil, err
 	}
+	now := s.now()
+	ticketNumber := strings.TrimSpace(input.TicketNumber)
+	if ticketNumber == "" {
+		ticketNumber = newAgentTicketNumber(now)
+	}
 	ticket := &models.Ticket{
-		TicketNumber:       newAgentTicketNumber(s.now()),
+		TicketNumber:       ticketNumber,
 		Title:              strings.TrimSpace(input.Request.Title),
 		Description:        input.Request.Description,
 		Type:               input.Request.Type,
@@ -2762,10 +2937,9 @@ func (s *AgentNativeService) CreateNativeTicket(
 		Source:             input.Request.Source,
 		Version:            1,
 		TrustLevel:         input.TrustLevel,
-		CreatedByID:        legacyUserID,
+		CreatedByID:        humanUserID,
 		CreatedByActorType: input.Actor.Type,
 		CreatedByActorID:   input.Actor.ID,
-		AssignedToID:       input.Request.AssignedToID,
 		CategoryID:         input.Request.CategoryID,
 		SubcategoryID:      input.Request.SubcategoryID,
 		Tags:               datatypes.JSONSlice[string](input.Request.Tags),
@@ -2773,7 +2947,6 @@ func (s *AgentNativeService) CreateNativeTicket(
 		CustomerEmail:      input.Request.CustomerEmail,
 		CustomerPhone:      input.Request.CustomerPhone,
 		CustomerName:       input.Request.CustomerName,
-		Attachments:        datatypes.JSONSlice[string](input.Request.Attachments),
 	}
 	if input.Request.CustomFields != nil {
 		ticket.CustomFields = datatypes.NewJSONType(input.Request.CustomFields.ToMap())
@@ -2781,18 +2954,29 @@ func (s *AgentNativeService) CreateNativeTicket(
 	if input.Request.AgentContext != nil {
 		ticket.AgentContext = datatypes.NewJSONType(*input.Request.AgentContext)
 	}
-	setTicketActorFields(ticket, input.Actor, input.AssignedActor)
+	setTicketActorFields(ticket, input.Actor, nil)
+	applyAssignmentChangesToTicket(ticket, assignmentChanges)
+	applyTicketStatusTimestamps(ticket, status, now)
 
 	var event *models.DomainEvent
 	result := &NativeTicketCreateResult{Ticket: ticket}
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if ticket.CategoryID != nil {
+			var category models.Category
+			if err := tx.Select("id", "sla_hours").First(&category, *ticket.CategoryID).Error; err != nil {
+				return fmt.Errorf("load ticket category: %w", err)
+			}
+			if category.SLAHours != nil && *category.SLAHours > 0 {
+				slaDueDate := now.Add(time.Duration(*category.SLAHours) * time.Hour)
+				ticket.SLADueDate = &slaDueDate
+			}
+		}
 		if err := tx.Create(ticket).Error; err != nil {
 			return fmt.Errorf("create native ticket: %w", err)
 		}
-		userID := legacyUserID
 		history := &models.TicketHistory{
 			TicketID:           ticket.ID,
-			UserID:             &userID,
+			UserID:             humanUserID,
 			ActorType:          input.Actor.Type,
 			ActorID:            input.Actor.ID,
 			Action:             models.HistoryActionCreate,
@@ -2804,12 +2988,9 @@ func (s *AgentNativeService) CreateNativeTicket(
 			ServicePrincipalID: actorServicePrincipalID(input.Actor),
 			Metadata:           policyMetadata(policyDecisionID),
 		}
-		if err := tx.Create(history).Error; err != nil {
-			return fmt.Errorf("create ticket history: %w", err)
-		}
 		var appendErr error
-		event, appendErr = s.AppendDomainEventTx(ctx, tx, DomainEventInput{
-			Type:                       "io.chronodesk.ticket.created.v1",
+		event, appendErr = s.AppendDomainEventWithAdditionalTargetsTx(ctx, tx, DomainEventInput{
+			Type:                       eventcontract.TicketCreatedEventType,
 			Subject:                    fmt.Sprintf("ticket/%d", ticket.ID),
 			Actor:                      input.Actor,
 			ResourceVersion:            ticket.Version,
@@ -2829,6 +3010,12 @@ func (s *AgentNativeService) CreateNativeTicket(
 		}, input.OutboxTargets)
 		if appendErr != nil {
 			return appendErr
+		}
+		if err := linkTicketHistoryToDomainEvent(history, event); err != nil {
+			return err
+		}
+		if err := tx.Create(history).Error; err != nil {
+			return fmt.Errorf("create ticket history: %w", err)
 		}
 		result.Receipt = OperationReceipt{
 			OperationID:      newNativeID(),
@@ -2873,7 +3060,6 @@ type VersionedTicketUpdateInput struct {
 	ExpectedVersion          uint64
 	LeaseID                  string
 	Actor                    models.ActorRef
-	CompatibilityUserID      uint
 	CredentialID             string
 	PolicyDecisionID         string
 	RequiredScope            string
@@ -2890,6 +3076,10 @@ type VersionedTicketUpdateInput struct {
 	IdempotencyRecordID      string
 	IdempotencyCompletionTTL time.Duration
 	OutboxTargets            []OutboxTarget
+
+	assignmentResolved            bool
+	authorizationContractOverride bool
+	historyRecords                []ticketHistorySpec
 }
 
 type VersionedTicketUpdateResult struct {
@@ -2922,6 +3112,14 @@ func (s *AgentNativeService) UpdateTicketVersion(
 			ErrCommandScopeMismatch,
 		)
 	}
+	if input.Actor.Type == models.ActorTypeServicePrincipal &&
+		assignmentFieldsPresent(fields) &&
+		!input.assignmentResolved {
+		return nil, fmt.Errorf(
+			"%w: Agent assignment changes require AssignTicket or EscalateTicket",
+			ErrCommandScopeMismatch,
+		)
+	}
 	if input.Actor.Type != models.ActorTypeSystem &&
 		(fieldsContain(fields, "sla_breached") || fieldsContain(fields, "sla_due_date")) {
 		return nil, fmt.Errorf(
@@ -2934,7 +3132,8 @@ func (s *AgentNativeService) UpdateTicketVersion(
 		action        string
 		categoryRisky bool
 	)
-	if input.Actor.Type != models.ActorTypeSystem {
+	if input.Actor.Type == models.ActorTypeServicePrincipal &&
+		!input.authorizationContractOverride {
 		scope, action, categoryRisky, err = ticketChangeAuthorizationContract(
 			fields,
 			input.RequiredScope,
@@ -2944,9 +3143,10 @@ func (s *AgentNativeService) UpdateTicketVersion(
 			return nil, err
 		}
 	} else {
-		// Trusted system workflows such as an automation escalation may need to
-		// update assignment and escalation metadata atomically. Human and
-		// service-principal calls remain bound to one minimal scope category.
+		// Human commands may intentionally update several Ticket fields in one
+		// form submission. Trusted system workflows and typed multi-scope
+		// commands also arrive here only after their domain authorization has
+		// completed.
 		scope = input.RequiredScope
 		action = input.Action
 	}
@@ -2998,6 +3198,7 @@ func (s *AgentNativeService) UpdateTicketVersion(
 		if err := tx.First(&ticket, input.TicketID).Error; err != nil {
 			return err
 		}
+		beforeTicket := ticket
 		if ticket.Version != input.ExpectedVersion {
 			return fmt.Errorf("%w: expected %d, actual %d", ErrVersionConflict, input.ExpectedVersion, ticket.Version)
 		}
@@ -3006,6 +3207,11 @@ func (s *AgentNativeService) UpdateTicketVersion(
 		}
 		if input.LeaseID != "" {
 			if _, err := s.validateTicketLeaseTx(tx, input.LeaseID, input.TicketID, input.Actor, input.ExpectedVersion); err != nil {
+				return err
+			}
+		}
+		if assignmentFieldsPresent(fields) {
+			if err := validateCanonicalAssignmentChangesTx(ctx, tx, changes); err != nil {
 				return err
 			}
 		}
@@ -3039,48 +3245,73 @@ func (s *AgentNativeService) UpdateTicketVersion(
 		if err := tx.First(&ticket, input.TicketID).Error; err != nil {
 			return err
 		}
-		legacyUserID, compatibilityErr := s.compatibilityUserIDTx(tx, input.Actor, input.CompatibilityUserID)
-		if compatibilityErr != nil && input.Actor.Type != models.ActorTypeSystem {
-			return compatibilityErr
+		humanUserID, projectionErr := s.humanUserProjectionTx(tx, input.Actor)
+		if projectionErr != nil {
+			return projectionErr
 		}
 		details, _ := json.Marshal(map[string]any{
 			"changed_fields":     fields,
 			"changes":            changeSet,
 			"policy_decision_id": policyDecisionID,
 		})
-		history := &models.TicketHistory{
-			TicketID:           ticket.ID,
-			UserID:             optionalUint(legacyUserID),
-			ActorType:          input.Actor.Type,
-			ActorID:            input.Actor.ID,
-			ServicePrincipalID: actorServicePrincipalID(input.Actor),
-			Action:             historyActionForChanges(fields),
-			Description:        "工单已更新",
-			Details:            string(details),
-			IsVisible:          true,
-			IsSystem:           input.Actor.Type == models.ActorTypeSystem,
-			IsAutomated:        input.Actor.Type != models.ActorTypeHuman,
-			IsImportant:        true,
-			Metadata:           policyMetadata(policyDecisionID),
-		}
-		if err := tx.Create(history).Error; err != nil {
-			return err
-		}
+		histories := ticketHistoriesForUpdate(
+			input,
+			&beforeTicket,
+			&ticket,
+			fields,
+			string(details),
+			humanUserID,
+			policyDecisionID,
+		)
 		eventType := input.EventType
 		if eventType == "" {
-			eventType = "io.chronodesk.ticket.updated.v1"
+			eventType = eventcontract.TicketUpdatedEventType
 		}
 		eventData := input.EventData
+		var eventDataMap map[string]any
 		if eventData == nil {
-			eventData = map[string]any{
+			eventDataMap = map[string]any{
 				"ticket_id":      ticket.ID,
 				"changed_fields": fields,
 				"status":         ticket.Status,
 				"priority":       ticket.Priority,
 			}
+			eventData = eventDataMap
 		}
+		notificationTargets := ticketUpdateNotificationTargets(
+			&beforeTicket,
+			&ticket,
+			input.Actor,
+			fields,
+		)
+		if len(notificationTargets) > 0 {
+			if eventDataMap == nil {
+				var normalizeErr error
+				eventDataMap, normalizeErr = normalizeTicketEventDataObject(eventData)
+				if normalizeErr != nil {
+					return normalizeErr
+				}
+			}
+			eventDataMap["ticket_id"] = ticket.ID
+			addTicketNotificationEventSnapshot(eventDataMap, &ticket)
+			if beforeTicket.Status != ticket.Status {
+				eventDataMap["old_status"] = beforeTicket.Status
+				eventDataMap["new_status"] = ticket.Status
+			}
+			if ticket.AssignedToID != nil {
+				eventDataMap["assigned_to_id"] = *ticket.AssignedToID
+			}
+			eventData = eventDataMap
+		}
+		additionalTargets := make(
+			[]OutboxTarget,
+			0,
+			len(input.OutboxTargets)+len(notificationTargets),
+		)
+		additionalTargets = append(additionalTargets, input.OutboxTargets...)
+		additionalTargets = append(additionalTargets, notificationTargets...)
 		var appendErr error
-		event, appendErr = s.AppendDomainEventTx(ctx, tx, DomainEventInput{
+		event, appendErr = s.AppendDomainEventWithAdditionalTargetsTx(ctx, tx, DomainEventInput{
 			Type:                       eventType,
 			Subject:                    fmt.Sprintf("ticket/%d", ticket.ID),
 			Actor:                      input.Actor,
@@ -3090,9 +3321,17 @@ func (s *AgentNativeService) UpdateTicketVersion(
 			CorrelationID:              input.CorrelationID,
 			CausationID:                input.CausationID,
 			Data:                       eventData,
-		}, input.OutboxTargets)
+		}, additionalTargets)
 		if appendErr != nil {
 			return appendErr
+		}
+		for _, history := range histories {
+			if err := linkTicketHistoryToDomainEvent(history, event); err != nil {
+				return err
+			}
+			if err := tx.Create(history).Error; err != nil {
+				return err
+			}
 		}
 		if input.LeaseID != "" {
 			if err := tx.Model(&models.TicketLease{}).
@@ -3148,7 +3387,6 @@ type NativeCommentInput struct {
 	ExpectedVersion          uint64
 	LeaseID                  string
 	Actor                    models.ActorRef
-	CompatibilityUserID      uint
 	CredentialID             string
 	PolicyDecisionID         string
 	SourceProtocol           string
@@ -3157,7 +3395,6 @@ type NativeCommentInput struct {
 	ContentType              string
 	Type                     models.CommentType
 	ParentID                 *uint
-	AttachmentIDs            []string
 	TimeSpent                *int
 	BillableTime             *int
 	WorkType                 string
@@ -3192,16 +3429,20 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 	if input.Content == "" ||
 		utf8.RuneCountInString(input.Content) > maxNativeCommentRunes ||
 		len(input.Content) > maxNativeCommentBytes {
-		return nil, fmt.Errorf("comment content must be between 1 and %d characters", maxNativeCommentRunes)
+		return nil, fmt.Errorf(
+			"%w: content must be between 1 and %d characters",
+			ErrInvalidComment,
+			maxNativeCommentRunes,
+		)
 	}
 	if input.ContentType == "" {
 		input.ContentType = "text"
 	}
 	if input.ContentType != "text" && input.ContentType != "markdown" {
-		return nil, fmt.Errorf("native comments support text or markdown only")
+		return nil, fmt.Errorf("%w: content type must be text or markdown", ErrInvalidComment)
 	}
 	if input.Type != models.CommentTypePublic && input.Type != models.CommentTypeInternal && input.Type != models.CommentTypeSystem {
-		return nil, fmt.Errorf("invalid comment type %q", input.Type)
+		return nil, fmt.Errorf("%w: unsupported comment type", ErrInvalidComment)
 	}
 	if input.Type == models.CommentTypeSystem && input.Actor.Type != models.ActorTypeSystem {
 		return nil, fmt.Errorf("%w: only system actors can create system comments", ErrPolicyDenied)
@@ -3248,11 +3489,10 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 	if err != nil {
 		return nil, err
 	}
-	legacyUserID, err := s.compatibilityUserID(ctx, input.Actor, input.CompatibilityUserID)
+	humanUserID, err := s.humanUserProjection(ctx, input.Actor)
 	if err != nil {
 		return nil, err
 	}
-	attachments, _ := json.Marshal(input.AttachmentIDs)
 	metadata, _ := json.Marshal(map[string]any{
 		"reason":             truncateText(input.Reason, 1000),
 		"evidence_refs":      input.EvidenceRefs,
@@ -3262,7 +3502,7 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 	})
 	comment := &models.TicketComment{
 		TicketID:           input.TicketID,
-		UserID:             legacyUserID,
+		UserID:             humanUserID,
 		ActorType:          input.Actor.Type,
 		ActorID:            input.Actor.ID,
 		ServicePrincipalID: actorServicePrincipalID(input.Actor),
@@ -3270,7 +3510,6 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 		ContentType:        input.ContentType,
 		Type:               input.Type,
 		ParentID:           input.ParentID,
-		Attachments:        string(attachments),
 		Metadata:           string(metadata),
 		TimeSpent:          input.TimeSpent,
 		BillableTime:       input.BillableTime,
@@ -3300,7 +3539,7 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 				return err
 			}
 			if count != 1 {
-				return fmt.Errorf("parent comment not found")
+				return fmt.Errorf("%w: parent comment not found", ErrInvalidComment)
 			}
 		}
 		if err := tx.Create(comment).Error; err != nil {
@@ -3314,7 +3553,7 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 				return result.Error
 			}
 			if result.RowsAffected != 1 {
-				return fmt.Errorf("parent comment not found")
+				return fmt.Errorf("%w: parent comment not found", ErrInvalidComment)
 			}
 		}
 		resourceVersion = input.ExpectedVersion + 1
@@ -3337,7 +3576,7 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 		}
 		history := &models.TicketHistory{
 			TicketID:           input.TicketID,
-			UserID:             optionalUint(legacyUserID),
+			UserID:             humanUserID,
 			ActorType:          input.Actor.Type,
 			ActorID:            input.Actor.ID,
 			ServicePrincipalID: actorServicePrincipalID(input.Actor),
@@ -3348,14 +3587,6 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 			IsSystem:           input.Actor.Type == models.ActorTypeSystem,
 			IsAutomated:        input.Actor.Type != models.ActorTypeHuman,
 			Metadata:           policyMetadata(policyDecisionID),
-		}
-		if err := tx.Create(history).Error; err != nil {
-			return err
-		}
-		if input.Type != models.CommentTypePublic {
-			if err := tx.Model(history).UpdateColumn("is_visible", false).Error; err != nil {
-				return err
-			}
 		}
 		var appendErr error
 		eventData := map[string]any{
@@ -3370,8 +3601,8 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 		if input.AutomationActionIndex != nil {
 			eventData["automation_action_index"] = *input.AutomationActionIndex
 		}
-		event, appendErr = s.AppendDomainEventTx(ctx, tx, DomainEventInput{
-			Type:                       "io.chronodesk.ticket.comment.created.v1",
+		event, appendErr = s.AppendDomainEventWithAdditionalTargetsTx(ctx, tx, DomainEventInput{
+			Type:                       eventcontract.TicketCommentCreatedEventType,
 			Subject:                    fmt.Sprintf("ticket/%d", input.TicketID),
 			Actor:                      input.Actor,
 			ResourceVersion:            resourceVersion,
@@ -3383,6 +3614,17 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 		}, input.OutboxTargets)
 		if appendErr != nil {
 			return appendErr
+		}
+		if err := linkTicketHistoryToDomainEvent(history, event); err != nil {
+			return err
+		}
+		if err := tx.Create(history).Error; err != nil {
+			return err
+		}
+		if input.Type != models.CommentTypePublic {
+			if err := tx.Model(history).UpdateColumn("is_visible", false).Error; err != nil {
+				return err
+			}
 		}
 		if input.LeaseID != "" {
 			if err := tx.Model(&models.TicketLease{}).
@@ -3599,7 +3841,6 @@ type NativeAttachmentInput struct {
 	ExpectedVersion     uint64
 	LeaseID             string
 	Actor               models.ActorRef
-	CompatibilityUserID uint
 	CredentialID        string
 	PolicyDecisionID    string
 	SourceProtocol      string
@@ -3681,7 +3922,7 @@ func (s *AgentNativeService) StoreAttachment(
 	if err != nil {
 		return nil, err
 	}
-	legacyUserID, err := s.compatibilityUserID(ctx, input.Actor, input.CompatibilityUserID)
+	humanUserID, err := s.humanUserProjection(ctx, input.Actor)
 	if err != nil {
 		return nil, err
 	}
@@ -3697,6 +3938,9 @@ func (s *AgentNativeService) StoreAttachment(
 			_ = s.attachmentStorage.Delete(context.Background(), stored.Key)
 		}
 	}()
+	if stored.Size == 0 {
+		return nil, ErrInvalidAttachment
+	}
 	contentType := strings.TrimSpace(input.ContentType)
 	if contentType == "" || contentType == "application/octet-stream" {
 		contentType = stored.DetectedContentType
@@ -3713,7 +3957,7 @@ func (s *AgentNativeService) StoreAttachment(
 	attachment := &models.TicketAttachment{
 		TicketID:           input.TicketID,
 		CommentID:          input.CommentID,
-		UploadedBy:         legacyUserID,
+		UploadedBy:         humanUserID,
 		ActorType:          input.Actor.Type,
 		ActorID:            input.Actor.ID,
 		ServicePrincipalID: actorServicePrincipalID(input.Actor),
@@ -3772,7 +4016,7 @@ func (s *AgentNativeService) StoreAttachment(
 		}
 		history := &models.TicketHistory{
 			TicketID:           input.TicketID,
-			UserID:             optionalUint(legacyUserID),
+			UserID:             humanUserID,
 			ActorType:          input.Actor.Type,
 			ActorID:            input.Actor.ID,
 			ServicePrincipalID: actorServicePrincipalID(input.Actor),
@@ -3784,17 +4028,9 @@ func (s *AgentNativeService) StoreAttachment(
 			IsAutomated:        input.Actor.Type != models.ActorTypeHuman,
 			Metadata:           policyMetadata(policyDecisionID),
 		}
-		if err := tx.Create(history).Error; err != nil {
-			return err
-		}
-		if !input.IsPublic {
-			if err := tx.Model(history).UpdateColumn("is_visible", false).Error; err != nil {
-				return err
-			}
-		}
 		var appendErr error
-		event, appendErr = s.AppendDomainEventTx(ctx, tx, DomainEventInput{
-			Type:                       "io.chronodesk.ticket.attachment.created.v1",
+		event, appendErr = s.AppendDomainEventWithAdditionalTargetsTx(ctx, tx, DomainEventInput{
+			Type:                       eventcontract.TicketAttachmentCreatedEventType,
 			Subject:                    fmt.Sprintf("ticket/%d", input.TicketID),
 			Actor:                      input.Actor,
 			ResourceVersion:            resourceVersion,
@@ -3813,6 +4049,17 @@ func (s *AgentNativeService) StoreAttachment(
 		}, input.OutboxTargets)
 		if appendErr != nil {
 			return appendErr
+		}
+		if err := linkTicketHistoryToDomainEvent(history, event); err != nil {
+			return err
+		}
+		if err := tx.Create(history).Error; err != nil {
+			return err
+		}
+		if !input.IsPublic {
+			if err := tx.Model(history).UpdateColumn("is_visible", false).Error; err != nil {
+				return err
+			}
 		}
 		if input.LeaseID != "" {
 			if err := tx.Model(&models.TicketLease{}).
@@ -3867,21 +4114,6 @@ func (s *AgentNativeService) OpenAttachment(
 	ctx context.Context,
 	attachmentID uint,
 ) (*models.TicketAttachment, io.ReadCloser, error) {
-	return s.openAttachment(ctx, attachmentID, true)
-}
-
-func (s *AgentNativeService) OpenAttachmentForScan(
-	ctx context.Context,
-	attachmentID uint,
-) (*models.TicketAttachment, io.ReadCloser, error) {
-	return s.openAttachment(ctx, attachmentID, false)
-}
-
-func (s *AgentNativeService) openAttachment(
-	ctx context.Context,
-	attachmentID uint,
-	requireClean bool,
-) (*models.TicketAttachment, io.ReadCloser, error) {
 	if s.attachmentStorage == nil {
 		return nil, nil, ErrAttachmentStorageMissing
 	}
@@ -3889,8 +4121,7 @@ func (s *AgentNativeService) openAttachment(
 	if err := s.db.WithContext(ctx).First(&attachment, attachmentID).Error; err != nil {
 		return nil, nil, err
 	}
-	if attachment.VirusScan == models.VirusScanInfected ||
-		(requireClean && attachment.VirusScan != models.VirusScanClean) {
+	if attachment.VirusScan != models.VirusScanClean {
 		return nil, nil, fmt.Errorf("%w: %s", ErrAttachmentNotClean, attachment.VirusScan)
 	}
 	reader, err := s.attachmentStorage.Open(ctx, attachment.StoragePath)
@@ -3988,45 +4219,37 @@ func attachmentTypeForMIME(contentType string) models.AttachmentType {
 	}
 }
 
-func (s *AgentNativeService) compatibilityUserID(
+func (s *AgentNativeService) humanUserProjection(
 	ctx context.Context,
 	actor models.ActorRef,
-	explicit uint,
-) (uint, error) {
-	return s.compatibilityUserIDTx(s.db.WithContext(ctx), actor, explicit)
+) (*uint, error) {
+	return s.humanUserProjectionTx(s.db.WithContext(ctx), actor)
 }
 
-func (s *AgentNativeService) compatibilityUserIDTx(
+func (s *AgentNativeService) humanUserProjectionTx(
 	tx *gorm.DB,
 	actor models.ActorRef,
-	explicit uint,
-) (uint, error) {
-	if explicit > 0 {
-		return explicit, nil
-	}
+) (*uint, error) {
 	switch actor.Type {
 	case models.ActorTypeHuman:
 		parsed, err := safeconv.ParsePositiveUint(actor.ID)
 		if err != nil {
-			return 0, fmt.Errorf("%w: human actor id must be a user id", ErrInvalidActor)
+			return nil, fmt.Errorf("%w: human actor id must be a user id", ErrInvalidActor)
 		}
-		return parsed, nil
-	case models.ActorTypeServicePrincipal:
-		var principal models.ServicePrincipal
-		if err := tx.Select("id", "compatibility_user_id").First(&principal, "id = ?", actor.ID).Error; err != nil {
-			return 0, ErrPrincipalNotFound
+		var count int64
+		if err := tx.Unscoped().Model(&models.User{}).
+			Where("id = ?", parsed).
+			Count(&count).Error; err != nil {
+			return nil, fmt.Errorf("validate human actor projection: %w", err)
 		}
-		if principal.CompatibilityUserID == nil || *principal.CompatibilityUserID == 0 {
-			return 0, fmt.Errorf("service principal %s has no compatibility user", actor.ID)
+		if count != 1 {
+			return nil, fmt.Errorf("%w: human actor user %d does not exist", ErrInvalidActor, parsed)
 		}
-		return *principal.CompatibilityUserID, nil
-	case models.ActorTypeSystem:
-		if s.systemCompatibilityUserID == 0 {
-			return 0, fmt.Errorf("system compatibility user is not configured")
-		}
-		return s.systemCompatibilityUserID, nil
+		return &parsed, nil
+	case models.ActorTypeServicePrincipal, models.ActorTypeSystem:
+		return nil, nil
 	default:
-		return 0, ErrInvalidActor
+		return nil, ErrInvalidActor
 	}
 }
 
@@ -4058,13 +4281,6 @@ func policyMetadata(policyDecisionID string) string {
 	return string(encoded)
 }
 
-func optionalUint(value uint) *uint {
-	if value == 0 {
-		return nil
-	}
-	return &value
-}
-
 var allowedTicketChangeFields = map[string]struct{}{
 	"title":                            {},
 	"description":                      {},
@@ -4084,6 +4300,8 @@ var allowedTicketChangeFields = map[string]struct{}{
 	"customer_phone":                   {},
 	"customer_name":                    {},
 	"internal_notes":                   {},
+	"rating":                           {},
+	"rating_comment":                   {},
 	"custom_fields":                    {},
 	"is_escalated":                     {},
 	"sla_breached":                     {},
@@ -4242,6 +4460,19 @@ func fieldsContain(fields []string, expected string) bool {
 	return false
 }
 
+func assignmentFieldsPresent(fields []string) bool {
+	for _, field := range fields {
+		switch field {
+		case "assigned_to_id",
+			"assigned_to_actor_type",
+			"assigned_to_actor_id",
+			"assigned_to_service_principal_id":
+			return true
+		}
+	}
+	return false
+}
+
 func ticketFieldValue(ticket *models.Ticket, field string) any {
 	switch field {
 	case "title":
@@ -4280,6 +4511,10 @@ func ticketFieldValue(ticket *models.Ticket, field string) any {
 		return ticket.CustomerName
 	case "internal_notes":
 		return ticket.InternalNotes
+	case "rating":
+		return ticket.Rating
+	case "rating_comment":
+		return ticket.RatingComment
 	case "custom_fields":
 		return ticket.CustomFields.Data()
 	case "is_escalated":
@@ -4386,10 +4621,23 @@ func isUniqueConstraintError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Production enables GORM's TranslateError option, so PostgreSQL 23505 is
+	// normalized to gorm.ErrDuplicatedKey before it reaches the domain layer.
+	if errors.Is(err, gorm.ErrDuplicatedKey) {
+		return true
+	}
+	var postgresError *pgconn.PgError
+	if errors.As(err, &postgresError) {
+		return postgresError.Code == "23505" &&
+			postgresError.ConstraintName == "idx_idempotency_actor_operation_key"
+	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "unique constraint") ||
-		strings.Contains(message, "duplicate key") ||
-		strings.Contains(message, "is not unique")
+	return strings.Contains(
+		message,
+		"unique constraint failed: idempotency_records.actor_type, "+
+			"idempotency_records.actor_id, idempotency_records.operation, "+
+			"idempotency_records.key",
+	)
 }
 
 func minInt(left, right int) int {

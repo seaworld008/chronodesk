@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	appconfig "github.com/seaworld008/chronodesk/server/internal/config"
@@ -14,9 +15,8 @@ import (
 
 // AuthModule 认证模块
 type AuthModule struct {
-	AuthService *AuthService
-	Handler     *AuthHandler
-	Config      *AuthConfig
+	Handler             *AuthHandler
+	EmailOutboxConsumer *AuthEmailOutboxConsumer
 }
 
 // NewAuthModule 创建认证模块
@@ -65,25 +65,51 @@ func NewAuthModule(
 	configService := services.NewConfigService(db)
 
 	// 创建服务
-	emailConfig := &EmailConfig{
-		Host:     "localhost",
-		Port:     "587",
-		Username: "",
-		Password: "",
-		From:     "noreply@ticket-system.com",
-	}
-	emailService := NewSMTPEmailService(emailConfig)
 	otpService := NewSimpleOTPService("ChronoDesk")
-	passwordService := NewSimplePasswordService(config.PasswordMinLength, "ticket-system-salt")
-	jwtManager := NewSimpleJWTManager(
-		config.JWTSecret,
-		config.JWTRefreshSecret,
-		config.AccessTokenExpire,
-		config.RefreshTokenExpire,
-	)
+	passwordService, err := NewSimplePasswordService(PasswordServiceConfig{
+		MinLength:  config.PasswordMinLength,
+		BcryptCost: cfg.Security.BcryptCost,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("initialize password service: %w", err)
+	}
+	jwtManager, err := NewSimpleJWTManager(JWTManagerConfig{
+		AccessSecret:  cfg.JWT.Secret,
+		RefreshSecret: cfg.JWT.RefreshSecret,
+		AccessExpire:  cfg.JWT.ExpiresIn,
+		RefreshExpire: cfg.JWT.RefreshExpiresIn,
+		Issuer:        cfg.JWT.Issuer,
+		Audience:      cfg.JWT.Audience,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("initialize human JWT manager: %w", err)
+	}
 
 	// 创建邮箱配置服务
 	emailConfigService := services.NewEmailConfigServiceWithProtector(db, protector)
+	emailService, err := NewConfiguredSMTPEmailService(
+		emailConfigService,
+		cfg.App.WebURL,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("initialize authentication email sender: %w", err)
+	}
+	authEmailOutboxRepo, err := NewGormAuthEmailOutboxRepository(
+		db,
+		protector,
+		strings.TrimRight(cfg.Agent.Issuer, "/")+"/events",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("initialize authentication email Outbox: %w", err)
+	}
+	authEmailOutboxConsumer, err := NewAuthEmailOutboxConsumer(
+		db,
+		protector,
+		emailService,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("initialize authentication email consumer: %w", err)
+	}
 
 	// 创建认证服务
 	authService := NewAuthService(
@@ -94,12 +120,12 @@ func NewAuthModule(
 		loginHistoryRepo,
 		trustedDeviceRepo,
 		configService,
-		emailService,
 		emailConfigService,
 		otpService,
 		passwordService,
 		jwtManager,
 		config,
+		WithAuthEmailOutboxRepository(authEmailOutboxRepo),
 	)
 
 	// 创建处理器
@@ -110,23 +136,7 @@ func NewAuthModule(
 	)
 
 	return &AuthModule{
-		AuthService: authService,
-		Handler:     authHandler,
-		Config:      config,
+		Handler:             authHandler,
+		EmailOutboxConsumer: authEmailOutboxConsumer,
 	}, nil
-}
-
-// GetAuthService 获取认证服务
-func (m *AuthModule) GetAuthService() *AuthService {
-	return m.AuthService
-}
-
-// GetHandler 获取处理器
-func (m *AuthModule) GetHandler() *AuthHandler {
-	return m.Handler
-}
-
-// GetConfig 获取配置
-func (m *AuthModule) GetConfig() *AuthConfig {
-	return m.Config
 }

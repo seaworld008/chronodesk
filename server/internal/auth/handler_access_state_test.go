@@ -38,6 +38,8 @@ func TestRequireAuthRevalidatesCurrentUserStateAndRole(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	passwordChangedAt := time.Now().Add(time.Minute)
+	activeLock := time.Now().Add(time.Hour)
+	expiredLock := time.Now().Add(-time.Hour)
 	tests := []struct {
 		name          string
 		currentUser   *User
@@ -45,6 +47,7 @@ func TestRequireAuthRevalidatesCurrentUserStateAndRole(t *testing.T) {
 		tokenRole     UserRole
 		sessionActive bool
 		sessionError  error
+		legacyToken   UserRole
 		wantStatus    int
 		wantErrorCode string
 	}{
@@ -70,6 +73,67 @@ func TestRequireAuthRevalidatesCurrentUserStateAndRole(t *testing.T) {
 			sessionActive: true,
 			wantStatus:    http.StatusUnauthorized,
 			wantErrorCode: "account_inactive",
+		},
+		{
+			name: "suspended user access token is rejected immediately",
+			currentUser: &User{
+				ID:     42,
+				Role:   RoleAdmin,
+				Status: StatusSuspended,
+			},
+			tokenRole:     RoleAdmin,
+			sessionActive: true,
+			wantStatus:    http.StatusUnauthorized,
+			wantErrorCode: "account_inactive",
+		},
+		{
+			name: "deleted user status is rejected immediately",
+			currentUser: &User{
+				ID:     42,
+				Role:   RoleAdmin,
+				Status: StatusDeleted,
+			},
+			tokenRole:     RoleAdmin,
+			sessionActive: true,
+			wantStatus:    http.StatusUnauthorized,
+			wantErrorCode: "account_inactive",
+		},
+		{
+			name: "unknown user status fails closed",
+			currentUser: &User{
+				ID:     42,
+				Role:   RoleAdmin,
+				Status: UserStatus("unknown"),
+			},
+			tokenRole:     RoleAdmin,
+			sessionActive: true,
+			wantStatus:    http.StatusUnauthorized,
+			wantErrorCode: "invalid_token",
+		},
+		{
+			name: "future lock deadline invalidates access token",
+			currentUser: &User{
+				ID:          42,
+				Role:        RoleAdmin,
+				Status:      StatusActive,
+				LockedUntil: &activeLock,
+			},
+			tokenRole:     RoleAdmin,
+			sessionActive: true,
+			wantStatus:    http.StatusUnauthorized,
+			wantErrorCode: "account_locked",
+		},
+		{
+			name: "expired lock deadline permits access token",
+			currentUser: &User{
+				ID:          42,
+				Role:        RoleAdmin,
+				Status:      StatusActive,
+				LockedUntil: &expiredLock,
+			},
+			tokenRole:     RoleAdmin,
+			sessionActive: true,
+			wantStatus:    http.StatusOK,
 		},
 		{
 			name:          "deleted user access token is rejected immediately",
@@ -98,6 +162,42 @@ func TestRequireAuthRevalidatesCurrentUserStateAndRole(t *testing.T) {
 			sessionActive: true,
 			wantStatus:    http.StatusUnauthorized,
 			wantErrorCode: "stale_token",
+		},
+		{
+			name: "migrated customer rejects historical role token",
+			currentUser: &User{
+				ID:     42,
+				Role:   RoleCustomer,
+				Status: StatusActive,
+			},
+			legacyToken:   UserRole("user"),
+			sessionActive: true,
+			wantStatus:    http.StatusUnauthorized,
+			wantErrorCode: "stale_token",
+		},
+		{
+			name: "migrated administrator rejects historical role token",
+			currentUser: &User{
+				ID:     42,
+				Role:   RoleAdmin,
+				Status: StatusActive,
+			},
+			legacyToken:   UserRole("superuser"),
+			sessionActive: true,
+			wantStatus:    http.StatusUnauthorized,
+			wantErrorCode: "stale_token",
+		},
+		{
+			name: "unmigrated historical role fails closed",
+			currentUser: &User{
+				ID:     42,
+				Role:   UserRole("user"),
+				Status: StatusActive,
+			},
+			legacyToken:   UserRole("user"),
+			sessionActive: true,
+			wantStatus:    http.StatusUnauthorized,
+			wantErrorCode: "invalid_token",
 		},
 		{
 			name: "password change invalidates old access token",
@@ -141,8 +241,27 @@ func TestRequireAuthRevalidatesCurrentUserStateAndRole(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			jwtManager := NewSimpleJWTManager("test-access-secret", "test-refresh-secret", time.Hour, time.Hour)
-			accessToken, _, err := jwtManager.GenerateTokenPair(42, test.tokenRole, "session-test-42")
+			jwtManager := mustTestJWTManager(t, time.Hour, time.Hour)
+			var accessToken string
+			var err error
+			if test.legacyToken != "" {
+				now := time.Now()
+				accessToken, err = jwtManager.generateToken(&JWTPayload{
+					UserID:    42,
+					Role:      test.legacyToken,
+					Type:      "access",
+					SessionID: "session-test-42",
+					Iss:       jwtManager.issuer,
+					Sub:       "42",
+					Aud:       jwtManager.audience,
+					Exp:       now.Add(time.Hour).Unix(),
+					Nbf:       now.Unix(),
+					Iat:       now.Unix(),
+					Jti:       "historical-role-token",
+				}, jwtManager.accessSecret)
+			} else {
+				accessToken, _, err = jwtManager.GenerateTokenPair(42, test.tokenRole, "session-test-42")
+			}
 			if err != nil {
 				t.Fatalf("generate token: %v", err)
 			}
@@ -193,13 +312,29 @@ func TestRequireAuthRevalidatesCurrentUserStateAndRole(t *testing.T) {
 }
 
 func TestJWTManagerRejectsWrongAudienceAndSubject(t *testing.T) {
-	manager := NewSimpleJWTManager("test-access-secret", "test-refresh-secret", time.Hour, time.Hour)
+	manager := mustTestJWTManager(t, time.Hour, time.Hour)
 	now := time.Now()
 
 	tests := []struct {
 		name    string
 		payload *JWTPayload
 	}{
+		{
+			name: "wrong issuer",
+			payload: &JWTPayload{
+				UserID:    42,
+				Role:      RoleAdmin,
+				Type:      "access",
+				SessionID: "session-wrong-issuer",
+				Iss:       "https://other-issuer.example.test",
+				Sub:       "42",
+				Aud:       manager.audience,
+				Exp:       now.Add(time.Hour).Unix(),
+				Nbf:       now.Unix(),
+				Iat:       now.Unix(),
+				Jti:       "wrong-issuer",
+			},
+		},
 		{
 			name: "wrong audience",
 			payload: &JWTPayload{
@@ -225,7 +360,7 @@ func TestJWTManagerRejectsWrongAudienceAndSubject(t *testing.T) {
 				SessionID: "session-wrong-subject",
 				Iss:       manager.issuer,
 				Sub:       "7",
-				Aud:       "ticket-system-api",
+				Aud:       manager.audience,
 				Exp:       now.Add(time.Hour).Unix(),
 				Nbf:       now.Unix(),
 				Iat:       now.Unix(),

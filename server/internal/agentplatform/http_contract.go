@@ -148,22 +148,6 @@ func ParseLimit(c *gin.Context, defaultValue, maximum int) (int, error) {
 	return value, nil
 }
 
-func FormatETag(version uint64) string {
-	return fmt.Sprintf(`"v%d"`, version)
-}
-
-func ParseIfMatch(value string) (uint64, error) {
-	value = strings.TrimSpace(value)
-	if len(value) < 4 || value[0] != '"' || value[len(value)-1] != '"' || value[1] != 'v' {
-		return 0, errors.New(`If-Match must use the format "v<number>"`)
-	}
-	version, err := strconv.ParseUint(value[2:len(value)-1], 10, 64)
-	if err != nil || version == 0 {
-		return 0, errors.New(`If-Match must use the format "v<number>"`)
-	}
-	return version, nil
-}
-
 func RequireIdempotencyKey(c *gin.Context) (string, bool) {
 	value := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
 	if len(value) < 8 || len(value) > 128 {

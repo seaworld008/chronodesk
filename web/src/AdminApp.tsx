@@ -164,7 +164,7 @@ const CustomMenu: React.FC = () => {
     const canAdminister = isAdministrativeRole(permissions?.role);
 
     return (
-        <Menu>
+        <Menu aria-label="主导航">
             <Menu.DashboardItem primaryText="仪表盘" />
             <Menu.Item to="/tickets" primaryText="工单管理" leftIcon={<TicketIcon />} />
             <Menu.Item to="/notifications" primaryText="通知中心" leftIcon={<NotificationIcon />} />
@@ -208,7 +208,7 @@ const LayoutWithMenu: React.FC<LayoutProps> = (props) => (
 /**
  * ChronoDesk 工单自动化平台
  */
-export const AdminApp: React.FC = () => {
+const AdminApp: React.FC = () => {
     return (
         <Admin
             dataProvider={dataProvider}

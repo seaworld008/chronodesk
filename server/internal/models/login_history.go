@@ -26,7 +26,7 @@ type LoginHistory struct {
 
 	// 登录状态
 	LoginStatus   LoginStatus `json:"login_status" gorm:"size:20;not null;default:'success'"`
-	LoginMethod   string      `json:"login_method" gorm:"size:20;default:'password'"` // password, otp, sso
+	LoginMethod   LoginMethod `json:"login_method" gorm:"size:32;not null;default:'password';check:chk_login_histories_login_method,login_method IN ('password','password+trusted','password+otp','password+otp_required')"`
 	FailureReason string      `json:"failure_reason,omitempty" gorm:"size:255"`
 
 	// 地理位置信息（可选）
@@ -41,8 +41,8 @@ type LoginHistory struct {
 	Browser         string `json:"browser,omitempty" gorm:"size:100"`          // Chrome, Firefox, Safari, etc.
 
 	// 会话信息
-	SessionDuration *int64 `json:"session_duration,omitempty"`                                                        // 会话持续时间（秒）
-	IsActive        bool   `json:"is_active" gorm:"default:true;index:idx_login_histories_session_active,priority:3"` // 会话是否仍然活跃
+	SessionDuration *int64 `json:"session_duration,omitempty"`                                                                  // 会话持续时间（秒）
+	IsActive        bool   `json:"is_active" gorm:"not null;default:false;index:idx_login_histories_session_active,priority:3"` // 会话是否仍然活跃；只有成功签发的会话显式设为 true
 }
 
 // LoginStatus 登录状态枚举
@@ -55,6 +55,32 @@ const (
 	LoginStatusSuspended LoginStatus = "suspended" // 账户被暂停
 	LoginStatusExpired   LoginStatus = "expired"   // 会话过期
 )
+
+// LoginMethod 是当前认证流程唯一允许写入登录审计的认证方式。最长值
+// password+otp_required 为 21 字节，持久化列保留到 32 字节以允许同一
+// 命名体系内扩展，同时由数据库约束拒绝未定义值。
+type LoginMethod string
+
+const (
+	LoginMethodMaxLength                   = 32
+	LoginMethodPassword        LoginMethod = "password"
+	LoginMethodPasswordTrusted LoginMethod = "password+trusted"
+	LoginMethodPasswordOTP     LoginMethod = "password+otp"
+	LoginMethodOTPRequired     LoginMethod = "password+otp_required"
+)
+
+// IsValid 确保应用层与数据库的封闭枚举保持一致。
+func (method LoginMethod) IsValid() bool {
+	switch method {
+	case LoginMethodPassword,
+		LoginMethodPasswordTrusted,
+		LoginMethodPasswordOTP,
+		LoginMethodOTPRequired:
+		return true
+	default:
+		return false
+	}
+}
 
 // TableName 指定表名
 func (LoginHistory) TableName() string {
@@ -122,7 +148,7 @@ type LoginHistoryRequest struct {
 	EndDate     *time.Time   `json:"end_date" query:"end_date"`
 	IPAddress   string       `json:"ip_address" query:"ip_address"`
 	DeviceType  string       `json:"device_type" query:"device_type"`
-	LoginMethod string       `json:"login_method" query:"login_method"`
+	LoginMethod LoginMethod  `json:"login_method" query:"login_method"`
 	SessionID   string       `json:"session_id" query:"session_id"`
 	IsActive    *bool        `json:"is_active" query:"is_active"`
 	Page        int          `json:"page" query:"page" validate:"min=1"`
@@ -143,7 +169,7 @@ type LoginHistoryResponse struct {
 	SessionID  string     `json:"session_id"`
 
 	LoginStatus   LoginStatus `json:"login_status"`
-	LoginMethod   string      `json:"login_method"`
+	LoginMethod   LoginMethod `json:"login_method"`
 	FailureReason string      `json:"failure_reason,omitempty"`
 
 	Location         string `json:"location"`         // 格式化的位置信息

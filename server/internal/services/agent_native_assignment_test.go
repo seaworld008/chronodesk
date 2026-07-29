@@ -11,7 +11,7 @@ import (
 
 func TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "assignment")
+	user := seedActorUser(t, db, "assignment")
 	service := NewAgentNativeService(db)
 
 	active := createNativePrincipal(t, service, user.ID, "assignment-active")
@@ -35,20 +35,6 @@ func TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules(t *testing.T
 	); err != nil {
 		t.Fatalf("emergency-disable assignment principal: %v", err)
 	}
-	withoutCompatibility, err := service.CreateServicePrincipal(
-		context.Background(),
-		CreateServicePrincipalInput{Name: "assignment-no-compatibility"},
-	)
-	if err != nil {
-		t.Fatalf("create principal without compatibility user: %v", err)
-	}
-	danglingCompatibility := createNativePrincipal(t, service, user.ID, "assignment-dangling-compatibility")
-	if err := db.Model(&models.ServicePrincipal{}).
-		Where("id = ?", danglingCompatibility.ID).
-		Update("compatibility_user_id", user.ID+100000).Error; err != nil {
-		t.Fatalf("make compatibility user dangling: %v", err)
-	}
-
 	tests := []struct {
 		name     string
 		assignee models.ActorRef
@@ -87,20 +73,10 @@ func TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules(t *testing.T
 			assignee: models.ServicePrincipalActor(emergency.ID),
 			wantErr:  ErrAssigneePolicyDenied,
 		},
-		{
-			name:     "service principal without compatibility user",
-			assignee: models.ServicePrincipalActor(withoutCompatibility.ID),
-			wantErr:  ErrAssigneePolicyDenied,
-		},
-		{
-			name:     "service principal with missing compatibility user",
-			assignee: models.ServicePrincipalActor(danglingCompatibility.ID),
-			wantErr:  ErrAssigneePolicyDenied,
-		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			changes, err := service.ResolveTicketAssignmentChanges(context.Background(), test.assignee)
+			changes, err := service.ResolveTicketAssignmentChanges(context.Background(), &test.assignee)
 			if !errors.Is(err, test.wantErr) {
 				t.Fatalf("ResolveTicketAssignmentChanges() error = %v, want %v", err, test.wantErr)
 			}
@@ -111,7 +87,8 @@ func TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules(t *testing.T
 	}
 
 	t.Run("human", func(t *testing.T) {
-		got, err := service.ResolveTicketAssignmentChanges(context.Background(), models.HumanActor(user.ID))
+		assignee := models.HumanActor(user.ID)
+		got, err := service.ResolveTicketAssignmentChanges(context.Background(), &assignee)
 		if err != nil {
 			t.Fatalf("resolve human assignment: %v", err)
 		}
@@ -127,17 +104,15 @@ func TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules(t *testing.T
 	})
 
 	t.Run("active service principal", func(t *testing.T) {
-		got, err := service.ResolveTicketAssignmentChanges(
-			context.Background(),
-			models.ServicePrincipalActor(active.ID),
-		)
+		assignee := models.ServicePrincipalActor(active.ID)
+		got, err := service.ResolveTicketAssignmentChanges(context.Background(), &assignee)
 		if err != nil {
 			t.Fatalf("resolve principal assignment: %v", err)
 		}
 		want := map[string]any{
 			"assigned_to_actor_type":           models.ActorTypeServicePrincipal,
 			"assigned_to_actor_id":             active.ID,
-			"assigned_to_id":                   user.ID,
+			"assigned_to_id":                   nil,
 			"assigned_to_service_principal_id": active.ID,
 		}
 		if !reflect.DeepEqual(got, want) {
@@ -145,22 +120,33 @@ func TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules(t *testing.T
 		}
 	})
 
-	t.Run("system clears compatibility assignment", func(t *testing.T) {
+	t.Run("release", func(t *testing.T) {
 		got, err := service.ResolveTicketAssignmentChanges(
 			context.Background(),
-			models.SystemActor("scheduler"),
+			nil,
 		)
 		if err != nil {
-			t.Fatalf("resolve system assignment: %v", err)
+			t.Fatalf("resolve released assignment: %v", err)
 		}
 		want := map[string]any{
-			"assigned_to_actor_type":           models.ActorTypeSystem,
-			"assigned_to_actor_id":             "scheduler",
+			"assigned_to_actor_type":           "",
+			"assigned_to_actor_id":             "",
 			"assigned_to_id":                   nil,
 			"assigned_to_service_principal_id": nil,
 		}
 		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("system changes = %#v, want %#v", got, want)
+			t.Fatalf("release changes = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("system is not an assignment target", func(t *testing.T) {
+		assignee := models.SystemActor("scheduler")
+		got, err := service.ResolveTicketAssignmentChanges(context.Background(), &assignee)
+		if !errors.Is(err, ErrInvalidAssignee) {
+			t.Fatalf("ResolveTicketAssignmentChanges() error = %v, want %v", err, ErrInvalidAssignee)
+		}
+		if got != nil {
+			t.Fatalf("system assignment returned changes: %#v", got)
 		}
 	})
 }

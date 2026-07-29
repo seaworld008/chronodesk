@@ -15,78 +15,65 @@ import (
 	"gorm.io/gorm"
 )
 
-func TestDatabaseSecretMigrationIsExplicitAndFailFast(t *testing.T) {
+func TestDatabaseSecretRotationRejectsPlaintextAndRollsBack(t *testing.T) {
 	db := openSecretTestDB(t)
 	ctx := context.Background()
-	legacyAuthentication := datatypes.JSON(`{"scheme":"Bearer","credentials":"legacy-auth"}`)
+	oldRing := testDatabaseKeyring(t, "dek-old", 0x51)
 	webhook := models.WebhookConfig{
-		Name: "legacy", Provider: models.WebhookProviderCustom,
+		Name: "rotate-before-plaintext", Provider: models.WebhookProviderCustom,
 		WebhookURL: "https://hooks.example.test", Status: models.WebhookStatusActive,
-		Secret: "legacy-webhook-secret", AccessToken: "legacy-access-token", CreatedBy: 1,
+		CreatedBy: 1,
 	}
-	email := models.EmailConfig{
-		SMTPPassword: "legacy-smtp-password", SMTPPort: 587, IsActive: true,
+	if err := db.Create(&webhook).Error; err != nil {
+		t.Fatal(err)
 	}
-	push := models.AgentPushNotificationConfig{
-		ID: "push-legacy", TaskID: "task-legacy", URL: "https://push.example.test",
-		Token: "legacy-push-token", Authentication: legacyAuthentication,
-	}
-	for _, row := range []any{&webhook, &email, &push} {
-		if err := db.Create(row).Error; err != nil {
-			t.Fatal(err)
-		}
-	}
-	ring := testDatabaseKeyring(t, "dek-one", 0x51)
-	if err := ValidateDatabaseSecrets(ctx, db, ring); !errors.Is(err, ErrPlaintextSecret) {
-		t.Fatalf("plaintext startup validation error=%v", err)
-	}
-
-	report, err := MigrateLegacyDatabaseSecrets(ctx, db, ring)
+	oldEnvelope, err := oldRing.Seal(
+		[]byte("authenticated-secret"),
+		FieldAAD(webhookSecretsTable, "1", "secret"),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Encrypted != 5 || report.Rotated != 0 {
-		t.Fatalf("migration report=%+v", report)
+	if err := db.Model(&webhook).UpdateColumn("secret", oldEnvelope).Error; err != nil {
+		t.Fatal(err)
 	}
-	if err := ValidateDatabaseSecrets(ctx, db, ring); err != nil {
-		t.Fatalf("post-migration validation: %v", err)
+	email := models.EmailConfig{
+		SMTPPassword: "unsupported-cleartext-value", SMTPPort: 587, IsActive: true,
+	}
+	if err := db.Create(&email).Error; err != nil {
+		t.Fatal(err)
+	}
+	rotating, err := NewKeyring("dek-new", map[string][]byte{
+		"dek-old": bytes.Repeat([]byte{0x51}, 32),
+		"dek-new": bytes.Repeat([]byte{0x52}, 32),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := RotateDatabaseSecrets(ctx, db, rotating)
+	if !errors.Is(err, ErrPlaintextSecret) {
+		t.Fatalf("RotateDatabaseSecrets() error = %v, want ErrPlaintextSecret", err)
+	}
+	if report != (SecretRotationReport{}) {
+		t.Fatalf("failed rotation report = %+v, want zero value", report)
 	}
 
 	var storedWebhook models.WebhookConfig
 	var storedEmail models.EmailConfig
-	var storedPush models.AgentPushNotificationConfig
 	if err := db.Unscoped().First(&storedWebhook, webhook.ID).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := db.First(&storedEmail, email.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.First(&storedPush, "id = ?", push.ID).Error; err != nil {
-		t.Fatal(err)
+	if storedWebhook.Secret != oldEnvelope {
+		t.Fatal("secret rotation was not rolled back after plaintext rejection")
 	}
-	databaseBytes := strings.Join([]string{
-		storedWebhook.Secret,
-		storedWebhook.AccessToken,
-		storedEmail.SMTPPassword,
-		storedPush.Token,
-		string(storedPush.Authentication),
-	}, "\n")
-	for _, plaintext := range []string{
-		"legacy-webhook-secret",
-		"legacy-access-token",
-		"legacy-smtp-password",
-		"legacy-push-token",
-		"legacy-auth",
-	} {
-		if strings.Contains(databaseBytes, plaintext) {
-			t.Fatalf("database still contains plaintext %q", plaintext)
-		}
+	if storedEmail.SMTPPassword != email.SMTPPassword {
+		t.Fatal("plaintext value was unexpectedly rewritten")
 	}
-
-	// Reconstructing a protector simulates a process restart.
-	restarted := testDatabaseKeyring(t, "dek-one", 0x51)
-	if err := ValidateDatabaseSecrets(ctx, db, restarted); err != nil {
-		t.Fatalf("restart validation: %v", err)
+	if err := ValidateDatabaseSecrets(ctx, db, rotating); !errors.Is(err, ErrPlaintextSecret) {
+		t.Fatalf("validation error = %v, want ErrPlaintextSecret", err)
 	}
 }
 
@@ -130,7 +117,32 @@ func TestDatabaseSecretValidationDetectsTamperAndWrongKey(t *testing.T) {
 	}
 }
 
-func TestDatabaseSecretMigrationRotatesKeyID(t *testing.T) {
+func TestDatabaseSecretRotationRejectsObjectAuthentication(t *testing.T) {
+	db := openSecretTestDB(t)
+	push := models.AgentPushNotificationConfig{
+		ID:             "push-object-auth",
+		TaskID:         "task-object-auth",
+		URL:            "https://push.example.test",
+		Authentication: datatypes.JSON(`{"scheme":"Bearer","credentials":"unsupported"}`),
+	}
+	if err := db.Create(&push).Error; err != nil {
+		t.Fatal(err)
+	}
+	ring := testDatabaseKeyring(t, "dek-one", 0x71)
+	if _, err := RotateDatabaseSecrets(context.Background(), db, ring); !errors.Is(err, ErrPlaintextSecret) {
+		t.Fatalf("RotateDatabaseSecrets() error = %v, want ErrPlaintextSecret", err)
+	}
+
+	var stored models.AgentPushNotificationConfig
+	if err := db.First(&stored, "id = ?", push.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if string(stored.Authentication) != string(push.Authentication) {
+		t.Fatal("object authentication was unexpectedly rewritten")
+	}
+}
+
+func TestDatabaseSecretRotationRotatesKeyID(t *testing.T) {
 	db := openSecretTestDB(t)
 	ctx := context.Background()
 	oldRing := testDatabaseKeyring(t, "dek-old", 0x31)
@@ -159,12 +171,22 @@ func TestDatabaseSecretMigrationRotatesKeyID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err := MigrateLegacyDatabaseSecrets(ctx, db, rotating)
+	primaryEnvelope, err := rotating.Seal(
+		[]byte("already-primary"),
+		FieldAAD(webhookSecretsTable, "1", "access_token"),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Rotated != 1 {
-		t.Fatalf("rotation report=%+v", report)
+	if err := db.Model(&webhook).UpdateColumn("access_token", primaryEnvelope).Error; err != nil {
+		t.Fatal(err)
+	}
+	report, err := RotateDatabaseSecrets(ctx, db, rotating)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Rotated != 1 || report.Verified != 1 {
+		t.Fatalf("rotation report = %+v", report)
 	}
 	var stored models.WebhookConfig
 	if err := db.First(&stored, webhook.ID).Error; err != nil {

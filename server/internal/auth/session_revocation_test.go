@@ -52,12 +52,7 @@ func setupSessionRevocationTest(t *testing.T) (*GormTokenRepository, *SimpleJWTM
 		t.Fatalf("migrate refresh token session table: %v", err)
 	}
 	repository := &GormTokenRepository{db: db}
-	manager := NewSimpleJWTManager(
-		"session-test-access-secret",
-		"session-test-refresh-secret",
-		time.Hour,
-		24*time.Hour,
-	)
+	manager := mustTestJWTManager(t, time.Hour, 24*time.Hour)
 	service := &AuthService{
 		userRepo: &sessionTestUserRepo{
 			users: map[uint]*User{
@@ -68,7 +63,7 @@ func setupSessionRevocationTest(t *testing.T) (*GormTokenRepository, *SimpleJWTM
 				},
 				84: {
 					ID:     84,
-					Role:   RoleUser,
+					Role:   RoleCustomer,
 					Status: StatusActive,
 				},
 			},
@@ -181,7 +176,7 @@ func TestLogoutAllRevokesEveryUserSessionOnly(t *testing.T) {
 	repository, manager, handler := setupSessionRevocationTest(t)
 	firstAccess, _ := issueSessionTokens(t, repository, manager, 42, RoleAdmin, "session-admin-one")
 	secondAccess, _ := issueSessionTokens(t, repository, manager, 42, RoleAdmin, "session-admin-two")
-	otherAccess, _ := issueSessionTokens(t, repository, manager, 84, RoleUser, "session-other-user")
+	otherAccess, _ := issueSessionTokens(t, repository, manager, 84, RoleCustomer, "session-other-user")
 
 	if err := handler.authService.LogoutAll(context.Background(), 42); err != nil {
 		t.Fatalf("logout all: %v", err)
@@ -246,14 +241,18 @@ func TestRevokedSessionCannotBeResurrectedByLateRefreshWrite(t *testing.T) {
 }
 
 func TestJWTRequiresPersistentSessionIdentifier(t *testing.T) {
-	manager := NewSimpleJWTManager(
-		"session-test-access-secret",
-		"session-test-refresh-secret",
-		time.Hour,
-		24*time.Hour,
-	)
+	manager := mustTestJWTManager(t, time.Hour, 24*time.Hour)
 	if _, _, err := manager.GenerateTokenPair(42, RoleAdmin, ""); err == nil {
 		t.Fatal("token pair without session id succeeded")
+	}
+	for _, historicalRole := range []UserRole{UserRole("user"), UserRole("superuser")} {
+		if _, _, err := manager.GenerateTokenPair(
+			42,
+			historicalRole,
+			"session-invalid-human-role",
+		); err == nil {
+			t.Errorf("token pair with historical role %q succeeded", historicalRole)
+		}
 	}
 
 	now := time.Now()
@@ -263,7 +262,7 @@ func TestJWTRequiresPersistentSessionIdentifier(t *testing.T) {
 		Type:   "access",
 		Iss:    manager.issuer,
 		Sub:    "42",
-		Aud:    "ticket-system-api",
+		Aud:    manager.audience,
 		Exp:    now.Add(time.Hour).Unix(),
 		Nbf:    now.Unix(),
 		Iat:    now.Unix(),
@@ -311,6 +310,38 @@ func TestRefreshTokenIssuedBeforePasswordChangeIsRejected(t *testing.T) {
 	}
 	if active {
 		t.Fatal("password change left the old refresh session active")
+	}
+}
+
+func TestRefreshTokenRoleMismatchIsRejectedAndRevokesSession(t *testing.T) {
+	repository, manager, handler := setupSessionRevocationTest(t)
+	_, refreshToken := issueSessionTokens(
+		t,
+		repository,
+		manager,
+		42,
+		RoleAdmin,
+		"session-before-role-change",
+	)
+
+	userRepo := handler.authService.userRepo.(*sessionTestUserRepo)
+	userRepo.users[42].Role = RoleCustomer
+
+	if _, err := handler.authService.RefreshToken(
+		context.Background(),
+		&RefreshTokenRequest{RefreshToken: refreshToken},
+		"127.0.0.1",
+		"session-test",
+	); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("refresh after role change error = %v, want invalid token", err)
+	}
+
+	active, err := repository.IsSessionActive(context.Background(), 42, "session-before-role-change")
+	if err != nil {
+		t.Fatalf("check revoked session: %v", err)
+	}
+	if active {
+		t.Fatal("role change left the old refresh session active")
 	}
 }
 

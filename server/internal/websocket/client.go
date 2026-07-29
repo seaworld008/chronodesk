@@ -152,7 +152,7 @@ func (c *Client) close() {
 // reads from this goroutine.
 func (c *Client) readPump() {
 	defer func() {
-		c.hub.unregister <- c
+		c.hub.unregisterClient(c)
 		c.close()
 	}()
 
@@ -347,7 +347,10 @@ func ServeWS(hub *Hub, c *gin.Context) {
 	}
 
 	client := NewClient(hub, conn, userID)
-	client.hub.register <- client
+	if !client.hub.registerClient(client) {
+		client.close()
+		return
+	}
 
 	// Start goroutines for reading and writing
 	go client.writePump()

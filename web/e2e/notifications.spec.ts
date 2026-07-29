@@ -3,16 +3,21 @@ import {
     authenticatePage,
     createNotification,
     deleteNotification,
-    E2E_PREFIX,
+    E2E_MARKER,
 } from './helpers/testData';
+import { assertDestructiveE2EAllowed } from './helpers/safety';
 
 const TEST_USER = {
     email: 'admin@example.com',
     password: 'Admin123!',
 };
 
-test.describe('Notifications', () => {
+test.describe('通知中心', () => {
     let notificationId: number | null = null;
+
+    test.beforeAll(() => {
+        assertDestructiveE2EAllowed('通知 E2E');
+    });
 
     test.afterAll(async ({ request }) => {
         if (notificationId) {
@@ -20,22 +25,53 @@ test.describe('Notifications', () => {
         }
     });
 
-    test('should display created notification', async ({ page, request }) => {
-        const title = `${E2E_PREFIX}通知-${Date.now()}`;
-        const content = `${E2E_PREFIX}通知内容-${Date.now()}`;
+    test('应显示本轮真实创建的通知', async ({ page, request }) => {
+        const title = `${E2E_MARKER}通知`;
+        const content = `${E2E_MARKER}通知内容`;
         notificationId = await createNotification(request, { title, content });
 
         await authenticatePage(page, TEST_USER);
         await page.goto('/#/notifications');
 
-        const searchInput = page.getByPlaceholder('搜索通知');
-        const listRequest = page.waitForResponse((response) =>
-            response.url().includes('/api/notifications') && response.request().method() === 'GET',
-        );
+        const main = page.getByRole('main');
+        const searchInput = main.getByPlaceholder('搜索通知', { exact: true });
+        const listRequest = page.waitForResponse((response) => {
+            const url = new URL(response.url());
+            if (
+                url.pathname !== '/api/notifications' ||
+                response.request().method() !== 'GET'
+            ) {
+                return false;
+            }
+            const rawFilter = url.searchParams.get('filter');
+            if (!rawFilter) {
+                return false;
+            }
+            try {
+                return (
+                    (JSON.parse(rawFilter) as Record<string, unknown>).q ===
+                    title
+                );
+            } catch {
+                return false;
+            }
+        });
         await searchInput.fill(title);
         await searchInput.press('Enter');
-        await listRequest;
+        expect((await listRequest).status()).toBe(200);
 
-        await expect(page.getByText(title)).toBeVisible({ timeout: 15000 });
+        const table = main.getByRole('table', {
+            name: '通知列表',
+            exact: true,
+        });
+        const notificationRow = table.getByRole('row', {
+            name: new RegExp(title, 'u'),
+        });
+        await expect(notificationRow).toBeVisible({ timeout: 15_000 });
+        await expect(
+            notificationRow.getByRole('cell', {
+                name: new RegExp(title, 'u'),
+            }),
+        ).toBeVisible();
     });
 });

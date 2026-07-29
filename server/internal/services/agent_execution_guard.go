@@ -31,7 +31,7 @@ type RedisScriptExecutor interface {
 }
 
 type AgentExecutionGuardRequest struct {
-	PrincipalID       string
+	SubjectID         string
 	RateLimit         int
 	ConcurrencyLimit  int
 	ConcurrencyTTL    time.Duration
@@ -72,10 +72,10 @@ func NewRedisAgentExecutionGuard(
 	keyPepper []byte,
 ) (*RedisAgentExecutionGuard, error) {
 	if client == nil {
-		return nil, errors.New("Redis Agent execution guard requires a client")
+		return nil, errors.New("redis Agent execution guard requires a client")
 	}
 	if len(keyPepper) < 16 {
-		return nil, errors.New("Redis Agent execution guard key pepper must be at least 16 bytes")
+		return nil, errors.New("redis Agent execution guard key pepper must be at least 16 bytes")
 	}
 	return &RedisAgentExecutionGuard{
 		client:    client,
@@ -106,8 +106,10 @@ if concurrency_limit > 0 and redis.call("ZCARD", KEYS[2]) >= concurrency_limit t
   return 2
 end
 
-redis.call("ZADD", KEYS[1], now_ms, token)
-redis.call("PEXPIRE", KEYS[1], rate_window_ms + 1000)
+if rate_limit > 0 then
+  redis.call("ZADD", KEYS[1], now_ms, token)
+  redis.call("PEXPIRE", KEYS[1], rate_window_ms + 1000)
+end
 redis.call("ZADD", KEYS[2], now_ms + concurrency_ttl_ms, token)
 redis.call("PEXPIRE", KEYS[2], concurrency_ttl_ms + 1000)
 return 0
@@ -148,7 +150,7 @@ func (g *RedisAgentExecutionGuard) Acquire(
 	if err != nil {
 		return nil, fmt.Errorf("generate Agent execution permit: %w", err)
 	}
-	hash := g.opaqueKey(request.PrincipalID)
+	hash := g.opaqueKey(request.SubjectID)
 	// The hash tag pins both keys to one Redis Cluster slot.
 	tag := "{" + hash + "}"
 	rateKey := agentGuardRedisKeyPrefix + ":" + tag + ":rate"
@@ -244,14 +246,14 @@ func (g *RedisAgentExecutionGuard) opaqueKey(raw string) string {
 }
 
 func validateAgentExecutionGuardRequest(request AgentExecutionGuardRequest) error {
-	if request.PrincipalID == "" {
-		return errors.New("Agent execution principal is required")
+	if request.SubjectID == "" {
+		return errors.New("agent execution subject is required")
 	}
-	if request.RateLimit <= 0 || request.ConcurrencyLimit <= 0 {
-		return errors.New("Agent execution limits must be positive")
+	if request.RateLimit < 0 || request.ConcurrencyLimit <= 0 {
+		return errors.New("agent execution rate limit must not be negative and concurrency limit must be positive")
 	}
 	if request.ConcurrencyTTL < time.Second {
-		return errors.New("Agent execution concurrency TTL must be at least one second")
+		return errors.New("agent execution concurrency TTL must be at least one second")
 	}
 	return nil
 }
@@ -286,18 +288,18 @@ func redisInteger(value interface{}) (int64, error) {
 		return int64(typed), nil
 	case uint64:
 		if typed > uint64(^uint64(0)>>1) {
-			return 0, errors.New("Redis integer overflows int64")
+			return 0, errors.New("redis integer overflows int64")
 		}
 		return int64(typed), nil
 	case float64:
 		if typed != float64(int64(typed)) {
-			return 0, errors.New("Redis number is not an integer")
+			return 0, errors.New("redis number is not an integer")
 		}
 		return int64(typed), nil
 	case string:
 		return strconv.ParseInt(typed, 10, 64)
 	default:
-		return 0, fmt.Errorf("unsupported Redis integer type %T", value)
+		return 0, fmt.Errorf("unsupported redis integer type %T", value)
 	}
 }
 
@@ -342,8 +344,8 @@ func (g *InMemoryAgentExecutionGuard) Acquire(
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.pruneExecutionLocked(now)
-	rates := retainAgentGuardTimes(g.rateWindows[request.PrincipalID], now.Add(-agentRateWindow), true)
-	inFlight := g.inFlight[request.PrincipalID]
+	rates := retainAgentGuardTimes(g.rateWindows[request.SubjectID], now.Add(-agentRateWindow), true)
+	inFlight := g.inFlight[request.SubjectID]
 	if inFlight == nil {
 		inFlight = make(map[string]time.Time)
 	}
@@ -352,21 +354,23 @@ func (g *InMemoryAgentExecutionGuard) Acquire(
 			delete(inFlight, leaseToken)
 		}
 	}
-	if len(rates) >= request.RateLimit {
-		g.rateWindows[request.PrincipalID] = rates
-		g.setInFlight(request.PrincipalID, inFlight)
+	if request.RateLimit > 0 && len(rates) >= request.RateLimit {
+		g.rateWindows[request.SubjectID] = rates
+		g.setInFlight(request.SubjectID, inFlight)
 		return nil, ErrRateLimited
 	}
 	if len(inFlight) >= request.ConcurrencyLimit {
-		g.rateWindows[request.PrincipalID] = rates
-		g.setInFlight(request.PrincipalID, inFlight)
+		g.rateWindows[request.SubjectID] = rates
+		g.setInFlight(request.SubjectID, inFlight)
 		return nil, ErrConcurrencyLimit
 	}
-	g.rateWindows[request.PrincipalID] = append(rates, now)
+	if request.RateLimit > 0 {
+		g.rateWindows[request.SubjectID] = append(rates, now)
+	}
 	inFlight[token] = now.Add(request.ConcurrencyTTL)
-	g.inFlight[request.PrincipalID] = inFlight
+	g.inFlight[request.SubjectID] = inFlight
 	g.pruneEmptyLocked()
-	return &AgentExecutionPermit{guardKey: request.PrincipalID, token: token}, nil
+	return &AgentExecutionPermit{guardKey: request.SubjectID, token: token}, nil
 }
 
 func (g *InMemoryAgentExecutionGuard) Release(

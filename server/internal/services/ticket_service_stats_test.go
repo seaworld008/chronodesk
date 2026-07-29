@@ -41,7 +41,7 @@ func setupStatsTestDB(t *testing.T) *gorm.DB {
 			Priority:     models.TicketPriorityHigh,
 			Type:         models.TicketTypeIncident,
 			Source:       models.TicketSourceWeb,
-			CreatedByID:  user.ID,
+			CreatedByID:  &user.ID,
 			AssignedToID: &assigneeID,
 			SLABreached:  true,
 			IsEscalated:  true,
@@ -54,7 +54,7 @@ func setupStatsTestDB(t *testing.T) *gorm.DB {
 			Priority:     models.TicketPriorityNormal,
 			Type:         models.TicketTypeIncident,
 			Source:       models.TicketSourceWeb,
-			CreatedByID:  user.ID,
+			CreatedByID:  &user.ID,
 			AssignedToID: &assigneeID,
 		},
 		{
@@ -65,7 +65,7 @@ func setupStatsTestDB(t *testing.T) *gorm.DB {
 			Priority:     models.TicketPriorityLow,
 			Type:         models.TicketTypeIncident,
 			Source:       models.TicketSourceWeb,
-			CreatedByID:  user.ID,
+			CreatedByID:  &user.ID,
 			AssignedToID: nil,
 			DueDate:      &now,
 		},
@@ -77,7 +77,7 @@ func setupStatsTestDB(t *testing.T) *gorm.DB {
 			Priority:     models.TicketPriorityNormal,
 			Type:         models.TicketTypeIncident,
 			Source:       models.TicketSourceWeb,
-			CreatedByID:  user.ID,
+			CreatedByID:  &user.ID,
 			AssignedToID: &assigneeID,
 		},
 	}
@@ -91,7 +91,7 @@ func setupStatsTestDB(t *testing.T) *gorm.DB {
 
 func TestGetTicketStatistics_Aggregates(t *testing.T) {
 	db := setupStatsTestDB(t)
-	svc := NewTicketService(db)
+	svc := newTicketServiceForTest(t, db)
 
 	stats, err := svc.GetTicketStatistics(1, "admin")
 	if err != nil {

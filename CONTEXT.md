@@ -16,6 +16,10 @@ A Ticket is not an A2A Task. Protocol interaction state such as
 `input-required` must never change a Ticket unless an explicit Ticket command is
 accepted.
 
+Attachments are durable `TicketAttachment` records linked to a Ticket and,
+optionally, a Comment. Ticket and Comment payloads never embed parallel
+attachment-reference arrays.
+
 ### Actor
 
 The identity responsible for an operation. `ActorRef` has one of three types:
@@ -25,9 +29,9 @@ The identity responsible for an operation. `ActorRef` has one of three types:
   policies, limits, and an emergency stop;
 - `system`: a trusted ChronoDesk workflow such as SLA or automation execution.
 
-Every durable write must record the Actor and its source protocol. A
-compatibility user is a persistence bridge for legacy human-oriented columns;
-it is not the authoritative Agent identity.
+Every durable write must record the Actor and its source protocol. Human user
+foreign keys are optional projections used only when the Actor is actually a
+human; service principals and system workflows never borrow a human identity.
 
 ### Assignment
 
@@ -35,10 +39,10 @@ The Actor currently responsible for a Ticket. Assignment validation is a domain
 invariant shared by REST, MCP, and A2A:
 
 - a human assignee must reference an existing user;
-- a service principal assignee must be active, not emergency-disabled, and have
-  a compatibility user;
-- a system assignee is explicit and clears human/service-principal compatibility
-  columns.
+- a service principal assignee must be active and not emergency-disabled;
+- `system` is a valid write Actor but not an assignable worker; system
+  workflows must assign an explicit human or service principal, or release the
+  Ticket to the queue.
 
 Protocol adapters may translate errors but must not implement different
 Assignment rules.

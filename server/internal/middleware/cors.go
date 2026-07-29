@@ -70,15 +70,6 @@ func DevelopmentCORSConfig() *CORSConfig {
 	return config
 }
 
-// ProductionCORSConfig 生产环境 CORS 配置
-func ProductionCORSConfig(allowedOrigins []string) *CORSConfig {
-	config := DefaultCORSConfig()
-	config.AllowAllOrigins = false
-	config.AllowOrigins = allowedOrigins
-	config.AllowCredentials = true
-	return config
-}
-
 // CORS CORS 中间件
 func CORS(config *CORSConfig) func(HTTPContext) {
 	if config == nil {
@@ -213,71 +204,4 @@ func matchWildcard(pattern, str string) bool {
 	}
 
 	return pattern == str
-}
-
-// CORSWithOrigins 快速创建指定源的 CORS 中间件
-func CORSWithOrigins(origins ...string) func(HTTPContext) {
-	config := DefaultCORSConfig()
-	config.AllowOrigins = origins
-	config.AllowAllOrigins = false
-	return CORS(config)
-}
-
-// CORSAllowAll 允许所有源的 CORS 中间件（仅用于开发）
-func CORSAllowAll() func(HTTPContext) {
-	return CORS(DevelopmentCORSConfig())
-}
-
-// CORSSecure 安全的 CORS 中间件（用于生产环境）
-func CORSSecure(allowedOrigins []string) func(HTTPContext) {
-	config := ProductionCORSConfig(allowedOrigins)
-	return CORS(config)
-}
-
-// ValidateOrigin 验证源是否被允许
-func ValidateOrigin(allowedOrigins []string, origin string) bool {
-	for _, allowedOrigin := range allowedOrigins {
-		if allowedOrigin == "*" || allowedOrigin == origin {
-			return true
-		}
-		if strings.Contains(allowedOrigin, "*") {
-			if matchWildcard(allowedOrigin, origin) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// CORSResponse CORS 预检响应结构
-type CORSResponse struct {
-	AllowOrigin      string `json:"allow_origin"`
-	AllowMethods     string `json:"allow_methods"`
-	AllowHeaders     string `json:"allow_headers"`
-	ExposeHeaders    string `json:"expose_headers"`
-	AllowCredentials bool   `json:"allow_credentials"`
-	MaxAge           int    `json:"max_age"`
-}
-
-// GetCORSInfo 获取 CORS 配置信息
-func GetCORSInfo(config *CORSConfig, origin string) *CORSResponse {
-	if config == nil {
-		config = DefaultCORSConfig()
-	}
-
-	allowOrigin := ""
-	if config.AllowAllOrigins {
-		allowOrigin = "*"
-	} else if ValidateOrigin(config.AllowOrigins, origin) {
-		allowOrigin = origin
-	}
-
-	return &CORSResponse{
-		AllowOrigin:      allowOrigin,
-		AllowMethods:     strings.Join(config.AllowMethods, ", "),
-		AllowHeaders:     strings.Join(config.AllowHeaders, ", "),
-		ExposeHeaders:    strings.Join(config.ExposeHeaders, ", "),
-		AllowCredentials: config.AllowCredentials,
-		MaxAge:           config.MaxAge,
-	}
 }

@@ -30,6 +30,8 @@ var (
 	ErrExecutionDeferred              = errors.New("a2a execution is deferred")
 	ErrExtendedAgentCardNotConfigured = errors.New("a2a extended agent card is not configured")
 	ErrContentTypeNotSupported        = errors.New("a2a content type is not supported")
+	ErrStreamQuotaExceeded            = errors.New("a2a stream quota exceeded")
+	ErrStreamControlUnavailable       = errors.New("a2a stream resource control is unavailable")
 )
 
 const DefaultExecutionClaimTTL = 30 * time.Second
@@ -164,10 +166,12 @@ type Service struct {
 	executionRenewInterval time.Duration
 	acceptedInputModes     map[string]struct{}
 	acceptedOutputModes    map[string]struct{}
-	taskLocks              sync.Map
+	taskLocks              [taskLockShardCount]sync.Mutex
 	executionsMu           sync.Mutex
 	executions             map[string]*taskExecution
 }
+
+const taskLockShardCount = 256
 
 type taskExecution struct {
 	cancel context.CancelFunc
@@ -398,13 +402,16 @@ func (s *Service) SendMessage(ctx context.Context, params SendMessageParams) (Ta
 	if replayed && !taskNeedsRecovery(task) {
 		return task, nil
 	}
+	// Authorize the persisted snapshot before starting any backend side effect.
+	// A linked Ticket can become unreadable between message validation and
+	// execution; protocol non-enumeration must not turn into unauthorized work.
+	if err := s.authorizeTaskSnapshot(ctx, task); err != nil {
+		return Task{}, err
+	}
 	executionContext := context.WithoutCancel(ctx)
 	messageID := strings.TrimSpace(params.Message.MessageID)
 	if params.Configuration.ReturnImmediately {
 		go s.execute(executionContext, task.ID, messageID, task.Version)
-		if err := s.authorizeTaskSnapshot(ctx, task); err != nil {
-			return Task{}, err
-		}
 		return limitTaskHistory(task, params.Configuration.HistoryLength), nil
 	}
 	s.execute(executionContext, task.ID, messageID, task.Version)
@@ -423,6 +430,9 @@ func taskNeedsRecovery(task Task) bool {
 }
 
 func (s *Service) ExecuteAsync(ctx context.Context, task Task, message Message) {
+	if err := s.authorizeTaskSnapshot(ctx, task); err != nil {
+		return
+	}
 	go s.execute(
 		context.WithoutCancel(ctx),
 		task.ID,
@@ -911,7 +921,7 @@ func (s *Service) execute(
 	if err != nil {
 		return
 	}
-	err = s.backend.Process(ctx, task.Clone(), message, reporter)
+	err = invokeBackendProcess(s.backend, ctx, task.Clone(), message, reporter)
 	if ctx.Err() != nil {
 		return
 	}
@@ -929,6 +939,23 @@ func (s *Service) execute(
 		return
 	}
 	_ = reporter.SetStatus(ctx, TaskStateCompleted, textMessage("Task completed."), nil)
+}
+
+func invokeBackendProcess(
+	backend Backend,
+	ctx context.Context,
+	task Task,
+	message Message,
+	reporter Reporter,
+) (processErr error) {
+	defer func() {
+		if recover() != nil {
+			// Panic values can contain customer data or credentials. Convert the
+			// failure to a fixed internal error without reflecting the value.
+			processErr = errors.New("A2A backend panic recovered")
+		}
+	}()
+	return backend.Process(ctx, task, message, reporter)
 }
 
 func (s *Service) renewExecutionClaim(
@@ -1105,8 +1132,16 @@ func (s *Service) emit(ctx context.Context, taskID, contextID string, payload St
 }
 
 func (s *Service) taskLock(taskID string) *sync.Mutex {
-	value, _ := s.taskLocks.LoadOrStore(taskID, &sync.Mutex{})
-	return value.(*sync.Mutex)
+	// A fixed shard set keeps per-task serialization bounded even when an
+	// untrusted caller presents an unlimited number of task identifiers.
+	// FNV-1a is sufficient here: collisions only serialize unrelated tasks
+	// and cannot affect authorization or correctness.
+	var hash uint64 = 14695981039346656037
+	for index := 0; index < len(taskID); index++ {
+		hash ^= uint64(taskID[index])
+		hash *= 1099511628211
+	}
+	return &s.taskLocks[hash&(taskLockShardCount-1)]
 }
 
 type taskReporter struct {

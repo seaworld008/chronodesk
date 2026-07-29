@@ -57,7 +57,7 @@ func TestNotificationOutboxRecoversAfterSideEffectBeforeAcknowledgement(t *testi
 		Priority:     models.TicketPriorityHigh,
 		Status:       models.TicketStatusOpen,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  actor.ID,
+		CreatedByID:  &actor.ID,
 		AssignedToID: &recipient.ID,
 		Version:      2,
 	}
@@ -111,8 +111,11 @@ func TestNotificationOutboxRecoversAfterSideEffectBeforeAcknowledgement(t *testi
 	if len(claimed) != 1 || claimed[0].Event == nil {
 		t.Fatalf("claimed deliveries = %#v", claimed)
 	}
-	notifications := services.NewNotificationService(db)
-	deliverer, err := NewNativeOutboxDeliverer(db, notifications, nil)
+	notifications := services.NewNotificationServiceWithProtector(db, nil)
+	deliverer, err := NewNativeOutboxDeliverer(NativeOutboxDelivererOptions{
+		DB:            db,
+		Notifications: notifications,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -49,6 +49,7 @@ import {
 } from '@mui/icons-material';
 import {
     EnterpriseDatagrid,
+    InlineDetails,
     TruncatedText,
     type ResizableColumn,
 } from '@/components/tables/EnterpriseTable';
@@ -291,16 +292,11 @@ const NotificationContent: React.FC = () => {
     const fullContent = [record.title, record.content].filter(Boolean).join(' — ');
 
     return (
-        <Tooltip title={fullContent} enterDelay={500}>
-            <Box sx={{ minWidth: 0, maxWidth: '100%' }}>
-                <TruncatedText title={record.title} fontWeight={600}>
-                    {record.title}
-                </TruncatedText>
-                <TruncatedText title={record.content} color="text.secondary">
-                    {record.content}
-                </TruncatedText>
-            </Box>
-        </Tooltip>
+        <InlineDetails
+            primary={record.title}
+            secondary={record.content}
+            title={fullContent}
+        />
     );
 };
 
@@ -480,6 +476,7 @@ const NotificationList: React.FC = () => {
             <EnterpriseDatagrid
                 tableId="notifications.main"
                 columns={notificationColumns}
+                aria-label="通知列表"
                 bulkActionButtons={false}
                 sx={{
                     '& .RaDatagrid-table': {

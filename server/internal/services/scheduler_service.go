@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/robfig/cron/v3"
+	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
 )
@@ -148,10 +149,10 @@ func (s *SchedulerService) SetAgentNativeService(native *AgentNativeService) err
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.running || s.stopped {
-		return errors.New("Agent native service must be configured before scheduler start")
+		return errors.New("agent native service must be configured before scheduler start")
 	}
 	if native == nil {
-		return errors.New("Agent native service is required")
+		return errors.New("agent native service is required")
 	}
 	if s.escalationService != nil {
 		s.escalationService.SetAgentNativeService(native)
@@ -509,12 +510,15 @@ func (s *SchedulerService) slaCheckHandler(ctx context.Context) error {
 // automationRulesHandler 自动化规则处理器
 func (s *SchedulerService) automationRulesHandler(ctx context.Context) error {
 	const batchSize = 50
-	hasActiveRules, err := s.automationService.HasActiveRules(ctx, "scheduled_check")
+	hasActiveRules, err := s.automationService.HasActiveRules(
+		ctx,
+		eventcontract.AutomationScheduledCheckEventType,
+	)
 	if err != nil {
 		return err
 	}
 	if !hasActiveRules {
-		log.Printf("Automation rules scheduler skipped: no active scheduled_check rules")
+		log.Printf("Automation rules scheduler skipped: no active scheduled CloudEvent rules")
 		return nil
 	}
 
@@ -532,7 +536,7 @@ func (s *SchedulerService) automationRulesHandler(ctx context.Context) error {
 					return ctx.Err()
 				}
 
-				if err := s.automationService.ExecuteRules(tx.Statement.Context, "scheduled_check", &tickets[i]); err != nil {
+				if err := s.automationService.EnqueueScheduledCheck(tx.Statement.Context, &tickets[i]); err != nil {
 					log.Printf("Failed to execute automation rules for ticket %d: %v", tickets[i].ID, err)
 				}
 				processed++
@@ -605,25 +609,6 @@ func (s *SchedulerService) updateStatisticsHandler(ctx context.Context) error {
 	}
 
 	return errors.Join(updateErrors...)
-}
-
-// ToggleJob 切换任务状态
-func (s *SchedulerService) ToggleJob(jobID string, active bool) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	job, exists := s.jobs[jobID]
-	if !exists {
-		return fmt.Errorf("job with ID %s not found", jobID)
-	}
-	if s.stopped {
-		return ErrSchedulerStopped
-	}
-
-	job.IsActive = active
-	log.Printf("定时任务 %s 已%s", jobID, map[bool]string{true: "启用", false: "停用"}[active])
-
-	return nil
 }
 
 // IsRunning 检查调度器是否运行中

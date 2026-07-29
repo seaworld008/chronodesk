@@ -12,6 +12,7 @@ import {
     Typography,
 } from '@mui/material'
 import { useLogin, useNotify } from 'react-admin'
+import { localizedUnknownErrorMessage } from '@/lib/apiClient'
 
 type NavigatorWithUAData = Navigator & {
     userAgentData?: {
@@ -68,7 +69,7 @@ const LoginPage = () => {
             })
             notify('登录成功', { type: 'info' })
         } catch (err) {
-            const message = err instanceof Error ? err.message : '登录失败'
+            const message = localizedUnknownErrorMessage(err, '登录失败')
             setError(message)
             notify(message, { type: 'warning' })
         } finally {

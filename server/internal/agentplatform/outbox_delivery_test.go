@@ -16,7 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/security"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"gorm.io/driver/sqlite"
@@ -54,7 +56,7 @@ func TestSLAEscalationOutboxDeliveryUsesInjectedConsumer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deliverer, err := NewNativeOutboxDeliverer(db, nil, nil)
+	deliverer, err := NewNativeOutboxDeliverer(NativeOutboxDelivererOptions{DB: db})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +73,13 @@ func TestSLAEscalationOutboxDeliveryUsesInjectedConsumer(t *testing.T) {
 		t.Fatal("unconfigured SLA continuation was acknowledged")
 	}
 	consumer := &recordingSLAEscalationConsumer{}
-	deliverer.SetSLAEscalationConsumer(consumer)
+	deliverer, err = NewNativeOutboxDeliverer(NativeOutboxDelivererOptions{
+		DB:            db,
+		SLAEscalation: consumer,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := deliverer.Deliver(context.Background(), delivery, event); err != nil {
 		t.Fatalf("deliver SLA continuation: %v", err)
 	}
@@ -115,7 +123,7 @@ func TestAttachmentCleanupOutboxRetriesAfterCommitAndIsIdempotent(t *testing.T) 
 		TicketNumber: "CLEANUP-1", Title: "Cleanup",
 		Description: "attachment", Priority: models.TicketPriorityNormal,
 		Status: models.TicketStatusOpen, Type: models.TicketTypeRequest,
-		Source: models.TicketSourceWeb, CreatedByID: user.ID, Version: 1,
+		Source: models.TicketSourceWeb, CreatedByID: &user.ID, Version: 1,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
@@ -134,7 +142,7 @@ func TestAttachmentCleanupOutboxRetriesAfterCommitAndIsIdempotent(t *testing.T) 
 		t.Fatal(err)
 	}
 	attachment := models.TicketAttachment{
-		TicketID: ticket.ID, UploadedBy: user.ID,
+		TicketID: ticket.ID, UploadedBy: &user.ID,
 		FileName: "retry.txt", OriginalName: "retry.txt",
 		FileSize: stored.Size, StoragePath: stored.Key, Hash: stored.SHA256,
 	}
@@ -149,12 +157,16 @@ func TestAttachmentCleanupOutboxRetriesAfterCommitAndIsIdempotent(t *testing.T) 
 			Type: "event_stream", ID: "default", MaxAttempts: 8,
 		}},
 	})
-	ticketService := services.NewTicketServiceWithAgentNative(db, nil, 0, native)
-	if err := ticketService.DeleteTicket(
+	ticketService, err := services.NewTicketService(db, native, nil, 0)
+	if err != nil {
+		t.Fatalf("NewTicketService() error = %v", err)
+	}
+	if err := ticketService.DeleteTicketExpectedVersion(
 		context.Background(),
 		ticket.ID,
 		user.ID,
 		"admin",
+		ticket.Version,
 	); err != nil {
 		t.Fatalf("delete ticket transaction: %v", err)
 	}
@@ -174,11 +186,13 @@ func TestAttachmentCleanupOutboxRetriesAfterCommitAndIsIdempotent(t *testing.T) 
 		t.Fatalf("load committed ticket deletion event: %v", err)
 	}
 	flaky := &failOnceAttachmentStorage{AttachmentStorage: local}
-	deliverer, err := NewNativeOutboxDeliverer(db, nil, nil)
+	deliverer, err := NewNativeOutboxDeliverer(NativeOutboxDelivererOptions{
+		DB:                db,
+		AttachmentStorage: flaky,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	deliverer.SetAttachmentStorage(flaky)
 
 	first, err := native.ProcessOutboxBatch(
 		context.Background(),
@@ -269,13 +283,13 @@ func TestAttachmentCleanupOutboxRejectsPathTraversal(t *testing.T) {
 		TicketNumber: "CLEANUP-TRAVERSAL", Title: "Traversal",
 		Description: "must reject", Priority: models.TicketPriorityNormal,
 		Status: models.TicketStatusOpen, Type: models.TicketTypeRequest,
-		Source: models.TicketSourceWeb, CreatedByID: user.ID, Version: 1,
+		Source: models.TicketSourceWeb, CreatedByID: &user.ID, Version: 1,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
 	}
 	attachment := models.TicketAttachment{
-		TicketID: ticket.ID, UploadedBy: user.ID,
+		TicketID: ticket.ID, UploadedBy: &user.ID,
 		FileName: "escape.txt", OriginalName: "escape.txt", FileSize: 1,
 		StoragePath: "../escape.txt", StorageUrl: "http://127.0.0.1/private",
 	}
@@ -300,11 +314,13 @@ func TestAttachmentCleanupOutboxRejectsPathTraversal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deliverer, err := NewNativeOutboxDeliverer(db, nil, nil)
+	deliverer, err := NewNativeOutboxDeliverer(NativeOutboxDelivererOptions{
+		DB:                db,
+		AttachmentStorage: local,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	deliverer.SetAttachmentStorage(local)
 	data, _ := json.Marshal(map[string]any{
 		"ticket_id": ticket.ID,
 		"deleted":   true,
@@ -349,14 +365,14 @@ func TestIsPublicCallbackIPRejectsSSRFNetworks(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.ip, func(t *testing.T) {
-			if got := isPublicCallbackIP(net.ParseIP(tt.ip)); got != tt.want {
-				t.Fatalf("isPublicCallbackIP(%q) = %v, want %v", tt.ip, got, tt.want)
+			if got := security.IsPublicCallbackIP(net.ParseIP(tt.ip)); got != tt.want {
+				t.Fatalf("security.IsPublicCallbackIP(%q) = %v, want %v", tt.ip, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestCloudEventRoutingKeepsStableEventIdentity(t *testing.T) {
+func TestWebhookNotificationKeepsExactCloudEventIdentity(t *testing.T) {
 	data, err := json.Marshal(map[string]any{"ticket_id": 42})
 	if err != nil {
 		t.Fatal(err)
@@ -370,27 +386,29 @@ func TestCloudEventRoutingKeepsStableEventIdentity(t *testing.T) {
 	if got := ticketIDFromCloudEvent(event); got != 42 {
 		t.Fatalf("ticketIDFromCloudEvent() = %d, want 42", got)
 	}
-	eventType, ok := webhookEventType(event)
-	if !ok || eventType != models.WebhookEventTicketComment {
-		t.Fatalf("webhookEventType() = (%q, %v)", eventType, ok)
+	notification := notificationEventFromCloudEvent(event)
+	if notification.Type != models.WebhookEventTicketComment {
+		t.Fatalf("comment type = %q", notification.Type)
 	}
 
 	event.Type = "io.chronodesk.ticket.transitioned.v1"
 	event.Data = json.RawMessage(`{"ticket_id":42,"new_status":"resolved"}`)
-	eventType, ok = webhookEventType(event)
-	if !ok || eventType != models.WebhookEventTicketResolved {
-		t.Fatalf("resolved webhookEventType() = (%q, %v)", eventType, ok)
+	notification = notificationEventFromCloudEvent(event)
+	if notification.Type != models.WebhookEventTicketTransitioned ||
+		notification.TransitionStatus != models.TicketStatusResolved {
+		t.Fatalf("resolved transition notification = %+v", notification)
 	}
 	event.Data = json.RawMessage(`{"ticket_id":42,"new_status":"closed"}`)
-	eventType, ok = webhookEventType(event)
-	if !ok || eventType != models.WebhookEventTicketClosed {
-		t.Fatalf("closed webhookEventType() = (%q, %v)", eventType, ok)
+	notification = notificationEventFromCloudEvent(event)
+	if notification.Type != models.WebhookEventTicketTransitioned ||
+		notification.TransitionStatus != models.TicketStatusClosed {
+		t.Fatalf("closed transition notification = %+v", notification)
 	}
 
 	event.Type = "io.chronodesk.ticket.sla.breached.v1"
-	eventType, ok = webhookEventType(event)
-	if !ok || eventType != models.WebhookEventSystemAlert {
-		t.Fatalf("SLA webhookEventType() = (%q, %v)", eventType, ok)
+	notification = notificationEventFromCloudEvent(event)
+	if notification.Type != models.WebhookEventTicketSLABreached {
+		t.Fatalf("SLA type was downgraded to %q", notification.Type)
 	}
 
 	event.Type = "io.chronodesk.automation.notification.requested.v1"
@@ -401,14 +419,19 @@ func TestCloudEventRoutingKeepsStableEventIdentity(t *testing.T) {
 			"content": "Ticket 42 needs an owner."
 		}
 	}`)
-	eventType, ok = webhookEventType(event)
-	if !ok || eventType != models.WebhookEventAutomationNotification {
-		t.Fatalf("automation notification webhookEventType() = (%q, %v)", eventType, ok)
+	notification = notificationEventFromCloudEvent(event)
+	if notification.Type != models.WebhookEventAutomationNotification {
+		t.Fatalf("automation notification type = %q", notification.Type)
 	}
-	notification := notificationEventFromCloudEvent(event, eventType)
 	if notification.Title != "Escalation required" ||
 		notification.Description != "Ticket 42 needs an owner." {
 		t.Fatalf("automation notification payload was ignored: %#v", notification)
+	}
+	if notification.Type != models.WebhookEventType(event.Type) {
+		t.Fatalf("CloudEvent identity was rewritten: %q != %q", notification.Type, event.Type)
+	}
+	if !eventcontract.IsWebhookDeliveryEventType(string(notification.Type)) {
+		t.Fatalf("current event type is not subscribable: %q", notification.Type)
 	}
 }
 
@@ -485,7 +508,10 @@ func TestOutboxWebhookDeliveryUsesOneBoundedAttemptWithoutLocalRetry(t *testing.
 		t.Fatalf("create webhook config: %v", err)
 	}
 	notifications := newWebhookTestNotificationService(db)
-	deliverer, err := NewNativeOutboxDeliverer(db, notifications, nil)
+	deliverer, err := NewNativeOutboxDeliverer(NativeOutboxDelivererOptions{
+		DB:            db,
+		Notifications: notifications,
+	})
 	if err != nil {
 		t.Fatalf("create outbox deliverer: %v", err)
 	}
@@ -530,6 +556,9 @@ func TestOutboxWebhookDeliveryUsesOneBoundedAttemptWithoutLocalRetry(t *testing.
 	}
 	if requestBody["event_id"] != event.ID || requestBody["delivery_id"] != delivery.ID {
 		t.Fatalf("stable event identity missing from webhook body: %#v", requestBody)
+	}
+	if requestBody["event_type"] != event.Type {
+		t.Fatalf("canonical CloudEvent type missing from webhook body: %#v", requestBody)
 	}
 	var logs []models.WebhookLog
 	if err := db.Order("id ASC").Find(&logs).Error; err != nil {
@@ -619,7 +648,7 @@ func TestConfiguredWebhookOutboxDeliveryFansOutDurablyAndIdempotently(t *testing
 	native := services.NewAgentNativeService(db, services.AgentNativeOptions{
 		Now: func() time.Time { return now },
 	})
-	eventModel, err := native.CreateDomainEvent(context.Background(), services.DomainEventInput{
+	eventModel, err := appendTestDomainEvent(context.Background(), native, services.DomainEventInput{
 		Type:            "io.chronodesk.ticket.created.v1",
 		Subject:         "ticket/42",
 		Actor:           models.SystemActor("fanout-test"),
@@ -643,7 +672,10 @@ func TestConfiguredWebhookOutboxDeliveryFansOutDurablyAndIdempotently(t *testing
 	).Error; err != nil {
 		t.Fatalf("load fanout delivery: %v", err)
 	}
-	deliverer, err := NewNativeOutboxDeliverer(db, newWebhookTestNotificationService(db), nil)
+	deliverer, err := NewNativeOutboxDeliverer(NativeOutboxDelivererOptions{
+		DB:            db,
+		Notifications: newWebhookTestNotificationService(db),
+	})
 	if err != nil {
 		t.Fatalf("create deliverer: %v", err)
 	}

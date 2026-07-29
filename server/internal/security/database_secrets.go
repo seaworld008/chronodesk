@@ -20,11 +20,10 @@ const (
 	a2aPushSecretsTable = "agent_push_notification_configs"
 )
 
-// LegacySecretMigrationReport reports only counts and never secret values.
-type LegacySecretMigrationReport struct {
-	Encrypted int
-	Rotated   int
-	Verified  int
+// SecretRotationReport reports only envelope counts and never secret values.
+type SecretRotationReport struct {
+	Rotated  int
+	Verified int
 }
 
 // ValidateDatabaseSecrets is the startup fail-fast gate. Any non-empty
@@ -88,18 +87,17 @@ func ValidateDatabaseSecrets(ctx context.Context, db *gorm.DB, protector Protect
 	return nil
 }
 
-// MigrateLegacyDatabaseSecrets is an explicit operator action. It encrypts
-// historical plaintext and rewraps envelopes that use a non-primary key.
-// Normal application startup must call ValidateDatabaseSecrets, not this
-// function, so an unexpected plaintext regression cannot be silently accepted.
-func MigrateLegacyDatabaseSecrets(
+// RotateDatabaseSecrets is an explicit operator action. It authenticates every
+// non-empty current-format envelope and rewraps values that use a non-primary
+// key. Plaintext and malformed envelopes fail closed and are never rewritten.
+func RotateDatabaseSecrets(
 	ctx context.Context,
 	db *gorm.DB,
 	protector Protector,
-) (LegacySecretMigrationReport, error) {
-	var report LegacySecretMigrationReport
+) (SecretRotationReport, error) {
+	var report SecretRotationReport
 	if db == nil {
-		return report, errors.New("secret migration database is required")
+		return report, errors.New("secret rotation database is required")
 	}
 	if protector == nil {
 		return report, ErrKeyringUnavailable
@@ -112,19 +110,19 @@ func MigrateLegacyDatabaseSecrets(
 		for _, row := range webhooks {
 			rowID := strconv.FormatUint(uint64(row.ID), 10)
 			updates := map[string]any{}
-			if value, status, err := migrateValue(protector, row.Secret, FieldAAD(webhookSecretsTable, rowID, "secret")); err != nil {
-				return fmt.Errorf("migrate webhook %d secret: %w", row.ID, err)
-			} else if status != migrationUnchanged {
+			if value, changed, err := rotateValue(protector, row.Secret, FieldAAD(webhookSecretsTable, rowID, "secret")); err != nil {
+				return fmt.Errorf("rotate webhook %d secret: %w", row.ID, err)
+			} else if changed {
 				updates["secret"] = value
-				report.add(status)
+				report.Rotated++
 			} else if row.Secret != "" {
 				report.Verified++
 			}
-			if value, status, err := migrateValue(protector, row.AccessToken, FieldAAD(webhookSecretsTable, rowID, "access_token")); err != nil {
-				return fmt.Errorf("migrate webhook %d access token: %w", row.ID, err)
-			} else if status != migrationUnchanged {
+			if value, changed, err := rotateValue(protector, row.AccessToken, FieldAAD(webhookSecretsTable, rowID, "access_token")); err != nil {
+				return fmt.Errorf("rotate webhook %d access token: %w", row.ID, err)
+			} else if changed {
 				updates["access_token"] = value
-				report.add(status)
+				report.Rotated++
 			} else if row.AccessToken != "" {
 				report.Verified++
 			}
@@ -141,16 +139,16 @@ func MigrateLegacyDatabaseSecrets(
 		}
 		for _, row := range emails {
 			rowID := strconv.FormatUint(uint64(row.ID), 10)
-			value, status, err := migrateValue(protector, row.SMTPPassword, FieldAAD(emailSecretsTable, rowID, "smtp_password"))
+			value, changed, err := rotateValue(protector, row.SMTPPassword, FieldAAD(emailSecretsTable, rowID, "smtp_password"))
 			if err != nil {
-				return fmt.Errorf("migrate email config %d SMTP password: %w", row.ID, err)
+				return fmt.Errorf("rotate email config %d SMTP password: %w", row.ID, err)
 			}
-			if status != migrationUnchanged {
+			if changed {
 				if err := tx.Model(&models.EmailConfig{}).Where("id = ?", row.ID).
 					UpdateColumn("smtp_password", value).Error; err != nil {
 					return err
 				}
-				report.add(status)
+				report.Rotated++
 			} else if row.SMTPPassword != "" {
 				report.Verified++
 			}
@@ -162,45 +160,34 @@ func MigrateLegacyDatabaseSecrets(
 		}
 		for _, row := range pushes {
 			updates := map[string]any{}
-			if value, status, err := migrateValue(protector, row.Token, FieldAAD(a2aPushSecretsTable, row.ID, "token")); err != nil {
-				return fmt.Errorf("migrate A2A push config %q token: %w", row.ID, err)
-			} else if status != migrationUnchanged {
+			if value, changed, err := rotateValue(protector, row.Token, FieldAAD(a2aPushSecretsTable, row.ID, "token")); err != nil {
+				return fmt.Errorf("rotate A2A push config %q token: %w", row.ID, err)
+			} else if changed {
 				updates["token"] = value
-				report.add(status)
+				report.Rotated++
 			} else if row.Token != "" {
 				report.Verified++
 			}
 
-			storedAuthentication, legacyAuthentication, err := storedSecretForMigration(row.Authentication)
+			storedAuthentication, err := storedJSONEnvelope(row.Authentication)
 			if err != nil {
-				return fmt.Errorf("migrate A2A push config %q authentication: %w", row.ID, err)
+				return fmt.Errorf("rotate A2A push config %q authentication: %w", row.ID, err)
 			}
-			var authenticationStatus migrationStatus
-			var authenticationEnvelope string
-			if legacyAuthentication {
-				authenticationEnvelope, err = ProtectOptional(
-					protector,
-					storedAuthentication,
-					FieldAAD(a2aPushSecretsTable, row.ID, "authentication"),
-				)
-				authenticationStatus = migrationEncrypted
-			} else {
-				authenticationEnvelope, authenticationStatus, err = migrateValue(
-					protector,
-					storedAuthentication,
-					FieldAAD(a2aPushSecretsTable, row.ID, "authentication"),
-				)
-			}
+			authenticationEnvelope, authenticationChanged, err := rotateValue(
+				protector,
+				storedAuthentication,
+				FieldAAD(a2aPushSecretsTable, row.ID, "authentication"),
+			)
 			if err != nil {
-				return fmt.Errorf("migrate A2A push config %q authentication: %w", row.ID, err)
+				return fmt.Errorf("rotate A2A push config %q authentication: %w", row.ID, err)
 			}
-			if authenticationStatus != migrationUnchanged {
+			if authenticationChanged {
 				encoded, err := json.Marshal(authenticationEnvelope)
 				if err != nil {
 					return err
 				}
 				updates["authentication"] = datatypes.JSON(encoded)
-				report.add(authenticationStatus)
+				report.Rotated++
 			} else if storedAuthentication != "" {
 				report.Verified++
 			}
@@ -213,24 +200,10 @@ func MigrateLegacyDatabaseSecrets(
 		}
 		return nil
 	})
-	return report, err
-}
-
-type migrationStatus uint8
-
-const (
-	migrationUnchanged migrationStatus = iota
-	migrationEncrypted
-	migrationRotated
-)
-
-func (r *LegacySecretMigrationReport) add(status migrationStatus) {
-	switch status {
-	case migrationEncrypted:
-		r.Encrypted++
-	case migrationRotated:
-		r.Rotated++
+	if err != nil {
+		return SecretRotationReport{}, err
 	}
+	return report, nil
 }
 
 func validateEnvelope(protector Protector, value string, aad []byte) error {
@@ -242,31 +215,30 @@ func validateEnvelope(protector Protector, value string, aad []byte) error {
 	return err
 }
 
-func migrateValue(protector Protector, value string, aad []byte) (string, migrationStatus, error) {
+func rotateValue(protector Protector, value string, aad []byte) (string, bool, error) {
 	if value == "" {
-		return "", migrationUnchanged, nil
+		return "", false, nil
 	}
 	if !IsEnvelope(value) {
 		if strings.HasPrefix(value, "cdsec:") {
-			return "", migrationUnchanged, ErrInvalidEnvelope
+			return "", false, ErrInvalidEnvelope
 		}
-		envelope, err := ProtectOptional(protector, value, aad)
-		return envelope, migrationEncrypted, err
+		return "", false, ErrPlaintextSecret
 	}
 	plaintext, err := protector.Open(value, aad)
 	if err != nil {
-		return "", migrationUnchanged, err
+		return "", false, err
 	}
 	defer clear(plaintext)
 	keyID, err := EnvelopeKeyID(value)
 	if err != nil {
-		return "", migrationUnchanged, err
+		return "", false, err
 	}
 	if keyID == protector.PrimaryKeyID() {
-		return value, migrationUnchanged, nil
+		return value, false, nil
 	}
 	envelope, err := protector.Seal(plaintext, aad)
-	return envelope, migrationRotated, err
+	return envelope, err == nil, err
 }
 
 func storedJSONEnvelope(raw datatypes.JSON) (string, error) {
@@ -278,28 +250,10 @@ func storedJSONEnvelope(raw datatypes.JSON) (string, error) {
 		return "", ErrPlaintextSecret
 	}
 	if envelope != "" && !IsEnvelope(envelope) {
+		if strings.HasPrefix(envelope, "cdsec:") {
+			return "", ErrInvalidEnvelope
+		}
 		return "", ErrPlaintextSecret
 	}
 	return envelope, nil
-}
-
-func storedSecretForMigration(raw datatypes.JSON) (value string, legacy bool, err error) {
-	if len(raw) == 0 || strings.TrimSpace(string(raw)) == "" || string(raw) == "null" {
-		return "", false, nil
-	}
-	var envelope string
-	if json.Unmarshal(raw, &envelope) == nil {
-		if IsEnvelope(envelope) {
-			return envelope, false, nil
-		}
-		return "", false, ErrInvalidEnvelope
-	}
-	if !json.Valid(raw) {
-		return "", false, ErrInvalidEnvelope
-	}
-	var object map[string]any
-	if err := json.Unmarshal(raw, &object); err != nil || len(object) == 0 {
-		return "", false, ErrInvalidEnvelope
-	}
-	return string(raw), true, nil
 }

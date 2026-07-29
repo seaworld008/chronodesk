@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -45,26 +46,24 @@ func GetCurrentUserID(c *gin.Context) (uint, bool) {
 // LogAdminOperation 记录管理员操作日志的中间件
 func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		start := time.Now()
 		method := c.Request.Method
 		path := c.Request.URL.Path
-		query := sanitizeAdminAuditQuery(c.Request.URL.RawQuery)
+		if !isImportantAdminOperation(method, path) {
+			c.Next()
+			return
+		}
+		if auditService == nil {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"code": 1,
+				"msg":  "管理员审计服务不可用",
+			})
+			return
+		}
+
+		start := time.Now()
+		query := sanitizeQueryForLogs(c.Request.URL.RawQuery)
 		clientIP := c.ClientIP()
 		userAgent := c.Request.UserAgent()
-
-		// 执行下一个处理器
-		c.Next()
-
-		if auditService == nil {
-			return
-		}
-
-		if !isImportantAdminOperation(method, path) {
-			return
-		}
-
-		statusCode := c.Writer.Status()
-		latency := time.Since(start)
 
 		userID, hasUser := GetCurrentUserID(c)
 		var userIDPtr *uint
@@ -81,34 +80,56 @@ func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.Han
 			}
 		}
 
-		ctx := c.Request.Context()
-		if ctx == nil {
-			ctx = context.Background()
-		}
-
 		action := fmt.Sprintf("%s %s", strings.ToUpper(method), path)
-		result := "success"
-		if statusCode >= http.StatusBadRequest {
-			result = "error"
-		}
-
 		record := &services.AdminAuditRecord{
 			UserID:     userIDPtr,
 			Role:       role,
 			Action:     action,
 			Method:     method,
 			Path:       path,
-			StatusCode: statusCode,
+			StatusCode: 0,
 			ClientIP:   clientIP,
 			UserAgent:  userAgent,
 			Query:      query,
-			Latency:    latency,
-			Result:     result,
+			Result:     "pending",
+			Notes:      "管理员写操作已进入执行阶段",
 		}
 
-		if err := auditService.Record(ctx, record); err != nil {
-			fmt.Println("[ADMIN-OP] failed to record audit log:", err)
+		if err := auditService.Record(c.Request.Context(), record); err != nil {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"code": 1,
+				"msg":  "管理员审计记录失败，操作未执行",
+			})
+			return
 		}
+
+		completed := false
+		defer func() {
+			record.StatusCode = c.Writer.Status()
+			record.Latency = time.Since(start)
+			record.Result = "success"
+			record.Notes = ""
+			if !completed {
+				record.StatusCode = http.StatusInternalServerError
+				record.Result = "error"
+				record.Notes = "管理员写操作异常终止"
+			} else if record.StatusCode >= http.StatusBadRequest {
+				record.Result = "error"
+			}
+
+			finalizeContext, cancel := context.WithTimeout(
+				context.WithoutCancel(c.Request.Context()),
+				3*time.Second,
+			)
+			defer cancel()
+			if err := auditService.Finalize(finalizeContext, record); err != nil {
+				// Persistence details may contain SQL values. Keep the operator
+				// signal fixed; the pending anchor remains durable for recovery.
+				log.Print("管理员审计最终状态写入失败，已保留 pending 锚点")
+			}
+		}()
+		c.Next()
+		completed = true
 	}
 }
 
@@ -127,16 +148,55 @@ func isPathWithin(path, prefix string) bool {
 	return path == prefix || strings.HasPrefix(path, prefix+"/")
 }
 
-func sanitizeAdminAuditQuery(rawQuery string) string {
+const maxLoggedQueryBytes = 2048
+
+func sanitizeQueryForLogs(rawQuery string) string {
 	values, err := url.ParseQuery(rawQuery)
 	if err != nil {
 		return ""
 	}
 	for key := range values {
-		switch strings.ToLower(strings.TrimSpace(key)) {
-		case "client_secret", "secret", "password", "access_token", "refresh_token", "token":
+		if isSensitiveQueryKey(key) {
 			values.Set(key, "[REDACTED]")
 		}
 	}
-	return values.Encode()
+	encoded := values.Encode()
+	if len(encoded) > maxLoggedQueryBytes {
+		return "[TRUNCATED]"
+	}
+	return encoded
+}
+
+func isSensitiveQueryKey(key string) bool {
+	normalized := strings.NewReplacer("-", "_", ".", "_").
+		Replace(strings.ToLower(strings.TrimSpace(key)))
+	switch normalized {
+	case "authorization",
+		"api_key",
+		"apikey",
+		"client_assertion",
+		"client_secret",
+		"code",
+		"credential",
+		"otp",
+		"password",
+		"saml_response",
+		"secret",
+		"signature",
+		"token":
+		return true
+	}
+	for _, suffix := range []string{
+		"_code",
+		"_credential",
+		"_password",
+		"_secret",
+		"_signature",
+		"_token",
+	} {
+		if strings.HasSuffix(normalized, suffix) {
+			return true
+		}
+	}
+	return false
 }

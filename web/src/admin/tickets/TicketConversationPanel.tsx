@@ -31,6 +31,10 @@ import {
     useRecordContext,
 } from 'react-admin'
 import type { Ticket } from '@/types'
+import {
+    localizedApiErrorMessage,
+    localizedUnknownErrorMessage,
+} from '@/lib/apiClient'
 import { canMutateTicket, type TicketRolePermissions } from './ticketAccess'
 
 const apiBase = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
@@ -81,14 +85,7 @@ const authHeaders = (contentType?: string) => {
 
 const responseMessage = async (response: Response, fallback: string) => {
     const payload = await response.json().catch(() => ({}))
-    if (
-        payload &&
-        typeof payload === 'object' &&
-        ('message' in payload || 'msg' in payload)
-    ) {
-        return String(payload.message ?? payload.msg)
-    }
-    return fallback
+    return localizedApiErrorMessage(payload, response.status, fallback)
 }
 
 const listPayload = <T,>(payload: unknown): T[] => {
@@ -105,6 +102,28 @@ const listPayload = <T,>(payload: unknown): T[] => {
     return []
 }
 
+const operationResourceVersion = (
+    response: Response,
+    payload: unknown,
+): number | undefined => {
+    const etag = response.headers.get('ETag')?.trim()
+    const etagMatch = etag?.match(/^"v([1-9]\d*)"$/u)
+    if (etagMatch) {
+        return Number(etagMatch[1])
+    }
+    if (!payload || typeof payload !== 'object' || !('receipt' in payload)) {
+        return undefined
+    }
+    const receipt = payload.receipt
+    if (!receipt || typeof receipt !== 'object' || !('resource_version' in receipt)) {
+        return undefined
+    }
+    const version = receipt.resource_version
+    return typeof version === 'number' && Number.isSafeInteger(version) && version > 0
+        ? version
+        : undefined
+}
+
 const actorName = (comment: TicketComment) => {
     if (comment.user?.username) {
         return comment.user.username
@@ -113,9 +132,15 @@ const actorName = (comment: TicketComment) => {
         return comment.service_principal.name
     }
     if (comment.actor?.type || comment.actor?.id) {
-        return `${comment.actor.type ?? 'actor'}:${comment.actor.id ?? 'unknown'}`
+        const actorTypeLabels: Record<string, string> = {
+            human: '用户',
+            service_principal: 'AI 智能体',
+            system: '系统',
+        }
+        const type = actorTypeLabels[comment.actor.type ?? ''] ?? '操作者'
+        return comment.actor.id ? `${type}：${comment.actor.id}` : type
     }
-    return 'system'
+    return '系统'
 }
 
 const formatBytes = (size: number) => {
@@ -146,6 +171,11 @@ export const TicketConversationPanel = () => {
     const [file, setFile] = useState<File>()
     const [attachmentPublic, setAttachmentPublic] = useState(false)
     const [attachmentSubmitting, setAttachmentSubmitting] = useState(false)
+    const [resourceVersion, setResourceVersion] = useState(ticket?.version ?? 0)
+
+    useEffect(() => {
+        setResourceVersion(ticket?.version ?? 0)
+    }, [ticket?.id, ticket?.version])
 
     const loadConversation = useCallback(async () => {
         if (!ticket?.id) return
@@ -177,7 +207,7 @@ export const TicketConversationPanel = () => {
             setComments(listPayload<TicketComment>(commentsPayload))
             setAttachments(listPayload<TicketAttachment>(attachmentsPayload))
         } catch (loadError) {
-            setError(loadError instanceof Error ? loadError.message : '加载工单会话失败')
+            setError(localizedUnknownErrorMessage(loadError, '加载工单会话失败'))
         } finally {
             setLoading(false)
         }
@@ -198,9 +228,11 @@ export const TicketConversationPanel = () => {
         if (!content) return
         setCommentSubmitting(true)
         try {
+            const headers = authHeaders('application/json')
+            headers.set('If-Match', `"v${resourceVersion}"`)
             const response = await fetch(`${apiBase}/tickets/${ticket.id}/comments`, {
                 method: 'POST',
-                headers: authHeaders('application/json'),
+                headers,
                 body: JSON.stringify({
                     content,
                     content_type: 'text',
@@ -210,12 +242,17 @@ export const TicketConversationPanel = () => {
             if (!response.ok) {
                 throw new Error(await responseMessage(response, '添加评论失败'))
             }
+            const payload = await response.json().catch(() => ({}))
+            const nextVersion = operationResourceVersion(response, payload)
+            if (nextVersion) {
+                setResourceVersion(nextVersion)
+            }
             setComment('')
             notify('评论已添加', { type: 'success' })
             await loadConversation()
         } catch (submitError) {
             notify(
-                submitError instanceof Error ? submitError.message : '添加评论失败',
+                localizedUnknownErrorMessage(submitError, '添加评论失败'),
                 { type: 'error' },
             )
         } finally {
@@ -230,20 +267,27 @@ export const TicketConversationPanel = () => {
             const form = new FormData()
             form.append('file', file)
             form.append('visibility', attachmentPublic ? 'public' : 'internal')
+            const headers = authHeaders()
+            headers.set('If-Match', `"v${resourceVersion}"`)
             const response = await fetch(`${apiBase}/tickets/${ticket.id}/attachments`, {
                 method: 'POST',
-                headers: authHeaders(),
+                headers,
                 body: form,
             })
             if (!response.ok) {
                 throw new Error(await responseMessage(response, '上传附件失败'))
+            }
+            const payload = await response.json().catch(() => ({}))
+            const nextVersion = operationResourceVersion(response, payload)
+            if (nextVersion) {
+                setResourceVersion(nextVersion)
             }
             setFile(undefined)
             notify('附件已上传，等待安全扫描', { type: 'success' })
             await loadConversation()
         } catch (uploadError) {
             notify(
-                uploadError instanceof Error ? uploadError.message : '上传附件失败',
+                localizedUnknownErrorMessage(uploadError, '上传附件失败'),
                 { type: 'error' },
             )
         } finally {
@@ -269,7 +313,7 @@ export const TicketConversationPanel = () => {
             URL.revokeObjectURL(objectUrl)
         } catch (downloadError) {
             notify(
-                downloadError instanceof Error ? downloadError.message : '下载附件失败',
+                localizedUnknownErrorMessage(downloadError, '下载附件失败'),
                 { type: 'error' },
             )
         }
@@ -278,7 +322,7 @@ export const TicketConversationPanel = () => {
     return (
         <Stack spacing={3}>
             {canWrite ? (
-                <Card variant="outlined">
+                <Card variant="outlined" role="region" aria-label="添加工单评论">
                     <CardContent>
                         <Typography variant="h6" gutterBottom>
                             添加评论
@@ -338,7 +382,7 @@ export const TicketConversationPanel = () => {
                     <CircularProgress size={28} />
                 </Box>
             ) : (
-                <Card variant="outlined">
+                <Card variant="outlined" role="region" aria-label="工单评论记录">
                     <CardContent>
                         <Typography variant="h6">评论记录</Typography>
                         {comments.length === 0 ? (
@@ -404,7 +448,7 @@ export const TicketConversationPanel = () => {
                 </Card>
             )}
 
-            <Card variant="outlined">
+            <Card variant="outlined" role="region" aria-label="工单附件">
                 <CardContent>
                     <Typography variant="h6" gutterBottom>
                         附件

@@ -48,7 +48,7 @@ func TestSendWebhookLogEnvironment(t *testing.T) {
 		t.Fatalf("create webhook config: %v", err)
 	}
 
-	service := NewNotificationService(db)
+	service := NewNotificationServiceWithProtector(db, nil)
 	useTestWebhookClient(service, server.Client())
 	event := &NotificationEvent{
 		Type:         models.WebhookEventSystemAlert,

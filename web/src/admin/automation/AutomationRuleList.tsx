@@ -23,21 +23,16 @@ import {
   EnterpriseBooleanFilterInput,
   EnterpriseSelectFilterInput,
 } from '@/components/inputs/EnterpriseFilterInputs'
+import {
+  automationTriggerEventChoices,
+  automationTriggerEventLabel,
+} from './triggerEvents'
 
 const ruleTypeChoices = [
   { id: 'assignment', name: '自动分配' },
   { id: 'classification', name: '自动分类' },
   { id: 'escalation', name: '升级处理' },
   { id: 'sla', name: 'SLA' },
-]
-
-const triggerEventChoices = [
-  { id: 'ticket.created', name: '工单创建' },
-  { id: 'ticket.updated', name: '工单更新' },
-  { id: 'ticket.assigned', name: '工单分配' },
-  { id: 'ticket.resolved', name: '工单解决' },
-  { id: 'ticket.closed', name: '工单关闭' },
-  { id: 'scheduled_check', name: '定时检查' },
 ]
 
 const automationRuleColumns: ResizableColumn[] = [
@@ -76,12 +71,17 @@ const AutomationRuleList: React.FC = () => (
         key="trigger_event"
         source="trigger_event"
         label="触发事件"
-        choices={triggerEventChoices}
+        choices={automationTriggerEventChoices}
       />,
       <EnterpriseBooleanFilterInput key="active" source="is_active" label="启用" />,
     ]}
   >
-    <EnterpriseDatagrid tableId="automation.rules" columns={automationRuleColumns} rowClick="show">
+    <EnterpriseDatagrid
+      tableId="automation.rules"
+      columns={automationRuleColumns}
+      aria-label="自动化规则列表"
+      rowClick="show"
+    >
       <FunctionField
         label="规则名称"
         sortBy="name"
@@ -103,7 +103,7 @@ const AutomationRuleList: React.FC = () => (
         sortBy="trigger_event"
         render={(record) => (
           <TruncatedText title={`触发事件代码：${record?.trigger_event || '—'}`}>
-            {triggerEventChoices.find((choice) => choice.id === record?.trigger_event)?.name ?? '未知事件'}
+            {automationTriggerEventLabel(record?.trigger_event)}
           </TruncatedText>
         )}
       />

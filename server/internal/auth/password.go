@@ -14,17 +14,50 @@ import (
 
 // SimplePasswordService 简单密码服务实现
 type SimplePasswordService struct {
-	minLength int
+	minLength  int
+	bcryptCost int
 }
 
-// NewSimplePasswordService 创建简单密码服务
-func NewSimplePasswordService(minLength int, _ string) *SimplePasswordService {
-	if minLength < 8 {
-		minLength = 8
+const (
+	// DefaultBcryptCost is the reviewed deployment default. Callers that do
+	// not have runtime configuration (for example explicit seed commands)
+	// must still opt into it by name.
+	DefaultBcryptCost = 12
+	// BcryptCostMin keeps password hashing at the current interactive-login
+	// security baseline. Lower costs are cheap enough to materially weaken
+	// offline resistance.
+	BcryptCostMin = 10
+	// BcryptCostMax prevents an operator typo from turning authentication into
+	// an avoidable CPU denial of service. Cost 16 already represents 64 times
+	// the work of cost 10.
+	BcryptCostMax = 16
+)
+
+// PasswordServiceConfig is the complete, explicit password-hashing contract.
+// ChronoDesk does not support application-level salts: bcrypt generates and
+// stores a unique salt in every hash.
+type PasswordServiceConfig struct {
+	MinLength  int
+	BcryptCost int
+}
+
+// NewSimplePasswordService 创建密码服务。配置错误会在启动时直接失败，不会
+// 静默回退到 bcrypt 库默认值。
+func NewSimplePasswordService(config PasswordServiceConfig) (*SimplePasswordService, error) {
+	if config.MinLength < 8 || config.MinLength > 128 {
+		return nil, fmt.Errorf("password minimum length must be between 8 and 128")
+	}
+	if config.BcryptCost < BcryptCostMin || config.BcryptCost > BcryptCostMax {
+		return nil, fmt.Errorf(
+			"bcrypt cost must be between %d and %d",
+			BcryptCostMin,
+			BcryptCostMax,
+		)
 	}
 	return &SimplePasswordService{
-		minLength: minLength,
-	}
+		minLength:  config.MinLength,
+		bcryptCost: config.BcryptCost,
+	}, nil
 }
 
 // HashPassword 哈希密码
@@ -33,7 +66,7 @@ func (s *SimplePasswordService) HashPassword(password string) (string, error) {
 		return "", errors.New("password cannot be empty")
 	}
 
-	hashed, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	hashed, err := bcrypt.GenerateFromPassword([]byte(password), s.bcryptCost)
 	if err != nil {
 		return "", fmt.Errorf("failed to hash password: %w", err)
 	}
@@ -295,18 +328,4 @@ func GenerateSecureToken(length int) (string, error) {
 	}
 
 	return hex.EncodeToString(bytes), nil
-}
-
-// GenerateNumericCode 生成数字验证码
-func GenerateNumericCode(length int) (string, error) {
-	if length <= 0 || length > 10 {
-		length = 6
-	}
-
-	bytes := make([]byte, length)
-	for i := 0; i < length; i++ {
-		bytes[i] = byte('0' + randInt(10))
-	}
-
-	return string(bytes), nil
 }

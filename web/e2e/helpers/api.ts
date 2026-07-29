@@ -1,4 +1,5 @@
 import type { APIRequestContext } from '@playwright/test';
+import { assertDestructiveE2EAllowed } from './safety';
 
 export type Credentials = {
     email: string;
@@ -50,12 +51,10 @@ export const loginSession = async (
     return data as AuthSession;
 };
 
-export const login = async (request: APIRequestContext, credentials: Credentials) =>
-    (await loginSession(request, credentials)).access_token;
-
 type RequestOptions = {
     method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
     data?: unknown;
+    headers?: Record<string, string>;
 };
 
 export const apiRequest = async <T>(
@@ -64,11 +63,16 @@ export const apiRequest = async <T>(
     url: string,
     options: RequestOptions = {},
 ): Promise<T> => {
+    const method = options.method ?? 'GET';
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+        assertDestructiveE2EAllowed(`${method} ${url}`);
+    }
     const response = await request.fetch(url, {
-        method: options.method ?? 'GET',
+        method,
         headers: {
             Authorization: `Bearer ${token}`,
             'Content-Type': 'application/json',
+            ...options.headers,
         },
         data: options.data,
     });

@@ -1,7 +1,9 @@
 package models
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -15,12 +17,8 @@ func TestTextBackedJSONFieldsAreDecodedIntoStableResponses(t *testing.T) {
 	}
 
 	comment := (&TicketComment{
-		Attachments: `["one.txt","two.png"]`,
-		Metadata:    `{"trusted":false}`,
+		Metadata: `{"trusted":false}`,
 	}).ToResponse()
-	if !reflect.DeepEqual(comment.Attachments, []string{"one.txt", "two.png"}) {
-		t.Fatalf("comment attachments were not decoded: %#v", comment.Attachments)
-	}
 	if trusted, ok := comment.Metadata["trusted"].(bool); !ok || trusted {
 		t.Fatalf("comment metadata was not decoded: %#v", comment.Metadata)
 	}
@@ -41,14 +39,26 @@ func TestTextBackedJSONFieldsAreDecodedIntoStableResponses(t *testing.T) {
 
 func TestTextBackedJSONFieldsUseEmptyCollectionsForBlankOrInvalidLegacyData(t *testing.T) {
 	comment := (&TicketComment{
-		Attachments: `not-json`,
-		Metadata:    "",
+		Metadata: "",
 	}).ToResponse()
 
-	if comment.Attachments == nil || len(comment.Attachments) != 0 {
-		t.Fatalf("attachments must be a stable empty array: %#v", comment.Attachments)
-	}
 	if comment.Metadata == nil || len(comment.Metadata) != 0 {
 		t.Fatalf("metadata must be a stable empty object: %#v", comment.Metadata)
+	}
+}
+
+func TestTicketAndCommentResponsesOmitLegacyAttachmentArrays(t *testing.T) {
+	responses := map[string]any{
+		"ticket":  (&Ticket{}).ToResponse(),
+		"comment": (&TicketComment{}).ToResponse(),
+	}
+	for name, response := range responses {
+		encoded, err := json.Marshal(response)
+		if err != nil {
+			t.Fatalf("marshal %s response: %v", name, err)
+		}
+		if strings.Contains(string(encoded), `"attachments"`) {
+			t.Fatalf("%s response exposes legacy attachment array: %s", name, encoded)
+		}
 	}
 }

@@ -5,8 +5,6 @@ import (
 	"errors"
 	"testing"
 	"time"
-
-	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
 type otpTestUserRepo struct {
@@ -47,10 +45,14 @@ func (r *otpTestUserRepo) UpdateLastLogin(ctx context.Context, userID uint, logi
 }
 func (r *otpTestUserRepo) IncrementFailedLogin(ctx context.Context, userID uint) error { return nil }
 func (r *otpTestUserRepo) ResetFailedLogin(ctx context.Context, userID uint) error     { return nil }
-func (r *otpTestUserRepo) LockUser(ctx context.Context, userID uint, until time.Time) error {
+func (r *otpTestUserRepo) ChangePasswordAndRevokeSessions(
+	context.Context,
+	uint,
+	string,
+	time.Time,
+) error {
 	return nil
 }
-func (r *otpTestUserRepo) UnlockUser(ctx context.Context, userID uint) error { return nil }
 func (r *otpTestUserRepo) ConfigureOTP(
 	context.Context,
 	uint,
@@ -121,21 +123,4 @@ func TestVerifyOTP_BackupCodePersistFailureReturnsError(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected persist failure to bubble up")
 	}
-}
-
-var _ LoginHistoryRepository = (*noopLoginHistoryRepo)(nil)
-
-type noopLoginHistoryRepo struct{}
-
-func (n *noopLoginHistoryRepo) Create(ctx context.Context, history *models.LoginHistory) error {
-	return nil
-}
-func (n *noopLoginHistoryRepo) RefreshSession(ctx context.Context, userID uint, sessionID, ipAddress, userAgent string, at time.Time) error {
-	return nil
-}
-func (n *noopLoginHistoryRepo) EndSession(ctx context.Context, userID uint, sessionID string, status models.LoginStatus, reason string, at time.Time) error {
-	return nil
-}
-func (n *noopLoginHistoryRepo) EndAllSessions(ctx context.Context, userID uint, status models.LoginStatus, reason string, at time.Time) error {
-	return nil
 }

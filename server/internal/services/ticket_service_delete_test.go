@@ -3,12 +3,47 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 )
+
+func TestDeleteTicketExpectedVersionRejectsStaleSnapshot(t *testing.T) {
+	db := openAgentNativeTestDB(t)
+	actor := seedActorUser(t, db, "delete-version")
+	ticket := seedNativeTicket(t, db, actor.ID, "DELETE-VERSION-1")
+	service := newTicketServiceForTest(t, db)
+
+	err := service.DeleteTicketExpectedVersion(
+		context.Background(),
+		ticket.ID,
+		actor.ID,
+		string(models.RoleAdmin),
+		ticket.Version+1,
+	)
+	if !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("stale delete error = %v, want ErrVersionConflict", err)
+	}
+
+	var current models.Ticket
+	if err := db.First(&current, ticket.ID).Error; err != nil {
+		t.Fatalf("stale delete removed ticket: %v", err)
+	}
+	if current.Version != ticket.Version {
+		t.Fatalf("stale delete changed version to %d", current.Version)
+	}
+	var eventCount int64
+	if err := db.Model(&models.DomainEvent{}).Count(&eventCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 0 {
+		t.Fatalf("stale delete emitted %d events", eventCount)
+	}
+}
 
 func TestDeleteTicketCleansRelatedData(t *testing.T) {
 	db := openTestDB(t)
@@ -20,6 +55,10 @@ func TestDeleteTicketCleansRelatedData(t *testing.T) {
 		&models.TicketHistory{},
 		&models.TicketComment{},
 		&models.TicketAttachment{},
+		&models.AutomationRule{},
+		&models.AutomationLog{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
 	); err != nil {
 		t.Fatalf("failed to migrate schemas: %v", err)
 	}
@@ -43,7 +82,7 @@ func TestDeleteTicketCleansRelatedData(t *testing.T) {
 		Status:       models.TicketStatusOpen,
 		Type:         models.TicketTypeRequest,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  user.ID,
+		CreatedByID:  &user.ID,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatalf("failed to seed ticket: %v", err)
@@ -64,6 +103,9 @@ func TestDeleteTicketCleansRelatedData(t *testing.T) {
 
 	history := models.TicketHistory{
 		TicketID:    ticket.ID,
+		UserID:      &user.ID,
+		ActorType:   models.ActorTypeHuman,
+		ActorID:     models.HumanActor(user.ID).ID,
 		Action:      models.HistoryActionCreate,
 		Description: "created",
 	}
@@ -73,7 +115,9 @@ func TestDeleteTicketCleansRelatedData(t *testing.T) {
 
 	comment := models.TicketComment{
 		TicketID:    ticket.ID,
-		UserID:      user.ID,
+		UserID:      &user.ID,
+		ActorType:   models.ActorTypeHuman,
+		ActorID:     models.HumanActor(user.ID).ID,
 		Content:     "first response",
 		ContentType: "text",
 		Type:        models.CommentTypePublic,
@@ -84,7 +128,9 @@ func TestDeleteTicketCleansRelatedData(t *testing.T) {
 
 	attachment := models.TicketAttachment{
 		TicketID:     ticket.ID,
-		UploadedBy:   user.ID,
+		UploadedBy:   &user.ID,
+		ActorType:    models.ActorTypeHuman,
+		ActorID:      models.HumanActor(user.ID).ID,
 		FileName:     "test.txt",
 		OriginalName: "test.txt",
 		FileSize:     12,
@@ -93,10 +139,35 @@ func TestDeleteTicketCleansRelatedData(t *testing.T) {
 	if err := db.Create(&attachment).Error; err != nil {
 		t.Fatalf("failed to seed ticket attachment: %v", err)
 	}
+	rule := models.AutomationRule{
+		Name:         "delete audit rule",
+		RuleType:     "assignment",
+		TriggerEvent: "io.chronodesk.ticket.created.v1",
+		CreatedBy:    user.ID,
+	}
+	if err := db.Create(&rule).Error; err != nil {
+		t.Fatalf("failed to seed automation rule: %v", err)
+	}
+	automationLog := models.AutomationLog{
+		RuleID:       rule.ID,
+		TicketID:     ticket.ID,
+		TriggerEvent: rule.TriggerEvent,
+		ExecutedAt:   time.Now(),
+		Success:      true,
+	}
+	if err := db.Create(&automationLog).Error; err != nil {
+		t.Fatalf("failed to seed automation audit log: %v", err)
+	}
 
-	svc := &TicketService{db: db}
-	if err := svc.DeleteTicket(context.Background(), ticket.ID, user.ID, "admin"); err != nil {
-		t.Fatalf("DeleteTicket returned error: %v", err)
+	svc := newTicketServiceForTest(t, db)
+	if err := svc.DeleteTicketExpectedVersion(
+		context.Background(),
+		ticket.ID,
+		user.ID,
+		"admin",
+		ticket.Version,
+	); err != nil {
+		t.Fatalf("DeleteTicketExpectedVersion returned error: %v", err)
 	}
 
 	var notificationCount int64
@@ -138,6 +209,22 @@ func TestDeleteTicketCleansRelatedData(t *testing.T) {
 	if ticketCount != 0 {
 		t.Fatalf("expected ticket to be deleted, got %d", ticketCount)
 	}
+	var deletedTicket models.Ticket
+	if err := db.Unscoped().First(&deletedTicket, ticket.ID).Error; err != nil {
+		t.Fatalf("deleted ticket audit anchor is missing: %v", err)
+	}
+	if !deletedTicket.DeletedAt.Valid {
+		t.Fatal("ticket deletion did not retain a soft-deleted audit anchor")
+	}
+	var automationLogCount int64
+	if err := db.Model(&models.AutomationLog{}).
+		Where("id = ? AND ticket_id = ?", automationLog.ID, ticket.ID).
+		Count(&automationLogCount).Error; err != nil {
+		t.Fatalf("failed to count retained automation logs: %v", err)
+	}
+	if automationLogCount != 1 {
+		t.Fatalf("ticket deletion lost %d automation audit logs", 1-automationLogCount)
+	}
 }
 
 func TestDeleteTicketCommitsAttachmentCleanupWithDefaultOutboxTargets(t *testing.T) {
@@ -169,7 +256,7 @@ func TestDeleteTicketCommitsAttachmentCleanupWithDefaultOutboxTargets(t *testing
 		Status:       models.TicketStatusOpen,
 		Type:         models.TicketTypeRequest,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  user.ID,
+		CreatedByID:  &user.ID,
 		Version:      1,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
@@ -189,7 +276,8 @@ func TestDeleteTicketCommitsAttachmentCleanupWithDefaultOutboxTargets(t *testing
 		t.Fatal(err)
 	}
 	attachment := models.TicketAttachment{
-		TicketID: ticket.ID, UploadedBy: user.ID,
+		TicketID: ticket.ID, UploadedBy: &user.ID,
+		ActorType: models.ActorTypeHuman, ActorID: models.HumanActor(user.ID).ID,
 		FileName: "evidence.txt", OriginalName: "evidence.txt",
 		FileSize: stored.Size, StoragePath: stored.Key, Hash: stored.SHA256,
 	}
@@ -204,12 +292,13 @@ func TestDeleteTicketCommitsAttachmentCleanupWithDefaultOutboxTargets(t *testing
 			{Type: "automation", ID: "rules", MaxAttempts: 8},
 		},
 	})
-	service := NewTicketServiceWithAgentNative(db, nil, 0, native)
-	if err := service.DeleteTicket(
+	service := newTicketServiceWithDependenciesForTest(t, db, native, nil, 0)
+	if err := service.DeleteTicketExpectedVersion(
 		context.Background(),
 		ticket.ID,
 		user.ID,
 		"admin",
+		ticket.Version,
 	); err != nil {
 		t.Fatalf("delete ticket: %v", err)
 	}

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from typing import Dict, List
 
 import pytest
 
@@ -14,7 +13,9 @@ from tests.utils import APIClient
 @pytest.mark.integration
 class TestAutomationRules:
     @pytest.fixture
-    def rule_payload(self, admin_tokens: Dict[str, Dict[str, object]]) -> Dict[str, object]:
+    def rule_payload(
+        self, admin_tokens: dict[str, dict[str, object]]
+    ) -> dict[str, object]:
         user = admin_tokens.get("user", {})
         admin_id = user.get("id")
         assert admin_id, "Admin token payload 缺少 user.id"
@@ -24,7 +25,7 @@ class TestAutomationRules:
             "name": f"Auto Rule {unique}",
             "description": "Created by automated pytest suite.",
             "rule_type": "assignment",
-            "trigger_event": "ticket.created",
+            "trigger_event": "io.chronodesk.ticket.created.v1",
             "conditions": [
                 {
                     "field": "priority",
@@ -43,10 +44,25 @@ class TestAutomationRules:
             ],
         }
 
+    def test_legacy_trigger_name_is_rejected(
+        self,
+        admin_api: APIClient,
+        rule_payload: dict[str, object],
+    ) -> None:
+        legacy_payload = {
+            **rule_payload,
+            "name": f"{rule_payload['name']} legacy trigger",
+            "trigger_event": "ticket.created",
+        }
+        response = admin_api.post_json("/admin/automation/rules", legacy_payload)
+        assert response.status_code == 400, response.text
+        body = response.json()
+        assert body.get("success") is False, body
+
     def test_rule_crud_flow(
         self,
         admin_api: APIClient,
-        rule_payload: Dict[str, object],
+        rule_payload: dict[str, object],
     ) -> None:
         created_rule_id: int | None = None
         try:
@@ -65,11 +81,15 @@ class TestAutomationRules:
             list_body = list_resp.json()
             assert list_body.get("success") is True, list_body
             list_data = list_body.get("data", {})
-            rules: List[Dict[str, object]] = list_data.get("rules", [])
-            assert any(rule.get("id") == created_rule_id for rule in rules), "规则列表未包含新建规则"
+            rules: list[dict[str, object]] = list_data.get("rules", [])
+            assert any(rule.get("id") == created_rule_id for rule in rules), (
+                "规则列表未包含新建规则"
+            )
 
             # Fetch rule detail
-            detail_resp = admin_api.get_json(f"/admin/automation/rules/{created_rule_id}")
+            detail_resp = admin_api.get_json(
+                f"/admin/automation/rules/{created_rule_id}"
+            )
             assert detail_resp.status_code == 200, detail_resp.text
             detail_body = detail_resp.json()
             assert detail_body.get("success") is True, detail_body
@@ -91,7 +111,9 @@ class TestAutomationRules:
             assert update_body.get("success") is True, update_body
 
             # Fetch stats (should default to zero counts)
-            stats_resp = admin_api.get_json(f"/admin/automation/rules/{created_rule_id}/stats")
+            stats_resp = admin_api.get_json(
+                f"/admin/automation/rules/{created_rule_id}/stats"
+            )
             assert stats_resp.status_code == 200, stats_resp.text
             stats_body = stats_resp.json()
             assert stats_body.get("success") is True, stats_body
@@ -110,7 +132,9 @@ class TestAutomationRules:
 
         finally:
             if created_rule_id is not None:
-                cleanup_resp = admin_api.delete(f"/admin/automation/rules/{created_rule_id}")
+                cleanup_resp = admin_api.delete(
+                    f"/admin/automation/rules/{created_rule_id}"
+                )
                 if cleanup_resp.status_code == 200:
                     cleanup_body = cleanup_resp.json()
                     assert cleanup_body.get("success") is True, cleanup_body

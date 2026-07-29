@@ -3,7 +3,7 @@ import polyglotI18nProvider from 'ra-i18n-polyglot'
 
 import zhCNMessages from './zhCN'
 
-export const defaultLocale = 'zh-CN'
+const defaultLocale = 'zh-CN'
 
 /**
  * 自定义页面中仍有少量直接传给 useNotify 的中文句子，因此允许缺失键原样显示；
@@ -16,4 +16,4 @@ export const i18nProvider = polyglotI18nProvider(
   { allowMissing: true },
 )
 
-export { muiZhCN, zhCNMessages }
+export { muiZhCN }

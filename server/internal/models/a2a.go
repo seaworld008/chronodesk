@@ -25,7 +25,7 @@ const (
 // by ID only: A2A lifecycle transitions never mutate the linked Ticket.
 type AgentTask struct {
 	ID                 string                        `json:"id" gorm:"primaryKey;size:64"`
-	ContextID          string                        `json:"context_id" gorm:"size:64;not null;index"`
+	ContextID          string                        `json:"context_id" gorm:"size:255;not null;index"`
 	LinkedTicketID     *uint                         `json:"linked_ticket_id,omitempty" gorm:"index"`
 	OwnerActorType     ActorType                     `json:"owner_actor_type,omitempty" gorm:"size:32;index:idx_agent_task_owner,priority:1"`
 	OwnerActorID       string                        `json:"owner_actor_id,omitempty" gorm:"size:128;index:idx_agent_task_owner,priority:2"`
@@ -36,7 +36,7 @@ type AgentTask struct {
 	Metadata           datatypes.JSON                `json:"metadata,omitempty" gorm:"type:json"`
 	Version            uint64                        `json:"version" gorm:"not null;default:1"`
 	ExecutionClaimID   string                        `json:"-" gorm:"size:64;not null;default:'';index"`
-	ExecutionMessageID string                        `json:"-" gorm:"size:64;not null;default:'';index"`
+	ExecutionMessageID string                        `json:"-" gorm:"size:255;not null;default:'';index"`
 	ExecutionExpiresAt *time.Time                    `json:"-" gorm:"index"`
 	CreatedAt          time.Time                     `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt          time.Time                     `json:"updated_at" gorm:"autoUpdateTime"`
@@ -53,9 +53,9 @@ func (AgentTask) TableName() string {
 // AgentMessage stores the complete protocol message as JSON while retaining
 // indexed routing fields for efficient task/context queries.
 type AgentMessage struct {
-	ID            string         `json:"id" gorm:"primaryKey;size:64"`
+	ID            string         `json:"id" gorm:"primaryKey;size:255"`
 	TaskID        string         `json:"task_id" gorm:"size:64;not null;index:idx_agent_messages_task_sequence,priority:1"`
-	ContextID     string         `json:"context_id" gorm:"size:64;not null;index"`
+	ContextID     string         `json:"context_id" gorm:"size:255;not null;index"`
 	Role          string         `json:"role" gorm:"size:24;not null"`
 	Sequence      uint64         `json:"sequence" gorm:"not null;index:idx_agent_messages_task_sequence,priority:2"`
 	RequestDigest string         `json:"-" gorm:"size:64;index"`
@@ -101,7 +101,7 @@ func (AgentTaskStatusHistory) TableName() string {
 type AgentTaskEvent struct {
 	ID              uint64         `json:"id" gorm:"primaryKey;autoIncrement"`
 	TaskID          string         `json:"task_id" gorm:"size:64;not null;index:idx_agent_events_task_id,priority:1"`
-	ContextID       string         `json:"context_id" gorm:"size:64;not null;index"`
+	ContextID       string         `json:"context_id" gorm:"size:255;not null;index"`
 	ResourceVersion uint64         `json:"resource_version" gorm:"not null;default:1"`
 	Payload         datatypes.JSON `json:"payload" gorm:"type:json;not null"`
 	CreatedAt       time.Time      `json:"created_at" gorm:"autoCreateTime;index:idx_agent_events_task_id,priority:2"`

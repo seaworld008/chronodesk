@@ -20,11 +20,8 @@ import (
 const (
 	envelopePrefix = "cdsec:v1:"
 
-	PrimaryKeyIDEnv          = "CHRONODESK_DATA_ENCRYPTION_PRIMARY_KEY_ID"
-	KeysEnv                  = "CHRONODESK_DATA_ENCRYPTION_KEYS"
-	AgentCredentialPepperEnv = "AGENT_CREDENTIAL_PEPPER"
-	AgentJWTSecretEnv        = "AGENT_JWT_SECRET"
-	HumanJWTSecretEnv        = "JWT_SECRET"
+	PrimaryKeyIDEnv = "CHRONODESK_DATA_ENCRYPTION_PRIMARY_KEY_ID"
+	KeysEnv         = "CHRONODESK_DATA_ENCRYPTION_KEYS"
 
 	DerivedDatabaseKeyID            = "agent-pepper-hkdf-v1"
 	DatabaseSecretsDerivationDomain = "database-secrets/v1"
@@ -279,17 +276,6 @@ func LoadDeploymentKeyring(rootSecret []byte) (*Keyring, error) {
 		DerivedDatabaseKeyID,
 		DatabaseSecretsDerivationDomain,
 	)
-}
-
-func LoadDeploymentKeyringFromEnvironment() (*Keyring, error) {
-	rootSecret := strings.TrimSpace(os.Getenv(AgentCredentialPepperEnv))
-	if rootSecret == "" {
-		rootSecret = strings.TrimSpace(os.Getenv(AgentJWTSecretEnv))
-	}
-	if rootSecret == "" {
-		rootSecret = strings.TrimSpace(os.Getenv(HumanJWTSecretEnv))
-	}
-	return LoadDeploymentKeyring([]byte(rootSecret))
 }
 
 func decodeKey(encoded string) ([]byte, error) {

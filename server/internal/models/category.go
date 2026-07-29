@@ -90,49 +90,6 @@ func (Category) TableName() string {
 	return "categories"
 }
 
-// IsActive 检查分类是否激活
-func (c *Category) IsActive() bool {
-	return c.Status == CategoryStatusActive
-}
-
-// IsInactive 检查分类是否停用
-func (c *Category) IsInactive() bool {
-	return c.Status == CategoryStatusInactive
-}
-
-// IsArchived 检查分类是否归档
-func (c *Category) IsArchived() bool {
-	return c.Status == CategoryStatusArchived
-}
-
-// IsRootCategory 检查是否为根分类
-func (c *Category) IsRootCategory() bool {
-	return c.ParentID == nil
-}
-
-// HasChildren 检查是否有子分类
-func (c *Category) HasChildren() bool {
-	return c.ChildrenCount > 0
-}
-
-// HasTickets 检查是否有工单
-func (c *Category) HasTickets() bool {
-	return c.TicketCount > 0
-}
-
-// CanBeDeleted 检查是否可以删除
-func (c *Category) CanBeDeleted() bool {
-	return !c.IsDefault && c.TicketCount == 0 && c.ChildrenCount == 0
-}
-
-// GetFullName 获取完整名称（包含父级）
-func (c *Category) GetFullName() string {
-	if c.Parent != nil {
-		return c.Parent.GetFullName() + " > " + c.Name
-	}
-	return c.Name
-}
-
 // CategoryCreateRequest 分类创建请求
 type CategoryCreateRequest struct {
 	Name             string                 `json:"name" validate:"required,max=100"`

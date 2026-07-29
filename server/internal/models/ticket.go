@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"gorm.io/datatypes"
+	"gorm.io/gorm"
 )
 
 // TicketStatus 工单状态枚举
@@ -53,6 +54,25 @@ func (s TicketStatus) CanTransitionTo(next TicketStatus) bool {
 	default:
 		return false
 	}
+}
+
+// AllowedTransitions returns the next workflow states in stable API order.
+func (s TicketStatus) AllowedTransitions() []TicketStatus {
+	candidates := []TicketStatus{
+		TicketStatusOpen,
+		TicketStatusInProgress,
+		TicketStatusPending,
+		TicketStatusResolved,
+		TicketStatusClosed,
+		TicketStatusCancelled,
+	}
+	allowed := make([]TicketStatus, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate != s && s.CanTransitionTo(candidate) {
+			allowed = append(allowed, candidate)
+		}
+	}
+	return allowed
 }
 
 // TicketPriority 工单优先级枚举
@@ -158,10 +178,10 @@ type AgentContext struct {
 
 // Ticket 工单模型
 type Ticket struct {
-	ID        uint       `json:"id" gorm:"primaryKey;autoIncrement"`
-	CreatedAt time.Time  `json:"created_at" gorm:"autoCreateTime"`
-	UpdatedAt time.Time  `json:"updated_at" gorm:"autoUpdateTime"`
-	DeletedAt *time.Time `json:"deleted_at,omitempty" gorm:"index"`
+	ID        uint           `json:"id" gorm:"primaryKey;autoIncrement"`
+	CreatedAt time.Time      `json:"created_at" gorm:"autoCreateTime"`
+	UpdatedAt time.Time      `json:"updated_at" gorm:"autoUpdateTime"`
+	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
 
 	// 基本信息
 	TicketNumber string `json:"ticket_number" gorm:"uniqueIndex;size:50;not null"` // 工单编号
@@ -180,13 +200,13 @@ type Ticket struct {
 	TrustLevel   TicketTrustLevel                 `json:"trust_level" gorm:"size:20;not null;default:'untrusted';index"`
 
 	// 用户关联
-	CreatedByID  uint  `json:"created_by_id" gorm:"not null;index"`
+	CreatedByID  *uint `json:"created_by_id,omitempty" gorm:"index"`
 	CreatedBy    *User `json:"created_by,omitempty" gorm:"foreignKey:CreatedByID"`
 	AssignedToID *uint `json:"assigned_to_id,omitempty" gorm:"index"`
 	AssignedTo   *User `json:"assigned_to,omitempty" gorm:"foreignKey:AssignedToID"`
 
-	// Actor fields are authoritative for Agent-native writes. The legacy user
-	// fields above remain populated with the configured compatibility user.
+	// Actor fields are authoritative. Human foreign keys are nullable
+	// projections and must be nil for service-principal and system actors.
 	CreatedByActorType  ActorType `json:"created_by_actor_type" gorm:"size:32;not null;default:'human';index"`
 	CreatedByActorID    string    `json:"created_by_actor_id" gorm:"size:128;index"`
 	AssignedToActorType ActorType `json:"assigned_to_actor_type,omitempty" gorm:"size:32;index"`
@@ -222,7 +242,6 @@ type Ticket struct {
 	CustomerName  string `json:"customer_name" gorm:"size:100"`
 
 	// 附加信息
-	Attachments   datatypes.JSONSlice[string]        `json:"attachments" gorm:"type:jsonb"`   // JSONB格式存储附件列表
 	CustomFields  datatypes.JSONType[map[string]any] `json:"custom_fields" gorm:"type:jsonb"` // JSONB格式存储自定义字段
 	InternalNotes string                             `json:"internal_notes" gorm:"type:text"` // 内部备注
 
@@ -306,7 +325,6 @@ type TicketCreateRequest struct {
 	CustomerEmail string         `json:"customer_email" binding:"omitempty,email"`
 	CustomerPhone string         `json:"customer_phone"`
 	CustomerName  string         `json:"customer_name"`
-	Attachments   []string       `json:"attachments"`
 	CustomFields  *JSONMap       `json:"custom_fields"`
 	AgentContext  *AgentContext  `json:"agent_context"`
 }
@@ -346,7 +364,7 @@ type TicketResponse struct {
 	Priority        TicketPriority         `json:"priority"`
 	Status          TicketStatus           `json:"status"`
 	Source          TicketSource           `json:"source"`
-	CreatedByID     uint                   `json:"created_by_id"`
+	CreatedByID     *uint                  `json:"created_by_id,omitempty"`
 	CreatedBy       *UserSummary           `json:"created_by,omitempty"`
 	AssignedToID    *uint                  `json:"assigned_to_id,omitempty"`
 	AssignedTo      *UserSummary           `json:"assigned_to,omitempty"`
@@ -366,7 +384,6 @@ type TicketResponse struct {
 	CustomerEmail   string                 `json:"customer_email"`
 	CustomerPhone   string                 `json:"customer_phone"`
 	CustomerName    string                 `json:"customer_name"`
-	Attachments     []string               `json:"attachments"`
 	CustomFields    map[string]interface{} `json:"custom_fields"`
 	ViewCount       int                    `json:"view_count"`
 	CommentCount    int                    `json:"comment_count"`
@@ -424,16 +441,9 @@ func (t *Ticket) ToResponse() *TicketResponse {
 		IsEscalated: t.IsEscalated,
 	}
 
-	if t.CreatedByActorType != "" && t.CreatedByActorID != "" {
-		response.CreatedByActor = ActorRef{Type: t.CreatedByActorType, ID: t.CreatedByActorID}
-	} else {
-		response.CreatedByActor = HumanActor(t.CreatedByID)
-	}
+	response.CreatedByActor = ActorRef{Type: t.CreatedByActorType, ID: t.CreatedByActorID}
 	if t.AssignedToActorType != "" && t.AssignedToActorID != "" {
 		assignedActor := ActorRef{Type: t.AssignedToActorType, ID: t.AssignedToActorID}
-		response.AssignedToActor = &assignedActor
-	} else if t.AssignedToID != nil {
-		assignedActor := HumanActor(*t.AssignedToID)
 		response.AssignedToActor = &assignedActor
 	}
 
@@ -455,7 +465,6 @@ func (t *Ticket) ToResponse() *TicketResponse {
 
 	// 直接使用JSONB类型字段（无需手动解析）
 	response.Tags = t.Tags
-	response.Attachments = t.Attachments
 	response.CustomFields = t.CustomFields.Data()
 
 	return response

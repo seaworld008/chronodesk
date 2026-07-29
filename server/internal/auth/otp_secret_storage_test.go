@@ -46,7 +46,7 @@ func newOTPSecretStorageTest(
 		Username:     "otp-storage-user",
 		Email:        "otp-storage@example.test",
 		PasswordHash: "$2a$10$3fG2XevM/i0vGg3tnBFDGuE6PoIgto7HGMlZosX8KCOj4I8tC9q2a",
-		Role:         RoleUser,
+		Role:         RoleCustomer,
 		Status:       StatusActive,
 	}
 	if err := repository.Create(context.Background(), user); err != nil {
@@ -186,39 +186,30 @@ func TestBackupCodeCanOnlyBeConsumedOnceConcurrently(t *testing.T) {
 	}
 }
 
-func TestLegacyOTPCredentialsRequireExplicitIdempotentMigration(t *testing.T) {
+func TestAuthCredentialValidationRejectsPlaintextOTPSecret(t *testing.T) {
 	db, _, ring, user := newOTPSecretStorageTest(t)
+	hashes, err := hashBackupCodes([]string{"ABCDEF12", "ZXCVBN34"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := db.Model(&models.User{}).Where("id = ?", user.ID).Updates(map[string]interface{}{
 		"two_factor_enabled": true,
 		"two_factor_secret":  "JBSWY3DPEHPK3PXP",
-		"backup_codes":       "ABCDEF12,ZXCVBN34",
+		"backup_codes":       hashes,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
 
-	if err := ValidateAuthCredentialStorage(context.Background(), db, ring); err == nil {
-		t.Fatal("runtime validation accepted plaintext OTP credentials")
-	}
-	report, err := MigrateLegacyAuthCredentials(context.Background(), db, ring)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if report.EncryptedOTPSecrets != 1 || report.HashedBackupCodes != 1 {
-		t.Fatalf("migration report = %+v, want one encrypted secret and one hashed code set", report)
-	}
-	if err := ValidateAuthCredentialStorage(context.Background(), db, ring); err != nil {
-		t.Fatalf("post-migration validation failed: %v", err)
-	}
-	second, err := MigrateLegacyAuthCredentials(context.Background(), db, ring)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if second != (CredentialMigrationReport{}) {
-		t.Fatalf("second migration was not idempotent: %+v", second)
+	if err := ValidateAuthCredentialStorage(
+		context.Background(),
+		db,
+		ring,
+	); !errors.Is(err, security.ErrPlaintextSecret) {
+		t.Fatalf("validation error = %v, want ErrPlaintextSecret", err)
 	}
 }
 
-func TestAuthCredentialValidationRejectsLegacyPasswordHash(t *testing.T) {
+func TestAuthCredentialValidationRejectsUnsupportedPasswordHash(t *testing.T) {
 	db, _, ring, user := newOTPSecretStorageTest(t)
 	if err := db.Model(&models.User{}).
 		Where("id = ?", user.ID).
@@ -231,11 +222,43 @@ func TestAuthCredentialValidationRejectsLegacyPasswordHash(t *testing.T) {
 	}
 }
 
-func TestCredentialMigrationAlsoProtectsSoftDeletedUsers(t *testing.T) {
+func TestAuthCredentialValidationRejectsDisabledCredentialsWithoutRewriting(t *testing.T) {
 	db, _, ring, user := newOTPSecretStorageTest(t)
 	if err := db.Model(&models.User{}).Where("id = ?", user.ID).Updates(map[string]interface{}{
+		"two_factor_enabled": false,
+		"two_factor_secret":  "unsupported-disabled-secret",
+		"backup_codes":       "unsupported-disabled-code",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAuthCredentialStorage(context.Background(), db, ring); err == nil ||
+		!strings.Contains(err.Error(), "disabled OTP credentials remain") {
+		t.Fatalf("validation error = %v, want disabled OTP credential rejection", err)
+	}
+
+	var stored models.User
+	if err := db.Unscoped().Select("two_factor_secret", "backup_codes").
+		First(&stored, user.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.TwoFactorSecret != "unsupported-disabled-secret" ||
+		stored.BackupCodes != "unsupported-disabled-code" {
+		t.Fatal("validation unexpectedly rewrote disabled OTP credentials")
+	}
+}
+
+func TestAuthCredentialValidationChecksSoftDeletedBackupCodes(t *testing.T) {
+	db, _, ring, user := newOTPSecretStorageTest(t)
+	envelope, err := ring.Seal(
+		[]byte("JBSWY3DPEHPK3PXP"),
+		otpSecretAAD(user.ID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.User{}).Where("id = ?", user.ID).Updates(map[string]interface{}{
 		"two_factor_enabled": true,
-		"two_factor_secret":  "JBSWY3DPEHPK3PXP",
+		"two_factor_secret":  envelope,
 		"backup_codes":       "ABCDEF12",
 	}).Error; err != nil {
 		t.Fatal(err)
@@ -243,21 +266,15 @@ func TestCredentialMigrationAlsoProtectsSoftDeletedUsers(t *testing.T) {
 	if err := db.Delete(&models.User{}, user.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if _, err := MigrateLegacyAuthCredentials(context.Background(), db, ring); err != nil {
-		t.Fatal(err)
-	}
-	if err := ValidateAuthCredentialStorage(context.Background(), db, ring); err != nil {
-		t.Fatal(err)
+	if err := ValidateAuthCredentialStorage(context.Background(), db, ring); !errors.Is(err, ErrInvalidBackupCodeStorage) {
+		t.Fatalf("validation error = %v, want ErrInvalidBackupCodeStorage", err)
 	}
 	var stored models.User
 	if err := db.Unscoped().Select("two_factor_secret", "backup_codes").
 		First(&stored, user.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if !security.IsEnvelope(stored.TwoFactorSecret) {
-		t.Fatal("soft-deleted user's TOTP secret remained plaintext")
-	}
-	if strings.Contains(stored.BackupCodes, "ABCDEF12") {
-		t.Fatal("soft-deleted user's backup code remained plaintext")
+	if stored.TwoFactorSecret != envelope || stored.BackupCodes != "ABCDEF12" {
+		t.Fatal("validation unexpectedly rewrote soft-deleted credentials")
 	}
 }

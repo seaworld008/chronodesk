@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/seaworld008/chronodesk/server/internal/httpcontract"
 )
 
 func TestCursorRoundTripAndTamperRejection(t *testing.T) {
@@ -23,16 +25,16 @@ func TestCursorRoundTripAndTamperRejection(t *testing.T) {
 }
 
 func TestETagRoundTrip(t *testing.T) {
-	if got := FormatETag(17); got != `"v17"` {
-		t.Fatalf("FormatETag() = %q", got)
+	if got := httpcontract.FormatETag(17); got != `"v17"` {
+		t.Fatalf("httpcontract.FormatETag() = %q", got)
 	}
-	version, err := ParseIfMatch(`"v17"`)
+	version, err := httpcontract.ParseIfMatch(`"v17"`)
 	if err != nil || version != 17 {
-		t.Fatalf("ParseIfMatch() = %d, %v", version, err)
+		t.Fatalf("httpcontract.ParseIfMatch() = %d, %v", version, err)
 	}
 	for _, invalid := range []string{"", "v17", `"17"`, `"v0"`, "*"} {
-		if _, err := ParseIfMatch(invalid); err == nil {
-			t.Fatalf("ParseIfMatch(%q) unexpectedly succeeded", invalid)
+		if _, err := httpcontract.ParseIfMatch(invalid); err == nil {
+			t.Fatalf("httpcontract.ParseIfMatch(%q) unexpectedly succeeded", invalid)
 		}
 	}
 }

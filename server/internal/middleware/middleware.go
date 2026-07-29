@@ -2,7 +2,6 @@ package middleware
 
 import (
 	"os"
-	"time"
 )
 
 // HTTPContext is the small framework-neutral surface used by the active
@@ -26,7 +25,6 @@ type MiddlewareConfig struct {
 	Logger     *LoggerConfig
 	Recovery   *RecoveryConfig
 	Security   *SecurityConfig
-	CSRF       *CSRFConfig
 	Additional []func(HTTPContext)
 }
 
@@ -34,16 +32,13 @@ type MiddlewareConfig struct {
 // cross-cutting middleware stack.
 func DefaultMiddlewareConfig() *MiddlewareConfig {
 	return &MiddlewareConfig{
-		CORS: DefaultCORSConfig(),
-		RateLimit: &RateLimitConfig{
-			Limiter: NewTokenBucket(100, 10, time.Minute),
-			KeyFunc: func(c HTTPContext) string { return getClientIP(c) },
-			Headers: true,
-		},
+		// Rate limiting is deliberately not enabled by a process-local
+		// default. Application composition must install the authoritative
+		// distributed limiter for each authenticated or anonymous surface.
+		CORS:     DefaultCORSConfig(),
 		Logger:   DefaultLoggerConfig(),
 		Recovery: DefaultRecoveryConfig(),
 		Security: DefaultSecurityConfig(),
-		CSRF:     DefaultCSRFConfig(),
 	}
 }
 
@@ -79,7 +74,7 @@ func SetupMiddlewares(config *MiddlewareConfig) []func(HTTPContext) {
 		config = DefaultMiddlewareConfig()
 	}
 
-	middlewares := make([]func(HTTPContext), 0, 7)
+	middlewares := make([]func(HTTPContext), 0, 6)
 	middlewares = append(middlewares, RequestIDMiddleware())
 	if config.Recovery != nil {
 		middlewares = append(middlewares, RecoveryMiddleware(config.Recovery))
@@ -95,9 +90,6 @@ func SetupMiddlewares(config *MiddlewareConfig) []func(HTTPContext) {
 	}
 	if config.RateLimit != nil {
 		middlewares = append(middlewares, RateLimit(config.RateLimit))
-	}
-	if config.CSRF != nil {
-		middlewares = append(middlewares, CSRFMiddleware(config.CSRF))
 	}
 	middlewares = append(middlewares, config.Additional...)
 	return middlewares

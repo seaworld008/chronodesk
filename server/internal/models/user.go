@@ -13,10 +13,18 @@ const (
 	RoleAdmin      UserRole = "admin"      // 管理员
 	RoleAgent      UserRole = "agent"      // 客服代理
 	RoleCustomer   UserRole = "customer"   // 客户
-	RoleUser       UserRole = "user"       // 旧认证模块的客户角色（兼容）
 	RoleSupervisor UserRole = "supervisor" // 主管
-	RoleSuperUser  UserRole = "superuser"  // 超级管理员（兼容认证模块）
 )
+
+// IsValid reports whether the role belongs to the closed human-role set.
+func (r UserRole) IsValid() bool {
+	switch r {
+	case RoleAdmin, RoleSupervisor, RoleAgent, RoleCustomer:
+		return true
+	default:
+		return false
+	}
+}
 
 // UserStatus 用户状态枚举
 type UserStatus string
@@ -50,7 +58,7 @@ type User struct {
 	Language    string `json:"language" gorm:"size:10;default:'zh-CN'"`
 
 	// 角色和权限
-	Role        UserRole   `json:"role" gorm:"size:20;not null;default:'customer';index" validate:"required,oneof=admin agent customer user supervisor superuser"`
+	Role        UserRole   `json:"role" gorm:"size:20;not null;default:'customer';index;check:chk_users_role,role IN ('admin','supervisor','agent','customer')" validate:"required,oneof=admin supervisor agent customer"`
 	Status      UserStatus `json:"status" gorm:"size:20;not null;default:'inactive';index" validate:"required,oneof=active inactive suspended deleted"`
 	Permissions string     `json:"permissions" gorm:"type:text"` // JSON格式存储权限列表
 
@@ -70,6 +78,10 @@ type User struct {
 	LockedUntil        *time.Time `json:"locked_until,omitempty"`
 	PasswordResetToken string     `json:"-" gorm:"size:255"`
 	PasswordResetAt    *time.Time `json:"password_reset_at,omitempty"`
+	// WelcomeEmailDeliveredAt is the durable idempotency receipt for the
+	// authentication email Outbox. It is intentionally not exposed through
+	// human or machine user contracts.
+	WelcomeEmailDeliveredAt *time.Time `json:"-"`
 
 	// 业务相关
 	Department string `json:"department" gorm:"size:100"`
@@ -126,7 +138,7 @@ func (u *User) HasRole(role UserRole) bool {
 
 // IsAdmin 检查是否为管理员
 func (u *User) IsAdmin() bool {
-	return u.Role == RoleAdmin || u.Role == RoleSuperUser
+	return u.Role == RoleAdmin
 }
 
 // IsAgent 检查是否为客服代理
@@ -136,7 +148,7 @@ func (u *User) IsAgent() bool {
 
 // IsCustomer 检查是否为客户
 func (u *User) IsCustomer() bool {
-	return u.Role == RoleCustomer || u.Role == RoleUser
+	return u.Role == RoleCustomer
 }
 
 // IsSupervisor 检查是否为主管
@@ -153,7 +165,7 @@ type UserCreateRequest struct {
 	FirstName   string   `json:"first_name" binding:"omitempty,max=50"`
 	LastName    string   `json:"last_name" binding:"omitempty,max=50"`
 	DisplayName string   `json:"display_name" binding:"omitempty,max=100"`
-	Role        UserRole `json:"role" binding:"required,oneof=admin agent customer user supervisor superuser"`
+	Role        UserRole `json:"role" binding:"required,oneof=admin supervisor agent customer"`
 	Department  string   `json:"department" binding:"omitempty,max=100"`
 	JobTitle    string   `json:"job_title" binding:"omitempty,max=100"`
 	ManagerID   *uint    `json:"manager_id"`
@@ -169,7 +181,7 @@ type UserUpdateRequest struct {
 	Avatar        *string     `json:"avatar"`
 	Timezone      *string     `json:"timezone" binding:"omitempty,max=50"`
 	Language      *string     `json:"language" binding:"omitempty,max=10"`
-	Role          *UserRole   `json:"role" binding:"omitempty,oneof=admin agent customer user supervisor superuser"`
+	Role          *UserRole   `json:"role" binding:"omitempty,oneof=admin supervisor agent customer"`
 	Status        *UserStatus `json:"status" binding:"omitempty,oneof=active inactive suspended deleted"`
 	EmailVerified *bool       `json:"email_verified"`
 	Department    *string     `json:"department" binding:"omitempty,max=100"`

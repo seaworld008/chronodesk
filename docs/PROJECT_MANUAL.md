@@ -70,7 +70,7 @@ ChronoDesk 是面向单组织私有化部署的企业工单自动化平台。它
 │   ├── cmd/
 │   │   ├── chronodesk/           # 最小可执行入口
 │   │   ├── migrate/              # 唯一结构迁移入口
-│   │   └── secret-migrate/       # 显式敏感字段迁移与验证
+│   │   └── credential-maintain/  # 凭据验证、密钥轮换与密码隔离
 │   ├── internal/
 │   │   ├── app/                  # 组合根、后台任务与优雅退出
 │   │   ├── a2a/                  # A2A v1.0.1 / wire 1.0 与 Task 存储
@@ -144,15 +144,22 @@ cd server && make migrate
 cd server && make migrate-seed
 ```
 
+演示账号与演示工单不属于基础种子数据；只可在隔离开发环境执行
+`make migrate-sample`。远程 PostgreSQL 必须使用 TLS，明文放行开关不得用于
+共享或生产环境。
+
 `migrate-drop` 仅用于一次性开发数据库，必须交互输入 `DROP`；不得用于共享或生产环境。
 
-既有数据库完成结构迁移后，需要显式迁移并验证敏感字段：
+数据库完成结构迁移后，必须只读验证当前凭据格式：
 
 ```bash
 cd server
-go run ./cmd/secret-migrate
-go run ./cmd/secret-migrate -validate-only
+go run ./cmd/credential-maintain -validate-only
 ```
+
+维护命令不会摄入历史明文。发现不支持的密码哈希时，管理员可显式执行
+`-quarantine`，随后完成正常密码重置并在审查后重新启用账号；信封密钥轮换
+使用 `-rotate`。
 
 详见 [数据库敏感字段静态加密](reference/DATA_AT_REST_ENCRYPTION.md)。
 
@@ -162,7 +169,9 @@ go run ./cmd/secret-migrate -validate-only
 
 - PostgreSQL：`DATABASE_URL` 或 `DB_*`。
 - Redis：`REDIS_*`；Redis 是运行、限流、调度和 Agent 控制的必要依赖。
-- 人类认证：`JWT_SECRET`、`JWT_REFRESH_SECRET`、`BCRYPT_COST`。
+- 人类认证：`JWT_SECRET`、`JWT_REFRESH_SECRET` 均至少 32 个字符且彼此独立；
+  issuer 固定为 `APP_URL`，REST audience 固定为 `${APP_URL}/api`。
+  `BCRYPT_COST` 必须在 10–16，默认及推荐值为 12，非法值会阻止启动。
 - Agent 身份：`AGENT_JWT_SECRET`、`AGENT_CREDENTIAL_PEPPER`、`AGENT_ISSUER`、TTL 与并发/附件限制。
 - 静态加密：`CHRONODESK_DATA_ENCRYPTION_PRIMARY_KEY_ID`、`CHRONODESK_DATA_ENCRYPTION_KEYS`。
 - 网络安全：`CORS_ALLOWED_*`、`TRUSTED_PROXIES` 和请求限流。

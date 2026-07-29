@@ -48,7 +48,7 @@ func TestValidate_RequiresJWTRefreshSecretInProduction(t *testing.T) {
 			Environment: "production",
 		},
 		JWT: JWTConfig{
-			Secret:        "changed-secret",
+			Secret:        "human-access-0123456789-abcdef-XYZ",
 			RefreshSecret: "your-super-secret-jwt-refresh-key-change-in-production",
 		},
 		Database: DatabaseConfig{
@@ -67,9 +67,95 @@ func TestValidate_RequiresJWTRefreshSecretInProduction(t *testing.T) {
 	}
 }
 
+func TestValidateProductionRequiresStrongIndependentSecrets(t *testing.T) {
+	valid := Config{
+		Server: ServerConfig{Environment: "production"},
+		App:    AppConfig{URL: "https://desk.internal.example"},
+		JWT: JWTConfig{
+			Secret:           "human-access-0123456789-abcdef-XYZ",
+			RefreshSecret:    "human-refresh-0123456789-abcdef-XYZ",
+			ExpiresIn:        time.Hour,
+			RefreshExpiresIn: 24 * time.Hour,
+			Issuer:           "https://desk.internal.example",
+			Audience:         "https://desk.internal.example/api",
+		},
+		Security: SecurityConfig{BcryptCost: 12},
+		Agent: AgentConfig{
+			Issuer:             "https://desk.internal.example",
+			MCPResourceURL:     "https://desk.internal.example/mcp",
+			APIResourceURL:     "https://desk.internal.example/api/v1",
+			A2AResourceURL:     "https://desk.internal.example/a2a/v1",
+			JWTSecret:          "agent-access-0123456789-abcdef-XYZ",
+			CredentialPepper:   "agent-pepper-0123456789-abcdef-XYZ",
+			TokenTTL:           15 * time.Minute,
+			CredentialTTL:      24 * time.Hour,
+			MaxAttachmentBytes: 1,
+			LoopThreshold:      1,
+			LoopWindow:         time.Minute,
+		},
+		Database: DatabaseConfig{Host: "localhost", User: "user", Name: "db"},
+		Redis:    RedisConfig{Host: "localhost"},
+		RateLimit: RateLimitConfig{
+			Requests:                  100,
+			Window:                    time.Hour,
+			AnonymousIdentityRequests: 20,
+			AnonymousIPRequests:       200,
+			AnonymousWindow:           time.Minute,
+		},
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid production secrets rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name: "short human access",
+			mutate: func(cfg *Config) {
+				cfg.JWT.Secret = "a"
+			},
+		},
+		{
+			name: "placeholder human refresh",
+			mutate: func(cfg *Config) {
+				cfg.JWT.RefreshSecret = "replace-with-a-real-refresh-secret-value"
+			},
+		},
+		{
+			name: "human access and refresh are equal",
+			mutate: func(cfg *Config) {
+				cfg.JWT.RefreshSecret = cfg.JWT.Secret
+			},
+		},
+		{
+			name: "Agent JWT equals human refresh",
+			mutate: func(cfg *Config) {
+				cfg.Agent.JWTSecret = cfg.JWT.RefreshSecret
+			},
+		},
+		{
+			name: "credential pepper equals human access",
+			mutate: func(cfg *Config) {
+				cfg.Agent.CredentialPepper = cfg.JWT.Secret
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := valid
+			test.mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("expected production secret validation to fail")
+			}
+		})
+	}
+}
+
 func TestLoadConfig_UsesJWTRefreshSecretEnv(t *testing.T) {
-	t.Setenv("JWT_SECRET", "secret-1")
-	t.Setenv("JWT_REFRESH_SECRET", "refresh-secret-1")
+	t.Setenv("JWT_SECRET", "human-access-secret-0123456789-abcdef")
+	t.Setenv("JWT_REFRESH_SECRET", "human-refresh-secret-0123456789-abcdef")
 	t.Setenv("ENVIRONMENT", "development")
 
 	cfg, err := Load()
@@ -77,7 +163,7 @@ func TestLoadConfig_UsesJWTRefreshSecretEnv(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if cfg.JWT.RefreshSecret != "refresh-secret-1" {
+	if cfg.JWT.RefreshSecret != "human-refresh-secret-0123456789-abcdef" {
 		t.Fatalf("expected refresh secret from env, got: %q", cfg.JWT.RefreshSecret)
 	}
 }
@@ -99,6 +185,12 @@ func TestLoadConfig_DefaultsUseCanonicalAgentResourceURLs(t *testing.T) {
 	}
 	if cfg.Agent.Issuer != cfg.App.URL {
 		t.Errorf("default Agent issuer = %q, want APP URL %q", cfg.Agent.Issuer, cfg.App.URL)
+	}
+	if cfg.JWT.Issuer != cfg.App.URL {
+		t.Errorf("default human JWT issuer = %q, want APP URL %q", cfg.JWT.Issuer, cfg.App.URL)
+	}
+	if cfg.JWT.Audience != cfg.App.URL+"/api" {
+		t.Errorf("default human JWT audience = %q, want %q", cfg.JWT.Audience, cfg.App.URL+"/api")
 	}
 	for name, resource := range map[string]struct {
 		got  string
@@ -126,12 +218,93 @@ func TestLoadConfig_AcceptsConfigurablePublicOrigin(t *testing.T) {
 	if cfg.Server.Port != "8081" || cfg.App.URL != "https://desk.internal.example" {
 		t.Fatalf("unexpected listen/public configuration: %#v %#v", cfg.Server, cfg.App)
 	}
+	if cfg.JWT.Issuer != cfg.App.URL || cfg.JWT.Audience != cfg.App.URL+"/api" {
+		t.Fatalf("unexpected human JWT resource contract: %#v", cfg.JWT)
+	}
+}
+
+func TestLoadConfigRejectsInvalidBcryptCost(t *testing.T) {
+	for _, value := range []string{"not-a-number", "9", "17"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("BCRYPT_COST", value)
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load() accepted BCRYPT_COST=%q", value)
+			}
+		})
+	}
+}
+
+func TestValidateHumanJWTTrustContractFailsClosed(t *testing.T) {
+	base, err := Load()
+	if err != nil {
+		t.Fatalf("load baseline config: %v", err)
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{
+			name: "empty access secret",
+			mutate: func(config *Config) {
+				config.JWT.Secret = ""
+			},
+			wantErr: "access secret",
+		},
+		{
+			name: "empty refresh secret",
+			mutate: func(config *Config) {
+				config.JWT.RefreshSecret = ""
+			},
+			wantErr: "refresh secret",
+		},
+		{
+			name: "same secrets",
+			mutate: func(config *Config) {
+				config.JWT.RefreshSecret = config.JWT.Secret
+			},
+			wantErr: "must be different",
+		},
+		{
+			name: "issuer differs from APP URL",
+			mutate: func(config *Config) {
+				config.JWT.Issuer = "https://auth.example.test"
+			},
+			wantErr: "issuer must exactly match APP URL",
+		},
+		{
+			name: "audience differs from human REST resource",
+			mutate: func(config *Config) {
+				config.JWT.Audience = config.App.URL + "/api/v1"
+			},
+			wantErr: "audience must exactly match",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := *base
+			test.mutate(&config)
+			err := config.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("Validate() error = %v, want substring %q", err, test.wantErr)
+			}
+		})
+	}
 }
 
 func TestValidate_AgentEndpointContract(t *testing.T) {
 	valid := Config{
 		Server: ServerConfig{Environment: "development"},
 		App:    AppConfig{URL: "https://desk.internal.example"},
+		JWT: JWTConfig{
+			Secret:           "human-access-0123456789-abcdef-XYZ",
+			RefreshSecret:    "human-refresh-0123456789-abcdef-XYZ",
+			ExpiresIn:        time.Hour,
+			RefreshExpiresIn: 24 * time.Hour,
+			Issuer:           "https://desk.internal.example",
+			Audience:         "https://desk.internal.example/api",
+		},
+		Security: SecurityConfig{BcryptCost: 12},
 		Agent: AgentConfig{
 			Issuer:             "https://desk.internal.example",
 			MCPResourceURL:     "https://desk.internal.example/mcp",
@@ -146,10 +319,11 @@ func TestValidate_AgentEndpointContract(t *testing.T) {
 		Database: DatabaseConfig{Host: "localhost", User: "user", Name: "db"},
 		Redis:    RedisConfig{Host: "localhost"},
 		RateLimit: RateLimitConfig{
-			Requests:          100,
-			Window:            time.Hour,
-			AnonymousRequests: 20,
-			AnonymousWindow:   time.Minute,
+			Requests:                  100,
+			Window:                    time.Hour,
+			AnonymousIdentityRequests: 20,
+			AnonymousIPRequests:       200,
+			AnonymousWindow:           time.Minute,
 		},
 	}
 	if err := valid.Validate(); err != nil {
@@ -226,9 +400,16 @@ func TestValidate_AgentEndpointContract(t *testing.T) {
 			wantErr: "rate limit requests and windows must be positive",
 		},
 		{
-			name: "anonymous rate limit count is not positive",
+			name: "anonymous identity rate limit count is not positive",
 			mutate: func(cfg *Config) {
-				cfg.RateLimit.AnonymousRequests = 0
+				cfg.RateLimit.AnonymousIdentityRequests = 0
+			},
+			wantErr: "rate limit requests and windows must be positive",
+		},
+		{
+			name: "anonymous IP rate limit count is not positive",
+			mutate: func(cfg *Config) {
+				cfg.RateLimit.AnonymousIPRequests = 0
 			},
 			wantErr: "rate limit requests and windows must be positive",
 		},

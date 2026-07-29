@@ -377,35 +377,50 @@ func TestDiscoverAdvertisesOnlyMCP20260728(t *testing.T) {
 	}
 }
 
-func TestDiscoverNegotiationProbeMayOmitProtocolHeaders(t *testing.T) {
+func TestDiscoverRequiresProtocolHeaders(t *testing.T) {
 	fixture := newTestFixture(t, []string{"*"})
 	response := fixture.postWithHeaders("server/discover", "", nil, nil)
-	if response.StatusCode != http.StatusOK {
+	if response.StatusCode != http.StatusBadRequest {
 		body, _ := io.ReadAll(response.Body)
 		t.Fatalf("headerless discover status=%d body=%s", response.StatusCode, body)
 	}
-	payload := decodeRPCResponse(t, response)
-	result, ok := payload["result"].(map[string]any)
-	if !ok {
-		t.Fatalf("headerless discover result=%#v", payload)
-	}
-	versions, ok := result["supportedVersions"].([]any)
-	if !ok || len(versions) != 1 || versions[0] != ProtocolVersion {
-		t.Fatalf("headerless discover supportedVersions=%#v", result["supportedVersions"])
+	if code := rpcErrorCode(t, response); code != float64(sdkmcp.CodeHeaderMismatch) {
+		t.Fatalf("code=%v want=%v", code, sdkmcp.CodeHeaderMismatch)
 	}
 }
 
-func TestDiscoverNegotiationProbeStillRequiresModernEnvelope(t *testing.T) {
+func TestRemovedTransportHeadersHaveNoSemantics(t *testing.T) {
+	fixture := newTestFixture(t, []string{"*"})
+	response := fixture.postWithHeaders("server/discover", "", nil, map[string]string{
+		HeaderProtocolVersion: ProtocolVersion,
+		HeaderMethod:          "server/discover",
+		"Mcp-Session-Id":      "removed-session",
+		"Last-Event-ID":       "removed-cursor",
+	})
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("discover status=%d body=%s", response.StatusCode, body)
+	}
+	defer response.Body.Close()
+	if response.Header.Get("Mcp-Session-Id") != "" ||
+		response.Header.Get("Last-Event-ID") != "" {
+		t.Fatalf("removed transport headers were echoed: %#v", response.Header)
+	}
+}
+
+func TestDiscoverRequiresModernEnvelope(t *testing.T) {
 	fixture := newTestFixture(t, []string{"*"})
 	tests := []struct {
-		name   string
-		params map[string]any
+		name     string
+		params   map[string]any
+		wantCode int64
 	}{
 		{
 			name: "missing protocol version",
 			params: map[string]any{"_meta": map[string]any{
 				"io.modelcontextprotocol/clientCapabilities": map[string]any{},
 			}},
+			wantCode: sdkjsonrpc.CodeInvalidParams,
 		},
 		{
 			name: "unsupported protocol version",
@@ -413,17 +428,21 @@ func TestDiscoverNegotiationProbeStillRequiresModernEnvelope(t *testing.T) {
 				"io.modelcontextprotocol/protocolVersion":    "2025-11-25",
 				"io.modelcontextprotocol/clientCapabilities": map[string]any{},
 			}},
+			wantCode: sdkmcp.CodeHeaderMismatch,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			response := fixture.postWithHeaders("server/discover", "", test.params, nil)
+			response := fixture.postWithHeaders("server/discover", "", test.params, map[string]string{
+				HeaderProtocolVersion: ProtocolVersion,
+				HeaderMethod:          "server/discover",
+			})
 			if response.StatusCode != http.StatusBadRequest {
 				body, _ := io.ReadAll(response.Body)
 				t.Fatalf("status=%d body=%s", response.StatusCode, body)
 			}
-			if code := rpcErrorCode(t, response); code != float64(sdkmcp.CodeHeaderMismatch) {
-				t.Fatalf("code=%v want=%v", code, sdkmcp.CodeHeaderMismatch)
+			if code := rpcErrorCode(t, response); code != float64(test.wantCode) {
+				t.Fatalf("code=%v want=%v", code, test.wantCode)
 			}
 		})
 	}
@@ -433,7 +452,10 @@ func TestDiscoverNegotiationProbeStillRequiresModernEnvelope(t *testing.T) {
 			"_meta": map[string]any{
 				"io.modelcontextprotocol/protocolVersion": ProtocolVersion,
 			},
-		}, nil)
+		}, map[string]string{
+			HeaderProtocolVersion: ProtocolVersion,
+			HeaderMethod:          "server/discover",
+		})
 		if response.StatusCode != http.StatusBadRequest {
 			body, _ := io.ReadAll(response.Body)
 			t.Fatalf("status=%d body=%s", response.StatusCode, body)
@@ -580,7 +602,7 @@ func TestOnlyStatelessPOSTTransportIsAvailable(t *testing.T) {
 	}
 }
 
-func TestLatestNotificationReturns202WithoutBody(t *testing.T) {
+func TestStreamableHTTPRejectsClientNotification(t *testing.T) {
 	fixture := newTestFixture(t, []string{"*"})
 	payload := map[string]any{
 		"jsonrpc": "2.0",
@@ -609,16 +631,12 @@ func TestLatestNotificationReturns202WithoutBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusAccepted {
+	if response.StatusCode != http.StatusBadRequest {
 		responseBody, _ := io.ReadAll(response.Body)
 		t.Fatalf("notification status=%d body=%s", response.StatusCode, responseBody)
 	}
-	responseBody, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(responseBody) != 0 {
-		t.Fatalf("notification returned a response body: %q", responseBody)
+	if code := rpcErrorCode(t, response); code != float64(sdkjsonrpc.CodeInvalidRequest) {
+		t.Fatalf("code=%v want=%v", code, sdkjsonrpc.CodeInvalidRequest)
 	}
 }
 
@@ -687,6 +705,20 @@ func TestModernProtocolAndHeaderValidation(t *testing.T) {
 			name:       "unknown method",
 			method:     "chronodesk/unknown",
 			headers:    map[string]string{HeaderProtocolVersion: ProtocolVersion, HeaderMethod: "chronodesk/unknown"},
+			wantStatus: http.StatusNotFound,
+			wantCode:   -32601,
+		},
+		{
+			name:       "removed legacy resource subscribe",
+			method:     "resources/subscribe",
+			headers:    map[string]string{HeaderProtocolVersion: ProtocolVersion, HeaderMethod: "resources/subscribe"},
+			wantStatus: http.StatusNotFound,
+			wantCode:   -32601,
+		},
+		{
+			name:       "removed legacy resource unsubscribe",
+			method:     "resources/unsubscribe",
+			headers:    map[string]string{HeaderProtocolVersion: ProtocolVersion, HeaderMethod: "resources/unsubscribe"},
 			wantStatus: http.StatusNotFound,
 			wantCode:   -32601,
 		},

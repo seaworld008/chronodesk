@@ -6,7 +6,7 @@ import (
 	"gorm.io/datatypes"
 )
 
-func TestActorRefValidationAndLegacyFallbacks(t *testing.T) {
+func TestActorRefValidationAndAuthoritativeBusinessActors(t *testing.T) {
 	human := HumanActor(42)
 	if err := human.Validate(); err != nil {
 		t.Fatalf("human actor should be valid: %v", err)
@@ -21,18 +21,42 @@ func TestActorRefValidationAndLegacyFallbacks(t *testing.T) {
 		t.Fatal("unknown actor type must be rejected")
 	}
 
-	comment := TicketComment{UserID: 42}
-	if comment.Actor() != human {
-		t.Fatalf("legacy comment should fall back to human actor: %+v", comment.Actor())
-	}
 	userID := uint(42)
-	history := TicketHistory{UserID: &userID}
-	if history.Actor() != human {
-		t.Fatalf("legacy history should fall back to human actor: %+v", history.Actor())
+	comment := TicketComment{
+		UserID:    &userID,
+		ActorType: ActorTypeHuman,
+		ActorID:   "42",
 	}
-	systemHistory := TicketHistory{}
+	if comment.Actor() != human {
+		t.Fatalf("comment actor should be authoritative: %+v", comment.Actor())
+	}
+	history := TicketHistory{UserID: &userID, ActorType: ActorTypeHuman, ActorID: "42"}
+	if history.Actor() != human {
+		t.Fatalf("history actor should be authoritative: %+v", history.Actor())
+	}
+	systemHistory := TicketHistory{ActorType: ActorTypeSystem, ActorID: "chronodesk"}
 	if systemHistory.Actor().Type != ActorTypeSystem {
-		t.Fatalf("history without actor or user should fall back to system: %+v", systemHistory.Actor())
+		t.Fatalf("system history actor should be authoritative: %+v", systemHistory.Actor())
+	}
+
+	// Human foreign keys are projections, never an identity fallback. Rows
+	// missing ActorRef must fail migration/constraints instead of silently
+	// impersonating the referenced human.
+	legacyComment := TicketComment{UserID: &userID}
+	if actor := legacyComment.Actor(); actor != (ActorRef{}) {
+		t.Fatalf("comment actor unexpectedly fell back to user projection: %+v", actor)
+	}
+	legacyAttachment := TicketAttachment{UploadedBy: &userID}
+	if actor := legacyAttachment.Actor(); actor != (ActorRef{}) {
+		t.Fatalf("attachment actor unexpectedly fell back to user projection: %+v", actor)
+	}
+	legacyHistory := TicketHistory{UserID: &userID}
+	if actor := legacyHistory.Actor(); actor != (ActorRef{}) {
+		t.Fatalf("history actor unexpectedly fell back to user projection: %+v", actor)
+	}
+	legacyTicket := Ticket{CreatedByID: &userID}
+	if actor := legacyTicket.ToResponse().CreatedByActor; actor != (ActorRef{}) {
+		t.Fatalf("ticket creator unexpectedly fell back to user projection: %+v", actor)
 	}
 }
 
@@ -43,11 +67,14 @@ func TestTicketSourceAgentAndAgentContextResponse(t *testing.T) {
 	if TicketSource("remote_url").IsValid() {
 		t.Fatal("unknown ticket source must be invalid")
 	}
+	createdByID := uint(7)
 	ticket := Ticket{
-		ID:          1,
-		CreatedByID: 7,
-		Version:     3,
-		TrustLevel:  TicketTrustLevelUntrusted,
+		ID:                 1,
+		CreatedByID:        &createdByID,
+		CreatedByActorType: ActorTypeHuman,
+		CreatedByActorID:   "7",
+		Version:            3,
+		TrustLevel:         TicketTrustLevelUntrusted,
 		AgentContext: datatypes.NewJSONType(AgentContext{
 			Goal: "resolve ticket",
 		}),

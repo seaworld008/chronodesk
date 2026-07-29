@@ -25,7 +25,7 @@ interface FilterInputBaseProps {
   size?: 'small' | 'medium'
 }
 
-export interface FilterChoice {
+interface FilterChoice {
   id: string | number
   name: string
 }
@@ -307,18 +307,21 @@ export const EnterpriseReferenceAutocompleteInput = ({
           label={label}
           inputRef={field.ref}
           margin="dense"
-          inputProps={{
-            ...params.inputProps,
-            'aria-label': label,
-          }}
-          InputProps={{
-            ...params.InputProps,
-            endAdornment: (
-              <>
-                {isPending ? <CircularProgress color="inherit" size={18} /> : null}
-                {params.InputProps.endAdornment}
-              </>
-            ),
+          slotProps={{
+            ...params.slotProps,
+            htmlInput: {
+              ...params.slotProps.htmlInput,
+              'aria-label': label,
+            },
+            input: {
+              ...params.slotProps.input,
+              endAdornment: (
+                <>
+                  {isPending ? <CircularProgress color="inherit" size={18} /> : null}
+                  {params.slotProps.input.endAdornment}
+                </>
+              ),
+            },
           }}
         />
       )}

@@ -16,8 +16,9 @@ GO_LDFLAGS := -s -w \
 	help doctor install-deps install-server-deps install-web-deps install-test-deps \
 	dev server-dev web-dev docker-up docker-down docker-logs \
 	build build-server build-web clean \
-	fmt fmt-check test test-server test-race test-web security verify \
-	openapi-lint smoke e2e db-migrate db-migrate-seed
+	fmt fmt-check test test-server test-race test-web test-python-static security verify \
+	openapi-lint smoke e2e db-migrate db-migrate-seed db-migrate-sample \
+	credential-validate credential-rotate credential-quarantine
 
 help:
 	@echo "ChronoDesk 开发命令"
@@ -41,6 +42,10 @@ help:
 	@echo "数据与容器"
 	@echo "  db-migrate      执行幂等数据库迁移"
 	@echo "  db-migrate-seed 执行迁移并写入开发种子数据"
+	@echo "  db-migrate-sample 执行迁移并写入开发演示数据"
+	@echo "  credential-validate    只读验证当前凭据存储"
+	@echo "  credential-rotate      将当前密文轮换到主密钥"
+	@echo "  credential-quarantine  隔离不支持的密码哈希"
 	@echo "  docker-down     停止 Docker Compose"
 	@echo "  docker-logs     查看 Docker Compose 日志"
 
@@ -71,7 +76,8 @@ web-dev:
 	cd web && npm run dev
 
 docker-up:
-	$(COMPOSE) up --build -d
+	VERSION=$(VERSION) COMMIT=$(COMMIT) BUILD_DATE=$(BUILD_DATE) \
+		$(COMPOSE) up --build -d
 	@echo "管理后台：http://localhost:3000"
 	@echo "健康检查：http://localhost:8081/healthz"
 
@@ -87,6 +93,7 @@ build-server:
 	cd server && mkdir -p bin
 	cd server && go build -trimpath -ldflags="$(GO_LDFLAGS)" -o bin/chronodesk ./cmd/chronodesk
 	cd server && go build -trimpath -ldflags="$(GO_LDFLAGS)" -o bin/chronodesk-migrate ./cmd/migrate
+	cd server && go build -trimpath -ldflags="$(GO_LDFLAGS)" -o bin/chronodesk-credential-maintain ./cmd/credential-maintain
 
 build-web:
 	cd web && npm run build
@@ -102,7 +109,7 @@ fmt-check:
 	@test -z "$$(cd server && gofmt -l .)" || \
 		{ echo "存在未格式化的 Go 文件："; cd server && gofmt -l .; exit 1; }
 
-test: test-server test-web openapi-lint
+test: test-server test-web test-python-static openapi-lint
 
 test-server:
 	cd server && go test ./... -count=1
@@ -115,6 +122,14 @@ test-web:
 	cd web && npm run typecheck
 	cd web && npm run lint
 	cd web && npm run audit:security
+
+test-python-static:
+	$(PYTHON) -m ruff format --check server/tests
+	$(PYTHON) -m ruff check server/tests
+	$(PYTHON) -m compileall -q server/tests
+	$(PYTHON) server/tests/validate_case_evidence_manifest.py
+	$(PYTHON) server/tests/validate_case_evidence_manifest.py --self-test
+	$(PYTHON) -m pytest -c server/pytest.ini --collect-only -q server/tests
 
 security:
 	cd server && go run golang.org/x/vuln/cmd/govulncheck@latest ./...
@@ -131,9 +146,9 @@ openapi-lint:
 		--fail-severity=warn
 
 smoke:
-	cd server && mkdir -p reports
-	cd server && pytest tests -v \
-		--html=reports/smoke.html \
+	mkdir -p server/reports
+	$(PYTHON) -m pytest -c server/pytest.ini server/tests -v \
+		--html=server/reports/smoke.html \
 		--self-contained-html
 
 e2e:
@@ -144,3 +159,15 @@ db-migrate:
 
 db-migrate-seed:
 	cd server && go run ./cmd/migrate -seed
+
+db-migrate-sample:
+	cd server && ENVIRONMENT=development go run ./cmd/migrate -seed -sample-data
+
+credential-validate:
+	cd server && go run ./cmd/credential-maintain -validate-only
+
+credential-rotate:
+	cd server && go run ./cmd/credential-maintain -rotate
+
+credential-quarantine:
+	cd server && go run ./cmd/credential-maintain -quarantine

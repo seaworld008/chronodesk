@@ -5,53 +5,98 @@ import {
     type AuthSession,
     type Credentials,
 } from './api';
+import {
+    assertDestructiveE2EAllowed,
+    assertGlobalE2EAllowed,
+    assertSecretMutationIsRestorable,
+    installBrowserMutationGuard,
+    isLoopbackE2E,
+} from './safety';
 
 export const E2E_PREFIX = 'E2E-';
 export const DEFAULT_PASSWORD = 'Admin123!';
+const e2eExecutionStartedAt = Date.now();
+const e2eRunLabel = (
+    process.env.CHRONODESK_E2E_RUN_ID?.trim() || 'local'
+)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 24) || 'run';
+const e2eWorkerIndex = (
+    process.env.TEST_WORKER_INDEX?.trim() || '0'
+).replace(/[^0-9]/g, '').slice(-3) || '0';
+const e2eExecutionToken = [
+    e2eExecutionStartedAt.toString(36),
+    `p${process.pid.toString(36)}`,
+    `w${e2eWorkerIndex}`,
+].join('-');
+const E2E_RUN_ID = `${e2eRunLabel}-${e2eExecutionToken}`;
+export const E2E_MARKER = `${E2E_PREFIX}${E2E_RUN_ID}-`;
+export const E2E_ACCOUNT_STEM = [
+    'e2e',
+    e2eRunLabel.slice(0, 8),
+    e2eExecutionStartedAt.toString(36),
+    `p${process.pid.toString(36)}`,
+    `w${e2eWorkerIndex}`,
+].join('_');
 
 export const DEFAULT_ADMIN: Credentials = {
     email: 'admin@example.com',
     password: DEFAULT_PASSWORD,
 };
 
-const ROLE_ACCOUNTS = [
-    {
-        email: 'admin.manager@example.com',
-        username: 'admin_manager',
-        role: 'admin',
-        first_name: 'Admin',
-        last_name: 'Manager',
-        department: 'IT',
-        job_title: 'System Admin',
-    },
-    {
-        email: 'agent@example.com',
-        username: 'agent',
-        role: 'agent',
-        first_name: 'Support',
-        last_name: 'Agent',
-        department: 'Support',
-        job_title: 'Support Agent',
-    },
-    {
-        email: 'customer@example.com',
-        username: 'customer',
-        role: 'customer',
-        first_name: 'Demo',
-        last_name: 'Customer',
-        department: 'Customer',
-        job_title: 'Customer',
-    },
-] as const;
+type TrackedResource =
+    | 'automationRules'
+    | 'tickets'
+    | 'notifications'
+    | 'users'
+    | 'webhooks'
+    | 'agentPrincipals'
+    | 'trustedDevices';
 
-const RESERVED_EMAILS = new Set([
-    DEFAULT_ADMIN.email,
-    ...ROLE_ACCOUNTS.map((account) => account.email),
-]);
+const trackedResources: Record<TrackedResource, Set<string>> = {
+    automationRules: new Set(),
+    tickets: new Set(),
+    notifications: new Set(),
+    users: new Set(),
+    webhooks: new Set(),
+    agentPrincipals: new Set(),
+    trustedDevices: new Set(),
+};
+
+export const trackE2EResource = (
+    resource: TrackedResource,
+    id: string | number,
+) => {
+    trackedResources[resource].add(String(id));
+};
+
+export const untrackE2EResource = (
+    resource: TrackedResource,
+    id: string | number,
+) => {
+    trackedResources[resource].delete(String(id));
+};
+
+const trackedIDs = (resource: TrackedResource) => [
+    ...trackedResources[resource],
+];
 
 const authSessions = new Map<string, Promise<AuthSession>>();
 
-const extractItems = <T>(payload: unknown): T[] => {
+export const extractData = <T>(payload: unknown): T => {
+    if (
+        payload &&
+        typeof payload === 'object' &&
+        'data' in payload
+    ) {
+        return (payload as Record<string, unknown>).data as T;
+    }
+    return payload as T;
+};
+
+export const extractItems = <T>(payload: unknown): T[] => {
     if (!payload || typeof payload !== 'object') {
         return [];
     }
@@ -89,7 +134,7 @@ const getAuthSession = (
     return pending;
 };
 
-const getAdminToken = async (request: APIRequestContext) =>
+export const getAdminToken = async (request: APIRequestContext) =>
     (await getAuthSession(request, DEFAULT_ADMIN)).access_token;
 
 export const authenticatePage = async (
@@ -97,6 +142,7 @@ export const authenticatePage = async (
     credentials: Credentials = DEFAULT_ADMIN,
 ) => {
     const session = await getAuthSession(page.request, credentials);
+    await installBrowserMutationGuard(page);
     await page.addInitScript((auth) => {
         localStorage.setItem('token', auth.access_token);
         if (auth.refresh_token) {
@@ -120,6 +166,7 @@ export const authenticatePage = async (
 };
 
 export const loginViaUI = async (page: Page, credentials: Credentials = DEFAULT_ADMIN) => {
+    await installBrowserMutationGuard(page);
     await page.goto('/#/login');
     await page.getByLabel('邮箱').fill(credentials.email);
     await page.getByLabel('密码').fill(credentials.password);
@@ -127,7 +174,11 @@ export const loginViaUI = async (page: Page, credentials: Credentials = DEFAULT_
     await page.getByRole('menuitem', { name: '工单管理' }).waitFor({ timeout: 15000 });
 };
 
-const findUserByEmail = async (request: APIRequestContext, token: string, email: string) => {
+export const findUserByEmail = async (
+    request: APIRequestContext,
+    token: string,
+    email: string,
+) => {
     const response = await apiRequest<Record<string, unknown>>(
         request,
         token,
@@ -137,52 +188,201 @@ const findUserByEmail = async (request: APIRequestContext, token: string, email:
     return users.find((user) => user.email === email);
 };
 
-export const ensureRoleAccounts = async (request: APIRequestContext) => {
-    const token = await getAdminToken(request);
+export const e2eRunID = () => E2E_RUN_ID;
+let adminCommandSequence = 0;
 
-    for (const account of ROLE_ACCOUNTS) {
-        const existing = await findUserByEmail(request, token, account.email);
-        if (existing) {
-            if (typeof existing.id !== 'number') {
-                throw new Error(`角色测试账号缺少有效 ID: ${account.email}`);
-            }
-            await apiRequest(request, token, `/api/admin/users/${existing.id}`, {
-                method: 'PUT',
-                data: {
-                    role: account.role,
-                    status: 'active',
-                    first_name: account.first_name,
-                    last_name: account.last_name,
-                    department: account.department,
-                    job_title: account.job_title,
-                },
-            });
-            await apiRequest(request, token, `/api/admin/users/${existing.id}/reset-password`, {
-                method: 'POST',
-                data: { new_password: DEFAULT_PASSWORD },
-            });
-            continue;
-        }
-        await apiRequest(request, token, '/api/admin/users', {
-            method: 'POST',
-            data: {
-                username: account.username,
-                email: account.email,
-                password: DEFAULT_PASSWORD,
-                role: account.role,
-                first_name: account.first_name,
-                last_name: account.last_name,
-                department: account.department,
-                job_title: account.job_title,
-            },
-        });
+const adminCommand = async <T>(
+    request: APIRequestContext,
+    token: string,
+    path: string,
+    options: {
+        method: 'POST' | 'PUT' | 'DELETE';
+        version?: number;
+        data?: unknown;
+    },
+) => apiRequest<T>(request, token, path, {
+    method: options.method,
+    data: options.data,
+    headers: {
+        'Idempotency-Key': `e2e-${E2E_RUN_ID}-${++adminCommandSequence}`,
+        ...(options.version !== undefined
+            ? { 'If-Match': `"v${options.version}"` }
+            : {}),
+    },
+});
+
+type TemporaryRoleAccount = Credentials & {
+    id: number;
+    username: string;
+    role: 'agent' | 'customer';
+    optionLabel: string;
+};
+
+export type TemporaryRoleAccounts = {
+    agent: TemporaryRoleAccount;
+    customer: TemporaryRoleAccount;
+};
+
+let temporaryRoleAccounts: Promise<TemporaryRoleAccounts> | undefined;
+
+const temporaryRoleAccountIdentity = (
+    account: keyof TemporaryRoleAccounts,
+) => {
+    const username = `${E2E_ACCOUNT_STEM}_workflow_${account}`;
+    const email = `${username}@example.test`;
+    if (username.length > 50 || email.length > 100) {
+        throw new Error('临时角色账号标识超过数据库字段上限');
     }
+    return { username, email };
+};
+
+const compensateTemporaryUsers = async (
+    request: APIRequestContext,
+    token: string,
+    userIDs: number[],
+) => {
+    const cleanupErrors: string[] = [];
+    for (const id of [...userIDs].reverse()) {
+        try {
+            await apiRequest(
+                request,
+                token,
+                `/api/admin/users/${encodeURIComponent(id)}`,
+                { method: 'DELETE' },
+            );
+            untrackE2EResource('users', id);
+        } catch (error) {
+            cleanupErrors.push(
+                `${id}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        }
+    }
+    if (cleanupErrors.length > 0) {
+        throw new Error(
+            `临时角色账号补偿清理失败：${cleanupErrors.join('；')}`,
+        );
+    }
+};
+
+export const ensureRoleAccounts = async (
+    request: APIRequestContext,
+): Promise<TemporaryRoleAccounts> => {
+    if (temporaryRoleAccounts) {
+        return temporaryRoleAccounts;
+    }
+
+    temporaryRoleAccounts = (async () => {
+        assertDestructiveE2EAllowed('创建本轮临时角色账号');
+        const token = await getAdminToken(request);
+        const agentIdentity = temporaryRoleAccountIdentity('agent');
+        const customerIdentity = temporaryRoleAccountIdentity('customer');
+        const definitions = [
+            {
+                key: 'agent',
+                ...agentIdentity,
+                role: 'agent',
+                first_name: 'Support',
+                last_name: 'Agent',
+                department: 'Support',
+                job_title: 'Support Agent',
+            },
+            {
+                key: 'customer',
+                ...customerIdentity,
+                role: 'customer',
+                first_name: 'Demo',
+                last_name: 'Customer',
+                department: 'Customer',
+                job_title: 'Customer',
+            },
+        ] as const;
+
+        const result = {} as TemporaryRoleAccounts;
+        const createdUserIDs: number[] = [];
+        try {
+            for (const definition of definitions) {
+                const existing = await findUserByEmail(
+                    request,
+                    token,
+                    definition.email,
+                );
+                if (existing) {
+                    throw new Error(
+                        `本轮临时角色账号已存在，拒绝重置其角色或密码：${definition.email}`,
+                    );
+                }
+
+                const response = await apiRequest<Record<string, unknown>>(
+                    request,
+                    token,
+                    '/api/admin/users',
+                    {
+                        method: 'POST',
+                        data: {
+                            username: definition.username,
+                            email: definition.email,
+                            password: DEFAULT_PASSWORD,
+                            role: definition.role,
+                            first_name: definition.first_name,
+                            last_name: definition.last_name,
+                            department: definition.department,
+                            job_title: definition.job_title,
+                        },
+                    },
+                );
+                const created = extractData<Record<string, unknown>>(response);
+                if (typeof created.id !== 'number') {
+                    throw new Error(
+                        `创建临时角色账号后响应缺少 ID：${definition.email}`,
+                    );
+                }
+                createdUserIDs.push(created.id);
+                trackE2EResource('users', created.id);
+                result[definition.key] = {
+                    id: created.id,
+                    username: definition.username,
+                    email: definition.email,
+                    password: DEFAULT_PASSWORD,
+                    role: definition.role,
+                    optionLabel: `${definition.username} (${definition.first_name} ${definition.last_name})`,
+                };
+            }
+        } catch (error) {
+            try {
+                await compensateTemporaryUsers(
+                    request,
+                    token,
+                    createdUserIDs,
+                );
+            } catch (cleanupError) {
+                throw new Error(
+                    `创建临时角色账号失败且补偿清理未完成；原始错误：${
+                        error instanceof Error ? error.message : String(error)
+                    }；清理错误：${
+                        cleanupError instanceof Error
+                            ? cleanupError.message
+                            : String(cleanupError)
+                    }`,
+                );
+            }
+            throw error;
+        }
+        return result;
+    })().catch((error) => {
+        temporaryRoleAccounts = undefined;
+        throw error;
+    });
+
+    return temporaryRoleAccounts;
 };
 
 export const createNotification = async (
     request: APIRequestContext,
     options: { title: string; content: string; recipientEmail?: string },
 ) => {
+    if (!options.title.startsWith(E2E_MARKER)) {
+        throw new Error('测试通知标题必须包含本轮唯一 marker');
+    }
     const token = await getAdminToken(request);
     const recipientEmail = options.recipientEmail ?? DEFAULT_ADMIN.email;
     const recipient = await findUserByEmail(request, token, recipientEmail);
@@ -203,15 +403,24 @@ export const createNotification = async (
     });
 
     const data = (response.data as Record<string, unknown>) ?? {};
-    return data.id as number;
+    const id = data.id as number;
+    trackE2EResource('notifications', id);
+    return id;
 };
 
 export const deleteNotification = async (request: APIRequestContext, id: number) => {
+    if (!trackedResources.notifications.has(String(id))) {
+        throw new Error(`拒绝删除未由本轮创建的通知：${id}`);
+    }
     const token = await getAdminToken(request);
     await apiRequest(request, token, `/api/admin/notifications/${id}`, { method: 'DELETE' });
+    untrackE2EResource('notifications', id);
 };
 
 export const createTicket = async (request: APIRequestContext, title: string) => {
+    if (!title.startsWith(E2E_MARKER)) {
+        throw new Error('测试工单标题必须包含本轮唯一 marker');
+    }
     const token = await getAdminToken(request);
     const response = await apiRequest<Record<string, unknown>>(request, token, '/api/tickets', {
         method: 'POST',
@@ -224,108 +433,566 @@ export const createTicket = async (request: APIRequestContext, title: string) =>
         },
     });
     const data = (response.data as Record<string, unknown>) ?? {};
-    return data.id as number;
+    const id = data.id as number;
+    trackE2EResource('tickets', id);
+    return id;
+};
+
+const deleteVersionedTicket = async (
+    request: APIRequestContext,
+    token: string,
+    id: string | number,
+) => {
+    const detail = await apiRequest<Record<string, unknown>>(
+        request,
+        token,
+        `/api/tickets/${encodeURIComponent(id)}`,
+    );
+    const ticket = extractData<Record<string, unknown>>(detail);
+    const version = ticket.version;
+    if (
+        typeof version !== 'number' ||
+        !Number.isSafeInteger(version) ||
+        version <= 0
+    ) {
+        throw new Error(`工单 ${id} 缺少有效版本，拒绝无条件清理`);
+    }
+    await apiRequest(request, token, `/api/tickets/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+        headers: { 'If-Match': `"v${version}"` },
+    });
 };
 
 export const deleteTicket = async (request: APIRequestContext, id: number) => {
+    if (!trackedResources.tickets.has(String(id))) {
+        throw new Error(`拒绝删除未由本轮创建的工单：${id}`);
+    }
     const token = await getAdminToken(request);
-    await apiRequest(request, token, `/api/tickets/${id}`, { method: 'DELETE' });
+    await deleteVersionedTicket(request, token, id);
+    untrackE2EResource('tickets', id);
 };
 
-export const deleteTicketByTitle = async (request: APIRequestContext, title: string) => {
+export const createAutomationRule = async (
+    request: APIRequestContext,
+    name: string,
+    active = false,
+) => {
+    if (!name.startsWith(E2E_MARKER)) {
+        throw new Error('测试自动化规则名称必须包含本轮唯一 marker');
+    }
     const token = await getAdminToken(request);
     const response = await apiRequest<Record<string, unknown>>(
         request,
         token,
-        `/api/tickets?search=${encodeURIComponent(title)}&page=1&page_size=20`,
+        '/api/admin/automation/rules',
+        {
+            method: 'POST',
+            data: {
+                name,
+                description: `${name} Playwright 表格测试规则`,
+                rule_type: 'assignment',
+                trigger_event: 'io.chronodesk.ticket.created.v1',
+                priority: 100,
+                is_active: active,
+                conditions: [],
+                actions: [],
+            },
+        },
     );
-    const tickets = extractItems<Record<string, unknown>>(response);
-    const target = tickets.find((ticket) => ticket.title === title);
-    if (!target) {
-        return;
-    }
-    await apiRequest(request, token, `/api/tickets/${target.id}`, { method: 'DELETE' });
+    const id = extractData<Record<string, unknown>>(response).id as number;
+    trackE2EResource('automationRules', id);
+    return id;
 };
 
 const deleteAutomationRules = async (request: APIRequestContext, token: string) => {
-    const response = await apiRequest<Record<string, unknown>>(
-        request,
-        token,
-        `/api/admin/automation/rules?search=${encodeURIComponent(E2E_PREFIX)}&page=1&page_size=100`,
-    );
-    const rules = extractItems<Record<string, unknown>>(response);
-    for (const rule of rules) {
-        if (typeof rule.name === 'string' && rule.name.startsWith(E2E_PREFIX)) {
-            await apiRequest(request, token, `/api/admin/automation/rules/${rule.id}`, { method: 'DELETE' });
-        }
+    for (const id of trackedIDs('automationRules')) {
+        await apiRequest(
+            request,
+            token,
+            `/api/admin/automation/rules/${encodeURIComponent(id)}`,
+            { method: 'DELETE' },
+        );
+        untrackE2EResource('automationRules', id);
     }
 };
 
 const deleteTickets = async (request: APIRequestContext, token: string) => {
-    const response = await apiRequest<Record<string, unknown>>(
-        request,
-        token,
-        `/api/tickets?search=${encodeURIComponent(E2E_PREFIX)}&page=1&page_size=100`,
-    );
-    const tickets = extractItems<Record<string, unknown>>(response);
-    for (const ticket of tickets) {
-        if (typeof ticket.title === 'string' && ticket.title.startsWith(E2E_PREFIX)) {
-            await apiRequest(request, token, `/api/tickets/${ticket.id}`, { method: 'DELETE' });
-        }
+    for (const id of trackedIDs('tickets')) {
+        await deleteVersionedTicket(request, token, id);
+        untrackE2EResource('tickets', id);
     }
 };
 
 const deleteNotifications = async (request: APIRequestContext, token: string) => {
-    const filter = encodeURIComponent(JSON.stringify({ q: E2E_PREFIX }));
+    for (const id of trackedIDs('notifications')) {
+        await apiRequest(
+            request,
+            token,
+            `/api/admin/notifications/${encodeURIComponent(id)}`,
+            { method: 'DELETE' },
+        );
+        untrackE2EResource('notifications', id);
+    }
+};
+
+const deleteWebhooks = async (request: APIRequestContext, token: string) => {
+    for (const id of trackedIDs('webhooks')) {
+        await apiRequest(request, token, `/api/webhooks/${encodeURIComponent(id)}`, {
+            method: 'DELETE',
+        });
+        untrackE2EResource('webhooks', id);
+    }
+};
+
+type AgentControlPrincipal = {
+    id: string;
+    name: string;
+    status: 'active' | 'inactive' | 'revoked';
+    read_only: boolean;
+    emergency_disabled: boolean;
+    resource_version: number;
+};
+
+type AgentControlSnapshot = {
+    global_read_only: boolean;
+    global_read_only_version: number;
+    emergency_stop: boolean;
+    emergency_stop_version: number;
+    principals: AgentControlPrincipal[];
+    attachments?: Array<{
+        id: number;
+        original_name: string;
+        virus_scan: string;
+        resource_version: number;
+    }>;
+};
+
+const getAgentControlSnapshot = async (
+    request: APIRequestContext,
+    suppliedToken?: string,
+) => {
+    const token = suppliedToken ?? await getAdminToken(request);
     const response = await apiRequest<Record<string, unknown>>(
         request,
         token,
-        `/api/notifications?filter=${filter}&page=1&page_size=100`,
+        '/api/v1/admin/agent-control/overview',
     );
-    const notifications = extractItems<Record<string, unknown>>(response);
-    for (const notification of notifications) {
-        if (typeof notification.title === 'string' && notification.title.startsWith(E2E_PREFIX)) {
-            await apiRequest(request, token, `/api/admin/notifications/${notification.id}`, { method: 'DELETE' });
-        }
+    return extractData<AgentControlSnapshot>(response);
+};
+
+export type AgentGlobalControlSnapshot = Pick<
+    AgentControlSnapshot,
+    | 'global_read_only'
+    | 'global_read_only_version'
+    | 'emergency_stop'
+    | 'emergency_stop_version'
+>;
+
+export const captureAgentGlobalControls = async (
+    request: APIRequestContext,
+): Promise<AgentGlobalControlSnapshot> => {
+    const snapshot = await getAgentControlSnapshot(request);
+    return {
+        global_read_only: snapshot.global_read_only,
+        global_read_only_version: snapshot.global_read_only_version,
+        emergency_stop: snapshot.emergency_stop,
+        emergency_stop_version: snapshot.emergency_stop_version,
+    };
+};
+
+export const restoreAgentGlobalControls = async (
+    request: APIRequestContext,
+    original: AgentGlobalControlSnapshot,
+) => {
+    const token = await getAdminToken(request);
+    let current = await getAgentControlSnapshot(request, token);
+    if (
+        current.global_read_only === original.global_read_only &&
+        current.emergency_stop === original.emergency_stop
+    ) {
+        return;
     }
+    assertGlobalE2EAllowed('恢复 Agent 全局控制');
+    if (current.global_read_only !== original.global_read_only) {
+        await adminCommand(
+            request,
+            token,
+            '/api/v1/admin/agent-control/read-only',
+            {
+                method: 'PUT',
+                version: current.global_read_only_version,
+                data: { enabled: original.global_read_only },
+            },
+        );
+        current = await getAgentControlSnapshot(request, token);
+    }
+    if (current.emergency_stop !== original.emergency_stop) {
+        await adminCommand(
+            request,
+            token,
+            '/api/v1/admin/agent-control/emergency-stop',
+            {
+                method: 'PUT',
+                version: current.emergency_stop_version,
+                data: { enabled: original.emergency_stop },
+            },
+        );
+    }
+
+    const restored = await getAgentControlSnapshot(request, token);
+    if (
+        restored.global_read_only !== original.global_read_only ||
+        restored.emergency_stop !== original.emergency_stop
+    ) {
+        throw new Error('Agent 全局控制状态未恢复到测试前快照');
+    }
+};
+
+const disableTrackedAgentPrincipals = async (
+    request: APIRequestContext,
+    token: string,
+) => {
+    for (const principalID of trackedIDs('agentPrincipals')) {
+        const policyResponse = await apiRequest<Record<string, unknown>>(
+            request,
+            token,
+            `/api/v1/admin/service-principals/${principalID}/policies`,
+        );
+        const policies = extractData<Array<Record<string, unknown>>>(
+            policyResponse,
+        ) ?? [];
+        for (const policy of policies) {
+            if (
+                policy.is_active !== true ||
+                typeof policy.id !== 'string' ||
+                typeof policy.resource_version !== 'number'
+            ) {
+                continue;
+            }
+            await adminCommand(
+                request,
+                token,
+                `/api/v1/admin/service-principals/${principalID}/policies/${policy.id}`,
+                {
+                    method: 'DELETE',
+                    version: policy.resource_version,
+                },
+            );
+        }
+
+        const snapshot = await getAgentControlSnapshot(request, token);
+        const principal = snapshot.principals.find(
+            (candidate) => candidate.id === principalID,
+        );
+        if (!principal) {
+            untrackE2EResource('agentPrincipals', principalID);
+            continue;
+        }
+        if (
+            principal.status !== 'inactive' ||
+            principal.read_only ||
+            principal.emergency_disabled
+        ) {
+            await adminCommand(
+                request,
+                token,
+                `/api/v1/admin/service-principals/${principalID}/status`,
+                {
+                    method: 'PUT',
+                    version: principal.resource_version,
+                    data: {
+                        status: 'inactive',
+                        read_only: false,
+                        emergency_disabled: false,
+                    },
+                },
+            );
+        }
+        untrackE2EResource('agentPrincipals', principalID);
+    }
+};
+
+export const cleanupTrackedAgentPrincipals = async (
+    request: APIRequestContext,
+) => {
+    const token = await getAdminToken(request);
+    await disableTrackedAgentPrincipals(request, token);
+};
+
+export const markE2EAttachmentClean = async (
+    request: APIRequestContext,
+    originalName: string,
+) => {
+    if (!originalName.startsWith(E2E_MARKER)) {
+        throw new Error('拒绝修改不属于本轮 marker 的附件扫描状态');
+    }
+    const token = await getAdminToken(request);
+    const snapshot = await getAgentControlSnapshot(request, token);
+    const attachment = (snapshot.attachments ?? []).find(
+        (candidate) => candidate.original_name === originalName,
+    );
+    if (!attachment) {
+        throw new Error(`未找到待扫描 E2E 附件：${originalName}`);
+    }
+    await adminCommand(
+        request,
+        token,
+        `/api/v1/admin/attachments/${attachment.id}/scan`,
+        {
+            method: 'POST',
+            version: attachment.resource_version,
+            data: {
+                status: 'clean',
+                details: 'Playwright E2E 小文件安全扫描通过',
+            },
+        },
+    );
+    return attachment.id;
+};
+
+export const revokeE2ETrustedDevices = async (
+    request: APIRequestContext,
+    suppliedToken?: string,
+) => {
+    const token = suppliedToken ?? await getAdminToken(request);
+    for (const id of trackedIDs('trustedDevices')) {
+        await apiRequest(
+            request,
+            token,
+            `/api/user/trusted-devices/${encodeURIComponent(id)}`,
+            { method: 'DELETE' },
+        );
+        untrackE2EResource('trustedDevices', id);
+    }
+};
+
+export const trackTrustedDeviceByName = async (
+    request: APIRequestContext,
+    deviceName: string,
+) => {
+    if (!deviceName.startsWith(E2E_MARKER)) {
+        throw new Error(`拒绝登记不属于本轮 marker 的可信设备：${deviceName}`);
+    }
+    const token = await getAdminToken(request);
+    const response = await apiRequest<Record<string, unknown>>(
+        request,
+        token,
+        '/api/user/trusted-devices',
+    );
+    const devices = extractData<Array<Record<string, unknown>>>(response) ?? [];
+    const device = devices.find(
+        (candidate) => candidate.device_name === deviceName,
+    );
+    if (typeof device?.id !== 'number') {
+        throw new Error(`未找到本轮可信设备：${deviceName}`);
+    }
+    trackE2EResource('trustedDevices', device.id);
+    return device.id;
 };
 
 const deleteTestUsers = async (request: APIRequestContext, token: string) => {
-    const response = await apiRequest<Record<string, unknown>>(
-        request,
-        token,
-        `/api/admin/users?search=e2e_&page=1&page_size=100`,
-    );
-    const users = extractItems<Record<string, unknown>>(response);
-
-    for (const user of users) {
-        const email = String(user.email ?? '');
-        if (!email || RESERVED_EMAILS.has(email)) {
-            continue;
+    for (const id of trackedIDs('users')) {
+        await apiRequest(
+            request,
+            token,
+            `/api/admin/users/${encodeURIComponent(id)}`,
+            { method: 'DELETE' },
+        );
+        untrackE2EResource('users', id);
+    }
+    if (temporaryRoleAccounts) {
+        const accounts = await temporaryRoleAccounts.catch(() => undefined);
+        if (accounts) {
+            authSessions.delete(accounts.agent.email.toLowerCase());
+            authSessions.delete(accounts.customer.email.toLowerCase());
         }
-        if (!email.startsWith('e2e_') && !email.startsWith('test_')) {
-            continue;
-        }
-        await apiRequest(request, token, `/api/admin/users/${user.id}`, { method: 'DELETE' });
+        temporaryRoleAccounts = undefined;
     }
 };
 
-const resetEmailConfig = async (request: APIRequestContext, token: string) => {
+export type EmailConfigSnapshot = {
+    id: number;
+    email_verification_enabled: boolean;
+    smtp_host: string;
+    smtp_port: number;
+    smtp_username: string;
+    smtp_use_tls: boolean;
+    smtp_use_ssl: boolean;
+    from_email: string;
+    from_name: string;
+    welcome_email_subject: string;
+    welcome_email_template: string;
+    otp_email_subject: string;
+    otp_email_template: string;
+    is_configured: boolean;
+};
+
+const EMAIL_RESTORABLE_KEYS = [
+    'email_verification_enabled',
+    'smtp_host',
+    'smtp_port',
+    'smtp_username',
+    'smtp_use_tls',
+    'smtp_use_ssl',
+    'from_email',
+    'from_name',
+    'welcome_email_subject',
+    'welcome_email_template',
+    'otp_email_subject',
+    'otp_email_template',
+] as const satisfies ReadonlyArray<keyof EmailConfigSnapshot>;
+
+const comparableEmailConfig = (config: EmailConfigSnapshot) =>
+    Object.fromEntries(
+        EMAIL_RESTORABLE_KEYS.map((key) => [key, config[key]]),
+    );
+
+export const captureEmailConfig = async (
+    request: APIRequestContext,
+): Promise<EmailConfigSnapshot> => {
+    const token = await getAdminToken(request);
+    const response = await apiRequest<Record<string, unknown>>(
+        request,
+        token,
+        '/api/admin/email-config',
+    );
+    return extractData<EmailConfigSnapshot>(response);
+};
+
+export const assertEmailConfigMutationSafe = (
+    snapshot: EmailConfigSnapshot,
+    touchesSMTPPassword = false,
+) => {
+    assertGlobalE2EAllowed('修改邮件配置');
+    assertSecretMutationIsRestorable(
+        '修改 SMTP 密码',
+        touchesSMTPPassword,
+    );
+    if (!isLoopbackE2E() && snapshot.email_verification_enabled) {
+        throw new Error(
+            '拒绝在非回环环境修改已启用的邮件配置：保存动作会触发真实 SMTP 连接。',
+        );
+    }
+};
+
+export const restoreEmailConfig = async (
+    request: APIRequestContext,
+    original: EmailConfigSnapshot,
+    expectedAfterTest: EmailConfigSnapshot,
+) => {
+    const token = await getAdminToken(request);
+    const current = await captureEmailConfig(request);
+    const originalComparable = comparableEmailConfig(original);
+    const currentComparable = comparableEmailConfig(current);
+    if (JSON.stringify(currentComparable) === JSON.stringify(originalComparable)) {
+        return;
+    }
+    if (
+        JSON.stringify(currentComparable) !==
+        JSON.stringify(comparableEmailConfig(expectedAfterTest))
+    ) {
+        throw new Error(
+            '邮件配置在测试期间被其他写入修改，拒绝覆盖并停止恢复。',
+        );
+    }
+
+    assertGlobalE2EAllowed('恢复邮件配置');
     await apiRequest(request, token, '/api/admin/email-config', {
         method: 'PUT',
         data: {
-            email_verification_enabled: false,
-            smtp_host: '',
-            smtp_port: 587,
-            smtp_username: '',
-            smtp_password: '',
-            smtp_use_tls: true,
-            smtp_use_ssl: false,
-            from_email: '',
-            from_name: '工单系统',
+            ...originalComparable,
             skip_smtp_test: true,
         },
     });
+    const restored = await captureEmailConfig(request);
+    if (
+        JSON.stringify(comparableEmailConfig(restored)) !==
+        JSON.stringify(originalComparable)
+    ) {
+        throw new Error('邮件配置未恢复到测试前快照');
+    }
+};
+
+export type SystemConfigSnapshot = {
+    id: number;
+    key: string;
+    value: string;
+    value_type: 'string' | 'int' | 'bool' | 'json';
+    description: string;
+    category: string;
+    group: string;
+    is_required: boolean;
+    is_active: boolean;
+    version: number;
+};
+
+export const captureSystemConfig = async (
+    request: APIRequestContext,
+    category: string,
+    key: string,
+): Promise<SystemConfigSnapshot> => {
+    const token = await getAdminToken(request);
+    const response = await apiRequest<Record<string, unknown>>(
+        request,
+        token,
+        `/api/admin/configs?category=${encodeURIComponent(category)}`,
+    );
+    const config = extractData<SystemConfigSnapshot[]>(response).find(
+        (candidate) => candidate.key === key,
+    );
+    if (!config) {
+        throw new Error(`未找到系统配置：${key}`);
+    }
+    return config;
+};
+
+export const restoreSystemConfig = async (
+    request: APIRequestContext,
+    original: SystemConfigSnapshot,
+    expectedAfterTest: SystemConfigSnapshot,
+) => {
+    const current = await captureSystemConfig(
+        request,
+        original.category,
+        original.key,
+    );
+    if (current.value === original.value) {
+        return;
+    }
+    if (current.value !== expectedAfterTest.value) {
+        throw new Error(
+            `系统配置 ${original.key} 在测试期间被其他写入修改，拒绝覆盖。`,
+        );
+    }
+
+    assertGlobalE2EAllowed(`恢复系统配置 ${original.key}`);
+    const token = await getAdminToken(request);
+    await apiRequest(
+        request,
+        token,
+        `/api/admin/configs/${encodeURIComponent(original.key)}`,
+        {
+            method: 'PUT',
+            data: {
+                key: original.key,
+                value: original.value,
+                value_type: original.value_type,
+                description: original.description,
+                category: original.category,
+                group: original.group,
+                is_required: original.is_required,
+                is_active: original.is_active,
+            },
+        },
+    );
+    const restored = await captureSystemConfig(
+        request,
+        original.category,
+        original.key,
+    );
+    if (restored.value !== original.value) {
+        throw new Error(`系统配置 ${original.key} 未恢复到测试前快照`);
+    }
 };
 
 type CleanupOptions = {
@@ -334,6 +1001,8 @@ type CleanupOptions = {
     notifications?: boolean;
     users?: boolean;
     emailConfig?: boolean;
+    webhooks?: boolean;
+    agentControl?: boolean;
 };
 
 const defaultCleanupOptions: Required<CleanupOptions> = {
@@ -341,7 +1010,10 @@ const defaultCleanupOptions: Required<CleanupOptions> = {
     tickets: true,
     notifications: true,
     users: true,
-    emailConfig: true,
+    // 邮件配置只能使用用例自己的快照恢复，通用清理绝不能写入共享配置。
+    emailConfig: false,
+    webhooks: false,
+    agentControl: false,
 };
 
 export const cleanupE2EData = async (request: APIRequestContext, options: CleanupOptions = {}) => {
@@ -361,6 +1033,12 @@ export const cleanupE2EData = async (request: APIRequestContext, options: Cleanu
         await deleteTestUsers(request, token);
     }
     if (config.emailConfig) {
-        await resetEmailConfig(request, token);
+        throw new Error('邮件配置必须使用 captureEmailConfig/restoreEmailConfig 精确恢复');
+    }
+    if (config.webhooks) {
+        await deleteWebhooks(request, token);
+    }
+    if (config.agentControl) {
+        await disableTrackedAgentPrincipals(request, token);
     }
 };

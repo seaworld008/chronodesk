@@ -99,8 +99,7 @@ type ServicePrincipal struct {
 	EmergencyDisabled  bool       `json:"emergency_disabled" gorm:"not null;default:false;index"`
 	LastUsedAt         *time.Time `json:"last_used_at,omitempty"`
 
-	CreatedByID         *uint `json:"created_by_id,omitempty" gorm:"index"`
-	CompatibilityUserID *uint `json:"compatibility_user_id,omitempty" gorm:"index"`
+	CreatedByID *uint `json:"created_by_id,omitempty" gorm:"index"`
 
 	Credentials []AgentCredential `json:"credentials,omitempty" gorm:"foreignKey:ServicePrincipalID"`
 	Policies    []AgentPolicy     `json:"policies,omitempty" gorm:"foreignKey:ServicePrincipalID"`
@@ -241,8 +240,8 @@ type DomainEvent struct {
 	Data            datatypes.JSON `json:"data" gorm:"type:jsonb;not null"`
 
 	TraceID         string     `json:"trace_id,omitempty" gorm:"size:128;index"`
-	CorrelationID   string     `json:"correlation_id,omitempty" gorm:"size:128;index"`
-	CausationID     string     `json:"causation_id,omitempty" gorm:"size:128;index"`
+	CorrelationID   string     `json:"correlation_id,omitempty" gorm:"size:255;index"`
+	CausationID     string     `json:"causation_id,omitempty" gorm:"size:255;index"`
 	ActorType       ActorType  `json:"actor_type" gorm:"size:32;not null;index"`
 	ActorID         string     `json:"actor_id" gorm:"size:128;not null;index"`
 	ResourceVersion uint64     `json:"resource_version" gorm:"not null;default:1"`

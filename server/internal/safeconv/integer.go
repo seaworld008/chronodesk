@@ -15,14 +15,14 @@ var ErrIntegerOutOfRange = errors.New("integer is outside the native-width range
 
 // ParseUint parses a base-10 value directly at the platform uint width.
 func ParseUint(value string) (uint, error) {
-	parsed, err := strconv.ParseUint(value, 10, strconv.IntSize)
+	parsed, err := strconv.ParseUint(value, 10, 64)
 	if err != nil {
 		return 0, err
 	}
-	// Keep the explicit constant bound even though ParseUint already received
-	// strconv.IntSize. It documents the cast invariant and is provable by
-	// security analyzers that do not evaluate platform-width arguments.
-	if parsed > uint64(math.MaxUint) {
+	// Compare against the destination type's actual maximum before casting.
+	// Keeping the proof independent of strconv.IntSize also makes the
+	// invariant visible to static analyzers on every target architecture.
+	if parsed > uint64(^uint(0)) {
 		return 0, ErrIntegerOutOfRange
 	}
 	return uint(parsed), nil
@@ -42,7 +42,7 @@ func ParsePositiveUint(value string) (uint, error) {
 
 // Uint converts a uint64 only after proving that it fits the platform uint.
 func Uint(value uint64) (uint, error) {
-	if value > uint64(math.MaxUint) {
+	if value > uint64(^uint(0)) {
 		return 0, ErrIntegerOutOfRange
 	}
 	return uint(value), nil
@@ -59,7 +59,7 @@ func PositiveUint(value uint64) (uint, error) {
 
 // Int converts an int64 only after proving that it fits the platform int.
 func Int(value int64) (int, error) {
-	if value < int64(math.MinInt) || value > int64(math.MaxInt) {
+	if strconv.IntSize == 32 && (value < math.MinInt32 || value > math.MaxInt32) {
 		return 0, ErrIntegerOutOfRange
 	}
 	return int(value), nil

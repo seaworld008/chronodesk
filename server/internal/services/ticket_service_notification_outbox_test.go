@@ -39,7 +39,7 @@ func newDurableNotificationFixture(t *testing.T, assigned bool) durableNotificat
 	users := []models.User{
 		{
 			Username: "notification-creator", Email: "notification-creator@example.com",
-			PasswordHash: "hash", Role: models.RoleUser, Status: models.UserStatusActive,
+			PasswordHash: "hash", Role: models.RoleCustomer, Status: models.UserStatusActive,
 		},
 		{
 			Username: "notification-assignee", Email: "notification-assignee@example.com",
@@ -63,7 +63,7 @@ func newDurableNotificationFixture(t *testing.T, assigned bool) durableNotificat
 		Priority:     models.TicketPriorityHigh,
 		Status:       models.TicketStatusOpen,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  users[0].ID,
+		CreatedByID:  &users[0].ID,
 		Version:      1,
 	}
 	if assigned {
@@ -81,7 +81,7 @@ func newDurableNotificationFixture(t *testing.T, assigned bool) durableNotificat
 	})
 	return durableNotificationFixture{
 		db:       db,
-		service:  NewTicketServiceWithAgentNative(db, nil, 0, native),
+		service:  newTicketServiceWithDependenciesForTest(t, db, native, nil, 0),
 		creator:  users[0],
 		assignee: users[1],
 		actor:    users[2],
@@ -94,7 +94,7 @@ func TestHumanTicketWritesCommitDurableNotificationOutboxTargets(t *testing.T) {
 		fixture := newDurableNotificationFixture(t, false)
 		status := models.TicketStatusInProgress
 		assigneeID := fixture.assignee.ID
-		if _, err := fixture.service.UpdateTicket(
+		if _, err := fixture.service.UpdateTicketExpectedVersion(
 			context.Background(),
 			fixture.ticket.ID,
 			&models.TicketUpdateRequest{
@@ -102,6 +102,7 @@ func TestHumanTicketWritesCommitDurableNotificationOutboxTargets(t *testing.T) {
 				AssignedToID: &assigneeID,
 			},
 			fixture.actor.ID,
+			fixture.ticket.Version,
 		); err != nil {
 			t.Fatalf("update ticket: %v", err)
 		}
@@ -119,11 +120,13 @@ func TestHumanTicketWritesCommitDurableNotificationOutboxTargets(t *testing.T) {
 
 	t.Run("assign", func(t *testing.T) {
 		fixture := newDurableNotificationFixture(t, false)
-		if _, err := fixture.service.AssignTicket(
+		if _, err := fixture.service.AssignTicketExpectedVersion(
+			context.Background(),
 			fixture.ticket.ID,
 			fixture.assignee.ID,
 			fixture.actor.ID,
 			"please investigate",
+			fixture.ticket.Version,
 		); err != nil {
 			t.Fatalf("assign ticket: %v", err)
 		}
@@ -139,14 +142,66 @@ func TestHumanTicketWritesCommitDurableNotificationOutboxTargets(t *testing.T) {
 		)
 	})
 
+	t.Run("transfer", func(t *testing.T) {
+		fixture := newDurableNotificationFixture(t, false)
+		if _, err := fixture.service.TransferTicketExpectedVersion(
+			context.Background(),
+			fixture.ticket.ID,
+			fixture.assignee.ID,
+			fixture.actor.ID,
+			"take over",
+			"capacity",
+			fixture.ticket.Version,
+		); err != nil {
+			t.Fatalf("transfer ticket: %v", err)
+		}
+		assertCommittedNotificationTargets(
+			t,
+			fixture.db,
+			"io.chronodesk.ticket.assigned.v1",
+			[]string{fmt.Sprintf(
+				"%s:%d",
+				models.NotificationTypeTicketAssigned,
+				fixture.assignee.ID,
+			)},
+		)
+	})
+
+	t.Run("escalate", func(t *testing.T) {
+		fixture := newDurableNotificationFixture(t, false)
+		if _, err := fixture.service.EscalateTicketExpectedVersion(
+			context.Background(),
+			fixture.ticket.ID,
+			fixture.assignee.ID,
+			fixture.actor.ID,
+			"SLA risk",
+			"please take over",
+			fixture.ticket.Version,
+		); err != nil {
+			t.Fatalf("escalate ticket: %v", err)
+		}
+		assertCommittedNotificationTargets(
+			t,
+			fixture.db,
+			"io.chronodesk.ticket.escalated.v1",
+			[]string{fmt.Sprintf(
+				"%s:%d",
+				models.NotificationTypeTicketAssigned,
+				fixture.assignee.ID,
+			)},
+		)
+	})
+
 	t.Run("transition", func(t *testing.T) {
 		fixture := newDurableNotificationFixture(t, true)
-		if _, err := fixture.service.UpdateTicketStatus(
+		if _, err := fixture.service.UpdateTicketStatusExpectedVersion(
+			context.Background(),
 			fixture.ticket.ID,
 			string(models.TicketStatusInProgress),
 			fixture.actor.ID,
 			"started",
 			"",
+			fixture.ticket.Version,
 		); err != nil {
 			t.Fatalf("transition ticket: %v", err)
 		}
@@ -219,12 +274,20 @@ func TestNotificationOutboxFailureRollsBackHumanTicketWrite(t *testing.T) {
 	native := NewAgentNativeService(fixture.db, AgentNativeOptions{
 		DefaultOutboxTargets: []OutboxTarget{{Type: "", ID: ""}},
 	})
-	service := NewTicketServiceWithAgentNative(fixture.db, nil, 0, native)
-	if _, err := service.AssignTicket(
+	service := newTicketServiceWithDependenciesForTest(
+		t,
+		fixture.db,
+		native,
+		nil,
+		0,
+	)
+	if _, err := service.AssignTicketExpectedVersion(
+		context.Background(),
 		fixture.ticket.ID,
 		fixture.assignee.ID,
 		fixture.actor.ID,
 		"must roll back",
+		fixture.ticket.Version,
 	); err == nil {
 		t.Fatal("invalid Outbox target did not fail the ticket transaction")
 	}

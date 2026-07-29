@@ -1,5 +1,16 @@
 import { test, expect } from '@playwright/test';
-import { authenticatePage, cleanupE2EData, E2E_PREFIX } from './helpers/testData';
+import {
+    assertEmailConfigMutationSafe,
+    authenticatePage,
+    captureEmailConfig,
+    E2E_MARKER,
+    restoreEmailConfig,
+} from './helpers/testData';
+import {
+    assertDestructiveE2EAllowed,
+    assertGlobalE2EAllowed,
+} from './helpers/safety';
+import { expectChineseOperations } from './helpers/browserAudit';
 
 const TEST_USER = {
     email: 'admin@example.com',
@@ -7,35 +18,55 @@ const TEST_USER = {
 };
 
 test.describe('Email Settings', () => {
-    test.afterAll(async ({ request }) => {
-        await cleanupE2EData(request, {
-            tickets: false,
-            automationRules: false,
-            notifications: false,
-            users: false,
-        });
+    test.beforeAll(() => {
+        assertDestructiveE2EAllowed('邮件配置 E2E');
+        assertGlobalE2EAllowed('邮件配置 E2E');
     });
 
-    test('should save email config with test data', async ({ page }) => {
-        await authenticatePage(page, TEST_USER);
+    test('UI-018：邮件配置使用快照恢复且不改写不可回显秘密', async ({
+        page,
+        request,
+    }) => {
+        const original = await captureEmailConfig(request);
+        assertEmailConfigMutationSafe(original, false);
+        const testFromName = `${E2E_MARKER}邮件发送方`;
+        const expectedAfterTest = {
+            ...original,
+            from_name: testFromName,
+        };
 
-        await page.goto('/#/email-settings');
+        try {
+            await authenticatePage(page, TEST_USER);
+            await page.goto('/#/email-settings');
+            await expect(page.getByLabel('发件人名称')).toHaveValue(
+                original.from_name,
+                { timeout: 15_000 },
+            );
+            await expect(
+                page.getByLabel('SMTP 密码（留空则不修改）'),
+            ).toHaveValue('');
 
-        const enableSwitch = page.getByLabel('启用邮件功能');
-        if (!(await enableSwitch.isChecked())) {
-            await enableSwitch.click();
+            await page.getByLabel('发件人名称').fill(testFromName);
+            const save = page.waitForResponse(
+                (response) =>
+                    response.request().method() === 'PUT' &&
+                    new URL(response.url()).pathname ===
+                        '/api/admin/email-config',
+            );
+            await page.getByRole('button', { name: '保存配置' }).click();
+            expect((await save).status()).toBe(200);
+            await expect(page.getByText('邮件配置保存成功')).toBeVisible({
+                timeout: 10_000,
+            });
+            await expectChineseOperations(page);
+            const saved = await captureEmailConfig(request);
+            expect(saved.from_name).toBe(testFromName);
+        } finally {
+            await restoreEmailConfig(
+                request,
+                original,
+                expectedAfterTest,
+            );
         }
-
-        const suffix = Date.now().toString();
-        await page.getByLabel('SMTP 主机').fill('smtp.test.local');
-        await page.getByLabel('SMTP 端口').fill('587');
-        await page.getByLabel('SMTP 用户名').fill(`test_user_${suffix}`);
-        await page.getByLabel('SMTP 密码（留空则不修改）').fill('test_pass_20260203');
-        await page.getByLabel('发件人邮箱').fill('test@example.com');
-        await page.getByLabel('发件人名称').fill(`${E2E_PREFIX}工单系统-${suffix}`);
-
-        await page.getByRole('button', { name: '保存配置' }).click();
-
-        await expect(page.getByText('邮件配置保存成功')).toBeVisible({ timeout: 10000 });
     });
 });

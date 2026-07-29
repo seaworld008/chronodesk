@@ -5,12 +5,28 @@ from __future__ import annotations
 import os
 import secrets
 import time
-from typing import Dict, Iterator
+from collections.abc import Iterator, Mapping
+from typing import Any
 
 import pytest
 import requests
 
-from .utils import APIClient, APIError
+from .utils import APIClient, APIError, E2EResourceManager, HumanIdentity
+from .utils.safety import (
+    TestSafetyError,
+    TestTarget,
+    healthcheck_url_for,
+    redact_text,
+    register_environment_secrets,
+    response_diagnostic,
+    safe_diagnostic,
+    sanitize_pytest_report,
+    scrub_html_report,
+    validate_test_target,
+)
+
+_TEST_TARGET = pytest.StashKey[TestTarget]()
+_COLLECTED_ITEMS = pytest.StashKey[list[pytest.Item]]()
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -22,10 +38,80 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    """Validate the target before collection can execute imported test code."""
+
+    register_environment_secrets()
+    configured = config.getoption("--api-base-url") or os.getenv(
+        "TEST_API_BASE_URL", "http://localhost:8081/api"
+    )
+    try:
+        config.stash[_TEST_TARGET] = validate_test_target(configured)
+    except TestSafetyError as exc:
+        raise pytest.UsageError(redact_text(exc)) from exc
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config,
+    items: list[pytest.Item],
+) -> None:
+    config.stash[_COLLECTED_ITEMS] = items
+
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_runtest_makereport(
+    item: pytest.Item,
+    call: pytest.CallInfo[None],
+) -> Iterator[None]:
+    """Scrub the final report consumed by terminals and pytest-html."""
+
+    del item, call
+    outcome = yield
+    sanitize_pytest_report(outcome.get_result())
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collectreport(
+    report: pytest.CollectReport,
+) -> None:
+    """Scrub import/collection failures before reporters receive them."""
+
+    sanitize_pytest_report(report)
+
+
+def pytest_assertrepr_compare(
+    config: pytest.Config,
+    op: str,
+    left: Any,
+    right: Any,
+) -> list[str] | None:
+    """Override comparison output only when credential redaction was required."""
+
+    del config
+    left_repr = repr(left)
+    right_repr = repr(right)
+    safe_left = redact_text(left_repr)
+    safe_right = redact_text(right_repr)
+    if safe_left == left_repr and safe_right == right_repr:
+        return None
+    return [
+        f"credential-safe comparison failed ({op})",
+        f"left: {safe_left}",
+        f"right: {safe_right}",
+    ]
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    """Scrub the completed pytest-html file after every reporter has written it."""
+
+    html_path = config.getoption("htmlpath", default=None)
+    if html_path:
+        scrub_html_report(html_path)
+
+
 @pytest.fixture(scope="session")
 def api_base_url(pytestconfig: pytest.Config) -> str:
-    option = pytestconfig.getoption("--api-base-url")
-    return option or os.getenv("TEST_API_BASE_URL", "http://localhost:8081/api")
+    return pytestconfig.stash[_TEST_TARGET].base_url
 
 
 @pytest.fixture(scope="session")
@@ -36,35 +122,52 @@ def api_client(api_base_url: str) -> APIClient:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _ensure_api_available(api_base_url: str) -> None:
-    """Skip test session early if API 未启动."""
-    health_url = os.getenv("TEST_HEALTHCHECK_URL")
-    if not health_url:
-        # 假设 api_base_url 以 /api 结尾
-        base_host = api_base_url.rsplit("/api", 1)[0]
-        health_url = f"{base_host}/healthz"
+def _ensure_api_available(
+    pytestconfig: pytest.Config,
+    api_base_url: str,
+) -> None:
+    """Fail closed when the real API or either required dependency is absent."""
+
+    items = pytestconfig.stash.get(_COLLECTED_ITEMS, [])
+    if items and all(item.get_closest_marker("unit") is not None for item in items):
+        return
+
+    target = pytestconfig.stash[_TEST_TARGET]
+    try:
+        health_url = healthcheck_url_for(
+            target,
+            os.getenv("TEST_HEALTHCHECK_URL"),
+        )
+    except TestSafetyError as exc:
+        pytest.fail(redact_text(exc), pytrace=False)
 
     try:
         response = requests.get(health_url, timeout=5)
     except requests.RequestException as exc:
-        pytest.fail(f"API 未启动或无法连接: {exc}")
+        pytest.fail(f"API 未启动或无法连接: {redact_text(exc)}", pytrace=False)
     if response.status_code != 200:
-        pytest.fail(f"API 健康检查失败: HTTP {response.status_code}")
+        pytest.fail(
+            f"API 健康检查失败: {response_diagnostic(response)}",
+            pytrace=False,
+        )
     try:
         payload = response.json()
     except ValueError as exc:
-        pytest.fail(f"API 健康检查返回非 JSON 响应: {exc}")
+        pytest.fail(
+            f"API 健康检查返回非 JSON 响应: {redact_text(exc)}",
+            pytrace=False,
+        )
     dependencies = payload.get("dependencies", {})
     if (
         payload.get("status") != "ok"
         or dependencies.get("postgresql") != "ok"
         or dependencies.get("redis") != "ok"
     ):
-        pytest.fail(f"API 依赖未就绪: {payload}")
+        pytest.fail(f"API 依赖未就绪: {safe_diagnostic(payload)}", pytrace=False)
 
 
 @pytest.fixture(scope="session")
-def admin_credentials() -> Dict[str, str]:
+def admin_credentials() -> dict[str, str]:
     return {
         "email": os.getenv("TEST_ADMIN_EMAIL", "admin@example.com"),
         "password": os.getenv("TEST_ADMIN_PASSWORD", "Admin123!"),
@@ -72,20 +175,26 @@ def admin_credentials() -> Dict[str, str]:
 
 
 @pytest.fixture(scope="session")
-def admin_tokens(api_client: APIClient, admin_credentials: Dict[str, str]) -> Dict[str, str]:
+def admin_tokens(
+    api_client: APIClient, admin_credentials: dict[str, str]
+) -> dict[str, object]:
     try:
-        payload = api_client.login(admin_credentials["email"], admin_credentials["password"])
+        payload = api_client.login(
+            admin_credentials["email"], admin_credentials["password"]
+        )
     except APIError as exc:
         response = exc.response
-        detail = response.text if response is not None else str(exc)
+        detail = (
+            response_diagnostic(response) if response is not None else redact_text(exc)
+        )
         pytest.fail(f"管理员登录失败，无法运行依赖测试: {detail}")
     return payload
 
 
 @pytest.fixture(scope="session")
-def admin_api(api_client: APIClient, admin_tokens: Dict[str, str]) -> APIClient:
+def admin_api(api_client: APIClient, admin_tokens: dict[str, object]) -> APIClient:
     token = admin_tokens.get("access_token")
-    if not token:
+    if not isinstance(token, str) or not token:
         pytest.fail("管理员登录响应缺少 access_token")
 
     authed_client = api_client.with_auth(token)
@@ -93,8 +202,74 @@ def admin_api(api_client: APIClient, admin_tokens: Dict[str, str]) -> APIClient:
     authed_client.close()
 
 
+@pytest.fixture(scope="session")
+def e2e_run_id(pytestconfig: pytest.Config) -> str:
+    target = pytestconfig.stash[_TEST_TARGET]
+    ownership = target.ownership_prefix or "e2e-local"
+    return f"{ownership}-{int(time.time())}-{secrets.token_hex(4)}"
+
+
+@pytest.fixture(scope="session")
+def e2e_manager(
+    api_client: APIClient,
+    admin_api: APIClient,
+    e2e_run_id: str,
+) -> Iterator[E2EResourceManager]:
+    manager = E2EResourceManager(api_client, admin_api, e2e_run_id)
+    try:
+        yield manager
+    finally:
+        manager.cleanup()
+
+
+@pytest.fixture(scope="session")
+def human_identities(
+    e2e_manager: E2EResourceManager,
+    admin_api: APIClient,
+    admin_credentials: dict[str, str],
+    admin_tokens: dict[str, object],
+) -> Mapping[str, HumanIdentity]:
+    admin_user = admin_tokens.get("user")
+    if not isinstance(admin_user, dict):
+        pytest.fail("管理员登录响应缺少 user")
+    admin_id = admin_user.get("id")
+    admin_username = admin_user.get("username")
+    admin_email = admin_user.get("email", admin_credentials["email"])
+    admin_access_token = admin_tokens.get("access_token")
+    admin_refresh_token = admin_tokens.get("refresh_token")
+    if (
+        not isinstance(admin_id, int)
+        or admin_id <= 0
+        or not isinstance(admin_username, str)
+        or not isinstance(admin_email, str)
+        or not isinstance(admin_access_token, str)
+        or not isinstance(admin_refresh_token, str)
+    ):
+        pytest.fail("管理员登录响应缺少完整身份或令牌字段")
+
+    return {
+        "admin": HumanIdentity(
+            id=admin_id,
+            role="admin",
+            username=admin_username,
+            email=admin_email,
+            password=admin_credentials["password"],
+            access_token=admin_access_token,
+            refresh_token=admin_refresh_token,
+            api=admin_api,
+        ),
+        "supervisor": e2e_manager.create_user("supervisor", "supervisor"),
+        "agent_a": e2e_manager.create_user("agent", "agent-a"),
+        "agent_b": e2e_manager.create_user("agent", "agent-b"),
+        "customer_a": e2e_manager.create_user("customer", "customer-a"),
+        "customer_b": e2e_manager.create_user("customer", "customer-b"),
+    }
+
+
 @pytest.fixture
-def registered_user(api_client: APIClient, admin_api: APIClient) -> Iterator[Dict[str, object]]:
+def registered_user(
+    api_client: APIClient, admin_api: APIClient
+) -> Iterator[dict[str, object]]:
     last_error: APIError | None = None
     for attempt in range(3):
         timestamp = int(time.time_ns())
@@ -122,7 +297,11 @@ def registered_user(api_client: APIClient, admin_api: APIClient) -> Iterator[Dic
     else:
         assert last_error is not None
         response = last_error.response
-        detail = response.text if response is not None else str(last_error)
+        detail = (
+            response_diagnostic(response)
+            if response is not None
+            else redact_text(last_error)
+        )
         pytest.fail(f"Failed to register test user: {detail}")
 
     registered = {
@@ -142,7 +321,7 @@ def registered_user(api_client: APIClient, admin_api: APIClient) -> Iterator[Dic
             if response.status_code not in (200, 204, 404):
                 pytest.fail(
                     f"Failed to clean up registered test user {user_id}: "
-                    f"HTTP {response.status_code} {response.text}"
+                    f"{response_diagnostic(response)}"
                 )
 
 
@@ -152,5 +331,8 @@ def _generate_strong_password() -> str:
     while True:
         token = secrets.token_hex(6)
         password = f"Aa1!{token}Z"
-        if all(password[i] != password[i + 1] or password[i] != password[i + 2] for i in range(len(password) - 2)):
+        if all(
+            password[i] != password[i + 1] or password[i] != password[i + 2]
+            for i in range(len(password) - 2)
+        ):
             return password

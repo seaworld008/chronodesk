@@ -59,7 +59,7 @@ func TestRedisAgentExecutionGuardUsesOpaqueClusterSlotAndAtomicRelease(t *testin
 	}
 	principalID := "principal-sensitive-identity"
 	permit, err := guard.Acquire(context.Background(), AgentExecutionGuardRequest{
-		PrincipalID:      principalID,
+		SubjectID:        principalID,
 		RateLimit:        20,
 		ConcurrencyLimit: 3,
 		ConcurrencyTTL:   90 * time.Second,
@@ -131,7 +131,7 @@ func TestRedisAgentExecutionGuardMapsLimitsAndFailsClosed(t *testing.T) {
 				t.Fatal(err)
 			}
 			_, err = guard.Acquire(context.Background(), AgentExecutionGuardRequest{
-				PrincipalID:      "principal",
+				SubjectID:        "principal",
 				RateLimit:        10,
 				ConcurrencyLimit: 1,
 				ConcurrencyTTL:   time.Minute,
@@ -195,7 +195,7 @@ func TestRedisAgentLoopWindowIsSharedAcrossGuardInstances(t *testing.T) {
 
 func TestRequiredDistributedExecutionGuardRejectsLocalFallback(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "distributed-required")
+	user := seedActorUser(t, db, "distributed-required")
 	service := NewAgentNativeService(db, AgentNativeOptions{
 		ExecutionGuard:                   NewInMemoryAgentExecutionGuardForTesting(),
 		RequireDistributedExecutionGuard: true,
@@ -217,7 +217,7 @@ func TestRequiredDistributedExecutionGuardRejectsLocalFallback(t *testing.T) {
 
 func TestPolicyWriteFailsClosedAndAuditsSharedGuardOutage(t *testing.T) {
 	db := openAgentNativeTestDB(t)
-	user := seedCompatibilityUser(t, db, "guard-outage")
+	user := seedActorUser(t, db, "guard-outage")
 	executor := &scriptedRedisExecution{errors: []error{errors.New("Redis unavailable")}}
 	guard, err := NewRedisAgentExecutionGuard(
 		executor,
@@ -263,7 +263,7 @@ func TestInMemoryAgentExecutionLeaseExpiresAfterCrashWindow(t *testing.T) {
 	guard := NewInMemoryAgentExecutionGuardForTesting()
 	now := time.Date(2026, 7, 29, 10, 0, 0, 0, time.UTC)
 	request := AgentExecutionGuardRequest{
-		PrincipalID:       "principal",
+		SubjectID:         "principal",
 		RateLimit:         100,
 		ConcurrencyLimit:  1,
 		ConcurrencyTTL:    time.Minute,

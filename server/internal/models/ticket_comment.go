@@ -23,7 +23,7 @@ type TicketComment struct {
 	// 关联信息
 	TicketID           uint              `json:"ticket_id" gorm:"not null;index"`
 	Ticket             *Ticket           `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
-	UserID             uint              `json:"user_id" gorm:"not null;index"`
+	UserID             *uint             `json:"user_id,omitempty" gorm:"index"`
 	User               *User             `json:"user,omitempty" gorm:"foreignKey:UserID"`
 	ActorType          ActorType         `json:"actor_type" gorm:"size:32;not null;default:'human';index"`
 	ActorID            string            `json:"actor_id" gorm:"size:128;index"`
@@ -35,11 +35,10 @@ type TicketComment struct {
 	ContentType string      `json:"content_type" gorm:"size:20;default:'text'"` // text, html, markdown
 	Type        CommentType `json:"type" gorm:"size:20;not null;default:'public'" validate:"required,oneof=public internal system"`
 
-	// 附件和元数据
-	Attachments string `json:"attachments" gorm:"type:text"` // JSON格式存储附件列表
-	Metadata    string `json:"metadata" gorm:"type:text"`    // JSON格式存储元数据
-	SourceIP    string `json:"source_ip" gorm:"size:45"`
-	UserAgent   string `json:"user_agent" gorm:"size:500"`
+	// 元数据
+	Metadata  string `json:"metadata" gorm:"type:text"` // JSON格式存储元数据
+	SourceIP  string `json:"source_ip" gorm:"size:45"`
+	UserAgent string `json:"user_agent" gorm:"size:500"`
 
 	// 状态信息
 	IsEdited    bool       `json:"is_edited" gorm:"default:false"`
@@ -74,48 +73,10 @@ func (TicketComment) TableName() string {
 	return "ticket_comments"
 }
 
-// IsPublic 检查是否为公开评论
-func (tc *TicketComment) IsPublic() bool {
-	return tc.Type == CommentTypePublic
-}
-
-// IsInternal 检查是否为内部评论
-func (tc *TicketComment) IsInternal() bool {
-	return tc.Type == CommentTypeInternal
-}
-
-// IsSystem 检查是否为系统评论
-func (tc *TicketComment) IsSystem() bool {
-	return tc.Type == CommentTypeSystem || tc.ActorType == ActorTypeSystem
-}
-
-// Actor returns the authoritative actor and falls back to the legacy user ID
-// for rows created before Agent-native actor columns existed.
+// Actor returns the authoritative ActorRef. Migration and database constraints
+// guarantee that it is complete and consistent with the optional projection.
 func (tc *TicketComment) Actor() ActorRef {
-	if tc.ActorType != "" && tc.ActorID != "" {
-		return ActorRef{Type: tc.ActorType, ID: tc.ActorID}
-	}
-	return HumanActor(tc.UserID)
-}
-
-// CanBeEdited 检查评论是否可以编辑
-func (tc *TicketComment) CanBeEdited() bool {
-	return !tc.IsDeleted && tc.Type != CommentTypeSystem
-}
-
-// CanBeDeleted 检查评论是否可以删除
-func (tc *TicketComment) CanBeDeleted() bool {
-	return !tc.IsDeleted
-}
-
-// IsReply 检查是否为回复
-func (tc *TicketComment) IsReply() bool {
-	return tc.ParentID != nil
-}
-
-// HasReplies 检查是否有回复
-func (tc *TicketComment) HasReplies() bool {
-	return tc.ReplyCount > 0
+	return ActorRef{Type: tc.ActorType, ID: tc.ActorID}
 }
 
 // TicketCommentCreateRequest 评论创建请求
@@ -125,22 +86,9 @@ type TicketCommentCreateRequest struct {
 	ContentType  string                 `json:"content_type" validate:"omitempty,oneof=text html markdown"`
 	Type         CommentType            `json:"type" validate:"required,oneof=public internal system"`
 	ParentID     *uint                  `json:"parent_id"`
-	Attachments  []string               `json:"attachments"`
 	TimeSpent    *int                   `json:"time_spent" validate:"omitempty,min=0"`
 	BillableTime *int                   `json:"billable_time" validate:"omitempty,min=0"`
 	WorkType     string                 `json:"work_type"`
-	Metadata     map[string]interface{} `json:"metadata"`
-}
-
-// TicketCommentUpdateRequest 评论更新请求
-type TicketCommentUpdateRequest struct {
-	Content      *string                `json:"content" validate:"omitempty,min=1"`
-	ContentType  *string                `json:"content_type" validate:"omitempty,oneof=text html markdown"`
-	Type         *CommentType           `json:"type" validate:"omitempty,oneof=public internal system"`
-	Attachments  []string               `json:"attachments"`
-	TimeSpent    *int                   `json:"time_spent" validate:"omitempty,min=0"`
-	BillableTime *int                   `json:"billable_time" validate:"omitempty,min=0"`
-	WorkType     *string                `json:"work_type"`
 	Metadata     map[string]interface{} `json:"metadata"`
 }
 
@@ -156,7 +104,6 @@ type TicketCommentResponse struct {
 	Content          string                   `json:"content"`
 	ContentType      string                   `json:"content_type"`
 	Type             CommentType              `json:"type"`
-	Attachments      []string                 `json:"attachments"`
 	Metadata         map[string]interface{}   `json:"metadata"`
 	IsEdited         bool                     `json:"is_edited"`
 	EditedAt         *time.Time               `json:"edited_at"`
@@ -216,7 +163,6 @@ func (tc *TicketComment) ToResponse() *TicketCommentResponse {
 		}
 	}
 
-	response.Attachments = decodeJSONStringSlice(tc.Attachments)
 	response.Metadata = decodeJSONMap(tc.Metadata)
 
 	return response

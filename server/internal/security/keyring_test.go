@@ -214,28 +214,3 @@ func TestLoadDeploymentKeyringPriorityAndFailClosedFallback(t *testing.T) {
 		t.Fatalf("invalid dedicated keyring unexpectedly fell back: %v", err)
 	}
 }
-
-func TestLoadDeploymentKeyringFromEnvironmentDerivesPepper(t *testing.T) {
-	t.Setenv(PrimaryKeyIDEnv, "")
-	t.Setenv(KeysEnv, "")
-	t.Setenv(AgentJWTSecretEnv, "")
-	t.Setenv(HumanJWTSecretEnv, "")
-	t.Setenv(AgentCredentialPepperEnv, strings.Repeat("high-entropy-pepper-", 3))
-	ring, err := LoadDeploymentKeyringFromEnvironment()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ring.PrimaryKeyID() != DerivedDatabaseKeyID {
-		t.Fatalf("derived primary=%q", ring.PrimaryKeyID())
-	}
-
-	t.Setenv(AgentCredentialPepperEnv, "")
-	t.Setenv(HumanJWTSecretEnv, strings.Repeat("stable-human-jwt-root-", 3))
-	fallback, err := LoadDeploymentKeyringFromEnvironment()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fallback.PrimaryKeyID() != DerivedDatabaseKeyID {
-		t.Fatalf("fallback primary=%q", fallback.PrimaryKeyID())
-	}
-}

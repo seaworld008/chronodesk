@@ -143,6 +143,7 @@ the Docker-backed smoke path.
 server/
   cmd/chronodesk/       minimal executable
   cmd/migrate/          explicit migration/seed command
+  cmd/credential-maintain/ current-format validation, rotation, and quarantine
   internal/app/         composition root and graceful lifecycle
   internal/services/    shared domain/application rules
   internal/agentplatform/
@@ -169,7 +170,7 @@ docs/
 - [A2A integration](docs/reference/A2A_1_0.md)
 - [Database migrations](docs/operations/database-migrations.md)
 - [Testing guide](docs/testing_guide.md)
-- [Full Agent-native verification report](docs/testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-29.md)
+- [Full Agent-native verification report](docs/testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-30.md)
 
 ## Project status
 

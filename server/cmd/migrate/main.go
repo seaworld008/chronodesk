@@ -21,6 +21,7 @@ var (
 	verbose  bool
 	dropAll  bool
 	seedData bool
+	samples  bool
 	timeout  time.Duration
 	resumeAt int
 )
@@ -30,6 +31,12 @@ func main() {
 	flag.BoolVar(&verbose, "v", false, "Enable verbose database logs")
 	flag.BoolVar(&dropAll, "drop", false, "Drop ChronoDesk tables before migration")
 	flag.BoolVar(&seedData, "seed", false, "Seed initial business data explicitly")
+	flag.BoolVar(
+		&samples,
+		"sample-data",
+		false,
+		"Also seed demonstration records (requires -seed and ENVIRONMENT=development)",
+	)
 	flag.DurationVar(&timeout, "timeout", 5*time.Minute, "Maximum migration duration")
 	flag.IntVar(
 		&resumeAt,
@@ -55,6 +62,15 @@ func main() {
 	}
 	if dropAll && os.Getenv("ALLOW_DESTRUCTIVE_MIGRATION") != "true" {
 		log.Fatal("-drop requires ALLOW_DESTRUCTIVE_MIGRATION=true")
+	}
+	if samples && !seedData {
+		log.Fatal("-sample-data requires -seed")
+	}
+	if err := database.ValidatePostgresTransport(
+		dsn,
+		os.Getenv("POSTGRES_ALLOW_INSECURE") == "true",
+	); err != nil {
+		log.Fatalf("PostgreSQL 连接安全校验失败：%v", err)
 	}
 
 	log.Println("开始执行 ChronoDesk 数据库迁移")
@@ -92,7 +108,9 @@ func main() {
 		log.Fatalf("数据库迁移失败：%v", err)
 	}
 	if seedData {
-		if err := database.SeedData(db); err != nil {
+		if err := database.SeedData(db, database.SeedOptions{
+			IncludeSampleData: samples,
+		}); err != nil {
 			log.Fatalf("初始化业务数据失败：%v", err)
 		}
 	}

@@ -9,13 +9,12 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/netip"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/a2a"
+	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/mcp"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/safeconv"
@@ -37,6 +36,14 @@ type MCPResourcePublisher struct {
 
 type SLAEscalationConsumer interface {
 	ExecuteDomainEvent(context.Context, services.CloudEventEnvelope) error
+}
+
+type AuthEmailOutboxConsumer interface {
+	DeliverAuthEmailOutbox(
+		context.Context,
+		*models.OutboxDelivery,
+		services.CloudEventEnvelope,
+	) error
 }
 
 func (p *MCPResourcePublisher) PublishTicket(ticketID uint) {
@@ -70,57 +77,46 @@ type NativeOutboxDeliverer struct {
 	automation    *services.AutomationService
 	slaEscalation SLAEscalationConsumer
 	attachments   services.AttachmentStorage
+	authEmails    AuthEmailOutboxConsumer
 	secretStore   security.Protector
 	resolver      *net.Resolver
 }
 
-func NewNativeOutboxDeliverer(
-	db *gorm.DB,
-	notifications *services.NotificationService,
-	publisher *MCPResourcePublisher,
-	automation ...*services.AutomationService,
-) (*NativeOutboxDeliverer, error) {
-	if db == nil {
+// NativeOutboxDelivererOptions is the complete, immutable dependency graph for
+// durable side-effect delivery. Optional consumers may be nil when that
+// destination type is not enabled, and Deliver will return a stable error if a
+// delivery is nevertheless routed to an unavailable consumer.
+type NativeOutboxDelivererOptions struct {
+	DB                *gorm.DB
+	Notifications     *services.NotificationService
+	Publisher         *MCPResourcePublisher
+	Automation        *services.AutomationService
+	SLAEscalation     SLAEscalationConsumer
+	AttachmentStorage services.AttachmentStorage
+	AuthEmails        AuthEmailOutboxConsumer
+	SecretProtector   security.Protector
+	Resolver          *net.Resolver
+}
+
+func NewNativeOutboxDeliverer(options NativeOutboxDelivererOptions) (*NativeOutboxDeliverer, error) {
+	if options.DB == nil {
 		return nil, errors.New("outbox deliverer database is required")
 	}
-	var automationService *services.AutomationService
-	if len(automation) > 0 {
-		automationService = automation[0]
+	resolver := options.Resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
 	}
-	protector, _ := security.LoadDeploymentKeyringFromEnvironment()
 	return &NativeOutboxDeliverer{
-		db:            db,
-		notifications: notifications,
-		publisher:     publisher,
-		automation:    automationService,
-		secretStore:   protector,
-		resolver:      net.DefaultResolver,
+		db:            options.DB,
+		notifications: options.Notifications,
+		publisher:     options.Publisher,
+		automation:    options.Automation,
+		slaEscalation: options.SLAEscalation,
+		attachments:   options.AttachmentStorage,
+		authEmails:    options.AuthEmails,
+		secretStore:   options.SecretProtector,
+		resolver:      resolver,
 	}, nil
-}
-
-// SetSLAEscalationConsumer keeps the existing constructor compatible while
-// allowing main to wire the durable SLA continuation before the worker starts.
-func (d *NativeOutboxDeliverer) SetSLAEscalationConsumer(consumer SLAEscalationConsumer) {
-	if d != nil {
-		d.slaEscalation = consumer
-	}
-}
-
-// SetAttachmentStorage wires the protocol-neutral object store used by
-// attachment uploads. Cleanup deliveries call only its Delete operation and
-// never interpret provider URLs from ticket data.
-func (d *NativeOutboxDeliverer) SetAttachmentStorage(storage services.AttachmentStorage) {
-	if d != nil {
-		d.attachments = storage
-	}
-}
-
-// SetSecretProtector injects the same application keyring used by the A2A
-// persistence store. It must be configured before the Outbox worker starts.
-func (d *NativeOutboxDeliverer) SetSecretProtector(protector security.Protector) {
-	if d != nil {
-		d.secretStore = protector
-	}
 }
 
 func (d *NativeOutboxDeliverer) Deliver(
@@ -141,7 +137,7 @@ func (d *NativeOutboxDeliverer) Deliver(
 		}
 		return nil
 	case "webhook":
-		return d.deliverLegacyWebhook(ctx, delivery, event)
+		return d.deliverWebhook(ctx, delivery, event)
 	case services.NotificationOutboxDestination:
 		if d.notifications == nil {
 			return errors.New("in-app notification service is unavailable")
@@ -175,8 +171,50 @@ func (d *NativeOutboxDeliverer) Deliver(
 		return d.slaEscalation.ExecuteDomainEvent(ctx, event)
 	case services.AttachmentCleanupOutboxDestination:
 		return d.deliverAttachmentCleanup(ctx, delivery, event)
+	case services.EmailOutboxDestination:
+		return d.deliverEmail(ctx, delivery, event)
 	default:
 		return fmt.Errorf("unsupported outbox destination type %q", delivery.DestinationType)
+	}
+}
+
+func (d *NativeOutboxDeliverer) deliverEmail(
+	ctx context.Context,
+	delivery *models.OutboxDelivery,
+	event services.CloudEventEnvelope,
+) error {
+	switch {
+	case strings.HasPrefix(
+		delivery.DestinationID,
+		services.NotificationEmailDestinationPrefix,
+	):
+		if d.notifications == nil {
+			return errors.New("email notification service is unavailable")
+		}
+		return d.notifications.DeliverEmailNotificationOutbox(
+			ctx,
+			event,
+			delivery.DestinationID,
+		)
+	case strings.HasPrefix(
+		delivery.DestinationID,
+		services.AuthVerificationEmailDestinationPrefix,
+	), strings.HasPrefix(
+		delivery.DestinationID,
+		services.AuthPasswordResetEmailDestinationPrefix,
+	), strings.HasPrefix(
+		delivery.DestinationID,
+		services.AuthWelcomeEmailDestinationPrefix,
+	):
+		if d.authEmails == nil {
+			return errors.New("authentication email service is unavailable")
+		}
+		return d.authEmails.DeliverAuthEmailOutbox(ctx, delivery, event)
+	default:
+		return fmt.Errorf(
+			"unsupported email Outbox destination %q",
+			delivery.DestinationID,
+		)
 	}
 }
 
@@ -188,7 +226,7 @@ func (d *NativeOutboxDeliverer) deliverAttachmentCleanup(
 	if d.attachments == nil {
 		return errors.New("attachment storage is unavailable")
 	}
-	if event.Type != "io.chronodesk.ticket.deleted.v1" {
+	if event.Type != eventcontract.TicketDeletedEventType {
 		return fmt.Errorf(
 			"attachment cleanup requires a ticket deletion event, got %q",
 			event.Type,
@@ -243,7 +281,7 @@ const (
 	webhookConfigPrefix        = "config:"
 )
 
-func (d *NativeOutboxDeliverer) deliverLegacyWebhook(
+func (d *NativeOutboxDeliverer) deliverWebhook(
 	ctx context.Context,
 	delivery *models.OutboxDelivery,
 	event services.CloudEventEnvelope,
@@ -251,18 +289,27 @@ func (d *NativeOutboxDeliverer) deliverLegacyWebhook(
 	if d.notifications == nil {
 		return errors.New("webhook notification service is unavailable")
 	}
-	eventType, ok := webhookEventType(event)
-	if !ok {
+	eventType := models.WebhookEventType(strings.TrimSpace(event.Type))
+	if !eventcontract.IsWebhookDeliveryEventType(string(eventType)) {
 		return nil
 	}
+	transitionStatus := models.TicketStatus("")
+	if eventType == models.WebhookEventTicketTransitioned {
+		transitionStatus = webhookTransitionStatus(event)
+	}
 	if delivery.DestinationID == webhookFanoutDestinationID {
-		return d.fanOutLegacyWebhookDeliveries(ctx, event, eventType)
+		return d.fanOutWebhookDeliveries(
+			ctx,
+			event,
+			eventType,
+			transitionStatus,
+		)
 	}
 	configID, err := parseWebhookConfigDestinationID(delivery.DestinationID)
 	if err != nil {
 		return err
 	}
-	notification := notificationEventFromCloudEvent(event, eventType)
+	notification := notificationEventFromCloudEvent(event)
 	notification.Metadata["delivery_id"] = delivery.ID
 	return d.notifications.SendWebhookOutboxAttempt(
 		ctx,
@@ -271,12 +318,17 @@ func (d *NativeOutboxDeliverer) deliverLegacyWebhook(
 	)
 }
 
-func (d *NativeOutboxDeliverer) fanOutLegacyWebhookDeliveries(
+func (d *NativeOutboxDeliverer) fanOutWebhookDeliveries(
 	ctx context.Context,
 	event services.CloudEventEnvelope,
 	eventType models.WebhookEventType,
+	transitionStatus models.TicketStatus,
 ) error {
-	targets, err := d.notifications.ListWebhookOutboxTargets(ctx, eventType)
+	targets, err := d.notifications.ListWebhookOutboxTargets(
+		ctx,
+		eventType,
+		transitionStatus,
+	)
 	if err != nil {
 		return fmt.Errorf("list webhook Outbox targets: %w", err)
 	}
@@ -314,7 +366,6 @@ func (d *NativeOutboxDeliverer) fanOutLegacyWebhookDeliveries(
 
 func notificationEventFromCloudEvent(
 	event services.CloudEventEnvelope,
-	eventType models.WebhookEventType,
 ) *services.NotificationEvent {
 	var payload map[string]any
 	if len(event.Data) > 0 {
@@ -326,9 +377,13 @@ func notificationEventFromCloudEvent(
 	payload["event_id"] = event.ID
 	payload["cloud_event"] = event
 	ticketID := ticketIDFromCloudEvent(event)
+	transitionStatus := models.TicketStatus("")
+	if event.Type == eventcontract.TicketTransitionedEventType {
+		transitionStatus = webhookTransitionStatus(event)
+	}
 	title := "ChronoDesk ticket event"
 	description := event.Type
-	if eventType == models.WebhookEventAutomationNotification {
+	if event.Type == eventcontract.AutomationNotificationRequestedEventType {
 		var requested struct {
 			Notification struct {
 				Title   string `json:"title"`
@@ -345,12 +400,13 @@ func notificationEventFromCloudEvent(
 		}
 	}
 	return &services.NotificationEvent{
-		Type:         eventType,
-		ResourceID:   ticketID,
-		ResourceType: "ticket",
-		Title:        title,
-		Description:  description,
-		Data:         payload,
+		Type:             models.WebhookEventType(event.Type),
+		TransitionStatus: transitionStatus,
+		ResourceID:       ticketID,
+		ResourceType:     "ticket",
+		Title:            title,
+		Description:      description,
+		Data:             payload,
 		Metadata: map[string]string{
 			"event_id":       event.ID,
 			"trace_id":       event.TraceID,
@@ -416,7 +472,7 @@ func (d *NativeOutboxDeliverer) deliverA2APush(
 
 	request, err := newA2APushRequest(ctx, row.URL, data.StreamResponse, event.ID)
 	if err != nil {
-		return fmt.Errorf("create A2A push request: %w", err)
+		return errors.New("A2A Push 回调请求无效")
 	}
 	token, err := security.RevealOptional(
 		d.secretStore,
@@ -454,18 +510,23 @@ func (d *NativeOutboxDeliverer) deliverA2APush(
 		}
 	}
 
-	client, err := d.secureCallbackClient(ctx, request.URL)
+	client, err := security.NewPinnedHTTPSClient(
+		ctx,
+		request.URL,
+		d.resolver,
+		20*time.Second,
+	)
 	if err != nil {
-		return err
+		return errors.New("A2A Push 回调地址不可用")
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return fmt.Errorf("deliver A2A push notification: %w", err)
+		return errors.New("A2A Push 网络投递失败")
 	}
 	defer response.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("A2A push endpoint returned HTTP %d", response.StatusCode)
+		return fmt.Errorf("A2A Push 上游返回 HTTP %d", response.StatusCode)
 	}
 	return nil
 }
@@ -483,82 +544,12 @@ func newA2APushRequest(
 		strings.NewReader(string(payload)),
 	)
 	if err != nil {
-		return nil, err
+		return nil, errors.New("invalid A2A push callback URL")
 	}
 	request.Header.Set("Content-Type", "application/a2a+json")
 	request.Header.Set("A2A-Version", a2a.ProtocolVersion)
 	request.Header.Set("X-CloudEvents-ID", eventID)
 	return request, nil
-}
-
-func (d *NativeOutboxDeliverer) secureCallbackClient(
-	ctx context.Context,
-	target *url.URL,
-) (*http.Client, error) {
-	if target == nil ||
-		!strings.EqualFold(target.Scheme, "https") ||
-		target.Hostname() == "" ||
-		target.User != nil {
-		return nil, errors.New("A2A push URL must be an absolute HTTPS URL without userinfo")
-	}
-	host := strings.TrimSuffix(strings.ToLower(target.Hostname()), ".")
-	addresses, err := d.resolver.LookupIPAddr(ctx, host)
-	if err != nil || len(addresses) == 0 {
-		return nil, errors.New("A2A push host could not be resolved")
-	}
-	for _, address := range addresses {
-		if !isPublicCallbackIP(address.IP) {
-			return nil, errors.New("A2A push host resolves to a private or reserved address")
-		}
-	}
-	port := target.Port()
-	if port == "" {
-		port = "443"
-	}
-	pinnedAddress := net.JoinHostPort(addresses[0].IP.String(), port)
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DialContext = func(dialContext context.Context, network, address string) (net.Conn, error) {
-		requestHost, _, splitErr := net.SplitHostPort(address)
-		if splitErr != nil || !strings.EqualFold(strings.TrimSuffix(requestHost, "."), host) {
-			return nil, errors.New("A2A push redirect or host change is not allowed")
-		}
-		return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(dialContext, network, pinnedAddress)
-	}
-	return &http.Client{
-		Transport: transport,
-		Timeout:   20 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}, nil
-}
-
-func isPublicCallbackIP(ip net.IP) bool {
-	address, ok := netip.AddrFromSlice(ip)
-	if !ok {
-		return false
-	}
-	address = address.Unmap()
-	if !address.IsGlobalUnicast() || address.IsPrivate() || address.IsLoopback() ||
-		address.IsLinkLocalUnicast() || address.IsUnspecified() {
-		return false
-	}
-	for _, prefix := range reservedCallbackPrefixes {
-		if prefix.Contains(address) {
-			return false
-		}
-	}
-	return true
-}
-
-var reservedCallbackPrefixes = []netip.Prefix{
-	netip.MustParsePrefix("100.64.0.0/10"),
-	netip.MustParsePrefix("192.0.0.0/24"),
-	netip.MustParsePrefix("192.0.2.0/24"),
-	netip.MustParsePrefix("198.18.0.0/15"),
-	netip.MustParsePrefix("198.51.100.0/24"),
-	netip.MustParsePrefix("203.0.113.0/24"),
-	netip.MustParsePrefix("2001:db8::/32"),
 }
 
 func ticketIDFromCloudEvent(event services.CloudEventEnvelope) uint {
@@ -576,37 +567,6 @@ func ticketIDFromCloudEvent(event services.CloudEventEnvelope) uint {
 		}
 	}
 	return 0
-}
-
-func webhookEventType(event services.CloudEventEnvelope) (models.WebhookEventType, bool) {
-	switch event.Type {
-	case "io.chronodesk.ticket.created.v1":
-		return models.WebhookEventTicketCreated, true
-	case "io.chronodesk.ticket.assigned.v1":
-		return models.WebhookEventTicketAssigned, true
-	case "io.chronodesk.ticket.comment.created.v1":
-		return models.WebhookEventTicketComment, true
-	case "io.chronodesk.ticket.escalated.v1":
-		return models.WebhookEventTicketEscalated, true
-	case "io.chronodesk.ticket.transitioned.v1":
-		switch webhookTransitionStatus(event) {
-		case models.TicketStatusResolved:
-			return models.WebhookEventTicketResolved, true
-		case models.TicketStatusClosed:
-			return models.WebhookEventTicketClosed, true
-		default:
-			return models.WebhookEventTicketUpdated, true
-		}
-	case "io.chronodesk.ticket.updated.v1",
-		"io.chronodesk.ticket.attachment.created.v1":
-		return models.WebhookEventTicketUpdated, true
-	case "io.chronodesk.ticket.sla.breached.v1":
-		return models.WebhookEventSystemAlert, true
-	case "io.chronodesk.automation.notification.requested.v1":
-		return models.WebhookEventAutomationNotification, true
-	default:
-		return "", false
-	}
 }
 
 func webhookTransitionStatus(event services.CloudEventEnvelope) models.TicketStatus {

@@ -95,7 +95,7 @@ func setupCacheTestDB(t *testing.T) *gorm.DB {
 		Priority:     models.TicketPriorityHigh,
 		Type:         models.TicketTypeIncident,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  user.ID,
+		CreatedByID:  &user.ID,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatalf("failed to create ticket: %v", err)
@@ -107,7 +107,13 @@ func setupCacheTestDB(t *testing.T) *gorm.DB {
 func TestGetTicketStatistics_Cache(t *testing.T) {
 	db := setupCacheTestDB(t)
 	cache := &fakeRedis{store: map[string]string{}}
-	svc := NewTicketServiceWithCache(db, cache, 30*time.Second)
+	svc := newTicketServiceWithDependenciesForTest(
+		t,
+		db,
+		NewAgentNativeService(db),
+		cache,
+		30*time.Second,
+	)
 
 	stats1, err := svc.GetTicketStatistics(1, "admin")
 	if err != nil {

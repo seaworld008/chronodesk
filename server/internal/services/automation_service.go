@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"gorm.io/datatypes"
@@ -46,26 +47,32 @@ const (
 	automationActionOperation        = "automation.rule.action"
 	automationRuleExecutionOperation = "automation.rule.execution"
 	automationTriggerOperation       = "automation.trigger.enqueue"
-	automationTriggerEventType       = "io.chronodesk.automation.trigger.requested.v1"
 	maxAutomationCausalDepth         = 16
 	automationReservationTTL         = 2 * time.Minute
 	automationFailureRetryDelay      = 2 * time.Second
 	automationCompletedRetentionTTL  = 365 * 24 * time.Hour
 )
 
-var ErrInvalidWorkingHours = errors.New("invalid SLA working hours")
+var (
+	ErrInvalidWorkingHours          = errors.New("invalid SLA working hours")
+	ErrInvalidAutomationTriggerType = errors.New("invalid automation trigger event type")
+)
 
 // AutomationRuleService 自动化规则相关方法
 
 // CreateRule 创建自动化规则
 func (s *AutomationService) CreateRule(ctx context.Context, req *models.AutomationRuleRequest, userID uint) (*models.AutomationRule, error) {
+	triggerEvent, err := normalizeAutomationRuleTriggerEvent(req.TriggerEvent)
+	if err != nil {
+		return nil, err
+	}
 	rule := &models.AutomationRule{
 		Name:         req.Name,
 		Description:  req.Description,
 		RuleType:     req.RuleType,
 		IsActive:     false,
 		Priority:     1,
-		TriggerEvent: req.TriggerEvent,
+		TriggerEvent: triggerEvent,
 		CreatedBy:    userID,
 	}
 
@@ -99,7 +106,11 @@ func (s *AutomationService) GetRules(ctx context.Context, ruleType string, trigg
 		query = query.Where("rule_type = ?", ruleType)
 	}
 	if triggerEvent != "" {
-		query = query.Where("trigger_event = ?", triggerEvent)
+		normalized, err := normalizeAutomationRuleTriggerEvent(triggerEvent)
+		if err != nil {
+			return nil, 0, err
+		}
+		query = query.Where("trigger_event = ?", normalized)
 	}
 	if isActive != nil {
 		query = query.Where("is_active = ?", *isActive)
@@ -141,12 +152,16 @@ func (s *AutomationService) UpdateRule(ctx context.Context, ruleID uint, req *mo
 	if err != nil {
 		return err
 	}
+	triggerEvent, err := normalizeAutomationRuleTriggerEvent(req.TriggerEvent)
+	if err != nil {
+		return err
+	}
 
 	updates := map[string]interface{}{
 		"name":          req.Name,
 		"description":   req.Description,
 		"rule_type":     req.RuleType,
-		"trigger_event": req.TriggerEvent,
+		"trigger_event": triggerEvent,
 		"updated_by":    userID,
 	}
 
@@ -183,12 +198,16 @@ func (s *AutomationService) DeleteRule(ctx context.Context, ruleID uint) error {
 	return nil
 }
 
-// ExecuteRules 执行自动化规则
-func (s *AutomationService) ExecuteRules(ctx context.Context, triggerEvent string, ticket *models.Ticket) error {
+// EnqueueScheduledCheck durably emits the scheduler's exact CloudEvent type.
+func (s *AutomationService) EnqueueScheduledCheck(ctx context.Context, ticket *models.Ticket) error {
 	if s == nil || s.native == nil {
 		return errors.New("agent-native automation service is unavailable")
 	}
-	return s.enqueueNativeTrigger(ctx, triggerEvent, ticket)
+	return s.enqueueNativeTrigger(
+		ctx,
+		eventcontract.AutomationScheduledCheckEventType,
+		ticket,
+	)
 }
 
 // HasActiveRules reports whether a trigger has at least one rule that can
@@ -196,14 +215,14 @@ func (s *AutomationService) ExecuteRules(ctx context.Context, triggerEvent strin
 // enqueueNativeTrigger repeats the guard so direct callers cannot create an
 // event/Outbox storm when no rule is enabled.
 func (s *AutomationService) HasActiveRules(ctx context.Context, triggerEvent string) (bool, error) {
-	triggerEvent = strings.TrimSpace(triggerEvent)
-	if triggerEvent == "" {
-		return false, errors.New("automation trigger event is required")
+	normalized, err := normalizeAutomationRuleTriggerEvent(triggerEvent)
+	if err != nil {
+		return false, err
 	}
 	var count int64
 	if err := s.db.WithContext(ctx).
 		Model(&models.AutomationRule{}).
-		Where("is_active = ? AND trigger_event = ?", true, triggerEvent).
+		Where("is_active = ? AND trigger_event = ?", true, normalized).
 		Limit(1).
 		Count(&count).Error; err != nil {
 		return false, fmt.Errorf("check active automation rules: %w", err)
@@ -219,11 +238,11 @@ func (s *AutomationService) enqueueNativeTrigger(
 	if ticket == nil || ticket.ID == 0 || ticket.Version == 0 {
 		return errors.New("versioned ticket is required")
 	}
-	triggerEvent = strings.TrimSpace(triggerEvent)
-	if triggerEvent == "" {
-		return errors.New("automation trigger event is required")
+	normalized, err := normalizeAutomationRuleTriggerEvent(triggerEvent)
+	if err != nil {
+		return err
 	}
-	hasActiveRules, err := s.HasActiveRules(ctx, triggerEvent)
+	hasActiveRules, err := s.HasActiveRules(ctx, normalized)
 	if err != nil {
 		return err
 	}
@@ -234,7 +253,7 @@ func (s *AutomationService) enqueueNativeTrigger(
 	bucket := now.Format("200601021504")
 	occurrenceKey := fmt.Sprintf(
 		"scheduled:%s:%d:%d:%s",
-		triggerEvent,
+		normalized,
 		ticket.ID,
 		ticket.Version,
 		bucket,
@@ -242,7 +261,6 @@ func (s *AutomationService) enqueueNativeTrigger(
 	eventID := stableAutomationEventID(occurrenceKey)
 	eventData := map[string]any{
 		"ticket_id":      ticket.ID,
-		"trigger_event":  triggerEvent,
 		"bucket":         bucket,
 		"occurrence_key": occurrenceKey,
 	}
@@ -268,7 +286,7 @@ func (s *AutomationService) enqueueNativeTrigger(
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		event, appendErr := s.native.AppendDomainEventTx(ctx, tx, DomainEventInput{
 			ID:              eventID,
-			Type:            automationTriggerEventType,
+			Type:            normalized,
 			Subject:         fmt.Sprintf("ticket/%d", ticket.ID),
 			Actor:           actor,
 			ResourceVersion: ticket.Version,
@@ -313,15 +331,16 @@ func (s *AutomationService) enqueueNativeTrigger(
 }
 
 // ExecuteDomainEvent consumes a committed CloudEvent from the durable Outbox.
-// Only ticket lifecycle events are mapped to legacy rule trigger names. Events
-// emitted by this engine (or causally descended from one) are acknowledged
-// without re-entering rules, which provides a hard loop boundary in addition
-// to per-action idempotency.
+// AutomationRule.TriggerEvent matches event.Type exactly. Events emitted by
+// this engine (or causally descended from one) are acknowledged without
+// re-entering rules, which provides a hard loop boundary in addition to
+// per-action idempotency.
 func (s *AutomationService) ExecuteDomainEvent(ctx context.Context, event CloudEventEnvelope) error {
 	if s == nil || s.native == nil {
 		return errors.New("agent-native automation service is unavailable")
 	}
-	if !automationEventSupported(event.Type) {
+	triggerEvent := strings.TrimSpace(event.Type)
+	if !eventcontract.IsAutomationRuleTriggerEventType(triggerEvent) {
 		return nil
 	}
 	if strings.TrimSpace(event.ID) == "" {
@@ -345,119 +364,25 @@ func (s *AutomationService) ExecuteDomainEvent(ctx context.Context, event CloudE
 		}
 		return fmt.Errorf("load automation ticket: %w", err)
 	}
-	var executionErrors []error
-	for _, triggerEvent := range automationTriggersForDomainEvent(event, ticket.Status) {
-		if err := s.executeNativeRules(
-			ctx,
-			triggerEvent,
-			event,
-			&ticket,
-			lineageRules,
-			rootEventID,
-		); err != nil {
-			executionErrors = append(
-				executionErrors,
-				fmt.Errorf("automation trigger %s: %w", triggerEvent, err),
-			)
-		}
+	if err := s.executeNativeRules(
+		ctx,
+		triggerEvent,
+		event,
+		&ticket,
+		lineageRules,
+		rootEventID,
+	); err != nil {
+		return fmt.Errorf("automation trigger %s: %w", triggerEvent, err)
 	}
-	return errors.Join(executionErrors...)
+	return nil
 }
 
-func automationEventSupported(eventType string) bool {
-	switch strings.TrimSpace(eventType) {
-	case "io.chronodesk.ticket.created.v1":
-		return true
-	case "io.chronodesk.ticket.updated.v1",
-		"io.chronodesk.ticket.assigned.v1",
-		"io.chronodesk.ticket.transitioned.v1",
-		"io.chronodesk.ticket.escalated.v1",
-		"io.chronodesk.ticket.comment.created.v1",
-		"io.chronodesk.ticket.attachment.created.v1",
-		"io.chronodesk.ticket.sla.breached.v1":
-		return true
-	case automationTriggerEventType:
-		return true
-	default:
-		return false
+func normalizeAutomationRuleTriggerEvent(value string) (string, error) {
+	normalized := strings.TrimSpace(value)
+	if !eventcontract.IsAutomationRuleTriggerEventType(normalized) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidAutomationTriggerType, normalized)
 	}
-}
-
-func automationTriggersForDomainEvent(
-	event CloudEventEnvelope,
-	currentStatus models.TicketStatus,
-) []string {
-	switch strings.TrimSpace(event.Type) {
-	case "io.chronodesk.ticket.created.v1":
-		return []string{"ticket.created"}
-	case "io.chronodesk.ticket.assigned.v1":
-		return []string{"ticket.assigned", "ticket.updated"}
-	case "io.chronodesk.ticket.transitioned.v1":
-		status := transitionStatusFromEvent(event)
-		if status == "" {
-			status = currentStatus
-		}
-		triggers := make([]string, 0, 3)
-		switch status {
-		case models.TicketStatusResolved:
-			triggers = append(triggers, "ticket.resolved")
-		case models.TicketStatusClosed:
-			triggers = append(triggers, "ticket.closed")
-		}
-		if eventHasChangedField(event, "assigned_to_id") {
-			triggers = append(triggers, "ticket.assigned")
-		}
-		return append(triggers, "ticket.updated")
-	case "io.chronodesk.ticket.updated.v1",
-		"io.chronodesk.ticket.escalated.v1",
-		"io.chronodesk.ticket.comment.created.v1",
-		"io.chronodesk.ticket.attachment.created.v1",
-		"io.chronodesk.ticket.sla.breached.v1":
-		return []string{"ticket.updated"}
-	case automationTriggerEventType:
-		var data struct {
-			TriggerEvent string `json:"trigger_event"`
-		}
-		if len(event.Data) == 0 || json.Unmarshal(event.Data, &data) != nil {
-			return nil
-		}
-		trigger := strings.TrimSpace(data.TriggerEvent)
-		if trigger == "" || len(trigger) > 100 {
-			return nil
-		}
-		return []string{trigger}
-	default:
-		return nil
-	}
-}
-
-func transitionStatusFromEvent(event CloudEventEnvelope) models.TicketStatus {
-	var data struct {
-		Status    models.TicketStatus `json:"status"`
-		NewStatus models.TicketStatus `json:"new_status"`
-	}
-	if len(event.Data) == 0 || json.Unmarshal(event.Data, &data) != nil {
-		return ""
-	}
-	if data.NewStatus != "" {
-		return data.NewStatus
-	}
-	return data.Status
-}
-
-func eventHasChangedField(event CloudEventEnvelope, field string) bool {
-	var data struct {
-		ChangedFields []string `json:"changed_fields"`
-	}
-	if len(event.Data) == 0 || json.Unmarshal(event.Data, &data) != nil {
-		return false
-	}
-	for _, changed := range data.ChangedFields {
-		if changed == field {
-			return true
-		}
-	}
-	return false
+	return normalized, nil
 }
 
 func automationTicketID(event CloudEventEnvelope) (uint, error) {
@@ -1475,7 +1400,7 @@ func (s *AutomationService) runNativeAction(
 			"assigned_to_actor_type":           models.ActorTypeHuman,
 			"assigned_to_actor_id":             strconv.FormatUint(uint64(userID), 10),
 			"assigned_to_service_principal_id": nil,
-		}, "io.chronodesk.ticket.assigned.v1", models.ScopeTicketsAssign, "ticket.assign",
+		}, eventcontract.TicketAssignedEventType, models.ScopeTicketsAssign, "ticket.assign",
 			"assigned_to_id", "assigned_to_actor_type", "assigned_to_actor_id")
 	case "set_priority":
 		raw, ok := action.Params["priority"]
@@ -1491,7 +1416,7 @@ func (s *AutomationService) runNativeAction(
 		}
 		return update(
 			map[string]any{"priority": priority},
-			"io.chronodesk.ticket.updated.v1",
+			eventcontract.TicketUpdatedEventType,
 			models.ScopeTicketsUpdate,
 			"ticket.update",
 			"priority",
@@ -1510,7 +1435,7 @@ func (s *AutomationService) runNativeAction(
 		}
 		return update(
 			map[string]any{"status": status},
-			"io.chronodesk.ticket.transitioned.v1",
+			eventcontract.TicketTransitionedEventType,
 			models.ScopeTicketsTransition,
 			"ticket.transition",
 			"status",
@@ -1520,17 +1445,10 @@ func (s *AutomationService) runNativeAction(
 		if !ok || strings.TrimSpace(fmt.Sprint(raw)) == "" {
 			return errors.New("content parameter required")
 		}
-		compatibilityUserID := uint(0)
-		if s.native.systemCompatibilityUserID == 0 {
-			// Old constructors predate a configured system user. ActorRef remains
-			// authoritative; the creator is only a non-null legacy FK fallback.
-			compatibilityUserID = ticket.CreatedByID
-		}
 		_, err := s.native.CreateComment(ctx, NativeCommentInput{
 			TicketID:                 ticket.ID,
 			ExpectedVersion:          ticket.Version,
 			Actor:                    models.SystemActor(automationActorID),
-			CompatibilityUserID:      compatibilityUserID,
 			SourceProtocol:           "automation",
 			Content:                  fmt.Sprint(raw),
 			ContentType:              "text",
@@ -1566,7 +1484,7 @@ func (s *AutomationService) runNativeAction(
 			"assigned_to_service_principal_id": nil,
 			"priority":                         models.TicketPriorityHigh,
 			"is_escalated":                     true,
-		}, "io.chronodesk.ticket.escalated.v1", "", "automation.ticket.escalate",
+		}, eventcontract.TicketEscalatedEventType, "", "automation.ticket.escalate",
 			"assigned_to_id", "priority", "is_escalated")
 	case "notify":
 		return s.recordAutomationNotification(
@@ -1663,7 +1581,7 @@ func (s *AutomationService) recordAutomationNotification(
 	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		event, err := s.native.AppendDomainEventTx(ctx, tx, DomainEventInput{
-			Type:            "io.chronodesk.automation.notification.requested.v1",
+			Type:            eventcontract.AutomationNotificationRequestedEventType,
 			Subject:         fmt.Sprintf("ticket/%d", ticket.ID),
 			Actor:           models.SystemActor(automationActorID),
 			ResourceVersion: ticket.Version,
@@ -1867,7 +1785,10 @@ func (s *AutomationService) getTicketFieldValue(field string, ticket *models.Tic
 		}
 		return nil
 	case "creator_id":
-		return ticket.CreatedByID
+		if ticket.CreatedByID != nil {
+			return *ticket.CreatedByID
+		}
+		return nil
 	case "created_at":
 		return ticket.CreatedAt.Format(time.RFC3339)
 	case "updated_at":
@@ -1927,82 +1848,6 @@ func (s *AutomationService) toFloat64(value interface{}) (float64, error) {
 	default:
 		return 0, fmt.Errorf("cannot convert to float64")
 	}
-}
-
-// executeAssignAction 执行分配动作
-func (s *AutomationService) executeAssignAction(ctx context.Context, action *models.RuleAction, ticket *models.Ticket) error {
-	return s.executeCompatibilityAction(ctx, action, ticket)
-}
-
-// executeSetPriorityAction 执行设置优先级动作
-func (s *AutomationService) executeSetPriorityAction(ctx context.Context, action *models.RuleAction, ticket *models.Ticket) error {
-	return s.executeCompatibilityAction(ctx, action, ticket)
-}
-
-// executeSetStatusAction 执行设置状态动作
-func (s *AutomationService) executeSetStatusAction(ctx context.Context, action *models.RuleAction, ticket *models.Ticket) error {
-	return s.executeCompatibilityAction(ctx, action, ticket)
-}
-
-// executeAddCommentAction 执行添加评论动作
-func (s *AutomationService) executeAddCommentAction(ctx context.Context, action *models.RuleAction, ticket *models.Ticket) error {
-	return s.executeCompatibilityAction(ctx, action, ticket)
-}
-
-// executeNotifyAction 执行通知动作
-func (s *AutomationService) executeNotifyAction(ctx context.Context, action *models.RuleAction, ticket *models.Ticket) error {
-	return s.executeCompatibilityAction(ctx, action, ticket)
-}
-
-// executeEscalateAction 执行升级动作
-func (s *AutomationService) executeEscalateAction(ctx context.Context, action *models.RuleAction, ticket *models.Ticket) error {
-	return s.executeCompatibilityAction(ctx, action, ticket)
-}
-
-// executeCompatibilityAction keeps the historical private action helpers
-// usable by old callers while routing them through the same native command
-// path. The synthetic event identity is deterministic for the ticket version
-// and action payload, so a retry cannot duplicate the action.
-func (s *AutomationService) executeCompatibilityAction(
-	ctx context.Context,
-	action *models.RuleAction,
-	ticket *models.Ticket,
-) error {
-	if s == nil || s.native == nil {
-		return errors.New("agent-native automation service is unavailable")
-	}
-	if ticket == nil || ticket.ID == 0 || ticket.Version == 0 {
-		return errors.New("versioned ticket is required")
-	}
-	encoded, err := json.Marshal(action)
-	if err != nil {
-		return fmt.Errorf("encode compatibility automation action: %w", err)
-	}
-	digest := sha256.Sum256(encoded)
-	eventID := fmt.Sprintf(
-		"compat:%d:%d:%x",
-		ticket.ID,
-		ticket.Version,
-		digest[:8],
-	)
-	return s.executeNativeAction(
-		ctx,
-		CloudEventEnvelope{
-			SpecVersion:     "1.0",
-			ID:              eventID,
-			Type:            "io.chronodesk.automation.compatibility.v1",
-			Subject:         fmt.Sprintf("ticket/%d", ticket.ID),
-			Time:            time.Now().UTC(),
-			CorrelationID:   eventID,
-			ActorType:       models.ActorTypeSystem,
-			ActorID:         "compatibility",
-			ResourceVersion: ticket.Version,
-		},
-		eventID,
-		&models.AutomationRule{},
-		0,
-		action,
-	)
 }
 
 // toUint 转换为uint
@@ -2558,129 +2403,6 @@ func (s *AutomationService) UseQuickReply(ctx context.Context, replyID uint) err
 		UpdateColumn("usage_count", gorm.Expr("usage_count + ?", 1)).Error
 }
 
-// BatchOperations 批量操作相关方法
-
-// BatchUpdateTickets 批量更新工单
-func (s *AutomationService) BatchUpdateTickets(
-	ctx context.Context,
-	ticketIDs []uint,
-	updates map[string]interface{},
-	actors ...models.ActorRef,
-) error {
-	if len(ticketIDs) == 0 {
-		return fmt.Errorf("no tickets specified")
-	}
-	if s == nil || s.native == nil {
-		return errors.New("agent-native automation service is unavailable")
-	}
-
-	// 验证更新字段
-	allowedFields := map[string]bool{
-		"status":         true,
-		"priority":       true,
-		"assigned_to_id": true,
-		"type":           true,
-	}
-
-	validUpdates := make(map[string]interface{})
-	for key, value := range updates {
-		if !allowedFields[key] {
-			return fmt.Errorf("field %s is not allowed for batch update", key)
-		}
-		switch key {
-		case "status":
-			if !models.TicketStatus(fmt.Sprintf("%v", value)).IsValid() {
-				return fmt.Errorf("invalid status: %v", value)
-			}
-		case "priority":
-			if !models.TicketPriority(fmt.Sprintf("%v", value)).IsValid() {
-				return fmt.Errorf("invalid priority: %v", value)
-			}
-		case "type":
-			if !models.TicketType(fmt.Sprintf("%v", value)).IsValid() {
-				return fmt.Errorf("invalid ticket type: %v", value)
-			}
-		case "assigned_to_id":
-			if value == nil {
-				validUpdates["assigned_to_actor_type"] = nil
-				validUpdates["assigned_to_actor_id"] = nil
-				validUpdates["assigned_to_service_principal_id"] = nil
-				break
-			}
-			userID, err := s.toUint(value)
-			if err != nil {
-				return fmt.Errorf("invalid assigned_to_id: %w", err)
-			}
-			if err := s.requireAutomationUser(ctx, userID); err != nil {
-				return err
-			}
-			value = userID
-			validUpdates["assigned_to_actor_type"] = models.ActorTypeHuman
-			validUpdates["assigned_to_actor_id"] = strconv.FormatUint(uint64(userID), 10)
-			validUpdates["assigned_to_service_principal_id"] = nil
-		}
-		validUpdates[key] = value
-	}
-	if len(validUpdates) == 0 {
-		return errors.New("no valid ticket changes specified")
-	}
-	actor := models.SystemActor(automationActorID)
-	if len(actors) > 0 {
-		if err := actors[0].Validate(); err != nil {
-			return fmt.Errorf("invalid batch actor: %w", err)
-		}
-		actor = actors[0]
-	}
-	changeGroups := splitAutomationChangeGroups(validUpdates)
-
-	var updateErrors []error
-	for _, ticketID := range ticketIDs {
-		if ticketID == 0 {
-			updateErrors = append(updateErrors, errors.New("ticket id must be positive"))
-			continue
-		}
-		for _, group := range changeGroups {
-			if err := s.executeSystemTicketUpdate(
-				ctx,
-				ticketID,
-				"automation.batch."+group.name,
-				group.changes,
-				map[string]any{
-					"ticket_id": ticketID,
-					"origin":    "admin_automation_batch",
-					"category":  group.name,
-				},
-				actor,
-			); err != nil {
-				updateErrors = append(
-					updateErrors,
-					fmt.Errorf("ticket %d %s: %w", ticketID, group.name, err),
-				)
-				break
-			}
-		}
-	}
-	return errors.Join(updateErrors...)
-}
-
-// BatchAssignTickets 批量分配工单
-func (s *AutomationService) BatchAssignTickets(
-	ctx context.Context,
-	ticketIDs []uint,
-	userID uint,
-	actors ...models.ActorRef,
-) error {
-	// 验证用户存在
-	var user models.User
-	if err := s.db.WithContext(ctx).First(&user, userID).Error; err != nil {
-		return fmt.Errorf("assigned user not found: %w", err)
-	}
-
-	return s.BatchUpdateTickets(ctx, ticketIDs, map[string]interface{}{
-		"assigned_to_id": userID,
-	}, actors...)
-}
-
 // ClassifyTicket 工单自动分类
 func (s *AutomationService) ClassifyTicket(ctx context.Context, ticket *models.Ticket) error {
 	if ticket == nil || ticket.ID == 0 {
@@ -2865,11 +2587,11 @@ func automationChangeContract(changes map[string]interface{}) (string, string, e
 func automationEventType(action string) string {
 	switch action {
 	case "ticket.assign":
-		return "io.chronodesk.ticket.assigned.v1"
+		return eventcontract.TicketAssignedEventType
 	case "ticket.transition":
-		return "io.chronodesk.ticket.transitioned.v1"
+		return eventcontract.TicketTransitionedEventType
 	default:
-		return "io.chronodesk.ticket.updated.v1"
+		return eventcontract.TicketUpdatedEventType
 	}
 }
 
@@ -2904,7 +2626,8 @@ func effectiveAutomationChanges(
 				continue
 			}
 		case "assigned_to_actor_type", "assigned_to_actor_id", "assigned_to_service_principal_id":
-			// These compatibility fields are coupled to assigned_to_id below.
+			// These authoritative actor projection fields are coupled to
+			// assigned_to_id below.
 		}
 		result[field] = value
 	}

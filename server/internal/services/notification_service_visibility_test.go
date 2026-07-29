@@ -56,7 +56,7 @@ func TestGetNotificationsPreservesRecipientAndReadFilters(t *testing.T) {
 	}
 
 	unread := false
-	service := NewNotificationService(db)
+	service := NewNotificationServiceWithProtector(db, nil)
 	items, total, err := service.GetNotifications(
 		context.Background(),
 		&models.NotificationFilter{
@@ -127,7 +127,7 @@ func TestDeliverTicketNotificationOutboxKeepsSnapshotAfterTicketDeletion(t *test
 		Priority:     models.TicketPriorityNormal,
 		Status:       models.TicketStatusOpen,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  recipient.ID,
+		CreatedByID:  &recipient.ID,
 		Version:      2,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
@@ -161,7 +161,7 @@ func TestDeliverTicketNotificationOutboxKeepsSnapshotAfterTicketDeletion(t *test
 		models.NotificationTypeTicketStatusChanged,
 		recipient.ID,
 	)
-	service := NewNotificationService(db)
+	service := NewNotificationServiceWithProtector(db, nil)
 	notification, created, err := service.DeliverTicketNotificationOutbox(
 		context.Background(),
 		event,

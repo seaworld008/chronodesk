@@ -51,7 +51,7 @@ func TestWebhookAuditLogNeverPersistsCredentialsOrSignatures(t *testing.T) {
 	if err := db.Create(&config).Error; err != nil {
 		t.Fatal(err)
 	}
-	service := NewNotificationService(db)
+	service := NewNotificationServiceWithProtector(db, nil)
 	useTestWebhookClient(service, endpoint.Client())
 	err := service.sendWebhookAttempt(context.Background(), &config, &NotificationEvent{
 		Type: models.WebhookEventSystemAlert, ResourceID: 7,

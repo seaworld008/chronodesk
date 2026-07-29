@@ -132,6 +132,7 @@ CI 还会执行 CodeQL、秘密扫描/推送保护、依赖自动更新和 Docke
 server/
   cmd/chronodesk/       最小可执行入口
   cmd/migrate/          显式迁移/种子命令
+  cmd/credential-maintain/ 当前格式验证、轮换与密码隔离
   internal/app/         组合根与优雅生命周期
   internal/services/    共享领域/应用规则
   internal/agentplatform/
@@ -158,7 +159,7 @@ docs/
 - [A2A 接入](docs/reference/A2A_1_0.md)
 - [数据库迁移](docs/operations/database-migrations.md)
 - [测试指南](docs/testing_guide.md)
-- [Agent 原生化完整测试报告](docs/testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-29.md)
+- [Agent 原生化完整测试报告](docs/testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-30.md)
 
 ## 项目状态
 

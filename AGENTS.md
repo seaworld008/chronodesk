@@ -40,6 +40,7 @@ make server-dev
 make web-dev
 make verify
 make test-race
+make credential-validate
 make smoke
 make e2e
 ```

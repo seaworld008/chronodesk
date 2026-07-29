@@ -47,7 +47,7 @@ func (h *AdminAuditHandler) GetAuditLogs(c *gin.Context) {
 	if err := c.ShouldBindQuery(&query); err != nil {
 		c.JSON(http.StatusBadRequest, ApiResponse{
 			Code: 1,
-			Msg:  "查询参数错误: " + err.Error(),
+			Msg:  "查询参数错误",
 			Data: nil,
 		})
 		return
@@ -92,9 +92,10 @@ func (h *AdminAuditHandler) GetAuditLogs(c *gin.Context) {
 
 	logs, total, err := h.auditService.List(c.Request.Context(), filter)
 	if err != nil {
+		logHandlerFailure(c, "admin_audit.list", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
-			Msg:  "获取审计日志失败: " + err.Error(),
+			Msg:  "获取审计日志失败",
 			Data: nil,
 		})
 		return

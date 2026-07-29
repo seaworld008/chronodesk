@@ -12,7 +12,6 @@ import React, {
 import {
   Datagrid,
   DatagridHeader,
-  DatagridHeaderCell,
   useListContextWithProps,
 } from 'react-admin'
 import type { DatagridProps } from 'react-admin'
@@ -23,6 +22,7 @@ import {
   TableCell,
   TableHead,
   TableRow,
+  TableSortLabel,
   Tooltip,
   Typography,
 } from '@mui/material'
@@ -94,16 +94,16 @@ const usePersistentColumnWidths = (tableId: string, rawColumns: ResizableColumn[
     })
   }, [columns])
 
-  useEffect(() => {
-    const persistenceTimer = window.setTimeout(() => {
-      try {
-        window.localStorage.setItem(`${STORAGE_PREFIX}.${tableId}`, JSON.stringify(widths))
-      } catch {
-        // Persisting preferences is a progressive enhancement.
-      }
-    }, 150)
-
-    return () => window.clearTimeout(persistenceTimer)
+  useLayoutEffect(() => {
+    try {
+      // Column-width preferences are tiny and must be durable before the user
+      // navigates or reloads. A deferred timer is cancelled during unmount and
+      // can silently discard a keyboard or pointer resize that is already
+      // visible on screen.
+      window.localStorage.setItem(`${STORAGE_PREFIX}.${tableId}`, JSON.stringify(widths))
+    } catch {
+      // Persisting preferences is a progressive enhancement.
+    }
   }, [tableId, widths])
 
   useEffect(() => () => resizeCleanupRef.current?.(), [])
@@ -124,7 +124,10 @@ const usePersistentColumnWidths = (tableId: string, rawColumns: ResizableColumn[
     const column = columns.find((item) => item.key === key)
     if (!column) return
 
-    event.preventDefault()
+    // Keep the native click sequence intact so Chrome can emit dblclick for
+    // the documented “restore default width” interaction. Text selection is
+    // still suppressed by cd-table-is-resizing and touch panning by
+    // touch-action: none on the handle.
     event.stopPropagation()
     resizeCleanupRef.current?.()
 
@@ -175,6 +178,7 @@ const usePersistentColumnWidths = (tableId: string, rawColumns: ResizableColumn[
 interface ColumnHeaderContentProps {
   column: NormalizedColumn
   label: React.ReactNode
+  accessibleLabel?: string
   width: number
   resizing: boolean
   onResizeStart: (key: string, event: React.PointerEvent<HTMLElement>) => void
@@ -185,6 +189,7 @@ interface ColumnHeaderContentProps {
 const ColumnHeaderContent = ({
   column,
   label,
+  accessibleLabel,
   width,
   resizing,
   onResizeStart,
@@ -192,14 +197,14 @@ const ColumnHeaderContent = ({
   onKeyDown,
 }: ColumnHeaderContentProps) => (
   <span className="cd-resizable-header-content">
-    <Tooltip title={typeof label === 'string' ? label : ''} enterDelay={600}>
+    <Tooltip title={accessibleLabel ?? (typeof label === 'string' ? label : '')} enterDelay={600}>
       <span className="cd-resizable-header-label">{label}</span>
     </Tooltip>
     <span
       className="cd-column-resize-handle"
       data-resizing={resizing || undefined}
       role="separator"
-      aria-label={`调整${typeof label === 'string' ? `“${label}”` : ''}列宽，当前 ${width} 像素`}
+      aria-label={`调整${accessibleLabel || (typeof label === 'string' ? `“${label}”` : '')}列宽，当前 ${width} 像素`}
       aria-orientation="vertical"
       aria-valuemin={column.minWidth}
       aria-valuemax={column.maxWidth}
@@ -219,12 +224,14 @@ const ColumnHeaderContent = ({
 )
 
 type DatagridHeaderProps = React.ComponentProps<typeof DatagridHeader>
-type DatagridField = NonNullable<React.ComponentProps<typeof DatagridHeaderCell>['field']>
 interface DatagridFieldProps {
   label?: React.ReactNode
   source?: string
   sortBy?: string
+  sortByOrder?: 'ASC' | 'DESC'
+  sortable?: boolean
 }
+type DatagridField = React.ReactElement<DatagridFieldProps>
 
 interface ResizableDatagridHeaderProps extends DatagridHeaderProps {
   columns: NormalizedColumn[]
@@ -253,29 +260,6 @@ const ResizableDatagridHeader = ({
 }: ResizableDatagridHeaderProps) => {
   const tableHeadRef = useRef<HTMLTableSectionElement>(null)
   const { sort, data, onSelect, selectedIds, setSort } = useListContextWithProps(listContextProps)
-
-  const updateSort = useCallback((event: React.MouseEvent<HTMLElement>) => {
-    event.stopPropagation()
-    if (!setSort) return
-    const field = event.currentTarget.dataset.field
-    if (!field) return
-    const order = sort?.field === field && sort.order === 'ASC'
-      ? 'DESC'
-      : (event.currentTarget.dataset.order === 'DESC' ? 'DESC' : 'ASC')
-    setSort({ field, order })
-  }, [setSort, sort])
-  // React Admin memoizes DatagridHeaderCell using only sort-related props.
-  // Refresh this callback when widths change so its memo comparator does not
-  // incorrectly suppress the updated width, aria-valuenow, and header label.
-  // Unlike changing the React key, this preserves focus during keyboard resize.
-  const columnWidthRevision = Object.values(widths).join(',')
-  const updateSortWithColumnWidths = useCallback(
-    (event: React.MouseEvent<HTMLElement>) => {
-      void columnWidthRevision
-      updateSort(event)
-    },
-    [columnWidthRevision, updateSort],
-  )
 
   const selectableIds = Array.isArray(data)
     ? data
@@ -348,28 +332,34 @@ const ResizableDatagridHeader = ({
           const typedField = field as unknown as React.ReactElement<DatagridFieldProps>
           const fieldProps = typedField.props
           const label = fieldProps.label ?? fieldProps.source ?? ''
-          const resizableField = cloneElement(typedField, {
-            label: (
-              <ColumnHeaderContent
-                column={column}
-                label={label}
-                width={width}
-                resizing={resizingKey === column.key}
-                onResizeStart={onResizeStart}
-                onReset={onReset}
-                onKeyDown={onResizeKeyDown}
-              />
-            ),
-          }) as unknown as DatagridField
+          const accessibleLabel = typeof label === 'string' ? label : column.key
+          const sortField = fieldProps.sortBy || fieldProps.source
+          const isSortable = fieldProps.sortable !== false && Boolean(sortField && setSort)
+          const isSorting = Boolean(sortField && sort?.field === sortField)
+          const direction = isSorting && sort?.order === 'DESC' ? 'desc' : 'asc'
+          const headerLabel = isSortable ? (
+            <TableSortLabel
+              active={isSorting}
+              direction={direction}
+              onClick={(event) => {
+                event.stopPropagation()
+                if (!setSort || !sortField) return
+                const nextOrder =
+                  isSorting && sort?.order === 'ASC'
+                    ? 'DESC'
+                    : (fieldProps.sortByOrder ?? 'ASC')
+                setSort({ field: sortField, order: nextOrder })
+              }}
+            >
+              {label}
+            </TableSortLabel>
+          ) : label
 
           return (
-            <DatagridHeaderCell
+            <TableCell
               key={column.key}
               className={`RaDatagrid-headerCell cd-column-${column.key}`}
-              field={resizableField}
-              sort={sort}
-              isSorting={sort?.field === (fieldProps.sortBy || fieldProps.source)}
-              updateSort={setSort ? updateSortWithColumnWidths : undefined}
+              sortDirection={isSorting ? direction : false}
               sx={{
                 boxSizing: 'border-box',
                 width,
@@ -386,7 +376,18 @@ const ResizableDatagridHeader = ({
                   zIndex: 4,
                 }),
               }}
-            />
+            >
+              <ColumnHeaderContent
+                column={column}
+                label={headerLabel}
+                accessibleLabel={`“${accessibleLabel}”`}
+                width={width}
+                resizing={resizingKey === column.key}
+                onResizeStart={onResizeStart}
+                onReset={onReset}
+                onKeyDown={onResizeKeyDown}
+              />
+            </TableCell>
           )
         })}
       </TableRow>
@@ -480,29 +481,21 @@ export const EnterpriseDatagrid = React.forwardRef<HTMLTableElement, EnterpriseD
       props.bulkActionButtons === false ? 0 : 52,
     )
 
-    const Header = useMemo(() => {
-      const HeaderComponent = (headerProps: DatagridHeaderProps) => (
-        <ResizableDatagridHeader
-          {...headerProps}
-          columns={columns}
-          widths={widths}
-          resizingKey={resizingKey}
-          onResizeStart={startResize}
-          onReset={resetColumnWidth}
-          onResizeKeyDown={handleResizeKeyDown}
-        />
-      )
-      HeaderComponent.displayName = `ResizableDatagridHeader(${tableId})`
-      return HeaderComponent
-    }, [
-      columns,
-      handleResizeKeyDown,
-      resetColumnWidth,
-      resizingKey,
-      startResize,
-      tableId,
-      widths,
-    ])
+    // React Admin accepts a header element and clones it with the current list
+    // context. Keeping ResizableDatagridHeader as the stable element type is
+    // important: a freshly-created component function would unmount the
+    // separator on pointerdown, interrupting the browser's dblclick sequence
+    // and dropping keyboard focus after every width update.
+    const header = (
+      <ResizableDatagridHeader
+        columns={columns}
+        widths={widths}
+        resizingKey={resizingKey}
+        onResizeStart={startResize}
+        onReset={resetColumnWidth}
+        onResizeKeyDown={handleResizeKeyDown}
+      />
+    )
 
     const rootSx = {
       width: '100%',
@@ -527,7 +520,7 @@ export const EnterpriseDatagrid = React.forwardRef<HTMLTableElement, EnterpriseD
       <Datagrid
         {...props}
         ref={forwardedRef}
-        header={Header}
+        header={header}
         className="cd-enterprise-table cd-enterprise-datagrid"
         sx={[rootSx, ...(Array.isArray(sx) ? sx : sx ? [sx] : [])]}
       >
@@ -672,6 +665,57 @@ const ResizableMuiTableInner = ({
 
 export const ResizableMuiTable = (props: ResizableMuiTableProps) => (
   <ResizableMuiTableInner key={props.tableId} {...props} />
+)
+
+interface InlineDetailsProps {
+  primary: React.ReactNode
+  secondary?: React.ReactNode
+  title: string
+  primaryFontWeight?: number
+}
+
+// InlineDetails presents a primary value and its secondary context as one
+// enterprise-table line. The full combined value remains available through a
+// tooltip while each segment can shrink independently.
+export const InlineDetails = ({
+  primary,
+  secondary,
+  title,
+  primaryFontWeight = 600,
+}: InlineDetailsProps) => (
+  <Tooltip title={title} enterDelay={500}>
+    <span
+      style={{
+        display: 'flex',
+        minWidth: 0,
+        maxWidth: '100%',
+        alignItems: 'center',
+        gap: '0.375rem',
+        overflow: 'hidden',
+        whiteSpace: 'nowrap',
+      }}
+    >
+      <Typography
+        component="span"
+        variant="body2"
+        noWrap
+        sx={{ minWidth: 0, flex: '0 1 auto', fontWeight: primaryFontWeight }}
+      >
+        {primary}
+      </Typography>
+      {secondary !== undefined && secondary !== null && secondary !== '' && (
+        <Typography
+          component="span"
+          variant="body2"
+          color="text.secondary"
+          noWrap
+          sx={{ minWidth: 0, flex: '1 1 auto' }}
+        >
+          · {secondary}
+        </Typography>
+      )}
+    </span>
+  </Tooltip>
 )
 
 interface TruncatedTextProps {

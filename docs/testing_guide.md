@@ -3,6 +3,23 @@
 本指南适用于当前 Go 1.26.5、React 19、MCP `2026-07-28`、A2A `1.0`
 和 OpenAPI 3.2 代码。除特别说明外，命令均在仓库根目录执行。
 
+发布范围、236 条功能/安全断言和自动化层级以
+[ChronoDesk 全功能专业测试用例](testing/CHRONODESK_COMPREHENSIVE_TEST_CASES_2026-07-29.md)
+为准。新增功能必须先补用例 ID，再补自动化和实现。
+
+236 条用例与具体 Go/Pytest/Playwright/Chrome/故障注入证据的唯一机器台账是
+[`CASE_EVIDENCE_MANIFEST.tsv`](testing/CASE_EVIDENCE_MANIFEST.tsv)。提交前执行：
+
+```bash
+python3 server/tests/validate_case_evidence_manifest.py
+```
+
+校验器会拒绝缺失、重复、未知 Case ID，以及不存在的测试文件/测试符号；证据状态
+不得写成“缺口”或“部分”。Manifest 的 `execution_record=not_recorded` 表示它只
+描述证据入口，不代表测试已经执行或通过。人工、Chrome 和故障注入的复现与留痕
+要求见
+[`RELEASE_EVIDENCE_PROCEDURES.md`](testing/RELEASE_EVIDENCE_PROCEDURES.md)。
+
 ## 1. 环境准备
 
 ```bash
@@ -19,13 +36,16 @@ curl --fail http://localhost:8081/healthz
 
 `/healthz` 必须返回 PostgreSQL 与 Redis 均为 `ok`。使用云 PostgreSQL/Redis 时，将连接信息放入本地 `server/.env` 或安全注入环境变量，不要写入测试报告、命令输出或 Git。
 
-首次使用既有数据库时先执行：
+首次使用数据库时先执行结构迁移与当前格式验证：
 
 ```bash
 make db-migrate
-cd server && go run ./cmd/secret-migrate
-cd server && go run ./cmd/secret-migrate -validate-only
+make credential-validate
 ```
+
+验证失败时不得用维护工具摄入明文。密钥轮换使用
+`make credential-rotate`；不支持的密码哈希使用
+`make credential-quarantine` 隔离，完成正常密码重置后再显式重新启用。
 
 ## 2. 提交前标准门禁
 
@@ -38,7 +58,7 @@ make verify
 1. Go 格式、完整测试、Vet 与 `govulncheck`
 2. Web TypeScript、ESLint、生产依赖安全策略与构建
 3. Redocly 2.41.1 与 Spectral 6.16.2 的 OpenAPI 3.2 严格校验
-4. `chronodesk`、迁移命令与 Web 生产资源构建
+4. `chronodesk`、数据库迁移、凭据维护命令与 Web 生产资源构建
 
 `make build` 输出 `server/bin/chronodesk`、
 `server/bin/chronodesk-migrate` 和 `web/dist/`。
@@ -129,11 +149,13 @@ Pytest 默认访问 `http://localhost:8081/api`；可通过 `TEST_API_BASE_URL`�
 ## 7. 发布前检查清单
 
 - [ ] PostgreSQL/Redis 健康检查通过，结构迁移与密钥验证完成。
+- [ ] 236 Case Evidence Manifest 校验通过，且当次报告记录所有发布规程结果。
 - [ ] `make verify` 通过。
 - [ ] Go race、vet 和真实 Redis 集成测试通过。
 - [ ] MCP Inspector、A2A 生命周期和 OpenAPI 契约通过。
 - [ ] Pytest 全套及通知/Webhook 专项通过。
 - [ ] Playwright 覆盖主要中文页面，表格、列宽、侧栏和响应式布局无回归。
+- [ ] Chrome 插件逐页实测控制台、网络、中文提示、真实增删改和页面完整性。
 - [ ] PR 的 Checks 列出实际执行命令与结果，不包含凭据、数据库连接串或 token。
 
-完整验收结果记录在 [Agent 原生化完整测试报告](testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-29.md)。
+完整验收结果记录在 [Agent 原生化完整测试报告](testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-30.md)。

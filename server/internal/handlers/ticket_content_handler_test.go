@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/httpcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
@@ -73,31 +75,31 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 		Title:        "content", Description: "content",
 		Type: models.TicketTypeRequest, Priority: models.TicketPriorityNormal,
 		Status: models.TicketStatusOpen, Source: models.TicketSourceWeb,
-		CreatedByID: owner.ID, Version: 1,
+		CreatedByID: &owner.ID, Version: 1,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
 	}
 	comments := []models.TicketComment{
 		{
-			TicketID: ticket.ID, UserID: owner.ID, ActorType: models.ActorTypeHuman,
+			TicketID: ticket.ID, UserID: &owner.ID, ActorType: models.ActorTypeHuman,
 			ActorID: strconv.FormatUint(uint64(owner.ID), 10),
 			Content: "public", ContentType: "text", Type: models.CommentTypePublic,
 		},
 		{
-			TicketID: ticket.ID, UserID: owner.ID, ActorType: models.ActorTypeHuman,
+			TicketID: ticket.ID, UserID: &owner.ID, ActorType: models.ActorTypeHuman,
 			ActorID: strconv.FormatUint(uint64(owner.ID), 10),
 			Content: "internal secret", ContentType: "text", Type: models.CommentTypeInternal,
 		},
 		{
-			TicketID: ticket.ID, UserID: agent.ID, ActorType: models.ActorTypeHuman,
+			TicketID: ticket.ID, UserID: &agent.ID, ActorType: models.ActorTypeHuman,
 			ActorID: "PRIVATE-HUMAN-ACTOR-ID",
 			Content: "support public", ContentType: "text", Type: models.CommentTypePublic,
 			TimeSpent: intPtr(42), BillableTime: intPtr(21), WorkType: "PRIVATE-WORK-TYPE",
 			NotificationSent: true, Metadata: `{"secret":"PRIVATE-COMMENT-METADATA"}`,
 		},
 		{
-			TicketID: ticket.ID, UserID: agent.ID, ActorType: models.ActorTypeServicePrincipal,
+			TicketID: ticket.ID, ActorType: models.ActorTypeServicePrincipal,
 			ActorID: "PRIVATE-SERVICE-ACTOR-ID", ServicePrincipalID: &principal.ID,
 			Content: "service public", ContentType: "markdown", Type: models.CommentTypePublic,
 			TimeSpent: intPtr(84), BillableTime: intPtr(63), WorkType: "PRIVATE-AGENT-WORK-TYPE",
@@ -107,8 +109,32 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 	if err := db.Create(&comments).Error; err != nil {
 		t.Fatal(err)
 	}
+	scannedAt := time.Now().Add(-time.Minute)
+	attachments := []models.TicketAttachment{
+		{
+			TicketID: ticket.ID, UploadedBy: &agent.ID,
+			ActorType: models.ActorTypeServicePrincipal, ActorID: "PRIVATE-ATTACHMENT-ACTOR-ID",
+			ServicePrincipalID: &principal.ID,
+			FileName:           "PRIVATE-STORAGE-FILE-NAME.txt", OriginalName: "customer-visible.txt",
+			FileSize: 12, MimeType: "text/plain", FileType: models.AttachmentTypeDocument,
+			Extension: ".txt", StoragePath: "PRIVATE-STORAGE-PATH",
+			IsPublic: true, DownloadCount: 99, Hash: "PRIVATE-ATTACHMENT-HASH",
+			VirusScan: models.VirusScanClean, ScanDetails: "PRIVATE-SCAN-DETAILS",
+			ScannedAt: &scannedAt, Description: "customer-visible-description",
+		},
+		{
+			TicketID: ticket.ID, UploadedBy: &agent.ID,
+			ActorType: models.ActorTypeHuman, ActorID: "PRIVATE-INTERNAL-ATTACHMENT-ACTOR",
+			FileName: "private.txt", OriginalName: "private.txt", FileSize: 7,
+			MimeType: "text/plain", StoragePath: "private/path", IsPublic: false,
+			VirusScan: models.VirusScanPending,
+		},
+	}
+	if err := db.Create(&attachments).Error; err != nil {
+		t.Fatal(err)
+	}
 
-	handler := NewTicketContentHandler(db, services.NewTicketService(db), nil, 0)
+	handler := NewTicketContentHandler(db, newHandlerTicketService(t, db), nil, 0)
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		userID, _ := strconv.ParseUint(c.GetHeader("X-Test-User"), 10, 32)
@@ -117,6 +143,7 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 		c.Next()
 	})
 	router.GET("/tickets/:id/comments", handler.ListComments)
+	router.GET("/tickets/:id/attachments", handler.ListAttachments)
 
 	ownerRequest := httptest.NewRequest(
 		http.MethodGet,
@@ -157,6 +184,49 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 		}
 	}
 
+	attachmentRequest := httptest.NewRequest(
+		http.MethodGet,
+		"/tickets/"+strconv.FormatUint(uint64(ticket.ID), 10)+"/attachments",
+		nil,
+	)
+	attachmentRequest.Header.Set("X-Test-User", strconv.FormatUint(uint64(owner.ID), 10))
+	attachmentResponse := httptest.NewRecorder()
+	router.ServeHTTP(attachmentResponse, attachmentRequest)
+	if attachmentResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"customer attachment response = %d: %s",
+			attachmentResponse.Code,
+			attachmentResponse.Body.String(),
+		)
+	}
+	var attachmentBody struct {
+		Data []customerAttachmentResponse `json:"data"`
+	}
+	if err := json.Unmarshal(attachmentResponse.Body.Bytes(), &attachmentBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(attachmentBody.Data) != 1 ||
+		attachmentBody.Data[0].OriginalName != "customer-visible.txt" ||
+		attachmentBody.Data[0].VirusScan != models.VirusScanClean {
+		t.Fatalf("customer attachment data=%+v", attachmentBody.Data)
+	}
+	rawAttachmentBody := attachmentResponse.Body.String()
+	for _, forbidden := range []string{
+		`"uploaded_by"`, `"actor_type"`, `"actor_id"`, `"service_principal_id"`,
+		`"file_name"`, `"download_count"`, `"hash"`, `"scan_details"`,
+		"PRIVATE-ATTACHMENT-ACTOR-ID", "PRIVATE-STORAGE-FILE-NAME",
+		"PRIVATE-STORAGE-PATH", "PRIVATE-ATTACHMENT-HASH", "PRIVATE-SCAN-DETAILS",
+		"private.txt",
+	} {
+		if strings.Contains(rawAttachmentBody, forbidden) {
+			t.Fatalf(
+				"customer attachment response leaked %q: %s",
+				forbidden,
+				rawAttachmentBody,
+			)
+		}
+	}
+
 	otherRequest := httptest.NewRequest(
 		http.MethodGet,
 		"/tickets/"+strconv.FormatUint(uint64(ticket.ID), 10)+"/comments",
@@ -193,28 +263,28 @@ func TestCustomerCannotReferenceInternalDeletedOrCrossTicketComment(t *testing.T
 			TicketNumber: "REFERENCE-1", Title: "one", Description: "one",
 			Type: models.TicketTypeRequest, Priority: models.TicketPriorityNormal,
 			Status: models.TicketStatusOpen, Source: models.TicketSourceWeb,
-			CreatedByID: customer.ID, Version: 1,
+			CreatedByID: &customer.ID, Version: 1,
 		},
 		{
 			TicketNumber: "REFERENCE-2", Title: "two", Description: "two",
 			Type: models.TicketTypeRequest, Priority: models.TicketPriorityNormal,
 			Status: models.TicketStatusOpen, Source: models.TicketSourceWeb,
-			CreatedByID: customer.ID, Version: 1,
+			CreatedByID: &customer.ID, Version: 1,
 		},
 	}
 	if err := db.Create(&tickets).Error; err != nil {
 		t.Fatal(err)
 	}
 	comments := []models.TicketComment{
-		{TicketID: tickets[0].ID, UserID: customer.ID, Content: "internal", Type: models.CommentTypeInternal},
-		{TicketID: tickets[0].ID, UserID: customer.ID, Content: "deleted", Type: models.CommentTypePublic, IsDeleted: true},
-		{TicketID: tickets[1].ID, UserID: customer.ID, Content: "other ticket", Type: models.CommentTypePublic},
+		{TicketID: tickets[0].ID, UserID: &customer.ID, ActorType: models.ActorTypeHuman, ActorID: strconv.FormatUint(uint64(customer.ID), 10), Content: "internal", Type: models.CommentTypeInternal},
+		{TicketID: tickets[0].ID, UserID: &customer.ID, ActorType: models.ActorTypeHuman, ActorID: strconv.FormatUint(uint64(customer.ID), 10), Content: "deleted", Type: models.CommentTypePublic, IsDeleted: true},
+		{TicketID: tickets[1].ID, UserID: &customer.ID, ActorType: models.ActorTypeHuman, ActorID: strconv.FormatUint(uint64(customer.ID), 10), Content: "other ticket", Type: models.CommentTypePublic},
 	}
 	if err := db.Create(&comments).Error; err != nil {
 		t.Fatal(err)
 	}
 
-	handler := NewTicketContentHandler(db, services.NewTicketService(db), nil, 1024)
+	handler := NewTicketContentHandler(db, newHandlerTicketService(t, db), nil, 1024)
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", customer.ID)
@@ -233,6 +303,7 @@ func TestCustomerCannotReferenceInternalDeletedOrCrossTicketComment(t *testing.T
 				payload,
 			)
 			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("If-Match", httpcontract.FormatETag(tickets[0].Version))
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, request)
 			if response.Code != http.StatusForbidden {
@@ -262,6 +333,7 @@ func TestCustomerCannotReferenceInternalDeletedOrCrossTicketComment(t *testing.T
 				&payload,
 			)
 			request.Header.Set("Content-Type", writer.FormDataContentType())
+			request.Header.Set("If-Match", httpcontract.FormatETag(tickets[0].Version))
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, request)
 			if response.Code != http.StatusForbidden {
@@ -288,12 +360,12 @@ func TestCustomerCannotCreateCommentWorklog(t *testing.T) {
 		TicketNumber: "WORKLOG-1", Title: "one", Description: "one",
 		Type: models.TicketTypeRequest, Priority: models.TicketPriorityNormal,
 		Status: models.TicketStatusOpen, Source: models.TicketSourceWeb,
-		CreatedByID: customer.ID, Version: 1,
+		CreatedByID: &customer.ID, Version: 1,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
 	}
-	handler := NewTicketContentHandler(db, services.NewTicketService(db), nil, 0)
+	handler := NewTicketContentHandler(db, newHandlerTicketService(t, db), nil, 0)
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", customer.ID)
@@ -313,10 +385,628 @@ func TestCustomerCannotCreateCommentWorklog(t *testing.T) {
 			bytes.NewBufferString(payload),
 		)
 		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("If-Match", httpcontract.FormatETag(ticket.Version))
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, request)
 		if response.Code != http.StatusForbidden {
 			t.Fatalf("worklog payload %s status=%d body=%s", payload, response.Code, response.Body.String())
 		}
+	}
+}
+
+func TestStoreAttachmentRejectsInvalidMultipartAsBadRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.Ticket{},
+		&models.TicketComment{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	admin := models.User{
+		Username: "attachment-contract-admin", Email: "attachment-contract@example.com",
+		PasswordHash: "hashed", Role: models.RoleAdmin, Status: models.UserStatusActive,
+	}
+	if err := db.Create(&admin).Error; err != nil {
+		t.Fatal(err)
+	}
+	ticket := models.Ticket{
+		TicketNumber: "ATTACHMENT-CONTRACT", Title: "attachment", Description: "attachment",
+		Type: models.TicketTypeRequest, Priority: models.TicketPriorityNormal,
+		Status: models.TicketStatusOpen, Source: models.TicketSourceWeb,
+		CreatedByID: &admin.ID, Version: 1,
+	}
+	if err := db.Create(&ticket).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewTicketContentHandler(db, newHandlerTicketService(t, db), nil, 1024)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", admin.ID)
+		c.Set("user_role", string(models.RoleAdmin))
+		c.Next()
+	})
+	router.POST("/tickets/:id/attachments", handler.StoreAttachment)
+
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/tickets/"+jsonNumber(ticket.ID)+"/attachments",
+		strings.NewReader("visibility=internal"),
+	)
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("If-Match", httpcontract.FormatETag(ticket.Version))
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest ||
+		!strings.Contains(response.Body.String(), `"code":"invalid_request"`) {
+		t.Fatalf(
+			"invalid multipart status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+}
+
+func TestTicketContentWritesEnforceIfMatch(t *testing.T) {
+	operations := []struct {
+		name       string
+		pathSuffix string
+		register   func(*gin.Engine, *TicketContentHandler)
+		request    func(*testing.T, string) *http.Request
+	}{
+		{
+			name:       "comment",
+			pathSuffix: "/comments",
+			register: func(router *gin.Engine, handler *TicketContentHandler) {
+				router.POST("/tickets/:id/comments", handler.CreateComment)
+			},
+			request: func(t *testing.T, path string) *http.Request {
+				t.Helper()
+				request := httptest.NewRequest(
+					http.MethodPost,
+					path,
+					bytes.NewBufferString(`{"content":"并发版本回归","type":"public"}`),
+				)
+				request.Header.Set("Content-Type", "application/json")
+				return request
+			},
+		},
+		{
+			name:       "attachment",
+			pathSuffix: "/attachments",
+			register: func(router *gin.Engine, handler *TicketContentHandler) {
+				router.POST("/tickets/:id/attachments", handler.StoreAttachment)
+			},
+			request: func(t *testing.T, path string) *http.Request {
+				t.Helper()
+				var payload bytes.Buffer
+				writer := multipart.NewWriter(&payload)
+				part, err := writer.CreateFormFile("file", "customer-proof.txt")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := part.Write([]byte("proof")); err != nil {
+					t.Fatal(err)
+				}
+				if err := writer.Close(); err != nil {
+					t.Fatal(err)
+				}
+				request := httptest.NewRequest(http.MethodPost, path, &payload)
+				request.Header.Set("Content-Type", writer.FormDataContentType())
+				return request
+			},
+		},
+	}
+
+	for _, operation := range operations {
+		operation := operation
+		t.Run(operation.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			db := openHandlerTestDB(t)
+			if err := db.AutoMigrate(
+				&models.User{},
+				&models.ServicePrincipal{},
+				&models.Ticket{},
+				&models.TicketComment{},
+				&models.TicketAttachment{},
+				&models.DomainEvent{},
+				&models.OutboxDelivery{},
+				&models.TicketHistory{},
+			); err != nil {
+				t.Fatalf("migrate content concurrency schemas: %v", err)
+			}
+			customer := models.User{
+				Username:     "content-version-" + operation.name,
+				Email:        "content-version-" + operation.name + "@example.com",
+				PasswordHash: "hashed",
+				Role:         models.RoleCustomer,
+				Status:       models.UserStatusActive,
+			}
+			if err := db.Create(&customer).Error; err != nil {
+				t.Fatal(err)
+			}
+			ticket := models.Ticket{
+				TicketNumber: "CONTENT-VERSION-" + strings.ToUpper(operation.name),
+				Title:        "content version",
+				Description:  "content version",
+				Type:         models.TicketTypeRequest,
+				Priority:     models.TicketPriorityNormal,
+				Status:       models.TicketStatusOpen,
+				Source:       models.TicketSourceWeb,
+				CreatedByID:  &customer.ID,
+				Version:      2,
+			}
+			if err := db.Create(&ticket).Error; err != nil {
+				t.Fatal(err)
+			}
+			storage, err := services.NewLocalAttachmentStorage(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			native := services.NewAgentNativeService(db, services.AgentNativeOptions{
+				AttachmentStorage:  storage,
+				AttachmentMaxBytes: 1024,
+			})
+			handler := NewTicketContentHandler(
+				db,
+				newHandlerTicketService(t, db),
+				native,
+				1024,
+			)
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				c.Set("user_id", customer.ID)
+				c.Set("user_role", string(models.RoleCustomer))
+				c.Next()
+			})
+			operation.register(router, handler)
+			path := "/tickets/" + jsonNumber(ticket.ID) + operation.pathSuffix
+
+			tests := []struct {
+				name        string
+				ifMatch     string
+				wantStatus  int
+				wantCode    string
+				wantRecords int64
+				wantVersion uint64
+			}{
+				{
+					name:        "missing",
+					wantStatus:  http.StatusPreconditionRequired,
+					wantCode:    "precondition_required",
+					wantVersion: 2,
+				},
+				{
+					name:        "stale",
+					ifMatch:     httpcontract.FormatETag(1),
+					wantStatus:  http.StatusConflict,
+					wantCode:    "version_conflict",
+					wantVersion: 2,
+				},
+				{
+					name:        "current",
+					ifMatch:     httpcontract.FormatETag(2),
+					wantStatus:  http.StatusCreated,
+					wantRecords: 1,
+					wantVersion: 3,
+				},
+			}
+			for _, test := range tests {
+				test := test
+				t.Run(test.name, func(t *testing.T) {
+					request := operation.request(t, path)
+					if test.ifMatch != "" {
+						request.Header.Set("If-Match", test.ifMatch)
+					}
+					response := httptest.NewRecorder()
+					router.ServeHTTP(response, request)
+					if response.Code != test.wantStatus {
+						t.Fatalf(
+							"status=%d, want %d: %s",
+							response.Code,
+							test.wantStatus,
+							response.Body.String(),
+						)
+					}
+					if test.wantCode != "" {
+						var problem humanTicketProblem
+						if err := json.Unmarshal(response.Body.Bytes(), &problem); err != nil {
+							t.Fatalf("decode problem response: %v", err)
+						}
+						if problem.Code != test.wantCode || problem.Status != test.wantStatus {
+							t.Fatalf("problem=%+v", problem)
+						}
+						if got := response.Header().Get("Content-Type"); !strings.HasPrefix(
+							got,
+							"application/problem+json",
+						) {
+							t.Fatalf("Content-Type=%q", got)
+						}
+					} else if got, want := response.Header().Get("ETag"), httpcontract.FormatETag(3); got != want {
+						t.Fatalf("ETag=%q, want %q", got, want)
+					}
+
+					var records int64
+					query := db
+					if operation.name == "comment" {
+						query = query.Model(&models.TicketComment{})
+					} else {
+						query = query.Model(&models.TicketAttachment{})
+					}
+					if err := query.Where("ticket_id = ?", ticket.ID).Count(&records).Error; err != nil {
+						t.Fatal(err)
+					}
+					if records != test.wantRecords {
+						t.Fatalf("persisted records=%d, want %d", records, test.wantRecords)
+					}
+					var current models.Ticket
+					if err := db.Select("version").First(&current, ticket.ID).Error; err != nil {
+						t.Fatal(err)
+					}
+					if current.Version != test.wantVersion {
+						t.Fatalf("ticket version=%d, want %d", current.Version, test.wantVersion)
+					}
+					if operation.name == "attachment" && test.wantStatus == http.StatusCreated {
+						for _, forbidden := range []string{
+							`"uploaded_by"`, `"actor_type"`, `"actor_id"`,
+							`"service_principal_id"`, `"file_name"`,
+							`"download_count"`, `"hash"`, `"scan_details"`,
+						} {
+							if strings.Contains(response.Body.String(), forbidden) {
+								t.Fatalf(
+									"customer attachment upload leaked %q: %s",
+									forbidden,
+									response.Body.String(),
+								)
+							}
+						}
+						if !strings.Contains(response.Body.String(), `"virus_scan":"pending"`) {
+							t.Fatalf("customer response lost public scan status: %s", response.Body.String())
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestCreateCommentRejectsInvalidInputWithChineseContract(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.ServicePrincipal{},
+		&models.Ticket{},
+		&models.TicketComment{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
+		&models.TicketHistory{},
+	); err != nil {
+		t.Fatalf("migrate comment contract schemas: %v", err)
+	}
+	admin := models.User{
+		Username: "comment-contract-admin", Email: "comment-contract@example.com",
+		PasswordHash: "hashed", Role: models.RoleAdmin, Status: models.UserStatusActive,
+	}
+	if err := db.Create(&admin).Error; err != nil {
+		t.Fatal(err)
+	}
+	ticket := models.Ticket{
+		TicketNumber: "COMMENT-CONTRACT", Title: "comment contract", Description: "comment contract",
+		Type: models.TicketTypeRequest, Priority: models.TicketPriorityNormal,
+		Status: models.TicketStatusOpen, Source: models.TicketSourceWeb,
+		CreatedByID:        &admin.ID,
+		CreatedByActorType: models.ActorTypeHuman,
+		CreatedByActorID:   strconv.FormatUint(uint64(admin.ID), 10),
+		Version:            1,
+	}
+	if err := db.Create(&ticket).Error; err != nil {
+		t.Fatal(err)
+	}
+	handler := NewTicketContentHandler(
+		db,
+		newHandlerTicketService(t, db),
+		services.NewAgentNativeService(db),
+		0,
+	)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", admin.ID)
+		c.Set("user_role", string(models.RoleAdmin))
+		c.Next()
+	})
+	router.POST("/tickets/:id/comments", handler.CreateComment)
+
+	longPayload, err := json.Marshal(map[string]any{
+		"content": strings.Repeat("评", maxHumanCommentContentRunes+1),
+		"type":    "public",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name        string
+		body        string
+		code        string
+		message     string
+		contentType string
+	}{
+		{
+			name:    "empty body",
+			code:    "invalid_request",
+			message: "请求正文不能为空",
+		},
+		{
+			name:    "malformed JSON",
+			body:    `{`,
+			code:    "invalid_request",
+			message: "请求正文必须是有效的 JSON 对象",
+		},
+		{
+			name:    "unknown field",
+			body:    `{"content":"有效评论","type":"public","unknown":true}`,
+			code:    "invalid_request",
+			message: "请求正文必须是有效的 JSON 对象",
+		},
+		{
+			name:    "empty content",
+			body:    `{"content":"","type":"public"}`,
+			code:    "validation_error",
+			message: "评论内容不能为空",
+		},
+		{
+			name:    "blank content",
+			body:    `{"content":" \t\n ","type":"public"}`,
+			code:    "validation_error",
+			message: "评论内容不能为空",
+		},
+		{
+			name:    "content too long",
+			body:    string(longPayload),
+			code:    "validation_error",
+			message: "评论内容不能超过 10000 个字符",
+		},
+		{
+			name:    "invalid content type",
+			body:    `{"content":"有效评论","content_type":"text/html","type":"public"}`,
+			code:    "validation_error",
+			message: "评论内容格式无效，仅支持纯文本或 Markdown",
+		},
+		{
+			name:    "invalid comment type",
+			body:    `{"content":"有效评论","type":"private"}`,
+			code:    "validation_error",
+			message: "评论类型无效，仅支持公开或内部评论",
+		},
+		{
+			name:    "zero parent",
+			body:    `{"content":"有效评论","type":"public","parent_id":0}`,
+			code:    "validation_error",
+			message: "父评论 ID 必须大于 0",
+		},
+		{
+			name:    "missing parent",
+			body:    `{"content":"有效评论","type":"public","parent_id":999999}`,
+			code:    "validation_error",
+			message: "评论请求不符合要求",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/tickets/"+jsonNumber(ticket.ID)+"/comments",
+				bytes.NewBufferString(test.body),
+			)
+			contentType := test.contentType
+			if contentType == "" {
+				contentType = "application/json"
+			}
+			request.Header.Set("Content-Type", contentType)
+			request.Header.Set("If-Match", httpcontract.FormatETag(ticket.Version))
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			var payload struct {
+				Success bool   `json:"success"`
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode error response: %v", err)
+			}
+			if payload.Success || payload.Code != test.code || payload.Message != test.message {
+				t.Fatalf("unexpected error contract: %+v", payload)
+			}
+			publicText := strings.ToLower(response.Body.String())
+			for _, forbidden := range []string{
+				"key: '",
+				"field validation",
+				"failed on the",
+				"comment content must",
+				"native comments support",
+				"invalid comment type",
+				"invalid comment",
+			} {
+				if strings.Contains(publicText, forbidden) {
+					t.Fatalf("response leaked internal detail %q: %s", forbidden, response.Body.String())
+				}
+			}
+
+			var commentCount int64
+			if err := db.Model(&models.TicketComment{}).
+				Where("ticket_id = ?", ticket.ID).
+				Count(&commentCount).Error; err != nil {
+				t.Fatal(err)
+			}
+			if commentCount != 0 {
+				t.Fatalf("invalid request persisted %d comments", commentCount)
+			}
+			var current models.Ticket
+			if err := db.Select("version").First(&current, ticket.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if current.Version != 1 {
+				t.Fatalf("invalid request changed ticket version to %d", current.Version)
+			}
+		})
+	}
+
+	validRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/tickets/"+jsonNumber(ticket.ID)+"/comments",
+		bytes.NewBufferString(`{"content":"  已完成核查  ","content_type":"markdown","type":"public"}`),
+	)
+	validRequest.Header.Set("Content-Type", "application/json")
+	validRequest.Header.Set("If-Match", httpcontract.FormatETag(ticket.Version))
+	validResponse := httptest.NewRecorder()
+	router.ServeHTTP(validResponse, validRequest)
+	if validResponse.Code != http.StatusCreated {
+		t.Fatalf(
+			"valid comment status=%d body=%s",
+			validResponse.Code,
+			validResponse.Body.String(),
+		)
+	}
+	var persisted models.TicketComment
+	if err := db.Where("ticket_id = ?", ticket.ID).First(&persisted).Error; err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Content != "已完成核查" ||
+		persisted.ContentType != "markdown" ||
+		persisted.Type != models.CommentTypePublic {
+		t.Fatalf("valid comment was not normalized correctly: %+v", persisted)
+	}
+}
+
+func TestCreateCommentKeepsHumanVisibilityDenial(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(&models.User{}, &models.Ticket{}, &models.TicketComment{}); err != nil {
+		t.Fatal(err)
+	}
+	admin := models.User{
+		Username: "comment-system-admin", Email: "comment-system-admin@example.com",
+		PasswordHash: "hashed", Role: models.RoleAdmin, Status: models.UserStatusActive,
+	}
+	if err := db.Create(&admin).Error; err != nil {
+		t.Fatal(err)
+	}
+	ticket := models.Ticket{
+		TicketNumber: "COMMENT-SYSTEM", Title: "system comment", Description: "system comment",
+		Type: models.TicketTypeRequest, Priority: models.TicketPriorityNormal,
+		Status: models.TicketStatusOpen, Source: models.TicketSourceWeb,
+		CreatedByID: &admin.ID, Version: 1,
+	}
+	if err := db.Create(&ticket).Error; err != nil {
+		t.Fatal(err)
+	}
+	handler := NewTicketContentHandler(db, newHandlerTicketService(t, db), nil, 0)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", admin.ID)
+		c.Set("user_role", string(models.RoleAdmin))
+		c.Next()
+	})
+	router.POST("/tickets/:id/comments", handler.CreateComment)
+
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/tickets/"+jsonNumber(ticket.ID)+"/comments",
+		bytes.NewBufferString(`{"content":"系统评论","type":"system"}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("If-Match", httpcontract.FormatETag(ticket.Version))
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden ||
+		!strings.Contains(response.Body.String(), `"code":"comment_visibility_denied"`) {
+		t.Fatalf("system comment denial changed: status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestCreateCommentKeepsNotFoundConflictAndInternalErrorsSafe(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(&models.User{}, &models.Ticket{}, &models.TicketComment{}); err != nil {
+		t.Fatal(err)
+	}
+	admin := models.User{
+		Username: "comment-error-admin", Email: "comment-error-admin@example.com",
+		PasswordHash: "hashed", Role: models.RoleAdmin, Status: models.UserStatusActive,
+	}
+	if err := db.Create(&admin).Error; err != nil {
+		t.Fatal(err)
+	}
+	handler := NewTicketContentHandler(db, newHandlerTicketService(t, db), nil, 0)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", admin.ID)
+		c.Set("user_role", string(models.RoleAdmin))
+		c.Next()
+	})
+	router.POST("/tickets/:id/comments", handler.CreateComment)
+
+	notFoundRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/tickets/999999/comments",
+		bytes.NewBufferString(`{"content":"有效评论","type":"public"}`),
+	)
+	notFoundRequest.Header.Set("Content-Type", "application/json")
+	notFoundResponse := httptest.NewRecorder()
+	router.ServeHTTP(notFoundResponse, notFoundRequest)
+	if notFoundResponse.Code != http.StatusNotFound ||
+		!strings.Contains(notFoundResponse.Body.String(), `"message":"资源不存在"`) {
+		t.Fatalf(
+			"not-found contract changed: status=%d body=%s",
+			notFoundResponse.Code,
+			notFoundResponse.Body.String(),
+		)
+	}
+
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+		forbidden  string
+	}{
+		{
+			name:       "version conflict",
+			err:        services.ErrVersionConflict,
+			wantStatus: http.StatusConflict,
+			wantCode:   "version_conflict",
+		},
+		{
+			name:       "internal error",
+			err:        errors.New("database password=PRIVATE must not leak"),
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "internal_error",
+			forbidden:  "PRIVATE",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			context, _ := gin.CreateTestContext(response)
+			context.Request = httptest.NewRequest(http.MethodPost, "/tickets/1/comments", nil)
+			handler.writeCommentError(context, test.err)
+			if response.Code != test.wantStatus ||
+				!strings.Contains(response.Body.String(), `"code":"`+test.wantCode+`"`) {
+				t.Fatalf(
+					"status=%d body=%s",
+					response.Code,
+					response.Body.String(),
+				)
+			}
+			if test.forbidden != "" && strings.Contains(response.Body.String(), test.forbidden) {
+				t.Fatalf("response leaked internal error: %s", response.Body.String())
+			}
+		})
 	}
 }

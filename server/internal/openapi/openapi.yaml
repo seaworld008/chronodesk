@@ -205,23 +205,16 @@ paths:
           $ref: '#/components/responses/NotFound'
     patch:
       tags: [Tickets]
-      operationId: mutateTicketV1
-      summary: Update, assign, or transition a ticket
+      operationId: updateTicketV1
+      summary: Update ordinary ticket fields
       description: |
-        The required OAuth scope is selected from the command shape:
-
-        * ordinary mutable fields require `tickets:update`;
-        * assignment fields require `tickets:assign`;
-        * `status` requires `tickets:transition`.
-
-        These categories cannot be mixed in one request. Assignment and
-        transition are risky actions and additionally require an explicit
-        matching allow policy. A valid lease owned by the caller and the
-        current resource ETag are mandatory.
+        Updates only ordinary mutable ticket fields under `tickets:update`.
+        Status transitions, assignment, escalation, provenance, trust, SLA,
+        and persistence projection fields are rejected. Use the explicit
+        command endpoints for risky lifecycle operations. A valid lease owned
+        by the caller and the current resource ETag are mandatory.
       security:
         - oauth2: ['tickets:update']
-        - oauth2: ['tickets:assign']
-        - oauth2: ['tickets:transition']
       parameters:
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -232,29 +225,186 @@ paths:
         content:
           application/merge-patch+json:
             schema:
-              oneOf:
-                - $ref: '#/components/schemas/TicketFieldPatch'
-                - $ref: '#/components/schemas/TicketAssignmentPatch'
-                - $ref: '#/components/schemas/TicketTransitionPatch'
-            examples:
-              update:
-                summary: Ordinary update requiring tickets:update
-                value:
-                  priority: high
-                  tags: [payments, investigated]
-              assignment:
-                summary: Service-principal assignment requiring tickets:assign
-                value:
-                  assigned_to_actor_type: service_principal
-                  assigned_to_actor_id: 4d24ebd5-70bf-43f8-b0d1-e140d987292f
-                  assigned_to_service_principal_id: 4d24ebd5-70bf-43f8-b0d1-e140d987292f
-              transition:
-                summary: State transition requiring tickets:transition
-                value:
-                  status: in_progress
+              $ref: '#/components/schemas/TicketFieldPatch'
+            example:
+              priority: high
+              tags: [payments, investigated]
       responses:
         '200':
           description: Updated ticket and operation receipt.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketWriteEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /tickets/{ticketId}/commands/assign:
+    parameters:
+      - $ref: '#/components/parameters/TicketId'
+    post:
+      tags: [Tickets]
+      operationId: assignTicketV1
+      summary: Assign or release a ticket
+      description: |
+        Assigns a ticket to one complete human or service-principal ActorRef.
+        Set `assignee` to null to release the current assignment. Raw
+        persistence projection fields and system ActorRefs are never accepted.
+        This is a risky command and requires an explicit matching allow policy.
+      security:
+        - oauth2: ['tickets:assign']
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TicketLease'
+        - $ref: '#/components/parameters/CommandCorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TicketAssignCommand'
+            examples:
+              assignServicePrincipal:
+                summary: Assign to an active service principal
+                value:
+                  assignee:
+                    type: service_principal
+                    id: 4d24ebd5-70bf-43f8-b0d1-e140d987292f
+                  reason: 该智能体具备当前队列所需的数据库排障能力。
+              release:
+                summary: Release the current assignment
+                value:
+                  assignee: null
+                  reason: 当前处理者结束轮值，释放工单供下一位处理者领取。
+      responses:
+        '200':
+          description: Assigned ticket snapshot and operation receipt.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketWriteEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /tickets/{ticketId}/commands/transition:
+    parameters:
+      - $ref: '#/components/parameters/TicketId'
+    post:
+      tags: [Tickets]
+      operationId: transitionTicketV1
+      summary: Transition a ticket
+      description: |
+        Performs one explicit lifecycle transition with a short auditable
+        reason. Assignment and ordinary field changes are rejected. This is a
+        risky command and requires an explicit matching allow policy.
+      security:
+        - oauth2: ['tickets:transition']
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TicketLease'
+        - $ref: '#/components/parameters/CommandCorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TicketTransitionCommand'
+            example:
+              status: in_progress
+              reason: 已确认告警并开始按生产故障手册处理。
+      responses:
+        '200':
+          description: Transitioned ticket snapshot and operation receipt.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketWriteEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /tickets/{ticketId}/commands/escalate:
+    parameters:
+      - $ref: '#/components/parameters/TicketId'
+    post:
+      tags: [Tickets]
+      operationId: escalateTicketV1
+      summary: Escalate a ticket
+      description: |
+        Performs the typed high-risk escalation command with a short auditable
+        reason. An optional human or service-principal assignee is applied in
+        the same transaction. When `assignee` is present the token must grant
+        both `tickets:transition` and `tickets:assign`, and both policy
+        decisions must allow the operation.
+      security:
+        - oauth2: ['tickets:transition']
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TicketLease'
+        - $ref: '#/components/parameters/CommandCorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TicketEscalateCommand'
+            examples:
+              escalate:
+                summary: Escalate without changing assignment
+                value:
+                  reason: 错误率持续超过升级阈值，需要主管介入。
+              escalateAndAssign:
+                summary: Escalate and atomically assign
+                value:
+                  reason: 需要事故响应智能体立即接管。
+                  priority: urgent
+                  assignee:
+                    type: service_principal
+                    id: 4d24ebd5-70bf-43f8-b0d1-e140d987292f
+      responses:
+        '200':
+          description: Escalated ticket snapshot and operation receipt.
           headers:
             ETag:
               $ref: '#/components/headers/ETag'
@@ -797,7 +947,7 @@ paths:
                 type: string
                 const: no-store
             Pragma:
-              description: Legacy cache prevention for the one-time client secret.
+              description: Secondary cache-prevention directive for the one-time client secret.
               schema:
                 type: string
                 const: no-cache
@@ -898,7 +1048,7 @@ paths:
                 type: string
                 const: no-store
             Pragma:
-              description: Legacy cache prevention for the one-time client secret.
+              description: Secondary cache-prevention directive for the one-time client secret.
               schema:
                 type: string
                 const: no-cache
@@ -1539,19 +1689,6 @@ paths:
                     notifications:
                       resourceSubscriptions:
                         - ticket://tickets/42
-              cancelledNotification:
-                summary: Send a notification without a JSON-RPC id
-                value:
-                  jsonrpc: '2.0'
-                  method: notifications/cancelled
-                  params:
-                    _meta:
-                      io.modelcontextprotocol/protocolVersion: '2026-07-28'
-                      io.modelcontextprotocol/clientCapabilities:
-                        extensions:
-                          io.modelcontextprotocol/oauth-client-credentials: {}
-                    requestId: request-1
-                    reason: caller cancelled
       responses:
         '200':
           description: |
@@ -1589,11 +1726,6 @@ paths:
 
                 data: {"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"ticket://tickets/42","_meta":{"io.modelcontextprotocol/subscriptionId":"listen-1"}}}
 
-        '202':
-          description: |
-            A valid JSON-RPC notification without an `id` was accepted. MCP
-            Streamable HTTP returns an empty body because notifications never
-            have JSON-RPC responses.
         '400':
           description: |
             There are two intentionally distinct error representations.
@@ -1605,9 +1737,11 @@ paths:
             `http.Error`; it has no JSON-RPC envelope.
 
             After a request can be decoded as JSON-RPC, missing or mismatched
-            modern headers, an invalid request `_meta`, and unsupported
-            protocol versions return HTTP 400 as an
-            `application/json` JSON-RPC error envelope.
+            modern headers, an invalid request `_meta`, unsupported protocol
+            versions, and client-to-server notifications return HTTP 400 as
+            an `application/json` JSON-RPC error envelope. The 2026-07-28
+            Streamable HTTP core defines no client notification; cancellation
+            is performed by closing the request response stream.
           content:
             application/json:
               schema:
@@ -1640,6 +1774,13 @@ paths:
                       data:
                         required:
                           - io.modelcontextprotocol/clientCapabilities
+                clientNotification:
+                  value:
+                    jsonrpc: '2.0'
+                    id: null
+                    error:
+                      code: -32600
+                      message: Client-to-server notifications are not defined for Streamable HTTP
                 subscriptionResourceLimit:
                   value:
                     jsonrpc: '2.0'
@@ -2026,6 +2167,15 @@ components:
       in: header
       required: false
       description: Caller correlation identifier copied to emitted domain events.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+    CommandCorrelationId:
+      name: X-Correlation-ID
+      in: header
+      required: true
+      description: Non-empty caller correlation identifier copied to every command domain event.
       schema:
         type: string
         minLength: 1
@@ -2440,6 +2590,17 @@ components:
         id:
           type: string
           minLength: 1
+    AssignableActorRef:
+      type: object
+      additionalProperties: false
+      required: [type, id]
+      properties:
+        type:
+          type: string
+          enum: [human, service_principal]
+        id:
+          type: string
+          minLength: 1
     TicketStatus:
       type: string
       enum: [open, in_progress, pending, resolved, closed, cancelled]
@@ -2584,10 +2745,6 @@ components:
           type: string
         customer_name:
           type: string
-        attachments:
-          type: array
-          items:
-            type: string
         custom_fields:
           type: object
           additionalProperties: true
@@ -2682,33 +2839,48 @@ components:
         custom_fields:
           type: object
           additionalProperties: true
-        is_escalated:
-          type: boolean
         agent_context:
           $ref: '#/components/schemas/AgentContext'
-    TicketAssignmentPatch:
+    TicketAssignCommand:
       type: object
       additionalProperties: false
-      minProperties: 1
+      required: [assignee, reason]
       properties:
-        assigned_to_id:
-          type: [integer, 'null']
-          minimum: 1
-        assigned_to_actor_type:
-          type: [string, 'null']
-          enum: [human, service_principal, null]
-        assigned_to_actor_id:
-          type: [string, 'null']
-        assigned_to_service_principal_id:
-          type: [string, 'null']
-          format: uuid
-    TicketTransitionPatch:
+        assignee:
+          oneOf:
+            - $ref: '#/components/schemas/AssignableActorRef'
+            - type: 'null'
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Short auditable rationale; never include chain-of-thought.
+    TicketTransitionCommand:
       type: object
       additionalProperties: false
-      required: [status]
+      required: [status, reason]
       properties:
         status:
           $ref: '#/components/schemas/TicketStatus'
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Short auditable rationale; never include chain-of-thought.
+    TicketEscalateCommand:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Short auditable rationale; never include chain-of-thought.
+        priority:
+          $ref: '#/components/schemas/TicketPriority'
+        assignee:
+          $ref: '#/components/schemas/AssignableActorRef'
     CommentCreate:
       type: object
       additionalProperties: false
@@ -3233,9 +3405,6 @@ components:
         expires_at:
           type: [string, 'null']
           format: date-time
-        compatibility_user_id:
-          type: [integer, 'null']
-          minimum: 1
     AgentScope:
       type: string
       enum:
@@ -3326,9 +3495,6 @@ components:
           type: [string, 'null']
           format: date-time
         created_by_id:
-          type: [integer, 'null']
-          minimum: 1
-        compatibility_user_id:
           type: [integer, 'null']
           minimum: 1
     ServicePrincipalEnvelope:
@@ -4141,10 +4307,6 @@ components:
           const: false
           description: No authorization endpoint or authorization response is exposed.
     MCP20260728Request:
-      oneOf:
-        - $ref: '#/components/schemas/MCP20260728CallRequest'
-        - $ref: '#/components/schemas/MCP20260728CancelledNotification'
-    MCP20260728CallRequest:
       type: object
       additionalProperties: false
       required: [jsonrpc, id, method, params]
@@ -4191,31 +4353,6 @@ components:
               items:
                 type: string
                 format: uri
-    MCP20260728CancelledNotification:
-      type: object
-      additionalProperties: false
-      required: [jsonrpc, method, params]
-      properties:
-        jsonrpc:
-          type: string
-          const: '2.0'
-        method:
-          type: string
-          const: notifications/cancelled
-        params:
-          type: object
-          additionalProperties: true
-          required: [_meta, requestId]
-          properties:
-            _meta:
-              $ref: '#/components/schemas/MCPRequestMeta'
-            requestId:
-              oneOf:
-                - type: string
-                  minLength: 1
-                - type: integer
-            reason:
-              type: string
     MCPRequestMeta:
       type: object
       additionalProperties: true

@@ -1,13 +1,16 @@
 package middleware
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"strconv"
 	"strings"
@@ -58,13 +61,13 @@ func NewRedisSlidingWindow(
 	timeout time.Duration,
 ) (*RedisSlidingWindow, error) {
 	if client == nil {
-		return nil, errors.New("Redis rate limiter requires a client")
+		return nil, errors.New("redis rate limiter requires a client")
 	}
 	if len(keyPepper) < 16 {
-		return nil, errors.New("Redis rate limiter key pepper must be at least 16 bytes")
+		return nil, errors.New("redis rate limiter key pepper must be at least 16 bytes")
 	}
 	if limit <= 0 || window <= 0 {
-		return nil, errors.New("Redis rate limiter requires positive limit and window")
+		return nil, errors.New("redis rate limiter requires positive limit and window")
 	}
 	if timeout <= 0 {
 		timeout = 2 * time.Second
@@ -160,6 +163,11 @@ func (limiter *RedisSlidingWindow) AllowN(key string, n int) bool {
 	return values[0] == 1
 }
 
+// Limit returns the maximum number of requests in one Redis window.
+func (limiter *RedisSlidingWindow) Limit() int {
+	return limiter.limit
+}
+
 func (limiter *RedisSlidingWindow) Remaining(key string) int {
 	snapshot, ok := limiter.snapshot(key)
 	if !ok {
@@ -174,17 +182,6 @@ func (limiter *RedisSlidingWindow) Reset(key string) time.Time {
 		return time.Now()
 	}
 	return snapshot.reset
-}
-
-func (limiter *RedisSlidingWindow) Cleanup() {
-	cutoff := time.Now().Add(-2 * limiter.window)
-	limiter.mu.Lock()
-	defer limiter.mu.Unlock()
-	for key, snapshot := range limiter.snapshots {
-		if snapshot.touchedAt.Before(cutoff) {
-			delete(limiter.snapshots, key)
-		}
-	}
 }
 
 func (limiter *RedisSlidingWindow) snapshot(key string) (redisRateLimitSnapshot, bool) {
@@ -257,12 +254,12 @@ func rateLimitInteger(value interface{}) (int, error) {
 		if typed <= uint(math.MaxInt) {
 			return int(typed), nil
 		}
-		return 0, errors.New("Redis rate-limit response exceeds the native int range")
+		return 0, errors.New("redis rate-limit response exceeds the native int range")
 	case float64:
 		if typed < float64(math.MinInt) ||
 			typed >= math.Ldexp(1, strconv.IntSize-1) ||
 			math.Trunc(typed) != typed {
-			return 0, errors.New("Redis rate-limit response is not an integer")
+			return 0, errors.New("redis rate-limit response is not an integer")
 		}
 		return int(typed), nil
 	case string:
@@ -271,11 +268,11 @@ func rateLimitInteger(value interface{}) (int, error) {
 			return 0, err
 		}
 		if parsed < int64(math.MinInt) || parsed > int64(math.MaxInt) {
-			return 0, errors.New("Redis rate-limit response exceeds the native int range")
+			return 0, errors.New("redis rate-limit response exceeds the native int range")
 		}
 		return int(parsed), nil
 	default:
-		return 0, fmt.Errorf("unexpected Redis rate-limit integer %T", value)
+		return 0, fmt.Errorf("unexpected redis rate-limit integer %T", value)
 	}
 }
 
@@ -291,15 +288,13 @@ func InfrastructureRouteRateLimitSkip(c HTTPContext) bool {
 	switch path {
 	case "/health", "/healthz", "/live", "/livez", "/ready", "/readyz",
 		"/metrics", "/favicon.ico", "/robots.txt", "/openapi.json",
-		"/openapi.yaml", "/.well-known", "/swagger", "/docs":
+		"/openapi.yaml", "/.well-known":
 		return true
 	}
 	for _, prefix := range []string{
 		"/.well-known/",
 		"/assets/",
 		"/static/",
-		"/swagger/",
-		"/docs/",
 		"/uploads/avatars/",
 	} {
 		if strings.HasPrefix(path, prefix) {
@@ -309,10 +304,90 @@ func InfrastructureRouteRateLimitSkip(c HTTPContext) bool {
 	return false
 }
 
-// AnonymousWriteRouteKeyFunc is the enterprise-safe key for unauthenticated
-// credential endpoints: trusted ClientIP plus the matched route pattern.
-func AnonymousWriteRouteKeyFunc(c HTTPContext) string {
+const anonymousCredentialBodyLimit = 64 << 10
+
+// AnonymousIPRouteKeyFunc is the coarse anti-abuse layer for unauthenticated
+// credential endpoints. It limits the trusted client IP and matched route,
+// regardless of which account or credential an attacker targets.
+func AnonymousIPRouteKeyFunc(c HTTPContext) string {
 	return RouteKeyFunc(c)
+}
+
+// AnonymousCredentialKeyFunc is the account/credential layer for
+// unauthenticated writes. It isolates employees sharing one enterprise NAT,
+// while a separate IP-route limiter still prevents attackers from evading the
+// coarse limit by rotating account identifiers.
+func AnonymousCredentialKeyFunc(c HTTPContext) string {
+	route := getRoutePattern(c)
+	subject := anonymousCredentialSubject(c)
+	if subject == "" {
+		return IPKeyFunc(c) + "|" + route + "|unidentified"
+	}
+	sum := sha256.Sum256([]byte(subject))
+	return route + "|subject_" + hex.EncodeToString(sum[:16])
+}
+
+func anonymousCredentialSubject(c HTTPContext) string {
+	ginContext, ok := c.(*GinHTTPContext)
+	if !ok ||
+		ginContext.Context.Request == nil ||
+		ginContext.Context.Request.Body == nil {
+		return ""
+	}
+	request := ginContext.Context.Request
+	if request.ContentLength > anonymousCredentialBodyLimit {
+		return ""
+	}
+
+	original := request.Body
+	body, err := io.ReadAll(io.LimitReader(original, anonymousCredentialBodyLimit+1))
+	if err != nil {
+		request.Body = &restoredRequestBody{
+			Reader: io.MultiReader(bytes.NewReader(body), original),
+			Closer: original,
+		}
+		return ""
+	}
+	if len(body) > anonymousCredentialBodyLimit {
+		request.Body = &restoredRequestBody{
+			Reader: io.MultiReader(bytes.NewReader(body), original),
+			Closer: original,
+		}
+		return ""
+	}
+	if err := original.Close(); err != nil {
+		request.Body = io.NopCloser(bytes.NewReader(body))
+		return ""
+	}
+	request.Body = io.NopCloser(bytes.NewReader(body))
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	for _, field := range []string{"email", "refresh_token", "token"} {
+		raw, exists := payload[field]
+		if !exists {
+			continue
+		}
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if field == "email" {
+			value = strings.ToLower(value)
+		}
+		if value != "" {
+			return field + ":" + value
+		}
+	}
+	return ""
+}
+
+type restoredRequestBody struct {
+	io.Reader
+	io.Closer
 }
 
 // AuthenticatedUserRouteKeyFunc isolates a logged-in human and route even

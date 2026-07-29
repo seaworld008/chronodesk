@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -15,13 +16,14 @@ import (
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 
+	"github.com/seaworld008/chronodesk/server/internal/httpcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
 type authorizationRaceTicketService struct {
 	services.TicketServiceInterface
-	versioned TicketVersionedService
+	versioned services.TicketServiceInterface
 	once      sync.Once
 	before    func()
 }
@@ -42,33 +44,37 @@ func (s *authorizationRaceTicketService) UpdateTicketExpectedVersion(
 }
 
 func (s *authorizationRaceTicketService) AssignTicketExpectedVersion(
+	ctx context.Context,
 	ticketID, assigneeID, userID uint,
 	comment string,
 	version uint64,
 ) (*models.Ticket, error) {
 	s.race()
-	return s.versioned.AssignTicketExpectedVersion(ticketID, assigneeID, userID, comment, version)
+	return s.versioned.AssignTicketExpectedVersion(ctx, ticketID, assigneeID, userID, comment, version)
 }
 
 func (s *authorizationRaceTicketService) TransferTicketExpectedVersion(
+	ctx context.Context,
 	ticketID, assigneeID, userID uint,
 	comment, reason string,
 	version uint64,
 ) (*models.Ticket, error) {
 	s.race()
-	return s.versioned.TransferTicketExpectedVersion(ticketID, assigneeID, userID, comment, reason, version)
+	return s.versioned.TransferTicketExpectedVersion(ctx, ticketID, assigneeID, userID, comment, reason, version)
 }
 
 func (s *authorizationRaceTicketService) EscalateTicketExpectedVersion(
+	ctx context.Context,
 	ticketID, escalateToID, userID uint,
 	reason, comment string,
 	version uint64,
 ) (*models.Ticket, error) {
 	s.race()
-	return s.versioned.EscalateTicketExpectedVersion(ticketID, escalateToID, userID, reason, comment, version)
+	return s.versioned.EscalateTicketExpectedVersion(ctx, ticketID, escalateToID, userID, reason, comment, version)
 }
 
 func (s *authorizationRaceTicketService) UpdateTicketStatusExpectedVersion(
+	ctx context.Context,
 	ticketID uint,
 	status string,
 	userID uint,
@@ -76,7 +82,7 @@ func (s *authorizationRaceTicketService) UpdateTicketStatusExpectedVersion(
 	version uint64,
 ) (*models.Ticket, error) {
 	s.race()
-	return s.versioned.UpdateTicketStatusExpectedVersion(ticketID, status, userID, comment, resolutionNotes, version)
+	return s.versioned.UpdateTicketStatusExpectedVersion(ctx, ticketID, status, userID, comment, resolutionNotes, version)
 }
 
 func setupWorkflowHandlerTest(
@@ -125,7 +131,7 @@ func setupWorkflowHandlerTest(
 		Status:       models.TicketStatusOpen,
 		Type:         models.TicketTypeRequest,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  agent.ID,
+		CreatedByID:  &agent.ID,
 		AssignedToID: &agent.ID,
 	}
 	if err := db.Create(&assignedTicket).Error; err != nil {
@@ -140,14 +146,14 @@ func setupWorkflowHandlerTest(
 		Status:       models.TicketStatusOpen,
 		Type:         models.TicketTypeIncident,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  otherAgent.ID,
+		CreatedByID:  &otherAgent.ID,
 		AssignedToID: &otherAgent.ID,
 	}
 	if err := db.Create(&otherTicket).Error; err != nil {
 		t.Fatalf("failed to create other ticket: %v", err)
 	}
 
-	return NewTicketWorkflowHandler(services.NewTicketService(db)), db, agent, otherAgent, assignedTicket, otherTicket
+	return NewTicketWorkflowHandler(newHandlerTicketService(t, db)), db, agent, otherAgent, assignedTicket, otherTicket
 }
 
 func TestTicketStatsUsesAuthenticatedUserRole(t *testing.T) {
@@ -252,7 +258,7 @@ func TestCustomerQueueAndAggregateQueriesAreObjectScoped(t *testing.T) {
 		Status:       models.TicketStatusOpen,
 		Type:         models.TicketTypeIncident,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  customer.ID,
+		CreatedByID:  &customer.ID,
 		DueDate:      &yesterday,
 		SLABreached:  true,
 	}
@@ -264,7 +270,7 @@ func TestCustomerQueueAndAggregateQueriesAreObjectScoped(t *testing.T) {
 		Status:       models.TicketStatusOpen,
 		Type:         models.TicketTypeIncident,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  otherAgent.ID,
+		CreatedByID:  &otherAgent.ID,
 		DueDate:      &yesterday,
 		SLABreached:  true,
 	}
@@ -293,7 +299,7 @@ func TestCustomerQueueAndAggregateQueriesAreObjectScoped(t *testing.T) {
 	if overdueTotal != 1 || len(overdue) != 1 || overdue[0].ID != own.ID {
 		t.Fatalf("customer overdue query was not object scoped: total=%d tickets=%+v", overdueTotal, overdue)
 	}
-	breached, breachedTotal, err := handler.ticketService.GetSLABreachedTickets(customer.ID, "user")
+	breached, breachedTotal, err := handler.ticketService.GetSLABreachedTickets(customer.ID, "customer")
 	if err != nil {
 		t.Fatalf("customer SLA tickets: %v", err)
 	}
@@ -332,10 +338,9 @@ func TestCustomerSpecialListsUseSafeTicketDTO(t *testing.T) {
 		TicketNumber: "SAFE-CUSTOMER", Title: "safe list", Description: "description",
 		Priority: models.TicketPriorityHigh, Status: models.TicketStatusOpen,
 		Type: models.TicketTypeIncident, Source: models.TicketSourceWeb,
-		CreatedByID: customer.ID, AssignedToID: &customer.ID,
+		CreatedByID: &customer.ID, AssignedToID: &customer.ID,
 		DueDate: &yesterday, SLABreached: true, Version: 1,
 		InternalNotes: "INTERNAL-NOTES-MUST-NOT-LEAK",
-		Attachments:   datatypes.JSONSlice[string]{"LEGACY-ATTACHMENT-MUST-NOT-LEAK"},
 		AgentContext: datatypes.NewJSONType(models.AgentContext{
 			Goal: "AGENT-CONTEXT-MUST-NOT-LEAK",
 		}),
@@ -344,7 +349,8 @@ func TestCustomerSpecialListsUseSafeTicketDTO(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := db.Create(&models.TicketComment{
-		TicketID: ticket.ID, UserID: customer.ID, Content: "COMMENT-MUST-NOT-LEAK",
+		TicketID: ticket.ID, UserID: &customer.ID, ActorType: models.ActorTypeHuman,
+		ActorID: strconv.FormatUint(uint64(customer.ID), 10), Content: "COMMENT-MUST-NOT-LEAK",
 		Type: models.CommentTypeInternal,
 	}).Error; err != nil {
 		t.Fatal(err)
@@ -375,7 +381,6 @@ func TestCustomerSpecialListsUseSafeTicketDTO(t *testing.T) {
 			`"role":`,
 			`"last_login`,
 			"INTERNAL-NOTES-MUST-NOT-LEAK",
-			"LEGACY-ATTACHMENT-MUST-NOT-LEAK",
 			"AGENT-CONTEXT-MUST-NOT-LEAK",
 			"COMMENT-MUST-NOT-LEAK",
 			"private-user-email@example.com",
@@ -401,7 +406,7 @@ func TestCustomerHistoryUsesVisibleNarrowDTO(t *testing.T) {
 		TicketNumber: "HISTORY-SAFE", Title: "history", Description: "history",
 		Priority: models.TicketPriorityNormal, Status: models.TicketStatusOpen,
 		Type: models.TicketTypeRequest, Source: models.TicketSourceWeb,
-		CreatedByID: customer.ID, Version: 1,
+		CreatedByID: &customer.ID, Version: 1,
 	}
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
@@ -459,11 +464,10 @@ func TestCustomerHistoryUsesVisibleNarrowDTO(t *testing.T) {
 func TestAuthorizedAgentWorkflowVersionIsBoundToCAS(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	_, db, agent, otherAgent, ticket, _ := setupWorkflowHandlerTest(t)
-	base := services.NewTicketService(db)
-	versioned := base.(TicketVersionedService)
+	base := newHandlerTicketService(t, db)
 	racing := &authorizationRaceTicketService{
 		TicketServiceInterface: base,
-		versioned:              versioned,
+		versioned:              base,
 		before: func() {
 			if err := db.Model(&models.Ticket{}).
 				Where("id = ?", ticket.ID).
@@ -489,6 +493,7 @@ func TestAuthorizedAgentWorkflowVersionIsBoundToCAS(t *testing.T) {
 		bytes.NewBufferString(`{"status":"in_progress"}`),
 	)
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("If-Match", httpcontract.FormatETag(ticket.Version))
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusConflict {
@@ -507,11 +512,10 @@ func TestAuthorizedAgentWorkflowVersionIsBoundToCAS(t *testing.T) {
 func TestAuthorizedAgentUpdateVersionIsBoundToCAS(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	_, db, agent, otherAgent, ticket, _ := setupWorkflowHandlerTest(t)
-	base := services.NewTicketService(db)
-	versioned := base.(TicketVersionedService)
+	base := newHandlerTicketService(t, db)
 	racing := &authorizationRaceTicketService{
 		TicketServiceInterface: base,
-		versioned:              versioned,
+		versioned:              base,
 		before: func() {
 			if err := db.Model(&models.Ticket{}).
 				Where("id = ?", ticket.ID).
@@ -537,6 +541,7 @@ func TestAuthorizedAgentUpdateVersionIsBoundToCAS(t *testing.T) {
 		bytes.NewBufferString(`{"title":"stale overwrite"}`),
 	)
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("If-Match", httpcontract.FormatETag(ticket.Version))
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusConflict {

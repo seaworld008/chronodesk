@@ -2,14 +2,18 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/seaworld008/chronodesk/server/internal/httpcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
@@ -40,6 +44,69 @@ type customerCommentResponse struct {
 	ParentID    *uint              `json:"parent_id,omitempty"`
 	IsEdited    bool               `json:"is_edited"`
 	EditedAt    *time.Time         `json:"edited_at,omitempty"`
+}
+
+// customerAttachmentResponse exposes only metadata customers need to display
+// and download a public attachment. Storage identifiers, actor identities,
+// hashes, scan diagnostics and internal counters remain privileged.
+type customerAttachmentResponse struct {
+	ID           uint                   `json:"id"`
+	CreatedAt    time.Time              `json:"created_at"`
+	UpdatedAt    time.Time              `json:"updated_at"`
+	TicketID     uint                   `json:"ticket_id"`
+	CommentID    *uint                  `json:"comment_id,omitempty"`
+	OriginalName string                 `json:"original_name"`
+	FileSize     int64                  `json:"file_size"`
+	MimeType     string                 `json:"mime_type"`
+	FileType     models.AttachmentType  `json:"file_type"`
+	Extension    string                 `json:"extension"`
+	IsPublic     bool                   `json:"is_public"`
+	VirusScan    models.VirusScanStatus `json:"virus_scan"`
+	ScannedAt    *time.Time             `json:"scanned_at,omitempty"`
+	Description  string                 `json:"description,omitempty"`
+	Width        int                    `json:"width,omitempty"`
+	Height       int                    `json:"height,omitempty"`
+	PageCount    int                    `json:"page_count,omitempty"`
+}
+
+func customerAttachmentFromModel(attachment *models.TicketAttachment) *customerAttachmentResponse {
+	if attachment == nil {
+		return nil
+	}
+	return &customerAttachmentResponse{
+		ID:           attachment.ID,
+		CreatedAt:    attachment.CreatedAt,
+		UpdatedAt:    attachment.UpdatedAt,
+		TicketID:     attachment.TicketID,
+		CommentID:    attachment.CommentID,
+		OriginalName: attachment.OriginalName,
+		FileSize:     attachment.FileSize,
+		MimeType:     attachment.MimeType,
+		FileType:     attachment.FileType,
+		Extension:    attachment.Extension,
+		IsPublic:     attachment.IsPublic,
+		VirusScan:    attachment.VirusScan,
+		ScannedAt:    attachment.ScannedAt,
+		Description:  attachment.Description,
+		Width:        attachment.Width,
+		Height:       attachment.Height,
+		PageCount:    attachment.PageCount,
+	}
+}
+
+const (
+	maxHumanCommentContentRunes = 10000
+	maxHumanCommentRequestBytes = 64 << 10
+)
+
+type humanCommentCreateRequest struct {
+	Content      string             `json:"content"`
+	ContentType  string             `json:"content_type"`
+	Type         models.CommentType `json:"type"`
+	ParentID     *uint              `json:"parent_id"`
+	TimeSpent    *int               `json:"time_spent"`
+	BillableTime *int               `json:"billable_time"`
+	WorkType     string             `json:"work_type"`
 }
 
 func NewTicketContentHandler(
@@ -115,17 +182,15 @@ func (h *TicketContentHandler) CreateComment(c *gin.Context) {
 	if !ok {
 		return
 	}
-	var request struct {
-		Content      string             `json:"content" binding:"required,max=10000"`
-		ContentType  string             `json:"content_type"`
-		Type         models.CommentType `json:"type"`
-		ParentID     *uint              `json:"parent_id"`
-		TimeSpent    *int               `json:"time_spent"`
-		BillableTime *int               `json:"billable_time"`
-		WorkType     string             `json:"work_type"`
+	expectedVersion, ok := requireTicketIfMatch(c)
+	if !ok {
+		return
 	}
-	if err := c.ShouldBindJSON(&request); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "code": "invalid_request", "message": err.Error()})
+	request, ok := decodeHumanCommentRequest(c)
+	if !ok {
+		return
+	}
+	if !validateHumanCommentRequest(c, request) {
 		return
 	}
 	if request.Type == "" {
@@ -155,31 +220,131 @@ func (h *TicketContentHandler) CreateComment(c *gin.Context) {
 	}
 	userID := c.GetUint("user_id")
 	result, err := h.native.CreateComment(c.Request.Context(), services.NativeCommentInput{
-		TicketID:            ticket.ID,
-		ExpectedVersion:     ticket.Version,
-		Actor:               models.HumanActor(userID),
-		CompatibilityUserID: userID,
-		SourceProtocol:      "rest-human",
-		Content:             request.Content,
-		ContentType:         request.ContentType,
-		Type:                request.Type,
-		ParentID:            request.ParentID,
-		TimeSpent:           request.TimeSpent,
-		BillableTime:        request.BillableTime,
-		WorkType:            request.WorkType,
-		TraceID:             requestID(c),
-		CorrelationID:       c.GetHeader("X-Correlation-ID"),
+		TicketID:        ticket.ID,
+		ExpectedVersion: expectedVersion,
+		Actor:           models.HumanActor(userID),
+		SourceProtocol:  "rest-human",
+		Content:         request.Content,
+		ContentType:     request.ContentType,
+		Type:            request.Type,
+		ParentID:        request.ParentID,
+		TimeSpent:       request.TimeSpent,
+		BillableTime:    request.BillableTime,
+		WorkType:        request.WorkType,
+		TraceID:         requestID(c),
+		CorrelationID:   c.GetHeader("X-Correlation-ID"),
 	})
 	if err != nil {
-		h.writeError(c, err)
+		h.writeCommentError(c, err)
 		return
 	}
-	c.Header("ETag", fmt.Sprintf(`"v%d"`, result.Receipt.ResourceVersion))
+	c.Header("ETag", httpcontract.FormatETag(result.Receipt.ResourceVersion))
 	c.JSON(http.StatusCreated, gin.H{
 		"success": true,
 		"data":    result.Comment.ToResponse(),
 		"receipt": result.Receipt,
 	})
+}
+
+func decodeHumanCommentRequest(c *gin.Context) (*humanCommentCreateRequest, bool) {
+	c.Request.Body = http.MaxBytesReader(
+		c.Writer,
+		c.Request.Body,
+		maxHumanCommentRequestBytes,
+	)
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+
+	var request humanCommentCreateRequest
+	if err := decoder.Decode(&request); err != nil {
+		var tooLarge *http.MaxBytesError
+		switch {
+		case errors.Is(err, io.EOF):
+			writeHumanCommentRequestError(c, "invalid_request", "请求正文不能为空")
+		case errors.As(err, &tooLarge):
+			writeHumanCommentRequestError(c, "invalid_request", "请求正文超过大小限制")
+		default:
+			writeHumanCommentRequestError(c, "invalid_request", "请求正文必须是有效的 JSON 对象")
+		}
+		return nil, false
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeHumanCommentRequestError(c, "invalid_request", "请求正文只能包含一个 JSON 对象")
+		return nil, false
+	}
+	return &request, true
+}
+
+func validateHumanCommentRequest(c *gin.Context, request *humanCommentCreateRequest) bool {
+	request.Content = strings.TrimSpace(request.Content)
+	switch {
+	case request.Content == "":
+		writeHumanCommentRequestError(c, "validation_error", "评论内容不能为空")
+		return false
+	case utf8.RuneCountInString(request.Content) > maxHumanCommentContentRunes:
+		writeHumanCommentRequestError(c, "validation_error", "评论内容不能超过 10000 个字符")
+		return false
+	}
+
+	request.ContentType = strings.TrimSpace(request.ContentType)
+	if request.ContentType == "" {
+		request.ContentType = "text"
+	}
+	if request.ContentType != "text" && request.ContentType != "markdown" {
+		writeHumanCommentRequestError(c, "validation_error", "评论内容格式无效，仅支持纯文本或 Markdown")
+		return false
+	}
+
+	request.Type = models.CommentType(strings.TrimSpace(string(request.Type)))
+	if request.Type == "" {
+		request.Type = models.CommentTypePublic
+	}
+	if request.Type != models.CommentTypePublic &&
+		request.Type != models.CommentTypeInternal &&
+		request.Type != models.CommentTypeSystem {
+		writeHumanCommentRequestError(c, "validation_error", "评论类型无效，仅支持公开或内部评论")
+		return false
+	}
+	if request.ParentID != nil && *request.ParentID == 0 {
+		writeHumanCommentRequestError(c, "validation_error", "父评论 ID 必须大于 0")
+		return false
+	}
+	if request.TimeSpent != nil && *request.TimeSpent < 0 {
+		writeHumanCommentRequestError(c, "validation_error", "工时不能为负数")
+		return false
+	}
+	if request.BillableTime != nil && *request.BillableTime < 0 {
+		writeHumanCommentRequestError(c, "validation_error", "计费时间不能为负数")
+		return false
+	}
+	request.WorkType = strings.TrimSpace(request.WorkType)
+	return true
+}
+
+func writeHumanCommentRequestError(c *gin.Context, code, message string) {
+	c.JSON(http.StatusBadRequest, gin.H{
+		"success": false,
+		"code":    code,
+		"message": message,
+	})
+}
+
+func (h *TicketContentHandler) writeCommentError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, services.ErrInvalidComment):
+		writeHumanCommentRequestError(c, "validation_error", "评论请求不符合要求")
+	case errors.Is(err, services.ErrInvalidActor):
+		writeHumanCommentRequestError(c, "invalid_request", "当前用户身份无效")
+	case errors.Is(err, gorm.ErrRecordNotFound), errors.Is(err, services.ErrVersionConflict):
+		h.writeError(c, err)
+	default:
+		logHandlerFailure(c, "ticket_comment.create", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"code":    "internal_error",
+			"message": "评论提交失败，请稍后重试",
+		})
+	}
 }
 
 func (h *TicketContentHandler) ListAttachments(c *gin.Context) {
@@ -197,6 +362,14 @@ func (h *TicketContentHandler) ListAttachments(c *gin.Context) {
 		h.writeError(c, err)
 		return
 	}
+	if isCustomerRole(normalizedUserRole(c)) {
+		result := make([]*customerAttachmentResponse, 0, len(attachments))
+		for i := range attachments {
+			result = append(result, customerAttachmentFromModel(&attachments[i]))
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true, "data": result, "total": len(result)})
+		return
+	}
 	result := make([]*models.TicketAttachmentResponse, 0, len(attachments))
 	for i := range attachments {
 		result = append(result, attachments[i].ToResponse())
@@ -209,12 +382,26 @@ func (h *TicketContentHandler) StoreAttachment(c *gin.Context) {
 	if !ok {
 		return
 	}
+	expectedVersion, ok := requireTicketIfMatch(c)
+	if !ok {
+		return
+	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.maxAttachmentBytes+(1<<20))
 	if err := c.Request.ParseMultipartForm(h.maxAttachmentBytes); err != nil {
-		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) ||
+			errors.Is(err, multipart.ErrMessageTooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+				"success": false,
+				"code":    "attachment_rejected",
+				"message": "附件超过大小限制",
+			})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
-			"code":    "attachment_rejected",
-			"message": "附件请求无效或超过大小限制",
+			"code":    "invalid_request",
+			"message": "附件请求格式无效",
 		})
 		return
 	}
@@ -254,28 +441,31 @@ func (h *TicketContentHandler) StoreAttachment(c *gin.Context) {
 	}
 	userID := c.GetUint("user_id")
 	result, err := h.native.StoreAttachment(c.Request.Context(), services.NativeAttachmentInput{
-		TicketID:            ticket.ID,
-		CommentID:           commentID,
-		ExpectedVersion:     ticket.Version,
-		Actor:               models.HumanActor(userID),
-		CompatibilityUserID: userID,
-		SourceProtocol:      "rest-human",
-		OriginalName:        header.Filename,
-		ContentType:         header.Header.Get("Content-Type"),
-		Description:         c.PostForm("description"),
-		IsPublic:            isPublic,
-		Reader:              bytes.NewReader(content),
-		TraceID:             requestID(c),
-		CorrelationID:       c.GetHeader("X-Correlation-ID"),
+		TicketID:        ticket.ID,
+		CommentID:       commentID,
+		ExpectedVersion: expectedVersion,
+		Actor:           models.HumanActor(userID),
+		SourceProtocol:  "rest-human",
+		OriginalName:    header.Filename,
+		ContentType:     header.Header.Get("Content-Type"),
+		Description:     c.PostForm("description"),
+		IsPublic:        isPublic,
+		Reader:          bytes.NewReader(content),
+		TraceID:         requestID(c),
+		CorrelationID:   c.GetHeader("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeError(c, err)
 		return
 	}
-	c.Header("ETag", fmt.Sprintf(`"v%d"`, result.Receipt.ResourceVersion))
+	c.Header("ETag", httpcontract.FormatETag(result.Receipt.ResourceVersion))
+	responseData := any(result.Attachment.ToResponse())
+	if isCustomerRole(normalizedUserRole(c)) {
+		responseData = customerAttachmentFromModel(result.Attachment)
+	}
 	c.JSON(http.StatusCreated, gin.H{
 		"success": true,
-		"data":    result.Attachment.ToResponse(),
+		"data":    responseData,
 		"receipt": result.Receipt,
 	})
 }
@@ -361,18 +551,23 @@ func (h *TicketContentHandler) authorizedTicket(
 
 func (h *TicketContentHandler) writeError(c *gin.Context, err error) {
 	switch {
-	case errors.Is(err, gorm.ErrRecordNotFound):
+	case errors.Is(err, gorm.ErrRecordNotFound), err.Error() == "ticket not found":
 		c.JSON(http.StatusNotFound, gin.H{"success": false, "code": "not_found", "message": "资源不存在"})
 	case errors.Is(err, services.ErrVersionConflict):
-		c.JSON(http.StatusConflict, gin.H{"success": false, "code": "version_conflict", "message": "工单已被其他操作更新，请刷新后重试"})
+		writeTicketVersionConflict(c)
 	case errors.Is(err, services.ErrAttachmentTooLarge):
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"success": false, "code": "attachment_rejected", "message": "附件超过大小限制"})
 	case errors.Is(err, services.ErrAttachmentNotClean):
 		c.JSON(http.StatusConflict, gin.H{"success": false, "code": "attachment_not_clean", "message": "附件尚未通过安全扫描"})
 	case errors.Is(err, services.ErrInvalidAttachmentName):
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "code": "attachment_rejected", "message": "附件名称无效"})
+	case errors.Is(err, services.ErrInvalidAttachment):
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "code": "attachment_rejected", "message": "附件内容不能为空"})
+	case err.Error() == "attachment comment not found":
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "code": "invalid_request", "message": "关联评论不存在或不属于当前工单"})
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "code": "invalid_request", "message": err.Error()})
+		logHandlerFailure(c, "ticket_content.operation", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "code": "internal_error", "message": "操作失败，请稍后重试"})
 	}
 }
 

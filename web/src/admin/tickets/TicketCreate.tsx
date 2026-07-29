@@ -28,7 +28,6 @@ import { minCharacters, maxCharacters } from '@/lib/validators';
 import {
     normalizeTagsForSubmit,
     formatTagsInputValue,
-    normalizeStringArrayForSubmit,
     normalizeCustomFieldsForSubmit,
 } from './tagUtils';
 import BackButton from '../common/BackButton';
@@ -97,7 +96,6 @@ type TicketCreateFormValues = CreateTicketRequest & {
     is_private?: boolean;
     estimated_hours?: number;
     tags?: unknown;
-    attachments?: unknown;
     custom_fields?: unknown;
     [key: string]: unknown;
 };
@@ -110,13 +108,6 @@ const transformTicketCreate = (data: TicketCreateFormValues): Record<string, unk
         payload.tags = normalizedTags;
     } else {
         delete payload.tags;
-    }
-
-    const normalizedAttachments = normalizeStringArrayForSubmit(data.attachments);
-    if (typeof normalizedAttachments !== 'undefined') {
-        payload.attachments = normalizedAttachments;
-    } else {
-        delete payload.attachments;
     }
 
     const normalizedCustomFields = normalizeCustomFieldsForSubmit(data.custom_fields);

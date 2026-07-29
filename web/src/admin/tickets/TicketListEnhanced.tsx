@@ -13,7 +13,6 @@ import {
     ExportButton,
     SelectField,
     TopToolbar,
-    BulkDeleteWithConfirmButton,
     WrapperField,
     SelectColumnsButton,
     useRecordContext,
@@ -43,6 +42,7 @@ import {
     type TicketRolePermissions,
 } from './ticketAccess';
 import {
+    InlineDetails,
     PersistentResizableDatagridHeader,
     TruncatedText,
     type ResizableColumn,
@@ -53,6 +53,7 @@ import {
     EnterpriseSelectFilterInput,
     EnterpriseTextFilterInput,
 } from '@/components/inputs/EnterpriseFilterInputs';
+import { FocusSafeBulkDeleteWithConfirmButton } from '@/components/actions/FocusSafeDeleteButtons';
 
 // 过滤器选项
 const statusChoices = [
@@ -256,17 +257,13 @@ const TicketTitleField: React.FC = () => {
     const record = useRecordContext<Ticket>();
     if (!record) return null;
 
+    const number = `#${record.ticket_number}`;
     return (
-        <Box sx={{ minWidth: 0 }}>
-            <Typography variant="caption" color="primary" sx={{
-                fontWeight: 600
-            }}>
-                #{record.ticket_number}
-            </Typography>
-            <TruncatedText title={record.title}>
-                {record.title}
-            </TruncatedText>
-        </Box>
+        <InlineDetails
+            primary={number}
+            secondary={record.title}
+            title={`${number} · ${record.title}`}
+        />
     );
 };
 
@@ -373,24 +370,39 @@ const QuickActionsField: React.FC = () => {
             {canMutate && (
                 <>
                     <Tooltip title="在详情页分配工单">
-                        <IconButton size="small" onClick={openWorkflow} color="primary">
+                        <IconButton
+                            size="small"
+                            aria-label="在详情页分配工单"
+                            onClick={openWorkflow}
+                            color="primary"
+                        >
                             <PersonAdd fontSize="small" />
                         </IconButton>
                     </Tooltip>
                     <Tooltip title="在详情页升级工单">
-                        <IconButton size="small" onClick={openWorkflow} color="warning">
+                        <IconButton
+                            size="small"
+                            aria-label="在详情页升级工单"
+                            onClick={openWorkflow}
+                            color="warning"
+                        >
                             <ArrowUpward fontSize="small" />
                         </IconButton>
                     </Tooltip>
                     <Tooltip title="在详情页变更状态">
-                        <IconButton size="small" onClick={openWorkflow} color="success">
+                        <IconButton
+                            size="small"
+                            aria-label="在详情页变更状态"
+                            onClick={openWorkflow}
+                            color="success"
+                        >
                             <SwapHoriz fontSize="small" />
                         </IconButton>
                     </Tooltip>
                 </>
             )}
-            <ShowButton label="" />
-            {canMutate && <EditButton label="" />}
+            <ShowButton label="查看" />
+            {canMutate && <EditButton label="编辑" />}
         </Box>
     );
 };
@@ -427,7 +439,7 @@ const TicketListActions = () => (
 const TicketBulkActionButtons = () => (
     <>
         <TicketBulkUpdateButton />
-        <BulkDeleteWithConfirmButton label="批量删除" mutationMode="pessimistic" />
+        <FocusSafeBulkDeleteWithConfirmButton label="批量删除" mutationMode="pessimistic" />
     </>
 );
 
@@ -467,6 +479,7 @@ const TicketListEnhanced: React.FC = () => {
             title="工单管理"
         >
             <DatagridConfigurable
+                aria-label="工单列表"
                 bulkActionButtons={canBulkManage ? <TicketBulkActionButtons /> : false}
                 rowClick="show"
                 header={TicketDatagridHeader}

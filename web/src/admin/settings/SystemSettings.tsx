@@ -20,11 +20,11 @@ import {
 } from '@mui/material'
 import { Save as SaveIcon, Refresh as RefreshIcon } from '@mui/icons-material'
 import { useNotify } from 'react-admin'
-import { apiFetch } from '@/lib/apiClient'
+import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
 import BackButton from '../common/BackButton'
 import {
+  InlineDetails,
   ResizableMuiTable,
-  TruncatedText,
   type ResizableColumn,
 } from '@/components/tables/EnterpriseTable'
 
@@ -108,10 +108,7 @@ const SystemSettings: React.FC = () => {
   const [bulkSaving, setBulkSaving] = useState(false)
 
   const extractErrorMessage = useCallback((error: unknown, fallback: string) => {
-    if (error instanceof Error) {
-      return error.message
-    }
-    return fallback
+    return localizedUnknownErrorMessage(error, fallback)
   }, [])
 
   const loadConfigs = useCallback(async (category: string, silent = false) => {
@@ -210,12 +207,14 @@ const SystemSettings: React.FC = () => {
   const handleRefresh = () => loadConfigs(activeTab)
 
   const renderValueCell = (config: EditableConfig, index: number) => {
+    const accessibleName = `配置“${config.key}”的值`
     switch (config.value_type) {
       case 'bool':
         return (
           <Switch
             checked={config.boolValue ?? false}
             onChange={(e) => handleValueChange(index, e.target.checked)}
+            slotProps={{ input: { 'aria-label': accessibleName } }}
           />
         )
       case 'int':
@@ -226,18 +225,18 @@ const SystemSettings: React.FC = () => {
             value={config.intValue ?? ''}
             onChange={(e) => handleValueChange(index, e.target.value)}
             sx={{ width: 160 }}
+            slotProps={{ htmlInput: { 'aria-label': accessibleName } }}
           />
         )
       case 'json':
         return (
           <TextField
             size="small"
-            multiline
-            minRows={2}
             value={config.jsonValue ?? ''}
             onChange={(e) => handleValueChange(index, e.target.value)}
             sx={{ width: 320 }}
-            helperText="请输入合法 JSON"
+            placeholder="请输入合法 JSON"
+            slotProps={{ htmlInput: { 'aria-label': accessibleName } }}
           />
         )
       default:
@@ -247,6 +246,7 @@ const SystemSettings: React.FC = () => {
             value={config.value}
             onChange={(e) => handleValueChange(index, e.target.value)}
             sx={{ width: 240 }}
+            slotProps={{ htmlInput: { 'aria-label': accessibleName } }}
           />
         )
     }
@@ -312,7 +312,12 @@ const SystemSettings: React.FC = () => {
       )}
       {!loading && currentConfigs.length > 0 && (
         <TableContainer component={Paper}>
-          <ResizableMuiTable tableId="settings.system-config" columns={systemConfigColumns} size="small">
+          <ResizableMuiTable
+            tableId="settings.system-config"
+            columns={systemConfigColumns}
+            size="small"
+            aria-label="系统配置列表"
+          >
             <TableHead>
               <TableRow>
                 <TableCell>配置项</TableCell>
@@ -326,18 +331,19 @@ const SystemSettings: React.FC = () => {
               {currentConfigs.map((config, index) => (
                 <TableRow key={config.key} hover selected={config.dirty}>
                   <TableCell>
-                    <TruncatedText title={config.key} fontWeight={600}>{config.key}</TruncatedText>
-                    <TruncatedText title={`分组：${config.group || '默认'}`} color="text.secondary">
-                      分组：{config.group || '默认'}
-                    </TruncatedText>
+                    <InlineDetails
+                      primary={config.key}
+                      secondary={`分组：${config.group || '默认'}`}
+                      title={`${config.key} · 分组：${config.group || '默认'}`}
+                    />
                   </TableCell>
                   <TableCell>
-                    <TruncatedText title={config.description || '—'}>{config.description || '—'}</TruncatedText>
-                    {config.default_value && (
-                      <TruncatedText title={`默认值：${config.default_value}`} color="text.secondary">
-                        默认值：{config.default_value}
-                      </TruncatedText>
-                    )}
+                    <InlineDetails
+                      primary={config.description || '—'}
+                      secondary={config.default_value ? `默认值：${config.default_value}` : undefined}
+                      title={`${config.description || '—'}${config.default_value ? ` · 默认值：${config.default_value}` : ''}`}
+                      primaryFontWeight={400}
+                    />
                   </TableCell>
                   <TableCell>{renderValueCell(config, index)}</TableCell>
                   <TableCell>
@@ -350,6 +356,7 @@ const SystemSettings: React.FC = () => {
                       <span>
                         <Button
                           size="small"
+                          aria-label={`保存配置：${config.key}`}
                           startIcon={<SaveIcon fontSize="inherit" />}
                           onClick={() => handleSave(config)}
                           disabled={!config.dirty || savingKey === config.key}

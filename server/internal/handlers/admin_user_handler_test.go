@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
@@ -74,5 +75,72 @@ func TestAdminUserUpdateAllowsClearingPhoneAndEmailVerification(t *testing.T) {
 	router.ServeHTTP(invalidResponse, invalidRequest)
 	if invalidResponse.Code != http.StatusBadRequest {
 		t.Fatalf("invalid phone status = %d, want %d", invalidResponse.Code, http.StatusBadRequest)
+	}
+
+	for _, historicalRole := range []string{"user", "superuser"} {
+		roleRequest := httptest.NewRequest(
+			http.MethodPut,
+			fmt.Sprintf("/users/%d", user.ID),
+			bytes.NewBufferString(fmt.Sprintf(`{"role":%q}`, historicalRole)),
+		)
+		roleRequest.Header.Set("Content-Type", "application/json")
+		roleResponse := httptest.NewRecorder()
+		router.ServeHTTP(roleResponse, roleRequest)
+		if roleResponse.Code != http.StatusBadRequest {
+			t.Errorf(
+				"historical role %q status = %d, want %d; body=%s",
+				historicalRole,
+				roleResponse.Code,
+				http.StatusBadRequest,
+				roleResponse.Body.String(),
+			)
+		}
+	}
+}
+
+func TestAdminUserCreateMapsRetainedIdentityConflictToChinese409(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(&models.User{}); err != nil {
+		t.Fatalf("migrate users: %v", err)
+	}
+	deleted := models.User{
+		Username:     "retained-handler-user",
+		Email:        "retained-handler-user@example.com",
+		PasswordHash: "hashed",
+		Role:         models.RoleAgent,
+		Status:       models.UserStatusDeleted,
+	}
+	if err := db.Create(&deleted).Error; err != nil {
+		t.Fatalf("create retained user: %v", err)
+	}
+	if err := db.Delete(&deleted).Error; err != nil {
+		t.Fatalf("soft delete retained user: %v", err)
+	}
+
+	handler := NewAdminUserHandler(services.NewAdminUserService(db))
+	router := gin.New()
+	router.POST("/users", handler.CreateUser)
+
+	body, _ := json.Marshal(map[string]any{
+		"username": "new-handler-user",
+		"email":    deleted.Email,
+		"password": "StrongPassword123!",
+		"role":     "agent",
+	})
+	request := httptest.NewRequest(http.MethodPost, "/users", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", response.Code, response.Body.String())
+	}
+	bodyText := response.Body.String()
+	if !strings.Contains(bodyText, "用户名或邮箱已被使用") {
+		t.Fatalf("response is not the stable Chinese conflict: %s", bodyText)
+	}
+	if strings.Contains(bodyText, "SQLSTATE") || strings.Contains(bodyText, "unique constraint") {
+		t.Fatalf("response leaked database details: %s", bodyText)
 	}
 }

@@ -1,10 +1,8 @@
-export const userRoles = [
+const userRoles = [
     'admin',
-    'superuser',
     'supervisor',
     'agent',
     'customer',
-    'user',
 ] as const
 
 export type UserRole = (typeof userRoles)[number]
@@ -16,10 +14,8 @@ export type RolePermissions = {
 const knownRoles = new Set<string>(userRoles)
 const administrativeRoles = new Set<UserRole>([
     'admin',
-    'superuser',
     'supervisor',
 ])
-const customerRoles = new Set<UserRole>(['customer', 'user'])
 
 export const normalizeUserRole = (role: unknown): UserRole | null => {
     const normalized = typeof role === 'string' ? role.trim().toLowerCase() : ''
@@ -34,17 +30,14 @@ export const isAdministrativeRole = (role: unknown) => {
 export const isAgentRole = (role: unknown) => normalizeUserRole(role) === 'agent'
 
 export const isCustomerRole = (role: unknown) => {
-    const normalized = normalizeUserRole(role)
-    return normalized !== null && customerRoles.has(normalized)
+    return normalizeUserRole(role) === 'customer'
 }
 
 const userRoleLabels: Record<UserRole, string> = {
     admin: '管理员',
-    superuser: '超级管理员',
     supervisor: '主管',
     agent: '客服代理',
     customer: '客户',
-    user: '普通用户（兼容角色）',
 }
 
 export const getUserRoleLabel = (role: unknown) => {

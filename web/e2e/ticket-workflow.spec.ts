@@ -5,25 +5,27 @@ import {
     createNotification,
     deleteNotification,
     ensureRoleAccounts,
-    E2E_PREFIX,
+    E2E_MARKER,
+    extractData,
+    trackE2EResource,
+    untrackE2EResource,
+    type TemporaryRoleAccounts,
 } from './helpers/testData';
+import { assertDestructiveE2EAllowed } from './helpers/safety';
 
 const TEST_USER = {
     email: 'admin@example.com',
     password: 'Admin123!',
 };
 
-const CUSTOMER_USER = {
-    email: 'customer@example.com',
-    password: 'Admin123!',
-};
-
 test.describe('Ticket Workflow', () => {
     test.describe.configure({ mode: 'serial' });
     let customerNotificationId: number | null = null;
+    let roleAccounts: TemporaryRoleAccounts;
 
     test.beforeAll(async ({ request }) => {
-        await ensureRoleAccounts(request);
+        assertDestructiveE2EAllowed('工单生命周期与临时角色 E2E');
+        roleAccounts = await ensureRoleAccounts(request);
     });
 
     test.afterAll(async ({ request }) => {
@@ -33,14 +35,14 @@ test.describe('Ticket Workflow', () => {
         await cleanupE2EData(request, {
             automationRules: false,
             notifications: false,
-            users: false,
+            users: true,
             emailConfig: false,
         });
     });
 
     test('should create assign resolve close and delete ticket', async ({ page }) => {
-        const title = `${E2E_PREFIX}工单-${Date.now()}`;
-        const description = `${E2E_PREFIX}工单描述-用于E2E验证完整流程`;
+        const title = `${E2E_MARKER}生命周期工单`;
+        const description = `${E2E_MARKER}工单描述-用于E2E验证完整流程`;
         const openTicketFromList = async () => {
             await page.goto('/#/tickets');
             const searchInput = page.getByPlaceholder('搜索工单');
@@ -67,13 +69,29 @@ test.describe('Ticket Workflow', () => {
         await page.getByLabel('工单标题').fill(title);
         await page.getByLabel('详细描述').fill(description);
 
-        const assigneeInput = page.locator('input[name="assigned_to_id"]');
+        const assigneeInput = page.getByRole('combobox', {
+            name: /^分配给/u,
+        });
         await assigneeInput.scrollIntoViewIfNeeded();
         await assigneeInput.click();
-        await assigneeInput.fill('agent');
-        await page.getByRole('option', { name: 'agent (Support Agent)' }).click();
+        await assigneeInput.fill(roleAccounts.agent.username);
+        await page
+            .getByRole('option', { name: roleAccounts.agent.optionLabel })
+            .click();
 
+        const create = page.waitForResponse(
+            (response) =>
+                response.request().method() === 'POST' &&
+                new URL(response.url()).pathname === '/api/tickets',
+        );
         await page.getByRole('button', { name: '创建工单' }).click();
+        const createResponse = await create;
+        expect(createResponse.status()).toBe(201);
+        const createdTicket = extractData<Record<string, unknown>>(
+            await createResponse.json(),
+        );
+        expect(typeof createdTicket.id).toBe('number');
+        trackE2EResource('tickets', createdTicket.id as number);
         await page.waitForURL(/#\/tickets\/\d+\/show/, { timeout: 15000 });
 
         await page.getByRole('link', { name: '编辑' }).click();
@@ -101,11 +119,19 @@ test.describe('Ticket Workflow', () => {
         const deleteResponse = page.waitForResponse((response) => {
             const pathname = new URL(response.url()).pathname;
             return response.request().method() === 'DELETE'
-                && /^\/api\/tickets\/\d+$/.test(pathname)
-                && response.ok();
+                && /^\/api\/tickets\/\d+$/.test(pathname);
         });
         await confirmDialog.getByRole('button', { name: '确认', exact: true }).click();
-        await deleteResponse;
+        const deleted = await deleteResponse;
+        expect(
+            deleted.request().headers()['if-match'],
+            '工单删除必须携带强 ETag 版本前置条件',
+        ).toMatch(/^"v[1-9]\d*"$/);
+        expect(
+            deleted.status(),
+            `工单删除失败：${await deleted.text()}`,
+        ).toBe(200);
+        untrackE2EResource('tickets', createdTicket.id as number);
 
         await expect(page).toHaveURL(/#\/tickets(?:\?.*)?$/, { timeout: 15000 });
         await expect(page.getByPlaceholder('搜索工单')).toBeVisible();
@@ -119,14 +145,14 @@ test.describe('Ticket Workflow', () => {
             }
         });
 
-        const notificationTitle = `${E2E_PREFIX}客户通知-${Date.now()}`;
+        const notificationTitle = `${E2E_MARKER}客户通知`;
         customerNotificationId = await createNotification(request, {
             title: notificationTitle,
             content: '用于验证客户通知筛选不会读取用户管理接口',
-            recipientEmail: CUSTOMER_USER.email,
+            recipientEmail: roleAccounts.customer.email,
         });
 
-        await authenticatePage(page, CUSTOMER_USER);
+        await authenticatePage(page, roleAccounts.customer);
         await page.goto('/#/notifications');
         await expect(page.getByText(notificationTitle)).toBeVisible();
         await expect(page.getByPlaceholder('搜索通知')).toBeVisible();
@@ -147,7 +173,7 @@ test.describe('Ticket Workflow', () => {
             }
         });
 
-        await authenticatePage(page, CUSTOMER_USER);
+        await authenticatePage(page, roleAccounts.customer);
 
         await expect(
             page.getByRole('menuitem', { name: 'AI 智能体控制' }),

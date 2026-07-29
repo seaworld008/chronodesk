@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -157,12 +158,36 @@ type Message struct {
 	RequestDigest   string         `json:"-"`
 }
 
+const (
+	maxA2AMessageIDLength = 255
+	maxA2AContextIDLength = 255
+	maxA2ATaskIDLength    = 64
+)
+
 func (m *Message) ValidateInbound() error {
 	if m == nil {
 		return errors.New("message is required")
 	}
 	if strings.TrimSpace(m.MessageID) == "" {
 		return errors.New("message.messageId is required")
+	}
+	if utf8.RuneCountInString(m.MessageID) > maxA2AMessageIDLength {
+		return fmt.Errorf(
+			"message.messageId must not exceed %d characters",
+			maxA2AMessageIDLength,
+		)
+	}
+	if utf8.RuneCountInString(m.ContextID) > maxA2AContextIDLength {
+		return fmt.Errorf(
+			"message.contextId must not exceed %d characters",
+			maxA2AContextIDLength,
+		)
+	}
+	if utf8.RuneCountInString(m.TaskID) > maxA2ATaskIDLength {
+		return fmt.Errorf(
+			"message.taskId must not exceed %d characters",
+			maxA2ATaskIDLength,
+		)
 	}
 	m.Role = normalizeRole(m.Role)
 	if m.Role != RoleUser {

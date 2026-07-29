@@ -78,15 +78,3 @@ func NotificationAllMarkedAsReadHook(ctx context.Context, userID uint) {
 	// Push unread count as 0
 	GlobalNotificationService.PushUnreadCount(ctx, userID, 0)
 }
-
-// TicketUpdatedHook is called when a ticket is updated
-func TicketUpdatedHook(ctx context.Context, ticket *models.Ticket, updateType string) {
-	if GlobalNotificationService == nil {
-		return
-	}
-
-	err := GlobalNotificationService.PushTicketUpdate(ctx, ticket, updateType)
-	if err != nil {
-		log.Printf("Failed to push ticket update via WebSocket: %v", err)
-	}
-}

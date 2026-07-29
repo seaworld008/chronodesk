@@ -18,7 +18,7 @@ import {
   Typography,
 } from '@mui/material'
 import { useNotify } from 'react-admin'
-import { apiFetch } from '@/lib/apiClient'
+import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
 import BackButton from '../common/BackButton'
 
 interface EmailConfigResponse {
@@ -68,10 +68,7 @@ const EmailSettings: React.FC = () => {
   const shouldSkipSMTPTest = import.meta.env.DEV || import.meta.env.VITE_DEV_MODE === 'true'
 
   const extractErrorMessage = useCallback((error: unknown, fallback: string) => {
-    if (error instanceof Error) {
-      return error.message
-    }
-    return fallback
+    return localizedUnknownErrorMessage(error, fallback)
   }, [])
 
   const loadConfig = useCallback(async () => {

@@ -44,14 +44,21 @@ export const CustomLayout: React.FC<LayoutProps> = (props) => (
             zIndex: theme.zIndex.drawer,
             width: 'inherit',
             maxWidth: 'inherit',
+            maxHeight: `calc(100dvh - ${minHeightValue}px)`,
             boxSizing: 'border-box',
             overflowX: 'hidden',
             overflowY: 'auto',
+            overscrollBehavior: 'contain',
+            scrollbarGutter: 'stable',
             backgroundColor: theme.palette.background.paper,
           },
-          '.RaSidebar-paper': {
+          '.RaSidebar-paper, .RaSidebar-root .MuiDrawer-paper': {
             zIndex: theme.zIndex.drawer,
-            overflow: 'visible',
+            maxHeight: '100dvh',
+            overflowX: 'hidden',
+            overflowY: 'auto',
+            overscrollBehavior: 'contain',
+            scrollbarGutter: 'stable',
           },
           '.RaLayout-content': {
             position: 'relative',

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
+	"github.com/seaworld008/chronodesk/server/internal/httpcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
@@ -40,20 +41,39 @@ const (
 )
 
 type RuntimeControl struct {
-	native    *services.AgentNativeService
-	db        *gorm.DB
-	readOnly  atomic.Bool
-	emergency atomic.Bool
+	native           *services.AgentNativeService
+	db               *gorm.DB
+	fallbackReadOnly bool
+	readOnly         atomic.Bool
+	emergency        atomic.Bool
+	healthy          atomic.Bool
 }
 
-func NewRuntimeControl(native *services.AgentNativeService, readOnly bool, databases ...*gorm.DB) *RuntimeControl {
-	control := &RuntimeControl{native: native}
-	if len(databases) > 0 {
-		control.db = databases[0]
+func NewRuntimeControl(
+	ctx context.Context,
+	native *services.AgentNativeService,
+	db *gorm.DB,
+	readOnly bool,
+) (*RuntimeControl, error) {
+	if ctx == nil {
+		return nil, errors.New("runtime control context is required")
+	}
+	if native == nil {
+		return nil, errors.New("runtime control Agent-native service is required")
+	}
+	if db == nil {
+		return nil, errors.New("runtime control database is required")
+	}
+	control := &RuntimeControl{
+		native:           native,
+		db:               db,
+		fallbackReadOnly: readOnly,
 	}
 	control.SetReadOnly(readOnly)
-	_ = control.Refresh(context.Background())
-	return control
+	if err := control.Refresh(ctx); err != nil {
+		return nil, fmt.Errorf("load persisted Agent safety controls: %w", err)
+	}
+	return control, nil
 }
 
 func (c *RuntimeControl) SetReadOnly(enabled bool) {
@@ -78,20 +98,8 @@ func (c *RuntimeControl) EmergencyStop() bool {
 	return c != nil && c.emergency.Load()
 }
 
-func (c *RuntimeControl) PersistReadOnly(ctx context.Context, enabled bool, updatedBy uint) error {
-	if err := c.persistOnDB(ctx, c.db, agentReadOnlyConfigKey, enabled, updatedBy); err != nil {
-		return err
-	}
-	c.SetReadOnly(enabled)
-	return nil
-}
-
-func (c *RuntimeControl) PersistEmergencyStop(ctx context.Context, enabled bool, updatedBy uint) error {
-	if err := c.persistOnDB(ctx, c.db, agentEmergencyConfigKey, enabled, updatedBy); err != nil {
-		return err
-	}
-	c.SetEmergencyStop(enabled)
-	return nil
+func (c *RuntimeControl) Healthy() bool {
+	return c != nil && c.healthy.Load()
 }
 
 func (c *RuntimeControl) persistTx(
@@ -143,23 +151,32 @@ func (c *RuntimeControl) persistOnDB(
 
 func (c *RuntimeControl) Refresh(ctx context.Context) error {
 	if c == nil || c.db == nil {
-		return nil
+		return errors.New("runtime control persistence is unavailable")
 	}
 	var rows []models.SystemConfig
 	if err := c.db.WithContext(ctx).
 		Where("key IN ? AND is_active = ?", []string{agentReadOnlyConfigKey, agentEmergencyConfigKey}, true).
 		Find(&rows).Error; err != nil {
+		// Persistence is authoritative for the emergency switch. A stale open
+		// value is unsafe, so any refresh failure immediately stops Agent writes.
+		c.healthy.Store(false)
+		c.SetEmergencyStop(true)
 		return err
 	}
+	nextReadOnly := c.fallbackReadOnly
+	nextEmergency := false
 	for i := range rows {
 		enabled := rows[i].GetBoolValue()
 		switch rows[i].Key {
 		case agentReadOnlyConfigKey:
-			c.SetReadOnly(enabled)
+			nextReadOnly = enabled
 		case agentEmergencyConfigKey:
-			c.SetEmergencyStop(enabled)
+			nextEmergency = enabled
 		}
 	}
+	c.SetReadOnly(nextReadOnly)
+	c.SetEmergencyStop(nextEmergency)
+	c.healthy.Store(true)
 	return nil
 }
 
@@ -233,12 +250,11 @@ func (s *CredentialStore) ValidateAccessContext(
 }
 
 type AdminHandler struct {
-	db                  *gorm.DB
-	native              *services.AgentNativeService
-	control             *RuntimeControl
-	credentialTTL       time.Duration
-	compatibilityUserID uint
-	replayCipher        cipher.AEAD
+	db            *gorm.DB
+	native        *services.AgentNativeService
+	control       *RuntimeControl
+	credentialTTL time.Duration
+	replayCipher  cipher.AEAD
 }
 
 func NewAdminHandler(
@@ -246,18 +262,16 @@ func NewAdminHandler(
 	native *services.AgentNativeService,
 	control *RuntimeControl,
 	credentialTTL time.Duration,
-	compatibilityUserID uint,
 	replayEncryptionKey ...[]byte,
 ) *AdminHandler {
 	if credentialTTL <= 0 {
 		credentialTTL = 90 * 24 * time.Hour
 	}
 	handler := &AdminHandler{
-		db:                  db,
-		native:              native,
-		control:             control,
-		credentialTTL:       credentialTTL,
-		compatibilityUserID: compatibilityUserID,
+		db:            db,
+		native:        native,
+		control:       control,
+		credentialTTL: credentialTTL,
 	}
 	if len(replayEncryptionKey) > 0 && len(replayEncryptionKey[0]) > 0 {
 		handler.replayCipher = newAdminReplayCipher(replayEncryptionKey[0])
@@ -308,7 +322,7 @@ func (h *AdminHandler) requireAdminCommandHeaders(c *gin.Context) {
 			c.Abort()
 			return
 		}
-		if _, err := ParseIfMatch(rawIfMatch); err != nil {
+		if _, err := httpcontract.ParseIfMatch(rawIfMatch); err != nil {
 			WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
 			c.Abort()
 			return
@@ -518,7 +532,7 @@ func (h *AdminHandler) Overview(c *gin.Context) {
 			"status":           delivery.Status,
 			"attempts":         delivery.Attempts,
 			"next_attempt_at":  delivery.NextAttemptAt,
-			"last_error":       delivery.LastError,
+			"last_error":       services.ScrubOutboxFailureText(delivery.LastError),
 			"updated_at":       delivery.UpdatedAt,
 			"resource_version": resourceVersions["outbox/"+delivery.ID],
 		})
@@ -577,13 +591,12 @@ func (h *AdminHandler) Overview(c *gin.Context) {
 
 func (h *AdminHandler) CreateServicePrincipal(c *gin.Context) {
 	var request struct {
-		Name                string     `json:"name" binding:"required,min=3,max=100"`
-		Description         string     `json:"description" binding:"max=500"`
-		Scopes              []string   `json:"scopes" binding:"required,min=1,unique"`
-		RateLimit           int        `json:"rate_limit" binding:"omitempty,min=1,max=10000"`
-		ConcurrencyLimit    int        `json:"concurrency_limit" binding:"omitempty,min=1,max=100"`
-		ExpiresAt           *time.Time `json:"expires_at"`
-		CompatibilityUserID *uint      `json:"compatibility_user_id"`
+		Name             string     `json:"name" binding:"required,min=3,max=100"`
+		Description      string     `json:"description" binding:"max=500"`
+		Scopes           []string   `json:"scopes" binding:"required,min=1,unique"`
+		RateLimit        int        `json:"rate_limit" binding:"omitempty,min=1,max=10000"`
+		ConcurrencyLimit int        `json:"concurrency_limit" binding:"omitempty,min=1,max=100"`
+		ExpiresAt        *time.Time `json:"expires_at"`
 	}
 	if err := bindAdminJSON(c, &request); err != nil {
 		WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
@@ -591,11 +604,6 @@ func (h *AdminHandler) CreateServicePrincipal(c *gin.Context) {
 	}
 
 	userID := c.GetUint("user_id")
-	compatibilityUserID := request.CompatibilityUserID
-	if compatibilityUserID == nil && h.compatibilityUserID > 0 {
-		value := h.compatibilityUserID
-		compatibilityUserID = &value
-	}
 	h.executeAdminMutation(
 		c,
 		adminMutationOptions{
@@ -605,14 +613,13 @@ func (h *AdminHandler) CreateServicePrincipal(c *gin.Context) {
 		},
 		func(txCtx context.Context, _ *gorm.DB) (adminMutationResult, error) {
 			principal, err := h.native.CreateServicePrincipal(txCtx, services.CreateServicePrincipalInput{
-				Name:                request.Name,
-				Description:         request.Description,
-				Scopes:              request.Scopes,
-				RateLimitPerMinute:  request.RateLimit,
-				ConcurrentLimit:     request.ConcurrencyLimit,
-				ExpiresAt:           request.ExpiresAt,
-				CompatibilityUserID: compatibilityUserID,
-				CreatedByID:         &userID,
+				Name:               request.Name,
+				Description:        request.Description,
+				Scopes:             request.Scopes,
+				RateLimitPerMinute: request.RateLimit,
+				ConcurrentLimit:    request.ConcurrencyLimit,
+				ExpiresAt:          request.ExpiresAt,
+				CreatedByID:        &userID,
 			})
 			if err != nil {
 				return adminMutationResult{}, err
@@ -1259,7 +1266,7 @@ func (h *AdminHandler) executeAdminMutation(
 			return
 		}
 		var err error
-		expectedVersion, err = ParseIfMatch(rawIfMatch)
+		expectedVersion, err = httpcontract.ParseIfMatch(rawIfMatch)
 		if err != nil {
 			WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
 			return
@@ -1346,7 +1353,7 @@ func (h *AdminHandler) executeAdminMutation(
 					return err
 				}
 				if options.PreconditionSubject != "" {
-					parentETag = FormatETag(parentVersion)
+					parentETag = httpcontract.FormatETag(parentVersion)
 				}
 			}
 			receipt, err = h.appendAdminMutationTx(
@@ -1372,7 +1379,7 @@ func (h *AdminHandler) executeAdminMutation(
 			replay, err = h.encodeAdminReplay(
 				reservation.Record.ID,
 				responseBody,
-				FormatETag(receipt.ResourceVersion),
+				httpcontract.FormatETag(receipt.ResourceVersion),
 				parentETag,
 				options.ContainsOneTimeSecret,
 			)
@@ -1402,9 +1409,9 @@ func (h *AdminHandler) executeAdminMutation(
 		}
 		var versionConflict *adminVersionConflictError
 		if errors.As(err, &versionConflict) && versionConflict.Current > 0 {
-			c.Header("ETag", FormatETag(versionConflict.Current))
+			c.Header("ETag", httpcontract.FormatETag(versionConflict.Current))
 		} else if options.PreconditionSubject != "" && expectedVersion > 0 {
-			c.Header("ETag", FormatETag(expectedVersion))
+			c.Header("ETag", httpcontract.FormatETag(expectedVersion))
 		}
 		h.writeNativeError(c, err)
 		return
@@ -1801,7 +1808,7 @@ func (h *AdminHandler) writeNativeError(c *gin.Context, err error) {
 		status, code, retryable = http.StatusTooManyRequests, ProblemAutomationLoop, true
 	case errors.Is(err, services.ErrExecutionGuardUnavailable):
 		status, code, retryable = http.StatusServiceUnavailable, ProblemServiceUnavailable, true
-		err = errors.New("Agent execution protection is temporarily unavailable")
+		err = errors.New("agent execution protection is temporarily unavailable")
 	case errors.Is(err, services.ErrVersionConflict):
 		status, code = http.StatusConflict, ProblemVersionConflict
 	case errors.Is(err, services.ErrLeaseConflict), errors.Is(err, services.ErrLeaseExpired), errors.Is(err, services.ErrLeaseNotOwned):

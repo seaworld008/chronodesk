@@ -5,19 +5,28 @@ on:
     branches: [ main ]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: read
     env:
       TEST_ADMIN_EMAIL: admin@example.com
       TEST_ADMIN_PASSWORD: Admin123!
       ADMIN_EMAIL: admin@example.com
       ADMIN_PASSWORD: Admin123!
+      CHRONODESK_E2E_OWNERSHIP_PREFIX: e2e-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      CHRONODESK_EPHEMERAL_E2E: "1"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -34,6 +43,9 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r server/requirements-test.txt
 
+      - name: Validate Python tests and release evidence
+        run: make test-python-static
+
       - name: Install Web and Playwright dependencies
         run: |
           cd web
@@ -42,10 +54,13 @@ jobs:
 
       - name: Start services
         run: |
+          export VERSION=0.1.0
+          export COMMIT="${GITHUB_SHA}"
+          export BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           if docker compose version >/dev/null 2>&1; then
-            docker compose up -d
+            docker compose up --build -d
           elif command -v docker-compose >/dev/null 2>&1; then
-            docker-compose up -d
+            docker-compose up --build -d
           else
             echo "Neither docker compose nor docker-compose is available"
             exit 127
@@ -58,20 +73,17 @@ jobs:
             if echo "$payload" | jq -e '
               .status == "ok" and
               .dependencies.postgresql == "ok" and
-              .dependencies.redis == "ok"
-            ' >/dev/null 2>&1; then
-              echo "API, PostgreSQL, and Redis are ready";
+              .dependencies.redis == "ok" and
+              .dependencies.agent_control == "ok"
+            ' >/dev/null 2>&1 &&
+              curl -fsS http://localhost:3000/ >/dev/null; then
+              echo "Web, API, PostgreSQL, Redis, and Agent control are ready";
               exit 0;
             fi;
-            echo "Waiting for API dependencies... payload: ${payload}";
+            echo "Waiting for API dependencies... attempt ${i}/30";
             sleep 5;
           done;
           echo "API dependencies did not become ready in time";
-          if docker compose version >/dev/null 2>&1; then
-            docker compose logs --no-color server || true
-          elif command -v docker-compose >/dev/null 2>&1; then
-            docker-compose logs --no-color server || true
-          fi
           exit 1
 
       - name: Run database migrations
@@ -94,23 +106,106 @@ jobs:
           TEST_BASE_URL: http://localhost:3000
         run: make e2e
 
-      - name: Dump server logs on failure
+      - name: Show service status on failure
         if: failure()
         run: |
           if docker compose version >/dev/null 2>&1; then
-            docker compose logs --no-color server || true
+            docker compose ps --services || true
           elif command -v docker-compose >/dev/null 2>&1; then
-            docker-compose logs --no-color server || true
+            docker-compose ps --services || true
           fi
 
-      - name: Upload smoke reports
+      - name: Prepare credential-safe reports
         if: always()
+        id: prepare-safe-reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .ci-safe-reports
+          mkdir -p .ci-safe-reports/server
+          echo "has_reports=false" >> "$GITHUB_OUTPUT"
+
+          unsafe_browser_artifact="$(
+            find web/test-results web/playwright-report \
+              -type f \( \
+                -name '*.zip' -o -name '*.webm' -o -name '*.png' -o \
+                -name '*.jpg' -o -name '*.jpeg' -o -name '*.webp' -o \
+                -name '*.har' \
+              \) \
+              -print -quit 2>/dev/null || true
+          )"
+          if [[ -n "$unsafe_browser_artifact" ]]; then
+            echo "::warning::检测到浏览器 trace/video/screenshot，跳过报告制品上传。"
+            exit 0
+          fi
+
+          report="server/reports/smoke.html"
+          if [[ ! -s "$report" ]]; then
+            echo "没有可上传的 Pytest HTML 报告。"
+            exit 0
+          fi
+
+          if ! python - "$report" <<'PY'
+          import html
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          report_path = Path(sys.argv[1])
+          document = report_path.read_text(encoding="utf-8", errors="replace")
+          visible = re.sub(r"<[^>]+>", " ", html.unescape(document))
+          sensitive_environment = (
+              "TEST_ADMIN_PASSWORD",
+              "ADMIN_PASSWORD",
+              "DATABASE_URL",
+              "REDIS_URL",
+          )
+          for name in sensitive_environment:
+              value = os.environ.get(name, "")
+              if len(value) >= 4 and value in document:
+                  print(f"报告包含环境凭据：{name}", file=sys.stderr)
+                  raise SystemExit(1)
+
+          patterns = {
+              "Authorization": re.compile(
+                  r"(?i)\bBearer\s+(?!<redacted>)[A-Za-z0-9._~+/=-]{8,}"
+              ),
+              "DSN": re.compile(
+                  r"(?i)\b(?:postgres(?:ql)?|redis(?:s)?|mysql|mariadb|"
+                  r"mongodb(?:\+srv)?|amqps?)://[^\s'\"<>]+"
+              ),
+              "credential field": re.compile(
+                  r"""(?ix)
+                  \b(?:access[_-]?token|refresh[_-]?token|authorization|
+                  backup[_-]?codes?|client[_-]?secret|cookies?|dsn|
+                  otp[_-]?secret|password|totp[_-]?(?:seed|secret))
+                  \b\s*[:=]\s*["']?(?!<redacted>|\[?<redacted>)
+                  [A-Za-z0-9._~+/!@#$%^&*?=-]{4,}
+                  """
+              ),
+          }
+          for label, pattern in patterns.items():
+              if pattern.search(visible):
+                  print(f"报告仍包含未脱敏的 {label}", file=sys.stderr)
+                  raise SystemExit(1)
+          PY
+          then
+            echo "::warning::Pytest 报告未通过凭据扫描，跳过制品上传。"
+            exit 0
+          fi
+
+          cp "$report" .ci-safe-reports/server/smoke.html
+          echo "has_reports=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload smoke reports
+        if: always() && steps.prepare-safe-reports.outputs.has_reports == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: smoke-reports
-          path: |
-            server/reports/*.html
-            web/playwright-report/
+          path: .ci-safe-reports/
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Stop services
         if: always()

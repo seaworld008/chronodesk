@@ -53,7 +53,7 @@ func TestRedisAgentExecutionGuardIntegration(t *testing.T) {
 	})
 
 	request := services.AgentExecutionGuardRequest{
-		PrincipalID:      principalID,
+		SubjectID:        principalID,
 		RateLimit:        2,
 		ConcurrencyLimit: 1,
 		ConcurrencyTTL:   5 * time.Second,

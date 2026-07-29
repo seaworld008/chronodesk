@@ -134,16 +134,6 @@ func WithResourceMetadataURL(resourceMetadataURL string) Option {
 	}
 }
 
-func WithMaxBodyBytes(maxBodyBytes int64) Option {
-	return func(server *Server) error {
-		if maxBodyBytes < 1024 {
-			return errors.New("MCP max body size must be at least 1024 bytes")
-		}
-		server.config.MaxBodyBytes = maxBodyBytes
-		return nil
-	}
-}
-
 func WithCredentialRecheckInterval(interval time.Duration) Option {
 	return func(server *Server) error {
 		if interval <= 0 {
@@ -597,7 +587,16 @@ func (s *Server) transportGuard(next http.Handler) http.Handler {
 			http.Error(writer, "Method Not Allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		request = s.normalizeDiscoveryProbe(request)
+		if request.Header.Get("Mcp-Session-Id") != "" ||
+			request.Header.Get("Last-Event-ID") != "" {
+			// MCP 2026-07-28 removed both transport fields. They carry no
+			// protocol semantics and must not reach an SDK path that could
+			// accidentally recreate session or replay behavior.
+			request = request.Clone(request.Context())
+			request.Header = request.Header.Clone()
+			request.Header.Del("Mcp-Session-Id")
+			request.Header.Del("Last-Event-ID")
+		}
 		version := strings.TrimSpace(request.Header.Get(HeaderProtocolVersion))
 		switch {
 		case version == "":
@@ -615,60 +614,6 @@ func (s *Server) transportGuard(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(writer, request)
 	})
-}
-
-// normalizeDiscoveryProbe bridges the version-negotiation bootstrap defined by
-// MCP 2026-07-28. A strict client can only declare the version in the
-// server/discover request envelope before a protocol revision has been
-// negotiated, so that one request is allowed to omit the version header.
-//
-// The request is normalized only when the body itself is a server/discover
-// request whose modern _meta envelope claims exactly the sole supported
-// revision. The SDK still validates the complete envelope (including
-// clientCapabilities and any present clientInfo) and the standard MCP headers.
-// Every post-negotiation method continues to require the header directly.
-func (s *Server) normalizeDiscoveryProbe(request *http.Request) *http.Request {
-	if request == nil ||
-		request.Body == nil ||
-		strings.TrimSpace(request.Header.Get(HeaderProtocolVersion)) != "" {
-		return request
-	}
-	methodHeader := strings.TrimSpace(request.Header.Get(HeaderMethod))
-	if methodHeader != "" && methodHeader != "server/discover" {
-		return request
-	}
-
-	body, err := io.ReadAll(io.LimitReader(request.Body, s.config.MaxBodyBytes+1))
-	_ = request.Body.Close()
-	request.Body = io.NopCloser(bytes.NewReader(body))
-	if err != nil || int64(len(body)) > s.config.MaxBodyBytes {
-		return request
-	}
-
-	var probe struct {
-		Method string `json:"method"`
-		Params struct {
-			Meta map[string]json.RawMessage `json:"_meta"`
-		} `json:"params"`
-	}
-	if json.Unmarshal(body, &probe) != nil || probe.Method != "server/discover" {
-		return request
-	}
-	rawVersion, ok := probe.Params.Meta["io.modelcontextprotocol/protocolVersion"]
-	if !ok {
-		return request
-	}
-	var envelopeVersion string
-	if json.Unmarshal(rawVersion, &envelopeVersion) != nil || envelopeVersion != ProtocolVersion {
-		return request
-	}
-
-	normalized := request.Clone(request.Context())
-	normalized.Header.Set(HeaderProtocolVersion, ProtocolVersion)
-	if methodHeader == "" {
-		normalized.Header.Set(HeaderMethod, "server/discover")
-	}
-	return normalized
 }
 
 func writeProtocolError(writer http.ResponseWriter, status int, code int64, message string, data any) {
@@ -717,6 +662,32 @@ func (s *Server) scopeGuard(next http.Handler) http.Handler {
 		}
 		if json.Unmarshal(body, &wire) != nil {
 			next.ServeHTTP(writer, request)
+			return
+		}
+		if len(wire.ID) == 0 {
+			writeProtocolError(
+				writer,
+				http.StatusBadRequest,
+				sdkjsonrpc.CodeInvalidRequest,
+				"Client-to-server notifications are not defined for Streamable HTTP",
+				nil,
+			)
+			return
+		}
+		// The 2026-07-28 wire protocol replaced the legacy resource
+		// subscription RPCs with subscriptions/listen. The SDK still exposes
+		// internal subscribe hooks used by the modern lifecycle, so reject the
+		// removed method names at the transport boundary before SDK dispatch.
+		switch wire.Method {
+		case "resources/subscribe", "resources/unsubscribe":
+			writeProtocolErrorWithID(
+				writer,
+				http.StatusNotFound,
+				sdkjsonrpc.CodeMethodNotFound,
+				"Method not found",
+				wireResponseID(wire.ID),
+				nil,
+			)
 			return
 		}
 		authorizations, required, exact, authorizationFailure := s.authorizationsForWireRequest(wire.Method, wire.Params)

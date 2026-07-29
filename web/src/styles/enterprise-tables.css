@@ -67,7 +67,21 @@
 
 .cd-resizable-header-label {
   display: block;
+  width: 100%;
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cd-resizable-header-label .MuiTableSortLabel-root {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.cd-resizable-header-label .MuiTableSortLabel-root > span:first-child {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
