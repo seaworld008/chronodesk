@@ -2,16 +2,17 @@ package handlers
 
 import (
 	"encoding/json"
-	"log"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/services"
-	websocketPkg "gongdan-system/internal/websocket"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
+	"github.com/seaworld008/chronodesk/server/internal/services"
+	websocketPkg "github.com/seaworld008/chronodesk/server/internal/websocket"
 )
 
 type NotificationHandler struct {
@@ -39,6 +40,14 @@ func (h *NotificationHandler) GetNotifications(c *gin.Context) {
 	userID := userIDValue.(uint)
 	filter := models.NotificationFilter{}
 	filter.RecipientID = &userID
+	if unsupported := unsupportedNotificationListQuery(c); unsupported != "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code": 1,
+			"msg":  "通知列表包含不支持的查询参数",
+			"data": nil,
+		})
+		return
+	}
 
 	// 分页参数
 	page := 1
@@ -53,17 +62,6 @@ func (h *NotificationHandler) GetNotifications(c *gin.Context) {
 	if pageSizeStr := c.Query("page_size"); pageSizeStr != "" {
 		if ps, err := strconv.Atoi(pageSizeStr); err == nil && ps > 0 {
 			pageSize = ps
-		}
-	}
-
-	if limit := c.Query("limit"); limit != "" {
-		if l, err := strconv.Atoi(limit); err == nil && l > 0 {
-			pageSize = l
-		}
-	}
-	if offset := c.Query("offset"); offset != "" {
-		if o, err := strconv.Atoi(offset); err == nil && o >= 0 {
-			page = (o / pageSize) + 1
 		}
 	}
 
@@ -101,25 +99,6 @@ func (h *NotificationHandler) GetNotifications(c *gin.Context) {
 		applyNotificationFilters(filterMap, &filter, userID)
 	}
 
-	// 同时兼容直接查询参数
-	if filter.IsRead == nil {
-		if isRead := c.Query("is_read"); isRead != "" {
-			if value, err := strconv.ParseBool(isRead); err == nil {
-				filter.IsRead = &value
-			}
-		}
-	}
-	if len(filter.Types) == 0 {
-		if notifType := c.Query("type"); notifType != "" {
-			filter.Types = []models.NotificationType{models.NotificationType(notifType)}
-		}
-	}
-	if len(filter.Priorities) == 0 {
-		if priority := c.Query("priority"); priority != "" {
-			filter.Priorities = []models.NotificationPriority{models.NotificationPriority(priority)}
-		}
-	}
-
 	if filter.OrderBy == "" {
 		filter.OrderBy = "created_at"
 	}
@@ -129,15 +108,16 @@ func (h *NotificationHandler) GetNotifications(c *gin.Context) {
 
 	notifications, total, err := h.notificationService.GetNotifications(c.Request.Context(), &filter)
 	if err != nil {
+		logHandlerFailure(c, "notification.list", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code": 1,
-			"msg":  "获取通知失败: " + err.Error(),
+			"msg":  "获取通知失败",
 			"data": nil,
 		})
 		return
 	}
 
-	var responses []*models.NotificationResponse
+	responses := make([]*models.NotificationResponse, 0, len(notifications))
 	for _, notification := range notifications {
 		responses = append(responses, notification.ToResponse())
 	}
@@ -158,6 +138,24 @@ func (h *NotificationHandler) GetNotifications(c *gin.Context) {
 			"total_pages": totalPages,
 		},
 	})
+}
+
+func unsupportedNotificationListQuery(c *gin.Context) string {
+	if c == nil || c.Request == nil || c.Request.URL == nil {
+		return ""
+	}
+	allowed := map[string]struct{}{
+		"page":      {},
+		"page_size": {},
+		"sort":      {},
+		"filter":    {},
+	}
+	for name := range c.Request.URL.Query() {
+		if _, ok := allowed[name]; !ok {
+			return name
+		}
+	}
+	return ""
 }
 
 func applyNotificationFilters(filterMap map[string]interface{}, filter *models.NotificationFilter, currentUserID uint) {
@@ -337,12 +335,13 @@ func parseBoolValue(value interface{}) (bool, bool) {
 func parseUintValue(value interface{}) (uint, bool) {
 	switch v := value.(type) {
 	case float64:
-		if v < 0 {
+		if v < 0 || math.Trunc(v) != v || v >= math.Ldexp(1, strconv.IntSize) {
 			return 0, false
 		}
 		return uint(v), true
 	case float32:
-		if v < 0 {
+		asFloat64 := float64(v)
+		if v < 0 || math.Trunc(asFloat64) != asFloat64 || asFloat64 >= math.Ldexp(1, strconv.IntSize) {
 			return 0, false
 		}
 		return uint(v), true
@@ -355,19 +354,23 @@ func parseUintValue(value interface{}) (uint, bool) {
 		if v < 0 {
 			return 0, false
 		}
-		return uint(v), true
+		parsed, err := safeconv.Uint(uint64(v))
+		return parsed, err == nil
 	case uint:
 		return v, true
+	case uint64:
+		parsed, err := safeconv.Uint(v)
+		return parsed, err == nil
 	case string:
 		trimmed := strings.TrimSpace(v)
 		if trimmed == "" {
 			return 0, false
 		}
-		parsed, err := strconv.ParseUint(trimmed, 10, 64)
+		parsed, err := safeconv.ParseUint(trimmed)
 		if err != nil {
 			return 0, false
 		}
-		return uint(parsed), true
+		return parsed, true
 	default:
 		return 0, false
 	}
@@ -429,6 +432,7 @@ func (h *NotificationHandler) MarkAsRead(c *gin.Context) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "无权限操作此通知"})
 			return
 		}
+		logHandlerFailure(c, "notification.mark_read", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "标记已读失败"})
 		return
 	}
@@ -436,7 +440,7 @@ func (h *NotificationHandler) MarkAsRead(c *gin.Context) {
 	// 触发WebSocket实时更新未读数量（使用真实计数）
 	unreadCount, countErr := h.notificationService.GetUnreadCount(c.Request.Context(), userID.(uint))
 	if countErr != nil {
-		log.Printf("failed to fetch unread count after mark read, user=%d notification=%d err=%v", userID.(uint), uint(id), countErr)
+		logHandlerFailure(c, "notification.refresh_unread_count", countErr)
 	} else {
 		websocketPkg.NotificationMarkedAsReadHook(c.Request.Context(), userID.(uint), unreadCount)
 	}
@@ -454,6 +458,7 @@ func (h *NotificationHandler) MarkAllAsRead(c *gin.Context) {
 
 	err := h.notificationService.MarkAllAsRead(c.Request.Context(), userID.(uint))
 	if err != nil {
+		logHandlerFailure(c, "notification.mark_all_read", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "批量标记失败"})
 		return
 	}
@@ -474,6 +479,7 @@ func (h *NotificationHandler) GetUnreadCount(c *gin.Context) {
 
 	count, err := h.notificationService.GetUnreadCount(c.Request.Context(), userID.(uint))
 	if err != nil {
+		logHandlerFailure(c, "notification.get_unread_count", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取未读数量失败"})
 		return
 	}
@@ -485,7 +491,7 @@ func (h *NotificationHandler) GetUnreadCount(c *gin.Context) {
 func (h *NotificationHandler) CreateNotification(c *gin.Context) {
 	var req models.NotificationCreateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误", "details": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
 		return
 	}
 
@@ -505,7 +511,8 @@ func (h *NotificationHandler) CreateNotification(c *gin.Context) {
 
 	notification, err := h.notificationService.CreateNotification(c.Request.Context(), &req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建通知失败", "details": err.Error()})
+		logHandlerFailure(c, "notification.create", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建通知失败"})
 		return
 	}
 
@@ -525,10 +532,14 @@ func (h *NotificationHandler) DeleteNotification(c *gin.Context) {
 
 	if err := h.notificationService.DeleteNotification(c.Request.Context(), uint(notificationID)); err != nil {
 		status := http.StatusInternalServerError
+		message := "删除通知失败"
 		if strings.Contains(err.Error(), "not found") {
 			status = http.StatusNotFound
+			message = "通知不存在"
+		} else {
+			logHandlerFailure(c, "notification.delete", err)
 		}
-		c.JSON(status, gin.H{"error": "删除通知失败", "details": err.Error()})
+		c.JSON(status, gin.H{"error": message})
 		return
 	}
 
@@ -545,6 +556,7 @@ func (h *NotificationHandler) GetNotificationPreferences(c *gin.Context) {
 
 	preferences, err := h.notificationService.GetNotificationPreferences(c.Request.Context(), userID.(uint))
 	if err != nil {
+		logHandlerFailure(c, "notification.get_preferences", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取偏好设置失败"})
 		return
 	}
@@ -568,6 +580,7 @@ func (h *NotificationHandler) UpdateNotificationPreferences(c *gin.Context) {
 
 	err := h.notificationService.UpdateNotificationPreferences(c.Request.Context(), userID.(uint), preferences)
 	if err != nil {
+		logHandlerFailure(c, "notification.update_preferences", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新偏好设置失败"})
 		return
 	}

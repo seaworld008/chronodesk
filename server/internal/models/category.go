@@ -90,49 +90,6 @@ func (Category) TableName() string {
 	return "categories"
 }
 
-// IsActive 检查分类是否激活
-func (c *Category) IsActive() bool {
-	return c.Status == CategoryStatusActive
-}
-
-// IsInactive 检查分类是否停用
-func (c *Category) IsInactive() bool {
-	return c.Status == CategoryStatusInactive
-}
-
-// IsArchived 检查分类是否归档
-func (c *Category) IsArchived() bool {
-	return c.Status == CategoryStatusArchived
-}
-
-// IsRootCategory 检查是否为根分类
-func (c *Category) IsRootCategory() bool {
-	return c.ParentID == nil
-}
-
-// HasChildren 检查是否有子分类
-func (c *Category) HasChildren() bool {
-	return c.ChildrenCount > 0
-}
-
-// HasTickets 检查是否有工单
-func (c *Category) HasTickets() bool {
-	return c.TicketCount > 0
-}
-
-// CanBeDeleted 检查是否可以删除
-func (c *Category) CanBeDeleted() bool {
-	return !c.IsDefault && c.TicketCount == 0 && c.ChildrenCount == 0
-}
-
-// GetFullName 获取完整名称（包含父级）
-func (c *Category) GetFullName() string {
-	if c.Parent != nil {
-		return c.Parent.GetFullName() + " > " + c.Name
-	}
-	return c.Name
-}
-
 // CategoryCreateRequest 分类创建请求
 type CategoryCreateRequest struct {
 	Name             string                 `json:"name" validate:"required,max=100"`
@@ -201,15 +158,15 @@ type CategoryResponse struct {
 	IsDefault         bool                   `json:"is_default"`
 	IsPublic          bool                   `json:"is_public"`
 	RequireApproval   bool                   `json:"require_approval"`
-	AutoAssignUser    *UserResponse          `json:"auto_assign_user,omitempty"`
+	AutoAssignUser    *UserSummary           `json:"auto_assign_user,omitempty"`
 	SLAHours          *int                   `json:"sla_hours"`
 	Template          string                 `json:"template"`
 	AllowedRoles      []string               `json:"allowed_roles"`
 	RestrictedRoles   []string               `json:"restricted_roles"`
 	Tags              []string               `json:"tags"`
 	Metadata          map[string]interface{} `json:"metadata"`
-	Creator           *UserResponse          `json:"creator,omitempty"`
-	Updater           *UserResponse          `json:"updater,omitempty"`
+	Creator           *UserSummary           `json:"creator,omitempty"`
+	Updater           *UserSummary           `json:"updater,omitempty"`
 }
 
 // ToResponse 转换为响应格式
@@ -241,13 +198,13 @@ func (c *Category) ToResponse() *CategoryResponse {
 
 	// 处理关联用户
 	if c.AutoAssignUser != nil {
-		response.AutoAssignUser = c.AutoAssignUser.ToResponse()
+		response.AutoAssignUser = c.AutoAssignUser.ToSummary()
 	}
 	if c.Creator != nil {
-		response.Creator = c.Creator.ToResponse()
+		response.Creator = c.Creator.ToSummary()
 	}
 	if c.Updater != nil {
-		response.Updater = c.Updater.ToResponse()
+		response.Updater = c.Updater.ToSummary()
 	}
 
 	// 处理父级分类
@@ -263,11 +220,10 @@ func (c *Category) ToResponse() *CategoryResponse {
 		}
 	}
 
-	// TODO: 解析JSON字段
-	// response.AllowedRoles = parseRolesFromJSON(c.AllowedRoles)
-	// response.RestrictedRoles = parseRolesFromJSON(c.RestrictedRoles)
-	// response.Tags = parseTagsFromJSON(c.Tags)
-	// response.Metadata = parseMetadataFromJSON(c.Metadata)
+	response.AllowedRoles = decodeJSONStringSlice(c.AllowedRoles)
+	response.RestrictedRoles = decodeJSONStringSlice(c.RestrictedRoles)
+	response.Tags = decodeJSONStringSlice(c.Tags)
+	response.Metadata = decodeJSONMap(c.Metadata)
 
 	return response
 }

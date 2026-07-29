@@ -31,7 +31,8 @@ import { usePermissions } from 'react-admin'
 import { useNavigate } from 'react-router-dom'
 import { alpha } from '@mui/material/styles'
 import { RatioRow } from '@/components/layout/RatioRow'
-import { API_BASE } from '@/lib/apiClient'
+import { API_BASE, localizedUnknownErrorMessage } from '@/lib/apiClient'
+import { isAgentRole, type RolePermissions } from '@/lib/accessControl'
 import {
   PieChart,
   Pie,
@@ -44,6 +45,7 @@ import {
   Tooltip,
   CartesianGrid,
   Sector,
+  type PieLabelRenderProps,
 } from 'recharts'
 
 interface TicketStats {
@@ -74,6 +76,23 @@ interface TicketItem {
   created_at: string
   is_overdue: boolean
   sla_breached: boolean
+}
+
+const ticketStatusLabels: Record<string, string> = {
+  open: '待处理',
+  in_progress: '处理中',
+  pending: '等待中',
+  resolved: '已解决',
+  closed: '已关闭',
+  cancelled: '已取消',
+}
+
+const ticketPriorityLabels: Record<string, string> = {
+  low: '低',
+  normal: '普通',
+  high: '高',
+  urgent: '紧急',
+  critical: '严重',
 }
 
 type TimeRange = 'today' | 'yesterday' | '7d' | '30d'
@@ -155,15 +174,6 @@ type PieActiveShapeProps = {
   fill?: string
 }
 
-type PieLabelProps = {
-  name: string
-  value: number
-  percent: number
-  cx: number
-  x: number
-  y: number
-}
-
 const renderActiveShape = (props: PieActiveShapeProps) => {
   const { cx, cy, innerRadius, outerRadius, startAngle, endAngle, fill } = props
   return (
@@ -181,8 +191,8 @@ const renderActiveShape = (props: PieActiveShapeProps) => {
   )
 }
 
-export const TicketDashboard: React.FC = () => {
-  const { permissions } = usePermissions()
+const TicketDashboard: React.FC = () => {
+  const { permissions } = usePermissions<RolePermissions>()
   const navigate = useNavigate()
   const theme = useTheme()
   const [stats, setStats] = useState<TicketStats>({
@@ -205,13 +215,7 @@ export const TicketDashboard: React.FC = () => {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
-  const [activeIndex, setActiveIndex] = useState(0)
-
-  const onPieEnter = useCallback((_: unknown, index: number) => {
-    setActiveIndex(index)
-  }, [])
-
-  const isAgent = permissions?.role === 'agent'
+  const isAgent = isAgentRole(permissions?.role)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -258,7 +262,7 @@ export const TicketDashboard: React.FC = () => {
         if (err instanceof DOMException && err.name === 'AbortError') {
           return
         }
-        const message = err instanceof Error ? err.message : '仪表盘数据加载失败'
+        const message = localizedUnknownErrorMessage(err, '仪表盘数据加载失败')
         setError(message)
       } finally {
         if (!controller.signal.aborted) {
@@ -401,8 +405,20 @@ export const TicketDashboard: React.FC = () => {
     filter?: Record<string, unknown>
   ) => (
     <Stack spacing={2} sx={{ minHeight: 0 }}>
-      <Stack direction="row" justifyContent="space-between" alignItems="center">
-        <Typography variant="subtitle1" fontWeight={600} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+      <Stack
+        direction="row"
+        sx={{
+          justifyContent: "space-between",
+          alignItems: "center"
+        }}>
+        <Typography
+          variant="subtitle1"
+          sx={{
+            fontWeight: 600,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 1
+          }}>
           <Box sx={{ width: 4, height: 16, bgcolor: 'primary.main', borderRadius: 1 }} />
           {title}
         </Typography>
@@ -450,30 +466,62 @@ export const TicketDashboard: React.FC = () => {
                 </ListItemAvatar>
                 <ListItemText
                   primary={
-                    <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
-                      <Typography variant="subtitle2" fontWeight={600} noWrap sx={{ maxWidth: '70%' }}>
+                    <Stack
+                      direction="row"
+                      spacing={1}
+                      sx={{
+                        justifyContent: "space-between",
+                        alignItems: "center"
+                      }}>
+                      <Typography
+                        variant="subtitle2"
+                        noWrap
+                        sx={{
+                          fontWeight: 600,
+                          maxWidth: '70%'
+                        }}>
                         {ticket.title}
                       </Typography>
                       <Chip
                         size="small"
-                        label={ticket.status}
+                        label={ticketStatusLabels[ticket.status] ?? '未知状态'}
                         color={getStatusColor(ticket.status)}
                         sx={{ height: 20, fontSize: '0.7rem', fontWeight: 500 }}
                       />
                     </Stack>
                   }
                   secondary={
-                    <Stack direction="row" alignItems="center" spacing={1} sx={{ mt: 0.5 }} component="span">
-                      <Typography variant="caption" color="text.secondary" sx={{ fontFamily: 'monospace' }}>
+                    <Stack
+                      direction="row"
+                      spacing={1}
+                      component="span"
+                      sx={{
+                        alignItems: "center",
+                        mt: 0.5
+                      }}>
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: "text.secondary",
+                          fontFamily: 'monospace'
+                        }}>
                         #{ticket.ticket_number}
                       </Typography>
-                      <Typography variant="caption" color="text.disabled">•</Typography>
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.disabled"
+                      }}>•</Typography>
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         {ticket.customer_name || '匿名'}
                       </Typography>
-                      <Typography variant="caption" color="text.disabled">•</Typography>
-                      <Typography variant="caption" color="text.secondary">
-                        {ticket.priority}
+                      <Typography variant="caption" sx={{
+                        color: "text.disabled"
+                      }}>•</Typography>
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
+                        {ticketPriorityLabels[ticket.priority] ?? '未知优先级'}
                       </Typography>
                     </Stack>
                   }
@@ -485,7 +533,9 @@ export const TicketDashboard: React.FC = () => {
         </List>
       ) : (
         <Box sx={{ py: 4, display: 'flex', justifyContent: 'center', opacity: 0.6 }}>
-          <Typography variant="body2" color="text.secondary">
+          <Typography variant="body2" sx={{
+            color: "text.secondary"
+          }}>
             {emptyLabel}
           </Typography>
         </Box>
@@ -499,24 +549,41 @@ export const TicketDashboard: React.FC = () => {
       <Stack spacing={3} sx={{ flex: 1 }}>
         <Stack
           direction={{ xs: 'column', md: 'row' }}
-          justifyContent="space-between"
-          alignItems={{ xs: 'flex-start', md: 'center' }}
           spacing={2}
-        >
+          sx={{
+            justifyContent: "space-between",
+            alignItems: { xs: 'flex-start', md: 'center' }
+          }}>
           <Box>
-            <Typography variant="h4" fontWeight={700} gutterBottom sx={{
-              background: 'linear-gradient(45deg, #2563eb 30%, #4f46e5 90%)',
-              WebkitBackgroundClip: 'text',
-              WebkitTextFillColor: 'transparent',
-              mb: 1
-            }}>
+            <Typography
+              variant="h4"
+              gutterBottom
+              sx={{
+                fontWeight: 700,
+                background: 'linear-gradient(45deg, #2563eb 30%, #4f46e5 90%)',
+                WebkitBackgroundClip: 'text',
+                WebkitTextFillColor: 'transparent',
+                mb: 1
+              }}>
               工单运营总览
             </Typography>
-            <Typography variant="body1" color="text.secondary" sx={{ maxWidth: 600 }}>
+            <Typography
+              variant="body1"
+              sx={{
+                color: "text.secondary",
+                maxWidth: 600
+              }}>
               实时监控工单状态、SLA 达标率及团队绩效，助力高效运营决策。
             </Typography>
           </Box>
-          <Stack direction="row" spacing={1} flexWrap="wrap" alignItems="center" justifyContent="flex-end">
+          <Stack
+            direction="row"
+            spacing={1}
+            sx={{
+              flexWrap: "wrap",
+              alignItems: "center",
+              justifyContent: "flex-end"
+            }}>
             <ToggleButtonGroup
               size="small"
               exclusive
@@ -543,7 +610,7 @@ export const TicketDashboard: React.FC = () => {
           </Card>
         )}
 
-        <RatioRow ratios={kpiRatios} gap={2} breakAt="md" alignItems="stretch">
+        <RatioRow ratios={kpiRatios} gap={2} breakAt="md">
           {kpis.map((item) => (
             <Card key={item.label} sx={{
               ...kpiCardSx,
@@ -564,12 +631,24 @@ export const TicketDashboard: React.FC = () => {
                 {loading ? (
                   <Skeleton variant="rounded" height={72} />
                 ) : (
-                  <Stack spacing={2} alignItems="flex-start">
-                    <Typography variant="h3" fontWeight={700} sx={{ color: item.color }}>
-                      {item.value.toLocaleString()}
+                  <Stack spacing={2} sx={{
+                    alignItems: "flex-start"
+                  }}>
+                    <Typography
+                      variant="h3"
+                      sx={{
+                        fontWeight: 700,
+                        color: item.color
+                      }}>
+                      {item.value.toLocaleString('zh-CN')}
                     </Typography>
                     <Box>
-                      <Typography variant="subtitle2" color="text.secondary" fontWeight={600}>
+                      <Typography
+                        variant="subtitle2"
+                        sx={{
+                          color: "text.secondary",
+                          fontWeight: 600
+                        }}>
                         {item.label}
                       </Typography>
                       <Chip
@@ -595,10 +674,12 @@ export const TicketDashboard: React.FC = () => {
           ))}
         </RatioRow>
 
-        <RatioRow ratios={SMALL_CARD_RATIOS} gap={2} breakAt="md" alignItems="stretch">
+        <RatioRow ratios={SMALL_CARD_RATIOS} gap={2} breakAt="md">
           <Card sx={infoCardSx}>
             <CardContent sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
-              <Typography variant="subtitle1" fontWeight={600} gutterBottom>
+              <Typography variant="subtitle1" gutterBottom sx={{
+                fontWeight: 600
+              }}>
                 状态分布
               </Typography>
               <Box sx={{ flex: 1, minHeight: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -616,14 +697,18 @@ export const TicketDashboard: React.FC = () => {
                         paddingAngle={5}
                         dataKey="value"
                         labelLine={true}
-                        activeIndex={activeIndex}
                         activeShape={renderActiveShape}
-                        onMouseEnter={onPieEnter}
-                        label={({ name, value, percent, cx, x, y }: PieLabelProps) => {
+                        label={({ name, value, percent, cx, x, y }: PieLabelRenderProps) => {
+                          const labelName = String(name ?? '')
+                          const labelValue = Number(value ?? 0)
+                          const percentage = Number(percent ?? 0)
+                          const centerX = Number(cx ?? 0)
+                          const labelX = Number(x ?? 0)
+                          const labelY = Number(y ?? 0)
                           return (
-                            <text x={x} y={y} fill="#666" textAnchor={x > cx ? 'start' : 'end'} dominantBaseline="central">
-                              <tspan x={x} dy="-0.5em" fontSize="10" fontWeight="bold">{name}</tspan>
-                              <tspan x={x} dy="1.2em" fontSize="10">{value} ({(percent * 100).toFixed(0)}%)</tspan>
+                            <text x={labelX} y={labelY} fill="#666" textAnchor={labelX > centerX ? 'start' : 'end'} dominantBaseline="central">
+                              <tspan x={labelX} dy="-0.5em" fontSize="10" fontWeight="bold">{labelName}</tspan>
+                              <tspan x={labelX} dy="1.2em" fontSize="10">{labelValue} ({(percentage * 100).toFixed(0)}%)</tspan>
                             </text>
                           );
                         }}
@@ -636,7 +721,9 @@ export const TicketDashboard: React.FC = () => {
                     </PieChart>
                   </ResponsiveContainer>
                 ) : (
-                  <Typography color="text.secondary">暂无数据</Typography>
+                  <Typography sx={{
+                    color: "text.secondary"
+                  }}>暂无数据</Typography>
                 )}
               </Box>
             </CardContent>
@@ -644,7 +731,9 @@ export const TicketDashboard: React.FC = () => {
 
           <Card sx={infoCardSx}>
             <CardContent sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
-              <Typography variant="subtitle1" fontWeight={600}>
+              <Typography variant="subtitle1" sx={{
+                fontWeight: 600
+              }}>
                 SLA 与风险
               </Typography>
               {loading ? (
@@ -654,22 +743,30 @@ export const TicketDashboard: React.FC = () => {
               ) : (
                 <Stack spacing={1.5}>
                   <Box sx={rowSx}>
-                    <Typography className="title" variant="body2" color="text.secondary">
+                    <Typography className="title" variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       SLA 违约
                     </Typography>
                     <Chip className="status" color="error" label={stats.sla_breached} onClick={() => handleNavigateToTickets({ sla_breached: true })} />
                   </Box>
                   <Box sx={rowSx}>
-                    <Typography className="title" variant="body2" color="text.secondary">
+                    <Typography className="title" variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       逾期工单
                     </Typography>
                     <Chip className="status" color="warning" label={stats.overdue} onClick={() => handleNavigateToTickets({ is_overdue: true })} />
                   </Box>
                   <Box sx={rowSx}>
-                    <Typography className="title" variant="body2" color="text.secondary">
+                    <Typography className="title" variant="body2" sx={{
+                      color: "text.secondary"
+                    }}>
                       解决率
                     </Typography>
-                    <Typography className="status" variant="h6" color="success.main">
+                    <Typography className="status" variant="h6" sx={{
+                      color: "success.main"
+                    }}>
                       {stats.total > 0 ? Math.round((stats.resolved / stats.total) * 100) : 0}%
                     </Typography>
                   </Box>
@@ -680,7 +777,9 @@ export const TicketDashboard: React.FC = () => {
 
           <Card sx={infoCardSx}>
             <CardContent sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
-              <Typography variant="subtitle1" fontWeight={600}>
+              <Typography variant="subtitle1" sx={{
+                fontWeight: 600
+              }}>
                 团队关注
               </Typography>
               {loading ? (
@@ -689,10 +788,14 @@ export const TicketDashboard: React.FC = () => {
                 </Stack>
               ) : isAgent ? (
                 <Stack spacing={1}>
-                  <Typography variant="body2" color="text.secondary">
+                  <Typography variant="body2" sx={{
+                    color: "text.secondary"
+                  }}>
                     当前分配给你的工单
                   </Typography>
-                  <Typography variant="h4" color="primary.main">
+                  <Typography variant="h4" sx={{
+                    color: "primary.main"
+                  }}>
                     {stats.my_tickets}
                   </Typography>
                   <Button variant="contained" onClick={() => handleNavigateToTickets({ assigned_to_me: true })}>
@@ -701,10 +804,14 @@ export const TicketDashboard: React.FC = () => {
                 </Stack>
               ) : (
                 <Stack spacing={1}>
-                  <Typography variant="body2" color="text.secondary">
+                  <Typography variant="body2" sx={{
+                    color: "text.secondary"
+                  }}>
                     待分配工单
                   </Typography>
-                  <Typography variant="h4" color="warning.main">
+                  <Typography variant="h4" sx={{
+                    color: "warning.main"
+                  }}>
                     {stats.unassigned}
                   </Typography>
                   <Button variant="contained" color="warning" onClick={() => handleNavigateToTickets({ assigned_to_id: null })}>
@@ -718,7 +825,9 @@ export const TicketDashboard: React.FC = () => {
 
         <Card sx={{ ...bottomCardSx, minHeight: 400 }}>
           <CardContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, flex: 1 }}>
-            <Typography variant="h6" fontWeight={600}>
+            <Typography variant="h6" sx={{
+              fontWeight: 600
+            }}>
               运营快照
             </Typography>
             {loading ? (
@@ -749,7 +858,9 @@ export const TicketDashboard: React.FC = () => {
 
         <Card sx={{ ...bottomCardSx, minHeight: 'auto' }}>
           <CardContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, flex: 1 }}>
-            <Typography variant="h6" fontWeight={600}>
+            <Typography variant="h6" sx={{
+              fontWeight: 600
+            }}>
               工单动态
             </Typography>
             <RatioRow ratios={DYNAMIC_SECTION_RATIOS} gap={4} breakAt="sm" sx={scrollSectionSx}>
@@ -770,7 +881,7 @@ export const TicketDashboard: React.FC = () => {
         </Card>
       </Stack>
     </Box>
-  )
+  );
 }
 
 export default TicketDashboard

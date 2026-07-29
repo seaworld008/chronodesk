@@ -11,7 +11,8 @@ import {
     TextField,
     Typography,
 } from '@mui/material'
-import { Notification, useLogin, useNotify } from 'react-admin'
+import { useLogin, useNotify } from 'react-admin'
+import { localizedUnknownErrorMessage } from '@/lib/apiClient'
 
 type NavigatorWithUAData = Navigator & {
     userAgentData?: {
@@ -68,7 +69,7 @@ const LoginPage = () => {
             })
             notify('登录成功', { type: 'info' })
         } catch (err) {
-            const message = err instanceof Error ? err.message : '登录失败'
+            const message = localizedUnknownErrorMessage(err, '登录失败')
             setError(message)
             notify(message, { type: 'warning' })
         } finally {
@@ -110,7 +111,6 @@ const LoginPage = () => {
                 },
             }}
         >
-            <Notification />
             <Card sx={{
                 maxWidth: 440,
                 width: '100%',
@@ -140,10 +140,18 @@ const LoginPage = () => {
                     >
                         T
                     </Box>
-                    <Typography variant="h5" fontWeight={700} color="#1e293b" gutterBottom>
-                        工单管理系统
+                    <Typography
+                        variant="h5"
+                        gutterBottom
+                        sx={{
+                            fontWeight: 700,
+                            color: "#1e293b"
+                        }}>
+                        ChronoDesk 工单自动化平台
                     </Typography>
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                    }}>
                         欢迎回来，请登录您的账号
                     </Typography>
                 </Box>
@@ -189,7 +197,7 @@ const LoginPage = () => {
                                 onChange={(event) => setOtpCode(event.target.value)}
                                 fullWidth
                                 placeholder="如开启双因子认证请填写"
-                                inputProps={{ maxLength: 10 }}
+                                slotProps={{ htmlInput: { maxLength: 10 } }}
                                 variant="outlined"
                                 sx={{
                                     '& .MuiOutlinedInput-root': {
@@ -214,7 +222,9 @@ const LoginPage = () => {
                                             size="small"
                                         />
                                     }
-                                    label={<Typography variant="body2" color="text.secondary">记住此设备（免 OTP）</Typography>}
+                                    label={<Typography variant="body2" sx={{
+                                        color: "text.secondary"
+                                    }}>记住此设备（免 OTP）</Typography>}
                                 />
                                 {rememberDevice && (
                                     <TextField
@@ -238,7 +248,9 @@ const LoginPage = () => {
                                     alignItems: 'center',
                                     gap: 1
                                 }}>
-                                    <Typography variant="body2" fontWeight={500}>
+                                    <Typography variant="body2" sx={{
+                                        fontWeight: 500
+                                    }}>
                                         {error}
                                     </Typography>
                                 </Box>
@@ -270,7 +282,7 @@ const LoginPage = () => {
                 </CardContent>
             </Card>
         </Box>
-    )
+    );
 }
 
 export default LoginPage

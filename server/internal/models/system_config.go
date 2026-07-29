@@ -30,9 +30,9 @@ type SystemConfig struct {
 	ValidValues  string `json:"valid_values,omitempty" gorm:"type:text"` // JSON数组格式的有效值列表
 
 	// 更新信息
-	UpdatedBy   *uint  `json:"updated_by,omitempty" gorm:"index"`
-	UpdatedUser *User  `json:"updated_user,omitempty" gorm:"foreignKey:UpdatedBy"`
-	Version     int    `json:"version" gorm:"default:1"`
+	UpdatedBy   *uint `json:"updated_by,omitempty" gorm:"index"`
+	UpdatedUser *User `json:"updated_user,omitempty" gorm:"foreignKey:UpdatedBy"`
+	Version     int   `json:"version" gorm:"default:1"`
 }
 
 // TableName 指定表名
@@ -110,10 +110,10 @@ func (sc *SystemConfig) SetValue(value interface{}) error {
 
 // CleanupConfig 清理配置结构
 type CleanupConfig struct {
-	LoginHistoryRetentionDays int  `json:"login_history_retention_days"` // 登录历史保留天数
-	CleanupEnabled            bool `json:"cleanup_enabled"`              // 是否启用自动清理
-	CleanupSchedule           string `json:"cleanup_schedule"`            // 清理计划（cron格式）
-	MaxRecordsPerCleanup      int  `json:"max_records_per_cleanup"`      // 每次清理的最大记录数
+	LoginHistoryRetentionDays int    `json:"login_history_retention_days"` // 登录历史保留天数
+	CleanupEnabled            bool   `json:"cleanup_enabled"`              // 是否启用自动清理
+	CleanupSchedule           string `json:"cleanup_schedule"`             // 清理计划（cron格式）
+	MaxRecordsPerCleanup      int    `json:"max_records_per_cleanup"`      // 每次清理的最大记录数
 }
 
 // GetDefaultCleanupConfig 获取默认清理配置
@@ -156,7 +156,7 @@ type SystemConfigResponse struct {
 // ToResponse 转换为响应格式
 func (sc *SystemConfig) ToResponse() *SystemConfigResponse {
 	var value interface{}
-	
+
 	switch sc.ValueType {
 	case "int":
 		value = sc.GetIntValue()
@@ -195,11 +195,11 @@ type CleanupLog struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 
 	// 清理任务信息
-	TaskType     string `json:"task_type" gorm:"size:50;not null;index"` // login_history, audit_logs, etc.
-	Status       string `json:"status" gorm:"size:20;not null"`          // started, completed, failed
-	StartTime    time.Time `json:"start_time" gorm:"not null"`
-	EndTime      *time.Time `json:"end_time,omitempty"`
-	Duration     *int64     `json:"duration,omitempty"` // 持续时间（毫秒）
+	TaskType  string     `json:"task_type" gorm:"size:50;not null;index"` // login_history, audit_logs, etc.
+	Status    string     `json:"status" gorm:"size:20;not null"`          // started, completed, failed
+	StartTime time.Time  `json:"start_time" gorm:"not null"`
+	EndTime   *time.Time `json:"end_time,omitempty"`
+	Duration  *int64     `json:"duration,omitempty"` // 持续时间（毫秒）
 
 	// 清理结果
 	RecordsProcessed int    `json:"records_processed" gorm:"default:0"`
@@ -207,9 +207,9 @@ type CleanupLog struct {
 	ErrorMessage     string `json:"error_message,omitempty" gorm:"type:text"`
 
 	// 清理条件
-	RetentionDays int        `json:"retention_days"`
-	CutoffDate    time.Time  `json:"cutoff_date"`
-	
+	RetentionDays int       `json:"retention_days"`
+	CutoffDate    time.Time `json:"cutoff_date"`
+
 	// 触发方式
 	TriggerType string `json:"trigger_type" gorm:"size:20"` // manual, scheduled
 	TriggerBy   *uint  `json:"trigger_by,omitempty" gorm:"index"`
@@ -226,7 +226,7 @@ func (cl *CleanupLog) GetDurationString() string {
 	if cl.Duration == nil {
 		return "未知"
 	}
-	
+
 	duration := time.Duration(*cl.Duration) * time.Millisecond
 	if duration < time.Second {
 		return "< 1秒"

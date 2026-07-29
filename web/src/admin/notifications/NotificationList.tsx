@@ -1,22 +1,16 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import {
     List,
-    Datagrid,
-    TextField,
     DateField,
     ReferenceField,
     FilterButton,
     ExportButton,
-    SearchInput,
-    SelectInput,
-    DateInput,
-    BooleanInput,
     ReferenceInput,
-    AutocompleteInput,
     TopToolbar,
     useRecordContext,
     WrapperField,
     FunctionField,
+    usePermissions,
 } from 'react-admin';
 import {
     Chip,
@@ -26,6 +20,7 @@ import {
     Card,
     CardContent,
     Avatar,
+    Tooltip,
 } from '@mui/material';
 import {
     NotificationsActive as NotificationIcon,
@@ -46,12 +41,29 @@ import {
     Comment as CommentedIcon,
     Create as CreatedIcon,
     AccessTime as OverdueIcon,
-    CheckCircleOutline as ResolvedIcon,
+    CheckCircleOutlined as ResolvedIcon,
     Close as ClosedIcon,
     Build as MaintenanceIcon,
     AlternateEmail as MentionIcon,
     Error as AlertIcon,
 } from '@mui/icons-material';
+import {
+    EnterpriseDatagrid,
+    InlineDetails,
+    TruncatedText,
+    type ResizableColumn,
+} from '@/components/tables/EnterpriseTable';
+import { EnterpriseSearchInput } from '@/components/inputs/EnterpriseSearchInput';
+import {
+    EnterpriseBooleanFilterInput,
+    EnterpriseDateFilterInput,
+    EnterpriseReferenceAutocompleteInput,
+    EnterpriseSelectFilterInput,
+} from '@/components/inputs/EnterpriseFilterInputs';
+import {
+    isAdministrativeRole,
+    type RolePermissions,
+} from '@/lib/accessControl';
 
 // 通知类型选项
 const notificationTypeChoices = [
@@ -81,6 +93,20 @@ const channelChoices = [
     { id: 'email', name: '邮件' },
     { id: 'webhook', name: 'Webhook' },
     { id: 'websocket', name: 'WebSocket' },
+];
+
+const notificationColumns: ResizableColumn[] = [
+    { key: 'type', defaultWidth: 164, minWidth: 120, maxWidth: 260 },
+    { key: 'column-2', defaultWidth: 360, minWidth: 220, maxWidth: 600 },
+    { key: 'priority', defaultWidth: 112, minWidth: 88, maxWidth: 180 },
+    { key: 'channel', defaultWidth: 136, minWidth: 104, maxWidth: 220 },
+    { key: 'recipient_id', defaultWidth: 176, minWidth: 128, maxWidth: 300 },
+    { key: 'sender_id', defaultWidth: 176, minWidth: 128, maxWidth: 300 },
+    { key: 'column-7', defaultWidth: 180, minWidth: 144, maxWidth: 260 },
+    { key: 'related_ticket_id', defaultWidth: 160, minWidth: 120, maxWidth: 260 },
+    { key: 'created_at', defaultWidth: 184, minWidth: 144, maxWidth: 280 },
+    { key: 'read_at', defaultWidth: 184, minWidth: 144, maxWidth: 280 },
+    { key: 'column-11', defaultWidth: 132, minWidth: 104, maxWidth: 200 },
 ];
 
 /**
@@ -117,16 +143,18 @@ const NotificationTypeIcon: React.FC = () => {
         }
     };
 
-    const typeName = notificationTypeChoices.find(t => t.id === record.type)?.name || record.type;
+    const typeName = notificationTypeChoices.find(t => t.id === record.type)?.name || '未知类型';
     const icon = getTypeIcon(record.type);
 
     return (
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-            {icon}
-            <Typography variant="body2">
-                {typeName}
-            </Typography>
-        </Box>
+        <Tooltip title={`通知类型代码：${record.type || '—'}`}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                {icon}
+                <Typography variant="body2" noWrap>
+                    {typeName}
+                </Typography>
+            </Box>
+        </Tooltip>
     );
 };
 
@@ -261,25 +289,14 @@ const NotificationContent: React.FC = () => {
     const record = useRecordContext();
     if (!record) return null;
 
+    const fullContent = [record.title, record.content].filter(Boolean).join(' — ');
+
     return (
-        <Box sx={{ maxWidth: '300px' }}>
-            <Typography variant="body2" fontWeight={600} sx={{ mb: 0.5 }}>
-                {record.title}
-            </Typography>
-            <Typography 
-                variant="caption" 
-                color="text.secondary"
-                sx={{
-                    display: '-webkit-box',
-                    WebkitLineClamp: 2,
-                    WebkitBoxOrient: 'vertical',
-                    overflow: 'hidden',
-                    lineHeight: 1.2,
-                }}
-            >
-                {record.content}
-            </Typography>
-        </Box>
+        <InlineDetails
+            primary={record.title}
+            secondary={record.content}
+            title={fullContent}
+        />
     );
 };
 
@@ -291,7 +308,7 @@ const StatusChips: React.FC = () => {
     if (!record) return null;
 
     return (
-        <Stack direction="row" spacing={0.5} flexWrap="wrap">
+        <Stack direction="row" spacing={0.5} sx={{ flexWrap: 'nowrap' }}>
             {/* 已读状态 */}
             <Chip
                 size="small"
@@ -301,7 +318,6 @@ const StatusChips: React.FC = () => {
                 variant={record.is_read ? 'filled' : 'outlined'}
                 sx={{ fontSize: '0.7rem' }}
             />
-            
             {/* 发送状态 */}
             <Chip
                 size="small"
@@ -323,17 +339,21 @@ const UserInfo: React.FC<{ userType: 'recipient' | 'sender' }> = ({ userType }) 
     if (!record) return null;
 
     const user = userType === 'recipient' ? record.recipient : record.sender;
-    if (!user) return <Typography variant="caption" color="text.secondary">--</Typography>;
+    if (!user) return (
+        <Typography variant="caption" sx={{
+            color: "text.secondary"
+        }}>--</Typography>
+    );
 
     return (
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
             <Avatar sx={{ width: 24, height: 24, fontSize: '0.7rem' }}>
                 {user.username?.charAt(0).toUpperCase()}
             </Avatar>
-            <Box>
-                <Typography variant="caption" fontWeight={500}>
+            <Box sx={{ minWidth: 0 }}>
+                <TruncatedText title={user.display_name || user.username} fontWeight={500}>
                     {user.display_name || user.username}
-                </Typography>
+                </TruncatedText>
             </Box>
         </Box>
     );
@@ -348,21 +368,58 @@ type NotificationRecord = {
     retry_count?: number
 }
 
-const NotificationFilters = [
-    <SearchInput source="q" placeholder="搜索通知" alwaysOn />,
-    <SelectInput source="type" label="通知类型" choices={notificationTypeChoices} />,
-    <SelectInput source="priority" label="优先级" choices={priorityChoices} />,
-    <SelectInput source="channel" label="通知渠道" choices={channelChoices} />,
-    <BooleanInput source="is_read" label="已读" />,
-    <BooleanInput source="is_sent" label="已发送" />,
-    <ReferenceInput source="recipient_id" reference="users" label="接收者">
-        <AutocompleteInput optionText="username" />
-    </ReferenceInput>,
-    <ReferenceInput source="sender_id" reference="users" label="发送者">
-        <AutocompleteInput optionText="username" />
-    </ReferenceInput>,
-    <DateInput source="created_at_gte" label="创建时间从" />,
-    <DateInput source="created_at_lte" label="创建时间到" />,
+const buildNotificationFilters = (canAdminister: boolean) => [
+    <EnterpriseSearchInput key="q" source="q" placeholder="搜索通知" alwaysOn />,
+    <EnterpriseSelectFilterInput
+        key="type"
+        source="type"
+        label="通知类型"
+        choices={notificationTypeChoices}
+    />,
+    <EnterpriseSelectFilterInput
+        key="priority"
+        source="priority"
+        label="优先级"
+        choices={priorityChoices}
+    />,
+    <EnterpriseSelectFilterInput
+        key="channel"
+        source="channel"
+        label="通知渠道"
+        choices={channelChoices}
+    />,
+    <EnterpriseBooleanFilterInput key="is_read" source="is_read" label="已读" />,
+    <EnterpriseBooleanFilterInput key="is_sent" source="is_sent" label="已发送" />,
+    ...(canAdminister
+        ? [
+            <ReferenceInput
+                key="recipient_id"
+                source="recipient_id"
+                reference="users"
+                label="接收者"
+            >
+                <EnterpriseReferenceAutocompleteInput label="接收者" optionText="username" />
+            </ReferenceInput>,
+            <ReferenceInput
+                key="sender_id"
+                source="sender_id"
+                reference="users"
+                label="发送者"
+            >
+                <EnterpriseReferenceAutocompleteInput label="发送者" optionText="username" />
+            </ReferenceInput>,
+        ]
+        : []),
+    <EnterpriseDateFilterInput
+        key="created_at_gte"
+        source="created_at_gte"
+        label="创建时间从"
+    />,
+    <EnterpriseDateFilterInput
+        key="created_at_lte"
+        source="created_at_lte"
+        label="创建时间到"
+    />,
 ];
 
 /**
@@ -386,7 +443,9 @@ const NotificationEmpty = () => (
                 <Typography variant="h5" component="h2" gutterBottom>
                     暂无通知
                 </Typography>
-                <Typography variant="body1" color="text.secondary">
+                <Typography variant="body1" sx={{
+                    color: "text.secondary"
+                }}>
                     当前没有任何通知记录。当系统产生通知时，它们会出现在这里。
                 </Typography>
             </CardContent>
@@ -398,16 +457,26 @@ const NotificationEmpty = () => (
  * 通知列表组件
  */
 const NotificationList: React.FC = () => {
+    const { permissions } = usePermissions<RolePermissions>();
+    const canAdminister = isAdministrativeRole(permissions?.role);
+    const filters = useMemo(
+        () => buildNotificationFilters(canAdminister),
+        [canAdminister],
+    );
+
     return (
         <List
-            filters={NotificationFilters}
+            filters={filters}
             actions={<NotificationListActions />}
             empty={<NotificationEmpty />}
             perPage={25}
             sort={{ field: 'created_at', order: 'DESC' }}
             title="通知管理"
         >
-            <Datagrid
+            <EnterpriseDatagrid
+                tableId="notifications.main"
+                columns={notificationColumns}
+                aria-label="通知列表"
                 bulkActionButtons={false}
                 sx={{
                     '& .RaDatagrid-table': {
@@ -465,7 +534,13 @@ const NotificationList: React.FC = () => {
                     label="相关工单"
                     emptyText="--"
                 >
-                    <TextField source="ticket_number" />
+                    <FunctionField
+                        render={(record) => (
+                            <TruncatedText title={record?.ticket_number || '—'}>
+                                {record?.ticket_number || '—'}
+                            </TruncatedText>
+                        )}
+                    />
                 </ReferenceField>
 
                 {/* 创建时间 */}
@@ -525,7 +600,7 @@ const NotificationList: React.FC = () => {
                                 />
                             );
                         }
-                        if (record.retry_count > 0) {
+                        if ((record.retry_count ?? 0) > 0) {
                             return (
                                 <Chip
                                     size="small"
@@ -545,7 +620,7 @@ const NotificationList: React.FC = () => {
                         );
                     }}
                 />
-            </Datagrid>
+            </EnterpriseDatagrid>
         </List>
     );
 };

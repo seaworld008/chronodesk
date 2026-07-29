@@ -13,6 +13,7 @@ import {
 } from 'react-admin'
 import { Box, Typography } from '@mui/material'
 import BackButton from '../common/BackButton'
+import { automationTriggerEventLabel } from './triggerEvents'
 
 const JsonDisplay: React.FC<{ value?: string }> = ({ value }) => {
   if (!value) {
@@ -54,7 +55,12 @@ const AutomationRuleShow: React.FC = (props) => (
       <TextField source="name" label="规则名称" />
       <TextField source="description" label="描述" />
       <TextField source="rule_type" label="规则类型" />
-      <TextField source="trigger_event" label="触发事件" />
+      <FunctionField
+        label="触发事件"
+        render={(record) =>
+          `${automationTriggerEventLabel(record?.trigger_event)}（${record?.trigger_event || '—'}）`
+        }
+      />
       <BooleanField source="is_active" label="启用" />
       <NumberField source="priority" label="优先级" />
       <FunctionField

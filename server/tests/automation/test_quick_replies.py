@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from typing import Dict
 
 import pytest
 
@@ -14,7 +13,7 @@ from tests.utils import APIClient
 @pytest.mark.integration
 class TestQuickReplies:
     @pytest.fixture
-    def quick_reply_payload(self) -> Dict[str, object]:
+    def quick_reply_payload(self) -> dict[str, object]:
         unique = int(time.time_ns())
         return {
             "name": f"Quick Reply {unique}",
@@ -27,11 +26,13 @@ class TestQuickReplies:
     def test_quick_reply_flow(
         self,
         admin_api: APIClient,
-        quick_reply_payload: Dict[str, object],
+        quick_reply_payload: dict[str, object],
     ) -> None:
         created_id: int | None = None
         try:
-            create_resp = admin_api.post_json("/admin/automation/quick-replies", quick_reply_payload)
+            create_resp = admin_api.post_json(
+                "/admin/automation/quick-replies", quick_reply_payload
+            )
             assert create_resp.status_code == 201, create_resp.text
             create_body = create_resp.json()
             assert create_body.get("success") is True, create_body
@@ -58,7 +59,9 @@ class TestQuickReplies:
             assert use_body.get("success") is True, use_body
         finally:
             if created_id is not None:
-                delete_resp = admin_api.delete(f"/admin/automation/quick-replies/{created_id}")
+                delete_resp = admin_api.delete(
+                    f"/admin/automation/quick-replies/{created_id}"
+                )
                 if delete_resp.status_code == 200:
                     delete_body = delete_resp.json()
                     assert delete_body.get("success") is True, delete_body

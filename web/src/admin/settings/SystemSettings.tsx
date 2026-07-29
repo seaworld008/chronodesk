@@ -7,7 +7,6 @@ import {
   Paper,
   Stack,
   Switch,
-  Table,
   TableBody,
   TableCell,
   TableContainer,
@@ -21,8 +20,21 @@ import {
 } from '@mui/material'
 import { Save as SaveIcon, Refresh as RefreshIcon } from '@mui/icons-material'
 import { useNotify } from 'react-admin'
-import { apiFetch } from '@/lib/apiClient'
+import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
 import BackButton from '../common/BackButton'
+import {
+  InlineDetails,
+  ResizableMuiTable,
+  type ResizableColumn,
+} from '@/components/tables/EnterpriseTable'
+
+const systemConfigColumns: ResizableColumn[] = [
+  { key: 'config', defaultWidth: 260, minWidth: 180, maxWidth: 460 },
+  { key: 'description', defaultWidth: 340, minWidth: 200, maxWidth: 560 },
+  { key: 'value', defaultWidth: 360, minWidth: 220, maxWidth: 640 },
+  { key: 'type', defaultWidth: 112, minWidth: 88, maxWidth: 180 },
+  { key: 'actions', defaultWidth: 120, minWidth: 104, maxWidth: 180, sticky: 'right' },
+]
 
 interface SystemConfig {
   id: number
@@ -53,6 +65,13 @@ const categories = [
   { id: 'ticket', label: '工单设置' },
   { id: 'notify', label: '通知设置' },
 ]
+
+const valueTypeLabels: Record<SystemConfig['value_type'], string> = {
+  string: '文本',
+  int: '整数',
+  bool: '布尔值',
+  json: 'JSON 数据',
+}
 
 const parseInitialValue = (config: SystemConfig): EditableConfig => {
   const editable: EditableConfig = { ...config }
@@ -89,10 +108,7 @@ const SystemSettings: React.FC = () => {
   const [bulkSaving, setBulkSaving] = useState(false)
 
   const extractErrorMessage = useCallback((error: unknown, fallback: string) => {
-    if (error instanceof Error) {
-      return error.message
-    }
-    return fallback
+    return localizedUnknownErrorMessage(error, fallback)
   }, [])
 
   const loadConfigs = useCallback(async (category: string, silent = false) => {
@@ -191,12 +207,14 @@ const SystemSettings: React.FC = () => {
   const handleRefresh = () => loadConfigs(activeTab)
 
   const renderValueCell = (config: EditableConfig, index: number) => {
+    const accessibleName = `配置“${config.key}”的值`
     switch (config.value_type) {
       case 'bool':
         return (
           <Switch
             checked={config.boolValue ?? false}
             onChange={(e) => handleValueChange(index, e.target.checked)}
+            slotProps={{ input: { 'aria-label': accessibleName } }}
           />
         )
       case 'int':
@@ -207,18 +225,18 @@ const SystemSettings: React.FC = () => {
             value={config.intValue ?? ''}
             onChange={(e) => handleValueChange(index, e.target.value)}
             sx={{ width: 160 }}
+            slotProps={{ htmlInput: { 'aria-label': accessibleName } }}
           />
         )
       case 'json':
         return (
           <TextField
             size="small"
-            multiline
-            minRows={2}
             value={config.jsonValue ?? ''}
             onChange={(e) => handleValueChange(index, e.target.value)}
             sx={{ width: 320 }}
-            helperText="请输入合法 JSON"
+            placeholder="请输入合法 JSON"
+            slotProps={{ htmlInput: { 'aria-label': accessibleName } }}
           />
         )
       default:
@@ -228,6 +246,7 @@ const SystemSettings: React.FC = () => {
             value={config.value}
             onChange={(e) => handleValueChange(index, e.target.value)}
             sx={{ width: 240 }}
+            slotProps={{ htmlInput: { 'aria-label': accessibleName } }}
           />
         )
     }
@@ -251,8 +270,16 @@ const SystemSettings: React.FC = () => {
 
   return (
     <Box sx={{ p: 3 }}>
-      <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 2 }}>
-        <Stack direction="row" spacing={2} alignItems="center">
+      <Stack
+        direction="row"
+        sx={{
+          justifyContent: "space-between",
+          alignItems: "center",
+          mb: 2
+        }}>
+        <Stack direction="row" spacing={2} sx={{
+          alignItems: "center"
+        }}>
           <BackButton fallbackPath="/system-settings" />
           <Typography variant="h4">系统设置概览</Typography>
         </Stack>
@@ -268,7 +295,6 @@ const SystemSettings: React.FC = () => {
           </Button>
         </Stack>
       </Stack>
-
       <Paper sx={{ mb: 2 }}>
         <Tabs value={activeTab} onChange={(_, value) => setActiveTab(value)} textColor="primary" indicatorColor="primary" variant="scrollable">
           {categories.map((category) => (
@@ -276,20 +302,22 @@ const SystemSettings: React.FC = () => {
           ))}
         </Tabs>
       </Paper>
-
       {loading && (
         <Box sx={{ display: 'flex', justifyContent: 'center', mt: 4 }}>
           <CircularProgress />
         </Box>
       )}
-
       {!loading && currentConfigs.length === 0 && (
         <Alert severity="info">当前分类暂无配置</Alert>
       )}
-
       {!loading && currentConfigs.length > 0 && (
         <TableContainer component={Paper}>
-          <Table size="small">
+          <ResizableMuiTable
+            tableId="settings.system-config"
+            columns={systemConfigColumns}
+            size="small"
+            aria-label="系统配置列表"
+          >
             <TableHead>
               <TableRow>
                 <TableCell>配置项</TableCell>
@@ -303,22 +331,32 @@ const SystemSettings: React.FC = () => {
               {currentConfigs.map((config, index) => (
                 <TableRow key={config.key} hover selected={config.dirty}>
                   <TableCell>
-                    <Typography fontWeight={600}>{config.key}</Typography>
-                    <Typography variant="caption" color="text.secondary">分组：{config.group || '默认'}</Typography>
+                    <InlineDetails
+                      primary={config.key}
+                      secondary={`分组：${config.group || '默认'}`}
+                      title={`${config.key} · 分组：${config.group || '默认'}`}
+                    />
                   </TableCell>
-                  <TableCell sx={{ maxWidth: 280 }}>
-                    <Typography variant="body2">{config.description || '—'}</Typography>
-                    {config.default_value && (
-                      <Typography variant="caption" color="text.secondary">默认值：{config.default_value}</Typography>
-                    )}
+                  <TableCell>
+                    <InlineDetails
+                      primary={config.description || '—'}
+                      secondary={config.default_value ? `默认值：${config.default_value}` : undefined}
+                      title={`${config.description || '—'}${config.default_value ? ` · 默认值：${config.default_value}` : ''}`}
+                      primaryFontWeight={400}
+                    />
                   </TableCell>
                   <TableCell>{renderValueCell(config, index)}</TableCell>
-                  <TableCell>{config.value_type}</TableCell>
+                  <TableCell>
+                    <Tooltip title={`类型代码：${config.value_type}`}>
+                      <span>{valueTypeLabels[config.value_type]}</span>
+                    </Tooltip>
+                  </TableCell>
                   <TableCell align="right">
                     <Tooltip title="保存">
                       <span>
                         <Button
                           size="small"
+                          aria-label={`保存配置：${config.key}`}
                           startIcon={<SaveIcon fontSize="inherit" />}
                           onClick={() => handleSave(config)}
                           disabled={!config.dirty || savingKey === config.key}
@@ -331,11 +369,11 @@ const SystemSettings: React.FC = () => {
                 </TableRow>
               ))}
             </TableBody>
-          </Table>
+          </ResizableMuiTable>
         </TableContainer>
       )}
     </Box>
-  )
+  );
 }
 
 export default SystemSettings

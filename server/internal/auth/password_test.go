@@ -1,14 +1,14 @@
 package auth
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func TestHashPassword_UsesBcryptPrefix(t *testing.T) {
-	svc := NewSimplePasswordService(8, "ignored")
+	svc := mustTestPasswordService(t)
 
 	hash, err := svc.HashPassword("StrongPass1!")
 	if err != nil {
@@ -18,22 +18,36 @@ func TestHashPassword_UsesBcryptPrefix(t *testing.T) {
 	if !strings.HasPrefix(hash, "$2") {
 		t.Fatalf("expected bcrypt hash prefix '$2', got: %s", hash)
 	}
-}
-
-func TestVerifyPassword_LegacySHA256Compatible(t *testing.T) {
-	svc := NewSimplePasswordService(8, "ticket-system-salt")
-	password := "StrongPass1!"
-
-	legacyHash := legacySHA256Hash(password, "ticket-system-salt")
-	if err := svc.VerifyPassword(legacyHash, password); err != nil {
-		t.Fatalf("expected legacy hash verification success, got error: %v", err)
+	cost, err := bcrypt.Cost([]byte(hash))
+	if err != nil {
+		t.Fatalf("read bcrypt cost: %v", err)
+	}
+	if cost != BcryptCostMin {
+		t.Fatalf("bcrypt cost = %d, want configured cost %d", cost, BcryptCostMin)
 	}
 }
 
-func legacySHA256Hash(password, salt string) string {
-	hasher := sha256.New()
-	hasher.Write([]byte(salt))
-	hasher.Write([]byte(password))
-	hasher.Write([]byte(salt))
-	return hex.EncodeToString(hasher.Sum(nil))
+func TestVerifyPassword_RejectsLegacySHA256(t *testing.T) {
+	svc := mustTestPasswordService(t)
+	password := "StrongPass1!"
+
+	legacyHash := "31430f91ca9e5474a389af707821646a78604d62f9f4dc0296e083b520616491"
+	err := svc.VerifyPassword(legacyHash, password)
+	if err == nil || !strings.Contains(err.Error(), "unsupported") {
+		t.Fatalf("legacy hash error = %v, want unsupported password hash", err)
+	}
+}
+
+func TestNewSimplePasswordServiceRejectsUnsafeOrAmbiguousConfig(t *testing.T) {
+	tests := []PasswordServiceConfig{
+		{MinLength: 7, BcryptCost: BcryptCostMin},
+		{MinLength: 129, BcryptCost: BcryptCostMin},
+		{MinLength: 8, BcryptCost: BcryptCostMin - 1},
+		{MinLength: 8, BcryptCost: BcryptCostMax + 1},
+	}
+	for _, config := range tests {
+		if _, err := NewSimplePasswordService(config); err == nil {
+			t.Errorf("NewSimplePasswordService(%+v) succeeded", config)
+		}
+	}
 }

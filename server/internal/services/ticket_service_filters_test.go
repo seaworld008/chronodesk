@@ -7,7 +7,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
 func setupFilterTestDB(t *testing.T) *gorm.DB {
@@ -15,7 +15,15 @@ func setupFilterTestDB(t *testing.T) *gorm.DB {
 
 	db := openTestDB(t)
 
-	if err := db.AutoMigrate(&models.User{}, &models.Category{}, &models.Ticket{}, &models.TicketComment{}); err != nil {
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.Category{},
+		&models.Ticket{},
+		&models.TicketComment{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
+		&models.TicketHistory{},
+	); err != nil {
 		t.Fatalf("failed to migrate: %v", err)
 	}
 
@@ -69,7 +77,7 @@ func TestGetTicketsFilters_SLAOverdueUnassigned(t *testing.T) {
 		Priority:     models.TicketPriorityHigh,
 		Type:         models.TicketTypeRequest,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  creator.ID,
+		CreatedByID:  &creator.ID,
 		AssignedToID: &assignee.ID,
 		SLABreached:  true,
 		DueDate:      ptrTime(now.Add(48 * time.Hour)),
@@ -83,7 +91,7 @@ func TestGetTicketsFilters_SLAOverdueUnassigned(t *testing.T) {
 		Priority:     models.TicketPriorityNormal,
 		Type:         models.TicketTypeRequest,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  creator.ID,
+		CreatedByID:  &creator.ID,
 		AssignedToID: &assignee.ID,
 		DueDate:      ptrTime(now.Add(-24 * time.Hour)),
 	})
@@ -96,12 +104,12 @@ func TestGetTicketsFilters_SLAOverdueUnassigned(t *testing.T) {
 		Priority:     models.TicketPriorityLow,
 		Type:         models.TicketTypeRequest,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  creator.ID,
+		CreatedByID:  &creator.ID,
 		AssignedToID: nil,
 		DueDate:      ptrTime(now.Add(24 * time.Hour)),
 	})
 
-	svc := NewTicketService(db)
+	svc := newTicketServiceForTest(t, db)
 
 	tickets, total, err := svc.GetTickets(context.Background(), TicketFilters{
 		SLABreached: boolPtr(true),
@@ -134,6 +142,46 @@ func TestGetTicketsFilters_SLAOverdueUnassigned(t *testing.T) {
 	}
 }
 
+func TestGetTicketsFilters_Source(t *testing.T) {
+	db := setupFilterTestDB(t)
+	creator := seedUser(t, db, "source-creator")
+
+	webTicket := seedTicket(t, db, models.Ticket{
+		TicketNumber: "SOURCE-WEB",
+		Title:        "Web ticket",
+		Description:  "desc",
+		Status:       models.TicketStatusOpen,
+		Priority:     models.TicketPriorityNormal,
+		Type:         models.TicketTypeRequest,
+		Source:       models.TicketSourceWeb,
+		CreatedByID:  &creator.ID,
+	})
+	seedTicket(t, db, models.Ticket{
+		TicketNumber: "SOURCE-API",
+		Title:        "API ticket",
+		Description:  "desc",
+		Status:       models.TicketStatusOpen,
+		Priority:     models.TicketPriorityNormal,
+		Type:         models.TicketTypeRequest,
+		Source:       models.TicketSourceAPI,
+		CreatedByID:  &creator.ID,
+	})
+
+	svc := newTicketServiceForTest(t, db)
+	tickets, total, err := svc.GetTickets(context.Background(), TicketFilters{
+		Source: string(models.TicketSourceWeb),
+	})
+	if err != nil {
+		t.Fatalf("GetTickets() source filter error = %v", err)
+	}
+	if total != 1 || len(tickets) != 1 {
+		t.Fatalf("GetTickets() source filter total=%d len=%d, want 1", total, len(tickets))
+	}
+	if tickets[0].ID != webTicket.ID {
+		t.Fatalf("GetTickets() source filter returned id=%d, want %d", tickets[0].ID, webTicket.ID)
+	}
+}
+
 func TestGetTickets_SortFieldInjectionFallsBackToCreatedAt(t *testing.T) {
 	db := setupFilterTestDB(t)
 	creator := seedUser(t, db, "sort-creator")
@@ -146,7 +194,7 @@ func TestGetTickets_SortFieldInjectionFallsBackToCreatedAt(t *testing.T) {
 		Priority:     models.TicketPriorityNormal,
 		Type:         models.TicketTypeRequest,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  creator.ID,
+		CreatedByID:  &creator.ID,
 	})
 	time.Sleep(10 * time.Millisecond)
 	newer := seedTicket(t, db, models.Ticket{
@@ -157,10 +205,10 @@ func TestGetTickets_SortFieldInjectionFallsBackToCreatedAt(t *testing.T) {
 		Priority:     models.TicketPriorityNormal,
 		Type:         models.TicketTypeRequest,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  creator.ID,
+		CreatedByID:  &creator.ID,
 	})
 
-	svc := NewTicketService(db)
+	svc := newTicketServiceForTest(t, db)
 
 	tickets, _, err := svc.GetTickets(context.Background(), TicketFilters{
 		SortBy:    "bad_column",
@@ -206,7 +254,7 @@ func TestGetSLABreachedTicketsUsesStoredDeadlineAndFlag(t *testing.T) {
 		Priority:     models.TicketPriorityHigh,
 		Type:         models.TicketTypeRequest,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  creator.ID,
+		CreatedByID:  &creator.ID,
 		AssignedToID: &assignee.ID,
 		CategoryID:   &category.ID,
 		SLADueDate:   &past,
@@ -219,7 +267,7 @@ func TestGetSLABreachedTicketsUsesStoredDeadlineAndFlag(t *testing.T) {
 		Priority:     models.TicketPriorityUrgent,
 		Type:         models.TicketTypeIncident,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  creator.ID,
+		CreatedByID:  &creator.ID,
 		AssignedToID: &assignee.ID,
 		CategoryID:   &category.ID,
 		SLABreached:  true,
@@ -233,13 +281,13 @@ func TestGetSLABreachedTicketsUsesStoredDeadlineAndFlag(t *testing.T) {
 		Priority:     models.TicketPriorityNormal,
 		Type:         models.TicketTypeRequest,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  creator.ID,
+		CreatedByID:  &creator.ID,
 		AssignedToID: &assignee.ID,
 		CategoryID:   &category.ID,
 		SLABreached:  true,
 	})
 
-	svc := NewTicketService(db)
+	svc := newTicketServiceForTest(t, db)
 	tickets, total, err := svc.GetSLABreachedTickets(assignee.ID, "agent")
 	if err != nil {
 		t.Fatalf("GetSLABreachedTickets returned error: %v", err)

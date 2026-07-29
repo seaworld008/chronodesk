@@ -11,12 +11,12 @@ import {
     TopToolbar,
     ListButton,
     ShowButton,
-    DeleteButton,
     SaveButton,
     TabbedForm,
     FormTab,
     useRecordContext,
 } from 'react-admin';
+import { FocusSafeDeleteButton } from '@/components/actions/FocusSafeDeleteButtons';
 import {
     Box,
     Typography,
@@ -34,14 +34,7 @@ import {
     Warning as WarningIcon,
 } from '@mui/icons-material';
 import BackButton from '../common/BackButton';
-
-// 角色选项
-const roleChoices = [
-    { id: 'admin', name: '管理员' },
-    { id: 'agent', name: '客服代理' },
-    { id: 'customer', name: '客户' },
-    { id: 'supervisor', name: '主管' },
-];
+import { userRoleChoices } from '@/lib/accessControl';
 
 // 状态选项
 const statusChoices = [
@@ -69,7 +62,7 @@ const timezoneChoices = [
 const languageChoices = [
     { id: 'zh-CN', name: '中文简体' },
     { id: 'zh-TW', name: '中文繁体' },
-    { id: 'en-US', name: 'English (US)' },
+    { id: 'en-US', name: '英语（美国）' },
     { id: 'ja-JP', name: '日本語' },
     { id: 'ko-KR', name: '한국어' },
 ];
@@ -122,10 +115,14 @@ const UserAvatarDisplay: React.FC = () => {
                 {initials}
             </Avatar>
             <Box>
-                <Typography variant="h6" fontWeight={600}>
+                <Typography variant="h6" sx={{
+                    fontWeight: 600
+                }}>
                     {displayName}
                 </Typography>
-                <Typography variant="body2" color="text.secondary">
+                <Typography variant="body2" sx={{
+                    color: "text.secondary"
+                }}>
                     @{record.username} • ID: {record.id}
                 </Typography>
             </Box>
@@ -178,7 +175,7 @@ const UserEditActions = () => (
     <TopToolbar>
         <ListButton label="返回列表" />
         <ShowButton label="查看详情" />
-        <DeleteButton label="删除" />
+            <FocusSafeDeleteButton label="删除" mutationMode="pessimistic" />
     </TopToolbar>
 );
 
@@ -191,7 +188,9 @@ const UserEditToolbar = () => (
             label="保存更改"
             variant="contained"
         />
-        <Typography variant="body2" color="text.secondary">
+        <Typography variant="body2" sx={{
+            color: "text.secondary"
+        }}>
             * 标记的字段为必填项
         </Typography>
     </Box>
@@ -230,7 +229,8 @@ const UserEdit: React.FC = () => {
                                                     validate={validateUsername}
                                                     fullWidth
                                                     required
-                                                    helperText="用户名用于登录，建议使用英文字母和数字"
+                                                    disabled
+                                                    helperText="用户名是稳定登录标识，创建后不可修改"
                                                 />
                                             </Box>
                                             
@@ -328,7 +328,7 @@ const UserEdit: React.FC = () => {
                                                 <SelectInput
                                                     source="role"
                                                     label="用户角色"
-                                                    choices={roleChoices}
+                                                    choices={userRoleChoices}
                                                     required
                                                     helperText="选择用户在系统中的角色权限"
                                                 />

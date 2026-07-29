@@ -1,21 +1,21 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/smtp"
-	"strings"
-	"time"
+	htmltemplate "html/template"
+	texttemplate "text/template"
 
+	"github.com/seaworld008/chronodesk/server/internal/mailer"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
-	"gongdan-system/internal/models"
 )
 
 // EmailNotificationServiceInterface 邮件通知服务接口
 type EmailNotificationServiceInterface interface {
-	SendEmailNotification(ctx context.Context, notification *models.Notification) error
-	SendBulkEmailNotifications(ctx context.Context, notifications []*models.Notification) error
+	SendEmailNotificationOutboxAttempt(ctx context.Context, notification *models.Notification) error
 	GetEmailTemplate(notificationType models.NotificationType) (*EmailTemplate, error)
 }
 
@@ -28,9 +28,9 @@ type EmailTemplate struct {
 
 // EmailNotificationService 邮件通知服务实现
 type EmailNotificationService struct {
-	db                   *gorm.DB
-	emailConfigService   EmailConfigServiceInterface
-	notificationService  NotificationServiceInterface
+	db                  *gorm.DB
+	emailConfigService  EmailConfigServiceInterface
+	notificationService NotificationServiceInterface
 }
 
 // NewEmailNotificationService 创建邮件通知服务
@@ -46,11 +46,31 @@ func NewEmailNotificationService(
 	}
 }
 
-// SendEmailNotification 发送邮件通知
-func (s *EmailNotificationService) SendEmailNotification(ctx context.Context, notification *models.Notification) error {
-	// 检查邮件是否已发送
+// SendEmailNotificationOutboxAttempt performs one bounded SMTP attempt for a
+// durable Outbox delivery. Retry scheduling belongs exclusively to the shared
+// Outbox worker; SMTP itself does not offer exactly-once delivery.
+func (s *EmailNotificationService) SendEmailNotificationOutboxAttempt(
+	ctx context.Context,
+	notification *models.Notification,
+) error {
+	if notification == nil || notification.ID == 0 {
+		return fmt.Errorf("邮件通知记录无效")
+	}
+	var persisted models.Notification
+	if err := s.db.WithContext(ctx).
+		Preload("Recipient").
+		Preload("Sender").
+		Preload("RelatedTicket").
+		First(&persisted, notification.ID).Error; err != nil {
+		return fmt.Errorf("获取邮件通知失败: %w", err)
+	}
+	*notification = persisted
 	if notification.IsSent {
 		return nil
+	}
+	if notification.Recipient == nil {
+		notification.DeliveryStatus = "skipped_recipient_unavailable"
+		return s.db.WithContext(ctx).Save(notification).Error
 	}
 
 	// 检查系统是否可以发送邮件
@@ -68,13 +88,6 @@ func (s *EmailNotificationService) SendEmailNotification(ctx context.Context, no
 		return fmt.Errorf("获取SMTP配置失败: %w", err)
 	}
 
-	// 预加载接收者信息
-	if notification.Recipient == nil {
-		if err := s.db.Preload("Recipient").First(notification, notification.ID).Error; err != nil {
-			return fmt.Errorf("获取接收者信息失败: %w", err)
-		}
-	}
-
 	// 检查用户邮件偏好
 	emailEnabled, err := s.isEmailEnabledForUser(ctx, notification.RecipientID, notification.Type)
 	if err != nil {
@@ -82,15 +95,16 @@ func (s *EmailNotificationService) SendEmailNotification(ctx context.Context, no
 	}
 	if !emailEnabled {
 		notification.DeliveryStatus = "skipped_user_preference"
-		s.db.Save(notification)
-		return nil
+		return s.db.WithContext(ctx).Save(notification).Error
 	}
 
 	// 检查用户邮箱是否有效
 	if notification.Recipient.Email == "" {
 		notification.DeliveryStatus = "failed_no_email"
 		notification.ErrorMessage = "用户未设置邮箱地址"
-		s.db.Save(notification)
+		if err := s.db.WithContext(ctx).Save(notification).Error; err != nil {
+			return fmt.Errorf("保存邮件投递失败状态: %w", err)
+		}
 		return fmt.Errorf("用户未设置邮箱地址")
 	}
 
@@ -107,13 +121,20 @@ func (s *EmailNotificationService) SendEmailNotification(ctx context.Context, no
 	}
 
 	// 发送邮件
-	err = s.sendEmail(smtpConfig, notification.Recipient.Email, subject, htmlBody)
+	err = s.sendEmail(
+		ctx,
+		smtpConfig,
+		notification.Recipient.Email,
+		subject,
+		htmlBody,
+	)
 	if err != nil {
 		// 更新失败状态
 		notification.ErrorMessage = err.Error()
 		notification.DeliveryStatus = "failed"
-		notification.IncrementRetry(time.Minute * 5) // 5分钟后重试
-		s.db.Save(notification)
+		if saveErr := s.db.WithContext(ctx).Save(notification).Error; saveErr != nil {
+			return fmt.Errorf("发送邮件失败且无法保存投递状态: %v: %w", err, saveErr)
+		}
 		return fmt.Errorf("发送邮件失败: %w", err)
 	}
 
@@ -121,43 +142,10 @@ func (s *EmailNotificationService) SendEmailNotification(ctx context.Context, no
 	notification.MarkAsSent()
 	notification.MarkAsDelivered()
 	notification.DeliveryStatus = "delivered"
-	if err := s.db.Save(notification).Error; err != nil {
+	notification.ErrorMessage = ""
+	notification.NextRetryAt = nil
+	if err := s.db.WithContext(ctx).Save(notification).Error; err != nil {
 		return fmt.Errorf("更新通知状态失败: %w", err)
-	}
-
-	return nil
-}
-
-// SendBulkEmailNotifications 批量发送邮件通知
-func (s *EmailNotificationService) SendBulkEmailNotifications(ctx context.Context, notifications []*models.Notification) error {
-	// 检查系统是否可以发送邮件
-	canSend, err := s.emailConfigService.CanSendEmail(ctx)
-	if err != nil {
-		return fmt.Errorf("检查邮件发送状态失败: %w", err)
-	}
-	if !canSend {
-		return fmt.Errorf("系统邮件功能未启用")
-	}
-
-	// 获取SMTP配置
-	_, err = s.emailConfigService.GetSMTPConfig(ctx)
-	if err != nil {
-		return fmt.Errorf("获取SMTP配置失败: %w", err)
-	}
-
-	successCount := 0
-	failedCount := 0
-
-	for _, notification := range notifications {
-		if err := s.SendEmailNotification(ctx, notification); err != nil {
-			failedCount++
-			continue
-		}
-		successCount++
-	}
-
-	if failedCount > 0 {
-		return fmt.Errorf("批量发送完成: 成功 %d, 失败 %d", successCount, failedCount)
 	}
 
 	return nil
@@ -220,8 +208,10 @@ func (s *EmailNotificationService) GetEmailTemplate(notificationType models.Noti
 // isEmailEnabledForUser 检查用户是否启用了邮件通知
 func (s *EmailNotificationService) isEmailEnabledForUser(ctx context.Context, userID uint, notificationType models.NotificationType) (bool, error) {
 	var preference models.NotificationPreference
-	err := s.db.Where("user_id = ? AND notification_type = ?", userID, notificationType).First(&preference).Error
-	
+	err := s.db.WithContext(ctx).
+		Where("user_id = ? AND notification_type = ?", userID, notificationType).
+		First(&preference).Error
+
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
 			// 没有设置偏好，默认启用邮件
@@ -229,64 +219,70 @@ func (s *EmailNotificationService) isEmailEnabledForUser(ctx context.Context, us
 		}
 		return false, err
 	}
-	
+
 	return preference.EmailEnabled, nil
 }
 
 // sendEmail 发送邮件
-func (s *EmailNotificationService) sendEmail(config *models.EmailConfig, to, subject, body string) error {
-	// 创建SMTP认证
-	auth := smtp.PlainAuth("", config.SMTPUsername, config.SMTPPassword, config.SMTPHost)
-	
+func (s *EmailNotificationService) sendEmail(
+	ctx context.Context,
+	config *models.EmailConfig,
+	to string,
+	subject string,
+	body string,
+) error {
+	recipient, err := mailer.CanonicalMailbox(to)
+	if err != nil {
+		return fmt.Errorf("收件邮箱无效: %w", err)
+	}
+	sender, err := mailer.CanonicalMailbox(config.FromEmail)
+	if err != nil {
+		return fmt.Errorf("发件邮箱无效: %w", err)
+	}
+
 	// 构建邮件消息
-	msg := s.buildEmailMessage(config.FromEmail, config.FromName, to, subject, body)
-	
-	// 发送邮件
-	addr := fmt.Sprintf("%s:%d", config.SMTPHost, config.SMTPPort)
-	err := smtp.SendMail(addr, auth, config.FromEmail, []string{to}, []byte(msg))
-	
-	return err
+	msg, err := s.buildEmailMessage(sender, config.FromName, subject, body)
+	if err != nil {
+		return fmt.Errorf("构建邮件失败: %w", err)
+	}
+
+	transport, err := smtpTransportForEmailConfig(config)
+	if err != nil {
+		return err
+	}
+	return transport.Send(ctx, sender, []string{recipient}, msg)
 }
 
 // buildEmailMessage 构建邮件消息
-func (s *EmailNotificationService) buildEmailMessage(fromEmail, fromName, to, subject, htmlBody string) string {
-	headers := make(map[string]string)
-	
-	// 设置发件人
-	if fromName != "" {
-		headers["From"] = fmt.Sprintf("%s <%s>", fromName, fromEmail)
-	} else {
-		headers["From"] = fromEmail
-	}
-	
-	headers["To"] = to
-	headers["Subject"] = subject
-	headers["MIME-Version"] = "1.0"
-	headers["Content-Type"] = "text/html; charset=UTF-8"
-	headers["Date"] = time.Now().Format(time.RFC1123Z)
-	
-	// 构建消息
-	message := ""
-	for k, v := range headers {
-		message += fmt.Sprintf("%s: %s\r\n", k, v)
-	}
-	message += "\r\n" + htmlBody
-	
-	return message
+func (s *EmailNotificationService) buildEmailMessage(fromEmail, fromName, subject, htmlBody string) ([]byte, error) {
+	return mailer.BuildHTMLMessage(fromEmail, fromName, subject, htmlBody)
 }
 
 // renderEmailContent 渲染邮件内容
 func (s *EmailNotificationService) renderEmailContent(template *EmailTemplate, notification *models.Notification) (string, string, error) {
 	// 创建模板数据
 	data := s.buildTemplateData(notification)
-	
-	// 渲染主题
-	subject := s.renderTemplate(template.Subject, data)
-	
-	// 渲染HTML内容
-	htmlBody := s.renderTemplate(template.HTMLBody, data)
-	
-	return subject, htmlBody, nil
+
+	subjectTemplate, err := texttemplate.New("subject").Parse(template.Subject)
+	if err != nil {
+		return "", "", fmt.Errorf("解析邮件主题模板失败: %w", err)
+	}
+	var subject bytes.Buffer
+	if err := subjectTemplate.Execute(&subject, data); err != nil {
+		return "", "", fmt.Errorf("渲染邮件主题失败: %w", err)
+	}
+
+	// html/template 按文本、属性、CSS 和 URL 上下文分别转义数据。
+	bodyTemplate, err := htmltemplate.New("body").Parse(template.HTMLBody)
+	if err != nil {
+		return "", "", fmt.Errorf("解析HTML邮件模板失败: %w", err)
+	}
+	var htmlBody bytes.Buffer
+	if err := bodyTemplate.Execute(&htmlBody, data); err != nil {
+		return "", "", fmt.Errorf("渲染HTML邮件失败: %w", err)
+	}
+
+	return subject.String(), htmlBody.String(), nil
 }
 
 // buildTemplateData 构建模板数据
@@ -299,18 +295,18 @@ func (s *EmailNotificationService) buildTemplateData(notification *models.Notifi
 		"CreatedAt": notification.CreatedAt.Format("2006-01-02 15:04:05"),
 		"ActionURL": notification.ActionURL,
 	}
-	
+
 	// 添加接收者信息
 	if notification.Recipient != nil {
 		data["RecipientName"] = notification.Recipient.Username
 		data["RecipientEmail"] = notification.Recipient.Email
 	}
-	
+
 	// 添加发送者信息
 	if notification.Sender != nil {
 		data["SenderName"] = notification.Sender.Username
 	}
-	
+
 	// 添加相关工单信息
 	if notification.RelatedTicket != nil {
 		data["TicketNumber"] = notification.RelatedTicket.TicketNumber
@@ -318,31 +314,20 @@ func (s *EmailNotificationService) buildTemplateData(notification *models.Notifi
 		data["TicketStatus"] = string(notification.RelatedTicket.Status)
 		data["TicketPriority"] = string(notification.RelatedTicket.Priority)
 	}
-	
+
 	// 解析metadata
 	if notification.Metadata != "" {
 		var metadata map[string]interface{}
 		if err := json.Unmarshal([]byte(notification.Metadata), &metadata); err == nil {
 			for k, v := range metadata {
-				data[k] = v
+				if _, reserved := data[k]; !reserved {
+					data[k] = v
+				}
 			}
 		}
 	}
-	
-	return data
-}
 
-// renderTemplate 简单模板渲染
-func (s *EmailNotificationService) renderTemplate(template string, data map[string]interface{}) string {
-	result := template
-	
-	for key, value := range data {
-		placeholder := fmt.Sprintf("{{.%s}}", key)
-		replacement := fmt.Sprintf("%v", value)
-		result = strings.ReplaceAll(result, placeholder, replacement)
-	}
-	
-	return result
+	return data
 }
 
 // HTML模板定义
@@ -388,7 +373,7 @@ func (s *EmailNotificationService) getTicketAssignedHTMLTemplate() string {
             <p>请尽快登录系统查看和处理此工单。</p>
         </div>
         <div class="footer">
-            <p>© 2024 工单系统. 保留所有权利.</p>
+            <p>© ChronoDesk. 保留所有权利.</p>
             <p>如果您不想接收此类邮件，请在系统中修改通知设置。</p>
         </div>
     </div>
@@ -433,7 +418,7 @@ func (s *EmailNotificationService) getTicketStatusChangedHTMLTemplate() string {
             <a href="{{.ActionURL}}" class="button">查看工单详情</a>
         </div>
         <div class="footer">
-            <p>© 2024 工单系统. 保留所有权利.</p>
+            <p>© ChronoDesk. 保留所有权利.</p>
         </div>
     </div>
 </body>
@@ -477,7 +462,7 @@ func (s *EmailNotificationService) getTicketCommentedHTMLTemplate() string {
             <a href="{{.ActionURL}}" class="button">查看完整对话</a>
         </div>
         <div class="footer">
-            <p>© 2024 工单系统. 保留所有权利.</p>
+            <p>© ChronoDesk. 保留所有权利.</p>
         </div>
     </div>
 </body>
@@ -522,7 +507,7 @@ func (s *EmailNotificationService) getTicketCreatedHTMLTemplate() string {
             <a href="{{.ActionURL}}" class="button">查看工单详情</a>
         </div>
         <div class="footer">
-            <p>© 2024 工单系统. 保留所有权利.</p>
+            <p>© ChronoDesk. 保留所有权利.</p>
         </div>
     </div>
 </body>
@@ -565,7 +550,7 @@ func (s *EmailNotificationService) getTicketOverdueHTMLTemplate() string {
             <a href="{{.ActionURL}}" class="button">立即处理</a>
         </div>
         <div class="footer">
-            <p>© 2024 工单系统. 保留所有权利.</p>
+            <p>© ChronoDesk. 保留所有权利.</p>
         </div>
     </div>
 </body>
@@ -606,7 +591,7 @@ func (s *EmailNotificationService) getSystemMaintenanceHTMLTemplate() string {
             <p>维护期间可能会影响系统正常使用，请您提前做好准备。感谢您的理解与配合！</p>
         </div>
         <div class="footer">
-            <p>© 2024 工单系统. 保留所有权利.</p>
+            <p>© ChronoDesk. 保留所有权利.</p>
         </div>
     </div>
 </body>
@@ -648,7 +633,7 @@ func (s *EmailNotificationService) getSystemAlertHTMLTemplate() string {
             <p>请管理员及时查看和处理此警报。</p>
         </div>
         <div class="footer">
-            <p>© 2024 工单系统. 保留所有权利.</p>
+            <p>© ChronoDesk. 保留所有权利.</p>
         </div>
     </div>
 </body>
@@ -687,7 +672,7 @@ func (s *EmailNotificationService) getDefaultHTMLTemplate() string {
             </div>
         </div>
         <div class="footer">
-            <p>© 2024 工单系统. 保留所有权利.</p>
+            <p>© ChronoDesk. 保留所有权利.</p>
         </div>
     </div>
 </body>
@@ -713,7 +698,7 @@ func (s *EmailNotificationService) getTicketAssignedTextTemplate() string {
 请访问以下链接查看详情：{{.ActionURL}}
 
 ---
-工单系统`
+ChronoDesk`
 }
 
 func (s *EmailNotificationService) getTicketStatusChangedTextTemplate() string {
@@ -734,7 +719,7 @@ func (s *EmailNotificationService) getTicketStatusChangedTextTemplate() string {
 请访问以下链接查看详情：{{.ActionURL}}
 
 ---
-工单系统`
+ChronoDesk`
 }
 
 func (s *EmailNotificationService) getTicketCommentedTextTemplate() string {
@@ -755,7 +740,7 @@ func (s *EmailNotificationService) getTicketCommentedTextTemplate() string {
 请访问以下链接查看完整对话：{{.ActionURL}}
 
 ---
-工单系统`
+ChronoDesk`
 }
 
 func (s *EmailNotificationService) getTicketCreatedTextTemplate() string {
@@ -777,7 +762,7 @@ func (s *EmailNotificationService) getTicketCreatedTextTemplate() string {
 请访问以下链接查看详情：{{.ActionURL}}
 
 ---
-工单系统`
+ChronoDesk`
 }
 
 func (s *EmailNotificationService) getTicketOverdueTextTemplate() string {
@@ -798,7 +783,7 @@ func (s *EmailNotificationService) getTicketOverdueTextTemplate() string {
 请立即访问以下链接处理：{{.ActionURL}}
 
 ---
-工单系统`
+ChronoDesk`
 }
 
 func (s *EmailNotificationService) getSystemMaintenanceTextTemplate() string {
@@ -818,7 +803,7 @@ func (s *EmailNotificationService) getSystemMaintenanceTextTemplate() string {
 感谢您的理解与配合！
 
 ---
-工单系统`
+ChronoDesk`
 }
 
 func (s *EmailNotificationService) getSystemAlertTextTemplate() string {
@@ -838,7 +823,7 @@ func (s *EmailNotificationService) getSystemAlertTextTemplate() string {
 请管理员及时查看和处理此警报。
 
 ---
-工单系统`
+ChronoDesk`
 }
 
 func (s *EmailNotificationService) getDefaultTextTemplate() string {
@@ -855,5 +840,5 @@ func (s *EmailNotificationService) getDefaultTextTemplate() string {
 {{.Content}}
 
 ---
-工单系统`
+ChronoDesk`
 }

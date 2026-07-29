@@ -1,14 +1,18 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 )
+
+var e164PhonePattern = regexp.MustCompile(`^\+[1-9][0-9]{1,14}$`)
 
 // AdminUserHandler 管理员用户管理处理器
 type AdminUserHandler struct {
@@ -47,7 +51,7 @@ func (h *AdminUserHandler) GetUserList(c *gin.Context) {
 	if err := c.ShouldBindQuery(&req); err != nil {
 		c.JSON(http.StatusBadRequest, ApiResponse{
 			Code: 1,
-			Msg:  "查询参数错误: " + err.Error(),
+			Msg:  "查询参数错误",
 			Data: nil,
 		})
 		return
@@ -55,9 +59,10 @@ func (h *AdminUserHandler) GetUserList(c *gin.Context) {
 
 	response, err := h.adminUserService.GetUserList(c.Request.Context(), &req)
 	if err != nil {
+		logHandlerFailure(c, "admin_user.list", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
-			Msg:  "获取用户列表失败: " + err.Error(),
+			Msg:  "获取用户列表失败",
 			Data: nil,
 		})
 		return
@@ -107,9 +112,10 @@ func (h *AdminUserHandler) GetUser(c *gin.Context) {
 			})
 			return
 		}
+		logHandlerFailure(c, "admin_user.get", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
-			Msg:  "获取用户信息失败: " + err.Error(),
+			Msg:  "获取用户信息失败",
 			Data: nil,
 		})
 		return
@@ -142,7 +148,7 @@ func (h *AdminUserHandler) CreateUser(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, ApiResponse{
 			Code: 1,
-			Msg:  "请求参数错误: " + err.Error(),
+			Msg:  "请求参数错误",
 			Data: nil,
 		})
 		return
@@ -169,17 +175,18 @@ func (h *AdminUserHandler) CreateUser(c *gin.Context) {
 
 	user, err := h.adminUserService.CreateUser(c.Request.Context(), &req)
 	if err != nil {
-		if strings.Contains(err.Error(), "already exists") {
+		if errors.Is(err, services.ErrAdminUserIdentityConflict) {
 			c.JSON(http.StatusConflict, ApiResponse{
 				Code: 1,
-				Msg:  err.Error(),
+				Msg:  "用户名或邮箱已被使用（包括已删除账号）",
 				Data: nil,
 			})
 			return
 		}
+		logHandlerFailure(c, "admin_user.create", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
-			Msg:  "创建用户失败: " + err.Error(),
+			Msg:  "创建用户失败",
 			Data: nil,
 		})
 		return
@@ -225,10 +232,22 @@ func (h *AdminUserHandler) UpdateUser(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, ApiResponse{
 			Code: 1,
-			Msg:  "请求参数错误: " + err.Error(),
+			Msg:  "请求参数错误",
 			Data: nil,
 		})
 		return
+	}
+	if req.Phone != nil {
+		phone := strings.TrimSpace(*req.Phone)
+		if phone != "" && !e164PhonePattern.MatchString(phone) {
+			c.JSON(http.StatusBadRequest, ApiResponse{
+				Code: 1,
+				Msg:  "电话号码必须是 E.164 格式，例如 +8613800138000",
+				Data: nil,
+			})
+			return
+		}
+		req.Phone = &phone
 	}
 
 	user, err := h.adminUserService.UpdateUser(c.Request.Context(), uint(userID), &req)
@@ -241,17 +260,26 @@ func (h *AdminUserHandler) UpdateUser(c *gin.Context) {
 			})
 			return
 		}
-		if strings.Contains(err.Error(), "already exists") {
+		if errors.Is(err, services.ErrAdminUserIdentityConflict) {
 			c.JSON(http.StatusConflict, ApiResponse{
 				Code: 1,
-				Msg:  err.Error(),
+				Msg:  "用户名或邮箱已被使用（包括已删除账号）",
 				Data: nil,
 			})
 			return
 		}
+		if strings.Contains(err.Error(), "cannot deactivate") {
+			c.JSON(http.StatusConflict, ApiResponse{
+				Code: 1,
+				Msg:  "不能停用或降级最后一个活跃管理员",
+				Data: nil,
+			})
+			return
+		}
+		logHandlerFailure(c, "admin_user.update", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
-			Msg:  "更新用户信息失败: " + err.Error(),
+			Msg:  "更新用户信息失败",
 			Data: nil,
 		})
 		return
@@ -296,7 +324,7 @@ func (h *AdminUserHandler) ResetUserPassword(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, ApiResponse{
 			Code: 1,
-			Msg:  "请求参数错误: " + err.Error(),
+			Msg:  "请求参数错误",
 			Data: nil,
 		})
 		return
@@ -321,9 +349,10 @@ func (h *AdminUserHandler) ResetUserPassword(c *gin.Context) {
 			})
 			return
 		}
+		logHandlerFailure(c, "admin_user.reset_password", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
-			Msg:  "重置密码失败: " + err.Error(),
+			Msg:  "重置密码失败",
 			Data: nil,
 		})
 		return
@@ -377,14 +406,15 @@ func (h *AdminUserHandler) DeleteUser(c *gin.Context) {
 		if strings.Contains(err.Error(), "cannot delete") {
 			c.JSON(http.StatusConflict, ApiResponse{
 				Code: 1,
-				Msg:  err.Error(),
+				Msg:  "不能删除最后一个活跃管理员",
 				Data: nil,
 			})
 			return
 		}
+		logHandlerFailure(c, "admin_user.delete", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
-			Msg:  "删除用户失败: " + err.Error(),
+			Msg:  "删除用户失败",
 			Data: nil,
 		})
 		return
@@ -393,127 +423,6 @@ func (h *AdminUserHandler) DeleteUser(c *gin.Context) {
 	c.JSON(http.StatusOK, ApiResponse{
 		Code: 0,
 		Msg:  "用户删除成功",
-		Data: nil,
-	})
-}
-
-// ToggleUserStatus 切换用户状态
-// @Summary 切换用户状态
-// @Description 管理员切换用户状态（启用/禁用）
-// @Tags 管理员-用户管理
-// @Accept json
-// @Produce json
-// @Security ApiKeyAuth
-// @Param id path int true "用户ID"
-// @Success 200 {object} ApiResponse{data=models.UserResponse}
-// @Failure 400 {object} ApiResponse
-// @Failure 401 {object} ApiResponse
-// @Failure 403 {object} ApiResponse
-// @Failure 404 {object} ApiResponse
-// @Failure 409 {object} ApiResponse
-// @Failure 500 {object} ApiResponse
-// @Router /api/admin/users/{id}/toggle-status [post]
-func (h *AdminUserHandler) ToggleUserStatus(c *gin.Context) {
-	userIDStr := c.Param("id")
-	userID, err := strconv.ParseUint(userIDStr, 10, 32)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, ApiResponse{
-			Code: 1,
-			Msg:  "无效的用户ID",
-			Data: nil,
-		})
-		return
-	}
-
-	user, err := h.adminUserService.ToggleUserStatus(c.Request.Context(), uint(userID))
-	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			c.JSON(http.StatusNotFound, ApiResponse{
-				Code: 1,
-				Msg:  "用户不存在",
-				Data: nil,
-			})
-			return
-		}
-		if strings.Contains(err.Error(), "cannot") {
-			c.JSON(http.StatusConflict, ApiResponse{
-				Code: 1,
-				Msg:  err.Error(),
-				Data: nil,
-			})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, ApiResponse{
-			Code: 1,
-			Msg:  "切换用户状态失败: " + err.Error(),
-			Data: nil,
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, ApiResponse{
-		Code: 0,
-		Msg:  "用户状态切换成功",
-		Data: user.ToResponse(),
-	})
-}
-
-// BatchDeleteUsers 批量删除用户
-// @Summary 批量删除用户
-// @Description 管理员批量删除多个用户
-// @Tags 管理员-用户管理
-// @Accept json
-// @Produce json
-// @Security ApiKeyAuth
-// @Param request body BatchDeleteUsersRequest true "批量删除用户请求"
-// @Success 200 {object} ApiResponse
-// @Failure 400 {object} ApiResponse
-// @Failure 401 {object} ApiResponse
-// @Failure 403 {object} ApiResponse
-// @Failure 409 {object} ApiResponse
-// @Failure 500 {object} ApiResponse
-// @Router /api/admin/users/batch-delete [post]
-func (h *AdminUserHandler) BatchDeleteUsers(c *gin.Context) {
-	var req BatchDeleteUsersRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ApiResponse{
-			Code: 1,
-			Msg:  "请求参数错误: " + err.Error(),
-			Data: nil,
-		})
-		return
-	}
-
-	if len(req.UserIDs) == 0 {
-		c.JSON(http.StatusBadRequest, ApiResponse{
-			Code: 1,
-			Msg:  "用户ID列表不能为空",
-			Data: nil,
-		})
-		return
-	}
-
-	err := h.adminUserService.BatchDeleteUsers(c.Request.Context(), req.UserIDs)
-	if err != nil {
-		if strings.Contains(err.Error(), "cannot delete") {
-			c.JSON(http.StatusConflict, ApiResponse{
-				Code: 1,
-				Msg:  err.Error(),
-				Data: nil,
-			})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, ApiResponse{
-			Code: 1,
-			Msg:  "批量删除用户失败: " + err.Error(),
-			Data: nil,
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, ApiResponse{
-		Code: 0,
-		Msg:  "批量删除用户成功",
 		Data: nil,
 	})
 }
@@ -533,9 +442,10 @@ func (h *AdminUserHandler) BatchDeleteUsers(c *gin.Context) {
 func (h *AdminUserHandler) GetUserStats(c *gin.Context) {
 	stats, err := h.adminUserService.GetUserStats(c.Request.Context())
 	if err != nil {
+		logHandlerFailure(c, "admin_user.get_statistics", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
-			Msg:  "获取用户统计信息失败: " + err.Error(),
+			Msg:  "获取用户统计信息失败",
 			Data: nil,
 		})
 		return
@@ -553,9 +463,4 @@ func (h *AdminUserHandler) GetUserStats(c *gin.Context) {
 // ResetPasswordRequest 重置密码请求
 type ResetPasswordRequest struct {
 	NewPassword string `json:"new_password" binding:"required,min=8" example:"newpassword123"`
-}
-
-// BatchDeleteUsersRequest 批量删除用户请求
-type BatchDeleteUsersRequest struct {
-	UserIDs []uint `json:"user_ids" binding:"required" example:"[1,2,3]"`
 }

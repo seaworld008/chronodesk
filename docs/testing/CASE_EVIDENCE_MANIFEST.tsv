@@ -1,0 +1,237 @@
+case_id	coverage	evidence	execution_record
+INF-001	fault_injection	fault@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::INF-001	not_recorded
+INF-002	fault_injection	fault@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::INF-002	not_recorded
+INF-003	release_manual	manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::INF-003	not_recorded
+INF-004	release_manual	manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::INF-004	not_recorded
+INF-005	automated	go@server/internal/database/migrate_test.go::TestRunMigrationsUpgradesLegacyHumanRolesBeforeInstallingConstraint;go@server/internal/database/automation_trigger_migration_test.go::TestMigrateAutomationRuleTriggerEventsIsIdempotent;go@server/internal/database/automation_trigger_migration_test.go::TestMigrateAutomationRuleTriggerEventsRejectsUnknownValues	not_recorded
+INF-006	automated	go@server/internal/security/database_secrets_test.go::TestDatabaseSecretRotationRejectsPlaintextAndRollsBack;go@server/internal/security/database_secrets_test.go::TestDatabaseSecretRotationRotatesKeyID;go@server/cmd/credential-maintain/main_test.go::TestSelectMaintenanceModeRequiresExactlyOneMode	not_recorded
+INF-007	ci_gate	ci@.github/workflows/smoke.yml	not_recorded
+INF-008	fault_injection	fault@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::INF-008	not_recorded
+INF-009	release_manual	manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::INF-009	not_recorded
+INF-010	fault_injection	fault@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::INF-010	not_recorded
+INF-011	automated	go@server/internal/services/agent_execution_guard_test.go::TestRedisAgentExecutionGuardMapsLimitsAndFailsClosed;go@server/internal/services/scheduler_service_test.go::TestSchedulerFailsClosedWhenRedisUnavailable	not_recorded
+INF-012	hybrid	go@server/internal/services/sla_working_time_test.go::TestAddWorkingTimeUsesBusinessTimezoneAndPreservesCallerLocation;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::INF-012	not_recorded
+INF-013	automated	go@server/internal/database/migrate_test.go::TestRunMigrationsFromModelRejectsInvalidResumePoint	not_recorded
+INF-014	ci_gate	ci@.github/workflows/smoke.yml	not_recorded
+AUTH-001	hybrid	go@server/internal/auth/password_test.go::TestHashPassword_UsesBcryptPrefix;pytest@server/tests/auth/test_auth_flows.py::test_register_refresh_and_logout	not_recorded
+AUTH-002	release_manual	go@server/internal/auth/handler_localization_test.go::TestAuthHandlerRegisterValidationMessagesAreChinese;manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::AUTH-002	not_recorded
+AUTH-003	fault_injection	fault@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::AUTH-003	not_recorded
+AUTH-004	hybrid	pytest@server/tests/auth/test_auth_flows.py::test_register_refresh_and_logout;playwright@web/e2e/tickets.spec.ts::should allow user to login	not_recorded
+AUTH-005	automated	pytest@server/tests/auth/test_auth_flows.py::test_wrong_password_and_unknown_email_are_indistinguishable_and_limited	not_recorded
+AUTH-006	automated	pytest@server/tests/auth/test_auth_flows.py::test_wrong_password_and_unknown_email_are_indistinguishable_and_limited	not_recorded
+AUTH-007	hybrid	go@server/internal/auth/handler_access_state_test.go::TestJWTManagerRejectsWrongAudienceAndSubject;pytest@server/tests/human/test_zz_error_contract.py::test_authentication_authorization_and_not_found_errors_are_machine_safe	not_recorded
+AUTH-008	automated	go@server/internal/auth/handler_access_state_test.go::TestRequireAuthRevalidatesCurrentUserStateAndRole	not_recorded
+AUTH-009	automated	go@server/internal/auth/handler_access_state_test.go::TestRequireAuthRevalidatesCurrentUserStateAndRole	not_recorded
+AUTH-010	hybrid	go@server/internal/auth/token_storage_test.go::TestRefreshRotationIsAtomicAndSingleWinner;pytest@server/tests/auth/test_auth_flows.py::test_register_refresh_and_logout	not_recorded
+AUTH-011	automated	go@server/internal/auth/session_revocation_test.go::TestRefreshTokenCanOnlyBeConsumedOnce	not_recorded
+AUTH-012	hybrid	go@server/internal/auth/session_revocation_test.go::TestLogoutRevokesAccessTokenSessionImmediately;pytest@server/tests/auth/test_auth_flows.py::test_register_refresh_and_logout	not_recorded
+AUTH-013	hybrid	go@server/internal/auth/session_revocation_test.go::TestLogoutAllRevokesEveryUserSessionOnly;pytest@server/tests/auth/test_auth_flows.py::test_logout_all_revokes_every_access_and_refresh_token	not_recorded
+AUTH-014	release_manual	go@server/internal/auth/session_revocation_test.go::TestRefreshTokenIssuedBeforePasswordChangeIsRejected;manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::AUTH-014	not_recorded
+AUTH-015	automated	go@server/internal/auth/token_storage_test.go::TestPasswordResetTransactionHasSingleWinnerAndRevokesSessions	not_recorded
+AUTH-016	automated	go@server/internal/auth/token_storage_test.go::TestEmailVerificationTransactionHasSingleWinner	not_recorded
+AUTH-017	hybrid	go@server/internal/auth/otp_secret_storage_test.go::TestOTPSecretAndBackupCodesAreProtectedAtRest;pytest@server/tests/auth/test_auth_flows.py::test_otp_trusted_device_flow	not_recorded
+AUTH-018	hybrid	go@server/internal/auth/otp_secret_storage_test.go::TestBackupCodeCanOnlyBeConsumedOnceConcurrently;pytest@server/tests/auth/test_auth_flows.py::test_backup_code_single_use	not_recorded
+AUTH-019	hybrid	go@server/internal/auth/handler_trusted_device_cookie_test.go::TestTrustedDeviceCredentialIsNotPartOfTheJSONContract;playwright@web/e2e/trusted-devices.spec.ts::AUTH-019 AUTH-022 UI-023：可信设备仅使用 HttpOnly Cookie 并可撤销	not_recorded
+AUTH-020	hybrid	go@server/internal/auth/token_storage_test.go::TestBearerCredentialsAreStoredOnlyAsPurposeSeparatedDigests;ci@.github/workflows/security.yml	not_recorded
+AUTH-021	automated	go@server/internal/services/user_service_avatar_test.go::TestUploadAvatarPersistsSanitizedObjectAndReplacesPreviousObject;go@server/internal/services/user_service_avatar_test.go::TestUploadAvatarRejectsSpoofedAndOversizedPayloads	not_recorded
+AUTH-022	hybrid	go@server/internal/services/trusted_device_service_test.go::TestTrustedDeviceService_RevokeTrustedDevice;playwright@web/e2e/trusted-devices.spec.ts::AUTH-019 AUTH-022 UI-023：可信设备仅使用 HttpOnly Cookie 并可撤销	not_recorded
+RBAC-001	hybrid	pytest@server/tests/human/test_rbac_matrix.py::test_ticket_object_permission_matrix;manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::RBAC-001	not_recorded
+RBAC-002	hybrid	pytest@server/tests/human/test_rbac_matrix.py::test_ticket_object_permission_matrix;manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::RBAC-002	not_recorded
+RBAC-003	automated	pytest@server/tests/human/test_failure_driven_contracts.py::test_agent_full_queue_read_remains_read_only_under_current_human_policy	not_recorded
+RBAC-004	automated	pytest@server/tests/human/test_failure_driven_contracts.py::test_agent_full_queue_read_remains_read_only_under_current_human_policy	not_recorded
+RBAC-005	automated	pytest@server/tests/human/test_rbac_matrix.py::test_ticket_object_permission_matrix	not_recorded
+RBAC-006	automated	pytest@server/tests/human/test_rbac_matrix.py::test_ticket_object_permission_matrix	not_recorded
+RBAC-007	automated	pytest@server/tests/human/test_content_and_notifications.py::test_public_and_internal_comment_permissions	not_recorded
+RBAC-008	automated	pytest@server/tests/human/test_rbac_matrix.py::test_four_human_roles_and_admin_only_surfaces	not_recorded
+RBAC-009	automated	pytest@server/tests/human/test_zz_error_contract.py::test_suspended_account_invalidates_an_existing_access_token;pytest@server/tests/human/test_zz_error_contract.py::test_deleted_account_invalidates_an_existing_access_token	not_recorded
+RBAC-010	hybrid	go@server/internal/auth/gorm_repository_role_test.go::TestGormUserRepositoryRejectsRolesOutsideClosedHumanEnum;pytest@server/tests/human/test_rbac_matrix.py::test_four_human_roles_and_admin_only_surfaces;pytest@server/tests/human/test_rbac_matrix.py::test_soft_deleted_human_identity_returns_stable_conflict	not_recorded
+RBAC-011	hybrid	go@server/internal/services/admin_user_service_role_test.go::TestAdminUserServiceUpdatePreservesLastActiveAdmin;playwright@web/e2e/00-users.spec.ts::RBAC-011 UI-013：最后一个活跃管理员不能被降级且提示中文	not_recorded
+RBAC-012	automated	pytest@server/tests/human/test_rbac_matrix.py::test_human_role_change_audit_identifies_actor_target_result_and_redacts_query	not_recorded
+TKT-001	hybrid	go@server/internal/services/agent_native_service_test.go::TestAgentNativeTicketCreateCommitsHistoryEventOutboxAndIdempotency;pytest@server/tests/human/test_ticket_boundaries.py::test_ticket_create_input_boundaries	not_recorded
+TKT-002	hybrid	go@server/internal/handlers/ticket_human_contract_test.go::TestHumanTicketCreateTrimsRequiredTextAndRejectsBlankValues;pytest@server/tests/human/test_ticket_boundaries.py::test_ticket_create_input_boundaries	not_recorded
+TKT-003	hybrid	go@server/internal/services/agent_native_service_test.go::TestAgentNativeIdempotencyReserveCompleteReplayAndConflict;pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_agent_rest_ticket_idempotency_lease_version_and_event_cursor	not_recorded
+TKT-004	automated	go@server/internal/services/agent_native_service_test.go::TestAgentNativeIdempotencyReserveCompleteReplayAndConflict	not_recorded
+TKT-005	hybrid	go@server/internal/handlers/ticket_human_contract_test.go::TestHumanTicketDetailReturnsStrongETag;pytest@server/tests/human/test_failure_driven_contracts.py::test_human_ticket_detail_returns_strong_etag	not_recorded
+TKT-006	automated	pytest@server/tests/human/test_ticket_boundaries.py::test_ticket_pagination_and_identifier_bounds	not_recorded
+TKT-007	hybrid	go@server/internal/handlers/ticket_human_contract_test.go::TestHumanTicketPutEnforcesIfMatch;pytest@server/tests/human/test_failure_driven_contracts.py::test_human_ticket_put_enforces_if_match	not_recorded
+TKT-008	hybrid	go@server/internal/handlers/ticket_human_contract_test.go::TestHumanWorkflowCommandsEnforceIfMatch;pytest@server/tests/human/test_failure_driven_contracts.py::test_human_ticket_workflow_enforces_if_match	not_recorded
+TKT-009	hybrid	go@server/internal/services/ticket_service_agent_native_test.go::TestHumanTicketCASCannotOverwriteConcurrentAgentVersion;pytest@server/tests/human/test_ticket_boundaries.py::test_concurrent_human_updates_produce_version_conflict	not_recorded
+TKT-010	hybrid	go@server/internal/services/agent_native_assignment_test.go::TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules;pytest@server/tests/tickets/test_lifecycle.py::test_full_lifecycle	not_recorded
+TKT-011	automated	go@server/internal/services/agent_native_assignment_test.go::TestAgentNativeAssignmentErrorCodesAreStable	not_recorded
+TKT-012	automated	go@server/internal/services/agent_native_assignment_test.go::TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules	not_recorded
+TKT-013	hybrid	go@server/internal/models/ticket_test.go::TestTicketStatusTransitions;pytest@server/tests/tickets/test_lifecycle.py::test_full_lifecycle	not_recorded
+TKT-014	automated	pytest@server/tests/human/test_ticket_workflow_contracts.py::test_invalid_transition_is_a_versioned_conflict_with_allowed_next_states	not_recorded
+TKT-015	hybrid	go@server/internal/services/ticket_service_test.go::TestReopenTicketClearsCompletionTimestamps;pytest@server/tests/tickets/test_lifecycle.py::test_full_lifecycle	not_recorded
+TKT-016	release_manual	go@server/internal/services/ticket_service_test.go::TestEscalateTicketMarksTicketAsEscalated;manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::TKT-016	not_recorded
+TKT-017	automated	pytest@server/tests/human/test_ticket_workflow_contracts.py::test_transfer_updates_assignee_history_event_and_recipient_notification	not_recorded
+TKT-018	hybrid	go@server/internal/services/ticket_service_delete_test.go::TestDeleteTicketCleansRelatedData;pytest@server/tests/tickets/test_lifecycle.py::test_full_lifecycle	not_recorded
+TKT-019	automated	pytest@server/tests/human/test_ticket_workflow_contracts.py::test_bulk_delete_reports_authorization_and_missing_items_without_silence	not_recorded
+TKT-020	automated	go@server/internal/services/ticket_service_bulk_update_test.go::TestBulkUpdateTicketsWritesVersionedAuditAndOutboxAtomically;go@server/internal/services/ticket_service_bulk_update_test.go::TestBulkUpdateTicketsRollsBackEveryTicketWhenLatestTransitionIsInvalid	not_recorded
+TKT-021	hybrid	go@server/internal/services/ticket_service_test.go::TestGetTicketsSupportsMultiValueFilters;pytest@server/tests/human/test_ticket_workflow_contracts.py::test_ticket_list_combines_status_priority_type_source_assignee_and_search	not_recorded
+TKT-022	release_manual	go@server/internal/services/ticket_service_filters_test.go::TestGetTickets_SortFieldInjectionFallsBackToCreatedAt;manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::TKT-022	not_recorded
+TKT-023	automated	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_agent_ticket_cursor_first_middle_tail_empty_and_invalid_limits	not_recorded
+TKT-024	automated	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_agent_ticket_cursor_first_middle_tail_empty_and_invalid_limits	not_recorded
+TKT-025	hybrid	go@server/internal/services/ticket_service_filters_test.go::TestGetTicketsFilters_SLAOverdueUnassigned;go@server/internal/handlers/ticket_workflow_handler_test.go::TestCustomerSpecialListsUseSafeTicketDTO	not_recorded
+TKT-026	release_manual	go@server/internal/models/ticket_test.go::TestTicketToResponseCustomFields;manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::TKT-026	not_recorded
+TKT-027	hybrid	go@server/internal/database/history_event_link_migration_test.go::TestMigrateTicketHistoryEventLinksBackfillsOnlyProvableMatches;pytest@server/tests/human/test_failure_driven_contracts.py::test_customer_history_redacts_assignment_and_internal_changes	not_recorded
+TKT-028	automated	go@server/internal/websocket/integration_test.go::TestNotificationMarkedAsReadHook_PushesProvidedUnreadCount;go@server/internal/websocket/integration_test.go::TestClientHandleMarkRead_InvokesReadHandlerAndPushesUnreadCount;go@server/internal/websocket/integration_test.go::TestClientHandleMarkReadRejectsInvalidNumericIDs;go@server/internal/websocket/origin_test.go::TestOriginAllowed	not_recorded
+TKT-029	automated	go@server/internal/services/ticket_service_notification_outbox_test.go::TestNotificationOutboxFailureRollsBackHumanTicketWrite	not_recorded
+TKT-030	automated	go@server/internal/services/sla_working_time_test.go::TestAddWorkingTimeUsesConfiguredWindowsAcrossWeekend;go@server/internal/services/escalation_service_test.go::TestHasFirstResponseIgnoresSystemComments	not_recorded
+CNT-001	hybrid	go@server/internal/services/agent_native_service_test.go::TestAgentNativeCommentActorEventAndIdempotency;pytest@server/tests/human/test_content_and_notifications.py::test_public_and_internal_comment_permissions	not_recorded
+CNT-002	automated	pytest@server/tests/human/test_content_and_notifications.py::test_public_and_internal_comment_permissions	not_recorded
+CNT-003	hybrid	go@server/internal/handlers/ticket_content_handler_test.go::TestCustomerCannotCreateCommentWorklog;pytest@server/tests/human/test_content_and_notifications.py::test_public_and_internal_comment_permissions	not_recorded
+CNT-004	hybrid	go@server/internal/handlers/ticket_content_handler_test.go::TestCreateCommentRejectsInvalidInputWithChineseContract;pytest@server/tests/human/test_failure_driven_contracts.py::test_invalid_comment_errors_are_chinese_without_validator_details	not_recorded
+CNT-005	release_manual	go@server/internal/handlers/ticket_content_handler_test.go::TestCustomerCannotReferenceInternalDeletedOrCrossTicketComment;manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::CNT-005	not_recorded
+CNT-006	hybrid	go@server/internal/services/agent_native_service_test.go::TestAgentNativeLocalAttachmentSecurityHashScanAndLimit;pytest@server/tests/human/test_content_and_notifications.py::test_attachment_rejection_name_safety_and_download_authorization	not_recorded
+CNT-007	release_manual	go@server/internal/services/user_service_avatar_test.go::TestUploadAvatarRejectsSpoofedAndOversizedPayloads;manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::CNT-007	not_recorded
+CNT-008	hybrid	go@server/internal/agentplatform/outbox_delivery_test.go::TestAttachmentCleanupOutboxRejectsPathTraversal;pytest@server/tests/human/test_content_and_notifications.py::test_attachment_rejection_name_safety_and_download_authorization	not_recorded
+CNT-009	hybrid	go@server/internal/services/agent_native_service_test.go::TestAgentNativeLocalAttachmentSecurityHashScanAndLimit;playwright@web/e2e/ticket-content.spec.ts::CNT-001 CNT-002 CNT-006 CNT-009 UI-011：评论、上传、扫描与下载	not_recorded
+CNT-010	automated	pytest@server/tests/human/test_content_and_notifications.py::test_attachment_rejection_name_safety_and_download_authorization	not_recorded
+CNT-011	fault_injection	fault@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::CNT-011	not_recorded
+CNT-012	release_manual	manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::CNT-012	not_recorded
+CNT-013	automated	go@server/internal/database/attachment_projection_migration_test.go::TestMigrateAttachmentProjectionsDropsOnlyEmptyLegacyColumns;go@server/internal/database/attachment_projection_migration_test.go::TestMigrateAttachmentProjectionsFailsClosedBeforeSchemaChange	not_recorded
+CNT-014	hybrid	go@server/internal/models/json_fields_test.go::TestTicketAndCommentResponsesOmitLegacyAttachmentArrays;ci@.github/workflows/security.yml	not_recorded
+AUT-001	hybrid	go@server/internal/services/automation_service_test.go::TestAutomationRuleWritesRequireCurrentCloudEventTypes;pytest@server/tests/automation/test_rules.py::test_rule_crud_flow	not_recorded
+AUT-002	hybrid	go@server/internal/services/automation_service_test.go::TestAutomationRuleWritesRequireCurrentCloudEventTypes;pytest@server/tests/automation/test_rules.py::test_legacy_trigger_name_is_rejected	not_recorded
+AUT-003	automated	go@server/internal/database/automation_trigger_migration_test.go::TestMigrateAutomationRuleTriggerEventsRejectsUnknownValues	not_recorded
+AUT-004	automated	go@server/internal/services/automation_native_test.go::TestDomainEventAutomationUsesNativeCommandsAndIsIdempotent;go@server/internal/services/automation_native_test.go::TestNativeUpdatedEventTriggersAutomationComment	not_recorded
+AUT-005	automated	go@server/internal/services/automation_native_test.go::TestDomainEventAutomationUsesNativeCommandsAndIsIdempotent	not_recorded
+AUT-006	automated	go@server/internal/services/automation_native_test.go::TestAutomationPermanentFailureRecordsOnlyClaimedAttempt	not_recorded
+AUT-007	automated	go@server/internal/database/webhook_event_migration_test.go::TestMigrateWebhookEventTaxonomyPreservesSubscriptionSemantics	not_recorded
+AUT-008	automated	go@server/internal/services/automation_native_test.go::TestScheduledAutomationTriggerIsDurableBeforeExecution	not_recorded
+AUT-009	hybrid	go@server/internal/services/sla_working_time_test.go::TestAddWorkingTimeRejectsInvalidOrEmptySchedules;pytest@server/tests/automation/test_sla.py::test_sla_create_list_detail_delete	not_recorded
+AUT-010	automated	go@server/internal/services/escalation_service_test.go::TestSLAViolationUsesNativeCommandsAndIsStableAcrossScans	not_recorded
+AUT-011	automated	pytest@server/tests/automation/test_templates.py::test_template_crud	not_recorded
+AUT-012	automated	pytest@server/tests/automation/test_quick_replies.py::test_quick_reply_flow	not_recorded
+AUT-013	release_manual	manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::AUT-013	not_recorded
+AUT-014	fault_injection	fault@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::AUT-014	not_recorded
+AUT-015	automated	go@server/internal/services/scheduler_service_test.go::TestSchedulerLeasePreventsCrossInstanceOverlap	not_recorded
+EVT-001	automated	go@server/internal/services/agent_native_service_test.go::TestAgentNativeEventOutboxRollbackRetryAndRecovery	not_recorded
+EVT-002	hybrid	go@server/internal/agentplatform/outbox_delivery_test.go::TestWebhookNotificationKeepsExactCloudEventIdentity;playwright@web/e2e/webhook-settings.spec.ts::EVT-002 EVT-007 EVT-008 EVT-010 UI-019：创建、编辑、测试并核对日志	not_recorded
+EVT-003	automated	go@server/internal/agentplatform/outbox_delivery_test.go::TestConfiguredWebhookOutboxDeliveryFansOutDurablyAndIdempotently	not_recorded
+EVT-004	automated	go@server/internal/services/notification_service_test.go::TestWebhookNon2xxAlwaysPropagatesToOutboxCaller;go@server/internal/services/notification_service_test.go::TestWebhookOutboxAttemptHasHardTimeoutAndNoLegacyRetry	not_recorded
+EVT-005	release_manual	go@server/internal/services/automation_native_test.go::TestAutomationPermanentFailureRecordsOnlyClaimedAttempt;manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::EVT-005	not_recorded
+EVT-006	release_manual	manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::EVT-006	not_recorded
+EVT-007	hybrid	go@server/internal/security/callback_test.go::TestCallbackURLRejectsSSRFPrimitives;playwright@web/e2e/webhook-settings.spec.ts::EVT-002 EVT-007 EVT-008 EVT-010 UI-019：创建、编辑、测试并核对日志	not_recorded
+EVT-008	hybrid	go@server/internal/services/notification_service_secret_logging_test.go::TestWebhookAuditLogNeverPersistsCredentialsOrSignatures;ci@.github/workflows/security.yml	not_recorded
+EVT-009	release_manual	manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::EVT-009	not_recorded
+EVT-010	hybrid	playwright@web/e2e/webhook-settings.spec.ts::EVT-002 EVT-007 EVT-008 EVT-010 UI-019：创建、编辑、测试并核对日志;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::EVT-010	not_recorded
+EVT-011	hybrid	pytest@server/tests/human/test_content_and_notifications.py::test_notifications_are_strictly_recipient_scoped;playwright@web/e2e/notifications.spec.ts::应显示本轮真实创建的通知	not_recorded
+EVT-012	automated	pytest@server/tests/human/test_content_and_notifications.py::test_notifications_are_strictly_recipient_scoped	not_recorded
+EVT-013	release_manual	manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::EVT-013	not_recorded
+EVT-014	automated	go@server/internal/services/agent_native_service_test.go::TestCloudEventWireUsesCompliantScalarExtensions	not_recorded
+EVT-015	release_manual	manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::EVT-015	not_recorded
+EVT-016	automated	go@server/internal/services/agent_native_service_test.go::TestProcessOutboxBatchStartsIndependentDeliveriesConcurrently	not_recorded
+EVT-017	release_manual	manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::EVT-017	not_recorded
+EVT-018	automated	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_agent_rest_ticket_idempotency_lease_version_and_event_cursor	not_recorded
+AGT-001	hybrid	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_admin_provisions_e2e_principal_and_explicit_policy;playwright@web/e2e/agent-control.spec.ts::AGT-001 AGT-002 AGT-008 UI-020：服务主体、策略、凭据与单体熔断	not_recorded
+AGT-002	hybrid	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_admin_provisions_e2e_principal_and_explicit_policy;playwright@web/e2e/agent-control.spec.ts::AGT-001 AGT-002 AGT-008 UI-020：服务主体、策略、凭据与单体熔断	not_recorded
+AGT-003	automated	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_client_credentials_rotation_and_deactivation_invalidate_tokens	not_recorded
+AGT-004	hybrid	go@server/internal/agentauth/token_test.go::TestManagerAudienceIsolationMatrixAndRFC9068ScopeClaim;pytest@server/tests/agent_protocol/test_mcp_2026_07_28.py::test_mcp_requires_audience_token_and_rejects_legacy_transport	not_recorded
+AGT-005	automated	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_client_credentials_rotation_and_deactivation_invalidate_tokens	not_recorded
+AGT-006	hybrid	go@server/internal/services/agent_native_service_test.go::TestAgentNativePolicyScopeDenyAndRiskyExplicitAllow;pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_admin_provisions_e2e_principal_and_explicit_policy	not_recorded
+AGT-007	automated	go@server/internal/services/agent_native_service_test.go::TestAgentNativePolicyScopeDenyAndRiskyExplicitAllow	not_recorded
+AGT-008	hybrid	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_client_credentials_rotation_and_deactivation_invalidate_tokens;playwright@web/e2e/agent-control.spec.ts::AGT-001 AGT-002 AGT-008 UI-020：服务主体、策略、凭据与单体熔断	not_recorded
+AGT-009	hybrid	go@server/internal/agentplatform/admin_handler_test.go::TestRuntimeSafetyControlsSurviveRestart;playwright@web/e2e/agent-control.spec.ts::AGT-009 UI-020 UI-021：页面完整且全局只读、紧急停止均可安全恢复	not_recorded
+AGT-010	automated	go@server/internal/services/agent_native_service_test.go::TestAgentNativeExecutionRateAndConcurrencyLimits;go@server/internal/middleware/ratelimit_test.go::TestRateLimitEmitsOnlyRFC9333Headers	not_recorded
+AGT-011	automated	go@server/internal/services/agent_native_service_test.go::TestAgentNativeAutomationLoopDetection	not_recorded
+AGT-012	automated	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_agent_rest_ticket_idempotency_lease_version_and_event_cursor	not_recorded
+AGT-013	automated	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_agent_rest_ticket_idempotency_lease_version_and_event_cursor	not_recorded
+AGT-014	automated	go@server/internal/agentplatform/api_handler_test.go::TestAgentCommentAndAttachmentEndpointsRequireTicketLeaseHeader	not_recorded
+AGT-015	automated	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_agent_rest_ticket_idempotency_lease_version_and_event_cursor	not_recorded
+AGT-016	automated	go@server/internal/services/agent_native_service_test.go::TestAgentNativeLeaseVersionConflictAndIdempotentUpdate	not_recorded
+AGT-017	automated	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_agent_rest_ticket_idempotency_lease_version_and_event_cursor	not_recorded
+AGT-018	automated	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_agent_rest_ticket_idempotency_lease_version_and_event_cursor	not_recorded
+AGT-019	automated	go@server/internal/services/agent_execution_guard_test.go::TestInMemoryAgentExecutionLeaseExpiresAfterCrashWindow	not_recorded
+AGT-020	hybrid	go@server/internal/services/agent_native_service_test.go::TestAgentNativeLeaseVersionConflictAndIdempotentUpdate;pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_agent_rest_ticket_idempotency_lease_version_and_event_cursor	not_recorded
+AGT-021	automated	go@server/internal/services/agent_native_service_test.go::TestAgentNativeServicePrincipalCommentAndAttachmentLeaseEnforcement	not_recorded
+AGT-022	automated	go@server/internal/services/agent_native_service_test.go::TestAgentNativeCommentActorEventAndIdempotency	not_recorded
+AGT-023	automated	go@server/internal/models/agent_native_test.go::TestTicketSourceAgentAndAgentContextResponse	not_recorded
+AGT-024	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::AGT-024	not_recorded
+AGT-025	automated	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_oauth_discovery_advertises_three_exact_resources	not_recorded
+MCP-001	hybrid	go@server/internal/mcp/server_test.go::TestDiscoverAdvertisesOnlyMCP20260728;pytest@server/tests/agent_protocol/test_mcp_2026_07_28.py::test_mcp_server_discover_advertises_latest_only	not_recorded
+MCP-002	automated	pytest@server/tests/agent_protocol/test_mcp_2026_07_28.py::test_mcp_rejects_old_version_or_missing_request_contract	not_recorded
+MCP-003	automated	pytest@server/tests/agent_protocol/test_mcp_2026_07_28.py::test_mcp_requires_audience_token_and_rejects_legacy_transport;pytest@server/tests/agent_protocol/test_mcp_2026_07_28.py::test_mcp_rejects_client_notifications_over_streamable_http	not_recorded
+MCP-004	hybrid	go@server/internal/mcp/server_test.go::TestStreamableHTTPRejectsClientNotification;pytest@server/tests/agent_protocol/test_mcp_2026_07_28.py::test_mcp_rejects_client_notifications_over_streamable_http	not_recorded
+MCP-005	automated	pytest@server/tests/agent_protocol/test_mcp_2026_07_28.py::test_mcp_rejects_old_version_or_missing_request_contract	not_recorded
+MCP-006	automated	pytest@server/tests/agent_protocol/test_mcp_2026_07_28.py::test_mcp_rejects_old_version_or_missing_request_contract	not_recorded
+MCP-007	automated	pytest@server/tests/agent_protocol/test_mcp_2026_07_28.py::test_mcp_tools_list_and_ticket_get_return_schema_bound_structured_result	not_recorded
+MCP-008	hybrid	go@server/internal/mcp/server_test.go::TestToolDiscoveryCallAndCacheContract;pytest@server/tests/agent_protocol/test_mcp_2026_07_28.py::test_mcp_tools_list_and_ticket_get_return_schema_bound_structured_result	not_recorded
+MCP-009	automated	go@server/internal/agentplatform/mcp_adapter_test.go::TestMCPAdapterAllToolsLifecycleAndIdempotency	not_recorded
+MCP-010	hybrid	go@server/internal/mcp/schema_security_test.go::TestValidateSchemaAllowsOnlyServerOwnedAnchoredPatterns;pytest@server/tests/agent_protocol/test_mcp_2026_07_28.py::test_mcp_tools_list_and_ticket_get_return_schema_bound_structured_result	not_recorded
+MCP-011	automated	go@server/internal/mcp/server_test.go::TestToolBackendErrorsRemainStructuredResults;go@server/internal/mcp/server_test.go::TestPolicyDenialReturnsHTTP403BeforeBackend	not_recorded
+MCP-012	automated	go@server/internal/mcp/server_test.go::TestResourcesUseModernCacheAndTrustContracts	not_recorded
+MCP-013	release_manual	manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::MCP-013	not_recorded
+MCP-014	automated	go@server/internal/mcp/server_test.go::TestSubscriptionsListenAcknowledgesAndPublishes	not_recorded
+MCP-015	automated	pytest@server/tests/agent_protocol/test_mcp_2026_07_28.py::test_mcp_requires_audience_token_and_rejects_legacy_transport	not_recorded
+MCP-016	automated	go@server/internal/mcp/server_test.go::TestToolDiscoveryCallAndCacheContract;go@server/internal/mcp/server_test.go::TestResourcesUseModernCacheAndTrustContracts	not_recorded
+MCP-017	automated	pytest@server/tests/agent_protocol/test_mcp_2026_07_28.py::test_mcp_server_discover_advertises_latest_only	not_recorded
+MCP-018	release_manual	manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::MCP-018	not_recorded
+MCP-019	release_manual	manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::MCP-019	not_recorded
+MCP-020	fault_injection	fault@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::MCP-020	not_recorded
+A2A-001	automated	pytest@server/tests/agent_protocol/test_a2a_v1.py::test_agent_card_etag_authentication_and_current_capabilities	not_recorded
+A2A-002	automated	pytest@server/tests/agent_protocol/test_a2a_v1.py::test_agent_card_etag_authentication_and_current_capabilities	not_recorded
+A2A-003	automated	pytest@server/tests/agent_protocol/test_a2a_v1.py::test_agent_card_etag_authentication_and_current_capabilities	not_recorded
+A2A-004	automated	pytest@server/tests/agent_protocol/test_a2a_v1.py::test_a2a_ticket_intake_creates_queryable_task_and_ticket_artifact	not_recorded
+A2A-005	automated	go@server/internal/agentplatform/a2a_adapter_test.go::TestA2ABackendMapsTicketSkillsToNativeLifecycle	not_recorded
+A2A-006	automated	go@server/internal/a2a/gorm_store_test.go::TestGormStorePersistsTaskGraphAndReplayLog;go@server/internal/a2a/list_order_test.go::TestGormStoreListsTasksByStatusTimestamp	not_recorded
+A2A-007	hybrid	go@server/internal/a2a/server_test.go::TestCancelStopsRunningBackendWithoutOverwritingCanceledState;pytest@server/tests/agent_protocol/test_a2a_v1.py::test_a2a_input_required_does_not_mutate_ticket_and_sse_resumes_by_cursor	not_recorded
+A2A-008	hybrid	go@server/internal/a2a/server_test.go::TestInputRequiredIsAnA2AStateOnly;pytest@server/tests/agent_protocol/test_a2a_v1.py::test_a2a_input_required_does_not_mutate_ticket_and_sse_resumes_by_cursor	not_recorded
+A2A-009	automated	go@server/internal/a2a/server_test.go::TestStreamingContinuationResubmitsAndIgnoresHistoricalInterruptedEvent	not_recorded
+A2A-010	hybrid	go@server/internal/a2a/list_authorizer_test.go::TestReplayAuthorizationIncludesHistoricalArtifactSnapshots;pytest@server/tests/agent_protocol/test_a2a_v1.py::test_a2a_ticket_intake_creates_queryable_task_and_ticket_artifact	not_recorded
+A2A-011	hybrid	go@server/internal/a2a/server_test.go::TestStreamingReplayUsesLastEventID;pytest@server/tests/agent_protocol/test_a2a_v1.py::test_a2a_input_required_does_not_mutate_ticket_and_sse_resumes_by_cursor	not_recorded
+A2A-012	automated	go@server/internal/a2a/server_test.go::TestPushNotificationConfigurationIsValidatedAndRedacted;go@server/internal/a2a/gorm_store_secrets_test.go::TestGormPushCredentialsEncryptedAcrossRestart	not_recorded
+A2A-013	automated	go@server/internal/a2a/idempotency_test.go::TestSendMessageRetryReturnsOriginalTaskWithoutReexecution	not_recorded
+A2A-014	automated	go@server/internal/a2a/server_test.go::TestJSONRPCRejectsNonCanonicalParameterFieldsBeforeDispatch;go@server/internal/a2a/server_test.go::TestJSONRPCIgnoresForwardCompatibleUnknownFieldsWithoutReflectingThem	not_recorded
+A2A-015	automated	go@server/internal/a2a/owner_isolation_test.go::TestTaskOwnerIsolationAcrossStores	not_recorded
+A2A-016	automated	go@server/internal/agentplatform/assignment_adapter_test.go::TestMCPAndA2AAssignmentPersistIdenticalCanonicalValues	not_recorded
+UI-001	hybrid	playwright@web/e2e/tickets.spec.ts::should allow user to login;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-001	not_recorded
+UI-002	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-002	not_recorded
+UI-003	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-003	not_recorded
+UI-004	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-004 UI-006 UI-028：全部 15 张企业表用真实数据验证实际单行布局;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-004	not_recorded
+UI-005	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-005 UI-026：全部 15 张表的键盘列宽可持久化且双击复位也持久化;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-005	not_recorded
+UI-006	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-004 UI-006 UI-028：全部 15 张企业表用真实数据验证实际单行布局;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-006	not_recorded
+UI-007	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-007 UI-029：窄视口横向滚动后 sticky 右操作列仍贴边、命中且按钮有名称;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-007	not_recorded
+UI-008	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-008	not_recorded
+UI-009	hybrid	playwright@web/e2e/tickets.spec.ts::should view ticket details;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-009	not_recorded
+UI-010	hybrid	playwright@web/e2e/ticket-workflow.spec.ts::should create assign resolve close and delete ticket;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-010	not_recorded
+UI-011	hybrid	playwright@web/e2e/ticket-content.spec.ts::CNT-001 CNT-002 CNT-006 CNT-009 UI-011：评论、上传、扫描与下载;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-011	not_recorded
+UI-012	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-012	not_recorded
+UI-013	hybrid	playwright@web/e2e/00-users.spec.ts::RBAC-010 UI-013：创建并编辑管理员、主管、客服代理、客户;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-013	not_recorded
+UI-014	hybrid	playwright@web/e2e/notifications.spec.ts::应显示本轮真实创建的通知;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-014	not_recorded
+UI-015	hybrid	playwright@web/e2e/automation-rules.spec.ts::should create an automation rule;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-015	not_recorded
+UI-016	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-016	not_recorded
+UI-017	hybrid	playwright@web/e2e/system-settings.spec.ts::UI-017：安全配置使用修改前快照并在 finally 恢复;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-017	not_recorded
+UI-018	hybrid	playwright@web/e2e/email-settings.spec.ts::UI-018：邮件配置使用快照恢复且不改写不可回显秘密;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-018	not_recorded
+UI-019	hybrid	playwright@web/e2e/webhook-settings.spec.ts::EVT-002 EVT-007 EVT-008 EVT-010 UI-019：创建、编辑、测试并核对日志;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-019	not_recorded
+UI-020	hybrid	playwright@web/e2e/agent-control.spec.ts::AGT-001 AGT-002 AGT-008 UI-020：服务主体、策略、凭据与单体熔断;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-020	not_recorded
+UI-021	hybrid	playwright@web/e2e/agent-control.spec.ts::AGT-009 UI-020 UI-021：页面完整且全局只读、紧急停止均可安全恢复;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-021	not_recorded
+UI-022	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-022	not_recorded
+UI-023	hybrid	playwright@web/e2e/trusted-devices.spec.ts::AUTH-019 AUTH-022 UI-023：可信设备仅使用 HttpOnly Cookie 并可撤销;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-023	not_recorded
+UI-024	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-024	not_recorded
+UI-025	hybrid	playwright@web/e2e/00-site-health.spec.ts::UI-025 UI-030：无浏览器错误、失败资源或英文操作提示;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-025	not_recorded
+UI-026	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-005 UI-026：全部 15 张表的键盘列宽可持久化且双击复位也持久化;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-026	not_recorded
+UI-027	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-027	not_recorded
+UI-028	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-004 UI-006 UI-028：全部 15 张企业表用真实数据验证实际单行布局;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-028	not_recorded
+UI-029	fault_injection	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-029	not_recorded
+UI-030	hybrid	playwright@web/e2e/00-site-health.spec.ts::UI-025 UI-030：无浏览器错误、失败资源或英文操作提示;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-030	not_recorded
+SEC-001	hybrid	go@server/internal/services/ticket_service_filters_test.go::TestGetTickets_SortFieldInjectionFallsBackToCreatedAt;manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::SEC-001	not_recorded
+SEC-002	release_manual	go@server/internal/services/email_notification_security_test.go::TestEmailNotificationRenderingEscapesUntrustedHTMLByContext;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::SEC-002	not_recorded
+SEC-003	automated	go@server/internal/mailer/message_test.go::TestBuildHTMLMessageRejectsHeaderInjection;go@server/internal/services/email_config_service_test.go::TestUpdateEmailConfigRejectsInjectedHeaderValues	not_recorded
+SEC-004	automated	go@server/internal/security/callback_test.go::TestCallbackURLRejectsSSRFPrimitives;go@server/internal/security/callback_test.go::TestPinnedCallbackClientRejectsPrivateDNSAnswer	not_recorded
+SEC-005	hybrid	go@server/internal/safeconv/integer_test.go::TestParseUintUsesNativeWidth;pytest@server/tests/human/test_ticket_boundaries.py::test_ticket_pagination_and_identifier_bounds	not_recorded
+SEC-006	fault_injection	fault@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::SEC-006	not_recorded
+SEC-007	automated	go@server/internal/config/config_test.go::TestCORSConfigFromEnv	not_recorded
+SEC-008	hybrid	go@server/internal/auth/handler_trusted_device_cookie_test.go::TestTrustedDeviceCookieUsesHardenedProductionAttributes;manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::SEC-008	not_recorded
+SEC-009	ci_gate	ci@.github/workflows/security.yml;ci@.github/workflows/codeql.yml	not_recorded
+SEC-010	automated	go@server/internal/observability/safe_log_test.go::TestSafeLogValueRemovesLineAndDisplayControlCharacters;go@server/internal/auth/handler_logging_test.go::TestAuthLogReasonNeverReturnsSensitiveErrorText	not_recorded
+PERF-001	fault_injection	fault@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::PERF-001	not_recorded
+PERF-002	fault_injection	fault@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::PERF-002	not_recorded
+PERF-003	fault_injection	fault@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::PERF-003	not_recorded
+PERF-004	fault_injection	fault@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::PERF-004	not_recorded
+RES-001	automated	go@server/internal/a2a/gorm_store_test.go::TestGormExpiredExecutionClaimCanRecoverAfterCrash;go@server/internal/services/agent_native_service_test.go::TestAgentNativeEventOutboxRollbackRetryAndRecovery	not_recorded
+RES-002	hybrid	go@server/internal/services/agent_execution_guard_integration_test.go::TestRedisAgentExecutionGuardIntegration;go@server/internal/services/scheduler_redis_integration_test.go::TestSchedulerRedisLeaseIntegration	not_recorded
+RES-003	fault_injection	fault@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::RES-003	not_recorded
+RES-004	hybrid	go@server/internal/a2a/server_test.go::TestStreamingReplayUsesLastEventID;pytest@server/tests/agent_protocol/test_a2a_v1.py::test_a2a_input_required_does_not_mutate_ticket_and_sse_resumes_by_cursor	not_recorded
+RES-005	hybrid	go@server/internal/services/agent_native_service_test.go::TestAgentNativeAutomationLoopDetection;playwright@web/e2e/agent-control.spec.ts::AGT-009 UI-020 UI-021：页面完整且全局只读、紧急停止均可安全恢复	not_recorded
+RES-006	release_manual	manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::RES-006	not_recorded

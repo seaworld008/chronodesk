@@ -4,13 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+
+	"github.com/seaworld008/chronodesk/server/internal/observability"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 )
 
 const (
@@ -25,6 +30,10 @@ const (
 
 	// Maximum message size allowed from peer.
 	maxMessageSize = 512
+
+	// JSON numbers are decoded through float64. Values above 2^53-1 no longer
+	// preserve an exact integer identity and must not be used as database IDs.
+	maxExactJSONInteger = float64(1<<53 - 1)
 )
 
 var upgrader = websocket.Upgrader{
@@ -143,7 +152,7 @@ func (c *Client) close() {
 // reads from this goroutine.
 func (c *Client) readPump() {
 	defer func() {
-		c.hub.unregister <- c
+		c.hub.unregisterClient(c)
 		c.close()
 	}()
 
@@ -158,7 +167,7 @@ func (c *Client) readPump() {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("WebSocket error: %v", err)
+				log.Print("WebSocket connection closed unexpectedly")
 			}
 			break
 		}
@@ -222,13 +231,13 @@ func (c *Client) writePump() {
 func (c *Client) handleMessage(message []byte) {
 	var msg map[string]interface{}
 	if err := json.Unmarshal(message, &msg); err != nil {
-		log.Printf("Error unmarshaling client message: %v", err)
+		log.Print("Rejected malformed WebSocket client message")
 		return
 	}
 
 	msgType, ok := msg["type"].(string)
 	if !ok {
-		log.Printf("Invalid message type from client %d", c.UserID)
+		log.Printf("Invalid message type from client user_id=%s", safeLogUint(c.UserID))
 		return
 	}
 
@@ -240,7 +249,11 @@ func (c *Client) handleMessage(message []byte) {
 		// Handle mark notification as read
 		c.handleMarkRead(msg)
 	default:
-		log.Printf("Unknown message type: %s from client %d", msgType, c.UserID)
+		log.Printf(
+			"Unknown WebSocket message type=%s user_id=%s",
+			observability.SafeLogValue(msgType),
+			safeLogUint(c.UserID),
+		)
 	}
 }
 
@@ -265,12 +278,45 @@ func (c *Client) sendPong() {
 func (c *Client) handleMarkRead(msg map[string]interface{}) {
 	// Extract notification ID from message
 	if idFloat, ok := msg["notification_id"].(float64); ok {
-		notificationID := uint(idFloat)
-		log.Printf("Client %d wants to mark notification %d as read", c.UserID, notificationID)
+		if idFloat <= 0 ||
+			math.Trunc(idFloat) != idFloat ||
+			idFloat > maxExactJSONInteger ||
+			idFloat >= math.Ldexp(1, strconv.IntSize) {
+			log.Printf(
+				"Rejected invalid WebSocket notification ID: user_id=%s",
+				safeLogUint(c.UserID),
+			)
+			return
+		}
+		notificationID, err := safeconv.PositiveUint(uint64(idFloat))
+		if err != nil {
+			log.Printf(
+				"Rejected out-of-range WebSocket notification ID: user_id=%s",
+				safeLogUint(c.UserID),
+			)
+			return
+		}
+		log.Printf(
+			"WebSocket mark-read requested: user_id=%s notification_id=%s",
+			safeLogUint(c.UserID),
+			safeLogUint(notificationID),
+		)
 		if err := MarkNotificationAsReadHook(context.Background(), c.UserID, notificationID); err != nil {
-			log.Printf("Failed to mark notification %d as read for user %d: %v", notificationID, c.UserID, err)
+			log.Printf(
+				"WebSocket mark-read failed: user_id=%s notification_id=%s reason=persistence_error",
+				safeLogUint(c.UserID),
+				safeLogUint(notificationID),
+			)
 		}
 	}
+}
+
+func safeLogUint(value uint) string {
+	return observability.SafeLogValue(strconv.FormatUint(uint64(value), 10))
+}
+
+func safeLogInt64(value int64) string {
+	return observability.SafeLogValue(strconv.FormatInt(value, 10))
 }
 
 // ServeWS handles websocket requests from the peer.
@@ -278,24 +324,33 @@ func ServeWS(hub *Hub, c *gin.Context) {
 	// Get user ID from JWT token in context
 	userIDInterface, exists := c.Get("user_id")
 	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":   "unauthorized",
+			"message": "用户未认证",
+		})
 		return
 	}
 
 	userID, ok := userIDInterface.(uint)
 	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid user ID"})
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "invalid_user_context",
+			"message": "用户身份上下文无效",
+		})
 		return
 	}
 
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		log.Printf("WebSocket upgrade failed: %v", err)
+		log.Print("WebSocket upgrade failed")
 		return
 	}
 
 	client := NewClient(hub, conn, userID)
-	client.hub.register <- client
+	if !client.hub.registerClient(client) {
+		client.close()
+		return
+	}
 
 	// Start goroutines for reading and writing
 	go client.writePump()

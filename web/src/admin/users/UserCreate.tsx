@@ -31,14 +31,7 @@ import {
     Info as InfoIcon,
 } from '@mui/icons-material';
 import BackButton from '../common/BackButton';
-
-// 角色选项
-const roleChoices = [
-    { id: 'customer', name: '客户' },
-    { id: 'agent', name: '客服代理' },
-    { id: 'supervisor', name: '主管' },
-    { id: 'admin', name: '管理员' },
-];
+import { assignableUserRoleChoices } from '@/lib/accessControl';
 
 // 状态选项
 const statusChoices = [
@@ -65,7 +58,7 @@ const timezoneChoices = [
 const languageChoices = [
     { id: 'zh-CN', name: '中文简体' },
     { id: 'zh-TW', name: '中文繁体' },
-    { id: 'en-US', name: 'English (US)' },
+    { id: 'en-US', name: '英语（美国）' },
     { id: 'ja-JP', name: '日本語' },
     { id: 'ko-KR', name: '한국어' },
 ];
@@ -75,7 +68,7 @@ const languageChoices = [
  */
 const validateUsername = [required('用户名不能为空'), minLength(3, '用户名至少3个字符'), maxLength(50, '用户名最多50个字符')];
 const validateEmail = [required('邮箱不能为空'), email('请输入有效的邮箱地址')];
-const validatePassword = [required('密码不能为空'), minLength(6, '密码至少6个字符')];
+const validatePassword = [required('密码不能为空'), minLength(8, '密码至少8个字符')];
 const validateName = [maxLength(50, '姓名最多50个字符')];
 const validateDisplayName = [maxLength(100, '显示名称最多100个字符')];
 
@@ -99,8 +92,8 @@ const CreateGuidance: React.FC = () => (
     <Alert severity="info" icon={<InfoIcon />} sx={{ mb: 3 }}>
         <AlertTitle>创建用户指南</AlertTitle>
         <Typography variant="body2">
-            创建新用户账户时，请确保填写准确的联系信息。新用户将收到包含初始密码的邮件通知。
-            建议首次登录后要求用户修改密码以确保账户安全。
+            创建新用户账户时，请确保填写准确的联系信息。系统不会自动发送初始密码，
+            请通过组织批准的安全渠道交付，并要求用户首次登录后立即修改密码。
         </Typography>
     </Alert>
 );
@@ -135,7 +128,8 @@ const SecurityReminder: React.FC = () => (
     <Alert severity="warning" sx={{ mb: 2 }}>
         <Typography variant="body2">
             <strong>安全提醒：</strong>
-            创建的初始密码将通过邮件发送给用户。请确保邮箱地址准确无误，并提醒用户首次登录后立即修改密码。
+            初始密码只在本表单中设置，系统不会通过邮件回传。请使用组织批准的安全渠道交付，
+            并提醒用户首次登录后立即修改密码。
         </Typography>
     </Alert>
 );
@@ -158,7 +152,9 @@ const UserCreateToolbar = () => (
             label="创建用户"
             variant="contained"
         />
-        <Typography variant="body2" color="text.secondary">
+        <Typography variant="body2" sx={{
+            color: "text.secondary"
+        }}>
             * 标记的字段为必填项
         </Typography>
     </Box>
@@ -317,7 +313,7 @@ const UserCreate: React.FC = () => {
                                                 <SelectInput
                                                     source="role"
                                                     label="用户角色"
-                                                    choices={roleChoices}
+                                                    choices={assignableUserRoleChoices}
                                                     required
                                                     helperText="选择用户在系统中的角色权限"
                                                 />
@@ -336,8 +332,8 @@ const UserCreate: React.FC = () => {
                                         
                                         <Alert severity="info" sx={{ mt: 2 }}>
                                             <Typography variant="body2">
-                                                <strong>建议：</strong>新创建的客户账户状态设为"未激活"，等待邮箱验证后自动激活。
-                                                内部用户（代理、主管、管理员）可以直接设为"激活"状态。
+                                                <strong>建议：</strong>新客户账户在完成组织要求的身份与邮箱核验前保持“未激活”。
+                                                内部用户（代理、主管、管理员）可按授权流程直接设为“激活”。
                                             </Typography>
                                         </Alert>
                                     </Box>
@@ -363,7 +359,7 @@ const UserCreate: React.FC = () => {
                                                     validate={validatePassword}
                                                     fullWidth
                                                     required
-                                                    helperText="至少6个字符，包含字母和数字更安全"
+                                                    helperText="至少8个字符，建议混合字母、数字和符号"
                                                 />
                                             </Box>
                                             
@@ -381,8 +377,8 @@ const UserCreate: React.FC = () => {
                                         
                                         <Alert severity="warning" sx={{ mt: 2 }}>
                                             <Typography variant="body2">
-                                                创建用户后，系统将自动发送包含登录信息的邮件给用户。
-                                                出于安全考虑，强烈建议用户首次登录后立即修改密码。
+                                                创建用户后请由管理员通过安全渠道交付登录信息。
+                                                系统不会自动发送明文密码。
                                             </Typography>
                                         </Alert>
                                     </Box>
@@ -451,8 +447,8 @@ const UserCreate: React.FC = () => {
                                     
                                     <Alert severity="warning" sx={{ mt: 2 }}>
                                         <Typography variant="body2">
-                                            <strong>建议：</strong>对于客户用户，建议不勾选此项，让他们通过邮件验证激活账户。
-                                            对于内部用户，可以直接勾选以跳过邮箱验证步骤。
+                                            <strong>建议：</strong>只有在已通过组织流程核验邮箱时才勾选。
+                                            未核验的账户仍应由管理员按状态和访问策略控制。
                                         </Typography>
                                     </Alert>
                                 </CardContent>

@@ -9,14 +9,14 @@ import {
     useRecordContext,
     TopToolbar,
     EditButton,
-    DeleteButton,
     ListButton,
     TabbedShowLayout,
     Tab,
     ReferenceManyField,
-    Datagrid,
     NumberField,
+    FunctionField,
 } from 'react-admin';
+import { FocusSafeDeleteButton } from '@/components/actions/FocusSafeDeleteButtons';
 import {
     Box,
     Typography,
@@ -48,13 +48,22 @@ import {
 } from '@mui/icons-material';
 import BackButton from '../common/BackButton';
 import { User } from '@/types';
+import {
+    EnterpriseDatagrid,
+    TruncatedText,
+    type ResizableColumn,
+} from '@/components/tables/EnterpriseTable';
+import {
+    getUserRoleLabel,
+    normalizeUserRole,
+    userRoleChoices,
+} from '@/lib/accessControl';
 
-// 角色选项（与UserList保持一致）
-const roleChoices = [
-    { id: 'admin', name: '管理员' },
-    { id: 'agent', name: '客服代理' },
-    { id: 'customer', name: '客户' },
-    { id: 'supervisor', name: '主管' },
+const relatedTicketColumns: ResizableColumn[] = [
+    { key: 'ticket_number', defaultWidth: 156, minWidth: 120, maxWidth: 240 },
+    { key: 'title', defaultWidth: 360, minWidth: 200, maxWidth: 640 },
+    { key: 'status', defaultWidth: 132, minWidth: 104, maxWidth: 220 },
+    { key: 'timestamp', defaultWidth: 188, minWidth: 144, maxWidth: 280 },
 ];
 
 // 状态选项（与UserList保持一致）
@@ -70,7 +79,7 @@ const statusChoices = [
  */
 type ChipConfig = {
     color: ChipProps['color'];
-    icon: React.ReactNode;
+    icon: React.ReactElement;
 };
 
 type AccountAlert = {
@@ -82,7 +91,7 @@ const UserHeader: React.FC = () => {
     const record = useRecordContext<User>();
     if (!record) return null;
 
-    const getInitials = (firstName: string, lastName: string, username: string) => {
+    const getInitials = (firstName?: string, lastName?: string, username?: string) => {
         if (firstName && lastName) {
             return `${firstName[0]}${lastName[0]}`.toUpperCase();
         }
@@ -96,8 +105,8 @@ const UserHeader: React.FC = () => {
     const fullName = `${record.first_name || ''} ${record.last_name || ''}`.trim();
     const displayName = record.display_name || fullName || record.username;
 
-    const getRoleConfig = (role: string): ChipConfig => {
-        switch (role) {
+    const getRoleConfig = (role: User['role']): ChipConfig => {
+        switch (normalizeUserRole(role)) {
             case 'admin':
                 return { color: 'error', icon: <AdminIcon /> };
             case 'agent':
@@ -111,7 +120,7 @@ const UserHeader: React.FC = () => {
         }
     };
 
-    const getStatusConfig = (status: string) => {
+    const getStatusConfig = (status: User['status']): ChipConfig => {
         switch (status) {
             case 'active':
                 return { color: 'success', icon: <CheckCircleIcon /> };
@@ -129,8 +138,8 @@ const UserHeader: React.FC = () => {
     const typedStatusConfig = getStatusConfig(record.status);
 
     const roleConfig = getRoleConfig(record.role);
-    const roleName = roleChoices.find(r => r.id === record.role)?.name || record.role;
-    const statusName = statusChoices.find(s => s.id === record.status)?.name || record.status;
+    const roleName = getUserRoleLabel(record.role);
+    const statusName = statusChoices.find(s => s.id === record.status)?.name || '未知状态';
 
     return (
         <Card sx={{ mb: 3 }}>
@@ -150,10 +159,17 @@ const UserHeader: React.FC = () => {
                 }
                 title={
                     <Box>
-                        <Typography variant="h4" component="h1" fontWeight={600}>
+                        <Typography variant="h4" component="h1" sx={{
+                            fontWeight: 600
+                        }}>
                             {displayName}
                         </Typography>
-                        <Typography variant="h6" color="text.secondary" sx={{ mb: 1 }}>
+                        <Typography
+                            variant="h6"
+                            sx={{
+                                color: "text.secondary",
+                                mb: 1
+                            }}>
                             @{record.username}
                         </Typography>
                         <Stack direction="row" spacing={1}>
@@ -197,12 +213,16 @@ const ContactInfoCard: React.FC = () => {
             <CardContent>
                 <Stack spacing={3}>
                     <Box>
-                        <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                        <Typography variant="subtitle2" gutterBottom sx={{
+                            color: "text.secondary"
+                        }}>
                             邮箱地址
                         </Typography>
                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                             <EmailIcon fontSize="small" color="action" />
-                            <Typography variant="body1" fontWeight={500}>
+                            <Typography variant="body1" sx={{
+                                fontWeight: 500
+                            }}>
                                 {record.email}
                             </Typography>
                             {record.email_verified ? (
@@ -215,7 +235,9 @@ const ContactInfoCard: React.FC = () => {
                     
                     {record.phone && (
                         <Box>
-                            <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                            <Typography variant="subtitle2" gutterBottom sx={{
+                                color: "text.secondary"
+                            }}>
                                 电话号码
                             </Typography>
                             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -248,7 +270,9 @@ const PreferencesCard: React.FC = () => {
             <CardContent>
                 <Stack spacing={3}>
                     <Box>
-                        <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                        <Typography variant="subtitle2" gutterBottom sx={{
+                            color: "text.secondary"
+                        }}>
                             时区
                         </Typography>
                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -260,7 +284,9 @@ const PreferencesCard: React.FC = () => {
                     </Box>
                     
                     <Box>
-                        <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                        <Typography variant="subtitle2" gutterBottom sx={{
+                            color: "text.secondary"
+                        }}>
                             语言设置
                         </Typography>
                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -342,7 +368,9 @@ const AccountStatusCard: React.FC = () => {
                     <Divider />
                     
                     <Box>
-                        <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                        <Typography variant="subtitle2" gutterBottom sx={{
+                            color: "text.secondary"
+                        }}>
                             注册时间
                         </Typography>
                         <Typography variant="body1">
@@ -352,7 +380,9 @@ const AccountStatusCard: React.FC = () => {
                     
                     {record.last_login_at && (
                         <Box>
-                            <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                            <Typography variant="subtitle2" gutterBottom sx={{
+                                color: "text.secondary"
+                            }}>
                                 最后登录
                             </Typography>
                             <Typography variant="body1">
@@ -363,7 +393,9 @@ const AccountStatusCard: React.FC = () => {
                     
                     {record.email_verified_at && (
                         <Box>
-                            <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                            <Typography variant="subtitle2" gutterBottom sx={{
+                                color: "text.secondary"
+                            }}>
                                 邮箱验证时间
                             </Typography>
                             <Typography variant="body1">
@@ -384,7 +416,7 @@ const UserShowActions = () => (
     <TopToolbar>
         <ListButton label="返回列表" />
         <EditButton label="编辑" />
-        <DeleteButton label="删除" />
+        <FocusSafeDeleteButton label="删除" mutationMode="pessimistic" />
     </TopToolbar>
 );
 
@@ -412,21 +444,27 @@ const UserShow: React.FC = () => {
                                         <CardContent>
                                             <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
-                                                    <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                                                    <Typography variant="subtitle2" gutterBottom sx={{
+                                                        color: "text.secondary"
+                                                    }}>
                                                         姓
                                                     </Typography>
                                                     <TextField source="first_name" />
                                                 </Box>
                                                 
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
-                                                    <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                                                    <Typography variant="subtitle2" gutterBottom sx={{
+                                                        color: "text.secondary"
+                                                    }}>
                                                         名
                                                     </Typography>
                                                     <TextField source="last_name" />
                                                 </Box>
                                                 
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
-                                                    <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                                                    <Typography variant="subtitle2" gutterBottom sx={{
+                                                        color: "text.secondary"
+                                                    }}>
                                                         显示名称
                                                     </Typography>
                                                     <TextField source="display_name" />
@@ -441,35 +479,45 @@ const UserShow: React.FC = () => {
                                         <CardContent>
                                             <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
-                                                    <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                                                    <Typography variant="subtitle2" gutterBottom sx={{
+                                                        color: "text.secondary"
+                                                    }}>
                                                         用户ID
                                                     </Typography>
                                                     <TextField source="id" />
                                                 </Box>
                                                 
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
-                                                    <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                                                    <Typography variant="subtitle2" gutterBottom sx={{
+                                                        color: "text.secondary"
+                                                    }}>
                                                         角色
                                                     </Typography>
-                                                    <SelectField source="role" choices={roleChoices} />
+                                                    <SelectField source="role" choices={userRoleChoices} />
                                                 </Box>
                                                 
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
-                                                    <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                                                    <Typography variant="subtitle2" gutterBottom sx={{
+                                                        color: "text.secondary"
+                                                    }}>
                                                         状态
                                                     </Typography>
                                                     <SelectField source="status" choices={statusChoices} />
                                                 </Box>
                                                 
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
-                                                    <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                                                    <Typography variant="subtitle2" gutterBottom sx={{
+                                                        color: "text.secondary"
+                                                    }}>
                                                         邮箱已验证
                                                     </Typography>
                                                     <BooleanField source="email_verified" />
                                                 </Box>
                                                 
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
-                                                    <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                                                    <Typography variant="subtitle2" gutterBottom sx={{
+                                                        color: "text.secondary"
+                                                    }}>
                                                         登录失败次数
                                                     </Typography>
                                                     <NumberField source="failed_login_count" />
@@ -499,9 +547,20 @@ const UserShow: React.FC = () => {
                             perPage={10}
                             sort={{ field: 'created_at', order: 'DESC' }}
                         >
-                            <Datagrid bulkActionButtons={false}>
+                            <EnterpriseDatagrid
+                                tableId="users.show.created-tickets"
+                                columns={relatedTicketColumns}
+                                aria-label="该用户创建的工单列表"
+                                bulkActionButtons={false}
+                            >
                                 <TextField source="ticket_number" label="工单编号" />
-                                <TextField source="title" label="标题" />
+                                <FunctionField
+                                    label="标题"
+                                    sortBy="title"
+                                    render={(record) => (
+                                        <TruncatedText title={record?.title}>{record?.title || '—'}</TruncatedText>
+                                    )}
+                                />
                                 <SelectField 
                                     source="status" 
                                     label="状态" 
@@ -520,7 +579,7 @@ const UserShow: React.FC = () => {
                                     showTime 
                                     locales="zh-CN"
                                 />
-                            </Datagrid>
+                            </EnterpriseDatagrid>
                         </ReferenceManyField>
                         
                         <Box sx={{ mt: 4 }}>
@@ -534,9 +593,20 @@ const UserShow: React.FC = () => {
                                 perPage={10}
                                 sort={{ field: 'created_at', order: 'DESC' }}
                             >
-                                <Datagrid bulkActionButtons={false}>
+                                <EnterpriseDatagrid
+                                    tableId="users.show.assigned-tickets"
+                                    columns={relatedTicketColumns}
+                                    aria-label="该用户负责的工单列表"
+                                    bulkActionButtons={false}
+                                >
                                     <TextField source="ticket_number" label="工单编号" />
-                                    <TextField source="title" label="标题" />
+                                    <FunctionField
+                                        label="标题"
+                                        sortBy="title"
+                                        render={(record) => (
+                                            <TruncatedText title={record?.title}>{record?.title || '—'}</TruncatedText>
+                                        )}
+                                    />
                                     <SelectField 
                                         source="status" 
                                         label="状态" 
@@ -555,7 +625,7 @@ const UserShow: React.FC = () => {
                                         showTime 
                                         locales="zh-CN"
                                     />
-                                </Datagrid>
+                                </EnterpriseDatagrid>
                             </ReferenceManyField>
                         </Box>
                     </Tab>

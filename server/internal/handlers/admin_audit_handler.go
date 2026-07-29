@@ -6,7 +6,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
 // AdminAuditHandler 管理员审计日志处理器
@@ -46,7 +47,7 @@ func (h *AdminAuditHandler) GetAuditLogs(c *gin.Context) {
 	if err := c.ShouldBindQuery(&query); err != nil {
 		c.JSON(http.StatusBadRequest, ApiResponse{
 			Code: 1,
-			Msg:  "查询参数错误: " + err.Error(),
+			Msg:  "查询参数错误",
 			Data: nil,
 		})
 		return
@@ -62,8 +63,7 @@ func (h *AdminAuditHandler) GetAuditLogs(c *gin.Context) {
 	}
 
 	if query.UserID != "" {
-		if id, err := strconv.ParseUint(query.UserID, 10, 64); err == nil {
-			uid := uint(id)
+		if uid, err := safeconv.ParsePositiveUint(query.UserID); err == nil {
 			filter.UserID = &uid
 		}
 	}
@@ -92,9 +92,10 @@ func (h *AdminAuditHandler) GetAuditLogs(c *gin.Context) {
 
 	logs, total, err := h.auditService.List(c.Request.Context(), filter)
 	if err != nil {
+		logHandlerFailure(c, "admin_audit.list", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
-			Msg:  "获取审计日志失败: " + err.Error(),
+			Msg:  "获取审计日志失败",
 			Data: nil,
 		})
 		return

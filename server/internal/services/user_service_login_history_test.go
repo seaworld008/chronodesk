@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -21,6 +21,17 @@ func setupUserServiceLoginHistoryDB(t *testing.T) *gorm.DB {
 
 	if err := db.AutoMigrate(&models.User{}, &models.LoginHistory{}); err != nil {
 		t.Fatalf("failed to migrate schemas: %v", err)
+	}
+	if err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS refresh_tokens (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			session_id TEXT NOT NULL,
+			revoked BOOLEAN NOT NULL DEFAULT FALSE,
+			revoked_at DATETIME
+		)
+	`).Error; err != nil {
+		t.Fatalf("failed to create refresh token session table: %v", err)
 	}
 
 	return db
@@ -242,6 +253,14 @@ func TestDeleteLoginSession(t *testing.T) {
 	if err := db.Create(session).Error; err != nil {
 		t.Fatalf("failed to create login history: %v", err)
 	}
+	if err := db.Exec(
+		"INSERT INTO refresh_tokens (user_id, session_id, revoked) VALUES (?, ?, ?)",
+		ownerID,
+		session.SessionID,
+		false,
+	).Error; err != nil {
+		t.Fatalf("failed to create refresh token session: %v", err)
+	}
 
 	if err := svc.DeleteLoginSession(context.Background(), ownerID, session.ID); err != nil {
 		t.Fatalf("DeleteLoginSession returned error: %v", err)
@@ -256,6 +275,15 @@ func TestDeleteLoginSession(t *testing.T) {
 	}
 	if refreshed.LogoutTime == nil {
 		t.Fatalf("expected logout_time to be set")
+	}
+	var activeTokens int64
+	if err := db.Table("refresh_tokens").
+		Where("user_id = ? AND session_id = ? AND revoked = ?", ownerID, session.SessionID, false).
+		Count(&activeTokens).Error; err != nil {
+		t.Fatalf("failed to count active refresh tokens: %v", err)
+	}
+	if activeTokens != 0 {
+		t.Fatalf("expected session refresh tokens to be revoked, got %d active", activeTokens)
 	}
 
 	err := svc.DeleteLoginSession(context.Background(), otherID, session.ID)

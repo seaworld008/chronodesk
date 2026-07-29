@@ -1,25 +1,38 @@
 package auth
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
-	appconfig "gongdan-system/internal/config"
-	"gongdan-system/internal/services"
+	appconfig "github.com/seaworld008/chronodesk/server/internal/config"
+	"github.com/seaworld008/chronodesk/server/internal/security"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 	"gorm.io/gorm"
 )
 
 // AuthModule 认证模块
 type AuthModule struct {
-	AuthService *AuthService
-	Handler     *AuthHandler
-	Config      *AuthConfig
+	Handler             *AuthHandler
+	EmailOutboxConsumer *AuthEmailOutboxConsumer
 }
 
 // NewAuthModule 创建认证模块
-func NewAuthModule(db *gorm.DB, cfg *appconfig.Config) (*AuthModule, error) {
+func NewAuthModule(
+	db *gorm.DB,
+	cfg *appconfig.Config,
+	protector security.Protector,
+) (*AuthModule, error) {
 	if cfg == nil {
 		return nil, errors.New("config is required")
+	}
+	if protector == nil {
+		return nil, security.ErrKeyringUnavailable
+	}
+	if err := ValidateAuthCredentialStorage(context.Background(), db, protector); err != nil {
+		return nil, fmt.Errorf("validate authentication credential storage: %w", err)
 	}
 
 	// 创建配置
@@ -43,7 +56,7 @@ func NewAuthModule(db *gorm.DB, cfg *appconfig.Config) (*AuthModule, error) {
 	logger := &SimpleLogger{}
 
 	// 创建仓库
-	userRepo := NewGormUserRepository(db)
+	userRepo := NewGormUserRepository(db, protector)
 	profileRepo := NewGormProfileRepository(db) // 使用GORM版本
 	tokenRepo := NewGormTokenRepository(db)
 	loginAttemptRepo := NewGormLoginAttemptRepository(db)
@@ -52,25 +65,51 @@ func NewAuthModule(db *gorm.DB, cfg *appconfig.Config) (*AuthModule, error) {
 	configService := services.NewConfigService(db)
 
 	// 创建服务
-	emailConfig := &EmailConfig{
-		Host:     "localhost",
-		Port:     "587",
-		Username: "",
-		Password: "",
-		From:     "noreply@ticket-system.com",
+	otpService := NewSimpleOTPService("ChronoDesk")
+	passwordService, err := NewSimplePasswordService(PasswordServiceConfig{
+		MinLength:  config.PasswordMinLength,
+		BcryptCost: cfg.Security.BcryptCost,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("initialize password service: %w", err)
 	}
-	emailService := NewSMTPEmailService(emailConfig)
-	otpService := NewSimpleOTPService("Ticket System")
-	passwordService := NewSimplePasswordService(config.PasswordMinLength, "ticket-system-salt")
-	jwtManager := NewSimpleJWTManager(
-		config.JWTSecret,
-		config.JWTRefreshSecret,
-		config.AccessTokenExpire,
-		config.RefreshTokenExpire,
-	)
+	jwtManager, err := NewSimpleJWTManager(JWTManagerConfig{
+		AccessSecret:  cfg.JWT.Secret,
+		RefreshSecret: cfg.JWT.RefreshSecret,
+		AccessExpire:  cfg.JWT.ExpiresIn,
+		RefreshExpire: cfg.JWT.RefreshExpiresIn,
+		Issuer:        cfg.JWT.Issuer,
+		Audience:      cfg.JWT.Audience,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("initialize human JWT manager: %w", err)
+	}
 
 	// 创建邮箱配置服务
-	emailConfigService := services.NewEmailConfigService(db)
+	emailConfigService := services.NewEmailConfigServiceWithProtector(db, protector)
+	emailService, err := NewConfiguredSMTPEmailService(
+		emailConfigService,
+		cfg.App.WebURL,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("initialize authentication email sender: %w", err)
+	}
+	authEmailOutboxRepo, err := NewGormAuthEmailOutboxRepository(
+		db,
+		protector,
+		strings.TrimRight(cfg.Agent.Issuer, "/")+"/events",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("initialize authentication email Outbox: %w", err)
+	}
+	authEmailOutboxConsumer, err := NewAuthEmailOutboxConsumer(
+		db,
+		protector,
+		emailService,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("initialize authentication email consumer: %w", err)
+	}
 
 	// 创建认证服务
 	authService := NewAuthService(
@@ -81,41 +120,23 @@ func NewAuthModule(db *gorm.DB, cfg *appconfig.Config) (*AuthModule, error) {
 		loginHistoryRepo,
 		trustedDeviceRepo,
 		configService,
-		emailService,
 		emailConfigService,
 		otpService,
 		passwordService,
 		jwtManager,
 		config,
+		WithAuthEmailOutboxRepository(authEmailOutboxRepo),
 	)
 
 	// 创建处理器
-	authHandler := NewAuthHandler(authService, logger)
+	authHandler := NewAuthHandler(
+		authService,
+		logger,
+		WithSecureTrustedDeviceCookie(cfg.Server.Environment == "production"),
+	)
 
 	return &AuthModule{
-		AuthService: authService,
-		Handler:     authHandler,
-		Config:      config,
+		Handler:             authHandler,
+		EmailOutboxConsumer: authEmailOutboxConsumer,
 	}, nil
-}
-
-// GetAuthService 获取认证服务
-func (m *AuthModule) GetAuthService() *AuthService {
-	return m.AuthService
-}
-
-// GetHandler 获取处理器
-func (m *AuthModule) GetHandler() *AuthHandler {
-	return m.Handler
-}
-
-// GetConfig 获取配置
-func (m *AuthModule) GetConfig() *AuthConfig {
-	return m.Config
-}
-
-// SetupAuthRoutes 设置认证路由（从routes.go移动到这里以便集成）
-func (m *AuthModule) SetupAuthRoutes(router interface{}) {
-	// 这里可以根据实际的路由器类型进行设置
-	// 由于我们使用Gin，这个方法可以在main.go中直接调用routes.go的函数
 }

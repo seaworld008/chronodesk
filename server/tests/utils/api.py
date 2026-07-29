@@ -5,11 +5,19 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any
 
 import requests
 
+from .safety import (
+    register_headers,
+    register_response_secrets,
+    register_secret,
+    register_sensitive_values,
+    response_diagnostic,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +29,7 @@ DEFAULT_RETRY_DELAY = float(os.getenv("TEST_REQUEST_RETRY_DELAY", "1.0"))
 class APIError(RuntimeError):
     """Simple exception wrapper for HTTP errors."""
 
-    def __init__(self, message: str, response: Optional[requests.Response] = None) -> None:
+    def __init__(self, message: str, response: requests.Response | None = None) -> None:
         super().__init__(message)
         self.response = response
 
@@ -47,14 +55,21 @@ class APIClient:
         method: str,
         path: str,
         *,
-        headers: Optional[Dict[str, str]] = None,
-        json: Optional[Dict[str, Any]] = None,
-        params: Optional[Dict[str, Any]] = None,
-        expected_status: Optional[int] = None,
+        headers: Mapping[str, str | None] | None = None,
+        json: Any | None = None,
+        params: dict[str, Any] | None = None,
+        data: Mapping[str, Any] | None = None,
+        files: Mapping[str, Any] | None = None,
+        expected_status: int | None = None,
     ) -> requests.Response:
         url = self._build_url(path)
         attempt = 0
-        last_exc: Optional[Exception] = None
+        last_exc: Exception | None = None
+        register_headers(self.session.headers)
+        register_headers(headers)
+        register_sensitive_values(json)
+        register_sensitive_values(data)
+        register_sensitive_values(params)
 
         while attempt < self.max_retries:
             try:
@@ -64,10 +79,16 @@ class APIClient:
                     headers=headers,
                     json=json,
                     params=params,
+                    data=data,
+                    files=files,
                     timeout=self.timeout,
                 )
+                register_response_secrets(response)
 
-                if expected_status is not None and response.status_code != expected_status:
+                if (
+                    expected_status is not None
+                    and response.status_code != expected_status
+                ):
                     raise APIError(
                         f"Unexpected status {response.status_code} (expected {expected_status})",
                         response=response,
@@ -86,24 +107,126 @@ class APIClient:
                 )
                 time.sleep(self.retry_delay)
 
-        raise APIError(f"Request {method} {url} failed after retries", response=None) from last_exc
+        raise APIError(
+            f"Request {method} {url} failed after retries", response=None
+        ) from last_exc
 
     # ------------------------------------------------------------------
     # Convenience helpers
     # ------------------------------------------------------------------
-    def post_json(self, path: str, payload: Dict[str, Any], *, headers: Optional[Dict[str, str]] = None) -> requests.Response:
+    def post_json(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> requests.Response:
         return self.request("POST", path, json=payload, headers=headers)
 
-    def get_json(self, path: str, *, headers: Optional[Dict[str, str]] = None, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+    def get_json(
+        self,
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> requests.Response:
         return self.request("GET", path, headers=headers, params=params)
 
-    def put_json(self, path: str, payload: Dict[str, Any], *, headers: Optional[Dict[str, str]] = None) -> requests.Response:
+    def put_json(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> requests.Response:
         return self.request("PUT", path, json=payload, headers=headers)
 
-    def delete(self, path: str, *, headers: Optional[Dict[str, str]] = None, expected_status: Optional[int] = None) -> requests.Response:
-        return self.request("DELETE", path, headers=headers, expected_status=expected_status)
+    def delete(
+        self,
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+        expected_status: int | None = None,
+    ) -> requests.Response:
+        return self.request(
+            "DELETE", path, headers=headers, expected_status=expected_status
+        )
 
-    def with_auth(self, token: str) -> "APIClient":
+    def post_multipart(
+        self,
+        path: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        fields: Mapping[str, Any] | None = None,
+        files: Mapping[str, Any] | None = None,
+    ) -> requests.Response:
+        # A request-level None removes the JSON Content-Type inherited from the
+        # session so requests can generate the multipart boundary safely.
+        request_headers: dict[str, str | None] = {"Content-Type": None}
+        request_headers.update(headers or {})
+        return self.request(
+            "POST",
+            path,
+            headers=request_headers,
+            data=fields,
+            files=files,
+        )
+
+    def ticket_etag(self, ticket_id: int) -> str:
+        assert isinstance(ticket_id, int) and ticket_id > 0
+        response = self.get_json(f"/tickets/{ticket_id}")
+        assert response.status_code == 200, response_diagnostic(response)
+        etag = response.headers.get("ETag")
+        assert isinstance(etag, str) and etag.startswith('"v') and etag.endswith('"'), (
+            f"ticket {ticket_id} response lacks a strong ETag"
+        )
+        return etag
+
+    def put_ticket(
+        self,
+        ticket_id: int,
+        payload: dict[str, Any],
+        *,
+        etag: str | None = None,
+    ) -> requests.Response:
+        validator = etag or self.ticket_etag(ticket_id)
+        return self.put_json(
+            f"/tickets/{ticket_id}",
+            payload,
+            headers={"If-Match": validator},
+        )
+
+    def post_ticket_command(
+        self,
+        ticket_id: int,
+        command: str,
+        payload: dict[str, Any],
+        *,
+        etag: str | None = None,
+    ) -> requests.Response:
+        assert command in {"assign", "transfer", "escalate", "status"}
+        validator = etag or self.ticket_etag(ticket_id)
+        return self.post_json(
+            f"/tickets/{ticket_id}/{command}",
+            payload,
+            headers={"If-Match": validator},
+        )
+
+    def delete_ticket(
+        self,
+        ticket_id: int,
+        *,
+        etag: str | None = None,
+    ) -> requests.Response:
+        assert isinstance(ticket_id, int) and ticket_id > 0
+        validator = etag or self.ticket_etag(ticket_id)
+        return self.delete(
+            f"/tickets/{ticket_id}",
+            headers={"If-Match": validator},
+        )
+
+    def with_auth(self, token: str) -> APIClient:
+        register_secret(token)
         clone = APIClient(
             base_url=self.base_url,
             timeout=self.timeout,
@@ -120,8 +243,8 @@ class APIClient:
     # ------------------------------------------------------------------
     # Authentication helpers
     # ------------------------------------------------------------------
-    def login(self, email: str, password: str, **extra_fields: Any) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
+    def login(self, email: str, password: str, **extra_fields: Any) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "email": email,
             "password": password,
         }
@@ -136,13 +259,13 @@ class APIClient:
             raise APIError("Unexpected login response payload", response=response)
         return data["data"]
 
-    def refresh(self, refresh_token: str) -> Dict[str, Any]:
+    def refresh(self, refresh_token: str) -> dict[str, Any]:
         response = self.post_json("/auth/refresh", {"refresh_token": refresh_token})
         if response.status_code != 200:
             raise APIError("Refresh token failed", response=response)
         return response.json().get("data", {})
 
-    def register_user(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def register_user(self, payload: dict[str, Any]) -> dict[str, Any]:
         response = self.post_json("/auth/register", payload)
         if response.status_code not in (200, 201):
             raise APIError("Registration failed", response=response)
@@ -152,8 +275,8 @@ class APIClient:
             raise APIError("Unexpected registration payload", response=response)
         return data["data"]
 
-    def logout(self, refresh_token: Optional[str] = None) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {}
+    def logout(self, refresh_token: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
         if refresh_token:
             payload["refresh_token"] = refresh_token
 

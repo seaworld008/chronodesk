@@ -28,6 +28,18 @@ const (
 	HistoryActionSystem         HistoryAction = "system"          // 系统操作
 )
 
+// TicketHistoryProvenance describes how a history record is linked to the
+// immutable domain event stream. Only domain_event records may carry EventID
+// and ResourceVersion. pre_event and imported records deliberately remain
+// unlinked because their event identity cannot be proven.
+type TicketHistoryProvenance string
+
+const (
+	TicketHistoryProvenanceDomainEvent TicketHistoryProvenance = "domain_event"
+	TicketHistoryProvenancePreEvent    TicketHistoryProvenance = "pre_event"
+	TicketHistoryProvenanceImported    TicketHistoryProvenance = "imported"
+)
+
 // TicketHistory 工单历史记录模型
 type TicketHistory struct {
 	ID        uint      `json:"id" gorm:"primaryKey;autoIncrement"`
@@ -35,10 +47,18 @@ type TicketHistory struct {
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
 	// 关联信息
-	TicketID uint    `json:"ticket_id" gorm:"not null;index"`
-	Ticket   *Ticket `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
-	UserID   *uint   `json:"user_id" gorm:"index"` // 可为空，系统操作时为空
-	User     *User   `json:"user,omitempty" gorm:"foreignKey:UserID"`
+	TicketID           uint                    `json:"ticket_id" gorm:"not null;index"`
+	Ticket             *Ticket                 `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
+	UserID             *uint                   `json:"user_id" gorm:"index"` // 可为空，系统操作时为空
+	User               *User                   `json:"user,omitempty" gorm:"foreignKey:UserID"`
+	ActorType          ActorType               `json:"actor_type" gorm:"size:32;not null;default:'human';index"`
+	ActorID            string                  `json:"actor_id" gorm:"size:128;index"`
+	ServicePrincipalID *string                 `json:"service_principal_id,omitempty" gorm:"size:36;index"`
+	ServicePrincipal   *ServicePrincipal       `json:"service_principal,omitempty" gorm:"foreignKey:ServicePrincipalID"`
+	EventID            *string                 `json:"event_id,omitempty" gorm:"size:36;index"`
+	Event              *DomainEvent            `json:"-" gorm:"foreignKey:EventID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
+	ResourceVersion    uint64                  `json:"resource_version" gorm:"not null;default:0"`
+	Provenance         TicketHistoryProvenance `json:"provenance" gorm:"size:32;not null;default:'pre_event';index"`
 
 	// 操作信息
 	Action      HistoryAction `json:"action" gorm:"size:50;not null;index" validate:"required"`
@@ -77,34 +97,10 @@ func (TicketHistory) TableName() string {
 	return "ticket_histories"
 }
 
-// IsUserAction 检查是否为用户操作
-func (th *TicketHistory) IsUserAction() bool {
-	return th.UserID != nil && !th.IsSystem
-}
-
-// IsSystemAction 检查是否为系统操作
-func (th *TicketHistory) IsSystemAction() bool {
-	return th.IsSystem || th.UserID == nil
-}
-
-// IsStatusChange 检查是否为状态变更
-func (th *TicketHistory) IsStatusChange() bool {
-	return th.Action == HistoryActionStatusChange
-}
-
-// IsPriorityChange 检查是否为优先级变更
-func (th *TicketHistory) IsPriorityChange() bool {
-	return th.Action == HistoryActionPriorityChange
-}
-
-// IsAssignmentChange 检查是否为分配变更
-func (th *TicketHistory) IsAssignmentChange() bool {
-	return th.Action == HistoryActionAssign || th.Action == HistoryActionUnassign
-}
-
-// HasFieldChange 检查是否有字段变更
-func (th *TicketHistory) HasFieldChange() bool {
-	return th.FieldName != "" && (th.OldValue != "" || th.NewValue != "")
+// Actor returns the authoritative ActorRef. Migration and database constraints
+// guarantee that it is complete and consistent with its optional projections.
+func (th *TicketHistory) Actor() ActorRef {
+	return ActorRef{Type: th.ActorType, ID: th.ActorID}
 }
 
 // GetDurationString 获取持续时间字符串
@@ -134,58 +130,67 @@ type TicketHistoryCreateRequest struct {
 
 // TicketHistoryResponse 历史记录响应
 type TicketHistoryResponse struct {
-	ID           uint                   `json:"id"`
-	CreatedAt    time.Time              `json:"created_at"`
-	TicketID     uint                   `json:"ticket_id"`
-	User         *UserResponse          `json:"user,omitempty"`
-	Action       HistoryAction          `json:"action"`
-	Description  string                 `json:"description"`
-	Details      map[string]interface{} `json:"details"`
-	FieldName    string                 `json:"field_name"`
-	OldValue     string                 `json:"old_value"`
-	NewValue     string                 `json:"new_value"`
-	CommentID    *uint                  `json:"comment_id"`
-	AttachmentID *uint                  `json:"attachment_id"`
-	Duration     *int                   `json:"duration"`
-	ScheduledAt  *time.Time             `json:"scheduled_at"`
-	CompletedAt  *time.Time             `json:"completed_at"`
-	IsVisible    bool                   `json:"is_visible"`
-	IsSystem     bool                   `json:"is_system"`
-	IsAutomated  bool                   `json:"is_automated"`
-	IsImportant  bool                   `json:"is_important"`
-	Metadata     map[string]interface{} `json:"metadata"`
+	ID               uint                     `json:"id"`
+	CreatedAt        time.Time                `json:"created_at"`
+	TicketID         uint                     `json:"ticket_id"`
+	User             *UserSummary             `json:"user,omitempty"`
+	Actor            ActorRef                 `json:"actor"`
+	ServicePrincipal *ServicePrincipalSummary `json:"service_principal,omitempty"`
+	EventID          *string                  `json:"event_id,omitempty"`
+	ResourceVersion  uint64                   `json:"resource_version"`
+	Provenance       TicketHistoryProvenance  `json:"provenance"`
+	Action           HistoryAction            `json:"action"`
+	Description      string                   `json:"description"`
+	Details          map[string]interface{}   `json:"details"`
+	FieldName        string                   `json:"field_name"`
+	OldValue         string                   `json:"old_value"`
+	NewValue         string                   `json:"new_value"`
+	CommentID        *uint                    `json:"comment_id"`
+	AttachmentID     *uint                    `json:"attachment_id"`
+	Duration         *int                     `json:"duration"`
+	ScheduledAt      *time.Time               `json:"scheduled_at"`
+	CompletedAt      *time.Time               `json:"completed_at"`
+	IsVisible        bool                     `json:"is_visible"`
+	IsSystem         bool                     `json:"is_system"`
+	IsAutomated      bool                     `json:"is_automated"`
+	IsImportant      bool                     `json:"is_important"`
+	Metadata         map[string]interface{}   `json:"metadata"`
 }
 
 // ToResponse 转换为响应格式
 func (th *TicketHistory) ToResponse() *TicketHistoryResponse {
 	response := &TicketHistoryResponse{
-		ID:           th.ID,
-		CreatedAt:    th.CreatedAt,
-		TicketID:     th.TicketID,
-		Action:       th.Action,
-		Description:  th.Description,
-		FieldName:    th.FieldName,
-		OldValue:     th.OldValue,
-		NewValue:     th.NewValue,
-		CommentID:    th.CommentID,
-		AttachmentID: th.AttachmentID,
-		Duration:     th.Duration,
-		ScheduledAt:  th.ScheduledAt,
-		CompletedAt:  th.CompletedAt,
-		IsVisible:    th.IsVisible,
-		IsSystem:     th.IsSystem,
-		IsAutomated:  th.IsAutomated,
-		IsImportant:  th.IsImportant,
+		ID:               th.ID,
+		CreatedAt:        th.CreatedAt,
+		TicketID:         th.TicketID,
+		Actor:            th.Actor(),
+		ServicePrincipal: th.ServicePrincipal.ToSummary(),
+		EventID:          th.EventID,
+		ResourceVersion:  th.ResourceVersion,
+		Provenance:       th.Provenance,
+		Action:           th.Action,
+		Description:      th.Description,
+		FieldName:        th.FieldName,
+		OldValue:         th.OldValue,
+		NewValue:         th.NewValue,
+		CommentID:        th.CommentID,
+		AttachmentID:     th.AttachmentID,
+		Duration:         th.Duration,
+		ScheduledAt:      th.ScheduledAt,
+		CompletedAt:      th.CompletedAt,
+		IsVisible:        th.IsVisible,
+		IsSystem:         th.IsSystem,
+		IsAutomated:      th.IsAutomated,
+		IsImportant:      th.IsImportant,
 	}
 
 	// 处理关联用户
 	if th.User != nil {
-		response.User = th.User.ToResponse()
+		response.User = th.User.ToSummary()
 	}
 
-	// TODO: 解析JSON字段
-	// response.Details = parseDetailsFromJSON(th.Details)
-	// response.Metadata = parseMetadataFromJSON(th.Metadata)
+	response.Details = decodeJSONMap(th.Details)
+	response.Metadata = decodeJSONMap(th.Metadata)
 
 	return response
 }

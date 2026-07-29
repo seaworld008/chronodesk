@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -19,30 +21,95 @@ type SimpleJWTManager struct {
 	accessExpire  time.Duration
 	refreshExpire time.Duration
 	issuer        string
+	audience      string
 }
 
-// NewSimpleJWTManager 创建简单JWT管理器
-func NewSimpleJWTManager(accessSecret, refreshSecret string, accessExpire, refreshExpire time.Duration) *SimpleJWTManager {
-	if accessSecret == "" {
-		accessSecret = "default-access-secret-change-in-production"
+const minimumHumanJWTSecretLength = 32
+
+// JWTManagerConfig is the explicit trust contract for human browser/session
+// tokens. Issuer is the canonical APP_URL origin and Audience is its /api
+// resource identifier.
+type JWTManagerConfig struct {
+	AccessSecret  string
+	RefreshSecret string
+	AccessExpire  time.Duration
+	RefreshExpire time.Duration
+	Issuer        string
+	Audience      string
+}
+
+// NewSimpleJWTManager 创建 JWT 管理器。无效或缺失的信任配置会在启动时
+// 直接失败；不存在公开固定密钥、issuer 或 audience 回退。
+func NewSimpleJWTManager(config JWTManagerConfig) (*SimpleJWTManager, error) {
+	if err := validateHumanJWTSecret("access", config.AccessSecret); err != nil {
+		return nil, err
 	}
-	if refreshSecret == "" {
-		refreshSecret = "default-refresh-secret-change-in-production"
+	if err := validateHumanJWTSecret("refresh", config.RefreshSecret); err != nil {
+		return nil, err
 	}
-	if accessExpire == 0 {
-		accessExpire = 15 * time.Minute
+	if config.AccessSecret == config.RefreshSecret {
+		return nil, errors.New("human JWT access and refresh secrets must be different")
 	}
-	if refreshExpire == 0 {
-		refreshExpire = 7 * 24 * time.Hour
+	if config.AccessExpire <= 0 || config.RefreshExpire <= 0 {
+		return nil, errors.New("human JWT access and refresh expiration must be positive")
+	}
+	if err := validateHumanJWTEndpointContract(config.Issuer, config.Audience); err != nil {
+		return nil, err
 	}
 
 	return &SimpleJWTManager{
-		accessSecret:  accessSecret,
-		refreshSecret: refreshSecret,
-		accessExpire:  accessExpire,
-		refreshExpire: refreshExpire,
-		issuer:        "ticket-system",
+		accessSecret:  config.AccessSecret,
+		refreshSecret: config.RefreshSecret,
+		accessExpire:  config.AccessExpire,
+		refreshExpire: config.RefreshExpire,
+		issuer:        config.Issuer,
+		audience:      config.Audience,
+	}, nil
+}
+
+func validateHumanJWTSecret(name, secret string) error {
+	if secret != strings.TrimSpace(secret) || len(secret) < minimumHumanJWTSecretLength {
+		return fmt.Errorf(
+			"human JWT %s secret must be at least %d characters without surrounding whitespace",
+			name,
+			minimumHumanJWTSecretLength,
+		)
 	}
+	return nil
+}
+
+func validateHumanJWTEndpointContract(issuer, audience string) error {
+	if issuer != strings.TrimSpace(issuer) {
+		return errors.New("human JWT issuer must not contain surrounding whitespace")
+	}
+	parsed, err := url.Parse(issuer)
+	if err != nil ||
+		!parsed.IsAbs() ||
+		parsed.Host == "" ||
+		parsed.User != nil ||
+		parsed.RawQuery != "" ||
+		parsed.Fragment != "" ||
+		parsed.Path != "" ||
+		parsed.RawPath != "" {
+		return errors.New("human JWT issuer must be an absolute canonical origin")
+	}
+	if parsed.Scheme != "https" &&
+		!(parsed.Scheme == "http" && isLoopbackJWTIssuer(parsed.Hostname())) {
+		return errors.New("human JWT issuer must use HTTPS except for loopback development")
+	}
+	expectedAudience := issuer + "/api"
+	if audience != expectedAudience {
+		return fmt.Errorf("human JWT audience must exactly match %q", expectedAudience)
+	}
+	return nil
+}
+
+func isLoopbackJWTIssuer(hostname string) bool {
+	if strings.EqualFold(hostname, "localhost") {
+		return true
+	}
+	address := net.ParseIP(hostname)
+	return address != nil && address.IsLoopback()
 }
 
 // JWTHeader JWT头部
@@ -53,35 +120,88 @@ type JWTHeader struct {
 
 // JWTPayload JWT载荷
 type JWTPayload struct {
-	UserID uint     `json:"user_id"`
-	Role   UserRole `json:"role"`
-	Type   string   `json:"type"` // access, refresh
-	Iss    string   `json:"iss"`  // issuer
-	Sub    string   `json:"sub"`  // subject
-	Aud    string   `json:"aud"`  // audience
-	Exp    int64    `json:"exp"`  // expiration time
-	Nbf    int64    `json:"nbf"`  // not before
-	Iat    int64    `json:"iat"`  // issued at
-	Jti    string   `json:"jti"`  // JWT ID
+	UserID    uint     `json:"user_id"`
+	Role      UserRole `json:"role"`
+	Type      string   `json:"type"` // access, refresh
+	SessionID string   `json:"sid"`  // server-authoritative login session
+	Iss       string   `json:"iss"`  // issuer
+	Sub       string   `json:"sub"`  // subject
+	Aud       string   `json:"aud"`  // audience
+	Exp       int64    `json:"exp"`  // expiration time
+	Nbf       int64    `json:"nbf"`  // not before
+	Iat       int64    `json:"iat"`  // issued at
+	Jti       string   `json:"jti"`  // JWT ID
 }
 
 // GenerateTokenPair 生成令牌对
-func (j *SimpleJWTManager) GenerateTokenPair(userID uint, role UserRole) (accessToken, refreshToken string, err error) {
-	now := time.Now()
+func (j *SimpleJWTManager) GenerateTokenPair(userID uint, role UserRole, sessionID string) (accessToken, refreshToken string, err error) {
+	return j.generateTokenPairAt(
+		userID,
+		role,
+		sessionID,
+		time.Now(),
+		generateJTI(),
+		generateJTI(),
+	)
+}
+
+// GenerateRefreshTokenPair deterministically derives one replacement pair from
+// the old refresh token and the persisted rotation time. This lets a client
+// replay an interrupted refresh without storing either replacement bearer
+// token in plaintext. The rotation seed is itself a confidential bearer token
+// and is only used as HMAC input.
+func (j *SimpleJWTManager) GenerateRefreshTokenPair(
+	userID uint,
+	role UserRole,
+	sessionID, rotationSeed string,
+	issuedAt time.Time,
+) (accessToken, refreshToken string, err error) {
+	if strings.TrimSpace(rotationSeed) == "" || issuedAt.IsZero() {
+		return "", "", errors.New("refresh rotation seed and issue time are required")
+	}
+	issuedAt = issuedAt.UTC().Truncate(time.Second)
+	return j.generateTokenPairAt(
+		userID,
+		role,
+		sessionID,
+		issuedAt,
+		j.rotationJTI(j.accessSecret, "access", rotationSeed, issuedAt),
+		j.rotationJTI(j.refreshSecret, "refresh", rotationSeed, issuedAt),
+	)
+}
+
+func (j *SimpleJWTManager) generateTokenPairAt(
+	userID uint,
+	role UserRole,
+	sessionID string,
+	now time.Time,
+	accessJTI, refreshJTI string,
+) (accessToken, refreshToken string, err error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if userID == 0 ||
+		!role.IsValid() ||
+		sessionID == "" ||
+		len(sessionID) > 128 ||
+		now.IsZero() ||
+		accessJTI == "" ||
+		refreshJTI == "" {
+		return "", "", errors.New("valid user and session identifiers are required")
+	}
 	userIDStr := strconv.FormatUint(uint64(userID), 10)
 
 	// 生成访问令牌
 	accessPayload := &JWTPayload{
-		UserID: userID,
-		Role:   role,
-		Type:   "access",
-		Iss:    j.issuer,
-		Sub:    userIDStr,
-		Aud:    "ticket-system-api",
-		Exp:    now.Add(j.accessExpire).Unix(),
-		Nbf:    now.Unix(),
-		Iat:    now.Unix(),
-		Jti:    generateJTI(),
+		UserID:    userID,
+		Role:      role,
+		Type:      "access",
+		SessionID: sessionID,
+		Iss:       j.issuer,
+		Sub:       userIDStr,
+		Aud:       j.audience,
+		Exp:       now.Add(j.accessExpire).Unix(),
+		Nbf:       now.Unix(),
+		Iat:       now.Unix(),
+		Jti:       accessJTI,
 	}
 
 	accessToken, err = j.generateToken(accessPayload, j.accessSecret)
@@ -91,16 +211,17 @@ func (j *SimpleJWTManager) GenerateTokenPair(userID uint, role UserRole) (access
 
 	// 生成刷新令牌
 	refreshPayload := &JWTPayload{
-		UserID: userID,
-		Role:   role,
-		Type:   "refresh",
-		Iss:    j.issuer,
-		Sub:    userIDStr,
-		Aud:    "ticket-system-api",
-		Exp:    now.Add(j.refreshExpire).Unix(),
-		Nbf:    now.Unix(),
-		Iat:    now.Unix(),
-		Jti:    generateJTI(),
+		UserID:    userID,
+		Role:      role,
+		Type:      "refresh",
+		SessionID: sessionID,
+		Iss:       j.issuer,
+		Sub:       userIDStr,
+		Aud:       j.audience,
+		Exp:       now.Add(j.refreshExpire).Unix(),
+		Nbf:       now.Unix(),
+		Iat:       now.Unix(),
+		Jti:       refreshJTI,
 	}
 
 	refreshToken, err = j.generateToken(refreshPayload, j.refreshSecret)
@@ -109,6 +230,20 @@ func (j *SimpleJWTManager) GenerateTokenPair(userID uint, role UserRole) (access
 	}
 
 	return accessToken, refreshToken, nil
+}
+
+func (j *SimpleJWTManager) rotationJTI(
+	secret, purpose, seed string,
+	issuedAt time.Time,
+) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte("chronodesk:refresh-rotation:v1\x00"))
+	_, _ = mac.Write([]byte(purpose))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(seed))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(strconv.FormatInt(issuedAt.Unix(), 10)))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
 // VerifyAccessToken 验证访问令牌
@@ -123,12 +258,13 @@ func (j *SimpleJWTManager) VerifyAccessToken(token string) (*Claims, error) {
 	}
 
 	return &Claims{
-		UserID: payload.UserID,
-		Role:   payload.Role,
-		Type:   payload.Type,
-		Exp:    payload.Exp,
-		Iat:    payload.Iat,
-		Jti:    payload.Jti,
+		UserID:    payload.UserID,
+		Role:      payload.Role,
+		Type:      payload.Type,
+		SessionID: payload.SessionID,
+		Exp:       payload.Exp,
+		Iat:       payload.Iat,
+		Jti:       payload.Jti,
 	}, nil
 }
 
@@ -144,20 +280,14 @@ func (j *SimpleJWTManager) VerifyRefreshToken(token string) (*Claims, error) {
 	}
 
 	return &Claims{
-		UserID: payload.UserID,
-		Role:   payload.Role,
-		Type:   payload.Type,
-		Exp:    payload.Exp,
-		Iat:    payload.Iat,
-		Jti:    payload.Jti,
+		UserID:    payload.UserID,
+		Role:      payload.Role,
+		Type:      payload.Type,
+		SessionID: payload.SessionID,
+		Exp:       payload.Exp,
+		Iat:       payload.Iat,
+		Jti:       payload.Jti,
 	}, nil
-}
-
-// RevokeToken 撤销令牌（简单实现，实际应该使用黑名单）
-func (j *SimpleJWTManager) RevokeToken(token string) error {
-	// 在实际实现中，应该将令牌添加到黑名单
-	// 这里只是一个占位符实现
-	return nil
 }
 
 // 内部方法
@@ -236,6 +366,18 @@ func (j *SimpleJWTManager) verifyToken(token, secret string) (*JWTPayload, error
 	if payload.Iss != j.issuer {
 		return nil, errors.New("invalid issuer")
 	}
+	if payload.Aud != j.audience {
+		return nil, errors.New("invalid audience")
+	}
+	if payload.Sub != strconv.FormatUint(uint64(payload.UserID), 10) {
+		return nil, errors.New("invalid subject")
+	}
+	if payload.UserID == 0 ||
+		strings.TrimSpace(payload.SessionID) == "" ||
+		len(payload.SessionID) > 128 ||
+		strings.TrimSpace(payload.Jti) == "" {
+		return nil, errors.New("invalid session claims")
+	}
 
 	return &payload, nil
 }
@@ -278,12 +420,13 @@ func (j *SimpleJWTManager) ParseTokenClaims(token string) (*Claims, error) {
 	}
 
 	return &Claims{
-		UserID: payload.UserID,
-		Role:   payload.Role,
-		Type:   payload.Type,
-		Exp:    payload.Exp,
-		Iat:    payload.Iat,
-		Jti:    payload.Jti,
+		UserID:    payload.UserID,
+		Role:      payload.Role,
+		Type:      payload.Type,
+		SessionID: payload.SessionID,
+		Exp:       payload.Exp,
+		Iat:       payload.Iat,
+		Jti:       payload.Jti,
 	}, nil
 }
 
@@ -337,7 +480,7 @@ func (j *SimpleJWTManager) RefreshTokenIfNeeded(accessToken string, threshold ti
 	}
 
 	// 生成新的访问令牌
-	newAccessToken, _, err := j.GenerateTokenPair(claims.UserID, claims.Role)
+	newAccessToken, _, err := j.GenerateTokenPair(claims.UserID, claims.Role, claims.SessionID)
 	if err != nil {
 		return "", false, err
 	}

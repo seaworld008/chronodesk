@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )

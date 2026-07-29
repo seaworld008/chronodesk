@@ -6,13 +6,14 @@ import (
 	"strings"
 	"time"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
 )
 
 // AdminAuditRecord 审计日志记录输入
 // swagger:model AdminAuditRecord
 type AdminAuditRecord struct {
+	ID         uint
 	UserID     *uint
 	Username   string
 	Role       string
@@ -64,6 +65,7 @@ type AdminAuditListItem struct {
 // AdminAuditServiceInterface 定义服务接口
 type AdminAuditServiceInterface interface {
 	Record(ctx context.Context, record *AdminAuditRecord) error
+	Finalize(ctx context.Context, record *AdminAuditRecord) error
 	List(ctx context.Context, filter *AdminAuditFilter) ([]*models.AdminAuditLog, int64, error)
 }
 
@@ -116,7 +118,40 @@ func (s *AdminAuditService) Record(ctx context.Context, record *AdminAuditRecord
 		}
 	}
 
-	return s.db.WithContext(ctx).Create(auditLog).Error
+	if err := s.db.WithContext(ctx).Create(auditLog).Error; err != nil {
+		return err
+	}
+	record.ID = auditLog.ID
+	return nil
+}
+
+// Finalize completes a durable pre-write audit anchor after the handler
+// returns. If finalization fails, the original pending row remains observable;
+// a successful administrative mutation can therefore never exist without an
+// audit record.
+func (s *AdminAuditService) Finalize(
+	ctx context.Context,
+	record *AdminAuditRecord,
+) error {
+	if record == nil || record.ID == 0 {
+		return errors.New("persisted audit record is required")
+	}
+	result := s.db.WithContext(ctx).
+		Model(&models.AdminAuditLog{}).
+		Where("id = ?", record.ID).
+		Updates(map[string]any{
+			"status_code": record.StatusCode,
+			"latency_ms":  record.Latency.Milliseconds(),
+			"result":      strings.TrimSpace(record.Result),
+			"notes":       record.Notes,
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errors.New("persisted audit record was not found")
+	}
+	return nil
 }
 
 // List 获取管理员操作日志列表

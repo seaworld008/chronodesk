@@ -5,9 +5,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-playground/validator/v10"
-	"gongdan-system/internal/middleware"
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/middleware"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
 var emailConfigValidator = validator.New()
@@ -44,7 +44,8 @@ func (h *EmailConfigHandler) GetEmailConfig(c *gin.Context) {
 	// 获取邮箱配置
 	config, err := h.emailConfigService.GetEmailConfig(ctx)
 	if err != nil {
-		h.response.Error(c, http.StatusInternalServerError, "get_email_config_failed", err.Error())
+		logHandlerFailure(c, "email_config.get", err)
+		h.response.Error(c, http.StatusInternalServerError, "get_email_config_failed", "获取邮箱配置失败")
 		return
 	}
 
@@ -78,7 +79,7 @@ func (h *EmailConfigHandler) UpdateEmailConfig(c *gin.Context) {
 	// 解析请求体
 	var req models.EmailConfigUpdateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		h.response.Error(c, http.StatusBadRequest, "invalid_request", "请求参数无效: "+err.Error())
+		h.response.Error(c, http.StatusBadRequest, "invalid_request", "请求参数无效")
 		return
 	}
 	if req.SMTPHost != nil && *req.SMTPHost != "" {
@@ -97,7 +98,8 @@ func (h *EmailConfigHandler) UpdateEmailConfig(c *gin.Context) {
 	// 更新邮箱配置
 	config, err := h.emailConfigService.UpdateEmailConfig(ctx, &req, userID.(uint))
 	if err != nil {
-		h.response.Error(c, http.StatusInternalServerError, "update_email_config_failed", err.Error())
+		logHandlerFailure(c, "email_config.update", err)
+		h.response.Error(c, http.StatusInternalServerError, "update_email_config_failed", "更新邮箱配置失败")
 		return
 	}
 
@@ -124,40 +126,17 @@ func (h *EmailConfigHandler) TestEmailConnection(c *gin.Context) {
 	// 解析请求体
 	var req models.EmailTestRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		h.response.Error(c, http.StatusBadRequest, "invalid_request", "请求参数无效: "+err.Error())
+		h.response.Error(c, http.StatusBadRequest, "invalid_request", "请求参数无效")
 		return
 	}
 
 	// 测试邮件连接
 	err := h.emailConfigService.TestEmailConnection(ctx, &req)
 	if err != nil {
-		h.response.Error(c, http.StatusInternalServerError, "test_email_failed", err.Error())
+		logHandlerFailure(c, "email_config.test_connection", err)
+		h.response.Error(c, http.StatusInternalServerError, "test_email_failed", "邮件连接测试失败")
 		return
 	}
 
 	h.response.Success(c, nil, "邮件测试成功")
-}
-
-// GetEmailStatus 获取邮箱验证状态
-// @Summary 获取邮箱验证状态
-// @Description 获取当前邮箱验证是否启用的状态
-// @Tags 邮箱配置
-// @Accept json
-// @Produce json
-// @Success 200 {object} SuccessResponse{data=map[string]bool}
-// @Failure 500 {object} ErrorResponse
-// @Router /api/email-status [get]
-func (h *EmailConfigHandler) GetEmailStatus(c *gin.Context) {
-	ctx := c.Request.Context()
-
-	// 检查邮箱验证是否启用
-	enabled, err := h.emailConfigService.IsEmailVerificationEnabled(ctx)
-	if err != nil {
-		h.response.Error(c, http.StatusInternalServerError, "get_email_status_failed", err.Error())
-		return
-	}
-
-	h.response.Success(c, map[string]bool{
-		"email_verification_enabled": enabled,
-	}, "邮箱状态获取成功")
 }

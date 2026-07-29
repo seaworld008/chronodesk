@@ -1,26 +1,48 @@
-# 文档中心（docs）
+# ChronoDesk 文档中心
 
-本目录是 ChronoDesk 的统一文档入口。阅读顺序按“先总览、再专题、后归档”组织，避免多份文档描述不一致。
+本目录只保留当前可执行文档、架构决策、协议参考、运维指南和可复核测试报告。
+历史计划与会话交接材料由 Git 历史保留，不作为当前事实来源。
 
-## 1. 必读文档
-- `PROJECT_MANUAL.md`：项目权威手册（功能、架构、API 地图、运行与测试标准）。
-- `../README.md`：根目录快速上手入口（安装、启动、常用命令）。
+## 从这里开始
 
-## 2. 参考文档（Reference）
-- `reference/API_DOCUMENTATION.md`：历史/扩展 API 说明（手工维护版本）。
-- `reference/REQUIRED_API_ENDPOINTS.md`：功能需求阶段沉淀的接口清单。
-- `../server/API_DOCUMENTATION.md`：后端侧 API 文档（与服务代码更接近）。
+- [项目权威手册](PROJECT_MANUAL.md)：功能、范围、技术基线和公共 Interface。
+- [架构总览](../ARCHITECTURE.md)：Module、Interface、Seam、Adapter 和依赖规则。
+- [领域词汇](../CONTEXT.md)：Ticket、Actor、Assignment、Lease、Event 与 Outbox
+  的统一含义。
+- [开发与质量门禁](testing_guide.md)：本地、Docker、云服务、协议和发布验证。
 
-## 3. 规划与交接
-- `planning/`：任务跟踪、阶段计划、里程碑文档。
-- `plans/`：实现计划（按日期命名）。
-- `handovers/`：会话交接文档。
+## 架构决策
 
-## 4. 历史归档
-- `archive/root-legacy/`：从根目录迁移的历史测试记录与初始化文档。
-- `archive/agent-control/`：解释为何 `AGENTS.md`、`CLAUDE.md` 仍保留在根目录。
+- [ADR 索引](adr/README.md)
+- [只保留当前 Agent 协议](adr/0001-current-only-agent-protocols.md)
+- [统一 Actor 与 Assignment 模型](adr/0002-actor-and-assignment-model.md)
+- [事务 Domain Event 与 Outbox](adr/0003-transactional-events-and-outbox.md)
+- [最小可执行入口与应用组合根](adr/0004-application-composition-root.md)
 
-## 5. 文档维护规则
-- 架构或接口变更时，先更新 `PROJECT_MANUAL.md`。
-- 新增专题文档时，必须在本索引登记用途与位置。
-- 不再活跃的文档迁移到 `archive/`，不要直接删除。
+## 运维
+
+- [数据库迁移](operations/database-migrations.md)
+- [数据库静态加密](reference/DATA_AT_REST_ENCRYPTION.md)
+
+## 协议与机器契约
+
+- [Agent REST 与 API 使用说明](reference/API_DOCUMENTATION.md)
+- [MCP 2026-07-28](reference/MCP_2026_07_28.md)
+- [A2A v1.0.1 / wire 1.0](reference/A2A_1_0.md)
+- [CloudEvents 1.0](reference/CLOUDEVENTS_1_0.md)
+- [OpenAPI 3.2](reference/OPENAPI_3_2.md)
+- [Reference 索引](reference/README.md)
+
+请求/响应 Schema 的唯一权威来源是
+`server/internal/openapi/openapi.yaml`，运行时由 `/openapi.yaml` 提供。
+
+## 测试证据
+
+- [Agent 原生化完整测试报告](testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-30.md)
+
+## 维护规则
+
+1. 领域术语变化先更新 `CONTEXT.md`。
+2. 跨 Module 的持久架构选择必须增加 ADR。
+3. Interface 或运行命令变化同步更新 `PROJECT_MANUAL.md`、根 README 和测试指南。
+4. 失效计划、提示词、一次性报告和本机路径不得继续留在当前文档树。

@@ -28,7 +28,6 @@ import { minCharacters, maxCharacters } from '@/lib/validators';
 import {
     normalizeTagsForSubmit,
     formatTagsInputValue,
-    normalizeStringArrayForSubmit,
     normalizeCustomFieldsForSubmit,
 } from './tagUtils';
 import BackButton from '../common/BackButton';
@@ -97,7 +96,6 @@ type TicketCreateFormValues = CreateTicketRequest & {
     is_private?: boolean;
     estimated_hours?: number;
     tags?: unknown;
-    attachments?: unknown;
     custom_fields?: unknown;
     [key: string]: unknown;
 };
@@ -110,13 +108,6 @@ const transformTicketCreate = (data: TicketCreateFormValues): Record<string, unk
         payload.tags = normalizedTags;
     } else {
         delete payload.tags;
-    }
-
-    const normalizedAttachments = normalizeStringArrayForSubmit(data.attachments);
-    if (typeof normalizedAttachments !== 'undefined') {
-        payload.attachments = normalizedAttachments;
-    } else {
-        delete payload.attachments;
     }
 
     const normalizedCustomFields = normalizeCustomFieldsForSubmit(data.custom_fields);
@@ -189,7 +180,7 @@ const TicketCreate: React.FC = () => {
                         <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                             <CardHeader
                                 title="工单基本信息"
-                                titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                 sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                             />
                             <CardContent>
@@ -252,8 +243,9 @@ const TicketCreate: React.FC = () => {
                                         </Box>
                                     </Box>
 
-                                    <ReferenceInput source="assigned_to_id" reference="users" label="分配给">
+                                    <ReferenceInput source="assigned_to_id" reference="assignees" label="分配给">
                                         <AutocompleteInput
+                                            label="分配给"
                                             optionText={(choice) => `${choice.username} (${choice.first_name} ${choice.last_name})`}
                                             fullWidth
                                             helperText="选择负责处理此工单的人员"
@@ -277,13 +269,14 @@ const TicketCreate: React.FC = () => {
                         <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                             <CardHeader
                                 title="工单分类"
-                                titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                 sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                             />
                             <CardContent>
                                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                                     <ReferenceInput source="category_id" reference="categories" label="工单类别" >
                                         <AutocompleteInput
+                                            label="工单类别"
                                             optionText="name"
                                             fullWidth
                                             helperText="选择工单所属的主要类别"
@@ -297,16 +290,8 @@ const TicketCreate: React.FC = () => {
                                         defaultValue="request"
                                         fullWidth
                                         required
-                                        helperText="进一步细化工单的具体类型，如Bug报告、功能请求、技术支持等"
+                                        helperText="进一步细化工单的具体类型，如缺陷报告、功能请求、技术支持等"
                                     />
-
-                                    <ReferenceInput source="product_id" reference="products" label="相关产品">
-                                        <AutocompleteInput
-                                            optionText="name"
-                                            fullWidth
-                                            helperText="选择此工单相关的产品或服务"
-                                        />
-                                    </ReferenceInput>
 
                                     <TextInput
                                         source="component"
@@ -324,7 +309,7 @@ const TicketCreate: React.FC = () => {
                         <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                             <CardHeader
                                 title="时间与SLA设置"
-                                titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                 sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                             />
                             <CardContent>
@@ -369,7 +354,7 @@ const TicketCreate: React.FC = () => {
                         <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                             <CardHeader
                                 title="高级设置"
-                                titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                 sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                             />
                             <CardContent>
@@ -395,6 +380,7 @@ const TicketCreate: React.FC = () => {
 
                                     <ReferenceInput source="parent_ticket_id" reference="tickets" label="父工单">
                                         <AutocompleteInput
+                                            label="父工单"
                                             optionText="title"
                                             fullWidth
                                             helperText="如果这是子工单，选择对应的父工单"

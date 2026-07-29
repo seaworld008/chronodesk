@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
 )
 
@@ -16,7 +16,14 @@ func setupTestDB(t *testing.T) *gorm.DB {
 
 	db := openTestDB(t)
 
-	if err := db.AutoMigrate(&models.User{}, &models.Ticket{}, &models.TicketComment{}, &models.TicketHistory{}); err != nil {
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.Ticket{},
+		&models.TicketComment{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
+		&models.TicketHistory{},
+	); err != nil {
 		t.Fatalf("failed to migrate schemas: %v", err)
 	}
 
@@ -42,7 +49,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 			Status:       models.TicketStatusOpen,
 			Type:         models.TicketTypeIncident,
 			Source:       models.TicketSourceWeb,
-			CreatedByID:  user.ID,
+			CreatedByID:  &user.ID,
 		},
 		{
 			TicketNumber: "T-002",
@@ -52,7 +59,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 			Status:       models.TicketStatusInProgress,
 			Type:         models.TicketTypeIncident,
 			Source:       models.TicketSourceWeb,
-			CreatedByID:  user.ID,
+			CreatedByID:  &user.ID,
 		},
 		{
 			TicketNumber: "T-003",
@@ -62,7 +69,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 			Status:       models.TicketStatusOpen,
 			Type:         models.TicketTypeIncident,
 			Source:       models.TicketSourceWeb,
-			CreatedByID:  user.ID,
+			CreatedByID:  &user.ID,
 		},
 		{
 			TicketNumber: "T-004",
@@ -72,7 +79,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 			Status:       models.TicketStatusResolved,
 			Type:         models.TicketTypeIncident,
 			Source:       models.TicketSourceWeb,
-			CreatedByID:  user.ID,
+			CreatedByID:  &user.ID,
 		},
 	}
 
@@ -169,13 +176,28 @@ func TestEscalateTicketMarksTicketAsEscalated(t *testing.T) {
 		t.Fatalf("failed to create manager: %v", err)
 	}
 
-	svc := NewTicketService(db)
-	updated, err := svc.EscalateTicket(ticket.ID, manager.ID, ticket.CreatedByID, "SLA breach", "please review")
+	svc := newTicketServiceForTest(t, db)
+	updated, err := svc.EscalateTicketExpectedVersion(
+		context.Background(),
+		ticket.ID,
+		manager.ID,
+		*ticket.CreatedByID,
+		"SLA breach",
+		"please review",
+		ticket.Version,
+	)
 	if err != nil {
 		t.Fatalf("EscalateTicket returned error: %v", err)
 	}
 	if !updated.IsEscalated {
 		t.Fatal("expected escalated ticket to set is_escalated")
+	}
+	if updated.AssignedTo == nil || updated.AssignedTo.ID != manager.ID {
+		t.Fatalf(
+			"escalated response assignee = %#v, want manager %d",
+			updated.AssignedTo,
+			manager.ID,
+		)
 	}
 }
 
@@ -194,8 +216,16 @@ func TestReopenTicketClearsCompletionTimestamps(t *testing.T) {
 		t.Fatalf("failed to seed completion timestamps: %v", err)
 	}
 
-	svc := NewTicketService(db)
-	reopened, err := svc.UpdateTicketStatus(ticket.ID, string(models.TicketStatusOpen), ticket.CreatedByID, "reopen", "")
+	svc := newTicketServiceForTest(t, db)
+	reopened, err := svc.UpdateTicketStatusExpectedVersion(
+		context.Background(),
+		ticket.ID,
+		string(models.TicketStatusOpen),
+		*ticket.CreatedByID,
+		"reopen",
+		"",
+		ticket.Version,
+	)
 	if err != nil {
 		t.Fatalf("UpdateTicketStatus returned error: %v", err)
 	}
@@ -221,7 +251,7 @@ func TestCreateTicketDerivesSLADeadlineFromCategory(t *testing.T) {
 	}
 
 	startedAt := time.Now()
-	svc := NewTicketService(db)
+	svc := newTicketServiceForTest(t, db)
 	ticket, err := svc.CreateTicket(context.Background(), &models.TicketCreateRequest{
 		Title:       "SLA-backed ticket",
 		Description: "deadline should be derived",

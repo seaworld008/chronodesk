@@ -1,0 +1,303 @@
+"""Safe factories for Human REST black-box scenarios."""
+
+from __future__ import annotations
+
+import hashlib
+import secrets
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from .api import APIClient
+from .safety import (
+    register_secret,
+    response_diagnostic,
+    safe_diagnostic,
+)
+
+HUMAN_ROLES = ("admin", "supervisor", "agent", "customer")
+
+
+def strong_password() -> str:
+    """Return a unique password accepted by the production policy."""
+
+    while True:
+        password = f"Aa1!{secrets.token_hex(10)}Z"
+        if all(
+            password[index] != password[index + 1]
+            or password[index] != password[index + 2]
+            for index in range(len(password) - 2)
+        ):
+            register_secret(password)
+            return password
+
+
+@dataclass(frozen=True)
+class HumanIdentity:
+    id: int
+    role: str
+    username: str
+    email: str
+    password: str = field(repr=False)
+    access_token: str = field(repr=False)
+    refresh_token: str = field(repr=False)
+    api: APIClient = field(repr=False)
+
+
+class E2EResourceManager:
+    """Create and precisely clean resources owned by one black-box run."""
+
+    def __init__(
+        self, api_client: APIClient, admin_api: APIClient, run_id: str
+    ) -> None:
+        self.api_client = api_client
+        self.admin_api = admin_api
+        self.run_id = run_id
+        self.prefix = f"E2E-{run_id}-"
+        # Usernames are capped at 50 characters.  Keeping an arbitrarily long
+        # ownership prefix at the front used to truncate both the role label and
+        # nonce, so e.g. agent-a and agent-b could collapse to the same username.
+        # A stable run token preserves ownership while leaving room for the
+        # per-identity label and a cryptographically random suffix.
+        self._user_run_token = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:12]
+        self._users: list[tuple[int, str]] = []
+        self._tickets: list[tuple[int, str]] = []
+        self._notifications: list[int] = []
+        self._clients: list[APIClient] = []
+
+    def unique(self, label: str) -> str:
+        return f"{self.prefix}{label}-{time.time_ns()}-{secrets.token_hex(2)}"
+
+    def create_user(self, role: str, label: str) -> HumanIdentity:
+        assert role in HUMAN_ROLES, f"unsupported Human role {role!r}"
+        safe_label = "".join(
+            character if character.isalnum() else "_" for character in label.lower()
+        )
+        compact_label = safe_label[:16] or "identity"
+        nonce = secrets.token_hex(6)
+        username = f"e2e_{self._user_run_token}_{compact_label}_{nonce}"
+        email = f"e2e+{self._user_run_token}.{compact_label}.{nonce}@example.com"
+        password = strong_password()
+        display_name = self.unique(f"{label}-user")
+        if role == "customer":
+            response = self.api_client.post_json(
+                "/auth/register",
+                {
+                    "username": username,
+                    "email": email,
+                    "password": password,
+                    "confirm_password": password,
+                    "first_name": "E2E",
+                    "last_name": label,
+                    "department": "QA Automation",
+                    "position": "Human REST Black-box",
+                },
+            )
+            assert response.status_code == 201, response_diagnostic(response)
+            body = response.json()
+            assert body.get("code") == 0, safe_diagnostic(body)
+            tokens = body.get("data")
+            assert isinstance(tokens, dict), safe_diagnostic(body)
+            created = tokens.get("user")
+            assert isinstance(created, dict), safe_diagnostic(body)
+        else:
+            response = self.admin_api.post_json(
+                "/admin/users",
+                {
+                    "username": username,
+                    "email": email,
+                    "password": password,
+                    "first_name": "E2E",
+                    "last_name": label,
+                    "display_name": display_name,
+                    "role": role,
+                    "department": "QA Automation",
+                    "job_title": "Human REST Black-box",
+                },
+            )
+            assert response.status_code == 201, response_diagnostic(response)
+            body = response.json()
+            assert body.get("code") == 0, safe_diagnostic(body)
+            created = body.get("data")
+            assert isinstance(created, dict), safe_diagnostic(body)
+            tokens = {}
+
+        user_id = created.get("id")
+        assert isinstance(user_id, int) and user_id > 0, safe_diagnostic(body)
+        assert created.get("role") == role, safe_diagnostic(body)
+        self._users.append((user_id, username))
+
+        verification = self.admin_api.put_json(
+            f"/admin/users/{user_id}",
+            {
+                "display_name": display_name,
+                "email_verified": True,
+            },
+        )
+        assert verification.status_code == 200, response_diagnostic(verification)
+
+        if role != "customer":
+            tokens = self.api_client.login(email, password)
+        access_token = tokens.get("access_token")
+        refresh_token = tokens.get("refresh_token")
+        assert isinstance(access_token, str) and access_token, safe_diagnostic(tokens)
+        assert isinstance(refresh_token, str) and refresh_token, safe_diagnostic(tokens)
+        api = self.api_client.with_auth(access_token)
+        self._clients.append(api)
+        return HumanIdentity(
+            id=user_id,
+            role=role,
+            username=username,
+            email=email,
+            password=password,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            api=api,
+        )
+
+    def create_ticket(
+        self,
+        identity: HumanIdentity,
+        label: str,
+        **overrides: Any,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "title": self.unique(f"{label}-ticket"),
+            "description": f"{self.prefix}Human REST black-box ticket",
+            "type": "request",
+            "priority": "normal",
+            "source": "api",
+        }
+        payload.update(overrides)
+        response = identity.api.post_json("/tickets", payload)
+        assert response.status_code == 201, response_diagnostic(response)
+        body = response.json()
+        assert body.get("code") == 0, safe_diagnostic(body)
+        ticket = body.get("data")
+        assert isinstance(ticket, dict), safe_diagnostic(body)
+        ticket_id = ticket.get("id")
+        title = ticket.get("title")
+        assert isinstance(ticket_id, int) and ticket_id > 0, safe_diagnostic(body)
+        assert isinstance(title, str) and title.startswith(self.prefix), (
+            safe_diagnostic(body)
+        )
+        self._tickets.append((ticket_id, title))
+        return ticket
+
+    def track_ticket(self, ticket: dict[str, Any]) -> None:
+        ticket_id = ticket.get("id")
+        title = ticket.get("title")
+        assert isinstance(ticket_id, int) and ticket_id > 0, safe_diagnostic(ticket)
+        assert isinstance(title, str) and title.startswith(self.prefix), (
+            safe_diagnostic(ticket)
+        )
+        if all(existing_id != ticket_id for existing_id, _ in self._tickets):
+            self._tickets.append((ticket_id, title))
+
+    def track_user(self, user_id: int, username: str) -> None:
+        """Track an unexpectedly accepted negative-test user for safe teardown."""
+
+        assert isinstance(user_id, int) and user_id > 0
+        assert username.startswith("e2e_")
+        if all(existing_id != user_id for existing_id, _ in self._users):
+            self._users.append((user_id, username))
+
+    def create_notification(
+        self,
+        recipient_id: int,
+        label: str,
+    ) -> dict[str, Any]:
+        title = self.unique(f"{label}-notification")
+        response = self.admin_api.post_json(
+            "/admin/notifications",
+            {
+                "type": "system_alert",
+                "title": title,
+                "content": f"{self.prefix}notification isolation",
+                "priority": "normal",
+                "channel": "in_app",
+                "recipient_id": recipient_id,
+            },
+        )
+        assert response.status_code == 201, response_diagnostic(response)
+        notification = response.json().get("data")
+        assert isinstance(notification, dict), response_diagnostic(response)
+        notification_id = notification.get("id")
+        assert isinstance(notification_id, int) and notification_id > 0, (
+            safe_diagnostic(notification)
+        )
+        self._notifications.append(notification_id)
+        return notification
+
+    def cleanup(self) -> None:
+        errors: list[str] = []
+
+        for ticket_id, expected_title in reversed(self._tickets):
+            detail = self.admin_api.get_json(f"/tickets/{ticket_id}")
+            if detail.status_code == 404:
+                continue
+            if detail.status_code != 200:
+                errors.append(
+                    f"inspect ticket {ticket_id}: {response_diagnostic(detail)}"
+                )
+                continue
+            ticket = detail.json().get("data", {})
+            actual_title = ticket.get("title") if isinstance(ticket, dict) else None
+            if not isinstance(actual_title, str) or not actual_title.startswith(
+                self.prefix
+            ):
+                errors.append(
+                    f"refused to delete unowned ticket {ticket_id}: "
+                    f"expected={expected_title!r} actual={actual_title!r}"
+                )
+                continue
+            etag = detail.headers.get("ETag")
+            if (
+                not isinstance(etag, str)
+                or not etag.startswith('"v')
+                or not etag.endswith('"')
+            ):
+                errors.append(
+                    f"inspect ticket {ticket_id}: response lacks a strong ETag"
+                )
+                continue
+            deleted = self.admin_api.delete_ticket(ticket_id, etag=etag)
+            if deleted.status_code not in (200, 204, 404):
+                errors.append(
+                    f"delete ticket {ticket_id}: {response_diagnostic(deleted)}"
+                )
+
+        for notification_id in reversed(self._notifications):
+            deleted = self.admin_api.delete(f"/admin/notifications/{notification_id}")
+            if deleted.status_code not in (200, 204, 404):
+                errors.append(
+                    f"delete notification {notification_id}: "
+                    f"{response_diagnostic(deleted)}"
+                )
+
+        for client in self._clients:
+            client.close()
+
+        for user_id, expected_username in reversed(self._users):
+            detail = self.admin_api.get_json(f"/admin/users/{user_id}")
+            if detail.status_code == 404:
+                continue
+            if detail.status_code != 200:
+                errors.append(f"inspect user {user_id}: {response_diagnostic(detail)}")
+                continue
+            user = detail.json().get("data", {})
+            actual_username = user.get("username") if isinstance(user, dict) else None
+            if actual_username != expected_username or not expected_username.startswith(
+                "e2e_"
+            ):
+                errors.append(
+                    f"refused to delete unowned user {user_id}: "
+                    f"expected={expected_username!r} actual={actual_username!r}"
+                )
+                continue
+            deleted = self.admin_api.delete(f"/admin/users/{user_id}")
+            if deleted.status_code not in (200, 204, 404):
+                errors.append(f"delete user {user_id}: {response_diagnostic(deleted)}")
+
+        if errors:
+            raise AssertionError("E2E 精确清理失败:\n" + "\n".join(errors))

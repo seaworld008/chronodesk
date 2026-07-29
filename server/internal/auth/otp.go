@@ -22,7 +22,7 @@ type SimpleOTPService struct {
 // NewSimpleOTPService 创建简单OTP服务
 func NewSimpleOTPService(issuer string) *SimpleOTPService {
 	if issuer == "" {
-		issuer = "Ticket System"
+		issuer = "ChronoDesk"
 	}
 	return &SimpleOTPService{
 		issuer: issuer,
@@ -251,44 +251,4 @@ func (s *SimpleOTPService) FormatSecret(secret string) string {
 	}
 
 	return formatted.String()
-}
-
-// ParseOTPURL 解析OTP URL
-func ParseOTPURL(url string) (issuer, account, secret string, err error) {
-	if !strings.HasPrefix(url, "otpauth://totp/") {
-		return "", "", "", fmt.Errorf("invalid OTP URL format")
-	}
-
-	// 简化的URL解析
-	// 实际实现中应该使用更完整的URL解析
-	parts := strings.Split(url, "?")
-	if len(parts) != 2 {
-		return "", "", "", fmt.Errorf("invalid OTP URL format")
-	}
-
-	// 解析路径部分
-	path := strings.TrimPrefix(parts[0], "otpauth://totp/")
-	if strings.Contains(path, ":") {
-		pathParts := strings.SplitN(path, ":", 2)
-		issuer = pathParts[0]
-		account = pathParts[1]
-	} else {
-		account = path
-	}
-
-	// 解析查询参数
-	params := strings.Split(parts[1], "&")
-	for _, param := range params {
-		if strings.HasPrefix(param, "secret=") {
-			secret = strings.TrimPrefix(param, "secret=")
-		} else if strings.HasPrefix(param, "issuer=") && issuer == "" {
-			issuer = strings.TrimPrefix(param, "issuer=")
-		}
-	}
-
-	if secret == "" {
-		return "", "", "", fmt.Errorf("secret not found in URL")
-	}
-
-	return issuer, account, secret, nil
 }

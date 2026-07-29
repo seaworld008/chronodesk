@@ -1,0 +1,96 @@
+name: Dependency Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 19 * * 0"
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: server/go.mod
+          cache: false
+
+      - name: Scan current source snapshot for secrets
+        run: >-
+          go run github.com/zricethezav/gitleaks/v8@v8.28.0
+          dir .
+          --redact=100
+          --no-banner
+          --no-color
+
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: server/go.mod
+          check-latest: true
+          cache-dependency-path: server/go.sum
+
+      - name: Test
+        run: go test ./... -count=1
+
+      - name: Scan reachable Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit production dependencies
+        run: npm run audit:security
+
+      - name: Validate OpenAPI 3.2 contract
+        run: |
+          npx --yes @redocly/cli@2.41.1 lint ../server/internal/openapi/openapi.yaml --format=stylish
+          npx --yes @stoplight/spectral-cli@6.16.2 lint \
+            -r ../server/internal/openapi/.spectral.yaml \
+            ../server/internal/openapi/openapi.yaml \
+            --fail-severity=warn
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build

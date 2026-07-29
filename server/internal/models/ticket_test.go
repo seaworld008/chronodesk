@@ -68,10 +68,7 @@ func TestTicketToResponseEmptyFields(t *testing.T) {
 	ticket := &Ticket{}
 	response := ticket.ToResponse()
 
-	if response.Tags != nil && len(response.Tags) != 0 {
+	if len(response.Tags) != 0 {
 		t.Fatalf("expected empty tags, got %v", response.Tags)
-	}
-	if response.CustomFields == nil {
-		// This is expected behavior - empty JSONType returns nil map
 	}
 }

@@ -46,6 +46,12 @@ type Notification struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
+	// SourceEventKey binds an in-app notification to one durable Outbox
+	// delivery. NULL is reserved for manually created notifications; Outbox
+	// consumers always set it and rely on the unique index for crash-safe
+	// replay after the row was committed but before delivery acknowledgement.
+	SourceEventKey *string `json:"-" gorm:"size:191;uniqueIndex:idx_notifications_source_event_key"`
+
 	// 基本信息
 	Type     NotificationType     `json:"type" gorm:"size:50;not null;index" validate:"required"`
 	Title    string               `json:"title" gorm:"size:255;not null" validate:"required,max=255"`
@@ -65,7 +71,7 @@ type Notification struct {
 	RelatedType     string  `json:"related_type" gorm:"size:50"` // 相关对象类型（如：ticket, user, system）
 	RelatedID       *uint   `json:"related_id" gorm:"index"`     // 相关对象ID
 	RelatedTicketID *uint   `json:"related_ticket_id" gorm:"index"`
-	RelatedTicket   *Ticket `json:"related_ticket,omitempty" gorm:"foreignKey:RelatedTicketID"`
+	RelatedTicket   *Ticket `json:"related_ticket,omitempty" gorm:"foreignKey:RelatedTicketID;constraint:OnUpdate:CASCADE,OnDelete:SET NULL;"`
 
 	// 状态信息
 	IsRead      bool       `json:"is_read" gorm:"default:false"`
@@ -178,8 +184,8 @@ type NotificationResponse struct {
 	Content        string                 `json:"content"`
 	Priority       NotificationPriority   `json:"priority"`
 	Channel        NotificationChannel    `json:"channel"`
-	Recipient      *UserResponse          `json:"recipient,omitempty"`
-	Sender         *UserResponse          `json:"sender,omitempty"`
+	Recipient      *UserSummary           `json:"recipient,omitempty"`
+	Sender         *UserSummary           `json:"sender,omitempty"`
 	RelatedType    string                 `json:"related_type"`
 	RelatedID      *uint                  `json:"related_id"`
 	RelatedTicket  *TicketResponse        `json:"related_ticket,omitempty"`
@@ -223,17 +229,16 @@ func (n *Notification) ToResponse() *NotificationResponse {
 
 	// 处理关联用户
 	if n.Recipient != nil {
-		response.Recipient = n.Recipient.ToResponse()
+		response.Recipient = n.Recipient.ToSummary()
 	}
 	if n.Sender != nil {
-		response.Sender = n.Sender.ToResponse()
+		response.Sender = n.Sender.ToSummary()
 	}
 	if n.RelatedTicket != nil {
 		response.RelatedTicket = n.RelatedTicket.ToResponse()
 	}
 
-	// TODO: 解析JSON字段
-	// response.Metadata = parseMetadataFromJSON(n.Metadata)
+	response.Metadata = decodeJSONMap(n.Metadata)
 
 	return response
 }

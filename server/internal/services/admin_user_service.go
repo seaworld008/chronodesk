@@ -2,14 +2,18 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
-	"gongdan-system/internal/models"
+	"gorm.io/gorm/clause"
 )
+
+var ErrAdminUserIdentityConflict = errors.New("admin user identity already exists")
 
 // AdminUserService 管理员用户管理服务
 type AdminUserService struct {
@@ -27,7 +31,7 @@ func NewAdminUserService(db *gorm.DB) *AdminUserService {
 type UserListRequest struct {
 	Page     int                `form:"page" binding:"omitempty,min=1"`
 	PageSize int                `form:"page_size" binding:"omitempty,min=1,max=100"`
-	Role     *models.UserRole   `form:"role" binding:"omitempty,oneof=admin agent customer supervisor"`
+	Role     *models.UserRole   `form:"role" binding:"omitempty,oneof=admin supervisor agent customer"`
 	Status   *models.UserStatus `form:"status" binding:"omitempty,oneof=active inactive suspended deleted"`
 	Search   string             `form:"search" binding:"omitempty,max=100"`
 	OrderBy  string             `form:"order_by" binding:"omitempty,oneof=id username email created_at updated_at last_login_at"`
@@ -45,6 +49,9 @@ type UserListResponse struct {
 
 // GetUserList 获取用户列表
 func (s *AdminUserService) GetUserList(ctx context.Context, req *UserListRequest) (*UserListResponse, error) {
+	if req.Role != nil && !req.Role.IsValid() {
+		return nil, fmt.Errorf("invalid human role")
+	}
 	// 设置默认值
 	if req.Page <= 0 {
 		req.Page = 1
@@ -85,9 +92,29 @@ func (s *AdminUserService) GetUserList(ctx context.Context, req *UserListRequest
 		return nil, fmt.Errorf("failed to count users: %w", err)
 	}
 
-	// 排序
-	orderClause := fmt.Sprintf("%s %s", req.OrderBy, strings.ToUpper(req.Order))
-	query = query.Order(orderClause)
+	// 排序列由固定映射构造，避免任何调用方绕过 HTTP binding 后把原始
+	// 请求字符串带入 SQL。
+	orderColumn := clause.Column{Name: "created_at"}
+	switch req.OrderBy {
+	case "id":
+		orderColumn.Name = "id"
+	case "username":
+		orderColumn.Name = "username"
+	case "email":
+		orderColumn.Name = "email"
+	case "updated_at":
+		orderColumn.Name = "updated_at"
+	case "last_login_at":
+		orderColumn.Name = "last_login_at"
+	case "created_at":
+		orderColumn.Name = "created_at"
+	}
+	query = query.Clauses(clause.OrderBy{
+		Columns: []clause.OrderByColumn{{
+			Column: orderColumn,
+			Desc:   !strings.EqualFold(req.Order, "asc"),
+		}},
+	})
 
 	// 分页
 	offset := (req.Page - 1) * req.PageSize
@@ -126,7 +153,7 @@ func (s *AdminUserService) GetUserByID(ctx context.Context, userID uint) (*model
 	err := s.db.WithContext(ctx).
 		Preload("Manager").
 		First(&user, userID).Error
-	
+
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return nil, fmt.Errorf("user not found")
@@ -139,20 +166,29 @@ func (s *AdminUserService) GetUserByID(ctx context.Context, userID uint) (*model
 
 // CreateUser 创建新用户
 func (s *AdminUserService) CreateUser(ctx context.Context, req *models.UserCreateRequest) (*models.User, error) {
-	// 检查用户名是否已存在
+	if !req.Role.IsValid() {
+		return nil, fmt.Errorf("invalid human role")
+	}
+	// 用户名和邮箱是长期审计身份，软删除后仍不得复用。Unscoped 与数据库
+	// 唯一索引保持同一语义，避免“活动查询未找到、INSERT 却返回 23505”。
 	var existingUser models.User
-	err := s.db.WithContext(ctx).Where("username = ?", req.Username).First(&existingUser).Error
+	err := s.db.WithContext(ctx).
+		Unscoped().
+		Where("username = ?", req.Username).
+		First(&existingUser).Error
 	if err == nil {
-		return nil, fmt.Errorf("username already exists")
+		return nil, fmt.Errorf("%w: username", ErrAdminUserIdentityConflict)
 	}
 	if err != gorm.ErrRecordNotFound {
 		return nil, fmt.Errorf("failed to check username: %w", err)
 	}
 
-	// 检查邮箱是否已存在
-	err = s.db.WithContext(ctx).Where("email = ?", req.Email).First(&existingUser).Error
+	err = s.db.WithContext(ctx).
+		Unscoped().
+		Where("email = ?", req.Email).
+		First(&existingUser).Error
 	if err == nil {
-		return nil, fmt.Errorf("email already exists")
+		return nil, fmt.Errorf("%w: email", ErrAdminUserIdentityConflict)
 	}
 	if err != gorm.ErrRecordNotFound {
 		return nil, fmt.Errorf("failed to check email: %w", err)
@@ -183,6 +219,11 @@ func (s *AdminUserService) CreateUser(ctx context.Context, req *models.UserCreat
 	}
 
 	if err := s.db.WithContext(ctx).Create(user).Error; err != nil {
+		// 预检查不能替代数据库约束；并发创建时由唯一索引裁决，并映射为
+		// 稳定冲突而不是把数据库细节泄漏成 500。
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			return nil, fmt.Errorf("%w: concurrent create", ErrAdminUserIdentityConflict)
+		}
 		return nil, fmt.Errorf("failed to create user: %w", err)
 	}
 
@@ -197,6 +238,9 @@ func (s *AdminUserService) CreateUser(ctx context.Context, req *models.UserCreat
 
 // UpdateUser 更新用户信息
 func (s *AdminUserService) UpdateUser(ctx context.Context, userID uint, req *models.UserUpdateRequest) (*models.User, error) {
+	if req.Role != nil && !req.Role.IsValid() {
+		return nil, fmt.Errorf("invalid human role")
+	}
 	user := &models.User{}
 	if err := s.db.WithContext(ctx).First(user, userID).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
@@ -205,16 +249,49 @@ func (s *AdminUserService) UpdateUser(ctx context.Context, userID uint, req *mod
 		return nil, fmt.Errorf("failed to find user: %w", err)
 	}
 
+	if user.Role == models.RoleAdmin {
+		targetRole := user.Role
+		if req.Role != nil {
+			targetRole = *req.Role
+		}
+		targetStatus := user.Status
+		if req.Status != nil {
+			targetStatus = *req.Status
+		}
+		if targetRole != models.RoleAdmin || targetStatus != models.UserStatusActive {
+			var activeAdminCount int64
+			if err := s.db.WithContext(ctx).
+				Model(&models.User{}).
+				Where(
+					"role = ? AND id != ? AND status = ?",
+					models.RoleAdmin,
+					userID,
+					models.UserStatusActive,
+				).
+				Count(&activeAdminCount).Error; err != nil {
+				return nil, fmt.Errorf("failed to count active admins: %w", err)
+			}
+			if activeAdminCount == 0 {
+				return nil, fmt.Errorf("cannot deactivate the last active admin user")
+			}
+		}
+	}
+
 	// 构建更新数据
 	updates := make(map[string]interface{})
 
 	if req.Email != nil {
-		// 检查邮箱是否被其他用户使用
+		// 审计保留的软删除身份同样占用邮箱。
 		var count int64
-		s.db.WithContext(ctx).Model(&models.User{}).
-			Where("email = ? AND id != ?", *req.Email, userID).Count(&count)
+		if err := s.db.WithContext(ctx).
+			Unscoped().
+			Model(&models.User{}).
+			Where("email = ? AND id != ?", *req.Email, userID).
+			Count(&count).Error; err != nil {
+			return nil, fmt.Errorf("failed to check email: %w", err)
+		}
 		if count > 0 {
-			return nil, fmt.Errorf("email already exists")
+			return nil, fmt.Errorf("%w: email", ErrAdminUserIdentityConflict)
 		}
 		updates["email"] = *req.Email
 		updates["email_verified"] = false // 邮箱变更需要重新验证
@@ -256,6 +333,9 @@ func (s *AdminUserService) UpdateUser(ctx context.Context, userID uint, req *mod
 	if req.Status != nil {
 		updates["status"] = *req.Status
 	}
+	if req.EmailVerified != nil {
+		updates["email_verified"] = *req.EmailVerified
+	}
 
 	if req.Department != nil {
 		updates["department"] = *req.Department
@@ -272,6 +352,9 @@ func (s *AdminUserService) UpdateUser(ctx context.Context, userID uint, req *mod
 	// 执行更新
 	if len(updates) > 0 {
 		if err := s.db.WithContext(ctx).Model(user).Updates(updates).Error; err != nil {
+			if errors.Is(err, gorm.ErrDuplicatedKey) {
+				return nil, fmt.Errorf("%w: concurrent update", ErrAdminUserIdentityConflict)
+			}
 			return nil, fmt.Errorf("failed to update user: %w", err)
 		}
 	}
@@ -301,19 +384,41 @@ func (s *AdminUserService) ResetUserPassword(ctx context.Context, userID uint, n
 		return fmt.Errorf("failed to hash password: %w", err)
 	}
 
-	// 更新密码
+	now := time.Now()
+	// 密码更新与会话撤销必须处于同一事务中。否则管理员重置密码后，
+	// 旧刷新令牌仍可能签发新的访问令牌。
 	updates := map[string]interface{}{
-		"password_hash":    hashedPassword,
-		"password_reset_at": time.Now(),
-		"login_attempts":   0,      // 重置登录尝试次数
-		"locked_until":     nil,    // 解除锁定
+		"password_hash":     hashedPassword,
+		"password_reset_at": now,
+		"login_attempts":    0,   // 重置登录尝试次数
+		"locked_until":      nil, // 解除锁定
 	}
 
-	if err := s.db.WithContext(ctx).Model(user).Updates(updates).Error; err != nil {
-		return fmt.Errorf("failed to reset password: %w", err)
-	}
-
-	return nil
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(user).Updates(updates).Error; err != nil {
+			return fmt.Errorf("failed to reset password: %w", err)
+		}
+		if err := tx.Table("refresh_tokens").
+			Where("user_id = ? AND revoked = ?", userID, false).
+			Updates(map[string]interface{}{
+				"revoked":    true,
+				"revoked_at": now,
+			}).Error; err != nil {
+			return fmt.Errorf("failed to revoke user refresh tokens: %w", err)
+		}
+		if err := tx.Model(&models.LoginHistory{}).
+			Where("user_id = ? AND is_active = ?", userID, true).
+			Updates(map[string]interface{}{
+				"is_active":        false,
+				"logout_time":      now,
+				"last_activity_at": now,
+				"login_status":     models.LoginStatusExpired,
+				"failure_reason":   "password_reset",
+			}).Error; err != nil {
+			return fmt.Errorf("failed to close user login sessions: %w", err)
+		}
+		return nil
+	})
 }
 
 // DeleteUser 删除用户（软删除）
@@ -333,108 +438,45 @@ func (s *AdminUserService) DeleteUser(ctx context.Context, userID uint) error {
 		s.db.WithContext(ctx).Model(&models.User{}).
 			Where("role = ? AND id != ? AND status = ?", models.RoleAdmin, userID, models.UserStatusActive).
 			Count(&adminCount)
-		
+
 		if adminCount == 0 {
 			return fmt.Errorf("cannot delete the last admin user")
 		}
 	}
 
-	// 执行软删除
-	if err := s.db.WithContext(ctx).Delete(user).Error; err != nil {
-		return fmt.Errorf("failed to delete user: %w", err)
-	}
-
-	return nil
-}
-
-// ToggleUserStatus 切换用户状态（启用/禁用）
-func (s *AdminUserService) ToggleUserStatus(ctx context.Context, userID uint) (*models.User, error) {
-	user := &models.User{}
-	if err := s.db.WithContext(ctx).First(user, userID).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
-			return nil, fmt.Errorf("user not found")
+	now := time.Now()
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 先使账号与所有长期会话失效，再软删除主体。认证/登录记录保留
+		// 作为审计证据，因此不能通过级联物理删除解决外键冲突。
+		if err := tx.Model(user).Update("status", models.UserStatusDeleted).Error; err != nil {
+			return fmt.Errorf("failed to disable user before deletion: %w", err)
 		}
-		return nil, fmt.Errorf("failed to find user: %w", err)
-	}
-
-	// 切换状态
-	var newStatus models.UserStatus
-	if user.Status == models.UserStatusActive {
-		newStatus = models.UserStatusSuspended
-	} else if user.Status == models.UserStatusSuspended {
-		newStatus = models.UserStatusActive
-	} else {
-		return nil, fmt.Errorf("cannot toggle status for user with status: %s", user.Status)
-	}
-
-	// 检查是否为最后一个活跃管理员
-	if user.Role == models.RoleAdmin && newStatus == models.UserStatusSuspended {
-		var activeAdminCount int64
-		s.db.WithContext(ctx).Model(&models.User{}).
-			Where("role = ? AND id != ? AND status = ?", models.RoleAdmin, userID, models.UserStatusActive).
-			Count(&activeAdminCount)
-		
-		if activeAdminCount == 0 {
-			return nil, fmt.Errorf("cannot suspend the last active admin user")
+		if err := tx.Table("refresh_tokens").
+			Where("user_id = ? AND revoked = ?", userID, false).
+			Updates(map[string]interface{}{
+				"revoked":    true,
+				"revoked_at": now,
+			}).Error; err != nil {
+			return fmt.Errorf("failed to revoke user refresh tokens: %w", err)
 		}
-	}
-
-	// 更新状态
-	if err := s.db.WithContext(ctx).Model(user).Update("status", newStatus).Error; err != nil {
-		return nil, fmt.Errorf("failed to update user status: %w", err)
-	}
-
-	// 重新加载用户信息
-	err := s.db.WithContext(ctx).Preload("Manager").First(user, user.ID).Error
-	if err != nil {
-		return nil, fmt.Errorf("failed to reload user: %w", err)
-	}
-
-	return user, nil
-}
-
-// BatchDeleteUsers 批量删除用户
-func (s *AdminUserService) BatchDeleteUsers(ctx context.Context, userIDs []uint) error {
-	if len(userIDs) == 0 {
-		return fmt.Errorf("no user IDs provided")
-	}
-
-	// 查询要删除的用户
-	var users []models.User
-	if err := s.db.WithContext(ctx).Where("id IN ?", userIDs).Find(&users).Error; err != nil {
-		return fmt.Errorf("failed to find users: %w", err)
-	}
-
-	if len(users) == 0 {
-		return fmt.Errorf("no users found")
-	}
-
-	// 检查管理员用户
-	adminIDs := make([]uint, 0)
-	for _, user := range users {
-		if user.Role == models.RoleAdmin {
-			adminIDs = append(adminIDs, user.ID)
+		if err := tx.Model(&models.LoginHistory{}).
+			Where("user_id = ? AND is_active = ?", userID, true).
+			Updates(map[string]interface{}{
+				"is_active":   false,
+				"logout_time": now,
+			}).Error; err != nil {
+			return fmt.Errorf("failed to close user login sessions: %w", err)
 		}
-	}
-
-	// 如果包含管理员，检查是否会删除所有管理员
-	if len(adminIDs) > 0 {
-		var totalAdminCount int64
-		s.db.WithContext(ctx).Model(&models.User{}).
-			Where("role = ? AND status = ?", models.RoleAdmin, models.UserStatusActive).
-			Count(&totalAdminCount)
-		
-		if int64(len(adminIDs)) >= totalAdminCount {
-			return fmt.Errorf("cannot delete all admin users")
+		if err := tx.Model(&models.OTPTrustedDevice{}).
+			Where("user_id = ? AND revoked = ?", userID, false).
+			Update("revoked", true).Error; err != nil {
+			return fmt.Errorf("failed to revoke trusted devices: %w", err)
 		}
-	}
-
-	// 执行批量删除
-	if err := s.db.WithContext(ctx).Delete(&models.User{}, userIDs).Error; err != nil {
-		return fmt.Errorf("failed to batch delete users: %w", err)
-	}
-
-	return nil
+		if err := tx.Delete(user).Error; err != nil {
+			return fmt.Errorf("failed to soft delete user: %w", err)
+		}
+		return nil
+	})
 }
 
 // GetUserStats 获取用户统计信息
@@ -489,10 +531,10 @@ func (s *AdminUserService) GetUserStats(ctx context.Context) (*UserStatsResponse
 
 // UserStatsResponse 用户统计响应
 type UserStatsResponse struct {
-	TotalUsers        int64            `json:"total_users"`
-	ActiveUsers       int64            `json:"active_users"`
-	UsersByRole       map[string]int64 `json:"users_by_role"`
-	NewUsersThisWeek  int64            `json:"new_users_this_week"`
+	TotalUsers       int64            `json:"total_users"`
+	ActiveUsers      int64            `json:"active_users"`
+	UsersByRole      map[string]int64 `json:"users_by_role"`
+	NewUsersThisWeek int64            `json:"new_users_this_week"`
 }
 
 // hashPassword 加密密码

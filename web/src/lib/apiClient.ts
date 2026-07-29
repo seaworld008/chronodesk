@@ -8,21 +8,109 @@ type JsonRecord = Record<string, unknown>
 
 const isJsonRecord = (value: unknown): value is JsonRecord => typeof value === 'object' && value !== null
 
+const problemMessages: Record<string, string> = {
+  invalid_request: '请求内容无效，请检查后重试',
+  invalid_actor: '操作身份无效，请重新认证后重试',
+  invalid_scope: '请求的权限范围无效',
+  unauthorized: '登录状态已失效，请重新登录',
+  insufficient_scope: '当前凭据缺少执行此操作所需的权限范围',
+  scope_not_granted: '当前服务主体未被授予所需权限范围',
+  scope_allowed: '权限范围校验通过',
+  explicit_allow: '显式允许策略已授权本次操作',
+  explicit_deny: '显式拒绝策略阻止了本次操作',
+  explicit_allow_required: '该风险操作需要配置显式允许策略',
+  policy_denied: '安全策略拒绝了本次操作',
+  principal_not_found: '服务主体不存在',
+  principal_disabled: '服务主体已停用',
+  principal_expired: '服务主体已过期',
+  invalid_credential: '智能体凭据无效或已被撤销',
+  credential_expired: '智能体凭据已过期',
+  global_emergency_stop: '智能体全局紧急停止已启用',
+  agent_emergency_stop: '智能体紧急停止已启用',
+  global_read_only: '智能体全局只读模式已启用',
+  principal_read_only: '该智能体当前处于只读模式',
+  read_only: '当前处于只读模式，写操作已被拒绝',
+  not_found: '请求的资源不存在或当前账号无权访问',
+  precondition_required: '数据版本信息缺失，请刷新后重试',
+  version_conflict: '数据已被其他操作更新，请刷新后重试',
+  lease_conflict: '工单租约已失效或由其他智能体持有',
+  lease_expired: '工单租约已过期，请重新领取',
+  lease_not_owned: '当前智能体不是该工单租约的持有者',
+  idempotency_conflict: '相同幂等键正在处理，或已用于不同请求',
+  idempotency_in_progress: '相同幂等请求仍在处理中，请稍后查询结果',
+  command_scope_mismatch: '幂等键已用于其他命令范围',
+  rate_limited: '操作过于频繁，请稍后重试',
+  concurrency_limit: '智能体并发任务数已达到上限',
+  execution_guard_unavailable: '智能体安全执行保护暂时不可用',
+  service_unavailable: '安全执行保护暂时不可用，请稍后重试',
+  automation_loop: '检测到异常自动化循环，操作已停止',
+  outbox_replay_conflict: '该投递当前无法回放，请刷新状态后重试',
+  attachment_rejected: '附件未通过安全校验，无法继续处理',
+  internal_error: '服务暂时不可用，请稍后重试',
+}
+
+export const containsChineseText = (value: string) => /[\u3400-\u9fff]/u.test(value)
+
+export const localizedUnknownErrorMessage = (
+  error: unknown,
+  fallback = '操作失败，请检查网络后重试',
+) => {
+  if (error instanceof DOMException && error.name === 'AbortError') {
+    return '请求已取消'
+  }
+  if (error instanceof Error && containsChineseText(error.message)) {
+    return error.message
+  }
+  return fallback
+}
+
+export const localizedApiErrorMessage = (
+  payload: unknown,
+  status: number,
+  fallback = '请求未能完成，请检查输入后重试',
+) => {
+  const record = isJsonRecord(payload) ? payload : null
+  const code =
+    typeof record?.code === 'string'
+      ? record.code
+      : typeof record?.reason_code === 'string'
+        ? record.reason_code
+        : ''
+  if (code && problemMessages[code]) return problemMessages[code]
+
+  const candidate = record
+    ? [record.detail, record.msg, record.message].find((value) => typeof value === 'string')
+    : undefined
+  if (typeof candidate === 'string' && containsChineseText(candidate)) return candidate
+
+  if (status === 401) return '登录状态已失效，请重新登录'
+  if (status === 403) return '当前账号无权执行此操作'
+  if (status === 404) return '请求的资源不存在'
+  if (status === 409) return '数据状态已发生变化，请刷新后重试'
+  if (status === 429) return '操作过于频繁，请稍后重试'
+  if (status >= 500) return '服务暂时不可用，请稍后重试'
+  return fallback
+}
+
 const extractDataFromEnvelope = <T>(payload: JsonRecord): T | undefined => {
   if (typeof payload.code === 'number') {
     if (payload.code !== 0) {
-      const message = typeof payload.msg === 'string' ? payload.msg : '操作失败'
-      throw new Error(message)
+      const status = typeof payload.status === 'number' ? payload.status : 400
+      throw new Error(localizedApiErrorMessage(payload, status, '操作失败，请检查后重试'))
     }
     return (payload.data as T | undefined) ?? (payload as unknown as T)
   }
 
   if (typeof payload.success === 'boolean') {
     if (!payload.success) {
-      const message = typeof payload.message === 'string' ? payload.message : '操作失败'
-      throw new Error(message)
+      const status = typeof payload.status === 'number' ? payload.status : 400
+      throw new Error(localizedApiErrorMessage(payload, status, '操作失败，请检查后重试'))
     }
     return (payload.data as T | undefined) ?? (payload as unknown as T)
+  }
+
+  if ('data' in payload && 'meta' in payload && isJsonRecord(payload.meta)) {
+    return payload.data as T
   }
 
   return payload as unknown as T
@@ -39,10 +127,15 @@ export async function apiFetch<T = unknown>(path: string, options: ApiOptions = 
     headers.set('Authorization', `Bearer ${token}`)
   }
 
-  const response = await fetch(toUrl(path), {
-    ...options,
-    headers,
-  })
+  let response: Response
+  try {
+    response = await fetch(toUrl(path), {
+      ...options,
+      headers,
+    })
+  } catch (error) {
+    throw new Error(localizedUnknownErrorMessage(error, '网络连接失败，请检查网络后重试'))
+  }
 
   if (options.rawResponse) {
     return response as unknown as T
@@ -60,10 +153,7 @@ export async function apiFetch<T = unknown>(path: string, options: ApiOptions = 
   }
 
   if (!response.ok) {
-    const message = isJsonRecord(parsed)
-      ? (parsed.msg as string) || (parsed.message as string) || response.statusText || '请求失败'
-      : response.statusText || '请求失败'
-    throw new Error(message)
+    throw new Error(localizedApiErrorMessage(parsed, response.status))
   }
 
   if (isJsonRecord(parsed)) {

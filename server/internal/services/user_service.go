@@ -1,22 +1,43 @@
 package services
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"image"
+	"image/jpeg"
+	"image/png"
+	"io"
 	"mime/multipart"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
-	"gongdan-system/internal/models"
+	"github.com/google/uuid"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
 )
 
 // UserService 用户服务
 type UserService struct {
-	db *gorm.DB
+	db             *gorm.DB
+	avatarStorage  AttachmentStorage
+	avatarMaxBytes int64
 }
+
+const (
+	defaultAvatarMaxBytes = 2 * 1024 * 1024
+	maxAvatarDimension    = 4096
+	maxAvatarPixels       = 16 * 1024 * 1024
+	avatarURLPrefix       = "/uploads/avatars/"
+)
+
+var (
+	ErrAvatarStorageMissing = errors.New("avatar storage is not configured")
+	ErrInvalidAvatar        = errors.New("invalid avatar image")
+	ErrAvatarNotFound       = errors.New("avatar not found")
+)
 
 var loginHistorySortableColumns = map[string]string{
 	"login_time":   "login_time",
@@ -32,122 +53,19 @@ var loginHistorySortableColumns = map[string]string{
 // NewUserService 创建用户服务
 func NewUserService(db *gorm.DB) *UserService {
 	return &UserService{
-		db: db,
+		db:             db,
+		avatarMaxBytes: defaultAvatarMaxBytes,
 	}
 }
 
-// GetUserProfile 获取用户详细信息
-func (s *UserService) GetUserProfile(ctx context.Context, userID uint) (*models.User, error) {
-	var user models.User
-	err := s.db.WithContext(ctx).
-		Preload("Manager").
-		First(&user, userID).Error
-	if err != nil {
-		return nil, fmt.Errorf("failed to get user profile: %w", err)
+// SetAvatarStorage reuses the protocol-neutral object store used by ticket
+// attachments. Avatar keys live in a separate prefix and are never accepted
+// from caller-provided URLs.
+func (s *UserService) SetAvatarStorage(storage AttachmentStorage, maxBytes int64) {
+	s.avatarStorage = storage
+	if maxBytes > 0 {
+		s.avatarMaxBytes = maxBytes
 	}
-
-	return &user, nil
-}
-
-// UpdateUserProfile 更新用户个人资料
-func (s *UserService) UpdateUserProfile(ctx context.Context, userID uint, req *models.UserUpdateRequest) error {
-	user := &models.User{}
-	if err := s.db.WithContext(ctx).First(user, userID).Error; err != nil {
-		return fmt.Errorf("user not found: %w", err)
-	}
-
-	// 构建更新数据
-	updates := make(map[string]interface{})
-
-	if req.Email != nil {
-		// 检查邮箱是否被其他用户使用
-		var count int64
-		s.db.Model(&models.User{}).Where("email = ? AND id != ?", *req.Email, userID).Count(&count)
-		if count > 0 {
-			return fmt.Errorf("email already exists")
-		}
-		updates["email"] = *req.Email
-		updates["email_verified"] = false // 邮箱变更需要重新验证
-	}
-
-	if req.Phone != nil {
-		updates["phone"] = *req.Phone
-		updates["phone_verified"] = false // 手机变更需要重新验证
-	}
-
-	if req.FirstName != nil {
-		updates["first_name"] = *req.FirstName
-	}
-
-	if req.LastName != nil {
-		updates["last_name"] = *req.LastName
-	}
-
-	if req.DisplayName != nil {
-		updates["display_name"] = *req.DisplayName
-	}
-
-	if req.Avatar != nil {
-		updates["avatar"] = *req.Avatar
-	}
-
-	if req.Timezone != nil {
-		updates["timezone"] = *req.Timezone
-	}
-
-	if req.Language != nil {
-		updates["language"] = *req.Language
-	}
-
-	if req.Department != nil {
-		updates["department"] = *req.Department
-	}
-
-	if req.JobTitle != nil {
-		updates["job_title"] = *req.JobTitle
-	}
-
-	if req.ManagerID != nil {
-		updates["manager_id"] = *req.ManagerID
-	}
-
-	// 执行更新
-	if len(updates) > 0 {
-		if err := s.db.WithContext(ctx).Model(user).Updates(updates).Error; err != nil {
-			return fmt.Errorf("failed to update user profile: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// ChangePassword 修改用户密码
-func (s *UserService) ChangePassword(ctx context.Context, userID uint, currentPassword, newPassword string) error {
-	user := &models.User{}
-	if err := s.db.WithContext(ctx).First(user, userID).Error; err != nil {
-		return fmt.Errorf("user not found: %w", err)
-	}
-
-	// 验证当前密码
-	if !s.verifyPassword(user.PasswordHash, currentPassword) {
-		return fmt.Errorf("invalid current password")
-	}
-
-	// 加密新密码
-	hashedPassword, err := s.hashPassword(newPassword)
-	if err != nil {
-		return fmt.Errorf("failed to hash new password: %w", err)
-	}
-
-	// 更新密码
-	if err := s.db.WithContext(ctx).Model(user).Update("password_hash", hashedPassword).Error; err != nil {
-		return fmt.Errorf("failed to update password: %w", err)
-	}
-
-	// 记录密码修改历史（可选）
-	s.recordPasswordChange(ctx, userID)
-
-	return nil
 }
 
 // GetLoginHistory 获取用户登录历史
@@ -227,95 +145,6 @@ func (s *UserService) GetLoginHistory(ctx context.Context, userID uint, req *mod
 	return responses, total, nil
 }
 
-// RecordLogin 记录用户登录
-func (s *UserService) RecordLogin(ctx context.Context, userID uint, req *RecordLoginRequest) error {
-	user := &models.User{}
-	if err := s.db.WithContext(ctx).First(user, userID).Error; err != nil {
-		return fmt.Errorf("user not found: %w", err)
-	}
-
-	// 解析设备信息
-	deviceInfo := parseUserAgent(req.UserAgent)
-
-	loginHistory := &models.LoginHistory{
-		UserID:      userID,
-		Username:    user.Username,
-		Email:       user.Email,
-		IPAddress:   req.IPAddress,
-		UserAgent:   req.UserAgent,
-		LoginTime:   time.Now(),
-		SessionID:   req.SessionID,
-		LoginStatus: models.LoginStatusSuccess,
-		LoginMethod: req.LoginMethod,
-
-		// 设备信息
-		DeviceType:      deviceInfo.DeviceType,
-		OperatingSystem: deviceInfo.OperatingSystem,
-		Browser:         deviceInfo.Browser,
-
-		// 地理位置信息（如果有）
-		Country:  req.Country,
-		Region:   req.Region,
-		City:     req.City,
-		Timezone: req.Timezone,
-
-		IsActive: true,
-	}
-
-	if err := s.db.WithContext(ctx).Create(loginHistory).Error; err != nil {
-		return fmt.Errorf("failed to record login: %w", err)
-	}
-
-	// 更新用户最后登录信息
-	now := time.Now()
-	updates := map[string]interface{}{
-		"last_login_at": &now,
-		"last_login_ip": req.IPAddress,
-	}
-
-	if err := s.db.WithContext(ctx).Model(user).Updates(updates).Error; err != nil {
-		// 记录日志但不返回错误
-		fmt.Printf("Warning: failed to update user last login info: %v\n", err)
-	}
-
-	return nil
-}
-
-// RecordLogout 记录用户退出登录
-func (s *UserService) RecordLogout(ctx context.Context, userID uint, sessionID string) error {
-	now := time.Now()
-
-	// 查找活跃的登录会话
-	var loginHistory models.LoginHistory
-	err := s.db.WithContext(ctx).
-		Where("user_id = ? AND session_id = ? AND is_active = ?", userID, sessionID, true).
-		First(&loginHistory).Error
-
-	if err != nil {
-		if err == gorm.ErrRecordNotFound {
-			// 会话未找到，可能已经过期或清理
-			return nil
-		}
-		return fmt.Errorf("failed to find login session: %w", err)
-	}
-
-	// 计算会话持续时间
-	sessionDuration := int64(now.Sub(loginHistory.LoginTime).Seconds())
-
-	// 更新登录记录
-	updates := map[string]interface{}{
-		"logout_time":      &now,
-		"session_duration": sessionDuration,
-		"is_active":        false,
-	}
-
-	if err := s.db.WithContext(ctx).Model(&loginHistory).Updates(updates).Error; err != nil {
-		return fmt.Errorf("failed to update logout time: %w", err)
-	}
-
-	return nil
-}
-
 // DeleteLoginSession 删除指定用户的登录会话（用于踢设备下线）
 func (s *UserService) DeleteLoginSession(ctx context.Context, userID uint, historyID uint) error {
 	var loginHistory models.LoginHistory
@@ -324,10 +153,6 @@ func (s *UserService) DeleteLoginSession(ctx context.Context, userID uint, histo
 		First(&loginHistory).Error
 	if err != nil {
 		return fmt.Errorf("failed to find login session: %w", err)
-	}
-
-	if !loginHistory.IsActive {
-		return nil
 	}
 
 	now := time.Now()
@@ -341,14 +166,34 @@ func (s *UserService) DeleteLoginSession(ctx context.Context, userID uint, histo
 		updates["session_duration"] = int64(now.Sub(loginHistory.LoginTime).Seconds())
 	}
 
-	if err := s.db.WithContext(ctx).
-		Model(&models.LoginHistory{}).
-		Where("id = ?", loginHistory.ID).
-		Updates(updates).Error; err != nil {
-		return fmt.Errorf("failed to deactivate login session: %w", err)
-	}
-
-	return nil
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if loginHistory.IsActive {
+			if err := tx.
+				Model(&models.LoginHistory{}).
+				Where("id = ? AND user_id = ?", loginHistory.ID, userID).
+				Updates(updates).Error; err != nil {
+				return fmt.Errorf("failed to deactivate login session: %w", err)
+			}
+		}
+		if strings.TrimSpace(loginHistory.SessionID) == "" {
+			return nil
+		}
+		if err := tx.
+			Table("refresh_tokens").
+			Where(
+				"user_id = ? AND session_id = ? AND revoked = ?",
+				userID,
+				loginHistory.SessionID,
+				false,
+			).
+			Updates(map[string]interface{}{
+				"revoked":    true,
+				"revoked_at": now,
+			}).Error; err != nil {
+			return fmt.Errorf("failed to revoke login session tokens: %w", err)
+		}
+		return nil
+	})
 }
 
 // GetUserStats 获取用户统计信息
@@ -428,52 +273,145 @@ func (s *UserService) GetUserStats(ctx context.Context, userID uint) (*models.Us
 
 // UploadAvatar 上传用户头像
 func (s *UserService) UploadAvatar(ctx context.Context, userID uint, file multipart.File, header *multipart.FileHeader) (string, error) {
-	// 验证文件类型
-	allowedTypes := []string{".jpg", ".jpeg", ".png", ".gif"}
-	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if s.avatarStorage == nil {
+		return "", ErrAvatarStorageMissing
+	}
+	if file == nil || header == nil {
+		return "", fmt.Errorf("%w: file is required", ErrInvalidAvatar)
+	}
+	maxBytes := s.avatarMaxBytes
+	if maxBytes <= 0 {
+		maxBytes = defaultAvatarMaxBytes
+	}
+	if header.Size > maxBytes {
+		return "", ErrAttachmentTooLarge
+	}
 
-	isAllowed := false
-	for _, allowedType := range allowedTypes {
-		if ext == allowedType {
-			isAllowed = true
-			break
+	payload, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("%w: read upload: %v", ErrInvalidAvatar, err)
+	}
+	if int64(len(payload)) > maxBytes {
+		return "", ErrAttachmentTooLarge
+	}
+
+	imageConfig, format, err := image.DecodeConfig(bytes.NewReader(payload))
+	if err != nil {
+		return "", fmt.Errorf("%w: image header cannot be decoded", ErrInvalidAvatar)
+	}
+	if imageConfig.Width <= 0 || imageConfig.Height <= 0 ||
+		imageConfig.Width > maxAvatarDimension || imageConfig.Height > maxAvatarDimension ||
+		int64(imageConfig.Width)*int64(imageConfig.Height) > maxAvatarPixels {
+		return "", fmt.Errorf("%w: image dimensions exceed the safe limit", ErrInvalidAvatar)
+	}
+	if format != "jpeg" && format != "png" {
+		return "", fmt.Errorf("%w: only JPEG and PNG are supported", ErrInvalidAvatar)
+	}
+
+	decoded, decodedFormat, err := image.Decode(bytes.NewReader(payload))
+	if err != nil || decodedFormat != format {
+		return "", fmt.Errorf("%w: image payload cannot be decoded", ErrInvalidAvatar)
+	}
+	sanitized := bytes.NewBuffer(make([]byte, 0, len(payload)))
+	extension := ".jpg"
+	switch format {
+	case "jpeg":
+		if err := jpeg.Encode(sanitized, decoded, &jpeg.Options{Quality: 90}); err != nil {
+			return "", fmt.Errorf("%w: encode JPEG: %v", ErrInvalidAvatar, err)
+		}
+	case "png":
+		extension = ".png"
+		encoder := png.Encoder{CompressionLevel: png.BestSpeed}
+		if err := encoder.Encode(sanitized, decoded); err != nil {
+			return "", fmt.Errorf("%w: encode PNG: %v", ErrInvalidAvatar, err)
 		}
 	}
-
-	if !isAllowed {
-		return "", fmt.Errorf("unsupported file type: %s", ext)
+	if int64(sanitized.Len()) > maxBytes {
+		return "", ErrAttachmentTooLarge
 	}
 
-	// 验证文件大小（2MB限制）
-	if header.Size > 2*1024*1024 {
-		return "", fmt.Errorf("file too large: maximum 2MB allowed")
+	var user models.User
+	if err := s.db.WithContext(ctx).Select("id", "avatar").First(&user, userID).Error; err != nil {
+		return "", fmt.Errorf("find avatar owner: %w", err)
 	}
 
-	// 生成唯一文件名
-	filename := fmt.Sprintf("avatar_%d_%d%s", userID, time.Now().Unix(), ext)
+	filename := uuid.NewString() + extension
+	key := filepath.ToSlash(filepath.Join("avatars", fmt.Sprintf("%d", userID), filename))
+	stored, err := s.avatarStorage.Put(ctx, key, bytes.NewReader(sanitized.Bytes()), maxBytes)
+	if err != nil {
+		return "", fmt.Errorf("store avatar: %w", err)
+	}
+	avatarURL := avatarURLPrefix + fmt.Sprintf("%d/%s", userID, filename)
 
-	// TODO: 实现文件保存逻辑（本地存储或云存储）
-	// 这里暂时返回模拟的URL
-	avatarURL := fmt.Sprintf("/uploads/avatars/%s", filename)
-
-	// 更新用户头像URL
 	if err := s.db.WithContext(ctx).Model(&models.User{}).
 		Where("id = ?", userID).
 		Update("avatar", avatarURL).Error; err != nil {
-		return "", fmt.Errorf("failed to update avatar: %w", err)
+		_ = s.avatarStorage.Delete(context.Background(), stored.Key)
+		return "", fmt.Errorf("update avatar: %w", err)
 	}
 
+	if oldKey, ok := avatarStorageKey(user.Avatar); ok && oldKey != stored.Key {
+		_ = s.avatarStorage.Delete(context.Background(), oldKey)
+	}
 	return avatarURL, nil
 }
 
-// recordPasswordChange 记录密码修改（内部方法）
-func (s *UserService) recordPasswordChange(ctx context.Context, userID uint) {
-	// 可以在这里记录密码修改历史
-	// 例如：更新密码修改时间、记录安全日志等
-	now := time.Now()
-	s.db.WithContext(ctx).Model(&models.User{}).
-		Where("id = ?", userID).
-		Update("password_reset_at", &now)
+// OpenAvatar only serves the user's current opaque avatar URL. Superseded
+// objects are deleted on replacement and cannot be replayed through this API.
+func (s *UserService) OpenAvatar(
+	ctx context.Context,
+	userID uint,
+	filename string,
+) (io.ReadCloser, string, error) {
+	if s.avatarStorage == nil {
+		return nil, "", ErrAvatarStorageMissing
+	}
+	if filepath.Base(filename) != filename {
+		return nil, "", ErrAvatarNotFound
+	}
+	extension := strings.ToLower(filepath.Ext(filename))
+	idPart := strings.TrimSuffix(filename, extension)
+	if _, err := uuid.Parse(idPart); err != nil || (extension != ".jpg" && extension != ".png") {
+		return nil, "", ErrAvatarNotFound
+	}
+	avatarURL := avatarURLPrefix + fmt.Sprintf("%d/%s", userID, filename)
+	var count int64
+	if err := s.db.WithContext(ctx).Model(&models.User{}).
+		Where("id = ? AND avatar = ? AND status <> ?", userID, avatarURL, models.UserStatusDeleted).
+		Count(&count).Error; err != nil {
+		return nil, "", fmt.Errorf("verify avatar owner: %w", err)
+	}
+	if count != 1 {
+		return nil, "", ErrAvatarNotFound
+	}
+
+	reader, err := s.avatarStorage.Open(
+		ctx,
+		filepath.ToSlash(filepath.Join("avatars", fmt.Sprintf("%d", userID), filename)),
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %v", ErrAvatarNotFound, err)
+	}
+	contentType := "image/jpeg"
+	if extension == ".png" {
+		contentType = "image/png"
+	}
+	return reader, contentType, nil
+}
+
+func avatarStorageKey(avatarURL string) (string, bool) {
+	if !strings.HasPrefix(avatarURL, avatarURLPrefix) {
+		return "", false
+	}
+	key := strings.TrimPrefix(avatarURL, avatarURLPrefix)
+	if key == "" || filepath.IsAbs(key) {
+		return "", false
+	}
+	cleaned := filepath.ToSlash(filepath.Clean(filepath.FromSlash(key)))
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return "", false
+	}
+	return "avatars/" + cleaned, true
 }
 
 // calculateSecurityScore 计算安全评分
@@ -511,52 +449,6 @@ func (s *UserService) calculateSecurityScore(user *models.User, stats *models.Us
 	return score
 }
 
-// parseUserAgent 解析User-Agent字符串
-func parseUserAgent(userAgent string) *DeviceInfo {
-	deviceInfo := &DeviceInfo{
-		DeviceType:      "desktop",
-		OperatingSystem: "Unknown",
-		Browser:         "Unknown",
-	}
-
-	userAgent = strings.ToLower(userAgent)
-
-	// 检测设备类型
-	if strings.Contains(userAgent, "mobile") || strings.Contains(userAgent, "android") || strings.Contains(userAgent, "iphone") {
-		deviceInfo.DeviceType = "mobile"
-	} else if strings.Contains(userAgent, "tablet") || strings.Contains(userAgent, "ipad") {
-		deviceInfo.DeviceType = "tablet"
-	}
-
-	// 检测操作系统
-	if strings.Contains(userAgent, "windows") {
-		deviceInfo.OperatingSystem = "Windows"
-	} else if strings.Contains(userAgent, "macintosh") || strings.Contains(userAgent, "mac os") {
-		deviceInfo.OperatingSystem = "macOS"
-	} else if strings.Contains(userAgent, "linux") {
-		deviceInfo.OperatingSystem = "Linux"
-	} else if strings.Contains(userAgent, "android") {
-		deviceInfo.OperatingSystem = "Android"
-	} else if strings.Contains(userAgent, "ios") || strings.Contains(userAgent, "iphone") || strings.Contains(userAgent, "ipad") {
-		deviceInfo.OperatingSystem = "iOS"
-	}
-
-	// 检测浏览器
-	if strings.Contains(userAgent, "chrome") {
-		deviceInfo.Browser = "Chrome"
-	} else if strings.Contains(userAgent, "firefox") {
-		deviceInfo.Browser = "Firefox"
-	} else if strings.Contains(userAgent, "safari") && !strings.Contains(userAgent, "chrome") {
-		deviceInfo.Browser = "Safari"
-	} else if strings.Contains(userAgent, "edge") {
-		deviceInfo.Browser = "Edge"
-	} else if strings.Contains(userAgent, "opera") {
-		deviceInfo.Browser = "Opera"
-	}
-
-	return deviceInfo
-}
-
 func sanitizeLoginHistoryOrder(orderBy, order string) (string, string) {
 	column := "login_time"
 	if requested := strings.ToLower(strings.TrimSpace(orderBy)); requested != "" {
@@ -574,44 +466,4 @@ func sanitizeLoginHistoryOrder(orderBy, order string) (string, string) {
 	}
 
 	return column, direction
-}
-
-// 请求和响应结构体
-
-// RecordLoginRequest 记录登录请求
-type RecordLoginRequest struct {
-	IPAddress   string `json:"ip_address"`
-	UserAgent   string `json:"user_agent"`
-	SessionID   string `json:"session_id"`
-	LoginMethod string `json:"login_method"`
-
-	// 地理位置信息（可选）
-	Country  string `json:"country,omitempty"`
-	Region   string `json:"region,omitempty"`
-	City     string `json:"city,omitempty"`
-	Timezone string `json:"timezone,omitempty"`
-}
-
-// DeviceInfo 设备信息
-type DeviceInfo struct {
-	DeviceType      string `json:"device_type"`
-	OperatingSystem string `json:"operating_system"`
-	Browser         string `json:"browser"`
-}
-
-// 密码处理方法
-
-// hashPassword 加密密码
-func (s *UserService) hashPassword(password string) (string, error) {
-	hashedBytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		return "", err
-	}
-	return string(hashedBytes), nil
-}
-
-// verifyPassword 验证密码
-func (s *UserService) verifyPassword(hashedPassword, password string) bool {
-	err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password))
-	return err == nil
 }

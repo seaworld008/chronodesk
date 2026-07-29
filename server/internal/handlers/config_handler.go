@@ -6,8 +6,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
 // ConfigHandler 配置管理处理器
@@ -45,10 +45,11 @@ func (h *ConfigHandler) GetAllConfigs(c *gin.Context) {
 	}
 
 	if err != nil {
+		logHandlerFailure(c, "config.list", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "获取配置失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -78,7 +79,7 @@ func (h *ConfigHandler) GetConfig(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{
 			"success": false,
 			"message": "配置不存在",
-			"error":   err.Error(),
+			"error":   "config_not_found",
 		})
 		return
 	}
@@ -110,7 +111,7 @@ func (h *ConfigHandler) CreateConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数错误",
-			"error":   err.Error(),
+			"error":   "invalid_request",
 		})
 		return
 	}
@@ -120,16 +121,17 @@ func (h *ConfigHandler) CreateConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "配置值验证失败",
-			"error":   err.Error(),
+			"error":   "invalid_config_value",
 		})
 		return
 	}
 
 	if err := h.configService.SetConfig(req.Key, req.Value, req.ValueType, req.Description, req.Category, req.Group); err != nil {
+		logHandlerFailure(c, "config.create", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "创建配置失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -161,7 +163,7 @@ func (h *ConfigHandler) UpdateConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数错误",
-			"error":   err.Error(),
+			"error":   "invalid_request",
 		})
 		return
 	}
@@ -174,16 +176,17 @@ func (h *ConfigHandler) UpdateConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "配置值验证失败",
-			"error":   err.Error(),
+			"error":   "invalid_config_value",
 		})
 		return
 	}
 
 	if err := h.configService.SetConfig(req.Key, req.Value, req.ValueType, req.Description, req.Category, req.Group); err != nil {
+		logHandlerFailure(c, "config.update", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "更新配置失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -209,10 +212,11 @@ func (h *ConfigHandler) DeleteConfig(c *gin.Context) {
 	key := c.Param("key")
 
 	if err := h.configService.DeleteConfig(key); err != nil {
+		logHandlerFailure(c, "config.delete", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "删除配置失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -239,7 +243,7 @@ func (h *ConfigHandler) BatchUpdateConfigs(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数错误",
-			"error":   err.Error(),
+			"error":   "invalid_request",
 		})
 		return
 	}
@@ -249,18 +253,19 @@ func (h *ConfigHandler) BatchUpdateConfigs(c *gin.Context) {
 		if err := h.configService.ValidateConfig(config.Key, config.Value, config.ValueType); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"success": false,
-				"message": "配置验证失败: " + config.Key,
-				"error":   err.Error(),
+				"message": "配置验证失败",
+				"error":   "invalid_config_value",
 			})
 			return
 		}
 	}
 
 	if err := h.configService.BatchUpdateConfigs(configs); err != nil {
+		logHandlerFailure(c, "config.batch_update", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "批量更新失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -285,10 +290,11 @@ func (h *ConfigHandler) BatchUpdateConfigs(c *gin.Context) {
 func (h *ConfigHandler) GetSecurityPolicy(c *gin.Context) {
 	policy, err := h.configService.GetSecurityPolicy()
 	if err != nil {
+		logHandlerFailure(c, "config.get_security_policy", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "获取安全策略失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -324,10 +330,11 @@ func (h *ConfigHandler) ExportConfigs(c *gin.Context) {
 
 	data, err := h.configService.ExportConfigs(category)
 	if err != nil {
+		logHandlerFailure(c, "config.export", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "导出配置失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -355,7 +362,7 @@ func (h *ConfigHandler) ImportConfigs(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请选择要导入的文件",
-			"error":   err.Error(),
+			"error":   "invalid_file",
 		})
 		return
 	}
@@ -363,10 +370,11 @@ func (h *ConfigHandler) ImportConfigs(c *gin.Context) {
 	// 打开文件
 	src, err := file.Open()
 	if err != nil {
+		logHandlerFailure(c, "config.import_open_file", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "文件打开失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -375,20 +383,22 @@ func (h *ConfigHandler) ImportConfigs(c *gin.Context) {
 	// 读取文件内容
 	data := make([]byte, file.Size)
 	if _, err := src.Read(data); err != nil {
+		logHandlerFailure(c, "config.import_read_file", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "文件读取失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
 
 	// 导入配置
 	if err := h.configService.ImportConfigs(data); err != nil {
+		logHandlerFailure(c, "config.import", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "配置导入失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -403,39 +413,6 @@ func (h *ConfigHandler) ImportConfigs(c *gin.Context) {
 	})
 }
 
-// ClearCache 清空配置缓存
-// @Summary 清空配置缓存
-// @Description 清空系统配置缓存
-// @Tags 系统配置
-// @Security ApiKeyAuth
-// @Success 200 {object} map[string]interface{} "成功"
-// @Router /api/admin/configs/cache/clear [post]
-func (h *ConfigHandler) ClearCache(c *gin.Context) {
-	h.configService.ClearCache()
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "配置缓存已清空",
-	})
-}
-
-// GetCacheStats 获取缓存统计
-// @Summary 获取缓存统计
-// @Description 获取配置缓存统计信息
-// @Tags 系统配置
-// @Security ApiKeyAuth
-// @Success 200 {object} map[string]interface{} "成功"
-// @Router /api/admin/configs/cache/stats [get]
-func (h *ConfigHandler) GetCacheStats(c *gin.Context) {
-	stats := h.configService.GetCacheStats()
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "获取缓存统计成功",
-		"data":    stats,
-	})
-}
-
 // InitDefaultConfigs 初始化默认配置
 // @Summary 初始化默认配置
 // @Description 初始化系统默认配置
@@ -446,10 +423,11 @@ func (h *ConfigHandler) GetCacheStats(c *gin.Context) {
 // @Router /api/admin/configs/init [post]
 func (h *ConfigHandler) InitDefaultConfigs(c *gin.Context) {
 	if err := h.configService.InitDefaultConfigs(); err != nil {
+		logHandlerFailure(c, "config.initialize_defaults", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "初始化默认配置失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}

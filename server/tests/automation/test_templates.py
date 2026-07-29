@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from typing import Dict
 
 import pytest
 
@@ -14,7 +13,9 @@ from tests.utils import APIClient
 @pytest.mark.integration
 class TestTemplates:
     @pytest.fixture
-    def template_payload(self, admin_tokens: Dict[str, Dict[str, object]]) -> Dict[str, object]:
+    def template_payload(
+        self, admin_tokens: dict[str, dict[str, object]]
+    ) -> dict[str, object]:
         user = admin_tokens.get("user", {})
         admin_id = user.get("id")
         assert admin_id, "Admin token payload 缺少 user.id"
@@ -43,11 +44,13 @@ class TestTemplates:
     def test_template_crud(
         self,
         admin_api: APIClient,
-        template_payload: Dict[str, object],
+        template_payload: dict[str, object],
     ) -> None:
         created_id: int | None = None
         try:
-            create_resp = admin_api.post_json("/admin/automation/templates", template_payload)
+            create_resp = admin_api.post_json(
+                "/admin/automation/templates", template_payload
+            )
             assert create_resp.status_code == 201, create_resp.text
             create_body = create_resp.json()
             assert create_body.get("success") is True, create_body
@@ -65,7 +68,9 @@ class TestTemplates:
             templates = list_body.get("data", {}).get("templates", [])
             assert any(tpl.get("id") == created_id for tpl in templates)
 
-            detail_resp = admin_api.get_json(f"/admin/automation/templates/{created_id}")
+            detail_resp = admin_api.get_json(
+                f"/admin/automation/templates/{created_id}"
+            )
             assert detail_resp.status_code == 200, detail_resp.text
             detail_body = detail_resp.json()
             assert detail_body.get("success") is True, detail_body
@@ -73,7 +78,9 @@ class TestTemplates:
             assert detail_data.get("name") == template_payload["name"]
         finally:
             if created_id is not None:
-                delete_resp = admin_api.delete(f"/admin/automation/templates/{created_id}")
+                delete_resp = admin_api.delete(
+                    f"/admin/automation/templates/{created_id}"
+                )
                 if delete_resp.status_code == 200:
                     delete_body = delete_resp.json()
                     assert delete_body.get("success") is True, delete_body

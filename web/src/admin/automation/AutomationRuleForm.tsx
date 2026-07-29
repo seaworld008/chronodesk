@@ -2,21 +2,13 @@ import React from 'react'
 import { BooleanInput, NumberInput, SelectInput, TextInput, SimpleForm } from 'react-admin'
 import BackButton from '../common/BackButton'
 import { AutomationRuleAction, AutomationRuleCondition, AutomationRuleFormValues } from '@/types'
+import { automationTriggerEventChoices } from './triggerEvents'
 
 const ruleTypeChoices = [
   { id: 'assignment', name: '自动分配' },
   { id: 'classification', name: '自动分类' },
   { id: 'escalation', name: '升级处理' },
   { id: 'sla', name: 'SLA' },
-]
-
-const triggerEventChoices = [
-  { id: 'ticket.created', name: '工单创建' },
-  { id: 'ticket.updated', name: '工单更新' },
-  { id: 'ticket.assigned', name: '工单分配' },
-  { id: 'ticket.resolved', name: '工单解决' },
-  { id: 'ticket.closed', name: '工单关闭' },
-  { id: 'scheduled_check', name: '定时检查' },
 ]
 
 const formatJsonText = (value?: string) => {
@@ -67,7 +59,7 @@ export const buildTransform = () => (data: AutomationRuleFormValues) => ({
   rule_type: data.rule_type,
   trigger_event: data.trigger_event,
   priority: normalizePriority(data.priority),
-  is_active: data.is_active ?? true,
+  is_active: data.is_active ?? false,
   conditions: parseJsonArray<AutomationRuleCondition>(data.conditions),
   actions: parseJsonArray<AutomationRuleAction>(data.actions),
 })
@@ -78,28 +70,40 @@ const AutomationRuleForm: React.FC<{ toolbar?: React.ReactElement }> = ({ toolba
     <TextInput source="name" label="名称" required fullWidth />
     <TextInput source="description" label="描述" multiline fullWidth />
     <SelectInput source="rule_type" label="规则类型" choices={ruleTypeChoices} required fullWidth />
-    <SelectInput source="trigger_event" label="触发事件" choices={triggerEventChoices} required fullWidth />
+    <SelectInput
+      source="trigger_event"
+      label="触发事件"
+      choices={automationTriggerEventChoices}
+      helperText="规则会与 CloudEvent type 精确匹配；状态流转可通过 status 条件区分解决、关闭或重新打开"
+      required
+      fullWidth
+    />
     <NumberInput source="priority" label="优先级" defaultValue={1} min={1} />
-    <BooleanInput source="is_active" label="启用" defaultValue={true} />
+    <BooleanInput
+      source="is_active"
+      label="启用"
+      defaultValue={false}
+      helperText="新规则默认停用；完成条件、动作和影响范围验证后再启用"
+    />
     <TextInput
       source="conditions"
-      label="条件 (JSON数组)"
+      label="条件（JSON 数组）"
       multiline
       fullWidth
       minRows={4}
       parse={parseJsonText}
       format={formatJsonText}
-      helperText={'例如: [{"field":"priority","operator":"eq","value":"high"}]'}
+      helperText={'例如：[{"field":"priority","operator":"eq","value":"high"}]'}
     />
     <TextInput
       source="actions"
-      label="动作 (JSON数组)"
+      label="动作（JSON 数组）"
       multiline
       fullWidth
       minRows={4}
       parse={parseJsonText}
       format={formatJsonText}
-      helperText={'例如: [{"type":"assign","params":{"user_id":1}}]'}
+      helperText={'例如：[{"type":"assign","params":{"user_id":1}}]'}
     />
   </SimpleForm>
 )

@@ -12,10 +12,12 @@ import {
     TopToolbar,
     ListButton,
     ShowButton,
-    DeleteButton,
     SaveButton,
     TabbedForm,
     FormTab,
+    useGetIdentity,
+    usePermissions,
+    useRecordContext,
 } from 'react-admin';
 import {
     Box,
@@ -30,15 +32,20 @@ import { minCharacters, maxCharacters } from '@/lib/validators';
 import {
     formatTagsInputValue,
     normalizeTagsForSubmit,
-    normalizeStringArrayForSubmit,
     normalizeCustomFieldsForSubmit,
 } from './tagUtils';
 import BackButton from '../common/BackButton';
 import { UpdateTicketRequest } from '@/types';
+import {
+    canDeleteTicket,
+    canMutateTicket,
+    type TicketAccessRecord,
+    type TicketRolePermissions,
+} from './ticketAccess';
+import { FocusSafeDeleteButton } from '@/components/actions/FocusSafeDeleteButtons';
 
 type TicketEditFormValues = UpdateTicketRequest & {
     tags?: unknown;
-    attachments?: unknown;
     custom_fields?: unknown;
     [key: string]: unknown;
 };
@@ -51,13 +58,6 @@ const transformTicketUpdate = (data: TicketEditFormValues): Record<string, unkno
         payload.tags = normalizedTags;
     } else {
         delete payload.tags;
-    }
-
-    const normalizedAttachments = normalizeStringArrayForSubmit(data.attachments);
-    if (typeof normalizedAttachments !== 'undefined') {
-        payload.attachments = normalizedAttachments;
-    } else {
-        delete payload.attachments;
     }
 
     const normalizedCustomFields = normalizeCustomFieldsForSubmit(data.custom_fields);
@@ -120,13 +120,40 @@ const validateDescription = [
 /**
  * 工单编辑操作按钮
  */
-const TicketEditActions = () => (
-    <TopToolbar>
-        <ShowButton label="查看详情" />
-        <ListButton label="返回列表" />
-        <DeleteButton label="删除" />
-    </TopToolbar>
-);
+const TicketEditActions = () => {
+    const { permissions } = usePermissions<TicketRolePermissions>();
+    return (
+        <TopToolbar>
+            <ShowButton label="查看详情" />
+            <ListButton label="返回列表" />
+            {canDeleteTicket(permissions?.role) && (
+                <FocusSafeDeleteButton label="删除" mutationMode="pessimistic" />
+            )}
+        </TopToolbar>
+    );
+};
+
+const TicketEditAuthorization = ({ children }: React.PropsWithChildren) => {
+    const record = useRecordContext<TicketAccessRecord>();
+    const { permissions, isPending: permissionsPending } = usePermissions<TicketRolePermissions>();
+    const { identity, isPending: identityPending } = useGetIdentity();
+
+    if (permissionsPending || identityPending || !record) {
+        return null;
+    }
+    if (!canMutateTicket(record, permissions?.role, identity?.id)) {
+        return (
+            <Alert severity="warning" sx={{ m: 2 }}>
+                <AlertTitle>当前工单为只读</AlertTitle>
+                只有工单创建者、当前处理人或管理角色可以修改此工单。
+                <Box sx={{ mt: 1 }}>
+                    <ShowButton label="查看工单详情" />
+                </Box>
+            </Alert>
+        );
+    }
+    return <>{children}</>;
+};
 
 /**
  * 自定义保存工具栏
@@ -151,10 +178,11 @@ const TicketEdit: React.FC = () => {
                 mutationMode="pessimistic"
                 transform={transformTicketUpdate}
             >
-                <TabbedForm
-                    toolbar={<TicketEditToolbar />}
-                    syncWithLocation={false}
-                >
+                <TicketEditAuthorization>
+                    <TabbedForm
+                        toolbar={<TicketEditToolbar />}
+                        syncWithLocation={false}
+                    >
                     {/* 基本信息 */}
                     <FormTab label="基本信息" path="">
                         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
@@ -174,7 +202,7 @@ const TicketEdit: React.FC = () => {
                             <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                                 <CardHeader
                                     title="基本信息"
-                                    titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                    slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                     sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                                 />
                                 <CardContent>
@@ -246,7 +274,7 @@ const TicketEdit: React.FC = () => {
                             <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                                 <CardHeader
                                     title="工单分配"
-                                    titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                    slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                     sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                                 />
                                 <CardContent>
@@ -254,10 +282,11 @@ const TicketEdit: React.FC = () => {
                                         <Box sx={{ flex: 1, minWidth: '250px' }}>
                                             <ReferenceInput
                                                 source="assigned_to_id"
-                                                reference="users"
+                                                reference="assignees"
                                                 label="分配给"
                                             >
                                                 <AutocompleteInput
+                                                    label="分配给"
                                                     optionText="username"
                                                     optionValue="id"
                                                     helperText="选择负责处理此工单的用户"
@@ -272,6 +301,7 @@ const TicketEdit: React.FC = () => {
                                                 label="工单分类"
                                             >
                                                 <AutocompleteInput
+                                                    label="工单分类"
                                                     optionText="name"
                                                     optionValue="id"
                                                     helperText="选择工单所属分类"
@@ -285,24 +315,11 @@ const TicketEdit: React.FC = () => {
                             <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                                 <CardHeader
                                     title="产品和组件"
-                                    titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                    slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                     sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                                 />
                                 <CardContent>
                                     <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
-                                        <Box sx={{ flex: 1, minWidth: '200px' }}>
-                                            <ReferenceInput
-                                                source="product_id"
-                                                reference="products"
-                                                label="相关产品"
-                                            >
-                                                <AutocompleteInput
-                                                    optionText="name"
-                                                    optionValue="id"
-                                                />
-                                            </ReferenceInput>
-                                        </Box>
-
                                         <Box sx={{ flex: 1, minWidth: '200px' }}>
                                             <TextInput
                                                 source="component"
@@ -330,24 +347,11 @@ const TicketEdit: React.FC = () => {
                             <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                                 <CardHeader
                                     title="客户详情"
-                                    titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                    slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                     sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                                 />
                                 <CardContent>
                                     <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
-                                        <Box sx={{ flex: 1, minWidth: '250px' }}>
-                                            <ReferenceInput
-                                                source="customer_id"
-                                                reference="users"
-                                                label="客户"
-                                            >
-                                                <AutocompleteInput
-                                                    optionText={(record) => `${record.first_name} ${record.last_name} (${record.email})`}
-                                                    optionValue="id"
-                                                />
-                                            </ReferenceInput>
-                                        </Box>
-
                                         <Box sx={{ flex: 1, minWidth: '250px' }}>
                                             <TextInput
                                                 source="customer_email"
@@ -373,7 +377,7 @@ const TicketEdit: React.FC = () => {
                             <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                                 <CardHeader
                                     title="联系信息"
-                                    titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                    slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                     sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                                 />
                                 <CardContent>
@@ -405,7 +409,7 @@ const TicketEdit: React.FC = () => {
                             <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                                 <CardHeader
                                     title="时间管理"
-                                    titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                    slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                     sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                                 />
                                 <CardContent>
@@ -442,7 +446,7 @@ const TicketEdit: React.FC = () => {
                             <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                                 <CardHeader
                                     title="SLA管理"
-                                    titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                    slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                     sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                                 />
                                 <CardContent>
@@ -470,7 +474,7 @@ const TicketEdit: React.FC = () => {
                             <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                                 <CardHeader
                                     title="工单设置"
-                                    titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                    slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                     sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                                 />
                                 <CardContent>
@@ -501,7 +505,7 @@ const TicketEdit: React.FC = () => {
                             <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                                 <CardHeader
                                     title="解决方案"
-                                    titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                    slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                     sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                                 />
                                 <CardContent>
@@ -519,7 +523,7 @@ const TicketEdit: React.FC = () => {
                             <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                                 <CardHeader
                                     title="外部引用"
-                                    titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                    slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                     sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                                 />
                                 <CardContent>
@@ -536,6 +540,7 @@ const TicketEdit: React.FC = () => {
                                             label="父工单"
                                         >
                                             <AutocompleteInput
+                                                label="父工单"
                                                 optionText="title"
                                                 optionValue="id"
                                             />
@@ -545,7 +550,8 @@ const TicketEdit: React.FC = () => {
                             </Card>
                         </Box>
                     </FormTab>
-                </TabbedForm>
+                    </TabbedForm>
+                </TicketEditAuthorization>
             </Edit>
         </Box>
     );

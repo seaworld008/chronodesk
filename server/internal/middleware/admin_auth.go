@@ -3,128 +3,15 @@ package middleware
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 )
-
-// RequireAdminRole 要求管理员角色的中间件
-// 这个中间件应该在JWT认证中间件之后使用
-func RequireAdminRole() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		// 检查用户是否已认证
-		userRole, exists := c.Get("user_role")
-		if !exists {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": "User not authenticated",
-				"code":  "AUTHENTICATION_REQUIRED",
-			})
-			c.Abort()
-			return
-		}
-
-		// 检查用户角色
-		role, ok := userRole.(string)
-		if !ok {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": "Invalid user role type",
-				"code":  "INVALID_ROLE_TYPE",
-			})
-			c.Abort()
-			return
-		}
-
-		// 检查是否为管理员
-		if role != "admin" {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": "Administrator privileges required",
-				"code":  "INSUFFICIENT_PRIVILEGES",
-			})
-			c.Abort()
-			return
-		}
-
-		// 继续执行下一个中间件或处理器
-		c.Next()
-	}
-}
-
-// RequireAdminOrSupervisor 要求管理员或主管角色的中间件
-func RequireAdminOrSupervisor() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		userRole, exists := c.Get("user_role")
-		if !exists {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": "User not authenticated",
-				"code":  "AUTHENTICATION_REQUIRED",
-			})
-			c.Abort()
-			return
-		}
-
-		role, ok := userRole.(string)
-		if !ok {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": "Invalid user role type",
-				"code":  "INVALID_ROLE_TYPE",
-			})
-			c.Abort()
-			return
-		}
-
-		// 检查是否为管理员或主管
-		if role != "admin" && role != "supervisor" {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": "Administrator or supervisor privileges required",
-				"code":  "INSUFFICIENT_PRIVILEGES",
-			})
-			c.Abort()
-			return
-		}
-
-		c.Next()
-	}
-}
-
-// RequireStaffRole 要求员工角色（管理员、主管、客服代理）的中间件
-func RequireStaffRole() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		userRole, exists := c.Get("user_role")
-		if !exists {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": "User not authenticated",
-				"code":  "AUTHENTICATION_REQUIRED",
-			})
-			c.Abort()
-			return
-		}
-
-		role, ok := userRole.(string)
-		if !ok {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": "Invalid user role type",
-				"code":  "INVALID_ROLE_TYPE",
-			})
-			c.Abort()
-			return
-		}
-
-		// 检查是否为员工角色
-		if role != "admin" && role != "supervisor" && role != "agent" {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": "Staff privileges required",
-				"code":  "INSUFFICIENT_PRIVILEGES",
-			})
-			c.Abort()
-			return
-		}
-
-		c.Next()
-	}
-}
 
 // GetCurrentUserRole 从上下文中获取当前用户角色
 func GetCurrentUserRole(c *gin.Context) (string, bool) {
@@ -156,95 +43,27 @@ func GetCurrentUserID(c *gin.Context) (uint, bool) {
 	return id, true
 }
 
-// IsCurrentUserAdmin 检查当前用户是否为管理员
-func IsCurrentUserAdmin(c *gin.Context) bool {
-	role, exists := GetCurrentUserRole(c)
-	if !exists {
-		return false
-	}
-	return role == "admin"
-}
-
-// IsCurrentUserStaff 检查当前用户是否为员工
-func IsCurrentUserStaff(c *gin.Context) bool {
-	role, exists := GetCurrentUserRole(c)
-	if !exists {
-		return false
-	}
-	return role == "admin" || role == "supervisor" || role == "agent"
-}
-
-// PreventSelfOperation 防止用户对自己进行某些操作的中间件
-// 比如删除自己的账号或修改自己的角色
-func PreventSelfOperation() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		// 获取当前用户ID
-		currentUserID, exists := GetCurrentUserID(c)
-		if !exists {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": "User not authenticated",
-				"code":  "AUTHENTICATION_REQUIRED",
-			})
-			c.Abort()
-			return
-		}
-
-		// 获取目标用户ID（从路径参数）
-		targetUserIDStr := c.Param("id")
-		if targetUserIDStr == "" {
-			// 如果没有路径参数，说明不是对特定用户的操作，继续执行
-			c.Next()
-			return
-		}
-
-		// 解析目标用户ID
-		var targetUserID uint
-		if _, err := fmt.Sscanf(targetUserIDStr, "%d", &targetUserID); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error": "Invalid user ID",
-				"code":  "INVALID_USER_ID",
-			})
-			c.Abort()
-			return
-		}
-
-		// 检查是否为自己
-		if currentUserID == targetUserID {
-			c.JSON(http.StatusConflict, gin.H{
-				"error": "Cannot perform this operation on yourself",
-				"code":  "SELF_OPERATION_NOT_ALLOWED",
-			})
-			c.Abort()
-			return
-		}
-
-		c.Next()
-	}
-}
-
 // LogAdminOperation 记录管理员操作日志的中间件
 func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		start := time.Now()
 		method := c.Request.Method
 		path := c.Request.URL.Path
-		query := c.Request.URL.RawQuery
+		if !isImportantAdminOperation(method, path) {
+			c.Next()
+			return
+		}
+		if auditService == nil {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"code": 1,
+				"msg":  "管理员审计服务不可用",
+			})
+			return
+		}
+
+		start := time.Now()
+		query := sanitizeQueryForLogs(c.Request.URL.RawQuery)
 		clientIP := c.ClientIP()
 		userAgent := c.Request.UserAgent()
-
-		// 执行下一个处理器
-		c.Next()
-
-		if auditService == nil {
-			return
-		}
-
-		if !isImportantAdminOperation(method, path) {
-			return
-		}
-
-		statusCode := c.Writer.Status()
-		latency := time.Since(start)
 
 		userID, hasUser := GetCurrentUserID(c)
 		var userIDPtr *uint
@@ -261,54 +80,123 @@ func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.Han
 			}
 		}
 
-		ctx := c.Request.Context()
-		if ctx == nil {
-			ctx = context.Background()
-		}
-
 		action := fmt.Sprintf("%s %s", strings.ToUpper(method), path)
-		result := "success"
-		if statusCode >= http.StatusBadRequest {
-			result = "error"
-		}
-
 		record := &services.AdminAuditRecord{
 			UserID:     userIDPtr,
 			Role:       role,
 			Action:     action,
 			Method:     method,
 			Path:       path,
-			StatusCode: statusCode,
+			StatusCode: 0,
 			ClientIP:   clientIP,
 			UserAgent:  userAgent,
 			Query:      query,
-			Latency:    latency,
-			Result:     result,
+			Result:     "pending",
+			Notes:      "管理员写操作已进入执行阶段",
 		}
 
-		if err := auditService.Record(ctx, record); err != nil {
-			fmt.Println("[ADMIN-OP] failed to record audit log:", err)
+		if err := auditService.Record(c.Request.Context(), record); err != nil {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"code": 1,
+				"msg":  "管理员审计记录失败，操作未执行",
+			})
+			return
 		}
+
+		completed := false
+		defer func() {
+			record.StatusCode = c.Writer.Status()
+			record.Latency = time.Since(start)
+			record.Result = "success"
+			record.Notes = ""
+			if !completed {
+				record.StatusCode = http.StatusInternalServerError
+				record.Result = "error"
+				record.Notes = "管理员写操作异常终止"
+			} else if record.StatusCode >= http.StatusBadRequest {
+				record.Result = "error"
+			}
+
+			finalizeContext, cancel := context.WithTimeout(
+				context.WithoutCancel(c.Request.Context()),
+				3*time.Second,
+			)
+			defer cancel()
+			if err := auditService.Finalize(finalizeContext, record); err != nil {
+				// Persistence details may contain SQL values. Keep the operator
+				// signal fixed; the pending anchor remains durable for recovery.
+				log.Print("管理员审计最终状态写入失败，已保留 pending 锚点")
+			}
+		}()
+		c.Next()
+		completed = true
 	}
 }
 
 // isImportantAdminOperation 判断是否为重要的管理操作
 func isImportantAdminOperation(method, path string) bool {
-	// 定义需要记录的重要操作路径
-	importantPaths := []string{
-		"/api/admin/users",    // 用户管理
-		"/api/admin/settings", // 系统设置
-		"/api/admin/webhooks", // Webhook管理
-		"/api/admin/backup",   // 备份操作
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
 	}
 
-	// 检查路径是否匹配
-	for _, importantPath := range importantPaths {
-		if strings.HasPrefix(path, importantPath) {
-			// 只记录非GET请求（修改操作）
-			return method != "GET"
+	return isPathWithin(path, "/api/admin") ||
+		isPathWithin(path, "/api/v1/admin")
+}
+
+func isPathWithin(path, prefix string) bool {
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
+}
+
+const maxLoggedQueryBytes = 2048
+
+func sanitizeQueryForLogs(rawQuery string) string {
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return ""
+	}
+	for key := range values {
+		if isSensitiveQueryKey(key) {
+			values.Set(key, "[REDACTED]")
 		}
 	}
+	encoded := values.Encode()
+	if len(encoded) > maxLoggedQueryBytes {
+		return "[TRUNCATED]"
+	}
+	return encoded
+}
 
+func isSensitiveQueryKey(key string) bool {
+	normalized := strings.NewReplacer("-", "_", ".", "_").
+		Replace(strings.ToLower(strings.TrimSpace(key)))
+	switch normalized {
+	case "authorization",
+		"api_key",
+		"apikey",
+		"client_assertion",
+		"client_secret",
+		"code",
+		"credential",
+		"otp",
+		"password",
+		"saml_response",
+		"secret",
+		"signature",
+		"token":
+		return true
+	}
+	for _, suffix := range []string{
+		"_code",
+		"_credential",
+		"_password",
+		"_secret",
+		"_signature",
+		"_token",
+	} {
+		if strings.HasSuffix(normalized, suffix) {
+			return true
+		}
+	}
 	return false
 }

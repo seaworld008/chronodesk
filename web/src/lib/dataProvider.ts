@@ -1,5 +1,6 @@
 import { DataProvider, fetchUtils, HttpError } from 'react-admin'
 import queryString from 'query-string'
+import { containsChineseText, localizedApiErrorMessage } from './apiClient'
 
 const apiUrl = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
 
@@ -8,7 +9,7 @@ const apiUrl = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
  */
 type HttpClientOptions = RequestInit & { headers?: Headers }
 
-const httpClient = (url: string, options: HttpClientOptions = {}) => {
+const httpClient = async (url: string, options: HttpClientOptions = {}) => {
     const token = localStorage.getItem('token')
     const headers = new Headers(options.headers ?? { Accept: 'application/json' })
 
@@ -20,7 +21,11 @@ const httpClient = (url: string, options: HttpClientOptions = {}) => {
         headers.set('Authorization', `Bearer ${token}`)
     }
 
-    return fetchUtils.fetchJson(url, { ...options, headers })
+    try {
+        return await fetchUtils.fetchJson(url, { ...options, headers })
+    } catch (error: unknown) {
+        return handleHttpError(error)
+    }
 }
 
 /**
@@ -59,25 +64,22 @@ const getTotalFromHeaders = (headers: Headers, defaultTotal: number = 0): number
 };
 
 /**
- * 工单管理系统专用数据提供器
+ * ChronoDesk 数据 Provider
  * 完美适配Go Gin后端API
  */
 const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === 'object' && value !== null
 
-const handleHttpError = (error: unknown): never => {
+function handleHttpError(error: unknown): never {
     if (error instanceof HttpError) {
-        if (isRecord(error.body)) {
-            const message =
-                (error.body.msg as string | undefined) ||
-                (error.body.message as string | undefined) ||
-                error.message
-            throw new HttpError(message, error.status, error.body)
-        }
-        throw error
+        const message = localizedApiErrorMessage(error.body, error.status)
+        throw new HttpError(message, error.status, error.body)
     }
 
-    const message = error instanceof Error ? error.message : '请求失败'
+    const rawMessage = error instanceof Error ? error.message : ''
+    const message = rawMessage && containsChineseText(rawMessage)
+        ? rawMessage
+        : '请求失败，请检查网络连接后重试'
     throw new HttpError(message, 500, {})
 }
 
@@ -92,6 +94,69 @@ const extractResponseData = (json: unknown): unknown => {
     }
     return json
 }
+
+const extractTypedResponseData = <T>(json: unknown): T => extractResponseData(json) as T
+
+const ticketVersionFromUpdate = (
+    previousData: unknown,
+    data: unknown,
+): number => {
+    const candidates = [previousData, data]
+    for (const candidate of candidates) {
+        if (!isRecord(candidate)) continue
+        const version = candidate.version
+        if (
+            typeof version === 'number' &&
+            Number.isSafeInteger(version) &&
+            version > 0
+        ) {
+            return version
+        }
+    }
+    throw new HttpError(
+        '工单版本信息缺失，请刷新页面后重试',
+        428,
+        { code: 'precondition_required' },
+    )
+}
+
+const ticketIfMatchHeaders = (version: number): Headers => {
+    const headers = new Headers()
+    headers.set('If-Match', `"v${version}"`)
+    return headers
+}
+
+const ticketVersionCache = new Map<string, number>()
+
+const rememberTicketVersions = (records: unknown[]): void => {
+    for (const record of records) {
+        if (!isRecord(record)) continue
+        const { id, version } = record
+        if (
+            (typeof id === 'number' || typeof id === 'string') &&
+            typeof version === 'number' &&
+            Number.isSafeInteger(version) &&
+            version > 0
+        ) {
+            ticketVersionCache.set(String(id), version)
+        }
+    }
+}
+
+const ticketPreconditions = (
+    ids: readonly (string | number)[],
+): Array<{ id: string | number; version: number }> =>
+    ids.map((id) => {
+        const version = ticketVersionCache.get(String(id))
+        if (version === undefined) {
+            throw new HttpError(
+                `工单 ${id} 的版本信息缺失，请刷新列表后重试`,
+                428,
+                { code: 'precondition_required', resource_id: id },
+            )
+        }
+        return { id, version }
+    })
 
 const parseListResponse = (resource: string, json: unknown, headers: Headers) => {
     if (isRecord(json) && resource === 'automation-logs' && isRecord(json.data) && Array.isArray(json.data.logs)) {
@@ -239,6 +304,10 @@ export const dataProvider: DataProvider = {
                     query.type = filter.type;
                     delete filter.type;
                 }
+                if (filter.source) {
+                    query.source = filter.source;
+                    delete filter.source;
+                }
                 if (filter.assigned_to_id) {
                     query.assigned_to = filter.assigned_to_id;
                     delete filter.assigned_to_id;
@@ -304,18 +373,16 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/rules';
         } else if (resource === 'automation-logs') {
             apiPath = 'admin/automation/logs';
-        } else if (resource === 'system-settings') {
-            // 系统设置是虚拟资源，返回空数据
-            return {
-                data: [],
-                total: 0,
-            };
         }
 
         const url = `${apiUrl}/${apiPath}?${queryString.stringify(query)}`;
         const { json, headers } = await httpClient(url);
 
-        return parseListResponse(resource, json, headers);
+        const result = parseListResponse(resource, json, headers);
+        if (resource === 'tickets') {
+            rememberTicketVersions(result.data);
+        }
+        return result;
     },
 
     // 获取单个资源
@@ -329,21 +396,32 @@ export const dataProvider: DataProvider = {
 
         const url = `${apiUrl}/${apiPath}/${params.id}`;
         const { json } = await httpClient(url);
-        
-        return { data: extractResponseData(json) };
+        const data = extractResponseData(json);
+        if (resource === 'tickets') {
+            rememberTicketVersions([data]);
+        }
+        return { data: extractTypedResponseData(json) };
     },
 
     // 获取多个资源
     getMany: async (resource, params) => {
+        if (resource === 'users' || resource === 'user') {
+            const records = await Promise.all(
+                params.ids.map(async (id) => {
+                    const { json } = await httpClient(`${apiUrl}/admin/users/${id}`)
+                    return extractTypedResponseData(json)
+                }),
+            )
+            return { data: records }
+        }
+
         // 如果后端支持批量查询
         const query = {
             filter: convertFilterToGoFormat({ ids: params.ids }),
         };
 
         let apiPath = resource;
-        if (resource === 'users' || resource === 'user') {
-            apiPath = 'admin/users';
-        } else if (resource === 'automation-rules') {
+        if (resource === 'automation-rules') {
             apiPath = 'admin/automation/rules';
         }
 
@@ -352,12 +430,15 @@ export const dataProvider: DataProvider = {
         
         const payload = extractResponseData(json);
         if (isRecord(payload) && Array.isArray(payload.items)) {
+            if (resource === 'tickets') rememberTicketVersions(payload.items);
             return { data: payload.items };
         }
         if (Array.isArray(payload)) {
+            if (resource === 'tickets') rememberTicketVersions(payload);
             return { data: payload };
         }
         if (isRecord(payload)) {
+            if (resource === 'tickets') rememberTicketVersions([payload]);
             return { data: [payload] };
         }
         return { data: [] };
@@ -383,6 +464,17 @@ export const dataProvider: DataProvider = {
             [params.target]: params.id,
         };
         query.filter = convertFilterToGoFormat(filter);
+
+        if (params.target === 'ticket_id' && (resource === 'comments' || resource === 'ticket_history')) {
+            const nestedResource = resource === 'comments' ? 'comments' : 'history'
+            const url = `${apiUrl}/tickets/${params.id}/${nestedResource}?${queryString.stringify({
+                page,
+                page_size: perPage,
+                sort: query.sort,
+            })}`
+            const { json, headers } = await httpClient(url)
+            return parseListResponse(resource, json, headers)
+        }
 
         let apiPath = resource;
         if (resource === 'users' || resource === 'user') {
@@ -415,10 +507,13 @@ export const dataProvider: DataProvider = {
                 method: 'POST',
                 body: JSON.stringify(params.data),
             });
-
-            return { data: extractResponseData(json) };
+            const data = extractResponseData(json);
+            if (resource === 'tickets') {
+                rememberTicketVersions([data]);
+            }
+            return { data: extractTypedResponseData(json) };
         } catch (error: unknown) {
-            handleHttpError(error)
+            return handleHttpError(error)
         }
     },
 
@@ -436,14 +531,23 @@ export const dataProvider: DataProvider = {
         const url = `${apiUrl}/${apiPath}/${params.id}`;
         
         try {
+            const headers = resource === 'tickets'
+                ? ticketIfMatchHeaders(
+                    ticketVersionFromUpdate(params.previousData, params.data),
+                )
+                : undefined
             const { json } = await httpClient(url, {
                 method: 'PUT',
                 body: JSON.stringify(params.data),
+                headers,
             });
-
-            return { data: extractResponseData(json) };
+            const data = extractResponseData(json);
+            if (resource === 'tickets') {
+                rememberTicketVersions([data]);
+            }
+            return { data: extractTypedResponseData(json) };
         } catch (error: unknown) {
-            handleHttpError(error)
+            return handleHttpError(error)
         }
     },
 
@@ -457,13 +561,17 @@ export const dataProvider: DataProvider = {
             }
 
             const url = `${apiUrl}/tickets/bulk-update`;
-            await httpClient(url, {
+            const { json } = await httpClient(url, {
                 method: 'POST',
                 body: JSON.stringify({
-                    ticket_ids: params.ids,
+                    tickets: ticketPreconditions(params.ids),
                     updates,
                 }),
             });
+            const payload = extractResponseData(json);
+            if (isRecord(payload) && Array.isArray(payload.tickets)) {
+                rememberTicketVersions(payload.tickets);
+            }
             return { data: params.ids };
         }
 
@@ -501,10 +609,30 @@ export const dataProvider: DataProvider = {
         }
 
         const url = `${apiUrl}/${apiPath}/${params.id}`;
+        const cachedVersion = resource === 'tickets'
+            ? ticketVersionCache.get(String(params.id))
+            : undefined
+        const headers = resource === 'tickets'
+            ? ticketIfMatchHeaders(
+                ticketVersionFromUpdate(
+                    params.previousData,
+                    cachedVersion === undefined
+                        ? undefined
+                        : { version: cachedVersion },
+                ),
+            )
+            : undefined
         const { json } = await httpClient(url, {
             method: 'DELETE',
+            headers,
         });
 
+        if (resource === 'tickets') {
+            ticketVersionCache.delete(String(params.id))
+            return {
+                data: params.previousData ?? { id: params.id },
+            }
+        }
         if (json.code === 0 && json.data) {
             return { data: json.data };
         } else if (json.data) {
@@ -518,11 +646,32 @@ export const dataProvider: DataProvider = {
         // 如果后端支持批量删除
         if (resource === 'tickets') {
             const url = `${apiUrl}/tickets/bulk-delete`;
-            await httpClient(url, {
+            const { json } = await httpClient(url, {
                 method: 'DELETE',
-                body: JSON.stringify({ ids: params.ids }),
+                body: JSON.stringify({
+                    tickets: ticketPreconditions(params.ids),
+                }),
             });
-            return { data: params.ids };
+            const payload = extractResponseData(json)
+            const deletedIds = isRecord(payload) && Array.isArray(payload.deleted_ids)
+                ? payload.deleted_ids
+                : []
+            const failedIds = isRecord(payload) && Array.isArray(payload.failed_ids)
+                ? payload.failed_ids
+                : []
+            for (const id of deletedIds) {
+                ticketVersionCache.delete(String(id))
+            }
+            if (failedIds.length > 0) {
+                throw new HttpError(
+                    deletedIds.length > 0
+                        ? '部分工单因版本冲突或权限变化未能删除，列表已刷新'
+                        : '工单删除失败，请刷新列表后重试',
+                    409,
+                    payload,
+                )
+            }
+            return { data: deletedIds };
         }
 
         // 否则逐个删除
@@ -545,96 +694,4 @@ export const dataProvider: DataProvider = {
         
         return { data: params.ids };
     },
-
-    // 自定义方法支持 - 用于系统设置等特殊API调用
-    customMethod: async (resource: string, params: Record<string, unknown>, type: string) => {
-        const method = typeof params.method === 'string' ? params.method.toUpperCase() : 'GET'
-        const data = params.data as unknown
-        const otherParams = Object.fromEntries(
-            Object.entries(params).filter(([key]) => !['method', 'data'].includes(key))
-        )
-
-        let url = `${apiUrl}`
-
-        if (resource.startsWith('admin/')) {
-            url += `/${resource}`
-        } else if (resource === 'email-config') {
-            url += '/admin/email-config'
-        } else if (resource === 'email-config/test') {
-            url += '/admin/email-config/test'
-        } else if (resource.startsWith('webhooks')) {
-            url += `/${resource}`
-        } else if (resource.startsWith('system/')) {
-            url += `/admin/${resource}`
-        } else {
-            url += `/${resource}`
-        }
-
-        const requestOptions: HttpClientOptions = {
-            method,
-        }
-
-        if (data && ['POST', 'PUT', 'PATCH'].includes(method)) {
-            requestOptions.body = JSON.stringify(data)
-        }
-
-        if (method === 'GET' && Object.keys(otherParams).length > 0) {
-            const queryParams = queryString.stringify(otherParams)
-            if (queryParams) {
-                url += `?${queryParams}`
-            }
-        }
-
-        try {
-            const { json, headers } = await httpClient(url, requestOptions)
-
-            switch (type) {
-                case 'getList': {
-                    let listData: unknown[] = []
-                    let total = 0
-
-                    if (isRecord(json) && json.code === 0 && json.data) {
-                        if (isRecord(json.data) && Array.isArray(json.data.items)) {
-                            listData = json.data.items
-                            total = (json.data.total as number | undefined) || (json.data.count as number | undefined) || listData.length
-                        } else if (Array.isArray(json.data)) {
-                            listData = json.data
-                            total = (json.total as number | undefined) || (json.count as number | undefined) || listData.length
-                        } else {
-                            listData = [json.data]
-                            total = 1
-                        }
-                    } else if (isRecord(json) && Array.isArray(json.data)) {
-                        listData = json.data
-                        total = (json.total as number | undefined) || (json.count as number | undefined) || listData.length
-                    } else if (Array.isArray(json)) {
-                        listData = json
-                        total = getTotalFromHeaders(headers, listData.length)
-                    }
-
-                    return { data: listData, total }
-                }
-
-                case 'get':
-                case 'getOne':
-                case 'create':
-                case 'update':
-                case 'delete':
-                    if (isRecord(json) && json.code === 0 && json.data) {
-                        return { data: json.data }
-                    }
-                    if (isRecord(json) && json.data) {
-                        return { data: json.data }
-                    }
-                    return { data: json }
-
-                default:
-                    return { data: json }
-            }
-        } catch (error: unknown) {
-            handleHttpError(error)
-        }
-    },
 };
-
-export default dataProvider;

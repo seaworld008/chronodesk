@@ -1,11 +1,18 @@
 # Reference 文档
 
-本目录存放可检索的参考资料，通常为接口清单、历史 API 文档、协议草案等。
+本目录存放 ChronoDesk 当前机器契约与 Agent 协议参考。运行时 `/openapi.yaml` 和 `server/internal/openapi/openapi.yaml` 是请求/响应 Schema 的唯一权威来源。
 
 ## 当前内容
-- `API_DOCUMENTATION.md`：历史汇总版 API 文档。
-- `REQUIRED_API_ENDPOINTS.md`：需求阶段沉淀的接口清单。
+
+- [API 使用说明](API_DOCUMENTATION.md)：`/api/v1` Agent 机器入口、`/api` 人类入口和协议发现地址。
+- [MCP 2026-07-28](MCP_2026_07_28.md)：无状态 Streamable HTTP、最新单版本约束、OAuth Client Credentials 扩展与 Inspector。
+- [A2A 1.0](A2A_1_0.md)：Agent Card、严格版本头、JSON-RPC、SSE、Task、Artifact 与 Push。
+- [CloudEvents 1.0](CLOUDEVENTS_1_0.md)：领域事件信封、合法扩展属性、Outbox 消费和去重约束。
+- [OpenAPI 3.2](OPENAPI_3_2.md)：单版本机器契约、Redocly/Spectral 严格门禁与管理员并发契约。
+- [数据库敏感字段静态加密](DATA_AT_REST_ENCRYPTION.md)：AES-256-GCM keyring、显式迁移、轮换与投递日志安全。
 
 ## 使用建议
-- 新开发请以代码实现与 `docs/PROJECT_MANUAL.md` 为准。
-- 如发现参考文档与代码不一致，优先修正文档并在 PR 描述中标注差异。
+
+- 项目全景、启动与迁移流程见 [项目权威手册](../PROJECT_MANUAL.md)。
+- SDK 生成、Agent 接入和契约测试必须直接读取 `/openapi.yaml`，不要从手工文档复制 Schema。
+- ChronoDesk 只实现 MCP `2026-07-28`、A2A `1.0`、OpenAPI `3.2.0` 与 CloudEvents `1.0`，不保留旧协议兼容分支。

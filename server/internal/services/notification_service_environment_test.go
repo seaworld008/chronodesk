@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
 func TestSendWebhookLogEnvironment(t *testing.T) {
@@ -48,7 +48,8 @@ func TestSendWebhookLogEnvironment(t *testing.T) {
 		t.Fatalf("create webhook config: %v", err)
 	}
 
-	service := NewNotificationService(db)
+	service := NewNotificationServiceWithProtector(db, nil)
+	useTestWebhookClient(service, server.Client())
 	event := &NotificationEvent{
 		Type:         models.WebhookEventSystemAlert,
 		ResourceID:   1,
@@ -59,8 +60,8 @@ func TestSendWebhookLogEnvironment(t *testing.T) {
 		Timestamp:    time.Now(),
 	}
 
-	if err := service.sendWebhook(context.Background(), &config, event); err != nil {
-		t.Fatalf("sendWebhook returned error: %v", err)
+	if err := service.sendWebhookAttempt(context.Background(), &config, event); err != nil {
+		t.Fatalf("sendWebhookAttempt returned error: %v", err)
 	}
 
 	var log models.WebhookLog

@@ -3,6 +3,8 @@ package websocket
 import (
 	"context"
 	"encoding/json"
+	"math"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -59,6 +61,38 @@ func TestNotificationMarkedAsReadHook_PushesProvidedUnreadCount(t *testing.T) {
 	}
 }
 
+func TestHubRunClosesClientsAndReturnsOnContextCancellation(t *testing.T) {
+	hub := NewHub()
+	client := &Client{
+		hub:  hub,
+		send: make(chan []byte, 1),
+		done: make(chan struct{}),
+	}
+	hub.clients[client] = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	returned := make(chan struct{})
+	go func() {
+		hub.Run(ctx)
+		close(returned)
+	}()
+	cancel()
+
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("WebSocket hub did not stop after context cancellation")
+	}
+	select {
+	case <-client.done:
+	default:
+		t.Fatal("WebSocket hub shutdown did not close connected client")
+	}
+	if len(hub.clients) != 0 {
+		t.Fatalf("WebSocket hub retained %d clients after shutdown", len(hub.clients))
+	}
+}
+
 func TestClientHandleMarkRead_InvokesReadHandlerAndPushesUnreadCount(t *testing.T) {
 	hub := NewHub()
 	client := &Client{
@@ -101,5 +135,34 @@ func TestClientHandleMarkRead_InvokesReadHandlerAndPushesUnreadCount(t *testing.
 		}
 	case <-time.After(200 * time.Millisecond):
 		t.Fatalf("expected unread_count message to be pushed")
+	}
+}
+
+func TestClientHandleMarkReadRejectsInvalidNumericIDs(t *testing.T) {
+	client := &Client{UserID: 303}
+	t.Cleanup(func() {
+		SetNotificationReadHandler(nil)
+	})
+
+	calls := 0
+	SetNotificationReadHandler(func(context.Context, uint, uint) (int64, error) {
+		calls++
+		return 0, nil
+	})
+
+	values := []float64{
+		0,
+		-1,
+		42.5,
+		math.NaN(),
+		math.Inf(1),
+		maxExactJSONInteger + 1,
+		math.Ldexp(1, strconv.IntSize),
+	}
+	for _, value := range values {
+		client.handleMarkRead(map[string]interface{}{"notification_id": value})
+	}
+	if calls != 0 {
+		t.Fatalf("invalid notification IDs invoked the persistence hook %d time(s)", calls)
 	}
 }

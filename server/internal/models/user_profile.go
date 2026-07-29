@@ -33,12 +33,12 @@ type UserProfile struct {
 	OfficeNumber string `json:"office_number" gorm:"size:50"`
 
 	// 偏好设置
-	Language        string `json:"language" gorm:"size:10;default:'zh-CN'"`
-	Timezone        string `json:"timezone" gorm:"size:50;default:'Asia/Shanghai'"`
-	DateFormat      string `json:"date_format" gorm:"size:20;default:'YYYY-MM-DD'"`
-	TimeFormat      string `json:"time_format" gorm:"size:20;default:'24h'"`
-	FirstDayOfWeek  int    `json:"first_day_of_week" gorm:"default:1"` // 1=Monday, 0=Sunday
-	ReceiveNewsletter bool `json:"receive_newsletter" gorm:"default:true"`
+	Language          string `json:"language" gorm:"size:10;default:'zh-CN'"`
+	Timezone          string `json:"timezone" gorm:"size:50;default:'Asia/Shanghai'"`
+	DateFormat        string `json:"date_format" gorm:"size:20;default:'YYYY-MM-DD'"`
+	TimeFormat        string `json:"time_format" gorm:"size:20;default:'24h'"`
+	FirstDayOfWeek    int    `json:"first_day_of_week" gorm:"default:1"` // 1=Monday, 0=Sunday
+	ReceiveNewsletter bool   `json:"receive_newsletter" gorm:"default:true"`
 
 	// 社交媒体
 	LinkedIn  string `json:"linkedin" gorm:"size:200"`

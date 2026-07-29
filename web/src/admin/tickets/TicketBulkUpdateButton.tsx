@@ -13,6 +13,7 @@ import {
 } from '@mui/material'
 import Select, { SelectChangeEvent } from '@mui/material/Select'
 import { useListContext, useNotify, useUpdateMany } from 'react-admin'
+import { localizedUnknownErrorMessage } from '@/lib/apiClient'
 
 const statusChoices = [
   { id: 'open', name: '待处理' },
@@ -77,14 +78,14 @@ const TicketBulkUpdateButton: React.FC = () => {
             setPriority('')
             onUnselectItems?.()
           },
-          onError: (error) => {
-            notify(error?.message || '批量更新失败', { type: 'warning' })
+          onError: (error: unknown) => {
+            notify(localizedUnknownErrorMessage(error, '批量更新失败'), { type: 'warning' })
           },
           mutationMode: 'pessimistic',
         }
       )
     } catch (err) {
-      const message = err instanceof Error ? err.message : '批量更新失败'
+      const message = localizedUnknownErrorMessage(err, '批量更新失败')
       notify(message, { type: 'warning' })
     }
   }

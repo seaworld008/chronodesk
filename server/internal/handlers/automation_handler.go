@@ -1,15 +1,15 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
 // AutomationHandler 自动化处理器
@@ -18,12 +18,22 @@ type AutomationHandler struct {
 	schedulerService  *services.SchedulerService
 }
 
-// NewAutomationHandler 创建自动化处理器
-func NewAutomationHandler(db *gorm.DB, schedulerService *services.SchedulerService) *AutomationHandler {
-	return &AutomationHandler{
-		automationService: services.NewAutomationService(db),
-		schedulerService:  schedulerService,
+// NewAutomationHandler creates the HTTP adapter over the application-owned
+// automation service. The adapter never constructs a second service graph.
+func NewAutomationHandler(
+	automationService *services.AutomationService,
+	schedulerService *services.SchedulerService,
+) (*AutomationHandler, error) {
+	if automationService == nil {
+		return nil, errors.New("automation service is required")
 	}
+	if schedulerService == nil {
+		return nil, errors.New("scheduler service is required")
+	}
+	return &AutomationHandler{
+		automationService: automationService,
+		schedulerService:  schedulerService,
+	}, nil
 }
 
 // AutomationRule 相关接口
@@ -47,7 +57,7 @@ func (h *AutomationHandler) CreateRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数错误",
-			"error":   err.Error(),
+			"error":   "invalid_request",
 		})
 		return
 	}
@@ -55,10 +65,20 @@ func (h *AutomationHandler) CreateRule(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 	rule, err := h.automationService.CreateRule(c.Request.Context(), &req, userID.(uint))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
+		status := http.StatusInternalServerError
+		message := "创建规则失败"
+		code := "internal_error"
+		if errors.Is(err, services.ErrInvalidAutomationTriggerType) {
+			status = http.StatusBadRequest
+			message = "触发事件类型无效"
+			code = "invalid_trigger_type"
+		} else {
+			logHandlerFailure(c, "automation.create_rule", err)
+		}
+		c.JSON(status, gin.H{
 			"success": false,
-			"message": "创建规则失败",
-			"error":   err.Error(),
+			"message": message,
+			"error":   code,
 		})
 		return
 	}
@@ -97,13 +117,24 @@ func (h *AutomationHandler) GetRules(c *gin.Context) {
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	page, pageSize = normalizePagination(page, pageSize, 100)
 
 	rules, total, err := h.automationService.GetRules(c.Request.Context(), ruleType, triggerEvent, isActive, search, page, pageSize)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
+		status := http.StatusInternalServerError
+		message := "获取规则列表失败"
+		code := "internal_error"
+		if errors.Is(err, services.ErrInvalidAutomationTriggerType) {
+			status = http.StatusBadRequest
+			message = "触发事件筛选值无效"
+			code = "invalid_trigger_type"
+		} else {
+			logHandlerFailure(c, "automation.list_rules", err)
+		}
+		c.JSON(status, gin.H{
 			"success": false,
-			"message": "获取规则列表失败",
-			"error":   err.Error(),
+			"message": message,
+			"error":   code,
 		})
 		return
 	}
@@ -146,13 +177,19 @@ func (h *AutomationHandler) GetRule(c *gin.Context) {
 	rule, err := h.automationService.GetRuleByID(c.Request.Context(), uint(ruleID))
 	if err != nil {
 		status := http.StatusInternalServerError
+		message := "获取规则详情失败"
+		code := "internal_error"
 		if strings.Contains(err.Error(), "not found") {
 			status = http.StatusNotFound
+			message = "规则不存在"
+			code = "rule_not_found"
+		} else {
+			logHandlerFailure(c, "automation.get_rule", err)
 		}
 		c.JSON(status, gin.H{
 			"success": false,
-			"message": "获取规则详情失败",
-			"error":   err.Error(),
+			"message": message,
+			"error":   code,
 		})
 		return
 	}
@@ -193,7 +230,7 @@ func (h *AutomationHandler) UpdateRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数错误",
-			"error":   err.Error(),
+			"error":   "invalid_request",
 		})
 		return
 	}
@@ -202,13 +239,23 @@ func (h *AutomationHandler) UpdateRule(c *gin.Context) {
 	err = h.automationService.UpdateRule(c.Request.Context(), uint(ruleID), &req, userID.(uint))
 	if err != nil {
 		status := http.StatusInternalServerError
+		message := "更新规则失败"
+		code := "internal_error"
 		if strings.Contains(err.Error(), "not found") {
 			status = http.StatusNotFound
+			message = "规则不存在"
+			code = "rule_not_found"
+		} else if errors.Is(err, services.ErrInvalidAutomationTriggerType) {
+			status = http.StatusBadRequest
+			message = "触发事件类型无效"
+			code = "invalid_trigger_type"
+		} else {
+			logHandlerFailure(c, "automation.update_rule", err)
 		}
 		c.JSON(status, gin.H{
 			"success": false,
-			"message": "更新规则失败",
-			"error":   err.Error(),
+			"message": message,
+			"error":   code,
 		})
 		return
 	}
@@ -244,13 +291,19 @@ func (h *AutomationHandler) DeleteRule(c *gin.Context) {
 	err = h.automationService.DeleteRule(c.Request.Context(), uint(ruleID))
 	if err != nil {
 		status := http.StatusInternalServerError
+		message := "删除规则失败"
+		code := "internal_error"
 		if strings.Contains(err.Error(), "not found") {
 			status = http.StatusNotFound
+			message = "规则不存在"
+			code = "rule_not_found"
+		} else {
+			logHandlerFailure(c, "automation.delete_rule", err)
 		}
 		c.JSON(status, gin.H{
 			"success": false,
-			"message": "删除规则失败",
-			"error":   err.Error(),
+			"message": message,
+			"error":   code,
 		})
 		return
 	}
@@ -286,13 +339,19 @@ func (h *AutomationHandler) GetRuleStats(c *gin.Context) {
 	stats, err := h.automationService.GetRuleStats(c.Request.Context(), uint(ruleID))
 	if err != nil {
 		status := http.StatusInternalServerError
+		message := "获取规则统计失败"
+		code := "internal_error"
 		if strings.Contains(err.Error(), "not found") {
 			status = http.StatusNotFound
+			message = "规则不存在"
+			code = "rule_not_found"
+		} else {
+			logHandlerFailure(c, "automation.get_rule_stats", err)
 		}
 		c.JSON(status, gin.H{
 			"success": false,
-			"message": "获取规则统计失败",
-			"error":   err.Error(),
+			"message": message,
+			"error":   code,
 		})
 		return
 	}
@@ -344,13 +403,15 @@ func (h *AutomationHandler) GetExecutionLogs(c *gin.Context) {
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	page, pageSize = normalizePagination(page, pageSize, 100)
 
 	logs, total, err := h.automationService.GetExecutionLogs(c.Request.Context(), ruleID, ticketID, success, page, pageSize)
 	if err != nil {
+		logHandlerFailure(c, "automation.list_execution_logs", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "获取执行日志失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -388,17 +449,26 @@ func (h *AutomationHandler) CreateSLAConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数错误",
-			"error":   err.Error(),
+			"error":   "invalid_request",
 		})
 		return
 	}
 
 	config, err := h.automationService.CreateSLAConfig(c.Request.Context(), &req)
 	if err != nil {
+		if errors.Is(err, services.ErrInvalidWorkingHours) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"message": "工作时间配置无效",
+				"error":   "invalid_working_hours",
+			})
+			return
+		}
+		logHandlerFailure(c, "automation.create_sla_config", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "创建SLA配置失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -432,13 +502,15 @@ func (h *AutomationHandler) GetSLAConfigs(c *gin.Context) {
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	page, pageSize = normalizePagination(page, pageSize, 100)
 
 	configs, total, err := h.automationService.GetSLAConfigs(c.Request.Context(), isActive, page, pageSize)
 	if err != nil {
+		logHandlerFailure(c, "automation.list_sla_configs", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "获取SLA配置列表失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -476,7 +548,7 @@ func (h *AutomationHandler) CreateTemplate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数错误",
-			"error":   err.Error(),
+			"error":   "invalid_request",
 		})
 		return
 	}
@@ -484,10 +556,11 @@ func (h *AutomationHandler) CreateTemplate(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 	template, err := h.automationService.CreateTemplate(c.Request.Context(), &req, userID.(uint))
 	if err != nil {
+		logHandlerFailure(c, "automation.create_template", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "创建模板失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -523,13 +596,15 @@ func (h *AutomationHandler) GetTemplates(c *gin.Context) {
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	page, pageSize = normalizePagination(page, pageSize, 100)
 
 	templates, total, err := h.automationService.GetTemplates(c.Request.Context(), category, isActive, page, pageSize)
 	if err != nil {
+		logHandlerFailure(c, "automation.list_templates", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "获取模板列表失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -572,13 +647,19 @@ func (h *AutomationHandler) GetTemplate(c *gin.Context) {
 	template, err := h.automationService.GetTemplateByID(c.Request.Context(), uint(templateID))
 	if err != nil {
 		status := http.StatusInternalServerError
+		message := "获取模板详情失败"
+		code := "internal_error"
 		if strings.Contains(err.Error(), "not found") {
 			status = http.StatusNotFound
+			message = "模板不存在"
+			code = "template_not_found"
+		} else {
+			logHandlerFailure(c, "automation.get_template", err)
 		}
 		c.JSON(status, gin.H{
 			"success": false,
-			"message": "获取模板详情失败",
-			"error":   err.Error(),
+			"message": message,
+			"error":   code,
 		})
 		return
 	}
@@ -610,7 +691,7 @@ func (h *AutomationHandler) CreateQuickReply(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数错误",
-			"error":   err.Error(),
+			"error":   "invalid_request",
 		})
 		return
 	}
@@ -618,10 +699,11 @@ func (h *AutomationHandler) CreateQuickReply(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 	reply, err := h.automationService.CreateQuickReply(c.Request.Context(), &req, userID.(uint))
 	if err != nil {
+		logHandlerFailure(c, "automation.create_quick_reply", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "创建快速回复失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -659,14 +741,16 @@ func (h *AutomationHandler) GetQuickReplies(c *gin.Context) {
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	page, pageSize = normalizePagination(page, pageSize, 100)
 
 	userID, _ := c.Get("user_id")
 	replies, total, err := h.automationService.GetQuickReplies(c.Request.Context(), category, keyword, isPublic, userID.(uint), page, pageSize)
 	if err != nil {
+		logHandlerFailure(c, "automation.list_quick_replies", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "获取快速回复列表失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -708,10 +792,11 @@ func (h *AutomationHandler) UseQuickReply(c *gin.Context) {
 
 	err = h.automationService.UseQuickReply(c.Request.Context(), uint(replyID))
 	if err != nil {
+		logHandlerFailure(c, "automation.use_quick_reply", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "使用快速回复失败",
-			"error":   err.Error(),
+			"error":   "internal_error",
 		})
 		return
 	}
@@ -719,93 +804,5 @@ func (h *AutomationHandler) UseQuickReply(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "使用快速回复成功",
-	})
-}
-
-// BatchOperations 批量操作相关接口
-
-// BatchUpdateTickets 批量更新工单
-// @Summary 批量更新工单
-// @Description 批量更新多个工单的状态、优先级等
-// @Tags 批量操作
-// @Security ApiKeyAuth
-// @Accept json
-// @Produce json
-// @Param request body map[string]interface{} true "批量更新请求"
-// @Success 200 {object} map[string]interface{} "成功"
-// @Failure 400 {object} map[string]interface{} "请求参数错误"
-// @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/batch/update [post]
-func (h *AutomationHandler) BatchUpdateTickets(c *gin.Context) {
-	var req struct {
-		TicketIDs []uint                 `json:"ticket_ids" binding:"required,min=1,max=100,unique,dive,gt=0"`
-		Updates   map[string]interface{} `json:"updates" binding:"required"`
-	}
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "请求参数错误",
-			"error":   err.Error(),
-		})
-		return
-	}
-
-	err := h.automationService.BatchUpdateTickets(c.Request.Context(), req.TicketIDs, req.Updates)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "批量更新工单失败",
-			"error":   err.Error(),
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "批量更新工单成功",
-	})
-}
-
-// BatchAssignTickets 批量分配工单
-// @Summary 批量分配工单
-// @Description 批量分配工单给指定用户
-// @Tags 批量操作
-// @Security ApiKeyAuth
-// @Accept json
-// @Produce json
-// @Param request body map[string]interface{} true "批量分配请求"
-// @Success 200 {object} map[string]interface{} "成功"
-// @Failure 400 {object} map[string]interface{} "请求参数错误"
-// @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/batch/assign [post]
-func (h *AutomationHandler) BatchAssignTickets(c *gin.Context) {
-	var req struct {
-		TicketIDs []uint `json:"ticket_ids" binding:"required,min=1,max=100,unique,dive,gt=0"`
-		UserID    uint   `json:"user_id" binding:"required"`
-	}
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "请求参数错误",
-			"error":   err.Error(),
-		})
-		return
-	}
-
-	err := h.automationService.BatchAssignTickets(c.Request.Context(), req.TicketIDs, req.UserID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "批量分配工单失败",
-			"error":   err.Error(),
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "批量分配工单成功",
 	})
 }

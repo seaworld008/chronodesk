@@ -2,27 +2,23 @@ import React from 'react';
 import {
     List,
     DatagridConfigurable,
-    TextField,
+    DatagridHeader,
     DateField,
     ReferenceField,
+    FunctionField,
     EditButton,
     ShowButton,
     FilterButton,
     CreateButton,
     ExportButton,
-    SearchInput,
-    SelectInput,
     SelectField,
-    DateInput,
-    BooleanInput,
-    TextInput,
     TopToolbar,
-    BulkDeleteWithConfirmButton,
     WrapperField,
     SelectColumnsButton,
     useRecordContext,
-    useNotify,
     useRedirect,
+    useGetIdentity,
+    usePermissions,
 } from 'react-admin';
 import { Box, Chip, Typography, Tooltip, IconButton, type ChipProps } from '@mui/material';
 import {
@@ -40,6 +36,24 @@ import {
 import TicketBulkUpdateButton from './TicketBulkUpdateButton';
 import { parseTagsToArray } from './tagUtils';
 import { Ticket } from '@/types';
+import {
+    canDeleteTicket,
+    canMutateTicket,
+    type TicketRolePermissions,
+} from './ticketAccess';
+import {
+    InlineDetails,
+    PersistentResizableDatagridHeader,
+    TruncatedText,
+    type ResizableColumn,
+} from '@/components/tables/EnterpriseTable';
+import { EnterpriseSearchInput } from '@/components/inputs/EnterpriseSearchInput';
+import {
+    EnterpriseBooleanFilterInput,
+    EnterpriseSelectFilterInput,
+    EnterpriseTextFilterInput,
+} from '@/components/inputs/EnterpriseFilterInputs';
+import { FocusSafeBulkDeleteWithConfirmButton } from '@/components/actions/FocusSafeDeleteButtons';
 
 // 过滤器选项
 const statusChoices = [
@@ -67,6 +81,29 @@ const typeChoices = [
     { id: 'complaint', name: '投诉' },
     { id: 'consultation', name: '咨询' },
 ];
+
+const ticketColumnDefaults: ResizableColumn[] = [
+    { key: 'ticket_number', defaultWidth: 260, minWidth: 180, maxWidth: 480 },
+    { key: 'status', defaultWidth: 108, minWidth: 88, maxWidth: 180 },
+    { key: 'priority', defaultWidth: 112, minWidth: 88, maxWidth: 180 },
+    { key: 'type', defaultWidth: 104, minWidth: 80, maxWidth: 180 },
+    { key: '标签', defaultWidth: 180, minWidth: 112, maxWidth: 360 },
+    { key: 'assigned_to_id', defaultWidth: 152, minWidth: 112, maxWidth: 280 },
+    { key: 'customer_name', defaultWidth: 168, minWidth: 112, maxWidth: 320 },
+    { key: 'sla_due_date', defaultWidth: 132, minWidth: 104, maxWidth: 220 },
+    { key: 'category_id', defaultWidth: 152, minWidth: 112, maxWidth: 280 },
+    { key: 'created_at', defaultWidth: 148, minWidth: 128, maxWidth: 240 },
+    { key: 'due_date', defaultWidth: 148, minWidth: 128, maxWidth: 240 },
+    { key: '操作', defaultWidth: 196, minWidth: 176, maxWidth: 240, sticky: 'right' },
+];
+
+const TicketDatagridHeader: React.FC<React.ComponentProps<typeof DatagridHeader>> = (props) => (
+    <PersistentResizableDatagridHeader
+        {...props}
+        tableId="tickets.main"
+        columnDefaults={ticketColumnDefaults}
+    />
+);
 
 /**
  * 增强的优先级显示组件
@@ -122,7 +159,7 @@ const EnhancedPriorityField: React.FC = () => {
     };
 
     const config = getPriorityConfig(record.priority);
-    const label = priorityChoices.find((p) => p.id === record.priority)?.name || record.priority;
+    const label = priorityChoices.find((p) => p.id === record.priority)?.name || '未知优先级';
 
     return (
         <Chip
@@ -155,15 +192,21 @@ const TicketTagsField: React.FC = () => {
 
     const tags = parseTagsToArray(record.tags);
     if (!tags.length) {
-        return <Typography variant="body2" color="text.secondary">--</Typography>;
+        return (
+            <Typography variant="body2" sx={{
+                color: "text.secondary"
+            }}>--</Typography>
+        );
     }
 
     return (
-        <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
-            {tags.map((tag) => (
-                <Chip key={tag} label={tag} size="small" color="default" variant="outlined" />
-            ))}
-        </Box>
+        <Tooltip title={tags.join('、')} enterDelay={500}>
+            <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'nowrap', overflow: 'hidden' }}>
+                {tags.map((tag) => (
+                    <Chip key={tag} label={tag} size="small" color="default" variant="outlined" />
+                ))}
+            </Box>
+        </Tooltip>
     );
 };
 
@@ -189,7 +232,7 @@ const EnhancedStatusField: React.FC = () => {
             case 'cancelled':
                 return { color: 'error', label: '已取消' };
             default:
-                return { color: 'default', label: status };
+                return { color: 'default', label: '未知状态' };
         }
     };
 
@@ -214,20 +257,13 @@ const TicketTitleField: React.FC = () => {
     const record = useRecordContext<Ticket>();
     if (!record) return null;
 
+    const number = `#${record.ticket_number}`;
     return (
-        <Box sx={{ minWidth: 0 }}>
-            <Typography variant="caption" color="primary" fontWeight={600}>
-                #{record.ticket_number}
-            </Typography>
-            <Typography
-                variant="body2"
-                noWrap
-                sx={{ maxWidth: 180 }}
-                title={record.title}
-            >
-                {record.title}
-            </Typography>
-        </Box>
+        <InlineDetails
+            primary={number}
+            secondary={record.title}
+            title={`${number} · ${record.title}`}
+        />
     );
 };
 
@@ -252,9 +288,9 @@ const AssignmentField: React.FC = () => {
     return (
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
             <Assignment fontSize="small" color="primary" />
-            <Typography variant="body2">
+            <TruncatedText title={record.assigned_to.username}>
                 {record.assigned_to.username}
-            </Typography>
+            </TruncatedText>
         </Box>
     );
 };
@@ -267,7 +303,11 @@ const SLAStatusField: React.FC = () => {
     if (!record) return null;
 
     if (!record.sla_due_date) {
-        return <Typography variant="caption" color="text.secondary">无 SLA</Typography>;
+        return (
+            <Typography variant="caption" sx={{
+                color: "text.secondary"
+            }}>无 SLA</Typography>
+        );
     }
 
     const now = new Date();
@@ -313,48 +353,56 @@ const SLAStatusField: React.FC = () => {
  */
 const QuickActionsField: React.FC = () => {
     const record = useRecordContext<Ticket>();
-    const notify = useNotify();
     const redirect = useRedirect();
+    const { permissions } = usePermissions<TicketRolePermissions>();
+    const { identity } = useGetIdentity();
 
     if (!record) return null;
+    const canMutate = canMutateTicket(record, permissions?.role, identity?.id);
 
-    const handleAssign = async (e: React.MouseEvent) => {
+    const openWorkflow = (e: React.MouseEvent) => {
         e.stopPropagation();
-        // TODO: 弹出分配对话框
-        notify('分配功能开发中', { type: 'info' });
-    };
-
-    const handleEscalate = async (e: React.MouseEvent) => {
-        e.stopPropagation();
-        notify('请在工单详情中选择升级对象', { type: 'info' });
         redirect('show', 'tickets', record.id);
     };
 
-    const handleStatusChange = async (e: React.MouseEvent) => {
-        e.stopPropagation();
-        // TODO: 弹出状态变更对话框
-        notify('状态变更功能开发中', { type: 'info' });
-    };
-
     return (
-        <Box sx={{ display: 'flex', gap: 0.25, alignItems: 'center' }}>
-            <Tooltip title="分配工单">
-                <IconButton size="small" onClick={handleAssign} color="primary">
-                    <PersonAdd fontSize="small" />
-                </IconButton>
-            </Tooltip>
-            <Tooltip title="升级工单">
-                <IconButton size="small" onClick={handleEscalate} color="warning">
-                    <ArrowUpward fontSize="small" />
-                </IconButton>
-            </Tooltip>
-            <Tooltip title="状态变更">
-                <IconButton size="small" onClick={handleStatusChange} color="success">
-                    <SwapHoriz fontSize="small" />
-                </IconButton>
-            </Tooltip>
-            <ShowButton label="" />
-            <EditButton label="" />
+        <Box className="cd-table-actions" sx={{ alignItems: 'center' }}>
+            {canMutate && (
+                <>
+                    <Tooltip title="在详情页分配工单">
+                        <IconButton
+                            size="small"
+                            aria-label="在详情页分配工单"
+                            onClick={openWorkflow}
+                            color="primary"
+                        >
+                            <PersonAdd fontSize="small" />
+                        </IconButton>
+                    </Tooltip>
+                    <Tooltip title="在详情页升级工单">
+                        <IconButton
+                            size="small"
+                            aria-label="在详情页升级工单"
+                            onClick={openWorkflow}
+                            color="warning"
+                        >
+                            <ArrowUpward fontSize="small" />
+                        </IconButton>
+                    </Tooltip>
+                    <Tooltip title="在详情页变更状态">
+                        <IconButton
+                            size="small"
+                            aria-label="在详情页变更状态"
+                            onClick={openWorkflow}
+                            color="success"
+                        >
+                            <SwapHoriz fontSize="small" />
+                        </IconButton>
+                    </Tooltip>
+                </>
+            )}
+            <ShowButton label="查看" />
+            {canMutate && <EditButton label="编辑" />}
         </Box>
     );
 };
@@ -363,17 +411,14 @@ const QuickActionsField: React.FC = () => {
  * 过滤器组件
  */
 const TicketFilters = [
-    <SearchInput source="q" placeholder="搜索工单" alwaysOn />,
-    <SelectInput source="status" label="状态" choices={statusChoices} />,
-    <SelectInput source="priority" label="优先级" choices={priorityChoices} />,
-    <SelectInput source="type" label="类型" choices={typeChoices} />,
-    <TextInput source="tags" label="标签" placeholder="支持逗号分隔多个标签" />,
-    <BooleanInput source="is_overdue" label="已逾期" />,
-    <BooleanInput source="sla_breached" label="SLA违约" />,
-    <BooleanInput source="unassigned" label="未分配" />,
-    <DateInput source="created_at_gte" label="创建时间从" />,
-    <DateInput source="created_at_lte" label="创建时间到" />,
-    <DateInput source="due_date_lte" label="截止时间到" />,
+    <EnterpriseSearchInput source="q" placeholder="搜索工单" alwaysOn />,
+    <EnterpriseSelectFilterInput source="status" label="状态" choices={statusChoices} />,
+    <EnterpriseSelectFilterInput source="priority" label="优先级" choices={priorityChoices} />,
+    <EnterpriseSelectFilterInput source="type" label="类型" choices={typeChoices} />,
+    <EnterpriseTextFilterInput source="tags" label="标签" placeholder="支持逗号分隔多个标签" />,
+    <EnterpriseBooleanFilterInput source="is_overdue" label="已逾期" />,
+    <EnterpriseBooleanFilterInput source="sla_breached" label="SLA 违约" />,
+    <EnterpriseBooleanFilterInput source="unassigned" label="未分配" />,
 ];
 
 /**
@@ -394,7 +439,7 @@ const TicketListActions = () => (
 const TicketBulkActionButtons = () => (
     <>
         <TicketBulkUpdateButton />
-        <BulkDeleteWithConfirmButton label="批量删除" mutationMode="pessimistic" />
+        <FocusSafeBulkDeleteWithConfirmButton label="批量删除" mutationMode="pessimistic" />
     </>
 );
 
@@ -407,7 +452,9 @@ const TicketListEmpty = () => (
         <Typography variant="h5" component="h2" gutterBottom>
             暂无工单
         </Typography>
-        <Typography variant="body1" color="text.secondary">
+        <Typography variant="body1" sx={{
+            color: "text.secondary"
+        }}>
             创建第一个工单开始管理客户请求
         </Typography>
         <CreateButton label="创建工单" sx={{ mt: 2 }} />
@@ -419,6 +466,9 @@ const TicketListEmpty = () => (
  * 集成工作流操作和智能显示
  */
 const TicketListEnhanced: React.FC = () => {
+    const { permissions } = usePermissions<TicketRolePermissions>();
+    const canBulkManage = canDeleteTicket(permissions?.role);
+
     return (
         <List
             filters={TicketFilters}
@@ -429,50 +479,30 @@ const TicketListEnhanced: React.FC = () => {
             title="工单管理"
         >
             <DatagridConfigurable
-                bulkActionButtons={<TicketBulkActionButtons />}
+                aria-label="工单列表"
+                bulkActionButtons={canBulkManage ? <TicketBulkActionButtons /> : false}
                 rowClick="show"
+                header={TicketDatagridHeader}
+                className="cd-enterprise-table cd-enterprise-datagrid"
                 sx={{
-                    '& .RaDatagrid-table': {
-                        tableLayout: 'auto',
+                    width: '100%',
+                    maxWidth: '100%',
+                    minWidth: 0,
+                    '& .RaDatagrid-tableWrapper': {
+                        contain: 'inline-size',
+                        display: 'block',
                         width: '100%',
+                        maxWidth: '100%',
+                        minWidth: 0,
+                        overflowX: 'auto',
+                    },
+                    '& .RaDatagrid-table': {
+                        tableLayout: 'fixed',
+                        minWidth: '100%',
                         borderCollapse: 'separate',
-                        '& .RaDatagrid-headerCell': {
-                            backgroundColor: '#f8fafc',
-                            fontWeight: 600,
-                            fontSize: '0.8rem',
-                            padding: '12px 8px',
-                            whiteSpace: 'nowrap',
-                            borderBottom: '2px solid #e2e8f0',
-                            verticalAlign: 'middle',
-                            position: 'relative',
-                            resize: 'horizontal',
-                            overflow: 'hidden',
-                            '&:hover': {
-                                backgroundColor: '#f1f5f9',
-                            }
-                        },
-                        '& .RaDatagrid-rowCell': {
-                            padding: '8px',
-                            fontSize: '0.85rem',
-                            borderBottom: '1px solid #f1f5f9',
-                            verticalAlign: 'middle',
-                        },
-                        '& .RaDatagrid-row:hover': {
-                            backgroundColor: '#f8fafc',
-                        },
-                        // 勾选框列固定宽度
-                        '& .RaDatagrid-headerCell:first-of-type, & .RaDatagrid-rowCell:first-of-type': {
-                            width: 48,
-                            minWidth: 48,
-                            maxWidth: 48,
-                            resize: 'none',
-                        },
-                        // 工单信息列
-                        '& .RaDatagrid-headerCell:nth-of-type(2), & .RaDatagrid-rowCell:nth-of-type(2)': {
-                            minWidth: 160,
-                            maxWidth: 300,
-                            // 移除 maxWidth 限制或者设大一点以便调整
-                        },
+                    },
+                    '& .RaDatagrid-row:hover': {
+                        backgroundColor: '#f8fafc',
                     },
                 }}
             >
@@ -505,7 +535,15 @@ const TicketListEnhanced: React.FC = () => {
                 </WrapperField>
 
                 {/* 客户信息 */}
-                <TextField source="customer_name" label="客户" emptyText="--" />
+                <FunctionField<Ticket>
+                    source="customer_name"
+                    label="客户"
+                    render={(record) => (
+                        <TruncatedText title={record?.customer_name || '—'}>
+                            {record?.customer_name || '—'}
+                        </TruncatedText>
+                    )}
+                />
 
                 {/* SLA状态 */}
                 <WrapperField label="SLA状态" sortBy="sla_due_date">
@@ -519,7 +557,13 @@ const TicketListEnhanced: React.FC = () => {
                     label="分类"
                     emptyText="--"
                 >
-                    <TextField source="name" />
+                    <FunctionField<{ name?: string }>
+                        render={(record) => (
+                            <TruncatedText title={record?.name || '—'}>
+                                {record?.name || '—'}
+                            </TruncatedText>
+                        )}
+                    />
                 </ReferenceField>
 
                 {/* 创建时间 */}
@@ -541,7 +585,11 @@ const TicketListEnhanced: React.FC = () => {
                 />
 
                 {/* 操作 */}
-                <WrapperField label="操作">
+                <WrapperField
+                    label="操作"
+                    cellClassName="cd-table-sticky-right"
+                    headerClassName="cd-table-sticky-right"
+                >
                     <QuickActionsField />
                 </WrapperField>
             </DatagridConfigurable>

@@ -6,48 +6,48 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 
-	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
-var ErrInvalidTicketTransition = errors.New("invalid ticket status transition")
+var (
+	ErrInvalidTicketTransition = errors.New("invalid ticket status transition")
+	ErrInvalidBulkTicketUpdate = errors.New("invalid bulk ticket update")
+)
 
 // TicketServiceInterface defines the interface for ticket service
 type TicketServiceInterface interface {
 	GetTickets(ctx context.Context, filters TicketFilters) ([]*models.Ticket, int64, error)
 	GetTicket(ctx context.Context, id uint) (*models.Ticket, error)
 	CreateTicket(ctx context.Context, req *models.TicketCreateRequest, userID uint) (*models.Ticket, error)
-	UpdateTicket(ctx context.Context, id uint, req *models.TicketUpdateRequest, userID uint) (*models.Ticket, error)
-	DeleteTicket(ctx context.Context, id uint, userID uint, userRole string) error
-	AssignTicket(ticketID uint, assigneeID uint, userID uint, comment string) (*models.Ticket, error)
-	TransferTicket(ticketID uint, assigneeID uint, userID uint, comment string, transferReason string) (*models.Ticket, error)
-	EscalateTicket(ticketID uint, escalateToID uint, userID uint, reason string, comment string) (*models.Ticket, error)
-	UpdateTicketStatus(ticketID uint, status string, userID uint, comment string, resolutionNotes string) (*models.Ticket, error)
+	UpdateTicketExpectedVersion(ctx context.Context, id uint, req *models.TicketUpdateRequest, userID uint, expectedVersion uint64) (*models.Ticket, error)
+	DeleteTicketExpectedVersion(ctx context.Context, id uint, userID uint, userRole string, expectedVersion uint64) error
+	AssignTicketExpectedVersion(ctx context.Context, ticketID uint, assigneeID uint, userID uint, comment string, expectedVersion uint64) (*models.Ticket, error)
+	TransferTicketExpectedVersion(ctx context.Context, ticketID uint, assigneeID uint, userID uint, comment string, transferReason string, expectedVersion uint64) (*models.Ticket, error)
+	EscalateTicketExpectedVersion(ctx context.Context, ticketID uint, escalateToID uint, userID uint, reason string, comment string, expectedVersion uint64) (*models.Ticket, error)
+	UpdateTicketStatusExpectedVersion(ctx context.Context, ticketID uint, status string, userID uint, comment string, resolutionNotes string, expectedVersion uint64) (*models.Ticket, error)
 	GetTicketStatistics(userID uint, role string) (*TicketStatisticsResponse, error)
 	GetUserTickets(userID uint, status string, priority string, limit int) ([]*models.Ticket, int64, error)
 	GetUnassignedTickets(priority string, categoryID string, limit int) ([]*models.Ticket, int64, error)
 	GetOverdueTickets(userID uint, role string) ([]*models.Ticket, int64, error)
 	GetSLABreachedTickets(userID uint, role string) ([]*models.Ticket, int64, error)
-	BulkAssignTickets(ticketIDs []uint, assigneeID uint, userID uint, comment string) (*BulkOperationResult, error)
-	BulkUpdateStatus(ticketIDs []uint, status string, userID uint, comment string) (*BulkOperationResult, error)
-	GetTicketStats(ctx context.Context, userID uint) (*TicketStats, error)
-	BulkUpdateTickets(ctx context.Context, req *BulkUpdateRequest, userID uint) error
+	BulkUpdateTickets(ctx context.Context, req *BulkUpdateRequest, userID uint) (*BulkUpdateResult, error)
 	GetTicketHistory(ticketID uint) ([]*models.TicketHistory, int64, error)
-	CreateTicketHistory(ctx context.Context, req *models.TicketHistoryCreateRequest, userID *uint) error
 }
 
 // TicketService implements TicketServiceInterface
 type TicketService struct {
-	db                  *gorm.DB
-	notificationService NotificationServiceInterface
-	statsCache          StatsCache
-	statsCacheTTL       time.Duration
+	db            *gorm.DB
+	agentNative   *AgentNativeService
+	statsCache    StatsCache
+	statsCacheTTL time.Duration
 }
 
 var ticketSortableColumns = map[string]string{
@@ -67,25 +67,31 @@ type StatsCache interface {
 	Set(ctx context.Context, key string, value interface{}, expiration time.Duration) error
 }
 
-// NewTicketService creates a new ticket service
-func NewTicketService(db *gorm.DB) TicketServiceInterface {
-	return &TicketService{
-		db:                  db,
-		notificationService: NewNotificationService(db),
+// NewTicketService constructs the Human REST ticket adapter over the same
+// transactional Agent-native event service used by REST v1, MCP, and A2A.
+// Both dependencies are mandatory so a write path can never silently skip its
+// DomainEvent and Outbox records.
+func NewTicketService(
+	db *gorm.DB,
+	native *AgentNativeService,
+	cache StatsCache,
+	ttl time.Duration,
+) (*TicketService, error) {
+	if db == nil {
+		return nil, errors.New("ticket database is required")
 	}
-}
-
-// NewTicketServiceWithCache creates a new ticket service with stats cache enabled.
-func NewTicketServiceWithCache(db *gorm.DB, cache StatsCache, ttl time.Duration) TicketServiceInterface {
+	if native == nil {
+		return nil, errors.New("agent-native event service is required")
+	}
 	service := &TicketService{
-		db:                  db,
-		notificationService: NewNotificationService(db),
+		db:          db,
+		agentNative: native,
 	}
 	if cache != nil && ttl > 0 {
 		service.statsCache = cache
 		service.statsCacheTTL = ttl
 	}
-	return service
+	return service, nil
 }
 
 // TicketFilters represents filters for ticket queries
@@ -93,6 +99,7 @@ type TicketFilters struct {
 	Status      string
 	Priority    string
 	Type        string
+	Source      string
 	Tags        []string
 	AssigneeID  *uint
 	CreatorID   *uint
@@ -104,16 +111,6 @@ type TicketFilters struct {
 	Limit       int
 	SortBy      string
 	SortOrder   string
-}
-
-// TicketStats represents ticket statistics
-type TicketStats struct {
-	Total      int64 `json:"total"`
-	Open       int64 `json:"open"`
-	InProgress int64 `json:"in_progress"`
-	Resolved   int64 `json:"resolved"`
-	Closed     int64 `json:"closed"`
-	Overdue    int64 `json:"overdue"`
 }
 
 // TicketStatisticsResponse represents enhanced ticket statistics for dashboard
@@ -134,24 +131,30 @@ type TicketStatisticsResponse struct {
 	ByCategory   map[string]int64 `json:"by_category"`
 }
 
-// BulkOperationResult represents the result of a bulk operation
-type BulkOperationResult struct {
-	AssignedCount   int    `json:"assigned_count,omitempty"`
-	UpdatedCount    int    `json:"updated_count,omitempty"`
-	FailedCount     int    `json:"failed_count"`
-	AssignedTickets []uint `json:"assigned_tickets,omitempty"`
-	UpdatedTickets  []uint `json:"updated_tickets,omitempty"`
-	FailedTickets   []uint `json:"failed_tickets"`
+// TicketVersionPrecondition binds a bulk command to the exact list snapshot
+// from which a human initiated it.
+type TicketVersionPrecondition struct {
+	ID      uint   `json:"id" binding:"required,gt=0"`
+	Version uint64 `json:"version" binding:"required,gt=0"`
+}
+
+type TicketVersionReceipt struct {
+	ID      uint   `json:"id"`
+	Version uint64 `json:"version"`
+}
+
+type BulkUpdateResult struct {
+	Tickets []TicketVersionReceipt `json:"tickets"`
 }
 
 // BulkUpdateRequest represents bulk update request
 type BulkUpdateRequest struct {
-	TicketIDs    []uint                 `json:"ticket_ids"`
-	Status       *string                `json:"status,omitempty"`
-	Priority     *string                `json:"priority,omitempty"`
-	AssignedToID *uint                  `json:"assigned_to_id,omitempty"`
-	Tags         []string               `json:"tags,omitempty"`
-	CustomFields map[string]interface{} `json:"custom_fields,omitempty"`
+	Tickets      []TicketVersionPrecondition `json:"tickets"`
+	Status       *string                     `json:"status,omitempty"`
+	Priority     *string                     `json:"priority,omitempty"`
+	AssignedToID *uint                       `json:"assigned_to_id,omitempty"`
+	Tags         []string                    `json:"tags,omitempty"`
+	CustomFields map[string]interface{}      `json:"custom_fields,omitempty"`
 }
 
 // GetTickets retrieves tickets with filters
@@ -180,6 +183,9 @@ func (s *TicketService) GetTickets(ctx context.Context, filters TicketFilters) (
 	}
 	if filters.Type != "" {
 		query = query.Where("type = ?", filters.Type)
+	}
+	if filters.Source != "" {
+		query = query.Where("source = ?", filters.Source)
 	}
 	if filters.AssigneeID != nil {
 		query = query.Where("assigned_to_id = ?", *filters.AssigneeID)
@@ -234,7 +240,7 @@ func (s *TicketService) GetTickets(ctx context.Context, filters TicketFilters) (
 	query = query.Order(fmt.Sprintf("%s %s", sortBy, sortOrder))
 
 	// Preload associations
-	query = query.Preload("CreatedBy").Preload("AssignedTo").Preload("Comments")
+	query = query.Preload("CreatedBy").Preload("AssignedTo")
 
 	if err := query.Find(&tickets).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to get tickets: %w", err)
@@ -297,471 +303,262 @@ func (s *TicketService) GetTicket(ctx context.Context, id uint) (*models.Ticket,
 
 // CreateTicket creates a new ticket
 func (s *TicketService) CreateTicket(ctx context.Context, req *models.TicketCreateRequest, userID uint) (*models.Ticket, error) {
-	// Generate unique ticket number
-	ticketNumber := s.generateTicketNumber()
-
-	status := models.TicketStatusOpen
-	if req.Status != nil {
-		status = models.TicketStatus(*req.Status)
+	if req == nil || userID == 0 {
+		return nil, fmt.Errorf("human ticket create request and actor are required")
 	}
-
-	now := time.Now()
-
-	ticket := &models.Ticket{
-		TicketNumber:  ticketNumber,
-		Title:         req.Title,
-		Description:   req.Description,
-		Status:        status,
-		Priority:      req.Priority,
-		Type:          req.Type,
-		Source:        req.Source,
-		CreatedByID:   userID,
-		Tags:          datatypes.JSONSlice[string](req.Tags), // 转换类型，GORM自动处理JSONB序列化
-		CustomerEmail: req.CustomerEmail,
-		CustomerPhone: req.CustomerPhone,
-		CustomerName:  req.CustomerName,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+	request := *req
+	if request.Source == "" {
+		request.Source = models.TicketSourceWeb
 	}
-
-	// 设置 CustomFields
-	if req.CustomFields != nil {
-		ticket.CustomFields = datatypes.NewJSONType(req.CustomFields.ToMap())
+	var assignedActor *models.ActorRef
+	if request.AssignedToID != nil {
+		actor := models.HumanActor(*request.AssignedToID)
+		assignedActor = &actor
 	}
-
-	if status == models.TicketStatusResolved && ticket.ResolvedAt == nil {
-		ticket.ResolvedAt = &now
-	}
-	if status == models.TicketStatusClosed && ticket.ClosedAt == nil {
-		ticket.ClosedAt = &now
-	}
-
-	// Set assignee if provided
-	if req.AssignedToID != nil {
-		ticket.AssignedToID = req.AssignedToID
-	}
-
-	// Set category if provided
-	if req.CategoryID != nil {
-		ticket.CategoryID = req.CategoryID
-		var category models.Category
-		if err := s.db.WithContext(ctx).Select("id", "sla_hours").First(&category, *req.CategoryID).Error; err != nil {
-			return nil, fmt.Errorf("failed to load ticket category: %w", err)
-		}
-		if category.SLAHours != nil && *category.SLAHours > 0 {
-			slaDueDate := now.Add(time.Duration(*category.SLAHours) * time.Hour)
-			ticket.SLADueDate = &slaDueDate
-		}
-	}
-
-	// Set subcategory if provided
-	if req.SubcategoryID != nil {
-		ticket.SubcategoryID = req.SubcategoryID
-	}
-
-	// Set due date if provided
-	if req.DueDate != nil {
-		ticket.DueDate = req.DueDate
-	}
-
-	if err := s.db.WithContext(ctx).Create(ticket).Error; err != nil {
-		return nil, fmt.Errorf("failed to create ticket: %w", err)
-	}
-
-	// Reload with associations
-	return s.GetTicket(ctx, ticket.ID)
-}
-
-// UpdateTicket updates an existing ticket
-func (s *TicketService) UpdateTicket(ctx context.Context, id uint, req *models.TicketUpdateRequest, userID uint) (*models.Ticket, error) {
-	// 获取原工单信息用于比较
-	originalTicket, err := s.GetTicket(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-
-	// 创建副本用于更新
-	ticket := *originalTicket
-	var historyRecords []*models.TicketHistoryCreateRequest
-
-	// Update fields and track changes
-	if req.Title != nil && *req.Title != ticket.Title {
-		historyRecords = append(historyRecords, &models.TicketHistoryCreateRequest{
-			TicketID:    id,
-			Action:      models.HistoryActionUpdate,
-			Description: "标题已更新",
-			FieldName:   "title",
-			OldValue:    ticket.Title,
-			NewValue:    *req.Title,
-		})
-		ticket.Title = *req.Title
-	}
-
-	if req.Description != nil && *req.Description != ticket.Description {
-		historyRecords = append(historyRecords, &models.TicketHistoryCreateRequest{
-			TicketID:    id,
-			Action:      models.HistoryActionUpdate,
-			Description: "描述已更新",
-			FieldName:   "description",
-			OldValue:    truncateString(ticket.Description, 50),
-			NewValue:    truncateString(*req.Description, 50),
-		})
-		ticket.Description = *req.Description
-	}
-
-	if req.Status != nil && models.TicketStatus(*req.Status) != ticket.Status {
-		if !ticket.Status.CanTransitionTo(*req.Status) {
-			return nil, fmt.Errorf("%w: %s to %s", ErrInvalidTicketTransition, ticket.Status, *req.Status)
-		}
-		oldStatus := string(ticket.Status)
-		newStatus := string(*req.Status)
-		historyRecords = append(historyRecords, &models.TicketHistoryCreateRequest{
-			TicketID:    id,
-			Action:      models.HistoryActionStatusChange,
-			Description: fmt.Sprintf("状态从「%s」变更为「%s」", getStatusLabel(oldStatus), getStatusLabel(newStatus)),
-			FieldName:   "status",
-			OldValue:    oldStatus,
-			NewValue:    newStatus,
-			IsImportant: getBoolPtr(true),
-		})
-		ticket.Status = models.TicketStatus(*req.Status)
-
-		applyTicketStatusTimestamps(&ticket, *req.Status, time.Now())
-	}
-
-	if req.Priority != nil && models.TicketPriority(*req.Priority) != ticket.Priority {
-		oldPriority := string(ticket.Priority)
-		newPriority := string(*req.Priority)
-		historyRecords = append(historyRecords, &models.TicketHistoryCreateRequest{
-			TicketID:    id,
-			Action:      models.HistoryActionPriorityChange,
-			Description: fmt.Sprintf("优先级从「%s」变更为「%s」", getPriorityLabel(oldPriority), getPriorityLabel(newPriority)),
-			FieldName:   "priority",
-			OldValue:    oldPriority,
-			NewValue:    newPriority,
-			IsImportant: getBoolPtr(true),
-		})
-		ticket.Priority = models.TicketPriority(*req.Priority)
-	}
-
-	if req.Type != nil && models.TicketType(*req.Type) != ticket.Type {
-		oldType := string(ticket.Type)
-		newType := string(*req.Type)
-		historyRecords = append(historyRecords, &models.TicketHistoryCreateRequest{
-			TicketID:    id,
-			Action:      models.HistoryActionUpdate,
-			Description: fmt.Sprintf("类型从「%s」变更为「%s」", oldType, newType),
-			FieldName:   "type",
-			OldValue:    oldType,
-			NewValue:    newType,
-		})
-		ticket.Type = models.TicketType(*req.Type)
-	}
-
-	if req.Source != nil && models.TicketSource(*req.Source) != ticket.Source {
-		oldSource := string(ticket.Source)
-		newSource := string(*req.Source)
-		historyRecords = append(historyRecords, &models.TicketHistoryCreateRequest{
-			TicketID:    id,
-			Action:      models.HistoryActionUpdate,
-			Description: fmt.Sprintf("来源从「%s」变更为「%s」", getSourceLabel(oldSource), getSourceLabel(newSource)),
-			FieldName:   "source",
-			OldValue:    oldSource,
-			NewValue:    newSource,
-		})
-		ticket.Source = models.TicketSource(*req.Source)
-	}
-
-	// 处理分配变更
-	if req.AssignedToID != nil {
-		oldAssigneeID := ticket.AssignedToID
-		newAssigneeID := req.AssignedToID
-
-		// 分配逻辑
-		if oldAssigneeID == nil && newAssigneeID != nil {
-			// 新分配
-			historyRecords = append(historyRecords, &models.TicketHistoryCreateRequest{
-				TicketID:    id,
-				Action:      models.HistoryActionAssign,
-				Description: fmt.Sprintf("工单已分配给用户 ID: %d", *newAssigneeID),
-				FieldName:   "assigned_to_id",
-				OldValue:    "未分配",
-				NewValue:    fmt.Sprintf("%d", *newAssigneeID),
-				IsImportant: getBoolPtr(true),
-			})
-		} else if oldAssigneeID != nil && newAssigneeID != nil && *oldAssigneeID != *newAssigneeID {
-			// 重新分配
-			historyRecords = append(historyRecords, &models.TicketHistoryCreateRequest{
-				TicketID:    id,
-				Action:      models.HistoryActionAssign,
-				Description: fmt.Sprintf("工单从用户 ID: %d 重新分配给用户 ID: %d", *oldAssigneeID, *newAssigneeID),
-				FieldName:   "assigned_to_id",
-				OldValue:    fmt.Sprintf("%d", *oldAssigneeID),
-				NewValue:    fmt.Sprintf("%d", *newAssigneeID),
-				IsImportant: getBoolPtr(true),
-			})
-		} else if oldAssigneeID != nil && newAssigneeID == nil {
-			// 取消分配
-			historyRecords = append(historyRecords, &models.TicketHistoryCreateRequest{
-				TicketID:    id,
-				Action:      models.HistoryActionUnassign,
-				Description: fmt.Sprintf("取消分配给用户 ID: %d", *oldAssigneeID),
-				FieldName:   "assigned_to_id",
-				OldValue:    fmt.Sprintf("%d", *oldAssigneeID),
-				NewValue:    "未分配",
-				IsImportant: getBoolPtr(true),
-			})
-		}
-		ticket.AssignedToID = req.AssignedToID
-	}
-
-	if req.DueDate != nil {
-		ticket.DueDate = req.DueDate
-	}
-	if req.Tags != nil {
-		ticket.Tags = datatypes.JSONSlice[string](req.Tags) // 转换类型
-	}
-	if req.CustomFields != nil {
-		ticket.CustomFields = datatypes.NewJSONType(req.CustomFields.ToMap())
-	}
-
-	ticket.UpdatedAt = time.Now()
-
-	// 在事务中保存工单和历史记录
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// 保存工单更新
-		if err := tx.Save(&ticket).Error; err != nil {
-			return fmt.Errorf("failed to update ticket: %w", err)
-		}
-
-		// 创建历史记录
-		for _, historyReq := range historyRecords {
-			history := &models.TicketHistory{
-				TicketID:    historyReq.TicketID,
-				UserID:      &userID,
-				Action:      historyReq.Action,
-				Description: historyReq.Description,
-				FieldName:   historyReq.FieldName,
-				OldValue:    historyReq.OldValue,
-				NewValue:    historyReq.NewValue,
-				IsVisible:   true,
-				IsSystem:    false,
-				IsAutomated: false,
-				IsImportant: historyReq.IsImportant != nil && *historyReq.IsImportant,
-			}
-
-			if err := tx.Create(history).Error; err != nil {
-				return fmt.Errorf("failed to create history record: %w", err)
-			}
-		}
-
-		return nil
+	result, err := s.agentNative.CreateNativeTicket(ctx, NativeTicketCreateInput{
+		Request:        request,
+		TicketNumber:   s.generateTicketNumber(),
+		Actor:          models.HumanActor(userID),
+		AssignedActor:  assignedActor,
+		SourceProtocol: "rest-human",
+		TrustLevel:     models.TicketTrustLevelUntrusted,
 	})
-
 	if err != nil {
 		return nil, err
 	}
-
-	// 发送通知
-	go func() {
-		// 检查是否有状态变更需要发送通知
-		if req.Status != nil && models.TicketStatus(*req.Status) != originalTicket.Status {
-			if err := s.notificationService.NotifyTicketStatusChanged(ctx, &ticket, originalTicket.Status, userID); err != nil {
-				// 记录错误但不影响主流程
-				fmt.Printf("Failed to send ticket status change notification: %v\n", err)
-			}
-		}
-
-		// 检查是否有分配变更需要发送通知
-		if req.AssignedToID != nil {
-			// 如果之前没有分配或者分配给了不同的人
-			if originalTicket.AssignedToID == nil || *originalTicket.AssignedToID != *req.AssignedToID {
-				if err := s.notificationService.NotifyTicketAssigned(ctx, &ticket, userID); err != nil {
-					fmt.Printf("Failed to send ticket assignment notification: %v\n", err)
-				}
-			}
-		}
-	}()
-
-	return &ticket, nil
+	return s.GetTicket(ctx, result.Ticket.ID)
 }
 
-// AssignTicket assigns a ticket to a user with workflow support
-func (s *TicketService) AssignTicket(ticketID uint, assigneeID uint, userID uint, comment string) (*models.Ticket, error) {
-	ticket, err := s.GetTicket(context.Background(), ticketID)
+// UpdateTicketExpectedVersion binds a prior authorization decision to the
+// exact ticket version that is updated.
+func (s *TicketService) UpdateTicketExpectedVersion(
+	ctx context.Context,
+	id uint,
+	req *models.TicketUpdateRequest,
+	userID uint,
+	expectedVersion uint64,
+) (*models.Ticket, error) {
+	if expectedVersion == 0 {
+		return nil, ErrVersionConflict
+	}
+	if req == nil || userID == 0 {
+		return nil, fmt.Errorf("human ticket update request and actor are required")
+	}
+	current, err := s.GetTicket(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	if current.Version != expectedVersion {
+		return nil, ErrVersionConflict
+	}
+	changes, histories, assignmentResolved, err := s.agentNative.buildHumanTicketUpdate(
+		ctx,
+		current,
+		req,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(changes) == 0 {
+		return current, nil
+	}
+	result, err := s.agentNative.UpdateTicketVersion(ctx, VersionedTicketUpdateInput{
+		TicketID:           id,
+		ExpectedVersion:    expectedVersion,
+		Actor:              models.HumanActor(userID),
+		SourceProtocol:     "rest-human",
+		Changes:            changes,
+		EventType:          eventcontract.TicketUpdatedEventType,
+		EventData:          map[string]any{"ticket_id": id},
+		assignmentResolved: assignmentResolved,
+		historyRecords:     histories,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return s.GetTicket(ctx, result.Ticket.ID)
+}
 
-	oldAssigneeID := ticket.AssignedToID
-	ticket.AssignedToID = &assigneeID
-	ticket.UpdatedAt = time.Now()
-
-	err = s.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Save(ticket).Error; err != nil {
-			return fmt.Errorf("failed to assign ticket: %w", err)
-		}
-
-		historyReq := &models.TicketHistoryCreateRequest{
-			TicketID:    ticketID,
+func (s *TicketService) AssignTicketExpectedVersion(
+	ctx context.Context,
+	ticketID uint,
+	assigneeID uint,
+	userID uint,
+	comment string,
+	expectedVersion uint64,
+) (*models.Ticket, error) {
+	if expectedVersion == 0 {
+		return nil, ErrVersionConflict
+	}
+	ticket, err := s.GetTicket(ctx, ticketID)
+	if err != nil {
+		return nil, err
+	}
+	if ticket.Version != expectedVersion {
+		return nil, ErrVersionConflict
+	}
+	description := fmt.Sprintf("工单分配给用户 ID: %d", assigneeID)
+	if comment != "" {
+		description += fmt.Sprintf(" - %s", comment)
+	}
+	assignee := models.HumanActor(assigneeID)
+	result, err := s.agentNative.AssignTicket(ctx, AssignTicketCommand{
+		TicketID:        ticketID,
+		ExpectedVersion: expectedVersion,
+		Actor:           models.HumanActor(userID),
+		Assignee:        &assignee,
+		SourceProtocol:  "rest-human",
+		Reason:          comment,
+		historyRecords: []ticketHistorySpec{{
 			Action:      models.HistoryActionAssign,
-			Description: fmt.Sprintf("工单分配给用户 ID: %d", assigneeID),
+			Description: description,
 			FieldName:   "assigned_to_id",
-			OldValue:    getAssigneeValue(oldAssigneeID),
-			NewValue:    fmt.Sprintf("%d", assigneeID),
-			IsImportant: getBoolPtr(true),
-		}
-
-		if comment != "" {
-			historyReq.Description += fmt.Sprintf(" - %s", comment)
-		}
-
-		history := &models.TicketHistory{
-			TicketID:    historyReq.TicketID,
-			UserID:      &userID,
-			Action:      historyReq.Action,
-			Description: historyReq.Description,
-			FieldName:   historyReq.FieldName,
-			OldValue:    historyReq.OldValue,
-			NewValue:    historyReq.NewValue,
+			OldValue:    getAssigneeValue(ticket.AssignedToID),
+			NewValue:    strconv.FormatUint(uint64(assigneeID), 10),
 			IsVisible:   true,
-			IsSystem:    false,
-			IsAutomated: false,
 			IsImportant: true,
-		}
-
-		return tx.Create(history).Error
+		}},
 	})
-
 	if err != nil {
 		return nil, err
 	}
-
-	go func() {
-		if err := s.notificationService.NotifyTicketAssigned(context.Background(), ticket, userID); err != nil {
-			fmt.Printf("Failed to send assignment notification: %v\n", err)
-		}
-	}()
-
-	return ticket, nil
+	return s.GetTicket(ctx, result.Ticket.ID)
 }
 
-// TransferTicket transfers a ticket to another user
-func (s *TicketService) TransferTicket(ticketID uint, assigneeID uint, userID uint, comment string, transferReason string) (*models.Ticket, error) {
-	ticket, err := s.GetTicket(context.Background(), ticketID)
+func (s *TicketService) TransferTicketExpectedVersion(
+	ctx context.Context,
+	ticketID uint,
+	assigneeID uint,
+	userID uint,
+	comment string,
+	transferReason string,
+	expectedVersion uint64,
+) (*models.Ticket, error) {
+	if expectedVersion == 0 {
+		return nil, ErrVersionConflict
+	}
+	ticket, err := s.GetTicket(ctx, ticketID)
 	if err != nil {
 		return nil, err
 	}
-
-	oldAssigneeID := ticket.AssignedToID
-	ticket.AssignedToID = &assigneeID
-	ticket.UpdatedAt = time.Now()
-
-	err = s.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Save(ticket).Error; err != nil {
-			return fmt.Errorf("failed to transfer ticket: %w", err)
-		}
-
-		description := fmt.Sprintf("工单从用户 ID: %s 转移给用户 ID: %d", getAssigneeValue(oldAssigneeID), assigneeID)
-		if transferReason != "" {
-			description += fmt.Sprintf(" (原因: %s)", transferReason)
-		}
-		if comment != "" {
-			description += fmt.Sprintf(" - %s", comment)
-		}
-
-		history := &models.TicketHistory{
-			TicketID:    ticketID,
-			UserID:      &userID,
+	if ticket.Version != expectedVersion {
+		return nil, ErrVersionConflict
+	}
+	description := fmt.Sprintf(
+		"工单从用户 ID: %s 转移给用户 ID: %d",
+		getAssigneeValue(ticket.AssignedToID),
+		assigneeID,
+	)
+	if transferReason != "" {
+		description += fmt.Sprintf(" (原因: %s)", transferReason)
+	}
+	if comment != "" {
+		description += fmt.Sprintf(" - %s", comment)
+	}
+	assignee := models.HumanActor(assigneeID)
+	result, err := s.agentNative.AssignTicket(ctx, AssignTicketCommand{
+		TicketID:        ticketID,
+		ExpectedVersion: expectedVersion,
+		Actor:           models.HumanActor(userID),
+		Assignee:        &assignee,
+		SourceProtocol:  "rest-human",
+		Reason:          transferReason,
+		historyRecords: []ticketHistorySpec{{
 			Action:      models.HistoryActionTransfer,
 			Description: description,
 			FieldName:   "assigned_to_id",
-			OldValue:    getAssigneeValue(oldAssigneeID),
-			NewValue:    fmt.Sprintf("%d", assigneeID),
+			OldValue:    getAssigneeValue(ticket.AssignedToID),
+			NewValue:    strconv.FormatUint(uint64(assigneeID), 10),
 			IsVisible:   true,
-			IsSystem:    false,
-			IsAutomated: false,
 			IsImportant: true,
-		}
-
-		return tx.Create(history).Error
+		}},
 	})
-
 	if err != nil {
 		return nil, err
 	}
-
-	return ticket, nil
+	return s.GetTicket(ctx, result.Ticket.ID)
 }
 
-// EscalateTicket escalates a ticket to a higher level
-func (s *TicketService) EscalateTicket(ticketID uint, escalateToID uint, userID uint, reason string, comment string) (*models.Ticket, error) {
-	ticket, err := s.GetTicket(context.Background(), ticketID)
+func (s *TicketService) EscalateTicketExpectedVersion(
+	ctx context.Context,
+	ticketID uint,
+	escalateToID uint,
+	userID uint,
+	reason string,
+	comment string,
+	expectedVersion uint64,
+) (*models.Ticket, error) {
+	if expectedVersion == 0 {
+		return nil, ErrVersionConflict
+	}
+	ticket, err := s.GetTicket(ctx, ticketID)
 	if err != nil {
 		return nil, err
 	}
-
-	oldAssigneeID := ticket.AssignedToID
-	oldPriority := ticket.Priority
-
-	ticket.AssignedToID = &escalateToID
-	ticket.IsEscalated = true
-	switch ticket.Priority {
-	case models.TicketPriorityLow:
-		ticket.Priority = models.TicketPriorityNormal
-	case models.TicketPriorityNormal:
-		ticket.Priority = models.TicketPriorityHigh
-	case models.TicketPriorityHigh:
-		ticket.Priority = models.TicketPriorityUrgent
-	case models.TicketPriorityUrgent:
-		ticket.Priority = models.TicketPriorityCritical
+	if ticket.Version != expectedVersion {
+		return nil, ErrVersionConflict
 	}
-	ticket.UpdatedAt = time.Now()
-
-	err = s.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Save(ticket).Error; err != nil {
-			return fmt.Errorf("failed to escalate ticket: %w", err)
-		}
-
-		description := fmt.Sprintf("工单升级到用户 ID: %d", escalateToID)
-		if reason != "" {
-			description += fmt.Sprintf(" (原因: %s)", reason)
-		}
-		if comment != "" {
-			description += fmt.Sprintf(" - %s", comment)
-		}
-
-		history := &models.TicketHistory{
-			TicketID:    ticketID,
-			UserID:      &userID,
+	nextPriority := escalatedPriority(ticket.Priority)
+	description := fmt.Sprintf("工单升级到用户 ID: %d", escalateToID)
+	if reason != "" {
+		description += fmt.Sprintf(" (原因: %s)", reason)
+	}
+	if comment != "" {
+		description += fmt.Sprintf(" - %s", comment)
+	}
+	assignee := models.HumanActor(escalateToID)
+	result, err := s.agentNative.EscalateTicket(ctx, EscalateTicketCommand{
+		TicketID:        ticketID,
+		ExpectedVersion: expectedVersion,
+		Actor:           models.HumanActor(userID),
+		Priority:        &nextPriority,
+		Assignee:        &assignee,
+		SourceProtocol:  "rest-human",
+		Reason:          reason,
+		Comment:         comment,
+		historyRecords: []ticketHistorySpec{{
 			Action:      models.HistoryActionEscalate,
 			Description: description,
 			FieldName:   "escalation",
-			OldValue:    fmt.Sprintf("assigned_to: %s, priority: %s", getAssigneeValue(oldAssigneeID), string(oldPriority)),
-			NewValue:    fmt.Sprintf("assigned_to: %d, priority: %s", escalateToID, string(ticket.Priority)),
+			OldValue: fmt.Sprintf(
+				"assigned_to: %s, priority: %s",
+				getAssigneeValue(ticket.AssignedToID),
+				ticket.Priority,
+			),
+			NewValue: fmt.Sprintf(
+				"assigned_to: %d, priority: %s",
+				escalateToID,
+				nextPriority,
+			),
 			IsVisible:   true,
-			IsSystem:    false,
-			IsAutomated: false,
 			IsImportant: true,
-		}
-
-		return tx.Create(history).Error
+		}},
 	})
-
 	if err != nil {
 		return nil, err
 	}
-
-	return ticket, nil
+	return s.GetTicket(ctx, result.Ticket.ID)
 }
 
-// UpdateTicketStatus updates ticket status with workflow support
-func (s *TicketService) UpdateTicketStatus(ticketID uint, status string, userID uint, comment string, resolutionNotes string) (*models.Ticket, error) {
-	ticket, err := s.GetTicket(context.Background(), ticketID)
+func (s *TicketService) UpdateTicketStatusExpectedVersion(
+	ctx context.Context,
+	ticketID uint,
+	status string,
+	userID uint,
+	comment string,
+	resolutionNotes string,
+	expectedVersion uint64,
+) (*models.Ticket, error) {
+	if expectedVersion == 0 {
+		return nil, ErrVersionConflict
+	}
+	ticket, err := s.GetTicket(ctx, ticketID)
 	if err != nil {
 		return nil, err
 	}
-
+	if ticket.Version != expectedVersion {
+		return nil, ErrVersionConflict
+	}
 	nextStatus := models.TicketStatus(status)
 	if !nextStatus.IsValid() || !ticket.Status.CanTransitionTo(nextStatus) {
 		return nil, fmt.Errorf("%w: %s to %s", ErrInvalidTicketTransition, ticket.Status, nextStatus)
@@ -769,54 +566,41 @@ func (s *TicketService) UpdateTicketStatus(ticketID uint, status string, userID 
 	if ticket.Status == nextStatus {
 		return ticket, nil
 	}
-
 	oldStatus := ticket.Status
-	ticket.Status = nextStatus
-	ticket.UpdatedAt = time.Now()
-
-	applyTicketStatusTimestamps(ticket, nextStatus, time.Now())
-
-	err = s.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Save(ticket).Error; err != nil {
-			return fmt.Errorf("failed to update ticket status: %w", err)
-		}
-
-		description := fmt.Sprintf("状态从「%s」变更为「%s」", getStatusLabel(string(oldStatus)), getStatusLabel(status))
-		if comment != "" {
-			description += fmt.Sprintf(" - %s", comment)
-		}
-		if resolutionNotes != "" && status == "resolved" {
-			description += fmt.Sprintf(" (解决方案: %s)", resolutionNotes)
-		}
-
-		history := &models.TicketHistory{
-			TicketID:    ticketID,
-			UserID:      &userID,
+	description := fmt.Sprintf(
+		"状态从「%s」变更为「%s」",
+		getStatusLabel(string(oldStatus)),
+		getStatusLabel(status),
+	)
+	if comment != "" {
+		description += fmt.Sprintf(" - %s", comment)
+	}
+	if resolutionNotes != "" && nextStatus == models.TicketStatusResolved {
+		description += fmt.Sprintf(" (解决方案: %s)", resolutionNotes)
+	}
+	result, err := s.agentNative.TransitionTicket(ctx, TransitionTicketCommand{
+		TicketID:        ticketID,
+		ExpectedVersion: expectedVersion,
+		Actor:           models.HumanActor(userID),
+		Status:          nextStatus,
+		SourceProtocol:  "rest-human",
+		Reason:          comment,
+		Comment:         comment,
+		ResolutionNotes: resolutionNotes,
+		historyRecords: []ticketHistorySpec{{
 			Action:      models.HistoryActionStatusChange,
 			Description: description,
 			FieldName:   "status",
 			OldValue:    string(oldStatus),
-			NewValue:    status,
+			NewValue:    string(nextStatus),
 			IsVisible:   true,
-			IsSystem:    false,
-			IsAutomated: false,
 			IsImportant: true,
-		}
-
-		return tx.Create(history).Error
+		}},
 	})
-
 	if err != nil {
 		return nil, err
 	}
-
-	go func() {
-		if err := s.notificationService.NotifyTicketStatusChanged(context.Background(), ticket, oldStatus, userID); err != nil {
-			fmt.Printf("Failed to send status change notification: %v\n", err)
-		}
-	}()
-
-	return ticket, nil
+	return s.GetTicket(ctx, result.Ticket.ID)
 }
 
 // GetTicketStatistics returns enhanced statistics for dashboard
@@ -844,10 +628,7 @@ func (s *TicketService) GetTicketStatistics(userID uint, role string) (*TicketSt
 	}
 
 	now := time.Now()
-	query := s.db.Model(&models.Ticket{})
-	if role == "agent" {
-		query = query.Where("assigned_to_id = ?", userID)
-	}
+	query := scopeHumanTicketQuery(s.db.Model(&models.Ticket{}), userID, role)
 
 	var aggregated struct {
 		Total        int64
@@ -890,7 +671,8 @@ func (s *TicketService) GetTicketStatistics(userID uint, role string) (*TicketSt
 	stats.HighPriority = aggregated.HighPriority
 	stats.SLABreached = aggregated.SLABreached
 	stats.Escalated = aggregated.Escalated
-	if role == "agent" {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case string(models.RoleAgent), string(models.RoleCustomer):
 		stats.MyTickets = stats.Total
 	}
 
@@ -899,10 +681,7 @@ func (s *TicketService) GetTicketStatistics(userID uint, role string) (*TicketSt
 		Count    int64
 	}{}
 
-	priorityQuery := s.db.Model(&models.Ticket{})
-	if role == "agent" {
-		priorityQuery = priorityQuery.Where("assigned_to_id = ?", userID)
-	}
+	priorityQuery := scopeHumanTicketQuery(s.db.Model(&models.Ticket{}), userID, role)
 
 	if err := priorityQuery.
 		Select("priority, count(*) as count").
@@ -999,10 +778,7 @@ func (s *TicketService) GetOverdueTickets(userID uint, role string) ([]*models.T
 	now := time.Now()
 	query := s.db.Model(&models.Ticket{}).
 		Where("due_date < ? AND status NOT IN (?, ?)", now, models.TicketStatusResolved, models.TicketStatusClosed)
-
-	if role == "agent" {
-		query = query.Where("assigned_to_id = ?", userID)
-	}
+	query = scopeHumanTicketQuery(query, userID, role)
 
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to count overdue tickets: %w", err)
@@ -1032,10 +808,7 @@ func (s *TicketService) GetSLABreachedTickets(userID uint, role string) ([]*mode
 			models.TicketStatusResolved,
 			models.TicketStatusClosed,
 		)
-
-	if role == "agent" {
-		query = query.Where("tickets.assigned_to_id = ?", userID)
-	}
+	query = scopeHumanTicketQuery(query, userID, role)
 
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to count SLA breached tickets: %w", err)
@@ -1051,44 +824,19 @@ func (s *TicketService) GetSLABreachedTickets(userID uint, role string) ([]*mode
 	return tickets, total, nil
 }
 
-// BulkAssignTickets assigns multiple tickets to a user
-func (s *TicketService) BulkAssignTickets(ticketIDs []uint, assigneeID uint, userID uint, comment string) (*BulkOperationResult, error) {
-	result := &BulkOperationResult{
-		AssignedTickets: []uint{},
-		FailedTickets:   []uint{},
+func scopeHumanTicketQuery(query *gorm.DB, userID uint, role string) *gorm.DB {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case string(models.RoleCustomer):
+		return query.Where("tickets.created_by_id = ?", userID)
+	case string(models.RoleAgent):
+		return query.Where("tickets.assigned_to_id = ?", userID)
+	case string(models.RoleSupervisor), string(models.RoleAdmin):
+		return query
+	default:
+		// Authentication currently rejects unknown roles. Keep the data layer
+		// fail-closed as defense in depth for direct service callers.
+		return query.Where("1 = 0")
 	}
-
-	for _, ticketID := range ticketIDs {
-		if _, err := s.AssignTicket(ticketID, assigneeID, userID, comment); err != nil {
-			result.FailedTickets = append(result.FailedTickets, ticketID)
-			result.FailedCount++
-		} else {
-			result.AssignedTickets = append(result.AssignedTickets, ticketID)
-			result.AssignedCount++
-		}
-	}
-
-	return result, nil
-}
-
-// BulkUpdateStatus updates status for multiple tickets
-func (s *TicketService) BulkUpdateStatus(ticketIDs []uint, status string, userID uint, comment string) (*BulkOperationResult, error) {
-	result := &BulkOperationResult{
-		UpdatedTickets: []uint{},
-		FailedTickets:  []uint{},
-	}
-
-	for _, ticketID := range ticketIDs {
-		if _, err := s.UpdateTicketStatus(ticketID, status, userID, comment, ""); err != nil {
-			result.FailedTickets = append(result.FailedTickets, ticketID)
-			result.FailedCount++
-		} else {
-			result.UpdatedTickets = append(result.UpdatedTickets, ticketID)
-			result.UpdatedCount++
-		}
-	}
-
-	return result, nil
 }
 
 // GetTicketHistory gets the history for a specific ticket
@@ -1132,204 +880,199 @@ func parseCommaSeparated(value string) []string {
 	return parts
 }
 
-// DeleteTicket deletes a ticket
-func (s *TicketService) DeleteTicket(ctx context.Context, id uint, userID uint, userRole string) error {
+// DeleteTicketExpectedVersion deletes a ticket only when the caller's list or
+// detail snapshot still matches the current resource version.
+func (s *TicketService) DeleteTicketExpectedVersion(
+	ctx context.Context,
+	id uint,
+	userID uint,
+	userRole string,
+	expectedVersion uint64,
+) error {
+	if expectedVersion == 0 {
+		return ErrVersionConflict
+	}
 	ticket, err := s.GetTicket(ctx, id)
 	if err != nil {
 		return err
 	}
+	if ticket.Version != expectedVersion {
+		return ErrVersionConflict
+	}
 
-	// Check if user has permission to delete (creator or admin)
-	if ticket.CreatedByID != userID {
+	// Creators and queue administrators may delete. Object authorization in the
+	// handler applies the same supervisor/admin visibility rule.
+	if ticket.CreatedByID == nil || *ticket.CreatedByID != userID {
 		if !isElevatedRole(userRole) {
 			return fmt.Errorf("permission denied")
 		}
 	}
 
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("related_ticket_id = ?", id).Delete(&models.Notification{}).Error; err != nil {
-			return fmt.Errorf("failed to delete ticket notifications: %w", err)
-		}
-		if err := tx.Where("ticket_id = ?", id).Delete(&models.TicketHistory{}).Error; err != nil {
-			return fmt.Errorf("failed to delete ticket histories: %w", err)
-		}
-		if err := tx.Where("ticket_id = ?", id).Delete(&models.TicketAttachment{}).Error; err != nil {
-			return fmt.Errorf("failed to delete ticket attachments: %w", err)
-		}
-		if err := tx.Where("ticket_id = ?", id).Delete(&models.TicketComment{}).Error; err != nil {
-			return fmt.Errorf("failed to delete ticket comments: %w", err)
-		}
-		if err := tx.Delete(ticket).Error; err != nil {
-			return fmt.Errorf("failed to delete ticket: %w", err)
-		}
-		return nil
+	_, err = s.agentNative.DeleteTicket(ctx, DeleteTicketCommand{
+		TicketID:        id,
+		ExpectedVersion: expectedVersion,
+		Actor:           models.HumanActor(userID),
+		SourceProtocol:  "rest-human",
 	})
+	return err
 }
 
 func isElevatedRole(role string) bool {
-	switch strings.ToLower(role) {
-	case "admin", "superuser", "super_admin", "super-user":
+	switch models.UserRole(strings.ToLower(strings.TrimSpace(role))) {
+	case models.RoleAdmin, models.RoleSupervisor:
 		return true
 	default:
 		return false
 	}
 }
 
-// GetTicketStats returns ticket statistics
-func (s *TicketService) GetTicketStats(ctx context.Context, userID uint) (*TicketStats, error) {
-	stats := &TicketStats{}
-
-	// Count total tickets
-	if err := s.db.WithContext(ctx).Model(&models.Ticket{}).Count(&stats.Total).Error; err != nil {
-		return nil, fmt.Errorf("failed to count total tickets: %w", err)
-	}
-
-	// Count by status
-	if err := s.db.WithContext(ctx).Model(&models.Ticket{}).Where("status = ?", models.TicketStatusOpen).Count(&stats.Open).Error; err != nil {
-		return nil, fmt.Errorf("failed to count open tickets: %w", err)
-	}
-
-	if err := s.db.WithContext(ctx).Model(&models.Ticket{}).Where("status = ?", models.TicketStatusInProgress).Count(&stats.InProgress).Error; err != nil {
-		return nil, fmt.Errorf("failed to count in progress tickets: %w", err)
-	}
-
-	if err := s.db.WithContext(ctx).Model(&models.Ticket{}).Where("status = ?", models.TicketStatusResolved).Count(&stats.Resolved).Error; err != nil {
-		return nil, fmt.Errorf("failed to count resolved tickets: %w", err)
-	}
-
-	if err := s.db.WithContext(ctx).Model(&models.Ticket{}).Where("status = ?", models.TicketStatusClosed).Count(&stats.Closed).Error; err != nil {
-		return nil, fmt.Errorf("failed to count closed tickets: %w", err)
-	}
-
-	// Count overdue tickets
-	now := time.Now()
-	if err := s.db.WithContext(ctx).Model(&models.Ticket{}).
-		Where("due_date < ? AND status NOT IN (?, ?)", now, models.TicketStatusResolved, models.TicketStatusClosed).
-		Count(&stats.Overdue).Error; err != nil {
-		return nil, fmt.Errorf("failed to count overdue tickets: %w", err)
-	}
-
-	return stats, nil
+// BulkUpdateTickets updates multiple version-bound tickets atomically.
+func (s *TicketService) BulkUpdateTickets(
+	ctx context.Context,
+	req *BulkUpdateRequest,
+	userID uint,
+) (*BulkUpdateResult, error) {
+	return s.agentNative.BulkUpdateHumanTickets(ctx, req, userID)
 }
 
-// BulkUpdateTickets updates multiple tickets
-func (s *TicketService) BulkUpdateTickets(ctx context.Context, req *BulkUpdateRequest, userID uint) error {
-	if len(req.TicketIDs) == 0 {
-		return fmt.Errorf("no ticket IDs provided")
+func bulkTicketEventType(changedFields []string) string {
+	for _, field := range changedFields {
+		if field == "status" {
+			return eventcontract.TicketTransitionedEventType
+		}
 	}
+	for _, field := range changedFields {
+		if field == "assigned_to_id" {
+			return eventcontract.TicketAssignedEventType
+		}
+	}
+	return eventcontract.TicketUpdatedEventType
+}
 
-	updates := make(map[string]interface{})
+func normalizedBulkTicketPreconditions(
+	input []TicketVersionPrecondition,
+) ([]TicketVersionPrecondition, error) {
+	preconditions := append([]TicketVersionPrecondition(nil), input...)
+	seen := make(map[uint]struct{}, len(preconditions))
+	for _, precondition := range preconditions {
+		if precondition.ID == 0 {
+			return nil, fmt.Errorf(
+				"%w: ticket IDs must be positive",
+				ErrInvalidBulkTicketUpdate,
+			)
+		}
+		if precondition.Version == 0 {
+			return nil, fmt.Errorf(
+				"%w: ticket %d version must be positive",
+				ErrInvalidBulkTicketUpdate,
+				precondition.ID,
+			)
+		}
+		if _, exists := seen[precondition.ID]; exists {
+			return nil, fmt.Errorf(
+				"%w: duplicate ticket ID %d",
+				ErrInvalidBulkTicketUpdate,
+				precondition.ID,
+			)
+		}
+		seen[precondition.ID] = struct{}{}
+	}
+	sort.Slice(preconditions, func(left, right int) bool {
+		return preconditions[left].ID < preconditions[right].ID
+	})
+	return preconditions, nil
+}
 
+func bulkTicketChanges(req *BulkUpdateRequest) (map[string]any, []string, error) {
+	raw := make(map[string]any)
 	if req.Status != nil {
-		nextStatus := models.TicketStatus(*req.Status)
-		if !nextStatus.IsValid() {
-			return fmt.Errorf("invalid ticket status: %s", *req.Status)
+		status := models.TicketStatus(strings.TrimSpace(*req.Status))
+		if !status.IsValid() {
+			return nil, nil, fmt.Errorf(
+				"%w: invalid ticket status %q",
+				ErrInvalidBulkTicketUpdate,
+				*req.Status,
+			)
 		}
-		var tickets []models.Ticket
-		if err := s.db.WithContext(ctx).Select("id", "status").Where("id IN ?", req.TicketIDs).Find(&tickets).Error; err != nil {
-			return fmt.Errorf("failed to validate ticket status transitions: %w", err)
-		}
-		if len(tickets) != len(req.TicketIDs) {
-			return fmt.Errorf("one or more tickets were not found")
-		}
-		for _, ticket := range tickets {
-			if !ticket.Status.CanTransitionTo(nextStatus) {
-				return fmt.Errorf("%w: ticket %d from %s to %s", ErrInvalidTicketTransition, ticket.ID, ticket.Status, nextStatus)
-			}
-		}
-		updates["status"] = *req.Status
-		switch nextStatus {
-		case models.TicketStatusResolved:
-			updates["resolved_at"] = gorm.Expr("COALESCE(resolved_at, ?)", time.Now())
-		case models.TicketStatusClosed:
-			updates["closed_at"] = gorm.Expr("COALESCE(closed_at, ?)", time.Now())
-		case models.TicketStatusOpen:
-			updates["resolved_at"] = nil
-			updates["closed_at"] = nil
-		}
+		raw["status"] = status
 	}
 	if req.Priority != nil {
-		if !models.TicketPriority(*req.Priority).IsValid() {
-			return fmt.Errorf("invalid ticket priority: %s", *req.Priority)
+		priority := models.TicketPriority(strings.TrimSpace(*req.Priority))
+		if !priority.IsValid() {
+			return nil, nil, fmt.Errorf(
+				"%w: invalid ticket priority %q",
+				ErrInvalidBulkTicketUpdate,
+				*req.Priority,
+			)
 		}
-		updates["priority"] = *req.Priority
+		raw["priority"] = priority
 	}
 	if req.AssignedToID != nil {
-		updates["assigned_to_id"] = *req.AssignedToID
+		if *req.AssignedToID == 0 {
+			return nil, nil, fmt.Errorf(
+				"%w: assigned_to_id must be positive",
+				ErrInvalidBulkTicketUpdate,
+			)
+		}
+		raw["assigned_to_id"] = *req.AssignedToID
+		raw["assigned_to_actor_type"] = models.ActorTypeHuman
+		raw["assigned_to_actor_id"] = models.HumanActor(*req.AssignedToID).ID
+		raw["assigned_to_service_principal_id"] = nil
 	}
 	if req.Tags != nil {
-		updates["tags"] = req.Tags
+		raw["tags"] = append([]string(nil), req.Tags...)
 	}
 	if req.CustomFields != nil {
-		customFieldsBytes, _ := json.Marshal(req.CustomFields)
-		updates["custom_fields"] = string(customFieldsBytes)
+		raw["custom_fields"] = req.CustomFields
 	}
-
-	updates["updated_at"] = time.Now()
-
-	if err := s.db.WithContext(ctx).Model(&models.Ticket{}).
-		Where("id IN ?", req.TicketIDs).
-		Updates(updates).Error; err != nil {
-		return fmt.Errorf("failed to bulk update tickets: %w", err)
+	if len(raw) == 0 {
+		return nil, nil, fmt.Errorf(
+			"%w: no ticket changes provided",
+			ErrInvalidBulkTicketUpdate,
+		)
 	}
-
-	return nil
+	changes, fields, err := sanitizeTicketChanges(raw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", ErrInvalidBulkTicketUpdate, err)
+	}
+	return changes, fields, nil
 }
 
-// CreateTicketHistory creates a new ticket history record
-func (s *TicketService) CreateTicketHistory(ctx context.Context, req *models.TicketHistoryCreateRequest, userID *uint) error {
-	history := &models.TicketHistory{
-		TicketID:     req.TicketID,
-		UserID:       userID,
-		Action:       req.Action,
-		Description:  req.Description,
-		FieldName:    req.FieldName,
-		OldValue:     req.OldValue,
-		NewValue:     req.NewValue,
-		CommentID:    req.CommentID,
-		AttachmentID: req.AttachmentID,
-		IsVisible:    true,
-		IsSystem:     false,
-		IsAutomated:  false,
-		IsImportant:  false,
+func cloneBulkTicketChanges(input map[string]any) map[string]any {
+	result := make(map[string]any, len(input)+4)
+	for field, value := range input {
+		result[field] = value
 	}
-
-	// 设置可选字段
-	if req.IsVisible != nil {
-		history.IsVisible = *req.IsVisible
-	}
-	if req.IsImportant != nil {
-		history.IsImportant = *req.IsImportant
-	}
-
-	// 处理JSON字段
-	if req.Details != nil {
-		detailsJSON, _ := json.Marshal(req.Details)
-		history.Details = string(detailsJSON)
-	}
-	if req.Metadata != nil {
-		metadataJSON, _ := json.Marshal(req.Metadata)
-		history.Metadata = string(metadataJSON)
-	}
-
-	// 如果没有用户ID，设置为系统操作
-	if userID == nil {
-		history.IsSystem = true
-	}
-
-	// 保存历史记录
-	if err := s.db.WithContext(ctx).Create(history).Error; err != nil {
-		return fmt.Errorf("failed to create ticket history: %w", err)
-	}
-
-	return nil
+	return result
 }
 
-// Helper functions
+func bulkHistoryFieldName(fields []string) string {
+	if len(fields) == 1 {
+		return fields[0]
+	}
+	return "bulk_update"
+}
 
-// getBoolPtr returns a pointer to a boolean value
-func getBoolPtr(b bool) *bool {
-	return &b
+func ticketFieldValueBeforeChange(changeSet map[string]any, field string, side string) any {
+	change, ok := changeSet[field].(map[string]any)
+	if !ok {
+		return nil
+	}
+	return change[side]
+}
+
+func bulkAuditValue(value any) string {
+	if value == nil {
+		return ""
+	}
+	if text, ok := value.(string); ok {
+		return text
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Sprint(value)
+	}
+	return string(encoded)
 }
 
 // truncateString truncates a string to the specified length
@@ -1397,6 +1140,7 @@ func getSourceLabel(source string) string {
 		"chat":   "聊天",
 		"api":    "API",
 		"mobile": "移动端",
+		"agent":  "AI Agent",
 	}
 	if label, exists := labels[source]; exists {
 		return label

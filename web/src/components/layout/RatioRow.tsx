@@ -24,9 +24,10 @@ export const RatioRow: React.FC<React.PropsWithChildren<RatioRowProps>> = ({
     <Stack
       direction={isDown ? 'column' : 'row'}
       spacing={gap}
-      alignItems="stretch"
       {...stackProps}
-    >
+      sx={[{
+        alignItems: "stretch"
+      }, ...(Array.isArray(stackProps.sx) ? stackProps.sx : [stackProps.sx])]}>
       {items.map((child, index) => (
         <Box
           key={index}
@@ -41,5 +42,5 @@ export const RatioRow: React.FC<React.PropsWithChildren<RatioRowProps>> = ({
         </Box>
       ))}
     </Stack>
-  )
+  );
 }

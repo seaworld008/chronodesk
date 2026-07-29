@@ -1,11 +1,12 @@
 import React from 'react'
-import { Edit, Toolbar, SaveButton, DeleteButton, TopToolbar, ListButton, ShowButton } from 'react-admin'
+import { Edit, Toolbar, SaveButton, TopToolbar, ListButton, ShowButton } from 'react-admin'
 import AutomationRuleForm, { buildTransform } from './AutomationRuleForm'
+import { FocusSafeDeleteButton } from '@/components/actions/FocusSafeDeleteButtons'
 
 const RuleEditToolbar: React.FC = () => (
   <Toolbar>
     <SaveButton />
-    <DeleteButton redirect="list" mutationMode="pessimistic" />
+    <FocusSafeDeleteButton redirect="list" mutationMode="pessimistic" />
   </Toolbar>
 )
 

@@ -1,0 +1,238 @@
+.cd-enterprise-table {
+  font-variant-numeric: tabular-nums;
+}
+
+.cd-enterprise-table .MuiTableCell-root,
+.cd-enterprise-table .RaDatagrid-headerCell,
+.cd-enterprise-table .RaDatagrid-rowCell {
+  box-sizing: border-box;
+  min-width: 0;
+  overflow: hidden;
+  padding-block: 0.375rem;
+  padding-inline: 0.625rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cd-enterprise-table .MuiTableCell-head,
+.cd-enterprise-table .RaDatagrid-headerCell {
+  background: var(--cd-table-header-background, #f8fafc);
+  color: var(--cd-table-header-color, #475569);
+  font-size: 0.75rem;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+
+.cd-enterprise-table .MuiTableCell-body,
+.cd-enterprise-table .RaDatagrid-rowCell {
+  font-size: 0.8125rem;
+  line-height: 1.25rem;
+}
+
+.cd-enterprise-table .MuiButton-root,
+.cd-enterprise-table .MuiIconButton-root,
+.cd-enterprise-table .MuiChip-root,
+.cd-enterprise-table .MuiStack-root {
+  flex-wrap: nowrap;
+  white-space: nowrap;
+}
+
+.cd-enterprise-table .MuiTableCell-root > *,
+.cd-enterprise-table .RaDatagrid-rowCell > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.cd-enterprise-table .cd-table-cell-multiline {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.cd-enterprise-table .cd-table-actions {
+  display: inline-flex;
+  flex-wrap: nowrap;
+  gap: 0.25rem;
+  white-space: nowrap;
+}
+
+.cd-resizable-header-content {
+  position: relative;
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  padding-right: 0.5rem;
+}
+
+.cd-resizable-header-label {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cd-resizable-header-label .MuiTableSortLabel-root {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.cd-resizable-header-label .MuiTableSortLabel-root > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cd-column-resize-handle {
+  position: absolute;
+  z-index: 6;
+  top: -0.625rem;
+  right: -0.625rem;
+  bottom: -0.625rem;
+  width: 0.75rem;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.cd-column-resize-handle::after {
+  position: absolute;
+  top: 0.375rem;
+  right: 0.3125rem;
+  bottom: 0.375rem;
+  width: 0.125rem;
+  border-radius: 999px;
+  background: #cbd5e1;
+  content: "";
+  opacity: 0;
+  transition: background-color 120ms ease, opacity 120ms ease;
+}
+
+.cd-column-resize-handle:hover::after,
+.cd-column-resize-handle:focus-visible::after,
+.cd-column-resize-handle[data-resizing]::after {
+  background: #2563eb;
+  opacity: 1;
+}
+
+.cd-column-resize-handle:focus-visible {
+  outline: 0.125rem solid #60a5fa;
+  outline-offset: -0.125rem;
+}
+
+.cd-table-is-resizing,
+.cd-table-is-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+.cd-enterprise-table .cd-table-selection-column,
+.cd-enterprise-table .MuiTableCell-root:has(.select-item),
+.cd-enterprise-table .MuiTableCell-root:has(.select-all) {
+  position: sticky;
+  z-index: 3;
+  left: 0;
+  width: 3.25rem;
+  min-width: 3.25rem;
+  max-width: 3.25rem;
+  border-right: 1px solid #e2e8f0;
+  background-color: #fff;
+  box-shadow: 0.375rem 0 0.625rem -0.625rem rgb(15 23 42 / 35%);
+}
+
+.cd-enterprise-table .cd-table-sticky-right {
+  position: sticky;
+  z-index: 3;
+  right: 0;
+  border-left: 1px solid #e2e8f0;
+  background-color: #fff;
+  box-shadow: -0.375rem 0 0.625rem -0.625rem rgb(15 23 42 / 35%);
+}
+
+.cd-enterprise-table .cd-table-sticky-left {
+  position: sticky;
+  z-index: 3;
+  left: 0;
+  border-right: 1px solid #e2e8f0;
+  background-color: #fff;
+  box-shadow: 0.375rem 0 0.625rem -0.625rem rgb(15 23 42 / 35%);
+}
+
+.cd-enterprise-table thead .cd-table-selection-column,
+.cd-enterprise-table thead .cd-table-sticky-left,
+.cd-enterprise-table thead .cd-table-sticky-right {
+  z-index: 5;
+  background-color: var(--cd-table-header-background, #f8fafc);
+}
+
+.cd-enterprise-table tbody tr:hover > .cd-table-selection-column,
+.cd-enterprise-table tbody tr:hover > .cd-table-sticky-left,
+.cd-enterprise-table tbody tr:hover > .cd-table-sticky-right,
+.cd-enterprise-table tbody tr:hover > .MuiTableCell-root:has(.select-item) {
+  background-color: #f8fafc;
+}
+
+.cd-enterprise-table tbody tr.Mui-selected > .cd-table-selection-column,
+.cd-enterprise-table tbody tr.Mui-selected > .cd-table-sticky-left,
+.cd-enterprise-table tbody tr.Mui-selected > .cd-table-sticky-right,
+.cd-enterprise-table tbody tr.Mui-selected > .MuiTableCell-root:has(.select-item) {
+  background-color: #eff6ff;
+}
+
+.RaDatagrid-root {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0 !important;
+}
+
+.RaDatagrid-root > div,
+.RaDatagrid-tableWrapper,
+.MuiTableContainer-root {
+  contain: inline-size;
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  scrollbar-gutter: stable;
+  -webkit-overflow-scrolling: touch;
+}
+
+.layout,
+.RaLayout-root {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0 !important;
+  overflow-x: hidden;
+}
+
+.RaLayout-appFrame,
+.RaLayout-contentWithSidebar,
+.RaLayout-content,
+.RaList-root,
+.RaList-main,
+.RaList-content,
+#main-content > * {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.RaLayout-content .MuiBox-root:has(> .MuiTableContainer-root),
+.RaLayout-content .MuiPaper-root:has(> .MuiTableContainer-root),
+.RaLayout-content .RaList-content:has(.RaDatagrid-root) {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+
+@media (max-width: 47.99rem) {
+  .cd-enterprise-table .MuiTableCell-root,
+  .cd-enterprise-table .RaDatagrid-headerCell,
+  .cd-enterprise-table .RaDatagrid-rowCell {
+    padding-inline: 0.5rem;
+  }
+}

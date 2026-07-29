@@ -2,6 +2,8 @@ package models
 
 import (
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // UserRole 用户角色枚举
@@ -13,6 +15,16 @@ const (
 	RoleCustomer   UserRole = "customer"   // 客户
 	RoleSupervisor UserRole = "supervisor" // 主管
 )
+
+// IsValid reports whether the role belongs to the closed human-role set.
+func (r UserRole) IsValid() bool {
+	switch r {
+	case RoleAdmin, RoleSupervisor, RoleAgent, RoleCustomer:
+		return true
+	default:
+		return false
+	}
+}
 
 // UserStatus 用户状态枚举
 type UserStatus string
@@ -26,10 +38,10 @@ const (
 
 // User 用户模型
 type User struct {
-	ID        uint       `json:"id" gorm:"primaryKey;autoIncrement"`
-	CreatedAt time.Time  `json:"created_at" gorm:"autoCreateTime"`
-	UpdatedAt time.Time  `json:"updated_at" gorm:"autoUpdateTime"`
-	DeletedAt *time.Time `json:"deleted_at,omitempty" gorm:"index"`
+	ID        uint           `json:"id" gorm:"primaryKey;autoIncrement"`
+	CreatedAt time.Time      `json:"created_at" gorm:"autoCreateTime"`
+	UpdatedAt time.Time      `json:"updated_at" gorm:"autoUpdateTime"`
+	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
 
 	// 基本信息
 	Username     string `json:"username" gorm:"uniqueIndex;size:50;not null" validate:"required,min=3,max=50"`
@@ -46,7 +58,7 @@ type User struct {
 	Language    string `json:"language" gorm:"size:10;default:'zh-CN'"`
 
 	// 角色和权限
-	Role        UserRole   `json:"role" gorm:"size:20;not null;default:'customer';index" validate:"required,oneof=admin agent customer supervisor"`
+	Role        UserRole   `json:"role" gorm:"size:20;not null;default:'customer';index;check:chk_users_role,role IN ('admin','supervisor','agent','customer')" validate:"required,oneof=admin supervisor agent customer"`
 	Status      UserStatus `json:"status" gorm:"size:20;not null;default:'inactive';index" validate:"required,oneof=active inactive suspended deleted"`
 	Permissions string     `json:"permissions" gorm:"type:text"` // JSON格式存储权限列表
 
@@ -66,6 +78,10 @@ type User struct {
 	LockedUntil        *time.Time `json:"locked_until,omitempty"`
 	PasswordResetToken string     `json:"-" gorm:"size:255"`
 	PasswordResetAt    *time.Time `json:"password_reset_at,omitempty"`
+	// WelcomeEmailDeliveredAt is the durable idempotency receipt for the
+	// authentication email Outbox. It is intentionally not exposed through
+	// human or machine user contracts.
+	WelcomeEmailDeliveredAt *time.Time `json:"-"`
 
 	// 业务相关
 	Department string `json:"department" gorm:"size:100"`
@@ -82,7 +98,6 @@ type User struct {
 	CreatedTickets  []Ticket        `json:"created_tickets,omitempty" gorm:"foreignKey:CreatedByID"`
 	AssignedTickets []Ticket        `json:"assigned_tickets,omitempty" gorm:"foreignKey:AssignedToID"`
 	Comments        []TicketComment `json:"comments,omitempty" gorm:"foreignKey:UserID"`
-	OTPCodes        []OTPCode       `json:"-" gorm:"foreignKey:UserID"`
 }
 
 // TableName 指定表名
@@ -150,7 +165,7 @@ type UserCreateRequest struct {
 	FirstName   string   `json:"first_name" binding:"omitempty,max=50"`
 	LastName    string   `json:"last_name" binding:"omitempty,max=50"`
 	DisplayName string   `json:"display_name" binding:"omitempty,max=100"`
-	Role        UserRole `json:"role" binding:"required,oneof=admin agent customer supervisor"`
+	Role        UserRole `json:"role" binding:"required,oneof=admin supervisor agent customer"`
 	Department  string   `json:"department" binding:"omitempty,max=100"`
 	JobTitle    string   `json:"job_title" binding:"omitempty,max=100"`
 	ManagerID   *uint    `json:"manager_id"`
@@ -158,19 +173,20 @@ type UserCreateRequest struct {
 
 // UserUpdateRequest 用户更新请求
 type UserUpdateRequest struct {
-	Email       *string     `json:"email" binding:"omitempty,email"`
-	Phone       *string     `json:"phone" binding:"omitempty,e164"`
-	FirstName   *string     `json:"first_name" binding:"omitempty,max=50"`
-	LastName    *string     `json:"last_name" binding:"omitempty,max=50"`
-	DisplayName *string     `json:"display_name" binding:"omitempty,max=100"`
-	Avatar      *string     `json:"avatar"`
-	Timezone    *string     `json:"timezone" binding:"omitempty,max=50"`
-	Language    *string     `json:"language" binding:"omitempty,max=10"`
-	Role        *UserRole   `json:"role" binding:"omitempty,oneof=admin agent customer supervisor"`
-	Status      *UserStatus `json:"status" binding:"omitempty,oneof=active inactive suspended deleted"`
-	Department  *string     `json:"department" binding:"omitempty,max=100"`
-	JobTitle    *string     `json:"job_title" binding:"omitempty,max=100"`
-	ManagerID   *uint       `json:"manager_id"`
+	Email         *string     `json:"email" binding:"omitempty,email"`
+	Phone         *string     `json:"phone"`
+	FirstName     *string     `json:"first_name" binding:"omitempty,max=50"`
+	LastName      *string     `json:"last_name" binding:"omitempty,max=50"`
+	DisplayName   *string     `json:"display_name" binding:"omitempty,max=100"`
+	Avatar        *string     `json:"avatar"`
+	Timezone      *string     `json:"timezone" binding:"omitempty,max=50"`
+	Language      *string     `json:"language" binding:"omitempty,max=10"`
+	Role          *UserRole   `json:"role" binding:"omitempty,oneof=admin supervisor agent customer"`
+	Status        *UserStatus `json:"status" binding:"omitempty,oneof=active inactive suspended deleted"`
+	EmailVerified *bool       `json:"email_verified"`
+	Department    *string     `json:"department" binding:"omitempty,max=100"`
+	JobTitle      *string     `json:"job_title" binding:"omitempty,max=100"`
+	ManagerID     *uint       `json:"manager_id"`
 }
 
 // UserResponse 用户响应
@@ -199,6 +215,29 @@ type UserResponse struct {
 	TicketsCreated   int        `json:"tickets_created"`
 	TicketsAssigned  int        `json:"tickets_assigned"`
 	TicketsResolved  int        `json:"tickets_resolved"`
+}
+
+// UserSummary is the only human identity shape embedded in tickets,
+// comments, histories, notifications, and categories. Authentication,
+// contact, verification, login, and account-control fields belong only to
+// dedicated user-management/profile endpoints.
+type UserSummary struct {
+	ID          uint   `json:"id"`
+	Username    string `json:"username"`
+	DisplayName string `json:"display_name"`
+	Avatar      string `json:"avatar"`
+}
+
+func (u *User) ToSummary() *UserSummary {
+	if u == nil {
+		return nil
+	}
+	return &UserSummary{
+		ID:          u.ID,
+		Username:    u.Username,
+		DisplayName: u.GetFullName(),
+		Avatar:      u.Avatar,
+	}
 }
 
 // ToResponse 转换为响应格式

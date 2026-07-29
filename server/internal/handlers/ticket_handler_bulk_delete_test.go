@@ -13,8 +13,8 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
 func openHandlerTestDB(t *testing.T) *gorm.DB {
@@ -28,6 +28,23 @@ func openHandlerTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
+func newHandlerTicketService(
+	t *testing.T,
+	db *gorm.DB,
+) *services.TicketService {
+	t.Helper()
+	service, err := services.NewTicketService(
+		db,
+		services.NewAgentNativeService(db),
+		nil,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("NewTicketService() error = %v", err)
+	}
+	return service
+}
+
 func TestBulkDeleteTicketsHandler_RemovesRequestedTickets(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -39,6 +56,8 @@ func TestBulkDeleteTicketsHandler_RemovesRequestedTickets(t *testing.T) {
 		&models.TicketHistory{},
 		&models.TicketComment{},
 		&models.TicketAttachment{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
 	); err != nil {
 		t.Fatalf("failed to migrate schemas: %v", err)
 	}
@@ -62,7 +81,7 @@ func TestBulkDeleteTicketsHandler_RemovesRequestedTickets(t *testing.T) {
 		Status:       models.TicketStatusOpen,
 		Type:         models.TicketTypeRequest,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  admin.ID,
+		CreatedByID:  &admin.ID,
 	}
 	if err := db.Create(&ticket1).Error; err != nil {
 		t.Fatalf("failed to create ticket1: %v", err)
@@ -76,13 +95,13 @@ func TestBulkDeleteTicketsHandler_RemovesRequestedTickets(t *testing.T) {
 		Status:       models.TicketStatusOpen,
 		Type:         models.TicketTypeRequest,
 		Source:       models.TicketSourceWeb,
-		CreatedByID:  admin.ID,
+		CreatedByID:  &admin.ID,
 	}
 	if err := db.Create(&ticket2).Error; err != nil {
 		t.Fatalf("failed to create ticket2: %v", err)
 	}
 
-	handler := NewTicketHandler(services.NewTicketService(db))
+	handler := NewTicketHandler(newHandlerTicketService(t, db))
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", admin.ID)
@@ -92,7 +111,10 @@ func TestBulkDeleteTicketsHandler_RemovesRequestedTickets(t *testing.T) {
 	router.DELETE("/tickets/bulk-delete", handler.BulkDeleteTickets)
 
 	body, err := json.Marshal(map[string]interface{}{
-		"ids": []uint{ticket1.ID, ticket2.ID},
+		"tickets": []map[string]any{
+			{"id": ticket1.ID, "version": ticket1.Version},
+			{"id": ticket2.ID, "version": ticket2.Version},
+		},
 	})
 	if err != nil {
 		t.Fatalf("failed to marshal request: %v", err)

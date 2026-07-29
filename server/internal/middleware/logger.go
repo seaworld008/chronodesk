@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -197,6 +199,12 @@ type RequestInfo struct {
 	StatusCode int
 	BodySize   int
 	Error      string
+	Err        error
+	ContextErr error
+	// ResponseStarted distinguishes a status already committed by a handler
+	// from the effective status used to describe a canceled request in logs.
+	ResponseStarted bool
+	CommittedStatus int
 }
 
 // LoggingMiddleware 日志中间件
@@ -254,10 +262,19 @@ func LoggingMiddleware(config *LoggerConfig) func(HTTPContext) {
 		requestInfo.Latency = endTime.Sub(startTime)
 		requestInfo.StatusCode = getStatusCode(c)
 		requestInfo.BodySize = getResponseSize(c)
+		requestInfo.ResponseStarted = responseStarted(c)
+		requestInfo.ContextErr = getRequestContextError(c)
+		if requestInfo.ContextErr != nil && requestInfo.StatusCode < httpStatusBadRequest {
+			if requestInfo.ResponseStarted {
+				requestInfo.CommittedStatus = requestInfo.StatusCode
+			}
+			requestInfo.StatusCode = requestTerminationStatus(requestInfo.ContextErr)
+		}
 
 		// 获取错误信息
 		if err := getError(c); err != nil {
 			requestInfo.Error = err.Error()
+			requestInfo.Err = err
 		}
 
 		// 记录请求完成日志
@@ -334,11 +351,24 @@ func logRequestEnd(logger Logger, info *RequestInfo, config *LoggerConfig) {
 
 	// 根据状态码选择日志级别
 	msg := "Request completed"
-	if info.Error != "" {
+	if info.StatusCode >= 500 {
+		if info.Error != "" {
+			fields = append(fields, Field{"error", info.Error})
+			msg = "Request failed"
+		}
+		logger.Error(msg, fields...)
+	} else if requestEndedWithContext(info) {
+		fields = append(fields, Field{"termination", requestTerminationReason(info.ContextErr)})
+		if info.ResponseStarted {
+			fields = append(fields, Field{"response_started", true})
+		}
+		if info.CommittedStatus != 0 {
+			fields = append(fields, Field{"committed_status", info.CommittedStatus})
+		}
+		logger.Info("Request canceled", fields...)
+	} else if info.Error != "" {
 		fields = append(fields, Field{"error", info.Error})
 		msg = "Request failed"
-		logger.Error(msg, fields...)
-	} else if info.StatusCode >= 500 {
 		logger.Error(msg, fields...)
 	} else if info.StatusCode >= 400 {
 		logger.Warn(msg, fields...)
@@ -347,22 +377,60 @@ func logRequestEnd(logger Logger, info *RequestInfo, config *LoggerConfig) {
 	}
 }
 
-// 以下函数需要根据具体的HTTP框架实现
+const (
+	httpStatusBadRequest          = 400
+	httpStatusClientClosedRequest = 499
+)
+
+func requestEndedWithContext(info *RequestInfo) bool {
+	if info == nil || info.ContextErr == nil {
+		return false
+	}
+	if !errors.Is(info.ContextErr, context.Canceled) &&
+		!errors.Is(info.ContextErr, context.DeadlineExceeded) {
+		return false
+	}
+	// A handler error unrelated to the request context remains a real failure,
+	// even if the client happened to disconnect at the same time.
+	return info.Err == nil || errors.Is(info.Err, info.ContextErr)
+}
+
+func requestTerminationStatus(err error) int {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return 408
+	}
+	return httpStatusClientClosedRequest
+}
+
+func requestTerminationReason(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline_exceeded"
+	}
+	return "client_canceled"
+}
 
 // getPath 获取请求路径
 func getPath(c HTTPContext) string {
-	// 需要根据具体框架实现
+	if ginCtx, ok := c.(*GinHTTPContext); ok && ginCtx.Context.Request != nil {
+		return ginCtx.Context.Request.URL.Path
+	}
 	return "/"
 }
 
 // getQuery 获取查询参数
 func getQuery(c HTTPContext) string {
-	// 需要根据具体框架实现
+	if ginCtx, ok := c.(*GinHTTPContext); ok && ginCtx.Context.Request != nil {
+		return sanitizeQueryForLogs(ginCtx.Context.Request.URL.RawQuery)
+	}
 	return ""
 }
 
 // getClientIP 获取客户端IP
 func getClientIP(c HTTPContext) string {
+	if ginCtx, ok := c.(*GinHTTPContext); ok {
+		return ginCtx.Context.ClientIP()
+	}
+
 	// 尝试从各种头部获取真实IP
 	ip := c.GetHeader("X-Forwarded-For")
 	if ip != "" {
@@ -412,18 +480,44 @@ func getRequestID(c HTTPContext) string {
 
 // getStatusCode 获取响应状态码
 func getStatusCode(c HTTPContext) int {
-	// 需要根据具体框架实现
+	if ginCtx, ok := c.(*GinHTTPContext); ok {
+		return ginCtx.Context.Writer.Status()
+	}
 	return 200
 }
 
 // getResponseSize 获取响应大小
 func getResponseSize(c HTTPContext) int {
-	// 需要根据具体框架实现
+	if ginCtx, ok := c.(*GinHTTPContext); ok {
+		size := ginCtx.Context.Writer.Size()
+		if size > 0 {
+			return size
+		}
+	}
 	return 0
+}
+
+func responseStarted(c HTTPContext) bool {
+	if ginCtx, ok := c.(*GinHTTPContext); ok {
+		return ginCtx.Context.Writer.Written()
+	}
+	return false
+}
+
+func getRequestContextError(c HTTPContext) error {
+	if ginCtx, ok := c.(*GinHTTPContext); ok &&
+		ginCtx.Context.Request != nil {
+		return ginCtx.Context.Request.Context().Err()
+	}
+	return nil
 }
 
 // getError 获取错误信息
 func getError(c HTTPContext) error {
+	if ginCtx, ok := c.(*GinHTTPContext); ok && len(ginCtx.Context.Errors) > 0 {
+		return ginCtx.Context.Errors.Last()
+	}
+
 	// 尝试从上下文获取错误
 	if err, exists := c.Get("error"); exists {
 		if e, ok := err.(error); ok {
@@ -431,38 +525,6 @@ func getError(c HTTPContext) error {
 		}
 	}
 	return nil
-}
-
-// AccessLogger 访问日志中间件（简化版）
-func AccessLogger(logger Logger) func(HTTPContext) {
-	return LoggingMiddleware(&LoggerConfig{
-		Logger:       logger,
-		LogLatency:   true,
-		LogRequestID: true,
-	})
-}
-
-// DebugLogger 调试日志中间件
-func DebugLogger() func(HTTPContext) {
-	return LoggingMiddleware(&LoggerConfig{
-		Logger:       NewSimpleLogger(os.Stdout, LogLevelDebug),
-		LogLatency:   true,
-		LogUserAgent: true,
-		LogReferer:   true,
-		LogRequestID: true,
-		LogBody:      true,
-		MaxBodySize:  1024,
-	})
-}
-
-// ProductionLogger 生产环境日志中间件
-func ProductionLogger() func(HTTPContext) {
-	return LoggingMiddleware(&LoggerConfig{
-		Logger:       NewSimpleLogger(os.Stdout, LogLevelInfo),
-		SkipPaths:    []string{"/health", "/metrics", "/favicon.ico"},
-		LogLatency:   true,
-		LogRequestID: true,
-	})
 }
 
 // RequestIDMiddleware 请求ID中间件
@@ -486,18 +548,4 @@ func RequestIDMiddleware() func(HTTPContext) {
 func generateRequestID() string {
 	// 简单的请求ID生成（实际使用中可能需要更复杂的实现）
 	return fmt.Sprintf("%d", time.Now().UnixNano())
-}
-
-// LogField 创建日志字段的辅助函数
-func LogField(key string, value interface{}) Field {
-	return Field{Key: key, Value: value}
-}
-
-// LogFields 创建多个日志字段的辅助函数
-func LogFields(fields map[string]interface{}) []Field {
-	result := make([]Field, 0, len(fields))
-	for k, v := range fields {
-		result = append(result, Field{Key: k, Value: v})
-	}
-	return result
 }

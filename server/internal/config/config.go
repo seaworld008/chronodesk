@@ -1,12 +1,16 @@
 package config
 
 import (
-	"bufio"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/joho/godotenv"
+	"github.com/seaworld008/chronodesk/server/internal/version"
 )
 
 // Config 应用配置结构
@@ -15,24 +19,19 @@ type Config struct {
 	Database  DatabaseConfig  `json:"database"`
 	Redis     RedisConfig     `json:"redis"`
 	JWT       JWTConfig       `json:"jwt"`
-	SMTP      SMTPConfig      `json:"smtp"`
-	OTP       OTPConfig       `json:"otp"`
 	Security  SecurityConfig  `json:"security"`
 	App       AppConfig       `json:"app"`
 	CORS      CORSConfig      `json:"cors"`
-	Log       LogConfig       `json:"log"`
-	Upload    UploadConfig    `json:"upload"`
 	RateLimit RateLimitConfig `json:"rate_limit"`
+	Agent     AgentConfig     `json:"agent"`
 }
 
 // ServerConfig 服务器配置
 type ServerConfig struct {
-	Port          string `json:"port"`
-	GinMode       string `json:"gin_mode"`
-	Environment   string `json:"environment"`
-	Debug         bool   `json:"debug"`
-	EnableSwagger bool   `json:"enable_swagger"`
-	EnablePprof   bool   `json:"enable_pprof"`
+	Port           string   `json:"port"`
+	GinMode        string   `json:"gin_mode"`
+	Environment    string   `json:"environment"`
+	TrustedProxies []string `json:"trusted_proxies"`
 }
 
 // DatabaseConfig 数据库配置
@@ -67,28 +66,13 @@ type JWTConfig struct {
 	RefreshSecret    string        `json:"refresh_secret"`
 	ExpiresIn        time.Duration `json:"expires_in"`
 	RefreshExpiresIn time.Duration `json:"refresh_expires_in"`
-}
-
-// SMTPConfig 邮件配置
-type SMTPConfig struct {
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-	From     string `json:"from"`
-	FromName string `json:"from_name"`
-}
-
-// OTPConfig OTP配置
-type OTPConfig struct {
-	ExpiresIn time.Duration `json:"expires_in"`
-	Length    int           `json:"length"`
+	Issuer           string        `json:"issuer"`
+	Audience         string        `json:"audience"`
 }
 
 // SecurityConfig 安全配置
 type SecurityConfig struct {
-	BcryptCost int    `json:"bcrypt_cost"`
-	CSRFSecret string `json:"csrf_secret"`
+	BcryptCost int `json:"bcrypt_cost"`
 }
 
 // AppConfig 应用配置
@@ -106,48 +90,59 @@ type CORSConfig struct {
 	AllowedHeaders []string `json:"allowed_headers"`
 }
 
-// LogConfig 日志配置
-type LogConfig struct {
-	Level  string `json:"level"`
-	Format string `json:"format"`
-	Output string `json:"output"`
-}
-
-// UploadConfig 文件上传配置
-type UploadConfig struct {
-	MaxSize      string   `json:"max_size"`
-	AllowedTypes []string `json:"allowed_types"`
-}
-
 // RateLimitConfig 限流配置
 type RateLimitConfig struct {
-	Requests int           `json:"requests"`
-	Window   time.Duration `json:"window"`
+	Requests                  int           `json:"requests"`
+	Window                    time.Duration `json:"window"`
+	AnonymousIdentityRequests int           `json:"anonymous_identity_requests"`
+	AnonymousIPRequests       int           `json:"anonymous_ip_requests"`
+	AnonymousWindow           time.Duration `json:"anonymous_window"`
+}
+
+// AgentConfig controls machine identities and protocol endpoints separately
+// from human browser sessions.
+type AgentConfig struct {
+	JWTSecret          string        `json:"-"`
+	CredentialPepper   string        `json:"-"`
+	Issuer             string        `json:"issuer"`
+	MCPResourceURL     string        `json:"mcp_resource_url"`
+	APIResourceURL     string        `json:"api_resource_url"`
+	A2AResourceURL     string        `json:"a2a_resource_url"`
+	TokenTTL           time.Duration `json:"token_ttl"`
+	CredentialTTL      time.Duration `json:"credential_ttl"`
+	AttachmentDir      string        `json:"attachment_dir"`
+	MaxAttachmentBytes int64         `json:"max_attachment_bytes"`
+	LoopThreshold      int           `json:"loop_threshold"`
+	LoopWindow         time.Duration `json:"loop_window"`
+	GlobalReadOnly     bool          `json:"global_read_only"`
 }
 
 // Load 加载配置
 func Load() (*Config, error) {
-	// 加载 .env 文件
-	if err := loadEnvFile(".env"); err != nil {
-		// 在生产环境中，.env 文件可能不存在，这是正常的
-		fmt.Printf("Warning: .env file not found: %v\n", err)
+	// 使用与迁移和维护命令一致的 dotenv 解析器，正确处理引号、转义和
+	// `export KEY=value`。部署环境通常没有 .env；缺失文件不是错误。
+	if err := godotenv.Load(".env"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("load .env: %w", err)
 	}
 
+	appURL := getEnv("APP_URL", "http://localhost:8081")
+	bcryptCost, err := getEnvAsStrictInt("BCRYPT_COST", 12)
+	if err != nil {
+		return nil, err
+	}
 	config := &Config{
 		Server: ServerConfig{
-			Port:          getEnv("PORT", "8081"),
-			GinMode:       getEnv("GIN_MODE", "debug"),
-			Environment:   getEnv("ENVIRONMENT", "development"),
-			Debug:         getEnvAsBool("DEBUG", true),
-			EnableSwagger: getEnvAsBool("ENABLE_SWAGGER", true),
-			EnablePprof:   getEnvAsBool("ENABLE_PPROF", false),
+			Port:           getEnv("PORT", "8081"),
+			GinMode:        getEnv("GIN_MODE", "debug"),
+			Environment:    getEnv("ENVIRONMENT", "development"),
+			TrustedProxies: getEnvAsSlice("TRUSTED_PROXIES", []string{}),
 		},
 		Database: DatabaseConfig{
 			Host:            getEnv("DB_HOST", "localhost"),
 			Port:            getEnvAsInt("DB_PORT", 5432),
-			User:            getEnv("DB_USER", "ticket_user"),
-			Password:        getEnv("DB_PASSWORD", "ticket_password"),
-			Name:            getEnv("DB_NAME", "ticket_system"),
+			User:            getEnv("DB_USER", "chronodesk"),
+			Password:        getEnv("DB_PASSWORD", "chronodesk_dev_only"),
+			Name:            getEnv("DB_NAME", "chronodesk"),
 			SSLMode:         getEnv("DB_SSLMODE", "disable"),
 			Timezone:        getEnv("DB_TIMEZONE", "Asia/Shanghai"),
 			MaxOpenConns:    getEnvAsInt("DB_MAX_OPEN_CONNS", 25),
@@ -169,46 +164,59 @@ func Load() (*Config, error) {
 			RefreshSecret:    getEnv("JWT_REFRESH_SECRET", "your-super-secret-jwt-refresh-key-change-in-production"),
 			ExpiresIn:        getEnvAsDuration("JWT_EXPIRES_IN", 24*time.Hour),
 			RefreshExpiresIn: getEnvAsDuration("JWT_REFRESH_EXPIRES_IN", 168*time.Hour),
-		},
-		SMTP: SMTPConfig{
-			Host:     getEnv("SMTP_HOST", "smtp.gmail.com"),
-			Port:     getEnvAsInt("SMTP_PORT", 587),
-			Username: getEnv("SMTP_USERNAME", ""),
-			Password: getEnv("SMTP_PASSWORD", ""),
-			From:     getEnv("SMTP_FROM", "noreply@ticketsystem.com"),
-			FromName: getEnv("SMTP_FROM_NAME", "Ticket System"),
-		},
-		OTP: OTPConfig{
-			ExpiresIn: getEnvAsDuration("OTP_EXPIRES_IN", 10*time.Minute),
-			Length:    getEnvAsInt("OTP_LENGTH", 6),
+			Issuer:           appURL,
+			Audience:         appURL + "/api",
 		},
 		Security: SecurityConfig{
-			BcryptCost: getEnvAsInt("BCRYPT_COST", 12),
-			CSRFSecret: getEnv("CSRF_SECRET", "your-csrf-secret-key"),
+			BcryptCost: bcryptCost,
 		},
 		App: AppConfig{
-			Name:    getEnv("APP_NAME", "Ticket System"),
-			Version: getEnv("APP_VERSION", "1.0.0"),
-			URL:     getEnv("APP_URL", "http://localhost:8080"),
+			Name:    getEnv("APP_NAME", "ChronoDesk"),
+			Version: getEnv("APP_VERSION", version.Version),
+			URL:     appURL,
 			WebURL:  getEnv("WEB_URL", "http://localhost:3000"),
 		},
 		CORS: CORSConfig{
 			AllowedOrigins: getEnvAsSlice("CORS_ALLOWED_ORIGINS", []string{"http://localhost:3000", "http://localhost:5173"}),
 			AllowedMethods: getEnvAsSlice("CORS_ALLOWED_METHODS", []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}),
-			AllowedHeaders: getEnvAsSlice("CORS_ALLOWED_HEADERS", []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Requested-With"}),
-		},
-		Log: LogConfig{
-			Level:  getEnv("LOG_LEVEL", "info"),
-			Format: getEnv("LOG_FORMAT", "json"),
-			Output: getEnv("LOG_OUTPUT", "stdout"),
-		},
-		Upload: UploadConfig{
-			MaxSize:      getEnv("UPLOAD_MAX_SIZE", "10MB"),
-			AllowedTypes: getEnvAsSlice("UPLOAD_ALLOWED_TYPES", []string{"jpg", "jpeg", "png", "gif", "pdf", "doc", "docx"}),
+			AllowedHeaders: getEnvAsSlice("CORS_ALLOWED_HEADERS", []string{
+				"Origin",
+				"Content-Type",
+				"Accept",
+				"Authorization",
+				"X-Requested-With",
+				"Idempotency-Key",
+				"If-Match",
+				"X-Ticket-Lease",
+				"MCP-Protocol-Version",
+				"Mcp-Method",
+				"Mcp-Name",
+			}),
 		},
 		RateLimit: RateLimitConfig{
-			Requests: getEnvAsInt("RATE_LIMIT_REQUESTS", 100),
-			Window:   getEnvAsDuration("RATE_LIMIT_WINDOW", 1*time.Hour),
+			Requests:                  getEnvAsInt("RATE_LIMIT_REQUESTS", 600),
+			Window:                    getEnvAsDuration("RATE_LIMIT_WINDOW", time.Minute),
+			AnonymousIdentityRequests: getEnvAsInt("AUTH_IDENTITY_RATE_LIMIT_REQUESTS", 20),
+			AnonymousIPRequests:       getEnvAsInt("AUTH_IP_RATE_LIMIT_REQUESTS", 200),
+			AnonymousWindow:           getEnvAsDuration("AUTH_RATE_LIMIT_WINDOW", time.Minute),
+		},
+		Agent: AgentConfig{
+			JWTSecret:        getEnv("AGENT_JWT_SECRET", getEnv("JWT_SECRET", "your-super-secret-jwt-key-change-in-production")),
+			CredentialPepper: getEnv("AGENT_CREDENTIAL_PEPPER", getEnv("AGENT_JWT_SECRET", getEnv("JWT_SECRET", "your-super-secret-jwt-key-change-in-production"))),
+			Issuer:           getEnv("AGENT_ISSUER", appURL),
+			// RFC 8707 resource identifiers are derived from the canonical public
+			// origin. They are intentionally not independently configurable:
+			// MCP, REST, and A2A tokens must never share an audience.
+			MCPResourceURL:     appURL + "/mcp",
+			APIResourceURL:     appURL + "/api/v1",
+			A2AResourceURL:     appURL + "/a2a/v1",
+			TokenTTL:           getEnvAsDuration("AGENT_TOKEN_TTL", 15*time.Minute),
+			CredentialTTL:      getEnvAsDuration("AGENT_CREDENTIAL_TTL", 90*24*time.Hour),
+			AttachmentDir:      getEnv("AGENT_ATTACHMENT_DIR", "./data/agent-attachments"),
+			MaxAttachmentBytes: int64(getEnvAsInt("AGENT_MAX_ATTACHMENT_BYTES", 25<<20)),
+			LoopThreshold:      getEnvAsInt("AGENT_LOOP_THRESHOLD", 20),
+			LoopWindow:         getEnvAsDuration("AGENT_LOOP_WINDOW", time.Minute),
+			GlobalReadOnly:     getEnvAsBool("AGENT_GLOBAL_READ_ONLY", false),
 		},
 	}
 
@@ -222,12 +230,82 @@ func Load() (*Config, error) {
 
 // Validate 验证配置
 func (c *Config) Validate() error {
-	// 验证必需的配置项
-	if c.JWT.Secret == "your-super-secret-jwt-key-change-in-production" && c.Server.Environment == "production" {
-		return fmt.Errorf("JWT secret must be changed in production environment")
+	if insecureHumanJWTSecret(c.JWT.Secret) {
+		return fmt.Errorf("human JWT access secret must be at least 32 characters without surrounding whitespace")
 	}
-	if c.JWT.RefreshSecret == "your-super-secret-jwt-refresh-key-change-in-production" && c.Server.Environment == "production" {
-		return fmt.Errorf("JWT refresh secret must be changed in production environment")
+	if insecureHumanJWTSecret(c.JWT.RefreshSecret) {
+		return fmt.Errorf("human JWT refresh secret must be at least 32 characters without surrounding whitespace")
+	}
+	if c.JWT.Secret == c.JWT.RefreshSecret {
+		return fmt.Errorf("human JWT access and refresh secrets must be different")
+	}
+	if c.JWT.ExpiresIn <= 0 || c.JWT.RefreshExpiresIn <= 0 {
+		return fmt.Errorf("human JWT access and refresh expiration must be positive")
+	}
+	if c.Security.BcryptCost < 10 || c.Security.BcryptCost > 16 {
+		return fmt.Errorf("bcrypt cost must be between 10 and 16")
+	}
+	if c.Server.Environment == "production" {
+		secrets := []struct {
+			name  string
+			value string
+		}{
+			{name: "human JWT access secret", value: c.JWT.Secret},
+			{name: "human JWT refresh secret", value: c.JWT.RefreshSecret},
+			{name: "Agent JWT secret", value: c.Agent.JWTSecret},
+			{name: "Agent credential pepper", value: c.Agent.CredentialPepper},
+		}
+		for _, secret := range secrets {
+			if insecureProductionSecret(secret.value) {
+				return fmt.Errorf("%s must be at least 32 non-placeholder characters", secret.name)
+			}
+		}
+		for left := 0; left < len(secrets); left++ {
+			for right := left + 1; right < len(secrets); right++ {
+				if secrets[left].value == secrets[right].value {
+					return fmt.Errorf(
+						"%s and %s must use separate production secrets",
+						secrets[left].name,
+						secrets[right].name,
+					)
+				}
+			}
+		}
+	}
+	if err := validateHumanJWTEndpointContract(
+		c.App.URL,
+		c.JWT.Issuer,
+		c.JWT.Audience,
+	); err != nil {
+		return err
+	}
+	if err := validateAgentEndpointContract(
+		c.App.URL,
+		c.Agent.Issuer,
+		c.Agent.MCPResourceURL,
+		c.Agent.APIResourceURL,
+		c.Agent.A2AResourceURL,
+	); err != nil {
+		return err
+	}
+	if c.Agent.TokenTTL <= 0 || c.Agent.TokenTTL > time.Hour {
+		return fmt.Errorf("agent token TTL must be between 1 second and 1 hour")
+	}
+	if c.Agent.CredentialTTL < time.Hour || c.Agent.CredentialTTL > 365*24*time.Hour {
+		return fmt.Errorf("agent credential TTL must be between 1 hour and 365 days")
+	}
+	if c.Agent.MaxAttachmentBytes <= 0 {
+		return fmt.Errorf("agent maximum attachment size must be positive")
+	}
+	if c.Agent.LoopThreshold <= 0 || c.Agent.LoopWindow <= 0 {
+		return fmt.Errorf("agent loop threshold and window must be positive")
+	}
+	if c.RateLimit.Requests <= 0 ||
+		c.RateLimit.Window <= 0 ||
+		c.RateLimit.AnonymousIdentityRequests <= 0 ||
+		c.RateLimit.AnonymousIPRequests <= 0 ||
+		c.RateLimit.AnonymousWindow <= 0 {
+		return fmt.Errorf("authenticated and anonymous rate limit requests and windows must be positive")
 	}
 
 	if c.Database.Host == "" {
@@ -249,32 +327,87 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// GetDSN 获取数据库连接字符串
-func (c *Config) GetDSN() string {
-	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s TimeZone=%s",
-		c.Database.Host,
-		c.Database.Port,
-		c.Database.User,
-		c.Database.Password,
-		c.Database.Name,
-		c.Database.SSLMode,
-		c.Database.Timezone,
-	)
+func validateHumanJWTEndpointContract(appURL, issuer, audience string) error {
+	if err := validateCanonicalAppURL(appURL); err != nil {
+		return err
+	}
+	if issuer != appURL {
+		return fmt.Errorf("human JWT issuer must exactly match APP URL")
+	}
+	expectedAudience := appURL + "/api"
+	if audience != expectedAudience {
+		return fmt.Errorf("human JWT audience must exactly match %q", expectedAudience)
+	}
+	return nil
 }
 
-// GetRedisAddr 获取Redis地址
-func (c *Config) GetRedisAddr() string {
-	return fmt.Sprintf("%s:%d", c.Redis.Host, c.Redis.Port)
+func validateAgentEndpointContract(appURL, issuer, mcpResourceURL, apiResourceURL, a2aResourceURL string) error {
+	if err := validateCanonicalAppURL(appURL); err != nil {
+		return err
+	}
+	if issuer != appURL {
+		return fmt.Errorf("agent issuer must exactly match APP URL")
+	}
+	expectedResources := map[string]struct {
+		got  string
+		path string
+	}{
+		"MCP": {got: mcpResourceURL, path: "/mcp"},
+		"API": {got: apiResourceURL, path: "/api/v1"},
+		"A2A": {got: a2aResourceURL, path: "/a2a/v1"},
+	}
+	for name, resource := range expectedResources {
+		expected := appURL + resource.path
+		if resource.got != expected {
+			return fmt.Errorf("agent %s resource URL must exactly match %q", name, expected)
+		}
+	}
+	return nil
 }
 
-// IsDevelopment 是否为开发环境
-func (c *Config) IsDevelopment() bool {
-	return c.Server.Environment == "development"
+func validateCanonicalAppURL(appURL string) error {
+	if appURL != strings.TrimSpace(appURL) {
+		return fmt.Errorf("APP URL must not contain surrounding whitespace")
+	}
+	parsed, err := url.Parse(appURL)
+	if err != nil ||
+		!parsed.IsAbs() ||
+		parsed.Host == "" ||
+		parsed.User != nil ||
+		parsed.RawQuery != "" ||
+		parsed.Fragment != "" ||
+		parsed.Path != "" ||
+		parsed.RawPath != "" {
+		return fmt.Errorf("APP URL must be an absolute canonical origin without path, query, fragment, or user info")
+	}
+	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHostname(parsed.Hostname())) {
+		return fmt.Errorf("APP URL must use HTTPS except for loopback development")
+	}
+	return nil
 }
 
-// IsProduction 是否为生产环境
-func (c *Config) IsProduction() bool {
-	return c.Server.Environment == "production"
+func isLoopbackHostname(hostname string) bool {
+	switch strings.ToLower(hostname) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return false
+	}
+}
+
+func insecureProductionSecret(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	normalized := strings.ToLower(trimmed)
+	return value != trimmed ||
+		len(trimmed) < 32 ||
+		strings.Contains(normalized, "replace-with") ||
+		strings.Contains(normalized, "change-in-production") ||
+		strings.Contains(normalized, "example")
+}
+
+func insecureHumanJWTSecret(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	return value != trimmed || len(trimmed) < 32
 }
 
 // 辅助函数
@@ -292,6 +425,18 @@ func getEnvAsInt(key string, defaultValue int) int {
 		}
 	}
 	return defaultValue
+}
+
+func getEnvAsStrictInt(key string, defaultValue int) (int, error) {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue, nil
+	}
+	intValue, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer: %w", key, err)
+	}
+	return intValue, nil
 }
 
 func getEnvAsBool(key string, defaultValue bool) bool {
@@ -320,32 +465,3 @@ func getEnvAsSlice(key string, defaultValue []string) []string {
 }
 
 // loadEnvFile 简单的.env文件加载器
-func loadEnvFile(filename string) error {
-	file, err := os.Open(filename)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		// 跳过空行和注释
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		// 解析键值对
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) == 2 {
-			key := strings.TrimSpace(parts[0])
-			value := strings.TrimSpace(parts[1])
-			// 只有当环境变量不存在时才设置
-			if os.Getenv(key) == "" {
-				os.Setenv(key, value)
-			}
-		}
-	}
-
-	return scanner.Err()
-}

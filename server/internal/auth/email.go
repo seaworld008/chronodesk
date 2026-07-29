@@ -2,387 +2,195 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"net/smtp"
+	"html"
+	"net/url"
+	"path"
 	"strings"
-	"time"
+
+	"github.com/seaworld008/chronodesk/server/internal/mailer"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
-// SMTPEmailService SMTP邮件服务实现
+// SMTPConfigProvider returns the active, decrypted SMTP configuration for one
+// Outbox attempt. Looking it up per attempt makes credential and transport-mode
+// rotation effective without restarting ChronoDesk.
+type SMTPConfigProvider interface {
+	GetSMTPConfig(context.Context) (*models.EmailConfig, error)
+}
+
+// SMTPEmailService is the dynamic authentication-email SMTP adapter. Business
+// flows queue durable email intents; only the Outbox consumer calls this type.
 type SMTPEmailService struct {
-	host     string
-	port     string
-	username string
-	password string
-	from     string
-	auth     smtp.Auth
+	provider SMTPConfigProvider
+	webURL   *url.URL
 }
 
-// EmailConfig 邮件配置
-type EmailConfig struct {
-	Host     string
-	Port     string
-	Username string
-	Password string
-	From     string
-}
-
-// NewSMTPEmailService 创建SMTP邮件服务
-func NewSMTPEmailService(config *EmailConfig) *SMTPEmailService {
-	auth := smtp.PlainAuth("", config.Username, config.Password, config.Host)
-	return &SMTPEmailService{
-		host:     config.Host,
-		port:     config.Port,
-		username: config.Username,
-		password: config.Password,
-		from:     config.From,
-		auth:     auth,
+func NewConfiguredSMTPEmailService(
+	provider SMTPConfigProvider,
+	webURL string,
+) (*SMTPEmailService, error) {
+	if provider == nil {
+		return nil, errors.New("SMTP配置提供器不能为空")
 	}
-}
-
-// SendVerificationEmail 发送邮箱验证邮件
-func (s *SMTPEmailService) SendVerificationEmail(ctx context.Context, email, token string) error {
-	subject := "Verify Your Email Address"
-	body := fmt.Sprintf(`
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>Email Verification</title>
-    <style>
-        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
-        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
-        .header { background-color: #007bff; color: white; padding: 20px; text-align: center; }
-        .content { padding: 20px; background-color: #f9f9f9; }
-        .button { display: inline-block; padding: 12px 24px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px; margin: 20px 0; }
-        .footer { padding: 20px; text-align: center; color: #666; font-size: 12px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>Email Verification</h1>
-        </div>
-        <div class="content">
-            <h2>Welcome to our Ticketing System!</h2>
-            <p>Thank you for registering with us. To complete your registration, please verify your email address by clicking the button below:</p>
-            <a href="http://localhost:3000/verify-email?token=%s" class="button">Verify Email Address</a>
-            <p>If the button doesn't work, you can copy and paste this link into your browser:</p>
-            <p>http://localhost:3000/verify-email?token=%s</p>
-            <p>This verification link will expire in 24 hours.</p>
-            <p>If you didn't create an account with us, please ignore this email.</p>
-        </div>
-        <div class="footer">
-            <p>© 2024 Ticketing System. All rights reserved.</p>
-        </div>
-    </div>
-</body>
-</html>
-	`, token, token)
-
-	return s.sendEmail(email, subject, body)
-}
-
-// SendPasswordResetEmail 发送密码重置邮件
-func (s *SMTPEmailService) SendPasswordResetEmail(ctx context.Context, email, token string) error {
-	subject := "Reset Your Password"
-	body := fmt.Sprintf(`
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>Password Reset</title>
-    <style>
-        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
-        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
-        .header { background-color: #dc3545; color: white; padding: 20px; text-align: center; }
-        .content { padding: 20px; background-color: #f9f9f9; }
-        .button { display: inline-block; padding: 12px 24px; background-color: #dc3545; color: white; text-decoration: none; border-radius: 4px; margin: 20px 0; }
-        .footer { padding: 20px; text-align: center; color: #666; font-size: 12px; }
-        .warning { background-color: #fff3cd; border: 1px solid #ffeaa7; padding: 10px; border-radius: 4px; margin: 10px 0; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>Password Reset Request</h1>
-        </div>
-        <div class="content">
-            <h2>Reset Your Password</h2>
-            <p>We received a request to reset your password. If you made this request, click the button below to reset your password:</p>
-            <a href="http://localhost:3000/reset-password?token=%s" class="button">Reset Password</a>
-            <p>If the button doesn't work, you can copy and paste this link into your browser:</p>
-            <p>http://localhost:3000/reset-password?token=%s</p>
-            <div class="warning">
-                <strong>Security Notice:</strong>
-                <ul>
-                    <li>This link will expire in 1 hour for security reasons</li>
-                    <li>If you didn't request this password reset, please ignore this email</li>
-                    <li>Your password will remain unchanged until you create a new one</li>
-                </ul>
-            </div>
-        </div>
-        <div class="footer">
-            <p>© 2024 Ticketing System. All rights reserved.</p>
-        </div>
-    </div>
-</body>
-</html>
-	`, token, token)
-
-	return s.sendEmail(email, subject, body)
-}
-
-// SendWelcomeEmail 发送欢迎邮件
-func (s *SMTPEmailService) SendWelcomeEmail(ctx context.Context, email, username string) error {
-	subject := "Welcome to Ticketing System!"
-	body := fmt.Sprintf(`
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>Welcome</title>
-    <style>
-        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
-        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
-        .header { background-color: #28a745; color: white; padding: 20px; text-align: center; }
-        .content { padding: 20px; background-color: #f9f9f9; }
-        .feature { background-color: white; padding: 15px; margin: 10px 0; border-radius: 4px; border-left: 4px solid #28a745; }
-        .button { display: inline-block; padding: 12px 24px; background-color: #28a745; color: white; text-decoration: none; border-radius: 4px; margin: 20px 0; }
-        .footer { padding: 20px; text-align: center; color: #666; font-size: 12px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>Welcome to Ticketing System!</h1>
-        </div>
-        <div class="content">
-            <h2>Hello %s!</h2>
-            <p>Congratulations! Your account has been successfully created and verified. You can now start using our ticketing system.</p>
-            
-            <h3>What you can do:</h3>
-            <div class="feature">
-                <strong>Create Tickets:</strong> Submit support requests and track their progress
-            </div>
-            <div class="feature">
-                <strong>Manage Profile:</strong> Update your personal information and preferences
-            </div>
-            <div class="feature">
-                <strong>Track History:</strong> View all your past tickets and interactions
-            </div>
-            <div class="feature">
-                <strong>Secure Access:</strong> Enable two-factor authentication for enhanced security
-            </div>
-            
-            <a href="http://localhost:3000/dashboard" class="button">Go to Dashboard</a>
-            
-            <p>If you have any questions or need assistance, feel free to contact our support team.</p>
-        </div>
-        <div class="footer">
-            <p>© 2024 Ticketing System. All rights reserved.</p>
-        </div>
-    </div>
-</body>
-</html>
-	`, username)
-
-	return s.sendEmail(email, subject, body)
-}
-
-// SendOTPEmail 发送OTP验证码邮件
-func (s *SMTPEmailService) SendOTPEmail(ctx context.Context, email, code string) error {
-	subject := "Your Verification Code"
-	body := fmt.Sprintf(`
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>Verification Code</title>
-    <style>
-        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
-        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
-        .header { background-color: #6f42c1; color: white; padding: 20px; text-align: center; }
-        .content { padding: 20px; background-color: #f9f9f9; }
-        .code { font-size: 32px; font-weight: bold; text-align: center; background-color: #6f42c1; color: white; padding: 20px; border-radius: 8px; margin: 20px 0; letter-spacing: 8px; }
-        .footer { padding: 20px; text-align: center; color: #666; font-size: 12px; }
-        .warning { background-color: #fff3cd; border: 1px solid #ffeaa7; padding: 10px; border-radius: 4px; margin: 10px 0; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>Verification Code</h1>
-        </div>
-        <div class="content">
-            <h2>Your One-Time Password</h2>
-            <p>Use the following verification code to complete your login:</p>
-            
-            <div class="code">%s</div>
-            
-            <div class="warning">
-                <strong>Important:</strong>
-                <ul>
-                    <li>This code will expire in 5 minutes</li>
-                    <li>Do not share this code with anyone</li>
-                    <li>If you didn't request this code, please ignore this email</li>
-                </ul>
-            </div>
-            
-            <p>If you're having trouble, please contact our support team.</p>
-        </div>
-        <div class="footer">
-            <p>© 2024 Ticketing System. All rights reserved.</p>
-        </div>
-    </div>
-</body>
-</html>
-	`, code)
-
-	return s.sendEmail(email, subject, body)
-}
-
-// sendEmail 发送邮件的通用方法
-func (s *SMTPEmailService) sendEmail(to, subject, body string) error {
-	// 构建邮件头
-	headers := make(map[string]string)
-	headers["From"] = s.from
-	headers["To"] = to
-	headers["Subject"] = subject
-	headers["MIME-Version"] = "1.0"
-	headers["Content-Type"] = "text/html; charset=UTF-8"
-	headers["Date"] = time.Now().Format(time.RFC1123Z)
-
-	// 构建邮件消息
-	message := ""
-	for k, v := range headers {
-		message += fmt.Sprintf("%s: %s\r\n", k, v)
-	}
-	message += "\r\n" + body
-
-	// 发送邮件
-	addr := fmt.Sprintf("%s:%s", s.host, s.port)
-	err := smtp.SendMail(addr, s.auth, s.from, []string{to}, []byte(message))
+	baseURL, err := parseApplicationWebURL(webURL)
 	if err != nil {
-		return fmt.Errorf("failed to send email: %w", err)
+		return nil, err
 	}
-
-	return nil
+	return &SMTPEmailService{
+		provider: provider,
+		webURL:   baseURL,
+	}, nil
 }
 
-// MockEmailService 模拟邮件服务（用于测试）
-type MockEmailService struct {
-	sentEmails []SentEmail
+func (s *SMTPEmailService) SendVerificationEmail(
+	ctx context.Context,
+	email string,
+	token string,
+) error {
+	verificationURL := html.EscapeString(s.applicationURL(
+		"/verify-email",
+		map[string]string{"token": token},
+	))
+	body := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>验证您的 ChronoDesk 邮箱</title></head>
+<body style="font-family:Arial,sans-serif;line-height:1.7;color:#1f2937">
+  <div style="max-width:600px;margin:0 auto;padding:24px">
+    <h1 style="color:#2563eb">验证您的邮箱</h1>
+    <p>感谢您注册 ChronoDesk。请点击下面的按钮完成邮箱验证：</p>
+    <p><a href="%s" style="display:inline-block;padding:12px 24px;background:#2563eb;color:#fff;text-decoration:none;border-radius:6px">验证邮箱</a></p>
+    <p>如果按钮无法打开，请复制以下链接到浏览器：</p>
+    <p style="word-break:break-all">%s</p>
+    <p>此链接将在 24 小时后失效。如果您没有注册 ChronoDesk，请忽略本邮件。</p>
+    <p style="color:#6b7280">ChronoDesk 团队</p>
+  </div>
+</body>
+</html>`, verificationURL, verificationURL)
+	return s.sendEmail(ctx, email, "验证您的 ChronoDesk 邮箱", body)
 }
 
-// SentEmail 已发送邮件记录
-type SentEmail struct {
-	To      string
-	Subject string
-	Body    string
-	SentAt  time.Time
+func (s *SMTPEmailService) SendPasswordResetEmail(
+	ctx context.Context,
+	email string,
+	token string,
+) error {
+	resetURL := html.EscapeString(s.applicationURL(
+		"/reset-password",
+		map[string]string{"token": token},
+	))
+	body := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>重置您的 ChronoDesk 密码</title></head>
+<body style="font-family:Arial,sans-serif;line-height:1.7;color:#1f2937">
+  <div style="max-width:600px;margin:0 auto;padding:24px">
+    <h1 style="color:#dc2626">重置密码</h1>
+    <p>我们收到了您的 ChronoDesk 密码重置请求。请点击下面的按钮继续：</p>
+    <p><a href="%s" style="display:inline-block;padding:12px 24px;background:#dc2626;color:#fff;text-decoration:none;border-radius:6px">重置密码</a></p>
+    <p>如果按钮无法打开，请复制以下链接到浏览器：</p>
+    <p style="word-break:break-all">%s</p>
+    <p>此链接将在 1 小时后失效。如果不是您本人发起的请求，请忽略本邮件，现有密码不会改变。</p>
+    <p style="color:#6b7280">ChronoDesk 团队</p>
+  </div>
+</body>
+</html>`, resetURL, resetURL)
+	return s.sendEmail(ctx, email, "重置您的 ChronoDesk 密码", body)
 }
 
-// NewMockEmailService 创建模拟邮件服务
-func NewMockEmailService() *MockEmailService {
-	return &MockEmailService{
-		sentEmails: make([]SentEmail, 0),
+func (s *SMTPEmailService) SendWelcomeEmail(
+	ctx context.Context,
+	email string,
+	username string,
+) error {
+	dashboardURL := html.EscapeString(s.applicationURL("/dashboard", nil))
+	safeUsername := html.EscapeString(username)
+	body := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>欢迎使用 ChronoDesk</title></head>
+<body style="font-family:Arial,sans-serif;line-height:1.7;color:#1f2937">
+  <div style="max-width:600px;margin:0 auto;padding:24px">
+    <h1 style="color:#16a34a">欢迎使用 ChronoDesk</h1>
+    <p>%s，您好！您的账户已经可以使用。</p>
+    <p>您可以在 ChronoDesk 中提交服务请求、跟踪处理进度并管理个人资料。</p>
+    <p><a href="%s" style="display:inline-block;padding:12px 24px;background:#16a34a;color:#fff;text-decoration:none;border-radius:6px">进入工作台</a></p>
+    <p>如果您需要帮助，请联系支持团队。</p>
+    <p style="color:#6b7280">ChronoDesk 团队</p>
+  </div>
+</body>
+</html>`, safeUsername, dashboardURL)
+	return s.sendEmail(ctx, email, "欢迎使用 ChronoDesk", body)
+}
+
+func (s *SMTPEmailService) sendEmail(
+	ctx context.Context,
+	to string,
+	subject string,
+	body string,
+) error {
+	config, err := s.provider.GetSMTPConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("读取SMTP配置失败: %w", err)
 	}
-}
-
-// SendVerificationEmail 模拟发送邮箱验证邮件
-func (m *MockEmailService) SendVerificationEmail(ctx context.Context, email, token string) error {
-	m.sentEmails = append(m.sentEmails, SentEmail{
-		To:      email,
-		Subject: "Verify Your Email Address",
-		Body:    fmt.Sprintf("Verification token: %s", token),
-		SentAt:  time.Now(),
+	recipient, err := mailer.CanonicalMailbox(to)
+	if err != nil {
+		return fmt.Errorf("收件邮箱无效: %w", err)
+	}
+	sender, err := mailer.CanonicalMailbox(config.FromEmail)
+	if err != nil {
+		return fmt.Errorf("发件邮箱无效: %w", err)
+	}
+	fromName := strings.TrimSpace(config.FromName)
+	if fromName == "" {
+		fromName = "ChronoDesk"
+	}
+	message, err := mailer.BuildHTMLMessage(sender, fromName, subject, body)
+	if err != nil {
+		return fmt.Errorf("构建邮件失败: %w", err)
+	}
+	transport, err := mailer.NewSMTPTransport(mailer.SMTPTransportConfig{
+		Host:           config.SMTPHost,
+		Port:           config.SMTPPort,
+		Username:       config.SMTPUsername,
+		Password:       config.SMTPPassword,
+		UseSTARTTLS:    config.SMTPUseTLS,
+		UseImplicitTLS: config.SMTPUseSSL,
 	})
-	return nil
-}
-
-// SendPasswordResetEmail 模拟发送密码重置邮件
-func (m *MockEmailService) SendPasswordResetEmail(ctx context.Context, email, token string) error {
-	m.sentEmails = append(m.sentEmails, SentEmail{
-		To:      email,
-		Subject: "Reset Your Password",
-		Body:    fmt.Sprintf("Reset token: %s", token),
-		SentAt:  time.Now(),
-	})
-	return nil
-}
-
-// SendWelcomeEmail 模拟发送欢迎邮件
-func (m *MockEmailService) SendWelcomeEmail(ctx context.Context, email, username string) error {
-	m.sentEmails = append(m.sentEmails, SentEmail{
-		To:      email,
-		Subject: "Welcome to Ticketing System!",
-		Body:    fmt.Sprintf("Welcome %s!", username),
-		SentAt:  time.Now(),
-	})
-	return nil
-}
-
-// SendOTPEmail 模拟发送OTP验证码邮件
-func (m *MockEmailService) SendOTPEmail(ctx context.Context, email, code string) error {
-	m.sentEmails = append(m.sentEmails, SentEmail{
-		To:      email,
-		Subject: "Your Verification Code",
-		Body:    fmt.Sprintf("OTP Code: %s", code),
-		SentAt:  time.Now(),
-	})
-	return nil
-}
-
-// GetSentEmails 获取已发送邮件列表
-func (m *MockEmailService) GetSentEmails() []SentEmail {
-	return m.sentEmails
-}
-
-// GetLastSentEmail 获取最后发送的邮件
-func (m *MockEmailService) GetLastSentEmail() *SentEmail {
-	if len(m.sentEmails) == 0 {
-		return nil
+	if err != nil {
+		return fmt.Errorf("SMTP配置无效: %w", err)
 	}
-	return &m.sentEmails[len(m.sentEmails)-1]
-}
-
-// Clear 清空已发送邮件记录
-func (m *MockEmailService) Clear() {
-	m.sentEmails = make([]SentEmail, 0)
-}
-
-// 邮件模板辅助函数
-
-// ValidateEmailTemplate 验证邮件模板
-func ValidateEmailTemplate(template string) error {
-	if template == "" {
-		return fmt.Errorf("email template cannot be empty")
-	}
-	if !strings.Contains(template, "%s") {
-		return fmt.Errorf("email template must contain placeholder")
+	if err := transport.Send(ctx, sender, []string{recipient}, message); err != nil {
+		return fmt.Errorf("发送邮件失败: %w", err)
 	}
 	return nil
 }
 
-// SanitizeEmailContent 清理邮件内容
-func SanitizeEmailContent(content string) string {
-	// 移除潜在的恶意脚本
-	content = strings.ReplaceAll(content, "<script", "&lt;script")
-	content = strings.ReplaceAll(content, "</script>", "&lt;/script&gt;")
-	content = strings.ReplaceAll(content, "javascript:", "")
-	return content
-}
-
-// FormatEmailAddress 格式化邮件地址
-func FormatEmailAddress(name, email string) string {
-	if name == "" {
-		return email
+func (s *SMTPEmailService) applicationURL(
+	route string,
+	parameters map[string]string,
+) string {
+	target := *s.webURL
+	target.Path = path.Join(strings.TrimSuffix(target.Path, "/"), route)
+	query := target.Query()
+	for key, value := range parameters {
+		query.Set(key, value)
 	}
-	return fmt.Sprintf("%s <%s>", name, email)
+	target.RawQuery = query.Encode()
+	return target.String()
 }
 
-// IsValidEmailFormat 验证邮件格式
-func IsValidEmailFormat(email string) bool {
-	return IsValidEmail(email)
+func parseApplicationWebURL(raw string) (*url.URL, error) {
+	raw = strings.TrimSpace(raw)
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("WEB_URL格式无效: %w", err)
+	}
+	if (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.Host == "" ||
+		parsed.User != nil ||
+		parsed.RawQuery != "" ||
+		parsed.Fragment != "" {
+		return nil, errors.New("WEB_URL必须是无凭据、查询参数和片段的绝对HTTP(S)地址")
+	}
+	return parsed, nil
 }

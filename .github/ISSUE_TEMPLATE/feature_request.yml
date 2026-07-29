@@ -1,0 +1,130 @@
+name: "✨ 功能建议 / Feature request"
+description: "提出聚焦、可评估的功能改进。Propose a focused, evaluable improvement."
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先搜索 Issues 和 Discussions。较大的架构或路线变更建议先在 [Discussions](https://github.com/seaworld008/chronodesk/discussions) 探索。安全漏洞请使用[私密 Security Advisory](https://github.com/seaworld008/chronodesk/security/advisories/new)。
+
+        Search first. Explore large architecture or roadmap changes in [Discussions](https://github.com/seaworld008/chronodesk/discussions). Report vulnerabilities through a [private Security Advisory](https://github.com/seaworld008/chronodesk/security/advisories/new).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: "问题与用户价值 / Problem and user value"
+      description: "描述需要解决的问题、受影响用户和当前代价，不要只描述功能名称。Describe the problem, affected users, and current cost."
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: "期望结果与验收标准 / Desired outcome and acceptance criteria"
+      description: "使用可观察、可验证的结果描述“完成”。Define done with observable and testable outcomes."
+      placeholder: |
+        - 当 / Given ...
+        - 执行 / When ...
+        - 应当 / Then ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: "建议方案 / Proposed approach"
+      description: "说明工作流、接口或交互；可附草图。Describe the workflow, contract, or interaction; sketches are welcome."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: "替代方案 / Alternatives considered"
+      description: "说明现有 workaround、其他方案及其不足。Describe current workarounds and why alternatives are insufficient."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: "主要影响区域 / Primary affected area"
+      options:
+        - "Go server / 领域服务"
+        - "React web / 管理端"
+        - "REST / OpenAPI"
+        - "MCP 2026-07-28"
+        - "A2A 1.0"
+        - "数据库 / 迁移"
+        - "部署 / 运维"
+        - "文档 / 社区"
+        - "其他 / Other"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: protocol_impact
+    attributes:
+      label: "协议影响 / Protocol impact"
+      description: "当前只支持 MCP 2026-07-28 与 A2A 1.0。Only these protocol baselines are supported."
+      options:
+        - "无 / None"
+        - "REST / OpenAPI"
+        - "MCP 2026-07-28"
+        - "A2A 1.0"
+        - "多个入口 / Multiple entry points"
+    validations:
+      required: true
+
+  - type: textarea
+    id: agent_impact
+    attributes:
+      label: "Agent 影响 / Agent impact"
+      description: "说明对服务主体、scope、策略、领域语义、幂等、租约、审计、回调和跨协议一致性的影响；无则写“无 / None”。"
+      placeholder: "请确认 Adapter 不会复制领域规则。Confirm adapters will not duplicate domain rules."
+    validations:
+      required: true
+
+  - type: textarea
+    id: security_impact
+    attributes:
+      label: "安全与隐私影响 / Security and privacy impact"
+      description: "说明不可信输入、认证授权、最小权限、数据隔离、秘密、个人数据、滥用与失败模式；无则写“无 / None”并说明理由。"
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: "范围与非目标 / Scope and non-goals"
+      description: "列出本建议明确包含和不包含的内容，以保持实现与 PR 聚焦。State what is explicitly in and out of scope."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: "贡献意愿 / Contribution"
+      description: "这不会影响建议是否被接受。This does not affect whether the request is accepted."
+      options:
+        - "我可以提交 PR / I can submit a PR"
+        - "我可以协助设计或测试 / I can help design or test"
+        - "我目前无法参与实现 / I cannot implement this currently"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: "提交确认 / Submission checks"
+      options:
+        - label: "我已搜索现有 Issues、Discussions 和 Roadmap。I searched existing Issues, Discussions, and the Roadmap."
+          required: true
+        - label: "该建议聚焦一个问题，并包含可验证的用户价值。This request focuses on one problem with testable user value."
+          required: true
+        - label: "这不是未修复安全漏洞的公开披露。This is not a public disclosure of an unpatched vulnerability."
+          required: true
+        - label: "我已阅读并同意遵守行为准则。I have read and agree to follow the Code of Conduct."
+          required: true

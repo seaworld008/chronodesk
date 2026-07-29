@@ -1,19 +1,14 @@
 import React from 'react';
 import {
     List,
-    Datagrid,
-    TextField,
     DateField,
     BooleanField,
+    FunctionField,
     EditButton,
     ShowButton,
-    DeleteButton,
     CreateButton,
     ExportButton,
     FilterButton,
-    SearchInput,
-    SelectInput,
-    DateInput,
     TopToolbar,
     useRecordContext,
     WrapperField,
@@ -38,14 +33,20 @@ import {
     Pause as SuspendedIcon,
     Delete as DeletedIcon,
 } from '@mui/icons-material';
-
-// 用户角色选项
-const roleChoices = [
-    { id: 'admin', name: '管理员' },
-    { id: 'agent', name: '客服代理' },
-    { id: 'customer', name: '客户' },
-    { id: 'supervisor', name: '主管' },
-];
+import {
+    EnterpriseDatagrid,
+    InlineDetails,
+    TruncatedText,
+    type ResizableColumn,
+} from '@/components/tables/EnterpriseTable';
+import { EnterpriseSearchInput } from '@/components/inputs/EnterpriseSearchInput';
+import { EnterpriseSelectFilterInput } from '@/components/inputs/EnterpriseFilterInputs';
+import {
+    getUserRoleLabel,
+    normalizeUserRole,
+    userRoleChoices,
+} from '@/lib/accessControl';
+import { FocusSafeBulkDeleteWithConfirmButton } from '@/components/actions/FocusSafeDeleteButtons';
 
 // 用户状态选项
 const statusChoices = [
@@ -53,6 +54,19 @@ const statusChoices = [
     { id: 'inactive', name: '未激活' },
     { id: 'suspended', name: '暂停' },
     { id: 'deleted', name: '删除' },
+];
+
+const userColumns: ResizableColumn[] = [
+    { key: 'username', defaultWidth: 260, minWidth: 180, maxWidth: 440 },
+    { key: 'role', defaultWidth: 128, minWidth: 104, maxWidth: 200 },
+    { key: 'status', defaultWidth: 128, minWidth: 104, maxWidth: 200 },
+    { key: 'column-4', defaultWidth: 260, minWidth: 180, maxWidth: 440 },
+    { key: 'timezone', defaultWidth: 160, minWidth: 120, maxWidth: 260 },
+    { key: 'language', defaultWidth: 104, minWidth: 80, maxWidth: 160 },
+    { key: 'last_login_at', defaultWidth: 152, minWidth: 120, maxWidth: 240 },
+    { key: 'created_at', defaultWidth: 184, minWidth: 144, maxWidth: 280 },
+    { key: 'email_verified', defaultWidth: 144, minWidth: 120, maxWidth: 200 },
+    { key: 'column-10', defaultWidth: 160, minWidth: 144, maxWidth: 220, sticky: 'right' },
 ];
 
 /**
@@ -73,6 +87,10 @@ const UserAvatar: React.FC = () => {
     };
 
     const initials = getInitials(record.first_name, record.last_name, record.username);
+    const displayName =
+        record.display_name ||
+        `${record.first_name || ''} ${record.last_name || ''}`.trim() ||
+        record.username;
 
     return (
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
@@ -87,14 +105,11 @@ const UserAvatar: React.FC = () => {
             >
                 {initials}
             </Avatar>
-            <Box>
-                <Typography variant="body2" fontWeight={600}>
-                    {record.display_name || `${record.first_name || ''} ${record.last_name || ''}`.trim() || record.username}
-                </Typography>
-                <Typography variant="caption" color="text.secondary">
-                    @{record.username}
-                </Typography>
-            </Box>
+            <InlineDetails
+                primary={displayName}
+                secondary={`@${record.username}`}
+                title={`${displayName} · @${record.username}`}
+            />
         </Box>
     );
 };
@@ -107,10 +122,12 @@ const RoleChip: React.FC = () => {
     if (!record) return null;
 
     const getRoleConfig = (role: string) => {
-        switch (role) {
+        const label = getUserRoleLabel(role);
+
+        switch (normalizeUserRole(role)) {
             case 'admin':
                 return {
-                    label: '管理员',
+                    label,
                     color: '#b91c1c',
                     backgroundColor: '#fee2e2',
                     border: '1px solid #fecaca',
@@ -118,7 +135,7 @@ const RoleChip: React.FC = () => {
                 };
             case 'agent':
                 return {
-                    label: '客服代理',
+                    label,
                     color: '#1d4ed8',
                     backgroundColor: '#dbeafe',
                     border: '1px solid #bfdbfe',
@@ -126,7 +143,7 @@ const RoleChip: React.FC = () => {
                 };
             case 'supervisor':
                 return {
-                    label: '主管',
+                    label,
                     color: '#7e22ce',
                     backgroundColor: '#f3e8ff',
                     border: '1px solid #d8b4fe',
@@ -134,7 +151,7 @@ const RoleChip: React.FC = () => {
                 };
             case 'customer':
                 return {
-                    label: '客户',
+                    label,
                     color: '#15803d',
                     backgroundColor: '#dcfce7',
                     border: '1px solid #bbf7d0',
@@ -243,18 +260,22 @@ const ContactInfo: React.FC = () => {
     const record = useRecordContext();
     if (!record) return null;
 
+    const summary = record.phone ? `${record.email} · ${record.phone}` : record.email;
     return (
-        <Box>
-            <Typography variant="body2" fontWeight={500}>
-                {record.email}
-            </Typography>
-            {record.phone && (
-                <Typography variant="caption" color="text.secondary">
-                    {record.phone}
-                </Typography>
-            )}
-        </Box>
+        <InlineDetails
+            primary={record.email}
+            secondary={record.phone}
+            title={summary}
+            primaryFontWeight={500}
+        />
     );
+};
+
+const languageLabels: Record<string, string> = {
+    'zh-CN': '简体中文',
+    'zh-TW': '繁体中文',
+    'en-US': '英语（美国）',
+    'en-GB': '英语（英国）',
 };
 
 /**
@@ -266,9 +287,10 @@ const LastLoginInfo: React.FC = () => {
 
     if (!record.last_login_at) {
         return (
-            <Typography variant="caption" color="text.secondary">
-                从未登录
-            </Typography>
+            <Typography variant="caption" sx={{
+                color: "text.secondary"
+            }}>从未登录
+                            </Typography>
         );
     }
 
@@ -301,12 +323,9 @@ const LastLoginInfo: React.FC = () => {
  * 过滤器组件
  */
 const UserFilters = [
-    <SearchInput source="q" placeholder="搜索用户" alwaysOn />,
-    <SelectInput source="role" label="角色" choices={roleChoices} />,
-    <SelectInput source="status" label="状态" choices={statusChoices} />,
-    <DateInput source="created_at_gte" label="注册时间从" />,
-    <DateInput source="created_at_lte" label="注册时间到" />,
-    <DateInput source="last_login_at_gte" label="最后登录从" />,
+    <EnterpriseSearchInput source="q" placeholder="搜索用户" alwaysOn />,
+    <EnterpriseSelectFilterInput source="role" label="角色" choices={userRoleChoices} />,
+    <EnterpriseSelectFilterInput source="status" label="状态" choices={statusChoices} />,
 ];
 
 /**
@@ -331,7 +350,12 @@ const UserEmpty = () => (
                 <Typography variant="h5" component="h2" gutterBottom>
                     还没有用户
                 </Typography>
-                <Typography variant="body1" color="text.secondary" paragraph>
+                <Typography
+                    variant="body1"
+                    sx={{
+                        color: "text.secondary",
+                        marginBottom: "16px"
+                    }}>
                     系统中暂时没有任何用户。创建第一个用户来开始使用用户管理系统。
                 </Typography>
                 <CreateButton label="创建第一个用户" variant="contained" />
@@ -345,7 +369,7 @@ const UserEmpty = () => (
  */
 const UserBulkActionButtons = () => (
     <>
-        <DeleteButton label="批量删除" />
+        <FocusSafeBulkDeleteWithConfirmButton label="批量删除" mutationMode="pessimistic" />
     </>
 );
 
@@ -362,7 +386,10 @@ const UserList: React.FC = () => {
             sort={{ field: 'created_at', order: 'DESC' }}
             title="用户管理"
         >
-            <Datagrid
+            <EnterpriseDatagrid
+                tableId="users.main"
+                columns={userColumns}
+                aria-label="用户列表"
                 rowClick="show"
                 bulkActionButtons={<UserBulkActionButtons />}
                 sx={{
@@ -427,16 +454,24 @@ const UserList: React.FC = () => {
                 </WrapperField>
 
                 {/* 时区和语言 */}
-                <TextField
+                <FunctionField
                     source="timezone"
                     label="时区"
-                    sx={{ minWidth: '120px' }}
+                    render={(record) => (
+                        <TruncatedText title={record?.timezone || '—'}>
+                            {record?.timezone || '—'}
+                        </TruncatedText>
+                    )}
                 />
 
-                <TextField
+                <FunctionField
                     source="language"
                     label="语言"
-                    sx={{ minWidth: '80px' }}
+                    render={(record) => (
+                        <TruncatedText title={record?.language ? `语言代码：${record.language}` : '—'}>
+                            {languageLabels[record?.language] || record?.language || '—'}
+                        </TruncatedText>
+                    )}
                 />
 
                 {/* 最后登录 */}
@@ -468,11 +503,17 @@ const UserList: React.FC = () => {
                 />
 
                 {/* 操作按钮 */}
-                <Stack direction="row" spacing={1}>
-                    <ShowButton label="查看" />
-                    <EditButton label="编辑" />
-                </Stack>
-            </Datagrid>
+                <WrapperField
+                    label="操作"
+                    cellClassName="cd-table-sticky-right"
+                    headerClassName="cd-table-sticky-right"
+                >
+                    <Stack className="cd-table-actions" direction="row" spacing={1}>
+                        <ShowButton label="查看" />
+                        <EditButton label="编辑" />
+                    </Stack>
+                </WrapperField>
+            </EnterpriseDatagrid>
         </List>
     );
 };
