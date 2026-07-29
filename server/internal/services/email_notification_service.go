@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"gorm.io/gorm"
 	"gongdan-system/internal/models"
+	"gorm.io/gorm"
 )
 
 // EmailNotificationServiceInterface 邮件通知服务接口
@@ -28,9 +28,9 @@ type EmailTemplate struct {
 
 // EmailNotificationService 邮件通知服务实现
 type EmailNotificationService struct {
-	db                   *gorm.DB
-	emailConfigService   EmailConfigServiceInterface
-	notificationService  NotificationServiceInterface
+	db                  *gorm.DB
+	emailConfigService  EmailConfigServiceInterface
+	notificationService NotificationServiceInterface
 }
 
 // NewEmailNotificationService 创建邮件通知服务
@@ -221,7 +221,7 @@ func (s *EmailNotificationService) GetEmailTemplate(notificationType models.Noti
 func (s *EmailNotificationService) isEmailEnabledForUser(ctx context.Context, userID uint, notificationType models.NotificationType) (bool, error) {
 	var preference models.NotificationPreference
 	err := s.db.Where("user_id = ? AND notification_type = ?", userID, notificationType).First(&preference).Error
-	
+
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
 			// 没有设置偏好，默认启用邮件
@@ -229,7 +229,7 @@ func (s *EmailNotificationService) isEmailEnabledForUser(ctx context.Context, us
 		}
 		return false, err
 	}
-	
+
 	return preference.EmailEnabled, nil
 }
 
@@ -237,41 +237,41 @@ func (s *EmailNotificationService) isEmailEnabledForUser(ctx context.Context, us
 func (s *EmailNotificationService) sendEmail(config *models.EmailConfig, to, subject, body string) error {
 	// 创建SMTP认证
 	auth := smtp.PlainAuth("", config.SMTPUsername, config.SMTPPassword, config.SMTPHost)
-	
+
 	// 构建邮件消息
 	msg := s.buildEmailMessage(config.FromEmail, config.FromName, to, subject, body)
-	
+
 	// 发送邮件
 	addr := fmt.Sprintf("%s:%d", config.SMTPHost, config.SMTPPort)
 	err := smtp.SendMail(addr, auth, config.FromEmail, []string{to}, []byte(msg))
-	
+
 	return err
 }
 
 // buildEmailMessage 构建邮件消息
 func (s *EmailNotificationService) buildEmailMessage(fromEmail, fromName, to, subject, htmlBody string) string {
 	headers := make(map[string]string)
-	
+
 	// 设置发件人
 	if fromName != "" {
 		headers["From"] = fmt.Sprintf("%s <%s>", fromName, fromEmail)
 	} else {
 		headers["From"] = fromEmail
 	}
-	
+
 	headers["To"] = to
 	headers["Subject"] = subject
 	headers["MIME-Version"] = "1.0"
 	headers["Content-Type"] = "text/html; charset=UTF-8"
 	headers["Date"] = time.Now().Format(time.RFC1123Z)
-	
+
 	// 构建消息
 	message := ""
 	for k, v := range headers {
 		message += fmt.Sprintf("%s: %s\r\n", k, v)
 	}
 	message += "\r\n" + htmlBody
-	
+
 	return message
 }
 
@@ -279,13 +279,13 @@ func (s *EmailNotificationService) buildEmailMessage(fromEmail, fromName, to, su
 func (s *EmailNotificationService) renderEmailContent(template *EmailTemplate, notification *models.Notification) (string, string, error) {
 	// 创建模板数据
 	data := s.buildTemplateData(notification)
-	
+
 	// 渲染主题
 	subject := s.renderTemplate(template.Subject, data)
-	
+
 	// 渲染HTML内容
 	htmlBody := s.renderTemplate(template.HTMLBody, data)
-	
+
 	return subject, htmlBody, nil
 }
 
@@ -299,18 +299,18 @@ func (s *EmailNotificationService) buildTemplateData(notification *models.Notifi
 		"CreatedAt": notification.CreatedAt.Format("2006-01-02 15:04:05"),
 		"ActionURL": notification.ActionURL,
 	}
-	
+
 	// 添加接收者信息
 	if notification.Recipient != nil {
 		data["RecipientName"] = notification.Recipient.Username
 		data["RecipientEmail"] = notification.Recipient.Email
 	}
-	
+
 	// 添加发送者信息
 	if notification.Sender != nil {
 		data["SenderName"] = notification.Sender.Username
 	}
-	
+
 	// 添加相关工单信息
 	if notification.RelatedTicket != nil {
 		data["TicketNumber"] = notification.RelatedTicket.TicketNumber
@@ -318,7 +318,7 @@ func (s *EmailNotificationService) buildTemplateData(notification *models.Notifi
 		data["TicketStatus"] = string(notification.RelatedTicket.Status)
 		data["TicketPriority"] = string(notification.RelatedTicket.Priority)
 	}
-	
+
 	// 解析metadata
 	if notification.Metadata != "" {
 		var metadata map[string]interface{}
@@ -328,20 +328,20 @@ func (s *EmailNotificationService) buildTemplateData(notification *models.Notifi
 			}
 		}
 	}
-	
+
 	return data
 }
 
 // renderTemplate 简单模板渲染
 func (s *EmailNotificationService) renderTemplate(template string, data map[string]interface{}) string {
 	result := template
-	
+
 	for key, value := range data {
 		placeholder := fmt.Sprintf("{{.%s}}", key)
 		replacement := fmt.Sprintf("%v", value)
 		result = strings.ReplaceAll(result, placeholder, replacement)
 	}
-	
+
 	return result
 }
 

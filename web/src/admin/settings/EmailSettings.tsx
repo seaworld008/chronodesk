@@ -193,22 +193,37 @@ const EmailSettings: React.FC = () => {
 
   return (
     <Box sx={{ p: 3 }}>
-      <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 2 }}>
-        <Stack direction="row" spacing={2} alignItems="center">
+      <Stack
+        direction="row"
+        sx={{
+          alignItems: "center",
+          justifyContent: "space-between",
+          mb: 2
+        }}>
+        <Stack direction="row" spacing={2} sx={{
+          alignItems: "center"
+        }}>
           <BackButton fallbackPath="/system-settings" />
           <Box>
             <Typography variant="h4" gutterBottom>
               邮件通知配置
             </Typography>
-            <Typography color="text.secondary">
+            <Typography sx={{
+              color: "text.secondary"
+            }}>
               配置 SMTP 服务器与模板，用于系统通知邮件发送。
             </Typography>
           </Box>
         </Stack>
       </Stack>
-
       <Paper sx={{ p: 3, mb: 3 }}>
-        <Stack direction="row" spacing={2} alignItems="center" sx={{ mb: 2 }}>
+        <Stack
+          direction="row"
+          spacing={2}
+          sx={{
+            alignItems: "center",
+            mb: 2
+          }}>
           <FormControlLabel
             control={<Switch checked={config.email_verification_enabled} onChange={(e) => handleChange('email_verification_enabled', e.target.checked)} />}
             label="启用邮件功能"
@@ -226,7 +241,11 @@ const EmailSettings: React.FC = () => {
         </Stack>
 
         <Grid container spacing={2}>
-          <Grid item xs={12} md={6}>
+          <Grid
+            size={{
+              xs: 12,
+              md: 6
+            }}>
             <TextField
               fullWidth
               label="SMTP 主机"
@@ -234,7 +253,11 @@ const EmailSettings: React.FC = () => {
               onChange={(e) => handleChange('smtp_host', e.target.value)}
             />
           </Grid>
-          <Grid item xs={12} md={6}>
+          <Grid
+            size={{
+              xs: 12,
+              md: 6
+            }}>
             <TextField
               fullWidth
               label="SMTP 端口"
@@ -243,7 +266,11 @@ const EmailSettings: React.FC = () => {
               onChange={(e) => handleChange('smtp_port', Number(e.target.value))}
             />
           </Grid>
-          <Grid item xs={12} md={6}>
+          <Grid
+            size={{
+              xs: 12,
+              md: 6
+            }}>
             <TextField
               fullWidth
               label="SMTP 用户名"
@@ -251,28 +278,44 @@ const EmailSettings: React.FC = () => {
               onChange={(e) => handleChange('smtp_username', e.target.value)}
             />
           </Grid>
-          <Grid item xs={12} md={6}>
+          <Grid
+            size={{
+              xs: 12,
+              md: 6
+            }}>
             <TextField
               fullWidth
               type="password"
-              label="SMTP 密码 (留空则不修改)"
+              label="SMTP 密码（留空则不修改）"
               value={config.smtp_password ?? ''}
               onChange={(e) => handleChange('smtp_password', e.target.value)}
             />
           </Grid>
-          <Grid item xs={12} md={6}>
+          <Grid
+            size={{
+              xs: 12,
+              md: 6
+            }}>
             <FormControlLabel
               control={<Switch checked={config.smtp_use_tls} onChange={(e) => handleChange('smtp_use_tls', e.target.checked)} />}
               label="启用 TLS"
             />
           </Grid>
-          <Grid item xs={12} md={6}>
+          <Grid
+            size={{
+              xs: 12,
+              md: 6
+            }}>
             <FormControlLabel
               control={<Switch checked={config.smtp_use_ssl} onChange={(e) => handleChange('smtp_use_ssl', e.target.checked)} />}
               label="启用 SSL"
             />
           </Grid>
-          <Grid item xs={12} md={6}>
+          <Grid
+            size={{
+              xs: 12,
+              md: 6
+            }}>
             <TextField
               fullWidth
               label="发件人邮箱"
@@ -280,7 +323,11 @@ const EmailSettings: React.FC = () => {
               onChange={(e) => handleChange('from_email', e.target.value)}
             />
           </Grid>
-          <Grid item xs={12} md={6}>
+          <Grid
+            size={{
+              xs: 12,
+              md: 6
+            }}>
             <TextField
               fullWidth
               label="发件人名称"
@@ -290,13 +337,16 @@ const EmailSettings: React.FC = () => {
           </Grid>
         </Grid>
       </Paper>
-
       <Paper sx={{ p: 3, mb: 3 }}>
         <Typography variant="h6" gutterBottom>
           邮件模板
         </Typography>
         <Grid container spacing={2}>
-          <Grid item xs={12} md={6}>
+          <Grid
+            size={{
+              xs: 12,
+              md: 6
+            }}>
             <TextField
               fullWidth
               label="欢迎邮件标题"
@@ -304,7 +354,11 @@ const EmailSettings: React.FC = () => {
               onChange={(e) => handleChange('welcome_email_subject', e.target.value)}
             />
           </Grid>
-          <Grid item xs={12} md={6}>
+          <Grid
+            size={{
+              xs: 12,
+              md: 6
+            }}>
             <TextField
               fullWidth
               label="验证码邮件标题"
@@ -312,7 +366,7 @@ const EmailSettings: React.FC = () => {
               onChange={(e) => handleChange('otp_email_subject', e.target.value)}
             />
           </Grid>
-          <Grid item xs={12}>
+          <Grid size={12}>
             <TextField
               fullWidth
               multiline
@@ -322,7 +376,7 @@ const EmailSettings: React.FC = () => {
               onChange={(e) => handleChange('welcome_email_template', e.target.value)}
             />
           </Grid>
-          <Grid item xs={12}>
+          <Grid size={12}>
             <TextField
               fullWidth
               multiline
@@ -334,7 +388,6 @@ const EmailSettings: React.FC = () => {
           </Grid>
         </Grid>
       </Paper>
-
       <Stack direction="row" spacing={2}>
         <Button
           variant="contained"
@@ -365,7 +418,6 @@ const EmailSettings: React.FC = () => {
           刷新
         </Button>
       </Stack>
-
       <Dialog open={testDialogOpen} onClose={() => setTestDialogOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>发送测试邮件</DialogTitle>
         <DialogContent dividers>
@@ -397,7 +449,7 @@ const EmailSettings: React.FC = () => {
         </DialogActions>
       </Dialog>
     </Box>
-  )
+  );
 }
 
 export default EmailSettings

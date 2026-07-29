@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net/smtp"
+	"strconv"
 
-	"gorm.io/gorm"
 	"gongdan-system/internal/models"
+	"gongdan-system/internal/security"
+	"gorm.io/gorm"
 )
 
 // EmailConfigServiceInterface defines the interface for email config service
@@ -22,13 +24,25 @@ type EmailConfigServiceInterface interface {
 
 // EmailConfigService implements EmailConfigServiceInterface
 type EmailConfigService struct {
-	db *gorm.DB
+	db        *gorm.DB
+	protector security.Protector
 }
 
 // NewEmailConfigService creates a new email config service
 func NewEmailConfigService(db *gorm.DB) EmailConfigServiceInterface {
+	protector, _ := security.LoadDeploymentKeyringFromEnvironment()
+	return NewEmailConfigServiceWithProtector(db, protector)
+}
+
+// NewEmailConfigServiceWithProtector injects the application data-encryption
+// keyring. A nil protector is fail-closed whenever an SMTP password is present.
+func NewEmailConfigServiceWithProtector(
+	db *gorm.DB,
+	protector security.Protector,
+) EmailConfigServiceInterface {
 	return &EmailConfigService{
-		db: db,
+		db:        db,
+		protector: protector,
 	}
 }
 
@@ -50,6 +64,9 @@ func (s *EmailConfigService) GetEmailConfig(ctx context.Context) (*models.EmailC
 		return nil, fmt.Errorf("failed to get email config: %w", err)
 	}
 
+	if err := s.revealSMTPPassword(&config); err != nil {
+		return nil, fmt.Errorf("无法读取SMTP凭据: %w", err)
+	}
 	return &config, nil
 }
 
@@ -118,10 +135,22 @@ func (s *EmailConfigService) UpdateEmailConfig(ctx context.Context, req *models.
 		}
 	}
 
-	// 保存配置
-	if err := s.db.WithContext(ctx).Save(config).Error; err != nil {
+	// 只将密文副本持久化；返回给调用方的运行时对象继续保留明文，以便
+	// 立即执行连接测试或发信。
+	persisted := *config
+	persisted.SMTPPassword, err = security.ProtectOptional(
+		s.protector,
+		config.SMTPPassword,
+		emailSMTPPasswordAAD(config.ID),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("无法加密SMTP凭据: %w", err)
+	}
+	if err := s.db.WithContext(ctx).Save(&persisted).Error; err != nil {
 		return nil, fmt.Errorf("failed to update email config: %w", err)
 	}
+	config.CreatedAt = persisted.CreatedAt
+	config.UpdatedAt = persisted.UpdatedAt
 
 	return config, nil
 }
@@ -200,6 +229,30 @@ func (s *EmailConfigService) createDefaultConfig(ctx context.Context) (*models.E
 	}
 
 	return config, nil
+}
+
+func (s *EmailConfigService) revealSMTPPassword(config *models.EmailConfig) error {
+	if config == nil {
+		return errors.New("SMTP配置不能为空")
+	}
+	password, err := security.RevealOptional(
+		s.protector,
+		config.SMTPPassword,
+		emailSMTPPasswordAAD(config.ID),
+	)
+	if err != nil {
+		return err
+	}
+	config.SMTPPassword = password
+	return nil
+}
+
+func emailSMTPPasswordAAD(configID uint) []byte {
+	return security.FieldAAD(
+		"email_configs",
+		strconv.FormatUint(uint64(configID), 10),
+		"smtp_password",
+	)
 }
 
 // testSMTPConnection tests the SMTP connection

@@ -5,8 +5,10 @@ Covers create -> update -> assign -> status changes -> notifications.
 
 from __future__ import annotations
 
+import json
+import secrets
 import time
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, Iterator, List, Set
 
 import pytest
 
@@ -35,39 +37,48 @@ class TestTicketLifecycle:
         items = payload.get("data", {}).get("items", [])
         return {item["id"] for item in items}
 
-    def _wait_for_ticket_notification(
+    def _wait_for_ticket_notifications(
         self,
         client: APIClient,
         ticket_id: int,
         *,
-        expected_type: str | None = None,
-        attempts: int = 5,
+        expected_counts: Dict[str, int],
+        attempts: int = 45,
         delay: float = 1.0,
-    ) -> Dict[str, Any]:
-        """Poll notifications until we find one referencing the ticket."""
+    ) -> List[Dict[str, Any]]:
+        """Poll the recipient's inbox until every expected Outbox item arrives."""
 
         for _ in range(attempts):
-            response = client.get_json("/notifications", params={"limit": 50})
+            response = client.get_json(
+                "/notifications",
+                params={
+                    "limit": 50,
+                    "filter": json.dumps({"related_ticket_id": ticket_id}),
+                },
+            )
             assert response.status_code == 200, response.text
             payload = response.json()
             assert payload.get("code") == 0, payload
 
             items = payload.get("data", {}).get("items", [])
+            linked: List[Dict[str, Any]] = []
             for item in items:
-                if expected_type and item.get("type") != expected_type:
-                    continue
-
                 related_ticket = item.get("related_ticket") or {}
-                if related_ticket and related_ticket.get("id") == ticket_id:
-                    return item
-
                 related_ticket_id = item.get("related_ticket_id")
-                if related_ticket_id == ticket_id:
-                    return item
+                if related_ticket.get("id") == ticket_id or related_ticket_id == ticket_id:
+                    linked.append(item)
+
+            if all(
+                sum(1 for item in linked if item.get("type") == notification_type) >= count
+                for notification_type, count in expected_counts.items()
+            ):
+                return linked
 
             time.sleep(delay)
 
-        pytest.fail(f"未在通知列表中找到与工单 {ticket_id} 相关的通知 ({expected_type or 'any'})")
+        pytest.fail(
+            f"未在通知列表中收到工单 {ticket_id} 的全部异步通知：{expected_counts}"
+        )
 
     def _fetch_ticket(self, client: APIClient, ticket_id: int) -> Dict[str, object]:
         response = client.get_json(f"/tickets/{ticket_id}")
@@ -76,23 +87,76 @@ class TestTicketLifecycle:
         assert payload.get("code") == 0, payload
         return payload["data"]
 
-    @pytest.fixture(scope="class")
-    def secondary_agent(self, admin_api: APIClient) -> Dict[str, Any]:
-        response = admin_api.get_json(
+    @pytest.fixture
+    def secondary_agent(
+        self,
+        api_client: APIClient,
+        admin_api: APIClient,
+    ) -> Iterator[Dict[str, Any]]:
+        """Create an isolated assignee and authenticate as that exact recipient."""
+
+        suffix = time.time_ns()
+        password = _generate_strong_password()
+        response = admin_api.post_json(
             "/admin/users",
-            params={
+            {
+                "username": f"ticket_agent_{suffix}",
+                "email": f"ticket_agent_{suffix}@example.com",
+                "password": password,
+                "first_name": "Ticket",
+                "last_name": "Agent",
+                "display_name": "工单回归客服",
                 "role": "agent",
-                "page_size": 1,
-                "order_by": "id",
-                "order": "asc",
+                "department": "QA Automation",
+                "job_title": "Integration Agent",
             },
         )
-        assert response.status_code == 200, response.text
+        assert response.status_code == 201, response.text
         body = response.json()
         assert body.get("code") == 0, body
-        items: List[Dict[str, Any]] = body.get("data", {}).get("items", [])
-        assert items, "缺少可用的客服/技术支持账号供分配"
-        return items[0]
+        agent: Dict[str, Any] = body["data"]
+
+        verification = admin_api.put_json(
+            f"/admin/users/{agent['id']}",
+            {"email_verified": True},
+        )
+        assert verification.status_code == 200, verification.text
+
+        login = api_client.login(agent["email"], password)
+        token = login.get("access_token")
+        assert token, "临时客服登录响应缺少 access_token"
+        agent_api = api_client.with_auth(token)
+        agent["api"] = agent_api
+        try:
+            yield agent
+        finally:
+            agent_api.close()
+            for notification_id in agent.get("_notification_ids", []):
+                notification_cleanup = admin_api.delete(
+                    f"/admin/notifications/{notification_id}"
+                )
+                assert notification_cleanup.status_code in (200, 204, 404), (
+                    notification_cleanup.text
+                )
+            cleanup = admin_api.delete(f"/admin/users/{agent['id']}")
+            assert cleanup.status_code in (200, 204, 404), cleanup.text
+
+    @pytest.fixture
+    def created_ticket_ids(
+        self,
+        admin_api: APIClient,
+        secondary_agent: Dict[str, Any],
+    ) -> Iterator[List[int]]:
+        """Always remove test tickets before the temporary assignee is deleted."""
+
+        del secondary_agent
+        ticket_ids: List[int] = []
+        try:
+            yield ticket_ids
+        finally:
+            for ticket_id in reversed(ticket_ids):
+                cleanup = admin_api.delete(f"/tickets/{ticket_id}")
+                assert cleanup.status_code in (200, 204, 404), cleanup.text
 
     def test_full_lifecycle(
         self,
@@ -100,9 +164,10 @@ class TestTicketLifecycle:
         admin_tokens: Dict[str, object],
         ticket_payload: Dict[str, object],
         secondary_agent: Dict[str, Any],
+        created_ticket_ids: List[int],
     ) -> None:
-        # Baseline notifications for diff check
-        existing_notifications = self._fetch_notification_ids(admin_api, limit=100)
+        agent_api = secondary_agent["api"]
+        existing_agent_notifications = self._fetch_notification_ids(agent_api, limit=100)
 
         # 1. Create ticket
         create_resp = admin_api.post_json("/tickets", ticket_payload)
@@ -111,6 +176,7 @@ class TestTicketLifecycle:
         assert create_body.get("code") == 0, create_body
         ticket = create_body["data"]
         ticket_id = ticket["id"]
+        created_ticket_ids.append(ticket_id)
 
         # Ensure title matches request
         assert ticket["title"] == ticket_payload["title"]
@@ -191,42 +257,63 @@ class TestTicketLifecycle:
         assert any(resolution_comment in desc for desc in status_descriptions), "解决状态历史未包含备注"
         assert any("Automated resolution notes" in desc for desc in status_descriptions), "解决历史未包含解决方案"
 
-        # 7. Verify notifications
-        # 获取通知并确认与工单相关的通知存在
-        latest_notifications = self._fetch_notification_ids(admin_api, limit=100)
-        assert latest_notifications - existing_notifications, "未检测到新的通知记录"
-
-        notif_resp = admin_api.get_json("/notifications", params={"limit": 50})
-        assert notif_resp.status_code == 200, notif_resp.text
-        notif_body = notif_resp.json()
-        assert notif_body.get("code") == 0, notif_body
-        items: List[Dict[str, object]] = notif_body.get("data", {}).get("items", [])
-        linked = [
-            item
-            for item in items
-            if (item.get("related_ticket") and item["related_ticket"]["id"] == ticket_id)
-            or (item.get("related_id") == ticket_id)
+        # 7. Verify the asynchronous Outbox delivery through the actual recipient.
+        # `/notifications` is deliberately object-scoped, so an administrator's
+        # self-service list must never be used to inspect another user's inbox.
+        delivered_notifications = self._wait_for_ticket_notifications(
+            agent_api,
+            ticket_id,
+            expected_counts={
+                "ticket_assigned": 1,
+                "ticket_status_changed": 2,
+            },
+        )
+        secondary_agent["_notification_ids"] = [
+            notification["id"] for notification in delivered_notifications
         ]
-        assert linked, "Expected at least one notification referencing the ticket"
-
-        agent_notifications = [
+        assignment_notification = next(
             item
-            for item in items
+            for item in delivered_notifications
             if item.get("type") == "ticket_assigned"
-            and item.get("recipient", {}).get("id") == agent_id
-            and (
-                (item.get("related_ticket") and item["related_ticket"].get("id") == ticket_id)
-                or item.get("related_ticket_id") == ticket_id
-            )
+        )
+        assert assignment_notification["id"] not in existing_agent_notifications
+        assert assignment_notification.get("recipient", {}).get("id") == agent_id
+
+        status_notifications = [
+            item
+            for item in delivered_notifications
+            if item.get("type") == "ticket_status_changed"
         ]
-        assert agent_notifications, "工单分配后未在通知列表中找到针对代理用户的通知"
+        assert len(status_notifications) >= 2
+        assert all(
+            item.get("recipient", {}).get("id") == agent_id
+            for item in status_notifications
+        )
+
+        admin_notification_ids = self._fetch_notification_ids(admin_api, limit=100)
+        assert assignment_notification["id"] not in admin_notification_ids
+        assert all(
+            notification["id"] not in admin_notification_ids
+            for notification in status_notifications
+        )
 
         # 8. Cleanup - delete ticket
         delete_resp = admin_api.delete(f"/tickets/{ticket_id}")
-        if delete_resp.status_code in (200, 204):
-            if delete_resp.status_code == 200:
-                delete_body = delete_resp.json()
-                assert delete_body.get("code") == 0, delete_body
-        else:
-            # 当前系统对关联通知存在外键限制，允许在通知保留时清理失败
-            assert "violates foreign key" in delete_resp.text
+        assert delete_resp.status_code in (200, 204), delete_resp.text
+        if delete_resp.status_code == 200:
+            delete_body = delete_resp.json()
+            assert delete_body.get("code") == 0, delete_body
+        created_ticket_ids.remove(ticket_id)
+
+
+def _generate_strong_password() -> str:
+    """Generate a password accepted by the production authentication policy."""
+
+    while True:
+        password = f"Aa1!{secrets.token_hex(8)}Z"
+        if all(
+            password[index] != password[index + 1]
+            or password[index] != password[index + 2]
+            for index in range(len(password) - 2)
+        ):
+            return password

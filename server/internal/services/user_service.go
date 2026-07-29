@@ -1,13 +1,20 @@
 package services
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"image"
+	"image/jpeg"
+	"image/png"
+	"io"
 	"mime/multipart"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 	"gongdan-system/internal/models"
 	"gorm.io/gorm"
@@ -15,8 +22,23 @@ import (
 
 // UserService 用户服务
 type UserService struct {
-	db *gorm.DB
+	db             *gorm.DB
+	avatarStorage  AttachmentStorage
+	avatarMaxBytes int64
 }
+
+const (
+	defaultAvatarMaxBytes = 2 * 1024 * 1024
+	maxAvatarDimension    = 4096
+	maxAvatarPixels       = 16 * 1024 * 1024
+	avatarURLPrefix       = "/uploads/avatars/"
+)
+
+var (
+	ErrAvatarStorageMissing = errors.New("avatar storage is not configured")
+	ErrInvalidAvatar        = errors.New("invalid avatar image")
+	ErrAvatarNotFound       = errors.New("avatar not found")
+)
 
 var loginHistorySortableColumns = map[string]string{
 	"login_time":   "login_time",
@@ -32,7 +54,18 @@ var loginHistorySortableColumns = map[string]string{
 // NewUserService 创建用户服务
 func NewUserService(db *gorm.DB) *UserService {
 	return &UserService{
-		db: db,
+		db:             db,
+		avatarMaxBytes: defaultAvatarMaxBytes,
+	}
+}
+
+// SetAvatarStorage reuses the protocol-neutral object store used by ticket
+// attachments. Avatar keys live in a separate prefix and are never accepted
+// from caller-provided URLs.
+func (s *UserService) SetAvatarStorage(storage AttachmentStorage, maxBytes int64) {
+	s.avatarStorage = storage
+	if maxBytes > 0 {
+		s.avatarMaxBytes = maxBytes
 	}
 }
 
@@ -326,10 +359,6 @@ func (s *UserService) DeleteLoginSession(ctx context.Context, userID uint, histo
 		return fmt.Errorf("failed to find login session: %w", err)
 	}
 
-	if !loginHistory.IsActive {
-		return nil
-	}
-
 	now := time.Now()
 	updates := map[string]interface{}{
 		"is_active": false,
@@ -341,14 +370,34 @@ func (s *UserService) DeleteLoginSession(ctx context.Context, userID uint, histo
 		updates["session_duration"] = int64(now.Sub(loginHistory.LoginTime).Seconds())
 	}
 
-	if err := s.db.WithContext(ctx).
-		Model(&models.LoginHistory{}).
-		Where("id = ?", loginHistory.ID).
-		Updates(updates).Error; err != nil {
-		return fmt.Errorf("failed to deactivate login session: %w", err)
-	}
-
-	return nil
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if loginHistory.IsActive {
+			if err := tx.
+				Model(&models.LoginHistory{}).
+				Where("id = ? AND user_id = ?", loginHistory.ID, userID).
+				Updates(updates).Error; err != nil {
+				return fmt.Errorf("failed to deactivate login session: %w", err)
+			}
+		}
+		if strings.TrimSpace(loginHistory.SessionID) == "" {
+			return nil
+		}
+		if err := tx.
+			Table("refresh_tokens").
+			Where(
+				"user_id = ? AND session_id = ? AND revoked = ?",
+				userID,
+				loginHistory.SessionID,
+				false,
+			).
+			Updates(map[string]interface{}{
+				"revoked":    true,
+				"revoked_at": now,
+			}).Error; err != nil {
+			return fmt.Errorf("failed to revoke login session tokens: %w", err)
+		}
+		return nil
+	})
 }
 
 // GetUserStats 获取用户统计信息
@@ -428,42 +477,145 @@ func (s *UserService) GetUserStats(ctx context.Context, userID uint) (*models.Us
 
 // UploadAvatar 上传用户头像
 func (s *UserService) UploadAvatar(ctx context.Context, userID uint, file multipart.File, header *multipart.FileHeader) (string, error) {
-	// 验证文件类型
-	allowedTypes := []string{".jpg", ".jpeg", ".png", ".gif"}
-	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if s.avatarStorage == nil {
+		return "", ErrAvatarStorageMissing
+	}
+	if file == nil || header == nil {
+		return "", fmt.Errorf("%w: file is required", ErrInvalidAvatar)
+	}
+	maxBytes := s.avatarMaxBytes
+	if maxBytes <= 0 {
+		maxBytes = defaultAvatarMaxBytes
+	}
+	if header.Size > maxBytes {
+		return "", ErrAttachmentTooLarge
+	}
 
-	isAllowed := false
-	for _, allowedType := range allowedTypes {
-		if ext == allowedType {
-			isAllowed = true
-			break
+	payload, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("%w: read upload: %v", ErrInvalidAvatar, err)
+	}
+	if int64(len(payload)) > maxBytes {
+		return "", ErrAttachmentTooLarge
+	}
+
+	imageConfig, format, err := image.DecodeConfig(bytes.NewReader(payload))
+	if err != nil {
+		return "", fmt.Errorf("%w: image header cannot be decoded", ErrInvalidAvatar)
+	}
+	if imageConfig.Width <= 0 || imageConfig.Height <= 0 ||
+		imageConfig.Width > maxAvatarDimension || imageConfig.Height > maxAvatarDimension ||
+		int64(imageConfig.Width)*int64(imageConfig.Height) > maxAvatarPixels {
+		return "", fmt.Errorf("%w: image dimensions exceed the safe limit", ErrInvalidAvatar)
+	}
+	if format != "jpeg" && format != "png" {
+		return "", fmt.Errorf("%w: only JPEG and PNG are supported", ErrInvalidAvatar)
+	}
+
+	decoded, decodedFormat, err := image.Decode(bytes.NewReader(payload))
+	if err != nil || decodedFormat != format {
+		return "", fmt.Errorf("%w: image payload cannot be decoded", ErrInvalidAvatar)
+	}
+	sanitized := bytes.NewBuffer(make([]byte, 0, len(payload)))
+	extension := ".jpg"
+	switch format {
+	case "jpeg":
+		if err := jpeg.Encode(sanitized, decoded, &jpeg.Options{Quality: 90}); err != nil {
+			return "", fmt.Errorf("%w: encode JPEG: %v", ErrInvalidAvatar, err)
+		}
+	case "png":
+		extension = ".png"
+		encoder := png.Encoder{CompressionLevel: png.BestSpeed}
+		if err := encoder.Encode(sanitized, decoded); err != nil {
+			return "", fmt.Errorf("%w: encode PNG: %v", ErrInvalidAvatar, err)
 		}
 	}
-
-	if !isAllowed {
-		return "", fmt.Errorf("unsupported file type: %s", ext)
+	if int64(sanitized.Len()) > maxBytes {
+		return "", ErrAttachmentTooLarge
 	}
 
-	// 验证文件大小（2MB限制）
-	if header.Size > 2*1024*1024 {
-		return "", fmt.Errorf("file too large: maximum 2MB allowed")
+	var user models.User
+	if err := s.db.WithContext(ctx).Select("id", "avatar").First(&user, userID).Error; err != nil {
+		return "", fmt.Errorf("find avatar owner: %w", err)
 	}
 
-	// 生成唯一文件名
-	filename := fmt.Sprintf("avatar_%d_%d%s", userID, time.Now().Unix(), ext)
+	filename := uuid.NewString() + extension
+	key := filepath.ToSlash(filepath.Join("avatars", fmt.Sprintf("%d", userID), filename))
+	stored, err := s.avatarStorage.Put(ctx, key, bytes.NewReader(sanitized.Bytes()), maxBytes)
+	if err != nil {
+		return "", fmt.Errorf("store avatar: %w", err)
+	}
+	avatarURL := avatarURLPrefix + fmt.Sprintf("%d/%s", userID, filename)
 
-	// TODO: 实现文件保存逻辑（本地存储或云存储）
-	// 这里暂时返回模拟的URL
-	avatarURL := fmt.Sprintf("/uploads/avatars/%s", filename)
-
-	// 更新用户头像URL
 	if err := s.db.WithContext(ctx).Model(&models.User{}).
 		Where("id = ?", userID).
 		Update("avatar", avatarURL).Error; err != nil {
-		return "", fmt.Errorf("failed to update avatar: %w", err)
+		_ = s.avatarStorage.Delete(context.Background(), stored.Key)
+		return "", fmt.Errorf("update avatar: %w", err)
 	}
 
+	if oldKey, ok := avatarStorageKey(user.Avatar); ok && oldKey != stored.Key {
+		_ = s.avatarStorage.Delete(context.Background(), oldKey)
+	}
 	return avatarURL, nil
+}
+
+// OpenAvatar only serves the user's current opaque avatar URL. Superseded
+// objects are deleted on replacement and cannot be replayed through this API.
+func (s *UserService) OpenAvatar(
+	ctx context.Context,
+	userID uint,
+	filename string,
+) (io.ReadCloser, string, error) {
+	if s.avatarStorage == nil {
+		return nil, "", ErrAvatarStorageMissing
+	}
+	if filepath.Base(filename) != filename {
+		return nil, "", ErrAvatarNotFound
+	}
+	extension := strings.ToLower(filepath.Ext(filename))
+	idPart := strings.TrimSuffix(filename, extension)
+	if _, err := uuid.Parse(idPart); err != nil || (extension != ".jpg" && extension != ".png") {
+		return nil, "", ErrAvatarNotFound
+	}
+	avatarURL := avatarURLPrefix + fmt.Sprintf("%d/%s", userID, filename)
+	var count int64
+	if err := s.db.WithContext(ctx).Model(&models.User{}).
+		Where("id = ? AND avatar = ? AND status <> ?", userID, avatarURL, models.UserStatusDeleted).
+		Count(&count).Error; err != nil {
+		return nil, "", fmt.Errorf("verify avatar owner: %w", err)
+	}
+	if count != 1 {
+		return nil, "", ErrAvatarNotFound
+	}
+
+	reader, err := s.avatarStorage.Open(
+		ctx,
+		filepath.ToSlash(filepath.Join("avatars", fmt.Sprintf("%d", userID), filename)),
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %v", ErrAvatarNotFound, err)
+	}
+	contentType := "image/jpeg"
+	if extension == ".png" {
+		contentType = "image/png"
+	}
+	return reader, contentType, nil
+}
+
+func avatarStorageKey(avatarURL string) (string, bool) {
+	if !strings.HasPrefix(avatarURL, avatarURLPrefix) {
+		return "", false
+	}
+	key := strings.TrimPrefix(avatarURL, avatarURLPrefix)
+	if key == "" || filepath.IsAbs(key) {
+		return "", false
+	}
+	cleaned := filepath.ToSlash(filepath.Clean(filepath.FromSlash(key)))
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return "", false
+	}
+	return "avatars/" + cleaned, true
 }
 
 // recordPasswordChange 记录密码修改（内部方法）

@@ -15,7 +15,7 @@ type AutomationRule struct {
 	Name        string `json:"name" gorm:"size:100;not null"`
 	Description string `json:"description" gorm:"type:text"`
 	RuleType    string `json:"rule_type" gorm:"size:50;not null;index"` // assignment, classification, escalation, sla
-	IsActive    bool   `json:"is_active" gorm:"default:true;index"`
+	IsActive    bool   `json:"is_active" gorm:"default:false;index"`
 	Priority    int    `json:"priority" gorm:"default:1;index"` // 规则优先级，数字越小优先级越高
 
 	// 触发条件
@@ -171,12 +171,43 @@ type WorkingHours struct {
 	Friday    TimeRange `json:"friday"`
 	Saturday  TimeRange `json:"saturday"`
 	Sunday    TimeRange `json:"sunday"`
+	// Timezone is an IANA zone such as Asia/Shanghai. Blank keeps the ticket's
+	// timestamp zone for backwards compatibility.
+	Timezone string `json:"timezone,omitempty"`
+	// Holidays contains explicit local calendar dates in YYYY-MM-DD format.
+	// They are applied only when ExcludeHolidays is enabled on the SLA config.
+	Holidays []string `json:"holidays,omitempty"`
 }
 
 // TimeRange 时间范围
 type TimeRange struct {
 	Start string `json:"start"` // HH:MM 格式
 	End   string `json:"end"`   // HH:MM 格式
+}
+
+// RangeFor returns the configured interval for a weekday.
+func (hours *WorkingHours) RangeFor(day time.Weekday) TimeRange {
+	if hours == nil {
+		return TimeRange{}
+	}
+	switch day {
+	case time.Monday:
+		return hours.Monday
+	case time.Tuesday:
+		return hours.Tuesday
+	case time.Wednesday:
+		return hours.Wednesday
+	case time.Thursday:
+		return hours.Thursday
+	case time.Friday:
+		return hours.Friday
+	case time.Saturday:
+		return hours.Saturday
+	case time.Sunday:
+		return hours.Sunday
+	default:
+		return TimeRange{}
+	}
 }
 
 // EscalationRule 升级规则

@@ -11,7 +11,7 @@
 - [x] **FE-LINT-06**：类型化 `web/src/layout/CustomLayout.tsx` 及其 props。
 - [x] **FE-LINT-07**：为 `web/src/lib/apiClient.ts` 补充请求/响应泛型，移除 `any`。
 - [x] **FE-LINT-08**：重构 `web/src/lib/dataProvider.ts`（查询/过滤/响应类型），解决 `any` 与 `no-case-declarations`。
-- [x] **FE-LINT-09**：整理 `web/src/lib/retry.ts`，补充泛型和错误类型。
+- [x] **FE-LINT-09**：删除未引用的 `web/src/lib/retry.ts`，由 `apiClient.ts` 统一处理请求错误。
 - [x] **FE-LINT-10**：补齐 `web/src/types/index.ts` 剩余 `any`（如 `ApiResponse`、`TicketHistory` 等）。
 
 ## 2. 认证与安全
@@ -35,7 +35,8 @@
 - [ ] **MODEL-JSON-02**：提供统一的 JSON 序列化/反序列化工具，避免直接字符串拼装。
 
 ## 6. 文档与流程
-- [ ] **DOC-01**：将 Swagger (`make swagger`) 纳入标准流程，并在 README 中描述。
+- [x] **DOC-01**：以服务内嵌 OpenAPI 3.2 和 `make openapi-lint` 作为唯一机器契约，
+  不再维护 Swagger 代码生成兼容流程。
 - [ ] **DOC-02**：为上面各任务提供完成后的更新记录（项目总览/README）。
 
 ---

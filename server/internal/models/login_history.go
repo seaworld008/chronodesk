@@ -11,7 +11,7 @@ type LoginHistory struct {
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
 	// 用户信息
-	UserID   uint   `json:"user_id" gorm:"index;not null"`
+	UserID   uint   `json:"user_id" gorm:"index;not null;index:idx_login_histories_session_active,priority:1"`
 	User     User   `json:"user,omitempty" gorm:"foreignKey:UserID"`
 	Username string `json:"username" gorm:"size:50;not null"`
 	Email    string `json:"email" gorm:"size:100;not null"`
@@ -22,7 +22,7 @@ type LoginHistory struct {
 	LoginTime      time.Time  `json:"login_time" gorm:"not null;index"`
 	LogoutTime     *time.Time `json:"logout_time,omitempty" gorm:"index"`
 	LastActivityAt *time.Time `json:"last_activity_at,omitempty" gorm:"index"`
-	SessionID      string     `json:"session_id" gorm:"size:255;index"`
+	SessionID      string     `json:"session_id" gorm:"size:255;index;index:idx_login_histories_session_active,priority:2"`
 
 	// 登录状态
 	LoginStatus   LoginStatus `json:"login_status" gorm:"size:20;not null;default:'success'"`
@@ -41,8 +41,8 @@ type LoginHistory struct {
 	Browser         string `json:"browser,omitempty" gorm:"size:100"`          // Chrome, Firefox, Safari, etc.
 
 	// 会话信息
-	SessionDuration *int64 `json:"session_duration,omitempty"`    // 会话持续时间（秒）
-	IsActive        bool   `json:"is_active" gorm:"default:true"` // 会话是否仍然活跃
+	SessionDuration *int64 `json:"session_duration,omitempty"`                                                        // 会话持续时间（秒）
+	IsActive        bool   `json:"is_active" gorm:"default:true;index:idx_login_histories_session_active,priority:3"` // 会话是否仍然活跃
 }
 
 // LoginStatus 登录状态枚举

@@ -85,12 +85,6 @@ class TestSystemConfigs:
             assert policy_resp.status_code == 200, policy_resp.text
             assert "password_policy" in policy_resp.json().get("data", {})
 
-            clear_resp = admin_api.post_json("/admin/configs/cache/clear", {})
-            assert clear_resp.status_code == 200, clear_resp.text
-            stats_resp = admin_api.get_json("/admin/configs/cache/stats")
-            assert stats_resp.status_code == 200, stats_resp.text
-            assert stats_resp.json().get("success") is True
-
             export_resp = admin_api.session.get(
                 admin_api._build_url("/admin/configs/export"),
                 params={"format": "json"},
@@ -117,4 +111,3 @@ class TestSystemConfigs:
                 delete_resp = admin_api.delete(f"/admin/configs/{created_key}")
                 if delete_resp.status_code == 200:
                     assert delete_resp.json().get("success") is True
-            admin_api.post_json("/admin/configs/cache/clear", {})

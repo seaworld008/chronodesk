@@ -1,7 +1,7 @@
 services:
   # PostgreSQL 数据库
   postgres:
-    image: postgres:15-alpine
+    image: postgres:18.4-alpine
     container_name: ticket-postgres
     environment:
       POSTGRES_DB: ticket_system
@@ -11,7 +11,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql
     networks:
       - ticket-network
     healthcheck:
@@ -22,7 +22,7 @@ services:
 
   # Redis 缓存
   redis:
-    image: redis:7-alpine
+    image: redis:8.8-alpine
     container_name: ticket-redis
     ports:
       - "6379:6379"
@@ -46,7 +46,10 @@ services:
       - "8081:8081"
     environment:
       - GIN_MODE=debug
+      - ENVIRONMENT=development
       - PORT=8081
+      - APP_URL=http://localhost:8081
+      - AUTO_MIGRATE=true
       - DATABASE_URL=postgres://ticket_user:ticket_password@postgres:5432/ticket_system?sslmode=disable
       - DB_HOST=postgres
       - DB_PORT=5432
@@ -56,6 +59,8 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - JWT_SECRET=your-super-secret-jwt-key-change-in-production
+      - AGENT_JWT_SECRET=development-agent-jwt-secret-not-for-production-2026
+      - AGENT_CREDENTIAL_PEPPER=development-agent-credential-pepper-not-for-production-2026
       - ADMIN_EMAIL=${ADMIN_EMAIL:-admin@example.com}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-Admin123!}
     depends_on:
@@ -63,6 +68,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "5", "-O", "/dev/null", "http://127.0.0.1:8081/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
     networks:
       - ticket-network
     restart: unless-stopped
@@ -79,7 +90,8 @@ services:
       - VITE_API_URL=/api
       - VITE_PROXY_TARGET=http://server:8081
     depends_on:
-      - server
+      server:
+        condition: service_healthy
     networks:
       - ticket-network
     restart: unless-stopped

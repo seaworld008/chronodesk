@@ -16,6 +16,7 @@ import {
     Stepper,
     Step,
     StepLabel,
+    Tooltip,
 } from '@mui/material';
 import {
     Assignment,
@@ -23,9 +24,17 @@ import {
     TrendingUp as Escalate,
     CheckCircle,
 } from '@mui/icons-material';
-import { useRecordContext, useNotify, useRefresh, ReferenceInput, AutocompleteInput } from 'react-admin';
+import {
+    useGetIdentity,
+    useGetList,
+    useNotify,
+    usePermissions,
+    useRecordContext,
+    useRefresh,
+} from 'react-admin';
 import { Ticket, TicketPriority, TicketStatus } from '@/types';
 import { apiFetch } from '@/lib/apiClient';
+import { canMutateTicket, type TicketRolePermissions } from './ticketAccess';
 
 // 工单状态流转定义
 const TICKET_WORKFLOWS: Record<TicketStatus, TicketStatus[]> = {
@@ -56,6 +65,14 @@ const PRIORITY_ESCALATION: Record<TicketPriority, TicketPriority> = {
     critical: 'critical'
 };
 
+const PRIORITY_LABELS: Record<TicketPriority, string> = {
+    low: '低',
+    normal: '普通',
+    high: '高',
+    urgent: '紧急',
+    critical: '严重',
+};
+
 interface WorkflowAction {
     type: 'assign' | 'transfer' | 'escalate' | 'status_change' | 'priority_change';
     label: string;
@@ -63,6 +80,13 @@ interface WorkflowAction {
     color: 'primary' | 'secondary' | 'warning' | 'error' | 'success';
     requiresInput?: boolean;
 }
+
+type AssigneeOption = {
+    id: number;
+    username: string;
+    first_name?: string;
+    last_name?: string;
+};
 
 /**
  * 工单工作流操作组件
@@ -72,6 +96,8 @@ const TicketWorkflowActions: React.FC = () => {
     const record = useRecordContext<Ticket>();
     const notify = useNotify();
     const refresh = useRefresh();
+    const { permissions } = usePermissions<TicketRolePermissions>();
+    const { identity } = useGetIdentity();
     
     const [dialogOpen, setDialogOpen] = useState(false);
     const [currentAction, setCurrentAction] = useState<WorkflowAction | null>(null);
@@ -80,6 +106,20 @@ const TicketWorkflowActions: React.FC = () => {
     const [escalationReason, setEscalationReason] = useState('');
     const [newStatus, setNewStatus] = useState<TicketStatus | ''>('');
     const [comment, setComment] = useState('');
+    const { data: assignees = [], isPending: assigneesPending } = useGetList<AssigneeOption>(
+        'assignees',
+        {
+            pagination: { page: 1, perPage: 100 },
+            sort: { field: 'username', order: 'ASC' },
+            filter: {},
+        },
+        {
+            enabled:
+                dialogOpen &&
+                currentAction !== null &&
+                ['assign', 'transfer', 'escalate'].includes(currentAction.type),
+        },
+    );
 
     if (!record) return null;
 
@@ -196,14 +236,15 @@ const TicketWorkflowActions: React.FC = () => {
         setDialogOpen(true);
     };
 
-    const availableActions = getAvailableActions();
+    const canMutate = canMutateTicket(record, permissions?.role, identity?.id);
+    const availableActions = canMutate ? getAvailableActions() : [];
 
     return (
         <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
             {/* 工单状态显示 */}
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mr: 2 }}>
                 <Chip 
-                    label={STATUS_LABELS[record.status as keyof typeof STATUS_LABELS]} 
+                    label={STATUS_LABELS[record.status as keyof typeof STATUS_LABELS] || '未知状态'}
                     color={record.status === 'resolved' ? 'success' : 
                            record.status === 'closed' ? 'default' : 
                            record.status === 'cancelled' ? 'error' : 'warning'}
@@ -215,6 +256,7 @@ const TicketWorkflowActions: React.FC = () => {
                 {record.is_overdue && (
                     <Chip label="已逾期" color="error" size="small" />
                 )}
+                {!canMutate && <Chip label="只读" size="small" variant="outlined" />}
             </Box>
 
             {/* 操作按钮 */}
@@ -247,16 +289,25 @@ const TicketWorkflowActions: React.FC = () => {
                             <Alert severity="info">
                                 选择要分配给的用户。分配后该用户将成为工单的负责人。
                             </Alert>
-                            <ReferenceInput 
-                                source="assigned_to_id" 
-                                reference="users" 
-                                label="分配给"
-                            >
-                                <AutocompleteInput 
-                                    optionText={(user) => `${user.username} (${user.first_name} ${user.last_name})`}
-                                    onChange={(value) => setAssigneeId(value)}
-                                />
-                            </ReferenceInput>
+                            <FormControl fullWidth>
+                                <InputLabel id="assign-user-label">分配给</InputLabel>
+                                <Select
+                                    labelId="assign-user-label"
+                                    label="分配给"
+                                    value={assigneeId ?? ''}
+                                    disabled={assigneesPending}
+                                    onChange={(event) => setAssigneeId(Number(event.target.value))}
+                                >
+                                    {assignees.map((user) => (
+                                        <MenuItem key={user.id} value={user.id}>
+                                            {user.username}
+                                            {user.first_name || user.last_name
+                                                ? ` (${user.first_name ?? ''} ${user.last_name ?? ''})`
+                                                : ''}
+                                        </MenuItem>
+                                    ))}
+                                </Select>
+                            </FormControl>
                         </Box>
                     )}
 
@@ -277,16 +328,22 @@ const TicketWorkflowActions: React.FC = () => {
                                     <MenuItem value="management">管理层</MenuItem>
                                 </Select>
                             </FormControl>
-                            <ReferenceInput 
-                                source="assigned_to_id" 
-                                reference="users" 
-                                label="转移给"
-                            >
-                                <AutocompleteInput 
-                                    optionText={(user) => `${user.username} (${user.first_name} ${user.last_name})`}
-                                    onChange={(value) => setAssigneeId(value)}
-                                />
-                            </ReferenceInput>
+                            <FormControl fullWidth>
+                                <InputLabel id="transfer-user-label">转移给</InputLabel>
+                                <Select
+                                    labelId="transfer-user-label"
+                                    label="转移给"
+                                    value={assigneeId ?? ''}
+                                    disabled={assigneesPending}
+                                    onChange={(event) => setAssigneeId(Number(event.target.value))}
+                                >
+                                    {assignees.map((user) => (
+                                        <MenuItem key={user.id} value={user.id}>
+                                            {user.username}
+                                        </MenuItem>
+                                    ))}
+                                </Select>
+                            </FormControl>
                         </Box>
                     )}
 
@@ -304,18 +361,32 @@ const TicketWorkflowActions: React.FC = () => {
                                 onChange={(e) => setEscalationReason(e.target.value)}
                                 required
                             />
-                            <ReferenceInput
-                                source="escalate_to_id"
-                                reference="users"
-                                label="升级给"
-                            >
-                                <AutocompleteInput
-                                    optionText={(user) => `${user.username} (${user.first_name} ${user.last_name})`}
-                                    onChange={(value) => setAssigneeId(value)}
-                                />
-                            </ReferenceInput>
+                            <FormControl fullWidth>
+                                <InputLabel id="escalate-user-label">升级给</InputLabel>
+                                <Select
+                                    labelId="escalate-user-label"
+                                    label="升级给"
+                                    value={assigneeId ?? ''}
+                                    disabled={assigneesPending}
+                                    onChange={(event) => setAssigneeId(Number(event.target.value))}
+                                >
+                                    {assignees.map((user) => (
+                                        <MenuItem key={user.id} value={user.id}>
+                                            {user.username}
+                                        </MenuItem>
+                                    ))}
+                                </Select>
+                            </FormControl>
                             <Box>
-                                <strong>优先级将从 {record.priority} 升级为 {PRIORITY_ESCALATION[record.priority as keyof typeof PRIORITY_ESCALATION]}</strong>
+                                <Tooltip
+                                    title={`优先级代码：${record.priority} → ${PRIORITY_ESCALATION[record.priority as keyof typeof PRIORITY_ESCALATION]}`}
+                                >
+                                    <strong>
+                                        优先级将从 {PRIORITY_LABELS[record.priority as TicketPriority] || '未知'}
+                                        {' '}升级为{' '}
+                                        {PRIORITY_LABELS[PRIORITY_ESCALATION[record.priority as TicketPriority]] || '未知'}
+                                    </strong>
+                                </Tooltip>
                             </Box>
                         </Box>
                     )}

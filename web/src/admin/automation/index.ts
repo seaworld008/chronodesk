@@ -1,5 +1,0 @@
-export { default as AutomationRuleList } from './AutomationRuleList'
-export { default as AutomationRuleShow } from './AutomationRuleShow'
-export { default as AutomationRuleCreate } from './AutomationRuleCreate'
-export { default as AutomationRuleEdit } from './AutomationRuleEdit'
-export { default as AutomationLogList } from './AutomationLogList'

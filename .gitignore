@@ -120,6 +120,7 @@ temp/
 .vscode/*
 !.vscode/extensions.json
 .idea
+.claude/settings.local.json
 *.suo
 *.ntvs*
 *.njsproj
@@ -154,6 +155,7 @@ __pycache__/
 server/tmp/
 server/logs/
 server/reports/
+server/data/
 web/dist/
 web/build/
 web/test-results/

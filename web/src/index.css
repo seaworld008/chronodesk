@@ -1,6 +1,36 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@import "./styles/enterprise-tables.css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --breakpoint-xs: 475px;
+  --breakpoint-2xl: 1400px;
+
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+}
 
 /* Root CSS Variables */
 :root {
@@ -61,6 +91,18 @@
 
 /* Mobile-optimized animations */
 @layer utilities {
+  .container {
+    width: 100%;
+    margin-inline: auto;
+    padding-inline: 2rem;
+  }
+
+  @media (width >= 1400px) {
+    .container {
+      max-width: 1400px;
+    }
+  }
+
   @keyframes slide-in-from-top {
     from {
       transform: translateY(-100%);
@@ -213,11 +255,11 @@
 
   /* Enhanced button styles for mobile */
   .btn-mobile-primary {
-    @apply bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-medium rounded-xl px-6 py-3 transition-all duration-200 touch-target-48 focus-visible-ring;
+    @apply min-h-12 min-w-12 bg-blue-600 px-6 py-3 font-medium text-white transition-all duration-200 hover:bg-blue-700 active:bg-blue-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-gray-800;
   }
 
   .btn-mobile-secondary {
-    @apply bg-white dark:bg-gray-800 border-2 border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300 font-medium rounded-xl px-6 py-3 transition-all duration-200 touch-target-48 focus-visible-ring;
+    @apply min-h-12 min-w-12 border-2 border-gray-200 bg-white px-6 py-3 font-medium text-gray-700 transition-all duration-200 hover:bg-gray-50 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700 dark:focus-visible:ring-offset-gray-800;
   }
 }
 
@@ -248,7 +290,8 @@
   input,
   select,
   textarea {
-    @apply touch-target-44;
+    min-height: 44px;
+    min-width: 44px;
   }
 
   /* Better spacing for mobile */

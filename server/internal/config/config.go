@@ -3,6 +3,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -23,16 +24,18 @@ type Config struct {
 	Log       LogConfig       `json:"log"`
 	Upload    UploadConfig    `json:"upload"`
 	RateLimit RateLimitConfig `json:"rate_limit"`
+	Agent     AgentConfig     `json:"agent"`
 }
 
 // ServerConfig 服务器配置
 type ServerConfig struct {
-	Port          string `json:"port"`
-	GinMode       string `json:"gin_mode"`
-	Environment   string `json:"environment"`
-	Debug         bool   `json:"debug"`
-	EnableSwagger bool   `json:"enable_swagger"`
-	EnablePprof   bool   `json:"enable_pprof"`
+	Port           string   `json:"port"`
+	GinMode        string   `json:"gin_mode"`
+	Environment    string   `json:"environment"`
+	Debug          bool     `json:"debug"`
+	EnableSwagger  bool     `json:"enable_swagger"`
+	EnablePprof    bool     `json:"enable_pprof"`
+	TrustedProxies []string `json:"trusted_proxies"`
 }
 
 // DatabaseConfig 数据库配置
@@ -121,8 +124,29 @@ type UploadConfig struct {
 
 // RateLimitConfig 限流配置
 type RateLimitConfig struct {
-	Requests int           `json:"requests"`
-	Window   time.Duration `json:"window"`
+	Requests          int           `json:"requests"`
+	Window            time.Duration `json:"window"`
+	AnonymousRequests int           `json:"anonymous_requests"`
+	AnonymousWindow   time.Duration `json:"anonymous_window"`
+}
+
+// AgentConfig controls machine identities and protocol endpoints separately
+// from human browser sessions.
+type AgentConfig struct {
+	JWTSecret           string        `json:"-"`
+	CredentialPepper    string        `json:"-"`
+	Issuer              string        `json:"issuer"`
+	MCPResourceURL      string        `json:"mcp_resource_url"`
+	APIResourceURL      string        `json:"api_resource_url"`
+	A2AResourceURL      string        `json:"a2a_resource_url"`
+	TokenTTL            time.Duration `json:"token_ttl"`
+	CredentialTTL       time.Duration `json:"credential_ttl"`
+	CompatibilityUserID uint          `json:"compatibility_user_id"`
+	AttachmentDir       string        `json:"attachment_dir"`
+	MaxAttachmentBytes  int64         `json:"max_attachment_bytes"`
+	LoopThreshold       int           `json:"loop_threshold"`
+	LoopWindow          time.Duration `json:"loop_window"`
+	GlobalReadOnly      bool          `json:"global_read_only"`
 }
 
 // Load 加载配置
@@ -133,14 +157,16 @@ func Load() (*Config, error) {
 		fmt.Printf("Warning: .env file not found: %v\n", err)
 	}
 
+	appURL := getEnv("APP_URL", "http://localhost:8081")
 	config := &Config{
 		Server: ServerConfig{
-			Port:          getEnv("PORT", "8081"),
-			GinMode:       getEnv("GIN_MODE", "debug"),
-			Environment:   getEnv("ENVIRONMENT", "development"),
-			Debug:         getEnvAsBool("DEBUG", true),
-			EnableSwagger: getEnvAsBool("ENABLE_SWAGGER", true),
-			EnablePprof:   getEnvAsBool("ENABLE_PPROF", false),
+			Port:           getEnv("PORT", "8081"),
+			GinMode:        getEnv("GIN_MODE", "debug"),
+			Environment:    getEnv("ENVIRONMENT", "development"),
+			Debug:          getEnvAsBool("DEBUG", true),
+			EnableSwagger:  getEnvAsBool("ENABLE_SWAGGER", true),
+			EnablePprof:    getEnvAsBool("ENABLE_PPROF", false),
+			TrustedProxies: getEnvAsSlice("TRUSTED_PROXIES", []string{}),
 		},
 		Database: DatabaseConfig{
 			Host:            getEnv("DB_HOST", "localhost"),
@@ -189,13 +215,25 @@ func Load() (*Config, error) {
 		App: AppConfig{
 			Name:    getEnv("APP_NAME", "Ticket System"),
 			Version: getEnv("APP_VERSION", "1.0.0"),
-			URL:     getEnv("APP_URL", "http://localhost:8080"),
+			URL:     appURL,
 			WebURL:  getEnv("WEB_URL", "http://localhost:3000"),
 		},
 		CORS: CORSConfig{
 			AllowedOrigins: getEnvAsSlice("CORS_ALLOWED_ORIGINS", []string{"http://localhost:3000", "http://localhost:5173"}),
 			AllowedMethods: getEnvAsSlice("CORS_ALLOWED_METHODS", []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}),
-			AllowedHeaders: getEnvAsSlice("CORS_ALLOWED_HEADERS", []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Requested-With"}),
+			AllowedHeaders: getEnvAsSlice("CORS_ALLOWED_HEADERS", []string{
+				"Origin",
+				"Content-Type",
+				"Accept",
+				"Authorization",
+				"X-Requested-With",
+				"Idempotency-Key",
+				"If-Match",
+				"X-Ticket-Lease",
+				"MCP-Protocol-Version",
+				"Mcp-Method",
+				"Mcp-Name",
+			}),
 		},
 		Log: LogConfig{
 			Level:  getEnv("LOG_LEVEL", "info"),
@@ -207,8 +245,29 @@ func Load() (*Config, error) {
 			AllowedTypes: getEnvAsSlice("UPLOAD_ALLOWED_TYPES", []string{"jpg", "jpeg", "png", "gif", "pdf", "doc", "docx"}),
 		},
 		RateLimit: RateLimitConfig{
-			Requests: getEnvAsInt("RATE_LIMIT_REQUESTS", 100),
-			Window:   getEnvAsDuration("RATE_LIMIT_WINDOW", 1*time.Hour),
+			Requests:          getEnvAsInt("RATE_LIMIT_REQUESTS", 600),
+			Window:            getEnvAsDuration("RATE_LIMIT_WINDOW", time.Minute),
+			AnonymousRequests: getEnvAsInt("AUTH_RATE_LIMIT_REQUESTS", 20),
+			AnonymousWindow:   getEnvAsDuration("AUTH_RATE_LIMIT_WINDOW", time.Minute),
+		},
+		Agent: AgentConfig{
+			JWTSecret:        getEnv("AGENT_JWT_SECRET", getEnv("JWT_SECRET", "your-super-secret-jwt-key-change-in-production")),
+			CredentialPepper: getEnv("AGENT_CREDENTIAL_PEPPER", getEnv("AGENT_JWT_SECRET", getEnv("JWT_SECRET", "your-super-secret-jwt-key-change-in-production"))),
+			Issuer:           getEnv("AGENT_ISSUER", appURL),
+			// RFC 8707 resource identifiers are derived from the canonical public
+			// origin. They are intentionally not independently configurable:
+			// MCP, REST, and A2A tokens must never share an audience.
+			MCPResourceURL:      appURL + "/mcp",
+			APIResourceURL:      appURL + "/api/v1",
+			A2AResourceURL:      appURL + "/a2a/v1",
+			TokenTTL:            getEnvAsDuration("AGENT_TOKEN_TTL", 15*time.Minute),
+			CredentialTTL:       getEnvAsDuration("AGENT_CREDENTIAL_TTL", 90*24*time.Hour),
+			CompatibilityUserID: uint(getEnvAsInt("AGENT_COMPATIBILITY_USER_ID", 1)),
+			AttachmentDir:       getEnv("AGENT_ATTACHMENT_DIR", "./data/agent-attachments"),
+			MaxAttachmentBytes:  int64(getEnvAsInt("AGENT_MAX_ATTACHMENT_BYTES", 25<<20)),
+			LoopThreshold:       getEnvAsInt("AGENT_LOOP_THRESHOLD", 20),
+			LoopWindow:          getEnvAsDuration("AGENT_LOOP_WINDOW", time.Minute),
+			GlobalReadOnly:      getEnvAsBool("AGENT_GLOBAL_READ_ONLY", false),
 		},
 	}
 
@@ -229,6 +288,47 @@ func (c *Config) Validate() error {
 	if c.JWT.RefreshSecret == "your-super-secret-jwt-refresh-key-change-in-production" && c.Server.Environment == "production" {
 		return fmt.Errorf("JWT refresh secret must be changed in production environment")
 	}
+	if c.Agent.JWTSecret == "your-super-secret-jwt-key-change-in-production" && c.Server.Environment == "production" {
+		return fmt.Errorf("agent JWT secret must be changed in production environment")
+	}
+	if c.Server.Environment == "production" {
+		if insecureProductionSecret(c.Agent.JWTSecret) {
+			return fmt.Errorf("agent JWT secret must be at least 32 non-placeholder characters")
+		}
+		if insecureProductionSecret(c.Agent.CredentialPepper) {
+			return fmt.Errorf("agent credential pepper must be at least 32 non-placeholder characters")
+		}
+		if c.Agent.JWTSecret == c.JWT.Secret || c.Agent.CredentialPepper == c.Agent.JWTSecret {
+			return fmt.Errorf("human JWT, Agent JWT, and Agent credential pepper must use separate production secrets")
+		}
+	}
+	if err := validateAgentEndpointContract(
+		c.App.URL,
+		c.Agent.Issuer,
+		c.Agent.MCPResourceURL,
+		c.Agent.APIResourceURL,
+		c.Agent.A2AResourceURL,
+	); err != nil {
+		return err
+	}
+	if c.Agent.TokenTTL <= 0 || c.Agent.TokenTTL > time.Hour {
+		return fmt.Errorf("agent token TTL must be between 1 second and 1 hour")
+	}
+	if c.Agent.CredentialTTL < time.Hour || c.Agent.CredentialTTL > 365*24*time.Hour {
+		return fmt.Errorf("agent credential TTL must be between 1 hour and 365 days")
+	}
+	if c.Agent.MaxAttachmentBytes <= 0 {
+		return fmt.Errorf("agent maximum attachment size must be positive")
+	}
+	if c.Agent.LoopThreshold <= 0 || c.Agent.LoopWindow <= 0 {
+		return fmt.Errorf("agent loop threshold and window must be positive")
+	}
+	if c.RateLimit.Requests <= 0 ||
+		c.RateLimit.Window <= 0 ||
+		c.RateLimit.AnonymousRequests <= 0 ||
+		c.RateLimit.AnonymousWindow <= 0 {
+		return fmt.Errorf("authenticated and anonymous rate limit requests and windows must be positive")
+	}
 
 	if c.Database.Host == "" {
 		return fmt.Errorf("database host is required")
@@ -247,6 +347,61 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+func validateAgentEndpointContract(appURL, issuer, mcpResourceURL, apiResourceURL, a2aResourceURL string) error {
+	if appURL != strings.TrimSpace(appURL) {
+		return fmt.Errorf("APP URL must not contain surrounding whitespace")
+	}
+	parsed, err := url.Parse(appURL)
+	if err != nil ||
+		!parsed.IsAbs() ||
+		parsed.Host == "" ||
+		parsed.User != nil ||
+		parsed.RawQuery != "" ||
+		parsed.Fragment != "" ||
+		parsed.Path != "" ||
+		parsed.RawPath != "" {
+		return fmt.Errorf("APP URL must be an absolute canonical origin without path, query, fragment, or user info")
+	}
+	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHostname(parsed.Hostname())) {
+		return fmt.Errorf("APP URL must use HTTPS except for loopback development")
+	}
+	if issuer != appURL {
+		return fmt.Errorf("agent issuer must exactly match APP URL")
+	}
+	expectedResources := map[string]struct {
+		got  string
+		path string
+	}{
+		"MCP": {got: mcpResourceURL, path: "/mcp"},
+		"API": {got: apiResourceURL, path: "/api/v1"},
+		"A2A": {got: a2aResourceURL, path: "/a2a/v1"},
+	}
+	for name, resource := range expectedResources {
+		expected := appURL + resource.path
+		if resource.got != expected {
+			return fmt.Errorf("agent %s resource URL must exactly match %q", name, expected)
+		}
+	}
+	return nil
+}
+
+func isLoopbackHostname(hostname string) bool {
+	switch strings.ToLower(hostname) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return false
+	}
+}
+
+func insecureProductionSecret(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	return len(value) < 32 ||
+		strings.Contains(normalized, "replace-with") ||
+		strings.Contains(normalized, "change-in-production") ||
+		strings.Contains(normalized, "example")
 }
 
 // GetDSN 获取数据库连接字符串

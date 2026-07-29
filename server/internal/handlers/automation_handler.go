@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,9 +20,17 @@ type AutomationHandler struct {
 }
 
 // NewAutomationHandler 创建自动化处理器
-func NewAutomationHandler(db *gorm.DB, schedulerService *services.SchedulerService) *AutomationHandler {
+func NewAutomationHandler(
+	db *gorm.DB,
+	schedulerService *services.SchedulerService,
+	native ...*services.AgentNativeService,
+) *AutomationHandler {
+	automationService := services.NewAutomationService(db)
+	if len(native) > 0 && native[0] != nil {
+		automationService = services.NewAutomationServiceWithAgentNative(db, native[0])
+	}
 	return &AutomationHandler{
-		automationService: services.NewAutomationService(db),
+		automationService: automationService,
 		schedulerService:  schedulerService,
 	}
 }
@@ -395,6 +404,14 @@ func (h *AutomationHandler) CreateSLAConfig(c *gin.Context) {
 
 	config, err := h.automationService.CreateSLAConfig(c.Request.Context(), &req)
 	if err != nil {
+		if errors.Is(err, services.ErrInvalidWorkingHours) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"message": "工作时间配置无效",
+				"error":   err.Error(),
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "创建SLA配置失败",
@@ -751,7 +768,12 @@ func (h *AutomationHandler) BatchUpdateTickets(c *gin.Context) {
 		return
 	}
 
-	err := h.automationService.BatchUpdateTickets(c.Request.Context(), req.TicketIDs, req.Updates)
+	err := h.automationService.BatchUpdateTickets(
+		c.Request.Context(),
+		req.TicketIDs,
+		req.Updates,
+		models.HumanActor(c.GetUint("user_id")),
+	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -794,7 +816,12 @@ func (h *AutomationHandler) BatchAssignTickets(c *gin.Context) {
 		return
 	}
 
-	err := h.automationService.BatchAssignTickets(c.Request.Context(), req.TicketIDs, req.UserID)
+	err := h.automationService.BatchAssignTickets(
+		c.Request.Context(),
+		req.TicketIDs,
+		req.UserID,
+		models.HumanActor(c.GetUint("user_id")),
+	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,

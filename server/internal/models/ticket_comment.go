@@ -21,10 +21,14 @@ type TicketComment struct {
 	DeletedAt *time.Time `json:"deleted_at,omitempty" gorm:"index"`
 
 	// 关联信息
-	TicketID uint    `json:"ticket_id" gorm:"not null;index"`
-	Ticket   *Ticket `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
-	UserID   uint    `json:"user_id" gorm:"not null;index"`
-	User     *User   `json:"user,omitempty" gorm:"foreignKey:UserID"`
+	TicketID           uint              `json:"ticket_id" gorm:"not null;index"`
+	Ticket             *Ticket           `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
+	UserID             uint              `json:"user_id" gorm:"not null;index"`
+	User               *User             `json:"user,omitempty" gorm:"foreignKey:UserID"`
+	ActorType          ActorType         `json:"actor_type" gorm:"size:32;not null;default:'human';index"`
+	ActorID            string            `json:"actor_id" gorm:"size:128;index"`
+	ServicePrincipalID *string           `json:"service_principal_id,omitempty" gorm:"size:36;index"`
+	ServicePrincipal   *ServicePrincipal `json:"service_principal,omitempty" gorm:"foreignKey:ServicePrincipalID"`
 
 	// 评论内容
 	Content     string      `json:"content" gorm:"type:text;not null" validate:"required"`
@@ -82,7 +86,16 @@ func (tc *TicketComment) IsInternal() bool {
 
 // IsSystem 检查是否为系统评论
 func (tc *TicketComment) IsSystem() bool {
-	return tc.Type == CommentTypeSystem
+	return tc.Type == CommentTypeSystem || tc.ActorType == ActorTypeSystem
+}
+
+// Actor returns the authoritative actor and falls back to the legacy user ID
+// for rows created before Agent-native actor columns existed.
+func (tc *TicketComment) Actor() ActorRef {
+	if tc.ActorType != "" && tc.ActorID != "" {
+		return ActorRef{Type: tc.ActorType, ID: tc.ActorID}
+	}
+	return HumanActor(tc.UserID)
 }
 
 // CanBeEdited 检查评论是否可以编辑
@@ -133,30 +146,32 @@ type TicketCommentUpdateRequest struct {
 
 // TicketCommentResponse 评论响应
 type TicketCommentResponse struct {
-	ID               uint                    `json:"id"`
-	CreatedAt        time.Time               `json:"created_at"`
-	UpdatedAt        time.Time               `json:"updated_at"`
-	TicketID         uint                    `json:"ticket_id"`
-	User             *UserResponse           `json:"user,omitempty"`
-	Content          string                  `json:"content"`
-	ContentType      string                  `json:"content_type"`
-	Type             CommentType             `json:"type"`
-	Attachments      []string                `json:"attachments"`
-	Metadata         map[string]interface{}  `json:"metadata"`
-	IsEdited         bool                    `json:"is_edited"`
-	EditedAt         *time.Time              `json:"edited_at"`
-	IsDeleted        bool                    `json:"is_deleted"`
-	DeletedBy        *UserResponse           `json:"deleted_by,omitempty"`
-	ParentID         *uint                   `json:"parent_id"`
-	Replies          []TicketCommentResponse `json:"replies,omitempty"`
-	ReplyCount       int                     `json:"reply_count"`
-	TimeSpent        *int                    `json:"time_spent"`
-	BillableTime     *int                    `json:"billable_time"`
-	WorkType         string                  `json:"work_type"`
-	NotificationSent bool                    `json:"notification_sent"`
-	IsHelpful        *bool                   `json:"is_helpful"`
-	HelpfulCount     int                     `json:"helpful_count"`
-	UnhelpfulCount   int                     `json:"unhelpful_count"`
+	ID               uint                     `json:"id"`
+	CreatedAt        time.Time                `json:"created_at"`
+	UpdatedAt        time.Time                `json:"updated_at"`
+	TicketID         uint                     `json:"ticket_id"`
+	User             *UserSummary             `json:"user,omitempty"`
+	Actor            ActorRef                 `json:"actor"`
+	ServicePrincipal *ServicePrincipalSummary `json:"service_principal,omitempty"`
+	Content          string                   `json:"content"`
+	ContentType      string                   `json:"content_type"`
+	Type             CommentType              `json:"type"`
+	Attachments      []string                 `json:"attachments"`
+	Metadata         map[string]interface{}   `json:"metadata"`
+	IsEdited         bool                     `json:"is_edited"`
+	EditedAt         *time.Time               `json:"edited_at"`
+	IsDeleted        bool                     `json:"is_deleted"`
+	DeletedBy        *UserSummary             `json:"deleted_by,omitempty"`
+	ParentID         *uint                    `json:"parent_id"`
+	Replies          []TicketCommentResponse  `json:"replies,omitempty"`
+	ReplyCount       int                      `json:"reply_count"`
+	TimeSpent        *int                     `json:"time_spent"`
+	BillableTime     *int                     `json:"billable_time"`
+	WorkType         string                   `json:"work_type"`
+	NotificationSent bool                     `json:"notification_sent"`
+	IsHelpful        *bool                    `json:"is_helpful"`
+	HelpfulCount     int                      `json:"helpful_count"`
+	UnhelpfulCount   int                      `json:"unhelpful_count"`
 }
 
 // ToResponse 转换为响应格式
@@ -166,6 +181,7 @@ func (tc *TicketComment) ToResponse() *TicketCommentResponse {
 		CreatedAt:        tc.CreatedAt,
 		UpdatedAt:        tc.UpdatedAt,
 		TicketID:         tc.TicketID,
+		Actor:            tc.Actor(),
 		Content:          tc.Content,
 		ContentType:      tc.ContentType,
 		Type:             tc.Type,
@@ -185,11 +201,12 @@ func (tc *TicketComment) ToResponse() *TicketCommentResponse {
 
 	// 处理关联用户
 	if tc.User != nil {
-		response.User = tc.User.ToResponse()
+		response.User = tc.User.ToSummary()
 	}
 	if tc.DeletedUser != nil {
-		response.DeletedBy = tc.DeletedUser.ToResponse()
+		response.DeletedBy = tc.DeletedUser.ToSummary()
 	}
+	response.ServicePrincipal = tc.ServicePrincipal.ToSummary()
 
 	// 处理回复
 	if len(tc.Replies) > 0 {
@@ -199,9 +216,8 @@ func (tc *TicketComment) ToResponse() *TicketCommentResponse {
 		}
 	}
 
-	// TODO: 解析JSON字段
-	// response.Attachments = parseAttachmentsFromJSON(tc.Attachments)
-	// response.Metadata = parseMetadataFromJSON(tc.Metadata)
+	response.Attachments = decodeJSONStringSlice(tc.Attachments)
+	response.Metadata = decodeJSONMap(tc.Metadata)
 
 	return response
 }

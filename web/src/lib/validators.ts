@@ -1,4 +1,4 @@
-import { ValidatorFunction } from 'ra-core'
+import type { Validator } from 'ra-core'
 
 const toLength = (value: unknown): number => {
   if (typeof value === 'number') {
@@ -13,7 +13,7 @@ const toLength = (value: unknown): number => {
   return Array.from(String(value)).length
 }
 
-export const minCharacters = (min: number, message?: string): ValidatorFunction => (value) => {
+export const minCharacters = (min: number, message?: string): Validator => (value) => {
   if (value === undefined || value === null || value === '') {
     return undefined
   }
@@ -24,7 +24,7 @@ export const minCharacters = (min: number, message?: string): ValidatorFunction 
   return undefined
 }
 
-export const maxCharacters = (max: number, message?: string): ValidatorFunction => (value) => {
+export const maxCharacters = (max: number, message?: string): Validator => (value) => {
   if (value === undefined || value === null || value === '') {
     return undefined
   }

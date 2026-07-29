@@ -67,7 +67,7 @@ export const buildTransform = () => (data: AutomationRuleFormValues) => ({
   rule_type: data.rule_type,
   trigger_event: data.trigger_event,
   priority: normalizePriority(data.priority),
-  is_active: data.is_active ?? true,
+  is_active: data.is_active ?? false,
   conditions: parseJsonArray<AutomationRuleCondition>(data.conditions),
   actions: parseJsonArray<AutomationRuleAction>(data.actions),
 })
@@ -80,26 +80,31 @@ const AutomationRuleForm: React.FC<{ toolbar?: React.ReactElement }> = ({ toolba
     <SelectInput source="rule_type" label="规则类型" choices={ruleTypeChoices} required fullWidth />
     <SelectInput source="trigger_event" label="触发事件" choices={triggerEventChoices} required fullWidth />
     <NumberInput source="priority" label="优先级" defaultValue={1} min={1} />
-    <BooleanInput source="is_active" label="启用" defaultValue={true} />
+    <BooleanInput
+      source="is_active"
+      label="启用"
+      defaultValue={false}
+      helperText="新规则默认停用；完成条件、动作和影响范围验证后再启用"
+    />
     <TextInput
       source="conditions"
-      label="条件 (JSON数组)"
+      label="条件（JSON 数组）"
       multiline
       fullWidth
       minRows={4}
       parse={parseJsonText}
       format={formatJsonText}
-      helperText={'例如: [{"field":"priority","operator":"eq","value":"high"}]'}
+      helperText={'例如：[{"field":"priority","operator":"eq","value":"high"}]'}
     />
     <TextInput
       source="actions"
-      label="动作 (JSON数组)"
+      label="动作（JSON 数组）"
       multiline
       fullWidth
       minRows={4}
       parse={parseJsonText}
       format={formatJsonText}
-      helperText={'例如: [{"type":"assign","params":{"user_id":1}}]'}
+      helperText={'例如：[{"type":"assign","params":{"user_id":1}}]'}
     />
   </SimpleForm>
 )

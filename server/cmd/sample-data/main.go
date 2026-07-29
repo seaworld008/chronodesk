@@ -6,9 +6,9 @@ import (
 	"os"
 
 	"github.com/joho/godotenv"
+	"gongdan-system/internal/database"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"gongdan-system/internal/database"
 )
 
 func main() {
@@ -56,7 +56,7 @@ func main() {
 			log.Fatalf("生成示例数据失败: %v", err)
 		}
 		log.Println("✅ 示例数据生成完成")
-		
+
 		log.Println("\n📋 示例账号信息:")
 		log.Println("技术支持: support@sample.com / DemoPass123!")
 		log.Println("客户服务: service@sample.com / DemoPass123!")

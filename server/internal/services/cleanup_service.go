@@ -6,8 +6,8 @@ import (
 	"log"
 	"time"
 
-	"gorm.io/gorm"
 	"gongdan-system/internal/models"
+	"gorm.io/gorm"
 )
 
 // CleanupService 数据清理服务
@@ -62,7 +62,7 @@ func (t *LoginHistoryCleanupTask) Execute(ctx context.Context, config *models.Cl
 
 	// 计算截止日期
 	cutoffDate := time.Now().AddDate(0, 0, -config.LoginHistoryRetentionDays)
-	log.Printf("🧹 开始清理登录历史记录 - 删除 %v 之前的记录 (保留 %d 天)", 
+	log.Printf("🧹 开始清理登录历史记录 - 删除 %v 之前的记录 (保留 %d 天)",
 		cutoffDate.Format("2006-01-02 15:04:05"), config.LoginHistoryRetentionDays)
 
 	// 计算要删除的记录数
@@ -116,7 +116,7 @@ func (t *LoginHistoryCleanupTask) Execute(ctx context.Context, config *models.Cl
 			Where("login_time < ?", cutoffDate).
 			Limit(batchSize).
 			Pluck("id", &ids).Error
-		
+
 		if err != nil {
 			result.EndTime = time.Now()
 			result.RecordsDeleted = deletedCount
@@ -132,7 +132,7 @@ func (t *LoginHistoryCleanupTask) Execute(ctx context.Context, config *models.Cl
 		deleteResult := t.db.WithContext(ctx).
 			Where("id IN ?", ids).
 			Delete(&models.LoginHistory{})
-		
+
 		if deleteResult.Error != nil {
 			result.EndTime = time.Now()
 			result.RecordsDeleted = deletedCount
@@ -142,8 +142,8 @@ func (t *LoginHistoryCleanupTask) Execute(ctx context.Context, config *models.Cl
 
 		batchDeleted := int(deleteResult.RowsAffected)
 		deletedCount += batchDeleted
-		
-		log.Printf("🗑️  已删除 %d 条记录 (进度: %d/%d, %.1f%%)", 
+
+		log.Printf("🗑️  已删除 %d 条记录 (进度: %d/%d, %.1f%%)",
 			batchDeleted, deletedCount, int(totalCount), float64(deletedCount)/float64(totalCount)*100)
 
 		// 短暂休息以减少数据库压力
@@ -154,8 +154,8 @@ func (t *LoginHistoryCleanupTask) Execute(ctx context.Context, config *models.Cl
 
 	result.RecordsDeleted = deletedCount
 	result.EndTime = time.Now()
-	
-	log.Printf("✅ 登录历史清理完成: 删除了 %d 条记录，耗时 %v", 
+
+	log.Printf("✅ 登录历史清理完成: 删除了 %d 条记录，耗时 %v",
 		deletedCount, result.EndTime.Sub(result.StartTime))
 
 	return result, nil
@@ -167,7 +167,7 @@ func (s *CleanupService) GetCleanupConfig(ctx context.Context) (*models.CleanupC
 	err := s.db.WithContext(ctx).
 		Where("key = ? AND category = ? AND is_active = ?", "cleanup", "system", true).
 		First(&config).Error
-	
+
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
 			// 返回默认配置
@@ -299,7 +299,7 @@ func (s *CleanupService) ExecuteCleanup(ctx context.Context, taskType string, tr
 
 	// 执行清理任务
 	result, err := task.Execute(ctx, config)
-	
+
 	// 更新清理日志
 	cleanupLog.RecordsProcessed = result.RecordsProcessed
 	cleanupLog.RecordsDeleted = result.RecordsDeleted
@@ -324,10 +324,10 @@ func (s *CleanupService) ExecuteCleanup(ctx context.Context, taskType string, tr
 // ExecuteAllCleanupTasks 执行所有清理任务
 func (s *CleanupService) ExecuteAllCleanupTasks(ctx context.Context, triggerType string, userID *uint) error {
 	taskTypes := []string{"login_history"} // 可以扩展其他任务类型
-	
+
 	var lastError error
 	successCount := 0
-	
+
 	for _, taskType := range taskTypes {
 		if err := s.ExecuteCleanup(ctx, taskType, triggerType, userID); err != nil {
 			log.Printf("Failed to execute cleanup task %s: %v", taskType, err)
@@ -348,7 +348,7 @@ func (s *CleanupService) ExecuteAllCleanupTasks(ctx context.Context, triggerType
 // GetCleanupLogs 获取清理日志
 func (s *CleanupService) GetCleanupLogs(ctx context.Context, taskType string, limit int) ([]*models.CleanupLogResponse, error) {
 	query := s.db.WithContext(ctx).Model(&models.CleanupLog{})
-	
+
 	if taskType != "" {
 		query = query.Where("task_type = ?", taskType)
 	}
@@ -407,11 +407,11 @@ func (s *CleanupService) GetCleanupStats(ctx context.Context) (*CleanupStatsResp
 		Where("status = ?", "completed").
 		Order("end_time DESC").
 		First(&lastCleanup).Error
-	
+
 	if err != nil && err != gorm.ErrRecordNotFound {
 		return nil, fmt.Errorf("failed to get last cleanup: %w", err)
 	}
-	
+
 	if err != gorm.ErrRecordNotFound {
 		stats.LastCleanupTime = lastCleanup.EndTime
 	}
@@ -438,12 +438,12 @@ func (s *CleanupService) GetCleanupStats(ctx context.Context) (*CleanupStatsResp
 
 // CleanupStatsResponse 清理统计响应
 type CleanupStatsResponse struct {
-	LoginHistoryCount    int64                  `json:"login_history_count"`
-	TotalCleanups        int64                  `json:"total_cleanups"`
-	SuccessfulCleanups   int64                  `json:"successful_cleanups"`
-	LastCleanupTime      *time.Time             `json:"last_cleanup_time,omitempty"`
-	TotalRecordsDeleted  int64                  `json:"total_records_deleted"`
-	CurrentConfig        *models.CleanupConfig  `json:"current_config"`
+	LoginHistoryCount   int64                 `json:"login_history_count"`
+	TotalCleanups       int64                 `json:"total_cleanups"`
+	SuccessfulCleanups  int64                 `json:"successful_cleanups"`
+	LastCleanupTime     *time.Time            `json:"last_cleanup_time,omitempty"`
+	TotalRecordsDeleted int64                 `json:"total_records_deleted"`
+	CurrentConfig       *models.CleanupConfig `json:"current_config"`
 }
 
 // InitializeDefaultConfig 初始化默认配置

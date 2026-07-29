@@ -1,202 +1,82 @@
-# 数据库迁移指南
+# ChronoDesk 数据库迁移
 
-本文档介绍如何使用工单系统的数据库迁移工具。
+ChronoDesk 只保留一个结构迁移入口：`cmd/migrate`。该命令基于当前领域模型执行可重复迁移、索引校验和运行时 Schema 门禁，不再提供旧版快速 DDL、JSONB 修复或手工填充命令。
 
-## 概述
+## 连接配置
 
-为了提高服务器启动速度和灵活性，我们将数据库迁移从服务器启动过程中分离出来，创建了独立的迁移工具。
+迁移程序会加载 `server/.env`，并按以下顺序选择 PostgreSQL 连接：
 
-## 迁移工具
+1. `DATABASE_URL_UNPOOLED`
+2. `POSTGRES_URL_NON_POOLING`
+3. `DATABASE_URL`
 
-### 独立迁移程序
+也可以通过 `-dsn` 显式传入连接字符串。生产环境应使用密钥管理系统注入连接信息，不要把凭据写入仓库或命令历史。
 
-位置：`cmd/migrate/main.go`
+## 常用命令
 
-这是一个独立的Go程序，可以按需执行数据库迁移操作。
-
-#### 使用方法
+在 `server/` 目录执行：
 
 ```bash
-# 显示帮助信息
-go run cmd/migrate/main.go -help
+# 仅执行结构迁移
+go run ./cmd/migrate
 
-# 执行完整迁移（推荐）
-go run cmd/migrate/main.go -all
+# 输出详细数据库日志
+go run ./cmd/migrate -v
 
-# 只迁移表结构
-go run cmd/migrate/main.go -migrate
+# 显式初始化业务种子数据
+go run ./cmd/migrate -seed
 
-# 只创建索引
-go run cmd/migrate/main.go -indexes
+# 为高延迟云数据库提高总超时
+go run ./cmd/migrate -timeout 10m
 
-# 只初始化种子数据
-go run cmd/migrate/main.go -seed
-
-# 组合操作
-go run cmd/migrate/main.go -migrate -indexes
+# 网络超时后从指定的一基模型序号继续
+go run ./cmd/migrate -timeout 10m -resume-from-model 15
 ```
 
-### Makefile 快捷命令
-
-我们提供了Makefile来简化常用操作：
+等价的 Make 目标：
 
 ```bash
-# 显示所有可用命令
-make help
-
-# 执行完整数据库迁移
-make migrate-all
-
-# 只迁移表结构
-make migrate-tables
-
-# 只创建索引
-make migrate-indexes
-
-# 只初始化种子数据
+make migrate
 make migrate-seed
+make migrate-verbose
 ```
 
-## 服务器启动
+`-resume-from-model` 只用于一次迁移在模型扫描阶段因网络超时中断的情况。已完成的单模型迁移会独立提交；续跑仍会执行全部索引与 Schema 校验。
 
-### 默认模式（推荐）
+## 破坏性重建
+
+开发环境需要重建 ChronoDesk 自有表时，使用：
 
 ```bash
-# 启动服务器，跳过自动迁移
-make run
-# 或
-go run main.go
+make migrate-drop
 ```
 
-服务器将快速启动，不执行数据库迁移。
+该目标要求交互输入 `DROP`，并在子进程中设置 `ALLOW_DESTRUCTIVE_MIGRATION=true`。不要在共享、测试、预发布或生产数据库执行。
 
-### 自动迁移模式
+## 应用启动
+
+默认启动不会迁移：
 
 ```bash
-# 启动服务器并自动执行迁移
-make run-migrate
-# 或
-AUTO_MIGRATE=true go run main.go
+go run ./main.go
 ```
 
-服务器启动时会自动执行完整的数据库迁移。
+只有显式设置以下变量才会在启动时运行相同的标准迁移：
 
-## 推荐工作流程
-
-### 首次部署
-
-1. 配置数据库连接（.env文件）
-2. 执行完整迁移：`make migrate-all`
-3. 启动服务器：`make run`
-
-### 开发环境
-
-1. 修改数据库模型后
-2. 执行表迁移：`make migrate-tables`
-3. 如需要，创建新索引：`make migrate-indexes`
-4. 重启服务器：`make run`
-
-### 生产环境
-
-1. 停止服务器
-2. 备份数据库
-3. 执行迁移：`make migrate-all`
-4. 启动服务器：`make run`
-
-## 迁移内容
-
-### 表结构迁移 (`-migrate`)
-
-- 用户表 (users)
-- 用户资料表 (user_profiles)
-- 刷新令牌表 (refresh_tokens)
-- 登录尝试表 (login_attempts)
-- 分类表 (categories)
-- 工单表 (tickets)
-- 工单评论表 (ticket_comments)
-- 工单历史表 (ticket_histories)
-- OTP验证码表 (otp_codes)
-
-### 索引创建 (`-indexes`)
-
-- 用户表索引（邮箱、用户名、角色等）
-- 工单表索引（状态、优先级、分类等）
-- 评论表索引（工单ID、用户ID等）
-- 历史表索引（工单ID、操作类型等）
-- 其他性能优化索引
-
-### 种子数据 (`-seed`)
-
-- 默认管理员用户
-- 基础分类数据
-- 系统配置数据
-
-## 故障排除
-
-### 常见问题
-
-1. **数据库连接失败**
-   - 检查 .env 文件中的数据库配置
-   - 确保数据库服务正在运行
-   - 验证数据库用户权限
-
-2. **迁移失败**
-   - 检查数据库用户是否有创建表的权限
-   - 查看详细错误信息
-   - 确保数据库版本兼容
-
-3. **索引创建失败**
-   - 通常是警告，不会中断迁移
-   - 检查是否有重复的索引
-   - 验证表结构是否正确
-
-### 日志信息
-
-迁移工具会输出详细的日志信息：
-
-```
-数据库连接成功
-开始执行完整数据库迁移...
-Starting database migration...
-Database migration completed successfully
-开始创建数据库索引...
-Additional indexes created successfully
-开始初始化种子数据...
-Seed data initialized successfully
-完整迁移完成
-所有操作完成
+```bash
+AUTO_MIGRATE=true go run ./main.go
 ```
 
-## 环境变量
+生产发布建议把迁移作为独立部署步骤，并在应用实例启动时保持 `AUTO_MIGRATE=false`，避免多个实例同时执行 DDL。
 
-### 服务器启动控制
+## 凭据加密迁移
 
-- `AUTO_MIGRATE=true`: 启用服务器启动时自动迁移
-- `AUTO_MIGRATE=false` 或未设置: 跳过自动迁移（默认）
+数据库结构迁移不会自动改写历史明文凭据。凭据加密使用独立、显式的一次性命令：
 
-### 数据库配置
-
-确保以下环境变量正确配置：
-
-```env
-DATABASE_URL=postgres://username:password@localhost:5432/dbname?sslmode=disable
-DB_HOST=localhost
-DB_PORT=5432
-DB_USER=username
-DB_PASSWORD=password
-DB_NAME=dbname
+```bash
+go run ./cmd/secret-migrate -validate-only
+go run ./cmd/secret-migrate
+go run ./cmd/secret-migrate -validate-only
 ```
 
-## 最佳实践
-
-1. **生产环境**：始终使用独立迁移工具，不要依赖自动迁移
-2. **开发环境**：可以使用自动迁移提高开发效率
-3. **备份**：生产环境迁移前务必备份数据库
-4. **测试**：在测试环境先验证迁移脚本
-5. **监控**：关注迁移过程中的日志和性能指标
-
-## 版本控制
-
-- 数据库模型变更应该通过代码版本控制
-- 迁移脚本随代码一起版本化
-- 生产环境部署时确保代码和数据库版本一致
+先验证、再迁移、最后再次验证。详情见 `docs/reference/DATA_AT_REST_ENCRYPTION.md`。

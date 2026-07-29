@@ -77,8 +77,8 @@ const TicketBulkUpdateButton: React.FC = () => {
             setPriority('')
             onUnselectItems?.()
           },
-          onError: (error) => {
-            notify(error?.message || '批量更新失败', { type: 'warning' })
+          onError: (error: unknown) => {
+            notify(error instanceof Error ? error.message : '批量更新失败', { type: 'warning' })
           },
           mutationMode: 'pessimistic',
         }

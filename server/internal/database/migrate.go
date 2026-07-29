@@ -1,33 +1,262 @@
 package database
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"strings"
+	"time"
 
 	"gongdan-system/internal/auth"
 	"gongdan-system/internal/models"
 	"gorm.io/gorm"
 )
 
+// ValidateRuntimeSchema verifies additive migrations that the running binary
+// cannot safely operate without. AUTO_MIGRATE may be disabled in production,
+// but the process must fail fast instead of starting schedulers that repeatedly
+// fail against an older schema.
+func ValidateRuntimeSchema(db *gorm.DB) error {
+	if db == nil {
+		return fmt.Errorf("database is required")
+	}
+
+	requirements := runtimeSchemaRequirements()
+	if db.Dialector.Name() == "postgres" {
+		return validatePostgresRuntimeSchema(db, requirements)
+	}
+
+	var missing []string
+	for _, required := range requirements {
+		if !db.Migrator().HasTable(required.model) {
+			missing = append(missing, required.table)
+			continue
+		}
+		for _, column := range required.columns {
+			if !db.Migrator().HasColumn(required.model, column) {
+				missing = append(missing, required.table+"."+column)
+			}
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"required schema objects are missing: %s; run `go run ./cmd/migrate` before starting the server",
+			strings.Join(missing, ", "),
+		)
+	}
+	return nil
+}
+
+type runtimeSchemaColumn struct {
+	TableName  string `gorm:"column:table_name"`
+	ColumnName string `gorm:"column:column_name"`
+}
+
+// validatePostgresRuntimeSchema reads all required metadata in one query.
+// Cloud PostgreSQL connections can add hundreds of milliseconds per network
+// round trip; issuing HasTable/HasColumn for every field turned a fail-fast
+// safety gate into a 40+ second cold start.
+func validatePostgresRuntimeSchema(
+	db *gorm.DB,
+	requirements []runtimeSchemaRequirement,
+) error {
+	tableNames := make([]string, 0, len(requirements))
+	seenTables := make(map[string]struct{}, len(requirements))
+	for _, required := range requirements {
+		if _, exists := seenTables[required.table]; exists {
+			continue
+		}
+		seenTables[required.table] = struct{}{}
+		tableNames = append(tableNames, required.table)
+	}
+
+	var rows []runtimeSchemaColumn
+	if err := db.Raw(`
+		SELECT table_name, column_name
+		FROM information_schema.columns
+		WHERE table_schema = CURRENT_SCHEMA()
+		  AND table_name IN ?
+	`, tableNames).Scan(&rows).Error; err != nil {
+		return fmt.Errorf("read PostgreSQL runtime schema metadata: %w", err)
+	}
+	present := make(map[string]map[string]struct{}, len(tableNames))
+	for _, row := range rows {
+		if present[row.TableName] == nil {
+			present[row.TableName] = make(map[string]struct{})
+		}
+		present[row.TableName][row.ColumnName] = struct{}{}
+	}
+
+	var missing []string
+	for _, required := range requirements {
+		columns, tableExists := present[required.table]
+		if !tableExists {
+			missing = append(missing, required.table)
+			continue
+		}
+		for _, column := range required.columns {
+			if _, exists := columns[column]; !exists {
+				missing = append(missing, required.table+"."+column)
+			}
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"required schema objects are missing: %s; run `go run ./cmd/migrate` before starting the server",
+			strings.Join(missing, ", "),
+		)
+	}
+	return nil
+}
+
+type runtimeSchemaRequirement struct {
+	model   any
+	table   string
+	columns []string
+}
+
+// runtimeSchemaRequirements covers every table/column needed before Agent,
+// Outbox, lease, A2A and immediately-revocable human sessions are allowed to
+// start background work. It intentionally checks the deployed schema rather
+// than trusting migration history.
+func runtimeSchemaRequirements() []runtimeSchemaRequirement {
+	return []runtimeSchemaRequirement{
+		{&models.User{}, "users", []string{
+			"id", "role", "status", "password_hash", "password_reset_at",
+			"two_factor_enabled", "two_factor_secret", "backup_codes",
+		}},
+		{&auth.RefreshToken{}, "refresh_tokens", []string{"user_id", "session_id", "expires_at", "revoked"}},
+		{&auth.EmailVerification{}, "email_verifications", []string{"user_id", "token", "used", "expires_at", "used_at"}},
+		{&auth.PasswordReset{}, "password_resets", []string{"user_id", "token", "used", "expires_at", "used_at"}},
+		{&auth.OTPCode{}, "otp_codes", []string{"user_id", "code", "type", "expires_at", "used", "used_at"}},
+		{&models.LoginHistory{}, "login_histories", []string{"user_id", "session_id", "is_active"}},
+		{&models.ServicePrincipal{}, "service_principals", []string{"id", "status", "scopes", "read_only", "emergency_disabled", "expires_at"}},
+		{&models.AgentCredential{}, "agent_credentials", []string{"service_principal_id", "secret_hash", "status", "expires_at", "revoked_at"}},
+		{&models.AgentPolicy{}, "agent_policies", []string{"service_principal_id", "effect", "scope", "action", "conditions", "is_active"}},
+		{&models.PolicyDecision{}, "policy_decisions", []string{"actor_type", "actor_id", "credential_id", "allowed", "reason_code", "request_digest"}},
+		{&models.IdempotencyRecord{}, "idempotency_records", []string{
+			"actor_type", "actor_id", "operation", "key", "request_hash", "state",
+			"resource_snapshot", "expires_at", "completion_ttl_nanoseconds", "completed_at",
+		}},
+		{&models.Ticket{}, "tickets", []string{
+			"id", "version", "agent_context", "trust_level", "created_by_actor_type",
+			"created_by_actor_id", "assigned_to_actor_type", "assigned_to_actor_id",
+		}},
+		{&models.TicketComment{}, "ticket_comments", []string{"ticket_id", "actor_type", "actor_id", "service_principal_id", "type"}},
+		{&models.TicketAttachment{}, "ticket_attachments", []string{
+			"ticket_id", "actor_type", "actor_id", "service_principal_id",
+			"storage_path", "hash", "virus_scan",
+		}},
+		{&models.TicketHistory{}, "ticket_histories", []string{"ticket_id", "actor_type", "actor_id", "service_principal_id", "action", "details"}},
+		{&models.TicketLease{}, "ticket_leases", []string{"ticket_id", "holder_actor_type", "holder_actor_id", "ticket_version", "expires_at", "released_at"}},
+		{&models.DomainEvent{}, "domain_events", []string{
+			"spec_version", "source", "type", "subject", "time", "data",
+			"actor_type", "actor_id", "resource_version", "published_at",
+		}},
+		{&models.OutboxDelivery{}, "outbox_deliveries", []string{
+			"event_id", "destination_type", "destination_id", "status",
+			"attempts", "next_attempt_at", "locked_at", "locked_by",
+		}},
+		{&models.AgentTask{}, "agent_tasks", []string{
+			"context_id", "linked_ticket_id", "owner_actor_type", "owner_actor_id",
+			"owner_credential_id", "state", "version", "execution_claim_id", "execution_expires_at",
+		}},
+		{&models.AgentMessage{}, "agent_messages", []string{"task_id", "context_id", "sequence", "request_digest", "payload"}},
+		{&models.AgentArtifact{}, "agent_artifacts", []string{"task_id", "sequence", "payload"}},
+		{&models.AgentTaskStatusHistory{}, "agent_task_status_history", []string{"task_id", "sequence", "state", "status"}},
+		{&models.AgentTaskEvent{}, "agent_task_events", []string{"task_id", "context_id", "resource_version", "payload"}},
+		{&models.AgentPushNotificationConfig{}, "agent_push_notification_configs", []string{"task_id", "url", "token", "authentication"}},
+		{&models.Notification{}, "notifications", []string{"recipient_id", "type", "channel", "related_ticket_id", "source_event_key"}},
+	}
+}
+
 // AutoMigrate 自动迁移所有模型
 func AutoMigrate(db *gorm.DB) error {
+	return autoMigrateFromModel(db, 1)
+}
+
+func autoMigrateFromModel(db *gorm.DB, firstModel int) error {
 	log.Println("Starting database migration...")
 
-	// 一次性迁移所有模型
-	err := db.AutoMigrate(
+	migrationModels := schemaMigrationModels()
+	if firstModel < 1 || firstModel > len(migrationModels)+1 {
+		return fmt.Errorf(
+			"first migration model must be between 1 and %d",
+			len(migrationModels)+1,
+		)
+	}
+	// 每个模型独立提交并记录进度。高延迟云数据库的元数据查询较多，
+	// 分段后失败可安全重跑，也能精确定位慢表，而不是出现无输出的长等待。
+	for index := firstModel - 1; index < len(migrationModels); index++ {
+		model := migrationModels[index]
+		startedAt := time.Now()
+		if err := migrateOneModel(db, model); err != nil {
+			return fmt.Errorf("failed to migrate model %d %T: %w", index+1, model, err)
+		}
+		log.Printf(
+			"Migrated model %d/%d %T in %s",
+			index+1,
+			len(migrationModels),
+			model,
+			time.Since(startedAt).Round(time.Millisecond),
+		)
+	}
+
+	log.Println("Database migration completed successfully")
+	return nil
+}
+
+// migrateOneModel isolates an upstream GORM PostgreSQL migrator defect where a
+// context deadline can leave ColumnTypes metadata nil and trigger a panic.
+// Operator tooling must return a resumable error instead of terminating with a
+// stack trace after the database connection has already timed out.
+func migrateOneModel(db *gorm.DB, model any) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("migration driver panic: %v", recovered)
+		}
+	}()
+	return db.AutoMigrate(model)
+}
+
+func schemaMigrationModels() []any {
+	return []any{
 		&models.User{},
-		&auth.UserProfile{},
+		&models.UserProfile{},
 		&auth.RefreshToken{},
 		&auth.LoginAttempt{},
+		&auth.EmailVerification{},
+		&auth.PasswordReset{},
 		&models.Category{},
+		&models.EmailConfig{},
+		&models.ServicePrincipal{},
+		&models.AgentCredential{},
+		&models.AgentPolicy{},
+		&models.PolicyDecision{},
+		&models.IdempotencyRecord{},
 		&models.Ticket{},
 		&models.TicketComment{},
+		&models.TicketAttachment{},
 		&models.TicketHistory{},
-		&models.OTPCode{},
+		&models.TicketTag{},
+		&models.TicketLease{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
+		&models.AgentTask{},
+		&models.AgentMessage{},
+		&models.AgentArtifact{},
+		&models.AgentTaskStatusHistory{},
+		&models.AgentTaskEvent{},
+		&models.AgentPushNotificationConfig{},
+		&auth.OTPCode{},
 		&models.OTPTrustedDevice{},
+		&models.NotificationPreference{},
+		&models.Notification{},
 		&models.WebhookConfig{},
 		&models.WebhookLog{},
+		&models.EmailLog{},
 		&models.LoginHistory{},
 		&models.SystemConfig{},
 		&models.CleanupLog{},
@@ -38,14 +267,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&models.AutomationLog{},
 		&models.QuickReply{},
 		&models.AdminAuditLog{},
-	)
-
-	if err != nil {
-		return fmt.Errorf("failed to migrate models: %w", err)
 	}
-
-	log.Println("Database migration completed successfully")
-	return nil
 }
 
 // CreateIndexes 创建额外的索引
@@ -74,13 +296,16 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_tickets_type ON tickets(type);",
 		"CREATE INDEX IF NOT EXISTS idx_tickets_source ON tickets(source);",
 		"CREATE INDEX IF NOT EXISTS idx_tickets_category_id ON tickets(category_id);",
-		"CREATE INDEX IF NOT EXISTS idx_tickets_created_by ON tickets(created_by);",
-		"CREATE INDEX IF NOT EXISTS idx_tickets_assigned_to ON tickets(assigned_to);",
-		"CREATE INDEX IF NOT EXISTS idx_tickets_due_at ON tickets(due_at);",
+		"CREATE INDEX IF NOT EXISTS idx_tickets_created_by ON tickets(created_by_id);",
+		"CREATE INDEX IF NOT EXISTS idx_tickets_assigned_to ON tickets(assigned_to_id);",
+		"CREATE INDEX IF NOT EXISTS idx_tickets_due_at ON tickets(due_date);",
 		"CREATE INDEX IF NOT EXISTS idx_tickets_resolved_at ON tickets(resolved_at);",
 		"CREATE INDEX IF NOT EXISTS idx_tickets_closed_at ON tickets(closed_at);",
 		"CREATE INDEX IF NOT EXISTS idx_tickets_status_priority ON tickets(status, priority);",
 		"CREATE INDEX IF NOT EXISTS idx_tickets_created_at ON tickets(created_at);",
+		"CREATE INDEX IF NOT EXISTS idx_tickets_version ON tickets(id, version);",
+		"CREATE INDEX IF NOT EXISTS idx_tickets_creator_actor ON tickets(created_by_actor_type, created_by_actor_id);",
+		"CREATE INDEX IF NOT EXISTS idx_tickets_assignee_actor ON tickets(assigned_to_actor_type, assigned_to_actor_id);",
 
 		// 工单评论表索引
 		"CREATE INDEX IF NOT EXISTS idx_ticket_comments_ticket_id ON ticket_comments(ticket_id);",
@@ -95,6 +320,19 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_ticket_histories_action ON ticket_histories(action);",
 		"CREATE INDEX IF NOT EXISTS idx_ticket_histories_created_at ON ticket_histories(created_at);",
 
+		// Agent-native identity, policy, event and lease indexes
+		"CREATE INDEX IF NOT EXISTS idx_service_principals_controls ON service_principals(status, emergency_disabled, expires_at);",
+		"CREATE INDEX IF NOT EXISTS idx_agent_credentials_lookup ON agent_credentials(service_principal_id, status, expires_at);",
+		"CREATE INDEX IF NOT EXISTS idx_agent_policies_lookup ON agent_policies(service_principal_id, scope, is_active, priority DESC);",
+		"CREATE INDEX IF NOT EXISTS idx_policy_decisions_actor_time ON policy_decisions(actor_type, actor_id, created_at DESC);",
+		"CREATE INDEX IF NOT EXISTS idx_domain_events_stream ON domain_events(type, created_at, id);",
+		"CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_deliveries(status, next_attempt_at);",
+		"CREATE INDEX IF NOT EXISTS idx_idempotency_expiry ON idempotency_records(expires_at);",
+		"CREATE INDEX IF NOT EXISTS idx_ticket_leases_expiry ON ticket_leases(expires_at, released_at);",
+		"CREATE INDEX IF NOT EXISTS idx_agent_tasks_context_state ON agent_tasks(context_id, state, updated_at DESC);",
+		"CREATE INDEX IF NOT EXISTS idx_agent_task_events_context_cursor ON agent_task_events(context_id, id);",
+		"CREATE INDEX IF NOT EXISTS idx_agent_push_task ON agent_push_notification_configs(task_id);",
+
 		// OTP表索引
 		"CREATE INDEX IF NOT EXISTS idx_otp_codes_user_id ON otp_codes(user_id);",
 		"CREATE INDEX IF NOT EXISTS idx_otp_codes_code ON otp_codes(code);",
@@ -106,6 +344,7 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_refresh_tokens_token ON refresh_tokens(token);",
 		"CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires_at ON refresh_tokens(expires_at);",
 		"CREATE INDEX IF NOT EXISTS idx_refresh_tokens_revoked ON refresh_tokens(revoked);",
+		"CREATE INDEX IF NOT EXISTS idx_refresh_tokens_session_active ON refresh_tokens(user_id, session_id, revoked, expires_at);",
 
 		// 登录尝试表索引
 		"CREATE INDEX IF NOT EXISTS idx_login_attempts_email ON login_attempts(email);",
@@ -134,6 +373,7 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_login_histories_login_time ON login_histories(login_time);",
 		"CREATE INDEX IF NOT EXISTS idx_login_histories_logout_time ON login_histories(logout_time);",
 		"CREATE INDEX IF NOT EXISTS idx_login_histories_session_id ON login_histories(session_id);",
+		"CREATE INDEX IF NOT EXISTS idx_login_histories_session_active ON login_histories(user_id, session_id, is_active);",
 		"CREATE INDEX IF NOT EXISTS idx_login_histories_login_status ON login_histories(login_status);",
 		"CREATE INDEX IF NOT EXISTS idx_login_histories_is_active ON login_histories(is_active);",
 		"CREATE INDEX IF NOT EXISTS idx_login_histories_user_login ON login_histories(user_id, login_time);",
@@ -156,14 +396,62 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_cleanup_logs_task_status ON cleanup_logs(task_type, status);",
 	}
 
+	var indexErrors []error
 	for _, indexSQL := range indexes {
 		if err := db.Exec(indexSQL).Error; err != nil {
-			log.Printf("Warning: Failed to create index: %v", err)
-			// 继续执行其他索引，不中断迁移过程
+			indexErrors = append(indexErrors, fmt.Errorf("%s: %w", indexSQL, err))
 		}
+	}
+	if err := errors.Join(indexErrors...); err != nil {
+		return fmt.Errorf("create required indexes: %w", err)
 	}
 
 	log.Println("Additional indexes created successfully")
+	return nil
+}
+
+// EnsureForeignKeyPolicies keeps optional historical references compatible
+// with resource deletion. A notification retains its event snapshot after a
+// ticket is removed, while PostgreSQL atomically clears the optional FK.
+func EnsureForeignKeyPolicies(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("database is required")
+	}
+	if db.Dialector.Name() != "postgres" {
+		return nil
+	}
+	const notificationTicketPolicy = `
+DO $$
+BEGIN
+	IF EXISTS (
+		SELECT 1
+		FROM information_schema.referential_constraints
+		WHERE constraint_schema = CURRENT_SCHEMA()
+		  AND constraint_name = 'notifications_related_ticket_id_fkey'
+		  AND delete_rule <> 'SET NULL'
+	) THEN
+		ALTER TABLE notifications
+			DROP CONSTRAINT notifications_related_ticket_id_fkey;
+	END IF;
+	IF NOT EXISTS (
+		SELECT 1
+		FROM information_schema.table_constraints
+		WHERE constraint_schema = CURRENT_SCHEMA()
+		  AND table_name = 'notifications'
+		  AND constraint_name = 'notifications_related_ticket_id_fkey'
+	) THEN
+		ALTER TABLE notifications
+			ADD CONSTRAINT notifications_related_ticket_id_fkey
+			FOREIGN KEY (related_ticket_id)
+			REFERENCES tickets(id)
+			ON UPDATE CASCADE
+			ON DELETE SET NULL;
+	END IF;
+END
+$$;`
+	if err := db.Exec(notificationTicketPolicy).Error; err != nil {
+		return fmt.Errorf("ensure notification ticket foreign-key policy: %w", err)
+	}
 	return nil
 }
 
@@ -311,23 +599,52 @@ func generateSampleDataIfNeeded(db *gorm.DB) error {
 	return nil
 }
 
-// RunMigrations 运行完整的数据库迁移流程
+// RunMigrations 只执行可重复的结构迁移。生产启动与普通 migrate 命令
+// 绝不能隐式创建账号、分类或示例工单；种子数据必须由显式 seed 命令触发。
 func RunMigrations(db *gorm.DB) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	return RunMigrationsContext(ctx, db)
+}
+
+// RunMigrationsContext is the bounded migration entry point used by operator
+// tooling. A lost TLS connection or pooler response must never leave deployment
+// automation blocked indefinitely.
+func RunMigrationsContext(ctx context.Context, db *gorm.DB) error {
+	return RunMigrationsFromModel(ctx, db, 1)
+}
+
+// RunMigrationsFromModel resumes the model scan at a one-based index while
+// still running all index and runtime-schema gates. It is intended for a
+// bounded operator retry after a network timeout; normal callers start at 1.
+func RunMigrationsFromModel(ctx context.Context, db *gorm.DB, firstModel int) error {
+	if ctx == nil {
+		return errors.New("migration context is required")
+	}
+	if db == nil {
+		return errors.New("migration database is required")
+	}
+	db = db.WithContext(ctx)
 	log.Println("Running database migrations...")
 
 	// 1. 自动迁移模型
-	if err := AutoMigrate(db); err != nil {
+	if err := autoMigrateFromModel(db, firstModel); err != nil {
 		return fmt.Errorf("auto migration failed: %w", err)
 	}
 
-	// 2. 创建额外索引
+	// 2. 收口删除语义明确的外键策略
+	if err := EnsureForeignKeyPolicies(db); err != nil {
+		return fmt.Errorf("foreign-key policy migration failed: %w", err)
+	}
+
+	// 3. 创建额外索引
 	if err := CreateIndexes(db); err != nil {
 		return fmt.Errorf("index creation failed: %w", err)
 	}
 
-	// 3. 初始化种子数据
-	if err := SeedData(db); err != nil {
-		return fmt.Errorf("seed data creation failed: %w", err)
+	// 4. 验证运行时所需的关键表和列真实存在
+	if err := ValidateRuntimeSchema(db); err != nil {
+		return fmt.Errorf("runtime schema validation failed: %w", err)
 	}
 
 	log.Println("All database migrations completed successfully")

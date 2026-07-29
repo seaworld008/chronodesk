@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import secrets
 import time
-from typing import Dict
+from typing import Dict, Iterator
 
 import pytest
 import requests
@@ -42,22 +42,32 @@ def _ensure_api_available(api_base_url: str) -> None:
     if not health_url:
         # 假设 api_base_url 以 /api 结尾
         base_host = api_base_url.rsplit("/api", 1)[0]
-        health_url = f"{base_host}/health"
+        health_url = f"{base_host}/healthz"
 
     try:
         response = requests.get(health_url, timeout=5)
     except requests.RequestException as exc:
-        pytest.skip(f"API 未启动或无法连接: {exc}")
-    else:
-        if response.status_code >= 500:
-            pytest.skip(f"API 健康检查失败: HTTP {response.status_code}")
+        pytest.fail(f"API 未启动或无法连接: {exc}")
+    if response.status_code != 200:
+        pytest.fail(f"API 健康检查失败: HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        pytest.fail(f"API 健康检查返回非 JSON 响应: {exc}")
+    dependencies = payload.get("dependencies", {})
+    if (
+        payload.get("status") != "ok"
+        or dependencies.get("postgresql") != "ok"
+        or dependencies.get("redis") != "ok"
+    ):
+        pytest.fail(f"API 依赖未就绪: {payload}")
 
 
 @pytest.fixture(scope="session")
 def admin_credentials() -> Dict[str, str]:
     return {
-        "email": os.getenv("TEST_ADMIN_EMAIL", "manager@tickets.com"),
-        "password": os.getenv("TEST_ADMIN_PASSWORD", "SecureTicket2025!@#$"),
+        "email": os.getenv("TEST_ADMIN_EMAIL", "admin@example.com"),
+        "password": os.getenv("TEST_ADMIN_PASSWORD", "Admin123!"),
     }
 
 
@@ -68,7 +78,7 @@ def admin_tokens(api_client: APIClient, admin_credentials: Dict[str, str]) -> Di
     except APIError as exc:
         response = exc.response
         detail = response.text if response is not None else str(exc)
-        pytest.skip(f"管理员登录失败，无法运行依赖测试: {detail}")
+        pytest.fail(f"管理员登录失败，无法运行依赖测试: {detail}")
     return payload
 
 
@@ -76,7 +86,7 @@ def admin_tokens(api_client: APIClient, admin_credentials: Dict[str, str]) -> Di
 def admin_api(api_client: APIClient, admin_tokens: Dict[str, str]) -> APIClient:
     token = admin_tokens.get("access_token")
     if not token:
-        pytest.skip("管理员登录响应缺少 access_token")
+        pytest.fail("管理员登录响应缺少 access_token")
 
     authed_client = api_client.with_auth(token)
     yield authed_client
@@ -84,7 +94,7 @@ def admin_api(api_client: APIClient, admin_tokens: Dict[str, str]) -> APIClient:
 
 
 @pytest.fixture
-def registered_user(api_client: APIClient) -> Dict[str, str]:
+def registered_user(api_client: APIClient, admin_api: APIClient) -> Iterator[Dict[str, object]]:
     last_error: APIError | None = None
     for attempt in range(3):
         timestamp = int(time.time_ns())
@@ -115,13 +125,25 @@ def registered_user(api_client: APIClient) -> Dict[str, str]:
         detail = response.text if response is not None else str(last_error)
         pytest.fail(f"Failed to register test user: {detail}")
 
-    return {
+    registered = {
         "email": email,
         "password": password,
         "access_token": data.get("access_token"),
         "refresh_token": data.get("refresh_token"),
         "user": data.get("user", {}),
     }
+    try:
+        yield registered
+    finally:
+        user = registered.get("user", {})
+        user_id = user.get("id") if isinstance(user, dict) else None
+        if user_id:
+            response = admin_api.delete(f"/admin/users/{user_id}")
+            if response.status_code not in (200, 204, 404):
+                pytest.fail(
+                    f"Failed to clean up registered test user {user_id}: "
+                    f"HTTP {response.status_code} {response.text}"
+                )
 
 
 def _generate_strong_password() -> str:

@@ -1,10 +1,13 @@
 package auth
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	appconfig "gongdan-system/internal/config"
+	"gongdan-system/internal/security"
 	"gongdan-system/internal/services"
 	"gorm.io/gorm"
 )
@@ -17,9 +20,19 @@ type AuthModule struct {
 }
 
 // NewAuthModule 创建认证模块
-func NewAuthModule(db *gorm.DB, cfg *appconfig.Config) (*AuthModule, error) {
+func NewAuthModule(
+	db *gorm.DB,
+	cfg *appconfig.Config,
+	protector security.Protector,
+) (*AuthModule, error) {
 	if cfg == nil {
 		return nil, errors.New("config is required")
+	}
+	if protector == nil {
+		return nil, security.ErrKeyringUnavailable
+	}
+	if err := ValidateAuthCredentialStorage(context.Background(), db, protector); err != nil {
+		return nil, fmt.Errorf("validate authentication credential storage: %w", err)
 	}
 
 	// 创建配置
@@ -43,7 +56,7 @@ func NewAuthModule(db *gorm.DB, cfg *appconfig.Config) (*AuthModule, error) {
 	logger := &SimpleLogger{}
 
 	// 创建仓库
-	userRepo := NewGormUserRepository(db)
+	userRepo := NewGormUserRepository(db, protector)
 	profileRepo := NewGormProfileRepository(db) // 使用GORM版本
 	tokenRepo := NewGormTokenRepository(db)
 	loginAttemptRepo := NewGormLoginAttemptRepository(db)
@@ -70,7 +83,7 @@ func NewAuthModule(db *gorm.DB, cfg *appconfig.Config) (*AuthModule, error) {
 	)
 
 	// 创建邮箱配置服务
-	emailConfigService := services.NewEmailConfigService(db)
+	emailConfigService := services.NewEmailConfigServiceWithProtector(db, protector)
 
 	// 创建认证服务
 	authService := NewAuthService(
@@ -112,10 +125,4 @@ func (m *AuthModule) GetHandler() *AuthHandler {
 // GetConfig 获取配置
 func (m *AuthModule) GetConfig() *AuthConfig {
 	return m.Config
-}
-
-// SetupAuthRoutes 设置认证路由（从routes.go移动到这里以便集成）
-func (m *AuthModule) SetupAuthRoutes(router interface{}) {
-	// 这里可以根据实际的路由器类型进行设置
-	// 由于我们使用Gin，这个方法可以在main.go中直接调用routes.go的函数
 }

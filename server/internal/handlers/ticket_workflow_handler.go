@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"gongdan-system/internal/models"
 	"gongdan-system/internal/services"
 )
 
@@ -74,10 +75,32 @@ func (h *TicketWorkflowHandler) AssignTicket(c *gin.Context) {
 		})
 		return
 	}
+	authorizedTicket, err := authorizeTicket(c.Request.Context(), c, h.ticketService, uint(ticketID), ticketAccessWorkflow)
+	if err != nil {
+		if !writeTicketAuthorizationError(c, err) {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "工单不存在"})
+		}
+		return
+	}
+	versionedService, ok := h.ticketService.(TicketVersionedService)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "code": "version_guard_unavailable", "message": "工单服务未启用授权版本校验"})
+		return
+	}
 
 	userID := c.GetUint("user_id")
-	ticket, err := h.ticketService.AssignTicket(uint(ticketID), req.AssignedToID, userID, req.Comment)
+	ticket, err := versionedService.AssignTicketExpectedVersion(
+		uint(ticketID),
+		req.AssignedToID,
+		userID,
+		req.Comment,
+		authorizedTicket.Version,
+	)
 	if err != nil {
+		if errors.Is(err, services.ErrVersionConflict) {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "code": "version_conflict", "message": "工单已被并发更新"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "工单分配失败",
@@ -88,7 +111,7 @@ func (h *TicketWorkflowHandler) AssignTicket(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    ticket.ToResponse(),
+		"data":    ticketResponseForRole(ticket, normalizedUserRole(c)),
 		"message": "工单分配成功",
 	})
 }
@@ -112,10 +135,33 @@ func (h *TicketWorkflowHandler) TransferTicket(c *gin.Context) {
 		})
 		return
 	}
+	authorizedTicket, err := authorizeTicket(c.Request.Context(), c, h.ticketService, uint(ticketID), ticketAccessWorkflow)
+	if err != nil {
+		if !writeTicketAuthorizationError(c, err) {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "工单不存在"})
+		}
+		return
+	}
+	versionedService, ok := h.ticketService.(TicketVersionedService)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "code": "version_guard_unavailable", "message": "工单服务未启用授权版本校验"})
+		return
+	}
 
 	userID := c.GetUint("user_id")
-	ticket, err := h.ticketService.TransferTicket(uint(ticketID), req.AssignedToID, userID, req.Comment, req.TransferReason)
+	ticket, err := versionedService.TransferTicketExpectedVersion(
+		uint(ticketID),
+		req.AssignedToID,
+		userID,
+		req.Comment,
+		req.TransferReason,
+		authorizedTicket.Version,
+	)
 	if err != nil {
+		if errors.Is(err, services.ErrVersionConflict) {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "code": "version_conflict", "message": "工单已被并发更新"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "工单转移失败",
@@ -126,7 +172,7 @@ func (h *TicketWorkflowHandler) TransferTicket(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    ticket.ToResponse(),
+		"data":    ticketResponseForRole(ticket, normalizedUserRole(c)),
 		"message": "工单转移成功",
 	})
 }
@@ -150,10 +196,33 @@ func (h *TicketWorkflowHandler) EscalateTicket(c *gin.Context) {
 		})
 		return
 	}
+	authorizedTicket, err := authorizeTicket(c.Request.Context(), c, h.ticketService, uint(ticketID), ticketAccessWorkflow)
+	if err != nil {
+		if !writeTicketAuthorizationError(c, err) {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "工单不存在"})
+		}
+		return
+	}
+	versionedService, ok := h.ticketService.(TicketVersionedService)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "code": "version_guard_unavailable", "message": "工单服务未启用授权版本校验"})
+		return
+	}
 
 	userID := c.GetUint("user_id")
-	ticket, err := h.ticketService.EscalateTicket(uint(ticketID), req.EscalateToID, userID, req.Reason, req.Comment)
+	ticket, err := versionedService.EscalateTicketExpectedVersion(
+		uint(ticketID),
+		req.EscalateToID,
+		userID,
+		req.Reason,
+		req.Comment,
+		authorizedTicket.Version,
+	)
 	if err != nil {
+		if errors.Is(err, services.ErrVersionConflict) {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "code": "version_conflict", "message": "工单已被并发更新"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": "工单升级失败",
@@ -164,7 +233,7 @@ func (h *TicketWorkflowHandler) EscalateTicket(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    ticket.ToResponse(),
+		"data":    ticketResponseForRole(ticket, normalizedUserRole(c)),
 		"message": "工单升级成功",
 	})
 }
@@ -188,10 +257,33 @@ func (h *TicketWorkflowHandler) UpdateTicketStatus(c *gin.Context) {
 		})
 		return
 	}
+	authorizedTicket, err := authorizeTicket(c.Request.Context(), c, h.ticketService, uint(ticketID), ticketAccessWorkflow)
+	if err != nil {
+		if !writeTicketAuthorizationError(c, err) {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "工单不存在"})
+		}
+		return
+	}
+	versionedService, ok := h.ticketService.(TicketVersionedService)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "code": "version_guard_unavailable", "message": "工单服务未启用授权版本校验"})
+		return
+	}
 
 	userID := c.GetUint("user_id")
-	ticket, err := h.ticketService.UpdateTicketStatus(uint(ticketID), req.Status, userID, req.Comment, req.ResolutionNotes)
+	ticket, err := versionedService.UpdateTicketStatusExpectedVersion(
+		uint(ticketID),
+		req.Status,
+		userID,
+		req.Comment,
+		req.ResolutionNotes,
+		authorizedTicket.Version,
+	)
 	if err != nil {
+		if errors.Is(err, services.ErrVersionConflict) {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "code": "version_conflict", "message": "工单已被并发更新"})
+			return
+		}
 		if errors.Is(err, services.ErrInvalidTicketTransition) {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"success": false,
@@ -210,14 +302,14 @@ func (h *TicketWorkflowHandler) UpdateTicketStatus(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    ticket.ToResponse(),
+		"data":    ticketResponseForRole(ticket, normalizedUserRole(c)),
 		"message": "状态更新成功",
 	})
 }
 
 func (h *TicketWorkflowHandler) GetTicketStats(c *gin.Context) {
 	userID := c.GetUint("user_id")
-	role := c.GetString("user_role")
+	role := normalizedUserRole(c)
 
 	stats, err := h.ticketService.GetTicketStatistics(userID, role)
 	if err != nil {
@@ -237,6 +329,7 @@ func (h *TicketWorkflowHandler) GetTicketStats(c *gin.Context) {
 
 func (h *TicketWorkflowHandler) GetMyTickets(c *gin.Context) {
 	userID := c.GetUint("user_id")
+	role := normalizedUserRole(c)
 
 	limit := 10
 	if l := c.Query("limit"); l != "" {
@@ -249,7 +342,30 @@ func (h *TicketWorkflowHandler) GetMyTickets(c *gin.Context) {
 	status := c.Query("status")
 	priority := c.Query("priority")
 
-	tickets, total, err := h.ticketService.GetUserTickets(userID, status, priority, limit)
+	var (
+		tickets []*models.Ticket
+		total   int64
+		err     error
+	)
+	if isCustomerRole(role) {
+		tickets, total, err = h.ticketService.GetTickets(c.Request.Context(), services.TicketFilters{
+			Page:      1,
+			Limit:     limit,
+			Status:    status,
+			Priority:  priority,
+			CreatorID: &userID,
+			SortBy:    "created_at",
+			SortOrder: "desc",
+		})
+	} else if role == "agent" || isPrivilegedRole(role) {
+		tickets, total, err = h.ticketService.GetUserTickets(userID, status, priority, limit)
+	} else {
+		c.JSON(http.StatusForbidden, gin.H{
+			"success": false,
+			"message": "当前身份不能查询工单",
+		})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -261,12 +377,20 @@ func (h *TicketWorkflowHandler) GetMyTickets(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    tickets,
+		"data":    ticketListResponseForRole(tickets, role),
 		"total":   total,
 	})
 }
 
 func (h *TicketWorkflowHandler) GetUnassignedTickets(c *gin.Context) {
+	role := normalizedUserRole(c)
+	if role != "agent" && !isPrivilegedRole(role) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"success": false,
+			"message": "当前身份不能查看未分配队列",
+		})
+		return
+	}
 	limit := 20
 	if l := c.Query("limit"); l != "" {
 		if parsed, err := strconv.Atoi(l); err == nil {
@@ -290,14 +414,14 @@ func (h *TicketWorkflowHandler) GetUnassignedTickets(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    tickets,
+		"data":    ticketListResponseForRole(tickets, role),
 		"total":   total,
 	})
 }
 
 func (h *TicketWorkflowHandler) GetOverdueTickets(c *gin.Context) {
 	userID := c.GetUint("user_id")
-	role := c.GetString("user_role")
+	role := normalizedUserRole(c)
 
 	tickets, total, err := h.ticketService.GetOverdueTickets(userID, role)
 	if err != nil {
@@ -311,14 +435,14 @@ func (h *TicketWorkflowHandler) GetOverdueTickets(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    tickets,
+		"data":    ticketListResponseForRole(tickets, role),
 		"total":   total,
 	})
 }
 
 func (h *TicketWorkflowHandler) GetSLABreachedTickets(c *gin.Context) {
 	userID := c.GetUint("user_id")
-	role := c.GetString("user_role")
+	role := normalizedUserRole(c)
 
 	tickets, total, err := h.ticketService.GetSLABreachedTickets(userID, role)
 	if err != nil {
@@ -332,12 +456,16 @@ func (h *TicketWorkflowHandler) GetSLABreachedTickets(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    tickets,
+		"data":    ticketListResponseForRole(tickets, role),
 		"total":   total,
 	})
 }
 
 func (h *TicketWorkflowHandler) BulkAssignTickets(c *gin.Context) {
+	if !isPrivilegedRole(normalizedUserRole(c)) {
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "仅管理员或主管可以批量分配"})
+		return
+	}
 	var req BulkAssignRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -367,6 +495,10 @@ func (h *TicketWorkflowHandler) BulkAssignTickets(c *gin.Context) {
 }
 
 func (h *TicketWorkflowHandler) BulkUpdateStatus(c *gin.Context) {
+	if !isPrivilegedRole(normalizedUserRole(c)) {
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "仅管理员或主管可以批量更新状态"})
+		return
+	}
 	var req BulkStatusRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -404,6 +536,12 @@ func (h *TicketWorkflowHandler) GetTicketHistory(c *gin.Context) {
 		})
 		return
 	}
+	if _, err := authorizeTicket(c.Request.Context(), c, h.ticketService, uint(ticketID), ticketAccessRead); err != nil {
+		if !writeTicketAuthorizationError(c, err) {
+			c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "工单不存在"})
+		}
+		return
+	}
 
 	history, total, err := h.ticketService.GetTicketHistory(uint(ticketID))
 	if err != nil {
@@ -414,10 +552,13 @@ func (h *TicketWorkflowHandler) GetTicketHistory(c *gin.Context) {
 		})
 		return
 	}
+	customer := isCustomerRole(normalizedUserRole(c))
+	responses := ticketHistoryResponses(history, customer)
+	total = int64(len(responses))
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    history,
+		"data":    responses,
 		"total":   total,
 	})
 }

@@ -347,22 +347,28 @@ func logRequestEnd(logger Logger, info *RequestInfo, config *LoggerConfig) {
 	}
 }
 
-// 以下函数需要根据具体的HTTP框架实现
-
 // getPath 获取请求路径
 func getPath(c HTTPContext) string {
-	// 需要根据具体框架实现
+	if ginCtx, ok := c.(*GinHTTPContext); ok && ginCtx.Context.Request != nil {
+		return ginCtx.Context.Request.URL.Path
+	}
 	return "/"
 }
 
 // getQuery 获取查询参数
 func getQuery(c HTTPContext) string {
-	// 需要根据具体框架实现
+	if ginCtx, ok := c.(*GinHTTPContext); ok && ginCtx.Context.Request != nil {
+		return ginCtx.Context.Request.URL.RawQuery
+	}
 	return ""
 }
 
 // getClientIP 获取客户端IP
 func getClientIP(c HTTPContext) string {
+	if ginCtx, ok := c.(*GinHTTPContext); ok {
+		return ginCtx.Context.ClientIP()
+	}
+
 	// 尝试从各种头部获取真实IP
 	ip := c.GetHeader("X-Forwarded-For")
 	if ip != "" {
@@ -412,18 +418,29 @@ func getRequestID(c HTTPContext) string {
 
 // getStatusCode 获取响应状态码
 func getStatusCode(c HTTPContext) int {
-	// 需要根据具体框架实现
+	if ginCtx, ok := c.(*GinHTTPContext); ok {
+		return ginCtx.Context.Writer.Status()
+	}
 	return 200
 }
 
 // getResponseSize 获取响应大小
 func getResponseSize(c HTTPContext) int {
-	// 需要根据具体框架实现
+	if ginCtx, ok := c.(*GinHTTPContext); ok {
+		size := ginCtx.Context.Writer.Size()
+		if size > 0 {
+			return size
+		}
+	}
 	return 0
 }
 
 // getError 获取错误信息
 func getError(c HTTPContext) error {
+	if ginCtx, ok := c.(*GinHTTPContext); ok && len(ginCtx.Context.Errors) > 0 {
+		return ginCtx.Context.Errors.Last()
+	}
+
 	// 尝试从上下文获取错误
 	if err, exists := c.Get("error"); exists {
 		if e, ok := err.(error); ok {

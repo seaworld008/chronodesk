@@ -2,6 +2,9 @@ package services
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 
 	"gongdan-system/internal/models"
@@ -134,5 +137,134 @@ func TestDeleteTicketCleansRelatedData(t *testing.T) {
 	}
 	if ticketCount != 0 {
 		t.Fatalf("expected ticket to be deleted, got %d", ticketCount)
+	}
+}
+
+func TestDeleteTicketCommitsAttachmentCleanupWithDefaultOutboxTargets(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.Ticket{},
+		&models.Notification{},
+		&models.TicketHistory{},
+		&models.TicketComment{},
+		&models.TicketAttachment{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
+	); err != nil {
+		t.Fatalf("migrate delete cleanup schema: %v", err)
+	}
+	user := models.User{
+		Username: "attachment-delete", Email: "attachment-delete@example.com",
+		PasswordHash: "hash", Role: models.RoleAdmin, Status: models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	ticket := models.Ticket{
+		TicketNumber: "T-DELETE-OBJECT-001",
+		Title:        "Delete attachment object",
+		Description:  "cleanup must happen after commit",
+		Priority:     models.TicketPriorityNormal,
+		Status:       models.TicketStatusOpen,
+		Type:         models.TicketTypeRequest,
+		Source:       models.TicketSourceWeb,
+		CreatedByID:  user.ID,
+		Version:      1,
+	}
+	if err := db.Create(&ticket).Error; err != nil {
+		t.Fatal(err)
+	}
+	storage, err := NewLocalAttachmentStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := storage.Put(
+		context.Background(),
+		"tickets/delete-cleanup/evidence.txt",
+		strings.NewReader("evidence"),
+		1024,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachment := models.TicketAttachment{
+		TicketID: ticket.ID, UploadedBy: user.ID,
+		FileName: "evidence.txt", OriginalName: "evidence.txt",
+		FileSize: stored.Size, StoragePath: stored.Key, Hash: stored.SHA256,
+	}
+	if err := db.Create(&attachment).Error; err != nil {
+		t.Fatal(err)
+	}
+	native := NewAgentNativeService(db, AgentNativeOptions{
+		AttachmentStorage: storage,
+		DefaultOutboxTargets: []OutboxTarget{
+			{Type: "event_stream", ID: "default", MaxAttempts: 8},
+			{Type: "webhook", ID: "configured", MaxAttempts: 8},
+			{Type: "automation", ID: "rules", MaxAttempts: 8},
+		},
+	})
+	service := NewTicketServiceWithAgentNative(db, nil, 0, native)
+	if err := service.DeleteTicket(
+		context.Background(),
+		ticket.ID,
+		user.ID,
+		"admin",
+	); err != nil {
+		t.Fatalf("delete ticket: %v", err)
+	}
+
+	// Object deletion is deliberately outside the business transaction.
+	reader, err := storage.Open(context.Background(), stored.Key)
+	if err != nil {
+		t.Fatalf("attachment was deleted inside the DB transaction: %v", err)
+	}
+	_ = reader.Close()
+
+	var event models.DomainEvent
+	if err := db.First(
+		&event,
+		"type = ? AND subject = ?",
+		"io.chronodesk.ticket.deleted.v1",
+		fmt.Sprintf("ticket/%d", ticket.ID),
+	).Error; err != nil {
+		t.Fatalf("load ticket.deleted event: %v", err)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(event.Data, &data); err != nil {
+		t.Fatal(err)
+	}
+	if data["attachment_cleanup_count"] != float64(1) {
+		t.Fatalf("cleanup count missing from event: %#v", data)
+	}
+	envelope := CloudEventFromModel(&event)
+	if strings.Contains(string(envelope.Data), stored.Key) {
+		t.Fatal("public CloudEvent leaked an internal attachment storage path")
+	}
+	if !strings.Contains(string(envelope.InternalData), stored.Key) {
+		t.Fatal("durable internal cleanup manifest did not retain the storage path")
+	}
+	wireEnvelope, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(wireEnvelope), stored.Key) {
+		t.Fatal("serialized CloudEvent leaked its internal cleanup manifest")
+	}
+
+	var deliveries []models.OutboxDelivery
+	if err := db.Where("event_id = ?", event.ID).Find(&deliveries).Error; err != nil {
+		t.Fatal(err)
+	}
+	destinations := make(map[string]int, len(deliveries))
+	for _, delivery := range deliveries {
+		destinations[delivery.DestinationType]++
+	}
+	if len(deliveries) != 4 ||
+		destinations["event_stream"] != 1 ||
+		destinations["webhook"] != 1 ||
+		destinations["automation"] != 1 ||
+		destinations[AttachmentCleanupOutboxDestination] != 1 {
+		t.Fatalf("ticket deletion lost or duplicated Outbox targets: %#v", deliveries)
 	}
 }

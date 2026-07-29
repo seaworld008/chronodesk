@@ -1,0 +1,98 @@
+package middleware
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"gongdan-system/internal/models"
+	"gongdan-system/internal/services"
+
+	"github.com/gin-gonic/gin"
+)
+
+type recordingAdminAuditService struct {
+	records []*services.AdminAuditRecord
+}
+
+func (s *recordingAdminAuditService) Record(_ context.Context, record *services.AdminAuditRecord) error {
+	s.records = append(s.records, record)
+	return nil
+}
+
+func (*recordingAdminAuditService) List(
+	context.Context,
+	*services.AdminAuditFilter,
+) ([]*models.AdminAuditLog, int64, error) {
+	return nil, 0, nil
+}
+
+func TestImportantAdminOperationCoversLegacyAndV1ControlPlanes(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		want   bool
+	}{
+		{name: "legacy write", method: http.MethodPost, path: "/api/admin/users", want: true},
+		{name: "legacy nested write", method: http.MethodDelete, path: "/api/admin/webhooks/42", want: true},
+		{name: "v1 principal write", method: http.MethodPost, path: "/api/v1/admin/service-principals", want: true},
+		{name: "v1 credential write", method: http.MethodPost, path: "/api/v1/admin/service-principals/p1/credentials/rotate", want: true},
+		{name: "v1 read", method: http.MethodGet, path: "/api/v1/admin/agent-control/overview", want: false},
+		{name: "head is read", method: http.MethodHead, path: "/api/admin/users", want: false},
+		{name: "options is read", method: http.MethodOptions, path: "/api/v1/admin/service-principals", want: false},
+		{name: "legacy prefix boundary", method: http.MethodPost, path: "/api/administrator/users", want: false},
+		{name: "v1 prefix boundary", method: http.MethodPost, path: "/api/v1/administer/service-principals", want: false},
+		{name: "non admin write", method: http.MethodPost, path: "/api/v1/tickets", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isImportantAdminOperation(tt.method, tt.path); got != tt.want {
+				t.Fatalf("isImportantAdminOperation(%q, %q) = %v, want %v", tt.method, tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLogAdminOperationRecordsV1AgentManagementWrite(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	audit := &recordingAdminAuditService{}
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", uint(7))
+		c.Set("user_role", "admin")
+		c.Next()
+	})
+	router.Use(LogAdminOperation(audit))
+	router.POST("/api/v1/admin/service-principals", func(c *gin.Context) {
+		c.Status(http.StatusCreated)
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/admin/service-principals?client_secret=must-not-leak&view=compact",
+		nil,
+	)
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusCreated)
+	}
+	if len(audit.records) != 1 {
+		t.Fatalf("audit records = %d, want 1", len(audit.records))
+	}
+	record := audit.records[0]
+	if record.Path != "/api/v1/admin/service-principals" ||
+		record.Method != http.MethodPost ||
+		record.StatusCode != http.StatusCreated ||
+		record.UserID == nil ||
+		*record.UserID != 7 {
+		t.Fatalf("unexpected audit record: %+v", record)
+	}
+	if record.Query != "client_secret=%5BREDACTED%5D&view=compact" {
+		t.Fatalf("audit query was not safely redacted: %q", record.Query)
+	}
+}

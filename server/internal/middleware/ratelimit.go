@@ -37,6 +37,15 @@ type bucket struct {
 
 // NewTokenBucket 创建令牌桶限流器
 func NewTokenBucket(capacity, refillRate int, window time.Duration) *TokenBucket {
+	if capacity <= 0 {
+		panic("token bucket capacity must be positive")
+	}
+	if refillRate <= 0 {
+		panic("token bucket refill rate must be positive")
+	}
+	if window <= 0 {
+		panic("token bucket cleanup window must be positive")
+	}
 	return &TokenBucket{
 		buckets:     make(map[string]*bucket),
 		capacity:    capacity,
@@ -53,6 +62,9 @@ func (tb *TokenBucket) Allow(key string) bool {
 
 // AllowN 检查是否允许请求（消耗n个令牌）
 func (tb *TokenBucket) AllowN(key string, n int) bool {
+	if n <= 0 {
+		return false
+	}
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
@@ -74,8 +86,8 @@ func (tb *TokenBucket) AllowN(key string, n int) bool {
 
 // Remaining 获取剩余令牌数
 func (tb *TokenBucket) Remaining(key string) int {
-	tb.mu.RLock()
-	defer tb.mu.RUnlock()
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
 
 	b := tb.getBucket(key)
 	tb.refillBucket(b)
@@ -84,10 +96,11 @@ func (tb *TokenBucket) Remaining(key string) int {
 
 // Reset 获取下次重置时间
 func (tb *TokenBucket) Reset(key string) time.Time {
-	tb.mu.RLock()
-	defer tb.mu.RUnlock()
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
 
 	b := tb.getBucket(key)
+	tb.refillBucket(b)
 	// 计算下次完全补满的时间
 	neededTokens := tb.capacity - b.tokens
 	if neededTokens <= 0 {
@@ -163,6 +176,12 @@ type window struct {
 
 // NewSlidingWindow 创建滑动窗口限流器
 func NewSlidingWindow(limit int, windowSize time.Duration) *SlidingWindow {
+	if limit <= 0 {
+		panic("sliding window limit must be positive")
+	}
+	if windowSize <= 0 {
+		panic("sliding window duration must be positive")
+	}
 	return &SlidingWindow{
 		windows:     make(map[string]*window),
 		limit:       limit,
@@ -178,6 +197,9 @@ func (sw *SlidingWindow) Allow(key string) bool {
 
 // AllowN 检查是否允许n个请求
 func (sw *SlidingWindow) AllowN(key string, n int) bool {
+	if n <= 0 {
+		return false
+	}
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 
@@ -208,8 +230,8 @@ func (sw *SlidingWindow) AllowN(key string, n int) bool {
 
 // Remaining 获取剩余请求数
 func (sw *SlidingWindow) Remaining(key string) int {
-	sw.mu.RLock()
-	defer sw.mu.RUnlock()
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
 
 	w := sw.getWindow(key)
 	sw.cleanExpiredRequests(w, time.Now())
@@ -218,10 +240,11 @@ func (sw *SlidingWindow) Remaining(key string) int {
 
 // Reset 获取窗口重置时间
 func (sw *SlidingWindow) Reset(key string) time.Time {
-	sw.mu.RLock()
-	defer sw.mu.RUnlock()
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
 
 	w := sw.getWindow(key)
+	sw.cleanExpiredRequests(w, time.Now())
 	if len(w.requests) == 0 {
 		return time.Now()
 	}
@@ -293,23 +316,15 @@ type RateLimitConfig struct {
 
 // DefaultKeyFunc 默认键生成函数（基于IP）
 func DefaultKeyFunc(c HTTPContext) string {
-	// 这里需要根据具体框架实现获取客户端IP
-	// 暂时返回固定值，实际使用时需要实现
-	return "default_key"
+	return getClientIP(c)
 }
 
 // IPKeyFunc 基于IP的键生成函数
 func IPKeyFunc(c HTTPContext) string {
-	// 获取真实IP地址
-	ip := c.GetHeader("X-Forwarded-For")
-	if ip == "" {
-		ip = c.GetHeader("X-Real-IP")
-	}
-	if ip == "" {
-		// 这里需要从连接中获取远程地址
-		ip = "unknown"
-	}
-	return ip
+	// Gin's ClientIP honours the application's explicit trusted-proxy list.
+	// Reading X-Forwarded-For directly would allow untrusted clients to choose
+	// their own rate-limit bucket.
+	return getClientIP(c)
 }
 
 // UserKeyFunc 基于用户ID的键生成函数
@@ -327,9 +342,23 @@ func UserKeyFunc(c HTTPContext) string {
 
 // RouteKeyFunc 基于路由的键生成函数
 func RouteKeyFunc(c HTTPContext) string {
-	// 这里需要根据具体框架实现获取路由信息
-	// 暂时返回IP，实际使用时需要实现
-	return IPKeyFunc(c)
+	return IPKeyFunc(c) + "|" + getRoutePattern(c)
+}
+
+// UserRouteKeyFunc isolates authenticated users behind the same enterprise
+// proxy/NAT and prevents unrelated endpoints from exhausting one shared
+// bucket. Before authentication it safely falls back to the trusted client IP.
+func UserRouteKeyFunc(c HTTPContext) string {
+	return UserKeyFunc(c) + "|" + getRoutePattern(c)
+}
+
+func getRoutePattern(c HTTPContext) string {
+	if ginContext, ok := c.(*GinHTTPContext); ok {
+		if route := ginContext.Context.FullPath(); route != "" {
+			return route
+		}
+	}
+	return getPath(c)
 }
 
 // RateLimit 限流中间件
@@ -349,8 +378,9 @@ func RateLimit(config *RateLimitConfig) func(HTTPContext) {
 	if config.ErrorHandler == nil {
 		config.ErrorHandler = func(c HTTPContext) {
 			c.JSON(http.StatusTooManyRequests, map[string]interface{}{
-				"error": "Too many requests",
-				"code":  "RATE_LIMIT_EXCEEDED",
+				"error":   "rate_limit_exceeded",
+				"code":    "RATE_LIMIT_EXCEEDED",
+				"message": "请求过于频繁，请稍后重试",
 			})
 		}
 	}
@@ -367,6 +397,11 @@ func RateLimit(config *RateLimitConfig) func(HTTPContext) {
 			// 设置限流信息头
 			if config.Headers {
 				setRateLimitHeaders(c, config.Limiter, key)
+				retryAfter := time.Until(config.Limiter.Reset(key))
+				if retryAfter < time.Second {
+					retryAfter = time.Second
+				}
+				setHeader(c, "Retry-After", strconv.FormatInt(ceilSeconds(retryAfter), 10))
 			}
 
 			config.ErrorHandler(c)
@@ -387,11 +422,26 @@ func RateLimit(config *RateLimitConfig) func(HTTPContext) {
 func setRateLimitHeaders(c HTTPContext, limiter RateLimiter, key string) {
 	remaining := limiter.Remaining(key)
 	reset := limiter.Reset(key)
+	resetAfter := time.Until(reset)
+	if resetAfter < 0 {
+		resetAfter = 0
+	}
+	resetSeconds := ceilSeconds(resetAfter)
 
-	// 设置标准的限流响应头
+	// RFC 9333 fields plus the legacy X-RateLimit fields used by existing
+	// clients during the non-protocol API transition.
+	setHeader(c, "RateLimit-Remaining", strconv.Itoa(remaining))
+	setHeader(c, "RateLimit-Reset", strconv.FormatInt(resetSeconds, 10))
 	setHeader(c, "X-RateLimit-Remaining", strconv.Itoa(remaining))
 	setHeader(c, "X-RateLimit-Reset", strconv.FormatInt(reset.Unix(), 10))
-	setHeader(c, "X-RateLimit-Reset-After", strconv.FormatInt(int64(time.Until(reset).Seconds()), 10))
+	setHeader(c, "X-RateLimit-Reset-After", strconv.FormatInt(resetSeconds, 10))
+}
+
+func ceilSeconds(duration time.Duration) int64 {
+	if duration <= 0 {
+		return 0
+	}
+	return int64((duration + time.Second - 1) / time.Second)
 }
 
 // TokenBucketRateLimit 令牌桶限流中间件

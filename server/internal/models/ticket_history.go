@@ -35,10 +35,14 @@ type TicketHistory struct {
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
 	// 关联信息
-	TicketID uint    `json:"ticket_id" gorm:"not null;index"`
-	Ticket   *Ticket `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
-	UserID   *uint   `json:"user_id" gorm:"index"` // 可为空，系统操作时为空
-	User     *User   `json:"user,omitempty" gorm:"foreignKey:UserID"`
+	TicketID           uint              `json:"ticket_id" gorm:"not null;index"`
+	Ticket             *Ticket           `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
+	UserID             *uint             `json:"user_id" gorm:"index"` // 可为空，系统操作时为空
+	User               *User             `json:"user,omitempty" gorm:"foreignKey:UserID"`
+	ActorType          ActorType         `json:"actor_type" gorm:"size:32;not null;default:'human';index"`
+	ActorID            string            `json:"actor_id" gorm:"size:128;index"`
+	ServicePrincipalID *string           `json:"service_principal_id,omitempty" gorm:"size:36;index"`
+	ServicePrincipal   *ServicePrincipal `json:"service_principal,omitempty" gorm:"foreignKey:ServicePrincipalID"`
 
 	// 操作信息
 	Action      HistoryAction `json:"action" gorm:"size:50;not null;index" validate:"required"`
@@ -79,12 +83,23 @@ func (TicketHistory) TableName() string {
 
 // IsUserAction 检查是否为用户操作
 func (th *TicketHistory) IsUserAction() bool {
-	return th.UserID != nil && !th.IsSystem
+	return th.Actor().Type != ActorTypeSystem && !th.IsSystem
 }
 
 // IsSystemAction 检查是否为系统操作
 func (th *TicketHistory) IsSystemAction() bool {
-	return th.IsSystem || th.UserID == nil
+	return th.IsSystem || th.Actor().Type == ActorTypeSystem
+}
+
+// Actor returns the authoritative actor with a backwards-compatible fallback.
+func (th *TicketHistory) Actor() ActorRef {
+	if th.ActorType != "" && th.ActorID != "" {
+		return ActorRef{Type: th.ActorType, ID: th.ActorID}
+	}
+	if th.UserID != nil {
+		return HumanActor(*th.UserID)
+	}
+	return SystemActor("legacy")
 }
 
 // IsStatusChange 检查是否为状态变更
@@ -134,58 +149,61 @@ type TicketHistoryCreateRequest struct {
 
 // TicketHistoryResponse 历史记录响应
 type TicketHistoryResponse struct {
-	ID           uint                   `json:"id"`
-	CreatedAt    time.Time              `json:"created_at"`
-	TicketID     uint                   `json:"ticket_id"`
-	User         *UserResponse          `json:"user,omitempty"`
-	Action       HistoryAction          `json:"action"`
-	Description  string                 `json:"description"`
-	Details      map[string]interface{} `json:"details"`
-	FieldName    string                 `json:"field_name"`
-	OldValue     string                 `json:"old_value"`
-	NewValue     string                 `json:"new_value"`
-	CommentID    *uint                  `json:"comment_id"`
-	AttachmentID *uint                  `json:"attachment_id"`
-	Duration     *int                   `json:"duration"`
-	ScheduledAt  *time.Time             `json:"scheduled_at"`
-	CompletedAt  *time.Time             `json:"completed_at"`
-	IsVisible    bool                   `json:"is_visible"`
-	IsSystem     bool                   `json:"is_system"`
-	IsAutomated  bool                   `json:"is_automated"`
-	IsImportant  bool                   `json:"is_important"`
-	Metadata     map[string]interface{} `json:"metadata"`
+	ID               uint                     `json:"id"`
+	CreatedAt        time.Time                `json:"created_at"`
+	TicketID         uint                     `json:"ticket_id"`
+	User             *UserSummary             `json:"user,omitempty"`
+	Actor            ActorRef                 `json:"actor"`
+	ServicePrincipal *ServicePrincipalSummary `json:"service_principal,omitempty"`
+	Action           HistoryAction            `json:"action"`
+	Description      string                   `json:"description"`
+	Details          map[string]interface{}   `json:"details"`
+	FieldName        string                   `json:"field_name"`
+	OldValue         string                   `json:"old_value"`
+	NewValue         string                   `json:"new_value"`
+	CommentID        *uint                    `json:"comment_id"`
+	AttachmentID     *uint                    `json:"attachment_id"`
+	Duration         *int                     `json:"duration"`
+	ScheduledAt      *time.Time               `json:"scheduled_at"`
+	CompletedAt      *time.Time               `json:"completed_at"`
+	IsVisible        bool                     `json:"is_visible"`
+	IsSystem         bool                     `json:"is_system"`
+	IsAutomated      bool                     `json:"is_automated"`
+	IsImportant      bool                     `json:"is_important"`
+	Metadata         map[string]interface{}   `json:"metadata"`
 }
 
 // ToResponse 转换为响应格式
 func (th *TicketHistory) ToResponse() *TicketHistoryResponse {
 	response := &TicketHistoryResponse{
-		ID:           th.ID,
-		CreatedAt:    th.CreatedAt,
-		TicketID:     th.TicketID,
-		Action:       th.Action,
-		Description:  th.Description,
-		FieldName:    th.FieldName,
-		OldValue:     th.OldValue,
-		NewValue:     th.NewValue,
-		CommentID:    th.CommentID,
-		AttachmentID: th.AttachmentID,
-		Duration:     th.Duration,
-		ScheduledAt:  th.ScheduledAt,
-		CompletedAt:  th.CompletedAt,
-		IsVisible:    th.IsVisible,
-		IsSystem:     th.IsSystem,
-		IsAutomated:  th.IsAutomated,
-		IsImportant:  th.IsImportant,
+		ID:               th.ID,
+		CreatedAt:        th.CreatedAt,
+		TicketID:         th.TicketID,
+		Actor:            th.Actor(),
+		ServicePrincipal: th.ServicePrincipal.ToSummary(),
+		Action:           th.Action,
+		Description:      th.Description,
+		FieldName:        th.FieldName,
+		OldValue:         th.OldValue,
+		NewValue:         th.NewValue,
+		CommentID:        th.CommentID,
+		AttachmentID:     th.AttachmentID,
+		Duration:         th.Duration,
+		ScheduledAt:      th.ScheduledAt,
+		CompletedAt:      th.CompletedAt,
+		IsVisible:        th.IsVisible,
+		IsSystem:         th.IsSystem,
+		IsAutomated:      th.IsAutomated,
+		IsImportant:      th.IsImportant,
 	}
 
 	// 处理关联用户
 	if th.User != nil {
-		response.User = th.User.ToResponse()
+		response.User = th.User.ToSummary()
 	}
 
-	// TODO: 解析JSON字段
-	// response.Details = parseDetailsFromJSON(th.Details)
-	// response.Metadata = parseMetadataFromJSON(th.Metadata)
+	response.Details = decodeJSONMap(th.Details)
+	response.Metadata = decodeJSONMap(th.Metadata)
 
 	return response
 }

@@ -7,7 +7,6 @@ import {
   Paper,
   Stack,
   Switch,
-  Table,
   TableBody,
   TableCell,
   TableContainer,
@@ -23,6 +22,19 @@ import { Save as SaveIcon, Refresh as RefreshIcon } from '@mui/icons-material'
 import { useNotify } from 'react-admin'
 import { apiFetch } from '@/lib/apiClient'
 import BackButton from '../common/BackButton'
+import {
+  ResizableMuiTable,
+  TruncatedText,
+  type ResizableColumn,
+} from '@/components/tables/EnterpriseTable'
+
+const systemConfigColumns: ResizableColumn[] = [
+  { key: 'config', defaultWidth: 260, minWidth: 180, maxWidth: 460 },
+  { key: 'description', defaultWidth: 340, minWidth: 200, maxWidth: 560 },
+  { key: 'value', defaultWidth: 360, minWidth: 220, maxWidth: 640 },
+  { key: 'type', defaultWidth: 112, minWidth: 88, maxWidth: 180 },
+  { key: 'actions', defaultWidth: 120, minWidth: 104, maxWidth: 180, sticky: 'right' },
+]
 
 interface SystemConfig {
   id: number
@@ -53,6 +65,13 @@ const categories = [
   { id: 'ticket', label: '工单设置' },
   { id: 'notify', label: '通知设置' },
 ]
+
+const valueTypeLabels: Record<SystemConfig['value_type'], string> = {
+  string: '文本',
+  int: '整数',
+  bool: '布尔值',
+  json: 'JSON 数据',
+}
 
 const parseInitialValue = (config: SystemConfig): EditableConfig => {
   const editable: EditableConfig = { ...config }
@@ -251,8 +270,16 @@ const SystemSettings: React.FC = () => {
 
   return (
     <Box sx={{ p: 3 }}>
-      <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 2 }}>
-        <Stack direction="row" spacing={2} alignItems="center">
+      <Stack
+        direction="row"
+        sx={{
+          justifyContent: "space-between",
+          alignItems: "center",
+          mb: 2
+        }}>
+        <Stack direction="row" spacing={2} sx={{
+          alignItems: "center"
+        }}>
           <BackButton fallbackPath="/system-settings" />
           <Typography variant="h4">系统设置概览</Typography>
         </Stack>
@@ -268,7 +295,6 @@ const SystemSettings: React.FC = () => {
           </Button>
         </Stack>
       </Stack>
-
       <Paper sx={{ mb: 2 }}>
         <Tabs value={activeTab} onChange={(_, value) => setActiveTab(value)} textColor="primary" indicatorColor="primary" variant="scrollable">
           {categories.map((category) => (
@@ -276,20 +302,17 @@ const SystemSettings: React.FC = () => {
           ))}
         </Tabs>
       </Paper>
-
       {loading && (
         <Box sx={{ display: 'flex', justifyContent: 'center', mt: 4 }}>
           <CircularProgress />
         </Box>
       )}
-
       {!loading && currentConfigs.length === 0 && (
         <Alert severity="info">当前分类暂无配置</Alert>
       )}
-
       {!loading && currentConfigs.length > 0 && (
         <TableContainer component={Paper}>
-          <Table size="small">
+          <ResizableMuiTable tableId="settings.system-config" columns={systemConfigColumns} size="small">
             <TableHead>
               <TableRow>
                 <TableCell>配置项</TableCell>
@@ -303,17 +326,25 @@ const SystemSettings: React.FC = () => {
               {currentConfigs.map((config, index) => (
                 <TableRow key={config.key} hover selected={config.dirty}>
                   <TableCell>
-                    <Typography fontWeight={600}>{config.key}</Typography>
-                    <Typography variant="caption" color="text.secondary">分组：{config.group || '默认'}</Typography>
+                    <TruncatedText title={config.key} fontWeight={600}>{config.key}</TruncatedText>
+                    <TruncatedText title={`分组：${config.group || '默认'}`} color="text.secondary">
+                      分组：{config.group || '默认'}
+                    </TruncatedText>
                   </TableCell>
-                  <TableCell sx={{ maxWidth: 280 }}>
-                    <Typography variant="body2">{config.description || '—'}</Typography>
+                  <TableCell>
+                    <TruncatedText title={config.description || '—'}>{config.description || '—'}</TruncatedText>
                     {config.default_value && (
-                      <Typography variant="caption" color="text.secondary">默认值：{config.default_value}</Typography>
+                      <TruncatedText title={`默认值：${config.default_value}`} color="text.secondary">
+                        默认值：{config.default_value}
+                      </TruncatedText>
                     )}
                   </TableCell>
                   <TableCell>{renderValueCell(config, index)}</TableCell>
-                  <TableCell>{config.value_type}</TableCell>
+                  <TableCell>
+                    <Tooltip title={`类型代码：${config.value_type}`}>
+                      <span>{valueTypeLabels[config.value_type]}</span>
+                    </Tooltip>
+                  </TableCell>
                   <TableCell align="right">
                     <Tooltip title="保存">
                       <span>
@@ -331,11 +362,11 @@ const SystemSettings: React.FC = () => {
                 </TableRow>
               ))}
             </TableBody>
-          </Table>
+          </ResizableMuiTable>
         </TableContainer>
       )}
     </Box>
-  )
+  );
 }
 
 export default SystemSettings

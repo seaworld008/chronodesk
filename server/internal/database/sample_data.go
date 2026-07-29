@@ -6,8 +6,8 @@ import (
 	"math/rand"
 	"time"
 
-	"gorm.io/gorm"
 	"gongdan-system/internal/models"
+	"gorm.io/gorm"
 )
 
 // SampleDataGenerator 示例数据生成器
@@ -62,20 +62,20 @@ func (g *SampleDataGenerator) createSampleUsers() error {
 	if err := g.db.Model(&models.User{}).Where("email LIKE ?", "%@sample.com").Count(&count).Error; err != nil {
 		return err
 	}
-	
+
 	if count > 0 {
 		log.Printf("示例用户已存在，跳过创建 (%d个)", count)
 		return g.loadExistingUsers()
 	}
 
 	sampleUsers := []struct {
-		Username    string
-		Email       string
-		FirstName   string
-		LastName    string
-		Role        models.UserRole
-		Department  string
-		JobTitle    string
+		Username   string
+		Email      string
+		FirstName  string
+		LastName   string
+		Role       models.UserRole
+		Department string
+		JobTitle   string
 	}{
 		{"tech_support", "support@sample.com", "张", "技术", models.RoleAgent, "技术部", "技术支持专员"},
 		{"customer_service", "service@sample.com", "李", "客服", models.RoleAgent, "客服部", "客户服务专员"},
@@ -165,7 +165,7 @@ func (g *SampleDataGenerator) createSampleCategories() error {
 		},
 		{
 			Name:        "功能请求示例",
-			Slug:        "feature-requests-sample", 
+			Slug:        "feature-requests-sample",
 			Description: "新功能和改进请求示例分类",
 			Type:        models.CategoryTypeRequest,
 			Status:      models.CategoryStatusActive,
@@ -388,11 +388,11 @@ func (g *SampleDataGenerator) createSampleComments() error {
 	for _, ticket := range tickets {
 		// 为每个工单随机创建1-3个评论
 		commentCount := rand.Intn(3) + 1
-		
+
 		for i := 0; i < commentCount; i++ {
 			// 随机选择评论模板
 			template := commentTemplates[rand.Intn(len(commentTemplates))]
-			
+
 			// 随机选择评论者（优先分配者，否则随机选择）
 			var commenterID uint
 			if ticket.AssignedToID != nil {

@@ -18,13 +18,13 @@ import {
   SelectChangeEvent,
   Stack,
   Switch,
-  Table,
   TableBody,
   TableCell,
   TableContainer,
   TableHead,
   TableRow,
   TextField,
+  Tooltip,
   Typography,
 } from '@mui/material'
 import {
@@ -37,6 +37,21 @@ import {
 import { useNotify } from 'react-admin'
 import { apiFetch } from '@/lib/apiClient'
 import BackButton from '../common/BackButton'
+import {
+  ResizableMuiTable,
+  TruncatedText,
+  type ResizableColumn,
+} from '@/components/tables/EnterpriseTable'
+
+const webhookColumns: ResizableColumn[] = [
+  { key: 'name', defaultWidth: 280, minWidth: 180, maxWidth: 480 },
+  { key: 'provider', defaultWidth: 132, minWidth: 104, maxWidth: 220 },
+  { key: 'status', defaultWidth: 112, minWidth: 88, maxWidth: 180 },
+  { key: 'events', defaultWidth: 360, minWidth: 200, maxWidth: 640 },
+  { key: 'delivery', defaultWidth: 180, minWidth: 140, maxWidth: 280 },
+  { key: 'last-success', defaultWidth: 188, minWidth: 150, maxWidth: 280 },
+  { key: 'actions', defaultWidth: 152, minWidth: 136, maxWidth: 220, sticky: 'right' },
+]
 
 interface WebhookConfig {
   id: number
@@ -90,12 +105,12 @@ interface WebhookForm {
 }
 
 const providerOptions = [
-  { value: 'wechat', label: '企业微信', hint: '需要配置机器人 Webhook URL，可选加签 Secret。' },
-  { value: 'dingtalk', label: '钉钉', hint: '机器人通常需要关键字或加签 Secret。' },
-  { value: 'lark', label: '飞书', hint: '支持自定义卡片消息，如需签名请填写 Secret。' },
-  { value: 'slack', label: 'Slack', hint: '使用 Slack Incoming Webhook URL。' },
-  { value: 'teams', label: 'Microsoft Teams', hint: '使用 Teams Incoming Webhook。' },
-  { value: 'custom', label: '自定义', hint: '自定义 HTTP 服务，支持自定义 Header。' },
+  { value: 'wechat', label: '企业微信', hint: '需要配置机器人 Webhook URL，可选签名密钥。' },
+  { value: 'dingtalk', label: '钉钉', hint: '机器人通常需要关键字或签名密钥。' },
+  { value: 'lark', label: '飞书', hint: '支持自定义卡片消息，如需签名请填写签名密钥。' },
+  { value: 'slack', label: 'Slack', hint: '使用 Slack 入站 Webhook URL。' },
+  { value: 'teams', label: 'Microsoft Teams', hint: '使用 Teams 入站 Webhook。' },
+  { value: 'custom', label: '自定义', hint: '自定义 HTTP 服务，支持自定义请求头。' },
 ]
 
 const eventOptions = [
@@ -106,9 +121,25 @@ const eventOptions = [
   'ticket.closed',
   'ticket.comment',
   'ticket.escalated',
+  'automation.notification',
   'user.registered',
   'system.alert',
 ]
+
+const eventLabels: Record<string, string> = {
+  'ticket.created': '工单创建',
+  'ticket.assigned': '工单分配',
+  'ticket.updated': '工单更新',
+  'ticket.resolved': '工单解决',
+  'ticket.closed': '工单关闭',
+  'ticket.comment': '工单评论',
+  'ticket.escalated': '工单升级',
+  'automation.notification': '自动化通知',
+  'user.registered': '用户注册',
+  'system.alert': '系统警报',
+}
+
+const eventLabel = (event: string) => eventLabels[event] ?? '自定义事件'
 
 const statusOptions = [
   { value: 'active', label: '启用' },
@@ -132,7 +163,7 @@ const defaultForm: WebhookForm = {
   is_async: true,
   rate_limit: 60,
   rate_limit_window: 60,
-  status: 'active',
+  status: 'inactive',
 }
 
 const statusColor = {
@@ -324,6 +355,7 @@ const WebhookSettings: React.FC = () => {
   }
 
   const handleTest = async (id: number) => {
+    if (!window.confirm('测试将立即向该 Webhook 地址发送一条真实请求，确定继续吗？')) return
     setTestId(id)
     try {
       await apiFetch(`/webhooks/${id}/test`, { method: 'POST' })
@@ -342,19 +374,31 @@ const WebhookSettings: React.FC = () => {
 
   return (
     <Box sx={{ p: 3 }}>
-      <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 3 }}>
-        <Stack direction="row" spacing={1.5} alignItems="center">
+      <Stack
+        direction="row"
+        sx={{
+          justifyContent: "space-between",
+          alignItems: "center",
+          mb: 3
+        }}>
+        <Stack direction="row" spacing={1.5} sx={{
+          alignItems: "center"
+        }}>
           <BackButton fallbackPath="/system-settings" />
           <Box>
             <Typography variant="h4" sx={{ fontWeight: 600 }}>
               Webhook 集成
             </Typography>
-            <Typography color="text.secondary" variant="body2">
+            <Typography variant="body2" sx={{
+              color: "text.secondary"
+            }}>
               管理企业微信、钉钉、飞书等即时通讯渠道的自动通知。
             </Typography>
           </Box>
         </Stack>
-        <Stack direction="row" spacing={1} alignItems="center">
+        <Stack direction="row" spacing={1} sx={{
+          alignItems: "center"
+        }}>
           <Button variant="outlined" startIcon={<RefreshIcon />} onClick={fetchWebhooks}>
             刷新
           </Button>
@@ -363,9 +407,8 @@ const WebhookSettings: React.FC = () => {
           </Button>
         </Stack>
       </Stack>
-
       <TableContainer component={Paper}>
-        <Table size="small">
+        <ResizableMuiTable tableId="settings.webhooks" columns={webhookColumns} size="small">
           <TableHead>
             <TableRow>
               <TableCell>名称</TableCell>
@@ -388,29 +431,44 @@ const WebhookSettings: React.FC = () => {
             {items.map((item) => (
               <TableRow key={item.id} hover>
                 <TableCell>
-                  <Typography fontWeight={600}>{item.name}</Typography>
-                  <Typography variant="body2" color="text.secondary">
+                  <TruncatedText title={item.name} fontWeight={600}>{item.name}</TruncatedText>
+                  <TruncatedText title={item.description || '—'} color="text.secondary">
                     {item.description || '—'}
-                  </Typography>
+                  </TruncatedText>
                 </TableCell>
-                <TableCell>{providerOptions.find((opt) => opt.value === item.provider)?.label || item.provider}</TableCell>
                 <TableCell>
-                  <Chip
-                    size="small"
-                    label={statusOptions.find((opt) => opt.value === item.status)?.label || item.status}
-                    color={statusColor[item.status as keyof typeof statusColor] ?? 'default'}
-                  />
+                  <Tooltip title={`提供商代码：${item.provider}`}>
+                    <span>{providerOptions.find((opt) => opt.value === item.provider)?.label || '其他提供商'}</span>
+                  </Tooltip>
+                </TableCell>
+                <TableCell>
+                  <Tooltip title={`状态代码：${item.status}`}>
+                    <Chip
+                      size="small"
+                      label={statusOptions.find((opt) => opt.value === item.status)?.label || '未知状态'}
+                      color={statusColor[item.status as keyof typeof statusColor] ?? 'default'}
+                    />
+                  </Tooltip>
                 </TableCell>
                 <TableCell>
                   {(item.enabled_events_list ?? []).slice(0, 3).map((evt) => (
-                    <Chip key={`${item.id}-${evt}`} label={evt} size="small" sx={{ mr: 0.5, mb: 0.5 }} />
+                    <Tooltip key={`${item.id}-${evt}`} title={`事件代码：${evt}`}>
+                      <Chip label={eventLabel(evt)} size="small" sx={{ mr: 0.5, mb: 0.5 }} />
+                    </Tooltip>
                   ))}
                   {(item.enabled_events_list ?? []).length > 3 ? '…' : null}
                 </TableCell>
                 <TableCell>
                   <Typography variant="body2">总计 {item.total_sent}</Typography>
-                  <Typography variant="caption" color="success.main">成功 {item.total_success}</Typography>
-                  <Typography variant="caption" color="error.main" sx={{ ml: 1 }}>失败 {item.total_failed}</Typography>
+                  <Typography variant="caption" sx={{
+                    color: "success.main"
+                  }}>成功 {item.total_success}</Typography>
+                  <Typography
+                    variant="caption"
+                    sx={{
+                      color: "error.main",
+                      ml: 1
+                    }}>失败 {item.total_failed}</Typography>
                 </TableCell>
                 <TableCell>
                   <Typography variant="body2">
@@ -418,14 +476,32 @@ const WebhookSettings: React.FC = () => {
                   </Typography>
                 </TableCell>
                 <TableCell align="right">
-                  <Stack direction="row" spacing={1} justifyContent="flex-end">
-                    <IconButton size="small" onClick={() => handleTest(item.id)} disabled={testId === item.id}>
+                  <Stack direction="row" spacing={1} sx={{
+                    justifyContent: "flex-end"
+                  }}>
+                    <IconButton
+                      size="small"
+                      aria-label={`测试 Webhook：${item.name}`}
+                      title="发送测试请求"
+                      onClick={() => handleTest(item.id)}
+                      disabled={testId === item.id}
+                    >
                       {testId === item.id ? <CircularProgress size={16} /> : <TestIcon fontSize="small" />}
                     </IconButton>
-                    <IconButton size="small" onClick={() => openEdit(item)}>
+                    <IconButton
+                      size="small"
+                      aria-label={`编辑 Webhook：${item.name}`}
+                      title="编辑 Webhook"
+                      onClick={() => openEdit(item)}
+                    >
                       <EditIcon fontSize="small" />
                     </IconButton>
-                    <IconButton size="small" onClick={() => handleDelete(item.id)}>
+                    <IconButton
+                      size="small"
+                      aria-label={`删除 Webhook：${item.name}`}
+                      title="删除 Webhook"
+                      onClick={() => handleDelete(item.id)}
+                    >
                       <DeleteIcon fontSize="small" />
                     </IconButton>
                   </Stack>
@@ -433,14 +509,17 @@ const WebhookSettings: React.FC = () => {
               </TableRow>
             ))}
           </TableBody>
-        </Table>
+        </ResizableMuiTable>
       </TableContainer>
-
       <Dialog open={formOpen} onClose={closeForm} maxWidth="md" fullWidth>
         <DialogTitle>{currentId ? '编辑 Webhook' : '新增 Webhook'}</DialogTitle>
         <DialogContent dividers>
           <Grid container spacing={2}>
-            <Grid item xs={12} md={6}>
+            <Grid
+              size={{
+                xs: 12,
+                md: 6
+              }}>
               <TextField
                 fullWidth
                 label="名称"
@@ -450,7 +529,11 @@ const WebhookSettings: React.FC = () => {
                 helperText={errors.name || '用于区分不同 Webhook 规则'}
               />
             </Grid>
-            <Grid item xs={12} md={6}>
+            <Grid
+              size={{
+                xs: 12,
+                md: 6
+              }}>
               <FormControl fullWidth error={Boolean(errors.status)}>
                 <InputLabel>状态</InputLabel>
                 <Select
@@ -466,7 +549,7 @@ const WebhookSettings: React.FC = () => {
                 </Select>
               </FormControl>
             </Grid>
-            <Grid item xs={12}>
+            <Grid size={12}>
               <TextField
                 fullWidth
                 label="描述"
@@ -475,7 +558,11 @@ const WebhookSettings: React.FC = () => {
                 onChange={(e) => handleFormChange('description', e.target.value)}
               />
             </Grid>
-            <Grid item xs={12} md={6}>
+            <Grid
+              size={{
+                xs: 12,
+                md: 6
+              }}>
               <FormControl fullWidth>
                 <InputLabel>提供商</InputLabel>
                 <Select
@@ -490,40 +577,54 @@ const WebhookSettings: React.FC = () => {
                   ))}
                 </Select>
                 {providerHint && (
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>
                     {providerHint}
                   </Typography>
                 )}
               </FormControl>
             </Grid>
-            <Grid item xs={12} md={6}>
+            <Grid
+              size={{
+                xs: 12,
+                md: 6
+              }}>
               <TextField
                 fullWidth
-                label="Webhook URL"
+                label="Webhook 地址"
                 value={form.webhook_url}
                 onChange={(e) => handleFormChange('webhook_url', e.target.value)}
                 error={Boolean(errors.webhook_url)}
                 helperText={errors.webhook_url || '复制自各渠道机器人配置界面'}
               />
             </Grid>
-            <Grid item xs={12} md={6}>
+            <Grid
+              size={{
+                xs: 12,
+                md: 6
+              }}>
               <TextField
                 fullWidth
-                label="Secret (可选)"
+                label="签名密钥（可选）"
                 value={form.secret}
                 onChange={(e) => handleFormChange('secret', e.target.value)}
                 helperText="部分渠道使用加签时需要填写"
               />
             </Grid>
-            <Grid item xs={12} md={6}>
+            <Grid
+              size={{
+                xs: 12,
+                md: 6
+              }}>
               <TextField
                 fullWidth
-                label="Access Token (可选)"
+                label="访问令牌（可选）"
                 value={form.access_token}
                 onChange={(e) => handleFormChange('access_token', e.target.value)}
               />
             </Grid>
-            <Grid item xs={12}>
+            <Grid size={12}>
               <FormControl fullWidth error={Boolean(errors.enabled_events)}>
                 <InputLabel>订阅事件</InputLabel>
                 <Select
@@ -531,11 +632,11 @@ const WebhookSettings: React.FC = () => {
                   multiple
                   value={form.enabled_events}
                   onChange={handleEventsChange}
-                  renderValue={(selected) => selected.join(', ')}
+                  renderValue={(selected) => selected.map(eventLabel).join('、')}
                 >
                   {eventOptions.map((evt) => (
                     <MenuItem key={evt} value={evt}>
-                      {evt}
+                      {eventLabel(evt)}（{evt}）
                     </MenuItem>
                   ))}
                 </Select>
@@ -544,16 +645,24 @@ const WebhookSettings: React.FC = () => {
                 </Typography>
               </FormControl>
             </Grid>
-            <Grid item xs={12} md={4}>
+            <Grid
+              size={{
+                xs: 12,
+                md: 4
+              }}>
               <TextField
                 fullWidth
                 label="消息格式"
                 value={form.message_format}
                 onChange={(e) => handleFormChange('message_format', e.target.value)}
-                helperText="markdown / text / card"
+                helperText="支持 Markdown、纯文本或卡片格式"
               />
             </Grid>
-            <Grid item xs={12} md={2}>
+            <Grid
+              size={{
+                xs: 12,
+                md: 2
+              }}>
               <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
                 <Switch
                   checked={form.is_async}
@@ -564,7 +673,11 @@ const WebhookSettings: React.FC = () => {
                 </Typography>
               </Box>
             </Grid>
-            <Grid item xs={12} md={2}>
+            <Grid
+              size={{
+                xs: 12,
+                md: 2
+              }}>
               <TextField
                 fullWidth
                 type="number"
@@ -575,7 +688,11 @@ const WebhookSettings: React.FC = () => {
                 helperText={errors.retry_count || undefined}
               />
             </Grid>
-            <Grid item xs={12} md={2}>
+            <Grid
+              size={{
+                xs: 12,
+                md: 2
+              }}>
               <TextField
                 fullWidth
                 type="number"
@@ -586,7 +703,11 @@ const WebhookSettings: React.FC = () => {
                 helperText={errors.retry_interval || undefined}
               />
             </Grid>
-            <Grid item xs={12} md={2}>
+            <Grid
+              size={{
+                xs: 12,
+                md: 2
+              }}>
               <TextField
                 fullWidth
                 type="number"
@@ -597,7 +718,11 @@ const WebhookSettings: React.FC = () => {
                 helperText={errors.timeout_seconds || undefined}
               />
             </Grid>
-            <Grid item xs={12} md={2}>
+            <Grid
+              size={{
+                xs: 12,
+                md: 2
+              }}>
               <TextField
                 fullWidth
                 type="number"
@@ -608,7 +733,11 @@ const WebhookSettings: React.FC = () => {
                 helperText={errors.rate_limit || undefined}
               />
             </Grid>
-            <Grid item xs={12} md={2}>
+            <Grid
+              size={{
+                xs: 12,
+                md: 2
+              }}>
               <TextField
                 fullWidth
                 type="number"
@@ -629,7 +758,7 @@ const WebhookSettings: React.FC = () => {
         </DialogActions>
       </Dialog>
     </Box>
-  )
+  );
 }
 
 export default WebhookSettings

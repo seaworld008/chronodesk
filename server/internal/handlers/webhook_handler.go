@@ -8,64 +8,77 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 	"gongdan-system/internal/models"
+	"gongdan-system/internal/security"
 	"gongdan-system/internal/services"
+	"gorm.io/gorm"
 )
 
 // WebhookHandler Webhook处理器
 type WebhookHandler struct {
 	db                  *gorm.DB
 	notificationService *services.NotificationService
+	secretStore         security.Protector
 }
 
 // NewWebhookHandler 创建Webhook处理器
 func NewWebhookHandler(db *gorm.DB) *WebhookHandler {
+	protector, _ := security.LoadDeploymentKeyringFromEnvironment()
+	return NewWebhookHandlerWithProtector(db, protector)
+}
+
+// NewWebhookHandlerWithProtector injects the application data-encryption
+// keyring used by both configuration writes and webhook deliveries.
+func NewWebhookHandlerWithProtector(
+	db *gorm.DB,
+	protector security.Protector,
+) *WebhookHandler {
 	return &WebhookHandler{
 		db:                  db,
-		notificationService: services.NewNotificationService(db),
+		notificationService: services.NewNotificationServiceWithProtector(db, protector),
+		secretStore:         protector,
 	}
 }
 
 // CreateWebhookRequest 创建webhook请求结构
 type CreateWebhookRequest struct {
-	Name            string                        `json:"name" binding:"required,max=100"`
-	Description     string                        `json:"description" binding:"max=500"`
-	Provider        models.WebhookProvider        `json:"provider" binding:"required"`
-	WebhookURL      string                        `json:"webhook_url" binding:"required,url"`
-	Secret          string                        `json:"secret"`
-	AccessToken     string                        `json:"access_token"`
-	EnabledEvents   []models.WebhookEventType     `json:"enabled_events"`
-	MessageTemplate string                        `json:"message_template"`
-	MessageFormat   string                        `json:"message_format"`
-	FilterRules     json.RawMessage               `json:"filter_rules"`
-	RetryCount      int                           `json:"retry_count"`
-	RetryInterval   int                           `json:"retry_interval"`
-	TimeoutSeconds  int                           `json:"timeout_seconds"`
-	IsAsync         bool                          `json:"is_async"`
-	RateLimit       int                           `json:"rate_limit"`
-	RateLimitWindow int                           `json:"rate_limit_window"`
+	Name            string                    `json:"name" binding:"required,max=100"`
+	Description     string                    `json:"description" binding:"max=500"`
+	Provider        models.WebhookProvider    `json:"provider" binding:"required"`
+	WebhookURL      string                    `json:"webhook_url" binding:"required,url"`
+	Secret          string                    `json:"secret"`
+	AccessToken     string                    `json:"access_token"`
+	EnabledEvents   []models.WebhookEventType `json:"enabled_events"`
+	MessageTemplate string                    `json:"message_template"`
+	MessageFormat   string                    `json:"message_format"`
+	FilterRules     json.RawMessage           `json:"filter_rules"`
+	RetryCount      int                       `json:"retry_count"`
+	RetryInterval   int                       `json:"retry_interval"`
+	TimeoutSeconds  int                       `json:"timeout_seconds"`
+	IsAsync         bool                      `json:"is_async"`
+	RateLimit       int                       `json:"rate_limit"`
+	RateLimitWindow int                       `json:"rate_limit_window"`
 }
 
 // UpdateWebhookRequest 更新webhook请求结构
 type UpdateWebhookRequest struct {
-	Name            *string                        `json:"name" binding:"omitempty,max=100"`
-	Description     *string                        `json:"description" binding:"omitempty,max=500"`
-	Provider        *models.WebhookProvider        `json:"provider"`
-	WebhookURL      *string                        `json:"webhook_url" binding:"omitempty,url"`
-	Secret          *string                        `json:"secret"`
-	AccessToken     *string                        `json:"access_token"`
-	EnabledEvents   *[]models.WebhookEventType     `json:"enabled_events"`
-	MessageTemplate *string                        `json:"message_template"`
-	MessageFormat   *string                        `json:"message_format"`
-	FilterRules     *json.RawMessage               `json:"filter_rules"`
-	RetryCount      *int                           `json:"retry_count"`
-	RetryInterval   *int                           `json:"retry_interval"`
-	TimeoutSeconds  *int                           `json:"timeout_seconds"`
-	IsAsync         *bool                          `json:"is_async"`
-	RateLimit       *int                           `json:"rate_limit"`
-	RateLimitWindow *int                           `json:"rate_limit_window"`
-	Status          *models.WebhookStatus          `json:"status"`
+	Name            *string                    `json:"name" binding:"omitempty,max=100"`
+	Description     *string                    `json:"description" binding:"omitempty,max=500"`
+	Provider        *models.WebhookProvider    `json:"provider"`
+	WebhookURL      *string                    `json:"webhook_url" binding:"omitempty,url"`
+	Secret          *string                    `json:"secret"`
+	AccessToken     *string                    `json:"access_token"`
+	EnabledEvents   *[]models.WebhookEventType `json:"enabled_events"`
+	MessageTemplate *string                    `json:"message_template"`
+	MessageFormat   *string                    `json:"message_format"`
+	FilterRules     *json.RawMessage           `json:"filter_rules"`
+	RetryCount      *int                       `json:"retry_count"`
+	RetryInterval   *int                       `json:"retry_interval"`
+	TimeoutSeconds  *int                       `json:"timeout_seconds"`
+	IsAsync         *bool                      `json:"is_async"`
+	RateLimit       *int                       `json:"rate_limit"`
+	RateLimitWindow *int                       `json:"rate_limit_window"`
+	Status          *models.WebhookStatus      `json:"status"`
 }
 
 // ListWebhooksResponse 列表响应结构
@@ -116,8 +129,6 @@ func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
 		Description:      req.Description,
 		Provider:         req.Provider,
 		WebhookURL:       req.WebhookURL,
-		Secret:           req.Secret,
-		AccessToken:      req.AccessToken,
 		EnabledEventsObj: req.EnabledEvents,
 		MessageTemplate:  req.MessageTemplate,
 		MessageFormat:    req.MessageFormat,
@@ -151,11 +162,40 @@ func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
 	if webhook.MessageFormat == "" {
 		webhook.MessageFormat = "markdown"
 	}
+	if err := security.ValidateHTTPSCallbackURLString(webhook.WebhookURL); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code": 1,
+			"msg":  "Webhook 地址必须是公网 HTTPS 地址，且不能包含用户凭据",
+			"data": nil,
+		})
+		return
+	}
 
-	if err := h.db.Create(&webhook).Error; err != nil {
+	if err := h.db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&webhook).Error; err != nil {
+			return err
+		}
+		secret, err := h.protectWebhookSecret(webhook.ID, "secret", req.Secret)
+		if err != nil {
+			return err
+		}
+		accessToken, err := h.protectWebhookSecret(webhook.ID, "access_token", req.AccessToken)
+		if err != nil {
+			return err
+		}
+		if secret == "" && accessToken == "" {
+			return nil
+		}
+		webhook.Secret = secret
+		webhook.AccessToken = accessToken
+		return tx.Model(&webhook).Updates(map[string]any{
+			"secret":       secret,
+			"access_token": accessToken,
+		}).Error
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code": 1,
-			"msg":  "创建webhook失败: " + err.Error(),
+			"msg":  "创建webhook失败，请检查加密配置或稍后重试",
 			"data": nil,
 		})
 		return
@@ -202,7 +242,7 @@ func (h *WebhookHandler) ListWebhooks(c *gin.Context) {
 
 	// 构建查询
 	query := h.db.Model(&models.WebhookConfig{})
-	
+
 	if provider != "" {
 		query = query.Where("provider = ?", provider)
 	}
@@ -372,13 +412,39 @@ func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 		updates["provider"] = *req.Provider
 	}
 	if req.WebhookURL != nil {
+		if err := security.ValidateHTTPSCallbackURLString(*req.WebhookURL); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code": 1,
+				"msg":  "Webhook 地址必须是公网 HTTPS 地址，且不能包含用户凭据",
+				"data": nil,
+			})
+			return
+		}
 		updates["webhook_url"] = *req.WebhookURL
 	}
 	if req.Secret != nil {
-		updates["secret"] = *req.Secret
+		secret, err := h.protectWebhookSecret(webhook.ID, "secret", *req.Secret)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"code": 1,
+				"msg":  "更新webhook失败，请检查加密配置",
+				"data": nil,
+			})
+			return
+		}
+		updates["secret"] = secret
 	}
 	if req.AccessToken != nil {
-		updates["access_token"] = *req.AccessToken
+		accessToken, err := h.protectWebhookSecret(webhook.ID, "access_token", *req.AccessToken)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"code": 1,
+				"msg":  "更新webhook失败，请检查加密配置",
+				"data": nil,
+			})
+			return
+		}
+		updates["access_token"] = accessToken
 	}
 	if req.EnabledEvents != nil {
 		webhook.EnabledEventsObj = *req.EnabledEvents
@@ -432,6 +498,22 @@ func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 		"msg":  "更新成功",
 		"data": webhook,
 	})
+}
+
+func (h *WebhookHandler) protectWebhookSecret(
+	configID uint,
+	field string,
+	plaintext string,
+) (string, error) {
+	return security.ProtectOptional(
+		h.secretStore,
+		plaintext,
+		security.FieldAAD(
+			"webhook_configs",
+			strconv.FormatUint(uint64(configID), 10),
+			field,
+		),
+	)
 }
 
 // DeleteWebhook 删除webhook配置
@@ -574,7 +656,7 @@ func (h *WebhookHandler) GetWebhookLogs(c *gin.Context) {
 
 	// 构建查询
 	query := h.db.Model(&models.WebhookLog{}).Where("config_id = ?", uint(id))
-	
+
 	if status != "" {
 		query = query.Where("status = ?", status)
 	}

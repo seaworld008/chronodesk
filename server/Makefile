@@ -1,6 +1,6 @@
 # 工单系统 Makefile
 
-.PHONY: help build run migrate migrate-all migrate-tables migrate-indexes migrate-seed clean test
+.PHONY: help build run run-migrate migrate migrate-seed migrate-drop migrate-verbose clean test test-race deps fmt vet dev-setup build-prod
 
 # 默认目标
 help:
@@ -10,14 +10,14 @@ help:
 	@echo "  build          构建服务器"
 	@echo "  run            运行服务器（不自动迁移）"
 	@echo "  run-migrate    运行服务器（启用自动迁移）"
-	@echo "  migrate-fast   快速数据库迁移（推荐）"
-	@echo "  build-migrate  构建快速迁移工具"
-	@echo "  migrate-all    执行完整数据库迁移（旧版，较慢）"
-	@echo "  migrate-tables 只迁移数据库表结构（旧版）"
-	@echo "  migrate-indexes 只创建数据库索引（旧版）"
-	@echo "  migrate-seed   只初始化种子数据（旧版）"
+	@echo "  migrate        执行唯一的标准数据库迁移"
+	@echo "  migrate-seed   迁移并显式初始化种子数据"
+	@echo "  migrate-drop   确认后删除自有表并重建（仅一次性开发环境）"
+	@echo "  migrate-verbose 输出详细迁移日志"
 	@echo "  clean          清理构建文件"
 	@echo "  test           运行测试"
+	@echo "  test-race      运行竞态检测"
+	@echo "  vet            执行 Go 静态检查"
 	@echo "  help           显示此帮助信息"
 
 # 构建服务器
@@ -47,7 +47,8 @@ migrate-seed:
 
 migrate-drop:
 	@echo "⚠️  删除所有表并重新迁移（危险操作）..."
-	@go run cmd/migrate/main.go -drop -seed
+	@printf "该操作会永久删除 ChronoDesk 数据。请输入 DROP 确认：" && read answer && [ "$$answer" = "DROP" ]
+	@ALLOW_DESTRUCTIVE_MIGRATION=true go run cmd/migrate/main.go -drop -seed
 
 migrate-verbose:
 	@echo "📝 执行详细数据库迁移..."
@@ -63,6 +64,10 @@ clean:
 test:
 	@echo "运行测试..."
 	go test ./...
+
+test-race:
+	@echo "运行 Go 竞态检测..."
+	go test -race ./...
 
 # 安装依赖
 deps:

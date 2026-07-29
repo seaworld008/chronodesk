@@ -176,7 +176,7 @@
         "files_created": [
           "server/internal/models/webhook_config.go",
           "server/internal/services/notification_service.go",
-          "server/internal/services/enhanced_ticket_service.go",
+          "server/internal/services/agent_native_service.go",
           "server/internal/handlers/webhook_handler.go"
         ],
         "files_modified": [
@@ -346,7 +346,8 @@
       ],
       "files_to_create": [
         "server/internal/services/cleanup_service.go",
-        "server/internal/scheduler/scheduler.go",
+        "server/internal/services/scheduler_service.go",
+        "server/internal/services/scheduler_lease.go",
         "server/internal/models/system_config.go",
         "server/internal/handlers/system_handler.go"
       ],
@@ -532,7 +533,7 @@
         "实现配置验证逻辑",
         "添加配置变更日志",
         "开发配置管理界面",
-        "实现配置缓存机制"
+        "确保配置更新后跨服务读取立即一致"
       ],
       "files_to_create": [
         "server/internal/handlers/config_handler.go", 
@@ -548,7 +549,7 @@
       "testing_requirements": [
         "测试配置增删改查功能",
         "验证配置验证逻辑",
-        "测试配置缓存功能",
+        "测试配置更新后的读取一致性",
         "验证变更日志记录"
       ]
     },
@@ -699,7 +700,7 @@
         "files_modified": [
           "web/src/components/layout/Layout.tsx",
           "web/src/components/layout/Header.tsx",
-          "web/tailwind.config.js",
+          "web/src/index.css",
           "web/index.html",
           "web/src/main.tsx"
         ],

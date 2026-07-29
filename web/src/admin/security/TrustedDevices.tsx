@@ -73,6 +73,9 @@ const TrustedDevices = () => {
     }, [fetchDevices, refreshFlag])
 
     const handleRevoke = async (deviceId: number) => {
+        if (!window.confirm('撤销后该设备需要重新验证身份，确定继续吗？')) {
+            return
+        }
         const token = localStorage.getItem('token')
         if (!token) {
             notify('未检测到登录令牌，请重新登录', { type: 'warning' })
@@ -99,23 +102,36 @@ const TrustedDevices = () => {
 
     if (loading) {
         return (
-            <Box display="flex" alignItems="center" justifyContent="center" minHeight="60vh">
+            <Box
+                sx={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    minHeight: "60vh"
+                }}>
                 <CircularProgress />
             </Box>
-        )
+        );
     }
 
     return (
-        <Box padding={3} display="flex" justifyContent="center">
+        <Box
+            sx={{
+                padding: 3,
+                display: "flex",
+                justifyContent: "center"
+            }}>
             <Card sx={{ maxWidth: 960, width: '100%' }}>
                 <CardHeader
                     avatar={<SecurityIcon color="primary" />}
                     title="可信设备管理"
-                    subheader="查看并管理已记住的登陆设备"
+                    subheader="查看并管理已记住的登录设备"
                 />
                 <CardContent>
                     {devices.length === 0 ? (
-                        <Typography color="text.secondary">暂无可信设备记录。</Typography>
+                        <Typography sx={{
+                            color: "text.secondary"
+                        }}>暂无可信设备记录。</Typography>
                     ) : (
                         <Stack spacing={2.5}>
                             {devices.map((device) => (
@@ -123,14 +139,18 @@ const TrustedDevices = () => {
                                     <CardContent>
                                         <Stack spacing={1.2}>
                                             <Typography variant="h6">{device.device_name || '未命名设备'}</Typography>
-                                            <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+                                            <Stack direction="row" spacing={1} useFlexGap sx={{
+                                                flexWrap: "wrap"
+                                            }}>
                                                 <Chip label={`最近使用：${formatDateTime(device.last_used_at)}`} />
                                                 <Chip label={`IP：${device.last_ip || '未知'}`} />
                                                 <Chip label={device.revoked ? '已撤销' : '生效中'} color={device.revoked ? 'default' : 'success'} />
                                                 <Chip label={`到期：${formatDateTime(device.expires_at)}`} />
                                             </Stack>
-                                            <Typography variant="body2" color="text.secondary">
-                                                User-Agent: {device.user_agent || '—'}
+                                            <Typography variant="body2" sx={{
+                                                color: "text.secondary"
+                                            }}>
+                                                浏览器标识（User-Agent）：{device.user_agent || '—'}
                                             </Typography>
                                             {!device.revoked && (
                                                 <Box>
@@ -152,7 +172,7 @@ const TrustedDevices = () => {
                 </CardContent>
             </Card>
         </Box>
-    )
+    );
 }
 
 export default TrustedDevices

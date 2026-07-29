@@ -1,0 +1,20 @@
+extends:
+  - spectral:oas
+
+rules:
+  # Spectral 6.16.2 validates against OpenAPI 3.0 and rejects 3.2-only fields
+  # such as jsonSchemaDialect, type unions, const, webhooks, and license
+  # identifiers. Redocly 2.41.1 provides the strict OpenAPI 3.2 structural and
+  # example validation gate, while Spectral continues to enforce its
+  # version-independent API design rules.
+  oas3-schema: off
+  oas3-valid-media-example: off
+
+  # This legacy Nimma selector crashes on OpenAPI 3.2 Schema unions before it
+  # can report a result. The Go contract test enforces duplicate-free enum,
+  # required, composition, and parameter arrays.
+  duplicated-entry-in-enum: off
+
+  # This is an internal private API and intentionally publishes no personal
+  # maintainer address.
+  info-contact: off

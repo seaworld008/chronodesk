@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 	"gongdan-system/internal/models"
 	"gongdan-system/internal/services"
+	"gorm.io/gorm"
 )
 
 // SystemHandler 系统配置处理器
@@ -41,7 +41,7 @@ func (h *SystemHandler) RegisterRoutes(router *gin.RouterGroup) {
 		// 清理配置专门接口
 		system.GET("/cleanup/config", h.GetCleanupConfig)
 		system.PUT("/cleanup/config", h.UpdateCleanupConfig)
-		
+
 		// 清理操作
 		system.POST("/cleanup/execute", h.ExecuteCleanup)
 		system.POST("/cleanup/execute-all", h.ExecuteAllCleanup)
@@ -57,7 +57,7 @@ func (h *SystemHandler) GetConfigs(c *gin.Context) {
 	isActive := c.Query("is_active")
 
 	query := h.db.Model(&models.SystemConfig{})
-	
+
 	if category != "" {
 		query = query.Where("category = ?", category)
 	}
@@ -72,7 +72,7 @@ func (h *SystemHandler) GetConfigs(c *gin.Context) {
 	if err := query.Order("category, \"group\", key").Find(&configs).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "failed_to_get_configs",
-			"message": "Failed to retrieve system configurations",
+			"message": "获取系统配置失败",
 		})
 		return
 	}
@@ -95,7 +95,7 @@ func (h *SystemHandler) CreateConfig(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":   "invalid_request",
-			"message": "Invalid request body",
+			"message": "请求体格式无效",
 			"details": err.Error(),
 		})
 		return
@@ -106,7 +106,7 @@ func (h *SystemHandler) CreateConfig(c *gin.Context) {
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error":   "unauthorized",
-			"message": "User not authenticated",
+			"message": "用户未登录",
 		})
 		return
 	}
@@ -116,7 +116,7 @@ func (h *SystemHandler) CreateConfig(c *gin.Context) {
 	if err := h.db.Where("key = ?", req.Key).First(&existingConfig).Error; err == nil {
 		c.JSON(http.StatusConflict, gin.H{
 			"error":   "config_exists",
-			"message": "Configuration with this key already exists",
+			"message": "该配置键已存在",
 		})
 		return
 	}
@@ -136,7 +136,7 @@ func (h *SystemHandler) CreateConfig(c *gin.Context) {
 	if err := config.SetValue(req.Value); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":   "invalid_value",
-			"message": "Invalid configuration value",
+			"message": "配置值无效",
 			"details": err.Error(),
 		})
 		return
@@ -145,7 +145,7 @@ func (h *SystemHandler) CreateConfig(c *gin.Context) {
 	if err := h.db.Create(&config).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "failed_to_create_config",
-			"message": "Failed to create configuration",
+			"message": "创建配置失败",
 		})
 		return
 	}
@@ -153,19 +153,19 @@ func (h *SystemHandler) CreateConfig(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{
 		"success": true,
 		"data":    config.ToResponse(),
-		"message": "Configuration created successfully",
+		"message": "配置创建成功",
 	})
 }
 
 // UpdateConfig 更新配置
 func (h *SystemHandler) UpdateConfig(c *gin.Context) {
 	key := c.Param("key")
-	
+
 	var req models.SystemConfigRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":   "invalid_request",
-			"message": "Invalid request body",
+			"message": "请求体格式无效",
 			"details": err.Error(),
 		})
 		return
@@ -175,7 +175,7 @@ func (h *SystemHandler) UpdateConfig(c *gin.Context) {
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error":   "unauthorized",
-			"message": "User not authenticated",
+			"message": "用户未登录",
 		})
 		return
 	}
@@ -185,12 +185,12 @@ func (h *SystemHandler) UpdateConfig(c *gin.Context) {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, gin.H{
 				"error":   "config_not_found",
-				"message": "Configuration not found",
+				"message": "未找到配置",
 			})
 		} else {
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"error":   "database_error",
-				"message": "Failed to retrieve configuration",
+				"message": "获取配置失败",
 			})
 		}
 		return
@@ -200,7 +200,7 @@ func (h *SystemHandler) UpdateConfig(c *gin.Context) {
 	if err := config.SetValue(req.Value); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":   "invalid_value",
-			"message": "Invalid configuration value",
+			"message": "配置值无效",
 			"details": err.Error(),
 		})
 		return
@@ -220,7 +220,7 @@ func (h *SystemHandler) UpdateConfig(c *gin.Context) {
 	if err := h.db.Save(&config).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "failed_to_update_config",
-			"message": "Failed to update configuration",
+			"message": "更新配置失败",
 		})
 		return
 	}
@@ -228,7 +228,7 @@ func (h *SystemHandler) UpdateConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data":    config.ToResponse(),
-		"message": "Configuration updated successfully",
+		"message": "配置更新成功",
 	})
 }
 
@@ -241,12 +241,12 @@ func (h *SystemHandler) DeleteConfig(c *gin.Context) {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, gin.H{
 				"error":   "config_not_found",
-				"message": "Configuration not found",
+				"message": "未找到配置",
 			})
 		} else {
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"error":   "database_error",
-				"message": "Failed to retrieve configuration",
+				"message": "获取配置失败",
 			})
 		}
 		return
@@ -256,7 +256,7 @@ func (h *SystemHandler) DeleteConfig(c *gin.Context) {
 	if config.IsRequired {
 		c.JSON(http.StatusForbidden, gin.H{
 			"error":   "cannot_delete_required_config",
-			"message": "Cannot delete required configuration",
+			"message": "必需配置不能删除",
 		})
 		return
 	}
@@ -264,14 +264,14 @@ func (h *SystemHandler) DeleteConfig(c *gin.Context) {
 	if err := h.db.Delete(&config).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "failed_to_delete_config",
-			"message": "Failed to delete configuration",
+			"message": "删除配置失败",
 		})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"message": "Configuration deleted successfully",
+		"message": "配置删除成功",
 	})
 }
 
@@ -284,12 +284,12 @@ func (h *SystemHandler) GetConfig(c *gin.Context) {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, gin.H{
 				"error":   "config_not_found",
-				"message": "Configuration not found",
+				"message": "未找到配置",
 			})
 		} else {
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"error":   "database_error",
-				"message": "Failed to retrieve configuration",
+				"message": "获取配置失败",
 			})
 		}
 		return
@@ -310,7 +310,7 @@ func (h *SystemHandler) GetCleanupConfig(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "failed_to_get_cleanup_config",
-			"message": "Failed to retrieve cleanup configuration",
+			"message": "获取清理配置失败",
 		})
 		return
 	}
@@ -327,7 +327,7 @@ func (h *SystemHandler) UpdateCleanupConfig(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":   "invalid_request",
-			"message": "Invalid request body",
+			"message": "请求体格式无效",
 			"details": err.Error(),
 		})
 		return
@@ -337,7 +337,7 @@ func (h *SystemHandler) UpdateCleanupConfig(c *gin.Context) {
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error":   "unauthorized",
-			"message": "User not authenticated",
+			"message": "用户未登录",
 		})
 		return
 	}
@@ -349,14 +349,14 @@ func (h *SystemHandler) UpdateCleanupConfig(c *gin.Context) {
 	if err := h.cleanupSvc.SetCleanupConfig(ctx, &req, uid); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":   "failed_to_update_cleanup_config",
-			"message": err.Error(),
+			"message": "更新清理配置失败，请检查配置内容",
 		})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"message": "Cleanup configuration updated successfully",
+		"message": "清理配置更新成功",
 		"data":    req,
 	})
 }
@@ -370,7 +370,7 @@ func (h *SystemHandler) ExecuteCleanup(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":   "invalid_request",
-			"message": "Invalid request body",
+			"message": "请求体格式无效",
 			"details": err.Error(),
 		})
 		return
@@ -380,7 +380,7 @@ func (h *SystemHandler) ExecuteCleanup(c *gin.Context) {
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error":   "unauthorized",
-			"message": "User not authenticated",
+			"message": "用户未登录",
 		})
 		return
 	}
@@ -399,7 +399,7 @@ func (h *SystemHandler) ExecuteCleanup(c *gin.Context) {
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"success": true,
-		"message": "Cleanup task started successfully",
+		"message": "清理任务已启动",
 		"data": gin.H{
 			"task_type":    req.TaskType,
 			"trigger_type": "manual",
@@ -414,7 +414,7 @@ func (h *SystemHandler) ExecuteAllCleanup(c *gin.Context) {
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error":   "unauthorized",
-			"message": "User not authenticated",
+			"message": "用户未登录",
 		})
 		return
 	}
@@ -433,7 +433,7 @@ func (h *SystemHandler) ExecuteAllCleanup(c *gin.Context) {
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"success": true,
-		"message": "All cleanup tasks started successfully",
+		"message": "所有清理任务已启动",
 		"data": gin.H{
 			"trigger_type": "manual",
 			"status":       "started",
@@ -445,7 +445,7 @@ func (h *SystemHandler) ExecuteAllCleanup(c *gin.Context) {
 func (h *SystemHandler) GetCleanupLogs(c *gin.Context) {
 	taskType := c.Query("task_type")
 	limitStr := c.Query("limit")
-	
+
 	limit := 20
 	if limitStr != "" {
 		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
@@ -460,7 +460,7 @@ func (h *SystemHandler) GetCleanupLogs(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "failed_to_get_cleanup_logs",
-			"message": "Failed to retrieve cleanup logs",
+			"message": "获取清理日志失败",
 		})
 		return
 	}
@@ -481,7 +481,7 @@ func (h *SystemHandler) GetCleanupStats(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "failed_to_get_cleanup_stats",
-			"message": "Failed to retrieve cleanup statistics",
+			"message": "获取清理统计信息失败",
 		})
 		return
 	}

@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
-	"gorm.io/gorm"
 	"gongdan-system/internal/models"
+	"gorm.io/gorm"
 )
 
 // AdminUserService 管理员用户管理服务
@@ -27,7 +27,7 @@ func NewAdminUserService(db *gorm.DB) *AdminUserService {
 type UserListRequest struct {
 	Page     int                `form:"page" binding:"omitempty,min=1"`
 	PageSize int                `form:"page_size" binding:"omitempty,min=1,max=100"`
-	Role     *models.UserRole   `form:"role" binding:"omitempty,oneof=admin agent customer supervisor"`
+	Role     *models.UserRole   `form:"role" binding:"omitempty,oneof=admin agent customer user supervisor superuser"`
 	Status   *models.UserStatus `form:"status" binding:"omitempty,oneof=active inactive suspended deleted"`
 	Search   string             `form:"search" binding:"omitempty,max=100"`
 	OrderBy  string             `form:"order_by" binding:"omitempty,oneof=id username email created_at updated_at last_login_at"`
@@ -126,7 +126,7 @@ func (s *AdminUserService) GetUserByID(ctx context.Context, userID uint) (*model
 	err := s.db.WithContext(ctx).
 		Preload("Manager").
 		First(&user, userID).Error
-	
+
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return nil, fmt.Errorf("user not found")
@@ -256,6 +256,9 @@ func (s *AdminUserService) UpdateUser(ctx context.Context, userID uint, req *mod
 	if req.Status != nil {
 		updates["status"] = *req.Status
 	}
+	if req.EmailVerified != nil {
+		updates["email_verified"] = *req.EmailVerified
+	}
 
 	if req.Department != nil {
 		updates["department"] = *req.Department
@@ -301,19 +304,41 @@ func (s *AdminUserService) ResetUserPassword(ctx context.Context, userID uint, n
 		return fmt.Errorf("failed to hash password: %w", err)
 	}
 
-	// 更新密码
+	now := time.Now()
+	// 密码更新与会话撤销必须处于同一事务中。否则管理员重置密码后，
+	// 旧刷新令牌仍可能签发新的访问令牌。
 	updates := map[string]interface{}{
-		"password_hash":    hashedPassword,
-		"password_reset_at": time.Now(),
-		"login_attempts":   0,      // 重置登录尝试次数
-		"locked_until":     nil,    // 解除锁定
+		"password_hash":     hashedPassword,
+		"password_reset_at": now,
+		"login_attempts":    0,   // 重置登录尝试次数
+		"locked_until":      nil, // 解除锁定
 	}
 
-	if err := s.db.WithContext(ctx).Model(user).Updates(updates).Error; err != nil {
-		return fmt.Errorf("failed to reset password: %w", err)
-	}
-
-	return nil
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(user).Updates(updates).Error; err != nil {
+			return fmt.Errorf("failed to reset password: %w", err)
+		}
+		if err := tx.Table("refresh_tokens").
+			Where("user_id = ? AND revoked = ?", userID, false).
+			Updates(map[string]interface{}{
+				"revoked":    true,
+				"revoked_at": now,
+			}).Error; err != nil {
+			return fmt.Errorf("failed to revoke user refresh tokens: %w", err)
+		}
+		if err := tx.Model(&models.LoginHistory{}).
+			Where("user_id = ? AND is_active = ?", userID, true).
+			Updates(map[string]interface{}{
+				"is_active":        false,
+				"logout_time":      now,
+				"last_activity_at": now,
+				"login_status":     models.LoginStatusExpired,
+				"failure_reason":   "password_reset",
+			}).Error; err != nil {
+			return fmt.Errorf("failed to close user login sessions: %w", err)
+		}
+		return nil
+	})
 }
 
 // DeleteUser 删除用户（软删除）
@@ -333,18 +358,45 @@ func (s *AdminUserService) DeleteUser(ctx context.Context, userID uint) error {
 		s.db.WithContext(ctx).Model(&models.User{}).
 			Where("role = ? AND id != ? AND status = ?", models.RoleAdmin, userID, models.UserStatusActive).
 			Count(&adminCount)
-		
+
 		if adminCount == 0 {
 			return fmt.Errorf("cannot delete the last admin user")
 		}
 	}
 
-	// 执行软删除
-	if err := s.db.WithContext(ctx).Delete(user).Error; err != nil {
-		return fmt.Errorf("failed to delete user: %w", err)
-	}
-
-	return nil
+	now := time.Now()
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 先使账号与所有长期会话失效，再软删除主体。认证/登录记录保留
+		// 作为审计证据，因此不能通过级联物理删除解决外键冲突。
+		if err := tx.Model(user).Update("status", models.UserStatusDeleted).Error; err != nil {
+			return fmt.Errorf("failed to disable user before deletion: %w", err)
+		}
+		if err := tx.Table("refresh_tokens").
+			Where("user_id = ? AND revoked = ?", userID, false).
+			Updates(map[string]interface{}{
+				"revoked":    true,
+				"revoked_at": now,
+			}).Error; err != nil {
+			return fmt.Errorf("failed to revoke user refresh tokens: %w", err)
+		}
+		if err := tx.Model(&models.LoginHistory{}).
+			Where("user_id = ? AND is_active = ?", userID, true).
+			Updates(map[string]interface{}{
+				"is_active":   false,
+				"logout_time": now,
+			}).Error; err != nil {
+			return fmt.Errorf("failed to close user login sessions: %w", err)
+		}
+		if err := tx.Model(&models.OTPTrustedDevice{}).
+			Where("user_id = ? AND revoked = ?", userID, false).
+			Update("revoked", true).Error; err != nil {
+			return fmt.Errorf("failed to revoke trusted devices: %w", err)
+		}
+		if err := tx.Delete(user).Error; err != nil {
+			return fmt.Errorf("failed to soft delete user: %w", err)
+		}
+		return nil
+	})
 }
 
 // ToggleUserStatus 切换用户状态（启用/禁用）
@@ -373,7 +425,7 @@ func (s *AdminUserService) ToggleUserStatus(ctx context.Context, userID uint) (*
 		s.db.WithContext(ctx).Model(&models.User{}).
 			Where("role = ? AND id != ? AND status = ?", models.RoleAdmin, userID, models.UserStatusActive).
 			Count(&activeAdminCount)
-		
+
 		if activeAdminCount == 0 {
 			return nil, fmt.Errorf("cannot suspend the last active admin user")
 		}
@@ -423,7 +475,7 @@ func (s *AdminUserService) BatchDeleteUsers(ctx context.Context, userIDs []uint)
 		s.db.WithContext(ctx).Model(&models.User{}).
 			Where("role = ? AND status = ?", models.RoleAdmin, models.UserStatusActive).
 			Count(&totalAdminCount)
-		
+
 		if int64(len(adminIDs)) >= totalAdminCount {
 			return fmt.Errorf("cannot delete all admin users")
 		}
@@ -489,10 +541,10 @@ func (s *AdminUserService) GetUserStats(ctx context.Context) (*UserStatsResponse
 
 // UserStatsResponse 用户统计响应
 type UserStatsResponse struct {
-	TotalUsers        int64            `json:"total_users"`
-	ActiveUsers       int64            `json:"active_users"`
-	UsersByRole       map[string]int64 `json:"users_by_role"`
-	NewUsersThisWeek  int64            `json:"new_users_this_week"`
+	TotalUsers       int64            `json:"total_users"`
+	ActiveUsers      int64            `json:"active_users"`
+	UsersByRole      map[string]int64 `json:"users_by_role"`
+	NewUsersThisWeek int64            `json:"new_users_this_week"`
 }
 
 // hashPassword 加密密码

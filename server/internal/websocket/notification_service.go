@@ -30,18 +30,18 @@ func (s *NotificationWebSocketService) PushNotification(ctx context.Context, not
 
 	// Convert notification to response format
 	notificationData := notification.ToResponse()
-	
+
 	// Send the notification via WebSocket
 	s.hub.BroadcastToUser(notification.RecipientID, "notification", map[string]interface{}{
-		"id":           notificationData.ID,
-		"type":         notificationData.Type,
-		"title":        notificationData.Title,
-		"content":      notificationData.Content,
-		"priority":     notificationData.Priority,
-		"created_at":   notificationData.CreatedAt,
-		"is_read":      notificationData.IsRead,
-		"action_url":   notificationData.ActionURL,
-		"sender":       notificationData.Sender,
+		"id":             notificationData.ID,
+		"type":           notificationData.Type,
+		"title":          notificationData.Title,
+		"content":        notificationData.Content,
+		"priority":       notificationData.Priority,
+		"created_at":     notificationData.CreatedAt,
+		"is_read":        notificationData.IsRead,
+		"action_url":     notificationData.ActionURL,
+		"sender":         notificationData.Sender,
 		"related_ticket": notificationData.RelatedTicket,
 	})
 
@@ -81,12 +81,12 @@ func (s *NotificationWebSocketService) PushUnreadCount(ctx context.Context, user
 func (s *NotificationWebSocketService) PushTicketUpdate(ctx context.Context, ticket *models.Ticket, updateType string) error {
 	// Create a list of users to notify
 	usersToNotify := make(map[uint]bool)
-	
+
 	// Notify the creator
 	if ticket.CreatedByID != 0 {
 		usersToNotify[ticket.CreatedByID] = true
 	}
-	
+
 	// Notify the assignee
 	if ticket.AssignedToID != nil && *ticket.AssignedToID != 0 {
 		usersToNotify[*ticket.AssignedToID] = true

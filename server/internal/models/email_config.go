@@ -17,7 +17,9 @@ type EmailConfig struct {
 	SMTPHost     string `json:"smtp_host" gorm:"size:255"`
 	SMTPPort     int    `json:"smtp_port" gorm:"default:587"`
 	SMTPUsername string `json:"smtp_username" gorm:"size:255"`
-	SMTPPassword string `json:"-" gorm:"size:255"` // 不在JSON中返回密码
+	// SMTPPassword contains a versioned AEAD envelope at rest and is decrypted
+	// only inside the email service.
+	SMTPPassword string `json:"-" gorm:"size:2048"` // 不在JSON中返回密码
 	SMTPUseTLS   bool   `json:"smtp_use_tls" gorm:"default:true"`
 	SMTPUseSSL   bool   `json:"smtp_use_ssl" gorm:"default:false"`
 

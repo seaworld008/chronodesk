@@ -68,7 +68,7 @@ class TestAuthenticationFlows:
             assert items, "注册后应记录至少一条登录历史"
             first_entry = items[0]
             assert first_entry.get("login_status") == "success"
-            session_id = first_entry.get("session_id")
+            assert first_entry.get("session_id"), "登录历史缺少会话 ID"
         finally:
             authed_client.close()
 
@@ -88,19 +88,62 @@ class TestAuthenticationFlows:
 
         authed_after = api_client.with_auth(new_access_token)
         try:
-            follow_resp = authed_after.get_json(
-                "/user/login-history",
-                params={"session_id": session_id} if session_id else None,
-            )
-            assert follow_resp.status_code == 200, follow_resp.text
+            follow_resp = authed_after.get_json("/user/login-history", params={"page_size": 5})
+            assert follow_resp.status_code == 401, follow_resp.text
             follow_body = follow_resp.json()
-            assert follow_body.get("code") == 0, follow_body
-
-            follow_items = follow_body.get("data", {}).get("items", [])
-            if follow_items:
-                assert follow_items[0].get("is_active") is False
+            assert follow_body.get("error") == "session_revoked", follow_body
         finally:
             authed_after.close()
+
+        # 刷新前签发的 access token 与新 token 共享同一个 sid，也必须一起失效。
+        original_after = api_client.with_auth(access_token)
+        try:
+            original_resp = original_after.get_json("/user/login-history", params={"page_size": 5})
+            assert original_resp.status_code == 401, original_resp.text
+            assert original_resp.json().get("error") == "session_revoked"
+        finally:
+            original_after.close()
+
+    def test_logout_all_revokes_every_access_and_refresh_token(
+        self,
+        api_client: APIClient,
+        registered_user: Dict[str, str],
+    ) -> None:
+        first_access = registered_user.get("access_token")
+        first_refresh = registered_user.get("refresh_token")
+        assert first_access and first_refresh
+
+        second_session = api_client.login(
+            registered_user["email"],
+            registered_user["password"],
+        )
+        second_access = second_session.get("access_token")
+        second_refresh = second_session.get("refresh_token")
+        assert second_access and second_refresh
+
+        first_client = api_client.with_auth(first_access)
+        try:
+            logout_all = first_client.post_json("/auth/logout-all", {})
+            assert logout_all.status_code == 200, logout_all.text
+            assert logout_all.json().get("success") is True
+        finally:
+            first_client.close()
+
+        for access_token in (first_access, second_access):
+            revoked_client = api_client.with_auth(access_token)
+            try:
+                response = revoked_client.get_json("/auth/me")
+                assert response.status_code == 401, response.text
+                assert response.json().get("error") == "session_revoked"
+            finally:
+                revoked_client.close()
+
+        for refresh_token in (first_refresh, second_refresh):
+            response = api_client.post_json(
+                "/auth/refresh",
+                {"refresh_token": refresh_token},
+            )
+            assert response.status_code == 401, response.text
 
     def test_otp_trusted_device_flow(
         self,
@@ -185,7 +228,7 @@ class TestAuthenticationFlows:
         )
         assert invalid_resp.status_code == 401, invalid_resp.text
         invalid_body = invalid_resp.json()
-        assert invalid_body.get("msg") in {"Invalid email or password", "Login failed"}
+        assert invalid_body.get("msg") in {"邮箱或密码错误", "登录失败"}
 
         refresh_resp = api_client.post_json(
             "/auth/refresh",

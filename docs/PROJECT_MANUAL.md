@@ -1,199 +1,264 @@
 # ChronoDesk 项目权威手册
 
-> 更新时间：2026-02-07  
+> 更新时间：2026-07-29
 > 适用分支：`main`（当前仓库工作区）
 
 ## 1. 项目定位
-ChronoDesk 是一个面向客服/运营团队的工单管理系统，覆盖“认证登录 -> 工单流转 -> 自动化执行 -> 通知触达 -> 运营分析 -> 系统配置”的闭环。当前实现由 Go 后端与 React-Admin 前端组成，支持本地开发、Docker 一体化运行，以及 Go/Python/Shell 多层测试手段。
 
-## 2. 当前能力总览
+ChronoDesk 是面向单组织私有化部署的企业工单自动化平台。它为客服和运营人员提供中文管理后台，也为外部 AI Agent 提供独立身份、稳定机器契约和原生协议入口。
 
-### 2.1 业务能力
-- 认证与账号安全：注册/登录/JWT 刷新、OTP、可信设备、登录历史。
-- 工单管理：CRUD、分配、转派、升级、状态流转、历史记录、批量更新。
-- 自动化：规则管理、执行日志、SLA 配置、模板、快速回复、批量动作。
-- 通知中心：站内通知、已读/未读、偏好设置，邮件与 Webhook 集成。
-- 系统治理：管理员用户管理、审计日志、系统配置、统计看板。
+人类后台与 Agent REST、MCP、A2A 直接复用同一套领域服务、策略引擎、事务事件和审计模型；系统不内置 LLM、RAG、提示词平台或自治规划器。
 
-### 2.2 技术栈
-- Backend：Go 1.21、Gin、GORM、PostgreSQL、Redis、JWT。
-- Frontend：React 18、TypeScript、React-Admin、MUI、Vite、Shadcn UI。
-- Tooling：Makefile、`dev.sh`、Docker Compose、Go test、Pytest、Playwright（web/e2e）。
+## 2. 当前能力
 
-## 3. 架构与代码组织
+### 2.1 人类工单后台
 
-### 3.1 仓库结构
+- 账号认证：注册、登录、单次使用的刷新令牌、会话撤销、邮箱验证、密码重置、TOTP、备用恢复码与可信设备。
+- 工单管理：创建、查询、编辑、分配、转派、升级、状态流转、历史、SLA、模板、快速回复与批量管理。
+- 协作内容：公开/内部评论；附件上传、对象存储抽象、下载授权、SHA-256 哈希、公开范围和病毒扫描状态。
+- 运营能力：自动化规则、通知中心、邮件、Webhook、WebSocket、统计分析、系统配置与管理员审计。
+- 企业界面：全中文操作提示；工单、用户、通知、自动化、Webhook、系统配置和 Agent 控制列表使用单行省略、悬停全文、横向滚动、固定操作列和可持久化的手动列宽。
+
+### 2.2 Agent 原生底座（P0-P1）
+
+- 工单、评论、附件、租约、事件与幂等记录由事务化领域服务统一提交。
+- 领域事件采用 CloudEvents 1.0；`domain_events` 与 `outbox_deliveries` 支持失败重试、回放和可观测投递。
+- 创建与命令接口使用 `Idempotency-Key`；资源使用 `version`、`ETag` 和 `If-Match` 防止并发覆盖。
+- 机器接口返回稳定 JSON Schema、操作回执、不透明 cursor 和 `application/problem+json` 错误。
+- AI Agent 使用独立 `service_principal`、可轮换凭据、短期 OAuth 访问令牌、最小 scope 和显式策略，不复用人类账号。
+- PostgreSQL 记录服务主体、凭据、策略决策、Actor、请求摘要、变更集、事件和管理员接管；不存储模型思维链。
+- Redis 提供跨实例限流、并发保护、调度器租约和 Agent 运行控制；支持全局/单主体紧急停止与只读模式。
+
+### 2.3 MCP 原生入口（P2）
+
+- `POST /mcp` 只实现 MCP `2026-07-28` 无状态 Streamable HTTP。
+- 工具覆盖工单查询/创建/更新、领取/续租/释放、分配/流转、评论、附件、历史和策略预检。
+- 只读资源覆盖工单、队列、历史、Ticket Schema 和能力说明；`subscriptions/listen` 通过 SSE 推送资源变化。
+- 原生发布 `io.modelcontextprotocol/oauth-client-credentials` 扩展，供无人值守服务主体使用。
+- MCP、Agent REST 和 A2A 使用独立 RFC 8707 resource/audience，令牌不能跨协议复用。
+
+完整约束见 [MCP 2026-07-28 接入说明](reference/MCP_2026_07_28.md)。
+
+### 2.4 A2A 服务端入口（P3）
+
+- `GET /.well-known/agent-card.json` 发布支持 ETag 的 Agent Card。
+- `POST /a2a/v1` 实现 A2A 官方最新发布 `v1.0.1`，线协议固定为
+  `A2A-Version: 1.0`；支持消息、Task 查询/取消、状态历史、Artifact、SSE
+  订阅与 Push 配置。
+- A2A Task 与业务 Ticket 分开建模，通过标准 metadata 关联工单；`input-required` 不会隐式修改工单状态。
+- 首期 skills 为工单受理、查询、处理、评论和升级；Push 投递复用可靠 Outbox，并执行 HTTPS/SSRF 防护。
+
+完整约束见 [A2A v1.0.1 接入说明](reference/A2A_1_0.md)。
+
+## 3. 技术基线
+
+| 层级 | 当前版本/组件 |
+| --- | --- |
+| 后端 | Go 1.26、Gin 1.12、GORM 1.31 |
+| 数据 | PostgreSQL 18（Compose 18.4）、Redis 8（Compose 8.8） |
+| 前端 | React 19.2.8、React Admin 5.15.1、MUI 7.3.11 |
+| 路由与构建 | React Router 7.18.2、TypeScript 6、Vite 8.1.5 |
+| 机器契约 | OpenAPI 3.2.0、CloudEvents 1.0 |
+| Agent 协议 | MCP 2026-07-28、A2A v1.0.1（wire 1.0） |
+| 工程工具 | Makefile、Docker Compose、Go test、Pytest、Playwright |
+
+## 4. 架构与代码组织
+
 ```text
 .
-├── server/                 # Go API 服务
-│   ├── cmd/migrate/        # 迁移/种子入口
+├── server/
+│   ├── cmd/
+│   │   ├── migrate/              # 唯一结构迁移入口
+│   │   └── secret-migrate/       # 显式敏感字段迁移与验证
 │   ├── internal/
-│   │   ├── auth/           # 认证与OTP
-│   │   ├── config/         # 环境配置加载
-│   │   ├── database/       # PostgreSQL/Redis 初始化与迁移
-│   │   ├── handlers/       # HTTP Handler 层
-│   │   ├── middleware/     # 鉴权/CORS/日志/限流
-│   │   ├── models/         # GORM 模型
-│   │   ├── scheduler/      # 定时任务执行
-│   │   ├── services/       # 业务服务层
-│   │   └── websocket/      # WebSocket 实时通知骨架
-│   └── main.go             # API 启动与路由装配
-├── web/                    # React Admin 管理端
-│   ├── src/admin/          # 业务页面
-│   ├── src/lib/            # dataProvider/authProvider/apiClient
-│   ├── src/components/     # UI 组件
-│   └── src/layout/         # 后台布局
-├── docs/                   # 项目文档中心
-├── Makefile                # 根级统一命令
-├── dev.sh                  # 本地前后端进程管理脚本
-└── docker-compose.yml      # 本地容器编排
+│   │   ├── a2a/                  # A2A v1.0.1 / wire 1.0 与 Task 存储
+│   │   ├── agentauth/            # 服务主体 OAuth 与 audience 校验
+│   │   ├── agentplatform/        # Agent REST、MCP/A2A 领域适配与控制面
+│   │   ├── auth/                 # 人类账号与凭据安全
+│   │   ├── database/             # PostgreSQL、Redis 与 Schema 校验
+│   │   ├── handlers/             # 人类后台 HTTP Handler
+│   │   ├── mcp/                  # MCP 2026-07-28 Server
+│   │   ├── models/               # 业务、Actor、事件与 Agent 模型
+│   │   ├── openapi/              # 内嵌 OpenAPI 3.2 权威契约
+│   │   ├── scheduler/            # Redis 分布式定时任务
+│   │   ├── security/             # AES-GCM keyring、SSRF 与迁移校验
+│   │   ├── services/             # 事务化领域服务与 Outbox
+│   │   └── websocket/            # 人类实时通知
+│   └── main.go                   # 服务初始化与路由装配
+├── web/
+│   └── src/
+│       ├── admin/                # 工单、用户、通知、自动化、设置、Agent 控制
+│       ├── components/tables/    # 企业表格与持久化列宽
+│       ├── i18n/                 # React Admin/MUI 中文本地化
+│       ├── layout/               # 侧栏与顶部栏
+│       └── lib/                  # dataProvider、authProvider、API 客户端
+├── docs/                         # 文档真相源与协议参考
+├── Makefile                      # 根级统一命令
+└── docker-compose.yml            # PostgreSQL、Redis、API、Web 编排
 ```
 
-### 3.2 后端分层
-- Handler 层：参数解析、鉴权上下文、HTTP 响应。
-- Service 层：核心业务逻辑（工单、自动化、通知、配置、审计）。
-- Model 层：数据库实体与字段约束。
-- Middleware 层：认证、角色校验、审计日志、限流、安全头等。
+Handler 只负责协议解析和响应；领域服务执行对象级授权、策略、事务和审计。人类、`service_principal` 与 `system` 统一使用 `ActorRef`，协议适配器不得通过内部 HTTP 回调自身接口。
 
-### 3.3 前端分层
-- `AdminApp` 统一注册资源：`tickets`、`users`、`notifications`、`automation-rules`、`automation-logs`。
-- `dataProvider` 负责 React-Admin 与后端 REST 参数适配。
-- `authProvider` 负责登录态、token 刷新与权限控制。
-- `CustomRoutes` 补充系统设置、邮箱、Webhook、可信设备页面。
+## 5. 启动、迁移与配置
 
-## 4. 运行时与端口约定
+### 5.1 Docker 一体化开发
 
-### 4.1 本地开发（推荐）
 ```bash
-./dev.sh start
+make install-deps
+cp server/.env.example server/.env
+make dev
 ```
-- Backend：`http://localhost:8081`
-- Frontend：`http://localhost:3000`
 
-### 4.2 分开运行
+- 管理后台：`http://localhost:3000`
+- API/协议服务：`http://localhost:8081`
+- 健康检查：`http://localhost:8081/healthz`
+
+`/healthz` 分别报告 PostgreSQL 与 Redis 状态；任一必要依赖不可用时返回 `503`。
+
+### 5.2 分开运行
+
 ```bash
 make server-dev
 make web-dev
 ```
 
-### 4.3 Docker 一体化
+后端启动前必须已有可用的 PostgreSQL、Redis 和最新 Schema。生产环境推荐显式迁移，不依赖应用启动时自动建表。
+
+### 5.3 数据库迁移
+
+结构迁移只有一个权威入口：
+
 ```bash
-make dev
-# 或 docker-compose up -d
+make db-migrate
+# 或
+cd server && make migrate
 ```
 
-## 5. API 路由地图（基于 `server/main.go`）
+只有明确需要初始化业务数据时才执行：
 
-### 5.1 公共与健康检查
-- `GET /healthz`
-- `GET /api/ping`
-- `GET /api/health`
-- `GET /api/redis/test`
-
-### 5.2 认证与账号
-- `POST /api/auth/register`
-- `POST /api/auth/login`
-- `POST /api/auth/logout`
-- `POST /api/auth/refresh`
-- `POST /api/auth/forgot-password`
-- `POST /api/auth/reset-password`
-- `POST /api/auth/verify-email`
-- `POST /api/auth/resend-verification`
-- `GET /api/auth/me`（鉴权）
-- `GET|PUT /api/auth/profile`（鉴权）
-- `POST /api/auth/change-password`（鉴权）
-- `POST /api/auth/enable-otp`（鉴权）
-- `POST /api/auth/disable-otp`（鉴权）
-- `POST /api/auth/verify-otp`（鉴权）
-- `POST /api/auth/otp/backup-codes`（鉴权）
-
-### 5.3 工单
-- `GET|POST /api/tickets`
-- `GET|PUT|DELETE /api/tickets/:id`
-- `POST /api/tickets/:id/assign`
-- `POST /api/tickets/:id/transfer`
-- `POST /api/tickets/:id/escalate`
-- `POST /api/tickets/:id/status`
-- `GET /api/tickets/:id/history`
-- `GET /api/tickets/stats`
-- `GET /api/tickets/my-tickets`
-- `GET /api/tickets/unassigned`
-- `GET /api/tickets/overdue`
-- `GET /api/tickets/sla-breach`
-- `POST /api/tickets/bulk-assign`
-- `POST /api/tickets/bulk-status`
-- `POST /api/tickets/bulk-update`
-
-### 5.4 用户中心
-- `GET|PUT /api/user/profile`
-- `PUT /api/user/password`
-- `GET /api/user/login-history`
-- `DELETE /api/user/login-history/:id`
-- `GET /api/user/stats`
-- `POST /api/user/avatar`
-- `GET /api/user/trusted-devices`
-- `DELETE /api/user/trusted-devices/:id`
-
-### 5.5 管理员域（`/api/admin`）
-- 邮件配置：`GET|PUT /email-config`，`POST /email-config/test`
-- 用户管理：`GET/POST /users`，`GET/PUT/DELETE /users/:id`，批量与重置接口
-- 审计日志：`GET /audit-logs`
-- 全局配置：`/configs`（CRUD、批量更新、导入导出、缓存管理）
-- 统计分析：`/analytics/system|business|dashboard|timerange|export|realtime`
-- 自动化：`/automation/rules|logs|sla|templates|quick-replies|batch`
-- 通知管理：`POST /notifications`，`DELETE /notifications/:id`
-
-### 5.6 通知/WebSocket/Webhook
-- 通知：`GET /api/notifications`、已读、偏好、未读计数
-- WebSocket：`GET /api/ws`（鉴权后连接）
-- Webhook：`/api/webhooks` 下配置/测试/日志/统计接口
-
-## 6. 配置与环境变量
-配置入口：`server/internal/config/config.go`，样例：`server/.env.example`。
-
-关键配置域：
-- Server：`PORT`、`ENVIRONMENT`、`GIN_MODE`
-- DB：`DB_HOST`、`DB_PORT`、`DB_USER`、`DB_PASSWORD`、`DB_NAME`
-- Redis：`REDIS_HOST`、`REDIS_PORT`、`REDIS_PASSWORD`
-- Auth：`JWT_SECRET`、`JWT_EXPIRES_IN`
-- Security：`BCRYPT_COST`、`RATE_LIMIT_*`
-- CORS：`CORS_ALLOWED_*`
-
-说明：项目脚本与 Docker 默认以 `8081` 作为后端端口，若调整端口，请同步更新 `dev.sh`、`docker-compose.yml`、前端环境变量。
-
-## 7. 测试与质量门槛
-
-### 7.1 后端
 ```bash
-make test-server
-cd server && make fmt && make vet
+cd server && make migrate-seed
 ```
 
-### 7.2 前端
+`migrate-drop` 仅用于一次性开发数据库，必须交互输入 `DROP`；不得用于共享或生产环境。
+
+既有数据库完成结构迁移后，需要显式迁移并验证敏感字段：
+
 ```bash
-make test-web
-cd web && npm run build
+cd server
+go run ./cmd/secret-migrate
+go run ./cmd/secret-migrate -validate-only
 ```
 
-### 7.3 冒烟与回归
+详见 [数据库敏感字段静态加密](reference/DATA_AT_REST_ENCRYPTION.md)。
+
+### 5.4 关键配置
+
+配置样例为 `server/.env.example`：
+
+- PostgreSQL：`DATABASE_URL` 或 `DB_*`。
+- Redis：`REDIS_*`；Redis 是运行、限流、调度和 Agent 控制的必要依赖。
+- 人类认证：`JWT_SECRET`、`JWT_REFRESH_SECRET`、`BCRYPT_COST`。
+- Agent 身份：`AGENT_JWT_SECRET`、`AGENT_CREDENTIAL_PEPPER`、`AGENT_ISSUER`、TTL 与并发/附件限制。
+- 静态加密：`CHRONODESK_DATA_ENCRYPTION_PRIMARY_KEY_ID`、`CHRONODESK_DATA_ENCRYPTION_KEYS`。
+- 网络安全：`CORS_ALLOWED_*`、`TRUSTED_PROXIES` 和请求限流。
+
+生产密钥必须由密钥管理系统注入，禁止提交 `.env` 或凭据。
+
+## 6. 公共接口
+
+### 6.1 权威机器契约
+
+- OpenAPI：`GET /openapi.yaml`
+- Agent 能力：`GET /api/v1/capabilities`
+- Agent REST 根路径：`/api/v1`
+- 人类后台 REST 根路径：`/api`
+- MCP：`POST /mcp`
+- A2A Agent Card：`GET /.well-known/agent-card.json`
+- A2A JSON-RPC：`POST /a2a/v1`
+- OAuth token：`POST /oauth/token`
+- OAuth 发现：`/.well-known/oauth-authorization-server` 和各 resource 的 Protected Resource Metadata
+
+`/api/v1` 是供 Agent 与 SDK 使用的稳定机器入口；`/api` 是供 React Admin 和人类会话使用的业务入口，不是旧 Agent 协议兼容层。所有 Schema、scope、错误码、示例和 Webhook 定义以运行时 `/openapi.yaml` 为准。
+
+### 6.2 Agent REST 契约
+
+`/api/v1` 提供工单、历史、评论、附件、租约、事件游标与管理员 Agent 控制面。最小 scope 为：
+
+```text
+tickets:read
+tickets:create
+tickets:update
+tickets:assign
+tickets:transition
+comments:write
+attachments:read
+attachments:write
+events:subscribe
+tasks:manage
+```
+
+写请求按操作要求携带 `Idempotency-Key`、`If-Match` 和 `X-Ticket-Lease`。成功响应包含操作 ID、资源 ID/版本、事件 ID、变更字段和策略决策 ID；版本或租约冲突返回稳定的 `409` 机器错误。
+
+### 6.3 人类后台 REST
+
+`/api` 使用人类 JWT 会话与角色/对象级授权，覆盖认证、工单、评论、附件、分类、处理人、通知、用户中心、自动化、系统设置、统计、邮件、Webhook、WebSocket 与 Agent 管理后台。客户只能访问授权工单和公开协作内容，内部评论、扫描状态、凭据和策略由更高权限控制。
+
+### 6.4 只保留当前协议
+
+ChronoDesk 不保留 MCP、A2A 或 OpenAPI 的旧版本协商、旧路径别名和降级实现：
+
+- MCP `2026-07-28`
+- A2A 官方发布 `v1.0.1`（wire `1.0`）
+- OpenAPI `3.2.0`
+- CloudEvents `1.0`
+
+接入细节见 [API 使用说明](reference/API_DOCUMENTATION.md) 和 [Reference 索引](reference/README.md)。
+
+## 7. 安全与审计
+
+- 人类密码使用 bcrypt；刷新/验证/重置/OTP token 使用域分离摘要；TOTP seed 和长期外部凭据使用版本化 AES-256-GCM 信封加密。
+- OAuth 严格校验 `iss`、`aud`、`exp`、凭据状态和 scope；MCP、REST 与 A2A audience 分离。
+- 每次 Agent 写入记录 Actor、credential、policy decision、来源协议、请求摘要、变更集和事件 ID。
+- 评论和附件内容统一视为不可信数据；服务端不替 Agent 抓取任意外部 URL。
+- Webhook 与 A2A Push 仅允许通过 DNS 固定、无代理、无重定向的公网 HTTPS 目标，阻断 SSRF 和 DNS rebinding。
+- 附件按对象授权下载，并记录文件哈希与病毒扫描状态。
+- Redis 限流按可信客户端/用户和路由隔离；健康检查、发现元数据和静态契约不共享凭据写入限流桶。
+
+## 8. 测试与质量门禁
+
+提交前的根级门禁：
+
 ```bash
-cd server && make smoke
+make test
+make build
+```
+
+`make test` 会执行 Go 测试、前端 TypeScript/Lint/依赖安全检查，以及 Redocly + Spectral 的 OpenAPI 3.2 严格校验。
+
+需要完整回归时执行：
+
+```bash
+cd server && make test-race
+cd server && make vet
+make smoke
 ./test_integration.sh
-server/test_notification_system.sh
 ```
 
-## 8. 安全与运维要点
-- 管理员接口统一经过角色鉴权与审计日志中间件。
-- JWT 密钥在生产环境必须替换默认值。
-- 建议开启 HTTPS、收紧 CORS 白名单、限制上传类型与大小。
-- 定期清理构建产物与日志（避免将大文件提交到 Git）。
+详细顺序、环境依赖和专项测试见 [测试与质量控制指南](testing_guide.md)。
 
-## 9. 已知风险与待办方向
-- WebSocket 仍偏骨架实现，未完全打通未读计数实时回写。
-- 前端 ESLint 存在历史告警，需分模块治理。
-- 部分历史文档与路径已归档，新增内容请优先更新本手册与 `docs/README.md`。
+## 9. 当前范围边界
 
-## 10. 维护规范（文档真相源）
-- 架构/功能/接口变化后，先更新本文件，再更新专题文档。
-- 根目录仅保留入口文档（`README.md`）与 agent 控制文件（`AGENTS.md`、`CLAUDE.md`）。
-- 历史资料放入 `docs/archive/`，参考资料放入 `docs/reference/`。
+- 单组织私有化部署；当前不包含多租户、计费和租户隔离。
+- Agent 智能模型、RAG 和规划器由外部平台承载。
+- A2A 首期只提供服务端，不主动发现或委派给外部 Agent。
+- MCP Apps 与 MCP Tasks 未声明；A2A Task 是独立协议模型。
+
+这些是明确的产品边界，不是隐藏的兼容分支。
+
+## 10. 文档维护规范
+
+- 架构、命令和公共接口变化后，先更新本文件，再更新专题文档与 `docs/README.md`。
+- API 请求/响应只以 `server/internal/openapi/openapi.yaml` 和运行时 `/openapi.yaml` 为机器真相源。
+- 根目录只保留快速入口和 Agent 协作文件；历史资料归档到 `docs/archive/`。
+- 失效脚本、旧版本协议和一次性测试结论不得继续出现在当前操作指南中。

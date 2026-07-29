@@ -17,10 +17,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -42,14 +42,18 @@ jobs:
         run: |
           for i in {1..30}; do
             payload=$(curl -s http://localhost:8081/healthz || true)
-            if echo "$payload" | grep -q '"database":"ok"'; then
-              echo "API and database are ready";
+            if echo "$payload" | jq -e '
+              .status == "ok" and
+              .dependencies.postgresql == "ok" and
+              .dependencies.redis == "ok"
+            ' >/dev/null 2>&1; then
+              echo "API, PostgreSQL, and Redis are ready";
               exit 0;
             fi;
-            echo "Waiting for API/DB... payload: ${payload}";
+            echo "Waiting for API dependencies... payload: ${payload}";
             sleep 5;
           done;
-          echo "API/database did not become ready in time";
+          echo "API dependencies did not become ready in time";
           if docker compose version >/dev/null 2>&1; then
             docker compose logs --no-color server || true
           elif command -v docker-compose >/dev/null 2>&1; then
@@ -60,9 +64,9 @@ jobs:
       - name: Run database migrations
         run: |
           if docker compose version >/dev/null 2>&1; then
-            docker compose exec -T server go run cmd/migrate/main.go -seed
+            docker compose exec -T server chronodesk-migrate -seed
           elif command -v docker-compose >/dev/null 2>&1; then
-            docker-compose exec -T server go run cmd/migrate/main.go -seed
+            docker-compose exec -T server chronodesk-migrate -seed
           else
             echo "Compose command not found for migration"
             exit 127
@@ -82,7 +86,7 @@ jobs:
 
       - name: Upload smoke reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: smoke-reports
           path: server/reports/*.html

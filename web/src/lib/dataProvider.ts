@@ -1,5 +1,6 @@
 import { DataProvider, fetchUtils, HttpError } from 'react-admin'
 import queryString from 'query-string'
+import { containsChineseText, localizedApiErrorMessage } from './apiClient'
 
 const apiUrl = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
 
@@ -8,7 +9,7 @@ const apiUrl = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
  */
 type HttpClientOptions = RequestInit & { headers?: Headers }
 
-const httpClient = (url: string, options: HttpClientOptions = {}) => {
+const httpClient = async (url: string, options: HttpClientOptions = {}) => {
     const token = localStorage.getItem('token')
     const headers = new Headers(options.headers ?? { Accept: 'application/json' })
 
@@ -20,7 +21,11 @@ const httpClient = (url: string, options: HttpClientOptions = {}) => {
         headers.set('Authorization', `Bearer ${token}`)
     }
 
-    return fetchUtils.fetchJson(url, { ...options, headers })
+    try {
+        return await fetchUtils.fetchJson(url, { ...options, headers })
+    } catch (error: unknown) {
+        return handleHttpError(error)
+    }
 }
 
 /**
@@ -65,19 +70,16 @@ const getTotalFromHeaders = (headers: Headers, defaultTotal: number = 0): number
 const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === 'object' && value !== null
 
-const handleHttpError = (error: unknown): never => {
+function handleHttpError(error: unknown): never {
     if (error instanceof HttpError) {
-        if (isRecord(error.body)) {
-            const message =
-                (error.body.msg as string | undefined) ||
-                (error.body.message as string | undefined) ||
-                error.message
-            throw new HttpError(message, error.status, error.body)
-        }
-        throw error
+        const message = localizedApiErrorMessage(error.body, error.status)
+        throw new HttpError(message, error.status, error.body)
     }
 
-    const message = error instanceof Error ? error.message : '请求失败'
+    const rawMessage = error instanceof Error ? error.message : ''
+    const message = rawMessage && containsChineseText(rawMessage)
+        ? rawMessage
+        : '请求失败，请检查网络连接后重试'
     throw new HttpError(message, 500, {})
 }
 
@@ -92,6 +94,8 @@ const extractResponseData = (json: unknown): unknown => {
     }
     return json
 }
+
+const extractTypedResponseData = <T>(json: unknown): T => extractResponseData(json) as T
 
 const parseListResponse = (resource: string, json: unknown, headers: Headers) => {
     if (isRecord(json) && resource === 'automation-logs' && isRecord(json.data) && Array.isArray(json.data.logs)) {
@@ -330,20 +334,28 @@ export const dataProvider: DataProvider = {
         const url = `${apiUrl}/${apiPath}/${params.id}`;
         const { json } = await httpClient(url);
         
-        return { data: extractResponseData(json) };
+        return { data: extractTypedResponseData(json) };
     },
 
     // 获取多个资源
     getMany: async (resource, params) => {
+        if (resource === 'users' || resource === 'user') {
+            const records = await Promise.all(
+                params.ids.map(async (id) => {
+                    const { json } = await httpClient(`${apiUrl}/admin/users/${id}`)
+                    return extractTypedResponseData(json)
+                }),
+            )
+            return { data: records }
+        }
+
         // 如果后端支持批量查询
         const query = {
             filter: convertFilterToGoFormat({ ids: params.ids }),
         };
 
         let apiPath = resource;
-        if (resource === 'users' || resource === 'user') {
-            apiPath = 'admin/users';
-        } else if (resource === 'automation-rules') {
+        if (resource === 'automation-rules') {
             apiPath = 'admin/automation/rules';
         }
 
@@ -384,6 +396,17 @@ export const dataProvider: DataProvider = {
         };
         query.filter = convertFilterToGoFormat(filter);
 
+        if (params.target === 'ticket_id' && (resource === 'comments' || resource === 'ticket_history')) {
+            const nestedResource = resource === 'comments' ? 'comments' : 'history'
+            const url = `${apiUrl}/tickets/${params.id}/${nestedResource}?${queryString.stringify({
+                page,
+                page_size: perPage,
+                sort: query.sort,
+            })}`
+            const { json, headers } = await httpClient(url)
+            return parseListResponse(resource, json, headers)
+        }
+
         let apiPath = resource;
         if (resource === 'users' || resource === 'user') {
             apiPath = 'admin/users';
@@ -416,9 +439,9 @@ export const dataProvider: DataProvider = {
                 body: JSON.stringify(params.data),
             });
 
-            return { data: extractResponseData(json) };
+            return { data: extractTypedResponseData(json) };
         } catch (error: unknown) {
-            handleHttpError(error)
+            return handleHttpError(error)
         }
     },
 
@@ -441,9 +464,9 @@ export const dataProvider: DataProvider = {
                 body: JSON.stringify(params.data),
             });
 
-            return { data: extractResponseData(json) };
+            return { data: extractTypedResponseData(json) };
         } catch (error: unknown) {
-            handleHttpError(error)
+            return handleHttpError(error)
         }
     },
 

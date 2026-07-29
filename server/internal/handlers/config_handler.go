@@ -403,39 +403,6 @@ func (h *ConfigHandler) ImportConfigs(c *gin.Context) {
 	})
 }
 
-// ClearCache 清空配置缓存
-// @Summary 清空配置缓存
-// @Description 清空系统配置缓存
-// @Tags 系统配置
-// @Security ApiKeyAuth
-// @Success 200 {object} map[string]interface{} "成功"
-// @Router /api/admin/configs/cache/clear [post]
-func (h *ConfigHandler) ClearCache(c *gin.Context) {
-	h.configService.ClearCache()
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "配置缓存已清空",
-	})
-}
-
-// GetCacheStats 获取缓存统计
-// @Summary 获取缓存统计
-// @Description 获取配置缓存统计信息
-// @Tags 系统配置
-// @Security ApiKeyAuth
-// @Success 200 {object} map[string]interface{} "成功"
-// @Router /api/admin/configs/cache/stats [get]
-func (h *ConfigHandler) GetCacheStats(c *gin.Context) {
-	stats := h.configService.GetCacheStats()
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "获取缓存统计成功",
-		"data":    stats,
-	})
-}
-
 // InitDefaultConfigs 初始化默认配置
 // @Summary 初始化默认配置
 // @Description 初始化系统默认配置

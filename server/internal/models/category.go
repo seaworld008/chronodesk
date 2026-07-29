@@ -201,15 +201,15 @@ type CategoryResponse struct {
 	IsDefault         bool                   `json:"is_default"`
 	IsPublic          bool                   `json:"is_public"`
 	RequireApproval   bool                   `json:"require_approval"`
-	AutoAssignUser    *UserResponse          `json:"auto_assign_user,omitempty"`
+	AutoAssignUser    *UserSummary           `json:"auto_assign_user,omitempty"`
 	SLAHours          *int                   `json:"sla_hours"`
 	Template          string                 `json:"template"`
 	AllowedRoles      []string               `json:"allowed_roles"`
 	RestrictedRoles   []string               `json:"restricted_roles"`
 	Tags              []string               `json:"tags"`
 	Metadata          map[string]interface{} `json:"metadata"`
-	Creator           *UserResponse          `json:"creator,omitempty"`
-	Updater           *UserResponse          `json:"updater,omitempty"`
+	Creator           *UserSummary           `json:"creator,omitempty"`
+	Updater           *UserSummary           `json:"updater,omitempty"`
 }
 
 // ToResponse 转换为响应格式
@@ -241,13 +241,13 @@ func (c *Category) ToResponse() *CategoryResponse {
 
 	// 处理关联用户
 	if c.AutoAssignUser != nil {
-		response.AutoAssignUser = c.AutoAssignUser.ToResponse()
+		response.AutoAssignUser = c.AutoAssignUser.ToSummary()
 	}
 	if c.Creator != nil {
-		response.Creator = c.Creator.ToResponse()
+		response.Creator = c.Creator.ToSummary()
 	}
 	if c.Updater != nil {
-		response.Updater = c.Updater.ToResponse()
+		response.Updater = c.Updater.ToSummary()
 	}
 
 	// 处理父级分类
@@ -263,11 +263,10 @@ func (c *Category) ToResponse() *CategoryResponse {
 		}
 	}
 
-	// TODO: 解析JSON字段
-	// response.AllowedRoles = parseRolesFromJSON(c.AllowedRoles)
-	// response.RestrictedRoles = parseRolesFromJSON(c.RestrictedRoles)
-	// response.Tags = parseTagsFromJSON(c.Tags)
-	// response.Metadata = parseMetadataFromJSON(c.Metadata)
+	response.AllowedRoles = decodeJSONStringSlice(c.AllowedRoles)
+	response.RestrictedRoles = decodeJSONStringSlice(c.RestrictedRoles)
+	response.Tags = decodeJSONStringSlice(c.Tags)
+	response.Metadata = decodeJSONMap(c.Metadata)
 
 	return response
 }

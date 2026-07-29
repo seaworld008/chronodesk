@@ -69,7 +69,7 @@ const timezoneChoices = [
 const languageChoices = [
     { id: 'zh-CN', name: '中文简体' },
     { id: 'zh-TW', name: '中文繁体' },
-    { id: 'en-US', name: 'English (US)' },
+    { id: 'en-US', name: '英语（美国）' },
     { id: 'ja-JP', name: '日本語' },
     { id: 'ko-KR', name: '한국어' },
 ];
@@ -122,10 +122,14 @@ const UserAvatarDisplay: React.FC = () => {
                 {initials}
             </Avatar>
             <Box>
-                <Typography variant="h6" fontWeight={600}>
+                <Typography variant="h6" sx={{
+                    fontWeight: 600
+                }}>
                     {displayName}
                 </Typography>
-                <Typography variant="body2" color="text.secondary">
+                <Typography variant="body2" sx={{
+                    color: "text.secondary"
+                }}>
                     @{record.username} • ID: {record.id}
                 </Typography>
             </Box>
@@ -178,7 +182,7 @@ const UserEditActions = () => (
     <TopToolbar>
         <ListButton label="返回列表" />
         <ShowButton label="查看详情" />
-        <DeleteButton label="删除" />
+        <DeleteButton label="删除" mutationMode="pessimistic" />
     </TopToolbar>
 );
 
@@ -191,7 +195,9 @@ const UserEditToolbar = () => (
             label="保存更改"
             variant="contained"
         />
-        <Typography variant="body2" color="text.secondary">
+        <Typography variant="body2" sx={{
+            color: "text.secondary"
+        }}>
             * 标记的字段为必填项
         </Typography>
     </Box>
@@ -230,7 +236,8 @@ const UserEdit: React.FC = () => {
                                                     validate={validateUsername}
                                                     fullWidth
                                                     required
-                                                    helperText="用户名用于登录，建议使用英文字母和数字"
+                                                    disabled
+                                                    helperText="用户名是稳定登录标识，创建后不可修改"
                                                 />
                                             </Box>
                                             

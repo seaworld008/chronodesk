@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"gongdan-system/internal/models"
@@ -63,9 +64,49 @@ func setupAutomationServiceTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
+func TestCreateAutomationRuleDefaultsToInactive(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.User{}, &models.AutomationRule{}); err != nil {
+		t.Fatalf("migrate automation schemas: %v", err)
+	}
+	user := models.User{
+		Username:     "automation-author",
+		Email:        "automation-author@example.com",
+		PasswordHash: "hashed",
+		Role:         models.RoleAdmin,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("create author: %v", err)
+	}
+
+	rule, err := NewAutomationService(db).CreateRule(
+		context.Background(),
+		&models.AutomationRuleRequest{
+			Name:         "safe inactive rule",
+			RuleType:     "assignment",
+			TriggerEvent: "ticket.created",
+		},
+		user.ID,
+	)
+	if err != nil {
+		t.Fatalf("create rule: %v", err)
+	}
+	if rule.IsActive {
+		t.Fatal("new automation rule must default to inactive")
+	}
+}
+
 func TestAutomationAssignmentUsesTicketAssigneeColumn(t *testing.T) {
 	db := openTestDB(t)
-	if err := db.AutoMigrate(&models.User{}, &models.Ticket{}); err != nil {
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.Ticket{},
+		&models.TicketHistory{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
+		&models.IdempotencyRecord{},
+	); err != nil {
 		t.Fatalf("failed to migrate schemas: %v", err)
 	}
 
@@ -124,7 +165,14 @@ func TestAutomationToUintRejectsUnsafeValues(t *testing.T) {
 
 func TestClassifyTicketPersistsCanonicalType(t *testing.T) {
 	db := openTestDB(t)
-	if err := db.AutoMigrate(&models.User{}, &models.Ticket{}); err != nil {
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.Ticket{},
+		&models.TicketHistory{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
+		&models.IdempotencyRecord{},
+	); err != nil {
 		t.Fatalf("failed to migrate schemas: %v", err)
 	}
 	user := models.User{
@@ -165,6 +213,19 @@ func TestClassifyTicketPersistsCanonicalType(t *testing.T) {
 	}
 	if updated.Priority != models.TicketPriorityHigh {
 		t.Fatalf("expected high priority, got %s", updated.Priority)
+	}
+	if updated.Version != 2 {
+		t.Fatalf("expected versioned classification update, got version %d", updated.Version)
+	}
+	var event models.DomainEvent
+	if err := db.
+		Where("subject = ? AND actor_type = ? AND actor_id = ?",
+			fmt.Sprintf("ticket/%d", ticket.ID),
+			models.ActorTypeSystem,
+			automationActorID,
+		).
+		First(&event).Error; err != nil {
+		t.Fatalf("expected classification domain event: %v", err)
 	}
 }
 

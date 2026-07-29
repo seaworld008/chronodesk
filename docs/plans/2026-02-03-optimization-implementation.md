@@ -1,5 +1,9 @@
 # Optimization & Consistency Implementation Plan
 
+> **状态：历史归档，请勿执行。** 当前系统已使用领域事件 Outbox 负责
+> Webhook 的持久重试，并由权威认证模块负责 JWT。下文的进程内并发重试、
+> `sendWebhook`、自制中间件认证链等步骤已被移除，仅保留为历史决策记录。
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** 统一后端中间件与 CORS、增强统计与过滤性能、稳定 WebSocket/通知链路、并清理前端响应解析与无用页面，保持前后端功能一致。
@@ -475,4 +479,3 @@ Expected: 允许存在当前基线错误，但不得新增
 - **Task 7（数据库迁移）**：采用手动验证，未写自动化测试
 - **Task 8（前端变更）**：当前无测试框架，使用 lint + 手动验证
 - **Task 6（中间件接入）**：属于接线变更，自动化测试仅覆盖配置读取
-

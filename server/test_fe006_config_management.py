@@ -8,7 +8,7 @@ Test script for FE006 - System Global Settings Management
 1. 验证系统配置管理 API (CRUD操作)
 2. 验证配置分类和分组管理
 3. 验证安全策略配置
-4. 验证配置缓存机制
+4. 验证配置更新后立即一致
 5. 验证配置导入/导出功能
 6. 验证配置初始化功能
 7. 验证配置验证机制
@@ -19,6 +19,7 @@ import requests
 import json
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, List, Optional, Any
 import os
 import sys
@@ -435,38 +436,6 @@ class ConfigManagementTester:
             self.log_test_result("导入配置", False, f"异常: {e}")
             return False
 
-    def test_cache_operations(self) -> bool:
-        """测试缓存操作"""
-        try:
-            # 获取缓存统计
-            response = self.session.get(f"{self.api_base}/admin/configs/cache/stats", timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("success"):
-                    stats = data.get("data", {})
-                    item_count = stats.get("item_count", 0)
-                    
-                    # 清空缓存
-                    clear_response = self.session.post(f"{self.api_base}/admin/configs/cache/clear", timeout=10)
-                    
-                    if clear_response.status_code == 200:
-                        clear_data = clear_response.json()
-                        if clear_data.get("success"):
-                            self.log_test_result("缓存操作", True,
-                                               f"缓存项数: {item_count}, 缓存已清空")
-                            return True
-                
-                self.log_test_result("缓存操作", False, "缓存操作失败")
-            else:
-                self.log_test_result("缓存操作", False,
-                                   f"状态码: {response.status_code}")
-            return False
-            
-        except Exception as e:
-            self.log_test_result("缓存操作", False, f"异常: {e}")
-            return False
-
     def test_delete_config(self) -> bool:
         """测试删除配置"""
         try:
@@ -505,7 +474,7 @@ class ConfigManagementTester:
                 "配置CRUD操作": "已实现",
                 "配置分类管理": "已实现",
                 "安全策略配置": "已实现",
-                "配置缓存机制": "已实现",
+                "配置读取一致性": "PostgreSQL 真相源",
                 "配置导入导出": "已实现",
                 "配置验证机制": "已实现",
                 "配置初始化": "已实现"
@@ -548,7 +517,6 @@ class ConfigManagementTester:
             self.test_config_validation,
             self.test_export_configs,
             self.test_import_configs,
-            self.test_cache_operations,
             self.test_delete_config,
         ]
         
@@ -564,8 +532,10 @@ class ConfigManagementTester:
         report = self.generate_test_report()
         
         # 保存报告
-        report_file = "fe006_config_management_test_report.json"
-        with open(report_file, 'w', encoding='utf-8') as f:
+        report_dir = Path(__file__).resolve().parent / "reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_file = report_dir / "fe006_config_management_test_report.json"
+        with report_file.open('w', encoding='utf-8') as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
         
         # 打印摘要

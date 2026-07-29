@@ -365,7 +365,7 @@
       "server/internal/handlers/analytics_handler.go - 统计分析API处理器(FE007)",
       "server/test_fe006_config_management.py - FE006配置管理测试脚本",
       "server/test_fe007_analytics.py - FE007监控统计测试脚本",
-      "server/fe006_config_management_test_report.json - FE006测试报告",
+      "server/reports/fe006_config_management_test_report.json - FE006测试运行产物（不纳入版本控制）",
       "server/fe007_analytics_test_report.json - FE007测试报告"
     ],
     "database_changes": [
@@ -383,8 +383,6 @@
       "GET /api/admin/configs/security-policy - 获取安全策略(FE006)",
       "GET /api/admin/configs/export - 导出配置(FE006)",
       "POST /api/admin/configs/import - 导入配置(FE006)",
-      "POST /api/admin/configs/cache/clear - 清空配置缓存(FE006)",
-      "GET /api/admin/configs/cache/stats - 获取缓存统计(FE006)",
       "GET /api/admin/analytics/system - 获取系统运行状态(FE007)",
       "GET /api/admin/analytics/business - 获取业务数据统计(FE007)",
       "GET /api/admin/analytics/dashboard - 获取仪表板综合统计(FE007)",
@@ -394,7 +392,7 @@
       "GET /api/health - 系统健康检查(FE007)"
     ],
     "technical_highlights": [
-      "patrickmn/go-cache内存缓存机制，提升配置读取性能(FE006)",
+      "PostgreSQL 权威读取，保证配置更新跨服务实例立即一致(FE006)",
       "系统配置分类管理，支持security/system/ticket/notify分组(FE006)",
       "类型安全配置验证，支持string/int/bool/json类型(FE006)",
       "配置导入导出功能，支持JSON格式数据迁移(FE006)",

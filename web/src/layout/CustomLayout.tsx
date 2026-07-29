@@ -27,11 +27,39 @@ export const CustomLayout: React.FC<LayoutProps> = (props) => (
         return {
           '.RaLayout-content, .RaLayout-contentWithSidebar': {
             maxWidth: 'none',
+            minWidth: 0,
+          },
+          '.RaLayout-contentWithSidebar': {
+            position: 'relative',
+            display: 'flex',
+            alignItems: 'stretch',
+            overflow: 'hidden',
+          },
+          '.RaSidebar-root': {
+            position: 'relative',
+            zIndex: theme.zIndex.drawer,
+            flexShrink: 0,
+          },
+          '.RaSidebar-fixed': {
+            zIndex: theme.zIndex.drawer,
+            width: 'inherit',
+            maxWidth: 'inherit',
+            boxSizing: 'border-box',
+            overflowX: 'hidden',
+            overflowY: 'auto',
+            backgroundColor: theme.palette.background.paper,
+          },
+          '.RaSidebar-paper': {
+            zIndex: theme.zIndex.drawer,
+            overflow: 'visible',
           },
           '.RaLayout-content': {
+            position: 'relative',
+            zIndex: 0,
             minHeight: `calc(100vh - ${minHeightValue}px)`,
             display: 'flex',
             flexDirection: 'column',
+            overflowX: 'hidden',
             padding: theme.spacing(0),
             backgroundColor: 'transparent',
           },

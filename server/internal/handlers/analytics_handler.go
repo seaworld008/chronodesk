@@ -15,13 +15,19 @@ import (
 type AnalyticsHandler struct {
 	analyticsService *services.AnalyticsService
 	response         *middleware.ResponseHelper
+	appVersion       string
 }
 
 // NewAnalyticsHandler 创建分析处理器
-func NewAnalyticsHandler(db *gorm.DB) *AnalyticsHandler {
+func NewAnalyticsHandler(db *gorm.DB, appVersion ...string) *AnalyticsHandler {
+	version := "1.0.0"
+	if len(appVersion) > 0 && appVersion[0] != "" {
+		version = appVersion[0]
+	}
 	return &AnalyticsHandler{
 		analyticsService: services.NewAnalyticsService(db),
 		response:         middleware.NewResponseHelper(),
+		appVersion:       version,
 	}
 }
 
@@ -163,7 +169,7 @@ func (h *AnalyticsHandler) GetHealthCheck(c *gin.Context) {
 	health := gin.H{
 		"status":      "healthy",
 		"timestamp":   time.Now(),
-		"version":     "2.0.0",
+		"version":     h.appVersion,
 		"environment": gin.Mode(),
 	}
 

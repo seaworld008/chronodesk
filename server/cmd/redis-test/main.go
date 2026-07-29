@@ -1,184 +1,302 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9/logging"
 )
 
-func main() {
-	// 加载环境变量
-	if err := godotenv.Load(); err != nil {
-		log.Println("Warning: .env file not found")
-	}
+const (
+	probeTimeout          = 10 * time.Second
+	maxProbeResponseBytes = 4 << 10
+)
 
-	// 首先尝试TCP连接
-	fmt.Println("=== Testing TCP Connection ===")
-	testRedisTCP()
-
-	// 然后尝试HTTP REST API
-	fmt.Println("\n=== Testing HTTP REST API ===")
-	testRedisHTTP()
+type probeResult struct {
+	transport  string
+	endpointID string
+	ok         bool
+	category   string
 }
 
-func testRedisTCP() {
-	// 获取Redis URL
-	redisURL := os.Getenv("REDIS_URL")
-	if redisURL == "" {
-		log.Fatal("REDIS_URL environment variable not set")
+func main() {
+	// 本地开发可从 .env 加载；生产环境继续以进程环境变量为准。
+	_ = godotenv.Load()
+	// 门禁只输出稳定错误分类，避免依赖库日志暴露端点细节。
+	logging.Disable()
+	os.Exit(runRedisGate(context.Background(), os.Stdout))
+}
+
+func runRedisGate(parent context.Context, output io.Writer) int {
+	results := make([]probeResult, 0, 2)
+
+	if redisURL := strings.TrimSpace(os.Getenv("REDIS_URL")); redisURL != "" {
+		results = append(results, probeRedisTCP(parent, redisURL))
 	}
 
-	fmt.Printf("Testing Redis TCP connection with URL: %s\n", redisURL)
-
-	// 解析Redis URL
-	opt, err := redis.ParseURL(redisURL)
-	if err != nil {
-		log.Fatalf("Failed to parse Redis URL: %v", err)
-	}
-
-	// 如果是rediss://协议，配置TLS
-	if strings.HasPrefix(redisURL, "rediss://") {
-		opt.TLSConfig = &tls.Config{
-			ServerName: strings.Split(opt.Addr, ":")[0],
-			MinVersion: tls.VersionTLS12,
+	if restURL := strings.TrimSpace(os.Getenv("KV_REST_API_URL")); restURL != "" {
+		token := strings.TrimSpace(os.Getenv("KV_REST_API_READ_ONLY_TOKEN"))
+		if token == "" {
+			token = strings.TrimSpace(os.Getenv("KV_REST_API_TOKEN"))
+		}
+		if token == "" {
+			results = append(results, probeResult{
+				transport:  "REST/HTTPS",
+				endpointID: endpointFingerprint(restURL),
+				category:   "missing_credentials",
+			})
+		} else {
+			results = append(results, probeRedisREST(parent, restURL, token, newProbeHTTPClient()))
 		}
 	}
 
-	fmt.Printf("Parsed Redis options:\n")
-	fmt.Printf("  Addr: %s\n", opt.Addr)
-	fmt.Printf("  DB: %d\n", opt.DB)
-	fmt.Printf("  TLSConfig: %v\n", opt.TLSConfig != nil)
+	fmt.Fprintln(output, "Redis 发布门禁（只读 PING）")
+	if len(results) == 0 {
+		fmt.Fprintln(output, "- 未配置 REDIS_URL 或 KV_REST_API_URL")
+		fmt.Fprintln(output, "结论：失败（missing_configuration）")
+		return 2
+	}
 
-	// 创建Redis客户端
-	rdb := redis.NewClient(opt)
-	defer rdb.Close()
+	successes := 0
+	for _, result := range results {
+		state := "失败"
+		if result.ok {
+			state = "成功"
+			successes++
+		}
+		fmt.Fprintf(
+			output,
+			"- %s [端点 %s]：%s（%s）\n",
+			result.transport,
+			result.endpointID,
+			state,
+			result.category,
+		)
+	}
 
-	// 测试连接
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if successes == 0 {
+		fmt.Fprintf(output, "结论：失败（0/%d 个传输可用）\n", len(results))
+		return 1
+	}
+	if successes < len(results) {
+		fmt.Fprintf(output, "结论：可用但存在降级（%d/%d 个传输可用）\n", successes, len(results))
+		return 0
+	}
+	fmt.Fprintf(output, "结论：通过（%d/%d 个传输可用）\n", successes, len(results))
+	return 0
+}
+
+func probeRedisTCP(parent context.Context, redisURL string) probeResult {
+	result := probeResult{
+		transport:  "TCP/RESP",
+		endpointID: endpointFingerprint(redisURL),
+	}
+
+	parsed, err := url.Parse(redisURL)
+	if err != nil || parsed.Hostname() == "" {
+		result.category = "invalid_url"
+		return result
+	}
+	if parsed.Scheme == "redis" && !isLoopbackHost(parsed.Hostname()) {
+		result.category = "insecure_transport"
+		return result
+	}
+
+	options, err := redis.ParseURL(redisURL)
+	if err != nil {
+		result.category = "invalid_url"
+		return result
+	}
+
+	client := redis.NewClient(options)
+	defer func() { _ = client.Close() }()
+
+	ctx, cancel := context.WithTimeout(parent, probeTimeout)
 	defer cancel()
-
-	fmt.Println("\nTesting Redis TCP connection...")
-
-	// 执行PING命令
-	pong, err := rdb.Ping(ctx).Result()
-	if err != nil {
-		fmt.Printf("❌ Redis TCP PING failed: %v\n", err)
-		return
+	if err := client.Ping(ctx).Err(); err != nil {
+		result.category = classifyConnectivityError(err)
+		return result
 	}
 
-	fmt.Printf("✅ Redis TCP PING successful: %s\n", pong)
+	result.ok = true
+	result.category = "pong"
+	return result
 }
 
-func testRedisHTTP() {
-	// 获取REST API配置
-	restURL := os.Getenv("KV_REST_API_URL")
-	restToken := os.Getenv("KV_REST_API_TOKEN")
-
-	if restURL == "" || restToken == "" {
-		fmt.Println("❌ KV_REST_API_URL or KV_REST_API_TOKEN not set")
-		return
+func probeRedisREST(parent context.Context, rawURL, token string, client *http.Client) probeResult {
+	result := probeResult{
+		transport:  "REST/HTTPS",
+		endpointID: endpointFingerprint(rawURL),
 	}
 
-	fmt.Printf("Testing Redis HTTP REST API: %s\n", restURL)
-
-	// 测试PING命令
-	pingURL := restURL + "/ping"
-	req, err := http.NewRequest("GET", pingURL, nil)
+	endpoint, err := validateRESTEndpoint(rawURL)
 	if err != nil {
-		fmt.Printf("❌ Failed to create request: %v\n", err)
-		return
+		result.category = err.Error()
+		return result
 	}
 
-	req.Header.Set("Authorization", "Bearer "+restToken)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	payload, err := json.Marshal([]string{"PING"})
 	if err != nil {
-		fmt.Printf("❌ HTTP request failed: %v\n", err)
-		return
+		result.category = "request_encoding_failed"
+		return result
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	ctx, cancel := context.WithTimeout(parent, probeTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		fmt.Printf("❌ Failed to read response: %v\n", err)
-		return
+		result.category = "request_creation_failed"
+		return result
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+
+	response, err := client.Do(request)
+	if err != nil {
+		result.category = classifyConnectivityError(err)
+		return result
+	}
+	defer response.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxProbeResponseBytes+1))
+	if err != nil {
+		result.category = "response_read_failed"
+		return result
+	}
+	if len(body) > maxProbeResponseBytes {
+		result.category = "response_too_large"
+		return result
+	}
+	if response.StatusCode != http.StatusOK {
+		result.category = fmt.Sprintf("http_status_%d", response.StatusCode)
+		return result
 	}
 
-	fmt.Printf("HTTP Status: %d\n", resp.StatusCode)
-	fmt.Printf("Response: %s\n", string(body))
+	var envelope struct {
+		Result string `json:"result"`
+		Error  string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		result.category = "invalid_response"
+		return result
+	}
+	if envelope.Error != "" {
+		result.category = "redis_error"
+		return result
+	}
+	if !strings.EqualFold(envelope.Result, "PONG") {
+		result.category = "unexpected_response"
+		return result
+	}
 
-	if resp.StatusCode == 200 {
-		fmt.Println("✅ Redis HTTP REST API PING successful!")
+	result.ok = true
+	result.category = "pong"
+	return result
+}
 
-		// 测试SET/GET操作
-		testRedisHTTPOperations(restURL, restToken)
+func newProbeHTTPClient() *http.Client {
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if ok {
+		transport = transport.Clone()
 	} else {
-		fmt.Printf("❌ Redis HTTP REST API PING failed with status %d\n", resp.StatusCode)
+		transport = &http.Transport{Proxy: http.ProxyFromEnvironment}
+	}
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   probeTimeout,
+		// 禁止重定向，避免 Authorization 被转发到非预期端点。
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 }
 
-func testRedisHTTPOperations(baseURL, token string) {
-	fmt.Println("\nTesting SET/GET operations...")
+func validateRESTEndpoint(rawURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || !parsed.IsAbs() || parsed.Hostname() == "" {
+		return "", errors.New("invalid_url")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("invalid_url")
+	}
+	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname())) {
+		return "", errors.New("insecure_transport")
+	}
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
 
-	// 测试SET操作
-	setURL := baseURL + "/set/test_key/test_value"
-	req, err := http.NewRequest("GET", setURL, nil)
-	if err != nil {
-		fmt.Printf("❌ Failed to create SET request: %v\n", err)
-		return
+func endpointFingerprint(rawEndpoint string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawEndpoint))
+	if err != nil || parsed.Hostname() == "" {
+		return "unknown"
+	}
+	digest := sha256.Sum256([]byte(strings.ToLower(parsed.Hostname())))
+	return fmt.Sprintf("sha256:%x", digest[:6])
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func classifyConnectivityError(err error) string {
+	switch {
+	case err == nil:
+		return "none"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "connection_eof"
+	case errors.Is(err, syscall.ECONNRESET):
+		return "connection_reset"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "connection_refused"
+	case errors.Is(err, syscall.ENETUNREACH), errors.Is(err, syscall.EHOSTUNREACH):
+		return "network_unreachable"
 	}
 
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Printf("❌ SET request failed: %v\n", err)
-		return
+	var dnsError *net.DNSError
+	if errors.As(err, &dnsError) {
+		return "dns_lookup_failed"
 	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Printf("❌ Failed to read SET response: %v\n", err)
-		return
+	var hostnameError x509.HostnameError
+	if errors.As(err, &hostnameError) {
+		return "tls_hostname_mismatch"
 	}
-
-	fmt.Printf("SET Response: %s\n", string(body))
-
-	// 测试GET操作
-	getURL := baseURL + "/get/test_key"
-	req, err = http.NewRequest("GET", getURL, nil)
-	if err != nil {
-		fmt.Printf("❌ Failed to create GET request: %v\n", err)
-		return
+	var authorityError x509.UnknownAuthorityError
+	if errors.As(err, &authorityError) {
+		return "tls_untrusted_certificate"
 	}
-
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err = client.Do(req)
-	if err != nil {
-		fmt.Printf("❌ GET request failed: %v\n", err)
-		return
+	var recordError tls.RecordHeaderError
+	if errors.As(err, &recordError) {
+		return "tls_handshake_failed"
 	}
-	defer resp.Body.Close()
-
-	body, err = io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Printf("❌ Failed to read GET response: %v\n", err)
-		return
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return "timeout"
 	}
-
-	fmt.Printf("GET Response: %s\n", string(body))
-	fmt.Println("✅ Redis HTTP REST API operations completed!")
+	return "transport_error"
 }

@@ -22,7 +22,7 @@
 ## Testing Guidelines
 - Backend suites use `go test`; extend coverage with table-driven cases for new handlers and services.
 - Python regression checks sit in `server/tests/` and top-level `test_*.py`; install deps via `pip install -r server/requirements-test.txt` and run `pytest --cov` for HTML + terminal reports.
-- Smoke scripts (`./test_integration.sh`, `server/test_notification_system.sh`) validate API health and cross-service wiring.
+- `./test_integration.sh` validates API health and cross-service wiring; notification and Webhook regressions run in `go test ./internal/services`.
 - Review coverage artifacts in `server/htmlcov/` before merging backend-heavy changes.
 
 ## Commit & Pull Request Guidelines

@@ -1,13 +1,12 @@
 package services
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/patrickmn/go-cache"
 	"gorm.io/gorm"
 
 	"gongdan-system/internal/models"
@@ -15,8 +14,8 @@ import (
 
 // ConfigService 系统配置服务
 type ConfigService struct {
-	db    *gorm.DB
-	cache *cache.Cache
+	db          *gorm.DB
+	auditLogger *log.Logger
 }
 
 // ConfigCategory 配置分类常量
@@ -72,12 +71,9 @@ const (
 
 // NewConfigService 创建配置服务
 func NewConfigService(db *gorm.DB) *ConfigService {
-	// 创建缓存实例，默认过期时间10分钟，清理间隔30秒
-	c := cache.New(10*time.Minute, 30*time.Second)
-
 	return &ConfigService{
-		db:    db,
-		cache: c,
+		db:          db,
+		auditLogger: log.Default(),
 	}
 }
 
@@ -127,7 +123,7 @@ func (s *ConfigService) InitDefaultConfigs() error {
 					log.Printf("❌ 创建默认配置失败 %s: %v", config.Key, err)
 					return err
 				}
-				log.Printf("✅ 创建默认配置: %s = %s", config.Key, config.Value)
+				s.logConfigChange(config.Key, config.Value, "DEFAULT_CREATE")
 			} else {
 				log.Printf("❌ 查询配置失败: %v", err)
 				return err
@@ -141,12 +137,6 @@ func (s *ConfigService) InitDefaultConfigs() error {
 
 // GetConfig 获取配置值
 func (s *ConfigService) GetConfig(key string) (string, error) {
-	// 先从缓存获取
-	if value, found := s.cache.Get(key); found {
-		return value.(string), nil
-	}
-
-	// 缓存不存在，从数据库查询
 	var config models.SystemConfig
 	if err := s.db.Where("key = ?", key).First(&config).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
@@ -155,18 +145,7 @@ func (s *ConfigService) GetConfig(key string) (string, error) {
 		return "", err
 	}
 
-	// 存入缓存
-	s.cache.Set(key, config.Value, cache.DefaultExpiration)
-
 	return config.Value, nil
-}
-
-// GetConfigWithDefault 获取配置值，如果不存在返回默认值
-func (s *ConfigService) GetConfigWithDefault(key, defaultValue string) string {
-	if value, err := s.GetConfig(key); err == nil {
-		return value
-	}
-	return defaultValue
 }
 
 // GetConfigInt 获取整数类型配置
@@ -241,9 +220,6 @@ func (s *ConfigService) SetConfig(key, value, valueType, description, category, 
 		s.logConfigChange(key, value, "UPDATE")
 	}
 
-	// 更新缓存
-	s.cache.Set(key, value, cache.DefaultExpiration)
-
 	return nil
 }
 
@@ -252,9 +228,6 @@ func (s *ConfigService) DeleteConfig(key string) error {
 	if err := s.db.Where("key = ?", key).Delete(&models.SystemConfig{}).Error; err != nil {
 		return err
 	}
-
-	// 从缓存删除
-	s.cache.Delete(key)
 
 	// 记录配置变更日志
 	s.logConfigChange(key, "", "DELETE")
@@ -284,79 +257,76 @@ func (s *ConfigService) GetAllConfigs() ([]models.SystemConfig, error) {
 
 // BatchUpdateConfigs 批量更新配置
 func (s *ConfigService) BatchUpdateConfigs(configs []models.SystemConfig) error {
-	tx := s.db.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
+	changes := make([]configAuditChange, 0, len(configs))
+	if err := s.db.Transaction(func(tx *gorm.DB) error {
+		for _, config := range configs {
+			var existingConfig models.SystemConfig
+			err := tx.Where("key = ?", config.Key).First(&existingConfig).Error
 
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
-
-	for _, config := range configs {
-		// 使用 SetConfig 方法确保正确的创建或更新逻辑
-		var existingConfig models.SystemConfig
-		err := tx.Where("key = ?", config.Key).First(&existingConfig).Error
-
-		if err == gorm.ErrRecordNotFound {
-			// 创建新配置
-			if err := tx.Create(&config).Error; err != nil {
-				tx.Rollback()
+			operation := "BATCH_UPDATE"
+			if err == gorm.ErrRecordNotFound {
+				if err := tx.Create(&config).Error; err != nil {
+					return err
+				}
+				operation = "BATCH_CREATE"
+			} else if err != nil {
 				return err
-			}
-			s.logConfigChange(config.Key, config.Value, "BATCH_CREATE")
-		} else if err != nil {
-			tx.Rollback()
-			return err
-		} else {
-			// 更新现有配置
-			updates := map[string]interface{}{
-				"value":       config.Value,
-				"value_type":  config.ValueType,
-				"description": config.Description,
-			}
-			if config.Category != "" {
-				updates["category"] = config.Category
-			}
-			if config.Group != "" {
-				updates["group"] = config.Group
+			} else {
+				updates := map[string]interface{}{
+					"value":       config.Value,
+					"value_type":  config.ValueType,
+					"description": config.Description,
+				}
+				if config.Category != "" {
+					updates["category"] = config.Category
+				}
+				if config.Group != "" {
+					updates["group"] = config.Group
+				}
+				if err := tx.Model(&existingConfig).Updates(updates).Error; err != nil {
+					return err
+				}
 			}
 
-			if err := tx.Model(&existingConfig).Updates(updates).Error; err != nil {
-				tx.Rollback()
-				return err
-			}
-			s.logConfigChange(config.Key, config.Value, "BATCH_UPDATE")
+			changes = append(changes, configAuditChange{
+				key:       config.Key,
+				value:     config.Value,
+				operation: operation,
+			})
 		}
-
-		// 更新缓存
-		s.cache.Set(config.Key, config.Value, cache.DefaultExpiration)
+		return nil
+	}); err != nil {
+		return err
 	}
-
-	return tx.Commit().Error
+	s.logCommittedConfigChanges(changes)
+	return nil
 }
 
-// ClearCache 清空配置缓存
-func (s *ConfigService) ClearCache() {
-	s.cache.Flush()
-	log.Println("🧹 系统配置缓存已清空")
+type configAuditChange struct {
+	key       string
+	value     string
+	operation string
 }
 
-// GetCacheStats 获取缓存统计信息
-func (s *ConfigService) GetCacheStats() map[string]interface{} {
-	return map[string]interface{}{
-		"item_count":         s.cache.ItemCount(),
-		"default_expiration": "10m",
-		"cleanup_interval":   "30s",
+func (s *ConfigService) logCommittedConfigChanges(changes []configAuditChange) {
+	for _, change := range changes {
+		s.logConfigChange(change.key, change.value, change.operation)
 	}
 }
 
 // logConfigChange 记录配置变更日志
 func (s *ConfigService) logConfigChange(key, value, operation string) {
-	// 这里可以扩展为更完整的审计日志
-	log.Printf("📝 配置变更日志: %s %s = %s", operation, key, value)
+	digest := sha256.Sum256([]byte(value))
+	logger := s.auditLogger
+	if logger == nil {
+		logger = log.Default()
+	}
+	logger.Printf(
+		"配置变更：operation=%s key=%s value_sha256=%x",
+		operation,
+		key,
+		digest,
+	)
 }
 
 // ExportConfigs 导出配置到JSON
@@ -382,35 +352,26 @@ func (s *ConfigService) ImportConfigs(data []byte) error {
 		return fmt.Errorf("JSON格式错误: %v", err)
 	}
 
-	tx := s.db.Begin()
-	if tx.Error != nil {
-		return tx.Error
+	changes := make([]configAuditChange, 0, len(configs))
+	if err := s.db.Transaction(func(tx *gorm.DB) error {
+		for _, config := range configs {
+			if err := tx.Save(&config).Error; err != nil {
+				return fmt.Errorf("导入配置失败 %s: %v", config.Key, err)
+			}
+			changes = append(changes, configAuditChange{
+				key:       config.Key,
+				value:     config.Value,
+				operation: "IMPORT",
+			})
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
-
-	for _, config := range configs {
-		if err := tx.Save(&config).Error; err != nil {
-			tx.Rollback()
-			return fmt.Errorf("导入配置失败 %s: %v", config.Key, err)
-		}
-
-		// 更新缓存
-		s.cache.Set(config.Key, config.Value, cache.DefaultExpiration)
-
-		// 记录配置变更日志
-		s.logConfigChange(config.Key, config.Value, "IMPORT")
-	}
-
-	// 清空缓存以确保一致性
-	s.ClearCache()
-
+	s.logCommittedConfigChanges(changes)
 	log.Printf("✅ 成功导入 %d 个配置项", len(configs))
-	return tx.Commit().Error
+	return nil
 }
 
 // ValidateConfig 验证配置值

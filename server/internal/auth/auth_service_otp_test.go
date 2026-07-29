@@ -10,10 +10,13 @@ import (
 )
 
 type otpTestUserRepo struct {
-	user         *User
-	updateCalled bool
-	updateErr    error
-	lastUpdated  *User
+	user          *User
+	updateCalled  bool
+	updateErr     error
+	lastUpdated   *User
+	consumeCalled bool
+	consumeResult bool
+	consumeErr    error
 }
 
 func (r *otpTestUserRepo) Create(ctx context.Context, user *User) error { return nil }
@@ -48,6 +51,22 @@ func (r *otpTestUserRepo) LockUser(ctx context.Context, userID uint, until time.
 	return nil
 }
 func (r *otpTestUserRepo) UnlockUser(ctx context.Context, userID uint) error { return nil }
+func (r *otpTestUserRepo) ConfigureOTP(
+	context.Context,
+	uint,
+	string,
+	string,
+	bool,
+) error {
+	return nil
+}
+func (r *otpTestUserRepo) ReplaceBackupCodes(context.Context, uint, string) error {
+	return nil
+}
+func (r *otpTestUserRepo) ConsumeBackupCode(context.Context, uint, string) (bool, error) {
+	r.consumeCalled = true
+	return r.consumeResult, r.consumeErr
+}
 
 type noopOTPService struct{}
 
@@ -59,6 +78,7 @@ func (s *noopOTPService) GenerateBackupCodes() ([]string, error)              { 
 
 func TestVerifyOTP_BackupCodePersistsRemoval(t *testing.T) {
 	repo := &otpTestUserRepo{
+		consumeResult: true,
 		user: &User{
 			ID:          42,
 			OTPEnabled:  true,
@@ -76,26 +96,21 @@ func TestVerifyOTP_BackupCodePersistsRemoval(t *testing.T) {
 		t.Fatalf("expected backup code to validate, got error: %v", err)
 	}
 
-	if !repo.updateCalled {
-		t.Fatalf("expected userRepo.Update to be called when backup code is consumed")
-	}
-	if repo.lastUpdated == nil {
-		t.Fatalf("expected updated user snapshot")
-	}
-	if repo.lastUpdated.BackupCodes != "ZXCVBN" {
-		t.Fatalf("expected consumed backup code to be removed, got %q", repo.lastUpdated.BackupCodes)
+	if !repo.consumeCalled {
+		t.Fatalf("expected repository CAS consumption")
 	}
 }
 
 func TestVerifyOTP_BackupCodePersistFailureReturnsError(t *testing.T) {
 	repo := &otpTestUserRepo{
+		consumeResult: true,
+		consumeErr:    errors.New("db write failed"),
 		user: &User{
 			ID:          42,
 			OTPEnabled:  true,
 			OTPSecret:   "secret",
 			BackupCodes: "ABCDEF,ZXCVBN",
 		},
-		updateErr: errors.New("db write failed"),
 	}
 	svc := &AuthService{
 		userRepo:   repo,

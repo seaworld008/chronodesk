@@ -14,6 +14,7 @@ import (
 
 	"gongdan-system/internal/models"
 	"gongdan-system/internal/services"
+	"gorm.io/gorm"
 )
 
 // 错误定义
@@ -39,10 +40,12 @@ var (
 type UserRole string
 
 const (
-	RoleUser      UserRole = "user"
-	RoleAgent     UserRole = "agent"
-	RoleAdmin     UserRole = "admin"
-	RoleSuperUser UserRole = "superuser"
+	RoleUser       UserRole = "user"
+	RoleCustomer   UserRole = "customer"
+	RoleAgent      UserRole = "agent"
+	RoleSupervisor UserRole = "supervisor"
+	RoleAdmin      UserRole = "admin"
+	RoleSuperUser  UserRole = "superuser"
 )
 
 // UserStatus 用户状态枚举
@@ -57,110 +60,111 @@ const (
 
 // User 用户模型
 type User struct {
-	ID                uint       `json:"id" gorm:"primaryKey"`
-	Username          string     `json:"username" gorm:"uniqueIndex;not null"`
-	Email             string     `json:"email" gorm:"uniqueIndex;not null"`
-	PasswordHash      string     `json:"-" gorm:"not null"`
-	Role              UserRole   `json:"role" gorm:"default:'user'"`
-	Status            UserStatus `json:"status" gorm:"default:'active'"`
-	EmailVerified     bool       `json:"email_verified" gorm:"default:false"`
-	EmailVerifiedAt   *time.Time `json:"email_verified_at"`
-	LastLoginAt       *time.Time `json:"last_login_at"`
-	FailedLoginCount  int        `json:"failed_login_count" gorm:"default:0"`
-	LockedUntil       *time.Time `json:"locked_until"`
-	OTPEnabled        bool       `json:"otp_enabled" gorm:"default:false"`
-	OTPSecret         string     `json:"-"`
-	BackupCodes       string     `json:"-"`
-	PasswordChangedAt *time.Time `json:"password_changed_at"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
+	ID                uint           `json:"id" gorm:"primaryKey"`
+	Username          string         `json:"username" gorm:"uniqueIndex;not null"`
+	Email             string         `json:"email" gorm:"uniqueIndex;not null"`
+	PasswordHash      string         `json:"-" gorm:"not null"`
+	Role              UserRole       `json:"role" gorm:"default:'user'"`
+	Status            UserStatus     `json:"status" gorm:"default:'active'"`
+	EmailVerified     bool           `json:"email_verified" gorm:"default:false"`
+	EmailVerifiedAt   *time.Time     `json:"email_verified_at"`
+	LastLoginAt       *time.Time     `json:"last_login_at"`
+	FailedLoginCount  int            `json:"failed_login_count" gorm:"default:0"`
+	LockedUntil       *time.Time     `json:"locked_until"`
+	OTPEnabled        bool           `json:"otp_enabled" gorm:"default:false"`
+	OTPSecret         string         `json:"-"`
+	BackupCodes       string         `json:"-"`
+	PasswordChangedAt *time.Time     `json:"password_changed_at"`
+	CreatedAt         time.Time      `json:"created_at"`
+	UpdatedAt         time.Time      `json:"updated_at"`
+	DeletedAt         gorm.DeletedAt `json:"-" gorm:"index"`
 }
 
 // UserProfile 用户资料
 type UserProfile struct {
-	ID          uint      `json:"id" gorm:"primaryKey"`
-	UserID      uint      `json:"user_id" gorm:"uniqueIndex;not null"`
-	FirstName   string    `json:"first_name"`
-	LastName    string    `json:"last_name"`
-	DisplayName string    `json:"display_name"`
-	Avatar      string    `json:"avatar"`
-	Phone       string    `json:"phone"`
-	Department  string    `json:"department"`
-	Position    string    `json:"position"`
-	Timezone    string    `json:"timezone" gorm:"default:'UTC'"`
-	Language    string    `json:"language" gorm:"default:'en'"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	User        User      `json:"user" gorm:"foreignKey:UserID"`
+	ID          uint        `json:"id" gorm:"primaryKey"`
+	UserID      uint        `json:"user_id" gorm:"uniqueIndex;not null"`
+	FirstName   string      `json:"first_name"`
+	LastName    string      `json:"last_name"`
+	DisplayName string      `json:"display_name"`
+	Avatar      string      `json:"avatar"`
+	Phone       string      `json:"phone"`
+	Department  string      `json:"department"`
+	Position    string      `json:"position"`
+	Timezone    string      `json:"timezone" gorm:"default:'UTC'"`
+	Language    string      `json:"language" gorm:"default:'en'"`
+	CreatedAt   time.Time   `json:"created_at"`
+	UpdatedAt   time.Time   `json:"updated_at"`
+	User        models.User `json:"user" gorm:"foreignKey:UserID"`
 }
 
 // LoginAttempt 登录尝试记录
 type LoginAttempt struct {
-	ID         uint      `json:"id" gorm:"primaryKey"`
-	UserID     *uint     `json:"user_id"`
-	Email      string    `json:"email"`
-	IPAddress  string    `json:"ip_address"`
-	UserAgent  string    `json:"user_agent"`
-	Success    bool      `json:"success"`
-	FailReason string    `json:"fail_reason"`
-	CreatedAt  time.Time `json:"created_at"`
-	User       *User     `json:"user,omitempty" gorm:"foreignKey:UserID"`
+	ID         uint         `json:"id" gorm:"primaryKey"`
+	UserID     *uint        `json:"user_id"`
+	Email      string       `json:"email"`
+	IPAddress  string       `json:"ip_address"`
+	UserAgent  string       `json:"user_agent"`
+	Success    bool         `json:"success"`
+	FailReason string       `json:"fail_reason"`
+	CreatedAt  time.Time    `json:"created_at"`
+	User       *models.User `json:"user,omitempty" gorm:"foreignKey:UserID"`
 }
 
 // RefreshToken 刷新令牌
 type RefreshToken struct {
-	ID        uint       `json:"id" gorm:"primaryKey"`
-	UserID    uint       `json:"user_id" gorm:"not null"`
-	Token     string     `json:"token" gorm:"uniqueIndex;not null"`
-	SessionID string     `json:"session_id" gorm:"size:128;index"`
-	ExpiresAt time.Time  `json:"expires_at"`
-	Revoked   bool       `json:"revoked" gorm:"default:false"`
-	RevokedAt *time.Time `json:"revoked_at"`
-	IPAddress string     `json:"ip_address"`
-	UserAgent string     `json:"user_agent"`
-	CreatedAt time.Time  `json:"created_at"`
-	User      User       `json:"user" gorm:"foreignKey:UserID"`
+	ID        uint        `json:"id" gorm:"primaryKey"`
+	UserID    uint        `json:"user_id" gorm:"not null;index:idx_refresh_tokens_session_active,priority:1"`
+	Token     string      `json:"-" gorm:"uniqueIndex;not null"`
+	SessionID string      `json:"session_id" gorm:"size:128;not null;index;index:idx_refresh_tokens_session_active,priority:2"`
+	ExpiresAt time.Time   `json:"expires_at" gorm:"index:idx_refresh_tokens_session_active,priority:4"`
+	Revoked   bool        `json:"revoked" gorm:"default:false;index:idx_refresh_tokens_session_active,priority:3"`
+	RevokedAt *time.Time  `json:"revoked_at"`
+	IPAddress string      `json:"ip_address"`
+	UserAgent string      `json:"user_agent"`
+	CreatedAt time.Time   `json:"created_at"`
+	User      models.User `json:"user" gorm:"foreignKey:UserID"`
 }
 
 // EmailVerification 邮箱验证
 type EmailVerification struct {
-	ID        uint       `json:"id" gorm:"primaryKey"`
-	UserID    uint       `json:"user_id" gorm:"not null;index"`
-	Email     string     `json:"email" gorm:"size:255;not null"`
-	Token     string     `json:"token" gorm:"size:255;not null;uniqueIndex"`
-	Used      bool       `json:"used" gorm:"default:false"`
-	ExpiresAt time.Time  `json:"expires_at" gorm:"not null"`
-	UsedAt    *time.Time `json:"used_at"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
-	User      User       `json:"user" gorm:"foreignKey:UserID"`
+	ID        uint        `json:"id" gorm:"primaryKey"`
+	UserID    uint        `json:"user_id" gorm:"not null;index"`
+	Email     string      `json:"email" gorm:"size:255;not null"`
+	Token     string      `json:"-" gorm:"size:255;not null;uniqueIndex"`
+	Used      bool        `json:"used" gorm:"default:false"`
+	ExpiresAt time.Time   `json:"expires_at" gorm:"not null"`
+	UsedAt    *time.Time  `json:"used_at"`
+	CreatedAt time.Time   `json:"created_at"`
+	UpdatedAt time.Time   `json:"updated_at"`
+	User      models.User `json:"user" gorm:"foreignKey:UserID"`
 }
 
 // PasswordReset 密码重置
 type PasswordReset struct {
-	ID        uint       `json:"id" gorm:"primaryKey"`
-	UserID    uint       `json:"user_id" gorm:"not null;index"`
-	Email     string     `json:"email" gorm:"size:255;not null"`
-	Token     string     `json:"token" gorm:"size:255;not null;uniqueIndex"`
-	Used      bool       `json:"used" gorm:"default:false"`
-	ExpiresAt time.Time  `json:"expires_at" gorm:"not null"`
-	UsedAt    *time.Time `json:"used_at"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
-	User      User       `json:"user" gorm:"foreignKey:UserID"`
+	ID        uint        `json:"id" gorm:"primaryKey"`
+	UserID    uint        `json:"user_id" gorm:"not null;index"`
+	Email     string      `json:"email" gorm:"size:255;not null"`
+	Token     string      `json:"-" gorm:"size:255;not null;uniqueIndex"`
+	Used      bool        `json:"used" gorm:"default:false"`
+	ExpiresAt time.Time   `json:"expires_at" gorm:"not null"`
+	UsedAt    *time.Time  `json:"used_at"`
+	CreatedAt time.Time   `json:"created_at"`
+	UpdatedAt time.Time   `json:"updated_at"`
+	User      models.User `json:"user" gorm:"foreignKey:UserID"`
 }
 
 // OTPCode OTP验证码
 type OTPCode struct {
-	ID        uint       `json:"id" gorm:"primaryKey"`
-	UserID    uint       `json:"user_id" gorm:"not null"`
-	Code      string     `json:"code" gorm:"not null"`
-	Type      string     `json:"type" gorm:"not null"` // login, setup, backup
-	ExpiresAt time.Time  `json:"expires_at"`
-	Used      bool       `json:"used" gorm:"default:false"`
-	UsedAt    *time.Time `json:"used_at"`
-	CreatedAt time.Time  `json:"created_at"`
-	User      User       `json:"user" gorm:"foreignKey:UserID"`
+	ID        uint        `json:"id" gorm:"primaryKey"`
+	UserID    uint        `json:"user_id" gorm:"not null"`
+	Code      string      `json:"-" gorm:"not null"`
+	Type      string      `json:"type" gorm:"not null"` // login, setup, backup
+	ExpiresAt time.Time   `json:"expires_at"`
+	Used      bool        `json:"used" gorm:"default:false"`
+	UsedAt    *time.Time  `json:"used_at"`
+	CreatedAt time.Time   `json:"created_at"`
+	User      models.User `json:"user" gorm:"foreignKey:UserID"`
 }
 
 // RegisterRequest 注册请求
@@ -204,15 +208,7 @@ type ForgotPasswordRequest struct {
 // ResetPasswordRequest 重置密码请求
 type ResetPasswordRequest struct {
 	Token       string `json:"token" binding:"required"`
-	NewPassword string `json:"new_password" binding:"omitempty,min=8"`
-	Password    string `json:"password,omitempty" binding:"omitempty,min=8"`
-}
-
-func (r *ResetPasswordRequest) EffectivePassword() string {
-	if strings.TrimSpace(r.NewPassword) != "" {
-		return r.NewPassword
-	}
-	return r.Password
+	NewPassword string `json:"new_password" binding:"required,min=8"`
 }
 
 // ResendVerificationRequest 重发验证邮件请求
@@ -289,6 +285,9 @@ type UserRepository interface {
 	ResetFailedLogin(ctx context.Context, userID uint) error
 	LockUser(ctx context.Context, userID uint, until time.Time) error
 	UnlockUser(ctx context.Context, userID uint) error
+	ConfigureOTP(ctx context.Context, userID uint, secret, backupCodeHashes string, enabled bool) error
+	ReplaceBackupCodes(ctx context.Context, userID uint, backupCodeHashes string) error
+	ConsumeBackupCode(ctx context.Context, userID uint, code string) (bool, error)
 }
 
 // ProfileRepository 用户资料仓库接口
@@ -307,8 +306,14 @@ type TokenRepository interface {
 	GetRefreshToken(ctx context.Context, token string) (*RefreshToken, error)
 	// 撤销令牌
 	RevokeRefreshToken(ctx context.Context, token string) error
+	// 原子轮换刷新令牌：旧令牌条件撤销与新令牌创建同事务提交
+	RotateRefreshToken(ctx context.Context, currentToken string, replacement *RefreshToken) error
 	// 撤销用户所有令牌
 	RevokeAllUserTokens(ctx context.Context, userID uint) error
+	// 撤销一个登录会话的全部刷新令牌，使该会话签发的访问令牌立即失效
+	RevokeSession(ctx context.Context, userID uint, sessionID string) error
+	// 检查数据库中是否仍存在该会话的有效刷新令牌
+	IsSessionActive(ctx context.Context, userID uint, sessionID string) (bool, error)
 	// 清理过期令牌
 	CleanupExpiredTokens(ctx context.Context) error
 	// 创建邮箱验证
@@ -317,12 +322,20 @@ type TokenRepository interface {
 	GetEmailVerification(ctx context.Context, token string) (*EmailVerification, error)
 	// 使用邮箱验证
 	UseEmailVerification(ctx context.Context, token string) error
+	// 原子消费邮箱验证令牌并更新用户验证状态
+	VerifyEmailWithToken(ctx context.Context, token string, verifiedAt time.Time) (uint, error)
 	// 创建密码重置
 	CreatePasswordReset(ctx context.Context, reset *PasswordReset) error
 	// 获取密码重置
 	GetPasswordReset(ctx context.Context, token string) (*PasswordReset, error)
 	// 使用密码重置
 	UsePasswordReset(ctx context.Context, token string) error
+	// 原子消费密码重置令牌、更新密码并撤销现有会话
+	ResetPasswordWithToken(
+		ctx context.Context,
+		token, passwordHash string,
+		changedAt time.Time,
+	) (uint, error)
 
 	CreateOTPCode(ctx context.Context, otp *OTPCode) error
 	GetOTPCode(ctx context.Context, userID uint, code string) (*OTPCode, error)
@@ -455,21 +468,21 @@ type AuthConfig struct {
 
 // JWTManager JWT管理器接口
 type JWTManager interface {
-	GenerateTokenPair(userID uint, role UserRole) (accessToken, refreshToken string, err error)
+	GenerateTokenPair(userID uint, role UserRole, sessionID string) (accessToken, refreshToken string, err error)
 	VerifyAccessToken(token string) (*Claims, error)
 	VerifyRefreshToken(token string) (*Claims, error)
-	RevokeToken(token string) error
 	ParseTokenClaims(token string) (*Claims, error)
 }
 
 // Claims JWT声明
 type Claims struct {
-	UserID uint     `json:"user_id"`
-	Role   UserRole `json:"role"`
-	Type   string   `json:"type"` // access, refresh
-	Exp    int64    `json:"exp"`
-	Iat    int64    `json:"iat"`
-	Jti    string   `json:"jti"`
+	UserID    uint     `json:"user_id"`
+	Role      UserRole `json:"role"`
+	Type      string   `json:"type"` // access, refresh
+	SessionID string   `json:"sid"`
+	Exp       int64    `json:"exp"`
+	Iat       int64    `json:"iat"`
+	Jti       string   `json:"jti"`
 }
 
 // NewAuthService 创建认证服务
@@ -612,15 +625,15 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 		}, nil
 	}
 
-	// 生成令牌
-	accessToken, refreshToken, err := s.jwtManager.GenerateTokenPair(user.ID, user.Role)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate tokens: %w", err)
-	}
-
 	sessionID, err := GenerateSecureToken(16)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate session id: %w", err)
+	}
+	// 访问令牌与刷新令牌必须绑定同一个持久化会话。先生成会话 ID，
+	// 再签发令牌，旧的不含 sid 的令牌会按最新安全契约失效。
+	accessToken, refreshToken, err := s.jwtManager.GenerateTokenPair(user.ID, user.Role, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate tokens: %w", err)
 	}
 	loginTime := time.Now()
 
@@ -629,7 +642,18 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 		return nil, fmt.Errorf("failed to save refresh token: %w", err)
 	}
 
-	s.recordLoginHistorySuccess(ctx, user, ipAddress, userAgent, sessionID, loginTime, determineLoginMethod(user, nil, false, false))
+	if err := s.recordLoginHistorySuccess(
+		ctx,
+		user,
+		ipAddress,
+		userAgent,
+		sessionID,
+		loginTime,
+		determineLoginMethod(user, nil, false, false),
+	); err != nil {
+		_ = s.tokenRepo.RevokeSession(ctx, user.ID, sessionID)
+		return nil, fmt.Errorf("failed to persist login session: %w", err)
+	}
 
 	return &AuthResponse{
 		User:         s.buildUserInfo(user, profile),
@@ -696,20 +720,6 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 		return nil, ErrInvalidCredentials
 	}
 
-	// 密码校验成功后，若仍是历史哈希格式则静默升级为bcrypt。
-	if !strings.HasPrefix(user.PasswordHash, "$2") {
-		if upgradedHash, hashErr := s.passwordService.HashPassword(req.Password); hashErr != nil {
-			fmt.Printf("Warning: failed to upgrade legacy password hash for user %d: %v\n", user.ID, hashErr)
-		} else {
-			originalHash := user.PasswordHash
-			user.PasswordHash = upgradedHash
-			if err := s.userRepo.Update(ctx, user); err != nil {
-				user.PasswordHash = originalHash
-				fmt.Printf("Warning: failed to persist upgraded password hash for user %d: %v\n", user.ID, err)
-			}
-		}
-	}
-
 	// 检查是否需要OTP验证
 	if user.OTPEnabled && !deviceTrusted {
 		if req.OTPCode == "" {
@@ -721,15 +731,15 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 
 		if !s.otpService.VerifyCode(user.OTPSecret, req.OTPCode) {
 			// 检查是否是备用码
-			if !s.verifyBackupCode(user, req.OTPCode) {
+			consumed, consumeErr := s.userRepo.ConsumeBackupCode(ctx, user.ID, req.OTPCode)
+			if consumeErr != nil {
+				return nil, fmt.Errorf("failed to consume backup code: %w", consumeErr)
+			}
+			if !consumed {
 				method := determineLoginMethod(user, req, deviceTrusted, false)
 				s.recordLoginAttempt(ctx, &user.ID, req.Email, ipAddress, userAgent, false, "invalid OTP")
 				s.recordLoginHistoryFailure(ctx, user, ipAddress, userAgent, method, "invalid OTP", models.LoginStatusFailed)
 				return nil, ErrInvalidOTP
-			}
-			// 使用备用码后持久化剩余的备用码集合
-			if err := s.userRepo.Update(ctx, user); err != nil {
-				fmt.Printf("Warning: failed to persist backup code usage for user %d: %v\n", user.ID, err)
 			}
 			otpValidated = true
 		}
@@ -751,15 +761,13 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 	// 记录成功登录
 	s.recordLoginAttempt(ctx, &user.ID, req.Email, ipAddress, userAgent, true, "")
 
-	// 生成令牌
-	accessToken, refreshToken, err := s.jwtManager.GenerateTokenPair(user.ID, user.Role)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate tokens: %w", err)
-	}
-
 	sessionID, err := GenerateSecureToken(16)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate session id: %w", err)
+	}
+	accessToken, refreshToken, err := s.jwtManager.GenerateTokenPair(user.ID, user.Role, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate tokens: %w", err)
 	}
 
 	// 保存刷新令牌
@@ -768,7 +776,18 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 	}
 
 	loginMethod := determineLoginMethod(user, req, deviceTrusted, otpValidated)
-	s.recordLoginHistorySuccess(ctx, user, ipAddress, userAgent, sessionID, now, loginMethod)
+	if err := s.recordLoginHistorySuccess(
+		ctx,
+		user,
+		ipAddress,
+		userAgent,
+		sessionID,
+		now,
+		loginMethod,
+	); err != nil {
+		_ = s.tokenRepo.RevokeSession(ctx, user.ID, sessionID)
+		return nil, fmt.Errorf("failed to persist login session: %w", err)
+	}
 
 	var trustedDeviceToken string
 	if s.trustedDeviceRepo != nil {
@@ -837,12 +856,15 @@ func (s *AuthService) RefreshToken(ctx context.Context, req *RefreshTokenRequest
 		return nil, ErrInvalidToken
 	}
 	sessionID := tokenRecord.SessionID
-	if sessionID == "" {
-		if generatedSessionID, genErr := GenerateSecureToken(16); genErr == nil {
-			sessionID = generatedSessionID
-		} else {
-			sessionID = fmt.Sprintf("fallback-%d", time.Now().UnixNano())
-		}
+	if sessionID == "" || claims.SessionID != sessionID || claims.UserID != tokenRecord.UserID {
+		return nil, ErrInvalidToken
+	}
+	sessionActive, err := s.tokenRepo.IsSessionActive(ctx, tokenRecord.UserID, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify login session: %w", err)
+	}
+	if !sessionActive {
+		return nil, ErrInvalidToken
 	}
 
 	// 获取用户
@@ -855,19 +877,33 @@ func (s *AuthService) RefreshToken(ctx context.Context, req *RefreshTokenRequest
 	if err := s.checkUserStatus(ctx, user); err != nil {
 		return nil, err
 	}
-
-	// 撤销旧的刷新令牌
-	s.tokenRepo.RevokeRefreshToken(ctx, req.RefreshToken)
+	// 密码变更会使此前签发的所有凭据失效。这里使用数据库中刷新令牌的
+	// 高精度创建时间，而不是只有秒精度的 JWT iat，避免同一秒内修改密码
+	// 时旧刷新令牌重新签发可用的访问令牌。
+	if user.PasswordChangedAt != nil && !tokenRecord.CreatedAt.After(*user.PasswordChangedAt) {
+		_ = s.tokenRepo.RevokeSession(ctx, tokenRecord.UserID, sessionID)
+		return nil, ErrInvalidToken
+	}
 
 	// 生成新的令牌对
-	accessToken, refreshToken, err := s.jwtManager.GenerateTokenPair(user.ID, user.Role)
+	accessToken, refreshToken, err := s.jwtManager.GenerateTokenPair(user.ID, user.Role, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate tokens: %w", err)
 	}
 
-	// 保存新的刷新令牌
-	if err := s.saveRefreshToken(ctx, user.ID, refreshToken, sessionID, ipAddress, userAgent); err != nil {
-		return nil, fmt.Errorf("failed to save refresh token: %w", err)
+	// 旧令牌条件撤销与新令牌创建必须同事务提交，确保并发轮换只有一个成功。
+	replacement, err := s.newRefreshTokenRecord(
+		user.ID,
+		refreshToken,
+		sessionID,
+		ipAddress,
+		userAgent,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.tokenRepo.RotateRefreshToken(ctx, req.RefreshToken, replacement); err != nil {
+		return nil, fmt.Errorf("failed to rotate refresh token: %w", err)
 	}
 
 	if s.loginHistoryRepo != nil && sessionID != "" {
@@ -902,27 +938,40 @@ func (s *AuthService) Logout(ctx context.Context, refreshToken string) error {
 	if tokenRecord, err := s.tokenRepo.GetRefreshToken(ctx, refreshToken); err == nil {
 		userID = tokenRecord.UserID
 		sessionID = tokenRecord.SessionID
-	} else if claims, parseErr := s.jwtManager.ParseTokenClaims(refreshToken); parseErr == nil {
-		userID = claims.UserID
 	}
 
+	if userID != 0 && sessionID != "" {
+		if err := s.tokenRepo.RevokeSession(ctx, userID, sessionID); err != nil {
+			return err
+		}
+	} else {
+		// Invalid and already-revoked refresh tokens keep logout idempotent without
+		// allowing unsigned ParseTokenClaims data to revoke another user's session.
+		if err := s.tokenRepo.RevokeRefreshToken(ctx, refreshToken); err != nil &&
+			!errors.Is(err, ErrInvalidToken) {
+			return err
+		}
+		return nil
+	}
 	if s.loginHistoryRepo != nil && userID != 0 && sessionID != "" {
 		if err := s.loginHistoryRepo.EndSession(ctx, userID, sessionID, models.LoginStatusSuccess, "", time.Now()); err != nil {
 			fmt.Printf("Warning: failed to mark session logout: %v\n", err)
 		}
 	}
-
-	return s.tokenRepo.RevokeRefreshToken(ctx, refreshToken)
+	return nil
 }
 
 // LogoutAll 登出所有设备
 func (s *AuthService) LogoutAll(ctx context.Context, userID uint) error {
+	if err := s.tokenRepo.RevokeAllUserTokens(ctx, userID); err != nil {
+		return err
+	}
 	if s.loginHistoryRepo != nil {
 		if err := s.loginHistoryRepo.EndAllSessions(ctx, userID, models.LoginStatusExpired, "logout_all", time.Now()); err != nil {
 			fmt.Printf("Warning: failed to end all sessions for user %d: %v\n", userID, err)
 		}
 	}
-	return s.tokenRepo.RevokeAllUserTokens(ctx, userID)
+	return nil
 }
 
 // ForgotPassword 忘记密码
@@ -980,37 +1029,24 @@ func (s *AuthService) ResetPassword(ctx context.Context, token, newPassword stri
 		return err
 	}
 
-	// 获取用户
-	user, err := s.userRepo.GetByID(ctx, reset.UserID)
-	if err != nil {
-		return fmt.Errorf("failed to get user: %w", err)
-	}
-
 	// 哈希新密码
 	hashedPassword, err := s.passwordService.HashPassword(newPassword)
 	if err != nil {
 		return fmt.Errorf("failed to hash password: %w", err)
 	}
 
-	// 更新用户密码
-	user.PasswordHash = hashedPassword
-	user.PasswordChangedAt = timePtr(time.Now())
-	user.FailedLoginCount = 0
-	user.LockedUntil = nil
-
-	err = s.userRepo.Update(ctx, user)
-	if err != nil {
-		return fmt.Errorf("failed to update user: %w", err)
+	// 条件消费令牌、更新密码与撤销会话在同一事务中完成。
+	if _, err := s.tokenRepo.ResetPasswordWithToken(
+		ctx,
+		token,
+		hashedPassword,
+		time.Now(),
+	); err != nil {
+		if errors.Is(err, ErrInvalidToken) {
+			return ErrInvalidToken
+		}
+		return fmt.Errorf("failed to reset password: %w", err)
 	}
-
-	// 标记令牌为已使用
-	err = s.tokenRepo.UsePasswordReset(ctx, token)
-	if err != nil {
-		return fmt.Errorf("failed to mark token as used: %w", err)
-	}
-
-	// 撤销所有刷新令牌
-	_ = s.tokenRepo.RevokeAllUserTokens(ctx, user.ID)
 
 	return nil
 }
@@ -1033,19 +1069,12 @@ func (s *AuthService) VerifyEmail(ctx context.Context, token string) error {
 		return fmt.Errorf("failed to get user: %w", err)
 	}
 
-	// 更新用户邮箱验证状态
-	user.EmailVerified = true
-	user.EmailVerifiedAt = timePtr(time.Now())
-
-	err = s.userRepo.Update(ctx, user)
-	if err != nil {
-		return fmt.Errorf("failed to update user: %w", err)
-	}
-
-	// 标记验证为已使用
-	err = s.tokenRepo.UseEmailVerification(ctx, token)
-	if err != nil {
-		return fmt.Errorf("failed to mark verification as used: %w", err)
+	// 条件消费令牌与更新用户状态在同一事务中完成。
+	if _, err := s.tokenRepo.VerifyEmailWithToken(ctx, token, time.Now()); err != nil {
+		if errors.Is(err, ErrInvalidToken) {
+			return ErrInvalidToken
+		}
+		return fmt.Errorf("failed to verify email: %w", err)
 	}
 
 	// 发送欢迎邮件
@@ -1153,7 +1182,9 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID uint, currentPa
 	}
 
 	// 撤销所有刷新令牌（强制重新登录）
-	_ = s.tokenRepo.RevokeAllUserTokens(ctx, user.ID)
+	if err := s.tokenRepo.RevokeAllUserTokens(ctx, user.ID); err != nil {
+		return fmt.Errorf("failed to revoke login sessions: %w", err)
+	}
 
 	return nil
 }
@@ -1197,14 +1228,19 @@ func (s *AuthService) EnableOTP(ctx context.Context, userID uint, password strin
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate backup codes: %w", err)
 	}
+	backupCodeHashes, err := hashBackupCodes(backupCodes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to protect backup codes: %w", err)
+	}
 
 	// 更新用户OTP设置
-	user.OTPSecret = secret
-	user.OTPEnabled = true
-	user.BackupCodes = strings.Join(backupCodes, ",")
-
-	err = s.userRepo.Update(ctx, user)
-	if err != nil {
+	if err := s.userRepo.ConfigureOTP(
+		ctx,
+		user.ID,
+		secret,
+		backupCodeHashes,
+		true,
+	); err != nil {
 		return nil, fmt.Errorf("failed to update user: %w", err)
 	}
 
@@ -1229,13 +1265,8 @@ func (s *AuthService) DisableOTP(ctx context.Context, userID uint, password stri
 		return ErrInvalidCredentials
 	}
 
-	// 禁用OTP
-	user.OTPEnabled = false
-	user.OTPSecret = ""
-	user.BackupCodes = ""
-
-	err = s.userRepo.Update(ctx, user)
-	if err != nil {
+	// 禁用OTP并清除所有静态凭据。
+	if err := s.userRepo.ConfigureOTP(ctx, user.ID, "", "", false); err != nil {
 		return fmt.Errorf("failed to update user: %w", err)
 	}
 
@@ -1261,10 +1292,11 @@ func (s *AuthService) VerifyOTP(ctx context.Context, userID uint, code string) e
 	}
 
 	// 检查备用码
-	if s.verifyBackupCode(user, code) {
-		if err := s.userRepo.Update(ctx, user); err != nil {
-			return fmt.Errorf("failed to persist backup code usage: %w", err)
-		}
+	consumed, err := s.userRepo.ConsumeBackupCode(ctx, user.ID, code)
+	if err != nil {
+		return fmt.Errorf("failed to consume backup code: %w", err)
+	}
+	if consumed {
 		return nil
 	}
 
@@ -1289,12 +1321,13 @@ func (s *AuthService) GenerateBackupCodes(ctx context.Context, userID uint) ([]s
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate backup codes: %w", err)
 	}
+	backupCodeHashes, err := hashBackupCodes(backupCodes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to protect backup codes: %w", err)
+	}
 
 	// 更新用户备用码
-	user.BackupCodes = strings.Join(backupCodes, ",")
-
-	err = s.userRepo.Update(ctx, user)
-	if err != nil {
+	if err := s.userRepo.ReplaceBackupCodes(ctx, user.ID, backupCodeHashes); err != nil {
 		return nil, fmt.Errorf("failed to update user: %w", err)
 	}
 
@@ -1359,15 +1392,35 @@ func (s *AuthService) recordLoginAttempt(ctx context.Context, userID *uint, emai
 }
 
 func (s *AuthService) saveRefreshToken(ctx context.Context, userID uint, token, sessionID, ipAddress, userAgent string) error {
-	refreshToken := &RefreshToken{
+	refreshToken, err := s.newRefreshTokenRecord(
+		userID,
+		token,
+		sessionID,
+		ipAddress,
+		userAgent,
+	)
+	if err != nil {
+		return err
+	}
+	return s.tokenRepo.CreateRefreshToken(ctx, refreshToken)
+}
+
+func (s *AuthService) newRefreshTokenRecord(
+	userID uint,
+	token, sessionID, ipAddress, userAgent string,
+) (*RefreshToken, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if userID == 0 || sessionID == "" || len(sessionID) > 128 {
+		return nil, errors.New("valid user and session identifiers are required")
+	}
+	return &RefreshToken{
 		UserID:    userID,
 		Token:     token,
 		SessionID: sessionID,
 		ExpiresAt: time.Now().Add(s.config.RefreshTokenExpire),
 		IPAddress: ipAddress,
 		UserAgent: userAgent,
-	}
-	return s.tokenRepo.CreateRefreshToken(ctx, refreshToken)
+	}, nil
 }
 
 func (s *AuthService) sendEmailVerification(ctx context.Context, user *User) error {
@@ -1390,26 +1443,15 @@ func (s *AuthService) sendEmailVerification(ctx context.Context, user *User) err
 	return s.emailService.SendVerificationEmail(ctx, user.Email, token)
 }
 
-func (s *AuthService) verifyBackupCode(user *User, code string) bool {
-	if user.BackupCodes == "" {
-		return false
-	}
-
-	codes := strings.Split(user.BackupCodes, ",")
-	for i, backupCode := range codes {
-		if backupCode == code {
-			// 移除已使用的备用码
-			codes = append(codes[:i], codes[i+1:]...)
-			user.BackupCodes = strings.Join(codes, ",")
-			return true
-		}
-	}
-	return false
-}
-
-func (s *AuthService) recordLoginHistorySuccess(ctx context.Context, user *User, ipAddress, userAgent, sessionID string, loginTime time.Time, method string) {
+func (s *AuthService) recordLoginHistorySuccess(
+	ctx context.Context,
+	user *User,
+	ipAddress, userAgent, sessionID string,
+	loginTime time.Time,
+	method string,
+) error {
 	if s.loginHistoryRepo == nil || user == nil {
-		return
+		return errors.New("login session repository is unavailable")
 	}
 
 	deviceType, operatingSystem, browser := extractDeviceContext(userAgent)
@@ -1431,9 +1473,7 @@ func (s *AuthService) recordLoginHistorySuccess(ctx context.Context, user *User,
 		IsActive:        true,
 	}
 
-	if err := s.loginHistoryRepo.Create(ctx, history); err != nil {
-		fmt.Printf("Warning: failed to record login history: %v\n", err)
-	}
+	return s.loginHistoryRepo.Create(ctx, history)
 }
 
 func (s *AuthService) recordLoginHistoryFailure(ctx context.Context, user *User, ipAddress, userAgent, method string, reason string, status models.LoginStatus) {
@@ -1671,7 +1711,7 @@ func timePtr(t time.Time) *time.Time {
 // ValidateRole 验证角色是否有效
 func ValidateRole(role string) bool {
 	switch UserRole(role) {
-	case RoleUser, RoleAgent, RoleAdmin, RoleSuperUser:
+	case RoleUser, RoleCustomer, RoleAgent, RoleSupervisor, RoleAdmin, RoleSuperUser:
 		return true
 	default:
 		return false
@@ -1691,10 +1731,12 @@ func ValidateStatus(status string) bool {
 // HasPermission 检查用户是否有指定权限
 func (u *User) HasPermission(requiredRole UserRole) bool {
 	roleHierarchy := map[UserRole]int{
-		RoleUser:      1,
-		RoleAgent:     2,
-		RoleAdmin:     3,
-		RoleSuperUser: 4,
+		RoleUser:       1,
+		RoleCustomer:   1,
+		RoleAgent:      2,
+		RoleSupervisor: 3,
+		RoleAdmin:      3,
+		RoleSuperUser:  4,
 	}
 
 	userLevel, exists := roleHierarchy[u.Role]

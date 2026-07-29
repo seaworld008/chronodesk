@@ -149,6 +149,14 @@ func (h *TicketHandler) GetTickets(c *gin.Context) {
 		}
 	}
 
+	// 对象级可见性：客户只能列出自己创建的工单。显式 created_by
+	// 参数不能扩大其可见范围。
+	if isCustomerRole(normalizedUserRole(c)) {
+		if userID := c.GetUint("user_id"); userID > 0 {
+			filters.CreatorID = &userID
+		}
+	}
+
 	// 获取工单列表
 	tickets, total, err := h.ticketService.GetTickets(ctx, filters)
 	if err != nil {
@@ -156,10 +164,7 @@ func (h *TicketHandler) GetTickets(c *gin.Context) {
 		return
 	}
 
-	responses := make([]*models.TicketResponse, len(tickets))
-	for i, ticket := range tickets {
-		responses[i] = ticket.ToResponse()
-	}
+	responses := ticketListResponseForRole(tickets, normalizedUserRole(c))
 
 	h.response.List(c, responses, total, page, pageSize, "获取工单列表成功")
 }
@@ -241,8 +246,11 @@ func (h *TicketHandler) GetTicket(c *gin.Context) {
 	}
 
 	// 获取工单
-	ticket, err := h.ticketService.GetTicket(ctx, uint(id))
+	ticket, err := authorizeTicket(ctx, c, h.ticketService, uint(id), ticketAccessRead)
 	if err != nil {
+		if writeTicketAuthorizationError(c, err) {
+			return
+		}
 		if err.Error() == "ticket not found" {
 			h.response.NotFound(c, "工单不存在")
 			return
@@ -251,7 +259,7 @@ func (h *TicketHandler) GetTicket(c *gin.Context) {
 		return
 	}
 
-	h.response.Success(c, ticket.ToResponse(), "获取工单成功")
+	h.response.Success(c, ticketResponseForRole(ticket, normalizedUserRole(c)), "获取工单成功")
 }
 
 // CreateTicket 创建工单
@@ -262,6 +270,10 @@ func (h *TicketHandler) CreateTicket(c *gin.Context) {
 	var req models.TicketCreateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.response.BadRequest(c, "请求格式错误: "+err.Error())
+		return
+	}
+	if isCustomerRole(normalizedUserRole(c)) && (req.Status != nil || req.AssignedToID != nil) {
+		h.response.Forbidden(c, "客户创建工单时不能指定状态或处理人")
 		return
 	}
 
@@ -279,7 +291,7 @@ func (h *TicketHandler) CreateTicket(c *gin.Context) {
 		return
 	}
 
-	h.response.Created(c, ticket.ToResponse(), "工单创建成功")
+	h.response.Created(c, ticketResponseForRole(ticket, normalizedUserRole(c)), "工单创建成功")
 }
 
 // UpdateTicket 更新工单
@@ -308,6 +320,24 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 		}
 	}
 
+	authorizedTicket, err := authorizeTicket(ctx, c, h.ticketService, uint(id), ticketAccessUpdate)
+	if err != nil {
+		if writeTicketAuthorizationError(c, err) {
+			return
+		}
+		if err.Error() == "ticket not found" {
+			h.response.NotFound(c, "工单不存在")
+			return
+		}
+		h.response.InternalServerError(c, "工单权限检查失败")
+		return
+	}
+	if isCustomerRole(normalizedUserRole(c)) &&
+		(req.Status != nil || req.AssignedToID != nil || req.InternalNotes != nil) {
+		h.response.Forbidden(c, "客户不能修改工单状态、处理人或内部备注")
+		return
+	}
+
 	// 获取当前用户ID
 	userID, exists := c.Get("user_id")
 	if !exists {
@@ -316,8 +346,23 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 	}
 
 	// 更新工单
-	ticket, err := h.ticketService.UpdateTicket(ctx, uint(id), &req, userID.(uint))
+	versionedService, ok := h.ticketService.(TicketVersionedService)
+	if !ok {
+		h.response.InternalServerError(c, "工单服务未启用授权版本校验")
+		return
+	}
+	ticket, err := versionedService.UpdateTicketExpectedVersion(
+		ctx,
+		uint(id),
+		&req,
+		userID.(uint),
+		authorizedTicket.Version,
+	)
 	if err != nil {
+		if errors.Is(err, services.ErrVersionConflict) {
+			h.response.Error(c, http.StatusConflict, "version_conflict", "工单已被其他操作更新，请刷新后重试")
+			return
+		}
 		if errors.Is(err, services.ErrInvalidTicketTransition) {
 			h.response.BadRequest(c, err.Error())
 			return
@@ -330,7 +375,7 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 		return
 	}
 
-	h.response.Success(c, ticket.ToResponse(), "工单更新成功")
+	h.response.Success(c, ticketResponseForRole(ticket, normalizedUserRole(c)), "工单更新成功")
 }
 
 // DeleteTicket 删除工单
@@ -363,6 +408,10 @@ func (h *TicketHandler) DeleteTicket(c *gin.Context) {
 		h.response.InternalServerError(c, "无效的角色类型")
 		return
 	}
+	if !isPrivilegedRole(strings.ToLower(strings.TrimSpace(role))) {
+		h.response.Forbidden(c, "仅管理员或主管可以删除工单")
+		return
+	}
 
 	userID, ok := userIDValue.(uint)
 	if !ok {
@@ -386,11 +435,12 @@ func (h *TicketHandler) DeleteTicket(c *gin.Context) {
 
 // AssignTicket 分配工单
 func (h *TicketHandler) AssignTicket(c *gin.Context) {
+	ctx := c.Request.Context()
 	// 解析工单ID
 	idStr := c.Param("id")
 	id, err := strconv.ParseUint(idStr, 10, 32)
 	if err != nil {
-		h.response.Error(c, http.StatusBadRequest, "invalid_ticket_id", "Invalid ticket ID")
+		h.response.Error(c, http.StatusBadRequest, "invalid_ticket_id", "工单 ID 无效")
 		return
 	}
 
@@ -399,35 +449,63 @@ func (h *TicketHandler) AssignTicket(c *gin.Context) {
 		AssignedToID *uint `json:"assigned_to_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		h.response.Error(c, http.StatusBadRequest, "invalid_request", "Invalid request format: "+err.Error())
+		h.response.Error(c, http.StatusBadRequest, "invalid_request", "请求格式无效")
 		return
 	}
 
 	// 获取当前用户ID
 	userID, exists := c.Get("user_id")
 	if !exists {
-		h.response.Error(c, http.StatusUnauthorized, "unauthorized", "User not authenticated")
+		h.response.Error(c, http.StatusUnauthorized, "unauthorized", "用户未登录")
 		return
 	}
 
 	// 验证分配用户ID
 	if req.AssignedToID == nil {
-		h.response.Error(c, http.StatusBadRequest, "invalid_request", "assigned_to_id is required")
+		h.response.Error(c, http.StatusBadRequest, "invalid_request", "必须指定处理人")
+		return
+	}
+
+	authorizedTicket, err := authorizeTicket(ctx, c, h.ticketService, uint(id), ticketAccessWorkflow)
+	if err != nil {
+		if writeTicketAuthorizationError(c, err) {
+			return
+		}
+		if err.Error() == "ticket not found" {
+			h.response.Error(c, http.StatusNotFound, "ticket_not_found", "工单不存在")
+			return
+		}
+		h.response.InternalServerError(c, "工单权限检查失败")
+		return
+	}
+	versionedService, ok := h.ticketService.(TicketVersionedService)
+	if !ok {
+		h.response.InternalServerError(c, "工单服务未启用授权版本校验")
 		return
 	}
 
 	// 分配工单
-	ticket, err := h.ticketService.AssignTicket(uint(id), *req.AssignedToID, userID.(uint), "")
+	ticket, err := versionedService.AssignTicketExpectedVersion(
+		uint(id),
+		*req.AssignedToID,
+		userID.(uint),
+		"",
+		authorizedTicket.Version,
+	)
 	if err != nil {
-		if err.Error() == "ticket not found" {
-			h.response.Error(c, http.StatusNotFound, "ticket_not_found", "Ticket not found")
+		if errors.Is(err, services.ErrVersionConflict) {
+			h.response.Error(c, http.StatusConflict, "version_conflict", "工单已被其他操作更新，请刷新后重试")
 			return
 		}
-		h.response.Error(c, http.StatusInternalServerError, "assign_ticket_failed", "Failed to assign ticket: "+err.Error())
+		if err.Error() == "ticket not found" {
+			h.response.Error(c, http.StatusNotFound, "ticket_not_found", "工单不存在")
+			return
+		}
+		h.response.Error(c, http.StatusInternalServerError, "assign_ticket_failed", "分配工单失败")
 		return
 	}
 
-	h.response.Success(c, ticket, "Ticket assigned successfully")
+	h.response.Success(c, ticketResponseForRole(ticket, normalizedUserRole(c)), "工单分配成功")
 }
 
 // GetTicketStats 获取工单统计
@@ -461,14 +539,18 @@ func (h *TicketHandler) BulkUpdateTickets(c *gin.Context) {
 		Updates   models.TicketUpdateRequest `json:"updates" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		h.response.Error(c, http.StatusBadRequest, "invalid_request", "Invalid request format: "+err.Error())
+		h.response.Error(c, http.StatusBadRequest, "invalid_request", "请求格式无效")
 		return
 	}
 
 	// 获取当前用户ID
 	userID, exists := c.Get("user_id")
 	if !exists {
-		h.response.Error(c, http.StatusUnauthorized, "unauthorized", "User not authenticated")
+		h.response.Error(c, http.StatusUnauthorized, "unauthorized", "用户未登录")
+		return
+	}
+	if !isPrivilegedRole(normalizedUserRole(c)) {
+		h.response.Forbidden(c, "仅管理员或主管可以批量更新工单")
 		return
 	}
 
@@ -498,15 +580,23 @@ func (h *TicketHandler) BulkUpdateTickets(c *gin.Context) {
 	// 批量更新工单
 	err := h.ticketService.BulkUpdateTickets(ctx, bulkReq, userID.(uint))
 	if err != nil {
+		if errors.Is(err, services.ErrVersionConflict) {
+			h.response.Error(c, http.StatusConflict, "version_conflict", "批量更新遇到并发修改，所有工单均未更新")
+			return
+		}
 		if errors.Is(err, services.ErrInvalidTicketTransition) {
 			h.response.Error(c, http.StatusBadRequest, "invalid_status_transition", err.Error())
 			return
 		}
-		h.response.Error(c, http.StatusInternalServerError, "bulk_update_failed", "Failed to bulk update tickets: "+err.Error())
+		if errors.Is(err, services.ErrInvalidBulkTicketUpdate) {
+			h.response.Error(c, http.StatusBadRequest, "invalid_bulk_update", err.Error())
+			return
+		}
+		h.response.Error(c, http.StatusInternalServerError, "bulk_update_failed", "批量更新工单失败")
 		return
 	}
 
-	h.response.Success(c, nil, "Tickets updated successfully")
+	h.response.Success(c, nil, "工单批量更新成功")
 }
 
 // BulkDeleteTickets 批量删除工单
@@ -517,13 +607,13 @@ func (h *TicketHandler) BulkDeleteTickets(c *gin.Context) {
 		IDs []uint `json:"ids" binding:"required,min=1,max=100,unique,dive,gt=0"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		h.response.Error(c, http.StatusBadRequest, "invalid_request", "Invalid request format: "+err.Error())
+		h.response.Error(c, http.StatusBadRequest, "invalid_request", "请求格式无效")
 		return
 	}
 
 	userIDValue, exists := c.Get("user_id")
 	if !exists {
-		h.response.Error(c, http.StatusUnauthorized, "unauthorized", "User not authenticated")
+		h.response.Error(c, http.StatusUnauthorized, "unauthorized", "用户未登录")
 		return
 	}
 	userID, ok := userIDValue.(uint)
@@ -540,6 +630,10 @@ func (h *TicketHandler) BulkDeleteTickets(c *gin.Context) {
 	userRole, ok := userRoleValue.(string)
 	if !ok {
 		h.response.InternalServerError(c, "无效的角色类型")
+		return
+	}
+	if !isPrivilegedRole(strings.ToLower(strings.TrimSpace(userRole))) {
+		h.response.Forbidden(c, "仅管理员或主管可以批量删除工单")
 		return
 	}
 
@@ -582,10 +676,21 @@ func (h *TicketHandler) GetTicketHistory(c *gin.Context) {
 	ticketIDStr := c.Param("id")
 	ticketIDValue, err := strconv.ParseUint(ticketIDStr, 10, strconv.IntSize)
 	if err != nil {
-		h.response.Error(c, http.StatusBadRequest, "invalid_ticket_id", "Invalid ticket ID format")
+		h.response.Error(c, http.StatusBadRequest, "invalid_ticket_id", "工单 ID 格式无效")
 		return
 	}
 	ticketID := uint(ticketIDValue)
+	if _, err := authorizeTicket(c.Request.Context(), c, h.ticketService, ticketID, ticketAccessRead); err != nil {
+		if writeTicketAuthorizationError(c, err) {
+			return
+		}
+		if err.Error() == "ticket not found" {
+			h.response.NotFound(c, "工单不存在")
+			return
+		}
+		h.response.InternalServerError(c, "工单权限检查失败")
+		return
+	}
 
 	// 解析查询参数
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -623,15 +728,11 @@ func (h *TicketHandler) GetTicketHistory(c *gin.Context) {
 	// 获取历史记录
 	histories, _, err := h.ticketService.GetTicketHistory(ticketID)
 	if err != nil {
-		h.response.Error(c, http.StatusInternalServerError, "get_history_failed", "Failed to get ticket history: "+err.Error())
+		h.response.Error(c, http.StatusInternalServerError, "get_history_failed", "获取工单历史记录失败")
 		return
 	}
 
-	// 转换为响应格式
-	responses := make([]*models.TicketHistoryResponse, len(histories))
-	for i, history := range histories {
-		responses[i] = history.ToResponse()
-	}
+	responses := ticketHistoryResponses(histories, isCustomerRole(normalizedUserRole(c)))
 
 	h.response.Success(c, responses, "获取工单历史记录成功")
 }

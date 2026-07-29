@@ -53,35 +53,41 @@ type JWTHeader struct {
 
 // JWTPayload JWT载荷
 type JWTPayload struct {
-	UserID uint     `json:"user_id"`
-	Role   UserRole `json:"role"`
-	Type   string   `json:"type"` // access, refresh
-	Iss    string   `json:"iss"`  // issuer
-	Sub    string   `json:"sub"`  // subject
-	Aud    string   `json:"aud"`  // audience
-	Exp    int64    `json:"exp"`  // expiration time
-	Nbf    int64    `json:"nbf"`  // not before
-	Iat    int64    `json:"iat"`  // issued at
-	Jti    string   `json:"jti"`  // JWT ID
+	UserID    uint     `json:"user_id"`
+	Role      UserRole `json:"role"`
+	Type      string   `json:"type"` // access, refresh
+	SessionID string   `json:"sid"`  // server-authoritative login session
+	Iss       string   `json:"iss"`  // issuer
+	Sub       string   `json:"sub"`  // subject
+	Aud       string   `json:"aud"`  // audience
+	Exp       int64    `json:"exp"`  // expiration time
+	Nbf       int64    `json:"nbf"`  // not before
+	Iat       int64    `json:"iat"`  // issued at
+	Jti       string   `json:"jti"`  // JWT ID
 }
 
 // GenerateTokenPair 生成令牌对
-func (j *SimpleJWTManager) GenerateTokenPair(userID uint, role UserRole) (accessToken, refreshToken string, err error) {
+func (j *SimpleJWTManager) GenerateTokenPair(userID uint, role UserRole, sessionID string) (accessToken, refreshToken string, err error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if userID == 0 || sessionID == "" || len(sessionID) > 128 {
+		return "", "", errors.New("valid user and session identifiers are required")
+	}
 	now := time.Now()
 	userIDStr := strconv.FormatUint(uint64(userID), 10)
 
 	// 生成访问令牌
 	accessPayload := &JWTPayload{
-		UserID: userID,
-		Role:   role,
-		Type:   "access",
-		Iss:    j.issuer,
-		Sub:    userIDStr,
-		Aud:    "ticket-system-api",
-		Exp:    now.Add(j.accessExpire).Unix(),
-		Nbf:    now.Unix(),
-		Iat:    now.Unix(),
-		Jti:    generateJTI(),
+		UserID:    userID,
+		Role:      role,
+		Type:      "access",
+		SessionID: sessionID,
+		Iss:       j.issuer,
+		Sub:       userIDStr,
+		Aud:       "ticket-system-api",
+		Exp:       now.Add(j.accessExpire).Unix(),
+		Nbf:       now.Unix(),
+		Iat:       now.Unix(),
+		Jti:       generateJTI(),
 	}
 
 	accessToken, err = j.generateToken(accessPayload, j.accessSecret)
@@ -91,16 +97,17 @@ func (j *SimpleJWTManager) GenerateTokenPair(userID uint, role UserRole) (access
 
 	// 生成刷新令牌
 	refreshPayload := &JWTPayload{
-		UserID: userID,
-		Role:   role,
-		Type:   "refresh",
-		Iss:    j.issuer,
-		Sub:    userIDStr,
-		Aud:    "ticket-system-api",
-		Exp:    now.Add(j.refreshExpire).Unix(),
-		Nbf:    now.Unix(),
-		Iat:    now.Unix(),
-		Jti:    generateJTI(),
+		UserID:    userID,
+		Role:      role,
+		Type:      "refresh",
+		SessionID: sessionID,
+		Iss:       j.issuer,
+		Sub:       userIDStr,
+		Aud:       "ticket-system-api",
+		Exp:       now.Add(j.refreshExpire).Unix(),
+		Nbf:       now.Unix(),
+		Iat:       now.Unix(),
+		Jti:       generateJTI(),
 	}
 
 	refreshToken, err = j.generateToken(refreshPayload, j.refreshSecret)
@@ -123,12 +130,13 @@ func (j *SimpleJWTManager) VerifyAccessToken(token string) (*Claims, error) {
 	}
 
 	return &Claims{
-		UserID: payload.UserID,
-		Role:   payload.Role,
-		Type:   payload.Type,
-		Exp:    payload.Exp,
-		Iat:    payload.Iat,
-		Jti:    payload.Jti,
+		UserID:    payload.UserID,
+		Role:      payload.Role,
+		Type:      payload.Type,
+		SessionID: payload.SessionID,
+		Exp:       payload.Exp,
+		Iat:       payload.Iat,
+		Jti:       payload.Jti,
 	}, nil
 }
 
@@ -144,20 +152,14 @@ func (j *SimpleJWTManager) VerifyRefreshToken(token string) (*Claims, error) {
 	}
 
 	return &Claims{
-		UserID: payload.UserID,
-		Role:   payload.Role,
-		Type:   payload.Type,
-		Exp:    payload.Exp,
-		Iat:    payload.Iat,
-		Jti:    payload.Jti,
+		UserID:    payload.UserID,
+		Role:      payload.Role,
+		Type:      payload.Type,
+		SessionID: payload.SessionID,
+		Exp:       payload.Exp,
+		Iat:       payload.Iat,
+		Jti:       payload.Jti,
 	}, nil
-}
-
-// RevokeToken 撤销令牌（简单实现，实际应该使用黑名单）
-func (j *SimpleJWTManager) RevokeToken(token string) error {
-	// 在实际实现中，应该将令牌添加到黑名单
-	// 这里只是一个占位符实现
-	return nil
 }
 
 // 内部方法
@@ -236,6 +238,18 @@ func (j *SimpleJWTManager) verifyToken(token, secret string) (*JWTPayload, error
 	if payload.Iss != j.issuer {
 		return nil, errors.New("invalid issuer")
 	}
+	if payload.Aud != "ticket-system-api" {
+		return nil, errors.New("invalid audience")
+	}
+	if payload.Sub != strconv.FormatUint(uint64(payload.UserID), 10) {
+		return nil, errors.New("invalid subject")
+	}
+	if payload.UserID == 0 ||
+		strings.TrimSpace(payload.SessionID) == "" ||
+		len(payload.SessionID) > 128 ||
+		strings.TrimSpace(payload.Jti) == "" {
+		return nil, errors.New("invalid session claims")
+	}
 
 	return &payload, nil
 }
@@ -278,12 +292,13 @@ func (j *SimpleJWTManager) ParseTokenClaims(token string) (*Claims, error) {
 	}
 
 	return &Claims{
-		UserID: payload.UserID,
-		Role:   payload.Role,
-		Type:   payload.Type,
-		Exp:    payload.Exp,
-		Iat:    payload.Iat,
-		Jti:    payload.Jti,
+		UserID:    payload.UserID,
+		Role:      payload.Role,
+		Type:      payload.Type,
+		SessionID: payload.SessionID,
+		Exp:       payload.Exp,
+		Iat:       payload.Iat,
+		Jti:       payload.Jti,
 	}, nil
 }
 
@@ -337,7 +352,7 @@ func (j *SimpleJWTManager) RefreshTokenIfNeeded(accessToken string, threshold ti
 	}
 
 	// 生成新的访问令牌
-	newAccessToken, _, err := j.GenerateTokenPair(claims.UserID, claims.Role)
+	newAccessToken, _, err := j.GenerateTokenPair(claims.UserID, claims.Role, claims.SessionID)
 	if err != nil {
 		return "", false, err
 	}

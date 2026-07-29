@@ -278,13 +278,19 @@ func ServeWS(hub *Hub, c *gin.Context) {
 	// Get user ID from JWT token in context
 	userIDInterface, exists := c.Get("user_id")
 	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":   "unauthorized",
+			"message": "用户未认证",
+		})
 		return
 	}
 
 	userID, ok := userIDInterface.(uint)
 	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid user ID"})
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "invalid_user_context",
+			"message": "用户身份上下文无效",
+		})
 		return
 	}
 

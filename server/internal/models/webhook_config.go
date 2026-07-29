@@ -11,12 +11,12 @@ import (
 type WebhookProvider string
 
 const (
-	WebhookProviderWeChat     WebhookProvider = "wechat"     // 企业微信
-	WebhookProviderDingTalk   WebhookProvider = "dingtalk"   // 钉钉
-	WebhookProviderLark       WebhookProvider = "lark"       // 飞书
-	WebhookProviderSlack      WebhookProvider = "slack"      // Slack
-	WebhookProviderTeams      WebhookProvider = "teams"      // Microsoft Teams
-	WebhookProviderCustom     WebhookProvider = "custom"     // 自定义webhook
+	WebhookProviderWeChat   WebhookProvider = "wechat"   // 企业微信
+	WebhookProviderDingTalk WebhookProvider = "dingtalk" // 钉钉
+	WebhookProviderLark     WebhookProvider = "lark"     // 飞书
+	WebhookProviderSlack    WebhookProvider = "slack"    // Slack
+	WebhookProviderTeams    WebhookProvider = "teams"    // Microsoft Teams
+	WebhookProviderCustom   WebhookProvider = "custom"   // 自定义webhook
 )
 
 // WebhookStatus 配置状态枚举
@@ -33,22 +33,23 @@ const (
 type WebhookEventType string
 
 const (
-	WebhookEventTicketCreated   WebhookEventType = "ticket.created"   // 工单创建
-	WebhookEventTicketAssigned  WebhookEventType = "ticket.assigned"  // 工单分配
-	WebhookEventTicketUpdated   WebhookEventType = "ticket.updated"   // 工单更新
-	WebhookEventTicketResolved  WebhookEventType = "ticket.resolved"  // 工单解决
-	WebhookEventTicketClosed    WebhookEventType = "ticket.closed"    // 工单关闭
-	WebhookEventTicketComment   WebhookEventType = "ticket.comment"   // 工单评论
-	WebhookEventTicketEscalated WebhookEventType = "ticket.escalated" // 工单升级
-	WebhookEventUserRegistered  WebhookEventType = "user.registered"  // 用户注册
-	WebhookEventSystemAlert     WebhookEventType = "system.alert"     // 系统告警
+	WebhookEventTicketCreated          WebhookEventType = "ticket.created"          // 工单创建
+	WebhookEventTicketAssigned         WebhookEventType = "ticket.assigned"         // 工单分配
+	WebhookEventTicketUpdated          WebhookEventType = "ticket.updated"          // 工单更新
+	WebhookEventTicketResolved         WebhookEventType = "ticket.resolved"         // 工单解决
+	WebhookEventTicketClosed           WebhookEventType = "ticket.closed"           // 工单关闭
+	WebhookEventTicketComment          WebhookEventType = "ticket.comment"          // 工单评论
+	WebhookEventTicketEscalated        WebhookEventType = "ticket.escalated"        // 工单升级
+	WebhookEventAutomationNotification WebhookEventType = "automation.notification" // 自动化通知
+	WebhookEventUserRegistered         WebhookEventType = "user.registered"         // 用户注册
+	WebhookEventSystemAlert            WebhookEventType = "system.alert"            // 系统告警
 )
 
 // WebhookConfig Webhook配置模型
 type WebhookConfig struct {
-	ID        uint      `json:"id" gorm:"primaryKey;autoIncrement"`
-	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
-	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
+	ID        uint       `json:"id" gorm:"primaryKey;autoIncrement"`
+	CreatedAt time.Time  `json:"created_at" gorm:"autoCreateTime"`
+	UpdatedAt time.Time  `json:"updated_at" gorm:"autoUpdateTime"`
 	DeletedAt *time.Time `json:"deleted_at,omitempty" gorm:"index"`
 
 	// 基本配置
@@ -59,19 +60,22 @@ type WebhookConfig struct {
 	Status      WebhookStatus   `json:"status" gorm:"size:20;not null;default:'active'" validate:"required"`
 
 	// 认证配置
-	Secret      string `json:"-" gorm:"size:255"` // 签名密钥，不返回给前端
-	AccessToken string `json:"-" gorm:"size:255"` // 访问令牌，不返回给前端
+	// Secret and AccessToken persist only versioned AEAD envelopes. The
+	// plaintext values exist in memory solely while an authorized delivery is
+	// being prepared.
+	Secret      string `json:"-" gorm:"size:2048"` // 签名密钥，不返回给前端
+	AccessToken string `json:"-" gorm:"size:2048"` // 访问令牌，不返回给前端
 
 	// 事件配置
-	EnabledEvents    string `json:"enabled_events" gorm:"type:text"` // JSON数组存储启用的事件类型
+	EnabledEvents    string             `json:"enabled_events" gorm:"type:text"`        // JSON数组存储启用的事件类型
 	EnabledEventsObj []WebhookEventType `json:"enabled_events_list,omitempty" gorm:"-"` // 运行时解析字段
 
 	// 消息配置
-	MessageTemplate string `json:"message_template" gorm:"type:text"` // 消息模板
+	MessageTemplate string `json:"message_template" gorm:"type:text"`                // 消息模板
 	MessageFormat   string `json:"message_format" gorm:"size:20;default:'markdown'"` // markdown, text, card
 
 	// 过滤配置
-	FilterRules    string          `json:"filter_rules" gorm:"type:text"` // JSON对象存储过滤规则
+	FilterRules    string          `json:"filter_rules" gorm:"type:text"`       // JSON对象存储过滤规则
 	FilterRulesObj json.RawMessage `json:"filter_rules_obj,omitempty" gorm:"-"` // 运行时解析字段
 
 	// 高级配置
@@ -81,7 +85,7 @@ type WebhookConfig struct {
 	IsAsync        bool `json:"is_async" gorm:"default:true"` // 是否异步发送
 
 	// 限流配置
-	RateLimit       int `json:"rate_limit" gorm:"default:60" validate:"min=1,max=1000"`     // 每分钟最大请求数
+	RateLimit       int `json:"rate_limit" gorm:"default:60" validate:"min=1,max=1000"`         // 每分钟最大请求数
 	RateLimitWindow int `json:"rate_limit_window" gorm:"default:60" validate:"min=60,max=3600"` // 限流窗口(秒)
 
 	// 监控统计
@@ -150,7 +154,7 @@ func (w *WebhookConfig) IsEventEnabled(eventType WebhookEventType) bool {
 // GetProviderConfig 获取提供商特定配置
 func (w *WebhookConfig) GetProviderConfig() map[string]interface{} {
 	config := make(map[string]interface{})
-	
+
 	switch w.Provider {
 	case WebhookProviderWeChat:
 		config["msgtype"] = "markdown"
@@ -184,28 +188,29 @@ type WebhookLog struct {
 	Config   *WebhookConfig `json:"config,omitempty" gorm:"foreignKey:ConfigID"`
 
 	// 事件信息
-	EventType   WebhookEventType `json:"event_type" gorm:"size:50;not null;index"`
-	EventData   string           `json:"event_data" gorm:"type:text"` // JSON格式的事件数据
-	ResourceID  uint             `json:"resource_id" gorm:"index"`    // 相关资源ID(如工单ID)
-	ResourceType string          `json:"resource_type" gorm:"size:50;index"` // 资源类型
+	EventType    WebhookEventType `json:"event_type" gorm:"size:50;not null;index"`
+	EventData    string           `json:"event_data" gorm:"type:text"`        // JSON格式的事件数据
+	ResourceID   uint             `json:"resource_id" gorm:"index"`           // 相关资源ID(如工单ID)
+	ResourceType string           `json:"resource_type" gorm:"size:50;index"` // 资源类型
 
 	// 请求信息
 	RequestURL     string `json:"request_url" gorm:"size:500"`
 	RequestMethod  string `json:"request_method" gorm:"size:10;default:'POST'"`
 	RequestHeaders string `json:"request_headers" gorm:"type:text"` // JSON格式
 	RequestBody    string `json:"request_body" gorm:"type:text"`
-	
+
 	// 响应信息
 	ResponseStatus  int    `json:"response_status"`
 	ResponseHeaders string `json:"response_headers" gorm:"type:text"` // JSON格式
 	ResponseBody    string `json:"response_body" gorm:"type:text"`
 	ResponseTime    int64  `json:"response_time"` // 响应时间(毫秒)
 
-	// 执行状态
-	Status       string `json:"status" gorm:"size:20;not null;index"` // pending, success, failed, retrying
-	ErrorMessage string `json:"error_message" gorm:"type:text"`
-	RetryCount   int    `json:"retry_count" gorm:"default:0"`
-	MaxRetries   int    `json:"max_retries" gorm:"default:3"`
+	// 执行状态。WebhookLog 只记录单次 Outbox 尝试；跨尝试重试状态由
+	// outbox_deliveries 持久化管理。
+	Status       string     `json:"status" gorm:"size:20;not null;index"` // pending, success, failed
+	ErrorMessage string     `json:"error_message" gorm:"type:text"`
+	RetryCount   int        `json:"retry_count" gorm:"default:0"`
+	MaxRetries   int        `json:"max_retries" gorm:"default:0"`
 	NextRetryAt  *time.Time `json:"next_retry_at,omitempty"`
 
 	// 元数据

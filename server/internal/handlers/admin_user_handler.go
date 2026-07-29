@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -9,6 +10,8 @@ import (
 	"gongdan-system/internal/models"
 	"gongdan-system/internal/services"
 )
+
+var e164PhonePattern = regexp.MustCompile(`^\+[1-9][0-9]{1,14}$`)
 
 // AdminUserHandler 管理员用户管理处理器
 type AdminUserHandler struct {
@@ -229,6 +232,18 @@ func (h *AdminUserHandler) UpdateUser(c *gin.Context) {
 			Data: nil,
 		})
 		return
+	}
+	if req.Phone != nil {
+		phone := strings.TrimSpace(*req.Phone)
+		if phone != "" && !e164PhonePattern.MatchString(phone) {
+			c.JSON(http.StatusBadRequest, ApiResponse{
+				Code: 1,
+				Msg:  "电话号码必须是 E.164 格式，例如 +8613800138000",
+				Data: nil,
+			})
+			return
+		}
+		req.Phone = &phone
 	}
 
 	user, err := h.adminUserService.UpdateUser(c.Request.Context(), uint(userID), &req)

@@ -137,7 +137,7 @@ func (h *NotificationHandler) GetNotifications(c *gin.Context) {
 		return
 	}
 
-	var responses []*models.NotificationResponse
+	responses := make([]*models.NotificationResponse, 0, len(notifications))
 	for _, notification := range notifications {
 		responses = append(responses, notification.ToResponse())
 	}

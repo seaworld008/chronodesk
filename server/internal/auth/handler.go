@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -94,7 +93,7 @@ func (h *AuthHandler) Register(c HTTPContext) {
 		h.logger.Error("Failed to bind register request", "error", err)
 		c.JSON(http.StatusBadRequest, map[string]interface{}{
 			"code": 1,
-			"msg":  "Invalid request format",
+			"msg":  "请求格式无效",
 			"data": nil,
 		})
 		return
@@ -119,19 +118,19 @@ func (h *AuthHandler) Register(c HTTPContext) {
 	if err != nil {
 		h.logger.Error("Registration failed", "error", err, "email", req.Email)
 
-		message := "Registration failed"
+		message := "注册失败"
 		status := http.StatusInternalServerError
 
 		switch err {
 		case ErrUserExists:
-			message = "User already exists"
+			message = "该用户已存在"
 			status = http.StatusConflict
 		case ErrPasswordTooWeak:
-			message = err.Error()
+			message = "密码强度不符合要求"
 			status = http.StatusBadRequest
 		default:
 			if strings.Contains(err.Error(), "password") {
-				message = err.Error()
+				message = "密码强度不符合要求"
 				status = http.StatusBadRequest
 			}
 		}
@@ -149,7 +148,7 @@ func (h *AuthHandler) Register(c HTTPContext) {
 	// 返回成功响应
 	c.JSON(http.StatusCreated, map[string]interface{}{
 		"code": 0, // 成功码设为0
-		"msg":  "Registration successful",
+		"msg":  "注册成功",
 		"data": resp,
 	})
 }
@@ -161,7 +160,7 @@ func (h *AuthHandler) Login(c HTTPContext) {
 		h.logger.Error("Failed to bind login request", "error", err)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
-			Message: "Invalid request format",
+			Message: "请求格式无效",
 		})
 		return
 	}
@@ -170,7 +169,7 @@ func (h *AuthHandler) Login(c HTTPContext) {
 	if req.Email == "" || req.Password == "" {
 		c.JSON(http.StatusBadRequest, map[string]interface{}{
 			"code": 1,
-			"msg":  "Email and password are required",
+			"msg":  "请输入邮箱和密码",
 			"data": nil,
 		})
 		return
@@ -186,28 +185,28 @@ func (h *AuthHandler) Login(c HTTPContext) {
 	if err != nil {
 		h.logger.Error("Login failed", "error", err, "email", req.Email)
 
-		message := "Login failed"
+		message := "登录失败"
 		status := http.StatusUnauthorized
 
 		switch err {
 		case ErrInvalidCredentials:
-			message = "Invalid email or password"
+			message = "邮箱或密码错误"
 		case ErrUserNotFound:
-			message = "Invalid email or password"
+			message = "邮箱或密码错误"
 		case ErrAccountLocked:
-			message = "Account is locked"
+			message = "账号已锁定"
 			status = http.StatusForbidden
 		case ErrEmailNotVerified:
-			message = "Email not verified"
+			message = "邮箱尚未验证"
 			status = http.StatusForbidden
 		case ErrInvalidOTP:
-			message = "Invalid OTP code"
+			message = "OTP 验证码错误"
 		default:
 			if strings.Contains(err.Error(), "OTP") {
-				message = "OTP code required"
+				message = "请输入 OTP 验证码"
 				status = http.StatusBadRequest
 			} else if strings.Contains(err.Error(), "too many") {
-				message = "Too many failed login attempts"
+				message = "登录失败次数过多，请稍后重试"
 				status = http.StatusTooManyRequests
 			}
 		}
@@ -228,7 +227,7 @@ func (h *AuthHandler) Login(c HTTPContext) {
 	// 返回成功响应 - 使用ApiResponse格式与前端保持一致
 	c.JSON(http.StatusOK, map[string]interface{}{
 		"code": 0,
-		"msg":  "Login successful",
+		"msg":  "登录成功",
 		"data": resp,
 	})
 }
@@ -240,7 +239,7 @@ func (h *AuthHandler) RefreshToken(c HTTPContext) {
 		h.logger.Error("Failed to bind refresh token request", "error", err)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
-			Message: "Invalid request format",
+			Message: "请求格式无效",
 		})
 		return
 	}
@@ -248,7 +247,7 @@ func (h *AuthHandler) RefreshToken(c HTTPContext) {
 	if req.RefreshToken == "" {
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "validation_error",
-			Message: "Refresh token is required",
+			Message: "缺少刷新令牌",
 		})
 		return
 	}
@@ -264,19 +263,19 @@ func (h *AuthHandler) RefreshToken(c HTTPContext) {
 		h.logger.Error("Token refresh failed", "error", err)
 
 		code := "refresh_failed"
-		message := "Token refresh failed"
+		message := "刷新登录令牌失败"
 		status := http.StatusUnauthorized
 
 		switch err {
 		case ErrInvalidToken:
 			code = "invalid_token"
-			message = "Invalid refresh token"
+			message = "刷新令牌无效"
 		case ErrTokenExpired:
 			code = "token_expired"
-			message = "Refresh token expired"
+			message = "刷新令牌已过期"
 		case ErrUserNotFound:
 			code = "user_not_found"
-			message = "User not found"
+			message = "未找到用户"
 		}
 
 		c.JSON(status, ErrorResponse{
@@ -292,7 +291,7 @@ func (h *AuthHandler) RefreshToken(c HTTPContext) {
 	// 返回成功响应
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
-		Message: "Token refreshed successfully",
+		Message: "登录令牌刷新成功",
 		Data:    resp,
 	})
 }
@@ -312,8 +311,16 @@ func (h *AuthHandler) Logout(c HTTPContext) {
 	}
 
 	ctx := context.Background()
+	if request := c.Request(); request != nil {
+		ctx = request.Context()
+	}
 	if err := h.authService.Logout(ctx, refreshToken); err != nil {
 		h.logger.Error("Logout failed", "error", err)
+		c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "logout_failed",
+			Message: "退出登录失败，请稍后重试",
+		})
+		return
 	}
 
 	h.logger.Info("User logged out successfully")
@@ -321,7 +328,7 @@ func (h *AuthHandler) Logout(c HTTPContext) {
 	// 返回成功响应
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
-		Message: "Logout successful",
+		Message: "退出登录成功",
 	})
 }
 
@@ -332,7 +339,7 @@ func (h *AuthHandler) LogoutAll(c HTTPContext) {
 	if !exists {
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "unauthorized",
-			Message: "User not authenticated",
+			Message: "用户未登录",
 		})
 		return
 	}
@@ -341,17 +348,20 @@ func (h *AuthHandler) LogoutAll(c HTTPContext) {
 	if !ok {
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error:   "internal_error",
-			Message: "Invalid user ID",
+			Message: "用户 ID 无效",
 		})
 		return
 	}
 
 	ctx := context.Background()
+	if request := c.Request(); request != nil {
+		ctx = request.Context()
+	}
 	if err := h.authService.LogoutAll(ctx, userIDUint); err != nil {
 		h.logger.Error("Logout all failed", "error", err, "user_id", userIDUint)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error:   "logout_failed",
-			Message: "Failed to logout from all devices",
+			Message: "无法从所有设备退出登录",
 		})
 		return
 	}
@@ -361,7 +371,7 @@ func (h *AuthHandler) LogoutAll(c HTTPContext) {
 	// 返回成功响应
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
-		Message: "Logged out from all devices successfully",
+		Message: "已从所有设备退出登录",
 	})
 }
 
@@ -372,7 +382,7 @@ func (h *AuthHandler) GetProfile(c HTTPContext) {
 	if !exists {
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "unauthorized",
-			Message: "User not authenticated",
+			Message: "用户未登录",
 		})
 		return
 	}
@@ -381,7 +391,7 @@ func (h *AuthHandler) GetProfile(c HTTPContext) {
 	if !ok {
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error:   "internal_error",
-			Message: "Invalid user ID",
+			Message: "用户 ID 无效",
 		})
 		return
 	}
@@ -392,7 +402,7 @@ func (h *AuthHandler) GetProfile(c HTTPContext) {
 		h.logger.Error("Failed to get user", "error", err, "user_id", userIDUint)
 		c.JSON(http.StatusNotFound, ErrorResponse{
 			Error:   "user_not_found",
-			Message: "User not found",
+			Message: "未找到用户",
 		})
 		return
 	}
@@ -411,7 +421,7 @@ func (h *AuthHandler) GetProfile(c HTTPContext) {
 func (h *AuthHandler) Health(c HTTPContext) {
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
-		Message: "Auth service is healthy",
+		Message: "认证服务运行正常",
 	})
 }
 
@@ -422,7 +432,7 @@ func (h *AuthHandler) ForgotPassword(c HTTPContext) {
 		h.logger.Error("Failed to bind forgot password request", "error", err)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
-			Message: "Invalid request format",
+			Message: "请求格式无效",
 		})
 		return
 	}
@@ -433,14 +443,14 @@ func (h *AuthHandler) ForgotPassword(c HTTPContext) {
 		h.logger.Error("Failed to process forgot password", "error", err, "email", req.Email)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error:   "forgot_password_failed",
-			Message: "Failed to process password reset request",
+			Message: "处理密码重置请求失败",
 		})
 		return
 	}
 
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
-		Message: "Password reset email sent",
+		Message: "密码重置邮件已发送",
 	})
 }
 
@@ -451,41 +461,32 @@ func (h *AuthHandler) ResetPassword(c HTTPContext) {
 		h.logger.Error("Failed to bind reset password request", "error", err)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
-			Message: "Invalid request format",
+			Message: "请求格式无效",
 		})
 		return
 	}
 
 	ctx := context.Background()
-	password := req.EffectivePassword()
-	if strings.TrimSpace(password) == "" {
-		c.JSON(http.StatusBadRequest, ErrorResponse{
-			Error:   "validation_error",
-			Message: "New password is required",
-		})
-		return
-	}
-
-	err := h.authService.ResetPassword(ctx, req.Token, password)
+	err := h.authService.ResetPassword(ctx, req.Token, req.NewPassword)
 	if err != nil {
 		h.logger.Error("Failed to reset password", "error", err)
 		if err == ErrInvalidToken {
 			c.JSON(http.StatusBadRequest, ErrorResponse{
 				Error:   "invalid_token",
-				Message: "Invalid or expired reset token",
+				Message: "密码重置令牌无效或已过期",
 			})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error:   "reset_password_failed",
-			Message: "Failed to reset password",
+			Message: "重置密码失败",
 		})
 		return
 	}
 
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
-		Message: "Password reset successfully",
+		Message: "密码重置成功",
 	})
 }
 
@@ -495,7 +496,7 @@ func (h *AuthHandler) VerifyEmail(c HTTPContext) {
 	if token == "" {
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "missing_token",
-			Message: "Verification token is required",
+			Message: "缺少邮箱验证令牌",
 		})
 		return
 	}
@@ -507,20 +508,20 @@ func (h *AuthHandler) VerifyEmail(c HTTPContext) {
 		if err == ErrInvalidToken {
 			c.JSON(http.StatusBadRequest, ErrorResponse{
 				Error:   "invalid_token",
-				Message: "Invalid or expired verification token",
+				Message: "邮箱验证令牌无效或已过期",
 			})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error:   "verification_failed",
-			Message: "Failed to verify email",
+			Message: "验证邮箱失败",
 		})
 		return
 	}
 
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
-		Message: "Email verified successfully",
+		Message: "邮箱验证成功",
 	})
 }
 
@@ -531,7 +532,7 @@ func (h *AuthHandler) ResendVerification(c HTTPContext) {
 		h.logger.Error("Failed to bind resend verification request", "error", err)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
-			Message: "Invalid request format",
+			Message: "请求格式无效",
 		})
 		return
 	}
@@ -542,14 +543,14 @@ func (h *AuthHandler) ResendVerification(c HTTPContext) {
 		h.logger.Error("Failed to resend verification", "error", err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error:   "resend_failed",
-			Message: "Failed to resend verification email",
+			Message: "重新发送验证邮件失败",
 		})
 		return
 	}
 
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
-		Message: "Verification email sent",
+		Message: "验证邮件已发送",
 	})
 }
 
@@ -560,7 +561,7 @@ func (h *AuthHandler) UpdateProfile(c HTTPContext) {
 		h.logger.Error("Failed to get user from context", "error", err)
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "unauthorized",
-			Message: "Authentication required",
+			Message: "请先登录",
 		})
 		return
 	}
@@ -570,7 +571,7 @@ func (h *AuthHandler) UpdateProfile(c HTTPContext) {
 		h.logger.Error("Failed to bind update profile request", "error", err)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
-			Message: "Invalid request format",
+			Message: "请求格式无效",
 		})
 		return
 	}
@@ -581,14 +582,14 @@ func (h *AuthHandler) UpdateProfile(c HTTPContext) {
 		h.logger.Error("Failed to update profile", "error", err, "userID", userInfo.ID)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error:   "update_failed",
-			Message: "Failed to update profile",
+			Message: "更新个人资料失败",
 		})
 		return
 	}
 
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
-		Message: "Profile updated successfully",
+		Message: "个人资料更新成功",
 	})
 }
 
@@ -599,7 +600,7 @@ func (h *AuthHandler) ChangePassword(c HTTPContext) {
 		h.logger.Error("Failed to get user from context", "error", err)
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "unauthorized",
-			Message: "Authentication required",
+			Message: "请先登录",
 		})
 		return
 	}
@@ -609,7 +610,7 @@ func (h *AuthHandler) ChangePassword(c HTTPContext) {
 		h.logger.Error("Failed to bind change password request", "error", err)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
-			Message: "Invalid request format",
+			Message: "请求格式无效",
 		})
 		return
 	}
@@ -621,20 +622,20 @@ func (h *AuthHandler) ChangePassword(c HTTPContext) {
 		if err == ErrInvalidCredentials {
 			c.JSON(http.StatusBadRequest, ErrorResponse{
 				Error:   "invalid_password",
-				Message: "Current password is incorrect",
+				Message: "当前密码错误",
 			})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error:   "change_password_failed",
-			Message: "Failed to change password",
+			Message: "修改密码失败",
 		})
 		return
 	}
 
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
-		Message: "Password changed successfully",
+		Message: "密码修改成功",
 	})
 }
 
@@ -644,7 +645,7 @@ func (h *AuthHandler) EnableOTP(c HTTPContext) {
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "unauthorized",
-			Message: "User not authenticated",
+			Message: "用户未登录",
 		})
 		return
 	}
@@ -654,7 +655,7 @@ func (h *AuthHandler) EnableOTP(c HTTPContext) {
 		h.logger.Error("Failed to bind enable OTP request", "error", err)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
-			Message: "Invalid request body",
+			Message: "请求体格式无效",
 		})
 		return
 	}
@@ -668,17 +669,17 @@ func (h *AuthHandler) EnableOTP(c HTTPContext) {
 	if err != nil {
 		h.logger.Error("Failed to enable OTP", "error", err, "user_id", userInfo.ID)
 		status := http.StatusInternalServerError
-		message := "Failed to enable OTP"
+		message := "启用 OTP 失败"
 
 		if errors.Is(err, ErrInvalidCredentials) {
 			status = http.StatusUnauthorized
-			message = "Invalid password"
+			message = "密码错误"
 		} else if errors.Is(err, ErrUserNotFound) {
 			status = http.StatusNotFound
-			message = "User not found"
+			message = "未找到用户"
 		} else if err.Error() == "OTP already enabled" {
 			status = http.StatusBadRequest
-			message = "OTP already enabled"
+			message = "OTP 已启用"
 		}
 
 		c.JSON(status, ErrorResponse{
@@ -690,7 +691,7 @@ func (h *AuthHandler) EnableOTP(c HTTPContext) {
 
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
-		Message: "OTP enabled successfully",
+		Message: "OTP 启用成功",
 		Data:    otpSetup,
 	})
 }
@@ -701,7 +702,7 @@ func (h *AuthHandler) DisableOTP(c HTTPContext) {
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "unauthorized",
-			Message: "User not authenticated",
+			Message: "用户未登录",
 		})
 		return
 	}
@@ -713,7 +714,7 @@ func (h *AuthHandler) DisableOTP(c HTTPContext) {
 		h.logger.Error("Failed to bind disable OTP request", "error", err)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
-			Message: "Invalid request body",
+			Message: "请求体格式无效",
 		})
 		return
 	}
@@ -726,11 +727,11 @@ func (h *AuthHandler) DisableOTP(c HTTPContext) {
 	if err := h.authService.DisableOTP(ctx, userInfo.ID, req.Password); err != nil {
 		h.logger.Error("Failed to disable OTP", "error", err, "user_id", userInfo.ID)
 		status := http.StatusInternalServerError
-		message := "Failed to disable OTP"
+		message := "停用 OTP 失败"
 
 		if errors.Is(err, ErrInvalidCredentials) {
 			status = http.StatusUnauthorized
-			message = "Invalid password"
+			message = "密码错误"
 		}
 
 		c.JSON(status, ErrorResponse{
@@ -742,7 +743,7 @@ func (h *AuthHandler) DisableOTP(c HTTPContext) {
 
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
-		Message: "OTP disabled successfully",
+		Message: "OTP 停用成功",
 	})
 }
 
@@ -752,7 +753,7 @@ func (h *AuthHandler) VerifyOTP(c HTTPContext) {
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "unauthorized",
-			Message: "User not authenticated",
+			Message: "用户未登录",
 		})
 		return
 	}
@@ -762,7 +763,7 @@ func (h *AuthHandler) VerifyOTP(c HTTPContext) {
 		h.logger.Error("Failed to bind verify OTP request", "error", err)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
-			Message: "Invalid request body",
+			Message: "请求体格式无效",
 		})
 		return
 	}
@@ -775,14 +776,14 @@ func (h *AuthHandler) VerifyOTP(c HTTPContext) {
 	if err := h.authService.VerifyOTP(ctx, userInfo.ID, req.Code); err != nil {
 		h.logger.Error("Failed to verify OTP", "error", err, "user_id", userInfo.ID)
 		status := http.StatusUnauthorized
-		message := "Invalid OTP code"
+		message := "OTP 验证码错误"
 
 		if errors.Is(err, ErrOTPExpired) {
 			status = http.StatusBadRequest
-			message = "OTP code expired"
+			message = "OTP 验证码已过期"
 		} else if !errors.Is(err, ErrInvalidOTP) {
 			status = http.StatusInternalServerError
-			message = "Failed to verify OTP"
+			message = "验证 OTP 失败"
 		}
 
 		c.JSON(status, ErrorResponse{
@@ -794,7 +795,7 @@ func (h *AuthHandler) VerifyOTP(c HTTPContext) {
 
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
-		Message: "OTP verified successfully",
+		Message: "OTP 验证成功",
 	})
 }
 
@@ -804,7 +805,7 @@ func (h *AuthHandler) GenerateBackupCodes(c HTTPContext) {
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "unauthorized",
-			Message: "User not authenticated",
+			Message: "用户未登录",
 		})
 		return
 	}
@@ -819,14 +820,14 @@ func (h *AuthHandler) GenerateBackupCodes(c HTTPContext) {
 		h.logger.Error("Failed to generate backup codes", "error", err, "user_id", userInfo.ID)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error:   "generate_backup_codes_failed",
-			Message: "Failed to generate backup codes",
+			Message: "生成备用验证码失败",
 		})
 		return
 	}
 
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
-		Message: "Backup codes generated successfully",
+		Message: "备用验证码生成成功",
 		Data: map[string]interface{}{
 			"backup_codes": codes,
 		},
@@ -837,34 +838,34 @@ func (h *AuthHandler) GenerateBackupCodes(c HTTPContext) {
 
 func (h *AuthHandler) validateRegisterRequest(req *RegisterRequest) error {
 	if req.Username == "" {
-		return fmt.Errorf("username is required")
+		return fmt.Errorf("请输入用户名")
 	}
 	if len(req.Username) < 3 || len(req.Username) > 50 {
-		return fmt.Errorf("username must be between 3 and 50 characters")
+		return fmt.Errorf("用户名长度必须为 3 到 50 个字符")
 	}
 	if !IsValidUsername(req.Username) {
-		return fmt.Errorf("username contains invalid characters")
+		return fmt.Errorf("用户名包含无效字符")
 	}
 
 	if req.Email == "" {
-		return fmt.Errorf("email is required")
+		return fmt.Errorf("请输入邮箱")
 	}
 	if !IsValidEmail(req.Email) {
-		return fmt.Errorf("invalid email format")
+		return fmt.Errorf("邮箱格式无效")
 	}
 
 	if req.Password == "" {
-		return fmt.Errorf("password is required")
+		return fmt.Errorf("请输入密码")
 	}
 	if len(req.Password) < 8 {
-		return fmt.Errorf("password must be at least 8 characters")
+		return fmt.Errorf("密码至少需要 8 个字符")
 	}
 
 	if req.ConfirmPassword == "" {
-		return fmt.Errorf("password confirmation is required")
+		return fmt.Errorf("请再次输入密码")
 	}
 	if req.Password != req.ConfirmPassword {
-		return fmt.Errorf("passwords do not match")
+		return fmt.Errorf("两次输入的密码不一致")
 	}
 
 	// 清理输入
@@ -923,7 +924,7 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 	if authHeader == "" {
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "missing_token",
-			Message: "Authorization token is required",
+			Message: "缺少访问令牌",
 		})
 		c.Abort()
 		return
@@ -934,7 +935,7 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 	if len(parts) != 2 || parts[0] != "Bearer" {
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "invalid_token_format",
-			Message: "Invalid authorization header format",
+			Message: "认证请求头格式无效",
 		})
 		c.Abort()
 		return
@@ -942,23 +943,146 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 
 	token := parts[1]
 
+	if h.authService == nil || h.authService.jwtManager == nil {
+		h.logger.Error("Authentication token verifier is unavailable")
+		c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "authentication_unavailable",
+			Message: "认证服务暂时不可用",
+		})
+		c.Abort()
+		return
+	}
+
 	// 验证令牌
 	claims, err := h.authService.jwtManager.VerifyAccessToken(token)
 	if err != nil {
 		h.logger.Error("Token verification failed", "error", err)
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "invalid_token",
-			Message: "Invalid or expired token",
+			Message: "访问令牌无效或已过期",
+		})
+		c.Abort()
+		return
+	}
+
+	// JWT 中的角色只是签发时快照。每次请求都必须重新读取当前用户，
+	// 以便停用、删除、锁定、降权和修改密码能够立即使旧访问令牌失效。
+	// 这对管理员及 Agent 控制面尤其重要，不能依赖最长可存活数小时的角色声明。
+	if h.authService.userRepo == nil {
+		h.logger.Error("Authentication principal repository is unavailable")
+		c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "authentication_unavailable",
+			Message: "认证服务暂时不可用",
+		})
+		c.Abort()
+		return
+	}
+
+	requestContext := context.Background()
+	if request := c.Request(); request != nil {
+		requestContext = request.Context()
+	}
+	currentUser, err := h.authService.userRepo.GetByID(requestContext, claims.UserID)
+	if err != nil {
+		if errors.Is(err, ErrUserNotFound) {
+			h.logger.Warn("Access token principal is no longer available", "user_id", claims.UserID)
+			c.JSON(http.StatusUnauthorized, ErrorResponse{
+				Error:   "invalid_token",
+				Message: "访问令牌对应的用户已失效",
+			})
+		} else {
+			h.logger.Error("Failed to revalidate access token principal", "error", err, "user_id", claims.UserID)
+			c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+				Error:   "authentication_unavailable",
+				Message: "认证服务暂时不可用",
+			})
+		}
+		c.Abort()
+		return
+	}
+	if currentUser.Status != StatusActive {
+		h.logger.Warn("Access token principal is not active", "user_id", claims.UserID, "status", currentUser.Status)
+		c.JSON(http.StatusUnauthorized, ErrorResponse{
+			Error:   "account_inactive",
+			Message: "账号当前不可用，请重新登录或联系管理员",
+		})
+		c.Abort()
+		return
+	}
+	if currentUser.Role != claims.Role {
+		h.logger.Warn(
+			"Access token role is stale",
+			"user_id", claims.UserID,
+			"token_role", claims.Role,
+			"current_role", currentUser.Role,
+		)
+		c.JSON(http.StatusUnauthorized, ErrorResponse{
+			Error:   "stale_token",
+			Message: "账号权限已变更，请重新登录",
+		})
+		c.Abort()
+		return
+	}
+	if currentUser.PasswordChangedAt != nil && claims.Iat < currentUser.PasswordChangedAt.Unix() {
+		h.logger.Warn("Access token predates password change", "user_id", claims.UserID)
+		c.JSON(http.StatusUnauthorized, ErrorResponse{
+			Error:   "stale_token",
+			Message: "密码已变更，请重新登录",
+		})
+		c.Abort()
+		return
+	}
+
+	// JWT 签名只证明令牌曾由本服务签发。会话是否仍有效必须以数据库为
+	// 权威，这样单设备退出、全部退出和管理员踢下线都能立即撤销 access token。
+	if h.authService.tokenRepo == nil {
+		h.logger.Error("Authentication session repository is unavailable")
+		c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "authentication_unavailable",
+			Message: "认证服务暂时不可用",
+		})
+		c.Abort()
+		return
+	}
+	sessionActive, err := h.authService.tokenRepo.IsSessionActive(
+		requestContext,
+		claims.UserID,
+		claims.SessionID,
+	)
+	if err != nil {
+		h.logger.Error(
+			"Failed to revalidate access token session",
+			"error", err,
+			"user_id", claims.UserID,
+			"session_id", claims.SessionID,
+		)
+		c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "authentication_unavailable",
+			Message: "认证服务暂时不可用",
+		})
+		c.Abort()
+		return
+	}
+	if !sessionActive {
+		h.logger.Warn(
+			"Access token session is no longer active",
+			"user_id", claims.UserID,
+			"session_id", claims.SessionID,
+		)
+		c.JSON(http.StatusUnauthorized, ErrorResponse{
+			Error:   "session_revoked",
+			Message: "登录会话已结束，请重新登录",
 		})
 		c.Abort()
 		return
 	}
 
 	// 设置用户信息到上下文
-	c.Set("user_id", claims.UserID)
-	c.Set("user_role", string(claims.Role))
-	c.Set("user_role_enum", claims.Role)
+	c.Set("user_id", currentUser.ID)
+	c.Set("user_role", string(currentUser.Role))
+	c.Set("user_role_enum", currentUser.Role)
 	c.Set("token_jti", claims.Jti)
+	c.Set("session_id", claims.SessionID)
 
 	// 继续处理
 	c.Next()
@@ -974,7 +1098,7 @@ func (h *AuthHandler) RequireRole(requiredRole UserRole) func(HTTPContext) {
 		if !exists {
 			c.JSON(http.StatusForbidden, ErrorResponse{
 				Error:   "access_denied",
-				Message: "Access denied",
+				Message: "无权访问",
 			})
 			c.Abort()
 			return
@@ -989,7 +1113,7 @@ func (h *AuthHandler) RequireRole(requiredRole UserRole) func(HTTPContext) {
 		default:
 			c.JSON(http.StatusForbidden, ErrorResponse{
 				Error:   "access_denied",
-				Message: "Access denied",
+				Message: "无权访问",
 			})
 			c.Abort()
 			return
@@ -1000,7 +1124,7 @@ func (h *AuthHandler) RequireRole(requiredRole UserRole) func(HTTPContext) {
 		if !user.HasPermission(requiredRole) {
 			c.JSON(http.StatusForbidden, ErrorResponse{
 				Error:   "insufficient_permissions",
-				Message: "Insufficient permissions",
+				Message: "权限不足",
 			})
 			c.Abort()
 			return
@@ -1028,250 +1152,4 @@ func ParseUserID(c HTTPContext) (uint, error) {
 	}
 
 	return uint(userID), nil
-}
-
-// ListUsers 获取用户列表（管理员功能）
-func (h *AuthHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
-	// 解析查询参数
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	if page < 1 {
-		page = 1
-	}
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit < 1 || limit > 100 {
-		limit = 20
-	}
-
-	// 这里应该调用用户服务获取用户列表
-	// users, total, err := h.userService.ListUsers(r.Context(), page, limit)
-	// 暂时返回空列表
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"users":   []interface{}{},
-		"total":   0,
-		"page":    page,
-		"limit":   limit,
-	})
-}
-
-// GetUser 获取单个用户信息（管理员功能）
-func (h *AuthHandler) GetUser(w http.ResponseWriter, r *http.Request) {
-	userIDStr := r.URL.Query().Get("id")
-	if userIDStr == "" {
-		http.Error(w, "User ID required", http.StatusBadRequest)
-		return
-	}
-
-	_, err := strconv.ParseUint(userIDStr, 10, 32)
-	if err != nil {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		return
-	}
-
-	// 这里应该调用用户服务获取用户信息
-	// user, err := h.userService.GetUser(r.Context(), uint(userID))
-	// 暂时返回空用户
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"user":    nil,
-	})
-}
-
-// UpdateUser 更新用户信息（管理员功能）
-func (h *AuthHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		ID       uint   `json:"id"`
-		Username string `json:"username"`
-		Email    string `json:"email"`
-		Role     string `json:"role"`
-		Status   string `json:"status"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.logger.Error("Failed to decode update user request", "error", err)
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	// 这里应该调用用户服务更新用户
-	// err := h.userService.UpdateUser(r.Context(), &req)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"message": "User updated successfully",
-	})
-}
-
-// DeleteUser 删除用户（管理员功能）
-func (h *AuthHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
-	userIDStr := r.URL.Query().Get("id")
-	if userIDStr == "" {
-		http.Error(w, "User ID required", http.StatusBadRequest)
-		return
-	}
-
-	_, err := strconv.ParseUint(userIDStr, 10, 32)
-	if err != nil {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		return
-	}
-
-	// 这里应该调用用户服务删除用户
-	// err := h.userService.DeleteUser(r.Context(), uint(userID))
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"message": "User deleted successfully",
-	})
-}
-
-// DisableUser 禁用用户（管理员功能）
-func (h *AuthHandler) DisableUser(w http.ResponseWriter, r *http.Request) {
-	userIDStr := r.URL.Query().Get("id")
-	if userIDStr == "" {
-		http.Error(w, "User ID required", http.StatusBadRequest)
-		return
-	}
-
-	_, err := strconv.ParseUint(userIDStr, 10, 32)
-	if err != nil {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		return
-	}
-
-	// 这里应该调用用户服务禁用用户
-	// err := h.userService.DisableUser(r.Context(), uint(userID))
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"message": "User disabled successfully",
-	})
-}
-
-// EnableUser 启用用户（管理员功能）
-func (h *AuthHandler) EnableUser(w http.ResponseWriter, r *http.Request) {
-	userIDStr := r.URL.Query().Get("id")
-	if userIDStr == "" {
-		http.Error(w, "User ID required", http.StatusBadRequest)
-		return
-	}
-
-	_, err := strconv.ParseUint(userIDStr, 10, 32)
-	if err != nil {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		return
-	}
-
-	// 这里应该调用用户服务启用用户
-	// err := h.userService.EnableUser(r.Context(), uint(userID))
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"message": "User enabled successfully",
-	})
-}
-
-// GetLoginAttempts 获取登录尝试记录（管理员功能）
-func (h *AuthHandler) GetLoginAttempts(w http.ResponseWriter, r *http.Request) {
-	// 解析查询参数
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	if page < 1 {
-		page = 1
-	}
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit < 1 || limit > 100 {
-		limit = 20
-	}
-
-	// 这里应该调用认证服务获取登录尝试记录
-	// attempts, total, err := h.authService.GetLoginAttempts(r.Context(), page, limit)
-	// 暂时返回空列表
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":  true,
-		"attempts": []interface{}{},
-		"total":    0,
-		"page":     page,
-		"limit":    limit,
-	})
-}
-
-// LoggingMiddleware 日志中间件
-func (h *AuthHandler) LoggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := context.Background()
-		h.logger.Info("Request started",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"remote_addr", r.RemoteAddr,
-			"user_agent", r.UserAgent(),
-		)
-		next.ServeHTTP(w, r)
-		h.logger.Info("Request completed",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"start", start,
-		)
-	})
-}
-
-// RecoveryMiddleware 恢复中间件
-func (h *AuthHandler) RecoveryMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if err := recover(); err != nil {
-				h.logger.Error("Panic recovered",
-					"error", err,
-					"method", r.Method,
-					"path", r.URL.Path,
-				)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			}
-		}()
-		next.ServeHTTP(w, r)
-	})
-}
-
-// CORSMiddleware CORS中间件
-func (h *AuthHandler) CORSMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Max-Age", "86400")
-
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
-// SecurityMiddleware 安全中间件
-func (h *AuthHandler) SecurityMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 设置安全头
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("X-XSS-Protection", "1; mode=block")
-		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'")
-
-		next.ServeHTTP(w, r)
-	})
 }

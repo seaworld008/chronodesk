@@ -1,10 +1,13 @@
 package services
 
 import (
+	"bytes"
 	"context"
+	"strings"
 	"testing"
 
 	"gongdan-system/internal/models"
+	"gongdan-system/internal/security"
 )
 
 func TestUpdateEmailConfigCanSkipSMTPTest(t *testing.T) {
@@ -14,7 +17,13 @@ func TestUpdateEmailConfigCanSkipSMTPTest(t *testing.T) {
 		t.Fatalf("failed to migrate email config: %v", err)
 	}
 
-	service := NewEmailConfigService(db)
+	protector, err := security.NewKeyring("test-email", map[string][]byte{
+		"test-email": bytes.Repeat([]byte{0x45}, 32),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewEmailConfigServiceWithProtector(db, protector)
 
 	enableEmail := true
 	smtpHost := "127.0.0.1"
@@ -48,5 +57,27 @@ func TestUpdateEmailConfigCanSkipSMTPTest(t *testing.T) {
 	}
 	if updated.SMTPHost != smtpHost {
 		t.Fatalf("expected smtp host %s, got %s", smtpHost, updated.SMTPHost)
+	}
+	if updated.SMTPPassword != smtpPassword {
+		t.Fatal("runtime SMTP password was not available to the email sender")
+	}
+	var stored models.EmailConfig
+	if err := db.First(&stored, updated.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.SMTPPassword == smtpPassword ||
+		strings.Contains(stored.SMTPPassword, smtpPassword) ||
+		!security.IsEnvelope(stored.SMTPPassword) {
+		t.Fatalf("SMTP password was not encrypted at rest: %q", stored.SMTPPassword)
+	}
+
+	// A separately constructed service simulates a process restart.
+	restarted := NewEmailConfigServiceWithProtector(db, protector)
+	reloaded, err := restarted.GetEmailConfig(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.SMTPPassword != smtpPassword {
+		t.Fatal("restarted service could not decrypt SMTP password")
 	}
 }

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -483,17 +484,32 @@ func (h *UserHandler) UploadAvatar(c *gin.Context) {
 
 	avatarURL, err := h.userService.UploadAvatar(c.Request.Context(), userID, file, header)
 	if err != nil {
-		if err.Error() == "file too large: maximum 2MB allowed" {
+		switch {
+		case errors.Is(err, services.ErrAttachmentTooLarge):
 			c.JSON(http.StatusRequestEntityTooLarge, ApiResponse{
 				Code: 1,
 				Msg:  "文件过大，最大支持2MB",
 				Data: nil,
 			})
 			return
+		case errors.Is(err, services.ErrInvalidAvatar):
+			c.JSON(http.StatusBadRequest, ApiResponse{
+				Code: 1,
+				Msg:  "头像格式无效，请上传有效的 JPEG 或 PNG 图片",
+				Data: nil,
+			})
+			return
+		case errors.Is(err, services.ErrAvatarStorageMissing):
+			c.JSON(http.StatusServiceUnavailable, ApiResponse{
+				Code: 1,
+				Msg:  "头像存储服务暂不可用",
+				Data: nil,
+			})
+			return
 		}
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
-			Msg:  "头像上传失败: " + err.Error(),
+			Msg:  "头像上传失败，请稍后重试",
 			Data: nil,
 		})
 		return
@@ -508,6 +524,40 @@ func (h *UserHandler) UploadAvatar(c *gin.Context) {
 		Msg:  "头像上传成功",
 		Data: response,
 	})
+}
+
+// GetAvatar serves immutable, sanitized avatar objects. Avatar URLs are opaque
+// and public because browser image elements cannot attach the API Bearer token.
+func (h *UserHandler) GetAvatar(c *gin.Context) {
+	userID64, err := strconv.ParseUint(c.Param("userID"), 10, 32)
+	if err != nil || userID64 == 0 {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	reader, contentType, err := h.userService.OpenAvatar(
+		c.Request.Context(),
+		uint(userID64),
+		c.Param("filename"),
+	)
+	if err != nil {
+		if errors.Is(err, services.ErrAvatarStorageMissing) {
+			c.Status(http.StatusServiceUnavailable)
+			return
+		}
+		c.Status(http.StatusNotFound)
+		return
+	}
+	defer reader.Close()
+
+	payload, err := io.ReadAll(io.LimitReader(reader, 2*1024*1024+1))
+	if err != nil || len(payload) > 2*1024*1024 {
+		c.Status(http.StatusInternalServerError)
+		return
+	}
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.Header("Content-Security-Policy", "default-src 'none'; sandbox")
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.Data(http.StatusOK, contentType, payload)
 }
 
 // DeleteLoginSession 删除登录会话

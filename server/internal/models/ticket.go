@@ -117,7 +117,44 @@ const (
 	TicketSourceChat   TicketSource = "chat"   // 聊天
 	TicketSourceAPI    TicketSource = "api"    // API
 	TicketSourceMobile TicketSource = "mobile" // 移动端
+	TicketSourceAgent  TicketSource = "agent"  // AI Agent
 )
+
+func (s TicketSource) IsValid() bool {
+	switch s {
+	case TicketSourceWeb,
+		TicketSourceEmail,
+		TicketSourcePhone,
+		TicketSourceChat,
+		TicketSourceAPI,
+		TicketSourceMobile,
+		TicketSourceAgent:
+		return true
+	default:
+		return false
+	}
+}
+
+// TicketTrustLevel describes how much the system trusts the ticket's external
+// source. User-provided text remains untrusted regardless of this value.
+type TicketTrustLevel string
+
+const (
+	TicketTrustLevelUntrusted TicketTrustLevel = "untrusted"
+	TicketTrustLevelVerified  TicketTrustLevel = "verified"
+	TicketTrustLevelTrusted   TicketTrustLevel = "trusted"
+	TicketTrustLevelSystem    TicketTrustLevel = "system"
+)
+
+// AgentContext contains only task facts that are safe to exchange between
+// agents. It intentionally has no prompt or chain-of-thought field.
+type AgentContext struct {
+	Goal               string   `json:"goal,omitempty"`
+	Constraints        []string `json:"constraints,omitempty"`
+	AcceptanceCriteria []string `json:"acceptance_criteria,omitempty"`
+	MissingInformation []string `json:"missing_information,omitempty"`
+	RelatedResources   []string `json:"related_resources,omitempty"`
+}
 
 // Ticket 工单模型
 type Ticket struct {
@@ -135,13 +172,30 @@ type Ticket struct {
 	Type     TicketType     `json:"type" gorm:"size:20;not null;default:'request';index" validate:"required,oneof=incident request problem change complaint consultation"`
 	Priority TicketPriority `json:"priority" gorm:"size:20;not null;default:'normal';index" validate:"required,oneof=low normal high urgent critical"`
 	Status   TicketStatus   `json:"status" gorm:"size:20;not null;default:'open';index" validate:"required,oneof=open in_progress pending resolved closed cancelled"`
-	Source   TicketSource   `json:"source" gorm:"size:20;not null;default:'web';index" validate:"required,oneof=web email phone chat api mobile"`
+	Source   TicketSource   `json:"source" gorm:"size:20;not null;default:'web';index" validate:"required,oneof=web email phone chat api mobile agent"`
+
+	// Agent-native concurrency and provenance
+	Version      uint64                           `json:"version" gorm:"not null;default:1"`
+	AgentContext datatypes.JSONType[AgentContext] `json:"agent_context" gorm:"type:jsonb"`
+	TrustLevel   TicketTrustLevel                 `json:"trust_level" gorm:"size:20;not null;default:'untrusted';index"`
 
 	// 用户关联
 	CreatedByID  uint  `json:"created_by_id" gorm:"not null;index"`
 	CreatedBy    *User `json:"created_by,omitempty" gorm:"foreignKey:CreatedByID"`
 	AssignedToID *uint `json:"assigned_to_id,omitempty" gorm:"index"`
 	AssignedTo   *User `json:"assigned_to,omitempty" gorm:"foreignKey:AssignedToID"`
+
+	// Actor fields are authoritative for Agent-native writes. The legacy user
+	// fields above remain populated with the configured compatibility user.
+	CreatedByActorType  ActorType `json:"created_by_actor_type" gorm:"size:32;not null;default:'human';index"`
+	CreatedByActorID    string    `json:"created_by_actor_id" gorm:"size:128;index"`
+	AssignedToActorType ActorType `json:"assigned_to_actor_type,omitempty" gorm:"size:32;index"`
+	AssignedToActorID   string    `json:"assigned_to_actor_id,omitempty" gorm:"size:128;index"`
+
+	CreatedByServicePrincipalID  *string           `json:"created_by_service_principal_id,omitempty" gorm:"size:36;index"`
+	CreatedByServicePrincipal    *ServicePrincipal `json:"created_by_service_principal,omitempty" gorm:"foreignKey:CreatedByServicePrincipalID"`
+	AssignedToServicePrincipalID *string           `json:"assigned_to_service_principal_id,omitempty" gorm:"size:36;index"`
+	AssignedToServicePrincipal   *ServicePrincipal `json:"assigned_to_service_principal,omitempty" gorm:"foreignKey:AssignedToServicePrincipalID"`
 
 	// 分类和标签
 	CategoryID    *uint                       `json:"category_id,omitempty" gorm:"index"`
@@ -243,7 +297,7 @@ type TicketCreateRequest struct {
 	Type          TicketType     `json:"type" binding:"required,oneof=incident request problem change complaint consultation"`
 	Priority      TicketPriority `json:"priority" binding:"required,oneof=low normal high urgent critical"`
 	Status        *TicketStatus  `json:"status" binding:"omitempty,oneof=open in_progress pending resolved closed cancelled"`
-	Source        TicketSource   `json:"source" binding:"required,oneof=web email phone chat api mobile"`
+	Source        TicketSource   `json:"source" binding:"required,oneof=web email phone chat api mobile agent"`
 	AssignedToID  *uint          `json:"assigned_to_id"`
 	CategoryID    *uint          `json:"category_id"`
 	SubcategoryID *uint          `json:"subcategory_id"`
@@ -254,6 +308,7 @@ type TicketCreateRequest struct {
 	CustomerName  string         `json:"customer_name"`
 	Attachments   []string       `json:"attachments"`
 	CustomFields  *JSONMap       `json:"custom_fields"`
+	AgentContext  *AgentContext  `json:"agent_context"`
 }
 
 // TicketUpdateRequest 工单更新请求
@@ -263,7 +318,7 @@ type TicketUpdateRequest struct {
 	Type          *TicketType     `json:"type" binding:"omitempty,oneof=incident request problem change complaint consultation"`
 	Priority      *TicketPriority `json:"priority" binding:"omitempty,oneof=low normal high urgent critical"`
 	Status        *TicketStatus   `json:"status" binding:"omitempty,oneof=open in_progress pending resolved closed cancelled"`
-	Source        *TicketSource   `json:"source" binding:"omitempty,oneof=web email phone chat api mobile"`
+	Source        *TicketSource   `json:"source" binding:"omitempty,oneof=web email phone chat api mobile agent"`
 	AssignedToID  *uint           `json:"assigned_to_id"`
 	CategoryID    *uint           `json:"category_id"`
 	SubcategoryID *uint           `json:"subcategory_id"`
@@ -276,42 +331,52 @@ type TicketUpdateRequest struct {
 	Rating        *int            `json:"rating" binding:"omitempty,min=1,max=5"`
 	RatingComment *string         `json:"rating_comment"`
 	CustomFields  *JSONMap        `json:"custom_fields"`
+	AgentContext  *AgentContext   `json:"agent_context"`
 }
 
 // TicketResponse 工单响应
 type TicketResponse struct {
-	ID             uint                   `json:"id"`
-	CreatedAt      time.Time              `json:"created_at"`
-	UpdatedAt      time.Time              `json:"updated_at"`
-	TicketNumber   string                 `json:"ticket_number"`
-	Title          string                 `json:"title"`
-	Description    string                 `json:"description"`
-	Type           TicketType             `json:"type"`
-	Priority       TicketPriority         `json:"priority"`
-	Status         TicketStatus           `json:"status"`
-	Source         TicketSource           `json:"source"`
-	CreatedBy      *UserResponse          `json:"created_by,omitempty"`
-	AssignedTo     *UserResponse          `json:"assigned_to,omitempty"`
-	Category       *CategoryResponse      `json:"category,omitempty"`
-	Subcategory    *CategoryResponse      `json:"subcategory,omitempty"`
-	Tags           []string               `json:"tags"`
-	DueDate        *time.Time             `json:"due_date"`
-	ResolvedAt     *time.Time             `json:"resolved_at"`
-	ClosedAt       *time.Time             `json:"closed_at"`
-	FirstReplyAt   *time.Time             `json:"first_reply_at"`
-	SLABreached    bool                   `json:"sla_breached"`
-	SLADueDate     *time.Time             `json:"sla_due_date"`
-	ResponseTime   *int                   `json:"response_time"`
-	ResolutionTime *int                   `json:"resolution_time"`
-	CustomerEmail  string                 `json:"customer_email"`
-	CustomerPhone  string                 `json:"customer_phone"`
-	CustomerName   string                 `json:"customer_name"`
-	Attachments    []string               `json:"attachments"`
-	CustomFields   map[string]interface{} `json:"custom_fields"`
-	ViewCount      int                    `json:"view_count"`
-	CommentCount   int                    `json:"comment_count"`
-	Rating         *int                   `json:"rating"`
-	RatingComment  string                 `json:"rating_comment"`
+	ID              uint                   `json:"id"`
+	CreatedAt       time.Time              `json:"created_at"`
+	UpdatedAt       time.Time              `json:"updated_at"`
+	TicketNumber    string                 `json:"ticket_number"`
+	Title           string                 `json:"title"`
+	Description     string                 `json:"description"`
+	Type            TicketType             `json:"type"`
+	Priority        TicketPriority         `json:"priority"`
+	Status          TicketStatus           `json:"status"`
+	Source          TicketSource           `json:"source"`
+	CreatedByID     uint                   `json:"created_by_id"`
+	CreatedBy       *UserSummary           `json:"created_by,omitempty"`
+	AssignedToID    *uint                  `json:"assigned_to_id,omitempty"`
+	AssignedTo      *UserSummary           `json:"assigned_to,omitempty"`
+	CategoryID      *uint                  `json:"category_id,omitempty"`
+	Category        *CategoryResponse      `json:"category,omitempty"`
+	SubcategoryID   *uint                  `json:"subcategory_id,omitempty"`
+	Subcategory     *CategoryResponse      `json:"subcategory,omitempty"`
+	Tags            []string               `json:"tags"`
+	DueDate         *time.Time             `json:"due_date"`
+	ResolvedAt      *time.Time             `json:"resolved_at"`
+	ClosedAt        *time.Time             `json:"closed_at"`
+	FirstReplyAt    *time.Time             `json:"first_reply_at"`
+	SLABreached     bool                   `json:"sla_breached"`
+	SLADueDate      *time.Time             `json:"sla_due_date"`
+	ResponseTime    *int                   `json:"response_time"`
+	ResolutionTime  *int                   `json:"resolution_time"`
+	CustomerEmail   string                 `json:"customer_email"`
+	CustomerPhone   string                 `json:"customer_phone"`
+	CustomerName    string                 `json:"customer_name"`
+	Attachments     []string               `json:"attachments"`
+	CustomFields    map[string]interface{} `json:"custom_fields"`
+	ViewCount       int                    `json:"view_count"`
+	CommentCount    int                    `json:"comment_count"`
+	Rating          *int                   `json:"rating"`
+	RatingComment   string                 `json:"rating_comment"`
+	Version         uint64                 `json:"version"`
+	AgentContext    AgentContext           `json:"agent_context"`
+	TrustLevel      TicketTrustLevel       `json:"trust_level"`
+	CreatedByActor  ActorRef               `json:"created_by_actor"`
+	AssignedToActor *ActorRef              `json:"assigned_to_actor,omitempty"`
 
 	// 工作流计算字段
 	IsOverdue   bool `json:"is_overdue"`   // 是否逾期
@@ -331,6 +396,10 @@ func (t *Ticket) ToResponse() *TicketResponse {
 		Priority:       t.Priority,
 		Status:         t.Status,
 		Source:         t.Source,
+		CreatedByID:    t.CreatedByID,
+		AssignedToID:   t.AssignedToID,
+		CategoryID:     t.CategoryID,
+		SubcategoryID:  t.SubcategoryID,
 		DueDate:        t.DueDate,
 		ResolvedAt:     t.ResolvedAt,
 		ClosedAt:       t.ClosedAt,
@@ -346,18 +415,34 @@ func (t *Ticket) ToResponse() *TicketResponse {
 		CommentCount:   t.CommentCount,
 		Rating:         t.Rating,
 		RatingComment:  t.RatingComment,
+		Version:        t.Version,
+		AgentContext:   t.AgentContext.Data(),
+		TrustLevel:     t.TrustLevel,
 
 		// 计算字段
 		IsOverdue:   t.IsOverdue(),
 		IsEscalated: t.IsEscalated,
 	}
 
+	if t.CreatedByActorType != "" && t.CreatedByActorID != "" {
+		response.CreatedByActor = ActorRef{Type: t.CreatedByActorType, ID: t.CreatedByActorID}
+	} else {
+		response.CreatedByActor = HumanActor(t.CreatedByID)
+	}
+	if t.AssignedToActorType != "" && t.AssignedToActorID != "" {
+		assignedActor := ActorRef{Type: t.AssignedToActorType, ID: t.AssignedToActorID}
+		response.AssignedToActor = &assignedActor
+	} else if t.AssignedToID != nil {
+		assignedActor := HumanActor(*t.AssignedToID)
+		response.AssignedToActor = &assignedActor
+	}
+
 	// 处理关联用户
 	if t.CreatedBy != nil {
-		response.CreatedBy = t.CreatedBy.ToResponse()
+		response.CreatedBy = t.CreatedBy.ToSummary()
 	}
 	if t.AssignedTo != nil {
-		response.AssignedTo = t.AssignedTo.ToResponse()
+		response.AssignedTo = t.AssignedTo.ToSummary()
 	}
 
 	// 处理分类

@@ -22,10 +22,20 @@ export default defineConfig({
   build: {
     rollupOptions: {
       output: {
-        manualChunks: {
-          vendor: ['react', 'react-dom', 'react-router-dom'],
-          ui: ['@mui/material', '@mui/icons-material'],
-          admin: ['react-admin', 'ra-data-simple-rest'],
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return
+          if (/[\\/]node_modules[\\/](react|react-dom|react-router|react-router-dom)[\\/]/.test(id)) {
+            return 'vendor'
+          }
+          if (id.includes('/node_modules/@mui/')) {
+            return 'ui'
+          }
+          if (
+            id.includes('/node_modules/react-admin/') ||
+            id.includes('/node_modules/ra-')
+          ) {
+            return 'admin'
+          }
         },
       },
     },

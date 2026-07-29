@@ -1,6 +1,7 @@
 import React from 'react';
-import { Admin, Resource, CustomRoutes, Menu, LayoutProps } from 'react-admin';
-import { Route } from 'react-router-dom';
+import { Admin, Resource, CustomRoutes, Menu, LayoutProps, usePermissions } from 'react-admin';
+import { Navigate, Route } from 'react-router-dom';
+import { Box, CircularProgress } from '@mui/material';
 import { createTheme } from '@mui/material/styles';
 
 // Data and Auth providers
@@ -16,98 +17,191 @@ import {
     AutoFixHigh as AutomationIcon,
     History as HistoryIcon,
     Security as SecurityIcon,
+    SmartToy as AgentIcon,
 } from '@mui/icons-material';
 
-// Enhanced Dashboard
-import { TicketDashboard } from './admin/tickets';
-
-// Ticket Management Components
-import { TicketList, TicketShow, TicketEdit, TicketCreate } from './admin/tickets';
-
-// User Management Components
-import { UserList, UserShow, UserEdit, UserCreate } from './admin/users';
-
-// Notification Components
-import { NotificationList } from './admin/notifications';
-
-// Automation Components
-import {
-    AutomationRuleList,
-    AutomationRuleShow,
-    AutomationRuleCreate,
-    AutomationRuleEdit,
-    AutomationLogList,
-} from './admin/automation';
-
-// Admin Components  
-// import { AdminUserList, AdminEmailSettings, AdminSystemConfig } from './admin/admin';
-
-// System Settings Components
-import { SimpleWorkingSystemSettings, EmailSettings, WebhookSettings, SystemSettings } from './admin/settings';
 import { CustomLayout as Layout } from './layout/CustomLayout';
 import { CustomAppBar } from './layout/CustomAppBar';
 import LoginPage from './components/auth/LoginPage';
-import TrustedDevices from './admin/security/TrustedDevices';
+import { AppNotification } from './components/layout/AppNotification';
+import { i18nProvider, muiZhCN } from './i18n';
+
+const PageLoading = () => (
+    <Box
+        role="status"
+        aria-label="正在加载页面"
+        sx={{ display: 'grid', minHeight: 240, placeItems: 'center' }}
+    >
+        <CircularProgress size={32} />
+    </Box>
+);
+
+const lazyPage = <P extends object>(
+    loader: () => Promise<{ default: React.ComponentType<P> }>,
+) => {
+    const LazyComponent = React.lazy(loader);
+    const LazyPage = (props: P) => (
+        <React.Suspense fallback={<PageLoading />}>
+            <LazyComponent {...props} />
+        </React.Suspense>
+    );
+    LazyPage.displayName = 'LazyAdminPage';
+    return LazyPage;
+};
+
+const TicketDashboard = lazyPage(() => import('./admin/tickets/TicketDashboard'));
+const TicketList = lazyPage(() => import('./admin/tickets/TicketListEnhanced'));
+const TicketShow = lazyPage(() => import('./admin/tickets/TicketShow'));
+const TicketEdit = lazyPage(() => import('./admin/tickets/TicketEdit'));
+const TicketCreate = lazyPage(() => import('./admin/tickets/TicketCreate'));
+const UserList = lazyPage(() => import('./admin/users/UserList'));
+const UserShow = lazyPage(() => import('./admin/users/UserShow'));
+const UserEdit = lazyPage(() => import('./admin/users/UserEdit'));
+const UserCreate = lazyPage(() => import('./admin/users/UserCreate'));
+const NotificationList = lazyPage(() => import('./admin/notifications/NotificationList'));
+const AutomationRuleList = lazyPage(() => import('./admin/automation/AutomationRuleList'));
+const AutomationRuleShow = lazyPage(() => import('./admin/automation/AutomationRuleShow'));
+const AutomationRuleCreate = lazyPage(() => import('./admin/automation/AutomationRuleCreate'));
+const AutomationRuleEdit = lazyPage(() => import('./admin/automation/AutomationRuleEdit'));
+const AutomationLogList = lazyPage(() => import('./admin/automation/AutomationLogList'));
+const SimpleWorkingSystemSettings = lazyPage(
+    () => import('./admin/settings/SimpleWorkingSystemSettings'),
+);
+const EmailSettings = lazyPage(() => import('./admin/settings/EmailSettings'));
+const WebhookSettings = lazyPage(() => import('./admin/settings/WebhookSettings'));
+const SystemSettings = lazyPage(() => import('./admin/settings/SystemSettings'));
+const TrustedDevices = lazyPage(() => import('./admin/security/TrustedDevices'));
+const AgentControlCenter = lazyPage(() => import('./admin/agents/AgentControlCenter'));
 
 /**
  * 自定义MUI主题
  */
-const theme = createTheme({
-    palette: {
-        mode: 'light',
-        primary: {
-            main: '#3b82f6',
-            light: '#60a5fa',
-            dark: '#1d4ed8',
-            contrastText: '#ffffff',
+const theme = createTheme(
+    {
+        palette: {
+            mode: 'light',
+            primary: {
+                main: '#3b82f6',
+                light: '#60a5fa',
+                dark: '#1d4ed8',
+                contrastText: '#ffffff',
+            },
+            secondary: {
+                main: '#64748b',
+                light: '#94a3b8',
+                dark: '#475569',
+                contrastText: '#ffffff',
+            },
+            background: {
+                default: '#f8fafc',
+                paper: '#ffffff',
+            },
         },
-        secondary: {
-            main: '#64748b',
-            light: '#94a3b8',
-            dark: '#475569',
-            contrastText: '#ffffff',
+        typography: {
+            fontFamily: [
+                'Inter',
+                '-apple-system',
+                'BlinkMacSystemFont',
+                '"Segoe UI"',
+                'Roboto',
+                '"Helvetica Neue"',
+                'Arial',
+                'sans-serif',
+            ].join(','),
         },
-        background: {
-            default: '#f8fafc',
-            paper: '#ffffff',
+        shape: {
+            borderRadius: 12,
         },
     },
-    typography: {
-        fontFamily: [
-            'Inter',
-            '-apple-system',
-            'BlinkMacSystemFont',
-            '"Segoe UI"',
-            'Roboto',
-            '"Helvetica Neue"',
-            'Arial',
-            'sans-serif',
-        ].join(','),
-    },
-    shape: {
-        borderRadius: 12,
-    },
-});
+    muiZhCN,
+);
+
+type AppPermissions = {
+    role?: string;
+};
+
+const administrativeRoles = new Set(['supervisor', 'admin', 'superuser']);
+
+const hasAdministrativeRole = (permissions?: AppPermissions) =>
+    administrativeRoles.has(permissions?.role ?? '');
+
+const AdministrativeRoute = ({ children }: React.PropsWithChildren) => {
+    const { permissions, isPending } = usePermissions<AppPermissions>();
+
+    if (isPending) {
+        return null;
+    }
+
+    if (!hasAdministrativeRole(permissions)) {
+        return <Navigate to="/" replace />;
+    }
+
+    return <>{children}</>;
+};
+
+const withAdministrativeAccess = <P extends object,>(Component: React.ComponentType<P>) => {
+    const GuardedAdministrativeView = (props: P) => (
+        <AdministrativeRoute>
+            <Component {...props} />
+        </AdministrativeRoute>
+    );
+    GuardedAdministrativeView.displayName = `Administrative${
+        Component.displayName || Component.name || 'View'
+    }`;
+    return GuardedAdministrativeView;
+};
+
+const AdministrativeUserList = withAdministrativeAccess(UserList);
+const AdministrativeUserShow = withAdministrativeAccess(UserShow);
+const AdministrativeUserEdit = withAdministrativeAccess(UserEdit);
+const AdministrativeUserCreate = withAdministrativeAccess(UserCreate);
+const AdministrativeAutomationRuleList = withAdministrativeAccess(AutomationRuleList);
+const AdministrativeAutomationRuleShow = withAdministrativeAccess(AutomationRuleShow);
+const AdministrativeAutomationRuleEdit = withAdministrativeAccess(AutomationRuleEdit);
+const AdministrativeAutomationRuleCreate = withAdministrativeAccess(AutomationRuleCreate);
+const AdministrativeAutomationLogList = withAdministrativeAccess(AutomationLogList);
 
 /**
- * 自定义菜单组件 - 添加系统设置菜单项
+ * 自定义菜单组件 - 只展示当前角色可访问的管理入口
  */
-const CustomMenu: React.FC = () => (
-    <Menu>
-        <Menu.DashboardItem />
-        <Menu.ResourceItems />
-        <Menu.Item
-            to="/system-settings"
-            primaryText="系统设置"
-            leftIcon={<AdminIcon />}
-        />
-        <Menu.Item
-            to="/account/trusted-devices"
-            primaryText="账号安全"
-            leftIcon={<SecurityIcon />}
-        />
-    </Menu>
-);
+const CustomMenu: React.FC = () => {
+    const { permissions } = usePermissions<AppPermissions>();
+    const canAdminister = hasAdministrativeRole(permissions);
+
+    return (
+        <Menu>
+            <Menu.DashboardItem primaryText="仪表盘" />
+            <Menu.Item to="/tickets" primaryText="工单管理" leftIcon={<TicketIcon />} />
+            <Menu.Item to="/notifications" primaryText="通知中心" leftIcon={<NotificationIcon />} />
+            {canAdminister && <Menu.Item to="/users" primaryText="用户管理" leftIcon={<UsersIcon />} />}
+            {canAdminister && (
+                <Menu.Item to="/automation-rules" primaryText="自动化规则" leftIcon={<AutomationIcon />} />
+            )}
+            {canAdminister && (
+                <Menu.Item to="/automation-logs" primaryText="自动化日志" leftIcon={<HistoryIcon />} />
+            )}
+            {canAdminister && (
+                <Menu.Item
+                    to="/system-settings"
+                    primaryText="系统设置"
+                    leftIcon={<AdminIcon />}
+                />
+            )}
+            {canAdminister && (
+                <Menu.Item
+                    to="/agent-control"
+                    primaryText="AI 智能体控制"
+                    leftIcon={<AgentIcon />}
+                />
+            )}
+            <Menu.Item
+                to="/account/trusted-devices"
+                primaryText="账号安全"
+                leftIcon={<SecurityIcon />}
+            />
+        </Menu>
+    );
+};
 
 /**
  * 自定义布局组件
@@ -124,11 +218,13 @@ export const AdminApp: React.FC = () => {
         <Admin
             dataProvider={dataProvider}
             authProvider={authProvider}
+            i18nProvider={i18nProvider}
             dashboard={TicketDashboard}
             theme={theme}
             title="工单管理系统"
             layout={LayoutWithMenu}
             loginPage={LoginPage}
+            notification={AppNotification}
             requireAuth
         >
             {/* 工单管理资源 */}
@@ -148,10 +244,10 @@ export const AdminApp: React.FC = () => {
             {/* 用户管理资源 */}
             <Resource
                 name="users"
-                list={UserList}
-                show={UserShow}
-                edit={UserEdit}
-                create={UserCreate}
+                list={AdministrativeUserList}
+                show={AdministrativeUserShow}
+                edit={AdministrativeUserEdit}
+                create={AdministrativeUserCreate}
                 icon={UsersIcon}
                 recordRepresentation={(record) => 
                     `${record.first_name || ''} ${record.last_name || ''}`.trim() || record.username
@@ -174,10 +270,10 @@ export const AdminApp: React.FC = () => {
             {/* 自动化规则 */}
             <Resource
                 name="automation-rules"
-                list={AutomationRuleList}
-                show={AutomationRuleShow}
-                edit={AutomationRuleEdit}
-                create={AutomationRuleCreate}
+                list={AdministrativeAutomationRuleList}
+                show={AdministrativeAutomationRuleShow}
+                edit={AdministrativeAutomationRuleEdit}
+                create={AdministrativeAutomationRuleCreate}
                 icon={AutomationIcon}
                 options={{
                     label: '自动化规则',
@@ -186,7 +282,7 @@ export const AdminApp: React.FC = () => {
 
             <Resource
                 name="automation-logs"
-                list={AutomationLogList}
+                list={AdministrativeAutomationLogList}
                 icon={HistoryIcon}
                 options={{
                     label: '自动化日志',
@@ -197,15 +293,51 @@ export const AdminApp: React.FC = () => {
             {/* 自定义路由 */}
             <CustomRoutes>
                 {/* 系统设置主页面 */}
-                <Route path="/system-settings" element={<SimpleWorkingSystemSettings />} />
+                <Route
+                    path="/system-settings"
+                    element={(
+                        <AdministrativeRoute>
+                            <SimpleWorkingSystemSettings />
+                        </AdministrativeRoute>
+                    )}
+                />
 
                 {/* 邮件设置 */}
-                <Route path="/email-settings" element={<EmailSettings />} />
+                <Route
+                    path="/email-settings"
+                    element={(
+                        <AdministrativeRoute>
+                            <EmailSettings />
+                        </AdministrativeRoute>
+                    )}
+                />
 
                 {/* Webhook设置 */}
-                <Route path="/webhook-settings" element={<WebhookSettings />} />
-                <Route path="/system-settings/overview" element={<SystemSettings />} />
+                <Route
+                    path="/webhook-settings"
+                    element={(
+                        <AdministrativeRoute>
+                            <WebhookSettings />
+                        </AdministrativeRoute>
+                    )}
+                />
+                <Route
+                    path="/system-settings/overview"
+                    element={(
+                        <AdministrativeRoute>
+                            <SystemSettings />
+                        </AdministrativeRoute>
+                    )}
+                />
                 <Route path="/account/trusted-devices" element={<TrustedDevices />} />
+                <Route
+                    path="/agent-control"
+                    element={(
+                        <AdministrativeRoute>
+                            <AgentControlCenter />
+                        </AdministrativeRoute>
+                    )}
+                />
             </CustomRoutes>
         </Admin>
     );

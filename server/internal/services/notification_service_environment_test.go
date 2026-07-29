@@ -49,6 +49,7 @@ func TestSendWebhookLogEnvironment(t *testing.T) {
 	}
 
 	service := NewNotificationService(db)
+	useTestWebhookClient(service, server.Client())
 	event := &NotificationEvent{
 		Type:         models.WebhookEventSystemAlert,
 		ResourceID:   1,
@@ -59,8 +60,8 @@ func TestSendWebhookLogEnvironment(t *testing.T) {
 		Timestamp:    time.Now(),
 	}
 
-	if err := service.sendWebhook(context.Background(), &config, event); err != nil {
-		t.Fatalf("sendWebhook returned error: %v", err)
+	if err := service.sendWebhookAttempt(context.Background(), &config, event); err != nil {
+		t.Fatalf("sendWebhookAttempt returned error: %v", err)
 	}
 
 	var log models.WebhookLog

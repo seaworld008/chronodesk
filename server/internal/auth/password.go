@@ -2,8 +2,6 @@ package auth
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -17,20 +15,15 @@ import (
 // SimplePasswordService 简单密码服务实现
 type SimplePasswordService struct {
 	minLength int
-	salt      string
 }
 
 // NewSimplePasswordService 创建简单密码服务
-func NewSimplePasswordService(minLength int, salt string) *SimplePasswordService {
+func NewSimplePasswordService(minLength int, _ string) *SimplePasswordService {
 	if minLength < 8 {
 		minLength = 8
 	}
-	if salt == "" {
-		salt = "default-salt-change-in-production"
-	}
 	return &SimplePasswordService{
 		minLength: minLength,
-		salt:      salt,
 	}
 }
 
@@ -54,29 +47,14 @@ func (s *SimplePasswordService) VerifyPassword(hashedPassword, password string) 
 		return errors.New("password and hash cannot be empty")
 	}
 
-	// bcrypt hash
-	if strings.HasPrefix(hashedPassword, "$2") {
-		if err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password)); err != nil {
-			return errors.New("password verification failed")
-		}
-		return nil
+	if !strings.HasPrefix(hashedPassword, "$2") {
+		return errors.New("unsupported password hash")
 	}
-
-	// legacy SHA256 hash fallback for migration period
-	computedHash := s.legacySHA256Hash(password)
-	if subtle.ConstantTimeCompare([]byte(computedHash), []byte(hashedPassword)) != 1 {
+	if err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password)); err != nil {
 		return errors.New("password verification failed")
 	}
 
 	return nil
-}
-
-func (s *SimplePasswordService) legacySHA256Hash(password string) string {
-	hasher := sha256.New()
-	hasher.Write([]byte(s.salt))
-	hasher.Write([]byte(password))
-	hasher.Write([]byte(s.salt))
-	return hex.EncodeToString(hasher.Sum(nil))
 }
 
 // ValidatePassword 验证密码强度

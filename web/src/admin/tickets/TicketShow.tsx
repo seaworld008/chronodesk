@@ -6,7 +6,6 @@ import {
     DateField,
     SelectField,
     ReferenceField,
-    BooleanField,
     NumberField,
     RichTextField,
     useRecordContext,
@@ -17,7 +16,10 @@ import {
     TabbedShowLayout,
     Tab,
     ReferenceManyField,
-    Datagrid,
+    WrapperField,
+    FunctionField,
+    useGetIdentity,
+    usePermissions,
 } from 'react-admin';
 import {
     Box,
@@ -42,6 +44,99 @@ import {
 import { parseTagsToArray } from './tagUtils';
 import BackButton from '../common/BackButton';
 import { Ticket } from '@/types';
+import TicketWorkflowActions from './TicketWorkflowActions';
+import { TicketConversationPanel } from './TicketConversationPanel';
+import {
+    canDeleteTicket,
+    canMutateTicket,
+    type TicketRolePermissions,
+} from './ticketAccess';
+import {
+    EnterpriseDatagrid,
+    TruncatedText,
+    type ResizableColumn,
+} from '@/components/tables/EnterpriseTable';
+
+const ticketHistoryColumns: ResizableColumn[] = [
+    { key: 'action', defaultWidth: 180, minWidth: 128, maxWidth: 320 },
+    { key: 'field_name', defaultWidth: 144, minWidth: 104, maxWidth: 240 },
+    { key: 'old_value', defaultWidth: 300, minWidth: 160, maxWidth: 640 },
+    { key: 'new_value', defaultWidth: 300, minWidth: 160, maxWidth: 640 },
+    { key: 'actor', defaultWidth: 200, minWidth: 144, maxWidth: 360 },
+    { key: 'created_at', defaultWidth: 188, minWidth: 144, maxWidth: 280 },
+];
+
+const historyActionLabels: Record<string, string> = {
+    create: '创建工单',
+    update: '更新工单',
+    status_change: '变更状态',
+    priority_change: '变更优先级',
+    assign: '分配工单',
+    unassign: '取消分配',
+    comment: '添加评论',
+    attachment: '添加附件',
+    close: '关闭工单',
+    reopen: '重新打开',
+    escalate: '升级工单',
+    merge: '合并工单',
+    split: '拆分工单',
+    transfer: '转移工单',
+    resolve: '解决工单',
+    reject: '拒绝工单',
+    approve: '批准工单',
+    system: '系统操作',
+};
+
+const historyFieldLabels: Record<string, string> = {
+    title: '标题',
+    description: '描述',
+    status: '状态',
+    priority: '优先级',
+    type: '类型',
+    source: '来源',
+    assigned_to_id: '处理人',
+    category_id: '分类',
+    due_date: '截止时间',
+    escalation: '升级状态',
+};
+
+const historyValueLabels: Record<string, string> = {
+    open: '待处理',
+    in_progress: '处理中',
+    pending: '等待中',
+    resolved: '已解决',
+    closed: '已关闭',
+    cancelled: '已取消',
+    low: '低',
+    normal: '普通',
+    high: '高',
+    urgent: '紧急',
+    critical: '严重',
+    incident: '事件',
+    request: '请求',
+    problem: '问题',
+    change: '变更',
+    complaint: '投诉',
+    consultation: '咨询',
+    web: '网页',
+    email: '邮件',
+    phone: '电话',
+    chat: '聊天',
+    api: 'API',
+};
+
+const translateHistoryField = (fieldName?: string) => {
+    if (!fieldName) return '—';
+    return fieldName
+        .split(',')
+        .map((field) => historyFieldLabels[field.trim()] || '其他字段')
+        .join('、');
+};
+
+const translateHistoryValue = (value?: string) => {
+    if (!value) return '—';
+    return historyValueLabels[value] || value;
+};
 
 // 选项配置（与TicketList保持一致）
 const statusChoices = [
@@ -109,19 +204,23 @@ const TicketHeader: React.FC = () => {
         }
     };
 
-    const statusName = statusChoices.find(s => s.id === record.status)?.name || record.status;
-    const priorityName = priorityChoices.find(p => p.id === record.priority)?.name || record.priority;
+    const statusName = statusChoices.find(s => s.id === record.status)?.name || '未知状态';
+    const priorityName = priorityChoices.find(p => p.id === record.priority)?.name || '未知优先级';
 
     return (
         <Card sx={{ mb: 3, borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)', overflow: 'visible' }}>
             <CardHeader
                 title={
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap' }}>
-                        <Typography variant="h5" component="h1" fontWeight={700} sx={{
-                            background: 'linear-gradient(45deg, #1e293b 30%, #334155 90%)',
-                            WebkitBackgroundClip: 'text',
-                            WebkitTextFillColor: 'transparent',
-                        }}>
+                        <Typography
+                            variant="h5"
+                            component="h1"
+                            sx={{
+                                fontWeight: 700,
+                                background: 'linear-gradient(45deg, #1e293b 30%, #334155 90%)',
+                                WebkitBackgroundClip: 'text',
+                                WebkitTextFillColor: 'transparent'
+                            }}>
                             {record.title}
                         </Typography>
                         <Chip
@@ -175,24 +274,30 @@ const CustomerInfoCard: React.FC = () => {
         <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
             <CardHeader
                 title="客户信息"
-                titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                 avatar={<PersonIcon color="primary" />}
                 sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
             />
             <CardContent>
                 <Stack spacing={2}>
                     <Box>
-                        <Typography variant="subtitle2" color="text.secondary">
+                        <Typography variant="subtitle2" sx={{
+                            color: "text.secondary"
+                        }}>
                             姓名
                         </Typography>
-                        <Typography variant="body1" fontWeight={500}>
+                        <Typography variant="body1" sx={{
+                            fontWeight: 500
+                        }}>
                             {record.customer_name || '未提供'}
                         </Typography>
                     </Box>
 
                     {record.customer_email && (
                         <Box>
-                            <Typography variant="subtitle2" color="text.secondary">
+                            <Typography variant="subtitle2" sx={{
+                                color: "text.secondary"
+                            }}>
                                 邮箱
                             </Typography>
                             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -206,7 +311,9 @@ const CustomerInfoCard: React.FC = () => {
 
                     {record.customer_phone && (
                         <Box>
-                            <Typography variant="subtitle2" color="text.secondary">
+                            <Typography variant="subtitle2" sx={{
+                                color: "text.secondary"
+                            }}>
                                 电话
                             </Typography>
                             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -234,15 +341,59 @@ const TicketTagsDisplay: React.FC = () => {
 
     return (
         <Box sx={{ flex: 1, minWidth: '150px' }}>
-            <Typography variant="subtitle2" color="text.secondary">
+            <Typography variant="subtitle2" sx={{
+                color: "text.secondary"
+            }}>
                 标签
             </Typography>
-            <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+            <Stack direction="row" spacing={1} useFlexGap sx={{
+                flexWrap: "wrap"
+            }}>
                 {tags.map((tag) => (
                     <Chip key={tag} label={tag} size="small" variant="outlined" />
                 ))}
             </Stack>
         </Box>
+    );
+};
+
+const ActorDisplayField: React.FC = () => {
+    const record = useRecordContext<{
+        actor?: { type?: string; id?: string }
+        user?: { username?: string }
+        service_principal?: { name?: string }
+    }>();
+    if (!record) return null;
+
+    let label = record.user?.username || record.service_principal?.name;
+    if (!label) {
+        const actorType = record.actor?.type;
+        const actorID = record.actor?.id;
+        if (actorType === 'system') {
+            label = actorID === 'sla-monitor' ? '系统 · SLA 监控' : `系统${actorID ? ` · ${actorID}` : ''}`;
+        } else if (actorType === 'service_principal') {
+            label = `AI 智能体${actorID ? ` · ${actorID}` : ''}`;
+        } else if (actorType === 'human') {
+            label = `用户${actorID ? ` · ${actorID}` : ''}`;
+        } else {
+            label = '系统';
+        }
+    }
+
+    return <Typography variant="body2">{label}</Typography>;
+};
+
+const TicketUserDisplay: React.FC<{ kind: 'creator' | 'assignee' }> = ({ kind }) => {
+    const record = useRecordContext<Ticket>();
+    if (!record) return null;
+    const user = kind === 'creator' ? record.created_by : record.assigned_to;
+    if (!user) {
+        return <Typography variant="body2">{kind === 'creator' ? '未知' : '未分配'}</Typography>;
+    }
+    return (
+        <Typography variant="body2">
+            {user.display_name || user.username}
+        </Typography>
     );
 };
 
@@ -257,14 +408,16 @@ const TimeTrackingCard: React.FC = () => {
         <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
             <CardHeader
                 title="时间跟踪"
-                titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                 avatar={<TimeIcon color="primary" />}
                 sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
             />
             <CardContent>
                 <Stack spacing={2}>
                     <Box>
-                        <Typography variant="subtitle2" color="text.secondary">
+                        <Typography variant="subtitle2" sx={{
+                            color: "text.secondary"
+                        }}>
                             创建时间
                         </Typography>
                         <Typography variant="body1">
@@ -274,7 +427,9 @@ const TimeTrackingCard: React.FC = () => {
 
                     {record.due_date && (
                         <Box>
-                            <Typography variant="subtitle2" color="text.secondary">
+                            <Typography variant="subtitle2" sx={{
+                                color: "text.secondary"
+                            }}>
                                 截止时间
                             </Typography>
                             <Typography
@@ -289,7 +444,9 @@ const TimeTrackingCard: React.FC = () => {
 
                     {record.first_reply_at && (
                         <Box>
-                            <Typography variant="subtitle2" color="text.secondary">
+                            <Typography variant="subtitle2" sx={{
+                                color: "text.secondary"
+                            }}>
                                 首次回复时间
                             </Typography>
                             <Typography variant="body1">
@@ -300,10 +457,14 @@ const TimeTrackingCard: React.FC = () => {
 
                     {record.resolved_at && (
                         <Box>
-                            <Typography variant="subtitle2" color="text.secondary">
+                            <Typography variant="subtitle2" sx={{
+                                color: "text.secondary"
+                            }}>
                                 解决时间
                             </Typography>
-                            <Typography variant="body1" color="success.main">
+                            <Typography variant="body1" sx={{
+                                color: "success.main"
+                            }}>
                                 {new Date(record.resolved_at).toLocaleString('zh-CN')}
                             </Typography>
                         </Box>
@@ -311,7 +472,9 @@ const TimeTrackingCard: React.FC = () => {
 
                     {record.closed_at && (
                         <Box>
-                            <Typography variant="subtitle2" color="text.secondary">
+                            <Typography variant="subtitle2" sx={{
+                                color: "text.secondary"
+                            }}>
                                 关闭时间
                             </Typography>
                             <Typography variant="body1">
@@ -340,7 +503,7 @@ const SLAInfoCard: React.FC = () => {
         <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
             <CardHeader
                 title="SLA信息"
-                titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                 avatar={<ScheduleIcon color="primary" />}
                 sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
             />
@@ -354,7 +517,9 @@ const SLAInfoCard: React.FC = () => {
 
                     {record.sla_due_date && (
                         <Box>
-                            <Typography variant="subtitle2" color="text.secondary">
+                            <Typography variant="subtitle2" sx={{
+                                color: "text.secondary"
+                            }}>
                                 SLA截止时间
                             </Typography>
                             <Typography
@@ -368,7 +533,9 @@ const SLAInfoCard: React.FC = () => {
 
                     {record.response_time && (
                         <Box>
-                            <Typography variant="subtitle2" color="text.secondary">
+                            <Typography variant="subtitle2" sx={{
+                                color: "text.secondary"
+                            }}>
                                 响应时间
                             </Typography>
                             <Typography variant="body1">
@@ -379,7 +546,9 @@ const SLAInfoCard: React.FC = () => {
 
                     {record.resolution_time && (
                         <Box>
-                            <Typography variant="subtitle2" color="text.secondary">
+                            <Typography variant="subtitle2" sx={{
+                                color: "text.secondary"
+                            }}>
                                 解决时间
                             </Typography>
                             <Typography variant="body1">
@@ -396,13 +565,22 @@ const SLAInfoCard: React.FC = () => {
 /**
  * 顶部工具栏
  */
-const TicketShowActions = () => (
-    <TopToolbar>
-        <ListButton label="返回列表" />
-        <EditButton label="编辑" />
-        <DeleteButton label="删除" />
-    </TopToolbar>
-);
+const TicketShowActions = () => {
+    const record = useRecordContext<Ticket>();
+    const { permissions } = usePermissions<TicketRolePermissions>();
+    const { identity } = useGetIdentity();
+    const canMutate = canMutateTicket(record, permissions?.role, identity?.id);
+
+    return (
+        <TopToolbar>
+            <ListButton label="返回列表" />
+            {canMutate && <EditButton label="编辑" />}
+            {canDeleteTicket(permissions?.role) && (
+                <DeleteButton label="删除" mutationMode="pessimistic" />
+            )}
+        </TopToolbar>
+    );
+};
 
 /**
  * 工单详情页面
@@ -412,6 +590,9 @@ const TicketShow: React.FC = () => {
         <Show actions={<TicketShowActions />} title="工单详情">
             <Box sx={{ p: 0 }}>
                 <TicketHeader />
+                <Box sx={{ px: 3, mb: 2 }}>
+                    <TicketWorkflowActions />
+                </Box>
                 <Box sx={{ px: 3 }}>
                     <BackButton />
                 </Box>
@@ -426,7 +607,7 @@ const TicketShow: React.FC = () => {
                                     <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                                         <CardHeader
                                             title="工单描述"
-                                            titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                            slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                             sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                                         />
                                         <CardContent>
@@ -438,45 +619,51 @@ const TicketShow: React.FC = () => {
                                     <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                                         <CardHeader
                                             title="基本信息"
-                                            titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+                                            slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                             sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                                         />
                                         <CardContent>
                                             <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
-                                                    <Typography variant="subtitle2" color="text.secondary">
+                                                    <Typography variant="subtitle2" sx={{
+                                                        color: "text.secondary"
+                                                    }}>
                                                         类型
                                                     </Typography>
                                                     <SelectField source="type" choices={typeChoices} />
                                                 </Box>
 
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
-                                                    <Typography variant="subtitle2" color="text.secondary">
+                                                    <Typography variant="subtitle2" sx={{
+                                                        color: "text.secondary"
+                                                    }}>
                                                         来源
                                                     </Typography>
                                                     <SelectField source="source" choices={sourceChoices} />
                                                 </Box>
 
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
-                                                    <Typography variant="subtitle2" color="text.secondary">
+                                                    <Typography variant="subtitle2" sx={{
+                                                        color: "text.secondary"
+                                                    }}>
                                                         创建人
                                                     </Typography>
-                                                    <ReferenceField source="created_by_id" reference="users">
-                                                        <TextField source="username" />
-                                                    </ReferenceField>
+                                                    <TicketUserDisplay kind="creator" />
                                                 </Box>
 
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
-                                                    <Typography variant="subtitle2" color="text.secondary">
+                                                    <Typography variant="subtitle2" sx={{
+                                                        color: "text.secondary"
+                                                    }}>
                                                         分配给
                                                     </Typography>
-                                                    <ReferenceField source="assigned_to_id" reference="users" emptyText="未分配">
-                                                        <TextField source="username" />
-                                                    </ReferenceField>
+                                                    <TicketUserDisplay kind="assignee" />
                                                 </Box>
 
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
-                                                    <Typography variant="subtitle2" color="text.secondary">
+                                                    <Typography variant="subtitle2" sx={{
+                                                        color: "text.secondary"
+                                                    }}>
                                                         分类
                                                     </Typography>
                                                     <ReferenceField source="category_id" reference="categories" emptyText="未分类">
@@ -503,69 +690,7 @@ const TicketShow: React.FC = () => {
 
                     {/* 评论历史 */}
                     <Tab label="评论历史">
-                        <ReferenceManyField
-                            reference="comments"
-                            target="ticket_id"
-                            label="评论"
-                            perPage={20}
-                            sort={{ field: 'created_at', order: 'DESC' }}
-                        >
-                            <Datagrid
-                                bulkActionButtons={false}
-                                sx={{
-                                    '& .RaDatagrid-table': {
-                                        borderCollapse: 'separate',
-                                        borderSpacing: '0 8px',
-                                        backgroundColor: 'transparent',
-                                        '& .RaDatagrid-headerCell': {
-                                            backgroundColor: 'transparent',
-                                            color: 'text.secondary',
-                                            fontWeight: 600,
-                                            borderBottom: 'none',
-                                        },
-                                        '& .RaDatagrid-tbody': {
-                                            '& .RaDatagrid-row': {
-                                                backgroundColor: '#ffffff',
-                                                borderRadius: 2,
-                                                boxShadow: '0 2px 4px rgba(0,0,0,0.02)',
-                                                transition: 'transform 0.2s, box-shadow 0.2s',
-                                                '&:hover': {
-                                                    transform: 'translateY(-2px)',
-                                                    boxShadow: '0 4px 12px rgba(0,0,0,0.05)',
-                                                    backgroundColor: '#ffffff',
-                                                },
-                                                '& .RaDatagrid-rowCell': {
-                                                    borderTop: '1px solid #f1f5f9',
-                                                    borderBottom: '1px solid #f1f5f9',
-                                                    '&:first-of-type': {
-                                                        borderLeft: '1px solid #f1f5f9',
-                                                        borderTopLeftRadius: 8,
-                                                        borderBottomLeftRadius: 8,
-                                                    },
-                                                    '&:last-child': {
-                                                        borderRight: '1px solid #f1f5f9',
-                                                        borderTopRightRadius: 8,
-                                                        borderBottomRightRadius: 8,
-                                                    },
-                                                },
-                                            },
-                                        },
-                                    },
-                                }}
-                            >
-                                <TextField source="content" label="内容" />
-                                <ReferenceField source="user_id" reference="users" label="用户">
-                                    <TextField source="username" />
-                                </ReferenceField>
-                                <DateField
-                                    source="created_at"
-                                    label="创建时间"
-                                    showTime
-                                    locales="zh-CN"
-                                />
-                                <BooleanField source="is_internal" label="内部评论" />
-                            </Datagrid>
-                        </ReferenceManyField>
+                        <TicketConversationPanel />
                     </Tab>
 
                     {/* 历史记录 */}
@@ -577,7 +702,9 @@ const TicketShow: React.FC = () => {
                             perPage={20}
                             sort={{ field: 'created_at', order: 'DESC' }}
                         >
-                            <Datagrid
+                            <EnterpriseDatagrid
+                                tableId="tickets.show.history"
+                                columns={ticketHistoryColumns}
                                 bulkActionButtons={false}
                                 sx={{
                                     '& .RaDatagrid-table': {
@@ -620,20 +747,48 @@ const TicketShow: React.FC = () => {
                                     },
                                 }}
                             >
-                                <TextField source="action" label="操作" />
-                                <TextField source="field_name" label="字段" />
-                                <TextField source="old_value" label="原值" />
-                                <TextField source="new_value" label="新值" />
-                                <ReferenceField source="user_id" reference="users" label="用户">
-                                    <TextField source="username" />
-                                </ReferenceField>
+                                <FunctionField
+                                    label="操作"
+                                    render={(record) => (
+                                        <TruncatedText title={record?.action || '—'}>
+                                            {historyActionLabels[record?.action] || '其他操作'}
+                                        </TruncatedText>
+                                    )}
+                                />
+                                <FunctionField
+                                    label="字段"
+                                    render={(record) => (
+                                        <TruncatedText title={record?.field_name || '—'}>
+                                            {translateHistoryField(record?.field_name)}
+                                        </TruncatedText>
+                                    )}
+                                />
+                                <FunctionField
+                                    label="原值"
+                                    render={(record) => (
+                                        <TruncatedText title={record?.old_value || '—'}>
+                                            {translateHistoryValue(record?.old_value)}
+                                        </TruncatedText>
+                                    )}
+                                />
+                                <FunctionField
+                                    label="新值"
+                                    render={(record) => (
+                                        <TruncatedText title={record?.new_value || '—'}>
+                                            {translateHistoryValue(record?.new_value)}
+                                        </TruncatedText>
+                                    )}
+                                />
+                                <WrapperField label="操作者">
+                                    <ActorDisplayField />
+                                </WrapperField>
                                 <DateField
                                     source="created_at"
                                     label="时间"
                                     showTime
                                     locales="zh-CN"
                                 />
-                            </Datagrid>
+                            </EnterpriseDatagrid>
                         </ReferenceManyField>
                     </Tab>
 
