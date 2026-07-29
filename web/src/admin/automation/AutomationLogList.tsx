@@ -15,7 +15,6 @@ import {
   TruncatedText,
   type ResizableColumn,
 } from '@/components/tables/EnterpriseTable'
-import { EnterpriseFilterLiveSearch } from '@/components/inputs/EnterpriseSearchInput'
 import {
   EnterpriseBooleanFilterInput,
   EnterpriseReferenceAutocompleteInput,
@@ -32,7 +31,6 @@ const SuccessChip: React.FC<{ value?: boolean }> = ({ value }) => (
 
 const LogListActions = () => (
   <TopToolbar>
-    <EnterpriseFilterLiveSearch />
     <FilterButton />
   </TopToolbar>
 )

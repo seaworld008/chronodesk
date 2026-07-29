@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
 // GetCurrentUserRole 从上下文中获取当前用户角色

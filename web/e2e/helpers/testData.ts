@@ -1,5 +1,10 @@
 import type { APIRequestContext, Page } from '@playwright/test';
-import { apiRequest, login, type Credentials } from './api';
+import {
+    apiRequest,
+    loginSession,
+    type AuthSession,
+    type Credentials,
+} from './api';
 
 export const E2E_PREFIX = 'E2E-';
 export const DEFAULT_PASSWORD = 'Admin123!';
@@ -44,6 +49,8 @@ const RESERVED_EMAILS = new Set([
     ...ROLE_ACCOUNTS.map((account) => account.email),
 ]);
 
+const authSessions = new Map<string, Promise<AuthSession>>();
+
 const extractItems = <T>(payload: unknown): T[] => {
     if (!payload || typeof payload !== 'object') {
         return [];
@@ -64,7 +71,53 @@ const extractItems = <T>(payload: unknown): T[] => {
     return [];
 };
 
-const getAdminToken = async (request: APIRequestContext) => login(request, DEFAULT_ADMIN);
+const getAuthSession = (
+    request: APIRequestContext,
+    credentials: Credentials,
+): Promise<AuthSession> => {
+    const key = credentials.email.toLowerCase();
+    const existing = authSessions.get(key);
+    if (existing) {
+        return existing;
+    }
+
+    const pending = loginSession(request, credentials).catch((error) => {
+        authSessions.delete(key);
+        throw error;
+    });
+    authSessions.set(key, pending);
+    return pending;
+};
+
+const getAdminToken = async (request: APIRequestContext) =>
+    (await getAuthSession(request, DEFAULT_ADMIN)).access_token;
+
+export const authenticatePage = async (
+    page: Page,
+    credentials: Credentials = DEFAULT_ADMIN,
+) => {
+    const session = await getAuthSession(page.request, credentials);
+    await page.addInitScript((auth) => {
+        localStorage.setItem('token', auth.access_token);
+        if (auth.refresh_token) {
+            localStorage.setItem('refreshToken', auth.refresh_token);
+        }
+        if (auth.user) {
+            localStorage.setItem('user', JSON.stringify(auth.user));
+        }
+        if (auth.permissions) {
+            localStorage.setItem('permissions', JSON.stringify(auth.permissions));
+        }
+        if (auth.expires_in) {
+            localStorage.setItem(
+                'tokenExpiresAt',
+                String(Date.now() + auth.expires_in * 1000),
+            );
+        }
+    }, session);
+    await page.goto('/#/');
+    await page.getByRole('menuitem', { name: '工单管理' }).waitFor({ timeout: 15000 });
+};
 
 export const loginViaUI = async (page: Page, credentials: Credentials = DEFAULT_ADMIN) => {
     await page.goto('/#/login');
@@ -90,6 +143,24 @@ export const ensureRoleAccounts = async (request: APIRequestContext) => {
     for (const account of ROLE_ACCOUNTS) {
         const existing = await findUserByEmail(request, token, account.email);
         if (existing) {
+            if (typeof existing.id !== 'number') {
+                throw new Error(`角色测试账号缺少有效 ID: ${account.email}`);
+            }
+            await apiRequest(request, token, `/api/admin/users/${existing.id}`, {
+                method: 'PUT',
+                data: {
+                    role: account.role,
+                    status: 'active',
+                    first_name: account.first_name,
+                    last_name: account.last_name,
+                    department: account.department,
+                    job_title: account.job_title,
+                },
+            });
+            await apiRequest(request, token, `/api/admin/users/${existing.id}/reset-password`, {
+                method: 'POST',
+                data: { new_password: DEFAULT_PASSWORD },
+            });
             continue;
         }
         await apiRequest(request, token, '/api/admin/users', {

@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/seaworld008/chronodesk/server/internal/agentcontract"
+	"github.com/seaworld008/chronodesk/server/internal/version"
 )
 
 type AgentCard struct {
@@ -100,18 +103,7 @@ type CardOptions struct {
 	DocumentationURL string
 }
 
-var a2aScopes = map[string]string{
-	"tickets:read":       "Read visible tickets and A2A task context.",
-	"tickets:create":     "Create tickets through an authorized skill.",
-	"tickets:update":     "Update ticket fields through an authorized skill.",
-	"tickets:assign":     "Assign tickets through an authorized skill.",
-	"tickets:transition": "Transition ticket lifecycle state.",
-	"comments:write":     "Add ticket comments.",
-	"attachments:read":   "Read authorized ticket attachments.",
-	"attachments:write":  "Attach content to tickets.",
-	"events:subscribe":   "Subscribe to task and ticket events.",
-	"tasks:manage":       "Create, inspect, continue, and cancel A2A tasks.",
-}
+var a2aScopes = agentcontract.ScopeDescriptions()
 
 func DefaultAgentCard(opts CardOptions) AgentCard {
 	baseURL := strings.TrimRight(opts.BaseURL, "/")
@@ -119,7 +111,7 @@ func DefaultAgentCard(opts CardOptions) AgentCard {
 		baseURL = "http://localhost:8081"
 	}
 	if opts.AgentVersion == "" {
-		opts.AgentVersion = "1.0.0"
+		opts.AgentVersion = version.Version
 	}
 	if opts.ProviderName == "" {
 		opts.ProviderName = "ChronoDesk"

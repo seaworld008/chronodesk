@@ -7,7 +7,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
 func setupFilterTestDB(t *testing.T) *gorm.DB {

@@ -8,7 +8,7 @@ import (
 	"net/url"
 	"testing"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 
 	"github.com/gin-gonic/gin"
 )

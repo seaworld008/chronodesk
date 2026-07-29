@@ -32,6 +32,7 @@ import { useNavigate } from 'react-router-dom'
 import { alpha } from '@mui/material/styles'
 import { RatioRow } from '@/components/layout/RatioRow'
 import { API_BASE } from '@/lib/apiClient'
+import { isAgentRole, type RolePermissions } from '@/lib/accessControl'
 import {
   PieChart,
   Pie,
@@ -191,7 +192,7 @@ const renderActiveShape = (props: PieActiveShapeProps) => {
 }
 
 export const TicketDashboard: React.FC = () => {
-  const { permissions } = usePermissions()
+  const { permissions } = usePermissions<RolePermissions>()
   const navigate = useNavigate()
   const theme = useTheme()
   const [stats, setStats] = useState<TicketStats>({
@@ -214,7 +215,7 @@ export const TicketDashboard: React.FC = () => {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
-  const isAgent = permissions?.role === 'agent'
+  const isAgent = isAgentRole(permissions?.role)
 
   useEffect(() => {
     const controller = new AbortController()

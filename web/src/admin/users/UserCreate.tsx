@@ -31,14 +31,7 @@ import {
     Info as InfoIcon,
 } from '@mui/icons-material';
 import BackButton from '../common/BackButton';
-
-// 角色选项
-const roleChoices = [
-    { id: 'customer', name: '客户' },
-    { id: 'agent', name: '客服代理' },
-    { id: 'supervisor', name: '主管' },
-    { id: 'admin', name: '管理员' },
-];
+import { assignableUserRoleChoices } from '@/lib/accessControl';
 
 // 状态选项
 const statusChoices = [
@@ -320,7 +313,7 @@ const UserCreate: React.FC = () => {
                                                 <SelectInput
                                                     source="role"
                                                     label="用户角色"
-                                                    choices={roleChoices}
+                                                    choices={assignableUserRoleChoices}
                                                     required
                                                     helperText="选择用户在系统中的角色权限"
                                                 />

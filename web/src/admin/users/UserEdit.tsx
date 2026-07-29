@@ -34,14 +34,7 @@ import {
     Warning as WarningIcon,
 } from '@mui/icons-material';
 import BackButton from '../common/BackButton';
-
-// 角色选项
-const roleChoices = [
-    { id: 'admin', name: '管理员' },
-    { id: 'agent', name: '客服代理' },
-    { id: 'customer', name: '客户' },
-    { id: 'supervisor', name: '主管' },
-];
+import { userRoleChoices } from '@/lib/accessControl';
 
 // 状态选项
 const statusChoices = [
@@ -151,6 +144,9 @@ const RoleChangeWarning: React.FC = () => (
                 <strong>管理员</strong>：拥有系统完全控制权限
             </Typography>
             <Typography component="li" variant="body2">
+                <strong>超级管理员</strong>：兼容角色，按管理员权限处理
+            </Typography>
+            <Typography component="li" variant="body2">
                 <strong>主管</strong>：可管理团队和工单分配
             </Typography>
             <Typography component="li" variant="body2">
@@ -158,6 +154,9 @@ const RoleChangeWarning: React.FC = () => (
             </Typography>
             <Typography component="li" variant="body2">
                 <strong>客户</strong>：只能查看和创建自己的工单
+            </Typography>
+            <Typography component="li" variant="body2">
+                <strong>普通用户（兼容角色）</strong>：按客户权限处理
             </Typography>
         </Box>
     </Alert>
@@ -335,7 +334,7 @@ const UserEdit: React.FC = () => {
                                                 <SelectInput
                                                     source="role"
                                                     label="用户角色"
-                                                    choices={roleChoices}
+                                                    choices={userRoleChoices}
                                                     required
                                                     helperText="选择用户在系统中的角色权限"
                                                 />

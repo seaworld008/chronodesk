@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"time"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"

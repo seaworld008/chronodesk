@@ -1,41 +1,48 @@
-# 文档中心（docs）
+# ChronoDesk 文档中心
 
-本目录是 ChronoDesk 的统一文档入口。项目当前面向人类后台和外部 AI Agent；接口、协议与命令说明均以当前代码和机器契约为准。
+本目录只保留当前可执行文档、架构决策、协议参考、运维指南和可复核测试报告。
+历史计划与会话交接材料由 Git 历史保留，不作为当前事实来源。
 
-## 1. 必读文档
+## 从这里开始
 
-- [项目权威手册](PROJECT_MANUAL.md)：功能、架构、技术栈、迁移、API 分层、安全与范围边界。
-- [根目录快速开始](../README.md)：安装、启动和常用质量门禁。
-- [测试与质量控制指南](testing_guide.md)：Go、前端、OpenAPI、Pytest 与集成测试顺序。
+- [项目权威手册](PROJECT_MANUAL.md)：功能、范围、技术基线和公共 Interface。
+- [架构总览](../ARCHITECTURE.md)：Module、Interface、Seam、Adapter 和依赖规则。
+- [领域词汇](../CONTEXT.md)：Ticket、Actor、Assignment、Lease、Event 与 Outbox
+  的统一含义。
+- [开发与质量门禁](testing_guide.md)：本地、Docker、云服务、协议和发布验证。
 
-## 2. 参考文档（Reference）
+## 架构决策
 
-- [API 使用说明](reference/API_DOCUMENTATION.md)：`/api/v1` Agent 机器入口、`/api` 人类入口和运行时 OpenAPI。
-- [MCP 2026-07-28](reference/MCP_2026_07_28.md)：最新单版本 MCP、OAuth Client Credentials 和 Inspector。
-- [A2A v1.0.1](reference/A2A_1_0.md)：官方最新发布，线协议固定为
-  `A2A-Version: 1.0`，覆盖 Agent Card、JSON-RPC、SSE 与 Push。
-- [CloudEvents 1.0](reference/CLOUDEVENTS_1_0.md)：领域事件信封、扩展属性与去重。
-- [OpenAPI 3.2](reference/OPENAPI_3_2.md)：机器契约与严格 lint 门禁。
-- [数据库静态加密](reference/DATA_AT_REST_ENCRYPTION.md)：keyring、显式凭据迁移和轮换。
-- [Reference 索引](reference/README.md)：全部当前参考资料。
+- [ADR 索引](adr/README.md)
+- [只保留当前 Agent 协议](adr/0001-current-only-agent-protocols.md)
+- [统一 Actor 与 Assignment 模型](adr/0002-actor-and-assignment-model.md)
+- [事务 Domain Event 与 Outbox](adr/0003-transactional-events-and-outbox.md)
+- [最小可执行入口与应用组合根](adr/0004-application-composition-root.md)
 
-## 3. 规划与交接
+## 运维
 
-- [`planning/`](planning/)：任务跟踪、阶段计划与里程碑。
-- [`plans/`](plans/)：按日期组织的实现计划。
-- [`handovers/`](handovers/)：会话交接资料。
+- [数据库迁移](operations/database-migrations.md)
+- [数据库静态加密](reference/DATA_AT_REST_ENCRYPTION.md)
 
-## 4. 测试报告
+## 协议与机器契约
 
-- [Agent 原生化完整测试报告](testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-29.md)：MCP/A2A、云 PostgreSQL/Redis、API 与浏览器功能验收。
+- [Agent REST 与 API 使用说明](reference/API_DOCUMENTATION.md)
+- [MCP 2026-07-28](reference/MCP_2026_07_28.md)
+- [A2A v1.0.1 / wire 1.0](reference/A2A_1_0.md)
+- [CloudEvents 1.0](reference/CLOUDEVENTS_1_0.md)
+- [OpenAPI 3.2](reference/OPENAPI_3_2.md)
+- [Reference 索引](reference/README.md)
 
-## 5. 历史归档
+请求/响应 Schema 的唯一权威来源是
+`server/internal/openapi/openapi.yaml`，运行时由 `/openapi.yaml` 提供。
 
-- [`archive/root-legacy/`](archive/root-legacy/)：过期 API、初始化和一次性测试资料。
-- [`archive/agent-control/`](archive/agent-control/)：根目录 Agent 控制文件的保留说明。
+## 测试证据
 
-## 6. 文档维护规则
+- [Agent 原生化完整测试报告](testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-29.md)
 
-- 架构或接口变更时先更新 [项目权威手册](PROJECT_MANUAL.md)。
-- 请求/响应 Schema 只维护在 `server/internal/openapi/openapi.yaml`，运行时由 `/openapi.yaml` 提供。
-- 新增专题文档必须登记到本索引；失效内容移动到 `archive/`，不得混入当前操作指南。
+## 维护规则
+
+1. 领域术语变化先更新 `CONTEXT.md`。
+2. 跨 Module 的持久架构选择必须增加 ADR。
+3. Interface 或运行命令变化同步更新 `PROJECT_MANUAL.md`、根 README 和测试指南。
+4. 失效计划、提示词、一次性报告和本机路径不得继续留在当前文档树。

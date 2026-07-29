@@ -7,7 +7,7 @@ import (
 	"errors"
 	"testing"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/sqlite"

@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/services"
-	websocketPkg "gongdan-system/internal/websocket"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
+	websocketPkg "github.com/seaworld008/chronodesk/server/internal/websocket"
 )
 
 type NotificationHandler struct {

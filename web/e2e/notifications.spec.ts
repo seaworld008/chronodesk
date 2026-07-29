@@ -1,9 +1,9 @@
 import { test, expect } from '@playwright/test';
 import {
+    authenticatePage,
     createNotification,
     deleteNotification,
     E2E_PREFIX,
-    loginViaUI,
 } from './helpers/testData';
 
 const TEST_USER = {
@@ -25,7 +25,7 @@ test.describe('Notifications', () => {
         const content = `${E2E_PREFIX}通知内容-${Date.now()}`;
         notificationId = await createNotification(request, { title, content });
 
-        await loginViaUI(page, TEST_USER);
+        await authenticatePage(page, TEST_USER);
         await page.goto('/#/notifications');
 
         const searchInput = page.getByPlaceholder('搜索通知');

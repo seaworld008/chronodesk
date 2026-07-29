@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"go.yaml.in/yaml/v3"
+
+	"github.com/seaworld008/chronodesk/server/internal/agentcontract"
 )
 
 func TestSpecificationIsStableAgentContract(t *testing.T) {
@@ -94,18 +96,7 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 	flows := contractMap(t, oauth2["flows"], "components.securitySchemes.oauth2.flows")
 	clientCredentials := contractMap(t, flows["clientCredentials"], "components.securitySchemes.oauth2.flows.clientCredentials")
 	scopes := contractMap(t, clientCredentials["scopes"], "OAuth scopes")
-	expectedScopes := []string{
-		"tickets:read",
-		"tickets:create",
-		"tickets:update",
-		"tickets:assign",
-		"tickets:transition",
-		"comments:write",
-		"attachments:read",
-		"attachments:write",
-		"events:subscribe",
-		"tasks:manage",
-	}
+	expectedScopes := agentcontract.SupportedScopes()
 	for _, scope := range expectedScopes {
 		if _, exists := scopes[scope]; !exists {
 			t.Errorf("OAuth scope %q is missing", scope)

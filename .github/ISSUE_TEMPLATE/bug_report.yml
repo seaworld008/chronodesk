@@ -1,0 +1,107 @@
+name: "🐛 缺陷报告 / Bug report"
+description: "报告可复现的 ChronoDesk 缺陷。Report a reproducible ChronoDesk defect."
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你的报告。未修复的安全漏洞不得写在这里，请改用[私密 Security Advisory](https://github.com/seaworld008/chronodesk/security/advisories/new)。
+
+        Thanks for helping us improve. Do not disclose an unpatched vulnerability here; use a [private Security Advisory](https://github.com/seaworld008/chronodesk/security/advisories/new).
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: "受影响区域 / Affected area"
+      description: "选择最接近问题的组件。Choose the closest affected component."
+      options:
+        - "Go server / 领域服务"
+        - "React web / 管理端"
+        - "REST / OpenAPI"
+        - "MCP 2026-07-28"
+        - "A2A 1.0"
+        - "数据库 / 迁移"
+        - "部署 / 运维"
+        - "文档 / Documentation"
+        - "其他 / Other"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: "版本或 commit / Version or commit"
+      description: "提供版本标签或完整 commit SHA。Provide a release tag or full commit SHA."
+      placeholder: "例如 / Example: main@0123456789abcdef..."
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: "运行环境 / Environment"
+      description: "操作系统、部署方式及相关 Go/Node/Docker 版本。OS, deployment method, and relevant Go/Node/Docker versions."
+      placeholder: "例如 / Example: Ubuntu 24.04, Docker Compose v2"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: "问题描述 / Description"
+      description: "清楚说明发生了什么、频率和影响。Describe what happened, how often, and its impact."
+      placeholder: "观察到的行为与影响 / Observed behavior and impact"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: "最小复现步骤 / Minimal reproduction"
+      description: "提供从干净环境开始的最小、确定步骤。Give minimal deterministic steps from a clean environment."
+      placeholder: |
+        1. 配置 / Configure ...
+        2. 调用 / Call ...
+        3. 观察 / Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: "预期结果 / Expected behavior"
+      description: "说明你期望的结果及依据。Describe the expected result and why."
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: "脱敏日志或载荷 / Sanitized logs or payloads"
+      description: "粘贴最小相关日志、请求 ID 或协议载荷。移除令牌、Cookie、连接串、客户数据和个人信息。Paste minimal relevant diagnostics with all secrets and personal data removed."
+      render: shell
+
+  - type: textarea
+    id: agent_impact
+    attributes:
+      label: "Agent、协议与安全影响 / Agent, protocol, and security impact"
+      description: "说明是否涉及 Agent 身份/scope、授权、幂等、租约、重试、回调、审计或跨协议差异；无则写“无 / None”。"
+      placeholder: "入口、身份权限、安全边界及 REST/MCP/A2A 一致性 / Entry point, identity, security boundary, and cross-protocol consistency"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: "提交确认 / Submission checks"
+      options:
+        - label: "我已搜索现有 Issues 和 Discussions。I searched existing Issues and Discussions."
+          required: true
+        - label: "我已在受支持版本上复现，并提供了足够信息。I reproduced this on a supported version and provided enough detail."
+          required: true
+        - label: "本报告不包含漏洞详情、秘密、真实客户数据或个人信息。This report contains no vulnerability details, secrets, customer data, or personal information."
+          required: true
+        - label: "我已阅读并同意遵守行为准则。I have read and agree to follow the Code of Conduct."
+          required: true

@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
 func avatarUploadFile(t *testing.T, payload []byte, name string) (*os.File, *multipart.FileHeader) {

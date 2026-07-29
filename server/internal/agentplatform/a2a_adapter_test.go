@@ -17,10 +17,10 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
-	"gongdan-system/internal/a2a"
-	"gongdan-system/internal/agentauth"
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/a2a"
+	"github.com/seaworld008/chronodesk/server/internal/agentauth"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
 type a2aAdapterFixture struct {

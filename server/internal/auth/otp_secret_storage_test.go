@@ -8,8 +8,8 @@ import (
 	"sync"
 	"testing"
 
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/security"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/security"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )

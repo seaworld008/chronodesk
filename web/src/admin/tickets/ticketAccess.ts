@@ -1,20 +1,23 @@
+import {
+    isAdministrativeRole,
+    isAgentRole,
+    isCustomerRole,
+    type RolePermissions,
+} from '@/lib/accessControl';
+
 export type TicketAccessRecord = {
     created_by_id?: number;
     assigned_to_id?: number | null;
 };
 
-export type TicketRolePermissions = {
-    role?: string;
-};
+export type TicketRolePermissions = RolePermissions;
 
-export const administrativeTicketRoles = new Set(['supervisor', 'admin', 'superuser']);
-
-export const canDeleteTicket = (role?: string) =>
-    administrativeTicketRoles.has(role ?? '');
+export const canDeleteTicket = (role?: string | null) =>
+    isAdministrativeRole(role);
 
 export const canMutateTicket = (
     record: TicketAccessRecord | undefined,
-    role: string | undefined,
+    role: string | null | undefined,
     identityId: string | number | undefined,
 ) => {
     if (!record || typeof identityId === 'undefined') {
@@ -24,10 +27,10 @@ export const canMutateTicket = (
         return true;
     }
     const userId = Number(identityId);
-    if (role === 'agent') {
+    if (isAgentRole(role)) {
         return record.assigned_to_id == null || record.assigned_to_id === userId;
     }
-    if (role === 'user' || role === 'customer') {
+    if (isCustomerRole(role)) {
         return record.created_by_id === userId;
     }
     return false;

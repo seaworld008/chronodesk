@@ -39,7 +39,7 @@ import {
 import BackButton from '../common/BackButton';
 import { UpdateTicketRequest } from '@/types';
 import {
-    administrativeTicketRoles,
+    canDeleteTicket,
     canMutateTicket,
     type TicketAccessRecord,
     type TicketRolePermissions,
@@ -135,7 +135,7 @@ const TicketEditActions = () => {
         <TopToolbar>
             <ShowButton label="查看详情" />
             <ListButton label="返回列表" />
-            {administrativeTicketRoles.has(permissions?.role ?? '') && (
+            {canDeleteTicket(permissions?.role) && (
                 <DeleteButton label="删除" mutationMode="pessimistic" />
             )}
         </TopToolbar>

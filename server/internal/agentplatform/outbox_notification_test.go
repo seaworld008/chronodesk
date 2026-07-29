@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"

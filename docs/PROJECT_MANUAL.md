@@ -54,7 +54,7 @@ ChronoDesk 是面向单组织私有化部署的企业工单自动化平台。它
 
 | 层级 | 当前版本/组件 |
 | --- | --- |
-| 后端 | Go 1.26、Gin 1.12、GORM 1.31 |
+| 后端 | Go 1.26.5、Gin 1.12、GORM 1.31 |
 | 数据 | PostgreSQL 18（Compose 18.4）、Redis 8（Compose 8.8） |
 | 前端 | React 19.2.8、React Admin 5.15.1、MUI 7.3.11 |
 | 路由与构建 | React Router 7.18.2、TypeScript 6、Vite 8.1.5 |
@@ -68,11 +68,14 @@ ChronoDesk 是面向单组织私有化部署的企业工单自动化平台。它
 .
 ├── server/
 │   ├── cmd/
+│   │   ├── chronodesk/           # 最小可执行入口
 │   │   ├── migrate/              # 唯一结构迁移入口
 │   │   └── secret-migrate/       # 显式敏感字段迁移与验证
 │   ├── internal/
+│   │   ├── app/                  # 组合根、后台任务与优雅退出
 │   │   ├── a2a/                  # A2A v1.0.1 / wire 1.0 与 Task 存储
 │   │   ├── agentauth/            # 服务主体 OAuth 与 audience 校验
+│   │   ├── agentcontract/        # 协议无关 scope 与机器契约
 │   │   ├── agentplatform/        # Agent REST、MCP/A2A 领域适配与控制面
 │   │   ├── auth/                 # 人类账号与凭据安全
 │   │   ├── database/             # PostgreSQL、Redis 与 Schema 校验
@@ -80,11 +83,10 @@ ChronoDesk 是面向单组织私有化部署的企业工单自动化平台。它
 │   │   ├── mcp/                  # MCP 2026-07-28 Server
 │   │   ├── models/               # 业务、Actor、事件与 Agent 模型
 │   │   ├── openapi/              # 内嵌 OpenAPI 3.2 权威契约
-│   │   ├── scheduler/            # Redis 分布式定时任务
 │   │   ├── security/             # AES-GCM keyring、SSRF 与迁移校验
 │   │   ├── services/             # 事务化领域服务与 Outbox
 │   │   └── websocket/            # 人类实时通知
-│   └── main.go                   # 服务初始化与路由装配
+│   └── Dockerfile                # 非 root 多阶段生产镜像
 ├── web/
 │   └── src/
 │       ├── admin/                # 工单、用户、通知、自动化、设置、Agent 控制
@@ -92,21 +94,23 @@ ChronoDesk 是面向单组织私有化部署的企业工单自动化平台。它
 │       ├── i18n/                 # React Admin/MUI 中文本地化
 │       ├── layout/               # 侧栏与顶部栏
 │       └── lib/                  # dataProvider、authProvider、API 客户端
-├── docs/                         # 文档真相源与协议参考
+├── docs/                         # ADR、运维、协议参考与测试证据
 ├── Makefile                      # 根级统一命令
 └── docker-compose.yml            # PostgreSQL、Redis、API、Web 编排
 ```
 
-Handler 只负责协议解析和响应；领域服务执行对象级授权、策略、事务和审计。人类、`service_principal` 与 `system` 统一使用 `ActorRef`，协议适配器不得通过内部 HTTP 回调自身接口。
+协议 Adapter 只负责解析、调用和错误映射；领域 Module 执行对象级授权、
+Assignment、策略、事务和审计。人类、`service_principal` 与 `system` 统一使用
+`ActorRef`，协议 Adapter 不得通过内部 HTTP 回调自身 Interface，也不得复制领域
+规则。完整依赖规则见根目录 [架构说明](../ARCHITECTURE.md)。
 
 ## 5. 启动、迁移与配置
 
 ### 5.1 Docker 一体化开发
 
 ```bash
-make install-deps
-cp server/.env.example server/.env
 make dev
+docker compose exec server chronodesk-migrate -seed
 ```
 
 - 管理后台：`http://localhost:3000`
@@ -230,19 +234,18 @@ ChronoDesk 不保留 MCP、A2A 或 OpenAPI 的旧版本协商、旧路径别名�
 提交前的根级门禁：
 
 ```bash
-make test
-make build
+make verify
 ```
 
-`make test` 会执行 Go 测试、前端 TypeScript/Lint/依赖安全检查，以及 Redocly + Spectral 的 OpenAPI 3.2 严格校验。
+`make verify` 会执行格式、Go 测试/Vet、前端 TypeScript/Lint/依赖安全、
+Redocly + Spectral OpenAPI 校验、`govulncheck` 和生产构建。
 
 需要完整回归时执行：
 
 ```bash
-cd server && make test-race
-cd server && make vet
+make test-race
 make smoke
-./test_integration.sh
+make e2e
 ```
 
 详细顺序、环境依赖和专项测试见 [测试与质量控制指南](testing_guide.md)。
@@ -260,5 +263,6 @@ make smoke
 
 - 架构、命令和公共接口变化后，先更新本文件，再更新专题文档与 `docs/README.md`。
 - API 请求/响应只以 `server/internal/openapi/openapi.yaml` 和运行时 `/openapi.yaml` 为机器真相源。
-- 根目录只保留快速入口和 Agent 协作文件；历史资料归档到 `docs/archive/`。
+- 根目录只保留快速入口、治理、架构与 Agent 协作文件；过期计划和会话交接资料由
+  Git 历史保留，不进入当前文档树。
 - 失效脚本、旧版本协议和一次性测试结论不得继续出现在当前操作指南中。

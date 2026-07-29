@@ -7,8 +7,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
-	"gongdan-system/internal/middleware"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/middleware"
+	"github.com/seaworld008/chronodesk/server/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/version"
 )
 
 // AnalyticsHandler 分析统计处理器
@@ -20,14 +21,14 @@ type AnalyticsHandler struct {
 
 // NewAnalyticsHandler 创建分析处理器
 func NewAnalyticsHandler(db *gorm.DB, appVersion ...string) *AnalyticsHandler {
-	version := "1.0.0"
+	appVersionValue := version.Version
 	if len(appVersion) > 0 && appVersion[0] != "" {
-		version = appVersion[0]
+		appVersionValue = appVersion[0]
 	}
 	return &AnalyticsHandler{
 		analyticsService: services.NewAnalyticsService(db),
 		response:         middleware.NewResponseHelper(),
-		appVersion:       version,
+		appVersion:       appVersionValue,
 	}
 }
 

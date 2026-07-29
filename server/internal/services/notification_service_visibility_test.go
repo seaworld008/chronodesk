@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
 func TestGetNotificationsPreservesRecipientAndReadFilters(t *testing.T) {

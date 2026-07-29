@@ -9,20 +9,11 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/seaworld008/chronodesk/server/internal/agentcontract"
 )
 
-var SupportedScopes = []string{
-	"tickets:read",
-	"tickets:create",
-	"tickets:update",
-	"tickets:assign",
-	"tickets:transition",
-	"comments:write",
-	"attachments:read",
-	"attachments:write",
-	"events:subscribe",
-	"tasks:manage",
-}
+var SupportedScopes = agentcontract.SupportedScopes()
 
 type Handler struct {
 	store        CredentialStore

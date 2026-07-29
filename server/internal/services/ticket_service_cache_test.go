@@ -8,7 +8,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
 type fakeRedis struct {

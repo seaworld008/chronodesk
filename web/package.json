@@ -1,7 +1,7 @@
 {
-  "name": "ticket-management-web",
+  "name": "chronodesk-web",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,6 +9,9 @@
     "lint": "eslint . --report-unused-disable-directives --max-warnings 0",
     "typecheck": "tsc --noEmit",
     "audit:security": "node ./scripts/audit-security.mjs",
+    "check": "npm run typecheck && npm run lint && npm run audit:security && npm run build",
+    "test:e2e": "playwright test",
+    "test:e2e:list": "playwright test --list",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -27,7 +30,6 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.62.0",
-    "@tailwindcss/postcss": "^4.3.3",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.4",
@@ -35,8 +37,6 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.3",
     "globals": "^17.8.0",
-    "postcss": "^8.5.24",
-    "tailwindcss": "^4.3.3",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.65.0",
     "vite": "^8.1.5"

@@ -1,5 +1,11 @@
 import { test, expect } from '@playwright/test';
-import { createTicket, deleteTicket, E2E_PREFIX, loginViaUI } from './helpers/testData';
+import {
+    authenticatePage,
+    createTicket,
+    deleteTicket,
+    E2E_PREFIX,
+    loginViaUI,
+} from './helpers/testData';
 
 /**
  * ChronoDesk Ticket Workflow E2E Tests
@@ -31,12 +37,15 @@ test.describe('Ticket Management', () => {
     });
 
     test.beforeEach(async ({ page }) => {
-        await loginViaUI(page, TEST_USER);
+        await authenticatePage(page, TEST_USER);
     });
 
     test('should display ticket list', async ({ page }) => {
         await page.goto('/#/tickets');
-        await expect(page.getByRole('columnheader', { name: '工单信息' })).toBeVisible({ timeout: 10000 });
+        const ticketInfoHeader = page
+            .getByRole('columnheader')
+            .filter({ hasText: '工单信息' });
+        await expect(ticketInfoHeader).toBeVisible({ timeout: 10000 });
     });
 
     test('should open create ticket form', async ({ page }) => {
@@ -54,7 +63,7 @@ test.describe('Ticket Management', () => {
 
 test.describe('Navigation', () => {
     test.beforeEach(async ({ page }) => {
-        await loginViaUI(page, TEST_USER);
+        await authenticatePage(page, TEST_USER);
     });
 
     test('should navigate to users page', async ({ page }) => {

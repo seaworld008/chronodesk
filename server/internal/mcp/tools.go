@@ -1,18 +1,22 @@
 package mcp
 
-import "sort"
+import (
+	"sort"
+
+	"github.com/seaworld008/chronodesk/server/internal/agentcontract"
+)
 
 const (
-	ScopeTicketsRead       = "tickets:read"
-	ScopeTicketsCreate     = "tickets:create"
-	ScopeTicketsUpdate     = "tickets:update"
-	ScopeTicketsAssign     = "tickets:assign"
-	ScopeTicketsTransition = "tickets:transition"
-	ScopeCommentsWrite     = "comments:write"
-	ScopeAttachmentsRead   = "attachments:read"
-	ScopeAttachmentsWrite  = "attachments:write"
-	ScopeEventsSubscribe   = "events:subscribe"
-	ScopeTasksManage       = "tasks:manage"
+	ScopeTicketsRead       = agentcontract.ScopeTicketsRead
+	ScopeTicketsCreate     = agentcontract.ScopeTicketsCreate
+	ScopeTicketsUpdate     = agentcontract.ScopeTicketsUpdate
+	ScopeTicketsAssign     = agentcontract.ScopeTicketsAssign
+	ScopeTicketsTransition = agentcontract.ScopeTicketsTransition
+	ScopeCommentsWrite     = agentcontract.ScopeCommentsWrite
+	ScopeAttachmentsRead   = agentcontract.ScopeAttachmentsRead
+	ScopeAttachmentsWrite  = agentcontract.ScopeAttachmentsWrite
+	ScopeEventsSubscribe   = agentcontract.ScopeEventsSubscribe
+	ScopeTasksManage       = agentcontract.ScopeTasksManage
 )
 
 // ToolAnnotations are the standard MCP behavioral risk hints.

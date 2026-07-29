@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"golang.org/x/crypto/bcrypt"
-	"gongdan-system/internal/models"
 	"gorm.io/gorm"
 )
 

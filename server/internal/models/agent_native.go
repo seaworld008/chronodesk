@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"gorm.io/datatypes"
+
+	"github.com/seaworld008/chronodesk/server/internal/agentcontract"
 )
 
 // ActorType identifies the security principal that performed an operation.
@@ -55,30 +57,19 @@ func SystemActor(component string) ActorRef {
 
 // Agent scopes deliberately describe small, composable capabilities.
 const (
-	ScopeTicketsRead       = "tickets:read"
-	ScopeTicketsCreate     = "tickets:create"
-	ScopeTicketsUpdate     = "tickets:update"
-	ScopeTicketsAssign     = "tickets:assign"
-	ScopeTicketsTransition = "tickets:transition"
-	ScopeCommentsWrite     = "comments:write"
-	ScopeAttachmentsRead   = "attachments:read"
-	ScopeAttachmentsWrite  = "attachments:write"
-	ScopeEventsSubscribe   = "events:subscribe"
-	ScopeTasksManage       = "tasks:manage"
+	ScopeTicketsRead       = agentcontract.ScopeTicketsRead
+	ScopeTicketsCreate     = agentcontract.ScopeTicketsCreate
+	ScopeTicketsUpdate     = agentcontract.ScopeTicketsUpdate
+	ScopeTicketsAssign     = agentcontract.ScopeTicketsAssign
+	ScopeTicketsTransition = agentcontract.ScopeTicketsTransition
+	ScopeCommentsWrite     = agentcontract.ScopeCommentsWrite
+	ScopeAttachmentsRead   = agentcontract.ScopeAttachmentsRead
+	ScopeAttachmentsWrite  = agentcontract.ScopeAttachmentsWrite
+	ScopeEventsSubscribe   = agentcontract.ScopeEventsSubscribe
+	ScopeTasksManage       = agentcontract.ScopeTasksManage
 )
 
-var SupportedAgentScopes = []string{
-	ScopeTicketsRead,
-	ScopeTicketsCreate,
-	ScopeTicketsUpdate,
-	ScopeTicketsAssign,
-	ScopeTicketsTransition,
-	ScopeCommentsWrite,
-	ScopeAttachmentsRead,
-	ScopeAttachmentsWrite,
-	ScopeEventsSubscribe,
-	ScopeTasksManage,
-}
+var SupportedAgentScopes = agentcontract.SupportedScopes()
 
 type ServicePrincipalStatus string
 

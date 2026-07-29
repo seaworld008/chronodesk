@@ -24,7 +24,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
@@ -81,6 +81,12 @@ const (
 // AgentNativeErrorCode turns exported sentinel errors into stable API codes.
 func AgentNativeErrorCode(err error) string {
 	switch {
+	case errors.Is(err, ErrInvalidAssignee):
+		return "invalid_assignee"
+	case errors.Is(err, ErrAssigneeNotFound):
+		return "assignee_not_found"
+	case errors.Is(err, ErrAssigneePolicyDenied):
+		return "assignee_policy_denied"
 	case errors.Is(err, ErrInvalidActor):
 		return "invalid_actor"
 	case errors.Is(err, ErrInvalidScope):

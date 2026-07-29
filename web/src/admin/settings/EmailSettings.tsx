@@ -53,7 +53,7 @@ interface TestForm {
 const defaultTestForm: TestForm = {
   to_email: '',
   subject: '测试邮件',
-  content: '这是一封来自工单管理系统的测试邮件，如果您收到此邮件说明配置已生效。',
+  content: '这是一封来自 ChronoDesk 的测试邮件，如果您收到此邮件说明配置已生效。',
 }
 
 const EmailSettings: React.FC = () => {

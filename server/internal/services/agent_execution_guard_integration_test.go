@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"gongdan-system/internal/database"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/database"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"

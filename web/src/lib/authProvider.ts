@@ -1,5 +1,11 @@
 import { AuthProvider, UserIdentity } from 'react-admin'
 import { containsChineseText, localizedApiErrorMessage } from './apiClient'
+import {
+    isAdministrativeRole,
+    isAgentRole,
+    isCustomerRole,
+    normalizeUserRole,
+} from './accessControl'
 
 const apiBase = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
 
@@ -7,7 +13,6 @@ const buildUrl = (path: string) => `${apiBase}${path.startsWith('/') ? path : `/
 
 const trustedDeviceTokenKey = 'trustedDeviceToken'
 const rememberDevicePreferenceKey = 'rememberDevicePreference'
-const administrativeRoles = new Set(['supervisor', 'admin', 'superuser'])
 
 type LoginParams = {
     username: string
@@ -19,7 +24,7 @@ type LoginParams = {
 }
 
 /**
- * 工单管理系统认证提供器
+ * ChronoDesk 人类会话认证 Provider
  * 完美适配Go JWT认证体系
  */
 export const authProvider: AuthProvider = {
@@ -158,6 +163,19 @@ export const authProvider: AuthProvider = {
             return Promise.reject({ message: '未找到登录令牌，请重新登录' })
         }
 
+        const user = JSON.parse(localStorage.getItem('user') || '{}')
+        const role = normalizeUserRole(user.role)
+        if (role === null) {
+            return Promise.reject({ message: '当前账号角色无效，请联系管理员' })
+        }
+        if (
+            params?.resource &&
+            params.resource.startsWith('admin/') &&
+            !isAdministrativeRole(role)
+        ) {
+            return Promise.reject({ message: '当前账号没有管理权限' })
+        }
+
         // 检查token是否过期
         if (tokenExpiresAt && Date.now() > parseInt(tokenExpiresAt)) {
             // 尝试刷新token
@@ -198,14 +216,6 @@ export const authProvider: AuthProvider = {
             localStorage.removeItem('permissions')
             localStorage.removeItem('tokenExpiresAt')
             return Promise.reject({ message: '登录状态已过期，请重新登录' })
-        }
-
-        // 对于特定路由的权限检查
-        if (params?.resource && params?.resource.startsWith('admin/')) {
-            const user = JSON.parse(localStorage.getItem('user') || '{}')
-            if (!administrativeRoles.has(user.role)) {
-                return Promise.reject({ message: '当前账号没有管理权限' })
-            }
         }
 
         return Promise.resolve()
@@ -290,12 +300,12 @@ export const authProvider: AuthProvider = {
             const permissions = JSON.parse(localStorage.getItem('permissions') || '[]');
 
             return Promise.resolve({
-                role: user.role || 'user',
+                role: normalizeUserRole(user.role),
                 permissions,
             });
         } catch (error) {
             console.error('获取用户权限失败：', error);
-            return Promise.resolve({ role: 'user', permissions: [] });
+            return Promise.resolve({ role: null, permissions: [] });
         }
     },
 
@@ -304,8 +314,11 @@ export const authProvider: AuthProvider = {
     // 避免普通账号看到管理按钮后再收到 403。
     canAccess: async ({ resource, action, record }) => {
         const user = JSON.parse(localStorage.getItem('user') || '{}');
-        const role = user.role || 'user';
-        if (administrativeRoles.has(role)) {
+        const role = normalizeUserRole(user.role);
+        if (role === null) {
+            return false;
+        }
+        if (isAdministrativeRole(role)) {
             return true;
         }
 
@@ -323,10 +336,10 @@ export const authProvider: AuthProvider = {
                     return true;
                 }
                 const userID = Number(user.id);
-                if (role === 'agent') {
+                if (isAgentRole(role)) {
                     return record.assigned_to_id == null || record.assigned_to_id === userID;
                 }
-                if (role === 'user' || role === 'customer') {
+                if (isCustomerRole(role)) {
                     return record.created_by_id === userID;
                 }
             }

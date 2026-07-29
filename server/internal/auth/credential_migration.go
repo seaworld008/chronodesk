@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/security"
 	"golang.org/x/crypto/bcrypt"
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/security"
 	"gorm.io/gorm"
 )
 

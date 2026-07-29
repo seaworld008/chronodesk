@@ -4,7 +4,7 @@
 - 测试分支：`feat/agent-native-platform`
 - 测试环境：最终源码构建的本地 API / Web，连接云 PostgreSQL 与新建的真实
   Upstash Redis
-- 总体结论：**发布前质量门禁通过，等待最终 PR/CI**
+- 总体结论：**本地、云服务与干净容器发布门禁通过**
 
 ## 1. 执行摘要
 
@@ -18,6 +18,7 @@ Outbox、幂等、版本与租约、对象级权限、全站中文化以及企�
 | --- | --- | --- |
 | Go 单元/集成测试 | 通过 | 全包普通与 Race 测试均通过 |
 | Python 黑盒 API 回归 | 通过 | `15 passed`，通过真实 API 与云 PostgreSQL |
+| Playwright 浏览器 E2E | 通过 | 干净 Docker 环境 `13 passed`，连续两轮结果一致 |
 | 前端类型/Lint/生产构建/审计 | 通过 | TypeScript、ESLint、生产构建和依赖审计均通过 |
 | Chrome 全功能回归 | 通过 | 全页面中文、侧栏、表格不换行与列宽拖拽均验证 |
 | OpenAPI/OAuth | 通过 | OpenAPI 3.2 严格 lint 零错误、零警告，发现与 scope 契约正常 |
@@ -25,8 +26,8 @@ Outbox、幂等、版本与租约、对象级权限、全站中文化以及企�
 | A2A `v1.0.1` | 通过 | 线协议 `1.0`；官方 TCK 经授权代理验证的目标子集通过 |
 | 云 PostgreSQL | 通过 | 健康检查与直连 `SELECT 1` 成功 |
 | 云 Redis | 通过 | 新建的真实 Upstash Redis 连接与应用集成通过 |
-| Docker / 安全扫描 | 通过 | 空卷启动、迁移、15 项回归、非 root 运行与 Gitleaks 均通过 |
-| PR / 合并 main | **未执行** | 发布前门禁已通过，等待最终 PR/CI |
+| Docker / 安全扫描 | 通过 | 空卷启动、幂等迁移、15 项 API、13 项浏览器、优雅停机、非 root 与 Gitleaks 均通过 |
+| PR / main 交付 | GitHub 记录 | [PR #3](https://github.com/seaworld008/chronodesk/pull/3) 是本次变更与远端 CI/合并状态的权威记录 |
 
 ## 2. 自动化测试结果
 
@@ -76,10 +77,29 @@ go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 认证夹具已改为在每个用例结束后由管理员软删除临时用户，避免给云数据库遗留
 测试账号。工单、规则、模板、SLA 和系统配置用例也执行了对应清理或恢复。
 
-`pytest-cov` 的 “No data was collected” 是黑盒 HTTP 测试未注入 Python
-被测代码造成的覆盖率提示，不代表测试失败。
+发布收尾已移除不适用于黑盒 HTTP 测试的 `pytest-cov` 配置；Go 覆盖率由
+`go test` 单独度量，Pytest 只报告实际 Interface 验收结果，不再产生无意义的
+“No data was collected” 提示。
 
-### 2.3 前端与依赖
+### 2.3 Playwright 浏览器 E2E
+
+在由最终 Docker 镜像、全新 PostgreSQL/Redis 卷和幂等种子数据组成的环境中执行：
+
+```text
+PLAYWRIGHT_REUSE_SERVER=1 TEST_BASE_URL=http://127.0.0.1:3000 make e2e
+13 passed
+```
+
+完整 13 项套件连续执行两轮均通过。测试固定单 worker，因为场景会修改共享管理员
+账号、系统配置和测试数据；这也符合生产登录限流对同一 Docker/NAT 来源 IP 的
+约束。除专门的登录用例外，其余场景复用短期 API 会话，避免测试框架自身制造
+无意义的匿名登录流量。
+
+覆盖真实 UI 登录、工单创建/分配/解决/关闭/删除、通知、自动化规则、邮件与系统
+配置、用户和设置导航，以及客户身份下的通知筛选隔离、Agent 管理菜单隐藏和直接
+路由防护。所有定位器均基于当前中文可访问名称，不依赖已删除的英文文案。
+
+### 2.4 前端与依赖
 
 以下命令全部通过：
 
@@ -97,6 +117,11 @@ Alpine `3.24.1` 最小运行镜像，运行用户为非 root `chronodesk`，不�
 工具链；独立 `chronodesk-migrate` 二进制支持容器内迁移。Compose 会等待
 PostgreSQL、Redis 和 API 三方健康后才启动 Web。Gitleaks 扫描未发现当前源码
 凭据泄漏，报告和扫描输出均未记录数据库或 Redis 凭据。
+
+容器内 43 个模型迁移与种子流程连续执行两次，第二次正确识别已有数据；API 接收
+SIGTERM 后记录停机信号、停止调度器并完成 HTTP 优雅关闭，重新启动后
+PostgreSQL、Redis 与 API 健康状态恢复。测试结束前 Outbox 为
+`succeeded:180`，`pending/processing/failed/dead=0`，全部服务重启次数为 0。
 
 安全审计只保留一个当前不可达的 React Router RSC 专用例外，复核截止日期为
 `2026-09-30`。当前项目未使用 RSC；审计脚本会在出现 RSC 调用或到期时自动失败。
@@ -295,6 +320,13 @@ token 或 password。
 
 ## 7. 本轮修复的发布级缺陷
 
+- MCP 与 A2A 曾分别实现不同的处理人校验，导致同一业务动作跨协议语义不一致；
+  现统一收敛到领域服务并增加协议一致性测试。
+- 未知或异常人类角色曾可能在前端权限分支中放行；现用统一访问控制 Module
+  fail closed，客户身份不会请求管理员用户或 Agent 控制接口。
+- 浏览器 E2E 并发登录会在 Docker/NAT 下命中真实匿名限流，同时英文 locator
+  已与中文 UI 脱节；现固定共享状态套件为单 worker、复用短期会话并全面对齐中文
+  可访问名称。
 - A2A 持久化 Task/Artifact 在权限撤销后仍可重放读取。
 - 幂等 processing 锁与 24 小时结果保留共用 TTL，崩溃后长期锁死。
 - 管理员停用、删除或降权后，旧 access token 仍保留原角色权限。
@@ -316,10 +348,21 @@ token 或 password。
   非 root 最小运行镜像和独立迁移二进制。
 - 云库遗留的 11 张 `Auto Test Ticket <时间戳>` 自动化工单已按精确 ID 清理，
   关联通知同步删除，Outbox 最终无 pending/failed/dead，业务审计保留。
+- Go 可执行入口曾是 879 行根 `main.go`，领域、协议和生命周期装配边界不清；
+  现改为 `cmd/chronodesk` 最小入口、`internal/app` 组合根和可测试的优雅生命周期。
+- scope 描述曾在模型、认证、MCP 与 OpenAPI 多处复制；现由
+  `internal/agentcontract` 提供唯一协议中立契约，并用静态架构测试阻止领域层反向
+  依赖 MCP、A2A、OpenAPI 或 HTTP Adapter。
+- 仓库曾缺少许可证、路线图、贡献/安全/支持政策、ADR、CodeQL、Issue Forms 和
+  可维护文档索引，并保留大量失效脚本与会话计划；现采用 Apache-2.0，补齐社区
+  健康与供应链门禁，删除无消费者或已过期资产。30 个 Markdown 文件共 92 个
+  相对链接复核为 0 个失效。
 
 ## 8. 发布决策
 
-**发布前质量门禁通过，等待最终 PR/CI。**
+**本地、云服务与干净容器发布门禁通过。**
 
-当前尚未创建 PR，也尚未合并 `main`。本报告只确认本地与受控云环境中的最终
-测试证据；PR 创建后的远端 CI 仍须按仓库门禁完成，CI 通过后方可进入最终合并。
+本报告确认本地与受控云环境中的最终测试证据。本次交付的远端检查、评审和
+`main` 合并状态由
+[GitHub PR #3](https://github.com/seaworld008/chronodesk/pull/3) 持久记录；
+任何远端失败都必须修复并重新通过后才能合并。

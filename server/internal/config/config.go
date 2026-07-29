@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/seaworld008/chronodesk/server/internal/version"
 )
 
 // Config 应用配置结构
@@ -171,9 +173,9 @@ func Load() (*Config, error) {
 		Database: DatabaseConfig{
 			Host:            getEnv("DB_HOST", "localhost"),
 			Port:            getEnvAsInt("DB_PORT", 5432),
-			User:            getEnv("DB_USER", "ticket_user"),
-			Password:        getEnv("DB_PASSWORD", "ticket_password"),
-			Name:            getEnv("DB_NAME", "ticket_system"),
+			User:            getEnv("DB_USER", "chronodesk"),
+			Password:        getEnv("DB_PASSWORD", "chronodesk_dev_only"),
+			Name:            getEnv("DB_NAME", "chronodesk"),
 			SSLMode:         getEnv("DB_SSLMODE", "disable"),
 			Timezone:        getEnv("DB_TIMEZONE", "Asia/Shanghai"),
 			MaxOpenConns:    getEnvAsInt("DB_MAX_OPEN_CONNS", 25),
@@ -201,8 +203,8 @@ func Load() (*Config, error) {
 			Port:     getEnvAsInt("SMTP_PORT", 587),
 			Username: getEnv("SMTP_USERNAME", ""),
 			Password: getEnv("SMTP_PASSWORD", ""),
-			From:     getEnv("SMTP_FROM", "noreply@ticketsystem.com"),
-			FromName: getEnv("SMTP_FROM_NAME", "Ticket System"),
+			From:     getEnv("SMTP_FROM", "noreply@chronodesk.local"),
+			FromName: getEnv("SMTP_FROM_NAME", "ChronoDesk"),
 		},
 		OTP: OTPConfig{
 			ExpiresIn: getEnvAsDuration("OTP_EXPIRES_IN", 10*time.Minute),
@@ -213,8 +215,8 @@ func Load() (*Config, error) {
 			CSRFSecret: getEnv("CSRF_SECRET", "your-csrf-secret-key"),
 		},
 		App: AppConfig{
-			Name:    getEnv("APP_NAME", "Ticket System"),
-			Version: getEnv("APP_VERSION", "1.0.0"),
+			Name:    getEnv("APP_NAME", "ChronoDesk"),
+			Version: getEnv("APP_VERSION", version.Version),
 			URL:     appURL,
 			WebURL:  getEnv("WEB_URL", "http://localhost:3000"),
 		},

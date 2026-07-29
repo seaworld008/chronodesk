@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
 // NotificationWebSocketService handles real-time notification pushing

@@ -3,7 +3,7 @@ package handlers
 import (
 	"testing"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
 func TestTicketResponseForRoleRedactsCustomerAssigneeID(t *testing.T) {

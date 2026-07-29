@@ -22,7 +22,7 @@ type SimpleOTPService struct {
 // NewSimpleOTPService 创建简单OTP服务
 func NewSimpleOTPService(issuer string) *SimpleOTPService {
 	if issuer == "" {
-		issuer = "Ticket System"
+		issuer = "ChronoDesk"
 	}
 	return &SimpleOTPService{
 		issuer: issuer,

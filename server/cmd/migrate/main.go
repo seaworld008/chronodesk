@@ -8,7 +8,7 @@ import (
 	"os"
 	"time"
 
-	"gongdan-system/internal/database"
+	"github.com/seaworld008/chronodesk/server/internal/database"
 
 	"github.com/joho/godotenv"
 	"gorm.io/driver/postgres"

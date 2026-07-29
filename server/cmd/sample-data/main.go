@@ -6,7 +6,7 @@ import (
 	"os"
 
 	"github.com/joho/godotenv"
-	"gongdan-system/internal/database"
+	"github.com/seaworld008/chronodesk/server/internal/database"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )

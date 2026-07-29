@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 
 	"gorm.io/datatypes"
 	"gorm.io/gorm"

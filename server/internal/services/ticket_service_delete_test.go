@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
 func TestDeleteTicketCleansRelatedData(t *testing.T) {

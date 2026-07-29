@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用讨论 / Usage discussions
+    url: https://github.com/seaworld008/chronodesk/discussions
+    about: 部署、排障、设计探索和一般问题请先到 Discussions。Use Discussions for setup, troubleshooting, and design questions.
+  - name: 私密安全报告 / Private security report
+    url: https://github.com/seaworld008/chronodesk/security/advisories/new
+    about: 禁止公开漏洞详情；请使用 GitHub Security Advisory 私密报告。Never disclose vulnerabilities in a public issue.
+  - name: 支持说明 / Support policy
+    url: https://github.com/seaworld008/chronodesk/blob/main/SUPPORT.md
+    about: 提交前请确认正确渠道、支持版本和所需诊断信息。Review support channels and required diagnostics first.

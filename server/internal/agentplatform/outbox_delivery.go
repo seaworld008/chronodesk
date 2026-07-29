@@ -15,12 +15,12 @@ import (
 	"strings"
 	"time"
 
-	"gongdan-system/internal/a2a"
-	"gongdan-system/internal/mcp"
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/security"
-	"gongdan-system/internal/services"
-	websocketPkg "gongdan-system/internal/websocket"
+	"github.com/seaworld008/chronodesk/server/internal/a2a"
+	"github.com/seaworld008/chronodesk/server/internal/mcp"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/security"
+	"github.com/seaworld008/chronodesk/server/internal/services"
+	websocketPkg "github.com/seaworld008/chronodesk/server/internal/websocket"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"

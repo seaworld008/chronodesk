@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
 func TestWebhookAuditLogNeverPersistsCredentialsOrSignatures(t *testing.T) {

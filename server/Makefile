@@ -23,18 +23,18 @@ help:
 # 构建服务器
 build:
 	@echo "构建服务器..."
-	go build -o bin/server main.go
-	@echo "构建完成: bin/server"
+	go build -trimpath -o bin/chronodesk ./cmd/chronodesk
+	@echo "构建完成: bin/chronodesk"
 
 # 运行服务器（不自动迁移）
 run:
 	@echo "启动服务器（跳过自动迁移）..."
-	go run main.go
+	go run ./cmd/chronodesk
 
 # 运行服务器（启用自动迁移）
 run-migrate:
 	@echo "启动服务器（启用自动迁移）..."
-	AUTO_MIGRATE=true go run main.go
+	AUTO_MIGRATE=true go run ./cmd/chronodesk
 
 # 数据库迁移命令（新版 - 基于GORM AutoMigrate，高效快速）
 migrate:
@@ -73,7 +73,6 @@ test-race:
 deps:
 	@echo "安装依赖..."
 	go mod download
-	go mod tidy
 
 # 格式化代码
 fmt:
@@ -94,5 +93,5 @@ dev-setup: deps
 # 生产环境构建
 build-prod:
 	@echo "生产环境构建..."
-	CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o bin/server main.go
-	@echo "生产环境构建完成: bin/server"
+	CGO_ENABLED=0 GOOS=linux go build -trimpath -o bin/chronodesk ./cmd/chronodesk
+	@echo "生产环境构建完成: bin/chronodesk"

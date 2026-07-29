@@ -64,7 +64,7 @@ const getTotalFromHeaders = (headers: Headers, defaultTotal: number = 0): number
 };
 
 /**
- * 工单管理系统专用数据提供器
+ * ChronoDesk 数据 Provider
  * 完美适配Go Gin后端API
  */
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -308,12 +308,6 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/rules';
         } else if (resource === 'automation-logs') {
             apiPath = 'admin/automation/logs';
-        } else if (resource === 'system-settings') {
-            // 系统设置是虚拟资源，返回空数据
-            return {
-                data: [],
-                total: 0,
-            };
         }
 
         const url = `${apiUrl}/${apiPath}?${queryString.stringify(query)}`;
@@ -567,96 +561,6 @@ export const dataProvider: DataProvider = {
         );
         
         return { data: params.ids };
-    },
-
-    // 自定义方法支持 - 用于系统设置等特殊API调用
-    customMethod: async (resource: string, params: Record<string, unknown>, type: string) => {
-        const method = typeof params.method === 'string' ? params.method.toUpperCase() : 'GET'
-        const data = params.data as unknown
-        const otherParams = Object.fromEntries(
-            Object.entries(params).filter(([key]) => !['method', 'data'].includes(key))
-        )
-
-        let url = `${apiUrl}`
-
-        if (resource.startsWith('admin/')) {
-            url += `/${resource}`
-        } else if (resource === 'email-config') {
-            url += '/admin/email-config'
-        } else if (resource === 'email-config/test') {
-            url += '/admin/email-config/test'
-        } else if (resource.startsWith('webhooks')) {
-            url += `/${resource}`
-        } else if (resource.startsWith('system/')) {
-            url += `/admin/${resource}`
-        } else {
-            url += `/${resource}`
-        }
-
-        const requestOptions: HttpClientOptions = {
-            method,
-        }
-
-        if (data && ['POST', 'PUT', 'PATCH'].includes(method)) {
-            requestOptions.body = JSON.stringify(data)
-        }
-
-        if (method === 'GET' && Object.keys(otherParams).length > 0) {
-            const queryParams = queryString.stringify(otherParams)
-            if (queryParams) {
-                url += `?${queryParams}`
-            }
-        }
-
-        try {
-            const { json, headers } = await httpClient(url, requestOptions)
-
-            switch (type) {
-                case 'getList': {
-                    let listData: unknown[] = []
-                    let total = 0
-
-                    if (isRecord(json) && json.code === 0 && json.data) {
-                        if (isRecord(json.data) && Array.isArray(json.data.items)) {
-                            listData = json.data.items
-                            total = (json.data.total as number | undefined) || (json.data.count as number | undefined) || listData.length
-                        } else if (Array.isArray(json.data)) {
-                            listData = json.data
-                            total = (json.total as number | undefined) || (json.count as number | undefined) || listData.length
-                        } else {
-                            listData = [json.data]
-                            total = 1
-                        }
-                    } else if (isRecord(json) && Array.isArray(json.data)) {
-                        listData = json.data
-                        total = (json.total as number | undefined) || (json.count as number | undefined) || listData.length
-                    } else if (Array.isArray(json)) {
-                        listData = json
-                        total = getTotalFromHeaders(headers, listData.length)
-                    }
-
-                    return { data: listData, total }
-                }
-
-                case 'get':
-                case 'getOne':
-                case 'create':
-                case 'update':
-                case 'delete':
-                    if (isRecord(json) && json.code === 0 && json.data) {
-                        return { data: json.data }
-                    }
-                    if (isRecord(json) && json.data) {
-                        return { data: json.data }
-                    }
-                    return { data: json }
-
-                default:
-                    return { data: json }
-            }
-        } catch (error: unknown) {
-            handleHttpError(error)
-        }
     },
 };
 

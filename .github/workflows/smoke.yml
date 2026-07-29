@@ -24,8 +24,21 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
       - name: Install Python dependencies
         run: pip install -r server/requirements-test.txt
+
+      - name: Install Web and Playwright dependencies
+        run: |
+          cd web
+          npm ci
+          npx playwright install --with-deps chromium
 
       - name: Start services
         run: |
@@ -75,6 +88,12 @@ jobs:
       - name: Run smoke tests
         run: make smoke
 
+      - name: Run browser E2E tests
+        env:
+          PLAYWRIGHT_REUSE_SERVER: "1"
+          TEST_BASE_URL: http://localhost:3000
+        run: make e2e
+
       - name: Dump server logs on failure
         if: failure()
         run: |
@@ -89,7 +108,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: smoke-reports
-          path: server/reports/*.html
+          path: |
+            server/reports/*.html
+            web/playwright-report/
 
       - name: Stop services
         if: always()

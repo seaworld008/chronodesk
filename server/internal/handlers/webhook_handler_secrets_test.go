@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/security"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/security"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/driver/sqlite"

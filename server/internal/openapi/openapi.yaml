@@ -2,7 +2,7 @@ openapi: 3.2.0
 jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 info:
   title: ChronoDesk Agent-Native API
-  version: 1.0.0
+  version: 0.1.0
   description: |
     Stable machine contract for ChronoDesk service principals.
 
@@ -15,8 +15,8 @@ info:
     leases. MCP 2026-07-28 and A2A 1.0 use the same service-principal identity,
     policy, audit, and domain-event foundation.
   license:
-    name: Proprietary
-    identifier: LicenseRef-Proprietary
+    name: Apache License 2.0
+    identifier: Apache-2.0
 servers:
   - url: /api/v1
     description: Stable Agent REST API
@@ -1495,7 +1495,7 @@ paths:
                           io.modelcontextprotocol/oauth-client-credentials: {}
                       io.modelcontextprotocol/clientInfo:
                         name: external-ticket-agent
-                        version: 1.0.0
+                        version: 0.1.0
               callTool:
                 summary: Call a tool using matching Mcp-Method and Mcp-Name headers
                 value:
@@ -1580,7 +1580,7 @@ paths:
                   _meta:
                     io.modelcontextprotocol/serverInfo:
                       name: chronodesk
-                      version: 1.0.0
+                      version: 0.1.0
             text/event-stream:
               schema:
                 $ref: '#/components/schemas/MCPSSEStream'

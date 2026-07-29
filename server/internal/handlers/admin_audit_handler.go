@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
 // AdminAuditHandler 管理员审计日志处理器

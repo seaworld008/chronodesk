@@ -40,18 +40,12 @@ import {
     type ResizableColumn,
 } from '@/components/tables/EnterpriseTable';
 import { EnterpriseSearchInput } from '@/components/inputs/EnterpriseSearchInput';
+import { EnterpriseSelectFilterInput } from '@/components/inputs/EnterpriseFilterInputs';
 import {
-    EnterpriseDateFilterInput,
-    EnterpriseSelectFilterInput,
-} from '@/components/inputs/EnterpriseFilterInputs';
-
-// 用户角色选项
-const roleChoices = [
-    { id: 'admin', name: '管理员' },
-    { id: 'agent', name: '客服代理' },
-    { id: 'customer', name: '客户' },
-    { id: 'supervisor', name: '主管' },
-];
+    getUserRoleLabel,
+    normalizeUserRole,
+    userRoleChoices,
+} from '@/lib/accessControl';
 
 // 用户状态选项
 const statusChoices = [
@@ -129,10 +123,13 @@ const RoleChip: React.FC = () => {
     if (!record) return null;
 
     const getRoleConfig = (role: string) => {
-        switch (role) {
+        const label = getUserRoleLabel(role);
+
+        switch (normalizeUserRole(role)) {
             case 'admin':
+            case 'superuser':
                 return {
-                    label: '管理员',
+                    label,
                     color: '#b91c1c',
                     backgroundColor: '#fee2e2',
                     border: '1px solid #fecaca',
@@ -140,7 +137,7 @@ const RoleChip: React.FC = () => {
                 };
             case 'agent':
                 return {
-                    label: '客服代理',
+                    label,
                     color: '#1d4ed8',
                     backgroundColor: '#dbeafe',
                     border: '1px solid #bfdbfe',
@@ -148,15 +145,16 @@ const RoleChip: React.FC = () => {
                 };
             case 'supervisor':
                 return {
-                    label: '主管',
+                    label,
                     color: '#7e22ce',
                     backgroundColor: '#f3e8ff',
                     border: '1px solid #d8b4fe',
                     icon: <SupervisorIcon sx={{ fontSize: '0.8rem' }} />
                 };
             case 'customer':
+            case 'user':
                 return {
-                    label: '客户',
+                    label,
                     color: '#15803d',
                     backgroundColor: '#dcfce7',
                     border: '1px solid #bbf7d0',
@@ -332,11 +330,8 @@ const LastLoginInfo: React.FC = () => {
  */
 const UserFilters = [
     <EnterpriseSearchInput source="q" placeholder="搜索用户" alwaysOn />,
-    <EnterpriseSelectFilterInput source="role" label="角色" choices={roleChoices} />,
+    <EnterpriseSelectFilterInput source="role" label="角色" choices={userRoleChoices} />,
     <EnterpriseSelectFilterInput source="status" label="状态" choices={statusChoices} />,
-    <EnterpriseDateFilterInput source="created_at_gte" label="注册时间从" />,
-    <EnterpriseDateFilterInput source="created_at_lte" label="注册时间到" />,
-    <EnterpriseDateFilterInput source="last_login_at_gte" label="最后登录从" />,
 ];
 
 /**

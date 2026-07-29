@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
 // Global WebSocket notification service instance

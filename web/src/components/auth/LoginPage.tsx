@@ -146,7 +146,7 @@ const LoginPage = () => {
                             fontWeight: 700,
                             color: "#1e293b"
                         }}>
-                        工单管理系统
+                        ChronoDesk 工单自动化平台
                     </Typography>
                     <Typography variant="body2" sx={{
                         color: "text.secondary"

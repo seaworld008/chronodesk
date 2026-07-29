@@ -1,3 +1,7 @@
+import type { UserRole } from '@/lib/accessControl'
+
+export type { UserRole } from '@/lib/accessControl'
+
 // 用户相关类型
 export interface User {
   id: number
@@ -10,7 +14,7 @@ export interface User {
   avatar?: string
   timezone?: string
   language?: string
-  role: 'admin' | 'agent' | 'customer' | 'supervisor'
+  role: UserRole
   status: 'active' | 'inactive' | 'suspended' | 'deleted'
   email_verified: boolean
   phone_verified?: boolean
@@ -67,8 +71,6 @@ export type TicketStatus = 'open' | 'in_progress' | 'pending' | 'resolved' | 'cl
 export type TicketPriority = 'low' | 'normal' | 'high' | 'urgent' | 'critical'
 export type TicketType = 'incident' | 'request' | 'problem' | 'change' | 'complaint' | 'consultation'
 export type TicketSource = 'web' | 'email' | 'phone' | 'chat' | 'api' | 'mobile'
-export type UserRole = 'admin' | 'agent' | 'customer' | 'supervisor'
-
 // 分类相关类型
 export interface Category {
   id: number

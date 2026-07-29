@@ -1,117 +1,146 @@
-# 工单管理系统 Makefile
+SHELL := /bin/bash
+.DEFAULT_GOAL := help
 
-.PHONY: help dev build build-server build-web test test-server test-web clean docker-up docker-down docker-logs install-deps install-server-deps install-web-deps openapi-lint smoke server-dev web-dev db-migrate init
-
-# 隔离一次性规范校验工具的缓存，避免用户级 npm 缓存的权限或版本污染。
+COMPOSE ?= docker compose
+PYTHON ?= python3
 NPM_TOOL_CACHE ?= $(CURDIR)/.cache/npm-tools
+VERSION ?= 0.1.0
+COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+GO_LDFLAGS := -s -w \
+	-X github.com/seaworld008/chronodesk/server/internal/version.Version=$(VERSION) \
+	-X github.com/seaworld008/chronodesk/server/internal/version.Commit=$(COMMIT) \
+	-X github.com/seaworld008/chronodesk/server/internal/version.BuildDate=$(BUILD_DATE)
 
-# 默认目标
+.PHONY: \
+	help doctor install-deps install-server-deps install-web-deps install-test-deps \
+	dev server-dev web-dev docker-up docker-down docker-logs \
+	build build-server build-web clean \
+	fmt fmt-check test test-server test-race test-web security verify \
+	openapi-lint smoke e2e db-migrate db-migrate-seed
+
 help:
-	@echo "可用命令："
-	@echo "  dev          - 启动 Docker 开发环境"
-	@echo "  build        - 构建后端与前端"
-	@echo "  test         - 执行后端与前端质量门禁"
-	@echo "  clean        - 清理构建产物"
-	@echo "  docker-up    - 启动 Docker Compose"
-	@echo "  docker-down  - 停止 Docker Compose"
-	@echo "  docker-logs  - 查看 Docker Compose 日志"
-	@echo "  install-deps - 安装依赖"
-	@echo "  server-dev   - 启动后端开发服务"
-	@echo "  web-dev      - 启动前端开发服务"
-	@echo "  db-migrate   - 执行标准数据库迁移"
-	@echo "  openapi-lint - 校验 OpenAPI 3.2 机器契约"
+	@echo "ChronoDesk 开发命令"
+	@echo ""
+	@echo "环境"
+	@echo "  doctor          检查本机工具链"
+	@echo "  install-deps    可重复安装 Go、Web 和 Python 测试依赖"
+	@echo "  dev             构建并启动 Docker Compose 开发环境"
+	@echo "  server-dev      在本机启动 Go API"
+	@echo "  web-dev         在本机启动 Vite 管理端"
+	@echo ""
+	@echo "质量"
+	@echo "  fmt             格式化 Go 源码"
+	@echo "  test            执行 Go、Web 与 OpenAPI 标准门禁"
+	@echo "  test-race       执行 Go 竞态检测"
+	@echo "  security        执行 Go 与 Web 依赖安全检查"
+	@echo "  verify          执行格式、测试、安全与生产构建门禁"
+	@echo "  smoke           对运行中的 API 执行全部 Python 黑盒测试"
+	@echo "  e2e             对运行中的完整环境执行 Playwright 测试"
+	@echo ""
+	@echo "数据与容器"
+	@echo "  db-migrate      执行幂等数据库迁移"
+	@echo "  db-migrate-seed 执行迁移并写入开发种子数据"
+	@echo "  docker-down     停止 Docker Compose"
+	@echo "  docker-logs     查看 Docker Compose 日志"
 
-# 开发环境
+doctor:
+	@command -v go >/dev/null && go version
+	@command -v node >/dev/null && node --version
+	@command -v npm >/dev/null && npm --version
+	@command -v $(PYTHON) >/dev/null && $(PYTHON) --version
+	@$(COMPOSE) version
+
+install-deps: install-server-deps install-web-deps install-test-deps
+
+install-server-deps:
+	cd server && go mod download
+
+install-web-deps:
+	cd web && npm ci
+
+install-test-deps:
+	$(PYTHON) -m pip install -r server/requirements-test.txt
+
 dev: docker-up
 
-# 构建项目
+server-dev:
+	cd server && go run ./cmd/chronodesk
+
+web-dev:
+	cd web && npm run dev
+
+docker-up:
+	$(COMPOSE) up --build -d
+	@echo "管理后台：http://localhost:3000"
+	@echo "健康检查：http://localhost:8081/healthz"
+
+docker-down:
+	$(COMPOSE) down
+
+docker-logs:
+	$(COMPOSE) logs -f
+
 build: build-server build-web
 
 build-server:
-	@echo "Building server..."
-	cd server && go build -o bin/server main.go
+	cd server && mkdir -p bin
+	cd server && go build -trimpath -ldflags="$(GO_LDFLAGS)" -o bin/chronodesk ./cmd/chronodesk
+	cd server && go build -trimpath -ldflags="$(GO_LDFLAGS)" -o bin/chronodesk-migrate ./cmd/migrate
 
 build-web:
-	@echo "Building web..."
 	cd web && npm run build
 
-# 运行测试
+clean:
+	rm -rf server/bin server/reports server/htmlcov
+	rm -rf web/dist web/build web/playwright-report web/test-results
+
+fmt:
+	cd server && gofmt -w .
+
+fmt-check:
+	@test -z "$$(cd server && gofmt -l .)" || \
+		{ echo "存在未格式化的 Go 文件："; cd server && gofmt -l .; exit 1; }
+
 test: test-server test-web openapi-lint
 
 test-server:
-	@echo "Running server tests..."
-	cd server && go test ./...
+	cd server && go test ./... -count=1
+	cd server && go vet ./...
+
+test-race:
+	cd server && go test -race ./... -count=1
 
 test-web:
-	@echo "Running web quality gates..."
 	cd web && npm run typecheck
 	cd web && npm run lint
 	cd web && npm run audit:security
 
+security:
+	cd server && go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+	cd web && npm run audit:security
+
+verify: fmt-check test security build
+
 openapi-lint:
-	@echo "Validating OpenAPI 3.2 contract..."
-	NPM_CONFIG_CACHE=$(NPM_TOOL_CACHE) npx --yes @redocly/cli@2.41.1 lint server/internal/openapi/openapi.yaml --format=stylish
-	NPM_CONFIG_CACHE=$(NPM_TOOL_CACHE) npx --yes @stoplight/spectral-cli@6.16.2 lint \
-		-r server/internal/openapi/.spectral.yaml \
+	NPM_CONFIG_CACHE=$(NPM_TOOL_CACHE) npx --yes @redocly/cli@2.41.1 \
+		lint server/internal/openapi/openapi.yaml --format=stylish
+	NPM_CONFIG_CACHE=$(NPM_TOOL_CACHE) npx --yes @stoplight/spectral-cli@6.16.2 \
+		lint -r server/internal/openapi/.spectral.yaml \
 		server/internal/openapi/openapi.yaml \
 		--fail-severity=warn
 
 smoke:
-	@echo "Running API smoke suites..."
 	cd server && mkdir -p reports
-	cd server && pytest tests/auth -v --html=reports/auth.html --self-contained-html
-	cd server && pytest tests/automation -v --html=reports/automation.html --self-contained-html
-	cd server && pytest tests/system -v --html=reports/system.html --self-contained-html
+	cd server && pytest tests -v \
+		--html=reports/smoke.html \
+		--self-contained-html
 
-# 清理
-clean:
-	@echo "Cleaning build artifacts..."
-	rm -rf server/bin
-	rm -rf web/dist
-	rm -rf web/build
+e2e:
+	cd web && npm run test:e2e
 
-# Docker 命令
-docker-up:
-	@echo "Starting services with Docker Compose..."
-	docker-compose up -d
-	@echo "Services started. Check status with: make docker-logs"
-	@echo "API: http://localhost:8081/healthz"
-	@echo "Web: http://localhost:3000"
-
-docker-down:
-	@echo "Stopping Docker Compose services..."
-	docker-compose down
-
-docker-logs:
-	@echo "Viewing Docker Compose logs..."
-	docker-compose logs -f
-
-# 安装依赖
-install-deps: install-server-deps install-web-deps
-
-install-server-deps:
-	@echo "Installing server dependencies..."
-	cd server && go mod tidy
-
-install-web-deps:
-	@echo "Installing web dependencies..."
-	cd web && npm install
-
-# 开发模式启动
-server-dev:
-	@echo "Starting server in development mode..."
-	cd server && go run main.go
-
-web-dev:
-	@echo "Starting web in development mode..."
-	cd web && npm run dev
-
-# 数据库迁移
 db-migrate:
-	@echo "Running database migrations..."
-	cd server && go run cmd/migrate/main.go
+	cd server && go run ./cmd/migrate
 
-# 初始化项目
-init: install-deps
-	@echo "Project initialized successfully!"
-	@echo "Run 'make dev' to start development environment"
+db-migrate-seed:
+	cd server && go run ./cmd/migrate -seed

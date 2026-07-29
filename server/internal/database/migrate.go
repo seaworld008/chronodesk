@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"gongdan-system/internal/auth"
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/auth"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
 )
 

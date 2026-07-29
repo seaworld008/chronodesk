@@ -38,7 +38,7 @@ import TicketBulkUpdateButton from './TicketBulkUpdateButton';
 import { parseTagsToArray } from './tagUtils';
 import { Ticket } from '@/types';
 import {
-    administrativeTicketRoles,
+    canDeleteTicket,
     canMutateTicket,
     type TicketRolePermissions,
 } from './ticketAccess';
@@ -50,7 +50,6 @@ import {
 import { EnterpriseSearchInput } from '@/components/inputs/EnterpriseSearchInput';
 import {
     EnterpriseBooleanFilterInput,
-    EnterpriseDateFilterInput,
     EnterpriseSelectFilterInput,
     EnterpriseTextFilterInput,
 } from '@/components/inputs/EnterpriseFilterInputs';
@@ -408,9 +407,6 @@ const TicketFilters = [
     <EnterpriseBooleanFilterInput source="is_overdue" label="已逾期" />,
     <EnterpriseBooleanFilterInput source="sla_breached" label="SLA 违约" />,
     <EnterpriseBooleanFilterInput source="unassigned" label="未分配" />,
-    <EnterpriseDateFilterInput source="created_at_gte" label="创建时间从" />,
-    <EnterpriseDateFilterInput source="created_at_lte" label="创建时间到" />,
-    <EnterpriseDateFilterInput source="due_date_lte" label="截止时间到" />,
 ];
 
 /**
@@ -459,7 +455,7 @@ const TicketListEmpty = () => (
  */
 const TicketListEnhanced: React.FC = () => {
     const { permissions } = usePermissions<TicketRolePermissions>();
-    const canBulkManage = administrativeTicketRoles.has(permissions?.role ?? '');
+    const canBulkManage = canDeleteTicket(permissions?.role);
 
     return (
         <List

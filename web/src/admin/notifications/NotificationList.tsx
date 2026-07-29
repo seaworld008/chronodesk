@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import {
     List,
     DateField,
@@ -10,6 +10,7 @@ import {
     useRecordContext,
     WrapperField,
     FunctionField,
+    usePermissions,
 } from 'react-admin';
 import {
     Chip,
@@ -58,6 +59,10 @@ import {
     EnterpriseReferenceAutocompleteInput,
     EnterpriseSelectFilterInput,
 } from '@/components/inputs/EnterpriseFilterInputs';
+import {
+    isAdministrativeRole,
+    type RolePermissions,
+} from '@/lib/accessControl';
 
 // 通知类型选项
 const notificationTypeChoices = [
@@ -367,21 +372,58 @@ type NotificationRecord = {
     retry_count?: number
 }
 
-const NotificationFilters = [
-    <EnterpriseSearchInput source="q" placeholder="搜索通知" alwaysOn />,
-    <EnterpriseSelectFilterInput source="type" label="通知类型" choices={notificationTypeChoices} />,
-    <EnterpriseSelectFilterInput source="priority" label="优先级" choices={priorityChoices} />,
-    <EnterpriseSelectFilterInput source="channel" label="通知渠道" choices={channelChoices} />,
-    <EnterpriseBooleanFilterInput source="is_read" label="已读" />,
-    <EnterpriseBooleanFilterInput source="is_sent" label="已发送" />,
-    <ReferenceInput source="recipient_id" reference="users" label="接收者">
-        <EnterpriseReferenceAutocompleteInput label="接收者" optionText="username" />
-    </ReferenceInput>,
-    <ReferenceInput source="sender_id" reference="users" label="发送者">
-        <EnterpriseReferenceAutocompleteInput label="发送者" optionText="username" />
-    </ReferenceInput>,
-    <EnterpriseDateFilterInput source="created_at_gte" label="创建时间从" />,
-    <EnterpriseDateFilterInput source="created_at_lte" label="创建时间到" />,
+const buildNotificationFilters = (canAdminister: boolean) => [
+    <EnterpriseSearchInput key="q" source="q" placeholder="搜索通知" alwaysOn />,
+    <EnterpriseSelectFilterInput
+        key="type"
+        source="type"
+        label="通知类型"
+        choices={notificationTypeChoices}
+    />,
+    <EnterpriseSelectFilterInput
+        key="priority"
+        source="priority"
+        label="优先级"
+        choices={priorityChoices}
+    />,
+    <EnterpriseSelectFilterInput
+        key="channel"
+        source="channel"
+        label="通知渠道"
+        choices={channelChoices}
+    />,
+    <EnterpriseBooleanFilterInput key="is_read" source="is_read" label="已读" />,
+    <EnterpriseBooleanFilterInput key="is_sent" source="is_sent" label="已发送" />,
+    ...(canAdminister
+        ? [
+            <ReferenceInput
+                key="recipient_id"
+                source="recipient_id"
+                reference="users"
+                label="接收者"
+            >
+                <EnterpriseReferenceAutocompleteInput label="接收者" optionText="username" />
+            </ReferenceInput>,
+            <ReferenceInput
+                key="sender_id"
+                source="sender_id"
+                reference="users"
+                label="发送者"
+            >
+                <EnterpriseReferenceAutocompleteInput label="发送者" optionText="username" />
+            </ReferenceInput>,
+        ]
+        : []),
+    <EnterpriseDateFilterInput
+        key="created_at_gte"
+        source="created_at_gte"
+        label="创建时间从"
+    />,
+    <EnterpriseDateFilterInput
+        key="created_at_lte"
+        source="created_at_lte"
+        label="创建时间到"
+    />,
 ];
 
 /**
@@ -419,9 +461,16 @@ const NotificationEmpty = () => (
  * 通知列表组件
  */
 const NotificationList: React.FC = () => {
+    const { permissions } = usePermissions<RolePermissions>();
+    const canAdminister = isAdministrativeRole(permissions?.role);
+    const filters = useMemo(
+        () => buildNotificationFilters(canAdminister),
+        [canAdminister],
+    );
+
     return (
         <List
-            filters={NotificationFilters}
+            filters={filters}
             actions={<NotificationListActions />}
             empty={<NotificationEmpty />}
             perPage={25}

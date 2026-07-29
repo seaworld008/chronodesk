@@ -8,9 +8,9 @@ import (
 	"strconv"
 	"strings"
 
-	"gongdan-system/internal/a2a"
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/a2a"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
 // A2ATaskListAuthorizer applies one request-scoped policy snapshot to a

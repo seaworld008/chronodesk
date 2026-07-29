@@ -6,7 +6,7 @@ import (
 	"io"
 	"testing"
 
-	"gongdan-system/internal/a2a"
+	"github.com/seaworld008/chronodesk/server/internal/a2a"
 )
 
 func TestA2APushRequestUsesCanonicalMediaTypeAndVersion(t *testing.T) {

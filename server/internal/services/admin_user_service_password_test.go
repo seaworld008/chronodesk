@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"golang.org/x/crypto/bcrypt"
-	"gongdan-system/internal/models"
 )
 
 func TestResetUserPasswordAtomicallyRevokesSessions(t *testing.T) {

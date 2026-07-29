@@ -9,7 +9,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/version"
 )
 
 // ConfigService 系统配置服务
@@ -83,9 +84,9 @@ func (s *ConfigService) InitDefaultConfigs() error {
 
 	defaultConfigs := []models.SystemConfig{
 		// 系统基础信息
-		{Key: KeySystemName, Value: "工单管理系统", ValueType: "string", Description: "系统名称", Category: CategorySystem, Group: "basic"},
-		{Key: KeySystemVersion, Value: "1.0.0", ValueType: "string", Description: "系统版本", Category: CategorySystem, Group: "basic"},
-		{Key: KeySystemDescription, Value: "现代化的工单管理系统", ValueType: "string", Description: "系统描述", Category: CategorySystem, Group: "basic"},
+		{Key: KeySystemName, Value: "ChronoDesk", ValueType: "string", Description: "系统名称", Category: CategorySystem, Group: "basic"},
+		{Key: KeySystemVersion, Value: version.Version, ValueType: "string", Description: "系统版本", Category: CategorySystem, Group: "basic"},
+		{Key: KeySystemDescription, Value: "AI Agent 原生工单自动化平台", ValueType: "string", Description: "系统描述", Category: CategorySystem, Group: "basic"},
 		{Key: KeySystemTimezone, Value: "Asia/Shanghai", ValueType: "string", Description: "系统时区", Category: CategorySystem, Group: "basic"},
 
 		// 安全策略

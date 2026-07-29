@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { loginViaUI } from './helpers/testData';
+import { authenticatePage } from './helpers/testData';
 
 const TEST_USER = {
     email: 'admin@example.com',
@@ -8,7 +8,7 @@ const TEST_USER = {
 
 test.describe('System Settings', () => {
     test('should update security config and restore', async ({ page }) => {
-        await loginViaUI(page, TEST_USER);
+        await authenticatePage(page, TEST_USER);
 
         await page.goto('/#/system-settings/overview');
         await page.getByRole('heading', { name: '系统设置概览' }).waitFor({ timeout: 15000 });
@@ -24,7 +24,7 @@ test.describe('System Settings', () => {
         await row.getByRole('button', { name: '保存' }).click();
         await expect(page.getByText('配置已更新')).toBeVisible({ timeout: 10000 });
 
-        await page.getByRole('button', { name: '刷新' }).click();
+        await page.getByRole('main').getByRole('button', { name: '刷新', exact: true }).click();
         const refreshedRow = page.locator('tr', { hasText: 'security.password_min_length' });
         await expect(refreshedRow.getByRole('spinbutton')).toHaveValue(updatedValue);
 

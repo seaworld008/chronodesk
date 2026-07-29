@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/robfig/cron/v3"
-	"gongdan-system/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
 )
 

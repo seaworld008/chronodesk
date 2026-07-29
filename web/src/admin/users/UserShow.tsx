@@ -53,20 +53,17 @@ import {
     TruncatedText,
     type ResizableColumn,
 } from '@/components/tables/EnterpriseTable';
+import {
+    getUserRoleLabel,
+    normalizeUserRole,
+    userRoleChoices,
+} from '@/lib/accessControl';
 
 const relatedTicketColumns: ResizableColumn[] = [
     { key: 'ticket_number', defaultWidth: 156, minWidth: 120, maxWidth: 240 },
     { key: 'title', defaultWidth: 360, minWidth: 200, maxWidth: 640 },
     { key: 'status', defaultWidth: 132, minWidth: 104, maxWidth: 220 },
     { key: 'timestamp', defaultWidth: 188, minWidth: 144, maxWidth: 280 },
-];
-
-// 角色选项（与UserList保持一致）
-const roleChoices = [
-    { id: 'admin', name: '管理员' },
-    { id: 'agent', name: '客服代理' },
-    { id: 'customer', name: '客户' },
-    { id: 'supervisor', name: '主管' },
 ];
 
 // 状态选项（与UserList保持一致）
@@ -109,14 +106,16 @@ const UserHeader: React.FC = () => {
     const displayName = record.display_name || fullName || record.username;
 
     const getRoleConfig = (role: User['role']): ChipConfig => {
-        switch (role) {
+        switch (normalizeUserRole(role)) {
             case 'admin':
+            case 'superuser':
                 return { color: 'error', icon: <AdminIcon /> };
             case 'agent':
                 return { color: 'primary', icon: <SupportIcon /> };
             case 'supervisor':
                 return { color: 'secondary', icon: <SupervisorIcon /> };
             case 'customer':
+            case 'user':
                 return { color: 'success', icon: <CustomerIcon /> };
             default:
                 return { color: 'default', icon: <PersonIcon /> };
@@ -141,7 +140,7 @@ const UserHeader: React.FC = () => {
     const typedStatusConfig = getStatusConfig(record.status);
 
     const roleConfig = getRoleConfig(record.role);
-    const roleName = roleChoices.find(r => r.id === record.role)?.name || '未知角色';
+    const roleName = getUserRoleLabel(record.role);
     const statusName = statusChoices.find(s => s.id === record.status)?.name || '未知状态';
 
     return (
@@ -496,7 +495,7 @@ const UserShow: React.FC = () => {
                                                     }}>
                                                         角色
                                                     </Typography>
-                                                    <SelectField source="role" choices={roleChoices} />
+                                                    <SelectField source="role" choices={userRoleChoices} />
                                                 </Box>
                                                 
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>

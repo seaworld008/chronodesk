@@ -17,10 +17,10 @@ import (
 	"strings"
 	"time"
 
-	"gongdan-system/internal/agentauth"
-	"gongdan-system/internal/mcp"
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/agentauth"
+	"github.com/seaworld008/chronodesk/server/internal/mcp"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
@@ -539,12 +539,9 @@ func (a *MCPAdapter) assignTicket(
 		Type: models.ActorType(argumentString(assigneeValue, "type")),
 		ID:   argumentString(assigneeValue, "id"),
 	}
-	if err := assignee.Validate(); err != nil {
-		return nil, invalidArgument("invalid assignee")
-	}
-	changes, err := a.assignmentChanges(ctx, assignee)
+	changes, err := a.service.ResolveTicketAssignmentChanges(ctx, assignee)
 	if err != nil {
-		return nil, err
+		return nil, backendError(err)
 	}
 	decision, err := a.checkPolicy(ctx, principal, policyRequest{
 		scope:        models.ScopeTicketsAssign,
@@ -1592,53 +1589,6 @@ func boundedMCPListCandidateBudget(limit int) int {
 	return budget
 }
 
-func (a *MCPAdapter) assignmentChanges(
-	ctx context.Context,
-	assignee models.ActorRef,
-) (map[string]any, error) {
-	changes := map[string]any{
-		"assigned_to_actor_type": assignee.Type,
-		"assigned_to_actor_id":   assignee.ID,
-	}
-	switch assignee.Type {
-	case models.ActorTypeHuman:
-		userID, err := strconv.ParseUint(assignee.ID, 10, 64)
-		if err != nil || userID == 0 {
-			return nil, invalidArgument("human assignee id must be a user id")
-		}
-		var count int64
-		if err := a.db.WithContext(ctx).Model(&models.User{}).
-			Where("id = ?", userID).
-			Count(&count).Error; err != nil {
-			return nil, backendError(err)
-		}
-		if count != 1 {
-			return nil, &mcp.BackendError{Code: "not_found", Message: "assignee not found"}
-		}
-		changes["assigned_to_id"] = uint(userID)
-		changes["assigned_to_service_principal_id"] = nil
-	case models.ActorTypeServicePrincipal:
-		var target models.ServicePrincipal
-		if err := a.db.WithContext(ctx).First(&target, "id = ?", assignee.ID).Error; err != nil {
-			return nil, backendError(err)
-		}
-		if target.Status != models.ServicePrincipalStatusActive || target.EmergencyDisabled {
-			return nil, &mcp.BackendError{Code: "policy_denied", Message: "assignee is unavailable"}
-		}
-		if target.CompatibilityUserID == nil || *target.CompatibilityUserID == 0 {
-			return nil, invalidArgument("service principal assignee has no compatibility user")
-		}
-		changes["assigned_to_id"] = *target.CompatibilityUserID
-		changes["assigned_to_service_principal_id"] = target.ID
-	case models.ActorTypeSystem:
-		changes["assigned_to_id"] = nil
-		changes["assigned_to_service_principal_id"] = nil
-	default:
-		return nil, invalidArgument("invalid assignee type")
-	}
-	return changes, nil
-}
-
 func principalActor(principal mcp.Principal) models.ActorRef {
 	return models.ServicePrincipalActor(principal.ID)
 }
@@ -2133,6 +2083,12 @@ func backendError(err error) *mcp.BackendError {
 	retryable := false
 	message := "operation failed"
 	switch {
+	case errors.Is(err, services.ErrInvalidAssignee):
+		code, message = "invalid_argument", "assignee is invalid"
+	case errors.Is(err, services.ErrAssigneeNotFound):
+		code, message = "not_found", "assignee not found"
+	case errors.Is(err, services.ErrAssigneePolicyDenied):
+		code, message = "policy_denied", "assignee is unavailable"
 	case errors.Is(err, gorm.ErrRecordNotFound):
 		code, message = "not_found", "resource not found"
 	case errors.Is(err, services.ErrVersionConflict):

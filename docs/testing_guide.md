@@ -1,6 +1,7 @@
 # 测试与质量控制指南
 
-本指南适用于当前 Go 1.26、React 19、MCP `2026-07-28`、A2A `1.0` 和 OpenAPI 3.2 代码。除特别说明外，命令均在仓库根目录执行。
+本指南适用于当前 Go 1.26.5、React 19、MCP `2026-07-28`、A2A `1.0`
+和 OpenAPI 3.2 代码。除特别说明外，命令均在仓库根目录执行。
 
 ## 1. 环境准备
 
@@ -29,26 +30,24 @@ cd server && go run ./cmd/secret-migrate -validate-only
 ## 2. 提交前标准门禁
 
 ```bash
-make test
-make build
+make verify
 ```
 
-`make test` 当前依次执行：
+`make verify` 当前依次执行：
 
-1. `cd server && go test ./...`
-2. `cd web && npm run typecheck`
-3. `cd web && npm run lint`
-4. `cd web && npm run audit:security`
-5. Redocly 2.41.1 与 Spectral 6.16.2 的 OpenAPI 3.2 严格校验
+1. Go 格式、完整测试、Vet 与 `govulncheck`
+2. Web TypeScript、ESLint、生产依赖安全策略与构建
+3. Redocly 2.41.1 与 Spectral 6.16.2 的 OpenAPI 3.2 严格校验
+4. `chronodesk`、迁移命令与 Web 生产资源构建
 
-`make build` 同时构建 `server/bin/server` 和 `web/dist/`。
+`make build` 输出 `server/bin/chronodesk`、
+`server/bin/chronodesk-migrate` 和 `web/dist/`。
 
 ## 3. 后端与安全回归
 
 ```bash
 make test-server
-cd server && make test-race
-cd server && make vet
+make test-race
 ```
 
 涉及认证、领域事务、Outbox、调度或并发控制时，不能只运行单个包；修复后需要重新执行完整 `make test-server`。
@@ -78,8 +77,7 @@ make build-web
 启动 API 与 Web 后，可执行现有 Playwright 套件：
 
 ```bash
-cd web
-npx playwright test
+make e2e
 ```
 
 重点检查：
@@ -120,26 +118,21 @@ MCP Inspector 2 的最新配置和命令见 [MCP 2026-07-28 接入说明](refere
 
 ```bash
 make smoke
-./test_integration.sh
 cd server && go test ./internal/services -run 'Notification|Webhook' -count=1
 ```
 
-`make smoke` 覆盖认证、自动化和系统配置。需要工单生命周期专项时执行：
-
-```bash
-cd server
-pytest tests/tickets -v
-```
+`make smoke` 覆盖认证、工单生命周期、通知收件人隔离、自动化和系统配置，
+并生成 `server/reports/smoke.html`。黑盒测试不伪造 Python 对 Go 源码的覆盖率。
 
 Pytest 默认访问 `http://localhost:8081/api`；可通过 `TEST_API_BASE_URL`、`TEST_HEALTHCHECK_URL`、`TEST_ADMIN_EMAIL` 和 `TEST_ADMIN_PASSWORD` 指向受控测试环境。
 
 ## 7. 发布前检查清单
 
 - [ ] PostgreSQL/Redis 健康检查通过，结构迁移与密钥验证完成。
-- [ ] `make test` 与 `make build` 通过。
+- [ ] `make verify` 通过。
 - [ ] Go race、vet 和真实 Redis 集成测试通过。
 - [ ] MCP Inspector、A2A 生命周期和 OpenAPI 契约通过。
-- [ ] Pytest、Shell 集成及通知/Webhook 专项通过。
+- [ ] Pytest 全套及通知/Webhook 专项通过。
 - [ ] Playwright 覆盖主要中文页面，表格、列宽、侧栏和响应式布局无回归。
 - [ ] PR 的 Checks 列出实际执行命令与结果，不包含凭据、数据库连接串或 token。
 

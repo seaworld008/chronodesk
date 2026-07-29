@@ -5,6 +5,14 @@ export type Credentials = {
     password: string;
 };
 
+export type AuthSession = {
+    access_token: string;
+    refresh_token?: string;
+    user?: Record<string, unknown>;
+    permissions?: unknown;
+    expires_in?: number;
+};
+
 const extractErrorMessage = (payload: unknown): string => {
     if (!payload || typeof payload !== 'object') {
         return '请求失败';
@@ -13,7 +21,10 @@ const extractErrorMessage = (payload: unknown): string => {
     return (data.msg as string) || (data.message as string) || '请求失败';
 };
 
-export const login = async (request: APIRequestContext, credentials: Credentials) => {
+export const loginSession = async (
+    request: APIRequestContext,
+    credentials: Credentials,
+): Promise<AuthSession> => {
     const response = await request.post('/api/auth/login', {
         data: {
             email: credentials.email,
@@ -31,14 +42,16 @@ export const login = async (request: APIRequestContext, credentials: Credentials
         throw new Error(extractErrorMessage(payload));
     }
 
-    const data = (payload.data ?? {}) as Record<string, unknown>;
-    const token = data.access_token as string | undefined;
-    if (!token) {
+    const data = (payload.data ?? {}) as Partial<AuthSession>;
+    if (!data.access_token) {
         throw new Error('登录响应缺少 access_token');
     }
 
-    return token;
+    return data as AuthSession;
 };
+
+export const login = async (request: APIRequestContext, credentials: Credentials) =>
+    (await loginSession(request, credentials)).access_token;
 
 type RequestOptions = {
     method?: 'GET' | 'POST' | 'PUT' | 'DELETE';

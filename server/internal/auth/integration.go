@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	appconfig "gongdan-system/internal/config"
-	"gongdan-system/internal/security"
-	"gongdan-system/internal/services"
+	appconfig "github.com/seaworld008/chronodesk/server/internal/config"
+	"github.com/seaworld008/chronodesk/server/internal/security"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 	"gorm.io/gorm"
 )
 
@@ -73,7 +73,7 @@ func NewAuthModule(
 		From:     "noreply@ticket-system.com",
 	}
 	emailService := NewSMTPEmailService(emailConfig)
-	otpService := NewSimpleOTPService("Ticket System")
+	otpService := NewSimpleOTPService("ChronoDesk")
 	passwordService := NewSimplePasswordService(config.PasswordMinLength, "ticket-system-salt")
 	jwtManager := NewSimpleJWTManager(
 		config.JWTSecret,

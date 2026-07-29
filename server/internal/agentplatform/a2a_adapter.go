@@ -16,10 +16,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
-	"gongdan-system/internal/a2a"
-	"gongdan-system/internal/agentauth"
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/a2a"
+	"github.com/seaworld008/chronodesk/server/internal/agentauth"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
 const a2aSourceProtocol = "a2a"
@@ -725,7 +725,7 @@ func (b *A2ABackend) ticketWork(
 		if command.ExpectedVersion == 0 || command.LeaseID == "" || command.Assignee == nil {
 			return requireA2AFields("expected_version", "lease_id", "assignee")
 		}
-		changes, err := b.assignmentChanges(ctx, *command.Assignee)
+		changes, err := b.native.ResolveTicketAssignmentChanges(ctx, *command.Assignee)
 		if err != nil {
 			return err
 		}
@@ -778,40 +778,6 @@ func (b *A2ABackend) updateTicket(
 		"ticket":    result.Ticket.ToResponse(),
 		"receipt":   result.Receipt,
 	})
-}
-
-func (b *A2ABackend) assignmentChanges(ctx context.Context, assignee models.ActorRef) (map[string]any, error) {
-	if err := assignee.Validate(); err != nil {
-		return nil, requireA2AFields("assignee.type", "assignee.id")
-	}
-	changes := map[string]any{
-		"assigned_to_actor_type": assignee.Type,
-		"assigned_to_actor_id":   assignee.ID,
-	}
-	switch assignee.Type {
-	case models.ActorTypeHuman:
-		userID, err := strconv.ParseUint(assignee.ID, 10, 64)
-		if err != nil || userID == 0 {
-			return nil, requireA2AFields("numeric human assignee.id")
-		}
-		changes["assigned_to_id"] = uint(userID)
-		changes["assigned_to_service_principal_id"] = nil
-	case models.ActorTypeServicePrincipal:
-		var principal models.ServicePrincipal
-		if err := b.db.WithContext(ctx).
-			Select("id", "compatibility_user_id").
-			First(&principal, "id = ?", assignee.ID).Error; err != nil {
-			return nil, err
-		}
-		if principal.CompatibilityUserID == nil || *principal.CompatibilityUserID == 0 {
-			return nil, requireA2AFields("assignee compatibility user")
-		}
-		changes["assigned_to_id"] = *principal.CompatibilityUserID
-		changes["assigned_to_service_principal_id"] = principal.ID
-	default:
-		return nil, requireA2AFields("human or service_principal assignee")
-	}
-	return changes, nil
 }
 
 type ticketCommentCommand struct {
@@ -1078,6 +1044,30 @@ func reportA2AIdempotentReplay(
 
 func (b *A2ABackend) reportDomainError(ctx context.Context, reporter a2a.Reporter, err error) error {
 	switch {
+	case errors.Is(err, services.ErrInvalidAssignee):
+		return reportA2AState(
+			ctx,
+			reporter,
+			a2a.TaskStateInputRequired,
+			services.AgentNativeErrorCode(err),
+			[]string{"valid assignee.type and assignee.id"},
+		)
+	case errors.Is(err, services.ErrAssigneeNotFound):
+		return reportA2AState(
+			ctx,
+			reporter,
+			a2a.TaskStateFailed,
+			services.AgentNativeErrorCode(err),
+			nil,
+		)
+	case errors.Is(err, services.ErrAssigneePolicyDenied):
+		return reportA2AState(
+			ctx,
+			reporter,
+			a2a.TaskStateRejected,
+			services.AgentNativeErrorCode(err),
+			nil,
+		)
 	case errors.Is(err, services.ErrInvalidCredential),
 		errors.Is(err, services.ErrCredentialExpired),
 		errors.Is(err, services.ErrPrincipalNotFound),

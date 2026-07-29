@@ -15,8 +15,8 @@ import (
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 
-	"gongdan-system/internal/models"
-	"gongdan-system/internal/services"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
 type authorizationRaceTicketService struct {

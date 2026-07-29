@@ -28,10 +28,10 @@ const notificationColors = {
 } as const
 
 /**
- * React Admin 5.15 still forwards the removed MUI Snackbar
- * `TransitionProps` and `ContentProps` properties. MUI 9 sends those unknown
- * properties to the DOM, which creates console errors. Keep the React Admin
- * notification queue and undo semantics while using the MUI 9 slot API only.
+ * React Admin 5.15 still supplies the legacy MUI Snackbar `TransitionProps`
+ * and `ContentProps` properties. MUI 7 accepts them but deprecates them in
+ * favor of the slot API. Keep the React Admin notification queue and undo
+ * semantics while normalizing all Snackbar customization through slots.
  */
 export const AppNotification = () => {
     const { notifications, takeNotification } = useNotificationContext()
@@ -103,7 +103,7 @@ export const AppNotification = () => {
         messageArgs,
         multiLine = false,
         undoable = false,
-        // Never forward the removed MUI properties if a caller supplies them.
+        // Do not forward the deprecated properties separately when callers use them.
         ContentProps: legacyContentProps,
         TransitionProps: legacyTransitionProps,
         slotProps: notificationSlotProps,

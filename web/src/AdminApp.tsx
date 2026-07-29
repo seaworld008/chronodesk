@@ -7,6 +7,10 @@ import { createTheme } from '@mui/material/styles';
 // Data and Auth providers
 import { dataProvider } from './lib/dataProvider';
 import { authProvider } from './lib/authProvider';
+import {
+    isAdministrativeRole,
+    type RolePermissions,
+} from './lib/accessControl';
 
 // Icons
 import {
@@ -116,23 +120,14 @@ const theme = createTheme(
     muiZhCN,
 );
 
-type AppPermissions = {
-    role?: string;
-};
-
-const administrativeRoles = new Set(['supervisor', 'admin', 'superuser']);
-
-const hasAdministrativeRole = (permissions?: AppPermissions) =>
-    administrativeRoles.has(permissions?.role ?? '');
-
 const AdministrativeRoute = ({ children }: React.PropsWithChildren) => {
-    const { permissions, isPending } = usePermissions<AppPermissions>();
+    const { permissions, isPending } = usePermissions<RolePermissions>();
 
     if (isPending) {
         return null;
     }
 
-    if (!hasAdministrativeRole(permissions)) {
+    if (!isAdministrativeRole(permissions?.role)) {
         return <Navigate to="/" replace />;
     }
 
@@ -165,8 +160,8 @@ const AdministrativeAutomationLogList = withAdministrativeAccess(AutomationLogLi
  * 自定义菜单组件 - 只展示当前角色可访问的管理入口
  */
 const CustomMenu: React.FC = () => {
-    const { permissions } = usePermissions<AppPermissions>();
-    const canAdminister = hasAdministrativeRole(permissions);
+    const { permissions } = usePermissions<RolePermissions>();
+    const canAdminister = isAdministrativeRole(permissions?.role);
 
     return (
         <Menu>
@@ -211,7 +206,7 @@ const LayoutWithMenu: React.FC<LayoutProps> = (props) => (
 );
 
 /**
- * 工单管理系统 - React Admin版本
+ * ChronoDesk 工单自动化平台
  */
 export const AdminApp: React.FC = () => {
     return (
@@ -221,7 +216,7 @@ export const AdminApp: React.FC = () => {
             i18nProvider={i18nProvider}
             dashboard={TicketDashboard}
             theme={theme}
-            title="工单管理系统"
+            title="ChronoDesk 工单自动化平台"
             layout={LayoutWithMenu}
             loginPage={LoginPage}
             notification={AppNotification}

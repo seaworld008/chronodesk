@@ -10,9 +10,9 @@ import (
 	"os"
 	"time"
 
-	"gongdan-system/internal/auth"
-	"gongdan-system/internal/config"
-	"gongdan-system/internal/security"
+	"github.com/seaworld008/chronodesk/server/internal/auth"
+	"github.com/seaworld008/chronodesk/server/internal/config"
+	"github.com/seaworld008/chronodesk/server/internal/security"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"

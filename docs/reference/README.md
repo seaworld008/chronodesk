@@ -10,7 +10,6 @@
 - [CloudEvents 1.0](CLOUDEVENTS_1_0.md)：领域事件信封、合法扩展属性、Outbox 消费和去重约束。
 - [OpenAPI 3.2](OPENAPI_3_2.md)：单版本机器契约、Redocly/Spectral 严格门禁与管理员并发契约。
 - [数据库敏感字段静态加密](DATA_AT_REST_ENCRYPTION.md)：AES-256-GCM keyring、显式迁移、轮换与投递日志安全。
-- [需求阶段接口清单](REQUIRED_API_ENDPOINTS.md)：历史需求核对资料，不作为当前接口契约。
 
 ## 使用建议
 
