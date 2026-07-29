@@ -103,7 +103,11 @@ func NewAuthModule(
 	)
 
 	// 创建处理器
-	authHandler := NewAuthHandler(authService, logger)
+	authHandler := NewAuthHandler(
+		authService,
+		logger,
+		WithSecureTrustedDeviceCookie(cfg.Server.Environment == "production"),
+	)
 
 	return &AuthModule{
 		AuthService: authService,

@@ -1,4 +1,11 @@
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import {
+    closeSync,
+    constants,
+    fstatSync,
+    openSync,
+    readFileSync,
+    readdirSync,
+} from 'node:fs';
 import { createRequire } from 'node:module';
 import { extname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -15,6 +22,11 @@ const unstableRSCMarkers = [
     'decodeReply',
     'react-server',
     'unstable_RSC',
+];
+const unsafeTrustedDeviceCredentialPatterns = [
+    /localStorage\.(?:getItem|setItem)\(\s*['"]trustedDeviceToken['"]/,
+    /\bdevice_token\b/,
+    /\btrusted_device_token\b/,
 ];
 
 const fail = (message) => {
@@ -50,20 +62,49 @@ if (routerPackage.version !== expectedRouterVersion) {
     );
 }
 
+const readRegularFileWithoutFollowingLinks = (target) => {
+    let descriptor;
+    try {
+        descriptor = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+        if (!fstatSync(descriptor).isFile()) {
+            fail(`安全审计只允许读取普通文件（${target}）`);
+        }
+        return readFileSync(descriptor, 'utf8');
+    } catch (error) {
+        fail(`无法安全读取源文件 ${target}：${error.message}`);
+    } finally {
+        if (descriptor !== undefined) {
+            closeSync(descriptor);
+        }
+    }
+};
+
 const scanFiles = (directory) => {
-    for (const entry of readdirSync(directory)) {
-        const target = join(directory, entry);
-        if (statSync(target).isDirectory()) {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const target = join(directory, entry.name);
+        if (entry.isSymbolicLink()) {
+            fail(`源码目录不允许符号链接，以免绕过安全审计（${target}）`);
+        }
+        if (entry.isDirectory()) {
             scanFiles(target);
+            continue;
+        }
+        if (!entry.isFile()) {
             continue;
         }
         if (!sourceExtensions.has(extname(target))) {
             continue;
         }
-        const source = readFileSync(target, 'utf8');
+        const source = readRegularFileWithoutFollowingLinks(target);
         const marker = unstableRSCMarkers.find((candidate) => source.includes(candidate));
         if (marker) {
             fail(`检测到不在安全例外范围内的 React Router RSC 标记 ${marker}（${target}）`);
+        }
+        const unsafeCredentialPattern = unsafeTrustedDeviceCredentialPatterns.find(
+            (candidate) => candidate.test(source),
+        );
+        if (unsafeCredentialPattern) {
+            fail(`可信设备凭据不得进入前端脚本、JSON 或 Web Storage（${target}）`);
         }
     }
 };

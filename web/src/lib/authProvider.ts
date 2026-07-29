@@ -11,8 +11,11 @@ const apiBase = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
 
 const buildUrl = (path: string) => `${apiBase}${path.startsWith('/') ? path : `/${path}`}`
 
-const trustedDeviceTokenKey = 'trustedDeviceToken'
 const rememberDevicePreferenceKey = 'rememberDevicePreference'
+
+// 旧版本曾把可信设备凭据写入 localStorage。启动时主动清除残留值；
+// 新版本只允许服务端通过 HttpOnly Cookie 管理该凭据。
+localStorage.removeItem('trustedDeviceToken')
 
 type LoginParams = {
     username: string
@@ -37,11 +40,6 @@ export const authProvider: AuthProvider = {
             password,
         }
 
-        const deviceToken = localStorage.getItem(trustedDeviceTokenKey)
-        if (deviceToken) {
-            payload.device_token = deviceToken
-        }
-
         const shouldRememberDevice = Boolean(rememberDevice ?? remember)
         if (shouldRememberDevice) {
             payload.remember_device = true
@@ -60,6 +58,7 @@ export const authProvider: AuthProvider = {
             const response = await fetch(buildUrl('/auth/login'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
+                credentials: 'include',
                 body: JSON.stringify(payload),
             })
 
@@ -72,9 +71,6 @@ export const authProvider: AuthProvider = {
                         : typeof result.message === 'string'
                             ? result.message
                             : ''
-                if (/otp/i.test(rawMessage) || /device/i.test(rawMessage)) {
-                    localStorage.removeItem(trustedDeviceTokenKey)
-                }
                 const message = containsChineseText(rawMessage)
                     ? rawMessage
                     : /otp/i.test(rawMessage)
@@ -106,14 +102,6 @@ export const authProvider: AuthProvider = {
                 localStorage.setItem('tokenExpiresAt', expiresAt.toString())
             }
 
-            if (data.trusted_device_token && shouldRememberDevice) {
-                localStorage.setItem(trustedDeviceTokenKey, data.trusted_device_token)
-            }
-
-            if (!shouldRememberDevice) {
-                localStorage.removeItem(trustedDeviceTokenKey)
-            }
-
             return Promise.resolve()
         } catch (error) {
             console.error('登录失败：', error)
@@ -130,6 +118,7 @@ export const authProvider: AuthProvider = {
                 // 调用后端注销API
                 await fetch(buildUrl('/auth/logout'), {
                     method: 'POST',
+                    credentials: 'include',
                     headers: {
                         Authorization: `Bearer ${token}`,
                         'Content-Type': 'application/json',
@@ -149,7 +138,6 @@ export const authProvider: AuthProvider = {
             localStorage.removeItem('user')
             localStorage.removeItem('permissions')
             localStorage.removeItem('tokenExpiresAt')
-            localStorage.removeItem(trustedDeviceTokenKey)
         }
         return Promise.resolve()
     },
@@ -233,7 +221,6 @@ export const authProvider: AuthProvider = {
             localStorage.removeItem('user')
             localStorage.removeItem('permissions')
             localStorage.removeItem('tokenExpiresAt')
-            localStorage.removeItem(trustedDeviceTokenKey)
             return Promise.reject({ message: '身份认证失败，请重新登录' })
         }
         // 403 及其他业务错误保留当前登录态，由调用页面展示拒绝原因。

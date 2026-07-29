@@ -7,12 +7,30 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // AuthHandler 认证处理器
 type AuthHandler struct {
-	authService *AuthService
-	logger      Logger
+	authService               *AuthService
+	logger                    Logger
+	secureTrustedDeviceCookie bool
+}
+
+const (
+	trustedDeviceCookieName = "chronodesk_trusted_device"
+	trustedDeviceCookiePath = "/api/auth/login"
+)
+
+// AuthHandlerOption 配置认证 HTTP 适配器。
+type AuthHandlerOption func(*AuthHandler)
+
+// WithSecureTrustedDeviceCookie 强制可信设备 Cookie 使用 Secure 属性。
+// 生产环境必须启用；TLS 直连请求即使未配置也会自动启用。
+func WithSecureTrustedDeviceCookie(secure bool) AuthHandlerOption {
+	return func(handler *AuthHandler) {
+		handler.secureTrustedDeviceCookie = secure
+	}
 }
 
 // Logger 日志接口
@@ -43,14 +61,20 @@ func (l *SimpleLogger) Debug(msg string, fields ...interface{}) {
 }
 
 // NewAuthHandler 创建认证处理器
-func NewAuthHandler(authService *AuthService, logger Logger) *AuthHandler {
+func NewAuthHandler(authService *AuthService, logger Logger, options ...AuthHandlerOption) *AuthHandler {
 	if logger == nil {
 		logger = &SimpleLogger{}
 	}
-	return &AuthHandler{
+	handler := &AuthHandler{
 		authService: authService,
 		logger:      logger,
 	}
+	for _, option := range options {
+		if option != nil {
+			option(handler)
+		}
+	}
+	return handler
 }
 
 // HTTPContext HTTP上下文接口
@@ -69,6 +93,7 @@ type HTTPContext interface {
 	ClientIP() string
 	UserAgent() string
 	Request() *http.Request
+	SetCookie(cookie *http.Cookie)
 	Next()
 }
 
@@ -164,6 +189,11 @@ func (h *AuthHandler) Login(c HTTPContext) {
 		})
 		return
 	}
+	if request := c.Request(); request != nil {
+		if cookie, err := request.Cookie(trustedDeviceCookieName); err == nil {
+			req.DeviceToken = cookie.Value
+		}
+	}
 
 	// 验证输入
 	if req.Email == "" || req.Password == "" {
@@ -183,6 +213,10 @@ func (h *AuthHandler) Login(c HTTPContext) {
 	ctx := context.Background()
 	resp, err := h.authService.Login(ctx, &req, ipAddress, userAgent)
 	if err != nil {
+		if req.DeviceToken != "" &&
+			(errors.Is(err, ErrInvalidOTP) || strings.Contains(err.Error(), "OTP")) {
+			h.clearTrustedDeviceCookie(c)
+		}
 		h.logger.Error("Login failed", "error", err, "email", req.Email)
 
 		message := "登录失败"
@@ -223,6 +257,15 @@ func (h *AuthHandler) Login(c HTTPContext) {
 
 	// 设置安全头
 	c.SetHeader("X-Auth-Token", resp.AccessToken)
+	if req.RememberDevice && resp.TrustedDeviceToken != "" {
+		h.setTrustedDeviceCookie(
+			c,
+			resp.TrustedDeviceToken,
+			resp.TrustedDeviceExpiresAt,
+		)
+	} else if !req.RememberDevice {
+		h.clearTrustedDeviceCookie(c)
+	}
 
 	// 返回成功响应 - 使用ApiResponse格式与前端保持一致
 	c.JSON(http.StatusOK, map[string]interface{}{
@@ -298,6 +341,8 @@ func (h *AuthHandler) RefreshToken(c HTTPContext) {
 
 // Logout 用户登出
 func (h *AuthHandler) Logout(c HTTPContext) {
+	h.clearTrustedDeviceCookie(c)
+
 	// 从头部获取刷新令牌
 	refreshToken := c.GetHeader("X-Refresh-Token")
 	if refreshToken == "" {
@@ -334,6 +379,8 @@ func (h *AuthHandler) Logout(c HTTPContext) {
 
 // LogoutAll 登出所有设备
 func (h *AuthHandler) LogoutAll(c HTTPContext) {
+	h.clearTrustedDeviceCookie(c)
+
 	// 从上下文获取用户ID
 	userID, exists := c.Get("user_id")
 	if !exists {
@@ -373,6 +420,49 @@ func (h *AuthHandler) LogoutAll(c HTTPContext) {
 		Success: true,
 		Message: "已从所有设备退出登录",
 	})
+}
+
+func (h *AuthHandler) setTrustedDeviceCookie(c HTTPContext, token string, expiresAt time.Time) {
+	if token == "" {
+		return
+	}
+	now := time.Now()
+	maxAge := int(time.Until(expiresAt).Seconds())
+	if maxAge < 1 {
+		maxAge = int(defaultTrustedDeviceTTL.Seconds())
+		expiresAt = now.Add(defaultTrustedDeviceTTL)
+	}
+	c.SetCookie(&http.Cookie{
+		Name:     trustedDeviceCookieName,
+		Value:    token,
+		Path:     trustedDeviceCookiePath,
+		MaxAge:   maxAge,
+		Expires:  expiresAt.UTC(),
+		HttpOnly: true,
+		Secure:   h.trustedDeviceCookieIsSecure(c),
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func (h *AuthHandler) clearTrustedDeviceCookie(c HTTPContext) {
+	c.SetCookie(&http.Cookie{
+		Name:     trustedDeviceCookieName,
+		Value:    "",
+		Path:     trustedDeviceCookiePath,
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0).UTC(),
+		HttpOnly: true,
+		Secure:   h.trustedDeviceCookieIsSecure(c),
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func (h *AuthHandler) trustedDeviceCookieIsSecure(c HTTPContext) bool {
+	if h.secureTrustedDeviceCookie {
+		return true
+	}
+	request := c.Request()
+	return request != nil && request.TLS != nil
 }
 
 // GetProfile 获取用户资料

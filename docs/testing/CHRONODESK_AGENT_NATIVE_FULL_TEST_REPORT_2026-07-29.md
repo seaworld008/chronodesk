@@ -118,6 +118,13 @@ Alpine `3.24.1` 最小运行镜像，运行用户为非 root `chronodesk`，不�
 PostgreSQL、Redis 和 API 三方健康后才启动 Web。Gitleaks 扫描未发现当前源码
 凭据泄漏，报告和扫描输出均未记录数据库或 Redis 凭据。
 
+GitHub Advanced Security 的 PR 增量检查又发现两项高风险问题：依赖审计脚本存在
+文件检查/读取竞态，可信设备令牌曾由 JSON 返回并写入 Web Storage。两项均未使用
+suppress：源码扫描改为 `O_NOFOLLOW` 打开并在同一文件描述符上完成
+`fstat/read/close`；可信设备凭据改由后端 `HttpOnly`、
+`SameSite=Strict`、生产环境 `Secure` Cookie 管理，前端与 JSON 契约均无法读取。
+Go 安全契约、Python OTP 黑盒、Web 防回归扫描和完整 Docker 浏览器套件均通过。
+
 容器内 43 个模型迁移与种子流程连续执行两次，第二次正确识别已有数据；API 接收
 SIGTERM 后记录停机信号、停止调度器并完成 HTTP 优雅关闭，重新启动后
 PostgreSQL、Redis 与 API 健康状态恢复。测试结束前 Outbox 为
@@ -320,6 +327,11 @@ token 或 password。
 
 ## 7. 本轮修复的发布级缺陷
 
+- 可信设备凭据曾进入登录 JSON 响应和浏览器 `localStorage`，一旦发生 XSS
+  就会泄漏长期免 OTP 凭据；现只接受后端 HttpOnly Cookie，JSON 请求/响应和
+  Web Storage 均由契约测试与源码扫描禁止。
+- 前端依赖审计先 `stat` 再按路径读取文件，存在符号链接替换竞态；现拒绝源码
+  symlink，并在带 `O_NOFOLLOW` 的同一文件描述符上校验和读取。
 - MCP 与 A2A 曾分别实现不同的处理人校验，导致同一业务动作跨协议语义不一致；
   现统一收敛到领域服务并增加协议一致性测试。
 - 未知或异常人类角色曾可能在前端权限分支中放行；现用统一访问控制 Module

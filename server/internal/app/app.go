@@ -313,10 +313,11 @@ func Run() error {
 		KeyFunc: middleware.AuthenticatedUserRouteKeyFunc,
 		Headers: true,
 	}))
-	// ChronoDesk is a stateless API: human and service-principal credentials are
-	// presented explicitly in Authorization headers and no endpoint authenticates
-	// with ambient cookies. Cookie-based CSRF validation would therefore block
-	// legitimate OAuth, REST, MCP and A2A writes without adding protection.
+	// ChronoDesk business APIs authenticate explicit Authorization credentials.
+	// The only ambient cookie is a SameSite=Strict, HttpOnly trusted-device
+	// second-factor credential; it cannot authenticate a request without the
+	// user's password. Cookie-based CSRF validation on all writes would therefore
+	// block legitimate OAuth, REST, MCP and A2A calls without adding protection.
 	middlewareConfig.CSRF = nil
 
 	// 应用基础中间件（不包含JWT）

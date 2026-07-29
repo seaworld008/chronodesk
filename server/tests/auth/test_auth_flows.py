@@ -184,8 +184,13 @@ class TestAuthenticationFlows:
         login_body = login_resp.json()
         assert login_body.get("code") == 0, login_body
         login_data = login_body.get("data", {})
-        trusted_token = login_data.get("trusted_device_token")
-        assert trusted_token, "登录响应缺少 trusted_device_token"
+        assert "trusted_device_token" not in login_data, "登录响应不得暴露可信设备凭据"
+        trusted_cookie = login_resp.cookies.get("chronodesk_trusted_device")
+        assert trusted_cookie, "登录响应缺少 HttpOnly 可信设备 Cookie"
+        set_cookie = login_resp.headers.get("Set-Cookie", "")
+        assert "HttpOnly" in set_cookie
+        assert "SameSite=Strict" in set_cookie
+        assert "Path=/api/auth/login" in set_cookie
         assert login_data.get("user", {}).get("otp_enabled") is True
 
         second_login_resp = api_client.post_json(
@@ -193,7 +198,6 @@ class TestAuthenticationFlows:
             {
                 "email": email,
                 "password": password,
-                "device_token": trusted_token,
             },
         )
         assert second_login_resp.status_code == 200, second_login_resp.text
@@ -201,7 +205,7 @@ class TestAuthenticationFlows:
         assert second_body.get("code") == 0, second_body
 
         second_data = second_body.get("data", {})
-        assert second_data.get("trusted_device_token") is None, "重复登录不应返回新的设备令牌"
+        assert "trusted_device_token" not in second_data, "重复登录不应返回设备凭据"
 
         # 设备免OTP登录仍应提供新的令牌对，验证刷新立即可用
         new_refresh = second_data.get("refresh_token")
@@ -262,15 +266,15 @@ class TestAuthenticationFlows:
         first_login_resp = api_client.post_json("/auth/login", login_payload)
         assert first_login_resp.status_code == 200, first_login_resp.text
         first_data = first_login_resp.json()["data"]
-        trusted_token = first_data.get("trusted_device_token")
-        assert trusted_token, "首次验证码登录应返回 trusted_device_token"
+        assert "trusted_device_token" not in first_data, "登录响应不得暴露可信设备凭据"
+        assert first_login_resp.cookies.get("chronodesk_trusted_device")
 
         second_login_resp = api_client.post_json(
             "/auth/login",
             {
                 "email": email,
                 "password": password,
-                "device_token": trusted_token,
+                "remember_device": True,
             },
         )
         assert second_login_resp.status_code == 200, second_login_resp.text
@@ -301,7 +305,6 @@ class TestAuthenticationFlows:
             {
                 "email": email,
                 "password": password,
-                "device_token": trusted_token,
             },
         )
         assert reuse_resp.status_code in (400, 401), reuse_resp.text

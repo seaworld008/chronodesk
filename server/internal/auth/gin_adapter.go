@@ -87,6 +87,11 @@ func (g *GinHTTPContext) Request() *http.Request {
 	return g.ginCtx.Request
 }
 
+// SetCookie 写入标准 HTTP Cookie。
+func (g *GinHTTPContext) SetCookie(cookie *http.Cookie) {
+	http.SetCookie(g.ginCtx.Writer, cookie)
+}
+
 // GetRequest 获取原始HTTP请求
 func (g *GinHTTPContext) GetRequest() *http.Request {
 	return g.ginCtx.Request

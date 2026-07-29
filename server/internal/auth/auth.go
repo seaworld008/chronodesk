@@ -184,7 +184,7 @@ type LoginRequest struct {
 	Email          string `json:"email" binding:"required,email"`
 	Password       string `json:"password" binding:"required"`
 	OTPCode        string `json:"otp_code,omitempty"`
-	DeviceToken    string `json:"device_token,omitempty"`
+	DeviceToken    string `json:"-"`
 	RememberDevice bool   `json:"remember_device,omitempty"`
 	DeviceName     string `json:"device_name,omitempty"`
 }
@@ -243,12 +243,13 @@ type VerifyOTPRequest struct {
 
 // AuthResponse 认证响应
 type AuthResponse struct {
-	User               *UserInfo `json:"user"`
-	AccessToken        string    `json:"access_token"`
-	RefreshToken       string    `json:"refresh_token"`
-	ExpiresIn          int64     `json:"expires_in"`
-	TokenType          string    `json:"token_type"`
-	TrustedDeviceToken string    `json:"trusted_device_token,omitempty"`
+	User                   *UserInfo `json:"user"`
+	AccessToken            string    `json:"access_token"`
+	RefreshToken           string    `json:"refresh_token"`
+	ExpiresIn              int64     `json:"expires_in"`
+	TokenType              string    `json:"token_type"`
+	TrustedDeviceToken     string    `json:"-"`
+	TrustedDeviceExpiresAt time.Time `json:"-"`
 }
 
 // UserInfo 用户信息
@@ -797,6 +798,7 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 			trustedDevice.UserAgent = userAgent
 			if req.RememberDevice {
 				trustedDevice.ExpiresAt = now.Add(trustedDeviceTTL)
+				trustedDeviceToken = req.DeviceToken
 				if req.DeviceName != "" {
 					trustedDevice.DeviceName = req.DeviceName
 				}
@@ -833,12 +835,13 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 	}
 
 	return &AuthResponse{
-		User:               s.buildUserInfo(user, profile),
-		AccessToken:        accessToken,
-		RefreshToken:       refreshToken,
-		ExpiresIn:          int64(s.config.AccessTokenExpire.Seconds()),
-		TokenType:          "Bearer",
-		TrustedDeviceToken: trustedDeviceToken,
+		User:                   s.buildUserInfo(user, profile),
+		AccessToken:            accessToken,
+		RefreshToken:           refreshToken,
+		ExpiresIn:              int64(s.config.AccessTokenExpire.Seconds()),
+		TokenType:              "Bearer",
+		TrustedDeviceToken:     trustedDeviceToken,
+		TrustedDeviceExpiresAt: now.Add(trustedDeviceTTL),
 	}, nil
 }
 
