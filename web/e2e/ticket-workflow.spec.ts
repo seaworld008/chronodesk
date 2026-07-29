@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Locator } from '@playwright/test';
 import {
     authenticatePage,
     cleanupE2EData,
@@ -28,6 +28,19 @@ test.describe('Ticket Workflow', () => {
         roleAccounts = await ensureRoleAccounts(request);
     });
 
+    test.afterEach(async ({ request }) => {
+        // Playwright retries serial groups in a fresh worker. Clean any ticket
+        // tracked before a failed assertion so a retry never inherits a
+        // half-completed lifecycle from the previous worker.
+        await cleanupE2EData(request, {
+            automationRules: false,
+            tickets: true,
+            notifications: false,
+            users: false,
+            emailConfig: false,
+        });
+    });
+
     test.afterAll(async ({ request }) => {
         if (customerNotificationId) {
             await deleteNotification(request, customerNotificationId);
@@ -43,20 +56,65 @@ test.describe('Ticket Workflow', () => {
     test('should create assign resolve close and delete ticket', async ({ page }) => {
         const title = `${E2E_MARKER}生命周期工单`;
         const description = `${E2E_MARKER}工单描述-用于E2E验证完整流程`;
+        const ticketListMain = () => page.getByRole('main');
+        const ticketRow = () =>
+            ticketListMain()
+                .getByRole('row')
+                .filter({ hasText: title });
+        const waitForTicketList = async () => {
+            await expect(page).toHaveURL(/#\/tickets(?:\?.*)?$/, {
+                timeout: 15_000,
+            });
+            const searchInput =
+                ticketListMain().getByPlaceholder('搜索工单');
+            await expect(searchInput).toBeVisible({ timeout: 15_000 });
+            return searchInput;
+        };
         const openTicketFromList = async () => {
             await page.goto('/#/tickets');
-            const searchInput = page.getByPlaceholder('搜索工单');
+            const searchInput = await waitForTicketList();
             await searchInput.fill(title);
             await searchInput.press('Enter');
-            await expect(page.getByText(title)).toBeVisible({ timeout: 10000 });
+            await expect(ticketRow()).toBeVisible({ timeout: 10_000 });
         };
         const openTicketDetailFromList = async () => {
             await openTicketFromList();
-            await page.getByText(title).click();
+            await ticketRow()
+                .getByRole('link', { name: '查看', exact: true })
+                .click();
             await expect(page).toHaveURL(/#\/tickets\/\d+\/show/);
         };
+        const openTicketEditFromDetail = async () => {
+            await page
+                .getByRole('main')
+                .getByRole('link', { name: '编辑', exact: true })
+                .click();
+            await expect(page).toHaveURL(/#\/tickets\/\d+$/, {
+                timeout: 15_000,
+            });
+            const editForm = page.getByRole('main').locator('form');
+            await expect(editForm).toBeVisible({ timeout: 15_000 });
+            return editForm;
+        };
+        const updateTicketStatus = async (
+            editForm: Locator,
+            statusLabel: '已解决' | '已关闭',
+        ) => {
+            const statusInput = editForm.getByRole('combobox', {
+                name: '状态',
+                exact: true,
+            });
+            await expect(statusInput).toBeVisible({ timeout: 15_000 });
+            await statusInput.click();
+            await page
+                .getByRole('option', { name: statusLabel, exact: true })
+                .click();
+            await editForm
+                .getByRole('button', { name: '保存更改', exact: true })
+                .click();
+        };
         const expectStatusInList = async (statusLabel: string) => {
-            const row = page.getByRole('row', { name: new RegExp(title) });
+            const row = ticketRow();
             await expect(row).toBeVisible({ timeout: 10000 });
             await expect(row.getByText(statusLabel)).toBeVisible({ timeout: 10000 });
         };
@@ -94,20 +152,14 @@ test.describe('Ticket Workflow', () => {
         trackE2EResource('tickets', createdTicket.id as number);
         await page.waitForURL(/#\/tickets\/\d+\/show/, { timeout: 15000 });
 
-        await page.getByRole('link', { name: '编辑' }).click();
-        await expect(page).toHaveURL(/#\/tickets\/\d+$/);
-
-        await page.getByLabel('状态').click();
-        await page.getByRole('option', { name: '已解决' }).click();
-        await page.getByRole('button', { name: '保存更改' }).click();
+        const firstEditForm = await openTicketEditFromDetail();
+        await updateTicketStatus(firstEditForm, '已解决');
         await openTicketFromList();
         await expectStatusInList('已解决');
 
         await openTicketDetailFromList();
-        await page.getByRole('link', { name: '编辑' }).click();
-        await page.getByLabel('状态').click();
-        await page.getByRole('option', { name: '已关闭' }).click();
-        await page.getByRole('button', { name: '保存更改' }).click();
+        const secondEditForm = await openTicketEditFromDetail();
+        await updateTicketStatus(secondEditForm, '已关闭');
         await openTicketFromList();
         await expectStatusInList('已关闭');
 
@@ -133,8 +185,7 @@ test.describe('Ticket Workflow', () => {
         ).toBe(200);
         untrackE2EResource('tickets', createdTicket.id as number);
 
-        await expect(page).toHaveURL(/#\/tickets(?:\?.*)?$/, { timeout: 15000 });
-        await expect(page.getByPlaceholder('搜索工单')).toBeVisible();
+        await waitForTicketList();
     });
 
     test('should not load user-management filters for customer notifications', async ({ page, request }) => {
