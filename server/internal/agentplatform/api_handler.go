@@ -16,6 +16,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
 	"github.com/seaworld008/chronodesk/server/internal/mcp"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/observability"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"github.com/gin-gonic/gin"
@@ -1405,7 +1406,10 @@ func writeNativeProblem(c *gin.Context, err error) {
 	default:
 		if code == "internal_error" {
 			status, retryable = http.StatusInternalServerError, true
-			log.Printf("Agent-native request %s failed: %v", RequestID(c), err)
+			log.Printf(
+				"Agent-native request failed: request_id=%s code=internal_error",
+				observability.SafeLogValue(RequestID(c)),
+			)
 			detail = "Internal server error"
 		}
 	}

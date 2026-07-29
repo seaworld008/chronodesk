@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"log"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 	websocketPkg "github.com/seaworld008/chronodesk/server/internal/websocket"
 )
@@ -337,12 +339,13 @@ func parseBoolValue(value interface{}) (bool, bool) {
 func parseUintValue(value interface{}) (uint, bool) {
 	switch v := value.(type) {
 	case float64:
-		if v < 0 {
+		if v < 0 || math.Trunc(v) != v || v >= math.Ldexp(1, strconv.IntSize) {
 			return 0, false
 		}
 		return uint(v), true
 	case float32:
-		if v < 0 {
+		asFloat64 := float64(v)
+		if v < 0 || math.Trunc(asFloat64) != asFloat64 || asFloat64 >= math.Ldexp(1, strconv.IntSize) {
 			return 0, false
 		}
 		return uint(v), true
@@ -355,19 +358,23 @@ func parseUintValue(value interface{}) (uint, bool) {
 		if v < 0 {
 			return 0, false
 		}
-		return uint(v), true
+		parsed, err := safeconv.Uint(uint64(v))
+		return parsed, err == nil
 	case uint:
 		return v, true
+	case uint64:
+		parsed, err := safeconv.Uint(v)
+		return parsed, err == nil
 	case string:
 		trimmed := strings.TrimSpace(v)
 		if trimmed == "" {
 			return 0, false
 		}
-		parsed, err := strconv.ParseUint(trimmed, 10, 64)
+		parsed, err := safeconv.ParseUint(trimmed)
 		if err != nil {
 			return 0, false
 		}
-		return uint(parsed), true
+		return parsed, true
 	default:
 		return 0, false
 	}

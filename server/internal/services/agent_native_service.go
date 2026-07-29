@@ -25,6 +25,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
@@ -202,14 +203,14 @@ func parseAttachmentCleanupDestination(destinationID string) (uint, string, erro
 	if len(parts) != 3 || parts[0]+":" != attachmentCleanupPrefix {
 		return 0, "", ErrInvalidAttachmentCleanup
 	}
-	attachmentID, err := strconv.ParseUint(parts[1], 10, 64)
-	if err != nil || attachmentID == 0 || len(parts[2]) != sha256.Size*2 {
+	attachmentID, err := safeconv.ParsePositiveUint(parts[1])
+	if err != nil || len(parts[2]) != sha256.Size*2 {
 		return 0, "", ErrInvalidAttachmentCleanup
 	}
 	if _, err := hex.DecodeString(parts[2]); err != nil {
 		return 0, "", ErrInvalidAttachmentCleanup
 	}
-	return uint(attachmentID), parts[2], nil
+	return attachmentID, parts[2], nil
 }
 
 type AgentNativeOptions struct {
@@ -4005,11 +4006,11 @@ func (s *AgentNativeService) compatibilityUserIDTx(
 	}
 	switch actor.Type {
 	case models.ActorTypeHuman:
-		parsed, err := strconv.ParseUint(actor.ID, 10, 64)
-		if err != nil || parsed == 0 {
+		parsed, err := safeconv.ParsePositiveUint(actor.ID)
+		if err != nil {
 			return 0, fmt.Errorf("%w: human actor id must be a user id", ErrInvalidActor)
 		}
-		return uint(parsed), nil
+		return parsed, nil
 	case models.ActorTypeServicePrincipal:
 		var principal models.ServicePrincipal
 		if err := tx.Select("id", "compatibility_user_id").First(&principal, "id = ?", actor.ID).Error; err != nil {

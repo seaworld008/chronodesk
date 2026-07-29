@@ -8,10 +8,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 )
 
 const redisHTTPRateLimitKeyPrefix = "chronodesk:http-rate:v1"
@@ -137,14 +140,19 @@ func (limiter *RedisSlidingWindow) AllowN(key string, n int) bool {
 		return false
 	}
 	values, err := redisRateLimitIntegers(result, 3)
-	if err != nil {
+	if err != nil ||
+		(values[0] != 0 && values[0] != 1) ||
+		values[1] < 0 ||
+		values[1] > limiter.limit ||
+		values[2] < 0 ||
+		int64(values[2]) > limiter.window.Milliseconds() {
 		limiter.recordFailure(opaqueKey)
 		return false
 	}
 	now := time.Now()
 	limiter.mu.Lock()
 	limiter.snapshots[opaqueKey] = redisRateLimitSnapshot{
-		remaining: int(values[1]),
+		remaining: values[1],
 		reset:     now.Add(time.Duration(values[2]) * time.Millisecond),
 		touchedAt: now,
 	}
@@ -212,7 +220,7 @@ func randomRateLimitToken() (string, error) {
 	return hex.EncodeToString(value[:]), nil
 }
 
-func redisRateLimitIntegers(value interface{}, count int) ([]int64, error) {
+func redisRateLimitIntegers(value interface{}, count int) ([]int, error) {
 	var raw []interface{}
 	switch typed := value.(type) {
 	case []interface{}:
@@ -228,7 +236,7 @@ func redisRateLimitIntegers(value interface{}, count int) ([]int64, error) {
 	if len(raw) != count {
 		return nil, fmt.Errorf("unexpected Redis rate-limit response length %d", len(raw))
 	}
-	result := make([]int64, len(raw))
+	result := make([]int, len(raw))
 	for index, item := range raw {
 		value, err := rateLimitInteger(item)
 		if err != nil {
@@ -239,21 +247,33 @@ func redisRateLimitIntegers(value interface{}, count int) ([]int64, error) {
 	return result, nil
 }
 
-func rateLimitInteger(value interface{}) (int64, error) {
+func rateLimitInteger(value interface{}) (int, error) {
 	switch typed := value.(type) {
 	case int:
-		return int64(typed), nil
-	case int64:
 		return typed, nil
+	case int64:
+		return safeconv.Int(typed)
 	case uint:
-		return int64(typed), nil
+		if typed <= uint(math.MaxInt) {
+			return int(typed), nil
+		}
+		return 0, errors.New("Redis rate-limit response exceeds the native int range")
 	case float64:
-		if typed != float64(int64(typed)) {
+		if typed < float64(math.MinInt) ||
+			typed >= math.Ldexp(1, strconv.IntSize-1) ||
+			math.Trunc(typed) != typed {
 			return 0, errors.New("Redis rate-limit response is not an integer")
 		}
-		return int64(typed), nil
+		return int(typed), nil
 	case string:
-		return strconv.ParseInt(typed, 10, 64)
+		parsed, err := strconv.ParseInt(typed, 10, strconv.IntSize)
+		if err != nil {
+			return 0, err
+		}
+		if parsed < int64(math.MinInt) || parsed > int64(math.MaxInt) {
+			return 0, errors.New("Redis rate-limit response exceeds the native int range")
+		}
+		return int(parsed), nil
 	default:
 		return 0, fmt.Errorf("unexpected Redis rate-limit integer %T", value)
 	}

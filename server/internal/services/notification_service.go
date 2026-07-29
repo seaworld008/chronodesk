@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -1007,17 +1008,31 @@ func (ns *NotificationService) GetNotifications(ctx context.Context, filter *mod
 		return nil, 0, fmt.Errorf("统计通知数量失败: %w", err)
 	}
 
-	// 排序
-	orderBy := "created_at"
-	orderDir := "desc"
+	// 排序列由固定映射构造，绝不把请求字符串作为 SQL 片段传给 GORM。
+	order := clause.OrderByColumn{
+		Column: clause.Column{Name: "created_at"},
+		Desc:   true,
+	}
 	switch filter.OrderBy {
-	case "id", "created_at", "updated_at", "priority", "type", "channel", "is_read":
-		orderBy = filter.OrderBy
+	case "id":
+		order.Column.Name = "id"
+	case "updated_at":
+		order.Column.Name = "updated_at"
+	case "priority":
+		order.Column.Name = "priority"
+	case "type":
+		order.Column.Name = "type"
+	case "channel":
+		order.Column.Name = "channel"
+	case "is_read":
+		order.Column.Name = "is_read"
+	case "created_at":
+		order.Column.Name = "created_at"
 	}
 	if strings.EqualFold(filter.OrderDir, "asc") {
-		orderDir = "asc"
+		order.Desc = false
 	}
-	dataQuery = dataQuery.Order(fmt.Sprintf("%s %s", orderBy, orderDir))
+	dataQuery = dataQuery.Clauses(clause.OrderBy{Columns: []clause.OrderByColumn{order}})
 
 	// 分页
 	if filter.Limit > 0 {
@@ -1154,11 +1169,10 @@ func (ns *NotificationService) DeliverTicketNotificationOutbox(
 			event.ActorType,
 		)
 	}
-	senderValue, err := strconv.ParseUint(event.ActorID, 10, 64)
-	if err != nil || senderValue == 0 {
+	senderID, err := safeconv.ParsePositiveUint(event.ActorID)
+	if err != nil {
 		return nil, false, errors.New("notification CloudEvent has an invalid human actor")
 	}
-	senderID := uint(senderValue)
 
 	notificationType, recipientID, err := parseTicketNotificationDestination(destinationID)
 	if err != nil {
@@ -1322,11 +1336,11 @@ func parseTicketNotificationDestination(
 			destinationID,
 		)
 	}
-	value, err := strconv.ParseUint(rawRecipient, 10, 64)
-	if err != nil || value == 0 {
+	value, err := safeconv.ParsePositiveUint(rawRecipient)
+	if err != nil {
 		return "", 0, errors.New("invalid notification recipient")
 	}
-	return notificationType, uint(value), nil
+	return notificationType, value, nil
 }
 
 func truncateNotificationTitle(value string, maxRunes int) string {

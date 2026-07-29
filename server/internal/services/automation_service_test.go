@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
@@ -154,7 +155,18 @@ func TestAutomationAssignmentUsesTicketAssigneeColumn(t *testing.T) {
 
 func TestAutomationToUintRejectsUnsafeValues(t *testing.T) {
 	svc := &AutomationService{}
-	invalid := []interface{}{-1, int64(-1), float64(-1), float64(1.5), uint(0)}
+	invalid := []interface{}{
+		-1,
+		int64(-1),
+		float64(-1),
+		float64(1.5),
+		math.NaN(),
+		math.Inf(1),
+		math.Ldexp(1, 64),
+		uint(0),
+		uint64(0),
+		"18446744073709551616",
+	}
 
 	for _, value := range invalid {
 		if _, err := svc.toUint(value); err == nil {

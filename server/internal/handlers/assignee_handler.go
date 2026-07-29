@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -109,14 +110,14 @@ func (h *AssigneeHandler) Get(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"code": 1, "msg": "未找到可分配的处理人"})
 		return
 	}
-	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
-	if err != nil || id == 0 {
+	id, err := safeconv.ParsePositiveUint(c.Param("id"))
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 1, "msg": "处理人 ID 无效"})
 		return
 	}
 
 	var user models.User
-	if err := h.assignableQuery(c).First(&user, uint(id)).Error; err != nil {
+	if err := h.assignableQuery(c).First(&user, id).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, gin.H{"code": 1, "msg": "未找到可分配的处理人"})
 			return

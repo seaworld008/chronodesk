@@ -126,6 +126,27 @@ func TestHTTPRedisClientEvalUsesNativeRedisArgumentOrder(t *testing.T) {
 	}
 }
 
+func TestHTTPRedisClientRejectsOversizedCommandsBeforeSending(t *testing.T) {
+	requests := 0
+	client := newHTTPRedisTestClient(t, func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		http.Error(writer, "request must not be sent", http.StatusInternalServerError)
+	})
+
+	tooMany := make([]interface{}, maxHTTPRedisCommandArguments)
+	if _, err := client.executeCommand(context.Background(), "SET", tooMany...); err == nil {
+		t.Fatal("executeCommand() accepted an oversized argument list")
+	}
+
+	keys := make([]string, maxHTTPRedisCommandArguments-1)
+	if _, err := client.Eval(context.Background(), "return 1", keys); err == nil {
+		t.Fatal("Eval() accepted an oversized key list")
+	}
+	if requests != 0 {
+		t.Fatalf("oversized commands sent %d HTTP request(s), want 0", requests)
+	}
+}
+
 func TestHTTPRedisClientReturnsUpstreamFailure(t *testing.T) {
 	const sensitiveBody = "upstream-internal-diagnostic"
 	client := newHTTPRedisTestClient(t, func(writer http.ResponseWriter, request *http.Request) {

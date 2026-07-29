@@ -13,6 +13,12 @@ const jsonSchema202012 = "https://json-schema.org/draft/2020-12/schema"
 
 type schema map[string]any
 
+var supportedSchemaPatterns = map[string]*regexp.Regexp{
+	`^[A-Za-z0-9._:-]+$`:     regexp.MustCompile(`^[A-Za-z0-9._:-]+$`),
+	`^[A-Za-z0-9+/]*={0,2}$`: regexp.MustCompile(`^[A-Za-z0-9+/]*={0,2}$`),
+	`^[a-f0-9]{64}$`:         regexp.MustCompile(`^[a-f0-9]{64}$`),
+}
+
 func objectSchema(properties map[string]any, required ...string) schema {
 	result := schema{
 		"$schema":              jsonSchema202012,
@@ -144,8 +150,8 @@ func validateSchema(value any, definition schema, path string) error {
 			return fmt.Errorf("%s is too long", path)
 		}
 		if pattern, ok := definition["pattern"].(string); ok {
-			expression, err := regexp.Compile(pattern)
-			if err != nil {
+			expression, supported := supportedSchemaPatterns[pattern]
+			if !supported {
 				return fmt.Errorf("invalid server schema at %s", path)
 			}
 			if !expression.MatchString(typed) {

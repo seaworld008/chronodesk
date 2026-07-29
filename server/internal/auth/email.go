@@ -3,9 +3,13 @@ package auth
 import (
 	"context"
 	"fmt"
+	"html"
 	"net/smtp"
+	"net/url"
 	"strings"
 	"time"
+
+	"github.com/seaworld008/chronodesk/server/internal/mailer"
 )
 
 // SMTPEmailService SMTP邮件服务实现
@@ -43,6 +47,7 @@ func NewSMTPEmailService(config *EmailConfig) *SMTPEmailService {
 // SendVerificationEmail 发送邮箱验证邮件
 func (s *SMTPEmailService) SendVerificationEmail(ctx context.Context, email, token string) error {
 	subject := "Verify Your Email Address"
+	safeToken := url.QueryEscape(token)
 	body := fmt.Sprintf(`
 <!DOCTYPE html>
 <html>
@@ -78,7 +83,7 @@ func (s *SMTPEmailService) SendVerificationEmail(ctx context.Context, email, tok
     </div>
 </body>
 </html>
-	`, token, token)
+	`, safeToken, safeToken)
 
 	return s.sendEmail(email, subject, body)
 }
@@ -86,6 +91,7 @@ func (s *SMTPEmailService) SendVerificationEmail(ctx context.Context, email, tok
 // SendPasswordResetEmail 发送密码重置邮件
 func (s *SMTPEmailService) SendPasswordResetEmail(ctx context.Context, email, token string) error {
 	subject := "Reset Your Password"
+	safeToken := url.QueryEscape(token)
 	body := fmt.Sprintf(`
 <!DOCTYPE html>
 <html>
@@ -128,7 +134,7 @@ func (s *SMTPEmailService) SendPasswordResetEmail(ctx context.Context, email, to
     </div>
 </body>
 </html>
-	`, token, token)
+	`, safeToken, safeToken)
 
 	return s.sendEmail(email, subject, body)
 }
@@ -136,6 +142,7 @@ func (s *SMTPEmailService) SendPasswordResetEmail(ctx context.Context, email, to
 // SendWelcomeEmail 发送欢迎邮件
 func (s *SMTPEmailService) SendWelcomeEmail(ctx context.Context, email, username string) error {
 	subject := "Welcome to Ticketing System!"
+	safeUsername := html.EscapeString(username)
 	body := fmt.Sprintf(`
 <!DOCTYPE html>
 <html>
@@ -185,7 +192,7 @@ func (s *SMTPEmailService) SendWelcomeEmail(ctx context.Context, email, username
     </div>
 </body>
 </html>
-	`, username)
+	`, safeUsername)
 
 	return s.sendEmail(email, subject, body)
 }
@@ -193,6 +200,7 @@ func (s *SMTPEmailService) SendWelcomeEmail(ctx context.Context, email, username
 // SendOTPEmail 发送OTP验证码邮件
 func (s *SMTPEmailService) SendOTPEmail(ctx context.Context, email, code string) error {
 	subject := "Your Verification Code"
+	safeCode := html.EscapeString(code)
 	body := fmt.Sprintf(`
 <!DOCTYPE html>
 <html>
@@ -237,32 +245,29 @@ func (s *SMTPEmailService) SendOTPEmail(ctx context.Context, email, code string)
     </div>
 </body>
 </html>
-	`, code)
+	`, safeCode)
 
 	return s.sendEmail(email, subject, body)
 }
 
 // sendEmail 发送邮件的通用方法
 func (s *SMTPEmailService) sendEmail(to, subject, body string) error {
-	// 构建邮件头
-	headers := make(map[string]string)
-	headers["From"] = s.from
-	headers["To"] = to
-	headers["Subject"] = subject
-	headers["MIME-Version"] = "1.0"
-	headers["Content-Type"] = "text/html; charset=UTF-8"
-	headers["Date"] = time.Now().Format(time.RFC1123Z)
-
-	// 构建邮件消息
-	message := ""
-	for k, v := range headers {
-		message += fmt.Sprintf("%s: %s\r\n", k, v)
+	recipient, err := mailer.CanonicalMailbox(to)
+	if err != nil {
+		return fmt.Errorf("invalid recipient email: %w", err)
 	}
-	message += "\r\n" + body
+	sender, err := mailer.CanonicalMailbox(s.from)
+	if err != nil {
+		return fmt.Errorf("invalid sender email: %w", err)
+	}
+	message, err := mailer.BuildHTMLMessage(sender, "ChronoDesk", subject, body)
+	if err != nil {
+		return fmt.Errorf("failed to build email: %w", err)
+	}
 
 	// 发送邮件
 	addr := fmt.Sprintf("%s:%s", s.host, s.port)
-	err := smtp.SendMail(addr, s.auth, s.from, []string{to}, []byte(message))
+	err = smtp.SendMail(addr, s.auth, sender, []string{recipient}, message)
 	if err != nil {
 		return fmt.Errorf("failed to send email: %w", err)
 	}
@@ -363,23 +368,6 @@ func ValidateEmailTemplate(template string) error {
 		return fmt.Errorf("email template must contain placeholder")
 	}
 	return nil
-}
-
-// SanitizeEmailContent 清理邮件内容
-func SanitizeEmailContent(content string) string {
-	// 移除潜在的恶意脚本
-	content = strings.ReplaceAll(content, "<script", "&lt;script")
-	content = strings.ReplaceAll(content, "</script>", "&lt;/script&gt;")
-	content = strings.ReplaceAll(content, "javascript:", "")
-	return content
-}
-
-// FormatEmailAddress 格式化邮件地址
-func FormatEmailAddress(name, email string) string {
-	if name == "" {
-		return email
-	}
-	return fmt.Sprintf("%s <%s>", name, email)
 }
 
 // IsValidEmailFormat 验证邮件格式

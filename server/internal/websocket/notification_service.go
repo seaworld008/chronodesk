@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/observability"
 )
 
 // NotificationWebSocketService handles real-time notification pushing
@@ -24,7 +25,10 @@ func NewNotificationWebSocketService(hub *Hub) *NotificationWebSocketService {
 func (s *NotificationWebSocketService) PushNotification(ctx context.Context, notification *models.Notification) error {
 	// Check if user is online
 	if !s.hub.IsUserOnline(notification.RecipientID) {
-		log.Printf("User %d is offline, notification will be delivered when they connect", notification.RecipientID)
+		log.Printf(
+			"Notification recipient is offline: user_id=%s delivery=deferred",
+			safeLogUint(notification.RecipientID),
+		)
 		return nil
 	}
 
@@ -45,7 +49,11 @@ func (s *NotificationWebSocketService) PushNotification(ctx context.Context, not
 		"related_ticket": notificationData.RelatedTicket,
 	})
 
-	log.Printf("Pushed notification %d to user %d via WebSocket", notification.ID, notification.RecipientID)
+	log.Printf(
+		"Pushed WebSocket notification: notification_id=%s user_id=%s",
+		safeLogUint(notification.ID),
+		safeLogUint(notification.RecipientID),
+	)
 	return nil
 }
 
@@ -58,7 +66,7 @@ func (s *NotificationWebSocketService) PushSystemNotification(ctx context.Contex
 		"priority":  "normal",
 	})
 
-	log.Printf("Pushed system notification to all users: %s", title)
+	log.Print("Pushed system notification to all connected users")
 	return nil
 }
 
@@ -73,7 +81,11 @@ func (s *NotificationWebSocketService) PushUnreadCount(ctx context.Context, user
 		"timestamp": time.Now().Unix(),
 	})
 
-	log.Printf("Pushed unread count %d to user %d", count, userID)
+	log.Printf(
+		"Pushed unread count: count=%s user_id=%s",
+		safeLogInt64(count),
+		safeLogUint(userID),
+	)
 	return nil
 }
 
@@ -109,7 +121,11 @@ func (s *NotificationWebSocketService) PushTicketUpdate(ctx context.Context, tic
 		}
 	}
 
-	log.Printf("Pushed ticket update for ticket %d to %d users", ticket.ID, len(usersToNotify))
+	log.Printf(
+		"Pushed ticket update: ticket_id=%s recipient_count=%s",
+		safeLogUint(ticket.ID),
+		safeLogInt64(int64(len(usersToNotify))),
+	)
 	return nil
 }
 
@@ -141,7 +157,11 @@ func (s *NotificationWebSocketService) PushUserStatusUpdate(ctx context.Context,
 	// In a real implementation, you might want to only notify admins or relevant users
 	s.hub.BroadcastToAll("user_status", statusData)
 
-	log.Printf("Pushed user status update: user %d is %s", userID, status)
+	log.Printf(
+		"Pushed user status update: user_id=%s status=%s",
+		safeLogUint(userID),
+		observability.SafeLogValue(status),
+	)
 	return nil
 }
 
@@ -162,6 +182,6 @@ func (s *NotificationWebSocketService) SendWelcomeMessage(ctx context.Context, u
 		},
 	})
 
-	log.Printf("Sent welcome message to user %d", userID)
+	log.Printf("Sent welcome message: user_id=%s", safeLogUint(userID))
 	return nil
 }

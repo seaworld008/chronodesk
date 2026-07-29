@@ -90,6 +90,39 @@ func TestConfigAuditLogStoresDigestNotPlaintextValue(t *testing.T) {
 	}
 }
 
+func TestConfigAuditLogCannotForgeAdditionalEntries(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatalf("migrate system configs: %v", err)
+	}
+
+	var output bytes.Buffer
+	service := NewConfigService(db)
+	service.auditLogger = log.New(&output, "", 0)
+
+	service.logConfigChange(
+		"system.test\r\n[ERROR] forged-key\u202e",
+		"credential-value-must-not-appear",
+		"UPDATE\r\n[ERROR] forged-operation",
+	)
+
+	logged := output.String()
+	if strings.Count(logged, "\n") != 1 || strings.Contains(logged, "\r") {
+		t.Fatalf("configuration audit log contains forged line boundaries: %q", logged)
+	}
+	if strings.Contains(logged, "\u202e") {
+		t.Fatalf("configuration audit log contains display-control character: %q", logged)
+	}
+	for _, forbidden := range []string{
+		"credential-value-must-not-appear",
+		"\n[ERROR]",
+	} {
+		if strings.Contains(logged, forbidden) {
+			t.Fatalf("configuration audit log contains unsafe value %q: %q", forbidden, logged)
+		}
+	}
+}
+
 func TestBatchConfigAuditLogsOnlyCommittedChanges(t *testing.T) {
 	db := openTestDB(t)
 	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {

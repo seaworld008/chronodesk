@@ -1,9 +1,11 @@
 package agentplatform
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,6 +22,47 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+func TestWriteNativeProblemLogsOnlySafeCorrelationMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var output bytes.Buffer
+	originalWriter := log.Writer()
+	originalFlags := log.Flags()
+	originalPrefix := log.Prefix()
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(originalWriter)
+		log.SetFlags(originalFlags)
+		log.SetPrefix(originalPrefix)
+	})
+
+	context, _ := gin.CreateTestContext(httptest.NewRecorder())
+	context.Set("request_id", "req-1\r\n[ERROR] forged\u202e")
+	writeNativeProblem(
+		context,
+		fmt.Errorf("database failure contained token=%s password=%s", "secret-token", "secret-password"),
+	)
+
+	logged := output.String()
+	for _, forbidden := range []string{
+		"secret-token",
+		"secret-password",
+		"\r",
+		"\n[ERROR]",
+		"\u202e",
+	} {
+		if strings.Contains(logged, forbidden) {
+			t.Fatalf("agent-native error log contains unsafe value %q: %q", forbidden, logged)
+		}
+	}
+	if !strings.Contains(logged, "request_id=req-1[ERROR] forged") ||
+		!strings.Contains(logged, "code=internal_error") {
+		t.Fatalf("agent-native error log lost safe correlation metadata: %q", logged)
+	}
+}
 
 func TestListTicketsFiltersEachResourcePolicy(t *testing.T) {
 	gin.SetMode(gin.TestMode)

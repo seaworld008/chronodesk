@@ -81,3 +81,26 @@ func TestUpdateEmailConfigCanSkipSMTPTest(t *testing.T) {
 		t.Fatal("restarted service could not decrypt SMTP password")
 	}
 }
+
+func TestUpdateEmailConfigRejectsInjectedHeaderValues(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.EmailConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	protector, err := security.NewKeyring("test-email-headers", map[string][]byte{
+		"test-email-headers": bytes.Repeat([]byte{0x46}, 32),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewEmailConfigServiceWithProtector(db, protector)
+
+	injected := "合法中文\r\nBcc: victim@example.com"
+	if _, err := service.UpdateEmailConfig(
+		context.Background(),
+		&models.EmailConfigUpdateRequest{FromName: &injected},
+		1,
+	); err == nil {
+		t.Fatal("expected CRLF header injection to be rejected")
+	}
+}

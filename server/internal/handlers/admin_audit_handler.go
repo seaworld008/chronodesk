@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
@@ -62,8 +63,7 @@ func (h *AdminAuditHandler) GetAuditLogs(c *gin.Context) {
 	}
 
 	if query.UserID != "" {
-		if id, err := strconv.ParseUint(query.UserID, 10, 64); err == nil {
-			uid := uint(id)
+		if uid, err := safeconv.ParsePositiveUint(query.UserID); err == nil {
 			filter.UserID = &uid
 		}
 	}

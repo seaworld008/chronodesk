@@ -3,6 +3,8 @@ package websocket
 import (
 	"context"
 	"encoding/json"
+	"math"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -101,5 +103,34 @@ func TestClientHandleMarkRead_InvokesReadHandlerAndPushesUnreadCount(t *testing.
 		}
 	case <-time.After(200 * time.Millisecond):
 		t.Fatalf("expected unread_count message to be pushed")
+	}
+}
+
+func TestClientHandleMarkReadRejectsInvalidNumericIDs(t *testing.T) {
+	client := &Client{UserID: 303}
+	t.Cleanup(func() {
+		SetNotificationReadHandler(nil)
+	})
+
+	calls := 0
+	SetNotificationReadHandler(func(context.Context, uint, uint) (int64, error) {
+		calls++
+		return 0, nil
+	})
+
+	values := []float64{
+		0,
+		-1,
+		42.5,
+		math.NaN(),
+		math.Inf(1),
+		maxExactJSONInteger + 1,
+		math.Ldexp(1, strconv.IntSize),
+	}
+	for _, value := range values {
+		client.handleMarkRead(map[string]interface{}{"notification_id": value})
+	}
+	if calls != 0 {
+		t.Fatalf("invalid notification IDs invoked the persistence hook %d time(s)", calls)
 	}
 }

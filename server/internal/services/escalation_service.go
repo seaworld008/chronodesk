@@ -532,7 +532,10 @@ func (s *EscalationService) executeSLAUpdate(
 		}
 		return "", false, nil
 	}
-	data := make(map[string]any, len(eventData)+3)
+	// eventData may originate from a protocol payload. Avoid deriving an
+	// allocation capacity from it; map growth remains bounded by the entries
+	// that are actually copied below.
+	data := make(map[string]any)
 	for key, value := range eventData {
 		data[key] = value
 	}

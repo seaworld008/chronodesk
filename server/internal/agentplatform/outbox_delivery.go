@@ -18,6 +18,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/a2a"
 	"github.com/seaworld008/chronodesk/server/internal/mcp"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 	websocketPkg "github.com/seaworld008/chronodesk/server/internal/websocket"
@@ -368,11 +369,11 @@ func parseWebhookConfigDestinationID(destinationID string) (uint, error) {
 	if !strings.HasPrefix(destinationID, webhookConfigPrefix) {
 		return 0, fmt.Errorf("unsupported webhook Outbox destination %q", destinationID)
 	}
-	value, err := strconv.ParseUint(strings.TrimPrefix(destinationID, webhookConfigPrefix), 10, 64)
-	if err != nil || value == 0 {
+	value, err := safeconv.ParsePositiveUint(strings.TrimPrefix(destinationID, webhookConfigPrefix))
+	if err != nil {
 		return 0, fmt.Errorf("invalid webhook Outbox destination %q", destinationID)
 	}
-	return uint(value), nil
+	return value, nil
 }
 
 func stableWebhookDeliveryID(eventID string, configID uint) string {
@@ -569,9 +570,9 @@ func ticketIDFromCloudEvent(event services.CloudEventEnvelope) uint {
 	}
 	const prefix = "ticket/"
 	if strings.HasPrefix(event.Subject, prefix) {
-		value, err := strconv.ParseUint(strings.TrimPrefix(event.Subject, prefix), 10, 64)
+		value, err := safeconv.ParsePositiveUint(strings.TrimPrefix(event.Subject, prefix))
 		if err == nil {
-			return uint(value)
+			return value
 		}
 	}
 	return 0

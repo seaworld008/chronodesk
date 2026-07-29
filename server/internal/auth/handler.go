@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/seaworld008/chronodesk/server/internal/observability"
 )
 
 // AuthHandler 认证处理器
@@ -58,6 +60,57 @@ func (l *SimpleLogger) Warn(msg string, fields ...interface{}) {
 
 func (l *SimpleLogger) Debug(msg string, fields ...interface{}) {
 	fmt.Printf("[DEBUG] %s %v\n", msg, fields)
+}
+
+func authLogRequestID(c HTTPContext) string {
+	if c == nil {
+		return "request-unavailable"
+	}
+	if value, exists := c.Get("request_id"); exists {
+		if requestID, ok := value.(string); ok && requestID != "" {
+			return observability.SafeLogValue(requestID)
+		}
+	}
+	if requestID := c.GetHeader("X-Request-ID"); requestID != "" {
+		return observability.SafeLogValue(requestID)
+	}
+	return "request-unavailable"
+}
+
+func authLogUserID(userID uint) string {
+	return observability.SafeLogValue(strconv.FormatUint(uint64(userID), 10))
+}
+
+// authLogReason intentionally returns only a bounded, predefined category.
+// Authentication service errors may include password-policy input, OTP/token
+// state, or database values and must never be written verbatim.
+func authLogReason(err error) string {
+	switch {
+	case err == nil:
+		return "none"
+	case errors.Is(err, ErrInvalidCredentials):
+		return "invalid_credentials"
+	case errors.Is(err, ErrUserNotFound):
+		return "user_not_found"
+	case errors.Is(err, ErrUserExists):
+		return "user_exists"
+	case errors.Is(err, ErrInvalidToken):
+		return "invalid_token"
+	case errors.Is(err, ErrTokenExpired):
+		return "token_expired"
+	case errors.Is(err, ErrInvalidOTP):
+		return "invalid_otp"
+	case errors.Is(err, ErrOTPExpired):
+		return "otp_expired"
+	case errors.Is(err, ErrEmailNotVerified):
+		return "email_not_verified"
+	case errors.Is(err, ErrAccountLocked):
+		return "account_locked"
+	case errors.Is(err, ErrPasswordTooWeak):
+		return "password_too_weak"
+	default:
+		return "internal_error"
+	}
 }
 
 // NewAuthHandler 创建认证处理器
@@ -115,7 +168,11 @@ type SuccessResponse struct {
 func (h *AuthHandler) Register(c HTTPContext) {
 	var req RegisterRequest
 	if err := c.Bind(&req); err != nil {
-		h.logger.Error("Failed to bind register request", "error", err)
+		h.logger.Error(
+			"Failed to bind register request",
+			"request_id", authLogRequestID(c),
+			"reason", "invalid_request_body",
+		)
 		c.JSON(http.StatusBadRequest, map[string]interface{}{
 			"code": 1,
 			"msg":  "请求格式无效",
@@ -141,7 +198,11 @@ func (h *AuthHandler) Register(c HTTPContext) {
 	ctx := context.Background()
 	resp, err := h.authService.Register(ctx, &req, ipAddress, userAgent)
 	if err != nil {
-		h.logger.Error("Registration failed", "error", err, "email", req.Email)
+		h.logger.Error(
+			"Registration failed",
+			"request_id", authLogRequestID(c),
+			"reason", authLogReason(err),
+		)
 
 		message := "注册失败"
 		status := http.StatusInternalServerError
@@ -168,7 +229,11 @@ func (h *AuthHandler) Register(c HTTPContext) {
 		return
 	}
 
-	h.logger.Info("User registered successfully", "user_id", resp.User.ID, "email", req.Email)
+	h.logger.Info(
+		"User registered successfully",
+		"request_id", authLogRequestID(c),
+		"user_id", authLogUserID(resp.User.ID),
+	)
 
 	// 返回成功响应
 	c.JSON(http.StatusCreated, map[string]interface{}{
@@ -182,7 +247,11 @@ func (h *AuthHandler) Register(c HTTPContext) {
 func (h *AuthHandler) Login(c HTTPContext) {
 	var req LoginRequest
 	if err := c.Bind(&req); err != nil {
-		h.logger.Error("Failed to bind login request", "error", err)
+		h.logger.Error(
+			"Failed to bind login request",
+			"request_id", authLogRequestID(c),
+			"reason", "invalid_request_body",
+		)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
 			Message: "请求格式无效",
@@ -217,7 +286,11 @@ func (h *AuthHandler) Login(c HTTPContext) {
 			(errors.Is(err, ErrInvalidOTP) || strings.Contains(err.Error(), "OTP")) {
 			h.clearTrustedDeviceCookie(c)
 		}
-		h.logger.Error("Login failed", "error", err, "email", req.Email)
+		h.logger.Error(
+			"Login failed",
+			"request_id", authLogRequestID(c),
+			"reason", authLogReason(err),
+		)
 
 		message := "登录失败"
 		status := http.StatusUnauthorized
@@ -253,7 +326,11 @@ func (h *AuthHandler) Login(c HTTPContext) {
 		return
 	}
 
-	h.logger.Info("User logged in successfully", "user_id", resp.User.ID, "email", req.Email)
+	h.logger.Info(
+		"User logged in successfully",
+		"request_id", authLogRequestID(c),
+		"user_id", authLogUserID(resp.User.ID),
+	)
 
 	// 设置安全头
 	c.SetHeader("X-Auth-Token", resp.AccessToken)
@@ -279,7 +356,11 @@ func (h *AuthHandler) Login(c HTTPContext) {
 func (h *AuthHandler) RefreshToken(c HTTPContext) {
 	var req RefreshTokenRequest
 	if err := c.Bind(&req); err != nil {
-		h.logger.Error("Failed to bind refresh token request", "error", err)
+		h.logger.Error(
+			"Failed to bind refresh token request",
+			"request_id", authLogRequestID(c),
+			"reason", "invalid_request_body",
+		)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
 			Message: "请求格式无效",
@@ -303,7 +384,11 @@ func (h *AuthHandler) RefreshToken(c HTTPContext) {
 	ctx := context.Background()
 	resp, err := h.authService.RefreshToken(ctx, &req, ipAddress, userAgent)
 	if err != nil {
-		h.logger.Error("Token refresh failed", "error", err)
+		h.logger.Error(
+			"Token refresh failed",
+			"request_id", authLogRequestID(c),
+			"reason", authLogReason(err),
+		)
 
 		code := "refresh_failed"
 		message := "刷新登录令牌失败"
@@ -329,7 +414,11 @@ func (h *AuthHandler) RefreshToken(c HTTPContext) {
 		return
 	}
 
-	h.logger.Info("Token refreshed successfully", "user_id", resp.User.ID)
+	h.logger.Info(
+		"Token refreshed successfully",
+		"request_id", authLogRequestID(c),
+		"user_id", authLogUserID(resp.User.ID),
+	)
 
 	// 返回成功响应
 	c.JSON(http.StatusOK, SuccessResponse{
@@ -360,7 +449,11 @@ func (h *AuthHandler) Logout(c HTTPContext) {
 		ctx = request.Context()
 	}
 	if err := h.authService.Logout(ctx, refreshToken); err != nil {
-		h.logger.Error("Logout failed", "error", err)
+		h.logger.Error(
+			"Logout failed",
+			"request_id", authLogRequestID(c),
+			"reason", authLogReason(err),
+		)
 		c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 			Error:   "logout_failed",
 			Message: "退出登录失败，请稍后重试",
@@ -368,7 +461,7 @@ func (h *AuthHandler) Logout(c HTTPContext) {
 		return
 	}
 
-	h.logger.Info("User logged out successfully")
+	h.logger.Info("User logged out successfully", "request_id", authLogRequestID(c))
 
 	// 返回成功响应
 	c.JSON(http.StatusOK, SuccessResponse{
@@ -405,7 +498,12 @@ func (h *AuthHandler) LogoutAll(c HTTPContext) {
 		ctx = request.Context()
 	}
 	if err := h.authService.LogoutAll(ctx, userIDUint); err != nil {
-		h.logger.Error("Logout all failed", "error", err, "user_id", userIDUint)
+		h.logger.Error(
+			"Logout all failed",
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(userIDUint),
+			"reason", authLogReason(err),
+		)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error:   "logout_failed",
 			Message: "无法从所有设备退出登录",
@@ -413,7 +511,11 @@ func (h *AuthHandler) LogoutAll(c HTTPContext) {
 		return
 	}
 
-	h.logger.Info("User logged out from all devices", "user_id", userIDUint)
+	h.logger.Info(
+		"User logged out from all devices",
+		"request_id", authLogRequestID(c),
+		"user_id", authLogUserID(userIDUint),
+	)
 
 	// 返回成功响应
 	c.JSON(http.StatusOK, SuccessResponse{
@@ -489,7 +591,12 @@ func (h *AuthHandler) GetProfile(c HTTPContext) {
 	ctx := context.Background()
 	user, err := h.authService.userRepo.GetByID(ctx, userIDUint)
 	if err != nil {
-		h.logger.Error("Failed to get user", "error", err, "user_id", userIDUint)
+		h.logger.Error(
+			"Failed to get user",
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(userIDUint),
+			"reason", authLogReason(err),
+		)
 		c.JSON(http.StatusNotFound, ErrorResponse{
 			Error:   "user_not_found",
 			Message: "未找到用户",
@@ -519,7 +626,11 @@ func (h *AuthHandler) Health(c HTTPContext) {
 func (h *AuthHandler) ForgotPassword(c HTTPContext) {
 	var req ForgotPasswordRequest
 	if err := c.Bind(&req); err != nil {
-		h.logger.Error("Failed to bind forgot password request", "error", err)
+		h.logger.Error(
+			"Failed to bind forgot password request",
+			"request_id", authLogRequestID(c),
+			"reason", "invalid_request_body",
+		)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
 			Message: "请求格式无效",
@@ -530,7 +641,11 @@ func (h *AuthHandler) ForgotPassword(c HTTPContext) {
 	ctx := context.Background()
 	err := h.authService.ForgotPassword(ctx, req.Email)
 	if err != nil {
-		h.logger.Error("Failed to process forgot password", "error", err, "email", req.Email)
+		h.logger.Error(
+			"Failed to process forgot password",
+			"request_id", authLogRequestID(c),
+			"reason", authLogReason(err),
+		)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error:   "forgot_password_failed",
 			Message: "处理密码重置请求失败",
@@ -548,7 +663,11 @@ func (h *AuthHandler) ForgotPassword(c HTTPContext) {
 func (h *AuthHandler) ResetPassword(c HTTPContext) {
 	var req ResetPasswordRequest
 	if err := c.Bind(&req); err != nil {
-		h.logger.Error("Failed to bind reset password request", "error", err)
+		h.logger.Error(
+			"Failed to bind reset password request",
+			"request_id", authLogRequestID(c),
+			"reason", "invalid_request_body",
+		)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
 			Message: "请求格式无效",
@@ -559,7 +678,11 @@ func (h *AuthHandler) ResetPassword(c HTTPContext) {
 	ctx := context.Background()
 	err := h.authService.ResetPassword(ctx, req.Token, req.NewPassword)
 	if err != nil {
-		h.logger.Error("Failed to reset password", "error", err)
+		h.logger.Error(
+			"Failed to reset password",
+			"request_id", authLogRequestID(c),
+			"reason", authLogReason(err),
+		)
 		if err == ErrInvalidToken {
 			c.JSON(http.StatusBadRequest, ErrorResponse{
 				Error:   "invalid_token",
@@ -594,7 +717,11 @@ func (h *AuthHandler) VerifyEmail(c HTTPContext) {
 	ctx := context.Background()
 	err := h.authService.VerifyEmail(ctx, token)
 	if err != nil {
-		h.logger.Error("Failed to verify email", "error", err)
+		h.logger.Error(
+			"Failed to verify email",
+			"request_id", authLogRequestID(c),
+			"reason", authLogReason(err),
+		)
 		if err == ErrInvalidToken {
 			c.JSON(http.StatusBadRequest, ErrorResponse{
 				Error:   "invalid_token",
@@ -619,7 +746,11 @@ func (h *AuthHandler) VerifyEmail(c HTTPContext) {
 func (h *AuthHandler) ResendVerification(c HTTPContext) {
 	var req ResendVerificationRequest
 	if err := c.Bind(&req); err != nil {
-		h.logger.Error("Failed to bind resend verification request", "error", err)
+		h.logger.Error(
+			"Failed to bind resend verification request",
+			"request_id", authLogRequestID(c),
+			"reason", "invalid_request_body",
+		)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
 			Message: "请求格式无效",
@@ -630,7 +761,11 @@ func (h *AuthHandler) ResendVerification(c HTTPContext) {
 	ctx := context.Background()
 	err := h.authService.ResendVerification(ctx, req.Email)
 	if err != nil {
-		h.logger.Error("Failed to resend verification", "error", err)
+		h.logger.Error(
+			"Failed to resend verification",
+			"request_id", authLogRequestID(c),
+			"reason", authLogReason(err),
+		)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error:   "resend_failed",
 			Message: "重新发送验证邮件失败",
@@ -648,7 +783,11 @@ func (h *AuthHandler) ResendVerification(c HTTPContext) {
 func (h *AuthHandler) UpdateProfile(c HTTPContext) {
 	userInfo, err := GetUserFromContext(c)
 	if err != nil {
-		h.logger.Error("Failed to get user from context", "error", err)
+		h.logger.Error(
+			"Failed to get user from context",
+			"request_id", authLogRequestID(c),
+			"reason", "missing_authentication_context",
+		)
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "unauthorized",
 			Message: "请先登录",
@@ -658,7 +797,12 @@ func (h *AuthHandler) UpdateProfile(c HTTPContext) {
 
 	var req UpdateProfileRequest
 	if err := c.Bind(&req); err != nil {
-		h.logger.Error("Failed to bind update profile request", "error", err)
+		h.logger.Error(
+			"Failed to bind update profile request",
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(userInfo.ID),
+			"reason", "invalid_request_body",
+		)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
 			Message: "请求格式无效",
@@ -669,7 +813,12 @@ func (h *AuthHandler) UpdateProfile(c HTTPContext) {
 	ctx := context.Background()
 	err = h.authService.UpdateProfile(ctx, userInfo.ID, &req)
 	if err != nil {
-		h.logger.Error("Failed to update profile", "error", err, "userID", userInfo.ID)
+		h.logger.Error(
+			"Failed to update profile",
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(userInfo.ID),
+			"reason", authLogReason(err),
+		)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error:   "update_failed",
 			Message: "更新个人资料失败",
@@ -687,7 +836,11 @@ func (h *AuthHandler) UpdateProfile(c HTTPContext) {
 func (h *AuthHandler) ChangePassword(c HTTPContext) {
 	userInfo, err := GetUserFromContext(c)
 	if err != nil {
-		h.logger.Error("Failed to get user from context", "error", err)
+		h.logger.Error(
+			"Failed to get user from context",
+			"request_id", authLogRequestID(c),
+			"reason", "missing_authentication_context",
+		)
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "unauthorized",
 			Message: "请先登录",
@@ -697,7 +850,12 @@ func (h *AuthHandler) ChangePassword(c HTTPContext) {
 
 	var req ChangePasswordRequest
 	if err := c.Bind(&req); err != nil {
-		h.logger.Error("Failed to bind change password request", "error", err)
+		h.logger.Error(
+			"Failed to bind change password request",
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(userInfo.ID),
+			"reason", "invalid_request_body",
+		)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
 			Message: "请求格式无效",
@@ -708,7 +866,12 @@ func (h *AuthHandler) ChangePassword(c HTTPContext) {
 	ctx := context.Background()
 	err = h.authService.ChangePassword(ctx, userInfo.ID, req.CurrentPassword, req.NewPassword)
 	if err != nil {
-		h.logger.Error("Failed to change password", "error", err, "userID", userInfo.ID)
+		h.logger.Error(
+			"Failed to change password",
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(userInfo.ID),
+			"reason", authLogReason(err),
+		)
 		if err == ErrInvalidCredentials {
 			c.JSON(http.StatusBadRequest, ErrorResponse{
 				Error:   "invalid_password",
@@ -742,7 +905,12 @@ func (h *AuthHandler) EnableOTP(c HTTPContext) {
 
 	var req EnableOTPRequest
 	if err := c.Bind(&req); err != nil {
-		h.logger.Error("Failed to bind enable OTP request", "error", err)
+		h.logger.Error(
+			"Failed to bind enable OTP request",
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(userInfo.ID),
+			"reason", "invalid_request_body",
+		)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
 			Message: "请求体格式无效",
@@ -757,7 +925,12 @@ func (h *AuthHandler) EnableOTP(c HTTPContext) {
 
 	otpSetup, err := h.authService.EnableOTP(ctx, userInfo.ID, req.Password)
 	if err != nil {
-		h.logger.Error("Failed to enable OTP", "error", err, "user_id", userInfo.ID)
+		h.logger.Error(
+			"Failed to enable OTP",
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(userInfo.ID),
+			"reason", authLogReason(err),
+		)
 		status := http.StatusInternalServerError
 		message := "启用 OTP 失败"
 
@@ -801,7 +974,12 @@ func (h *AuthHandler) DisableOTP(c HTTPContext) {
 		Password string `json:"password" binding:"required"`
 	}
 	if err := c.Bind(&req); err != nil {
-		h.logger.Error("Failed to bind disable OTP request", "error", err)
+		h.logger.Error(
+			"Failed to bind disable OTP request",
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(userInfo.ID),
+			"reason", "invalid_request_body",
+		)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
 			Message: "请求体格式无效",
@@ -815,7 +993,12 @@ func (h *AuthHandler) DisableOTP(c HTTPContext) {
 	}
 
 	if err := h.authService.DisableOTP(ctx, userInfo.ID, req.Password); err != nil {
-		h.logger.Error("Failed to disable OTP", "error", err, "user_id", userInfo.ID)
+		h.logger.Error(
+			"Failed to disable OTP",
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(userInfo.ID),
+			"reason", authLogReason(err),
+		)
 		status := http.StatusInternalServerError
 		message := "停用 OTP 失败"
 
@@ -850,7 +1033,12 @@ func (h *AuthHandler) VerifyOTP(c HTTPContext) {
 
 	var req VerifyOTPRequest
 	if err := c.Bind(&req); err != nil {
-		h.logger.Error("Failed to bind verify OTP request", "error", err)
+		h.logger.Error(
+			"Failed to bind verify OTP request",
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(userInfo.ID),
+			"reason", "invalid_request_body",
+		)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
 			Message: "请求体格式无效",
@@ -864,7 +1052,12 @@ func (h *AuthHandler) VerifyOTP(c HTTPContext) {
 	}
 
 	if err := h.authService.VerifyOTP(ctx, userInfo.ID, req.Code); err != nil {
-		h.logger.Error("Failed to verify OTP", "error", err, "user_id", userInfo.ID)
+		h.logger.Error(
+			"Failed to verify OTP",
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(userInfo.ID),
+			"reason", authLogReason(err),
+		)
 		status := http.StatusUnauthorized
 		message := "OTP 验证码错误"
 
@@ -907,7 +1100,12 @@ func (h *AuthHandler) GenerateBackupCodes(c HTTPContext) {
 
 	codes, err := h.authService.GenerateBackupCodes(ctx, userInfo.ID)
 	if err != nil {
-		h.logger.Error("Failed to generate backup codes", "error", err, "user_id", userInfo.ID)
+		h.logger.Error(
+			"Failed to generate backup codes",
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(userInfo.ID),
+			"reason", authLogReason(err),
+		)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error:   "generate_backup_codes_failed",
 			Message: "生成备用验证码失败",
@@ -1046,7 +1244,11 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 	// 验证令牌
 	claims, err := h.authService.jwtManager.VerifyAccessToken(token)
 	if err != nil {
-		h.logger.Error("Token verification failed", "error", err)
+		h.logger.Error(
+			"Token verification failed",
+			"request_id", authLogRequestID(c),
+			"reason", authLogReason(err),
+		)
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "invalid_token",
 			Message: "访问令牌无效或已过期",
@@ -1075,13 +1277,21 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 	currentUser, err := h.authService.userRepo.GetByID(requestContext, claims.UserID)
 	if err != nil {
 		if errors.Is(err, ErrUserNotFound) {
-			h.logger.Warn("Access token principal is no longer available", "user_id", claims.UserID)
+			h.logger.Warn(
+				"Access token principal is no longer available",
+				"request_id", authLogRequestID(c),
+				"reason", "principal_not_found",
+			)
 			c.JSON(http.StatusUnauthorized, ErrorResponse{
 				Error:   "invalid_token",
 				Message: "访问令牌对应的用户已失效",
 			})
 		} else {
-			h.logger.Error("Failed to revalidate access token principal", "error", err, "user_id", claims.UserID)
+			h.logger.Error(
+				"Failed to revalidate access token principal",
+				"request_id", authLogRequestID(c),
+				"reason", authLogReason(err),
+			)
 			c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 				Error:   "authentication_unavailable",
 				Message: "认证服务暂时不可用",
@@ -1091,7 +1301,12 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 		return
 	}
 	if currentUser.Status != StatusActive {
-		h.logger.Warn("Access token principal is not active", "user_id", claims.UserID, "status", currentUser.Status)
+		h.logger.Warn(
+			"Access token principal is not active",
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(currentUser.ID),
+			"status", observability.SafeLogValue(string(currentUser.Status)),
+		)
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "account_inactive",
 			Message: "账号当前不可用，请重新登录或联系管理员",
@@ -1102,9 +1317,9 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 	if currentUser.Role != claims.Role {
 		h.logger.Warn(
 			"Access token role is stale",
-			"user_id", claims.UserID,
-			"token_role", claims.Role,
-			"current_role", currentUser.Role,
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(currentUser.ID),
+			"reason", "role_changed",
 		)
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "stale_token",
@@ -1114,7 +1329,11 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 		return
 	}
 	if currentUser.PasswordChangedAt != nil && claims.Iat < currentUser.PasswordChangedAt.Unix() {
-		h.logger.Warn("Access token predates password change", "user_id", claims.UserID)
+		h.logger.Warn(
+			"Access token predates password change",
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(currentUser.ID),
+		)
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "stale_token",
 			Message: "密码已变更，请重新登录",
@@ -1142,9 +1361,9 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 	if err != nil {
 		h.logger.Error(
 			"Failed to revalidate access token session",
-			"error", err,
-			"user_id", claims.UserID,
-			"session_id", claims.SessionID,
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(currentUser.ID),
+			"reason", authLogReason(err),
 		)
 		c.JSON(http.StatusServiceUnavailable, ErrorResponse{
 			Error:   "authentication_unavailable",
@@ -1156,8 +1375,8 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 	if !sessionActive {
 		h.logger.Warn(
 			"Access token session is no longer active",
-			"user_id", claims.UserID,
-			"session_id", claims.SessionID,
+			"request_id", authLogRequestID(c),
+			"user_id", authLogUserID(currentUser.ID),
 		)
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "session_revoked",

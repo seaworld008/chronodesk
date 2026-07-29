@@ -7,6 +7,7 @@ import (
 	"net/smtp"
 	"strconv"
 
+	"github.com/seaworld008/chronodesk/server/internal/mailer"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"gorm.io/gorm"
@@ -116,6 +117,24 @@ func (s *EmailConfigService) UpdateEmailConfig(ctx context.Context, req *models.
 	}
 	if req.OTPEmailTemplate != nil {
 		config.OTPEmailTemplate = *req.OTPEmailTemplate
+	}
+
+	if config.FromEmail != "" {
+		if _, err := mailer.CanonicalMailbox(config.FromEmail); err != nil {
+			return nil, fmt.Errorf("发件邮箱无效: %w", err)
+		}
+	}
+	for _, header := range []struct {
+		name  string
+		value string
+	}{
+		{name: "发件人名称", value: config.FromName},
+		{name: "欢迎邮件主题", value: config.WelcomeEmailSubject},
+		{name: "验证码邮件主题", value: config.OTPEmailSubject},
+	} {
+		if err := mailer.ValidateHeaderValue(header.name, header.value, true); err != nil {
+			return nil, err
+		}
 	}
 
 	config.UpdatedByID = &userID
@@ -286,15 +305,30 @@ func (s *EmailConfigService) testSMTPConnection(config *models.EmailConfig) erro
 
 // sendTestEmail sends a test email
 func (s *EmailConfigService) sendTestEmail(config *models.EmailConfig, req *models.EmailTestRequest) error {
+	recipient, err := mailer.CanonicalMailbox(req.ToEmail)
+	if err != nil {
+		return fmt.Errorf("收件邮箱无效: %w", err)
+	}
+	sender, err := mailer.CanonicalMailbox(config.FromEmail)
+	if err != nil {
+		return fmt.Errorf("发件邮箱无效: %w", err)
+	}
 	addr := fmt.Sprintf("%s:%d", config.SMTPHost, config.SMTPPort)
 	auth := smtp.PlainAuth("", config.SMTPUsername, config.SMTPPassword, config.SMTPHost)
 
-	// 构建邮件内容
-	msg := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s",
-		req.ToEmail, req.Subject, req.Content)
+	// 测试内容是纯文本数据；MIME构建器负责严格的头校验与正文传输编码。
+	msg, err := mailer.BuildTextMessage(
+		sender,
+		config.FromName,
+		req.Subject,
+		req.Content,
+	)
+	if err != nil {
+		return fmt.Errorf("构建测试邮件失败: %w", err)
+	}
 
 	// 发送邮件
-	err := smtp.SendMail(addr, auth, config.FromEmail, []string{req.ToEmail}, []byte(msg))
+	err = smtp.SendMail(addr, auth, sender, []string{recipient}, msg)
 	if err != nil {
 		return fmt.Errorf("发送测试邮件失败: %w", err)
 	}

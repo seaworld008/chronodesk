@@ -184,6 +184,47 @@ func TestRedisSlidingWindowFailsClosedWhenSharedAuthorityFails(t *testing.T) {
 	}
 }
 
+func TestRedisSlidingWindowFailsClosedOnOutOfRangeMetadata(t *testing.T) {
+	tests := []struct {
+		name   string
+		result interface{}
+	}{
+		{
+			name:   "remaining exceeds configured limit",
+			result: []interface{}{float64(1), float64(4), float64(0)},
+		},
+		{
+			name:   "negative reset",
+			result: []interface{}{float64(1), float64(2), float64(-1)},
+		},
+		{
+			name:   "native int overflow",
+			result: []interface{}{"1", "9223372036854775808", "0"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			executor := &testRedisRateExecutor{result: test.result}
+			limiter, err := NewRedisSlidingWindow(
+				executor,
+				[]byte("0123456789abcdef-test-pepper"),
+				3,
+				time.Minute,
+				time.Second,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if limiter.Allow("198.51.100.9|/api/auth/login") {
+				t.Fatal("malformed Redis metadata must fail closed")
+			}
+			if limiter.Remaining("198.51.100.9|/api/auth/login") != 0 {
+				t.Fatal("malformed Redis metadata must advertise zero remaining")
+			}
+		})
+	}
+}
+
 func TestInfrastructureRoutesBypassOnlyGenericLimiter(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()

@@ -15,7 +15,10 @@ import (
 	"time"
 )
 
-const maxHTTPRedisResponseBytes = 64 << 10
+const (
+	maxHTTPRedisResponseBytes    = 64 << 10
+	maxHTTPRedisCommandArguments = 10_000
+)
 
 // HTTPRedisClient HTTP REST API Redis客户端
 type HTTPRedisClient struct {
@@ -190,8 +193,14 @@ func (c *HTTPRedisClient) Eval(
 	keys []string,
 	args ...interface{},
 ) (interface{}, error) {
-	commandArgs := make([]interface{}, 0, 2+len(keys)+len(args))
-	commandArgs = append(commandArgs, script, len(keys))
+	if len(keys) > maxHTTPRedisCommandArguments-2 ||
+		len(args) > maxHTTPRedisCommandArguments-2-len(keys) {
+		return nil, fmt.Errorf(
+			"Redis EVAL exceeds the %d argument limit",
+			maxHTTPRedisCommandArguments,
+		)
+	}
+	commandArgs := []interface{}{script, len(keys)}
 	for _, key := range keys {
 		commandArgs = append(commandArgs, key)
 	}
@@ -214,8 +223,13 @@ func (c *HTTPRedisClient) Close() error {
 // executeCommand uses Upstash's canonical JSON command-array transport. Keeping
 // all command arguments in the body avoids path escaping bugs for arbitrary keys.
 func (c *HTTPRedisClient) executeCommand(ctx context.Context, command string, args ...interface{}) (*HTTPRedisResponse, error) {
-	body := make([]interface{}, 0, len(args)+1)
-	body = append(body, command)
+	if len(args) > maxHTTPRedisCommandArguments-1 {
+		return nil, fmt.Errorf(
+			"Redis command exceeds the %d argument limit",
+			maxHTTPRedisCommandArguments,
+		)
+	}
+	body := []interface{}{command}
 	body = append(body, args...)
 	return c.makeRequest(ctx, http.MethodPost, "", body)
 }

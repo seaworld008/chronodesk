@@ -1,13 +1,16 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	htmltemplate "html/template"
 	"net/smtp"
-	"strings"
+	texttemplate "text/template"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/mailer"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
 )
@@ -235,44 +238,34 @@ func (s *EmailNotificationService) isEmailEnabledForUser(ctx context.Context, us
 
 // sendEmail 发送邮件
 func (s *EmailNotificationService) sendEmail(config *models.EmailConfig, to, subject, body string) error {
+	recipient, err := mailer.CanonicalMailbox(to)
+	if err != nil {
+		return fmt.Errorf("收件邮箱无效: %w", err)
+	}
+	sender, err := mailer.CanonicalMailbox(config.FromEmail)
+	if err != nil {
+		return fmt.Errorf("发件邮箱无效: %w", err)
+	}
+
 	// 创建SMTP认证
 	auth := smtp.PlainAuth("", config.SMTPUsername, config.SMTPPassword, config.SMTPHost)
 
 	// 构建邮件消息
-	msg := s.buildEmailMessage(config.FromEmail, config.FromName, to, subject, body)
+	msg, err := s.buildEmailMessage(sender, config.FromName, subject, body)
+	if err != nil {
+		return fmt.Errorf("构建邮件失败: %w", err)
+	}
 
 	// 发送邮件
 	addr := fmt.Sprintf("%s:%d", config.SMTPHost, config.SMTPPort)
-	err := smtp.SendMail(addr, auth, config.FromEmail, []string{to}, []byte(msg))
+	err = smtp.SendMail(addr, auth, sender, []string{recipient}, msg)
 
 	return err
 }
 
 // buildEmailMessage 构建邮件消息
-func (s *EmailNotificationService) buildEmailMessage(fromEmail, fromName, to, subject, htmlBody string) string {
-	headers := make(map[string]string)
-
-	// 设置发件人
-	if fromName != "" {
-		headers["From"] = fmt.Sprintf("%s <%s>", fromName, fromEmail)
-	} else {
-		headers["From"] = fromEmail
-	}
-
-	headers["To"] = to
-	headers["Subject"] = subject
-	headers["MIME-Version"] = "1.0"
-	headers["Content-Type"] = "text/html; charset=UTF-8"
-	headers["Date"] = time.Now().Format(time.RFC1123Z)
-
-	// 构建消息
-	message := ""
-	for k, v := range headers {
-		message += fmt.Sprintf("%s: %s\r\n", k, v)
-	}
-	message += "\r\n" + htmlBody
-
-	return message
+func (s *EmailNotificationService) buildEmailMessage(fromEmail, fromName, subject, htmlBody string) ([]byte, error) {
+	return mailer.BuildHTMLMessage(fromEmail, fromName, subject, htmlBody)
 }
 
 // renderEmailContent 渲染邮件内容
@@ -280,13 +273,26 @@ func (s *EmailNotificationService) renderEmailContent(template *EmailTemplate, n
 	// 创建模板数据
 	data := s.buildTemplateData(notification)
 
-	// 渲染主题
-	subject := s.renderTemplate(template.Subject, data)
+	subjectTemplate, err := texttemplate.New("subject").Parse(template.Subject)
+	if err != nil {
+		return "", "", fmt.Errorf("解析邮件主题模板失败: %w", err)
+	}
+	var subject bytes.Buffer
+	if err := subjectTemplate.Execute(&subject, data); err != nil {
+		return "", "", fmt.Errorf("渲染邮件主题失败: %w", err)
+	}
 
-	// 渲染HTML内容
-	htmlBody := s.renderTemplate(template.HTMLBody, data)
+	// html/template 按文本、属性、CSS 和 URL 上下文分别转义数据。
+	bodyTemplate, err := htmltemplate.New("body").Parse(template.HTMLBody)
+	if err != nil {
+		return "", "", fmt.Errorf("解析HTML邮件模板失败: %w", err)
+	}
+	var htmlBody bytes.Buffer
+	if err := bodyTemplate.Execute(&htmlBody, data); err != nil {
+		return "", "", fmt.Errorf("渲染HTML邮件失败: %w", err)
+	}
 
-	return subject, htmlBody, nil
+	return subject.String(), htmlBody.String(), nil
 }
 
 // buildTemplateData 构建模板数据
@@ -324,25 +330,14 @@ func (s *EmailNotificationService) buildTemplateData(notification *models.Notifi
 		var metadata map[string]interface{}
 		if err := json.Unmarshal([]byte(notification.Metadata), &metadata); err == nil {
 			for k, v := range metadata {
-				data[k] = v
+				if _, reserved := data[k]; !reserved {
+					data[k] = v
+				}
 			}
 		}
 	}
 
 	return data
-}
-
-// renderTemplate 简单模板渲染
-func (s *EmailNotificationService) renderTemplate(template string, data map[string]interface{}) string {
-	result := template
-
-	for key, value := range data {
-		placeholder := fmt.Sprintf("{{.%s}}", key)
-		replacement := fmt.Sprintf("%v", value)
-		result = strings.ReplaceAll(result, placeholder, replacement)
-	}
-
-	return result
 }
 
 // HTML模板定义

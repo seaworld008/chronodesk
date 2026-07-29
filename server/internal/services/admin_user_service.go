@@ -9,6 +9,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // AdminUserService 管理员用户管理服务
@@ -85,9 +86,29 @@ func (s *AdminUserService) GetUserList(ctx context.Context, req *UserListRequest
 		return nil, fmt.Errorf("failed to count users: %w", err)
 	}
 
-	// 排序
-	orderClause := fmt.Sprintf("%s %s", req.OrderBy, strings.ToUpper(req.Order))
-	query = query.Order(orderClause)
+	// 排序列由固定映射构造，避免任何调用方绕过 HTTP binding 后把原始
+	// 请求字符串带入 SQL。
+	orderColumn := clause.Column{Name: "created_at"}
+	switch req.OrderBy {
+	case "id":
+		orderColumn.Name = "id"
+	case "username":
+		orderColumn.Name = "username"
+	case "email":
+		orderColumn.Name = "email"
+	case "updated_at":
+		orderColumn.Name = "updated_at"
+	case "last_login_at":
+		orderColumn.Name = "last_login_at"
+	case "created_at":
+		orderColumn.Name = "created_at"
+	}
+	query = query.Clauses(clause.OrderBy{
+		Columns: []clause.OrderByColumn{{
+			Column: orderColumn,
+			Desc:   !strings.EqualFold(req.Order, "asc"),
+		}},
+	})
 
 	// 分页
 	offset := (req.Page - 1) * req.PageSize

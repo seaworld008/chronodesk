@@ -60,6 +60,14 @@ func TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules(t *testing.T
 			wantErr:  ErrInvalidAssignee,
 		},
 		{
+			name: "overflowing human id",
+			assignee: models.ActorRef{
+				Type: models.ActorTypeHuman,
+				ID:   "18446744073709551616",
+			},
+			wantErr: ErrInvalidAssignee,
+		},
+		{
 			name:     "missing human",
 			assignee: models.HumanActor(user.ID + 99999),
 			wantErr:  ErrAssigneeNotFound,

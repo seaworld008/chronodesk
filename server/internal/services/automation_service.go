@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
@@ -468,9 +469,9 @@ func automationTicketID(event CloudEventEnvelope) (uint, error) {
 	}
 	const prefix = "ticket/"
 	if strings.HasPrefix(event.Subject, prefix) {
-		value, err := strconv.ParseUint(strings.TrimPrefix(event.Subject, prefix), 10, 64)
-		if err == nil && value > 0 {
-			return uint(value), nil
+		value, err := safeconv.ParsePositiveUint(strings.TrimPrefix(event.Subject, prefix))
+		if err == nil {
+			return value, nil
 		}
 	}
 	return 0, fmt.Errorf("event %s does not identify a ticket", event.ID)
@@ -2008,31 +2009,33 @@ func (s *AutomationService) executeCompatibilityAction(
 func (s *AutomationService) toUint(value interface{}) (uint, error) {
 	switch v := value.(type) {
 	case float64:
-		if v <= 0 || math.Trunc(v) != v || v > float64(^uint(0)) {
+		if v <= 0 || math.Trunc(v) != v || v >= math.Ldexp(1, strconv.IntSize) {
 			return 0, fmt.Errorf("value must be a positive integer")
 		}
-		return uint(v), nil
+		return safeconv.PositiveUint(uint64(v))
 	case int:
 		if v <= 0 {
 			return 0, fmt.Errorf("value must be positive")
 		}
 		return uint(v), nil
 	case int64:
-		if v <= 0 || uint64(v) > uint64(^uint(0)) {
+		if v <= 0 {
 			return 0, fmt.Errorf("value must be a positive platform-sized integer")
 		}
-		return uint(v), nil
+		return safeconv.PositiveUint(uint64(v))
+	case uint64:
+		return safeconv.PositiveUint(v)
 	case uint:
 		if v == 0 {
 			return 0, fmt.Errorf("value must be positive")
 		}
 		return v, nil
 	case string:
-		i, err := strconv.ParseUint(v, 10, strconv.IntSize)
-		if err != nil || i == 0 {
+		i, err := safeconv.ParsePositiveUint(v)
+		if err != nil {
 			return 0, fmt.Errorf("value must be a positive integer")
 		}
-		return uint(i), nil
+		return i, nil
 	default:
 		return 0, fmt.Errorf("cannot convert to uint")
 	}

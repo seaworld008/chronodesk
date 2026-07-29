@@ -2,6 +2,7 @@ package services
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/observability"
 	"github.com/seaworld008/chronodesk/server/internal/version"
 )
 
@@ -121,12 +123,15 @@ func (s *ConfigService) InitDefaultConfigs() error {
 			if err == gorm.ErrRecordNotFound {
 				// 配置不存在，创建新的
 				if err := s.db.Create(&config).Error; err != nil {
-					log.Printf("❌ 创建默认配置失败 %s: %v", config.Key, err)
+					log.Printf(
+						"❌ 创建默认配置失败：key=%s reason=persistence_error",
+						observability.SafeLogValue(config.Key),
+					)
 					return err
 				}
 				s.logConfigChange(config.Key, config.Value, "DEFAULT_CREATE")
 			} else {
-				log.Printf("❌ 查询配置失败: %v", err)
+				log.Print("❌ 查询默认配置失败：reason=persistence_error")
 				return err
 			}
 		}
@@ -318,15 +323,16 @@ func (s *ConfigService) logCommittedConfigChanges(changes []configAuditChange) {
 // logConfigChange 记录配置变更日志
 func (s *ConfigService) logConfigChange(key, value, operation string) {
 	digest := sha256.Sum256([]byte(value))
+	digestHex := observability.SafeLogValue(hex.EncodeToString(digest[:]))
 	logger := s.auditLogger
 	if logger == nil {
 		logger = log.Default()
 	}
 	logger.Printf(
-		"配置变更：operation=%s key=%s value_sha256=%x",
-		operation,
-		key,
-		digest,
+		"配置变更：operation=%s key=%s value_sha256=%s",
+		observability.SafeLogValue(operation),
+		observability.SafeLogValue(key),
+		digestHex,
 	)
 }
 

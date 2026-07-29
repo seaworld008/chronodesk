@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 
 	"gorm.io/gorm"
 )
@@ -43,12 +43,12 @@ func (s *AgentNativeService) ResolveTicketAssignmentChanges(
 	}
 	switch assignee.Type {
 	case models.ActorTypeHuman:
-		userID, err := strconv.ParseUint(assignee.ID, 10, 64)
-		if err != nil || userID == 0 || uint64(uint(userID)) != userID {
+		userID, err := safeconv.ParsePositiveUint(assignee.ID)
+		if err != nil {
 			return nil, fmt.Errorf("%w: human assignee id must be a user id", ErrInvalidAssignee)
 		}
 		var user models.User
-		if err := s.db.WithContext(ctx).Select("id").First(&user, uint(userID)).Error; err != nil {
+		if err := s.db.WithContext(ctx).Select("id").First(&user, userID).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil, fmt.Errorf("%w: human %s", ErrAssigneeNotFound, assignee.ID)
 			}

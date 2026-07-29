@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
+
 	"gorm.io/gorm"
 )
 
@@ -1318,9 +1320,16 @@ func linkedTicketIDFromMetadata(metadata map[string]any) (*uint, error) {
 	var err error
 	switch candidate := raw.(type) {
 	case json.Number:
-		value, err = strconv.ParseUint(candidate.String(), 10, 64)
+		result, parseErr := safeconv.ParsePositiveUint(candidate.String())
+		if parseErr != nil {
+			err = parseErr
+		} else {
+			return &result, nil
+		}
 	case float64:
-		if candidate <= 0 || math.Trunc(candidate) != candidate || candidate > float64(^uint(0)) {
+		if candidate <= 0 ||
+			math.Trunc(candidate) != candidate ||
+			candidate >= math.Ldexp(1, strconv.IntSize) {
 			err = errors.New("value must be a positive integer")
 		} else {
 			value = uint64(candidate)
@@ -1368,10 +1377,10 @@ func linkedTicketIDFromMetadata(metadata map[string]any) (*uint, error) {
 	default:
 		err = errors.New("value must be a positive integer")
 	}
-	if err != nil || value == 0 || value > uint64(^uint(0)) {
+	result, convertErr := safeconv.PositiveUint(value)
+	if err != nil || convertErr != nil {
 		return nil, fmt.Errorf("%s must be a positive integer", MetadataLinkedTicketID)
 	}
-	result := uint(value)
 	return &result, nil
 }
 

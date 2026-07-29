@@ -10,6 +10,7 @@ import (
 
 	"github.com/seaworld008/chronodesk/server/internal/a2a"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
@@ -245,10 +246,11 @@ func a2aTicketIDValue(value any) (uint, bool) {
 		}
 		return typed, true
 	case uint64:
-		if typed == 0 || uint64(uint(typed)) != typed {
+		parsed, err := safeconv.PositiveUint(typed)
+		if err != nil {
 			return 0, false
 		}
-		return uint(typed), true
+		return parsed, true
 	case int:
 		if typed <= 0 {
 			return 0, false
@@ -257,9 +259,9 @@ func a2aTicketIDValue(value any) (uint, bool) {
 	default:
 		return 0, false
 	}
-	parsed, err := strconv.ParseUint(encoded, 10, 64)
-	if err != nil || parsed == 0 || uint64(uint(parsed)) != parsed {
+	parsed, err := safeconv.ParsePositiveUint(encoded)
+	if err != nil {
 		return 0, false
 	}
-	return uint(parsed), true
+	return parsed, true
 }

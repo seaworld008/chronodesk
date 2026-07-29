@@ -21,19 +21,12 @@ import (
 
 func main() {
 	var validateOnly bool
-	var upgradeLegacyAdminPassword bool
 	var quarantineUnsupportedPasswords bool
 	flag.BoolVar(
 		&validateOnly,
 		"validate-only",
 		false,
 		"Validate encrypted database secrets without modifying them",
-	)
-	flag.BoolVar(
-		&upgradeLegacyAdminPassword,
-		"upgrade-legacy-admin-password",
-		false,
-		"Upgrade one proven legacy SHA-256 administrator password and revoke its sessions",
 	)
 	flag.BoolVar(
 		&quarantineUnsupportedPasswords,
@@ -80,27 +73,6 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	if upgradeLegacyAdminPassword {
-		adminEmail := os.Getenv("ADMIN_EMAIL")
-		if adminEmail == "" {
-			adminEmail = "admin@example.com"
-		}
-		upgraded, upgradeErr := auth.UpgradeVerifiedLegacySHA256Password(
-			ctx,
-			db,
-			adminEmail,
-			os.Getenv("LEGACY_ADMIN_PASSWORD"),
-			os.Getenv("ADMIN_PASSWORD"),
-		)
-		if upgradeErr != nil {
-			log.Fatalf("Legacy administrator password upgrade failed: %v", upgradeErr)
-		}
-		if upgraded {
-			log.Println("Legacy administrator password upgraded and active sessions revoked")
-		} else {
-			log.Println("Administrator password already uses bcrypt")
-		}
-	}
 	if quarantineUnsupportedPasswords {
 		report, quarantineErr := auth.QuarantineUnsupportedPasswordHashes(ctx, db)
 		if quarantineErr != nil {

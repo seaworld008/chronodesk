@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"regexp"
 	"sort"
@@ -20,6 +21,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
 	"github.com/seaworld008/chronodesk/server/internal/mcp"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"gorm.io/datatypes"
@@ -1412,8 +1414,8 @@ func (a *MCPAdapter) replayComment(
 	if err != nil {
 		return nil, err
 	}
-	commentID, parseErr := strconv.ParseUint(receipt.ResourceID, 10, 64)
-	if parseErr != nil || commentID == 0 {
+	commentID, parseErr := safeconv.ParsePositiveUint(receipt.ResourceID)
+	if parseErr != nil {
 		return nil, backendError(errors.New("invalid replayed comment id"))
 	}
 	var comment models.TicketComment
@@ -1421,7 +1423,7 @@ func (a *MCPAdapter) replayComment(
 		if err := json.Unmarshal(record.ResourceSnapshot, &comment); err != nil {
 			return nil, backendError(errors.New("invalid replayed comment snapshot"))
 		}
-	} else if err := a.db.WithContext(ctx).First(&comment, uint(commentID)).Error; err != nil {
+	} else if err := a.db.WithContext(ctx).First(&comment, commentID).Error; err != nil {
 		return nil, backendError(err)
 	}
 	return map[string]any{
@@ -1438,8 +1440,8 @@ func (a *MCPAdapter) replayAttachment(
 	if err != nil {
 		return nil, err
 	}
-	attachmentID, parseErr := strconv.ParseUint(receipt.ResourceID, 10, 64)
-	if parseErr != nil || attachmentID == 0 {
+	attachmentID, parseErr := safeconv.ParsePositiveUint(receipt.ResourceID)
+	if parseErr != nil {
 		return nil, backendError(errors.New("invalid replayed attachment id"))
 	}
 	var attachment models.TicketAttachment
@@ -1447,7 +1449,7 @@ func (a *MCPAdapter) replayAttachment(
 		if err := json.Unmarshal(record.ResourceSnapshot, &attachment); err != nil {
 			return nil, backendError(errors.New("invalid replayed attachment snapshot"))
 		}
-	} else if err := a.db.WithContext(ctx).First(&attachment, uint(attachmentID)).Error; err != nil {
+	} else if err := a.db.WithContext(ctx).First(&attachment, attachmentID).Error; err != nil {
 		return nil, backendError(err)
 	}
 	return map[string]any{
@@ -1961,16 +1963,19 @@ func argumentInt(
 	if !ok {
 		return defaultValue, nil
 	}
-	number, err := numericUint64(value)
-	if err != nil || number < uint64(minimum) || number > uint64(maximum) {
+	number, err := numericPositiveInt(value)
+	if err != nil || number < minimum || number > maximum {
 		return 0, invalidArgument(fmt.Sprintf("%s must be between %d and %d", key, minimum, maximum))
 	}
-	return int(number), nil
+	return number, nil
 }
 
 func numericUint(value any) (uint, error) {
 	number, err := numericUint64(value)
-	return uint(number), err
+	if err != nil {
+		return 0, err
+	}
+	return safeconv.PositiveUint(number)
 }
 
 func numericUint64(value any) (uint64, error) {
@@ -1994,7 +1999,7 @@ func numericUint64(value any) (uint64, error) {
 			return uint64(typed), nil
 		}
 	case float64:
-		if typed > 0 && typed == float64(uint64(typed)) {
+		if typed > 0 && typed < math.Ldexp(1, 64) && math.Trunc(typed) == typed {
 			return uint64(typed), nil
 		}
 	case json.Number:
@@ -2003,12 +2008,51 @@ func numericUint64(value any) (uint64, error) {
 	return 0, errors.New("not a positive integer")
 }
 
+func numericPositiveInt(value any) (int, error) {
+	switch typed := value.(type) {
+	case int:
+		if typed > 0 {
+			return typed, nil
+		}
+	case int64:
+		if typed > 0 {
+			return safeconv.Int(typed)
+		}
+	case int32:
+		if typed > 0 {
+			return int(typed), nil
+		}
+	case uint:
+		if uint64(typed) <= uint64(math.MaxInt) {
+			return int(typed), nil
+		}
+	case uint64:
+		if typed <= uint64(math.MaxInt) {
+			return int(typed), nil
+		}
+	case uint32:
+		if uint64(typed) <= uint64(math.MaxInt) {
+			return int(typed), nil
+		}
+	case float64:
+		if typed > 0 && typed < math.Ldexp(1, strconv.IntSize-1) && math.Trunc(typed) == typed {
+			return int(typed), nil
+		}
+	case json.Number:
+		number, err := strconv.ParseInt(string(typed), 10, strconv.IntSize)
+		if err == nil && number > 0 && number <= int64(math.MaxInt) {
+			return int(number), nil
+		}
+	}
+	return 0, errors.New("not a positive integer")
+}
+
 func parsePositiveUintString(value, label string) (uint, error) {
-	number, err := strconv.ParseUint(value, 10, 64)
-	if err != nil || number == 0 {
+	number, err := safeconv.ParsePositiveUint(value)
+	if err != nil {
 		return 0, invalidArgument("invalid " + label)
 	}
-	return uint(number), nil
+	return number, nil
 }
 
 func requestDigest(value any) string {

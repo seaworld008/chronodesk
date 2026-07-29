@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -121,8 +122,8 @@ func (h *CategoryHandler) List(c *gin.Context) {
 }
 
 func (h *CategoryHandler) Get(c *gin.Context) {
-	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
-	if err != nil || id == 0 {
+	id, err := safeconv.ParsePositiveUint(c.Param("id"))
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"code": 1,
 			"msg":  "分类 ID 无效",
@@ -131,7 +132,7 @@ func (h *CategoryHandler) Get(c *gin.Context) {
 	}
 
 	var category models.Category
-	if err := h.visibleQuery(c).First(&category, uint(id)).Error; err != nil {
+	if err := h.visibleQuery(c).First(&category, id).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, gin.H{
 				"code": 1,
