@@ -200,16 +200,15 @@ func (resolver *ProjectKnowledgeAccessResolver) resolvePrincipalSubjects(
 
 func parseKnowledgeHumanID(value string) (uint, error) {
 	trimmed := strings.TrimSpace(value)
-	parsed, err := strconv.ParseUint(trimmed, 10, 64)
+	parsed, err := strconv.ParseUint(trimmed, 10, strconv.IntSize)
 	if err != nil || parsed == 0 {
 		return 0, errors.New("human actor id must be a positive integer")
 	}
 	if trimmed != value || strconv.FormatUint(parsed, 10) != value {
 		return 0, errors.New("human actor id must use canonical decimal form")
 	}
-	userID := uint(parsed)
-	if uint64(userID) != parsed {
+	if parsed > uint64(^uint(0)) {
 		return 0, errors.New("human actor id exceeds platform range")
 	}
-	return userID, nil
+	return uint(parsed), nil
 }

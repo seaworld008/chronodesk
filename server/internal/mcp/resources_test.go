@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -110,6 +111,12 @@ func TestProjectResourceTemplatesAreExplicitlyScoped(t *testing.T) {
 }
 
 func TestParseProjectResourceURI(t *testing.T) {
+	maxTicketID := ^uint(0)
+	maxTicketIDText := strconv.FormatUint(uint64(maxTicketID), 10)
+	overflowTicketIDText := "18446744073709551616"
+	if strconv.IntSize == 32 {
+		overflowTicketIDText = "4294967296"
+	}
 	tests := []struct {
 		name string
 		uri  string
@@ -133,6 +140,30 @@ func TestParseProjectResourceURI(t *testing.T) {
 			uri:  "ticket://projects/OPS/queues/triage",
 			want: ProjectResourceReference{ProjectKey: "OPS", Kind: ProjectResourceQueue, Queue: "triage"},
 			ok:   true,
+		},
+		{
+			name: "native-width maximum ticket",
+			uri:  "ticket://projects/OPS/tickets/" + maxTicketIDText,
+			want: ProjectResourceReference{
+				ProjectKey: "OPS",
+				Kind:       ProjectResourceTicket,
+				TicketID:   maxTicketID,
+			},
+			ok: true,
+		},
+		{
+			name: "native-width maximum history",
+			uri:  "ticket://projects/OPS/tickets/" + maxTicketIDText + "/history",
+			want: ProjectResourceReference{
+				ProjectKey: "OPS",
+				Kind:       ProjectResourceHistory,
+				TicketID:   maxTicketID,
+			},
+			ok: true,
+		},
+		{
+			name: "native-width overflow ticket",
+			uri:  "ticket://projects/OPS/tickets/" + overflowTicketIDText,
 		},
 		{name: "legacy ticket URI", uri: "ticket://tickets/42"},
 		{name: "legacy queue URI", uri: "ticket://queues/triage"},

@@ -120,6 +120,24 @@ func TestCrossProjectWorkbenchPaginationIsBounded(t *testing.T) {
 		t.Fatalf("unexpected second page: %+v", page)
 	}
 
+	page, err = service.ListTickets(
+		context.Background(),
+		CrossProjectWorkbenchQuery{
+			UserID:   userID,
+			View:     CrossProjectWorkbenchAssigned,
+			Page:     1,
+			PageSize: maxCrossProjectWorkbenchPageSize,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.PageSize != maxCrossProjectWorkbenchPageSize ||
+		page.Total != 2 ||
+		len(page.Items) != 2 {
+		t.Fatalf("maximum bounded page is invalid: %+v", page)
+	}
+
 	_, err = service.ListTickets(
 		context.Background(),
 		CrossProjectWorkbenchQuery{
@@ -131,6 +149,59 @@ func TestCrossProjectWorkbenchPaginationIsBounded(t *testing.T) {
 	)
 	if !errors.Is(err, ErrCrossProjectWorkbenchQuery) {
 		t.Fatalf("oversized page error = %v", err)
+	}
+}
+
+func TestNormalizeCrossProjectWorkbenchQueryRejectsIntegerExtremes(
+	t *testing.T,
+) {
+	maxInt := int(^uint(0) >> 1)
+	minInt := -maxInt - 1
+	tests := []struct {
+		name     string
+		page     int
+		pageSize int
+	}{
+		{
+			name:     "maximum page size",
+			page:     1,
+			pageSize: maxInt,
+		},
+		{
+			name:     "minimum page size",
+			page:     1,
+			pageSize: minInt,
+		},
+		{
+			name:     "maximum page",
+			page:     maxInt,
+			pageSize: defaultCrossProjectWorkbenchPageSize,
+		},
+		{
+			name:     "minimum page",
+			page:     minInt,
+			pageSize: defaultCrossProjectWorkbenchPageSize,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := normalizeCrossProjectWorkbenchQuery(
+				CrossProjectWorkbenchQuery{
+					UserID:   7,
+					View:     CrossProjectWorkbenchTodo,
+					Page:     test.page,
+					PageSize: test.pageSize,
+				},
+			)
+			if !errors.Is(err, ErrCrossProjectWorkbenchQuery) {
+				t.Fatalf(
+					"normalize page=%d pageSize=%d error=%v",
+					test.page,
+					test.pageSize,
+					err,
+				)
+			}
+		})
 	}
 }
 

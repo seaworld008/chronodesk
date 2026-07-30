@@ -70,7 +70,10 @@ func newTicketRelationshipHandler(
 func (handler *TicketRelationshipHandler) RegisterRoutes(
 	projectGroup *gin.RouterGroup,
 ) {
-	tickets := projectGroup.Group("/tickets/:ticketID")
+	// Gin requires sibling routes to use the same wildcard name for a shared
+	// path segment. The existing human ticket adapter owns this segment as
+	// ":id", so relationship routes must use the same canonical name.
+	tickets := projectGroup.Group("/tickets/:id")
 	tickets.GET("/entity-links", handler.ListEntityLinks)
 	tickets.POST("/entity-links", handler.AddEntityLink)
 	tickets.GET("/relations", handler.ListTicketRelations)
@@ -346,7 +349,7 @@ func (handler *TicketRelationshipHandler) authorizedTicket(
 	if !handler.requireTrustedContext(c) {
 		return nil, false
 	}
-	rawTicketID := strings.TrimSpace(c.Param("ticketID"))
+	rawTicketID := strings.TrimSpace(c.Param("id"))
 	ticketID, err := strconv.ParseUint(rawTicketID, 10, 32)
 	if err != nil || ticketID == 0 {
 		handler.writeProblem(

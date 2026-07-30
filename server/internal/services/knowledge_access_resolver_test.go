@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -316,6 +317,73 @@ func TestProjectKnowledgeAccessResolverPrincipalGrant(t *testing.T) {
 			ID:   string(models.ProjectRoleAgent),
 		}) {
 		t.Fatalf("principal subjects = %+v", subjects)
+	}
+}
+
+func TestParseKnowledgeHumanIDHonorsPlatformUintRange(t *testing.T) {
+	maxUint := uint64(^uint(0))
+	overflow := "18446744073709551616"
+	if strconv.IntSize == 32 {
+		overflow = strconv.FormatUint(maxUint+1, 10)
+	}
+
+	tests := []struct {
+		name    string
+		value   string
+		want    uint
+		wantErr bool
+	}{
+		{
+			name:  "ordinary positive identifier",
+			value: "42",
+			want:  42,
+		},
+		{
+			name:  "platform maximum identifier",
+			value: strconv.FormatUint(maxUint, 10),
+			want:  ^uint(0),
+		},
+		{
+			name:    "zero is rejected",
+			value:   "0",
+			wantErr: true,
+		},
+		{
+			name:    "platform overflow is rejected before conversion",
+			value:   overflow,
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseKnowledgeHumanID(test.value)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf(
+						"parseKnowledgeHumanID(%q) = %d, want error",
+						test.value,
+						got,
+					)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf(
+					"parseKnowledgeHumanID(%q) error = %v",
+					test.value,
+					err,
+				)
+			}
+			if got != test.want {
+				t.Fatalf(
+					"parseKnowledgeHumanID(%q) = %d, want %d",
+					test.value,
+					got,
+					test.want,
+				)
+			}
+		})
 	}
 }
 

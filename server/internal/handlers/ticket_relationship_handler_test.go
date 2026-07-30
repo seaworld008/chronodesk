@@ -91,17 +91,23 @@ func TestTicketRelationshipHandlerRegistersOnlyProjectScopedRoutes(
 		ticketRelationshipTicketServiceStub{},
 	)
 	router := gin.New()
-	handler.RegisterRoutes(router.Group("/api/projects/:projectKey"))
+	projectGroup := router.Group("/api/projects/:projectKey")
+	handler.RegisterRoutes(projectGroup)
+	// Match the production registration order and prove these routes can share
+	// the canonical ticket wildcard without making Gin panic at startup.
+	projectGroup.GET("/tickets/:id", func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
 
 	got := make(map[string]struct{})
 	for _, route := range router.Routes() {
 		got[route.Method+" "+route.Path] = struct{}{}
 	}
 	for _, route := range []string{
-		"GET /api/projects/:projectKey/tickets/:ticketID/entity-links",
-		"POST /api/projects/:projectKey/tickets/:ticketID/entity-links",
-		"GET /api/projects/:projectKey/tickets/:ticketID/relations",
-		"POST /api/projects/:projectKey/tickets/:ticketID/relations",
+		"GET /api/projects/:projectKey/tickets/:id/entity-links",
+		"POST /api/projects/:projectKey/tickets/:id/entity-links",
+		"GET /api/projects/:projectKey/tickets/:id/relations",
+		"POST /api/projects/:projectKey/tickets/:id/relations",
 	} {
 		if _, ok := got[route]; !ok {
 			t.Fatalf("project-scoped route %q was not registered: %#v", route, got)

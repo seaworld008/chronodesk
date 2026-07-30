@@ -6,9 +6,10 @@ ChronoDesk 只保留一个结构迁移入口：`cmd/migrate`。该命令基于�
 
 迁移程序会加载 `server/.env`，并按以下顺序选择 PostgreSQL 连接：
 
-1. `DATABASE_URL_UNPOOLED`
-2. `POSTGRES_URL_NON_POOLING`
-3. `DATABASE_URL`
+1. `DATABASE_MIGRATION_URL`
+2. `DATABASE_URL_UNPOOLED`
+3. `POSTGRES_URL_NON_POOLING`
+4. `DATABASE_URL`
 
 也可以通过 `-dsn` 显式传入连接字符串。生产环境应使用密钥管理系统注入连接信息，不要把凭据写入仓库或命令历史。
 非回环 PostgreSQL 必须使用不会降级为明文的 TLS 模式（`sslmode=require`、

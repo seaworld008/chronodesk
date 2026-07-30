@@ -4,6 +4,7 @@
 - 目标分支：`main`
 - 开发分支：`codex/ai-native-multiproject`
 - 基线提交：`cdd42a047728`
+- 交付 PR：[GitHub #7](https://github.com/seaworld008/chronodesk/pull/7)
 - 升级策略：开发期一次性破坏性升级，不保留 `/api/v1`、隐式项目或旧队列投影兼容层
 - 状态说明：本文记录当前真实实现状态，原始总体规划仍是目标；标为“部分完成”的能力不得当作生产可用
 
@@ -105,8 +106,8 @@
    机器契约。
 2. Proposal 服务层已升级为封闭 `ActionExecutorRegistry` 和真实领域命令，
    但项目显式 Agent REST/MCP/A2A 执行 Adapter 尚未接入。
-3. 本地工作树在本检查点文档创建前包含 181 个已跟踪文件修改和 118 个未跟踪
-   入口；合并前必须以最终 `git status` 和发布门禁结果为准。
+3. 本检查点的实现统一通过 PR #7 交付；恢复开发时以 PR 合并结果、最新
+   `main` 和 `git log` 为权威状态，不依赖旧工作树数量。
 
 ## 5. 已知技术债与下一轮优先级
 
@@ -152,7 +153,8 @@ make verify
 
 ## 7. 发布门禁记录
 
-本节在提交 PR 前更新，只有真实执行成功的命令可以标为通过。
+只有真实执行成功的命令可以标为通过。PR 检查与合并状态以
+[GitHub PR #7](https://github.com/seaworld008/chronodesk/pull/7) 为权威记录。
 
 - [x] `git diff --check`
 - [x] `cd server && go test ./... -count=1`
@@ -167,4 +169,9 @@ make verify
 - [x] `make security`
 - [x] `make build`
 - [x] `make verify`
-- [ ] PR 检查通过并合并到 `main`
+- [x] 隔离 fresh-volume Docker Compose 启动、85/85 模型迁移、FORCE RLS、
+  Server 健康检查与 `chronodesk-migrate -seed`
+
+本机 Python 门禁工具已完整安装并验证：`ruff 0.16.0`、
+`pytest 9.1.1`、`server/requirements-test.txt` 全量依赖，且
+`python3 -m pip check` 无损坏依赖。

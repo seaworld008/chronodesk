@@ -150,7 +150,15 @@ func (service *CrossProjectWorkbenchService) ListTickets(
 	}
 	actorID := strconv.FormatUint(uint64(normalized.UserID), 10)
 	var total int64
-	items := make([]CrossProjectWorkbenchTicket, 0, normalized.PageSize)
+	// Keep allocation independent from request-derived pagination values. The
+	// query normalization below still defines the requested limit, while this
+	// compile-time bound makes the memory-safety boundary explicit to humans
+	// and static data-flow analysis.
+	items := make(
+		[]CrossProjectWorkbenchTicket,
+		0,
+		maxCrossProjectWorkbenchPageSize,
+	)
 	offset := (normalized.Page - 1) * normalized.PageSize
 	if err := scopeddb.WithAuthorizedProjectScopeTransaction(
 		ctx,

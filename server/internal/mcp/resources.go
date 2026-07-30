@@ -274,10 +274,9 @@ func ParseProjectResourceURI(raw string) (ProjectResourceReference, error) {
 		if len(segments) != 3 && !(len(segments) == 4 && segments[3] == "history") {
 			return ProjectResourceReference{}, fmt.Errorf("unsupported resource URI")
 		}
-		ticketID, parseErr := strconv.ParseUint(segments[2], 10, 64)
+		ticketID, parseErr := strconv.ParseUint(segments[2], 10, strconv.IntSize)
 		if parseErr != nil ||
 			ticketID == 0 ||
-			uint64(uint(ticketID)) != ticketID ||
 			strconv.FormatUint(ticketID, 10) != segments[2] {
 			return ProjectResourceReference{}, fmt.Errorf("unsupported resource URI")
 		}

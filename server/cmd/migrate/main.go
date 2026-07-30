@@ -48,14 +48,10 @@ func main() {
 	_ = godotenv.Load()
 
 	if dsn == "" {
-		dsn = firstEnvironmentValue(
-			"DATABASE_URL_UNPOOLED",
-			"POSTGRES_URL_NON_POOLING",
-			"DATABASE_URL",
-		)
+		dsn = migrationDSNFromEnvironment()
 	}
 	if dsn == "" {
-		log.Fatal("DATABASE_URL or -dsn is required")
+		log.Fatal("DATABASE_MIGRATION_URL or -dsn is required")
 	}
 	if timeout <= 0 {
 		log.Fatal("-timeout must be positive")
@@ -126,6 +122,15 @@ func firstEnvironmentValue(names ...string) string {
 		}
 	}
 	return ""
+}
+
+func migrationDSNFromEnvironment() string {
+	return firstEnvironmentValue(
+		"DATABASE_MIGRATION_URL",
+		"DATABASE_URL_UNPOOLED",
+		"POSTGRES_URL_NON_POOLING",
+		"DATABASE_URL",
+	)
 }
 
 func dropChronoDeskTables(db *gorm.DB) error {
