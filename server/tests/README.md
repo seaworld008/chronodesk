@@ -65,9 +65,8 @@ make smoke
 运行单个切片：
 
 ```bash
-cd server
-python3 -m pytest tests/tickets -v
-python3 -m pytest tests/human -v
+./.venv/bin/python -m pytest -c server/pytest.ini server/tests/tickets -v
+./.venv/bin/python -m pytest -c server/pytest.ini server/tests/human -v
 ```
 
 `make smoke` 生成忽略跟踪的 `server/reports/smoke.html`。每个写入用例必须使用
@@ -83,5 +82,8 @@ Human REST 套件统一使用 `E2E-<run-id>-` 前缀，并在删除前重新校�
 证据清单静态校验不要求启动 API，也不声称测试已经执行：
 
 ```bash
-python3 tests/validate_case_evidence_manifest.py
+./.venv/bin/python server/tests/validate_case_evidence_manifest.py
 ```
+
+执行上述直接命令前先运行 `make install-deps`。该命令创建或复用仓库根目录已被
+Git 忽略的 `.venv`；不要向系统 Python 安装测试依赖。

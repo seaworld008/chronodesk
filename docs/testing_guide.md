@@ -11,7 +11,7 @@
 [`CASE_EVIDENCE_MANIFEST.tsv`](testing/CASE_EVIDENCE_MANIFEST.tsv)。提交前执行：
 
 ```bash
-python3 server/tests/validate_case_evidence_manifest.py
+make test-python-static
 ```
 
 校验器会拒绝缺失、重复、未知 Case ID，以及不存在的测试文件/测试符号；证据状态
@@ -26,6 +26,11 @@ python3 server/tests/validate_case_evidence_manifest.py
 make install-deps
 cp server/.env.example server/.env
 ```
+
+`make install-deps` 会在仓库根目录创建或复用已忽略的 `.venv`，并把
+`server/requirements-test.txt` 完整安装到其中。所有 Make Python 门禁都使用
+`.venv/bin/python`，不会写入系统 Python；如需指定创建虚拟环境的解释器，可运行
+`make BOOTSTRAP_PYTHON=python3.12 install-deps`（`PYTHON=...` 仍是兼容别名）。
 
 需要端到端或浏览器测试时，先启动完整环境：
 
