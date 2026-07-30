@@ -1,7 +1,6 @@
 package services
 
 import (
-	"context"
 	"fmt"
 	"sort"
 	"testing"
@@ -15,9 +14,14 @@ import (
 func TestDomainContractHumanUpdateKeepsAssignmentActorProjectionAtomic(t *testing.T) {
 	fixture := newDurableNotificationFixture(t, false)
 	assigneeID := fixture.assignee.ID
+	ctx := testProjectOperationContext(
+		t,
+		fixture.db,
+		models.HumanActor(fixture.actor.ID),
+	)
 
 	updated, err := fixture.service.UpdateTicketExpectedVersion(
-		context.Background(),
+		ctx,
 		fixture.ticket.ID,
 		&models.TicketUpdateRequest{AssignedToID: &assigneeID},
 		fixture.actor.ID,
@@ -52,8 +56,13 @@ func TestDomainContractHumanBulkCommandsCommitNotificationOutbox(t *testing.T) {
 	t.Run("bulk assignment", func(t *testing.T) {
 		fixture := newDurableNotificationFixture(t, false)
 		assigneeID := fixture.assignee.ID
+		ctx := testProjectOperationContext(
+			t,
+			fixture.db,
+			models.HumanActor(fixture.actor.ID),
+		)
 		if _, err := fixture.service.BulkUpdateTickets(
-			context.Background(),
+			ctx,
 			&BulkUpdateRequest{
 				Tickets: []TicketVersionPrecondition{{
 					ID:      fixture.ticket.ID,
@@ -81,8 +90,13 @@ func TestDomainContractHumanBulkCommandsCommitNotificationOutbox(t *testing.T) {
 	t.Run("bulk status transition", func(t *testing.T) {
 		fixture := newDurableNotificationFixture(t, true)
 		status := string(models.TicketStatusInProgress)
+		ctx := testProjectOperationContext(
+			t,
+			fixture.db,
+			models.HumanActor(fixture.actor.ID),
+		)
 		if _, err := fixture.service.BulkUpdateTickets(
-			context.Background(),
+			ctx,
 			&BulkUpdateRequest{
 				Tickets: []TicketVersionPrecondition{{
 					ID:      fixture.ticket.ID,

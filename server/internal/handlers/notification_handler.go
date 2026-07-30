@@ -413,6 +413,11 @@ func (h *NotificationHandler) MarkAsRead(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "未授权"})
 		return
 	}
+	access, ok := ProjectAccessFromGin(c)
+	if !ok {
+		c.JSON(http.StatusForbidden, gin.H{"error": "未解析可信项目范围"})
+		return
+	}
 
 	notificationID := c.Param("id")
 	id, err := strconv.ParseUint(notificationID, 10, 32)
@@ -442,7 +447,12 @@ func (h *NotificationHandler) MarkAsRead(c *gin.Context) {
 	if countErr != nil {
 		logHandlerFailure(c, "notification.refresh_unread_count", countErr)
 	} else {
-		websocketPkg.NotificationMarkedAsReadHook(c.Request.Context(), userID.(uint), unreadCount)
+		_ = websocketPkg.NotificationMarkedAsReadHook(
+			c.Request.Context(),
+			access.Scope,
+			userID.(uint),
+			unreadCount,
+		)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "标记成功"})
@@ -455,6 +465,11 @@ func (h *NotificationHandler) MarkAllAsRead(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "未授权"})
 		return
 	}
+	access, ok := ProjectAccessFromGin(c)
+	if !ok {
+		c.JSON(http.StatusForbidden, gin.H{"error": "未解析可信项目范围"})
+		return
+	}
 
 	err := h.notificationService.MarkAllAsRead(c.Request.Context(), userID.(uint))
 	if err != nil {
@@ -464,7 +479,11 @@ func (h *NotificationHandler) MarkAllAsRead(c *gin.Context) {
 	}
 
 	// 触发WebSocket实时更新未读数量
-	websocketPkg.NotificationAllMarkedAsReadHook(c.Request.Context(), userID.(uint))
+	_ = websocketPkg.NotificationAllMarkedAsReadHook(
+		c.Request.Context(),
+		access.Scope,
+		userID.(uint),
+	)
 
 	c.JSON(http.StatusOK, gin.H{"message": "标记成功"})
 }
@@ -489,6 +508,16 @@ func (h *NotificationHandler) GetUnreadCount(c *gin.Context) {
 
 // CreateNotification 创建通知 (管理员接口)
 func (h *NotificationHandler) CreateNotification(c *gin.Context) {
+	access, ok := ProjectAccessFromGin(c)
+	if !ok {
+		c.JSON(http.StatusForbidden, gin.H{"error": "未解析可信项目范围"})
+		return
+	}
+	if access.Role != models.ProjectRoleAdmin &&
+		access.Role != models.ProjectRoleManager {
+		c.JSON(http.StatusForbidden, gin.H{"error": "仅项目管理员或经理可创建通知"})
+		return
+	}
 	var req models.NotificationCreateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
@@ -524,6 +553,15 @@ func (h *NotificationHandler) CreateNotification(c *gin.Context) {
 
 // DeleteNotification 删除通知 (管理员接口)
 func (h *NotificationHandler) DeleteNotification(c *gin.Context) {
+	access, ok := ProjectAccessFromGin(c)
+	if !ok {
+		c.JSON(http.StatusForbidden, gin.H{"error": "未解析可信项目范围"})
+		return
+	}
+	if access.Role != models.ProjectRoleAdmin {
+		c.JSON(http.StatusForbidden, gin.H{"error": "仅项目管理员可删除通知"})
+		return
+	}
 	notificationID, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的通知ID"})

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
 const (
@@ -23,6 +25,12 @@ const (
 	// protocol-defined metadata object instead of adding a non-standard field
 	// to SendMessageRequest or Task.
 	MetadataLinkedTicketID = "com.chronodesk/linkedTicketId"
+
+	// MetadataProjectKey binds SendMessage and SendStreamingMessage to the
+	// project already authenticated by OAuth. It is an assertion that must
+	// match trusted context, never a source from which authorization is
+	// derived.
+	MetadataProjectKey = "io.chronodesk/projectKey"
 )
 
 // TaskState follows the A2A 1.0 ProtoJSON enum names on the wire.
@@ -350,6 +358,46 @@ type TaskOwner struct {
 }
 
 type taskOwnerContextKey struct{}
+
+// ProjectBinding is the trusted A2A wire-to-persistence binding resolved from
+// the OAuth project_key and an active Project grant. Tenant remains an opaque
+// wire compatibility field and is never copied into this value.
+type ProjectBinding struct {
+	ProjectKey string
+	Scope      models.ProjectScope
+}
+
+type projectBindingContextKey struct{}
+
+func WithProjectBinding(
+	ctx context.Context,
+	binding ProjectBinding,
+) (context.Context, error) {
+	if ctx == nil {
+		return nil, errors.New("A2A project binding context is required")
+	}
+	binding.ProjectKey = strings.TrimSpace(binding.ProjectKey)
+	if err := models.ValidateProjectKey(binding.ProjectKey); err != nil {
+		return nil, fmt.Errorf("invalid A2A project key: %w", err)
+	}
+	if err := binding.Scope.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid A2A project scope: %w", err)
+	}
+	return context.WithValue(ctx, projectBindingContextKey{}, binding), nil
+}
+
+func ProjectBindingFromContext(ctx context.Context) (ProjectBinding, bool) {
+	if ctx == nil {
+		return ProjectBinding{}, false
+	}
+	binding, ok := ctx.Value(projectBindingContextKey{}).(ProjectBinding)
+	if !ok ||
+		models.ValidateProjectKey(binding.ProjectKey) != nil ||
+		binding.Scope.Validate() != nil {
+		return ProjectBinding{}, false
+	}
+	return binding, true
+}
 
 func WithTaskOwner(ctx context.Context, owner TaskOwner) context.Context {
 	return context.WithValue(ctx, taskOwnerContextKey{}, owner)

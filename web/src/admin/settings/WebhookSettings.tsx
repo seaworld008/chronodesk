@@ -37,6 +37,7 @@ import {
 } from '@mui/icons-material'
 import { useNotify } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
+import { projectResourcePath } from '@/lib/projectScope'
 import BackButton from '../common/BackButton'
 import {
   InlineDetails,
@@ -241,7 +242,8 @@ const WebhookSettings: React.FC = () => {
   const fetchWebhooks = useCallback(async () => {
     try {
       setLoading(true)
-      const data = await apiFetch<WebhookListResponse>('/webhooks?page=1&page_size=100')
+      const path = await projectResourcePath('webhooks?page=1&page_size=100')
+      const data = await apiFetch<WebhookListResponse>(path)
       setItems(data.items ?? [])
     } catch (error: unknown) {
       notify(extractErrorMessage(error, '加载 Webhook 列表失败'), { type: 'error' })
@@ -385,13 +387,15 @@ const WebhookSettings: React.FC = () => {
     try {
       const payload = buildPayload()
       if (currentId) {
-        await apiFetch(`/webhooks/${currentId}`, {
+        const path = await projectResourcePath(`webhooks/${currentId}`)
+        await apiFetch(path, {
           method: 'PUT',
           body: JSON.stringify(payload),
         })
         notify('Webhook 更新成功', { type: 'success' })
       } else {
-        await apiFetch('/webhooks', {
+        const path = await projectResourcePath('webhooks')
+        await apiFetch(path, {
           method: 'POST',
           body: JSON.stringify(payload),
         })
@@ -408,7 +412,8 @@ const WebhookSettings: React.FC = () => {
 
   const executeDelete = async (id: number) => {
     try {
-      await apiFetch(`/webhooks/${id}`, { method: 'DELETE' })
+      const path = await projectResourcePath(`webhooks/${id}`)
+      await apiFetch(path, { method: 'DELETE' })
       notify('删除成功', { type: 'success' })
       fetchWebhooks()
     } catch (error: unknown) {
@@ -419,7 +424,8 @@ const WebhookSettings: React.FC = () => {
   const executeTest = async (id: number) => {
     setTestId(id)
     try {
-      await apiFetch(`/webhooks/${id}/test`, { method: 'POST' })
+      const path = await projectResourcePath(`webhooks/${id}/test`)
+      await apiFetch(path, { method: 'POST' })
       notify('Webhook 测试成功', { type: 'success' })
     } catch (error: unknown) {
       notify(extractErrorMessage(error, 'Webhook 测试失败'), { type: 'error' })
@@ -456,7 +462,7 @@ const WebhookSettings: React.FC = () => {
         <Stack direction="row" spacing={1.5} sx={{
           alignItems: "center"
         }}>
-          <BackButton fallbackPath="/system-settings" />
+          <BackButton fallbackPath="/" />
           <Box>
             <Typography variant="h4" sx={{ fontWeight: 600 }}>
               Webhook 集成

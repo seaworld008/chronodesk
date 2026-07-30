@@ -18,6 +18,33 @@ services:
       timeout: 5s
       retries: 5
 
+  # 开发环境一次性建立非 owner、NOBYPASSRLS 的应用运行角色。该服务
+  # 同时修复已有 volume 的授权；生产环境应由独立数据库发布流程完成。
+  postgres-runtime-role:
+    image: postgres:18.4-alpine
+    environment:
+      PGPASSWORD: chronodesk_dev_only
+    command:
+      [
+        "psql",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-h",
+        "postgres",
+        "-U",
+        "chronodesk",
+        "-d",
+        "chronodesk",
+        "-c",
+        "DO $$chronodesk$$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'chronodesk_runtime') THEN CREATE ROLE chronodesk_runtime LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD 'chronodesk_runtime_dev_only'; ELSE ALTER ROLE chronodesk_runtime LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD 'chronodesk_runtime_dev_only'; END IF; IF pg_has_role('chronodesk_runtime', 'chronodesk', 'MEMBER') THEN REVOKE chronodesk FROM chronodesk_runtime; END IF; END $$chronodesk$$;",
+        "-c",
+        "GRANT CONNECT ON DATABASE chronodesk TO chronodesk_runtime; GRANT USAGE ON SCHEMA public TO chronodesk_runtime; GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO chronodesk_runtime; GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO chronodesk_runtime; ALTER DEFAULT PRIVILEGES FOR ROLE chronodesk IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO chronodesk_runtime; ALTER DEFAULT PRIVILEGES FOR ROLE chronodesk IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO chronodesk_runtime;"
+      ]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   # Redis 缓存
   redis:
     image: redis:8.8-alpine
@@ -30,6 +57,25 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # 知识库全文＋向量混合索引（权威数据仍在 PostgreSQL）
+  opensearch:
+    image: opensearchproject/opensearch:3.5.0
+    environment:
+      - discovery.type=single-node
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      - DISABLE_SECURITY_PLUGIN=true
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9200/_cluster/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
 
   # 后端服务 (开发环境)
   server:
@@ -48,11 +94,12 @@ services:
       - PORT=8081
       - APP_URL=http://localhost:8081
       - AUTO_MIGRATE=true
-      - DATABASE_URL=postgres://chronodesk:chronodesk_dev_only@postgres:5432/chronodesk?sslmode=disable
+      - DATABASE_MIGRATION_URL=postgres://chronodesk:chronodesk_dev_only@postgres:5432/chronodesk?sslmode=disable
+      - DATABASE_RUNTIME_URL=postgres://chronodesk_runtime:chronodesk_runtime_dev_only@postgres:5432/chronodesk?sslmode=disable
       - DB_HOST=postgres
       - DB_PORT=5432
-      - DB_USER=chronodesk
-      - DB_PASSWORD=chronodesk_dev_only
+      - DB_USER=chronodesk_runtime
+      - DB_PASSWORD=chronodesk_runtime_dev_only
       - DB_NAME=chronodesk
       # 仅限隔离的 Compose 开发网络；共享/生产 PostgreSQL 必须使用 TLS。
       - POSTGRES_ALLOW_INSECURE=true
@@ -60,6 +107,12 @@ services:
       - REDIS_PORT=6379
       - REDIS_URL=redis://redis:6379
       - REDIS_ALLOW_INSECURE=true
+      - OPENSEARCH_URL=http://opensearch:9200
+      - OPENSEARCH_ALLOW_INSECURE=true
+      - OPENSEARCH_INDEX_PREFIX=chronodesk-knowledge
+      - OPENSEARCH_SEARCH_PIPELINE=chronodesk-knowledge-hybrid
+      - OPENSEARCH_VECTOR_DIMENSION=384
+      - METRICS_ENABLED=true
       - JWT_SECRET=your-super-secret-jwt-key-change-in-production
       - AGENT_JWT_SECRET=development-agent-jwt-secret-not-for-production-2026
       - AGENT_CREDENTIAL_PEPPER=development-agent-credential-pepper-not-for-production-2026
@@ -68,7 +121,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-runtime-role:
+        condition: service_completed_successfully
       redis:
+        condition: service_healthy
+      opensearch:
         condition: service_healthy
     volumes:
       - attachment_data:/app/data
@@ -131,4 +188,6 @@ volumes:
   redis_data:
     driver: local
   attachment_data:
+    driver: local
+  opensearch_data:
     driver: local

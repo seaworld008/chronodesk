@@ -25,6 +25,7 @@ import (
 type AutomationService struct {
 	db     *gorm.DB
 	native *AgentNativeService
+	sla    *SLAService
 }
 
 // NewAutomationService 创建自动化服务实例
@@ -32,6 +33,7 @@ func NewAutomationService(db *gorm.DB) *AutomationService {
 	return &AutomationService{
 		db:     db,
 		native: NewAgentNativeService(db),
+		sla:    NewSLAService(db),
 	}
 }
 
@@ -39,7 +41,14 @@ func NewAutomationService(db *gorm.DB) *AutomationService {
 // engine. Rule actions reuse the same versioned, event-producing domain
 // commands as REST, MCP and A2A instead of mutating ticket tables directly.
 func NewAutomationServiceWithAgentNative(db *gorm.DB, native *AgentNativeService) *AutomationService {
-	return &AutomationService{db: db, native: native}
+	return &AutomationService{db: db, native: native, sla: NewSLAService(db)}
+}
+
+func (s *AutomationService) slaDomainService() *SLAService {
+	if s.sla == nil {
+		s.sla = NewSLAService(s.db)
+	}
+	return s.sla
 }
 
 const (
@@ -54,26 +63,53 @@ const (
 )
 
 var (
-	ErrInvalidWorkingHours          = errors.New("invalid SLA working hours")
 	ErrInvalidAutomationTriggerType = errors.New("invalid automation trigger event type")
 )
+
+func automationProjectScope(ctx context.Context) (models.ProjectScope, error) {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return models.ProjectScope{}, fmt.Errorf(
+			"trusted automation project scope is required: %w",
+			err,
+		)
+	}
+	return scope, nil
+}
+
+func scopedAutomationQuery(
+	db *gorm.DB,
+	scope models.ProjectScope,
+) *gorm.DB {
+	return db.Where(
+		"organization_id = ? AND project_id = ?",
+		scope.OrganizationID,
+		scope.ProjectID,
+	)
+}
 
 // AutomationRuleService 自动化规则相关方法
 
 // CreateRule 创建自动化规则
 func (s *AutomationService) CreateRule(ctx context.Context, req *models.AutomationRuleRequest, userID uint) (*models.AutomationRule, error) {
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	triggerEvent, err := normalizeAutomationRuleTriggerEvent(req.TriggerEvent)
 	if err != nil {
 		return nil, err
 	}
 	rule := &models.AutomationRule{
-		Name:         req.Name,
-		Description:  req.Description,
-		RuleType:     req.RuleType,
-		IsActive:     false,
-		Priority:     1,
-		TriggerEvent: triggerEvent,
-		CreatedBy:    userID,
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		Name:           req.Name,
+		Description:    req.Description,
+		RuleType:       req.RuleType,
+		IsActive:       false,
+		Priority:       1,
+		TriggerEvent:   triggerEvent,
+		CreatedBy:      userID,
 	}
 
 	if req.IsActive != nil {
@@ -100,7 +136,14 @@ func (s *AutomationService) CreateRule(ctx context.Context, req *models.Automati
 
 // GetRules 获取自动化规则列表
 func (s *AutomationService) GetRules(ctx context.Context, ruleType string, triggerEvent string, isActive *bool, search string, page, pageSize int) ([]*models.AutomationRule, int64, error) {
-	query := s.db.WithContext(ctx).Model(&models.AutomationRule{}).Preload("CreatedUser").Preload("UpdatedUser")
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	query := scopedAutomationQuery(
+		s.db.WithContext(ctx).Model(&models.AutomationRule{}),
+		scope,
+	).Preload("CreatedUser").Preload("UpdatedUser")
 
 	if ruleType != "" {
 		query = query.Where("rule_type = ?", ruleType)
@@ -136,8 +179,18 @@ func (s *AutomationService) GetRules(ctx context.Context, ruleType string, trigg
 
 // GetRuleByID 根据ID获取规则
 func (s *AutomationService) GetRuleByID(ctx context.Context, ruleID uint) (*models.AutomationRule, error) {
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var rule models.AutomationRule
-	if err := s.db.WithContext(ctx).Preload("CreatedUser").Preload("UpdatedUser").First(&rule, ruleID).Error; err != nil {
+	if err := scopedAutomationQuery(
+		s.db.WithContext(ctx),
+		scope,
+	).Preload("CreatedUser").
+		Preload("UpdatedUser").
+		Where("id = ?", ruleID).
+		First(&rule).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, fmt.Errorf("rule not found")
 		}
@@ -183,12 +236,33 @@ func (s *AutomationService) UpdateRule(ctx context.Context, ruleID uint, req *mo
 	updates["conditions"] = rule.Conditions
 	updates["actions"] = rule.Actions
 
-	return s.db.WithContext(ctx).Model(rule).Updates(updates).Error
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return err
+	}
+	result := scopedAutomationQuery(
+		s.db.WithContext(ctx).Model(&models.AutomationRule{}),
+		scope,
+	).Where("id = ?", rule.ID).Updates(updates)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errors.New("rule not found")
+	}
+	return nil
 }
 
 // DeleteRule 删除规则
 func (s *AutomationService) DeleteRule(ctx context.Context, ruleID uint) error {
-	result := s.db.WithContext(ctx).Delete(&models.AutomationRule{}, ruleID)
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return err
+	}
+	result := scopedAutomationQuery(
+		s.db.WithContext(ctx),
+		scope,
+	).Where("id = ?", ruleID).Delete(&models.AutomationRule{})
 	if result.Error != nil {
 		return fmt.Errorf("failed to delete rule: %w", result.Error)
 	}
@@ -203,6 +277,23 @@ func (s *AutomationService) EnqueueScheduledCheck(ctx context.Context, ticket *m
 	if s == nil || s.native == nil {
 		return errors.New("agent-native automation service is unavailable")
 	}
+	if ticket == nil || ticket.ID == 0 || ticket.Version == 0 {
+		return errors.New("versioned ticket is required")
+	}
+	var err error
+	ctx, err = EnsureSystemProjectOperationContext(
+		ctx,
+		models.ProjectScope{
+			OrganizationID: ticket.OrganizationID,
+			ProjectID:      ticket.ProjectID,
+		},
+		models.SystemActor("scheduler"),
+		"",
+		"",
+	)
+	if err != nil {
+		return err
+	}
 	return s.enqueueNativeTrigger(
 		ctx,
 		eventcontract.AutomationScheduledCheckEventType,
@@ -215,13 +306,19 @@ func (s *AutomationService) EnqueueScheduledCheck(ctx context.Context, ticket *m
 // enqueueNativeTrigger repeats the guard so direct callers cannot create an
 // event/Outbox storm when no rule is enabled.
 func (s *AutomationService) HasActiveRules(ctx context.Context, triggerEvent string) (bool, error) {
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return false, err
+	}
 	normalized, err := normalizeAutomationRuleTriggerEvent(triggerEvent)
 	if err != nil {
 		return false, err
 	}
 	var count int64
-	if err := s.db.WithContext(ctx).
-		Model(&models.AutomationRule{}).
+	if err := scopedAutomationQuery(
+		s.db.WithContext(ctx).Model(&models.AutomationRule{}),
+		scope,
+	).
 		Where("is_active = ? AND trigger_event = ?", true, normalized).
 		Limit(1).
 		Count(&count).Error; err != nil {
@@ -283,7 +380,7 @@ func (s *AutomationService) enqueueNativeTrigger(
 	if reservation.Replayed {
 		return nil
 	}
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		event, appendErr := s.native.AppendDomainEventTx(ctx, tx, DomainEventInput{
 			ID:              eventID,
 			Type:            normalized,
@@ -346,6 +443,21 @@ func (s *AutomationService) ExecuteDomainEvent(ctx context.Context, event CloudE
 	if strings.TrimSpace(event.ID) == "" {
 		return errors.New("automation event id is required")
 	}
+	scope := models.ProjectScope{
+		OrganizationID: event.OrganizationID,
+		ProjectID:      event.ProjectID,
+	}
+	var err error
+	ctx, err = EnsureSystemProjectOperationContext(
+		ctx,
+		scope,
+		models.SystemActor(automationActorID),
+		event.TraceID,
+		event.CorrelationID,
+	)
+	if err != nil {
+		return err
+	}
 	lineageRules, rootEventID, looped, err := s.automationLineage(ctx, event)
 	if err != nil {
 		return err
@@ -358,7 +470,12 @@ func (s *AutomationService) ExecuteDomainEvent(ctx context.Context, event CloudE
 		return err
 	}
 	var ticket models.Ticket
-	if err := s.db.WithContext(ctx).First(&ticket, ticketID).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		ticketID,
+		scope.OrganizationID,
+		scope.ProjectID,
+	).First(&ticket).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil
 		}
@@ -406,6 +523,10 @@ func (s *AutomationService) automationLineage(
 	ctx context.Context,
 	event CloudEventEnvelope,
 ) (map[uint]struct{}, string, bool, error) {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, "", false, err
+	}
 	lineageRules := make(map[uint]struct{})
 	seen := make(map[string]struct{})
 	currentID := strings.TrimSpace(event.ID)
@@ -431,7 +552,13 @@ func (s *AutomationService) automationLineage(
 		var cause models.DomainEvent
 		err := s.db.WithContext(ctx).
 			Select("id", "causation_id", "data").
-			First(&cause, "id = ?", causationID).Error
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ?",
+				causationID,
+				scope.OrganizationID,
+				scope.ProjectID,
+			).
+			First(&cause).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			rootEventID = causationID
 			return lineageRules, rootEventID, false, nil
@@ -467,8 +594,15 @@ func (s *AutomationService) executeNativeRules(
 	lineageRules map[uint]struct{},
 	rootEventID string,
 ) error {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return err
+	}
 	var rules []models.AutomationRule
-	if err := s.db.WithContext(ctx).
+	if err := scopedAutomationQuery(
+		s.db.WithContext(ctx),
+		scope,
+	).
 		Where("is_active = ? AND trigger_event = ?", true, triggerEvent).
 		Order("priority ASC, id ASC").
 		Find(&rules).Error; err != nil {
@@ -483,7 +617,12 @@ func (s *AutomationService) executeNativeRules(
 	var executionErrors []error
 	for index := range rules {
 		var current models.Ticket
-		if err := s.db.WithContext(ctx).First(&current, ticket.ID).Error; err != nil {
+		if err := s.db.WithContext(ctx).Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			ticket.ID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).First(&current).Error; err != nil {
 			executionErrors = append(
 				executionErrors,
 				fmt.Errorf("rule %d reload ticket: %w", rules[index].ID, err),
@@ -512,6 +651,18 @@ func (s *AutomationService) executeNativeRule(
 	lineageRules map[uint]struct{},
 	rootEventID string,
 ) (returnErr error) {
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return err
+	}
+	if rule == nil ||
+		rule.OrganizationID != scope.OrganizationID ||
+		rule.ProjectID != scope.ProjectID ||
+		ticket == nil ||
+		ticket.OrganizationID != scope.OrganizationID ||
+		ticket.ProjectID != scope.ProjectID {
+		return errors.New("automation rule and ticket must match trusted project scope")
+	}
 	if _, recursivelyTriggered := lineageRules[rule.ID]; recursivelyTriggered {
 		return nil
 	}
@@ -636,18 +787,20 @@ type automationRuleExecutionClaim struct {
 }
 
 type automationRuleSnapshot struct {
-	ID           uint      `json:"id"`
-	Name         string    `json:"name"`
-	Description  string    `json:"description"`
-	RuleType     string    `json:"rule_type"`
-	IsActive     bool      `json:"is_active"`
-	Priority     int       `json:"priority"`
-	TriggerEvent string    `json:"trigger_event"`
-	Conditions   string    `json:"conditions"`
-	Actions      string    `json:"actions"`
-	CreatedBy    uint      `json:"created_by"`
-	UpdatedBy    *uint     `json:"updated_by,omitempty"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID             uint      `json:"id"`
+	OrganizationID uint      `json:"organization_id"`
+	ProjectID      uint      `json:"project_id"`
+	Name           string    `json:"name"`
+	Description    string    `json:"description"`
+	RuleType       string    `json:"rule_type"`
+	IsActive       bool      `json:"is_active"`
+	Priority       int       `json:"priority"`
+	TriggerEvent   string    `json:"trigger_event"`
+	Conditions     string    `json:"conditions"`
+	Actions        string    `json:"actions"`
+	CreatedBy      uint      `json:"created_by"`
+	UpdatedBy      *uint     `json:"updated_by,omitempty"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type automationRuleExecutionSnapshot struct {
@@ -658,42 +811,52 @@ type automationRuleExecutionSnapshot struct {
 }
 
 func newAutomationRuleSnapshot(rule *models.AutomationRule) (automationRuleSnapshot, error) {
-	if rule == nil || rule.ID == 0 {
+	if rule == nil ||
+		rule.ID == 0 ||
+		rule.OrganizationID == 0 ||
+		rule.ProjectID == 0 {
 		return automationRuleSnapshot{}, errors.New("automation rule is required")
 	}
 	return automationRuleSnapshot{
-		ID:           rule.ID,
-		Name:         rule.Name,
-		Description:  rule.Description,
-		RuleType:     rule.RuleType,
-		IsActive:     rule.IsActive,
-		Priority:     rule.Priority,
-		TriggerEvent: rule.TriggerEvent,
-		Conditions:   rule.Conditions,
-		Actions:      rule.Actions,
-		CreatedBy:    rule.CreatedBy,
-		UpdatedBy:    rule.UpdatedBy,
-		UpdatedAt:    rule.UpdatedAt,
+		ID:             rule.ID,
+		OrganizationID: rule.OrganizationID,
+		ProjectID:      rule.ProjectID,
+		Name:           rule.Name,
+		Description:    rule.Description,
+		RuleType:       rule.RuleType,
+		IsActive:       rule.IsActive,
+		Priority:       rule.Priority,
+		TriggerEvent:   rule.TriggerEvent,
+		Conditions:     rule.Conditions,
+		Actions:        rule.Actions,
+		CreatedBy:      rule.CreatedBy,
+		UpdatedBy:      rule.UpdatedBy,
+		UpdatedAt:      rule.UpdatedAt,
 	}, nil
 }
 
 func (snapshot automationRuleSnapshot) rule() (*models.AutomationRule, error) {
-	if snapshot.ID == 0 || strings.TrimSpace(snapshot.TriggerEvent) == "" {
+	if snapshot.ID == 0 ||
+		snapshot.OrganizationID == 0 ||
+		snapshot.ProjectID == 0 ||
+		strings.TrimSpace(snapshot.TriggerEvent) == "" {
 		return nil, errors.New("automation rule snapshot is invalid")
 	}
 	return &models.AutomationRule{
-		ID:           snapshot.ID,
-		Name:         snapshot.Name,
-		Description:  snapshot.Description,
-		RuleType:     snapshot.RuleType,
-		IsActive:     snapshot.IsActive,
-		Priority:     snapshot.Priority,
-		TriggerEvent: snapshot.TriggerEvent,
-		Conditions:   snapshot.Conditions,
-		Actions:      snapshot.Actions,
-		CreatedBy:    snapshot.CreatedBy,
-		UpdatedBy:    snapshot.UpdatedBy,
-		UpdatedAt:    snapshot.UpdatedAt,
+		ID:             snapshot.ID,
+		OrganizationID: snapshot.OrganizationID,
+		ProjectID:      snapshot.ProjectID,
+		Name:           snapshot.Name,
+		Description:    snapshot.Description,
+		RuleType:       snapshot.RuleType,
+		IsActive:       snapshot.IsActive,
+		Priority:       snapshot.Priority,
+		TriggerEvent:   snapshot.TriggerEvent,
+		Conditions:     snapshot.Conditions,
+		Actions:        snapshot.Actions,
+		CreatedBy:      snapshot.CreatedBy,
+		UpdatedBy:      snapshot.UpdatedBy,
+		UpdatedAt:      snapshot.UpdatedAt,
 	}, nil
 }
 
@@ -740,13 +903,19 @@ func (s *AutomationService) loadIncompleteNativeRuleSnapshots(
 	rootEventID string,
 	triggerEvent string,
 ) ([]models.AutomationRule, error) {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rootEventID = strings.TrimSpace(rootEventID)
 	keyPrefix := automationRootKey(rootEventID) + ":"
 	var records []models.IdempotencyRecord
 	if err := s.db.WithContext(ctx).
 		Select("key", "resource_snapshot").
 		Where(
-			"actor_type = ? AND actor_id = ? AND operation = ? AND state IN ? AND key LIKE ?",
+			"organization_id = ? AND project_id = ? AND actor_type = ? AND actor_id = ? AND operation = ? AND state IN ? AND key LIKE ?",
+			scope.OrganizationID,
+			scope.ProjectID,
 			models.ActorTypeSystem,
 			automationActorID,
 			automationRuleExecutionOperation,
@@ -769,6 +938,12 @@ func (s *AutomationService) loadIncompleteNativeRuleSnapshots(
 		)
 		if err != nil {
 			return nil, fmt.Errorf("load frozen rule for %s: %w", records[index].Key, err)
+		}
+		if rule.OrganizationID != scope.OrganizationID ||
+			rule.ProjectID != scope.ProjectID {
+			return nil, errors.New(
+				"frozen automation rule does not match trusted project scope",
+			)
 		}
 		if snapshot.RootEventID == rootEventID && rule.TriggerEvent == triggerEvent {
 			rules = append(rules, *rule)
@@ -808,9 +983,19 @@ func (s *AutomationService) reserveNativeRuleExecution(
 	rootEventID string,
 	rule *models.AutomationRule,
 ) (*automationRuleExecutionClaim, error) {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rootEventID = strings.TrimSpace(rootEventID)
 	if rootEventID == "" || rule == nil || rule.ID == 0 {
 		return nil, errors.New("automation causal root and rule are required")
+	}
+	if rule.OrganizationID != scope.OrganizationID ||
+		rule.ProjectID != scope.ProjectID {
+		return nil, errors.New(
+			"automation rule does not match trusted project scope",
+		)
 	}
 	ruleSnapshot, err := newAutomationRuleSnapshot(rule)
 	if err != nil {
@@ -838,6 +1023,8 @@ func (s *AutomationService) reserveNativeRuleExecution(
 	token := newNativeID()
 	record := &models.IdempotencyRecord{
 		ID:               newNativeID(),
+		OrganizationID:   scope.OrganizationID,
+		ProjectID:        scope.ProjectID,
 		ActorType:        models.ActorTypeSystem,
 		ActorID:          automationActorID,
 		Operation:        automationRuleExecutionOperation,
@@ -866,7 +1053,9 @@ func (s *AutomationService) reserveNativeRuleExecution(
 	var existing models.IdempotencyRecord
 	if err := s.db.WithContext(ctx).
 		Where(
-			"actor_type = ? AND actor_id = ? AND operation = ? AND key = ?",
+			"organization_id = ? AND project_id = ? AND actor_type = ? AND actor_id = ? AND operation = ? AND key = ?",
+			scope.OrganizationID,
+			scope.ProjectID,
 			models.ActorTypeSystem,
 			automationActorID,
 			automationRuleExecutionOperation,
@@ -904,8 +1093,10 @@ func (s *AutomationService) reserveNativeRuleExecution(
 	token = newNativeID()
 	result := s.db.WithContext(ctx).Model(&models.IdempotencyRecord{}).
 		Where(
-			"id = ? AND state IN ? AND expires_at <= ?",
+			"id = ? AND organization_id = ? AND project_id = ? AND state IN ? AND expires_at <= ?",
 			existing.ID,
+			scope.OrganizationID,
+			scope.ProjectID,
 			[]models.IdempotencyState{
 				models.IdempotencyStateProcessing,
 				models.IdempotencyStateFailed,
@@ -944,6 +1135,10 @@ func (s *AutomationService) persistNativeRuleConditionDecision(
 	claim *automationRuleExecutionClaim,
 	matched bool,
 ) error {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return err
+	}
 	if claim == nil || claim.RecordID == "" || claim.Token == "" ||
 		claim.Rule == nil || strings.TrimSpace(claim.RootEventID) == "" {
 		return errors.New("automation rule execution claim is required")
@@ -964,8 +1159,10 @@ func (s *AutomationService) persistNativeRuleConditionDecision(
 	now := s.native.now()
 	result := s.db.WithContext(ctx).Model(&models.IdempotencyRecord{}).
 		Where(
-			"id = ? AND state = ? AND resource_id = ? AND expires_at > ?",
+			"id = ? AND organization_id = ? AND project_id = ? AND state = ? AND resource_id = ? AND expires_at > ?",
 			claim.RecordID,
+			scope.OrganizationID,
+			scope.ProjectID,
 			models.IdempotencyStateProcessing,
 			claim.Token,
 			now,
@@ -989,14 +1186,20 @@ func (s *AutomationService) renewNativeRuleExecution(
 	ctx context.Context,
 	claim *automationRuleExecutionClaim,
 ) error {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return err
+	}
 	if claim == nil || claim.RecordID == "" || claim.Token == "" {
 		return errors.New("automation rule execution claim is required")
 	}
 	now := s.native.now()
 	result := s.db.WithContext(ctx).Model(&models.IdempotencyRecord{}).
 		Where(
-			"id = ? AND state = ? AND resource_id = ? AND expires_at > ?",
+			"id = ? AND organization_id = ? AND project_id = ? AND state = ? AND resource_id = ? AND expires_at > ?",
 			claim.RecordID,
+			scope.OrganizationID,
+			scope.ProjectID,
 			models.IdempotencyStateProcessing,
 			claim.Token,
 			now,
@@ -1025,6 +1228,10 @@ func (s *AutomationService) completeNativeRuleExecution(
 	actionsExecuted []string,
 	execTime time.Duration,
 ) error {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return err
+	}
 	if claim == nil || claim.RecordID == "" || claim.Token == "" {
 		return errors.New("automation rule execution claim is required")
 	}
@@ -1054,11 +1261,13 @@ func (s *AutomationService) completeNativeRuleExecution(
 
 	now := s.native.now()
 	execMillis := execTime.Milliseconds()
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		result := tx.Model(&models.IdempotencyRecord{}).
 			Where(
-				"id = ? AND state = ? AND resource_id = ? AND expires_at > ?",
+				"id = ? AND organization_id = ? AND project_id = ? AND state = ? AND resource_id = ? AND expires_at > ?",
 				claim.RecordID,
+				scope.OrganizationID,
+				scope.ProjectID,
 				models.IdempotencyStateProcessing,
 				claim.Token,
 				now,
@@ -1083,6 +1292,7 @@ func (s *AutomationService) completeNativeRuleExecution(
 
 		ruleExists, err := updateAutomationRuleAttemptStatisticsTx(
 			tx,
+			scope,
 			rule.ID,
 			true,
 			execMillis,
@@ -1098,6 +1308,8 @@ func (s *AutomationService) completeNativeRuleExecution(
 		}
 
 		entry := &models.AutomationLog{
+			OrganizationID:  scope.OrganizationID,
+			ProjectID:       scope.ProjectID,
 			RuleID:          rule.ID,
 			TicketID:        ticket.ID,
 			TriggerEvent:    rule.TriggerEvent,
@@ -1125,6 +1337,10 @@ func (s *AutomationService) failNativeRuleExecution(
 	execTime time.Duration,
 	failure error,
 ) error {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return err
+	}
 	if claim == nil || claim.RecordID == "" || claim.Token == "" ||
 		rule == nil || ticket == nil || failure == nil {
 		return nil
@@ -1158,11 +1374,13 @@ func (s *AutomationService) failNativeRuleExecution(
 	}
 	now := s.native.now()
 	execMillis := execTime.Milliseconds()
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		result := tx.Model(&models.IdempotencyRecord{}).
 			Where(
-				"id = ? AND state = ? AND resource_id = ? AND expires_at > ?",
+				"id = ? AND organization_id = ? AND project_id = ? AND state = ? AND resource_id = ? AND expires_at > ?",
 				claim.RecordID,
+				scope.OrganizationID,
+				scope.ProjectID,
 				models.IdempotencyStateProcessing,
 				claim.Token,
 				now,
@@ -1186,6 +1404,7 @@ func (s *AutomationService) failNativeRuleExecution(
 
 		ruleExists, err := updateAutomationRuleAttemptStatisticsTx(
 			tx,
+			scope,
 			rule.ID,
 			false,
 			execMillis,
@@ -1198,6 +1417,8 @@ func (s *AutomationService) failNativeRuleExecution(
 			return nil
 		}
 		entry := &models.AutomationLog{
+			OrganizationID:  scope.OrganizationID,
+			ProjectID:       scope.ProjectID,
 			RuleID:          rule.ID,
 			TicketID:        ticket.ID,
 			TriggerEvent:    rule.TriggerEvent,
@@ -1217,6 +1438,7 @@ func (s *AutomationService) failNativeRuleExecution(
 
 func updateAutomationRuleAttemptStatisticsTx(
 	tx *gorm.DB,
+	scope models.ProjectScope,
 	ruleID uint,
 	success bool,
 	execMillis int64,
@@ -1236,7 +1458,10 @@ func updateAutomationRuleAttemptStatisticsTx(
 	} else {
 		updates["failure_count"] = gorm.Expr("failure_count + 1")
 	}
-	result := tx.Model(&models.AutomationRule{}).
+	result := scopedAutomationQuery(
+		tx.Model(&models.AutomationRule{}),
+		scope,
+	).
 		Where("id = ?", ruleID).
 		Updates(updates)
 	if result.Error != nil {
@@ -1255,6 +1480,10 @@ func (s *AutomationService) nativeRuleActionCheckpoint(
 	ruleID uint,
 	actionCount int,
 ) (automationRuleCheckpoint, error) {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return automationRuleCheckpoint{}, err
+	}
 	if actionCount <= 0 {
 		return automationRuleCheckpoint{}, nil
 	}
@@ -1266,7 +1495,9 @@ func (s *AutomationService) nativeRuleActionCheckpoint(
 	if err := s.db.WithContext(ctx).
 		Select("key", "state").
 		Where(
-			"actor_type = ? AND actor_id = ? AND operation = ? AND key IN ?",
+			"organization_id = ? AND project_id = ? AND actor_type = ? AND actor_id = ? AND operation = ? AND key IN ?",
+			scope.OrganizationID,
+			scope.ProjectID,
 			models.ActorTypeSystem,
 			automationActorID,
 			automationActionOperation,
@@ -1328,12 +1559,21 @@ func (s *AutomationService) runNativeAction(
 	action *models.RuleAction,
 	idempotencyRecordID string,
 ) error {
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return err
+	}
 	var ticket models.Ticket
 	ticketID, err := automationTicketID(event)
 	if err != nil {
 		return err
 	}
-	if err := s.db.WithContext(ctx).First(&ticket, ticketID).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		ticketID,
+		scope.OrganizationID,
+		scope.ProjectID,
+	).First(&ticket).Error; err != nil {
 		return fmt.Errorf("reload automation ticket: %w", err)
 	}
 	correlationID := strings.TrimSpace(event.CorrelationID)
@@ -1540,7 +1780,7 @@ func (s *AutomationService) completeAutomationNoop(
 		EventID:         causationEventID,
 		ChangedFields:   []string{},
 	}
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		if err := s.native.CompleteIdempotencyTxWithTTL(
 			ctx,
 			tx,
@@ -1579,7 +1819,7 @@ func (s *AutomationService) recordAutomationNotification(
 	if err != nil {
 		return err
 	}
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		event, err := s.native.AppendDomainEventTx(ctx, tx, DomainEventInput{
 			Type:            eventcontract.AutomationNotificationRequestedEventType,
 			Subject:         fmt.Sprintf("ticket/%d", ticket.ID),
@@ -1888,8 +2128,26 @@ func (s *AutomationService) toUint(value interface{}) (uint, error) {
 
 // GetExecutionLogs 获取执行日志
 func (s *AutomationService) GetExecutionLogs(ctx context.Context, ruleID, ticketID *uint, success *bool, page, pageSize int) ([]*models.AutomationLog, int64, error) {
-	query := s.db.WithContext(ctx).Model(&models.AutomationLog{}).
-		Preload("Rule").Preload("Ticket")
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	query := scopedAutomationQuery(
+		s.db.WithContext(ctx).Model(&models.AutomationLog{}),
+		scope,
+	).
+		Preload(
+			"Rule",
+			"organization_id = ? AND project_id = ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		Preload(
+			"Ticket",
+			"organization_id = ? AND project_id = ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+		)
 
 	if ruleID != nil {
 		query = query.Where("rule_id = ?", *ruleID)
@@ -1943,7 +2201,13 @@ func (s *AutomationService) GetRuleStats(ctx context.Context, ruleID uint) (map[
 
 // CreateSLAConfig 创建SLA配置
 func (s *AutomationService) CreateSLAConfig(ctx context.Context, req *models.SLAConfigRequest) (*models.SLAConfig, error) {
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	config := &models.SLAConfig{
+		OrganizationID:  scope.OrganizationID,
+		ProjectID:       scope.ProjectID,
 		Name:            req.Name,
 		Description:     req.Description,
 		IsActive:        true,
@@ -1992,17 +2256,23 @@ func (s *AutomationService) CreateSLAConfig(ctx context.Context, req *models.SLA
 		config.EscalationRules = string(escalationJSON)
 	}
 
-	// 如果设置为默认配置，需要取消其他默认配置
-	if config.IsDefault {
-		if err := s.db.WithContext(ctx).Model(&models.SLAConfig{}).
-			Where("is_default = ?", true).
-			Update("is_default", false).Error; err != nil {
-			return nil, fmt.Errorf("failed to update existing default config: %w", err)
+	if err := transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
+		// 如果设置为默认配置，仅取消当前项目的其他默认配置。
+		if config.IsDefault {
+			if err := scopedAutomationQuery(
+				tx.Model(&models.SLAConfig{}),
+				scope,
+			).Where("is_default = ?", true).
+				Update("is_default", false).Error; err != nil {
+				return fmt.Errorf("failed to update existing default config: %w", err)
+			}
 		}
-	}
-
-	if err := s.db.WithContext(ctx).Create(config).Error; err != nil {
-		return nil, fmt.Errorf("failed to create SLA config: %w", err)
+		if err := tx.Create(config).Error; err != nil {
+			return fmt.Errorf("failed to create SLA config: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	return config, nil
@@ -2010,7 +2280,14 @@ func (s *AutomationService) CreateSLAConfig(ctx context.Context, req *models.SLA
 
 // GetSLAConfigs 获取SLA配置列表
 func (s *AutomationService) GetSLAConfigs(ctx context.Context, isActive *bool, page, pageSize int) ([]*models.SLAConfig, int64, error) {
-	query := s.db.WithContext(ctx).Model(&models.SLAConfig{})
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	query := scopedAutomationQuery(
+		s.db.WithContext(ctx).Model(&models.SLAConfig{}),
+		scope,
+	)
 
 	if isActive != nil {
 		query = query.Where("is_active = ?", *isActive)
@@ -2032,76 +2309,12 @@ func (s *AutomationService) GetSLAConfigs(ctx context.Context, isActive *bool, p
 
 // GetSLAConfigForTicket 为工单获取适用的SLA配置
 func (s *AutomationService) GetSLAConfigForTicket(ctx context.Context, ticket *models.Ticket) (*models.SLAConfig, error) {
-	query := s.db.WithContext(ctx).Where("is_active = ?", true)
-
-	// 按优先级查找最匹配的配置
-	conditions := []string{}
-	params := []interface{}{}
-
-	if ticket.Type != "" {
-		conditions = append(conditions, "ticket_type = ? OR ticket_type IS NULL")
-		params = append(params, ticket.Type)
-	} else {
-		conditions = append(conditions, "ticket_type IS NULL")
-	}
-
-	if ticket.Priority != "" {
-		conditions = append(conditions, "priority = ? OR priority IS NULL")
-		params = append(params, ticket.Priority)
-	} else {
-		conditions = append(conditions, "priority IS NULL")
-	}
-
-	if ticket.AssignedToID != nil {
-		conditions = append(conditions, "assigned_user_id = ? OR assigned_user_id IS NULL")
-		params = append(params, *ticket.AssignedToID)
-	} else {
-		conditions = append(conditions, "assigned_user_id IS NULL")
-	}
-
-	whereClause := "(" + strings.Join(conditions, ") AND (") + ")"
-	query = query.Where(whereClause, params...)
-
-	var config models.SLAConfig
-	// 首先尝试找到最匹配的配置
-	if err := query.Order("(ticket_type IS NOT NULL) DESC, (priority IS NOT NULL) DESC, (assigned_user_id IS NOT NULL) DESC").
-		First(&config).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			// 如果没有匹配的，使用默认配置
-			if err := s.db.WithContext(ctx).Where("is_default = ? AND is_active = ?", true, true).
-				First(&config).Error; err != nil {
-				return nil, fmt.Errorf("no suitable SLA config found")
-			}
-		} else {
-			return nil, fmt.Errorf("failed to get SLA config: %w", err)
-		}
-	}
-
-	return &config, nil
+	return s.slaDomainService().GetConfigForTicket(ctx, ticket)
 }
 
 // CalculateSLADeadlines 计算SLA截止时间
 func (s *AutomationService) CalculateSLADeadlines(ctx context.Context, ticket *models.Ticket, config *models.SLAConfig) (responseDeadline, resolutionDeadline time.Time, err error) {
-	startTime := ticket.CreatedAt
-
-	workingHours, err := config.GetWorkingHours()
-	if err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("failed to get working hours: %w", err)
-	}
-
-	// 计算响应截止时间
-	responseDeadline, err = s.addWorkingTime(startTime, time.Duration(config.ResponseTime)*time.Minute, workingHours, config.ExcludeWeekends, config.ExcludeHolidays)
-	if err != nil {
-		return time.Time{}, time.Time{}, err
-	}
-
-	// 计算解决截止时间
-	resolutionDeadline, err = s.addWorkingTime(startTime, time.Duration(config.ResolutionTime)*time.Minute, workingHours, config.ExcludeWeekends, config.ExcludeHolidays)
-	if err != nil {
-		return time.Time{}, time.Time{}, err
-	}
-
-	return responseDeadline, resolutionDeadline, nil
+	return s.slaDomainService().CalculateDeadlines(ctx, ticket, config)
 }
 
 // addWorkingTime 添加工作时间（考虑工作时间、周末、节假日）
@@ -2111,59 +2324,13 @@ func (s *AutomationService) addWorkingTime(
 	workingHours *models.WorkingHours,
 	excludeWeekends, excludeHolidays bool,
 ) (time.Time, error) {
-	if duration < 0 {
-		return time.Time{}, fmt.Errorf("%w: duration must not be negative", ErrInvalidWorkingHours)
-	}
-	if duration == 0 {
-		return startTime, nil
-	}
-
-	schedule, err := prepareWorkingSchedule(
+	return s.slaDomainService().addWorkingTime(
+		startTime,
+		duration,
 		workingHours,
 		excludeWeekends,
 		excludeHolidays,
-		startTime.Location(),
 	)
-	if err != nil {
-		return time.Time{}, err
-	}
-
-	current := startTime.In(schedule.location)
-	remaining := duration
-	// The validation guarantees at least one weekly interval. This upper bound
-	// is a final guard against corrupt calendars causing an infinite scheduler.
-	const maximumCalendarDays = 366 * 100
-	for dayCount := 0; dayCount < maximumCalendarDays; dayCount++ {
-		dayStart := time.Date(current.Year(), current.Month(), current.Day(), 0, 0, 0, 0, schedule.location)
-		if schedule.isExcluded(dayStart) {
-			current = dayStart.AddDate(0, 0, 1)
-			continue
-		}
-
-		interval, ok := schedule.intervals[current.Weekday()]
-		if !ok {
-			current = dayStart.AddDate(0, 0, 1)
-			continue
-		}
-		windowStart := dayStart.Add(interval.start)
-		windowEnd := dayStart.Add(interval.end)
-		if current.Before(windowStart) {
-			current = windowStart
-		}
-		if !current.Before(windowEnd) {
-			current = dayStart.AddDate(0, 0, 1)
-			continue
-		}
-
-		available := windowEnd.Sub(current)
-		if remaining <= available {
-			return current.Add(remaining).In(startTime.Location()), nil
-		}
-		remaining -= available
-		current = dayStart.AddDate(0, 0, 1)
-	}
-
-	return time.Time{}, fmt.Errorf("%w: deadline exceeds supported calendar range", ErrInvalidWorkingHours)
 }
 
 type workingInterval struct {
@@ -2267,7 +2434,13 @@ func (schedule *workingSchedule) isExcluded(day time.Time) bool {
 
 // CreateTemplate 创建工单模板
 func (s *AutomationService) CreateTemplate(ctx context.Context, req *models.TicketTemplateRequest, userID uint) (*models.TicketTemplate, error) {
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	template := &models.TicketTemplate{
+		OrganizationID:  scope.OrganizationID,
+		ProjectID:       scope.ProjectID,
 		Name:            req.Name,
 		Description:     req.Description,
 		Category:        req.Category,
@@ -2303,7 +2476,14 @@ func (s *AutomationService) CreateTemplate(ctx context.Context, req *models.Tick
 
 // GetTemplates 获取模板列表
 func (s *AutomationService) GetTemplates(ctx context.Context, category string, isActive *bool, page, pageSize int) ([]*models.TicketTemplate, int64, error) {
-	query := s.db.WithContext(ctx).Model(&models.TicketTemplate{}).Preload("CreatedUser").Preload("AssignToUser")
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	query := scopedAutomationQuery(
+		s.db.WithContext(ctx).Model(&models.TicketTemplate{}),
+		scope,
+	).Preload("CreatedUser").Preload("AssignToUser")
 
 	if category != "" {
 		query = query.Where("category = ?", category)
@@ -2328,8 +2508,18 @@ func (s *AutomationService) GetTemplates(ctx context.Context, category string, i
 
 // GetTemplateByID 根据ID获取模板
 func (s *AutomationService) GetTemplateByID(ctx context.Context, templateID uint) (*models.TicketTemplate, error) {
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var template models.TicketTemplate
-	if err := s.db.WithContext(ctx).Preload("CreatedUser").Preload("AssignToUser").First(&template, templateID).Error; err != nil {
+	if err := scopedAutomationQuery(
+		s.db.WithContext(ctx),
+		scope,
+	).Preload("CreatedUser").
+		Preload("AssignToUser").
+		Where("id = ?", templateID).
+		First(&template).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, fmt.Errorf("template not found")
 		}
@@ -2342,13 +2532,19 @@ func (s *AutomationService) GetTemplateByID(ctx context.Context, templateID uint
 
 // CreateQuickReply 创建快速回复
 func (s *AutomationService) CreateQuickReply(ctx context.Context, req *models.QuickReplyRequest, userID uint) (*models.QuickReply, error) {
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	reply := &models.QuickReply{
-		Name:      req.Name,
-		Category:  req.Category,
-		Content:   req.Content,
-		Tags:      req.Tags,
-		IsPublic:  false,
-		CreatedBy: userID,
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		Name:           req.Name,
+		Category:       req.Category,
+		Content:        req.Content,
+		Tags:           req.Tags,
+		IsPublic:       false,
+		CreatedBy:      userID,
 	}
 
 	if req.IsPublic != nil {
@@ -2364,7 +2560,14 @@ func (s *AutomationService) CreateQuickReply(ctx context.Context, req *models.Qu
 
 // GetQuickReplies 获取快速回复列表
 func (s *AutomationService) GetQuickReplies(ctx context.Context, category, keyword string, isPublic *bool, userID uint, page, pageSize int) ([]*models.QuickReply, int64, error) {
-	query := s.db.WithContext(ctx).Model(&models.QuickReply{}).Preload("CreatedUser")
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	query := scopedAutomationQuery(
+		s.db.WithContext(ctx).Model(&models.QuickReply{}),
+		scope,
+	).Preload("CreatedUser")
 
 	// 只能看到自己创建的或公开的
 	if isPublic == nil || !*isPublic {
@@ -2398,9 +2601,22 @@ func (s *AutomationService) GetQuickReplies(ctx context.Context, category, keywo
 
 // UseQuickReply 使用快速回复（增加使用计数）
 func (s *AutomationService) UseQuickReply(ctx context.Context, replyID uint) error {
-	return s.db.WithContext(ctx).Model(&models.QuickReply{}).
-		Where("id = ?", replyID).
-		UpdateColumn("usage_count", gorm.Expr("usage_count + ?", 1)).Error
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return err
+	}
+	result := scopedAutomationQuery(
+		s.db.WithContext(ctx).Model(&models.QuickReply{}),
+		scope,
+	).Where("id = ?", replyID).
+		UpdateColumn("usage_count", gorm.Expr("usage_count + ?", 1))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errors.New("quick reply not found")
+	}
+	return nil
 }
 
 // ClassifyTicket 工单自动分类
@@ -2408,8 +2624,31 @@ func (s *AutomationService) ClassifyTicket(ctx context.Context, ticket *models.T
 	if ticket == nil || ticket.ID == 0 {
 		return errors.New("ticket is required")
 	}
+	var err error
+	ctx, err = EnsureSystemProjectOperationContext(
+		ctx,
+		models.ProjectScope{
+			OrganizationID: ticket.OrganizationID,
+			ProjectID:      ticket.ProjectID,
+		},
+		models.SystemActor(automationActorID),
+		"",
+		"",
+	)
+	if err != nil {
+		return err
+	}
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return err
+	}
 	var current models.Ticket
-	if err := s.db.WithContext(ctx).First(&current, ticket.ID).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		ticket.ID,
+		scope.OrganizationID,
+		scope.ProjectID,
+	).First(&current).Error; err != nil {
 		return fmt.Errorf("load ticket for classification: %w", err)
 	}
 	// 基于关键词的简单分类逻辑
@@ -2462,8 +2701,17 @@ func (s *AutomationService) executeSystemTicketUpdate(
 	if s == nil || s.native == nil {
 		return errors.New("agent-native automation service is unavailable")
 	}
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return err
+	}
 	var ticket models.Ticket
-	if err := s.db.WithContext(ctx).First(&ticket, ticketID).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		ticketID,
+		scope.OrganizationID,
+		scope.ProjectID,
+	).First(&ticket).Error; err != nil {
 		return fmt.Errorf("load ticket: %w", err)
 	}
 	changes = effectiveAutomationChanges(&ticket, changes)

@@ -1,10 +1,14 @@
 package config
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 )
+
+const testRuntimeDatabaseURL = "postgres://chronodesk_runtime:test@localhost:5432/chronodesk?sslmode=disable"
 
 func TestCORSConfigFromEnv(t *testing.T) {
 	t.Setenv("CORS_ALLOWED_ORIGINS", "https://a.com,https://b.com")
@@ -52,9 +56,10 @@ func TestValidate_RequiresJWTRefreshSecretInProduction(t *testing.T) {
 			RefreshSecret: "your-super-secret-jwt-refresh-key-change-in-production",
 		},
 		Database: DatabaseConfig{
-			Host: "localhost",
-			User: "user",
-			Name: "db",
+			RuntimeURL: testRuntimeDatabaseURL,
+			Host:       "localhost",
+			User:       "user",
+			Name:       "db",
 		},
 		Redis: RedisConfig{
 			Host: "localhost",
@@ -83,7 +88,7 @@ func TestValidateProductionRequiresStrongIndependentSecrets(t *testing.T) {
 		Agent: AgentConfig{
 			Issuer:             "https://desk.internal.example",
 			MCPResourceURL:     "https://desk.internal.example/mcp",
-			APIResourceURL:     "https://desk.internal.example/api/v1",
+			APIResourceURL:     "https://desk.internal.example/api/v2",
 			A2AResourceURL:     "https://desk.internal.example/a2a/v1",
 			JWTSecret:          "agent-access-0123456789-abcdef-XYZ",
 			CredentialPepper:   "agent-pepper-0123456789-abcdef-XYZ",
@@ -93,8 +98,13 @@ func TestValidateProductionRequiresStrongIndependentSecrets(t *testing.T) {
 			LoopThreshold:      1,
 			LoopWindow:         time.Minute,
 		},
-		Database: DatabaseConfig{Host: "localhost", User: "user", Name: "db"},
-		Redis:    RedisConfig{Host: "localhost"},
+		Database: DatabaseConfig{
+			RuntimeURL: testRuntimeDatabaseURL,
+			Host:       "localhost",
+			User:       "user",
+			Name:       "db",
+		},
+		Redis: RedisConfig{Host: "localhost"},
 		RateLimit: RateLimitConfig{
 			Requests:                  100,
 			Window:                    time.Hour,
@@ -197,12 +207,208 @@ func TestLoadConfig_DefaultsUseCanonicalAgentResourceURLs(t *testing.T) {
 		path string
 	}{
 		"MCP": {got: cfg.Agent.MCPResourceURL, path: "/mcp"},
-		"API": {got: cfg.Agent.APIResourceURL, path: "/api/v1"},
+		"API": {got: cfg.Agent.APIResourceURL, path: "/api/v2"},
 		"A2A": {got: cfg.Agent.A2AResourceURL, path: "/a2a/v1"},
 	} {
 		if resource.got != cfg.App.URL+resource.path {
 			t.Errorf("default %s resource = %q, want %q", name, resource.got, cfg.App.URL+resource.path)
 		}
+	}
+}
+
+func TestLoadConfigKnowledgeInfrastructureIsDeploymentOwned(t *testing.T) {
+	t.Setenv("OPENSEARCH_URL", "https://search.internal.example")
+	t.Setenv("OPENSEARCH_INDEX_PREFIX", "desk-knowledge")
+	t.Setenv("OPENSEARCH_SEARCH_PIPELINE", "desk-hybrid")
+	t.Setenv("OPENSEARCH_VECTOR_DIMENSION", "768")
+	t.Setenv("MODEL_GATEWAY_URL", "https://models.internal.example")
+	t.Setenv("MODEL_GATEWAY_PROVIDER_KEY", "private-gateway")
+	t.Setenv("MODEL_GATEWAY_EXTERNAL", "false")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if cfg.Knowledge.OpenSearchURL != "https://search.internal.example" ||
+		cfg.Knowledge.OpenSearchIndexPrefix != "desk-knowledge" ||
+		cfg.Knowledge.OpenSearchPipeline != "desk-hybrid" ||
+		cfg.Knowledge.OpenSearchVectorSize != 768 ||
+		cfg.Knowledge.ModelGatewayURL != "https://models.internal.example" ||
+		cfg.Knowledge.ModelGatewayProviderKey != "private-gateway" ||
+		cfg.Knowledge.ModelGatewayExternal {
+		t.Fatalf("unexpected knowledge infrastructure config: %+v", cfg.Knowledge)
+	}
+}
+
+func TestValidateKnowledgeGatewayRequiresSearchAndVectorDimension(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	cfg.Knowledge.OpenSearchURL = ""
+	cfg.Knowledge.ModelGatewayURL = "https://models.internal.example"
+	if err := cfg.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "requires an OpenSearch endpoint") {
+		t.Fatalf("model gateway without search error = %v", err)
+	}
+	cfg.Knowledge.OpenSearchURL = "https://search.internal.example"
+	cfg.Knowledge.OpenSearchVectorSize = 0
+	if err := cfg.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "vector dimension") {
+		t.Fatalf("invalid vector dimension error = %v", err)
+	}
+}
+
+func TestLoadObservabilityDeploymentControls(t *testing.T) {
+	t.Setenv(
+		"OTEL_EXPORTER_OTLP_ENDPOINT",
+		"https://otel.internal.example/v1/traces",
+	)
+	t.Setenv("OTEL_TRACE_SAMPLING_RATIO", "0.25")
+	t.Setenv(
+		"CHRONODESK_OTLP_HEADERS_JSON",
+		`{"Authorization":"Bearer deployment-secret"}`,
+	)
+	t.Setenv("METRICS_ENABLED", "false")
+	t.Setenv(
+		"CHRONODESK_METRICS_BEARER_TOKEN",
+		"metrics-bearer-token-0123456789-abcdef",
+	)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Observability.OTLPHTTPEndpoint !=
+		"https://otel.internal.example/v1/traces" ||
+		cfg.Observability.TraceSamplingRatio != 0.25 ||
+		cfg.Observability.MetricsEnabled ||
+		cfg.Observability.MetricsBearerToken !=
+			"metrics-bearer-token-0123456789-abcdef" ||
+		cfg.Observability.OTLPHeaders["Authorization"] !=
+			"Bearer deployment-secret" {
+		t.Fatalf("unexpected observability config: %+v", cfg.Observability)
+	}
+}
+
+func TestProductionMetricsRequireStrongBearerToken(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "production")
+	t.Setenv("APP_URL", "https://desk.internal.example")
+	t.Setenv("JWT_SECRET", "human-access-0123456789-abcdef-XYZ")
+	t.Setenv("JWT_REFRESH_SECRET", "human-refresh-0123456789-abcdef-XYZ")
+	t.Setenv("AGENT_JWT_SECRET", "agent-access-0123456789-abcdef-XYZ")
+	t.Setenv(
+		"AGENT_CREDENTIAL_PEPPER",
+		"agent-pepper-0123456789-abcdef-XYZ",
+	)
+	t.Setenv("METRICS_ENABLED", "false")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Observability.MetricsEnabled = true
+	cfg.Observability.MetricsBearerToken = ""
+	if err := cfg.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "production metrics require") {
+		t.Fatalf("missing production metrics token error = %v", err)
+	}
+	cfg.Observability.MetricsBearerToken = strings.Repeat("m", 31)
+	if err := cfg.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "at least 32 bytes") {
+		t.Fatalf("weak production metrics token error = %v", err)
+	}
+	cfg.Observability.MetricsBearerToken = strings.Repeat("m", 32)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("strong production metrics token rejected: %v", err)
+	}
+}
+
+func TestDatabaseRuntimeAndMigrationRolesAreExplicitAndDistinct(t *testing.T) {
+	t.Setenv(
+		"DATABASE_RUNTIME_URL",
+		"postgres://chronodesk_runtime:runtime@db.internal/desk?sslmode=require",
+	)
+	t.Setenv(
+		"DATABASE_MIGRATION_URL",
+		"postgres://chronodesk_migration:migration@db.internal/desk?sslmode=require",
+	)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Database.RuntimeURL == "" || cfg.Database.MigrationURL == "" {
+		t.Fatalf("database role URLs were not loaded")
+	}
+	cfg.Observability.MetricsBearerToken =
+		"metrics-bearer-token-0123456789-abcdef"
+	encoded, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{
+		"chronodesk_runtime:runtime",
+		"chronodesk_migration:migration",
+		cfg.Observability.MetricsBearerToken,
+	} {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("serialized configuration exposed deployment secret")
+		}
+	}
+
+	cfg.Database.MigrationURL =
+		"postgres://chronodesk_runtime:other@db.internal/desk?sslmode=require"
+	if err := cfg.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "different PostgreSQL roles") {
+		t.Fatalf("same runtime/migration role error = %v", err)
+	}
+	cfg.Database.MigrationURL = "not-a-postgres-url"
+	if err := cfg.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "DATABASE_MIGRATION_URL") {
+		t.Fatalf("invalid migration URL error = %v", err)
+	}
+}
+
+func TestLoadObservabilityRejectsMalformedControls(t *testing.T) {
+	t.Setenv("OTEL_TRACE_SAMPLING_RATIO", "not-a-number")
+	if _, err := Load(); err == nil ||
+		!strings.Contains(err.Error(), "OTEL_TRACE_SAMPLING_RATIO") {
+		t.Fatalf("invalid sampling ratio error = %v", err)
+	}
+	t.Setenv("OTEL_TRACE_SAMPLING_RATIO", "0.1")
+	t.Setenv("CHRONODESK_OTLP_HEADERS_JSON", `{"Authorization":42}`)
+	if _, err := Load(); err == nil ||
+		!strings.Contains(err.Error(), "CHRONODESK_OTLP_HEADERS_JSON") {
+		t.Fatalf("invalid OTLP headers error = %v", err)
+	}
+}
+
+func TestLoadIntegrationHMACKeyRotationIsDeploymentOwned(t *testing.T) {
+	current := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("c", 32)))
+	previous := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("p", 32)))
+	t.Setenv(
+		"CHRONODESK_INTEGRATION_HMAC_KEYS_JSON",
+		`{"erp-primary":{"current":"`+current+
+			`","previous":"`+previous+`"}}`,
+	)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, exists := cfg.Integration.HMACKeys["erp-primary"]
+	if !exists ||
+		string(keys.Current) != strings.Repeat("c", 32) ||
+		string(keys.Previous) != strings.Repeat("p", 32) {
+		t.Fatalf("unexpected integration HMAC key configuration")
+	}
+}
+
+func TestLoadIntegrationHMACKeysRejectsUnknownOrWeakValues(t *testing.T) {
+	t.Setenv(
+		"CHRONODESK_INTEGRATION_HMAC_KEYS_JSON",
+		`{"erp":{"current":"d2Vhaw==","endpoint":"https://evil.test"}}`,
+	)
+	if _, err := Load(); err == nil ||
+		!strings.Contains(err.Error(), "CHRONODESK_INTEGRATION_HMAC_KEYS_JSON") {
+		t.Fatalf("invalid integration HMAC key map error = %v", err)
 	}
 }
 
@@ -275,7 +481,7 @@ func TestValidateHumanJWTTrustContractFailsClosed(t *testing.T) {
 		{
 			name: "audience differs from human REST resource",
 			mutate: func(config *Config) {
-				config.JWT.Audience = config.App.URL + "/api/v1"
+				config.JWT.Audience = config.App.URL + "/api/v2"
 			},
 			wantErr: "audience must exactly match",
 		},
@@ -308,7 +514,7 @@ func TestValidate_AgentEndpointContract(t *testing.T) {
 		Agent: AgentConfig{
 			Issuer:             "https://desk.internal.example",
 			MCPResourceURL:     "https://desk.internal.example/mcp",
-			APIResourceURL:     "https://desk.internal.example/api/v1",
+			APIResourceURL:     "https://desk.internal.example/api/v2",
 			A2AResourceURL:     "https://desk.internal.example/a2a/v1",
 			TokenTTL:           15 * time.Minute,
 			CredentialTTL:      24 * time.Hour,
@@ -316,8 +522,13 @@ func TestValidate_AgentEndpointContract(t *testing.T) {
 			LoopThreshold:      1,
 			LoopWindow:         time.Minute,
 		},
-		Database: DatabaseConfig{Host: "localhost", User: "user", Name: "db"},
-		Redis:    RedisConfig{Host: "localhost"},
+		Database: DatabaseConfig{
+			RuntimeURL: testRuntimeDatabaseURL,
+			Host:       "localhost",
+			User:       "user",
+			Name:       "db",
+		},
+		Redis: RedisConfig{Host: "localhost"},
 		RateLimit: RateLimitConfig{
 			Requests:                  100,
 			Window:                    time.Hour,
@@ -352,7 +563,7 @@ func TestValidate_AgentEndpointContract(t *testing.T) {
 		{
 			name: "API resource has trailing slash",
 			mutate: func(cfg *Config) {
-				cfg.Agent.APIResourceURL = "https://desk.internal.example/api/v1/"
+				cfg.Agent.APIResourceURL = "https://desk.internal.example/api/v2/"
 			},
 			wantErr: "API resource URL",
 		},
@@ -369,7 +580,7 @@ func TestValidate_AgentEndpointContract(t *testing.T) {
 				cfg.App.URL = "https://desk.internal.example/base"
 				cfg.Agent.Issuer = cfg.App.URL
 				cfg.Agent.MCPResourceURL = cfg.App.URL + "/mcp"
-				cfg.Agent.APIResourceURL = cfg.App.URL + "/api/v1"
+				cfg.Agent.APIResourceURL = cfg.App.URL + "/api/v2"
 				cfg.Agent.A2AResourceURL = cfg.App.URL + "/a2a/v1"
 			},
 			wantErr: "canonical origin",
@@ -380,7 +591,7 @@ func TestValidate_AgentEndpointContract(t *testing.T) {
 				cfg.App.URL = "http://desk.internal.example"
 				cfg.Agent.Issuer = cfg.App.URL
 				cfg.Agent.MCPResourceURL = cfg.App.URL + "/mcp"
-				cfg.Agent.APIResourceURL = cfg.App.URL + "/api/v1"
+				cfg.Agent.APIResourceURL = cfg.App.URL + "/api/v2"
 				cfg.Agent.A2AResourceURL = cfg.App.URL + "/a2a/v1"
 			},
 			wantErr: "HTTPS",

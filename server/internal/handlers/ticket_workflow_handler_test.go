@@ -158,14 +158,15 @@ func setupWorkflowHandlerTest(
 
 func TestTicketStatsUsesAuthenticatedUserRole(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	handler, _, agent, _, _, _ := setupWorkflowHandlerTest(t)
+	handler, db, agent, _, _, _ := setupWorkflowHandlerTest(t)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", agent.ID)
-		c.Set("user_role", "agent")
+		c.Set(projectRoleContextKey, string(models.ProjectRoleAgent))
 		c.Next()
 	})
+	router.Use(handlerTestProjectMiddleware(t, db))
 	router.GET("/tickets/stats", handler.GetTicketStats)
 
 	req := httptest.NewRequest(http.MethodGet, "/tickets/stats", nil)
@@ -192,14 +193,15 @@ func TestTicketStatsUsesAuthenticatedUserRole(t *testing.T) {
 
 func TestUpdateTicketStatusRejectsUnknownStatus(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	handler, _, agent, _, ticket, _ := setupWorkflowHandlerTest(t)
+	handler, db, agent, _, ticket, _ := setupWorkflowHandlerTest(t)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", agent.ID)
-		c.Set("user_role", "agent")
+		c.Set(projectRoleContextKey, string(models.ProjectRoleAgent))
 		c.Next()
 	})
+	router.Use(handlerTestProjectMiddleware(t, db))
 	router.POST("/tickets/:id/status", handler.UpdateTicketStatus)
 
 	body := bytes.NewBufferString(`{"status":"reopened","comment":"invalid state"}`)
@@ -215,14 +217,15 @@ func TestUpdateTicketStatusRejectsUnknownStatus(t *testing.T) {
 
 func TestAgentCannotWorkflowTicketAssignedToAnotherAgent(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	handler, _, agent, _, _, otherTicket := setupWorkflowHandlerTest(t)
+	handler, db, agent, _, _, otherTicket := setupWorkflowHandlerTest(t)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", agent.ID)
-		c.Set("user_role", "agent")
+		c.Set(projectRoleContextKey, string(models.ProjectRoleAgent))
 		c.Next()
 	})
+	router.Use(handlerTestProjectMiddleware(t, db))
 	router.POST("/tickets/:id/status", handler.UpdateTicketStatus)
 
 	body := bytes.NewBufferString(`{"status":"in_progress"}`)
@@ -281,7 +284,11 @@ func TestCustomerQueueAndAggregateQueriesAreObjectScoped(t *testing.T) {
 		t.Fatalf("create private ticket: %v", err)
 	}
 
-	stats, err := handler.ticketService.GetTicketStatistics(customer.ID, "customer")
+	stats, err := handler.ticketService.GetTicketStatistics(
+		handlerTestRequestContext(t, db, customer.ID),
+		customer.ID,
+		string(models.ProjectRoleRequester),
+	)
 	if err != nil {
 		t.Fatalf("customer stats: %v", err)
 	}
@@ -292,14 +299,22 @@ func TestCustomerQueueAndAggregateQueriesAreObjectScoped(t *testing.T) {
 			stats.MyTickets,
 		)
 	}
-	overdue, overdueTotal, err := handler.ticketService.GetOverdueTickets(customer.ID, "customer")
+	overdue, overdueTotal, err := handler.ticketService.GetOverdueTickets(
+		handlerTestRequestContext(t, db, customer.ID),
+		customer.ID,
+		string(models.ProjectRoleRequester),
+	)
 	if err != nil {
 		t.Fatalf("customer overdue tickets: %v", err)
 	}
 	if overdueTotal != 1 || len(overdue) != 1 || overdue[0].ID != own.ID {
 		t.Fatalf("customer overdue query was not object scoped: total=%d tickets=%+v", overdueTotal, overdue)
 	}
-	breached, breachedTotal, err := handler.ticketService.GetSLABreachedTickets(customer.ID, "customer")
+	breached, breachedTotal, err := handler.ticketService.GetSLABreachedTickets(
+		handlerTestRequestContext(t, db, customer.ID),
+		customer.ID,
+		string(models.ProjectRoleRequester),
+	)
 	if err != nil {
 		t.Fatalf("customer SLA tickets: %v", err)
 	}
@@ -310,9 +325,10 @@ func TestCustomerQueueAndAggregateQueriesAreObjectScoped(t *testing.T) {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", customer.ID)
-		c.Set("user_role", "customer")
+		c.Set(projectRoleContextKey, string(models.ProjectRoleRequester))
 		c.Next()
 	})
+	router.Use(handlerTestProjectMiddleware(t, db))
 	router.GET("/tickets/unassigned", handler.GetUnassignedTickets)
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/tickets/unassigned", nil))
@@ -359,9 +375,10 @@ func TestCustomerSpecialListsUseSafeTicketDTO(t *testing.T) {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", customer.ID)
-		c.Set("user_role", "customer")
+		c.Set(projectRoleContextKey, string(models.ProjectRoleRequester))
 		c.Next()
 	})
+	router.Use(handlerTestProjectMiddleware(t, db))
 	router.GET("/tickets/my", handler.GetMyTickets)
 	router.GET("/tickets/overdue", handler.GetOverdueTickets)
 	router.GET("/tickets/sla-breach", handler.GetSLABreachedTickets)
@@ -434,9 +451,10 @@ func TestCustomerHistoryUsesVisibleNarrowDTO(t *testing.T) {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", customer.ID)
-		c.Set("user_role", "customer")
+		c.Set(projectRoleContextKey, string(models.ProjectRoleRequester))
 		c.Next()
 	})
+	router.Use(handlerTestProjectMiddleware(t, db))
 	router.GET("/tickets/:id/history", handler.GetTicketHistory)
 	response := httptest.NewRecorder()
 	router.ServeHTTP(
@@ -483,9 +501,10 @@ func TestAuthorizedAgentWorkflowVersionIsBoundToCAS(t *testing.T) {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", agent.ID)
-		c.Set("user_role", "agent")
+		c.Set(projectRoleContextKey, string(models.ProjectRoleAgent))
 		c.Next()
 	})
+	router.Use(handlerTestProjectMiddleware(t, db))
 	router.POST("/tickets/:id/status", handler.UpdateTicketStatus)
 	request := httptest.NewRequest(
 		http.MethodPost,
@@ -531,9 +550,10 @@ func TestAuthorizedAgentUpdateVersionIsBoundToCAS(t *testing.T) {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", agent.ID)
-		c.Set("user_role", "agent")
+		c.Set(projectRoleContextKey, string(models.ProjectRoleAgent))
 		c.Next()
 	})
+	router.Use(handlerTestProjectMiddleware(t, db))
 	router.PATCH("/tickets/:id", handler.UpdateTicket)
 	request := httptest.NewRequest(
 		http.MethodPatch,

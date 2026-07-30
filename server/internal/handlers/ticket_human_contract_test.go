@@ -102,6 +102,7 @@ func (s *recordingVersionedTicketService) UpdateTicketStatusExpectedVersion(
 type recordingCreateTicketService struct {
 	services.TicketServiceInterface
 	request *models.TicketCreateRequest
+	err     error
 }
 
 func (s *recordingCreateTicketService) CreateTicket(
@@ -111,6 +112,9 @@ func (s *recordingCreateTicketService) CreateTicket(
 ) (*models.Ticket, error) {
 	copy := *request
 	s.request = &copy
+	if s.err != nil {
+		return nil, s.err
+	}
 	return &models.Ticket{
 		ID:          1,
 		Title:       copy.Title,
@@ -288,19 +292,19 @@ func TestHumanTicketCreateTrimsRequiredTextAndRejectsBlankValues(t *testing.T) {
 	}{
 		{
 			name:       "trim",
-			body:       `{"title":"  标题  ","description":"  描述  ","type":"request","priority":"normal","source":"web"}`,
+			body:       `{"title":"  标题  ","description":"  描述  ","type":"request","priority":"normal","source":"web","request_type_version_id":"00000000-0000-7000-8000-000000000102"}`,
 			wantStatus: http.StatusCreated,
 			wantTitle:  "标题",
 			wantBody:   "描述",
 		},
 		{
 			name:       "blank title",
-			body:       `{"title":" \t\n ","description":"描述","type":"request","priority":"normal","source":"web"}`,
+			body:       `{"title":" \t\n ","description":"描述","type":"request","priority":"normal","source":"web","request_type_version_id":"00000000-0000-7000-8000-000000000102"}`,
 			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name:       "blank description",
-			body:       `{"title":"标题","description":" \t\n ","type":"request","priority":"normal","source":"web"}`,
+			body:       `{"title":"标题","description":" \t\n ","type":"request","priority":"normal","source":"web","request_type_version_id":"00000000-0000-7000-8000-000000000102"}`,
 			wantStatus: http.StatusBadRequest,
 		},
 	} {
@@ -343,6 +347,36 @@ func TestHumanTicketCreateTrimsRequiredTextAndRejectsBlankValues(t *testing.T) {
 			assertHumanProblem(t, response, http.StatusBadRequest, "invalid_request")
 		})
 	}
+}
+
+func TestHumanTicketCreateMapsDomainMembershipDenialToForbidden(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service := &recordingCreateTicketService{
+		err: services.ErrTicketCreateAccessDenied,
+	}
+	handler := NewTicketHandler(service)
+	user := models.User{ID: 7, Role: models.RoleAdmin}
+	router := humanTicketTestRouter(user, func(router *gin.Engine) {
+		router.POST("/tickets", handler.CreateTicket)
+	})
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/tickets",
+		bytes.NewBufferString(
+			`{"title":"标题","description":"描述","type":"request","priority":"normal","source":"web","request_type_version_id":"00000000-0000-7000-8000-000000000102"}`,
+		),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	assertHumanProblem(
+		t,
+		response,
+		http.StatusForbidden,
+		"ticket_create_access_denied",
+	)
 }
 
 func TestCustomerHistoryRedactsInternalAndAssignmentRecords(t *testing.T) {
@@ -500,6 +534,32 @@ func humanTicketTestRouter(
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", user.ID)
 		c.Set("user_role", string(user.Role))
+		projectRole := models.ProjectRoleRequester
+		switch user.Role {
+		case models.RoleAdmin:
+			projectRole = models.ProjectRoleAdmin
+		case models.RoleSupervisor:
+			projectRole = models.ProjectRoleManager
+		case models.RoleAgent:
+			projectRole = models.ProjectRoleAgent
+		}
+		c.Set(projectRoleContextKey, string(projectRole))
+		requestContext, err := services.WithOperationContext(
+			c.Request.Context(),
+			services.OperationContext{
+				Scope: models.ProjectScope{
+					OrganizationID: 1,
+					ProjectID:      1,
+				},
+				Actor:  models.HumanActor(user.ID),
+				Source: services.SourceProtocolHumanREST,
+			},
+		)
+		if err != nil {
+			c.AbortWithStatus(http.StatusInternalServerError)
+			return
+		}
+		c.Request = c.Request.WithContext(requestContext)
 		c.Next()
 	})
 	register(router)

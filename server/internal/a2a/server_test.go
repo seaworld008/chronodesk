@@ -64,6 +64,37 @@ func TestAgentCardSupportsDiscoveryAndConditionalGET(t *testing.T) {
 		if _, exists := wantSkills[skill.ID]; exists {
 			wantSkills[skill.ID] = true
 		}
+		if len(skill.InputModes) != 1 || skill.InputModes[0] != "application/json" {
+			t.Errorf("skill %q advertises non-structured input modes: %#v", skill.ID, skill.InputModes)
+		}
+		for _, example := range skill.Examples {
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(example), &payload); err != nil {
+				t.Errorf("skill %q example is not structured JSON: %v", skill.ID, err)
+			}
+			if payload["skill"] != skill.ID {
+				t.Errorf("skill %q example has mismatched skill: %#v", skill.ID, payload["skill"])
+			}
+			input, ok := payload["input"].(map[string]any)
+			if !ok {
+				t.Errorf("skill %q example is missing an input object", skill.ID)
+				continue
+			}
+			if skill.ID == "ticket-intake" {
+				for _, field := range []string{
+					"request_type_version_id",
+					"workflow_version_id",
+				} {
+					value, isString := input[field].(string)
+					if !isString || strings.TrimSpace(value) == "" {
+						t.Errorf(
+							"ticket-intake example is missing %s",
+							field,
+						)
+					}
+				}
+			}
+		}
 	}
 	for skill, found := range wantSkills {
 		if !found {
@@ -355,6 +386,117 @@ func TestJSONRPCRejectsNonCanonicalParameterFieldsBeforeDispatch(t *testing.T) {
 	}
 }
 
+func TestA2ASendMethodsRequireAuthenticatedProjectMetadataAndIgnoreTenant(t *testing.T) {
+	var backendCalls int
+	server := newTestServer(t, BackendFuncs{
+		ProcessFunc: func(context.Context, Task, Message, Reporter) error {
+			backendCalls++
+			return nil
+		},
+	})
+	router := gin.New()
+	registerTestServerRoutes(router, server)
+
+	tests := []struct {
+		name   string
+		method string
+		params map[string]any
+		reason string
+	}{
+		{
+			name:   "send missing project metadata",
+			method: "SendMessage",
+			params: map[string]any{
+				"message": validInboundMessageParams("scope-missing"),
+			},
+			reason: "PROJECT_SCOPE_REQUIRED",
+		},
+		{
+			name:   "send mismatched project metadata",
+			method: "SendMessage",
+			params: map[string]any{
+				"message": validInboundMessageParams("scope-mismatch"),
+				"metadata": map[string]any{
+					MetadataProjectKey: "OTHER",
+				},
+			},
+			reason: "PROJECT_SCOPE_MISMATCH",
+		},
+		{
+			name:   "stream mismatched project metadata",
+			method: "SendStreamingMessage",
+			params: map[string]any{
+				"message": validInboundMessageParams("stream-scope-mismatch"),
+				"metadata": map[string]any{
+					MetadataProjectKey: "OTHER",
+				},
+			},
+			reason: "PROJECT_SCOPE_MISMATCH",
+		},
+		{
+			name:   "nested message metadata cannot override project",
+			method: "SendMessage",
+			params: map[string]any{
+				"message": map[string]any{
+					"messageId": "nested-scope-mismatch",
+					"role":      "ROLE_USER",
+					"parts":     []any{map[string]any{"text": "strict request"}},
+					"metadata": map[string]any{
+						MetadataProjectKey: "OTHER",
+					},
+				},
+				"metadata": map[string]any{
+					MetadataProjectKey: a2aTestProjectKey,
+				},
+			},
+			reason: "PROJECT_SCOPE_MISMATCH",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := rawRPCBody(t, test.method, test.params)
+			request := httptest.NewRequest(http.MethodPost, RPCPath, bytes.NewReader(body))
+			request = request.WithContext(a2aTestContext(t))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("A2A-Version", ProtocolVersion)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			var response rpcEnvelope
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode project-scope error: %v (%s)", err, recorder.Body.String())
+			}
+			if response.Error == nil || response.Error.Code != -32602 {
+				t.Fatalf("project-scope error=%#v", response.Error)
+			}
+			if got := rpcErrorReason(t, response.Error); got != test.reason {
+				t.Fatalf("project-scope reason=%q, want %q", got, test.reason)
+			}
+		})
+	}
+	if backendCalls != 0 {
+		t.Fatalf("invalid project assertions reached backend %d times", backendCalls)
+	}
+
+	// tenant is an opaque A2A compatibility field. It cannot select or
+	// override the project already bound by OAuth.
+	accepted := rpcCall(t, router, "SendMessage", map[string]any{
+		"tenant":  "OTHER",
+		"message": validInboundMessageParams("tenant-is-not-project"),
+		"metadata": map[string]any{
+			MetadataProjectKey: a2aTestProjectKey,
+		},
+	})
+	if accepted.Error != nil {
+		t.Fatalf("opaque tenant was treated as project scope: %#v", accepted.Error)
+	}
+	if backendCalls != 1 {
+		t.Fatalf("valid authenticated project reached backend %d times, want 1", backendCalls)
+	}
+}
+
 func TestJSONRPCIgnoresForwardCompatibleUnknownFieldsWithoutReflectingThem(t *testing.T) {
 	var backendCalls int
 	server := newTestServer(t, BackendFuncs{
@@ -497,6 +639,7 @@ func TestStreamingContinuationResubmitsAndIgnoresHistoricalInterruptedEvent(t *t
 		},
 	})
 	request := httptest.NewRequest(http.MethodPost, "/a2a/v1", bytes.NewReader(body))
+	request = request.WithContext(a2aTestContext(t))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("A2A-Version", ProtocolVersion)
 	recorder := httptest.NewRecorder()
@@ -559,6 +702,7 @@ func TestStreamingReplayUsesLastEventID(t *testing.T) {
 		},
 	})
 	streamRequest := httptest.NewRequest(http.MethodPost, "/a2a/v1", bytes.NewReader(streamBody))
+	streamRequest = streamRequest.WithContext(a2aTestContext(t))
 	streamRequest.Header.Set("Content-Type", "application/json")
 	streamRequest.Header.Set("A2A-Version", ProtocolVersion)
 	streamRecorder := httptest.NewRecorder()
@@ -633,6 +777,7 @@ func TestStreamingIdempotentReplayOfTerminalTaskReturnsSnapshot(t *testing.T) {
 		RPCPath,
 		bytes.NewReader(body),
 	)
+	request = request.WithContext(a2aTestContext(t))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("A2A-Version", ProtocolVersion)
 	recorder := httptest.NewRecorder()
@@ -1247,6 +1392,7 @@ func rpcCall(t *testing.T, router http.Handler, method string, params any) rpcEn
 	t.Helper()
 	body := rpcBody(t, method, params)
 	request := httptest.NewRequest(http.MethodPost, "/a2a/v1", bytes.NewReader(body))
+	request = request.WithContext(a2aTestContext(t))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("A2A-Version", ProtocolVersion)
 	recorder := httptest.NewRecorder()
@@ -1263,6 +1409,12 @@ func rpcCall(t *testing.T, router http.Handler, method string, params any) rpcEn
 
 func rpcBody(t *testing.T, method string, params any) []byte {
 	t.Helper()
+	params = withA2ATestProjectMetadata(method, params)
+	return rawRPCBody(t, method, params)
+}
+
+func rawRPCBody(t *testing.T, method string, params any) []byte {
+	t.Helper()
 	body, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      "request-1",
@@ -1273,6 +1425,58 @@ func rpcBody(t *testing.T, method string, params any) []byte {
 		t.Fatalf("marshal RPC body: %v", err)
 	}
 	return body
+}
+
+func rpcErrorReason(t *testing.T, rpcErr *JSONRPCError) string {
+	t.Helper()
+	if rpcErr == nil || len(rpcErr.Data) != 1 {
+		t.Fatalf("expected one canonical ErrorInfo, got %#v", rpcErr)
+	}
+	detail, ok := rpcErr.Data[0].(map[string]any)
+	if !ok {
+		t.Fatalf("canonical ErrorInfo has type %T", rpcErr.Data[0])
+	}
+	reason, ok := detail["reason"].(string)
+	if !ok {
+		t.Fatalf("canonical ErrorInfo has no reason: %#v", detail)
+	}
+	return reason
+}
+
+func withA2ATestProjectMetadata(method string, params any) any {
+	if method != "SendMessage" && method != "SendStreamingMessage" {
+		return params
+	}
+	switch value := params.(type) {
+	case map[string]any:
+		cloned := make(map[string]any, len(value)+1)
+		for key, item := range value {
+			cloned[key] = item
+		}
+		metadata := make(map[string]any)
+		if existing, ok := value["metadata"].(map[string]any); ok {
+			for key, item := range existing {
+				metadata[key] = item
+			}
+		}
+		if _, exists := metadata[MetadataProjectKey]; !exists {
+			metadata[MetadataProjectKey] = a2aTestProjectKey
+		}
+		cloned["metadata"] = metadata
+		return cloned
+	case SendMessageParams:
+		cloned := value
+		cloned.Metadata = cloneMap(value.Metadata)
+		if cloned.Metadata == nil {
+			cloned.Metadata = make(map[string]any)
+		}
+		if _, exists := cloned.Metadata[MetadataProjectKey]; !exists {
+			cloned.Metadata[MetadataProjectKey] = a2aTestProjectKey
+		}
+		return cloned
+	default:
+		return params
+	}
 }
 
 func decodeResult(t *testing.T, raw json.RawMessage, target any) {

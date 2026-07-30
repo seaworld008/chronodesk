@@ -178,10 +178,12 @@ func DefaultAgentCard(opts CardOptions) AgentCard {
 			{
 				ID:          "ticket-intake",
 				Name:        "Ticket Intake",
-				Description: "Create a structured ticket from untrusted user-provided content.",
+				Description: "Create a structured ticket using explicitly selected published request-type and workflow versions.",
 				Tags:        []string{"tickets", "intake", "create"},
-				Examples:    []string{"Create a high-priority incident ticket for an API outage."},
-				InputModes:  []string{"text/plain", "application/json"},
+				Examples: []string{
+					`{"skill":"ticket-intake","input":{"title":"API outage","description":"The public API is unavailable.","type":"incident","priority":"high","request_type_version_id":"018f0f95-9e85-7a2b-8c3d-1234567890ab","workflow_version_id":"018f0f95-9e85-7a2b-8c3d-1234567890ac"}}`,
+				},
+				InputModes:  []string{"application/json"},
 				OutputModes: []string{"application/json"},
 				SecurityRequirements: skillSecurityRequirements(
 					"tasks:manage",
@@ -193,8 +195,8 @@ func DefaultAgentCard(opts CardOptions) AgentCard {
 				Name:        "Ticket Query",
 				Description: "Retrieve an authorized ticket snapshot and its progress.",
 				Tags:        []string{"tickets", "query", "status"},
-				Examples:    []string{"Show the current status of ticket CD-2026-001."},
-				InputModes:  []string{"text/plain", "application/json"},
+				Examples:    []string{`{"skill":"ticket-query","input":{"ticket_id":42}}`},
+				InputModes:  []string{"application/json"},
 				OutputModes: []string{"application/json"},
 				SecurityRequirements: skillSecurityRequirements(
 					"tasks:manage",
@@ -206,8 +208,10 @@ func DefaultAgentCard(opts CardOptions) AgentCard {
 				Name:        "Ticket Work",
 				Description: "Perform policy-authorized work against a linked ticket.",
 				Tags:        []string{"tickets", "workflow", "automation"},
-				Examples:    []string{"Claim this ticket and record the investigation result."},
-				InputModes:  []string{"text/plain", "application/json"},
+				Examples: []string{
+					`{"skill":"ticket-work","input":{"operation":"claim","ticket_id":42,"expected_version":3,"lease_seconds":300}}`,
+				},
+				InputModes:  []string{"application/json"},
 				OutputModes: []string{"text/plain", "application/json"},
 				SecurityRequirements: skillSecurityRequirements(
 					"tasks:manage",
@@ -222,8 +226,10 @@ func DefaultAgentCard(opts CardOptions) AgentCard {
 				Name:        "Ticket Comment",
 				Description: "Add a public or internal comment to an authorized ticket.",
 				Tags:        []string{"tickets", "comments", "collaboration"},
-				Examples:    []string{"Add an internal note with the diagnostic evidence."},
-				InputModes:  []string{"text/plain", "application/json"},
+				Examples: []string{
+					`{"skill":"ticket-comment","input":{"ticket_id":42,"expected_version":3,"lease_id":"lease-id","content":"Diagnostic evidence attached.","type":"internal"}}`,
+				},
+				InputModes:  []string{"application/json"},
 				OutputModes: []string{"application/json"},
 				SecurityRequirements: skillSecurityRequirements(
 					"tasks:manage",
@@ -236,8 +242,10 @@ func DefaultAgentCard(opts CardOptions) AgentCard {
 				Name:        "Ticket Escalation",
 				Description: "Escalate a ticket when policy and SLA conditions permit.",
 				Tags:        []string{"tickets", "escalation", "sla"},
-				Examples:    []string{"Escalate this breached critical incident."},
-				InputModes:  []string{"text/plain", "application/json"},
+				Examples: []string{
+					`{"skill":"ticket-escalation","input":{"ticket_id":42,"expected_version":3,"lease_id":"lease-id","reason":"SLA breached","priority":"critical"}}`,
+				},
+				InputModes:  []string{"application/json"},
 				OutputModes: []string{"application/json"},
 				SecurityRequirements: skillSecurityRequirements(
 					"tasks:manage",

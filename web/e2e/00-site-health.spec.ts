@@ -22,6 +22,7 @@ const navigationItems = [
     '用户管理',
     '自动化规则',
     '自动化日志',
+    'Webhook 集成',
     '系统设置',
     'AI 智能体控制',
     '账号安全',
@@ -434,7 +435,7 @@ test.describe('全站一级页面健康巡航', () => {
 
         await page.unrouteAll({ behavior: 'wait' });
         await page.route(
-            '**/api/v1/admin/agent-control/overview',
+            '**/api/projects/*/admin/agents/agent-control/overview',
             async (route) => {
                 await route.fulfill({
                     status: 503,

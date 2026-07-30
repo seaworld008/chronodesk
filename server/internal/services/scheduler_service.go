@@ -12,6 +12,7 @@ import (
 	"github.com/robfig/cron/v3"
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"gorm.io/gorm"
 )
 
@@ -61,9 +62,22 @@ const (
 	defaultSchedulerLeaseTTL      = 30 * time.Second
 	defaultSchedulerRedisTimeout  = 2 * time.Second
 	minimumSchedulerLeaseRenewals = 3
+	maxSystemWorkerProjects       = 1000
+	systemWorkerTicketBatchSize   = 100
+	schedulerSystemActorID        = "scheduler"
+	outboxSystemActorID           = "outbox-delivery-worker"
 )
 
-var ErrSchedulerStopped = errors.New("scheduler has been stopped")
+var (
+	ErrSchedulerStopped         = errors.New("scheduler has been stopped")
+	ErrSystemWorkerProjectLimit = errors.New("system worker project limit exceeded")
+	ErrSystemWorkerContext      = errors.New("invalid system worker context")
+)
+
+type systemWorkerProject struct {
+	Scope models.ProjectScope
+	Key   models.ProjectKey
+}
 
 type schedulerServiceOptions struct {
 	leaseTTL              time.Duration
@@ -509,51 +523,219 @@ func (s *SchedulerService) slaCheckHandler(ctx context.Context) error {
 
 // automationRulesHandler 自动化规则处理器
 func (s *SchedulerService) automationRulesHandler(ctx context.Context) error {
-	const batchSize = 50
-	hasActiveRules, err := s.automationService.HasActiveRules(
+	actor := models.SystemActor(schedulerSystemActorID)
+	projects, err := systemWorkerProjects(ctx, s.db, actor)
+	if err != nil {
+		return err
+	}
+	processed := 0
+	var projectErrors []error
+	for _, project := range projects {
+		projectProcessed, projectErr := s.automationRulesInProject(
+			ctx,
+			project,
+			actor,
+		)
+		processed += projectProcessed
+		if projectErr != nil {
+			projectErrors = append(
+				projectErrors,
+				fmt.Errorf(
+					"scheduled automation project %s: %w",
+					project.Key,
+					projectErr,
+				),
+			)
+		}
+	}
+	log.Printf("Automation rules scheduler processed %d tickets", processed)
+	return errors.Join(projectErrors...)
+}
+
+func (s *SchedulerService) automationRulesInProject(
+	ctx context.Context,
+	project systemWorkerProject,
+	actor models.ActorRef,
+) (int, error) {
+	hasActiveRules := false
+	if err := runSystemProjectOperation(
 		ctx,
-		eventcontract.AutomationScheduledCheckEventType,
+		s.db,
+		project.Scope,
+		actor,
+		"",
+		"",
+		func(projectCtx context.Context) error {
+			var err error
+			hasActiveRules, err = s.automationService.HasActiveRules(
+				projectCtx,
+				eventcontract.AutomationScheduledCheckEventType,
+			)
+			return err
+		},
+	); err != nil {
+		return 0, err
+	}
+	if !hasActiveRules {
+		return 0, nil
+	}
+
+	processed := 0
+	lastID := uint(0)
+	var ticketErrors []error
+	for {
+		if err := ctx.Err(); err != nil {
+			return processed, errors.Join(errors.Join(ticketErrors...), err)
+		}
+		tickets := make([]models.Ticket, 0, systemWorkerTicketBatchSize)
+		if err := runSystemProjectOperation(
+			ctx,
+			s.db,
+			project.Scope,
+			actor,
+			"",
+			"",
+			func(projectCtx context.Context) error {
+				return s.db.WithContext(projectCtx).
+					Where(
+						"organization_id = ? AND project_id = ? AND id > ? AND status IN ?",
+						project.Scope.OrganizationID,
+						project.Scope.ProjectID,
+						lastID,
+						[]models.TicketStatus{
+							models.TicketStatusOpen,
+							models.TicketStatusInProgress,
+						},
+					).
+					Order("id ASC").
+					Limit(systemWorkerTicketBatchSize).
+					Find(&tickets).Error
+			},
+		); err != nil {
+			return processed, errors.Join(
+				errors.Join(ticketErrors...),
+				fmt.Errorf("load scheduled automation tickets: %w", err),
+			)
+		}
+		if len(tickets) == 0 {
+			break
+		}
+		for index := range tickets {
+			ticket := tickets[index]
+			if err := runSystemProjectOperation(
+				ctx,
+				s.db,
+				project.Scope,
+				actor,
+				"",
+				"",
+				func(projectCtx context.Context) error {
+					return s.automationService.EnqueueScheduledCheck(
+						projectCtx,
+						&ticket,
+					)
+				},
+			); err != nil {
+				ticketErrors = append(
+					ticketErrors,
+					fmt.Errorf(
+						"enqueue scheduled automation ticket %d: %w",
+						ticket.ID,
+						err,
+					),
+				)
+			}
+			processed++
+			lastID = ticket.ID
+		}
+		if len(tickets) < systemWorkerTicketBatchSize {
+			break
+		}
+	}
+	return processed, errors.Join(ticketErrors...)
+}
+
+// systemWorkerProjects resolves the server-owned project set. A caller may
+// supply one already-trusted worker OperationContext to restrict an explicit
+// retry to one project; global scheduler invocations enumerate only active
+// projects from the control table, never a project-owned business table.
+func systemWorkerProjects(
+	ctx context.Context,
+	db *gorm.DB,
+	actor models.ActorRef,
+) ([]systemWorkerProject, error) {
+	if ctx == nil || db == nil || actor.Type != models.ActorTypeSystem {
+		return nil, ErrSystemWorkerContext
+	}
+	if operation, err := OperationContextFromContext(ctx); err == nil {
+		if operation.Actor != actor ||
+			operation.Source != SourceProtocolWorker {
+			return nil, ErrSystemWorkerContext
+		}
+		return []systemWorkerProject{{
+			Scope: operation.Scope,
+		}}, nil
+	}
+	var projects []models.Project
+	if err := db.WithContext(ctx).
+		Select("id", "organization_id", "key").
+		Where("status = ?", models.ProjectStatusActive).
+		Order("organization_id ASC, id ASC").
+		Limit(maxSystemWorkerProjects + 1).
+		Find(&projects).Error; err != nil {
+		return nil, fmt.Errorf("list system worker projects: %w", err)
+	}
+	if len(projects) > maxSystemWorkerProjects {
+		return nil, ErrSystemWorkerProjectLimit
+	}
+	result := make([]systemWorkerProject, 0, len(projects))
+	for index := range projects {
+		scope := projects[index].Scope()
+		if err := scope.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid system worker project: %w", err)
+		}
+		result = append(result, systemWorkerProject{
+			Scope: scope,
+			Key:   projects[index].Key,
+		})
+	}
+	return result, nil
+}
+
+// runSystemProjectOperation binds both trusted ActorRef provenance and the
+// transaction-local PostgreSQL RLS scope. The callback must contain database
+// work only; network, model and file I/O must run after it returns.
+func runSystemProjectOperation(
+	ctx context.Context,
+	db *gorm.DB,
+	scope models.ProjectScope,
+	actor models.ActorRef,
+	traceID string,
+	correlationID string,
+	fn func(context.Context) error,
+) error {
+	if fn == nil {
+		return ErrSystemWorkerContext
+	}
+	projectCtx, err := EnsureSystemProjectOperationContext(
+		ctx,
+		scope,
+		actor,
+		traceID,
+		correlationID,
 	)
 	if err != nil {
 		return err
 	}
-	if !hasActiveRules {
-		log.Printf("Automation rules scheduler skipped: no active scheduled CloudEvent rules")
-		return nil
+	if scopeddb.HasTransaction(projectCtx) {
+		return fn(projectCtx)
 	}
-
-	var (
-		tickets   []models.Ticket
-		processed int
+	return scopeddb.WithProjectScopeContextTransaction(
+		projectCtx,
+		db,
+		scope,
+		fn,
 	)
-
-	result := s.db.WithContext(ctx).
-		Where("status IN ?", []string{"open", "in_progress"}).
-		Order("id ASC").
-		FindInBatches(&tickets, batchSize, func(tx *gorm.DB, batch int) error {
-			for i := range tickets {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-
-				if err := s.automationService.EnqueueScheduledCheck(tx.Statement.Context, &tickets[i]); err != nil {
-					log.Printf("Failed to execute automation rules for ticket %d: %v", tickets[i].ID, err)
-				}
-				processed++
-			}
-			return nil
-		})
-
-	if result.Error != nil && !errors.Is(result.Error, context.Canceled) {
-		return fmt.Errorf("failed to process automation rules: %w", result.Error)
-	}
-
-	if errors.Is(result.Error, context.Canceled) {
-		return result.Error
-	}
-
-	log.Printf("Automation rules scheduler processed %d tickets", processed)
-	return nil
 }
 
 // cleanupHandler 清理处理器
@@ -585,26 +767,73 @@ func (s *SchedulerService) cleanupHandler(ctx context.Context) error {
 
 // updateStatisticsHandler 更新统计数据处理器
 func (s *SchedulerService) updateStatisticsHandler(ctx context.Context) error {
-	// 这里可以更新各种统计信息
-	// 例如：工单处理速度、用户活跃度、系统性能指标等
 	log.Println("Updating system statistics...")
-
-	// 更新SLA合规率
-	var slaConfigs []models.SLAConfig
-	if err := s.db.WithContext(ctx).Where("is_active = ?", true).Find(&slaConfigs).Error; err != nil {
-		return fmt.Errorf("failed to get SLA configs: %w", err)
+	actor := models.SystemActor(schedulerSystemActorID)
+	projects, err := systemWorkerProjects(ctx, s.db, actor)
+	if err != nil {
+		return err
 	}
-
 	var updateErrors []error
-	for _, config := range slaConfigs {
-		if config.AppliedCount > 0 {
-			complianceRate := float64(config.AppliedCount-config.ViolationCount) / float64(config.AppliedCount) * 100
-			if err := s.db.WithContext(ctx).Model(&config).Update("compliance_rate", complianceRate).Error; err != nil {
-				updateErrors = append(
-					updateErrors,
-					fmt.Errorf("update compliance rate for SLA config %d: %w", config.ID, err),
-				)
-			}
+	for _, project := range projects {
+		if err := runSystemProjectOperation(
+			ctx,
+			s.db,
+			project.Scope,
+			actor,
+			"",
+			"",
+			func(projectCtx context.Context) error {
+				var slaConfigs []models.SLAConfig
+				if err := s.db.WithContext(projectCtx).
+					Where(
+						"organization_id = ? AND project_id = ? AND is_active = ?",
+						project.Scope.OrganizationID,
+						project.Scope.ProjectID,
+						true,
+					).
+					Find(&slaConfigs).Error; err != nil {
+					return fmt.Errorf("load project SLA configs: %w", err)
+				}
+				var projectErrors []error
+				for index := range slaConfigs {
+					config := &slaConfigs[index]
+					if config.AppliedCount == 0 {
+						continue
+					}
+					complianceRate := float64(
+						config.AppliedCount-config.ViolationCount,
+					) / float64(config.AppliedCount) * 100
+					result := s.db.WithContext(projectCtx).
+						Model(&models.SLAConfig{}).
+						Where(
+							"id = ? AND organization_id = ? AND project_id = ?",
+							config.ID,
+							project.Scope.OrganizationID,
+							project.Scope.ProjectID,
+						).
+						Update("compliance_rate", complianceRate)
+					if result.Error != nil {
+						projectErrors = append(
+							projectErrors,
+							fmt.Errorf(
+								"update compliance rate for SLA config %d: %w",
+								config.ID,
+								result.Error,
+							),
+						)
+					}
+				}
+				return errors.Join(projectErrors...)
+			},
+		); err != nil {
+			updateErrors = append(
+				updateErrors,
+				fmt.Errorf(
+					"update statistics for project %s: %w",
+					project.Key,
+					err,
+				),
+			)
 		}
 	}
 

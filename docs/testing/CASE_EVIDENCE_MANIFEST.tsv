@@ -59,7 +59,7 @@ TKT-009	hybrid	go@server/internal/services/ticket_service_agent_native_test.go::
 TKT-010	hybrid	go@server/internal/services/agent_native_assignment_test.go::TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules;pytest@server/tests/tickets/test_lifecycle.py::test_full_lifecycle	not_recorded
 TKT-011	automated	go@server/internal/services/agent_native_assignment_test.go::TestAgentNativeAssignmentErrorCodesAreStable	not_recorded
 TKT-012	automated	go@server/internal/services/agent_native_assignment_test.go::TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules	not_recorded
-TKT-013	hybrid	go@server/internal/models/ticket_test.go::TestTicketStatusTransitions;pytest@server/tests/tickets/test_lifecycle.py::test_full_lifecycle	not_recorded
+TKT-013	hybrid	go@server/internal/services/ticket_configuration_runtime_test.go::TestTicketTransitionUsesStoredWorkflowVersionInsteadOfHardcodedLifecycle;pytest@server/tests/tickets/test_lifecycle.py::test_full_lifecycle	not_recorded
 TKT-014	automated	pytest@server/tests/human/test_ticket_workflow_contracts.py::test_invalid_transition_is_a_versioned_conflict_with_allowed_next_states	not_recorded
 TKT-015	hybrid	go@server/internal/services/ticket_service_test.go::TestReopenTicketClearsCompletionTimestamps;pytest@server/tests/tickets/test_lifecycle.py::test_full_lifecycle	not_recorded
 TKT-016	release_manual	go@server/internal/services/ticket_service_test.go::TestEscalateTicketMarksTicketAsEscalated;manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::TKT-016	not_recorded
@@ -108,7 +108,7 @@ AUT-014	fault_injection	fault@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::AUT-0
 AUT-015	automated	go@server/internal/services/scheduler_service_test.go::TestSchedulerLeasePreventsCrossInstanceOverlap	not_recorded
 EVT-001	automated	go@server/internal/services/agent_native_service_test.go::TestAgentNativeEventOutboxRollbackRetryAndRecovery	not_recorded
 EVT-002	hybrid	go@server/internal/agentplatform/outbox_delivery_test.go::TestWebhookNotificationKeepsExactCloudEventIdentity;playwright@web/e2e/webhook-settings.spec.ts::EVT-002 EVT-007 EVT-008 EVT-010 UI-019：创建、编辑、测试并核对日志	not_recorded
-EVT-003	automated	go@server/internal/agentplatform/outbox_delivery_test.go::TestConfiguredWebhookOutboxDeliveryFansOutDurablyAndIdempotently	not_recorded
+EVT-003	automated	go@server/internal/agentplatform/outbox_delivery_test.go::TestCommittedWebhookDeliveriesUseImmutableSnapshots	not_recorded
 EVT-004	automated	go@server/internal/services/notification_service_test.go::TestWebhookNon2xxAlwaysPropagatesToOutboxCaller;go@server/internal/services/notification_service_test.go::TestWebhookOutboxAttemptHasHardTimeoutAndNoLegacyRetry	not_recorded
 EVT-005	release_manual	go@server/internal/services/automation_native_test.go::TestAutomationPermanentFailureRecordsOnlyClaimedAttempt;manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::EVT-005	not_recorded
 EVT-006	release_manual	manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::EVT-006	not_recorded
@@ -132,7 +132,7 @@ AGT-005	automated	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.p
 AGT-006	hybrid	go@server/internal/services/agent_native_service_test.go::TestAgentNativePolicyScopeDenyAndRiskyExplicitAllow;pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_admin_provisions_e2e_principal_and_explicit_policy	not_recorded
 AGT-007	automated	go@server/internal/services/agent_native_service_test.go::TestAgentNativePolicyScopeDenyAndRiskyExplicitAllow	not_recorded
 AGT-008	hybrid	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_client_credentials_rotation_and_deactivation_invalidate_tokens;playwright@web/e2e/agent-control.spec.ts::AGT-001 AGT-002 AGT-008 UI-020：服务主体、策略、凭据与单体熔断	not_recorded
-AGT-009	hybrid	go@server/internal/agentplatform/admin_handler_test.go::TestRuntimeSafetyControlsSurviveRestart;playwright@web/e2e/agent-control.spec.ts::AGT-009 UI-020 UI-021：页面完整且全局只读、紧急停止均可安全恢复	not_recorded
+AGT-009	hybrid	go@server/internal/agentplatform/admin_handler_test.go::TestRuntimeSafetyControlsSurviveRestart;playwright@web/e2e/agent-control.spec.ts::AGT-009 UI-020 UI-021：页面完整且平台级安全开关只读展示	not_recorded
 AGT-010	automated	go@server/internal/services/agent_native_service_test.go::TestAgentNativeExecutionRateAndConcurrencyLimits;go@server/internal/middleware/ratelimit_test.go::TestRateLimitEmitsOnlyRFC9333Headers	not_recorded
 AGT-011	automated	go@server/internal/services/agent_native_service_test.go::TestAgentNativeAutomationLoopDetection	not_recorded
 AGT-012	automated	pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_agent_rest_ticket_idempotency_lease_version_and_event_cursor	not_recorded
@@ -205,7 +205,7 @@ UI-017	hybrid	playwright@web/e2e/system-settings.spec.ts::UI-017：安全配置�
 UI-018	hybrid	playwright@web/e2e/email-settings.spec.ts::UI-018：邮件配置使用快照恢复且不改写不可回显秘密;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-018	not_recorded
 UI-019	hybrid	playwright@web/e2e/webhook-settings.spec.ts::EVT-002 EVT-007 EVT-008 EVT-010 UI-019：创建、编辑、测试并核对日志;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-019	not_recorded
 UI-020	hybrid	playwright@web/e2e/agent-control.spec.ts::AGT-001 AGT-002 AGT-008 UI-020：服务主体、策略、凭据与单体熔断;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-020	not_recorded
-UI-021	hybrid	playwright@web/e2e/agent-control.spec.ts::AGT-009 UI-020 UI-021：页面完整且全局只读、紧急停止均可安全恢复;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-021	not_recorded
+UI-021	hybrid	playwright@web/e2e/agent-control.spec.ts::AGT-009 UI-020 UI-021：页面完整且平台级安全开关只读展示;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-021	not_recorded
 UI-022	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-022	not_recorded
 UI-023	hybrid	playwright@web/e2e/trusted-devices.spec.ts::AUTH-019 AUTH-022 UI-023：可信设备仅使用 HttpOnly Cookie 并可撤销;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-023	not_recorded
 UI-024	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-024	not_recorded
@@ -233,5 +233,5 @@ RES-001	automated	go@server/internal/a2a/gorm_store_test.go::TestGormExpiredExec
 RES-002	hybrid	go@server/internal/services/agent_execution_guard_integration_test.go::TestRedisAgentExecutionGuardIntegration;go@server/internal/services/scheduler_redis_integration_test.go::TestSchedulerRedisLeaseIntegration	not_recorded
 RES-003	fault_injection	fault@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::RES-003	not_recorded
 RES-004	hybrid	go@server/internal/a2a/server_test.go::TestStreamingReplayUsesLastEventID;pytest@server/tests/agent_protocol/test_a2a_v1.py::test_a2a_input_required_does_not_mutate_ticket_and_sse_resumes_by_cursor	not_recorded
-RES-005	hybrid	go@server/internal/services/agent_native_service_test.go::TestAgentNativeAutomationLoopDetection;playwright@web/e2e/agent-control.spec.ts::AGT-009 UI-020 UI-021：页面完整且全局只读、紧急停止均可安全恢复	not_recorded
+RES-005	hybrid	go@server/internal/services/agent_native_service_test.go::TestAgentNativeAutomationLoopDetection;playwright@web/e2e/agent-control.spec.ts::AGT-009 UI-020 UI-021：页面完整且平台级安全开关只读展示	not_recorded
 RES-006	release_manual	manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::RES-006	not_recorded

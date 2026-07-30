@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -22,6 +23,187 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+type apiHandlerTestProject struct {
+	organization models.Organization
+	project      models.Project
+	queue        models.Queue
+}
+
+func ensureAPIHandlerTestProject(
+	t *testing.T,
+	db *gorm.DB,
+) apiHandlerTestProject {
+	t.Helper()
+	if err := db.AutoMigrate(
+		&models.Organization{},
+		&models.BusinessUnit{},
+		&models.Project{},
+		&models.Queue{},
+		&models.ProjectPrincipalGrant{},
+	); err != nil {
+		t.Fatalf("migrate API handler project fixture: %v", err)
+	}
+	var organization models.Organization
+	if err := db.Where("slug = ?", "api-handler-test").
+		FirstOrCreate(&organization, models.Organization{
+			Slug:   "api-handler-test",
+			Name:   "API Handler Test",
+			Status: models.OrganizationStatusActive,
+		}).Error; err != nil {
+		t.Fatalf("seed API handler organization: %v", err)
+	}
+	var unit models.BusinessUnit
+	if err := db.Where(
+		"organization_id = ? AND key = ?",
+		organization.ID,
+		"TEST",
+	).FirstOrCreate(&unit, models.BusinessUnit{
+		OrganizationID: organization.ID,
+		Key:            "TEST",
+		Name:           "Test",
+		Status:         models.BusinessUnitStatusActive,
+	}).Error; err != nil {
+		t.Fatalf("seed API handler business unit: %v", err)
+	}
+	var project models.Project
+	if err := db.Where(
+		"organization_id = ? AND key = ?",
+		organization.ID,
+		models.ProjectKey("TEST"),
+	).FirstOrCreate(&project, models.Project{
+		OrganizationID: organization.ID,
+		BusinessUnitID: unit.ID,
+		Key:            "TEST",
+		Name:           "Test",
+		Status:         models.ProjectStatusActive,
+	}).Error; err != nil {
+		t.Fatalf("seed API handler project: %v", err)
+	}
+	var queue models.Queue
+	if err := db.Where(
+		"project_id = ? AND key = ?",
+		project.ID,
+		models.QueueKey("default"),
+	).FirstOrCreate(&queue, models.Queue{
+		ProjectID: project.ID,
+		Key:       "default",
+		Name:      "Default",
+		Status:    models.QueueStatusActive,
+		IsDefault: true,
+	}).Error; err != nil {
+		t.Fatalf("seed API handler queue: %v", err)
+	}
+	scope := project.Scope()
+	if db.Migrator().HasTable(&models.Ticket{}) {
+		if err := db.Model(&models.Ticket{}).
+			Where("organization_id = 0 OR project_id = 0 OR queue_id = 0").
+			Updates(map[string]any{
+				"organization_id": scope.OrganizationID,
+				"project_id":      scope.ProjectID,
+				"queue_id":        queue.ID,
+			}).Error; err != nil {
+			t.Fatalf("scope API handler tickets: %v", err)
+		}
+	}
+	for _, model := range []any{
+		&models.TicketComment{},
+		&models.TicketAttachment{},
+		&models.TicketHistory{},
+		&models.TicketLease{},
+		&models.IdempotencyRecord{},
+		&models.PolicyDecision{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
+	} {
+		if !db.Migrator().HasTable(model) ||
+			!db.Migrator().HasColumn(model, "organization_id") ||
+			!db.Migrator().HasColumn(model, "project_id") {
+			continue
+		}
+		if err := db.Model(model).
+			Where("organization_id = 0 OR project_id = 0").
+			Updates(map[string]any{
+				"organization_id": scope.OrganizationID,
+				"project_id":      scope.ProjectID,
+			}).Error; err != nil {
+			t.Fatalf("scope API handler fixture %T: %v", model, err)
+		}
+	}
+	return apiHandlerTestProject{
+		organization: organization,
+		project:      project,
+		queue:        queue,
+	}
+}
+
+func grantAPIHandlerTestProject(
+	t *testing.T,
+	db *gorm.DB,
+	project models.Project,
+	principalID string,
+	scopes []string,
+) {
+	t.Helper()
+	if err := db.AutoMigrate(&models.ProjectPrincipalGrant{}); err != nil {
+		t.Fatalf("migrate API handler project grant: %v", err)
+	}
+	encodedScopes, err := json.Marshal(scopes)
+	if err != nil {
+		t.Fatalf("encode API handler project scopes: %v", err)
+	}
+	var grant models.ProjectPrincipalGrant
+	result := db.Where(
+		"project_id = ? AND service_principal_id = ?",
+		project.ID,
+		principalID,
+	).First(&grant)
+	switch {
+	case errors.Is(result.Error, gorm.ErrRecordNotFound):
+		grant = models.ProjectPrincipalGrant{
+			ProjectID:          project.ID,
+			ServicePrincipalID: principalID,
+			Role:               models.ProjectRoleAgent,
+			Scopes:             datatypes.JSON(encodedScopes),
+			IsActive:           true,
+		}
+		if err := db.Create(&grant).Error; err != nil {
+			t.Fatalf("seed API handler project grant: %v", err)
+		}
+	case result.Error != nil:
+		t.Fatalf("load API handler project grant: %v", result.Error)
+	default:
+		if err := db.Model(&grant).Updates(map[string]any{
+			"scopes":    datatypes.JSON(encodedScopes),
+			"is_active": true,
+		}).Error; err != nil {
+			t.Fatalf("update API handler project grant: %v", err)
+		}
+	}
+}
+
+func apiHandlerTestOperationContext(
+	t *testing.T,
+	db *gorm.DB,
+	principalID,
+	credentialID string,
+) context.Context {
+	t.Helper()
+	project := ensureAPIHandlerTestProject(t, db)
+	ctx, err := services.WithOperationContext(
+		context.Background(),
+		services.OperationContext{
+			Scope:        project.project.Scope(),
+			Actor:        models.ServicePrincipalActor(principalID),
+			Source:       services.SourceProtocolAgentREST,
+			CredentialID: credentialID,
+		},
+	)
+	if err != nil {
+		t.Fatalf("build API handler operation context: %v", err)
+	}
+	return ctx
+}
 
 func TestWriteNativeProblemLogsOnlySafeCorrelationMetadata(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -153,10 +335,17 @@ func TestListTicketsFiltersEachResourcePolicy(t *testing.T) {
 	}
 
 	handler := &APIHandler{db: db, native: native}
+	operationContext := apiHandlerTestOperationContext(
+		t,
+		db,
+		principal.ID,
+		credential.Credential.ID,
+	)
 	router := gin.New()
 	router.GET("/tickets", func(c *gin.Context) {
 		c.Set("agent_principal_id", principal.ID)
 		c.Set("agent_credential_id", credential.Credential.ID)
+		c.Request = c.Request.WithContext(operationContext)
 		handler.ListTickets(c)
 	})
 	recorder := httptest.NewRecorder()
@@ -258,10 +447,17 @@ func TestListTicketsUsesBoundedPolicyBatchAndAdvancingCandidateCursor(t *testing
 	})
 
 	handler := &APIHandler{db: db, native: native}
+	operationContext := apiHandlerTestOperationContext(
+		t,
+		db,
+		principal.ID,
+		credential.Credential.ID,
+	)
 	router := gin.New()
 	router.GET("/tickets", func(c *gin.Context) {
 		c.Set("agent_principal_id", principal.ID)
 		c.Set("agent_credential_id", credential.Credential.ID)
+		c.Request = c.Request.WithContext(operationContext)
 		handler.ListTickets(c)
 	})
 	requestPage := func(cursor string) struct {
@@ -417,10 +613,17 @@ func TestListEventsUsesBoundedPolicyBatchWithoutDecisionAmplification(t *testing
 	})
 
 	handler := &APIHandler{db: db, native: native}
+	operationContext := apiHandlerTestOperationContext(
+		t,
+		db,
+		principal.ID,
+		credential.Credential.ID,
+	)
 	router := gin.New()
 	router.GET("/events", func(c *gin.Context) {
 		c.Set("agent_principal_id", principal.ID)
 		c.Set("agent_credential_id", credential.Credential.ID)
+		c.Request = c.Request.WithContext(operationContext)
 		handler.ListEvents(c)
 	})
 	recorder := httptest.NewRecorder()
@@ -552,6 +755,12 @@ func TestListEventsRequiresEventAndLinkedTicketAuthorization(t *testing.T) {
 			c.Set(agentauth.ContextPrincipalID, principalID)
 			c.Set(agentauth.ContextCredentialID, credentialID)
 			c.Set(agentauth.ContextScopes, scopes)
+			c.Request = c.Request.WithContext(apiHandlerTestOperationContext(
+				t,
+				db,
+				principalID,
+				credentialID,
+			))
 			handler.ListEvents(c)
 		})
 		recorder := httptest.NewRecorder()
@@ -868,6 +1077,14 @@ func TestAPIHandlerRegistersAndServesLeaseCommandRoutes(t *testing.T) {
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
 	}
+	projectFixture := ensureAPIHandlerTestProject(t, db)
+	grantAPIHandlerTestProject(
+		t,
+		db,
+		projectFixture.project,
+		principal.ID,
+		[]string{models.ScopeTasksManage},
+	)
 
 	tokens := agentauth.NewManager("lease-route-secret", "https://issuer.example.test", "https://api.example.test", time.Hour)
 	accessToken, _, err := tokens.Issue(&agentauth.Principal{
@@ -877,13 +1094,17 @@ func TestAPIHandlerRegistersAndServesLeaseCommandRoutes(t *testing.T) {
 		Name:         principal.Name,
 		Scopes:       []string{models.ScopeTasksManage},
 		Active:       true,
-	}, nil)
+	}, "TEST", []string{models.ScopeTasksManage})
 	if err != nil {
 		t.Fatal(err)
 	}
+	verifiedAccess, err := tokens.Verify(accessToken)
+	if err != nil || verifiedAccess.ProjectKey != "TEST" {
+		t.Fatalf("issued lease-route token project = %#v, err=%v", verifiedAccess, err)
+	}
 	handler := NewAPIHandler(db, native, tokens, 1<<20, nil)
 	router := gin.New()
-	handler.RegisterRoutes(router.Group("/api/v1"))
+	handler.RegisterRoutes(router.Group("/api/v2/projects/:projectKey"))
 
 	doRequest := func(path, idempotencyKey, body string) *httptest.ResponseRecorder {
 		t.Helper()
@@ -898,7 +1119,7 @@ func TestAPIHandlerRegistersAndServesLeaseCommandRoutes(t *testing.T) {
 	}
 
 	claimBody := `{"ttl_seconds":60}`
-	claimPath := fmt.Sprintf("/api/v1/tickets/%d/claim", ticket.ID)
+	claimPath := fmt.Sprintf("/api/v2/projects/TEST/tickets/%d/claim", ticket.ID)
 	claimResponse := doRequest(claimPath, "claim-route-key", claimBody)
 	if claimResponse.Code != http.StatusOK {
 		t.Fatalf("claim status=%d body=%s", claimResponse.Code, claimResponse.Body.String())
@@ -933,9 +1154,13 @@ func TestAPIHandlerRegistersAndServesLeaseCommandRoutes(t *testing.T) {
 	if claimRecord.RequestHash != wantClaimHash {
 		t.Fatalf("claim fingerprint did not use canonical route: got=%s want=%s", claimRecord.RequestHash, wantClaimHash)
 	}
+	if claimRecord.OrganizationID != projectFixture.organization.ID ||
+		claimRecord.ProjectID != projectFixture.project.ID {
+		t.Fatalf("claim idempotency record lost project binding: %+v", claimRecord)
+	}
 
 	heartbeatBody := `{"ttl_seconds":90}`
-	heartbeatPath := "/api/v1/leases/" + claimEnvelope.Data.LeaseID + "/heartbeat"
+	heartbeatPath := "/api/v2/projects/TEST/leases/" + claimEnvelope.Data.LeaseID + "/heartbeat"
 	heartbeatResponse := doRequest(heartbeatPath, "heartbeat-route-key", heartbeatBody)
 	if heartbeatResponse.Code != http.StatusOK {
 		t.Fatalf("heartbeat status=%d body=%s", heartbeatResponse.Code, heartbeatResponse.Body.String())
@@ -967,6 +1192,40 @@ func TestAPIHandlerRegistersAndServesLeaseCommandRoutes(t *testing.T) {
 			heartbeatRecord.RequestHash,
 			wantHeartbeatHash,
 		)
+	}
+	if heartbeatRecord.OrganizationID != projectFixture.organization.ID ||
+		heartbeatRecord.ProjectID != projectFixture.project.ID {
+		t.Fatalf("heartbeat idempotency record lost project binding: %+v", heartbeatRecord)
+	}
+
+	mismatchPath := fmt.Sprintf(
+		"/api/v2/projects/OTHER/tickets/%d/claim",
+		ticket.ID,
+	)
+	mismatchResponse := doRequest(
+		mismatchPath,
+		"claim-project-mismatch",
+		claimBody,
+	)
+	if mismatchResponse.Code != http.StatusForbidden ||
+		!strings.Contains(
+			mismatchResponse.Body.String(),
+			`"code":"project_scope_mismatch"`,
+		) {
+		t.Fatalf(
+			"token/path project mismatch status=%d body=%s",
+			mismatchResponse.Code,
+			mismatchResponse.Body.String(),
+		)
+	}
+	var mismatchRecords int64
+	if err := db.Model(&models.IdempotencyRecord{}).
+		Where("key = ?", "claim-project-mismatch").
+		Count(&mismatchRecords).Error; err != nil {
+		t.Fatal(err)
+	}
+	if mismatchRecords != 0 {
+		t.Fatalf("project mismatch reached domain work: records=%d", mismatchRecords)
 	}
 }
 
@@ -1009,19 +1268,29 @@ func TestIdempotentCommentReplayMatchesInitialEnvelope(t *testing.T) {
 	if err := db.Create(&comment).Error; err != nil {
 		t.Fatal(err)
 	}
+	projectFixture := ensureAPIHandlerTestProject(t, db)
 	receipt := Receipt{
 		OperationID: "operation", ResourceID: fmt.Sprint(comment.ID),
 		ResourceVersion: 2, EventID: "event", ChangedFields: []string{"comments"},
 	}
 	responseBody, _ := json.Marshal(receipt)
 	record := &models.IdempotencyRecord{
-		ResourceID: fmt.Sprint(comment.ID), ResponseCode: http.StatusCreated,
-		ResponseBody: datatypes.JSON(responseBody),
+		OrganizationID: projectFixture.organization.ID,
+		ProjectID:      projectFixture.project.ID,
+		ResourceID:     fmt.Sprint(comment.ID),
+		ResponseCode:   http.StatusCreated,
+		ResponseBody:   datatypes.JSON(responseBody),
 	}
 
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
-	context.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+	request := httptest.NewRequest(http.MethodPost, "/", nil)
+	context.Request = request.WithContext(apiHandlerTestOperationContext(
+		t,
+		db,
+		"replay-principal",
+		"replay-credential",
+	))
 	(&APIHandler{db: db}).writeReplayedComment(context, record)
 
 	if recorder.Code != http.StatusCreated || recorder.Header().Get("ETag") != `"v2"` {
@@ -1051,12 +1320,32 @@ func TestIdempotentTicketReplayUsesOriginalSnapshot(t *testing.T) {
 	}
 	receiptBody, _ := json.Marshal(receipt)
 	record := &models.IdempotencyRecord{
-		ResourceID: "7", ResponseCode: http.StatusCreated,
-		ResponseBody: datatypes.JSON(receiptBody), ResourceSnapshot: datatypes.JSON(snapshotBody),
+		OrganizationID:   1,
+		ProjectID:        1,
+		ResourceID:       "7",
+		ResponseCode:     http.StatusCreated,
+		ResponseBody:     datatypes.JSON(receiptBody),
+		ResourceSnapshot: datatypes.JSON(snapshotBody),
 	}
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
-	context.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+	request := httptest.NewRequest(http.MethodPost, "/", nil)
+	operationContext, err := services.WithOperationContext(
+		request.Context(),
+		services.OperationContext{
+			Scope: models.ProjectScope{
+				OrganizationID: 1,
+				ProjectID:      1,
+			},
+			Actor:        models.ServicePrincipalActor("replay-principal"),
+			Source:       services.SourceProtocolAgentREST,
+			CredentialID: "replay-credential",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	context.Request = request.WithContext(operationContext)
 	(&APIHandler{}).writeReplayedTicket(context, record, http.StatusCreated)
 
 	var envelope struct {

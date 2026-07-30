@@ -388,6 +388,16 @@ const TicketUserDisplay: React.FC<{ kind: 'creator' | 'assignee' }> = ({ kind })
     if (!record) return null;
     const user = kind === 'creator' ? record.created_by : record.assigned_to;
     if (!user) {
+        const actor = kind === 'creator' ? record.created_by_actor : record.assigned_to_actor;
+        if (actor?.type === 'service_principal') {
+            return <Typography variant="body2">AI 智能体 · {actor.id}</Typography>;
+        }
+        if (actor?.type === 'human') {
+            return <Typography variant="body2">用户 · {actor.id}</Typography>;
+        }
+        if (actor?.type === 'system') {
+            return <Typography variant="body2">系统 · {actor.id}</Typography>;
+        }
         return <Typography variant="body2">{kind === 'creator' ? '未知' : '未分配'}</Typography>;
     }
     return (

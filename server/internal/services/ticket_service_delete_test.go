@@ -17,9 +17,10 @@ func TestDeleteTicketExpectedVersionRejectsStaleSnapshot(t *testing.T) {
 	actor := seedActorUser(t, db, "delete-version")
 	ticket := seedNativeTicket(t, db, actor.ID, "DELETE-VERSION-1")
 	service := newTicketServiceForTest(t, db)
+	ctx := testProjectOperationContext(t, db, models.HumanActor(actor.ID))
 
 	err := service.DeleteTicketExpectedVersion(
-		context.Background(),
+		ctx,
 		ticket.ID,
 		actor.ID,
 		string(models.RoleAdmin),
@@ -59,6 +60,8 @@ func TestDeleteTicketCleansRelatedData(t *testing.T) {
 		&models.AutomationLog{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
+		&models.WebhookConfig{},
+		&models.WebhookDeliverySnapshot{},
 	); err != nil {
 		t.Fatalf("failed to migrate schemas: %v", err)
 	}
@@ -160,8 +163,9 @@ func TestDeleteTicketCleansRelatedData(t *testing.T) {
 	}
 
 	svc := newTicketServiceForTest(t, db)
+	ctx := testProjectOperationContext(t, db, models.HumanActor(user.ID))
 	if err := svc.DeleteTicketExpectedVersion(
-		context.Background(),
+		ctx,
 		ticket.ID,
 		user.ID,
 		"admin",
@@ -238,6 +242,8 @@ func TestDeleteTicketCommitsAttachmentCleanupWithDefaultOutboxTargets(t *testing
 		&models.TicketAttachment{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
+		&models.WebhookConfig{},
+		&models.WebhookDeliverySnapshot{},
 	); err != nil {
 		t.Fatalf("migrate delete cleanup schema: %v", err)
 	}
@@ -293,8 +299,28 @@ func TestDeleteTicketCommitsAttachmentCleanupWithDefaultOutboxTargets(t *testing
 		},
 	})
 	service := newTicketServiceWithDependenciesForTest(t, db, native, nil, 0)
+	ctx := testProjectOperationContext(t, db, models.HumanActor(user.ID))
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	webhook := models.WebhookConfig{
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		Name:           "ticket-delete-snapshot",
+		Provider:       models.WebhookProviderCustom,
+		WebhookURL:     "https://webhook.example.test/deleted",
+		Status:         models.WebhookStatusActive,
+		EnabledEventsObj: []models.WebhookEventType{
+			models.WebhookEventTicketDeleted,
+		},
+		CreatedBy: user.ID,
+	}
+	if err := db.Create(&webhook).Error; err != nil {
+		t.Fatal(err)
+	}
 	if err := service.DeleteTicketExpectedVersion(
-		context.Background(),
+		ctx,
 		ticket.ID,
 		user.ID,
 		"admin",
@@ -355,5 +381,23 @@ func TestDeleteTicketCommitsAttachmentCleanupWithDefaultOutboxTargets(t *testing
 		destinations["automation"] != 1 ||
 		destinations[AttachmentCleanupOutboxDestination] != 1 {
 		t.Fatalf("ticket deletion lost or duplicated Outbox targets: %#v", deliveries)
+	}
+	var snapshot models.WebhookDeliverySnapshot
+	if err := db.Where(
+		"event_id = ? AND config_id = ?",
+		event.ID,
+		webhook.ID,
+	).First(&snapshot).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, delivery := range deliveries {
+		if delivery.DestinationType == "webhook" &&
+			delivery.DestinationID !=
+				webhookSnapshotDestinationPrefix+snapshot.ID {
+			t.Fatalf(
+				"ticket deletion webhook target is not snapshot-bound: %+v",
+				delivery,
+			)
+		}
 	}
 }

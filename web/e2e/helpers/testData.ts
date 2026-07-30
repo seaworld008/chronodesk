@@ -84,6 +84,32 @@ const trackedIDs = (resource: TrackedResource) => [
 ];
 
 const authSessions = new Map<string, Promise<AuthSession>>();
+const projectKeyRequests = new Map<string, Promise<string>>();
+const ticketCreateConfigurationRequests = new Map<
+    string,
+    Promise<TicketCreateConfiguration>
+>();
+
+type TicketCreateConfiguration = {
+    requestTypeVersionID: string;
+    workflowVersionID: string;
+    workClass: string;
+};
+
+type TicketIntakeConfiguration = {
+    request_types?: Array<{
+        id?: unknown;
+        status?: unknown;
+        work_class?: unknown;
+    }>;
+    workflows?: Array<{
+        id?: unknown;
+        status?: unknown;
+    }>;
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+    typeof value === 'object' && value !== null;
 
 export const extractData = <T>(payload: unknown): T => {
     if (
@@ -97,21 +123,18 @@ export const extractData = <T>(payload: unknown): T => {
 };
 
 export const extractItems = <T>(payload: unknown): T[] => {
-    if (!payload || typeof payload !== 'object') {
-        return [];
+    const data = isRecord(payload) && 'data' in payload
+        ? payload.data
+        : payload;
+    if (Array.isArray(data)) {
+        return data as T[];
     }
-    const data = (payload as Record<string, unknown>).data as Record<string, unknown> | undefined;
-    if (data?.items && Array.isArray(data.items)) {
-        return data.items as T[];
-    }
-    if (data?.rules && Array.isArray(data.rules)) {
-        return data.rules as T[];
-    }
-    if (data?.logs && Array.isArray(data.logs)) {
-        return data.logs as T[];
-    }
-    if (Array.isArray(payload)) {
-        return payload as T[];
+    if (isRecord(data)) {
+        for (const key of ['items', 'rules', 'logs'] as const) {
+            if (Array.isArray(data[key])) {
+                return data[key] as T[];
+            }
+        }
     }
     return [];
 };
@@ -137,14 +160,119 @@ const getAuthSession = (
 export const getAdminToken = async (request: APIRequestContext) =>
     (await getAuthSession(request, DEFAULT_ADMIN)).access_token;
 
+export const resolveE2EProjectKey = (
+    request: APIRequestContext,
+    token: string,
+): Promise<string> => {
+    const existing = projectKeyRequests.get(token);
+    if (existing) {
+        return existing;
+    }
+    const pending = (async () => {
+        const response = await apiRequest<Record<string, unknown>>(
+            request,
+            token,
+            '/api/projects',
+        );
+        const accesses =
+            extractData<Array<Record<string, unknown>>>(response) ?? [];
+        const selected = accesses
+            .map((access) => access.project)
+            .find(
+                (project): project is Record<string, unknown> =>
+                    typeof project === 'object' &&
+                    project !== null &&
+                    project.status === 'active' &&
+                    project.key === 'DEFAULT',
+            );
+        if (!selected || typeof selected.key !== 'string') {
+            throw new Error('当前账号没有可用于 E2E 的活动 DEFAULT 项目');
+        }
+        return selected.key;
+    })().catch((error) => {
+        projectKeyRequests.delete(token);
+        throw error;
+    });
+    projectKeyRequests.set(token, pending);
+    return pending;
+};
+
+export const projectAPIPath = (
+    projectKey: string,
+    suffix: string,
+) => `/api/projects/${encodeURIComponent(projectKey)}/${suffix.replace(/^\/+/, '')}`;
+
+export const resolveE2ETicketCreateConfiguration = (
+    request: APIRequestContext,
+    token: string,
+    projectKey: string,
+): Promise<TicketCreateConfiguration> => {
+    const cacheKey = `${token}:${projectKey}`;
+    const existing = ticketCreateConfigurationRequests.get(cacheKey);
+    if (existing) {
+        return existing;
+    }
+
+    const pending = (async () => {
+        const response = await apiRequest<Record<string, unknown>>(
+            request,
+            token,
+            projectAPIPath(projectKey, 'configuration/intake'),
+        );
+        const intake = extractData<TicketIntakeConfiguration>(response);
+        const requestType = intake.request_types?.find(
+            (candidate) =>
+                candidate.status === 'published' &&
+                candidate.work_class === 'request' &&
+                typeof candidate.id === 'string' &&
+                candidate.id.length > 0,
+        );
+        const workflow = intake.workflows?.find(
+            (candidate) =>
+                candidate.status === 'published' &&
+                typeof candidate.id === 'string' &&
+                candidate.id.length > 0,
+        );
+        if (
+            !requestType ||
+            typeof requestType.id !== 'string' ||
+            typeof requestType.work_class !== 'string' ||
+            !workflow ||
+            typeof workflow.id !== 'string'
+        ) {
+            throw new Error(
+                `项目 ${projectKey} 缺少可用于 E2E 建单的已发布请求类型或工作流`,
+            );
+        }
+        return {
+            requestTypeVersionID: requestType.id,
+            workflowVersionID: workflow.id,
+            workClass: requestType.work_class,
+        };
+    })().catch((error) => {
+        ticketCreateConfigurationRequests.delete(cacheKey);
+        throw error;
+    });
+    ticketCreateConfigurationRequests.set(cacheKey, pending);
+    return pending;
+};
+
 export const authenticatePage = async (
     page: Page,
     credentials: Credentials = DEFAULT_ADMIN,
 ) => {
     const session = await getAuthSession(page.request, credentials);
+    const projectKey = await resolveE2EProjectKey(
+        page.request,
+        session.access_token,
+    );
     await installBrowserMutationGuard(page);
-    await page.addInitScript((auth) => {
+    await page.addInitScript(({ auth, activeProjectKey }) => {
         localStorage.setItem('token', auth.access_token);
+        localStorage.setItem(
+            'chronodesk.activeProjectKey',
+            activeProjectKey,
+        );
         if (auth.refresh_token) {
             localStorage.setItem('refreshToken', auth.refresh_token);
         }
@@ -160,7 +288,7 @@ export const authenticatePage = async (
                 String(Date.now() + auth.expires_in * 1000),
             );
         }
-    }, session);
+    }, { auth: session, activeProjectKey: projectKey });
     await page.goto('/#/');
     await page.getByRole('menuitem', { name: '工单管理' }).waitFor({ timeout: 15000 });
 };
@@ -236,14 +364,49 @@ const temporaryRoleAccountIdentity = (
     return { username, email };
 };
 
+const deactivateProjectMembership = async (
+    request: APIRequestContext,
+    token: string,
+    projectKey: string,
+    userID: number,
+) => {
+    assertDestructiveE2EAllowed(
+        `DELETE project membership ${projectKey}/${userID}`,
+    );
+    const response = await request.delete(
+        projectAPIPath(
+            projectKey,
+            `memberships/${encodeURIComponent(userID)}`,
+        ),
+        {
+            headers: {
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json',
+            },
+        },
+    );
+    if (![200, 204, 404].includes(response.status())) {
+        throw new Error(
+            `撤销临时用户 ${userID} 的项目成员关系失败：HTTP ${response.status()}`,
+        );
+    }
+};
+
 const compensateTemporaryUsers = async (
     request: APIRequestContext,
     token: string,
+    projectKey: string,
     userIDs: number[],
 ) => {
     const cleanupErrors: string[] = [];
     for (const id of [...userIDs].reverse()) {
         try {
+            await deactivateProjectMembership(
+                request,
+                token,
+                projectKey,
+                id,
+            );
             await apiRequest(
                 request,
                 token,
@@ -274,6 +437,7 @@ export const ensureRoleAccounts = async (
     temporaryRoleAccounts = (async () => {
         assertDestructiveE2EAllowed('创建本轮临时角色账号');
         const token = await getAdminToken(request);
+        const projectKey = await resolveE2EProjectKey(request, token);
         const agentIdentity = temporaryRoleAccountIdentity('agent');
         const customerIdentity = temporaryRoleAccountIdentity('customer');
         const definitions = [
@@ -338,6 +502,21 @@ export const ensureRoleAccounts = async (
                 }
                 createdUserIDs.push(created.id);
                 trackE2EResource('users', created.id);
+                await apiRequest(
+                    request,
+                    token,
+                    projectAPIPath(projectKey, 'memberships'),
+                    {
+                        method: 'POST',
+                        data: {
+                            user_id: created.id,
+                            role:
+                                definition.role === 'agent'
+                                    ? 'agent'
+                                    : 'requester',
+                        },
+                    },
+                );
                 result[definition.key] = {
                     id: created.id,
                     username: definition.username,
@@ -352,6 +531,7 @@ export const ensureRoleAccounts = async (
                 await compensateTemporaryUsers(
                     request,
                     token,
+                    projectKey,
                     createdUserIDs,
                 );
             } catch (cleanupError) {
@@ -384,23 +564,29 @@ export const createNotification = async (
         throw new Error('测试通知标题必须包含本轮唯一 marker');
     }
     const token = await getAdminToken(request);
+    const projectKey = await resolveE2EProjectKey(request, token);
     const recipientEmail = options.recipientEmail ?? DEFAULT_ADMIN.email;
     const recipient = await findUserByEmail(request, token, recipientEmail);
     if (!recipient) {
         throw new Error(`未找到通知接收者: ${recipientEmail}`);
     }
 
-    const response = await apiRequest<Record<string, unknown>>(request, token, '/api/admin/notifications', {
-        method: 'POST',
-        data: {
-            type: 'system_alert',
-            title: options.title,
-            content: options.content,
-            priority: 'normal',
-            channel: 'in_app',
-            recipient_id: recipient.id,
+    const response = await apiRequest<Record<string, unknown>>(
+        request,
+        token,
+        projectAPIPath(projectKey, 'notifications'),
+        {
+            method: 'POST',
+            data: {
+                type: 'system_alert',
+                title: options.title,
+                content: options.content,
+                priority: 'normal',
+                channel: 'in_app',
+                recipient_id: recipient.id,
+            },
         },
-    });
+    );
 
     const data = (response.data as Record<string, unknown>) ?? {};
     const id = data.id as number;
@@ -413,7 +599,13 @@ export const deleteNotification = async (request: APIRequestContext, id: number)
         throw new Error(`拒绝删除未由本轮创建的通知：${id}`);
     }
     const token = await getAdminToken(request);
-    await apiRequest(request, token, `/api/admin/notifications/${id}`, { method: 'DELETE' });
+    const projectKey = await resolveE2EProjectKey(request, token);
+    await apiRequest(
+        request,
+        token,
+        projectAPIPath(projectKey, `notifications/${encodeURIComponent(id)}`),
+        { method: 'DELETE' },
+    );
     untrackE2EResource('notifications', id);
 };
 
@@ -422,18 +614,39 @@ export const createTicket = async (request: APIRequestContext, title: string) =>
         throw new Error('测试工单标题必须包含本轮唯一 marker');
     }
     const token = await getAdminToken(request);
-    const response = await apiRequest<Record<string, unknown>>(request, token, '/api/tickets', {
-        method: 'POST',
-        data: {
-            title,
-            description: `${title} 自动化测试描述`,
-            type: 'request',
-            priority: 'normal',
-            source: 'web',
+    const projectKey = await resolveE2EProjectKey(request, token);
+    const configuration = await resolveE2ETicketCreateConfiguration(
+        request,
+        token,
+        projectKey,
+    );
+    const response = await apiRequest<Record<string, unknown>>(
+        request,
+        token,
+        projectAPIPath(projectKey, 'tickets'),
+        {
+            method: 'POST',
+            data: {
+                title,
+                description: `${title} 自动化测试描述`,
+                type: configuration.workClass,
+                priority: 'normal',
+                source: 'web',
+                request_type_version_id:
+                    configuration.requestTypeVersionID,
+                workflow_version_id: configuration.workflowVersionID,
+            },
         },
-    });
-    const data = (response.data as Record<string, unknown>) ?? {};
-    const id = data.id as number;
+    );
+    const ticket = extractData<Record<string, unknown>>(response);
+    if (
+        typeof ticket.id !== 'number' ||
+        !Number.isSafeInteger(ticket.id) ||
+        ticket.id <= 0
+    ) {
+        throw new Error('创建 E2E 工单后响应缺少有效 ID');
+    }
+    const id = ticket.id;
     trackE2EResource('tickets', id);
     return id;
 };
@@ -443,10 +656,15 @@ const deleteVersionedTicket = async (
     token: string,
     id: string | number,
 ) => {
+    const projectKey = await resolveE2EProjectKey(request, token);
+    const ticketPath = projectAPIPath(
+        projectKey,
+        `tickets/${encodeURIComponent(id)}`,
+    );
     const detail = await apiRequest<Record<string, unknown>>(
         request,
         token,
-        `/api/tickets/${encodeURIComponent(id)}`,
+        ticketPath,
     );
     const ticket = extractData<Record<string, unknown>>(detail);
     const version = ticket.version;
@@ -457,7 +675,7 @@ const deleteVersionedTicket = async (
     ) {
         throw new Error(`工单 ${id} 缺少有效版本，拒绝无条件清理`);
     }
-    await apiRequest(request, token, `/api/tickets/${encodeURIComponent(id)}`, {
+    await apiRequest(request, token, ticketPath, {
         method: 'DELETE',
         headers: { 'If-Match': `"v${version}"` },
     });
@@ -481,10 +699,11 @@ export const createAutomationRule = async (
         throw new Error('测试自动化规则名称必须包含本轮唯一 marker');
     }
     const token = await getAdminToken(request);
+    const projectKey = await resolveE2EProjectKey(request, token);
     const response = await apiRequest<Record<string, unknown>>(
         request,
         token,
-        '/api/admin/automation/rules',
+        projectAPIPath(projectKey, 'admin/automation/rules'),
         {
             method: 'POST',
             data: {
@@ -505,11 +724,15 @@ export const createAutomationRule = async (
 };
 
 const deleteAutomationRules = async (request: APIRequestContext, token: string) => {
+    const projectKey = await resolveE2EProjectKey(request, token);
     for (const id of trackedIDs('automationRules')) {
         await apiRequest(
             request,
             token,
-            `/api/admin/automation/rules/${encodeURIComponent(id)}`,
+            projectAPIPath(
+                projectKey,
+                `admin/automation/rules/${encodeURIComponent(id)}`,
+            ),
             { method: 'DELETE' },
         );
         untrackE2EResource('automationRules', id);
@@ -524,11 +747,15 @@ const deleteTickets = async (request: APIRequestContext, token: string) => {
 };
 
 const deleteNotifications = async (request: APIRequestContext, token: string) => {
+    const projectKey = await resolveE2EProjectKey(request, token);
     for (const id of trackedIDs('notifications')) {
         await apiRequest(
             request,
             token,
-            `/api/admin/notifications/${encodeURIComponent(id)}`,
+            projectAPIPath(
+                projectKey,
+                `notifications/${encodeURIComponent(id)}`,
+            ),
             { method: 'DELETE' },
         );
         untrackE2EResource('notifications', id);
@@ -536,10 +763,17 @@ const deleteNotifications = async (request: APIRequestContext, token: string) =>
 };
 
 const deleteWebhooks = async (request: APIRequestContext, token: string) => {
+    const projectKey = await resolveE2EProjectKey(request, token);
     for (const id of trackedIDs('webhooks')) {
-        await apiRequest(request, token, `/api/webhooks/${encodeURIComponent(id)}`, {
-            method: 'DELETE',
-        });
+        await apiRequest(
+            request,
+            token,
+            projectAPIPath(
+                projectKey,
+                `webhooks/${encodeURIComponent(id)}`,
+            ),
+            { method: 'DELETE' },
+        );
         untrackE2EResource('webhooks', id);
     }
 };
@@ -555,9 +789,7 @@ type AgentControlPrincipal = {
 
 type AgentControlSnapshot = {
     global_read_only: boolean;
-    global_read_only_version: number;
     emergency_stop: boolean;
-    emergency_stop_version: number;
     principals: AgentControlPrincipal[];
     attachments?: Array<{
         id: number;
@@ -572,10 +804,11 @@ const getAgentControlSnapshot = async (
     suppliedToken?: string,
 ) => {
     const token = suppliedToken ?? await getAdminToken(request);
+    const projectKey = await resolveE2EProjectKey(request, token);
     const response = await apiRequest<Record<string, unknown>>(
         request,
         token,
-        '/api/v1/admin/agent-control/overview',
+        projectAPIPath(projectKey, 'admin/agents/agent-control/overview'),
     );
     return extractData<AgentControlSnapshot>(response);
 };
@@ -583,9 +816,7 @@ const getAgentControlSnapshot = async (
 export type AgentGlobalControlSnapshot = Pick<
     AgentControlSnapshot,
     | 'global_read_only'
-    | 'global_read_only_version'
     | 'emergency_stop'
-    | 'emergency_stop_version'
 >;
 
 export const captureAgentGlobalControls = async (
@@ -594,9 +825,7 @@ export const captureAgentGlobalControls = async (
     const snapshot = await getAgentControlSnapshot(request);
     return {
         global_read_only: snapshot.global_read_only,
-        global_read_only_version: snapshot.global_read_only_version,
         emergency_stop: snapshot.emergency_stop,
-        emergency_stop_version: snapshot.emergency_stop_version,
     };
 };
 
@@ -605,58 +834,27 @@ export const restoreAgentGlobalControls = async (
     original: AgentGlobalControlSnapshot,
 ) => {
     const token = await getAdminToken(request);
-    let current = await getAgentControlSnapshot(request, token);
+    const current = await getAgentControlSnapshot(request, token);
     if (
         current.global_read_only === original.global_read_only &&
         current.emergency_stop === original.emergency_stop
     ) {
         return;
     }
-    assertGlobalE2EAllowed('恢复 Agent 全局控制');
-    if (current.global_read_only !== original.global_read_only) {
-        await adminCommand(
-            request,
-            token,
-            '/api/v1/admin/agent-control/read-only',
-            {
-                method: 'PUT',
-                version: current.global_read_only_version,
-                data: { enabled: original.global_read_only },
-            },
-        );
-        current = await getAgentControlSnapshot(request, token);
-    }
-    if (current.emergency_stop !== original.emergency_stop) {
-        await adminCommand(
-            request,
-            token,
-            '/api/v1/admin/agent-control/emergency-stop',
-            {
-                method: 'PUT',
-                version: current.emergency_stop_version,
-                data: { enabled: original.emergency_stop },
-            },
-        );
-    }
-
-    const restored = await getAgentControlSnapshot(request, token);
-    if (
-        restored.global_read_only !== original.global_read_only ||
-        restored.emergency_stop !== original.emergency_stop
-    ) {
-        throw new Error('Agent 全局控制状态未恢复到测试前快照');
-    }
+    throw new Error('项目级 Agent 控制面不允许修改平台全局安全开关');
 };
 
 const disableTrackedAgentPrincipals = async (
     request: APIRequestContext,
     token: string,
 ) => {
+    const projectKey = await resolveE2EProjectKey(request, token);
+    const agentAdminPath = projectAPIPath(projectKey, 'admin/agents');
     for (const principalID of trackedIDs('agentPrincipals')) {
         const policyResponse = await apiRequest<Record<string, unknown>>(
             request,
             token,
-            `/api/v1/admin/service-principals/${principalID}/policies`,
+            `${agentAdminPath}/service-principals/${principalID}/policies`,
         );
         const policies = extractData<Array<Record<string, unknown>>>(
             policyResponse,
@@ -672,7 +870,7 @@ const disableTrackedAgentPrincipals = async (
             await adminCommand(
                 request,
                 token,
-                `/api/v1/admin/service-principals/${principalID}/policies/${policy.id}`,
+                `${agentAdminPath}/service-principals/${principalID}/policies/${policy.id}`,
                 {
                     method: 'DELETE',
                     version: policy.resource_version,
@@ -696,7 +894,7 @@ const disableTrackedAgentPrincipals = async (
             await adminCommand(
                 request,
                 token,
-                `/api/v1/admin/service-principals/${principalID}/status`,
+                `${agentAdminPath}/service-principals/${principalID}/status`,
                 {
                     method: 'PUT',
                     version: principal.resource_version,
@@ -727,6 +925,8 @@ export const markE2EAttachmentClean = async (
         throw new Error('拒绝修改不属于本轮 marker 的附件扫描状态');
     }
     const token = await getAdminToken(request);
+    const projectKey = await resolveE2EProjectKey(request, token);
+    const agentAdminPath = projectAPIPath(projectKey, 'admin/agents');
     const snapshot = await getAgentControlSnapshot(request, token);
     const attachment = (snapshot.attachments ?? []).find(
         (candidate) => candidate.original_name === originalName,
@@ -737,7 +937,7 @@ export const markE2EAttachmentClean = async (
     await adminCommand(
         request,
         token,
-        `/api/v1/admin/attachments/${attachment.id}/scan`,
+        `${agentAdminPath}/attachments/${attachment.id}/scan`,
         {
             method: 'POST',
             version: attachment.resource_version,
@@ -791,7 +991,14 @@ export const trackTrustedDeviceByName = async (
 };
 
 const deleteTestUsers = async (request: APIRequestContext, token: string) => {
+    const projectKey = await resolveE2EProjectKey(request, token);
     for (const id of trackedIDs('users')) {
+        await deactivateProjectMembership(
+            request,
+            token,
+            projectKey,
+            Number(id),
+        );
         await apiRequest(
             request,
             token,

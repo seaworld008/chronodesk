@@ -6,8 +6,6 @@ import {
     DateTimeInput,
     ReferenceInput,
     AutocompleteInput,
-    BooleanInput,
-    NumberInput,
     required,
     TopToolbar,
     ListButton,
@@ -33,6 +31,8 @@ import {
     formatTagsInputValue,
     normalizeTagsForSubmit,
     normalizeCustomFieldsForSubmit,
+    formatCustomFieldsInputValue,
+    validateCustomFieldsInput,
 } from './tagUtils';
 import BackButton from '../common/BackButton';
 import { UpdateTicketRequest } from '@/types';
@@ -51,7 +51,29 @@ type TicketEditFormValues = UpdateTicketRequest & {
 };
 
 const transformTicketUpdate = (data: TicketEditFormValues): Record<string, unknown> => {
-    const payload: Record<string, unknown> = { ...data };
+    const payload: Record<string, unknown> = {};
+    for (const field of [
+        'title',
+        'description',
+        'type',
+        'priority',
+        'status',
+        'source',
+        'assigned_to_id',
+        'category_id',
+        'subcategory_id',
+        'due_date',
+        'customer_name',
+        'customer_email',
+        'customer_phone',
+        'internal_notes',
+        'rating',
+        'rating_comment',
+    ] as const) {
+        if (typeof data[field] !== 'undefined') {
+            payload[field] = data[field];
+        }
+    }
     const normalizedTags = normalizeTagsForSubmit(data.tags);
 
     if (typeof normalizedTags !== 'undefined') {
@@ -312,32 +334,6 @@ const TicketEdit: React.FC = () => {
                                 </CardContent>
                             </Card>
 
-                            <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
-                                <CardHeader
-                                    title="产品和组件"
-                                    slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
-                                    sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
-                                />
-                                <CardContent>
-                                    <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
-                                        <Box sx={{ flex: 1, minWidth: '200px' }}>
-                                            <TextInput
-                                                source="component"
-                                                label="组件/模块"
-                                                fullWidth
-                                            />
-                                        </Box>
-
-                                        <Box sx={{ flex: 1, minWidth: '200px' }}>
-                                            <TextInput
-                                                source="version"
-                                                label="版本"
-                                                fullWidth
-                                            />
-                                        </Box>
-                                    </Box>
-                                </CardContent>
-                            </Card>
                         </Box>
                     </FormTab>
 
@@ -354,6 +350,13 @@ const TicketEdit: React.FC = () => {
                                     <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
                                         <Box sx={{ flex: 1, minWidth: '250px' }}>
                                             <TextInput
+                                                source="customer_name"
+                                                label="客户姓名"
+                                                fullWidth
+                                            />
+                                        </Box>
+                                        <Box sx={{ flex: 1, minWidth: '250px' }}>
+                                            <TextInput
                                                 source="customer_email"
                                                 label="客户邮箱"
                                                 type="email"
@@ -362,15 +365,6 @@ const TicketEdit: React.FC = () => {
                                         </Box>
                                     </Box>
 
-                                    <Box sx={{ mt: 2 }}>
-                                        <TextInput
-                                            source="customer_notes"
-                                            label="客户备注"
-                                            fullWidth
-                                            multiline
-                                            rows={3}
-                                        />
-                                    </Box>
                                 </CardContent>
                             </Card>
 
@@ -386,14 +380,6 @@ const TicketEdit: React.FC = () => {
                                             <TextInput
                                                 source="customer_phone"
                                                 label="客户电话"
-                                                fullWidth
-                                            />
-                                        </Box>
-
-                                        <Box sx={{ flex: 1, minWidth: '200px' }}>
-                                            <TextInput
-                                                source="customer_company"
-                                                label="客户公司"
                                                 fullWidth
                                             />
                                         </Box>
@@ -420,48 +406,6 @@ const TicketEdit: React.FC = () => {
                                             fullWidth
                                         />
 
-                                        <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
-                                            <Box sx={{ flex: 1, minWidth: '150px' }}>
-                                                <NumberInput
-                                                    source="estimated_hours"
-                                                    label="预估工时"
-                                                    min={0}
-                                                    step={0.5}
-                                                />
-                                            </Box>
-
-                                            <Box sx={{ flex: 1, minWidth: '150px' }}>
-                                                <NumberInput
-                                                    source="actual_hours"
-                                                    label="实际工时"
-                                                    min={0}
-                                                    step={0.5}
-                                                />
-                                            </Box>
-                                        </Box>
-                                    </Box>
-                                </CardContent>
-                            </Card>
-
-                            <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
-                                <CardHeader
-                                    title="SLA管理"
-                                    slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
-                                    sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
-                                />
-                                <CardContent>
-                                    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                                        <NumberInput
-                                            source="sla_hours"
-                                            label="SLA时间（小时）"
-                                            min={1}
-                                            fullWidth
-                                        />
-
-                                        <BooleanInput
-                                            source="is_overdue"
-                                            label="已逾期"
-                                        />
                                     </Box>
                                 </CardContent>
                             </Card>
@@ -487,64 +431,23 @@ const TicketEdit: React.FC = () => {
                                             format={formatTagsInputValue}
                                         />
 
-                                        <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
-                                            <BooleanInput
-                                                source="is_private"
-                                                label="私有工单"
-                                            />
-
-                                            <BooleanInput
-                                                source="is_internal"
-                                                label="内部工单"
-                                            />
-                                        </Box>
-                                    </Box>
-                                </CardContent>
-                            </Card>
-
-                            <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
-                                <CardHeader
-                                    title="解决方案"
-                                    slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
-                                    sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
-                                />
-                                <CardContent>
-                                    <TextInput
-                                        source="resolution_notes"
-                                        label="解决方案"
-                                        fullWidth
-                                        multiline
-                                        rows={4}
-                                        helperText="记录工单的解决过程和方案"
-                                    />
-                                </CardContent>
-                            </Card>
-
-                            <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
-                                <CardHeader
-                                    title="外部引用"
-                                    slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
-                                    sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
-                                />
-                                <CardContent>
-                                    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                                         <TextInput
-                                            source="external_reference"
-                                            label="外部参考号"
+                                            source="internal_notes"
+                                            label="内部备注"
                                             fullWidth
+                                            multiline
+                                            rows={4}
                                         />
-
-                                        <ReferenceInput
-                                            source="parent_ticket_id"
-                                            reference="tickets"
-                                            label="父工单"
-                                        >
-                                            <AutocompleteInput
-                                                label="父工单"
-                                                optionText="title"
-                                                optionValue="id"
-                                            />
-                                        </ReferenceInput>
+                                        <TextInput
+                                            source="custom_fields"
+                                            label="扩展字段（JSON）"
+                                            fullWidth
+                                            multiline
+                                            rows={8}
+                                            format={formatCustomFieldsInputValue}
+                                            validate={validateCustomFieldsInput}
+                                            helperText='请输入 JSON 对象，例如 {"asset_id":"A-1001"}'
+                                        />
                                     </Box>
                                 </CardContent>
                             </Card>

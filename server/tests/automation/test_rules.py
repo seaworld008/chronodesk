@@ -54,7 +54,10 @@ class TestAutomationRules:
             "name": f"{rule_payload['name']} legacy trigger",
             "trigger_event": "ticket.created",
         }
-        response = admin_api.post_json("/admin/automation/rules", legacy_payload)
+        response = admin_api.post_json(
+            admin_api.project_path("admin/automation/rules"),
+            legacy_payload,
+        )
         assert response.status_code == 400, response.text
         body = response.json()
         assert body.get("success") is False, body
@@ -67,7 +70,10 @@ class TestAutomationRules:
         created_rule_id: int | None = None
         try:
             # Create rule
-            create_resp = admin_api.post_json("/admin/automation/rules", rule_payload)
+            create_resp = admin_api.post_json(
+                admin_api.project_path("admin/automation/rules"),
+                rule_payload,
+            )
             assert create_resp.status_code == 201, create_resp.text
             create_body = create_resp.json()
             assert create_body.get("success") is True, create_body
@@ -76,7 +82,9 @@ class TestAutomationRules:
             assert created_rule_id, "创建规则未返回 ID"
 
             # List rules and ensure new rule present
-            list_resp = admin_api.get_json("/admin/automation/rules")
+            list_resp = admin_api.get_json(
+                admin_api.project_path("admin/automation/rules")
+            )
             assert list_resp.status_code == 200, list_resp.text
             list_body = list_resp.json()
             assert list_body.get("success") is True, list_body
@@ -88,7 +96,7 @@ class TestAutomationRules:
 
             # Fetch rule detail
             detail_resp = admin_api.get_json(
-                f"/admin/automation/rules/{created_rule_id}"
+                admin_api.project_path(f"admin/automation/rules/{created_rule_id}")
             )
             assert detail_resp.status_code == 200, detail_resp.text
             detail_body = detail_resp.json()
@@ -103,7 +111,7 @@ class TestAutomationRules:
                 "is_active": False,
             }
             update_resp = admin_api.put_json(
-                f"/admin/automation/rules/{created_rule_id}",
+                admin_api.project_path(f"admin/automation/rules/{created_rule_id}"),
                 updated_payload,
             )
             assert update_resp.status_code == 200, update_resp.text
@@ -112,7 +120,9 @@ class TestAutomationRules:
 
             # Fetch stats (should default to zero counts)
             stats_resp = admin_api.get_json(
-                f"/admin/automation/rules/{created_rule_id}/stats"
+                admin_api.project_path(
+                    f"admin/automation/rules/{created_rule_id}/stats"
+                )
             )
             assert stats_resp.status_code == 200, stats_resp.text
             stats_body = stats_resp.json()
@@ -123,7 +133,7 @@ class TestAutomationRules:
 
             # Execution logs (likely empty but endpoint should succeed)
             logs_resp = admin_api.get_json(
-                "/admin/automation/logs",
+                admin_api.project_path("admin/automation/logs"),
                 params={"rule_id": created_rule_id, "page_size": 5},
             )
             assert logs_resp.status_code == 200, logs_resp.text
@@ -133,7 +143,7 @@ class TestAutomationRules:
         finally:
             if created_rule_id is not None:
                 cleanup_resp = admin_api.delete(
-                    f"/admin/automation/rules/{created_rule_id}"
+                    admin_api.project_path(f"admin/automation/rules/{created_rule_id}")
                 )
                 if cleanup_resp.status_code == 200:
                     cleanup_body = cleanup_resp.json()

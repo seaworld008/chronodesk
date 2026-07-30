@@ -2,14 +2,40 @@ package database
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
-	"github.com/seaworld008/chronodesk/server/internal/auth"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+func auditedSeedOptions(options SeedOptions) SeedOptions {
+	options.EnsureInitialAdministratorMembership =
+		services.EnsureBootstrapProjectAdministratorMembership
+	return options
+}
+
+func TestSeedDataRequiresAuditedInitialAdministratorMembershipWriter(
+	t *testing.T,
+) {
+	db, err := gorm.Open(
+		sqlite.Open("file:seed-writer-required?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = SeedData(db, SeedOptions{})
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"audited initial administrator membership writer is required",
+	) {
+		t.Fatalf("SeedData() error = %v, want audited writer requirement", err)
+	}
+}
 
 func TestValidateRuntimeSchemaRequiresIdempotencyCompletionTTL(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open("file:runtime-schema-missing?mode=memory&cache=shared"), &gorm.Config{})
@@ -39,36 +65,7 @@ func TestValidateRuntimeSchemaAcceptsMigratedModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open database: %v", err)
 	}
-	modelsToMigrate := []any{
-		&models.User{},
-		&models.UserProfile{},
-		&models.EmailConfig{},
-		&auth.RefreshToken{},
-		&auth.EmailVerification{},
-		&auth.PasswordReset{},
-		&auth.OTPCode{},
-		&models.LoginHistory{},
-		&models.ServicePrincipal{},
-		&models.AgentCredential{},
-		&models.AgentPolicy{},
-		&models.PolicyDecision{},
-		&models.IdempotencyRecord{},
-		&models.Ticket{},
-		&models.TicketComment{},
-		&models.TicketAttachment{},
-		&models.TicketHistory{},
-		&models.TicketLease{},
-		&models.DomainEvent{},
-		&models.OutboxDelivery{},
-		&models.AgentTask{},
-		&models.AgentMessage{},
-		&models.AgentArtifact{},
-		&models.AgentTaskStatusHistory{},
-		&models.AgentTaskEvent{},
-		&models.AgentPushNotificationConfig{},
-		&models.Notification{},
-	}
-	if err := db.AutoMigrate(modelsToMigrate...); err != nil {
+	if err := RunMigrations(db); err != nil {
 		t.Fatalf("migrate runtime schema: %v", err)
 	}
 	if err := ValidateRuntimeSchema(db); err != nil {
@@ -143,7 +140,7 @@ func TestSeedDataIsTransactionalAndIdempotent(t *testing.T) {
 		t.Fatalf("run schema migration: %v", err)
 	}
 	for run := 1; run <= 2; run++ {
-		if err := SeedData(db, SeedOptions{}); err != nil {
+		if err := SeedData(db, auditedSeedOptions(SeedOptions{})); err != nil {
 			t.Fatalf("seed run %d: %v", run, err)
 		}
 	}
@@ -170,19 +167,210 @@ func TestSeedDataIsTransactionalAndIdempotent(t *testing.T) {
 	if err := db.Model(&models.EmailConfig{}).Count(&emailConfigs).Error; err != nil {
 		t.Fatal(err)
 	}
+	var administrator models.User
+	if err := db.Where("role = ?", models.RoleAdmin).
+		First(&administrator).Error; err != nil {
+		t.Fatal(err)
+	}
+	_, _, project, _ := loadDefaultProjectHierarchy(t, db)
+	var memberships []models.ProjectMembership
+	if err := db.Where(
+		"project_id = ? AND user_id = ?",
+		project.ID,
+		administrator.ID,
+	).Find(&memberships).Error; err != nil {
+		t.Fatal(err)
+	}
 	if admins != 1 ||
 		categories != 4 ||
 		tickets != 0 ||
 		configs != int64(len(models.DefaultSystemConfigs("test"))) ||
-		emailConfigs != 1 {
+		emailConfigs != 1 ||
+		len(memberships) != 1 ||
+		memberships[0].Role != models.ProjectRoleAdmin ||
+		!memberships[0].IsActive {
 		t.Fatalf(
-			"unexpected idempotent seed result: admins=%d categories=%d tickets=%d configs=%d email_configs=%d",
+			"unexpected idempotent seed result: admins=%d categories=%d tickets=%d configs=%d email_configs=%d memberships=%+v",
 			admins,
 			categories,
 			tickets,
 			configs,
 			emailConfigs,
+			memberships,
 		)
+	}
+}
+
+func TestSeedDataGrantsExistingInitialAdministratorDefaultProjectAccess(
+	t *testing.T,
+) {
+	t.Setenv("ADMIN_PASSWORD", "")
+	t.Setenv("ENVIRONMENT", "development")
+
+	db, err := gorm.Open(
+		sqlite.Open("file:seed-existing-admin-membership?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("run schema migration: %v", err)
+	}
+	administrator := models.User{
+		Username:     "existing-admin",
+		Email:        "existing-admin@example.test",
+		PasswordHash: "existing-password-hash",
+		Role:         models.RoleAdmin,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&administrator).Error; err != nil {
+		t.Fatalf("create existing administrator: %v", err)
+	}
+
+	if err := SeedData(db, auditedSeedOptions(SeedOptions{})); err != nil {
+		t.Fatalf("seed existing administrator: %v", err)
+	}
+
+	organization, _, project, _ := loadDefaultProjectHierarchy(t, db)
+	var membership models.ProjectMembership
+	if err := db.Where(
+		"project_id = ? AND user_id = ?",
+		project.ID,
+		administrator.ID,
+	).First(&membership).Error; err != nil {
+		t.Fatalf("load existing administrator membership: %v", err)
+	}
+	if project.OrganizationID != organization.ID ||
+		membership.Role != models.ProjectRoleAdmin ||
+		!membership.IsActive {
+		t.Fatalf(
+			"default project membership is not an active administrator grant: project=%+v membership=%+v",
+			project,
+			membership,
+		)
+	}
+}
+
+func TestSeedDataRejectsConflictingDefaultProjectMembershipWithoutOverwrite(
+	t *testing.T,
+) {
+	t.Setenv("ADMIN_PASSWORD", "")
+	t.Setenv("ENVIRONMENT", "development")
+
+	db, err := gorm.Open(
+		sqlite.Open("file:seed-conflicting-admin-membership?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("run schema migration: %v", err)
+	}
+	administrator := models.User{
+		Username:     "configured-admin",
+		Email:        "configured-admin@example.test",
+		PasswordHash: "configured-password-hash",
+		Role:         models.RoleAdmin,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&administrator).Error; err != nil {
+		t.Fatalf("create existing administrator: %v", err)
+	}
+	_, _, project, _ := loadDefaultProjectHierarchy(t, db)
+	existingMembership := models.ProjectMembership{
+		ProjectID: project.ID,
+		UserID:    administrator.ID,
+		Role:      models.ProjectRoleManager,
+		IsActive:  true,
+	}
+	if err := db.Create(&existingMembership).Error; err != nil {
+		t.Fatalf("create explicit membership: %v", err)
+	}
+
+	err = SeedData(db, auditedSeedOptions(SeedOptions{}))
+	if err == nil || !errors.Is(err, services.ErrProjectMembershipConflict) {
+		t.Fatalf("SeedData() error = %v, want explicit membership conflict", err)
+	}
+
+	var preserved models.ProjectMembership
+	if err := db.First(&preserved, existingMembership.ID).Error; err != nil {
+		t.Fatalf("reload explicit membership: %v", err)
+	}
+	if preserved.Role != models.ProjectRoleManager || !preserved.IsActive {
+		t.Fatalf("explicit membership was overwritten: %+v", preserved)
+	}
+	var categories int64
+	if err := db.Model(&models.Category{}).Count(&categories).Error; err != nil {
+		t.Fatal(err)
+	}
+	var configs int64
+	if err := db.Model(&models.SystemConfig{}).Count(&configs).Error; err != nil {
+		t.Fatal(err)
+	}
+	var emailConfigs int64
+	if err := db.Model(&models.EmailConfig{}).Count(&emailConfigs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if categories != 0 || configs != 0 || emailConfigs != 0 {
+		t.Fatalf(
+			"failed seed was not rolled back: categories=%d configs=%d email_configs=%d",
+			categories,
+			configs,
+			emailConfigs,
+		)
+	}
+}
+
+func TestSeedDataRequiresTrustedDefaultProjectAndRollsBackAdministrator(
+	t *testing.T,
+) {
+	t.Setenv("ADMIN_EMAIL", "missing-project@example.test")
+	t.Setenv("ADMIN_PASSWORD", "ChronoDesk-Test-2026!")
+	t.Setenv("ENVIRONMENT", "development")
+
+	db, err := gorm.Open(
+		sqlite.Open("file:seed-missing-default-project?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("run schema migration: %v", err)
+	}
+	_, _, project, _ := loadDefaultProjectHierarchy(t, db)
+	if err := db.Delete(&models.Project{}, project.ID).Error; err != nil {
+		t.Fatalf("remove default project fixture: %v", err)
+	}
+
+	err = SeedData(db, auditedSeedOptions(SeedOptions{}))
+	if err == nil || !strings.Contains(err.Error(), "trusted default project") {
+		t.Fatalf("SeedData() error = %v, want missing trusted project", err)
+	}
+
+	for _, assertion := range []struct {
+		name  string
+		model any
+	}{
+		{name: "administrators", model: &models.User{}},
+		{name: "memberships", model: &models.ProjectMembership{}},
+		{name: "categories", model: &models.Category{}},
+		{name: "configs", model: &models.SystemConfig{}},
+		{name: "email configs", model: &models.EmailConfig{}},
+	} {
+		var count int64
+		query := db.Model(assertion.model)
+		if assertion.name == "administrators" {
+			query = query.Where("role = ?", models.RoleAdmin)
+		}
+		if err := query.Count(&count).Error; err != nil {
+			t.Fatalf("count %s: %v", assertion.name, err)
+		}
+		if count != 0 {
+			t.Fatalf("%s after failed seed = %d, want 0", assertion.name, count)
+		}
 	}
 }
 
@@ -201,7 +389,10 @@ func TestSeedDataRejectsSamplesOutsideDevelopmentAndRollsBack(t *testing.T) {
 	if err := RunMigrations(db); err != nil {
 		t.Fatalf("run schema migration: %v", err)
 	}
-	err = SeedData(db, SeedOptions{IncludeSampleData: true})
+	err = SeedData(
+		db,
+		auditedSeedOptions(SeedOptions{IncludeSampleData: true}),
+	)
 	if err == nil || !strings.Contains(err.Error(), "ENVIRONMENT=development") {
 		t.Fatalf("SeedData() error = %v, want environment gate", err)
 	}
@@ -222,13 +413,40 @@ func TestSeedDataRejectsSamplesOutsideDevelopmentAndRollsBack(t *testing.T) {
 	if err := db.Model(&models.EmailConfig{}).Count(&emailConfigs).Error; err != nil {
 		t.Fatal(err)
 	}
-	if users != 0 || categories != 0 || configs != 0 || emailConfigs != 0 {
+	var memberships int64
+	if err := db.Model(&models.ProjectMembership{}).Count(&memberships).Error; err != nil {
+		t.Fatal(err)
+	}
+	var events int64
+	if err := db.Model(&models.DomainEvent{}).Count(&events).Error; err != nil {
+		t.Fatal(err)
+	}
+	var deliveries int64
+	if err := db.Model(&models.OutboxDelivery{}).Count(&deliveries).Error; err != nil {
+		t.Fatal(err)
+	}
+	var auditEntries int64
+	if err := db.Model(&models.AuditLedgerEntry{}).Count(&auditEntries).Error; err != nil {
+		t.Fatal(err)
+	}
+	if users != 0 ||
+		categories != 0 ||
+		configs != 0 ||
+		emailConfigs != 0 ||
+		memberships != 0 ||
+		events != 0 ||
+		deliveries != 0 ||
+		auditEntries != 0 {
 		t.Fatalf(
-			"failed seed was not rolled back: users=%d categories=%d configs=%d email_configs=%d",
+			"failed seed was not rolled back: users=%d categories=%d configs=%d email_configs=%d memberships=%d events=%d deliveries=%d audit_entries=%d",
 			users,
 			categories,
 			configs,
 			emailConfigs,
+			memberships,
+			events,
+			deliveries,
+			auditEntries,
 		)
 	}
 }
@@ -282,7 +500,10 @@ func TestRunMigrationsUpgradesLegacyHumanRolesBeforeInstallingConstraint(t *test
 	}
 
 	for run := 1; run <= 2; run++ {
-		if err := RunMigrations(db); err != nil {
+		if err := RunMigrations(
+			db,
+			services.EnsureProjectScopeMigrationMembership,
+		); err != nil {
 			t.Fatalf("run migration %d: %v", run, err)
 		}
 	}

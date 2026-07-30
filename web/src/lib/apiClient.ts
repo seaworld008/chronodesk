@@ -46,6 +46,9 @@ const problemMessages: Record<string, string> = {
   automation_loop: '检测到异常自动化循环，操作已停止',
   outbox_replay_conflict: '该投递当前无法回放，请刷新状态后重试',
   attachment_rejected: '附件未通过安全校验，无法继续处理',
+  ticket_configuration_unavailable: '当前项目没有完整的已发布建单配置',
+  request_type_version_required: '请选择当前项目已发布的请求类型',
+  ticket_form_validation_failed: '提交内容不符合所选请求类型的表单规则',
   internal_error: '服务暂时不可用，请稍后重试',
 }
 

@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/security"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -18,6 +20,38 @@ import (
 type GormStore struct {
 	db        *gorm.DB
 	protector security.Protector
+}
+
+func withGormStoreProjectScope[T any](
+	store *GormStore,
+	ctx context.Context,
+	scope models.ProjectScope,
+	run func(context.Context) (T, error),
+) (T, error) {
+	var zero T
+	if store == nil || store.db == nil || run == nil {
+		return zero, errors.New("A2A project store is unavailable")
+	}
+	if scopeddb.HasTransaction(ctx) {
+		return run(ctx)
+	}
+	var (
+		result       T
+		operationErr error
+	)
+	transactionErr := scopeddb.WithProjectScopeContextTransaction(
+		ctx,
+		store.db,
+		scope,
+		func(scopedContext context.Context) error {
+			result, operationErr = run(scopedContext)
+			return operationErr
+		},
+	)
+	if transactionErr != nil {
+		return zero, transactionErr
+	}
+	return result, operationErr
 }
 
 // NewGormStoreWithProtector injects the data-encryption keyring used by A2A
@@ -40,39 +74,106 @@ func MigrationModels() []any {
 	}
 }
 
+// AutoMigrate is a migration-control-plane operation executed with the
+// dedicated migration role before FORCE RLS runtime traffic starts. It is not
+// part of the context-bound A2A Store interface.
 func (s *GormStore) AutoMigrate() error {
 	return s.db.AutoMigrate(MigrationModels()...)
 }
 
 func (s *GormStore) CreateTask(ctx context.Context, task Task) error {
+	scope, err := requireA2AStoreScope(ctx)
+	if err != nil {
+		return err
+	}
 	if err := bindTaskOwner(ctx, &task); err != nil {
 		return err
 	}
 	if task.Version == 0 {
 		task.Version = 1
 	}
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		return createGormTask(tx.WithContext(ctx), task)
-	})
+	_, err = withGormStoreProjectScope(
+		s,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (struct{}, error) {
+			err := scopeddb.TransactionForContext(
+				scopedContext,
+				s.db,
+				func(tx *gorm.DB) error {
+					return createGormTask(
+						tx.WithContext(scopedContext),
+						task,
+						scope,
+					)
+				},
+			)
+			return struct{}{}, err
+		},
+	)
+	return err
 }
 
 func (s *GormStore) FindTaskByMessageID(ctx context.Context, messageID string) (Task, error) {
-	var message models.AgentMessage
-	if err := s.db.WithContext(ctx).
-		Select("task_id").
-		First(&message, "id = ?", strings.TrimSpace(messageID)).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return Task{}, ErrTaskNotFound
-		}
+	scope, err := requireA2AStoreScope(ctx)
+	if err != nil {
 		return Task{}, err
 	}
-	return s.GetTask(ctx, message.TaskID)
+	return withGormStoreProjectScope(
+		s,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (Task, error) {
+			var message models.AgentMessage
+			if err := scopeA2AProject(
+				s.db.WithContext(scopedContext),
+				scope,
+			).
+				Select("task_id").
+				First(
+					&message,
+					"id = ?",
+					strings.TrimSpace(messageID),
+				).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return Task{}, ErrTaskNotFound
+				}
+				return Task{}, err
+			}
+			return getGormTask(
+				s.db.WithContext(scopedContext),
+				message.TaskID,
+				scope,
+			)
+		},
+	)
 }
 
 func (s *GormStore) UpdateTask(ctx context.Context, task Task) error {
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		return updateGormTask(tx.WithContext(ctx), task)
-	})
+	scope, err := requireA2AStoreScope(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = withGormStoreProjectScope(
+		s,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (struct{}, error) {
+			err := scopeddb.TransactionForContext(
+				scopedContext,
+				s.db,
+				func(tx *gorm.DB) error {
+					return updateGormTask(
+						tx.WithContext(scopedContext),
+						task,
+						scope,
+					)
+				},
+			)
+			return struct{}{}, err
+		},
+	)
+	return err
 }
 
 func (s *GormStore) ClaimTaskExecution(
@@ -84,32 +185,55 @@ func (s *GormStore) ClaimTaskExecution(
 	now time.Time,
 	expiresAt time.Time,
 ) error {
-	databaseNow := taskClaimDatabaseNowSQL(s.db)
-	databaseExpiry := taskClaimDatabaseExpirySQL(s.db, expiresAt.Sub(now))
-	result := s.db.WithContext(ctx).
-		Model(&models.AgentTask{}).
-		Where("id = ? AND version = ?", taskID, expectedVersion).
-		Where("state IN ?", []models.A2ATaskState{
-			models.A2ATaskStateSubmitted,
-			models.A2ATaskStateWorking,
-		}).
-		Where(
-			"execution_claim_id = ? OR execution_expires_at IS NULL OR execution_expires_at <= "+databaseNow,
-			"",
-		).
-		Scopes(scopeA2ATaskOwner).
-		UpdateColumns(map[string]any{
-			"execution_claim_id":   claimID,
-			"execution_message_id": messageID,
-			"execution_expires_at": databaseExpiry,
-		})
-	if result.Error != nil {
-		return result.Error
+	scope, err := requireA2AStoreScope(ctx)
+	if err != nil {
+		return err
 	}
-	if result.RowsAffected == 1 {
-		return nil
-	}
-	return s.executionClaimFailure(ctx, taskID, expectedVersion)
+	_, err = withGormStoreProjectScope(
+		s,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (struct{}, error) {
+			databaseNow := taskClaimDatabaseNowSQL(s.db)
+			databaseExpiry := taskClaimDatabaseExpirySQL(
+				s.db,
+				expiresAt.Sub(now),
+			)
+			result := s.db.WithContext(scopedContext).
+				Model(&models.AgentTask{}).
+				Scopes(func(db *gorm.DB) *gorm.DB {
+					return scopeA2AProject(db, scope)
+				}).
+				Where("id = ? AND version = ?", taskID, expectedVersion).
+				Where("state IN ?", []models.A2ATaskState{
+					models.A2ATaskStateSubmitted,
+					models.A2ATaskStateWorking,
+				}).
+				Where(
+					"execution_claim_id = ? OR execution_expires_at IS NULL OR execution_expires_at <= "+databaseNow,
+					"",
+				).
+				Scopes(scopeA2ATaskOwner).
+				UpdateColumns(map[string]any{
+					"execution_claim_id":   claimID,
+					"execution_message_id": messageID,
+					"execution_expires_at": databaseExpiry,
+				})
+			if result.Error != nil {
+				return struct{}{}, result.Error
+			}
+			if result.RowsAffected == 1 {
+				return struct{}{}, nil
+			}
+			return struct{}{}, s.executionClaimFailure(
+				scopedContext,
+				scope,
+				taskID,
+				expectedVersion,
+			)
+		},
+	)
+	return err
 }
 
 func (s *GormStore) RenewTaskExecution(
@@ -120,30 +244,48 @@ func (s *GormStore) RenewTaskExecution(
 	now time.Time,
 	expiresAt time.Time,
 ) error {
-	databaseNow := taskClaimDatabaseNowSQL(s.db)
-	databaseExpiry := taskClaimDatabaseExpirySQL(s.db, expiresAt.Sub(now))
-	result := s.db.WithContext(ctx).
-		Model(&models.AgentTask{}).
-		Where(
-			"id = ? AND execution_claim_id = ? AND execution_message_id = ?",
-			taskID,
-			claimID,
-			messageID,
-		).
-		Where("execution_expires_at > "+databaseNow).
-		Where("state IN ?", []models.A2ATaskState{
-			models.A2ATaskStateSubmitted,
-			models.A2ATaskStateWorking,
-		}).
-		Scopes(scopeA2ATaskOwner).
-		UpdateColumn("execution_expires_at", databaseExpiry)
-	if result.Error != nil {
-		return result.Error
+	scope, err := requireA2AStoreScope(ctx)
+	if err != nil {
+		return err
 	}
-	if result.RowsAffected == 0 {
-		return ErrTaskBusy
-	}
-	return nil
+	_, err = withGormStoreProjectScope(
+		s,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (struct{}, error) {
+			databaseNow := taskClaimDatabaseNowSQL(s.db)
+			databaseExpiry := taskClaimDatabaseExpirySQL(
+				s.db,
+				expiresAt.Sub(now),
+			)
+			result := s.db.WithContext(scopedContext).
+				Model(&models.AgentTask{}).
+				Scopes(func(db *gorm.DB) *gorm.DB {
+					return scopeA2AProject(db, scope)
+				}).
+				Where(
+					"id = ? AND execution_claim_id = ? AND execution_message_id = ?",
+					taskID,
+					claimID,
+					messageID,
+				).
+				Where("execution_expires_at > "+databaseNow).
+				Where("state IN ?", []models.A2ATaskState{
+					models.A2ATaskStateSubmitted,
+					models.A2ATaskStateWorking,
+				}).
+				Scopes(scopeA2ATaskOwner).
+				UpdateColumn("execution_expires_at", databaseExpiry)
+			if result.Error != nil {
+				return struct{}{}, result.Error
+			}
+			if result.RowsAffected == 0 {
+				return struct{}{}, ErrTaskBusy
+			}
+			return struct{}{}, nil
+		},
+	)
+	return err
 }
 
 func (s *GormStore) ReleaseTaskExecution(
@@ -152,36 +294,52 @@ func (s *GormStore) ReleaseTaskExecution(
 	messageID string,
 	claimID string,
 ) error {
-	result := s.db.WithContext(ctx).
-		Model(&models.AgentTask{}).
-		Where(
-			"id = ? AND execution_claim_id = ? AND execution_message_id = ?",
-			taskID,
-			claimID,
-			messageID,
-		).
-		Scopes(scopeA2ATaskOwner).
-		UpdateColumns(map[string]any{
-			"execution_claim_id":   "",
-			"execution_message_id": "",
-			"execution_expires_at": nil,
-		})
-	if result.Error != nil {
-		return result.Error
+	scope, err := requireA2AStoreScope(ctx)
+	if err != nil {
+		return err
 	}
-	if result.RowsAffected == 0 {
-		return ErrTaskBusy
-	}
-	return nil
+	_, err = withGormStoreProjectScope(
+		s,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (struct{}, error) {
+			result := s.db.WithContext(scopedContext).
+				Model(&models.AgentTask{}).
+				Scopes(func(db *gorm.DB) *gorm.DB {
+					return scopeA2AProject(db, scope)
+				}).
+				Where(
+					"id = ? AND execution_claim_id = ? AND execution_message_id = ?",
+					taskID,
+					claimID,
+					messageID,
+				).
+				Scopes(scopeA2ATaskOwner).
+				UpdateColumns(map[string]any{
+					"execution_claim_id":   "",
+					"execution_message_id": "",
+					"execution_expires_at": nil,
+				})
+			if result.Error != nil {
+				return struct{}{}, result.Error
+			}
+			if result.RowsAffected == 0 {
+				return struct{}{}, ErrTaskBusy
+			}
+			return struct{}{}, nil
+		},
+	)
+	return err
 }
 
 func (s *GormStore) executionClaimFailure(
 	ctx context.Context,
+	scope models.ProjectScope,
 	taskID string,
 	expectedVersion uint64,
 ) error {
 	var task models.AgentTask
-	if err := s.db.WithContext(ctx).
+	if err := scopeA2AProject(s.db.WithContext(ctx), scope).
 		Select("id", "version").
 		Where("id = ?", taskID).
 		Scopes(scopeA2ATaskOwner).
@@ -198,16 +356,53 @@ func (s *GormStore) executionClaimFailure(
 }
 
 func (s *GormStore) GetTask(ctx context.Context, id string) (Task, error) {
-	return getGormTask(s.db.WithContext(ctx), id)
+	scope, err := requireA2AStoreScope(ctx)
+	if err != nil {
+		return Task{}, err
+	}
+	return withGormStoreProjectScope(
+		s,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (Task, error) {
+			return getGormTask(
+				s.db.WithContext(scopedContext),
+				id,
+				scope,
+			)
+		},
+	)
 }
 
 func (s *GormStore) ListTasks(ctx context.Context, params ListTasksParams) (ListTasksResult, error) {
+	scope, err := requireA2AStoreScope(ctx)
+	if err != nil {
+		return ListTasksResult{}, err
+	}
+	return withGormStoreProjectScope(
+		s,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (ListTasksResult, error) {
+			return s.listTasksInProject(scopedContext, scope, params)
+		},
+	)
+}
+
+func (s *GormStore) listTasksInProject(
+	ctx context.Context,
+	scope models.ProjectScope,
+	params ListTasksParams,
+) (ListTasksResult, error) {
 	pageSize := normalizePageSize(params.PageSize)
 	cursor, err := decodeTaskPageToken(params.PageToken)
 	if err != nil {
 		return ListTasksResult{}, err
 	}
-	query := s.db.WithContext(ctx).Model(&models.AgentTask{}).Scopes(scopeA2ATaskOwner)
+	query := scopeA2AProject(
+		s.db.WithContext(ctx).Model(&models.AgentTask{}),
+		scope,
+	).Scopes(scopeA2ATaskOwner)
 	if params.ContextID != "" {
 		query = query.Where("context_id = ?", params.ContextID)
 	}
@@ -243,7 +438,7 @@ func (s *GormStore) ListTasks(ctx context.Context, params ListTasksParams) (List
 	}
 	tasks := make([]Task, 0, len(rows))
 	for i := range rows {
-		task, err := hydrateGormTask(s.db.WithContext(ctx), rows[i])
+		task, err := hydrateGormTask(s.db.WithContext(ctx), rows[i], scope)
 		if err != nil {
 			return ListTasksResult{}, err
 		}
@@ -262,7 +457,23 @@ func (s *GormStore) ListTasks(ctx context.Context, params ListTasksParams) (List
 }
 
 func (s *GormStore) AppendEvent(ctx context.Context, event StoredEvent) (StoredEvent, error) {
-	return appendGormEvent(ctx, s.db, event)
+	scope, err := requireA2AStoreScope(ctx)
+	if err != nil {
+		return StoredEvent{}, err
+	}
+	return withGormStoreProjectScope(
+		s,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (StoredEvent, error) {
+			return appendGormEvent(
+				scopedContext,
+				s.db,
+				event,
+				scope,
+			)
+		},
+	)
 }
 
 func (s *GormStore) CreateTaskWithEvent(
@@ -272,6 +483,10 @@ func (s *GormStore) CreateTaskWithEvent(
 	pushConfig *PushNotificationConfig,
 	dispatcher TransactionalPushDispatcher,
 ) (StoredEvent, error) {
+	scope, err := requireA2AStoreScope(ctx)
+	if err != nil {
+		return StoredEvent{}, err
+	}
 	if err := bindTaskOwner(ctx, &task); err != nil {
 		return StoredEvent{}, err
 	}
@@ -281,11 +496,12 @@ func (s *GormStore) CreateTaskWithEvent(
 	return s.persistTaskWithEvent(
 		ctx,
 		func(tx *gorm.DB) error {
-			return createGormTask(tx, task)
+			return createGormTask(tx, task, scope)
 		},
 		event,
 		pushConfig,
 		dispatcher,
+		scope,
 	)
 }
 
@@ -296,14 +512,19 @@ func (s *GormStore) UpdateTaskWithEvent(
 	pushConfig *PushNotificationConfig,
 	dispatcher TransactionalPushDispatcher,
 ) (StoredEvent, error) {
+	scope, err := requireA2AStoreScope(ctx)
+	if err != nil {
+		return StoredEvent{}, err
+	}
 	return s.persistTaskWithEvent(
 		ctx,
 		func(tx *gorm.DB) error {
-			return updateGormTask(tx, task)
+			return updateGormTask(tx, task, scope)
 		},
 		event,
 		pushConfig,
 		dispatcher,
+		scope,
 	)
 }
 
@@ -313,29 +534,61 @@ func (s *GormStore) persistTaskWithEvent(
 	event StoredEvent,
 	pushConfig *PushNotificationConfig,
 	dispatcher TransactionalPushDispatcher,
+	scope models.ProjectScope,
 ) (StoredEvent, error) {
-	var persisted StoredEvent
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		tx = tx.WithContext(ctx)
-		if err := mutate(tx); err != nil {
-			return err
-		}
-		if pushConfig != nil {
-			if err := createGormPushConfig(tx, *pushConfig, s.protector); err != nil {
-				return err
+	return withGormStoreProjectScope(
+		s,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (StoredEvent, error) {
+			var persisted StoredEvent
+			err := scopeddb.TransactionForContext(
+				scopedContext,
+				s.db,
+				func(tx *gorm.DB) error {
+					tx = tx.WithContext(scopedContext)
+					if err := mutate(tx); err != nil {
+						return err
+					}
+					if pushConfig != nil {
+						if err := createGormPushConfig(
+							tx,
+							*pushConfig,
+							s.protector,
+							scope,
+						); err != nil {
+							return err
+						}
+					}
+					var appendErr error
+					persisted, appendErr = appendGormEvent(
+						scopedContext,
+						tx,
+						event,
+						scope,
+					)
+					if appendErr != nil {
+						return appendErr
+					}
+					// EnqueueTx may only persist an outbox intent. Actual
+					// delivery and all network I/O happen after commit.
+					return enqueueGormPushDeliveries(
+						scopedContext,
+						tx,
+						event.TaskID,
+						persisted,
+						dispatcher,
+						s.protector,
+						scope,
+					)
+				},
+			)
+			if err != nil {
+				return StoredEvent{}, err
 			}
-		}
-		var appendErr error
-		persisted, appendErr = appendGormEvent(ctx, tx, event)
-		if appendErr != nil {
-			return appendErr
-		}
-		return enqueueGormPushDeliveries(ctx, tx, event.TaskID, persisted, dispatcher, s.protector)
-	})
-	if err != nil {
-		return StoredEvent{}, err
-	}
-	return persisted, nil
+			return persisted, nil
+		},
+	)
 }
 
 func (s *GormStore) AppendEventWithPush(
@@ -343,27 +596,62 @@ func (s *GormStore) AppendEventWithPush(
 	event StoredEvent,
 	dispatcher TransactionalPushDispatcher,
 ) (StoredEvent, error) {
-	if dispatcher == nil {
-		return StoredEvent{}, errors.New("transactional push dispatcher is required")
-	}
-	var persisted StoredEvent
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var appendErr error
-		persisted, appendErr = appendGormEvent(ctx, tx, event)
-		if appendErr != nil {
-			return appendErr
-		}
-		return enqueueGormPushDeliveries(ctx, tx, event.TaskID, persisted, dispatcher, s.protector)
-	})
+	scope, err := requireA2AStoreScope(ctx)
 	if err != nil {
 		return StoredEvent{}, err
 	}
-	return persisted, nil
+	if dispatcher == nil {
+		return StoredEvent{}, errors.New("transactional push dispatcher is required")
+	}
+	return withGormStoreProjectScope(
+		s,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (StoredEvent, error) {
+			var persisted StoredEvent
+			err := scopeddb.TransactionForContext(
+				scopedContext,
+				s.db,
+				func(tx *gorm.DB) error {
+					var appendErr error
+					persisted, appendErr = appendGormEvent(
+						scopedContext,
+						tx,
+						event,
+						scope,
+					)
+					if appendErr != nil {
+						return appendErr
+					}
+					// EnqueueTx is a database-only outbox operation. Push
+					// delivery must never execute inside this transaction.
+					return enqueueGormPushDeliveries(
+						scopedContext,
+						tx,
+						event.TaskID,
+						persisted,
+						dispatcher,
+						s.protector,
+						scope,
+					)
+				},
+			)
+			if err != nil {
+				return StoredEvent{}, err
+			}
+			return persisted, nil
+		},
+	)
 }
 
-func appendGormEvent(ctx context.Context, db *gorm.DB, event StoredEvent) (StoredEvent, error) {
+func appendGormEvent(
+	ctx context.Context,
+	db *gorm.DB,
+	event StoredEvent,
+	scope models.ProjectScope,
+) (StoredEvent, error) {
 	var task models.AgentTask
-	if err := db.WithContext(ctx).
+	if err := scopeA2AProject(db.WithContext(ctx), scope).
 		Select("id", "version").
 		Where("id = ?", event.TaskID).
 		Scopes(scopeA2ATaskOwner).
@@ -384,6 +672,8 @@ func appendGormEvent(ctx context.Context, db *gorm.DB, event StoredEvent) (Store
 		return StoredEvent{}, err
 	}
 	row := models.AgentTaskEvent{
+		OrganizationID:  scope.OrganizationID,
+		ProjectID:       scope.ProjectID,
 		TaskID:          event.TaskID,
 		ContextID:       event.ContextID,
 		ResourceVersion: event.ResourceVersion,
@@ -398,42 +688,71 @@ func appendGormEvent(ctx context.Context, db *gorm.DB, event StoredEvent) (Store
 }
 
 func (s *GormStore) EventsAfter(ctx context.Context, taskID, cursor string, limit int) ([]StoredEvent, error) {
-	var taskCount int64
-	if err := s.db.WithContext(ctx).
-		Model(&models.AgentTask{}).
-		Where("id = ?", taskID).
-		Scopes(scopeA2ATaskOwner).
-		Count(&taskCount).Error; err != nil {
+	scope, err := requireA2AStoreScope(ctx)
+	if err != nil {
 		return nil, err
-	}
-	if taskCount == 0 {
-		return nil, ErrTaskNotFound
 	}
 	after, err := decodeEventCursor(cursor)
 	if err != nil {
 		return nil, err
 	}
-	if after > 0 {
-		var cursorEvent models.AgentTaskEvent
-		err := s.db.WithContext(ctx).Select("id", "task_id").Where("id = ?", after).First(&cursorEvent).Error
-		if errors.Is(err, gorm.ErrRecordNotFound) || (err == nil && cursorEvent.TaskID != taskID) {
-			return nil, ErrInvalidEventCursor
-		}
-		if err != nil {
-			return nil, err
-		}
-	}
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}
-	var rows []models.AgentTaskEvent
-	if err := s.db.WithContext(ctx).
-		Where("task_id = ? AND id > ?", taskID, after).
-		Order("id ASC").
-		Limit(limit).
-		Find(&rows).Error; err != nil {
+	rows, err := withGormStoreProjectScope(
+		s,
+		ctx,
+		scope,
+		func(scopedContext context.Context) ([]models.AgentTaskEvent, error) {
+			var taskCount int64
+			if err := scopeA2AProject(
+				s.db.WithContext(scopedContext),
+				scope,
+			).
+				Model(&models.AgentTask{}).
+				Where("id = ?", taskID).
+				Scopes(scopeA2ATaskOwner).
+				Count(&taskCount).Error; err != nil {
+				return nil, err
+			}
+			if taskCount == 0 {
+				return nil, ErrTaskNotFound
+			}
+			if after > 0 {
+				var cursorEvent models.AgentTaskEvent
+				err := scopeA2AProject(
+					s.db.WithContext(scopedContext),
+					scope,
+				).
+					Select("id", "task_id").
+					Where("id = ?", after).
+					First(&cursorEvent).Error
+				if errors.Is(err, gorm.ErrRecordNotFound) ||
+					(err == nil && cursorEvent.TaskID != taskID) {
+					return nil, ErrInvalidEventCursor
+				}
+				if err != nil {
+					return nil, err
+				}
+			}
+			var rows []models.AgentTaskEvent
+			if err := scopeA2AProject(
+				s.db.WithContext(scopedContext),
+				scope,
+			).
+				Where("task_id = ? AND id > ?", taskID, after).
+				Order("id ASC").
+				Limit(limit).
+				Find(&rows).Error; err != nil {
+				return nil, err
+			}
+			return rows, nil
+		},
+	)
+	if err != nil {
 		return nil, err
 	}
+	// Decode stream payloads after the short RLS transaction has committed.
 	events := make([]StoredEvent, 0, len(rows))
 	for _, row := range rows {
 		var payload StreamResponse
@@ -453,16 +772,38 @@ func (s *GormStore) EventsAfter(ctx context.Context, taskID, cursor string, limi
 }
 
 func (s *GormStore) CreatePushConfig(ctx context.Context, config PushNotificationConfig) error {
-	if _, err := s.GetTask(ctx, config.TaskID); err != nil {
+	scope, err := requireA2AStoreScope(ctx)
+	if err != nil {
 		return err
 	}
-	return createGormPushConfig(s.db.WithContext(ctx), config, s.protector)
+	_, err = withGormStoreProjectScope(
+		s,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (struct{}, error) {
+			if _, err := getGormTask(
+				s.db.WithContext(scopedContext),
+				config.TaskID,
+				scope,
+			); err != nil {
+				return struct{}{}, err
+			}
+			return struct{}{}, createGormPushConfig(
+				s.db.WithContext(scopedContext),
+				config,
+				s.protector,
+				scope,
+			)
+		},
+	)
+	return err
 }
 
 func createGormPushConfig(
 	db *gorm.DB,
 	config PushNotificationConfig,
 	protector security.Protector,
+	scope models.ProjectScope,
 ) error {
 	token, err := security.ProtectOptional(
 		protector,
@@ -495,6 +836,8 @@ func createGormPushConfig(
 	}
 	row := models.AgentPushNotificationConfig{
 		ID:             config.ID,
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
 		TaskID:         config.TaskID,
 		URL:            config.URL,
 		Token:          token,
@@ -511,48 +854,102 @@ func createGormPushConfig(
 }
 
 func (s *GormStore) GetPushConfig(ctx context.Context, taskID, id string) (PushNotificationConfig, error) {
-	if _, err := s.GetTask(ctx, taskID); err != nil {
-		return PushNotificationConfig{}, err
-	}
-	var row models.AgentPushNotificationConfig
-	err := s.db.WithContext(ctx).Where("task_id = ? AND id = ?", taskID, id).First(&row).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return PushNotificationConfig{}, ErrPushConfigNotFound
-	}
+	scope, err := requireA2AStoreScope(ctx)
 	if err != nil {
 		return PushNotificationConfig{}, err
 	}
+	row, err := withGormStoreProjectScope(
+		s,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (models.AgentPushNotificationConfig, error) {
+			if _, err := getGormTask(
+				s.db.WithContext(scopedContext),
+				taskID,
+				scope,
+			); err != nil {
+				return models.AgentPushNotificationConfig{}, err
+			}
+			var row models.AgentPushNotificationConfig
+			err := scopeA2AProject(
+				s.db.WithContext(scopedContext),
+				scope,
+			).
+				Where("task_id = ? AND id = ?", taskID, id).
+				First(&row).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return models.AgentPushNotificationConfig{},
+					ErrPushConfigNotFound
+			}
+			return row, err
+		},
+	)
+	if err != nil {
+		return PushNotificationConfig{}, err
+	}
+	// Secret decryption happens only after the short RLS transaction.
 	return pushConfigFromModel(row, s.protector)
 }
 
 func (s *GormStore) ListPushConfigs(ctx context.Context, taskID, pageToken string, pageSize int) ([]PushNotificationConfig, string, error) {
-	var taskCount int64
-	if err := s.db.WithContext(ctx).
-		Model(&models.AgentTask{}).
-		Where("id = ?", taskID).
-		Scopes(scopeA2ATaskOwner).
-		Count(&taskCount).Error; err != nil {
+	scope, err := requireA2AStoreScope(ctx)
+	if err != nil {
 		return nil, "", err
-	}
-	if taskCount == 0 {
-		return nil, "", ErrTaskNotFound
 	}
 	offset, err := decodeOffset(pageToken)
 	if err != nil {
 		return nil, "", err
 	}
 	pageSize = normalizePageSize(pageSize)
-	var total int64
-	query := s.db.WithContext(ctx).Model(&models.AgentPushNotificationConfig{}).Where("task_id = ?", taskID)
-	if err := query.Count(&total).Error; err != nil {
+	type pushConfigPage struct {
+		rows  []models.AgentPushNotificationConfig
+		total int64
+	}
+	page, err := withGormStoreProjectScope(
+		s,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (pushConfigPage, error) {
+			var taskCount int64
+			if err := scopeA2AProject(
+				s.db.WithContext(scopedContext),
+				scope,
+			).
+				Model(&models.AgentTask{}).
+				Where("id = ?", taskID).
+				Scopes(scopeA2ATaskOwner).
+				Count(&taskCount).Error; err != nil {
+				return pushConfigPage{}, err
+			}
+			if taskCount == 0 {
+				return pushConfigPage{}, ErrTaskNotFound
+			}
+			query := scopeA2AProject(
+				s.db.WithContext(scopedContext).
+					Model(&models.AgentPushNotificationConfig{}),
+				scope,
+			).Where("task_id = ?", taskID)
+			var total int64
+			if err := query.Count(&total).Error; err != nil {
+				return pushConfigPage{}, err
+			}
+			var rows []models.AgentPushNotificationConfig
+			if err := query.
+				Order("created_at ASC, id ASC").
+				Offset(offset).
+				Limit(pageSize).
+				Find(&rows).Error; err != nil {
+				return pushConfigPage{}, err
+			}
+			return pushConfigPage{rows: rows, total: total}, nil
+		},
+	)
+	if err != nil {
 		return nil, "", err
 	}
-	var rows []models.AgentPushNotificationConfig
-	if err := query.Order("created_at ASC, id ASC").Offset(offset).Limit(pageSize).Find(&rows).Error; err != nil {
-		return nil, "", err
-	}
-	configs := make([]PushNotificationConfig, 0, len(rows))
-	for _, row := range rows {
+	// Decrypt secrets only after the short RLS transaction.
+	configs := make([]PushNotificationConfig, 0, len(page.rows))
+	for _, row := range page.rows {
 		config, err := pushConfigFromModel(row, s.protector)
 		if err != nil {
 			return nil, "", err
@@ -560,31 +957,54 @@ func (s *GormStore) ListPushConfigs(ctx context.Context, taskID, pageToken strin
 		configs = append(configs, config)
 	}
 	next := ""
-	if int64(offset+len(rows)) < total {
-		next = encodeOffset(offset + len(rows))
+	if int64(offset+len(page.rows)) < page.total {
+		next = encodeOffset(offset + len(page.rows))
 	}
 	return configs, next, nil
 }
 
 func (s *GormStore) DeletePushConfig(ctx context.Context, taskID, id string) error {
-	var taskCount int64
-	if err := s.db.WithContext(ctx).
-		Model(&models.AgentTask{}).
-		Where("id = ?", taskID).
-		Scopes(scopeA2ATaskOwner).
-		Count(&taskCount).Error; err != nil {
+	scope, err := requireA2AStoreScope(ctx)
+	if err != nil {
 		return err
 	}
-	if taskCount == 0 {
-		return ErrTaskNotFound
-	}
-	return s.db.WithContext(ctx).
-		Where("task_id = ? AND id = ?", taskID, id).
-		Delete(&models.AgentPushNotificationConfig{}).Error
+	_, err = withGormStoreProjectScope(
+		s,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (struct{}, error) {
+			var taskCount int64
+			if err := scopeA2AProject(
+				s.db.WithContext(scopedContext),
+				scope,
+			).
+				Model(&models.AgentTask{}).
+				Where("id = ?", taskID).
+				Scopes(scopeA2ATaskOwner).
+				Count(&taskCount).Error; err != nil {
+				return struct{}{}, err
+			}
+			if taskCount == 0 {
+				return struct{}{}, ErrTaskNotFound
+			}
+			err := scopeA2AProject(
+				s.db.WithContext(scopedContext),
+				scope,
+			).
+				Where("task_id = ? AND id = ?", taskID, id).
+				Delete(&models.AgentPushNotificationConfig{}).Error
+			return struct{}{}, err
+		},
+	)
+	return err
 }
 
-func createGormTask(db *gorm.DB, task Task) error {
-	row, err := taskModel(task)
+func createGormTask(
+	db *gorm.DB,
+	task Task,
+	scope models.ProjectScope,
+) error {
+	row, err := taskModel(task, scope)
 	if err != nil {
 		return err
 	}
@@ -594,11 +1014,15 @@ func createGormTask(db *gorm.DB, task Task) error {
 		}
 		return err
 	}
-	return persistTaskChildren(db, task)
+	return persistTaskChildren(db, task, scope)
 }
 
-func updateGormTask(db *gorm.DB, task Task) error {
-	current, err := getGormTask(db, task.ID)
+func updateGormTask(
+	db *gorm.DB,
+	task Task,
+	scope models.ProjectScope,
+) error {
+	current, err := getGormTask(db, task.ID, scope)
 	if err != nil {
 		return err
 	}
@@ -614,12 +1038,13 @@ func updateGormTask(db *gorm.DB, task Task) error {
 			claim.ClaimID != current.ExecutionClaimID) {
 		return ErrTaskBusy
 	}
-	row, err := taskModel(task)
+	row, err := taskModel(task, scope)
 	if err != nil {
 		return err
 	}
 	nextVersion := task.Version + 1
 	query := db.Model(&models.AgentTask{}).
+		Scopes(func(db *gorm.DB) *gorm.DB { return scopeA2AProject(db, scope) }).
 		Where("id = ? AND version = ?", task.ID, task.Version).
 		Scopes(scopeA2ATaskOwner)
 	if claimedExecution {
@@ -645,7 +1070,8 @@ func updateGormTask(db *gorm.DB, task Task) error {
 	}
 	if result.RowsAffected == 0 {
 		var persisted models.AgentTask
-		if err := db.Select("id", "version").
+		if err := scopeA2AProject(db, scope).
+			Select("id", "version").
 			Where("id = ?", task.ID).
 			Scopes(scopeA2ATaskOwner).
 			First(&persisted).Error; err != nil {
@@ -662,7 +1088,7 @@ func updateGormTask(db *gorm.DB, task Task) error {
 		}
 		return ErrTaskConflict
 	}
-	return persistTaskChildren(db, task)
+	return persistTaskChildren(db, task, scope)
 }
 
 func taskClaimDatabaseNowSQL(db *gorm.DB) string {
@@ -709,9 +1135,10 @@ func enqueueGormPushDeliveries(
 	event StoredEvent,
 	dispatcher TransactionalPushDispatcher,
 	protector security.Protector,
+	scope models.ProjectScope,
 ) error {
 	var rows []models.AgentPushNotificationConfig
-	if err := tx.WithContext(ctx).
+	if err := scopeA2AProject(tx.WithContext(ctx), scope).
 		Where("task_id = ?", taskID).
 		Order("created_at ASC, id ASC").
 		Find(&rows).Error; err != nil {
@@ -735,25 +1162,39 @@ func enqueueGormPushDeliveries(
 	return nil
 }
 
-func getGormTask(db *gorm.DB, id string) (Task, error) {
+func getGormTask(
+	db *gorm.DB,
+	id string,
+	scope models.ProjectScope,
+) (Task, error) {
 	var row models.AgentTask
-	err := db.Where("id = ?", id).Scopes(scopeA2ATaskOwner).First(&row).Error
+	err := scopeA2AProject(db, scope).
+		Where("id = ?", id).
+		Scopes(scopeA2ATaskOwner).
+		First(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return Task{}, ErrTaskNotFound
 	}
 	if err != nil {
 		return Task{}, err
 	}
-	return hydrateGormTask(db, row)
+	return hydrateGormTask(db, row, scope)
 }
 
-func hydrateGormTask(db *gorm.DB, row models.AgentTask) (Task, error) {
+func hydrateGormTask(
+	db *gorm.DB,
+	row models.AgentTask,
+	scope models.ProjectScope,
+) (Task, error) {
 	task, err := taskFromModel(row)
 	if err != nil {
 		return Task{}, err
 	}
 	var messages []models.AgentMessage
-	if err := db.Where("task_id = ?", row.ID).Order("sequence ASC").Find(&messages).Error; err != nil {
+	if err := scopeA2AProject(db, scope).
+		Where("task_id = ?", row.ID).
+		Order("sequence ASC").
+		Find(&messages).Error; err != nil {
 		return Task{}, err
 	}
 	for _, item := range messages {
@@ -765,7 +1206,10 @@ func hydrateGormTask(db *gorm.DB, row models.AgentTask) (Task, error) {
 		task.History = append(task.History, message)
 	}
 	var artifacts []models.AgentArtifact
-	if err := db.Where("task_id = ?", row.ID).Order("sequence ASC").Find(&artifacts).Error; err != nil {
+	if err := scopeA2AProject(db, scope).
+		Where("task_id = ?", row.ID).
+		Order("sequence ASC").
+		Find(&artifacts).Error; err != nil {
 		return Task{}, err
 	}
 	for _, item := range artifacts {
@@ -776,7 +1220,10 @@ func hydrateGormTask(db *gorm.DB, row models.AgentTask) (Task, error) {
 		task.Artifacts = append(task.Artifacts, artifact)
 	}
 	var statuses []models.AgentTaskStatusHistory
-	if err := db.Where("task_id = ?", row.ID).Order("sequence ASC").Find(&statuses).Error; err != nil {
+	if err := scopeA2AProject(db, scope).
+		Where("task_id = ?", row.ID).
+		Order("sequence ASC").
+		Find(&statuses).Error; err != nil {
 		return Task{}, err
 	}
 	for _, item := range statuses {
@@ -789,7 +1236,10 @@ func hydrateGormTask(db *gorm.DB, row models.AgentTask) (Task, error) {
 	return task, nil
 }
 
-func taskModel(task Task) (models.AgentTask, error) {
+func taskModel(
+	task Task,
+	scope models.ProjectScope,
+) (models.AgentTask, error) {
 	statusMessage, err := json.Marshal(task.Status.Message)
 	if err != nil {
 		return models.AgentTask{}, err
@@ -800,6 +1250,8 @@ func taskModel(task Task) (models.AgentTask, error) {
 	}
 	return models.AgentTask{
 		ID:                 task.ID,
+		OrganizationID:     scope.OrganizationID,
+		ProjectID:          scope.ProjectID,
 		ContextID:          task.ContextID,
 		LinkedTicketID:     task.LinkedTicketID,
 		OwnerActorType:     models.ActorType(task.OwnerActorType),
@@ -852,6 +1304,33 @@ func taskFromModel(row models.AgentTask) (Task, error) {
 	return task, nil
 }
 
+func requireA2AStoreScope(ctx context.Context) (models.ProjectScope, error) {
+	binding, ok := ProjectBindingFromContext(ctx)
+	if !ok {
+		return models.ProjectScope{}, ErrProjectBindingRequired
+	}
+	operation, err := services.OperationContextFromContext(ctx)
+	if err != nil {
+		return models.ProjectScope{}, fmt.Errorf("%w: %v", ErrProjectBindingRequired, err)
+	}
+	if operation.Source != services.SourceProtocolA2A ||
+		operation.Scope != binding.Scope {
+		return models.ProjectScope{}, ErrProjectScopeMismatch
+	}
+	return binding.Scope, nil
+}
+
+func scopeA2AProject(
+	db *gorm.DB,
+	scope models.ProjectScope,
+) *gorm.DB {
+	return db.Where(
+		"organization_id = ? AND project_id = ?",
+		scope.OrganizationID,
+		scope.ProjectID,
+	)
+}
+
 func scopeA2ATaskOwner(db *gorm.DB) *gorm.DB {
 	if db == nil || db.Statement == nil {
 		return db
@@ -863,20 +1342,26 @@ func scopeA2ATaskOwner(db *gorm.DB) *gorm.DB {
 	return db.Where("owner_actor_type = ? AND owner_actor_id = ?", owner.ActorType, owner.ActorID)
 }
 
-func persistTaskChildren(tx *gorm.DB, task Task) error {
+func persistTaskChildren(
+	tx *gorm.DB,
+	task Task,
+	scope models.ProjectScope,
+) error {
 	for sequence, message := range task.History {
 		payload, err := json.Marshal(message)
 		if err != nil {
 			return err
 		}
 		row := models.AgentMessage{
-			ID:            message.MessageID,
-			TaskID:        task.ID,
-			ContextID:     task.ContextID,
-			Role:          string(message.Role),
-			Sequence:      uint64(sequence + 1),
-			RequestDigest: message.RequestDigest,
-			Payload:       datatypes.JSON(payload),
+			ID:             message.MessageID,
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			TaskID:         task.ID,
+			ContextID:      task.ContextID,
+			Role:           string(message.Role),
+			Sequence:       uint64(sequence + 1),
+			RequestDigest:  message.RequestDigest,
+			Payload:        datatypes.JSON(payload),
 		}
 		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row)
 		if result.Error != nil {
@@ -884,7 +1369,12 @@ func persistTaskChildren(tx *gorm.DB, task Task) error {
 		}
 		if result.RowsAffected == 0 {
 			var existing models.AgentMessage
-			if err := tx.Select("task_id", "request_digest").First(&existing, "id = ?", row.ID).Error; err != nil {
+			if err := scopeA2AProject(tx, scope).
+				Select("task_id", "request_digest").
+				First(&existing, "id = ?", row.ID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return ErrTaskConflict
+				}
 				return err
 			}
 			if existing.TaskID != task.ID || existing.RequestDigest != row.RequestDigest {
@@ -898,16 +1388,34 @@ func persistTaskChildren(tx *gorm.DB, task Task) error {
 			return err
 		}
 		row := models.AgentArtifact{
-			ID:       artifact.ArtifactID,
-			TaskID:   task.ID,
-			Sequence: uint64(sequence + 1),
-			Payload:  datatypes.JSON(payload),
+			ID:             artifact.ArtifactID,
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			TaskID:         task.ID,
+			Sequence:       uint64(sequence + 1),
+			Payload:        datatypes.JSON(payload),
 		}
-		if err := tx.Clauses(clause.OnConflict{
+		result := tx.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "id"}, {Name: "task_id"}},
-			DoUpdates: clause.AssignmentColumns([]string{"sequence", "payload", "updated_at"}),
-		}).Create(&row).Error; err != nil {
-			return err
+			DoNothing: true,
+		}).Create(&row)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			update := scopeA2AProject(tx.Model(&models.AgentArtifact{}), scope).
+				Where("id = ? AND task_id = ?", row.ID, row.TaskID).
+				Updates(map[string]any{
+					"sequence":   row.Sequence,
+					"payload":    row.Payload,
+					"updated_at": time.Now().UTC(),
+				})
+			if update.Error != nil {
+				return update.Error
+			}
+			if update.RowsAffected != 1 {
+				return ErrTaskConflict
+			}
 		}
 	}
 	for sequence, status := range task.StatusHistory {
@@ -916,10 +1424,12 @@ func persistTaskChildren(tx *gorm.DB, task Task) error {
 			return err
 		}
 		row := models.AgentTaskStatusHistory{
-			TaskID:   task.ID,
-			Sequence: uint64(sequence + 1),
-			State:    persistedTaskState(status.State),
-			Status:   datatypes.JSON(payload),
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			TaskID:         task.ID,
+			Sequence:       uint64(sequence + 1),
+			State:          persistedTaskState(status.State),
+			Status:         datatypes.JSON(payload),
 		}
 		if err := tx.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "task_id"}, {Name: "sequence"}},

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"github.com/gin-gonic/gin"
 )
@@ -14,7 +15,13 @@ import (
 func TestAssigneeHandlerReturnsOnlyActiveAssignableUsers(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := openHandlerTestDB(t)
-	if err := db.AutoMigrate(&models.User{}); err != nil {
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.Organization{},
+		&models.BusinessUnit{},
+		&models.Project{},
+		&models.ProjectMembership{},
+	); err != nil {
 		t.Fatalf("migrate users: %v", err)
 	}
 
@@ -35,20 +42,73 @@ func TestAssigneeHandlerReturnsOnlyActiveAssignableUsers(t *testing.T) {
 	if err := db.Create(&users).Error; err != nil {
 		t.Fatalf("create users: %v", err)
 	}
+	organization := models.Organization{
+		Slug: "assignee-test", Name: "Assignee Test",
+		Status: models.OrganizationStatusActive,
+	}
+	if err := db.Create(&organization).Error; err != nil {
+		t.Fatal(err)
+	}
+	unit := models.BusinessUnit{
+		OrganizationID: organization.ID,
+		Key:            "OPS", Name: "Operations",
+		Status: models.BusinessUnitStatusActive,
+	}
+	if err := db.Create(&unit).Error; err != nil {
+		t.Fatal(err)
+	}
+	project := models.Project{
+		OrganizationID: organization.ID,
+		BusinessUnitID: unit.ID,
+		Key:            "ASSIGNEE", Name: "Assignee",
+		Status: models.ProjectStatusActive,
+	}
+	if err := db.Create(&project).Error; err != nil {
+		t.Fatal(err)
+	}
+	memberships := []models.ProjectMembership{
+		{
+			ProjectID: project.ID, UserID: users[0].ID,
+			Role: models.ProjectRoleAgent, IsActive: true,
+		},
+		{
+			ProjectID: project.ID, UserID: users[1].ID,
+			Role: models.ProjectRoleRequester, IsActive: true,
+		},
+		{
+			ProjectID: project.ID, UserID: users[2].ID,
+			Role: models.ProjectRoleAgent, IsActive: true,
+		},
+	}
+	if err := db.Create(&memberships).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	handler := NewAssigneeHandler(db)
 	router := gin.New()
+	bindProject := func(c *gin.Context) {
+		role := models.ProjectRole(c.GetHeader("X-Test-Role"))
+		c.Set(projectRoleContextKey, string(role))
+		c.Set(projectAccessContextKey, services.ProjectAccess{
+			Project: project,
+			Role:    role,
+			Scope:   project.Scope(),
+		})
+	}
 	router.GET("/assignees", func(c *gin.Context) {
-		c.Set("user_role", c.GetHeader("X-Test-Role"))
+		bindProject(c)
 		handler.List(c)
 	})
 	router.GET("/assignees/:id", func(c *gin.Context) {
-		c.Set("user_role", c.GetHeader("X-Test-Role"))
+		bindProject(c)
 		handler.Get(c)
 	})
 
 	adminRequest := httptest.NewRequest(http.MethodGet, "/assignees", nil)
-	adminRequest.Header.Set("X-Test-Role", string(models.RoleAdmin))
+	adminRequest.Header.Set(
+		"X-Test-Role",
+		string(models.ProjectRoleAdmin),
+	)
 	adminResponse := httptest.NewRecorder()
 	router.ServeHTTP(adminResponse, adminRequest)
 	if adminResponse.Code != http.StatusOK {
@@ -74,7 +134,10 @@ func TestAssigneeHandlerReturnsOnlyActiveAssignableUsers(t *testing.T) {
 	}
 
 	customerRequest := httptest.NewRequest(http.MethodGet, "/assignees", nil)
-	customerRequest.Header.Set("X-Test-Role", string(models.RoleCustomer))
+	customerRequest.Header.Set(
+		"X-Test-Role",
+		string(models.ProjectRoleRequester),
+	)
 	customerResponse := httptest.NewRecorder()
 	router.ServeHTTP(customerResponse, customerRequest)
 	if customerResponse.Code != http.StatusOK {
@@ -94,7 +157,10 @@ func TestAssigneeHandlerReturnsOnlyActiveAssignableUsers(t *testing.T) {
 	}
 
 	invalidFilterRequest := httptest.NewRequest(http.MethodGet, "/assignees?filter=%7B", nil)
-	invalidFilterRequest.Header.Set("X-Test-Role", string(models.RoleAdmin))
+	invalidFilterRequest.Header.Set(
+		"X-Test-Role",
+		string(models.ProjectRoleAdmin),
+	)
 	invalidFilterResponse := httptest.NewRecorder()
 	router.ServeHTTP(invalidFilterResponse, invalidFilterRequest)
 	if invalidFilterResponse.Code != http.StatusBadRequest {
@@ -111,7 +177,10 @@ func TestAssigneeHandlerReturnsOnlyActiveAssignableUsers(t *testing.T) {
 	}
 
 	invalidIDRequest := httptest.NewRequest(http.MethodGet, "/assignees/not-a-number", nil)
-	invalidIDRequest.Header.Set("X-Test-Role", string(models.RoleAdmin))
+	invalidIDRequest.Header.Set(
+		"X-Test-Role",
+		string(models.ProjectRoleAdmin),
+	)
 	invalidIDResponse := httptest.NewRecorder()
 	router.ServeHTTP(invalidIDResponse, invalidIDRequest)
 	if invalidIDResponse.Code != http.StatusBadRequest {

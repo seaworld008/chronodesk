@@ -139,9 +139,15 @@ func (h *TicketContentHandler) ListComments(c *gin.Context) {
 	if !ok {
 		return
 	}
-	customer := isCustomerRole(normalizedUserRole(c))
+	customer := isRequesterRole(normalizedProjectRole(c))
 	query := h.db.WithContext(c.Request.Context()).
-		Where("ticket_id = ? AND is_deleted = ?", ticket.ID, false)
+		Where(
+			"ticket_id = ? AND organization_id = ? AND project_id = ? AND is_deleted = ?",
+			ticket.ID,
+			ticket.OrganizationID,
+			ticket.ProjectID,
+			false,
+		)
 	if customer {
 		query = query.Where("type = ?", models.CommentTypePublic)
 	} else {
@@ -197,7 +203,7 @@ func (h *TicketContentHandler) CreateComment(c *gin.Context) {
 		request.Type = models.CommentTypePublic
 	}
 	if request.Type == models.CommentTypeSystem ||
-		(isCustomerRole(normalizedUserRole(c)) && request.Type != models.CommentTypePublic) {
+		(isRequesterRole(normalizedProjectRole(c)) && request.Type != models.CommentTypePublic) {
 		c.JSON(http.StatusForbidden, gin.H{
 			"success": false,
 			"code":    "comment_visibility_denied",
@@ -205,7 +211,7 @@ func (h *TicketContentHandler) CreateComment(c *gin.Context) {
 		})
 		return
 	}
-	if isCustomerRole(normalizedUserRole(c)) {
+	if isRequesterRole(normalizedProjectRole(c)) {
 		if request.TimeSpent != nil || request.BillableTime != nil || strings.TrimSpace(request.WorkType) != "" {
 			c.JSON(http.StatusForbidden, gin.H{
 				"success": false,
@@ -353,8 +359,13 @@ func (h *TicketContentHandler) ListAttachments(c *gin.Context) {
 		return
 	}
 	query := h.db.WithContext(c.Request.Context()).
-		Where("ticket_id = ?", ticket.ID)
-	if isCustomerRole(normalizedUserRole(c)) {
+		Where(
+			"ticket_id = ? AND organization_id = ? AND project_id = ?",
+			ticket.ID,
+			ticket.OrganizationID,
+			ticket.ProjectID,
+		)
+	if isRequesterRole(normalizedProjectRole(c)) {
 		query = query.Where("is_public = ?", true)
 	}
 	var attachments []models.TicketAttachment
@@ -362,7 +373,7 @@ func (h *TicketContentHandler) ListAttachments(c *gin.Context) {
 		h.writeError(c, err)
 		return
 	}
-	if isCustomerRole(normalizedUserRole(c)) {
+	if isRequesterRole(normalizedProjectRole(c)) {
 		result := make([]*customerAttachmentResponse, 0, len(attachments))
 		for i := range attachments {
 			result = append(result, customerAttachmentFromModel(&attachments[i]))
@@ -422,7 +433,7 @@ func (h *TicketContentHandler) StoreAttachment(c *gin.Context) {
 	}
 	isPublic := strings.EqualFold(c.PostForm("visibility"), "public") ||
 		strings.EqualFold(c.PostForm("is_public"), "true")
-	if isCustomerRole(normalizedUserRole(c)) {
+	if isRequesterRole(normalizedProjectRole(c)) {
 		isPublic = true
 	}
 	var commentID *uint
@@ -435,7 +446,7 @@ func (h *TicketContentHandler) StoreAttachment(c *gin.Context) {
 		parsed := uint(value)
 		commentID = &parsed
 	}
-	if isCustomerRole(normalizedUserRole(c)) && commentID != nil &&
+	if isRequesterRole(normalizedProjectRole(c)) && commentID != nil &&
 		!h.customerCanReferenceComment(c, ticket.ID, *commentID) {
 		return
 	}
@@ -460,7 +471,7 @@ func (h *TicketContentHandler) StoreAttachment(c *gin.Context) {
 	}
 	c.Header("ETag", httpcontract.FormatETag(result.Receipt.ResourceVersion))
 	responseData := any(result.Attachment.ToResponse())
-	if isCustomerRole(normalizedUserRole(c)) {
+	if isRequesterRole(normalizedProjectRole(c)) {
 		responseData = customerAttachmentFromModel(result.Attachment)
 	}
 	c.JSON(http.StatusCreated, gin.H{
@@ -471,13 +482,20 @@ func (h *TicketContentHandler) StoreAttachment(c *gin.Context) {
 }
 
 func (h *TicketContentHandler) customerCanReferenceComment(c *gin.Context, ticketID, commentID uint) bool {
+	scope, err := services.RequireProjectScope(c.Request.Context())
+	if err != nil {
+		h.writeError(c, err)
+		return false
+	}
 	var count int64
-	err := h.db.WithContext(c.Request.Context()).
+	err = h.db.WithContext(c.Request.Context()).
 		Model(&models.TicketComment{}).
 		Where(
-			"id = ? AND ticket_id = ? AND type = ? AND is_deleted = ?",
+			"id = ? AND ticket_id = ? AND organization_id = ? AND project_id = ? AND type = ? AND is_deleted = ?",
 			commentID,
 			ticketID,
+			scope.OrganizationID,
+			scope.ProjectID,
 			models.CommentTypePublic,
 			false,
 		).
@@ -503,17 +521,24 @@ func (h *TicketContentHandler) DownloadAttachment(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "code": "invalid_request", "message": "附件 ID 无效"})
 		return
 	}
+	ticket, ok := h.authorizedTicket(c, ticketAccessRead)
+	if !ok {
+		return
+	}
 	var metadata models.TicketAttachment
 	if err := h.db.WithContext(c.Request.Context()).
-		Where("id = ? AND ticket_id = ?", uint(attachmentID), c.Param("id")).
+		Where(
+			"id = ? AND ticket_id = ? AND organization_id = ? AND project_id = ?",
+			uint(attachmentID),
+			ticket.ID,
+			ticket.OrganizationID,
+			ticket.ProjectID,
+		).
 		First(&metadata).Error; err != nil {
 		h.writeError(c, err)
 		return
 	}
-	if _, ok := h.authorizedTicket(c, ticketAccessRead); !ok {
-		return
-	}
-	if isCustomerRole(normalizedUserRole(c)) && !metadata.IsPublic {
+	if isRequesterRole(normalizedProjectRole(c)) && !metadata.IsPublic {
 		c.JSON(http.StatusForbidden, gin.H{"success": false, "code": "ticket_access_denied", "message": "无权下载该附件"})
 		return
 	}
@@ -524,7 +549,13 @@ func (h *TicketContentHandler) DownloadAttachment(c *gin.Context) {
 	}
 	defer reader.Close()
 	_ = h.db.WithContext(c.Request.Context()).Model(&models.TicketAttachment{}).
-		Where("id = ?", attachment.ID).
+		Where(
+			"id = ? AND ticket_id = ? AND organization_id = ? AND project_id = ?",
+			attachment.ID,
+			ticket.ID,
+			ticket.OrganizationID,
+			ticket.ProjectID,
+		).
 		UpdateColumn("download_count", gorm.Expr("download_count + 1")).Error
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, attachment.OriginalName))
 	c.DataFromReader(http.StatusOK, attachment.FileSize, attachment.MimeType, reader, nil)

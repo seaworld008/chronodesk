@@ -2,6 +2,8 @@ package websocket
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"time"
 
@@ -22,8 +24,31 @@ func NewNotificationWebSocketService(hub *Hub) *NotificationWebSocketService {
 
 // PushNotification sends a notification to a specific user via WebSocket
 func (s *NotificationWebSocketService) PushNotification(ctx context.Context, notification *models.Notification) error {
+	if s == nil || s.hub == nil {
+		return errors.New("WebSocket notification service is unavailable")
+	}
+	if notification == nil {
+		return errors.New("notification is required")
+	}
+	scope := models.ProjectScope{
+		OrganizationID: notification.OrganizationID,
+		ProjectID:      notification.ProjectID,
+	}
+	if err := scope.Validate(); err != nil {
+		return fmt.Errorf("notification project scope: %w", err)
+	}
+	if notification.RecipientID == 0 {
+		return errors.New("notification recipient is required")
+	}
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+	}
 	// Check if user is online
-	if !s.hub.IsUserOnline(notification.RecipientID) {
+	if !s.hub.IsUserOnline(scope, notification.RecipientID) {
 		log.Printf(
 			"Notification recipient is offline: user_id=%s delivery=deferred",
 			safeLogUint(notification.RecipientID),
@@ -35,7 +60,7 @@ func (s *NotificationWebSocketService) PushNotification(ctx context.Context, not
 	notificationData := notification.ToResponse()
 
 	// Send the notification via WebSocket
-	s.hub.BroadcastToUser(notification.RecipientID, "notification", map[string]interface{}{
+	if err := s.hub.BroadcastToUser(scope, notification.RecipientID, "notification", map[string]interface{}{
 		"id":             notificationData.ID,
 		"type":           notificationData.Type,
 		"title":          notificationData.Title,
@@ -46,7 +71,9 @@ func (s *NotificationWebSocketService) PushNotification(ctx context.Context, not
 		"action_url":     notificationData.ActionURL,
 		"sender":         notificationData.Sender,
 		"related_ticket": notificationData.RelatedTicket,
-	})
+	}); err != nil {
+		return err
+	}
 
 	log.Printf(
 		"Pushed WebSocket notification: notification_id=%s user_id=%s",
@@ -57,15 +84,41 @@ func (s *NotificationWebSocketService) PushNotification(ctx context.Context, not
 }
 
 // PushUnreadCount sends updated unread count to a specific user
-func (s *NotificationWebSocketService) PushUnreadCount(ctx context.Context, userID uint, count int64) error {
-	if !s.hub.IsUserOnline(userID) {
+func (s *NotificationWebSocketService) PushUnreadCount(
+	ctx context.Context,
+	scope models.ProjectScope,
+	userID uint,
+	count int64,
+) error {
+	if s == nil || s.hub == nil {
+		return errors.New("WebSocket notification service is unavailable")
+	}
+	if err := scope.Validate(); err != nil {
+		return fmt.Errorf("unread-count project scope: %w", err)
+	}
+	if userID == 0 {
+		return errors.New("unread-count user is required")
+	}
+	if count < 0 {
+		return errors.New("unread count cannot be negative")
+	}
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+	}
+	if !s.hub.IsUserOnline(scope, userID) {
 		return nil
 	}
 
-	s.hub.BroadcastToUser(userID, "unread_count", map[string]interface{}{
+	if err := s.hub.BroadcastToUser(scope, userID, "unread_count", map[string]interface{}{
 		"count":     count,
 		"timestamp": time.Now().Unix(),
-	})
+	}); err != nil {
+		return err
+	}
 
 	log.Printf(
 		"Pushed unread count: count=%s user_id=%s",

@@ -44,7 +44,7 @@ func (*recordingAdminAuditService) List(
 	return nil, 0, nil
 }
 
-func TestImportantAdminOperationCoversLegacyAndV1ControlPlanes(t *testing.T) {
+func TestImportantAdminOperationCoversPlatformAndProjectAgentControlPlanes(t *testing.T) {
 	tests := []struct {
 		name   string
 		method string
@@ -53,14 +53,15 @@ func TestImportantAdminOperationCoversLegacyAndV1ControlPlanes(t *testing.T) {
 	}{
 		{name: "legacy write", method: http.MethodPost, path: "/api/admin/users", want: true},
 		{name: "legacy nested write", method: http.MethodDelete, path: "/api/admin/webhooks/42", want: true},
-		{name: "v1 principal write", method: http.MethodPost, path: "/api/v1/admin/service-principals", want: true},
-		{name: "v1 credential write", method: http.MethodPost, path: "/api/v1/admin/service-principals/p1/credentials/rotate", want: true},
-		{name: "v1 read", method: http.MethodGet, path: "/api/v1/admin/agent-control/overview", want: false},
+		{name: "agent principal write", method: http.MethodPost, path: "/api/projects/OPS/admin/agents/service-principals", want: true},
+		{name: "agent credential write", method: http.MethodPost, path: "/api/projects/OPS/admin/agents/service-principals/p1/credentials/rotate", want: true},
+		{name: "agent read", method: http.MethodGet, path: "/api/projects/OPS/admin/agents/agent-control/overview", want: false},
 		{name: "head is read", method: http.MethodHead, path: "/api/admin/users", want: false},
-		{name: "options is read", method: http.MethodOptions, path: "/api/v1/admin/service-principals", want: false},
+		{name: "options is read", method: http.MethodOptions, path: "/api/projects/OPS/admin/agents/service-principals", want: false},
+		{name: "project admin prefix boundary", method: http.MethodPost, path: "/api/projects/OPS/admin/agent/service-principals", want: false},
 		{name: "legacy prefix boundary", method: http.MethodPost, path: "/api/administrator/users", want: false},
-		{name: "v1 prefix boundary", method: http.MethodPost, path: "/api/v1/administer/service-principals", want: false},
-		{name: "non admin write", method: http.MethodPost, path: "/api/v1/tickets", want: false},
+		{name: "admin prefix boundary", method: http.MethodPost, path: "/api/administrator/service-principals", want: false},
+		{name: "non admin write", method: http.MethodPost, path: "/api/v2/projects/OPS/tickets", want: false},
 	}
 
 	for _, tt := range tests {
@@ -72,7 +73,7 @@ func TestImportantAdminOperationCoversLegacyAndV1ControlPlanes(t *testing.T) {
 	}
 }
 
-func TestLogAdminOperationRecordsV1AgentManagementWrite(t *testing.T) {
+func TestLogAdminOperationRecordsProjectAgentManagementWrite(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	audit := &recordingAdminAuditService{}
 	router := gin.New()
@@ -82,14 +83,14 @@ func TestLogAdminOperationRecordsV1AgentManagementWrite(t *testing.T) {
 		c.Next()
 	})
 	router.Use(LogAdminOperation(audit))
-	router.POST("/api/v1/admin/service-principals", func(c *gin.Context) {
+	router.POST("/api/projects/:projectKey/admin/agents/service-principals", func(c *gin.Context) {
 		c.Status(http.StatusCreated)
 	})
 
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(
 		http.MethodPost,
-		"/api/v1/admin/service-principals?client_secret=must-not-leak&view=compact",
+		"/api/projects/OPS/admin/agents/service-principals?client_secret=must-not-leak&view=compact",
 		nil,
 	)
 	router.ServeHTTP(recorder, request)
@@ -104,7 +105,7 @@ func TestLogAdminOperationRecordsV1AgentManagementWrite(t *testing.T) {
 		t.Fatalf("audit finalize calls = %d, want 1", audit.finalizeCalls)
 	}
 	record := audit.records[0]
-	if record.Path != "/api/v1/admin/service-principals" ||
+	if record.Path != "/api/projects/OPS/admin/agents/service-principals" ||
 		record.Method != http.MethodPost ||
 		record.StatusCode != http.StatusCreated ||
 		record.UserID == nil ||

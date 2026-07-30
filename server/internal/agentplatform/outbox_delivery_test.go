@@ -1,7 +1,11 @@
 package agentplatform
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +22,7 @@ import (
 
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
@@ -25,9 +30,82 @@ import (
 	"gorm.io/gorm"
 )
 
+const agentplatformCustomWebhookTestSecret = "agentplatform-custom-webhook-test-secret"
+
 type recordingSLAEscalationConsumer struct {
 	calls int
 	event services.CloudEventEnvelope
+}
+
+func TestNativeOutboxDelivererRequiresTrustedMatchingWorkerBoundary(
+	t *testing.T,
+) {
+	db, err := gorm.Open(
+		sqlite.Open("file:outbox-trusted-boundary?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliverer, err := NewNativeOutboxDeliverer(
+		NativeOutboxDelivererOptions{DB: db},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := models.ProjectScope{OrganizationID: 1, ProjectID: 2}
+	delivery := &models.OutboxDelivery{
+		ID:              "trusted-boundary-delivery",
+		OrganizationID:  scope.OrganizationID,
+		ProjectID:       scope.ProjectID,
+		EventID:         "trusted-boundary-event",
+		DestinationType: "event_stream",
+		DestinationID:   "default",
+	}
+	event := services.CloudEventEnvelope{
+		ID:             delivery.EventID,
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+	}
+	if err := deliverer.Deliver(
+		context.Background(),
+		delivery,
+		event,
+	); err == nil || !strings.Contains(err.Error(), "trusted worker context") {
+		t.Fatalf("missing worker context error = %v", err)
+	}
+	if err := deliverer.Deliver(
+		agentplatformTestOutboxWorkerContext(
+			t,
+			models.ProjectScope{OrganizationID: 1, ProjectID: 3},
+		),
+		delivery,
+		event,
+	); err == nil || !strings.Contains(err.Error(), "project scope mismatch") {
+		t.Fatalf("mismatched worker scope error = %v", err)
+	}
+	mismatchedEvent := event
+	mismatchedEvent.ID = "different-event"
+	if err := deliverer.Deliver(
+		agentplatformTestOutboxWorkerContext(t, scope),
+		delivery,
+		mismatchedEvent,
+	); err == nil || !strings.Contains(err.Error(), "event reference mismatch") {
+		t.Fatalf("mismatched event reference error = %v", err)
+	}
+	workerCtx := agentplatformTestOutboxWorkerContext(t, scope)
+	err = scopeddb.WithProjectScopeContextTransaction(
+		workerCtx,
+		db,
+		scope,
+		func(transactionContext context.Context) error {
+			return deliverer.Deliver(transactionContext, delivery, event)
+		},
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "cannot run inside a database transaction") {
+		t.Fatalf("transactional side-effect error = %v", err)
+	}
 }
 
 type failOnceAttachmentStorage struct {
@@ -62,14 +140,23 @@ func TestSLAEscalationOutboxDeliveryUsesInjectedConsumer(t *testing.T) {
 	}
 	delivery := &models.OutboxDelivery{
 		ID:              "sla-delivery",
+		OrganizationID:  1,
+		ProjectID:       1,
+		EventID:         "sla-event",
 		DestinationType: services.SLAEscalationOutboxDestination,
 		DestinationID:   "breach",
 	}
 	event := services.CloudEventEnvelope{
-		ID:   "sla-event",
-		Type: services.SLABreachEventType,
+		ID:             "sla-event",
+		Type:           services.SLABreachEventType,
+		OrganizationID: 1,
+		ProjectID:      1,
 	}
-	if err := deliverer.Deliver(context.Background(), delivery, event); err == nil {
+	workerCtx := agentplatformTestOutboxWorkerContext(
+		t,
+		models.ProjectScope{OrganizationID: 1, ProjectID: 1},
+	)
+	if err := deliverer.Deliver(workerCtx, delivery, event); err == nil {
 		t.Fatal("unconfigured SLA continuation was acknowledged")
 	}
 	consumer := &recordingSLAEscalationConsumer{}
@@ -80,7 +167,7 @@ func TestSLAEscalationOutboxDeliveryUsesInjectedConsumer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := deliverer.Deliver(context.Background(), delivery, event); err != nil {
+	if err := deliverer.Deliver(workerCtx, delivery, event); err != nil {
 		t.Fatalf("deliver SLA continuation: %v", err)
 	}
 	if consumer.calls != 1 || consumer.event.ID != event.ID {
@@ -119,8 +206,12 @@ func TestAttachmentCleanupOutboxRetriesAfterCommitAndIsIdempotent(t *testing.T) 
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
 	}
+	projectFixture := ensureAPIHandlerTestProject(t, db)
 	ticket := models.Ticket{
-		TicketNumber: "CLEANUP-1", Title: "Cleanup",
+		OrganizationID: projectFixture.organization.ID,
+		ProjectID:      projectFixture.project.ID,
+		QueueID:        projectFixture.queue.ID,
+		TicketNumber:   "CLEANUP-1", Title: "Cleanup",
 		Description: "attachment", Priority: models.TicketPriorityNormal,
 		Status: models.TicketStatusOpen, Type: models.TicketTypeRequest,
 		Source: models.TicketSourceWeb, CreatedByID: &user.ID, Version: 1,
@@ -161,8 +252,19 @@ func TestAttachmentCleanupOutboxRetriesAfterCommitAndIsIdempotent(t *testing.T) 
 	if err != nil {
 		t.Fatalf("NewTicketService() error = %v", err)
 	}
-	if err := ticketService.DeleteTicketExpectedVersion(
+	operationContext, err := services.WithOperationContext(
 		context.Background(),
+		services.OperationContext{
+			Scope:  projectFixture.project.Scope(),
+			Actor:  models.HumanActor(user.ID),
+			Source: services.SourceProtocolHumanREST,
+		},
+	)
+	if err != nil {
+		t.Fatalf("create cleanup operation context: %v", err)
+	}
+	if err := ticketService.DeleteTicketExpectedVersion(
+		operationContext,
 		ticket.ID,
 		user.ID,
 		"admin",
@@ -245,7 +347,13 @@ func TestAttachmentCleanupOutboxRetriesAfterCommitAndIsIdempotent(t *testing.T) 
 	// A crash after object deletion but before acknowledgement may invoke the
 	// same delivery again. AttachmentStorage.Delete must make that safe.
 	if err := deliverer.Deliver(
-		context.Background(),
+		agentplatformTestOutboxWorkerContext(
+			t,
+			models.ProjectScope{
+				OrganizationID: delivery.OrganizationID,
+				ProjectID:      delivery.ProjectID,
+			},
+		),
 		&delivery,
 		services.CloudEventFromModel(&event),
 	); err != nil {
@@ -279,8 +387,11 @@ func TestAttachmentCleanupOutboxRejectsPathTraversal(t *testing.T) {
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
 	}
+	scope := installAgentplatformTestProjectScope(t, db)
 	ticket := models.Ticket{
-		TicketNumber: "CLEANUP-TRAVERSAL", Title: "Traversal",
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		TicketNumber:   "CLEANUP-TRAVERSAL", Title: "Traversal",
 		Description: "must reject", Priority: models.TicketPriorityNormal,
 		Status: models.TicketStatusOpen, Type: models.TicketTypeRequest,
 		Source: models.TicketSourceWeb, CreatedByID: &user.ID, Version: 1,
@@ -330,17 +441,26 @@ func TestAttachmentCleanupOutboxRejectsPathTraversal(t *testing.T) {
 			StoragePath:  attachment.StoragePath,
 		}},
 	})
+	eventID := "attachment-path-traversal-event"
+	delivery := &models.OutboxDelivery{
+		OrganizationID:  scope.OrganizationID,
+		ProjectID:       scope.ProjectID,
+		EventID:         eventID,
+		DestinationType: services.AttachmentCleanupOutboxDestination,
+		DestinationID:   target.ID,
+	}
+	event := services.CloudEventEnvelope{
+		ID:             eventID,
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		Type:           "io.chronodesk.ticket.deleted.v1",
+		Subject:        fmt.Sprintf("ticket/%d", ticket.ID),
+		Data:           data,
+	}
 	err = deliverer.Deliver(
-		context.Background(),
-		&models.OutboxDelivery{
-			DestinationType: services.AttachmentCleanupOutboxDestination,
-			DestinationID:   target.ID,
-		},
-		services.CloudEventEnvelope{
-			Type:    "io.chronodesk.ticket.deleted.v1",
-			Subject: fmt.Sprintf("ticket/%d", ticket.ID),
-			Data:    data,
-		},
+		agentplatformTestOutboxWorkerContext(t, scope),
+		delivery,
+		event,
 	)
 	if !errors.Is(err, services.ErrInvalidAttachmentName) {
 		t.Fatalf("path traversal cleanup error = %v", err)
@@ -451,6 +571,9 @@ func TestOutboxWebhookDeliveryUsesOneBoundedAttemptWithoutLocalRetry(t *testing.
 	requests := make(chan struct {
 		CloudEventID  string
 		IdempotencyID string
+		ContentType   string
+		Timestamp     string
+		Signature     string
 		Body          []byte
 	}, 1)
 	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -459,10 +582,16 @@ func TestOutboxWebhookDeliveryUsesOneBoundedAttemptWithoutLocalRetry(t *testing.
 		requests <- struct {
 			CloudEventID  string
 			IdempotencyID string
+			ContentType   string
+			Timestamp     string
+			Signature     string
 			Body          []byte
 		}{
 			CloudEventID:  request.Header.Get("X-CloudEvents-ID"),
 			IdempotencyID: request.Header.Get("Idempotency-Key"),
+			ContentType:   request.Header.Get("Content-Type"),
+			Timestamp:     request.Header.Get("X-ChronoDesk-Timestamp"),
+			Signature:     request.Header.Get("X-ChronoDesk-Signature"),
 			Body:          body,
 		}
 		http.Error(w, "temporary failure", http.StatusBadGateway)
@@ -480,7 +609,14 @@ func TestOutboxWebhookDeliveryUsesOneBoundedAttemptWithoutLocalRetry(t *testing.
 	}
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
-	if err := db.AutoMigrate(&models.User{}, &models.WebhookConfig{}, &models.WebhookLog{}); err != nil {
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.WebhookConfig{},
+		&models.WebhookDeliverySnapshot{},
+		&models.WebhookLog{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
+	); err != nil {
 		t.Fatalf("migrate webhook schema: %v", err)
 	}
 	user := models.User{
@@ -493,7 +629,11 @@ func TestOutboxWebhookDeliveryUsesOneBoundedAttemptWithoutLocalRetry(t *testing.
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatalf("create webhook owner: %v", err)
 	}
+	projectFixture := ensureAPIHandlerTestProject(t, db)
+	projectScope := projectFixture.project.Scope()
 	config := models.WebhookConfig{
+		OrganizationID:   projectScope.OrganizationID,
+		ProjectID:        projectScope.ProjectID,
 		Name:             "outbox-single-attempt",
 		Provider:         models.WebhookProviderCustom,
 		WebhookURL:       endpoint.URL,
@@ -507,7 +647,28 @@ func TestOutboxWebhookDeliveryUsesOneBoundedAttemptWithoutLocalRetry(t *testing.
 	if err := db.Create(&config).Error; err != nil {
 		t.Fatalf("create webhook config: %v", err)
 	}
-	notifications := newWebhookTestNotificationService(db)
+	notifications := newWebhookTestNotificationService(t, db)
+	actor := models.SystemActor("webhook-outbox-test")
+	eventModel, err := appendTestDomainEvent(
+		context.Background(),
+		services.NewAgentNativeService(db),
+		services.DomainEventInput{
+			Type:            "io.chronodesk.ticket.created.v1",
+			Subject:         "ticket/42",
+			Actor:           actor,
+			ResourceVersion: 1,
+			Scope:           projectScope,
+			Data:            map[string]any{"ticket_id": 42},
+		},
+		[]services.OutboxTarget{{
+			Type:        "webhook",
+			ID:          "configured",
+			MaxAttempts: 8,
+		}},
+	)
+	if err != nil {
+		t.Fatalf("commit webhook event and snapshot: %v", err)
+	}
 	deliverer, err := NewNativeOutboxDeliverer(NativeOutboxDelivererOptions{
 		DB:            db,
 		Notifications: notifications,
@@ -515,23 +676,25 @@ func TestOutboxWebhookDeliveryUsesOneBoundedAttemptWithoutLocalRetry(t *testing.
 	if err != nil {
 		t.Fatalf("create outbox deliverer: %v", err)
 	}
-	eventData, _ := json.Marshal(map[string]any{"ticket_id": 42})
-	event := services.CloudEventEnvelope{
-		SpecVersion: "1.0",
-		ID:          "event-single-attempt",
-		Type:        "io.chronodesk.ticket.created.v1",
-		Subject:     "ticket/42",
-		Time:        time.Now().UTC(),
-		Data:        eventData,
+	event := services.CloudEventFromModel(eventModel)
+	var delivery models.OutboxDelivery
+	if err := db.Where(
+		"event_id = ? AND destination_type = ?",
+		event.ID,
+		"webhook",
+	).First(&delivery).Error; err != nil {
+		t.Fatalf("load snapshot delivery: %v", err)
+	}
+	if !strings.HasPrefix(delivery.DestinationID, webhookSnapshotPrefix) {
+		t.Fatalf("webhook delivery is not snapshot-bound: %+v", delivery)
 	}
 
 	started := time.Now()
-	delivery := &models.OutboxDelivery{
-		ID:              "delivery-single-attempt",
-		DestinationType: "webhook",
-		DestinationID:   "config:" + strconv.FormatUint(uint64(config.ID), 10),
-	}
-	err = deliverer.Deliver(context.Background(), delivery, event)
+	err = deliverer.Deliver(
+		agentplatformTestOutboxWorkerContext(t, projectScope),
+		&delivery,
+		event,
+	)
 	elapsed := time.Since(started)
 	if err == nil {
 		t.Fatal("non-2xx webhook attempt must fail for Outbox backoff")
@@ -550,15 +713,49 @@ func TestOutboxWebhookDeliveryUsesOneBoundedAttemptWithoutLocalRetry(t *testing.
 			request.IdempotencyID,
 		)
 	}
-	var requestBody map[string]any
+	if request.ContentType != "application/cloudevents+json" {
+		t.Fatalf("custom Webhook Content-Type = %q", request.ContentType)
+	}
+	timestamp, err := strconv.ParseInt(request.Timestamp, 10, 64)
+	if err != nil {
+		t.Fatalf("custom Webhook timestamp = %q: %v", request.Timestamp, err)
+	}
+	if timestamp < started.Add(-time.Second).Unix() ||
+		timestamp > time.Now().Add(time.Second).Unix() {
+		t.Fatalf("custom Webhook timestamp %d is outside the replay window", timestamp)
+	}
+	mac := hmac.New(sha256.New, []byte(agentplatformCustomWebhookTestSecret))
+	_, _ = mac.Write([]byte(request.Timestamp))
+	_, _ = mac.Write([]byte("."))
+	_, _ = mac.Write(request.Body)
+	wantSignature := "v1=" + hex.EncodeToString(mac.Sum(nil))
+	if !hmac.Equal([]byte(request.Signature), []byte(wantSignature)) {
+		t.Fatalf("custom Webhook signature = %q, want %q", request.Signature, wantSignature)
+	}
+	wantBody, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(request.Body, wantBody) {
+		t.Fatalf("custom Webhook body = %s, want exact CloudEvent %s", request.Body, wantBody)
+	}
+	var requestBody services.CloudEventEnvelope
 	if err := json.Unmarshal(request.Body, &requestBody); err != nil {
 		t.Fatal(err)
 	}
-	if requestBody["event_id"] != event.ID || requestBody["delivery_id"] != delivery.ID {
-		t.Fatalf("stable event identity missing from webhook body: %#v", requestBody)
+	if requestBody.ID != event.ID ||
+		requestBody.Type != event.Type ||
+		requestBody.SpecVersion != "1.0" ||
+		requestBody.OrganizationID != projectScope.OrganizationID ||
+		requestBody.ProjectID != projectScope.ProjectID {
+		t.Fatalf("structured CloudEvent identity missing from webhook body: %#v", requestBody)
 	}
-	if requestBody["event_type"] != event.Type {
-		t.Fatalf("canonical CloudEvent type missing from webhook body: %#v", requestBody)
+	var requestData map[string]any
+	if err := json.Unmarshal(requestBody.Data, &requestData); err != nil {
+		t.Fatal(err)
+	}
+	if requestData["ticket_id"] != float64(42) {
+		t.Fatalf("structured CloudEvent data missing ticket identity: %#v", requestData)
 	}
 	var logs []models.WebhookLog
 	if err := db.Order("id ASC").Find(&logs).Error; err != nil {
@@ -570,219 +767,393 @@ func TestOutboxWebhookDeliveryUsesOneBoundedAttemptWithoutLocalRetry(t *testing.
 	if logs[0].Status != "failed" || logs[0].NextRetryAt != nil {
 		t.Fatalf("Outbox attempt scheduled a competing legacy retry: %+v", logs[0])
 	}
+	if logs[0].OrganizationID != projectScope.OrganizationID ||
+		logs[0].ProjectID != projectScope.ProjectID {
+		t.Fatalf("Outbox attempt log lost project scope: %+v", logs[0])
+	}
 }
 
-func TestConfiguredWebhookOutboxDeliveryFansOutDurablyAndIdempotently(t *testing.T) {
+func TestCommittedWebhookDeliveriesUseImmutableSnapshots(t *testing.T) {
+	type capturedRequest struct {
+		Timestamp string
+		Signature string
+		Body      []byte
+	}
 	var firstAttempts atomic.Int32
-	firstEndpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		firstAttempts.Add(1)
-		w.WriteHeader(http.StatusNoContent)
-	}))
+	firstRequests := make(chan capturedRequest, 1)
+	firstEndpoint := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, request *http.Request) {
+			firstAttempts.Add(1)
+			body, _ := io.ReadAll(request.Body)
+			firstRequests <- capturedRequest{
+				Timestamp: request.Header.Get("X-ChronoDesk-Timestamp"),
+				Signature: request.Header.Get("X-ChronoDesk-Signature"),
+				Body:      body,
+			}
+			w.WriteHeader(http.StatusNoContent)
+		},
+	))
 	defer firstEndpoint.Close()
 	var secondAttempts atomic.Int32
-	secondEndpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if secondAttempts.Add(1) == 1 {
-			http.Error(w, "temporary failure", http.StatusBadGateway)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
+	secondEndpoint := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			secondAttempts.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		},
+	))
 	defer secondEndpoint.Close()
+	var changedAttempts atomic.Int32
+	changedEndpoint := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			changedAttempts.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		},
+	))
+	defer changedEndpoint.Close()
+	var newAttempts atomic.Int32
+	newEndpoint := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			newAttempts.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		},
+	))
+	defer newEndpoint.Close()
 
-	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") +
+		"?mode=memory&cache=shared"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
+		t.Fatal(err)
 	}
 	sqlDB, err := db.DB()
 	if err != nil {
-		t.Fatalf("get sqlite handle: %v", err)
+		t.Fatal(err)
 	}
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.WebhookConfig{},
+		&models.WebhookDeliverySnapshot{},
 		&models.WebhookLog{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
 	); err != nil {
-		t.Fatalf("migrate Outbox schema: %v", err)
+		t.Fatal(err)
 	}
 	user := models.User{
-		Username:     "fanout-owner",
-		Email:        "fanout-owner@example.com",
+		Username:     "snapshot-owner",
+		Email:        "snapshot-owner@example.test",
 		PasswordHash: "not-a-real-password",
 		Role:         models.RoleAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
-		t.Fatalf("create owner: %v", err)
+		t.Fatal(err)
 	}
+	projectFixture := ensureAPIHandlerTestProject(t, db)
+	scope := projectFixture.project.Scope()
 	configs := []models.WebhookConfig{
 		{
-			Name:             "first",
-			Provider:         models.WebhookProviderCustom,
-			WebhookURL:       firstEndpoint.URL,
-			Status:           models.WebhookStatusActive,
-			EnabledEventsObj: []models.WebhookEventType{models.WebhookEventTicketCreated},
-			RetryCount:       1,
-			CreatedBy:        user.ID,
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			Name:           "first-frozen",
+			Provider:       models.WebhookProviderCustom,
+			WebhookURL:     firstEndpoint.URL,
+			Status:         models.WebhookStatusActive,
+			EnabledEventsObj: []models.WebhookEventType{
+				models.WebhookEventTicketCreated,
+			},
+			RetryCount: 1,
+			CreatedBy:  user.ID,
 		},
 		{
-			Name:             "second",
-			Provider:         models.WebhookProviderCustom,
-			WebhookURL:       secondEndpoint.URL,
-			Status:           models.WebhookStatusActive,
-			EnabledEventsObj: []models.WebhookEventType{models.WebhookEventTicketCreated},
-			RetryCount:       4,
-			CreatedBy:        user.ID,
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			Name:           "second-frozen",
+			Provider:       models.WebhookProviderCustom,
+			WebhookURL:     secondEndpoint.URL,
+			Status:         models.WebhookStatusActive,
+			EnabledEventsObj: []models.WebhookEventType{
+				models.WebhookEventTicketCreated,
+			},
+			RetryCount: 4,
+			CreatedBy:  user.ID,
 		},
 	}
-	for i := range configs {
-		if err := db.Create(&configs[i]).Error; err != nil {
-			t.Fatalf("create webhook %d: %v", i, err)
+	for index := range configs {
+		if err := db.Create(&configs[index]).Error; err != nil {
+			t.Fatal(err)
 		}
 	}
+	notifications := newWebhookTestNotificationService(t, db)
 	now := time.Now().UTC()
-	native := services.NewAgentNativeService(db, services.AgentNativeOptions{
-		Now: func() time.Time { return now },
-	})
-	eventModel, err := appendTestDomainEvent(context.Background(), native, services.DomainEventInput{
-		Type:            "io.chronodesk.ticket.created.v1",
-		Subject:         "ticket/42",
-		Actor:           models.SystemActor("fanout-test"),
-		ResourceVersion: 1,
-		Data:            map[string]any{"ticket_id": 42},
-	}, []services.OutboxTarget{{
-		Type:        "webhook",
-		ID:          webhookFanoutDestinationID,
-		MaxAttempts: 8,
-	}})
-	if err != nil {
-		t.Fatalf("create domain event: %v", err)
-	}
-	var parent models.OutboxDelivery
-	if err := db.First(
-		&parent,
-		"event_id = ? AND destination_type = ? AND destination_id = ?",
-		eventModel.ID,
-		"webhook",
-		webhookFanoutDestinationID,
-	).Error; err != nil {
-		t.Fatalf("load fanout delivery: %v", err)
-	}
-	deliverer, err := NewNativeOutboxDeliverer(NativeOutboxDelivererOptions{
-		DB:            db,
-		Notifications: newWebhookTestNotificationService(db),
-	})
-	if err != nil {
-		t.Fatalf("create deliverer: %v", err)
-	}
-	envelope := services.CloudEventFromModel(eventModel)
-	firstBatch, err := native.ProcessOutboxBatch(
+	native := services.NewAgentNativeService(
+		db,
+		services.AgentNativeOptions{Now: func() time.Time { return now }},
+	)
+	event, err := appendTestDomainEvent(
 		context.Background(),
-		"webhook-fanout-worker",
+		native,
+		services.DomainEventInput{
+			Type:            "io.chronodesk.ticket.created.v1",
+			Subject:         "ticket/42",
+			Actor:           models.SystemActor("snapshot-test"),
+			ResourceVersion: 1,
+			Scope:           scope,
+			Data:            map[string]any{"ticket_id": 42},
+		},
+		[]services.OutboxTarget{{
+			Type:        "webhook",
+			ID:          "configured",
+			MaxAttempts: 8,
+		}},
+	)
+	if err != nil {
+		t.Fatalf("commit domain event: %v", err)
+	}
+	var snapshots []models.WebhookDeliverySnapshot
+	if err := db.Where("event_id = ?", event.ID).
+		Order("config_id ASC").
+		Find(&snapshots).Error; err != nil {
+		t.Fatal(err)
+	}
+	var deliveries []models.OutboxDelivery
+	if err := db.Where(
+		"event_id = ? AND destination_type = ?",
+		event.ID,
+		"webhook",
+	).Order("destination_id ASC").Find(&deliveries).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshots) != 2 || len(deliveries) != 2 {
+		t.Fatalf(
+			"committed snapshots=%d deliveries=%d, want 2 each",
+			len(snapshots),
+			len(deliveries),
+		)
+	}
+	snapshotByID := make(map[string]models.WebhookDeliverySnapshot, 2)
+	for _, snapshot := range snapshots {
+		snapshotByID[snapshot.ID] = snapshot
+	}
+	for _, delivery := range deliveries {
+		snapshotID, err := parseWebhookSnapshotDestinationID(
+			delivery.DestinationID,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot, exists := snapshotByID[snapshotID]
+		if !exists ||
+			delivery.MaxAttempts != snapshot.RetryCount+1 ||
+			delivery.Status != models.OutboxDeliveryPending {
+			t.Fatalf("invalid snapshot delivery: %+v", delivery)
+		}
+	}
+
+	protector := newAgentplatformWebhookTestProtector(t)
+	rotatedSecret := "rotated-webhook-secret"
+	rotatedEnvelope, err := security.ProtectOptional(
+		protector,
+		rotatedSecret,
+		security.FieldAAD(
+			"webhook_configs",
+			strconv.FormatUint(uint64(configs[0].ID), 10),
+			"secret",
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.WebhookConfig{}).
+		Where("id = ?", configs[0].ID).
+		UpdateColumns(map[string]any{
+			"webhook_url":    changedEndpoint.URL,
+			"secret":         rotatedEnvelope,
+			"enabled_events": `["io.chronodesk.ticket.transitioned.v1"]`,
+			"filter_rules":   `{"transition_statuses":["closed"]}`,
+			"status":         models.WebhookStatusDisabled,
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
+	newConfig := models.WebhookConfig{
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		Name:           "created-after-event",
+		Provider:       models.WebhookProviderCustom,
+		WebhookURL:     newEndpoint.URL,
+		Status:         models.WebhookStatusActive,
+		EnabledEventsObj: []models.WebhookEventType{
+			models.WebhookEventTicketCreated,
+		},
+		CreatedBy: user.ID,
+	}
+	if err := db.Create(&newConfig).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	deliverer, err := NewNativeOutboxDeliverer(
+		NativeOutboxDelivererOptions{
+			DB:            db,
+			Notifications: notifications,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := native.ProcessOutboxBatch(
+		context.Background(),
+		"webhook-snapshot-worker",
 		10,
 		deliverer,
 	)
 	if err != nil {
-		t.Fatalf("process webhook fanout: %v", err)
+		t.Fatal(err)
 	}
-	if firstBatch.Delivered != 1 || firstAttempts.Load() != 0 || secondAttempts.Load() != 0 {
+	if result.Delivered != 2 || result.Failed != 0 ||
+		firstAttempts.Load() != 1 ||
+		secondAttempts.Load() != 1 ||
+		changedAttempts.Load() != 0 ||
+		newAttempts.Load() != 0 {
 		t.Fatalf(
-			"fanout seed performed HTTP delivery: result=%+v attempts=(%d,%d)",
-			firstBatch,
+			"snapshot delivery result=%+v attempts=(old:%d,%d changed:%d new:%d)",
+			result,
 			firstAttempts.Load(),
 			secondAttempts.Load(),
+			changedAttempts.Load(),
+			newAttempts.Load(),
 		)
 	}
-	// Reprocessing after a crash must not create duplicate child deliveries.
-	if err := deliverer.Deliver(context.Background(), &parent, envelope); err != nil {
-		t.Fatalf("repeat webhook fanout: %v", err)
+	firstRequest := <-firstRequests
+	mac := hmac.New(
+		sha256.New,
+		[]byte(agentplatformCustomWebhookTestSecret),
+	)
+	_, _ = mac.Write([]byte(firstRequest.Timestamp))
+	_, _ = mac.Write([]byte("."))
+	_, _ = mac.Write(firstRequest.Body)
+	oldSignature := "v1=" + hex.EncodeToString(mac.Sum(nil))
+	if !hmac.Equal(
+		[]byte(firstRequest.Signature),
+		[]byte(oldSignature),
+	) {
+		t.Fatalf(
+			"committed delivery did not use frozen secret: got %q want %q",
+			firstRequest.Signature,
+			oldSignature,
+		)
 	}
-	var children []models.OutboxDelivery
-	if err := db.
-		Where("event_id = ? AND destination_type = ? AND destination_id LIKE ?",
-			eventModel.ID,
-			"webhook",
-			webhookConfigPrefix+"%",
-		).
-		Order("destination_id ASC").
-		Find(&children).Error; err != nil {
-		t.Fatalf("load child deliveries: %v", err)
+	var snapshotCount, newConfigSnapshots int64
+	if err := db.Model(&models.WebhookDeliverySnapshot{}).
+		Where("event_id = ?", event.ID).
+		Count(&snapshotCount).Error; err != nil {
+		t.Fatal(err)
 	}
-	if len(children) != 2 {
-		t.Fatalf("fanout created %d child deliveries, want 2", len(children))
+	if err := db.Model(&models.WebhookDeliverySnapshot{}).
+		Where("event_id = ? AND config_id = ?", event.ID, newConfig.ID).
+		Count(&newConfigSnapshots).Error; err != nil {
+		t.Fatal(err)
 	}
-	maxAttempts := map[string]int{
-		webhookConfigDestinationID(configs[0].ID): 2,
-		webhookConfigDestinationID(configs[1].ID): 5,
+	if snapshotCount != 2 || newConfigSnapshots != 0 {
+		t.Fatalf(
+			"historical event snapshots=%d new subscription snapshots=%d",
+			snapshotCount,
+			newConfigSnapshots,
+		)
 	}
-	for _, child := range children {
-		if child.Status != models.OutboxDeliveryPending ||
-			child.MaxAttempts != maxAttempts[child.DestinationID] {
-			t.Fatalf("unexpected independent child delivery: %+v", child)
-		}
+	var retained models.WebhookDeliverySnapshot
+	if err := db.First(
+		&retained,
+		"event_id = ? AND config_id = ?",
+		event.ID,
+		configs[0].ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if retained.WebhookURL != firstEndpoint.URL ||
+		retained.EnabledEvents !=
+			`["io.chronodesk.ticket.created.v1"]` {
+		t.Fatalf("committed snapshot changed after config edit: %+v", retained)
+	}
+	otherProject := models.Project{
+		OrganizationID: scope.OrganizationID,
+		BusinessUnitID: projectFixture.project.BusinessUnitID,
+		Key:            "OTHER",
+		Name:           "Other",
+		Status:         models.ProjectStatusActive,
+	}
+	if err := db.Create(&otherProject).Error; err != nil {
+		t.Fatal(err)
+	}
+	foreignScope := otherProject.Scope()
+	foreignDelivery := deliveries[0]
+	foreignDelivery.ID = "foreign-project-snapshot-delivery"
+	foreignDelivery.OrganizationID = foreignScope.OrganizationID
+	foreignDelivery.ProjectID = foreignScope.ProjectID
+	foreignEvent := services.CloudEventFromModel(event)
+	foreignEvent.OrganizationID = foreignScope.OrganizationID
+	foreignEvent.ProjectID = foreignScope.ProjectID
+	if err := deliverer.Deliver(
+		agentplatformTestOutboxWorkerContext(t, foreignScope),
+		&foreignDelivery,
+		foreignEvent,
+	); err == nil ||
+		!strings.Contains(err.Error(), "load webhook delivery snapshot") {
+		t.Fatalf("cross-project snapshot error = %v", err)
+	}
+	if firstAttempts.Load() != 1 ||
+		secondAttempts.Load() != 1 ||
+		changedAttempts.Load() != 0 ||
+		newAttempts.Load() != 0 {
+		t.Fatal("cross-project snapshot lookup performed an HTTP request")
 	}
 	var persistedEvent models.DomainEvent
-	if err := db.First(&persistedEvent, "id = ?", eventModel.ID).Error; err != nil {
-		t.Fatalf("reload event after fanout: %v", err)
-	}
-	if persistedEvent.PublishedAt != nil {
-		t.Fatal("fanout seed published event before child deliveries completed")
-	}
-
-	now = now.Add(time.Minute)
-	secondBatch, err := native.ProcessOutboxBatch(
-		context.Background(),
-		"webhook-delivery-worker",
-		10,
-		deliverer,
-	)
-	if err != nil {
-		t.Fatalf("process independent webhook deliveries: %v", err)
-	}
-	if secondBatch.Delivered != 1 || secondBatch.Failed != 1 ||
-		firstAttempts.Load() != 1 || secondAttempts.Load() != 1 {
-		t.Fatalf(
-			"unexpected independent delivery result=%+v attempts=(%d,%d)",
-			secondBatch,
-			firstAttempts.Load(),
-			secondAttempts.Load(),
-		)
-	}
-
-	now = now.Add(3 * time.Second)
-	thirdBatch, err := native.ProcessOutboxBatch(
-		context.Background(),
-		"webhook-retry-worker",
-		10,
-		deliverer,
-	)
-	if err != nil {
-		t.Fatalf("process Outbox-managed retry: %v", err)
-	}
-	if thirdBatch.Delivered != 1 || firstAttempts.Load() != 1 || secondAttempts.Load() != 2 {
-		t.Fatalf(
-			"successful target was redelivered: result=%+v attempts=(%d,%d)",
-			thirdBatch,
-			firstAttempts.Load(),
-			secondAttempts.Load(),
-		)
-	}
-	if err := db.First(&persistedEvent, "id = ?", eventModel.ID).Error; err != nil {
-		t.Fatalf("reload published event: %v", err)
+	if err := db.First(&persistedEvent, "id = ?", event.ID).Error; err != nil {
+		t.Fatal(err)
 	}
 	if persistedEvent.PublishedAt == nil {
-		t.Fatal("event was not published after every independent target succeeded")
+		t.Fatal("event was not published after snapshot deliveries completed")
 	}
 }
 
-func newWebhookTestNotificationService(db *gorm.DB) *services.NotificationService {
+func newWebhookTestNotificationService(
+	t testing.TB,
+	db *gorm.DB,
+) *services.NotificationService {
+	t.Helper()
+	protector := newAgentplatformWebhookTestProtector(t)
+	var configs []models.WebhookConfig
+	if err := db.Where("provider = ?", models.WebhookProviderCustom).
+		Find(&configs).Error; err != nil {
+		t.Fatal(err)
+	}
+	for index := range configs {
+		config := &configs[index]
+		if security.IsEnvelope(config.Secret) {
+			continue
+		}
+		envelope, err := security.ProtectOptional(
+			protector,
+			agentplatformCustomWebhookTestSecret,
+			security.FieldAAD(
+				"webhook_configs",
+				strconv.FormatUint(uint64(config.ID), 10),
+				"secret",
+			),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Model(&models.WebhookConfig{}).
+			Where("id = ?", config.ID).
+			UpdateColumn("secret", envelope).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
 	return services.NewNotificationServiceWithClientFactory(
 		db,
-		nil,
+		protector,
 		services.WebhookClientFactoryFunc(func(
 			context.Context,
 			*url.URL,
@@ -791,4 +1162,20 @@ func newWebhookTestNotificationService(db *gorm.DB) *services.NotificationServic
 			return http.DefaultClient, nil
 		}),
 	)
+}
+
+func newAgentplatformWebhookTestProtector(
+	t testing.TB,
+) security.Protector {
+	t.Helper()
+	protector, err := security.NewKeyring(
+		"agentplatform-webhook-test",
+		map[string][]byte{
+			"agentplatform-webhook-test": bytes.Repeat([]byte{0x59}, 32),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return protector
 }

@@ -27,6 +27,9 @@ export const isAdministrativeRole = (role: unknown) => {
     return normalized !== null && administrativeRoles.has(normalized)
 }
 
+export const isPlatformAdministrator = (role: unknown) =>
+    normalizeUserRole(role) === 'admin'
+
 export const isAgentRole = (role: unknown) => normalizeUserRole(role) === 'agent'
 
 export const isCustomerRole = (role: unknown) => {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,26 +39,60 @@ func (a *A2ATaskListAuthorizer) AuthorizeTaskSnapshot(
 	if err != nil {
 		return false, err
 	}
-	for _, ticketID := range a2aTaskSnapshotTicketIDs(task) {
-		if _, checkErr := a.native.CheckAction(ctx, services.PolicyCheckInput{
-			ServicePrincipalID: identity.Actor.ID,
-			CredentialID:       identity.CredentialID,
-			Scope:              models.ScopeTicketsRead,
-			Action:             "ticket.read",
-			ResourceType:       "ticket",
-			ResourceID:         strconv.FormatUint(uint64(ticketID), 10),
-			SourceProtocol:     a2aSourceProtocol,
-			Context: map[string]any{
-				"a2a_task_id":     task.ID,
-				"a2a_context_id":  task.ContextID,
-				"stored_snapshot": true,
-			},
-		}); checkErr != nil {
-			if errors.Is(checkErr, services.ErrPolicyDenied) {
-				return false, nil
+	ticketIDs := a2aTaskSnapshotTicketIDs(task)
+	if len(ticketIDs) == 0 {
+		return true, nil
+	}
+	if !a2aTokenHasScopes(
+		identity,
+		models.ScopeTasksManage,
+		models.ScopeTicketsRead,
+	) {
+		return false, nil
+	}
+	var checkErr error
+	transactionErr := a.native.RunProjectOperation(
+		ctx,
+		func(scopedContext context.Context) error {
+			for _, ticketID := range ticketIDs {
+				if _, err := a.native.CheckAction(
+					scopedContext,
+					services.PolicyCheckInput{
+						ServicePrincipalID: identity.Actor.ID,
+						CredentialID:       identity.CredentialID,
+						Scope:              models.ScopeTicketsRead,
+						Action:             "ticket.read",
+						ResourceType:       "ticket",
+						ResourceID: strconv.FormatUint(
+							uint64(ticketID),
+							10,
+						),
+						SourceProtocol: a2aSourceProtocol,
+						Context: map[string]any{
+							"a2a_task_id":     task.ID,
+							"a2a_context_id":  task.ContextID,
+							"stored_snapshot": true,
+						},
+					},
+				); err != nil {
+					checkErr = err
+					break
+				}
 			}
-			return false, checkErr
+			// A denied snapshot is a durable authorization outcome. Commit its
+			// PolicyDecision and return the domain error after the short
+			// project transaction closes.
+			return nil
+		},
+	)
+	if transactionErr != nil {
+		return false, transactionErr
+	}
+	if checkErr != nil {
+		if errors.Is(checkErr, services.ErrPolicyDenied) {
+			return false, nil
 		}
+		return false, checkErr
 	}
 	return true, nil
 }
@@ -83,33 +118,52 @@ func (a *A2ATaskListAuthorizer) PrepareTaskList(
 	if err != nil {
 		return nil, err
 	}
-	batch, err := a.native.PrepareReadPolicyBatch(
+	var (
+		batch      *services.ReadPolicyBatch
+		prepareErr error
+	)
+	transactionErr := a.native.RunProjectOperation(
 		ctx,
-		services.PolicyCheckInput{
-			ServicePrincipalID: identity.Actor.ID,
-			CredentialID:       identity.CredentialID,
-			Scope:              models.ScopeTasksManage,
-			Action:             "a2a.ListTasks",
-			ResourceType:       "a2a_task",
-			ResourceID:         "*",
-			RequestDigest:      digestBytes(payload),
-			SourceProtocol:     a2aSourceProtocol,
+		func(scopedContext context.Context) error {
+			batch, prepareErr = a.native.PrepareReadPolicyBatch(
+				scopedContext,
+				services.PolicyCheckInput{
+					ServicePrincipalID: identity.Actor.ID,
+					CredentialID:       identity.CredentialID,
+					Scope:              models.ScopeTasksManage,
+					Action:             "a2a.ListTasks",
+					ResourceType:       "a2a_task",
+					ResourceID:         "*",
+					RequestDigest:      digestBytes(payload),
+					SourceProtocol:     a2aSourceProtocol,
+				},
+			)
+			// A denied list request records one PolicyDecision during prepare.
+			// Keep that evidence and return the denial after COMMIT.
+			return nil
 		},
 	)
-	if err != nil {
-		return nil, err
+	if transactionErr != nil {
+		return nil, transactionErr
+	}
+	if prepareErr != nil {
+		return nil, prepareErr
 	}
 	return &a2aTaskListPolicyBatch{
+		service:      a.native,
 		native:       batch,
 		principalID:  identity.Actor.ID,
 		credentialID: identity.CredentialID,
+		tokenScopes:  append([]string(nil), identity.TokenScopes...),
 	}, nil
 }
 
 type a2aTaskListPolicyBatch struct {
+	service      *services.AgentNativeService
 	native       *services.ReadPolicyBatch
 	principalID  string
 	credentialID string
+	tokenScopes  []string
 }
 
 func (b *a2aTaskListPolicyBatch) Allows(task a2a.Task) (bool, error) {
@@ -127,7 +181,15 @@ func (b *a2aTaskListPolicyBatch) Allows(task a2a.Task) (bool, error) {
 			return allowed, err
 		}
 	}
-	for _, ticketID := range a2aTaskSnapshotTicketIDs(task) {
+	ticketIDs := a2aTaskSnapshotTicketIDs(task)
+	if len(ticketIDs) > 0 && !a2aTokenScopeSnapshotHasScopes(
+		b.tokenScopes,
+		models.ScopeTasksManage,
+		models.ScopeTicketsRead,
+	) {
+		return false, nil
+	}
+	for _, ticketID := range ticketIDs {
 		allowed, err := b.native.Allows(services.PolicyCheckInput{
 			ServicePrincipalID: b.principalID,
 			CredentialID:       b.credentialID,
@@ -148,15 +210,24 @@ func (b *a2aTaskListPolicyBatch) RecordSummary(
 	ctx context.Context,
 	summary a2a.TaskListAuthorizationSummary,
 ) error {
-	_, err := b.native.RecordSummary(ctx, map[string]any{
+	if b == nil || b.service == nil || b.native == nil {
+		return errors.New("A2A Task list policy batch is unavailable")
+	}
+	summaryContext := map[string]any{
 		"candidate_budget":   summary.CandidateBudget,
 		"candidates_scanned": summary.CandidatesScanned,
 		"items_returned":     summary.ItemsReturned,
 		"items_filtered":     summary.ItemsFiltered,
 		"has_more":           summary.HasMore,
 		"cursor_semantics":   summary.CursorSemantics,
-	})
-	return err
+	}
+	return b.service.RunProjectOperation(
+		ctx,
+		func(scopedContext context.Context) error {
+			_, err := b.native.RecordSummary(scopedContext, summaryContext)
+			return err
+		},
+	)
 }
 
 func trustedA2AIdentity(ctx context.Context) (A2AExecutionIdentity, error) {
@@ -164,6 +235,12 @@ func trustedA2AIdentity(ctx context.Context) (A2AExecutionIdentity, error) {
 	if !ok || identity.Actor.Type != models.ActorTypeServicePrincipal ||
 		strings.TrimSpace(identity.Actor.ID) == "" {
 		return A2AExecutionIdentity{}, errors.New("trusted A2A identity is unavailable")
+	}
+	if err := validateA2AExecutionIdentity(ctx, identity); err != nil {
+		return A2AExecutionIdentity{}, fmt.Errorf(
+			"trusted A2A identity is invalid: %w",
+			err,
+		)
 	}
 	return identity, nil
 }

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -12,6 +13,14 @@ import (
 
 type TicketWorkflowHandler struct {
 	ticketService services.TicketServiceInterface
+}
+
+type ticketWorkflowTransitionReader interface {
+	AllowedTicketTransitions(
+		context.Context,
+		uint,
+		uint,
+	) ([]models.TicketStatus, error)
 }
 
 func NewTicketWorkflowHandler(ticketService services.TicketServiceInterface) *TicketWorkflowHandler {
@@ -100,7 +109,7 @@ func (h *TicketWorkflowHandler) AssignTicket(c *gin.Context) {
 	setTicketETag(c, ticket.Version)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    ticketResponseForRole(ticket, normalizedUserRole(c)),
+		"data":    ticketResponseForRole(ticket, normalizedProjectRole(c)),
 		"message": "工单分配成功",
 	})
 }
@@ -162,7 +171,7 @@ func (h *TicketWorkflowHandler) TransferTicket(c *gin.Context) {
 	setTicketETag(c, ticket.Version)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    ticketResponseForRole(ticket, normalizedUserRole(c)),
+		"data":    ticketResponseForRole(ticket, normalizedProjectRole(c)),
 		"message": "工单转移成功",
 	})
 }
@@ -224,7 +233,7 @@ func (h *TicketWorkflowHandler) EscalateTicket(c *gin.Context) {
 	setTicketETag(c, ticket.Version)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    ticketResponseForRole(ticket, normalizedUserRole(c)),
+		"data":    ticketResponseForRole(ticket, normalizedProjectRole(c)),
 		"message": "工单升级成功",
 	})
 }
@@ -275,7 +284,17 @@ func (h *TicketWorkflowHandler) UpdateTicketStatus(c *gin.Context) {
 			return
 		}
 		if errors.Is(err, services.ErrInvalidTicketTransition) {
-			allowed := currentTicket.Status.AllowedTransitions()
+			allowed := []models.TicketStatus{}
+			if reader, supportsVersionedWorkflow :=
+				h.ticketService.(ticketWorkflowTransitionReader); supportsVersionedWorkflow {
+				if configured, readErr := reader.AllowedTicketTransitions(
+					c.Request.Context(),
+					uint(ticketID),
+					userID,
+				); readErr == nil {
+					allowed = configured
+				}
+			}
 			allowedValues := make([]string, len(allowed))
 			for index, status := range allowed {
 				allowedValues[index] = string(status)
@@ -307,16 +326,16 @@ func (h *TicketWorkflowHandler) UpdateTicketStatus(c *gin.Context) {
 	setTicketETag(c, ticket.Version)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    ticketResponseForRole(ticket, normalizedUserRole(c)),
+		"data":    ticketResponseForRole(ticket, normalizedProjectRole(c)),
 		"message": "状态更新成功",
 	})
 }
 
 func (h *TicketWorkflowHandler) GetTicketStats(c *gin.Context) {
 	userID := c.GetUint("user_id")
-	role := normalizedUserRole(c)
+	role := normalizedProjectRole(c)
 
-	stats, err := h.ticketService.GetTicketStatistics(userID, role)
+	stats, err := h.ticketService.GetTicketStatistics(c.Request.Context(), userID, role)
 	if err != nil {
 		logHandlerFailure(c, "ticket_workflow.get_statistics", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -335,7 +354,7 @@ func (h *TicketWorkflowHandler) GetTicketStats(c *gin.Context) {
 
 func (h *TicketWorkflowHandler) GetMyTickets(c *gin.Context) {
 	userID := c.GetUint("user_id")
-	role := normalizedUserRole(c)
+	role := normalizedProjectRole(c)
 
 	limit := 10
 	if l := c.Query("limit"); l != "" {
@@ -353,7 +372,7 @@ func (h *TicketWorkflowHandler) GetMyTickets(c *gin.Context) {
 		total   int64
 		err     error
 	)
-	if isCustomerRole(role) {
+	if isRequesterRole(role) {
 		tickets, total, err = h.ticketService.GetTickets(c.Request.Context(), services.TicketFilters{
 			Page:      1,
 			Limit:     limit,
@@ -363,8 +382,14 @@ func (h *TicketWorkflowHandler) GetMyTickets(c *gin.Context) {
 			SortBy:    "created_at",
 			SortOrder: "desc",
 		})
-	} else if role == "agent" || isPrivilegedRole(role) {
-		tickets, total, err = h.ticketService.GetUserTickets(userID, status, priority, limit)
+	} else if isProjectAgentRole(role) || isProjectManagerRole(role) {
+		tickets, total, err = h.ticketService.GetUserTickets(
+			c.Request.Context(),
+			userID,
+			status,
+			priority,
+			limit,
+		)
 	} else {
 		c.JSON(http.StatusForbidden, gin.H{
 			"success": false,
@@ -390,8 +415,8 @@ func (h *TicketWorkflowHandler) GetMyTickets(c *gin.Context) {
 }
 
 func (h *TicketWorkflowHandler) GetUnassignedTickets(c *gin.Context) {
-	role := normalizedUserRole(c)
-	if role != "agent" && !isPrivilegedRole(role) {
+	role := normalizedProjectRole(c)
+	if !isProjectAgentRole(role) && !isProjectManagerRole(role) {
 		c.JSON(http.StatusForbidden, gin.H{
 			"success": false,
 			"message": "当前身份不能查看未分配队列",
@@ -409,7 +434,12 @@ func (h *TicketWorkflowHandler) GetUnassignedTickets(c *gin.Context) {
 	priority := c.Query("priority")
 	categoryID := c.Query("category_id")
 
-	tickets, total, err := h.ticketService.GetUnassignedTickets(priority, categoryID, limit)
+	tickets, total, err := h.ticketService.GetUnassignedTickets(
+		c.Request.Context(),
+		priority,
+		categoryID,
+		limit,
+	)
 	if err != nil {
 		logHandlerFailure(c, "ticket_workflow.get_unassigned_tickets", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -429,9 +459,13 @@ func (h *TicketWorkflowHandler) GetUnassignedTickets(c *gin.Context) {
 
 func (h *TicketWorkflowHandler) GetOverdueTickets(c *gin.Context) {
 	userID := c.GetUint("user_id")
-	role := normalizedUserRole(c)
+	role := normalizedProjectRole(c)
 
-	tickets, total, err := h.ticketService.GetOverdueTickets(userID, role)
+	tickets, total, err := h.ticketService.GetOverdueTickets(
+		c.Request.Context(),
+		userID,
+		role,
+	)
 	if err != nil {
 		logHandlerFailure(c, "ticket_workflow.get_overdue_tickets", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -451,9 +485,13 @@ func (h *TicketWorkflowHandler) GetOverdueTickets(c *gin.Context) {
 
 func (h *TicketWorkflowHandler) GetSLABreachedTickets(c *gin.Context) {
 	userID := c.GetUint("user_id")
-	role := normalizedUserRole(c)
+	role := normalizedProjectRole(c)
 
-	tickets, total, err := h.ticketService.GetSLABreachedTickets(userID, role)
+	tickets, total, err := h.ticketService.GetSLABreachedTickets(
+		c.Request.Context(),
+		userID,
+		role,
+	)
 	if err != nil {
 		logHandlerFailure(c, "ticket_workflow.get_sla_breached_tickets", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -487,7 +525,10 @@ func (h *TicketWorkflowHandler) GetTicketHistory(c *gin.Context) {
 		return
 	}
 
-	history, _, err := h.ticketService.GetTicketHistory(uint(ticketID))
+	history, _, err := h.ticketService.GetTicketHistory(
+		c.Request.Context(),
+		uint(ticketID),
+	)
 	if err != nil {
 		logHandlerFailure(c, "ticket_workflow.get_history", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -497,7 +538,7 @@ func (h *TicketWorkflowHandler) GetTicketHistory(c *gin.Context) {
 		})
 		return
 	}
-	customer := isCustomerRole(normalizedUserRole(c))
+	customer := isRequesterRole(normalizedProjectRole(c))
 	responses := ticketHistoryResponses(history, customer)
 
 	c.JSON(http.StatusOK, gin.H{

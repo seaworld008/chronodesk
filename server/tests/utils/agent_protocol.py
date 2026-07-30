@@ -7,6 +7,7 @@ messages and dataclass representations.
 
 from __future__ import annotations
 
+import re
 import secrets
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -26,6 +27,7 @@ from .safety import (
 
 MCP_PROTOCOL_VERSION = "2026-07-28"
 A2A_PROTOCOL_VERSION = "1.0"
+PROJECT_KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_-]{0,31}$")
 
 MINIMAL_AGENT_SCOPES = (
     "tickets:read",
@@ -112,6 +114,7 @@ def parse_etag(value: str) -> int:
 @dataclass
 class AgentAccessToken:
     resource: str
+    project_key: str
     scopes: tuple[str, ...]
     access_token: str = field(repr=False)
 
@@ -138,10 +141,14 @@ class AgentProtocolHarness:
         api_base_url: str,
         admin_access_token: str,
         run_id: str,
+        project_key: str,
         resource_manager: E2EResourceManager,
     ) -> None:
+        if PROJECT_KEY_PATTERN.fullmatch(project_key) is None:
+            raise AssertionError("Agent 测试项目键必须规范")
         self.root_url = root_url_from_api_base(api_base_url)
         self.run_id = run_id
+        self.project_key = project_key
         self.prefix = f"E2E-{run_id}-"
         self._admin_access_token = admin_access_token
         self._resources = resource_manager
@@ -161,6 +168,33 @@ class AgentProtocolHarness:
             character.lower() if character.isalnum() else "-" for character in label
         ).strip("-")
         return f"e2e-{self.run_id}-{safe_label}-{secrets.token_hex(4)}"[:128]
+
+    def project_api_path(self, suffix: str = "") -> str:
+        """Return an Agent REST v2 path bound to the configured project."""
+
+        base = f"/api/v2/projects/{self.project_key}"
+        normalized = suffix.strip("/")
+        return f"{base}/{normalized}" if normalized else base
+
+    def ticket_create_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        work_class: str | None = None,
+    ) -> dict[str, Any]:
+        """Bind machine intake to the project's published immutable versions."""
+
+        return self._resources.ticket_create_payload(
+            payload,
+            work_class=work_class,
+        )
+
+    def agent_admin_path(self, suffix: str = "") -> str:
+        """Return the Human REST Agent control path for the configured project."""
+
+        base = f"/api/projects/{self.project_key}/admin/agents"
+        normalized = suffix.strip("/")
+        return f"{base}/{normalized}" if normalized else base
 
     def url(self, path_or_url: str) -> str:
         if path_or_url.startswith(("http://", "https://")):
@@ -238,7 +272,7 @@ class AgentProtocolHarness:
     def overview(self) -> dict[str, Any]:
         response = self.request(
             "GET",
-            "/api/v1/admin/agent-control/overview",
+            self.agent_admin_path("agent-control/overview"),
             headers=self.admin_read_headers(),
         )
         assert_status(response, 200, operation="读取 Agent 控制总览")
@@ -276,7 +310,7 @@ class AgentProtocolHarness:
         principal_name = self.unique(label)
         response = self.admin_request(
             "POST",
-            "/api/v1/admin/service-principals",
+            self.agent_admin_path("service-principals"),
             json_body={
                 "name": principal_name,
                 "description": f"{self.prefix}Agent protocol black-box identity",
@@ -304,6 +338,9 @@ class AgentProtocolHarness:
         assert isinstance(client_id, str) and client_id, "服务主体响应缺少 client_id"
         assert isinstance(client_secret, str) and client_secret, (
             "服务主体响应缺少一次性 client_secret"
+        )
+        assert data.get("project_key") == self.project_key, (
+            "服务主体初始项目 grant 与请求不一致"
         )
         assert isinstance(version, int) and version > 0, (
             "服务主体响应缺少 resource_version"
@@ -338,7 +375,7 @@ class AgentProtocolHarness:
         current = self.principal_row(principal)
         response = self.admin_request(
             "POST",
-            f"/api/v1/admin/service-principals/{principal.client_id}/policies",
+            self.agent_admin_path(f"service-principals/{principal.client_id}/policies"),
             json_body={
                 "name": self.unique(label),
                 "effect": effect,
@@ -397,6 +434,7 @@ class AgentProtocolHarness:
             token_endpoint,
             data={
                 "grant_type": "client_credentials",
+                "project_key": self.project_key,
                 "resource": resource,
                 "scope": " ".join(requested_scopes),
             },
@@ -412,6 +450,9 @@ class AgentProtocolHarness:
         assert payload.get("resource") == resource, (
             "OAuth token resource/audience 不匹配"
         )
+        assert payload.get("project_key") == self.project_key, (
+            "OAuth token project_key 不匹配"
+        )
         granted = tuple(str(payload.get("scope") or "").split())
         assert set(granted) == set(requested_scopes), (
             "OAuth 返回的 scope 与请求的最小权限不一致"
@@ -422,6 +463,7 @@ class AgentProtocolHarness:
         return AgentAccessToken(
             access_token=access_token,
             resource=resource,
+            project_key=self.project_key,
             scopes=granted,
         )
 
@@ -429,9 +471,8 @@ class AgentProtocolHarness:
         current = self.principal_row(principal)
         response = self.admin_request(
             "POST",
-            (
-                f"/api/v1/admin/service-principals/{principal.client_id}"
-                "/credentials/rotate"
+            self.agent_admin_path(
+                f"service-principals/{principal.client_id}/credentials/rotate"
             ),
             if_match=int(current["resource_version"]),
             operation="rotate-credential",
@@ -455,7 +496,7 @@ class AgentProtocolHarness:
         current = self.principal_row(principal)
         response = self.admin_request(
             "PUT",
-            f"/api/v1/admin/service-principals/{principal.client_id}/status",
+            self.agent_admin_path(f"service-principals/{principal.client_id}/status"),
             json_body={
                 "status": status,
                 "read_only": read_only,
@@ -509,7 +550,7 @@ class AgentProtocolHarness:
             try:
                 response = self.admin_request(
                     "POST",
-                    f"/api/v1/admin/leases/{lease_id}/force-release",
+                    self.agent_admin_path(f"leases/{lease_id}/force-release"),
                     if_match=version,
                     operation="cleanup-force-release",
                 )
@@ -524,9 +565,8 @@ class AgentProtocolHarness:
             try:
                 policies_response = self.request(
                     "GET",
-                    (
-                        f"/api/v1/admin/service-principals/{principal.client_id}"
-                        "/policies"
+                    self.agent_admin_path(
+                        f"service-principals/{principal.client_id}/policies"
                     ),
                     headers=self.admin_read_headers(),
                 )
@@ -549,8 +589,8 @@ class AgentProtocolHarness:
                                 continue
                             disabled = self.admin_request(
                                 "DELETE",
-                                (
-                                    "/api/v1/admin/service-principals/"
+                                self.agent_admin_path(
+                                    "service-principals/"
                                     f"{principal.client_id}/policies/{policy_id}"
                                 ),
                                 if_match=version,

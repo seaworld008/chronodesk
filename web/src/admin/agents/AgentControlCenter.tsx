@@ -50,6 +50,12 @@ import {
   TruncatedText,
   type ResizableColumn,
 } from '../../components/tables/EnterpriseTable'
+import { resolveActiveProjectKey } from '../../lib/projectScope'
+
+const resolveAgentAdminPath = async (): Promise<string> => {
+  const projectKey = await resolveActiveProjectKey()
+  return `/projects/${encodeURIComponent(projectKey)}/admin/agents`
+}
 
 const AVAILABLE_SCOPES = [
   'tickets:read',
@@ -190,9 +196,7 @@ interface AgentPolicy {
 
 interface AgentControlSnapshot {
   global_read_only: boolean
-  global_read_only_version: number
   emergency_stop: boolean
-  emergency_stop_version: number
   principals: ServicePrincipal[]
   leases: TicketLease[]
   events: DomainEvent[]
@@ -496,12 +500,11 @@ const AgentControlCenter: React.FC = () => {
     setLoading(true)
     setError('')
     try {
-      const result = await apiFetch<AgentControlSnapshot>('/v1/admin/agent-control/overview')
+      const agentAdminPath = await resolveAgentAdminPath()
+      const result = await apiFetch<AgentControlSnapshot>(`${agentAdminPath}/agent-control/overview`)
       const normalized: AgentControlSnapshot = {
         global_read_only: Boolean(result.global_read_only),
-        global_read_only_version: result.global_read_only_version,
         emergency_stop: Boolean(result.emergency_stop),
-        emergency_stop_version: result.emergency_stop_version,
         principals: result.principals ?? [],
         leases: result.leases ?? [],
         events: result.events ?? [],
@@ -541,7 +544,8 @@ const AgentControlCenter: React.FC = () => {
 
     setSubmitting(true)
     try {
-      const result = await adminWrite<CredentialResult>('/v1/admin/service-principals', {
+      const agentAdminPath = await resolveAgentAdminPath()
+      const result = await adminWrite<CredentialResult>(`${agentAdminPath}/service-principals`, {
         method: 'POST',
         body: JSON.stringify({
           ...createForm,
@@ -564,8 +568,9 @@ const AgentControlCenter: React.FC = () => {
   const rotateCredential = async (principal: ServicePrincipal) => {
     setSubmitting(true)
     try {
+      const agentAdminPath = await resolveAgentAdminPath()
       const result = await adminWrite<CredentialResult>(
-        `/v1/admin/service-principals/${principal.id}/credentials/rotate`,
+        `${agentAdminPath}/service-principals/${principal.id}/credentials/rotate`,
         { method: 'POST' },
         principal.resource_version,
       )
@@ -582,7 +587,8 @@ const AgentControlCenter: React.FC = () => {
   const togglePrincipal = async (principal: ServicePrincipal) => {
     const nextStatus: PrincipalStatus = principal.status === 'active' ? 'inactive' : 'active'
     try {
-      await adminWrite(`/v1/admin/service-principals/${principal.id}/status`, {
+      const agentAdminPath = await resolveAgentAdminPath()
+      await adminWrite(`${agentAdminPath}/service-principals/${principal.id}/status`, {
         method: 'PUT',
         body: JSON.stringify({ status: nextStatus }),
       }, principal.resource_version)
@@ -593,43 +599,10 @@ const AgentControlCenter: React.FC = () => {
     }
   }
 
-  const toggleReadOnly = async () => {
-    if (!snapshot) return
-    const nextValue = !snapshot.global_read_only
-    try {
-      await adminWrite('/v1/admin/agent-control/read-only', {
-        method: 'PUT',
-        body: JSON.stringify({ enabled: nextValue }),
-      }, snapshot.global_read_only_version)
-      notify(nextValue ? '智能体全局只读模式已开启' : '智能体写操作已恢复', {
-        type: nextValue ? 'warning' : 'success',
-      })
-      await loadSnapshot()
-    } catch (requestError) {
-      notify(localizedUnknownErrorMessage(requestError, '全局模式更新失败'), { type: 'error' })
-    }
-  }
-
-  const toggleEmergencyStop = async () => {
-    if (!snapshot) return
-    const nextValue = !snapshot.emergency_stop
-    try {
-      await adminWrite('/v1/admin/agent-control/emergency-stop', {
-        method: 'PUT',
-        body: JSON.stringify({ enabled: nextValue }),
-      }, snapshot.emergency_stop_version)
-      notify(nextValue ? '智能体全局紧急停止已启用' : '智能体全局紧急停止已解除', {
-        type: nextValue ? 'warning' : 'success',
-      })
-      await loadSnapshot()
-    } catch (requestError) {
-      notify(localizedUnknownErrorMessage(requestError, '紧急停止更新失败'), { type: 'error' })
-    }
-  }
-
   const togglePrincipalEmergency = async (principal: ServicePrincipal) => {
     try {
-      await adminWrite(`/v1/admin/service-principals/${principal.id}/status`, {
+      const agentAdminPath = await resolveAgentAdminPath()
+      await adminWrite(`${agentAdminPath}/service-principals/${principal.id}/status`, {
         method: 'PUT',
         body: JSON.stringify({ emergency_disabled: !principal.emergency_disabled }),
       }, principal.resource_version)
@@ -646,7 +619,8 @@ const AgentControlCenter: React.FC = () => {
     setPolicyPrincipal(principal)
     setPolicyForm(initialPolicyForm)
     try {
-      const result = await apiFetch<AgentPolicy[]>(`/v1/admin/service-principals/${principal.id}/policies`)
+      const agentAdminPath = await resolveAgentAdminPath()
+      const result = await apiFetch<AgentPolicy[]>(`${agentAdminPath}/service-principals/${principal.id}/policies`)
       setPolicies(result ?? [])
     } catch (requestError) {
       notify(localizedUnknownErrorMessage(requestError, '策略加载失败'), { type: 'error' })
@@ -657,11 +631,12 @@ const AgentControlCenter: React.FC = () => {
     if (!policyPrincipal) return
     setSubmitting(true)
     try {
-      await adminWrite(`/v1/admin/service-principals/${policyPrincipal.id}/policies`, {
+      const agentAdminPath = await resolveAgentAdminPath()
+      await adminWrite(`${agentAdminPath}/service-principals/${policyPrincipal.id}/policies`, {
         method: 'POST',
         body: JSON.stringify(policyForm),
       }, policyPrincipal.resource_version)
-      const result = await apiFetch<AgentPolicy[]>(`/v1/admin/service-principals/${policyPrincipal.id}/policies`)
+      const result = await apiFetch<AgentPolicy[]>(`${agentAdminPath}/service-principals/${policyPrincipal.id}/policies`)
       setPolicies(result ?? [])
       setPolicyForm(initialPolicyForm)
       const refreshed = await loadSnapshot()
@@ -678,7 +653,8 @@ const AgentControlCenter: React.FC = () => {
   const disablePolicy = async (policy: AgentPolicy) => {
     if (!policyPrincipal) return
     try {
-      await adminWrite(`/v1/admin/service-principals/${policyPrincipal.id}/policies/${policy.id}`, {
+      const agentAdminPath = await resolveAgentAdminPath()
+      await adminWrite(`${agentAdminPath}/service-principals/${policyPrincipal.id}/policies/${policy.id}`, {
         method: 'DELETE',
       }, policy.resource_version)
       setPolicies(policies.map((item) => (item.id === policy.id ? { ...item, is_active: false } : item)))
@@ -690,8 +666,9 @@ const AgentControlCenter: React.FC = () => {
 
   const forceReleaseLease = async (lease: TicketLease) => {
     try {
+      const agentAdminPath = await resolveAgentAdminPath()
       await adminWrite(
-        `/v1/admin/leases/${lease.id}/force-release`,
+        `${agentAdminPath}/leases/${lease.id}/force-release`,
         { method: 'POST' },
         lease.resource_version,
       )
@@ -704,8 +681,9 @@ const AgentControlCenter: React.FC = () => {
 
   const replayDelivery = async (delivery: OutboxDelivery) => {
     try {
+      const agentAdminPath = await resolveAgentAdminPath()
       await adminWrite(
-        `/v1/admin/outbox/${delivery.id}/replay`,
+        `${agentAdminPath}/outbox/${delivery.id}/replay`,
         { method: 'POST' },
         delivery.resource_version,
       )
@@ -754,36 +732,6 @@ const AgentControlCenter: React.FC = () => {
       confirmLabel: activating ? '确认启用' : '确认停用',
       color: activating ? 'primary' : 'warning',
       action: () => togglePrincipal(principal),
-    })
-  }
-
-  const confirmToggleReadOnly = () => {
-    if (!snapshot) return
-
-    const enabling = !snapshot.global_read_only
-    requestConfirmation({
-      title: enabling ? '确认开启全局只读' : '确认恢复智能体写操作',
-      description: enabling
-        ? '开启后，所有智能体写操作都会被策略层拒绝，查询和审计仍可用。'
-        : '恢复后，所有已授权智能体可立即重新执行写操作，请先确认异常或维护已结束。',
-      confirmLabel: enabling ? '开启全局只读' : '恢复写操作',
-      color: 'warning',
-      action: toggleReadOnly,
-    })
-  }
-
-  const confirmToggleEmergencyStop = () => {
-    if (!snapshot) return
-
-    const enabling = !snapshot.emergency_stop
-    requestConfirmation({
-      title: enabling ? '确认全局紧急停止' : '确认解除全局紧急停止',
-      description: enabling
-        ? '启用后，所有智能体请求会立即被拒绝，运行中的自动化处理可能中断。'
-        : '解除后，已授权智能体会立即恢复访问，请确认安全事件已完成处置。',
-      confirmLabel: enabling ? '立即停止全部智能体' : '解除紧急停止',
-      color: 'error',
-      action: toggleEmergencyStop,
     })
   }
 
@@ -880,9 +828,8 @@ const AgentControlCenter: React.FC = () => {
               control={
                 <Switch
                   checked={snapshot?.emergency_stop ?? false}
-                  onChange={confirmToggleEmergencyStop}
                   color="error"
-                  disabled={confirming}
+                  disabled
                   slotProps={{ input: { 'aria-label': '智能体全局紧急停止' } }}
                 />
               }
@@ -892,9 +839,8 @@ const AgentControlCenter: React.FC = () => {
               control={
                 <Switch
                   checked={snapshot?.global_read_only ?? false}
-                  onChange={confirmToggleReadOnly}
                   color="warning"
-                  disabled={confirming}
+                  disabled
                   slotProps={{ input: { 'aria-label': '智能体全局只读模式' } }}
                 />
               }
@@ -912,6 +858,10 @@ const AgentControlCenter: React.FC = () => {
             </Button>
           </Stack>
         </Stack>
+
+        <Alert severity="info" sx={{ mb: 3 }}>
+          全局只读和紧急停止属于平台级安全控制，本项目页面仅展示状态；变更入口已与项目业务操作隔离。
+        </Alert>
 
         {snapshot?.global_read_only && (
           <Alert severity="warning" icon={<PausedIcon />} sx={{ mb: 3 }}>

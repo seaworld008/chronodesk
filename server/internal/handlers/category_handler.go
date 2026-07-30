@@ -159,10 +159,9 @@ func (h *CategoryHandler) Get(c *gin.Context) {
 
 func (h *CategoryHandler) visibleQuery(c *gin.Context) *gorm.DB {
 	query := h.db.WithContext(c.Request.Context()).Model(&models.Category{})
-	role, _ := c.Get("user_role")
-	roleName, _ := role.(string)
-	switch roleName {
-	case string(models.RoleAdmin):
+	switch normalizedProjectRole(c) {
+	case string(models.ProjectRoleAdmin),
+		string(models.ProjectRoleManager):
 		return query
 	default:
 		return query.Where("status = ? AND is_public = ?", models.CategoryStatusActive, true)

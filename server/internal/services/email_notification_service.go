@@ -7,15 +7,21 @@ import (
 	"fmt"
 	htmltemplate "html/template"
 	texttemplate "text/template"
+	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/mailer"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"gorm.io/gorm"
 )
 
 // EmailNotificationServiceInterface 邮件通知服务接口
 type EmailNotificationServiceInterface interface {
-	SendEmailNotificationOutboxAttempt(ctx context.Context, notification *models.Notification) error
+	SendEmailNotificationOutboxAttempt(
+		ctx context.Context,
+		scope models.ProjectScope,
+		notification *models.Notification,
+	) error
 	GetEmailTemplate(notificationType models.NotificationType) (*EmailTemplate, error)
 }
 
@@ -51,18 +57,39 @@ func NewEmailNotificationService(
 // Outbox worker; SMTP itself does not offer exactly-once delivery.
 func (s *EmailNotificationService) SendEmailNotificationOutboxAttempt(
 	ctx context.Context,
+	scope models.ProjectScope,
 	notification *models.Notification,
 ) error {
-	if notification == nil || notification.ID == 0 {
+	if notification == nil || notification.ID == 0 ||
+		scope.Validate() != nil {
 		return fmt.Errorf("邮件通知记录无效")
 	}
 	var persisted models.Notification
-	if err := s.db.WithContext(ctx).
-		Preload("Recipient").
-		Preload("Sender").
-		Preload("RelatedTicket").
-		First(&persisted, notification.ID).Error; err != nil {
+	if err := s.withProjectOperation(
+		ctx,
+		scope,
+		func(scopedContext context.Context) error {
+			return s.db.WithContext(scopedContext).
+				Preload("Recipient").
+				Preload("Sender").
+				Preload("RelatedTicket").
+				Where(
+					"id = ? AND organization_id = ? AND project_id = ?",
+					notification.ID,
+					scope.OrganizationID,
+					scope.ProjectID,
+				).
+				First(&persisted).Error
+		},
+	); err != nil {
 		return fmt.Errorf("获取邮件通知失败: %w", err)
+	}
+	if persisted.RecipientID != notification.RecipientID ||
+		persisted.Type != notification.Type ||
+		persisted.OrganizationID != scope.OrganizationID ||
+		persisted.ProjectID != scope.ProjectID ||
+		persisted.Channel != models.NotificationChannelEmail {
+		return fmt.Errorf("邮件通知 Outbox 业务引用不一致")
 	}
 	*notification = persisted
 	if notification.IsSent {
@@ -70,7 +97,17 @@ func (s *EmailNotificationService) SendEmailNotificationOutboxAttempt(
 	}
 	if notification.Recipient == nil {
 		notification.DeliveryStatus = "skipped_recipient_unavailable"
-		return s.db.WithContext(ctx).Save(notification).Error
+		return s.persistDeliveryState(ctx, scope, notification)
+	}
+	now := time.Now()
+	if notification.ExpiresAt != nil &&
+		!notification.ExpiresAt.After(now) {
+		notification.DeliveryStatus = "skipped_expired"
+		return s.persistDeliveryState(ctx, scope, notification)
+	}
+	if notification.ScheduledAt != nil &&
+		notification.ScheduledAt.After(now) {
+		return fmt.Errorf("邮件通知尚未到计划发送时间")
 	}
 
 	// 检查系统是否可以发送邮件
@@ -95,14 +132,18 @@ func (s *EmailNotificationService) SendEmailNotificationOutboxAttempt(
 	}
 	if !emailEnabled {
 		notification.DeliveryStatus = "skipped_user_preference"
-		return s.db.WithContext(ctx).Save(notification).Error
+		return s.persistDeliveryState(ctx, scope, notification)
 	}
 
 	// 检查用户邮箱是否有效
 	if notification.Recipient.Email == "" {
 		notification.DeliveryStatus = "failed_no_email"
 		notification.ErrorMessage = "用户未设置邮箱地址"
-		if err := s.db.WithContext(ctx).Save(notification).Error; err != nil {
+		if err := s.persistDeliveryState(
+			ctx,
+			scope,
+			notification,
+		); err != nil {
 			return fmt.Errorf("保存邮件投递失败状态: %w", err)
 		}
 		return fmt.Errorf("用户未设置邮箱地址")
@@ -132,7 +173,11 @@ func (s *EmailNotificationService) SendEmailNotificationOutboxAttempt(
 		// 更新失败状态
 		notification.ErrorMessage = err.Error()
 		notification.DeliveryStatus = "failed"
-		if saveErr := s.db.WithContext(ctx).Save(notification).Error; saveErr != nil {
+		if saveErr := s.persistDeliveryState(
+			ctx,
+			scope,
+			notification,
+		); saveErr != nil {
 			return fmt.Errorf("发送邮件失败且无法保存投递状态: %v: %w", err, saveErr)
 		}
 		return fmt.Errorf("发送邮件失败: %w", err)
@@ -144,11 +189,76 @@ func (s *EmailNotificationService) SendEmailNotificationOutboxAttempt(
 	notification.DeliveryStatus = "delivered"
 	notification.ErrorMessage = ""
 	notification.NextRetryAt = nil
-	if err := s.db.WithContext(ctx).Save(notification).Error; err != nil {
+	if err := s.persistDeliveryState(ctx, scope, notification); err != nil {
 		return fmt.Errorf("更新通知状态失败: %w", err)
 	}
 
 	return nil
+}
+
+func (s *EmailNotificationService) withProjectOperation(
+	ctx context.Context,
+	scope models.ProjectScope,
+	run func(context.Context) error,
+) error {
+	if s == nil || s.db == nil || run == nil {
+		return fmt.Errorf("邮件通知项目操作不可用")
+	}
+	if scopeddb.HasTransaction(ctx) {
+		return run(ctx)
+	}
+	return scopeddb.WithProjectScopeContextTransaction(
+		ctx,
+		s.db,
+		scope,
+		run,
+	)
+}
+
+func (s *EmailNotificationService) persistDeliveryState(
+	ctx context.Context,
+	scope models.ProjectScope,
+	notification *models.Notification,
+) error {
+	if notification == nil {
+		return fmt.Errorf("邮件通知记录无效")
+	}
+	finalizeContext, cancelFinalize := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		5*time.Second,
+	)
+	defer cancelFinalize()
+	return s.withProjectOperation(
+		finalizeContext,
+		scope,
+		func(scopedContext context.Context) error {
+			result := s.db.WithContext(scopedContext).
+				Model(&models.Notification{}).
+				Where(
+					"id = ? AND organization_id = ? AND project_id = ?",
+					notification.ID,
+					scope.OrganizationID,
+					scope.ProjectID,
+				).
+				Updates(map[string]any{
+					"is_sent":         notification.IsSent,
+					"sent_at":         notification.SentAt,
+					"is_delivered":    notification.IsDelivered,
+					"delivered_at":    notification.DeliveredAt,
+					"delivery_status": notification.DeliveryStatus,
+					"error_message":   notification.ErrorMessage,
+					"next_retry_at":   notification.NextRetryAt,
+					"updated_at":      time.Now(),
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return gorm.ErrRecordNotFound
+			}
+			return nil
+		},
+	)
 }
 
 // GetEmailTemplate 获取邮件模板

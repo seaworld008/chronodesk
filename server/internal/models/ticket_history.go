@@ -2,6 +2,8 @@ package models
 
 import (
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // HistoryAction 历史操作类型枚举
@@ -47,6 +49,8 @@ type TicketHistory struct {
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
 	// 关联信息
+	OrganizationID     uint                    `json:"organization_id" gorm:"not null;index"`
+	ProjectID          uint                    `json:"project_id" gorm:"not null;index"`
 	TicketID           uint                    `json:"ticket_id" gorm:"not null;index"`
 	Ticket             *Ticket                 `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
 	UserID             *uint                   `json:"user_id" gorm:"index"` // 可为空，系统操作时为空
@@ -95,6 +99,15 @@ type TicketHistory struct {
 // TableName 指定表名
 func (TicketHistory) TableName() string {
 	return "ticket_histories"
+}
+
+func (history *TicketHistory) BeforeCreate(tx *gorm.DB) error {
+	return inheritTicketProjectScope(
+		tx,
+		history.TicketID,
+		&history.OrganizationID,
+		&history.ProjectID,
+	)
 }
 
 // Actor returns the authoritative ActorRef. Migration and database constraints

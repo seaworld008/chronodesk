@@ -32,8 +32,23 @@ type recordingNotificationOutboxEmailSender struct {
 
 func (s *recordingNotificationOutboxEmailSender) SendEmailNotificationOutboxAttempt(
 	ctx context.Context,
+	scope models.ProjectScope,
 	notification *models.Notification,
 ) error {
+	var persisted models.Notification
+	if err := s.db.WithContext(ctx).
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			notification.ID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		First(&persisted).Error; err != nil {
+		return err
+	}
+	if persisted.IsSent {
+		return nil
+	}
 	s.mu.Lock()
 	s.calls++
 	if s.failures > 0 {
@@ -42,10 +57,10 @@ func (s *recordingNotificationOutboxEmailSender) SendEmailNotificationOutboxAtte
 		return errors.New("injected notification SMTP failure")
 	}
 	s.mu.Unlock()
-	notification.MarkAsSent()
-	notification.MarkAsDelivered()
-	notification.DeliveryStatus = "delivered"
-	return s.db.WithContext(ctx).Save(notification).Error
+	persisted.MarkAsSent()
+	persisted.MarkAsDelivered()
+	persisted.DeliveryStatus = "delivered"
+	return s.db.WithContext(ctx).Save(&persisted).Error
 }
 
 func (s *recordingNotificationOutboxEmailSender) GetEmailTemplate(
@@ -104,6 +119,7 @@ type authEmailOutboxFixture struct {
 	sender     *recordingAuthOutboxEmailSender
 	plaintext  string
 	deliveryID string
+	workerCtx  context.Context
 }
 
 func newAuthEmailOutboxFixture(
@@ -130,6 +146,7 @@ func newAuthEmailOutboxFixture(
 	); err != nil {
 		t.Fatal(err)
 	}
+	scope := installAgentplatformTestProjectScope(t, db)
 	protector, err := security.NewKeyring(
 		"test-outbox-email",
 		map[string][]byte{
@@ -142,6 +159,7 @@ func newAuthEmailOutboxFixture(
 	repository, err := auth.NewGormAuthEmailOutboxRepository(
 		db,
 		protector,
+		scope,
 		"urn:test:auth-email",
 	)
 	if err != nil {
@@ -169,6 +187,7 @@ func newAuthEmailOutboxFixture(
 	); err != nil {
 		t.Fatal(err)
 	}
+	workerCtx := agentplatformTestOutboxWorkerContext(t, scope)
 	sender := &recordingAuthOutboxEmailSender{failures: failures}
 	consumer, err := auth.NewAuthEmailOutboxConsumer(db, protector, sender)
 	if err != nil {
@@ -197,6 +216,7 @@ func newAuthEmailOutboxFixture(
 		sender:     sender,
 		plaintext:  plaintext,
 		deliveryID: delivery.ID,
+		workerCtx:  workerCtx,
 	}
 }
 
@@ -266,7 +286,7 @@ func TestAuthenticationEmailOutboxRetriesAndRecoversIdempotently(t *testing.T) {
 			name: "process crash after SMTP before acknowledgement",
 			run: func(t *testing.T, fixture *authEmailOutboxFixture) {
 				claimed, err := fixture.native.ClaimPendingOutbox(
-					context.Background(),
+					fixture.workerCtx,
 					"email-worker-crashed",
 					10,
 					2*time.Minute,
@@ -278,7 +298,7 @@ func TestAuthenticationEmailOutboxRetriesAndRecoversIdempotently(t *testing.T) {
 					t.Fatalf("claimed deliveries = %+v", claimed)
 				}
 				if err := fixture.deliverer.Deliver(
-					context.Background(),
+					fixture.workerCtx,
 					claimed[0],
 					services.CloudEventFromModel(claimed[0].Event),
 				); err != nil {
@@ -357,6 +377,7 @@ func TestNotificationEmailOutboxRetriesFailedAttemptAndSkipsReplay(t *testing.T)
 	); err != nil {
 		t.Fatal(err)
 	}
+	scope := installAgentplatformTestProjectScope(t, db)
 	user := models.User{
 		Username:     "notification-outbox-user",
 		Email:        "notification-outbox@example.test",
@@ -367,6 +388,18 @@ func TestNotificationEmailOutboxRetriesFailedAttemptAndSkipsReplay(t *testing.T)
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
 	}
+	if err := db.AutoMigrate(&models.ProjectMembership{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.ProjectMembership{
+		ProjectID: scope.ProjectID,
+		UserID:    user.ID,
+		Role:      models.ProjectRoleRequester,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 	emailAttempt := &recordingNotificationOutboxEmailSender{
 		db:       db,
 		failures: 1,
@@ -374,7 +407,11 @@ func TestNotificationEmailOutboxRetriesFailedAttemptAndSkipsReplay(t *testing.T)
 	notifications := services.NewNotificationServiceWithProtector(db, nil)
 	notifications.SetEmailNotificationService(emailAttempt)
 	notification, err := notifications.CreateNotification(
-		context.Background(),
+		agentplatformTestOperationContext(
+			t,
+			scope,
+			models.SystemActor("notification-service"),
+		),
 		&models.NotificationCreateRequest{
 			Type:        models.NotificationTypeSystemAlert,
 			Title:       "Outbox 通知",
@@ -386,6 +423,7 @@ func TestNotificationEmailOutboxRetriesFailedAttemptAndSkipsReplay(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	installAgentplatformTestProjectScope(t, db)
 	deliverer, err := NewNativeOutboxDeliverer(
 		NativeOutboxDelivererOptions{
 			DB:            db,
@@ -443,7 +481,7 @@ func TestNotificationEmailOutboxRetriesFailedAttemptAndSkipsReplay(t *testing.T)
 		t.Fatal(err)
 	}
 	if err := deliverer.Deliver(
-		context.Background(),
+		agentplatformTestOutboxWorkerContext(t, scope),
 		&delivery,
 		services.CloudEventFromModel(delivery.Event),
 	); err != nil {

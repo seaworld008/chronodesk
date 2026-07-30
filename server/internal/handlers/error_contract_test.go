@@ -27,6 +27,7 @@ type failingTicketStatisticsService struct {
 }
 
 func (failingTicketStatisticsService) GetTicketStatistics(
+	context.Context,
 	uint,
 	string,
 ) (*services.TicketStatisticsResponse, error) {
@@ -140,7 +141,10 @@ func TestInternalHandlerErrorsStayInServerLogs(t *testing.T) {
 		db := openErrorContractDB(t, "webhook")
 		handler := NewWebhookHandlerWithProtector(db, nil)
 		router := gin.New()
-		router.GET("/webhooks", handler.ListWebhooks)
+		router.GET("/webhooks", func(c *gin.Context) {
+			bindWebhookProjectTestContext(t, c)
+			handler.ListWebhooks(c)
+		})
 
 		response := httptest.NewRecorder()
 		router.ServeHTTP(
@@ -179,7 +183,10 @@ func TestBindingErrorsUseStableChineseMessages(t *testing.T) {
 	t.Run("webhook", func(t *testing.T) {
 		handler := NewWebhookHandlerWithProtector(openErrorContractDB(t, "webhook-binding"), nil)
 		router := gin.New()
-		router.POST("/webhooks", handler.CreateWebhook)
+		router.POST("/webhooks", func(c *gin.Context) {
+			bindWebhookProjectTestContext(t, c)
+			handler.CreateWebhook(c)
+		})
 
 		response := httptest.NewRecorder()
 		request := httptest.NewRequest(

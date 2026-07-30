@@ -46,10 +46,23 @@ type ToolDefinition struct {
 }
 
 func toolDefinitions() []ToolDefinition {
+	projectKey := schema{
+		"type":        "string",
+		"description": "Canonical project key bound to the access token.",
+		"minLength":   float64(1),
+		"maxLength":   float64(32),
+		"pattern":     `^[A-Za-z0-9._:-]+$`,
+	}
 	ticketID := integerSchema("Numeric ticket identifier.", 1)
 	version := integerSchema("Expected ticket resource version.", 1)
 	leaseID := boundedString("Opaque lease identifier returned by ticket_claim.", 1, 255)
 	leaseID["pattern"] = `^[A-Za-z0-9._:-]+$`
+	configurationVersionID := boundedString(
+		"Published project configuration version identifier.",
+		36,
+		36,
+	)
+	configurationVersionID["format"] = "uuid"
 	idempotencyKey := schema{
 		"type":        "string",
 		"description": "Caller-generated key used to safely replay this command.",
@@ -125,15 +138,25 @@ func toolDefinitions() []ToolDefinition {
 			"Create ticket",
 			"Create a ticket from structured fields. Text is stored as untrusted content and is never treated as instructions.",
 			objectSchema(map[string]any{
-				"title":           boundedString("Ticket title.", 1, 255),
-				"description":     boundedString("Ticket description.", 1, 10000),
-				"type":            ticketTypeSchema(),
-				"priority":        ticketPrioritySchema(),
-				"queue":           boundedString("Optional destination queue.", 1, 128),
-				"tags":            arraySchema("Ticket tags.", boundedString("Tag.", 1, 64)),
-				"agent_context":   agentContextSchema(),
-				"idempotency_key": idempotencyKey,
-			}, "title", "description", "type", "priority", "idempotency_key"),
+				"title":                   boundedString("Ticket title.", 1, 255),
+				"description":             boundedString("Ticket description.", 1, 10000),
+				"type":                    ticketTypeSchema(),
+				"priority":                ticketPrioritySchema(),
+				"request_type_version_id": configurationVersionID,
+				"workflow_version_id":     configurationVersionID,
+				"queue":                   boundedString("Optional destination queue.", 1, 128),
+				"tags":                    arraySchema("Ticket tags.", boundedString("Tag.", 1, 64)),
+				"agent_context":           agentContextSchema(),
+				"idempotency_key":         idempotencyKey,
+			},
+				"title",
+				"description",
+				"type",
+				"priority",
+				"request_type_version_id",
+				"workflow_version_id",
+				"idempotency_key",
+			),
 			receiptData,
 			[]string{ScopeTicketsCreate},
 			false, false, true, false,
@@ -330,6 +353,13 @@ func toolDefinitions() []ToolDefinition {
 			true, false, true, false,
 			false, false,
 		),
+	}
+
+	for i := range definitions {
+		properties := definitions[i].InputSchema["properties"].(map[string]any)
+		properties["project_key"] = projectKey
+		required, _ := definitions[i].InputSchema["required"].([]string)
+		definitions[i].InputSchema["required"] = append(required, "project_key")
 	}
 
 	sort.Slice(definitions, func(i, j int) bool {

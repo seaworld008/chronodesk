@@ -31,6 +31,11 @@ func (s *AgentNativeService) DeleteTicket(
 	ctx context.Context,
 	command DeleteTicketCommand,
 ) (OperationReceipt, error) {
+	operation, err := commandOperationContext(ctx, command.Actor)
+	if err != nil {
+		return OperationReceipt{}, err
+	}
+	projectScope := operation.Scope
 	if err := command.Actor.Validate(); err != nil {
 		return OperationReceipt{}, fmt.Errorf("%w: %v", ErrInvalidActor, err)
 	}
@@ -41,10 +46,16 @@ func (s *AgentNativeService) DeleteTicket(
 		return OperationReceipt{}, ErrVersionConflict
 	}
 	var receipt OperationReceipt
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		var ticket models.Ticket
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			First(&ticket, command.TicketID).Error; err != nil {
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ?",
+				command.TicketID,
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+			).
+			First(&ticket).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return fmt.Errorf("ticket not found")
 			}
@@ -55,7 +66,13 @@ func (s *AgentNativeService) DeleteTicket(
 		}
 		nextVersion := command.ExpectedVersion + 1
 		update := tx.Model(&models.Ticket{}).
-			Where("id = ? AND version = ?", ticket.ID, command.ExpectedVersion).
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ? AND version = ?",
+				ticket.ID,
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+				command.ExpectedVersion,
+			).
 			Updates(map[string]any{
 				"version":    nextVersion,
 				"updated_at": s.now(),
@@ -71,7 +88,12 @@ func (s *AgentNativeService) DeleteTicket(
 		var attachments []models.TicketAttachment
 		if err := tx.
 			Select("id", "ticket_id", "storage_path").
-			Where("ticket_id = ?", ticket.ID).
+			Where(
+				"ticket_id = ? AND organization_id = ? AND project_id = ?",
+				ticket.ID,
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+			).
 			Order("id ASC").
 			Find(&attachments).Error; err != nil {
 			return fmt.Errorf("load ticket attachment cleanup manifest: %w", err)
@@ -97,19 +119,39 @@ func (s *AgentNativeService) DeleteTicket(
 				StoragePath:  attachments[i].StoragePath,
 			})
 		}
-		if err := tx.Where("related_ticket_id = ?", ticket.ID).
+		if err := tx.Where(
+			"related_ticket_id = ? AND organization_id = ? AND project_id = ?",
+			ticket.ID,
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+		).
 			Delete(&models.Notification{}).Error; err != nil {
 			return fmt.Errorf("delete ticket notifications: %w", err)
 		}
-		if err := tx.Where("ticket_id = ?", ticket.ID).
+		if err := tx.Where(
+			"ticket_id = ? AND organization_id = ? AND project_id = ?",
+			ticket.ID,
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+		).
 			Delete(&models.TicketHistory{}).Error; err != nil {
 			return fmt.Errorf("delete ticket histories: %w", err)
 		}
-		if err := tx.Where("ticket_id = ?", ticket.ID).
+		if err := tx.Where(
+			"ticket_id = ? AND organization_id = ? AND project_id = ?",
+			ticket.ID,
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+		).
 			Delete(&models.TicketAttachment{}).Error; err != nil {
 			return fmt.Errorf("delete ticket attachments: %w", err)
 		}
-		if err := tx.Where("ticket_id = ?", ticket.ID).
+		if err := tx.Where(
+			"ticket_id = ? AND organization_id = ? AND project_id = ?",
+			ticket.ID,
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+		).
 			Delete(&models.TicketComment{}).Error; err != nil {
 			return fmt.Errorf("delete ticket comments: %w", err)
 		}
@@ -168,6 +210,12 @@ func (s *AgentNativeService) BulkUpdateHumanTickets(
 	if userID == 0 {
 		return nil, fmt.Errorf("%w: human actor is required", ErrInvalidBulkTicketUpdate)
 	}
+	actor := models.HumanActor(userID)
+	operation, err := commandOperationContext(ctx, actor)
+	if err != nil {
+		return nil, err
+	}
+	projectScope := operation.Scope
 	preconditions, err := normalizedBulkTicketPreconditions(request.Tickets)
 	if err != nil {
 		return nil, err
@@ -186,14 +234,18 @@ func (s *AgentNativeService) BulkUpdateHumanTickets(
 			changes[field] = value
 		}
 	}
-	actor := models.HumanActor(userID)
 	result := &BulkUpdateResult{
 		Tickets: make([]TicketVersionReceipt, 0, len(preconditions)),
 	}
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		for _, precondition := range preconditions {
 			var ticket models.Ticket
-			if err := tx.First(&ticket, precondition.ID).Error; err != nil {
+			if err := tx.Where(
+				"id = ? AND organization_id = ? AND project_id = ?",
+				precondition.ID,
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+			).First(&ticket).Error; err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {
 					return fmt.Errorf(
 						"%w: ticket %d not found",
@@ -212,7 +264,14 @@ func (s *AgentNativeService) BulkUpdateHumanTickets(
 					ticket.Version,
 				)
 			}
-			if err := validateTicketChangeSemantics(&ticket, changes); err != nil {
+			if err := validateTicketChangeSemantics(
+				ctx,
+				tx,
+				projectScope,
+				&ticket,
+				changes,
+				actor,
+			); err != nil {
 				return fmt.Errorf("ticket %d: %w", precondition.ID, err)
 			}
 			beforeTicket := ticket
@@ -235,7 +294,13 @@ func (s *AgentNativeService) BulkUpdateHumanTickets(
 			writeChanges["version"] = precondition.Version + 1
 			writeChanges["updated_at"] = now
 			update := tx.Model(&models.Ticket{}).
-				Where("id = ? AND version = ?", precondition.ID, precondition.Version).
+				Where(
+					"id = ? AND organization_id = ? AND project_id = ? AND version = ?",
+					precondition.ID,
+					projectScope.OrganizationID,
+					projectScope.ProjectID,
+					precondition.Version,
+				).
 				Updates(writeChanges)
 			if update.Error != nil {
 				return fmt.Errorf("bulk update ticket %d: %w", precondition.ID, update.Error)
@@ -248,7 +313,12 @@ func (s *AgentNativeService) BulkUpdateHumanTickets(
 					precondition.Version,
 				)
 			}
-			if err := tx.First(&ticket, precondition.ID).Error; err != nil {
+			if err := tx.Where(
+				"id = ? AND organization_id = ? AND project_id = ?",
+				precondition.ID,
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+			).First(&ticket).Error; err != nil {
 				return fmt.Errorf("reload bulk ticket %d: %w", precondition.ID, err)
 			}
 

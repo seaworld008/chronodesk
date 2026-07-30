@@ -137,3 +137,37 @@ export const normalizeCustomFieldsForSubmit = (value: unknown): Record<string, u
 
     return {};
 };
+
+export const formatCustomFieldsInputValue = (value: unknown): string => {
+    if (value == null || value === '') {
+        return '';
+    }
+    if (typeof value === 'string') {
+        return value;
+    }
+    if (typeof value === 'object' && !Array.isArray(value)) {
+        return JSON.stringify(value, null, 2);
+    }
+    return '';
+};
+
+export const validateCustomFieldsInput = (value: unknown): string | undefined => {
+    if (value == null || value === '') {
+        return undefined;
+    }
+    if (typeof value === 'object' && !Array.isArray(value)) {
+        return undefined;
+    }
+    if (typeof value !== 'string') {
+        return '扩展字段必须是 JSON 对象';
+    }
+    try {
+        const parsed = JSON.parse(value);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return '扩展字段必须是 JSON 对象';
+        }
+        return undefined;
+    } catch {
+        return '扩展字段不是有效的 JSON';
+    }
+};

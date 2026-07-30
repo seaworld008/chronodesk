@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/handlers"
 	"github.com/seaworld008/chronodesk/server/internal/httpcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/services"
@@ -153,6 +154,30 @@ type adminWriteEnvelope struct {
 	Receipt *Receipt        `json:"receipt"`
 }
 
+func bindAdminTestProjectScope(
+	scope models.ProjectScope,
+	adminID uint,
+) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		scopedContext, err := services.WithOperationContext(
+			c.Request.Context(),
+			services.OperationContext{
+				Scope:         scope,
+				Actor:         models.HumanActor(adminID),
+				Source:        services.SourceProtocolHumanREST,
+				TraceID:       c.GetHeader("X-Request-ID"),
+				CorrelationID: c.GetHeader("X-Request-ID"),
+			},
+		)
+		if err != nil {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
+		c.Request = c.Request.WithContext(scopedContext)
+		c.Next()
+	}
+}
+
 func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
@@ -174,6 +199,8 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
 		&models.IdempotencyRecord{},
+		&models.AuditChainHead{},
+		&models.AuditLedgerEntry{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -187,9 +214,15 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 	if err := db.Create(&admin).Error; err != nil {
 		t.Fatal(err)
 	}
+	projectFixture := ensureAPIHandlerTestProject(t, db)
+	auditLedger, err := services.NewAuditLedgerService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	native := services.NewAgentNativeService(db, services.AgentNativeOptions{
 		CredentialPepper: []byte("admin-handler-test-pepper"),
+		AuditLedger:      auditLedger,
 	})
 	control := newTestRuntimeControl(t, db, native, false)
 	handler := NewAdminHandler(
@@ -206,7 +239,8 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		c.Set("request_id", "req-"+strings.ReplaceAll(c.FullPath(), "/", "-"))
 		c.Next()
 	})
-	group := router.Group("/api/v1/admin")
+	router.Use(bindAdminTestProjectScope(projectFixture.project.Scope(), admin.ID))
+	group := router.Group("/api/projects/:projectKey/admin/agents")
 	handler.RegisterRoutes(group)
 
 	var requestCounter int
@@ -271,6 +305,18 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		if event.Subject == "" || event.ResourceVersion != receipt.ResourceVersion {
 			tt.Fatalf("%s %s event/receipt version mismatch: event=%+v receipt=%+v", method, path, event, receipt)
 		}
+		if event.OrganizationID != projectFixture.project.OrganizationID ||
+			event.ProjectID != projectFixture.project.ID {
+			tt.Fatalf(
+				"%s %s event scope=%d/%d want=%d/%d",
+				method,
+				path,
+				event.OrganizationID,
+				event.ProjectID,
+				projectFixture.project.OrganizationID,
+				projectFixture.project.ID,
+			)
+		}
 		if wantAdminEvent && !strings.HasPrefix(event.Type, "io.chronodesk.admin.") {
 			tt.Fatalf("%s %s event type=%q, want administrator event", method, path, event.Type)
 		}
@@ -299,20 +345,13 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		return recorder, envelope, event
 	}
 
-	t.Run("global read-only", func(t *testing.T) {
-		doWrite(t, http.MethodPut, "/api/v1/admin/agent-control/read-only", `{"enabled":true}`, http.StatusOK, 1, true)
-	})
-	t.Run("global emergency stop", func(t *testing.T) {
-		doWrite(t, http.MethodPut, "/api/v1/admin/agent-control/emergency-stop", `{"enabled":false}`, http.StatusOK, 1, true)
-	})
-
 	var principalID string
 	var initialSecret string
 	t.Run("principal create", func(t *testing.T) {
 		recorder, envelope, _ := doWrite(
 			t,
 			http.MethodPost,
-			"/api/v1/admin/service-principals",
+			"/api/projects/TEST/admin/agents/service-principals",
 			`{"name":"admin-created-agent","scopes":["tickets:read","tasks:manage"]}`,
 			http.StatusCreated,
 			0,
@@ -325,12 +364,42 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		var data struct {
 			ClientID     string `json:"client_id"`
 			ClientSecret string `json:"client_secret"`
+			ProjectKey   string `json:"project_key"`
 		}
 		if err := json.Unmarshal(envelope.Data, &data); err != nil {
 			t.Fatal(err)
 		}
-		if data.ClientID == "" || data.ClientSecret == "" {
+		if data.ClientID == "" ||
+			data.ClientSecret == "" ||
+			data.ProjectKey != string(projectFixture.project.Key) {
 			t.Fatalf("missing issued credential: %s", envelope.Data)
+		}
+		var grant models.ProjectPrincipalGrant
+		if err := db.Where(
+			"project_id = ? AND service_principal_id = ?",
+			projectFixture.project.ID,
+			data.ClientID,
+		).First(&grant).Error; err != nil {
+			t.Fatalf("load created project grant: %v", err)
+		}
+		if !grant.IsActive ||
+			grant.Role != models.ProjectRoleAgent ||
+			!grant.HasScope(models.ScopeTicketsRead) ||
+			!grant.HasScope(models.ScopeTasksManage) {
+			t.Fatalf("created project grant is incomplete: %+v", grant)
+		}
+		var ledgerEntry models.AuditLedgerEntry
+		if err := db.Where(
+			"organization_id = ? AND project_id = ?",
+			projectFixture.organization.ID,
+			projectFixture.project.ID,
+		).First(&ledgerEntry).Error; err != nil {
+			t.Fatalf("load service principal audit ledger entry: %v", err)
+		}
+		if ledgerEntry.Actor() != models.HumanActor(admin.ID) ||
+			ledgerEntry.EventType !=
+				"io.chronodesk.admin.service_principal.created.v1" {
+			t.Fatalf("unexpected service principal audit entry: %+v", ledgerEntry)
 		}
 		principalID, initialSecret = data.ClientID, data.ClientSecret
 	})
@@ -338,7 +407,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		doWrite(
 			t,
 			http.MethodPut,
-			"/api/v1/admin/service-principals/"+principalID+"/status",
+			"/api/projects/TEST/admin/agents/service-principals/"+principalID+"/status",
 			`{"read_only":true}`,
 			http.StatusOK,
 			1,
@@ -352,7 +421,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		recorder, envelope, _ := doWrite(
 			t,
 			http.MethodPost,
-			"/api/v1/admin/service-principals/"+principalID+"/credentials/rotate",
+			"/api/projects/TEST/admin/agents/service-principals/"+principalID+"/credentials/rotate",
 			"",
 			http.StatusOK,
 			2,
@@ -378,7 +447,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		doWrite(
 			t,
 			http.MethodDelete,
-			"/api/v1/admin/service-principals/"+principalID+"/credentials/"+rotatedCredentialID,
+			"/api/projects/TEST/admin/agents/service-principals/"+principalID+"/credentials/"+rotatedCredentialID,
 			"",
 			http.StatusOK,
 			3,
@@ -391,7 +460,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		_, envelope, _ := doWrite(
 			t,
 			http.MethodPost,
-			"/api/v1/admin/service-principals/"+principalID+"/policies",
+			"/api/projects/TEST/admin/agents/service-principals/"+principalID+"/policies",
 			`{"name":"allow ticket query","effect":"allow","scope":"tickets:read","action":"ticket.read","resource_type":"ticket","resource_id":"*"}`,
 			http.StatusCreated,
 			4,
@@ -410,7 +479,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		doWrite(
 			t,
 			http.MethodDelete,
-			"/api/v1/admin/service-principals/"+principalID+"/policies/"+policyID,
+			"/api/projects/TEST/admin/agents/service-principals/"+principalID+"/policies/"+policyID,
 			"",
 			http.StatusOK,
 			1,
@@ -419,6 +488,9 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 	})
 
 	ticket := models.Ticket{
+		OrganizationID:     projectFixture.organization.ID,
+		ProjectID:          projectFixture.project.ID,
+		QueueID:            projectFixture.queue.ID,
 		TicketNumber:       "ADMIN-CONTROL-1",
 		Title:              "Admin control test",
 		Description:        "Safe test ticket",
@@ -454,7 +526,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		doWrite(
 			t,
 			http.MethodPost,
-			fmt.Sprintf("/api/v1/admin/attachments/%d/scan", attachment.ID),
+			fmt.Sprintf("/api/projects/TEST/admin/agents/attachments/%d/scan", attachment.ID),
 			`{"status":"clean","details":"scanner verified"}`,
 			http.StatusOK,
 			1,
@@ -463,14 +535,18 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 	})
 
 	var replayDelivery models.OutboxDelivery
-	if err := db.Order("created_at ASC").First(&replayDelivery).Error; err != nil {
+	if err := db.Where(
+		"organization_id = ? AND project_id = ?",
+		projectFixture.organization.ID,
+		projectFixture.project.ID,
+	).Order("created_at ASC").First(&replayDelivery).Error; err != nil {
 		t.Fatal(err)
 	}
 	t.Run("outbox replay", func(t *testing.T) {
 		doWrite(
 			t,
 			http.MethodPost,
-			"/api/v1/admin/outbox/"+replayDelivery.ID+"/replay",
+			"/api/projects/TEST/admin/agents/outbox/"+replayDelivery.ID+"/replay",
 			"",
 			http.StatusAccepted,
 			1,
@@ -494,7 +570,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		_, _, event := doWrite(
 			t,
 			http.MethodPost,
-			"/api/v1/admin/leases/"+lease.ID+"/force-release",
+			"/api/projects/TEST/admin/agents/leases/"+lease.ID+"/force-release",
 			"",
 			http.StatusOK,
 			1,
@@ -517,7 +593,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 	overviewRecorder := httptest.NewRecorder()
 	overviewRequest := httptest.NewRequest(
 		http.MethodGet,
-		"/api/v1/admin/agent-control/overview",
+		"/api/projects/TEST/admin/agents/agent-control/overview",
 		nil,
 	)
 	router.ServeHTTP(overviewRecorder, overviewRequest)
@@ -526,9 +602,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 	}
 	var overviewEnvelope struct {
 		Data struct {
-			GlobalReadOnlyVersion uint64 `json:"global_read_only_version"`
-			EmergencyStopVersion  uint64 `json:"emergency_stop_version"`
-			Principals            []struct {
+			Principals []struct {
 				ID              string `json:"id"`
 				ResourceVersion uint64 `json:"resource_version"`
 			} `json:"principals"`
@@ -545,10 +619,6 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 	}
 	if err := json.Unmarshal(overviewRecorder.Body.Bytes(), &overviewEnvelope); err != nil {
 		t.Fatal(err)
-	}
-	if overviewEnvelope.Data.GlobalReadOnlyVersion != 2 ||
-		overviewEnvelope.Data.EmergencyStopVersion != 2 {
-		t.Fatalf("control versions missing from overview: %+v", overviewEnvelope.Data)
 	}
 	assertVersion := func(name string, want uint64, found bool, got uint64) {
 		t.Helper()
@@ -584,7 +654,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 	policyRecorder := httptest.NewRecorder()
 	policyRequest := httptest.NewRequest(
 		http.MethodGet,
-		"/api/v1/admin/service-principals/"+principalID+"/policies",
+		"/api/projects/TEST/admin/agents/service-principals/"+principalID+"/policies",
 		nil,
 	)
 	router.ServeHTTP(policyRecorder, policyRequest)
@@ -620,13 +690,27 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 			t.Fatalf("credential secret leaked into %d domain events", leaked)
 		}
 	}
+	var unscopedIdempotency int64
+	if err := db.Model(&models.IdempotencyRecord{}).
+		Where("organization_id = 0 OR project_id = 0").
+		Count(&unscopedIdempotency).Error; err != nil {
+		t.Fatal(err)
+	}
+	if unscopedIdempotency != 0 {
+		t.Fatalf(
+			"administrator writes created %d unscoped idempotency records",
+			unscopedIdempotency,
+		)
+	}
 }
 
 type adminContractFixture struct {
-	db     *gorm.DB
-	native *services.AgentNativeService
-	router *gin.Engine
-	admin  models.User
+	db      *gorm.DB
+	native  *services.AgentNativeService
+	router  *gin.Engine
+	admin   models.User
+	scope   models.ProjectScope
+	project models.Project
 }
 
 func newAdminContractFixture(t *testing.T) *adminContractFixture {
@@ -651,11 +735,14 @@ func newAdminContractFixture(t *testing.T) *adminContractFixture {
 		&models.ServicePrincipal{},
 		&models.AgentCredential{},
 		&models.AgentPolicy{},
+		&models.PolicyDecision{},
+		&models.Ticket{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
 		&models.IdempotencyRecord{},
 		&models.TicketLease{},
 		&models.TicketAttachment{},
+		&models.ProjectMembership{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -669,6 +756,7 @@ func newAdminContractFixture(t *testing.T) *adminContractFixture {
 	if err := db.Create(&admin).Error; err != nil {
 		t.Fatal(err)
 	}
+	projectFixture := ensureAPIHandlerTestProject(t, db)
 	native := services.NewAgentNativeService(db, services.AgentNativeOptions{
 		CredentialPepper: []byte("admin-contract-credential-pepper"),
 	})
@@ -677,9 +765,17 @@ func newAdminContractFixture(t *testing.T) *adminContractFixture {
 		db,
 		native,
 		admin,
+		projectFixture.project.Scope(),
 		[]byte("admin-contract-stable-replay-encryption-key"),
 	)
-	return &adminContractFixture{db: db, native: native, router: router, admin: admin}
+	return &adminContractFixture{
+		db:      db,
+		native:  native,
+		router:  router,
+		admin:   admin,
+		scope:   projectFixture.project.Scope(),
+		project: projectFixture.project,
+	}
 }
 
 func newAdminContractRouter(
@@ -687,6 +783,7 @@ func newAdminContractRouter(
 	db *gorm.DB,
 	native *services.AgentNativeService,
 	admin models.User,
+	scope models.ProjectScope,
 	replayKey []byte,
 ) *gin.Engine {
 	handler := NewAdminHandler(
@@ -707,7 +804,10 @@ func newAdminContractRouter(
 		}
 		c.Next()
 	})
-	handler.RegisterRoutes(router.Group("/api/v1/admin"))
+	router.Use(bindAdminTestProjectScope(scope, admin.ID))
+	handler.RegisterRoutes(
+		router.Group("/api/projects/:projectKey/admin/agents"),
+	)
 	return router
 }
 
@@ -736,6 +836,532 @@ func performAdminContractRequest(
 	return recorder
 }
 
+func TestCreateServicePrincipalDerivesProjectOnlyFromTrustedPath(t *testing.T) {
+	fixture := newAdminContractFixture(t)
+
+	untrustedBodyScope := performAdminContractRequest(
+		fixture.router,
+		http.MethodPost,
+		"/api/projects/TEST/admin/agents/service-principals",
+		`{"name":"body-scoped","project_key":"MISSING","scopes":["tickets:read"]}`,
+		"body-project-rejected",
+		"",
+		"body-project-request",
+	)
+	if untrustedBodyScope.Code != http.StatusBadRequest ||
+		!strings.Contains(untrustedBodyScope.Body.String(), "unknown field") {
+		t.Fatalf(
+			"body project field status=%d body=%s",
+			untrustedBodyScope.Code,
+			untrustedBodyScope.Body.String(),
+		)
+	}
+
+	created := performAdminContractRequest(
+		fixture.router,
+		http.MethodPost,
+		"/api/projects/TEST/admin/agents/service-principals",
+		`{"name":"path-scoped","scopes":["tickets:read"]}`,
+		"path-project-create",
+		"",
+		"path-project-request",
+	)
+	if created.Code != http.StatusCreated {
+		t.Fatalf(
+			"path-scoped create status=%d body=%s",
+			created.Code,
+			created.Body.String(),
+		)
+	}
+	var envelope adminWriteEnvelope
+	if err := json.Unmarshal(created.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		ClientID   string `json:"client_id"`
+		ProjectKey string `json:"project_key"`
+	}
+	if err := json.Unmarshal(envelope.Data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.ClientID == "" || result.ProjectKey != "TEST" {
+		t.Fatalf("created principal did not bind path project: %s", envelope.Data)
+	}
+
+	var rejectedPrincipalCount int64
+	if err := fixture.db.Model(&models.ServicePrincipal{}).
+		Where("name = ?", "body-scoped").
+		Count(&rejectedPrincipalCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	var grant models.ProjectPrincipalGrant
+	if err := fixture.db.Where(
+		"project_id = ? AND service_principal_id = ?",
+		fixture.scope.ProjectID,
+		result.ClientID,
+	).First(&grant).Error; err != nil {
+		t.Fatal(err)
+	}
+	if rejectedPrincipalCount != 0 || !grant.IsActive {
+		t.Fatalf(
+			"trusted path grant mismatch: rejected=%d grant=%+v",
+			rejectedPrincipalCount,
+			grant,
+		)
+	}
+}
+
+func TestAdminRoutesRequireProjectScopeAndDoNotExposePlatformControlWrites(
+	t *testing.T,
+) {
+	fixture := newAdminContractFixture(t)
+
+	for name, request := range map[string]*http.Request{
+		"legacy global route": httptest.NewRequest(
+			http.MethodGet,
+			"/api/admin/agents/agent-control/overview",
+			nil,
+		),
+		"project global read-only write": httptest.NewRequest(
+			http.MethodPut,
+			"/api/projects/TEST/admin/agents/agent-control/read-only",
+			strings.NewReader(`{"enabled":true}`),
+		),
+		"project emergency-stop write": httptest.NewRequest(
+			http.MethodPut,
+			"/api/projects/TEST/admin/agents/agent-control/emergency-stop",
+			strings.NewReader(`{"enabled":true}`),
+		),
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			fixture.router.ServeHTTP(response, request)
+			if response.Code != http.StatusNotFound {
+				t.Fatalf(
+					"status=%d want=%d body=%s",
+					response.Code,
+					http.StatusNotFound,
+					response.Body.String(),
+				)
+			}
+		})
+	}
+
+	handler := NewAdminHandler(
+		fixture.db,
+		fixture.native,
+		newTestRuntimeControl(t, fixture.db, fixture.native, false),
+		time.Hour,
+		[]byte("unscoped-admin-test-replay-key"),
+	)
+	unscoped := gin.New()
+	unscoped.Use(func(c *gin.Context) {
+		c.Set("user_id", fixture.admin.ID)
+		c.Set("user_role", "admin")
+		c.Next()
+	})
+	handler.RegisterRoutes(
+		unscoped.Group("/api/projects/:projectKey/admin/agents"),
+	)
+	response := performAdminContractRequest(
+		unscoped,
+		http.MethodPost,
+		"/api/projects/TEST/admin/agents/service-principals",
+		`{"name":"unscoped-principal","scopes":["tickets:read"]}`,
+		"unscoped-write",
+		"",
+		"unscoped-write",
+	)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf(
+			"unscoped write status=%d want=%d body=%s",
+			response.Code,
+			http.StatusForbidden,
+			response.Body.String(),
+		)
+	}
+	mismatched := gin.New()
+	mismatched.Use(func(c *gin.Context) {
+		c.Set("user_id", fixture.admin.ID)
+		c.Set("user_role", "admin")
+		c.Next()
+	})
+	mismatched.Use(
+		bindAdminTestProjectScope(fixture.scope, fixture.admin.ID+1),
+	)
+	handler.RegisterRoutes(
+		mismatched.Group("/api/projects/:projectKey/admin/agents"),
+	)
+	mismatchedResponse := performAdminContractRequest(
+		mismatched,
+		http.MethodPost,
+		"/api/projects/TEST/admin/agents/service-principals",
+		`{"name":"mismatched-actor","scopes":["tickets:read"]}`,
+		"mismatched-actor-write",
+		"",
+		"mismatched-actor-write",
+	)
+	if mismatchedResponse.Code != http.StatusForbidden {
+		t.Fatalf(
+			"mismatched actor status=%d want=%d body=%s",
+			mismatchedResponse.Code,
+			http.StatusForbidden,
+			mismatchedResponse.Body.String(),
+		)
+	}
+	var unsafeRecords int64
+	if err := fixture.db.Model(&models.IdempotencyRecord{}).
+		Where("organization_id = 0 OR project_id = 0").
+		Count(&unsafeRecords).Error; err != nil {
+		t.Fatal(err)
+	}
+	if unsafeRecords != 0 {
+		t.Fatalf("unscoped administrator write created %d idempotency records", unsafeRecords)
+	}
+}
+
+func TestAdminWriteRunsThroughHumanProjectScopeTransaction(t *testing.T) {
+	fixture := newAdminContractFixture(t)
+	projectService, err := services.NewProjectService(fixture.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewAdminHandler(
+		fixture.db,
+		fixture.native,
+		newTestRuntimeControl(t, fixture.db, fixture.native, false),
+		time.Hour,
+		[]byte("project-middleware-admin-replay-key"),
+	)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", fixture.admin.ID)
+		c.Set("user_role", string(models.RoleAdmin))
+		c.Set("request_id", "project-middleware-admin-request")
+		c.Next()
+	})
+	group := router.Group("/api/projects/:projectKey/admin/agents")
+	group.Use(handlers.ProjectScopeMiddleware(projectService, fixture.db))
+	handler.RegisterRoutes(group)
+
+	response := performAdminContractRequest(
+		router,
+		http.MethodPost,
+		"/api/projects/TEST/admin/agents/service-principals",
+		`{"name":"middleware-scoped-principal","scopes":["tickets:read"]}`,
+		"middleware-scoped-create",
+		"",
+		"middleware-scoped-request",
+	)
+	if response.Code != http.StatusCreated {
+		t.Fatalf(
+			"project middleware create status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	var record models.IdempotencyRecord
+	if err := fixture.db.Where(
+		"key = ?",
+		"middleware-scoped-create",
+	).First(&record).Error; err != nil {
+		t.Fatal(err)
+	}
+	if record.OrganizationID != fixture.scope.OrganizationID ||
+		record.ProjectID != fixture.scope.ProjectID {
+		t.Fatalf(
+			"idempotency scope=%d/%d want=%d/%d",
+			record.OrganizationID,
+			record.ProjectID,
+			fixture.scope.OrganizationID,
+			fixture.scope.ProjectID,
+		)
+	}
+	var event models.DomainEvent
+	if err := fixture.db.First(&event, "id = ?", record.EventID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if event.OrganizationID != fixture.scope.OrganizationID ||
+		event.ProjectID != fixture.scope.ProjectID {
+		t.Fatalf(
+			"domain event scope=%d/%d want=%d/%d",
+			event.OrganizationID,
+			event.ProjectID,
+			fixture.scope.OrganizationID,
+			fixture.scope.ProjectID,
+		)
+	}
+}
+
+func TestAdminProjectScopeFiltersOverviewAndOpaqueMutations(t *testing.T) {
+	fixture := newAdminContractFixture(t)
+
+	var unit models.BusinessUnit
+	if err := fixture.db.First(
+		&unit,
+		"id = ?",
+		fixture.project.BusinessUnitID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	foreignProject := models.Project{
+		OrganizationID: fixture.scope.OrganizationID,
+		BusinessUnitID: unit.ID,
+		Key:            "OTHER",
+		Name:           "Other",
+		Status:         models.ProjectStatusActive,
+	}
+	if err := fixture.db.Create(&foreignProject).Error; err != nil {
+		t.Fatal(err)
+	}
+	foreignQueue := models.Queue{
+		ProjectID: foreignProject.ID,
+		Key:       "default",
+		Name:      "Foreign Default",
+		Status:    models.QueueStatusActive,
+		IsDefault: true,
+	}
+	if err := fixture.db.Create(&foreignQueue).Error; err != nil {
+		t.Fatal(err)
+	}
+	foreignPrincipal, err := fixture.native.CreateServicePrincipal(
+		context.Background(),
+		services.CreateServicePrincipalInput{
+			Name:   "foreign-project-agent",
+			Scopes: []string{models.ScopeTicketsRead},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grantAPIHandlerTestProject(
+		t,
+		fixture.db,
+		foreignProject,
+		foreignPrincipal.ID,
+		foreignPrincipal.ScopeList(),
+	)
+	foreignTicket := models.Ticket{
+		OrganizationID:     foreignProject.OrganizationID,
+		ProjectID:          foreignProject.ID,
+		QueueID:            foreignQueue.ID,
+		TicketNumber:       "OTHER-1",
+		Title:              "Foreign ticket",
+		Description:        "Must remain isolated",
+		Type:               models.TicketTypeRequest,
+		Priority:           models.TicketPriorityNormal,
+		Status:             models.TicketStatusOpen,
+		Source:             models.TicketSourceAgent,
+		Version:            1,
+		TrustLevel:         models.TicketTrustLevelSystem,
+		CreatedByActorType: models.ActorTypeSystem,
+		CreatedByActorID:   "foreign-test",
+	}
+	if err := fixture.db.Create(&foreignTicket).Error; err != nil {
+		t.Fatal(err)
+	}
+	foreignAttachment := models.TicketAttachment{
+		TicketID:     foreignTicket.ID,
+		ActorType:    models.ActorTypeSystem,
+		ActorID:      "foreign-test",
+		FileName:     "foreign.txt",
+		OriginalName: "foreign.txt",
+		FileSize:     7,
+		MimeType:     "text/plain",
+		StoragePath:  "foreign/foreign.txt",
+		VirusScan:    models.VirusScanPending,
+	}
+	if err := fixture.db.Create(&foreignAttachment).Error; err != nil {
+		t.Fatal(err)
+	}
+	foreignLease := models.TicketLease{
+		ID:              "foreign-project-lease",
+		TicketID:        foreignTicket.ID,
+		HolderActorType: models.ActorTypeServicePrincipal,
+		HolderActorID:   foreignPrincipal.ID,
+		TicketVersion:   foreignTicket.Version,
+		ExpiresAt:       time.Now().UTC().Add(time.Hour),
+		LastHeartbeatAt: time.Now().UTC(),
+	}
+	if err := fixture.db.Create(&foreignLease).Error; err != nil {
+		t.Fatal(err)
+	}
+	foreignContext := agentplatformTestOperationContext(
+		t,
+		foreignProject.Scope(),
+		models.SystemActor("foreign-project-test"),
+	)
+	foreignEvent, err := appendTestDomainEvent(
+		foreignContext,
+		fixture.native,
+		services.DomainEventInput{
+			Type:            "io.chronodesk.test.foreign.v1",
+			Subject:         "foreign/test",
+			Actor:           models.SystemActor("foreign-project-test"),
+			Scope:           foreignProject.Scope(),
+			ResourceVersion: 1,
+			Data:            gin.H{"foreign": true},
+		},
+		[]services.OutboxTarget{{
+			Type: "event_stream",
+			ID:   "foreign-project-test",
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var foreignDelivery models.OutboxDelivery
+	if err := fixture.db.First(
+		&foreignDelivery,
+		"event_id = ?",
+		foreignEvent.ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	foreignDecision := models.PolicyDecision{
+		ID:                 "foreign-project-decision",
+		OrganizationID:     foreignProject.OrganizationID,
+		ProjectID:          foreignProject.ID,
+		ServicePrincipalID: foreignPrincipal.ID,
+		ActorType:          models.ActorTypeServicePrincipal,
+		ActorID:            foreignPrincipal.ID,
+		Scope:              models.ScopeTicketsRead,
+		Action:             "ticket.read",
+		ResourceType:       "ticket",
+		ResourceID:         foreignTicket.TicketNumber,
+		Allowed:            true,
+		ReasonCode:         "scope_allowed",
+		SourceProtocol:     "agent_rest",
+	}
+	if err := fixture.db.Create(&foreignDecision).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	overview := httptest.NewRecorder()
+	fixture.router.ServeHTTP(
+		overview,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/api/projects/TEST/admin/agents/agent-control/overview",
+			nil,
+		),
+	)
+	if overview.Code != http.StatusOK {
+		t.Fatalf("overview status=%d body=%s", overview.Code, overview.Body.String())
+	}
+	for _, foreignValue := range []string{
+		foreignPrincipal.ID,
+		foreignLease.ID,
+		foreignEvent.ID,
+		foreignDelivery.ID,
+		foreignAttachment.OriginalName,
+		foreignDecision.ID,
+		foreignTicket.TicketNumber,
+	} {
+		if strings.Contains(overview.Body.String(), foreignValue) {
+			t.Fatalf(
+				"project overview exposed foreign value %q: %s",
+				foreignValue,
+				overview.Body.String(),
+			)
+		}
+	}
+
+	foreignMutations := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{
+			name:   "principal status",
+			method: http.MethodPut,
+			path: "/api/projects/TEST/admin/agents/service-principals/" +
+				foreignPrincipal.ID + "/status",
+			body: `{"read_only":true}`,
+		},
+		{
+			name:   "lease release",
+			method: http.MethodPost,
+			path: "/api/projects/TEST/admin/agents/leases/" +
+				foreignLease.ID + "/force-release",
+		},
+		{
+			name:   "attachment scan",
+			method: http.MethodPost,
+			path: fmt.Sprintf(
+				"/api/projects/TEST/admin/agents/attachments/%d/scan",
+				foreignAttachment.ID,
+			),
+			body: `{"status":"clean"}`,
+		},
+		{
+			name:   "outbox replay",
+			method: http.MethodPost,
+			path: "/api/projects/TEST/admin/agents/outbox/" +
+				foreignDelivery.ID + "/replay",
+		},
+	}
+	for index, mutation := range foreignMutations {
+		response := performAdminContractRequest(
+			fixture.router,
+			mutation.method,
+			mutation.path,
+			mutation.body,
+			fmt.Sprintf("foreign-mutation-%d", index),
+			httpcontract.FormatETag(1),
+			fmt.Sprintf("foreign-mutation-%d", index),
+		)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf(
+				"%s status=%d want=%d body=%s",
+				mutation.name,
+				response.Code,
+				http.StatusNotFound,
+				response.Body.String(),
+			)
+		}
+	}
+	policies := httptest.NewRecorder()
+	fixture.router.ServeHTTP(
+		policies,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/api/projects/TEST/admin/agents/service-principals/"+
+				foreignPrincipal.ID+
+				"/policies",
+			nil,
+		),
+	)
+	if policies.Code != http.StatusNotFound {
+		t.Fatalf(
+			"foreign policy list status=%d want=%d body=%s",
+			policies.Code,
+			http.StatusNotFound,
+			policies.Body.String(),
+		)
+	}
+
+	var unsafeRecords int64
+	if err := fixture.db.Model(&models.IdempotencyRecord{}).
+		Where("organization_id = 0 OR project_id = 0").
+		Count(&unsafeRecords).Error; err != nil {
+		t.Fatal(err)
+	}
+	if unsafeRecords != 0 {
+		t.Fatalf("foreign opaque IDs created %d unscoped idempotency rows", unsafeRecords)
+	}
+	var unsafeEvents int64
+	if err := fixture.db.Model(&models.DomainEvent{}).
+		Where("organization_id = 0 OR project_id = 0").
+		Count(&unsafeEvents).Error; err != nil {
+		t.Fatal(err)
+	}
+	if unsafeEvents != 0 {
+		t.Fatalf("foreign opaque IDs created %d unscoped domain events", unsafeEvents)
+	}
+}
+
 func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 	fixture := newAdminContractFixture(t)
 
@@ -745,17 +1371,15 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 		path   string
 		body   string
 	}{
-		{"read-only", http.MethodPut, "/api/v1/admin/agent-control/read-only", `{"enabled":true}`},
-		{"emergency-stop", http.MethodPut, "/api/v1/admin/agent-control/emergency-stop", `{"enabled":true}`},
-		{"principal-create", http.MethodPost, "/api/v1/admin/service-principals", `{"name":"missing-key-agent","scopes":["tickets:read"]}`},
-		{"principal-status", http.MethodPut, "/api/v1/admin/service-principals/missing/status", `{"read_only":true}`},
-		{"credential-rotate", http.MethodPost, "/api/v1/admin/service-principals/missing/credentials/rotate", ""},
-		{"credential-revoke", http.MethodDelete, "/api/v1/admin/service-principals/missing/credentials/missing", ""},
-		{"policy-create", http.MethodPost, "/api/v1/admin/service-principals/missing/policies", `{"effect":"allow","scope":"tickets:read"}`},
-		{"policy-disable", http.MethodDelete, "/api/v1/admin/service-principals/missing/policies/missing", ""},
-		{"lease-release", http.MethodPost, "/api/v1/admin/leases/missing/force-release", ""},
-		{"attachment-scan", http.MethodPost, "/api/v1/admin/attachments/1/scan", `{"status":"clean"}`},
-		{"outbox-replay", http.MethodPost, "/api/v1/admin/outbox/missing/replay", ""},
+		{"principal-create", http.MethodPost, "/api/projects/TEST/admin/agents/service-principals", `{"name":"missing-key-agent","scopes":["tickets:read"]}`},
+		{"principal-status", http.MethodPut, "/api/projects/TEST/admin/agents/service-principals/missing/status", `{"read_only":true}`},
+		{"credential-rotate", http.MethodPost, "/api/projects/TEST/admin/agents/service-principals/missing/credentials/rotate", ""},
+		{"credential-revoke", http.MethodDelete, "/api/projects/TEST/admin/agents/service-principals/missing/credentials/missing", ""},
+		{"policy-create", http.MethodPost, "/api/projects/TEST/admin/agents/service-principals/missing/policies", `{"effect":"allow","scope":"tickets:read"}`},
+		{"policy-disable", http.MethodDelete, "/api/projects/TEST/admin/agents/service-principals/missing/policies/missing", ""},
+		{"lease-release", http.MethodPost, "/api/projects/TEST/admin/agents/leases/missing/force-release", ""},
+		{"attachment-scan", http.MethodPost, "/api/projects/TEST/admin/agents/attachments/1/scan", `{"status":"clean"}`},
+		{"outbox-replay", http.MethodPost, "/api/projects/TEST/admin/agents/outbox/missing/replay", ""},
 	}
 	for _, endpoint := range writeEndpoints {
 		t.Run("idempotency-required/"+endpoint.name, func(t *testing.T) {
@@ -795,8 +1419,8 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 	unknownField := performAdminContractRequest(
 		fixture.router,
 		http.MethodPost,
-		"/api/v1/admin/service-principals",
-		`{"name":"unknown-field-agent","scopes":["tickets:read"],"unexpected":true}`,
+		"/api/projects/TEST/admin/agents/service-principals",
+		`{"name":"unknown-field-agent","project_key":"TEST","scopes":["tickets:read"]}`,
 		"unknown-field-rejected",
 		"",
 		"unknown-field",
@@ -810,7 +1434,7 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 	first := performAdminContractRequest(
 		fixture.router,
 		http.MethodPost,
-		"/api/v1/admin/service-principals",
+		"/api/projects/TEST/admin/agents/service-principals",
 		` { "scopes" : ["tickets:read", "tasks:manage"], "name" : "exact-replay-agent" } `,
 		createKey,
 		"",
@@ -850,12 +1474,13 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 		fixture.db,
 		fixture.native,
 		fixture.admin,
+		fixture.scope,
 		[]byte("different-admin-replay-encryption-key"),
 	)
 	wrongKeyReplay := performAdminContractRequest(
 		wrongKeyRouter,
 		http.MethodPost,
-		"/api/v1/admin/service-principals",
+		"/api/projects/TEST/admin/agents/service-principals",
 		`{"name":"exact-replay-agent","scopes":["tickets:read","tasks:manage"]}`,
 		createKey,
 		"",
@@ -874,12 +1499,13 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 		fixture.db,
 		fixture.native,
 		fixture.admin,
+		fixture.scope,
 		[]byte("admin-contract-stable-replay-encryption-key"),
 	)
 	replayed := performAdminContractRequest(
 		restartedRouter,
 		http.MethodPost,
-		"/api/v1/admin/service-principals",
+		"/api/projects/TEST/admin/agents/service-principals",
 		`{"name":"exact-replay-agent","scopes":["tickets:read","tasks:manage"]}`,
 		createKey,
 		"",
@@ -931,7 +1557,7 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 	conflicting := performAdminContractRequest(
 		fixture.router,
 		http.MethodPost,
-		"/api/v1/admin/service-principals",
+		"/api/projects/TEST/admin/agents/service-principals",
 		`{"name":"different-request","scopes":["tickets:read"]}`,
 		createKey,
 		"",
@@ -943,7 +1569,7 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 	}
 
 	statusKey := "principal-status-exact-replay"
-	statusPath := "/api/v1/admin/service-principals/" + credentialData.ClientID + "/status"
+	statusPath := "/api/projects/TEST/admin/agents/service-principals/" + credentialData.ClientID + "/status"
 	statusFirst := performAdminContractRequest(
 		fixture.router,
 		http.MethodPut,
@@ -988,9 +1614,13 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 	processingBody := []byte(`{"read_only":false}`)
 	const processingKey = "administrator-command-processing"
 	processingReservation, err := fixture.native.ReserveIdempotency(
-		context.Background(),
+		agentplatformTestOperationContext(
+			t,
+			fixture.scope,
+			models.HumanActor(fixture.admin.ID),
+		),
 		models.HumanActor(fixture.admin.ID),
-		"admin:PUT:/api/v1/admin/service-principals/:id/status",
+		"admin:PUT:/api/projects/:projectKey/admin/agents/service-principals/:id/status",
 		processingKey,
 		commandFingerprint(
 			http.MethodPut,
@@ -1022,7 +1652,7 @@ func TestAdminCommandsEnforceHeadersAndEncryptedExactReplay(t *testing.T) {
 	}
 
 	rotateKey := "credential-rotation-exact-replay"
-	rotatePath := "/api/v1/admin/service-principals/" + credentialData.ClientID + "/credentials/rotate"
+	rotatePath := "/api/projects/TEST/admin/agents/service-principals/" + credentialData.ClientID + "/credentials/rotate"
 	rotated := performAdminContractRequest(
 		fixture.router,
 		http.MethodPost,
@@ -1072,7 +1702,14 @@ func TestAdminResourceCASAllowsOnlyOneConcurrentWriter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := "/api/v1/admin/service-principals/" + principal.ID + "/status"
+	grantAPIHandlerTestProject(
+		t,
+		fixture.db,
+		fixture.project,
+		principal.ID,
+		principal.ScopeList(),
+	)
+	path := "/api/projects/TEST/admin/agents/service-principals/" + principal.ID + "/status"
 	type response struct {
 		code int
 		body string
@@ -1189,6 +1826,7 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 	if err := db.Create(&admin).Error; err != nil {
 		t.Fatal(err)
 	}
+	projectFixture := ensureAPIHandlerTestProject(t, db)
 	healthy := services.NewAgentNativeService(db, services.AgentNativeOptions{
 		CredentialPepper: []byte("rollback-test-pepper"),
 	})
@@ -1214,7 +1852,10 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 		c.Set("request_id", "rollback-request")
 		c.Next()
 	})
-	handler.RegisterRoutes(router.Group("/api/v1/admin"))
+	router.Use(bindAdminTestProjectScope(projectFixture.project.Scope(), admin.ID))
+	handler.RegisterRoutes(
+		router.Group("/api/projects/:projectKey/admin/agents"),
+	)
 
 	var failedRequestCounter int
 	requestFailure := func(method, path, body string, expectedVersion uint64) {
@@ -1240,7 +1881,7 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 
 	requestFailure(
 		http.MethodPost,
-		"/api/v1/admin/service-principals",
+		"/api/projects/TEST/admin/agents/service-principals",
 		`{"name":"rolled-back-principal","scopes":["tickets:read"]}`,
 		0,
 	)
@@ -1265,6 +1906,13 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	grantAPIHandlerTestProject(
+		t,
+		db,
+		projectFixture.project,
+		principal.ID,
+		principal.ScopeList(),
+	)
 	issued, err := healthy.IssueCredential(context.Background(), principal.ID, "existing", time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -1272,7 +1920,7 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 
 	requestFailure(
 		http.MethodPost,
-		"/api/v1/admin/service-principals/"+principal.ID+"/credentials/rotate",
+		"/api/projects/TEST/admin/agents/service-principals/"+principal.ID+"/credentials/rotate",
 		"",
 		1,
 	)
@@ -1289,7 +1937,7 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 
 	requestFailure(
 		http.MethodDelete,
-		"/api/v1/admin/service-principals/"+principal.ID+"/credentials/"+issued.Credential.ID,
+		"/api/projects/TEST/admin/agents/service-principals/"+principal.ID+"/credentials/"+issued.Credential.ID,
 		"",
 		1,
 	)
@@ -1303,7 +1951,7 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 
 	requestFailure(
 		http.MethodPut,
-		"/api/v1/admin/service-principals/"+principal.ID+"/status",
+		"/api/projects/TEST/admin/agents/service-principals/"+principal.ID+"/status",
 		`{"read_only":true}`,
 		1,
 	)
@@ -1317,7 +1965,7 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 
 	requestFailure(
 		http.MethodPost,
-		"/api/v1/admin/service-principals/"+principal.ID+"/policies",
+		"/api/projects/TEST/admin/agents/service-principals/"+principal.ID+"/policies",
 		`{"effect":"allow","scope":"tickets:read","action":"ticket.read"}`,
 		1,
 	)
@@ -1342,7 +1990,7 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 	}
 	requestFailure(
 		http.MethodDelete,
-		"/api/v1/admin/service-principals/"+principal.ID+"/policies/"+policy.ID,
+		"/api/projects/TEST/admin/agents/service-principals/"+principal.ID+"/policies/"+policy.ID,
 		"",
 		1,
 	)
@@ -1354,18 +2002,6 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 		t.Fatal("policy disable was not rolled back")
 	}
 
-	requestFailure(
-		http.MethodPut,
-		"/api/v1/admin/agent-control/read-only",
-		`{"enabled":true}`,
-		1,
-	)
-	requestFailure(
-		http.MethodPut,
-		"/api/v1/admin/agent-control/emergency-stop",
-		`{"enabled":true}`,
-		1,
-	)
 	if control.ReadOnly() || control.EmergencyStop() {
 		t.Fatalf("runtime memory changed before rollback: read_only=%v emergency=%v", control.ReadOnly(), control.EmergencyStop())
 	}
@@ -1380,6 +2016,9 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 	}
 
 	ticket := models.Ticket{
+		OrganizationID:     projectFixture.organization.ID,
+		ProjectID:          projectFixture.project.ID,
+		QueueID:            projectFixture.queue.ID,
 		TicketNumber:       "ADMIN-ROLLBACK-1",
 		Title:              "Rollback test",
 		Description:        "Safe test data",
@@ -1413,7 +2052,7 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 	}
 	requestFailure(
 		http.MethodPost,
-		fmt.Sprintf("/api/v1/admin/attachments/%d/scan", attachment.ID),
+		fmt.Sprintf("/api/projects/TEST/admin/agents/attachments/%d/scan", attachment.ID),
 		`{"status":"clean","details":"must roll back"}`,
 		1,
 	)
@@ -1432,6 +2071,7 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 		Type:            "io.chronodesk.test.rollback.v1",
 		Subject:         "rollback/source",
 		Actor:           models.SystemActor("rollback-test"),
+		Scope:           projectFixture.project.Scope(),
 		ResourceVersion: 1,
 		Data:            gin.H{"test": true},
 	}, nil)
@@ -1456,7 +2096,7 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 	}
 	requestFailure(
 		http.MethodPost,
-		"/api/v1/admin/outbox/"+delivery.ID+"/replay",
+		"/api/projects/TEST/admin/agents/outbox/"+delivery.ID+"/replay",
 		"",
 		1,
 	)

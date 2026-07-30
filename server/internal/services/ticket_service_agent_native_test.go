@@ -1,7 +1,6 @@
 package services
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -36,8 +35,13 @@ func TestHumanTicketCASCannotOverwriteConcurrentAgentVersion(t *testing.T) {
 	}
 	stale.Priority = models.TicketPriorityHigh
 	stale.Version = 2
+	ctx := testProjectOperationContext(
+		t,
+		db,
+		models.SystemActor("cas-test"),
+	)
 	_, err := NewAgentNativeService(db).UpdateTicketVersion(
-		context.Background(),
+		ctx,
 		VersionedTicketUpdateInput{
 			TicketID:        stale.ID,
 			ExpectedVersion: 1,
@@ -79,7 +83,15 @@ func TestHumanTicketLifecycleUsesNativeEventOutboxTransaction(t *testing.T) {
 	}
 	native := NewAgentNativeService(db)
 	service := newTicketServiceWithDependenciesForTest(t, db, native, nil, 0)
-	ticket, err := service.CreateTicket(context.Background(), &models.TicketCreateRequest{
+	ctx := testProjectOperationContext(t, db, models.HumanActor(user.ID))
+	grantHumanTicketCreateMembership(
+		t,
+		db,
+		ctx,
+		user.ID,
+		models.ProjectRoleAgent,
+	)
+	ticket, err := service.CreateTicket(ctx, &models.TicketCreateRequest{
 		Title: "Human lifecycle", Description: "untrusted",
 		Type: models.TicketTypeRequest, Priority: models.TicketPriorityNormal,
 		Source: models.TicketSourceWeb,
@@ -93,7 +105,7 @@ func TestHumanTicketLifecycleUsesNativeEventOutboxTransaction(t *testing.T) {
 
 	title := "Human lifecycle updated"
 	updated, err := service.UpdateTicketExpectedVersion(
-		context.Background(),
+		ctx,
 		ticket.ID,
 		&models.TicketUpdateRequest{Title: &title},
 		user.ID,

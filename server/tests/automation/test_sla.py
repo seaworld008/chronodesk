@@ -37,7 +37,10 @@ class TestSLAConfigs:
     ) -> None:
         created_id: int | None = None
         try:
-            create_resp = admin_api.post_json("/admin/automation/sla", sla_payload)
+            create_resp = admin_api.post_json(
+                admin_api.project_path("admin/automation/sla"),
+                sla_payload,
+            )
             assert create_resp.status_code == 201, create_resp.text
             create_body = create_resp.json()
             assert create_body.get("success") is True, create_body
@@ -46,7 +49,8 @@ class TestSLAConfigs:
             assert created_id, "SLA 创建未返回 ID"
 
             list_resp = admin_api.get_json(
-                "/admin/automation/sla", params={"page_size": 50}
+                admin_api.project_path("admin/automation/sla"),
+                params={"page_size": 50},
             )
             assert list_resp.status_code == 200, list_resp.text
             list_body = list_resp.json()
@@ -58,7 +62,9 @@ class TestSLAConfigs:
 
         finally:
             if created_id is not None:
-                delete_resp = admin_api.delete(f"/admin/automation/sla/{created_id}")
+                delete_resp = admin_api.delete(
+                    admin_api.project_path(f"admin/automation/sla/{created_id}")
+                )
                 if delete_resp.status_code == 200:
                     delete_body = delete_resp.json()
                     assert delete_body.get("success") is True, delete_body

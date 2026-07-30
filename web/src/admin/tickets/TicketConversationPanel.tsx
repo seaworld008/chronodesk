@@ -35,6 +35,7 @@ import {
     localizedApiErrorMessage,
     localizedUnknownErrorMessage,
 } from '@/lib/apiClient'
+import { projectResourcePath } from '@/lib/projectScope'
 import { canMutateTicket, type TicketRolePermissions } from './ticketAccess'
 
 const apiBase = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
@@ -182,11 +183,14 @@ export const TicketConversationPanel = () => {
         setLoading(true)
         setError('')
         try {
+            const ticketPath = await projectResourcePath(
+                `tickets/${encodeURIComponent(String(ticket.id))}`,
+            )
             const [commentsResponse, attachmentsResponse] = await Promise.all([
-                fetch(`${apiBase}/tickets/${ticket.id}/comments`, {
+                fetch(`${apiBase}/${ticketPath}/comments`, {
                     headers: authHeaders(),
                 }),
-                fetch(`${apiBase}/tickets/${ticket.id}/attachments`, {
+                fetch(`${apiBase}/${ticketPath}/attachments`, {
                     headers: authHeaders(),
                 }),
             ])
@@ -230,15 +234,21 @@ export const TicketConversationPanel = () => {
         try {
             const headers = authHeaders('application/json')
             headers.set('If-Match', `"v${resourceVersion}"`)
-            const response = await fetch(`${apiBase}/tickets/${ticket.id}/comments`, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify({
-                    content,
-                    content_type: 'text',
-                    type: commentType,
-                }),
-            })
+            const ticketPath = await projectResourcePath(
+                `tickets/${encodeURIComponent(String(ticket.id))}`,
+            )
+            const response = await fetch(
+                `${apiBase}/${ticketPath}/comments`,
+                {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({
+                        content,
+                        content_type: 'text',
+                        type: commentType,
+                    }),
+                },
+            )
             if (!response.ok) {
                 throw new Error(await responseMessage(response, '添加评论失败'))
             }
@@ -269,11 +279,17 @@ export const TicketConversationPanel = () => {
             form.append('visibility', attachmentPublic ? 'public' : 'internal')
             const headers = authHeaders()
             headers.set('If-Match', `"v${resourceVersion}"`)
-            const response = await fetch(`${apiBase}/tickets/${ticket.id}/attachments`, {
-                method: 'POST',
-                headers,
-                body: form,
-            })
+            const ticketPath = await projectResourcePath(
+                `tickets/${encodeURIComponent(String(ticket.id))}`,
+            )
+            const response = await fetch(
+                `${apiBase}/${ticketPath}/attachments`,
+                {
+                    method: 'POST',
+                    headers,
+                    body: form,
+                },
+            )
             if (!response.ok) {
                 throw new Error(await responseMessage(response, '上传附件失败'))
             }
@@ -297,8 +313,12 @@ export const TicketConversationPanel = () => {
 
     const downloadAttachment = async (attachment: TicketAttachment) => {
         try {
+            const attachmentPath = await projectResourcePath(
+                `tickets/${encodeURIComponent(String(ticket.id))}` +
+                    `/attachments/${encodeURIComponent(String(attachment.id))}/content`,
+            )
             const response = await fetch(
-                `${apiBase}/tickets/${ticket.id}/attachments/${attachment.id}/content`,
+                `${apiBase}/${attachmentPath}`,
                 { headers: authHeaders() },
             )
             if (!response.ok) {

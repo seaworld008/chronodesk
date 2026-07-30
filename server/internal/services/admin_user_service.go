@@ -394,7 +394,7 @@ func (s *AdminUserService) ResetUserPassword(ctx context.Context, userID uint, n
 		"locked_until":      nil, // 解除锁定
 	}
 
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		if err := tx.Model(user).Updates(updates).Error; err != nil {
 			return fmt.Errorf("failed to reset password: %w", err)
 		}
@@ -445,7 +445,7 @@ func (s *AdminUserService) DeleteUser(ctx context.Context, userID uint) error {
 	}
 
 	now := time.Now()
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		// 先使账号与所有长期会话失效，再软删除主体。认证/登录记录保留
 		// 作为审计证据，因此不能通过级联物理删除解决外键冲突。
 		if err := tx.Model(user).Update("status", models.UserStatusDeleted).Error; err != nil {

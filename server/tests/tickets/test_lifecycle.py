@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from tests.utils import APIClient
+from tests.utils import APIClient, E2EResourceManager
 
 
 @pytest.mark.api
@@ -32,7 +32,7 @@ class TestTicketLifecycle:
 
     def _fetch_notification_ids(self, client: APIClient, limit: int = 50) -> set[int]:
         response = client.get_json(
-            "/notifications",
+            client.project_path("notifications"),
             params={"page": 1, "page_size": limit},
         )
         assert response.status_code == 200, response.text
@@ -54,7 +54,7 @@ class TestTicketLifecycle:
 
         for _ in range(attempts):
             response = client.get_json(
-                "/notifications",
+                client.project_path("notifications"),
                 params={
                     "page": 1,
                     "page_size": 50,
@@ -89,7 +89,7 @@ class TestTicketLifecycle:
         )
 
     def _fetch_ticket(self, client: APIClient, ticket_id: int) -> dict[str, object]:
-        response = client.get_json(f"/tickets/{ticket_id}")
+        response = client.get_json(client.project_path(f"tickets/{ticket_id}"))
         assert response.status_code == 200, response.text
         payload = response.json()
         assert payload.get("code") == 0, payload
@@ -100,9 +100,11 @@ class TestTicketLifecycle:
         self,
         api_client: APIClient,
         admin_api: APIClient,
+        project_key: str,
     ) -> Iterator[dict[str, Any]]:
         """Create an isolated assignee and authenticate as that exact recipient."""
 
+        del project_key
         suffix = time.time_ns()
         password = _generate_strong_password()
         response = admin_api.post_json(
@@ -124,30 +126,45 @@ class TestTicketLifecycle:
         assert body.get("code") == 0, body
         agent: dict[str, Any] = body["data"]
 
-        verification = admin_api.put_json(
-            f"/admin/users/{agent['id']}",
-            {"email_verified": True},
-        )
-        assert verification.status_code == 200, verification.text
-
-        login = api_client.login(agent["email"], password)
-        token = login.get("access_token")
-        assert token, "临时客服登录响应缺少 access_token"
-        agent_api = api_client.with_auth(token)
-        agent["api"] = agent_api
+        agent_api: APIClient | None = None
         try:
+            membership = admin_api.post_json(
+                admin_api.project_path("memberships"),
+                {"user_id": agent["id"], "role": "agent"},
+            )
+            assert membership.status_code == 200, membership.text
+
+            verification = admin_api.put_json(
+                f"/admin/users/{agent['id']}",
+                {"email_verified": True},
+            )
+            assert verification.status_code == 200, verification.text
+
+            login = api_client.login(agent["email"], password)
+            token = login.get("access_token")
+            assert token, "临时客服登录响应缺少 access_token"
+            agent_api = api_client.with_auth(token)
+            agent["api"] = agent_api
             yield agent
         finally:
-            agent_api.close()
+            cleanup_errors: list[str] = []
+            if agent_api is not None:
+                agent_api.close()
             for notification_id in agent.get("_notification_ids", []):
                 notification_cleanup = admin_api.delete(
-                    f"/admin/notifications/{notification_id}"
+                    admin_api.project_path(f"notifications/{notification_id}")
                 )
-                assert notification_cleanup.status_code in (200, 204, 404), (
-                    notification_cleanup.text
-                )
+                if notification_cleanup.status_code not in (200, 204, 404):
+                    cleanup_errors.append(notification_cleanup.text)
+            membership_cleanup = admin_api.delete(
+                admin_api.project_path(f"memberships/{agent['id']}")
+            )
+            if membership_cleanup.status_code not in (200, 204, 404):
+                cleanup_errors.append(membership_cleanup.text)
             cleanup = admin_api.delete(f"/admin/users/{agent['id']}")
-            assert cleanup.status_code in (200, 204, 404), cleanup.text
+            if cleanup.status_code not in (200, 204, 404):
+                cleanup_errors.append(cleanup.text)
+            assert not cleanup_errors, "\n".join(cleanup_errors)
 
     @pytest.fixture
     def created_ticket_ids(
@@ -173,6 +190,7 @@ class TestTicketLifecycle:
         ticket_payload: dict[str, object],
         secondary_agent: dict[str, Any],
         created_ticket_ids: list[int],
+        e2e_manager: E2EResourceManager,
     ) -> None:
         agent_api = secondary_agent["api"]
         existing_agent_notifications = self._fetch_notification_ids(
@@ -180,7 +198,11 @@ class TestTicketLifecycle:
         )
 
         # 1. Create ticket
-        create_resp = admin_api.post_json("/tickets", ticket_payload)
+        configured_ticket_payload = e2e_manager.ticket_create_payload(ticket_payload)
+        create_resp = admin_api.post_json(
+            admin_api.project_path("tickets"),
+            configured_ticket_payload,
+        )
         assert create_resp.status_code in (200, 201), create_resp.text
         create_body = create_resp.json()
         assert create_body.get("code") == 0, create_body
@@ -261,7 +283,9 @@ class TestTicketLifecycle:
         reloaded = self._fetch_ticket(admin_api, ticket_id)
         assert reloaded["status"] == "resolved"
 
-        history_resp = admin_api.get_json(f"/tickets/{ticket_id}/history")
+        history_resp = admin_api.get_json(
+            admin_api.project_path(f"tickets/{ticket_id}/history")
+        )
         assert history_resp.status_code == 200, history_resp.text
         history_body = history_resp.json()
         # workflow handler returns {success: bool, data: [...]}
@@ -294,8 +318,8 @@ class TestTicketLifecycle:
         ), "解决历史未包含解决方案"
 
         # 7. Verify the asynchronous Outbox delivery through the actual recipient.
-        # `/notifications` is deliberately object-scoped, so an administrator's
-        # self-service list must never be used to inspect another user's inbox.
+        # Project notifications remain recipient-scoped, so an administrator's
+        # self-service list must never inspect another user's inbox.
         delivered_notifications = self._wait_for_ticket_notifications(
             agent_api,
             ticket_id,

@@ -1,0 +1,13 @@
+generatorName: java
+inputSpec: ../../server/internal/openapi/openapi.yaml
+outputDir: dist/java
+library: native
+artifactId: chronodesk-java
+groupId: io.chronodesk
+artifactVersion: 0.1.0
+additionalProperties:
+  dateLibrary: java8
+  disallowAdditionalPropertiesIfNotPresent: false
+  hideGenerationTimestamp: true
+  serializationLibrary: jackson
+  useJakartaEe: true

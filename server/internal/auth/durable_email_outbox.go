@@ -12,6 +12,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/safeconv"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 	"gorm.io/gorm"
@@ -35,12 +36,14 @@ type AuthEmailOutboxRepository interface {
 type GormAuthEmailOutboxRepository struct {
 	db          *gorm.DB
 	protector   security.Protector
+	scope       models.ProjectScope
 	eventSource string
 }
 
 func NewGormAuthEmailOutboxRepository(
 	db *gorm.DB,
 	protector security.Protector,
+	scope models.ProjectScope,
 	eventSource string,
 ) (*GormAuthEmailOutboxRepository, error) {
 	if db == nil {
@@ -49,6 +52,12 @@ func NewGormAuthEmailOutboxRepository(
 	if protector == nil {
 		return nil, security.ErrKeyringUnavailable
 	}
+	if err := scope.Validate(); err != nil {
+		return nil, fmt.Errorf(
+			"authentication email Outbox project scope: %w",
+			err,
+		)
+	}
 	eventSource = strings.TrimSpace(eventSource)
 	if eventSource == "" {
 		eventSource = "urn:chronodesk:auth"
@@ -56,8 +65,65 @@ func NewGormAuthEmailOutboxRepository(
 	return &GormAuthEmailOutboxRepository{
 		db:          db,
 		protector:   protector,
+		scope:       scope,
 		eventSource: eventSource,
 	}, nil
+}
+
+// withProjectTransaction binds the server-resolved DEFAULT project to both
+// PostgreSQL RLS and the immutable authentication SystemActor provenance.
+// Authentication state and its email intent therefore commit or roll back as
+// one project-scoped transaction.
+func (r *GormAuthEmailOutboxRepository) withProjectTransaction(
+	ctx context.Context,
+	actor models.ActorRef,
+	fn func(context.Context, *gorm.DB) error,
+) error {
+	if r == nil || r.db == nil || fn == nil {
+		return errors.New(
+			"authentication email Outbox project transaction is unavailable",
+		)
+	}
+	traceID := ""
+	correlationID := ""
+	existing, existingErr := services.OperationContextFromContext(ctx)
+	if scopeddb.HasTransaction(ctx) &&
+		(existingErr != nil || existing.Scope != r.scope) {
+		return errors.New(
+			"authentication email Outbox transaction project scope mismatch",
+		)
+	}
+	if existingErr == nil {
+		traceID = existing.TraceID
+		correlationID = existing.CorrelationID
+	}
+	operationCtx, err := services.WithOperationContext(
+		ctx,
+		services.OperationContext{
+			Scope:         r.scope,
+			Actor:         actor,
+			Source:        services.SourceProtocolWorker,
+			TraceID:       traceID,
+			CorrelationID: correlationID,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"bind authentication email Outbox operation: %w",
+			err,
+		)
+	}
+	if scopeddb.HasTransaction(operationCtx) {
+		return fn(operationCtx, r.db.WithContext(operationCtx))
+	}
+	return scopeddb.WithProjectScopeContextTransaction(
+		operationCtx,
+		r.db,
+		r.scope,
+		func(scopedCtx context.Context) error {
+			return fn(scopedCtx, r.db.WithContext(scopedCtx))
+		},
+	)
 }
 
 func (r *GormAuthEmailOutboxRepository) Register(
@@ -79,57 +145,67 @@ func (r *GormAuthEmailOutboxRepository) Register(
 	modelUser := authUserToModel(user, profile)
 	modelProfile := authProfileToModel(profile)
 	var storedVerification *EmailVerification
-	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&modelUser).Error; err != nil {
-			return err
-		}
-		modelProfile.UserID = modelUser.ID
-		if err := tx.Create(&modelProfile).Error; err != nil {
-			return err
-		}
-
-		if verification != nil {
-			verificationCopy := *verification
-			verificationCopy.UserID = modelUser.ID
-			if verificationCopy.Email == "" {
-				verificationCopy.Email = modelUser.Email
-			}
-			if verificationCopy.Email != modelUser.Email {
-				return errors.New("email verification recipient does not match user")
-			}
-			if err := r.createEmailVerificationTx(ctx, tx, &verificationCopy); err != nil {
+	err := r.withProjectTransaction(
+		ctx,
+		models.SystemActor("auth-registration"),
+		func(txCtx context.Context, tx *gorm.DB) error {
+			if err := tx.Create(&modelUser).Error; err != nil {
 				return err
 			}
-			storedVerification = &verificationCopy
-			_, err := services.AppendEmailOutboxTx(ctx, tx, services.EmailOutboxEventInput{
+			modelProfile.UserID = modelUser.ID
+			if err := tx.Create(&modelProfile).Error; err != nil {
+				return err
+			}
+
+			if verification != nil {
+				verificationCopy := *verification
+				verificationCopy.UserID = modelUser.ID
+				if verificationCopy.Email == "" {
+					verificationCopy.Email = modelUser.Email
+				}
+				if verificationCopy.Email != modelUser.Email {
+					return errors.New("email verification recipient does not match user")
+				}
+				if err := r.createEmailVerificationTx(
+					txCtx,
+					tx,
+					&verificationCopy,
+				); err != nil {
+					return err
+				}
+				storedVerification = &verificationCopy
+				_, err := services.AppendEmailOutboxTx(txCtx, tx, services.EmailOutboxEventInput{
+					Scope:   r.scope,
+					Source:  r.eventSource,
+					Type:    eventcontract.EmailVerificationRequestedEventType,
+					Subject: fmt.Sprintf("user/%d", modelUser.ID),
+					Actor:   models.SystemActor("auth-registration"),
+					Data: services.EmailIntentReference{
+						UserID:         modelUser.ID,
+						VerificationID: verificationCopy.ID,
+						RequestReason:  "registration",
+					},
+					DestinationID: services.AuthVerificationEmailDestinationPrefix +
+						strconv.FormatUint(uint64(verificationCopy.ID), 10),
+				})
+				return err
+			}
+
+			_, err := services.AppendEmailOutboxTx(txCtx, tx, services.EmailOutboxEventInput{
+				Scope:   r.scope,
 				Source:  r.eventSource,
-				Type:    eventcontract.EmailVerificationRequestedEventType,
+				Type:    eventcontract.UserRegisteredEventType,
 				Subject: fmt.Sprintf("user/%d", modelUser.ID),
 				Actor:   models.SystemActor("auth-registration"),
 				Data: services.EmailIntentReference{
-					UserID:         modelUser.ID,
-					VerificationID: verificationCopy.ID,
-					RequestReason:  "registration",
+					UserID: modelUser.ID,
 				},
-				DestinationID: services.AuthVerificationEmailDestinationPrefix +
-					strconv.FormatUint(uint64(verificationCopy.ID), 10),
+				DestinationID: services.AuthWelcomeEmailDestinationPrefix +
+					strconv.FormatUint(uint64(modelUser.ID), 10),
 			})
 			return err
-		}
-
-		_, err := services.AppendEmailOutboxTx(ctx, tx, services.EmailOutboxEventInput{
-			Source:  r.eventSource,
-			Type:    eventcontract.UserRegisteredEventType,
-			Subject: fmt.Sprintf("user/%d", modelUser.ID),
-			Actor:   models.SystemActor("auth-registration"),
-			Data: services.EmailIntentReference{
-				UserID: modelUser.ID,
-			},
-			DestinationID: services.AuthWelcomeEmailDestinationPrefix +
-				strconv.FormatUint(uint64(modelUser.ID), 10),
-		})
-		return err
-	})
+		},
+	)
 	if err != nil {
 		return err
 	}
@@ -160,32 +236,37 @@ func (r *GormAuthEmailOutboxRepository) QueueEmailVerification(
 		reason = "resend"
 	}
 	stored := *verification
-	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := validateAuthEmailRecipientTx(
-			tx,
-			stored.UserID,
-			stored.Email,
-		); err != nil {
+	err := r.withProjectTransaction(
+		ctx,
+		models.SystemActor("auth-email-verification"),
+		func(txCtx context.Context, tx *gorm.DB) error {
+			if err := validateAuthEmailRecipientTx(
+				tx,
+				stored.UserID,
+				stored.Email,
+			); err != nil {
+				return err
+			}
+			if err := r.createEmailVerificationTx(txCtx, tx, &stored); err != nil {
+				return err
+			}
+			_, err := services.AppendEmailOutboxTx(txCtx, tx, services.EmailOutboxEventInput{
+				Scope:   r.scope,
+				Source:  r.eventSource,
+				Type:    eventcontract.EmailVerificationRequestedEventType,
+				Subject: fmt.Sprintf("user/%d", stored.UserID),
+				Actor:   models.SystemActor("auth-email-verification"),
+				Data: services.EmailIntentReference{
+					UserID:         stored.UserID,
+					VerificationID: stored.ID,
+					RequestReason:  reason,
+				},
+				DestinationID: services.AuthVerificationEmailDestinationPrefix +
+					strconv.FormatUint(uint64(stored.ID), 10),
+			})
 			return err
-		}
-		if err := r.createEmailVerificationTx(ctx, tx, &stored); err != nil {
-			return err
-		}
-		_, err := services.AppendEmailOutboxTx(ctx, tx, services.EmailOutboxEventInput{
-			Source:  r.eventSource,
-			Type:    eventcontract.EmailVerificationRequestedEventType,
-			Subject: fmt.Sprintf("user/%d", stored.UserID),
-			Actor:   models.SystemActor("auth-email-verification"),
-			Data: services.EmailIntentReference{
-				UserID:         stored.UserID,
-				VerificationID: stored.ID,
-				RequestReason:  reason,
-			},
-			DestinationID: services.AuthVerificationEmailDestinationPrefix +
-				strconv.FormatUint(uint64(stored.ID), 10),
-		})
-		return err
-	})
+		},
+	)
 	if err != nil {
 		return err
 	}
@@ -205,32 +286,37 @@ func (r *GormAuthEmailOutboxRepository) QueuePasswordReset(
 		return ErrInvalidToken
 	}
 	stored := *reset
-	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := validateAuthEmailRecipientTx(
-			tx,
-			stored.UserID,
-			stored.Email,
-		); err != nil {
+	err := r.withProjectTransaction(
+		ctx,
+		models.SystemActor("auth-password-reset"),
+		func(txCtx context.Context, tx *gorm.DB) error {
+			if err := validateAuthEmailRecipientTx(
+				tx,
+				stored.UserID,
+				stored.Email,
+			); err != nil {
+				return err
+			}
+			if err := r.createPasswordResetTx(txCtx, tx, &stored); err != nil {
+				return err
+			}
+			_, err := services.AppendEmailOutboxTx(txCtx, tx, services.EmailOutboxEventInput{
+				Scope:   r.scope,
+				Source:  r.eventSource,
+				Type:    eventcontract.PasswordResetRequestedEventType,
+				Subject: fmt.Sprintf("user/%d", stored.UserID),
+				Actor:   models.SystemActor("auth-password-reset"),
+				Data: services.EmailIntentReference{
+					UserID:          stored.UserID,
+					PasswordResetID: stored.ID,
+					RequestReason:   "forgot-password",
+				},
+				DestinationID: services.AuthPasswordResetEmailDestinationPrefix +
+					strconv.FormatUint(uint64(stored.ID), 10),
+			})
 			return err
-		}
-		if err := r.createPasswordResetTx(ctx, tx, &stored); err != nil {
-			return err
-		}
-		_, err := services.AppendEmailOutboxTx(ctx, tx, services.EmailOutboxEventInput{
-			Source:  r.eventSource,
-			Type:    eventcontract.PasswordResetRequestedEventType,
-			Subject: fmt.Sprintf("user/%d", stored.UserID),
-			Actor:   models.SystemActor("auth-password-reset"),
-			Data: services.EmailIntentReference{
-				UserID:          stored.UserID,
-				PasswordResetID: stored.ID,
-				RequestReason:   "forgot-password",
-			},
-			DestinationID: services.AuthPasswordResetEmailDestinationPrefix +
-				strconv.FormatUint(uint64(stored.ID), 10),
-		})
-		return err
-	})
+		},
+	)
 	if err != nil {
 		return err
 	}
@@ -265,64 +351,69 @@ func (r *GormAuthEmailOutboxRepository) VerifyEmailAndQueueWelcome(
 ) (uint, error) {
 	digest := bearerTokenDigest("email-verification", token)
 	var userID uint
-	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var verification EmailVerification
-		if err := tx.Where(
-			"token = ? AND used = ? AND expires_at > ?",
-			digest,
-			false,
-			verifiedAt,
-		).Take(&verification).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrInvalidToken
-			}
-			return err
-		}
-		result := tx.Model(&EmailVerification{}).
-			Where(
-				"id = ? AND used = ? AND expires_at > ?",
-				verification.ID,
+	err := r.withProjectTransaction(
+		ctx,
+		models.SystemActor("auth-email-verification"),
+		func(txCtx context.Context, tx *gorm.DB) error {
+			var verification EmailVerification
+			if err := tx.Where(
+				"token = ? AND used = ? AND expires_at > ?",
+				digest,
 				false,
 				verifiedAt,
-			).
-			Updates(map[string]any{
-				"used":            true,
-				"used_at":         &verifiedAt,
-				"delivery_secret": "",
-			})
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected != 1 {
-			return ErrInvalidToken
-		}
+			).Take(&verification).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return ErrInvalidToken
+				}
+				return err
+			}
+			result := tx.Model(&EmailVerification{}).
+				Where(
+					"id = ? AND used = ? AND expires_at > ?",
+					verification.ID,
+					false,
+					verifiedAt,
+				).
+				Updates(map[string]any{
+					"used":            true,
+					"used_at":         &verifiedAt,
+					"delivery_secret": "",
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return ErrInvalidToken
+			}
 
-		result = tx.Model(&models.User{}).
-			Where("id = ?", verification.UserID).
-			Updates(map[string]any{
-				"email_verified":    true,
-				"email_verified_at": &verifiedAt,
+			result = tx.Model(&models.User{}).
+				Where("id = ?", verification.UserID).
+				Updates(map[string]any{
+					"email_verified":    true,
+					"email_verified_at": &verifiedAt,
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return ErrUserNotFound
+			}
+			userID = verification.UserID
+			_, err := services.AppendEmailOutboxTx(txCtx, tx, services.EmailOutboxEventInput{
+				Scope:   r.scope,
+				Source:  r.eventSource,
+				Type:    eventcontract.EmailVerifiedEventType,
+				Subject: fmt.Sprintf("user/%d", userID),
+				Actor:   models.SystemActor("auth-email-verification"),
+				Data: services.EmailIntentReference{
+					UserID: userID,
+				},
+				DestinationID: services.AuthWelcomeEmailDestinationPrefix +
+					strconv.FormatUint(uint64(userID), 10),
 			})
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected != 1 {
-			return ErrUserNotFound
-		}
-		userID = verification.UserID
-		_, err := services.AppendEmailOutboxTx(ctx, tx, services.EmailOutboxEventInput{
-			Source:  r.eventSource,
-			Type:    eventcontract.EmailVerifiedEventType,
-			Subject: fmt.Sprintf("user/%d", userID),
-			Actor:   models.SystemActor("auth-email-verification"),
-			Data: services.EmailIntentReference{
-				UserID: userID,
-			},
-			DestinationID: services.AuthWelcomeEmailDestinationPrefix +
-				strconv.FormatUint(uint64(userID), 10),
-		})
-		return err
-	})
+			return err
+		},
+	)
 	return userID, err
 }
 

@@ -86,6 +86,9 @@ jobs:
             ../server/internal/openapi/openapi.yaml \
             --fail-severity=warn
 
+      - name: Validate AsyncAPI 3.1 contract
+        run: npx --yes @asyncapi/cli@6.0.2 validate ../server/internal/asyncapi/asyncapi.yaml
+
       - name: Lint
         run: npm run lint
 

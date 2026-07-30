@@ -57,20 +57,29 @@ func TestHasFirstResponseIgnoresSystemComments(t *testing.T) {
 	}
 
 	svc := NewEscalationService(db)
-	ctx := context.Background()
+	ctx := testProjectOperationContext(
+		t,
+		db,
+		models.SystemActor(slaMonitorActorID),
+	)
+	if err := db.First(&ticket, ticket.ID).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	if svc.hasFirstResponse(ctx, ticket.ID) {
 		t.Fatalf("expected no first response when only system comments exist")
 	}
 
 	publicComment := models.TicketComment{
-		TicketID:    ticket.ID,
-		UserID:      &user.ID,
-		ActorType:   models.ActorTypeHuman,
-		ActorID:     models.HumanActor(user.ID).ID,
-		Content:     "public response",
-		ContentType: "text",
-		Type:        models.CommentTypePublic,
+		OrganizationID: ticket.OrganizationID,
+		ProjectID:      ticket.ProjectID,
+		TicketID:       ticket.ID,
+		UserID:         &user.ID,
+		ActorType:      models.ActorTypeHuman,
+		ActorID:        models.HumanActor(user.ID).ID,
+		Content:        "public response",
+		ContentType:    "text",
+		Type:           models.CommentTypePublic,
 	}
 	if err := db.Create(&publicComment).Error; err != nil {
 		t.Fatalf("failed to seed public comment: %v", err)
@@ -138,6 +147,17 @@ func TestSLAViolationUsesNativeCommandsAndIsStableAcrossScans(t *testing.T) {
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
 	}
+	ctx := testProjectOperationContext(
+		t,
+		db,
+		models.SystemActor(slaMonitorActorID),
+	)
+	if err := db.First(&ticket, ticket.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&config, config.ID).Error; err != nil {
+		t.Fatal(err)
+	}
 	native := NewAgentNativeService(db, AgentNativeOptions{
 		DefaultOutboxTargets: []OutboxTarget{{
 			Type: "event_stream", ID: "default", MaxAttempts: 8,
@@ -156,7 +176,7 @@ func TestSLAViolationUsesNativeCommandsAndIsStableAcrossScans(t *testing.T) {
 		ResolutionOverdueMinutes: 60,
 		SLAConfig:                &config,
 	}
-	if err := service.HandleSLAViolation(context.Background(), &ticket, status); err != nil {
+	if err := service.HandleSLAViolation(ctx, &ticket, status); err != nil {
 		t.Fatalf("handle first SLA breach: %v", err)
 	}
 
@@ -353,6 +373,17 @@ func TestSLARuleCanTriggerAfterBreachWasAlreadyRecorded(t *testing.T) {
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
 	}
+	ctx := testProjectOperationContext(
+		t,
+		db,
+		models.SystemActor(slaMonitorActorID),
+	)
+	if err := db.First(&ticket, ticket.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&config, config.ID).Error; err != nil {
+		t.Fatal(err)
+	}
 	native := NewAgentNativeService(db, AgentNativeOptions{
 		DefaultOutboxTargets: []OutboxTarget{{Type: "event_stream", ID: "default"}},
 	})
@@ -365,7 +396,7 @@ func TestSLARuleCanTriggerAfterBreachWasAlreadyRecorded(t *testing.T) {
 		IsResponseOverdue:  true, ResponseOverdueMinutes: 10,
 		SLAConfig: &config,
 	}
-	if err := service.HandleSLAViolation(context.Background(), &ticket, status); err != nil {
+	if err := service.HandleSLAViolation(ctx, &ticket, status); err != nil {
 		t.Fatal(err)
 	}
 	var comments int64
@@ -374,7 +405,7 @@ func TestSLARuleCanTriggerAfterBreachWasAlreadyRecorded(t *testing.T) {
 		t.Fatalf("rule triggered before threshold: comments=%d", comments)
 	}
 	status.ResponseOverdueMinutes = 60
-	if err := service.HandleSLAViolation(context.Background(), &ticket, status); err != nil {
+	if err := service.HandleSLAViolation(ctx, &ticket, status); err != nil {
 		t.Fatal(err)
 	}
 	_ = db.Model(&models.TicketComment{}).Count(&comments).Error
@@ -382,7 +413,7 @@ func TestSLARuleCanTriggerAfterBreachWasAlreadyRecorded(t *testing.T) {
 		t.Fatalf("rule did not trigger after threshold: comments=%d", comments)
 	}
 	status.ResponseOverdueMinutes = 120
-	if err := service.HandleSLAViolation(context.Background(), &ticket, status); err != nil {
+	if err := service.HandleSLAViolation(ctx, &ticket, status); err != nil {
 		t.Fatal(err)
 	}
 	_ = db.Model(&models.TicketComment{}).Count(&comments).Error
@@ -451,6 +482,17 @@ func TestSLABreachOutboxRecoversFromSnapshotAfterStateAndConfigChange(t *testing
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
 	}
+	ctx := testProjectOperationContext(
+		t,
+		db,
+		models.SystemActor(slaMonitorActorID),
+	)
+	if err := db.First(&ticket, ticket.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&config, config.ID).Error; err != nil {
+		t.Fatal(err)
+	}
 	native := NewAgentNativeService(db, AgentNativeOptions{
 		DefaultOutboxTargets: []OutboxTarget{{
 			Type: "event_stream", ID: "default", MaxAttempts: 8,
@@ -483,7 +525,7 @@ func TestSLABreachOutboxRecoversFromSnapshotAfterStateAndConfigChange(t *testing
 	// event, idempotency completion and dedicated continuation delivery commit,
 	// but no synchronous statistics or rule execution is invoked.
 	breachEvent, err := service.markSLABreach(
-		context.Background(),
+		ctx,
 		&ticket,
 		snapshot,
 		execution,
@@ -651,6 +693,14 @@ func TestSLAViolationRequiresNativeServiceAndSLAFieldsAreSystemControlled(t *tes
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
 	}
+	workerCtx := testProjectOperationContext(
+		t,
+		db,
+		models.SystemActor(slaMonitorActorID),
+	)
+	if err := db.First(&ticket, ticket.ID).Error; err != nil {
+		t.Fatal(err)
+	}
 	status := &TicketSLAStatus{
 		TicketID: ticket.ID, ResponseDeadline: time.Now().Add(-time.Hour),
 		ResolutionDeadline:  time.Now().Add(-time.Minute),
@@ -660,7 +710,7 @@ func TestSLAViolationRequiresNativeServiceAndSLAFieldsAreSystemControlled(t *tes
 	if err := service.CheckSLAViolations(context.Background()); err == nil {
 		t.Fatal("legacy SLA scan ran without AgentNative")
 	}
-	if err := service.HandleSLAViolation(context.Background(), &ticket, status); err == nil {
+	if err := service.HandleSLAViolation(workerCtx, &ticket, status); err == nil {
 		t.Fatal("legacy escalation service performed a raw SLA write without AgentNative")
 	}
 	var unchanged models.Ticket
@@ -672,7 +722,8 @@ func TestSLAViolationRequiresNativeServiceAndSLAFieldsAreSystemControlled(t *tes
 	}
 
 	native := NewAgentNativeService(db)
-	_, err := native.UpdateTicketVersion(context.Background(), VersionedTicketUpdateInput{
+	humanCtx := testProjectOperationContext(t, db, models.HumanActor(user.ID))
+	_, err := native.UpdateTicketVersion(humanCtx, VersionedTicketUpdateInput{
 		TicketID:        ticket.ID,
 		ExpectedVersion: 1,
 		Actor:           models.HumanActor(user.ID),

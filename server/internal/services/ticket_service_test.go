@@ -1,7 +1,6 @@
 package services
 
 import (
-	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -93,6 +92,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 func TestGetTicketsSupportsMultiValueFilters(t *testing.T) {
 	db := setupTestDB(t)
 	svc := &TicketService{db: db}
+	ctx := testProjectOperationContext(t, db, models.HumanActor(1))
 
 	filters := TicketFilters{
 		Status:    "open,in_progress",
@@ -103,7 +103,7 @@ func TestGetTicketsSupportsMultiValueFilters(t *testing.T) {
 		SortOrder: "desc",
 	}
 
-	tickets, total, err := svc.GetTickets(context.Background(), filters)
+	tickets, total, err := svc.GetTickets(ctx, filters)
 	if err != nil {
 		t.Fatalf("GetTickets returned error: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestGetTicketsSupportsMultiValueFilters(t *testing.T) {
 	// control: single value still works
 	filters.Priority = string(models.TicketPriorityUrgent)
 
-	singleTickets, singleTotal, err := svc.GetTickets(context.Background(), filters)
+	singleTickets, singleTotal, err := svc.GetTickets(ctx, filters)
 	if err != nil {
 		t.Fatalf("GetTickets single priority returned error: %v", err)
 	}
@@ -136,6 +136,53 @@ func TestGetTicketsSupportsMultiValueFilters(t *testing.T) {
 	}
 	if singleTickets[0].Priority != models.TicketPriorityUrgent {
 		t.Fatalf("expected urgent ticket, got %s", singleTickets[0].Priority)
+	}
+}
+
+func TestGetTicketHistoryFiltersEveryQueryByProjectScope(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := testProjectOperationContext(t, db, models.HumanActor(1))
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ticket models.Ticket
+	if err := db.Where("ticket_number = ?", "T-001").First(&ticket).Error; err != nil {
+		t.Fatalf("load scoped ticket: %v", err)
+	}
+	local := models.TicketHistory{
+		TicketID:    ticket.ID,
+		ActorType:   models.ActorTypeHuman,
+		ActorID:     "1",
+		Action:      models.HistoryActionUpdate,
+		Description: "local project history",
+		IsVisible:   true,
+		Provenance:  models.TicketHistoryProvenancePreEvent,
+	}
+	if err := db.Create(&local).Error; err != nil {
+		t.Fatalf("seed local history: %v", err)
+	}
+	foreign := models.TicketHistory{
+		OrganizationID: operation.Scope.OrganizationID + 100,
+		ProjectID:      operation.Scope.ProjectID + 100,
+		TicketID:       ticket.ID,
+		ActorType:      models.ActorTypeHuman,
+		ActorID:        "1",
+		Action:         models.HistoryActionUpdate,
+		Description:    "foreign project history",
+		IsVisible:      true,
+		Provenance:     models.TicketHistoryProvenanceImported,
+	}
+	if err := db.Session(&gorm.Session{SkipHooks: true}).Create(&foreign).Error; err != nil {
+		t.Fatalf("seed cross-project history: %v", err)
+	}
+
+	histories, total, err := (&TicketService{db: db}).GetTicketHistory(ctx, ticket.ID)
+	if err != nil {
+		t.Fatalf("GetTicketHistory: %v", err)
+	}
+	if total != 1 || len(histories) != 1 || histories[0].ID != local.ID {
+		t.Fatalf("cross-project history leaked: total=%d histories=%+v", total, histories)
 	}
 }
 
@@ -177,8 +224,13 @@ func TestEscalateTicketMarksTicketAsEscalated(t *testing.T) {
 	}
 
 	svc := newTicketServiceForTest(t, db)
+	ctx := testProjectOperationContext(
+		t,
+		db,
+		models.HumanActor(*ticket.CreatedByID),
+	)
 	updated, err := svc.EscalateTicketExpectedVersion(
-		context.Background(),
+		ctx,
 		ticket.ID,
 		manager.ID,
 		*ticket.CreatedByID,
@@ -217,10 +269,15 @@ func TestReopenTicketClearsCompletionTimestamps(t *testing.T) {
 	}
 
 	svc := newTicketServiceForTest(t, db)
+	ctx := testProjectOperationContext(
+		t,
+		db,
+		models.HumanActor(*ticket.CreatedByID),
+	)
 	reopened, err := svc.UpdateTicketStatusExpectedVersion(
-		context.Background(),
+		ctx,
 		ticket.ID,
-		string(models.TicketStatusOpen),
+		string(models.TicketStatusInProgress),
 		*ticket.CreatedByID,
 		"reopen",
 		"",
@@ -229,15 +286,18 @@ func TestReopenTicketClearsCompletionTimestamps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpdateTicketStatus returned error: %v", err)
 	}
+	if reopened.Status != models.TicketStatusInProgress {
+		t.Fatalf("resumed ticket status = %s", reopened.Status)
+	}
 	if reopened.ResolvedAt != nil || reopened.ClosedAt != nil {
 		t.Fatalf("reopened ticket must clear completion timestamps, got resolved_at=%v closed_at=%v", reopened.ResolvedAt, reopened.ClosedAt)
 	}
 }
 
-func TestCreateTicketDerivesSLADeadlineFromCategory(t *testing.T) {
+func TestCreateTicketDerivesSLAProjectionFromSLAConfig(t *testing.T) {
 	db := setupFilterTestDB(t)
 	creator := seedUser(t, db, "sla-create-user")
-	slaHours := 6
+	slaHours := 1
 	category := models.Category{
 		Name:      "Create SLA category",
 		Slug:      "create-sla-category",
@@ -250,9 +310,33 @@ func TestCreateTicketDerivesSLADeadlineFromCategory(t *testing.T) {
 		t.Fatalf("failed to create category: %v", err)
 	}
 
-	startedAt := time.Now()
-	svc := newTicketServiceForTest(t, db)
-	ticket, err := svc.CreateTicket(context.Background(), &models.TicketCreateRequest{
+	config := models.SLAConfig{
+		Name:            "authoritative creation SLA",
+		IsActive:        true,
+		IsDefault:       true,
+		ResponseTime:    30,
+		ResolutionTime:  120,
+		ExcludeWeekends: true,
+	}
+	if err := db.Create(&config).Error; err != nil {
+		t.Fatalf("failed to create SLA config: %v", err)
+	}
+	location, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 3, 10, 0, 0, 0, location)
+	native := NewAgentNativeService(db, AgentNativeOptions{Now: func() time.Time { return now }})
+	svc := newTicketServiceWithDependenciesForTest(t, db, native, nil, 0)
+	ctx := testProjectOperationContext(t, db, models.HumanActor(creator.ID))
+	grantHumanTicketCreateMembership(
+		t,
+		db,
+		ctx,
+		creator.ID,
+		models.ProjectRoleAgent,
+	)
+	ticket, err := svc.CreateTicket(ctx, &models.TicketCreateRequest{
 		Title:       "SLA-backed ticket",
 		Description: "deadline should be derived",
 		Type:        models.TicketTypeRequest,
@@ -264,12 +348,13 @@ func TestCreateTicketDerivesSLADeadlineFromCategory(t *testing.T) {
 		t.Fatalf("CreateTicket returned error: %v", err)
 	}
 	if ticket.SLADueDate == nil {
-		t.Fatal("expected SLA deadline from category")
+		t.Fatal("expected SLA projection from active config")
 	}
-
-	earliest := startedAt.Add(time.Duration(slaHours) * time.Hour)
-	latest := time.Now().Add(time.Duration(slaHours) * time.Hour)
-	if ticket.SLADueDate.Before(earliest) || ticket.SLADueDate.After(latest) {
-		t.Fatalf("unexpected SLA deadline %v, expected between %v and %v", ticket.SLADueDate, earliest, latest)
+	want := time.Date(2026, time.August, 3, 12, 0, 0, 0, location)
+	if !ticket.SLADueDate.Equal(want) {
+		t.Fatalf("SLA deadline = %v, want config-derived %v", ticket.SLADueDate, want)
+	}
+	if ticket.SLADueDate.Equal(now.Add(time.Duration(slaHours) * time.Hour)) {
+		t.Fatal("category SLAHours natural-time deadline must not remain authoritative")
 	}
 }

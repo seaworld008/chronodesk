@@ -20,6 +20,7 @@ type recordingNotificationEmailAttempt struct {
 
 func (s *recordingNotificationEmailAttempt) SendEmailNotificationOutboxAttempt(
 	_ context.Context,
+	_ models.ProjectScope,
 	_ *models.Notification,
 ) error {
 	s.mu.Lock()
@@ -42,7 +43,7 @@ func (s *recordingNotificationEmailAttempt) callCount() int {
 
 func newNotificationEmailOutboxTestService(
 	t *testing.T,
-) (*gorm.DB, *NotificationService, *recordingNotificationEmailAttempt, models.User) {
+) (*gorm.DB, *NotificationService, *recordingNotificationEmailAttempt, models.User, context.Context) {
 	t.Helper()
 	db, err := gorm.Open(
 		sqlite.Open(
@@ -72,16 +73,21 @@ func newNotificationEmailOutboxTestService(
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
 	}
+	scope := seedNotificationProjectMembership(t, db, user.ID)
 	attempt := &recordingNotificationEmailAttempt{}
 	service := NewNotificationServiceWithProtector(db, nil)
 	service.SetEmailNotificationService(attempt)
-	return db, service, attempt, user
+	return db, service, attempt, user, notificationTestOperationContext(
+		t,
+		scope,
+		models.SystemActor("notification-service"),
+	)
 }
 
 func TestCreateEmailNotificationCommitsOnlyDurableOutboxIntent(t *testing.T) {
-	db, service, attempt, user := newNotificationEmailOutboxTestService(t)
+	db, service, attempt, user, ctx := newNotificationEmailOutboxTestService(t)
 	notification, err := service.CreateNotification(
-		context.Background(),
+		ctx,
 		&models.NotificationCreateRequest{
 			Type:        models.NotificationTypeSystemAlert,
 			Title:       "需要持久投递",
@@ -119,7 +125,7 @@ func TestCreateEmailNotificationCommitsOnlyDurableOutboxIntent(t *testing.T) {
 }
 
 func TestCreateEmailNotificationRollsBackWhenOutboxInsertFails(t *testing.T) {
-	db, service, attempt, user := newNotificationEmailOutboxTestService(t)
+	db, service, attempt, user, ctx := newNotificationEmailOutboxTestService(t)
 	const callbackName = "fail-notification-email-outbox"
 	if err := db.Callback().Create().
 		Before("gorm:create").
@@ -137,7 +143,7 @@ func TestCreateEmailNotificationRollsBackWhenOutboxInsertFails(t *testing.T) {
 	}()
 
 	if _, err := service.CreateNotification(
-		context.Background(),
+		ctx,
 		&models.NotificationCreateRequest{
 			Type:        models.NotificationTypeSystemAlert,
 			Title:       "必须回滚",

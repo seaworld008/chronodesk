@@ -36,16 +36,25 @@ const (
 	ticketAccessDelete
 )
 
-func normalizedUserRole(c *gin.Context) string {
-	return strings.ToLower(strings.TrimSpace(c.GetString("user_role")))
+func normalizedProjectRole(c *gin.Context) string {
+	return strings.ToLower(strings.TrimSpace(c.GetString(projectRoleContextKey)))
 }
 
-func isCustomerRole(role string) bool {
-	return role == string(models.RoleCustomer)
+func isRequesterRole(role string) bool {
+	return role == string(models.ProjectRoleRequester)
 }
 
-func isPrivilegedRole(role string) bool {
-	return role == string(models.RoleAdmin) || role == string(models.RoleSupervisor)
+func isProjectManagerRole(role string) bool {
+	return role == string(models.ProjectRoleAdmin) ||
+		role == string(models.ProjectRoleManager)
+}
+
+func isProjectAgentRole(role string) bool {
+	return role == string(models.ProjectRoleAgent)
+}
+
+func isProjectObserverRole(role string) bool {
+	return role == string(models.ProjectRoleObserver)
 }
 
 func authorizeTicket(
@@ -60,16 +69,16 @@ func authorizeTicket(
 		return nil, err
 	}
 
-	role := normalizedUserRole(c)
+	role := normalizedProjectRole(c)
 	userID := c.GetUint("user_id")
-	if isPrivilegedRole(role) {
+	if isProjectManagerRole(role) {
 		return ticket, nil
 	}
 	if mode == ticketAccessDelete {
 		return nil, errTicketAccessDenied
 	}
 
-	if isCustomerRole(role) {
+	if isRequesterRole(role) {
 		if ticket.CreatedByID == nil || *ticket.CreatedByID != userID {
 			return nil, errTicketAccessDenied
 		}
@@ -79,7 +88,7 @@ func authorizeTicket(
 		return ticket, nil
 	}
 
-	if role == string(models.RoleAgent) {
+	if isProjectAgentRole(role) {
 		if mode == ticketAccessRead {
 			return ticket, nil
 		}
@@ -87,6 +96,9 @@ func authorizeTicket(
 			return ticket, nil
 		}
 		return nil, errTicketAccessDenied
+	}
+	if isProjectObserverRole(role) && mode == ticketAccessRead {
+		return ticket, nil
 	}
 
 	return nil, errTicketAccessDenied
@@ -182,7 +194,7 @@ func ticketResponseForRole(ticket *models.Ticket, role string) *models.TicketRes
 		return nil
 	}
 	response := ticket.ToResponse()
-	if isCustomerRole(role) {
+	if isRequesterRole(role) {
 		response.CreatedBy = nil
 		response.AssignedToID = nil
 		response.AssignedTo = nil

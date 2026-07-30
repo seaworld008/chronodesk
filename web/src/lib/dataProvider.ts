@@ -1,8 +1,26 @@
 import { DataProvider, fetchUtils, HttpError } from 'react-admin'
 import queryString from 'query-string'
 import { containsChineseText, localizedApiErrorMessage } from './apiClient'
+import { projectResourcePath } from './projectScope'
 
 const apiUrl = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
+
+const projectScopedResources = new Set([
+    'tickets',
+    'categories',
+    'assignees',
+    'notifications',
+    'automation-rules',
+    'automation-logs',
+])
+
+const scopedApiPath = async (
+    resource: string,
+    apiPath: string,
+): Promise<string> =>
+    projectScopedResources.has(resource)
+        ? projectResourcePath(apiPath)
+        : apiPath
 
 /**
  * 自定义HTTP客户端，处理JWT认证和请求格式化
@@ -375,6 +393,7 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/logs';
         }
 
+        apiPath = await scopedApiPath(resource, apiPath)
         const url = `${apiUrl}/${apiPath}?${queryString.stringify(query)}`;
         const { json, headers } = await httpClient(url);
 
@@ -394,6 +413,7 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/rules';
         }
 
+        apiPath = await scopedApiPath(resource, apiPath)
         const url = `${apiUrl}/${apiPath}/${params.id}`;
         const { json } = await httpClient(url);
         const data = extractResponseData(json);
@@ -425,6 +445,7 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/rules';
         }
 
+        apiPath = await scopedApiPath(resource, apiPath)
         const url = `${apiUrl}/${apiPath}?${queryString.stringify(query)}`;
         const { json } = await httpClient(url);
         
@@ -467,7 +488,8 @@ export const dataProvider: DataProvider = {
 
         if (params.target === 'ticket_id' && (resource === 'comments' || resource === 'ticket_history')) {
             const nestedResource = resource === 'comments' ? 'comments' : 'history'
-            const url = `${apiUrl}/tickets/${params.id}/${nestedResource}?${queryString.stringify({
+            const ticketsPath = await projectResourcePath('tickets')
+            const url = `${apiUrl}/${ticketsPath}/${params.id}/${nestedResource}?${queryString.stringify({
                 page,
                 page_size: perPage,
                 sort: query.sort,
@@ -483,6 +505,7 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/rules';
         }
 
+        apiPath = await scopedApiPath(resource, apiPath)
         const url = `${apiUrl}/${apiPath}?${queryString.stringify(query)}`;
         const { json, headers } = await httpClient(url);
 
@@ -500,6 +523,7 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/logs';
         }
 
+        apiPath = await scopedApiPath(resource, apiPath)
         const url = `${apiUrl}/${apiPath}`;
         
         try {
@@ -528,6 +552,7 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/logs';
         }
 
+        apiPath = await scopedApiPath(resource, apiPath)
         const url = `${apiUrl}/${apiPath}/${params.id}`;
         
         try {
@@ -560,7 +585,8 @@ export const dataProvider: DataProvider = {
                 throw new HttpError('请先选择需要更新的字段', 400);
             }
 
-            const url = `${apiUrl}/tickets/bulk-update`;
+            const ticketsPath = await projectResourcePath('tickets')
+            const url = `${apiUrl}/${ticketsPath}/bulk-update`;
             const { json } = await httpClient(url, {
                 method: 'POST',
                 body: JSON.stringify({
@@ -585,6 +611,7 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/logs';
         }
 
+        apiPath = await scopedApiPath(resource, apiPath)
         await Promise.all(
             params.ids.map(id =>
                 httpClient(`${apiUrl}/${apiPath}/${id}`, {
@@ -608,6 +635,7 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/logs';
         }
 
+        apiPath = await scopedApiPath(resource, apiPath)
         const url = `${apiUrl}/${apiPath}/${params.id}`;
         const cachedVersion = resource === 'tickets'
             ? ticketVersionCache.get(String(params.id))
@@ -645,7 +673,8 @@ export const dataProvider: DataProvider = {
     deleteMany: async (resource, params) => {
         // 如果后端支持批量删除
         if (resource === 'tickets') {
-            const url = `${apiUrl}/tickets/bulk-delete`;
+            const ticketsPath = await projectResourcePath('tickets')
+            const url = `${apiUrl}/${ticketsPath}/bulk-delete`;
             const { json } = await httpClient(url, {
                 method: 'DELETE',
                 body: JSON.stringify({
@@ -684,6 +713,7 @@ export const dataProvider: DataProvider = {
             apiPath = 'admin/automation/logs';
         }
 
+        apiPath = await scopedApiPath(resource, apiPath)
         await Promise.all(
             params.ids.map(id =>
                 httpClient(`${apiUrl}/${apiPath}/${id}`, {

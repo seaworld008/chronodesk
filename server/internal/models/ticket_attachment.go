@@ -2,6 +2,8 @@ package models
 
 import (
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // AttachmentType 附件类型
@@ -33,8 +35,10 @@ type TicketAttachment struct {
 	DeletedAt *time.Time `json:"deleted_at,omitempty" gorm:"index"`
 
 	// 关联信息
-	TicketID uint    `json:"ticket_id" gorm:"not null;index"`
-	Ticket   *Ticket `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
+	OrganizationID uint    `json:"organization_id" gorm:"not null;index"`
+	ProjectID      uint    `json:"project_id" gorm:"not null;index"`
+	TicketID       uint    `json:"ticket_id" gorm:"not null;index"`
+	Ticket         *Ticket `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
 
 	CommentID *uint          `json:"comment_id,omitempty" gorm:"index"`
 	Comment   *TicketComment `json:"comment,omitempty" gorm:"foreignKey:CommentID"`
@@ -88,6 +92,15 @@ func (TicketAttachment) TableName() string {
 	return "ticket_attachments"
 }
 
+func (attachment *TicketAttachment) BeforeCreate(tx *gorm.DB) error {
+	return inheritTicketProjectScope(
+		tx,
+		attachment.TicketID,
+		&attachment.OrganizationID,
+		&attachment.ProjectID,
+	)
+}
+
 func (a *TicketAttachment) Actor() ActorRef {
 	return ActorRef{Type: a.ActorType, ID: a.ActorID}
 }
@@ -99,6 +112,8 @@ type TicketAttachmentResponse struct {
 	CreatedAt          time.Time       `json:"created_at"`
 	UpdatedAt          time.Time       `json:"updated_at"`
 	TicketID           uint            `json:"ticket_id"`
+	OrganizationID     uint            `json:"organization_id"`
+	ProjectID          uint            `json:"project_id"`
 	CommentID          *uint           `json:"comment_id,omitempty"`
 	UploadedBy         *uint           `json:"uploaded_by,omitempty"`
 	ActorType          ActorType       `json:"actor_type"`
@@ -131,6 +146,8 @@ func (a *TicketAttachment) ToResponse() *TicketAttachmentResponse {
 		CreatedAt:          a.CreatedAt,
 		UpdatedAt:          a.UpdatedAt,
 		TicketID:           a.TicketID,
+		OrganizationID:     a.OrganizationID,
+		ProjectID:          a.ProjectID,
 		CommentID:          a.CommentID,
 		UploadedBy:         a.UploadedBy,
 		ActorType:          a.ActorType,

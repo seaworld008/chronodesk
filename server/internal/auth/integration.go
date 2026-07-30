@@ -8,6 +8,7 @@ import (
 	"time"
 
 	appconfig "github.com/seaworld008/chronodesk/server/internal/config"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 	"gorm.io/gorm"
@@ -33,6 +34,16 @@ func NewAuthModule(
 	}
 	if err := ValidateAuthCredentialStorage(context.Background(), db, protector); err != nil {
 		return nil, fmt.Errorf("validate authentication credential storage: %w", err)
+	}
+	authProjectScope, err := resolveActiveDefaultAuthProjectScope(
+		context.Background(),
+		db,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"resolve authentication DEFAULT project: %w",
+			err,
+		)
 	}
 
 	// 创建配置
@@ -97,6 +108,7 @@ func NewAuthModule(
 	authEmailOutboxRepo, err := NewGormAuthEmailOutboxRepository(
 		db,
 		protector,
+		authProjectScope,
 		strings.TrimRight(cfg.Agent.Issuer, "/")+"/events",
 	)
 	if err != nil {
@@ -139,4 +151,47 @@ func NewAuthModule(
 		Handler:             authHandler,
 		EmailOutboxConsumer: authEmailOutboxConsumer,
 	}, nil
+}
+
+func resolveActiveDefaultAuthProjectScope(
+	ctx context.Context,
+	db *gorm.DB,
+) (models.ProjectScope, error) {
+	if ctx == nil || db == nil {
+		return models.ProjectScope{}, errors.New(
+			"authentication DEFAULT project database is required",
+		)
+	}
+	var projects []models.Project
+	if err := db.WithContext(ctx).
+		Select("id", "organization_id").
+		Where(
+			"key = ? AND status = ?",
+			models.ProjectKey("DEFAULT"),
+			models.ProjectStatusActive,
+		).
+		Order("organization_id ASC, id ASC").
+		Limit(2).
+		Find(&projects).Error; err != nil {
+		return models.ProjectScope{}, err
+	}
+	if len(projects) == 0 {
+		return models.ProjectScope{}, errors.New(
+			"one active DEFAULT project is required, found none",
+		)
+	}
+	if len(projects) != 1 {
+		return models.ProjectScope{}, fmt.Errorf(
+			"one active DEFAULT project is required, found %d or more",
+			len(projects),
+		)
+	}
+	scope := projects[0].Scope()
+	if err := scope.Validate(); err != nil {
+		return models.ProjectScope{}, fmt.Errorf(
+			"active DEFAULT project scope is invalid: %w",
+			err,
+		)
+	}
+	return scope, nil
 }

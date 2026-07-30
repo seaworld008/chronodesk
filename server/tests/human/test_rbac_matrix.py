@@ -142,7 +142,7 @@ def test_four_human_roles_and_admin_only_surfaces(
     for path in (
         "/admin/users?page=1&page_size=1",
         "/admin/configs?page=1",
-        "/v1/admin/agent-control/overview",
+        admin.project_path("admin/agents/agent-control/overview"),
     ):
         allowed = admin.get_json(path)
         assert allowed.status_code == 200, f"{path}: {allowed.text}"
@@ -152,7 +152,7 @@ def test_four_human_roles_and_admin_only_surfaces(
         for path in (
             "/admin/users?page=1&page_size=1",
             "/admin/configs?page=1",
-            "/v1/admin/agent-control/overview",
+            identity.api.project_path("admin/agents/agent-control/overview"),
         ):
             denied = identity.api.get_json(path)
             assert_error_contract(
@@ -210,7 +210,7 @@ def test_ticket_object_permission_matrix(
     ticket_a_id = ticket_a["id"]
     ticket_b_id = ticket_b["id"]
 
-    admin_read = admin.api.get_json(f"/tickets/{ticket_a_id}")
+    admin_read = admin.api.get_json(e2e_manager.project_path(f"tickets/{ticket_a_id}"))
     assert admin_read.status_code == 200, admin_read.text
     admin_update = admin.api.put_ticket(
         ticket_a_id,
@@ -218,7 +218,9 @@ def test_ticket_object_permission_matrix(
     )
     assert admin_update.status_code == 200, admin_update.text
 
-    supervisor_read = supervisor.api.get_json(f"/tickets/{ticket_a_id}")
+    supervisor_read = supervisor.api.get_json(
+        e2e_manager.project_path(f"tickets/{ticket_a_id}")
+    )
     assert supervisor_read.status_code == 200, supervisor_read.text
     assigned = supervisor.api.post_ticket_command(
         ticket_a_id,
@@ -246,7 +248,9 @@ def test_ticket_object_permission_matrix(
         machine_codes={"ticket_access_denied"},
     )
 
-    customer_own = customer_a.api.get_json(f"/tickets/{ticket_a_id}")
+    customer_own = customer_a.api.get_json(
+        e2e_manager.project_path(f"tickets/{ticket_a_id}")
+    )
     assert customer_own.status_code == 200, customer_own.text
     customer_ticket = customer_own.json().get("data", {})
     assert customer_ticket.get("id") == ticket_a_id
@@ -255,7 +259,9 @@ def test_ticket_object_permission_matrix(
     assert not customer_ticket.get("attachments")
     assert not customer_ticket.get("agent_context")
 
-    customer_cross = customer_a.api.get_json(f"/tickets/{ticket_b_id}")
+    customer_cross = customer_a.api.get_json(
+        e2e_manager.project_path(f"tickets/{ticket_b_id}")
+    )
     assert_error_contract(
         customer_cross,
         403,
@@ -273,7 +279,9 @@ def test_ticket_object_permission_matrix(
         403,
         machine_codes={"ticket_access_denied"},
     )
-    customer_history = customer_a.api.get_json(f"/tickets/{ticket_a_id}/history")
+    customer_history = customer_a.api.get_json(
+        e2e_manager.project_path(f"tickets/{ticket_a_id}/history")
+    )
     assert customer_history.status_code == 200, customer_history.text
     customer_history_items = customer_history.json().get("data", [])
     assert customer_history_items
@@ -281,7 +289,9 @@ def test_ticket_object_permission_matrix(
         assert item.get("is_visible") is True
         assert "actor" not in item
 
-    cross_history = customer_a.api.get_json(f"/tickets/{ticket_b_id}/history")
+    cross_history = customer_a.api.get_json(
+        e2e_manager.project_path(f"tickets/{ticket_b_id}/history")
+    )
     assert_error_contract(
         cross_history,
         403,
@@ -289,7 +299,7 @@ def test_ticket_object_permission_matrix(
     )
 
     customer_list = customer_a.api.get_json(
-        "/tickets",
+        e2e_manager.project_path("tickets"),
         params={"page_size": 100, "created_by": customer_b.id},
     )
     assert customer_list.status_code == 200, customer_list.text
@@ -297,8 +307,13 @@ def test_ticket_object_permission_matrix(
     assert ticket_a_id in {item.get("id") for item in listed}
     assert ticket_b_id not in {item.get("id") for item in listed}
 
-    own_agent_read = agent_a.api.get_json(f"/tickets/{ticket_a_id}")
+    own_agent_read = agent_a.api.get_json(
+        e2e_manager.project_path(f"tickets/{ticket_a_id}")
+    )
     assert own_agent_read.status_code == 200, own_agent_read.text
-    unassigned = agent_a.api.get_json("/tickets/unassigned", params={"limit": 100})
+    unassigned = agent_a.api.get_json(
+        e2e_manager.project_path("tickets/unassigned"),
+        params={"limit": 100},
+    )
     assert unassigned.status_code == 200, unassigned.text
     assert ticket_b_id in {item.get("id") for item in unassigned.json().get("data", [])}

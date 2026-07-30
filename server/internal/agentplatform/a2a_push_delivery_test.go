@@ -48,9 +48,11 @@ func TestA2APushCallbackPolicyFailureNeverReturnsURLQueryToken(t *testing.T) {
 	}
 	const sensitiveToken = "callback-query-token-must-not-return"
 	config := models.AgentPushNotificationConfig{
-		ID:     "push-safe-error",
-		TaskID: "task-safe-error",
-		URL:    "https://192.0.2.1/a2a?access_token=" + sensitiveToken,
+		ID:             "push-safe-error",
+		OrganizationID: 1,
+		ProjectID:      1,
+		TaskID:         "task-safe-error",
+		URL:            "https://192.0.2.1/a2a?access_token=" + sensitiveToken,
 	}
 	if err := fixture.db.Create(&config).Error; err != nil {
 		t.Fatal(err)
@@ -82,8 +84,10 @@ func TestA2APushCallbackPolicyFailureNeverReturnsURLQueryToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = deliverer.deliverA2APush(context.Background(), services.CloudEventEnvelope{
-		ID:   "event-safe-error",
-		Data: eventData,
+		ID:             "event-safe-error",
+		OrganizationID: 1,
+		ProjectID:      1,
+		Data:           eventData,
 	})
 	if err == nil || err.Error() != "A2A Push 回调地址不可用" {
 		t.Fatalf("push policy error=%v", err)

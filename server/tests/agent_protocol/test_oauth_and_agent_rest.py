@@ -92,13 +92,14 @@ def test_oauth_discovery_advertises_three_exact_resources(
         "client_secret_basic",
         "client_secret_post",
     }.issubset(set(authorization.get("token_endpoint_auth_methods_supported", [])))
+    assert authorization.get("project_key_parameter_supported") is True
     assert set(MINIMAL_AGENT_SCOPES).issubset(
         set(authorization.get("scopes_supported", []))
     )
 
     observed_resources: set[str] = set()
     expected_names = {
-        "api/v1": "ChronoDesk Agent REST API",
+        "api/v2": "ChronoDesk Agent REST API",
         "mcp": "ChronoDesk MCP",
         "a2a/v1": "ChronoDesk A2A",
     }
@@ -142,9 +143,8 @@ def test_admin_provisions_e2e_principal_and_explicit_policy(
 
     response = protocol_harness.request(
         "GET",
-        (
-            "/api/v1/admin/service-principals/"
-            f"{full_service_principal.client_id}/policies"
+        protocol_harness.agent_admin_path(
+            f"service-principals/{full_service_principal.client_id}/policies"
         ),
         headers=protocol_harness.admin_read_headers(),
     )
@@ -198,7 +198,7 @@ def test_client_credentials_rotation_and_deactivation_invalidate_tokens(
     )
     visible = protocol_harness.request(
         "GET",
-        "/api/v1/tickets",
+        protocol_harness.project_api_path("tickets"),
         headers=_bearer(first),
         params={"limit": 1},
     )
@@ -206,19 +206,21 @@ def test_client_credentials_rotation_and_deactivation_invalidate_tokens(
 
     denied_create = protocol_harness.request(
         "POST",
-        "/api/v1/tickets",
+        protocol_harness.project_api_path("tickets"),
         headers={
             **_bearer(first),
             "Idempotency-Key": protocol_harness.idempotency_key(
                 "read-token-create-denied"
             ),
         },
-        json_body={
-            "title": protocol_harness.unique("must-not-create"),
-            "description": f"{protocol_harness.prefix}insufficient scope",
-            "type": "request",
-            "priority": "normal",
-        },
+        json_body=protocol_harness.ticket_create_payload(
+            {
+                "title": protocol_harness.unique("must-not-create"),
+                "description": f"{protocol_harness.prefix}insufficient scope",
+                "type": "request",
+                "priority": "normal",
+            }
+        ),
     )
     _assert_problem(
         denied_create,
@@ -230,7 +232,7 @@ def test_client_credentials_rotation_and_deactivation_invalidate_tokens(
     protocol_harness.rotate_credential(principal)
     stale_after_rotation = protocol_harness.request(
         "GET",
-        "/api/v1/tickets",
+        protocol_harness.project_api_path("tickets"),
         headers=_bearer(first),
         params={"limit": 1},
     )
@@ -251,7 +253,7 @@ def test_client_credentials_rotation_and_deactivation_invalidate_tokens(
     )
     valid_after_rotation = protocol_harness.request(
         "GET",
-        "/api/v1/tickets",
+        protocol_harness.project_api_path("tickets"),
         headers=_bearer(rotated),
         params={"limit": 1},
     )
@@ -260,7 +262,7 @@ def test_client_credentials_rotation_and_deactivation_invalidate_tokens(
     protocol_harness.set_principal_status(principal, status="inactive")
     stale_after_deactivation = protocol_harness.request(
         "GET",
-        "/api/v1/tickets",
+        protocol_harness.project_api_path("tickets"),
         headers=_bearer(rotated),
         params={"limit": 1},
     )
@@ -283,13 +285,17 @@ def test_agent_rest_ticket_idempotency_lease_version_and_event_cursor(
     token = agent_tokens["api"]
     headers = _bearer(token)
 
-    capabilities_response = protocol_harness.request("GET", "/api/v1/capabilities")
+    capabilities_response = protocol_harness.request(
+        "GET",
+        protocol_harness.project_api_path("capabilities"),
+        headers=headers,
+    )
     assert_status(capabilities_response, 200, operation="读取 Agent REST capabilities")
     capabilities = envelope_data(
         capabilities_response,
         operation="读取 Agent REST capabilities",
     )
-    assert capabilities.get("api_version") == "v1"
+    assert capabilities.get("api_version") == "v2"
     assert capabilities.get("mcp_version") == "2026-07-28"
     assert capabilities.get("a2a_version") == "1.0"
     assert capabilities.get("concurrency") == {
@@ -298,30 +304,33 @@ def test_agent_rest_ticket_idempotency_lease_version_and_event_cursor(
         "idempotency_keys": True,
     }
     assert set(capabilities.get("scopes_supported", [])) == set(MINIMAL_AGENT_SCOPES)
-    assert protected_resources["api"].endswith("/api/v1")
+    assert protected_resources["api"].endswith("/api/v2")
+    assert token.project_key == protocol_harness.project_key
 
     title = protocol_harness.unique("agent-rest-ticket")
     create_key = protocol_harness.idempotency_key("agent-rest-create")
-    create_payload = {
-        "title": title,
-        "description": (
-            f"{protocol_harness.prefix}Agent REST idempotency and lease contract"
-        ),
-        "type": "request",
-        "priority": "normal",
-        "tags": ["e2e", "agent-rest"],
-        "agent_context": {
-            "goal": "验证机器接口的幂等、租约和版本边界",
-            "constraints": ["只操作当前 E2E 工单"],
-            "acceptance_criteria": ["冲突写入不覆盖数据"],
-            "missing_information": [],
-            "related_resources": [],
-        },
-    }
+    create_payload = protocol_harness.ticket_create_payload(
+        {
+            "title": title,
+            "description": (
+                f"{protocol_harness.prefix}Agent REST idempotency and lease contract"
+            ),
+            "type": "request",
+            "priority": "normal",
+            "tags": ["e2e", "agent-rest"],
+            "agent_context": {
+                "goal": "验证机器接口的幂等、租约和版本边界",
+                "constraints": ["只操作当前 E2E 工单"],
+                "acceptance_criteria": ["冲突写入不覆盖数据"],
+                "missing_information": [],
+                "related_resources": [],
+            },
+        }
+    )
     create_headers = {**headers, "Idempotency-Key": create_key}
     first_create = protocol_harness.request(
         "POST",
-        "/api/v1/tickets",
+        protocol_harness.project_api_path("tickets"),
         headers=create_headers,
         json_body=create_payload,
     )
@@ -347,7 +356,7 @@ def test_agent_rest_ticket_idempotency_lease_version_and_event_cursor(
 
     replay = protocol_harness.request(
         "POST",
-        "/api/v1/tickets",
+        protocol_harness.project_api_path("tickets"),
         headers=create_headers,
         json_body=create_payload,
     )
@@ -359,7 +368,7 @@ def test_agent_rest_ticket_idempotency_lease_version_and_event_cursor(
 
     listed = protocol_harness.request(
         "GET",
-        "/api/v1/tickets",
+        protocol_harness.project_api_path("tickets"),
         headers=headers,
         params={"search": title, "limit": 10},
     )
@@ -372,7 +381,7 @@ def test_agent_rest_ticket_idempotency_lease_version_and_event_cursor(
 
     detail = protocol_harness.request(
         "GET",
-        f"/api/v1/tickets/{ticket_id}",
+        protocol_harness.project_api_path(f"tickets/{ticket_id}"),
         headers=headers,
     )
     assert_status(detail, 200, operation="Agent REST 读取工单")
@@ -383,7 +392,7 @@ def test_agent_rest_ticket_idempotency_lease_version_and_event_cursor(
 
     claim = protocol_harness.request(
         "POST",
-        f"/api/v1/tickets/{ticket_id}/claim",
+        protocol_harness.project_api_path(f"tickets/{ticket_id}/claim"),
         headers={
             **headers,
             "If-Match": f'"v{version}"',
@@ -405,7 +414,7 @@ def test_agent_rest_ticket_idempotency_lease_version_and_event_cursor(
 
     heartbeat = protocol_harness.request(
         "POST",
-        f"/api/v1/leases/{lease_id}/heartbeat",
+        protocol_harness.project_api_path(f"leases/{lease_id}/heartbeat"),
         headers={
             **headers,
             "If-Match": f'"v{version}"',
@@ -423,7 +432,7 @@ def test_agent_rest_ticket_idempotency_lease_version_and_event_cursor(
 
     stale_update = protocol_harness.request(
         "PATCH",
-        f"/api/v1/tickets/{ticket_id}",
+        protocol_harness.project_api_path(f"tickets/{ticket_id}"),
         headers={
             **headers,
             "If-Match": f'"v{version + 1}"',
@@ -441,7 +450,7 @@ def test_agent_rest_ticket_idempotency_lease_version_and_event_cursor(
 
     unchanged = protocol_harness.request(
         "GET",
-        f"/api/v1/tickets/{ticket_id}",
+        protocol_harness.project_api_path(f"tickets/{ticket_id}"),
         headers=headers,
     )
     assert_status(unchanged, 200, operation="冲突后重新读取 Agent 工单")
@@ -455,7 +464,7 @@ def test_agent_rest_ticket_idempotency_lease_version_and_event_cursor(
     release_key = protocol_harness.idempotency_key("release")
     release = protocol_harness.request(
         "DELETE",
-        f"/api/v1/leases/{lease_id}",
+        protocol_harness.project_api_path(f"leases/{lease_id}"),
         headers={**headers, "Idempotency-Key": release_key},
     )
     assert_status(release, 200, operation="Agent REST release 租约")
@@ -466,7 +475,7 @@ def test_agent_rest_ticket_idempotency_lease_version_and_event_cursor(
 
     events_page_one = protocol_harness.request(
         "GET",
-        "/api/v1/events",
+        protocol_harness.project_api_path("events"),
         headers=headers,
         params={"limit": 1},
     )
@@ -497,7 +506,7 @@ def test_agent_rest_ticket_idempotency_lease_version_and_event_cursor(
 
     events_page_two = protocol_harness.request(
         "GET",
-        "/api/v1/events",
+        protocol_harness.project_api_path("events"),
         headers=headers,
         params={"limit": 1, "cursor": cursor},
     )
@@ -530,19 +539,21 @@ def test_agent_ticket_cursor_first_middle_tail_empty_and_invalid_limits(
     for index in range(3):
         response = protocol_harness.request(
             "POST",
-            "/api/v1/tickets",
+            protocol_harness.project_api_path("tickets"),
             headers={
                 **headers,
                 "Idempotency-Key": protocol_harness.idempotency_key(
                     f"cursor-ticket-{index}"
                 ),
             },
-            json_body={
-                "title": f"{marker}-{index}",
-                "description": f"{protocol_harness.prefix}cursor page {index}",
-                "type": "request",
-                "priority": "normal",
-            },
+            json_body=protocol_harness.ticket_create_payload(
+                {
+                    "title": f"{marker}-{index}",
+                    "description": f"{protocol_harness.prefix}cursor page {index}",
+                    "type": "request",
+                    "priority": "normal",
+                }
+            ),
         )
         assert_status(response, 201, operation=f"创建 cursor 工单 {index}")
         ticket = envelope_data(response, operation=f"创建 cursor 工单 {index}")
@@ -559,7 +570,7 @@ def test_agent_ticket_cursor_first_middle_tail_empty_and_invalid_limits(
             params["cursor"] = cursor
         response = protocol_harness.request(
             "GET",
-            "/api/v1/tickets",
+            protocol_harness.project_api_path("tickets"),
             headers=headers,
             params=params,
         )
@@ -586,7 +597,7 @@ def test_agent_ticket_cursor_first_middle_tail_empty_and_invalid_limits(
 
     empty = protocol_harness.request(
         "GET",
-        "/api/v1/tickets",
+        protocol_harness.project_api_path("tickets"),
         headers=headers,
         params={
             "search": protocol_harness.unique("cursor-empty"),
@@ -608,7 +619,7 @@ def test_agent_ticket_cursor_first_middle_tail_empty_and_invalid_limits(
     ):
         rejected = protocol_harness.request(
             "GET",
-            "/api/v1/tickets",
+            protocol_harness.project_api_path("tickets"),
             headers=headers,
             params=params,
         )

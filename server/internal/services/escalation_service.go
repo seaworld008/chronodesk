@@ -21,9 +21,9 @@ import (
 
 // EscalationService 升级服务
 type EscalationService struct {
-	db                *gorm.DB
-	automationService *AutomationService
-	agentNative       *AgentNativeService
+	db          *gorm.DB
+	slaService  *SLAService
+	agentNative *AgentNativeService
 }
 
 const (
@@ -63,21 +63,9 @@ func (s *EscalationService) SetAgentNativeService(native *AgentNativeService) {
 // NewEscalationService 创建升级服务实例
 func NewEscalationService(db *gorm.DB) *EscalationService {
 	return &EscalationService{
-		db:                db,
-		automationService: NewAutomationService(db),
+		db:         db,
+		slaService: NewSLAService(db),
 	}
-}
-
-// TicketSLAStatus SLA状态结构
-type TicketSLAStatus struct {
-	TicketID                 uint              `json:"ticket_id"`
-	ResponseDeadline         time.Time         `json:"response_deadline"`
-	ResolutionDeadline       time.Time         `json:"resolution_deadline"`
-	IsResponseOverdue        bool              `json:"is_response_overdue"`
-	IsResolutionOverdue      bool              `json:"is_resolution_overdue"`
-	ResponseOverdueMinutes   int64             `json:"response_overdue_minutes"`
-	ResolutionOverdueMinutes int64             `json:"resolution_overdue_minutes"`
-	SLAConfig                *models.SLAConfig `json:"sla_config,omitempty"`
 }
 
 // CheckSLAViolations 检查SLA违规
@@ -86,81 +74,187 @@ func (s *EscalationService) CheckSLAViolations(ctx context.Context) error {
 	if s == nil || s.agentNative == nil {
 		return errors.New("agent-native SLA escalation service is unavailable")
 	}
-
-	// 获取所有未关闭的工单
-	var tickets []models.Ticket
-	if err := s.db.WithContext(ctx).Where("status IN ?", []string{"open", "in_progress"}).Find(&tickets).Error; err != nil {
-		return fmt.Errorf("failed to get open tickets: %w", err)
+	actor := models.SystemActor(slaMonitorActorID)
+	projects, err := systemWorkerProjects(ctx, s.db, actor)
+	if err != nil {
+		return err
 	}
+	var scanErrors []error
+	for _, project := range projects {
+		if err := s.checkSLAViolationsInProject(
+			ctx,
+			project.Scope,
+		); err != nil {
+			scanErrors = append(
+				scanErrors,
+				fmt.Errorf("project %s: %w", project.Key, err),
+			)
+		}
+	}
+	return errors.Join(scanErrors...)
+}
 
+func (s *EscalationService) checkSLAViolationsInProject(
+	ctx context.Context,
+	scope models.ProjectScope,
+) error {
 	violationCount := 0
 	var scanErrors []error
-	for _, ticket := range tickets {
-		status, err := s.CheckTicketSLA(ctx, &ticket)
-		if err != nil {
-			log.Printf("Failed to check SLA for ticket %d: %v", ticket.ID, err)
-			scanErrors = append(scanErrors, fmt.Errorf("check ticket %d SLA: %w", ticket.ID, err))
-			continue
+	lastID := uint(0)
+	actor := models.SystemActor(slaMonitorActorID)
+	for {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(errors.Join(scanErrors...), err)
 		}
-
-		// 处理违规情况
-		if status.IsResponseOverdue || status.IsResolutionOverdue {
-			violationCount++
-			if err := s.HandleSLAViolation(ctx, &ticket, status); err != nil {
-				log.Printf("Failed to handle SLA violation for ticket %d: %v", ticket.ID, err)
-				scanErrors = append(scanErrors, fmt.Errorf("handle ticket %d SLA violation: %w", ticket.ID, err))
+		tickets := make([]models.Ticket, 0, systemWorkerTicketBatchSize)
+		if err := runSystemProjectOperation(
+			ctx,
+			s.db,
+			scope,
+			actor,
+			"",
+			"",
+			func(projectCtx context.Context) error {
+				return s.db.WithContext(projectCtx).
+					Where(
+						"organization_id = ? AND project_id = ? AND id > ? AND status IN ?",
+						scope.OrganizationID,
+						scope.ProjectID,
+						lastID,
+						slaActiveTicketStatuses(),
+					).
+					Order("id ASC").
+					Limit(systemWorkerTicketBatchSize).
+					Find(&tickets).Error
+			},
+		); err != nil {
+			return errors.Join(
+				errors.Join(scanErrors...),
+				fmt.Errorf("load project SLA tickets: %w", err),
+			)
+		}
+		if len(tickets) == 0 {
+			break
+		}
+		for index := range tickets {
+			ticket := tickets[index]
+			err := runSystemProjectOperation(
+				ctx,
+				s.db,
+				scope,
+				actor,
+				"",
+				"",
+				func(projectCtx context.Context) error {
+					violated, ticketErr := s.checkSLATicket(
+						projectCtx,
+						&ticket,
+					)
+					if violated {
+						violationCount++
+					}
+					return ticketErr
+				},
+			)
+			if err != nil {
+				log.Printf(
+					"Failed to check SLA for ticket %d: %v",
+					ticket.ID,
+					err,
+				)
+				scanErrors = append(
+					scanErrors,
+					fmt.Errorf("check ticket %d SLA: %w", ticket.ID, err),
+				)
 			}
+			lastID = ticket.ID
+		}
+		if len(tickets) < systemWorkerTicketBatchSize {
+			break
 		}
 	}
-
 	log.Printf("SLA检查完成，发现 %d 个违规工单", violationCount)
 	return errors.Join(scanErrors...)
 }
 
+func (s *EscalationService) checkSLATicket(
+	ctx context.Context,
+	ticket *models.Ticket,
+) (bool, error) {
+	projection, status, err := s.slaService.projectionForTicketOnDB(
+		ctx,
+		s.db,
+		ticket,
+		s.slaService.now(),
+	)
+	if err != nil {
+		return false, err
+	}
+	if status == nil {
+		return false, s.persistSLAProjection(ctx, ticket, projection)
+	}
+	if status.IsResponseOverdue || status.IsResolutionOverdue {
+		return true, s.HandleSLAViolation(ctx, ticket, status)
+	}
+	return false, s.persistSLAProjection(ctx, ticket, projection)
+}
+
 // CheckTicketSLA 检查单个工单的SLA状态
 func (s *EscalationService) CheckTicketSLA(ctx context.Context, ticket *models.Ticket) (*TicketSLAStatus, error) {
-	// 获取适用的SLA配置
-	slaConfig, err := s.automationService.GetSLAConfigForTicket(ctx, ticket)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get SLA config: %w", err)
-	}
-
-	// 计算SLA截止时间
-	responseDeadline, resolutionDeadline, err := s.automationService.CalculateSLADeadlines(ctx, ticket, slaConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to calculate SLA deadlines: %w", err)
-	}
-
-	now := time.Now()
-	status := &TicketSLAStatus{
-		TicketID:           ticket.ID,
-		ResponseDeadline:   responseDeadline,
-		ResolutionDeadline: resolutionDeadline,
-		SLAConfig:          slaConfig,
-	}
-
-	// 检查响应超时
-	if now.After(responseDeadline) && !s.hasFirstResponse(ctx, ticket.ID) {
-		status.IsResponseOverdue = true
-		status.ResponseOverdueMinutes = int64(now.Sub(responseDeadline).Minutes())
-	}
-
-	// 检查解决超时
-	if now.After(resolutionDeadline) && ticket.Status != "resolved" && ticket.Status != "closed" {
-		status.IsResolutionOverdue = true
-		status.ResolutionOverdueMinutes = int64(now.Sub(resolutionDeadline).Minutes())
-	}
-
-	return status, nil
+	return s.slaService.CheckTicket(ctx, ticket)
 }
 
 // hasFirstResponse 检查是否有首次响应
 func (s *EscalationService) hasFirstResponse(ctx context.Context, ticketID uint) bool {
-	var count int64
-	s.db.WithContext(ctx).Model(&models.TicketComment{}).
-		Where("ticket_id = ? AND type != ?", ticketID, models.CommentTypeSystem).
-		Count(&count)
-	return count > 0
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return false
+	}
+	var ticket models.Ticket
+	if err := s.db.WithContext(ctx).
+		Select("id", "organization_id", "project_id").
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			ticketID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		First(&ticket).Error; err != nil {
+		return false
+	}
+	hasResponse, err := hasTicketFirstResponseOnDB(ctx, s.db, &ticket)
+	return err == nil && hasResponse
+}
+
+func (s *EscalationService) persistSLAProjection(
+	ctx context.Context,
+	ticket *models.Ticket,
+	projection slaProjection,
+) error {
+	changes := slaProjectionChanges(ticket, projection)
+	if len(changes) == 0 {
+		return nil
+	}
+	result, err := s.agentNative.UpdateTicketVersion(ctx, VersionedTicketUpdateInput{
+		TicketID:                     ticket.ID,
+		ExpectedVersion:              ticket.Version,
+		Actor:                        models.SystemActor(slaMonitorActorID),
+		Action:                       "ticket.sla.refresh",
+		SourceProtocol:               "scheduler",
+		Changes:                      changes,
+		slaProjectionAlreadyResolved: true,
+		EventData: map[string]any{
+			"ticket_id":      ticket.ID,
+			"changed_fields": slaProjectionFieldNames(changes),
+			"sla_breached":   projection.Breached,
+			"sla_due_date":   projection.DueDate,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	*ticket = *result.Ticket
+	return nil
 }
 
 // HandleSLAViolation 处理SLA违规
@@ -171,6 +265,33 @@ func (s *EscalationService) HandleSLAViolation(ctx context.Context, ticket *mode
 	if ticket == nil || ticket.ID == 0 || status == nil || status.SLAConfig == nil {
 		return errors.New("ticket and SLA status are required")
 	}
+	scope := models.ProjectScope{
+		OrganizationID: ticket.OrganizationID,
+		ProjectID:      ticket.ProjectID,
+	}
+	if err := scope.Validate(); err != nil ||
+		status.SLAConfig.OrganizationID != scope.OrganizationID ||
+		status.SLAConfig.ProjectID != scope.ProjectID {
+		return errors.New("ticket and SLA config must share a valid project scope")
+	}
+	return runSystemProjectOperation(
+		ctx,
+		s.db,
+		scope,
+		models.SystemActor(slaMonitorActorID),
+		"",
+		"",
+		func(projectCtx context.Context) error {
+			return s.handleSLAViolationInProject(projectCtx, ticket, status)
+		},
+	)
+}
+
+func (s *EscalationService) handleSLAViolationInProject(
+	ctx context.Context,
+	ticket *models.Ticket,
+	status *TicketSLAStatus,
+) error {
 	log.Printf("处理工单 %d 的SLA违规", ticket.ID)
 
 	execution, err := newSLAExecutionContext(ticket, status)
@@ -201,7 +322,15 @@ func (s *EscalationService) HandleSLAViolation(ctx context.Context, ticket *mode
 		executionErrors = append(executionErrors, err)
 	}
 
-	if err := s.db.WithContext(ctx).First(ticket, ticket.ID).Error; err != nil {
+	scope, scopeErr := RequireProjectScope(ctx)
+	if scopeErr != nil {
+		executionErrors = append(executionErrors, scopeErr)
+	} else if err := s.db.WithContext(ctx).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		ticket.ID,
+		scope.OrganizationID,
+		scope.ProjectID,
+	).First(ticket).Error; err != nil {
 		executionErrors = append(executionErrors, fmt.Errorf("reload SLA ticket: %w", err))
 	}
 
@@ -229,6 +358,27 @@ func (s *EscalationService) ExecuteDomainEvent(ctx context.Context, event CloudE
 	if event.ActorType != models.ActorTypeSystem || event.ActorID != slaMonitorActorID {
 		return fmt.Errorf("SLA breach event has invalid actor %s/%s", event.ActorType, event.ActorID)
 	}
+	scope := models.ProjectScope{
+		OrganizationID: event.OrganizationID,
+		ProjectID:      event.ProjectID,
+	}
+	return runSystemProjectOperation(
+		ctx,
+		s.db,
+		scope,
+		models.SystemActor(slaMonitorActorID),
+		event.TraceID,
+		event.CorrelationID,
+		func(projectCtx context.Context) error {
+			return s.executeDomainEventInProject(projectCtx, event)
+		},
+	)
+}
+
+func (s *EscalationService) executeDomainEventInProject(
+	ctx context.Context,
+	event CloudEventEnvelope,
+) error {
 	var snapshot slaEscalationEventData
 	if err := json.Unmarshal(event.Data, &snapshot); err != nil {
 		return fmt.Errorf("decode SLA breach event: %w", err)
@@ -464,6 +614,10 @@ func (s *EscalationService) executeSLAUpdate(
 	eventData map[string]any,
 	buildChanges func(*models.Ticket) (map[string]any, error),
 ) (string, bool, error) {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return "", false, err
+	}
 	reservation, err := s.reserveSLAOperation(ctx, "sla.rule."+step, execution, ruleID, step)
 	if err != nil {
 		return "", false, err
@@ -472,7 +626,12 @@ func (s *EscalationService) executeSLAUpdate(
 		return reservation.Record.EventID, reservation.Record.EventID != "", nil
 	}
 	var current models.Ticket
-	if err := s.db.WithContext(ctx).First(&current, ticketID).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		ticketID,
+		scope.OrganizationID,
+		scope.ProjectID,
+	).First(&current).Error; err != nil {
 		return "", false, s.failSLAReservation(ctx, reservation.Record.ID, err)
 	}
 	changes, err := buildChanges(&current)
@@ -496,18 +655,19 @@ func (s *EscalationService) executeSLAUpdate(
 	data["sla_occurrence_id"] = execution.OccurrenceID
 	data["changed_fields"] = sortedMapKeys(changes)
 	result, err := s.agentNative.UpdateTicketVersion(ctx, VersionedTicketUpdateInput{
-		TicketID:                 ticketID,
-		ExpectedVersion:          current.Version,
-		Actor:                    models.SystemActor(slaMonitorActorID),
-		SourceProtocol:           "scheduler",
-		Changes:                  changes,
-		EventType:                eventType,
-		EventData:                data,
-		TraceID:                  execution.TraceID,
-		CorrelationID:            execution.CorrelationID,
-		CausationID:              execution.CausationID,
-		IdempotencyRecordID:      reservation.Record.ID,
-		IdempotencyCompletionTTL: slaCompletedRetentionTTL,
+		TicketID:                     ticketID,
+		ExpectedVersion:              current.Version,
+		Actor:                        models.SystemActor(slaMonitorActorID),
+		SourceProtocol:               "scheduler",
+		Changes:                      changes,
+		EventType:                    eventType,
+		EventData:                    data,
+		TraceID:                      execution.TraceID,
+		CorrelationID:                execution.CorrelationID,
+		CausationID:                  execution.CausationID,
+		IdempotencyRecordID:          reservation.Record.ID,
+		IdempotencyCompletionTTL:     slaCompletedRetentionTTL,
+		slaProjectionAlreadyResolved: true,
 	})
 	if err != nil {
 		return "", false, s.failSLAReservation(ctx, reservation.Record.ID, err)
@@ -524,6 +684,10 @@ func (s *EscalationService) executeSLAComment(
 	content string,
 	causationID string,
 ) error {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return err
+	}
 	reservation, err := s.reserveSLAOperation(ctx, "sla.rule."+step, execution, ruleID, step)
 	if err != nil {
 		return err
@@ -532,7 +696,12 @@ func (s *EscalationService) executeSLAComment(
 		return nil
 	}
 	var current models.Ticket
-	if err := s.db.WithContext(ctx).First(&current, ticketID).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		ticketID,
+		scope.OrganizationID,
+		scope.ProjectID,
+	).First(&current).Error; err != nil {
 		return s.failSLAReservation(ctx, reservation.Record.ID, err)
 	}
 	_, err = s.agentNative.CreateComment(ctx, NativeCommentInput{
@@ -564,10 +733,20 @@ func (s *EscalationService) resolveSLAManager(
 	if configured != nil && *configured > 0 {
 		return *configured, nil
 	}
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return 0, err
+	}
 	var current models.Ticket
 	if err := s.db.WithContext(ctx).
 		Select("id", "assigned_to_id", "assigned_to_actor_type", "is_escalated").
-		First(&current, ticketID).Error; err != nil {
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			ticketID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		First(&current).Error; err != nil {
 		return 0, err
 	}
 	if current.IsEscalated &&
@@ -702,6 +881,18 @@ func (s *EscalationService) markSLABreach(
 	if err := s.db.WithContext(ctx).First(&current, ticket.ID).Error; err != nil {
 		return nil, s.failSLAReservation(ctx, reservation.Record.ID, err)
 	}
+	if current.Version != ticket.Version {
+		return nil, s.failSLAReservation(
+			ctx,
+			reservation.Record.ID,
+			fmt.Errorf(
+				"%w: SLA evaluated version %d, current version %d",
+				ErrVersionConflict,
+				ticket.Version,
+				current.Version,
+			),
+		)
+	}
 	changes := make(map[string]any, 2)
 	if !current.SLABreached {
 		changes["sla_breached"] = true
@@ -725,19 +916,20 @@ func (s *EscalationService) markSLABreach(
 		return event, nil
 	}
 	result, err := s.agentNative.UpdateTicketVersion(ctx, VersionedTicketUpdateInput{
-		TicketID:                 current.ID,
-		ExpectedVersion:          current.Version,
-		Actor:                    models.SystemActor(slaMonitorActorID),
-		SourceProtocol:           "scheduler",
-		Changes:                  changes,
-		EventType:                SLABreachEventType,
-		EventData:                snapshot,
-		TraceID:                  execution.TraceID,
-		CorrelationID:            execution.CorrelationID,
-		CausationID:              execution.CausationID,
-		IdempotencyRecordID:      reservation.Record.ID,
-		IdempotencyCompletionTTL: slaCompletedRetentionTTL,
-		OutboxTargets:            s.slaBreachOutboxTargets(),
+		TicketID:                     current.ID,
+		ExpectedVersion:              current.Version,
+		Actor:                        models.SystemActor(slaMonitorActorID),
+		SourceProtocol:               "scheduler",
+		Changes:                      changes,
+		EventType:                    SLABreachEventType,
+		EventData:                    snapshot,
+		TraceID:                      execution.TraceID,
+		CorrelationID:                execution.CorrelationID,
+		CausationID:                  execution.CausationID,
+		IdempotencyRecordID:          reservation.Record.ID,
+		IdempotencyCompletionTTL:     slaCompletedRetentionTTL,
+		OutboxTargets:                s.slaBreachOutboxTargets(),
+		slaProjectionAlreadyResolved: true,
 	})
 	if err != nil {
 		return nil, s.failSLAReservation(ctx, reservation.Record.ID, err)
@@ -754,7 +946,7 @@ func (s *EscalationService) appendNoopSLABreachEvent(
 	execution *slaExecutionContext,
 ) (*models.DomainEvent, error) {
 	var event *models.DomainEvent
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		var appendErr error
 		event, appendErr = s.agentNative.AppendDomainEventTx(
 			ctx,
@@ -841,7 +1033,7 @@ func (s *EscalationService) completeSLAIdempotencyNoop(
 	ticket *models.Ticket,
 	eventID string,
 ) error {
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		return s.completeSLAIdempotencyNoopTx(ctx, tx, recordID, ticket, eventID)
 	})
 }
@@ -899,6 +1091,10 @@ func (s *EscalationService) updateSLAStatsOnce(
 	execution *slaExecutionContext,
 	breachEventID string,
 ) error {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return err
+	}
 	reservation, err := s.reserveSLAOperation(ctx, "sla.stats.record", execution, "", "stats")
 	if err != nil {
 		return err
@@ -907,9 +1103,14 @@ func (s *EscalationService) updateSLAStatsOnce(
 		return nil
 	}
 	var config models.SLAConfig
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		result := tx.Model(&models.SLAConfig{}).
-			Where("id = ?", slaConfigID).
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ?",
+				slaConfigID,
+				scope.OrganizationID,
+				scope.ProjectID,
+			).
 			Updates(map[string]any{
 				"applied_count":   gorm.Expr("applied_count + ?", 1),
 				"violation_count": gorm.Expr("violation_count + ?", 1),
@@ -920,7 +1121,12 @@ func (s *EscalationService) updateSLAStatsOnce(
 		if result.RowsAffected != 1 {
 			return gorm.ErrRecordNotFound
 		}
-		if err := tx.First(&config, slaConfigID).Error; err != nil {
+		if err := tx.Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			slaConfigID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).First(&config).Error; err != nil {
 			return err
 		}
 		complianceRate := 0.0
@@ -928,7 +1134,14 @@ func (s *EscalationService) updateSLAStatsOnce(
 			complianceRate = float64(config.AppliedCount-config.ViolationCount) /
 				float64(config.AppliedCount) * 100
 		}
-		if err := tx.Model(&config).Update("compliance_rate", complianceRate).Error; err != nil {
+		if err := tx.Model(&models.SLAConfig{}).
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ?",
+				config.ID,
+				scope.OrganizationID,
+				scope.ProjectID,
+			).
+			Update("compliance_rate", complianceRate).Error; err != nil {
 			return err
 		}
 		config.ComplianceRate = complianceRate
@@ -993,11 +1206,20 @@ func (s *EscalationService) recordSLAViolation(ctx context.Context, ticket *mode
 
 // GetSLADashboard 获取SLA仪表板数据
 func (s *EscalationService) GetSLADashboard(ctx context.Context) (map[string]interface{}, error) {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	dashboard := make(map[string]interface{})
 
 	// 获取所有SLA配置统计
 	var configs []models.SLAConfig
-	if err := s.db.WithContext(ctx).Where("is_active = ?", true).Find(&configs).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where(
+		"organization_id = ? AND project_id = ? AND is_active = ?",
+		scope.OrganizationID,
+		scope.ProjectID,
+		true,
+	).Find(&configs).Error; err != nil {
 		return nil, fmt.Errorf("failed to get SLA configs: %w", err)
 	}
 
@@ -1042,22 +1264,23 @@ func (s *EscalationService) GetSLADashboard(ctx context.Context) (map[string]int
 
 // getCurrentViolationCount 获取当前违规工单数量
 func (s *EscalationService) getCurrentViolationCount(ctx context.Context) (int64, error) {
-	var tickets []models.Ticket
-	if err := s.db.WithContext(ctx).Where("status IN ?", []string{"open", "in_progress"}).Find(&tickets).Error; err != nil {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
 		return 0, err
 	}
-
 	violationCount := int64(0)
-	for _, ticket := range tickets {
-		status, err := s.CheckTicketSLA(ctx, &ticket)
-		if err != nil {
-			continue
-		}
-		if status.IsResponseOverdue || status.IsResolutionOverdue {
-			violationCount++
-		}
+	if err := s.db.WithContext(ctx).
+		Model(&models.Ticket{}).
+		Where(
+			"organization_id = ? AND project_id = ? AND sla_breached = ? AND status IN ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+			true,
+			slaActiveTicketStatuses(),
+		).
+		Count(&violationCount).Error; err != nil {
+		return 0, err
 	}
-
 	return violationCount, nil
 }
 
@@ -1076,8 +1299,17 @@ func (s *EscalationService) ScheduleSLACheck() {
 
 // GetTicketSLAStatus 获取工单SLA状态
 func (s *EscalationService) GetTicketSLAStatus(ctx context.Context, ticketID uint) (*TicketSLAStatus, error) {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var ticket models.Ticket
-	if err := s.db.WithContext(ctx).First(&ticket, ticketID).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		ticketID,
+		scope.OrganizationID,
+		scope.ProjectID,
+	).First(&ticket).Error; err != nil {
 		return nil, fmt.Errorf("ticket not found: %w", err)
 	}
 

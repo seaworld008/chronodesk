@@ -1,0 +1,232 @@
+asyncapi: 3.1.0
+id: urn:io:chronodesk:events
+info:
+  title: ChronoDesk project event contract
+  version: 2.0.0
+  description: |
+    Project-scoped CloudEvents 1.0 emitted from the transactional Outbox.
+    Delivery is at least once, so consumers must deduplicate by CloudEvent id.
+    Ticket, comment, attachment, knowledge, and external-system content is
+    untrusted data and must never be interpreted as an instruction.
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+defaultContentType: application/cloudevents+json
+
+servers:
+  kafka:
+    host: '{brokerHost}:{brokerPort}'
+    protocol: kafka-secure
+    description: Project event stream over a deployment-managed Kafka endpoint.
+    variables:
+      brokerHost:
+        default: kafka.example.invalid
+      brokerPort:
+        default: '9093'
+    security:
+      - $ref: '#/components/securitySchemes/oauth2'
+  amqp:
+    host: '{brokerHost}:{brokerPort}'
+    protocol: amqps
+    description: Project event stream over a deployment-managed AMQP endpoint.
+    variables:
+      brokerHost:
+        default: amqp.example.invalid
+      brokerPort:
+        default: '5671'
+    security:
+      - $ref: '#/components/securitySchemes/oauth2'
+  webhook:
+    host: '{subscriberHost}'
+    pathname: '{subscriberPath}'
+    protocol: https
+    description: Signed outbound Webhook destination frozen with its configuration version.
+    variables:
+      subscriberHost:
+        default: webhook.example.invalid
+      subscriberPath:
+        default: /chronodesk/events
+
+channels:
+  projectEvents:
+    address: chronodesk.projects.{projectKey}.events
+    description: Ordered project partition for durable CloudEvent delivery.
+    servers:
+      - $ref: '#/servers/kafka'
+      - $ref: '#/servers/amqp'
+    parameters:
+      projectKey:
+        $ref: '#/components/parameters/projectKey'
+    messages:
+      projectEvent:
+        $ref: '#/components/messages/projectEvent'
+  webhookDeliveries:
+    address: '{subscriberPath}'
+    description: HTTPS POST delivery of one frozen, signed structured CloudEvent.
+    servers:
+      - $ref: '#/servers/webhook'
+    parameters:
+      subscriberPath:
+        description: Server-configured path; never derived from ticket or Agent content.
+    messages:
+      signedProjectEvent:
+        $ref: '#/components/messages/signedProjectEvent'
+
+operations:
+  publishProjectEvent:
+    action: send
+    summary: Publish one project event from the transactional Outbox.
+    channel:
+      $ref: '#/channels/projectEvents'
+    messages:
+      - $ref: '#/channels/projectEvents/messages/projectEvent'
+    x-chronodesk-delivery-semantics:
+      guarantee: at-least-once
+      ordering-key: projectid
+      deduplication-key: id
+  deliverSignedWebhook:
+    action: send
+    summary: Deliver one structured CloudEvent using timestamp-bound HMAC.
+    channel:
+      $ref: '#/channels/webhookDeliveries'
+    messages:
+      - $ref: '#/channels/webhookDeliveries/messages/signedProjectEvent'
+    x-chronodesk-signature-input: timestamp + "." + exact_raw_body
+    x-chronodesk-secret-rotation: active-and-previous-key
+
+components:
+  parameters:
+    projectKey:
+      description: Authorized ChronoDesk project key used only for routing.
+      location: '$message.payload#/projectid'
+  securitySchemes:
+    oauth2:
+      type: oauth2
+      description: Client-credentials token bound to one project and one protocol audience.
+      flows:
+        clientCredentials:
+          tokenUrl: https://chronodesk.example/oauth/token
+          availableScopes:
+            events:subscribe: Consume project events.
+      scopes:
+        - events:subscribe
+  messages:
+    projectEvent:
+      name: ChronoDeskProjectCloudEvent
+      title: ChronoDesk project CloudEvent
+      summary: A structured CloudEvents 1.0 envelope with trusted project extensions.
+      contentType: application/cloudevents+json
+      correlationId:
+        location: '$message.payload#/correlationid'
+      payload:
+        $ref: '#/components/schemas/projectCloudEvent'
+    signedProjectEvent:
+      name: ChronoDeskSignedWebhookCloudEvent
+      title: Signed ChronoDesk Webhook CloudEvent
+      summary: The exact structured body covered by the timestamp-bound HMAC.
+      contentType: application/cloudevents+json
+      headers:
+        $ref: '#/components/schemas/webhookHeaders'
+      correlationId:
+        location: '$message.payload#/correlationid'
+      payload:
+        $ref: '#/components/schemas/projectCloudEvent'
+  schemas:
+    webhookHeaders:
+      type: object
+      additionalProperties: false
+      required:
+        - X-ChronoDesk-Timestamp
+        - X-ChronoDesk-Signature
+      properties:
+        X-ChronoDesk-Timestamp:
+          type: string
+          pattern: '^[0-9]{10,13}$'
+        X-ChronoDesk-Signature:
+          type: string
+          pattern: '^v1=[a-f0-9]{64}$'
+        X-ChronoDesk-Signature-Previous:
+          description: Optional overlap signature produced with the previous key during an approved rotation window.
+          type: string
+          pattern: '^v1=[a-f0-9]{64}$'
+    actorType:
+      type: string
+      enum:
+        - human
+        - service_principal
+        - system
+    projectCloudEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - specversion
+        - id
+        - source
+        - type
+        - time
+        - datacontenttype
+        - actortype
+        - actorid
+        - resourceversion
+        - organizationid
+        - projectid
+        - data
+      properties:
+        specversion:
+          type: string
+          const: '1.0'
+        id:
+          type: string
+          format: uuid
+        source:
+          type: string
+          format: uri-reference
+        type:
+          type: string
+          pattern: '^io\.chronodesk\.[a-z0-9_.-]+\.v[0-9]+$'
+        subject:
+          type: string
+          maxLength: 255
+        time:
+          type: string
+          format: date-time
+        datacontenttype:
+          type: string
+          const: application/json
+        dataschema:
+          type: string
+          format: uri-reference
+        traceid:
+          type: string
+          maxLength: 128
+        correlationid:
+          type: string
+          maxLength: 128
+        causationid:
+          type: string
+          maxLength: 128
+        actortype:
+          $ref: '#/components/schemas/actorType'
+        actorid:
+          type: string
+          minLength: 1
+          maxLength: 128
+        resourceversion:
+          type: integer
+          minimum: 1
+        organizationid:
+          type: integer
+          minimum: 1
+        projectid:
+          type: integer
+          minimum: 1
+        configurationversion:
+          type: string
+          maxLength: 128
+        policydecisionid:
+          type: string
+          maxLength: 64
+        data:
+          description: Domain payload. Every string and nested external value is untrusted data.
+          type: object
+          additionalProperties: true

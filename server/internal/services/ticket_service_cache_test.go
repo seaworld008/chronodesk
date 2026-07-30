@@ -114,8 +114,9 @@ func TestGetTicketStatistics_Cache(t *testing.T) {
 		cache,
 		30*time.Second,
 	)
+	ctx := testProjectOperationContext(t, db, models.HumanActor(1))
 
-	stats1, err := svc.GetTicketStatistics(1, "admin")
+	stats1, err := svc.GetTicketStatistics(ctx, 1, string(models.ProjectRoleAdmin))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -124,7 +125,7 @@ func TestGetTicketStatistics_Cache(t *testing.T) {
 		t.Fatalf("failed to update ticket: %v", err)
 	}
 
-	stats2, err := svc.GetTicketStatistics(1, "admin")
+	stats2, err := svc.GetTicketStatistics(ctx, 1, string(models.ProjectRoleAdmin))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

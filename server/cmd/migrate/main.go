@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/database"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"github.com/joho/godotenv"
 	"gorm.io/driver/postgres"
@@ -48,14 +49,10 @@ func main() {
 	_ = godotenv.Load()
 
 	if dsn == "" {
-		dsn = firstEnvironmentValue(
-			"DATABASE_URL_UNPOOLED",
-			"POSTGRES_URL_NON_POOLING",
-			"DATABASE_URL",
-		)
+		dsn = migrationDSNFromEnvironment()
 	}
 	if dsn == "" {
-		log.Fatal("DATABASE_URL or -dsn is required")
+		log.Fatal("DATABASE_MIGRATION_URL or -dsn is required")
 	}
 	if timeout <= 0 {
 		log.Fatal("-timeout must be positive")
@@ -91,8 +88,10 @@ func main() {
 		log.Fatalf("获取数据库连接池失败：%v", err)
 	}
 	defer sqlDB.Close()
-	sqlDB.SetMaxIdleConns(1)
-	sqlDB.SetMaxOpenConns(1)
+	// The atomic GORM migration holds one PostgreSQL transaction connection
+	// while catalog inspection may acquire a second connection.
+	sqlDB.SetMaxIdleConns(2)
+	sqlDB.SetMaxOpenConns(2)
 	sqlDB.SetConnMaxLifetime(time.Hour)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -104,12 +103,19 @@ func main() {
 			log.Fatalf("删除数据表失败：%v", err)
 		}
 	}
-	if err := database.RunMigrationsFromModel(ctx, db, resumeAt); err != nil {
+	if err := database.RunMigrationsFromModel(
+		ctx,
+		db,
+		resumeAt,
+		services.EnsureProjectScopeMigrationMembership,
+	); err != nil {
 		log.Fatalf("数据库迁移失败：%v", err)
 	}
 	if seedData {
 		if err := database.SeedData(db, database.SeedOptions{
 			IncludeSampleData: samples,
+			EnsureInitialAdministratorMembership: services.
+				EnsureBootstrapProjectAdministratorMembership,
 		}); err != nil {
 			log.Fatalf("初始化业务数据失败：%v", err)
 		}
@@ -124,6 +130,15 @@ func firstEnvironmentValue(names ...string) string {
 		}
 	}
 	return ""
+}
+
+func migrationDSNFromEnvironment() string {
+	return firstEnvironmentValue(
+		"DATABASE_MIGRATION_URL",
+		"DATABASE_URL_UNPOOLED",
+		"POSTGRES_URL_NON_POOLING",
+		"DATABASE_URL",
+	)
 }
 
 func dropChronoDeskTables(db *gorm.DB) error {

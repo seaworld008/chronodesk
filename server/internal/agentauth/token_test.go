@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,7 +29,7 @@ func TestManagerIssueVerifyAndAudience(t *testing.T) {
 		Scopes:       []string{"tickets:read", "tickets:update"},
 		Active:       true,
 	}
-	token, _, err := manager.Issue(principal, []string{"tickets:read"})
+	token, _, err := manager.Issue(principal, "TEST", []string{"tickets:read"})
 	if err != nil {
 		t.Fatalf("Issue() error = %v", err)
 	}
@@ -36,7 +37,10 @@ func TestManagerIssueVerifyAndAudience(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
 	}
-	if access.PrincipalID != principal.ID || len(access.Scopes) != 1 || access.Scopes[0] != "tickets:read" {
+	if access.PrincipalID != principal.ID ||
+		access.ProjectKey != "TEST" ||
+		len(access.Scopes) != 1 ||
+		access.Scopes[0] != "tickets:read" {
 		t.Fatalf("unexpected access context: %#v", access)
 	}
 
@@ -57,7 +61,7 @@ func TestManagerAudienceIsolationMatrixAndRFC9068ScopeClaim(t *testing.T) {
 	now := time.Date(2026, 7, 29, 10, 0, 0, 0, time.UTC)
 	resources := map[string]string{
 		"mcp": "https://api.example/mcp",
-		"api": "https://api.example/api/v1",
+		"api": "https://api.example/api/v2",
 		"a2a": "https://api.example/a2a/v1",
 	}
 	managers := make(map[string]*Manager, len(resources))
@@ -76,7 +80,7 @@ func TestManagerAudienceIsolationMatrixAndRFC9068ScopeClaim(t *testing.T) {
 	}
 	tokens := make(map[string]string, len(managers))
 	for name, manager := range managers {
-		token, _, err := manager.Issue(principal, principal.Scopes)
+		token, _, err := manager.Issue(principal, "TEST", principal.Scopes)
 		if err != nil {
 			t.Fatalf("Issue(%s) error = %v", name, err)
 		}
@@ -113,6 +117,130 @@ func TestManagerAudienceIsolationMatrixAndRFC9068ScopeClaim(t *testing.T) {
 	if got, ok := claims["scope"].(string); !ok || got != "tickets:read tasks:manage" {
 		t.Fatalf("RFC 9068 scope claim = %#v, want a space-delimited string", claims["scope"])
 	}
+	if claims["project_key"] != "TEST" {
+		t.Fatalf("project_key claim = %#v, want TEST", claims["project_key"])
+	}
+}
+
+func TestManagerRequiresCanonicalProjectKey(t *testing.T) {
+	manager := NewManager("project-key-test-secret", "issuer", "resource", time.Minute)
+	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	principal := &Principal{
+		ID: "principal", CredentialID: "credential", ClientID: "client",
+		Name: "agent", Scopes: []string{"tickets:read"}, Active: true,
+	}
+	for _, projectKey := range []string{"", " test ", "lowercase", "TOO/LONG"} {
+		if _, _, err := manager.Issue(principal, projectKey, principal.Scopes); err != ErrInvalidToken {
+			t.Fatalf("Issue(project_key=%q) error = %v, want %v", projectKey, err, ErrInvalidToken)
+		}
+	}
+
+	legacyToken, err := manager.sign(accessClaims{
+		Iss:          "issuer",
+		Sub:          "service-principal:principal",
+		Aud:          "resource",
+		Exp:          now.Add(time.Minute).Unix(),
+		Iat:          now.Unix(),
+		JTI:          "legacy-token",
+		ClientID:     "client",
+		PrincipalID:  "principal",
+		CredentialID: "credential",
+		Name:         "agent",
+		Scope:        "tickets:read",
+		TokenType:    "agent_access",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Verify(legacyToken); err != ErrInvalidToken {
+		t.Fatalf("legacy token without project_key error = %v, want %v", err, ErrInvalidToken)
+	}
+}
+
+type recordingAccessValidator struct {
+	projectKey string
+	scopes     []string
+	calls      int
+}
+
+func (validator *recordingAccessValidator) ValidateAccessContext(
+	_ context.Context,
+	_, _, projectKey string,
+	scopes []string,
+) error {
+	validator.calls++
+	validator.projectKey = projectKey
+	validator.scopes = append([]string(nil), scopes...)
+	return nil
+}
+
+func TestMiddlewareBindsTokenToProjectRouteAndGinContext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	manager := NewManager("project-route-test-secret", "issuer", "resource", time.Minute)
+	principal := &Principal{
+		ID: "principal", CredentialID: "credential", ClientID: "client",
+		Name: "agent", Scopes: []string{"tickets:read"}, Active: true,
+	}
+	token, _, err := manager.Issue(principal, "ALPHA", principal.Scopes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validator := &recordingAccessValidator{}
+	manager.SetAccessValidator(validator)
+
+	router := gin.New()
+	router.GET(
+		"/projects/:projectKey/tickets",
+		manager.Middleware("tickets:read"),
+		func(c *gin.Context) {
+			value, exists := c.Get(ContextProjectKey)
+			if !exists || value != "ALPHA" {
+				t.Fatalf("Gin project context = %#v, exists=%v", value, exists)
+			}
+			c.Status(http.StatusNoContent)
+		},
+	)
+
+	for _, test := range []struct {
+		projectKey string
+		status     int
+	}{
+		{projectKey: "ALPHA", status: http.StatusNoContent},
+		{projectKey: "BETA", status: http.StatusForbidden},
+	} {
+		request := httptest.NewRequest(
+			http.MethodGet,
+			"/projects/"+test.projectKey+"/tickets",
+			nil,
+		)
+		request.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != test.status {
+			t.Fatalf(
+				"project %s status = %d, want %d; body=%s",
+				test.projectKey,
+				response.Code,
+				test.status,
+				response.Body.String(),
+			)
+		}
+		if test.status == http.StatusForbidden &&
+			!strings.Contains(response.Body.String(), `"code":"project_scope_mismatch"`) {
+			t.Fatalf("project mismatch body = %s", response.Body.String())
+		}
+	}
+	if validator.calls != 1 ||
+		validator.projectKey != "ALPHA" ||
+		fmt.Sprint(validator.scopes) != fmt.Sprint(principal.Scopes) {
+		t.Fatalf(
+			"access validator calls=%d project=%q scopes=%v",
+			validator.calls,
+			validator.projectKey,
+			validator.scopes,
+		)
+	}
 }
 
 func TestAudienceSpecificBearerMiddlewareRejectsCrossResourceTokens(t *testing.T) {
@@ -120,7 +248,7 @@ func TestAudienceSpecificBearerMiddlewareRejectsCrossResourceTokens(t *testing.T
 	now := time.Date(2026, 7, 29, 10, 0, 0, 0, time.UTC)
 	resources := map[string]string{
 		"mcp": "https://api.example/mcp",
-		"api": "https://api.example/api/v1",
+		"api": "https://api.example/api/v2",
 		"a2a": "https://api.example/a2a/v1",
 	}
 	managers := make(map[string]*Manager, len(resources))
@@ -138,7 +266,7 @@ func TestAudienceSpecificBearerMiddlewareRejectsCrossResourceTokens(t *testing.T
 		manager := NewManager("shared-http-resource-secret", "https://api.example", resource, 10*time.Minute)
 		manager.now = func() time.Time { return now }
 		managers[name] = manager
-		token, _, err := manager.Issue(principal, principal.Scopes)
+		token, _, err := manager.Issue(principal, "TEST", principal.Scopes)
 		if err != nil {
 			t.Fatalf("Issue(%s) error = %v", name, err)
 		}
@@ -187,11 +315,11 @@ func TestManagerRejectsScopeEscalationAndExpiry(t *testing.T) {
 		Active:       true,
 		ExpiresAt:    &expiresAt,
 	}
-	if _, _, err := manager.Issue(principal, []string{"tickets:update"}); err != ErrInsufficientScope {
+	if _, _, err := manager.Issue(principal, "TEST", []string{"tickets:update"}); err != ErrInsufficientScope {
 		t.Fatalf("Issue() error = %v, want %v", err, ErrInsufficientScope)
 	}
 
-	token, _, err := manager.Issue(principal, nil)
+	token, _, err := manager.Issue(principal, "TEST", nil)
 	if err != nil {
 		t.Fatalf("Issue() error = %v", err)
 	}
@@ -203,7 +331,13 @@ func TestManagerRejectsScopeEscalationAndExpiry(t *testing.T) {
 
 type rejectingAccessValidator struct{}
 
-func (rejectingAccessValidator) ValidateAccessContext(context.Context, string, string) error {
+func (rejectingAccessValidator) ValidateAccessContext(
+	context.Context,
+	string,
+	string,
+	string,
+	[]string,
+) error {
 	return errors.New("credential revoked")
 }
 
@@ -214,7 +348,7 @@ func TestMiddlewareRevalidatesCredentialRevocation(t *testing.T) {
 		ID: "principal", CredentialID: "credential", ClientID: "client",
 		Name: "agent", Scopes: []string{"tickets:read"}, Active: true,
 	}
-	token, _, err := manager.Issue(principal, principal.Scopes)
+	token, _, err := manager.Issue(principal, "TEST", principal.Scopes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +374,7 @@ func TestMiddlewareAppliesTokenDeadlineWithoutSSEAcceptHeader(t *testing.T) {
 		ID: "principal", CredentialID: "credential", ClientID: "client",
 		Name: "agent", Scopes: []string{"tickets:read"}, Active: true,
 	}
-	token, expiresAt, err := manager.Issue(principal, principal.Scopes)
+	token, expiresAt, err := manager.Issue(principal, "TEST", principal.Scopes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +404,13 @@ type revocableAccessValidator struct {
 	revoked atomic.Bool
 }
 
-func (v *revocableAccessValidator) ValidateAccessContext(context.Context, string, string) error {
+func (v *revocableAccessValidator) ValidateAccessContext(
+	context.Context,
+	string,
+	string,
+	string,
+	[]string,
+) error {
 	if v.revoked.Load() {
 		return errors.New("credential revoked")
 	}
@@ -285,7 +425,7 @@ func TestMiddlewareCancelsLongRequestAfterCredentialRevocationWithoutAcceptHeade
 		ID: "principal", CredentialID: "credential", ClientID: "client",
 		Name: "agent", Scopes: []string{"tasks:manage"}, Active: true,
 	}
-	token, _, err := manager.Issue(principal, principal.Scopes)
+	token, _, err := manager.Issue(principal, "TEST", principal.Scopes)
 	if err != nil {
 		t.Fatal(err)
 	}

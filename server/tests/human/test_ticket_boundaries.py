@@ -25,20 +25,24 @@ def test_ticket_create_input_boundaries(
     """TKT-001/TKT-002: exact request limits and customer-controlled fields."""
 
     admin = human_identities["admin"]
-    valid_base = {
-        "description": f"{e2e_manager.prefix}valid description",
-        "type": "request",
-        "priority": "normal",
-        "source": "api",
-    }
-    invalid_payloads = [
-        valid_base,
+    valid_base = e2e_manager.ticket_create_payload(
         {
-            "title": e2e_manager.unique("missing-description"),
+            "description": f"{e2e_manager.prefix}valid description",
             "type": "request",
             "priority": "normal",
             "source": "api",
-        },
+        }
+    )
+    invalid_payloads = [
+        valid_base,
+        e2e_manager.ticket_create_payload(
+            {
+                "title": e2e_manager.unique("missing-description"),
+                "type": "request",
+                "priority": "normal",
+                "source": "api",
+            }
+        ),
         {**valid_base, "title": e2e_manager.prefix + ("x" * 256)},
         {
             **valid_base,
@@ -57,21 +61,24 @@ def test_ticket_create_input_boundaries(
         },
     ]
     for payload in invalid_payloads:
-        rejected = admin.api.post_json("/tickets", payload)
+        rejected = admin.api.post_json(
+            e2e_manager.project_path("tickets"),
+            payload,
+        )
         if rejected.status_code == 201:
             unexpected_ticket = rejected.json().get("data", {})
             unexpected_id = unexpected_ticket.get("id")
             assert isinstance(unexpected_id, int) and unexpected_id > 0, (
                 unexpected_ticket
             )
-            cleanup = admin.api.delete(f"/tickets/{unexpected_id}")
+            cleanup = admin.api.delete_ticket(unexpected_id)
             assert cleanup.status_code in (200, 204), cleanup.text
         assert_error_contract(rejected, 400)
 
     title = e2e_manager.prefix + ("T" * (255 - len(e2e_manager.prefix)))
     description = e2e_manager.prefix + ("D" * (10000 - len(e2e_manager.prefix)))
     maximum = admin.api.post_json(
-        "/tickets",
+        e2e_manager.project_path("tickets"),
         {
             **valid_base,
             "title": title,
@@ -87,7 +94,7 @@ def test_ticket_create_input_boundaries(
 
     customer = human_identities["customer_a"]
     forbidden_customer_fields = customer.api.post_json(
-        "/tickets",
+        e2e_manager.project_path("tickets"),
         {
             **valid_base,
             "title": e2e_manager.unique("customer-forbidden-fields"),
@@ -99,7 +106,7 @@ def test_ticket_create_input_boundaries(
         unexpected_ticket = forbidden_customer_fields.json().get("data", {})
         unexpected_id = unexpected_ticket.get("id")
         assert isinstance(unexpected_id, int) and unexpected_id > 0, unexpected_ticket
-        cleanup = admin.api.delete(f"/tickets/{unexpected_id}")
+        cleanup = admin.api.delete_ticket(unexpected_id)
         assert cleanup.status_code in (200, 204), cleanup.text
     assert_error_contract(forbidden_customer_fields, 403)
 
@@ -114,7 +121,7 @@ def test_ticket_pagination_and_identifier_bounds(
     ticket = e2e_manager.create_ticket(admin, "pagination")
 
     oversized = admin.api.get_json(
-        "/tickets",
+        e2e_manager.project_path("tickets"),
         params={"page": -99, "page_size": 100000},
     )
     assert oversized.status_code == 200, oversized.text
@@ -124,11 +131,13 @@ def test_ticket_pagination_and_identifier_bounds(
     assert len(page.get("items", [])) <= 100
     assert ticket["id"] in {item.get("id") for item in page.get("items", [])}
 
-    invalid_id = admin.api.get_json("/tickets/not-a-number")
+    invalid_id = admin.api.get_json(e2e_manager.project_path("tickets/not-a-number"))
     assert_error_contract(invalid_id, 400)
-    overflow_id = admin.api.get_json("/tickets/18446744073709551616")
+    overflow_id = admin.api.get_json(
+        e2e_manager.project_path("tickets/18446744073709551616")
+    )
     assert_error_contract(overflow_id, 400)
-    not_found = admin.api.get_json("/tickets/4294967295")
+    not_found = admin.api.get_json(e2e_manager.project_path("tickets/4294967295"))
     assert_error_contract(not_found, 404)
 
     oversized_user_page = admin.api.get_json(

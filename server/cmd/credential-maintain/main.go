@@ -64,13 +64,9 @@ func main() {
 		log.Fatalf("Load configuration: %v", err)
 	}
 
-	dsn := firstEnvironmentValue(
-		"DATABASE_URL_UNPOOLED",
-		"POSTGRES_URL_NON_POOLING",
-		"DATABASE_URL",
-	)
+	dsn := maintenanceDatabaseURL()
 	if dsn == "" {
-		log.Fatal("DATABASE_URL environment variable is required")
+		log.Fatal("privileged PostgreSQL maintenance URL is required")
 	}
 	if err := database.ValidatePostgresTransport(
 		dsn,
@@ -180,4 +176,13 @@ func firstEnvironmentValue(names ...string) string {
 		}
 	}
 	return ""
+}
+
+func maintenanceDatabaseURL() string {
+	return firstEnvironmentValue(
+		"DATABASE_MIGRATION_URL",
+		"DATABASE_URL_UNPOOLED",
+		"POSTGRES_URL_NON_POOLING",
+		"DATABASE_URL",
+	)
 }

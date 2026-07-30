@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/seaworld008/chronodesk/server/internal/agentcontract"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
 var SupportedScopes = agentcontract.SupportedScopes()
@@ -108,6 +109,10 @@ func (h *Handler) Token(c *gin.Context) {
 		writeOAuthError(c, http.StatusBadRequest, "unsupported_grant_type", "Only client_credentials is supported")
 		return
 	}
+	if models.ValidateProjectKey(request.projectKey) != nil {
+		writeOAuthError(c, http.StatusBadRequest, "invalid_request", "The project_key parameter is required and must identify one project")
+		return
+	}
 	if len(request.resources) != 1 {
 		writeOAuthError(c, http.StatusBadRequest, "invalid_target", "The resource parameter must exactly match one advertised protected resource")
 		return
@@ -122,7 +127,12 @@ func (h *Handler) Token(c *gin.Context) {
 		return
 	}
 
-	principal, err := h.store.AuthenticateClient(c.Request.Context(), request.clientID, request.clientSecret)
+	principal, err := h.store.AuthenticateClient(
+		c.Request.Context(),
+		request.clientID,
+		request.clientSecret,
+		request.projectKey,
+	)
 	if err != nil || principal == nil || !principal.Active {
 		writeInvalidClient(c)
 		return
@@ -132,7 +142,11 @@ func (h *Handler) Token(c *gin.Context) {
 	if len(effectiveScopes) == 0 {
 		effectiveScopes = principal.Scopes
 	}
-	token, expiresAt, err := resource.Manager.Issue(principal, effectiveScopes)
+	token, expiresAt, err := resource.Manager.Issue(
+		principal,
+		request.projectKey,
+		effectiveScopes,
+	)
 	if err != nil {
 		if err == ErrInsufficientScope {
 			writeOAuthError(c, http.StatusBadRequest, "invalid_scope", "Requested scope is not permitted")
@@ -154,6 +168,7 @@ func (h *Handler) Token(c *gin.Context) {
 		"expires_in":   expiresIn,
 		"scope":        strings.Join(normalizeScopes(effectiveScopes), " "),
 		"resource":     resource.Manager.audience,
+		"project_key":  request.projectKey,
 	})
 }
 
@@ -183,6 +198,7 @@ func (h *Handler) AuthorizationServerMetadata(c *gin.Context) {
 		"response_types_supported":                       []string{},
 		"client_id_metadata_document_supported":          false,
 		"authorization_response_iss_parameter_supported": false,
+		"project_key_parameter_supported":                true,
 	})
 }
 
@@ -223,6 +239,7 @@ type tokenRequest struct {
 	clientSecret string
 	scope        string
 	resources    []string
+	projectKey   string
 }
 
 func parseTokenRequest(c *gin.Context) (*tokenRequest, error) {
@@ -238,6 +255,9 @@ func parseTokenRequest(c *gin.Context) (*tokenRequest, error) {
 			return nil, errMalformedTokenRequest
 		}
 	}
+	if len(c.Request.PostForm["project_key"]) > 1 {
+		return nil, errMalformedTokenRequest
+	}
 
 	request := &tokenRequest{
 		grantType:    c.Request.PostForm.Get("grant_type"),
@@ -245,6 +265,7 @@ func parseTokenRequest(c *gin.Context) (*tokenRequest, error) {
 		clientSecret: c.Request.PostForm.Get("client_secret"),
 		scope:        c.Request.PostForm.Get("scope"),
 		resources:    append([]string(nil), c.Request.PostForm["resource"]...),
+		projectKey:   c.Request.PostForm.Get("project_key"),
 	}
 
 	authorization := strings.TrimSpace(c.GetHeader("Authorization"))

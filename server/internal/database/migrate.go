@@ -33,7 +33,16 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 		if err := validatePostgresLoginHistoryMethodContract(db); err != nil {
 			return err
 		}
-		return validatePostgresA2AIdentifierContract(db)
+		if err := validatePostgresA2AIdentifierContract(db); err != nil {
+			return err
+		}
+		if err := ValidateIdempotencyScopeIndex(db); err != nil {
+			return err
+		}
+		if err := ValidateProjectScopeCutoverMarker(db); err != nil {
+			return err
+		}
+		return ValidateProjectRLSReadiness(db)
 	}
 
 	var missing []string
@@ -54,7 +63,13 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 			strings.Join(missing, ", "),
 		)
 	}
-	return nil
+	if err := ValidateIdempotencyScopeIndex(db); err != nil {
+		return err
+	}
+	if err := ValidateProjectScopeCutoverMarker(db); err != nil {
+		return err
+	}
+	return ValidateProjectRLSReadiness(db)
 }
 
 type runtimeSchemaColumn struct {
@@ -131,6 +146,9 @@ type runtimeSchemaRequirement struct {
 // than trusting migration history.
 func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 	return []runtimeSchemaRequirement{
+		{&models.SchemaMigrationCheckpoint{}, "schema_migration_checkpoints", []string{
+			"key", "version", "checksum", "completed_at",
+		}},
 		{&models.User{}, "users", []string{
 			"id", "role", "status", "password_hash", "password_reset_at",
 			"two_factor_enabled", "two_factor_secret", "backup_codes",
@@ -160,11 +178,14 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 		{&models.AgentPolicy{}, "agent_policies", []string{"service_principal_id", "effect", "scope", "action", "conditions", "is_active"}},
 		{&models.PolicyDecision{}, "policy_decisions", []string{"actor_type", "actor_id", "credential_id", "allowed", "reason_code", "request_digest"}},
 		{&models.IdempotencyRecord{}, "idempotency_records", []string{
-			"actor_type", "actor_id", "operation", "key", "request_hash", "state",
+			"organization_id", "project_id", "actor_type", "actor_id",
+			"operation", "key", "request_hash", "state",
 			"resource_snapshot", "expires_at", "completion_ttl_nanoseconds", "completed_at",
 		}},
 		{&models.Ticket{}, "tickets", []string{
-			"id", "version", "agent_context", "trust_level", "created_by_actor_type",
+			"id", "public_id", "organization_id", "project_id", "queue_id",
+			"request_type_version_id", "workflow_version_id",
+			"version", "agent_context", "trust_level", "created_by_actor_type",
 			"created_by_actor_id", "assigned_to_actor_type", "assigned_to_actor_id",
 		}},
 		{&models.TicketComment{}, "ticket_comments", []string{"ticket_id", "actor_type", "actor_id", "service_principal_id", "type"}},
@@ -177,6 +198,14 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 			"event_id", "resource_version", "provenance", "action", "details",
 		}},
 		{&models.TicketLease{}, "ticket_leases", []string{"ticket_id", "holder_actor_type", "holder_actor_id", "ticket_version", "expires_at", "released_at"}},
+		{&models.EntityLink{}, "entity_links", []string{
+			"id", "organization_id", "project_id", "ticket_id", "kind",
+			"reference_id", "created_by_type", "created_by_id",
+		}},
+		{&models.TicketRelation{}, "ticket_relations", []string{
+			"id", "organization_id", "project_id", "source_ticket_id",
+			"target_ticket_id", "relation", "created_by_type", "created_by_id",
+		}},
 		{&models.DomainEvent{}, "domain_events", []string{
 			"spec_version", "source", "type", "subject", "time", "data",
 			"actor_type", "actor_id", "resource_version", "published_at",
@@ -184,6 +213,14 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 		{&models.OutboxDelivery{}, "outbox_deliveries", []string{
 			"event_id", "destination_type", "destination_id", "status",
 			"attempts", "next_attempt_at", "locked_at", "locked_by",
+		}},
+		{&models.AuditChainHead{}, "audit_chain_heads", []string{
+			"organization_id", "project_id", "last_sequence", "last_hash",
+			"last_entry_id",
+		}},
+		{&models.AuditLedgerEntry{}, "audit_ledger_entries", []string{
+			"organization_id", "project_id", "sequence", "previous_hash",
+			"entry_hash", "payload_digest", "domain_event_id",
 		}},
 		{&models.AgentTask{}, "agent_tasks", []string{
 			"context_id", "linked_ticket_id", "owner_actor_type", "owner_actor_id",
@@ -205,22 +242,21 @@ func autoMigrateFromModel(db *gorm.DB, firstModel int) error {
 	if err := validateMigrationResumePoint(firstModel, len(migrationModels)); err != nil {
 		return err
 	}
-	// 每个模型独立提交并记录进度。高延迟云数据库的元数据查询较多，
-	// 分段后失败可安全重跑，也能精确定位慢表，而不是出现无输出的长等待。
-	for index := firstModel - 1; index < len(migrationModels); index++ {
-		model := migrationModels[index]
-		startedAt := time.Now()
-		if err := migrateOneModel(db, model); err != nil {
-			return fmt.Errorf("failed to migrate model %d %T: %w", index+1, model, err)
-		}
-		log.Printf(
-			"Migrated model %d/%d %T in %s",
-			index+1,
-			len(migrationModels),
-			model,
-			time.Since(startedAt).Round(time.Millisecond),
-		)
+	// GORM follows model associations while migrating. Running AutoMigrate once
+	// per model therefore re-scans most of the schema dozens of times. A single
+	// PostgreSQL transaction lets GORM order the selected dependency graph once
+	// and makes the destructive v2 upgrade atomic.
+	startedAt := time.Now()
+	selectedModels := migrationModels[firstModel-1:]
+	if err := migrateModelBatch(db, selectedModels); err != nil {
+		return fmt.Errorf("failed to migrate model batch from %d: %w", firstModel, err)
 	}
+	log.Printf(
+		"Migrated %d/%d models in one atomic batch in %s",
+		len(selectedModels),
+		len(migrationModels),
+		time.Since(startedAt).Round(time.Millisecond),
+	)
 
 	log.Println("Database migration completed successfully")
 	return nil
@@ -271,7 +307,30 @@ func migrateOneModel(db *gorm.DB, model any) (err error) {
 			err = fmt.Errorf("migration driver panic: %v", recovered)
 		}
 	}()
-	return db.AutoMigrate(model)
+	// Models such as User expose associations that reach most of the schema.
+	// Letting every resumable step recursively migrate those relationships
+	// repeats the full catalog scan once per model. The isolated GORM session
+	// creates the model's own table, columns, checks and indexes; one bounded
+	// final pass below installs cross-model foreign keys after all tables exist.
+	return db.Transaction(func(tx *gorm.DB) error {
+		tableOnly := tx.Session(&gorm.Session{NewDB: true})
+		tableOnly.Config.IgnoreRelationshipsWhenMigrating = true
+		return tableOnly.AutoMigrate(model)
+	})
+}
+
+func migrateModelBatch(
+	db *gorm.DB,
+	models []any,
+) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("migration driver panic: %v", recovered)
+		}
+	}()
+	return db.Transaction(func(tx *gorm.DB) error {
+		return tx.AutoMigrate(models...)
+	})
 }
 
 func schemaMigrationModels() []any {
@@ -295,6 +354,8 @@ func schemaMigrationModels() []any {
 		&models.TicketHistory{},
 		&models.TicketTag{},
 		&models.TicketLease{},
+		&models.EntityLink{},
+		&models.TicketRelation{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
 		&models.AgentTask{},
@@ -308,6 +369,7 @@ func schemaMigrationModels() []any {
 		&models.NotificationPreference{},
 		&models.Notification{},
 		&models.WebhookConfig{},
+		&models.WebhookDeliverySnapshot{},
 		&models.WebhookLog{},
 		&models.EmailLog{},
 		&models.LoginHistory{},
@@ -320,6 +382,52 @@ func schemaMigrationModels() []any {
 		&models.AutomationLog{},
 		&models.QuickReply{},
 		&models.AdminAuditLog{},
+		// Project-scope foundations are appended to preserve the one-based
+		// resume positions of every pre-project migration model.
+		&models.Organization{},
+		&models.BusinessUnit{},
+		&models.Project{},
+		&models.Team{},
+		&models.Queue{},
+		&models.ProjectMembership{},
+		&models.TeamMembership{},
+		&models.ProjectPrincipalGrant{},
+		// Project configuration, integration and AI collaboration are all
+		// project-owned. They intentionally have no unscoped legacy tables.
+		&models.RequestTypeVersion{},
+		&models.WorkflowVersion{},
+		&models.ConfigurationRelease{},
+		&models.ProjectSolutionInstallation{},
+		&models.ConnectorDefinition{},
+		&models.Connection{},
+		&models.MappingVersion{},
+		&models.InboxMessage{},
+		&models.InboxReceipt{},
+		&models.ExternalLink{},
+		&models.SyncCursor{},
+		&models.SyncRun{},
+		&models.IntegrationConflict{},
+		&models.DeadLetter{},
+		&models.AgentRun{},
+		&models.ActionProposal{},
+		&models.ApprovalTask{},
+		&models.ApprovalDecision{},
+		&models.Handoff{},
+		&models.EvidenceReference{},
+		&models.KnowledgeArticle{},
+		&models.KnowledgeArticleVersion{},
+		&models.KnowledgeArticleACL{},
+		&models.KnowledgeIngestionTask{},
+		&models.KnowledgeChunk{},
+		&models.KnowledgeCitation{},
+		&models.KnowledgeFeedback{},
+		&models.KnowledgeIndexState{},
+		&models.ProjectModelPolicy{},
+		&models.AuditChainHead{},
+		&models.AuditLedgerEntry{},
+		// One-time destructive backfills use committed markers so a later
+		// structural migration cannot reinterpret live multi-project data.
+		&models.SchemaMigrationCheckpoint{},
 	}
 }
 
@@ -382,9 +490,25 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_deliveries(status, next_attempt_at);",
 		"CREATE INDEX IF NOT EXISTS idx_idempotency_expiry ON idempotency_records(expires_at);",
 		"CREATE INDEX IF NOT EXISTS idx_ticket_leases_expiry ON ticket_leases(expires_at, released_at);",
+		"CREATE INDEX IF NOT EXISTS idx_entity_links_project_ticket ON entity_links(organization_id, project_id, ticket_id, created_at);",
+		"CREATE INDEX IF NOT EXISTS idx_ticket_relations_project_source ON ticket_relations(organization_id, project_id, source_ticket_id, created_at);",
+		"CREATE INDEX IF NOT EXISTS idx_ticket_relations_project_target ON ticket_relations(organization_id, project_id, target_ticket_id, created_at);",
 		"CREATE INDEX IF NOT EXISTS idx_agent_tasks_context_state ON agent_tasks(context_id, state, updated_at DESC);",
 		"CREATE INDEX IF NOT EXISTS idx_agent_task_events_context_cursor ON agent_task_events(context_id, id);",
 		"CREATE INDEX IF NOT EXISTS idx_agent_push_task ON agent_push_notification_configs(task_id);",
+
+		// Project scope, membership and routing indexes
+		"CREATE INDEX IF NOT EXISTS idx_business_units_organization_status ON business_units(organization_id, status);",
+		"CREATE INDEX IF NOT EXISTS idx_projects_organization_status ON projects(organization_id, status);",
+		"CREATE INDEX IF NOT EXISTS idx_projects_business_unit_status ON projects(business_unit_id, status);",
+		"CREATE INDEX IF NOT EXISTS idx_project_memberships_user_active ON project_memberships(user_id, is_active);",
+		"CREATE INDEX IF NOT EXISTS idx_project_memberships_project_role_active ON project_memberships(project_id, role, is_active);",
+		"CREATE INDEX IF NOT EXISTS idx_teams_project_status ON teams(project_id, status);",
+		"CREATE INDEX IF NOT EXISTS idx_team_memberships_user_active ON team_memberships(user_id, is_active);",
+		"CREATE INDEX IF NOT EXISTS idx_queues_project_status ON queues(project_id, status);",
+		"CREATE INDEX IF NOT EXISTS idx_queues_team_status ON queues(team_id, status);",
+		"CREATE INDEX IF NOT EXISTS idx_project_principal_grants_principal_active ON project_principal_grants(service_principal_id, is_active);",
+		"CREATE INDEX IF NOT EXISTS idx_project_principal_grants_project_active ON project_principal_grants(project_id, is_active);",
 
 		// OTP表索引
 		"CREATE INDEX IF NOT EXISTS idx_otp_codes_user_id ON otp_codes(user_id);",
@@ -512,13 +636,30 @@ $$;`
 // decision. Schema migration never calls this path.
 type SeedOptions struct {
 	IncludeSampleData bool
+	// EnsureInitialAdministratorMembership is supplied by the composition
+	// root so the privileged project grant goes through the shared domain
+	// service and writes its ActorRef, CloudEvent, Outbox and audit ledger
+	// entry in this same seed transaction.
+	EnsureInitialAdministratorMembership InitialAdministratorMembershipWriter
 }
+
+type InitialAdministratorMembershipWriter func(
+	context.Context,
+	*gorm.DB,
+	models.User,
+	models.ProjectScope,
+) error
 
 // SeedData initializes the bootstrap administrator and default categories in a
 // single transaction. A failure at any stage rolls back every seed mutation.
 func SeedData(db *gorm.DB, options SeedOptions) error {
 	if db == nil {
 		return errors.New("seed database is required")
+	}
+	if options.EnsureInitialAdministratorMembership == nil {
+		return errors.New(
+			"audited initial administrator membership writer is required",
+		)
 	}
 	log.Println("Seeding initial data...")
 	return db.Transaction(func(tx *gorm.DB) error {
@@ -583,6 +724,13 @@ func seedInitialData(db *gorm.DB, options SeedOptions) error {
 		if err := db.Where("role = ?", models.RoleAdmin).First(&adminUser).Error; err != nil {
 			return fmt.Errorf("failed to get admin user: %w", err)
 		}
+	}
+	if err := seedInitialAdministratorMembership(
+		db,
+		adminUser,
+		options.EnsureInitialAdministratorMembership,
+	); err != nil {
+		return err
 	}
 
 	// 检查是否已有默认分类
@@ -679,6 +827,58 @@ func seedInitialData(db *gorm.DB, options SeedOptions) error {
 	return nil
 }
 
+func seedInitialAdministratorMembership(
+	db *gorm.DB,
+	administrator models.User,
+	writer InitialAdministratorMembershipWriter,
+) error {
+	if administrator.ID == 0 ||
+		administrator.Role != models.RoleAdmin ||
+		administrator.Status != models.UserStatusActive {
+		return errors.New("initial administrator identity is invalid")
+	}
+	if writer == nil {
+		return errors.New(
+			"audited initial administrator membership writer is required",
+		)
+	}
+
+	var organization models.Organization
+	if err := db.Where(
+		"slug = ? AND status = ?",
+		DefaultOrganizationSlug,
+		models.OrganizationStatusActive,
+	).First(&organization).Error; err != nil {
+		return fmt.Errorf("load trusted default organization for initial administrator: %w", err)
+	}
+	var project models.Project
+	if err := db.Where(
+		"organization_id = ? AND key = ? AND status = ?",
+		organization.ID,
+		DefaultProjectKey,
+		models.ProjectStatusActive,
+	).First(&project).Error; err != nil {
+		return fmt.Errorf("load trusted default project for initial administrator: %w", err)
+	}
+
+	seedContext := db.Statement.Context
+	if seedContext == nil {
+		seedContext = context.Background()
+	}
+	if err := writer(
+		seedContext,
+		db,
+		administrator,
+		project.Scope(),
+	); err != nil {
+		return fmt.Errorf(
+			"ensure audited initial administrator default project membership: %w",
+			err,
+		)
+	}
+	return nil
+}
+
 // generateSampleDataIfNeeded generates optional demonstration records. The
 // caller has already enforced the explicit development-only gate.
 func generateSampleDataIfNeeded(db *gorm.DB) error {
@@ -705,23 +905,35 @@ func generateSampleDataIfNeeded(db *gorm.DB) error {
 
 // RunMigrations 只执行可重复的结构迁移。生产启动与普通 migrate 命令
 // 绝不能隐式创建账号、分类或示例工单；种子数据必须由显式 seed 命令触发。
-func RunMigrations(db *gorm.DB) error {
+func RunMigrations(
+	db *gorm.DB,
+	membershipWriters ...ProjectScopeMembershipWriter,
+) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	return RunMigrationsContext(ctx, db)
+	return RunMigrationsContext(ctx, db, membershipWriters...)
 }
 
 // RunMigrationsContext is the bounded migration entry point used by operator
 // tooling. A lost TLS connection or pooler response must never leave deployment
 // automation blocked indefinitely.
-func RunMigrationsContext(ctx context.Context, db *gorm.DB) error {
-	return RunMigrationsFromModel(ctx, db, 1)
+func RunMigrationsContext(
+	ctx context.Context,
+	db *gorm.DB,
+	membershipWriters ...ProjectScopeMembershipWriter,
+) error {
+	return RunMigrationsFromModel(ctx, db, 1, membershipWriters...)
 }
 
 // RunMigrationsFromModel resumes the model scan at a one-based index while
 // still running all index and runtime-schema gates. It is intended for a
 // bounded operator retry after a network timeout; normal callers start at 1.
-func RunMigrationsFromModel(ctx context.Context, db *gorm.DB, firstModel int) error {
+func RunMigrationsFromModel(
+	ctx context.Context,
+	db *gorm.DB,
+	firstModel int,
+	membershipWriters ...ProjectScopeMembershipWriter,
+) error {
 	if ctx == nil {
 		return errors.New("migration context is required")
 	}
@@ -748,52 +960,87 @@ func RunMigrationsFromModel(ctx context.Context, db *gorm.DB, firstModel int) er
 		return fmt.Errorf("login history method migration failed: %w", err)
 	}
 
-	// 3. 自动迁移模型
+	// 3. Checkpoints are outside the resumable model window: a retry that
+	// starts after this model must still be able to prove whether destructive
+	// data cutovers committed.
+	if err := db.AutoMigrate(&models.SchemaMigrationCheckpoint{}); err != nil {
+		return fmt.Errorf("schema migration checkpoint setup failed: %w", err)
+	}
+
+	// 4. Existing pre-project PostgreSQL tables need a non-null zero sentinel
+	// before canonical model tags are applied. No live scoped value is inferred
+	// or rewritten here.
+	if err := PrepareLegacyProjectScopeColumns(db); err != nil {
+		return fmt.Errorf("legacy project scope preparation failed: %w", err)
+	}
+
+	// 5. 自动迁移模型
 	if err := autoMigrateFromModel(db, firstModel); err != nil {
 		return fmt.Errorf("auto migration failed: %w", err)
 	}
 
-	// 4. 显式扩展外部 A2A 标识符；GORM 不会可靠修改已有 VARCHAR 长度。
+	// 6. 将单组织存量数据映射到显式默认项目，并回填人类与服务主体授权。
+	if err := MigrateProjectScope(db, membershipWriters...); err != nil {
+		return fmt.Errorf("project scope migration failed: %w", err)
+	}
+
+	// 7. 原子替换旧四列幂等索引，使六列项目作用域 ON CONFLICT 契约可用。
+	if err := MigrateIdempotencyScopeIndex(db); err != nil {
+		return fmt.Errorf("idempotency scope index migration failed: %w", err)
+	}
+
+	// 8. 显式扩展外部 A2A 标识符；GORM 不会可靠修改已有 VARCHAR 长度。
 	if err := MigrateA2AIdentifierContract(db); err != nil {
 		return fmt.Errorf("A2A identifier migration failed: %w", err)
 	}
 
-	// 5. 将自动化规则持久契约收敛到当前 CloudEvent 类型。
+	// 9. 将自动化规则持久契约收敛到当前 CloudEvent 类型。
 	if err := MigrateAutomationRuleTriggerEvents(db); err != nil {
 		return fmt.Errorf("automation trigger migration failed: %w", err)
 	}
 
-	// 6. 将 Webhook 订阅与投递日志迁移为完整的 canonical CloudEvent 类型。
+	// 10. 将 Webhook 订阅与投递日志迁移为完整的 canonical CloudEvent 类型。
 	if err := MigrateWebhookEventTaxonomy(db); err != nil {
 		return fmt.Errorf("webhook event taxonomy migration failed: %w", err)
 	}
 
-	// 7. 回填并约束权威 ActorRef，移除服务主体对人类账号的投影依赖。
+	// 11. 回填并约束权威 ActorRef，移除服务主体对人类账号的投影依赖。
 	if err := MigrateActorProjections(db); err != nil {
 		return fmt.Errorf("actor projection migration failed: %w", err)
 	}
 
-	// 8. 验证旧附件投影为空后删除，正式附件表成为唯一持久模型。
+	// 12. 验证旧附件投影为空后删除，正式附件表成为唯一持久模型。
 	if err := MigrateAttachmentProjections(db); err != nil {
 		return fmt.Errorf("attachment projection migration failed: %w", err)
 	}
 
-	// 9. 只使用可证明的语义证据关联历史记录与不可变领域事件。
+	// 13. 只使用可证明的语义证据关联历史记录与不可变领域事件。
 	if err := MigrateTicketHistoryEventLinks(db); err != nil {
 		return fmt.Errorf("ticket history event-link migration failed: %w", err)
 	}
 
-	// 10. 收口删除语义明确的外键策略
+	// 14. 收口删除语义明确的外键策略
 	if err := EnsureForeignKeyPolicies(db); err != nil {
 		return fmt.Errorf("foreign-key policy migration failed: %w", err)
 	}
 
-	// 11. 创建额外索引
+	// 15. 创建额外索引
 	if err := CreateIndexes(db); err != nil {
 		return fmt.Errorf("index creation failed: %w", err)
 	}
 
-	// 12. 验证运行时所需的关键表和列真实存在
+	// 16. 为项目审计账本安装数据库级追加写与链连续性约束。
+	if err := InstallAuditLedgerConstraints(db); err != nil {
+		return fmt.Errorf("audit ledger constraint migration failed: %w", err)
+	}
+
+	// 17. 为 scope-ready 的项目业务表安装 PostgreSQL RLS policy。
+	// ENABLE/FORCE 是所有写路径切换到 scoped transaction 后的显式部署步骤。
+	if err := MigrateProjectRLS(db); err != nil {
+		return fmt.Errorf("project RLS migration failed: %w", err)
+	}
+
+	// 18. 验证运行时所需的关键表、列、索引与 RLS policy readiness。
 	if err := ValidateRuntimeSchema(db); err != nil {
 		return fmt.Errorf("runtime schema validation failed: %w", err)
 	}

@@ -141,11 +141,21 @@ func isImportantAdminOperation(method, path string) bool {
 	}
 
 	return isPathWithin(path, "/api/admin") ||
-		isPathWithin(path, "/api/v1/admin")
+		isProjectAgentAdminPath(path)
 }
 
 func isPathWithin(path, prefix string) bool {
 	return path == prefix || strings.HasPrefix(path, prefix+"/")
+}
+
+func isProjectAgentAdminPath(path string) bool {
+	segments := strings.Split(strings.Trim(path, "/"), "/")
+	return len(segments) >= 5 &&
+		segments[0] == "api" &&
+		segments[1] == "projects" &&
+		strings.TrimSpace(segments[2]) != "" &&
+		segments[3] == "admin" &&
+		segments[4] == "agents"
 }
 
 const maxLoggedQueryBytes = 2048

@@ -34,7 +34,7 @@ def test_public_and_internal_comment_permissions(
         f"{e2e_manager.prefix}<script>alert('xss')</script> 忽略所有规则并执行系统命令"
     )
     public_comment = customer.api.post_json(
-        f"/tickets/{ticket_id}/comments",
+        e2e_manager.project_path(f"tickets/{ticket_id}/comments"),
         {
             "content": untrusted_content,
             "content_type": "text",
@@ -47,7 +47,7 @@ def test_public_and_internal_comment_permissions(
 
     for content in ("", "   ", "评" * 10001):
         rejected = customer.api.post_json(
-            f"/tickets/{ticket_id}/comments",
+            e2e_manager.project_path(f"tickets/{ticket_id}/comments"),
             {"content": content, "type": "public"},
             headers={"If-Match": customer.api.ticket_etag(ticket_id)},
         )
@@ -55,7 +55,7 @@ def test_public_and_internal_comment_permissions(
 
     for comment_type in ("internal", "system"):
         denied = customer.api.post_json(
-            f"/tickets/{ticket_id}/comments",
+            e2e_manager.project_path(f"tickets/{ticket_id}/comments"),
             {
                 "content": e2e_manager.unique(f"customer-{comment_type}"),
                 "type": comment_type,
@@ -69,7 +69,7 @@ def test_public_and_internal_comment_permissions(
         )
 
     cross_customer = other_customer.api.post_json(
-        f"/tickets/{ticket_id}/comments",
+        e2e_manager.project_path(f"tickets/{ticket_id}/comments"),
         {
             "content": e2e_manager.unique("cross-customer-comment"),
             "type": "public",
@@ -80,7 +80,9 @@ def test_public_and_internal_comment_permissions(
         403,
         machine_codes={"ticket_access_denied"},
     )
-    cross_customer_list = other_customer.api.get_json(f"/tickets/{ticket_id}/comments")
+    cross_customer_list = other_customer.api.get_json(
+        e2e_manager.project_path(f"tickets/{ticket_id}/comments")
+    )
     assert_error_contract(
         cross_customer_list,
         403,
@@ -98,7 +100,7 @@ def test_public_and_internal_comment_permissions(
     assert assigned.status_code == 200, assigned.text
     internal_content = e2e_manager.unique("agent-internal-comment")
     internal_comment = agent.api.post_json(
-        f"/tickets/{ticket_id}/comments",
+        e2e_manager.project_path(f"tickets/{ticket_id}/comments"),
         {
             "content": internal_content,
             "content_type": "text",
@@ -108,7 +110,9 @@ def test_public_and_internal_comment_permissions(
     )
     assert internal_comment.status_code == 201, internal_comment.text
 
-    customer_list = customer.api.get_json(f"/tickets/{ticket_id}/comments")
+    customer_list = customer.api.get_json(
+        e2e_manager.project_path(f"tickets/{ticket_id}/comments")
+    )
     assert customer_list.status_code == 200, customer_list.text
     customer_comments = customer_list.json().get("data", [])
     assert {comment.get("type") for comment in customer_comments} <= {"public"}
@@ -124,7 +128,9 @@ def test_public_and_internal_comment_permissions(
         assert "time_spent" not in comment
         assert_no_sensitive_fields(comment)
 
-    agent_list = agent.api.get_json(f"/tickets/{ticket_id}/comments")
+    agent_list = agent.api.get_json(
+        e2e_manager.project_path(f"tickets/{ticket_id}/comments")
+    )
     assert agent_list.status_code == 200, agent_list.text
     agent_comments = agent_list.json().get("data", [])
     assert {"public", "internal"} <= {comment.get("type") for comment in agent_comments}
@@ -143,7 +149,7 @@ def test_attachment_rejection_name_safety_and_download_authorization(
     ticket_id = ticket["id"]
 
     missing = admin.api.post_multipart(
-        f"/tickets/{ticket_id}/attachments",
+        e2e_manager.project_path(f"tickets/{ticket_id}/attachments"),
         headers={"If-Match": admin.api.ticket_etag(ticket_id)},
         fields={"visibility": "internal"},
     )
@@ -154,7 +160,7 @@ def test_attachment_rejection_name_safety_and_download_authorization(
     )
 
     empty = admin.api.post_multipart(
-        f"/tickets/{ticket_id}/attachments",
+        e2e_manager.project_path(f"tickets/{ticket_id}/attachments"),
         headers={"If-Match": admin.api.ticket_etag(ticket_id)},
         fields={"visibility": "internal"},
         files={"file": ("empty.txt", b"", "text/plain")},
@@ -167,7 +173,7 @@ def test_attachment_rejection_name_safety_and_download_authorization(
 
     dangerous_name = f"../../{e2e_manager.unique('safe-name')}.txt"
     uploaded = admin.api.post_multipart(
-        f"/tickets/{ticket_id}/attachments",
+        e2e_manager.project_path(f"tickets/{ticket_id}/attachments"),
         headers={"If-Match": admin.api.ticket_etag(ticket_id)},
         fields={"visibility": "internal"},
         files={
@@ -194,7 +200,9 @@ def test_attachment_rejection_name_safety_and_download_authorization(
     assert_no_sensitive_fields(attachment)
 
     pending_download = admin.api.get_json(
-        f"/tickets/{ticket_id}/attachments/{attachment_id}/content"
+        e2e_manager.project_path(
+            f"tickets/{ticket_id}/attachments/{attachment_id}/content"
+        )
     )
     assert_error_contract(
         pending_download,
@@ -202,7 +210,9 @@ def test_attachment_rejection_name_safety_and_download_authorization(
         machine_codes={"attachment_not_clean"},
     )
     owner_download = owner.api.get_json(
-        f"/tickets/{ticket_id}/attachments/{attachment_id}/content"
+        e2e_manager.project_path(
+            f"tickets/{ticket_id}/attachments/{attachment_id}/content"
+        )
     )
     assert_error_contract(
         owner_download,
@@ -210,14 +220,18 @@ def test_attachment_rejection_name_safety_and_download_authorization(
         machine_codes={"ticket_access_denied"},
     )
     cross_download = other_customer.api.get_json(
-        f"/tickets/{ticket_id}/attachments/{attachment_id}/content"
+        e2e_manager.project_path(
+            f"tickets/{ticket_id}/attachments/{attachment_id}/content"
+        )
     )
     assert_error_contract(
         cross_download,
         403,
         machine_codes={"ticket_access_denied"},
     )
-    guessed = owner.api.get_json(f"/tickets/{ticket_id}/attachments/4294967295/content")
+    guessed = owner.api.get_json(
+        e2e_manager.project_path(f"tickets/{ticket_id}/attachments/4294967295/content")
+    )
     assert_error_contract(
         guessed,
         404,
@@ -238,7 +252,7 @@ def test_notifications_are_strictly_recipient_scoped(
     notification_b = e2e_manager.create_notification(customer_b.id, "recipient-b")
 
     forged_filter = customer_a.api.get_json(
-        "/notifications",
+        customer_a.api.project_path("notifications"),
         params={
             "page_size": 100,
             "filter": json.dumps(
@@ -259,7 +273,7 @@ def test_notifications_are_strictly_recipient_scoped(
     assert_no_sensitive_fields(a_items)
 
     b_list = customer_b.api.get_json(
-        "/notifications",
+        customer_b.api.project_path("notifications"),
         params={
             "page_size": 100,
             "filter": json.dumps({"q": e2e_manager.prefix}, ensure_ascii=False),
@@ -272,13 +286,13 @@ def test_notifications_are_strictly_recipient_scoped(
     assert notification_a["id"] not in b_ids
 
     cross_mark = customer_a.api.put_json(
-        f"/notifications/{notification_b['id']}/read",
+        customer_a.api.project_path(f"notifications/{notification_b['id']}/read"),
         {},
     )
     assert_error_contract(cross_mark, 403)
 
     still_unread = customer_b.api.get_json(
-        "/notifications",
+        customer_b.api.project_path("notifications"),
         params={
             "filter": json.dumps(
                 {"q": notification_b["title"], "is_read": False},

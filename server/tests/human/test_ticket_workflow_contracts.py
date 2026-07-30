@@ -70,7 +70,10 @@ def test_ticket_list_combines_status_priority_type_source_assignee_and_search(
         "search": marker,
         "page_size": 100,
     }
-    direct = admin.api.get_json("/tickets", params=common)
+    direct = admin.api.get_json(
+        e2e_manager.project_path("tickets"),
+        params=common,
+    )
     assert direct.status_code == 200, direct.text
     direct_ids = {
         item.get("id") for item in direct.json().get("data", {}).get("items", [])
@@ -78,7 +81,7 @@ def test_ticket_list_combines_status_priority_type_source_assignee_and_search(
     assert direct_ids == {matching["id"]}
 
     json_filter = admin.api.get_json(
-        "/tickets",
+        e2e_manager.project_path("tickets"),
         params={
             "filter": json.dumps(
                 {
@@ -101,7 +104,7 @@ def test_ticket_list_combines_status_priority_type_source_assignee_and_search(
     assert json_ids == {matching["id"]}
 
     excluded = admin.api.get_json(
-        "/tickets",
+        e2e_manager.project_path("tickets"),
         params={**common, "source": "email"},
     )
     assert excluded.status_code == 200, excluded.text
@@ -113,7 +116,7 @@ def _ticket_notifications(
     ticket_id: int,
 ) -> list[dict[str, Any]]:
     response = identity.api.get_json(
-        "/notifications",
+        identity.api.project_path("notifications"),
         params={
             "page_size": 100,
             "filter": f'{{"related_ticket_id":{ticket_id}}}',
@@ -170,14 +173,12 @@ def test_invalid_transition_is_a_versioned_conflict_with_allowed_next_states(
     details = body.get("details")
     assert isinstance(details, dict), body
     allowed = details.get("allowed_next_statuses")
-    assert set(allowed or []) == {
-        "in_progress",
-        "pending",
-        "resolved",
-        "cancelled",
-    }
+    # The published bootstrap workflow requires work to start before it can
+    # wait or resolve.  This assertion deliberately follows that immutable
+    # workflow version instead of the removed global lifecycle projection.
+    assert set(allowed or []) == {"in_progress", "cancelled"}
 
-    unchanged = admin.api.get_json(f"/tickets/{ticket['id']}")
+    unchanged = admin.api.get_json(e2e_manager.project_path(f"tickets/{ticket['id']}"))
     assert unchanged.status_code == 200, unchanged.text
     unchanged_ticket = unchanged.json().get("data", {})
     assert unchanged_ticket.get("status") == "open"
@@ -234,7 +235,9 @@ def test_transfer_updates_assignee_history_event_and_recipient_notification(
     )
     assert transferred.headers.get("ETag") == f'"v{transfer_data["version"]}"'
 
-    history_response = supervisor.api.get_json(f"/tickets/{ticket['id']}/history")
+    history_response = supervisor.api.get_json(
+        e2e_manager.project_path(f"tickets/{ticket['id']}/history")
+    )
     assert history_response.status_code == 200, history_response.text
     transfer_history = [
         item
@@ -270,7 +273,7 @@ def test_bulk_delete_reports_authorization_and_missing_items_without_silence(
 
     removed_legacy_shape = admin.api.request(
         "DELETE",
-        "/tickets/bulk-delete",
+        e2e_manager.project_path("tickets/bulk-delete"),
         json={"ids": [other["id"]]},
     )
     assert_error_contract(
@@ -278,12 +281,14 @@ def test_bulk_delete_reports_authorization_and_missing_items_without_silence(
         400,
         machine_codes={"invalid_request"},
     )
-    still_present = admin.api.get_json(f"/tickets/{other['id']}")
+    still_present = admin.api.get_json(
+        e2e_manager.project_path(f"tickets/{other['id']}")
+    )
     assert still_present.status_code == 200, still_present.text
 
     denied = customer.api.request(
         "DELETE",
-        "/tickets/bulk-delete",
+        e2e_manager.project_path("tickets/bulk-delete"),
         json={
             "tickets": [
                 {"id": owned["id"], "version": owned["version"]},
@@ -296,7 +301,7 @@ def test_bulk_delete_reports_authorization_and_missing_items_without_silence(
     missing_id = 4_294_967_295
     mixed = admin.api.request(
         "DELETE",
-        "/tickets/bulk-delete",
+        e2e_manager.project_path("tickets/bulk-delete"),
         json={
             "tickets": [
                 {"id": other["id"], "version": other["version"]},

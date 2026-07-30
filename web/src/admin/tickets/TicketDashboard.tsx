@@ -17,8 +17,6 @@ import {
   ListItemText,
   Skeleton,
   Stack,
-  ToggleButton,
-  ToggleButtonGroup,
   Typography,
   useTheme,
   type ChipProps,
@@ -33,6 +31,7 @@ import { alpha } from '@mui/material/styles'
 import { RatioRow } from '@/components/layout/RatioRow'
 import { API_BASE, localizedUnknownErrorMessage } from '@/lib/apiClient'
 import { isAgentRole, type RolePermissions } from '@/lib/accessControl'
+import { projectResourcePath } from '@/lib/projectScope'
 import {
   PieChart,
   Pie,
@@ -60,10 +59,6 @@ interface TicketStats {
   unassigned: number
   high_priority: number
   escalated: number
-  avg_first_response_minutes?: number
-  avg_resolution_minutes?: number
-  today_created?: number
-  today_resolved?: number
 }
 
 interface TicketItem {
@@ -94,8 +89,6 @@ const ticketPriorityLabels: Record<string, string> = {
   urgent: '紧急',
   critical: '严重',
 }
-
-type TimeRange = 'today' | 'yesterday' | '7d' | '30d'
 
 const containerSx = {
   width: '100%',
@@ -211,7 +204,6 @@ const TicketDashboard: React.FC = () => {
   const [urgentTickets, setUrgentTickets] = useState<TicketItem[]>([])
   const [recentTickets, setRecentTickets] = useState<TicketItem[]>([])
   const [myTickets, setMyTickets] = useState<TicketItem[]>([])
-  const [timeRange, setTimeRange] = useState<TimeRange>('7d')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
@@ -226,17 +218,17 @@ const TicketDashboard: React.FC = () => {
         const headers: HeadersInit = {
           Authorization: `Bearer ${localStorage.getItem('token') || ''}`,
         }
-        const query = `range=${timeRange}`
-
+        const ticketsPath = await projectResourcePath('tickets')
+        const ticketsURL = `${API_BASE}/${ticketsPath}`
         const [statsRes, urgentRes, recentRes, myRes] = await Promise.all([
-          fetch(`${API_BASE}/tickets/stats?${query}`, { headers, signal: controller.signal }),
-          fetch(`${API_BASE}/tickets?priority=urgent,critical&status=open,in_progress&page_size=10&${query}`, {
+          fetch(`${ticketsURL}/stats`, { headers, signal: controller.signal }),
+          fetch(`${ticketsURL}?priority=urgent,critical&status=open,in_progress&page_size=10`, {
             headers,
             signal: controller.signal,
           }),
-          fetch(`${API_BASE}/tickets?page_size=10&sort_by=created_at&sort_order=desc&${query}`, { headers, signal: controller.signal }),
+          fetch(`${ticketsURL}?page_size=10&sort_by=created_at&sort_order=desc`, { headers, signal: controller.signal }),
           isAgent
-            ? fetch(`${API_BASE}/tickets/my-tickets?limit=10&${query}`, { headers, signal: controller.signal })
+            ? fetch(`${ticketsURL}/my-tickets?limit=10`, { headers, signal: controller.signal })
             : Promise.resolve(null),
         ])
 
@@ -273,7 +265,7 @@ const TicketDashboard: React.FC = () => {
 
     fetchDashboard()
     return () => controller.abort()
-  }, [timeRange, refreshKey, isAgent])
+  }, [refreshKey, isAgent])
 
   const handleRefresh = () => setRefreshKey((key) => key + 1)
 
@@ -371,28 +363,28 @@ const TicketDashboard: React.FC = () => {
   const snapshotMetrics = useMemo(() => {
     return [
       {
-        label: '今日新增',
-        value: stats.today_created ?? 0,
+        label: '待处理',
+        value: stats.open,
         fill: theme.palette.primary.main,
       },
       {
-        label: '今日解决',
-        value: stats.today_resolved ?? 0,
+        label: '处理中',
+        value: stats.in_progress,
         fill: theme.palette.success.main,
       },
       {
-        label: '待回复(24h)',
-        value: stats.pending ?? 0,
+        label: '等待中',
+        value: stats.pending,
         fill: theme.palette.warning.main,
       },
       {
-        label: '首次响应(分)',
-        value: stats.avg_first_response_minutes ?? 0,
+        label: '已解决',
+        value: stats.resolved,
         fill: theme.palette.info.main,
       },
       {
-        label: '平均解决(分)',
-        value: stats.avg_resolution_minutes ?? 0,
+        label: '待分配',
+        value: stats.unassigned,
         fill: theme.palette.secondary.main,
       },
     ]
@@ -584,18 +576,6 @@ const TicketDashboard: React.FC = () => {
               alignItems: "center",
               justifyContent: "flex-end"
             }}>
-            <ToggleButtonGroup
-              size="small"
-              exclusive
-              value={timeRange}
-              onChange={(_, value: TimeRange | null) => value && setTimeRange(value)}
-              sx={{ flexWrap: 'wrap', gap: 1 }}
-            >
-              <ToggleButton value="today">今日</ToggleButton>
-              <ToggleButton value="yesterday">昨日</ToggleButton>
-              <ToggleButton value="7d">近 7 天</ToggleButton>
-              <ToggleButton value="30d">近 30 天</ToggleButton>
-            </ToggleButtonGroup>
             <Button startIcon={<RefreshIcon />} onClick={handleRefresh}>
               刷新
             </Button>
@@ -814,7 +794,7 @@ const TicketDashboard: React.FC = () => {
                   }}>
                     {stats.unassigned}
                   </Typography>
-                  <Button variant="contained" color="warning" onClick={() => handleNavigateToTickets({ assigned_to_id: null })}>
+                  <Button variant="contained" color="warning" onClick={() => handleNavigateToTickets({ unassigned: true })}>
                     快速分配
                   </Button>
                 </Stack>

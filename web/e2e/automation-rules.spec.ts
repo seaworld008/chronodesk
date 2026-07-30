@@ -4,6 +4,9 @@ import {
     cleanupE2EData,
     E2E_MARKER,
     extractData,
+    getAdminToken,
+    projectAPIPath,
+    resolveE2EProjectKey,
     trackE2EResource,
 } from './helpers/testData';
 import { assertDestructiveE2EAllowed } from './helpers/safety';
@@ -26,7 +29,13 @@ test.describe('Automation Rules', () => {
         });
     });
 
-    test('should create an automation rule', async ({ page }) => {
+    test('should create an automation rule', async ({ page, request }) => {
+        const token = await getAdminToken(request);
+        const projectKey = await resolveE2EProjectKey(request, token);
+        const automationRulesPath = projectAPIPath(
+            projectKey,
+            'admin/automation/rules',
+        );
         await authenticatePage(page, TEST_USER);
 
         await page.goto('/#/automation-rules');
@@ -68,7 +77,7 @@ test.describe('Automation Rules', () => {
             (response) =>
                 response.request().method() === 'POST' &&
                 new URL(response.url()).pathname ===
-                    '/api/admin/automation/rules',
+                    automationRulesPath,
         );
         await page.getByRole('button', { name: '保存' }).click();
         const createResponse = await create;
@@ -79,7 +88,8 @@ test.describe('Automation Rules', () => {
         expect(typeof created.id).toBe('number');
         trackE2EResource('automationRules', created.id as number);
 
-        await expect(page).toHaveURL(/#\/automation-rules/);
+        await page.getByRole('link', { name: '返回列表' }).click();
+        await expect(page).toHaveURL(/#\/automation-rules$/);
         await expect(page.getByText(ruleName)).toBeVisible({ timeout: 10000 });
     });
 });

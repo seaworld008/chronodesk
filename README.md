@@ -7,10 +7,12 @@
 [![CodeQL](https://github.com/seaworld008/chronodesk/actions/workflows/codeql.yml/badge.svg)](https://github.com/seaworld008/chronodesk/actions/workflows/codeql.yml)
 [![License](https://img.shields.io/github/license/seaworld008/chronodesk)](LICENSE)
 
-ChronoDesk is an AI-agent-native ticket automation platform for support and
-operations teams. Humans work in a Chinese enterprise console; external Agents
-use stable REST, MCP, or A2A Interfaces backed by the same authorization,
-concurrency, event, and audit semantics.
+ChronoDesk is an AI-agent-native ticket and task execution platform for teams
+that need trustworthy human-agent collaboration across support, IT service,
+SRE, security operations, internal services, and field operations. Humans work
+in a Chinese enterprise console; external Agents use stable REST, MCP, or A2A
+Interfaces backed by the same authorization, concurrency, event, and audit
+semantics.
 
 The project is a single-organization, self-hosted modular monolith. It does not
 embed an LLM, RAG system, prompt platform, or autonomous planner.
@@ -32,6 +34,71 @@ embed an LLM, RAG system, prompt platform, or autonomous planner.
   no-wrap/resizable tables, persisted widths, responsive navigation, SLA,
   automation, notifications, Webhooks, and Agent operations.
 
+## Use cases and industries
+
+ChronoDesk is broader than a traditional support desk. If work can be expressed
+as “intake → triage and assignment → execution → information gathering →
+review or escalation → completion,” a Ticket can coordinate humans, AI Agents,
+and enterprise systems in one auditable workflow.
+
+| Industry or team | Typical use cases |
+| --- | --- |
+| IT and software | Service desk, access requests, bugs, cloud resources, alerts, incidents, and changes |
+| Support, retail, and commerce | After-sales support, complaints, refunds, logistics exceptions, suppliers, and VIP escalation |
+| Manufacturing, energy, and facilities | Equipment faults, quality exceptions, inspections, repairs, spare parts, and maintenance records |
+| Finance, insurance, and professional services | Complaints, document checks, claims assistance, risk investigation, legal, and finance requests |
+| Healthcare, education, and public service | Equipment operations, administration, student or citizen requests, document routing, and supervision |
+| Data and content operations | Content review, data-quality issues, labeling tasks, and exception remediation |
+| Enterprise shared services | HR, administration, procurement, finance, compliance, and cross-team requests |
+
+ChronoDesk is a particularly good fit when:
+
+- status, ownership, and escalation paths are explicit, with SLA, notification,
+  and audit requirements;
+- AI must query and execute real operations instead of only drafting text;
+- multiple humans or Agents may work concurrently and need idempotency,
+  versions, and Ticket Leases;
+- automation must coexist with least privilege, policy, circuit breakers, and
+  human takeover.
+
+## Human-agent collaboration
+
+ChronoDesk supports several operating models, from assistance to policy-bound
+autonomy:
+
+1. **AI assists humans**: classify, summarize, complete fields, and recommend
+   assignees or replies while a human decides what to execute.
+2. **AI handles first, humans take over**: an Agent performs initial diagnosis
+   and escalates when confidence, information, or permission is insufficient.
+3. **AI acts autonomously within policy**: an Agent can claim a Ticket, add
+   comments, transition status, and release its lease. Scopes, policies,
+   limits, versions, leases, and circuit breakers constrain risk.
+4. **Humans supervise multiple Agents**: administrators inspect identities,
+   credentials, policy decisions, live leases, event delivery, and audit trails,
+   and can disable an Agent, enter read-only mode, or take over.
+5. **Agent-to-Agent collaboration**: MCP exposes Ticket tools while A2A carries
+   tasks, messages, status, and Artifacts. Every participant remains anchored
+   to the same business Ticket.
+
+```text
+Email / alert / human / external Agent creates a Ticket
+→ AI classifies, prioritizes, and claims it
+→ automation resolves it or requests more information
+→ low-risk operations complete within policy
+→ high-risk, exceptional, or low-confidence work escalates to a human
+→ completion, notification, and a reconstructable audit trail
+```
+
+### Current boundaries
+
+- The current deployment model is single-organization and self-hosted. Models,
+  RAG, and autonomous planning live in an external Agent platform.
+- ChronoDesk can coordinate exceptions produced by real-time control, clinical,
+  trading, or other specialist systems, but it does not replace those systems
+  or their professional decisions.
+- Multi-tenancy, billing, embedded models, knowledge retrieval, and outbound
+  delegation are later phases.
+
 ## Current protocol baseline
 
 ChronoDesk intentionally supports only the current protocol line:
@@ -50,7 +117,7 @@ There are no legacy MCP sessions, downgraded schemas, or old A2A method aliases.
 ```mermaid
 flowchart LR
     Users["Support teams"] --> Human["Human REST + WebSocket"]
-    Agents["External AI Agents"] --> REST["Agent REST /api/v1"]
+    Agents["External AI Agents"] --> REST["Agent REST /api/v2/projects/{projectKey}"]
     Agents --> MCP["MCP 2026-07-28"]
     Agents --> A2A["A2A 1.0"]
     Human --> Adapters["Protocol Adapters"]
@@ -83,7 +150,7 @@ Open:
 - Console: <http://localhost:3000>
 - Health: <http://localhost:8081/healthz>
 - OpenAPI: <http://localhost:8081/openapi.yaml>
-- Agent REST: <http://localhost:8081/api/v1>
+- Agent REST: `http://localhost:8081/api/v2/projects/{projectKey}`
 - MCP: <http://localhost:8081/mcp>
 - A2A Agent Card: <http://localhost:8081/.well-known/agent-card.json>
 

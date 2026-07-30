@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -199,5 +200,81 @@ func TestWebhookDeletionRetainsDeliveryAuditLog(t *testing.T) {
 	}
 	if logCount != 1 {
 		t.Fatalf("Webhook deletion retained %d logs, want 1", logCount)
+	}
+}
+
+func TestWebhookDeliverySnapshotIsAppendOnly(t *testing.T) {
+	db, err := gorm.Open(
+		sqlite.Open(fmt.Sprintf(
+			"file:%s?mode=memory&cache=shared",
+			t.Name(),
+		)),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(
+		&User{},
+		&WebhookConfig{},
+		&WebhookDeliverySnapshot{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	user := User{
+		Username:     "webhook-snapshot-owner",
+		Email:        "webhook-snapshot-owner@example.test",
+		PasswordHash: "hash",
+		Role:         RoleAdmin,
+		Status:       UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	config := WebhookConfig{
+		OrganizationID: 11,
+		ProjectID:      22,
+		Name:           "append-only",
+		Provider:       WebhookProviderCustom,
+		WebhookURL:     "https://old.example.test/events",
+		Status:         WebhookStatusActive,
+		EnabledEventsObj: []WebhookEventType{
+			WebhookEventTicketCreated,
+		},
+		RetryCount: 2,
+		CreatedBy:  user.ID,
+	}
+	if err := db.Create(&config).Error; err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := NewWebhookDeliverySnapshot(config, "event-append-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(snapshot).Error; err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := uuid.Parse(snapshot.ID)
+	if err != nil || parsed.Version() != 7 {
+		t.Fatalf("snapshot id %q is not UUIDv7: %v", snapshot.ID, err)
+	}
+
+	if err := db.Model(snapshot).
+		Update("webhook_url", "https://changed.example.test/events").Error; err == nil ||
+		!strings.Contains(err.Error(), "immutable") {
+		t.Fatalf("snapshot update error = %v, want immutable rejection", err)
+	}
+	if err := db.Delete(snapshot).Error; err == nil ||
+		!strings.Contains(err.Error(), "immutable") {
+		t.Fatalf("snapshot delete error = %v, want immutable rejection", err)
+	}
+
+	var retained WebhookDeliverySnapshot
+	if err := db.First(&retained, "id = ?", snapshot.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if retained.WebhookURL != config.WebhookURL ||
+		retained.EventID != "event-append-only" {
+		t.Fatalf("immutable snapshot changed: %+v", retained)
 	}
 }

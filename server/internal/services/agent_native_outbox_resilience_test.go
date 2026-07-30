@@ -242,6 +242,7 @@ func createOutboxResilienceEvent(
 		})
 	}
 	if _, err := service.createDomainEvent(
+		t,
 		context.Background(),
 		DomainEventInput{
 			Type:            "io.chronodesk.outbox.resilience.test.v1",

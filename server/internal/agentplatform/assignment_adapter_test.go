@@ -22,6 +22,9 @@ func TestAssignmentTargetErrorsMapConsistentlyAcrossMCPAndA2A(t *testing.T) {
 		StaticA2AIdentityResolver{Identity: A2AExecutionIdentity{
 			Actor:        models.ServicePrincipalActor(fixture.principal.ID),
 			CredentialID: fixture.credential.ID,
+			ProjectKey:   string(fixture.project.Key),
+			Scope:        fixture.project.Scope(),
+			TokenScopes:  fixture.principal.ScopeList(),
 		}},
 	)
 	if err != nil {
@@ -146,6 +149,9 @@ func TestMCPAndA2AAssignmentPersistIdenticalCanonicalValues(t *testing.T) {
 		StaticA2AIdentityResolver{Identity: A2AExecutionIdentity{
 			Actor:        models.ServicePrincipalActor(fixture.principal.ID),
 			CredentialID: fixture.credential.ID,
+			ProjectKey:   string(fixture.project.Key),
+			Scope:        fixture.project.Scope(),
+			TokenScopes:  fixture.principal.ScopeList(),
 		}},
 	)
 	if err != nil {
@@ -188,7 +194,7 @@ func TestMCPAndA2AAssignmentPersistIdenticalCanonicalValues(t *testing.T) {
 			mcpLease := seedAssignmentLease(t, fixture, mcpTicket)
 			a2aLease := seedAssignmentLease(t, fixture, a2aTicket)
 
-			if _, err := fixture.adapter.CallTool(ctx, fixture.actor, "ticket_assign", map[string]any{
+			if _, err := fixture.callTool(ctx, "ticket_assign", map[string]any{
 				"ticket_id":        int64(mcpTicket.ID),
 				"expected_version": int64(1),
 				"lease_id":         mcpLease.ID,

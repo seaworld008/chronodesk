@@ -22,6 +22,7 @@ type ReadPolicyBatch struct {
 	service       *AgentNativeService
 	principal     *models.ServicePrincipal
 	credentialID  string
+	projectScope  models.ProjectScope
 	policies      []models.AgentPolicy
 	summary       PolicyCheckInput
 	summaryReason string
@@ -29,6 +30,20 @@ type ReadPolicyBatch struct {
 
 	recordMu sync.Mutex
 	recorded bool
+}
+
+// RunProjectOperation gives protocol adapters a project-scoped database
+// boundary without exposing the service's root database handle. An existing
+// trusted boundary is reused; otherwise the OperationContext scope is applied
+// transaction-locally before project-owned reads or writes execute.
+func (s *AgentNativeService) RunProjectOperation(
+	ctx context.Context,
+	run func(context.Context) error,
+) error {
+	if s == nil {
+		return errors.New("Agent service is required")
+	}
+	return runProjectOperation(ctx, s.db, run)
 }
 
 // EvaluateReadAction performs a side-effect-free authorization check for
@@ -95,6 +110,10 @@ func (s *AgentNativeService) PrepareReadPolicyBatch(
 	if summary.IsWrite {
 		return nil, errors.New("read policy batch cannot authorize writes")
 	}
+	operation, err := readPolicyBatchOperation(ctx, summary)
+	if err != nil {
+		return nil, err
+	}
 
 	principal, principalErr := s.getUsablePrincipal(ctx, summary.ServicePrincipalID)
 	if principalErr != nil &&
@@ -138,6 +157,7 @@ func (s *AgentNativeService) PrepareReadPolicyBatch(
 		service:      s,
 		principal:    principal,
 		credentialID: summary.CredentialID,
+		projectScope: operation.Scope,
 		policies:     policies,
 		summary:      summary,
 	}
@@ -210,6 +230,15 @@ func (b *ReadPolicyBatch) recordDecision(
 	summaryContext map[string]any,
 	allowed bool,
 ) (*models.PolicyDecision, error) {
+	operation, err := readPolicyBatchOperation(ctx, b.summary)
+	if err != nil {
+		return nil, err
+	}
+	if operation.Scope != b.projectScope {
+		return nil, errors.New(
+			"read policy batch project scope does not match trusted operation context",
+		)
+	}
 	decisionContext := make(map[string]any)
 	for key, value := range b.summary.Context {
 		decisionContext[key] = value
@@ -224,6 +253,8 @@ func (b *ReadPolicyBatch) recordDecision(
 	decision := &models.PolicyDecision{
 		ID:                 newNativeID(),
 		CreatedAt:          b.service.now(),
+		OrganizationID:     operation.Scope.OrganizationID,
+		ProjectID:          operation.Scope.ProjectID,
 		ServicePrincipalID: b.summary.ServicePrincipalID,
 		CredentialID:       b.summary.CredentialID,
 		ActorType:          models.ActorTypeServicePrincipal,
@@ -241,10 +272,42 @@ func (b *ReadPolicyBatch) recordDecision(
 		SourceProtocol:     b.summary.SourceProtocol,
 		Context:            datatypes.JSON(contextJSON),
 	}
-	if err := b.service.db.WithContext(ctx).Create(decision).Error; err != nil {
+	if err := b.service.RunProjectOperation(
+		ctx,
+		func(scopedContext context.Context) error {
+			return b.service.dbForContext(scopedContext).
+				Create(decision).Error
+		},
+	); err != nil {
 		return nil, fmt.Errorf("persist policy decision: %w", err)
 	}
 	return decision, nil
+}
+
+func readPolicyBatchOperation(
+	ctx context.Context,
+	input PolicyCheckInput,
+) (OperationContext, error) {
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		return OperationContext{}, fmt.Errorf(
+			"read policy batch requires trusted operation context: %w",
+			err,
+		)
+	}
+	if operation.Actor !=
+		models.ServicePrincipalActor(input.ServicePrincipalID) {
+		return OperationContext{}, errors.New(
+			"read policy batch principal does not match trusted operation context",
+		)
+	}
+	if strings.TrimSpace(input.CredentialID) == "" ||
+		operation.CredentialID != input.CredentialID {
+		return OperationContext{}, errors.New(
+			"read policy batch credential does not match trusted operation context",
+		)
+	}
+	return operation, nil
 }
 
 func evaluateLoadedPolicies(

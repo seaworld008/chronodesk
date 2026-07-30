@@ -36,6 +36,69 @@ func NewAutomationHandler(
 	}, nil
 }
 
+// RegisterProjectRoutes mounts automation administration below the trusted
+// ProjectScopeMiddleware boundary. There is deliberately no global alias.
+func (h *AutomationHandler) RegisterProjectRoutes(projectGroup *gin.RouterGroup) {
+	automation := projectGroup.Group("/admin/automation")
+	automation.Use(h.requireProjectManager)
+
+	rules := automation.Group("/rules")
+	rules.POST("", h.CreateRule)
+	rules.GET("", h.GetRules)
+	rules.GET("/:id", h.GetRule)
+	rules.PUT("/:id", h.UpdateRule)
+	rules.DELETE("/:id", h.DeleteRule)
+	rules.GET("/:id/stats", h.GetRuleStats)
+
+	automation.GET("/logs", h.GetExecutionLogs)
+
+	sla := automation.Group("/sla")
+	sla.POST("", h.CreateSLAConfig)
+	sla.GET("", h.GetSLAConfigs)
+
+	templates := automation.Group("/templates")
+	templates.POST("", h.CreateTemplate)
+	templates.GET("", h.GetTemplates)
+	templates.GET("/:id", h.GetTemplate)
+
+	quickReplies := automation.Group("/quick-replies")
+	quickReplies.POST("", h.CreateQuickReply)
+	quickReplies.GET("", h.GetQuickReplies)
+	quickReplies.POST("/:id/use", h.UseQuickReply)
+}
+
+func (h *AutomationHandler) requireProjectManager(c *gin.Context) {
+	access, ok := ProjectAccessFromGin(c)
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+			"success": false,
+			"message": "未解析可信项目范围",
+			"error":   "project_scope_required",
+		})
+		return
+	}
+	operation, err := services.OperationContextFromContext(c.Request.Context())
+	if err != nil ||
+		operation.Scope != access.Scope ||
+		operation.Source != services.SourceProtocolHumanREST ||
+		operation.Actor != models.HumanActor(c.GetUint("user_id")) {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+			"success": false,
+			"message": "项目操作上下文无效",
+			"error":   "invalid_project_context",
+		})
+		return
+	}
+	if access.Role != models.ProjectRoleAdmin &&
+		access.Role != models.ProjectRoleManager {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+			"success": false,
+			"message": "仅项目管理员或经理可管理自动化",
+			"error":   "project_role_forbidden",
+		})
+	}
+}
+
 // AutomationRule 相关接口
 
 // CreateRule 创建自动化规则
@@ -50,7 +113,7 @@ func NewAutomationHandler(
 // @Failure 400 {object} map[string]interface{} "请求参数错误"
 // @Failure 401 {object} map[string]interface{} "未授权"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/rules [post]
+// @Router /api/projects/{projectKey}/admin/automation/rules [post]
 func (h *AutomationHandler) CreateRule(c *gin.Context) {
 	var req models.AutomationRuleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -104,7 +167,7 @@ func (h *AutomationHandler) CreateRule(c *gin.Context) {
 // @Success 200 {object} map[string]interface{} "成功"
 // @Failure 401 {object} map[string]interface{} "未授权"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/rules [get]
+// @Router /api/projects/{projectKey}/admin/automation/rules [get]
 func (h *AutomationHandler) GetRules(c *gin.Context) {
 	ruleType := strings.TrimSpace(c.Query("rule_type"))
 	triggerEvent := strings.TrimSpace(c.Query("trigger_event"))
@@ -163,7 +226,7 @@ func (h *AutomationHandler) GetRules(c *gin.Context) {
 // @Success 200 {object} map[string]interface{} "成功"
 // @Failure 404 {object} map[string]interface{} "规则不存在"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/rules/{id} [get]
+// @Router /api/projects/{projectKey}/admin/automation/rules/{id} [get]
 func (h *AutomationHandler) GetRule(c *gin.Context) {
 	ruleID, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {
@@ -214,7 +277,7 @@ func (h *AutomationHandler) GetRule(c *gin.Context) {
 // @Failure 400 {object} map[string]interface{} "请求参数错误"
 // @Failure 404 {object} map[string]interface{} "规则不存在"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/rules/{id} [put]
+// @Router /api/projects/{projectKey}/admin/automation/rules/{id} [put]
 func (h *AutomationHandler) UpdateRule(c *gin.Context) {
 	ruleID, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {
@@ -277,7 +340,7 @@ func (h *AutomationHandler) UpdateRule(c *gin.Context) {
 // @Success 200 {object} map[string]interface{} "成功"
 // @Failure 404 {object} map[string]interface{} "规则不存在"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/rules/{id} [delete]
+// @Router /api/projects/{projectKey}/admin/automation/rules/{id} [delete]
 func (h *AutomationHandler) DeleteRule(c *gin.Context) {
 	ruleID, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {
@@ -325,7 +388,7 @@ func (h *AutomationHandler) DeleteRule(c *gin.Context) {
 // @Success 200 {object} map[string]interface{} "成功"
 // @Failure 404 {object} map[string]interface{} "规则不存在"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/rules/{id}/stats [get]
+// @Router /api/projects/{projectKey}/admin/automation/rules/{id}/stats [get]
 func (h *AutomationHandler) GetRuleStats(c *gin.Context) {
 	ruleID, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {
@@ -377,7 +440,7 @@ func (h *AutomationHandler) GetRuleStats(c *gin.Context) {
 // @Param page_size query int false "页大小" default(20)
 // @Success 200 {object} map[string]interface{} "成功"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/logs [get]
+// @Router /api/projects/{projectKey}/admin/automation/logs [get]
 func (h *AutomationHandler) GetExecutionLogs(c *gin.Context) {
 	var ruleID, ticketID *uint
 	var success *bool
@@ -442,7 +505,7 @@ func (h *AutomationHandler) GetExecutionLogs(c *gin.Context) {
 // @Success 201 {object} map[string]interface{} "成功"
 // @Failure 400 {object} map[string]interface{} "请求参数错误"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/sla [post]
+// @Router /api/projects/{projectKey}/admin/automation/sla [post]
 func (h *AutomationHandler) CreateSLAConfig(c *gin.Context) {
 	var req models.SLAConfigRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -492,7 +555,7 @@ func (h *AutomationHandler) CreateSLAConfig(c *gin.Context) {
 // @Param page_size query int false "页大小" default(20)
 // @Success 200 {object} map[string]interface{} "成功"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/sla [get]
+// @Router /api/projects/{projectKey}/admin/automation/sla [get]
 func (h *AutomationHandler) GetSLAConfigs(c *gin.Context) {
 	var isActive *bool
 	if activeStr := c.Query("is_active"); activeStr != "" {
@@ -541,7 +604,7 @@ func (h *AutomationHandler) GetSLAConfigs(c *gin.Context) {
 // @Success 201 {object} map[string]interface{} "成功"
 // @Failure 400 {object} map[string]interface{} "请求参数错误"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/templates [post]
+// @Router /api/projects/{projectKey}/admin/automation/templates [post]
 func (h *AutomationHandler) CreateTemplate(c *gin.Context) {
 	var req models.TicketTemplateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -585,7 +648,7 @@ func (h *AutomationHandler) CreateTemplate(c *gin.Context) {
 // @Param page_size query int false "页大小" default(20)
 // @Success 200 {object} map[string]interface{} "成功"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/templates [get]
+// @Router /api/projects/{projectKey}/admin/automation/templates [get]
 func (h *AutomationHandler) GetTemplates(c *gin.Context) {
 	category := c.Query("category")
 	var isActive *bool
@@ -633,7 +696,7 @@ func (h *AutomationHandler) GetTemplates(c *gin.Context) {
 // @Success 200 {object} map[string]interface{} "成功"
 // @Failure 404 {object} map[string]interface{} "模板不存在"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/templates/{id} [get]
+// @Router /api/projects/{projectKey}/admin/automation/templates/{id} [get]
 func (h *AutomationHandler) GetTemplate(c *gin.Context) {
 	templateID, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {
@@ -684,7 +747,7 @@ func (h *AutomationHandler) GetTemplate(c *gin.Context) {
 // @Success 201 {object} map[string]interface{} "成功"
 // @Failure 400 {object} map[string]interface{} "请求参数错误"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/quick-replies [post]
+// @Router /api/projects/{projectKey}/admin/automation/quick-replies [post]
 func (h *AutomationHandler) CreateQuickReply(c *gin.Context) {
 	var req models.QuickReplyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -729,7 +792,7 @@ func (h *AutomationHandler) CreateQuickReply(c *gin.Context) {
 // @Param page_size query int false "页大小" default(20)
 // @Success 200 {object} map[string]interface{} "成功"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/quick-replies [get]
+// @Router /api/projects/{projectKey}/admin/automation/quick-replies [get]
 func (h *AutomationHandler) GetQuickReplies(c *gin.Context) {
 	category := c.Query("category")
 	keyword := c.Query("keyword")
@@ -779,7 +842,7 @@ func (h *AutomationHandler) GetQuickReplies(c *gin.Context) {
 // @Success 200 {object} map[string]interface{} "成功"
 // @Failure 404 {object} map[string]interface{} "快速回复不存在"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/automation/quick-replies/{id}/use [post]
+// @Router /api/projects/{projectKey}/admin/automation/quick-replies/{id}/use [post]
 func (h *AutomationHandler) UseQuickReply(c *gin.Context) {
 	replyID, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {

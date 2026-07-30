@@ -1,0 +1,11 @@
+generatorName: csharp
+inputSpec: ../../server/internal/openapi/openapi.yaml
+outputDir: dist/dotnet
+packageName: ChronoDesk.Client
+packageVersion: 0.1.0
+library: httpclient
+additionalProperties:
+  disallowAdditionalPropertiesIfNotPresent: false
+  hideGenerationTimestamp: true
+  nullableReferenceTypes: true
+  targetFramework: net8.0

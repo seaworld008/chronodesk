@@ -17,6 +17,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/a2a"
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
 	"github.com/seaworld008/chronodesk/server/internal/agentplatform"
+	asyncapiContract "github.com/seaworld008/chronodesk/server/internal/asyncapi"
 	"github.com/seaworld008/chronodesk/server/internal/auth"
 	"github.com/seaworld008/chronodesk/server/internal/config"
 	"github.com/seaworld008/chronodesk/server/internal/database"
@@ -24,6 +25,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/mcp"
 	"github.com/seaworld008/chronodesk/server/internal/middleware"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/observability"
 	openapiContract "github.com/seaworld008/chronodesk/server/internal/openapi"
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"github.com/seaworld008/chronodesk/server/internal/services"
@@ -37,6 +39,30 @@ func ginAdapter(handler func(auth.HTTPContext)) gin.HandlerFunc {
 		ctx := auth.NewGinHTTPContext(c)
 		handler(ctx)
 	}
+}
+
+func migrateAndEnableProjectRLS(cfg *config.Config) error {
+	migrationDB, closeMigration, err :=
+		database.OpenProjectMigrationDatabase(cfg)
+	if err != nil {
+		return err
+	}
+	var operationErr error
+	if err := database.RunMigrations(
+		migrationDB,
+		services.EnsureProjectScopeMigrationMembership,
+	); err != nil {
+		operationErr = fmt.Errorf("run database migrations: %w", err)
+	} else if err := database.EnableProjectRLS(migrationDB); err != nil {
+		operationErr = fmt.Errorf("enable and force project RLS: %w", err)
+	}
+	if closeErr := closeMigration(); closeErr != nil {
+		operationErr = errors.Join(
+			operationErr,
+			fmt.Errorf("close migration database: %w", closeErr),
+		)
+	}
+	return operationErr
 }
 
 // Run assembles and runs the ChronoDesk application until it receives a
@@ -54,6 +80,53 @@ func Run() error {
 	if err != nil {
 		log.Fatal("Failed to load config:", err)
 	}
+	traceSamplingRatio := cfg.Observability.TraceSamplingRatio
+	tracingRuntime, err := observability.NewTracingRuntime(
+		appContext,
+		observability.TracingConfig{
+			ServiceName:        "chronodesk",
+			ServiceVersion:     cfg.App.Version,
+			Environment:        cfg.Server.Environment,
+			OTLPHTTPEndpoint:   cfg.Observability.OTLPHTTPEndpoint,
+			OTLPHeaders:        cfg.Observability.OTLPHeaders,
+			AllowInsecureHTTP:  cfg.Observability.AllowInsecureHTTP,
+			TraceSamplingRatio: &traceSamplingRatio,
+		},
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize OpenTelemetry tracing: ", err)
+	}
+	restoreTelemetryGlobals := tracingRuntime.InstallGlobals()
+	defer restoreTelemetryGlobals()
+	defer func() {
+		shutdownContext, cancel := context.WithTimeout(
+			context.Background(),
+			10*time.Second,
+		)
+		defer cancel()
+		if err := tracingRuntime.Shutdown(shutdownContext); err != nil {
+			log.Printf("OpenTelemetry shutdown failed: %v", err)
+		}
+	}()
+	var httpMetrics *observability.HTTPMetrics
+	var metricsAuth *middleware.OperationalEndpointAuth
+	if cfg.Observability.MetricsEnabled {
+		httpMetrics, err = observability.NewHTTPMetrics(
+			observability.HTTPMetricsConfig{Namespace: "chronodesk"},
+		)
+		if err != nil {
+			log.Fatal("Failed to initialize Prometheus metrics: ", err)
+		}
+		metricsAuth, err = middleware.NewOperationalEndpointAuth(
+			cfg.Observability.MetricsBearerToken,
+			cfg.Server.Environment == "development" &&
+				cfg.Observability.MetricsBearerToken == "",
+		)
+		if err != nil {
+			log.Fatal("Failed to secure Prometheus metrics: ", err)
+		}
+	}
+	cfg.Observability.MetricsBearerToken = ""
 
 	// 生产环境强制 release；其他环境尊重已校验的 GIN_MODE，便于在
 	// 云集成测试中关闭路由和 SQL 调试噪声。
@@ -68,23 +141,29 @@ func Run() error {
 		log.Fatalf("Unsupported GIN_MODE %q", ginMode)
 	}
 
-	// 初始化数据库
-	db, err := database.New(cfg)
-	if err != nil {
-		log.Fatal("Failed to connect to database:", err)
-	}
-	defer db.Close()
-
-	// 可选的数据库迁移（通过环境变量控制）
+	// DDL 只使用短生命周期迁移角色；应用进程随后仅保留显式配置的
+	// least-privilege runtime 连接，禁止 owner/BYPASSRLS 身份接收流量。
 	if os.Getenv("AUTO_MIGRATE") == "true" {
 		log.Println("Starting database migration...")
-		if err := database.RunMigrations(db.DB); err != nil {
-			log.Fatal("Failed to run database migrations:", err)
+		if err := migrateAndEnableProjectRLS(cfg); err != nil {
+			log.Fatal("Failed to prepare project database: ", err)
 		}
-		log.Println("Database migration completed")
+		log.Println("Database migration and FORCE RLS cutover completed")
 	} else {
-		log.Println("Skipping database migration (set AUTO_MIGRATE=true to enable)")
+		log.Println(
+			"Skipping database migration; runtime startup will require pre-enabled FORCE RLS",
+		)
 	}
+	// Do not retain the privileged DSN in the live configuration after the
+	// short migration phase.
+	cfg.Database.MigrationURL = ""
+
+	db, err := database.NewProjectRuntime(cfg)
+	if err != nil {
+		log.Fatal("Failed to initialize least-privilege database runtime: ", err)
+	}
+	cfg.Database.RuntimeURL = ""
+	defer db.Close()
 	if err := database.ValidateRuntimeSchema(db.DB); err != nil {
 		log.Fatal("Database schema validation failed: ", err)
 	}
@@ -98,7 +177,7 @@ func Run() error {
 		context.Background(),
 		30*time.Second,
 	)
-	if err := security.ValidateDatabaseSecrets(
+	if err := security.ValidateRuntimeDatabaseSecrets(
 		secretValidationContext,
 		db.DB,
 		secretProtector,
@@ -127,6 +206,10 @@ func Run() error {
 	if err != nil {
 		log.Fatal("Failed to initialize distributed Agent execution guard: ", err)
 	}
+	auditLedger, err := services.NewAuditLedgerService(db.DB)
+	if err != nil {
+		log.Fatal("Failed to initialize project audit ledger: ", err)
+	}
 	nativeService := services.NewAgentNativeService(db.DB, services.AgentNativeOptions{
 		CredentialPepper:                 []byte(cfg.Agent.CredentialPepper),
 		EventSource:                      strings.TrimRight(cfg.Agent.Issuer, "/") + "/events",
@@ -136,6 +219,7 @@ func Run() error {
 		LoopThreshold:                    cfg.Agent.LoopThreshold,
 		LoopWindow:                       cfg.Agent.LoopWindow,
 		ExecutionGuard:                   executionGuard,
+		AuditLedger:                      auditLedger,
 		RequireDistributedExecutionGuard: true,
 		DefaultOutboxTargets: []services.OutboxTarget{
 			{Type: "event_stream", ID: "default", MaxAttempts: 8},
@@ -157,7 +241,172 @@ func Run() error {
 	if err != nil {
 		log.Fatal("Failed to load persisted Agent safety controls: ", err)
 	}
-	credentialStore := agentplatform.NewCredentialStore(nativeService)
+	projectService, err := services.NewProjectService(db.DB, nativeService)
+	if err != nil {
+		log.Fatal("Failed to initialize project service: ", err)
+	}
+	crossProjectWorkbenchService, err :=
+		services.NewCrossProjectWorkbenchService(db.DB)
+	if err != nil {
+		log.Fatal("Failed to initialize cross-project workbench: ", err)
+	}
+	projectConfigurationService, err := services.NewProjectConfigurationService(
+		db.DB,
+		nativeService,
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize project configuration service: ", err)
+	}
+	if err := projectConfigurationService.BootstrapActiveProjects(appContext); err != nil {
+		log.Fatal("Failed to bootstrap active project configuration: ", err)
+	}
+	agentCollaborationService, err := services.NewAgentCollaborationService(
+		db.DB,
+		nativeService,
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize Agent collaboration service: ", err)
+	}
+	agentCollaborationQueries, err := services.NewAgentCollaborationQueryService(
+		db.DB,
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize Agent collaboration queries: ", err)
+	}
+	knowledgeAccessResolver, err := services.NewProjectKnowledgeAccessResolver(
+		db.DB,
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize project knowledge access: ", err)
+	}
+	var knowledgeSearchIndex services.HybridSearchIndex
+	if strings.TrimSpace(cfg.Knowledge.OpenSearchURL) != "" {
+		openSearchIndex, indexErr := services.NewOpenSearchKnowledgeIndex(
+			services.OpenSearchKnowledgeIndexOptions{
+				Endpoint:          cfg.Knowledge.OpenSearchURL,
+				IndexPrefix:       cfg.Knowledge.OpenSearchIndexPrefix,
+				SearchPipeline:    cfg.Knowledge.OpenSearchPipeline,
+				VectorDimension:   cfg.Knowledge.OpenSearchVectorSize,
+				AllowInsecureHTTP: cfg.Knowledge.OpenSearchAllowInsecure,
+			},
+		)
+		if indexErr != nil {
+			log.Fatal("Failed to initialize OpenSearch knowledge index: ", indexErr)
+		}
+		indexContext, cancelIndex := context.WithTimeout(
+			appContext,
+			30*time.Second,
+		)
+		indexErr = openSearchIndex.EnsureSearchPipeline(indexContext)
+		cancelIndex()
+		if indexErr != nil {
+			log.Fatal("Failed to initialize OpenSearch search pipeline: ", indexErr)
+		}
+		knowledgeSearchIndex = openSearchIndex
+	}
+	knowledgeModelProviders := map[string]services.ModelProvider{}
+	if strings.TrimSpace(cfg.Knowledge.ModelGatewayURL) != "" {
+		modelGatewayProvider, providerErr :=
+			services.NewHTTPModelGatewayProvider(
+				services.HTTPModelGatewayProviderConfig{
+					ProviderKey:      cfg.Knowledge.ModelGatewayProviderKey,
+					Endpoint:         cfg.Knowledge.ModelGatewayURL,
+					IsExternal:       cfg.Knowledge.ModelGatewayExternal,
+					Timeout:          2 * time.Minute,
+					MaxRequestBytes:  8 << 20,
+					MaxResponseBytes: 16 << 20,
+					EmbeddingDimensions: cfg.Knowledge.
+						OpenSearchVectorSize,
+				},
+				nil,
+				services.ModelGatewayAuthorizerFunc(
+					func(
+						context.Context,
+						services.ModelGatewayAuthorizationInput,
+					) (http.Header, error) {
+						// Deployment authentication may be enforced by mTLS
+						// or an authenticated private Relay. Project/user
+						// content can never influence these headers.
+						return make(http.Header), nil
+					},
+				),
+			)
+		if providerErr != nil {
+			log.Fatal("Failed to initialize model Gateway provider: ", providerErr)
+		}
+		knowledgeModelProviders[cfg.Knowledge.ModelGatewayProviderKey] =
+			modelGatewayProvider
+	}
+	knowledgeService, err := services.NewKnowledgeService(
+		db.DB,
+		services.KnowledgeServiceDependencies{
+			SearchIndex:    knowledgeSearchIndex,
+			AccessResolver: knowledgeAccessResolver,
+			ModelProviders: knowledgeModelProviders,
+		},
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize project knowledge service: ", err)
+	}
+	defer func() {
+		for _, keySet := range cfg.Integration.HMACKeys {
+			clear(keySet.Current)
+			clear(keySet.Previous)
+		}
+	}()
+	integrationKeyResolver := services.IntegrationVerificationKeyResolverFunc(
+		func(
+			_ context.Context,
+			reference string,
+		) (services.IntegrationVerificationKeySet, error) {
+			keySet, exists := cfg.Integration.HMACKeys[strings.TrimSpace(
+				reference,
+			)]
+			if !exists {
+				return services.IntegrationVerificationKeySet{},
+					services.ErrIntegrationVerificationKeyUnavailable
+			}
+			return services.IntegrationVerificationKeySet{
+				Current:  append([]byte(nil), keySet.Current...),
+				Previous: append([]byte(nil), keySet.Previous...),
+			}, nil
+		},
+	)
+	integrationVerifier, err := services.NewIntegrationHMACSHA256Verifier(
+		integrationKeyResolver,
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize integration signature verifier: ", err)
+	}
+	integrationRuntime, err := services.NewDeclarativeIntegrationRuntime(
+		nativeService,
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize integration command runtime: ", err)
+	}
+	integrationInboxService, err := services.NewIntegrationInboxService(
+		services.IntegrationInboxServiceOptions{
+			DB:                db.DB,
+			SignatureVerifier: integrationVerifier,
+			CommandHandler:    integrationRuntime,
+			DryRunner:         integrationRuntime,
+		},
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize integration Inbox: ", err)
+	}
+	integrationManagementService, err :=
+		services.NewIntegrationManagementService(
+			db.DB,
+			integrationInboxService,
+		)
+	if err != nil {
+		log.Fatal("Failed to initialize integration management service: ", err)
+	}
+	credentialStore := agentplatform.NewCredentialStore(
+		nativeService,
+		projectService,
+	)
 	mcpTokens := agentauth.NewManager(
 		cfg.Agent.JWTSecret,
 		cfg.Agent.Issuer,
@@ -292,7 +541,22 @@ func Run() error {
 	if err := r.SetTrustedProxies(trustedProxies); err != nil {
 		log.Fatal("Failed to configure trusted proxies: ", err)
 	}
+	r.Use(
+		middleware.TracingMiddleware(middleware.TelemetryConfig{
+			TracerProvider: tracingRuntime.TracerProvider(),
+			Propagator:     tracingRuntime.Propagator(),
+		}),
+		middleware.HTTPMetricsMiddleware(httpMetrics),
+	)
+	if httpMetrics != nil {
+		r.GET(
+			"/metrics",
+			metricsAuth.Middleware(),
+			middleware.PrometheusHandler(httpMetrics),
+		)
+	}
 	openapiContract.RegisterRoutes(r)
+	asyncapiContract.RegisterRoutes(r)
 
 	// 设置中间件配置
 	var middlewareConfig *middleware.MiddlewareConfig
@@ -380,6 +644,12 @@ func Run() error {
 	}))
 	// 应用基础中间件（不包含JWT）
 	r.Use(middleware.WrapGinMiddlewares(middleware.SetupMiddlewares(middlewareConfig))...)
+	integrationInboundHandler := handlers.NewIntegrationInboundHandler(
+		integrationInboxService,
+	)
+	integrationInboundRoutes := r.Group("")
+	integrationInboundRoutes.Use(anonymousIPRateLimit)
+	integrationInboundHandler.RegisterRoutes(integrationInboundRoutes)
 
 	// 健康检查端点
 	r.GET("/healthz", func(c *gin.Context) {
@@ -435,15 +705,16 @@ func Run() error {
 	r.POST(
 		a2a.RPCPath,
 		a2aTokens.Middleware(models.ScopeTasksManage),
-		agentplatform.BindA2AIdentity(),
+		agentplatform.BindA2AIdentityWithProject(projectService),
 		a2aPrincipalRateLimit,
 		a2aCredentialRateLimit,
 		agentplatform.A2ARequestPolicyMiddleware(nativeService, a2aServer.Service()),
 		a2aServer.RPCHandler(),
 	)
 
-	// /api/v1 是面向 Agent 的稳定机器契约；/api 是浏览器管理端的人类 REST 接口。
-	apiV1 := r.Group("/api/v1")
+	// Agent REST 只暴露项目显式 v2；浏览器管理端继续使用独立的人类
+	// REST Adapter。旧 /api/v1 不注册，不提供隐式项目兼容层。
+	agentProjectAPI := r.Group("/api/v2/projects/:projectKey")
 	agentAPI := agentplatform.NewAPIHandler(
 		db.DB,
 		nativeService,
@@ -451,7 +722,7 @@ func Run() error {
 		cfg.Agent.MaxAttachmentBytes,
 		mcpPublisher,
 	)
-	agentAPI.RegisterRoutes(apiV1)
+	agentAPI.RegisterRoutes(agentProjectAPI)
 	agentAdmin := agentplatform.NewAdminHandler(
 		db.DB,
 		nativeService,
@@ -459,12 +730,6 @@ func Run() error {
 		cfg.Agent.CredentialTTL,
 		[]byte(cfg.Agent.CredentialPepper),
 	)
-	agentAdminRoutes := apiV1.Group("/admin")
-	agentAdminRoutes.Use(ginAdapter(authModule.Handler.RequireAuth))
-	agentAdminRoutes.Use(authenticatedRateLimit)
-	agentAdminRoutes.Use(ginAdapter(authModule.Handler.RequireRole(auth.RoleAdmin)))
-	agentAdminRoutes.Use(middleware.LogAdminOperation(adminAuditService))
-	agentAdmin.RegisterRoutes(agentAdminRoutes)
 
 	// API 路由组
 	api := r.Group("/api")
@@ -499,26 +764,87 @@ func Run() error {
 			}
 		}
 
-		// 工单路由
+		// 普通跨项目工作台始终按当前 human 的显式项目成员关系收敛；
+		// 平台管理员也不会在该入口获得隐式全局工单视图。
+		crossProjectWorkbenchHandler :=
+			handlers.NewCrossProjectWorkbenchHandler(
+				crossProjectWorkbenchService,
+			)
+		workbench := api.Group("/workbench")
+		workbench.Use(ginAdapter(authModule.Handler.RequireAuth))
+		workbench.Use(authenticatedRateLimit)
+		workbench.GET("/tickets", crossProjectWorkbenchHandler.ListTickets)
+
+		// 项目是所有工单、配置与集成资源的唯一运行边界。
+		projectHandler := handlers.NewProjectHandler(projectService)
+		projects := api.Group("/projects")
+		projects.Use(ginAdapter(authModule.Handler.RequireAuth))
+		projects.Use(authenticatedRateLimit)
+		projects.GET("", projectHandler.List)
+		projects.POST(
+			"",
+			ginAdapter(authModule.Handler.RequireRole(auth.RoleAdmin)),
+			projectHandler.Create,
+		)
+		agentAdminRoutes := projects.Group("/:projectKey/admin/agents")
+		agentAdminRoutes.Use(
+			ginAdapter(authModule.Handler.RequireRole(auth.RoleAdmin)),
+		)
+		agentAdminRoutes.Use(middleware.LogAdminOperation(adminAuditService))
+		agentAdminRoutes.Use(
+			handlers.ProjectScopeMiddleware(projectService, db.DB),
+		)
+		agentAdmin.RegisterRoutes(agentAdminRoutes)
+		projectScoped := projects.Group("/:projectKey")
+		projectScoped.Use(handlers.ProjectScopeMiddleware(projectService, db.DB))
+		projectScoped.GET("/context", projectHandler.Current)
+		projectScoped.GET("/queues", projectHandler.ListQueues)
+		projectScoped.GET("/memberships", projectHandler.ListMemberships)
+		projectScoped.POST("/memberships", projectHandler.UpsertMembership)
+		projectScoped.DELETE(
+			"/memberships/:userID",
+			projectHandler.DeactivateMembership,
+		)
+		projectConfigurationHandler := handlers.NewProjectConfigurationHandler(
+			projectConfigurationService,
+		)
+		projectConfigurationHandler.RegisterRoutes(projectScoped)
+		automationHandler, err := handlers.NewAutomationHandler(
+			automationService,
+			schedulerService,
+		)
+		if err != nil {
+			log.Fatal("Failed to initialize automation handler: ", err)
+		}
+		automationHandler.RegisterProjectRoutes(projectScoped)
+		agentCollaborationHandler := handlers.NewAgentCollaborationHandler(
+			agentCollaborationQueries,
+			agentCollaborationService,
+		)
+		agentCollaborationHandler.RegisterRoutes(projectScoped)
+		knowledgeHandler := handlers.NewKnowledgeHandler(knowledgeService)
+		knowledgeHandler.RegisterRoutes(projectScoped)
+		integrationHandler := handlers.NewIntegrationHandler(
+			integrationManagementService,
+		)
+		integrationHandler.RegisterRoutes(projectScoped)
+
+		// 项目级工单路由
 		categoryHandler := handlers.NewCategoryHandler(db.DB)
-		categories := api.Group("/categories")
-		categories.Use(ginAdapter(authModule.Handler.RequireAuth))
-		categories.Use(authenticatedRateLimit)
+		categories := projectScoped.Group("/categories")
 		{
 			categories.GET("", categoryHandler.List)
 			categories.GET("/:id", categoryHandler.Get)
 		}
 
 		assigneeHandler := handlers.NewAssigneeHandler(db.DB)
-		assignees := api.Group("/assignees")
-		assignees.Use(ginAdapter(authModule.Handler.RequireAuth))
-		assignees.Use(authenticatedRateLimit)
+		assignees := projectScoped.Group("/assignees")
 		{
 			assignees.GET("", assigneeHandler.List)
 			assignees.GET("/:id", assigneeHandler.Get)
 		}
 
-		tickets := api.Group("/tickets")
+		tickets := projectScoped.Group("/tickets")
 		{
 			// 创建工单服务和处理器
 			cacheTTL := getTicketStatsCacheTTL()
@@ -539,10 +865,21 @@ func Run() error {
 				nativeService,
 				cfg.Agent.MaxAttachmentBytes,
 			)
-
-			// 所有工单路由都需要认证
-			tickets.Use(ginAdapter(authModule.Handler.RequireAuth))
-			tickets.Use(authenticatedRateLimit)
+			relationshipService, err :=
+				services.NewTicketRelationshipService(
+					db.DB,
+					nativeService,
+				)
+			if err != nil {
+				log.Fatal(
+					"Failed to initialize Ticket relationship service: ",
+					err,
+				)
+			}
+			handlers.NewTicketRelationshipHandler(
+				relationshipService,
+				ticketService,
+			).RegisterRoutes(projectScoped)
 
 			// 基础工单CRUD路由
 			tickets.GET("", ticketHandler.GetTickets)                       // 获取工单列表
@@ -656,53 +993,6 @@ func Run() error {
 				analytics.GET("/realtime", analyticsHandler.GetRealtimeMetrics) // 获取实时指标
 			}
 
-			// FE008 自动化流程管理路由
-			automationHandler, err := handlers.NewAutomationHandler(
-				automationService,
-				schedulerService,
-			)
-			if err != nil {
-				log.Fatal("Failed to initialize automation handler: ", err)
-			}
-			automation := admin.Group("/automation")
-			{
-				// 自动化规则管理
-				rules := automation.Group("/rules")
-				{
-					rules.POST("", automationHandler.CreateRule)            // 创建自动化规则
-					rules.GET("", automationHandler.GetRules)               // 获取规则列表
-					rules.GET("/:id", automationHandler.GetRule)            // 获取规则详情
-					rules.PUT("/:id", automationHandler.UpdateRule)         // 更新规则
-					rules.DELETE("/:id", automationHandler.DeleteRule)      // 删除规则
-					rules.GET("/:id/stats", automationHandler.GetRuleStats) // 获取规则统计
-				}
-
-				// 执行日志查询
-				automation.GET("/logs", automationHandler.GetExecutionLogs) // 获取执行日志
-
-				// SLA配置管理
-				sla := automation.Group("/sla")
-				{
-					sla.POST("", automationHandler.CreateSLAConfig) // 创建SLA配置
-					sla.GET("", automationHandler.GetSLAConfigs)    // 获取SLA配置列表
-				}
-
-				// 工单模板管理
-				templates := automation.Group("/templates")
-				{
-					templates.POST("", automationHandler.CreateTemplate) // 创建工单模板
-					templates.GET("", automationHandler.GetTemplates)    // 获取模板列表
-					templates.GET("/:id", automationHandler.GetTemplate) // 获取模板详情
-				}
-
-				// 快速回复管理
-				quickReplies := automation.Group("/quick-replies")
-				{
-					quickReplies.POST("", automationHandler.CreateQuickReply)      // 创建快速回复
-					quickReplies.GET("", automationHandler.GetQuickReplies)        // 获取快速回复列表
-					quickReplies.POST("/:id/use", automationHandler.UseQuickReply) // 使用快速回复
-				}
-			}
 		}
 
 		// 通知系统服务和处理器
@@ -755,45 +1045,101 @@ func Run() error {
 
 		// 设置全局WebSocket通知服务以供hook使用
 		websocketPkg.SetGlobalNotificationService(wsNotificationService)
-		websocketPkg.SetNotificationReadHandler(func(ctx context.Context, userID uint, notificationID uint) (int64, error) {
-			if err := notificationService.MarkAsRead(ctx, notificationID, userID); err != nil {
+		websocketPkg.SetNotificationReadHandler(func(
+			ctx context.Context,
+			scope models.ProjectScope,
+			userID uint,
+			notificationID uint,
+		) (int64, error) {
+			// WebSocket 连接可能长于一次成员授权。每次写入前重新校验
+			// 当前用户仍是项目成员（平台管理员除外），再构造可信操作上下文。
+			var authorized int64
+			if err := db.DB.WithContext(ctx).
+				Table("projects").
+				Joins("JOIN users ON users.id = ?", userID).
+				Joins(
+					"LEFT JOIN project_memberships ON project_memberships.project_id = projects.id AND project_memberships.user_id = users.id AND project_memberships.is_active = ?",
+					true,
+				).
+				Where(
+					"projects.id = ? AND projects.organization_id = ? AND projects.status = ? AND users.status = ? AND (project_memberships.id IS NOT NULL OR users.role = ?)",
+					scope.ProjectID,
+					scope.OrganizationID,
+					models.ProjectStatusActive,
+					models.UserStatusActive,
+					models.RoleAdmin,
+				).
+				Count(&authorized).Error; err != nil {
+				return 0, fmt.Errorf("revalidate WebSocket project access: %w", err)
+			}
+			if authorized != 1 {
+				return 0, services.ErrProjectAccessDenied
+			}
+			operationContext, err := services.WithOperationContext(
+				ctx,
+				services.OperationContext{
+					Scope:  scope,
+					Actor:  models.HumanActor(userID),
+					Source: services.SourceProtocolHumanREST,
+				},
+			)
+			if err != nil {
 				return 0, err
 			}
-			return notificationService.GetUnreadCount(ctx, userID)
+			if err := notificationService.MarkAsRead(
+				operationContext,
+				notificationID,
+				userID,
+			); err != nil {
+				return 0, err
+			}
+			return notificationService.GetUnreadCount(operationContext, userID)
 		})
 
-		// 管理员通知管理路由
-		admin.POST("/notifications", notificationHandler.CreateNotification)       // 创建通知（管理员）
-		admin.DELETE("/notifications/:id", notificationHandler.DeleteNotification) // 删除通知（管理员）
-
-		// 通知系统路由（需要认证）
-		notifications := api.Group("/notifications")
-		notifications.Use(ginAdapter(authModule.Handler.RequireAuth))
-		notifications.Use(authenticatedRateLimit)
+		// 通知属于项目数据，读写必须经过显式项目路径与同一 RLS 事务。
+		notifications := projectScoped.Group("/notifications")
 		{
-			notifications.GET("", notificationHandler.GetNotifications)                          // 获取通知列表
-			notifications.PUT("/:id/read", notificationHandler.MarkAsRead)                       // 标记单个通知为已读
-			notifications.PUT("/read-all", notificationHandler.MarkAllAsRead)                    // 标记所有通知为已读
-			notifications.GET("/unread-count", notificationHandler.GetUnreadCount)               // 获取未读通知数量
-			notifications.GET("/preferences", notificationHandler.GetNotificationPreferences)    // 获取通知偏好设置
-			notifications.PUT("/preferences", notificationHandler.UpdateNotificationPreferences) // 更新通知偏好设置
+			notifications.GET("", notificationHandler.GetNotifications)            // 获取通知列表
+			notifications.POST("", notificationHandler.CreateNotification)         // 项目管理员或经理创建通知
+			notifications.DELETE("/:id", notificationHandler.DeleteNotification)   // 项目管理员删除通知
+			notifications.PUT("/:id/read", notificationHandler.MarkAsRead)         // 标记单个通知为已读
+			notifications.PUT("/read-all", notificationHandler.MarkAllAsRead)      // 标记所有通知为已读
+			notifications.GET("/unread-count", notificationHandler.GetUnreadCount) // 获取未读通知数量
 		}
 
-		// WebSocket 连接端点 (需要认证)
-		api.GET(
-			"/ws",
-			ginAdapter(authModule.Handler.RequireAuth),
-			authenticatedRateLimit,
-			func(c *gin.Context) {
-				websocketPkg.ServeWS(wsHub, c)
-			},
-		)
+		// 通知偏好是用户级设置，不属于任一项目，使用独立的显式资源路径。
+		notificationPreferences := api.Group("/notification-preferences")
+		notificationPreferences.Use(ginAdapter(authModule.Handler.RequireAuth))
+		notificationPreferences.Use(authenticatedRateLimit)
+		{
+			notificationPreferences.GET("", notificationHandler.GetNotificationPreferences)
+			notificationPreferences.PUT("", notificationHandler.UpdateNotificationPreferences)
+		}
 
-		// Webhook管理路由（需要管理员权限）
-		webhooks := api.Group("/webhooks")
-		webhooks.Use(ginAdapter(authModule.Handler.RequireAuth))
-		webhooks.Use(authenticatedRateLimit)
-		webhooks.Use(ginAdapter(authModule.Handler.RequireRole(auth.RoleAdmin)))
+		// WebSocket 同样要求显式项目路径；连接建立前重新解析成员授权，
+		// 且不使用会缓冲响应的项目事务中间件（HTTP Upgrade 需要 Hijacker）。
+		projects.GET("/:projectKey/ws", func(c *gin.Context) {
+			access, err := projectService.ResolveHumanProject(
+				c.Request.Context(),
+				c.Param("projectKey"),
+				c.GetUint("user_id"),
+				strings.EqualFold(
+					strings.TrimSpace(c.GetString("user_role")),
+					string(models.RoleAdmin),
+				),
+			)
+			if err != nil {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+					"code": "project_access_denied",
+					"msg":  "无权访问该项目",
+				})
+				return
+			}
+			websocketPkg.ServeWS(wsHub, c, access.Scope)
+		})
+
+		// Webhook 是项目级出站连接，不再保留全局隐式项目路由。
+		webhooks := projectScoped.Group("/webhooks")
 		webhooks.Use(middleware.LogAdminOperation(adminAuditService))
 		{
 			// 创建Webhook处理器

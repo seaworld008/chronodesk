@@ -1,6 +1,7 @@
 package models
 
 import (
+	"fmt"
 	"time"
 
 	"gorm.io/datatypes"
@@ -32,47 +33,6 @@ func (s TicketStatus) IsValid() bool {
 	default:
 		return false
 	}
-}
-
-// CanTransitionTo centralizes the ticket lifecycle used by API and UI workflows.
-func (s TicketStatus) CanTransitionTo(next TicketStatus) bool {
-	if s == next {
-		return true
-	}
-
-	switch s {
-	case TicketStatusOpen:
-		return next == TicketStatusInProgress || next == TicketStatusPending || next == TicketStatusResolved || next == TicketStatusCancelled
-	case TicketStatusInProgress:
-		return next == TicketStatusPending || next == TicketStatusResolved || next == TicketStatusCancelled
-	case TicketStatusPending:
-		return next == TicketStatusInProgress || next == TicketStatusResolved || next == TicketStatusCancelled
-	case TicketStatusResolved:
-		return next == TicketStatusClosed || next == TicketStatusOpen
-	case TicketStatusCancelled:
-		return next == TicketStatusOpen
-	default:
-		return false
-	}
-}
-
-// AllowedTransitions returns the next workflow states in stable API order.
-func (s TicketStatus) AllowedTransitions() []TicketStatus {
-	candidates := []TicketStatus{
-		TicketStatusOpen,
-		TicketStatusInProgress,
-		TicketStatusPending,
-		TicketStatusResolved,
-		TicketStatusClosed,
-		TicketStatusCancelled,
-	}
-	allowed := make([]TicketStatus, 0, len(candidates))
-	for _, candidate := range candidates {
-		if candidate != s && s.CanTransitionTo(candidate) {
-			allowed = append(allowed, candidate)
-		}
-	}
-	return allowed
 }
 
 // TicketPriority 工单优先级枚举
@@ -179,12 +139,22 @@ type AgentContext struct {
 // Ticket 工单模型
 type Ticket struct {
 	ID        uint           `json:"id" gorm:"primaryKey;autoIncrement"`
+	PublicID  string         `json:"public_id" gorm:"size:36;not null;uniqueIndex;<-:create"`
 	CreatedAt time.Time      `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time      `json:"updated_at" gorm:"autoUpdateTime"`
 	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
 
+	// Project is the only security and configuration boundary. These values are
+	// resolved from trusted OperationContext and never accepted from a request
+	// body or Agent payload.
+	OrganizationID       uint   `json:"organization_id" gorm:"not null;index"`
+	ProjectID            uint   `json:"project_id" gorm:"not null;index;uniqueIndex:idx_tickets_project_number,priority:1"`
+	QueueID              uint   `json:"queue_id" gorm:"not null;index"`
+	RequestTypeVersionID string `json:"request_type_version_id" gorm:"size:36;not null;index"`
+	WorkflowVersionID    string `json:"workflow_version_id" gorm:"size:36;not null;index"`
+
 	// 基本信息
-	TicketNumber string `json:"ticket_number" gorm:"uniqueIndex;size:50;not null"` // 工单编号
+	TicketNumber string `json:"ticket_number" gorm:"uniqueIndex:idx_tickets_project_number,priority:2;size:64;not null"` // 项目内工单编号
 	Title        string `json:"title" gorm:"size:255;not null" validate:"required,max=255"`
 	Description  string `json:"description" gorm:"type:text" validate:"required"`
 
@@ -264,6 +234,38 @@ func (Ticket) TableName() string {
 	return "tickets"
 }
 
+func (ticket *Ticket) BeforeCreate(_ *gorm.DB) error {
+	return ensureProjectPublicID(&ticket.PublicID)
+}
+
+func inheritTicketProjectScope(
+	tx *gorm.DB,
+	ticketID uint,
+	organizationID *uint,
+	projectID *uint,
+) error {
+	if tx == nil || ticketID == 0 || organizationID == nil || projectID == nil {
+		return fmt.Errorf("ticket project scope inheritance requires a transaction and ticket")
+	}
+	var ticketScope struct {
+		OrganizationID uint
+		ProjectID      uint
+	}
+	if err := tx.Model(&Ticket{}).
+		Select("organization_id", "project_id").
+		Where("id = ?", ticketID).
+		First(&ticketScope).Error; err != nil {
+		return fmt.Errorf("load ticket project scope: %w", err)
+	}
+	if (*organizationID != 0 && *organizationID != ticketScope.OrganizationID) ||
+		(*projectID != 0 && *projectID != ticketScope.ProjectID) {
+		return fmt.Errorf("ticket project scope mismatch")
+	}
+	*organizationID = ticketScope.OrganizationID
+	*projectID = ticketScope.ProjectID
+	return nil
+}
+
 // IsOpen 检查工单是否开放
 func (t *Ticket) IsOpen() bool {
 	return t.Status == TicketStatusOpen
@@ -311,22 +313,24 @@ func (t *Ticket) CanBeClosed() bool {
 
 // TicketCreateRequest 工单创建请求
 type TicketCreateRequest struct {
-	Title         string         `json:"title" binding:"required,max=255"`
-	Description   string         `json:"description" binding:"required,max=10000"`
-	Type          TicketType     `json:"type" binding:"required,oneof=incident request problem change complaint consultation"`
-	Priority      TicketPriority `json:"priority" binding:"required,oneof=low normal high urgent critical"`
-	Status        *TicketStatus  `json:"status" binding:"omitempty,oneof=open in_progress pending resolved closed cancelled"`
-	Source        TicketSource   `json:"source" binding:"required,oneof=web email phone chat api mobile agent"`
-	AssignedToID  *uint          `json:"assigned_to_id"`
-	CategoryID    *uint          `json:"category_id"`
-	SubcategoryID *uint          `json:"subcategory_id"`
-	Tags          StringList     `json:"tags"`
-	DueDate       *time.Time     `json:"due_date"`
-	CustomerEmail string         `json:"customer_email" binding:"omitempty,email"`
-	CustomerPhone string         `json:"customer_phone"`
-	CustomerName  string         `json:"customer_name"`
-	CustomFields  *JSONMap       `json:"custom_fields"`
-	AgentContext  *AgentContext  `json:"agent_context"`
+	Title                string         `json:"title" binding:"required,max=255"`
+	Description          string         `json:"description" binding:"required,max=10000"`
+	Type                 TicketType     `json:"type" binding:"required,oneof=incident request problem change complaint consultation"`
+	Priority             TicketPriority `json:"priority" binding:"required,oneof=low normal high urgent critical"`
+	Status               *TicketStatus  `json:"status" binding:"omitempty,oneof=open in_progress pending resolved closed cancelled"`
+	Source               TicketSource   `json:"source" binding:"required,oneof=web email phone chat api mobile agent"`
+	RequestTypeVersionID string         `json:"request_type_version_id" binding:"required,uuid"`
+	WorkflowVersionID    string         `json:"workflow_version_id" binding:"omitempty,uuid"`
+	AssignedToID         *uint          `json:"assigned_to_id"`
+	CategoryID           *uint          `json:"category_id"`
+	SubcategoryID        *uint          `json:"subcategory_id"`
+	Tags                 StringList     `json:"tags"`
+	DueDate              *time.Time     `json:"due_date"`
+	CustomerEmail        string         `json:"customer_email" binding:"omitempty,email"`
+	CustomerPhone        string         `json:"customer_phone"`
+	CustomerName         string         `json:"customer_name"`
+	CustomFields         *JSONMap       `json:"custom_fields"`
+	AgentContext         *AgentContext  `json:"agent_context"`
 }
 
 // TicketUpdateRequest 工单更新请求
@@ -354,46 +358,52 @@ type TicketUpdateRequest struct {
 
 // TicketResponse 工单响应
 type TicketResponse struct {
-	ID              uint                   `json:"id"`
-	CreatedAt       time.Time              `json:"created_at"`
-	UpdatedAt       time.Time              `json:"updated_at"`
-	TicketNumber    string                 `json:"ticket_number"`
-	Title           string                 `json:"title"`
-	Description     string                 `json:"description"`
-	Type            TicketType             `json:"type"`
-	Priority        TicketPriority         `json:"priority"`
-	Status          TicketStatus           `json:"status"`
-	Source          TicketSource           `json:"source"`
-	CreatedByID     *uint                  `json:"created_by_id,omitempty"`
-	CreatedBy       *UserSummary           `json:"created_by,omitempty"`
-	AssignedToID    *uint                  `json:"assigned_to_id,omitempty"`
-	AssignedTo      *UserSummary           `json:"assigned_to,omitempty"`
-	CategoryID      *uint                  `json:"category_id,omitempty"`
-	Category        *CategoryResponse      `json:"category,omitempty"`
-	SubcategoryID   *uint                  `json:"subcategory_id,omitempty"`
-	Subcategory     *CategoryResponse      `json:"subcategory,omitempty"`
-	Tags            []string               `json:"tags"`
-	DueDate         *time.Time             `json:"due_date"`
-	ResolvedAt      *time.Time             `json:"resolved_at"`
-	ClosedAt        *time.Time             `json:"closed_at"`
-	FirstReplyAt    *time.Time             `json:"first_reply_at"`
-	SLABreached     bool                   `json:"sla_breached"`
-	SLADueDate      *time.Time             `json:"sla_due_date"`
-	ResponseTime    *int                   `json:"response_time"`
-	ResolutionTime  *int                   `json:"resolution_time"`
-	CustomerEmail   string                 `json:"customer_email"`
-	CustomerPhone   string                 `json:"customer_phone"`
-	CustomerName    string                 `json:"customer_name"`
-	CustomFields    map[string]interface{} `json:"custom_fields"`
-	ViewCount       int                    `json:"view_count"`
-	CommentCount    int                    `json:"comment_count"`
-	Rating          *int                   `json:"rating"`
-	RatingComment   string                 `json:"rating_comment"`
-	Version         uint64                 `json:"version"`
-	AgentContext    AgentContext           `json:"agent_context"`
-	TrustLevel      TicketTrustLevel       `json:"trust_level"`
-	CreatedByActor  ActorRef               `json:"created_by_actor"`
-	AssignedToActor *ActorRef              `json:"assigned_to_actor,omitempty"`
+	ID                   uint                   `json:"id"`
+	PublicID             string                 `json:"public_id"`
+	CreatedAt            time.Time              `json:"created_at"`
+	UpdatedAt            time.Time              `json:"updated_at"`
+	OrganizationID       uint                   `json:"organization_id"`
+	ProjectID            uint                   `json:"project_id"`
+	QueueID              uint                   `json:"queue_id"`
+	RequestTypeVersionID string                 `json:"request_type_version_id"`
+	WorkflowVersionID    string                 `json:"workflow_version_id"`
+	TicketNumber         string                 `json:"ticket_number"`
+	Title                string                 `json:"title"`
+	Description          string                 `json:"description"`
+	Type                 TicketType             `json:"type"`
+	Priority             TicketPriority         `json:"priority"`
+	Status               TicketStatus           `json:"status"`
+	Source               TicketSource           `json:"source"`
+	CreatedByID          *uint                  `json:"created_by_id,omitempty"`
+	CreatedBy            *UserSummary           `json:"created_by,omitempty"`
+	AssignedToID         *uint                  `json:"assigned_to_id,omitempty"`
+	AssignedTo           *UserSummary           `json:"assigned_to,omitempty"`
+	CategoryID           *uint                  `json:"category_id,omitempty"`
+	Category             *CategoryResponse      `json:"category,omitempty"`
+	SubcategoryID        *uint                  `json:"subcategory_id,omitempty"`
+	Subcategory          *CategoryResponse      `json:"subcategory,omitempty"`
+	Tags                 []string               `json:"tags"`
+	DueDate              *time.Time             `json:"due_date"`
+	ResolvedAt           *time.Time             `json:"resolved_at"`
+	ClosedAt             *time.Time             `json:"closed_at"`
+	FirstReplyAt         *time.Time             `json:"first_reply_at"`
+	SLABreached          bool                   `json:"sla_breached"`
+	SLADueDate           *time.Time             `json:"sla_due_date"`
+	ResponseTime         *int                   `json:"response_time"`
+	ResolutionTime       *int                   `json:"resolution_time"`
+	CustomerEmail        string                 `json:"customer_email"`
+	CustomerPhone        string                 `json:"customer_phone"`
+	CustomerName         string                 `json:"customer_name"`
+	CustomFields         map[string]interface{} `json:"custom_fields"`
+	ViewCount            int                    `json:"view_count"`
+	CommentCount         int                    `json:"comment_count"`
+	Rating               *int                   `json:"rating"`
+	RatingComment        string                 `json:"rating_comment"`
+	Version              uint64                 `json:"version"`
+	AgentContext         AgentContext           `json:"agent_context"`
+	TrustLevel           TicketTrustLevel       `json:"trust_level"`
+	CreatedByActor       ActorRef               `json:"created_by_actor"`
+	AssignedToActor      *ActorRef              `json:"assigned_to_actor,omitempty"`
 
 	// 工作流计算字段
 	IsOverdue   bool `json:"is_overdue"`   // 是否逾期
@@ -403,38 +413,44 @@ type TicketResponse struct {
 // ToResponse 转换为响应格式
 func (t *Ticket) ToResponse() *TicketResponse {
 	response := &TicketResponse{
-		ID:             t.ID,
-		CreatedAt:      t.CreatedAt,
-		UpdatedAt:      t.UpdatedAt,
-		TicketNumber:   t.TicketNumber,
-		Title:          t.Title,
-		Description:    t.Description,
-		Type:           t.Type,
-		Priority:       t.Priority,
-		Status:         t.Status,
-		Source:         t.Source,
-		CreatedByID:    t.CreatedByID,
-		AssignedToID:   t.AssignedToID,
-		CategoryID:     t.CategoryID,
-		SubcategoryID:  t.SubcategoryID,
-		DueDate:        t.DueDate,
-		ResolvedAt:     t.ResolvedAt,
-		ClosedAt:       t.ClosedAt,
-		FirstReplyAt:   t.FirstReplyAt,
-		SLABreached:    t.SLABreached,
-		SLADueDate:     t.SLADueDate,
-		ResponseTime:   t.ResponseTime,
-		ResolutionTime: t.ResolutionTime,
-		CustomerEmail:  t.CustomerEmail,
-		CustomerPhone:  t.CustomerPhone,
-		CustomerName:   t.CustomerName,
-		ViewCount:      t.ViewCount,
-		CommentCount:   t.CommentCount,
-		Rating:         t.Rating,
-		RatingComment:  t.RatingComment,
-		Version:        t.Version,
-		AgentContext:   t.AgentContext.Data(),
-		TrustLevel:     t.TrustLevel,
+		ID:                   t.ID,
+		PublicID:             t.PublicID,
+		CreatedAt:            t.CreatedAt,
+		UpdatedAt:            t.UpdatedAt,
+		OrganizationID:       t.OrganizationID,
+		ProjectID:            t.ProjectID,
+		QueueID:              t.QueueID,
+		RequestTypeVersionID: t.RequestTypeVersionID,
+		WorkflowVersionID:    t.WorkflowVersionID,
+		TicketNumber:         t.TicketNumber,
+		Title:                t.Title,
+		Description:          t.Description,
+		Type:                 t.Type,
+		Priority:             t.Priority,
+		Status:               t.Status,
+		Source:               t.Source,
+		CreatedByID:          t.CreatedByID,
+		AssignedToID:         t.AssignedToID,
+		CategoryID:           t.CategoryID,
+		SubcategoryID:        t.SubcategoryID,
+		DueDate:              t.DueDate,
+		ResolvedAt:           t.ResolvedAt,
+		ClosedAt:             t.ClosedAt,
+		FirstReplyAt:         t.FirstReplyAt,
+		SLABreached:          t.SLABreached,
+		SLADueDate:           t.SLADueDate,
+		ResponseTime:         t.ResponseTime,
+		ResolutionTime:       t.ResolutionTime,
+		CustomerEmail:        t.CustomerEmail,
+		CustomerPhone:        t.CustomerPhone,
+		CustomerName:         t.CustomerName,
+		ViewCount:            t.ViewCount,
+		CommentCount:         t.CommentCount,
+		Rating:               t.Rating,
+		RatingComment:        t.RatingComment,
+		Version:              t.Version,
+		AgentContext:         t.AgentContext.Data(),
+		TrustLevel:           t.TrustLevel,
 
 		// 计算字段
 		IsOverdue:   t.IsOverdue(),

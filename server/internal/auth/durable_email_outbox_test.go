@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 	"golang.org/x/crypto/bcrypt"
@@ -36,6 +37,9 @@ func newAuthEmailOutboxTestRepository(
 		&models.UserProfile{},
 		&EmailVerification{},
 		&PasswordReset{},
+		&models.Organization{},
+		&models.BusinessUnit{},
+		&models.Project{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
 	); err != nil {
@@ -50,15 +54,52 @@ func newAuthEmailOutboxTestRepository(
 	if err != nil {
 		t.Fatal(err)
 	}
+	scope := seedAuthEmailOutboxDefaultProject(t, db)
 	repository, err := NewGormAuthEmailOutboxRepository(
 		db,
 		protector,
+		scope,
 		"urn:test:auth",
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return db, repository, protector
+}
+
+func seedAuthEmailOutboxDefaultProject(
+	t *testing.T,
+	db *gorm.DB,
+) models.ProjectScope {
+	t.Helper()
+	organization := models.Organization{
+		Slug:   "default",
+		Name:   "Default",
+		Status: models.OrganizationStatusActive,
+	}
+	if err := db.Create(&organization).Error; err != nil {
+		t.Fatal(err)
+	}
+	unit := models.BusinessUnit{
+		OrganizationID: organization.ID,
+		Key:            "DEFAULT",
+		Name:           "Default",
+		Status:         models.BusinessUnitStatusActive,
+	}
+	if err := db.Create(&unit).Error; err != nil {
+		t.Fatal(err)
+	}
+	project := models.Project{
+		OrganizationID: organization.ID,
+		BusinessUnitID: unit.ID,
+		Key:            models.ProjectKey("DEFAULT"),
+		Name:           "Default",
+		Status:         models.ProjectStatusActive,
+	}
+	if err := db.Create(&project).Error; err != nil {
+		t.Fatal(err)
+	}
+	return project.Scope()
 }
 
 func seedAuthEmailOutboxUser(t *testing.T, db *gorm.DB) models.User {
@@ -86,6 +127,18 @@ func TestParseEmailDestinationIDRejectsNativeUintNarrowing(t *testing.T) {
 	}
 	if got, err := parseEmailDestinationID(prefix+"42", prefix); err != nil || got != 42 {
 		t.Fatalf("parseEmailDestinationID() = (%d, %v), want (42, nil)", got, err)
+	}
+}
+
+func TestAuthEmailOutboxRepositoryRejectsZeroProjectScope(t *testing.T) {
+	db, _, protector := newAuthEmailOutboxTestRepository(t)
+	if _, err := NewGormAuthEmailOutboxRepository(
+		db,
+		protector,
+		models.ProjectScope{},
+		"urn:test:auth",
+	); err == nil {
+		t.Fatal("zero project scope was accepted")
 	}
 }
 
@@ -180,6 +233,16 @@ func TestAuthEmailIntentsCommitWithEncryptedOneTimeCredential(t *testing.T) {
 				delivery.Status != models.OutboxDeliveryPending {
 				t.Fatalf("unexpected durable email Outbox row: %+v", delivery)
 			}
+			if event.OrganizationID != repository.scope.OrganizationID ||
+				event.ProjectID != repository.scope.ProjectID ||
+				delivery.OrganizationID != repository.scope.OrganizationID ||
+				delivery.ProjectID != repository.scope.ProjectID {
+				t.Fatalf(
+					"authentication email Outbox scope mismatch: event=%+v delivery=%+v",
+					event,
+					delivery,
+				)
+			}
 			digest, envelope, err := test.loadSecret(db)
 			if err != nil {
 				t.Fatal(err)
@@ -200,6 +263,173 @@ func TestAuthEmailIntentsCommitWithEncryptedOneTimeCredential(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAuthEmailOutboxWritesUseTrustedDefaultProjectTransaction(
+	t *testing.T,
+) {
+	db, repository, _ := newAuthEmailOutboxTestRepository(t)
+	user := seedAuthEmailOutboxUser(t, db)
+	const callbackName = "test:auth_email_scoped_transaction"
+	observed := false
+	if err := db.Callback().Create().
+		Before("gorm:create").
+		Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement == nil ||
+				tx.Statement.Schema == nil ||
+				tx.Statement.Schema.Table != "domain_events" {
+				return
+			}
+			if !scopeddb.HasTransaction(tx.Statement.Context) {
+				_ = tx.AddError(errors.New(
+					"email DomainEvent did not use a project-scoped transaction",
+				))
+				return
+			}
+			operation, err := services.OperationContextFromContext(
+				tx.Statement.Context,
+			)
+			if err != nil ||
+				operation.Scope != repository.scope ||
+				operation.Actor != models.SystemActor("auth-password-reset") ||
+				operation.Source != services.SourceProtocolWorker {
+				_ = tx.AddError(fmt.Errorf(
+					"unexpected email DomainEvent operation context: %+v err=%v",
+					operation,
+					err,
+				))
+				return
+			}
+			if _, ok := tx.Statement.ConnPool.(gorm.TxCommitter); !ok {
+				_ = tx.AddError(errors.New(
+					"email DomainEvent did not use the active SQL transaction",
+				))
+				return
+			}
+			observed = true
+		}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = db.Callback().Create().Remove(callbackName)
+	})
+
+	if err := repository.QueuePasswordReset(
+		context.Background(),
+		&PasswordReset{
+			UserID:    user.ID,
+			Email:     user.Email,
+			Token:     "trusted-scope-password-reset",
+			ExpiresAt: time.Now().Add(time.Hour),
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !observed {
+		t.Fatal("project-scoped email DomainEvent insert was not observed")
+	}
+}
+
+func TestResolveActiveDefaultAuthProjectScopeRequiresExactlyOne(t *testing.T) {
+	t.Run("one active DEFAULT project", func(t *testing.T) {
+		db := openAuthProjectResolverTestDB(t)
+		expected := seedAuthEmailOutboxDefaultProject(t, db)
+		scope, err := resolveActiveDefaultAuthProjectScope(
+			context.Background(),
+			db,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if scope != expected {
+			t.Fatalf("resolved scope = %+v, want %+v", scope, expected)
+		}
+	})
+
+	t.Run("missing active DEFAULT project", func(t *testing.T) {
+		db := openAuthProjectResolverTestDB(t)
+		if _, err := resolveActiveDefaultAuthProjectScope(
+			context.Background(),
+			db,
+		); err == nil {
+			t.Fatal("missing DEFAULT project was accepted")
+		}
+	})
+
+	t.Run("archived DEFAULT project", func(t *testing.T) {
+		db := openAuthProjectResolverTestDB(t)
+		scope := seedAuthEmailOutboxDefaultProject(t, db)
+		if err := db.Model(&models.Project{}).
+			Where("id = ?", scope.ProjectID).
+			Update("status", models.ProjectStatusArchived).Error; err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolveActiveDefaultAuthProjectScope(
+			context.Background(),
+			db,
+		); err == nil {
+			t.Fatal("archived DEFAULT project was accepted")
+		}
+	})
+
+	t.Run("multiple active DEFAULT projects", func(t *testing.T) {
+		db := openAuthProjectResolverTestDB(t)
+		seedAuthEmailOutboxDefaultProject(t, db)
+		organization := models.Organization{
+			Slug:   "second",
+			Name:   "Second",
+			Status: models.OrganizationStatusActive,
+		}
+		if err := db.Create(&organization).Error; err != nil {
+			t.Fatal(err)
+		}
+		unit := models.BusinessUnit{
+			OrganizationID: organization.ID,
+			Key:            "DEFAULT",
+			Name:           "Second",
+			Status:         models.BusinessUnitStatusActive,
+		}
+		if err := db.Create(&unit).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Create(&models.Project{
+			OrganizationID: organization.ID,
+			BusinessUnitID: unit.ID,
+			Key:            models.ProjectKey("DEFAULT"),
+			Name:           "Second",
+			Status:         models.ProjectStatusActive,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolveActiveDefaultAuthProjectScope(
+			context.Background(),
+			db,
+		); err == nil {
+			t.Fatal("multiple active DEFAULT projects were accepted")
+		}
+	})
+}
+
+func openAuthProjectResolverTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(
+		sqlite.Open(
+			"file:"+strings.ReplaceAll(t.Name(), "/", "-")+
+				"?mode=memory&cache=shared",
+		),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(
+		&models.Organization{},
+		&models.BusinessUnit{},
+		&models.Project{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	return db
 }
 
 func TestRegistrationRollsBackUserProfileCredentialEventAndOutbox(t *testing.T) {

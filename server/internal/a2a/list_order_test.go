@@ -1,7 +1,6 @@
 package a2a
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -71,13 +70,13 @@ func assertTaskStatusTimestampOrder(t *testing.T, store Store) {
 	}
 	for _, task := range tasks {
 		task.StatusHistory = []TaskStatus{task.Status}
-		if err := store.CreateTask(context.Background(), task); err != nil {
+		if err := store.CreateTask(a2aTestContext(t), task); err != nil {
 			t.Fatalf("create task %q: %v", task.ID, err)
 		}
 	}
 
 	first, err := store.ListTasks(
-		context.Background(),
+		a2aTestContext(t),
 		ListTasksParams{ContextID: "status-order", PageSize: 2},
 	)
 	if err != nil {
@@ -90,7 +89,7 @@ func assertTaskStatusTimestampOrder(t *testing.T, store Store) {
 		t.Fatalf("first status-ordered page: %#v", first)
 	}
 
-	second, err := store.ListTasks(context.Background(), ListTasksParams{
+	second, err := store.ListTasks(a2aTestContext(t), ListTasksParams{
 		ContextID: "status-order",
 		PageSize:  2,
 		PageToken: first.NextPageToken,

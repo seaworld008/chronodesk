@@ -3,6 +3,7 @@ package websocket
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"math"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/observability"
 	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 )
@@ -118,6 +120,11 @@ type Client struct {
 	// User ID associated with this connection
 	UserID uint
 
+	// scope is the trusted, server-resolved project boundary for the lifetime
+	// of this connection. It is deliberately private so external callers
+	// cannot mutate a registered client into another project.
+	scope models.ProjectScope
+
 	// Hub reference
 	hub *Hub
 
@@ -126,14 +133,40 @@ type Client struct {
 }
 
 // NewClient creates a new WebSocket client
-func NewClient(hub *Hub, conn *websocket.Conn, userID uint) *Client {
+func NewClient(
+	hub *Hub,
+	conn *websocket.Conn,
+	userID uint,
+	scope models.ProjectScope,
+) (*Client, error) {
+	if hub == nil {
+		return nil, errors.New("WebSocket hub is required")
+	}
+	if conn == nil {
+		return nil, errors.New("WebSocket connection is required")
+	}
+	if userID == 0 {
+		return nil, errors.New("WebSocket user is required")
+	}
+	if err := scope.Validate(); err != nil {
+		return nil, errors.New("trusted WebSocket project scope is required")
+	}
 	return &Client{
 		hub:    hub,
 		conn:   conn,
 		send:   make(chan []byte, 256),
 		UserID: userID,
+		scope:  scope,
 		done:   make(chan struct{}),
+	}, nil
+}
+
+// ProjectScope returns the immutable project binding for this connection.
+func (c *Client) ProjectScope() models.ProjectScope {
+	if c == nil {
+		return models.ProjectScope{}
 	}
+	return c.scope
 }
 
 func (c *Client) close() {
@@ -301,7 +334,12 @@ func (c *Client) handleMarkRead(msg map[string]interface{}) {
 			safeLogUint(c.UserID),
 			safeLogUint(notificationID),
 		)
-		if err := MarkNotificationAsReadHook(context.Background(), c.UserID, notificationID); err != nil {
+		if err := MarkNotificationAsReadHook(
+			context.Background(),
+			c.scope,
+			c.UserID,
+			notificationID,
+		); err != nil {
 			log.Printf(
 				"WebSocket mark-read failed: user_id=%s notification_id=%s reason=persistence_error",
 				safeLogUint(c.UserID),
@@ -320,7 +358,26 @@ func safeLogInt64(value int64) string {
 }
 
 // ServeWS handles websocket requests from the peer.
-func ServeWS(hub *Hub, c *gin.Context) {
+func ServeWS(
+	hub *Hub,
+	c *gin.Context,
+	scope models.ProjectScope,
+) {
+	if hub == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":   "websocket_unavailable",
+			"message": "实时通知服务不可用",
+		})
+		return
+	}
+	if err := scope.Validate(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "invalid_project_context",
+			"message": "项目上下文无效",
+		})
+		return
+	}
+
 	// Get user ID from JWT token in context
 	userIDInterface, exists := c.Get("user_id")
 	if !exists {
@@ -346,7 +403,12 @@ func ServeWS(hub *Hub, c *gin.Context) {
 		return
 	}
 
-	client := NewClient(hub, conn, userID)
+	client, err := NewClient(hub, conn, userID, scope)
+	if err != nil {
+		_ = conn.Close()
+		log.Print("Rejected invalid WebSocket client binding")
+		return
+	}
 	if !client.hub.registerClient(client) {
 		client.close()
 		return

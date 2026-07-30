@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
@@ -53,6 +54,7 @@ func NotificationEmailEventID(notificationID uint) string {
 
 type EmailOutboxEventInput struct {
 	ID              string
+	Scope           models.ProjectScope
 	Source          string
 	Type            string
 	Subject         string
@@ -73,6 +75,26 @@ func AppendEmailOutboxTx(
 ) (*models.DomainEvent, error) {
 	if tx == nil {
 		return nil, errors.New("email Outbox transaction is required")
+	}
+	if err := input.Scope.Validate(); err != nil {
+		return nil, fmt.Errorf("email Outbox project scope is required: %w", err)
+	}
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"email Outbox trusted operation context is required: %w",
+			err,
+		)
+	}
+	if operation.Scope != input.Scope {
+		return nil, errors.New(
+			"email Outbox project scope does not match trusted operation context",
+		)
+	}
+	if !scopeddb.HasTransaction(ctx) {
+		return nil, errors.New(
+			"email Outbox requires an active project-scoped transaction",
+		)
 	}
 	if strings.TrimSpace(input.Type) == "" {
 		return nil, errors.New("email DomainEvent type is required")
@@ -113,6 +135,8 @@ func AppendEmailOutboxTx(
 
 	event := &models.DomainEvent{
 		ID:              input.ID,
+		OrganizationID:  input.Scope.OrganizationID,
+		ProjectID:       input.Scope.ProjectID,
 		SpecVersion:     "1.0",
 		Source:          input.Source,
 		Type:            input.Type,
@@ -131,6 +155,8 @@ func AppendEmailOutboxTx(
 
 	delivery := models.OutboxDelivery{
 		ID:              uuid.NewString(),
+		OrganizationID:  input.Scope.OrganizationID,
+		ProjectID:       input.Scope.ProjectID,
 		EventID:         event.ID,
 		DestinationType: EmailOutboxDestination,
 		DestinationID:   input.DestinationID,

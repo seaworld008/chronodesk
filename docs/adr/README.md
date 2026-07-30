@@ -16,6 +16,9 @@ maintainers and coding agents should not repeatedly re-litigate.
 - [ADR-0002: One Actor and Assignment model](0002-actor-and-assignment-model.md)
 - [ADR-0003: Transactional Domain Events and Outbox](0003-transactional-events-and-outbox.md)
 - [ADR-0004: Minimal executable and application composition root](0004-application-composition-root.md)
+- [ADR-0005: Project is the runtime security and configuration boundary](0005-project-is-the-runtime-boundary.md)
+- [ADR-0006: Immutable project configuration and proposal-based AI actions](0006-versioned-configuration-and-ai-actions.md)
+- [ADR-0007: Inbox, immutable mapping, and explicit external identity](0007-inbox-mapping-and-external-identity.md)
 
 New ADRs use the next four-digit number and include Context, Decision,
 Consequences, and Verification sections.

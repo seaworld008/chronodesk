@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -21,6 +20,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/mcp"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/safeconv"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"gorm.io/datatypes"
@@ -41,11 +41,25 @@ var mcpQueuePattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 // mcp.Authenticator, and mcp.Authorizer. It keeps transport concerns out of
 // AgentNativeService while reusing that service for every state transition.
 type MCPAdapter struct {
-	db      *gorm.DB
-	service *services.AgentNativeService
-	tokens  *agentauth.Manager
-	events  chan mcp.ResourceEvent
+	db       *gorm.DB
+	service  *services.AgentNativeService
+	projects *services.ProjectService
+	tokens   *agentauth.Manager
+	events   chan mcp.ResourceEvent
 }
+
+type mcpPublication struct {
+	principal mcp.Principal
+	ticketID  uint
+	oldQueue  string
+	newQueue  string
+}
+
+type mcpPublicationBuffer struct {
+	items []mcpPublication
+}
+
+type mcpPublicationBufferContextKey struct{}
 
 var (
 	_ mcp.Backend       = (*MCPAdapter)(nil)
@@ -68,11 +82,16 @@ func NewMCPAdapter(
 	if tokens == nil {
 		return nil, errors.New("MCP adapter token manager is required")
 	}
+	projects, err := services.NewProjectService(db)
+	if err != nil {
+		return nil, fmt.Errorf("create MCP project service: %w", err)
+	}
 	return &MCPAdapter{
-		db:      db,
-		service: service,
-		tokens:  tokens,
-		events:  make(chan mcp.ResourceEvent, 256),
+		db:       db,
+		service:  service,
+		projects: projects,
+		tokens:   tokens,
+		events:   make(chan mcp.ResourceEvent, 256),
 	}, nil
 }
 
@@ -123,13 +142,33 @@ func (a *MCPAdapter) authenticate(
 		return mcp.Principal{}, errors.New("invalid agent access token")
 	}
 
-	scopes := intersectScopes(access.Scopes, principal.ScopeList())
+	projectAccess, err := a.projects.ResolvePrincipalProject(
+		ctx,
+		access.ProjectKey,
+		principal.ID,
+	)
+	if err != nil || projectAccess == nil {
+		return mcp.Principal{}, errors.New("invalid agent access token")
+	}
+	scopes := intersectScopes(
+		intersectScopes(access.Scopes, principal.ScopeList()),
+		projectAccess.Scopes,
+	)
+	operationContext, err := services.WithOperationContext(ctx, services.OperationContext{
+		Scope:        projectAccess.Scope,
+		Actor:        models.ServicePrincipalActor(principal.ID),
+		Source:       services.SourceProtocolMCP,
+		CredentialID: credential.ID,
+	})
+	if err != nil {
+		return mcp.Principal{}, errors.New("invalid agent access token")
+	}
 	if touchLastUsed {
 		usedAt := now
-		_ = a.db.WithContext(ctx).Model(&models.AgentCredential{}).
+		_ = a.db.WithContext(operationContext).Model(&models.AgentCredential{}).
 			Where("id = ?", credential.ID).
 			Update("last_used_at", usedAt).Error
-		_ = a.db.WithContext(ctx).Model(&models.ServicePrincipal{}).
+		_ = a.db.WithContext(operationContext).Model(&models.ServicePrincipal{}).
 			Where("id = ?", principal.ID).
 			Update("last_used_at", usedAt).Error
 	}
@@ -140,12 +179,83 @@ func (a *MCPAdapter) authenticate(
 		CredentialID: credential.ID,
 		Scopes:       scopes,
 		Attributes: map[string]any{
-			"name":       access.Name,
-			"client_id":  access.ClientID,
-			"token_id":   access.JTI,
-			"expires_at": access.ExpiresAt.Format(time.RFC3339Nano),
+			"name":            access.Name,
+			"client_id":       access.ClientID,
+			"token_id":        access.JTI,
+			"expires_at":      access.ExpiresAt.Format(time.RFC3339Nano),
+			"project_key":     access.ProjectKey,
+			"organization_id": projectAccess.Scope.OrganizationID,
+			"project_id":      projectAccess.Scope.ProjectID,
 		},
 	}, nil
+}
+
+// runMCPProjectOperation is the database security boundary for one MCP
+// authorization, tool call, resource read, or subscription revalidation. The
+// callback's domain result is deliberately separated from the outer
+// transaction result: denied PolicyDecision rows and failed idempotency
+// reservations remain auditable, while each domain service keeps its own
+// savepoint-backed rollback semantics through scopeddb.TransactionForContext.
+func runMCPProjectOperation[T any](
+	adapter *MCPAdapter,
+	ctx context.Context,
+	principal mcp.Principal,
+	run func(
+		context.Context,
+		string,
+		models.ProjectScope,
+	) (T, error),
+) (T, error) {
+	var zero T
+	if adapter == nil || adapter.db == nil || run == nil {
+		return zero, errors.New("MCP project operation is unavailable")
+	}
+	operationContext, projectKey, scope, err :=
+		mcpOperationContext(ctx, principal)
+	if err != nil {
+		return zero, err
+	}
+	publications := &mcpPublicationBuffer{}
+	operationContext = context.WithValue(
+		operationContext,
+		mcpPublicationBufferContextKey{},
+		publications,
+	)
+	var (
+		result       T
+		operationErr error
+	)
+	transactionErr := scopeddb.WithProjectScopeContextTransaction(
+		operationContext,
+		adapter.db,
+		scope,
+		func(scopedContext context.Context) error {
+			result, operationErr = run(
+				scopedContext,
+				projectKey,
+				scope,
+			)
+			// Domain errors are part of the operation outcome. In particular,
+			// denied policy decisions and failed idempotency records must
+			// remain durable. Infrastructure errors from COMMIT are returned
+			// by the outer transaction itself.
+			return nil
+		},
+	)
+	if transactionErr != nil {
+		return zero, transactionErr
+	}
+	if operationErr == nil {
+		for _, publication := range publications.items {
+			adapter.publishTicketResourcesNow(
+				publication.principal,
+				publication.ticketID,
+				publication.oldQueue,
+				publication.newQueue,
+			)
+		}
+	}
+	return result, operationErr
 }
 
 func (a *MCPAdapter) Authorize(
@@ -153,11 +263,48 @@ func (a *MCPAdapter) Authorize(
 	principal mcp.Principal,
 	request mcp.AuthorizationRequest,
 ) error {
-	if err := validateMCPPrincipal(principal); err != nil {
-		return err
-	}
+	_, err := runMCPProjectOperation(
+		a,
+		ctx,
+		principal,
+		func(
+			scopedContext context.Context,
+			projectKey string,
+			_ models.ProjectScope,
+		) (struct{}, error) {
+			return struct{}{}, a.authorizeScoped(
+				scopedContext,
+				principal,
+				request,
+				projectKey,
+			)
+		},
+	)
+	return err
+}
+
+func (a *MCPAdapter) authorizeScoped(
+	ctx context.Context,
+	principal mcp.Principal,
+	request mcp.AuthorizationRequest,
+	projectKey string,
+) error {
 	if !principal.HasScopes(request.RequiredScopes...) {
 		return errors.New("insufficient scope")
+	}
+	if mcpTicketTool(request.Action) {
+		if err := validateMCPProjectArgument(request.Arguments, projectKey); err != nil {
+			return err
+		}
+	}
+	var resourceReference mcp.ProjectResourceReference
+	if request.ResourceURI != "" {
+		parsedReference, parseErr :=
+			mcp.ParseProjectResourceURI(request.ResourceURI)
+		if parseErr != nil || parsedReference.ProjectKey != projectKey {
+			return errors.New("MCP resource project does not match access token")
+		}
+		resourceReference = parsedReference
 	}
 
 	// ticket_list performs its list- and object-level checks against one
@@ -172,17 +319,13 @@ func (a *MCPAdapter) Authorize(
 		return errors.New("unsupported MCP policy action")
 	}
 	if request.Action == "resource:read" {
-		parsed, err := url.Parse(request.ResourceURI)
-		if err == nil && parsed.Scheme == "ticket" {
-			segments := splitMCPResourcePath(parsed.Path)
-			if parsed.Host == "queues" {
-				// Queue reads are filtered by listTickets using one bounded
-				// request-scoped policy batch.
-				return nil
-			}
-			if parsed.Host == "tickets" && len(segments) == 2 && segments[1] == "history" {
-				spec.action = "ticket.history.read"
-			}
+		if resourceReference.Kind == mcp.ProjectResourceQueue {
+			// Queue reads are filtered by listTickets using one bounded
+			// request-scoped policy batch.
+			return nil
+		}
+		if resourceReference.Kind == mcp.ProjectResourceHistory {
+			spec.action = "ticket.history.read"
 		}
 	}
 	resourceID, policyContext := mcpAuthorizationTarget(request)
@@ -225,21 +368,15 @@ func mcpAuthorizationTarget(request mcp.AuthorizationRequest) (string, map[strin
 
 	policyContext := make(map[string]any)
 	if request.ResourceURI != "" {
-		parsed, err := url.Parse(request.ResourceURI)
-		if err == nil && parsed.Scheme == "ticket" && parsed.RawQuery == "" && parsed.Fragment == "" {
-			segments := splitMCPResourcePath(parsed.Path)
-			switch parsed.Host {
-			case "tickets":
-				if len(segments) > 0 {
-					if ticketID, parseErr := parsePositiveUintString(segments[0], "ticket id"); parseErr == nil {
-						resourceID = strconv.FormatUint(uint64(ticketID), 10)
-					}
-				}
-			case "queues":
-				if len(segments) == 1 && mcpQueuePattern.MatchString(segments[0]) {
-					resourceID = "*"
-					policyContext["queue"] = segments[0]
-				}
+		reference, err := mcp.ParseProjectResourceURI(request.ResourceURI)
+		if err == nil {
+			policyContext["project_key"] = reference.ProjectKey
+			switch reference.Kind {
+			case mcp.ProjectResourceTicket, mcp.ProjectResourceHistory:
+				resourceID = strconv.FormatUint(uint64(reference.TicketID), 10)
+			case mcp.ProjectResourceQueue:
+				resourceID = "*"
+				policyContext["queue"] = reference.Queue
 			}
 		}
 	}
@@ -296,8 +433,42 @@ func (a *MCPAdapter) CallTool(
 	name string,
 	arguments map[string]any,
 ) (map[string]any, error) {
-	if err := validateMCPPrincipal(principal); err != nil {
+	result, err := runMCPProjectOperation(
+		a,
+		ctx,
+		principal,
+		func(
+			scopedContext context.Context,
+			projectKey string,
+			_ models.ProjectScope,
+		) (map[string]any, error) {
+			return a.callToolScoped(
+				scopedContext,
+				principal,
+				projectKey,
+				name,
+				arguments,
+			)
+		},
+	)
+	if err != nil {
 		return nil, backendError(err)
+	}
+	return result, nil
+}
+
+func (a *MCPAdapter) callToolScoped(
+	ctx context.Context,
+	principal mcp.Principal,
+	projectKey string,
+	name string,
+	arguments map[string]any,
+) (map[string]any, error) {
+	if !mcpTicketTool(name) {
+		return nil, &mcp.BackendError{Code: "unknown_tool", Message: "unknown MCP tool"}
+	}
+	if err := validateMCPProjectArgument(arguments, projectKey); err != nil {
+		return nil, err
 	}
 	if mcpToolRequiresLease(name) && argumentString(arguments, "lease_id") == "" {
 		return nil, invalidParams("lease_id is required", "lease_id")
@@ -340,6 +511,27 @@ func (a *MCPAdapter) CallTool(
 	}
 }
 
+func mcpTicketTool(name string) bool {
+	switch name {
+	case "ticket_list",
+		"ticket_get",
+		"ticket_history",
+		"action_check",
+		"ticket_create",
+		"ticket_update",
+		"ticket_claim",
+		"ticket_heartbeat",
+		"ticket_release",
+		"ticket_assign",
+		"ticket_transition",
+		"ticket_add_comment",
+		"ticket_attach_file":
+		return true
+	default:
+		return false
+	}
+}
+
 func mcpToolRequiresLease(name string) bool {
 	switch name {
 	case "ticket_update",
@@ -358,13 +550,31 @@ func (a *MCPAdapter) createTicket(
 	principal mcp.Principal,
 	arguments map[string]any,
 ) (map[string]any, error) {
+	requestTypeVersionID, ok := normalizeMachineConfigurationVersionID(
+		argumentString(arguments, "request_type_version_id"),
+	)
+	if !ok {
+		return nil, invalidArgument(
+			"request_type_version_id must be a canonical UUID",
+		)
+	}
+	workflowVersionID, ok := normalizeMachineConfigurationVersionID(
+		argumentString(arguments, "workflow_version_id"),
+	)
+	if !ok {
+		return nil, invalidArgument(
+			"workflow_version_id must be a canonical UUID",
+		)
+	}
 	request := models.TicketCreateRequest{
-		Title:       argumentString(arguments, "title"),
-		Description: argumentString(arguments, "description"),
-		Type:        models.TicketType(argumentString(arguments, "type")),
-		Priority:    models.TicketPriority(argumentString(arguments, "priority")),
-		Source:      models.TicketSourceAgent,
-		Tags:        models.StringList(argumentStrings(arguments, "tags")),
+		Title:                argumentString(arguments, "title"),
+		Description:          argumentString(arguments, "description"),
+		Type:                 models.TicketType(argumentString(arguments, "type")),
+		Priority:             models.TicketPriority(argumentString(arguments, "priority")),
+		Source:               models.TicketSourceAgent,
+		RequestTypeVersionID: requestTypeVersionID,
+		WorkflowVersionID:    workflowVersionID,
+		Tags:                 models.StringList(argumentStrings(arguments, "tags")),
 	}
 	if rawContext, ok := arguments["agent_context"].(map[string]any); ok {
 		encoded, _ := json.Marshal(rawContext)
@@ -414,7 +624,13 @@ func (a *MCPAdapter) createTicket(
 		a.failReservation(ctx, reservation, err)
 		return nil, backendError(err)
 	}
-	a.publishTicketResources(result.Ticket.ID, "", ticketQueue(result.Ticket))
+	a.publishTicketResources(
+		ctx,
+		principal,
+		result.Ticket.ID,
+		"",
+		ticketQueue(result.Ticket),
+	)
 	return receiptMap(result.Receipt), nil
 }
 
@@ -464,8 +680,19 @@ func (a *MCPAdapter) updateTicket(
 	if err != nil {
 		return nil, err
 	}
+	scope, err := services.RequireProjectScope(ctx)
+	if err != nil {
+		return nil, backendError(err)
+	}
 	var current models.Ticket
-	if err := a.db.WithContext(ctx).First(&current, ticketID).Error; err != nil {
+	if err := a.db.WithContext(ctx).
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			ticketID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		First(&current).Error; err != nil {
 		return nil, backendError(err)
 	}
 	oldQueue := ticketQueue(&current)
@@ -519,7 +746,13 @@ func (a *MCPAdapter) updateTicket(
 		a.failReservation(ctx, reservation, err)
 		return nil, backendError(err)
 	}
-	a.publishTicketResources(ticketID, oldQueue, ticketQueue(result.Ticket))
+	a.publishTicketResources(
+		ctx,
+		principal,
+		ticketID,
+		oldQueue,
+		ticketQueue(result.Ticket),
+	)
 	return receiptMap(result.Receipt), nil
 }
 
@@ -582,7 +815,13 @@ func (a *MCPAdapter) assignTicket(
 		a.failReservation(ctx, reservation, err)
 		return nil, backendError(err)
 	}
-	a.publishTicketResources(ticketID, "", ticketQueue(result.Ticket))
+	a.publishTicketResources(
+		ctx,
+		principal,
+		ticketID,
+		"",
+		ticketQueue(result.Ticket),
+	)
 	return receiptMap(result.Receipt), nil
 }
 
@@ -634,7 +873,13 @@ func (a *MCPAdapter) transitionTicket(
 		a.failReservation(ctx, reservation, err)
 		return nil, backendError(err)
 	}
-	a.publishTicketResources(ticketID, "", ticketQueue(result.Ticket))
+	a.publishTicketResources(
+		ctx,
+		principal,
+		ticketID,
+		"",
+		ticketQueue(result.Ticket),
+	)
 	return receiptMap(result.Receipt), nil
 }
 
@@ -684,7 +929,7 @@ func (a *MCPAdapter) addComment(
 		a.failReservation(ctx, reservation, err)
 		return nil, backendError(err)
 	}
-	a.publishTicketResources(ticketID, "", "")
+	a.publishTicketResources(ctx, principal, ticketID, "", "")
 	return map[string]any{
 		"receipt": receiptMap(result.Receipt),
 		"comment": commentMap(result.Comment),
@@ -747,7 +992,7 @@ func (a *MCPAdapter) attachFile(
 		a.failReservation(ctx, reservation, err)
 		return nil, backendError(err)
 	}
-	a.publishTicketResources(ticketID, "", "")
+	a.publishTicketResources(ctx, principal, ticketID, "", "")
 	return map[string]any{
 		"receipt":    receiptMap(result.Receipt),
 		"attachment": attachmentMap(result.Attachment),
@@ -804,7 +1049,7 @@ func (a *MCPAdapter) claimTicket(
 		a.failReservation(ctx, reservation, err)
 		return nil, backendError(err)
 	}
-	a.publishTicketResources(ticketID, "", "")
+	a.publishTicketResources(ctx, principal, ticketID, "", "")
 	return leaseResultMap(result), nil
 }
 
@@ -840,8 +1085,21 @@ func (a *MCPAdapter) heartbeatTicket(
 	if reservation.Replayed {
 		return replayLeaseResult(reservation.Record)
 	}
+	scope, err := services.RequireProjectScope(ctx)
+	if err != nil {
+		a.failReservation(ctx, reservation, err)
+		return nil, backendError(err)
+	}
 	var existing models.TicketLease
-	if err := a.db.WithContext(ctx).First(&existing, "id = ? AND ticket_id = ?", leaseID, ticketID).Error; err != nil {
+	if err := a.db.WithContext(ctx).
+		Where(
+			"id = ? AND ticket_id = ? AND organization_id = ? AND project_id = ?",
+			leaseID,
+			ticketID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		First(&existing).Error; err != nil {
 		a.failReservation(ctx, reservation, err)
 		return nil, backendError(err)
 	}
@@ -860,7 +1118,7 @@ func (a *MCPAdapter) heartbeatTicket(
 		a.failReservation(ctx, reservation, err)
 		return nil, backendError(err)
 	}
-	a.publishTicketResources(ticketID, "", "")
+	a.publishTicketResources(ctx, principal, ticketID, "", "")
 	return leaseResultMap(result), nil
 }
 
@@ -892,8 +1150,21 @@ func (a *MCPAdapter) releaseTicket(
 	if reservation.Replayed {
 		return replayReceipt(reservation.Record)
 	}
+	scope, err := services.RequireProjectScope(ctx)
+	if err != nil {
+		a.failReservation(ctx, reservation, err)
+		return nil, backendError(err)
+	}
 	var lease models.TicketLease
-	if err := a.db.WithContext(ctx).First(&lease, "id = ? AND ticket_id = ?", leaseID, ticketID).Error; err != nil {
+	if err := a.db.WithContext(ctx).
+		Where(
+			"id = ? AND ticket_id = ? AND organization_id = ? AND project_id = ?",
+			leaseID,
+			ticketID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		First(&lease).Error; err != nil {
 		a.failReservation(ctx, reservation, err)
 		return nil, backendError(err)
 	}
@@ -911,7 +1182,7 @@ func (a *MCPAdapter) releaseTicket(
 		a.failReservation(ctx, reservation, err)
 		return nil, backendError(err)
 	}
-	a.publishTicketResources(ticketID, "", "")
+	a.publishTicketResources(ctx, principal, ticketID, "", "")
 	return receiptMap(result.Receipt), nil
 }
 
@@ -920,8 +1191,38 @@ func (a *MCPAdapter) ReadResource(
 	principal mcp.Principal,
 	resourceURI string,
 ) (mcp.ResourceContent, error) {
-	if err := validateMCPPrincipal(principal); err != nil {
+	result, err := runMCPProjectOperation(
+		a,
+		ctx,
+		principal,
+		func(
+			scopedContext context.Context,
+			projectKey string,
+			_ models.ProjectScope,
+		) (mcp.ResourceContent, error) {
+			return a.readResourceScoped(
+				scopedContext,
+				principal,
+				projectKey,
+				resourceURI,
+			)
+		},
+	)
+	if err != nil {
 		return mcp.ResourceContent{}, backendError(err)
+	}
+	return result, nil
+}
+
+func (a *MCPAdapter) readResourceScoped(
+	ctx context.Context,
+	principal mcp.Principal,
+	projectKey string,
+	resourceURI string,
+) (mcp.ResourceContent, error) {
+	reference, err := mcp.ParseProjectResourceURI(resourceURI)
+	if err != nil || reference.ProjectKey != projectKey {
+		return mcp.ResourceContent{}, invalidArgument("resource project does not match access token")
 	}
 	release, err := a.service.AcquireAgentExecution(ctx, principal.ID)
 	if err != nil {
@@ -929,37 +1230,17 @@ func (a *MCPAdapter) ReadResource(
 	}
 	defer release()
 
-	parsed, err := url.Parse(resourceURI)
-	if err != nil || parsed.Scheme != "ticket" || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return mcp.ResourceContent{}, invalidArgument("unsupported resource URI")
-	}
-	segments := splitMCPResourcePath(parsed.Path)
 	var payload any
-	switch parsed.Host {
-	case "tickets":
-		if len(segments) == 1 {
-			ticketID, parseErr := parsePositiveUintString(segments[0], "ticket id")
-			if parseErr != nil {
-				return mcp.ResourceContent{}, parseErr
-			}
-			payload, err = a.getTicketByID(ctx, principal, ticketID)
-		} else if len(segments) == 2 && segments[1] == "history" {
-			ticketID, parseErr := parsePositiveUintString(segments[0], "ticket id")
-			if parseErr != nil {
-				return mcp.ResourceContent{}, parseErr
-			}
-			payload, err = a.historyByTicket(ctx, principal, ticketID, "", mcpMaximumLimit)
-		} else {
-			err = invalidArgument("unsupported ticket resource URI")
-		}
-	case "queues":
-		if len(segments) != 1 || !mcpQueuePattern.MatchString(segments[0]) {
-			err = invalidArgument("unsupported queue resource URI")
-			break
-		}
+	switch reference.Kind {
+	case mcp.ProjectResourceTicket:
+		payload, err = a.getTicketByID(ctx, principal, reference.TicketID)
+	case mcp.ProjectResourceHistory:
+		payload, err = a.historyByTicket(ctx, principal, reference.TicketID, "", mcpMaximumLimit)
+	case mcp.ProjectResourceQueue:
 		payload, err = a.listTickets(ctx, principal, map[string]any{
-			"queue": segments[0],
-			"limit": int64(mcpMaximumLimit),
+			"project_key": projectKey,
+			"queue":       reference.Queue,
+			"limit":       int64(mcpMaximumLimit),
 		})
 	default:
 		err = invalidArgument("unsupported resource URI")
@@ -987,7 +1268,38 @@ func (a *MCPAdapter) ValidateSubscription(
 	principal mcp.Principal,
 	resourceURI string,
 ) (bool, error) {
-	if err := validateMCPPrincipal(principal); err != nil {
+	if _, _, _, err := mcpOperationContext(ctx, principal); err != nil {
+		return false, nil
+	}
+	return runMCPProjectOperation(
+		a,
+		ctx,
+		principal,
+		func(
+			scopedContext context.Context,
+			projectKey string,
+			scope models.ProjectScope,
+		) (bool, error) {
+			return a.validateSubscriptionScoped(
+				scopedContext,
+				principal,
+				projectKey,
+				scope,
+				resourceURI,
+			)
+		},
+	)
+}
+
+func (a *MCPAdapter) validateSubscriptionScoped(
+	ctx context.Context,
+	principal mcp.Principal,
+	projectKey string,
+	scope models.ProjectScope,
+	resourceURI string,
+) (bool, error) {
+	reference, err := mcp.ParseProjectResourceURI(resourceURI)
+	if err != nil || reference.ProjectKey != projectKey {
 		return false, nil
 	}
 	authorization := mcp.AuthorizationRequest{
@@ -1015,22 +1327,10 @@ func (a *MCPAdapter) ValidateSubscription(
 		}
 	}
 
-	parsed, err := url.Parse(resourceURI)
-	if err != nil || parsed.Scheme != "ticket" || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return false, nil
-	}
-	segments := splitMCPResourcePath(parsed.Path)
-	switch parsed.Host {
-	case "tickets":
-		if len(segments) != 1 && !(len(segments) == 2 && segments[1] == "history") {
-			return false, nil
-		}
-		ticketID, parseErr := parsePositiveUintString(segments[0], "ticket id")
-		if parseErr != nil {
-			return false, nil
-		}
+	switch reference.Kind {
+	case mcp.ProjectResourceTicket, mcp.ProjectResourceHistory:
 		readAction := "ticket.read"
-		if len(segments) == 2 {
+		if reference.Kind == mcp.ProjectResourceHistory {
 			readAction = "ticket.history.read"
 		}
 		allowed, evaluateErr := a.service.EvaluateReadAction(ctx, services.PolicyCheckInput{
@@ -1039,7 +1339,7 @@ func (a *MCPAdapter) ValidateSubscription(
 			Scope:              models.ScopeTicketsRead,
 			Action:             readAction,
 			ResourceType:       "ticket",
-			ResourceID:         strconv.FormatUint(uint64(ticketID), 10),
+			ResourceID:         strconv.FormatUint(uint64(reference.TicketID), 10),
 			SourceProtocol:     mcpSourceProtocol,
 		})
 		if evaluateErr != nil || !allowed {
@@ -1047,16 +1347,18 @@ func (a *MCPAdapter) ValidateSubscription(
 		}
 		var exists int64
 		queryErr := a.db.WithContext(ctx).Model(&models.Ticket{}).
-			Where("id = ?", ticketID).
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ?",
+				reference.TicketID,
+				scope.OrganizationID,
+				scope.ProjectID,
+			).
 			Count(&exists).Error
 		if queryErr != nil {
 			return false, queryErr
 		}
 		return exists == 1, nil
-	case "queues":
-		if len(segments) != 1 || !mcpQueuePattern.MatchString(segments[0]) {
-			return false, nil
-		}
+	case mcp.ProjectResourceQueue:
 		return true, nil
 	default:
 		return false, nil
@@ -1086,6 +1388,10 @@ func (a *MCPAdapter) listTickets(
 	if queue != "" && !mcpQueuePattern.MatchString(queue) {
 		return nil, invalidArgument("invalid queue")
 	}
+	scope, err := services.RequireProjectScope(ctx)
+	if err != nil {
+		return nil, backendError(err)
+	}
 
 	policyBatch, err := a.service.PrepareReadPolicyBatch(ctx, services.PolicyCheckInput{
 		ServicePrincipalID: principal.ID,
@@ -1101,7 +1407,13 @@ func (a *MCPAdapter) listTickets(
 		return nil, backendError(err)
 	}
 
-	query := a.db.WithContext(ctx).Model(&models.Ticket{})
+	query := a.db.WithContext(ctx).
+		Model(&models.Ticket{}).
+		Where(
+			"organization_id = ? AND project_id = ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+		)
 	if statuses := argumentStrings(arguments, "status"); len(statuses) > 0 {
 		query = query.Where("status IN ?", statuses)
 	}
@@ -1222,8 +1534,19 @@ func (a *MCPAdapter) getTicketByID(
 	}); err != nil {
 		return nil, err
 	}
+	scope, err := services.RequireProjectScope(ctx)
+	if err != nil {
+		return nil, backendError(err)
+	}
 	var ticket models.Ticket
-	if err := a.db.WithContext(ctx).First(&ticket, ticketID).Error; err != nil {
+	if err := a.db.WithContext(ctx).
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			ticketID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		First(&ticket).Error; err != nil {
 		return nil, backendError(err)
 	}
 	return ticketDetail(&ticket)
@@ -1260,8 +1583,20 @@ func (a *MCPAdapter) historyByTicket(
 	}); err != nil {
 		return nil, err
 	}
+	scope, err := services.RequireProjectScope(ctx)
+	if err != nil {
+		return nil, backendError(err)
+	}
 	var ticket models.Ticket
-	if err := a.db.WithContext(ctx).Select("id").First(&ticket, ticketID).Error; err != nil {
+	if err := a.db.WithContext(ctx).
+		Select("id").
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			ticketID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		First(&ticket).Error; err != nil {
 		return nil, backendError(err)
 	}
 	cursor, err := decodeMCPQueryCursor(cursorValue)
@@ -1270,7 +1605,12 @@ func (a *MCPAdapter) historyByTicket(
 	}
 	query := a.db.WithContext(ctx).
 		Preload("Event").
-		Where("ticket_id = ?", ticketID).
+		Where(
+			"ticket_id = ? AND organization_id = ? AND project_id = ?",
+			ticketID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
 		Order("id DESC")
 	if !cursor.CreatedAt.IsZero() {
 		cursorID, parseErr := strconv.ParseUint(cursor.ID, 10, 64)
@@ -1409,8 +1749,21 @@ func (a *MCPAdapter) replayComment(
 		if err := json.Unmarshal(record.ResourceSnapshot, &comment); err != nil {
 			return nil, backendError(errors.New("invalid replayed comment snapshot"))
 		}
-	} else if err := a.db.WithContext(ctx).First(&comment, commentID).Error; err != nil {
-		return nil, backendError(err)
+	} else {
+		scope, scopeErr := services.RequireProjectScope(ctx)
+		if scopeErr != nil {
+			return nil, backendError(scopeErr)
+		}
+		if err := a.db.WithContext(ctx).
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ?",
+				commentID,
+				scope.OrganizationID,
+				scope.ProjectID,
+			).
+			First(&comment).Error; err != nil {
+			return nil, backendError(err)
+		}
 	}
 	return map[string]any{
 		"receipt": receiptMap(receipt),
@@ -1435,8 +1788,21 @@ func (a *MCPAdapter) replayAttachment(
 		if err := json.Unmarshal(record.ResourceSnapshot, &attachment); err != nil {
 			return nil, backendError(errors.New("invalid replayed attachment snapshot"))
 		}
-	} else if err := a.db.WithContext(ctx).First(&attachment, attachmentID).Error; err != nil {
-		return nil, backendError(err)
+	} else {
+		scope, scopeErr := services.RequireProjectScope(ctx)
+		if scopeErr != nil {
+			return nil, backendError(scopeErr)
+		}
+		if err := a.db.WithContext(ctx).
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ?",
+				attachmentID,
+				scope.OrganizationID,
+				scope.ProjectID,
+			).
+			First(&attachment).Error; err != nil {
+			return nil, backendError(err)
+		}
 	}
 	return map[string]any{
 		"receipt":    receiptMap(receipt),
@@ -1615,14 +1981,45 @@ func sortedMapKeys(input map[string]any) []string {
 	return result
 }
 
-func (a *MCPAdapter) publishTicketResources(ticketID uint, oldQueue, newQueue string) {
+func (a *MCPAdapter) publishTicketResources(
+	ctx context.Context,
+	principal mcp.Principal,
+	ticketID uint,
+	oldQueue,
+	newQueue string,
+) {
+	if buffer, ok := ctx.Value(
+		mcpPublicationBufferContextKey{},
+	).(*mcpPublicationBuffer); ok && buffer != nil {
+		buffer.items = append(buffer.items, mcpPublication{
+			principal: principal,
+			ticketID:  ticketID,
+			oldQueue:  oldQueue,
+			newQueue:  newQueue,
+		})
+		return
+	}
+	a.publishTicketResourcesNow(principal, ticketID, oldQueue, newQueue)
+}
+
+func (a *MCPAdapter) publishTicketResourcesNow(
+	principal mcp.Principal,
+	ticketID uint,
+	oldQueue,
+	newQueue string,
+) {
+	projectKey, err := mcpPrincipalProjectKey(principal)
+	if err != nil {
+		return
+	}
+	baseURI := "ticket://projects/" + projectKey
 	uris := []string{
-		fmt.Sprintf("ticket://tickets/%d", ticketID),
-		fmt.Sprintf("ticket://tickets/%d/history", ticketID),
+		fmt.Sprintf("%s/tickets/%d", baseURI, ticketID),
+		fmt.Sprintf("%s/tickets/%d/history", baseURI, ticketID),
 	}
 	for _, queue := range []string{"default", oldQueue, newQueue} {
 		if mcpQueuePattern.MatchString(queue) {
-			uris = append(uris, "ticket://queues/"+queue)
+			uris = append(uris, baseURI+"/queues/"+queue)
 		}
 	}
 	for _, uri := range uniqueStrings(uris) {
@@ -1884,18 +2281,77 @@ func historyItem(history *models.TicketHistory) (map[string]any, error) {
 }
 
 func validateMCPPrincipal(principal mcp.Principal) error {
-	if principal.Type != string(models.ActorTypeServicePrincipal) || strings.TrimSpace(principal.ID) == "" {
+	if principal.Type != string(models.ActorTypeServicePrincipal) ||
+		strings.TrimSpace(principal.ID) == "" ||
+		strings.TrimSpace(principal.CredentialID) == "" {
 		return services.ErrInvalidActor
 	}
 	return nil
 }
 
-func splitMCPResourcePath(path string) []string {
-	path = strings.Trim(path, "/")
-	if path == "" {
-		return nil
+func mcpPrincipalProjectKey(principal mcp.Principal) (string, error) {
+	if err := validateMCPPrincipal(principal); err != nil {
+		return "", err
 	}
-	return strings.Split(path, "/")
+	rawProjectKey, ok := principal.Attributes["project_key"].(string)
+	if !ok || rawProjectKey != strings.TrimSpace(rawProjectKey) ||
+		models.ValidateProjectKey(rawProjectKey) != nil {
+		return "", errors.New("trusted MCP project context is required")
+	}
+	return rawProjectKey, nil
+}
+
+func mcpOperationContext(
+	ctx context.Context,
+	principal mcp.Principal,
+) (context.Context, string, models.ProjectScope, error) {
+	projectKey, err := mcpPrincipalProjectKey(principal)
+	if err != nil {
+		return nil, "", models.ProjectScope{}, err
+	}
+	organizationID, err := numericUint(principal.Attributes["organization_id"])
+	if err != nil || organizationID == 0 {
+		return nil, "", models.ProjectScope{}, errors.New("trusted MCP organization context is required")
+	}
+	projectID, err := numericUint(principal.Attributes["project_id"])
+	if err != nil || projectID == 0 {
+		return nil, "", models.ProjectScope{}, errors.New("trusted MCP project context is required")
+	}
+	scope := models.ProjectScope{
+		OrganizationID: organizationID,
+		ProjectID:      projectID,
+	}
+	operationContext, err := services.WithOperationContext(ctx, services.OperationContext{
+		Scope:        scope,
+		Actor:        principalActor(principal),
+		Source:       services.SourceProtocolMCP,
+		CredentialID: principal.CredentialID,
+	})
+	if err != nil {
+		return nil, "", models.ProjectScope{}, err
+	}
+	return operationContext, projectKey, scope, nil
+}
+
+func validateMCPProjectArgument(arguments map[string]any, projectKey string) error {
+	rawProjectKey, ok := arguments["project_key"].(string)
+	if !ok || rawProjectKey == "" {
+		return invalidParams("project_key is required", "project_key")
+	}
+	if rawProjectKey != strings.TrimSpace(rawProjectKey) ||
+		models.ValidateProjectKey(rawProjectKey) != nil {
+		return invalidParams("project_key must be canonical", "project_key")
+	}
+	if rawProjectKey != projectKey {
+		return &mcp.BackendError{
+			Code:    "project_scope_mismatch",
+			Message: "project_key does not match the authenticated access token",
+			Details: map[string]any{
+				"field": "project_key",
+			},
+		}
+	}
+	return nil
 }
 
 func decodeMCPQueryCursor(value string) (Cursor, error) {
@@ -2133,6 +2589,10 @@ func backendPolicyError(err error, decision *models.PolicyDecision) *mcp.Backend
 func backendError(err error) *mcp.BackendError {
 	if err == nil {
 		return &mcp.BackendError{Code: "internal_error", Message: "operation failed"}
+	}
+	var safeBackendError *mcp.BackendError
+	if errors.As(err, &safeBackendError) && safeBackendError != nil {
+		return safeBackendError
 	}
 	code := services.AgentNativeErrorCode(err)
 	retryable := false

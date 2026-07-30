@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
@@ -26,20 +27,80 @@ type SecretRotationReport struct {
 	Verified int
 }
 
-// ValidateDatabaseSecrets is the startup fail-fast gate. Any non-empty
-// sensitive column must contain an authenticated envelope decryptable by the
-// configured keyring. Existing plaintext is never treated as a usable value.
+// ValidateDatabaseSecrets validates through a privileged maintenance handle.
+// Runtime startup must use ValidateRuntimeDatabaseSecrets so FORCE RLS cannot
+// turn a project-owned table scan into a misleading empty result.
 func ValidateDatabaseSecrets(ctx context.Context, db *gorm.DB, protector Protector) error {
+	if err := validateDatabaseSecretInputs(db, protector); err != nil {
+		return err
+	}
+	if err := validateProjectDatabaseSecrets(ctx, db, protector); err != nil {
+		return err
+	}
+	return validateGlobalDatabaseSecrets(ctx, db, protector)
+}
+
+// ValidateRuntimeDatabaseSecrets is the least-privilege startup gate. It
+// enumerates the server-owned project inventory, then validates each
+// project-owned secret table inside a short RLS transaction. Project IDs come
+// exclusively from the database and are never accepted from request data.
+func ValidateRuntimeDatabaseSecrets(
+	ctx context.Context,
+	db *gorm.DB,
+	protector Protector,
+) error {
+	if err := validateDatabaseSecretInputs(db, protector); err != nil {
+		return err
+	}
+	if err := validateGlobalDatabaseSecrets(ctx, db, protector); err != nil {
+		return err
+	}
+
+	var projects []models.Project
+	if err := db.WithContext(ctx).
+		Select("id", "organization_id").
+		Order("organization_id ASC, id ASC").
+		Find(&projects).Error; err != nil {
+		return fmt.Errorf("list projects for secret validation: %w", err)
+	}
+	for _, project := range projects {
+		scope := project.Scope()
+		if err := scopeddb.WithProjectScopeTransaction(
+			ctx,
+			db,
+			scope,
+			func(tx *gorm.DB) error {
+				return validateProjectDatabaseSecrets(ctx, tx, protector)
+			},
+		); err != nil {
+			return fmt.Errorf(
+				"validate project %d database secrets: %w",
+				project.ID,
+				err,
+			)
+		}
+	}
+	return nil
+}
+
+func validateDatabaseSecretInputs(db *gorm.DB, protector Protector) error {
 	if db == nil {
 		return errors.New("secret validation database is required")
 	}
 	if protector == nil {
 		return ErrKeyringUnavailable
 	}
+	return nil
+}
 
+func validateProjectDatabaseSecrets(
+	ctx context.Context,
+	db *gorm.DB,
+	protector Protector,
+) error {
 	var webhooks []models.WebhookConfig
 	if err := db.WithContext(ctx).Unscoped().
-		Select("id", "secret", "access_token").
+		Select("id", "secret", "previous_secret", "access_token").
 		Find(&webhooks).Error; err != nil {
 		return fmt.Errorf("validate webhook secrets: %w", err)
 	}
@@ -48,21 +109,15 @@ func ValidateDatabaseSecrets(ctx context.Context, db *gorm.DB, protector Protect
 		if err := validateEnvelope(protector, row.Secret, FieldAAD(webhookSecretsTable, rowID, "secret")); err != nil {
 			return fmt.Errorf("webhook %d secret: %w", row.ID, err)
 		}
+		if err := validateEnvelope(
+			protector,
+			row.PreviousSecret,
+			FieldAAD(webhookSecretsTable, rowID, "previous_secret"),
+		); err != nil {
+			return fmt.Errorf("webhook %d previous secret: %w", row.ID, err)
+		}
 		if err := validateEnvelope(protector, row.AccessToken, FieldAAD(webhookSecretsTable, rowID, "access_token")); err != nil {
 			return fmt.Errorf("webhook %d access token: %w", row.ID, err)
-		}
-	}
-
-	var emails []models.EmailConfig
-	if err := db.WithContext(ctx).
-		Select("id", "smtp_password").
-		Find(&emails).Error; err != nil {
-		return fmt.Errorf("validate SMTP secrets: %w", err)
-	}
-	for _, row := range emails {
-		rowID := strconv.FormatUint(uint64(row.ID), 10)
-		if err := validateEnvelope(protector, row.SMTPPassword, FieldAAD(emailSecretsTable, rowID, "smtp_password")); err != nil {
-			return fmt.Errorf("email config %d SMTP password: %w", row.ID, err)
 		}
 	}
 
@@ -87,6 +142,34 @@ func ValidateDatabaseSecrets(ctx context.Context, db *gorm.DB, protector Protect
 	return nil
 }
 
+func validateGlobalDatabaseSecrets(
+	ctx context.Context,
+	db *gorm.DB,
+	protector Protector,
+) error {
+	var emails []models.EmailConfig
+	if err := db.WithContext(ctx).
+		Select("id", "smtp_password").
+		Find(&emails).Error; err != nil {
+		return fmt.Errorf("validate SMTP secrets: %w", err)
+	}
+	for _, row := range emails {
+		rowID := strconv.FormatUint(uint64(row.ID), 10)
+		if err := validateEnvelope(
+			protector,
+			row.SMTPPassword,
+			FieldAAD(emailSecretsTable, rowID, "smtp_password"),
+		); err != nil {
+			return fmt.Errorf(
+				"email config %d SMTP password: %w",
+				row.ID,
+				err,
+			)
+		}
+	}
+	return nil
+}
+
 // RotateDatabaseSecrets is an explicit operator action. It authenticates every
 // non-empty current-format envelope and rewraps values that use a non-primary
 // key. Plaintext and malformed envelopes fail closed and are never rewritten.
@@ -104,7 +187,9 @@ func RotateDatabaseSecrets(
 	}
 	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var webhooks []models.WebhookConfig
-		if err := tx.Unscoped().Select("id", "secret", "access_token").Find(&webhooks).Error; err != nil {
+		if err := tx.Unscoped().
+			Select("id", "secret", "previous_secret", "access_token").
+			Find(&webhooks).Error; err != nil {
 			return err
 		}
 		for _, row := range webhooks {
@@ -116,6 +201,22 @@ func RotateDatabaseSecrets(
 				updates["secret"] = value
 				report.Rotated++
 			} else if row.Secret != "" {
+				report.Verified++
+			}
+			if value, changed, err := rotateValue(
+				protector,
+				row.PreviousSecret,
+				FieldAAD(webhookSecretsTable, rowID, "previous_secret"),
+			); err != nil {
+				return fmt.Errorf(
+					"rotate webhook %d previous secret: %w",
+					row.ID,
+					err,
+				)
+			} else if changed {
+				updates["previous_secret"] = value
+				report.Rotated++
+			} else if row.PreviousSecret != "" {
 				report.Verified++
 			}
 			if value, changed, err := rotateValue(protector, row.AccessToken, FieldAAD(webhookSecretsTable, rowID, "access_token")); err != nil {

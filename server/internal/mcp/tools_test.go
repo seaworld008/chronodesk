@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"slices"
 	"testing"
 	"time"
 )
@@ -20,6 +21,22 @@ func TestToolSchemasMatchAuthoritativeRuntimeLimits(t *testing.T) {
 			t.Fatal("ticket_create still requires caller-controlled source")
 		}
 	}
+	for _, field := range []string{
+		"request_type_version_id",
+		"workflow_version_id",
+	} {
+		versionID, ok := createProperties[field].(schema)
+		if !ok ||
+			versionID["format"] != "uuid" ||
+			versionID["minLength"] != float64(36) ||
+			versionID["maxLength"] != float64(36) {
+			t.Fatalf("ticket_create %s schema = %#v", field, versionID)
+		}
+		required := tools["ticket_create"].InputSchema["required"].([]string)
+		if !slices.Contains(required, field) {
+			t.Fatalf("ticket_create does not require %s: %#v", field, required)
+		}
+	}
 
 	for _, name := range []string{"ticket_claim", "ticket_heartbeat"} {
 		properties := tools[name].InputSchema["properties"].(map[string]any)
@@ -33,6 +50,24 @@ func TestToolSchemasMatchAuthoritativeRuntimeLimits(t *testing.T) {
 	comment := commentProperties["content"].(schema)
 	if comment["maxLength"] != float64(10000) {
 		t.Fatalf("comment maxLength = %v, want 10000", comment["maxLength"])
+	}
+}
+
+func TestEveryTicketToolRequiresCanonicalProjectKey(t *testing.T) {
+	for _, tool := range toolDefinitions() {
+		properties := tool.InputSchema["properties"].(map[string]any)
+		projectKey, ok := properties["project_key"].(schema)
+		if !ok {
+			t.Fatalf("%s has no project_key schema", tool.Name)
+		}
+		if projectKey["pattern"] != `^[A-Za-z0-9._:-]+$` ||
+			projectKey["maxLength"] != float64(32) {
+			t.Fatalf("%s project_key schema = %#v", tool.Name, projectKey)
+		}
+		required, _ := tool.InputSchema["required"].([]string)
+		if !slices.Contains(required, "project_key") {
+			t.Fatalf("%s does not require project_key: %#v", tool.Name, required)
+		}
 	}
 }
 

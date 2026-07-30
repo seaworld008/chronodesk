@@ -127,7 +127,7 @@ make openapi-lint
 
 - MCP 只接受 `2026-07-28`，发现结果包含 OAuth Client Credentials 扩展，无旧 Session/GET SSE 兼容路径。
 - A2A 只接受 `1.0` PascalCase JSON-RPC 方法，Agent Card、SSE 游标、Task、Artifact 与 Push 契约一致。
-- `/api/v1` OAuth token 严格校验 REST audience，不能访问 `/mcp` 或 `/a2a/v1`。
+- `/api/v2` OAuth token 严格校验 REST audience 和单一 `project_key`，不能访问 `/mcp` 或 `/a2a/v1`。
 - 相同 `Idempotency-Key` 只产生一次副作用；错误请求体复用同一 key 返回冲突。
 - `ETag` / `If-Match` 和有效租约共同防止两个 Agent 覆盖同一工单。
 - CloudEvent 可按 `(source, id)` 去重，Outbox 可重试/回放，事件 cursor 可恢复。

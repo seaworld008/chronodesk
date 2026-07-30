@@ -139,9 +139,10 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 	router.Use(func(c *gin.Context) {
 		userID, _ := strconv.ParseUint(c.GetHeader("X-Test-User"), 10, 32)
 		c.Set("user_id", uint(userID))
-		c.Set("user_role", "customer")
+		c.Set(projectRoleContextKey, string(models.ProjectRoleRequester))
 		c.Next()
 	})
+	router.Use(handlerTestProjectMiddleware(t, db))
 	router.GET("/tickets/:id/comments", handler.ListComments)
 	router.GET("/tickets/:id/attachments", handler.ListAttachments)
 
@@ -288,9 +289,10 @@ func TestCustomerCannotReferenceInternalDeletedOrCrossTicketComment(t *testing.T
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", customer.ID)
-		c.Set("user_role", "customer")
+		c.Set(projectRoleContextKey, string(models.ProjectRoleRequester))
 		c.Next()
 	})
+	router.Use(handlerTestProjectMiddleware(t, db))
 	router.POST("/tickets/:id/comments", handler.CreateComment)
 	router.POST("/tickets/:id/attachments", handler.StoreAttachment)
 
@@ -369,9 +371,10 @@ func TestCustomerCannotCreateCommentWorklog(t *testing.T) {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", customer.ID)
-		c.Set("user_role", "customer")
+		c.Set(projectRoleContextKey, string(models.ProjectRoleRequester))
 		c.Next()
 	})
+	router.Use(handlerTestProjectMiddleware(t, db))
 	router.POST("/tickets/:id/comments", handler.CreateComment)
 
 	for _, payload := range []string{
@@ -425,9 +428,10 @@ func TestStoreAttachmentRejectsInvalidMultipartAsBadRequest(t *testing.T) {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", admin.ID)
-		c.Set("user_role", string(models.RoleAdmin))
+		c.Set(projectRoleContextKey, string(models.ProjectRoleAdmin))
 		c.Next()
 	})
+	router.Use(handlerTestProjectMiddleware(t, db))
 	router.POST("/tickets/:id/attachments", handler.StoreAttachment)
 
 	request := httptest.NewRequest(
@@ -558,9 +562,10 @@ func TestTicketContentWritesEnforceIfMatch(t *testing.T) {
 			router := gin.New()
 			router.Use(func(c *gin.Context) {
 				c.Set("user_id", customer.ID)
-				c.Set("user_role", string(models.RoleCustomer))
+				c.Set(projectRoleContextKey, string(models.ProjectRoleRequester))
 				c.Next()
 			})
+			router.Use(handlerTestProjectMiddleware(t, db))
 			operation.register(router, handler)
 			path := "/tickets/" + jsonNumber(ticket.ID) + operation.pathSuffix
 
@@ -714,9 +719,10 @@ func TestCreateCommentRejectsInvalidInputWithChineseContract(t *testing.T) {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", admin.ID)
-		c.Set("user_role", string(models.RoleAdmin))
+		c.Set(projectRoleContextKey, string(models.ProjectRoleAdmin))
 		c.Next()
 	})
+	router.Use(handlerTestProjectMiddleware(t, db))
 	router.POST("/tickets/:id/comments", handler.CreateComment)
 
 	longPayload, err := json.Marshal(map[string]any{
@@ -910,9 +916,10 @@ func TestCreateCommentKeepsHumanVisibilityDenial(t *testing.T) {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", admin.ID)
-		c.Set("user_role", string(models.RoleAdmin))
+		c.Set(projectRoleContextKey, string(models.ProjectRoleAdmin))
 		c.Next()
 	})
+	router.Use(handlerTestProjectMiddleware(t, db))
 	router.POST("/tickets/:id/comments", handler.CreateComment)
 
 	request := httptest.NewRequest(
@@ -947,9 +954,10 @@ func TestCreateCommentKeepsNotFoundConflictAndInternalErrorsSafe(t *testing.T) {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", admin.ID)
-		c.Set("user_role", string(models.RoleAdmin))
+		c.Set(projectRoleContextKey, string(models.ProjectRoleAdmin))
 		c.Next()
 	})
+	router.Use(handlerTestProjectMiddleware(t, db))
 	router.POST("/tickets/:id/comments", handler.CreateComment)
 
 	notFoundRequest := httptest.NewRequest(

@@ -15,12 +15,12 @@ func TestTicketResponseForRoleRedactsCustomerAssigneeID(t *testing.T) {
 		AssignedToID: &assigneeID,
 	}
 
-	adminResponse := ticketResponseForRole(ticket, "admin")
+	adminResponse := ticketResponseForRole(ticket, string(models.ProjectRoleAdmin))
 	if adminResponse.AssignedToID == nil || *adminResponse.AssignedToID != assigneeID {
 		t.Fatalf("admin assigned_to_id = %v, want %d", adminResponse.AssignedToID, assigneeID)
 	}
 
-	customerResponse := ticketResponseForRole(ticket, "customer")
+	customerResponse := ticketResponseForRole(ticket, string(models.ProjectRoleRequester))
 	if customerResponse.AssignedToID != nil {
 		t.Fatalf("customer assigned_to_id = %v, want nil", customerResponse.AssignedToID)
 	}

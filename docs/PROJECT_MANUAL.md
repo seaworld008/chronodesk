@@ -183,8 +183,8 @@ go run ./cmd/credential-maintain -validate-only
 ### 6.1 权威机器契约
 
 - OpenAPI：`GET /openapi.yaml`
-- Agent 能力：`GET /api/v1/capabilities`
-- Agent REST 根路径：`/api/v1`
+- Agent 能力：`GET /api/v2/projects/{projectKey}/capabilities`
+- Agent REST 根路径：`/api/v2/projects/{projectKey}`
 - 人类后台 REST 根路径：`/api`
 - MCP：`POST /mcp`
 - A2A Agent Card：`GET /.well-known/agent-card.json`
@@ -192,11 +192,11 @@ go run ./cmd/credential-maintain -validate-only
 - OAuth token：`POST /oauth/token`
 - OAuth 发现：`/.well-known/oauth-authorization-server` 和各 resource 的 Protected Resource Metadata
 
-`/api/v1` 是供 Agent 与 SDK 使用的稳定机器入口；`/api` 是供 React Admin 和人类会话使用的业务入口，不是旧 Agent 协议兼容层。所有 Schema、scope、错误码、示例和 Webhook 定义以运行时 `/openapi.yaml` 为准。
+`/api/v2/projects/{projectKey}` 是供 Agent 与 SDK 使用的项目显式机器入口；`/api` 是供 React Admin 和人类会话使用的业务入口，不提供旧 Agent 协议兼容层。所有 Schema、scope、错误码、示例和 Webhook 定义以运行时 `/openapi.yaml` 为准。
 
 ### 6.2 Agent REST 契约
 
-`/api/v1` 提供工单、历史、评论、附件、租约、事件游标与管理员 Agent 控制面。最小 scope 为：
+`/api/v2/projects/{projectKey}` 提供工单、历史、评论、附件、租约和事件游标；Human 管理员的 Agent 控制面位于 `/api/projects/{projectKey}/admin/agents`，同样只能访问路径所绑定的已授权项目。最小 scope 为：
 
 ```text
 tickets:read

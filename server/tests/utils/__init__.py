@@ -3,6 +3,7 @@
 from .api import APIClient, APIError
 from .assertions import assert_error_contract, assert_no_sensitive_fields
 from .human import HUMAN_ROLES, E2EResourceManager, HumanIdentity, strong_password
+from .intake import PublishedRequestType, PublishedTicketIntake
 from .safety import (
     TestSafetyError,
     assert_local_ephemeral_target,
@@ -17,6 +18,8 @@ __all__ = [
     "APIError",
     "E2EResourceManager",
     "HumanIdentity",
+    "PublishedRequestType",
+    "PublishedTicketIntake",
     "TestSafetyError",
     "assert_error_contract",
     "assert_local_ephemeral_target",

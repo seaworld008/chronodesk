@@ -12,6 +12,7 @@ import pytest
 import requests
 
 from .utils import APIClient, APIError, E2EResourceManager, HumanIdentity
+from .utils.api import validate_project_key
 from .utils.safety import (
     TestSafetyError,
     TestTarget,
@@ -115,7 +116,7 @@ def api_base_url(pytestconfig: pytest.Config) -> str:
 
 
 @pytest.fixture(scope="session")
-def api_client(api_base_url: str) -> APIClient:
+def bootstrap_api_client(api_base_url: str) -> APIClient:
     client = APIClient(api_base_url)
     yield client
     client.close()
@@ -176,10 +177,11 @@ def admin_credentials() -> dict[str, str]:
 
 @pytest.fixture(scope="session")
 def admin_tokens(
-    api_client: APIClient, admin_credentials: dict[str, str]
+    bootstrap_api_client: APIClient,
+    admin_credentials: dict[str, str],
 ) -> dict[str, object]:
     try:
-        payload = api_client.login(
+        payload = bootstrap_api_client.login(
             admin_credentials["email"], admin_credentials["password"]
         )
     except APIError as exc:
@@ -203,6 +205,54 @@ def admin_api(api_client: APIClient, admin_tokens: dict[str, object]) -> APIClie
 
 
 @pytest.fixture(scope="session")
+def project_key(
+    bootstrap_api_client: APIClient,
+    admin_tokens: dict[str, object],
+) -> str:
+    token = admin_tokens.get("access_token")
+    if not isinstance(token, str) or not token:
+        pytest.fail("管理员登录响应缺少 access_token，无法发现项目")
+    discovery_client = bootstrap_api_client.with_auth(token)
+    try:
+        response = discovery_client.get_json("/projects")
+        if response.status_code != 200:
+            pytest.fail(f"项目发现失败：{response_diagnostic(response)}")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            pytest.fail(f"项目发现返回非 JSON：{redact_text(exc)}")
+    finally:
+        discovery_client.close()
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        pytest.fail(f"项目发现缺少 data：{safe_diagnostic(payload)}")
+    active_projects = [
+        row["project"]
+        for row in rows
+        if isinstance(row, dict)
+        and isinstance(row.get("project"), dict)
+        and row["project"].get("status") == "active"
+    ]
+    if len(active_projects) != 1:
+        pytest.fail(f"隔离测试要求唯一 active 项目，实际 {len(active_projects)} 个")
+    selected = active_projects[0].get("key")
+    if not isinstance(selected, str) or not selected:
+        pytest.fail(f"active 项目缺少 key：{safe_diagnostic(active_projects[0])}")
+    try:
+        validate_project_key(selected)
+    except AssertionError as exc:
+        pytest.fail(str(exc))
+    return selected
+
+
+@pytest.fixture(scope="session")
+def api_client(api_base_url: str, project_key: str) -> APIClient:
+    client = APIClient(api_base_url, project_key=project_key)
+    yield client
+    client.close()
+
+
+@pytest.fixture(scope="session")
 def e2e_run_id(pytestconfig: pytest.Config) -> str:
     target = pytestconfig.stash[_TEST_TARGET]
     ownership = target.ownership_prefix or "e2e-local"
@@ -214,8 +264,9 @@ def e2e_manager(
     api_client: APIClient,
     admin_api: APIClient,
     e2e_run_id: str,
+    project_key: str,
 ) -> Iterator[E2EResourceManager]:
-    manager = E2EResourceManager(api_client, admin_api, e2e_run_id)
+    manager = E2EResourceManager(api_client, admin_api, e2e_run_id, project_key)
     try:
         yield manager
     finally:
@@ -311,18 +362,41 @@ def registered_user(
         "refresh_token": data.get("refresh_token"),
         "user": data.get("user", {}),
     }
+    registered_identity = registered["user"]
+    registered_id = (
+        registered_identity.get("id") if isinstance(registered_identity, dict) else None
+    )
+    if not isinstance(registered_id, int) or registered_id <= 0:
+        pytest.fail("注册响应缺少 user.id，无法授权测试项目")
     try:
+        membership = admin_api.post_json(
+            admin_api.project_path("memberships"),
+            {"user_id": registered_id, "role": "requester"},
+        )
+        if membership.status_code != 200:
+            pytest.fail(f"注册用户项目授权失败：{response_diagnostic(membership)}")
         yield registered
     finally:
+        cleanup_errors: list[str] = []
+        membership_cleanup = admin_api.delete(
+            admin_api.project_path(f"memberships/{registered_id}")
+        )
+        if membership_cleanup.status_code not in (200, 204, 404):
+            cleanup_errors.append(
+                "Failed to revoke registered test user membership "
+                f"{registered_id}: {response_diagnostic(membership_cleanup)}"
+            )
         user = registered.get("user", {})
         user_id = user.get("id") if isinstance(user, dict) else None
         if user_id:
             response = admin_api.delete(f"/admin/users/{user_id}")
             if response.status_code not in (200, 204, 404):
-                pytest.fail(
+                cleanup_errors.append(
                     f"Failed to clean up registered test user {user_id}: "
                     f"{response_diagnostic(response)}"
                 )
+        if cleanup_errors:
+            pytest.fail("\n".join(cleanup_errors))
 
 
 def _generate_strong_password() -> str:

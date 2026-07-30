@@ -12,7 +12,12 @@ import (
 var GlobalNotificationService *NotificationWebSocketService
 
 // NotificationReadHandler handles notification read request and returns unread count.
-type NotificationReadHandler func(ctx context.Context, userID uint, notificationID uint) (int64, error)
+type NotificationReadHandler func(
+	ctx context.Context,
+	scope models.ProjectScope,
+	userID uint,
+	notificationID uint,
+) (int64, error)
 
 // Global notification read handler instance.
 var GlobalNotificationReadHandler NotificationReadHandler
@@ -29,6 +34,10 @@ func SetNotificationReadHandler(handler NotificationReadHandler) {
 
 // NotificationCreatedHook is called when a new notification is created
 func NotificationCreatedHook(ctx context.Context, notification *models.Notification) {
+	if notification == nil {
+		log.Print("Rejected nil notification WebSocket hook")
+		return
+	}
 	if GlobalNotificationService == nil {
 		log.Printf("WebSocket service not initialized, skipping real-time push for notification %d", notification.ID)
 		return
@@ -44,37 +53,74 @@ func NotificationCreatedHook(ctx context.Context, notification *models.Notificat
 }
 
 // MarkNotificationAsReadHook is called when a notification is marked as read via WebSocket.
-func MarkNotificationAsReadHook(ctx context.Context, userID uint, notificationID uint) error {
+func MarkNotificationAsReadHook(
+	ctx context.Context,
+	scope models.ProjectScope,
+	userID uint,
+	notificationID uint,
+) error {
+	if err := scope.Validate(); err != nil {
+		return fmt.Errorf("notification read project scope: %w", err)
+	}
+	if userID == 0 || notificationID == 0 {
+		return fmt.Errorf("notification read user and notification are required")
+	}
 	if GlobalNotificationReadHandler == nil {
 		return fmt.Errorf("notification read handler not initialized")
 	}
 
-	unreadCount, err := GlobalNotificationReadHandler(ctx, userID, notificationID)
+	unreadCount, err := GlobalNotificationReadHandler(
+		ctx,
+		scope,
+		userID,
+		notificationID,
+	)
 	if err != nil {
 		return err
 	}
 
-	NotificationMarkedAsReadHook(ctx, userID, unreadCount)
-	return nil
+	return NotificationMarkedAsReadHook(ctx, scope, userID, unreadCount)
 }
 
 // NotificationMarkedAsReadHook pushes unread count to user after notification is marked as read.
-func NotificationMarkedAsReadHook(ctx context.Context, userID uint, unreadCount int64) {
+func NotificationMarkedAsReadHook(
+	ctx context.Context,
+	scope models.ProjectScope,
+	userID uint,
+	unreadCount int64,
+) error {
+	if err := scope.Validate(); err != nil {
+		return fmt.Errorf("notification unread-count project scope: %w", err)
+	}
 	if GlobalNotificationService == nil {
-		return
+		return nil
 	}
 
-	if err := GlobalNotificationService.PushUnreadCount(ctx, userID, unreadCount); err != nil {
+	if err := GlobalNotificationService.PushUnreadCount(
+		ctx,
+		scope,
+		userID,
+		unreadCount,
+	); err != nil {
 		log.Printf("Failed to push unread count for user %d: %v", userID, err)
+		return err
 	}
+	return nil
 }
 
 // NotificationAllMarkedAsReadHook is called when all notifications are marked as read
-func NotificationAllMarkedAsReadHook(ctx context.Context, userID uint) {
+func NotificationAllMarkedAsReadHook(
+	ctx context.Context,
+	scope models.ProjectScope,
+	userID uint,
+) error {
+	if err := scope.Validate(); err != nil {
+		return fmt.Errorf("notification unread-count project scope: %w", err)
+	}
 	if GlobalNotificationService == nil {
-		return
+		return nil
 	}
 
 	// Push unread count as 0
-	GlobalNotificationService.PushUnreadCount(ctx, userID, 0)
+	return GlobalNotificationService.PushUnreadCount(ctx, scope, userID, 0)
 }
