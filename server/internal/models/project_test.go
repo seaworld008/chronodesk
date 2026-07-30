@@ -54,7 +54,7 @@ func TestQueueKeyValidation(t *testing.T) {
 	}{
 		{name: "word", key: "default", valid: true},
 		{name: "leading digit", key: "1st-line", valid: true},
-		{name: "routing punctuation", key: "ops.critical_1", valid: true},
+		{name: "routing punctuation", key: "a.b_c-1", valid: true},
 		{name: "empty", key: "", valid: false},
 		{name: "uppercase", key: "Default", valid: false},
 		{name: "leading hyphen", key: "-default", valid: false},

@@ -208,7 +208,7 @@ func TestAgentCollaborationApprovalBindsDigestPolicyAndTicketVersion(t *testing.
 		fixture.agentCtx,
 		ExecuteApprovedProposalInput{
 			ProposalID:      created.Proposal.ID,
-			IdempotencyKey:  "approved-proposal-execution-0001",
+			IdempotencyKey:  "same-request",
 			AuthorizedScope: models.ScopeTicketsUpdate,
 		},
 	)
@@ -224,7 +224,7 @@ func TestAgentCollaborationApprovalBindsDigestPolicyAndTicketVersion(t *testing.
 		fixture.agentCtx,
 		ExecuteApprovedProposalInput{
 			ProposalID:      created.Proposal.ID,
-			IdempotencyKey:  "approved-proposal-execution-0001",
+			IdempotencyKey:  "same-request",
 			AuthorizedScope: models.ScopeTicketsUpdate,
 		},
 	)

@@ -17,6 +17,11 @@ import (
 	"time"
 )
 
+const (
+	currentHMACFixture  = "testtesttesttesttesttesttesttest"
+	previousHMACFixture = "demodemodemodemodemodemodemodemo"
+)
+
 func TestHealthReportsDependencyState(t *testing.T) {
 	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -236,11 +241,11 @@ func TestProjectConnectionsUsesHumanRESTAndFailsOnConnectionError(t *testing.T) 
 func TestWebhookDryRunAndVerifyExactRawBody(t *testing.T) {
 	t.Setenv(
 		"CTL_TEST_WEBHOOK_SECRET",
-		"0123456789abcdef0123456789abcdef",
+		currentHMACFixture,
 	)
 	t.Setenv(
 		"CTL_TEST_PREVIOUS_WEBHOOK_SECRET",
-		"abcdef0123456789abcdef0123456789",
+		previousHMACFixture,
 	)
 	body := []byte("{\"title\":\"保留  空格和换行\"}\n")
 	bodyFile := filepath.Join(t.TempDir(), "payload.json")
@@ -289,7 +294,7 @@ func TestWebhookDryRunAndVerifyExactRawBody(t *testing.T) {
 	)
 	expected := testHMACSignature(
 		canonicalInbound,
-		[]byte("0123456789abcdef0123456789abcdef"),
+		[]byte(currentHMACFixture),
 	)
 	if preview.Headers["X-ChronoDesk-Signature"] != expected {
 		t.Fatalf("signature = %q, want %q", preview.Headers["X-ChronoDesk-Signature"], expected)
@@ -300,7 +305,7 @@ func TestWebhookDryRunAndVerifyExactRawBody(t *testing.T) {
 	previousExpected := outboundWebhookSignature(
 		timestamp,
 		body,
-		[]byte("abcdef0123456789abcdef0123456789"),
+		[]byte(previousHMACFixture),
 	)
 	if preview.Sent {
 		t.Fatal("dry-run must not send the request")
@@ -309,8 +314,8 @@ func TestWebhookDryRunAndVerifyExactRawBody(t *testing.T) {
 		t.Fatalf("url = %q", preview.URL)
 	}
 	for _, secret := range []string{
-		"0123456789abcdef0123456789abcdef",
-		"abcdef0123456789abcdef0123456789",
+		currentHMACFixture,
+		previousHMACFixture,
 		string(body),
 	} {
 		if strings.Contains(stdout.String(), secret) {
@@ -353,7 +358,7 @@ func TestWebhookDryRunAndVerifyExactRawBody(t *testing.T) {
 	staleSignature := outboundWebhookSignature(
 		staleTimestamp,
 		body,
-		[]byte("0123456789abcdef0123456789abcdef"),
+		[]byte(currentHMACFixture),
 	)
 	stdout.Reset()
 	stderr.Reset()
@@ -397,7 +402,7 @@ func TestInboundWebhookSigningPayloadAuthenticatesRoutingMetadata(t *testing.T) 
 		t.Fatalf("signing payload = %q, want %q", got, want)
 	}
 
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := []byte(currentHMACFixture)
 	original := inboundWebhookSignature(input, secret)
 	input.ProjectKey = "HR"
 	if changed := inboundWebhookSignature(input, secret); changed == original {
@@ -504,7 +509,7 @@ func TestOutboundWebhookSignatureKeepsLegacyDomainEventFraming(t *testing.T) {
 	t.Parallel()
 	timestamp := "1785369600"
 	body := []byte("{\"specversion\":\"1.0\"}\n")
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := []byte(currentHMACFixture)
 	want := testHMACSignature(
 		append([]byte(timestamp+"."), body...),
 		secret,
