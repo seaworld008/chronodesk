@@ -12,6 +12,7 @@ from tests.utils.agent_protocol import (
     A2A_PROTOCOL_VERSION,
     AgentAccessToken,
     AgentProtocolHarness,
+    ServicePrincipalFixture,
     assert_status,
     envelope_data,
     json_object,
@@ -86,13 +87,15 @@ def _create_agent_rest_ticket(
             "Authorization": api_token.authorization,
             "Idempotency-Key": harness.idempotency_key(label),
         },
-        json_body={
-            "title": harness.unique(label),
-            "description": f"{harness.prefix}A2A linked Ticket isolation",
-            "type": "request",
-            "priority": "normal",
-            "tags": ["e2e", "a2a"],
-        },
+        json_body=harness.ticket_create_payload(
+            {
+                "title": harness.unique(label),
+                "description": f"{harness.prefix}A2A linked Ticket isolation",
+                "type": "request",
+                "priority": "normal",
+                "tags": ["e2e", "a2a"],
+            }
+        ),
     )
     assert_status(response, 201, operation="为 A2A 创建关联工单")
     ticket = envelope_data(response, operation="为 A2A 创建关联工单")
@@ -225,13 +228,17 @@ def test_a2a_ticket_intake_creates_queryable_task_and_ticket_artifact(
             "role": "ROLE_USER",
             "parts": [
                 {
-                    "data": {
-                        "title": title,
-                        "description": (f"{protocol_harness.prefix}A2A ticket intake"),
-                        "type": "request",
-                        "priority": "normal",
-                        "tags": ["e2e", "a2a-intake"],
-                    },
+                    "data": protocol_harness.ticket_create_payload(
+                        {
+                            "title": title,
+                            "description": (
+                                f"{protocol_harness.prefix}A2A ticket intake"
+                            ),
+                            "type": "request",
+                            "priority": "normal",
+                            "tags": ["e2e", "a2a-intake"],
+                        }
+                    ),
                     "mediaType": "application/json",
                 }
             ],
@@ -300,6 +307,88 @@ def test_a2a_ticket_intake_creates_queryable_task_and_ticket_artifact(
     )
     list_result = _rpc_result(listed, operation="A2A ListTasks")
     assert any(item.get("id") == task["id"] for item in list_result.get("tasks", []))
+
+
+def test_a2a_oauth_token_scopes_attenuate_full_principal(
+    protocol_harness: AgentProtocolHarness,
+    full_service_principal: ServicePrincipalFixture,
+    protected_resources: dict[str, str],
+    agent_tokens: dict[str, AgentAccessToken],
+) -> None:
+    """A2A token authority is the intersection, never the Principal maximum."""
+
+    ticket = _create_agent_rest_ticket(
+        protocol_harness,
+        agent_tokens["api"],
+        "a2a-token-attenuation",
+    )
+    query_params = {
+        "message": {
+            "messageId": protocol_harness.unique("a2a-narrow-query-message"),
+            "role": "ROLE_USER",
+            "parts": [
+                {
+                    "data": {"ticket_id": ticket["id"]},
+                    "mediaType": "application/json",
+                }
+            ],
+            "metadata": {
+                "skill": "ticket-query",
+                "io.chronodesk/projectKey": protocol_harness.project_key,
+            },
+        },
+        "metadata": {
+            "testRun": protocol_harness.run_id,
+            "io.chronodesk/projectKey": protocol_harness.project_key,
+        },
+    }
+
+    tasks_only = protocol_harness.exchange_token(
+        full_service_principal,
+        protected_resources["a2a"],
+        ("tasks:manage",),
+    )
+    denied = _a2a_rpc(
+        protocol_harness,
+        tasks_only,
+        "SendMessage",
+        query_params,
+        request_id="e2e-a2a-token-attenuation-denied",
+    )
+    denied_result = _rpc_result(
+        denied,
+        operation="A2A 窄 token 拒绝 ticket-query",
+    )
+    denied_task = denied_result.get("task")
+    assert isinstance(denied_task, dict)
+    assert denied_task.get("status", {}).get("state") == "TASK_STATE_REJECTED"
+    assert not denied_task.get("artifacts"), "窄 token 不得返回 Ticket 快照"
+
+    tasks_and_read = protocol_harness.exchange_token(
+        full_service_principal,
+        protected_resources["a2a"],
+        ("tasks:manage", "tickets:read"),
+    )
+    allowed_params = json.loads(json.dumps(query_params))
+    allowed_params["message"]["messageId"] = protocol_harness.unique(
+        "a2a-read-query-message"
+    )
+    allowed = _a2a_rpc(
+        protocol_harness,
+        tasks_and_read,
+        "SendMessage",
+        allowed_params,
+        request_id="e2e-a2a-token-attenuation-allowed",
+    )
+    allowed_result = _rpc_result(
+        allowed,
+        operation="A2A tasks+read token 查询工单",
+    )
+    allowed_task = allowed_result.get("task")
+    assert isinstance(allowed_task, dict)
+    assert allowed_task.get("status", {}).get("state") == "TASK_STATE_COMPLETED"
+    domain_result = _artifact_domain_result(allowed_task)
+    assert domain_result.get("ticket", {}).get("id") == ticket["id"]
 
 
 def test_a2a_input_required_does_not_mutate_ticket_and_sse_resumes_by_cursor(

@@ -118,7 +118,7 @@ type ConnectorDefinition struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
-	OrganizationID             uint                      `json:"organization_id" gorm:"index"`
+	OrganizationID             uint                      `json:"organization_id" gorm:"not null;index"`
 	ProjectID                  uint                      `json:"project_id" gorm:"not null;index;uniqueIndex:idx_connector_definitions_project_key,priority:1"`
 	Project                    Project                   `json:"project,omitempty" gorm:"constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 	Key                        string                    `json:"key" gorm:"size:64;not null;uniqueIndex:idx_connector_definitions_project_key,priority:2"`
@@ -163,7 +163,7 @@ type Connection struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
-	OrganizationID        uint                `json:"organization_id" gorm:"index"`
+	OrganizationID        uint                `json:"organization_id" gorm:"not null;index"`
 	ProjectID             uint                `json:"project_id" gorm:"not null;index;uniqueIndex:idx_connections_project_key,priority:1"`
 	Project               Project             `json:"project,omitempty" gorm:"constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 	ConnectorDefinitionID uint                `json:"connector_definition_id" gorm:"not null;index"`
@@ -235,7 +235,7 @@ type MappingVersion struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
-	OrganizationID   uint                 `json:"organization_id" gorm:"index"`
+	OrganizationID   uint                 `json:"organization_id" gorm:"not null;index"`
 	ProjectID        uint                 `json:"project_id" gorm:"not null;index;uniqueIndex:idx_mapping_versions_project_connection_key_version,priority:1"`
 	Project          Project              `json:"project,omitempty" gorm:"constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 	ConnectionID     uint                 `json:"connection_id" gorm:"not null;index;uniqueIndex:idx_mapping_versions_project_connection_key_version,priority:2"`
@@ -369,7 +369,7 @@ type InboxMessage struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
-	OrganizationID       uint               `json:"organization_id" gorm:"index"`
+	OrganizationID       uint               `json:"organization_id" gorm:"not null;index"`
 	ProjectID            uint               `json:"project_id" gorm:"not null;index;uniqueIndex:idx_inbox_messages_project_connection_external_id,priority:1"`
 	ConnectionID         uint               `json:"connection_id" gorm:"not null;index;uniqueIndex:idx_inbox_messages_project_connection_external_id,priority:2"`
 	MappingVersionID     uint               `json:"mapping_version_id" gorm:"not null;index"`
@@ -410,7 +410,7 @@ type InboxReceipt struct {
 	PublicID  string    `json:"public_id" gorm:"size:36;not null;uniqueIndex;<-:create"`
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 
-	OrganizationID  uint               `json:"organization_id" gorm:"index"`
+	OrganizationID  uint               `json:"organization_id" gorm:"not null;index"`
 	ProjectID       uint               `json:"project_id" gorm:"not null;index"`
 	ConnectionID    uint               `json:"connection_id" gorm:"not null;index"`
 	InboxMessageID  uint               `json:"inbox_message_id" gorm:"not null;uniqueIndex"`
@@ -455,7 +455,7 @@ type ExternalLink struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
-	OrganizationID       uint   `json:"organization_id" gorm:"index"`
+	OrganizationID       uint   `json:"organization_id" gorm:"not null;index"`
 	ProjectID            uint   `json:"project_id" gorm:"not null;index;uniqueIndex:idx_external_links_external_identity,priority:1;uniqueIndex:idx_external_links_internal_identity,priority:1"`
 	ConnectionID         uint   `json:"connection_id" gorm:"not null;index;uniqueIndex:idx_external_links_external_identity,priority:2;uniqueIndex:idx_external_links_internal_identity,priority:2"`
 	ExternalResourceType string `json:"external_resource_type" gorm:"size:64;not null;uniqueIndex:idx_external_links_external_identity,priority:3"`
@@ -493,7 +493,7 @@ type SyncCursor struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
-	OrganizationID uint          `json:"organization_id" gorm:"index"`
+	OrganizationID uint          `json:"organization_id" gorm:"not null;index"`
 	ProjectID      uint          `json:"project_id" gorm:"not null;index;uniqueIndex:idx_sync_cursors_project_connection_direction_stream,priority:1"`
 	ConnectionID   uint          `json:"connection_id" gorm:"not null;index;uniqueIndex:idx_sync_cursors_project_connection_direction_stream,priority:2"`
 	Stream         string        `json:"stream" gorm:"size:128;not null;uniqueIndex:idx_sync_cursors_project_connection_direction_stream,priority:4"`
@@ -526,7 +526,7 @@ type SyncRun struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
-	OrganizationID uint          `json:"organization_id" gorm:"index"`
+	OrganizationID uint          `json:"organization_id" gorm:"not null;index"`
 	ProjectID      uint          `json:"project_id" gorm:"not null;index;uniqueIndex:idx_sync_runs_project_connection_run_key,priority:1"`
 	ConnectionID   uint          `json:"connection_id" gorm:"not null;index;uniqueIndex:idx_sync_runs_project_connection_run_key,priority:2"`
 	RunKey         string        `json:"run_key" gorm:"size:191;not null;uniqueIndex:idx_sync_runs_project_connection_run_key,priority:3"`
@@ -564,7 +564,7 @@ type IntegrationConflict struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
-	OrganizationID               uint                      `json:"organization_id" gorm:"index"`
+	OrganizationID               uint                      `json:"organization_id" gorm:"not null;index"`
 	ProjectID                    uint                      `json:"project_id" gorm:"not null;index;uniqueIndex:idx_integration_conflicts_project_connection_key,priority:1"`
 	ConnectionID                 uint                      `json:"connection_id" gorm:"not null;index;uniqueIndex:idx_integration_conflicts_project_connection_key,priority:2"`
 	InboxMessageID               uint                      `json:"inbox_message_id" gorm:"not null;index"`
@@ -608,7 +608,7 @@ type DeadLetter struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
-	OrganizationID uint             `json:"organization_id" gorm:"index"`
+	OrganizationID uint             `json:"organization_id" gorm:"not null;index"`
 	ProjectID      uint             `json:"project_id" gorm:"not null;index"`
 	ConnectionID   uint             `json:"connection_id" gorm:"not null;index"`
 	InboxMessageID uint             `json:"inbox_message_id" gorm:"not null;uniqueIndex"`

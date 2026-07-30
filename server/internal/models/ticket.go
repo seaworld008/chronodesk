@@ -139,7 +139,7 @@ type AgentContext struct {
 // Ticket 工单模型
 type Ticket struct {
 	ID        uint           `json:"id" gorm:"primaryKey;autoIncrement"`
-	PublicID  string         `json:"public_id" gorm:"size:36;uniqueIndex;<-:create"`
+	PublicID  string         `json:"public_id" gorm:"size:36;not null;uniqueIndex;<-:create"`
 	CreatedAt time.Time      `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time      `json:"updated_at" gorm:"autoUpdateTime"`
 	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
@@ -147,11 +147,11 @@ type Ticket struct {
 	// Project is the only security and configuration boundary. These values are
 	// resolved from trusted OperationContext and never accepted from a request
 	// body or Agent payload.
-	OrganizationID       uint   `json:"organization_id" gorm:"index"`
-	ProjectID            uint   `json:"project_id" gorm:"index;uniqueIndex:idx_tickets_project_number,priority:1"`
-	QueueID              uint   `json:"queue_id" gorm:"index"`
-	RequestTypeVersionID string `json:"request_type_version_id" gorm:"size:36;index"`
-	WorkflowVersionID    string `json:"workflow_version_id" gorm:"size:36;index"`
+	OrganizationID       uint   `json:"organization_id" gorm:"not null;index"`
+	ProjectID            uint   `json:"project_id" gorm:"not null;index;uniqueIndex:idx_tickets_project_number,priority:1"`
+	QueueID              uint   `json:"queue_id" gorm:"not null;index"`
+	RequestTypeVersionID string `json:"request_type_version_id" gorm:"size:36;not null;index"`
+	WorkflowVersionID    string `json:"workflow_version_id" gorm:"size:36;not null;index"`
 
 	// 基本信息
 	TicketNumber string `json:"ticket_number" gorm:"uniqueIndex:idx_tickets_project_number,priority:2;size:64;not null"` // 项目内工单编号

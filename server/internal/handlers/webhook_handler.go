@@ -86,17 +86,26 @@ type ListWebhooksResponse struct {
 	Size  int                    `json:"size"`
 }
 
+// TestWebhookResult separates command handling from the external delivery
+// outcome. A failed delivery is still a successfully handled test command, so
+// the project transaction can commit its durable attempt log.
+type TestWebhookResult struct {
+	Status    string `json:"status"`
+	Delivered bool   `json:"delivered"`
+}
+
 // CreateWebhook 创建webhook配置
 // @Summary 创建webhook配置
 // @Description 创建新的webhook通知配置
 // @Tags webhook
 // @Accept json
 // @Produce json
+// @Param projectKey path string true "项目 Key"
 // @Param webhook body CreateWebhookRequest true "Webhook配置"
 // @Success 200 {object} models.WebhookConfig
 // @Failure 400 {object} map[string]interface{}
 // @Failure 500 {object} map[string]interface{}
-// @Router /api/webhooks [post]
+// @Router /api/projects/{projectKey}/webhooks [post]
 // @Security BearerAuth
 func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
 	operation, ok := requireWebhookProjectAccess(c, true)
@@ -225,13 +234,14 @@ func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
 // @Tags webhook
 // @Accept json
 // @Produce json
+// @Param projectKey path string true "项目 Key"
 // @Param page query int false "页码" default(1)
 // @Param page_size query int false "每页数量" default(10)
 // @Param provider query string false "提供商过滤"
 // @Param status query string false "状态过滤"
 // @Success 200 {object} ListWebhooksResponse
 // @Failure 500 {object} map[string]interface{}
-// @Router /api/webhooks [get]
+// @Router /api/projects/{projectKey}/webhooks [get]
 // @Security BearerAuth
 func (h *WebhookHandler) ListWebhooks(c *gin.Context) {
 	operation, ok := requireWebhookProjectAccess(c, false)
@@ -316,11 +326,12 @@ func (h *WebhookHandler) ListWebhooks(c *gin.Context) {
 // @Tags webhook
 // @Accept json
 // @Produce json
+// @Param projectKey path string true "项目 Key"
 // @Param id path int true "Webhook ID"
 // @Success 200 {object} models.WebhookConfig
 // @Failure 404 {object} map[string]interface{}
 // @Failure 500 {object} map[string]interface{}
-// @Router /api/webhooks/{id} [get]
+// @Router /api/projects/{projectKey}/webhooks/{id} [get]
 // @Security BearerAuth
 func (h *WebhookHandler) GetWebhook(c *gin.Context) {
 	operation, ok := requireWebhookProjectAccess(c, false)
@@ -378,13 +389,14 @@ func (h *WebhookHandler) GetWebhook(c *gin.Context) {
 // @Tags webhook
 // @Accept json
 // @Produce json
+// @Param projectKey path string true "项目 Key"
 // @Param id path int true "Webhook ID"
 // @Param webhook body UpdateWebhookRequest true "更新数据"
 // @Success 200 {object} models.WebhookConfig
 // @Failure 400 {object} map[string]interface{}
 // @Failure 404 {object} map[string]interface{}
 // @Failure 500 {object} map[string]interface{}
-// @Router /api/webhooks/{id} [put]
+// @Router /api/projects/{projectKey}/webhooks/{id} [put]
 // @Security BearerAuth
 func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 	operation, ok := requireWebhookProjectAccess(c, true)
@@ -662,11 +674,12 @@ func (h *WebhookHandler) protectWebhookSecret(
 // @Tags webhook
 // @Accept json
 // @Produce json
+// @Param projectKey path string true "项目 Key"
 // @Param id path int true "Webhook ID"
 // @Success 200 {object} map[string]interface{}
 // @Failure 404 {object} map[string]interface{}
 // @Failure 500 {object} map[string]interface{}
-// @Router /api/webhooks/{id} [delete]
+// @Router /api/projects/{projectKey}/webhooks/{id} [delete]
 // @Security BearerAuth
 func (h *WebhookHandler) DeleteWebhook(c *gin.Context) {
 	operation, ok := requireWebhookProjectAccess(c, true)
@@ -737,11 +750,12 @@ func (h *WebhookHandler) DeleteWebhook(c *gin.Context) {
 // @Tags webhook
 // @Accept json
 // @Produce json
+// @Param projectKey path string true "项目 Key"
 // @Param id path int true "Webhook ID"
 // @Success 200 {object} map[string]interface{}
 // @Failure 404 {object} map[string]interface{}
 // @Failure 500 {object} map[string]interface{}
-// @Router /api/webhooks/{id}/test [post]
+// @Router /api/projects/{projectKey}/webhooks/{id}/test [post]
 // @Security BearerAuth
 func (h *WebhookHandler) TestWebhook(c *gin.Context) {
 	operation, ok := requireWebhookProjectAccess(c, true)
@@ -766,10 +780,17 @@ func (h *WebhookHandler) TestWebhook(c *gin.Context) {
 		uint(id),
 	); err != nil {
 		logHandlerFailure(c, "webhook.test", err)
-		c.JSON(http.StatusBadRequest, gin.H{
+		// The command completed and produced an auditable failed delivery
+		// result. Keep the HTTP status successful so ProjectScopeMiddleware
+		// commits the attempt log, while the non-zero application code retains
+		// the existing UI error semantics.
+		c.JSON(http.StatusOK, gin.H{
 			"code": 1,
 			"msg":  "Webhook 测试失败，请检查配置和目标服务状态",
-			"data": nil,
+			"data": TestWebhookResult{
+				Status:    "failed",
+				Delivered: false,
+			},
 		})
 		return
 	}
@@ -777,7 +798,10 @@ func (h *WebhookHandler) TestWebhook(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"msg":  "测试消息发送成功",
-		"data": nil,
+		"data": TestWebhookResult{
+			Status:    "success",
+			Delivered: true,
+		},
 	})
 }
 
@@ -787,13 +811,14 @@ func (h *WebhookHandler) TestWebhook(c *gin.Context) {
 // @Tags webhook
 // @Accept json
 // @Produce json
+// @Param projectKey path string true "项目 Key"
 // @Param id path int true "Webhook ID"
 // @Param page query int false "页码" default(1)
 // @Param page_size query int false "每页数量" default(20)
 // @Param status query string false "状态过滤"
 // @Success 200 {object} map[string]interface{}
 // @Failure 500 {object} map[string]interface{}
-// @Router /api/webhooks/{id}/logs [get]
+// @Router /api/projects/{projectKey}/webhooks/{id}/logs [get]
 // @Security BearerAuth
 func (h *WebhookHandler) GetWebhookLogs(c *gin.Context) {
 	operation, ok := requireWebhookProjectAccess(c, false)
@@ -823,23 +848,25 @@ func (h *WebhookHandler) GetWebhookLogs(c *gin.Context) {
 
 	offset := (page - 1) * pageSize
 
-	// 构建查询
-	query := h.db.WithContext(c.Request.Context()).
-		Model(&models.WebhookLog{}).
-		Where(
-			"organization_id = ? AND project_id = ? AND config_id = ?",
-			operation.Scope.OrganizationID,
-			operation.Scope.ProjectID,
-			uint(id),
-		)
-
-	if status != "" {
-		query = query.Where("status = ?", status)
+	// Count 和 Find 必须使用独立 Statement，避免 GORM 的终结方法污染后续查询。
+	newLogQuery := func() *gorm.DB {
+		query := h.db.WithContext(c.Request.Context()).
+			Model(&models.WebhookLog{}).
+			Where(
+				"organization_id = ? AND project_id = ? AND config_id = ?",
+				operation.Scope.OrganizationID,
+				operation.Scope.ProjectID,
+				uint(id),
+			)
+		if status != "" {
+			query = query.Where("status = ?", status)
+		}
+		return query
 	}
 
 	// 获取总数
 	var total int64
-	if err := query.Count(&total).Error; err != nil {
+	if err := newLogQuery().Count(&total).Error; err != nil {
 		logHandlerFailure(c, "webhook.count_logs", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code": 1,
@@ -851,7 +878,7 @@ func (h *WebhookHandler) GetWebhookLogs(c *gin.Context) {
 
 	// 获取数据
 	var logs []models.WebhookLog
-	if err := query.Order("created_at DESC").
+	if err := newLogQuery().Order("created_at DESC").
 		Offset(offset).
 		Limit(pageSize).
 		Find(&logs).Error; err != nil {
@@ -882,11 +909,12 @@ func (h *WebhookHandler) GetWebhookLogs(c *gin.Context) {
 // @Tags webhook
 // @Accept json
 // @Produce json
+// @Param projectKey path string true "项目 Key"
 // @Param id path int true "Webhook ID"
 // @Param days query int false "统计天数" default(7)
 // @Success 200 {object} map[string]interface{}
 // @Failure 500 {object} map[string]interface{}
-// @Router /api/webhooks/{id}/stats [get]
+// @Router /api/projects/{projectKey}/webhooks/{id}/stats [get]
 // @Security BearerAuth
 func (h *WebhookHandler) GetWebhookStats(c *gin.Context) {
 	operation, ok := requireWebhookProjectAccess(c, false)

@@ -495,7 +495,10 @@ func newProjectConfigurationHandlerEnvironment(
 	if err != nil {
 		t.Fatal(err)
 	}
-	configService, err := services.NewProjectConfigurationService(database)
+	configService, err := services.NewProjectConfigurationService(
+		database,
+		projectHandlerEventAppender{},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -182,6 +182,9 @@ func ValidateProjectRLSReadiness(db *gorm.DB) error {
 	if err := validateProjectOwnedTableScopes(db, projectRLSProtectedTableNames); err != nil {
 		return fmt.Errorf("project RLS schema validation failed: %w", err)
 	}
+	if err := validatePostgresProjectOwnedNotNullContract(db); err != nil {
+		return fmt.Errorf("project RLS nullability validation failed: %w", err)
+	}
 	if db.Dialector.Name() != "postgres" {
 		return nil
 	}
@@ -194,6 +197,9 @@ func ValidateProjectRLSReadiness(db *gorm.DB) error {
 func EnableProjectRLS(db *gorm.DB) error {
 	if err := validateProjectOwnedTableScopes(db, projectRLSProtectedTableNames); err != nil {
 		return fmt.Errorf("project RLS schema validation failed: %w", err)
+	}
+	if err := validatePostgresProjectOwnedNotNullContract(db); err != nil {
+		return fmt.Errorf("project RLS nullability validation failed: %w", err)
 	}
 	if db.Dialector.Name() != "postgres" {
 		return errors.New("project RLS can only be enabled on PostgreSQL")
@@ -227,6 +233,9 @@ func EnableProjectRLS(db *gorm.DB) error {
 func ValidateProjectRLSRuntime(db *gorm.DB) error {
 	if err := validateProjectOwnedTableScopes(db, projectRLSProtectedTableNames); err != nil {
 		return fmt.Errorf("project RLS schema validation failed: %w", err)
+	}
+	if err := validatePostgresProjectOwnedNotNullContract(db); err != nil {
+		return fmt.Errorf("project RLS nullability validation failed: %w", err)
 	}
 	if db.Dialector.Name() != "postgres" {
 		return nil
@@ -339,6 +348,100 @@ type postgresProjectRLSState struct {
 	PolicyPublic     bool           `gorm:"column:policy_public"`
 	UsingExpression  sql.NullString `gorm:"column:using_expression"`
 	CheckExpression  sql.NullString `gorm:"column:check_expression"`
+}
+
+type postgresProjectColumnNullability struct {
+	TableName  string `gorm:"column:table_name"`
+	ColumnName string `gorm:"column:column_name"`
+	NotNull    bool   `gorm:"column:not_null"`
+}
+
+type projectOwnedNotNullColumn struct {
+	table  string
+	column string
+}
+
+func projectOwnedNotNullContract() []projectOwnedNotNullColumn {
+	contract := make(
+		[]projectOwnedNotNullColumn,
+		0,
+		len(requiredProjectOwnedTableNames)*2+4,
+	)
+	for _, tableName := range requiredProjectOwnedTableNames {
+		contract = append(
+			contract,
+			projectOwnedNotNullColumn{table: tableName, column: "organization_id"},
+			projectOwnedNotNullColumn{table: tableName, column: "project_id"},
+		)
+	}
+	for _, columnName := range []string{
+		"public_id",
+		"queue_id",
+		"request_type_version_id",
+		"workflow_version_id",
+	} {
+		contract = append(
+			contract,
+			projectOwnedNotNullColumn{table: "tickets", column: columnName},
+		)
+	}
+	return contract
+}
+
+func validatePostgresProjectOwnedNotNullContract(db *gorm.DB) error {
+	if db == nil || db.Dialector.Name() != "postgres" {
+		return nil
+	}
+	tableNames := RequiredProjectOwnedTables()
+	columnNames := []string{
+		"organization_id",
+		"project_id",
+		"public_id",
+		"queue_id",
+		"request_type_version_id",
+		"workflow_version_id",
+	}
+	var rows []postgresProjectColumnNullability
+	if err := db.Raw(`
+		SELECT
+			table_name,
+			column_name,
+			(is_nullable = 'NO') AS not_null
+		FROM information_schema.columns
+		WHERE table_schema = CURRENT_SCHEMA()
+		  AND table_name IN ?
+		  AND column_name IN ?
+	`, tableNames, columnNames).Scan(&rows).Error; err != nil {
+		return fmt.Errorf("read project column nullability: %w", err)
+	}
+
+	present := make(
+		map[string]postgresProjectColumnNullability,
+		len(rows),
+	)
+	for _, row := range rows {
+		present[row.TableName+"."+row.ColumnName] = row
+	}
+	var violations []string
+	for _, required := range projectOwnedNotNullContract() {
+		key := required.table + "." + required.column
+		row, exists := present[key]
+		if !exists {
+			violations = append(violations, key+" (missing)")
+			continue
+		}
+		if !row.NotNull {
+			violations = append(violations, key+" (nullable)")
+		}
+	}
+	if len(violations) > 0 {
+		sort.Strings(violations)
+		return fmt.Errorf(
+			"project-owned columns must be NOT NULL: %s",
+			strings.Join(violations, ", "),
+		)
+	}
+	return nil
 }
 
 func validatePostgresProjectRLSState(db *gorm.DB, requireEnabled bool) error {

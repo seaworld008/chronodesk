@@ -1,6 +1,8 @@
 package database
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -61,7 +63,10 @@ func TestMigrateProjectScopeBackfillsTicketBoundaryAndQueues(t *testing.T) {
 	}
 
 	for attempt := 1; attempt <= 2; attempt++ {
-		if err := MigrateProjectScope(db); err != nil {
+		if err := MigrateProjectScope(
+			db,
+			testProjectScopeMembershipWriter,
+		); err != nil {
 			t.Fatalf("migration attempt %d: %v", attempt, err)
 		}
 	}
@@ -245,7 +250,10 @@ func TestMigrateProjectScopeBackfillsLegacyChildEventAndDeliveryRows(t *testing.
 		t.Fatal(err)
 	}
 
-	if err := MigrateProjectScope(db); err != nil {
+	if err := MigrateProjectScope(
+		db,
+		testProjectScopeMembershipWriter,
+	); err != nil {
 		t.Fatal(err)
 	}
 	organization, _, project, _ := loadDefaultProjectHierarchy(t, db)
@@ -309,7 +317,10 @@ func TestMigrateProjectScopeBackfillsDefaultAuthorizationIdempotently(t *testing
 	}
 
 	for attempt := 1; attempt <= 2; attempt++ {
-		if err := MigrateProjectScope(db); err != nil {
+		if err := MigrateProjectScope(
+			db,
+			testProjectScopeMembershipWriter,
+		); err != nil {
 			t.Fatalf("project scope migration attempt %d: %v", attempt, err)
 		}
 	}
@@ -391,8 +402,8 @@ func TestMigrateProjectScopeBackfillsDefaultAuthorizationIdempotently(t *testing
 		}
 	}
 
-	// A rerun must fill newly discovered identities without undoing explicit
-	// project-local authorization changes made after the first migration.
+	// A rerun must not reinterpret identities created after the one-time
+	// cutover or undo explicit project-local authorization changes.
 	if err := db.Model(&models.ProjectMembership{}).
 		Where("project_id = ? AND user_id = ?", project.ID, users[0].ID).
 		Updates(map[string]any{
@@ -426,7 +437,10 @@ func TestMigrateProjectScopeBackfillsDefaultAuthorizationIdempotently(t *testing
 		t.Fatal(err)
 	}
 
-	if err := MigrateProjectScope(db); err != nil {
+	if err := MigrateProjectScope(
+		db,
+		testProjectScopeMembershipWriter,
+	); err != nil {
 		t.Fatalf("project scope migration after new identities: %v", err)
 	}
 
@@ -458,40 +472,252 @@ func TestMigrateProjectScopeBackfillsDefaultAuthorizationIdempotently(t *testing
 		t.Fatalf("explicit principal grant change was overwritten: %+v", preservedGrant)
 	}
 
-	var lateMembership models.ProjectMembership
-	if err := db.Where(
+	var lateMembershipCount int64
+	if err := db.Model(&models.ProjectMembership{}).Where(
 		"project_id = ? AND user_id = ?",
 		project.ID,
 		newUser.ID,
-	).First(&lateMembership).Error; err != nil {
+	).Count(&lateMembershipCount).Error; err != nil {
 		t.Fatal(err)
 	}
-	if lateMembership.Role != models.ProjectRoleAgent || !lateMembership.IsActive {
-		t.Fatalf("late user membership = %+v", lateMembership)
+	if lateMembershipCount != 0 {
+		t.Fatalf("late user received %d implicit DEFAULT memberships", lateMembershipCount)
 	}
-	var lateGrant models.ProjectPrincipalGrant
-	if err := db.Where(
+	var lateGrantCount int64
+	if err := db.Model(&models.ProjectPrincipalGrant{}).Where(
 		"project_id = ? AND service_principal_id = ?",
 		project.ID,
 		newPrincipal.ID,
-	).First(&lateGrant).Error; err != nil {
+	).Count(&lateGrantCount).Error; err != nil {
 		t.Fatal(err)
 	}
-	lateScopes, err := lateGrant.ScopeList()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !lateGrant.IsActive ||
-		!reflect.DeepEqual(lateScopes, []string{"events:subscribe"}) {
-		t.Fatalf("late principal grant = %+v scopes=%v", lateGrant, lateScopes)
+	if lateGrantCount != 0 {
+		t.Fatalf("late principal received %d implicit DEFAULT grants", lateGrantCount)
 	}
 
 	assertProjectScopeRowCount(t, db, &models.Organization{}, 1)
 	assertProjectScopeRowCount(t, db, &models.BusinessUnit{}, 1)
 	assertProjectScopeRowCount(t, db, &models.Project{}, 1)
 	assertProjectScopeRowCount(t, db, &models.Queue{}, 1)
-	assertProjectScopeRowCount(t, db, &models.ProjectMembership{}, 5)
-	assertProjectScopeRowCount(t, db, &models.ProjectPrincipalGrant{}, 3)
+	assertProjectScopeRowCount(t, db, &models.ProjectMembership{}, 4)
+	assertProjectScopeRowCount(t, db, &models.ProjectPrincipalGrant{}, 2)
+	assertProjectScopeRowCount(t, db, &models.SchemaMigrationCheckpoint{}, 1)
+}
+
+func TestMigrateProjectScopeCheckpointProtectsLiveMultiProjectData(
+	t *testing.T,
+) {
+	db := openProjectScopeMigrationDB(t, "checkpoint-protects-live-data")
+	if err := db.AutoMigrate(&models.Ticket{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateProjectScope(
+		db,
+		testProjectScopeMembershipWriter,
+	); err != nil {
+		t.Fatalf("initial project scope cutover: %v", err)
+	}
+	organization, _, defaultProject, _ := loadDefaultProjectHierarchy(t, db)
+	if err := db.Model(&models.Project{}).
+		Where("id = ?", defaultProject.ID).
+		UpdateColumn("ticket_sequence", 41).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	unit := models.BusinessUnit{
+		OrganizationID: organization.ID,
+		Key:            "OTHER",
+		Name:           "其他业务线",
+		Status:         models.BusinessUnitStatusActive,
+	}
+	if err := db.Create(&unit).Error; err != nil {
+		t.Fatal(err)
+	}
+	otherProject := models.Project{
+		OrganizationID: organization.ID,
+		BusinessUnitID: unit.ID,
+		Key:            models.ProjectKey("OTHER"),
+		Name:           "其他项目",
+		Status:         models.ProjectStatusActive,
+		TicketSequence: 7,
+	}
+	if err := db.Create(&otherProject).Error; err != nil {
+		t.Fatal(err)
+	}
+	otherQueue := models.Queue{
+		ProjectID: otherProject.ID,
+		Key:       models.QueueKey("other"),
+		Name:      "其他队列",
+		Status:    models.QueueStatusActive,
+		IsDefault: true,
+	}
+	if err := db.Create(&otherQueue).Error; err != nil {
+		t.Fatal(err)
+	}
+	otherTicket := models.Ticket{
+		OrganizationID:       organization.ID,
+		ProjectID:            otherProject.ID,
+		QueueID:              otherQueue.ID,
+		RequestTypeVersionID: "00000000-0000-7000-8000-000000009001",
+		WorkflowVersionID:    "00000000-0000-7000-8000-000000009002",
+		TicketNumber:         "OTHER-7",
+		Title:                "保持项目边界",
+		Description:          "迁移重跑不能重写",
+		Type:                 models.TicketTypeRequest,
+		Priority:             models.TicketPriorityNormal,
+		Status:               models.TicketStatusOpen,
+		Source:               models.TicketSourceAPI,
+		Version:              3,
+		CreatedByActorType:   models.ActorTypeSystem,
+		CreatedByActorID:     "checkpoint-regression",
+	}
+	if err := db.Create(&otherTicket).Error; err != nil {
+		t.Fatal(err)
+	}
+	originalPublicID := otherTicket.PublicID
+
+	lateUser := projectScopeMigrationUser("other-only-user", models.RoleAgent)
+	if err := db.Create(&lateUser).Error; err != nil {
+		t.Fatal(err)
+	}
+	latePrincipal := projectScopeMigrationPrincipal(
+		"00000000-0000-4000-8000-000000009003",
+		"other-only-principal",
+		`["tickets:read"]`,
+	)
+	if err := db.Create(&latePrincipal).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := MigrateProjectScope(
+		db,
+		testProjectScopeMembershipWriter,
+	); err != nil {
+		t.Fatalf("repeat project scope migration: %v", err)
+	}
+
+	var preserved models.Ticket
+	if err := db.Unscoped().First(&preserved, otherTicket.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if preserved.OrganizationID != organization.ID ||
+		preserved.ProjectID != otherProject.ID ||
+		preserved.QueueID != otherQueue.ID ||
+		preserved.PublicID != originalPublicID ||
+		preserved.TicketNumber != "OTHER-7" ||
+		preserved.RequestTypeVersionID != otherTicket.RequestTypeVersionID ||
+		preserved.WorkflowVersionID != otherTicket.WorkflowVersionID ||
+		preserved.Version != 3 {
+		t.Fatalf("repeat cutover rewrote scoped ticket: %+v", preserved)
+	}
+	var reloadedDefault models.Project
+	if err := db.First(&reloadedDefault, defaultProject.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var reloadedOther models.Project
+	if err := db.First(&reloadedOther, otherProject.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if reloadedDefault.TicketSequence != 41 ||
+		reloadedOther.TicketSequence != 7 {
+		t.Fatalf(
+			"repeat cutover changed project sequences: DEFAULT=%d OTHER=%d",
+			reloadedDefault.TicketSequence,
+			reloadedOther.TicketSequence,
+		)
+	}
+	var implicitMemberships int64
+	if err := db.Model(&models.ProjectMembership{}).
+		Where("project_id = ? AND user_id = ?", defaultProject.ID, lateUser.ID).
+		Count(&implicitMemberships).Error; err != nil {
+		t.Fatal(err)
+	}
+	var implicitGrants int64
+	if err := db.Model(&models.ProjectPrincipalGrant{}).
+		Where(
+			"project_id = ? AND service_principal_id = ?",
+			defaultProject.ID,
+			latePrincipal.ID,
+		).
+		Count(&implicitGrants).Error; err != nil {
+		t.Fatal(err)
+	}
+	if implicitMemberships != 0 || implicitGrants != 0 {
+		t.Fatalf(
+			"repeat cutover granted DEFAULT access: memberships=%d grants=%d",
+			implicitMemberships,
+			implicitGrants,
+		)
+	}
+	assertProjectScopeRowCount(t, db, &models.SchemaMigrationCheckpoint{}, 1)
+}
+
+func TestMigrateProjectScopeRejectsMismatchedCheckpoint(t *testing.T) {
+	db := openProjectScopeMigrationDB(t, "mismatched-checkpoint")
+	if err := db.Create(&models.SchemaMigrationCheckpoint{
+		Key:         projectScopeCutoverCheckpointKey,
+		Version:     projectScopeCutoverCheckpointVersion,
+		Checksum:    strings.Repeat("0", 64),
+		CompletedAt: time.Now().UTC(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	err := MigrateProjectScope(db, testProjectScopeMembershipWriter)
+	if err == nil || !strings.Contains(err.Error(), "version or checksum") {
+		t.Fatalf("mismatched checkpoint error = %v", err)
+	}
+	assertProjectScopeRowCount(t, db, &models.Organization{}, 0)
+}
+
+func TestMigrateProjectScopeWritesCheckpointOnlyAfterAtomicBackfill(
+	t *testing.T,
+) {
+	db := openProjectScopeMigrationDB(t, "checkpoint-after-backfill")
+	users := []models.User{
+		projectScopeMigrationUser("first-legacy-user", models.RoleAdmin),
+		projectScopeMigrationUser("second-legacy-user", models.RoleAgent),
+	}
+	if err := db.Create(&users).Error; err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected membership writer failure")
+	calls := 0
+	failingWriter := func(
+		_ context.Context,
+		tx *gorm.DB,
+		user models.User,
+		scope models.ProjectScope,
+		role models.ProjectRole,
+	) error {
+		calls++
+		if calls == 2 {
+			return injected
+		}
+		return testProjectScopeMembershipWriter(
+			context.Background(),
+			tx,
+			user,
+			scope,
+			role,
+		)
+	}
+	err := MigrateProjectScope(db, failingWriter)
+	if !errors.Is(err, injected) {
+		t.Fatalf("cutover error = %v, want injected failure", err)
+	}
+	assertProjectScopeRowCount(t, db, &models.Organization{}, 0)
+	assertProjectScopeRowCount(t, db, &models.ProjectMembership{}, 0)
+	assertProjectScopeRowCount(t, db, &models.SchemaMigrationCheckpoint{}, 0)
+
+	if err := MigrateProjectScope(
+		db,
+		testProjectScopeMembershipWriter,
+	); err != nil {
+		t.Fatalf("retry project scope cutover: %v", err)
+	}
+	assertProjectScopeRowCount(t, db, &models.Organization{}, 1)
+	assertProjectScopeRowCount(t, db, &models.ProjectMembership{}, 2)
+	assertProjectScopeRowCount(t, db, &models.SchemaMigrationCheckpoint{}, 1)
 }
 
 func TestMigrateProjectScopeFailsClosedAndRollsBack(t *testing.T) {
@@ -547,7 +773,10 @@ func TestMigrateProjectScopeFailsClosedAndRollsBack(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			db := openProjectScopeMigrationDB(t, test.name)
 			test.seed(t, db)
-			err := MigrateProjectScope(db)
+			err := MigrateProjectScope(
+				db,
+				testProjectScopeMembershipWriter,
+			)
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("migration error = %v, want %q", err, test.want)
 			}
@@ -557,8 +786,33 @@ func TestMigrateProjectScopeFailsClosedAndRollsBack(t *testing.T) {
 			assertProjectScopeRowCount(t, db, &models.Queue{}, 0)
 			assertProjectScopeRowCount(t, db, &models.ProjectMembership{}, 0)
 			assertProjectScopeRowCount(t, db, &models.ProjectPrincipalGrant{}, 0)
+			assertProjectScopeRowCount(t, db, &models.SchemaMigrationCheckpoint{}, 0)
 		})
 	}
+}
+
+func TestMigrateProjectScopeRequiresAuditedWriterForLegacyUsers(
+	t *testing.T,
+) {
+	db := openProjectScopeMigrationDB(t, "membership-writer-required")
+	user := projectScopeMigrationUser("legacy-admin", models.RoleAdmin)
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	err := MigrateProjectScope(db)
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"audited project scope membership writer is required",
+	) {
+		t.Fatalf("migration error = %v, want audited writer requirement", err)
+	}
+	assertProjectScopeRowCount(t, db, &models.Organization{}, 0)
+	assertProjectScopeRowCount(t, db, &models.BusinessUnit{}, 0)
+	assertProjectScopeRowCount(t, db, &models.Project{}, 0)
+	assertProjectScopeRowCount(t, db, &models.Queue{}, 0)
+	assertProjectScopeRowCount(t, db, &models.ProjectMembership{}, 0)
+	assertProjectScopeRowCount(t, db, &models.SchemaMigrationCheckpoint{}, 0)
 }
 
 func TestMigrateProjectScopeRequiresCompleteSchema(t *testing.T) {
@@ -619,6 +873,7 @@ func openProjectScopeMigrationDB(t *testing.T, suffix string) *gorm.DB {
 		t.Fatal(err)
 	}
 	if err := db.AutoMigrate(
+		&models.SchemaMigrationCheckpoint{},
 		&models.User{},
 		&models.ServicePrincipal{},
 		&models.Organization{},
@@ -646,6 +901,22 @@ func projectScopeMigrationUser(
 		Role:         role,
 		Status:       models.UserStatusActive,
 	}
+}
+
+func testProjectScopeMembershipWriter(
+	_ context.Context,
+	tx *gorm.DB,
+	user models.User,
+	scope models.ProjectScope,
+	role models.ProjectRole,
+) error {
+	return tx.Create(&models.ProjectMembership{
+		ProjectID: scope.ProjectID,
+		UserID:    user.ID,
+		Role:      role,
+		IsActive:  true,
+		Version:   1,
+	}).Error
 }
 
 func projectScopeMigrationPrincipal(

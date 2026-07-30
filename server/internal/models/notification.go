@@ -45,8 +45,8 @@ type Notification struct {
 	ID             uint      `json:"id" gorm:"primaryKey;autoIncrement"`
 	CreatedAt      time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt      time.Time `json:"updated_at" gorm:"autoUpdateTime"`
-	OrganizationID uint      `json:"organization_id" gorm:"index"`
-	ProjectID      uint      `json:"project_id" gorm:"index"`
+	OrganizationID uint      `json:"organization_id" gorm:"not null;index"`
+	ProjectID      uint      `json:"project_id" gorm:"not null;index"`
 
 	// SourceEventKey binds an in-app notification to one durable Outbox
 	// delivery. NULL is reserved for manually created notifications; Outbox

@@ -329,6 +329,13 @@ func TestCreateTicketDerivesSLAProjectionFromSLAConfig(t *testing.T) {
 	native := NewAgentNativeService(db, AgentNativeOptions{Now: func() time.Time { return now }})
 	svc := newTicketServiceWithDependenciesForTest(t, db, native, nil, 0)
 	ctx := testProjectOperationContext(t, db, models.HumanActor(creator.ID))
+	grantHumanTicketCreateMembership(
+		t,
+		db,
+		ctx,
+		creator.ID,
+		models.ProjectRoleAgent,
+	)
 	ticket, err := svc.CreateTicket(ctx, &models.TicketCreateRequest{
 		Title:       "SLA-backed ticket",
 		Description: "deadline should be derived",

@@ -95,8 +95,12 @@ func TestPostgresProjectRLSIntegration(t *testing.T) {
 	if err := db.Exec(`
 		CREATE TABLE tickets (
 			id BIGINT PRIMARY KEY,
+			public_id VARCHAR(36) NOT NULL,
 			organization_id BIGINT NOT NULL,
 			project_id BIGINT NOT NULL,
+			queue_id BIGINT NOT NULL,
+			request_type_version_id VARCHAR(36) NOT NULL,
+			workflow_version_id VARCHAR(36) NOT NULL,
 			title TEXT NOT NULL
 		)
 	`).Error; err != nil {
@@ -123,10 +127,37 @@ func TestPostgresProjectRLSIntegration(t *testing.T) {
 		t.Fatalf("seed projects: %v", err)
 	}
 	if err := db.Exec(`
-		INSERT INTO tickets (id, organization_id, project_id, title)
+		INSERT INTO tickets (
+			id,
+			public_id,
+			organization_id,
+			project_id,
+			queue_id,
+			request_type_version_id,
+			workflow_version_id,
+			title
+		)
 		VALUES
-			(1, 10, 100, 'project-a'),
-			(2, 10, 200, 'project-b')
+			(
+				1,
+				'00000000-0000-7000-8000-000000000001',
+				10,
+				100,
+				1000,
+				'00000000-0000-7000-8000-000000000101',
+				'00000000-0000-7000-8000-000000000201',
+				'project-a'
+			),
+			(
+				2,
+				'00000000-0000-7000-8000-000000000002',
+				10,
+				200,
+				2000,
+				'00000000-0000-7000-8000-000000000102',
+				'00000000-0000-7000-8000-000000000202',
+				'project-b'
+			)
 	`).Error; err != nil {
 		t.Fatalf("seed cross-project rows: %v", err)
 	}
@@ -295,12 +326,25 @@ func TestPostgresProjectRLSIntegration(t *testing.T) {
 					return tx.Exec(`
 						INSERT INTO tickets (
 							id,
+							public_id,
 							organization_id,
 							project_id,
+							queue_id,
+							request_type_version_id,
+							workflow_version_id,
 							title
 						)
-						VALUES (?, ?, ?, ?)
-					`, 5, 10, 100, "project-a-context").Error
+						VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+					`,
+						5,
+						"00000000-0000-7000-8000-000000000005",
+						10,
+						100,
+						1000,
+						"00000000-0000-7000-8000-000000000101",
+						"00000000-0000-7000-8000-000000000201",
+						"project-a-context",
+					).Error
 				},
 			)
 		},
@@ -344,12 +388,25 @@ func TestPostgresProjectRLSIntegration(t *testing.T) {
 			return runtimeDB.WithContext(scopedContext).Exec(`
 				INSERT INTO tickets (
 					id,
+					public_id,
 					organization_id,
 					project_id,
+					queue_id,
+					request_type_version_id,
+					workflow_version_id,
 					title
 				)
-				VALUES (?, ?, ?, ?)
-			`, 6, 20, 300, "cross-organization-write").Error
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			`,
+				6,
+				"00000000-0000-7000-8000-000000000006",
+				20,
+				300,
+				3000,
+				"00000000-0000-7000-8000-000000000101",
+				"00000000-0000-7000-8000-000000000201",
+				"cross-organization-write",
+			).Error
 		},
 	)
 	if crossWriteErr == nil {
@@ -453,9 +510,27 @@ func TestPostgresProjectRLSIntegration(t *testing.T) {
 				return fmt.Errorf("correct scope returned ticket ids %v", ids)
 			}
 			return scoped.Exec(`
-				INSERT INTO tickets (id, organization_id, project_id, title)
-				VALUES (?, ?, ?, ?)
-			`, 3, 10, 100, "project-a-created").Error
+				INSERT INTO tickets (
+					id,
+					public_id,
+					organization_id,
+					project_id,
+					queue_id,
+					request_type_version_id,
+					workflow_version_id,
+					title
+				)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			`,
+				3,
+				"00000000-0000-7000-8000-000000000003",
+				10,
+				100,
+				1000,
+				"00000000-0000-7000-8000-000000000101",
+				"00000000-0000-7000-8000-000000000201",
+				"project-a-created",
+			).Error
 		},
 	); err != nil {
 		t.Fatalf("verify correct scope read/write: %v", err)
@@ -478,9 +553,27 @@ func TestPostgresProjectRLSIntegration(t *testing.T) {
 		models.ProjectScope{OrganizationID: 10, ProjectID: 100},
 		func(scoped *gorm.DB) error {
 			return scoped.Exec(`
-				INSERT INTO tickets (id, organization_id, project_id, title)
-				VALUES (?, ?, ?, ?)
-			`, 4, 10, 200, "cross-project-write").Error
+				INSERT INTO tickets (
+					id,
+					public_id,
+					organization_id,
+					project_id,
+					queue_id,
+					request_type_version_id,
+					workflow_version_id,
+					title
+				)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			`,
+				4,
+				"00000000-0000-7000-8000-000000000004",
+				10,
+				200,
+				2000,
+				"00000000-0000-7000-8000-000000000101",
+				"00000000-0000-7000-8000-000000000201",
+				"cross-project-write",
+			).Error
 		},
 	)
 	if writeErr == nil {

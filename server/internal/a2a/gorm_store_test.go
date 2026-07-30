@@ -15,6 +15,8 @@ import (
 	"gorm.io/gorm"
 )
 
+const gormAsyncTestTimeout = 5 * time.Second
+
 func TestGormStorePersistsTaskGraphAndReplayLog(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {
@@ -140,6 +142,13 @@ func TestGormExecutionClaimIsExclusiveAcrossServicesAndRenews(t *testing.T) {
 	var cancellations atomic.Int32
 	started := make(chan struct{})
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseBackend := func() {
+		releaseOnce.Do(func() {
+			close(release)
+		})
+	}
+	t.Cleanup(releaseBackend)
 	backend := BackendFuncs{
 		ProcessFunc: func(ctx context.Context, _ Task, _ Message, _ Reporter) error {
 			if executions.Add(1) == 1 {
@@ -155,8 +164,8 @@ func TestGormExecutionClaimIsExclusiveAcrossServicesAndRenews(t *testing.T) {
 		},
 	}
 	options := ServiceOptions{
-		ExecutionClaimTTL:      80 * time.Millisecond,
-		ExecutionRenewInterval: 15 * time.Millisecond,
+		ExecutionClaimTTL:      5 * time.Second,
+		ExecutionRenewInterval: 100 * time.Millisecond,
 	}
 	serviceOne := NewService(storeOne, backend, options)
 	serviceTwo := NewService(storeTwo, backend, options)
@@ -175,22 +184,73 @@ func TestGormExecutionClaimIsExclusiveAcrossServicesAndRenews(t *testing.T) {
 	}
 	select {
 	case <-started:
-	case <-time.After(time.Second):
+	case <-time.After(gormAsyncTestTimeout):
 		t.Fatal("first service did not start backend")
 	}
 	working, err := storeOne.GetTask(a2aTestContext(t), first.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if working.ExecutionClaimID == "" || working.ExecutionExpiresAt == nil {
+		t.Fatalf("working Task is missing its execution claim: %+v", working)
+	}
+	if working.ExecutionMessageID != params.Message.MessageID {
+		t.Fatalf(
+			"working Task execution message=%q, want %q",
+			working.ExecutionMessageID,
+			params.Message.MessageID,
+		)
+	}
+	claimID := working.ExecutionClaimID
+	initialExpiry := *working.ExecutionExpiresAt
 	workingVersion := working.Version
 	workingModified := working.LastModified
 
-	// Retry beyond the initial TTL. Successful renewals must keep the second
-	// service from acquiring and restarting the same durable execution.
+	// Observe a real heartbeat before replaying through the second service.
+	// This proves renewal without relying on a sub-second TTL that can expire
+	// solely because a shared CI runner pauses the process.
+	renewDeadline := time.Now().Add(gormAsyncTestTimeout)
+	for {
+		renewed, getErr := storeOne.GetTask(a2aTestContext(t), first.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if renewed.ExecutionClaimID != claimID {
+			t.Fatalf(
+				"heartbeat changed execution claim from %q to %q",
+				claimID,
+				renewed.ExecutionClaimID,
+			)
+		}
+		if renewed.ExecutionExpiresAt != nil &&
+			renewed.ExecutionExpiresAt.After(initialExpiry) {
+			break
+		}
+		if time.Now().After(renewDeadline) {
+			t.Fatalf(
+				"execution claim %q was not renewed beyond %s",
+				claimID,
+				initialExpiry,
+			)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Successful renewal must keep the second service from acquiring and
+	// restarting the same durable execution.
 	for i := 0; i < 4; i++ {
 		time.Sleep(35 * time.Millisecond)
-		if _, err := serviceTwo.SendMessage(a2aTestContext(t), params); err != nil {
-			t.Fatalf("service two retry %d: %v", i, err)
+		replayed, replayErr := serviceTwo.SendMessage(a2aTestContext(t), params)
+		if replayErr != nil {
+			t.Fatalf("service two retry %d: %v", i, replayErr)
+		}
+		if replayed.ID != first.ID {
+			t.Fatalf(
+				"service two retry %d returned Task %q, want %q",
+				i,
+				replayed.ID,
+				first.ID,
+			)
 		}
 	}
 	if got := executions.Load(); got != 1 {
@@ -214,24 +274,29 @@ func TestGormExecutionClaimIsExclusiveAcrossServicesAndRenews(t *testing.T) {
 		)
 	}
 
-	close(release)
-	deadline := time.Now().Add(time.Second)
+	releaseBackend()
+	deadline := time.Now().Add(gormAsyncTestTimeout)
 	for {
 		task, getErr := storeOne.GetTask(a2aTestContext(t), first.ID)
 		if getErr != nil {
 			t.Fatal(getErr)
 		}
-		if task.Status.State == TaskStateCompleted && task.ExecutionClaimID == "" {
+		if task.Status.State == TaskStateCompleted &&
+			task.ExecutionClaimID == "" &&
+			task.ExecutionMessageID == "" &&
+			task.ExecutionExpiresAt == nil {
 			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf(
-				"Task did not complete and release claim: state=%s claim=%q",
+				"Task did not complete and release claim: state=%s claim=%q message=%q expires=%v",
 				task.Status.State,
 				task.ExecutionClaimID,
+				task.ExecutionMessageID,
+				task.ExecutionExpiresAt,
 			)
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	changedText := "mutated cross-service command"
 	mismatched := params
@@ -509,8 +574,8 @@ func TestGormCancellationStopsRemoteExecutionRenewal(t *testing.T) {
 		},
 	}
 	options := ServiceOptions{
-		ExecutionClaimTTL:      100 * time.Millisecond,
-		ExecutionRenewInterval: 15 * time.Millisecond,
+		ExecutionClaimTTL:      5 * time.Second,
+		ExecutionRenewInterval: 100 * time.Millisecond,
 	}
 	serviceOne := NewService(storeOne, backend, options)
 	serviceTwo := NewService(storeTwo, backend, options)
@@ -528,7 +593,7 @@ func TestGormCancellationStopsRemoteExecutionRenewal(t *testing.T) {
 	}
 	select {
 	case <-started:
-	case <-time.After(time.Second):
+	case <-time.After(gormAsyncTestTimeout):
 		t.Fatal("backend did not start")
 	}
 	canceledTask, err := serviceTwo.CancelTask(a2aTestContext(t), task.ID)
@@ -540,10 +605,10 @@ func TestGormCancellationStopsRemoteExecutionRenewal(t *testing.T) {
 	}
 	select {
 	case <-canceled:
-	case <-time.After(time.Second):
+	case <-time.After(gormAsyncTestTimeout):
 		t.Fatal("terminal state did not make remote renewal cancel backend")
 	}
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(gormAsyncTestTimeout)
 	for {
 		reloaded, getErr := storeOne.GetTask(a2aTestContext(t), task.ID)
 		if getErr != nil {

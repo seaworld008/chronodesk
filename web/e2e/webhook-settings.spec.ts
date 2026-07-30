@@ -8,6 +8,8 @@ import {
     extractData,
     extractItems,
     getAdminToken,
+    projectAPIPath,
+    resolveE2EProjectKey,
     trackE2EResource,
 } from './helpers/testData';
 import { assertDestructiveE2EAllowed } from './helpers/safety';
@@ -38,6 +40,9 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
         request,
     }) => {
         test.setTimeout(60_000);
+        const token = await getAdminToken(request);
+        const projectKey = await resolveE2EProjectKey(request, token);
+        const webhooksPath = projectAPIPath(projectKey, 'webhooks');
         await authenticatePage(page);
         await page.goto('/#/webhook-settings');
         await page
@@ -65,7 +70,7 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
         const create = page.waitForResponse(
             (response) =>
                 response.request().method() === 'POST' &&
-                new URL(response.url()).pathname === '/api/webhooks',
+                new URL(response.url()).pathname === webhooksPath,
         );
         await form.getByRole('button', { name: '保存' }).click();
         const createResponse = await create;
@@ -108,7 +113,7 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
         const update = page.waitForResponse(
             (response) =>
                 response.request().method() === 'PUT' &&
-                /^\/api\/webhooks\/\d+$/.test(new URL(response.url()).pathname),
+                new URL(response.url()).pathname.startsWith(`${webhooksPath}/`),
         );
         await form.getByRole('button', { name: '保存' }).click();
         expect((await update).status()).toBe(200);
@@ -116,11 +121,10 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
             timeout: 15_000,
         });
 
-        const token = await getAdminToken(request);
         const listResponse = await apiRequest<Record<string, unknown>>(
             request,
             token,
-            `/api/webhooks?page=1&page_size=100&name=${encodeURIComponent(webhookName)}`,
+            `${webhooksPath}?page=1&page_size=100&name=${encodeURIComponent(webhookName)}`,
         );
         expect(JSON.stringify(listResponse)).not.toContain(markerSecret);
         const webhook = extractItems<Record<string, unknown>>(listResponse).find(
@@ -148,7 +152,7 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
             (response) =>
                 response.request().method() === 'POST' &&
                 new URL(response.url()).pathname ===
-                    `/api/webhooks/${webhook!.id}/test`,
+                    `${webhooksPath}/${webhook!.id}/test`,
         );
         await confirmation
             .getByRole('button', {
@@ -156,19 +160,36 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
                 exact: true,
             })
             .click();
-        expect((await testResponse).status()).toBe(400);
+        const tested = await testResponse;
+        expect(tested.status()).toBe(200);
+        const testPayload = await tested.json() as Record<string, unknown>;
+        expect(testPayload.code).toBe(1);
+        expect(extractData<Record<string, unknown>>(testPayload).status).toBe(
+            'failed',
+        );
         await expect(
             page.getByText(/测试失败|webhook目标地址未通过安全校验/i),
         ).toBeVisible({ timeout: 10_000 });
         await expectChineseOperations(page);
 
-        const logsResponse = await apiRequest<Record<string, unknown>>(
-            request,
-            token,
-            `/api/webhooks/${webhook!.id}/logs?page=1&page_size=20`,
-        );
-        const logs = extractItems<Record<string, unknown>>(logsResponse);
-        expect(logs.length).toBeGreaterThan(0);
+        let logs: Record<string, unknown>[] = [];
+        await expect
+            .poll(
+                async () => {
+                    const logsResponse = await apiRequest<Record<string, unknown>>(
+                        request,
+                        token,
+                        `${webhooksPath}/${webhook!.id}/logs?page=1&page_size=20`,
+                    );
+                    logs = extractItems<Record<string, unknown>>(logsResponse);
+                    return logs.length;
+                },
+                {
+                    message: 'Webhook 测试失败日志应在项目作用域内持久化',
+                    timeout: 10_000,
+                },
+            )
+            .toBeGreaterThan(0);
         expect(logs[0].event_type).toBe('io.chronodesk.system.alert.v1');
         expect(logs[0].status).toBe('failed');
         expect(JSON.stringify(logs)).not.toContain(markerSecret);

@@ -85,6 +85,31 @@ const trackedIDs = (resource: TrackedResource) => [
 
 const authSessions = new Map<string, Promise<AuthSession>>();
 const projectKeyRequests = new Map<string, Promise<string>>();
+const ticketCreateConfigurationRequests = new Map<
+    string,
+    Promise<TicketCreateConfiguration>
+>();
+
+type TicketCreateConfiguration = {
+    requestTypeVersionID: string;
+    workflowVersionID: string;
+    workClass: string;
+};
+
+type TicketIntakeConfiguration = {
+    request_types?: Array<{
+        id?: unknown;
+        status?: unknown;
+        work_class?: unknown;
+    }>;
+    workflows?: Array<{
+        id?: unknown;
+        status?: unknown;
+    }>;
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+    typeof value === 'object' && value !== null;
 
 export const extractData = <T>(payload: unknown): T => {
     if (
@@ -98,21 +123,18 @@ export const extractData = <T>(payload: unknown): T => {
 };
 
 export const extractItems = <T>(payload: unknown): T[] => {
-    if (!payload || typeof payload !== 'object') {
-        return [];
+    const data = isRecord(payload) && 'data' in payload
+        ? payload.data
+        : payload;
+    if (Array.isArray(data)) {
+        return data as T[];
     }
-    const data = (payload as Record<string, unknown>).data as Record<string, unknown> | undefined;
-    if (data?.items && Array.isArray(data.items)) {
-        return data.items as T[];
-    }
-    if (data?.rules && Array.isArray(data.rules)) {
-        return data.rules as T[];
-    }
-    if (data?.logs && Array.isArray(data.logs)) {
-        return data.logs as T[];
-    }
-    if (Array.isArray(payload)) {
-        return payload as T[];
+    if (isRecord(data)) {
+        for (const key of ['items', 'rules', 'logs'] as const) {
+            if (Array.isArray(data[key])) {
+                return data[key] as T[];
+            }
+        }
     }
     return [];
 };
@@ -161,11 +183,10 @@ export const resolveE2EProjectKey = (
                     typeof project === 'object' &&
                     project !== null &&
                     project.status === 'active' &&
-                    typeof project.key === 'string' &&
-                    /^[A-Z][A-Z0-9_-]{0,31}$/.test(project.key),
+                    project.key === 'DEFAULT',
             );
         if (!selected || typeof selected.key !== 'string') {
-            throw new Error('当前账号没有可用于 E2E 的活动项目');
+            throw new Error('当前账号没有可用于 E2E 的活动 DEFAULT 项目');
         }
         return selected.key;
     })().catch((error) => {
@@ -180,6 +201,61 @@ export const projectAPIPath = (
     projectKey: string,
     suffix: string,
 ) => `/api/projects/${encodeURIComponent(projectKey)}/${suffix.replace(/^\/+/, '')}`;
+
+export const resolveE2ETicketCreateConfiguration = (
+    request: APIRequestContext,
+    token: string,
+    projectKey: string,
+): Promise<TicketCreateConfiguration> => {
+    const cacheKey = `${token}:${projectKey}`;
+    const existing = ticketCreateConfigurationRequests.get(cacheKey);
+    if (existing) {
+        return existing;
+    }
+
+    const pending = (async () => {
+        const response = await apiRequest<Record<string, unknown>>(
+            request,
+            token,
+            projectAPIPath(projectKey, 'configuration/intake'),
+        );
+        const intake = extractData<TicketIntakeConfiguration>(response);
+        const requestType = intake.request_types?.find(
+            (candidate) =>
+                candidate.status === 'published' &&
+                candidate.work_class === 'request' &&
+                typeof candidate.id === 'string' &&
+                candidate.id.length > 0,
+        );
+        const workflow = intake.workflows?.find(
+            (candidate) =>
+                candidate.status === 'published' &&
+                typeof candidate.id === 'string' &&
+                candidate.id.length > 0,
+        );
+        if (
+            !requestType ||
+            typeof requestType.id !== 'string' ||
+            typeof requestType.work_class !== 'string' ||
+            !workflow ||
+            typeof workflow.id !== 'string'
+        ) {
+            throw new Error(
+                `项目 ${projectKey} 缺少可用于 E2E 建单的已发布请求类型或工作流`,
+            );
+        }
+        return {
+            requestTypeVersionID: requestType.id,
+            workflowVersionID: workflow.id,
+            workClass: requestType.work_class,
+        };
+    })().catch((error) => {
+        ticketCreateConfigurationRequests.delete(cacheKey);
+        throw error;
+    });
+    ticketCreateConfigurationRequests.set(cacheKey, pending);
+    return pending;
+};
 
 export const authenticatePage = async (
     page: Page,
@@ -538,18 +614,39 @@ export const createTicket = async (request: APIRequestContext, title: string) =>
         throw new Error('测试工单标题必须包含本轮唯一 marker');
     }
     const token = await getAdminToken(request);
-    const response = await apiRequest<Record<string, unknown>>(request, token, '/api/tickets', {
-        method: 'POST',
-        data: {
-            title,
-            description: `${title} 自动化测试描述`,
-            type: 'request',
-            priority: 'normal',
-            source: 'web',
+    const projectKey = await resolveE2EProjectKey(request, token);
+    const configuration = await resolveE2ETicketCreateConfiguration(
+        request,
+        token,
+        projectKey,
+    );
+    const response = await apiRequest<Record<string, unknown>>(
+        request,
+        token,
+        projectAPIPath(projectKey, 'tickets'),
+        {
+            method: 'POST',
+            data: {
+                title,
+                description: `${title} 自动化测试描述`,
+                type: configuration.workClass,
+                priority: 'normal',
+                source: 'web',
+                request_type_version_id:
+                    configuration.requestTypeVersionID,
+                workflow_version_id: configuration.workflowVersionID,
+            },
         },
-    });
-    const data = (response.data as Record<string, unknown>) ?? {};
-    const id = data.id as number;
+    );
+    const ticket = extractData<Record<string, unknown>>(response);
+    if (
+        typeof ticket.id !== 'number' ||
+        !Number.isSafeInteger(ticket.id) ||
+        ticket.id <= 0
+    ) {
+        throw new Error('创建 E2E 工单后响应缺少有效 ID');
+    }
+    const id = ticket.id;
     trackE2EResource('tickets', id);
     return id;
 };
@@ -559,10 +656,15 @@ const deleteVersionedTicket = async (
     token: string,
     id: string | number,
 ) => {
+    const projectKey = await resolveE2EProjectKey(request, token);
+    const ticketPath = projectAPIPath(
+        projectKey,
+        `tickets/${encodeURIComponent(id)}`,
+    );
     const detail = await apiRequest<Record<string, unknown>>(
         request,
         token,
-        `/api/tickets/${encodeURIComponent(id)}`,
+        ticketPath,
     );
     const ticket = extractData<Record<string, unknown>>(detail);
     const version = ticket.version;
@@ -573,7 +675,7 @@ const deleteVersionedTicket = async (
     ) {
         throw new Error(`工单 ${id} 缺少有效版本，拒绝无条件清理`);
     }
-    await apiRequest(request, token, `/api/tickets/${encodeURIComponent(id)}`, {
+    await apiRequest(request, token, ticketPath, {
         method: 'DELETE',
         headers: { 'If-Match': `"v${version}"` },
     });
@@ -597,10 +699,11 @@ export const createAutomationRule = async (
         throw new Error('测试自动化规则名称必须包含本轮唯一 marker');
     }
     const token = await getAdminToken(request);
+    const projectKey = await resolveE2EProjectKey(request, token);
     const response = await apiRequest<Record<string, unknown>>(
         request,
         token,
-        '/api/admin/automation/rules',
+        projectAPIPath(projectKey, 'admin/automation/rules'),
         {
             method: 'POST',
             data: {
@@ -621,11 +724,15 @@ export const createAutomationRule = async (
 };
 
 const deleteAutomationRules = async (request: APIRequestContext, token: string) => {
+    const projectKey = await resolveE2EProjectKey(request, token);
     for (const id of trackedIDs('automationRules')) {
         await apiRequest(
             request,
             token,
-            `/api/admin/automation/rules/${encodeURIComponent(id)}`,
+            projectAPIPath(
+                projectKey,
+                `admin/automation/rules/${encodeURIComponent(id)}`,
+            ),
             { method: 'DELETE' },
         );
         untrackE2EResource('automationRules', id);
@@ -656,10 +763,17 @@ const deleteNotifications = async (request: APIRequestContext, token: string) =>
 };
 
 const deleteWebhooks = async (request: APIRequestContext, token: string) => {
+    const projectKey = await resolveE2EProjectKey(request, token);
     for (const id of trackedIDs('webhooks')) {
-        await apiRequest(request, token, `/api/webhooks/${encodeURIComponent(id)}`, {
-            method: 'DELETE',
-        });
+        await apiRequest(
+            request,
+            token,
+            projectAPIPath(
+                projectKey,
+                `webhooks/${encodeURIComponent(id)}`,
+            ),
+            { method: 'DELETE' },
+        );
         untrackE2EResource('webhooks', id);
     }
 };

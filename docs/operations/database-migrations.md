@@ -61,9 +61,48 @@ make -C server migrate-sample
 make -C server migrate-verbose
 ```
 
-`-seed` 只初始化管理员与默认分类，并在一个事务内完成；任一步失败都会整体
-回滚。演示数据必须额外传入 `-sample-data`，且仅接受
+`-seed` 初始化管理员、默认分类、必要系统配置，以及该管理员在迁移所创建的
+active 默认 Organization/Project 下的明确 `project_admin` Membership。全部写入
+在一个事务内完成；默认项目缺失、已归档或已有冲突 Membership 时会拒绝覆盖并
+整体回滚。该高权限 Membership 必须通过共享领域服务，以
+`chronodesk-bootstrap` system Actor 同事务写入 CloudEvent、Outbox 和审计哈希链；
+命令缺少该领域写入器时 fail closed。重复执行不会创建重复管理员、Membership
+或事件。演示数据必须额外传入 `-sample-data`，且仅接受
 `ENVIRONMENT=development`。
+
+旧库已有的 active 用户在项目 scope 迁移中按原角色映射到默认项目。迁移命令和
+应用启动组合层必须注入共享 Membership 领域写入器；缺失时迁移整体回滚。新建
+授权以 `chronodesk-project-scope-migration` system Actor 同事务写入
+Membership、CloudEvent、Outbox 与审计哈希链。停用或软删除用户不会获得新的
+active Membership。
+
+该破坏性数据切换只允许执行一次。迁移在同一事务的最后写入
+`schema_migration_checkpoints`，固定记录 key、版本、编译期 checksum 和完成时间；
+PostgreSQL 使用事务级 advisory lock 串行化首次切换。任一 Ticket、Membership、
+事件、Outbox 或审计写入失败时，checkpoint 与全部回填一起回滚。后续迁移验证
+checkpoint 后会跳过全部数据与授权回填，因此不会重置项目编号、改写其他项目
+工单，也不会把后来创建的 Human 或 Service Principal 静默授予 DEFAULT 项目。
+结构门禁仍会检查并按需恢复项目列的 `NOT NULL`；健康数据库不会重复执行
+`ALTER TABLE`。checkpoint 内容不匹配会 fail closed；在项目 RLS 已启用后发现
+checkpoint 缺失同样拒绝自动认领，必须先人工审计数据库。
+
+对于真正的旧库，迁移在 GORM 应用最终模型契约前，仅给原本不存在的
+`organization_id/project_id` 加入非空 `0` 哨兵，并移除列默认值；Ticket 的
+公共 ID 使用唯一、可识别的临时哨兵。一次性回填会把这些值替换为可信项目范围
+与 UUIDv7。上一次迁移中断后留下的“六列已存在但全部为 `NULL/0`”形态会被
+规范回相同的 legacy 哨兵，以便安全重试；任何既有项目控制数据或非零项目范围
+都会 fail closed，绝不会在 checkpoint 缺失时被自动归入 DEFAULT。
+
+模型、迁移与运行时门禁共同要求所有项目业务表的
+`organization_id/project_id`，以及 Ticket 的 `public_id/queue_id/`
+`request_type_version_id/workflow_version_id` 为 `NOT NULL`。运行时会从
+PostgreSQL catalog 验证该契约；六列幂等唯一索引不能在可空项目范围上启动。
+
+项目 scope 回填后，迁移会在事务内锁定 `idempotency_records`，将旧四列
+`idx_idempotency_actor_operation_key` 原子重建为
+`organization_id, project_id, actor_type, actor_id, operation, key` 六列唯一
+索引。运行时启动校验会核对唯一性和精确列顺序；旧索引、表达式索引、部分索引
+或无效索引都会拒绝启动。
 
 `-resume-from-model` 只用于一次迁移在模型扫描阶段因网络超时中断的情况。已完成的单模型迁移会独立提交；续跑仍会执行全部索引与 Schema 校验。
 
@@ -122,6 +161,9 @@ Worker 必须按项目把 claim 与 finalize 分成两个短事务，网络投�
 
 数据库结构迁移不会改写凭据。ChronoDesk 只接受当前 `cdsec` 信封、bcrypt
 密码/备用码哈希和域分离 token 摘要；维护命令不会摄入历史明文。
+凭据维护需要与结构迁移相同的短生命周期特权连接，优先读取
+`DATABASE_MIGRATION_URL`，且不会使用 `DATABASE_RUNTIME_URL` 做可能被 RLS
+过滤成空结果的全局校验。
 
 ```bash
 make credential-validate

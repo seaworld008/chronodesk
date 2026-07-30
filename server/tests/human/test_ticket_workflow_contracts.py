@@ -173,12 +173,10 @@ def test_invalid_transition_is_a_versioned_conflict_with_allowed_next_states(
     details = body.get("details")
     assert isinstance(details, dict), body
     allowed = details.get("allowed_next_statuses")
-    assert set(allowed or []) == {
-        "in_progress",
-        "pending",
-        "resolved",
-        "cancelled",
-    }
+    # The published bootstrap workflow requires work to start before it can
+    # wait or resolve.  This assertion deliberately follows that immutable
+    # workflow version instead of the removed global lifecycle projection.
+    assert set(allowed or []) == {"in_progress", "cancelled"}
 
     unchanged = admin.api.get_json(e2e_manager.project_path(f"tickets/{ticket['id']}"))
     assert unchanged.status_code == 200, unchanged.text

@@ -24,6 +24,7 @@ func TestAssignmentTargetErrorsMapConsistentlyAcrossMCPAndA2A(t *testing.T) {
 			CredentialID: fixture.credential.ID,
 			ProjectKey:   string(fixture.project.Key),
 			Scope:        fixture.project.Scope(),
+			TokenScopes:  fixture.principal.ScopeList(),
 		}},
 	)
 	if err != nil {
@@ -150,6 +151,7 @@ func TestMCPAndA2AAssignmentPersistIdenticalCanonicalValues(t *testing.T) {
 			CredentialID: fixture.credential.ID,
 			ProjectKey:   string(fixture.project.Key),
 			Scope:        fixture.project.Scope(),
+			TokenScopes:  fixture.principal.ScopeList(),
 		}},
 	)
 	if err != nil {

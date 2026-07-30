@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/database"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"github.com/joho/godotenv"
 	"gorm.io/driver/postgres"
@@ -102,12 +103,19 @@ func main() {
 			log.Fatalf("删除数据表失败：%v", err)
 		}
 	}
-	if err := database.RunMigrationsFromModel(ctx, db, resumeAt); err != nil {
+	if err := database.RunMigrationsFromModel(
+		ctx,
+		db,
+		resumeAt,
+		services.EnsureProjectScopeMigrationMembership,
+	); err != nil {
 		log.Fatalf("数据库迁移失败：%v", err)
 	}
 	if seedData {
 		if err := database.SeedData(db, database.SeedOptions{
 			IncludeSampleData: samples,
+			EnsureInitialAdministratorMembership: services.
+				EnsureBootstrapProjectAdministratorMembership,
 		}); err != nil {
 			log.Fatalf("初始化业务数据失败：%v", err)
 		}

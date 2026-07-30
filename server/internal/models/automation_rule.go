@@ -14,8 +14,8 @@ type AutomationRule struct {
 	UpdatedAt time.Time      `json:"updated_at" gorm:"autoUpdateTime"`
 	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
 
-	OrganizationID uint `json:"organization_id" gorm:"index"`
-	ProjectID      uint `json:"project_id" gorm:"index"`
+	OrganizationID uint `json:"organization_id" gorm:"not null;index"`
+	ProjectID      uint `json:"project_id" gorm:"not null;index"`
 
 	// 基本信息
 	Name        string `json:"name" gorm:"size:100;not null"`
@@ -133,8 +133,8 @@ type SLAConfig struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
-	OrganizationID uint `json:"organization_id" gorm:"index"`
-	ProjectID      uint `json:"project_id" gorm:"index"`
+	OrganizationID uint `json:"organization_id" gorm:"not null;index"`
+	ProjectID      uint `json:"project_id" gorm:"not null;index"`
 
 	// 基本信息
 	Name        string `json:"name" gorm:"size:100;not null"`
@@ -263,8 +263,8 @@ type TicketTemplate struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
-	OrganizationID uint `json:"organization_id" gorm:"index"`
-	ProjectID      uint `json:"project_id" gorm:"index"`
+	OrganizationID uint `json:"organization_id" gorm:"not null;index"`
+	ProjectID      uint `json:"project_id" gorm:"not null;index"`
 
 	// 基本信息
 	Name        string `json:"name" gorm:"size:100;not null"`
@@ -325,8 +325,8 @@ type AutomationLog struct {
 	ID        uint      `json:"id" gorm:"primaryKey;autoIncrement"`
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 
-	OrganizationID uint `json:"organization_id" gorm:"index"`
-	ProjectID      uint `json:"project_id" gorm:"index"`
+	OrganizationID uint `json:"organization_id" gorm:"not null;index"`
+	ProjectID      uint `json:"project_id" gorm:"not null;index"`
 
 	// 关联信息
 	RuleID   uint            `json:"rule_id" gorm:"index"`
@@ -357,8 +357,8 @@ type QuickReply struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
-	OrganizationID uint `json:"organization_id" gorm:"index"`
-	ProjectID      uint `json:"project_id" gorm:"index"`
+	OrganizationID uint `json:"organization_id" gorm:"not null;index"`
+	ProjectID      uint `json:"project_id" gorm:"not null;index"`
 
 	// 基本信息
 	Name     string `json:"name" gorm:"size:100;not null"`

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"gorm.io/datatypes"
@@ -22,6 +23,7 @@ var (
 	ErrQueueNotFound             = errors.New("queue not found")
 	ErrProjectMembershipNotFound = errors.New("project membership not found")
 	ErrProjectMembershipUser     = errors.New("project membership user is unavailable")
+	ErrProjectMembershipConflict = errors.New("project membership conflicts with required grant")
 	ErrLastProjectAdministrator  = errors.New("project requires an active administrator")
 	ErrProjectEventWriter        = errors.New("project event writer is unavailable")
 	ErrProjectSequenceConflict   = errors.New("project ticket sequence conflict")
@@ -166,6 +168,27 @@ func (service *ProjectService) UpsertHumanMembership(
 	scope models.ProjectScope,
 	input UpsertProjectMembershipInput,
 ) (*ProjectMembershipView, error) {
+	return service.writeHumanMembership(ctx, scope, input, false)
+}
+
+// EnsureHumanMembership creates the requested grant exactly once. An existing
+// identical active grant is a no-op; an inactive or differently privileged
+// grant fails closed instead of silently changing an operator decision. This
+// is used by trusted bootstrap flows that must remain idempotent and auditable.
+func (service *ProjectService) EnsureHumanMembership(
+	ctx context.Context,
+	scope models.ProjectScope,
+	input UpsertProjectMembershipInput,
+) (*ProjectMembershipView, error) {
+	return service.writeHumanMembership(ctx, scope, input, true)
+}
+
+func (service *ProjectService) writeHumanMembership(
+	ctx context.Context,
+	scope models.ProjectScope,
+	input UpsertProjectMembershipInput,
+	ensureOnly bool,
+) (*ProjectMembershipView, error) {
 	operation, err := matchingProjectOperation(ctx, scope)
 	if err != nil {
 		return nil, err
@@ -178,6 +201,7 @@ func (service *ProjectService) UpsertHumanMembership(
 	}
 
 	var membership models.ProjectMembership
+	changed := false
 	err = transactionForContext(ctx, service.db, func(tx *gorm.DB) error {
 		var project models.Project
 		if err := tx.Clauses(clause.Locking{Strength: "SHARE"}).
@@ -219,9 +243,22 @@ func (service *ProjectService) UpsertHumanMembership(
 			if err := tx.Create(&membership).Error; err != nil {
 				return fmt.Errorf("create project membership: %w", err)
 			}
+			changed = true
 		case query.Error != nil:
 			return fmt.Errorf("lock project membership: %w", query.Error)
 		default:
+			if ensureOnly {
+				if membership.Role != input.Role || !membership.IsActive {
+					return fmt.Errorf(
+						"%w: existing role %q active=%t",
+						ErrProjectMembershipConflict,
+						membership.Role,
+						membership.IsActive,
+					)
+				}
+				membership.User = user
+				return nil
+			}
 			if membership.Role == models.ProjectRoleAdmin &&
 				input.Role != models.ProjectRoleAdmin &&
 				membership.IsActive {
@@ -245,6 +282,10 @@ func (service *ProjectService) UpsertHumanMembership(
 				return fmt.Errorf("update project membership: %w", err)
 			}
 			membership.User = user
+			changed = true
+		}
+		if !changed {
+			return nil
 		}
 		return service.appendMembershipEventTx(
 			ctx,
@@ -512,6 +553,49 @@ func (service *ProjectService) ResolveHumanProject(
 	}, nil
 }
 
+func (service *ProjectService) activeHumanMembershipRole(
+	ctx context.Context,
+	scope models.ProjectScope,
+	userID uint,
+) (models.ProjectRole, error) {
+	if service == nil || service.db == nil || userID == 0 {
+		return "", ErrProjectAccessDenied
+	}
+	if err := scope.Validate(); err != nil {
+		return "", ErrProjectAccessDenied
+	}
+	var membership struct {
+		Role models.ProjectRole
+	}
+	if err := service.db.WithContext(ctx).
+		Table("project_memberships").
+		Select("project_memberships.role").
+		Joins(
+			"JOIN projects ON projects.id = project_memberships.project_id",
+		).
+		Where(
+			"project_memberships.project_id = ? AND project_memberships.user_id = ? AND project_memberships.is_active = ?",
+			scope.ProjectID,
+			userID,
+			true,
+		).
+		Where(
+			"projects.organization_id = ? AND projects.status = ?",
+			scope.OrganizationID,
+			models.ProjectStatusActive,
+		).
+		Take(&membership).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", ErrProjectAccessDenied
+		}
+		return "", fmt.Errorf("resolve active project membership: %w", err)
+	}
+	if !membership.Role.IsValid() {
+		return "", ErrProjectAccessDenied
+	}
+	return membership.Role, nil
+}
+
 func (service *ProjectService) ResolvePrincipalProject(
 	ctx context.Context,
 	projectKey string,
@@ -769,6 +853,9 @@ func (service *ProjectService) CreateProject(
 	if models.ValidateQueueKey(input.DefaultQueueKey) != nil {
 		return nil, errors.New("invalid default queue key")
 	}
+	if service.events == nil {
+		return nil, ErrProjectEventWriter
+	}
 	project := models.Project{
 		OrganizationID: input.OrganizationID,
 		BusinessUnitID: input.BusinessUnitID,
@@ -777,6 +864,8 @@ func (service *ProjectService) CreateProject(
 		Description:    strings.TrimSpace(input.Description),
 		Status:         models.ProjectStatusActive,
 	}
+	var queue models.Queue
+	var bootstrapRelease models.ConfigurationRelease
 	err := transactionForContext(ctx, service.db, func(tx *gorm.DB) error {
 		var unit models.BusinessUnit
 		if err := tx.WithContext(ctx).
@@ -801,7 +890,7 @@ func (service *ProjectService) CreateProject(
 		if err := tx.WithContext(ctx).Create(&membership).Error; err != nil {
 			return fmt.Errorf("create project administrator membership: %w", err)
 		}
-		queue := models.Queue{
+		queue = models.Queue{
 			ProjectID: project.ID,
 			Key:       models.QueueKey(input.DefaultQueueKey),
 			Name:      strings.TrimSpace(input.DefaultQueueName),
@@ -824,15 +913,23 @@ func (service *ProjectService) CreateProject(
 		if err != nil {
 			return err
 		}
-		if _, err := bootstrapProjectConfigurationTx(
+		bootstrapRelease, err = bootstrapProjectConfigurationTx(
 			projectContext,
 			tx,
 			operation,
 			service.now().UTC(),
-		); err != nil {
+		)
+		if err != nil {
 			return fmt.Errorf("bootstrap project configuration: %w", err)
 		}
-		return nil
+		return service.appendProjectCreatedEventTx(
+			projectContext,
+			tx,
+			operation,
+			&project,
+			&queue,
+			&bootstrapRelease,
+		)
 	})
 	if err != nil {
 		return nil, err
@@ -842,4 +939,56 @@ func (service *ProjectService) CreateProject(
 		Role:    models.ProjectRoleAdmin,
 		Scope:   project.Scope(),
 	}, nil
+}
+
+func (service *ProjectService) appendProjectCreatedEventTx(
+	ctx context.Context,
+	tx *gorm.DB,
+	operation OperationContext,
+	project *models.Project,
+	queue *models.Queue,
+	release *models.ConfigurationRelease,
+) error {
+	if service.events == nil {
+		return ErrProjectEventWriter
+	}
+	if project == nil || queue == nil || release == nil {
+		return errors.New("project creation event resources are required")
+	}
+	eventTime := service.now().UTC()
+	if release.PublishedAt != nil {
+		eventTime = release.PublishedAt.UTC()
+	}
+	_, err := service.events.AppendDomainEventTx(
+		ctx,
+		tx,
+		DomainEventInput{
+			Type:    eventcontract.ProjectCreatedEventType,
+			Subject: fmt.Sprintf("project/%d", project.ID),
+			Time:    eventTime,
+			Data: map[string]any{
+				"organization_id":               project.OrganizationID,
+				"project_id":                    project.ID,
+				"project_public_id":             project.PublicID,
+				"project_key":                   project.Key,
+				"business_unit_id":              project.BusinessUnitID,
+				"administrator_id":              operation.Actor.ID,
+				"default_queue_id":              queue.ID,
+				"default_queue_key":             queue.Key,
+				"configuration_release_id":      release.ID,
+				"configuration_release_version": release.Version,
+			},
+			Scope:                operation.Scope,
+			TraceID:              operation.TraceID,
+			CorrelationID:        operation.CorrelationID,
+			Actor:                operation.Actor,
+			ResourceVersion:      1,
+			ConfigurationVersion: release.ID,
+		},
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("append project created event: %w", err)
+	}
+	return nil
 }

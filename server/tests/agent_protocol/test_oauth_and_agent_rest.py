@@ -213,12 +213,14 @@ def test_client_credentials_rotation_and_deactivation_invalidate_tokens(
                 "read-token-create-denied"
             ),
         },
-        json_body={
-            "title": protocol_harness.unique("must-not-create"),
-            "description": f"{protocol_harness.prefix}insufficient scope",
-            "type": "request",
-            "priority": "normal",
-        },
+        json_body=protocol_harness.ticket_create_payload(
+            {
+                "title": protocol_harness.unique("must-not-create"),
+                "description": f"{protocol_harness.prefix}insufficient scope",
+                "type": "request",
+                "priority": "normal",
+            }
+        ),
     )
     _assert_problem(
         denied_create,
@@ -307,22 +309,24 @@ def test_agent_rest_ticket_idempotency_lease_version_and_event_cursor(
 
     title = protocol_harness.unique("agent-rest-ticket")
     create_key = protocol_harness.idempotency_key("agent-rest-create")
-    create_payload = {
-        "title": title,
-        "description": (
-            f"{protocol_harness.prefix}Agent REST idempotency and lease contract"
-        ),
-        "type": "request",
-        "priority": "normal",
-        "tags": ["e2e", "agent-rest"],
-        "agent_context": {
-            "goal": "验证机器接口的幂等、租约和版本边界",
-            "constraints": ["只操作当前 E2E 工单"],
-            "acceptance_criteria": ["冲突写入不覆盖数据"],
-            "missing_information": [],
-            "related_resources": [],
-        },
-    }
+    create_payload = protocol_harness.ticket_create_payload(
+        {
+            "title": title,
+            "description": (
+                f"{protocol_harness.prefix}Agent REST idempotency and lease contract"
+            ),
+            "type": "request",
+            "priority": "normal",
+            "tags": ["e2e", "agent-rest"],
+            "agent_context": {
+                "goal": "验证机器接口的幂等、租约和版本边界",
+                "constraints": ["只操作当前 E2E 工单"],
+                "acceptance_criteria": ["冲突写入不覆盖数据"],
+                "missing_information": [],
+                "related_resources": [],
+            },
+        }
+    )
     create_headers = {**headers, "Idempotency-Key": create_key}
     first_create = protocol_harness.request(
         "POST",
@@ -542,12 +546,14 @@ def test_agent_ticket_cursor_first_middle_tail_empty_and_invalid_limits(
                     f"cursor-ticket-{index}"
                 ),
             },
-            json_body={
-                "title": f"{marker}-{index}",
-                "description": f"{protocol_harness.prefix}cursor page {index}",
-                "type": "request",
-                "priority": "normal",
-            },
+            json_body=protocol_harness.ticket_create_payload(
+                {
+                    "title": f"{marker}-{index}",
+                    "description": f"{protocol_harness.prefix}cursor page {index}",
+                    "type": "request",
+                    "priority": "normal",
+                }
+            ),
         )
         assert_status(response, 201, operation=f"创建 cursor 工单 {index}")
         ticket = envelope_data(response, operation=f"创建 cursor 工单 {index}")

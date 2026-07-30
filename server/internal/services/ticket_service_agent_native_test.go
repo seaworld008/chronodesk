@@ -84,6 +84,13 @@ func TestHumanTicketLifecycleUsesNativeEventOutboxTransaction(t *testing.T) {
 	native := NewAgentNativeService(db)
 	service := newTicketServiceWithDependenciesForTest(t, db, native, nil, 0)
 	ctx := testProjectOperationContext(t, db, models.HumanActor(user.ID))
+	grantHumanTicketCreateMembership(
+		t,
+		db,
+		ctx,
+		user.ID,
+		models.ProjectRoleAgent,
+	)
 	ticket, err := service.CreateTicket(ctx, &models.TicketCreateRequest{
 		Title: "Human lifecycle", Description: "untrusted",
 		Type: models.TicketTypeRequest, Priority: models.TicketPriorityNormal,

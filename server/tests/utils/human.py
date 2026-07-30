@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .api import APIClient
+from .intake import PublishedTicketIntake, load_published_ticket_intake
 from .safety import (
     register_secret,
     response_diagnostic,
@@ -23,16 +24,58 @@ PROJECT_ROLE_BY_HUMAN_ROLE = {
     "customer": "requester",
 }
 
+_WEAK_PASSWORD_PATTERNS = (
+    "password",
+    "123456",
+    "123456789",
+    "qwerty",
+    "abc123",
+    "password123",
+    "admin",
+    "letmein",
+    "welcome",
+    "monkey",
+    "1234567890",
+    "qwertyuiop",
+    "asdfghjkl",
+    "zxcvbnm",
+)
+
+
+def _has_sequential_ascii(value: str, length: int = 4) -> bool:
+    """Mirror the backend's ascending/descending byte-sequence rejection."""
+
+    for start in range(len(value) - length + 1):
+        codepoint = ord(value[start])
+        window = value[start : start + length]
+        if all(
+            ord(character) == codepoint + offset
+            for offset, character in enumerate(window)
+        ):
+            return True
+        if all(
+            ord(character) == codepoint - offset
+            for offset, character in enumerate(window)
+        ):
+            return True
+    return False
+
 
 def strong_password() -> str:
     """Return a unique password accepted by the production policy."""
 
     while True:
         password = f"Aa1!{secrets.token_hex(10)}Z"
-        if all(
+        no_repeating_triple = all(
             password[index] != password[index + 1]
             or password[index] != password[index + 2]
             for index in range(len(password) - 2)
+        )
+        lowered = password.lower()
+        if (
+            no_repeating_triple
+            and not _has_sequential_ascii(password)
+            and not any(pattern in lowered for pattern in _WEAK_PASSWORD_PATTERNS)
         ):
             register_secret(password)
             return password
@@ -81,12 +124,28 @@ class E2EResourceManager:
         self._tickets: list[tuple[int, str]] = []
         self._notifications: list[int] = []
         self._clients: list[APIClient] = []
+        self._published_ticket_intake: PublishedTicketIntake | None = None
 
     def unique(self, label: str) -> str:
         return f"{self.prefix}{label}-{time.time_ns()}-{secrets.token_hex(2)}"
 
     def project_path(self, suffix: str) -> str:
         return self.admin_api.project_path(suffix)
+
+    def ticket_create_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        work_class: str | None = None,
+    ) -> dict[str, Any]:
+        """Bind a Ticket create payload to this project's published release."""
+
+        if self._published_ticket_intake is None:
+            self._published_ticket_intake = load_published_ticket_intake(self.admin_api)
+        return self._published_ticket_intake.ticket_create_payload(
+            payload,
+            work_class=work_class,
+        )
 
     def create_user(self, role: str, label: str) -> HumanIdentity:
         assert role in HUMAN_ROLES, f"unsupported Human role {role!r}"
@@ -98,7 +157,13 @@ class E2EResourceManager:
         username = f"e2e_{self._user_run_token}_{compact_label}_{nonce}"
         email = f"e2e+{self._user_run_token}.{compact_label}.{nonce}@example.com"
         password = strong_password()
-        display_name = self.unique(f"{label}-user")
+        # DisplayName is capped at 100 characters.  Remote ownership prefixes
+        # may be intentionally verbose, so use the stable run token here too
+        # and keep the time/nonce suffix intact instead of truncating it away.
+        display_name = (
+            f"E2E-{self._user_run_token}-{compact_label}-"
+            f"{time.time_ns()}-{secrets.token_hex(2)}"
+        )
         if role == "customer":
             response = self.api_client.post_json(
                 "/auth/register",
@@ -205,6 +270,7 @@ class E2EResourceManager:
             "source": "api",
         }
         payload.update(overrides)
+        payload = self.ticket_create_payload(payload)
         response = identity.api.post_json(
             identity.api.project_path("tickets"),
             payload,

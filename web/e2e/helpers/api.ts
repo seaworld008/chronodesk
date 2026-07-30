@@ -34,7 +34,7 @@ export const loginSession = async (
     });
 
     const json = await response.json().catch(() => ({}));
-    if (!response.ok) {
+    if (!response.ok()) {
         throw new Error(extractErrorMessage(json));
     }
 
@@ -78,7 +78,7 @@ export const apiRequest = async <T>(
     });
 
     const json = await response.json().catch(() => ({}));
-    if (!response.ok) {
+    if (!response.ok()) {
         throw new Error(extractErrorMessage(json));
     }
 

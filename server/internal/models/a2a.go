@@ -25,8 +25,8 @@ const (
 // by ID only: A2A lifecycle transitions never mutate the linked Ticket.
 type AgentTask struct {
 	ID                 string                        `json:"id" gorm:"primaryKey;size:64"`
-	OrganizationID     uint                          `json:"organization_id" gorm:"index"`
-	ProjectID          uint                          `json:"project_id" gorm:"index"`
+	OrganizationID     uint                          `json:"organization_id" gorm:"not null;index"`
+	ProjectID          uint                          `json:"project_id" gorm:"not null;index"`
 	ContextID          string                        `json:"context_id" gorm:"size:255;not null;index"`
 	LinkedTicketID     *uint                         `json:"linked_ticket_id,omitempty" gorm:"index"`
 	OwnerActorType     ActorType                     `json:"owner_actor_type,omitempty" gorm:"size:32;index:idx_agent_task_owner,priority:1"`
@@ -56,8 +56,8 @@ func (AgentTask) TableName() string {
 // indexed routing fields for efficient task/context queries.
 type AgentMessage struct {
 	ID             string         `json:"id" gorm:"primaryKey;size:255"`
-	OrganizationID uint           `json:"organization_id" gorm:"index"`
-	ProjectID      uint           `json:"project_id" gorm:"index"`
+	OrganizationID uint           `json:"organization_id" gorm:"not null;index"`
+	ProjectID      uint           `json:"project_id" gorm:"not null;index"`
 	TaskID         string         `json:"task_id" gorm:"size:64;not null;index:idx_agent_messages_task_sequence,priority:1"`
 	ContextID      string         `json:"context_id" gorm:"size:255;not null;index"`
 	Role           string         `json:"role" gorm:"size:24;not null"`
@@ -75,8 +75,8 @@ func (AgentMessage) TableName() string {
 // attachments. A backend may choose to expose a Ticket attachment as a Part.
 type AgentArtifact struct {
 	ID             string         `json:"id" gorm:"primaryKey;size:64"`
-	OrganizationID uint           `json:"organization_id" gorm:"index"`
-	ProjectID      uint           `json:"project_id" gorm:"index"`
+	OrganizationID uint           `json:"organization_id" gorm:"not null;index"`
+	ProjectID      uint           `json:"project_id" gorm:"not null;index"`
 	TaskID         string         `json:"task_id" gorm:"primaryKey;size:64;not null;index:idx_agent_artifacts_task_sequence,priority:1"`
 	Sequence       uint64         `json:"sequence" gorm:"not null;index:idx_agent_artifacts_task_sequence,priority:2"`
 	Payload        datatypes.JSON `json:"payload" gorm:"type:json;not null"`
@@ -91,8 +91,8 @@ func (AgentArtifact) TableName() string {
 // AgentTaskStatusHistory is the append-only audit trail of A2A status changes.
 type AgentTaskStatusHistory struct {
 	ID             uint64         `json:"id" gorm:"primaryKey;autoIncrement"`
-	OrganizationID uint           `json:"organization_id" gorm:"index"`
-	ProjectID      uint           `json:"project_id" gorm:"index"`
+	OrganizationID uint           `json:"organization_id" gorm:"not null;index"`
+	ProjectID      uint           `json:"project_id" gorm:"not null;index"`
 	TaskID         string         `json:"task_id" gorm:"size:64;not null;uniqueIndex:idx_agent_status_task_sequence,priority:1"`
 	Sequence       uint64         `json:"sequence" gorm:"not null;uniqueIndex:idx_agent_status_task_sequence,priority:2"`
 	State          A2ATaskState   `json:"state" gorm:"size:32;not null;index"`
@@ -108,8 +108,8 @@ func (AgentTaskStatusHistory) TableName() string {
 // subscriptions. ID is the monotonically increasing event cursor source.
 type AgentTaskEvent struct {
 	ID              uint64         `json:"id" gorm:"primaryKey;autoIncrement"`
-	OrganizationID  uint           `json:"organization_id" gorm:"index"`
-	ProjectID       uint           `json:"project_id" gorm:"index"`
+	OrganizationID  uint           `json:"organization_id" gorm:"not null;index"`
+	ProjectID       uint           `json:"project_id" gorm:"not null;index"`
 	TaskID          string         `json:"task_id" gorm:"size:64;not null;index:idx_agent_events_task_id,priority:1"`
 	ContextID       string         `json:"context_id" gorm:"size:255;not null;index"`
 	ResourceVersion uint64         `json:"resource_version" gorm:"not null;default:1"`
@@ -126,8 +126,8 @@ func (AgentTaskEvent) TableName() string {
 // layer after creation.
 type AgentPushNotificationConfig struct {
 	ID             string `json:"id" gorm:"primaryKey;size:64"`
-	OrganizationID uint   `json:"organization_id" gorm:"index"`
-	ProjectID      uint   `json:"project_id" gorm:"index"`
+	OrganizationID uint   `json:"organization_id" gorm:"not null;index"`
+	ProjectID      uint   `json:"project_id" gorm:"not null;index"`
 	TaskID         string `json:"task_id" gorm:"size:64;not null;index"`
 	URL            string `json:"url" gorm:"size:2048;not null"`
 	// Token contains an AEAD envelope. Authentication stores that envelope as

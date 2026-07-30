@@ -19,6 +19,8 @@ import {
     findUserByEmail,
     getAdminToken,
     projectAPIPath,
+    resolveE2EProjectKey,
+    resolveE2ETicketCreateConfiguration,
     trackE2EResource,
 } from './helpers/testData';
 import { waitForPrimaryPage } from './helpers/browserAudit';
@@ -86,33 +88,6 @@ const backendRoot = () => {
     return parsed.toString().replace(/\/$/u, '');
 };
 
-const resolveE2EProjectKey = async (
-    request: APIRequestContext,
-    token: string,
-) => {
-    const response = await apiRequest<Record<string, unknown>>(
-        request,
-        token,
-        '/api/projects',
-    );
-    const projects =
-        extractData<Array<Record<string, unknown>>>(response) ?? [];
-    const project = projects
-        .map((access) => access.project)
-        .find(
-            (candidate): candidate is Record<string, unknown> =>
-                typeof candidate === 'object' &&
-                candidate !== null &&
-                candidate.status === 'active' &&
-                typeof candidate.key === 'string' &&
-                candidate.key.length > 0,
-        );
-    if (!project || typeof project.key !== 'string') {
-        throw new Error('当前管理员没有可用于 Agent E2E 的活动项目');
-    }
-    return project.key;
-};
-
 const createTableTicket = async (
     request: APIRequestContext,
     token: string,
@@ -120,6 +95,11 @@ const createTableTicket = async (
     assignedToID?: number,
 ): Promise<TicketFixture> => {
     const projectKey = await resolveE2EProjectKey(request, token);
+    const configuration = await resolveE2ETicketCreateConfiguration(
+        request,
+        token,
+        projectKey,
+    );
     const response = await apiRequest<Record<string, unknown>>(
         request,
         token,
@@ -132,9 +112,12 @@ const createTableTicket = async (
             data: {
                 title,
                 description: `${title} 自动化测试描述`,
-                type: 'request',
+                type: configuration.workClass,
                 priority: 'normal',
                 source: 'web',
+                request_type_version_id:
+                    configuration.requestTypeVersionID,
+                workflow_version_id: configuration.workflowVersionID,
                 ...(assignedToID
                     ? { assigned_to_id: assignedToID }
                     : {}),
@@ -158,10 +141,11 @@ const createWebhookFixture = async (
     request: APIRequestContext,
     token: string,
 ) => {
+    const projectKey = await resolveE2EProjectKey(request, token);
     const response = await apiRequest<Record<string, unknown>>(
         request,
         token,
-        '/api/webhooks',
+        projectAPIPath(projectKey, 'webhooks'),
         {
             method: 'POST',
             data: {
@@ -850,6 +834,7 @@ test.describe('企业级列表表格', () => {
         test.setTimeout(120_000);
         assertDestructiveE2EAllowed('企业列表真实数据 E2E');
         const token = await getAdminToken(request);
+        const projectKey = await resolveE2EProjectKey(request, token);
         const admin = await findUserByEmail(
             request,
             token,
@@ -882,7 +867,10 @@ test.describe('企业级列表表格', () => {
                     const response = await apiRequest<Record<string, unknown>>(
                         request,
                         token,
-                        '/api/admin/automation/logs?page=1&page_size=100',
+                        `${projectAPIPath(
+                            projectKey,
+                            'admin/automation/logs',
+                        )}?page=1&page_size=100`,
                     );
                     return extractItems<Record<string, unknown>>(response).some(
                         (item) =>

@@ -121,13 +121,15 @@ def _create_ticket_for_mcp(
             "Authorization": api_token.authorization,
             "Idempotency-Key": harness.idempotency_key("mcp-ticket"),
         },
-        json_body={
-            "title": harness.unique("mcp-ticket"),
-            "description": f"{harness.prefix}MCP ticket_get structured result",
-            "type": "request",
-            "priority": "normal",
-            "tags": ["e2e", "mcp"],
-        },
+        json_body=harness.ticket_create_payload(
+            {
+                "title": harness.unique("mcp-ticket"),
+                "description": f"{harness.prefix}MCP ticket_get structured result",
+                "type": "request",
+                "priority": "normal",
+                "tags": ["e2e", "mcp"],
+            }
+        ),
     )
     assert_status(response, 201, operation="为 MCP 创建 E2E 工单")
     ticket = json_object(response, operation="为 MCP 创建 E2E 工单").get("data")

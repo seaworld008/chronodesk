@@ -25,20 +25,24 @@ def test_ticket_create_input_boundaries(
     """TKT-001/TKT-002: exact request limits and customer-controlled fields."""
 
     admin = human_identities["admin"]
-    valid_base = {
-        "description": f"{e2e_manager.prefix}valid description",
-        "type": "request",
-        "priority": "normal",
-        "source": "api",
-    }
-    invalid_payloads = [
-        valid_base,
+    valid_base = e2e_manager.ticket_create_payload(
         {
-            "title": e2e_manager.unique("missing-description"),
+            "description": f"{e2e_manager.prefix}valid description",
             "type": "request",
             "priority": "normal",
             "source": "api",
-        },
+        }
+    )
+    invalid_payloads = [
+        valid_base,
+        e2e_manager.ticket_create_payload(
+            {
+                "title": e2e_manager.unique("missing-description"),
+                "type": "request",
+                "priority": "normal",
+                "source": "api",
+            }
+        ),
         {**valid_base, "title": e2e_manager.prefix + ("x" * 256)},
         {
             **valid_base,

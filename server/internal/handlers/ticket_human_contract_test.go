@@ -102,6 +102,7 @@ func (s *recordingVersionedTicketService) UpdateTicketStatusExpectedVersion(
 type recordingCreateTicketService struct {
 	services.TicketServiceInterface
 	request *models.TicketCreateRequest
+	err     error
 }
 
 func (s *recordingCreateTicketService) CreateTicket(
@@ -111,6 +112,9 @@ func (s *recordingCreateTicketService) CreateTicket(
 ) (*models.Ticket, error) {
 	copy := *request
 	s.request = &copy
+	if s.err != nil {
+		return nil, s.err
+	}
 	return &models.Ticket{
 		ID:          1,
 		Title:       copy.Title,
@@ -343,6 +347,36 @@ func TestHumanTicketCreateTrimsRequiredTextAndRejectsBlankValues(t *testing.T) {
 			assertHumanProblem(t, response, http.StatusBadRequest, "invalid_request")
 		})
 	}
+}
+
+func TestHumanTicketCreateMapsDomainMembershipDenialToForbidden(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service := &recordingCreateTicketService{
+		err: services.ErrTicketCreateAccessDenied,
+	}
+	handler := NewTicketHandler(service)
+	user := models.User{ID: 7, Role: models.RoleAdmin}
+	router := humanTicketTestRouter(user, func(router *gin.Engine) {
+		router.POST("/tickets", handler.CreateTicket)
+	})
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/tickets",
+		bytes.NewBufferString(
+			`{"title":"标题","description":"描述","type":"request","priority":"normal","source":"web","request_type_version_id":"00000000-0000-7000-8000-000000000102"}`,
+		),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	assertHumanProblem(
+		t,
+		response,
+		http.StatusForbidden,
+		"ticket_create_access_denied",
+	)
 }
 
 func TestCustomerHistoryRedactsInternalAndAssignmentRecords(t *testing.T) {

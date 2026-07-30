@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"gorm.io/datatypes"
@@ -20,21 +21,42 @@ var (
 	ErrConfigurationNotFound      = errors.New("project configuration not found")
 	ErrConfigurationStateConflict = errors.New("project configuration state conflict")
 	ErrConfigurationImmutable     = models.ErrPublishedConfigurationImmutable
-	ErrSolutionInstallationState  = errors.New("solution installation state conflict")
+	ErrConfigurationEventWriter   = errors.New(
+		"project configuration event writer is unavailable",
+	)
+	ErrSolutionInstallationState = errors.New("solution installation state conflict")
 )
 
 type ProjectConfigurationService struct {
-	db  *gorm.DB
-	now func() time.Time
+	db     *gorm.DB
+	events projectDomainEventAppender
+	now    func() time.Time
 }
 
 func NewProjectConfigurationService(
 	db *gorm.DB,
+	eventAppenders ...projectDomainEventAppender,
 ) (*ProjectConfigurationService, error) {
 	if db == nil {
 		return nil, errors.New("project configuration database is required")
 	}
-	return &ProjectConfigurationService{db: db, now: time.Now}, nil
+	if len(eventAppenders) > 1 {
+		return nil, errors.New(
+			"only one project configuration event writer is supported",
+		)
+	}
+	var events projectDomainEventAppender
+	if len(eventAppenders) == 1 {
+		if eventAppenders[0] == nil {
+			return nil, ErrConfigurationEventWriter
+		}
+		events = eventAppenders[0]
+	}
+	return &ProjectConfigurationService{
+		db:     db,
+		events: events,
+		now:    time.Now,
+	}, nil
 }
 
 const projectConfigurationBootstrapActorID = "project-configuration-bootstrap"
@@ -628,6 +650,9 @@ func (service *ProjectConfigurationService) RollbackConfigurationRelease(
 	if err != nil {
 		return nil, err
 	}
+	if service.events == nil {
+		return nil, ErrConfigurationEventWriter
+	}
 	var rollback models.ConfigurationRelease
 	err = transactionForContext(ctx, service.db, func(tx *gorm.DB) error {
 		var target models.ConfigurationRelease
@@ -673,7 +698,12 @@ func (service *ProjectConfigurationService) RollbackConfigurationRelease(
 		if err := tx.WithContext(ctx).Create(&rollback).Error; err != nil {
 			return fmt.Errorf("create rollback release: %w", err)
 		}
-		return nil
+		return service.appendConfigurationPublishedEventTx(
+			ctx,
+			tx,
+			operation,
+			&rollback,
+		)
 	})
 	if err != nil {
 		return nil, err
@@ -1354,6 +1384,9 @@ func (service *ProjectConfigurationService) publishConfigurationReleaseTx(
 	operation OperationContext,
 	id string,
 ) (*models.ConfigurationRelease, error) {
+	if service.events == nil {
+		return nil, ErrConfigurationEventWriter
+	}
 	var release models.ConfigurationRelease
 	if err := scopedConfigurationQuery(tx.WithContext(ctx), operation.Scope).
 		Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -1449,7 +1482,67 @@ func (service *ProjectConfigurationService) publishConfigurationReleaseTx(
 		First(&release).Error; err != nil {
 		return nil, err
 	}
+	if err := service.appendConfigurationPublishedEventTx(
+		ctx,
+		tx,
+		operation,
+		&release,
+	); err != nil {
+		return nil, err
+	}
 	return &release, nil
+}
+
+func (service *ProjectConfigurationService) appendConfigurationPublishedEventTx(
+	ctx context.Context,
+	tx *gorm.DB,
+	operation OperationContext,
+	release *models.ConfigurationRelease,
+) error {
+	if service.events == nil {
+		return ErrConfigurationEventWriter
+	}
+	if release == nil || release.ID == "" ||
+		release.Status != models.ConfigurationStatusPublished {
+		return ErrConfigurationStateConflict
+	}
+	eventTime := service.now().UTC()
+	if release.PublishedAt != nil {
+		eventTime = release.PublishedAt.UTC()
+	}
+	_, err := service.events.AppendDomainEventTx(
+		ctx,
+		tx,
+		DomainEventInput{
+			Type: eventcontract.ConfigurationPublishedEventType,
+			Subject: fmt.Sprintf(
+				"project/%d/configuration-releases/%s",
+				release.ProjectID,
+				release.ID,
+			),
+			Time: eventTime,
+			Data: map[string]any{
+				"organization_id":               release.OrganizationID,
+				"project_id":                    release.ProjectID,
+				"configuration_release_id":      release.ID,
+				"configuration_release_version": release.Version,
+				"snapshot_hash":                 release.SnapshotHash,
+				"source_package_key":            release.SourcePackageKey,
+				"source_package_version":        release.SourcePackageVersion,
+			},
+			Scope:                operation.Scope,
+			TraceID:              operation.TraceID,
+			CorrelationID:        operation.CorrelationID,
+			Actor:                operation.Actor,
+			ResourceVersion:      release.Version,
+			ConfigurationVersion: release.ID,
+		},
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("append configuration published event: %w", err)
+	}
+	return nil
 }
 
 func (service *ProjectConfigurationService) validateSolutionDependencies(

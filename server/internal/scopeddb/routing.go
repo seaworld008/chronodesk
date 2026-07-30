@@ -206,6 +206,43 @@ func TransactionForContext(
 		Transaction(fn)
 }
 
+// CanReuseProjectScopeTransaction reports whether ctx carries a trusted
+// transaction binding that is exactly scoped to the requested single project.
+// A valid multi-project binding is deliberately rejected even when it contains
+// scope.ProjectID: reusing it for a project-owned operation would silently
+// widen PostgreSQL RLS visibility beyond the OperationContext.
+//
+// A context without a transaction binding returns false so the caller can open
+// a new single-project transaction. Any present but invalid, empty,
+// multi-project, cross-organization, or different-project binding fails
+// closed with an error.
+func CanReuseProjectScopeTransaction(
+	ctx context.Context,
+	scope models.ProjectScope,
+) (bool, error) {
+	if ctx == nil {
+		return false, errors.New("transaction context is required")
+	}
+	if err := scope.Validate(); err != nil {
+		return false, fmt.Errorf("invalid project scope: %w", err)
+	}
+	binding, ok := fromContext(ctx)
+	if !ok {
+		return false, nil
+	}
+	if err := binding.validate(); err != nil {
+		return false, err
+	}
+	if binding.organizationID != scope.OrganizationID ||
+		len(binding.projectIDs) != 1 ||
+		binding.projectIDs[0] != scope.ProjectID {
+		return false, errors.New(
+			"active transaction binding does not exactly match the project operation scope",
+		)
+	}
+	return true, nil
+}
+
 func HasTransaction(ctx context.Context) bool {
 	_, ok := fromContext(ctx)
 	return ok

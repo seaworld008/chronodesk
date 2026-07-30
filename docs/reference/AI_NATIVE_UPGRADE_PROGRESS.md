@@ -6,6 +6,9 @@
 - 基线提交：`cdd42a047728`
 - 交付 PR：[GitHub #7](https://github.com/seaworld008/chronodesk/pull/7)
 - 升级策略：开发期一次性破坏性升级，不保留 `/api/v1`、隐式项目或旧队列投影兼容层
+- 当前状态：PR #7 的 fresh-volume、本地全量、race、83 条协议黑盒和 33 条
+  Playwright 发布门禁均已通过，正在完成最终提交、CI 和合并；合并后立即从最新
+  `main` 新建分支继续 P1A 平台角色解耦
 - 状态说明：本文记录当前真实实现状态，原始总体规划仍是目标；标为“部分完成”的能力不得当作生产可用
 
 ## 1. 已锁定的架构决策
@@ -97,24 +100,80 @@
 - 两类记录使用 UUIDv7、Actor 审计、不可变约束、项目 RLS、Ticket 乐观版本和 CloudEvent。
 - 跨项目直接 Relation 被拒绝；目标项目协作单仍是后续实现项。
 
-## 4. 当前暂停点与未完成收口
+## 4. PR #7 收口结果与继续点
 
-暂停时不得把下列内容视为已发布契约：
+本轮恢复开发后已完成以下发布阻断项：
+
+1. fresh-volume 黑盒测试统一通过项目 Intake API 发现不可变
+   RequestType/Workflow 版本，不再发送旧的隐式建单 payload。
+2. A2A 请求策略与异步命令将策略快照、不可变 `PolicyDecision` 和业务写入
+   拆为独立的可信 `OperationContext` 项目短事务；Redis execution guard 和
+   `RecordLoop` 仅在事务外执行，拒绝决策仍提交审计，Reporter 与创建结果的
+   只读快照检查在业务事务提交后执行。完成态 Task Snapshot 和列表汇总决策
+   同样保持可信项目范围；已有多项目事务不能冒充单项目事务被复用。
+3. Agent REST 幂等预留使用显式唯一键 `ON CONFLICT DO NOTHING`，避免
+   PostgreSQL 唯一键异常污染外层事务；迁移会原子重建旧四列索引为精确六列
+   项目作用域唯一索引，运行时校验列序、唯一性和有效状态，相同请求可稳定重放。
+4. 旧库 active 用户的默认项目 Membership 由
+   `chronodesk-project-scope-migration` system Actor 通过共享领域接口迁移；
+   初始管理员 seed 同样在一个事务内获得明确 `project_admin` Membership。
+   两条路径都同步写 CloudEvent、Outbox 与审计哈希链，重复执行幂等，冲突
+   fail closed。
+5. A2A durable execution 的 CI 时序测试不再依赖亚秒 TTL，并验证 claim
+   续租、跨实例唯一执行、完成清理和远程取消。
+6. A2A OAuth token scope 作为不可放大的可信身份快照贯穿同步、异步和
+   ReturnImmediately；命令在幂等预留前使用 services canonical scope 校验，
+   Task/Ticket 快照要求 `tickets:read`。缺少 `events:subscribe` 时主业务可成功，
+   但外部投递软拒绝并持久化拒绝决策。
+7. 项目 scope 破坏性回填由版本化、带 checksum 的事务 checkpoint 保护；
+   重跑直接跳过数据与授权回填，不会重写其他项目数据、重置项目序列或给后建
+   Human/Agent 隐式授予 DEFAULT 权限。checkpoint 缺失但 RLS 已开启时
+   fail closed；即使 RLS 尚未启用，只要发现既有项目控制数据或任意非零项目
+   范围也会拒绝自动回填。已存在但全为 `NULL/0` 的失败迁移形态可安全恢复。
+8. Human 建单在共享领域服务校验 active 项目 Membership；只允许
+   `project_admin/manager/agent/requester`，`observer` 和未知角色稳定拒绝。
+   项目创建以及配置发布、方案包发布和回滚均在同一事务追加
+   CloudEvent、Outbox 和审计记录，事件失败会回滚业务变更。
+9. Dashboard、Webhook 与自动化管理页全部使用 active project 显式路径；
+   自动化与 Webhook 权限按当前项目 `project_admin|manager` 判定，不再错误依赖
+   全局 supervisor/admin。权限加载失败和未知角色均 fail closed。
+10. Webhook 日志的 Count 与 Find 使用两个独立、完整的项目范围 GORM 查询，
+    避免 Count 污染后续列表 Statement；回归测试覆盖状态筛选和跨项目干扰行。
+11. 特权凭据维护命令与迁移入口统一优先读取 `DATABASE_MIGRATION_URL`，不使用
+    `DATABASE_RUNTIME_URL` 做可能被 FORCE RLS 过滤成空结果的全局验证。
+12. A2A `update/transition/assign/escalation` 成功结果与建单、幂等重放使用同一
+    post-commit Ticket 快照门禁；OAuth `tickets:read` 之外还必须通过对象级
+    `ticket.read` PolicyDecision，显式 deny 只返回 receipt，不泄露 Ticket。
+13. 工单评论与附件 UI、Dashboard、Webhook、自动化以及全部 E2E 数据 helper
+    均使用 active project 显式路径；Playwright `APIResponse.ok()` 已改为真实
+    方法调用，404 不再被误判为成功。
+14. Webhook 测试投递失败被建模为“命令已处理、投递结果失败”：HTTP 200 携带
+    `code:1` 和结构化 failed 结果，使项目事务提交不可丢失的失败日志，同时 UI
+    仍显示稳定中文错误；Count 与 Find 继续使用独立项目查询。
+15. 所有项目业务表 scope 列及 Ticket 六个关键项目列在模型、迁移和 PostgreSQL
+    runtime gate 三层强制 `NOT NULL`。二次迁移不会放松约束，健康 checkpoint
+    不执行重复 `ALTER TABLE`；真实 PostgreSQL 覆盖旧表、partial retry、
+    nullable 漂移修复和未 checkpoint 多项目拒绝。
+
+下列能力仍不得视为已发布契约：
 
 1. EntityLink/TicketRelation Human API 已挂载到项目路由；后续如向 Agent
    开放，必须再原子更新 OpenAPI、MCP/A2A 和 SDK，不得把 Human API 当作
    机器契约。
 2. Proposal 服务层已升级为封闭 `ActionExecutorRegistry` 和真实领域命令，
    但项目显式 Agent REST/MCP/A2A 执行 Adapter 尚未接入。
-3. 本检查点的实现统一通过 PR #7 交付；恢复开发时以 PR 合并结果、最新
-   `main` 和 `git log` 为权威状态，不依赖旧工作树数量。
+3. PR #7 合并后以最新 `main` 和 `git log` 为权威状态；后续分支不得复用
+   PR #7 的旧工作树基线。
 
 ## 5. 已知技术债与下一轮优先级
 
-下一次继续开发时按以下顺序推进：
+PR #7 合并后按以下顺序推进：
 
-1. 同步 OpenAPI、文档、SDK 和 Web 类型：Agent Admin 项目路径、Proposal 执行、EntityLink/TicketRelation。
-2. 完成平台角色破坏性升级：`platform_admin/security_auditor/emergency_operator/member`；项目职责只使用项目角色。
+1. 完成平台角色破坏性升级：
+   `platform_admin/security_auditor/emergency_operator/member`；删除旧
+   `admin/supervisor/agent/customer`，项目职责只使用项目角色，并取消全局
+   管理员隐式跨项目授权。
+2. 同步 OpenAPI、文档、SDK 和 Web 类型：Agent Admin 项目路径、Proposal 执行、EntityLink/TicketRelation。
 3. 实现 OIDC、SAML 和 SCIM；SCIM 不得自动授予项目管理员，并保留受控 break-glass 管理员。
 4. 实现“创建目标项目协作单”的跨项目流程，不移动源工单、不跨两个项目安全边界持有长事务。
 5. 补齐邮件、CSV、Kafka/AMQP、内网 Relay、Java/.NET SDK 和连接诊断的生产实现。
@@ -129,10 +188,12 @@
 - Analytics、用户统计和平台管理查询不得以零范围绕过 RLS。
 - 所有 CloudEvent 都应填充真实 `configurationversion` 和 `policydecisionid`，不能只在建单事件中完整。
 
-## 6. 恢复开发步骤
+## 6. PR 合并后继续开发
 
 ```bash
-git switch codex/ai-native-multiproject
+git switch main
+git pull --ff-only
+git switch -c codex/p1-platform-roles
 git status --short
 git log -1 --oneline
 make doctor
@@ -140,7 +201,7 @@ make install-deps
 make verify
 ```
 
-恢复后先阅读：
+新分支开始前先阅读：
 
 1. `CONTEXT.md`
 2. `ARCHITECTURE.md`
@@ -149,7 +210,7 @@ make verify
 5. `docs/adr/0006-versioned-configuration-and-ai-actions.md`
 6. `docs/adr/0007-inbox-mapping-and-external-identity.md`
 
-若本检查点已经通过 PR 合并，则从最新 `main` 新建 `codex/` 前缀分支继续，不复用已合并分支。
+PR 合并后从最新 `main` 新建 `codex/` 前缀分支继续，不复用已合并分支。
 
 ## 7. 发布门禁记录
 
@@ -169,8 +230,23 @@ make verify
 - [x] `make security`
 - [x] `make build`
 - [x] `make verify`
-- [x] 隔离 fresh-volume Docker Compose 启动、85/85 模型迁移、FORCE RLS、
+- [x] 隔离 fresh-volume Docker Compose 启动、86/86 模型迁移、FORCE RLS、
   Server 健康检查与 `chronodesk-migrate -seed`
+- [x] 隔离 PostgreSQL Schema 回归：旧四列幂等索引升级、Agent REST
+  幂等重放事务保持可用
+- [x] `NOSUPERUSER`、`NOBYPASSRLS`、表 owner 且 `FORCE RLS` 的 PostgreSQL
+  回归：fresh seed 与旧管理员迁移连续执行均只产生一条
+  Membership/CloudEvent/Outbox/Audit
+- [x] fresh-volume `make smoke`：83/83 Human REST、Agent REST、MCP、A2A
+  及失败驱动黑盒用例通过
+- [x] fresh-volume 特权维护连接执行
+  `chronodesk-credential-maintain -validate-only`
+- [x] Playwright 项目范围回归：Dashboard 四条请求、项目权限 fail closed、
+  自动化真实 CRUD 和 Webhook 项目显式 CRUD/test
+- [x] fresh-volume `make e2e`：33/33 真实浏览器流程通过，包含 15 张企业表、
+  评论/附件、完整工单流转、项目管理权限与 Webhook 失败日志
+- [x] PostgreSQL catalog 核验：二次迁移后项目契约 nullable 列为 `0`，
+  checkpoint 唯一；旧表、失败迁移重试和 nullable 漂移修复回归通过
 
 本机 Python 门禁工具已完整安装并验证：`ruff 0.16.0`、
 `pytest 9.1.1`、`server/requirements-test.txt` 全量依赖，且

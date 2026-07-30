@@ -150,8 +150,8 @@ type WebhookConfig struct {
 	CreatedAt      time.Time      `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt      time.Time      `json:"updated_at" gorm:"autoUpdateTime"`
 	DeletedAt      gorm.DeletedAt `json:"-" gorm:"index"`
-	OrganizationID uint           `json:"organization_id" gorm:"index"`
-	ProjectID      uint           `json:"project_id" gorm:"index"`
+	OrganizationID uint           `json:"organization_id" gorm:"not null;index"`
+	ProjectID      uint           `json:"project_id" gorm:"not null;index"`
 
 	// 基本配置
 	Name        string          `json:"name" gorm:"size:100;not null" validate:"required,max=100"`
@@ -482,8 +482,8 @@ func (w *WebhookConfig) MatchesEvent(
 type WebhookLog struct {
 	ID             uint      `json:"id" gorm:"primaryKey;autoIncrement"`
 	CreatedAt      time.Time `json:"created_at" gorm:"autoCreateTime"`
-	OrganizationID uint      `json:"organization_id" gorm:"index"`
-	ProjectID      uint      `json:"project_id" gorm:"index"`
+	OrganizationID uint      `json:"organization_id" gorm:"not null;index"`
+	ProjectID      uint      `json:"project_id" gorm:"not null;index"`
 
 	// 关联配置
 	ConfigID uint           `json:"config_id" gorm:"not null;index"`

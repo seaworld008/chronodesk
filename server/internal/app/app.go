@@ -48,7 +48,10 @@ func migrateAndEnableProjectRLS(cfg *config.Config) error {
 		return err
 	}
 	var operationErr error
-	if err := database.RunMigrations(migrationDB); err != nil {
+	if err := database.RunMigrations(
+		migrationDB,
+		services.EnsureProjectScopeMigrationMembership,
+	); err != nil {
 		operationErr = fmt.Errorf("run database migrations: %w", err)
 	} else if err := database.EnableProjectRLS(migrationDB); err != nil {
 		operationErr = fmt.Errorf("enable and force project RLS: %w", err)
@@ -247,7 +250,10 @@ func Run() error {
 	if err != nil {
 		log.Fatal("Failed to initialize cross-project workbench: ", err)
 	}
-	projectConfigurationService, err := services.NewProjectConfigurationService(db.DB)
+	projectConfigurationService, err := services.NewProjectConfigurationService(
+		db.DB,
+		nativeService,
+	)
 	if err != nil {
 		log.Fatal("Failed to initialize project configuration service: ", err)
 	}

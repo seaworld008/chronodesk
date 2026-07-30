@@ -7,6 +7,9 @@ import {
     ensureRoleAccounts,
     E2E_MARKER,
     extractData,
+    getAdminToken,
+    projectAPIPath,
+    resolveE2EProjectKey,
     trackE2EResource,
     untrackE2EResource,
     type TemporaryRoleAccounts,
@@ -53,9 +56,16 @@ test.describe('Ticket Workflow', () => {
         });
     });
 
-    test('should create assign resolve close and delete ticket', async ({ page }) => {
+    test('should create assign resolve close and delete ticket', async ({
+        page,
+        request,
+    }) => {
+        test.setTimeout(60_000);
         const title = `${E2E_MARKER}生命周期工单`;
         const description = `${E2E_MARKER}工单描述-用于E2E验证完整流程`;
+        const token = await getAdminToken(request);
+        const projectKey = await resolveE2EProjectKey(request, token);
+        const ticketsPath = projectAPIPath(projectKey, 'tickets');
         const ticketListMain = () => page.getByRole('main');
         const ticketRow = () =>
             ticketListMain()
@@ -98,7 +108,8 @@ test.describe('Ticket Workflow', () => {
         };
         const updateTicketStatus = async (
             editForm: Locator,
-            statusLabel: '已解决' | '已关闭',
+            ticketID: number,
+            statusLabel: '处理中' | '已解决' | '已关闭',
         ) => {
             const statusInput = editForm.getByRole('combobox', {
                 name: '状态',
@@ -109,9 +120,22 @@ test.describe('Ticket Workflow', () => {
             await page
                 .getByRole('option', { name: statusLabel, exact: true })
                 .click();
+            const update = page.waitForResponse(
+                (response) =>
+                    response.request().method() === 'PUT' &&
+                    new URL(response.url()).pathname ===
+                        `${ticketsPath}/${encodeURIComponent(
+                            String(ticketID),
+                        )}`,
+            );
             await editForm
                 .getByRole('button', { name: '保存更改', exact: true })
                 .click();
+            const updated = await update;
+            expect(
+                updated.status(),
+                `工单更新失败：${await updated.text()}`,
+            ).toBe(200);
         };
         const expectStatusInList = async (statusLabel: string) => {
             const row = ticketRow();
@@ -140,7 +164,7 @@ test.describe('Ticket Workflow', () => {
         const create = page.waitForResponse(
             (response) =>
                 response.request().method() === 'POST' &&
-                new URL(response.url()).pathname === '/api/tickets',
+                new URL(response.url()).pathname === ticketsPath,
         );
         await page.getByRole('button', { name: '创建工单' }).click();
         const createResponse = await create;
@@ -152,14 +176,33 @@ test.describe('Ticket Workflow', () => {
         trackE2EResource('tickets', createdTicket.id as number);
         await page.waitForURL(/#\/tickets\/\d+\/show/, { timeout: 15000 });
 
+        const createdTicketID = createdTicket.id as number;
         const firstEditForm = await openTicketEditFromDetail();
-        await updateTicketStatus(firstEditForm, '已解决');
+        await updateTicketStatus(
+            firstEditForm,
+            createdTicketID,
+            '处理中',
+        );
+        await openTicketFromList();
+        await expectStatusInList('处理中');
+
+        await openTicketDetailFromList();
+        const resolveEditForm = await openTicketEditFromDetail();
+        await updateTicketStatus(
+            resolveEditForm,
+            createdTicketID,
+            '已解决',
+        );
         await openTicketFromList();
         await expectStatusInList('已解决');
 
         await openTicketDetailFromList();
-        const secondEditForm = await openTicketEditFromDetail();
-        await updateTicketStatus(secondEditForm, '已关闭');
+        const closeEditForm = await openTicketEditFromDetail();
+        await updateTicketStatus(
+            closeEditForm,
+            createdTicketID,
+            '已关闭',
+        );
         await openTicketFromList();
         await expectStatusInList('已关闭');
 
@@ -171,7 +214,10 @@ test.describe('Ticket Workflow', () => {
         const deleteResponse = page.waitForResponse((response) => {
             const pathname = new URL(response.url()).pathname;
             return response.request().method() === 'DELETE'
-                && /^\/api\/tickets\/\d+$/.test(pathname);
+                && pathname ===
+                    `${ticketsPath}/${encodeURIComponent(
+                        String(createdTicket.id),
+                    )}`;
         });
         await confirmDialog.getByRole('button', { name: '确认', exact: true }).click();
         const deleted = await deleteResponse;

@@ -67,7 +67,14 @@ func runProjectOperation(
 	if err != nil {
 		return err
 	}
-	if scopeddb.HasTransaction(ctx) {
+	reusable, err := scopeddb.CanReuseProjectScopeTransaction(
+		ctx,
+		operation.Scope,
+	)
+	if err != nil {
+		return err
+	}
+	if reusable {
 		return fn(ctx)
 	}
 	return scopeddb.WithProjectScopeContextTransaction(

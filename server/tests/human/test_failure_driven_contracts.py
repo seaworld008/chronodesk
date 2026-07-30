@@ -168,13 +168,15 @@ def test_blank_ticket_text_is_chinese_400_without_persisted_row(
 
     admin = human_identities["admin"]
     marker = e2e_manager.unique(f"{blank_field}-must-not-persist")
-    payload = {
-        "title": marker,
-        "description": marker,
-        "type": "request",
-        "priority": "normal",
-        "source": "api",
-    }
+    payload = e2e_manager.ticket_create_payload(
+        {
+            "title": marker,
+            "description": marker,
+            "type": "request",
+            "priority": "normal",
+            "source": "api",
+        }
+    )
     payload[blank_field] = " \t\n "
     rejected = admin.api.post_json(e2e_manager.project_path("tickets"), payload)
 

@@ -49,8 +49,8 @@ type TicketHistory struct {
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
 	// 关联信息
-	OrganizationID     uint                    `json:"organization_id" gorm:"index"`
-	ProjectID          uint                    `json:"project_id" gorm:"index"`
+	OrganizationID     uint                    `json:"organization_id" gorm:"not null;index"`
+	ProjectID          uint                    `json:"project_id" gorm:"not null;index"`
 	TicketID           uint                    `json:"ticket_id" gorm:"not null;index"`
 	Ticket             *Ticket                 `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
 	UserID             *uint                   `json:"user_id" gorm:"index"` // 可为空，系统操作时为空

@@ -5,7 +5,10 @@ import {
     createTicket,
     deleteTicket,
     E2E_MARKER,
+    getAdminToken,
     markE2EAttachmentClean,
+    projectAPIPath,
+    resolveE2EProjectKey,
 } from './helpers/testData';
 import { assertDestructiveE2EAllowed } from './helpers/safety';
 import { expectChineseOperations } from './helpers/browserAudit';
@@ -33,12 +36,32 @@ test.describe('工单评论与附件真实交互', () => {
         page,
         request,
     }) => {
+        const token = await getAdminToken(request);
+        const projectKey = await resolveE2EProjectKey(request, token);
+        const ticketPath = projectAPIPath(
+            projectKey,
+            `tickets/${ticketID}`,
+        );
+        const commentsPath = `${ticketPath}/comments`;
+        const attachmentsPath = `${ticketPath}/attachments`;
         await authenticatePage(page);
         await page.goto(`/#/tickets/${ticketID}/show`);
         const main = page.getByRole('main');
+        const commentsListResponse = page.waitForResponse(
+            (response) =>
+                response.request().method() === 'GET' &&
+                new URL(response.url()).pathname === commentsPath,
+        );
+        const attachmentsListResponse = page.waitForResponse(
+            (response) =>
+                response.request().method() === 'GET' &&
+                new URL(response.url()).pathname === attachmentsPath,
+        );
         await main
             .getByRole('tab', { name: '评论历史', exact: true })
             .click();
+        expect((await commentsListResponse).status()).toBe(200);
+        expect((await attachmentsListResponse).status()).toBe(200);
         const commentFormRegion = main.getByRole('region', {
             name: '添加工单评论',
             exact: true,
@@ -53,8 +76,7 @@ test.describe('工单评论与附件真实交互', () => {
         const publicResponse = page.waitForResponse(
             (response) =>
                 response.request().method() === 'POST' &&
-                new URL(response.url()).pathname ===
-                    `/api/tickets/${ticketID}/comments`,
+                new URL(response.url()).pathname === commentsPath,
         );
         await commentFormRegion
             .getByRole('button', { name: '添加评论', exact: true })
@@ -82,8 +104,7 @@ test.describe('工单评论与附件真实交互', () => {
         const internalResponse = page.waitForResponse(
             (response) =>
                 response.request().method() === 'POST' &&
-                new URL(response.url()).pathname ===
-                    `/api/tickets/${ticketID}/comments`,
+                new URL(response.url()).pathname === commentsPath,
         );
         await commentFormRegion
             .getByRole('button', { name: '添加评论', exact: true })
@@ -109,8 +130,7 @@ test.describe('工单评论与附件真实交互', () => {
         const uploadResponse = page.waitForResponse(
             (response) =>
                 response.request().method() === 'POST' &&
-                new URL(response.url()).pathname ===
-                    `/api/tickets/${ticketID}/attachments`,
+                new URL(response.url()).pathname === attachmentsPath,
         );
         await attachmentRegion
             .getByRole('button', { name: '上传附件', exact: true })
@@ -130,7 +150,7 @@ test.describe('工单评论与附件真实交互', () => {
             attachmentItem.getByRole('button', { name: '下载' }),
         ).toBeDisabled();
 
-        await markE2EAttachmentClean(request, fileName);
+        const attachmentID = await markE2EAttachmentClean(request, fileName);
         await page.reload();
         await main
             .getByRole('tab', { name: '评论历史', exact: true })
@@ -147,8 +167,18 @@ test.describe('工单评论与附件真实交互', () => {
         await expect(downloadButton).toBeEnabled();
 
         const downloadPromise = page.waitForEvent('download');
+        const downloadResponse = page.waitForResponse(
+            (response) =>
+                response.request().method() === 'GET' &&
+                new URL(response.url()).pathname ===
+                    `${attachmentsPath}/${attachmentID}/content`,
+        );
         await downloadButton.click();
-        const download = await downloadPromise;
+        const [download, downloaded] = await Promise.all([
+            downloadPromise,
+            downloadResponse,
+        ]);
+        expect(downloaded.status()).toBe(200);
         expect(download.suggestedFilename()).toBe(fileName);
     });
 });

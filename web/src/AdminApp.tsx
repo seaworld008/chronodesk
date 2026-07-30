@@ -1,5 +1,13 @@
 import React from 'react';
-import { Admin, Resource, CustomRoutes, Menu, LayoutProps, usePermissions } from 'react-admin';
+import {
+    Admin,
+    Resource,
+    CustomRoutes,
+    Menu,
+    type AuthProvider,
+    type LayoutProps,
+    usePermissions,
+} from 'react-admin';
 import { Navigate, Route } from 'react-router-dom';
 import { Box, CircularProgress } from '@mui/material';
 import { createTheme } from '@mui/material/styles';
@@ -11,6 +19,11 @@ import {
     isPlatformAdministrator,
     type RolePermissions,
 } from './lib/accessControl';
+import {
+    isProjectManagementRole,
+    resolveActiveProjectAccess,
+    type AuthorizedProject,
+} from './lib/projectScope';
 
 // Icons
 import {
@@ -23,6 +36,7 @@ import {
     Security as SecurityIcon,
     SmartToy as AgentIcon,
     DashboardCustomize as WorkbenchIcon,
+    Webhook as WebhookIcon,
 } from '@mui/icons-material';
 
 import { CustomLayout as Layout } from './layout/CustomLayout';
@@ -150,15 +164,93 @@ const withAdministrativeAccess = <P extends object,>(Component: React.ComponentT
     return GuardedAdministrativeView;
 };
 
+type ActiveProjectAccessState = {
+    access: AuthorizedProject | null;
+    isPending: boolean;
+};
+
+const useActiveProjectAccess = (): ActiveProjectAccessState => {
+    const [state, setState] = React.useState<ActiveProjectAccessState>({
+        access: null,
+        isPending: true,
+    });
+
+    React.useEffect(() => {
+        let active = true;
+        void resolveActiveProjectAccess()
+            .then((access) => {
+                if (active) {
+                    setState({ access, isPending: false });
+                }
+            })
+            .catch(() => {
+                if (active) {
+                    setState({ access: null, isPending: false });
+                }
+            });
+        return () => {
+            active = false;
+        };
+    }, []);
+
+    return state;
+};
+
+const ProjectManagementRoute = ({ children }: React.PropsWithChildren) => {
+    const { access, isPending } = useActiveProjectAccess();
+
+    if (isPending) {
+        return <PageLoading />;
+    }
+
+    if (!isProjectManagementRole(access?.role)) {
+        return <Navigate to="/" replace />;
+    }
+
+    return <>{children}</>;
+};
+
+const withProjectManagementAccess = <P extends object,>(
+    Component: React.ComponentType<P>,
+) => {
+    const GuardedProjectManagementView = (props: P) => (
+        <ProjectManagementRoute>
+            <Component {...props} />
+        </ProjectManagementRoute>
+    );
+    GuardedProjectManagementView.displayName = `ProjectManagement${
+        Component.displayName || Component.name || 'View'
+    }`;
+    return GuardedProjectManagementView;
+};
+
 const AdministrativeUserList = withAdministrativeAccess(UserList);
 const AdministrativeUserShow = withAdministrativeAccess(UserShow);
 const AdministrativeUserEdit = withAdministrativeAccess(UserEdit);
 const AdministrativeUserCreate = withAdministrativeAccess(UserCreate);
-const AdministrativeAutomationRuleList = withAdministrativeAccess(AutomationRuleList);
-const AdministrativeAutomationRuleShow = withAdministrativeAccess(AutomationRuleShow);
-const AdministrativeAutomationRuleEdit = withAdministrativeAccess(AutomationRuleEdit);
-const AdministrativeAutomationRuleCreate = withAdministrativeAccess(AutomationRuleCreate);
-const AdministrativeAutomationLogList = withAdministrativeAccess(AutomationLogList);
+const ProjectAutomationRuleList = withProjectManagementAccess(AutomationRuleList);
+const ProjectAutomationRuleShow = withProjectManagementAccess(AutomationRuleShow);
+const ProjectAutomationRuleEdit = withProjectManagementAccess(AutomationRuleEdit);
+const ProjectAutomationRuleCreate = withProjectManagementAccess(AutomationRuleCreate);
+const ProjectAutomationLogList = withProjectManagementAccess(AutomationLogList);
+
+const projectAwareAuthProvider: AuthProvider = {
+    ...authProvider,
+    canAccess: async (params) => {
+        if (
+            params.resource === 'automation-rules' ||
+            params.resource === 'automation-logs'
+        ) {
+            try {
+                const access = await resolveActiveProjectAccess();
+                return isProjectManagementRole(access.role);
+            } catch {
+                return false;
+            }
+        }
+        return authProvider.canAccess?.(params) ?? true;
+    },
+};
 
 /**
  * 自定义菜单组件 - 只展示当前角色可访问的管理入口
@@ -166,6 +258,9 @@ const AdministrativeAutomationLogList = withAdministrativeAccess(AutomationLogLi
 const CustomMenu: React.FC = () => {
     const { permissions } = usePermissions<RolePermissions>();
     const canAdminister = isPlatformAdministrator(permissions?.role);
+    const { access, isPending: isProjectAccessPending } = useActiveProjectAccess();
+    const canManageProject =
+        !isProjectAccessPending && isProjectManagementRole(access?.role);
 
     return (
         <Menu aria-label="主导航">
@@ -178,11 +273,18 @@ const CustomMenu: React.FC = () => {
             <Menu.Item to="/tickets" primaryText="工单管理" leftIcon={<TicketIcon />} />
             <Menu.Item to="/notifications" primaryText="通知中心" leftIcon={<NotificationIcon />} />
             {canAdminister && <Menu.Item to="/users" primaryText="用户管理" leftIcon={<UsersIcon />} />}
-            {canAdminister && (
+            {canManageProject && (
                 <Menu.Item to="/automation-rules" primaryText="自动化规则" leftIcon={<AutomationIcon />} />
             )}
-            {canAdminister && (
+            {canManageProject && (
                 <Menu.Item to="/automation-logs" primaryText="自动化日志" leftIcon={<HistoryIcon />} />
+            )}
+            {canManageProject && (
+                <Menu.Item
+                    to="/webhook-settings"
+                    primaryText="Webhook 集成"
+                    leftIcon={<WebhookIcon />}
+                />
             )}
             {canAdminister && (
                 <Menu.Item
@@ -221,7 +323,7 @@ const AdminApp: React.FC = () => {
     return (
         <Admin
             dataProvider={dataProvider}
-            authProvider={authProvider}
+            authProvider={projectAwareAuthProvider}
             i18nProvider={i18nProvider}
             dashboard={TicketDashboard}
             theme={theme}
@@ -274,10 +376,10 @@ const AdminApp: React.FC = () => {
             {/* 自动化规则 */}
             <Resource
                 name="automation-rules"
-                list={AdministrativeAutomationRuleList}
-                show={AdministrativeAutomationRuleShow}
-                edit={AdministrativeAutomationRuleEdit}
-                create={AdministrativeAutomationRuleCreate}
+                list={ProjectAutomationRuleList}
+                show={ProjectAutomationRuleShow}
+                edit={ProjectAutomationRuleEdit}
+                create={ProjectAutomationRuleCreate}
                 icon={AutomationIcon}
                 options={{
                     label: '自动化规则',
@@ -286,7 +388,7 @@ const AdminApp: React.FC = () => {
 
             <Resource
                 name="automation-logs"
-                list={AdministrativeAutomationLogList}
+                list={ProjectAutomationLogList}
                 icon={HistoryIcon}
                 options={{
                     label: '自动化日志',
@@ -322,9 +424,9 @@ const AdminApp: React.FC = () => {
                 <Route
                     path="/webhook-settings"
                     element={(
-                        <AdministrativeRoute>
+                        <ProjectManagementRoute>
                             <WebhookSettings />
-                        </AdministrativeRoute>
+                        </ProjectManagementRoute>
                     )}
                 />
                 <Route

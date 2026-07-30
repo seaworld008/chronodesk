@@ -110,6 +110,13 @@ func TestTicketTransitionUsesStoredWorkflowVersionInsteadOfHardcodedLifecycle(
 		t.Fatal(err)
 	}
 	ctx := testProjectOperationContext(t, db, models.HumanActor(user.ID))
+	grantHumanTicketCreateMembership(
+		t,
+		db,
+		ctx,
+		user.ID,
+		models.ProjectRoleAgent,
+	)
 	ticket, err := ticketService.CreateTicket(
 		ctx,
 		&models.TicketCreateRequest{

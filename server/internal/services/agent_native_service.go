@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/safeconv"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/datatypes"
@@ -841,7 +843,204 @@ type PolicyCheckInput struct {
 	Context            map[string]any
 }
 
+type preparedPolicyCheck struct {
+	input         PolicyCheckInput
+	decision      models.PolicyDecision
+	guardRequired bool
+}
+
+// PolicyDecisionAuthorization binds one already-persisted PolicyDecision to
+// the exact action it authorized. Protocol adapters use this only after the
+// execution guard and PolicyDecision have completed outside the later business
+// transaction.
+type PolicyDecisionAuthorization struct {
+	Input      PolicyCheckInput
+	DecisionID string
+}
+
+type policyDecisionAuthorizationContextKey struct{}
+
+type policyDecisionAuthorizationContext struct {
+	service *AgentNativeService
+	byKey   map[string]string
+}
+
+// RequirePolicyDecisionAuthorizations installs an empty fail-closed binding.
+// A protocol adapter uses it before entering a business transaction so any
+// unexpected guarded action is rejected instead of invoking the execution
+// guard from inside that transaction.
+func (s *AgentNativeService) RequirePolicyDecisionAuthorizations(
+	ctx context.Context,
+) (context.Context, error) {
+	if s == nil || ctx == nil {
+		return nil, errors.New("policy decision authorization context is required")
+	}
+	return context.WithValue(
+		ctx,
+		policyDecisionAuthorizationContextKey{},
+		policyDecisionAuthorizationContext{
+			service: s,
+			byKey:   map[string]string{},
+		},
+	), nil
+}
+
+// WithPolicyDecisionAuthorizations installs validated, request-local
+// references to PolicyDecisions. CheckAction revalidates the referenced
+// decision and current principal controls before reusing it, so callers cannot
+// turn a stale or mismatched decision into authority.
+func (s *AgentNativeService) WithPolicyDecisionAuthorizations(
+	ctx context.Context,
+	authorizations ...PolicyDecisionAuthorization,
+) (context.Context, error) {
+	if s == nil || ctx == nil || len(authorizations) == 0 {
+		return nil, errors.New("policy decision authorizations are required")
+	}
+	binding := policyDecisionAuthorizationContext{
+		service: s,
+		byKey:   make(map[string]string, len(authorizations)),
+	}
+	for _, authorization := range authorizations {
+		decisionID := strings.TrimSpace(authorization.DecisionID)
+		if decisionID == "" {
+			return nil, errors.New("policy decision authorization requires a decision id")
+		}
+		key, err := policyCheckAuthorizationKey(authorization.Input)
+		if err != nil {
+			return nil, err
+		}
+		if existing := binding.byKey[key]; existing != "" && existing != decisionID {
+			return nil, errors.New("policy action has conflicting decision authorizations")
+		}
+		binding.byKey[key] = decisionID
+	}
+	return context.WithValue(
+		ctx,
+		policyDecisionAuthorizationContextKey{},
+		binding,
+	), nil
+}
+
 func (s *AgentNativeService) CheckAction(ctx context.Context, input PolicyCheckInput) (*models.PolicyDecision, error) {
+	if binding, ok := ctx.Value(
+		policyDecisionAuthorizationContextKey{},
+	).(policyDecisionAuthorizationContext); ok {
+		if binding.service != s {
+			return nil, errors.New("policy decision authorization belongs to another service")
+		}
+		key, err := policyCheckAuthorizationKey(input)
+		if err != nil {
+			return nil, err
+		}
+		decisionID := binding.byKey[key]
+		if decisionID == "" {
+			return nil, errors.New(
+				"business action is missing its prepared policy decision",
+			)
+		}
+		decision, err := s.loadMatchingPolicyDecision(
+			ctx,
+			decisionID,
+			models.ServicePrincipalActor(input.ServicePrincipalID),
+			input,
+			true,
+		)
+		if err != nil {
+			return decision, err
+		}
+		return decision, policyDecisionOutcome(decision)
+	}
+	prepared, err := s.preparePolicyCheck(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	s.applyPolicyExecutionGuard(ctx, prepared)
+	decision, err := s.persistPreparedPolicyCheck(ctx, prepared)
+	if err != nil {
+		return nil, err
+	}
+	return decision, policyDecisionOutcome(decision)
+}
+
+// CheckActionInShortProjectTransactions separates database policy work from
+// the distributed execution guard. The policy snapshot and final immutable
+// PolicyDecision each use a short trusted project transaction; Redis or another
+// AgentExecutionGuard is invoked only after the snapshot transaction closes.
+func (s *AgentNativeService) CheckActionInShortProjectTransactions(
+	ctx context.Context,
+	input PolicyCheckInput,
+) (*models.PolicyDecision, error) {
+	if s == nil {
+		return nil, errors.New("Agent service is required")
+	}
+	if scopeddb.HasTransaction(ctx) {
+		return nil, errors.New(
+			"short policy check requires a context outside a project transaction",
+		)
+	}
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if operation.Actor !=
+		models.ServicePrincipalActor(input.ServicePrincipalID) ||
+		strings.TrimSpace(input.CredentialID) == "" ||
+		operation.CredentialID != input.CredentialID ||
+		(input.SourceProtocol != "" &&
+			string(operation.Source) != input.SourceProtocol) {
+		return nil, errors.New(
+			"policy check does not match trusted operation context",
+		)
+	}
+
+	var prepared *preparedPolicyCheck
+	if err := s.RunProjectOperation(
+		ctx,
+		func(scopedContext context.Context) error {
+			var prepareErr error
+			prepared, prepareErr = s.preparePolicyCheck(
+				scopedContext,
+				input,
+			)
+			return prepareErr
+		},
+	); err != nil {
+		return nil, err
+	}
+
+	s.applyPolicyExecutionGuard(ctx, prepared)
+
+	var (
+		decision   *models.PolicyDecision
+		outcomeErr error
+	)
+	transactionErr := s.RunProjectOperation(
+		ctx,
+		func(scopedContext context.Context) error {
+			var persistErr error
+			decision, persistErr = s.persistPreparedPolicyCheck(
+				scopedContext,
+				prepared,
+			)
+			if persistErr != nil {
+				return persistErr
+			}
+			outcomeErr = policyDecisionOutcome(decision)
+			// Denials are durable audit outcomes. Commit their decision and
+			// return the domain error only after the short transaction closes.
+			return nil
+		},
+	)
+	if transactionErr != nil {
+		return nil, transactionErr
+	}
+	return decision, outcomeErr
+}
+
+func (s *AgentNativeService) preparePolicyCheck(
+	ctx context.Context,
+	input PolicyCheckInput,
+) (*preparedPolicyCheck, error) {
 	db := s.dbForContext(ctx)
 	loopGuarded := input.IsWrite && input.RequestDigest != "" && s.loopThreshold > 0
 	principal, principalErr := s.getUsablePrincipal(ctx, input.ServicePrincipalID)
@@ -907,81 +1106,118 @@ func (s *AgentNativeService) CheckAction(ctx context.Context, input PolicyCheckI
 	} else if allowed && explicitAllow {
 		reason = "explicit_allow"
 	}
-	if allowed && loopGuarded {
-		if !s.executionGuardReady() {
-			allowed, reason = false, "execution_guard_unavailable"
-		} else {
-			loopDetected, guardErr := s.executionGuard.RecordLoop(
-				ctx,
-				AgentLoopGuardRequest{
-					Fingerprint:       agentLoopFingerprint(input),
-					Threshold:         s.loopThreshold,
-					Window:            s.loopWindow,
-					ObservedAtForTest: s.now(),
-				},
-			)
-			switch {
-			case guardErr != nil:
-				allowed, reason = false, "execution_guard_unavailable"
-			case loopDetected:
-				allowed, reason = false, "automation_loop"
-			}
-		}
-	}
-
 	contextJSON, err := json.Marshal(input.Context)
 	if err != nil {
 		return nil, fmt.Errorf("encode policy context: %w", err)
 	}
-	decision := &models.PolicyDecision{
-		ID:                 newNativeID(),
-		CreatedAt:          s.now(),
-		ServicePrincipalID: input.ServicePrincipalID,
-		CredentialID:       input.CredentialID,
-		ActorType:          models.ActorTypeServicePrincipal,
-		ActorID:            input.ServicePrincipalID,
-		Scope:              input.Scope,
-		Action:             input.Action,
-		ResourceType:       input.ResourceType,
-		ResourceID:         input.ResourceID,
-		IsWrite:            input.IsWrite,
-		IsRisky:            input.IsRisky,
-		Allowed:            allowed,
-		ReasonCode:         reason,
-		MatchedPolicyID:    matchedPolicyID,
-		RequestDigest:      input.RequestDigest,
-		SourceProtocol:     input.SourceProtocol,
-		Context:            datatypes.JSON(contextJSON),
+	return &preparedPolicyCheck{
+		input: input,
+		decision: models.PolicyDecision{
+			ServicePrincipalID: input.ServicePrincipalID,
+			CredentialID:       input.CredentialID,
+			ActorType:          models.ActorTypeServicePrincipal,
+			ActorID:            input.ServicePrincipalID,
+			Scope:              input.Scope,
+			Action:             input.Action,
+			ResourceType:       input.ResourceType,
+			ResourceID:         input.ResourceID,
+			IsWrite:            input.IsWrite,
+			IsRisky:            input.IsRisky,
+			Allowed:            allowed,
+			ReasonCode:         reason,
+			MatchedPolicyID:    matchedPolicyID,
+			RequestDigest:      input.RequestDigest,
+			SourceProtocol:     input.SourceProtocol,
+			Context:            datatypes.JSON(contextJSON),
+		},
+		guardRequired: allowed && loopGuarded,
+	}, nil
+}
+
+func (s *AgentNativeService) applyPolicyExecutionGuard(
+	ctx context.Context,
+	prepared *preparedPolicyCheck,
+) {
+	if prepared == nil || !prepared.guardRequired {
+		return
 	}
+	if !s.executionGuardReady() {
+		prepared.decision.Allowed = false
+		prepared.decision.ReasonCode = "execution_guard_unavailable"
+		return
+	}
+	loopDetected, guardErr := s.executionGuard.RecordLoop(
+		ctx,
+		AgentLoopGuardRequest{
+			Fingerprint:       agentLoopFingerprint(prepared.input),
+			Threshold:         s.loopThreshold,
+			Window:            s.loopWindow,
+			ObservedAtForTest: s.now(),
+		},
+	)
+	switch {
+	case guardErr != nil:
+		prepared.decision.Allowed = false
+		prepared.decision.ReasonCode = "execution_guard_unavailable"
+	case loopDetected:
+		prepared.decision.Allowed = false
+		prepared.decision.ReasonCode = "automation_loop"
+	}
+}
+
+func (s *AgentNativeService) persistPreparedPolicyCheck(
+	ctx context.Context,
+	prepared *preparedPolicyCheck,
+) (*models.PolicyDecision, error) {
+	if prepared == nil {
+		return nil, errors.New("prepared policy check is required")
+	}
+	decision := prepared.decision
+	decision.ID = newNativeID()
+	decision.CreatedAt = s.now()
 	if operationContext, contextErr := OperationContextFromContext(ctx); contextErr == nil &&
-		operationContext.Actor == models.ServicePrincipalActor(input.ServicePrincipalID) {
+		operationContext.Actor ==
+			models.ServicePrincipalActor(prepared.input.ServicePrincipalID) {
 		decision.OrganizationID = operationContext.Scope.OrganizationID
 		decision.ProjectID = operationContext.Scope.ProjectID
 	}
-	if err := db.Create(decision).Error; err != nil {
+	if err := s.dbForContext(ctx).Create(&decision).Error; err != nil {
 		return nil, fmt.Errorf("persist policy decision: %w", err)
 	}
-	if !allowed {
-		switch reason {
-		case "global_emergency_stop":
-			return decision, ErrGlobalEmergencyStop
-		case "global_read_only", "principal_read_only":
-			return decision, ErrReadOnlyMode
-		case "principal_disabled":
-			return decision, ErrPrincipalDisabled
-		case "principal_expired":
-			return decision, ErrPrincipalExpired
-		case "invalid_credential":
-			return decision, ErrInvalidCredential
-		case "automation_loop":
-			return decision, ErrAutomationLoop
-		case "execution_guard_unavailable":
-			return decision, ErrExecutionGuardUnavailable
-		default:
-			return decision, fmt.Errorf("%w: %s", ErrPolicyDenied, reason)
-		}
+	return &decision, nil
+}
+
+func policyDecisionOutcome(decision *models.PolicyDecision) error {
+	if decision == nil || decision.Allowed {
+		return nil
 	}
-	return decision, nil
+	switch decision.ReasonCode {
+	case "global_emergency_stop":
+		return ErrGlobalEmergencyStop
+	case "global_read_only", "principal_read_only":
+		return ErrReadOnlyMode
+	case "principal_disabled":
+		return ErrPrincipalDisabled
+	case "principal_expired":
+		return ErrPrincipalExpired
+	case "invalid_credential":
+		return ErrInvalidCredential
+	case "automation_loop":
+		return ErrAutomationLoop
+	case "execution_guard_unavailable":
+		return ErrExecutionGuardUnavailable
+	default:
+		return fmt.Errorf("%w: %s", ErrPolicyDenied, decision.ReasonCode)
+	}
+}
+
+func policyCheckAuthorizationKey(input PolicyCheckInput) (string, error) {
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		return "", fmt.Errorf("encode policy decision authorization: %w", err)
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func agentLoopFingerprint(input PolicyCheckInput) string {
@@ -1011,18 +1247,16 @@ func (s *AgentNativeService) externalNotificationsAllowed(
 	if actor.Type != models.ActorTypeServicePrincipal {
 		return true, nil
 	}
-	_, err := s.CheckAction(ctx, PolicyCheckInput{
-		ServicePrincipalID: actor.ID,
-		CredentialID:       credentialID,
-		Scope:              models.ScopeEventsSubscribe,
-		Action:             externalNotificationAction,
-		ResourceType:       "ticket",
-		ResourceID:         resourceID,
-		IsWrite:            true,
-		IsRisky:            true,
-		RequestDigest:      requestDigest,
-		SourceProtocol:     sourceProtocol,
-	})
+	_, err := s.CheckAction(
+		ctx,
+		externalNotificationPolicyCheck(
+			actor,
+			credentialID,
+			resourceID,
+			requestDigest,
+			sourceProtocol,
+		),
+	)
 	if err == nil {
 		return true, nil
 	}
@@ -1038,30 +1272,62 @@ func (s *AgentNativeService) validatePolicyDecision(
 	actor models.ActorRef,
 	input PolicyCheckInput,
 ) error {
-	if s.globalEmergencyStop.Load() {
-		return ErrGlobalEmergencyStop
-	}
-	principal, err := s.getUsablePrincipal(ctx, input.ServicePrincipalID)
+	decision, err := s.loadMatchingPolicyDecision(
+		ctx,
+		decisionID,
+		actor,
+		input,
+		false,
+	)
 	if err != nil {
 		return err
 	}
+	if !decision.Allowed {
+		return fmt.Errorf(
+			"%w: policy decision does not authorize this action",
+			ErrPolicyDenied,
+		)
+	}
+	return nil
+}
+
+func (s *AgentNativeService) loadMatchingPolicyDecision(
+	ctx context.Context,
+	decisionID string,
+	actor models.ActorRef,
+	input PolicyCheckInput,
+	exact bool,
+) (*models.PolicyDecision, error) {
+	if s.globalEmergencyStop.Load() {
+		return nil, ErrGlobalEmergencyStop
+	}
+	principal, err := s.getUsablePrincipal(ctx, input.ServicePrincipalID)
+	if err != nil {
+		return nil, err
+	}
 	if !principal.HasScope(input.Scope) {
-		return fmt.Errorf("%w: scope is no longer granted", ErrPolicyDenied)
+		return nil, fmt.Errorf(
+			"%w: scope is no longer granted",
+			ErrPolicyDenied,
+		)
 	}
 	if input.CredentialID != "" {
 		if err := s.ValidateCredentialReference(ctx, input.ServicePrincipalID, input.CredentialID); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if input.IsWrite && (s.globalReadOnly.Load() || principal.ReadOnly) {
-		return ErrReadOnlyMode
+		return nil, ErrReadOnlyMode
 	}
 	var decision models.PolicyDecision
-	if err := s.db.WithContext(ctx).First(&decision, "id = ?", decisionID).Error; err != nil {
-		return fmt.Errorf("%w: policy decision not found", ErrPolicyDenied)
+	if err := s.dbForContext(ctx).
+		First(&decision, "id = ?", decisionID).Error; err != nil {
+		return nil, fmt.Errorf(
+			"%w: policy decision not found",
+			ErrPolicyDenied,
+		)
 	}
-	if !decision.Allowed ||
-		actor.Type != models.ActorTypeServicePrincipal ||
+	if actor.Type != models.ActorTypeServicePrincipal ||
 		decision.ActorType != actor.Type ||
 		decision.ActorID != actor.ID ||
 		decision.ServicePrincipalID != input.ServicePrincipalID ||
@@ -1069,17 +1335,56 @@ func (s *AgentNativeService) validatePolicyDecision(
 		decision.Action != input.Action ||
 		decision.ResourceType != input.ResourceType ||
 		decision.IsWrite != input.IsWrite ||
-		(input.IsRisky && !decision.IsRisky) ||
-		(input.ResourceID != "" && decision.ResourceID != input.ResourceID) ||
-		(input.CredentialID != "" && decision.CredentialID != input.CredentialID) ||
-		(input.RequestDigest != "" && decision.RequestDigest != input.RequestDigest) ||
-		(input.SourceProtocol != "" && decision.SourceProtocol != input.SourceProtocol) {
-		return fmt.Errorf("%w: policy decision does not authorize this action", ErrPolicyDenied)
+		(exact && (decision.ResourceID != input.ResourceID ||
+			decision.IsRisky != input.IsRisky ||
+			decision.CredentialID != input.CredentialID ||
+			decision.RequestDigest != input.RequestDigest ||
+			decision.SourceProtocol != input.SourceProtocol ||
+			!policyDecisionContextEqual(decision.Context, input.Context))) ||
+		(!exact && ((input.IsRisky && !decision.IsRisky) ||
+			(input.ResourceID != "" && decision.ResourceID != input.ResourceID) ||
+			(input.CredentialID != "" && decision.CredentialID != input.CredentialID) ||
+			(input.RequestDigest != "" && decision.RequestDigest != input.RequestDigest) ||
+			(input.SourceProtocol != "" && decision.SourceProtocol != input.SourceProtocol))) {
+		return nil, fmt.Errorf(
+			"%w: policy decision does not authorize this action",
+			ErrPolicyDenied,
+		)
+	}
+	if operation, operationErr := OperationContextFromContext(ctx); operationErr == nil &&
+		(decision.OrganizationID != operation.Scope.OrganizationID ||
+			decision.ProjectID != operation.Scope.ProjectID) {
+		return nil, fmt.Errorf(
+			"%w: policy decision project scope does not match",
+			ErrPolicyDenied,
+		)
 	}
 	if s.now().Sub(decision.CreatedAt) > 5*time.Minute {
-		return fmt.Errorf("%w: policy decision expired", ErrPolicyDenied)
+		return nil, fmt.Errorf(
+			"%w: policy decision expired",
+			ErrPolicyDenied,
+		)
 	}
-	return nil
+	return &decision, nil
+}
+
+func policyDecisionContextEqual(
+	persisted datatypes.JSON,
+	input map[string]any,
+) bool {
+	expected, err := json.Marshal(input)
+	if err != nil {
+		return false
+	}
+	var persistedValue any
+	if err := json.Unmarshal(persisted, &persistedValue); err != nil {
+		return false
+	}
+	var expectedValue any
+	if err := json.Unmarshal(expected, &expectedValue); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(persistedValue, expectedValue)
 }
 
 func policyMatches(policy *models.AgentPolicy, input PolicyCheckInput) bool {
@@ -1315,10 +1620,28 @@ func (s *AgentNativeService) ReserveIdempotency(
 		record.OrganizationID = operationContext.Scope.OrganizationID
 		record.ProjectID = operationContext.Scope.ProjectID
 	}
-	if err := db.Create(record).Error; err == nil {
+	createResult := db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{
+			{Name: "organization_id"},
+			{Name: "project_id"},
+			{Name: "actor_type"},
+			{Name: "actor_id"},
+			{Name: "operation"},
+			{Name: "key"},
+		},
+		DoNothing: true,
+	}).Create(record)
+	if createResult.Error != nil {
+		return nil, fmt.Errorf("reserve idempotency key: %w", createResult.Error)
+	}
+	if createResult.RowsAffected == 1 {
 		return &IdempotencyReservation{Record: record}, nil
-	} else if !isUniqueConstraintError(err) {
-		return nil, fmt.Errorf("reserve idempotency key: %w", err)
+	}
+	if createResult.RowsAffected != 0 {
+		return nil, fmt.Errorf(
+			"reserve idempotency key: unexpected rows affected: %d",
+			createResult.RowsAffected,
+		)
 	}
 
 	var existing models.IdempotencyRecord
@@ -3329,16 +3652,34 @@ func (s *AgentNativeService) authorizeLeaseCommand(
 	if actor.Type != models.ActorTypeServicePrincipal {
 		return "", nil
 	}
-	check := PolicyCheckInput{
-		ServicePrincipalID: actor.ID,
-		CredentialID:       credentialID,
-		Scope:              models.ScopeTasksManage,
-		Action:             action,
-		ResourceType:       "ticket",
-		ResourceID:         strconv.FormatUint(uint64(ticketID), 10),
-		IsWrite:            true,
-		RequestDigest:      requestDigest,
-		SourceProtocol:     sourceProtocol,
+	check := PolicyCheckInput{}
+	if kind, canonical := nativeLeaseCommandKind(action); canonical {
+		var planErr error
+		check, _, planErr = nativeCommandPrimaryPolicyCheck(
+			NativeCommandAuthorizationInput{
+				Kind:           kind,
+				Actor:          actor,
+				CredentialID:   credentialID,
+				TicketID:       ticketID,
+				RequestDigest:  requestDigest,
+				SourceProtocol: sourceProtocol,
+			},
+		)
+		if planErr != nil {
+			return "", planErr
+		}
+	} else {
+		check = PolicyCheckInput{
+			ServicePrincipalID: actor.ID,
+			CredentialID:       credentialID,
+			Scope:              models.ScopeTasksManage,
+			Action:             action,
+			ResourceType:       "ticket",
+			ResourceID:         strconv.FormatUint(uint64(ticketID), 10),
+			IsWrite:            true,
+			RequestDigest:      requestDigest,
+			SourceProtocol:     sourceProtocol,
+		}
 	}
 	if providedDecisionID != "" {
 		if err := s.validatePolicyDecision(ctx, providedDecisionID, actor, check); err != nil {
@@ -3547,15 +3888,17 @@ func (s *AgentNativeService) CreateNativeTicket(
 
 	policyDecisionID := input.PolicyDecisionID
 	if input.Actor.Type == models.ActorTypeServicePrincipal {
-		check := PolicyCheckInput{
-			ServicePrincipalID: input.Actor.ID,
-			CredentialID:       input.CredentialID,
-			Scope:              models.ScopeTicketsCreate,
-			Action:             "ticket.create",
-			ResourceType:       "ticket",
-			IsWrite:            true,
-			RequestDigest:      input.RequestDigest,
-			SourceProtocol:     input.SourceProtocol,
+		check, _, planErr := nativeCommandPrimaryPolicyCheck(
+			NativeCommandAuthorizationInput{
+				Kind:           NativeCommandTicketCreate,
+				Actor:          input.Actor,
+				CredentialID:   input.CredentialID,
+				RequestDigest:  input.RequestDigest,
+				SourceProtocol: input.SourceProtocol,
+			},
+		)
+		if planErr != nil {
+			return nil, planErr
 		}
 		if policyDecisionID != "" {
 			if err := s.validatePolicyDecision(ctx, policyDecisionID, input.Actor, check); err != nil {
@@ -3883,17 +4226,35 @@ func (s *AgentNativeService) UpdateTicketVersion(
 	isRisky := input.IsRisky || categoryRisky
 	policyDecisionID := input.PolicyDecisionID
 	if input.Actor.Type == models.ActorTypeServicePrincipal {
-		check := PolicyCheckInput{
-			ServicePrincipalID: input.Actor.ID,
-			CredentialID:       input.CredentialID,
-			Scope:              scope,
-			Action:             action,
-			ResourceType:       "ticket",
-			ResourceID:         strconv.FormatUint(uint64(input.TicketID), 10),
-			IsWrite:            true,
-			IsRisky:            isRisky,
-			RequestDigest:      input.RequestDigest,
-			SourceProtocol:     input.SourceProtocol,
+		kind, canonical := nativeMutationCommandKind(scope, action)
+		if !canonical {
+			return nil, fmt.Errorf(
+				"%w: unsupported Agent mutation policy contract %s/%s",
+				ErrCommandScopeMismatch,
+				scope,
+				action,
+			)
+		}
+		check, _, planErr := nativeCommandPrimaryPolicyCheck(
+			NativeCommandAuthorizationInput{
+				Kind:           kind,
+				Actor:          input.Actor,
+				CredentialID:   input.CredentialID,
+				TicketID:       input.TicketID,
+				RequestDigest:  input.RequestDigest,
+				SourceProtocol: input.SourceProtocol,
+			},
+		)
+		if planErr != nil {
+			return nil, planErr
+		}
+		if check.Scope != scope ||
+			check.Action != action ||
+			check.IsRisky != isRisky {
+			return nil, fmt.Errorf(
+				"%w: Agent mutation policy contract drift",
+				ErrCommandScopeMismatch,
+			)
 		}
 		if policyDecisionID != "" {
 			if err := s.validatePolicyDecision(ctx, policyDecisionID, input.Actor, check); err != nil {
@@ -4261,16 +4622,18 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 
 	policyDecisionID := input.PolicyDecisionID
 	if input.Actor.Type == models.ActorTypeServicePrincipal {
-		check := PolicyCheckInput{
-			ServicePrincipalID: input.Actor.ID,
-			CredentialID:       input.CredentialID,
-			Scope:              models.ScopeCommentsWrite,
-			Action:             "ticket.comment.create",
-			ResourceType:       "ticket",
-			ResourceID:         strconv.FormatUint(uint64(input.TicketID), 10),
-			IsWrite:            true,
-			RequestDigest:      input.RequestDigest,
-			SourceProtocol:     input.SourceProtocol,
+		check, _, planErr := nativeCommandPrimaryPolicyCheck(
+			NativeCommandAuthorizationInput{
+				Kind:           NativeCommandCommentCreate,
+				Actor:          input.Actor,
+				CredentialID:   input.CredentialID,
+				TicketID:       input.TicketID,
+				RequestDigest:  input.RequestDigest,
+				SourceProtocol: input.SourceProtocol,
+			},
+		)
+		if planErr != nil {
+			return nil, planErr
 		}
 		if policyDecisionID != "" {
 			if err := s.validatePolicyDecision(ctx, policyDecisionID, input.Actor, check); err != nil {

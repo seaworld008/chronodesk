@@ -10,17 +10,39 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
+type configurationEventAppenderStub struct {
+	input     DomainEventInput
+	operation OperationContext
+	err       error
+	calls     int
+}
+
+func (stub *configurationEventAppenderStub) AppendDomainEventTx(
+	ctx context.Context,
+	_ *gorm.DB,
+	input DomainEventInput,
+	_ []OutboxTarget,
+) (*models.DomainEvent, error) {
+	stub.calls++
+	stub.input = input
+	if operation, err := OperationContextFromContext(ctx); err == nil {
+		stub.operation = operation
+	}
+	if stub.err != nil {
+		return nil, stub.err
+	}
+	return &models.DomainEvent{ID: "configuration-event"}, nil
+}
+
 func TestProjectConfigurationReleaseLifecycleIsImmutableAndScoped(t *testing.T) {
 	db, project, otherProject := newProjectConfigurationTestDB(t)
-	service, err := NewProjectConfigurationService(db)
-	if err != nil {
-		t.Fatal(err)
-	}
+	service := newAuditedProjectConfigurationService(t, db)
 	service.now = func() time.Time {
 		return time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 	}
@@ -91,6 +113,59 @@ func TestProjectConfigurationReleaseLifecycleIsImmutableAndScoped(t *testing.T) 
 		workflow.ID,
 		models.ConfigurationStatusPublished,
 	)
+	var event models.DomainEvent
+	if err := db.Where(
+		"type = ? AND project_id = ?",
+		eventcontract.ConfigurationPublishedEventType,
+		project.ID,
+	).First(&event).Error; err != nil {
+		t.Fatal(err)
+	}
+	if event.OrganizationID != project.OrganizationID ||
+		event.ProjectID != project.ID ||
+		event.ActorType != models.ActorTypeHuman ||
+		event.ActorID != models.HumanActor(1).ID ||
+		event.ResourceVersion != published.Version ||
+		event.ConfigurationVersion != published.ID {
+		t.Fatalf("configuration event identity = %+v", event)
+	}
+	var eventData struct {
+		OrganizationID              uint   `json:"organization_id"`
+		ProjectID                   uint   `json:"project_id"`
+		ConfigurationReleaseID      string `json:"configuration_release_id"`
+		ConfigurationReleaseVersion uint64 `json:"configuration_release_version"`
+		SnapshotHash                string `json:"snapshot_hash"`
+	}
+	if err := json.Unmarshal(event.Data, &eventData); err != nil {
+		t.Fatal(err)
+	}
+	if eventData.OrganizationID != project.OrganizationID ||
+		eventData.ProjectID != project.ID ||
+		eventData.ConfigurationReleaseID != published.ID ||
+		eventData.ConfigurationReleaseVersion != published.Version ||
+		eventData.SnapshotHash != published.SnapshotHash {
+		t.Fatalf("configuration event data = %+v", eventData)
+	}
+	var delivery models.OutboxDelivery
+	if err := db.Where("event_id = ?", event.ID).First(&delivery).Error; err != nil {
+		t.Fatal(err)
+	}
+	if delivery.OrganizationID != project.OrganizationID ||
+		delivery.ProjectID != project.ID ||
+		delivery.DestinationType != "event_stream" {
+		t.Fatalf("configuration event outbox = %+v", delivery)
+	}
+	var audit models.AuditLedgerEntry
+	if err := db.Where("domain_event_id = ?", event.ID).First(&audit).Error; err != nil {
+		t.Fatal(err)
+	}
+	if audit.ActorType != models.ActorTypeHuman ||
+		audit.ActorID != models.HumanActor(1).ID ||
+		audit.EventType != eventcontract.ConfigurationPublishedEventType ||
+		audit.ResourceVersion != published.Version ||
+		audit.ConfigurationVersion != published.ID {
+		t.Fatalf("configuration event audit = %+v", audit)
+	}
 
 	_, err = service.UpdateRequestTypeDraft(ctx, requestType.ID, RequestTypeDraftInput{
 		Name:       "Mutated",
@@ -140,11 +215,103 @@ func TestProjectConfigurationReleaseLifecycleIsImmutableAndScoped(t *testing.T) 
 	}
 }
 
+func TestProjectConfigurationPublicationRollsBackWhenEventAppendFails(
+	t *testing.T,
+) {
+	db, project, _ := newProjectConfigurationTestDB(t)
+	eventFailure := errors.New("configuration event persistence failed")
+	events := &configurationEventAppenderStub{err: eventFailure}
+	service, err := NewProjectConfigurationService(db, events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := projectConfigurationTestContext(t, project)
+	requestType, workflow := createConfigurationDraftVersions(
+		t,
+		service,
+		ctx,
+	)
+	release, err := service.CreateConfigurationReleaseDraft(
+		ctx,
+		ConfigurationReleaseDraftInput{
+			Snapshot: models.ConfigurationSnapshot{
+				RequestTypeVersionIDs: []string{requestType.ID},
+				WorkflowVersionIDs:    []string{workflow.ID},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SimulateConfigurationRelease(
+		ctx,
+		release.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	withoutEvents, err := NewProjectConfigurationService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := withoutEvents.ApproveConfigurationRelease(
+		ctx,
+		release.ID,
+	); !errors.Is(err, ErrConfigurationEventWriter) {
+		t.Fatalf("missing configuration event writer error = %v", err)
+	}
+
+	_, err = service.ApproveConfigurationRelease(ctx, release.ID)
+	if !errors.Is(err, eventFailure) {
+		t.Fatalf("publication error = %v, want event failure", err)
+	}
+	if events.calls != 1 ||
+		events.input.Type != eventcontract.ConfigurationPublishedEventType ||
+		events.input.Scope != project.Scope() ||
+		events.operation.Scope != project.Scope() ||
+		events.input.Actor != models.HumanActor(1) ||
+		events.operation.Actor != models.HumanActor(1) ||
+		events.input.ResourceVersion != release.Version ||
+		events.input.ConfigurationVersion != release.ID {
+		t.Fatalf(
+			"configuration event input/context = input=%+v operation=%+v",
+			events.input,
+			events.operation,
+		)
+	}
+	var persisted models.ConfigurationRelease
+	if err := db.First(&persisted, "id = ?", release.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != models.ConfigurationStatusSimulated ||
+		persisted.ApprovedByType != "" ||
+		persisted.ApprovedByID != "" ||
+		persisted.PublishedAt != nil {
+		t.Fatalf("event failure persisted release publication: %+v", persisted)
+	}
+	assertConfigurationVersionStatus(
+		t,
+		db,
+		&models.RequestTypeVersion{},
+		requestType.ID,
+		models.ConfigurationStatusSimulated,
+	)
+	assertConfigurationVersionStatus(
+		t,
+		db,
+		&models.WorkflowVersion{},
+		workflow.ID,
+		models.ConfigurationStatusSimulated,
+	)
+}
+
 func TestCurrentIntakeConfigurationPreservesPublishedSnapshotOrder(
 	t *testing.T,
 ) {
 	db, project, otherProject := newProjectConfigurationTestDB(t)
-	service, err := NewProjectConfigurationService(db)
+	service, err := NewProjectConfigurationService(
+		db,
+		&configurationEventAppenderStub{},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +431,10 @@ func TestProjectConfigurationRejectsInvalidWorkflowMapping(t *testing.T) {
 
 func TestIndustrySolutionInstallUpgradeDiffApprovalAndRollback(t *testing.T) {
 	db, project, otherProject := newProjectConfigurationTestDB(t)
-	service, err := NewProjectConfigurationService(db)
+	service, err := NewProjectConfigurationService(
+		db,
+		&configurationEventAppenderStub{},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -513,6 +683,28 @@ func TestBootstrapProjectConfigurationUsesProjectUniqueUUIDv7Versions(t *testing
 	}
 }
 
+func newAuditedProjectConfigurationService(
+	t *testing.T,
+	db *gorm.DB,
+) *ProjectConfigurationService {
+	t.Helper()
+	ledger, err := NewAuditLedgerService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	native := NewAgentNativeService(db, AgentNativeOptions{
+		AuditLedger: ledger,
+		DefaultOutboxTargets: []OutboxTarget{
+			{Type: "event_stream", ID: "default", MaxAttempts: 8},
+		},
+	})
+	service, err := NewProjectConfigurationService(db, native)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service
+}
+
 func newProjectConfigurationTestDB(
 	t *testing.T,
 ) (*gorm.DB, models.Project, models.Project) {
@@ -550,6 +742,10 @@ func newProjectConfigurationStandaloneDB(
 		&models.WorkflowVersion{},
 		&models.ConfigurationRelease{},
 		&models.ProjectSolutionInstallation{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
+		&models.AuditChainHead{},
+		&models.AuditLedgerEntry{},
 	); err != nil {
 		t.Fatal(err)
 	}

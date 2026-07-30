@@ -322,6 +322,16 @@ func (h *TicketHandler) CreateTicket(c *gin.Context) {
 	ticket, err := h.ticketService.CreateTicket(ctx, &req, userID.(uint))
 	if err != nil {
 		switch {
+		case errors.Is(err, services.ErrTicketCreateAccessDenied):
+			writeHumanTicketProblem(
+				c,
+				http.StatusForbidden,
+				"ticket_create_access_denied",
+				"无权创建工单",
+				"当前用户没有该项目的有效建单成员权限",
+				false,
+			)
+			return
 		case errors.Is(err, services.ErrTicketFormValidation):
 			writeHumanTicketProblem(
 				c,

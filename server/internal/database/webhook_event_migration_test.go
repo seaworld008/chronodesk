@@ -8,6 +8,7 @@ import (
 
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -50,16 +51,18 @@ func insertLegacyWebhookConfig(
 ) {
 	t.Helper()
 	if err := db.Table("webhook_configs").Create(map[string]any{
-		"id":             id,
-		"created_at":     time.Now().UTC(),
-		"updated_at":     time.Now().UTC(),
-		"name":           name,
-		"provider":       models.WebhookProviderCustom,
-		"webhook_url":    "https://hooks.example.test/events",
-		"status":         models.WebhookStatusActive,
-		"enabled_events": events,
-		"filter_rules":   "",
-		"created_by":     1,
+		"id":              id,
+		"organization_id": 1,
+		"project_id":      1,
+		"created_at":      time.Now().UTC(),
+		"updated_at":      time.Now().UTC(),
+		"name":            name,
+		"provider":        models.WebhookProviderCustom,
+		"webhook_url":     "https://hooks.example.test/events",
+		"status":          models.WebhookStatusActive,
+		"enabled_events":  events,
+		"filter_rules":    "",
+		"created_by":      1,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -111,6 +114,8 @@ func TestMigrateWebhookEventTaxonomyPreservesSubscriptionSemantics(t *testing.T)
 	}
 	for _, row := range logs {
 		row["created_at"] = time.Now().UTC()
+		row["organization_id"] = 1
+		row["project_id"] = 1
 		if err := db.Table("webhook_logs").Create(row).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -234,12 +239,14 @@ func TestMigrateWebhookEventTaxonomyRejectsPublisherlessHistoricalLog(t *testing
 		`["io.chronodesk.ticket.created.v1"]`,
 	)
 	if err := db.Table("webhook_logs").Create(map[string]any{
-		"id":         1,
-		"created_at": time.Now().UTC(),
-		"config_id":  1,
-		"event_type": "user.registered",
-		"event_data": `{}`,
-		"status":     "success",
+		"id":              1,
+		"organization_id": 1,
+		"project_id":      1,
+		"created_at":      time.Now().UTC(),
+		"config_id":       1,
+		"event_type":      "user.registered",
+		"event_data":      `{}`,
+		"status":          "success",
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +261,10 @@ func TestRunMigrationsInvokesWebhookEventTaxonomyMigration(t *testing.T) {
 	db := openWebhookMigrationTestDB(t)
 	insertLegacyWebhookConfig(t, db, 1, "closed", `["ticket.closed"]`)
 
-	if err := RunMigrations(db); err != nil {
+	if err := RunMigrations(
+		db,
+		services.EnsureProjectScopeMigrationMembership,
+	); err != nil {
 		t.Fatalf("RunMigrations(): %v", err)
 	}
 	var migrated models.WebhookConfig

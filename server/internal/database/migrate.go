@@ -36,6 +36,12 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 		if err := validatePostgresA2AIdentifierContract(db); err != nil {
 			return err
 		}
+		if err := ValidateIdempotencyScopeIndex(db); err != nil {
+			return err
+		}
+		if err := ValidateProjectScopeCutoverMarker(db); err != nil {
+			return err
+		}
 		return ValidateProjectRLSReadiness(db)
 	}
 
@@ -56,6 +62,12 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 			"required schema objects are missing: %s; run `go run ./cmd/migrate` before starting the server",
 			strings.Join(missing, ", "),
 		)
+	}
+	if err := ValidateIdempotencyScopeIndex(db); err != nil {
+		return err
+	}
+	if err := ValidateProjectScopeCutoverMarker(db); err != nil {
+		return err
 	}
 	return ValidateProjectRLSReadiness(db)
 }
@@ -134,6 +146,9 @@ type runtimeSchemaRequirement struct {
 // than trusting migration history.
 func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 	return []runtimeSchemaRequirement{
+		{&models.SchemaMigrationCheckpoint{}, "schema_migration_checkpoints", []string{
+			"key", "version", "checksum", "completed_at",
+		}},
 		{&models.User{}, "users", []string{
 			"id", "role", "status", "password_hash", "password_reset_at",
 			"two_factor_enabled", "two_factor_secret", "backup_codes",
@@ -163,11 +178,14 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 		{&models.AgentPolicy{}, "agent_policies", []string{"service_principal_id", "effect", "scope", "action", "conditions", "is_active"}},
 		{&models.PolicyDecision{}, "policy_decisions", []string{"actor_type", "actor_id", "credential_id", "allowed", "reason_code", "request_digest"}},
 		{&models.IdempotencyRecord{}, "idempotency_records", []string{
-			"actor_type", "actor_id", "operation", "key", "request_hash", "state",
+			"organization_id", "project_id", "actor_type", "actor_id",
+			"operation", "key", "request_hash", "state",
 			"resource_snapshot", "expires_at", "completion_ttl_nanoseconds", "completed_at",
 		}},
 		{&models.Ticket{}, "tickets", []string{
-			"id", "version", "agent_context", "trust_level", "created_by_actor_type",
+			"id", "public_id", "organization_id", "project_id", "queue_id",
+			"request_type_version_id", "workflow_version_id",
+			"version", "agent_context", "trust_level", "created_by_actor_type",
 			"created_by_actor_id", "assigned_to_actor_type", "assigned_to_actor_id",
 		}},
 		{&models.TicketComment{}, "ticket_comments", []string{"ticket_id", "actor_type", "actor_id", "service_principal_id", "type"}},
@@ -407,6 +425,9 @@ func schemaMigrationModels() []any {
 		&models.ProjectModelPolicy{},
 		&models.AuditChainHead{},
 		&models.AuditLedgerEntry{},
+		// One-time destructive backfills use committed markers so a later
+		// structural migration cannot reinterpret live multi-project data.
+		&models.SchemaMigrationCheckpoint{},
 	}
 }
 
@@ -615,13 +636,30 @@ $$;`
 // decision. Schema migration never calls this path.
 type SeedOptions struct {
 	IncludeSampleData bool
+	// EnsureInitialAdministratorMembership is supplied by the composition
+	// root so the privileged project grant goes through the shared domain
+	// service and writes its ActorRef, CloudEvent, Outbox and audit ledger
+	// entry in this same seed transaction.
+	EnsureInitialAdministratorMembership InitialAdministratorMembershipWriter
 }
+
+type InitialAdministratorMembershipWriter func(
+	context.Context,
+	*gorm.DB,
+	models.User,
+	models.ProjectScope,
+) error
 
 // SeedData initializes the bootstrap administrator and default categories in a
 // single transaction. A failure at any stage rolls back every seed mutation.
 func SeedData(db *gorm.DB, options SeedOptions) error {
 	if db == nil {
 		return errors.New("seed database is required")
+	}
+	if options.EnsureInitialAdministratorMembership == nil {
+		return errors.New(
+			"audited initial administrator membership writer is required",
+		)
 	}
 	log.Println("Seeding initial data...")
 	return db.Transaction(func(tx *gorm.DB) error {
@@ -686,6 +724,13 @@ func seedInitialData(db *gorm.DB, options SeedOptions) error {
 		if err := db.Where("role = ?", models.RoleAdmin).First(&adminUser).Error; err != nil {
 			return fmt.Errorf("failed to get admin user: %w", err)
 		}
+	}
+	if err := seedInitialAdministratorMembership(
+		db,
+		adminUser,
+		options.EnsureInitialAdministratorMembership,
+	); err != nil {
+		return err
 	}
 
 	// 检查是否已有默认分类
@@ -782,6 +827,58 @@ func seedInitialData(db *gorm.DB, options SeedOptions) error {
 	return nil
 }
 
+func seedInitialAdministratorMembership(
+	db *gorm.DB,
+	administrator models.User,
+	writer InitialAdministratorMembershipWriter,
+) error {
+	if administrator.ID == 0 ||
+		administrator.Role != models.RoleAdmin ||
+		administrator.Status != models.UserStatusActive {
+		return errors.New("initial administrator identity is invalid")
+	}
+	if writer == nil {
+		return errors.New(
+			"audited initial administrator membership writer is required",
+		)
+	}
+
+	var organization models.Organization
+	if err := db.Where(
+		"slug = ? AND status = ?",
+		DefaultOrganizationSlug,
+		models.OrganizationStatusActive,
+	).First(&organization).Error; err != nil {
+		return fmt.Errorf("load trusted default organization for initial administrator: %w", err)
+	}
+	var project models.Project
+	if err := db.Where(
+		"organization_id = ? AND key = ? AND status = ?",
+		organization.ID,
+		DefaultProjectKey,
+		models.ProjectStatusActive,
+	).First(&project).Error; err != nil {
+		return fmt.Errorf("load trusted default project for initial administrator: %w", err)
+	}
+
+	seedContext := db.Statement.Context
+	if seedContext == nil {
+		seedContext = context.Background()
+	}
+	if err := writer(
+		seedContext,
+		db,
+		administrator,
+		project.Scope(),
+	); err != nil {
+		return fmt.Errorf(
+			"ensure audited initial administrator default project membership: %w",
+			err,
+		)
+	}
+	return nil
+}
+
 // generateSampleDataIfNeeded generates optional demonstration records. The
 // caller has already enforced the explicit development-only gate.
 func generateSampleDataIfNeeded(db *gorm.DB) error {
@@ -808,23 +905,35 @@ func generateSampleDataIfNeeded(db *gorm.DB) error {
 
 // RunMigrations 只执行可重复的结构迁移。生产启动与普通 migrate 命令
 // 绝不能隐式创建账号、分类或示例工单；种子数据必须由显式 seed 命令触发。
-func RunMigrations(db *gorm.DB) error {
+func RunMigrations(
+	db *gorm.DB,
+	membershipWriters ...ProjectScopeMembershipWriter,
+) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	return RunMigrationsContext(ctx, db)
+	return RunMigrationsContext(ctx, db, membershipWriters...)
 }
 
 // RunMigrationsContext is the bounded migration entry point used by operator
 // tooling. A lost TLS connection or pooler response must never leave deployment
 // automation blocked indefinitely.
-func RunMigrationsContext(ctx context.Context, db *gorm.DB) error {
-	return RunMigrationsFromModel(ctx, db, 1)
+func RunMigrationsContext(
+	ctx context.Context,
+	db *gorm.DB,
+	membershipWriters ...ProjectScopeMembershipWriter,
+) error {
+	return RunMigrationsFromModel(ctx, db, 1, membershipWriters...)
 }
 
 // RunMigrationsFromModel resumes the model scan at a one-based index while
 // still running all index and runtime-schema gates. It is intended for a
 // bounded operator retry after a network timeout; normal callers start at 1.
-func RunMigrationsFromModel(ctx context.Context, db *gorm.DB, firstModel int) error {
+func RunMigrationsFromModel(
+	ctx context.Context,
+	db *gorm.DB,
+	firstModel int,
+	membershipWriters ...ProjectScopeMembershipWriter,
+) error {
 	if ctx == nil {
 		return errors.New("migration context is required")
 	}
@@ -851,68 +960,87 @@ func RunMigrationsFromModel(ctx context.Context, db *gorm.DB, firstModel int) er
 		return fmt.Errorf("login history method migration failed: %w", err)
 	}
 
-	// 3. 自动迁移模型
+	// 3. Checkpoints are outside the resumable model window: a retry that
+	// starts after this model must still be able to prove whether destructive
+	// data cutovers committed.
+	if err := db.AutoMigrate(&models.SchemaMigrationCheckpoint{}); err != nil {
+		return fmt.Errorf("schema migration checkpoint setup failed: %w", err)
+	}
+
+	// 4. Existing pre-project PostgreSQL tables need a non-null zero sentinel
+	// before canonical model tags are applied. No live scoped value is inferred
+	// or rewritten here.
+	if err := PrepareLegacyProjectScopeColumns(db); err != nil {
+		return fmt.Errorf("legacy project scope preparation failed: %w", err)
+	}
+
+	// 5. 自动迁移模型
 	if err := autoMigrateFromModel(db, firstModel); err != nil {
 		return fmt.Errorf("auto migration failed: %w", err)
 	}
 
-	// 4. 将单组织存量数据映射到显式默认项目，并回填人类与服务主体授权。
-	if err := MigrateProjectScope(db); err != nil {
+	// 6. 将单组织存量数据映射到显式默认项目，并回填人类与服务主体授权。
+	if err := MigrateProjectScope(db, membershipWriters...); err != nil {
 		return fmt.Errorf("project scope migration failed: %w", err)
 	}
 
-	// 5. 显式扩展外部 A2A 标识符；GORM 不会可靠修改已有 VARCHAR 长度。
+	// 7. 原子替换旧四列幂等索引，使六列项目作用域 ON CONFLICT 契约可用。
+	if err := MigrateIdempotencyScopeIndex(db); err != nil {
+		return fmt.Errorf("idempotency scope index migration failed: %w", err)
+	}
+
+	// 8. 显式扩展外部 A2A 标识符；GORM 不会可靠修改已有 VARCHAR 长度。
 	if err := MigrateA2AIdentifierContract(db); err != nil {
 		return fmt.Errorf("A2A identifier migration failed: %w", err)
 	}
 
-	// 6. 将自动化规则持久契约收敛到当前 CloudEvent 类型。
+	// 9. 将自动化规则持久契约收敛到当前 CloudEvent 类型。
 	if err := MigrateAutomationRuleTriggerEvents(db); err != nil {
 		return fmt.Errorf("automation trigger migration failed: %w", err)
 	}
 
-	// 7. 将 Webhook 订阅与投递日志迁移为完整的 canonical CloudEvent 类型。
+	// 10. 将 Webhook 订阅与投递日志迁移为完整的 canonical CloudEvent 类型。
 	if err := MigrateWebhookEventTaxonomy(db); err != nil {
 		return fmt.Errorf("webhook event taxonomy migration failed: %w", err)
 	}
 
-	// 8. 回填并约束权威 ActorRef，移除服务主体对人类账号的投影依赖。
+	// 11. 回填并约束权威 ActorRef，移除服务主体对人类账号的投影依赖。
 	if err := MigrateActorProjections(db); err != nil {
 		return fmt.Errorf("actor projection migration failed: %w", err)
 	}
 
-	// 9. 验证旧附件投影为空后删除，正式附件表成为唯一持久模型。
+	// 12. 验证旧附件投影为空后删除，正式附件表成为唯一持久模型。
 	if err := MigrateAttachmentProjections(db); err != nil {
 		return fmt.Errorf("attachment projection migration failed: %w", err)
 	}
 
-	// 10. 只使用可证明的语义证据关联历史记录与不可变领域事件。
+	// 13. 只使用可证明的语义证据关联历史记录与不可变领域事件。
 	if err := MigrateTicketHistoryEventLinks(db); err != nil {
 		return fmt.Errorf("ticket history event-link migration failed: %w", err)
 	}
 
-	// 11. 收口删除语义明确的外键策略
+	// 14. 收口删除语义明确的外键策略
 	if err := EnsureForeignKeyPolicies(db); err != nil {
 		return fmt.Errorf("foreign-key policy migration failed: %w", err)
 	}
 
-	// 12. 创建额外索引
+	// 15. 创建额外索引
 	if err := CreateIndexes(db); err != nil {
 		return fmt.Errorf("index creation failed: %w", err)
 	}
 
-	// 13. 为项目审计账本安装数据库级追加写与链连续性约束。
+	// 16. 为项目审计账本安装数据库级追加写与链连续性约束。
 	if err := InstallAuditLedgerConstraints(db); err != nil {
 		return fmt.Errorf("audit ledger constraint migration failed: %w", err)
 	}
 
-	// 14. 为 scope-ready 的项目业务表安装 PostgreSQL RLS policy。
+	// 17. 为 scope-ready 的项目业务表安装 PostgreSQL RLS policy。
 	// ENABLE/FORCE 是所有写路径切换到 scoped transaction 后的显式部署步骤。
 	if err := MigrateProjectRLS(db); err != nil {
 		return fmt.Errorf("project RLS migration failed: %w", err)
 	}
 
-	// 15. 验证运行时所需的关键表、列与 RLS policy readiness。
+	// 18. 验证运行时所需的关键表、列、索引与 RLS policy readiness。
 	if err := ValidateRuntimeSchema(db); err != nil {
 		return fmt.Errorf("runtime schema validation failed: %w", err)
 	}

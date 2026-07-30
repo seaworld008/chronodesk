@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from tests.utils import APIClient
+from tests.utils import APIClient, E2EResourceManager
 
 
 @pytest.mark.api
@@ -190,6 +190,7 @@ class TestTicketLifecycle:
         ticket_payload: dict[str, object],
         secondary_agent: dict[str, Any],
         created_ticket_ids: list[int],
+        e2e_manager: E2EResourceManager,
     ) -> None:
         agent_api = secondary_agent["api"]
         existing_agent_notifications = self._fetch_notification_ids(
@@ -197,9 +198,10 @@ class TestTicketLifecycle:
         )
 
         # 1. Create ticket
+        configured_ticket_payload = e2e_manager.ticket_create_payload(ticket_payload)
         create_resp = admin_api.post_json(
             admin_api.project_path("tickets"),
-            ticket_payload,
+            configured_ticket_payload,
         )
         assert create_resp.status_code in (200, 201), create_resp.text
         create_body = create_resp.json()

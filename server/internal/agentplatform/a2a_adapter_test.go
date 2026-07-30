@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/a2a"
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
@@ -35,6 +37,80 @@ type a2aAdapterFixture struct {
 	principal             *models.ServicePrincipal
 	credential            models.AgentCredential
 	user                  models.User
+}
+
+type transactionAssertingExecutionGuard struct {
+	inner services.AgentExecutionGuard
+
+	mu              sync.Mutex
+	acquireCalls    int
+	releaseCalls    int
+	recordLoopCalls int
+}
+
+func newTransactionAssertingExecutionGuard() *transactionAssertingExecutionGuard {
+	return &transactionAssertingExecutionGuard{
+		inner: services.NewInMemoryAgentExecutionGuardForTesting(),
+	}
+}
+
+func (guard *transactionAssertingExecutionGuard) Acquire(
+	ctx context.Context,
+	request services.AgentExecutionGuardRequest,
+) (*services.AgentExecutionPermit, error) {
+	guard.mu.Lock()
+	guard.acquireCalls++
+	guard.mu.Unlock()
+	if scopeddb.HasTransaction(ctx) {
+		return nil, errors.New(
+			"Agent execution acquire ran inside a project transaction",
+		)
+	}
+	return guard.inner.Acquire(ctx, request)
+}
+
+func (guard *transactionAssertingExecutionGuard) Release(
+	ctx context.Context,
+	permit *services.AgentExecutionPermit,
+) error {
+	guard.mu.Lock()
+	guard.releaseCalls++
+	guard.mu.Unlock()
+	if scopeddb.HasTransaction(ctx) {
+		return errors.New(
+			"Agent execution release ran inside a project transaction",
+		)
+	}
+	return guard.inner.Release(ctx, permit)
+}
+
+func (guard *transactionAssertingExecutionGuard) RecordLoop(
+	ctx context.Context,
+	request services.AgentLoopGuardRequest,
+) (bool, error) {
+	guard.mu.Lock()
+	guard.recordLoopCalls++
+	guard.mu.Unlock()
+	if scopeddb.HasTransaction(ctx) {
+		return false, errors.New(
+			"Agent automation loop guard ran inside a project transaction",
+		)
+	}
+	return guard.inner.RecordLoop(ctx, request)
+}
+
+func (guard *transactionAssertingExecutionGuard) IsDistributed() bool {
+	return guard.inner.IsDistributed()
+}
+
+func (guard *transactionAssertingExecutionGuard) counts() (
+	acquire int,
+	release int,
+	recordLoop int,
+) {
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	return guard.acquireCalls, guard.releaseCalls, guard.recordLoopCalls
 }
 
 func TestA2AProtocolPolicyClassifiesExternalPushAsRisky(t *testing.T) {
@@ -229,6 +305,18 @@ func newA2AAdapterFixtureWithScopes(
 	t *testing.T,
 	scopes []string,
 ) a2aAdapterFixture {
+	return newA2AAdapterFixtureWithOptions(
+		t,
+		scopes,
+		services.AgentNativeOptions{},
+	)
+}
+
+func newA2AAdapterFixtureWithOptions(
+	t *testing.T,
+	scopes []string,
+	options services.AgentNativeOptions,
+) a2aAdapterFixture {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {
@@ -331,7 +419,7 @@ func newA2AAdapterFixtureWithScopes(
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatalf("create actor user: %v", err)
 	}
-	native := services.NewAgentNativeService(db)
+	native := services.NewAgentNativeService(db, options)
 	principal, err := native.CreateServicePrincipal(context.Background(), services.CreateServicePrincipalInput{
 		Name:   "a2a-adapter-agent",
 		Scopes: scopes,
@@ -367,6 +455,7 @@ func newA2AAdapterFixtureWithScopes(
 		CredentialID: issuedCredential.Credential.ID,
 		ProjectKey:   string(project.Key),
 		Scope:        project.Scope(),
+		TokenScopes:  append([]string(nil), scopes...),
 	}
 	backend, err := NewA2ABackend(db, native, StaticA2AIdentityResolver{Identity: identity})
 	if err != nil {
@@ -418,7 +507,7 @@ func TestA2ATaskListAuthorizerFiltersExactDenyWithOneSummaryDecision(t *testing.
 	if err != nil || allowed {
 		t.Fatalf("denied Task policy = %v, %v", allowed, err)
 	}
-	if err := batch.RecordSummary(context.Background(), a2a.TaskListAuthorizationSummary{
+	if err := batch.RecordSummary(ctx, a2a.TaskListAuthorizationSummary{
 		CandidateBudget:   100,
 		CandidatesScanned: 2,
 		ItemsReturned:     1,
@@ -814,6 +903,24 @@ func TestA2APolicyMiddlewareAliasCannotBypassSendDenyWithAllowedPush(t *testing.
 		func(c *gin.Context) {
 			c.Set(agentauth.ContextPrincipalID, fixture.principal.ID)
 			c.Set(agentauth.ContextCredentialID, a2aFixtureCredentialID(t, fixture))
+			ctx, err := bindA2AOperationIdentity(
+				c.Request.Context(),
+				A2AExecutionIdentity{
+					Actor: models.ServicePrincipalActor(
+						fixture.principal.ID,
+					),
+					CredentialID: fixture.credential.ID,
+					ProjectKey:   string(fixture.project.Key),
+					Scope:        fixture.project.Scope(),
+					TokenScopes:  fixture.principal.ScopeList(),
+				},
+			)
+			if err != nil {
+				t.Errorf("bind trusted A2A operation: %v", err)
+				c.AbortWithStatus(http.StatusInternalServerError)
+				return
+			}
+			c.Request = c.Request.WithContext(ctx)
 			c.Next()
 		},
 		A2ARequestPolicyMiddleware(
@@ -860,6 +967,202 @@ func TestA2APolicyMiddlewareAliasCannotBypassSendDenyWithAllowedPush(t *testing.
 	}
 }
 
+func TestA2ARequestPolicyMiddlewarePersistsDecisionInTrustedProjectTransaction(
+	t *testing.T,
+) {
+	fixture := newA2AAdapterFixture(t)
+	const callbackName = "test:require_scoped_a2a_policy_decision"
+	if err := fixture.db.Callback().Create().
+		Before("gorm:create").
+		Register(callbackName, func(tx *gorm.DB) {
+			decision, ok := tx.Statement.Dest.(*models.PolicyDecision)
+			if !ok {
+				return
+			}
+			if !scopeddb.HasTransaction(tx.Statement.Context) {
+				_ = tx.AddError(errors.New(
+					"policy decision was created outside a project transaction",
+				))
+				return
+			}
+			if decision.OrganizationID == 0 || decision.ProjectID == 0 {
+				_ = tx.AddError(errors.New(
+					"policy decision is missing trusted project scope",
+				))
+			}
+		}); err != nil {
+		t.Fatalf("register policy transaction assertion: %v", err)
+	}
+
+	identity := A2AExecutionIdentity{
+		Actor:        models.ServicePrincipalActor(fixture.principal.ID),
+		CredentialID: fixture.credential.ID,
+		ProjectKey:   string(fixture.project.Key),
+		Scope:        fixture.project.Scope(),
+		TokenScopes:  fixture.principal.ScopeList(),
+	}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST(
+		"/a2a/v1",
+		func(c *gin.Context) {
+			c.Set(agentauth.ContextPrincipalID, fixture.principal.ID)
+			c.Set(agentauth.ContextCredentialID, fixture.credential.ID)
+			ctx, err := bindA2AOperationIdentity(
+				c.Request.Context(),
+				identity,
+			)
+			if err != nil {
+				t.Errorf("bind trusted A2A operation: %v", err)
+				c.AbortWithStatus(http.StatusInternalServerError)
+				return
+			}
+			c.Request = c.Request.WithContext(ctx)
+			c.Next()
+		},
+		A2ARequestPolicyMiddleware(
+			fixture.native,
+			A2ATaskResourceResolverFunc(
+				func(context.Context, string) (string, error) {
+					return "", a2a.ErrTaskNotFound
+				},
+			),
+		),
+		func(c *gin.Context) {
+			c.Status(http.StatusNoContent)
+		},
+	)
+	body := `{
+		"jsonrpc":"2.0",
+		"id":"scoped-policy",
+		"method":"GetTask",
+		"params":{"id":"task-1"}
+	}`
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/a2a/v1",
+		strings.NewReader(body),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("A2A-Version", a2a.ProtocolVersion)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf(
+			"scoped A2A policy status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+
+	var decision models.PolicyDecision
+	if err := fixture.db.
+		Where(
+			"service_principal_id = ? AND action = ?",
+			fixture.principal.ID,
+			"a2a.GetTask",
+		).
+		First(&decision).Error; err != nil {
+		t.Fatalf("load scoped A2A policy decision: %v", err)
+	}
+	if decision.OrganizationID != fixture.organization.ID ||
+		decision.ProjectID != fixture.project.ID {
+		t.Fatalf(
+			"policy decision scope = %d/%d, want %d/%d",
+			decision.OrganizationID,
+			decision.ProjectID,
+			fixture.organization.ID,
+			fixture.project.ID,
+		)
+	}
+}
+
+func TestA2ARequestPolicyMiddlewareRunsLoopGuardOutsideProjectTransaction(
+	t *testing.T,
+) {
+	guard := newTransactionAssertingExecutionGuard()
+	fixture := newA2AAdapterFixtureWithOptions(
+		t,
+		[]string{models.ScopeTasksManage},
+		services.AgentNativeOptions{ExecutionGuard: guard},
+	)
+	identity := A2AExecutionIdentity{
+		Actor:        models.ServicePrincipalActor(fixture.principal.ID),
+		CredentialID: fixture.credential.ID,
+		ProjectKey:   string(fixture.project.Key),
+		Scope:        fixture.project.Scope(),
+		TokenScopes:  fixture.principal.ScopeList(),
+	}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST(
+		"/a2a/v1",
+		func(c *gin.Context) {
+			c.Set(agentauth.ContextPrincipalID, fixture.principal.ID)
+			c.Set(agentauth.ContextCredentialID, fixture.credential.ID)
+			ctx, err := bindA2AOperationIdentity(
+				c.Request.Context(),
+				identity,
+			)
+			if err != nil {
+				t.Errorf("bind trusted A2A operation: %v", err)
+				c.AbortWithStatus(http.StatusInternalServerError)
+				return
+			}
+			c.Request = c.Request.WithContext(ctx)
+			c.Next()
+		},
+		A2ARequestPolicyMiddleware(
+			fixture.native,
+			A2ATaskResourceResolverFunc(
+				func(context.Context, string) (string, error) {
+					return "task-guarded-send", nil
+				},
+			),
+		),
+		func(c *gin.Context) {
+			c.Status(http.StatusNoContent)
+		},
+	)
+	body := `{
+		"jsonrpc":"2.0",
+		"id":"guarded-send",
+		"method":"SendMessage",
+		"params":{
+			"message":{
+				"messageId":"guarded-message",
+				"role":"ROLE_USER",
+				"parts":[{"text":"continue"}]
+			}
+		}
+	}`
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/a2a/v1",
+		strings.NewReader(body),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("A2A-Version", a2a.ProtocolVersion)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf(
+			"guarded A2A send status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	acquireCalls, releaseCalls, recordLoopCalls := guard.counts()
+	if acquireCalls != 0 || releaseCalls != 0 || recordLoopCalls != 1 {
+		t.Fatalf(
+			"middleware guard calls acquire=%d release=%d record_loop=%d, want 0/0/1",
+			acquireCalls,
+			releaseCalls,
+			recordLoopCalls,
+		)
+	}
+}
+
 func a2aFixtureCredentialID(t *testing.T, fixture a2aAdapterFixture) string {
 	t.Helper()
 	var credential models.AgentCredential
@@ -875,6 +1178,18 @@ func a2aFixtureContext(
 	t *testing.T,
 	fixture a2aAdapterFixture,
 ) context.Context {
+	return a2aFixtureContextWithTokenScopes(
+		t,
+		fixture,
+		fixture.principal.ScopeList(),
+	)
+}
+
+func a2aFixtureContextWithTokenScopes(
+	t *testing.T,
+	fixture a2aAdapterFixture,
+	tokenScopes []string,
+) context.Context {
 	t.Helper()
 	ctx, err := bindA2AOperationIdentity(
 		context.Background(),
@@ -883,12 +1198,65 @@ func a2aFixtureContext(
 			CredentialID: fixture.credential.ID,
 			ProjectKey:   string(fixture.project.Key),
 			Scope:        fixture.project.Scope(),
+			TokenScopes:  append([]string(nil), tokenScopes...),
 		},
 	)
 	if err != nil {
 		t.Fatalf("bind A2A fixture context: %v", err)
 	}
 	return ctx
+}
+
+func a2aBackendWithTokenScopes(
+	t *testing.T,
+	fixture a2aAdapterFixture,
+	tokenScopes []string,
+) *A2ABackend {
+	t.Helper()
+	backend, err := NewA2ABackend(
+		fixture.db,
+		fixture.native,
+		StaticA2AIdentityResolver{Identity: A2AExecutionIdentity{
+			Actor:        models.ServicePrincipalActor(fixture.principal.ID),
+			CredentialID: fixture.credential.ID,
+			ProjectKey:   string(fixture.project.Key),
+			Scope:        fixture.project.Scope(),
+			TokenScopes:  append([]string(nil), tokenScopes...),
+		}},
+	)
+	if err != nil {
+		t.Fatalf("create token-scoped A2A backend: %v", err)
+	}
+	return backend
+}
+
+func seedA2AQueryTicket(
+	t *testing.T,
+	fixture a2aAdapterFixture,
+	number string,
+) models.Ticket {
+	t.Helper()
+	ticket := models.Ticket{
+		OrganizationID:       fixture.organization.ID,
+		ProjectID:            fixture.project.ID,
+		QueueID:              fixture.queue.ID,
+		TicketNumber:         number,
+		Title:                "Token-scoped A2A query",
+		Description:          "OAuth token authority must remain attenuated.",
+		Type:                 models.TicketTypeRequest,
+		Priority:             models.TicketPriorityNormal,
+		Status:               models.TicketStatusOpen,
+		Source:               models.TicketSourceAgent,
+		Version:              1,
+		RequestTypeVersionID: fixture.requestTypeVersionIDs[models.TicketTypeRequest],
+		WorkflowVersionID:    fixture.workflowVersionID,
+		CreatedByActorType:   models.ActorTypeServicePrincipal,
+		CreatedByActorID:     fixture.principal.ID,
+	}
+	if err := fixture.db.Create(&ticket).Error; err != nil {
+		t.Fatalf("create token-scope query ticket: %v", err)
+	}
+	return ticket
 }
 
 func a2aTicketIntakePayload(
@@ -955,6 +1323,756 @@ func TestA2ABackendRequiresStructuredInputAndNeverInfersText(t *testing.T) {
 	}
 	if ticketCount != 0 {
 		t.Fatalf("natural-language input created %d tickets", ticketCount)
+	}
+}
+
+func TestA2ABackendAttenuatesFullPrincipalToOAuthTokenScopes(t *testing.T) {
+	fixture := newA2AAdapterFixture(t)
+	ticket := seedA2AQueryTicket(t, fixture, "TEST-TOKEN-SCOPE-1")
+	narrow := a2aBackendWithTokenScopes(
+		t,
+		fixture,
+		[]string{models.ScopeTasksManage},
+	)
+
+	queryReporter := &recordingA2AReporter{}
+	if err := narrow.Process(
+		context.Background(),
+		a2a.Task{
+			ID:        "task-narrow-token-query",
+			ContextID: "context-narrow-token",
+		},
+		structuredA2AMessage(t, "ticket-query", map[string]any{
+			"ticket_id": ticket.ID,
+		}),
+		queryReporter,
+	); err != nil {
+		t.Fatalf("process narrow-token query: %v", err)
+	}
+	if queryReporter.lastState() != a2a.TaskStateRejected ||
+		len(queryReporter.artifacts) != 0 {
+		t.Fatalf(
+			"narrow token received query snapshot: state=%s artifacts=%#v",
+			queryReporter.lastState(),
+			queryReporter.artifacts,
+		)
+	}
+
+	writeReporter := &recordingA2AReporter{}
+	writeMessage := structuredA2AMessage(
+		t,
+		"ticket-intake",
+		a2aTicketIntakePayload(t, fixture, map[string]any{
+			"title":       "Narrow token write",
+			"description": "This write must be rejected before reservation.",
+			"type":        "request",
+			"priority":    "normal",
+		}),
+	)
+	writeMessage.MessageID = "message-narrow-token-write"
+	if err := narrow.Process(
+		context.Background(),
+		a2a.Task{
+			ID:        "task-narrow-token-write",
+			ContextID: "context-narrow-token",
+		},
+		writeMessage,
+		writeReporter,
+	); err != nil {
+		t.Fatalf("process narrow-token write: %v", err)
+	}
+	if writeReporter.lastState() != a2a.TaskStateRejected ||
+		len(writeReporter.artifacts) != 0 {
+		t.Fatalf(
+			"narrow token received write snapshot: state=%s artifacts=%#v",
+			writeReporter.lastState(),
+			writeReporter.artifacts,
+		)
+	}
+	var ticketCount, reservationCount int64
+	if err := fixture.db.Model(&models.Ticket{}).
+		Count(&ticketCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.db.Model(&models.IdempotencyRecord{}).
+		Count(&reservationCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if ticketCount != 1 || reservationCount != 0 {
+		t.Fatalf(
+			"narrow token side effects: tickets=%d reservations=%d",
+			ticketCount,
+			reservationCount,
+		)
+	}
+
+	readBackend := a2aBackendWithTokenScopes(
+		t,
+		fixture,
+		[]string{models.ScopeTasksManage, models.ScopeTicketsRead},
+	)
+	readReporter := &recordingA2AReporter{}
+	if err := readBackend.Process(
+		context.Background(),
+		a2a.Task{
+			ID:        "task-read-token-query",
+			ContextID: "context-read-token",
+		},
+		structuredA2AMessage(t, "ticket-query", map[string]any{
+			"ticket_id": ticket.ID,
+		}),
+		readReporter,
+	); err != nil {
+		t.Fatalf("process read-token query: %v", err)
+	}
+	if len(readReporter.artifacts) != 1 ||
+		!strings.Contains(
+			string(readReporter.artifacts[0].Parts[0].Data),
+			`"ticket"`,
+		) {
+		t.Fatalf(
+			"read token did not receive query snapshot: %#v",
+			readReporter.artifacts,
+		)
+	}
+}
+
+func TestA2AMissingTokenEventScopeSoftDeniesExternalDelivery(t *testing.T) {
+	fixture := newA2AAdapterFixtureWithOptions(
+		t,
+		[]string{
+			models.ScopeTasksManage,
+			models.ScopeTicketsCreate,
+			models.ScopeTicketsRead,
+			models.ScopeEventsSubscribe,
+		},
+		services.AgentNativeOptions{
+			DefaultOutboxTargets: []services.OutboxTarget{{
+				Type:        "webhook",
+				ID:          "token-scope-test",
+				MaxAttempts: 3,
+			}},
+		},
+	)
+	if _, err := fixture.native.CreateAgentPolicy(
+		context.Background(),
+		services.CreateAgentPolicyInput{
+			ServicePrincipalID: fixture.principal.ID,
+			Name:               "allow token-scope test external delivery",
+			Effect:             models.AgentPolicyEffectAllow,
+			Scope:              models.ScopeEventsSubscribe,
+			Action:             "external.notification.send",
+			ResourceType:       "ticket",
+			ResourceID:         "*",
+			Priority:           100,
+		},
+	); err != nil {
+		t.Fatalf("create external delivery allow policy: %v", err)
+	}
+
+	processIntake := func(
+		backend *A2ABackend,
+		taskID string,
+		messageID string,
+	) *recordingA2AReporter {
+		t.Helper()
+		reporter := &recordingA2AReporter{}
+		message := structuredA2AMessage(
+			t,
+			"ticket-intake",
+			a2aTicketIntakePayload(t, fixture, map[string]any{
+				"title":       "External token attenuation " + taskID,
+				"description": "Primary business action must not restore omitted token scopes.",
+				"type":        "request",
+				"priority":    "normal",
+			}),
+		)
+		message.MessageID = messageID
+		if err := backend.Process(
+			context.Background(),
+			a2a.Task{ID: taskID, ContextID: "context-token-events"},
+			message,
+			reporter,
+		); err != nil {
+			t.Fatalf("process token-scoped intake: %v", err)
+		}
+		return reporter
+	}
+
+	withoutEvents := a2aBackendWithTokenScopes(
+		t,
+		fixture,
+		[]string{
+			models.ScopeTasksManage,
+			models.ScopeTicketsCreate,
+			models.ScopeTicketsRead,
+		},
+	)
+	if reporter := processIntake(
+		withoutEvents,
+		"task-token-without-events",
+		"message-token-without-events",
+	); len(reporter.artifacts) != 1 {
+		t.Fatalf(
+			"missing events scope blocked primary business action: %#v",
+			reporter,
+		)
+	}
+	var deniedExternal, webhookDeliveries int64
+	if err := fixture.db.Model(&models.PolicyDecision{}).
+		Where(
+			"action = ? AND reason_code = ? AND allowed = ?",
+			"external.notification.send",
+			"token_scope_not_granted",
+			false,
+		).
+		Count(&deniedExternal).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.db.Model(&models.OutboxDelivery{}).
+		Where("destination_type = ?", "webhook").
+		Count(&webhookDeliveries).Error; err != nil {
+		t.Fatal(err)
+	}
+	if deniedExternal != 1 || webhookDeliveries != 0 {
+		t.Fatalf(
+			"external token attenuation failed: denied=%d webhook_deliveries=%d",
+			deniedExternal,
+			webhookDeliveries,
+		)
+	}
+
+	withEvents := a2aBackendWithTokenScopes(
+		t,
+		fixture,
+		[]string{
+			models.ScopeTasksManage,
+			models.ScopeTicketsCreate,
+			models.ScopeTicketsRead,
+			models.ScopeEventsSubscribe,
+		},
+	)
+	processIntake(
+		withEvents,
+		"task-token-with-events",
+		"message-token-with-events",
+	)
+	if err := fixture.db.Model(&models.OutboxDelivery{}).
+		Where("destination_type = ?", "webhook").
+		Count(&webhookDeliveries).Error; err != nil {
+		t.Fatal(err)
+	}
+	if webhookDeliveries != 1 {
+		t.Fatalf(
+			"events-scoped token did not permit external delivery: %d",
+			webhookDeliveries,
+		)
+	}
+}
+
+func TestA2AReturnImmediatelyPreservesTokenScopeSnapshot(t *testing.T) {
+	fixture := newA2AAdapterFixture(t)
+	ticket := seedA2AQueryTicket(t, fixture, "TEST-TOKEN-SCOPE-ASYNC")
+	backend, err := NewA2ABackend(fixture.db, fixture.native)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := a2a.NewService(
+		a2a.NewMemoryStore(),
+		backend,
+		a2a.ServiceOptions{},
+	)
+	ctx := a2aFixtureContextWithTokenScopes(
+		t,
+		fixture,
+		[]string{models.ScopeTasksManage, models.ScopeTicketsRead},
+	)
+	message := structuredA2AMessage(t, "ticket-query", map[string]any{
+		"ticket_id": ticket.ID,
+	})
+	message.MessageID = "message-return-immediately-token-scope"
+	started, err := service.SendMessage(ctx, a2a.SendMessageParams{
+		Message: message,
+		Configuration: a2a.SendMessageConfiguration{
+			ReturnImmediately: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("start ReturnImmediately query: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		current, getErr := service.GetTask(
+			ctx,
+			a2a.GetTaskParams{ID: started.ID},
+		)
+		if getErr != nil {
+			t.Fatalf("get ReturnImmediately task: %v", getErr)
+		}
+		if current.Status.State.IsTerminal() {
+			if current.Status.State != a2a.TaskStateCompleted ||
+				len(current.Artifacts) != 1 ||
+				!strings.Contains(
+					string(current.Artifacts[0].Parts[0].Data),
+					`"ticket"`,
+				) {
+				t.Fatalf(
+					"async token scope snapshot was lost: %+v",
+					current,
+				)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ReturnImmediately task did not complete: %+v", current)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestA2ABackendAsyncDatabasePhaseUsesTrustedProjectTransaction(
+	t *testing.T,
+) {
+	fixture := newA2AAdapterFixture(t)
+	ticket := models.Ticket{
+		OrganizationID:       fixture.organization.ID,
+		ProjectID:            fixture.project.ID,
+		QueueID:              fixture.queue.ID,
+		TicketNumber:         "TEST-ASYNC-RLS-1",
+		Title:                "Async A2A RLS query",
+		Description:          "The backend must establish its own project transaction.",
+		Type:                 models.TicketTypeRequest,
+		Priority:             models.TicketPriorityNormal,
+		Status:               models.TicketStatusOpen,
+		Source:               models.TicketSourceAgent,
+		Version:              1,
+		RequestTypeVersionID: fixture.requestTypeVersionIDs[models.TicketTypeRequest],
+		WorkflowVersionID:    fixture.workflowVersionID,
+		CreatedByActorType:   models.ActorTypeServicePrincipal,
+		CreatedByActorID:     fixture.principal.ID,
+	}
+	if err := fixture.db.Create(&ticket).Error; err != nil {
+		t.Fatalf("create async RLS ticket: %v", err)
+	}
+
+	var policyDecisionCreates int
+	const decisionCallback = "test:require_a2a_backend_policy_scope"
+	if err := fixture.db.Callback().Create().
+		Before("gorm:create").
+		Register(decisionCallback, func(tx *gorm.DB) {
+			decision, ok := tx.Statement.Dest.(*models.PolicyDecision)
+			if !ok {
+				return
+			}
+			policyDecisionCreates++
+			if !scopeddb.HasTransaction(tx.Statement.Context) {
+				_ = tx.AddError(errors.New(
+					"A2A backend policy decision is outside a project transaction",
+				))
+				return
+			}
+			if decision.OrganizationID != fixture.organization.ID ||
+				decision.ProjectID != fixture.project.ID {
+				_ = tx.AddError(errors.New(
+					"A2A backend policy decision has untrusted project scope",
+				))
+			}
+		}); err != nil {
+		t.Fatalf("register A2A decision assertion: %v", err)
+	}
+
+	var ticketQueries int
+	const queryCallback = "test:require_a2a_backend_ticket_scope"
+	if err := fixture.db.Callback().Query().
+		Before("gorm:query").
+		Register(queryCallback, func(tx *gorm.DB) {
+			if tx.Statement.Table != (models.Ticket{}).TableName() {
+				return
+			}
+			ticketQueries++
+			if !scopeddb.HasTransaction(tx.Statement.Context) {
+				_ = tx.AddError(errors.New(
+					"A2A backend ticket query is outside a project transaction",
+				))
+				return
+			}
+			scope, err := services.RequireProjectScope(
+				tx.Statement.Context,
+			)
+			if err != nil ||
+				scope != fixture.project.Scope() {
+				_ = tx.AddError(errors.New(
+					"A2A backend ticket query has untrusted project scope",
+				))
+			}
+		}); err != nil {
+		t.Fatalf("register A2A ticket assertion: %v", err)
+	}
+
+	reporter := &outsideTransactionA2AReporter{}
+	asyncContext := context.WithoutCancel(a2aFixtureContext(t, fixture))
+	err := fixture.backend.Process(
+		asyncContext,
+		a2a.Task{
+			ID:        "task-async-rls-query",
+			ContextID: "context-async-rls-query",
+		},
+		structuredA2AMessage(t, "ticket-query", map[string]any{
+			"ticket_id": ticket.ID,
+		}),
+		reporter,
+	)
+	if err != nil {
+		t.Fatalf("process async RLS query: %v", err)
+	}
+	if policyDecisionCreates != 1 {
+		t.Fatalf(
+			"async query created %d policy decisions, want 1",
+			policyDecisionCreates,
+		)
+	}
+	if ticketQueries == 0 {
+		t.Fatal("async query did not access the scoped ticket repository")
+	}
+	if !reporter.called || len(reporter.artifacts) != 1 {
+		t.Fatalf(
+			"deferred reporter was not flushed outside the transaction: %+v",
+			reporter,
+		)
+	}
+}
+
+func TestA2ABackendAsyncTicketIntakeReadDecisionUsesProjectTransaction(
+	t *testing.T,
+) {
+	fixture := newA2AAdapterFixture(t)
+	actions := make(map[string]int)
+	const callbackName = "test:require_a2a_intake_policy_scope"
+	if err := fixture.db.Callback().Create().
+		Before("gorm:create").
+		Register(callbackName, func(tx *gorm.DB) {
+			decision, ok := tx.Statement.Dest.(*models.PolicyDecision)
+			if !ok {
+				return
+			}
+			actions[decision.Action]++
+			if !scopeddb.HasTransaction(tx.Statement.Context) {
+				_ = tx.AddError(errors.New(
+					"A2A intake policy decision is outside a project transaction",
+				))
+				return
+			}
+			if decision.OrganizationID != fixture.organization.ID ||
+				decision.ProjectID != fixture.project.ID {
+				_ = tx.AddError(errors.New(
+					"A2A intake policy decision has untrusted project scope",
+				))
+			}
+		}); err != nil {
+		t.Fatalf("register A2A intake decision assertion: %v", err)
+	}
+
+	reporter := &outsideTransactionA2AReporter{}
+	err := fixture.backend.Process(
+		context.WithoutCancel(a2aFixtureContext(t, fixture)),
+		a2a.Task{
+			ID:        "task-async-rls-intake",
+			ContextID: "context-async-rls-intake",
+		},
+		structuredA2AMessage(
+			t,
+			"ticket-intake",
+			a2aTicketIntakePayload(t, fixture, map[string]any{
+				"title":       "Async A2A RLS intake",
+				"description": "The response read check must retain project scope.",
+				"type":        "request",
+				"priority":    "normal",
+			}),
+		),
+		reporter,
+	)
+	if err != nil {
+		t.Fatalf("process async RLS intake: %v", err)
+	}
+	for _, action := range []string{"ticket.create", "ticket.read"} {
+		if actions[action] != 1 {
+			t.Fatalf(
+				"async intake policy action %q count=%d, want 1; all=%v",
+				action,
+				actions[action],
+				actions,
+			)
+		}
+	}
+	if !reporter.called || len(reporter.artifacts) != 1 {
+		t.Fatalf(
+			"intake reporter was not flushed outside the transaction: %+v",
+			reporter,
+		)
+	}
+}
+
+func TestA2ABackendExecutionGuardRunsOutsideProjectTransactions(
+	t *testing.T,
+) {
+	guard := newTransactionAssertingExecutionGuard()
+	fixture := newA2AAdapterFixtureWithOptions(
+		t,
+		[]string{
+			models.ScopeTicketsRead,
+			models.ScopeTicketsCreate,
+			models.ScopeEventsSubscribe,
+			models.ScopeTasksManage,
+		},
+		services.AgentNativeOptions{ExecutionGuard: guard},
+	)
+	if _, err := fixture.native.CreateAgentPolicy(
+		context.Background(),
+		services.CreateAgentPolicyInput{
+			ServicePrincipalID: fixture.principal.ID,
+			Name:               "allow A2A external Ticket notification",
+			Effect:             models.AgentPolicyEffectAllow,
+			Scope:              models.ScopeEventsSubscribe,
+			Action:             "external.notification.send",
+			ResourceType:       "ticket",
+			ResourceID:         "*",
+			Priority:           100,
+		},
+	); err != nil {
+		t.Fatalf("create external notification policy: %v", err)
+	}
+
+	actions := make(map[string]int)
+	const callbackName = "test:require_a2a_guard_decision_scope"
+	if err := fixture.db.Callback().Create().
+		Before("gorm:create").
+		Register(callbackName, func(tx *gorm.DB) {
+			decision, ok := tx.Statement.Dest.(*models.PolicyDecision)
+			if !ok {
+				return
+			}
+			actions[decision.Action]++
+			if !scopeddb.HasTransaction(tx.Statement.Context) {
+				_ = tx.AddError(errors.New(
+					"A2A policy decision is outside a project transaction",
+				))
+				return
+			}
+			if decision.OrganizationID != fixture.organization.ID ||
+				decision.ProjectID != fixture.project.ID {
+				_ = tx.AddError(errors.New(
+					"A2A policy decision has untrusted project scope",
+				))
+			}
+		}); err != nil {
+		t.Fatalf("register A2A guard decision assertion: %v", err)
+	}
+
+	reporter := &outsideTransactionA2AReporter{}
+	err := fixture.backend.Process(
+		context.WithoutCancel(a2aFixtureContext(t, fixture)),
+		a2a.Task{
+			ID:        "task-guard-outside-transaction",
+			ContextID: "context-guard-outside-transaction",
+		},
+		structuredA2AMessage(
+			t,
+			"ticket-intake",
+			a2aTicketIntakePayload(t, fixture, map[string]any{
+				"title":       "Guard transaction boundary",
+				"description": "Redis-equivalent guard calls must not hold a PostgreSQL transaction.",
+				"type":        "request",
+				"priority":    "normal",
+			}),
+		),
+		reporter,
+	)
+	if err != nil {
+		t.Fatalf("process guarded A2A intake: %v", err)
+	}
+	acquireCalls, releaseCalls, recordLoopCalls := guard.counts()
+	if acquireCalls != 1 || releaseCalls != 1 || recordLoopCalls != 2 {
+		t.Fatalf(
+			"guard calls acquire=%d release=%d record_loop=%d, want 1/1/2",
+			acquireCalls,
+			releaseCalls,
+			recordLoopCalls,
+		)
+	}
+	for _, action := range []string{
+		"ticket.create",
+		"external.notification.send",
+		"ticket.read",
+	} {
+		if actions[action] != 1 {
+			t.Fatalf(
+				"A2A policy action %q count=%d, want 1; all=%v",
+				action,
+				actions[action],
+				actions,
+			)
+		}
+	}
+	if !reporter.called || len(reporter.artifacts) != 1 {
+		t.Fatalf(
+			"A2A reporter was not flushed after commit: %+v",
+			reporter,
+		)
+	}
+}
+
+func TestA2ABackendRejectsExistingProjectTransactionBeforeExternalIO(
+	t *testing.T,
+) {
+	guard := newTransactionAssertingExecutionGuard()
+	fixture := newA2AAdapterFixtureWithOptions(
+		t,
+		[]string{
+			models.ScopeTicketsCreate,
+			models.ScopeTasksManage,
+		},
+		services.AgentNativeOptions{ExecutionGuard: guard},
+	)
+	task := a2a.Task{
+		ID:        "task-reject-existing-transaction",
+		ContextID: "context-reject-existing-transaction",
+	}
+	message := structuredA2AMessage(
+		t,
+		"ticket-intake",
+		a2aTicketIntakePayload(t, fixture, map[string]any{
+			"title":       "Reject nested A2A backend",
+			"description": "External guard and reporter calls must not inherit a project transaction.",
+			"type":        "request",
+			"priority":    "normal",
+		}),
+	)
+	reporter := &recordingA2AReporter{}
+	var processErr error
+	if err := fixture.native.RunProjectOperation(
+		a2aFixtureContext(t, fixture),
+		func(scopedContext context.Context) error {
+			processErr = fixture.backend.Process(
+				scopedContext,
+				task,
+				message,
+				reporter,
+			)
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("open outer project transaction: %v", err)
+	}
+	if processErr == nil ||
+		!strings.Contains(processErr.Error(), "outside a project transaction") {
+		t.Fatalf(
+			"A2A backend existing transaction error=%v",
+			processErr,
+		)
+	}
+	acquireCalls, releaseCalls, recordLoopCalls := guard.counts()
+	if acquireCalls != 0 || releaseCalls != 0 || recordLoopCalls != 0 {
+		t.Fatalf(
+			"rejected backend reached guard: acquire=%d release=%d record_loop=%d",
+			acquireCalls,
+			releaseCalls,
+			recordLoopCalls,
+		)
+	}
+	if len(reporter.statuses) != 0 || len(reporter.artifacts) != 0 {
+		t.Fatalf("rejected backend called reporter: %+v", reporter)
+	}
+}
+
+func TestPreparedPolicyDecisionAuthorizesOnlyExactBusinessAction(
+	t *testing.T,
+) {
+	fixture := newA2AAdapterFixture(t)
+	ctx := a2aFixtureContext(t, fixture)
+	input := services.PolicyCheckInput{
+		ServicePrincipalID: fixture.principal.ID,
+		CredentialID:       fixture.credential.ID,
+		Scope:              models.ScopeTicketsRead,
+		Action:             "ticket.query",
+		ResourceType:       "ticket",
+		ResourceID:         "101",
+		SourceProtocol:     a2aSourceProtocol,
+		Context: map[string]any{
+			"a2a_task_id":    "task-exact-decision",
+			"a2a_context_id": "context-exact-decision",
+		},
+	}
+	decision, err := fixture.native.CheckActionInShortProjectTransactions(
+		ctx,
+		input,
+	)
+	if err != nil {
+		t.Fatalf("prepare exact policy decision: %v", err)
+	}
+	authorizedContext, err :=
+		fixture.native.WithPolicyDecisionAuthorizations(
+			ctx,
+			services.PolicyDecisionAuthorization{
+				Input:      input,
+				DecisionID: decision.ID,
+			},
+		)
+	if err != nil {
+		t.Fatalf("bind exact policy decision: %v", err)
+	}
+	var mismatchErr error
+	if err := fixture.native.RunProjectOperation(
+		authorizedContext,
+		func(scopedContext context.Context) error {
+			reused, exactErr := fixture.native.CheckAction(
+				scopedContext,
+				input,
+			)
+			if exactErr != nil ||
+				reused == nil ||
+				reused.ID != decision.ID {
+				return fmt.Errorf(
+					"reuse exact decision: decision=%+v err=%w",
+					reused,
+					exactErr,
+				)
+			}
+			mismatch := input
+			mismatch.ResourceID = "102"
+			_, mismatchErr = fixture.native.CheckAction(
+				scopedContext,
+				mismatch,
+			)
+			return nil
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if mismatchErr == nil ||
+		!strings.Contains(
+			mismatchErr.Error(),
+			"missing its prepared policy decision",
+		) {
+		t.Fatalf(
+			"mismatched action reused prepared decision: %v",
+			mismatchErr,
+		)
+	}
+	var decisionCount int64
+	if err := fixture.db.Model(&models.PolicyDecision{}).
+		Where(
+			"service_principal_id = ? AND action = ?",
+			fixture.principal.ID,
+			input.Action,
+		).
+		Count(&decisionCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if decisionCount != 1 {
+		t.Fatalf(
+			"prepared decision reuse created %d decisions, want 1",
+			decisionCount,
+		)
 	}
 }
 
@@ -1056,15 +2174,16 @@ func TestA2ATicketCommentRequiresExplicitLeaseID(t *testing.T) {
 		t.Fatalf("create ticket: %v", err)
 	}
 	reporter := &recordingA2AReporter{}
+	message := structuredA2AMessage(t, "ticket-comment", map[string]any{
+		"ticket_id":        ticket.ID,
+		"expected_version": 1,
+		"content":          "This must not bypass the lease.",
+		"type":             "internal",
+	})
 	err := fixture.backend.Process(
 		context.Background(),
 		a2a.Task{ID: "task-comment-no-lease", ContextID: "context-comment-no-lease"},
-		structuredA2AMessage(t, "ticket-comment", map[string]any{
-			"ticket_id":        ticket.ID,
-			"expected_version": 1,
-			"content":          "This must not bypass the lease.",
-			"type":             "internal",
-		}),
+		message,
 		reporter,
 	)
 	if err != nil {
@@ -1087,6 +2206,22 @@ func TestA2ATicketCommentRequiresExplicitLeaseID(t *testing.T) {
 	}
 	if commentCount != 0 {
 		t.Fatalf("lease-less A2A command created %d comments", commentCount)
+	}
+	var reservation models.IdempotencyRecord
+	if err := fixture.db.
+		Where(
+			"actor_id = ? AND key = ?",
+			fixture.principal.ID,
+			message.MessageID,
+		).
+		First(&reservation).Error; err != nil {
+		t.Fatalf("load failed A2A reservation: %v", err)
+	}
+	if reservation.State != models.IdempotencyStateFailed {
+		t.Fatalf(
+			"invalid A2A command reservation state=%s, want failed",
+			reservation.State,
+		)
 	}
 }
 
@@ -1183,6 +2318,324 @@ func TestA2ATicketIntakeWithoutReadScopeReturnsReceiptOnly(t *testing.T) {
 	}
 	if tickets != 1 {
 		t.Fatalf("ticket intake created %d tickets, want one", tickets)
+	}
+}
+
+func TestA2ALiveMutationSnapshotsRequireObjectReadAuthorization(t *testing.T) {
+	type mutationCase struct {
+		name        string
+		skill       string
+		writeScope  string
+		writeAction string
+		input       func(
+			ticket models.Ticket,
+			lease models.TicketLease,
+			fixture a2aAdapterFixture,
+		) map[string]any
+	}
+	mutations := []mutationCase{
+		{
+			name:        "update",
+			skill:       "ticket-work",
+			writeScope:  models.ScopeTicketsUpdate,
+			writeAction: "ticket.update",
+			input: func(
+				ticket models.Ticket,
+				lease models.TicketLease,
+				_ a2aAdapterFixture,
+			) map[string]any {
+				return map[string]any{
+					"operation":        "update",
+					"ticket_id":        ticket.ID,
+					"expected_version": ticket.Version,
+					"lease_id":         lease.ID,
+					"changes": map[string]any{
+						"title": "Object-authorized A2A update",
+					},
+				}
+			},
+		},
+		{
+			name:        "transition",
+			skill:       "ticket-work",
+			writeScope:  models.ScopeTicketsTransition,
+			writeAction: "ticket.transition",
+			input: func(
+				ticket models.Ticket,
+				lease models.TicketLease,
+				_ a2aAdapterFixture,
+			) map[string]any {
+				return map[string]any{
+					"operation":        "transition",
+					"ticket_id":        ticket.ID,
+					"expected_version": ticket.Version,
+					"lease_id":         lease.ID,
+					"status":           models.TicketStatusInProgress,
+				}
+			},
+		},
+		{
+			name:        "assign",
+			skill:       "ticket-work",
+			writeScope:  models.ScopeTicketsAssign,
+			writeAction: "ticket.assign",
+			input: func(
+				ticket models.Ticket,
+				lease models.TicketLease,
+				fixture a2aAdapterFixture,
+			) map[string]any {
+				return map[string]any{
+					"operation":        "assign",
+					"ticket_id":        ticket.ID,
+					"expected_version": ticket.Version,
+					"lease_id":         lease.ID,
+					"assignee":         models.HumanActor(fixture.user.ID),
+				}
+			},
+		},
+		{
+			name:        "escalation",
+			skill:       "ticket-escalation",
+			writeScope:  models.ScopeTicketsTransition,
+			writeAction: "ticket.escalate",
+			input: func(
+				ticket models.Ticket,
+				lease models.TicketLease,
+				_ a2aAdapterFixture,
+			) map[string]any {
+				return map[string]any{
+					"ticket_id":        ticket.ID,
+					"expected_version": ticket.Version,
+					"lease_id":         lease.ID,
+					"reason":           "Object-level response policy regression",
+					"priority":         models.TicketPriorityUrgent,
+				}
+			},
+		},
+	}
+	accessCases := []struct {
+		name               string
+		readPolicyEffect   models.AgentPolicyEffect
+		tokenHasReadScope  bool
+		wantTicket         bool
+		wantReadDecision   bool
+		wantDecisionAllow  bool
+		wantDecisionReason string
+	}{
+		{
+			name:               "allow",
+			readPolicyEffect:   models.AgentPolicyEffectAllow,
+			tokenHasReadScope:  true,
+			wantTicket:         true,
+			wantReadDecision:   true,
+			wantDecisionAllow:  true,
+			wantDecisionReason: "explicit_allow",
+		},
+		{
+			name:               "deny",
+			readPolicyEffect:   models.AgentPolicyEffectDeny,
+			tokenHasReadScope:  true,
+			wantReadDecision:   true,
+			wantDecisionReason: "explicit_deny",
+		},
+		{
+			name: "token_without_read_scope",
+		},
+	}
+
+	for mutationIndex, mutation := range mutations {
+		mutation := mutation
+		t.Run(mutation.name, func(t *testing.T) {
+			for accessIndex, access := range accessCases {
+				access := access
+				t.Run(access.name, func(t *testing.T) {
+					fixture := newA2AAdapterFixture(t)
+					ticket := seedA2AQueryTicket(
+						t,
+						fixture,
+						fmt.Sprintf(
+							"A2A-MUTATION-READ-%d-%d",
+							mutationIndex,
+							accessIndex,
+						),
+					)
+					now := time.Now().UTC()
+					lease := models.TicketLease{
+						ID: fmt.Sprintf(
+							"a2a-mutation-read-lease-%d-%d",
+							mutationIndex,
+							accessIndex,
+						),
+						TicketID:        ticket.ID,
+						HolderActorType: models.ActorTypeServicePrincipal,
+						HolderActorID:   fixture.principal.ID,
+						TicketVersion:   ticket.Version,
+						ExpiresAt:       now.Add(time.Minute),
+						LastHeartbeatAt: now,
+					}
+					if err := fixture.db.Create(&lease).Error; err != nil {
+						t.Fatalf("seed mutation lease: %v", err)
+					}
+					if _, err := fixture.native.CreateAgentPolicy(
+						context.Background(),
+						services.CreateAgentPolicyInput{
+							ServicePrincipalID: fixture.principal.ID,
+							Name: "allow A2A mutation " +
+								mutation.name,
+							Effect:       models.AgentPolicyEffectAllow,
+							Scope:        mutation.writeScope,
+							Action:       mutation.writeAction,
+							ResourceType: "ticket",
+							ResourceID:   strconvUint(ticket.ID),
+							Priority:     100,
+						},
+					); err != nil {
+						t.Fatalf("create mutation allow policy: %v", err)
+					}
+					if access.readPolicyEffect != "" {
+						if _, err := fixture.native.CreateAgentPolicy(
+							context.Background(),
+							services.CreateAgentPolicyInput{
+								ServicePrincipalID: fixture.principal.ID,
+								Name: "A2A mutation response " +
+									access.name,
+								Effect:       access.readPolicyEffect,
+								Scope:        models.ScopeTicketsRead,
+								Action:       "ticket.read",
+								ResourceType: "ticket",
+								ResourceID:   strconvUint(ticket.ID),
+								Priority:     200,
+							},
+						); err != nil {
+							t.Fatalf("create response read policy: %v", err)
+						}
+					}
+
+					tokenScopes := []string{
+						models.ScopeTasksManage,
+						mutation.writeScope,
+					}
+					if access.tokenHasReadScope {
+						tokenScopes = append(
+							tokenScopes,
+							models.ScopeTicketsRead,
+						)
+					}
+					backend := a2aBackendWithTokenScopes(
+						t,
+						fixture,
+						tokenScopes,
+					)
+					reporter := &recordingA2AReporter{}
+					message := structuredA2AMessage(
+						t,
+						mutation.skill,
+						mutation.input(ticket, lease, fixture),
+					)
+					message.MessageID = fmt.Sprintf(
+						"a2a-mutation-read-%d-%d",
+						mutationIndex,
+						accessIndex,
+					)
+					if err := backend.Process(
+						context.Background(),
+						a2a.Task{
+							ID: fmt.Sprintf(
+								"task-mutation-read-%d-%d",
+								mutationIndex,
+								accessIndex,
+							),
+							ContextID: "context-mutation-read",
+						},
+						message,
+						reporter,
+					); err != nil {
+						t.Fatalf("process live mutation: %v", err)
+					}
+
+					var persisted models.Ticket
+					if err := fixture.db.First(
+						&persisted,
+						ticket.ID,
+					).Error; err != nil {
+						t.Fatalf("reload mutated Ticket: %v", err)
+					}
+					if persisted.Version != ticket.Version+1 {
+						t.Fatalf(
+							"mutation version=%d, want %d",
+							persisted.Version,
+							ticket.Version+1,
+						)
+					}
+					if len(reporter.artifacts) != 1 ||
+						len(reporter.artifacts[0].Parts) != 1 {
+						t.Fatalf(
+							"unexpected mutation artifact: %#v",
+							reporter.artifacts,
+						)
+					}
+					var artifact struct {
+						Result map[string]json.RawMessage `json:"result"`
+					}
+					if err := json.Unmarshal(
+						reporter.artifacts[0].Parts[0].Data,
+						&artifact,
+					); err != nil {
+						t.Fatalf("decode mutation artifact: %v", err)
+					}
+					if _, exists := artifact.Result["receipt"]; !exists {
+						t.Fatalf(
+							"mutation response omitted receipt: %s",
+							reporter.artifacts[0].Parts[0].Data,
+						)
+					}
+					_, ticketExists := artifact.Result["ticket"]
+					if ticketExists != access.wantTicket {
+						t.Fatalf(
+							"Ticket snapshot present=%v, want %v: %s",
+							ticketExists,
+							access.wantTicket,
+							reporter.artifacts[0].Parts[0].Data,
+						)
+					}
+
+					var readDecisions []models.PolicyDecision
+					if err := fixture.db.
+						Where(
+							"service_principal_id = ? AND action = ? AND resource_id = ?",
+							fixture.principal.ID,
+							"ticket.read",
+							strconvUint(ticket.ID),
+						).
+						Find(&readDecisions).Error; err != nil {
+						t.Fatalf("load response read decisions: %v", err)
+					}
+					wantReadDecisions := 0
+					if access.wantReadDecision {
+						wantReadDecisions = 1
+					}
+					if got := len(readDecisions); got != wantReadDecisions {
+						t.Fatalf(
+							"response read decisions=%d, want decision=%v",
+							got,
+							access.wantReadDecision,
+						)
+					}
+					if access.wantReadDecision {
+						decision := readDecisions[0]
+						if decision.Allowed != access.wantDecisionAllow ||
+							decision.ReasonCode != access.wantDecisionReason {
+							t.Fatalf(
+								"response read decision=%+v, want allowed=%v reason=%q",
+								decision,
+								access.wantDecisionAllow,
+								access.wantDecisionReason,
+							)
+						}
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -1770,14 +3223,20 @@ func TestBindA2AIdentityResolvesVerifiedProjectGrantAndOperationContext(t *testi
 	}
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
+	sourceTokenScopes := []string{
+		models.ScopeTasksManage,
+		models.ScopeTicketsRead,
+	}
 	router.Use(func(c *gin.Context) {
 		c.Set(agentauth.ContextPrincipalID, fixture.principal.ID)
 		c.Set(agentauth.ContextCredentialID, fixture.credential.ID)
 		c.Set(agentauth.ContextProjectKey, string(fixture.project.Key))
+		c.Set(agentauth.ContextScopes, sourceTokenScopes)
 		c.Next()
 	})
 	router.Use(BindA2AIdentityWithProject(projectService))
 	router.GET("/identity", func(c *gin.Context) {
+		sourceTokenScopes[1] = models.ScopeTicketsUpdate
 		identity, ok := A2AExecutionIdentityFromContext(c.Request.Context())
 		owner, ownerOK := a2a.TaskOwnerFromContext(c.Request.Context())
 		binding, bindingOK := a2a.ProjectBindingFromContext(c.Request.Context())
@@ -1788,6 +3247,7 @@ func TestBindA2AIdentityResolvesVerifiedProjectGrantAndOperationContext(t *testi
 			"credential_id":       identity.CredentialID,
 			"project_key":         identity.ProjectKey,
 			"project_id":          identity.Scope.ProjectID,
+			"token_scopes":        identity.TokenScopes,
 			"owner_ok":            ownerOK,
 			"owner_type":          owner.ActorType,
 			"owner_id":            owner.ActorID,
@@ -1805,12 +3265,87 @@ func TestBindA2AIdentityResolvesVerifiedProjectGrantAndOperationContext(t *testi
 		!strings.Contains(response.Body.String(), fixture.principal.ID) ||
 		!strings.Contains(response.Body.String(), fixture.credential.ID) ||
 		!strings.Contains(response.Body.String(), `"project_key":"TEST"`) ||
+		!strings.Contains(
+			response.Body.String(),
+			`"token_scopes":["tasks:manage","tickets:read"]`,
+		) ||
 		!strings.Contains(response.Body.String(), `"owner_ok":true`) ||
 		!strings.Contains(response.Body.String(), `"owner_type":"service_principal"`) ||
 		!strings.Contains(response.Body.String(), `"binding_ok":true`) ||
 		!strings.Contains(response.Body.String(), `"operation_ok":true`) ||
 		!strings.Contains(response.Body.String(), `"operation_source":"a2a"`) {
 		t.Fatalf("identity middleware failed: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestBindA2AIdentityRejectsInvalidTokenScopeSnapshots(t *testing.T) {
+	fixture := newA2AAdapterFixture(t)
+	projectService, err := services.NewProjectService(fixture.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name      string
+		setScopes bool
+		scopes    any
+	}{
+		{name: "missing"},
+		{name: "empty", setScopes: true, scopes: []string{}},
+		{
+			name:      "unsupported",
+			setScopes: true,
+			scopes: []string{
+				models.ScopeTasksManage,
+				"tickets:superuser",
+			},
+		},
+		{
+			name:      "missing tasks manage",
+			setScopes: true,
+			scopes:    []string{models.ScopeTicketsRead},
+		},
+		{
+			name:      "wrong context type",
+			setScopes: true,
+			scopes:    models.ScopeTasksManage,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				c.Set(agentauth.ContextPrincipalID, fixture.principal.ID)
+				c.Set(agentauth.ContextCredentialID, fixture.credential.ID)
+				c.Set(
+					agentauth.ContextProjectKey,
+					string(fixture.project.Key),
+				)
+				if test.setScopes {
+					c.Set(agentauth.ContextScopes, test.scopes)
+				}
+				c.Next()
+			})
+			router.Use(BindA2AIdentityWithProject(projectService))
+			reached := false
+			router.GET("/identity", func(c *gin.Context) {
+				reached = true
+				c.Status(http.StatusNoContent)
+			})
+			response := httptest.NewRecorder()
+			router.ServeHTTP(
+				response,
+				httptest.NewRequest(http.MethodGet, "/identity", nil),
+			)
+			if response.Code != http.StatusUnauthorized || reached {
+				t.Fatalf(
+					"invalid scopes status=%d reached=%v body=%s",
+					response.Code,
+					reached,
+					response.Body.String(),
+				)
+			}
+		})
 	}
 }
 
@@ -1837,6 +3372,10 @@ func TestA2ABindIdentityRejectsProjectWithoutPrincipalGrant(t *testing.T) {
 		c.Set(agentauth.ContextPrincipalID, fixture.principal.ID)
 		c.Set(agentauth.ContextCredentialID, fixture.credential.ID)
 		c.Set(agentauth.ContextProjectKey, string(otherProject.Key))
+		c.Set(
+			agentauth.ContextScopes,
+			[]string{models.ScopeTasksManage},
+		)
 		c.Next()
 	})
 	router.Use(BindA2AIdentityWithProject(projectService))
@@ -1866,6 +3405,7 @@ func TestA2ABindOperationIdentityDoesNotOverwriteTrustedProjectBinding(t *testin
 		Actor:        models.ServicePrincipalActor("a2a-binding-principal"),
 		CredentialID: "a2a-binding-credential",
 		ProjectKey:   "TEST",
+		TokenScopes:  []string{models.ScopeTasksManage},
 		Scope: models.ProjectScope{
 			OrganizationID: 21,
 			ProjectID:      34,
@@ -1903,6 +3443,49 @@ type recordingA2AReporter struct {
 	statusMessages []*a2a.Message
 	artifacts      []a2a.Artifact
 	artifactErr    error
+}
+
+type outsideTransactionA2AReporter struct {
+	recordingA2AReporter
+	called bool
+}
+
+func (r *outsideTransactionA2AReporter) SetStatus(
+	ctx context.Context,
+	state a2a.TaskState,
+	message *a2a.Message,
+	metadata map[string]any,
+) error {
+	if scopeddb.HasTransaction(ctx) {
+		return errors.New("A2A reporter called inside a project transaction")
+	}
+	r.called = true
+	return r.recordingA2AReporter.SetStatus(
+		ctx,
+		state,
+		message,
+		metadata,
+	)
+}
+
+func (r *outsideTransactionA2AReporter) AddArtifact(
+	ctx context.Context,
+	artifact a2a.Artifact,
+	appendParts bool,
+	lastChunk bool,
+	metadata map[string]any,
+) error {
+	if scopeddb.HasTransaction(ctx) {
+		return errors.New("A2A reporter called inside a project transaction")
+	}
+	r.called = true
+	return r.recordingA2AReporter.AddArtifact(
+		ctx,
+		artifact,
+		appendParts,
+		lastChunk,
+		metadata,
+	)
 }
 
 func (r *recordingA2AReporter) SetStatus(

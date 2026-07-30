@@ -204,8 +204,8 @@ func (AgentPolicy) TableName() string {
 type PolicyDecision struct {
 	ID                 string         `json:"id" gorm:"primaryKey;size:36"`
 	CreatedAt          time.Time      `json:"created_at" gorm:"autoCreateTime;index"`
-	OrganizationID     uint           `json:"organization_id" gorm:"index"`
-	ProjectID          uint           `json:"project_id" gorm:"index"`
+	OrganizationID     uint           `json:"organization_id" gorm:"not null;index"`
+	ProjectID          uint           `json:"project_id" gorm:"not null;index"`
 	ServicePrincipalID string         `json:"service_principal_id" gorm:"size:36;index"`
 	CredentialID       string         `json:"credential_id,omitempty" gorm:"size:36;index"`
 	ActorType          ActorType      `json:"actor_type" gorm:"size:32;not null;index"`
@@ -233,8 +233,8 @@ func (PolicyDecision) TableName() string {
 type DomainEvent struct {
 	ID                   string         `json:"id" gorm:"primaryKey;size:36"`
 	CreatedAt            time.Time      `json:"created_at" gorm:"autoCreateTime;index"`
-	OrganizationID       uint           `json:"organizationid" gorm:"index"`
-	ProjectID            uint           `json:"projectid" gorm:"index"`
+	OrganizationID       uint           `json:"organizationid" gorm:"not null;index"`
+	ProjectID            uint           `json:"projectid" gorm:"not null;index"`
 	ConfigurationVersion string         `json:"configurationversion,omitempty" gorm:"size:100;index"`
 	PolicyDecisionID     string         `json:"policydecisionid,omitempty" gorm:"size:36;index"`
 	SpecVersion          string         `json:"specversion" gorm:"size:10;not null;default:'1.0'"`
@@ -276,8 +276,8 @@ type OutboxDelivery struct {
 	ID              string               `json:"id" gorm:"primaryKey;size:36"`
 	CreatedAt       time.Time            `json:"created_at" gorm:"autoCreateTime;index"`
 	UpdatedAt       time.Time            `json:"updated_at" gorm:"autoUpdateTime"`
-	OrganizationID  uint                 `json:"organization_id" gorm:"index"`
-	ProjectID       uint                 `json:"project_id" gorm:"index"`
+	OrganizationID  uint                 `json:"organization_id" gorm:"not null;index"`
+	ProjectID       uint                 `json:"project_id" gorm:"not null;index"`
 	EventID         string               `json:"event_id" gorm:"size:36;not null;uniqueIndex:idx_event_destination,priority:1"`
 	Event           *DomainEvent         `json:"event,omitempty" gorm:"foreignKey:EventID"`
 	DestinationType string               `json:"destination_type" gorm:"size:50;not null;uniqueIndex:idx_event_destination,priority:2;index"`
@@ -309,8 +309,8 @@ type IdempotencyRecord struct {
 	ID               string           `json:"id" gorm:"primaryKey;size:36"`
 	CreatedAt        time.Time        `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt        time.Time        `json:"updated_at" gorm:"autoUpdateTime"`
-	OrganizationID   uint             `json:"organization_id" gorm:"index;uniqueIndex:idx_idempotency_actor_operation_key,priority:1"`
-	ProjectID        uint             `json:"project_id" gorm:"index;uniqueIndex:idx_idempotency_actor_operation_key,priority:2"`
+	OrganizationID   uint             `json:"organization_id" gorm:"not null;index;uniqueIndex:idx_idempotency_actor_operation_key,priority:1"`
+	ProjectID        uint             `json:"project_id" gorm:"not null;index;uniqueIndex:idx_idempotency_actor_operation_key,priority:2"`
 	ActorType        ActorType        `json:"actor_type" gorm:"size:32;not null;uniqueIndex:idx_idempotency_actor_operation_key,priority:3"`
 	ActorID          string           `json:"actor_id" gorm:"size:128;not null;uniqueIndex:idx_idempotency_actor_operation_key,priority:4"`
 	Operation        string           `json:"operation" gorm:"size:128;not null;uniqueIndex:idx_idempotency_actor_operation_key,priority:5"`
@@ -339,8 +339,8 @@ type TicketLease struct {
 	ID              string     `json:"lease_id" gorm:"primaryKey;size:36"`
 	CreatedAt       time.Time  `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt       time.Time  `json:"updated_at" gorm:"autoUpdateTime"`
-	OrganizationID  uint       `json:"organization_id" gorm:"index"`
-	ProjectID       uint       `json:"project_id" gorm:"index"`
+	OrganizationID  uint       `json:"organization_id" gorm:"not null;index"`
+	ProjectID       uint       `json:"project_id" gorm:"not null;index"`
 	TicketID        uint       `json:"ticket_id" gorm:"not null;uniqueIndex"`
 	HolderActorType ActorType  `json:"holder_actor_type" gorm:"size:32;not null;index"`
 	HolderActorID   string     `json:"holder_actor_id" gorm:"size:128;not null;index"`

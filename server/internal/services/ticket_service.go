@@ -17,8 +17,11 @@ import (
 )
 
 var (
-	ErrInvalidTicketTransition = errors.New("invalid ticket status transition")
-	ErrInvalidBulkTicketUpdate = errors.New("invalid bulk ticket update")
+	ErrInvalidTicketTransition  = errors.New("invalid ticket status transition")
+	ErrInvalidBulkTicketUpdate  = errors.New("invalid bulk ticket update")
+	ErrTicketCreateAccessDenied = errors.New(
+		"human ticket creation requires an authorized active project membership",
+	)
 )
 
 // TicketServiceInterface defines the interface for ticket service
@@ -346,6 +349,24 @@ func (s *TicketService) CreateTicket(ctx context.Context, req *models.TicketCrea
 			"human ticket actor does not match operation context",
 		)
 	}
+	role, err := s.projects.activeHumanMembershipRole(
+		ctx,
+		operation.Scope,
+		userID,
+	)
+	if err != nil {
+		if errors.Is(err, ErrProjectAccessDenied) {
+			return nil, ErrTicketCreateAccessDenied
+		}
+		return nil, err
+	}
+	if !humanProjectRoleCanCreateTicket(role) {
+		return nil, ErrTicketCreateAccessDenied
+	}
+	if role == models.ProjectRoleRequester &&
+		(req.Status != nil || req.AssignedToID != nil) {
+		return nil, ErrTicketCreateAccessDenied
+	}
 	request := *req
 	if request.Source == "" {
 		request.Source = models.TicketSourceWeb
@@ -366,6 +387,18 @@ func (s *TicketService) CreateTicket(ctx context.Context, req *models.TicketCrea
 		return nil, err
 	}
 	return s.GetTicket(ctx, result.Ticket.ID)
+}
+
+func humanProjectRoleCanCreateTicket(role models.ProjectRole) bool {
+	switch role {
+	case models.ProjectRoleAdmin,
+		models.ProjectRoleManager,
+		models.ProjectRoleAgent,
+		models.ProjectRoleRequester:
+		return true
+	default:
+		return false
+	}
 }
 
 // UpdateTicketExpectedVersion binds a prior authorization decision to the

@@ -149,7 +149,10 @@ func TestReferenceSolutionPackagesInstallThroughExistingProjectChain(
 	t *testing.T,
 ) {
 	db, project, _ := newProjectConfigurationTestDB(t)
-	service, err := NewProjectConfigurationService(db)
+	service, err := NewProjectConfigurationService(
+		db,
+		&configurationEventAppenderStub{},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

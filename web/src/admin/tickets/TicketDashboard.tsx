@@ -31,6 +31,7 @@ import { alpha } from '@mui/material/styles'
 import { RatioRow } from '@/components/layout/RatioRow'
 import { API_BASE, localizedUnknownErrorMessage } from '@/lib/apiClient'
 import { isAgentRole, type RolePermissions } from '@/lib/accessControl'
+import { projectResourcePath } from '@/lib/projectScope'
 import {
   PieChart,
   Pie,
@@ -217,15 +218,17 @@ const TicketDashboard: React.FC = () => {
         const headers: HeadersInit = {
           Authorization: `Bearer ${localStorage.getItem('token') || ''}`,
         }
+        const ticketsPath = await projectResourcePath('tickets')
+        const ticketsURL = `${API_BASE}/${ticketsPath}`
         const [statsRes, urgentRes, recentRes, myRes] = await Promise.all([
-          fetch(`${API_BASE}/tickets/stats`, { headers, signal: controller.signal }),
-          fetch(`${API_BASE}/tickets?priority=urgent,critical&status=open,in_progress&page_size=10`, {
+          fetch(`${ticketsURL}/stats`, { headers, signal: controller.signal }),
+          fetch(`${ticketsURL}?priority=urgent,critical&status=open,in_progress&page_size=10`, {
             headers,
             signal: controller.signal,
           }),
-          fetch(`${API_BASE}/tickets?page_size=10&sort_by=created_at&sort_order=desc`, { headers, signal: controller.signal }),
+          fetch(`${ticketsURL}?page_size=10&sort_by=created_at&sort_order=desc`, { headers, signal: controller.signal }),
           isAgent
-            ? fetch(`${API_BASE}/tickets/my-tickets?limit=10`, { headers, signal: controller.signal })
+            ? fetch(`${ticketsURL}/my-tickets?limit=10`, { headers, signal: controller.signal })
             : Promise.resolve(null),
         ])
 

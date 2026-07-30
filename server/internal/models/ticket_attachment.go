@@ -35,8 +35,8 @@ type TicketAttachment struct {
 	DeletedAt *time.Time `json:"deleted_at,omitempty" gorm:"index"`
 
 	// 关联信息
-	OrganizationID uint    `json:"organization_id" gorm:"index"`
-	ProjectID      uint    `json:"project_id" gorm:"index"`
+	OrganizationID uint    `json:"organization_id" gorm:"not null;index"`
+	ProjectID      uint    `json:"project_id" gorm:"not null;index"`
 	TicketID       uint    `json:"ticket_id" gorm:"not null;index"`
 	Ticket         *Ticket `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
 

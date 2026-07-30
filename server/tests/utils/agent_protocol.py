@@ -176,6 +176,19 @@ class AgentProtocolHarness:
         normalized = suffix.strip("/")
         return f"{base}/{normalized}" if normalized else base
 
+    def ticket_create_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        work_class: str | None = None,
+    ) -> dict[str, Any]:
+        """Bind machine intake to the project's published immutable versions."""
+
+        return self._resources.ticket_create_payload(
+            payload,
+            work_class=work_class,
+        )
+
     def agent_admin_path(self, suffix: str = "") -> str:
         """Return the Human REST Agent control path for the configured project."""
 

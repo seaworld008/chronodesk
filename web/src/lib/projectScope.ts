@@ -4,6 +4,13 @@ import { localizedApiErrorMessage } from './apiClient'
 const apiBase = (import.meta.env.VITE_API_URL ?? '/api').toString().replace(/\/$/, '')
 const activeProjectStorageKey = 'chronodesk.activeProjectKey'
 
+export type ProjectRole =
+    | 'project_admin'
+    | 'manager'
+    | 'agent'
+    | 'requester'
+    | 'observer'
+
 export interface AuthorizedProject {
     project: {
         id: number
@@ -15,7 +22,7 @@ export interface AuthorizedProject {
         organization_id: number
         status: 'active' | 'archived'
     }
-    role: 'project_admin' | 'manager' | 'agent' | 'requester' | 'observer'
+    role: ProjectRole
     scope: {
         organization_id: number
         project_id: number
@@ -74,7 +81,7 @@ export const activeProjectKey = (): string | undefined => {
     return value || undefined
 }
 
-export const resolveActiveProjectKey = async (): Promise<string> => {
+export const resolveActiveProjectAccess = async (): Promise<AuthorizedProject> => {
     const projects = await loadAuthorizedProjects()
     const stored = activeProjectKey()
     const selected =
@@ -88,8 +95,16 @@ export const resolveActiveProjectKey = async (): Promise<string> => {
     if (selected.project.key !== stored) {
         localStorage.setItem(activeProjectStorageKey, selected.project.key)
     }
-    return selected.project.key
+    return selected
 }
+
+export const resolveActiveProjectKey = async (): Promise<string> =>
+    (await resolveActiveProjectAccess()).project.key
+
+export const isProjectManagementRole = (
+    role: unknown,
+): role is Extract<ProjectRole, 'project_admin' | 'manager'> =>
+    role === 'project_admin' || role === 'manager'
 
 export const setActiveProjectKey = (
     projectKey: string,
