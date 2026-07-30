@@ -10,7 +10,7 @@ BOOTSTRAP_PYTHON ?= $(PYTHON)
 VENV ?= $(CURDIR)/.venv
 PYTHON_REQUIREMENTS ?= server/requirements-test.txt
 VENV_PYTHON := $(VENV)/bin/python
-PYTHON_REQUIREMENTS_STAMP := $(VENV)/.requirements-test.txt
+PYTHON_REQUIREMENTS_SNAPSHOT := $(VENV)/.requirements-test.txt
 NPM_TOOL_CACHE ?= $(CURDIR)/.cache/npm-tools
 VERSION ?= 0.1.0
 COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
@@ -24,12 +24,9 @@ GO_LDFLAGS := -s -w \
 	help doctor install-deps install-server-deps install-web-deps install-test-deps install-sdk-deps \
 	dev server-dev web-dev docker-up docker-down docker-logs \
 	build build-server build-web build-sdk clean \
-	fmt fmt-check test test-server test-race test-web test-sdk test-python-static test-python-toolchain security verify \
+	fmt fmt-check test test-server test-race test-web test-sdk test-python-static test-python-toolchain python-toolchain security verify \
 	openapi-lint asyncapi-lint smoke e2e db-migrate db-migrate-seed db-migrate-sample \
 	credential-validate credential-rotate credential-quarantine
-
-.PHONY: FORCE
-FORCE:
 
 help:
 	@echo "ChronoDesk 开发命令"
@@ -78,17 +75,19 @@ install-server-deps:
 install-web-deps:
 	cd web && npm ci
 
-install-test-deps: $(PYTHON_REQUIREMENTS_STAMP)
-	"$(VENV_PYTHON)" -m pip check
+install-test-deps: python-toolchain
 
-$(VENV_PYTHON):
-	"$(BOOTSTRAP_PYTHON)" -m venv "$(VENV)"
-
-$(PYTHON_REQUIREMENTS_STAMP): FORCE | $(VENV_PYTHON)
-	@if ! cmp -s "$(PYTHON_REQUIREMENTS)" "$@"; then \
-		"$(VENV_PYTHON)" -m pip install -r "$(PYTHON_REQUIREMENTS)" && \
-		cp "$(PYTHON_REQUIREMENTS)" "$@"; \
+# Keep VENV-derived paths out of Make's target graph: GNU Make tokenizes target
+# names before recipes run, so a configurable VENV may safely contain spaces.
+python-toolchain:
+	@if [[ ! -x "$(VENV_PYTHON)" ]]; then \
+		"$(BOOTSTRAP_PYTHON)" -m venv "$(VENV)"; \
 	fi
+	@if ! cmp -s "$(PYTHON_REQUIREMENTS)" "$(PYTHON_REQUIREMENTS_SNAPSHOT)"; then \
+		"$(VENV_PYTHON)" -m pip install -r "$(PYTHON_REQUIREMENTS)" && \
+		cp "$(PYTHON_REQUIREMENTS)" "$(PYTHON_REQUIREMENTS_SNAPSHOT)"; \
+	fi
+	"$(VENV_PYTHON)" -m pip check
 
 install-sdk-deps:
 	cd sdk/typescript && npm ci
@@ -113,7 +112,7 @@ docker-down:
 docker-logs:
 	$(COMPOSE) logs -f
 
-build: build-server build-web build-sdk
+build: python-toolchain build-server build-web build-sdk
 
 build-server:
 	cd server && mkdir -p bin
@@ -125,7 +124,7 @@ build-server:
 build-web:
 	cd web && npm run build
 
-build-sdk: $(PYTHON_REQUIREMENTS_STAMP)
+build-sdk: python-toolchain
 	cd sdk/go && go build ./...
 	"$(VENV_PYTHON)" -m compileall -q sdk/python/chronodesk sdk/python/examples
 	cd sdk/typescript && npm run build
@@ -137,12 +136,12 @@ clean:
 	rm -rf sdk/python/build sdk/python/*.egg-info
 	find sdk/python -type d -name __pycache__ -prune -exec rm -rf {} +
 
-fmt: $(PYTHON_REQUIREMENTS_STAMP)
+fmt: python-toolchain
 	cd server && gofmt -w .
 	gofmt -w $$(rg --files sdk/go -g '*.go')
 	"$(VENV_PYTHON)" -m ruff format sdk/python
 
-fmt-check: $(PYTHON_REQUIREMENTS_STAMP)
+fmt-check: python-toolchain
 	@test -z "$$(cd server && gofmt -l .)" || \
 		{ echo "存在未格式化的 Go 文件："; cd server && gofmt -l .; exit 1; }
 	@test -z "$$(gofmt -l $$(rg --files sdk/go -g '*.go'))" || \
@@ -150,7 +149,7 @@ fmt-check: $(PYTHON_REQUIREMENTS_STAMP)
 		  gofmt -l $$(rg --files sdk/go -g '*.go'); exit 1; }
 	"$(VENV_PYTHON)" -m ruff format --check sdk/python
 
-test: test-server test-web test-sdk test-python-static openapi-lint asyncapi-lint
+test: python-toolchain test-server test-web test-sdk test-python-static openapi-lint asyncapi-lint
 
 test-server:
 	cd server && go test ./... -count=1
@@ -164,14 +163,14 @@ test-web:
 	cd web && npm run lint
 	cd web && npm run audit:security
 
-test-sdk: $(PYTHON_REQUIREMENTS_STAMP)
+test-sdk: python-toolchain
 	cd sdk/go && go test ./... -count=1
 	"$(VENV_PYTHON)" -m ruff check sdk/python
 	PYTHONPATH=$(CURDIR)/sdk/python "$(VENV_PYTHON)" -m unittest discover \
 		-s sdk/python/tests -p 'test_*.py'
 	cd sdk/typescript && npm test
 
-test-python-static: $(PYTHON_REQUIREMENTS_STAMP) test-python-toolchain
+test-python-static: python-toolchain test-python-toolchain
 	"$(VENV_PYTHON)" -m ruff format --check server/tests
 	"$(VENV_PYTHON)" -m ruff check server/tests
 	"$(VENV_PYTHON)" -m compileall -q server/tests
@@ -188,7 +187,7 @@ security:
 	cd web && npm run audit:security
 	cd sdk/typescript && npm audit --audit-level=high
 
-verify: fmt-check test security build
+verify: python-toolchain fmt-check test security build
 
 openapi-lint:
 	NPM_CONFIG_CACHE=$(NPM_TOOL_CACHE) npx --yes @redocly/cli@2.41.1 \
@@ -202,7 +201,7 @@ asyncapi-lint:
 	NPM_CONFIG_CACHE=$(NPM_TOOL_CACHE) npx --yes @asyncapi/cli@6.0.2 \
 		validate server/internal/asyncapi/asyncapi.yaml
 
-smoke: $(PYTHON_REQUIREMENTS_STAMP)
+smoke: python-toolchain
 	mkdir -p server/reports
 	"$(VENV_PYTHON)" -m pytest -c server/pytest.ini server/tests -v \
 		--html=server/reports/smoke.html \

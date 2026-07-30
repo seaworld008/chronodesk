@@ -9,7 +9,7 @@ repository_root="$(
 temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/chronodesk-python-toolchain.XXXXXX")"
 trap 'rm -rf "$temporary_root"' EXIT
 
-venv_path="$temporary_root/alternate-venv"
+venv_path="$temporary_root/alternate venv"
 requirements_path="$temporary_root/requirements-test.txt"
 bootstrap_path="$temporary_root/bootstrap-python"
 bootstrap_log="$temporary_root/bootstrap.log"
@@ -22,6 +22,10 @@ cat >"$bootstrap_path" <<'BOOTSTRAP'
 set -euo pipefail
 
 printf '%s\n' "$*" >>"$FAKE_BOOTSTRAP_LOG"
+if [[ "$#" -ge 3 && "$1" == "-m" && "$2" == "pip" ]]; then
+  printf 'error: externally-managed-environment\n' >&2
+  exit 73
+fi
 if [[ "$#" -eq 3 && "$1" == "-m" && "$2" == "venv" ]]; then
   mkdir -p "$3/bin"
   cat >"$3/bin/python" <<'PYTHON'
@@ -86,21 +90,24 @@ assert_line_count() {
 install_test_dependencies
 [[ -x "$venv_path/bin/python" ]]
 assert_line_count 1 "-m venv $venv_path" "$bootstrap_log"
+assert_line_count 0 "-m pip" "$bootstrap_log"
 assert_line_count 1 "-m pip install -r $requirements_path" "$runtime_log"
 assert_line_count 1 "-m pip check" "$runtime_log"
 
 install_test_dependencies
 assert_line_count 1 "-m venv $venv_path" "$bootstrap_log"
+assert_line_count 0 "-m pip" "$bootstrap_log"
 assert_line_count 1 "-m pip install -r $requirements_path" "$runtime_log"
 assert_line_count 2 "-m pip check" "$runtime_log"
 
 printf 'second-dependency==2.0\n' >>"$requirements_path"
 install_test_dependencies
 assert_line_count 1 "-m venv $venv_path" "$bootstrap_log"
+assert_line_count 0 "-m pip" "$bootstrap_log"
 assert_line_count 2 "-m pip install -r $requirements_path" "$runtime_log"
 assert_line_count 3 "-m pip check" "$runtime_log"
 
-for target in install-deps fmt fmt-check build-sdk test-sdk test-python-static smoke; do
+for target in install-deps fmt fmt-check build-sdk test-sdk test-python-static smoke verify; do
   dry_run="$(
     make --no-print-directory -n -C "$repository_root" \
       VENV="$venv_path" \
@@ -119,4 +126,5 @@ for target in install-deps fmt fmt-check build-sdk test-sdk test-python-static s
   fi
 done
 
+printf 'PEP 668 bootstrap safeguard passed.\n'
 printf 'Python toolchain Make regression passed.\n'
