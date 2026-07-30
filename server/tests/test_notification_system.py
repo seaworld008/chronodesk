@@ -31,7 +31,9 @@ def notification_under_test(
         "管理员登录响应缺少有效用户 ID"
     )
 
-    unread_response = admin_api.get_json("/notifications/unread-count")
+    unread_response = admin_api.get_json(
+        admin_api.project_path("notifications/unread-count")
+    )
     assert unread_response.status_code == 200, "创建通知前应能查询未读数量"
     baseline_unread = unread_response.json().get("count")
     assert isinstance(baseline_unread, int) and baseline_unread >= 0, (
@@ -50,7 +52,10 @@ def notification_under_test(
 
     notification_id: int | None = None
     try:
-        create_response = admin_api.post_json("/admin/notifications", payload)
+        create_response = admin_api.post_json(
+            admin_api.project_path("notifications"),
+            payload,
+        )
         assert create_response.status_code == 201, "管理员创建通知应返回 HTTP 201"
 
         created = create_response.json().get("data")
@@ -69,7 +74,7 @@ def notification_under_test(
     finally:
         if notification_id is not None:
             delete_response = admin_api.delete(
-                f"/admin/notifications/{notification_id}"
+                admin_api.project_path(f"notifications/{notification_id}")
             )
             assert delete_response.status_code == 200, "管理员应能清理本测试创建的通知"
             assert delete_response.json().get("message") == "删除通知成功", (
@@ -95,7 +100,10 @@ def _list_notifications(
         "filter": json.dumps(notification_filter, ensure_ascii=False),
     }
 
-    response = admin_api.get_json("/notifications", params=params)
+    response = admin_api.get_json(
+        admin_api.project_path("notifications"),
+        params=params,
+    )
     assert response.status_code == 200, "当前用户读取通知列表应返回 HTTP 200"
 
     body = response.json()
@@ -129,7 +137,8 @@ def test_notification_lifecycle_uses_current_contract(
     """验证通知列表、未读计数、创建、读取、单条标记已读和管理员清理。"""
 
     unauthenticated_response = api_client.get_json(
-        "/notifications", params={"page": 1, "page_size": 1}
+        api_client.project_path("notifications"),
+        params={"page": 1, "page_size": 1},
     )
     assert unauthenticated_response.status_code == 401, "未认证客户端不应读取通知列表"
 
@@ -149,7 +158,9 @@ def test_notification_lifecycle_uses_current_contract(
     assert created.get("channel") == payload["channel"], "创建响应中的渠道应与请求一致"
     assert created.get("is_read") is False, "新创建的通知应为未读状态"
 
-    unread_after_create_response = admin_api.get_json("/notifications/unread-count")
+    unread_after_create_response = admin_api.get_json(
+        admin_api.project_path("notifications/unread-count")
+    )
     assert unread_after_create_response.status_code == 200, "当前用户应能查询未读数量"
     unread_after_create = unread_after_create_response.json().get("count")
     assert isinstance(unread_after_create, int), "未读数量应为整数"
@@ -165,7 +176,10 @@ def test_notification_lifecycle_uses_current_contract(
     assert len(matching_unread) == 1, "当前用户的未读列表应包含本测试创建的通知"
     assert matching_unread[0].get("is_read") is False, "列表中的新通知应保持未读"
 
-    mark_response = admin_api.put_json(f"/notifications/{notification_id}/read", {})
+    mark_response = admin_api.put_json(
+        admin_api.project_path(f"notifications/{notification_id}/read"),
+        {},
+    )
     assert mark_response.status_code == 200, "当前用户标记单条通知已读应返回 HTTP 200"
     assert mark_response.json().get("message") == "标记成功", (
         "标记已读应返回中文成功提示"
@@ -189,7 +203,9 @@ def test_notification_lifecycle_uses_current_contract(
         item.get("id") != notification_id for item in unread_data_after_mark["items"]
     ), "标记已读后，该通知不应继续出现在未读列表"
 
-    unread_after_mark_response = admin_api.get_json("/notifications/unread-count")
+    unread_after_mark_response = admin_api.get_json(
+        admin_api.project_path("notifications/unread-count")
+    )
     assert unread_after_mark_response.status_code == 200, "标记已读后仍应能查询未读数量"
     unread_after_mark = unread_after_mark_response.json().get("count")
     assert isinstance(unread_after_mark, int) and unread_after_mark >= 0, (
@@ -197,4 +213,24 @@ def test_notification_lifecycle_uses_current_contract(
     )
     assert unread_after_mark <= unread_after_create - 1, (
         "标记该通知已读后未读数量应至少减少一条"
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.api
+def test_legacy_global_notification_routes_are_removed(
+    admin_api: APIClient,
+) -> None:
+    """破坏性升级后，不得保留任何隐式项目通知入口。"""
+
+    legacy_list = admin_api.get_json(
+        "/notifications",
+        params={"page": 1, "page_size": 1},
+    )
+    assert legacy_list.status_code == 404, "旧全局 /notifications 必须直接不存在"
+
+    # 空负载确保即使旧创建路由意外存在，也不会产生测试数据。
+    legacy_admin_create = admin_api.post_json("/admin/notifications", {})
+    assert legacy_admin_create.status_code == 404, (
+        "旧全局 /admin/notifications 必须直接不存在"
     )

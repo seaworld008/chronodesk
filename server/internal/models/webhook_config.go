@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"gorm.io/gorm"
 )
@@ -145,10 +146,12 @@ func ensureWebhookJSONEOF(decoder *json.Decoder) error {
 
 // WebhookConfig Webhook配置模型
 type WebhookConfig struct {
-	ID        uint           `json:"id" gorm:"primaryKey;autoIncrement"`
-	CreatedAt time.Time      `json:"created_at" gorm:"autoCreateTime"`
-	UpdatedAt time.Time      `json:"updated_at" gorm:"autoUpdateTime"`
-	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
+	ID             uint           `json:"id" gorm:"primaryKey;autoIncrement"`
+	CreatedAt      time.Time      `json:"created_at" gorm:"autoCreateTime"`
+	UpdatedAt      time.Time      `json:"updated_at" gorm:"autoUpdateTime"`
+	DeletedAt      gorm.DeletedAt `json:"-" gorm:"index"`
+	OrganizationID uint           `json:"organization_id" gorm:"index"`
+	ProjectID      uint           `json:"project_id" gorm:"index"`
 
 	// 基本配置
 	Name        string          `json:"name" gorm:"size:100;not null" validate:"required,max=100"`
@@ -161,8 +164,10 @@ type WebhookConfig struct {
 	// Secret and AccessToken persist only versioned AEAD envelopes. The
 	// plaintext values exist in memory solely while an authorized delivery is
 	// being prepared.
-	Secret      string `json:"-" gorm:"size:2048"` // 签名密钥，不返回给前端
-	AccessToken string `json:"-" gorm:"size:2048"` // 访问令牌，不返回给前端
+	Secret                  string     `json:"-" gorm:"size:2048"` // 当前签名密钥
+	PreviousSecret          string     `json:"-" gorm:"size:2048"` // 轮换重叠期旧密钥
+	PreviousSecretExpiresAt *time.Time `json:"previous_secret_expires_at,omitempty" gorm:"index"`
+	AccessToken             string     `json:"-" gorm:"size:2048"` // 访问令牌，不返回给前端
 
 	// 事件配置
 	EnabledEvents    string             `json:"enabled_events" gorm:"type:text"`        // JSON数组存储启用的事件类型
@@ -200,6 +205,142 @@ type WebhookConfig struct {
 	Creator   *User `json:"creator,omitempty" gorm:"foreignKey:CreatedBy"`
 	UpdatedBy *uint `json:"updated_by,omitempty" gorm:"index"`
 	Updater   *User `json:"updater,omitempty" gorm:"foreignKey:UpdatedBy"`
+}
+
+// WebhookDeliverySnapshot is the immutable delivery configuration captured in
+// the same transaction as a DomainEvent and its OutboxDelivery. It prevents a
+// later subscription edit, disable, deletion, or key rotation from changing
+// the destination or credentials of already committed external work.
+//
+// Secret values remain versioned AEAD envelopes copied from WebhookConfig.
+// They are revealed only for one bounded delivery attempt using the original
+// ConfigID as encryption AAD.
+type WebhookDeliverySnapshot struct {
+	ID        string    `json:"id" gorm:"primaryKey;size:36;<-:create"`
+	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime;<-:create"`
+
+	OrganizationID  uint      `json:"organization_id" gorm:"not null;index;<-:create"`
+	ProjectID       uint      `json:"project_id" gorm:"not null;index;<-:create"`
+	ConfigID        uint      `json:"config_id" gorm:"not null;index;uniqueIndex:idx_webhook_snapshot_event_config,priority:2;<-:create"`
+	EventID         string    `json:"event_id" gorm:"size:64;not null;index;uniqueIndex:idx_webhook_snapshot_event_config,priority:1;<-:create"`
+	ConfigUpdatedAt time.Time `json:"config_updated_at" gorm:"not null;<-:create"`
+
+	Provider   WebhookProvider `json:"provider" gorm:"size:20;not null;<-:create"`
+	WebhookURL string          `json:"webhook_url" gorm:"size:500;not null;<-:create"`
+
+	Secret                  string     `json:"-" gorm:"size:2048;<-:create"`
+	PreviousSecret          string     `json:"-" gorm:"size:2048;<-:create"`
+	PreviousSecretExpiresAt *time.Time `json:"-" gorm:"<-:create"`
+	AccessToken             string     `json:"-" gorm:"size:2048;<-:create"`
+
+	EnabledEvents   string `json:"-" gorm:"type:text;not null;<-:create"`
+	MessageTemplate string `json:"-" gorm:"type:text;<-:create"`
+	MessageFormat   string `json:"-" gorm:"size:20;<-:create"`
+	FilterRules     string `json:"-" gorm:"type:text;<-:create"`
+
+	RetryCount      int `json:"retry_count" gorm:"not null;<-:create"`
+	RetryInterval   int `json:"retry_interval" gorm:"not null;<-:create"`
+	TimeoutSeconds  int `json:"timeout_seconds" gorm:"not null;<-:create"`
+	RateLimit       int `json:"rate_limit" gorm:"not null;<-:create"`
+	RateLimitWindow int `json:"rate_limit_window" gorm:"not null;<-:create"`
+}
+
+func (WebhookDeliverySnapshot) TableName() string {
+	return "webhook_delivery_snapshots"
+}
+
+func (snapshot *WebhookDeliverySnapshot) BeforeCreate(_ *gorm.DB) error {
+	if snapshot.OrganizationID == 0 || snapshot.ProjectID == 0 ||
+		snapshot.ConfigID == 0 || strings.TrimSpace(snapshot.EventID) == "" {
+		return errors.New("webhook delivery snapshot scope and source are required")
+	}
+	if strings.TrimSpace(snapshot.ID) == "" {
+		generated, err := uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("generate webhook delivery snapshot id: %w", err)
+		}
+		snapshot.ID = generated.String()
+	}
+	if err := uuid.Validate(snapshot.ID); err != nil {
+		return fmt.Errorf("invalid webhook delivery snapshot id: %w", err)
+	}
+	return nil
+}
+
+func (*WebhookDeliverySnapshot) BeforeUpdate(_ *gorm.DB) error {
+	return errors.New("webhook delivery snapshots are immutable")
+}
+
+func (*WebhookDeliverySnapshot) BeforeDelete(_ *gorm.DB) error {
+	return errors.New("webhook delivery snapshots are immutable")
+}
+
+func NewWebhookDeliverySnapshot(
+	config WebhookConfig,
+	eventID string,
+) (*WebhookDeliverySnapshot, error) {
+	if config.ID == 0 || config.OrganizationID == 0 || config.ProjectID == 0 ||
+		config.Status != WebhookStatusActive {
+		return nil, errors.New("active project webhook configuration is required")
+	}
+	if err := config.ValidateSubscriptions(true); err != nil {
+		return nil, err
+	}
+	return &WebhookDeliverySnapshot{
+		OrganizationID:          config.OrganizationID,
+		ProjectID:               config.ProjectID,
+		ConfigID:                config.ID,
+		EventID:                 strings.TrimSpace(eventID),
+		ConfigUpdatedAt:         config.UpdatedAt.UTC(),
+		Provider:                config.Provider,
+		WebhookURL:              config.WebhookURL,
+		Secret:                  config.Secret,
+		PreviousSecret:          config.PreviousSecret,
+		PreviousSecretExpiresAt: config.PreviousSecretExpiresAt,
+		AccessToken:             config.AccessToken,
+		EnabledEvents:           config.EnabledEvents,
+		MessageTemplate:         config.MessageTemplate,
+		MessageFormat:           config.MessageFormat,
+		FilterRules:             config.FilterRules,
+		RetryCount:              config.RetryCount,
+		RetryInterval:           config.RetryInterval,
+		TimeoutSeconds:          config.TimeoutSeconds,
+		RateLimit:               config.RateLimit,
+		RateLimitWindow:         config.RateLimitWindow,
+	}, nil
+}
+
+// WebhookConfig reconstructs the delivery-only view. It deliberately does not
+// load the mutable source row.
+func (snapshot WebhookDeliverySnapshot) WebhookConfig() (
+	WebhookConfig,
+	error,
+) {
+	config := WebhookConfig{
+		ID:                      snapshot.ConfigID,
+		OrganizationID:          snapshot.OrganizationID,
+		ProjectID:               snapshot.ProjectID,
+		Provider:                snapshot.Provider,
+		WebhookURL:              snapshot.WebhookURL,
+		Status:                  WebhookStatusActive,
+		Secret:                  snapshot.Secret,
+		PreviousSecret:          snapshot.PreviousSecret,
+		PreviousSecretExpiresAt: snapshot.PreviousSecretExpiresAt,
+		AccessToken:             snapshot.AccessToken,
+		EnabledEvents:           snapshot.EnabledEvents,
+		MessageTemplate:         snapshot.MessageTemplate,
+		MessageFormat:           snapshot.MessageFormat,
+		FilterRules:             snapshot.FilterRules,
+		RetryCount:              snapshot.RetryCount,
+		RetryInterval:           snapshot.RetryInterval,
+		TimeoutSeconds:          snapshot.TimeoutSeconds,
+		RateLimit:               snapshot.RateLimit,
+		RateLimitWindow:         snapshot.RateLimitWindow,
+	}
+	if err := config.AfterFind(nil); err != nil {
+		return WebhookConfig{}, err
+	}
+	return config, nil
 }
 
 // BeforeSave GORM钩子 - 保存前处理
@@ -339,8 +480,10 @@ func (w *WebhookConfig) MatchesEvent(
 
 // WebhookLog 通知日志模型
 type WebhookLog struct {
-	ID        uint      `json:"id" gorm:"primaryKey;autoIncrement"`
-	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
+	ID             uint      `json:"id" gorm:"primaryKey;autoIncrement"`
+	CreatedAt      time.Time `json:"created_at" gorm:"autoCreateTime"`
+	OrganizationID uint      `json:"organization_id" gorm:"index"`
+	ProjectID      uint      `json:"project_id" gorm:"index"`
 
 	// 关联配置
 	ConfigID uint           `json:"config_id" gorm:"not null;index"`

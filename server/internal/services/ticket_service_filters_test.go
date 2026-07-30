@@ -1,7 +1,6 @@
 package services
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -20,6 +19,7 @@ func setupFilterTestDB(t *testing.T) *gorm.DB {
 		&models.Category{},
 		&models.Ticket{},
 		&models.TicketComment{},
+		&models.SLAConfig{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
 		&models.TicketHistory{},
@@ -108,10 +108,24 @@ func TestGetTicketsFilters_SLAOverdueUnassigned(t *testing.T) {
 		AssignedToID: nil,
 		DueDate:      ptrTime(now.Add(24 * time.Hour)),
 	})
+	seedTicket(t, db, models.Ticket{
+		TicketNumber: "T-004",
+		Title:        "Resolved legacy SLA projection",
+		Description:  "desc",
+		Status:       models.TicketStatusResolved,
+		Priority:     models.TicketPriorityHigh,
+		Type:         models.TicketTypeRequest,
+		Source:       models.TicketSourceWeb,
+		CreatedByID:  &creator.ID,
+		AssignedToID: &assignee.ID,
+		SLABreached:  true,
+		DueDate:      ptrTime(now.Add(48 * time.Hour)),
+	})
 
+	ctx := testProjectOperationContext(t, db, models.HumanActor(creator.ID))
 	svc := newTicketServiceForTest(t, db)
 
-	tickets, total, err := svc.GetTickets(context.Background(), TicketFilters{
+	tickets, total, err := svc.GetTickets(ctx, TicketFilters{
 		SLABreached: boolPtr(true),
 	})
 	if err != nil {
@@ -121,7 +135,7 @@ func TestGetTicketsFilters_SLAOverdueUnassigned(t *testing.T) {
 		t.Fatalf("expected 1 sla_breached ticket, got total=%d len=%d", total, len(tickets))
 	}
 
-	tickets, total, err = svc.GetTickets(context.Background(), TicketFilters{
+	tickets, total, err = svc.GetTickets(ctx, TicketFilters{
 		IsOverdue: boolPtr(true),
 	})
 	if err != nil {
@@ -131,7 +145,7 @@ func TestGetTicketsFilters_SLAOverdueUnassigned(t *testing.T) {
 		t.Fatalf("expected 1 overdue ticket, got total=%d len=%d", total, len(tickets))
 	}
 
-	tickets, total, err = svc.GetTickets(context.Background(), TicketFilters{
+	tickets, total, err = svc.GetTickets(ctx, TicketFilters{
 		Unassigned: boolPtr(true),
 	})
 	if err != nil {
@@ -168,7 +182,8 @@ func TestGetTicketsFilters_Source(t *testing.T) {
 	})
 
 	svc := newTicketServiceForTest(t, db)
-	tickets, total, err := svc.GetTickets(context.Background(), TicketFilters{
+	ctx := testProjectOperationContext(t, db, models.HumanActor(creator.ID))
+	tickets, total, err := svc.GetTickets(ctx, TicketFilters{
 		Source: string(models.TicketSourceWeb),
 	})
 	if err != nil {
@@ -209,8 +224,9 @@ func TestGetTickets_SortFieldInjectionFallsBackToCreatedAt(t *testing.T) {
 	})
 
 	svc := newTicketServiceForTest(t, db)
+	ctx := testProjectOperationContext(t, db, models.HumanActor(creator.ID))
 
-	tickets, _, err := svc.GetTickets(context.Background(), TicketFilters{
+	tickets, _, err := svc.GetTickets(ctx, TicketFilters{
 		SortBy:    "bad_column",
 		SortOrder: "DESC",
 	})
@@ -227,7 +243,7 @@ func TestGetTickets_SortFieldInjectionFallsBackToCreatedAt(t *testing.T) {
 	}
 }
 
-func TestGetSLABreachedTicketsUsesStoredDeadlineAndFlag(t *testing.T) {
+func TestGetSLABreachedTicketsUsesAuthoritativeProjection(t *testing.T) {
 	db := setupFilterTestDB(t)
 	creator := seedUser(t, db, "sla-creator")
 	assignee := seedUser(t, db, "sla-assignee")
@@ -288,12 +304,23 @@ func TestGetSLABreachedTicketsUsesStoredDeadlineAndFlag(t *testing.T) {
 	})
 
 	svc := newTicketServiceForTest(t, db)
-	tickets, total, err := svc.GetSLABreachedTickets(assignee.ID, "agent")
+	ctx := testProjectOperationContext(t, db, models.HumanActor(assignee.ID))
+	tickets, total, err := svc.GetSLABreachedTickets(
+		ctx,
+		assignee.ID,
+		"agent",
+	)
 	if err != nil {
 		t.Fatalf("GetSLABreachedTickets returned error: %v", err)
 	}
-	if total != 2 || len(tickets) != 2 {
-		t.Fatalf("expected 2 active SLA breaches, got total=%d len=%d", total, len(tickets))
+	if total != 1 || len(tickets) != 1 {
+		t.Fatalf("expected 1 projected SLA breach, got total=%d len=%d", total, len(tickets))
+	}
+	if tickets[0].TicketNumber != "SLA-002" {
+		t.Fatalf(
+			"expired legacy sla_due_date must not bypass the projection, got %s",
+			tickets[0].TicketNumber,
+		)
 	}
 }
 

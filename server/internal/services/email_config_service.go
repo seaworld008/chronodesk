@@ -155,7 +155,7 @@ func (s *EmailConfigService) UpdateEmailConfig(ctx context.Context, req *models.
 	// 保存先在同一事务中插入不含密码的记录以取得主键，再用该主键生成
 	// record-specific AAD，避免生成无法在重启后解密的 ID=0 密文。
 	var persisted models.EmailConfig
-	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	if err := transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		persisted = *config
 		if persisted.ID == 0 {
 			plaintextPassword := persisted.SMTPPassword

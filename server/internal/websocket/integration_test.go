@@ -4,9 +4,25 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+)
+
+var (
+	websocketTestScopeA = models.ProjectScope{
+		OrganizationID: 7,
+		ProjectID:      70,
+	}
+	websocketTestScopeB = models.ProjectScope{
+		OrganizationID: 7,
+		ProjectID:      71,
+	}
 )
 
 func parseUnreadCountMessage(t *testing.T, raw []byte) int64 {
@@ -37,11 +53,7 @@ func parseUnreadCountMessage(t *testing.T, raw []byte) int64 {
 
 func TestNotificationMarkedAsReadHook_PushesProvidedUnreadCount(t *testing.T) {
 	hub := NewHub()
-	client := &Client{
-		hub:    hub,
-		send:   make(chan []byte, 1),
-		UserID: 101,
-	}
+	client := newWebSocketTestClient(hub, 101, websocketTestScopeA, 1)
 	hub.clients[client] = true
 
 	GlobalNotificationService = NewNotificationWebSocketService(hub)
@@ -49,7 +61,14 @@ func TestNotificationMarkedAsReadHook_PushesProvidedUnreadCount(t *testing.T) {
 		GlobalNotificationService = nil
 	})
 
-	NotificationMarkedAsReadHook(context.Background(), 101, 5)
+	if err := NotificationMarkedAsReadHook(
+		context.Background(),
+		websocketTestScopeA,
+		101,
+		5,
+	); err != nil {
+		t.Fatal(err)
+	}
 
 	select {
 	case msg := <-client.send:
@@ -61,13 +80,89 @@ func TestNotificationMarkedAsReadHook_PushesProvidedUnreadCount(t *testing.T) {
 	}
 }
 
+func TestNotificationPushesOnlyToSameProjectAndUser(t *testing.T) {
+	hub := NewHub()
+	projectAClient := newWebSocketTestClient(
+		hub,
+		101,
+		websocketTestScopeA,
+		2,
+	)
+	projectBClient := newWebSocketTestClient(
+		hub,
+		101,
+		websocketTestScopeB,
+		2,
+	)
+	otherUserClient := newWebSocketTestClient(
+		hub,
+		102,
+		websocketTestScopeA,
+		2,
+	)
+	hub.clients[projectAClient] = true
+	hub.clients[projectBClient] = true
+	hub.clients[otherUserClient] = true
+	service := NewNotificationWebSocketService(hub)
+
+	if err := service.PushNotification(
+		context.Background(),
+		&models.Notification{
+			ID:             55,
+			OrganizationID: websocketTestScopeA.OrganizationID,
+			ProjectID:      websocketTestScopeA.ProjectID,
+			RecipientID:    101,
+			Type:           models.NotificationTypeTicketAssigned,
+			Title:          "Project A",
+			Content:        "Scoped notification",
+			Priority:       models.NotificationPriorityNormal,
+			Channel:        models.NotificationChannelWebSocket,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-projectAClient.send:
+	default:
+		t.Fatal("same-project user did not receive notification")
+	}
+	select {
+	case <-projectBClient.send:
+		t.Fatal("notification leaked to same user in another project")
+	default:
+	}
+	select {
+	case <-otherUserClient.send:
+		t.Fatal("notification leaked to another user in the same project")
+	default:
+	}
+
+	if err := service.PushUnreadCount(
+		context.Background(),
+		websocketTestScopeB,
+		101,
+		3,
+	); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case message := <-projectBClient.send:
+		if got := parseUnreadCountMessage(t, message); got != 3 {
+			t.Fatalf("project B unread count = %d", got)
+		}
+	default:
+		t.Fatal("same-project user did not receive unread count")
+	}
+	select {
+	case <-projectAClient.send:
+		t.Fatal("unread count leaked to another project")
+	default:
+	}
+}
+
 func TestHubRunClosesClientsAndReturnsOnContextCancellation(t *testing.T) {
 	hub := NewHub()
-	client := &Client{
-		hub:  hub,
-		send: make(chan []byte, 1),
-		done: make(chan struct{}),
-	}
+	client := newWebSocketTestClient(hub, 100, websocketTestScopeA, 1)
 	hub.clients[client] = true
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -95,11 +190,7 @@ func TestHubRunClosesClientsAndReturnsOnContextCancellation(t *testing.T) {
 
 func TestClientHandleMarkRead_InvokesReadHandlerAndPushesUnreadCount(t *testing.T) {
 	hub := NewHub()
-	client := &Client{
-		hub:    hub,
-		send:   make(chan []byte, 2),
-		UserID: 202,
-	}
+	client := newWebSocketTestClient(hub, 202, websocketTestScopeA, 2)
 	hub.clients[client] = true
 
 	GlobalNotificationService = NewNotificationWebSocketService(hub)
@@ -109,8 +200,20 @@ func TestClientHandleMarkRead_InvokesReadHandlerAndPushesUnreadCount(t *testing.
 	})
 
 	var called bool
-	SetNotificationReadHandler(func(ctx context.Context, userID uint, notificationID uint) (int64, error) {
+	SetNotificationReadHandler(func(
+		ctx context.Context,
+		scope models.ProjectScope,
+		userID uint,
+		notificationID uint,
+	) (int64, error) {
 		called = true
+		if scope != websocketTestScopeA {
+			t.Fatalf(
+				"expected scope %+v, got %+v",
+				websocketTestScopeA,
+				scope,
+			)
+		}
 		if userID != 202 {
 			t.Fatalf("expected userID 202, got %d", userID)
 		}
@@ -139,13 +242,23 @@ func TestClientHandleMarkRead_InvokesReadHandlerAndPushesUnreadCount(t *testing.
 }
 
 func TestClientHandleMarkReadRejectsInvalidNumericIDs(t *testing.T) {
-	client := &Client{UserID: 303}
+	client := newWebSocketTestClient(
+		NewHub(),
+		303,
+		websocketTestScopeA,
+		1,
+	)
 	t.Cleanup(func() {
 		SetNotificationReadHandler(nil)
 	})
 
 	calls := 0
-	SetNotificationReadHandler(func(context.Context, uint, uint) (int64, error) {
+	SetNotificationReadHandler(func(
+		context.Context,
+		models.ProjectScope,
+		uint,
+		uint,
+	) (int64, error) {
 		calls++
 		return 0, nil
 	})
@@ -164,5 +277,82 @@ func TestClientHandleMarkReadRejectsInvalidNumericIDs(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Fatalf("invalid notification IDs invoked the persistence hook %d time(s)", calls)
+	}
+}
+
+func TestClientHandleMarkReadRejectsMissingProjectScope(t *testing.T) {
+	hub := NewHub()
+	client := newWebSocketTestClient(
+		hub,
+		303,
+		models.ProjectScope{},
+		1,
+	)
+	calls := 0
+	SetNotificationReadHandler(func(
+		context.Context,
+		models.ProjectScope,
+		uint,
+		uint,
+	) (int64, error) {
+		calls++
+		return 0, nil
+	})
+	t.Cleanup(func() {
+		SetNotificationReadHandler(nil)
+	})
+
+	client.handleMarkRead(map[string]interface{}{
+		"notification_id": float64(88),
+	})
+	if calls != 0 {
+		t.Fatal("unscoped mark-read reached the persistence handler")
+	}
+	if hub.registerClient(client) {
+		t.Fatal("hub registered a client without project scope")
+	}
+}
+
+func TestServeWSRejectsMissingTrustedProjectScopeBeforeUpgrade(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ginContext, _ := gin.CreateTestContext(recorder)
+	ginContext.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/api/v2/projects/TEST/ws",
+		nil,
+	)
+	ginContext.Set("user_id", uint(404))
+
+	ServeWS(NewHub(), ginContext, models.ProjectScope{})
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf(
+			"ServeWS missing-scope status = %d, want %d",
+			recorder.Code,
+			http.StatusInternalServerError,
+		)
+	}
+	var response map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["error"] != "invalid_project_context" {
+		t.Fatalf("ServeWS missing-scope response = %#v", response)
+	}
+}
+
+func newWebSocketTestClient(
+	hub *Hub,
+	userID uint,
+	scope models.ProjectScope,
+	sendCapacity int,
+) *Client {
+	return &Client{
+		hub:    hub,
+		send:   make(chan []byte, sendCapacity),
+		UserID: userID,
+		scope:  scope,
+		done:   make(chan struct{}),
 	}
 }

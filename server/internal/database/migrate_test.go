@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/seaworld008/chronodesk/server/internal/auth"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -39,35 +38,7 @@ func TestValidateRuntimeSchemaAcceptsMigratedModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open database: %v", err)
 	}
-	modelsToMigrate := []any{
-		&models.User{},
-		&models.UserProfile{},
-		&models.EmailConfig{},
-		&auth.RefreshToken{},
-		&auth.EmailVerification{},
-		&auth.PasswordReset{},
-		&auth.OTPCode{},
-		&models.LoginHistory{},
-		&models.ServicePrincipal{},
-		&models.AgentCredential{},
-		&models.AgentPolicy{},
-		&models.PolicyDecision{},
-		&models.IdempotencyRecord{},
-		&models.Ticket{},
-		&models.TicketComment{},
-		&models.TicketAttachment{},
-		&models.TicketHistory{},
-		&models.TicketLease{},
-		&models.DomainEvent{},
-		&models.OutboxDelivery{},
-		&models.AgentTask{},
-		&models.AgentMessage{},
-		&models.AgentArtifact{},
-		&models.AgentTaskStatusHistory{},
-		&models.AgentTaskEvent{},
-		&models.AgentPushNotificationConfig{},
-		&models.Notification{},
-	}
+	modelsToMigrate := schemaMigrationModels()
 	if err := db.AutoMigrate(modelsToMigrate...); err != nil {
 		t.Fatalf("migrate runtime schema: %v", err)
 	}

@@ -4,6 +4,9 @@ import {
     createNotification,
     deleteNotification,
     E2E_MARKER,
+    getAdminToken,
+    projectAPIPath,
+    resolveE2EProjectKey,
 } from './helpers/testData';
 import { assertDestructiveE2EAllowed } from './helpers/safety';
 
@@ -28,6 +31,12 @@ test.describe('通知中心', () => {
     test('应显示本轮真实创建的通知', async ({ page, request }) => {
         const title = `${E2E_MARKER}通知`;
         const content = `${E2E_MARKER}通知内容`;
+        const token = await getAdminToken(request);
+        const projectKey = await resolveE2EProjectKey(request, token);
+        const notificationsPath = projectAPIPath(
+            projectKey,
+            'notifications',
+        );
         notificationId = await createNotification(request, { title, content });
 
         await authenticatePage(page, TEST_USER);
@@ -38,7 +47,7 @@ test.describe('通知中心', () => {
         const listRequest = page.waitForResponse((response) => {
             const url = new URL(response.url());
             if (
-                url.pathname !== '/api/notifications' ||
+                url.pathname !== notificationsPath ||
                 response.request().method() !== 'GET'
             ) {
                 return false;
@@ -73,5 +82,27 @@ test.describe('通知中心', () => {
                 name: new RegExp(title, 'u'),
             }),
         ).toBeVisible();
+    });
+
+    test('旧全局通知路由应直接返回 404', async ({ request }) => {
+        const token = await getAdminToken(request);
+        const headers = {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+        };
+        const legacyList = await request.get('/api/notifications', {
+            headers,
+        });
+        expect(legacyList.status()).toBe(404);
+
+        // 空负载保证旧创建路由意外存在时也不会产生通知。
+        const legacyAdminCreate = await request.post(
+            '/api/admin/notifications',
+            {
+                headers,
+                data: {},
+            },
+        );
+        expect(legacyAdminCreate.status()).toBe(404);
     });
 });

@@ -274,6 +274,19 @@ const AssignmentField: React.FC = () => {
     const record = useRecordContext<Ticket>();
     if (!record) return null;
 
+    if (record.assigned_to_actor?.type === 'service_principal') {
+        return (
+            <Tooltip title={record.assigned_to_actor.id}>
+                <Chip
+                    label={`AI 智能体 · ${record.assigned_to_actor.id}`}
+                    color="info"
+                    size="small"
+                    variant="outlined"
+                />
+            </Tooltip>
+        );
+    }
+
     if (!record.assigned_to) {
         return (
             <Chip

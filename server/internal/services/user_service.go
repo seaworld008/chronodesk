@@ -166,7 +166,7 @@ func (s *UserService) DeleteLoginSession(ctx context.Context, userID uint, histo
 		updates["session_duration"] = int64(now.Sub(loginHistory.LoginTime).Seconds())
 	}
 
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		if loginHistory.IsActive {
 			if err := tx.
 				Model(&models.LoginHistory{}).

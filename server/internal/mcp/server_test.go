@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	sdkjsonrpc "github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -203,6 +204,18 @@ func (f *testFixture) postWithHeaders(method, name string, params map[string]any
 	f.t.Helper()
 	if params == nil {
 		params = map[string]any{}
+	}
+	if method == "tools/call" {
+		if arguments, ok := params["arguments"].(map[string]any); ok {
+			scopedArguments := make(map[string]any, len(arguments)+1)
+			for key, value := range arguments {
+				scopedArguments[key] = value
+			}
+			if _, exists := scopedArguments["project_key"]; !exists {
+				scopedArguments["project_key"] = "TEST"
+			}
+			params["arguments"] = scopedArguments
+		}
 	}
 	if _, ok := params["_meta"]; !ok {
 		params["_meta"] = modernMeta()
@@ -811,14 +824,18 @@ func TestInsufficientScopeReturnsOAuthChallengeBeforeBackend(t *testing.T) {
 		[]string{ScopeTicketsRead},
 		WithResourceMetadataURL("https://chronodesk.example/.well-known/oauth-protected-resource/mcp"),
 	)
+	requestTypeVersionID := uuid.Must(uuid.NewV7()).String()
+	workflowVersionID := uuid.Must(uuid.NewV7()).String()
 	response := fixture.post("tools/call", "ticket_create", map[string]any{
 		"name": "ticket_create",
 		"arguments": map[string]any{
-			"title":           "Denied",
-			"description":     "Denied",
-			"type":            "request",
-			"priority":        "normal",
-			"idempotency_key": "denied-create-0001",
+			"title":                   "Denied",
+			"description":             "Denied",
+			"type":                    "request",
+			"priority":                "normal",
+			"request_type_version_id": requestTypeVersionID,
+			"workflow_version_id":     workflowVersionID,
+			"idempotency_key":         "denied-create-0001",
 		},
 	})
 	if response.StatusCode != http.StatusForbidden {
@@ -850,14 +867,18 @@ func TestPolicyDenialReturnsHTTP403BeforeBackend(t *testing.T) {
 			return nil
 		})),
 	)
+	requestTypeVersionID := uuid.Must(uuid.NewV7()).String()
+	workflowVersionID := uuid.Must(uuid.NewV7()).String()
 	response := fixture.post("tools/call", "ticket_create", map[string]any{
 		"name": "ticket_create",
 		"arguments": map[string]any{
-			"title":           "Denied",
-			"description":     "Denied",
-			"type":            "request",
-			"priority":        "normal",
-			"idempotency_key": "policy-denied-0001",
+			"title":                   "Denied",
+			"description":             "Denied",
+			"type":                    "request",
+			"priority":                "normal",
+			"request_type_version_id": requestTypeVersionID,
+			"workflow_version_id":     workflowVersionID,
+			"idempotency_key":         "policy-denied-0001",
 		},
 	})
 	if response.StatusCode != http.StatusForbidden {
@@ -888,7 +909,7 @@ func TestResourcesUseModernCacheAndTrustContracts(t *testing.T) {
 		t.Fatalf("static resource result=%#v", staticResult)
 	}
 
-	uri := "ticket://tickets/42"
+	uri := "ticket://projects/TEST/tickets/42"
 	dynamicResponse := fixture.post("resources/read", uri, map[string]any{"uri": uri})
 	dynamicResult := decodeRPCResponse(t, dynamicResponse)["result"].(map[string]any)
 	if dynamicResult["resultType"] != "complete" || dynamicResult["cacheScope"] != "private" ||
@@ -915,7 +936,7 @@ func TestResourcesUseModernCacheAndTrustContracts(t *testing.T) {
 
 func TestSubscriptionsListenAcknowledgesAndPublishes(t *testing.T) {
 	fixture := newTestFixture(t, []string{"*"}, WithCredentialRecheckInterval(20*time.Millisecond))
-	uri := "ticket://tickets/42"
+	uri := "ticket://projects/TEST/tickets/42"
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1020,7 +1041,7 @@ func TestSubscriptionStreamCredentialLimitAndRelease(t *testing.T) {
 		WithCredentialRecheckInterval(time.Hour),
 		WithSubscriptionStreamLimits(2, 2, 1),
 	)
-	uri := "ticket://tickets/42"
+	uri := "ticket://projects/TEST/tickets/42"
 	firstCtx, cancelFirst := context.WithCancel(context.Background())
 	first, err := openSubscription(firstCtx, fixture.http.Client(), fixture.http.URL+"/mcp", "valid-token", "listen-1", []string{uri})
 	if err != nil {
@@ -1132,13 +1153,13 @@ func TestSubscriptionResourceListLimitAndDuplicates(t *testing.T) {
 	}{
 		{
 			name:  "over limit",
-			uris:  []string{"ticket://tickets/1", "ticket://tickets/2", "ticket://tickets/3"},
+			uris:  []string{"ticket://projects/TEST/tickets/1", "ticket://projects/TEST/tickets/2", "ticket://projects/TEST/tickets/3"},
 			code:  "subscription_resource_limit_exceeded",
 			limit: 2,
 		},
 		{
 			name: "duplicate",
-			uris: []string{"ticket://tickets/1", "ticket://tickets/1"},
+			uris: []string{"ticket://projects/TEST/tickets/1", "ticket://projects/TEST/tickets/1"},
 			code: "duplicate_subscription_resource",
 		},
 	}
@@ -1174,10 +1195,10 @@ func TestSubscriptionDeliveryQueueIsBoundedAndCoalesces(t *testing.T) {
 		pending: make(map[string]struct{}),
 	}
 	for i := 0; i < 100; i++ {
-		delivery.enqueue("ticket://tickets/1")
+		delivery.enqueue("ticket://projects/TEST/tickets/1")
 	}
-	delivery.enqueue("ticket://tickets/2")
-	delivery.enqueue("ticket://tickets/3")
+	delivery.enqueue("ticket://projects/TEST/tickets/2")
+	delivery.enqueue("ticket://projects/TEST/tickets/3")
 	if got := len(delivery.updates); got != 2 {
 		t.Fatalf("bounded delivery queue length=%d, want 2", got)
 	}
@@ -1186,11 +1207,11 @@ func TestSubscriptionDeliveryQueueIsBoundedAndCoalesces(t *testing.T) {
 	}
 	first := <-delivery.updates
 	delivery.complete(first)
-	delivery.enqueue("ticket://tickets/3")
+	delivery.enqueue("ticket://projects/TEST/tickets/3")
 	if got := len(delivery.updates); got != 2 {
 		t.Fatalf("delivery queue did not accept URI after capacity released: %d", got)
 	}
-	if _, ok := delivery.pending["ticket://tickets/3"]; !ok {
+	if _, ok := delivery.pending["ticket://projects/TEST/tickets/3"]; !ok {
 		t.Fatal("new URI was not tracked after capacity released")
 	}
 }
@@ -1239,7 +1260,7 @@ func TestCredentialWatchIsSharedAndScopeReductionClosesStream(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	response, err := openSubscription(ctx, httpServer.Client(), httpServer.URL+"/mcp", "shared-token", "scope-listen", []string{"ticket://tickets/42"})
+	response, err := openSubscription(ctx, httpServer.Client(), httpServer.URL+"/mcp", "shared-token", "scope-listen", []string{"ticket://projects/TEST/tickets/42"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1338,7 +1359,7 @@ func TestPublishRevokesBeforeNotifyingAuthorizedSubscriber(t *testing.T) {
 		if denyRevoked.Load() &&
 			principal.CredentialID == "credential-revoked" &&
 			request.Action == "resource:subscribe" &&
-			request.ResourceURI == "ticket://tickets/42" {
+			request.ResourceURI == "ticket://projects/TEST/tickets/42" {
 			return &PolicyError{ReasonCode: "object_access_revoked"}
 		}
 		return nil
@@ -1347,7 +1368,7 @@ func TestPublishRevokesBeforeNotifyingAuthorizedSubscriber(t *testing.T) {
 		subscribe: func(principal Principal, uri string) (bool, error) {
 			if denyRevoked.Load() &&
 				principal.CredentialID == "credential-revoked" &&
-				uri == "ticket://tickets/42" {
+				uri == "ticket://projects/TEST/tickets/42" {
 				revokedStartOnce.Do(func() { close(revokedCheckStarted) })
 				<-releaseRevokedCheck
 				return false, nil
@@ -1373,7 +1394,7 @@ func TestPublishRevokesBeforeNotifyingAuthorizedSubscriber(t *testing.T) {
 		httpServer.Close()
 	}()
 
-	uri := "ticket://tickets/42"
+	uri := "ticket://projects/TEST/tickets/42"
 	validCtx, cancelValid := context.WithCancel(context.Background())
 	defer cancelValid()
 	revokedCtx, cancelRevoked := context.WithCancel(context.Background())
@@ -1439,7 +1460,7 @@ func TestPublishTransientAuthorizationFailureKeepsSubscription(t *testing.T) {
 	)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	uri := "ticket://tickets/42"
+	uri := "ticket://projects/TEST/tickets/42"
 	response, err := openSubscription(
 		ctx,
 		fixture.http.Client(),

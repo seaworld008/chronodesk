@@ -64,6 +64,13 @@ func TestNotificationOutboxRecoversAfterSideEffectBeforeAcknowledgement(t *testi
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
 	}
+	scope := installAgentplatformTestProjectScope(t, db)
+	eventCtx := agentplatformTestOperationContext(
+		t,
+		scope,
+		models.HumanActor(actor.ID),
+	)
+	workerCtx := agentplatformTestOutboxWorkerContext(t, scope)
 
 	now := time.Date(2026, 7, 29, 9, 0, 0, 0, time.UTC)
 	native := services.NewAgentNativeService(db, services.AgentNativeOptions{
@@ -74,16 +81,20 @@ func TestNotificationOutboxRecoversAfterSideEffectBeforeAcknowledgement(t *testi
 		t.Fatalf("assignment targets = %#v, want one", targets)
 	}
 	var event *models.DomainEvent
-	if err := db.Transaction(func(tx *gorm.DB) error {
+	if err := native.InTransaction(eventCtx, func(
+		txCtx context.Context,
+		tx *gorm.DB,
+	) error {
 		var appendErr error
 		event, appendErr = native.AppendDomainEventTx(
-			context.Background(),
+			txCtx,
 			tx,
 			services.DomainEventInput{
 				Type:            "io.chronodesk.ticket.assigned.v1",
 				Subject:         fmt.Sprintf("ticket/%d", ticket.ID),
 				Actor:           models.HumanActor(actor.ID),
 				ResourceVersion: ticket.Version,
+				Scope:           scope,
 				Data: map[string]any{
 					"ticket_id":       ticket.ID,
 					"ticket_number":   ticket.TicketNumber,
@@ -100,7 +111,7 @@ func TestNotificationOutboxRecoversAfterSideEffectBeforeAcknowledgement(t *testi
 	}
 
 	claimed, err := native.ClaimPendingOutbox(
-		context.Background(),
+		workerCtx,
 		"notification-worker-before-crash",
 		10,
 		2*time.Minute,
@@ -123,7 +134,7 @@ func TestNotificationOutboxRecoversAfterSideEffectBeforeAcknowledgement(t *testi
 	// Persist the side effect but deliberately omit MarkOutboxDelivered to
 	// model a process crash in the acknowledgement gap.
 	if err := deliverer.Deliver(
-		context.Background(),
+		workerCtx,
 		claimed[0],
 		services.CloudEventFromModel(claimed[0].Event),
 	); err != nil {
@@ -160,7 +171,7 @@ func TestNotificationOutboxRecoversAfterSideEffectBeforeAcknowledgement(t *testi
 	// Administrative replay or duplicate broker delivery remains idempotent
 	// even after the original Outbox row is already acknowledged.
 	if err := deliverer.Deliver(
-		context.Background(),
+		workerCtx,
 		&delivery,
 		services.CloudEventFromModel(event),
 	); err != nil {

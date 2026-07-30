@@ -43,7 +43,7 @@ func TestAgentRESTTicketCommandsCommitTypedAuditableChanges(t *testing.T) {
 		t,
 		router,
 		http.MethodPatch,
-		fmt.Sprintf("/api/v1/tickets/%d", ticket.ID),
+		fmt.Sprintf("/api/v2/projects/TEST/tickets/%d", ticket.ID),
 		fixture.token,
 		map[string]string{
 			"If-Match":         httpcontract.FormatETag(1),
@@ -84,7 +84,7 @@ func TestAgentRESTTicketCommandsCommitTypedAuditableChanges(t *testing.T) {
 		t,
 		router,
 		http.MethodPost,
-		fmt.Sprintf("/api/v1/tickets/%d/commands/assign", ticket.ID),
+		fmt.Sprintf("/api/v2/projects/TEST/tickets/%d/commands/assign", ticket.ID),
 		fixture.token,
 		assignHeaders,
 		assignBody,
@@ -110,7 +110,7 @@ func TestAgentRESTTicketCommandsCommitTypedAuditableChanges(t *testing.T) {
 		t,
 		router,
 		http.MethodPost,
-		fmt.Sprintf("/api/v1/tickets/%d/commands/assign", ticket.ID),
+		fmt.Sprintf("/api/v2/projects/TEST/tickets/%d/commands/assign", ticket.ID),
 		fixture.token,
 		assignHeaders,
 		assignBody,
@@ -139,7 +139,7 @@ func TestAgentRESTTicketCommandsCommitTypedAuditableChanges(t *testing.T) {
 		t,
 		router,
 		http.MethodPost,
-		fmt.Sprintf("/api/v1/tickets/%d/commands/transition", ticket.ID),
+		fmt.Sprintf("/api/v2/projects/TEST/tickets/%d/commands/transition", ticket.ID),
 		fixture.token,
 		map[string]string{
 			"If-Match":         httpcontract.FormatETag(3),
@@ -166,7 +166,7 @@ func TestAgentRESTTicketCommandsCommitTypedAuditableChanges(t *testing.T) {
 		t,
 		router,
 		http.MethodPost,
-		fmt.Sprintf("/api/v1/tickets/%d/commands/escalate", ticket.ID),
+		fmt.Sprintf("/api/v2/projects/TEST/tickets/%d/commands/escalate", ticket.ID),
 		fixture.token,
 		map[string]string{
 			"If-Match":         httpcontract.FormatETag(4),
@@ -208,7 +208,7 @@ func TestAgentRESTTicketCommandsCommitTypedAuditableChanges(t *testing.T) {
 		t,
 		router,
 		http.MethodPost,
-		fmt.Sprintf("/api/v1/tickets/%d/commands/assign", ticket.ID),
+		fmt.Sprintf("/api/v2/projects/TEST/tickets/%d/commands/assign", ticket.ID),
 		fixture.token,
 		map[string]string{
 			"If-Match":         httpcontract.FormatETag(5),
@@ -309,6 +309,8 @@ func TestAgentRESTTicketCommandsCommitTypedAuditableChanges(t *testing.T) {
 		if history.EventID == nil ||
 			*history.EventID == "" ||
 			history.ResourceVersion == 0 ||
+			history.OrganizationID != fixture.organization.ID ||
+			history.ProjectID != fixture.project.ID ||
 			history.ServicePrincipalID == nil ||
 			*history.ServicePrincipalID != fixture.principal.ID {
 			t.Fatalf("history is missing immutable Agent audit linkage: %+v", history)
@@ -357,7 +359,7 @@ func TestAgentRESTTicketCommandsRejectPrivilegeAndContractBypass(t *testing.T) {
 	}
 	commandPath := func(command string) string {
 		return fmt.Sprintf(
-			"/api/v1/tickets/%d/commands/%s",
+			"/api/v2/projects/TEST/tickets/%d/commands/%s",
 			ticket.ID,
 			command,
 		)
@@ -589,7 +591,7 @@ func TestAgentRESTTicketCommandsRejectPrivilegeAndContractBypass(t *testing.T) {
 				t,
 				router,
 				http.MethodPatch,
-				fmt.Sprintf("/api/v1/tickets/%d", ticket.ID),
+				fmt.Sprintf("/api/v2/projects/TEST/tickets/%d", ticket.ID),
 				fixture.token,
 				baseHeaders("reject-patch-"+field),
 				map[string]any{field: value},
@@ -620,7 +622,7 @@ func newAgentRESTCommandRouter(fixture *mcpAdapterFixture) *gin.Engine {
 		nil,
 	)
 	router := gin.New()
-	handler.RegisterRoutes(router.Group("/api/v1"))
+	handler.RegisterRoutes(router.Group("/api/v2/projects/:projectKey"))
 	return router
 }
 
@@ -639,6 +641,7 @@ func issueAgentRESTTestToken(
 			Scopes:       append([]string(nil), models.SupportedAgentScopes...),
 			Active:       true,
 		},
+		"TEST",
 		scopes,
 	)
 	if err != nil {
@@ -805,6 +808,8 @@ func assertAgentRESTCommandEvent(
 		t.Fatalf("load REST command event: %v", err)
 	}
 	if event.CorrelationID != correlationID ||
+		event.OrganizationID != fixture.organization.ID ||
+		event.ProjectID != fixture.project.ID ||
 		event.ActorType != models.ActorTypeServicePrincipal ||
 		event.ActorID != fixture.principal.ID {
 		t.Fatalf("REST command event lost provenance: %+v", event)

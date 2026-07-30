@@ -50,7 +50,14 @@ type TicketType =
   | 'complaint'
   | 'consultation'
 
-type TicketSource = 'web' | 'email' | 'phone' | 'chat' | 'api' | 'mobile'
+type TicketSource = 'web' | 'email' | 'phone' | 'chat' | 'api' | 'mobile' | 'agent'
+
+export type ActorType = 'human' | 'service_principal' | 'system'
+
+export interface ActorRef {
+  type: ActorType
+  id: string
+}
 
 interface Category {
   id: number
@@ -93,6 +100,8 @@ export interface Ticket {
   created_by?: User
   assigned_to_id?: number | null
   assigned_to?: User
+  created_by_actor?: ActorRef
+  assigned_to_actor?: ActorRef | null
   category_id?: number | null
   category?: Category
   subcategory_id?: number | null
@@ -121,6 +130,8 @@ export interface CreateTicketRequest {
   description: string
   type: TicketType
   priority: TicketPriority
+  request_type_version_id: string
+  workflow_version_id?: string
   source?: TicketSource
   assigned_to_id?: number
   category_id?: number
@@ -130,6 +141,9 @@ export interface CreateTicketRequest {
   customer_email?: string
   customer_phone?: string
   customer_name?: string
+  internal_notes?: string
+  rating?: number
+  rating_comment?: string
   custom_fields?: Record<string, unknown>
 }
 
@@ -148,6 +162,9 @@ export interface UpdateTicketRequest {
   customer_email?: string
   customer_phone?: string
   customer_name?: string
+  internal_notes?: string
+  rating?: number
+  rating_comment?: string
   custom_fields?: Record<string, unknown>
 }
 

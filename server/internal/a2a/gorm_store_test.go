@@ -53,7 +53,7 @@ func TestGormStorePersistsTaskGraphAndReplayLog(t *testing.T) {
 
 	ticketID := uint(42)
 	text := "work ticket"
-	task, err := service.SendMessage(context.Background(), SendMessageParams{
+	task, err := service.SendMessage(a2aTestContext(t), SendMessageParams{
 		Message: Message{
 			MessageID: "message-gorm",
 			Role:      RoleUser,
@@ -71,7 +71,7 @@ func TestGormStorePersistsTaskGraphAndReplayLog(t *testing.T) {
 	}
 
 	reloadedStore := NewGormStoreWithProtector(db, nil)
-	reloaded, err := reloadedStore.GetTask(context.Background(), task.ID)
+	reloaded, err := reloadedStore.GetTask(a2aTestContext(t), task.ID)
 	if err != nil {
 		t.Fatalf("reload task: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestGormStorePersistsTaskGraphAndReplayLog(t *testing.T) {
 		TaskStateCompleted,
 	)
 
-	events, err := reloadedStore.EventsAfter(context.Background(), task.ID, "", 100)
+	events, err := reloadedStore.EventsAfter(a2aTestContext(t), task.ID, "", 100)
 	if err != nil {
 		t.Fatalf("load replay events: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestGormStorePersistsTaskGraphAndReplayLog(t *testing.T) {
 			)
 		}
 	}
-	replayed, err := reloadedStore.EventsAfter(context.Background(), task.ID, events[1].Cursor, 100)
+	replayed, err := reloadedStore.EventsAfter(a2aTestContext(t), task.ID, events[1].Cursor, 100)
 	if err != nil {
 		t.Fatalf("resume replay: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestGormExecutionClaimIsExclusiveAcrossServicesAndRenews(t *testing.T) {
 		},
 		Configuration: SendMessageConfiguration{ReturnImmediately: true},
 	}
-	first, err := serviceOne.SendMessage(context.Background(), params)
+	first, err := serviceOne.SendMessage(a2aTestContext(t), params)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestGormExecutionClaimIsExclusiveAcrossServicesAndRenews(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("first service did not start backend")
 	}
-	working, err := storeOne.GetTask(context.Background(), first.ID)
+	working, err := storeOne.GetTask(a2aTestContext(t), first.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +189,7 @@ func TestGormExecutionClaimIsExclusiveAcrossServicesAndRenews(t *testing.T) {
 	// service from acquiring and restarting the same durable execution.
 	for i := 0; i < 4; i++ {
 		time.Sleep(35 * time.Millisecond)
-		if _, err := serviceTwo.SendMessage(context.Background(), params); err != nil {
+		if _, err := serviceTwo.SendMessage(a2aTestContext(t), params); err != nil {
 			t.Fatalf("service two retry %d: %v", i, err)
 		}
 	}
@@ -199,7 +199,7 @@ func TestGormExecutionClaimIsExclusiveAcrossServicesAndRenews(t *testing.T) {
 	if got := cancellations.Load(); got != 0 {
 		t.Fatalf("healthy renewed execution canceled %d times", got)
 	}
-	stillWorking, err := storeOne.GetTask(context.Background(), first.ID)
+	stillWorking, err := storeOne.GetTask(a2aTestContext(t), first.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestGormExecutionClaimIsExclusiveAcrossServicesAndRenews(t *testing.T) {
 	close(release)
 	deadline := time.Now().Add(time.Second)
 	for {
-		task, getErr := storeOne.GetTask(context.Background(), first.ID)
+		task, getErr := storeOne.GetTask(a2aTestContext(t), first.ID)
 		if getErr != nil {
 			t.Fatal(getErr)
 		}
@@ -236,7 +236,7 @@ func TestGormExecutionClaimIsExclusiveAcrossServicesAndRenews(t *testing.T) {
 	changedText := "mutated cross-service command"
 	mismatched := params
 	mismatched.Message.Parts = []Part{{Text: &changedText}}
-	if _, err := serviceTwo.SendMessage(context.Background(), mismatched); !errors.Is(err, ErrTaskConflict) {
+	if _, err := serviceTwo.SendMessage(a2aTestContext(t), mismatched); !errors.Is(err, ErrTaskConflict) {
 		t.Fatalf("cross-service payload mismatch error=%v, want ErrTaskConflict", err)
 	}
 	if got := executions.Load(); got != 1 {
@@ -272,13 +272,13 @@ func TestGormExpiredExecutionClaimCanRecoverAfterCrash(t *testing.T) {
 		Role:      RoleUser,
 		Parts:     []Part{{Text: &text}},
 	}}
-	task, replayed, err := service.StartMessageOnce(context.Background(), params)
+	task, replayed, err := service.StartMessageOnce(a2aTestContext(t), params)
 	if err != nil || replayed {
 		t.Fatalf("start replayed=%v err=%v", replayed, err)
 	}
 	now := time.Now().UTC()
 	if err := store.ClaimTaskExecution(
-		context.Background(),
+		a2aTestContext(t),
 		task.ID,
 		params.Message.MessageID,
 		task.Version,
@@ -288,7 +288,7 @@ func TestGormExpiredExecutionClaimCanRecoverAfterCrash(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	working, err := store.GetTask(context.Background(), task.ID)
+	working, err := store.GetTask(a2aTestContext(t), task.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func TestGormExpiredExecutionClaimCanRecoverAfterCrash(t *testing.T) {
 	working.LastModified = working.Status.Timestamp
 	if err := store.UpdateTask(
 		withTaskExecutionClaim(
-			context.Background(),
+			a2aTestContext(t),
 			task.ID,
 			params.Message.MessageID,
 			"crashed-process-claim",
@@ -307,7 +307,7 @@ func TestGormExpiredExecutionClaimCanRecoverAfterCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(40 * time.Millisecond)
-	recovered, err := service.SendMessage(context.Background(), params)
+	recovered, err := service.SendMessage(a2aTestContext(t), params)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,11 +362,11 @@ func TestExpiredExecutionClaimCannotFenceTaskMutation(t *testing.T) {
 				StatusHistory: []TaskStatus{{State: TaskStateSubmitted, Timestamp: now}},
 				CreatedAt:     now, LastModified: now, Version: 1,
 			}
-			if err := store.CreateTask(context.Background(), task); err != nil {
+			if err := store.CreateTask(a2aTestContext(t), task); err != nil {
 				t.Fatal(err)
 			}
 			if err := store.ClaimTaskExecution(
-				context.Background(),
+				a2aTestContext(t),
 				task.ID,
 				"expired-fence-message",
 				task.Version,
@@ -379,7 +379,7 @@ func TestExpiredExecutionClaimCannotFenceTaskMutation(t *testing.T) {
 			if test.databaseClock {
 				time.Sleep(100 * time.Millisecond)
 			}
-			claimed, err := store.GetTask(context.Background(), task.ID)
+			claimed, err := store.GetTask(a2aTestContext(t), task.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -389,7 +389,7 @@ func TestExpiredExecutionClaimCannotFenceTaskMutation(t *testing.T) {
 			claimed.StatusHistory = append(claimed.StatusHistory, claimed.Status)
 			claimed.LastModified = claimed.Status.Timestamp
 			expiredContext := withTaskExecutionClaimAt(
-				context.Background(),
+				a2aTestContext(t),
 				task.ID,
 				"expired-fence-message",
 				"expired-fence-claim",
@@ -398,7 +398,7 @@ func TestExpiredExecutionClaimCannotFenceTaskMutation(t *testing.T) {
 			if err := store.UpdateTask(expiredContext, claimed); !errors.Is(err, ErrTaskBusy) {
 				t.Fatalf("expired claim update error=%v, want ErrTaskBusy", err)
 			}
-			reloaded, err := store.GetTask(context.Background(), task.ID)
+			reloaded, err := store.GetTask(a2aTestContext(t), task.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -442,11 +442,11 @@ func TestGormExecutionClaimUsesDatabaseClockForFencing(t *testing.T) {
 		}},
 		CreatedAt: serviceNow, LastModified: serviceNow, Version: 1,
 	}
-	if err := store.CreateTask(context.Background(), task); err != nil {
+	if err := store.CreateTask(a2aTestContext(t), task); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.ClaimTaskExecution(
-		context.Background(),
+		a2aTestContext(t),
 		task.ID,
 		"database-clock-message",
 		task.Version,
@@ -456,7 +456,7 @@ func TestGormExecutionClaimUsesDatabaseClockForFencing(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	claimed, err := store.GetTask(context.Background(), task.ID)
+	claimed, err := store.GetTask(a2aTestContext(t), task.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,7 +468,7 @@ func TestGormExecutionClaimUsesDatabaseClockForFencing(t *testing.T) {
 	// Gorm must ignore the injected checked-at value and fence against the
 	// database's current time.
 	ctx := withTaskExecutionClaimAt(
-		context.Background(),
+		a2aTestContext(t),
 		task.ID,
 		"database-clock-message",
 		"database-clock-claim",
@@ -515,7 +515,7 @@ func TestGormCancellationStopsRemoteExecutionRenewal(t *testing.T) {
 	serviceOne := NewService(storeOne, backend, options)
 	serviceTwo := NewService(storeTwo, backend, options)
 	text := "cancel remote durable execution"
-	task, err := serviceOne.SendMessage(context.Background(), SendMessageParams{
+	task, err := serviceOne.SendMessage(a2aTestContext(t), SendMessageParams{
 		Message: Message{
 			MessageID: "remote-cancel-message",
 			Role:      RoleUser,
@@ -531,7 +531,7 @@ func TestGormCancellationStopsRemoteExecutionRenewal(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("backend did not start")
 	}
-	canceledTask, err := serviceTwo.CancelTask(context.Background(), task.ID)
+	canceledTask, err := serviceTwo.CancelTask(a2aTestContext(t), task.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,7 +545,7 @@ func TestGormCancellationStopsRemoteExecutionRenewal(t *testing.T) {
 	}
 	deadline := time.Now().Add(time.Second)
 	for {
-		reloaded, getErr := storeOne.GetTask(context.Background(), task.ID)
+		reloaded, getErr := storeOne.GetTask(a2aTestContext(t), task.ID)
 		if getErr != nil {
 			t.Fatal(getErr)
 		}
@@ -619,7 +619,7 @@ func TestGormPushEventsCarryCommittedTaskResourceVersion(t *testing.T) {
 		},
 	}, ServiceOptions{PushDispatcher: dispatcher})
 	text := "version every event"
-	task, err := service.SendMessage(context.Background(), SendMessageParams{
+	task, err := service.SendMessage(a2aTestContext(t), SendMessageParams{
 		Message: Message{
 			MessageID: "resource-version-message",
 			Role:      RoleUser,
@@ -653,7 +653,7 @@ func TestPushConfigurationRequiresDispatcher(t *testing.T) {
 	store := NewMemoryStore()
 	service := NewService(store, BackendFuncs{}, ServiceOptions{})
 	text := "push requires dispatcher"
-	_, _, err := service.StartMessageOnce(context.Background(), SendMessageParams{
+	_, _, err := service.StartMessageOnce(a2aTestContext(t), SendMessageParams{
 		Message: Message{
 			MessageID: "missing-push-dispatcher",
 			Role:      RoleUser,
@@ -668,7 +668,7 @@ func TestPushConfigurationRequiresDispatcher(t *testing.T) {
 	if !errors.Is(err, ErrPushUnavailable) {
 		t.Fatalf("push without dispatcher error=%v", err)
 	}
-	list, listErr := service.ListTasks(context.Background(), ListTasksParams{PageSize: 10})
+	list, listErr := service.ListTasks(a2aTestContext(t), ListTasksParams{PageSize: 10})
 	if listErr != nil {
 		t.Fatal(listErr)
 	}
@@ -683,25 +683,25 @@ func TestPushConfigurationRequiresDispatcher(t *testing.T) {
 		StatusHistory: []TaskStatus{{State: TaskStateSubmitted, Timestamp: now}},
 		CreatedAt:     now, LastModified: now, Version: 1,
 	}
-	if err := store.CreateTask(context.Background(), task); err != nil {
+	if err := store.CreateTask(a2aTestContext(t), task); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.CreatePushConfig(context.Background(), PushNotificationConfig{
+	if _, err := service.CreatePushConfig(a2aTestContext(t), PushNotificationConfig{
 		TaskID: task.ID,
 		URL:    "https://hooks.example.com/a2a",
 	}); !errors.Is(err, ErrPushUnavailable) {
 		t.Fatalf("CreatePushConfig without dispatcher error=%v", err)
 	}
-	if err := store.CreatePushConfig(context.Background(), PushNotificationConfig{
+	if err := store.CreatePushConfig(a2aTestContext(t), PushNotificationConfig{
 		ID: "preconfigured-push", TaskID: task.ID,
 		URL: "https://hooks.example.com/a2a", CreatedAt: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.CancelTask(context.Background(), task.ID); !errors.Is(err, ErrPushUnavailable) {
+	if _, err := service.CancelTask(a2aTestContext(t), task.ID); !errors.Is(err, ErrPushUnavailable) {
 		t.Fatalf("mutation with stored push and no dispatcher error=%v", err)
 	}
-	reloaded, err := store.GetTask(context.Background(), task.ID)
+	reloaded, err := store.GetTask(a2aTestContext(t), task.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -749,7 +749,7 @@ func TestGormTaskMutationRollsBackWithEventAndPushFailure(t *testing.T) {
 		PushDispatcher: failingTransactionalPushDispatcher{},
 	})
 	text := "atomic task creation"
-	_, _, err = service.StartMessageOnce(context.Background(), SendMessageParams{
+	_, _, err = service.StartMessageOnce(a2aTestContext(t), SendMessageParams{
 		Message: Message{
 			MessageID: "atomic-create-message",
 			Role:      RoleUser,
@@ -764,7 +764,7 @@ func TestGormTaskMutationRollsBackWithEventAndPushFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected transactional push failure")
 	}
-	list, err := store.ListTasks(context.Background(), ListTasksParams{PageSize: 10})
+	list, err := store.ListTasks(a2aTestContext(t), ListTasksParams{PageSize: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -789,21 +789,21 @@ func TestGormTaskMutationRollsBackWithEventAndPushFailure(t *testing.T) {
 		CreatedAt: now, LastModified: now, Version: 1,
 	}
 	task.StatusHistory = []TaskStatus{task.Status}
-	if err := store.CreateTask(context.Background(), task); err != nil {
+	if err := store.CreateTask(a2aTestContext(t), task); err != nil {
 		t.Fatal(err)
 	}
 	config := PushNotificationConfig{
 		ID: "atomic-update-push", TaskID: task.ID,
 		URL: "https://hooks.example.com/a2a", CreatedAt: now,
 	}
-	if err := store.CreatePushConfig(context.Background(), config); err != nil {
+	if err := store.CreatePushConfig(a2aTestContext(t), config); err != nil {
 		t.Fatal(err)
 	}
 	task.Status = TaskStatus{State: TaskStateWorking, Timestamp: now.Add(time.Second)}
 	task.StatusHistory = append(task.StatusHistory, task.Status)
 	task.LastModified = now.Add(time.Second)
 	_, err = store.UpdateTaskWithEvent(
-		context.Background(),
+		a2aTestContext(t),
 		task,
 		StoredEvent{
 			TaskID: task.ID, ContextID: task.ContextID,
@@ -818,14 +818,14 @@ func TestGormTaskMutationRollsBackWithEventAndPushFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected transactional update push failure")
 	}
-	reloaded, err := store.GetTask(context.Background(), task.ID)
+	reloaded, err := store.GetTask(a2aTestContext(t), task.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if reloaded.Status.State != TaskStateSubmitted || reloaded.Version != 1 {
 		t.Fatalf("Task mutation escaped rollback: state=%s version=%d", reloaded.Status.State, reloaded.Version)
 	}
-	events, err := store.EventsAfter(context.Background(), task.ID, "", 10)
+	events, err := store.EventsAfter(a2aTestContext(t), task.ID, "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}

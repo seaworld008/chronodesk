@@ -34,20 +34,20 @@ identifier 误判为错误，其旧 Nimma enum 选择器还会在 3.2 Schema 上
 
 CloudEvent webhook 使用 `webhookHmac` 安全方案，Agent API 使用 OAuth
 最小 scope。MCP `2026-07-28` 和 A2A `1.0` 的协议 Schema 也由同一文档
-约束。OAuth token 按 `/mcp`、`/api/v1`、`/a2a/v1` 三个 RFC 8707
+约束。OAuth token 按 `/mcp`、`/api/v2`、`/a2a/v1` 三个 RFC 8707
 resource 分别签发，跨 audience 请求必须返回 `401`。
 
 ## 管理端并发与幂等契约
 
-`/api/v1/admin` 下每个写操作都必须携带 `Idempotency-Key`。除创建顶层
-服务主体外，还必须携带当前资源版本对应的强 `If-Match: "v<number>"`。
+`/api/projects/{projectKey}/admin/agents` 下每个写操作都必须携带
+`Idempotency-Key`。项目范围只由认证、路径和服务端授权解析，创建服务主体的
+Body 不重复接受 `project_key`。除创建服务主体外，还必须携带当前资源版本
+对应的强 `If-Match: "v<number>"`。
 完全相同的幂等重试返回首次响应的状态、正文、ETag 和相关缓存头，不会
 重复产生业务副作用或领域事件。
 
 | 写操作 | `If-Match` 来源 | 成功响应版本 |
 | --- | --- | --- |
-| 全局只读开关 | Overview `global_read_only_version` | `ETag` |
-| 全局紧急停止 | Overview `emergency_stop_version` | `ETag` |
 | 创建服务主体 | 不需要，新建顶层资源 | 新主体 `ETag` |
 | 主体状态、凭据轮换、凭据撤销 | Overview `principals[].resource_version` | 主体 `ETag` |
 | 创建策略 | Overview `principals[].resource_version` | 策略 `ETag`；父主体 `X-Parent-ETag` |
@@ -58,8 +58,9 @@ resource 分别签发，跨 audience 请求必须返回 `401`。
 
 管理 Overview、策略列表、主体控制响应和强制释放租约响应均使用封闭
 Schema，不允许以 `additionalProperties: true` 逃避字段契约。每个可变
-Overview 资源及每条策略都显式声明 `resource_version`；全局控制使用独立
-版本字段。策略条件是唯一允许扩展的管理数据，但其值通过递归 JSON value
+Overview 资源及每条策略都显式声明 `resource_version`。平台级全局只读与
+紧急停止只在项目 Overview 中展示，不提供项目级写接口；平台资源不能伪装成
+项目事件。策略条件是唯一允许扩展的管理数据，但其值通过递归 JSON value
 Schema 约束，而不是无类型开放对象。
 
 所有管理写操作声明 `400`、`401`、`403`、`409`、`413`、`500`、`503`；

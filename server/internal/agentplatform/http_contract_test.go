@@ -41,19 +41,19 @@ func TestETagRoundTrip(t *testing.T) {
 
 func TestCommandFingerprintBindsResourceVersionAndLease(t *testing.T) {
 	body := []byte(`{"priority":"high"}`)
-	baseline := commandFingerprint(http.MethodPatch, "/api/v1/tickets/1", 7, "lease-1", body)
+	baseline := commandFingerprint(http.MethodPatch, "/api/v2/projects/TEST/tickets/1", 7, "lease-1", body)
 	if !bytes.Equal(
 		baseline,
-		commandFingerprint(http.MethodPatch, "/api/v1/tickets/1", 7, "lease-1", body),
+		commandFingerprint(http.MethodPatch, "/api/v2/projects/TEST/tickets/1", 7, "lease-1", body),
 	) {
 		t.Fatal("equivalent commands must have a stable fingerprint")
 	}
 	for name, candidate := range map[string][]byte{
-		"resource": commandFingerprint(http.MethodPatch, "/api/v1/tickets/2", 7, "lease-1", body),
-		"version":  commandFingerprint(http.MethodPatch, "/api/v1/tickets/1", 8, "lease-1", body),
-		"lease":    commandFingerprint(http.MethodPatch, "/api/v1/tickets/1", 7, "lease-2", body),
-		"method":   commandFingerprint(http.MethodPost, "/api/v1/tickets/1", 7, "lease-1", body),
-		"body":     commandFingerprint(http.MethodPatch, "/api/v1/tickets/1", 7, "lease-1", []byte(`{"priority":"urgent"}`)),
+		"resource": commandFingerprint(http.MethodPatch, "/api/v2/projects/TEST/tickets/2", 7, "lease-1", body),
+		"version":  commandFingerprint(http.MethodPatch, "/api/v2/projects/TEST/tickets/1", 8, "lease-1", body),
+		"lease":    commandFingerprint(http.MethodPatch, "/api/v2/projects/TEST/tickets/1", 7, "lease-2", body),
+		"method":   commandFingerprint(http.MethodPost, "/api/v2/projects/TEST/tickets/1", 7, "lease-1", body),
+		"body":     commandFingerprint(http.MethodPatch, "/api/v2/projects/TEST/tickets/1", 7, "lease-1", []byte(`{"priority":"urgent"}`)),
 	} {
 		if bytes.Equal(baseline, candidate) {
 			t.Fatalf("%s was not bound into the command fingerprint", name)

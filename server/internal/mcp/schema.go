@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const jsonSchema202012 = "https://json-schema.org/draft/2020-12/schema"
@@ -154,9 +156,19 @@ func validateSchema(value any, definition schema, path string) error {
 				return fmt.Errorf("%s has an invalid format", path)
 			}
 		}
-		if format, ok := definition["format"].(string); ok && format == "date-time" {
-			if _, err := time.Parse(time.RFC3339, typed); err != nil {
-				return fmt.Errorf("%s must be an RFC 3339 timestamp", path)
+		if format, ok := definition["format"].(string); ok {
+			switch format {
+			case "date-time":
+				if _, err := time.Parse(time.RFC3339, typed); err != nil {
+					return fmt.Errorf("%s must be an RFC 3339 timestamp", path)
+				}
+			case "uuid":
+				parsed, err := uuid.Parse(typed)
+				if err != nil ||
+					len(typed) != len(parsed.String()) ||
+					!strings.EqualFold(typed, parsed.String()) {
+					return fmt.Errorf("%s must be a canonical UUID", path)
+				}
 			}
 		}
 	case float64:

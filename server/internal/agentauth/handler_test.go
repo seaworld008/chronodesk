@@ -17,7 +17,7 @@ import (
 const (
 	testIssuer      = "https://auth.example"
 	testMCPResource = "https://api.example/mcp"
-	testAPIResource = "https://api.example/api/v1"
+	testAPIResource = "https://api.example/api/v2"
 	testA2AResource = "https://api.example/a2a/v1"
 )
 
@@ -25,10 +25,16 @@ type testCredentialStore struct {
 	principal *Principal
 	err       error
 	authCalls int
+	projects  []string
 }
 
-func (s *testCredentialStore) AuthenticateClient(context.Context, string, string) (*Principal, error) {
+func (s *testCredentialStore) AuthenticateClient(
+	_ context.Context,
+	_, _ string,
+	projectKey string,
+) (*Principal, error) {
 	s.authCalls++
+	s.projects = append(s.projects, projectKey)
 	return s.principal, s.err
 }
 
@@ -83,7 +89,7 @@ func TestDiscoveryMetadataUsesThreeCanonicalResourcesAndLatestFields(t *testing.
 		name     string
 	}{
 		{path: "/.well-known/oauth-protected-resource/mcp", resource: testMCPResource, name: "ChronoDesk MCP"},
-		{path: "/.well-known/oauth-protected-resource/api/v1", resource: testAPIResource, name: "ChronoDesk Agent REST API"},
+		{path: "/.well-known/oauth-protected-resource/api/v2", resource: testAPIResource, name: "ChronoDesk Agent REST API"},
 		{path: "/.well-known/oauth-protected-resource/a2a/v1", resource: testA2AResource, name: "ChronoDesk A2A"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -140,6 +146,9 @@ func TestDiscoveryMetadataUsesThreeCanonicalResourcesAndLatestFields(t *testing.
 	if got, exists := authorizationMetadata["authorization_response_iss_parameter_supported"]; !exists || got != false {
 		t.Fatalf("authorization_response_iss_parameter_supported = %#v, exists = %v", got, exists)
 	}
+	if got, exists := authorizationMetadata["project_key_parameter_supported"]; !exists || got != true {
+		t.Fatalf("project_key_parameter_supported = %#v, exists = %v", got, exists)
+	}
 }
 
 func TestTokenRequiresExactRFC8707Resource(t *testing.T) {
@@ -156,9 +165,10 @@ func TestTokenRequiresExactRFC8707Resource(t *testing.T) {
 	for _, resource := range []string{testMCPResource, testAPIResource, testA2AResource} {
 		t.Run(resource, func(t *testing.T) {
 			form := url.Values{
-				"grant_type": {"client_credentials"},
-				"scope":      {"tickets:read"},
-				"resource":   {resource},
+				"grant_type":  {"client_credentials"},
+				"project_key": {"TEST"},
+				"scope":       {"tickets:read"},
+				"resource":    {resource},
 			}
 			request := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
 			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -181,12 +191,19 @@ func TestTokenRequiresExactRFC8707Resource(t *testing.T) {
 			if got := payload["resource"]; got != resource {
 				t.Fatalf("resource = %#v, want %q", got, resource)
 			}
+			if got := payload["project_key"]; got != "TEST" {
+				t.Fatalf("project_key = %#v, want TEST", got)
+			}
 			token, _ := payload["access_token"].(string)
 			if token == "" {
 				t.Fatal("access_token is empty")
 			}
-			if _, err := managers[resource].Verify(token); err != nil {
+			access, err := managers[resource].Verify(token)
+			if err != nil {
 				t.Fatalf("issued token failed verification: %v", err)
+			}
+			if access.ProjectKey != "TEST" {
+				t.Fatalf("verified project_key = %q, want TEST", access.ProjectKey)
 			}
 		})
 	}
@@ -196,13 +213,14 @@ func TestTokenRequiresExactRFC8707Resource(t *testing.T) {
 		resources []string
 	}{
 		{name: "missing"},
-		{name: "unknown endpoint", resources: []string{"https://api.example/api/v2"}},
+		{name: "unknown endpoint", resources: []string{"https://api.example/api/v3"}},
 		{name: "trailing slash differs", resources: []string{testMCPResource + "/"}},
 		{name: "multiple targets", resources: []string{testMCPResource, "https://api.example/other"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			values := url.Values{
-				"grant_type": {"client_credentials"},
+				"grant_type":  {"client_credentials"},
+				"project_key": {"TEST"},
 			}
 			for _, resource := range test.resources {
 				values.Add("resource", resource)
@@ -217,6 +235,56 @@ func TestTokenRequiresExactRFC8707Resource(t *testing.T) {
 	}
 	if store.authCalls != 3 {
 		t.Fatalf("AuthenticateClient calls = %d, want 3; invalid resources must fail before authentication", store.authCalls)
+	}
+	for _, projectKey := range store.projects {
+		if projectKey != "TEST" {
+			t.Fatalf("AuthenticateClient project_key = %q, want TEST", projectKey)
+		}
+	}
+}
+
+func TestTokenRequiresExactlyOneProjectKeyBeforeAuthentication(t *testing.T) {
+	store := &testCredentialStore{principal: &Principal{
+		ID: "principal-1", CredentialID: "credential-1", ClientID: "client-1",
+		Name: "agent", Scopes: []string{"tickets:read"}, Active: true,
+	}}
+	router, _ := newOAuthTestRouter(store)
+
+	tests := []struct {
+		name        string
+		projectKeys []string
+	}{
+		{name: "missing"},
+		{name: "empty", projectKeys: []string{""}},
+		{name: "duplicate", projectKeys: []string{"TEST", "OTHER"}},
+		{name: "invalid", projectKeys: []string{"lowercase"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			form := url.Values{
+				"grant_type": {"client_credentials"},
+				"resource":   {testMCPResource},
+			}
+			for _, projectKey := range test.projectKeys {
+				form.Add("project_key", projectKey)
+			}
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/oauth/token",
+				strings.NewReader(form.Encode()),
+			)
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			request.SetBasicAuth("client-1", "secret")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			assertOAuthError(t, response, http.StatusBadRequest, "invalid_request")
+		})
+	}
+	if store.authCalls != 0 {
+		t.Fatalf(
+			"AuthenticateClient calls = %d, want 0 for invalid project_key requests",
+			store.authCalls,
+		)
 	}
 }
 
@@ -238,6 +306,7 @@ func TestTokenRejectsLegacyJSONAndMultipleClientAuthMethods(t *testing.T) {
 		"grant_type":    {"client_credentials"},
 		"client_id":     {"client-1"},
 		"client_secret": {"secret"},
+		"project_key":   {"TEST"},
 		"resource":      {testMCPResource},
 	}
 	duplicateRequest := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
@@ -256,8 +325,9 @@ func TestTokenInvalidClientChallengeAndErrorCacheHeaders(t *testing.T) {
 	store := &testCredentialStore{err: errors.New("not found")}
 	router, _ := newOAuthTestRouter(store)
 	form := url.Values{
-		"grant_type": {"client_credentials"},
-		"resource":   {testMCPResource},
+		"grant_type":  {"client_credentials"},
+		"project_key": {"TEST"},
+		"resource":    {testMCPResource},
 	}
 	request := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -305,8 +375,9 @@ func TestTokenEndpointHasIndependentAnonymousRateLimit(t *testing.T) {
 	)
 	for attempt := 1; attempt <= 3; attempt++ {
 		form := url.Values{
-			"grant_type": {"client_credentials"},
-			"resource":   {testMCPResource},
+			"grant_type":  {"client_credentials"},
+			"project_key": {"TEST"},
+			"resource":    {testMCPResource},
 		}
 		request := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
 		request.RemoteAddr = "192.0.2.10:43210"

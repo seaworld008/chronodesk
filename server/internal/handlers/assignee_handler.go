@@ -27,6 +27,11 @@ type assigneeResponse struct {
 	Role        string `json:"role"`
 }
 
+type assignableUser struct {
+	models.User
+	ProjectRole models.ProjectRole `gorm:"column:project_role"`
+}
+
 type assigneeFilter struct {
 	IDs    []uint `json:"ids"`
 	Q      string `json:"q"`
@@ -38,7 +43,7 @@ func NewAssigneeHandler(db *gorm.DB) *AssigneeHandler {
 }
 
 func (h *AssigneeHandler) List(c *gin.Context) {
-	if !canAssignTickets(c.GetString("user_role")) {
+	if !canAssignTickets(normalizedProjectRole(c)) {
 		c.JSON(http.StatusOK, gin.H{
 			"code": 0,
 			"data": gin.H{"items": []assigneeResponse{}, "total": 0},
@@ -54,7 +59,14 @@ func (h *AssigneeHandler) List(c *gin.Context) {
 		}
 	}
 
-	query := h.assignableQuery(c)
+	query, ok := h.assignableQuery(c)
+	if !ok {
+		c.JSON(http.StatusForbidden, gin.H{
+			"code": 1,
+			"msg":  "缺少可信项目范围",
+		})
+		return
+	}
 	if len(filter.IDs) > 0 {
 		query = query.Where("id IN ?", filter.IDs)
 	}
@@ -86,7 +98,7 @@ func (h *AssigneeHandler) List(c *gin.Context) {
 
 	page := parsePositiveInt(c.Query("page"), 1, 1_000_000)
 	pageSize := parsePositiveInt(c.Query("page_size"), 25, 100)
-	var users []models.User
+	var users []assignableUser
 	if err := query.
 		Order("username ASC, id ASC").
 		Limit(pageSize).
@@ -109,7 +121,7 @@ func (h *AssigneeHandler) List(c *gin.Context) {
 }
 
 func (h *AssigneeHandler) Get(c *gin.Context) {
-	if !canAssignTickets(c.GetString("user_role")) {
+	if !canAssignTickets(normalizedProjectRole(c)) {
 		c.JSON(http.StatusNotFound, gin.H{"code": 1, "msg": "未找到可分配的处理人"})
 		return
 	}
@@ -119,8 +131,13 @@ func (h *AssigneeHandler) Get(c *gin.Context) {
 		return
 	}
 
-	var user models.User
-	if err := h.assignableQuery(c).First(&user, id).Error; err != nil {
+	query, ok := h.assignableQuery(c)
+	if !ok {
+		c.JSON(http.StatusForbidden, gin.H{"code": 1, "msg": "缺少可信项目范围"})
+		return
+	}
+	var user assignableUser
+	if err := query.Where("users.id = ?", id).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"code": 1, "msg": "未找到可分配的处理人"})
 			return
@@ -132,33 +149,45 @@ func (h *AssigneeHandler) Get(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": assigneeDTO(&user)})
 }
 
-func (h *AssigneeHandler) assignableQuery(c *gin.Context) *gorm.DB {
+func (h *AssigneeHandler) assignableQuery(
+	c *gin.Context,
+) (*gorm.DB, bool) {
+	access, ok := ProjectAccessFromGin(c)
+	if !ok {
+		return nil, false
+	}
 	return h.db.WithContext(c.Request.Context()).
 		Model(&models.User{}).
-		Where("status = ?", models.UserStatusActive).
-		Where("role IN ?", []models.UserRole{
-			models.RoleAgent,
-			models.RoleSupervisor,
-			models.RoleAdmin,
-		})
+		Select("users.*, project_memberships.role AS project_role").
+		Joins(
+			"JOIN project_memberships ON project_memberships.user_id = users.id AND project_memberships.project_id = ? AND project_memberships.is_active = ?",
+			access.Scope.ProjectID,
+			true,
+		).
+		Where("users.status = ?", models.UserStatusActive).
+		Where("project_memberships.role IN ?", []models.ProjectRole{
+			models.ProjectRoleAgent,
+			models.ProjectRoleManager,
+			models.ProjectRoleAdmin,
+		}), true
 }
 
-func assigneeDTO(user *models.User) assigneeResponse {
+func assigneeDTO(user *assignableUser) assigneeResponse {
 	return assigneeResponse{
 		ID:          user.ID,
 		Username:    user.Username,
 		FirstName:   user.FirstName,
 		LastName:    user.LastName,
 		DisplayName: user.DisplayName,
-		Role:        string(user.Role),
+		Role:        string(user.ProjectRole),
 	}
 }
 
 func canAssignTickets(role string) bool {
 	switch strings.ToLower(strings.TrimSpace(role)) {
-	case string(models.RoleAgent),
-		string(models.RoleSupervisor),
-		string(models.RoleAdmin):
+	case string(models.ProjectRoleAgent),
+		string(models.ProjectRoleManager),
+		string(models.ProjectRoleAdmin):
 		return true
 	default:
 		return false

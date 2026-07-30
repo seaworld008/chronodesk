@@ -2,7 +2,6 @@ package a2a
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -42,7 +41,7 @@ func TestGormPushCredentialsEncryptedAcrossRestart(t *testing.T) {
 		StatusHistory: []TaskStatus{{State: TaskStateSubmitted, Timestamp: now}},
 		CreatedAt:     now, LastModified: now, Version: 1,
 	}
-	if err := store.CreateTask(context.Background(), task); err != nil {
+	if err := store.CreateTask(a2aTestContext(t), task); err != nil {
 		t.Fatal(err)
 	}
 	want := PushNotificationConfig{
@@ -53,7 +52,7 @@ func TestGormPushCredentialsEncryptedAcrossRestart(t *testing.T) {
 		},
 		CreatedAt: now,
 	}
-	if err := store.CreatePushConfig(context.Background(), want); err != nil {
+	if err := store.CreatePushConfig(a2aTestContext(t), want); err != nil {
 		t.Fatal(err)
 	}
 
@@ -75,7 +74,7 @@ func TestGormPushCredentialsEncryptedAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	restarted := NewGormStoreWithProtector(db, restartedRing)
-	got, err := restarted.GetPushConfig(context.Background(), task.ID, want.ID)
+	got, err := restarted.GetPushConfig(a2aTestContext(t), task.ID, want.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +90,7 @@ func TestGormPushCredentialsEncryptedAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := NewGormStoreWithProtector(db, wrong).
-		GetPushConfig(context.Background(), task.ID, want.ID); !errors.Is(err, security.ErrAuthentication) {
+		GetPushConfig(a2aTestContext(t), task.ID, want.ID); !errors.Is(err, security.ErrAuthentication) {
 		t.Fatalf("wrong key error=%v", err)
 	}
 }
@@ -111,17 +110,21 @@ func TestGormPushStoreRejectsLegacyPlaintext(t *testing.T) {
 		Status:    TaskStatus{State: TaskStateSubmitted, Timestamp: now},
 		CreatedAt: now, LastModified: now, Version: 1,
 	}
-	if err := store.CreateTask(context.Background(), task); err != nil {
+	if err := store.CreateTask(a2aTestContext(t), task); err != nil {
 		t.Fatal(err)
 	}
 	row := models.AgentPushNotificationConfig{
-		ID: "push-legacy-secret", TaskID: task.ID,
-		URL: "https://push.example.test", Token: "plaintext-token",
+		ID:             "push-legacy-secret",
+		OrganizationID: a2aDefaultTestScope.OrganizationID,
+		ProjectID:      a2aDefaultTestScope.ProjectID,
+		TaskID:         task.ID,
+		URL:            "https://push.example.test",
+		Token:          "plaintext-token",
 	}
 	if err := db.Create(&row).Error; err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.GetPushConfig(context.Background(), task.ID, row.ID); !errors.Is(err, security.ErrKeyringUnavailable) &&
+	if _, err := store.GetPushConfig(a2aTestContext(t), task.ID, row.ID); !errors.Is(err, security.ErrKeyringUnavailable) &&
 		!errors.Is(err, security.ErrPlaintextSecret) {
 		t.Fatalf("legacy plaintext error=%v", err)
 	}

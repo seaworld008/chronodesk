@@ -39,14 +39,17 @@ func TestGetNotificationsPreservesRecipientAndReadFilters(t *testing.T) {
 		{
 			Type: models.NotificationTypeSystemAlert, Title: "本人未读",
 			Content: "owner unread", RecipientID: firstUser.ID, IsRead: false,
+			OrganizationID: 1, ProjectID: 1,
 		},
 		{
 			Type: models.NotificationTypeSystemAlert, Title: "本人已读",
 			Content: "owner read", RecipientID: firstUser.ID, IsRead: true,
+			OrganizationID: 1, ProjectID: 1,
 		},
 		{
 			Type: models.NotificationTypeSystemAlert, Title: "他人未读",
 			Content: "other unread", RecipientID: secondUser.ID, IsRead: false,
+			OrganizationID: 1, ProjectID: 1,
 		},
 	}
 	for index := range notifications {
@@ -57,8 +60,13 @@ func TestGetNotificationsPreservesRecipientAndReadFilters(t *testing.T) {
 
 	unread := false
 	service := NewNotificationServiceWithProtector(db, nil)
+	ctx := notificationTestOperationContext(
+		t,
+		models.ProjectScope{OrganizationID: 1, ProjectID: 1},
+		models.HumanActor(firstUser.ID),
+	)
 	items, total, err := service.GetNotifications(
-		context.Background(),
+		ctx,
 		&models.NotificationFilter{
 			RecipientID: &firstUser.ID,
 			IsRead:      &unread,
@@ -80,7 +88,7 @@ func TestGetNotificationsPreservesRecipientAndReadFilters(t *testing.T) {
 	}
 
 	items, total, err = service.GetNotifications(
-		context.Background(),
+		ctx,
 		&models.NotificationFilter{
 			RecipientID: &firstUser.ID,
 			Limit:       1,

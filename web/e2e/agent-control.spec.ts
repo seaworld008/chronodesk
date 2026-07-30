@@ -11,7 +11,6 @@ import {
 } from './helpers/testData';
 import {
     assertDestructiveE2EAllowed,
-    assertGlobalE2EAllowed,
 } from './helpers/safety';
 import { expectChineseOperations } from './helpers/browserAudit';
 
@@ -38,144 +37,65 @@ test.describe('AI 智能体控制中心', () => {
         await cleanupTrackedAgentPrincipals(request);
     });
 
-    test('AGT-009 UI-020 UI-021：页面完整且全局只读、紧急停止均可安全恢复', async ({
+    test('AGT-009 UI-020 UI-021：页面完整且平台级安全开关只读展示', async ({
         page,
-        request,
     }) => {
-        assertGlobalE2EAllowed('Agent 全局控制 E2E');
-        try {
-            await authenticatePage(page);
-            await page.goto('/#/agent-control');
-            const main = page.getByRole('main');
+        await authenticatePage(page);
+        await page.goto('/#/agent-control');
+        const main = page.getByRole('main');
+        await expect(
+            main.getByRole('heading', {
+                name: 'AI 智能体控制中心',
+                exact: true,
+            }),
+        ).toBeVisible({ timeout: 15_000 });
+
+        for (const helper of [
+            '可签发令牌的服务主体',
+            '正在处理的工单',
+            '最近一页领域事件',
+            '需要关注的事件投递记录',
+        ] as const) {
             await expect(
-                main.getByRole('heading', {
-                    name: 'AI 智能体控制中心',
-                    exact: true,
-                }),
-            ).toBeVisible({ timeout: 15_000 });
-
-            for (const helper of [
-                '可签发令牌的服务主体',
-                '正在处理的工单',
-                '最近一页领域事件',
-                '需要关注的事件投递记录',
-            ] as const) {
-                await expect(
-                    main.getByText(helper, { exact: true }),
-                ).toBeVisible();
-            }
-
-            const tabs = [
-                ['服务主体', '服务主体列表'],
-                ['实时租约', '工单租约列表'],
-                ['领域事件', '领域事件列表'],
-                ['事件投递（Outbox）', '事件投递列表'],
-                ['策略审计', '智能体策略决策审计'],
-            ] as const;
-            for (const [tab, table] of tabs) {
-                await main.getByRole('tab', { name: tab, exact: true }).click();
-                await expect(
-                    main.getByRole('table', { name: table, exact: true }),
-                ).toBeVisible();
-            }
-            await main
-                .getByRole('tab', { name: '服务主体', exact: true })
-                .click();
-
-            const readOnly = main.getByLabel('智能体全局只读模式', {
-                exact: true,
-            });
-            await expect(readOnly).toBeChecked({
-                checked: globalControlsBeforeTest.global_read_only,
-            });
-            const setReadOnly = async (enabled: boolean) => {
-                await readOnly.click();
-                const confirmation = page.getByRole('dialog', {
-                    name: enabled
-                        ? '确认开启全局只读'
-                        : '确认恢复智能体写操作',
-                });
-                if (enabled) {
-                    await expect(confirmation).toContainText(
-                        '所有智能体写操作都会被策略层拒绝',
-                    );
-                }
-                const response = page.waitForResponse(
-                    (candidate) =>
-                        candidate.request().method() === 'PUT' &&
-                        new URL(candidate.url()).pathname ===
-                            '/api/v1/admin/agent-control/read-only',
-                );
-                await confirmation
-                    .getByRole('button', {
-                        name: enabled ? '开启全局只读' : '恢复写操作',
-                    })
-                    .click();
-                expect((await response).status()).toBe(200);
-                await expect(readOnly).toBeChecked({ checked: enabled });
-                await expect(
-                    page.getByText(
-                        enabled
-                            ? '智能体全局只读模式已开启'
-                            : '智能体写操作已恢复',
-                        { exact: true },
-                    ),
-                ).toBeVisible();
-            };
-            await setReadOnly(!globalControlsBeforeTest.global_read_only);
-            await setReadOnly(globalControlsBeforeTest.global_read_only);
-
-            const emergencyStop = main.getByLabel('智能体全局紧急停止', {
-                exact: true,
-            });
-            await expect(emergencyStop).toBeChecked({
-                checked: globalControlsBeforeTest.emergency_stop,
-            });
-            const setEmergencyStop = async (enabled: boolean) => {
-                await emergencyStop.click();
-                const confirmation = page.getByRole('dialog', {
-                    name: enabled
-                        ? '确认全局紧急停止'
-                        : '确认解除全局紧急停止',
-                });
-                if (enabled) {
-                    await expect(confirmation).toContainText(
-                        '所有智能体请求会立即被拒绝',
-                    );
-                }
-                const response = page.waitForResponse(
-                    (candidate) =>
-                        candidate.request().method() === 'PUT' &&
-                        new URL(candidate.url()).pathname ===
-                            '/api/v1/admin/agent-control/emergency-stop',
-                );
-                await confirmation
-                    .getByRole('button', {
-                        name: enabled
-                            ? '立即停止全部智能体'
-                            : '解除紧急停止',
-                    })
-                    .click();
-                expect((await response).status()).toBe(200);
-                await expect(emergencyStop).toBeChecked({ checked: enabled });
-                await expect(
-                    page.getByText(
-                        enabled
-                            ? '智能体全局紧急停止已启用'
-                            : '智能体全局紧急停止已解除',
-                        { exact: true },
-                    ),
-                ).toBeVisible();
-            };
-            await setEmergencyStop(!globalControlsBeforeTest.emergency_stop);
-            await setEmergencyStop(globalControlsBeforeTest.emergency_stop);
-            await expectChineseOperations(page);
-        } finally {
-            await restoreAgentGlobalControls(
-                request,
-                globalControlsBeforeTest,
-            );
+                main.getByText(helper, { exact: true }),
+            ).toBeVisible();
         }
+
+        const tabs = [
+            ['服务主体', '服务主体列表'],
+            ['实时租约', '工单租约列表'],
+            ['领域事件', '领域事件列表'],
+            ['事件投递（Outbox）', '事件投递列表'],
+            ['策略审计', '智能体策略决策审计'],
+        ] as const;
+        for (const [tab, table] of tabs) {
+            await main.getByRole('tab', { name: tab, exact: true }).click();
+            await expect(
+                main.getByRole('table', { name: table, exact: true }),
+            ).toBeVisible();
+        }
+
+        const readOnly = main.getByLabel('智能体全局只读模式', {
+            exact: true,
+        });
+        await expect(readOnly).toBeChecked({
+            checked: globalControlsBeforeTest.global_read_only,
+        });
+        await expect(readOnly).toBeDisabled();
+        const emergencyStop = main.getByLabel('智能体全局紧急停止', {
+            exact: true,
+        });
+        await expect(emergencyStop).toBeChecked({
+            checked: globalControlsBeforeTest.emergency_stop,
+        });
+        await expect(emergencyStop).toBeDisabled();
+        await expect(
+            main.getByText(
+                '全局只读和紧急停止属于平台级安全控制，本项目页面仅展示状态；变更入口已与项目业务操作隔离。',
+                { exact: true },
+            ),
+        ).toBeVisible();
+        await expectChineseOperations(page);
     });
 
     test('AGT-001 AGT-002 AGT-008 UI-020：服务主体、策略、凭据与单体熔断', async ({
@@ -209,8 +129,9 @@ test.describe('AI 智能体控制中心', () => {
         const create = page.waitForResponse(
             (response) =>
                 response.request().method() === 'POST' &&
-                new URL(response.url()).pathname ===
-                    '/api/v1/admin/service-principals',
+                /^\/api\/projects\/[^/]+\/admin\/agents\/service-principals$/.test(
+                    new URL(response.url()).pathname,
+                ),
         );
         await dialog
             .getByRole('button', { name: '创建并签发凭据' })
@@ -263,7 +184,7 @@ test.describe('AI 智能体控制中心', () => {
         let createPolicy = page.waitForResponse(
             (response) =>
                 response.request().method() === 'POST' &&
-                /\/api\/v1\/admin\/service-principals\/[^/]+\/policies$/.test(
+                /\/api\/projects\/[^/]+\/admin\/agents\/service-principals\/[^/]+\/policies$/.test(
                     new URL(response.url()).pathname,
                 ),
         );
@@ -292,7 +213,7 @@ test.describe('AI 智能体控制中心', () => {
         createPolicy = page.waitForResponse(
             (response) =>
                 response.request().method() === 'POST' &&
-                /\/api\/v1\/admin\/service-principals\/[^/]+\/policies$/.test(
+                /\/api\/projects\/[^/]+\/admin\/agents\/service-principals\/[^/]+\/policies$/.test(
                     new URL(response.url()).pathname,
                 ),
         );

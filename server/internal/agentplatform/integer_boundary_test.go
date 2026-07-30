@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
@@ -15,8 +16,21 @@ func TestProtocolIntegerParsersRejectNativeUintOverflow(t *testing.T) {
 		overflow = strconv.FormatUint(uint64(math.MaxUint32)+1, 10)
 	}
 
-	if _, err := parseWebhookConfigDestinationID(webhookConfigPrefix + overflow); err == nil {
-		t.Fatal("parseWebhookConfigDestinationID() accepted native uint overflow")
+	if _, err := parseWebhookSnapshotDestinationID(
+		webhookSnapshotPrefix + overflow,
+	); err == nil {
+		t.Fatal("parseWebhookSnapshotDestinationID() accepted numeric legacy destination")
+	}
+	snapshotID := uuid.Must(uuid.NewV7()).String()
+	if got, err := parseWebhookSnapshotDestinationID(
+		webhookSnapshotPrefix + snapshotID,
+	); err != nil || got != snapshotID {
+		t.Fatalf(
+			"parseWebhookSnapshotDestinationID() = (%q,%v), want %q",
+			got,
+			err,
+			snapshotID,
+		)
 	}
 	if got := ticketIDFromCloudEvent(services.CloudEventEnvelope{
 		Subject: "ticket/" + overflow,

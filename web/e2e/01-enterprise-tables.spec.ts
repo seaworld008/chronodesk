@@ -18,6 +18,7 @@ import {
     extractItems,
     findUserByEmail,
     getAdminToken,
+    projectAPIPath,
     trackE2EResource,
 } from './helpers/testData';
 import { waitForPrimaryPage } from './helpers/browserAudit';
@@ -34,6 +35,7 @@ type TicketFixture = {
     id: number;
     ticketNumber: string;
     version: number;
+    projectKey: string;
 };
 
 type EnterpriseTableCase = {
@@ -50,11 +52,17 @@ type EnterpriseTableCase = {
 };
 
 let adminUserID = 0;
-let ticketFixture: TicketFixture = { id: 0, ticketNumber: '', version: 0 };
+let ticketFixture: TicketFixture = {
+    id: 0,
+    ticketNumber: '',
+    version: 0,
+    projectKey: '',
+};
 let agentTicketFixture: TicketFixture = {
     id: 0,
     ticketNumber: '',
     version: 0,
+    projectKey: '',
 };
 let agentLeaseID = '';
 let automationRuleID = 0;
@@ -78,16 +86,44 @@ const backendRoot = () => {
     return parsed.toString().replace(/\/$/u, '');
 };
 
+const resolveE2EProjectKey = async (
+    request: APIRequestContext,
+    token: string,
+) => {
+    const response = await apiRequest<Record<string, unknown>>(
+        request,
+        token,
+        '/api/projects',
+    );
+    const projects =
+        extractData<Array<Record<string, unknown>>>(response) ?? [];
+    const project = projects
+        .map((access) => access.project)
+        .find(
+            (candidate): candidate is Record<string, unknown> =>
+                typeof candidate === 'object' &&
+                candidate !== null &&
+                candidate.status === 'active' &&
+                typeof candidate.key === 'string' &&
+                candidate.key.length > 0,
+        );
+    if (!project || typeof project.key !== 'string') {
+        throw new Error('当前管理员没有可用于 Agent E2E 的活动项目');
+    }
+    return project.key;
+};
+
 const createTableTicket = async (
     request: APIRequestContext,
     token: string,
     title: string,
     assignedToID?: number,
 ): Promise<TicketFixture> => {
+    const projectKey = await resolveE2EProjectKey(request, token);
     const response = await apiRequest<Record<string, unknown>>(
         request,
         token,
-        '/api/tickets',
+        `/api/projects/${encodeURIComponent(projectKey)}/tickets`,
         {
             method: 'POST',
             headers: {
@@ -114,6 +150,7 @@ const createTableTicket = async (
         id: ticket.id as number,
         ticketNumber: ticket.ticket_number as string,
         version: ticket.version as number,
+        projectKey,
     };
 };
 
@@ -158,7 +195,10 @@ const provisionAgentLease = async (
     const principalResponse = await apiRequest<Record<string, unknown>>(
         request,
         adminToken,
-        '/api/v1/admin/service-principals',
+        projectAPIPath(
+            ticket.projectKey,
+            'admin/agents/service-principals',
+        ),
         {
             method: 'POST',
             headers: {
@@ -178,12 +218,13 @@ const provisionAgentLease = async (
     expect(typeof principal.client_secret).toBe('string');
     const clientID = principal.client_id as string;
     const clientSecret = principal.client_secret as string;
+    expect(principal.project_key).toBe(ticket.projectKey);
     trackE2EResource('agentPrincipals', clientID);
 
     const root = backendRoot();
     const [resourceResponse, authorizationResponse] = await Promise.all([
         request.get(
-            `${root}/.well-known/oauth-protected-resource/api/v1`,
+            `${root}/.well-known/oauth-protected-resource/api/v2`,
         ),
         request.get(`${root}/.well-known/oauth-authorization-server`),
     ]);
@@ -196,6 +237,10 @@ const provisionAgentLease = async (
     const authorizationMetadata =
         (await authorizationResponse.json()) as Record<string, unknown>;
     expect(typeof resourceMetadata.resource).toBe('string');
+    expect(
+        new URL(resourceMetadata.resource as string).pathname,
+        'Agent REST audience 必须使用 v2',
+    ).toBe('/api/v2');
     expect(typeof authorizationMetadata.token_endpoint).toBe('string');
 
     const tokenResponse = await request.post(
@@ -210,6 +255,7 @@ const provisionAgentLease = async (
                 grant_type: 'client_credentials',
                 resource: resourceMetadata.resource as string,
                 scope: 'tickets:read tasks:manage',
+                project_key: ticket.projectKey,
             },
         },
     );
@@ -219,9 +265,10 @@ const provisionAgentLease = async (
         unknown
     >;
     expect(typeof tokenPayload.access_token).toBe('string');
+    expect(tokenPayload.project_key).toBe(ticket.projectKey);
 
     const claimResponse = await request.post(
-        `${root}/api/v1/tickets/${ticket.id}/claim`,
+        `${root}/api/v2/projects/${encodeURIComponent(ticket.projectKey)}/tickets/${ticket.id}/claim`,
         {
             headers: {
                 Authorization: `Bearer ${tokenPayload.access_token as string}`,
@@ -250,7 +297,10 @@ const releaseAgentLease = async (request: APIRequestContext) => {
     const overviewResponse = await apiRequest<Record<string, unknown>>(
         request,
         token,
-        '/api/v1/admin/agent-control/overview',
+        projectAPIPath(
+            agentTicketFixture.projectKey,
+            'admin/agents/agent-control/overview',
+        ),
     );
     const overview = extractData<Record<string, unknown>>(overviewResponse);
     const leases = Array.isArray(overview.leases)
@@ -264,7 +314,10 @@ const releaseAgentLease = async (request: APIRequestContext) => {
     await apiRequest(
         request,
         token,
-        `/api/v1/admin/leases/${agentLeaseID}/force-release`,
+        projectAPIPath(
+            agentTicketFixture.projectKey,
+            `admin/agents/leases/${agentLeaseID}/force-release`,
+        ),
         {
             method: 'POST',
             headers: {
@@ -852,7 +905,10 @@ test.describe('企业级列表表格', () => {
                     const response = await apiRequest<Record<string, unknown>>(
                         request,
                         token,
-                        '/api/v1/admin/agent-control/overview',
+                        projectAPIPath(
+                            agentTicketFixture.projectKey,
+                            'admin/agents/agent-control/overview',
+                        ),
                     );
                     const overview =
                         extractData<Record<string, unknown>>(response);

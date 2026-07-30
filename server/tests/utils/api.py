@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -24,6 +25,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT = int(os.getenv("TEST_REQUEST_TIMEOUT", "15"))
 DEFAULT_MAX_RETRIES = int(os.getenv("TEST_REQUEST_MAX_RETRIES", "3"))
 DEFAULT_RETRY_DELAY = float(os.getenv("TEST_REQUEST_RETRY_DELAY", "1.0"))
+PROJECT_KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_-]{0,31}$")
+PROJECT_PATH_SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
+
+
+def validate_project_key(project_key: str) -> str:
+    if PROJECT_KEY_PATTERN.fullmatch(project_key) is None:
+        raise AssertionError("项目键格式无效")
+    return project_key
 
 
 class APIError(RuntimeError):
@@ -40,10 +49,13 @@ class APIClient:
     timeout: int = DEFAULT_TIMEOUT
     max_retries: int = DEFAULT_MAX_RETRIES
     retry_delay: float = DEFAULT_RETRY_DELAY
+    project_key: str | None = None
 
     def __post_init__(self) -> None:
         # remove trailing slash for consistency
         self.base_url = self.base_url.rstrip("/")
+        if self.project_key is not None:
+            self.bind_project(self.project_key)
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
 
@@ -172,9 +184,30 @@ class APIClient:
             files=files,
         )
 
+    def bind_project(self, project_key: str) -> None:
+        """Bind project-scoped Human REST helpers to one canonical project."""
+
+        self.project_key = validate_project_key(project_key)
+
+    def project_path(self, suffix: str) -> str:
+        """Return a Human REST path under the client's explicit project."""
+
+        project_key = self.project_key
+        if project_key is None:
+            raise AssertionError("APIClient 尚未绑定项目")
+        normalized = suffix.strip("/")
+        segments = normalized.split("/")
+        if not normalized or any(
+            segment in {".", ".."}
+            or PROJECT_PATH_SEGMENT_PATTERN.fullmatch(segment) is None
+            for segment in segments
+        ):
+            raise AssertionError("项目资源路径包含非法段")
+        return f"/projects/{project_key}/{normalized}"
+
     def ticket_etag(self, ticket_id: int) -> str:
         assert isinstance(ticket_id, int) and ticket_id > 0
-        response = self.get_json(f"/tickets/{ticket_id}")
+        response = self.get_json(self.project_path(f"tickets/{ticket_id}"))
         assert response.status_code == 200, response_diagnostic(response)
         etag = response.headers.get("ETag")
         assert isinstance(etag, str) and etag.startswith('"v') and etag.endswith('"'), (
@@ -191,7 +224,7 @@ class APIClient:
     ) -> requests.Response:
         validator = etag or self.ticket_etag(ticket_id)
         return self.put_json(
-            f"/tickets/{ticket_id}",
+            self.project_path(f"tickets/{ticket_id}"),
             payload,
             headers={"If-Match": validator},
         )
@@ -207,7 +240,7 @@ class APIClient:
         assert command in {"assign", "transfer", "escalate", "status"}
         validator = etag or self.ticket_etag(ticket_id)
         return self.post_json(
-            f"/tickets/{ticket_id}/{command}",
+            self.project_path(f"tickets/{ticket_id}/{command}"),
             payload,
             headers={"If-Match": validator},
         )
@@ -221,7 +254,7 @@ class APIClient:
         assert isinstance(ticket_id, int) and ticket_id > 0
         validator = etag or self.ticket_etag(ticket_id)
         return self.delete(
-            f"/tickets/{ticket_id}",
+            self.project_path(f"tickets/{ticket_id}"),
             headers={"If-Match": validator},
         )
 
@@ -232,6 +265,7 @@ class APIClient:
             timeout=self.timeout,
             max_retries=self.max_retries,
             retry_delay=self.retry_delay,
+            project_key=self.project_key,
         )
         clone.session.headers.update(self.session.headers)
         clone.session.headers["Authorization"] = f"Bearer {token}"

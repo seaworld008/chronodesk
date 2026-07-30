@@ -116,7 +116,7 @@ def _create_ticket_for_mcp(
 ) -> dict[str, Any]:
     response = harness.request(
         "POST",
-        "/api/v1/tickets",
+        harness.project_api_path("tickets"),
         headers={
             "Authorization": api_token.authorization,
             "Idempotency-Key": harness.idempotency_key("mcp-ticket"),
@@ -366,8 +366,11 @@ def test_mcp_tools_list_and_ticket_get_return_schema_bound_structured_result(
     assert names == EXPECTED_TOOLS
 
     for tool in tools:
-        assert tool.get("inputSchema", {}).get("type") == "object"
-        assert tool.get("inputSchema", {}).get("additionalProperties") is False
+        input_schema = tool.get("inputSchema", {})
+        assert input_schema.get("type") == "object"
+        assert input_schema.get("additionalProperties") is False
+        assert "project_key" in input_schema.get("properties", {})
+        assert "project_key" in input_schema.get("required", [])
         assert tool.get("outputSchema", {}).get("type") == "object"
         assert tool.get("outputSchema", {}).get("additionalProperties") is False
         annotations = tool.get("annotations")
@@ -395,7 +398,13 @@ def test_mcp_tools_list_and_ticket_get_return_schema_bound_structured_result(
         protocol_harness,
         agent_tokens["mcp"],
         method="tools/call",
-        params={"name": "ticket_get", "arguments": {"ticket_id": ticket_id}},
+        params={
+            "name": "ticket_get",
+            "arguments": {
+                "project_key": protocol_harness.project_key,
+                "ticket_id": ticket_id,
+            },
+        },
     )
     _rpc_error(
         missing_name,
@@ -409,7 +418,13 @@ def test_mcp_tools_list_and_ticket_get_return_schema_bound_structured_result(
         agent_tokens["mcp"],
         method="tools/call",
         name="ticket_list",
-        params={"name": "ticket_get", "arguments": {"ticket_id": ticket_id}},
+        params={
+            "name": "ticket_get",
+            "arguments": {
+                "project_key": protocol_harness.project_key,
+                "ticket_id": ticket_id,
+            },
+        },
     )
     _rpc_error(
         mismatched_name,
@@ -423,7 +438,13 @@ def test_mcp_tools_list_and_ticket_get_return_schema_bound_structured_result(
         agent_tokens["mcp"],
         method="tools/call",
         name="ticket_get",
-        params={"name": "ticket_get", "arguments": {"ticket_id": ticket_id}},
+        params={
+            "name": "ticket_get",
+            "arguments": {
+                "project_key": protocol_harness.project_key,
+                "ticket_id": ticket_id,
+            },
+        },
     )
     assert_status(call_response, 200, operation="MCP ticket_get")
     call_body = json_object(call_response, operation="MCP ticket_get")
@@ -455,6 +476,7 @@ def test_mcp_tools_list_and_ticket_get_return_schema_bound_structured_result(
         params={
             "name": "ticket_get",
             "arguments": {
+                "project_key": protocol_harness.project_key,
                 "ticket_id": str(ticket_id),
                 "external_url": "https://example.invalid/untrusted",
             },

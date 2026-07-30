@@ -2,6 +2,7 @@ package agentplatform
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -17,8 +18,10 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
 	"github.com/seaworld008/chronodesk/server/internal/httpcontract"
 	"github.com/seaworld008/chronodesk/server/internal/mcp"
+	"github.com/seaworld008/chronodesk/server/internal/middleware"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/observability"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"github.com/gin-gonic/gin"
@@ -26,12 +29,21 @@ import (
 )
 
 type ResourcePublisher interface {
-	PublishTicket(ticketID uint)
+	PublishTicket(projectKey string, ticketID uint)
 }
+
+type apiPublicationBuffer struct {
+	projectKey string
+	ticketIDs  []uint
+	seen       map[uint]struct{}
+}
+
+type apiPublicationBufferContextKey struct{}
 
 type APIHandler struct {
 	db                 *gorm.DB
 	native             *services.AgentNativeService
+	projects           *services.ProjectService
 	tokens             *agentauth.Manager
 	maxAttachmentBytes int64
 	publisher          ResourcePublisher
@@ -47,9 +59,11 @@ func NewAPIHandler(
 	if maxAttachmentBytes <= 0 {
 		maxAttachmentBytes = 10 << 20
 	}
+	projects, _ := services.NewProjectService(db)
 	return &APIHandler{
 		db:                 db,
 		native:             native,
+		projects:           projects,
 		tokens:             tokens,
 		maxAttachmentBytes: maxAttachmentBytes,
 		publisher:          publisher,
@@ -57,30 +71,189 @@ func NewAPIHandler(
 }
 
 func (h *APIHandler) RegisterRoutes(api *gin.RouterGroup) {
-	api.GET("/capabilities", h.Capabilities)
-	api.GET("/tickets", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.ListTickets)
-	api.POST("/tickets", h.tokens.Middleware(models.ScopeTicketsCreate), h.executionLimit(), h.CreateTicket)
-	api.GET("/tickets/:id", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.GetTicket)
-	api.PATCH("/tickets/:id", h.tokens.Middleware(models.ScopeTicketsUpdate), h.executionLimit(), h.UpdateTicket)
-	api.POST("/tickets/:id/commands/assign", h.tokens.Middleware(models.ScopeTicketsAssign), h.executionLimit(), h.AssignTicket)
-	api.POST("/tickets/:id/commands/transition", h.tokens.Middleware(models.ScopeTicketsTransition), h.executionLimit(), h.TransitionTicket)
-	api.POST("/tickets/:id/commands/escalate", h.tokens.Middleware(models.ScopeTicketsTransition), h.executionLimit(), h.EscalateTicket)
-	api.GET("/tickets/:id/history", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.GetHistory)
-	api.GET("/tickets/:id/comments", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.ListComments)
-	api.POST("/tickets/:id/comments", h.tokens.Middleware(models.ScopeCommentsWrite), h.executionLimit(), h.CreateComment)
-	api.GET("/tickets/:id/attachments", h.tokens.Middleware(models.ScopeAttachmentsRead), h.executionLimit(), h.ListAttachments)
-	api.POST("/tickets/:id/attachments", h.tokens.Middleware(models.ScopeAttachmentsWrite), h.executionLimit(), h.StoreAttachment)
-	api.GET("/attachments/:id/content", h.tokens.Middleware(models.ScopeAttachmentsRead), h.executionLimit(), h.DownloadAttachment)
-	api.POST("/tickets/:id/claim", h.tokens.Middleware(models.ScopeTasksManage), h.executionLimit(), h.ClaimTicket)
-	api.POST("/leases/:id/heartbeat", h.tokens.Middleware(models.ScopeTasksManage), h.executionLimit(), h.HeartbeatLease)
-	api.DELETE("/leases/:id", h.tokens.Middleware(models.ScopeTasksManage), h.executionLimit(), h.ReleaseLease)
-	api.GET("/events", h.tokens.Middleware(models.ScopeEventsSubscribe), h.executionLimit(), h.ListEvents)
+	api.GET("/capabilities", h.tokens.Middleware(models.ScopeTicketsRead), h.bindProjectContext(), h.Capabilities)
+	api.GET("/tickets", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.bindProjectContext(), h.ListTickets)
+	api.POST("/tickets", h.tokens.Middleware(models.ScopeTicketsCreate), h.executionLimit(), h.bindProjectContext(), h.CreateTicket)
+	api.GET("/tickets/:id", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.bindProjectContext(), h.GetTicket)
+	api.PATCH("/tickets/:id", h.tokens.Middleware(models.ScopeTicketsUpdate), h.executionLimit(), h.bindProjectContext(), h.UpdateTicket)
+	api.POST("/tickets/:id/commands/assign", h.tokens.Middleware(models.ScopeTicketsAssign), h.executionLimit(), h.bindProjectContext(), h.AssignTicket)
+	api.POST("/tickets/:id/commands/transition", h.tokens.Middleware(models.ScopeTicketsTransition), h.executionLimit(), h.bindProjectContext(), h.TransitionTicket)
+	api.POST("/tickets/:id/commands/escalate", h.tokens.Middleware(models.ScopeTicketsTransition), h.executionLimit(), h.bindProjectContext(), h.EscalateTicket)
+	api.GET("/tickets/:id/history", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.bindProjectContext(), h.GetHistory)
+	api.GET("/tickets/:id/comments", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.bindProjectContext(), h.ListComments)
+	api.POST("/tickets/:id/comments", h.tokens.Middleware(models.ScopeCommentsWrite), h.executionLimit(), h.bindProjectContext(), h.CreateComment)
+	api.GET("/tickets/:id/attachments", h.tokens.Middleware(models.ScopeAttachmentsRead), h.executionLimit(), h.bindProjectContext(), h.ListAttachments)
+	api.POST("/tickets/:id/attachments", h.tokens.Middleware(models.ScopeAttachmentsWrite), h.executionLimit(), h.bindProjectContext(), h.StoreAttachment)
+	api.GET("/attachments/:id/content", h.tokens.Middleware(models.ScopeAttachmentsRead), h.executionLimit(), h.bindProjectContext(), h.DownloadAttachment)
+	api.POST("/tickets/:id/claim", h.tokens.Middleware(models.ScopeTasksManage), h.executionLimit(), h.bindProjectContext(), h.ClaimTicket)
+	api.POST("/leases/:id/heartbeat", h.tokens.Middleware(models.ScopeTasksManage), h.executionLimit(), h.bindProjectContext(), h.HeartbeatLease)
+	api.DELETE("/leases/:id", h.tokens.Middleware(models.ScopeTasksManage), h.executionLimit(), h.bindProjectContext(), h.ReleaseLease)
+	api.GET("/events", h.tokens.Middleware(models.ScopeEventsSubscribe), h.executionLimit(), h.bindProjectContext(), h.ListEvents)
+}
+
+func (h *APIHandler) bindProjectContext() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if h.projects == nil {
+			WriteProblem(
+				c,
+				http.StatusServiceUnavailable,
+				ProblemInternal,
+				"Project authorization is unavailable",
+				true,
+			)
+			c.Abort()
+			return
+		}
+		principalID := strings.TrimSpace(
+			c.GetString(agentauth.ContextPrincipalID),
+		)
+		credentialID := strings.TrimSpace(
+			c.GetString(agentauth.ContextCredentialID),
+		)
+		projectKey := strings.TrimSpace(c.Param("projectKey"))
+		access, err := h.projects.ResolvePrincipalProject(
+			c.Request.Context(),
+			projectKey,
+			principalID,
+		)
+		if err != nil {
+			WriteProblem(
+				c,
+				http.StatusForbidden,
+				ProblemPolicyDenied,
+				"Project access is denied",
+				false,
+			)
+			c.Abort()
+			return
+		}
+		operationContext, err := services.WithOperationContext(
+			c.Request.Context(),
+			services.OperationContext{
+				Scope:        access.Scope,
+				Actor:        models.ServicePrincipalActor(principalID),
+				Source:       services.SourceProtocolAgentREST,
+				CredentialID: credentialID,
+				TraceID: observability.TraceIDFromContext(
+					c.Request.Context(),
+				),
+				CorrelationID: observability.CorrelationIDFromContext(
+					c.Request.Context(),
+				),
+			},
+		)
+		if err != nil {
+			WriteProblem(
+				c,
+				http.StatusForbidden,
+				ProblemPolicyDenied,
+				"Project operation context is invalid",
+				false,
+			)
+			c.Abort()
+			return
+		}
+		publications := &apiPublicationBuffer{
+			projectKey: projectKey,
+			seen:       make(map[uint]struct{}),
+		}
+		operationContext = context.WithValue(
+			operationContext,
+			apiPublicationBufferContextKey{},
+			publications,
+		)
+		originalWriter := c.Writer
+		originalRequest := c.Request
+		defer func() {
+			c.Writer = originalWriter
+			c.Request = originalRequest.WithContext(operationContext)
+		}()
+		responseBuffer, err :=
+			middleware.NewTransactionalResponseBuffer(originalWriter)
+		if err != nil {
+			WriteProblem(
+				c,
+				http.StatusInternalServerError,
+				ProblemInternal,
+				"Project response transaction is unavailable",
+				true,
+			)
+			c.Abort()
+			return
+		}
+		defer func() {
+			if closeErr := responseBuffer.Close(); closeErr != nil {
+				_ = c.Error(closeErr)
+			}
+		}()
+
+		transactionErr := scopeddb.WithProjectScopeContextTransaction(
+			operationContext,
+			h.db,
+			access.Scope,
+			func(scopedContext context.Context) error {
+				c.Request = originalRequest.WithContext(scopedContext)
+				c.Writer = responseBuffer
+				c.Next()
+				c.Writer = originalWriter
+				if responseErr := responseBuffer.Err(); responseErr != nil {
+					return responseErr
+				}
+				// HTTP problem responses can carry durable denied
+				// PolicyDecision and failed idempotency state. Domain
+				// transactions preserve their own rollback via savepoints.
+				return nil
+			},
+		)
+		c.Writer = originalWriter
+		c.Request = originalRequest.WithContext(operationContext)
+		if transactionErr != nil {
+			_ = c.Error(transactionErr)
+			WriteProblem(
+				c,
+				http.StatusInternalServerError,
+				ProblemInternal,
+				"Project transaction failed",
+				true,
+			)
+			c.Abort()
+			return
+		}
+		for _, ticketID := range publications.ticketIDs {
+			if h.publisher != nil {
+				h.publisher.PublishTicket(projectKey, ticketID)
+			}
+		}
+		if err := responseBuffer.Commit(); err != nil {
+			_ = c.Error(err)
+			if !c.Writer.Written() {
+				WriteProblem(
+					c,
+					http.StatusInternalServerError,
+					ProblemInternal,
+					"Project response failed",
+					true,
+				)
+			}
+			c.Abort()
+		}
+	}
+}
+
+func agentRESTProjectPath(c *gin.Context, suffix string) string {
+	projectKey := ""
+	if c != nil {
+		projectKey = strings.TrimSpace(c.Param("projectKey"))
+	}
+	return "/api/v2/projects/" + projectKey + "/" +
+		strings.TrimPrefix(suffix, "/")
 }
 
 func (h *APIHandler) Capabilities(c *gin.Context) {
 	WriteData(c, http.StatusOK, gin.H{
-		"api_version":       "v1",
+		"api_version":       "v2",
 		"openapi":           "/openapi.yaml",
+		"asyncapi":          "/asyncapi.yaml",
 		"mcp_endpoint":      "/mcp",
 		"mcp_version":       mcp.ProtocolVersion,
 		"mcp_transport":     "streamable-http",
@@ -90,7 +263,7 @@ func (h *APIHandler) Capabilities(c *gin.Context) {
 		"a2a_version":       "1.0",
 		"agent_card":        "/.well-known/agent-card.json",
 		"oauth_metadata": gin.H{
-			"api": "/.well-known/oauth-protected-resource/api/v1",
+			"api": "/.well-known/oauth-protected-resource/api/v2",
 			"mcp": "/.well-known/oauth-protected-resource/mcp",
 			"a2a": "/.well-known/oauth-protected-resource/a2a/v1",
 		},
@@ -135,8 +308,18 @@ func (h *APIHandler) ListTickets(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
+	projectScope, err := services.RequireProjectScope(c.Request.Context())
+	if err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
 
 	query := h.db.WithContext(c.Request.Context()).Model(&models.Ticket{}).
+		Where(
+			"tickets.organization_id = ? AND tickets.project_id = ?",
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+		).
 		Preload("CreatedBy").
 		Preload("AssignedTo")
 	if status := strings.TrimSpace(c.Query("status")); status != "" {
@@ -262,20 +445,52 @@ func (h *APIHandler) CreateTicket(c *gin.Context) {
 		return
 	}
 	var request struct {
-		Title        string                `json:"title"`
-		Description  string                `json:"description"`
-		Type         models.TicketType     `json:"type"`
-		Priority     models.TicketPriority `json:"priority"`
-		Tags         []string              `json:"tags"`
-		AgentContext *models.AgentContext  `json:"agent_context"`
-		CategoryID   *uint                 `json:"category_id"`
-		DueDate      *time.Time            `json:"due_date"`
+		Title                string                `json:"title"`
+		Description          string                `json:"description"`
+		Type                 models.TicketType     `json:"type"`
+		Priority             models.TicketPriority `json:"priority"`
+		RequestTypeVersionID string                `json:"request_type_version_id"`
+		WorkflowVersionID    string                `json:"workflow_version_id"`
+		Tags                 []string              `json:"tags"`
+		AgentContext         *models.AgentContext  `json:"agent_context"`
+		CategoryID           *uint                 `json:"category_id"`
+		DueDate              *time.Time            `json:"due_date"`
 	}
 	if err := decodeStrictJSON(body, &request); err != nil {
 		WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
 		return
 	}
-	fingerprint := commandFingerprint(http.MethodPost, "/api/v1/tickets", 0, "", body)
+	request.RequestTypeVersionID, ok =
+		normalizeMachineConfigurationVersionID(request.RequestTypeVersionID)
+	if !ok {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			"request_type_version_id must be a canonical UUID",
+			false,
+		)
+		return
+	}
+	request.WorkflowVersionID, ok =
+		normalizeMachineConfigurationVersionID(request.WorkflowVersionID)
+	if !ok {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			"workflow_version_id must be a canonical UUID",
+			false,
+		)
+		return
+	}
+	fingerprint := commandFingerprint(
+		http.MethodPost,
+		agentRESTProjectPath(c, "/tickets"),
+		0,
+		"",
+		body,
+	)
 	actor := models.ServicePrincipalActor(principal.ID)
 	reservation, err := h.native.ReserveIdempotency(
 		c.Request.Context(), actor, "ticket.create", key, fingerprint, 24*time.Hour,
@@ -294,15 +509,17 @@ func (h *APIHandler) CreateTicket(c *gin.Context) {
 
 	result, err := h.native.CreateNativeTicket(c.Request.Context(), services.NativeTicketCreateInput{
 		Request: models.TicketCreateRequest{
-			Title:        request.Title,
-			Description:  request.Description,
-			Type:         request.Type,
-			Priority:     request.Priority,
-			Source:       models.TicketSourceAgent,
-			Tags:         models.StringList(request.Tags),
-			AgentContext: request.AgentContext,
-			CategoryID:   request.CategoryID,
-			DueDate:      request.DueDate,
+			Title:                request.Title,
+			Description:          request.Description,
+			Type:                 request.Type,
+			Priority:             request.Priority,
+			Source:               models.TicketSourceAgent,
+			RequestTypeVersionID: request.RequestTypeVersionID,
+			WorkflowVersionID:    request.WorkflowVersionID,
+			Tags:                 models.StringList(request.Tags),
+			AgentContext:         request.AgentContext,
+			CategoryID:           request.CategoryID,
+			DueDate:              request.DueDate,
 		},
 		Actor:               actor,
 		CredentialID:        principal.CredentialID,
@@ -318,7 +535,7 @@ func (h *APIHandler) CreateTicket(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
-	h.publishTicket(result.Ticket.ID)
+	h.publishTicket(c, result.Ticket.ID)
 	c.Header("ETag", httpcontract.FormatETag(result.Ticket.Version))
 	WriteReceipt(c, http.StatusCreated, result.Ticket.ToResponse(), receiptFromService(result.Receipt))
 }
@@ -356,7 +573,7 @@ func (h *APIHandler) UpdateTicket(c *gin.Context) {
 	}
 	fingerprint := commandFingerprint(
 		http.MethodPatch,
-		fmt.Sprintf("/api/v1/tickets/%d", ticketID),
+		agentRESTProjectPath(c, fmt.Sprintf("/tickets/%d", ticketID)),
 		expectedVersion,
 		leaseID,
 		body,
@@ -405,7 +622,7 @@ func (h *APIHandler) UpdateTicket(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
-	h.publishTicket(ticketID)
+	h.publishTicket(c, ticketID)
 	c.Header("ETag", httpcontract.FormatETag(result.Ticket.Version))
 	WriteReceipt(c, http.StatusOK, result.Ticket.ToResponse(), receiptFromService(result.Receipt))
 }
@@ -475,7 +692,7 @@ func (h *APIHandler) AssignTicket(c *gin.Context) {
 	}
 
 	path := fmt.Sprintf(
-		"/api/v1/tickets/%d/commands/assign",
+		agentRESTProjectPath(c, "/tickets/%d/commands/assign"),
 		commandRequest.ticketID,
 	)
 	fingerprint := commandFingerprint(
@@ -555,7 +772,7 @@ func (h *APIHandler) TransitionTicket(c *gin.Context) {
 	}
 
 	path := fmt.Sprintf(
-		"/api/v1/tickets/%d/commands/transition",
+		agentRESTProjectPath(c, "/tickets/%d/commands/transition"),
 		commandRequest.ticketID,
 	)
 	fingerprint := commandFingerprint(
@@ -646,7 +863,7 @@ func (h *APIHandler) EscalateTicket(c *gin.Context) {
 	}
 
 	path := fmt.Sprintf(
-		"/api/v1/tickets/%d/commands/escalate",
+		agentRESTProjectPath(c, "/tickets/%d/commands/escalate"),
 		commandRequest.ticketID,
 	)
 	fingerprint := commandFingerprint(
@@ -736,7 +953,7 @@ func (h *APIHandler) writeTicketCommandResult(
 	ticketID uint,
 	result *services.VersionedTicketUpdateResult,
 ) {
-	h.publishTicket(ticketID)
+	h.publishTicket(c, ticketID)
 	c.Header("ETag", httpcontract.FormatETag(result.Ticket.Version))
 	WriteReceipt(
 		c,
@@ -779,7 +996,7 @@ func (h *APIHandler) ClaimTicket(c *gin.Context) {
 	}
 	fingerprint := commandFingerprint(
 		http.MethodPost,
-		fmt.Sprintf("/api/v1/tickets/%d/claim", ticketID),
+		agentRESTProjectPath(c, fmt.Sprintf("/tickets/%d/claim", ticketID)),
 		expectedVersion,
 		"",
 		body,
@@ -827,7 +1044,7 @@ func (h *APIHandler) ClaimTicket(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
-	h.publishTicket(ticketID)
+	h.publishTicket(c, ticketID)
 	WriteReceipt(c, http.StatusOK, leaseResponseData(result.Lease), receiptFromService(result.Receipt))
 }
 
@@ -865,7 +1082,7 @@ func (h *APIHandler) HeartbeatLease(c *gin.Context) {
 	})
 	fingerprint := commandFingerprint(
 		http.MethodPost,
-		"/api/v1/leases/"+c.Param("id")+"/heartbeat",
+		agentRESTProjectPath(c, "/leases/"+c.Param("id")+"/heartbeat"),
 		expectedVersion,
 		c.Param("id"),
 		body,
@@ -913,7 +1130,7 @@ func (h *APIHandler) HeartbeatLease(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
-	h.publishTicket(result.Lease.TicketID)
+	h.publishTicket(c, result.Lease.TicketID)
 	WriteReceipt(c, http.StatusOK, leaseResponseData(result.Lease), receiptFromService(result.Receipt))
 }
 
@@ -928,7 +1145,7 @@ func (h *APIHandler) ReleaseLease(c *gin.Context) {
 	}
 	fingerprint := commandFingerprint(
 		http.MethodDelete,
-		"/api/v1/leases/"+c.Param("id"),
+		agentRESTProjectPath(c, "/leases/"+c.Param("id")),
 		0,
 		c.Param("id"),
 		nil,
@@ -975,7 +1192,7 @@ func (h *APIHandler) ReleaseLease(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
-	h.publishTicket(result.Lease.TicketID)
+	h.publishTicket(c, result.Lease.TicketID)
 	WriteReceipt(c, http.StatusOK, leaseResponseData(result.Lease), receiptFromService(result.Receipt))
 }
 
@@ -1019,7 +1236,7 @@ func (h *APIHandler) CreateComment(c *gin.Context) {
 	}
 	fingerprint := commandFingerprint(
 		http.MethodPost,
-		fmt.Sprintf("/api/v1/tickets/%d/comments", ticketID),
+		agentRESTProjectPath(c, fmt.Sprintf("/tickets/%d/comments", ticketID)),
 		expectedVersion,
 		leaseID,
 		body,
@@ -1069,7 +1286,7 @@ func (h *APIHandler) CreateComment(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
-	h.publishTicket(ticketID)
+	h.publishTicket(c, ticketID)
 	c.Header("ETag", httpcontract.FormatETag(result.Receipt.ResourceVersion))
 	WriteReceipt(c, http.StatusCreated, result.Comment.ToResponse(), receiptFromService(result.Receipt))
 }
@@ -1127,7 +1344,7 @@ func (h *APIHandler) StoreAttachment(c *gin.Context) {
 	})
 	fingerprint := commandFingerprint(
 		http.MethodPost,
-		fmt.Sprintf("/api/v1/tickets/%d/attachments", ticketID),
+		agentRESTProjectPath(c, fmt.Sprintf("/tickets/%d/attachments", ticketID)),
 		expectedVersion,
 		leaseID,
 		idempotencyBody,
@@ -1176,7 +1393,7 @@ func (h *APIHandler) StoreAttachment(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
-	h.publishTicket(ticketID)
+	h.publishTicket(c, ticketID)
 	c.Header("ETag", httpcontract.FormatETag(result.Receipt.ResourceVersion))
 	WriteReceipt(c, http.StatusCreated, result.Attachment.ToResponse(), receiptFromService(result.Receipt))
 }
@@ -1186,11 +1403,22 @@ func (h *APIHandler) ListComments(c *gin.Context) {
 		return
 	}
 	ticketID, _ := parsePathUint(c, "id")
+	projectScope, err := services.RequireProjectScope(c.Request.Context())
+	if err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
 	var comments []models.TicketComment
 	if err := h.db.WithContext(c.Request.Context()).
 		Preload("User").
 		Preload("ServicePrincipal").
-		Where("ticket_id = ? AND is_deleted = ?", ticketID, false).
+		Where(
+			"organization_id = ? AND project_id = ? AND ticket_id = ? AND is_deleted = ?",
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+			ticketID,
+			false,
+		).
 		Order("created_at ASC").
 		Find(&comments).Error; err != nil {
 		h.writeNativeError(c, err)
@@ -1212,9 +1440,19 @@ func (h *APIHandler) ListAttachments(c *gin.Context) {
 		return
 	}
 	ticketID, _ := parsePathUint(c, "id")
+	projectScope, err := services.RequireProjectScope(c.Request.Context())
+	if err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
 	var attachments []models.TicketAttachment
 	if err := h.db.WithContext(c.Request.Context()).
-		Where("ticket_id = ?", ticketID).
+		Where(
+			"organization_id = ? AND project_id = ? AND ticket_id = ?",
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+			ticketID,
+		).
 		Order("created_at DESC").
 		Find(&attachments).Error; err != nil {
 		h.writeNativeError(c, err)
@@ -1233,7 +1471,19 @@ func (h *APIHandler) DownloadAttachment(c *gin.Context) {
 		return
 	}
 	var metadata models.TicketAttachment
-	if err := h.db.WithContext(c.Request.Context()).First(&metadata, attachmentID).Error; err != nil {
+	projectScope, err := services.RequireProjectScope(c.Request.Context())
+	if err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
+	if err := h.db.WithContext(c.Request.Context()).
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			attachmentID,
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+		).
+		First(&metadata).Error; err != nil {
 		h.writeNativeError(c, err)
 		return
 	}
@@ -1268,6 +1518,11 @@ func (h *APIHandler) GetHistory(c *gin.Context) {
 		return
 	}
 	ticketID, _ := parsePathUint(c, "id")
+	projectScope, err := services.RequireProjectScope(c.Request.Context())
+	if err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
 	limit, err := ParseLimit(c, 50, 100)
 	if err != nil {
 		WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
@@ -1277,7 +1532,12 @@ func (h *APIHandler) GetHistory(c *gin.Context) {
 	if err := h.db.WithContext(c.Request.Context()).
 		Preload("User").
 		Preload("ServicePrincipal").
-		Where("ticket_id = ?", ticketID).
+		Where(
+			"organization_id = ? AND project_id = ? AND ticket_id = ?",
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+			ticketID,
+		).
 		Order("created_at DESC, id DESC").
 		Limit(limit).
 		Find(&history).Error; err != nil {
@@ -1322,7 +1582,18 @@ func (h *APIHandler) ListEvents(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
-	query := h.db.WithContext(c.Request.Context()).Model(&models.DomainEvent{})
+	projectScope, err := services.RequireProjectScope(c.Request.Context())
+	if err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
+	query := h.db.WithContext(c.Request.Context()).
+		Model(&models.DomainEvent{}).
+		Where(
+			"organization_id = ? AND project_id = ?",
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+		)
 	if eventType := strings.TrimSpace(c.Query("type")); eventType != "" {
 		query = query.Where("type = ?", eventType)
 	}
@@ -1509,10 +1780,21 @@ func (h *APIHandler) loadAuthorizedTicketFor(
 		return nil, false
 	}
 	var ticket models.Ticket
+	projectScope, err := services.RequireProjectScope(c.Request.Context())
+	if err != nil {
+		h.writeNativeError(c, err)
+		return nil, false
+	}
 	if err := h.db.WithContext(c.Request.Context()).
 		Preload("CreatedBy").
 		Preload("AssignedTo").
-		First(&ticket, ticketID).Error; err != nil {
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			ticketID,
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+		).
+		First(&ticket).Error; err != nil {
 		h.writeNativeError(c, err)
 		return nil, false
 	}
@@ -1806,6 +2088,10 @@ func validateCommandReason(reason string) (string, error) {
 }
 
 func (h *APIHandler) writeReplayedTicket(c *gin.Context, record *models.IdempotencyRecord, status int) {
+	if !idempotencyRecordMatchesProject(c, record) {
+		WriteProblem(c, http.StatusConflict, ProblemIdempotencyConflict, "Idempotency record belongs to another project", false)
+		return
+	}
 	var receipt Receipt
 	_ = json.Unmarshal(record.ResponseBody, &receipt)
 	if len(record.ResourceSnapshot) > 0 {
@@ -1822,7 +2108,12 @@ func (h *APIHandler) writeReplayedTicket(c *gin.Context, record *models.Idempote
 		return
 	}
 	var ticket models.Ticket
-	if err := h.db.WithContext(c.Request.Context()).First(&ticket, uint(resourceID)).Error; err != nil {
+	if err := h.db.WithContext(c.Request.Context()).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		uint(resourceID),
+		record.OrganizationID,
+		record.ProjectID,
+	).First(&ticket).Error; err != nil {
 		h.writeIdempotentBody(c, record)
 		return
 	}
@@ -1831,6 +2122,10 @@ func (h *APIHandler) writeReplayedTicket(c *gin.Context, record *models.Idempote
 }
 
 func (h *APIHandler) writeReplayedLease(c *gin.Context, record *models.IdempotencyRecord) {
+	if !idempotencyRecordMatchesProject(c, record) {
+		WriteProblem(c, http.StatusConflict, ProblemIdempotencyConflict, "Idempotency record belongs to another project", false)
+		return
+	}
 	var receipt Receipt
 	if json.Unmarshal(record.ResponseBody, &receipt) != nil ||
 		receipt.OperationID == "" ||
@@ -1847,6 +2142,10 @@ func (h *APIHandler) writeReplayedLease(c *gin.Context, record *models.Idempoten
 }
 
 func (h *APIHandler) writeReplayedComment(c *gin.Context, record *models.IdempotencyRecord) {
+	if !idempotencyRecordMatchesProject(c, record) {
+		WriteProblem(c, http.StatusConflict, ProblemIdempotencyConflict, "Idempotency record belongs to another project", false)
+		return
+	}
 	var receipt Receipt
 	_ = json.Unmarshal(record.ResponseBody, &receipt)
 	if len(record.ResourceSnapshot) > 0 {
@@ -1866,7 +2165,13 @@ func (h *APIHandler) writeReplayedComment(c *gin.Context, record *models.Idempot
 	if err := h.db.WithContext(c.Request.Context()).
 		Preload("User").
 		Preload("ServicePrincipal").
-		First(&comment, uint(resourceID)).Error; err != nil {
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			uint(resourceID),
+			record.OrganizationID,
+			record.ProjectID,
+		).
+		First(&comment).Error; err != nil {
 		h.writeIdempotentBody(c, record)
 		return
 	}
@@ -1885,6 +2190,10 @@ func leaseResponseData(lease *models.TicketLease) gin.H {
 }
 
 func (h *APIHandler) writeReplayedAttachment(c *gin.Context, record *models.IdempotencyRecord) {
+	if !idempotencyRecordMatchesProject(c, record) {
+		WriteProblem(c, http.StatusConflict, ProblemIdempotencyConflict, "Idempotency record belongs to another project", false)
+		return
+	}
 	var receipt Receipt
 	_ = json.Unmarshal(record.ResponseBody, &receipt)
 	if len(record.ResourceSnapshot) > 0 {
@@ -1901,12 +2210,30 @@ func (h *APIHandler) writeReplayedAttachment(c *gin.Context, record *models.Idem
 		return
 	}
 	var attachment models.TicketAttachment
-	if err := h.db.WithContext(c.Request.Context()).First(&attachment, uint(resourceID)).Error; err != nil {
+	if err := h.db.WithContext(c.Request.Context()).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		uint(resourceID),
+		record.OrganizationID,
+		record.ProjectID,
+	).First(&attachment).Error; err != nil {
 		h.writeIdempotentBody(c, record)
 		return
 	}
 	c.Header("ETag", httpcontract.FormatETag(receipt.ResourceVersion))
 	WriteReceipt(c, record.ResponseCode, attachment.ToResponse(), receipt)
+}
+
+func idempotencyRecordMatchesProject(
+	c *gin.Context,
+	record *models.IdempotencyRecord,
+) bool {
+	if c == nil || record == nil {
+		return false
+	}
+	scope, err := services.RequireProjectScope(c.Request.Context())
+	return err == nil &&
+		record.OrganizationID == scope.OrganizationID &&
+		record.ProjectID == scope.ProjectID
 }
 
 func (h *APIHandler) writeIdempotentBody(c *gin.Context, record *models.IdempotencyRecord) {
@@ -1917,9 +2244,23 @@ func (h *APIHandler) writeIdempotentBody(c *gin.Context, record *models.Idempote
 	WriteData(c, record.ResponseCode, response, Meta{})
 }
 
-func (h *APIHandler) publishTicket(ticketID uint) {
-	if h.publisher != nil {
-		h.publisher.PublishTicket(ticketID)
+func (h *APIHandler) publishTicket(c *gin.Context, ticketID uint) {
+	if h.publisher == nil || c == nil || ticketID == 0 {
+		return
+	}
+	if buffer, ok := c.Request.Context().Value(
+		apiPublicationBufferContextKey{},
+	).(*apiPublicationBuffer); ok && buffer != nil {
+		if _, duplicate := buffer.seen[ticketID]; duplicate {
+			return
+		}
+		buffer.seen[ticketID] = struct{}{}
+		buffer.ticketIDs = append(buffer.ticketIDs, ticketID)
+		return
+	}
+	projectKey := strings.TrimSpace(c.Param("projectKey"))
+	if models.ValidateProjectKey(projectKey) == nil {
+		h.publisher.PublishTicket(projectKey, ticketID)
 	}
 }
 
@@ -1964,6 +2305,12 @@ func writeNativeProblem(c *gin.Context, err error) {
 		status, code = http.StatusConflict, ProblemIdempotencyConflict
 	case errors.Is(err, services.ErrOutboxReplayConflict):
 		status, code = http.StatusConflict, ProblemOutboxConflict
+	case errors.Is(err, services.ErrTicketConfigurationUnavailable):
+		status, code = http.StatusConflict, "ticket_configuration_unavailable"
+	case errors.Is(err, services.ErrTicketRequestTypeAmbiguous):
+		status, code = http.StatusBadRequest, "request_type_version_required"
+	case errors.Is(err, services.ErrTicketFormValidation):
+		status, code = http.StatusUnprocessableEntity, "ticket_form_validation_failed"
 	case errors.Is(err, services.ErrInvalidAttachment):
 		status, code = http.StatusBadRequest, ProblemAttachmentRejected
 	case errors.Is(err, services.ErrAttachmentTooLarge), errors.Is(err, services.ErrAttachmentNotClean), errors.Is(err, services.ErrInvalidAttachmentName):

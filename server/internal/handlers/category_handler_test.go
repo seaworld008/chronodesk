@@ -58,15 +58,15 @@ func TestCategoryHandlerVisibilityAndReferenceFilters(t *testing.T) {
 	handler := NewCategoryHandler(db)
 	router := gin.New()
 	router.GET("/categories", func(c *gin.Context) {
-		c.Set("user_role", c.GetHeader("X-Test-Role"))
+		c.Set(projectRoleContextKey, c.GetHeader("X-Test-Role"))
 		handler.List(c)
 	})
 	router.GET("/categories/:id", func(c *gin.Context) {
-		c.Set("user_role", c.GetHeader("X-Test-Role"))
+		c.Set(projectRoleContextKey, c.GetHeader("X-Test-Role"))
 		handler.Get(c)
 	})
 
-	customerList := performCategoryRequest(t, router, http.MethodGet, "/categories", string(models.RoleCustomer))
+	customerList := performCategoryRequest(t, router, http.MethodGet, "/categories", string(models.ProjectRoleRequester))
 	if customerList.Code != http.StatusOK {
 		t.Fatalf("customer list status = %d, body=%s", customerList.Code, customerList.Body.String())
 	}
@@ -92,7 +92,7 @@ func TestCategoryHandlerVisibilityAndReferenceFilters(t *testing.T) {
 		router,
 		http.MethodGet,
 		"/categories?filter="+filter,
-		string(models.RoleAdmin),
+		string(models.ProjectRoleAdmin),
 	)
 	if adminList.Code != http.StatusOK {
 		t.Fatalf("admin filtered list status = %d, body=%s", adminList.Code, adminList.Body.String())
@@ -115,7 +115,7 @@ func TestCategoryHandlerVisibilityAndReferenceFilters(t *testing.T) {
 		router,
 		http.MethodGet,
 		fmt.Sprintf("/categories/%d", categories[1].ID),
-		string(models.RoleCustomer),
+		string(models.ProjectRoleRequester),
 	)
 	if hiddenGet.Code != http.StatusNotFound {
 		t.Fatalf("hidden category status = %d, want %d", hiddenGet.Code, http.StatusNotFound)
@@ -135,7 +135,7 @@ func TestCategoryHandlerVisibilityAndReferenceFilters(t *testing.T) {
 		router,
 		http.MethodGet,
 		"/categories?filter=%7B",
-		string(models.RoleAdmin),
+		string(models.ProjectRoleAdmin),
 	)
 	if invalidFilter.Code != http.StatusBadRequest {
 		t.Fatalf("invalid category filter status = %d, body=%s", invalidFilter.Code, invalidFilter.Body.String())

@@ -33,6 +33,22 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 	if got := document["openapi"]; got != "3.2.0" {
 		t.Fatalf("openapi = %v, want 3.2.0", got)
 	}
+	if bytes.Contains(Specification(), []byte("/api/v1")) {
+		t.Fatal("breaking v2 contract still exposes the removed /api/v1 surface")
+	}
+	servers := contractSlice(t, document["servers"], "servers")
+	if len(servers) != 1 {
+		t.Fatalf("servers = %d, want one project-scoped Agent REST server", len(servers))
+	}
+	projectServer := contractMap(t, servers[0], "servers[0]")
+	if got := projectServer["url"]; got !=
+		"https://chronodesk.example/api/v2/projects/{projectKey}" {
+		t.Fatalf("Agent REST server URL = %v", got)
+	}
+	serverVariables := contractMap(t, projectServer["variables"], "servers[0].variables")
+	if _, exists := serverVariables["projectKey"]; !exists {
+		t.Fatal("Agent REST server does not declare its projectKey variable")
+	}
 
 	paths := contractMap(t, document["paths"], "paths")
 	operationIDs := make(map[string]string)
@@ -47,6 +63,9 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 			operationID, ok := operation["operationId"].(string)
 			if !ok || strings.TrimSpace(operationID) == "" {
 				t.Fatalf("%s %s has no operationId", strings.ToUpper(method), path)
+			}
+			if strings.HasSuffix(operationID, "V1") {
+				t.Fatalf("%s %s retains removed v1 operationId %q", strings.ToUpper(method), path, operationID)
 			}
 			if previous, duplicate := operationIDs[operationID]; duplicate {
 				t.Fatalf("duplicate operationId %q on %s and %s %s", operationID, previous, strings.ToUpper(method), path)
@@ -65,16 +84,51 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 		"/events",
 		"/oauth/token",
 		"/.well-known/oauth-protected-resource/mcp",
-		"/.well-known/oauth-protected-resource/api/v1",
+		"/.well-known/oauth-protected-resource/api/v2",
 		"/.well-known/oauth-protected-resource/a2a/v1",
 		"/.well-known/agent-card.json",
 		"/mcp",
 		"/a2a/v1",
-		"/admin/leases/{leaseId}/force-release",
-		"/admin/attachments/{attachmentId}/scan",
+		"/projects/{projectKey}/admin/agents/agent-control/overview",
+		"/projects/{projectKey}/admin/agents/leases/{leaseId}/force-release",
+		"/projects/{projectKey}/admin/agents/attachments/{attachmentId}/scan",
 	} {
 		if _, exists := paths[path]; !exists {
 			t.Errorf("required protocol path %s is missing", path)
+		}
+	}
+	for path := range paths {
+		if strings.HasPrefix(path, "/admin/agents/") {
+			t.Errorf("removed global Agent administrator path remains: %s", path)
+		}
+		if !strings.HasPrefix(
+			path,
+			"/projects/{projectKey}/admin/agents/",
+		) {
+			continue
+		}
+		pathItem := contractMap(t, paths[path], "paths."+path)
+		parameters := contractSlice(
+			t,
+			pathItem["parameters"],
+			"paths."+path+".parameters",
+		)
+		if !contractSliceContainsReference(
+			parameters,
+			"#/components/parameters/HumanProjectKey",
+		) {
+			t.Errorf(
+				"project Agent administrator path %s does not require HumanProjectKey",
+				path,
+			)
+		}
+	}
+	for _, removed := range []string{
+		"/projects/{projectKey}/admin/agents/agent-control/read-only",
+		"/projects/{projectKey}/admin/agents/agent-control/emergency-stop",
+	} {
+		if _, exists := paths[removed]; exists {
+			t.Errorf("project route exposes forbidden platform mutation %s", removed)
 		}
 	}
 
@@ -105,6 +159,10 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 	patch := contractOperation(t, paths, "/tickets/{ticketId}", "patch")
 	if !hasOAuthScopeAlternative(patch, "tickets:update") {
 		t.Error("ordinary ticket patch has no tickets:update scope")
+	}
+	capabilities := contractOperation(t, paths, "/capabilities", "get")
+	if !hasOAuthScopeAlternative(capabilities, "tickets:read") {
+		t.Error("project capabilities discovery has no tickets:read scope")
 	}
 	for _, forbiddenScope := range []string{"tickets:assign", "tickets:transition"} {
 		if hasOAuthScopeAlternative(patch, forbiddenScope) {
@@ -153,6 +211,66 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 	if webhookPost["operationId"] != "receiveChronoDeskDomainEvent" {
 		t.Errorf("CloudEvent webhook operationId = %v", webhookPost["operationId"])
 	}
+	webhookParameters, ok := webhookPost["parameters"].([]any)
+	if !ok {
+		t.Fatal("CloudEvent webhook has no signed delivery parameters")
+	}
+	webhookHeaders := make(map[string]map[string]any, len(webhookParameters))
+	for _, rawParameter := range webhookParameters {
+		parameter := contractMap(t, rawParameter, "webhooks.domainEvent.post parameter")
+		name, _ := parameter["name"].(string)
+		webhookHeaders[name] = parameter
+	}
+	for _, name := range []string{
+		"X-ChronoDesk-Timestamp",
+		"X-ChronoDesk-Signature",
+		"X-CloudEvents-ID",
+		"Idempotency-Key",
+		"X-ChronoDesk-Delivery-ID",
+	} {
+		parameter := webhookHeaders[name]
+		if parameter == nil ||
+			parameter["in"] != "header" ||
+			parameter["required"] != true {
+			t.Errorf("CloudEvent webhook header %s is not required: %#v", name, parameter)
+		}
+	}
+	timestampDescription, _ := webhookHeaders["X-ChronoDesk-Timestamp"]["description"].(string)
+	if !strings.Contains(timestampDescription, "Unix time in seconds") ||
+		!strings.Contains(timestampDescription, "replay") {
+		t.Errorf("CloudEvent timestamp does not define replay semantics: %q", timestampDescription)
+	}
+	signature := webhookHeaders["X-ChronoDesk-Signature"]
+	signatureSchema := contractMap(
+		t,
+		signature["schema"],
+		"webhooks.domainEvent.post X-ChronoDesk-Signature schema",
+	)
+	if signatureSchema["pattern"] != "^v1=[a-f0-9]{64}$" {
+		t.Errorf("CloudEvent signature pattern = %v", signatureSchema["pattern"])
+	}
+	signatureDescription, _ := signature["description"].(string)
+	for _, signedPart := range []string{"timestamp", `"."`, "exact_raw_body"} {
+		if !strings.Contains(signatureDescription, signedPart) {
+			t.Errorf("CloudEvent signature does not bind %s: %q", signedPart, signatureDescription)
+		}
+	}
+	webhookRequestBody := contractMap(
+		t,
+		webhookPost["requestBody"],
+		"webhooks.domainEvent.post requestBody",
+	)
+	webhookContent := contractMap(
+		t,
+		webhookRequestBody["content"],
+		"webhooks.domainEvent.post requestBody content",
+	)
+	if _, exists := webhookContent["application/cloudevents+json"]; !exists {
+		t.Error("CloudEvent webhook is not published as structured CloudEvents JSON")
+	}
+	if _, exists := webhookContent["application/json"]; exists {
+		t.Error("CloudEvent webhook still publishes a generic application/json body")
+	}
 
 	adminWriteSchemas := []struct {
 		path       string
@@ -160,17 +278,15 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 		status     string
 		schemaName string
 	}{
-		{path: "/admin/agent-control/read-only", method: "put", status: "200", schemaName: "BooleanControlEnvelope"},
-		{path: "/admin/agent-control/emergency-stop", method: "put", status: "200", schemaName: "BooleanControlEnvelope"},
-		{path: "/admin/service-principals", method: "post", status: "201", schemaName: "IssuedCredentialEnvelope"},
-		{path: "/admin/service-principals/{principalId}/status", method: "put", status: "200", schemaName: "ServicePrincipalEnvelope"},
-		{path: "/admin/service-principals/{principalId}/credentials/rotate", method: "post", status: "200", schemaName: "IssuedCredentialEnvelope"},
-		{path: "/admin/service-principals/{principalId}/credentials/{credentialId}", method: "delete", status: "200", schemaName: "CredentialRevocationEnvelope"},
-		{path: "/admin/service-principals/{principalId}/policies", method: "post", status: "201", schemaName: "AgentPolicyEnvelope"},
-		{path: "/admin/service-principals/{principalId}/policies/{policyId}", method: "delete", status: "200", schemaName: "PolicyDisableEnvelope"},
-		{path: "/admin/leases/{leaseId}/force-release", method: "post", status: "200", schemaName: "AdminTicketLeaseEnvelope"},
-		{path: "/admin/attachments/{attachmentId}/scan", method: "post", status: "200", schemaName: "AttachmentScanEnvelope"},
-		{path: "/admin/outbox/{deliveryId}/replay", method: "post", status: "202", schemaName: "ReplayEnvelope"},
+		{path: "/projects/{projectKey}/admin/agents/service-principals", method: "post", status: "201", schemaName: "IssuedCredentialEnvelope"},
+		{path: "/projects/{projectKey}/admin/agents/service-principals/{principalId}/status", method: "put", status: "200", schemaName: "ServicePrincipalEnvelope"},
+		{path: "/projects/{projectKey}/admin/agents/service-principals/{principalId}/credentials/rotate", method: "post", status: "200", schemaName: "IssuedCredentialEnvelope"},
+		{path: "/projects/{projectKey}/admin/agents/service-principals/{principalId}/credentials/{credentialId}", method: "delete", status: "200", schemaName: "CredentialRevocationEnvelope"},
+		{path: "/projects/{projectKey}/admin/agents/service-principals/{principalId}/policies", method: "post", status: "201", schemaName: "AgentPolicyEnvelope"},
+		{path: "/projects/{projectKey}/admin/agents/service-principals/{principalId}/policies/{policyId}", method: "delete", status: "200", schemaName: "PolicyDisableEnvelope"},
+		{path: "/projects/{projectKey}/admin/agents/leases/{leaseId}/force-release", method: "post", status: "200", schemaName: "AdminTicketLeaseEnvelope"},
+		{path: "/projects/{projectKey}/admin/agents/attachments/{attachmentId}/scan", method: "post", status: "200", schemaName: "AttachmentScanEnvelope"},
+		{path: "/projects/{projectKey}/admin/agents/outbox/{deliveryId}/replay", method: "post", status: "202", schemaName: "ReplayEnvelope"},
 	}
 	schemas := contractMap(t, components["schemas"], "components.schemas")
 	for _, schemaName := range []string{"Ticket", "TicketCreate", "TicketFieldPatch", "Comment", "CommentCreate"} {
@@ -182,6 +298,44 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 		if _, exists := properties["attachment_ids"]; exists {
 			t.Errorf("%s exposes unsupported attachment association input", schemaName)
 		}
+	}
+	ticketCreate := contractMap(
+		t,
+		schemas["TicketCreate"],
+		"components.schemas.TicketCreate",
+	)
+	ticketCreateProperties := contractMap(
+		t,
+		ticketCreate["properties"],
+		"components.schemas.TicketCreate.properties",
+	)
+	for _, field := range []string{
+		"request_type_version_id",
+		"workflow_version_id",
+	} {
+		if !contractSliceContains(ticketCreate["required"], field) {
+			t.Errorf("TicketCreate does not require %s", field)
+		}
+		property := contractMap(
+			t,
+			ticketCreateProperties[field],
+			"components.schemas.TicketCreate.properties."+field,
+		)
+		if property["$ref"] != "#/components/schemas/ConfigurationVersionID" {
+			t.Errorf("TicketCreate %s schema = %#v", field, property)
+		}
+	}
+	configurationVersionID := contractMap(
+		t,
+		schemas["ConfigurationVersionID"],
+		"components.schemas.ConfigurationVersionID",
+	)
+	if configurationVersionID["type"] != "string" ||
+		configurationVersionID["format"] != "uuid" {
+		t.Errorf(
+			"ConfigurationVersionID schema = %#v",
+			configurationVersionID,
+		)
 	}
 	for _, removed := range []string{"TicketAssignmentPatch", "TicketTransitionPatch"} {
 		if _, exists := schemas[removed]; exists {
@@ -271,7 +425,8 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 			"ETag",
 		)
 		requiredHeaders := []string{"IdempotencyKey"}
-		isTopLevelCreate := expected.path == "/admin/service-principals"
+		isTopLevelCreate := expected.path ==
+			"/projects/{projectKey}/admin/agents/service-principals"
 		if !isTopLevelCreate {
 			requiredHeaders = append(requiredHeaders, "IfMatch")
 			assertOperationResponseRef(
@@ -318,9 +473,7 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 				responseName,
 			)
 		}
-		if !isTopLevelCreate &&
-			expected.path != "/admin/agent-control/read-only" &&
-			expected.path != "/admin/agent-control/emergency-stop" {
+		if !isTopLevelCreate {
 			assertOperationResponseRef(
 				t,
 				paths,
@@ -339,7 +492,7 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 	assertResponseHeaderRef(
 		t,
 		paths,
-		"/admin/service-principals/{principalId}/policies",
+		"/projects/{projectKey}/admin/agents/service-principals/{principalId}/policies",
 		"post",
 		"201",
 		"X-Parent-ETag",
@@ -348,11 +501,17 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 	for schemaName := range receiptSchemas {
 		assertSchemaRequiresReceipt(t, schemas, schemaName)
 	}
-	assertNoStoreCredentialResponse(t, paths, "/admin/service-principals", "post", "201")
 	assertNoStoreCredentialResponse(
 		t,
 		paths,
-		"/admin/service-principals/{principalId}/credentials/rotate",
+		"/projects/{projectKey}/admin/agents/service-principals",
+		"post",
+		"201",
+	)
+	assertNoStoreCredentialResponse(
+		t,
+		paths,
+		"/projects/{projectKey}/admin/agents/service-principals/{principalId}/credentials/rotate",
 		"post",
 		"200",
 	)
@@ -397,7 +556,10 @@ func assertEveryAdminWriteIsDeclared(
 	t.Helper()
 	found := make(map[string]bool)
 	for path, rawPathItem := range paths {
-		if !strings.HasPrefix(path, "/admin/") {
+		if !strings.HasPrefix(
+			path,
+			"/projects/{projectKey}/admin/agents/",
+		) {
 			continue
 		}
 		pathItem := contractMap(t, rawPathItem, "paths."+path)
@@ -423,7 +585,6 @@ func assertAdminResourceVersionContract(t *testing.T, schemas map[string]any) {
 	t.Helper()
 
 	closedSchemas := []string{
-		"BooleanControl",
 		"ServicePrincipalCreate",
 		"ServicePrincipalControl",
 		"ServicePrincipal",
@@ -450,8 +611,22 @@ func assertAdminResourceVersionContract(t *testing.T, schemas map[string]any) {
 		}
 		assertNoOpenAdditionalProperties(t, schema, "components.schemas."+name)
 	}
+	principalCreate := contractMap(
+		t,
+		schemas["ServicePrincipalCreate"],
+		"components.schemas.ServicePrincipalCreate",
+	)
+	principalCreateProperties := contractMap(
+		t,
+		principalCreate["properties"],
+		"components.schemas.ServicePrincipalCreate.properties",
+	)
+	if _, exists := principalCreateProperties["project_key"]; exists {
+		t.Error(
+			"ServicePrincipalCreate duplicates trusted path project_key in the request body",
+		)
+	}
 	for _, name := range []string{
-		"BooleanControlEnvelope",
 		"ServicePrincipalEnvelope",
 		"IssuedCredentialEnvelope",
 		"AgentPolicyEnvelope",
@@ -1170,7 +1345,7 @@ func assertMCPResourceBoundTokenContract(
 	}
 	for path, operationID := range map[string]string{
 		"/.well-known/oauth-protected-resource/mcp":    "getMCPOAuthProtectedResourceMetadata",
-		"/.well-known/oauth-protected-resource/api/v1": "getAPIOAuthProtectedResourceMetadata",
+		"/.well-known/oauth-protected-resource/api/v2": "getAPIOAuthProtectedResourceMetadata",
 		"/.well-known/oauth-protected-resource/a2a/v1": "getA2AOAuthProtectedResourceMetadata",
 	} {
 		operation := contractOperation(t, paths, path, "get")
@@ -1204,6 +1379,7 @@ func assertMCPResourceBoundTokenContract(
 	for _, field := range []string{
 		"client_id_metadata_document_supported",
 		"authorization_response_iss_parameter_supported",
+		"project_key_parameter_supported",
 	} {
 		if _, exists := authorizationProperties[field]; !exists {
 			t.Errorf("AuthorizationServerMetadata does not declare runtime %s", field)
@@ -1217,9 +1393,12 @@ func assertMCPResourceBoundTokenContract(
 	capabilityJSON := contractMap(t, capabilityContent["application/json"], "GET /capabilities JSON response")
 	capabilityExample := contractMap(t, capabilityJSON["example"], "GET /capabilities example")
 	capabilityData := contractMap(t, capabilityExample["data"], "GET /capabilities example data")
+	if got := capabilityData["asyncapi"]; got != "/asyncapi.yaml" {
+		t.Errorf("GET /capabilities asyncapi = %v, want /asyncapi.yaml", got)
+	}
 	oauthMetadata := contractMap(t, capabilityData["oauth_metadata"], "GET /capabilities oauth_metadata")
 	for resource, path := range map[string]string{
-		"api": "/.well-known/oauth-protected-resource/api/v1",
+		"api": "/.well-known/oauth-protected-resource/api/v2",
 		"mcp": "/.well-known/oauth-protected-resource/mcp",
 		"a2a": "/.well-known/oauth-protected-resource/a2a/v1",
 	} {
@@ -1249,7 +1428,7 @@ func assertMCPResourceBoundTokenContract(
 	formExamples := contractMap(t, form["examples"], "POST /oauth/token form examples")
 	for name, expectedResource := range map[string]string{
 		"mcp": "https://chronodesk.example/mcp",
-		"api": "https://chronodesk.example/api/v1",
+		"api": "https://chronodesk.example/api/v2",
 		"a2a": "https://chronodesk.example/a2a/v1",
 	} {
 		example := contractMap(t, formExamples[name], "POST /oauth/token "+name+" example")
@@ -1257,21 +1436,33 @@ func assertMCPResourceBoundTokenContract(
 		if got := value["resource"]; got != expectedResource {
 			t.Errorf("POST /oauth/token %s example resource = %v, want %s", name, got, expectedResource)
 		}
+		if got := value["project_key"]; got != "OPS" {
+			t.Errorf("POST /oauth/token %s example project_key = %v, want OPS", name, got)
+		}
 	}
 
 	tokenRequest := contractMap(t, schemas["OAuthTokenRequest"], "components.schemas.OAuthTokenRequest")
-	for _, field := range []string{"grant_type", "resource"} {
+	for _, field := range []string{"grant_type", "project_key", "resource"} {
 		if !contractSliceContains(tokenRequest["required"], field) {
 			t.Errorf("OAuthTokenRequest does not require %s", field)
 		}
 	}
 	requestProperties := contractMap(t, tokenRequest["properties"], "OAuthTokenRequest.properties")
+	projectKey := contractMap(t, requestProperties["project_key"], "OAuthTokenRequest.project_key")
+	if pattern := fmt.Sprint(projectKey["pattern"]); !strings.Contains(pattern, "[A-Z") {
+		t.Errorf("OAuthTokenRequest.project_key pattern = %v", projectKey["pattern"])
+	}
 	resource := contractMap(t, requestProperties["resource"], "OAuthTokenRequest.resource")
 	if got := resource["format"]; got != "uri" {
 		t.Errorf("OAuthTokenRequest.resource format = %v, want uri", got)
 	}
+
+	tokenResponse := contractMap(t, schemas["OAuthTokenResponse"], "components.schemas.OAuthTokenResponse")
+	if !contractSliceContains(tokenResponse["required"], "project_key") {
+		t.Error("OAuthTokenResponse does not require project_key")
+	}
 	resourceDescription := fmt.Sprint(resource["description"])
-	for _, audience := range []string{"${APP_URL}/mcp", "${APP_URL}/api/v1", "${APP_URL}/a2a/v1"} {
+	for _, audience := range []string{"${APP_URL}/mcp", "${APP_URL}/api/v2", "${APP_URL}/a2a/v1"} {
 		if !strings.Contains(resourceDescription, audience) {
 			t.Errorf("OAuthTokenRequest.resource does not document canonical audience %s", audience)
 		}
@@ -1467,6 +1658,25 @@ func contractMap(t *testing.T, value any, location string) map[string]any {
 		t.Fatalf("%s is %T, want object", location, value)
 	}
 	return result
+}
+
+func contractSlice(t *testing.T, value any, location string) []any {
+	t.Helper()
+	result, ok := value.([]any)
+	if !ok {
+		t.Fatalf("%s is %T, want array", location, value)
+	}
+	return result
+}
+
+func contractSliceContainsReference(values []any, expected string) bool {
+	for _, raw := range values {
+		value, ok := raw.(map[string]any)
+		if ok && value["$ref"] == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func walkContract(value any, location string, visitRef func(location, ref string)) {

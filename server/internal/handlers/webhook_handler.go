@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 	"gorm.io/gorm"
@@ -56,23 +58,24 @@ type CreateWebhookRequest struct {
 
 // UpdateWebhookRequest 更新webhook请求结构
 type UpdateWebhookRequest struct {
-	Name            *string                    `json:"name" binding:"omitempty,max=100"`
-	Description     *string                    `json:"description" binding:"omitempty,max=500"`
-	Provider        *models.WebhookProvider    `json:"provider"`
-	WebhookURL      *string                    `json:"webhook_url" binding:"omitempty,url"`
-	Secret          *string                    `json:"secret"`
-	AccessToken     *string                    `json:"access_token"`
-	EnabledEvents   *[]models.WebhookEventType `json:"enabled_events"`
-	MessageTemplate *string                    `json:"message_template"`
-	MessageFormat   *string                    `json:"message_format"`
-	FilterRules     *models.WebhookFilterRules `json:"filter_rules"`
-	RetryCount      *int                       `json:"retry_count"`
-	RetryInterval   *int                       `json:"retry_interval"`
-	TimeoutSeconds  *int                       `json:"timeout_seconds"`
-	IsAsync         *bool                      `json:"is_async"`
-	RateLimit       *int                       `json:"rate_limit"`
-	RateLimitWindow *int                       `json:"rate_limit_window"`
-	Status          *models.WebhookStatus      `json:"status"`
+	Name                 *string                    `json:"name" binding:"omitempty,max=100"`
+	Description          *string                    `json:"description" binding:"omitempty,max=500"`
+	Provider             *models.WebhookProvider    `json:"provider"`
+	WebhookURL           *string                    `json:"webhook_url" binding:"omitempty,url"`
+	Secret               *string                    `json:"secret"`
+	SecretOverlapSeconds *int                       `json:"secret_overlap_seconds"`
+	AccessToken          *string                    `json:"access_token"`
+	EnabledEvents        *[]models.WebhookEventType `json:"enabled_events"`
+	MessageTemplate      *string                    `json:"message_template"`
+	MessageFormat        *string                    `json:"message_format"`
+	FilterRules          *models.WebhookFilterRules `json:"filter_rules"`
+	RetryCount           *int                       `json:"retry_count"`
+	RetryInterval        *int                       `json:"retry_interval"`
+	TimeoutSeconds       *int                       `json:"timeout_seconds"`
+	IsAsync              *bool                      `json:"is_async"`
+	RateLimit            *int                       `json:"rate_limit"`
+	RateLimitWindow      *int                       `json:"rate_limit_window"`
+	Status               *models.WebhookStatus      `json:"status"`
 }
 
 // ListWebhooksResponse 列表响应结构
@@ -96,6 +99,10 @@ type ListWebhooksResponse struct {
 // @Router /api/webhooks [post]
 // @Security BearerAuth
 func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
+	operation, ok := requireWebhookProjectAccess(c, true)
+	if !ok {
+		return
+	}
 	var req CreateWebhookRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -107,18 +114,12 @@ func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
 	}
 
 	// 获取当前用户ID
-	userID, exists := c.Get("user_id")
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"code": 1,
-			"msg":  "用户未认证",
-			"data": nil,
-		})
-		return
-	}
+	userID := c.GetUint("user_id")
 
 	// 创建webhook配置
 	webhook := models.WebhookConfig{
+		OrganizationID:  operation.Scope.OrganizationID,
+		ProjectID:       operation.Scope.ProjectID,
 		Name:            req.Name,
 		Description:     req.Description,
 		Provider:        req.Provider,
@@ -132,7 +133,7 @@ func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
 		RateLimit:       req.RateLimit,
 		RateLimitWindow: req.RateLimitWindow,
 		Status:          models.WebhookStatusActive,
-		CreatedBy:       userID.(uint),
+		CreatedBy:       userID,
 	}
 	if err := webhook.SetSubscriptions(req.EnabledEvents, req.FilterRules, true); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -171,28 +172,32 @@ func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
 		return
 	}
 
-	if err := h.db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&webhook).Error; err != nil {
-			return err
-		}
-		secret, err := h.protectWebhookSecret(webhook.ID, "secret", req.Secret)
-		if err != nil {
-			return err
-		}
-		accessToken, err := h.protectWebhookSecret(webhook.ID, "access_token", req.AccessToken)
-		if err != nil {
-			return err
-		}
-		if secret == "" && accessToken == "" {
-			return nil
-		}
-		webhook.Secret = secret
-		webhook.AccessToken = accessToken
-		return tx.Model(&webhook).Updates(map[string]any{
-			"secret":       secret,
-			"access_token": accessToken,
-		}).Error
-	}); err != nil {
+	if err := scopeddb.TransactionForContext(
+		c.Request.Context(),
+		h.db,
+		func(tx *gorm.DB) error {
+			if err := tx.Create(&webhook).Error; err != nil {
+				return err
+			}
+			secret, err := h.protectWebhookSecret(webhook.ID, "secret", req.Secret)
+			if err != nil {
+				return err
+			}
+			accessToken, err := h.protectWebhookSecret(webhook.ID, "access_token", req.AccessToken)
+			if err != nil {
+				return err
+			}
+			if secret == "" && accessToken == "" {
+				return nil
+			}
+			webhook.Secret = secret
+			webhook.AccessToken = accessToken
+			return tx.Model(&webhook).Updates(map[string]any{
+				"secret":       secret,
+				"access_token": accessToken,
+			}).Error
+		},
+	); err != nil {
 		logHandlerFailure(c, "webhook.create", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code": 1,
@@ -229,6 +234,10 @@ func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
 // @Router /api/webhooks [get]
 // @Security BearerAuth
 func (h *WebhookHandler) ListWebhooks(c *gin.Context) {
+	operation, ok := requireWebhookProjectAccess(c, false)
+	if !ok {
+		return
+	}
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "10"))
 	provider := c.Query("provider")
@@ -244,7 +253,13 @@ func (h *WebhookHandler) ListWebhooks(c *gin.Context) {
 	offset := (page - 1) * pageSize
 
 	// 构建查询
-	query := h.db.WithContext(c.Request.Context()).Model(&models.WebhookConfig{})
+	query := h.db.WithContext(c.Request.Context()).
+		Model(&models.WebhookConfig{}).
+		Where(
+			"organization_id = ? AND project_id = ?",
+			operation.Scope.OrganizationID,
+			operation.Scope.ProjectID,
+		)
 
 	if provider != "" {
 		query = query.Where("provider = ?", provider)
@@ -308,6 +323,10 @@ func (h *WebhookHandler) ListWebhooks(c *gin.Context) {
 // @Router /api/webhooks/{id} [get]
 // @Security BearerAuth
 func (h *WebhookHandler) GetWebhook(c *gin.Context) {
+	operation, ok := requireWebhookProjectAccess(c, false)
+	if !ok {
+		return
+	}
 	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -319,8 +338,16 @@ func (h *WebhookHandler) GetWebhook(c *gin.Context) {
 	}
 
 	var webhook models.WebhookConfig
-	if err := h.db.WithContext(c.Request.Context()).Preload("Creator").Preload("Updater").
-		First(&webhook, uint(id)).Error; err != nil {
+	if err := h.db.WithContext(c.Request.Context()).
+		Preload("Creator").
+		Preload("Updater").
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			uint(id),
+			operation.Scope.OrganizationID,
+			operation.Scope.ProjectID,
+		).
+		First(&webhook).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{
 				"code": 1,
@@ -360,6 +387,10 @@ func (h *WebhookHandler) GetWebhook(c *gin.Context) {
 // @Router /api/webhooks/{id} [put]
 // @Security BearerAuth
 func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
+	operation, ok := requireWebhookProjectAccess(c, true)
+	if !ok {
+		return
+	}
 	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -381,19 +412,16 @@ func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 	}
 
 	// 获取当前用户ID
-	userID, exists := c.Get("user_id")
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"code": 1,
-			"msg":  "用户未认证",
-			"data": nil,
-		})
-		return
-	}
+	userID := c.GetUint("user_id")
 
 	// 检查webhook是否存在
 	var webhook models.WebhookConfig
-	if err := h.db.WithContext(c.Request.Context()).First(&webhook, uint(id)).Error; err != nil {
+	if err := h.db.WithContext(c.Request.Context()).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		uint(id),
+		operation.Scope.OrganizationID,
+		operation.Scope.ProjectID,
+	).First(&webhook).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{
 				"code": 1,
@@ -413,7 +441,7 @@ func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 
 	// 更新字段
 	updates := map[string]interface{}{
-		"updated_by": userID.(uint),
+		"updated_by": userID,
 	}
 
 	if req.Name != nil {
@@ -437,6 +465,66 @@ func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 		updates["webhook_url"] = *req.WebhookURL
 	}
 	if req.Secret != nil {
+		if strings.TrimSpace(*req.Secret) == "" {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code": 1,
+				"msg":  "Webhook 签名密钥不能为空",
+				"data": nil,
+			})
+			return
+		}
+		overlapSeconds := 24 * 60 * 60
+		if req.SecretOverlapSeconds != nil {
+			overlapSeconds = *req.SecretOverlapSeconds
+		}
+		if overlapSeconds < 0 || overlapSeconds > 7*24*60*60 {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code": 1,
+				"msg":  "Webhook 密钥重叠期必须在 0 到 7 天之间",
+				"data": nil,
+			})
+			return
+		}
+		previousSecret := ""
+		var previousExpiresAt *time.Time
+		if overlapSeconds > 0 && webhook.Secret != "" {
+			plaintext, revealErr := security.RevealOptional(
+				h.secretStore,
+				webhook.Secret,
+				security.FieldAAD(
+					"webhook_configs",
+					strconv.FormatUint(uint64(webhook.ID), 10),
+					"secret",
+				),
+			)
+			if revealErr != nil {
+				logHandlerFailure(c, "webhook.reveal_previous_secret", revealErr)
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"code": 1,
+					"msg":  "更新webhook失败，请检查加密配置",
+					"data": nil,
+				})
+				return
+			}
+			previousSecret, revealErr = h.protectWebhookSecret(
+				webhook.ID,
+				"previous_secret",
+				plaintext,
+			)
+			if revealErr != nil {
+				logHandlerFailure(c, "webhook.protect_previous_secret", revealErr)
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"code": 1,
+					"msg":  "更新webhook失败，请检查加密配置",
+					"data": nil,
+				})
+				return
+			}
+			expiresAt := time.Now().UTC().Add(
+				time.Duration(overlapSeconds) * time.Second,
+			)
+			previousExpiresAt = &expiresAt
+		}
 		secret, err := h.protectWebhookSecret(webhook.ID, "secret", *req.Secret)
 		if err != nil {
 			logHandlerFailure(c, "webhook.protect_secret", err)
@@ -448,6 +536,8 @@ func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 			return
 		}
 		updates["secret"] = secret
+		updates["previous_secret"] = previousSecret
+		updates["previous_secret_expires_at"] = previousExpiresAt
 	}
 	if req.AccessToken != nil {
 		accessToken, err := h.protectWebhookSecret(webhook.ID, "access_token", *req.AccessToken)
@@ -511,7 +601,15 @@ func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 	}
 
 	// 执行更新
-	if err := h.db.WithContext(c.Request.Context()).Model(&webhook).Updates(updates).Error; err != nil {
+	if err := h.db.WithContext(c.Request.Context()).
+		Model(&models.WebhookConfig{}).
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			webhook.ID,
+			operation.Scope.OrganizationID,
+			operation.Scope.ProjectID,
+		).
+		Updates(updates).Error; err != nil {
 		logHandlerFailure(c, "webhook.update", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code": 1,
@@ -525,7 +623,13 @@ func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 	if err := h.db.WithContext(c.Request.Context()).
 		Preload("Creator").
 		Preload("Updater").
-		First(&webhook, webhook.ID).Error; err != nil {
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			webhook.ID,
+			operation.Scope.OrganizationID,
+			operation.Scope.ProjectID,
+		).
+		First(&webhook).Error; err != nil {
 		logHandlerFailure(c, "webhook.reload_after_update", err)
 	}
 
@@ -565,6 +669,10 @@ func (h *WebhookHandler) protectWebhookSecret(
 // @Router /api/webhooks/{id} [delete]
 // @Security BearerAuth
 func (h *WebhookHandler) DeleteWebhook(c *gin.Context) {
+	operation, ok := requireWebhookProjectAccess(c, true)
+	if !ok {
+		return
+	}
 	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -577,7 +685,12 @@ func (h *WebhookHandler) DeleteWebhook(c *gin.Context) {
 
 	// 检查webhook是否存在
 	var webhook models.WebhookConfig
-	if err := h.db.WithContext(c.Request.Context()).First(&webhook, uint(id)).Error; err != nil {
+	if err := h.db.WithContext(c.Request.Context()).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		uint(id),
+		operation.Scope.OrganizationID,
+		operation.Scope.ProjectID,
+	).First(&webhook).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{
 				"code": 1,
@@ -596,7 +709,12 @@ func (h *WebhookHandler) DeleteWebhook(c *gin.Context) {
 	}
 
 	// 软删除
-	if err := h.db.WithContext(c.Request.Context()).Delete(&webhook).Error; err != nil {
+	if err := h.db.WithContext(c.Request.Context()).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		webhook.ID,
+		operation.Scope.OrganizationID,
+		operation.Scope.ProjectID,
+	).Delete(&models.WebhookConfig{}).Error; err != nil {
 		logHandlerFailure(c, "webhook.delete", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code": 1,
@@ -626,6 +744,10 @@ func (h *WebhookHandler) DeleteWebhook(c *gin.Context) {
 // @Router /api/webhooks/{id}/test [post]
 // @Security BearerAuth
 func (h *WebhookHandler) TestWebhook(c *gin.Context) {
+	operation, ok := requireWebhookProjectAccess(c, true)
+	if !ok {
+		return
+	}
 	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -638,7 +760,11 @@ func (h *WebhookHandler) TestWebhook(c *gin.Context) {
 
 	// 测试webhook
 	ctx := c.Request.Context()
-	if err := h.notificationService.TestWebhook(ctx, uint(id)); err != nil {
+	if err := h.notificationService.TestWebhook(
+		ctx,
+		operation.Scope,
+		uint(id),
+	); err != nil {
 		logHandlerFailure(c, "webhook.test", err)
 		c.JSON(http.StatusBadRequest, gin.H{
 			"code": 1,
@@ -670,6 +796,10 @@ func (h *WebhookHandler) TestWebhook(c *gin.Context) {
 // @Router /api/webhooks/{id}/logs [get]
 // @Security BearerAuth
 func (h *WebhookHandler) GetWebhookLogs(c *gin.Context) {
+	operation, ok := requireWebhookProjectAccess(c, false)
+	if !ok {
+		return
+	}
 	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -694,7 +824,14 @@ func (h *WebhookHandler) GetWebhookLogs(c *gin.Context) {
 	offset := (page - 1) * pageSize
 
 	// 构建查询
-	query := h.db.WithContext(c.Request.Context()).Model(&models.WebhookLog{}).Where("config_id = ?", uint(id))
+	query := h.db.WithContext(c.Request.Context()).
+		Model(&models.WebhookLog{}).
+		Where(
+			"organization_id = ? AND project_id = ? AND config_id = ?",
+			operation.Scope.OrganizationID,
+			operation.Scope.ProjectID,
+			uint(id),
+		)
 
 	if status != "" {
 		query = query.Where("status = ?", status)
@@ -752,6 +889,10 @@ func (h *WebhookHandler) GetWebhookLogs(c *gin.Context) {
 // @Router /api/webhooks/{id}/stats [get]
 // @Security BearerAuth
 func (h *WebhookHandler) GetWebhookStats(c *gin.Context) {
+	operation, ok := requireWebhookProjectAccess(c, false)
+	if !ok {
+		return
+	}
 	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -777,8 +918,15 @@ func (h *WebhookHandler) GetWebhookStats(c *gin.Context) {
 	}
 
 	var webhook models.WebhookConfig
-	if err := h.db.WithContext(c.Request.Context()).Select("total_sent, total_success, total_failed").
-		First(&webhook, uint(id)).Error; err != nil {
+	if err := h.db.WithContext(c.Request.Context()).
+		Select("total_sent, total_success, total_failed").
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			uint(id),
+			operation.Scope.OrganizationID,
+			operation.Scope.ProjectID,
+		).
+		First(&webhook).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{
 				"code": 1,
@@ -815,10 +963,16 @@ func (h *WebhookHandler) GetWebhookStats(c *gin.Context) {
 			COUNT(CASE WHEN status = 'success' THEN 1 END) as success,
 			COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed
 		FROM webhook_logs 
-		WHERE config_id = ? AND created_at >= ?
+		WHERE organization_id = ? AND project_id = ?
+		  AND config_id = ? AND created_at >= ?
 		GROUP BY DATE(created_at)
 		ORDER BY date
-	`, uint(id), startTime).Rows()
+	`,
+		operation.Scope.OrganizationID,
+		operation.Scope.ProjectID,
+		uint(id),
+		startTime,
+	).Rows()
 
 	if err != nil {
 		logHandlerFailure(c, "webhook.query_stats", err)
@@ -868,4 +1022,43 @@ func (h *WebhookHandler) GetWebhookStats(c *gin.Context) {
 			"period":      fmt.Sprintf("最近%d天", days),
 		},
 	})
+}
+
+func requireWebhookProjectAccess(
+	c *gin.Context,
+	manage bool,
+) (services.OperationContext, bool) {
+	if c == nil || c.Request == nil {
+		return services.OperationContext{}, false
+	}
+	operation, err := services.OperationContextFromContext(c.Request.Context())
+	if err != nil || operation.Source != services.SourceProtocolHumanREST ||
+		operation.Actor.Type != models.ActorTypeHuman {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+			"code": 1,
+			"msg":  "无权访问项目 Webhook",
+			"data": nil,
+		})
+		return services.OperationContext{}, false
+	}
+	access, exists := ProjectAccessFromGin(c)
+	if !exists || access.Scope != operation.Scope {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+			"code": 1,
+			"msg":  "无权访问项目 Webhook",
+			"data": nil,
+		})
+		return services.OperationContext{}, false
+	}
+	if manage &&
+		access.Role != models.ProjectRoleAdmin &&
+		access.Role != models.ProjectRoleManager {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+			"code": 1,
+			"msg":  "仅项目管理员或经理可管理 Webhook",
+			"data": nil,
+		})
+		return services.OperationContext{}, false
+	}
+	return operation, true
 }

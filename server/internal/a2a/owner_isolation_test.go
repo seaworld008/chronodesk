@@ -62,17 +62,17 @@ func TestTaskOwnerIsolationAcrossStores(t *testing.T) {
 			service := NewService(store, BackendFuncs{}, ServiceOptions{
 				PushDispatcher: noopTestPushDispatcher{},
 			})
-			ownerA := WithTaskOwner(context.Background(), TaskOwner{
+			ownerA := WithTaskOwner(a2aTestContext(t), TaskOwner{
 				ActorType:    "service_principal",
 				ActorID:      "principal-a",
 				CredentialID: "credential-a",
 			})
-			rotatedA := WithTaskOwner(context.Background(), TaskOwner{
+			rotatedA := WithTaskOwner(a2aTestContext(t), TaskOwner{
 				ActorType:    "service_principal",
 				ActorID:      "principal-a",
 				CredentialID: "credential-a-rotated",
 			})
-			ownerB := WithTaskOwner(context.Background(), TaskOwner{
+			ownerB := WithTaskOwner(a2aTestContext(t), TaskOwner{
 				ActorType:    "service_principal",
 				ActorID:      "principal-b",
 				CredentialID: "credential-b",
@@ -239,7 +239,7 @@ func TestTaskOwnerIsolationAcrossStores(t *testing.T) {
 }
 
 func TestScopedCreateCannotForgeTaskOwner(t *testing.T) {
-	ctx := WithTaskOwner(context.Background(), TaskOwner{
+	ctx := WithTaskOwner(a2aTestContext(t), TaskOwner{
 		ActorType:    "service_principal",
 		ActorID:      "principal-a",
 		CredentialID: "credential-a",

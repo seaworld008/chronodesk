@@ -31,6 +31,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var (
@@ -81,6 +82,8 @@ const (
 	defaultIdempotencyRetentionTTL    = 24 * time.Hour
 	defaultIdempotencyProcessingLease = 2 * time.Minute
 	idempotencyFailureCleanupTimeout  = 5 * time.Second
+	webhookConfiguredDestinationID    = "configured"
+	webhookSnapshotDestinationPrefix  = "snapshot:"
 )
 
 // AgentNativeErrorCode turns exported sentinel errors into stable API codes.
@@ -146,6 +149,12 @@ func AgentNativeErrorCode(err error) string {
 		return "invalid_comment"
 	case errors.Is(err, ErrOutboxReplayConflict):
 		return "outbox_replay_conflict"
+	case errors.Is(err, ErrTicketConfigurationUnavailable):
+		return "ticket_configuration_unavailable"
+	case errors.Is(err, ErrTicketRequestTypeAmbiguous):
+		return "request_type_version_required"
+	case errors.Is(err, ErrTicketFormValidation):
+		return "ticket_form_validation_failed"
 	case errors.Is(err, gorm.ErrRecordNotFound):
 		return "not_found"
 	default:
@@ -239,6 +248,7 @@ type AgentNativeOptions struct {
 	LoopWindow                 time.Duration
 	ExecutionGuard             AgentExecutionGuard
 	ExecutionLeaseTTL          time.Duration
+	AuditLedger                *AuditLedgerService
 	// RequireDistributedExecutionGuard prevents a production deployment from
 	// silently falling back to process-local enforcement when Redis is absent.
 	RequireDistributedExecutionGuard bool
@@ -249,6 +259,8 @@ type AgentNativeOptions struct {
 // comment and attachment invariants shared by REST, MCP and A2A adapters.
 type AgentNativeService struct {
 	db                         *gorm.DB
+	sla                        *SLAService
+	slaProjectionEnabled       bool
 	credentialPepper           []byte
 	eventSource                string
 	defaultOutboxTargets       []OutboxTarget
@@ -262,10 +274,12 @@ type AgentNativeService struct {
 	outboxLockTTL              time.Duration
 	outboxDeliveryTimeout      time.Duration
 	outboxDeliverySlots        chan struct{}
+	outboxProjectCursor        atomic.Uint64
 	loopThreshold              int
 	loopWindow                 time.Duration
 	executionGuard             AgentExecutionGuard
 	executionLeaseTTL          time.Duration
+	auditLedger                *AuditLedgerService
 	requireDistributedGuard    bool
 	now                        func() time.Time
 
@@ -288,7 +302,7 @@ func (s *AgentNativeService) InTransaction(
 	if existing, ok := ctx.Value(agentNativeTransactionContextKey{}).(*gorm.DB); ok && existing != nil {
 		return fn(ctx, existing.WithContext(ctx))
 	}
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		txCtx := context.WithValue(ctx, agentNativeTransactionContextKey{}, tx)
 		return fn(txCtx, tx.WithContext(txCtx))
 	})
@@ -299,6 +313,21 @@ func (s *AgentNativeService) dbForContext(ctx context.Context) *gorm.DB {
 		return tx.WithContext(ctx)
 	}
 	return s.db.WithContext(ctx)
+}
+
+func (s *AgentNativeService) projectTicketSLAOnDB(
+	ctx context.Context,
+	db *gorm.DB,
+	ticket *models.Ticket,
+	now time.Time,
+) (slaProjection, *TicketSLAStatus, error) {
+	if s.sla == nil || db == nil || !s.slaProjectionEnabled {
+		return slaProjection{
+			DueDate:  ticket.SLADueDate,
+			Breached: ticket.SLABreached,
+		}, nil, nil
+	}
+	return s.sla.projectionForTicketOnDB(ctx, db, ticket, now)
 }
 
 func NewAgentNativeService(db *gorm.DB, provided ...AgentNativeOptions) *AgentNativeService {
@@ -357,9 +386,12 @@ func NewAgentNativeService(db *gorm.DB, provided ...AgentNativeOptions) *AgentNa
 	if options.Now == nil {
 		options.Now = time.Now
 	}
+	slaProjectionEnabled := db != nil && db.Migrator().HasTable(&models.SLAConfig{})
 
 	return &AgentNativeService{
 		db:                         db,
+		sla:                        newSLAServiceWithClock(db, options.Now),
+		slaProjectionEnabled:       slaProjectionEnabled,
 		credentialPepper:           append([]byte(nil), options.CredentialPepper...),
 		eventSource:                options.EventSource,
 		defaultOutboxTargets:       append([]OutboxTarget(nil), options.DefaultOutboxTargets...),
@@ -377,6 +409,7 @@ func NewAgentNativeService(db *gorm.DB, provided ...AgentNativeOptions) *AgentNa
 		loopWindow:                 options.LoopWindow,
 		executionGuard:             options.ExecutionGuard,
 		executionLeaseTTL:          options.ExecutionLeaseTTL,
+		auditLedger:                options.AuditLedger,
 		requireDistributedGuard:    options.RequireDistributedExecutionGuard,
 		now:                        options.Now,
 	}
@@ -630,7 +663,7 @@ func (s *AgentNativeService) ValidateCredential(
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	if err := transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		if err := tx.Model(&models.AgentCredential{}).
 			Where("id = ?", credential.ID).
 			Update("last_used_at", now).Error; err != nil {
@@ -659,7 +692,7 @@ func (s *AgentNativeService) ValidateCredentialReference(
 		return err
 	}
 	var credential models.AgentCredential
-	if err := s.db.WithContext(ctx).
+	if err := s.dbForContext(ctx).
 		Where("id = ? AND service_principal_id = ?", credentialID, principalID).
 		First(&credential).Error; err != nil {
 		return ErrInvalidCredential
@@ -809,6 +842,7 @@ type PolicyCheckInput struct {
 }
 
 func (s *AgentNativeService) CheckAction(ctx context.Context, input PolicyCheckInput) (*models.PolicyDecision, error) {
+	db := s.dbForContext(ctx)
 	loopGuarded := input.IsWrite && input.RequestDigest != "" && s.loopThreshold > 0
 	principal, principalErr := s.getUsablePrincipal(ctx, input.ServicePrincipalID)
 	var credentialErr error
@@ -840,7 +874,7 @@ func (s *AgentNativeService) CheckAction(ctx context.Context, input PolicyCheckI
 
 	var policies []models.AgentPolicy
 	if principalErr == nil {
-		if err := s.db.WithContext(ctx).
+		if err := db.
 			Where("service_principal_id = ? AND is_active = ?", input.ServicePrincipalID, true).
 			Where("expires_at IS NULL OR expires_at > ?", s.now()).
 			Order("priority DESC, created_at ASC").
@@ -919,7 +953,12 @@ func (s *AgentNativeService) CheckAction(ctx context.Context, input PolicyCheckI
 		SourceProtocol:     input.SourceProtocol,
 		Context:            datatypes.JSON(contextJSON),
 	}
-	if err := s.db.WithContext(ctx).Create(decision).Error; err != nil {
+	if operationContext, contextErr := OperationContextFromContext(ctx); contextErr == nil &&
+		operationContext.Actor == models.ServicePrincipalActor(input.ServicePrincipalID) {
+		decision.OrganizationID = operationContext.Scope.OrganizationID
+		decision.ProjectID = operationContext.Scope.ProjectID
+	}
+	if err := db.Create(decision).Error; err != nil {
 		return nil, fmt.Errorf("persist policy decision: %w", err)
 	}
 	if !allowed {
@@ -1242,6 +1281,7 @@ func (s *AgentNativeService) ReserveIdempotency(
 	requestBody []byte,
 	ttl time.Duration,
 ) (*IdempotencyReservation, error) {
+	db := s.dbForContext(ctx)
 	if err := actor.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidActor, err)
 	}
@@ -1271,15 +1311,27 @@ func (s *AgentNativeService) ReserveIdempotency(
 		ExpiresAt:                now.Add(processingLease),
 		CompletionTTLNanoseconds: ttl.Nanoseconds(),
 	}
-	if err := s.db.WithContext(ctx).Create(record).Error; err == nil {
+	if operationContext, contextErr := OperationContextFromContext(ctx); contextErr == nil && operationContext.Actor == actor {
+		record.OrganizationID = operationContext.Scope.OrganizationID
+		record.ProjectID = operationContext.Scope.ProjectID
+	}
+	if err := db.Create(record).Error; err == nil {
 		return &IdempotencyReservation{Record: record}, nil
 	} else if !isUniqueConstraintError(err) {
 		return nil, fmt.Errorf("reserve idempotency key: %w", err)
 	}
 
 	var existing models.IdempotencyRecord
-	if err := s.db.WithContext(ctx).
-		Where("actor_type = ? AND actor_id = ? AND operation = ? AND key = ?", actor.Type, actor.ID, operation, key).
+	if err := db.
+		Where(
+			"organization_id = ? AND project_id = ? AND actor_type = ? AND actor_id = ? AND operation = ? AND key = ?",
+			record.OrganizationID,
+			record.ProjectID,
+			actor.Type,
+			actor.ID,
+			operation,
+			key,
+		).
 		First(&existing).Error; err != nil {
 		return nil, fmt.Errorf("load idempotency key: %w", err)
 	}
@@ -1302,7 +1354,7 @@ func (s *AgentNativeService) ReserveIdempotency(
 
 	replacementID := newNativeID()
 	processingLeaseCutoff := now.Add(-s.idempotencyProcessingLease)
-	result := s.db.WithContext(ctx).Model(&models.IdempotencyRecord{}).
+	result := db.Model(&models.IdempotencyRecord{}).
 		Where(
 			`id = ? AND (
 				state = ?
@@ -1339,7 +1391,7 @@ func (s *AgentNativeService) ReserveIdempotency(
 		return nil, ErrIdempotencyInProgress
 	}
 	var refreshed models.IdempotencyRecord
-	if err := s.db.WithContext(ctx).First(&refreshed, "id = ?", replacementID).Error; err != nil {
+	if err := db.First(&refreshed, "id = ?", replacementID).Error; err != nil {
 		return nil, fmt.Errorf("reload idempotency reservation: %w", err)
 	}
 	return &IdempotencyReservation{Record: &refreshed}, nil
@@ -1485,39 +1537,46 @@ func (s *AgentNativeService) FailIdempotency(ctx context.Context, recordID strin
 }
 
 type DomainEventInput struct {
-	ID              string
-	Source          string
-	Type            string
-	Subject         string
-	Time            time.Time
-	DataSchema      string
-	Data            any
-	TraceID         string
-	CorrelationID   string
-	CausationID     string
-	Actor           models.ActorRef
-	ResourceVersion uint64
+	ID                   string
+	Source               string
+	Type                 string
+	Subject              string
+	Time                 time.Time
+	DataSchema           string
+	Data                 any
+	TraceID              string
+	CorrelationID        string
+	CausationID          string
+	Actor                models.ActorRef
+	ResourceVersion      uint64
+	Scope                models.ProjectScope
+	ConfigurationVersion string
+	PolicyDecisionID     string
 	// Service-principal events may fan out to external webhooks only after a
 	// separate risky policy check explicitly allows that side effect.
 	AllowExternalNotifications bool
 }
 
 type CloudEventEnvelope struct {
-	SpecVersion     string           `json:"specversion"`
-	ID              string           `json:"id"`
-	Source          string           `json:"source"`
-	Type            string           `json:"type"`
-	Subject         string           `json:"subject,omitempty"`
-	Time            time.Time        `json:"time"`
-	DataContentType string           `json:"datacontenttype"`
-	DataSchema      string           `json:"dataschema,omitempty"`
-	TraceID         string           `json:"traceid,omitempty"`
-	CorrelationID   string           `json:"correlationid,omitempty"`
-	CausationID     string           `json:"causationid,omitempty"`
-	ActorType       models.ActorType `json:"actortype"`
-	ActorID         string           `json:"actorid"`
-	ResourceVersion uint64           `json:"resourceversion"`
-	Data            json.RawMessage  `json:"data"`
+	SpecVersion          string           `json:"specversion"`
+	ID                   string           `json:"id"`
+	Source               string           `json:"source"`
+	Type                 string           `json:"type"`
+	Subject              string           `json:"subject,omitempty"`
+	Time                 time.Time        `json:"time"`
+	DataContentType      string           `json:"datacontenttype"`
+	DataSchema           string           `json:"dataschema,omitempty"`
+	TraceID              string           `json:"traceid,omitempty"`
+	CorrelationID        string           `json:"correlationid,omitempty"`
+	CausationID          string           `json:"causationid,omitempty"`
+	ActorType            models.ActorType `json:"actortype"`
+	ActorID              string           `json:"actorid"`
+	ResourceVersion      uint64           `json:"resourceversion"`
+	OrganizationID       uint             `json:"organizationid,omitempty"`
+	ProjectID            uint             `json:"projectid,omitempty"`
+	ConfigurationVersion string           `json:"configurationversion,omitempty"`
+	PolicyDecisionID     string           `json:"policydecisionid,omitempty"`
+	Data                 json.RawMessage  `json:"data"`
 	// InternalData contains the persisted event payload before private Outbox
 	// fields are removed. It is never serialized to REST, webhook, MCP or A2A.
 	InternalData json.RawMessage `json:"-"`
@@ -1526,20 +1585,24 @@ type CloudEventEnvelope struct {
 func CloudEventFromModel(event *models.DomainEvent) CloudEventEnvelope {
 	internalData := append(json.RawMessage(nil), event.Data...)
 	return CloudEventEnvelope{
-		SpecVersion:     event.SpecVersion,
-		ID:              event.ID,
-		Source:          event.Source,
-		Type:            event.Type,
-		Subject:         event.Subject,
-		Time:            event.Time,
-		DataContentType: event.DataContentType,
-		DataSchema:      event.DataSchema,
-		TraceID:         event.TraceID,
-		CorrelationID:   event.CorrelationID,
-		CausationID:     event.CausationID,
-		ActorType:       event.ActorType,
-		ActorID:         event.ActorID,
-		ResourceVersion: event.ResourceVersion,
+		SpecVersion:          event.SpecVersion,
+		ID:                   event.ID,
+		Source:               event.Source,
+		Type:                 event.Type,
+		Subject:              event.Subject,
+		Time:                 event.Time,
+		DataContentType:      event.DataContentType,
+		DataSchema:           event.DataSchema,
+		TraceID:              event.TraceID,
+		CorrelationID:        event.CorrelationID,
+		CausationID:          event.CausationID,
+		ActorType:            event.ActorType,
+		ActorID:              event.ActorID,
+		ResourceVersion:      event.ResourceVersion,
+		OrganizationID:       event.OrganizationID,
+		ProjectID:            event.ProjectID,
+		ConfigurationVersion: event.ConfigurationVersion,
+		PolicyDecisionID:     event.PolicyDecisionID,
 		Data: publicCloudEventData(
 			internalData,
 			models.ActorRef{Type: event.ActorType, ID: event.ActorID},
@@ -1635,6 +1698,25 @@ func (s *AgentNativeService) AppendDomainEventTx(
 	if err := input.Actor.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidActor, err)
 	}
+	if input.Scope.IsZero() {
+		if operationContext, contextErr := OperationContextFromContext(ctx); contextErr == nil && operationContext.Actor == input.Actor {
+			input.Scope = operationContext.Scope
+			if input.TraceID == "" {
+				input.TraceID = operationContext.TraceID
+			}
+			if input.CorrelationID == "" {
+				input.CorrelationID = operationContext.CorrelationID
+			}
+		}
+	} else if err := input.Scope.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid domain event project scope: %w", err)
+	}
+	if input.Scope.IsZero() {
+		return nil, fmt.Errorf(
+			"%w: domain events require an explicit project scope",
+			ErrInvalidScope,
+		)
+	}
 	payload, err := json.Marshal(input.Data)
 	if err != nil {
 		return nil, fmt.Errorf("encode domain event data: %w", err)
@@ -1657,27 +1739,63 @@ func (s *AgentNativeService) AppendDomainEventTx(
 		input.Time = input.Time.UTC()
 	}
 	event := &models.DomainEvent{
-		ID:              input.ID,
-		SpecVersion:     "1.0",
-		Source:          input.Source,
-		Type:            input.Type,
-		Subject:         input.Subject,
-		Time:            input.Time,
-		DataContentType: "application/json",
-		DataSchema:      input.DataSchema,
-		Data:            datatypes.JSON(payload),
-		TraceID:         input.TraceID,
-		CorrelationID:   input.CorrelationID,
-		CausationID:     input.CausationID,
-		ActorType:       input.Actor.Type,
-		ActorID:         input.Actor.ID,
-		ResourceVersion: input.ResourceVersion,
+		ID:                   input.ID,
+		OrganizationID:       input.Scope.OrganizationID,
+		ProjectID:            input.Scope.ProjectID,
+		ConfigurationVersion: strings.TrimSpace(input.ConfigurationVersion),
+		PolicyDecisionID:     strings.TrimSpace(input.PolicyDecisionID),
+		SpecVersion:          "1.0",
+		Source:               input.Source,
+		Type:                 input.Type,
+		Subject:              input.Subject,
+		Time:                 input.Time,
+		DataContentType:      "application/json",
+		DataSchema:           input.DataSchema,
+		Data:                 datatypes.JSON(payload),
+		TraceID:              input.TraceID,
+		CorrelationID:        input.CorrelationID,
+		CausationID:          input.CausationID,
+		ActorType:            input.Actor.Type,
+		ActorID:              input.Actor.ID,
+		ResourceVersion:      input.ResourceVersion,
 	}
 	if event.ResourceVersion == 0 {
 		event.ResourceVersion = 1
 	}
 	if err := tx.WithContext(ctx).Create(event).Error; err != nil {
 		return nil, fmt.Errorf("create domain event: %w", err)
+	}
+	if s.auditLedger != nil && !input.Scope.IsZero() {
+		operation, err := OperationContextFromContext(ctx)
+		if err != nil ||
+			operation.Scope != input.Scope ||
+			operation.Actor != input.Actor {
+			return nil, fmt.Errorf(
+				"append domain event audit ledger entry: operation context does not match event scope and actor",
+			)
+		}
+		payloadDigest := sha256.Sum256(payload)
+		if _, err := s.auditLedger.AppendTx(
+			ctx,
+			tx,
+			AuditLedgerAppendInput{
+				PayloadDigest:        hex.EncodeToString(payloadDigest[:]),
+				EventType:            event.Type,
+				ResourceType:         "domain_event",
+				ResourceID:           event.ID,
+				ResourceVersion:      event.ResourceVersion,
+				Outcome:              models.AuditLedgerOutcomeSucceeded,
+				DomainEventID:        event.ID,
+				ConfigurationVersion: event.ConfigurationVersion,
+				PolicyVersion:        event.PolicyDecisionID,
+				OccurredAt:           event.Time,
+			},
+		); err != nil {
+			return nil, fmt.Errorf(
+				"append domain event audit ledger entry: %w",
+				err,
+			)
+		}
 	}
 	if len(targets) == 0 {
 		targets = s.defaultOutboxTargets
@@ -1702,10 +1820,21 @@ func (s *AgentNativeService) AppendDomainEventTx(
 		}
 		targets = filtered
 	}
+	targets, err = s.freezeWebhookOutboxTargetsTx(
+		ctx,
+		tx,
+		event,
+		targets,
+	)
+	if err != nil {
+		return nil, err
+	}
 	now := s.now()
 	for _, target := range targets {
 		delivery := &models.OutboxDelivery{
 			ID:              newNativeID(),
+			OrganizationID:  event.OrganizationID,
+			ProjectID:       event.ProjectID,
 			EventID:         event.ID,
 			DestinationType: target.Type,
 			DestinationID:   target.ID,
@@ -1719,6 +1848,110 @@ func (s *AgentNativeService) AppendDomainEventTx(
 		event.Deliveries = append(event.Deliveries, *delivery)
 	}
 	return event, nil
+}
+
+// freezeWebhookOutboxTargetsTx resolves active matching subscriptions and
+// copies every delivery-affecting field into immutable snapshots before the
+// business transaction commits. Outbox workers never fan out against mutable
+// WebhookConfig rows.
+func (s *AgentNativeService) freezeWebhookOutboxTargetsTx(
+	ctx context.Context,
+	tx *gorm.DB,
+	event *models.DomainEvent,
+	targets []OutboxTarget,
+) ([]OutboxTarget, error) {
+	if tx == nil || event == nil {
+		return nil, errors.New("webhook snapshot transaction and event are required")
+	}
+	requiresSnapshot := false
+	for _, target := range targets {
+		if target.Type == "webhook" &&
+			target.ID == webhookConfiguredDestinationID {
+			requiresSnapshot = true
+			break
+		}
+	}
+	if !requiresSnapshot {
+		return targets, nil
+	}
+
+	eventType := models.WebhookEventType(strings.TrimSpace(event.Type))
+	var transitionStatus models.TicketStatus
+	if eventType == models.WebhookEventTicketTransitioned {
+		var data struct {
+			Status    models.TicketStatus `json:"status"`
+			NewStatus models.TicketStatus `json:"new_status"`
+		}
+		if err := json.Unmarshal(event.Data, &data); err != nil {
+			return nil, fmt.Errorf("decode webhook transition status: %w", err)
+		}
+		transitionStatus = data.NewStatus
+		if transitionStatus == "" {
+			transitionStatus = data.Status
+		}
+	}
+
+	var configs []models.WebhookConfig
+	if eventcontract.IsWebhookDeliveryEventType(event.Type) {
+		if err := tx.WithContext(ctx).
+			Where(
+				"organization_id = ? AND project_id = ? AND status = ?",
+				event.OrganizationID,
+				event.ProjectID,
+				models.WebhookStatusActive,
+			).
+			Order("id ASC").
+			Find(&configs).Error; err != nil {
+			return nil, fmt.Errorf(
+				"freeze webhook subscriptions for domain event: %w",
+				err,
+			)
+		}
+	}
+
+	frozen := make([]OutboxTarget, 0, len(targets)+len(configs))
+	for _, target := range targets {
+		if target.Type != "webhook" ||
+			target.ID != webhookConfiguredDestinationID {
+			frozen = append(frozen, target)
+			continue
+		}
+		for _, config := range configs {
+			if !config.MatchesEvent(eventType, transitionStatus) {
+				continue
+			}
+			snapshot, err := models.NewWebhookDeliverySnapshot(
+				config,
+				event.ID,
+			)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"freeze webhook configuration %d: %w",
+					config.ID,
+					err,
+				)
+			}
+			if err := tx.WithContext(ctx).Create(snapshot).Error; err != nil {
+				return nil, fmt.Errorf(
+					"create webhook delivery snapshot: %w",
+					err,
+				)
+			}
+			maxAttempts := config.RetryCount + 1
+			if maxAttempts < 1 {
+				maxAttempts = 1
+			}
+			if maxAttempts > 11 {
+				maxAttempts = 11
+			}
+			frozen = append(frozen, OutboxTarget{
+				Type:        "webhook",
+				ID:          webhookSnapshotDestinationPrefix + snapshot.ID,
+				MaxAttempts: maxAttempts,
+			})
+		}
+	}
+	return frozen, nil
 }
 
 // AppendDomainEventWithAdditionalTargetsTx preserves every configured default
@@ -1771,53 +2004,95 @@ func (s *AgentNativeService) ClaimPendingOutbox(
 	now := s.now()
 	lockCutoff := now.Add(-lockTTL)
 	var claimed []*models.OutboxDelivery
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var candidates []models.OutboxDelivery
-		if err := tx.
-			Where(
-				"(status IN ? AND next_attempt_at <= ?) OR (status = ? AND locked_at < ?)",
-				[]models.OutboxDeliveryStatus{models.OutboxDeliveryPending, models.OutboxDeliveryFailed},
-				now,
-				models.OutboxDeliveryProcessing,
-				lockCutoff,
-			).
-			Order("next_attempt_at ASC, created_at ASC").
-			Limit(limit).
-			Find(&candidates).Error; err != nil {
-			return err
-		}
-		for i := range candidates {
-			candidate := &candidates[i]
-			result := tx.Model(&models.OutboxDelivery{}).
-				Where(
-					"id = ? AND ((status IN ? AND next_attempt_at <= ?) OR (status = ? AND locked_at < ?))",
-					candidate.ID,
-					[]models.OutboxDeliveryStatus{models.OutboxDeliveryPending, models.OutboxDeliveryFailed},
-					now,
-					models.OutboxDeliveryProcessing,
-					lockCutoff,
-				).
-				Updates(map[string]any{
-					"status":     models.OutboxDeliveryProcessing,
-					"attempts":   gorm.Expr("attempts + 1"),
-					"locked_at":  now,
-					"locked_by":  workerID,
-					"updated_at": now,
-				})
-			if result.Error != nil {
-				return result.Error
-			}
-			if result.RowsAffected == 0 {
-				continue
-			}
-			var delivery models.OutboxDelivery
-			if err := tx.Preload("Event").First(&delivery, "id = ?", candidate.ID).Error; err != nil {
-				return err
-			}
-			claimed = append(claimed, &delivery)
-		}
-		return nil
-	})
+	operation, err := requireOutboxWorkerOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	err = runSystemProjectOperation(
+		ctx,
+		s.db,
+		operation.Scope,
+		operation.Actor,
+		operation.TraceID,
+		operation.CorrelationID,
+		func(projectCtx context.Context) error {
+			return transactionForContext(
+				projectCtx,
+				s.db,
+				func(tx *gorm.DB) error {
+					var candidates []models.OutboxDelivery
+					if err := tx.
+						Where(
+							"organization_id = ? AND project_id = ? AND ((status IN ? AND next_attempt_at <= ?) OR (status = ? AND locked_at < ?))",
+							operation.Scope.OrganizationID,
+							operation.Scope.ProjectID,
+							[]models.OutboxDeliveryStatus{
+								models.OutboxDeliveryPending,
+								models.OutboxDeliveryFailed,
+							},
+							now,
+							models.OutboxDeliveryProcessing,
+							lockCutoff,
+						).
+						Order("next_attempt_at ASC, created_at ASC").
+						Limit(limit).
+						Find(&candidates).Error; err != nil {
+						return err
+					}
+					for index := range candidates {
+						candidate := &candidates[index]
+						result := tx.Model(&models.OutboxDelivery{}).
+							Where(
+								"id = ? AND organization_id = ? AND project_id = ? AND ((status IN ? AND next_attempt_at <= ?) OR (status = ? AND locked_at < ?))",
+								candidate.ID,
+								operation.Scope.OrganizationID,
+								operation.Scope.ProjectID,
+								[]models.OutboxDeliveryStatus{
+									models.OutboxDeliveryPending,
+									models.OutboxDeliveryFailed,
+								},
+								now,
+								models.OutboxDeliveryProcessing,
+								lockCutoff,
+							).
+							Updates(map[string]any{
+								"status":     models.OutboxDeliveryProcessing,
+								"attempts":   gorm.Expr("attempts + 1"),
+								"locked_at":  now,
+								"locked_by":  workerID,
+								"updated_at": now,
+							})
+						if result.Error != nil {
+							return result.Error
+						}
+						if result.RowsAffected == 0 {
+							continue
+						}
+						var delivery models.OutboxDelivery
+						if err := tx.Preload("Event").Where(
+							"id = ? AND organization_id = ? AND project_id = ?",
+							candidate.ID,
+							operation.Scope.OrganizationID,
+							operation.Scope.ProjectID,
+						).First(&delivery).Error; err != nil {
+							return err
+						}
+						if delivery.Event == nil ||
+							delivery.Event.OrganizationID !=
+								operation.Scope.OrganizationID ||
+							delivery.Event.ProjectID !=
+								operation.Scope.ProjectID {
+							return errors.New(
+								"outbox delivery event project scope mismatch",
+							)
+						}
+						claimed = append(claimed, &delivery)
+					}
+					return nil
+				},
+			)
+		},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("claim outbox deliveries: %w", err)
 	}
@@ -1825,89 +2100,188 @@ func (s *AgentNativeService) ClaimPendingOutbox(
 }
 
 func (s *AgentNativeService) MarkOutboxDelivered(ctx context.Context, deliveryID, workerID string) error {
+	operation, err := requireOutboxWorkerOperation(ctx)
+	if err != nil {
+		return err
+	}
 	now := s.now()
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		result := tx.Model(&models.OutboxDelivery{}).
-			Where("id = ? AND status = ? AND locked_by = ?", deliveryID, models.OutboxDeliveryProcessing, workerID).
-			Updates(map[string]any{
-				"status":       models.OutboxDeliverySucceeded,
-				"delivered_at": now,
-				"locked_at":    nil,
-				"locked_by":    "",
-				"last_error":   "",
-				"updated_at":   now,
-			})
-		if result.Error != nil {
-			return fmt.Errorf("mark outbox delivered: %w", result.Error)
-		}
-		if result.RowsAffected == 0 {
-			return ErrOutboxLockLost
-		}
-		var delivery models.OutboxDelivery
-		if err := tx.First(&delivery, "id = ?", deliveryID).Error; err != nil {
-			return err
-		}
-		var remaining int64
-		if err := tx.Model(&models.OutboxDelivery{}).
-			Where("event_id = ? AND status <> ?", delivery.EventID, models.OutboxDeliverySucceeded).
-			Count(&remaining).Error; err != nil {
-			return err
-		}
-		if remaining == 0 {
-			if err := tx.Model(&models.DomainEvent{}).
-				Where("id = ?", delivery.EventID).
-				Update("published_at", now).Error; err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	return runSystemProjectOperation(
+		ctx,
+		s.db,
+		operation.Scope,
+		operation.Actor,
+		operation.TraceID,
+		operation.CorrelationID,
+		func(projectCtx context.Context) error {
+			return transactionForContext(
+				projectCtx,
+				s.db,
+				func(tx *gorm.DB) error {
+					result := tx.Model(&models.OutboxDelivery{}).
+						Where(
+							"id = ? AND organization_id = ? AND project_id = ? AND status = ? AND locked_by = ?",
+							deliveryID,
+							operation.Scope.OrganizationID,
+							operation.Scope.ProjectID,
+							models.OutboxDeliveryProcessing,
+							workerID,
+						).
+						Updates(map[string]any{
+							"status":       models.OutboxDeliverySucceeded,
+							"delivered_at": now,
+							"locked_at":    nil,
+							"locked_by":    "",
+							"last_error":   "",
+							"updated_at":   now,
+						})
+					if result.Error != nil {
+						return fmt.Errorf(
+							"mark outbox delivered: %w",
+							result.Error,
+						)
+					}
+					if result.RowsAffected == 0 {
+						return ErrOutboxLockLost
+					}
+					var delivery models.OutboxDelivery
+					if err := tx.Where(
+						"id = ? AND organization_id = ? AND project_id = ?",
+						deliveryID,
+						operation.Scope.OrganizationID,
+						operation.Scope.ProjectID,
+					).First(&delivery).Error; err != nil {
+						return err
+					}
+					var remaining int64
+					if err := tx.Model(&models.OutboxDelivery{}).
+						Where(
+							"event_id = ? AND organization_id = ? AND project_id = ? AND status <> ?",
+							delivery.EventID,
+							operation.Scope.OrganizationID,
+							operation.Scope.ProjectID,
+							models.OutboxDeliverySucceeded,
+						).
+						Count(&remaining).Error; err != nil {
+						return err
+					}
+					if remaining == 0 {
+						if err := tx.Model(&models.DomainEvent{}).
+							Where(
+								"id = ? AND organization_id = ? AND project_id = ?",
+								delivery.EventID,
+								operation.Scope.OrganizationID,
+								operation.Scope.ProjectID,
+							).
+							Update("published_at", now).Error; err != nil {
+							return err
+						}
+					}
+					return nil
+				},
+			)
+		},
+	)
 }
 
 func (s *AgentNativeService) MarkOutboxFailed(ctx context.Context, deliveryID, workerID string, deliveryErr error) error {
-	var delivery models.OutboxDelivery
-	if err := s.db.WithContext(ctx).
-		Where("id = ? AND status = ? AND locked_by = ?", deliveryID, models.OutboxDeliveryProcessing, workerID).
-		First(&delivery).Error; err != nil {
-		return ErrOutboxLockLost
-	}
-	status := models.OutboxDeliveryFailed
-	if delivery.Attempts >= delivery.MaxAttempts {
-		status = models.OutboxDeliveryDead
-	}
-	backoff := time.Second * time.Duration(1<<minInt(delivery.Attempts, 10))
-	if backoff > time.Hour {
-		backoff = time.Hour
+	operation, err := requireOutboxWorkerOperation(ctx)
+	if err != nil {
+		return err
 	}
 	message := ""
 	if deliveryErr != nil {
 		message = scrubOutboxFailure(deliveryErr)
 	}
-	now := s.now()
-	result := s.db.WithContext(ctx).Model(&models.OutboxDelivery{}).
-		Where("id = ? AND status = ? AND locked_by = ?", deliveryID, models.OutboxDeliveryProcessing, workerID).
-		Updates(map[string]any{
-			"status":          status,
-			"next_attempt_at": now.Add(backoff),
-			"locked_at":       nil,
-			"locked_by":       "",
-			"last_error":      message,
-			"updated_at":      now,
-		})
-	if result.Error != nil {
-		return fmt.Errorf("mark outbox failed: %w", result.Error)
-	}
-	if result.RowsAffected == 0 {
-		return ErrOutboxLockLost
-	}
-	return nil
+	return runSystemProjectOperation(
+		ctx,
+		s.db,
+		operation.Scope,
+		operation.Actor,
+		operation.TraceID,
+		operation.CorrelationID,
+		func(projectCtx context.Context) error {
+			return transactionForContext(
+				projectCtx,
+				s.db,
+				func(tx *gorm.DB) error {
+					var delivery models.OutboxDelivery
+					load := tx.Clauses(
+						clause.Locking{Strength: "UPDATE"},
+					).Where(
+						"id = ? AND organization_id = ? AND project_id = ? AND status = ? AND locked_by = ?",
+						deliveryID,
+						operation.Scope.OrganizationID,
+						operation.Scope.ProjectID,
+						models.OutboxDeliveryProcessing,
+						workerID,
+					).First(&delivery)
+					if errors.Is(load.Error, gorm.ErrRecordNotFound) {
+						return ErrOutboxLockLost
+					}
+					if load.Error != nil {
+						return fmt.Errorf(
+							"lock failed outbox delivery: %w",
+							load.Error,
+						)
+					}
+					status := models.OutboxDeliveryFailed
+					if delivery.Attempts >= delivery.MaxAttempts {
+						status = models.OutboxDeliveryDead
+					}
+					backoff := time.Second * time.Duration(
+						1<<minInt(delivery.Attempts, 10),
+					)
+					if backoff > time.Hour {
+						backoff = time.Hour
+					}
+					now := s.now()
+					result := tx.Model(&models.OutboxDelivery{}).
+						Where(
+							"id = ? AND organization_id = ? AND project_id = ? AND status = ? AND locked_by = ?",
+							deliveryID,
+							operation.Scope.OrganizationID,
+							operation.Scope.ProjectID,
+							models.OutboxDeliveryProcessing,
+							workerID,
+						).
+						Updates(map[string]any{
+							"status":          status,
+							"next_attempt_at": now.Add(backoff),
+							"locked_at":       nil,
+							"locked_by":       "",
+							"last_error":      message,
+							"updated_at":      now,
+						})
+					if result.Error != nil {
+						return fmt.Errorf(
+							"mark outbox failed: %w",
+							result.Error,
+						)
+					}
+					if result.RowsAffected == 0 {
+						return ErrOutboxLockLost
+					}
+					return nil
+				},
+			)
+		},
+	)
 }
 
 func (s *AgentNativeService) ReplayOutbox(ctx context.Context, deliveryID string) error {
+	projectScope, err := commandProjectScope(ctx)
+	if err != nil {
+		return err
+	}
 	now := s.now()
 	return s.InTransaction(ctx, func(txCtx context.Context, tx *gorm.DB) error {
 		var delivery models.OutboxDelivery
-		if err := tx.First(&delivery, "id = ?", deliveryID).Error; err != nil {
+		if err := tx.Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			deliveryID,
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+		).First(&delivery).Error; err != nil {
 			return err
 		}
 		if delivery.Status == models.OutboxDeliveryProcessing &&
@@ -1916,7 +2290,12 @@ func (s *AgentNativeService) ReplayOutbox(ctx context.Context, deliveryID string
 			return ErrOutboxReplayConflict
 		}
 		result := tx.Model(&models.OutboxDelivery{}).
-			Where("id = ?", deliveryID).
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ?",
+				deliveryID,
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+			).
 			Updates(map[string]any{
 				"status":          models.OutboxDeliveryPending,
 				"attempts":        0,
@@ -1934,7 +2313,12 @@ func (s *AgentNativeService) ReplayOutbox(ctx context.Context, deliveryID string
 			return gorm.ErrRecordNotFound
 		}
 		if err := tx.Model(&models.DomainEvent{}).
-			Where("id = ?", delivery.EventID).
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ?",
+				delivery.EventID,
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+			).
 			Update("published_at", nil).Error; err != nil {
 			return fmt.Errorf("reset replayed event publication state: %w", err)
 		}
@@ -1972,14 +2356,56 @@ func (s *AgentNativeService) ProcessOutboxBatch(
 	if deliverer == nil {
 		return result, fmt.Errorf("outbox deliverer is required")
 	}
-	deliveries, err := s.ClaimPendingOutbox(
-		ctx,
-		workerID,
-		limit,
-		s.outboxLockTTL,
-	)
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	actor := models.SystemActor(outboxSystemActorID)
+	projects, err := systemWorkerProjects(ctx, s.db, actor)
 	if err != nil {
 		return result, err
+	}
+	deliveries := make([]*models.OutboxDelivery, 0, limit)
+	if len(projects) > 0 {
+		start := int(
+			(s.outboxProjectCursor.Add(1) - 1) % uint64(len(projects)),
+		)
+		for offset := 0; offset < len(projects) &&
+			len(deliveries) < limit; offset++ {
+			project := projects[(start+offset)%len(projects)]
+			traceID := fmt.Sprintf(
+				"outbox:%s:%d:%d",
+				workerID,
+				project.Scope.ProjectID,
+				s.now().UnixNano(),
+			)
+			projectCtx, contextErr := EnsureSystemProjectOperationContext(
+				ctx,
+				project.Scope,
+				actor,
+				traceID,
+				traceID,
+			)
+			if contextErr != nil {
+				return result, contextErr
+			}
+			claimed, claimErr := s.ClaimPendingOutbox(
+				projectCtx,
+				workerID,
+				limit-len(deliveries),
+				s.outboxLockTTL,
+			)
+			if claimErr != nil {
+				return result, fmt.Errorf(
+					"claim project %s outbox: %w",
+					project.Key,
+					claimErr,
+				)
+			}
+			deliveries = append(deliveries, claimed...)
+		}
 	}
 	result.Claimed = len(deliveries)
 	if len(deliveries) == 0 {
@@ -2019,10 +2445,19 @@ func (s *AgentNativeService) ProcessOutboxBatch(
 	for range workerCount {
 		go func() {
 			for job := range jobs {
+				deliveryCtx, contextErr :=
+					outboxDeliveryOperationContext(ctx, job.delivery)
+				if contextErr != nil {
+					attempts <- deliveryAttempt{
+						delivery: job.delivery,
+						err:      contextErr,
+					}
+					continue
+				}
 				attempts <- deliveryAttempt{
 					delivery: job.delivery,
 					err: s.performOutboxDeliveryAttempt(
-						ctx,
+						deliveryCtx,
 						job.deadline,
 						deliverer,
 						job.delivery,
@@ -2034,8 +2469,20 @@ func (s *AgentNativeService) ProcessOutboxBatch(
 
 	for range deliveries {
 		attempt := <-attempts
-		finalizeCtx, cancelFinalize := context.WithTimeout(
+		finalizeBase, contextErr := outboxWorkerOperationContext(
 			context.WithoutCancel(ctx),
+			models.ProjectScope{
+				OrganizationID: attempt.delivery.OrganizationID,
+				ProjectID:      attempt.delivery.ProjectID,
+			},
+			attempt.delivery,
+		)
+		if contextErr != nil {
+			batchErrors = append(batchErrors, contextErr)
+			continue
+		}
+		finalizeCtx, cancelFinalize := context.WithTimeout(
+			finalizeBase,
 			5*time.Second,
 		)
 		if attempt.err == nil {
@@ -2069,6 +2516,97 @@ func (s *AgentNativeService) ProcessOutboxBatch(
 		}
 	}
 	return result, errors.Join(batchErrors...)
+}
+
+func requireOutboxWorkerOperation(
+	ctx context.Context,
+) (OperationContext, error) {
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		return OperationContext{}, fmt.Errorf(
+			"%w: outbox operation requires trusted context",
+			ErrSystemWorkerContext,
+		)
+	}
+	if operation.Actor != models.SystemActor(outboxSystemActorID) ||
+		operation.Source != SourceProtocolWorker {
+		return OperationContext{}, fmt.Errorf(
+			"%w: outbox operation actor mismatch",
+			ErrSystemWorkerContext,
+		)
+	}
+	return operation, nil
+}
+
+func outboxWorkerOperationContext(
+	ctx context.Context,
+	scope models.ProjectScope,
+	delivery *models.OutboxDelivery,
+) (context.Context, error) {
+	traceID := ""
+	correlationID := ""
+	if delivery != nil {
+		traceID = delivery.ID
+		if delivery.Event != nil {
+			if strings.TrimSpace(delivery.Event.TraceID) != "" {
+				traceID = delivery.Event.TraceID
+			}
+			correlationID = delivery.Event.CorrelationID
+		}
+	}
+	if correlationID == "" {
+		correlationID = traceID
+	}
+	return WithOperationContext(ctx, OperationContext{
+		Scope:         scope,
+		Actor:         models.SystemActor(outboxSystemActorID),
+		Source:        SourceProtocolWorker,
+		TraceID:       traceID,
+		CorrelationID: correlationID,
+	})
+}
+
+// outboxDeliveryOperationContext creates trusted per-destination provenance
+// without opening a database transaction. Deliverers may perform network,
+// model or file I/O; any database prepare/finalize phase they need must open
+// its own short project-scoped transaction.
+func outboxDeliveryOperationContext(
+	ctx context.Context,
+	delivery *models.OutboxDelivery,
+) (context.Context, error) {
+	if delivery == nil ||
+		delivery.OrganizationID == 0 ||
+		delivery.ProjectID == 0 ||
+		delivery.Event == nil ||
+		delivery.Event.OrganizationID != delivery.OrganizationID ||
+		delivery.Event.ProjectID != delivery.ProjectID {
+		return nil, errors.New("outbox delivery has invalid project scope")
+	}
+	actorID := outboxSystemActorID
+	switch delivery.DestinationType {
+	case "automation":
+		actorID = automationActorID
+	case SLAEscalationOutboxDestination:
+		actorID = slaMonitorActorID
+	}
+	traceID := delivery.Event.TraceID
+	if traceID == "" {
+		traceID = delivery.ID
+	}
+	correlationID := delivery.Event.CorrelationID
+	if correlationID == "" {
+		correlationID = traceID
+	}
+	return WithOperationContext(ctx, OperationContext{
+		Scope: models.ProjectScope{
+			OrganizationID: delivery.OrganizationID,
+			ProjectID:      delivery.ProjectID,
+		},
+		Actor:         models.SystemActor(actorID),
+		Source:        SourceProtocolWorker,
+		TraceID:       traceID,
+		CorrelationID: correlationID,
+	})
 }
 
 func (s *AgentNativeService) performOutboxDeliveryAttempt(
@@ -2133,6 +2671,37 @@ func (s *AgentNativeService) normalizeLeaseTTL(ttl time.Duration) (time.Duration
 	return ttl, nil
 }
 
+func commandProjectScope(ctx context.Context) (models.ProjectScope, error) {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return models.ProjectScope{}, fmt.Errorf(
+			"project-scoped command requires trusted operation context: %w",
+			err,
+		)
+	}
+	return scope, nil
+}
+
+func commandOperationContext(
+	ctx context.Context,
+	actor models.ActorRef,
+) (OperationContext, error) {
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		return OperationContext{}, fmt.Errorf(
+			"project-scoped command requires trusted operation context: %w",
+			err,
+		)
+	}
+	if operation.Actor != actor {
+		return OperationContext{}, fmt.Errorf(
+			"%w: command actor does not match trusted operation context",
+			ErrInvalidActor,
+		)
+	}
+	return operation, nil
+}
+
 func (s *AgentNativeService) claimTicketLeaseOnDB(
 	ctx context.Context,
 	db *gorm.DB,
@@ -2141,10 +2710,14 @@ func (s *AgentNativeService) claimTicketLeaseOnDB(
 	expectedVersion uint64,
 	ttl time.Duration,
 ) (*models.TicketLease, error) {
+	projectScope, err := commandProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if err := actor.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidActor, err)
 	}
-	ttl, err := s.normalizeLeaseTTL(ttl)
+	ttl, err = s.normalizeLeaseTTL(ttl)
 	if err != nil {
 		return nil, err
 	}
@@ -2153,9 +2726,16 @@ func (s *AgentNativeService) claimTicketLeaseOnDB(
 	}
 	now := s.now()
 	var claimed *models.TicketLease
-	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = transactionForContext(ctx, db, func(tx *gorm.DB) error {
 		var ticket models.Ticket
-		if err := tx.Select("id", "version").First(&ticket, ticketID).Error; err != nil {
+		if err := tx.Select("id", "version", "organization_id", "project_id").
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ?",
+				ticketID,
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+			).
+			First(&ticket).Error; err != nil {
 			return err
 		}
 		if ticket.Version != expectedVersion {
@@ -2163,10 +2743,17 @@ func (s *AgentNativeService) claimTicketLeaseOnDB(
 		}
 
 		var lease models.TicketLease
-		err := tx.Where("ticket_id = ?", ticketID).First(&lease).Error
+		err := tx.Where(
+			"organization_id = ? AND project_id = ? AND ticket_id = ?",
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+			ticketID,
+		).First(&lease).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			lease = models.TicketLease{
 				ID:              newNativeID(),
+				OrganizationID:  projectScope.OrganizationID,
+				ProjectID:       projectScope.ProjectID,
 				TicketID:        ticketID,
 				HolderActorType: actor.Type,
 				HolderActorID:   actor.ID,
@@ -2200,7 +2787,13 @@ func (s *AgentNativeService) claimTicketLeaseOnDB(
 			// A retry by the same holder is idempotent. Refreshing version here
 			// also lets the holder explicitly recover after a human edit.
 			result := tx.Model(&models.TicketLease{}).
-				Where("id = ? AND released_at IS NULL AND expires_at > ?", lease.ID, now).
+				Where(
+					"id = ? AND organization_id = ? AND project_id = ? AND released_at IS NULL AND expires_at > ?",
+					lease.ID,
+					projectScope.OrganizationID,
+					projectScope.ProjectID,
+					now,
+				).
 				Updates(map[string]any{
 					"ticket_version":    ticket.Version,
 					"expires_at":        now.Add(ttl),
@@ -2222,7 +2815,13 @@ func (s *AgentNativeService) claimTicketLeaseOnDB(
 
 		newID := newNativeID()
 		result := tx.Model(&models.TicketLease{}).
-			Where("ticket_id = ? AND (released_at IS NOT NULL OR expires_at <= ?)", ticketID, now).
+			Where(
+				"organization_id = ? AND project_id = ? AND ticket_id = ? AND (released_at IS NOT NULL OR expires_at <= ?)",
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+				ticketID,
+				now,
+			).
 			Updates(map[string]any{
 				"id":                newID,
 				"holder_actor_type": actor.Type,
@@ -2266,17 +2865,26 @@ func (s *AgentNativeService) heartbeatTicketLeaseOnDB(
 	expectedVersion uint64,
 	ttl time.Duration,
 ) (*models.TicketLease, error) {
+	projectScope, err := commandProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if err := actor.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidActor, err)
 	}
-	ttl, err := s.normalizeLeaseTTL(ttl)
+	ttl, err = s.normalizeLeaseTTL(ttl)
 	if err != nil {
 		return nil, err
 	}
 	now := s.now()
 	var lease models.TicketLease
-	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.First(&lease, "id = ?", leaseID).Error; err != nil {
+	err = transactionForContext(ctx, db, func(tx *gorm.DB) error {
+		if err := tx.Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			leaseID,
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+		).First(&lease).Error; err != nil {
 			return err
 		}
 		if lease.HolderActorType != actor.Type || lease.HolderActorID != actor.ID {
@@ -2286,14 +2894,27 @@ func (s *AgentNativeService) heartbeatTicketLeaseOnDB(
 			return ErrLeaseExpired
 		}
 		var ticket models.Ticket
-		if err := tx.Select("id", "version").First(&ticket, lease.TicketID).Error; err != nil {
+		if err := tx.Select("id", "version").
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ?",
+				lease.TicketID,
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+			).
+			First(&ticket).Error; err != nil {
 			return err
 		}
 		if expectedVersion == 0 || ticket.Version != expectedVersion || lease.TicketVersion != expectedVersion {
 			return fmt.Errorf("%w: expected %d, actual %d", ErrVersionConflict, expectedVersion, ticket.Version)
 		}
 		result := tx.Model(&models.TicketLease{}).
-			Where("id = ? AND released_at IS NULL AND expires_at > ?", leaseID, now).
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ? AND released_at IS NULL AND expires_at > ?",
+				leaseID,
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+				now,
+			).
 			Updates(map[string]any{
 				"expires_at":        now.Add(ttl),
 				"last_heartbeat_at": now,
@@ -2322,11 +2943,19 @@ func (s *AgentNativeService) releaseTicketLeaseOnDB(
 	actor models.ActorRef,
 	reason string,
 ) error {
+	projectScope, err := commandProjectScope(ctx)
+	if err != nil {
+		return err
+	}
 	if err := actor.Validate(); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidActor, err)
 	}
 	now := s.now()
-	query := db.WithContext(ctx).Model(&models.TicketLease{})
+	query := db.WithContext(ctx).Model(&models.TicketLease{}).Where(
+		"organization_id = ? AND project_id = ?",
+		projectScope.OrganizationID,
+		projectScope.ProjectID,
+	)
 	if actor.Type == models.ActorTypeSystem {
 		query = query.Where("id = ? AND released_at IS NULL", leaseID)
 	} else {
@@ -2347,7 +2976,12 @@ func (s *AgentNativeService) releaseTicketLeaseOnDB(
 	}
 	if result.RowsAffected == 0 {
 		var lease models.TicketLease
-		if err := db.WithContext(ctx).First(&lease, "id = ?", leaseID).Error; err != nil {
+		if err := db.WithContext(ctx).Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			leaseID,
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+		).First(&lease).Error; err != nil {
 			return err
 		}
 		if actor.Type != models.ActorTypeSystem &&
@@ -2432,7 +3066,7 @@ func (s *AgentNativeService) ClaimTicketLeaseCommand(
 	var lease *models.TicketLease
 	var event *models.DomainEvent
 	var receipt OperationReceipt
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		var claimErr error
 		lease, claimErr = s.claimTicketLeaseOnDB(
 			ctx,
@@ -2497,8 +3131,17 @@ func (s *AgentNativeService) HeartbeatTicketLeaseCommand(
 	ctx context.Context,
 	input HeartbeatTicketLeaseCommandInput,
 ) (*TicketLeaseCommandResult, error) {
+	projectScope, err := commandProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var existing models.TicketLease
-	if err := s.db.WithContext(ctx).First(&existing, "id = ?", input.LeaseID).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		input.LeaseID,
+		projectScope.OrganizationID,
+		projectScope.ProjectID,
+	).First(&existing).Error; err != nil {
 		return nil, err
 	}
 	policyDecisionID, err := s.authorizeLeaseCommand(
@@ -2517,7 +3160,7 @@ func (s *AgentNativeService) HeartbeatTicketLeaseCommand(
 	var lease *models.TicketLease
 	var event *models.DomainEvent
 	var receipt OperationReceipt
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		var heartbeatErr error
 		lease, heartbeatErr = s.heartbeatTicketLeaseOnDB(
 			ctx,
@@ -2582,8 +3225,17 @@ func (s *AgentNativeService) ReleaseTicketLeaseCommand(
 	ctx context.Context,
 	input ReleaseTicketLeaseCommandInput,
 ) (*TicketLeaseCommandResult, error) {
+	projectScope, err := commandProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var existing models.TicketLease
-	if err := s.db.WithContext(ctx).First(&existing, "id = ?", input.LeaseID).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		input.LeaseID,
+		projectScope.OrganizationID,
+		projectScope.ProjectID,
+	).First(&existing).Error; err != nil {
 		return nil, err
 	}
 	policyDecisionID, err := s.authorizeLeaseCommand(
@@ -2602,7 +3254,7 @@ func (s *AgentNativeService) ReleaseTicketLeaseCommand(
 	var event *models.DomainEvent
 	var receipt OperationReceipt
 	var lease models.TicketLease
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		if err := tx.First(&lease, "id = ?", input.LeaseID).Error; err != nil {
 			return err
 		}
@@ -2794,19 +3446,22 @@ func linkTicketHistoryToDomainEvent(
 }
 
 type NativeTicketCreateInput struct {
-	Request             models.TicketCreateRequest
-	TicketNumber        string
-	Actor               models.ActorRef
-	AssignedActor       *models.ActorRef
-	CredentialID        string
-	PolicyDecisionID    string
-	SourceProtocol      string
-	RequestDigest       string
-	TrustLevel          models.TicketTrustLevel
-	TraceID             string
-	CorrelationID       string
-	IdempotencyRecordID string
-	OutboxTargets       []OutboxTarget
+	Request              models.TicketCreateRequest
+	TicketNumber         string
+	QueueID              uint
+	RequestTypeVersionID string
+	WorkflowVersionID    string
+	Actor                models.ActorRef
+	AssignedActor        *models.ActorRef
+	CredentialID         string
+	PolicyDecisionID     string
+	SourceProtocol       string
+	RequestDigest        string
+	TrustLevel           models.TicketTrustLevel
+	TraceID              string
+	CorrelationID        string
+	IdempotencyRecordID  string
+	OutboxTargets        []OutboxTarget
 }
 
 type NativeTicketCreateResult struct {
@@ -2821,8 +3476,18 @@ func (s *AgentNativeService) CreateNativeTicket(
 	ctx context.Context,
 	input NativeTicketCreateInput,
 ) (*NativeTicketCreateResult, error) {
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if err := input.Actor.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidActor, err)
+	}
+	if input.Actor != operation.Actor {
+		return nil, fmt.Errorf(
+			"%w: command actor does not match trusted operation context",
+			ErrInvalidActor,
+		)
 	}
 	if strings.TrimSpace(input.Request.Title) == "" || strings.TrimSpace(input.Request.Description) == "" {
 		return nil, fmt.Errorf("ticket title and description are required")
@@ -2923,30 +3588,30 @@ func (s *AgentNativeService) CreateNativeTicket(
 		return nil, err
 	}
 	now := s.now()
-	ticketNumber := strings.TrimSpace(input.TicketNumber)
-	if ticketNumber == "" {
-		ticketNumber = newAgentTicketNumber(now)
-	}
 	ticket := &models.Ticket{
-		TicketNumber:       ticketNumber,
-		Title:              strings.TrimSpace(input.Request.Title),
-		Description:        input.Request.Description,
-		Type:               input.Request.Type,
-		Priority:           input.Request.Priority,
-		Status:             status,
-		Source:             input.Request.Source,
-		Version:            1,
-		TrustLevel:         input.TrustLevel,
-		CreatedByID:        humanUserID,
-		CreatedByActorType: input.Actor.Type,
-		CreatedByActorID:   input.Actor.ID,
-		CategoryID:         input.Request.CategoryID,
-		SubcategoryID:      input.Request.SubcategoryID,
-		Tags:               datatypes.JSONSlice[string](input.Request.Tags),
-		DueDate:            input.Request.DueDate,
-		CustomerEmail:      input.Request.CustomerEmail,
-		CustomerPhone:      input.Request.CustomerPhone,
-		CustomerName:       input.Request.CustomerName,
+		OrganizationID:       operation.Scope.OrganizationID,
+		ProjectID:            operation.Scope.ProjectID,
+		QueueID:              input.QueueID,
+		RequestTypeVersionID: strings.TrimSpace(input.RequestTypeVersionID),
+		WorkflowVersionID:    strings.TrimSpace(input.WorkflowVersionID),
+		Title:                strings.TrimSpace(input.Request.Title),
+		Description:          input.Request.Description,
+		Type:                 input.Request.Type,
+		Priority:             input.Request.Priority,
+		Status:               status,
+		Source:               input.Request.Source,
+		Version:              1,
+		TrustLevel:           input.TrustLevel,
+		CreatedByID:          humanUserID,
+		CreatedByActorType:   input.Actor.Type,
+		CreatedByActorID:     input.Actor.ID,
+		CategoryID:           input.Request.CategoryID,
+		SubcategoryID:        input.Request.SubcategoryID,
+		Tags:                 datatypes.JSONSlice[string](input.Request.Tags),
+		DueDate:              input.Request.DueDate,
+		CustomerEmail:        input.Request.CustomerEmail,
+		CustomerPhone:        input.Request.CustomerPhone,
+		CustomerName:         input.Request.CustomerName,
 	}
 	if input.Request.CustomFields != nil {
 		ticket.CustomFields = datatypes.NewJSONType(input.Request.CustomFields.ToMap())
@@ -2960,17 +3625,69 @@ func (s *AgentNativeService) CreateNativeTicket(
 
 	var event *models.DomainEvent
 	result := &NativeTicketCreateResult{Ticket: ticket}
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if ticket.CategoryID != nil {
-			var category models.Category
-			if err := tx.Select("id", "sla_hours").First(&category, *ticket.CategoryID).Error; err != nil {
-				return fmt.Errorf("load ticket category: %w", err)
-			}
-			if category.SLAHours != nil && *category.SLAHours > 0 {
-				slaDueDate := now.Add(time.Duration(*category.SLAHours) * time.Hour)
-				ticket.SLADueDate = &slaDueDate
-			}
+	err = transactionForContext(ctx, s.dbForContext(ctx), func(tx *gorm.DB) error {
+		ticket.CreatedAt = now
+		ticket.UpdatedAt = now
+		projectService, projectErr := NewProjectService(tx)
+		if projectErr != nil {
+			return projectErr
 		}
+		ticketNumber, projectErr := projectService.AllocateTicketIdentityTx(
+			ctx,
+			tx,
+			operation.Scope,
+		)
+		if projectErr != nil {
+			return fmt.Errorf("allocate project ticket number: %w", projectErr)
+		}
+		ticket.TicketNumber = ticketNumber
+		queueQuery := tx.WithContext(ctx).Where(
+			"project_id = ? AND status = ?",
+			operation.Scope.ProjectID,
+			models.QueueStatusActive,
+		)
+		if ticket.QueueID != 0 {
+			queueQuery = queueQuery.Where("id = ?", ticket.QueueID)
+		} else {
+			queueQuery = queueQuery.Where("is_default = ?", true)
+		}
+		var queue models.Queue
+		if queueErr := queueQuery.Order("id ASC").First(&queue).Error; queueErr != nil {
+			return fmt.Errorf("resolve project queue: %w", queueErr)
+		}
+		ticket.QueueID = queue.ID
+		configuration, configurationErr := resolveTicketConfigurationTx(
+			ctx,
+			tx,
+			operation.Scope,
+			&input.Request,
+			ticket.RequestTypeVersionID,
+			ticket.WorkflowVersionID,
+		)
+		if configurationErr != nil {
+			return configurationErr
+		}
+		initialStatus, configurationErr := configuration.InitialStatus()
+		if configurationErr != nil {
+			return fmt.Errorf(
+				"resolve workflow initial state: %w",
+				configurationErr,
+			)
+		}
+		if ticket.Status != initialStatus {
+			return fmt.Errorf(
+				"ticket initial status %q does not match workflow lifecycle %q",
+				ticket.Status,
+				initialStatus,
+			)
+		}
+		ticket.RequestTypeVersionID = configuration.RequestType.ID
+		ticket.WorkflowVersionID = configuration.Workflow.ID
+		projection, _, projectionErr := s.projectTicketSLAOnDB(ctx, tx, ticket, now)
+		if projectionErr != nil {
+			return fmt.Errorf("initialize ticket SLA projection: %w", projectionErr)
+		}
+		applySLAProjection(ticket, projection)
 		if err := tx.Create(ticket).Error; err != nil {
 			return fmt.Errorf("create native ticket: %w", err)
 		}
@@ -2997,15 +3714,23 @@ func (s *AgentNativeService) CreateNativeTicket(
 			AllowExternalNotifications: allowExternalNotifications,
 			TraceID:                    input.TraceID,
 			CorrelationID:              input.CorrelationID,
+			Scope:                      operation.Scope,
+			ConfigurationVersion:       configuration.Release.ID,
+			PolicyDecisionID:           policyDecisionID,
 			DataSchema:                 "https://chronodesk.local/schemas/events/ticket-created.v1.json",
 			Data: map[string]any{
-				"ticket_id":     ticket.ID,
-				"ticket_number": ticket.TicketNumber,
-				"title":         ticket.Title,
-				"status":        ticket.Status,
-				"priority":      ticket.Priority,
-				"source":        ticket.Source,
-				"trust_level":   ticket.TrustLevel,
+				"organization_id":         ticket.OrganizationID,
+				"project_id":              ticket.ProjectID,
+				"queue_id":                ticket.QueueID,
+				"ticket_id":               ticket.ID,
+				"ticket_number":           ticket.TicketNumber,
+				"title":                   ticket.Title,
+				"status":                  ticket.Status,
+				"priority":                ticket.Priority,
+				"source":                  ticket.Source,
+				"trust_level":             ticket.TrustLevel,
+				"request_type_version_id": ticket.RequestTypeVersionID,
+				"workflow_version_id":     ticket.WorkflowVersionID,
 			},
 		}, input.OutboxTargets)
 		if appendErr != nil {
@@ -3080,6 +3805,7 @@ type VersionedTicketUpdateInput struct {
 	assignmentResolved            bool
 	authorizationContractOverride bool
 	historyRecords                []ticketHistorySpec
+	slaProjectionAlreadyResolved  bool
 }
 
 type VersionedTicketUpdateResult struct {
@@ -3092,6 +3818,10 @@ func (s *AgentNativeService) UpdateTicketVersion(
 	ctx context.Context,
 	input VersionedTicketUpdateInput,
 ) (*VersionedTicketUpdateResult, error) {
+	projectScope, err := commandProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if err := input.Actor.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidActor, err)
 	}
@@ -3194,8 +3924,13 @@ func (s *AgentNativeService) UpdateTicketVersion(
 	var ticket models.Ticket
 	var event *models.DomainEvent
 	var receipt OperationReceipt
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.First(&ticket, input.TicketID).Error; err != nil {
+	err = transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
+		if err := tx.Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			input.TicketID,
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+		).First(&ticket).Error; err != nil {
 			return err
 		}
 		beforeTicket := ticket
@@ -3215,7 +3950,14 @@ func (s *AgentNativeService) UpdateTicketVersion(
 				return err
 			}
 		}
-		if err := validateTicketChangeSemantics(&ticket, changes); err != nil {
+		if err := validateTicketChangeSemantics(
+			ctx,
+			tx,
+			projectScope,
+			&ticket,
+			changes,
+			input.Actor,
+		); err != nil {
 			return err
 		}
 		if rawStatus, ok := changes["status"]; ok {
@@ -3234,7 +3976,13 @@ func (s *AgentNativeService) UpdateTicketVersion(
 		changes["version"] = input.ExpectedVersion + 1
 		changes["updated_at"] = s.now()
 		update := tx.Model(&models.Ticket{}).
-			Where("id = ? AND version = ?", input.TicketID, input.ExpectedVersion).
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ? AND version = ?",
+				input.TicketID,
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+				input.ExpectedVersion,
+			).
 			Updates(changes)
 		if update.Error != nil {
 			return fmt.Errorf("update ticket version: %w", update.Error)
@@ -3242,8 +3990,49 @@ func (s *AgentNativeService) UpdateTicketVersion(
 		if update.RowsAffected != 1 {
 			return ErrVersionConflict
 		}
-		if err := tx.First(&ticket, input.TicketID).Error; err != nil {
+		if err := tx.Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			input.TicketID,
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+		).First(&ticket).Error; err != nil {
 			return err
+		}
+		derivedSLAChanges := map[string]any{}
+		if !input.slaProjectionAlreadyResolved {
+			projection, _, projectionErr := s.projectTicketSLAOnDB(
+				ctx,
+				tx,
+				&ticket,
+				s.now(),
+			)
+			if projectionErr != nil {
+				return fmt.Errorf("refresh ticket SLA projection: %w", projectionErr)
+			}
+			derivedSLAChanges = slaProjectionChanges(&ticket, projection)
+			if len(derivedSLAChanges) > 0 {
+				if err := tx.Model(&models.Ticket{}).
+					Where(
+						"id = ? AND organization_id = ? AND project_id = ?",
+						ticket.ID,
+						projectScope.OrganizationID,
+						projectScope.ProjectID,
+					).
+					Updates(derivedSLAChanges).Error; err != nil {
+					return fmt.Errorf("persist ticket SLA projection: %w", err)
+				}
+				applySLAProjection(&ticket, projection)
+				for _, field := range slaProjectionFieldNames(derivedSLAChanges) {
+					if !fieldsContain(fields, field) {
+						fields = append(fields, field)
+					}
+					changeSet[field] = map[string]any{
+						"old": ticketFieldValue(&beforeTicket, field),
+						"new": ticketFieldValue(&ticket, field),
+					}
+				}
+				sort.Strings(fields)
+			}
 		}
 		humanUserID, projectionErr := s.humanUserProjectionTx(tx, input.Actor)
 		if projectionErr != nil {
@@ -3276,6 +4065,20 @@ func (s *AgentNativeService) UpdateTicketVersion(
 				"status":         ticket.Status,
 				"priority":       ticket.Priority,
 			}
+			eventData = eventDataMap
+		}
+		if len(derivedSLAChanges) > 0 {
+			if eventDataMap == nil {
+				var normalizeErr error
+				eventDataMap, normalizeErr = normalizeTicketEventDataObject(eventData)
+				if normalizeErr != nil {
+					return normalizeErr
+				}
+			}
+			eventDataMap["ticket_id"] = ticket.ID
+			eventDataMap["changed_fields"] = fields
+			eventDataMap["sla_breached"] = ticket.SLABreached
+			eventDataMap["sla_due_date"] = ticket.SLADueDate
 			eventData = eventDataMap
 		}
 		notificationTargets := ticketUpdateNotificationTargets(
@@ -3418,6 +4221,11 @@ type NativeCommentResult struct {
 }
 
 func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeCommentInput) (*NativeCommentResult, error) {
+	operation, err := commandOperationContext(ctx, input.Actor)
+	if err != nil {
+		return nil, err
+	}
+	projectScope := operation.Scope
 	if err := input.Actor.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidActor, err)
 	}
@@ -3518,9 +4326,14 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 	var event *models.DomainEvent
 	var resourceVersion uint64
 	var receipt OperationReceipt
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = transactionForContext(ctx, s.dbForContext(ctx), func(tx *gorm.DB) error {
 		var ticket models.Ticket
-		if err := tx.Select("id", "version").First(&ticket, input.TicketID).Error; err != nil {
+		if err := tx.Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			input.TicketID,
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+		).First(&ticket).Error; err != nil {
 			return err
 		}
 		if ticket.Version != input.ExpectedVersion {
@@ -3534,7 +4347,14 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 		if input.ParentID != nil {
 			var count int64
 			if err := tx.Model(&models.TicketComment{}).
-				Where("id = ? AND ticket_id = ? AND is_deleted = ?", *input.ParentID, input.TicketID, false).
+				Where(
+					"id = ? AND ticket_id = ? AND organization_id = ? AND project_id = ? AND is_deleted = ?",
+					*input.ParentID,
+					input.TicketID,
+					projectScope.OrganizationID,
+					projectScope.ProjectID,
+					false,
+				).
 				Count(&count).Error; err != nil {
 				return err
 			}
@@ -3547,7 +4367,13 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 		}
 		if input.ParentID != nil {
 			result := tx.Model(&models.TicketComment{}).
-				Where("id = ? AND ticket_id = ?", *input.ParentID, input.TicketID).
+				Where(
+					"id = ? AND ticket_id = ? AND organization_id = ? AND project_id = ?",
+					*input.ParentID,
+					input.TicketID,
+					projectScope.OrganizationID,
+					projectScope.ProjectID,
+				).
 				Update("reply_count", gorm.Expr("reply_count + 1"))
 			if result.Error != nil {
 				return result.Error
@@ -3565,8 +4391,30 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 		if input.Type == models.CommentTypePublic && input.Actor.Type != models.ActorTypeHuman {
 			ticketUpdates["first_reply_at"] = gorm.Expr("COALESCE(first_reply_at, ?)", s.now())
 		}
+		projectionChanges := map[string]any{}
+		if input.Type != models.CommentTypeSystem {
+			projection, _, projectionErr := s.projectTicketSLAOnDB(
+				ctx,
+				tx,
+				&ticket,
+				s.now(),
+			)
+			if projectionErr != nil {
+				return fmt.Errorf("refresh ticket SLA projection after comment: %w", projectionErr)
+			}
+			projectionChanges = slaProjectionChanges(&ticket, projection)
+			for field, value := range projectionChanges {
+				ticketUpdates[field] = value
+			}
+		}
 		update := tx.Model(&models.Ticket{}).
-			Where("id = ? AND version = ?", input.TicketID, input.ExpectedVersion).
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ? AND version = ?",
+				input.TicketID,
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+				input.ExpectedVersion,
+			).
 			Updates(ticketUpdates)
 		if update.Error != nil {
 			return update.Error
@@ -3628,17 +4476,24 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 		}
 		if input.LeaseID != "" {
 			if err := tx.Model(&models.TicketLease{}).
-				Where("id = ?", input.LeaseID).
+				Where(
+					"id = ? AND organization_id = ? AND project_id = ?",
+					input.LeaseID,
+					projectScope.OrganizationID,
+					projectScope.ProjectID,
+				).
 				Update("ticket_version", resourceVersion).Error; err != nil {
 				return err
 			}
 		}
+		changedFields := []string{"comments", "comment_count"}
+		changedFields = append(changedFields, slaProjectionFieldNames(projectionChanges)...)
 		receipt = OperationReceipt{
 			OperationID:      newNativeID(),
 			ResourceID:       strconv.FormatUint(uint64(comment.ID), 10),
 			ResourceVersion:  resourceVersion,
 			EventID:          event.ID,
-			ChangedFields:    []string{"comments", "comment_count"},
+			ChangedFields:    changedFields,
 			PolicyDecisionID: policyDecisionID,
 		}
 		if input.IdempotencyRecordID != "" {
@@ -3867,6 +4722,11 @@ func (s *AgentNativeService) StoreAttachment(
 	ctx context.Context,
 	input NativeAttachmentInput,
 ) (*NativeAttachmentResult, error) {
+	operation, err := commandOperationContext(ctx, input.Actor)
+	if err != nil {
+		return nil, err
+	}
+	projectScope := operation.Scope
 	if s.attachmentStorage == nil {
 		return nil, ErrAttachmentStorageMissing
 	}
@@ -3977,9 +4837,16 @@ func (s *AgentNativeService) StoreAttachment(
 	var event *models.DomainEvent
 	var resourceVersion uint64
 	var receipt OperationReceipt
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
 		var ticket models.Ticket
-		if err := tx.Select("id", "version").First(&ticket, input.TicketID).Error; err != nil {
+		if err := tx.Select("id", "organization_id", "project_id", "version").
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ?",
+				input.TicketID,
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+			).
+			First(&ticket).Error; err != nil {
 			return err
 		}
 		if ticket.Version != input.ExpectedVersion {
@@ -3993,7 +4860,13 @@ func (s *AgentNativeService) StoreAttachment(
 		if input.CommentID != nil {
 			var count int64
 			if err := tx.Model(&models.TicketComment{}).
-				Where("id = ? AND ticket_id = ?", *input.CommentID, input.TicketID).
+				Where(
+					"id = ? AND ticket_id = ? AND organization_id = ? AND project_id = ?",
+					*input.CommentID,
+					input.TicketID,
+					projectScope.OrganizationID,
+					projectScope.ProjectID,
+				).
 				Count(&count).Error; err != nil {
 				return err
 			}
@@ -4006,7 +4879,13 @@ func (s *AgentNativeService) StoreAttachment(
 		}
 		resourceVersion = input.ExpectedVersion + 1
 		update := tx.Model(&models.Ticket{}).
-			Where("id = ? AND version = ?", input.TicketID, input.ExpectedVersion).
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ? AND version = ?",
+				input.TicketID,
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+				input.ExpectedVersion,
+			).
 			Updates(map[string]any{"version": resourceVersion, "updated_at": s.now()})
 		if update.Error != nil {
 			return update.Error
@@ -4063,7 +4942,12 @@ func (s *AgentNativeService) StoreAttachment(
 		}
 		if input.LeaseID != "" {
 			if err := tx.Model(&models.TicketLease{}).
-				Where("id = ?", input.LeaseID).
+				Where(
+					"id = ? AND organization_id = ? AND project_id = ?",
+					input.LeaseID,
+					projectScope.OrganizationID,
+					projectScope.ProjectID,
+				).
 				Update("ticket_version", resourceVersion).Error; err != nil {
 				return err
 			}
@@ -4114,11 +4998,20 @@ func (s *AgentNativeService) OpenAttachment(
 	ctx context.Context,
 	attachmentID uint,
 ) (*models.TicketAttachment, io.ReadCloser, error) {
+	projectScope, err := commandProjectScope(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	if s.attachmentStorage == nil {
 		return nil, nil, ErrAttachmentStorageMissing
 	}
 	var attachment models.TicketAttachment
-	if err := s.db.WithContext(ctx).First(&attachment, attachmentID).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		attachmentID,
+		projectScope.OrganizationID,
+		projectScope.ProjectID,
+	).First(&attachment).Error; err != nil {
 		return nil, nil, err
 	}
 	if attachment.VirusScan != models.VirusScanClean {
@@ -4137,12 +5030,21 @@ func (s *AgentNativeService) MarkAttachmentScan(
 	status models.VirusScanStatus,
 	details string,
 ) error {
+	projectScope, err := commandProjectScope(ctx)
+	if err != nil {
+		return err
+	}
 	if status != models.VirusScanClean && status != models.VirusScanInfected && status != models.VirusScanError {
 		return fmt.Errorf("invalid terminal virus scan status %q", status)
 	}
 	now := s.now()
 	result := s.dbForContext(ctx).Model(&models.TicketAttachment{}).
-		Where("id = ?", attachmentID).
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			attachmentID,
+			projectScope.OrganizationID,
+			projectScope.ProjectID,
+		).
 		Updates(map[string]any{
 			"virus_scan":   status,
 			"scan_details": truncateText(details, 4000),
@@ -4532,11 +5434,25 @@ func ticketFieldValue(ticket *models.Ticket, field string) any {
 	}
 }
 
-func validateTicketChangeSemantics(ticket *models.Ticket, changes map[string]any) error {
+func validateTicketChangeSemantics(
+	ctx context.Context,
+	tx *gorm.DB,
+	scope models.ProjectScope,
+	ticket *models.Ticket,
+	changes map[string]any,
+	actor models.ActorRef,
+) error {
 	if value, ok := changes["status"]; ok {
 		status := models.TicketStatus(fmt.Sprint(value))
-		if !status.IsValid() || !ticket.Status.CanTransitionTo(status) {
-			return fmt.Errorf("%w: %s to %s", ErrInvalidTicketTransition, ticket.Status, status)
+		if err := validateTicketWorkflowTransitionTx(
+			ctx,
+			tx,
+			scope,
+			ticket,
+			status,
+			actor,
+		); err != nil {
+			return err
 		}
 	}
 	if value, ok := changes["priority"]; ok {
@@ -4632,12 +5548,11 @@ func isUniqueConstraintError(err error) bool {
 			postgresError.ConstraintName == "idx_idempotency_actor_operation_key"
 	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(
-		message,
-		"unique constraint failed: idempotency_records.actor_type, "+
-			"idempotency_records.actor_id, idempotency_records.operation, "+
-			"idempotency_records.key",
-	)
+	return strings.Contains(message, "unique constraint failed: idempotency_records.") &&
+		strings.Contains(message, "idempotency_records.actor_type") &&
+		strings.Contains(message, "idempotency_records.actor_id") &&
+		strings.Contains(message, "idempotency_records.operation") &&
+		strings.Contains(message, "idempotency_records.key")
 }
 
 func minInt(left, right int) int {

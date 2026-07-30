@@ -434,7 +434,7 @@ test.describe('全站一级页面健康巡航', () => {
 
         await page.unrouteAll({ behavior: 'wait' });
         await page.route(
-            '**/api/v1/admin/agent-control/overview',
+            '**/api/projects/*/admin/agents/agent-control/overview',
             async (route) => {
                 await route.fulfill({
                     status: 503,

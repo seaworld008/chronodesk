@@ -21,6 +21,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/safeconv"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -52,6 +53,41 @@ type NotificationService struct {
 	environment              string
 	secretStore              security.Protector
 	webhookClients           WebhookClientFactory
+}
+
+func withNotificationProjectOperation[T any](
+	service *NotificationService,
+	ctx context.Context,
+	scope models.ProjectScope,
+	run func(context.Context) (T, error),
+) (T, error) {
+	var zero T
+	if service == nil || service.db == nil || run == nil {
+		return zero, errors.New("notification project operation is unavailable")
+	}
+	if err := scope.Validate(); err != nil {
+		return zero, err
+	}
+	if scopeddb.HasTransaction(ctx) {
+		return run(ctx)
+	}
+	var (
+		result       T
+		operationErr error
+	)
+	transactionErr := scopeddb.WithProjectScopeContextTransaction(
+		ctx,
+		service.db,
+		scope,
+		func(scopedContext context.Context) error {
+			result, operationErr = run(scopedContext)
+			return operationErr
+		},
+	)
+	if transactionErr != nil {
+		return zero, transactionErr
+	}
+	return result, operationErr
 }
 
 // WebhookClientFactory is the explicit outbound-network policy boundary.
@@ -224,8 +260,33 @@ type NotificationEvent struct {
 
 // DeleteNotification 删除通知
 func (ns *NotificationService) DeleteNotification(ctx context.Context, notificationID uint) error {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return fmt.Errorf("notification project scope: %w", err)
+	}
+	if !scopeddb.HasTransaction(ctx) {
+		_, err := withNotificationProjectOperation(
+			ns,
+			ctx,
+			scope,
+			func(scopedContext context.Context) (struct{}, error) {
+				return struct{}{}, ns.DeleteNotification(
+					scopedContext,
+					notificationID,
+				)
+			},
+		)
+		return err
+	}
 	var notification models.Notification
-	if err := ns.db.WithContext(ctx).First(&notification, notificationID).Error; err != nil {
+	if err := ns.db.WithContext(ctx).
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			notificationID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		First(&notification).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return fmt.Errorf("notification not found")
 		}
@@ -250,13 +311,22 @@ func getRuntimeEnvironment() string {
 // getActiveWebhooks 获取活跃的webhook配置
 func (ns *NotificationService) getActiveWebhooks(
 	ctx context.Context,
+	scope models.ProjectScope,
 	eventType models.WebhookEventType,
 	transitionStatus models.TicketStatus,
 ) ([]*models.WebhookConfig, error) {
+	if err := scope.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid webhook project scope: %w", err)
+	}
 	var configs []*models.WebhookConfig
 
 	// 查询活跃状态的webhook配置
-	if err := ns.db.WithContext(ctx).Where("status = ?", models.WebhookStatusActive).
+	if err := ns.db.WithContext(ctx).Where(
+		"organization_id = ? AND project_id = ? AND status = ?",
+		scope.OrganizationID,
+		scope.ProjectID,
+		models.WebhookStatusActive,
+	).
 		Find(&configs).Error; err != nil {
 		return nil, err
 	}
@@ -287,28 +357,44 @@ type WebhookOutboxTarget struct {
 // event before the fan-out delivery is acknowledged.
 func (ns *NotificationService) ListWebhookOutboxTargets(
 	ctx context.Context,
+	scope models.ProjectScope,
 	eventType models.WebhookEventType,
 	transitionStatus models.TicketStatus,
 ) ([]WebhookOutboxTarget, error) {
-	configs, err := ns.getActiveWebhooks(ctx, eventType, transitionStatus)
-	if err != nil {
-		return nil, err
-	}
-	targets := make([]WebhookOutboxTarget, 0, len(configs))
-	for _, config := range configs {
-		maxAttempts := config.RetryCount + 1
-		if maxAttempts < 1 {
-			maxAttempts = 1
-		}
-		if maxAttempts > 11 {
-			maxAttempts = 11
-		}
-		targets = append(targets, WebhookOutboxTarget{
-			ConfigID:    config.ID,
-			MaxAttempts: maxAttempts,
-		})
-	}
-	return targets, nil
+	return withNotificationProjectOperation(
+		ns,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (
+			[]WebhookOutboxTarget,
+			error,
+		) {
+			configs, err := ns.getActiveWebhooks(
+				scopedContext,
+				scope,
+				eventType,
+				transitionStatus,
+			)
+			if err != nil {
+				return nil, err
+			}
+			targets := make([]WebhookOutboxTarget, 0, len(configs))
+			for _, config := range configs {
+				maxAttempts := config.RetryCount + 1
+				if maxAttempts < 1 {
+					maxAttempts = 1
+				}
+				if maxAttempts > 11 {
+					maxAttempts = 11
+				}
+				targets = append(targets, WebhookOutboxTarget{
+					ConfigID:    config.ID,
+					MaxAttempts: maxAttempts,
+				})
+			}
+			return targets, nil
+		},
+	)
 }
 
 // SendWebhookOutboxAttempt performs exactly one bounded HTTP attempt. It does
@@ -316,16 +402,46 @@ func (ns *NotificationService) ListWebhookOutboxTargets(
 // outbox_deliveries.next_attempt_at.
 func (ns *NotificationService) SendWebhookOutboxAttempt(
 	ctx context.Context,
+	scope models.ProjectScope,
 	configID uint,
 	event *NotificationEvent,
 ) error {
 	if event == nil {
 		return errors.New("webhook event is required")
 	}
-	var config models.WebhookConfig
-	err := ns.db.WithContext(ctx).
-		Where("id = ? AND status = ?", configID, models.WebhookStatusActive).
-		First(&config).Error
+	if err := scope.Validate(); err != nil {
+		return fmt.Errorf("invalid webhook project scope: %w", err)
+	}
+	config, err := withNotificationProjectOperation(
+		ns,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (
+			models.WebhookConfig,
+			error,
+		) {
+			var config models.WebhookConfig
+			err := ns.db.WithContext(scopedContext).
+				Where(
+					"id = ? AND organization_id = ? AND project_id = ? AND status = ?",
+					configID,
+					scope.OrganizationID,
+					scope.ProjectID,
+					models.WebhookStatusActive,
+				).
+				First(&config).Error
+			if err != nil {
+				return models.WebhookConfig{}, err
+			}
+			if err := ns.revealWebhookSecrets(&config); err != nil {
+				return models.WebhookConfig{}, fmt.Errorf(
+					"无法读取webhook凭据: %w",
+					err,
+				)
+			}
+			return config, nil
+		},
+	)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		// A removed or disabled subscription no longer needs delivery.
 		return nil
@@ -333,11 +449,77 @@ func (ns *NotificationService) SendWebhookOutboxAttempt(
 	if err != nil {
 		return fmt.Errorf("load webhook configuration: %w", err)
 	}
-	if err := ns.revealWebhookSecrets(&config); err != nil {
-		return fmt.Errorf("无法读取webhook凭据: %w", err)
-	}
 	if !config.MatchesEvent(event.Type, event.TransitionStatus) {
 		return nil
+	}
+	timeout := ns.outboxWebhookTimeout
+	if timeout <= 0 || timeout > defaultOutboxWebhookAttemptTimeout {
+		timeout = defaultOutboxWebhookAttemptTimeout
+	}
+	if config.TimeoutSeconds > 0 {
+		configured := time.Duration(config.TimeoutSeconds) * time.Second
+		if configured < timeout {
+			timeout = configured
+		}
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return ns.sendWebhookAttempt(attemptCtx, &config, event)
+}
+
+// SendWebhookSnapshotOutboxAttempt performs one attempt using only the
+// immutable configuration captured with the source DomainEvent. The mutable
+// WebhookConfig row is never consulted for routing, filtering, credentials, or
+// retry behavior.
+func (ns *NotificationService) SendWebhookSnapshotOutboxAttempt(
+	ctx context.Context,
+	scope models.ProjectScope,
+	snapshotID string,
+	event *NotificationEvent,
+) error {
+	if event == nil {
+		return errors.New("webhook event is required")
+	}
+	if err := scope.Validate(); err != nil {
+		return fmt.Errorf("invalid webhook project scope: %w", err)
+	}
+	snapshotID = strings.TrimSpace(snapshotID)
+	if snapshotID == "" {
+		return errors.New("webhook delivery snapshot is required")
+	}
+	snapshot, err := withNotificationProjectOperation(
+		ns,
+		ctx,
+		scope,
+		func(scopedContext context.Context) (
+			models.WebhookDeliverySnapshot,
+			error,
+		) {
+			var snapshot models.WebhookDeliverySnapshot
+			err := ns.db.WithContext(scopedContext).
+				Where(
+					"id = ? AND organization_id = ? AND project_id = ?",
+					snapshotID,
+					scope.OrganizationID,
+					scope.ProjectID,
+				).
+				First(&snapshot).Error
+			return snapshot, err
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("load webhook delivery snapshot: %w", err)
+	}
+	if eventID := strings.TrimSpace(event.Metadata["event_id"]); eventID == "" ||
+		eventID != snapshot.EventID {
+		return errors.New("webhook delivery snapshot event mismatch")
+	}
+	config, err := snapshot.WebhookConfig()
+	if err != nil {
+		return fmt.Errorf("hydrate webhook delivery snapshot: %w", err)
+	}
+	if err := ns.revealWebhookSecrets(&config); err != nil {
+		return fmt.Errorf("无法读取webhook快照凭据: %w", err)
 	}
 	timeout := ns.outboxWebhookTimeout
 	if timeout <= 0 || timeout > defaultOutboxWebhookAttemptTimeout {
@@ -359,29 +541,48 @@ func (ns *NotificationService) sendWebhookAttempt(
 	config *models.WebhookConfig,
 	event *NotificationEvent,
 ) error {
+	if config == nil {
+		return errors.New("webhook配置不能为空")
+	}
+	if event == nil {
+		return errors.New("webhook事件不能为空")
+	}
 	startTime := time.Now()
 
 	// 创建日志记录
 	log := &models.WebhookLog{
-		ConfigID:     config.ID,
-		EventType:    event.Type,
-		ResourceID:   event.ResourceID,
-		ResourceType: event.ResourceType,
-		Status:       "pending",
-		MaxRetries:   0,
-		Environment:  ns.environment,
+		OrganizationID: config.OrganizationID,
+		ProjectID:      config.ProjectID,
+		ConfigID:       config.ID,
+		EventType:      event.Type,
+		ResourceID:     event.ResourceID,
+		ResourceType:   event.ResourceType,
+		Status:         "pending",
+		MaxRetries:     0,
+		Environment:    ns.environment,
 	}
 
 	// 序列化事件数据
 	eventDataBytes, _ := json.Marshal(event)
 	log.EventData = string(eventDataBytes)
 
+	// Custom Webhooks implement the authenticated CloudEvents contract. An
+	// unsigned delivery would contradict the public receiver contract and
+	// must never be sent.
+	if config.Provider == models.WebhookProviderCustom &&
+		strings.TrimSpace(config.Secret) == "" {
+		log.Status = "failed"
+		log.ErrorMessage = "自定义webhook缺少签名密钥"
+		ns.saveLog(ctx, log, config)
+		return errors.New("自定义webhook缺少签名密钥")
+	}
+
 	// 生成消息内容
 	message, err := ns.generateMessage(config, event)
 	if err != nil {
 		log.Status = "failed"
 		log.ErrorMessage = fmt.Sprintf("生成消息失败: %v", err)
-		ns.saveLog(log, config)
+		ns.saveLog(ctx, log, config)
 		return err
 	}
 
@@ -390,8 +591,25 @@ func (ns *NotificationService) sendWebhookAttempt(
 	if err != nil {
 		log.Status = "failed"
 		log.ErrorMessage = fmt.Sprintf("构建请求失败: %v", err)
-		ns.saveLog(log, config)
+		ns.saveLog(ctx, log, config)
 		return err
+	}
+	eventID := strings.TrimSpace(event.Metadata["event_id"])
+	if config.Provider == models.WebhookProviderCustom {
+		var structuredEvent CloudEventEnvelope
+		if err := json.Unmarshal(requestBody, &structuredEvent); err != nil {
+			log.Status = "failed"
+			log.ErrorMessage = "读取自定义webhook CloudEvent标识失败"
+			ns.saveLog(ctx, log, config)
+			return errors.New("读取自定义webhook CloudEvent标识失败")
+		}
+		if eventID != "" && eventID != structuredEvent.ID {
+			log.Status = "failed"
+			log.ErrorMessage = "自定义webhook CloudEvent标识不一致"
+			ns.saveLog(ctx, log, config)
+			return errors.New("自定义webhook CloudEvent标识不一致")
+		}
+		eventID = structuredEvent.ID
 	}
 
 	log.RequestURL = webhookEndpointForLog(config.WebhookURL)
@@ -403,23 +621,20 @@ func (ns *NotificationService) sendWebhookAttempt(
 	if err != nil {
 		log.Status = "failed"
 		log.ErrorMessage = "创建webhook请求失败"
-		ns.saveLog(log, config)
+		ns.saveLog(ctx, log, config)
 		return errors.New("webhook请求地址无效")
 	}
 
 	// 设置请求头
 	ns.setRequestHeaders(req, config, requestBody)
-	if eventID := strings.TrimSpace(event.Metadata["event_id"]); eventID != "" &&
-		!strings.ContainsAny(eventID, "\r\n") {
+	if eventID != "" && !strings.ContainsAny(eventID, "\r\n") {
 		req.Header.Set("X-CloudEvents-ID", eventID)
 		idempotencyKey := strings.TrimSpace(event.Metadata["delivery_id"])
-		if idempotencyKey == "" {
+		if idempotencyKey == "" || strings.ContainsAny(idempotencyKey, "\r\n") {
 			idempotencyKey = fmt.Sprintf("%s:webhook:%d", eventID, config.ID)
 		}
-		if !strings.ContainsAny(idempotencyKey, "\r\n") {
-			req.Header.Set("Idempotency-Key", idempotencyKey)
-			req.Header.Set("X-ChronoDesk-Delivery-ID", idempotencyKey)
-		}
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+		req.Header.Set("X-ChronoDesk-Delivery-ID", idempotencyKey)
 	}
 
 	// 日志只保留严格白名单中的非敏感头。Authorization、签名、Cookie
@@ -434,7 +649,7 @@ func (ns *NotificationService) sendWebhookAttempt(
 	if err != nil || client == nil {
 		log.Status = "failed"
 		log.ErrorMessage = "webhook目标地址未通过安全校验"
-		ns.saveLog(log, config)
+		ns.saveLog(ctx, log, config)
 		return errors.New("webhook目标地址未通过安全校验")
 	}
 	defer client.CloseIdleConnections()
@@ -446,7 +661,7 @@ func (ns *NotificationService) sendWebhookAttempt(
 	if err != nil {
 		log.Status = "failed"
 		log.ErrorMessage = "webhook请求发送失败"
-		ns.saveLog(log, config)
+		ns.saveLog(ctx, log, config)
 		return errors.New("webhook请求发送失败")
 	}
 	defer resp.Body.Close()
@@ -467,18 +682,23 @@ func (ns *NotificationService) sendWebhookAttempt(
 		log.Status = "success"
 
 		// 更新配置统计
-		ns.updateConfigStats(config.ID, true, nil)
+		ns.updateConfigStats(ctx, config, true, nil)
 	} else {
 		log.Status = "failed"
 		log.ErrorMessage = fmt.Sprintf("HTTP错误: %d", resp.StatusCode)
 
 		// 更新配置统计
-		ns.updateConfigStats(config.ID, false, fmt.Errorf("HTTP %d", resp.StatusCode))
+		ns.updateConfigStats(
+			ctx,
+			config,
+			false,
+			fmt.Errorf("HTTP %d", resp.StatusCode),
+		)
 
 	}
 
 	// 保存日志
-	ns.saveLog(log, config)
+	ns.saveLog(ctx, log, config)
 
 	// Any non-2xx response must remain an error. The durable Agent Outbox is
 	// the recovery owner for domain-event delivery; returning nil for a
@@ -629,8 +849,9 @@ func (ns *NotificationService) buildRequestBodyForEvent(
 		return ns.buildDingTalkBody(message)
 	case models.WebhookProviderLark:
 		return ns.buildLarkBody(message)
+	case models.WebhookProviderCustom:
+		return ns.buildCustomCloudEventBody(event)
 	default:
-		// 自定义webhook，使用通用格式
 		payload := map[string]interface{}{
 			"text":      message,
 			"timestamp": time.Now().Unix(),
@@ -652,6 +873,79 @@ func (ns *NotificationService) buildRequestBodyForEvent(
 		}
 		return json.Marshal(payload)
 	}
+}
+
+func (ns *NotificationService) buildCustomCloudEventBody(
+	event *NotificationEvent,
+) ([]byte, error) {
+	if event == nil || event.Data == nil {
+		return nil, errors.New("自定义webhook缺少CloudEvent")
+	}
+	value, exists := event.Data["cloud_event"]
+	if !exists || value == nil {
+		return nil, errors.New("自定义webhook缺少CloudEvent")
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("编码自定义webhook CloudEvent失败: %w", err)
+	}
+	var envelope CloudEventEnvelope
+	if err := json.Unmarshal(encoded, &envelope); err != nil {
+		return nil, fmt.Errorf("解析自定义webhook CloudEvent失败: %w", err)
+	}
+	if err := validateCustomWebhookCloudEvent(envelope); err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, fmt.Errorf("编码自定义webhook CloudEvent失败: %w", err)
+	}
+	return body, nil
+}
+
+func validateCustomWebhookCloudEvent(event CloudEventEnvelope) error {
+	switch {
+	case event.SpecVersion != "1.0":
+		return errors.New("自定义webhook CloudEvent specversion必须为1.0")
+	case strings.TrimSpace(event.ID) == "":
+		return errors.New("自定义webhook CloudEvent缺少id")
+	case strings.ContainsAny(event.ID, "\r\n"):
+		return errors.New("自定义webhook CloudEvent id包含非法字符")
+	case strings.TrimSpace(event.Source) == "":
+		return errors.New("自定义webhook CloudEvent缺少source")
+	case strings.TrimSpace(event.Type) == "":
+		return errors.New("自定义webhook CloudEvent缺少type")
+	case strings.TrimSpace(event.Subject) == "":
+		return errors.New("自定义webhook CloudEvent缺少subject")
+	case event.Time.IsZero():
+		return errors.New("自定义webhook CloudEvent缺少time")
+	case event.DataContentType != "application/json":
+		return errors.New("自定义webhook CloudEvent datacontenttype必须为application/json")
+	case strings.TrimSpace(event.DataSchema) == "":
+		return errors.New("自定义webhook CloudEvent缺少dataschema")
+	case event.ResourceVersion == 0:
+		return errors.New("自定义webhook CloudEvent缺少resourceversion")
+	case len(event.Data) == 0 || !json.Valid(event.Data):
+		return errors.New("自定义webhook CloudEvent data必须是有效JSON")
+	}
+	if err := (models.ActorRef{
+		Type: event.ActorType,
+		ID:   event.ActorID,
+	}).Validate(); err != nil {
+		return fmt.Errorf("自定义webhook CloudEvent actor无效: %w", err)
+	}
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(event.Data, &data); err != nil || data == nil {
+		return errors.New("自定义webhook CloudEvent data必须是JSON对象")
+	}
+	var actor models.ActorRef
+	if rawActor, exists := data["actor"]; !exists ||
+		json.Unmarshal(rawActor, &actor) != nil ||
+		actor.Validate() != nil ||
+		actor != (models.ActorRef{Type: event.ActorType, ID: event.ActorID}) {
+		return errors.New("自定义webhook CloudEvent data.actor必须匹配事件actor")
+	}
+	return nil
 }
 
 // buildWeChatBody 构建企业微信请求体
@@ -687,10 +981,35 @@ func (ns *NotificationService) buildLarkBody(message string) ([]byte, error) {
 
 // setRequestHeaders 设置请求头
 func (ns *NotificationService) setRequestHeaders(req *http.Request, config *models.WebhookConfig, body []byte) {
-	req.Header.Set("Content-Type", "application/json")
+	contentType := "application/json"
+	if config.Provider == models.WebhookProviderCustom {
+		contentType = "application/cloudevents+json"
+	}
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("User-Agent", "ChronoDesk-Webhook/1.0")
 	if config.AccessToken != "" && !strings.ContainsAny(config.AccessToken, "\r\n") {
 		req.Header.Set("Authorization", "Bearer "+config.AccessToken)
+	}
+
+	if config.Provider == models.WebhookProviderCustom && config.Secret != "" {
+		timestamp := strconv.FormatInt(time.Now().UTC().Unix(), 10)
+		req.Header.Set("X-ChronoDesk-Timestamp", timestamp)
+		req.Header.Set(
+			"X-ChronoDesk-Signature",
+			ns.generateCustomWebhookSign(timestamp, body, config.Secret),
+		)
+		if config.PreviousSecret != "" &&
+			config.PreviousSecretExpiresAt != nil &&
+			config.PreviousSecretExpiresAt.After(time.Now().UTC()) {
+			req.Header.Set(
+				"X-ChronoDesk-Signature-Previous",
+				ns.generateCustomWebhookSign(
+					timestamp,
+					body,
+					config.PreviousSecret,
+				),
+			)
+		}
 	}
 
 	// 钉钉签名
@@ -724,6 +1043,7 @@ var (
 		"X-Cloudevents-Id":         {},
 		"Idempotency-Key":          {},
 		"X-Chronodesk-Delivery-Id": {},
+		"X-Chronodesk-Timestamp":   {},
 	}
 	responseHeaderAuditAllowlist = map[string]struct{}{
 		"Content-Type": {},
@@ -781,7 +1101,11 @@ func scrubWebhookLog(log *models.WebhookLog, config *models.WebhookConfig) {
 		&log.ResponseBody,
 		&log.ErrorMessage,
 	}
-	for _, secret := range []string{config.Secret, config.AccessToken} {
+	for _, secret := range []string{
+		config.Secret,
+		config.PreviousSecret,
+		config.AccessToken,
+	} {
 		if secret == "" {
 			continue
 		}
@@ -799,6 +1123,18 @@ func (ns *NotificationService) generateDingTalkSign(timestamp int64, secret stri
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
+func (ns *NotificationService) generateCustomWebhookSign(
+	timestamp string,
+	body []byte,
+	secret string,
+) string {
+	h := hmac.New(sha256.New, []byte(secret))
+	_, _ = h.Write([]byte(timestamp))
+	_, _ = h.Write([]byte("."))
+	_, _ = h.Write(body)
+	return fmt.Sprintf("v1=%x", h.Sum(nil))
+}
+
 // generateLarkSign 生成飞书签名
 func (ns *NotificationService) generateLarkSign(timestamp, secret string) string {
 	stringToSign := timestamp + "\n" + "chronodesk" + "\n" + secret
@@ -807,7 +1143,23 @@ func (ns *NotificationService) generateLarkSign(timestamp, secret string) string
 }
 
 // updateConfigStats 更新配置统计
-func (ns *NotificationService) updateConfigStats(configID uint, success bool, err error) {
+func (ns *NotificationService) updateConfigStats(
+	ctx context.Context,
+	config *models.WebhookConfig,
+	success bool,
+	err error,
+) {
+	if config == nil ||
+		config.ID == 0 ||
+		config.OrganizationID == 0 ||
+		config.ProjectID == 0 {
+		return
+	}
+	finalizeContext, cancelFinalize := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		5*time.Second,
+	)
+	defer cancelFinalize()
 	updates := map[string]interface{}{
 		"last_triggered_at": time.Now(),
 		"total_sent":        gorm.Expr("total_sent + 1"),
@@ -825,25 +1177,77 @@ func (ns *NotificationService) updateConfigStats(configID uint, success bool, er
 		}
 	}
 
-	ns.db.Model(&models.WebhookConfig{}).Where("id = ?", configID).Updates(updates)
+	_, _ = withNotificationProjectOperation(
+		ns,
+		finalizeContext,
+		models.ProjectScope{
+			OrganizationID: config.OrganizationID,
+			ProjectID:      config.ProjectID,
+		},
+		func(scopedContext context.Context) (struct{}, error) {
+			result := ns.db.WithContext(scopedContext).
+				Model(&models.WebhookConfig{}).
+				Where(
+					"id = ? AND organization_id = ? AND project_id = ?",
+					config.ID,
+					config.OrganizationID,
+					config.ProjectID,
+				).
+				Updates(updates)
+			return struct{}{}, result.Error
+		},
+	)
 }
 
 // saveLog 保存日志
 func (ns *NotificationService) saveLog(
+	ctx context.Context,
 	log *models.WebhookLog,
 	config *models.WebhookConfig,
 ) {
 	scrubWebhookLog(log, config)
-	if err := ns.db.Create(log).Error; err != nil {
+	if log == nil || config == nil {
+		return
+	}
+	finalizeContext, cancelFinalize := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		5*time.Second,
+	)
+	defer cancelFinalize()
+	_, err := withNotificationProjectOperation(
+		ns,
+		finalizeContext,
+		models.ProjectScope{
+			OrganizationID: config.OrganizationID,
+			ProjectID:      config.ProjectID,
+		},
+		func(scopedContext context.Context) (struct{}, error) {
+			result := ns.db.WithContext(scopedContext).Create(log)
+			return struct{}{}, result.Error
+		},
+	)
+	if err != nil {
 		// 记录日志失败，但不影响主流程
 		fmt.Printf("保存webhook日志失败: %v\n", err)
 	}
 }
 
 // TestWebhook 测试webhook配置
-func (ns *NotificationService) TestWebhook(ctx context.Context, configID uint) error {
+func (ns *NotificationService) TestWebhook(
+	ctx context.Context,
+	scope models.ProjectScope,
+	configID uint,
+) error {
+	if err := scope.Validate(); err != nil {
+		return fmt.Errorf("invalid webhook project scope: %w", err)
+	}
 	var config models.WebhookConfig
-	if err := ns.db.First(&config, configID).Error; err != nil {
+	if err := ns.db.WithContext(ctx).Where(
+		"id = ? AND organization_id = ? AND project_id = ?",
+		configID,
+		scope.OrganizationID,
+		scope.ProjectID,
+	).First(&config).Error; err != nil {
 		return fmt.Errorf("webhook配置不存在: %w", err)
 	}
 	if err := ns.revealWebhookSecrets(&config); err != nil {
@@ -851,6 +1255,34 @@ func (ns *NotificationService) TestWebhook(ctx context.Context, configID uint) e
 	}
 
 	// 创建测试事件
+	now := time.Now().UTC()
+	eventID := fmt.Sprintf("webhook-test-%d", now.UnixNano())
+	actor := models.SystemActor("webhook-test")
+	cloudEventData, err := json.Marshal(map[string]any{
+		"actor":       actor,
+		"description": "这是一个测试消息，用于验证Webhook配置是否正常工作。",
+		"test":        true,
+		"title":       "Webhook测试通知",
+	})
+	if err != nil {
+		return fmt.Errorf("创建webhook测试事件失败: %w", err)
+	}
+	cloudEvent := CloudEventEnvelope{
+		SpecVersion:     "1.0",
+		ID:              eventID,
+		Source:          "urn:chronodesk:webhook-test",
+		Type:            string(models.WebhookEventSystemAlert),
+		Subject:         "webhook/test",
+		Time:            now,
+		DataContentType: "application/json",
+		DataSchema:      "urn:chronodesk:schema:webhook-test:v1",
+		ActorType:       actor.Type,
+		ActorID:         actor.ID,
+		ResourceVersion: 1,
+		OrganizationID:  scope.OrganizationID,
+		ProjectID:       scope.ProjectID,
+		Data:            cloudEventData,
+	}
 	testEvent := &NotificationEvent{
 		Type:         models.WebhookEventSystemAlert,
 		ResourceID:   0,
@@ -860,11 +1292,14 @@ func (ns *NotificationService) TestWebhook(ctx context.Context, configID uint) e
 		Data: map[string]interface{}{
 			"ticket_number": "TEST-001",
 			"test":          true,
+			"cloud_event":   cloudEvent,
 		},
 		Metadata: map[string]string{
-			"source": "webhook_test",
+			"delivery_id": "webhook-test:" + eventID,
+			"event_id":    eventID,
+			"source":      "webhook_test",
 		},
-		Timestamp: time.Now(),
+		Timestamp: now,
 	}
 
 	return ns.sendWebhookAttempt(ctx, &config, testEvent)
@@ -883,6 +1318,23 @@ func (ns *NotificationService) revealWebhookSecrets(config *models.WebhookConfig
 	if err != nil {
 		return err
 	}
+	previousSecret := ""
+	if config.PreviousSecret != "" &&
+		config.PreviousSecretExpiresAt != nil &&
+		config.PreviousSecretExpiresAt.After(time.Now().UTC()) {
+		previousSecret, err = security.RevealOptional(
+			ns.secretStore,
+			config.PreviousSecret,
+			security.FieldAAD(
+				"webhook_configs",
+				rowID,
+				"previous_secret",
+			),
+		)
+		if err != nil {
+			return err
+		}
+	}
 	accessToken, err := security.RevealOptional(
 		ns.secretStore,
 		config.AccessToken,
@@ -892,6 +1344,7 @@ func (ns *NotificationService) revealWebhookSecrets(config *models.WebhookConfig
 		return err
 	}
 	config.Secret = secret
+	config.PreviousSecret = previousSecret
 	config.AccessToken = accessToken
 	return nil
 }
@@ -903,18 +1356,48 @@ func (ns *NotificationService) CreateNotification(ctx context.Context, req *mode
 	if req == nil {
 		return nil, errors.New("通知请求不能为空")
 	}
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("通知项目上下文无效: %w", err)
+	}
+	if !scopeddb.HasTransaction(ctx) {
+		return withNotificationProjectOperation(
+			ns,
+			ctx,
+			operation.Scope,
+			func(scopedContext context.Context) (*models.Notification, error) {
+				return ns.CreateNotification(scopedContext, req)
+			},
+		)
+	}
+	if req.SenderID != nil {
+		return nil, errors.New("通知发送者由可信身份上下文确定")
+	}
+	var senderID *uint
+	if operation.Actor.Type == models.ActorTypeHuman {
+		value, parseErr := safeconv.ParsePositiveUint(operation.Actor.ID)
+		if parseErr != nil {
+			return nil, errors.New("通知发送者身份无效")
+		}
+		senderID = &value
+	}
+	if req.RelatedTicketID == nil &&
+		(req.RelatedID != nil ||
+			strings.TrimSpace(req.RelatedType) != "" ||
+			strings.TrimSpace(req.ActionURL) != "") {
+		return nil, errors.New("通知关联对象必须使用项目内工单引用")
+	}
 	notification := &models.Notification{
+		OrganizationID:  operation.Scope.OrganizationID,
+		ProjectID:       operation.Scope.ProjectID,
 		Type:            req.Type,
 		Title:           req.Title,
 		Content:         req.Content,
 		Priority:        req.Priority,
 		Channel:         req.Channel,
 		RecipientID:     req.RecipientID,
-		SenderID:        req.SenderID,
-		RelatedType:     req.RelatedType,
-		RelatedID:       req.RelatedID,
+		SenderID:        senderID,
 		RelatedTicketID: req.RelatedTicketID,
-		ActionURL:       req.ActionURL,
 		ScheduledAt:     req.ScheduledAt,
 		ExpiresAt:       req.ExpiresAt,
 	}
@@ -930,12 +1413,52 @@ func (ns *NotificationService) CreateNotification(ctx context.Context, req *mode
 	// 处理metadata
 	if req.Metadata != nil {
 		metadataBytes, err := json.Marshal(req.Metadata)
-		if err == nil {
-			notification.Metadata = string(metadataBytes)
+		if err != nil {
+			return nil, fmt.Errorf("通知元数据无效: %w", err)
 		}
+		if len(metadataBytes) > 16*1024 {
+			return nil, errors.New("通知元数据超过 16 KiB 限制")
+		}
+		notification.Metadata = string(metadataBytes)
 	}
 
-	err := ns.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = transactionForContext(ctx, ns.db, func(tx *gorm.DB) error {
+		var membershipCount int64
+		if err := tx.Model(&models.ProjectMembership{}).
+			Where(
+				"project_id = ? AND user_id = ? AND is_active = ?",
+				operation.Scope.ProjectID,
+				notification.RecipientID,
+				true,
+			).
+			Count(&membershipCount).Error; err != nil {
+			return fmt.Errorf("校验通知接收者项目成员关系: %w", err)
+		}
+		if membershipCount != 1 {
+			return errors.New("通知接收者不是当前项目的有效成员")
+		}
+		if notification.RelatedTicketID != nil {
+			var ticketCount int64
+			if err := tx.Model(&models.Ticket{}).
+				Where(
+					"id = ? AND organization_id = ? AND project_id = ?",
+					*notification.RelatedTicketID,
+					operation.Scope.OrganizationID,
+					operation.Scope.ProjectID,
+				).
+				Count(&ticketCount).Error; err != nil {
+				return fmt.Errorf("校验通知关联工单: %w", err)
+			}
+			if ticketCount != 1 {
+				return errors.New("通知关联工单不属于当前项目")
+			}
+			notification.RelatedType = "ticket"
+			notification.RelatedID = notification.RelatedTicketID
+			notification.ActionURL = fmt.Sprintf(
+				"/tickets/%d",
+				*notification.RelatedTicketID,
+			)
+		}
 		if err := tx.Create(notification).Error; err != nil {
 			return err
 		}
@@ -947,11 +1470,12 @@ func (ns *NotificationService) CreateNotification(ctx context.Context, req *mode
 			availableAt = *notification.ScheduledAt
 		}
 		_, err := AppendEmailOutboxTx(ctx, tx, EmailOutboxEventInput{
+			Scope:   operation.Scope,
 			ID:      NotificationEmailEventID(notification.ID),
 			Source:  "urn:chronodesk:notifications",
 			Type:    eventcontract.NotificationEmailRequestedEventType,
 			Subject: fmt.Sprintf("notification/%d", notification.ID),
-			Actor:   models.SystemActor("notification-service"),
+			Actor:   operation.Actor,
 			Data: EmailIntentReference{
 				UserID:           notification.RecipientID,
 				NotificationID:   notification.ID,
@@ -1004,44 +1528,64 @@ func (ns *NotificationService) DeliverEmailNotificationOutbox(
 		return errors.New("邮件通知 Outbox 事件引用不一致")
 	}
 
-	var notification models.Notification
-	if err := ns.db.WithContext(ctx).First(&notification, notificationID).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil
-		}
-		return fmt.Errorf("读取邮件通知失败: %w", err)
-	}
-	if notification.Channel != models.NotificationChannelEmail ||
-		notification.RecipientID != reference.UserID ||
-		string(notification.Type) != reference.NotificationType {
-		return errors.New("邮件通知 Outbox 业务引用不一致")
-	}
-	if notification.IsSent {
-		return nil
-	}
-	now := time.Now()
-	if notification.ExpiresAt != nil && !notification.ExpiresAt.After(now) {
-		notification.DeliveryStatus = "skipped_expired"
-		return ns.db.WithContext(ctx).Save(&notification).Error
-	}
-	if notification.ScheduledAt != nil && notification.ScheduledAt.After(now) {
-		return errors.New("邮件通知尚未到计划发送时间")
-	}
 	if ns.emailNotificationService == nil {
 		return errors.New("邮件通知发送器未初始化")
 	}
+	scope := models.ProjectScope{
+		OrganizationID: event.OrganizationID,
+		ProjectID:      event.ProjectID,
+	}
+	if err := scope.Validate(); err != nil {
+		return errors.New("邮件通知 Outbox 项目范围无效")
+	}
 	return ns.emailNotificationService.SendEmailNotificationOutboxAttempt(
 		ctx,
-		&notification,
+		scope,
+		&models.Notification{
+			ID:             notificationID,
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			RecipientID:    reference.UserID,
+			Type:           models.NotificationType(reference.NotificationType),
+		},
 	)
 }
 
 // GetNotifications 获取通知列表
 func (ns *NotificationService) GetNotifications(ctx context.Context, filter *models.NotificationFilter) ([]*models.Notification, int64, error) {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("notification project scope: %w", err)
+	}
+	if !scopeddb.HasTransaction(ctx) {
+		type result struct {
+			items []*models.Notification
+			total int64
+		}
+		value, operationErr := withNotificationProjectOperation(
+			ns,
+			ctx,
+			scope,
+			func(scopedContext context.Context) (result, error) {
+				items, total, queryErr := ns.GetNotifications(
+					scopedContext,
+					filter,
+				)
+				return result{items: items, total: total}, queryErr
+			},
+		)
+		return value.items, value.total, operationErr
+	}
 	if filter == nil {
 		filter = &models.NotificationFilter{}
 	}
-	baseQuery := ns.db.WithContext(ctx).Model(&models.Notification{})
+	baseQuery := ns.db.WithContext(ctx).
+		Model(&models.Notification{}).
+		Where(
+			"organization_id = ? AND project_id = ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+		)
 
 	// 应用过滤条件
 	if filter.RecipientID != nil {
@@ -1146,8 +1690,34 @@ func (ns *NotificationService) GetNotifications(ctx context.Context, filter *mod
 
 // MarkAsRead 标记通知为已读
 func (ns *NotificationService) MarkAsRead(ctx context.Context, notificationID uint, userID uint) error {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return fmt.Errorf("notification project scope: %w", err)
+	}
+	if !scopeddb.HasTransaction(ctx) {
+		_, err := withNotificationProjectOperation(
+			ns,
+			ctx,
+			scope,
+			func(scopedContext context.Context) (struct{}, error) {
+				return struct{}{}, ns.MarkAsRead(
+					scopedContext,
+					notificationID,
+					userID,
+				)
+			},
+		)
+		return err
+	}
 	var notification models.Notification
-	if err := ns.db.First(&notification, notificationID).Error; err != nil {
+	if err := ns.db.WithContext(ctx).
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			notificationID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		First(&notification).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return fmt.Errorf("通知不存在")
 		}
@@ -1161,7 +1731,7 @@ func (ns *NotificationService) MarkAsRead(ctx context.Context, notificationID ui
 
 	// 标记为已读
 	notification.MarkAsRead()
-	if err := ns.db.Save(&notification).Error; err != nil {
+	if err := ns.db.WithContext(ctx).Save(&notification).Error; err != nil {
 		return fmt.Errorf("标记已读失败: %w", err)
 	}
 
@@ -1170,6 +1740,24 @@ func (ns *NotificationService) MarkAsRead(ctx context.Context, notificationID ui
 
 // MarkAllAsRead 标记所有通知为已读
 func (ns *NotificationService) MarkAllAsRead(ctx context.Context, userID uint) error {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return fmt.Errorf("notification project scope: %w", err)
+	}
+	if !scopeddb.HasTransaction(ctx) {
+		_, err := withNotificationProjectOperation(
+			ns,
+			ctx,
+			scope,
+			func(scopedContext context.Context) (struct{}, error) {
+				return struct{}{}, ns.MarkAllAsRead(
+					scopedContext,
+					userID,
+				)
+			},
+		)
+		return err
+	}
 	now := time.Now()
 	updates := map[string]interface{}{
 		"is_read":    true,
@@ -1177,8 +1765,13 @@ func (ns *NotificationService) MarkAllAsRead(ctx context.Context, userID uint) e
 		"updated_at": now,
 	}
 
-	if err := ns.db.Model(&models.Notification{}).
-		Where("recipient_id = ? AND is_read = false", userID).
+	if err := ns.db.WithContext(ctx).Model(&models.Notification{}).
+		Where(
+			"organization_id = ? AND project_id = ? AND recipient_id = ? AND is_read = false",
+			scope.OrganizationID,
+			scope.ProjectID,
+			userID,
+		).
 		Updates(updates).Error; err != nil {
 		return fmt.Errorf("批量标记已读失败: %w", err)
 	}
@@ -1188,9 +1781,28 @@ func (ns *NotificationService) MarkAllAsRead(ctx context.Context, userID uint) e
 
 // GetUnreadCount 获取未读通知数量
 func (ns *NotificationService) GetUnreadCount(ctx context.Context, userID uint) (int64, error) {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("notification project scope: %w", err)
+	}
+	if !scopeddb.HasTransaction(ctx) {
+		return withNotificationProjectOperation(
+			ns,
+			ctx,
+			scope,
+			func(scopedContext context.Context) (int64, error) {
+				return ns.GetUnreadCount(scopedContext, userID)
+			},
+		)
+	}
 	var count int64
-	if err := ns.db.Model(&models.Notification{}).
-		Where("recipient_id = ? AND is_read = false", userID).
+	if err := ns.db.WithContext(ctx).Model(&models.Notification{}).
+		Where(
+			"organization_id = ? AND project_id = ? AND recipient_id = ? AND is_read = false",
+			scope.OrganizationID,
+			scope.ProjectID,
+			userID,
+		).
 		Count(&count).Error; err != nil {
 		return 0, fmt.Errorf("获取未读数量失败: %w", err)
 	}
@@ -1286,6 +1898,8 @@ func (ns *NotificationService) DeliverTicketNotificationOutbox(
 	}
 
 	notification := &models.Notification{
+		OrganizationID:  event.OrganizationID,
+		ProjectID:       event.ProjectID,
 		Type:            notificationType,
 		Priority:        models.NotificationPriorityNormal,
 		Channel:         models.NotificationChannelInApp,

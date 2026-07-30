@@ -19,6 +19,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/a2a"
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
@@ -36,6 +37,8 @@ type a2aCommandReservationContextKey struct{}
 type A2AExecutionIdentity struct {
 	Actor        models.ActorRef
 	CredentialID string
+	ProjectKey   string
+	Scope        models.ProjectScope
 }
 
 type a2aIdentityContextKey struct{}
@@ -49,23 +52,74 @@ func A2AExecutionIdentityFromContext(ctx context.Context) (A2AExecutionIdentity,
 	return identity, ok
 }
 
-// BindA2AIdentity snapshots the service-principal identity established by
-// agentauth.Middleware into request context. Mount it after authentication and
-// before the A2A RPC handler.
+// BindA2AIdentity is retained as a fail-closed compatibility shim while the
+// application composition root migrates to BindA2AIdentityWithProject.
 func BindA2AIdentity() gin.HandlerFunc {
+	return BindA2AIdentityWithProject(nil)
+}
+
+// BindA2AIdentityWithProject resolves the OAuth project_key through the live
+// service-principal grant and installs one trusted A2A OperationContext.
+// Message metadata and the A2A tenant compatibility field never construct or
+// override this scope. Mount it after agentauth.Middleware.
+func BindA2AIdentityWithProject(
+	projectService *services.ProjectService,
+) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if projectService == nil {
+			WriteProblem(c, http.StatusServiceUnavailable, ProblemInternal, "A2A project service is unavailable", true)
+			c.Abort()
+			return
+		}
 		principalID := strings.TrimSpace(c.GetString(agentauth.ContextPrincipalID))
 		credentialID := strings.TrimSpace(c.GetString(agentauth.ContextCredentialID))
-		if principalID == "" {
+		projectKey := strings.TrimSpace(c.GetString(agentauth.ContextProjectKey))
+		if principalID == "" || credentialID == "" || projectKey == "" {
 			WriteProblem(c, 401, ProblemUnauthorized, "Verified A2A principal is missing", false)
+			c.Abort()
+			return
+		}
+		projectAccess, err := projectService.ResolvePrincipalProject(
+			c.Request.Context(),
+			projectKey,
+			principalID,
+			models.ScopeTasksManage,
+		)
+		if err != nil {
+			WriteProblem(c, http.StatusForbidden, ProblemPolicyDenied, "Project access is denied", false)
 			c.Abort()
 			return
 		}
 		identity := A2AExecutionIdentity{
 			Actor:        models.ServicePrincipalActor(principalID),
 			CredentialID: credentialID,
+			ProjectKey:   projectKey,
+			Scope:        projectAccess.Scope,
 		}
-		ctx := WithA2AExecutionIdentity(c.Request.Context(), identity)
+		ctx, err := services.WithOperationContext(
+			c.Request.Context(),
+			services.OperationContext{
+				Scope:        identity.Scope,
+				Actor:        identity.Actor,
+				Source:       services.SourceProtocolA2A,
+				CredentialID: identity.CredentialID,
+			},
+		)
+		if err != nil {
+			WriteProblem(c, http.StatusUnauthorized, ProblemUnauthorized, "Verified A2A identity is invalid", false)
+			c.Abort()
+			return
+		}
+		ctx, err = a2a.WithProjectBinding(ctx, a2a.ProjectBinding{
+			ProjectKey: identity.ProjectKey,
+			Scope:      identity.Scope,
+		})
+		if err != nil {
+			WriteProblem(c, http.StatusUnauthorized, ProblemUnauthorized, "Verified A2A project is invalid", false)
+			c.Abort()
+			return
+		}
+		ctx = WithA2AExecutionIdentity(ctx, identity)
 		ctx = a2a.WithTaskOwner(ctx, a2a.TaskOwner{
 			ActorType:    string(identity.Actor.Type),
 			ActorID:      identity.Actor.ID,
@@ -233,6 +287,9 @@ func (ContextA2AIdentityResolver) ResolveA2AIdentity(
 	if !ok {
 		return A2AExecutionIdentity{}, errors.New("trusted A2A identity is unavailable")
 	}
+	if err := validateA2AExecutionIdentity(ctx, identity); err != nil {
+		return A2AExecutionIdentity{}, err
+	}
 	return identity, nil
 }
 
@@ -256,6 +313,89 @@ type A2ABackend struct {
 	native                *services.AgentNativeService
 	identity              A2AIdentityResolver
 	commandReservationTTL time.Duration
+}
+
+type deferredA2AReport struct {
+	status      *a2a.TaskState
+	message     *a2a.Message
+	artifact    *a2a.Artifact
+	appendParts bool
+	lastChunk   bool
+	metadata    map[string]any
+}
+
+// deferredA2AReporter keeps live task updates behind the Ticket transaction
+// boundary. A2A streaming clients can therefore never observe a success
+// artifact for a command whose PostgreSQL commit later fails.
+type deferredA2AReporter struct {
+	reports []deferredA2AReport
+}
+
+func (reporter *deferredA2AReporter) SetStatus(
+	_ context.Context,
+	state a2a.TaskState,
+	message *a2a.Message,
+	metadata map[string]any,
+) error {
+	stateCopy := state
+	reporter.reports = append(reporter.reports, deferredA2AReport{
+		status:   &stateCopy,
+		message:  message,
+		metadata: cloneA2AMap(metadata),
+	})
+	return nil
+}
+
+func (reporter *deferredA2AReporter) AddArtifact(
+	_ context.Context,
+	artifact a2a.Artifact,
+	appendParts bool,
+	lastChunk bool,
+	metadata map[string]any,
+) error {
+	artifactCopy := artifact
+	reporter.reports = append(reporter.reports, deferredA2AReport{
+		artifact:    &artifactCopy,
+		appendParts: appendParts,
+		lastChunk:   lastChunk,
+		metadata:    cloneA2AMap(metadata),
+	})
+	return nil
+}
+
+func (reporter *deferredA2AReporter) Flush(
+	ctx context.Context,
+	target a2a.Reporter,
+) error {
+	if reporter == nil || target == nil {
+		return errors.New("A2A reporter is unavailable")
+	}
+	for _, report := range reporter.reports {
+		var err error
+		switch {
+		case report.status != nil:
+			err = target.SetStatus(
+				ctx,
+				*report.status,
+				report.message,
+				report.metadata,
+			)
+		case report.artifact != nil:
+			err = target.AddArtifact(
+				ctx,
+				*report.artifact,
+				report.appendParts,
+				report.lastChunk,
+				report.metadata,
+			)
+		default:
+			err = errors.New("deferred A2A report is invalid")
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func NewA2ABackend(
@@ -291,6 +431,10 @@ func (b *A2ABackend) Process(
 	if err != nil || identity.Actor.Validate() != nil {
 		return reportA2AState(ctx, reporter, a2a.TaskStateAuthRequired, "authentication_required", nil)
 	}
+	ctx, err = bindA2AOperationIdentity(ctx, identity)
+	if err != nil {
+		return reportA2AState(ctx, reporter, a2a.TaskStateAuthRequired, "project_scope_mismatch", nil)
+	}
 
 	if identity.Actor.Type == models.ActorTypeServicePrincipal {
 		release, acquireErr := b.native.AcquireAgentExecution(ctx, identity.Actor.ID)
@@ -310,6 +454,46 @@ func (b *A2ABackend) Process(
 			parseErr.required,
 		)
 	}
+	deferredReporter := &deferredA2AReporter{}
+	var outcomeErr error
+	transactionErr := scopeddb.WithProjectScopeContextTransaction(
+		ctx,
+		b.db,
+		identity.Scope,
+		func(scopedContext context.Context) error {
+			outcomeErr = b.processA2ACommandScoped(
+				scopedContext,
+				task,
+				message,
+				identity,
+				skill,
+				payload,
+				deferredReporter,
+			)
+			// Denied PolicyDecision rows and failed idempotency records are
+			// durable business outcomes. Domain services use savepoints for
+			// command-level rollback.
+			return nil
+		},
+	)
+	if transactionErr != nil {
+		return b.reportDomainError(ctx, reporter, transactionErr)
+	}
+	if err := deferredReporter.Flush(ctx, reporter); err != nil {
+		return err
+	}
+	return outcomeErr
+}
+
+func (b *A2ABackend) processA2ACommandScoped(
+	ctx context.Context,
+	task a2a.Task,
+	message a2a.Message,
+	identity A2AExecutionIdentity,
+	skill string,
+	payload map[string]any,
+	reporter a2a.Reporter,
+) error {
 	reservation, replayed, reserveErr := b.reserveA2ACommand(
 		ctx,
 		task,
@@ -342,6 +526,7 @@ func (b *A2ABackend) Process(
 		ctx = context.WithValue(ctx, a2aCommandReservationContextKey{}, reservation)
 	}
 
+	var err error
 	switch skill {
 	case "ticket-intake":
 		err = b.ticketIntake(ctx, task, message, identity, payload, reporter)
@@ -373,6 +558,94 @@ func (b *A2ABackend) Process(
 		)
 	}
 	return b.reportDomainError(ctx, reporter, err)
+}
+
+func validateA2AExecutionIdentity(
+	ctx context.Context,
+	identity A2AExecutionIdentity,
+) error {
+	if err := identity.Actor.Validate(); err != nil {
+		return err
+	}
+	if identity.Actor.Type != models.ActorTypeServicePrincipal ||
+		strings.TrimSpace(identity.CredentialID) == "" ||
+		models.ValidateProjectKey(identity.ProjectKey) != nil ||
+		identity.Scope.Validate() != nil {
+		return errors.New("trusted A2A identity is incomplete")
+	}
+	operation, err := services.OperationContextFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	if operation.Actor != identity.Actor ||
+		operation.CredentialID != identity.CredentialID ||
+		operation.Source != services.SourceProtocolA2A ||
+		operation.Scope != identity.Scope {
+		return errors.New("trusted A2A operation context does not match identity")
+	}
+	binding, ok := a2a.ProjectBindingFromContext(ctx)
+	if !ok ||
+		binding.ProjectKey != identity.ProjectKey ||
+		binding.Scope != identity.Scope {
+		return errors.New("trusted A2A project binding does not match identity")
+	}
+	return nil
+}
+
+func bindA2AOperationIdentity(
+	ctx context.Context,
+	identity A2AExecutionIdentity,
+) (context.Context, error) {
+	if err := identity.Actor.Validate(); err != nil {
+		return nil, err
+	}
+	if identity.Actor.Type != models.ActorTypeServicePrincipal ||
+		strings.TrimSpace(identity.CredentialID) == "" ||
+		models.ValidateProjectKey(identity.ProjectKey) != nil ||
+		identity.Scope.Validate() != nil {
+		return nil, errors.New("trusted A2A identity is incomplete")
+	}
+	if operation, err := services.OperationContextFromContext(ctx); err == nil {
+		if operation.Actor != identity.Actor ||
+			operation.CredentialID != identity.CredentialID ||
+			operation.Source != services.SourceProtocolA2A ||
+			operation.Scope != identity.Scope {
+			return nil, errors.New("trusted A2A operation context does not match identity")
+		}
+	} else {
+		var bindErr error
+		ctx, bindErr = services.WithOperationContext(ctx, services.OperationContext{
+			Scope:        identity.Scope,
+			Actor:        identity.Actor,
+			Source:       services.SourceProtocolA2A,
+			CredentialID: identity.CredentialID,
+		})
+		if bindErr != nil {
+			return nil, bindErr
+		}
+	}
+	if binding, ok := a2a.ProjectBindingFromContext(ctx); ok {
+		if binding.ProjectKey != identity.ProjectKey ||
+			binding.Scope != identity.Scope {
+			return nil, errors.New("existing A2A project binding does not match identity")
+		}
+	} else {
+		var err error
+		ctx, err = a2a.WithProjectBinding(ctx, a2a.ProjectBinding{
+			ProjectKey: identity.ProjectKey,
+			Scope:      identity.Scope,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	ctx = WithA2AExecutionIdentity(ctx, identity)
+	ctx = a2a.WithTaskOwner(ctx, a2a.TaskOwner{
+		ActorType:    string(identity.Actor.Type),
+		ActorID:      identity.Actor.ID,
+		CredentialID: identity.CredentialID,
+	})
+	return ctx, nil
 }
 
 func (b *A2ABackend) reserveA2ACommand(
@@ -523,19 +796,21 @@ func normalizeA2ASkill(value string) string {
 }
 
 type ticketIntakeCommand struct {
-	Title         string                `json:"title"`
-	Description   string                `json:"description"`
-	Type          models.TicketType     `json:"type"`
-	Priority      models.TicketPriority `json:"priority"`
-	CategoryID    *uint                 `json:"category_id,omitempty"`
-	SubcategoryID *uint                 `json:"subcategory_id,omitempty"`
-	Tags          []string              `json:"tags,omitempty"`
-	DueDate       *time.Time            `json:"due_date,omitempty"`
-	CustomerEmail string                `json:"customer_email,omitempty"`
-	CustomerPhone string                `json:"customer_phone,omitempty"`
-	CustomerName  string                `json:"customer_name,omitempty"`
-	CustomFields  map[string]any        `json:"custom_fields,omitempty"`
-	AgentContext  *models.AgentContext  `json:"agent_context,omitempty"`
+	Title                string                `json:"title"`
+	Description          string                `json:"description"`
+	Type                 models.TicketType     `json:"type"`
+	Priority             models.TicketPriority `json:"priority"`
+	RequestTypeVersionID string                `json:"request_type_version_id"`
+	WorkflowVersionID    string                `json:"workflow_version_id"`
+	CategoryID           *uint                 `json:"category_id,omitempty"`
+	SubcategoryID        *uint                 `json:"subcategory_id,omitempty"`
+	Tags                 []string              `json:"tags,omitempty"`
+	DueDate              *time.Time            `json:"due_date,omitempty"`
+	CustomerEmail        string                `json:"customer_email,omitempty"`
+	CustomerPhone        string                `json:"customer_phone,omitempty"`
+	CustomerName         string                `json:"customer_name,omitempty"`
+	CustomFields         map[string]any        `json:"custom_fields,omitempty"`
+	AgentContext         *models.AgentContext  `json:"agent_context,omitempty"`
 }
 
 func (b *A2ABackend) ticketIntake(
@@ -552,7 +827,24 @@ func (b *A2ABackend) ticketIntake(
 		strings.TrimSpace(command.Description) == "" ||
 		!command.Type.IsValid() ||
 		!command.Priority.IsValid() {
-		return requireA2AFields("title", "description", "type", "priority")
+		return requireA2AFields(
+			"title",
+			"description",
+			"type",
+			"priority",
+			"request_type_version_id",
+			"workflow_version_id",
+		)
+	}
+	requestTypeVersionID, validRequestTypeVersion :=
+		normalizeMachineConfigurationVersionID(command.RequestTypeVersionID)
+	workflowVersionID, validWorkflowVersion :=
+		normalizeMachineConfigurationVersionID(command.WorkflowVersionID)
+	if !validRequestTypeVersion || !validWorkflowVersion {
+		return requireA2AFields(
+			"request_type_version_id (canonical UUID)",
+			"workflow_version_id (canonical UUID)",
+		)
 	}
 	var customFields *models.JSONMap
 	if command.CustomFields != nil {
@@ -560,20 +852,22 @@ func (b *A2ABackend) ticketIntake(
 		customFields = &value
 	}
 	request := models.TicketCreateRequest{
-		Title:         command.Title,
-		Description:   command.Description,
-		Type:          command.Type,
-		Priority:      command.Priority,
-		Source:        models.TicketSourceAgent,
-		CategoryID:    command.CategoryID,
-		SubcategoryID: command.SubcategoryID,
-		Tags:          models.StringList(command.Tags),
-		DueDate:       command.DueDate,
-		CustomerEmail: command.CustomerEmail,
-		CustomerPhone: command.CustomerPhone,
-		CustomerName:  command.CustomerName,
-		CustomFields:  customFields,
-		AgentContext:  command.AgentContext,
+		Title:                command.Title,
+		Description:          command.Description,
+		Type:                 command.Type,
+		Priority:             command.Priority,
+		Source:               models.TicketSourceAgent,
+		RequestTypeVersionID: requestTypeVersionID,
+		WorkflowVersionID:    workflowVersionID,
+		CategoryID:           command.CategoryID,
+		SubcategoryID:        command.SubcategoryID,
+		Tags:                 models.StringList(command.Tags),
+		DueDate:              command.DueDate,
+		CustomerEmail:        command.CustomerEmail,
+		CustomerPhone:        command.CustomerPhone,
+		CustomerName:         command.CustomerName,
+		CustomFields:         customFields,
+		AgentContext:         command.AgentContext,
 	}
 	reservation := a2aReservationFromContext(ctx)
 	result, err := b.native.CreateNativeTicket(ctx, services.NativeTicketCreateInput{
@@ -1380,8 +1674,35 @@ func (d *A2AOutboxPushDispatcher) Enqueue(
 	config a2a.PushNotificationConfig,
 	event a2a.StoredEvent,
 ) error {
-	return d.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		return d.EnqueueTx(ctx, tx, config, event)
+	operation, err := services.OperationContextFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	workerContext, err := d.workerOperationContext(ctx, operation.Scope, event)
+	if err != nil {
+		return err
+	}
+	return scopeddb.WithProjectScopeTransaction(
+		workerContext,
+		d.db,
+		operation.Scope,
+		func(tx *gorm.DB) error {
+			return d.EnqueueTx(workerContext, tx, config, event)
+		},
+	)
+}
+
+func (d *A2AOutboxPushDispatcher) workerOperationContext(
+	ctx context.Context,
+	scope models.ProjectScope,
+	event a2a.StoredEvent,
+) (context.Context, error) {
+	return services.WithOperationContext(ctx, services.OperationContext{
+		Scope:         scope,
+		Actor:         d.actor,
+		Source:        services.SourceProtocolWorker,
+		TraceID:       event.TaskID,
+		CorrelationID: event.ContextID,
 	})
 }
 
@@ -1394,11 +1715,25 @@ func (d *A2AOutboxPushDispatcher) EnqueueTx(
 	if tx == nil {
 		return errors.New("A2A push transaction is required")
 	}
+	operation, err := services.OperationContextFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	workerContext, err := d.workerOperationContext(ctx, operation.Scope, event)
+	if err != nil {
+		return err
+	}
+	scope := operation.Scope
 	eventID := stableA2APushEventID(event.TaskID, event.Cursor, config.ID)
 	var existing int64
-	if err := tx.WithContext(ctx).
+	if err := tx.WithContext(workerContext).
 		Model(&models.DomainEvent{}).
-		Where("id = ?", eventID).
+		Where(
+			"organization_id = ? AND project_id = ? AND id = ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+			eventID,
+		).
 		Count(&existing).Error; err != nil {
 		return err
 	}
@@ -1412,29 +1747,35 @@ func (d *A2AOutboxPushDispatcher) EnqueueTx(
 	if resourceVersion == 0 {
 		resourceVersion = 1
 	}
-	_, err := d.native.AppendDomainEventTx(ctx, tx, services.DomainEventInput{
-		ID:              eventID,
-		Type:            "io.chronodesk.a2a.task.updated.v1",
-		Subject:         "a2a/task/" + event.TaskID,
-		Actor:           d.actor,
-		ResourceVersion: resourceVersion,
-		TraceID:         event.TaskID,
-		CorrelationID:   event.ContextID,
-		CausationID:     event.Cursor,
-		Data: map[string]any{
-			"a2a_task_id":      event.TaskID,
-			"a2a_context_id":   event.ContextID,
-			"a2a_event_cursor": event.Cursor,
-			"push_config_id":   config.ID,
-			"callback_url":     config.URL,
-			"stream_response":  event.Payload,
-			"contains_secrets": false,
+	_, err = d.native.AppendDomainEventTx(
+		workerContext,
+		tx.WithContext(workerContext),
+		services.DomainEventInput{
+			ID:              eventID,
+			Type:            "io.chronodesk.a2a.task.updated.v1",
+			Subject:         "a2a/task/" + event.TaskID,
+			Actor:           d.actor,
+			Scope:           scope,
+			ResourceVersion: resourceVersion,
+			TraceID:         event.TaskID,
+			CorrelationID:   event.ContextID,
+			CausationID:     event.Cursor,
+			Data: map[string]any{
+				"a2a_task_id":      event.TaskID,
+				"a2a_context_id":   event.ContextID,
+				"a2a_event_cursor": event.Cursor,
+				"push_config_id":   config.ID,
+				"callback_url":     config.URL,
+				"stream_response":  event.Payload,
+				"contains_secrets": false,
+			},
 		},
-	}, []services.OutboxTarget{{
-		Type:        "a2a_push",
-		ID:          config.ID,
-		MaxAttempts: d.maxAttempts,
-	}})
+		[]services.OutboxTarget{{
+			Type:        "a2a_push",
+			ID:          config.ID,
+			MaxAttempts: d.maxAttempts,
+		}},
+	)
 	return err
 }
 

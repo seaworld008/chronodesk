@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/security"
@@ -43,8 +44,12 @@ func TestWebhookHandlerEncryptsCredentialsAtRest(t *testing.T) {
 	handler := NewWebhookHandlerWithProtector(db, ring)
 	router := gin.New()
 	router.POST("/webhooks", func(c *gin.Context) {
-		c.Set("user_id", uint(1))
+		bindWebhookProjectTestContext(t, c)
 		handler.CreateWebhook(c)
+	})
+	router.PUT("/webhooks/:id", func(c *gin.Context) {
+		bindWebhookProjectTestContext(t, c)
+		handler.UpdateWebhook(c)
 	})
 	payload := map[string]any{
 		"name":              "secure webhook",
@@ -88,12 +93,73 @@ func TestWebhookHandlerEncryptsCredentialsAtRest(t *testing.T) {
 	service := services.NewNotificationServiceWithProtector(db, ring)
 	targets, err := service.ListWebhookOutboxTargets(
 		request.Context(),
+		models.ProjectScope{OrganizationID: 1, ProjectID: 10},
 		models.WebhookEventTicketCreated,
 		"",
 	)
 	if err != nil || len(targets) != 1 {
 		t.Fatalf("encrypted webhook reload targets=%+v err=%v", targets, err)
 	}
+
+	rotationRequest := httptest.NewRequest(
+		http.MethodPut,
+		"/webhooks/"+strconv.FormatUint(uint64(stored.ID), 10),
+		strings.NewReader(`{
+			"secret":"rotated-signature-secret",
+			"secret_overlap_seconds":3600
+		}`),
+	)
+	rotationRequest.Header.Set("Content-Type", "application/json")
+	rotationResponse := httptest.NewRecorder()
+	router.ServeHTTP(rotationResponse, rotationRequest)
+	if rotationResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"rotate status=%d body=%s",
+			rotationResponse.Code,
+			rotationResponse.Body.String(),
+		)
+	}
+	if strings.Contains(rotationResponse.Body.String(), "signature-secret") {
+		t.Fatal("webhook rotation response leaked a signing secret")
+	}
+	var rotated models.WebhookConfig
+	if err := db.First(&rotated, stored.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !security.IsEnvelope(rotated.Secret) ||
+		!security.IsEnvelope(rotated.PreviousSecret) ||
+		rotated.PreviousSecretExpiresAt == nil ||
+		!rotated.PreviousSecretExpiresAt.After(time.Now().UTC()) {
+		t.Fatalf("webhook dual-key rotation was not persisted: %+v", rotated)
+	}
+	current, err := ring.Open(
+		rotated.Secret,
+		security.FieldAAD(
+			"webhook_configs",
+			strconv.FormatUint(uint64(rotated.ID), 10),
+			"secret",
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous, err := ring.Open(
+		rotated.PreviousSecret,
+		security.FieldAAD(
+			"webhook_configs",
+			strconv.FormatUint(uint64(rotated.ID), 10),
+			"previous_secret",
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(current) != "rotated-signature-secret" ||
+		string(previous) != "signature-secret" {
+		t.Fatal("webhook dual-key rotation stored incorrect key material")
+	}
+	clear(current)
+	clear(previous)
 }
 
 func TestWebhookHandlerFailsClosedWithoutKeyring(t *testing.T) {
@@ -114,7 +180,7 @@ func TestWebhookHandlerFailsClosedWithoutKeyring(t *testing.T) {
 	handler := NewWebhookHandlerWithProtector(db, nil)
 	router := gin.New()
 	router.POST("/webhooks", func(c *gin.Context) {
-		c.Set("user_id", uint(1))
+		bindWebhookProjectTestContext(t, c)
 		handler.CreateWebhook(c)
 	})
 	request := httptest.NewRequest(
@@ -161,7 +227,7 @@ func TestWebhookHandlerRejectsSSRFTarget(t *testing.T) {
 	handler := NewWebhookHandlerWithProtector(db, nil)
 	router := gin.New()
 	router.POST("/webhooks", func(c *gin.Context) {
-		c.Set("user_id", uint(1))
+		bindWebhookProjectTestContext(t, c)
 		handler.CreateWebhook(c)
 	})
 	request := httptest.NewRequest(
@@ -214,11 +280,11 @@ func TestWebhookHandlerEnforcesCanonicalEventsAndTransitionPredicates(t *testing
 	handler := NewWebhookHandlerWithProtector(db, nil)
 	router := gin.New()
 	router.POST("/webhooks", func(c *gin.Context) {
-		c.Set("user_id", uint(1))
+		bindWebhookProjectTestContext(t, c)
 		handler.CreateWebhook(c)
 	})
 	router.PUT("/webhooks/:id", func(c *gin.Context) {
-		c.Set("user_id", uint(1))
+		bindWebhookProjectTestContext(t, c)
 		handler.UpdateWebhook(c)
 	})
 
@@ -296,4 +362,111 @@ func TestWebhookHandlerEnforcesCanonicalEventsAndTransitionPredicates(t *testing
 			removeResponse.Body.String(),
 		)
 	}
+}
+
+func TestWebhookHandlerDoesNotExposeAnotherProject(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := gorm.Open(
+		sqlite.Open("file:webhook-project-isolation?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&models.User{}, &models.WebhookConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.User{
+		ID: 1, Username: "project-webhook-admin",
+		Email:        "project-webhook-admin@example.test",
+		PasswordHash: "hash",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	configs := []models.WebhookConfig{
+		{
+			OrganizationID: 1,
+			ProjectID:      10,
+			Name:           "visible",
+			Provider:       models.WebhookProviderCustom,
+			WebhookURL:     "https://visible.example.test",
+			Status:         models.WebhookStatusActive,
+			CreatedBy:      1,
+		},
+		{
+			OrganizationID: 1,
+			ProjectID:      11,
+			Name:           "hidden",
+			Provider:       models.WebhookProviderCustom,
+			WebhookURL:     "https://hidden.example.test",
+			Status:         models.WebhookStatusActive,
+			CreatedBy:      1,
+		},
+	}
+	if err := db.Create(&configs).Error; err != nil {
+		t.Fatal(err)
+	}
+	handler := NewWebhookHandlerWithProtector(db, nil)
+	router := gin.New()
+	router.GET("/webhooks", func(c *gin.Context) {
+		bindWebhookProjectTestContext(t, c)
+		handler.ListWebhooks(c)
+	})
+	router.GET("/webhooks/:id", func(c *gin.Context) {
+		bindWebhookProjectTestContext(t, c)
+		handler.GetWebhook(c)
+	})
+	listResponse := httptest.NewRecorder()
+	router.ServeHTTP(
+		listResponse,
+		httptest.NewRequest(http.MethodGet, "/webhooks", nil),
+	)
+	if listResponse.Code != http.StatusOK ||
+		!strings.Contains(listResponse.Body.String(), `"visible"`) ||
+		strings.Contains(listResponse.Body.String(), `"hidden"`) {
+		t.Fatalf(
+			"project webhook list status=%d body=%s",
+			listResponse.Code,
+			listResponse.Body.String(),
+		)
+	}
+	hiddenResponse := httptest.NewRecorder()
+	router.ServeHTTP(
+		hiddenResponse,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/webhooks/"+strconv.FormatUint(uint64(configs[1].ID), 10),
+			nil,
+		),
+	)
+	if hiddenResponse.Code != http.StatusNotFound {
+		t.Fatalf(
+			"cross-project webhook status=%d body=%s",
+			hiddenResponse.Code,
+			hiddenResponse.Body.String(),
+		)
+	}
+}
+
+func bindWebhookProjectTestContext(t *testing.T, c *gin.Context) {
+	t.Helper()
+	scope := models.ProjectScope{OrganizationID: 1, ProjectID: 10}
+	operationContext, err := services.WithOperationContext(
+		c.Request.Context(),
+		services.OperationContext{
+			Scope:  scope,
+			Actor:  models.HumanActor(1),
+			Source: services.SourceProtocolHumanREST,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Set("user_id", uint(1))
+	c.Set(projectAccessContextKey, services.ProjectAccess{
+		Scope: scope,
+		Role:  models.ProjectRoleAdmin,
+	})
+	c.Set(projectRoleContextKey, string(models.ProjectRoleAdmin))
+	c.Request = c.Request.WithContext(operationContext)
 }

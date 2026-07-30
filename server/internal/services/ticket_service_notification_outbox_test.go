@@ -14,6 +14,7 @@ import (
 
 type durableNotificationFixture struct {
 	db       *gorm.DB
+	ctx      context.Context
 	service  TicketServiceInterface
 	creator  models.User
 	assignee models.User
@@ -79,8 +80,14 @@ func newDurableNotificationFixture(t *testing.T, assigned bool) durableNotificat
 			Type: "event_stream", ID: "default", MaxAttempts: 8,
 		}},
 	})
+	ctx := testProjectOperationContext(
+		t,
+		db,
+		models.HumanActor(users[2].ID),
+	)
 	return durableNotificationFixture{
 		db:       db,
+		ctx:      ctx,
 		service:  newTicketServiceWithDependenciesForTest(t, db, native, nil, 0),
 		creator:  users[0],
 		assignee: users[1],
@@ -95,7 +102,7 @@ func TestHumanTicketWritesCommitDurableNotificationOutboxTargets(t *testing.T) {
 		status := models.TicketStatusInProgress
 		assigneeID := fixture.assignee.ID
 		if _, err := fixture.service.UpdateTicketExpectedVersion(
-			context.Background(),
+			fixture.ctx,
 			fixture.ticket.ID,
 			&models.TicketUpdateRequest{
 				Status:       &status,
@@ -121,7 +128,7 @@ func TestHumanTicketWritesCommitDurableNotificationOutboxTargets(t *testing.T) {
 	t.Run("assign", func(t *testing.T) {
 		fixture := newDurableNotificationFixture(t, false)
 		if _, err := fixture.service.AssignTicketExpectedVersion(
-			context.Background(),
+			fixture.ctx,
 			fixture.ticket.ID,
 			fixture.assignee.ID,
 			fixture.actor.ID,
@@ -145,7 +152,7 @@ func TestHumanTicketWritesCommitDurableNotificationOutboxTargets(t *testing.T) {
 	t.Run("transfer", func(t *testing.T) {
 		fixture := newDurableNotificationFixture(t, false)
 		if _, err := fixture.service.TransferTicketExpectedVersion(
-			context.Background(),
+			fixture.ctx,
 			fixture.ticket.ID,
 			fixture.assignee.ID,
 			fixture.actor.ID,
@@ -170,7 +177,7 @@ func TestHumanTicketWritesCommitDurableNotificationOutboxTargets(t *testing.T) {
 	t.Run("escalate", func(t *testing.T) {
 		fixture := newDurableNotificationFixture(t, false)
 		if _, err := fixture.service.EscalateTicketExpectedVersion(
-			context.Background(),
+			fixture.ctx,
 			fixture.ticket.ID,
 			fixture.assignee.ID,
 			fixture.actor.ID,
@@ -195,7 +202,7 @@ func TestHumanTicketWritesCommitDurableNotificationOutboxTargets(t *testing.T) {
 	t.Run("transition", func(t *testing.T) {
 		fixture := newDurableNotificationFixture(t, true)
 		if _, err := fixture.service.UpdateTicketStatusExpectedVersion(
-			context.Background(),
+			fixture.ctx,
 			fixture.ticket.ID,
 			string(models.TicketStatusInProgress),
 			fixture.actor.ID,
@@ -282,7 +289,7 @@ func TestNotificationOutboxFailureRollsBackHumanTicketWrite(t *testing.T) {
 		0,
 	)
 	if _, err := service.AssignTicketExpectedVersion(
-		context.Background(),
+		fixture.ctx,
 		fixture.ticket.ID,
 		fixture.assignee.ID,
 		fixture.actor.ID,

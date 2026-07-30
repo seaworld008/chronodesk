@@ -4,12 +4,13 @@
 
 ## 当前内容
 
-- [API 使用说明](API_DOCUMENTATION.md)：`/api/v1` Agent 机器入口、`/api` 人类入口和协议发现地址。
+- [API 使用说明](API_DOCUMENTATION.md)：项目显式的 `/api/v2/projects/{projectKey}` Agent 机器入口、`/api` 人类入口和协议发现地址。
 - [MCP 2026-07-28](MCP_2026_07_28.md)：无状态 Streamable HTTP、最新单版本约束、OAuth Client Credentials 扩展与 Inspector。
 - [A2A 1.0](A2A_1_0.md)：Agent Card、严格版本头、JSON-RPC、SSE、Task、Artifact 与 Push。
 - [CloudEvents 1.0](CLOUDEVENTS_1_0.md)：领域事件信封、合法扩展属性、Outbox 消费和去重约束。
 - [OpenAPI 3.2](OPENAPI_3_2.md)：单版本机器契约、Redocly/Spectral 严格门禁与管理员并发契约。
 - [数据库敏感字段静态加密](DATA_AT_REST_ENCRYPTION.md)：AES-256-GCM keyring、显式迁移、轮换与投递日志安全。
+- [AI 原生多项目升级开发检查点](AI_NATIVE_UPGRADE_PROGRESS.md)：当前实现、未闭环能力、验证状态和下一次恢复入口。
 
 ## 使用建议
 

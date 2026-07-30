@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -53,7 +54,7 @@ func TestCapabilitiesDescribeStatelessCoreAndSubscriptionRecovery(t *testing.T) 
 	recovery := capabilityObject(t, capabilities, "durable_event_recovery")
 	if recovery["supported"] != true ||
 		recovery["transport"] != "rest" ||
-		recovery["endpoint"] != "/api/v1/events" ||
+		recovery["endpoint"] != "/api/v2/projects/{projectKey}/events" ||
 		recovery["cursor"] != "opaque" ||
 		recovery["required_scope"] != ScopeEventsSubscribe {
 		t.Fatalf("durable_event_recovery=%#v", recovery)
@@ -90,6 +91,73 @@ func TestCapabilitiesDoNotExposeRemovedFlatTransportFields(t *testing.T) {
 		if _, exists := capabilities[removed]; exists {
 			t.Errorf("removed capability field %q is still exposed", removed)
 		}
+	}
+}
+
+func TestProjectResourceTemplatesAreExplicitlyScoped(t *testing.T) {
+	got := make([]string, 0, len(resourceTemplates()))
+	for _, template := range resourceTemplates() {
+		got = append(got, template.URITemplate)
+	}
+	want := []string{
+		"ticket://projects/{projectKey}/tickets/{id}",
+		"ticket://projects/{projectKey}/queues/{queue}",
+		"ticket://projects/{projectKey}/tickets/{id}/history",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("resource templates = %#v, want %#v", got, want)
+	}
+}
+
+func TestParseProjectResourceURI(t *testing.T) {
+	tests := []struct {
+		name string
+		uri  string
+		want ProjectResourceReference
+		ok   bool
+	}{
+		{
+			name: "ticket",
+			uri:  "ticket://projects/OPS/tickets/42",
+			want: ProjectResourceReference{ProjectKey: "OPS", Kind: ProjectResourceTicket, TicketID: 42},
+			ok:   true,
+		},
+		{
+			name: "history",
+			uri:  "ticket://projects/OPS/tickets/42/history",
+			want: ProjectResourceReference{ProjectKey: "OPS", Kind: ProjectResourceHistory, TicketID: 42},
+			ok:   true,
+		},
+		{
+			name: "queue",
+			uri:  "ticket://projects/OPS/queues/triage",
+			want: ProjectResourceReference{ProjectKey: "OPS", Kind: ProjectResourceQueue, Queue: "triage"},
+			ok:   true,
+		},
+		{name: "legacy ticket URI", uri: "ticket://tickets/42"},
+		{name: "legacy queue URI", uri: "ticket://queues/triage"},
+		{name: "lowercase project", uri: "ticket://projects/ops/tickets/42"},
+		{name: "zero ticket", uri: "ticket://projects/OPS/tickets/0"},
+		{name: "leading-zero ticket", uri: "ticket://projects/OPS/tickets/042"},
+		{name: "encoded separator", uri: "ticket://projects/OPS/tickets%2F42"},
+		{name: "encoded project character", uri: "ticket://projects/%4fPS/tickets/42"},
+		{name: "trailing slash", uri: "ticket://projects/OPS/tickets/42/"},
+		{name: "query", uri: "ticket://projects/OPS/tickets/42?project=OTHER"},
+		{name: "fragment", uri: "ticket://projects/OPS/tickets/42#history"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := ParseProjectResourceURI(test.uri)
+			if test.ok {
+				if err != nil || !reflect.DeepEqual(got, test.want) {
+					t.Fatalf("ParseProjectResourceURI() = (%#v, %v), want %#v", got, err, test.want)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("ParseProjectResourceURI(%q) unexpectedly succeeded: %#v", test.uri, got)
+			}
+		})
 	}
 }
 

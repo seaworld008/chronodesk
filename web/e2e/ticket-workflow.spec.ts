@@ -219,7 +219,11 @@ test.describe('Ticket Workflow', () => {
     test('should hide and guard agent control from customer role', async ({ page }) => {
         const agentAdminRequests: string[] = [];
         page.on('request', (request) => {
-            if (new URL(request.url()).pathname.includes('/v1/admin/')) {
+            if (
+                /^\/api\/projects\/[^/]+\/admin\/agents\//.test(
+                    new URL(request.url()).pathname,
+                )
+            ) {
                 agentAdminRequests.push(request.url());
             }
         });

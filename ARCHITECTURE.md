@@ -1,8 +1,10 @@
 # ChronoDesk Architecture
 
-ChronoDesk is a modular monolith for a single organization. Human REST, Agent
-REST, MCP, and A2A are protocol Adapters over the same Ticket, identity, policy,
-lease, event, and audit Implementation.
+ChronoDesk is an AI-native, multi-project modular monolith for a single private
+Organization. Human REST, Agent REST, MCP, A2A, and Connector Adapters are
+protocol projections over the same project-scoped Ticket, identity, policy,
+lease, configuration, integration, knowledge, event, and audit
+Implementations.
 
 Read [CONTEXT.md](CONTEXT.md) first for the domain language and invariants.
 
@@ -12,23 +14,28 @@ Read [CONTEXT.md](CONTEXT.md) first for the domain language and invariants.
 flowchart LR
     Human["Human admin / support user"]
     Agent["External AI Agent"]
+    System["External business system"]
 
     subgraph Interfaces["Protocol Interfaces"]
         HumanREST["Human REST + WebSocket"]
-        AgentREST["Agent REST /api/v1"]
+        AgentREST["Agent REST /api/v2/projects/{projectKey}"]
         MCP["MCP 2026-07-28"]
         A2A["A2A 1.0"]
+        Connector["Signed Inbox / CloudEvents"]
     end
 
     subgraph App["Application Module"]
         Composition["internal/app\ncomposition root"]
         Adapters["handlers + agentplatform\nprotocol Adapters"]
-        Domain["services\nTicket / identity / policy / lease invariants"]
+        Scope["OperationContext\nProjectScope + ActorRef"]
+        Domain["services\nTicket / configuration / AI / integration invariants"]
     end
 
     subgraph State["Durable and coordination state"]
         PG["PostgreSQL\nbusiness state + audit + events"]
         Redis["Redis\nlimits + leases + runtime control"]
+        Search["OpenSearch\nrebuildable ACL-filtered index"]
+        Objects["Object storage\nsource files + attachments"]
         Outbox["Outbox delivery workers"]
     end
 
@@ -36,14 +43,19 @@ flowchart LR
     Agent --> AgentREST
     Agent --> MCP
     Agent --> A2A
+    System --> Connector
     HumanREST --> Adapters
     AgentREST --> Adapters
     MCP --> Adapters
     A2A --> Adapters
+    Connector --> Adapters
     Composition --> Adapters
-    Adapters --> Domain
+    Adapters --> Scope
+    Scope --> Domain
     Domain --> PG
     Domain --> Redis
+    Domain --> Search
+    Domain --> Objects
     PG --> Outbox
     Outbox --> HumanREST
     Outbox --> MCP
@@ -58,6 +70,7 @@ flowchart LR
 │   ├── cmd/chronodesk/       # minimal executable entry
 │   ├── cmd/migrate/          # explicit schema/seed command
 │   ├── cmd/credential-maintain/ # validate, rotate, or quarantine credentials
+│   ├── cmd/chronodeskctl/     # connection and contract diagnostics
 │   └── internal/
 │       ├── app/              # composition root and lifecycle
 │       ├── agentcontract/    # protocol-neutral scopes and machine contracts
@@ -70,6 +83,8 @@ flowchart LR
 │       ├── mcp/              # MCP protocol Module
 │       ├── a2a/              # A2A protocol Module
 │       ├── openapi/          # embedded machine contract Module
+│       ├── asyncapi/         # embedded CloudEvents/stream contract Module
+│       ├── observability/    # trace context, metrics, and telemetry lifecycle
 │       ├── security/         # keyring and outbound callback protection
 │       └── database/         # PostgreSQL/Redis bootstrap and migrations
 ├── web/                      # React Admin enterprise UI
@@ -93,6 +108,16 @@ These rules preserve Module Depth and domain Locality:
 6. External callbacks use the pinned, no-proxy, no-redirect HTTPS Adapter in
    `internal/security`; no feature creates an ad-hoc HTTP client for untrusted
    destinations.
+7. Every project-owned Repository, statistic, SLA calculation, automation,
+   index operation, and Worker accepts an explicit `ProjectScope`.
+8. A public project key becomes a numeric scope only after membership or
+   Principal Grant authorization. A request body, custom field, or A2A
+   `tenant` value never supplies scope.
+9. Project-owned PostgreSQL tables use `ENABLE` and `FORCE ROW LEVEL
+   SECURITY`; the application role is neither the owner nor `BYPASSRLS`.
+10. Human, Service Principal, Connector, and system writes share
+    `OperationContext`, `ActorRef`, version, idempotency, event, and audit
+    semantics.
 
 `server/internal/architecture/dependencies_test.go` enforces the static import
 portion of these rules.
@@ -120,14 +145,23 @@ portion of these rules.
 
 - Human and machine credentials use separate issuers/resources and storage.
 - MCP, Agent REST, and A2A tokens have distinct audiences.
+- OAuth client-credential tokens bind exactly one Project and one audience.
+- Project membership/grant checks and PostgreSQL RLS independently prevent
+  cross-project reads and writes.
 - Attachment content is size-limited, hashed, scan-state gated, and authorized
   on download.
 - User-controlled content is data, never instructions.
 - Runtime controls include global and per-principal read-only/emergency stops,
   rate/concurrency limits, and loop detection.
+- Agent actions use risk obligations, immutable Proposals, expiring Approvals,
+  and atomic human takeover.
+- Integration ingress uses timestamped signatures, replay protection,
+  idempotent Inbox receipts, immutable Mapping Versions, and an Outbox.
+- Audit ledger entries form a per-project tamper-evident hash chain.
 
 ## Decisions and future changes
 
 Accepted decisions live in [`docs/adr/`](docs/adr/). Large domain package moves,
-multi-tenancy, an A2A client, embedded models, and knowledge retrieval require
-separate ADRs and focused pull requests.
+SaaS multi-tenancy, multi-region writes, customer-branded portals, MSP
+delegation, and embedded model runtimes require separate ADRs and focused pull
+requests. They must not weaken the Project boundary established here.

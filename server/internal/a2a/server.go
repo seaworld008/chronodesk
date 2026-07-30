@@ -168,6 +168,9 @@ func (s *Server) dispatch(c *gin.Context, request JSONRPCRequest) (any, error) {
 		if err := decodeParams(request.Params, &params); err != nil {
 			return nil, err
 		}
+		if err := ValidateSendMessageProjectBinding(ctx, params); err != nil {
+			return nil, err
+		}
 		task, err := s.service.SendMessage(ctx, params)
 		if err != nil {
 			return nil, err
@@ -241,6 +244,10 @@ func (s *Server) dispatch(c *gin.Context, request JSONRPCRequest) (any, error) {
 func (s *Server) handleSendStream(c *gin.Context, request JSONRPCRequest) {
 	var params SendMessageParams
 	if err := decodeParams(request.Params, &params); err != nil {
+		s.writeServiceError(c, request.ID, err)
+		return
+	}
+	if err := ValidateSendMessageProjectBinding(c.Request.Context(), params); err != nil {
 		s.writeServiceError(c, request.ID, err)
 		return
 	}
@@ -495,6 +502,24 @@ func (s *Server) writeServiceError(c *gin.Context, id json.RawMessage, err error
 			-32011,
 			"A2A 资源控制暂时不可用",
 			"RESOURCE_CONTROL_UNAVAILABLE",
+			nil,
+		)
+	case errors.Is(err, ErrProjectBindingRequired):
+		s.writeError(
+			c,
+			id,
+			-32602,
+			"Authenticated project metadata is required",
+			"PROJECT_SCOPE_REQUIRED",
+			nil,
+		)
+	case errors.Is(err, ErrProjectScopeMismatch):
+		s.writeError(
+			c,
+			id,
+			-32602,
+			"Project metadata does not match the authenticated project",
+			"PROJECT_SCOPE_MISMATCH",
 			nil,
 		)
 	default:

@@ -2,28 +2,27 @@ package agentplatform
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/seaworld008/chronodesk/server/internal/a2a"
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/mcp"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/safeconv"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 	websocketPkg "github.com/seaworld008/chronodesk/server/internal/websocket"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 // MCPResourcePublisher bridges durable domain events to live MCP resource
@@ -46,26 +45,38 @@ type AuthEmailOutboxConsumer interface {
 	) error
 }
 
-func (p *MCPResourcePublisher) PublishTicket(ticketID uint) {
-	if p == nil || p.Server == nil || ticketID == 0 {
+func (p *MCPResourcePublisher) PublishTicket(
+	projectKey string,
+	ticketID uint,
+) {
+	projectKey = strings.TrimSpace(projectKey)
+	if p == nil || p.Server == nil || ticketID == 0 ||
+		models.ValidateProjectKey(projectKey) != nil {
 		return
 	}
-	p.Server.Publish(mcp.ResourceEvent{URI: fmt.Sprintf("ticket://tickets/%d", ticketID)})
-	p.Server.Publish(mcp.ResourceEvent{URI: fmt.Sprintf("ticket://tickets/%d/history", ticketID)})
+	baseURI := "ticket://projects/" + projectKey
+	p.Server.Publish(mcp.ResourceEvent{
+		URI: fmt.Sprintf("%s/tickets/%d", baseURI, ticketID),
+	})
+	p.Server.Publish(mcp.ResourceEvent{
+		URI: fmt.Sprintf("%s/tickets/%d/history", baseURI, ticketID),
+	})
 	p.Server.Publish(mcp.ResourceEvent{URI: "ticket://capabilities"})
-	if p.DB != nil {
-		var ticket models.Ticket
-		if err := p.DB.Select("id", "custom_fields").First(&ticket, ticketID).Error; err == nil {
-			p.Server.Publish(mcp.ResourceEvent{URI: "ticket://queues/" + ticketQueue(&ticket)})
-		}
-	}
 }
 
-func (p *MCPResourcePublisher) PublishQueue(queue string) {
-	if p == nil || p.Server == nil || !mcpQueuePattern.MatchString(queue) {
+func (p *MCPResourcePublisher) PublishQueue(
+	projectKey string,
+	queue string,
+) {
+	projectKey = strings.TrimSpace(projectKey)
+	if p == nil || p.Server == nil ||
+		models.ValidateProjectKey(projectKey) != nil ||
+		!mcpQueuePattern.MatchString(queue) {
 		return
 	}
-	p.Server.Publish(mcp.ResourceEvent{URI: "ticket://queues/" + queue})
+	p.Server.Publish(mcp.ResourceEvent{
+		URI: "ticket://projects/" + projectKey + "/queues/" + queue,
+	})
 }
 
 // NativeOutboxDeliverer owns the side effects executed after a domain
@@ -98,6 +109,39 @@ type NativeOutboxDelivererOptions struct {
 	Resolver          *net.Resolver
 }
 
+func (d *NativeOutboxDeliverer) withProjectTransaction(
+	ctx context.Context,
+	scope models.ProjectScope,
+	run func(*gorm.DB) error,
+) error {
+	if d == nil || d.db == nil || run == nil {
+		return errors.New("outbox project transaction is unavailable")
+	}
+	if scopeddb.HasTransaction(ctx) {
+		return scopeddb.TransactionForContext(ctx, d.db, run)
+	}
+	return scopeddb.WithProjectScopeTransaction(ctx, d.db, scope, run)
+}
+
+func (d *NativeOutboxDeliverer) withProjectContext(
+	ctx context.Context,
+	scope models.ProjectScope,
+	run func(context.Context) error,
+) error {
+	if d == nil || d.db == nil || run == nil {
+		return errors.New("outbox project operation is unavailable")
+	}
+	if scopeddb.HasTransaction(ctx) {
+		return run(ctx)
+	}
+	return scopeddb.WithProjectScopeContextTransaction(
+		ctx,
+		d.db,
+		scope,
+		run,
+	)
+}
+
 func NewNativeOutboxDeliverer(options NativeOutboxDelivererOptions) (*NativeOutboxDeliverer, error) {
 	if options.DB == nil {
 		return nil, errors.New("outbox deliverer database is required")
@@ -124,16 +168,20 @@ func (d *NativeOutboxDeliverer) Deliver(
 	delivery *models.OutboxDelivery,
 	event services.CloudEventEnvelope,
 ) error {
-	if delivery == nil {
-		return errors.New("outbox delivery is required")
+	if err := validateOutboxDeliveryOperation(ctx, delivery, event); err != nil {
+		return err
 	}
 	switch delivery.DestinationType {
 	case "event_stream":
+		projectKey, err := d.projectKeyForEvent(ctx, event)
+		if err != nil {
+			return err
+		}
 		if ticketID := ticketIDFromCloudEvent(event); ticketID > 0 {
-			d.publisher.PublishTicket(ticketID)
+			d.publisher.PublishTicket(projectKey, ticketID)
 		}
 		for _, queue := range queueNamesFromCloudEvent(event) {
-			d.publisher.PublishQueue(queue)
+			d.publisher.PublishQueue(projectKey, queue)
 		}
 		return nil
 	case "webhook":
@@ -142,10 +190,23 @@ func (d *NativeOutboxDeliverer) Deliver(
 		if d.notifications == nil {
 			return errors.New("in-app notification service is unavailable")
 		}
-		notification, created, err := d.notifications.DeliverTicketNotificationOutbox(
+		var (
+			notification *models.Notification
+			created      bool
+		)
+		err := d.withProjectContext(
 			ctx,
-			event,
-			delivery.DestinationID,
+			outboxDeliveryScope(delivery),
+			func(scopedContext context.Context) error {
+				var deliveryErr error
+				notification, created, deliveryErr =
+					d.notifications.DeliverTicketNotificationOutbox(
+						scopedContext,
+						event,
+						delivery.DestinationID,
+					)
+				return deliveryErr
+			},
 		)
 		if err != nil {
 			return err
@@ -163,12 +224,30 @@ func (d *NativeOutboxDeliverer) Deliver(
 		if d.automation == nil {
 			return errors.New("automation service is unavailable")
 		}
-		return d.automation.ExecuteDomainEvent(ctx, event)
+		return d.withProjectContext(
+			ctx,
+			outboxDeliveryScope(delivery),
+			func(scopedContext context.Context) error {
+				return d.automation.ExecuteDomainEvent(
+					scopedContext,
+					event,
+				)
+			},
+		)
 	case services.SLAEscalationOutboxDestination:
 		if d.slaEscalation == nil {
 			return errors.New("SLA escalation consumer is unavailable")
 		}
-		return d.slaEscalation.ExecuteDomainEvent(ctx, event)
+		return d.withProjectContext(
+			ctx,
+			outboxDeliveryScope(delivery),
+			func(scopedContext context.Context) error {
+				return d.slaEscalation.ExecuteDomainEvent(
+					scopedContext,
+					event,
+				)
+			},
+		)
 	case services.AttachmentCleanupOutboxDestination:
 		return d.deliverAttachmentCleanup(ctx, delivery, event)
 	case services.EmailOutboxDestination:
@@ -176,6 +255,82 @@ func (d *NativeOutboxDeliverer) Deliver(
 	default:
 		return fmt.Errorf("unsupported outbox destination type %q", delivery.DestinationType)
 	}
+}
+
+// validateOutboxDeliveryOperation prevents adapters and tests from bypassing
+// the same trusted worker boundary used by ProcessOutboxBatch. Side effects
+// execute outside a database transaction; consumers that need persistence
+// open their own bounded project transaction.
+func validateOutboxDeliveryOperation(
+	ctx context.Context,
+	delivery *models.OutboxDelivery,
+	event services.CloudEventEnvelope,
+) error {
+	if delivery == nil {
+		return errors.New("outbox delivery is required")
+	}
+	if scopeddb.HasTransaction(ctx) {
+		return errors.New("outbox side effects cannot run inside a database transaction")
+	}
+	operation, err := services.OperationContextFromContext(ctx)
+	if err != nil {
+		return errors.New("outbox delivery requires a trusted worker context")
+	}
+	if operation.Source != services.SourceProtocolWorker ||
+		operation.Actor.Type != models.ActorTypeSystem {
+		return errors.New("outbox delivery requires a system worker actor")
+	}
+	scope := outboxDeliveryScope(delivery)
+	if err := scope.Validate(); err != nil || operation.Scope != scope {
+		return errors.New("outbox delivery project scope mismatch")
+	}
+	if strings.TrimSpace(delivery.EventID) == "" ||
+		strings.TrimSpace(event.ID) == "" ||
+		delivery.EventID != event.ID {
+		return errors.New("outbox delivery event reference mismatch")
+	}
+	if event.OrganizationID != scope.OrganizationID ||
+		event.ProjectID != scope.ProjectID {
+		return errors.New("outbox event project scope mismatch")
+	}
+	return nil
+}
+
+func outboxDeliveryScope(
+	delivery *models.OutboxDelivery,
+) models.ProjectScope {
+	if delivery == nil {
+		return models.ProjectScope{}
+	}
+	return models.ProjectScope{
+		OrganizationID: delivery.OrganizationID,
+		ProjectID:      delivery.ProjectID,
+	}
+}
+
+func (d *NativeOutboxDeliverer) projectKeyForEvent(
+	ctx context.Context,
+	event services.CloudEventEnvelope,
+) (string, error) {
+	if d == nil || d.db == nil ||
+		event.OrganizationID == 0 || event.ProjectID == 0 {
+		return "", errors.New("outbox event project scope is required")
+	}
+	var project models.Project
+	err := d.db.WithContext(ctx).
+		Select("id", "organization_id", "key", "status").
+		Where(
+			"id = ? AND organization_id = ? AND status = ?",
+			event.ProjectID,
+			event.OrganizationID,
+			models.ProjectStatusActive,
+		).
+		First(&project).Error
+	projectKey := string(project.Key)
+	if err != nil || models.ValidateProjectKey(projectKey) != nil {
+		return "", errors.New("outbox event project is unavailable")
+	}
+	return projectKey, nil
 }
 
 func (d *NativeOutboxDeliverer) deliverEmail(
@@ -276,10 +431,7 @@ func queueNamesFromCloudEvent(event services.CloudEventEnvelope) []string {
 	return result
 }
 
-const (
-	webhookFanoutDestinationID = "configured"
-	webhookConfigPrefix        = "config:"
-)
+const webhookSnapshotPrefix = "snapshot:"
 
 func (d *NativeOutboxDeliverer) deliverWebhook(
 	ctx context.Context,
@@ -289,79 +441,26 @@ func (d *NativeOutboxDeliverer) deliverWebhook(
 	if d.notifications == nil {
 		return errors.New("webhook notification service is unavailable")
 	}
-	eventType := models.WebhookEventType(strings.TrimSpace(event.Type))
-	if !eventcontract.IsWebhookDeliveryEventType(string(eventType)) {
+	if !eventcontract.IsWebhookDeliveryEventType(strings.TrimSpace(event.Type)) {
 		return nil
 	}
-	transitionStatus := models.TicketStatus("")
-	if eventType == models.WebhookEventTicketTransitioned {
-		transitionStatus = webhookTransitionStatus(event)
-	}
-	if delivery.DestinationID == webhookFanoutDestinationID {
-		return d.fanOutWebhookDeliveries(
-			ctx,
-			event,
-			eventType,
-			transitionStatus,
-		)
-	}
-	configID, err := parseWebhookConfigDestinationID(delivery.DestinationID)
+	snapshotID, err := parseWebhookSnapshotDestinationID(
+		delivery.DestinationID,
+	)
 	if err != nil {
 		return err
 	}
 	notification := notificationEventFromCloudEvent(event)
 	notification.Metadata["delivery_id"] = delivery.ID
-	return d.notifications.SendWebhookOutboxAttempt(
+	return d.notifications.SendWebhookSnapshotOutboxAttempt(
 		ctx,
-		configID,
+		models.ProjectScope{
+			OrganizationID: event.OrganizationID,
+			ProjectID:      event.ProjectID,
+		},
+		snapshotID,
 		notification,
 	)
-}
-
-func (d *NativeOutboxDeliverer) fanOutWebhookDeliveries(
-	ctx context.Context,
-	event services.CloudEventEnvelope,
-	eventType models.WebhookEventType,
-	transitionStatus models.TicketStatus,
-) error {
-	targets, err := d.notifications.ListWebhookOutboxTargets(
-		ctx,
-		eventType,
-		transitionStatus,
-	)
-	if err != nil {
-		return fmt.Errorf("list webhook Outbox targets: %w", err)
-	}
-	if len(targets) == 0 {
-		return nil
-	}
-	now := time.Now().UTC()
-	return d.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		for _, target := range targets {
-			destinationID := webhookConfigDestinationID(target.ConfigID)
-			child := models.OutboxDelivery{
-				ID:              stableWebhookDeliveryID(event.ID, target.ConfigID),
-				EventID:         event.ID,
-				DestinationType: "webhook",
-				DestinationID:   destinationID,
-				Status:          models.OutboxDeliveryPending,
-				MaxAttempts:     target.MaxAttempts,
-				NextAttemptAt:   now,
-			}
-			result := tx.Clauses(clause.OnConflict{
-				Columns: []clause.Column{
-					{Name: "event_id"},
-					{Name: "destination_type"},
-					{Name: "destination_id"},
-				},
-				DoNothing: true,
-			}).Create(&child)
-			if result.Error != nil {
-				return fmt.Errorf("create webhook Outbox target %s: %w", destinationID, result.Error)
-			}
-		}
-		return nil
-	})
 }
 
 func notificationEventFromCloudEvent(
@@ -417,34 +516,24 @@ func notificationEventFromCloudEvent(
 	}
 }
 
-func webhookConfigDestinationID(configID uint) string {
-	return webhookConfigPrefix + strconv.FormatUint(uint64(configID), 10)
-}
-
-func parseWebhookConfigDestinationID(destinationID string) (uint, error) {
-	if !strings.HasPrefix(destinationID, webhookConfigPrefix) {
-		return 0, fmt.Errorf("unsupported webhook Outbox destination %q", destinationID)
+func parseWebhookSnapshotDestinationID(
+	destinationID string,
+) (string, error) {
+	if !strings.HasPrefix(destinationID, webhookSnapshotPrefix) {
+		return "", fmt.Errorf(
+			"unsupported webhook Outbox destination %q",
+			destinationID,
+		)
 	}
-	value, err := safeconv.ParsePositiveUint(strings.TrimPrefix(destinationID, webhookConfigPrefix))
-	if err != nil {
-		return 0, fmt.Errorf("invalid webhook Outbox destination %q", destinationID)
+	value := strings.TrimPrefix(destinationID, webhookSnapshotPrefix)
+	parsed, err := uuid.Parse(value)
+	if err != nil || parsed.String() != value || parsed.Version() != 7 {
+		return "", fmt.Errorf(
+			"invalid webhook Outbox snapshot destination %q",
+			destinationID,
+		)
 	}
 	return value, nil
-}
-
-func stableWebhookDeliveryID(eventID string, configID uint) string {
-	sum := sha256.Sum256([]byte(eventID + "\x00" + strconv.FormatUint(uint64(configID), 10)))
-	value := append([]byte(nil), sum[:16]...)
-	value[6] = (value[6] & 0x0f) | 0x50
-	value[8] = (value[8] & 0x3f) | 0x80
-	return fmt.Sprintf(
-		"%08x-%04x-%04x-%04x-%012x",
-		value[0:4],
-		value[4:6],
-		value[6:8],
-		value[8:10],
-		value[10:16],
-	)
 }
 
 func (d *NativeOutboxDeliverer) deliverA2APush(
@@ -464,9 +553,23 @@ func (d *NativeOutboxDeliverer) deliverA2APush(
 	}
 
 	var row models.AgentPushNotificationConfig
-	if err := d.db.WithContext(ctx).
-		Where("id = ? AND task_id = ?", data.PushConfigID, data.TaskID).
-		First(&row).Error; err != nil {
+	scope := models.ProjectScope{
+		OrganizationID: event.OrganizationID,
+		ProjectID:      event.ProjectID,
+	}
+	if err := d.withProjectTransaction(
+		ctx,
+		scope,
+		func(tx *gorm.DB) error {
+			return tx.Where(
+				"id = ? AND task_id = ? AND organization_id = ? AND project_id = ?",
+				data.PushConfigID,
+				data.TaskID,
+				scope.OrganizationID,
+				scope.ProjectID,
+			).First(&row).Error
+		},
+	); err != nil {
 		return fmt.Errorf("load A2A push configuration: %w", err)
 	}
 

@@ -2,7 +2,6 @@ package services
 
 import (
 	"context"
-	cryptorand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,19 +32,20 @@ type TicketServiceInterface interface {
 	TransferTicketExpectedVersion(ctx context.Context, ticketID uint, assigneeID uint, userID uint, comment string, transferReason string, expectedVersion uint64) (*models.Ticket, error)
 	EscalateTicketExpectedVersion(ctx context.Context, ticketID uint, escalateToID uint, userID uint, reason string, comment string, expectedVersion uint64) (*models.Ticket, error)
 	UpdateTicketStatusExpectedVersion(ctx context.Context, ticketID uint, status string, userID uint, comment string, resolutionNotes string, expectedVersion uint64) (*models.Ticket, error)
-	GetTicketStatistics(userID uint, role string) (*TicketStatisticsResponse, error)
-	GetUserTickets(userID uint, status string, priority string, limit int) ([]*models.Ticket, int64, error)
-	GetUnassignedTickets(priority string, categoryID string, limit int) ([]*models.Ticket, int64, error)
-	GetOverdueTickets(userID uint, role string) ([]*models.Ticket, int64, error)
-	GetSLABreachedTickets(userID uint, role string) ([]*models.Ticket, int64, error)
+	GetTicketStatistics(ctx context.Context, userID uint, role string) (*TicketStatisticsResponse, error)
+	GetUserTickets(ctx context.Context, userID uint, status string, priority string, limit int) ([]*models.Ticket, int64, error)
+	GetUnassignedTickets(ctx context.Context, priority string, categoryID string, limit int) ([]*models.Ticket, int64, error)
+	GetOverdueTickets(ctx context.Context, userID uint, role string) ([]*models.Ticket, int64, error)
+	GetSLABreachedTickets(ctx context.Context, userID uint, role string) ([]*models.Ticket, int64, error)
 	BulkUpdateTickets(ctx context.Context, req *BulkUpdateRequest, userID uint) (*BulkUpdateResult, error)
-	GetTicketHistory(ticketID uint) ([]*models.TicketHistory, int64, error)
+	GetTicketHistory(ctx context.Context, ticketID uint) ([]*models.TicketHistory, int64, error)
 }
 
 // TicketService implements TicketServiceInterface
 type TicketService struct {
 	db            *gorm.DB
 	agentNative   *AgentNativeService
+	projects      *ProjectService
 	statsCache    StatsCache
 	statsCacheTTL time.Duration
 }
@@ -87,6 +87,11 @@ func NewTicketService(
 		db:          db,
 		agentNative: native,
 	}
+	projects, err := NewProjectService(db)
+	if err != nil {
+		return nil, err
+	}
+	service.projects = projects
 	if cache != nil && ttl > 0 {
 		service.statsCache = cache
 		service.statsCacheTTL = ttl
@@ -162,7 +167,11 @@ func (s *TicketService) GetTickets(ctx context.Context, filters TicketFilters) (
 	var tickets []*models.Ticket
 	var total int64
 
-	query := s.db.WithContext(ctx).Model(&models.Ticket{})
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	query := scopedTicketQuery(s.db.WithContext(ctx).Model(&models.Ticket{}), scope)
 
 	// Apply filters
 	if filters.Status != "" {
@@ -206,7 +215,19 @@ func (s *TicketService) GetTickets(ctx context.Context, filters TicketFilters) (
 		}
 	}
 	if filters.SLABreached != nil {
-		query = query.Where("sla_breached = ?", *filters.SLABreached)
+		if *filters.SLABreached {
+			query = query.Where(
+				"sla_breached = ? AND status IN ?",
+				true,
+				slaActiveTicketStatuses(),
+			)
+		} else {
+			query = query.Where(
+				"sla_breached = ? OR status NOT IN ?",
+				false,
+				slaActiveTicketStatuses(),
+			)
+		}
 	}
 	if filters.IsOverdue != nil {
 		now := time.Now()
@@ -283,13 +304,23 @@ func sanitizeTicketSort(sortBy, sortOrder string) (string, string) {
 // GetTicket retrieves a single ticket by ID
 func (s *TicketService) GetTicket(ctx context.Context, id uint) (*models.Ticket, error) {
 	var ticket models.Ticket
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 
-	err := s.db.WithContext(ctx).
+	err = s.db.WithContext(ctx).
 		Preload("CreatedBy").
 		Preload("AssignedTo").
 		Preload("Comments").
 		Preload("Comments.User").
-		First(&ticket, id).Error
+		Where(
+			"tickets.id = ? AND tickets.organization_id = ? AND tickets.project_id = ?",
+			id,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		First(&ticket).Error
 
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -306,6 +337,15 @@ func (s *TicketService) CreateTicket(ctx context.Context, req *models.TicketCrea
 	if req == nil || userID == 0 {
 		return nil, fmt.Errorf("human ticket create request and actor are required")
 	}
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if operation.Actor != models.HumanActor(userID) {
+		return nil, fmt.Errorf(
+			"human ticket actor does not match operation context",
+		)
+	}
 	request := *req
 	if request.Source == "" {
 		request.Source = models.TicketSourceWeb
@@ -317,7 +357,6 @@ func (s *TicketService) CreateTicket(ctx context.Context, req *models.TicketCrea
 	}
 	result, err := s.agentNative.CreateNativeTicket(ctx, NativeTicketCreateInput{
 		Request:        request,
-		TicketNumber:   s.generateTicketNumber(),
 		Actor:          models.HumanActor(userID),
 		AssignedActor:  assignedActor,
 		SourceProtocol: "rest-human",
@@ -560,7 +599,7 @@ func (s *TicketService) UpdateTicketStatusExpectedVersion(
 		return nil, ErrVersionConflict
 	}
 	nextStatus := models.TicketStatus(status)
-	if !nextStatus.IsValid() || !ticket.Status.CanTransitionTo(nextStatus) {
+	if !nextStatus.IsValid() {
 		return nil, fmt.Errorf("%w: %s to %s", ErrInvalidTicketTransition, ticket.Status, nextStatus)
 	}
 	if ticket.Status == nextStatus {
@@ -603,12 +642,81 @@ func (s *TicketService) UpdateTicketStatusExpectedVersion(
 	return s.GetTicket(ctx, result.Ticket.ID)
 }
 
-// GetTicketStatistics returns enhanced statistics for dashboard
-func (s *TicketService) GetTicketStatistics(userID uint, role string) (*TicketStatisticsResponse, error) {
+// AllowedTicketTransitions projects the immutable workflow bound to a Ticket
+// into the shared lifecycle statuses visible to Human REST. It is intentionally
+// not a global status matrix.
+func (s *TicketService) AllowedTicketTransitions(
+	ctx context.Context,
+	ticketID uint,
+	userID uint,
+) ([]models.TicketStatus, error) {
+	if ticketID == 0 || userID == 0 {
+		return nil, ErrInvalidTicketTransition
+	}
+	operation, err := commandOperationContext(
+		ctx,
+		models.HumanActor(userID),
+	)
+	if err != nil {
+		return nil, err
+	}
+	var allowed []models.TicketStatus
+	err = transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
+		var ticket models.Ticket
+		if err := tx.WithContext(ctx).Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			ticketID,
+			operation.Scope.OrganizationID,
+			operation.Scope.ProjectID,
+		).First(&ticket).Error; err != nil {
+			return err
+		}
+		for _, candidate := range []models.TicketStatus{
+			models.TicketStatusOpen,
+			models.TicketStatusInProgress,
+			models.TicketStatusPending,
+			models.TicketStatusResolved,
+			models.TicketStatusClosed,
+			models.TicketStatusCancelled,
+		} {
+			if candidate == ticket.Status {
+				continue
+			}
+			if err := validateTicketWorkflowTransitionTx(
+				ctx,
+				tx,
+				operation.Scope,
+				&ticket,
+				candidate,
+				operation.Actor,
+			); err == nil {
+				allowed = append(allowed, candidate)
+			}
+		}
+		return nil
+	})
+	return allowed, err
+}
+
+// GetTicketStatistics returns enhanced statistics for one authorized project.
+func (s *TicketService) GetTicketStatistics(
+	ctx context.Context,
+	userID uint,
+	role string,
+) (*TicketStatisticsResponse, error) {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	cacheKey := ""
 	if s.statsCache != nil && s.statsCacheTTL > 0 {
-		cacheKey = fmt.Sprintf("ticket_stats:%s:%d", role, userID)
-		if cached, err := s.statsCache.Get(context.Background(), cacheKey); err == nil && cached != "" {
+		cacheKey = fmt.Sprintf(
+			"ticket_stats:%d:%s:%d",
+			scope.ProjectID,
+			role,
+			userID,
+		)
+		if cached, err := s.statsCache.Get(ctx, cacheKey); err == nil && cached != "" {
 			var cachedStats TicketStatisticsResponse
 			if err := json.Unmarshal([]byte(cached), &cachedStats); err == nil {
 				if cachedStats.ByPriority == nil {
@@ -628,7 +736,11 @@ func (s *TicketService) GetTicketStatistics(userID uint, role string) (*TicketSt
 	}
 
 	now := time.Now()
-	query := scopeHumanTicketQuery(s.db.Model(&models.Ticket{}), userID, role)
+	query := scopedTicketQuery(
+		s.db.WithContext(ctx).Model(&models.Ticket{}),
+		scope,
+	)
+	query = scopeHumanTicketQuery(query, userID, role)
 
 	var aggregated struct {
 		Total        int64
@@ -654,7 +766,7 @@ func (s *TicketService) GetTicketStatistics(userID uint, role string) (*TicketSt
 		SUM(CASE WHEN due_date < ? AND status NOT IN ('resolved','closed') THEN 1 ELSE 0 END) AS overdue,
 		SUM(CASE WHEN assigned_to_id IS NULL THEN 1 ELSE 0 END) AS unassigned,
 		SUM(CASE WHEN priority IN ('high','urgent') THEN 1 ELSE 0 END) AS high_priority,
-		SUM(CASE WHEN sla_breached = true THEN 1 ELSE 0 END) AS sla_breached,
+			SUM(CASE WHEN sla_breached = true AND status IN ('open','in_progress','pending') THEN 1 ELSE 0 END) AS sla_breached,
 		SUM(CASE WHEN is_escalated = true THEN 1 ELSE 0 END) AS escalated
 	`, now).Scan(&aggregated).Error; err != nil {
 		return nil, fmt.Errorf("failed to aggregate ticket statistics: %w", err)
@@ -672,7 +784,8 @@ func (s *TicketService) GetTicketStatistics(userID uint, role string) (*TicketSt
 	stats.SLABreached = aggregated.SLABreached
 	stats.Escalated = aggregated.Escalated
 	switch strings.ToLower(strings.TrimSpace(role)) {
-	case string(models.RoleAgent), string(models.RoleCustomer):
+	case string(models.ProjectRoleAgent),
+		string(models.ProjectRoleRequester):
 		stats.MyTickets = stats.Total
 	}
 
@@ -681,7 +794,11 @@ func (s *TicketService) GetTicketStatistics(userID uint, role string) (*TicketSt
 		Count    int64
 	}{}
 
-	priorityQuery := scopeHumanTicketQuery(s.db.Model(&models.Ticket{}), userID, role)
+	priorityQuery := scopedTicketQuery(
+		s.db.WithContext(ctx).Model(&models.Ticket{}),
+		scope,
+	)
+	priorityQuery = scopeHumanTicketQuery(priorityQuery, userID, role)
 
 	if err := priorityQuery.
 		Select("priority, count(*) as count").
@@ -694,19 +811,32 @@ func (s *TicketService) GetTicketStatistics(userID uint, role string) (*TicketSt
 
 	if cacheKey != "" {
 		if payload, err := json.Marshal(stats); err == nil {
-			_ = s.statsCache.Set(context.Background(), cacheKey, string(payload), s.statsCacheTTL)
+			_ = s.statsCache.Set(ctx, cacheKey, string(payload), s.statsCacheTTL)
 		}
 	}
 
 	return stats, nil
 }
 
-// GetUserTickets gets tickets assigned to a specific user
-func (s *TicketService) GetUserTickets(userID uint, status string, priority string, limit int) ([]*models.Ticket, int64, error) {
+// GetUserTickets gets tickets assigned to a specific user in one project.
+func (s *TicketService) GetUserTickets(
+	ctx context.Context,
+	userID uint,
+	status string,
+	priority string,
+	limit int,
+) ([]*models.Ticket, int64, error) {
 	var tickets []*models.Ticket
 	var total int64
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
 
-	query := s.db.Model(&models.Ticket{}).Where("assigned_to_id = ?", userID)
+	query := scopedTicketQuery(
+		s.db.WithContext(ctx).Model(&models.Ticket{}),
+		scope,
+	).Where("assigned_to_id = ?", userID)
 
 	if status != "" {
 		statuses := parseCommaSeparated(status)
@@ -735,12 +865,24 @@ func (s *TicketService) GetUserTickets(userID uint, status string, priority stri
 	return tickets, total, nil
 }
 
-// GetUnassignedTickets gets unassigned tickets
-func (s *TicketService) GetUnassignedTickets(priority string, categoryID string, limit int) ([]*models.Ticket, int64, error) {
+// GetUnassignedTickets gets unassigned tickets in one project.
+func (s *TicketService) GetUnassignedTickets(
+	ctx context.Context,
+	priority string,
+	categoryID string,
+	limit int,
+) ([]*models.Ticket, int64, error) {
 	var tickets []*models.Ticket
 	var total int64
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
 
-	query := s.db.Model(&models.Ticket{}).Where("assigned_to_id IS NULL")
+	query := scopedTicketQuery(
+		s.db.WithContext(ctx).Model(&models.Ticket{}),
+		scope,
+	).Where("assigned_to_id IS NULL")
 
 	if priority != "" {
 		priorities := parseCommaSeparated(priority)
@@ -770,13 +912,24 @@ func (s *TicketService) GetUnassignedTickets(priority string, categoryID string,
 	return tickets, total, nil
 }
 
-// GetOverdueTickets gets overdue tickets
-func (s *TicketService) GetOverdueTickets(userID uint, role string) ([]*models.Ticket, int64, error) {
+// GetOverdueTickets gets overdue tickets in one project.
+func (s *TicketService) GetOverdueTickets(
+	ctx context.Context,
+	userID uint,
+	role string,
+) ([]*models.Ticket, int64, error) {
 	var tickets []*models.Ticket
 	var total int64
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
 
 	now := time.Now()
-	query := s.db.Model(&models.Ticket{}).
+	query := scopedTicketQuery(
+		s.db.WithContext(ctx).Model(&models.Ticket{}),
+		scope,
+	).
 		Where("due_date < ? AND status NOT IN (?, ?)", now, models.TicketStatusResolved, models.TicketStatusClosed)
 	query = scopeHumanTicketQuery(query, userID, role)
 
@@ -794,20 +947,24 @@ func (s *TicketService) GetOverdueTickets(userID uint, role string) ([]*models.T
 	return tickets, total, nil
 }
 
-// GetSLABreachedTickets gets SLA breached tickets
-func (s *TicketService) GetSLABreachedTickets(userID uint, role string) ([]*models.Ticket, int64, error) {
+// GetSLABreachedTickets gets SLA breached tickets in one project.
+func (s *TicketService) GetSLABreachedTickets(
+	ctx context.Context,
+	userID uint,
+	role string,
+) ([]*models.Ticket, int64, error) {
 	var tickets []*models.Ticket
 	var total int64
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
 
-	now := time.Now()
-	query := s.db.Model(&models.Ticket{}).
-		Where(
-			"(tickets.sla_breached = ? OR (tickets.sla_due_date IS NOT NULL AND tickets.sla_due_date < ?)) AND tickets.status NOT IN (?, ?)",
-			true,
-			now,
-			models.TicketStatusResolved,
-			models.TicketStatusClosed,
-		)
+	query := scopedTicketQuery(
+		s.db.WithContext(ctx).Model(&models.Ticket{}),
+		scope,
+	).
+		Where("tickets.sla_breached = ? AND tickets.status IN ?", true, slaActiveTicketStatuses())
 	query = scopeHumanTicketQuery(query, userID, role)
 
 	if err := query.Count(&total).Error; err != nil {
@@ -826,11 +983,13 @@ func (s *TicketService) GetSLABreachedTickets(userID uint, role string) ([]*mode
 
 func scopeHumanTicketQuery(query *gorm.DB, userID uint, role string) *gorm.DB {
 	switch strings.ToLower(strings.TrimSpace(role)) {
-	case string(models.RoleCustomer):
+	case string(models.ProjectRoleRequester):
 		return query.Where("tickets.created_by_id = ?", userID)
-	case string(models.RoleAgent):
+	case string(models.ProjectRoleAgent):
 		return query.Where("tickets.assigned_to_id = ?", userID)
-	case string(models.RoleSupervisor), string(models.RoleAdmin):
+	case string(models.ProjectRoleManager),
+		string(models.ProjectRoleAdmin),
+		string(models.ProjectRoleObserver):
 		return query
 	default:
 		// Authentication currently rejects unknown roles. Keep the data layer
@@ -839,12 +998,34 @@ func scopeHumanTicketQuery(query *gorm.DB, userID uint, role string) *gorm.DB {
 	}
 }
 
-// GetTicketHistory gets the history for a specific ticket
-func (s *TicketService) GetTicketHistory(ticketID uint) ([]*models.TicketHistory, int64, error) {
+// GetTicketHistory gets the history for a project-scoped ticket.
+func (s *TicketService) GetTicketHistory(
+	ctx context.Context,
+	ticketID uint,
+) ([]*models.TicketHistory, int64, error) {
 	var histories []*models.TicketHistory
 	var total int64
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	var ticket models.Ticket
+	if err := scopedTicketQuery(
+		s.db.WithContext(ctx).Model(&models.Ticket{}),
+		scope,
+	).Select("tickets.id").Where("tickets.id = ?", ticketID).
+		First(&ticket).Error; err != nil {
+		return nil, 0, err
+	}
 
-	query := s.db.Model(&models.TicketHistory{}).Where("ticket_id = ?", ticketID)
+	query := s.db.WithContext(ctx).
+		Model(&models.TicketHistory{}).
+		Where(
+			"ticket_id = ? AND organization_id = ? AND project_id = ?",
+			ticketID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		)
 
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to count ticket history: %w", err)
@@ -918,8 +1099,8 @@ func (s *TicketService) DeleteTicketExpectedVersion(
 }
 
 func isElevatedRole(role string) bool {
-	switch models.UserRole(strings.ToLower(strings.TrimSpace(role))) {
-	case models.RoleAdmin, models.RoleSupervisor:
+	switch models.ProjectRole(strings.ToLower(strings.TrimSpace(role))) {
+	case models.ProjectRoleAdmin, models.ProjectRoleManager:
 		return true
 	default:
 		return false
@@ -932,7 +1113,49 @@ func (s *TicketService) BulkUpdateTickets(
 	req *BulkUpdateRequest,
 	userID uint,
 ) (*BulkUpdateResult, error) {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if req == nil {
+		return nil, ErrInvalidBulkTicketUpdate
+	}
+	preconditions, err := normalizedBulkTicketPreconditions(req.Tickets)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]uint, 0, len(preconditions))
+	for _, precondition := range preconditions {
+		ids = append(ids, precondition.ID)
+	}
+	var scopedCount int64
+	if err := scopedTicketQuery(
+		s.db.WithContext(ctx).Model(&models.Ticket{}),
+		scope,
+	).Where("tickets.id IN ?", ids).Count(&scopedCount).Error; err != nil {
+		return nil, err
+	}
+	if scopedCount != int64(len(ids)) {
+		return nil, ErrProjectAccessDenied
+	}
 	return s.agentNative.BulkUpdateHumanTickets(ctx, req, userID)
+}
+
+func scopedTicketQuery(
+	query *gorm.DB,
+	scope models.ProjectScope,
+) *gorm.DB {
+	if query == nil {
+		return nil
+	}
+	if scope.Validate() != nil {
+		return query.Where("1 = 0")
+	}
+	return query.Where(
+		"tickets.organization_id = ? AND tickets.project_id = ?",
+		scope.OrganizationID,
+		scope.ProjectID,
+	)
 }
 
 func bulkTicketEventType(changedFields []string) string {
@@ -1093,7 +1316,9 @@ func applyTicketStatusTimestamps(ticket *models.Ticket, status models.TicketStat
 		if ticket.ClosedAt == nil {
 			ticket.ClosedAt = &now
 		}
-	case models.TicketStatusOpen:
+	case models.TicketStatusOpen,
+		models.TicketStatusInProgress,
+		models.TicketStatusPending:
 		ticket.ResolvedAt = nil
 		ticket.ClosedAt = nil
 	}
@@ -1146,14 +1371,4 @@ func getSourceLabel(source string) string {
 		return label
 	}
 	return source
-}
-
-// generateTicketNumber generates a unique ticket number
-func (s *TicketService) generateTicketNumber() string {
-	now := time.Now()
-	randomSuffix := make([]byte, 6)
-	if _, err := cryptorand.Read(randomSuffix); err != nil {
-		return fmt.Sprintf("TK-%s-%d", now.Format("20060102-150405"), now.UnixNano())
-	}
-	return fmt.Sprintf("TK-%s-%x", now.Format("20060102-150405"), randomSuffix)
 }

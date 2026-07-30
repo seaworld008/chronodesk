@@ -81,7 +81,7 @@ def _create_agent_rest_ticket(
 ) -> dict[str, Any]:
     response = harness.request(
         "POST",
-        "/api/v1/tickets",
+        harness.project_api_path("tickets"),
         headers={
             "Authorization": api_token.authorization,
             "Idempotency-Key": harness.idempotency_key(label),
@@ -235,9 +235,15 @@ def test_a2a_ticket_intake_creates_queryable_task_and_ticket_artifact(
                     "mediaType": "application/json",
                 }
             ],
-            "metadata": {"skill": "ticket-intake"},
+            "metadata": {
+                "skill": "ticket-intake",
+                "io.chronodesk/projectKey": protocol_harness.project_key,
+            },
         },
-        "metadata": {"testRun": protocol_harness.run_id},
+        "metadata": {
+            "testRun": protocol_harness.run_id,
+            "io.chronodesk/projectKey": protocol_harness.project_key,
+        },
     }
     response = _a2a_rpc(
         protocol_harness,
@@ -325,10 +331,14 @@ def test_a2a_input_required_does_not_mutate_ticket_and_sse_resumes_by_cursor(
                         "mediaType": "application/json",
                     }
                 ],
-                "metadata": {"skill": "ticket-comment"},
+                "metadata": {
+                    "skill": "ticket-comment",
+                    "io.chronodesk/projectKey": protocol_harness.project_key,
+                },
             },
             "metadata": {
                 "com.chronodesk/linkedTicketId": ticket_id,
+                "io.chronodesk/projectKey": protocol_harness.project_key,
             },
         },
         request_id="e2e-a2a-input-required",
@@ -353,7 +363,7 @@ def test_a2a_input_required_does_not_mutate_ticket_and_sse_resumes_by_cursor(
 
     unchanged = protocol_harness.request(
         "GET",
-        f"/api/v1/tickets/{ticket_id}",
+        protocol_harness.project_api_path(f"tickets/{ticket_id}"),
         headers={"Authorization": agent_tokens["api"].authorization},
     )
     assert_status(unchanged, 200, operation="input-required 后读取业务工单")
@@ -425,7 +435,7 @@ def test_a2a_input_required_does_not_mutate_ticket_and_sse_resumes_by_cursor(
 
     still_unchanged = protocol_harness.request(
         "GET",
-        f"/api/v1/tickets/{ticket_id}",
+        protocol_harness.project_api_path(f"tickets/{ticket_id}"),
         headers={"Authorization": agent_tokens["api"].authorization},
     )
     assert_status(

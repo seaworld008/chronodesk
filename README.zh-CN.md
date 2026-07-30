@@ -7,9 +7,10 @@
 [![CodeQL](https://github.com/seaworld008/chronodesk/actions/workflows/codeql.yml/badge.svg)](https://github.com/seaworld008/chronodesk/actions/workflows/codeql.yml)
 [![许可证](https://img.shields.io/github/license/seaworld008/chronodesk)](LICENSE)
 
-ChronoDesk 是面向客服和运营团队的 AI Agent 原生工单自动化平台。人类在全中文
-企业管理后台中工作；外部 Agent 通过稳定的 REST、MCP 或 A2A Interface 接入，
-并共享完全一致的权限、并发控制、事件和审计语义。
+ChronoDesk 是面向 AI Agent 与人类协作的原生工单和任务执行平台，适用于客服、
+IT 服务、SRE、安全运营、企业内部服务、设备运维等需要可信任务流转的团队。人类
+在全中文企业管理后台中工作；外部 Agent 通过稳定的 REST、MCP 或 A2A Interface
+接入，并共享完全一致的权限、并发控制、事件和审计语义。
 
 项目采用面向单组织私有化部署的模块化单体架构，不内置 LLM、RAG、提示词平台或
 自治规划器。
@@ -27,6 +28,59 @@ ChronoDesk 是面向客服和运营团队的 AI Agent 原生工单自动化平�
 - **不可信内容隔离**：评论、附件、文件名和 Agent payload 永远是数据，不是控制指令。
 - **企业管理体验**：全中文提示、对象级权限、不换行且可调列宽的表格、SLA、
   自动化、通知、Webhook 与 Agent 控制中心。
+
+## 适用场景与行业
+
+ChronoDesk 不只适用于传统客服。只要一项工作可以表达为“接收事项 → 判断与分配
+→ 执行 → 补充信息 → 审核或升级 → 完成”，就可以用 Ticket 统一承载，并让人类、
+AI Agent 和企业系统在同一条可审计流程中协作。
+
+| 行业或团队 | 典型场景 |
+| --- | --- |
+| IT 与软件 | 服务台、账号和权限申请、Bug、云资源、告警、故障与变更处置 |
+| 客服、零售与电商 | 售后咨询、投诉、退款、物流异常、供应商和 VIP 客户升级 |
+| 制造、能源与物业 | 设备故障、质量异常、巡检、维修派单、备件与维护记录 |
+| 金融、保险与专业服务 | 客诉、材料核验、理赔辅助、风险调查、法务和财税请求 |
+| 医疗、教育与政企服务 | 设备运维、行政服务、学生或办事请求、材料流转与督办 |
+| 数据与内容运营 | 内容审核、数据质量问题、标注任务和异常数据修复 |
+| 企业内部共享服务 | 人事、行政、采购、财务、合规和跨部门服务请求 |
+
+ChronoDesk 尤其适合以下业务：
+
+- 处理状态、责任人和升级路径明确，需要 SLA、通知与完整审计；
+- AI 需要真正查询和执行操作，而不只是生成文字建议；
+- 多个人或 Agent 可能并行处理，需要幂等、版本控制和 Ticket Lease；
+- 需要在自动化效率和权限、策略、熔断、人工接管之间取得平衡。
+
+## AI 与人的协作
+
+ChronoDesk 支持从辅助决策到策略内自主执行的多种协作方式：
+
+1. **AI 辅助人**：自动分类、摘要、补全字段、推荐处理人或回复，由人类决定执行。
+2. **AI 先处理，人类接管**：Agent 完成初步排查；遇到低置信度、缺少信息或权限
+   不足时升级给人类。
+3. **AI 在策略内自主执行**：Agent 可以领取工单、添加评论、更新状态和释放租约；
+   scope、策略、限额、版本、租约和熔断共同控制风险。
+4. **人类监督多个 Agent**：管理员查看身份、凭据、策略决策、实时租约、事件投递
+   和操作审计，并可随时停用 Agent、切换只读或强制接管。
+5. **Agent 与 Agent 协作**：MCP 用于调用 Ticket 工具，A2A 用于传递任务、消息、
+   状态和 Artifact；多个 Agent 仍通过同一业务 Ticket 保持一致。
+
+```text
+邮件 / 告警 / 人类 / 外部 Agent 创建工单
+→ AI 分类、判断优先级并领取
+→ 自动处理或请求补充信息
+→ 低风险操作在策略内完成
+→ 高风险、异常或低置信度事项升级给人类
+→ 完成、通知并保留完整审计链
+```
+
+### 当前边界
+
+- 当前面向单组织私有化部署；模型、RAG 和自治规划由外部 Agent 平台承载。
+- ChronoDesk 管理实时控制、临床、交易等专业系统产生的异常和处置流程，但不替代
+  工业实时控制、临床诊断、高频交易或其他行业核心决策系统。
+- 多租户、计费、内置模型、知识库检索和主动对外委派属于后续阶段。
 
 ## 当前协议基线
 
@@ -46,7 +100,7 @@ ChronoDesk 只支持当前协议版本：
 ```mermaid
 flowchart LR
     Users["客服与运营人员"] --> Human["人类 REST + WebSocket"]
-    Agents["外部 AI Agent"] --> REST["Agent REST /api/v1"]
+    Agents["外部 AI Agent"] --> REST["Agent REST /api/v2/projects/{projectKey}"]
     Agents --> MCP["MCP 2026-07-28"]
     Agents --> A2A["A2A 1.0"]
     Human --> Adapters["协议 Adapter"]
@@ -79,7 +133,7 @@ docker compose exec server chronodesk-migrate -seed
 - 管理后台：<http://localhost:3000>
 - 健康检查：<http://localhost:8081/healthz>
 - OpenAPI：<http://localhost:8081/openapi.yaml>
-- Agent REST：<http://localhost:8081/api/v1>
+- Agent REST：`http://localhost:8081/api/v2/projects/{projectKey}`
 - MCP：<http://localhost:8081/mcp>
 - A2A Agent Card：<http://localhost:8081/.well-known/agent-card.json>
 

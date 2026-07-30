@@ -79,6 +79,7 @@ func setupStatsTestDB(t *testing.T) *gorm.DB {
 			Source:       models.TicketSourceWeb,
 			CreatedByID:  &user.ID,
 			AssignedToID: &assigneeID,
+			SLABreached:  true,
 		},
 	}
 
@@ -92,8 +93,9 @@ func setupStatsTestDB(t *testing.T) *gorm.DB {
 func TestGetTicketStatistics_Aggregates(t *testing.T) {
 	db := setupStatsTestDB(t)
 	svc := newTicketServiceForTest(t, db)
+	ctx := testProjectOperationContext(t, db, models.HumanActor(1))
 
-	stats, err := svc.GetTicketStatistics(1, "admin")
+	stats, err := svc.GetTicketStatistics(ctx, 1, string(models.ProjectRoleAdmin))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

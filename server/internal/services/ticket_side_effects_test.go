@@ -32,8 +32,13 @@ func TestUpdateTicketVersionNormalizesStructuredEventDataForNotifications(t *tes
 		Reason           string `json:"reason"`
 	}
 	service := NewAgentNativeService(db)
+	ctx := testProjectOperationContext(
+		t,
+		db,
+		models.SystemActor("automation"),
+	)
 	result, err := service.UpdateTicketVersion(
-		context.Background(),
+		ctx,
 		VersionedTicketUpdateInput{
 			TicketID:        ticket.ID,
 			ExpectedVersion: ticket.Version,
@@ -100,8 +105,13 @@ func TestAppendDomainEventAdditionalTargetsDeduplicatesDefaults(t *testing.T) {
 		db,
 		AgentNativeOptions{DefaultOutboxTargets: []OutboxTarget{target}},
 	)
+	ctx := testProjectOperationContext(
+		t,
+		db,
+		models.SystemActor("test"),
+	)
 	var event *models.DomainEvent
-	err := service.InTransaction(context.Background(), func(ctx context.Context, tx *gorm.DB) error {
+	err := service.InTransaction(ctx, func(ctx context.Context, tx *gorm.DB) error {
 		var appendErr error
 		event, appendErr = service.AppendDomainEventWithAdditionalTargetsTx(
 			ctx,

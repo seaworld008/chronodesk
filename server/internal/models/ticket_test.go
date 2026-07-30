@@ -37,33 +37,6 @@ func TestTicketToResponseCustomFields(t *testing.T) {
 	}
 }
 
-func TestTicketStatusTransitions(t *testing.T) {
-	tests := []struct {
-		name string
-		from TicketStatus
-		to   TicketStatus
-		want bool
-	}{
-		{name: "open to in progress", from: TicketStatusOpen, to: TicketStatusInProgress, want: true},
-		{name: "open can resolve directly", from: TicketStatusOpen, to: TicketStatusResolved, want: true},
-		{name: "in progress to resolved", from: TicketStatusInProgress, to: TicketStatusResolved, want: true},
-		{name: "resolved to closed", from: TicketStatusResolved, to: TicketStatusClosed, want: true},
-		{name: "resolved can reopen", from: TicketStatusResolved, to: TicketStatusOpen, want: true},
-		{name: "cancelled can reopen", from: TicketStatusCancelled, to: TicketStatusOpen, want: true},
-		{name: "open cannot close directly", from: TicketStatusOpen, to: TicketStatusClosed, want: false},
-		{name: "closed is terminal", from: TicketStatusClosed, to: TicketStatusOpen, want: false},
-		{name: "same status is allowed", from: TicketStatusPending, to: TicketStatusPending, want: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.from.CanTransitionTo(tt.to); got != tt.want {
-				t.Fatalf("%s.CanTransitionTo(%s) = %v, want %v", tt.from, tt.to, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestTicketToResponseEmptyFields(t *testing.T) {
 	ticket := &Ticket{}
 	response := ticket.ToResponse()

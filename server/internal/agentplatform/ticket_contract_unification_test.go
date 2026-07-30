@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strconv"
 	"testing"
-	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
@@ -230,7 +229,7 @@ func TestMCPAssignmentAndTransitionCommitNotificationOutbox(t *testing.T) {
 	})
 }
 
-func TestAgentCreateUsesCategorySLAInitialization(t *testing.T) {
+func TestAgentCreateUsesAuthoritativeSLAConfigProjection(t *testing.T) {
 	fixture := newMCPAdapterFixture(t)
 	allowAgentTicketAction(
 		t,
@@ -238,7 +237,7 @@ func TestAgentCreateUsesCategorySLAInitialization(t *testing.T) {
 		models.ScopeTicketsCreate,
 		"ticket.create",
 	)
-	slaHours := 4
+	slaHours := 1
 	category := models.Category{
 		Name:      "Agent SLA contract",
 		Slug:      "agent-sla-contract",
@@ -250,18 +249,44 @@ func TestAgentCreateUsesCategorySLAInitialization(t *testing.T) {
 	if err := fixture.db.Create(&category).Error; err != nil {
 		t.Fatalf("create SLA category: %v", err)
 	}
+	config := models.SLAConfig{
+		OrganizationID:  fixture.organization.ID,
+		ProjectID:       fixture.project.ID,
+		Name:            "Agent SLA contract",
+		IsActive:        true,
+		IsDefault:       true,
+		ResponseTime:    60,
+		ResolutionTime:  240,
+		ExcludeWeekends: true,
+	}
+	if err := fixture.db.Create(&config).Error; err != nil {
+		t.Fatalf("create authoritative SLA config: %v", err)
+	}
 
-	startedAt := time.Now()
-	result, err := fixture.service.CreateNativeTicket(
+	operationContext, err := services.WithOperationContext(
 		context.Background(),
+		services.OperationContext{
+			Scope:        fixture.project.Scope(),
+			Actor:        models.ServicePrincipalActor(fixture.principal.ID),
+			Source:       services.SourceProtocolMCP,
+			CredentialID: fixture.credential.ID,
+		},
+	)
+	if err != nil {
+		t.Fatalf("create Agent SLA operation context: %v", err)
+	}
+	result, err := fixture.service.CreateNativeTicket(
+		operationContext,
 		services.NativeTicketCreateInput{
 			Request: models.TicketCreateRequest{
-				Title:       "Agent category SLA",
-				Description: "Agent intake must share human SLA initialization",
-				Type:        models.TicketTypeRequest,
-				Priority:    models.TicketPriorityNormal,
-				Source:      models.TicketSourceAgent,
-				CategoryID:  &category.ID,
+				Title:                "Agent category SLA",
+				Description:          "Agent intake must share human SLA initialization",
+				Type:                 models.TicketTypeRequest,
+				Priority:             models.TicketPriorityNormal,
+				Source:               models.TicketSourceAgent,
+				CategoryID:           &category.ID,
+				RequestTypeVersionID: fixture.requestTypeVersionID,
+				WorkflowVersionID:    fixture.workflowVersionID,
 			},
 			Actor:          models.ServicePrincipalActor(fixture.principal.ID),
 			CredentialID:   fixture.credential.ID,
@@ -275,19 +300,16 @@ func TestAgentCreateUsesCategorySLAInitialization(t *testing.T) {
 	}
 	if result.Ticket.SLADueDate == nil {
 		t.Fatal(
-			"Agent create persisted category_id without category SLA deadline; Human and Agent intake must share one initialization rule",
+			"Agent create persisted category_id without the authoritative SLA projection",
 		)
 	}
-	earliest := startedAt.Add(time.Duration(slaHours) * time.Hour)
-	latest := time.Now().Add(time.Duration(slaHours) * time.Hour)
-	if result.Ticket.SLADueDate.Before(earliest) ||
-		result.Ticket.SLADueDate.After(latest) {
-		t.Fatalf(
-			"Agent SLA deadline = %v, want between %v and %v",
-			result.Ticket.SLADueDate,
-			earliest,
-			latest,
-		)
+	_, want, err := services.NewSLAService(fixture.db).
+		CalculateDeadlines(operationContext, result.Ticket, &config)
+	if err != nil {
+		t.Fatalf("calculate expected SLA projection: %v", err)
+	}
+	if !result.Ticket.SLADueDate.Equal(want) {
+		t.Fatalf("Agent SLA deadline = %v, want %v", result.Ticket.SLADueDate, want)
 	}
 }
 

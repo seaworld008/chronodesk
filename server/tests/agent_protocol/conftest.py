@@ -20,6 +20,7 @@ def protocol_harness(
     api_base_url: str,
     admin_tokens: dict[str, str],
     e2e_run_id: str,
+    project_key: str,
     e2e_manager: E2EResourceManager,
 ) -> Iterator[AgentProtocolHarness]:
     admin_access_token = admin_tokens.get("access_token")
@@ -29,6 +30,7 @@ def protocol_harness(
         api_base_url,
         admin_access_token,
         e2e_run_id,
+        project_key,
         e2e_manager,
     )
     try:
@@ -64,7 +66,7 @@ def protected_resources(
 ) -> dict[str, str]:
     result: dict[str, str] = {}
     for name, suffix in {
-        "api": "api/v1",
+        "api": "api/v2",
         "mcp": "mcp",
         "a2a": "a2a/v1",
     }.items():

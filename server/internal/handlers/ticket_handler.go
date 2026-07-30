@@ -158,7 +158,7 @@ func (h *TicketHandler) GetTickets(c *gin.Context) {
 
 	// 对象级可见性：客户只能列出自己创建的工单。显式 created_by
 	// 参数不能扩大其可见范围。
-	if isCustomerRole(normalizedUserRole(c)) {
+	if isRequesterRole(normalizedProjectRole(c)) {
 		if userID := c.GetUint("user_id"); userID > 0 {
 			filters.CreatorID = &userID
 		}
@@ -172,7 +172,7 @@ func (h *TicketHandler) GetTickets(c *gin.Context) {
 		return
 	}
 
-	responses := ticketListResponseForRole(tickets, normalizedUserRole(c))
+	responses := ticketListResponseForRole(tickets, normalizedProjectRole(c))
 
 	h.response.List(c, responses, total, page, pageSize, "获取工单列表成功")
 }
@@ -269,7 +269,7 @@ func (h *TicketHandler) GetTicket(c *gin.Context) {
 	}
 
 	setTicketETag(c, ticket.Version)
-	h.response.Success(c, ticketResponseForRole(ticket, normalizedUserRole(c)), "获取工单成功")
+	h.response.Success(c, ticketResponseForRole(ticket, normalizedProjectRole(c)), "获取工单成功")
 }
 
 // CreateTicket 创建工单
@@ -306,7 +306,7 @@ func (h *TicketHandler) CreateTicket(c *gin.Context) {
 		)
 		return
 	}
-	if isCustomerRole(normalizedUserRole(c)) && (req.Status != nil || req.AssignedToID != nil) {
+	if isRequesterRole(normalizedProjectRole(c)) && (req.Status != nil || req.AssignedToID != nil) {
 		h.response.Forbidden(c, "客户创建工单时不能指定状态或处理人")
 		return
 	}
@@ -321,13 +321,45 @@ func (h *TicketHandler) CreateTicket(c *gin.Context) {
 	// 创建工单
 	ticket, err := h.ticketService.CreateTicket(ctx, &req, userID.(uint))
 	if err != nil {
+		switch {
+		case errors.Is(err, services.ErrTicketFormValidation):
+			writeHumanTicketProblem(
+				c,
+				http.StatusUnprocessableEntity,
+				"ticket_form_validation_failed",
+				"工单表单校验失败",
+				"提交内容不符合所选请求类型的已发布表单",
+				false,
+			)
+			return
+		case errors.Is(err, services.ErrTicketRequestTypeAmbiguous):
+			writeHumanTicketProblem(
+				c,
+				http.StatusBadRequest,
+				"request_type_version_required",
+				"必须选择请求类型",
+				"请选择当前项目已发布的请求类型版本",
+				false,
+			)
+			return
+		case errors.Is(err, services.ErrTicketConfigurationUnavailable):
+			writeHumanTicketProblem(
+				c,
+				http.StatusConflict,
+				"ticket_configuration_unavailable",
+				"项目配置不可用",
+				"当前项目没有完整的已发布建单配置",
+				false,
+			)
+			return
+		}
 		logHandlerFailure(c, "ticket.create", err)
 		h.response.InternalServerError(c, "创建工单失败")
 		return
 	}
 
 	setTicketETag(c, ticket.Version)
-	h.response.Created(c, ticketResponseForRole(ticket, normalizedUserRole(c)), "工单创建成功")
+	h.response.Created(c, ticketResponseForRole(ticket, normalizedProjectRole(c)), "工单创建成功")
 }
 
 // UpdateTicket 更新工单
@@ -369,7 +401,7 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 		h.response.InternalServerError(c, "工单权限检查失败")
 		return
 	}
-	if isCustomerRole(normalizedUserRole(c)) &&
+	if isRequesterRole(normalizedProjectRole(c)) &&
 		(req.Status != nil || req.AssignedToID != nil || req.InternalNotes != nil) {
 		h.response.Forbidden(c, "客户不能修改工单状态、处理人或内部备注")
 		return
@@ -413,7 +445,7 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 	}
 
 	setTicketETag(c, ticket.Version)
-	h.response.Success(c, ticketResponseForRole(ticket, normalizedUserRole(c)), "工单更新成功")
+	h.response.Success(c, ticketResponseForRole(ticket, normalizedProjectRole(c)), "工单更新成功")
 }
 
 // DeleteTicket 删除工单
@@ -435,19 +467,9 @@ func (h *TicketHandler) DeleteTicket(c *gin.Context) {
 		return
 	}
 
-	userRoleValue, roleExists := c.Get("user_role")
-	if !roleExists {
-		h.response.Forbidden(c, "缺少用户角色信息")
-		return
-	}
-
-	role, ok := userRoleValue.(string)
-	if !ok {
-		h.response.InternalServerError(c, "无效的角色类型")
-		return
-	}
-	if !isPrivilegedRole(strings.ToLower(strings.TrimSpace(role))) {
-		h.response.Forbidden(c, "仅管理员或主管可以删除工单")
+	role := normalizedProjectRole(c)
+	if !isProjectManagerRole(role) {
+		h.response.Forbidden(c, "仅项目管理员或经理可以删除工单")
 		return
 	}
 	expectedVersion, ok := requireTicketIfMatch(c)
@@ -507,8 +529,8 @@ func (h *TicketHandler) BulkUpdateTickets(c *gin.Context) {
 		h.response.Error(c, http.StatusUnauthorized, "unauthorized", "用户未登录")
 		return
 	}
-	if !isPrivilegedRole(normalizedUserRole(c)) {
-		h.response.Forbidden(c, "仅管理员或主管可以批量更新工单")
+	if !isProjectManagerRole(normalizedProjectRole(c)) {
+		h.response.Forbidden(c, "仅项目管理员或经理可以批量更新工单")
 		return
 	}
 
@@ -581,18 +603,9 @@ func (h *TicketHandler) BulkDeleteTickets(c *gin.Context) {
 		return
 	}
 
-	userRoleValue, roleExists := c.Get("user_role")
-	if !roleExists {
-		h.response.Forbidden(c, "缺少用户角色信息")
-		return
-	}
-	userRole, ok := userRoleValue.(string)
-	if !ok {
-		h.response.InternalServerError(c, "无效的角色类型")
-		return
-	}
-	if !isPrivilegedRole(strings.ToLower(strings.TrimSpace(userRole))) {
-		h.response.Forbidden(c, "仅管理员或主管可以批量删除工单")
+	projectRole := normalizedProjectRole(c)
+	if !isProjectManagerRole(projectRole) {
+		h.response.Forbidden(c, "仅项目管理员或经理可以批量删除工单")
 		return
 	}
 
@@ -606,7 +619,7 @@ func (h *TicketHandler) BulkDeleteTickets(c *gin.Context) {
 			ctx,
 			precondition.ID,
 			userID,
-			userRole,
+			projectRole,
 			precondition.Version,
 		); err != nil {
 			failedIDs = append(failedIDs, precondition.ID)

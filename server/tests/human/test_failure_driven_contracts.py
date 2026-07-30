@@ -47,12 +47,14 @@ def test_agent_full_queue_read_remains_read_only_under_current_human_policy(
     )
     assert assigned.status_code == 200, assigned.text
 
-    detail = observing_agent.api.get_json(f"/tickets/{ticket_id}")
+    detail = observing_agent.api.get_json(
+        e2e_manager.project_path(f"tickets/{ticket_id}")
+    )
     assert detail.status_code == 200, detail.text
     assert detail.json().get("data", {}).get("id") == ticket_id
 
     queue = observing_agent.api.get_json(
-        "/tickets",
+        e2e_manager.project_path("tickets"),
         params={"search": ticket["title"], "page_size": 100},
     )
     assert queue.status_code == 200, queue.text
@@ -80,7 +82,7 @@ def test_agent_full_queue_read_remains_read_only_under_current_human_policy(
         machine_codes={"ticket_access_denied"},
     )
     comment = observing_agent.api.post_json(
-        f"/tickets/{ticket_id}/comments",
+        e2e_manager.project_path(f"tickets/{ticket_id}/comments"),
         {
             "content": e2e_manager.unique("cross-owner-comment"),
             "type": "public",
@@ -115,7 +117,7 @@ def test_customer_history_redacts_assignment_and_internal_changes(
     )
     assert assigned.status_code == 200, assigned.text
     internal = agent.api.post_json(
-        f"/tickets/{ticket_id}/comments",
+        e2e_manager.project_path(f"tickets/{ticket_id}/comments"),
         {
             "content": e2e_manager.unique("history-internal-comment"),
             "type": "internal",
@@ -126,7 +128,9 @@ def test_customer_history_redacts_assignment_and_internal_changes(
     internal_comment_id = internal.json().get("data", {}).get("id")
     assert isinstance(internal_comment_id, int) and internal_comment_id > 0
 
-    privileged_history = supervisor.api.get_json(f"/tickets/{ticket_id}/history")
+    privileged_history = supervisor.api.get_json(
+        e2e_manager.project_path(f"tickets/{ticket_id}/history")
+    )
     assert privileged_history.status_code == 200, privileged_history.text
     privileged_items = privileged_history.json().get("data", [])
     assert any(
@@ -134,7 +138,9 @@ def test_customer_history_redacts_assignment_and_internal_changes(
     ), privileged_items
     assert internal_comment_id in {item.get("comment_id") for item in privileged_items}
 
-    customer_history = customer.api.get_json(f"/tickets/{ticket_id}/history")
+    customer_history = customer.api.get_json(
+        e2e_manager.project_path(f"tickets/{ticket_id}/history")
+    )
     assert customer_history.status_code == 200, customer_history.text
     customer_items = customer_history.json().get("data", [])
     assert customer_items
@@ -170,10 +176,10 @@ def test_blank_ticket_text_is_chinese_400_without_persisted_row(
         "source": "api",
     }
     payload[blank_field] = " \t\n "
-    rejected = admin.api.post_json("/tickets", payload)
+    rejected = admin.api.post_json(e2e_manager.project_path("tickets"), payload)
 
     lookup = admin.api.get_json(
-        "/tickets",
+        e2e_manager.project_path("tickets"),
         params={"search": marker, "page_size": 100},
     )
     assert lookup.status_code == 200, lookup.text
@@ -186,7 +192,7 @@ def test_blank_ticket_text_is_chinese_400_without_persisted_row(
     for item in matching:
         ticket_id = item.get("id")
         assert isinstance(ticket_id, int) and ticket_id > 0, item
-        cleanup = admin.api.delete(f"/tickets/{ticket_id}")
+        cleanup = admin.api.delete_ticket(ticket_id)
         assert cleanup.status_code in (200, 204), cleanup.text
 
     assert rejected.status_code == 400 and not matching, (
@@ -222,12 +228,14 @@ def test_invalid_comment_errors_are_chinese_without_validator_details(
     admin = human_identities["admin"]
     ticket = e2e_manager.create_ticket(admin, f"invalid-comment-{case_name}")
     rejected = admin.api.post_json(
-        f"/tickets/{ticket['id']}/comments",
+        e2e_manager.project_path(f"tickets/{ticket['id']}/comments"),
         payload,
         headers={"If-Match": admin.api.ticket_etag(ticket["id"])},
     )
 
-    comments = admin.api.get_json(f"/tickets/{ticket['id']}/comments")
+    comments = admin.api.get_json(
+        e2e_manager.project_path(f"tickets/{ticket['id']}/comments")
+    )
     assert comments.status_code == 200, comments.text
     assert comments.json().get("data", []) == [], comments.text
 
@@ -258,7 +266,7 @@ def test_human_ticket_detail_returns_strong_etag(
 
     admin = human_identities["admin"]
     ticket = e2e_manager.create_ticket(admin, "human-get-etag")
-    response = admin.api.get_json(f"/tickets/{ticket['id']}")
+    response = admin.api.get_json(e2e_manager.project_path(f"tickets/{ticket['id']}"))
 
     assert response.status_code == 200, response.text
     version = response.json().get("data", {}).get("version")
@@ -289,7 +297,7 @@ def test_human_ticket_put_enforces_if_match(
     ticket = e2e_manager.create_ticket(admin, f"human-put-if-match-{case_name}")
     headers = {} if etag is None else {"If-Match": etag}
     response = admin.api.put_json(
-        f"/tickets/{ticket['id']}",
+        e2e_manager.project_path(f"tickets/{ticket['id']}"),
         {"priority": "high"},
         headers=headers,
     )
@@ -335,7 +343,7 @@ def test_human_ticket_workflow_enforces_if_match(
     )
     headers = {} if etag is None else {"If-Match": etag}
     response = admin.api.post_json(
-        f"/tickets/{ticket['id']}/status",
+        e2e_manager.project_path(f"tickets/{ticket['id']}/status"),
         {"status": "in_progress"},
         headers=headers,
     )

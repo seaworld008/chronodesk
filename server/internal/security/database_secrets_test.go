@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -114,6 +116,142 @@ func TestDatabaseSecretValidationDetectsTamperAndWrongKey(t *testing.T) {
 	}
 	if err := ValidateDatabaseSecrets(ctx, db, ring); !errors.Is(err, ErrAuthentication) {
 		t.Fatalf("tamper validation error=%v", err)
+	}
+}
+
+func TestRuntimeDatabaseSecretValidationUsesOneScopedTransactionPerProject(
+	t *testing.T,
+) {
+	db := openSecretTestDB(t)
+	if err := db.AutoMigrate(
+		&models.Organization{},
+		&models.BusinessUnit{},
+		&models.Project{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	organization := models.Organization{
+		Slug:   "runtime-secrets",
+		Name:   "Runtime Secrets",
+		Status: models.OrganizationStatusActive,
+	}
+	if err := db.Create(&organization).Error; err != nil {
+		t.Fatal(err)
+	}
+	unit := models.BusinessUnit{
+		OrganizationID: organization.ID,
+		Key:            "security",
+		Name:           "Security",
+		Status:         models.BusinessUnitStatusActive,
+	}
+	if err := db.Create(&unit).Error; err != nil {
+		t.Fatal(err)
+	}
+	projects := []models.Project{
+		{
+			OrganizationID: organization.ID,
+			BusinessUnitID: unit.ID,
+			Key:            "SECONE",
+			Name:           "Security One",
+			Status:         models.ProjectStatusActive,
+		},
+		{
+			OrganizationID: organization.ID,
+			BusinessUnitID: unit.ID,
+			Key:            "SECTWO",
+			Name:           "Security Two",
+			Status:         models.ProjectStatusArchived,
+		},
+	}
+	ring := testDatabaseKeyring(t, "dek-runtime", 0x41)
+	for index := range projects {
+		if err := db.Create(&projects[index]).Error; err != nil {
+			t.Fatal(err)
+		}
+		webhook := models.WebhookConfig{
+			OrganizationID: organization.ID,
+			ProjectID:      projects[index].ID,
+			Name:           "runtime-scoped",
+			Provider:       models.WebhookProviderCustom,
+			WebhookURL:     "https://hooks.example.test",
+			Status:         models.WebhookStatusActive,
+			CreatedBy:      1,
+		}
+		if err := db.Create(&webhook).Error; err != nil {
+			t.Fatal(err)
+		}
+		envelope, err := ring.Seal(
+			[]byte("runtime-secret"),
+			FieldAAD(
+				webhookSecretsTable,
+				strconv.FormatUint(uint64(webhook.ID), 10),
+				"secret",
+			),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Model(&webhook).
+			UpdateColumn("secret", envelope).Error; err != nil {
+			t.Fatal(err)
+		}
+		push := models.AgentPushNotificationConfig{
+			ID:             fmt.Sprintf("runtime-push-%d", index),
+			OrganizationID: organization.ID,
+			ProjectID:      projects[index].ID,
+			TaskID:         fmt.Sprintf("runtime-task-%d", index),
+			URL:            "https://push.example.test",
+		}
+		if err := db.Create(&push).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var protectedQueries int
+	var unscopedProtectedQueries int
+	callbackName := "assert_runtime_secret_project_transaction"
+	if err := db.Callback().Query().Before("gorm:query").Register(
+		callbackName,
+		func(query *gorm.DB) {
+			tableName := query.Statement.Table
+			if query.Statement.Schema != nil {
+				tableName = query.Statement.Schema.Table
+			}
+			if tableName != webhookSecretsTable &&
+				tableName != a2aPushSecretsTable {
+				return
+			}
+			protectedQueries++
+			if _, ok := query.Statement.ConnPool.(gorm.TxCommitter); !ok {
+				unscopedProtectedQueries++
+			}
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		db.Callback().Query().Remove(callbackName)
+	})
+
+	if err := ValidateRuntimeDatabaseSecrets(
+		context.Background(),
+		db,
+		ring,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if protectedQueries != len(projects)*2 {
+		t.Fatalf(
+			"project-owned secret queries = %d, want %d",
+			protectedQueries,
+			len(projects)*2,
+		)
+	}
+	if unscopedProtectedQueries != 0 {
+		t.Fatalf(
+			"project-owned secret queries outside transactions = %d, want 0",
+			unscopedProtectedQueries,
+		)
 	}
 }
 

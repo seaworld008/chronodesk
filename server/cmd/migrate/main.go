@@ -91,8 +91,10 @@ func main() {
 		log.Fatalf("获取数据库连接池失败：%v", err)
 	}
 	defer sqlDB.Close()
-	sqlDB.SetMaxIdleConns(1)
-	sqlDB.SetMaxOpenConns(1)
+	// The atomic GORM migration holds one PostgreSQL transaction connection
+	// while catalog inspection may acquire a second connection.
+	sqlDB.SetMaxIdleConns(2)
+	sqlDB.SetMaxOpenConns(2)
 	sqlDB.SetConnMaxLifetime(time.Hour)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()

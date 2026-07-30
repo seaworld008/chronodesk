@@ -43,7 +43,9 @@ func TestWebhookAuditLogNeverPersistsCredentialsOrSignatures(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := models.WebhookConfig{
-		Name: "sensitive-log-test", Provider: models.WebhookProviderLark,
+		OrganizationID: 1,
+		ProjectID:      1,
+		Name:           "sensitive-log-test", Provider: models.WebhookProviderLark,
 		WebhookURL: endpoint.URL + "/callback/" + accessToken + "?secret=" + signingSecret,
 		Secret:     signingSecret, AccessToken: accessToken,
 		Status: models.WebhookStatusActive, CreatedBy: owner.ID,

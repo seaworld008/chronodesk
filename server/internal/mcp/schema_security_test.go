@@ -25,3 +25,28 @@ func TestValidateSchemaAllowsOnlyServerOwnedAnchoredPatterns(t *testing.T) {
 		t.Fatal("validateSchema() executed a pattern outside the server allowlist")
 	}
 }
+
+func TestValidateSchemaEnforcesCanonicalUUIDFormat(t *testing.T) {
+	definition := schema{"type": "string", "format": "uuid"}
+	if err := validateSchema(
+		"018f0f95-9e85-7a2b-8c3d-1234567890ab",
+		definition,
+		"$.request_type_version_id",
+	); err != nil {
+		t.Fatalf("validateSchema() rejected canonical UUID: %v", err)
+	}
+	for _, invalid := range []string{
+		"",
+		"not-a-uuid",
+		"018f0f959e857a2b8c3d1234567890ab",
+		"urn:uuid:018f0f95-9e85-7a2b-8c3d-1234567890ab",
+	} {
+		if err := validateSchema(
+			invalid,
+			definition,
+			"$.request_type_version_id",
+		); err == nil {
+			t.Fatalf("validateSchema() accepted non-canonical UUID %q", invalid)
+		}
+	}
+}

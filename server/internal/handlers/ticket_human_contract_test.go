@@ -288,19 +288,19 @@ func TestHumanTicketCreateTrimsRequiredTextAndRejectsBlankValues(t *testing.T) {
 	}{
 		{
 			name:       "trim",
-			body:       `{"title":"  标题  ","description":"  描述  ","type":"request","priority":"normal","source":"web"}`,
+			body:       `{"title":"  标题  ","description":"  描述  ","type":"request","priority":"normal","source":"web","request_type_version_id":"00000000-0000-7000-8000-000000000102"}`,
 			wantStatus: http.StatusCreated,
 			wantTitle:  "标题",
 			wantBody:   "描述",
 		},
 		{
 			name:       "blank title",
-			body:       `{"title":" \t\n ","description":"描述","type":"request","priority":"normal","source":"web"}`,
+			body:       `{"title":" \t\n ","description":"描述","type":"request","priority":"normal","source":"web","request_type_version_id":"00000000-0000-7000-8000-000000000102"}`,
 			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name:       "blank description",
-			body:       `{"title":"标题","description":" \t\n ","type":"request","priority":"normal","source":"web"}`,
+			body:       `{"title":"标题","description":" \t\n ","type":"request","priority":"normal","source":"web","request_type_version_id":"00000000-0000-7000-8000-000000000102"}`,
 			wantStatus: http.StatusBadRequest,
 		},
 	} {
@@ -500,6 +500,32 @@ func humanTicketTestRouter(
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", user.ID)
 		c.Set("user_role", string(user.Role))
+		projectRole := models.ProjectRoleRequester
+		switch user.Role {
+		case models.RoleAdmin:
+			projectRole = models.ProjectRoleAdmin
+		case models.RoleSupervisor:
+			projectRole = models.ProjectRoleManager
+		case models.RoleAgent:
+			projectRole = models.ProjectRoleAgent
+		}
+		c.Set(projectRoleContextKey, string(projectRole))
+		requestContext, err := services.WithOperationContext(
+			c.Request.Context(),
+			services.OperationContext{
+				Scope: models.ProjectScope{
+					OrganizationID: 1,
+					ProjectID:      1,
+				},
+				Actor:  models.HumanActor(user.ID),
+				Source: services.SourceProtocolHumanREST,
+			},
+		)
+		if err != nil {
+			c.AbortWithStatus(http.StatusInternalServerError)
+			return
+		}
+		c.Request = c.Request.WithContext(requestContext)
 		c.Next()
 	})
 	register(router)

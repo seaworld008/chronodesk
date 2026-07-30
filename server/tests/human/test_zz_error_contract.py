@@ -25,11 +25,11 @@ def test_authentication_authorization_and_not_found_errors_are_machine_safe(
     api_client: APIClient,
     human_identities: Mapping[str, HumanIdentity],
 ) -> None:
-    missing = api_client.get_json("/tickets")
+    missing = api_client.get_json(api_client.project_path("tickets"))
     assert_error_contract(missing, 401, machine_codes={"missing_token"})
 
     malformed = api_client.get_json(
-        "/tickets",
+        api_client.project_path("tickets"),
         headers={"Authorization": "Token deliberately-invalid"},
     )
     assert_error_contract(
@@ -39,7 +39,7 @@ def test_authentication_authorization_and_not_found_errors_are_machine_safe(
     )
 
     forged = api_client.get_json(
-        "/tickets",
+        api_client.project_path("tickets"),
         headers={"Authorization": "Bearer aaa.bbb.ccc"},
     )
     assert_error_contract(
@@ -51,7 +51,8 @@ def test_authentication_authorization_and_not_found_errors_are_machine_safe(
     forbidden = human_identities["customer_a"].api.get_json("/admin/users")
     assert_error_contract(forbidden, 403)
 
-    absent = human_identities["customer_a"].api.get_json("/tickets/4294967295")
+    customer_api = human_identities["customer_a"].api
+    absent = customer_api.get_json(customer_api.project_path("tickets/4294967295"))
     assert_error_contract(absent, 404)
 
 

@@ -8,7 +8,7 @@ import { createTheme } from '@mui/material/styles';
 import { dataProvider } from './lib/dataProvider';
 import { authProvider } from './lib/authProvider';
 import {
-    isAdministrativeRole,
+    isPlatformAdministrator,
     type RolePermissions,
 } from './lib/accessControl';
 
@@ -22,6 +22,7 @@ import {
     History as HistoryIcon,
     Security as SecurityIcon,
     SmartToy as AgentIcon,
+    DashboardCustomize as WorkbenchIcon,
 } from '@mui/icons-material';
 
 import { CustomLayout as Layout } from './layout/CustomLayout';
@@ -76,6 +77,9 @@ const WebhookSettings = lazyPage(() => import('./admin/settings/WebhookSettings'
 const SystemSettings = lazyPage(() => import('./admin/settings/SystemSettings'));
 const TrustedDevices = lazyPage(() => import('./admin/security/TrustedDevices'));
 const AgentControlCenter = lazyPage(() => import('./admin/agents/AgentControlCenter'));
+const CrossProjectWorkbench = lazyPage(
+    () => import('./admin/workbench/CrossProjectWorkbench'),
+);
 
 /**
  * 自定义MUI主题
@@ -127,7 +131,7 @@ const AdministrativeRoute = ({ children }: React.PropsWithChildren) => {
         return null;
     }
 
-    if (!isAdministrativeRole(permissions?.role)) {
+    if (!isPlatformAdministrator(permissions?.role)) {
         return <Navigate to="/" replace />;
     }
 
@@ -161,11 +165,16 @@ const AdministrativeAutomationLogList = withAdministrativeAccess(AutomationLogLi
  */
 const CustomMenu: React.FC = () => {
     const { permissions } = usePermissions<RolePermissions>();
-    const canAdminister = isAdministrativeRole(permissions?.role);
+    const canAdminister = isPlatformAdministrator(permissions?.role);
 
     return (
         <Menu aria-label="主导航">
             <Menu.DashboardItem primaryText="仪表盘" />
+            <Menu.Item
+                to="/workbench"
+                primaryText="我的跨项目工作台"
+                leftIcon={<WorkbenchIcon />}
+            />
             <Menu.Item to="/tickets" primaryText="工单管理" leftIcon={<TicketIcon />} />
             <Menu.Item to="/notifications" primaryText="通知中心" leftIcon={<NotificationIcon />} />
             {canAdminister && <Menu.Item to="/users" primaryText="用户管理" leftIcon={<UsersIcon />} />}
@@ -287,6 +296,8 @@ const AdminApp: React.FC = () => {
 
             {/* 自定义路由 */}
             <CustomRoutes>
+                <Route path="/workbench" element={<CrossProjectWorkbench />} />
+
                 {/* 系统设置主页面 */}
                 <Route
                     path="/system-settings"

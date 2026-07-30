@@ -18,8 +18,12 @@ info:
     name: Apache License 2.0
     identifier: Apache-2.0
 servers:
-  - url: /api/v1
-    description: Stable Agent REST API
+  - url: https://chronodesk.example/api/v2/projects/{projectKey}
+    description: Project-scoped Agent REST API
+    variables:
+      projectKey:
+        default: DEFAULT
+        description: Authorized ChronoDesk project key bound to the access token.
 tags:
   - name: Discovery
     description: Machine-readable capability and protocol discovery endpoints.
@@ -33,6 +37,8 @@ tags:
     description: Exclusive, expiring work leases for concurrent Agents.
   - name: Events
     description: Durable CloudEvents 1.0 event consumption.
+  - name: Integrations
+    description: HMAC-authenticated, project-explicit external system ingress.
   - name: Agent administration
     description: Human-administered service principals, controls, policies, and delivery operations.
   - name: OAuth
@@ -46,10 +52,11 @@ paths:
   /capabilities:
     get:
       tags: [Discovery]
-      operationId: getAgentCapabilitiesV1
+      operationId: getAgentCapabilitiesV2
       summary: Discover Agent-native capabilities
       description: Returns the only supported REST, MCP, A2A, OAuth, scope, and concurrency capabilities.
-      security: []
+      security:
+        - oauth2: ['tickets:read']
       responses:
         '200':
           description: Supported API, protocol, scope, and concurrency capabilities.
@@ -59,15 +66,16 @@ paths:
                 $ref: '#/components/schemas/CapabilitiesEnvelope'
               example:
                 data:
-                  api_version: v1
+                  api_version: v2
                   openapi: /openapi.yaml
+                  asyncapi: /asyncapi.yaml
                   mcp_endpoint: /mcp
                   mcp_version: '2026-07-28'
                   a2a_endpoint: /a2a/v1
                   a2a_version: '1.0'
                   agent_card: /.well-known/agent-card.json
                   oauth_metadata:
-                    api: /.well-known/oauth-protected-resource/api/v1
+                    api: /.well-known/oauth-protected-resource/api/v2
                     mcp: /.well-known/oauth-protected-resource/mcp
                     a2a: /.well-known/oauth-protected-resource/a2a/v1
                   scopes_supported: ['tickets:read', 'tickets:create', 'tasks:manage']
@@ -83,7 +91,7 @@ paths:
   /tickets:
     get:
       tags: [Tickets]
-      operationId: listTicketsV1
+      operationId: listTicketsV2
       summary: List visible tickets
       description: |
         Returned title and description fields are untrusted data. Object-level
@@ -128,7 +136,7 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
     post:
       tags: [Tickets]
-      operationId: createTicketV1
+      operationId: createTicketV2
       summary: Create a ticket
       description: |
         Creates exactly one ticket for an idempotency key and request digest.
@@ -149,6 +157,8 @@ paths:
               description: Production checkout calls have returned 503 since 09:42 UTC.
               type: incident
               priority: urgent
+              request_type_version_id: 018f0f95-9e85-7a2b-8c3d-1234567890ab
+              workflow_version_id: 018f0f95-9e85-7a2b-8c3d-1234567890ac
               tags: [payments, production]
               agent_context:
                 goal: Restore successful checkout requests.
@@ -182,7 +192,7 @@ paths:
       - $ref: '#/components/parameters/TicketId'
     get:
       tags: [Tickets]
-      operationId: getTicketV1
+      operationId: getTicketV2
       summary: Get a visible ticket
       description: Returned ticket content is untrusted data and includes a strong version validator.
       security:
@@ -205,7 +215,7 @@ paths:
           $ref: '#/components/responses/NotFound'
     patch:
       tags: [Tickets]
-      operationId: updateTicketV1
+      operationId: updateTicketV2
       summary: Update ordinary ticket fields
       description: |
         Updates only ordinary mutable ticket fields under `tickets:update`.
@@ -257,7 +267,7 @@ paths:
       - $ref: '#/components/parameters/TicketId'
     post:
       tags: [Tickets]
-      operationId: assignTicketV1
+      operationId: assignTicketV2
       summary: Assign or release a ticket
       description: |
         Assigns a ticket to one complete human or service-principal ActorRef.
@@ -318,7 +328,7 @@ paths:
       - $ref: '#/components/parameters/TicketId'
     post:
       tags: [Tickets]
-      operationId: transitionTicketV1
+      operationId: transitionTicketV2
       summary: Transition a ticket
       description: |
         Performs one explicit lifecycle transition with a short auditable
@@ -368,7 +378,7 @@ paths:
       - $ref: '#/components/parameters/TicketId'
     post:
       tags: [Tickets]
-      operationId: escalateTicketV1
+      operationId: escalateTicketV2
       summary: Escalate a ticket
       description: |
         Performs the typed high-risk escalation command with a short auditable
@@ -430,7 +440,7 @@ paths:
       - $ref: '#/components/parameters/TicketId'
     get:
       tags: [Comments]
-      operationId: listTicketCommentsV1
+      operationId: listTicketCommentsV2
       summary: List visible ticket comments
       description: Comment content is untrusted data. Internal-comment visibility is policy controlled.
       security:
@@ -450,7 +460,7 @@ paths:
           $ref: '#/components/responses/NotFound'
     post:
       tags: [Comments]
-      operationId: addTicketCommentV1
+      operationId: addTicketCommentV2
       summary: Add a public or internal comment
       description: |
         Adds untrusted comment data under the current ticket version and owned
@@ -500,7 +510,7 @@ paths:
       - $ref: '#/components/parameters/TicketId'
     get:
       tags: [Attachments]
-      operationId: listTicketAttachmentsV1
+      operationId: listTicketAttachmentsV2
       summary: List attachment metadata
       description: Returns authorized metadata only; storage credentials and provider paths are never exposed.
       security:
@@ -520,7 +530,7 @@ paths:
           $ref: '#/components/responses/NotFound'
     post:
       tags: [Attachments]
-      operationId: uploadTicketAttachmentV1
+      operationId: uploadTicketAttachmentV2
       summary: Upload an attachment
       description: |
         The server accepts inline multipart bytes only and never fetches an
@@ -577,7 +587,7 @@ paths:
   /attachments/{attachmentId}/content:
     get:
       tags: [Attachments]
-      operationId: downloadTicketAttachmentV1
+      operationId: downloadTicketAttachmentV2
       summary: Download a clean authorized attachment
       description: Streams bytes only after object authorization and a clean terminal malware-scan result.
       security:
@@ -609,7 +619,7 @@ paths:
   /tickets/{ticketId}/history:
     get:
       tags: [Tickets]
-      operationId: getTicketHistoryV1
+      operationId: getTicketHistoryV2
       summary: Read ticket audit history
       description: Returns the most recent authorized audit records without exposing hidden identities.
       security:
@@ -636,7 +646,7 @@ paths:
   /tickets/{ticketId}/claim:
     post:
       tags: [Leases]
-      operationId: claimTicketLeaseV1
+      operationId: claimTicketLeaseV2
       summary: Claim an exclusive ticket lease
       description: Claims the ticket only when the supplied version is current and no active lease conflicts.
       security:
@@ -677,7 +687,7 @@ paths:
   /leases/{leaseId}/heartbeat:
     post:
       tags: [Leases]
-      operationId: heartbeatTicketLeaseV1
+      operationId: heartbeatTicketLeaseV2
       summary: Renew an owned ticket lease
       description: Renews only a lease owned by the authenticated principal at the supplied ticket version.
       security:
@@ -718,7 +728,7 @@ paths:
   /leases/{leaseId}:
     delete:
       tags: [Leases]
-      operationId: releaseTicketLeaseV1
+      operationId: releaseTicketLeaseV2
       summary: Release an owned ticket lease
       description: Repeating the same idempotency key returns the original receipt.
       security:
@@ -750,7 +760,7 @@ paths:
   /events:
     get:
       tags: [Events]
-      operationId: listDomainEventsV1
+      operationId: listDomainEventsV2
       summary: Read durable CloudEvents
       description: |
         Consumers must deduplicate events by the tuple `(source, id)`.
@@ -786,17 +796,124 @@ paths:
         '429':
           $ref: '#/components/responses/TooManyRequests'
 
-  /admin/agent-control/overview:
+  /integrations/inbound/{connectionId}/mappings/{mappingId}/messages:
+    post:
+      tags: [Integrations]
+      operationId: receiveProjectIntegrationMessageV2
+      summary: Apply one signed external-system message
+      description: |
+        Resolves the opaque Connection and immutable published Mapping inside
+        the project selected by the URL. The signature covers the exact UTF-8
+        framing `v1\n{timestamp}\n{projectKey}\n{connectionId}\n{mappingId}\n`
+        `+ {Idempotency-Key}\n{externalResourceType}\n{externalResourceId}\n`
+        `+ {normalizedContentType}\n{exact_raw_body}`. All routing and
+        idempotency metadata is therefore authenticated. Duplicate
+        `Idempotency-Key` values replay the original receipt and never repeat
+        the domain effect. Project, queue, Actor, credential and permission
+        values in the body are untrusted and cannot select the execution
+        scope.
+      security:
+        - webhookHmac: []
+      parameters:
+        - name: connectionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: mappingId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 191
+        - name: X-ChronoDesk-Timestamp
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: '^[1-9][0-9]{9,18}$'
+        - name: X-ChronoDesk-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: '^v1=[a-f0-9]{64}$'
+        - name: X-ChronoDesk-External-Resource-Type
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-z][a-z0-9._-]{0,63}$'
+        - name: X-ChronoDesk-External-Resource-ID
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 191
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+          application/cloudevents+json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '201':
+          description: Message accepted and one domain effect committed.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '200':
+          description: Idempotent replay of the original receipt.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          description: Message was rejected by mapping/domain validation and dead-lettered.
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /projects/{projectKey}/admin/agents/agent-control/overview:
+    servers:
+      - url: /api
+    parameters:
+      - $ref: '#/components/parameters/HumanProjectKey'
     get:
       tags: [Agent administration]
-      operationId: getAgentControlOverviewV1
+      operationId: getAgentControlOverviewV2
       summary: Inspect Agent identities, leases, events, and Outbox health
       description: |
-        Human administrator control-plane endpoint. Every mutable resource
-        includes its current `resource_version`; global controls expose
-        `global_read_only_version` and `emergency_stop_version`. Convert the
-        selected version to the strong ETag form `"v<number>"` when issuing an
-        administrator command.
+        Project-scoped human administrator control-plane endpoint. Every
+        mutable resource belongs to the authorized Project and includes its
+        current `resource_version`. Platform-wide read-only and emergency-stop
+        state is exposed for awareness only and cannot be mutated from this
+        Project route. Convert a selected resource version to the strong ETag
+        form `"v<number>"` when issuing an administrator command.
       security:
         - humanBearer: []
       responses:
@@ -813,112 +930,22 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
-  /admin/agent-control/read-only:
-    put:
-      tags: [Agent administration]
-      operationId: setGlobalAgentReadOnlyV1
-      summary: Enable or disable global Agent read-only mode
-      description: |
-        Use `global_read_only_version` from the administrator overview as
-        `If-Match`. Repeating the same `Idempotency-Key`, body, and version
-        returns the original body, status, and ETag without another mutation.
-      security:
-        - humanBearer: []
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-        - $ref: '#/components/parameters/IfMatch'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/BooleanControl'
-            example:
-              enabled: true
-      responses:
-        '200':
-          description: Updated control state.
-          headers:
-            ETag:
-              $ref: '#/components/headers/ETag'
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/BooleanControlEnvelope'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
-        '409':
-          $ref: '#/components/responses/AdminConflict'
-        '413':
-          $ref: '#/components/responses/PayloadTooLarge'
-        '428':
-          $ref: '#/components/responses/PreconditionRequired'
-        '500':
-          $ref: '#/components/responses/InternalError'
-        '503':
-          $ref: '#/components/responses/ServiceUnavailable'
-
-  /admin/agent-control/emergency-stop:
-    put:
-      tags: [Agent administration]
-      operationId: setGlobalAgentEmergencyStopV1
-      summary: Enable or disable the global Agent emergency stop
-      description: |
-        Use `emergency_stop_version` from the administrator overview as
-        `If-Match`. Repeating the same `Idempotency-Key`, body, and version
-        returns the original body, status, and ETag without another mutation.
-      security:
-        - humanBearer: []
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-        - $ref: '#/components/parameters/IfMatch'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/BooleanControl'
-      responses:
-        '200':
-          description: Updated control state.
-          headers:
-            ETag:
-              $ref: '#/components/headers/ETag'
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/BooleanControlEnvelope'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
-        '409':
-          $ref: '#/components/responses/AdminConflict'
-        '413':
-          $ref: '#/components/responses/PayloadTooLarge'
-        '428':
-          $ref: '#/components/responses/PreconditionRequired'
-        '500':
-          $ref: '#/components/responses/InternalError'
-        '503':
-          $ref: '#/components/responses/ServiceUnavailable'
-
-  /admin/service-principals:
+  /projects/{projectKey}/admin/agents/service-principals:
+    servers:
+      - url: /api
+    parameters:
+      - $ref: '#/components/parameters/HumanProjectKey'
     post:
       tags: [Agent administration]
-      operationId: createServicePrincipalV1
+      operationId: createServicePrincipalV2
       summary: Create a service principal and initial credential
       description: |
         The returned client secret is shown once and is never stored in
         plaintext. `If-Match` is not used because this creates a new top-level
         resource. Repeating the same `Idempotency-Key` and body returns the
-        encrypted replay of the original one-time response.
+        encrypted replay of the original one-time response. The Project is
+        bound by the authorized path; the principal and its initial Project
+        grant are committed atomically, with no implicit default authorization.
       security:
         - humanBearer: []
       parameters:
@@ -970,10 +997,14 @@ paths:
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
 
-  /admin/service-principals/{principalId}/status:
+  /projects/{projectKey}/admin/agents/service-principals/{principalId}/status:
+    servers:
+      - url: /api
+    parameters:
+      - $ref: '#/components/parameters/HumanProjectKey'
     put:
       tags: [Agent administration]
-      operationId: setServicePrincipalStatusV1
+      operationId: setServicePrincipalStatusV2
       summary: Update status and safety controls for a service principal
       description: |
         Use the matching principal's `resource_version` from the administrator
@@ -1020,10 +1051,14 @@ paths:
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
 
-  /admin/service-principals/{principalId}/credentials/rotate:
+  /projects/{projectKey}/admin/agents/service-principals/{principalId}/credentials/rotate:
+    servers:
+      - url: /api
+    parameters:
+      - $ref: '#/components/parameters/HumanProjectKey'
     post:
       tags: [Agent administration]
-      operationId: rotateServicePrincipalCredentialV1
+      operationId: rotateServicePrincipalCredentialV2
       summary: Rotate a service principal credential
       description: |
         Existing active credentials are revoked after the new one is issued.
@@ -1075,10 +1110,14 @@ paths:
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
 
-  /admin/service-principals/{principalId}/credentials/{credentialId}:
+  /projects/{projectKey}/admin/agents/service-principals/{principalId}/credentials/{credentialId}:
+    servers:
+      - url: /api
+    parameters:
+      - $ref: '#/components/parameters/HumanProjectKey'
     delete:
       tags: [Agent administration]
-      operationId: revokeServicePrincipalCredentialV1
+      operationId: revokeServicePrincipalCredentialV2
       summary: Revoke one service-principal credential immediately
       description: |
         Use the parent principal's `resource_version` from the administrator
@@ -1120,10 +1159,14 @@ paths:
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
 
-  /admin/service-principals/{principalId}/policies:
+  /projects/{projectKey}/admin/agents/service-principals/{principalId}/policies:
+    servers:
+      - url: /api
+    parameters:
+      - $ref: '#/components/parameters/HumanProjectKey'
     get:
       tags: [Agent administration]
-      operationId: listServicePrincipalPoliciesV1
+      operationId: listServicePrincipalPoliciesV2
       summary: List explicit allow and deny policies
       description: Returns closed policy objects with the `resource_version` required for policy commands.
       security:
@@ -1145,7 +1188,7 @@ paths:
           $ref: '#/components/responses/InternalError'
     post:
       tags: [Agent administration]
-      operationId: createServicePrincipalPolicyV1
+      operationId: createServicePrincipalPolicyV2
       summary: Add an explicit allow or deny policy
       description: |
         Use the parent principal's `resource_version` from the administrator
@@ -1203,10 +1246,14 @@ paths:
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
 
-  /admin/service-principals/{principalId}/policies/{policyId}:
+  /projects/{projectKey}/admin/agents/service-principals/{principalId}/policies/{policyId}:
+    servers:
+      - url: /api
+    parameters:
+      - $ref: '#/components/parameters/HumanProjectKey'
     delete:
       tags: [Agent administration]
-      operationId: disableServicePrincipalPolicyV1
+      operationId: disableServicePrincipalPolicyV2
       summary: Disable an Agent policy without deleting its audit history
       description: |
         Use the matching policy's `resource_version` from the policy list as
@@ -1248,10 +1295,14 @@ paths:
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
 
-  /admin/leases/{leaseId}/force-release:
+  /projects/{projectKey}/admin/agents/leases/{leaseId}/force-release:
+    servers:
+      - url: /api
+    parameters:
+      - $ref: '#/components/parameters/HumanProjectKey'
     post:
       tags: [Agent administration]
-      operationId: forceReleaseTicketLeaseV1
+      operationId: forceReleaseTicketLeaseV2
       summary: Force release an Agent lease for administrator takeover
       description: |
         Use the lease's `resource_version` from the administrator overview as
@@ -1292,10 +1343,14 @@ paths:
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
 
-  /admin/attachments/{attachmentId}/scan:
+  /projects/{projectKey}/admin/agents/attachments/{attachmentId}/scan:
+    servers:
+      - url: /api
+    parameters:
+      - $ref: '#/components/parameters/HumanProjectKey'
     post:
       tags: [Agent administration]
-      operationId: recordAttachmentVirusScanV1
+      operationId: recordAttachmentVirusScanV2
       summary: Record a terminal attachment malware-scan result
       description: |
         Use the attachment's `resource_version` from the administrator overview
@@ -1342,10 +1397,14 @@ paths:
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
 
-  /admin/outbox/{deliveryId}/replay:
+  /projects/{projectKey}/admin/agents/outbox/{deliveryId}/replay:
+    servers:
+      - url: /api
+    parameters:
+      - $ref: '#/components/parameters/HumanProjectKey'
     post:
       tags: [Agent administration]
-      operationId: replayOutboxDeliveryV1
+      operationId: replayOutboxDeliveryV2
       summary: Requeue an Outbox delivery
       description: |
         Use the delivery's `resource_version` from the administrator overview
@@ -1396,9 +1455,11 @@ paths:
       description: |
         Accepts only `application/x-www-form-urlencoded` and supports
         `client_secret_basic` and `client_secret_post`. The requested scope
-        must be a subset of the principal's allowed scopes. The RFC 8707
+        must be a subset of both the principal's allowed scopes and its
+        project grant. `project_key` is mandatory and binds the token to one
+        authorized project. The RFC 8707
         `resource` indicator is mandatory and must exactly equal one canonical
-        protected resource: `${APP_URL}/mcp`, `${APP_URL}/api/v1`, or
+        protected resource: `${APP_URL}/mcp`, `${APP_URL}/api/v2`, or
         `${APP_URL}/a2a/v1`. The selected value becomes the JWT audience;
         tokens are rejected by the other two resources. Missing, multiple, or
         mismatched resource indicators return `invalid_target`.
@@ -1418,6 +1479,7 @@ paths:
                   grant_type: client_credentials
                   client_id: 4d24ebd5-70bf-43f8-b0d1-e140d987292f
                   client_secret: credential-id.one-time-secret
+                  project_key: OPS
                   scope: tickets:read tasks:manage
                   resource: https://chronodesk.example/mcp
               api:
@@ -1426,14 +1488,16 @@ paths:
                   grant_type: client_credentials
                   client_id: 4d24ebd5-70bf-43f8-b0d1-e140d987292f
                   client_secret: credential-id.one-time-secret
+                  project_key: OPS
                   scope: tickets:read
-                  resource: https://chronodesk.example/api/v1
+                  resource: https://chronodesk.example/api/v2
               a2a:
                 summary: Token restricted to A2A
                 value:
                   grant_type: client_credentials
                   client_id: 4d24ebd5-70bf-43f8-b0d1-e140d987292f
                   client_secret: credential-id.one-time-secret
+                  project_key: OPS
                   scope: tasks:manage tickets:read
                   resource: https://chronodesk.example/a2a/v1
       responses:
@@ -1508,7 +1572,7 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
 
-  /.well-known/oauth-protected-resource/api/v1:
+  /.well-known/oauth-protected-resource/api/v2:
     servers:
       - url: /
     get:
@@ -1613,7 +1677,8 @@ paths:
         `subscriptions/listen` instead owns a long-lived
         `text/event-stream` response whose first message is
         `notifications/subscriptions/acknowledged`. Disconnecting the POST
-        cancels that subscription; durable recovery uses `/api/v1/events`.
+        cancels that subscription; durable recovery uses the project-explicit
+        `/api/v2/projects/{projectKey}/events` endpoint.
         A listen request may contain at most 64 unique resource URIs. Active
         listen streams are bounded to 256 globally, 8 per service principal,
         and 4 per credential.
@@ -1974,17 +2039,72 @@ webhooks:
     post:
       operationId: receiveChronoDeskDomainEvent
       summary: Receive a reliably delivered ChronoDesk domain event
-      description: Consumers must deduplicate by `(source, id)` before applying side effects.
+      description: |
+        Custom Webhook consumers must authenticate the exact structured
+        CloudEvent body before applying side effects. Compute
+        `HMAC-SHA256(secret, timestamp + "." + exact_raw_body)`, compare the
+        lowercase hexadecimal `v1=` signature in constant time, and reject
+        timestamps outside the consumer's replay window. Consumers must also
+        deduplicate by `(source, id)` or the stable `Idempotency-Key`.
       security:
         - webhookHmac: []
       parameters:
+        - name: X-ChronoDesk-Timestamp
+          in: header
+          required: true
+          description: |
+            Decimal Unix time in seconds included in the signed input.
+            Consumers should reject values outside their configured replay
+            window before accepting the event.
+          schema:
+            type: string
+            pattern: '^[0-9]{10,}$'
         - name: X-ChronoDesk-Signature
           in: header
           required: true
-          description: HMAC signature over the exact request body.
+          description: |
+            `v1=` followed by the lowercase hexadecimal HMAC-SHA256 of
+            `timestamp + "." + exact_raw_body`, using the custom Webhook
+            secret.
+          schema:
+            type: string
+            pattern: '^v1=[a-f0-9]{64}$'
+        - name: X-ChronoDesk-Signature-Previous
+          in: header
+          required: false
+          description: |
+            During an approved dual-key rotation window, ChronoDesk also
+            signs the identical timestamp and raw body with the previous key.
+            Consumers may accept either valid signature until the overlap
+            expires; new integrations should prefer the primary signature.
+          schema:
+            type: string
+            pattern: '^v1=[a-f0-9]{64}$'
+        - name: X-CloudEvents-ID
+          in: header
+          required: true
+          description: CloudEvent ID; must exactly match the structured body `id`.
           schema:
             type: string
             minLength: 1
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: |
+            Stable identifier for this event and custom Webhook destination.
+            Retries of the same delivery reuse this value.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+        - name: X-ChronoDesk-Delivery-ID
+          in: header
+          required: true
+          description: Alias of `Idempotency-Key` for delivery tracing.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
       requestBody:
         required: true
         content:
@@ -2051,9 +2171,19 @@ components:
       type: apiKey
       in: header
       name: X-ChronoDesk-Signature
-      description: HMAC signature over the exact CloudEvent request body.
+      description: |
+        Required for custom Webhooks. The value is
+        `v1=<lowercase hex HMAC-SHA256(secret, timestamp + "." + exact_raw_body)>`,
+        where `timestamp` is the exact `X-ChronoDesk-Timestamp` header value.
 
   parameters:
+    HumanProjectKey:
+      name: projectKey
+      in: path
+      required: true
+      description: Human-authorized Project key resolved by the server.
+      schema:
+        $ref: '#/components/schemas/ProjectKey'
     TicketId:
       name: ticketId
       in: path
@@ -2296,7 +2426,7 @@ components:
       description: |
         Bearer token is missing, invalid, expired, or has the wrong audience.
         On service-principal endpoints, the challenge contains the exact
-        audience-specific `resource_metadata` URL for `/api/v1` or `/a2a/v1`;
+        audience-specific `resource_metadata` URL for `/api/v2` or `/a2a/v1`;
         human-admin endpoints use the human session challenge.
       headers:
         WWW-Authenticate:
@@ -2613,6 +2743,10 @@ components:
     TicketSource:
       type: string
       enum: [web, email, phone, chat, api, mobile, agent]
+    ConfigurationVersionID:
+      type: string
+      format: uuid
+      description: Immutable published project configuration version identifier.
     AgentContext:
       type: object
       additionalProperties: false
@@ -2648,6 +2782,8 @@ components:
         - created_at
         - updated_at
         - ticket_number
+        - request_type_version_id
+        - workflow_version_id
         - title
         - description
         - type
@@ -2675,6 +2811,10 @@ components:
         ticket_number:
           type: string
           maxLength: 50
+        request_type_version_id:
+          $ref: '#/components/schemas/ConfigurationVersionID'
+        workflow_version_id:
+          $ref: '#/components/schemas/ConfigurationVersionID'
         title:
           type: string
           maxLength: 255
@@ -2766,7 +2906,13 @@ components:
     TicketCreate:
       type: object
       additionalProperties: false
-      required: [title, description, type, priority]
+      required:
+        - title
+        - description
+        - type
+        - priority
+        - request_type_version_id
+        - workflow_version_id
       properties:
         title:
           type: string
@@ -2780,6 +2926,10 @@ components:
           $ref: '#/components/schemas/TicketType'
         priority:
           $ref: '#/components/schemas/TicketPriority'
+        request_type_version_id:
+          $ref: '#/components/schemas/ConfigurationVersionID'
+        workflow_version_id:
+          $ref: '#/components/schemas/ConfigurationVersionID'
         tags:
           type: array
           uniqueItems: true
@@ -3205,6 +3355,7 @@ components:
               required:
                 - api_version
                 - openapi
+                - asyncapi
                 - mcp_endpoint
                 - mcp_version
                 - a2a_endpoint
@@ -3216,8 +3367,11 @@ components:
               properties:
                 api_version:
                   type: string
-                  const: v1
+                  const: v2
                 openapi:
+                  type: string
+                  format: uri-reference
+                asyncapi:
                   type: string
                   format: uri-reference
                 mcp_endpoint:
@@ -3357,23 +3511,6 @@ components:
               $ref: '#/components/schemas/LeaseResult'
             receipt:
               $ref: '#/components/schemas/Receipt'
-    BooleanControl:
-      type: object
-      additionalProperties: false
-      required: [enabled]
-      properties:
-        enabled:
-          type: boolean
-    BooleanControlEnvelope:
-      allOf:
-        - $ref: '#/components/schemas/Envelope'
-        - type: object
-          required: [receipt]
-          properties:
-            data:
-              $ref: '#/components/schemas/BooleanControl'
-            receipt:
-              $ref: '#/components/schemas/Receipt'
     ServicePrincipalCreate:
       type: object
       additionalProperties: false
@@ -3405,6 +3542,11 @@ components:
         expires_at:
           type: [string, 'null']
           format: date-time
+    ProjectKey:
+      type: string
+      pattern: '^[A-Z][A-Z0-9_-]{0,31}$'
+      minLength: 1
+      maxLength: 32
     AgentScope:
       type: string
       enum:
@@ -3522,6 +3664,8 @@ components:
         expires_at:
           type: string
           format: date-time
+        project_key:
+          $ref: '#/components/schemas/ProjectKey'
     IssuedCredentialEnvelope:
       allOf:
         - $ref: '#/components/schemas/Envelope'
@@ -4183,7 +4327,7 @@ components:
     OAuthTokenRequest:
       type: object
       additionalProperties: false
-      required: [grant_type, resource]
+      required: [grant_type, project_key, resource]
       properties:
         grant_type:
           type: string
@@ -4196,21 +4340,28 @@ components:
         scope:
           type: string
           description: Space-delimited subset of the principal's allowed scopes.
+        project_key:
+          type: string
+          pattern: '^[A-Z][A-Z0-9]{1,15}$'
+          description: |
+            Exactly one authorized project key. It is persisted in the token
+            and must match Agent REST paths, MCP tool arguments, or A2A
+            metadata at execution time.
         resource:
           type: string
           format: uri
           description: |
             RFC 8707 resource indicator. It must exactly equal one of
-            `${APP_URL}/mcp`, `${APP_URL}/api/v1`, or `${APP_URL}/a2a/v1`.
+            `${APP_URL}/mcp`, `${APP_URL}/api/v2`, or `${APP_URL}/a2a/v1`.
             The resulting token is valid only at that resource.
           examples:
             - https://chronodesk.example/mcp
-            - https://chronodesk.example/api/v1
+            - https://chronodesk.example/api/v2
             - https://chronodesk.example/a2a/v1
     OAuthTokenResponse:
       type: object
       additionalProperties: false
-      required: [access_token, token_type, expires_in, scope, resource]
+      required: [access_token, token_type, expires_in, scope, resource, project_key]
       properties:
         access_token:
           type: string
@@ -4228,6 +4379,9 @@ components:
         resource:
           type: string
           format: uri
+        project_key:
+          type: string
+          pattern: '^[A-Z][A-Z0-9]{1,15}$'
     OAuthError:
       type: object
       additionalProperties: false
@@ -4274,6 +4428,7 @@ components:
         - token_endpoint_auth_methods_supported
         - scopes_supported
         - response_types_supported
+        - project_key_parameter_supported
       properties:
         issuer:
           type: string
@@ -4306,6 +4461,10 @@ components:
           type: boolean
           const: false
           description: No authorization endpoint or authorization response is exposed.
+        project_key_parameter_supported:
+          type: boolean
+          const: true
+          description: Every client-credentials token request binds exactly one project key.
     MCP20260728Request:
       type: object
       additionalProperties: false

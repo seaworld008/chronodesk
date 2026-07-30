@@ -32,9 +32,40 @@ var (
 	ErrContentTypeNotSupported        = errors.New("a2a content type is not supported")
 	ErrStreamQuotaExceeded            = errors.New("a2a stream quota exceeded")
 	ErrStreamControlUnavailable       = errors.New("a2a stream resource control is unavailable")
+	ErrProjectBindingRequired         = errors.New("trusted A2A project binding is required")
+	ErrProjectScopeMismatch           = errors.New("A2A project metadata does not match authenticated project")
 )
 
 const DefaultExecutionClaimTTL = 30 * time.Second
+
+// ValidateSendMessageProjectBinding enforces the only project assertion
+// accepted on the A2A 1.0 wire. The trusted binding comes from OAuth plus a
+// live Project grant; tenant and every other client field remain untrusted
+// data and cannot select a persistence scope.
+func ValidateSendMessageProjectBinding(
+	ctx context.Context,
+	params SendMessageParams,
+) error {
+	binding, ok := ProjectBindingFromContext(ctx)
+	if !ok {
+		return ErrProjectBindingRequired
+	}
+	rawProjectKey, exists := params.Metadata[MetadataProjectKey]
+	if !exists {
+		return fmt.Errorf("%w: metadata[%q] is required", ErrProjectBindingRequired, MetadataProjectKey)
+	}
+	projectKey, stringValue := rawProjectKey.(string)
+	if !stringValue || projectKey != binding.ProjectKey {
+		return ErrProjectScopeMismatch
+	}
+	if rawMessageProjectKey, messageHasProjectKey := params.Message.Metadata[MetadataProjectKey]; messageHasProjectKey {
+		messageProjectKey, messageStringValue := rawMessageProjectKey.(string)
+		if !messageStringValue || messageProjectKey != binding.ProjectKey {
+			return ErrProjectScopeMismatch
+		}
+	}
+	return nil
+}
 
 // Backend is the only domain execution dependency of the protocol server.
 // Implementations bridge skills to ChronoDesk services and report structured

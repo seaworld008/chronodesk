@@ -31,7 +31,8 @@ class TestQuickReplies:
         created_id: int | None = None
         try:
             create_resp = admin_api.post_json(
-                "/admin/automation/quick-replies", quick_reply_payload
+                admin_api.project_path("admin/automation/quick-replies"),
+                quick_reply_payload,
             )
             assert create_resp.status_code == 201, create_resp.text
             create_body = create_resp.json()
@@ -41,7 +42,7 @@ class TestQuickReplies:
             assert created_id, "快速回复创建未返回 ID"
 
             list_resp = admin_api.get_json(
-                "/admin/automation/quick-replies",
+                admin_api.project_path("admin/automation/quick-replies"),
                 params={"page_size": 50, "is_public": True},
             )
             assert list_resp.status_code == 200, list_resp.text
@@ -51,7 +52,9 @@ class TestQuickReplies:
             assert any(reply.get("id") == created_id for reply in replies)
 
             use_resp = admin_api.post_json(
-                f"/admin/automation/quick-replies/{created_id}/use",
+                admin_api.project_path(
+                    f"admin/automation/quick-replies/{created_id}/use"
+                ),
                 {},
             )
             assert use_resp.status_code == 200, use_resp.text
@@ -60,7 +63,9 @@ class TestQuickReplies:
         finally:
             if created_id is not None:
                 delete_resp = admin_api.delete(
-                    f"/admin/automation/quick-replies/{created_id}"
+                    admin_api.project_path(
+                        f"admin/automation/quick-replies/{created_id}"
+                    )
                 )
                 if delete_resp.status_code == 200:
                     delete_body = delete_resp.json()

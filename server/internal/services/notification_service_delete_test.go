@@ -1,7 +1,6 @@
 package services
 
 import (
-	"context"
 	"testing"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
@@ -25,19 +24,26 @@ func TestDeleteNotification(t *testing.T) {
 	}
 
 	notification := models.Notification{
-		Type:        models.NotificationTypeSystemAlert,
-		Title:       "E2E-通知删除",
-		Content:     "E2E-通知删除",
-		Priority:    models.NotificationPriorityNormal,
-		Channel:     models.NotificationChannelInApp,
-		RecipientID: user.ID,
+		OrganizationID: 1,
+		ProjectID:      1,
+		Type:           models.NotificationTypeSystemAlert,
+		Title:          "E2E-通知删除",
+		Content:        "E2E-通知删除",
+		Priority:       models.NotificationPriorityNormal,
+		Channel:        models.NotificationChannelInApp,
+		RecipientID:    user.ID,
 	}
 	if err := db.Create(&notification).Error; err != nil {
 		t.Fatalf("create notification: %v", err)
 	}
 
 	service := NewNotificationServiceWithProtector(db, nil)
-	if err := service.DeleteNotification(context.Background(), notification.ID); err != nil {
+	ctx := notificationTestOperationContext(
+		t,
+		models.ProjectScope{OrganizationID: 1, ProjectID: 1},
+		models.HumanActor(user.ID),
+	)
+	if err := service.DeleteNotification(ctx, notification.ID); err != nil {
 		t.Fatalf("delete notification: %v", err)
 	}
 

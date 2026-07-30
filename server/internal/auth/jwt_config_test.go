@@ -68,7 +68,7 @@ func TestNewSimpleJWTManagerFailsClosedOnInvalidTrustConfig(t *testing.T) {
 		{
 			name: "wrong audience",
 			mutate: func(config *JWTManagerConfig) {
-				config.Audience = config.Issuer + "/api/v1"
+				config.Audience = config.Issuer + "/api/v2"
 			},
 			wantErr: "audience must exactly match",
 		},

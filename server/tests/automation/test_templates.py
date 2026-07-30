@@ -49,7 +49,8 @@ class TestTemplates:
         created_id: int | None = None
         try:
             create_resp = admin_api.post_json(
-                "/admin/automation/templates", template_payload
+                admin_api.project_path("admin/automation/templates"),
+                template_payload,
             )
             assert create_resp.status_code == 201, create_resp.text
             create_body = create_resp.json()
@@ -59,7 +60,7 @@ class TestTemplates:
             assert created_id, "模板创建未返回 ID"
 
             list_resp = admin_api.get_json(
-                "/admin/automation/templates",
+                admin_api.project_path("admin/automation/templates"),
                 params={"page_size": 50},
             )
             assert list_resp.status_code == 200, list_resp.text
@@ -69,7 +70,7 @@ class TestTemplates:
             assert any(tpl.get("id") == created_id for tpl in templates)
 
             detail_resp = admin_api.get_json(
-                f"/admin/automation/templates/{created_id}"
+                admin_api.project_path(f"admin/automation/templates/{created_id}")
             )
             assert detail_resp.status_code == 200, detail_resp.text
             detail_body = detail_resp.json()
@@ -79,7 +80,7 @@ class TestTemplates:
         finally:
             if created_id is not None:
                 delete_resp = admin_api.delete(
-                    f"/admin/automation/templates/{created_id}"
+                    admin_api.project_path(f"admin/automation/templates/{created_id}")
                 )
                 if delete_resp.status_code == 200:
                     delete_body = delete_resp.json()

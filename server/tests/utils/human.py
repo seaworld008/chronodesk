@@ -16,6 +16,12 @@ from .safety import (
 )
 
 HUMAN_ROLES = ("admin", "supervisor", "agent", "customer")
+PROJECT_ROLE_BY_HUMAN_ROLE = {
+    "admin": "project_admin",
+    "supervisor": "manager",
+    "agent": "agent",
+    "customer": "requester",
+}
 
 
 def strong_password() -> str:
@@ -48,11 +54,21 @@ class E2EResourceManager:
     """Create and precisely clean resources owned by one black-box run."""
 
     def __init__(
-        self, api_client: APIClient, admin_api: APIClient, run_id: str
+        self,
+        api_client: APIClient,
+        admin_api: APIClient,
+        run_id: str,
+        project_key: str,
     ) -> None:
+        if (
+            api_client.project_key != project_key
+            or admin_api.project_key != project_key
+        ):
+            raise AssertionError("E2E 资源管理器要求统一的显式项目绑定")
         self.api_client = api_client
         self.admin_api = admin_api
         self.run_id = run_id
+        self.project_key = project_key
         self.prefix = f"E2E-{run_id}-"
         # Usernames are capped at 50 characters.  Keeping an arbitrarily long
         # ownership prefix at the front used to truncate both the role label and
@@ -61,12 +77,16 @@ class E2EResourceManager:
         # per-identity label and a cryptographically random suffix.
         self._user_run_token = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:12]
         self._users: list[tuple[int, str]] = []
+        self._memberships: list[int] = []
         self._tickets: list[tuple[int, str]] = []
         self._notifications: list[int] = []
         self._clients: list[APIClient] = []
 
     def unique(self, label: str) -> str:
         return f"{self.prefix}{label}-{time.time_ns()}-{secrets.token_hex(2)}"
+
+    def project_path(self, suffix: str) -> str:
+        return self.admin_api.project_path(suffix)
 
     def create_user(self, role: str, label: str) -> HumanIdentity:
         assert role in HUMAN_ROLES, f"unsupported Human role {role!r}"
@@ -127,6 +147,22 @@ class E2EResourceManager:
         assert created.get("role") == role, safe_diagnostic(body)
         self._users.append((user_id, username))
 
+        membership = self.admin_api.post_json(
+            self.project_path("memberships"),
+            {
+                "user_id": user_id,
+                "role": PROJECT_ROLE_BY_HUMAN_ROLE[role],
+            },
+        )
+        assert membership.status_code == 200, response_diagnostic(membership)
+        self._memberships.append(user_id)
+        granted = membership.json().get("data")
+        assert isinstance(granted, dict), response_diagnostic(membership)
+        assert granted.get("user_id") == user_id, safe_diagnostic(granted)
+        assert granted.get("role") == PROJECT_ROLE_BY_HUMAN_ROLE[role], safe_diagnostic(
+            granted
+        )
+
         verification = self.admin_api.put_json(
             f"/admin/users/{user_id}",
             {
@@ -169,7 +205,10 @@ class E2EResourceManager:
             "source": "api",
         }
         payload.update(overrides)
-        response = identity.api.post_json("/tickets", payload)
+        response = identity.api.post_json(
+            identity.api.project_path("tickets"),
+            payload,
+        )
         assert response.status_code == 201, response_diagnostic(response)
         body = response.json()
         assert body.get("code") == 0, safe_diagnostic(body)
@@ -209,7 +248,7 @@ class E2EResourceManager:
     ) -> dict[str, Any]:
         title = self.unique(f"{label}-notification")
         response = self.admin_api.post_json(
-            "/admin/notifications",
+            self.project_path("notifications"),
             {
                 "type": "system_alert",
                 "title": title,
@@ -233,7 +272,9 @@ class E2EResourceManager:
         errors: list[str] = []
 
         for ticket_id, expected_title in reversed(self._tickets):
-            detail = self.admin_api.get_json(f"/tickets/{ticket_id}")
+            detail = self.admin_api.get_json(
+                self.admin_api.project_path(f"tickets/{ticket_id}")
+            )
             if detail.status_code == 404:
                 continue
             if detail.status_code != 200:
@@ -268,7 +309,9 @@ class E2EResourceManager:
                 )
 
         for notification_id in reversed(self._notifications):
-            deleted = self.admin_api.delete(f"/admin/notifications/{notification_id}")
+            deleted = self.admin_api.delete(
+                self.project_path(f"notifications/{notification_id}")
+            )
             if deleted.status_code not in (200, 204, 404):
                 errors.append(
                     f"delete notification {notification_id}: "
@@ -277,6 +320,16 @@ class E2EResourceManager:
 
         for client in self._clients:
             client.close()
+
+        for user_id in reversed(self._memberships):
+            membership = self.admin_api.delete(
+                self.project_path(f"memberships/{user_id}")
+            )
+            if membership.status_code not in (200, 204, 404):
+                errors.append(
+                    f"revoke project membership for user {user_id}: "
+                    f"{response_diagnostic(membership)}"
+                )
 
         for user_id, expected_username in reversed(self._users):
             detail = self.admin_api.get_json(f"/admin/users/{user_id}")

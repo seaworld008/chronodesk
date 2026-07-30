@@ -83,9 +83,10 @@ func TestCreateAutomationRuleDefaultsToInactive(t *testing.T) {
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatalf("create author: %v", err)
 	}
+	ctx := testProjectOperationContext(t, db, models.HumanActor(user.ID))
 
 	rule, err := NewAutomationService(db).CreateRule(
-		context.Background(),
+		ctx,
 		&models.AutomationRuleRequest{
 			Name:         "safe inactive rule",
 			RuleType:     "assignment",
@@ -151,8 +152,9 @@ func TestDeleteAutomationRuleRetainsExecutionAuditLog(t *testing.T) {
 	if err := db.Create(&execution).Error; err != nil {
 		t.Fatal(err)
 	}
+	ctx := testProjectOperationContext(t, db, models.HumanActor(user.ID))
 
-	if err := NewAutomationService(db).DeleteRule(context.Background(), rule.ID); err != nil {
+	if err := NewAutomationService(db).DeleteRule(ctx, rule.ID); err != nil {
 		t.Fatalf("DeleteRule() error = %v", err)
 	}
 	var visibleRules int64
@@ -198,9 +200,10 @@ func TestAutomationRuleWritesRequireCurrentCloudEventTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := NewAutomationService(db)
+	ctx := testProjectOperationContext(t, db, models.HumanActor(user.ID))
 
 	if _, err := service.CreateRule(
-		context.Background(),
+		ctx,
 		&models.AutomationRuleRequest{
 			Name:         "legacy trigger",
 			RuleType:     "assignment",
@@ -212,7 +215,7 @@ func TestAutomationRuleWritesRequireCurrentCloudEventTypes(t *testing.T) {
 	}
 
 	rule, err := service.CreateRule(
-		context.Background(),
+		ctx,
 		&models.AutomationRuleRequest{
 			Name:         "current trigger",
 			RuleType:     "assignment",
@@ -224,7 +227,7 @@ func TestAutomationRuleWritesRequireCurrentCloudEventTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := service.UpdateRule(
-		context.Background(),
+		ctx,
 		rule.ID,
 		&models.AutomationRuleRequest{
 			Name:         rule.Name,
@@ -236,7 +239,7 @@ func TestAutomationRuleWritesRequireCurrentCloudEventTypes(t *testing.T) {
 		t.Fatalf("legacy update error = %v, want invalid trigger type", err)
 	}
 	if err := service.UpdateRule(
-		context.Background(),
+		ctx,
 		rule.ID,
 		&models.AutomationRuleRequest{
 			Name:         rule.Name,
@@ -306,9 +309,17 @@ func TestClassifyTicketPersistsCanonicalType(t *testing.T) {
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatalf("failed to create ticket: %v", err)
 	}
+	ctx := testProjectOperationContext(
+		t,
+		db,
+		models.SystemActor(automationActorID),
+	)
+	if err := db.First(&ticket, ticket.ID).Error; err != nil {
+		t.Fatalf("reload project-scoped ticket: %v", err)
+	}
 
 	svc := NewAutomationService(db)
-	if err := svc.ClassifyTicket(context.Background(), &ticket); err != nil {
+	if err := svc.ClassifyTicket(ctx, &ticket); err != nil {
 		t.Fatalf("ClassifyTicket returned error: %v", err)
 	}
 
@@ -341,7 +352,11 @@ func TestAutomationServiceGetRulesFilters(t *testing.T) {
 	db := setupAutomationServiceTestDB(t)
 	svc := NewAutomationService(db)
 
-	ctx := context.Background()
+	ctx := testProjectOperationContext(
+		t,
+		db,
+		models.SystemActor(automationActorID),
+	)
 
 	// filter by rule type
 	rules, total, err := svc.GetRules(ctx, "assignment", "", nil, "", 1, 10)
@@ -386,5 +401,172 @@ func TestAutomationServiceGetRulesFilters(t *testing.T) {
 	}
 	if total != 1 || len(rules) != 1 {
 		t.Fatalf("expected search to match 1 rule, got total=%d len=%d", total, len(rules))
+	}
+}
+
+func TestAutomationAndSLAResourcesAreStrictlyProjectScoped(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.AutomationRule{},
+		&models.AutomationLog{},
+		&models.SLAConfig{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	user := models.User{
+		Username:     "automation-project-owner",
+		Email:        "automation-project-owner@example.com",
+		PasswordHash: "hashed",
+		Role:         models.RoleAdmin,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	projectAContext := testProjectOperationContext(
+		t,
+		db,
+		models.HumanActor(user.ID),
+	)
+	projectAOperation, err := OperationContextFromContext(projectAContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectB := createAdditionalWorkerTestProject(
+		t,
+		db,
+		projectAOperation.Scope.OrganizationID,
+		models.ProjectKey("AUTOMATION-ISOLATION-B"),
+	)
+	projectBContext, err := WithOperationContext(
+		context.Background(),
+		OperationContext{
+			Scope:  projectB.Scope(),
+			Actor:  models.HumanActor(user.ID),
+			Source: SourceProtocolHumanREST,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	service := NewAutomationService(db)
+	active := true
+	ruleA, err := service.CreateRule(
+		projectAContext,
+		&models.AutomationRuleRequest{
+			Name:         "project A rule",
+			RuleType:     "assignment",
+			TriggerEvent: eventcontract.TicketCreatedEventType,
+			IsActive:     &active,
+		},
+		user.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ruleB, err := service.CreateRule(
+		projectBContext,
+		&models.AutomationRuleRequest{
+			Name:         "project B rule",
+			RuleType:     "assignment",
+			TriggerEvent: eventcontract.TicketCreatedEventType,
+			IsActive:     &active,
+		},
+		user.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ruleA.ProjectID == ruleB.ProjectID ||
+		ruleA.ProjectID != projectAOperation.Scope.ProjectID ||
+		ruleB.ProjectID != projectB.ID {
+		t.Fatalf("rules were not assigned to distinct trusted scopes: A=%+v B=%+v", ruleA, ruleB)
+	}
+	rulesA, totalA, err := service.GetRules(
+		projectAContext,
+		"",
+		"",
+		nil,
+		"",
+		1,
+		20,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totalA != 1 || len(rulesA) != 1 || rulesA[0].ID != ruleA.ID {
+		t.Fatalf("project A rule list leaked scope: total=%d rules=%+v", totalA, rulesA)
+	}
+	if _, err := service.GetRuleByID(
+		projectAContext,
+		ruleB.ID,
+	); err == nil {
+		t.Fatal("project A loaded project B automation rule")
+	}
+	if _, _, err := service.GetRules(
+		context.Background(),
+		"",
+		"",
+		nil,
+		"",
+		1,
+		20,
+	); err == nil {
+		t.Fatal("unscoped automation rule list unexpectedly succeeded")
+	}
+
+	slaA, err := service.CreateSLAConfig(
+		projectAContext,
+		&models.SLAConfigRequest{
+			Name:           "project A SLA",
+			IsDefault:      &active,
+			ResponseTime:   60,
+			ResolutionTime: 120,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slaB, err := service.CreateSLAConfig(
+		projectBContext,
+		&models.SLAConfigRequest{
+			Name:           "project B SLA",
+			IsDefault:      &active,
+			ResponseTime:   5,
+			ResolutionTime: 10,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticketA := &models.Ticket{
+		ID:             1,
+		OrganizationID: projectAOperation.Scope.OrganizationID,
+		ProjectID:      projectAOperation.Scope.ProjectID,
+		Type:           models.TicketTypeRequest,
+		Priority:       models.TicketPriorityNormal,
+		Status:         models.TicketStatusOpen,
+		CreatedAt:      time.Now(),
+	}
+	selected, err := service.GetSLAConfigForTicket(projectAContext, ticketA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != slaA.ID || selected.ID == slaB.ID {
+		t.Fatalf("project A selected cross-project SLA: selected=%+v A=%+v B=%+v", selected, slaA, slaB)
+	}
+	if _, err := service.GetSLAConfigForTicket(
+		projectBContext,
+		ticketA,
+	); err == nil {
+		t.Fatal("project B context evaluated a project A ticket")
+	}
+	if _, err := service.GetSLAConfigForTicket(
+		context.Background(),
+		ticketA,
+	); err == nil {
+		t.Fatal("unscoped SLA selection unexpectedly succeeded")
 	}
 }

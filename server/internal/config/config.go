@@ -1,8 +1,12 @@
 package config
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"strconv"
@@ -15,15 +19,18 @@ import (
 
 // Config 应用配置结构
 type Config struct {
-	Server    ServerConfig    `json:"server"`
-	Database  DatabaseConfig  `json:"database"`
-	Redis     RedisConfig     `json:"redis"`
-	JWT       JWTConfig       `json:"jwt"`
-	Security  SecurityConfig  `json:"security"`
-	App       AppConfig       `json:"app"`
-	CORS      CORSConfig      `json:"cors"`
-	RateLimit RateLimitConfig `json:"rate_limit"`
-	Agent     AgentConfig     `json:"agent"`
+	Server        ServerConfig        `json:"server"`
+	Database      DatabaseConfig      `json:"database"`
+	Redis         RedisConfig         `json:"redis"`
+	JWT           JWTConfig           `json:"jwt"`
+	Security      SecurityConfig      `json:"security"`
+	App           AppConfig           `json:"app"`
+	CORS          CORSConfig          `json:"cors"`
+	RateLimit     RateLimitConfig     `json:"rate_limit"`
+	Agent         AgentConfig         `json:"agent"`
+	Knowledge     KnowledgeConfig     `json:"knowledge"`
+	Observability ObservabilityConfig `json:"observability"`
+	Integration   IntegrationConfig   `json:"integration"`
 }
 
 // ServerConfig 服务器配置
@@ -36,6 +43,8 @@ type ServerConfig struct {
 
 // DatabaseConfig 数据库配置
 type DatabaseConfig struct {
+	RuntimeURL      string        `json:"-"`
+	MigrationURL    string        `json:"-"`
 	Host            string        `json:"host"`
 	Port            int           `json:"port"`
 	User            string        `json:"user"`
@@ -117,6 +126,38 @@ type AgentConfig struct {
 	GlobalReadOnly     bool          `json:"global_read_only"`
 }
 
+// KnowledgeConfig controls only deployment-owned search infrastructure.
+// Project model/provider allowlists, data-egress policy, budgets, and limits
+// remain versioned project data in PostgreSQL.
+type KnowledgeConfig struct {
+	OpenSearchURL           string `json:"opensearch_url"`
+	OpenSearchIndexPrefix   string `json:"opensearch_index_prefix"`
+	OpenSearchPipeline      string `json:"opensearch_pipeline"`
+	OpenSearchVectorSize    int    `json:"opensearch_vector_size"`
+	OpenSearchAllowInsecure bool   `json:"opensearch_allow_insecure"`
+	ModelGatewayURL         string `json:"model_gateway_url"`
+	ModelGatewayProviderKey string `json:"model_gateway_provider_key"`
+	ModelGatewayExternal    bool   `json:"model_gateway_external"`
+}
+
+type ObservabilityConfig struct {
+	OTLPHTTPEndpoint   string            `json:"otlp_http_endpoint"`
+	OTLPHeaders        map[string]string `json:"-"`
+	AllowInsecureHTTP  bool              `json:"allow_insecure_http"`
+	TraceSamplingRatio float64           `json:"trace_sampling_ratio"`
+	MetricsEnabled     bool              `json:"metrics_enabled"`
+	MetricsBearerToken string            `json:"-"`
+}
+
+type IntegrationConfig struct {
+	HMACKeys map[string]IntegrationHMACKeyConfig `json:"-"`
+}
+
+type IntegrationHMACKeyConfig struct {
+	Current  []byte
+	Previous []byte
+}
+
 // Load 加载配置
 func Load() (*Config, error) {
 	// 使用与迁移和维护命令一致的 dotenv 解析器，正确处理引号、转义和
@@ -130,6 +171,25 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	traceSamplingRatio, err := getEnvAsStrictFloat64(
+		"OTEL_TRACE_SAMPLING_RATIO",
+		0.1,
+	)
+	if err != nil {
+		return nil, err
+	}
+	otlpHeaders, err := getEnvAsStrictStringMap(
+		"CHRONODESK_OTLP_HEADERS_JSON",
+	)
+	if err != nil {
+		return nil, err
+	}
+	integrationHMACKeys, err := getEnvAsIntegrationHMACKeys(
+		"CHRONODESK_INTEGRATION_HMAC_KEYS_JSON",
+	)
+	if err != nil {
+		return nil, err
+	}
 	config := &Config{
 		Server: ServerConfig{
 			Port:           getEnv("PORT", "8081"),
@@ -138,10 +198,15 @@ func Load() (*Config, error) {
 			TrustedProxies: getEnvAsSlice("TRUSTED_PROXIES", []string{}),
 		},
 		Database: DatabaseConfig{
+			RuntimeURL: getEnv(
+				"DATABASE_RUNTIME_URL",
+				"postgres://chronodesk_runtime:chronodesk_runtime_dev_only@localhost:5432/chronodesk?sslmode=disable",
+			),
+			MigrationURL:    getEnv("DATABASE_MIGRATION_URL", ""),
 			Host:            getEnv("DB_HOST", "localhost"),
 			Port:            getEnvAsInt("DB_PORT", 5432),
-			User:            getEnv("DB_USER", "chronodesk"),
-			Password:        getEnv("DB_PASSWORD", "chronodesk_dev_only"),
+			User:            getEnv("DB_USER", "chronodesk_runtime"),
+			Password:        getEnv("DB_PASSWORD", "chronodesk_runtime_dev_only"),
 			Name:            getEnv("DB_NAME", "chronodesk"),
 			SSLMode:         getEnv("DB_SSLMODE", "disable"),
 			Timezone:        getEnv("DB_TIMEZONE", "Asia/Shanghai"),
@@ -191,6 +256,10 @@ func Load() (*Config, error) {
 				"MCP-Protocol-Version",
 				"Mcp-Method",
 				"Mcp-Name",
+				"traceparent",
+				"tracestate",
+				"baggage",
+				"X-Correlation-ID",
 			}),
 		},
 		RateLimit: RateLimitConfig{
@@ -208,7 +277,7 @@ func Load() (*Config, error) {
 			// origin. They are intentionally not independently configurable:
 			// MCP, REST, and A2A tokens must never share an audience.
 			MCPResourceURL:     appURL + "/mcp",
-			APIResourceURL:     appURL + "/api/v1",
+			APIResourceURL:     appURL + "/api/v2",
 			A2AResourceURL:     appURL + "/a2a/v1",
 			TokenTTL:           getEnvAsDuration("AGENT_TOKEN_TTL", 15*time.Minute),
 			CredentialTTL:      getEnvAsDuration("AGENT_CREDENTIAL_TTL", 90*24*time.Hour),
@@ -218,6 +287,31 @@ func Load() (*Config, error) {
 			LoopWindow:         getEnvAsDuration("AGENT_LOOP_WINDOW", time.Minute),
 			GlobalReadOnly:     getEnvAsBool("AGENT_GLOBAL_READ_ONLY", false),
 		},
+		Knowledge: KnowledgeConfig{
+			OpenSearchURL:           getEnv("OPENSEARCH_URL", ""),
+			OpenSearchIndexPrefix:   getEnv("OPENSEARCH_INDEX_PREFIX", "chronodesk-knowledge"),
+			OpenSearchPipeline:      getEnv("OPENSEARCH_SEARCH_PIPELINE", "chronodesk-knowledge-hybrid"),
+			OpenSearchVectorSize:    getEnvAsInt("OPENSEARCH_VECTOR_DIMENSION", 384),
+			OpenSearchAllowInsecure: getEnvAsBool("OPENSEARCH_ALLOW_INSECURE", false),
+			ModelGatewayURL:         getEnv("MODEL_GATEWAY_URL", ""),
+			ModelGatewayProviderKey: getEnv("MODEL_GATEWAY_PROVIDER_KEY", "default"),
+			ModelGatewayExternal:    getEnvAsBool("MODEL_GATEWAY_EXTERNAL", true),
+		},
+		Observability: ObservabilityConfig{
+			OTLPHTTPEndpoint: getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+			OTLPHeaders:      otlpHeaders,
+			AllowInsecureHTTP: getEnvAsBool(
+				"OTEL_EXPORTER_OTLP_ALLOW_INSECURE",
+				false,
+			),
+			TraceSamplingRatio: traceSamplingRatio,
+			MetricsEnabled:     getEnvAsBool("METRICS_ENABLED", true),
+			MetricsBearerToken: getEnv(
+				"CHRONODESK_METRICS_BEARER_TOKEN",
+				"",
+			),
+		},
+		Integration: IntegrationConfig{HMACKeys: integrationHMACKeys},
 	}
 
 	// 验证配置
@@ -300,6 +394,37 @@ func (c *Config) Validate() error {
 	if c.Agent.LoopThreshold <= 0 || c.Agent.LoopWindow <= 0 {
 		return fmt.Errorf("agent loop threshold and window must be positive")
 	}
+	if strings.TrimSpace(c.Knowledge.OpenSearchURL) != "" &&
+		(c.Knowledge.OpenSearchVectorSize < 1 ||
+			c.Knowledge.OpenSearchVectorSize > 65535) {
+		return fmt.Errorf("OpenSearch vector dimension must be between 1 and 65535")
+	}
+	if strings.TrimSpace(c.Knowledge.OpenSearchURL) == "" &&
+		strings.TrimSpace(c.Knowledge.ModelGatewayURL) != "" {
+		return fmt.Errorf("model gateway requires an OpenSearch endpoint")
+	}
+	if strings.TrimSpace(c.Knowledge.ModelGatewayURL) != "" &&
+		strings.TrimSpace(c.Knowledge.ModelGatewayProviderKey) == "" {
+		return fmt.Errorf("model gateway provider key is required")
+	}
+	if c.Observability.TraceSamplingRatio < 0 ||
+		c.Observability.TraceSamplingRatio > 1 {
+		return fmt.Errorf(
+			"OpenTelemetry trace sampling ratio must be between zero and one",
+		)
+	}
+	if err := validateOperationalBearerToken(
+		c.Observability.MetricsBearerToken,
+	); err != nil {
+		return err
+	}
+	if c.Server.Environment == "production" &&
+		c.Observability.MetricsEnabled &&
+		c.Observability.MetricsBearerToken == "" {
+		return fmt.Errorf(
+			"production metrics require CHRONODESK_METRICS_BEARER_TOKEN",
+		)
+	}
 	if c.RateLimit.Requests <= 0 ||
 		c.RateLimit.Window <= 0 ||
 		c.RateLimit.AnonymousIdentityRequests <= 0 ||
@@ -319,12 +444,92 @@ func (c *Config) Validate() error {
 	if c.Database.Name == "" {
 		return fmt.Errorf("database name is required")
 	}
+	if err := validatePostgresDatabaseURL(
+		"DATABASE_RUNTIME_URL",
+		c.Database.RuntimeURL,
+		true,
+	); err != nil {
+		return err
+	}
+	if err := validatePostgresDatabaseURL(
+		"DATABASE_MIGRATION_URL",
+		c.Database.MigrationURL,
+		false,
+	); err != nil {
+		return err
+	}
+	if samePostgresDatabaseIdentity(
+		c.Database.RuntimeURL,
+		c.Database.MigrationURL,
+	) {
+		return fmt.Errorf(
+			"DATABASE_RUNTIME_URL and DATABASE_MIGRATION_URL must use different PostgreSQL roles",
+		)
+	}
 
 	if c.Redis.Host == "" {
 		return fmt.Errorf("redis host is required")
 	}
 
 	return nil
+}
+
+func validateOperationalBearerToken(value string) error {
+	if strings.TrimSpace(value) != value {
+		return fmt.Errorf(
+			"CHRONODESK_METRICS_BEARER_TOKEN must not contain surrounding whitespace",
+		)
+	}
+	if value != "" && len(value) < 32 {
+		return fmt.Errorf(
+			"CHRONODESK_METRICS_BEARER_TOKEN must contain at least 32 bytes",
+		)
+	}
+	return nil
+}
+
+func validatePostgresDatabaseURL(
+	name string,
+	value string,
+	required bool,
+) error {
+	if value == "" {
+		if required {
+			return fmt.Errorf("%s is required", name)
+		}
+		return nil
+	}
+	if strings.TrimSpace(value) != value {
+		return fmt.Errorf("%s must not contain surrounding whitespace", name)
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" ||
+		(parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") ||
+		parsed.User == nil || parsed.User.Username() == "" ||
+		strings.Trim(parsed.Path, "/") == "" ||
+		parsed.Fragment != "" {
+		return fmt.Errorf(
+			"%s must be a PostgreSQL URL with an explicit role, host, and database",
+			name,
+		)
+	}
+	return nil
+}
+
+func samePostgresDatabaseIdentity(runtimeURL, migrationURL string) bool {
+	if runtimeURL == "" || migrationURL == "" {
+		return false
+	}
+	runtime, runtimeErr := url.Parse(runtimeURL)
+	migration, migrationErr := url.Parse(migrationURL)
+	if runtimeErr != nil || migrationErr != nil ||
+		runtime.User == nil || migration.User == nil {
+		return false
+	}
+	return strings.EqualFold(runtime.Scheme, migration.Scheme) &&
+		strings.EqualFold(runtime.Host, migration.Host) &&
+		runtime.Path == migration.Path &&
+		runtime.User.Username() == migration.User.Username()
 }
 
 func validateHumanJWTEndpointContract(appURL, issuer, audience string) error {
@@ -353,7 +558,7 @@ func validateAgentEndpointContract(appURL, issuer, mcpResourceURL, apiResourceUR
 		path string
 	}{
 		"MCP": {got: mcpResourceURL, path: "/mcp"},
-		"API": {got: apiResourceURL, path: "/api/v1"},
+		"API": {got: apiResourceURL, path: "/api/v2"},
 		"A2A": {got: a2aResourceURL, path: "/a2a/v1"},
 	}
 	for name, resource := range expectedResources {
@@ -437,6 +642,111 @@ func getEnvAsStrictInt(key string, defaultValue int) (int, error) {
 		return 0, fmt.Errorf("%s must be an integer: %w", key, err)
 	}
 	return intValue, nil
+}
+
+func getEnvAsStrictFloat64(
+	key string,
+	defaultValue float64,
+) (float64, error) {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue, nil
+	}
+	floatValue, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a number: %w", key, err)
+	}
+	return floatValue, nil
+}
+
+func getEnvAsStrictStringMap(key string) (map[string]string, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return nil, nil
+	}
+	result := map[string]string{}
+	if err := json.Unmarshal([]byte(value), &result); err != nil {
+		return nil, fmt.Errorf("%s must be a JSON string map: %w", key, err)
+	}
+	return result, nil
+}
+
+func getEnvAsIntegrationHMACKeys(
+	key string,
+) (map[string]IntegrationHMACKeyConfig, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return map[string]IntegrationHMACKeyConfig{}, nil
+	}
+	var encoded map[string]struct {
+		Current  string `json:"current"`
+		Previous string `json:"previous,omitempty"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader([]byte(value)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&encoded); err != nil {
+		return nil, fmt.Errorf("%s must be a strict key map: %w", key, err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err == nil {
+		return nil, fmt.Errorf("%s must contain one JSON value", key)
+	} else if !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%s contains invalid trailing data: %w", key, err)
+	}
+	result := make(
+		map[string]IntegrationHMACKeyConfig,
+		len(encoded),
+	)
+	for reference, pair := range encoded {
+		if !validIntegrationKeyReference(reference) {
+			return nil, fmt.Errorf("%s contains an invalid key reference", key)
+		}
+		current, err := base64.StdEncoding.DecodeString(pair.Current)
+		if err != nil || len(current) < 32 || len(current) > 4096 {
+			return nil, fmt.Errorf(
+				"%s current key %q must be Base64 for 32-4096 bytes",
+				key,
+				reference,
+			)
+		}
+		var previous []byte
+		if pair.Previous != "" {
+			previous, err = base64.StdEncoding.DecodeString(pair.Previous)
+			if err != nil || len(previous) < 32 || len(previous) > 4096 {
+				clear(current)
+				return nil, fmt.Errorf(
+					"%s previous key %q must be Base64 for 32-4096 bytes",
+					key,
+					reference,
+				)
+			}
+		}
+		result[reference] = IntegrationHMACKeyConfig{
+			Current:  current,
+			Previous: previous,
+		}
+	}
+	return result, nil
+}
+
+func validIntegrationKeyReference(value string) bool {
+	if value == "" || len(value) > 191 || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, character := range value {
+		if character >= 'a' && character <= 'z' ||
+			character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' {
+			continue
+		}
+		switch character {
+		case '.', '_', ':', '/', '-':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func getEnvAsBool(key string, defaultValue bool) bool {

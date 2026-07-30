@@ -31,15 +31,20 @@ import (
 var mcpAdapterTestSequence atomic.Uint64
 
 type mcpAdapterFixture struct {
-	db         *gorm.DB
-	service    *services.AgentNativeService
-	manager    *agentauth.Manager
-	adapter    *MCPAdapter
-	user       models.User
-	principal  *models.ServicePrincipal
-	credential models.AgentCredential
-	token      string
-	actor      mcp.Principal
+	db                   *gorm.DB
+	service              *services.AgentNativeService
+	manager              *agentauth.Manager
+	adapter              *MCPAdapter
+	organization         models.Organization
+	project              models.Project
+	queue                models.Queue
+	requestTypeVersionID string
+	workflowVersionID    string
+	user                 models.User
+	principal            *models.ServicePrincipal
+	credential           models.AgentCredential
+	token                string
+	actor                mcp.Principal
 }
 
 func newMCPAdapterFixture(t *testing.T) *mcpAdapterFixture {
@@ -53,6 +58,13 @@ func newMCPAdapterFixture(t *testing.T) *mcpAdapterFixture {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	if err := db.AutoMigrate(
+		&models.Organization{},
+		&models.BusinessUnit{},
+		&models.Project{},
+		&models.Queue{},
+		&models.RequestTypeVersion{},
+		&models.WorkflowVersion{},
+		&models.ConfigurationRelease{},
 		&models.User{},
 		&models.Category{},
 		&models.ServicePrincipal{},
@@ -60,6 +72,7 @@ func newMCPAdapterFixture(t *testing.T) *mcpAdapterFixture {
 		&models.AgentPolicy{},
 		&models.PolicyDecision{},
 		&models.IdempotencyRecord{},
+		&models.SLAConfig{},
 		&models.Ticket{},
 		&models.TicketComment{},
 		&models.TicketAttachment{},
@@ -67,9 +80,49 @@ func newMCPAdapterFixture(t *testing.T) *mcpAdapterFixture {
 		&models.TicketLease{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
+		&models.ProjectPrincipalGrant{},
 	); err != nil {
 		t.Fatalf("migrate sqlite: %v", err)
 	}
+	organization := models.Organization{
+		Slug:   fmt.Sprintf("mcp-%d", mcpAdapterTestSequence.Load()),
+		Name:   "MCP test organization",
+		Status: models.OrganizationStatusActive,
+	}
+	if err := db.Create(&organization).Error; err != nil {
+		t.Fatalf("seed organization: %v", err)
+	}
+	businessUnit := models.BusinessUnit{
+		OrganizationID: organization.ID,
+		Key:            "support",
+		Name:           "Support",
+		Status:         models.BusinessUnitStatusActive,
+	}
+	if err := db.Create(&businessUnit).Error; err != nil {
+		t.Fatalf("seed business unit: %v", err)
+	}
+	project := models.Project{
+		OrganizationID: organization.ID,
+		BusinessUnitID: businessUnit.ID,
+		Key:            "TEST",
+		Name:           "MCP test project",
+		Status:         models.ProjectStatusActive,
+	}
+	if err := db.Create(&project).Error; err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	queue := models.Queue{
+		ProjectID: project.ID,
+		Key:       "default",
+		Name:      "Default",
+		Status:    models.QueueStatusActive,
+		IsDefault: true,
+	}
+	if err := db.Create(&queue).Error; err != nil {
+		t.Fatalf("seed default queue: %v", err)
+	}
+	requestTypeVersionID, workflowVersionID :=
+		bootstrapAgentplatformTestConfiguration(t, db, project.Scope())
 	user := models.User{
 		Username:     fmt.Sprintf("mcp-compat-%d", mcpAdapterTestSequence.Load()),
 		Email:        fmt.Sprintf("mcp-compat-%d@example.com", mcpAdapterTestSequence.Load()),
@@ -109,6 +162,20 @@ func newMCPAdapterFixture(t *testing.T) *mcpAdapterFixture {
 	if err := db.Create(&credential).Error; err != nil {
 		t.Fatalf("seed credential: %v", err)
 	}
+	encodedScopes, err := json.Marshal(scopes)
+	if err != nil {
+		t.Fatalf("encode project grant scopes: %v", err)
+	}
+	grant := models.ProjectPrincipalGrant{
+		ProjectID:          project.ID,
+		ServicePrincipalID: principal.ID,
+		Role:               models.ProjectRoleAgent,
+		Scopes:             datatypes.JSON(encodedScopes),
+		IsActive:           true,
+	}
+	if err := db.Create(&grant).Error; err != nil {
+		t.Fatalf("seed project principal grant: %v", err)
+	}
 	manager := agentauth.NewManager(
 		"mcp-adapter-test-secret",
 		"https://chronodesk.test",
@@ -122,7 +189,7 @@ func newMCPAdapterFixture(t *testing.T) *mcpAdapterFixture {
 		Name:         principal.Name,
 		Scopes:       scopes,
 		Active:       true,
-	}, scopes)
+	}, "TEST", scopes)
 	if err != nil {
 		t.Fatalf("issue access token: %v", err)
 	}
@@ -135,15 +202,20 @@ func newMCPAdapterFixture(t *testing.T) *mcpAdapterFixture {
 		t.Fatalf("Authenticate: %v", err)
 	}
 	return &mcpAdapterFixture{
-		db:         db,
-		service:    service,
-		manager:    manager,
-		adapter:    adapter,
-		user:       user,
-		principal:  principal,
-		credential: credential,
-		token:      token,
-		actor:      actor,
+		db:                   db,
+		service:              service,
+		manager:              manager,
+		adapter:              adapter,
+		organization:         organization,
+		project:              project,
+		queue:                queue,
+		requestTypeVersionID: requestTypeVersionID,
+		workflowVersionID:    workflowVersionID,
+		user:                 user,
+		principal:            principal,
+		credential:           credential,
+		token:                token,
+		actor:                actor,
 	}
 }
 
@@ -154,18 +226,23 @@ func (f *mcpAdapterFixture) seedTicket(t *testing.T, number, queue string) model
 		customFields["queue"] = queue
 	}
 	ticket := models.Ticket{
-		TicketNumber:       number,
-		Title:              "Ticket " + number,
-		Description:        "Untrusted ticket content",
-		Type:               models.TicketTypeRequest,
-		Priority:           models.TicketPriorityNormal,
-		Status:             models.TicketStatusOpen,
-		Source:             models.TicketSourceAgent,
-		Version:            1,
-		TrustLevel:         models.TicketTrustLevelUntrusted,
-		CreatedByID:        &f.user.ID,
-		CreatedByActorType: models.ActorTypeHuman,
-		CreatedByActorID:   strconv.FormatUint(uint64(f.user.ID), 10),
+		OrganizationID:       f.organization.ID,
+		ProjectID:            f.project.ID,
+		QueueID:              f.queue.ID,
+		RequestTypeVersionID: f.requestTypeVersionID,
+		WorkflowVersionID:    f.workflowVersionID,
+		TicketNumber:         number,
+		Title:                "Ticket " + number,
+		Description:          "Untrusted ticket content",
+		Type:                 models.TicketTypeRequest,
+		Priority:             models.TicketPriorityNormal,
+		Status:               models.TicketStatusOpen,
+		Source:               models.TicketSourceAgent,
+		Version:              1,
+		TrustLevel:           models.TicketTrustLevelUntrusted,
+		CreatedByID:          &f.user.ID,
+		CreatedByActorType:   models.ActorTypeHuman,
+		CreatedByActorID:     strconv.FormatUint(uint64(f.user.ID), 10),
 	}
 	if len(customFields) > 0 {
 		ticket.CustomFields = datatypes.NewJSONType(customFields)
@@ -187,6 +264,29 @@ func (f *mcpAdapterFixture) seedTicket(t *testing.T, number, queue string) model
 		t.Fatalf("seed history: %v", err)
 	}
 	return ticket
+}
+
+func (f *mcpAdapterFixture) callTool(
+	ctx context.Context,
+	name string,
+	arguments map[string]any,
+) (map[string]any, error) {
+	return f.adapter.CallTool(
+		ctx,
+		f.actor,
+		name,
+		withMCPProjectKey(arguments, string(f.project.Key)),
+	)
+}
+
+func (f *mcpAdapterFixture) authorize(
+	ctx context.Context,
+	request mcp.AuthorizationRequest,
+) error {
+	if mcpTicketTool(request.Action) {
+		request.Arguments = withMCPProjectKey(request.Arguments, string(f.project.Key))
+	}
+	return f.adapter.Authorize(ctx, f.actor, request)
 }
 
 func TestTicketAssignedActorRejectsIncompleteAndContradictoryProjections(t *testing.T) {
@@ -304,7 +404,7 @@ func TestMCPAdapterReturnsStableIntegrityErrorForLegacyAssignmentProjection(t *t
 		{name: "ticket_list", arguments: map[string]any{"search": ticket.TicketNumber}},
 	} {
 		t.Run(call.name, func(t *testing.T) {
-			_, err := fixture.adapter.CallTool(context.Background(), fixture.actor, call.name, call.arguments)
+			_, err := fixture.callTool(context.Background(), call.name, call.arguments)
 			var failure *mcp.BackendError
 			if !errors.As(err, &failure) ||
 				failure.Code != "data_integrity_error" ||
@@ -328,9 +428,13 @@ func TestMCPAdapterAuthenticationQueriesResourcesAndPolicy(t *testing.T) {
 		!fixture.actor.HasScopes(models.ScopeTicketsRead, models.ScopeTicketsUpdate) {
 		t.Fatalf("unexpected authenticated principal: %+v", fixture.actor)
 	}
-	if err := fixture.adapter.Authorize(
+	if fixture.actor.Attributes["project_key"] != string(fixture.project.Key) ||
+		fixture.actor.Attributes["organization_id"] != fixture.organization.ID ||
+		fixture.actor.Attributes["project_id"] != fixture.project.ID {
+		t.Fatalf("authenticated principal has no trusted project context: %+v", fixture.actor.Attributes)
+	}
+	if err := fixture.authorize(
 		context.Background(),
-		fixture.actor,
 		mcp.AuthorizationRequest{
 			Action:         "ticket_get",
 			RequiredScopes: []string{models.ScopeTicketsRead},
@@ -339,8 +443,20 @@ func TestMCPAdapterAuthenticationQueriesResourcesAndPolicy(t *testing.T) {
 	); err != nil {
 		t.Fatalf("Authorize read: %v", err)
 	}
+	var authorizationDecision models.PolicyDecision
+	if err := fixture.db.
+		Where("action = ? AND resource_id = ?", "ticket.read", strconv.FormatUint(uint64(first.ID), 10)).
+		Order("created_at DESC").
+		First(&authorizationDecision).Error; err != nil {
+		t.Fatalf("load authorization decision: %v", err)
+	}
+	if authorizationDecision.OrganizationID != fixture.organization.ID ||
+		authorizationDecision.ProjectID != fixture.project.ID ||
+		authorizationDecision.SourceProtocol != mcpSourceProtocol {
+		t.Fatalf("authorization did not persist trusted MCP project context: %+v", authorizationDecision)
+	}
 
-	pageOne, err := fixture.adapter.CallTool(context.Background(), fixture.actor, "ticket_list", map[string]any{
+	pageOne, err := fixture.callTool(context.Background(), "ticket_list", map[string]any{
 		"limit": int64(1),
 	})
 	if err != nil {
@@ -350,7 +466,7 @@ func TestMCPAdapterAuthenticationQueriesResourcesAndPolicy(t *testing.T) {
 	if len(items) != 1 || items[0]["id"] != second.ID || pageOne["next_cursor"] == "" {
 		t.Fatalf("unexpected first page: %#v", pageOne)
 	}
-	pageTwo, err := fixture.adapter.CallTool(context.Background(), fixture.actor, "ticket_list", map[string]any{
+	pageTwo, err := fixture.callTool(context.Background(), "ticket_list", map[string]any{
 		"limit":  int64(1),
 		"cursor": pageOne["next_cursor"],
 	})
@@ -362,7 +478,7 @@ func TestMCPAdapterAuthenticationQueriesResourcesAndPolicy(t *testing.T) {
 		t.Fatalf("unexpected second page: %#v first_time=%s second_time=%s cursor=%v", pageTwo, first.CreatedAt, second.CreatedAt, pageOne["next_cursor"])
 	}
 
-	queueResult, err := fixture.adapter.CallTool(context.Background(), fixture.actor, "ticket_list", map[string]any{
+	queueResult, err := fixture.callTool(context.Background(), "ticket_list", map[string]any{
 		"queue": "triage",
 	})
 	if err != nil {
@@ -373,7 +489,7 @@ func TestMCPAdapterAuthenticationQueriesResourcesAndPolicy(t *testing.T) {
 		t.Fatalf("queue filter result: %#v", queueResult)
 	}
 
-	getResult, err := fixture.adapter.CallTool(context.Background(), fixture.actor, "ticket_get", map[string]any{
+	getResult, err := fixture.callTool(context.Background(), "ticket_get", map[string]any{
 		"ticket_id": int64(first.ID),
 	})
 	if err != nil {
@@ -384,7 +500,7 @@ func TestMCPAdapterAuthenticationQueriesResourcesAndPolicy(t *testing.T) {
 		t.Fatalf("ticket_get result: %#v", ticket)
 	}
 
-	historyResult, err := fixture.adapter.CallTool(context.Background(), fixture.actor, "ticket_history", map[string]any{
+	historyResult, err := fixture.callTool(context.Background(), "ticket_history", map[string]any{
 		"ticket_id": int64(first.ID),
 	})
 	if err != nil {
@@ -401,9 +517,9 @@ func TestMCPAdapterAuthenticationQueriesResourcesAndPolicy(t *testing.T) {
 	}
 
 	for _, uri := range []string{
-		fmt.Sprintf("ticket://tickets/%d", first.ID),
-		"ticket://queues/triage",
-		fmt.Sprintf("ticket://tickets/%d/history", first.ID),
+		fmt.Sprintf("ticket://projects/TEST/tickets/%d", first.ID),
+		"ticket://projects/TEST/queues/triage",
+		fmt.Sprintf("ticket://projects/TEST/tickets/%d/history", first.ID),
 	} {
 		resource, err := fixture.adapter.ReadResource(context.Background(), fixture.actor, uri)
 		if err != nil {
@@ -433,12 +549,12 @@ func TestMCPAdapterAuthenticationQueriesResourcesAndPolicy(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create deny policy: %v", err)
 	}
-	if _, err := fixture.adapter.CallTool(context.Background(), fixture.actor, "ticket_get", map[string]any{
+	if _, err := fixture.callTool(context.Background(), "ticket_get", map[string]any{
 		"ticket_id": int64(first.ID),
 	}); err == nil || !strings.Contains(err.Error(), "action denied") {
 		t.Fatalf("object policy did not deny ticket_get: %v", err)
 	}
-	filtered, err := fixture.adapter.CallTool(context.Background(), fixture.actor, "ticket_list", map[string]any{})
+	filtered, err := fixture.callTool(context.Background(), "ticket_list", map[string]any{})
 	if err != nil {
 		t.Fatalf("policy-filtered list: %v", err)
 	}
@@ -458,6 +574,133 @@ func TestMCPAdapterAuthenticationQueriesResourcesAndPolicy(t *testing.T) {
 	}
 	if _, err := fixture.adapter.Revalidate(context.Background(), fixture.token); err == nil {
 		t.Fatal("Revalidate accepted revoked credential")
+	}
+}
+
+func TestMCPAdapterRejectsProjectConfusionAndFiltersForeignTickets(t *testing.T) {
+	fixture := newMCPAdapterFixture(t)
+	foreignProject := models.Project{
+		OrganizationID: fixture.organization.ID,
+		BusinessUnitID: fixture.project.BusinessUnitID,
+		Key:            "OTHER",
+		Name:           "Foreign project",
+		Status:         models.ProjectStatusActive,
+	}
+	if err := fixture.db.Create(&foreignProject).Error; err != nil {
+		t.Fatalf("seed foreign project: %v", err)
+	}
+	foreignQueue := models.Queue{
+		ProjectID: foreignProject.ID,
+		Key:       "default",
+		Name:      "Default",
+		Status:    models.QueueStatusActive,
+		IsDefault: true,
+	}
+	if err := fixture.db.Create(&foreignQueue).Error; err != nil {
+		t.Fatalf("seed foreign queue: %v", err)
+	}
+	foreignTicket := models.Ticket{
+		OrganizationID:     fixture.organization.ID,
+		ProjectID:          foreignProject.ID,
+		QueueID:            foreignQueue.ID,
+		TicketNumber:       "FOREIGN-001",
+		Title:              "Foreign ticket",
+		Description:        "must not cross the project boundary",
+		Type:               models.TicketTypeRequest,
+		Priority:           models.TicketPriorityNormal,
+		Status:             models.TicketStatusOpen,
+		Source:             models.TicketSourceAgent,
+		Version:            1,
+		TrustLevel:         models.TicketTrustLevelUntrusted,
+		CreatedByID:        &fixture.user.ID,
+		CreatedByActorType: models.ActorTypeHuman,
+		CreatedByActorID:   strconv.FormatUint(uint64(fixture.user.ID), 10),
+	}
+	if err := fixture.db.Create(&foreignTicket).Error; err != nil {
+		t.Fatalf("seed foreign ticket: %v", err)
+	}
+
+	_, err := fixture.adapter.CallTool(
+		context.Background(),
+		fixture.actor,
+		"ticket_get",
+		map[string]any{"ticket_id": foreignTicket.ID},
+	)
+	var failure *mcp.BackendError
+	if !errors.As(err, &failure) ||
+		failure.Code != "invalid_params" ||
+		failure.Details["field"] != "project_key" {
+		t.Fatalf("missing project_key error = %#v, err=%v", failure, err)
+	}
+
+	_, err = fixture.adapter.CallTool(
+		context.Background(),
+		fixture.actor,
+		"ticket_get",
+		map[string]any{
+			"project_key": string(foreignProject.Key),
+			"ticket_id":   foreignTicket.ID,
+		},
+	)
+	failure = nil
+	if !errors.As(err, &failure) || failure.Code != "project_scope_mismatch" {
+		t.Fatalf("mismatched project_key error = %#v, err=%v", failure, err)
+	}
+	if err := fixture.adapter.Authorize(
+		context.Background(),
+		fixture.actor,
+		mcp.AuthorizationRequest{
+			Action:         "ticket_get",
+			RequiredScopes: []string{models.ScopeTicketsRead},
+			Arguments: map[string]any{
+				"project_key": string(foreignProject.Key),
+				"ticket_id":   foreignTicket.ID,
+			},
+		},
+	); err == nil {
+		t.Fatal("authorization accepted a project_key that differs from the token")
+	}
+
+	if _, err := fixture.callTool(
+		context.Background(),
+		"ticket_get",
+		map[string]any{"ticket_id": foreignTicket.ID},
+	); err == nil {
+		t.Fatal("foreign ticket was readable through a matching token project key")
+	}
+	if _, err := fixture.adapter.ReadResource(
+		context.Background(),
+		fixture.actor,
+		fmt.Sprintf("ticket://projects/OTHER/tickets/%d", foreignTicket.ID),
+	); err == nil {
+		t.Fatal("foreign project resource URI was accepted")
+	}
+	if _, err := fixture.adapter.ReadResource(
+		context.Background(),
+		fixture.actor,
+		fmt.Sprintf("ticket://projects/TEST/tickets/%d", foreignTicket.ID),
+	); err == nil {
+		t.Fatal("foreign ticket was readable through a forged token-project URI")
+	}
+	if allowed, err := fixture.adapter.ValidateSubscription(
+		context.Background(),
+		fixture.actor,
+		fmt.Sprintf("ticket://projects/OTHER/tickets/%d", foreignTicket.ID),
+	); err != nil || allowed {
+		t.Fatalf("foreign project subscription = (%v, %v), want denied", allowed, err)
+	}
+
+	if err := fixture.db.Model(&models.ProjectPrincipalGrant{}).
+		Where(
+			"project_id = ? AND service_principal_id = ?",
+			fixture.project.ID,
+			fixture.principal.ID,
+		).
+		Update("is_active", false).Error; err != nil {
+		t.Fatalf("revoke project grant: %v", err)
+	}
+	if _, err := fixture.adapter.Revalidate(context.Background(), fixture.token); err == nil {
+		t.Fatal("Revalidate accepted a revoked project grant")
 	}
 }
 
@@ -518,14 +761,14 @@ func TestMCPAdapterAuthorizationUsesConcreteTicketContext(t *testing.T) {
 		return mcp.AuthorizationRequest{
 			Action:         "resource:subscribe",
 			RequiredScopes: []string{models.ScopeTicketsRead, models.ScopeEventsSubscribe},
-			ResourceURI:    "ticket://tickets/" + ticketID,
+			ResourceURI:    "ticket://projects/TEST/tickets/" + ticketID,
 		}
 	}
 	var policyErr *mcp.PolicyError
-	if err := fixture.adapter.Authorize(context.Background(), fixture.actor, subscription(deniedID)); !errors.As(err, &policyErr) {
+	if err := fixture.authorize(context.Background(), subscription(deniedID)); !errors.As(err, &policyErr) {
 		t.Fatalf("expected concrete subscription policy denial, got %v", err)
 	}
-	if err := fixture.adapter.Authorize(context.Background(), fixture.actor, subscription(allowedID)); err != nil {
+	if err := fixture.authorize(context.Background(), subscription(allowedID)); err != nil {
 		t.Fatalf("unrelated ticket subscription denied: %v", err)
 	}
 
@@ -551,11 +794,11 @@ func TestMCPAdapterAuthorizationUsesConcreteTicketContext(t *testing.T) {
 			},
 		}
 	}
-	if err := fixture.adapter.Authorize(context.Background(), fixture.actor, transition(allowed.ID)); err != nil {
+	if err := fixture.authorize(context.Background(), transition(allowed.ID)); err != nil {
 		t.Fatalf("ticket-specific risky allow was not honored: %v", err)
 	}
 	policyErr = nil
-	if err := fixture.adapter.Authorize(context.Background(), fixture.actor, transition(denied.ID)); !errors.As(err, &policyErr) {
+	if err := fixture.authorize(context.Background(), transition(denied.ID)); !errors.As(err, &policyErr) {
 		t.Fatalf("expected risky transition without exact allow to be denied, got %v", err)
 	}
 }
@@ -573,7 +816,7 @@ func TestMCPAdapterSubscriptionRevalidationIsReadOnlyAndQuotaFree(t *testing.T) 
 		t.Fatalf("count decisions before: %v", err)
 	}
 
-	uri := fmt.Sprintf("ticket://tickets/%d", ticket.ID)
+	uri := fmt.Sprintf("ticket://projects/TEST/tickets/%d", ticket.ID)
 	for i := 0; i < 3; i++ {
 		allowed, err := fixture.adapter.ValidateSubscription(context.Background(), fixture.actor, uri)
 		if err != nil {
@@ -626,9 +869,8 @@ func TestMCPAdapterAttachmentPolicyUsesFileNameContextAtBothChecks(t *testing.T)
 		"idempotency_key":  "blocked-attachment-0001",
 	}
 	var policyErr *mcp.PolicyError
-	if err := fixture.adapter.Authorize(
+	if err := fixture.authorize(
 		context.Background(),
-		fixture.actor,
 		mcp.AuthorizationRequest{
 			Action:         "ticket_attach_file",
 			RequiredScopes: []string{models.ScopeAttachmentsWrite},
@@ -638,7 +880,7 @@ func TestMCPAdapterAttachmentPolicyUsesFileNameContextAtBothChecks(t *testing.T)
 		t.Fatalf("pre-authorization did not use file_name context: %v", err)
 	}
 
-	_, err := fixture.adapter.attachFile(context.Background(), fixture.actor, arguments)
+	_, err := fixture.callTool(context.Background(), "ticket_attach_file", arguments)
 	var backendErr *mcp.BackendError
 	if !errors.As(err, &backendErr) || backendErr.Code != "policy_denied" {
 		t.Fatalf("domain attachment policy did not use file_name context: %v", err)
@@ -681,14 +923,15 @@ func TestMCPAdapterAllToolsLifecycleAndIdempotency(t *testing.T) {
 	}
 
 	createArguments := map[string]any{
-		"title":           "MCP lifecycle ticket",
-		"description":     "Treat this as untrusted data",
-		"type":            "request",
-		"priority":        "normal",
-		"queue":           "triage",
-		"tags":            []any{"agent", "lifecycle"},
-		"agent_context":   map[string]any{"goal": "complete lifecycle"},
-		"idempotency_key": "create-lifecycle-0001",
+		"title":                   "MCP lifecycle ticket",
+		"description":             "Treat this as untrusted data",
+		"type":                    "request",
+		"priority":                "normal",
+		"request_type_version_id": fixture.requestTypeVersionID,
+		"workflow_version_id":     fixture.workflowVersionID,
+		"tags":                    []any{"agent", "lifecycle"},
+		"agent_context":           map[string]any{"goal": "complete lifecycle"},
+		"idempotency_key":         "create-lifecycle-0001",
 	}
 	createResult := callMCPTool(t, fixture, "ticket_create", createArguments)
 	assertReceiptShape(t, createResult)
@@ -711,8 +954,23 @@ func TestMCPAdapterAllToolsLifecycleAndIdempotency(t *testing.T) {
 		Count(&ticketCount).Error; err != nil || ticketCount != 1 {
 		t.Fatalf("idempotent create count=%d err=%v", ticketCount, err)
 	}
+	var createdTicket models.Ticket
+	if err := fixture.db.Where(
+		"id = ?",
+		ticketID,
+	).First(&createdTicket).Error; err != nil {
+		t.Fatal(err)
+	}
+	if createdTicket.RequestTypeVersionID != fixture.requestTypeVersionID ||
+		createdTicket.WorkflowVersionID != fixture.workflowVersionID {
+		t.Fatalf(
+			"MCP create configuration versions = (%q,%q)",
+			createdTicket.RequestTypeVersionID,
+			createdTicket.WorkflowVersionID,
+		)
+	}
 
-	listResult := callMCPTool(t, fixture, "ticket_list", map[string]any{"queue": "triage"})
+	listResult := callMCPTool(t, fixture, "ticket_list", map[string]any{})
 	if len(listResult["items"].([]map[string]any)) != 1 {
 		t.Fatalf("ticket_list result: %#v", listResult)
 	}
@@ -876,10 +1134,59 @@ func TestMCPAdapterAllToolsLifecycleAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestMCPAdapterTicketCreateRequiresCanonicalConfigurationVersions(
+	t *testing.T,
+) {
+	fixture := newMCPAdapterFixture(t)
+	base := map[string]any{
+		"title":           "Rejected MCP ticket",
+		"description":     "Configuration versions are mandatory.",
+		"type":            "request",
+		"priority":        "normal",
+		"idempotency_key": "mcp-version-contract-0001",
+	}
+	for _, test := range []struct {
+		name      string
+		arguments map[string]any
+	}{
+		{name: "missing", arguments: base},
+		{
+			name: "invalid UUID",
+			arguments: func() map[string]any {
+				result := cloneStringAnyMap(base)
+				result["request_type_version_id"] = "not-a-uuid"
+				result["workflow_version_id"] = "also-not-a-uuid"
+				return result
+			}(),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := fixture.callTool(
+				context.Background(),
+				"ticket_create",
+				test.arguments,
+			)
+			var backendErr *mcp.BackendError
+			if !errors.As(err, &backendErr) ||
+				backendErr.Code != "invalid_argument" {
+				t.Fatalf("error=%#v, want invalid_argument", err)
+			}
+			var count int64
+			if err := fixture.db.Model(&models.Ticket{}).
+				Count(&count).Error; err != nil {
+				t.Fatal(err)
+			}
+			if count != 0 {
+				t.Fatalf("invalid MCP intake created %d ticket(s)", count)
+			}
+		})
+	}
+}
+
 func TestMCPAdapterRejectsAttachmentHashAndConstructorMisconfiguration(t *testing.T) {
 	fixture := newMCPAdapterFixture(t)
 	ticket := fixture.seedTicket(t, "MCP-HASH-001", "default")
-	_, err := fixture.adapter.CallTool(context.Background(), fixture.actor, "ticket_attach_file", map[string]any{
+	_, err := fixture.callTool(context.Background(), "ticket_attach_file", map[string]any{
 		"ticket_id":        int64(ticket.ID),
 		"expected_version": int64(1),
 		"lease_id":         "lease-not-used-before-hash-rejection",
@@ -960,9 +1267,8 @@ func TestMCPAdapterCommentAndAttachmentRequireLeaseBeforeDomainWork(t *testing.T
 		},
 	}
 	for _, testCase := range cases {
-		_, err := fixture.adapter.CallTool(
+		_, err := fixture.callTool(
 			context.Background(),
-			fixture.actor,
 			testCase.name,
 			testCase.arguments,
 		)
@@ -1010,6 +1316,9 @@ func TestMCPAdapterListTicketsUsesBoundedPolicyBatchAndRawCursor(t *testing.T) {
 		tickets[i] = models.Ticket{
 			CreatedAt:          createdAt,
 			UpdatedAt:          createdAt,
+			OrganizationID:     fixture.organization.ID,
+			ProjectID:          fixture.project.ID,
+			QueueID:            fixture.queue.ID,
 			TicketNumber:       fmt.Sprintf("MCP-BOUNDED-%03d", i+1),
 			Title:              fmt.Sprintf("Bounded ticket %03d", i+1),
 			Description:        "Untrusted content",
@@ -1040,9 +1349,8 @@ func TestMCPAdapterListTicketsUsesBoundedPolicyBatchAndRawCursor(t *testing.T) {
 		t.Fatalf("create ticket read deny policy: %v", err)
 	}
 
-	if err := fixture.adapter.Authorize(
+	if err := fixture.authorize(
 		context.Background(),
-		fixture.actor,
 		mcp.AuthorizationRequest{
 			Action:         "ticket_list",
 			RequiredScopes: []string{models.ScopeTicketsRead},
@@ -1070,9 +1378,8 @@ func TestMCPAdapterListTicketsUsesBoundedPolicyBatchAndRawCursor(t *testing.T) {
 	); err != nil {
 		t.Fatalf("register query counter: %v", err)
 	}
-	firstPage, err := fixture.adapter.CallTool(
+	firstPage, err := fixture.callTool(
 		context.Background(),
-		fixture.actor,
 		"ticket_list",
 		map[string]any{"limit": int64(100)},
 	)
@@ -1116,9 +1423,8 @@ func TestMCPAdapterListTicketsUsesBoundedPolicyBatchAndRawCursor(t *testing.T) {
 	}
 
 	queryCount.Store(0)
-	secondPage, err := fixture.adapter.CallTool(
+	secondPage, err := fixture.callTool(
 		context.Background(),
-		fixture.actor,
 		"ticket_list",
 		map[string]any{"limit": int64(100), "cursor": firstCursor},
 	)
@@ -1238,6 +1544,7 @@ func TestMCPAdapterResultsSatisfyAdvertisedMCPOutputSchemas(t *testing.T) {
 
 	call := func(id int, name string, arguments map[string]any) map[string]any {
 		t.Helper()
+		arguments = withMCPProjectKey(arguments, string(fixture.project.Key))
 		response, payload := post(map[string]any{
 			"jsonrpc": "2.0",
 			"id":      id,
@@ -1260,11 +1567,13 @@ func TestMCPAdapterResultsSatisfyAdvertisedMCPOutputSchemas(t *testing.T) {
 	}
 
 	create := call(2, "ticket_create", map[string]any{
-		"title":           "Schema contract ticket",
-		"description":     "Untrusted",
-		"type":            "request",
-		"priority":        "normal",
-		"idempotency_key": "schema-create-0001",
+		"title":                   "Schema contract ticket",
+		"description":             "Untrusted",
+		"type":                    "request",
+		"priority":                "normal",
+		"request_type_version_id": fixture.requestTypeVersionID,
+		"workflow_version_id":     fixture.workflowVersionID,
+		"idempotency_key":         "schema-create-0001",
 	})
 	ticketID, _ := strconv.ParseUint(create["resource_id"].(string), 10, 64)
 	claim := call(3, "ticket_claim", map[string]any{
@@ -1307,10 +1616,19 @@ func callMCPTool(
 	arguments map[string]any,
 ) map[string]any {
 	t.Helper()
-	result, err := fixture.adapter.CallTool(context.Background(), fixture.actor, name, arguments)
+	result, err := fixture.callTool(context.Background(), name, arguments)
 	if err != nil {
 		t.Fatalf("%s failed: %v", name, err)
 	}
+	return result
+}
+
+func withMCPProjectKey(arguments map[string]any, projectKey string) map[string]any {
+	result := make(map[string]any, len(arguments)+1)
+	for key, value := range arguments {
+		result[key] = value
+	}
+	result["project_key"] = projectKey
 	return result
 }
 

@@ -1,7 +1,6 @@
 package services
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/url"
@@ -16,8 +15,13 @@ func TestMarkOutboxFailedNeverPersistsCallbackURLQueryOrCredential(t *testing.T)
 	db := openAgentNativeTestDB(t)
 	service := NewAgentNativeService(db, AgentNativeOptions{})
 	createOutboxResilienceEvent(t, service, 1)
+	workerCtx := testProjectOperationContext(
+		t,
+		db,
+		models.SystemActor(outboxSystemActorID),
+	)
 	claimed, err := service.ClaimPendingOutbox(
-		context.Background(),
+		workerCtx,
 		"scrub-worker",
 		1,
 		time.Minute,
@@ -35,7 +39,7 @@ func TestMarkOutboxFailedNeverPersistsCallbackURLQueryOrCredential(t *testing.T)
 		bearer,
 	)
 	if err := service.MarkOutboxFailed(
-		context.Background(),
+		workerCtx,
 		claimed[0].ID,
 		"scrub-worker",
 		deliveryErr,

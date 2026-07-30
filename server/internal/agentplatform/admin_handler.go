@@ -200,19 +200,24 @@ func (c *RuntimeControl) Run(ctx context.Context, interval time.Duration) {
 }
 
 type CredentialStore struct {
-	native *services.AgentNativeService
+	native   *services.AgentNativeService
+	projects *services.ProjectService
 }
 
-func NewCredentialStore(native *services.AgentNativeService) *CredentialStore {
-	return &CredentialStore{native: native}
+func NewCredentialStore(
+	native *services.AgentNativeService,
+	projects *services.ProjectService,
+) *CredentialStore {
+	return &CredentialStore{native: native, projects: projects}
 }
 
 func (s *CredentialStore) AuthenticateClient(
 	ctx context.Context,
 	clientID string,
 	clientSecret string,
+	projectKey string,
 ) (*agentauth.Principal, error) {
-	if s == nil || s.native == nil {
+	if s == nil || s.native == nil || s.projects == nil {
 		return nil, services.ErrInvalidCredential
 	}
 	principal, credential, err := s.native.ValidateCredentialToken(ctx, clientSecret)
@@ -222,12 +227,20 @@ func (s *CredentialStore) AuthenticateClient(
 	if clientID != principal.ID {
 		return nil, services.ErrInvalidCredential
 	}
+	projectAccess, err := s.projects.ResolvePrincipalProject(
+		ctx,
+		projectKey,
+		principal.ID,
+	)
+	if err != nil {
+		return nil, err
+	}
 	return &agentauth.Principal{
 		ID:           principal.ID,
 		CredentialID: credential.ID,
 		ClientID:     principal.ID,
 		Name:         principal.Name,
-		Scopes:       principal.ScopeList(),
+		Scopes:       intersectAgentScopes(principal.ScopeList(), projectAccess.Scopes),
 		Active:       principal.Status == models.ServicePrincipalStatusActive && !principal.EmergencyDisabled,
 		ExpiresAt:    principal.ExpiresAt,
 	}, nil
@@ -242,11 +255,44 @@ func (s *CredentialStore) ValidateAccessContext(
 	ctx context.Context,
 	principalID string,
 	credentialID string,
+	projectKey string,
+	scopes []string,
 ) error {
-	if s == nil || s.native == nil {
+	if s == nil || s.native == nil || s.projects == nil {
 		return services.ErrInvalidCredential
 	}
-	return s.native.ValidateCredentialReference(ctx, principalID, credentialID)
+	if err := s.native.ValidateCredentialReference(ctx, principalID, credentialID); err != nil {
+		return err
+	}
+	_, err := s.projects.ResolvePrincipalProject(ctx, projectKey, principalID, scopes...)
+	return err
+}
+
+func intersectAgentScopes(globalScopes, projectScopes []string) []string {
+	projectSet := make(map[string]struct{}, len(projectScopes))
+	for _, scope := range projectScopes {
+		scope = strings.TrimSpace(scope)
+		if scope != "" {
+			projectSet[scope] = struct{}{}
+		}
+	}
+	seen := make(map[string]struct{}, len(globalScopes))
+	intersection := make([]string, 0, len(globalScopes))
+	for _, scope := range globalScopes {
+		scope = strings.TrimSpace(scope)
+		if scope == "" {
+			continue
+		}
+		if _, granted := projectSet[scope]; !granted {
+			continue
+		}
+		if _, duplicate := seen[scope]; duplicate {
+			continue
+		}
+		seen[scope] = struct{}{}
+		intersection = append(intersection, scope)
+	}
+	return intersection
 }
 
 type AdminHandler struct {
@@ -282,8 +328,10 @@ func NewAdminHandler(
 func (h *AdminHandler) RegisterRoutes(group *gin.RouterGroup) {
 	group.Use(h.requireAdminCommandHeaders)
 	group.GET("/agent-control/overview", h.Overview)
-	group.PUT("/agent-control/read-only", h.SetReadOnly)
-	group.PUT("/agent-control/emergency-stop", h.SetEmergencyStop)
+	// Global read-only and emergency-stop are platform resources persisted in
+	// SystemConfig. They are intentionally read-only from this project route:
+	// a project-scoped command must never emit an unscoped 0/0 DomainEvent or
+	// disguise a platform-wide mutation as project-local.
 	group.POST("/service-principals", h.CreateServicePrincipal)
 	group.PUT("/service-principals/:id/status", h.SetServicePrincipalStatus)
 	group.POST("/service-principals/:id/credentials/rotate", h.RotateCredential)
@@ -294,6 +342,127 @@ func (h *AdminHandler) RegisterRoutes(group *gin.RouterGroup) {
 	group.POST("/leases/:id/force-release", h.ForceReleaseLease)
 	group.POST("/attachments/:id/scan", h.MarkAttachmentScan)
 	group.POST("/outbox/:id/replay", h.ReplayOutbox)
+}
+
+func (h *AdminHandler) requireProjectScope(
+	c *gin.Context,
+) (models.ProjectScope, bool) {
+	if h == nil || h.db == nil {
+		WriteProblem(
+			c,
+			http.StatusServiceUnavailable,
+			ProblemServiceUnavailable,
+			"Agent administrator project scope is unavailable",
+			true,
+		)
+		return models.ProjectScope{}, false
+	}
+	operation, err := services.OperationContextFromContext(
+		c.Request.Context(),
+	)
+	expectedActor := models.HumanActor(c.GetUint("user_id"))
+	if err != nil ||
+		operation.Actor != expectedActor ||
+		operation.Source != services.SourceProtocolHumanREST {
+		WriteProblem(
+			c,
+			http.StatusForbidden,
+			ProblemPolicyDenied,
+			"Trusted project scope is required",
+			false,
+		)
+		return models.ProjectScope{}, false
+	}
+	scope := operation.Scope
+	projectKey := strings.TrimSpace(c.Param("projectKey"))
+	var matching int64
+	if models.ValidateProjectKey(projectKey) != nil {
+		WriteProblem(
+			c,
+			http.StatusNotFound,
+			ProblemNotFound,
+			"Project administrator resource was not found",
+			false,
+		)
+		return models.ProjectScope{}, false
+	}
+	if err := h.db.WithContext(c.Request.Context()).
+		Model(&models.Project{}).
+		Where(
+			"id = ? AND organization_id = ? AND key = ? AND status = ?",
+			scope.ProjectID,
+			scope.OrganizationID,
+			projectKey,
+			models.ProjectStatusActive,
+		).
+		Count(&matching).Error; err != nil {
+		WriteProblem(
+			c,
+			http.StatusInternalServerError,
+			ProblemInternal,
+			"Failed to validate administrator project scope",
+			true,
+		)
+		return models.ProjectScope{}, false
+	}
+	if matching != 1 {
+		WriteProblem(
+			c,
+			http.StatusNotFound,
+			ProblemNotFound,
+			"Project administrator resource was not found",
+			false,
+		)
+		return models.ProjectScope{}, false
+	}
+	return scope, true
+}
+
+func scopedAdminPrincipalQuery(
+	db *gorm.DB,
+	scope models.ProjectScope,
+) *gorm.DB {
+	return db.Model(&models.ServicePrincipal{}).
+		Select("service_principals.*").
+		Joins(
+			"JOIN project_principal_grants ON project_principal_grants.service_principal_id = service_principals.id",
+		).
+		Joins(
+			"JOIN projects ON projects.id = project_principal_grants.project_id",
+		).
+		Where(
+			"project_principal_grants.project_id = ? AND projects.organization_id = ? AND project_principal_grants.is_active = ?",
+			scope.ProjectID,
+			scope.OrganizationID,
+			true,
+		).
+		Where(
+			"project_principal_grants.expires_at IS NULL OR project_principal_grants.expires_at > ?",
+			time.Now().UTC(),
+		)
+}
+
+func requireScopedAdminPrincipal(
+	ctx context.Context,
+	db *gorm.DB,
+	scope models.ProjectScope,
+	principalID string,
+) (*models.ServicePrincipal, error) {
+	principalID = strings.TrimSpace(principalID)
+	if principalID == "" {
+		return nil, services.ErrPrincipalNotFound
+	}
+	var principal models.ServicePrincipal
+	err := scopedAdminPrincipalQuery(db.WithContext(ctx), scope).
+		Where("service_principals.id = ?", principalID).
+		First(&principal).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, services.ErrPrincipalNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &principal, nil
 }
 
 func (h *AdminHandler) requireAdminCommandHeaders(c *gin.Context) {
@@ -382,18 +551,51 @@ func bindAdminJSON(c *gin.Context, target any) error {
 }
 
 func (h *AdminHandler) Overview(c *gin.Context) {
+	scope, ok := h.requireProjectScope(c)
+	if !ok {
+		return
+	}
 	var principals []models.ServicePrincipal
-	if err := h.db.WithContext(c.Request.Context()).
-		Order("created_at DESC").
+	if err := scopedAdminPrincipalQuery(
+		h.db.WithContext(c.Request.Context()),
+		scope,
+	).
+		Order("service_principals.created_at DESC").
 		Find(&principals).Error; err != nil {
 		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load service principals", true)
 		return
+	}
+	var grants []models.ProjectPrincipalGrant
+	if err := h.db.WithContext(c.Request.Context()).
+		Where(
+			"project_id = ? AND is_active = ? AND (expires_at IS NULL OR expires_at > ?)",
+			scope.ProjectID,
+			true,
+			time.Now().UTC(),
+		).
+		Find(&grants).Error; err != nil {
+		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load project principal grants", true)
+		return
+	}
+	projectScopes := make(map[string][]string, len(grants))
+	for i := range grants {
+		scopes, err := grants[i].ScopeList()
+		if err != nil {
+			WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to decode project principal grant", true)
+			return
+		}
+		projectScopes[grants[i].ServicePrincipalID] = scopes
 	}
 
 	now := time.Now().UTC()
 	var leases []models.TicketLease
 	if err := h.db.WithContext(c.Request.Context()).
-		Where("released_at IS NULL AND expires_at > ?", now).
+		Where(
+			"organization_id = ? AND project_id = ? AND released_at IS NULL AND expires_at > ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+			now,
+		).
 		Order("expires_at ASC").
 		Limit(100).
 		Find(&leases).Error; err != nil {
@@ -403,6 +605,11 @@ func (h *AdminHandler) Overview(c *gin.Context) {
 
 	var events []models.DomainEvent
 	if err := h.db.WithContext(c.Request.Context()).
+		Where(
+			"organization_id = ? AND project_id = ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
 		Order("created_at DESC").
 		Limit(100).
 		Find(&events).Error; err != nil {
@@ -412,6 +619,11 @@ func (h *AdminHandler) Overview(c *gin.Context) {
 
 	var deliveries []models.OutboxDelivery
 	if err := h.db.WithContext(c.Request.Context()).
+		Where(
+			"organization_id = ? AND project_id = ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
 		Order("updated_at DESC").
 		Limit(100).
 		Find(&deliveries).Error; err != nil {
@@ -420,6 +632,11 @@ func (h *AdminHandler) Overview(c *gin.Context) {
 	}
 	var attachments []models.TicketAttachment
 	if err := h.db.WithContext(c.Request.Context()).
+		Where(
+			"organization_id = ? AND project_id = ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
 		Order("updated_at DESC").
 		Limit(100).
 		Find(&attachments).Error; err != nil {
@@ -428,6 +645,11 @@ func (h *AdminHandler) Overview(c *gin.Context) {
 	}
 	var decisions []models.PolicyDecision
 	if err := h.db.WithContext(c.Request.Context()).
+		Where(
+			"organization_id = ? AND project_id = ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
 		Order("created_at DESC").
 		Limit(100).
 		Find(&decisions).Error; err != nil {
@@ -435,7 +657,7 @@ func (h *AdminHandler) Overview(c *gin.Context) {
 		return
 	}
 
-	versionSubjects := []string{"agent-control/read-only", "agent-control/emergency-stop"}
+	versionSubjects := make([]string, 0, len(principals)+len(leases)+len(deliveries)+len(attachments))
 	for i := range principals {
 		versionSubjects = append(versionSubjects, "service-principal/"+principals[i].ID)
 	}
@@ -454,6 +676,7 @@ func (h *AdminHandler) Overview(c *gin.Context) {
 	resourceVersions, err := h.adminResourceVersions(
 		c.Request.Context(),
 		h.db,
+		scope,
 		versionSubjects,
 	)
 	if err != nil {
@@ -465,12 +688,15 @@ func (h *AdminHandler) Overview(c *gin.Context) {
 	for i := range principals {
 		principal := &principals[i]
 		principalRows = append(principalRows, gin.H{
-			"id":                 principal.ID,
-			"client_id":          principal.ID,
-			"name":               principal.Name,
-			"description":        principal.Description,
-			"status":             principal.Status,
-			"scopes":             principal.ScopeList(),
+			"id":          principal.ID,
+			"client_id":   principal.ID,
+			"name":        principal.Name,
+			"description": principal.Description,
+			"status":      principal.Status,
+			"scopes": intersectAgentScopes(
+				principal.ScopeList(),
+				projectScopes[principal.ID],
+			),
 			"rate_limit":         principal.RateLimitPerMinute,
 			"concurrency_limit":  principal.ConcurrentLimit,
 			"last_used_at":       principal.LastUsedAt,
@@ -486,13 +712,24 @@ func (h *AdminHandler) Overview(c *gin.Context) {
 	for i := range leases {
 		lease := &leases[i]
 		var ticket models.Ticket
-		_ = h.db.WithContext(c.Request.Context()).Select("id", "ticket_number").
-			First(&ticket, lease.TicketID).Error
+		_ = h.db.WithContext(c.Request.Context()).
+			Select("id", "ticket_number").
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ?",
+				lease.TicketID,
+				scope.OrganizationID,
+				scope.ProjectID,
+			).
+			First(&ticket).Error
 		principalName := lease.HolderActorID
 		if lease.HolderActorType == models.ActorTypeServicePrincipal {
-			var principal models.ServicePrincipal
-			if h.db.WithContext(c.Request.Context()).Select("name").
-				First(&principal, "id = ?", lease.HolderActorID).Error == nil {
+			principal, principalErr := requireScopedAdminPrincipal(
+				c.Request.Context(),
+				h.db,
+				scope,
+				lease.HolderActorID,
+			)
+			if principalErr == nil {
 				principalName = principal.Name
 			}
 		}
@@ -576,16 +813,14 @@ func (h *AdminHandler) Overview(c *gin.Context) {
 	}
 
 	WriteData(c, http.StatusOK, gin.H{
-		"global_read_only":         h.control != nil && h.control.ReadOnly(),
-		"global_read_only_version": resourceVersions["agent-control/read-only"],
-		"emergency_stop":           h.control != nil && h.control.EmergencyStop(),
-		"emergency_stop_version":   resourceVersions["agent-control/emergency-stop"],
-		"principals":               principalRows,
-		"leases":                   leaseRows,
-		"events":                   eventRows,
-		"outbox":                   outboxRows,
-		"attachments":              attachmentRows,
-		"policy_decisions":         decisionRows,
+		"global_read_only": h.control != nil && h.control.ReadOnly(),
+		"emergency_stop":   h.control != nil && h.control.EmergencyStop(),
+		"principals":       principalRows,
+		"leases":           leaseRows,
+		"events":           eventRows,
+		"outbox":           outboxRows,
+		"attachments":      attachmentRows,
+		"policy_decisions": decisionRows,
 	}, Meta{})
 }
 
@@ -604,6 +839,7 @@ func (h *AdminHandler) CreateServicePrincipal(c *gin.Context) {
 	}
 
 	userID := c.GetUint("user_id")
+	projectKey := strings.TrimSpace(c.Param("projectKey"))
 	h.executeAdminMutation(
 		c,
 		adminMutationOptions{
@@ -611,7 +847,7 @@ func (h *AdminHandler) CreateServicePrincipal(c *gin.Context) {
 			ContainsOneTimeSecret: true,
 			Request:               request,
 		},
-		func(txCtx context.Context, _ *gorm.DB) (adminMutationResult, error) {
+		func(txCtx context.Context, tx *gorm.DB) (adminMutationResult, error) {
 			principal, err := h.native.CreateServicePrincipal(txCtx, services.CreateServicePrincipalInput{
 				Name:               request.Name,
 				Description:        request.Description,
@@ -624,6 +860,21 @@ func (h *AdminHandler) CreateServicePrincipal(c *gin.Context) {
 			if err != nil {
 				return adminMutationResult{}, err
 			}
+			projectService, err := services.NewProjectService(tx)
+			if err != nil {
+				return adminMutationResult{}, err
+			}
+			projectAccess, err := projectService.GrantPrincipalProject(
+				txCtx,
+				projectKey,
+				principal.ID,
+				models.ProjectRoleAgent,
+				principal.ScopeList(),
+				principal.ExpiresAt,
+			)
+			if err != nil {
+				return adminMutationResult{}, err
+			}
 			issued, err := h.native.IssueCredential(txCtx, principal.ID, "initial", h.credentialTTL)
 			if err != nil {
 				return adminMutationResult{}, err
@@ -633,14 +884,17 @@ func (h *AdminHandler) CreateServicePrincipal(c *gin.Context) {
 					"client_id":     principal.ID,
 					"client_secret": issued.Token,
 					"expires_at":    issued.Credential.ExpiresAt,
+					"project_key":   projectAccess.Project.Key,
 				},
 				EventName:     "service_principal.created",
 				Subject:       "service-principal/" + principal.ID,
 				ResourceID:    principal.ID,
-				ChangedFields: []string{"service_principal", "credentials"},
+				Scope:         projectAccess.Scope,
+				ChangedFields: []string{"service_principal", "project_grant", "credentials"},
 				PublicValues: gin.H{
 					"status":               principal.Status,
 					"scopes":               principal.ScopeList(),
+					"project_key":          projectAccess.Project.Key,
 					"rate_limit":           principal.RateLimitPerMinute,
 					"concurrency_limit":    principal.ConcurrentLimit,
 					"credential_id":        issued.Credential.ID,
@@ -667,7 +921,19 @@ func (h *AdminHandler) RotateCredential(c *gin.Context) {
 			PreconditionSubject:   "service-principal/" + principalID,
 			Request:               struct{}{},
 		},
-		func(txCtx context.Context, _ *gorm.DB) (adminMutationResult, error) {
+		func(txCtx context.Context, tx *gorm.DB) (adminMutationResult, error) {
+			scope, err := services.RequireProjectScope(txCtx)
+			if err != nil {
+				return adminMutationResult{}, err
+			}
+			if _, err := requireScopedAdminPrincipal(
+				txCtx,
+				tx,
+				scope,
+				principalID,
+			); err != nil {
+				return adminMutationResult{}, err
+			}
 			issued, err := h.native.RotateCredential(
 				txCtx,
 				principalID,
@@ -708,6 +974,18 @@ func (h *AdminHandler) RevokeCredential(c *gin.Context) {
 			},
 		},
 		func(txCtx context.Context, tx *gorm.DB) (adminMutationResult, error) {
+			scope, err := services.RequireProjectScope(txCtx)
+			if err != nil {
+				return adminMutationResult{}, err
+			}
+			if _, err := requireScopedAdminPrincipal(
+				txCtx,
+				tx,
+				scope,
+				c.Param("id"),
+			); err != nil {
+				return adminMutationResult{}, err
+			}
 			var credential models.AgentCredential
 			if err := tx.WithContext(txCtx).
 				Where("id = ? AND service_principal_id = ?", c.Param("credential_id"), c.Param("id")).
@@ -760,8 +1038,17 @@ func (h *AdminHandler) SetServicePrincipalStatus(c *gin.Context) {
 			PreconditionSubject: "service-principal/" + c.Param("id"),
 			Request:             request,
 		},
-		func(txCtx context.Context, _ *gorm.DB) (adminMutationResult, error) {
-			existing, err := h.native.GetServicePrincipal(txCtx, c.Param("id"))
+		func(txCtx context.Context, tx *gorm.DB) (adminMutationResult, error) {
+			scope, err := services.RequireProjectScope(txCtx)
+			if err != nil {
+				return adminMutationResult{}, err
+			}
+			existing, err := requireScopedAdminPrincipal(
+				txCtx,
+				tx,
+				scope,
+				c.Param("id"),
+			)
 			if err != nil {
 				return adminMutationResult{}, err
 			}
@@ -826,7 +1113,19 @@ func (h *AdminHandler) CreatePolicy(c *gin.Context) {
 			PreconditionSubject: "service-principal/" + c.Param("id"),
 			Request:             request,
 		},
-		func(txCtx context.Context, _ *gorm.DB) (adminMutationResult, error) {
+		func(txCtx context.Context, tx *gorm.DB) (adminMutationResult, error) {
+			scope, err := services.RequireProjectScope(txCtx)
+			if err != nil {
+				return adminMutationResult{}, err
+			}
+			if _, err := requireScopedAdminPrincipal(
+				txCtx,
+				tx,
+				scope,
+				c.Param("id"),
+			); err != nil {
+				return adminMutationResult{}, err
+			}
 			policy, err := h.native.CreateAgentPolicy(txCtx, services.CreateAgentPolicyInput{
 				ServicePrincipalID: c.Param("id"),
 				Name:               request.Name,
@@ -864,6 +1163,19 @@ func (h *AdminHandler) CreatePolicy(c *gin.Context) {
 }
 
 func (h *AdminHandler) ListPolicies(c *gin.Context) {
+	scope, ok := h.requireProjectScope(c)
+	if !ok {
+		return
+	}
+	if _, err := requireScopedAdminPrincipal(
+		c.Request.Context(),
+		h.db,
+		scope,
+		c.Param("id"),
+	); err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
 	var policies []models.AgentPolicy
 	if err := h.db.WithContext(c.Request.Context()).
 		Where("service_principal_id = ?", c.Param("id")).
@@ -879,7 +1191,12 @@ func (h *AdminHandler) ListPolicies(c *gin.Context) {
 			"service-principal/"+policies[i].ServicePrincipalID+"/policy/"+policies[i].ID,
 		)
 	}
-	versions, err := h.adminResourceVersions(c.Request.Context(), h.db, subjects)
+	versions, err := h.adminResourceVersions(
+		c.Request.Context(),
+		h.db,
+		scope,
+		subjects,
+	)
 	if err != nil {
 		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load policy versions", true)
 		return
@@ -920,6 +1237,18 @@ func (h *AdminHandler) DisablePolicy(c *gin.Context) {
 			},
 		},
 		func(txCtx context.Context, tx *gorm.DB) (adminMutationResult, error) {
+			scope, err := services.RequireProjectScope(txCtx)
+			if err != nil {
+				return adminMutationResult{}, err
+			}
+			if _, err := requireScopedAdminPrincipal(
+				txCtx,
+				tx,
+				scope,
+				c.Param("id"),
+			); err != nil {
+				return adminMutationResult{}, err
+			}
 			update := tx.WithContext(txCtx).
 				Model(&models.AgentPolicy{}).
 				Where("id = ? AND service_principal_id = ?", c.Param("policy_id"), c.Param("id")).
@@ -945,94 +1274,6 @@ func (h *AdminHandler) DisablePolicy(c *gin.Context) {
 	)
 }
 
-func (h *AdminHandler) SetReadOnly(c *gin.Context) {
-	var request struct {
-		Enabled bool `json:"enabled"`
-	}
-	if err := bindAdminJSON(c, &request); err != nil {
-		WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
-		return
-	}
-	if h.control == nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Agent runtime control is unavailable", true)
-		return
-	}
-	h.executeAdminMutation(
-		c,
-		adminMutationOptions{
-			Status:              http.StatusOK,
-			PreconditionSubject: "agent-control/read-only",
-			Request:             request,
-		},
-		func(txCtx context.Context, tx *gorm.DB) (adminMutationResult, error) {
-			if err := h.control.persistTx(
-				txCtx,
-				tx,
-				agentReadOnlyConfigKey,
-				request.Enabled,
-				c.GetUint("user_id"),
-			); err != nil {
-				return adminMutationResult{}, err
-			}
-			return adminMutationResult{
-				Data:          gin.H{"enabled": request.Enabled},
-				EventName:     "agent_control.read_only.updated",
-				Subject:       "agent-control/read-only",
-				ResourceID:    agentReadOnlyConfigKey,
-				ChangedFields: []string{"enabled"},
-				PublicValues:  gin.H{"enabled": request.Enabled},
-				AfterCommit: func() {
-					h.control.SetReadOnly(request.Enabled)
-				},
-			}, nil
-		},
-	)
-}
-
-func (h *AdminHandler) SetEmergencyStop(c *gin.Context) {
-	var request struct {
-		Enabled bool `json:"enabled"`
-	}
-	if err := bindAdminJSON(c, &request); err != nil {
-		WriteProblem(c, http.StatusBadRequest, ProblemInvalidRequest, err.Error(), false)
-		return
-	}
-	if h.control == nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Agent runtime control is unavailable", true)
-		return
-	}
-	h.executeAdminMutation(
-		c,
-		adminMutationOptions{
-			Status:              http.StatusOK,
-			PreconditionSubject: "agent-control/emergency-stop",
-			Request:             request,
-		},
-		func(txCtx context.Context, tx *gorm.DB) (adminMutationResult, error) {
-			if err := h.control.persistTx(
-				txCtx,
-				tx,
-				agentEmergencyConfigKey,
-				request.Enabled,
-				c.GetUint("user_id"),
-			); err != nil {
-				return adminMutationResult{}, err
-			}
-			return adminMutationResult{
-				Data:          gin.H{"enabled": request.Enabled},
-				EventName:     "agent_control.emergency_stop.updated",
-				Subject:       "agent-control/emergency-stop",
-				ResourceID:    agentEmergencyConfigKey,
-				ChangedFields: []string{"enabled"},
-				PublicValues:  gin.H{"enabled": request.Enabled},
-				AfterCommit: func() {
-					h.control.SetEmergencyStop(request.Enabled)
-				},
-			}, nil
-		},
-	)
-}
-
 func (h *AdminHandler) ReplayOutbox(c *gin.Context) {
 	h.executeAdminMutation(
 		c,
@@ -1043,8 +1284,23 @@ func (h *AdminHandler) ReplayOutbox(c *gin.Context) {
 				"delivery_id": c.Param("id"),
 			},
 		},
-		func(txCtx context.Context, _ *gorm.DB) (adminMutationResult, error) {
-			if err := h.native.ReplayOutbox(txCtx, c.Param("id")); err != nil {
+		func(txCtx context.Context, tx *gorm.DB) (adminMutationResult, error) {
+			scope, err := services.RequireProjectScope(txCtx)
+			if err != nil {
+				return adminMutationResult{}, err
+			}
+			var delivery models.OutboxDelivery
+			if err := tx.WithContext(txCtx).
+				Where(
+					"id = ? AND organization_id = ? AND project_id = ?",
+					c.Param("id"),
+					scope.OrganizationID,
+					scope.ProjectID,
+				).
+				First(&delivery).Error; err != nil {
+				return adminMutationResult{}, err
+			}
+			if err := h.native.ReplayOutbox(txCtx, delivery.ID); err != nil {
 				return adminMutationResult{}, err
 			}
 			return adminMutationResult{
@@ -1052,6 +1308,7 @@ func (h *AdminHandler) ReplayOutbox(c *gin.Context) {
 				EventName:     "outbox.replayed",
 				Subject:       "outbox/" + c.Param("id"),
 				ResourceID:    c.Param("id"),
+				Scope:         scope,
 				ChangedFields: []string{"status", "attempts", "next_attempt_at", "locked_at", "last_error", "delivered_at"},
 				PublicValues:  gin.H{"status": models.OutboxDeliveryPending},
 			}, nil
@@ -1075,15 +1332,31 @@ func (h *AdminHandler) ForceReleaseLease(c *gin.Context) {
 			},
 		},
 		func(txCtx context.Context, tx *gorm.DB) (adminMutationResult, error) {
+			scope, err := services.RequireProjectScope(txCtx)
+			if err != nil {
+				return adminMutationResult{}, err
+			}
 			var lease models.TicketLease
-			if err := tx.WithContext(txCtx).First(&lease, "id = ?", leaseID).Error; err != nil {
+			if err := tx.WithContext(txCtx).
+				Where(
+					"id = ? AND organization_id = ? AND project_id = ?",
+					leaseID,
+					scope.OrganizationID,
+					scope.ProjectID,
+				).
+				First(&lease).Error; err != nil {
 				return adminMutationResult{}, err
 			}
 			reason := fmt.Sprintf("force released by administrator %d", c.GetUint("user_id"))
 			now := time.Now().UTC()
 			release := tx.WithContext(txCtx).
 				Model(&models.TicketLease{}).
-				Where("id = ? AND released_at IS NULL", leaseID).
+				Where(
+					"id = ? AND organization_id = ? AND project_id = ? AND released_at IS NULL",
+					leaseID,
+					scope.OrganizationID,
+					scope.ProjectID,
+				).
 				Updates(map[string]any{
 					"released_at":    now,
 					"release_reason": reason,
@@ -1102,6 +1375,7 @@ func (h *AdminHandler) ForceReleaseLease(c *gin.Context) {
 				EventName:     "ticket.lease.force_released",
 				Subject:       "lease/" + leaseID,
 				ResourceID:    leaseID,
+				Scope:         scope,
 				ChangedFields: []string{"released_at", "release_reason"},
 				PublicValues: gin.H{
 					"ticket_id":      lease.TicketID,
@@ -1133,7 +1407,23 @@ func (h *AdminHandler) MarkAttachmentScan(c *gin.Context) {
 			PreconditionSubject: fmt.Sprintf("attachment/%d", attachmentID),
 			Request:             request,
 		},
-		func(txCtx context.Context, _ *gorm.DB) (adminMutationResult, error) {
+		func(txCtx context.Context, tx *gorm.DB) (adminMutationResult, error) {
+			scope, err := services.RequireProjectScope(txCtx)
+			if err != nil {
+				return adminMutationResult{}, err
+			}
+			var attachment models.TicketAttachment
+			if err := tx.WithContext(txCtx).
+				Select("id", "organization_id", "project_id").
+				Where(
+					"id = ? AND organization_id = ? AND project_id = ?",
+					attachmentID,
+					scope.OrganizationID,
+					scope.ProjectID,
+				).
+				First(&attachment).Error; err != nil {
+				return adminMutationResult{}, err
+			}
 			if err := h.native.MarkAttachmentScan(
 				txCtx,
 				uint(attachmentID),
@@ -1150,6 +1440,7 @@ func (h *AdminHandler) MarkAttachmentScan(c *gin.Context) {
 				EventName:     "attachment.scan.recorded",
 				Subject:       fmt.Sprintf("attachment/%d", attachmentID),
 				ResourceID:    strconv.FormatUint(attachmentID, 10),
+				Scope:         scope,
 				ChangedFields: []string{"virus_scan", "scan_details", "scanned_at"},
 				PublicValues:  gin.H{"status": request.Status},
 			}, nil
@@ -1169,6 +1460,7 @@ type adminMutationResult struct {
 	EventName     string
 	Subject       string
 	ResourceID    string
+	Scope         models.ProjectScope
 	ChangedFields []string
 	PublicValues  map[string]any
 	AfterCommit   func()
@@ -1231,6 +1523,10 @@ func (h *AdminHandler) executeAdminMutation(
 	options adminMutationOptions,
 	mutate func(context.Context, *gorm.DB) (adminMutationResult, error),
 ) {
+	projectScope, ok := h.requireProjectScope(c)
+	if !ok {
+		return
+	}
 	if h.native == nil {
 		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Agent-native service is unavailable", true)
 		return
@@ -1324,6 +1620,7 @@ func (h *AdminHandler) executeAdminMutation(
 				parentVersion, casErr = h.compareAndSwapAdminResourceVersionTx(
 					txCtx,
 					tx,
+					projectScope,
 					options.PreconditionSubject,
 					expectedVersion,
 					c.GetUint("user_id"),
@@ -1340,12 +1637,22 @@ func (h *AdminHandler) executeAdminMutation(
 			if strings.TrimSpace(result.Subject) == "" || strings.TrimSpace(result.ResourceID) == "" {
 				return fmt.Errorf("%w: administrator mutation returned no resource identity", errAdminEventPersistence)
 			}
+			if result.Scope.IsZero() {
+				result.Scope = projectScope
+			}
+			if result.Scope != projectScope {
+				return fmt.Errorf(
+					"%w: administrator mutation scope does not match trusted project",
+					errAdminEventPersistence,
+				)
+			}
 			resourceVersion := parentVersion
 			parentETag := ""
 			if options.PreconditionSubject == "" || options.PreconditionSubject != result.Subject {
 				resourceVersion, err = h.initializeAdminResourceVersionTx(
 					txCtx,
 					tx,
+					projectScope,
 					result.Subject,
 					c.GetUint("user_id"),
 				)
@@ -1446,6 +1753,13 @@ func (h *AdminHandler) appendAdminMutationTx(
 	if resourceVersion == 0 {
 		return Receipt{}, fmt.Errorf("%w: resource version is required", errAdminEventPersistence)
 	}
+	if err := result.Scope.Validate(); err != nil {
+		return Receipt{}, fmt.Errorf(
+			"%w: administrator project scope is required: %v",
+			errAdminEventPersistence,
+			err,
+		)
+	}
 	eventData := gin.H{
 		"request_id":     requestID,
 		"subject":        result.Subject,
@@ -1455,13 +1769,31 @@ func (h *AdminHandler) appendAdminMutationTx(
 	if values := safeAdminEventValues(result.PublicValues); len(values) > 0 {
 		eventData["values"] = values
 	}
-	event, err := h.native.AppendDomainEventTx(
+	eventContext, err := services.WithOperationContext(
 		ctx,
+		services.OperationContext{
+			Scope:         result.Scope,
+			Actor:         models.HumanActor(adminUserID),
+			Source:        services.SourceProtocolHumanREST,
+			TraceID:       requestID,
+			CorrelationID: requestID,
+		},
+	)
+	if err != nil {
+		return Receipt{}, fmt.Errorf(
+			"%w: bind administrator project scope: %v",
+			errAdminEventPersistence,
+			err,
+		)
+	}
+	event, err := h.native.AppendDomainEventTx(
+		eventContext,
 		tx,
 		services.DomainEventInput{
 			Type:            "io.chronodesk.admin." + result.EventName + ".v1",
 			Subject:         result.Subject,
 			Data:            eventData,
+			Scope:           result.Scope,
 			TraceID:         requestID,
 			CorrelationID:   requestID,
 			Actor:           models.HumanActor(adminUserID),
@@ -1484,10 +1816,11 @@ func (h *AdminHandler) appendAdminMutationTx(
 func (h *AdminHandler) initializeAdminResourceVersionTx(
 	ctx context.Context,
 	tx *gorm.DB,
+	scope models.ProjectScope,
 	subject string,
 	updatedBy uint,
 ) (uint64, error) {
-	row := adminResourceVersionRow(subject, 1, updatedBy)
+	row := adminResourceVersionRow(scope, subject, 1, updatedBy)
 	create := tx.WithContext(ctx).
 		Clauses(clause.OnConflict{DoNothing: true}).
 		Create(&row)
@@ -1497,7 +1830,7 @@ func (h *AdminHandler) initializeAdminResourceVersionTx(
 	if create.RowsAffected == 1 {
 		return 1, nil
 	}
-	current, err := h.currentAdminResourceVersion(ctx, tx, subject)
+	current, err := h.currentAdminResourceVersion(ctx, tx, scope, subject)
 	if err != nil {
 		return 0, err
 	}
@@ -1507,6 +1840,7 @@ func (h *AdminHandler) initializeAdminResourceVersionTx(
 func (h *AdminHandler) compareAndSwapAdminResourceVersionTx(
 	ctx context.Context,
 	tx *gorm.DB,
+	scope models.ProjectScope,
 	subject string,
 	expected uint64,
 	updatedBy uint,
@@ -1514,7 +1848,13 @@ func (h *AdminHandler) compareAndSwapAdminResourceVersionTx(
 	if expected == 0 {
 		return 0, &adminVersionConflictError{Expected: expected, Current: 1}
 	}
-	if err := h.ensureAdminResourceVersionTx(ctx, tx, subject, updatedBy); err != nil {
+	if err := h.ensureAdminResourceVersionTx(
+		ctx,
+		tx,
+		scope,
+		subject,
+		updatedBy,
+	); err != nil {
 		return 0, err
 	}
 	now := time.Now().UTC()
@@ -1524,7 +1864,11 @@ func (h *AdminHandler) compareAndSwapAdminResourceVersionTx(
 	}
 	update := tx.WithContext(ctx).
 		Model(&models.SystemConfig{}).
-		Where("key = ? AND version = ?", adminResourceVersionKey(subject), expected).
+		Where(
+			"key = ? AND version = ?",
+			adminResourceVersionKey(scope, subject),
+			expected,
+		).
 		Updates(map[string]any{
 			"version":    gorm.Expr("version + 1"),
 			"updated_at": now,
@@ -1536,7 +1880,7 @@ func (h *AdminHandler) compareAndSwapAdminResourceVersionTx(
 	if update.RowsAffected == 1 {
 		return expected + 1, nil
 	}
-	current, err := h.currentAdminResourceVersion(ctx, tx, subject)
+	current, err := h.currentAdminResourceVersion(ctx, tx, scope, subject)
 	if err != nil {
 		return 0, err
 	}
@@ -1546,6 +1890,7 @@ func (h *AdminHandler) compareAndSwapAdminResourceVersionTx(
 func (h *AdminHandler) ensureAdminResourceVersionTx(
 	ctx context.Context,
 	tx *gorm.DB,
+	scope models.ProjectScope,
 	subject string,
 	updatedBy uint,
 ) error {
@@ -1553,14 +1898,20 @@ func (h *AdminHandler) ensureAdminResourceVersionTx(
 	if err := tx.WithContext(ctx).
 		Model(&models.DomainEvent{}).
 		Select("COALESCE(MAX(resource_version), 0)").
-		Where("subject = ? AND type LIKE ?", subject, "io.chronodesk.admin.%").
+		Where(
+			"organization_id = ? AND project_id = ? AND subject = ? AND type LIKE ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+			subject,
+			"io.chronodesk.admin.%",
+		).
 		Scan(&eventVersion).Error; err != nil {
 		return fmt.Errorf("%w: load administrator event version: %v", errAdminEventPersistence, err)
 	}
 	if eventVersion == 0 {
 		eventVersion = 1
 	}
-	row := adminResourceVersionRow(subject, eventVersion, updatedBy)
+	row := adminResourceVersionRow(scope, subject, eventVersion, updatedBy)
 	if err := tx.WithContext(ctx).
 		Clauses(clause.OnConflict{DoNothing: true}).
 		Create(&row).Error; err != nil {
@@ -1569,13 +1920,18 @@ func (h *AdminHandler) ensureAdminResourceVersionTx(
 	return nil
 }
 
-func adminResourceVersionRow(subject string, version uint64, updatedBy uint) models.SystemConfig {
+func adminResourceVersionRow(
+	scope models.ProjectScope,
+	subject string,
+	version uint64,
+	updatedBy uint,
+) models.SystemConfig {
 	var userID *uint
 	if updatedBy > 0 {
 		userID = &updatedBy
 	}
 	return models.SystemConfig{
-		Key:          adminResourceVersionKey(subject),
+		Key:          adminResourceVersionKey(scope, subject),
 		Value:        subject,
 		ValueType:    "string",
 		Description:  "Administrator command resource version",
@@ -1588,20 +1944,29 @@ func adminResourceVersionRow(subject string, version uint64, updatedBy uint) mod
 	}
 }
 
-func adminResourceVersionKey(subject string) string {
-	sum := sha256.Sum256([]byte(strings.TrimSpace(subject)))
+func adminResourceVersionKey(
+	scope models.ProjectScope,
+	subject string,
+) string {
+	scopeSubject := strconv.FormatUint(uint64(scope.OrganizationID), 10) +
+		"/" +
+		strconv.FormatUint(uint64(scope.ProjectID), 10) +
+		"/" +
+		strings.TrimSpace(subject)
+	sum := sha256.Sum256([]byte(scopeSubject))
 	return adminVersionKeyPrefix + base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 func (h *AdminHandler) currentAdminResourceVersion(
 	ctx context.Context,
 	db *gorm.DB,
+	scope models.ProjectScope,
 	subject string,
 ) (uint64, error) {
 	var row models.SystemConfig
 	err := db.WithContext(ctx).
 		Select("version").
-		First(&row, "key = ?", adminResourceVersionKey(subject)).Error
+		First(&row, "key = ?", adminResourceVersionKey(scope, subject)).Error
 	if err == nil {
 		if row.Version <= 0 {
 			return 1, nil
@@ -1615,7 +1980,13 @@ func (h *AdminHandler) currentAdminResourceVersion(
 	if err := db.WithContext(ctx).
 		Model(&models.DomainEvent{}).
 		Select("COALESCE(MAX(resource_version), 0)").
-		Where("subject = ? AND type LIKE ?", subject, "io.chronodesk.admin.%").
+		Where(
+			"organization_id = ? AND project_id = ? AND subject = ? AND type LIKE ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+			subject,
+			"io.chronodesk.admin.%",
+		).
 		Scan(&eventVersion).Error; err != nil {
 		return 0, err
 	}
@@ -1628,6 +1999,7 @@ func (h *AdminHandler) currentAdminResourceVersion(
 func (h *AdminHandler) adminResourceVersions(
 	ctx context.Context,
 	db *gorm.DB,
+	scope models.ProjectScope,
 	subjects []string,
 ) (map[string]uint64, error) {
 	versions := make(map[string]uint64, len(subjects))
@@ -1643,7 +2015,7 @@ func (h *AdminHandler) adminResourceVersions(
 			continue
 		}
 		versions[subject] = 1
-		key := adminResourceVersionKey(subject)
+		key := adminResourceVersionKey(scope, subject)
 		subjectByKey[key] = subject
 		keys = append(keys, key)
 		uniqueSubjects = append(uniqueSubjects, subject)
@@ -1685,7 +2057,13 @@ func (h *AdminHandler) adminResourceVersions(
 	if err := db.WithContext(ctx).
 		Model(&models.DomainEvent{}).
 		Select("subject, MAX(resource_version) AS version").
-		Where("subject IN ? AND type LIKE ?", missing, "io.chronodesk.admin.%").
+		Where(
+			"organization_id = ? AND project_id = ? AND subject IN ? AND type LIKE ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+			missing,
+			"io.chronodesk.admin.%",
+		).
 		Group("subject").
 		Scan(&eventRows).Error; err != nil {
 		return nil, err
@@ -1795,8 +2173,14 @@ func (h *AdminHandler) writeNativeError(c *gin.Context, err error) {
 	status := http.StatusBadRequest
 	retryable := false
 	switch {
-	case errors.Is(err, services.ErrPrincipalNotFound), errors.Is(err, gorm.ErrRecordNotFound):
+	case errors.Is(err, services.ErrPrincipalNotFound),
+		errors.Is(err, services.ErrProjectNotFound),
+		errors.Is(err, gorm.ErrRecordNotFound):
 		status, code = http.StatusNotFound, ProblemNotFound
+	case errors.Is(err, services.ErrProjectAccessDenied):
+		status, code = http.StatusForbidden, ProblemPolicyDenied
+	case errors.Is(err, services.ErrProjectInactive):
+		status, code = http.StatusForbidden, ProblemPolicyDenied
 	case errors.Is(err, services.ErrPolicyDenied),
 		errors.Is(err, services.ErrReadOnlyMode),
 		errors.Is(err, services.ErrGlobalEmergencyStop):

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
 const (
@@ -22,6 +23,7 @@ const (
 	ContextCredentialID  = "agent_credential_id"
 	ContextScopes        = "agent_scopes"
 	ContextActorType     = "actor_type"
+	ContextProjectKey    = "project_key"
 )
 
 var (
@@ -45,12 +47,19 @@ type Principal struct {
 
 // CredentialStore authenticates a pre-registered service principal.
 type CredentialStore interface {
-	AuthenticateClient(ctx context.Context, clientID, clientSecret string) (*Principal, error)
+	AuthenticateClient(
+		ctx context.Context,
+		clientID, clientSecret, projectKey string,
+	) (*Principal, error)
 	TouchCredential(ctx context.Context, credentialID string, usedAt time.Time) error
 }
 
 type AccessValidator interface {
-	ValidateAccessContext(ctx context.Context, principalID, credentialID string) error
+	ValidateAccessContext(
+		ctx context.Context,
+		principalID, credentialID, projectKey string,
+		scopes []string,
+	) error
 }
 
 type Manager struct {
@@ -80,6 +89,7 @@ type accessClaims struct {
 	Name         string `json:"name"`
 	Scope        string `json:"scope"`
 	TokenType    string `json:"token_type"`
+	ProjectKey   string `json:"project_key"`
 }
 
 type AccessContext struct {
@@ -90,6 +100,7 @@ type AccessContext struct {
 	Scopes       []string
 	JTI          string
 	ExpiresAt    time.Time
+	ProjectKey   string
 }
 
 func NewManager(secret, issuer, audience string, ttl time.Duration) *Manager {
@@ -106,12 +117,18 @@ func NewManager(secret, issuer, audience string, ttl time.Duration) *Manager {
 	}
 }
 
-func (m *Manager) Issue(principal *Principal, requestedScopes []string) (string, time.Time, error) {
+func (m *Manager) Issue(
+	principal *Principal,
+	projectKey string,
+	requestedScopes []string,
+) (string, time.Time, error) {
+	projectKey = strings.TrimSpace(projectKey)
 	if principal == nil ||
 		!principal.Active ||
 		strings.TrimSpace(principal.ID) == "" ||
 		strings.TrimSpace(principal.CredentialID) == "" ||
-		strings.TrimSpace(principal.ClientID) == "" {
+		strings.TrimSpace(principal.ClientID) == "" ||
+		models.ValidateProjectKey(projectKey) != nil {
 		return "", time.Time{}, ErrInvalidToken
 	}
 	now := m.now().UTC()
@@ -123,7 +140,7 @@ func (m *Manager) Issue(principal *Principal, requestedScopes []string) (string,
 	if len(scopes) == 0 {
 		scopes = normalizeScopes(principal.Scopes)
 	}
-	if !containsAll(principal.Scopes, scopes) {
+	if len(scopes) == 0 || !containsAll(principal.Scopes, scopes) {
 		return "", time.Time{}, ErrInsufficientScope
 	}
 
@@ -144,6 +161,7 @@ func (m *Manager) Issue(principal *Principal, requestedScopes []string) (string,
 		Name:         principal.Name,
 		Scope:        strings.Join(scopes, " "),
 		TokenType:    "agent_access",
+		ProjectKey:   projectKey,
 	}
 	token, err := m.sign(claims)
 	return token, expiresAt, err
@@ -198,7 +216,8 @@ func (m *Manager) Verify(token string) (*AccessContext, error) {
 		claims.Iat <= 0 ||
 		claims.Iat > now.Add(30*time.Second).Unix() ||
 		claims.Exp <= claims.Iat ||
-		len(strings.Fields(claims.Scope)) == 0 {
+		len(strings.Fields(claims.Scope)) == 0 ||
+		models.ValidateProjectKey(claims.ProjectKey) != nil {
 		return nil, ErrInvalidToken
 	}
 	if claims.Aud != m.audience {
@@ -213,6 +232,7 @@ func (m *Manager) Verify(token string) (*AccessContext, error) {
 		Scopes:       normalizeScopes([]string{claims.Scope}),
 		JTI:          claims.JTI,
 		ExpiresAt:    time.Unix(claims.Exp, 0).UTC(),
+		ProjectKey:   claims.ProjectKey,
 	}, nil
 }
 
@@ -233,11 +253,24 @@ func (m *Manager) Middleware(requiredScopes ...string) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+		if strings.Contains(c.FullPath(), ":projectKey") &&
+			c.Param("projectKey") != access.ProjectKey {
+			writeOAuthProblem(
+				c,
+				403,
+				"project_scope_mismatch",
+				"The access token is not valid for the requested project",
+			)
+			c.Abort()
+			return
+		}
 		if m.accessValidator != nil {
 			if err := m.accessValidator.ValidateAccessContext(
 				c.Request.Context(),
 				access.PrincipalID,
 				access.CredentialID,
+				access.ProjectKey,
+				access.Scopes,
 			); err != nil {
 				m.setBearerChallenge(c, "invalid_token", requiredScopes)
 				writeOAuthProblem(c, 401, "unauthorized", "Access token credential is no longer active")
@@ -257,6 +290,7 @@ func (m *Manager) Middleware(requiredScopes ...string) gin.HandlerFunc {
 		c.Set(ContextCredentialID, access.CredentialID)
 		c.Set(ContextScopes, access.Scopes)
 		c.Set(ContextActorType, "service_principal")
+		c.Set(ContextProjectKey, access.ProjectKey)
 		requestContext, cancel := context.WithDeadline(c.Request.Context(), access.ExpiresAt)
 		c.Request = c.Request.WithContext(requestContext)
 		done := make(chan struct{})
@@ -279,6 +313,8 @@ func (m *Manager) Middleware(requiredScopes ...string) gin.HandlerFunc {
 							requestContext,
 							access.PrincipalID,
 							access.CredentialID,
+							access.ProjectKey,
+							access.Scopes,
 						); err != nil {
 							cancel()
 							return

@@ -1,7 +1,6 @@
 package services
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -22,10 +21,11 @@ func TestBulkUpdateTicketsWritesVersionedAuditAndOutboxAtomically(t *testing.T) 
 	second := seedNativeTicket(t, db, actor.ID, "BULK-NATIVE-2")
 	native := NewAgentNativeService(db)
 	service := &TicketService{db: db, agentNative: native}
+	ctx := testProjectOperationContext(t, db, models.HumanActor(actor.ID))
 
 	status := string(models.TicketStatusInProgress)
 	priority := string(models.TicketPriorityHigh)
-	result, err := service.BulkUpdateTickets(context.Background(), &BulkUpdateRequest{
+	result, err := service.BulkUpdateTickets(ctx, &BulkUpdateRequest{
 		Tickets: []TicketVersionPrecondition{
 			{ID: second.ID, Version: second.Version},
 			{ID: first.ID, Version: first.Version},
@@ -110,10 +110,11 @@ func TestBulkUpdateTicketsRollsBackEveryTicketWhenLatestTransitionIsInvalid(t *t
 		t.Fatalf("seed latest closed state: %v", err)
 	}
 	service := &TicketService{db: db, agentNative: NewAgentNativeService(db)}
+	ctx := testProjectOperationContext(t, db, models.HumanActor(actor.ID))
 	status := string(models.TicketStatusInProgress)
 	priority := string(models.TicketPriorityHigh)
 
-	_, err := service.BulkUpdateTickets(context.Background(), &BulkUpdateRequest{
+	_, err := service.BulkUpdateTickets(ctx, &BulkUpdateRequest{
 		Tickets: []TicketVersionPrecondition{
 			{ID: first.ID, Version: first.Version},
 			{ID: second.ID, Version: second.Version},
@@ -161,6 +162,12 @@ func TestBulkUpdateTicketsDoesNotOverwriteAgentCommitBetweenReadAndCAS(t *testin
 	ticket := seedNativeTicket(t, db, actor.ID, "BULK-CONCURRENT-1")
 	native := NewAgentNativeService(db)
 	service := &TicketService{db: db, agentNative: native}
+	humanCtx := testProjectOperationContext(t, db, models.HumanActor(actor.ID))
+	systemCtx := testProjectOperationContext(
+		t,
+		db,
+		models.SystemActor("concurrent-agent"),
+	)
 
 	var injectAgentCommit atomic.Bool
 	injectAgentCommit.Store(true)
@@ -174,7 +181,7 @@ func TestBulkUpdateTicketsDoesNotOverwriteAgentCommitBetweenReadAndCAS(t *testin
 				return
 			}
 			_, agentCommitErr = native.UpdateTicketVersion(
-				context.Background(),
+				systemCtx,
 				VersionedTicketUpdateInput{
 					TicketID:        ticket.ID,
 					ExpectedVersion: 1,
@@ -195,7 +202,7 @@ func TestBulkUpdateTicketsDoesNotOverwriteAgentCommitBetweenReadAndCAS(t *testin
 	}()
 
 	priority := string(models.TicketPriorityHigh)
-	_, err := service.BulkUpdateTickets(context.Background(), &BulkUpdateRequest{
+	_, err := service.BulkUpdateTickets(humanCtx, &BulkUpdateRequest{
 		Tickets:  []TicketVersionPrecondition{{ID: ticket.ID, Version: ticket.Version}},
 		Priority: &priority,
 	}, actor.ID)

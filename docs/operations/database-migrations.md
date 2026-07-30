@@ -15,6 +15,18 @@ ChronoDesk 只保留一个结构迁移入口：`cmd/migrate`。该命令基于�
 `verify-ca` 或 `verify-full`）。`POSTGRES_ALLOW_INSECURE=true` 只允许用于隔离的
 一次性开发网络，禁止在共享或生产环境设置。
 
+运行中的 ChronoDesk 不读取上述迁移连接。应用只接受
+`DATABASE_RUNTIME_URL`，该 URL 必须使用可登录、非表 owner、
+`NOSUPERUSER`、`NOBYPASSRLS` 且不是 owner 角色成员的独立 PostgreSQL
+角色。应用启动会验证全部项目表已经同时启用 `ENABLE ROW LEVEL SECURITY`
+和 `FORCE ROW LEVEL SECURITY`，验证失败时不接收流量。
+
+当开发环境显式使用 `AUTO_MIGRATE=true` 时，还必须设置
+`DATABASE_MIGRATION_URL`。应用以这个短生命周期 owner 连接执行迁移并原子
+启用/强制 RLS，关闭迁移连接后才建立 runtime 连接。生产实例应保持
+`AUTO_MIGRATE=false`，由独立发布任务运行 `cmd/migrate` 和 RLS cutover，
+不要向长期运行的应用容器注入迁移凭据。
+
 ## 常用命令
 
 在仓库根目录执行：
@@ -72,13 +84,28 @@ make -C server migrate-drop
 make server-dev
 ```
 
-只有显式设置以下变量才会在启动时运行相同的标准迁移：
+只有显式设置迁移 URL 和以下变量，才会在启动时运行相同的标准迁移并
+完成 FORCE RLS cutover：
 
 ```bash
-cd server && AUTO_MIGRATE=true go run ./cmd/chronodesk
+cd server && \
+  AUTO_MIGRATE=true \
+  DATABASE_MIGRATION_URL='postgres://migration-role:...@localhost/chronodesk?sslmode=disable' \
+  DATABASE_RUNTIME_URL='postgres://runtime-role:...@localhost/chronodesk?sslmode=disable' \
+  go run ./cmd/chronodesk
 ```
 
 生产发布建议把迁移作为独立部署步骤，并在应用实例启动时保持 `AUTO_MIGRATE=false`，避免多个实例同时执行 DDL。
+
+项目请求在一个带 `SET LOCAL` 范围的短事务内执行，响应只有在 COMMIT
+成功后才发给客户端。普通 JSON 响应在内存缓冲；较大的附件响应使用有界
+临时文件，项目路由不允许 WebSocket、实时 flush 或 HTTP/2 push。后台
+Worker 必须按项目把 claim 与 finalize 分成两个短事务，网络投递、模型调用
+和文件处理不得占用数据库事务。
+
+启动时的数据库密钥信封校验同样使用 runtime 角色：服务先从可信项目目录
+枚举全部项目，再逐项目进入短 RLS 事务校验 Webhook 与 A2A Push 凭据；
+全局 SMTP 配置单独校验。禁止用无范围扫描的“零行结果”判定密钥健康。
 
 ## 事件契约迁移门禁
 

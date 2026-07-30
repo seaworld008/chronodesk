@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 )
@@ -36,29 +35,28 @@ func TestSendWebhookLogEnvironment(t *testing.T) {
 	defer server.Close()
 
 	config := models.WebhookConfig{
-		Name:          "env-test",
-		Provider:      models.WebhookProviderCustom,
-		WebhookURL:    server.URL,
-		Status:        models.WebhookStatusActive,
-		RetryCount:    0,
-		RetryInterval: 1,
-		CreatedBy:     creator.ID,
+		OrganizationID: 1,
+		ProjectID:      1,
+		Name:           "env-test",
+		Provider:       models.WebhookProviderCustom,
+		WebhookURL:     server.URL,
+		Status:         models.WebhookStatusActive,
+		RetryCount:     0,
+		RetryInterval:  1,
+		CreatedBy:      creator.ID,
 	}
 	if err := db.Create(&config).Error; err != nil {
 		t.Fatalf("create webhook config: %v", err)
 	}
+	config.Secret = testCustomWebhookSecret
 
 	service := NewNotificationServiceWithProtector(db, nil)
 	useTestWebhookClient(service, server.Client())
-	event := &NotificationEvent{
-		Type:         models.WebhookEventSystemAlert,
-		ResourceID:   1,
-		ResourceType: "ticket",
-		Title:        "test",
-		Description:  "test",
-		Data:         map[string]interface{}{"ticket_number": "T-1"},
-		Timestamp:    time.Now(),
-	}
+	event, _ := newTestCustomWebhookEvent(
+		t,
+		"event-environment-log",
+		models.WebhookEventSystemAlert,
+	)
 
 	if err := service.sendWebhookAttempt(context.Background(), &config, event); err != nil {
 		t.Fatalf("sendWebhookAttempt returned error: %v", err)

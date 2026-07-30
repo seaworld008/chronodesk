@@ -22,6 +22,11 @@ func setupNativeAutomationTest(
 		t.Fatalf("migrate automation models: %v", err)
 	}
 	user := seedActorUser(t, db, "automation-native")
+	_ = testProjectOperationContext(
+		t,
+		db,
+		models.SystemActor(automationActorID),
+	)
 	native := NewAgentNativeService(db, AgentNativeOptions{
 		DefaultOutboxTargets: []OutboxTarget{
 			{Type: "automation", ID: "rules", MaxAttempts: 4},
@@ -43,6 +48,18 @@ func automationTestDeliverer(service *AutomationService) OutboxDeliverer {
 	})
 }
 
+func automationWorkerTestContext(
+	t *testing.T,
+	service *AutomationService,
+) context.Context {
+	t.Helper()
+	return testProjectOperationContext(
+		t,
+		service.db,
+		models.SystemActor(automationActorID),
+	)
+}
+
 func createAutomationRule(
 	t *testing.T,
 	service *AutomationService,
@@ -50,12 +67,21 @@ func createAutomationRule(
 	actions ...models.RuleAction,
 ) models.AutomationRule {
 	t.Helper()
+	var project models.Project
+	if err := service.db.Where(
+		"key = ?",
+		models.ProjectKey("TEST"),
+	).First(&project).Error; err != nil {
+		t.Fatalf("load automation test project: %v", err)
+	}
 	rule := models.AutomationRule{
-		Name:         "native " + trigger,
-		RuleType:     "assignment",
-		IsActive:     true,
-		Priority:     1,
-		TriggerEvent: trigger,
+		OrganizationID: project.OrganizationID,
+		ProjectID:      project.ID,
+		Name:           "native " + trigger,
+		RuleType:       "assignment",
+		IsActive:       true,
+		Priority:       1,
+		TriggerEvent:   trigger,
 	}
 	if err := rule.SetConditions(nil); err != nil {
 		t.Fatalf("set conditions: %v", err)
@@ -75,7 +101,8 @@ func createAutomationTestTicket(
 	user models.User,
 ) *NativeTicketCreateResult {
 	t.Helper()
-	result, err := native.CreateNativeTicket(context.Background(), NativeTicketCreateInput{
+	ctx := testProjectOperationContext(t, native.db, models.HumanActor(user.ID))
+	result, err := native.CreateNativeTicket(ctx, NativeTicketCreateInput{
 		Request: models.TicketCreateRequest{
 			Title:       "Agent-native automation",
 			Description: "created through the transactional domain service",
@@ -235,7 +262,10 @@ func TestDomainEventAutomationUsesNativeCommandsAndIsIdempotent(t *testing.T) {
 		First(&originalDelivery).Error; err != nil {
 		t.Fatalf("load original delivery: %v", err)
 	}
-	if err := native.ReplayOutbox(context.Background(), originalDelivery.ID); err != nil {
+	if err := native.ReplayOutbox(
+		automationWorkerTestContext(t, automation),
+		originalDelivery.ID,
+	); err != nil {
 		t.Fatalf("replay original delivery: %v", err)
 	}
 	if _, err := native.ProcessOutboxBatch(
@@ -299,7 +329,8 @@ func TestNativeUpdatedEventTriggersAutomationComment(t *testing.T) {
 		},
 	)
 	created := createAutomationTestTicket(t, native, user)
-	updated, err := native.UpdateTicketVersion(context.Background(), VersionedTicketUpdateInput{
+	ctx := testProjectOperationContext(t, automation.db, models.HumanActor(user.ID))
+	updated, err := native.UpdateTicketVersion(ctx, VersionedTicketUpdateInput{
 		TicketID:        created.Ticket.ID,
 		ExpectedVersion: created.Ticket.Version,
 		Actor:           models.HumanActor(user.ID),
@@ -492,12 +523,16 @@ func TestAutomationConcurrentSiblingDeliveriesHaveOneRuleOwnerAndOneStatistic(t 
 	}
 	rule := createAutomationRule(t, automation, eventcontract.TicketUpdatedEventType, action)
 
-	root, err := native.createDomainEvent(context.Background(), DomainEventInput{
+	root, err := native.createDomainEvent(t, context.Background(), DomainEventInput{
 		Type:            "io.chronodesk.ticket.updated.v1",
 		Subject:         fmt.Sprintf("ticket/%d", ticket.ID),
 		Actor:           models.HumanActor(creator.ID),
 		ResourceVersion: ticket.Version,
-		Data:            map[string]any{"ticket_id": ticket.ID},
+		Scope: models.ProjectScope{
+			OrganizationID: ticket.OrganizationID,
+			ProjectID:      ticket.ProjectID,
+		},
+		Data: map[string]any{"ticket_id": ticket.ID},
 	}, []OutboxTarget{{Type: "test-root", ID: "not-delivered"}})
 	if err != nil {
 		t.Fatal(err)
@@ -510,7 +545,7 @@ func TestAutomationConcurrentSiblingDeliveriesHaveOneRuleOwnerAndOneStatistic(t 
 
 	children := make([]*models.DomainEvent, 0, 2)
 	for index := 0; index < 2; index++ {
-		child, createErr := native.createDomainEvent(context.Background(), DomainEventInput{
+		child, createErr := native.createDomainEvent(t, context.Background(), DomainEventInput{
 			Type:            "io.chronodesk.ticket.updated.v1",
 			Subject:         fmt.Sprintf("ticket/%d", ticket.ID),
 			Actor:           models.SystemActor(fmt.Sprintf("sibling-%d", index)),
@@ -518,7 +553,11 @@ func TestAutomationConcurrentSiblingDeliveriesHaveOneRuleOwnerAndOneStatistic(t 
 			TraceID:         root.ID,
 			CorrelationID:   root.ID,
 			CausationID:     root.ID,
-			Data:            map[string]any{"ticket_id": ticket.ID},
+			Scope: models.ProjectScope{
+				OrganizationID: ticket.OrganizationID,
+				ProjectID:      ticket.ProjectID,
+			},
+			Data: map[string]any{"ticket_id": ticket.ID},
 		}, []OutboxTarget{{Type: "automation", ID: "rules", MaxAttempts: 4}})
 		if createErr != nil {
 			t.Fatal(createErr)
@@ -536,7 +575,7 @@ func TestAutomationConcurrentSiblingDeliveriesHaveOneRuleOwnerAndOneStatistic(t 
 		t.Fatal(err)
 	}
 	blockedAction, err := native.ReserveIdempotency(
-		context.Background(),
+		automationWorkerTestContext(t, automation),
 		models.SystemActor(automationActorID),
 		automationActionOperation,
 		automationActionKey(root.ID, rule.ID, 0),
@@ -713,12 +752,16 @@ func TestAutomationRuleExecutionClaimRecoversAfterExpiry(t *testing.T) {
 		eventcontract.TicketUpdatedEventType,
 		action,
 	)
-	root, err := native.createDomainEvent(context.Background(), DomainEventInput{
+	root, err := native.createDomainEvent(t, context.Background(), DomainEventInput{
 		Type:            "io.chronodesk.ticket.updated.v1",
 		Subject:         fmt.Sprintf("ticket/%d", ticket.ID),
 		Actor:           models.HumanActor(creator.ID),
 		ResourceVersion: ticket.Version,
-		Data:            map[string]any{"ticket_id": ticket.ID},
+		Scope: models.ProjectScope{
+			OrganizationID: ticket.OrganizationID,
+			ProjectID:      ticket.ProjectID,
+		},
+		Data: map[string]any{"ticket_id": ticket.ID},
 	}, []OutboxTarget{{Type: "test-root", ID: "not-delivered"}})
 	if err != nil {
 		t.Fatal(err)
@@ -728,7 +771,7 @@ func TestAutomationRuleExecutionClaimRecoversAfterExpiry(t *testing.T) {
 		Delete(&models.OutboxDelivery{}).Error; err != nil {
 		t.Fatal(err)
 	}
-	child, err := native.createDomainEvent(context.Background(), DomainEventInput{
+	child, err := native.createDomainEvent(t, context.Background(), DomainEventInput{
 		Type:            "io.chronodesk.ticket.updated.v1",
 		Subject:         fmt.Sprintf("ticket/%d", ticket.ID),
 		Actor:           models.SystemActor("claim-recovery-source"),
@@ -736,7 +779,11 @@ func TestAutomationRuleExecutionClaimRecoversAfterExpiry(t *testing.T) {
 		TraceID:         root.ID,
 		CorrelationID:   root.ID,
 		CausationID:     root.ID,
-		Data:            map[string]any{"ticket_id": ticket.ID},
+		Scope: models.ProjectScope{
+			OrganizationID: ticket.OrganizationID,
+			ProjectID:      ticket.ProjectID,
+		},
+		Data: map[string]any{"ticket_id": ticket.ID},
 	}, []OutboxTarget{{Type: "automation", ID: "rules"}})
 	if err != nil {
 		t.Fatal(err)
@@ -748,7 +795,7 @@ func TestAutomationRuleExecutionClaimRecoversAfterExpiry(t *testing.T) {
 	}
 
 	staleClaim, err := automation.reserveNativeRuleExecution(
-		context.Background(),
+		automationWorkerTestContext(t, automation),
 		root.ID,
 		&rule,
 	)
@@ -756,7 +803,7 @@ func TestAutomationRuleExecutionClaimRecoversAfterExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := automation.executeNativeAction(
-		context.Background(),
+		automationWorkerTestContext(t, automation),
 		CloudEventFromModel(child),
 		root.ID,
 		&rule,
@@ -778,7 +825,7 @@ func TestAutomationRuleExecutionClaimRecoversAfterExpiry(t *testing.T) {
 	}
 
 	if err := automation.completeNativeRuleExecution(
-		context.Background(),
+		automationWorkerTestContext(t, automation),
 		staleClaim,
 		&rule,
 		&ticket,
@@ -1031,12 +1078,16 @@ func TestAutomationDeletedRuleResumesFromFrozenSnapshot(t *testing.T) {
 		Params: map[string]interface{}{"content": "deleted rule snapshot resumed"},
 	}
 	rule := createAutomationRule(t, automation, eventcontract.TicketUpdatedEventType, action)
-	root, err := native.createDomainEvent(context.Background(), DomainEventInput{
+	root, err := native.createDomainEvent(t, context.Background(), DomainEventInput{
 		Type:            "io.chronodesk.ticket.updated.v1",
 		Subject:         fmt.Sprintf("ticket/%d", ticket.ID),
 		Actor:           models.HumanActor(creator.ID),
 		ResourceVersion: ticket.Version,
-		Data:            map[string]any{"ticket_id": ticket.ID},
+		Scope: models.ProjectScope{
+			OrganizationID: ticket.OrganizationID,
+			ProjectID:      ticket.ProjectID,
+		},
+		Data: map[string]any{"ticket_id": ticket.ID},
 	}, []OutboxTarget{{Type: "test-root", ID: "not-delivered"}})
 	if err != nil {
 		t.Fatal(err)
@@ -1046,7 +1097,7 @@ func TestAutomationDeletedRuleResumesFromFrozenSnapshot(t *testing.T) {
 		Delete(&models.OutboxDelivery{}).Error; err != nil {
 		t.Fatal(err)
 	}
-	child, err := native.createDomainEvent(context.Background(), DomainEventInput{
+	child, err := native.createDomainEvent(t, context.Background(), DomainEventInput{
 		Type:            "io.chronodesk.ticket.updated.v1",
 		Subject:         fmt.Sprintf("ticket/%d", ticket.ID),
 		Actor:           models.SystemActor("deleted-rule-source"),
@@ -1054,7 +1105,11 @@ func TestAutomationDeletedRuleResumesFromFrozenSnapshot(t *testing.T) {
 		TraceID:         root.ID,
 		CorrelationID:   root.ID,
 		CausationID:     root.ID,
-		Data:            map[string]any{"ticket_id": ticket.ID},
+		Scope: models.ProjectScope{
+			OrganizationID: ticket.OrganizationID,
+			ProjectID:      ticket.ProjectID,
+		},
+		Data: map[string]any{"ticket_id": ticket.ID},
 	}, []OutboxTarget{{Type: "automation", ID: "rules"}})
 	if err != nil {
 		t.Fatal(err)
@@ -1064,7 +1119,11 @@ func TestAutomationDeletedRuleResumesFromFrozenSnapshot(t *testing.T) {
 		Delete(&models.OutboxDelivery{}).Error; err != nil {
 		t.Fatal(err)
 	}
-	claim, err := automation.reserveNativeRuleExecution(context.Background(), root.ID, &rule)
+	claim, err := automation.reserveNativeRuleExecution(
+		automationWorkerTestContext(t, automation),
+		root.ID,
+		&rule,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1153,12 +1212,16 @@ func TestAutomationConditionDecisionSurvivesCrashBeforeFirstAction(t *testing.T)
 			if err := automation.db.Model(&rule).Update("conditions", rule.Conditions).Error; err != nil {
 				t.Fatal(err)
 			}
-			event, err := native.createDomainEvent(context.Background(), DomainEventInput{
+			event, err := native.createDomainEvent(t, context.Background(), DomainEventInput{
 				Type:            "io.chronodesk.ticket.updated.v1",
 				Subject:         fmt.Sprintf("ticket/%d", ticket.ID),
 				Actor:           models.HumanActor(creator.ID),
 				ResourceVersion: ticket.Version,
-				Data:            map[string]any{"ticket_id": ticket.ID},
+				Scope: models.ProjectScope{
+					OrganizationID: ticket.OrganizationID,
+					ProjectID:      ticket.ProjectID,
+				},
+				Data: map[string]any{"ticket_id": ticket.ID},
 			}, []OutboxTarget{{Type: "test-root", ID: "not-delivered"}})
 			if err != nil {
 				t.Fatal(err)
@@ -1170,7 +1233,7 @@ func TestAutomationConditionDecisionSurvivesCrashBeforeFirstAction(t *testing.T)
 			}
 
 			claim, err := automation.reserveNativeRuleExecution(
-				context.Background(),
+				automationWorkerTestContext(t, automation),
 				event.ID,
 				&rule,
 			)
@@ -1186,7 +1249,7 @@ func TestAutomationConditionDecisionSurvivesCrashBeforeFirstAction(t *testing.T)
 				t.Fatalf("initial condition=%t, want %t", evaluated, tt.wantMatched)
 			}
 			if err := automation.persistNativeRuleConditionDecision(
-				context.Background(),
+				automationWorkerTestContext(t, automation),
 				claim,
 				evaluated,
 			); err != nil {
@@ -1273,14 +1336,14 @@ func TestAutomationOpaqueRootIDsDoNotShareSnapshotsOrActionKeys(t *testing.T) {
 	const firstRoot = "abc"
 	const secondRoot = "abc:def"
 	if _, err := automation.reserveNativeRuleExecution(
-		context.Background(),
+		automationWorkerTestContext(t, automation),
 		firstRoot,
 		&first,
 	); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := automation.reserveNativeRuleExecution(
-		context.Background(),
+		automationWorkerTestContext(t, automation),
 		secondRoot,
 		&second,
 	); err != nil {
@@ -1288,7 +1351,7 @@ func TestAutomationOpaqueRootIDsDoNotShareSnapshotsOrActionKeys(t *testing.T) {
 	}
 
 	firstRules, err := automation.loadIncompleteNativeRuleSnapshots(
-		context.Background(),
+		automationWorkerTestContext(t, automation),
 		firstRoot,
 		first.TriggerEvent,
 	)
@@ -1296,7 +1359,7 @@ func TestAutomationOpaqueRootIDsDoNotShareSnapshotsOrActionKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	secondRules, err := automation.loadIncompleteNativeRuleSnapshots(
-		context.Background(),
+		automationWorkerTestContext(t, automation),
 		secondRoot,
 		second.TriggerEvent,
 	)
@@ -1439,12 +1502,16 @@ func TestAutomationDomainEventMatchesRuleTypeExactly(t *testing.T) {
 			Params: map[string]interface{}{"content": "updated event matched"},
 		},
 	)
-	if _, err := native.createDomainEvent(context.Background(), DomainEventInput{
+	if _, err := native.createDomainEvent(t, context.Background(), DomainEventInput{
 		Type:            eventcontract.TicketAssignedEventType,
 		Subject:         fmt.Sprintf("ticket/%d", ticket.ID),
 		Actor:           models.HumanActor(creator.ID),
 		ResourceVersion: ticket.Version,
-		Data:            map[string]any{"ticket_id": ticket.ID},
+		Scope: models.ProjectScope{
+			OrganizationID: ticket.OrganizationID,
+			ProjectID:      ticket.ProjectID,
+		},
+		Data: map[string]any{"ticket_id": ticket.ID},
 	}, []OutboxTarget{{Type: "automation", ID: "rules", MaxAttempts: 4}}); err != nil {
 		t.Fatal(err)
 	}

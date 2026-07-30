@@ -2,6 +2,8 @@ package models
 
 import (
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // CommentType 评论类型枚举
@@ -21,6 +23,8 @@ type TicketComment struct {
 	DeletedAt *time.Time `json:"deleted_at,omitempty" gorm:"index"`
 
 	// 关联信息
+	OrganizationID     uint              `json:"organization_id" gorm:"index"`
+	ProjectID          uint              `json:"project_id" gorm:"index"`
 	TicketID           uint              `json:"ticket_id" gorm:"not null;index"`
 	Ticket             *Ticket           `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
 	UserID             *uint             `json:"user_id,omitempty" gorm:"index"`
@@ -73,6 +77,15 @@ func (TicketComment) TableName() string {
 	return "ticket_comments"
 }
 
+func (comment *TicketComment) BeforeCreate(tx *gorm.DB) error {
+	return inheritTicketProjectScope(
+		tx,
+		comment.TicketID,
+		&comment.OrganizationID,
+		&comment.ProjectID,
+	)
+}
+
 // Actor returns the authoritative ActorRef. Migration and database constraints
 // guarantee that it is complete and consistent with the optional projection.
 func (tc *TicketComment) Actor() ActorRef {
@@ -98,6 +111,8 @@ type TicketCommentResponse struct {
 	CreatedAt        time.Time                `json:"created_at"`
 	UpdatedAt        time.Time                `json:"updated_at"`
 	TicketID         uint                     `json:"ticket_id"`
+	OrganizationID   uint                     `json:"organization_id"`
+	ProjectID        uint                     `json:"project_id"`
 	User             *UserSummary             `json:"user,omitempty"`
 	Actor            ActorRef                 `json:"actor"`
 	ServicePrincipal *ServicePrincipalSummary `json:"service_principal,omitempty"`
@@ -128,6 +143,8 @@ func (tc *TicketComment) ToResponse() *TicketCommentResponse {
 		CreatedAt:        tc.CreatedAt,
 		UpdatedAt:        tc.UpdatedAt,
 		TicketID:         tc.TicketID,
+		OrganizationID:   tc.OrganizationID,
+		ProjectID:        tc.ProjectID,
 		Actor:            tc.Actor(),
 		Content:          tc.Content,
 		ContentType:      tc.ContentType,

@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"testing"
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
@@ -13,10 +14,17 @@ import (
 // adapters must use the audited command methods instead of bypassing policy,
 // idempotency, and event creation through low-level lease operations.
 func (s *AgentNativeService) createDomainEvent(
+	t *testing.T,
 	ctx context.Context,
 	input DomainEventInput,
 	targets []OutboxTarget,
 ) (*models.DomainEvent, error) {
+	t.Helper()
+	if input.Scope.IsZero() {
+		if _, err := OperationContextFromContext(ctx); err != nil {
+			ctx = testProjectOperationContext(t, s.db, input.Actor)
+		}
+	}
 	var event *models.DomainEvent
 	err := s.InTransaction(ctx, func(txCtx context.Context, tx *gorm.DB) error {
 		var err error
