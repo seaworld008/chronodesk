@@ -8,6 +8,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,6 +45,17 @@ type AuthEmailOutboxConsumer interface {
 		*models.OutboxDelivery,
 		services.CloudEventEnvelope,
 	) error
+}
+
+type AttachmentUploadOutboxConsumer interface {
+	ExecuteAttachmentUploadOutbox(context.Context, uint) error
+	ExecuteAttachmentStagingCleanupOutbox(context.Context, uint) error
+}
+
+type WebSocketAccessRevoker interface {
+	RevokeProjectMembership(models.ProjectScope, uint) error
+	RevokeUser(uint) error
+	RevokeProject(models.ProjectScope) error
 }
 
 func (p *MCPResourcePublisher) PublishTicket(
@@ -82,16 +95,27 @@ func (p *MCPResourcePublisher) PublishQueue(
 // NativeOutboxDeliverer owns the side effects executed after a domain
 // transaction commits. It deliberately has no generic URL-fetch operation.
 type NativeOutboxDeliverer struct {
-	db            *gorm.DB
-	notifications *services.NotificationService
-	publisher     *MCPResourcePublisher
-	automation    *services.AutomationService
-	slaEscalation SLAEscalationConsumer
-	attachments   services.AttachmentStorage
-	authEmails    AuthEmailOutboxConsumer
-	secretStore   security.Protector
-	resolver      *net.Resolver
+	db                *gorm.DB
+	notifications     *services.NotificationService
+	publisher         *MCPResourcePublisher
+	automation        *services.AutomationService
+	slaEscalation     SLAEscalationConsumer
+	attachments       services.AttachmentStorage
+	attachmentUploads AttachmentUploadOutboxConsumer
+	knowledge         *services.KnowledgeService
+	authEmails        AuthEmailOutboxConsumer
+	accessRevocations WebSocketAccessRevoker
+	secretStore       security.Protector
+	resolver          *net.Resolver
+	a2aPushClient     a2aPushClientFactory
 }
+
+type a2aPushClientFactory func(
+	context.Context,
+	*url.URL,
+	*net.Resolver,
+	time.Duration,
+) (*http.Client, error)
 
 // NativeOutboxDelivererOptions is the complete, immutable dependency graph for
 // durable side-effect delivery. Optional consumers may be nil when that
@@ -104,7 +128,10 @@ type NativeOutboxDelivererOptions struct {
 	Automation        *services.AutomationService
 	SLAEscalation     SLAEscalationConsumer
 	AttachmentStorage services.AttachmentStorage
+	AttachmentUploads AttachmentUploadOutboxConsumer
+	Knowledge         *services.KnowledgeService
 	AuthEmails        AuthEmailOutboxConsumer
+	AccessRevocations WebSocketAccessRevoker
 	SecretProtector   security.Protector
 	Resolver          *net.Resolver
 }
@@ -151,15 +178,19 @@ func NewNativeOutboxDeliverer(options NativeOutboxDelivererOptions) (*NativeOutb
 		resolver = net.DefaultResolver
 	}
 	return &NativeOutboxDeliverer{
-		db:            options.DB,
-		notifications: options.Notifications,
-		publisher:     options.Publisher,
-		automation:    options.Automation,
-		slaEscalation: options.SLAEscalation,
-		attachments:   options.AttachmentStorage,
-		authEmails:    options.AuthEmails,
-		secretStore:   options.SecretProtector,
-		resolver:      resolver,
+		db:                options.DB,
+		notifications:     options.Notifications,
+		publisher:         options.Publisher,
+		automation:        options.Automation,
+		slaEscalation:     options.SLAEscalation,
+		attachments:       options.AttachmentStorage,
+		attachmentUploads: options.AttachmentUploads,
+		knowledge:         options.Knowledge,
+		authEmails:        options.AuthEmails,
+		accessRevocations: options.AccessRevocations,
+		secretStore:       options.SecretProtector,
+		resolver:          resolver,
+		a2aPushClient:     security.NewPinnedHTTPSClient,
 	}, nil
 }
 
@@ -173,6 +204,10 @@ func (d *NativeOutboxDeliverer) Deliver(
 	}
 	switch delivery.DestinationType {
 	case "event_stream":
+		handled, err := d.deliverWebSocketAccessRevocation(event)
+		if err != nil || handled {
+			return err
+		}
 		projectKey, err := d.projectKeyForEvent(ctx, event)
 		if err != nil {
 			return err
@@ -219,7 +254,7 @@ func (d *NativeOutboxDeliverer) Deliver(
 		}
 		return nil
 	case "a2a_push":
-		return d.deliverA2APush(ctx, event)
+		return d.deliverA2APush(ctx, delivery, event)
 	case "automation":
 		if d.automation == nil {
 			return errors.New("automation service is unavailable")
@@ -250,11 +285,141 @@ func (d *NativeOutboxDeliverer) Deliver(
 		)
 	case services.AttachmentCleanupOutboxDestination:
 		return d.deliverAttachmentCleanup(ctx, delivery, event)
+	case services.AttachmentUploadOutboxDestination:
+		if d.attachmentUploads == nil {
+			return errors.New(
+				"attachment upload consumer is unavailable",
+			)
+		}
+		attachmentID, err := safeconv.ParsePositiveUint(
+			delivery.DestinationID,
+		)
+		if err != nil {
+			return errors.New(
+				"attachment upload destination is invalid",
+			)
+		}
+		return d.attachmentUploads.ExecuteAttachmentUploadOutbox(
+			ctx,
+			attachmentID,
+		)
+	case services.AttachmentStagingCleanupOutboxDestination:
+		if d.attachmentUploads == nil {
+			return errors.New(
+				"attachment staging cleanup consumer is unavailable",
+			)
+		}
+		attachmentID, err := safeconv.ParsePositiveUint(
+			delivery.DestinationID,
+		)
+		if err != nil {
+			return errors.New(
+				"attachment staging cleanup destination is invalid",
+			)
+		}
+		return d.attachmentUploads.ExecuteAttachmentStagingCleanupOutbox(
+			ctx,
+			attachmentID,
+		)
+	case services.KnowledgeIndexRebuildOutboxDestination:
+		if d.knowledge == nil {
+			return errors.New(
+				"knowledge index rebuild consumer is unavailable",
+			)
+		}
+		stateID, generation, err :=
+			parseKnowledgeIndexRebuildDestination(
+				delivery.DestinationID,
+			)
+		if err != nil {
+			return err
+		}
+		return d.knowledge.ExecuteIndexRebuildOutbox(
+			ctx,
+			stateID,
+			generation,
+		)
 	case services.EmailOutboxDestination:
 		return d.deliverEmail(ctx, delivery, event)
 	default:
 		return fmt.Errorf("unsupported outbox destination type %q", delivery.DestinationType)
 	}
+}
+
+func (d *NativeOutboxDeliverer) deliverWebSocketAccessRevocation(
+	event services.CloudEventEnvelope,
+) (bool, error) {
+	scope := models.ProjectScope{
+		OrganizationID: event.OrganizationID,
+		ProjectID:      event.ProjectID,
+	}
+	switch event.Type {
+	case services.ProjectMembershipDeactivatedEventType:
+		if d == nil || d.accessRevocations == nil {
+			return true, errors.New(
+				"WebSocket membership revocation consumer is unavailable",
+			)
+		}
+		var data struct {
+			UserID uint `json:"user_id"`
+		}
+		if err := json.Unmarshal(event.Data, &data); err != nil ||
+			data.UserID == 0 {
+			return true, errors.New(
+				"WebSocket membership revocation event is invalid",
+			)
+		}
+		return true, d.accessRevocations.RevokeProjectMembership(
+			scope,
+			data.UserID,
+		)
+	case services.UserAccessRevokedEventType:
+		if d == nil || d.accessRevocations == nil {
+			return true, errors.New(
+				"WebSocket user revocation consumer is unavailable",
+			)
+		}
+		var data struct {
+			UserID uint `json:"user_id"`
+		}
+		if err := json.Unmarshal(event.Data, &data); err != nil ||
+			data.UserID == 0 {
+			return true, errors.New(
+				"WebSocket user revocation event is invalid",
+			)
+		}
+		return true, d.accessRevocations.RevokeUser(data.UserID)
+	case services.ProjectAccessRevokedEventType:
+		if d == nil || d.accessRevocations == nil {
+			return true, errors.New(
+				"WebSocket project revocation consumer is unavailable",
+			)
+		}
+		return true, d.accessRevocations.RevokeProject(scope)
+	default:
+		return false, nil
+	}
+}
+
+func parseKnowledgeIndexRebuildDestination(
+	destinationID string,
+) (string, uint64, error) {
+	stateID, generationText, ok := strings.Cut(
+		strings.TrimSpace(destinationID),
+		":",
+	)
+	if !ok || strings.TrimSpace(stateID) == "" {
+		return "", 0, errors.New(
+			"knowledge index rebuild destination is invalid",
+		)
+	}
+	generation, err := strconv.ParseUint(generationText, 10, 64)
+	if err != nil || generation == 0 {
+		return "", 0, errors.New(
+			"knowledge index rebuild generation is invalid",
+		)
+	}
+	return stateID, generation, nil
 }
 
 // validateOutboxDeliveryOperation prevents adapters and tests from bypassing
@@ -538,65 +703,80 @@ func parseWebhookSnapshotDestinationID(
 
 func (d *NativeOutboxDeliverer) deliverA2APush(
 	ctx context.Context,
+	delivery *models.OutboxDelivery,
 	event services.CloudEventEnvelope,
 ) error {
+	snapshotID, err := parseA2APushSnapshotDestinationID(
+		delivery.DestinationID,
+	)
+	if err != nil {
+		return err
+	}
 	var data struct {
-		TaskID         string          `json:"a2a_task_id"`
-		PushConfigID   string          `json:"push_config_id"`
-		StreamResponse json.RawMessage `json:"stream_response"`
+		TaskID         string `json:"a2a_task_id"`
+		PushSnapshotID string `json:"push_snapshot_id"`
 	}
 	if err := json.Unmarshal(event.Data, &data); err != nil {
 		return fmt.Errorf("decode A2A push event: %w", err)
 	}
-	if data.TaskID == "" || data.PushConfigID == "" || len(data.StreamResponse) == 0 {
+	if data.TaskID == "" ||
+		data.PushSnapshotID == "" ||
+		data.PushSnapshotID != snapshotID {
 		return errors.New("A2A push event is incomplete")
 	}
 
-	var row models.AgentPushNotificationConfig
-	scope := models.ProjectScope{
-		OrganizationID: event.OrganizationID,
-		ProjectID:      event.ProjectID,
-	}
+	var snapshot models.A2APushDeliverySnapshot
+	scope := outboxDeliveryScope(delivery)
 	if err := d.withProjectTransaction(
 		ctx,
 		scope,
 		func(tx *gorm.DB) error {
 			return tx.Where(
-				"id = ? AND task_id = ? AND organization_id = ? AND project_id = ?",
-				data.PushConfigID,
+				"id = ? AND event_id = ? AND task_id = ? AND organization_id = ? AND project_id = ?",
+				snapshotID,
+				event.ID,
 				data.TaskID,
 				scope.OrganizationID,
 				scope.ProjectID,
-			).First(&row).Error
+			).First(&snapshot).Error
 		},
 	); err != nil {
-		return fmt.Errorf("load A2A push configuration: %w", err)
+		return fmt.Errorf("load A2A push delivery snapshot: %w", err)
 	}
 
-	request, err := newA2APushRequest(ctx, row.URL, data.StreamResponse, event.ID)
+	request, err := newA2APushSnapshotRequest(
+		ctx,
+		snapshot.CallbackURL,
+		json.RawMessage(snapshot.RequestBody),
+		snapshot.EventID,
+		snapshot.ContentType,
+		snapshot.ProtocolVersion,
+	)
 	if err != nil {
 		return errors.New("A2A Push 回调请求无效")
 	}
 	token, err := security.RevealOptional(
 		d.secretStore,
-		row.Token,
-		security.FieldAAD("agent_push_notification_configs", row.ID, "token"),
+		snapshot.TokenCiphertext,
+		a2aPushSnapshotSecretAAD(snapshot, "token"),
 	)
 	if err != nil {
 		return fmt.Errorf("decrypt A2A push token: %w", err)
 	}
+	if strings.ContainsAny(token, "\r\n") {
+		return errors.New("A2A push token contains invalid characters")
+	}
 	if token != "" {
 		request.Header.Set("X-A2A-Notification-Token", token)
 	}
-	if len(row.Authentication) > 0 && string(row.Authentication) != "null" {
-		var envelope string
-		if err := json.Unmarshal(row.Authentication, &envelope); err != nil {
-			return fmt.Errorf("decode A2A push authentication envelope: %w", security.ErrPlaintextSecret)
-		}
+	if snapshot.AuthenticationCiphertext != "" {
 		plaintext, err := security.RevealOptional(
 			d.secretStore,
-			envelope,
-			security.FieldAAD("agent_push_notification_configs", row.ID, "authentication"),
+			snapshot.AuthenticationCiphertext,
+			a2aPushSnapshotSecretAAD(
+				snapshot,
+				"authentication",
+			),
 		)
 		if err != nil {
 			return fmt.Errorf("decrypt A2A push authentication: %w", err)
@@ -613,7 +793,10 @@ func (d *NativeOutboxDeliverer) deliverA2APush(
 		}
 	}
 
-	client, err := security.NewPinnedHTTPSClient(
+	if d.a2aPushClient == nil {
+		return errors.New("A2A Push 回调地址不可用")
+	}
+	client, err := d.a2aPushClient(
 		ctx,
 		request.URL,
 		d.resolver,
@@ -634,12 +817,61 @@ func (d *NativeOutboxDeliverer) deliverA2APush(
 	return nil
 }
 
+func parseA2APushSnapshotDestinationID(
+	destinationID string,
+) (string, error) {
+	if !strings.HasPrefix(
+		destinationID,
+		a2aPushSnapshotDestinationPrefix,
+	) {
+		return "", errors.New(
+			"A2A push Outbox destination snapshot is invalid",
+		)
+	}
+	value := strings.TrimPrefix(
+		destinationID,
+		a2aPushSnapshotDestinationPrefix,
+	)
+	parsed, err := uuid.Parse(value)
+	if err != nil ||
+		parsed.String() != value ||
+		parsed.Version() != 7 {
+		return "", errors.New(
+			"A2A push Outbox destination snapshot is invalid",
+		)
+	}
+	return value, nil
+}
+
 func newA2APushRequest(
 	ctx context.Context,
 	target string,
 	payload json.RawMessage,
 	eventID string,
 ) (*http.Request, error) {
+	return newA2APushSnapshotRequest(
+		ctx,
+		target,
+		payload,
+		eventID,
+		"application/a2a+json",
+		a2a.ProtocolVersion,
+	)
+}
+
+func newA2APushSnapshotRequest(
+	ctx context.Context,
+	target string,
+	payload json.RawMessage,
+	eventID string,
+	contentType string,
+	protocolVersion string,
+) (*http.Request, error) {
+	if contentType != "application/a2a+json" ||
+		protocolVersion != a2a.ProtocolVersion ||
+		!json.Valid(payload) {
+		return nil, errors.New("invalid A2A push request snapshot")
+	}
 	request, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
@@ -649,8 +881,8 @@ func newA2APushRequest(
 	if err != nil {
 		return nil, errors.New("invalid A2A push callback URL")
 	}
-	request.Header.Set("Content-Type", "application/a2a+json")
-	request.Header.Set("A2A-Version", a2a.ProtocolVersion)
+	request.Header.Set("Content-Type", contentType)
+	request.Header.Set("A2A-Version", protocolVersion)
 	request.Header.Set("X-CloudEvents-ID", eventID)
 	return request, nil
 }

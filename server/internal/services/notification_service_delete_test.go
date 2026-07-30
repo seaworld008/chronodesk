@@ -16,7 +16,7 @@ func TestDeleteNotification(t *testing.T) {
 		Username:     "e2e",
 		Email:        "e2e@example.com",
 		PasswordHash: "hash",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {

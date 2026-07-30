@@ -2,92 +2,154 @@ package services
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"runtime"
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
-// AnalyticsService 系统监控统计服务
+var (
+	ErrAnalyticsAuthorizedProjectSetRequired = errors.New(
+		"analytics authorized project set is required",
+	)
+	ErrAnalyticsInvalidTimeRange = errors.New(
+		"analytics time range is invalid",
+	)
+)
+
+// AnalyticsAuthorizedProjectSet is trusted control data resolved by a
+// server-side membership/grant resolver. Transport payloads must never build
+// this value directly. Adapters must resolve a fresh set for every request so a
+// revoked membership disappears from the next query.
+type AnalyticsAuthorizedProjectSet struct {
+	OrganizationID uint
+	ProjectIDs     []uint
+	humanUserID    uint
+}
+
+func (authorized AnalyticsAuthorizedProjectSet) validate() error {
+	if authorized.OrganizationID == 0 || authorized.humanUserID == 0 {
+		return ErrAnalyticsAuthorizedProjectSetRequired
+	}
+	return nil
+}
+
+func (authorized AnalyticsAuthorizedProjectSet) snapshot() AnalyticsAuthorizedProjectSet {
+	authorized.ProjectIDs = append([]uint(nil), authorized.ProjectIDs...)
+	return authorized
+}
+
+// NewHumanAnalyticsAuthorizedProjectSet binds a server-resolved project set to
+// the authenticated human whose live memberships will be checked again inside
+// the analytics transaction. The subject remains private so transport-decoded
+// data cannot construct a trusted authorization fact.
+func NewHumanAnalyticsAuthorizedProjectSet(
+	humanUserID uint,
+	organizationID uint,
+	projectIDs []uint,
+) (AnalyticsAuthorizedProjectSet, error) {
+	authorized := AnalyticsAuthorizedProjectSet{
+		OrganizationID: organizationID,
+		ProjectIDs:     append([]uint(nil), projectIDs...),
+		humanUserID:    humanUserID,
+	}
+	if err := authorized.validate(); err != nil {
+		return AnalyticsAuthorizedProjectSet{}, err
+	}
+	return authorized, nil
+}
+
+// AnalyticsService keeps platform observability separate from project-owned
+// business analytics. Project business methods always enter an authorized
+// project-set transaction before reading any business table.
 type AnalyticsService struct {
 	db *gorm.DB
 }
 
-// NewAnalyticsService 创建分析服务实例
 func NewAnalyticsService(db *gorm.DB) *AnalyticsService {
 	return &AnalyticsService{db: db}
 }
 
-// SystemStats 系统运行状态统计
+// SystemStats contains runtime metrics that can be read truthfully from the Go
+// runtime. Uptime is deliberately absent: this service has no authoritative
+// lifecycle start source, so it must not fabricate one from the current time.
 type SystemStats struct {
-	// 基础系统信息
-	Uptime     time.Duration `json:"uptime"`
-	CPUCount   int           `json:"cpu_count"`
-	GoVersion  string        `json:"go_version"`
-	ServerTime time.Time     `json:"server_time"`
-
-	// Go 运行时统计
-	GoRoutines int   `json:"goroutines"`
-	CGOCalls   int64 `json:"cgo_calls"`
-
-	// 内存统计
-	MemStats MemoryStats `json:"memory_stats"`
-
-	// GC 统计
-	GCStats GCStats `json:"gc_stats"`
+	CPUCount   int         `json:"cpu_count"`
+	GoVersion  string      `json:"go_version"`
+	ServerTime time.Time   `json:"server_time"`
+	GoRoutines int         `json:"goroutines"`
+	CGOCalls   int64       `json:"cgo_calls"`
+	MemStats   MemoryStats `json:"memory_stats"`
+	GCStats    GCStats     `json:"gc_stats"`
 }
 
-// MemoryStats 内存统计信息
 type MemoryStats struct {
-	// 堆内存
-	HeapAlloc    uint64 `json:"heap_alloc"`    // 当前分配的堆内存
-	HeapSys      uint64 `json:"heap_sys"`      // 从系统获取的堆内存
-	HeapIdle     uint64 `json:"heap_idle"`     // 空闲堆内存
-	HeapInuse    uint64 `json:"heap_inuse"`    // 正在使用的堆内存
-	HeapReleased uint64 `json:"heap_released"` // 释放给系统的内存
-	HeapObjects  uint64 `json:"heap_objects"`  // 堆中对象数量
-
-	// 总体内存
-	Sys        uint64 `json:"sys"`         // 从系统获取的总内存
-	Alloc      uint64 `json:"alloc"`       // 当前分配的总内存
-	TotalAlloc uint64 `json:"total_alloc"` // 累计分配的内存
-
-	// 栈内存
-	StackInuse uint64 `json:"stack_inuse"` // 栈使用的内存
-	StackSys   uint64 `json:"stack_sys"`   // 栈从系统获取的内存
-
-	// 其他
-	Mallocs uint64 `json:"mallocs"` // 累计分配次数
-	Frees   uint64 `json:"frees"`   // 累计释放次数
+	HeapAlloc    uint64 `json:"heap_alloc"`
+	HeapSys      uint64 `json:"heap_sys"`
+	HeapIdle     uint64 `json:"heap_idle"`
+	HeapInuse    uint64 `json:"heap_inuse"`
+	HeapReleased uint64 `json:"heap_released"`
+	HeapObjects  uint64 `json:"heap_objects"`
+	Sys          uint64 `json:"sys"`
+	Alloc        uint64 `json:"alloc"`
+	TotalAlloc   uint64 `json:"total_alloc"`
+	StackInuse   uint64 `json:"stack_inuse"`
+	StackSys     uint64 `json:"stack_sys"`
+	Mallocs      uint64 `json:"mallocs"`
+	Frees        uint64 `json:"frees"`
 }
 
-// GCStats 垃圾回收统计
 type GCStats struct {
-	NumGC         uint32        `json:"num_gc"`          // GC次数
-	NumForcedGC   uint32        `json:"num_forced_gc"`   // 强制GC次数
-	GCCPUFraction float64       `json:"gc_cpu_fraction"` // GC CPU占用比例
-	LastGC        time.Time     `json:"last_gc"`         // 上次GC时间
-	NextGC        uint64        `json:"next_gc"`         // 下次GC阈值
-	PauseTotal    time.Duration `json:"pause_total"`     // 总暂停时间
-	PauseNs       []uint64      `json:"pause_ns"`        // 最近暂停时间(纳秒)
+	NumGC         uint32        `json:"num_gc"`
+	NumForcedGC   uint32        `json:"num_forced_gc"`
+	GCCPUFraction float64       `json:"gc_cpu_fraction"`
+	LastGC        *time.Time    `json:"last_gc,omitempty"`
+	NextGC        uint64        `json:"next_gc"`
+	PauseTotal    time.Duration `json:"pause_total"`
+	PauseNs       []uint64      `json:"pause_ns"`
 }
 
-// BusinessStats 业务数据统计
+// PlatformStats contains only process/runtime and platform-owned identity and
+// maintenance metrics. It never reads Ticket, TicketComment, Category, or
+// ProjectMembership.
+type PlatformStats struct {
+	Runtime *SystemStats         `json:"runtime"`
+	Users   PlatformUserStats    `json:"users"`
+	Cleanup PlatformCleanupStats `json:"cleanup"`
+}
+
+type PlatformUserStats struct {
+	Total              int64 `json:"total"`
+	Active             int64 `json:"active"`
+	PlatformAdmins     int64 `json:"platform_admins"`
+	SecurityAuditors   int64 `json:"security_auditors"`
+	EmergencyOperators int64 `json:"emergency_operators"`
+	Members            int64 `json:"members"`
+	TodayLogins        int64 `json:"today_logins"`
+	WeekLogins         int64 `json:"week_logins"`
+	MonthLogins        int64 `json:"month_logins"`
+}
+
+type PlatformCleanupStats struct {
+	CleanupJobs int64      `json:"cleanup_jobs"`
+	LastCleanup *time.Time `json:"last_cleanup,omitempty"`
+}
+
+// BusinessStats contains only data derived from the explicitly authorized
+// project set.
 type BusinessStats struct {
-	// 工单统计
-	TicketStats AnalyticsTicketStats `json:"ticket_stats"`
-
-	// 用户统计
-	UserStats UserStats `json:"user_stats"`
-
-	// 系统活动统计
-	ActivityStats ActivityStats `json:"activity_stats"`
+	TicketStats     AnalyticsTicketStats   `json:"ticket_stats"`
+	MembershipStats ProjectMembershipStats `json:"membership_stats"`
+	ActivityStats   ActivityStats          `json:"activity_stats"`
 }
 
-// AnalyticsTicketStats 工单统计
 type AnalyticsTicketStats struct {
 	Total      int64 `json:"total"`
 	Open       int64 `json:"open"`
@@ -95,553 +157,866 @@ type AnalyticsTicketStats struct {
 	Resolved   int64 `json:"resolved"`
 	Closed     int64 `json:"closed"`
 
-	// 按优先级统计
 	HighPriority   int64 `json:"high_priority"`
 	MediumPriority int64 `json:"medium_priority"`
 	LowPriority    int64 `json:"low_priority"`
 
-	// 按类型统计
 	ByCategory map[string]int64 `json:"by_category"`
 
-	// 时间范围统计
 	Today     int64 `json:"today"`
 	ThisWeek  int64 `json:"this_week"`
 	ThisMonth int64 `json:"this_month"`
 
-	// 响应时间统计
-	AvgResponseTime   float64 `json:"avg_response_time_hours"`
-	AvgResolutionTime float64 `json:"avg_resolution_time_hours"`
+	// Values are hours derived only from the durable response_time and
+	// resolution_time minute fields. Nil means the metric is unavailable
+	// because the authorized set has no real sample.
+	AvgResponseTime   *float64 `json:"avg_response_time_hours,omitempty"`
+	AvgResolutionTime *float64 `json:"avg_resolution_time_hours,omitempty"`
 }
 
-// UserStats 用户统计
-type UserStats struct {
-	Total       int64 `json:"total"`
-	Active      int64 `json:"active"` // 活跃用户(最近30天有活动)
-	Admins      int64 `json:"admins"`
-	Supervisors int64 `json:"supervisors"`
-	Agents      int64 `json:"agents"`
-	Customers   int64 `json:"customers"`
-
-	// 登录统计
-	TodayLogins int64 `json:"today_logins"`
-	WeekLogins  int64 `json:"week_logins"`
-	MonthLogins int64 `json:"month_logins"`
+type ProjectMembershipStats struct {
+	Total         int64 `json:"total"`
+	ActiveUsers   int64 `json:"active_users"`
+	ProjectAdmins int64 `json:"project_admins"`
+	Managers      int64 `json:"managers"`
+	Agents        int64 `json:"agents"`
+	Requesters    int64 `json:"requesters"`
+	Observers     int64 `json:"observers"`
 }
 
-// ActivityStats 系统活动统计
 type ActivityStats struct {
-	// 评论统计
-	TotalComments int64 `json:"total_comments"`
-	TodayComments int64 `json:"today_comments"`
-	WeekComments  int64 `json:"week_comments"`
-
-	// 分类统计
+	TotalComments   int64 `json:"total_comments"`
+	TodayComments   int64 `json:"today_comments"`
+	WeekComments    int64 `json:"week_comments"`
 	TotalCategories int64 `json:"total_categories"`
-
-	// 清理任务统计
-	CleanupJobs int64     `json:"cleanup_jobs"`
-	LastCleanup time.Time `json:"last_cleanup"`
 }
 
-// TimeRangeStats 时间范围统计
 type TimeRangeStats struct {
-	StartDate time.Time `json:"start_date"`
-	EndDate   time.Time `json:"end_date"`
-
-	// 工单趋势
-	TicketTrend []DailyCount `json:"ticket_trend"`
-
-	// 用户活动趋势
+	StartDate         time.Time    `json:"start_date"`
+	EndDate           time.Time    `json:"end_date"`
+	TicketTrend       []DailyCount `json:"ticket_trend"`
 	UserActivityTrend []DailyCount `json:"user_activity_trend"`
-
-	// 评论趋势
-	CommentTrend []DailyCount `json:"comment_trend"`
+	CommentTrend      []DailyCount `json:"comment_trend"`
 }
 
-// DailyCount 每日计数
 type DailyCount struct {
 	Date  time.Time `json:"date"`
 	Count int64     `json:"count"`
 }
 
-// GetSystemStats 获取系统运行状态
 func (s *AnalyticsService) GetSystemStats() (*SystemStats, error) {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
+	var memory runtime.MemStats
+	runtime.ReadMemStats(&memory)
 
-	// 计算运行时间(简化版，实际应该记录启动时间)
-	uptime := time.Since(time.Now().Add(-time.Hour)) // 占位符
+	var lastGC *time.Time
+	if memory.LastGC != 0 {
+		value := time.Unix(0, int64(memory.LastGC))
+		lastGC = &value
+	}
+	pauseCount := int(memory.NumGC)
+	if pauseCount > len(memory.PauseNs) {
+		pauseCount = len(memory.PauseNs)
+	}
+	pauses := make([]uint64, pauseCount)
+	copy(pauses, memory.PauseNs[:pauseCount])
 
-	stats := &SystemStats{
-		Uptime:     uptime,
+	return &SystemStats{
 		CPUCount:   runtime.NumCPU(),
 		GoVersion:  runtime.Version(),
 		ServerTime: time.Now(),
 		GoRoutines: runtime.NumGoroutine(),
 		CGOCalls:   runtime.NumCgoCall(),
-
 		MemStats: MemoryStats{
-			HeapAlloc:    m.HeapAlloc,
-			HeapSys:      m.HeapSys,
-			HeapIdle:     m.HeapIdle,
-			HeapInuse:    m.HeapInuse,
-			HeapReleased: m.HeapReleased,
-			HeapObjects:  m.HeapObjects,
-			Sys:          m.Sys,
-			Alloc:        m.Alloc,
-			TotalAlloc:   m.TotalAlloc,
-			StackInuse:   m.StackInuse,
-			StackSys:     m.StackSys,
-			Mallocs:      m.Mallocs,
-			Frees:        m.Frees,
+			HeapAlloc:    memory.HeapAlloc,
+			HeapSys:      memory.HeapSys,
+			HeapIdle:     memory.HeapIdle,
+			HeapInuse:    memory.HeapInuse,
+			HeapReleased: memory.HeapReleased,
+			HeapObjects:  memory.HeapObjects,
+			Sys:          memory.Sys,
+			Alloc:        memory.Alloc,
+			TotalAlloc:   memory.TotalAlloc,
+			StackInuse:   memory.StackInuse,
+			StackSys:     memory.StackSys,
+			Mallocs:      memory.Mallocs,
+			Frees:        memory.Frees,
 		},
-
 		GCStats: GCStats{
-			NumGC:         m.NumGC,
-			NumForcedGC:   m.NumForcedGC,
-			GCCPUFraction: m.GCCPUFraction,
-			LastGC:        time.Unix(0, int64(m.LastGC)),
-			NextGC:        m.NextGC,
-			PauseTotal:    time.Duration(m.PauseTotalNs),
-			PauseNs:       []uint64{}, // Empty for now
+			NumGC:         memory.NumGC,
+			NumForcedGC:   memory.NumForcedGC,
+			GCCPUFraction: memory.GCCPUFraction,
+			LastGC:        lastGC,
+			NextGC:        memory.NextGC,
+			PauseTotal:    time.Duration(memory.PauseTotalNs),
+			PauseNs:       pauses,
 		},
-	}
-
-	return stats, nil
-}
-
-// GetBusinessStats 获取业务数据统计
-func (s *AnalyticsService) GetBusinessStats(ctx context.Context) (*BusinessStats, error) {
-	ticketStats, err := s.getTicketStats(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get ticket stats: %v", err)
-	}
-
-	userStats, err := s.getUserStats(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get user stats: %v", err)
-	}
-
-	activityStats, err := s.getActivityStats(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get activity stats: %v", err)
-	}
-
-	return &BusinessStats{
-		TicketStats:   *ticketStats,
-		UserStats:     *userStats,
-		ActivityStats: *activityStats,
 	}, nil
 }
 
-// getTicketStats 获取工单统计
-func (s *AnalyticsService) getTicketStats(ctx context.Context) (*AnalyticsTicketStats, error) {
-	var stats AnalyticsTicketStats
-
-	// 总工单数
-	if err := s.db.WithContext(ctx).Model(&models.Ticket{}).Count(&stats.Total).Error; err != nil {
-		return nil, err
-	}
-
-	// 按状态统计
-	statusCounts := []struct {
-		Status string
-		Count  int64
-	}{}
-
-	err := s.db.WithContext(ctx).Model(&models.Ticket{}).
-		Select("status, count(*) as count").
-		Group("status").
-		Scan(&statusCounts).Error
+func (s *AnalyticsService) GetPlatformStats(
+	ctx context.Context,
+) (*PlatformStats, error) {
+	runtimeStats, err := s.GetSystemStats()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get platform runtime stats: %w", err)
 	}
-
-	for _, sc := range statusCounts {
-		switch sc.Status {
-		case "open":
-			stats.Open = sc.Count
-		case "in_progress":
-			stats.InProgress = sc.Count
-		case "resolved":
-			stats.Resolved = sc.Count
-		case "closed":
-			stats.Closed = sc.Count
-		}
-	}
-
-	// 按优先级统计
-	priorityCounts := []struct {
-		Priority string
-		Count    int64
-	}{}
-
-	err = s.db.WithContext(ctx).Model(&models.Ticket{}).
-		Select("priority, count(*) as count").
-		Group("priority").
-		Scan(&priorityCounts).Error
+	userStats, err := s.getPlatformUserStats(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get platform user stats: %w", err)
 	}
-
-	for _, pc := range priorityCounts {
-		switch pc.Priority {
-		case "high":
-			stats.HighPriority = pc.Count
-		case "medium":
-			stats.MediumPriority = pc.Count
-		case "low":
-			stats.LowPriority = pc.Count
-		}
-	}
-
-	// 按分类统计
-	stats.ByCategory = make(map[string]int64)
-	categoryCounts := []struct {
-		CategoryName string `gorm:"column:category_name"`
-		Count        int64  `gorm:"column:count"`
-	}{}
-
-	err = s.db.WithContext(ctx).Table("tickets t").
-		Select("c.name as category_name, count(*) as count").
-		Joins("LEFT JOIN categories c ON t.category_id = c.id").
-		Group("c.name").
-		Scan(&categoryCounts).Error
+	cleanupStats, err := s.getPlatformCleanupStats(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get platform cleanup stats: %w", err)
 	}
-
-	for _, cc := range categoryCounts {
-		if cc.CategoryName != "" {
-			stats.ByCategory[cc.CategoryName] = cc.Count
-		}
-	}
-
-	// 时间范围统计
-	now := time.Now()
-	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	weekStart := today.AddDate(0, 0, -int(today.Weekday()))
-	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-
-	// 今日工单
-	s.db.WithContext(ctx).Model(&models.Ticket{}).
-		Where("created_at >= ?", today).
-		Count(&stats.Today)
-
-	// 本周工单
-	s.db.WithContext(ctx).Model(&models.Ticket{}).
-		Where("created_at >= ?", weekStart).
-		Count(&stats.ThisWeek)
-
-	// 本月工单
-	s.db.WithContext(ctx).Model(&models.Ticket{}).
-		Where("created_at >= ?", monthStart).
-		Count(&stats.ThisMonth)
-
-	// 响应时间统计(简化版)
-	var avgResponse struct {
-		AvgHours float64 `gorm:"column:avg_hours"`
-	}
-
-	err = s.db.WithContext(ctx).Raw(`
-		SELECT AVG(EXTRACT(epoch FROM (updated_at - created_at))/3600) as avg_hours
-		FROM tickets 
-		WHERE status != 'open' AND updated_at > created_at
-	`).Scan(&avgResponse).Error
-
-	if err == nil {
-		stats.AvgResponseTime = avgResponse.AvgHours
-	}
-
-	// 解决时间统计
-	var avgResolution struct {
-		AvgHours float64 `gorm:"column:avg_hours"`
-	}
-
-	err = s.db.WithContext(ctx).Raw(`
-		SELECT AVG(EXTRACT(epoch FROM (updated_at - created_at))/3600) as avg_hours
-		FROM tickets 
-		WHERE status IN ('resolved', 'closed') AND updated_at > created_at
-	`).Scan(&avgResolution).Error
-
-	if err == nil {
-		stats.AvgResolutionTime = avgResolution.AvgHours
-	}
-
-	return &stats, nil
+	return &PlatformStats{
+		Runtime: runtimeStats,
+		Users:   *userStats,
+		Cleanup: *cleanupStats,
+	}, nil
 }
 
-// getUserStats 获取用户统计
-func (s *AnalyticsService) getUserStats(ctx context.Context) (*UserStats, error) {
-	var stats UserStats
-
-	// 总用户数
-	if err := s.db.WithContext(ctx).Model(&models.User{}).Count(&stats.Total).Error; err != nil {
+func (s *AnalyticsService) GetBusinessStats(
+	ctx context.Context,
+	authorized AnalyticsAuthorizedProjectSet,
+) (*BusinessStats, error) {
+	if err := authorized.validate(); err != nil {
 		return nil, err
 	}
-
-	// 按角色统计
-	roleCounts := []struct {
-		Role  string
-		Count int64
-	}{}
-
-	err := s.db.WithContext(ctx).Model(&models.User{}).
-		Select("role, count(*) as count").
-		Group("role").
-		Scan(&roleCounts).Error
+	authorized = authorized.snapshot()
+	stats := emptyBusinessStats()
+	err := s.withAuthorizedHumanProjectSetTransaction(
+		ctx,
+		authorized,
+		func(scopedCtx context.Context) error {
+			ticketStats, queryErr := s.getTicketStats(scopedCtx, authorized)
+			if queryErr != nil {
+				return fmt.Errorf("get ticket stats: %w", queryErr)
+			}
+			membershipStats, queryErr := s.getProjectMembershipStats(
+				scopedCtx,
+				authorized,
+			)
+			if queryErr != nil {
+				return fmt.Errorf("get project membership stats: %w", queryErr)
+			}
+			activityStats, queryErr := s.getActivityStats(
+				scopedCtx,
+				authorized,
+			)
+			if queryErr != nil {
+				return fmt.Errorf("get activity stats: %w", queryErr)
+			}
+			stats.TicketStats = *ticketStats
+			stats.MembershipStats = *membershipStats
+			stats.ActivityStats = *activityStats
+			return nil
+		},
+	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("query authorized business stats: %w", err)
 	}
-
-	for _, rc := range roleCounts {
-		switch rc.Role {
-		case string(models.RoleAdmin):
-			stats.Admins = rc.Count
-		case string(models.RoleSupervisor):
-			stats.Supervisors = rc.Count
-		case string(models.RoleAgent):
-			stats.Agents = rc.Count
-		case string(models.RoleCustomer):
-			stats.Customers = rc.Count
-		}
-	}
-
-	// 活跃用户(最近30天有登录记录)
-	thirtyDaysAgo := time.Now().AddDate(0, 0, -30)
-	err = s.db.WithContext(ctx).Model(&models.LoginHistory{}).
-		Select("COUNT(DISTINCT user_id)").
-		Where("login_time >= ?", thirtyDaysAgo).
-		Scan(&stats.Active).Error
-	if err != nil {
-		return nil, err
-	}
-
-	// 登录统计
-	now := time.Now()
-	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	weekStart := today.AddDate(0, 0, -int(today.Weekday()))
-	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-
-	// 今日登录
-	s.db.WithContext(ctx).Model(&models.LoginHistory{}).
-		Where("login_time >= ?", today).
-		Count(&stats.TodayLogins)
-
-	// 本周登录
-	s.db.WithContext(ctx).Model(&models.LoginHistory{}).
-		Where("login_time >= ?", weekStart).
-		Count(&stats.WeekLogins)
-
-	// 本月登录
-	s.db.WithContext(ctx).Model(&models.LoginHistory{}).
-		Where("login_time >= ?", monthStart).
-		Count(&stats.MonthLogins)
-
-	return &stats, nil
-}
-
-// getActivityStats 获取活动统计
-func (s *AnalyticsService) getActivityStats(ctx context.Context) (*ActivityStats, error) {
-	var stats ActivityStats
-
-	// 评论统计
-	if err := s.db.WithContext(ctx).Model(&models.TicketComment{}).Count(&stats.TotalComments).Error; err != nil {
-		return nil, err
-	}
-
-	// 分类统计
-	if err := s.db.WithContext(ctx).Model(&models.Category{}).Count(&stats.TotalCategories).Error; err != nil {
-		return nil, err
-	}
-
-	// 时间范围统计
-	now := time.Now()
-	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	weekStart := today.AddDate(0, 0, -int(today.Weekday()))
-
-	// 今日评论
-	s.db.WithContext(ctx).Model(&models.TicketComment{}).
-		Where("created_at >= ?", today).
-		Count(&stats.TodayComments)
-
-	// 本周评论
-	s.db.WithContext(ctx).Model(&models.TicketComment{}).
-		Where("created_at >= ?", weekStart).
-		Count(&stats.WeekComments)
-
-	// 清理任务统计(如果存在清理日志表)
-	var cleanupCount int64
-	err := s.db.WithContext(ctx).Model(&models.CleanupLog{}).Count(&cleanupCount).Error
-	if err == nil {
-		stats.CleanupJobs = cleanupCount
-
-		// 最后清理时间
-		var lastCleanup models.CleanupLog
-		if err := s.db.WithContext(ctx).Model(&models.CleanupLog{}).
-			Order("start_time DESC").First(&lastCleanup).Error; err == nil {
-			stats.LastCleanup = lastCleanup.StartTime
-		}
-	}
-
-	return &stats, nil
-}
-
-// GetTimeRangeStats 获取指定时间范围的统计数据
-func (s *AnalyticsService) GetTimeRangeStats(ctx context.Context, startDate, endDate time.Time) (*TimeRangeStats, error) {
-	stats := &TimeRangeStats{
-		StartDate: startDate,
-		EndDate:   endDate,
-	}
-
-	// 工单趋势
-	ticketTrend, err := s.getDailyTicketTrend(ctx, startDate, endDate)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get ticket trend: %v", err)
-	}
-	stats.TicketTrend = ticketTrend
-
-	// 用户活动趋势
-	userTrend, err := s.getDailyUserActivityTrend(ctx, startDate, endDate)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get user activity trend: %v", err)
-	}
-	stats.UserActivityTrend = userTrend
-
-	// 评论趋势
-	commentTrend, err := s.getDailyCommentTrend(ctx, startDate, endDate)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get comment trend: %v", err)
-	}
-	stats.CommentTrend = commentTrend
-
 	return stats, nil
 }
 
-// getDailyTicketTrend 获取每日工单趋势
-func (s *AnalyticsService) getDailyTicketTrend(ctx context.Context, startDate, endDate time.Time) ([]DailyCount, error) {
-	var results []struct {
-		Date  time.Time `gorm:"column:date"`
-		Count int64     `gorm:"column:count"`
+func (s *AnalyticsService) withAuthorizedHumanProjectSetTransaction(
+	ctx context.Context,
+	authorized AnalyticsAuthorizedProjectSet,
+	fn func(context.Context) error,
+) error {
+	return scopeddb.WithAuthorizedProjectScopeTransaction(
+		ctx,
+		s.db,
+		authorized.OrganizationID,
+		authorized.ProjectIDs,
+		func(scopedCtx context.Context) error {
+			if err := s.revalidateHumanAnalyticsProjectSet(
+				scopedCtx,
+				authorized,
+			); err != nil {
+				return err
+			}
+			if len(authorized.ProjectIDs) == 0 {
+				return nil
+			}
+			return fn(scopedCtx)
+		},
+	)
+}
+
+// revalidateHumanAnalyticsProjectSet is deliberately the first callback work
+// after SET LOCAL installs the authorized project array. Its lock order matches
+// the single-project authorization path: Project rows, Human row, Membership
+// rows. No Ticket, Comment, category, or trend query runs before it succeeds.
+func (s *AnalyticsService) revalidateHumanAnalyticsProjectSet(
+	ctx context.Context,
+	authorized AnalyticsAuthorizedProjectSet,
+) error {
+	db := s.db.WithContext(ctx)
+
+	var projects []models.Project
+	if err := db.Clauses(clause.Locking{Strength: "SHARE"}).
+		Where(
+			"organization_id = ? AND id IN ? AND status = ?",
+			authorized.OrganizationID,
+			authorized.ProjectIDs,
+			models.ProjectStatusActive,
+		).
+		Order("id ASC").
+		Find(&projects).Error; err != nil {
+		return fmt.Errorf("lock analytics projects: %w", err)
+	}
+	if len(projects) != len(authorized.ProjectIDs) {
+		return ErrProjectAccessDenied
 	}
 
-	err := s.db.WithContext(ctx).Raw(`
-		SELECT DATE(created_at) as date, COUNT(*) as count
-		FROM tickets 
-		WHERE created_at >= ? AND created_at <= ?
-		GROUP BY DATE(created_at)
-		ORDER BY date
-	`, startDate, endDate).Scan(&results).Error
-
+	var user models.User
+	err := db.Clauses(clause.Locking{Strength: "SHARE"}).
+		Select("id", "status").
+		Where(
+			"id = ? AND status = ?",
+			authorized.humanUserID,
+			models.UserStatusActive,
+		).
+		Take(&user).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return ErrProjectAccessDenied
+	}
 	if err != nil {
+		return fmt.Errorf("lock analytics human identity: %w", err)
+	}
+
+	if len(authorized.ProjectIDs) == 0 {
+		return nil
+	}
+	var memberships []models.ProjectMembership
+	if err := db.Clauses(clause.Locking{Strength: "SHARE"}).
+		Select("id", "project_id", "user_id", "role", "is_active").
+		Where(
+			"project_id IN ? AND user_id = ? AND is_active = ?",
+			authorized.ProjectIDs,
+			authorized.humanUserID,
+			true,
+		).
+		Order("project_id ASC").
+		Find(&memberships).Error; err != nil {
+		return fmt.Errorf("lock analytics project memberships: %w", err)
+	}
+	if len(memberships) != len(authorized.ProjectIDs) {
+		return ErrProjectAccessDenied
+	}
+	expected := make(map[uint]struct{}, len(authorized.ProjectIDs))
+	for _, projectID := range authorized.ProjectIDs {
+		expected[projectID] = struct{}{}
+	}
+	for _, membership := range memberships {
+		if membership.UserID != authorized.humanUserID ||
+			!membership.IsActive ||
+			!membership.Role.IsValid() {
+			return ErrProjectAccessDenied
+		}
+		if _, exists := expected[membership.ProjectID]; !exists {
+			return ErrProjectAccessDenied
+		}
+		delete(expected, membership.ProjectID)
+	}
+	if len(expected) != 0 {
+		return ErrProjectAccessDenied
+	}
+	return nil
+}
+
+func emptyBusinessStats() *BusinessStats {
+	return &BusinessStats{
+		TicketStats: AnalyticsTicketStats{
+			ByCategory: make(map[string]int64),
+		},
+	}
+}
+
+func (s *AnalyticsService) getTicketStats(
+	ctx context.Context,
+	authorized AnalyticsAuthorizedProjectSet,
+) (*AnalyticsTicketStats, error) {
+	stats := AnalyticsTicketStats{
+		ByCategory: make(map[string]int64),
+	}
+	tickets := s.authorizedTickets(ctx, authorized)
+	if err := tickets.Count(&stats.Total).Error; err != nil {
 		return nil, err
 	}
 
-	trend := make([]DailyCount, len(results))
-	for i, r := range results {
-		trend[i] = DailyCount{
-			Date:  r.Date,
-			Count: r.Count,
+	var statusCounts []struct {
+		Status models.TicketStatus
+		Count  int64
+	}
+	if err := s.authorizedTickets(ctx, authorized).
+		Select("status, count(*) AS count").
+		Group("status").
+		Scan(&statusCounts).Error; err != nil {
+		return nil, err
+	}
+	for _, value := range statusCounts {
+		switch value.Status {
+		case models.TicketStatusOpen:
+			stats.Open = value.Count
+		case models.TicketStatusInProgress:
+			stats.InProgress = value.Count
+		case models.TicketStatusResolved:
+			stats.Resolved = value.Count
+		case models.TicketStatusClosed:
+			stats.Closed = value.Count
 		}
 	}
 
-	return trend, nil
-}
-
-// getDailyUserActivityTrend 获取每日用户活动趋势
-func (s *AnalyticsService) getDailyUserActivityTrend(ctx context.Context, startDate, endDate time.Time) ([]DailyCount, error) {
-	var results []struct {
-		Date  time.Time `gorm:"column:date"`
-		Count int64     `gorm:"column:count"`
+	var priorityCounts []struct {
+		Priority models.TicketPriority
+		Count    int64
+	}
+	if err := s.authorizedTickets(ctx, authorized).
+		Select("priority, count(*) AS count").
+		Group("priority").
+		Scan(&priorityCounts).Error; err != nil {
+		return nil, err
+	}
+	for _, value := range priorityCounts {
+		switch value.Priority {
+		case models.TicketPriorityHigh:
+			stats.HighPriority = value.Count
+		case models.TicketPriorityNormal:
+			stats.MediumPriority = value.Count
+		case models.TicketPriorityLow:
+			stats.LowPriority = value.Count
+		}
 	}
 
-	err := s.db.WithContext(ctx).Raw(`
-		SELECT DATE(login_time) as date, COUNT(DISTINCT user_id) as count
-		FROM login_histories 
-		WHERE login_time >= ? AND login_time <= ?
-		GROUP BY DATE(login_time)
-		ORDER BY date
-	`, startDate, endDate).Scan(&results).Error
+	var categoryCounts []struct {
+		CategoryName string `gorm:"column:category_name"`
+		Count        int64
+	}
+	if err := s.db.WithContext(ctx).
+		Table("tickets AS tickets").
+		Select("categories.name AS category_name, count(*) AS count").
+		Joins("JOIN categories ON categories.id = tickets.category_id").
+		Where("tickets.deleted_at IS NULL").
+		Where("tickets.organization_id = ?", authorized.OrganizationID).
+		Where("tickets.project_id IN ?", authorized.ProjectIDs).
+		Group("categories.name").
+		Scan(&categoryCounts).Error; err != nil {
+		return nil, err
+	}
+	for _, value := range categoryCounts {
+		if value.CategoryName != "" {
+			stats.ByCategory[value.CategoryName] = value.Count
+		}
+	}
 
-	if err != nil {
+	now := time.Now()
+	today := dayStart(now)
+	weekStart := today.AddDate(0, 0, -int(today.Weekday()))
+	monthStart := time.Date(
+		now.Year(),
+		now.Month(),
+		1,
+		0,
+		0,
+		0,
+		0,
+		now.Location(),
+	)
+	if err := s.authorizedTickets(ctx, authorized).
+		Where("created_at >= ?", today).
+		Count(&stats.Today).Error; err != nil {
+		return nil, err
+	}
+	if err := s.authorizedTickets(ctx, authorized).
+		Where("created_at >= ?", weekStart).
+		Count(&stats.ThisWeek).Error; err != nil {
+		return nil, err
+	}
+	if err := s.authorizedTickets(ctx, authorized).
+		Where("created_at >= ?", monthStart).
+		Count(&stats.ThisMonth).Error; err != nil {
 		return nil, err
 	}
 
-	trend := make([]DailyCount, len(results))
-	for i, r := range results {
-		trend[i] = DailyCount{
-			Date:  r.Date,
-			Count: r.Count,
-		}
-	}
-
-	return trend, nil
-}
-
-// getDailyCommentTrend 获取每日评论趋势
-func (s *AnalyticsService) getDailyCommentTrend(ctx context.Context, startDate, endDate time.Time) ([]DailyCount, error) {
-	var results []struct {
-		Date  time.Time `gorm:"column:date"`
-		Count int64     `gorm:"column:count"`
-	}
-
-	err := s.db.WithContext(ctx).Raw(`
-		SELECT DATE(created_at) as date, COUNT(*) as count
-		FROM ticket_comments 
-		WHERE created_at >= ? AND created_at <= ?
-		GROUP BY DATE(created_at)
-		ORDER BY date
-	`, startDate, endDate).Scan(&results).Error
-
+	responseHours, err := s.averagePersistedTicketMinutes(
+		ctx,
+		authorized,
+		"response_time",
+		nil,
+	)
 	if err != nil {
 		return nil, err
 	}
+	resolutionHours, err := s.averagePersistedTicketMinutes(
+		ctx,
+		authorized,
+		"resolution_time",
+		[]models.TicketStatus{
+			models.TicketStatusResolved,
+			models.TicketStatusClosed,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	stats.AvgResponseTime = responseHours
+	stats.AvgResolutionTime = resolutionHours
+	return &stats, nil
+}
 
-	trend := make([]DailyCount, len(results))
-	for i, r := range results {
-		trend[i] = DailyCount{
-			Date:  r.Date,
-			Count: r.Count,
+func (s *AnalyticsService) averagePersistedTicketMinutes(
+	ctx context.Context,
+	authorized AnalyticsAuthorizedProjectSet,
+	column string,
+	statuses []models.TicketStatus,
+) (*float64, error) {
+	var average sql.NullFloat64
+	query := s.authorizedTickets(ctx, authorized).
+		Select("AVG(" + column + ")").
+		Where(column + " IS NOT NULL AND " + column + " >= 0")
+	if len(statuses) > 0 {
+		query = query.Where("status IN ?", statuses)
+	}
+	if err := query.Scan(&average).Error; err != nil {
+		return nil, err
+	}
+	if !average.Valid {
+		return nil, nil
+	}
+	hours := average.Float64 / 60
+	return &hours, nil
+}
+
+func (s *AnalyticsService) authorizedTickets(
+	ctx context.Context,
+	authorized AnalyticsAuthorizedProjectSet,
+) *gorm.DB {
+	return s.db.WithContext(ctx).
+		Model(&models.Ticket{}).
+		Where("organization_id = ?", authorized.OrganizationID).
+		Where("project_id IN ?", authorized.ProjectIDs)
+}
+
+func (s *AnalyticsService) getProjectMembershipStats(
+	ctx context.Context,
+	authorized AnalyticsAuthorizedProjectSet,
+) (*ProjectMembershipStats, error) {
+	stats := ProjectMembershipStats{}
+	base := func() *gorm.DB {
+		return s.db.WithContext(ctx).
+			Table("project_memberships AS memberships").
+			Joins("JOIN projects ON projects.id = memberships.project_id").
+			Joins("JOIN users ON users.id = memberships.user_id").
+			Where("projects.organization_id = ?", authorized.OrganizationID).
+			Where("projects.id IN ?", authorized.ProjectIDs).
+			Where("projects.status = ?", models.ProjectStatusActive).
+			Where("memberships.project_id IN ?", authorized.ProjectIDs).
+			Where("memberships.is_active = ?", true).
+			Where("users.deleted_at IS NULL").
+			Where("users.status = ?", models.UserStatusActive)
+	}
+	if err := base().Count(&stats.Total).Error; err != nil {
+		return nil, err
+	}
+	if err := base().
+		Select("COUNT(DISTINCT memberships.user_id)").
+		Scan(&stats.ActiveUsers).Error; err != nil {
+		return nil, err
+	}
+	var roleCounts []struct {
+		Role  models.ProjectRole
+		Count int64
+	}
+	if err := base().
+		Select("memberships.role, count(*) AS count").
+		Group("memberships.role").
+		Scan(&roleCounts).Error; err != nil {
+		return nil, err
+	}
+	for _, value := range roleCounts {
+		switch value.Role {
+		case models.ProjectRoleAdmin:
+			stats.ProjectAdmins = value.Count
+		case models.ProjectRoleManager:
+			stats.Managers = value.Count
+		case models.ProjectRoleAgent:
+			stats.Agents = value.Count
+		case models.ProjectRoleRequester:
+			stats.Requesters = value.Count
+		case models.ProjectRoleObserver:
+			stats.Observers = value.Count
+		}
+	}
+	return &stats, nil
+}
+
+func (s *AnalyticsService) getActivityStats(
+	ctx context.Context,
+	authorized AnalyticsAuthorizedProjectSet,
+) (*ActivityStats, error) {
+	stats := ActivityStats{}
+	comments := func() *gorm.DB {
+		return s.db.WithContext(ctx).
+			Model(&models.TicketComment{}).
+			Where("organization_id = ?", authorized.OrganizationID).
+			Where("project_id IN ?", authorized.ProjectIDs).
+			Where("deleted_at IS NULL")
+	}
+	if err := comments().Count(&stats.TotalComments).Error; err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	today := dayStart(now)
+	weekStart := today.AddDate(0, 0, -int(today.Weekday()))
+	if err := comments().
+		Where("created_at >= ?", today).
+		Count(&stats.TodayComments).Error; err != nil {
+		return nil, err
+	}
+	if err := comments().
+		Where("created_at >= ?", weekStart).
+		Count(&stats.WeekComments).Error; err != nil {
+		return nil, err
+	}
+	if err := s.authorizedTickets(ctx, authorized).
+		Where("category_id IS NOT NULL").
+		Select("COUNT(DISTINCT category_id)").
+		Scan(&stats.TotalCategories).Error; err != nil {
+		return nil, err
+	}
+	return &stats, nil
+}
+
+func (s *AnalyticsService) getPlatformUserStats(
+	ctx context.Context,
+) (*PlatformUserStats, error) {
+	stats := PlatformUserStats{}
+	if err := s.db.WithContext(ctx).
+		Model(&models.User{}).
+		Count(&stats.Total).Error; err != nil {
+		return nil, err
+	}
+	var roleCounts []struct {
+		PlatformRole models.PlatformRole
+		Count        int64
+	}
+	if err := s.db.WithContext(ctx).
+		Model(&models.User{}).
+		Select("platform_role, count(*) AS count").
+		Group("platform_role").
+		Scan(&roleCounts).Error; err != nil {
+		return nil, err
+	}
+	for _, value := range roleCounts {
+		switch value.PlatformRole {
+		case models.PlatformRolePlatformAdmin:
+			stats.PlatformAdmins = value.Count
+		case models.PlatformRoleSecurityAuditor:
+			stats.SecurityAuditors = value.Count
+		case models.PlatformRoleEmergencyOperator:
+			stats.EmergencyOperators = value.Count
+		case models.PlatformRoleMember:
+			stats.Members = value.Count
 		}
 	}
 
-	return trend, nil
+	now := time.Now()
+	today := dayStart(now)
+	weekStart := today.AddDate(0, 0, -int(today.Weekday()))
+	monthStart := time.Date(
+		now.Year(),
+		now.Month(),
+		1,
+		0,
+		0,
+		0,
+		0,
+		now.Location(),
+	)
+	if err := s.db.WithContext(ctx).
+		Model(&models.LoginHistory{}).
+		Select("COUNT(DISTINCT user_id)").
+		Where("login_time >= ?", now.AddDate(0, 0, -30)).
+		Scan(&stats.Active).Error; err != nil {
+		return nil, err
+	}
+	if err := s.db.WithContext(ctx).
+		Model(&models.LoginHistory{}).
+		Where("login_time >= ?", today).
+		Count(&stats.TodayLogins).Error; err != nil {
+		return nil, err
+	}
+	if err := s.db.WithContext(ctx).
+		Model(&models.LoginHistory{}).
+		Where("login_time >= ?", weekStart).
+		Count(&stats.WeekLogins).Error; err != nil {
+		return nil, err
+	}
+	if err := s.db.WithContext(ctx).
+		Model(&models.LoginHistory{}).
+		Where("login_time >= ?", monthStart).
+		Count(&stats.MonthLogins).Error; err != nil {
+		return nil, err
+	}
+	return &stats, nil
 }
 
-// ExportStats 导出统计数据
-func (s *AnalyticsService) ExportStats(ctx context.Context, format string, startDate, endDate *time.Time) ([]byte, error) {
-	// 获取系统统计
-	systemStats, err := s.GetSystemStats()
+func (s *AnalyticsService) getPlatformCleanupStats(
+	ctx context.Context,
+) (*PlatformCleanupStats, error) {
+	stats := PlatformCleanupStats{}
+	if err := s.db.WithContext(ctx).
+		Model(&models.CleanupLog{}).
+		Count(&stats.CleanupJobs).Error; err != nil {
+		return nil, err
+	}
+	var latest models.CleanupLog
+	err := s.db.WithContext(ctx).
+		Model(&models.CleanupLog{}).
+		Order("start_time DESC").
+		First(&latest).Error
+	switch {
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		return &stats, nil
+	case err != nil:
+		return nil, err
+	default:
+		value := latest.StartTime
+		stats.LastCleanup = &value
+		return &stats, nil
+	}
+}
+
+func (s *AnalyticsService) GetTimeRangeStats(
+	ctx context.Context,
+	authorized AnalyticsAuthorizedProjectSet,
+	startDate time.Time,
+	endDate time.Time,
+) (*TimeRangeStats, error) {
+	if err := authorized.validate(); err != nil {
+		return nil, err
+	}
+	authorized = authorized.snapshot()
+	if startDate.IsZero() || endDate.IsZero() || endDate.Before(startDate) {
+		return nil, ErrAnalyticsInvalidTimeRange
+	}
+	stats := &TimeRangeStats{
+		StartDate:         startDate,
+		EndDate:           endDate,
+		TicketTrend:       make([]DailyCount, 0),
+		UserActivityTrend: make([]DailyCount, 0),
+		CommentTrend:      make([]DailyCount, 0),
+	}
+	err := s.withAuthorizedHumanProjectSetTransaction(
+		ctx,
+		authorized,
+		func(scopedCtx context.Context) error {
+			var queryErr error
+			stats.TicketTrend, queryErr = s.getDailyTicketTrend(
+				scopedCtx,
+				authorized,
+				startDate,
+				endDate,
+			)
+			if queryErr != nil {
+				return fmt.Errorf("get ticket trend: %w", queryErr)
+			}
+			stats.UserActivityTrend, queryErr = s.getDailyUserActivityTrend(
+				scopedCtx,
+				authorized,
+				startDate,
+				endDate,
+			)
+			if queryErr != nil {
+				return fmt.Errorf("get user activity trend: %w", queryErr)
+			}
+			stats.CommentTrend, queryErr = s.getDailyCommentTrend(
+				scopedCtx,
+				authorized,
+				startDate,
+				endDate,
+			)
+			if queryErr != nil {
+				return fmt.Errorf("get comment trend: %w", queryErr)
+			}
+			return nil
+		},
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get system stats: %v", err)
+		return nil, fmt.Errorf("query authorized time-range stats: %w", err)
 	}
+	return stats, nil
+}
 
-	// 获取业务统计
-	businessStats, err := s.GetBusinessStats(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get business stats: %v", err)
+func (s *AnalyticsService) getDailyTicketTrend(
+	ctx context.Context,
+	authorized AnalyticsAuthorizedProjectSet,
+	startDate time.Time,
+	endDate time.Time,
+) ([]DailyCount, error) {
+	return s.dailyTrend(
+		s.authorizedTickets(ctx, authorized).
+			Where("created_at >= ? AND created_at <= ?", startDate, endDate),
+		"created_at",
+	)
+}
+
+func (s *AnalyticsService) getDailyUserActivityTrend(
+	ctx context.Context,
+	authorized AnalyticsAuthorizedProjectSet,
+	startDate time.Time,
+	endDate time.Time,
+) ([]DailyCount, error) {
+	query := s.db.WithContext(ctx).
+		Table("login_histories AS login_histories").
+		Joins("JOIN users ON users.id = login_histories.user_id").
+		Where("users.deleted_at IS NULL").
+		Where("users.status = ?", models.UserStatusActive).
+		Where("login_histories.login_time >= ?", startDate).
+		Where("login_histories.login_time <= ?", endDate).
+		Where(
+			`EXISTS (
+				SELECT 1
+				FROM project_memberships AS memberships
+				JOIN projects ON projects.id = memberships.project_id
+				WHERE memberships.user_id = login_histories.user_id
+					AND memberships.is_active = ?
+					AND memberships.project_id IN ?
+					AND projects.organization_id = ?
+					AND projects.id IN ?
+					AND projects.status = ?
+			)`,
+			true,
+			authorized.ProjectIDs,
+			authorized.OrganizationID,
+			authorized.ProjectIDs,
+			models.ProjectStatusActive,
+		)
+	return s.dailyDistinctUserTrend(query, "login_histories.login_time")
+}
+
+func (s *AnalyticsService) getDailyCommentTrend(
+	ctx context.Context,
+	authorized AnalyticsAuthorizedProjectSet,
+	startDate time.Time,
+	endDate time.Time,
+) ([]DailyCount, error) {
+	query := s.db.WithContext(ctx).
+		Model(&models.TicketComment{}).
+		Where("organization_id = ?", authorized.OrganizationID).
+		Where("project_id IN ?", authorized.ProjectIDs).
+		Where("deleted_at IS NULL").
+		Where("created_at >= ? AND created_at <= ?", startDate, endDate)
+	return s.dailyTrend(query, "created_at")
+}
+
+func (s *AnalyticsService) dailyTrend(
+	query *gorm.DB,
+	timeColumn string,
+) ([]DailyCount, error) {
+	var rows []struct {
+		Date  string `gorm:"column:date"`
+		Count int64
 	}
-
-	// 构建导出数据
-	exportData := map[string]interface{}{
-		"export_time":    time.Now(),
-		"system_stats":   systemStats,
-		"business_stats": businessStats,
+	if err := query.
+		Select("DATE(" + timeColumn + ") AS date, COUNT(*) AS count").
+		Group("DATE(" + timeColumn + ")").
+		Order("date").
+		Scan(&rows).Error; err != nil {
+		return nil, err
 	}
+	return parseDailyCounts(rows)
+}
 
-	// 如果指定了时间范围，添加趋势数据
-	if startDate != nil && endDate != nil {
-		timeRangeStats, err := s.GetTimeRangeStats(ctx, *startDate, *endDate)
+func (s *AnalyticsService) dailyDistinctUserTrend(
+	query *gorm.DB,
+	timeColumn string,
+) ([]DailyCount, error) {
+	var rows []struct {
+		Date  string `gorm:"column:date"`
+		Count int64
+	}
+	if err := query.
+		Select(
+			"DATE(" + timeColumn + ") AS date, " +
+				"COUNT(DISTINCT login_histories.user_id) AS count",
+		).
+		Group("DATE(" + timeColumn + ")").
+		Order("date").
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	return parseDailyCounts(rows)
+}
+
+func parseDailyCounts(
+	rows []struct {
+		Date  string `gorm:"column:date"`
+		Count int64
+	},
+) ([]DailyCount, error) {
+	values := make([]DailyCount, 0, len(rows))
+	for _, row := range rows {
+		date, err := time.Parse("2006-01-02", row.Date)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get time range stats: %v", err)
+			return nil, fmt.Errorf("parse analytics date %q: %w", row.Date, err)
 		}
-		exportData["time_range_stats"] = timeRangeStats
+		values = append(values, DailyCount{Date: date, Count: row.Count})
 	}
+	return values, nil
+}
 
-	// 目前只支持JSON格式
+func (s *AnalyticsService) ExportStats(
+	ctx context.Context,
+	authorized AnalyticsAuthorizedProjectSet,
+	format string,
+	startDate *time.Time,
+	endDate *time.Time,
+) ([]byte, error) {
 	if format != "json" {
 		return nil, fmt.Errorf("unsupported export format: %s", format)
 	}
-
+	if (startDate == nil) != (endDate == nil) {
+		return nil, ErrAnalyticsInvalidTimeRange
+	}
+	platformStats, err := s.GetPlatformStats(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get platform stats: %w", err)
+	}
+	businessStats, err := s.GetBusinessStats(ctx, authorized)
+	if err != nil {
+		return nil, fmt.Errorf("get business stats: %w", err)
+	}
+	exportData := map[string]any{
+		"export_time":    time.Now(),
+		"platform_stats": platformStats,
+		"business_stats": businessStats,
+	}
+	if startDate != nil {
+		timeRangeStats, rangeErr := s.GetTimeRangeStats(
+			ctx,
+			authorized,
+			*startDate,
+			*endDate,
+		)
+		if rangeErr != nil {
+			return nil, fmt.Errorf("get time range stats: %w", rangeErr)
+		}
+		exportData["time_range_stats"] = timeRangeStats
+	}
 	return json.MarshalIndent(exportData, "", "  ")
+}
+
+func dayStart(value time.Time) time.Time {
+	return time.Date(
+		value.Year(),
+		value.Month(),
+		value.Day(),
+		0,
+		0,
+		0,
+		0,
+		value.Location(),
+	)
 }

@@ -51,7 +51,7 @@ func seedRefreshService(
 		Username:        "refresh-atomic-user",
 		Email:           "refresh-atomic@example.test",
 		PasswordHash:    "unused-refresh-password",
-		Role:            models.RoleCustomer,
+		PlatformRole:    models.PlatformRoleMember,
 		Status:          models.UserStatusActive,
 		EmailVerified:   true,
 		PasswordResetAt: &passwordChangedAt,
@@ -65,7 +65,7 @@ func seedRefreshService(
 	manager := mustTestJWTManager(t, time.Hour, 24*time.Hour)
 	_, oldRefresh, err := manager.GenerateTokenPair(
 		user.ID,
-		RoleCustomer,
+		PlatformRoleMember,
 		"atomic-refresh-session",
 	)
 	if err != nil {
@@ -244,7 +244,7 @@ func TestPasswordChangeRollsBackWhenSessionRevocationAuditFails(t *testing.T) {
 		Username:     "password-rollback-user",
 		Email:        "password-rollback@example.test",
 		PasswordHash: "old-password-hash",
-		Role:         models.RoleCustomer,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
@@ -394,7 +394,7 @@ func newLoginFailureService(
 		Username:      "audit-failure-user",
 		Email:         "audit-failure@example.test",
 		PasswordHash:  hash,
-		Role:          RoleCustomer,
+		PlatformRole:  PlatformRoleMember,
 		Status:        StatusActive,
 		EmailVerified: true,
 	}, incrementErr: incrementErr}

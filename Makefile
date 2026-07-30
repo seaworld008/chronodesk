@@ -24,8 +24,8 @@ GO_LDFLAGS := -s -w \
 	help doctor install-deps install-server-deps install-web-deps install-test-deps install-sdk-deps \
 	dev server-dev web-dev docker-up docker-down docker-logs \
 	build build-server build-web build-sdk clean \
-	fmt fmt-check test test-server test-race test-web test-sdk test-python-static test-python-toolchain python-toolchain security verify \
-	openapi-lint asyncapi-lint smoke e2e db-migrate db-migrate-seed db-migrate-sample \
+	fmt fmt-check test test-server test-race test-redis-integration test-web test-sdk test-python-static test-python-toolchain python-toolchain security verify \
+	openapi-lint human-openapi-generate human-openapi-check asyncapi-lint smoke e2e db-migrate db-migrate-seed db-migrate-sample \
 	credential-validate credential-rotate credential-quarantine
 
 help:
@@ -44,7 +44,9 @@ help:
 	@echo "  test-python-toolchain 验证仓库 Python 虚拟环境与依赖刷新"
 	@echo "  test            执行 Go、Web、OpenAPI 与 AsyncAPI 标准门禁"
 	@echo "  test-race       执行 Go 竞态检测"
+	@echo "  test-redis-integration 使用显式 Redis 配置验证 Agent execution guard"
 	@echo "  test-sdk        编译并测试 Go、Python、TypeScript 项目绑定 SDK"
+	@echo "  human-openapi-check 验证 Human Web OpenAPI 与生成类型一致"
 	@echo "  security        执行 Go 与 Web 依赖安全检查"
 	@echo "  verify          执行格式、测试、安全与生产构建门禁"
 	@echo "  smoke           对运行中的 API 执行全部 Python 黑盒测试"
@@ -158,7 +160,18 @@ test-server:
 test-race:
 	cd server && go test -race ./... -count=1
 
+test-redis-integration:
+	@test "$(CHRONODESK_REDIS_INTEGRATION)" = "1" || \
+		{ echo "CHRONODESK_REDIS_INTEGRATION 必须显式设为 1"; exit 1; }
+	@test -n "$(REDIS_URL)" || \
+		{ echo "REDIS_URL 未配置，拒绝跳过 Redis execution guard 集成测试"; exit 1; }
+	cd server && CHRONODESK_REDIS_INTEGRATION=1 REDIS_URL="$(REDIS_URL)" \
+		go test ./internal/services \
+		-run '^TestRedisAgentExecutionGuardIntegration$$' -count=1
+
 test-web:
+	cd web && npm run check:human-api
+	cd web && npm run test:human-api
 	cd web && npm run typecheck
 	cd web && npm run lint
 	cd web && npm run audit:security
@@ -192,10 +205,24 @@ verify: python-toolchain fmt-check test security build
 openapi-lint:
 	NPM_CONFIG_CACHE=$(NPM_TOOL_CACHE) npx --yes @redocly/cli@2.41.1 \
 		lint server/internal/openapi/openapi.yaml --format=stylish
+	NPM_CONFIG_CACHE=$(NPM_TOOL_CACHE) npx --yes @redocly/cli@2.41.1 \
+		lint server/internal/humanopenapi/openapi.json --format=stylish
 	NPM_CONFIG_CACHE=$(NPM_TOOL_CACHE) npx --yes @stoplight/spectral-cli@6.16.2 \
 		lint -r server/internal/openapi/.spectral.yaml \
 		server/internal/openapi/openapi.yaml \
 		--fail-severity=warn
+	NPM_CONFIG_CACHE=$(NPM_TOOL_CACHE) npx --yes @stoplight/spectral-cli@6.16.2 \
+		lint -r server/internal/openapi/.spectral.yaml \
+		server/internal/humanopenapi/openapi.json \
+		--fail-severity=warn
+
+human-openapi-generate:
+	cd web && npm run generate:human-api
+
+human-openapi-check:
+	cd server && go test ./internal/humanopenapi -count=1
+	cd web && npm run check:human-api
+	cd web && npm run test:human-api
 
 asyncapi-lint:
 	NPM_CONFIG_CACHE=$(NPM_TOOL_CACHE) npx --yes @asyncapi/cli@6.0.2 \

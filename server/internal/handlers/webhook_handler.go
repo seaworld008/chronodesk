@@ -1,14 +1,17 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/security"
@@ -28,10 +31,18 @@ type WebhookHandler struct {
 func NewWebhookHandlerWithProtector(
 	db *gorm.DB,
 	protector security.Protector,
+	provided ...*services.NotificationService,
 ) *WebhookHandler {
+	notificationService := services.NewNotificationServiceWithProtector(
+		db,
+		protector,
+	)
+	if len(provided) > 0 && provided[0] != nil {
+		notificationService = provided[0]
+	}
 	return &WebhookHandler{
 		db:                  db,
-		notificationService: services.NewNotificationServiceWithProtector(db, protector),
+		notificationService: notificationService,
 		secretStore:         protector,
 	}
 }
@@ -86,12 +97,26 @@ type ListWebhooksResponse struct {
 	Size  int                    `json:"size"`
 }
 
-// TestWebhookResult separates command handling from the external delivery
-// outcome. A failed delivery is still a successfully handled test command, so
-// the project transaction can commit its durable attempt log.
-type TestWebhookResult struct {
-	Status    string `json:"status"`
-	Delivered bool   `json:"delivered"`
+// TestWebhookResult is a queued operation receipt. External delivery and its
+// WebhookLog are produced later by the Outbox worker.
+type TestWebhookResult = services.WebhookTestReceipt
+
+func decodeStrictWebhookJSON(c *gin.Context, target any) error {
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		return errors.New("request body is required")
+	}
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request body must contain exactly one JSON value")
+		}
+		return err
+	}
+	return binding.Validator.ValidateStruct(target)
 }
 
 // CreateWebhook 创建webhook配置
@@ -113,7 +138,7 @@ func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
 		return
 	}
 	var req CreateWebhookRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictWebhookJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"code": 1,
 			"msg":  "参数验证失败",
@@ -414,7 +439,7 @@ func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 	}
 
 	var req UpdateWebhookRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictWebhookJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"code": 1,
 			"msg":  "参数验证失败",
@@ -746,13 +771,15 @@ func (h *WebhookHandler) DeleteWebhook(c *gin.Context) {
 
 // TestWebhook 测试webhook配置
 // @Summary 测试webhook配置
-// @Description 发送测试消息验证webhook配置
+// @Description 将测试消息作为不可变快照写入 Outbox，提交后异步投递
 // @Tags webhook
 // @Accept json
 // @Produce json
 // @Param projectKey path string true "项目 Key"
 // @Param id path int true "Webhook ID"
-// @Success 200 {object} map[string]interface{}
+// @Success 202 {object} map[string]interface{}
+// @Failure 400 {object} map[string]interface{}
+// @Failure 403 {object} map[string]interface{}
 // @Failure 404 {object} map[string]interface{}
 // @Failure 500 {object} map[string]interface{}
 // @Router /api/projects/{projectKey}/webhooks/{id}/test [post]
@@ -772,36 +799,41 @@ func (h *WebhookHandler) TestWebhook(c *gin.Context) {
 		return
 	}
 
-	// 测试webhook
 	ctx := c.Request.Context()
-	if err := h.notificationService.TestWebhook(
+	receipt, err := h.notificationService.TestWebhook(
 		ctx,
 		operation.Scope,
 		uint(id),
-	); err != nil {
+	)
+	if err != nil {
 		logHandlerFailure(c, "webhook.test", err)
-		// The command completed and produced an auditable failed delivery
-		// result. Keep the HTTP status successful so ProjectScopeMiddleware
-		// commits the attempt log, while the non-zero application code retains
-		// the existing UI error semantics.
-		c.JSON(http.StatusOK, gin.H{
-			"code": 1,
-			"msg":  "Webhook 测试失败，请检查配置和目标服务状态",
-			"data": TestWebhookResult{
-				Status:    "failed",
-				Delivered: false,
-			},
-		})
+		switch {
+		case errors.Is(err, services.ErrWebhookTestAccessDenied):
+			c.JSON(http.StatusForbidden, gin.H{
+				"code": 1,
+				"msg":  "仅项目管理员或经理可测试 Webhook",
+				"data": nil,
+			})
+		case errors.Is(err, services.ErrWebhookTestNotFound):
+			c.JSON(http.StatusNotFound, gin.H{
+				"code": 1,
+				"msg":  "Webhook 配置不存在或不可用",
+				"data": nil,
+			})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"code": 1,
+				"msg":  "Webhook 测试入队失败",
+				"data": nil,
+			})
+		}
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	c.JSON(http.StatusAccepted, gin.H{
 		"code": 0,
-		"msg":  "测试消息发送成功",
-		"data": TestWebhookResult{
-			Status:    "success",
-			Delivered: true,
-		},
+		"msg":  "Webhook 测试已入队",
+		"data": receipt,
 	})
 }
 

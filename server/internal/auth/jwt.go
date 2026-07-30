@@ -120,24 +120,28 @@ type JWTHeader struct {
 
 // JWTPayload JWT载荷
 type JWTPayload struct {
-	UserID    uint     `json:"user_id"`
-	Role      UserRole `json:"role"`
-	Type      string   `json:"type"` // access, refresh
-	SessionID string   `json:"sid"`  // server-authoritative login session
-	Iss       string   `json:"iss"`  // issuer
-	Sub       string   `json:"sub"`  // subject
-	Aud       string   `json:"aud"`  // audience
-	Exp       int64    `json:"exp"`  // expiration time
-	Nbf       int64    `json:"nbf"`  // not before
-	Iat       int64    `json:"iat"`  // issued at
-	Jti       string   `json:"jti"`  // JWT ID
+	UserID       uint         `json:"user_id"`
+	PlatformRole PlatformRole `json:"platform_role"`
+	Type         string       `json:"type"` // access, refresh
+	SessionID    string       `json:"sid"`  // server-authoritative login session
+	Iss          string       `json:"iss"`  // issuer
+	Sub          string       `json:"sub"`  // subject
+	Aud          string       `json:"aud"`  // audience
+	Exp          int64        `json:"exp"`  // expiration time
+	Nbf          int64        `json:"nbf"`  // not before
+	Iat          int64        `json:"iat"`  // issued at
+	Jti          string       `json:"jti"`  // JWT ID
 }
 
 // GenerateTokenPair 生成令牌对
-func (j *SimpleJWTManager) GenerateTokenPair(userID uint, role UserRole, sessionID string) (accessToken, refreshToken string, err error) {
+func (j *SimpleJWTManager) GenerateTokenPair(
+	userID uint,
+	platformRole PlatformRole,
+	sessionID string,
+) (accessToken, refreshToken string, err error) {
 	return j.generateTokenPairAt(
 		userID,
-		role,
+		platformRole,
 		sessionID,
 		time.Now(),
 		generateJTI(),
@@ -152,7 +156,7 @@ func (j *SimpleJWTManager) GenerateTokenPair(userID uint, role UserRole, session
 // and is only used as HMAC input.
 func (j *SimpleJWTManager) GenerateRefreshTokenPair(
 	userID uint,
-	role UserRole,
+	platformRole PlatformRole,
 	sessionID, rotationSeed string,
 	issuedAt time.Time,
 ) (accessToken, refreshToken string, err error) {
@@ -162,7 +166,7 @@ func (j *SimpleJWTManager) GenerateRefreshTokenPair(
 	issuedAt = issuedAt.UTC().Truncate(time.Second)
 	return j.generateTokenPairAt(
 		userID,
-		role,
+		platformRole,
 		sessionID,
 		issuedAt,
 		j.rotationJTI(j.accessSecret, "access", rotationSeed, issuedAt),
@@ -172,14 +176,14 @@ func (j *SimpleJWTManager) GenerateRefreshTokenPair(
 
 func (j *SimpleJWTManager) generateTokenPairAt(
 	userID uint,
-	role UserRole,
+	platformRole PlatformRole,
 	sessionID string,
 	now time.Time,
 	accessJTI, refreshJTI string,
 ) (accessToken, refreshToken string, err error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if userID == 0 ||
-		!role.IsValid() ||
+		!platformRole.IsValid() ||
 		sessionID == "" ||
 		len(sessionID) > 128 ||
 		now.IsZero() ||
@@ -191,17 +195,17 @@ func (j *SimpleJWTManager) generateTokenPairAt(
 
 	// 生成访问令牌
 	accessPayload := &JWTPayload{
-		UserID:    userID,
-		Role:      role,
-		Type:      "access",
-		SessionID: sessionID,
-		Iss:       j.issuer,
-		Sub:       userIDStr,
-		Aud:       j.audience,
-		Exp:       now.Add(j.accessExpire).Unix(),
-		Nbf:       now.Unix(),
-		Iat:       now.Unix(),
-		Jti:       accessJTI,
+		UserID:       userID,
+		PlatformRole: platformRole,
+		Type:         "access",
+		SessionID:    sessionID,
+		Iss:          j.issuer,
+		Sub:          userIDStr,
+		Aud:          j.audience,
+		Exp:          now.Add(j.accessExpire).Unix(),
+		Nbf:          now.Unix(),
+		Iat:          now.Unix(),
+		Jti:          accessJTI,
 	}
 
 	accessToken, err = j.generateToken(accessPayload, j.accessSecret)
@@ -211,17 +215,17 @@ func (j *SimpleJWTManager) generateTokenPairAt(
 
 	// 生成刷新令牌
 	refreshPayload := &JWTPayload{
-		UserID:    userID,
-		Role:      role,
-		Type:      "refresh",
-		SessionID: sessionID,
-		Iss:       j.issuer,
-		Sub:       userIDStr,
-		Aud:       j.audience,
-		Exp:       now.Add(j.refreshExpire).Unix(),
-		Nbf:       now.Unix(),
-		Iat:       now.Unix(),
-		Jti:       refreshJTI,
+		UserID:       userID,
+		PlatformRole: platformRole,
+		Type:         "refresh",
+		SessionID:    sessionID,
+		Iss:          j.issuer,
+		Sub:          userIDStr,
+		Aud:          j.audience,
+		Exp:          now.Add(j.refreshExpire).Unix(),
+		Nbf:          now.Unix(),
+		Iat:          now.Unix(),
+		Jti:          refreshJTI,
 	}
 
 	refreshToken, err = j.generateToken(refreshPayload, j.refreshSecret)
@@ -258,13 +262,13 @@ func (j *SimpleJWTManager) VerifyAccessToken(token string) (*Claims, error) {
 	}
 
 	return &Claims{
-		UserID:    payload.UserID,
-		Role:      payload.Role,
-		Type:      payload.Type,
-		SessionID: payload.SessionID,
-		Exp:       payload.Exp,
-		Iat:       payload.Iat,
-		Jti:       payload.Jti,
+		UserID:       payload.UserID,
+		PlatformRole: payload.PlatformRole,
+		Type:         payload.Type,
+		SessionID:    payload.SessionID,
+		Exp:          payload.Exp,
+		Iat:          payload.Iat,
+		Jti:          payload.Jti,
 	}, nil
 }
 
@@ -280,13 +284,13 @@ func (j *SimpleJWTManager) VerifyRefreshToken(token string) (*Claims, error) {
 	}
 
 	return &Claims{
-		UserID:    payload.UserID,
-		Role:      payload.Role,
-		Type:      payload.Type,
-		SessionID: payload.SessionID,
-		Exp:       payload.Exp,
-		Iat:       payload.Iat,
-		Jti:       payload.Jti,
+		UserID:       payload.UserID,
+		PlatformRole: payload.PlatformRole,
+		Type:         payload.Type,
+		SessionID:    payload.SessionID,
+		Exp:          payload.Exp,
+		Iat:          payload.Iat,
+		Jti:          payload.Jti,
 	}, nil
 }
 
@@ -373,6 +377,7 @@ func (j *SimpleJWTManager) verifyToken(token, secret string) (*JWTPayload, error
 		return nil, errors.New("invalid subject")
 	}
 	if payload.UserID == 0 ||
+		!payload.PlatformRole.IsValid() ||
 		strings.TrimSpace(payload.SessionID) == "" ||
 		len(payload.SessionID) > 128 ||
 		strings.TrimSpace(payload.Jti) == "" {
@@ -420,13 +425,13 @@ func (j *SimpleJWTManager) ParseTokenClaims(token string) (*Claims, error) {
 	}
 
 	return &Claims{
-		UserID:    payload.UserID,
-		Role:      payload.Role,
-		Type:      payload.Type,
-		SessionID: payload.SessionID,
-		Exp:       payload.Exp,
-		Iat:       payload.Iat,
-		Jti:       payload.Jti,
+		UserID:       payload.UserID,
+		PlatformRole: payload.PlatformRole,
+		Type:         payload.Type,
+		SessionID:    payload.SessionID,
+		Exp:          payload.Exp,
+		Iat:          payload.Iat,
+		Jti:          payload.Jti,
 	}, nil
 }
 
@@ -480,7 +485,11 @@ func (j *SimpleJWTManager) RefreshTokenIfNeeded(accessToken string, threshold ti
 	}
 
 	// 生成新的访问令牌
-	newAccessToken, _, err := j.GenerateTokenPair(claims.UserID, claims.Role, claims.SessionID)
+	newAccessToken, _, err := j.GenerateTokenPair(
+		claims.UserID,
+		claims.PlatformRole,
+		claims.SessionID,
+	)
 	if err != nil {
 		return "", false, err
 	}

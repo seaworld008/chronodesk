@@ -10,21 +10,20 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
-// GetCurrentUserRole 从上下文中获取当前用户角色
-func GetCurrentUserRole(c *gin.Context) (string, bool) {
-	userRole, exists := c.Get("user_role")
+// GetCurrentPlatformRole 从上下文中获取当前用户的平台职责。
+func GetCurrentPlatformRole(c *gin.Context) (models.PlatformRole, bool) {
+	value, exists := c.Get("platform_role")
 	if !exists {
 		return "", false
 	}
-
-	role, ok := userRole.(string)
-	if !ok {
+	role, ok := value.(models.PlatformRole)
+	if !ok || !role.IsValid() {
 		return "", false
 	}
-
 	return role, true
 }
 
@@ -71,28 +70,21 @@ func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.Han
 			userIDPtr = &userID
 		}
 
-		role, _ := GetCurrentUserRole(c)
-		if role == "" {
-			if value, ok := c.Get("user_role"); ok {
-				if str, ok := value.(string); ok {
-					role = str
-				}
-			}
-		}
+		platformRole, _ := GetCurrentPlatformRole(c)
 
 		action := fmt.Sprintf("%s %s", strings.ToUpper(method), path)
 		record := &services.AdminAuditRecord{
-			UserID:     userIDPtr,
-			Role:       role,
-			Action:     action,
-			Method:     method,
-			Path:       path,
-			StatusCode: 0,
-			ClientIP:   clientIP,
-			UserAgent:  userAgent,
-			Query:      query,
-			Result:     "pending",
-			Notes:      "管理员写操作已进入执行阶段",
+			UserID:       userIDPtr,
+			PlatformRole: platformRole,
+			Action:       action,
+			Method:       method,
+			Path:         path,
+			StatusCode:   0,
+			ClientIP:     clientIP,
+			UserAgent:    userAgent,
+			Query:        query,
+			Result:       "pending",
+			Notes:        "管理员写操作已进入执行阶段",
 		}
 
 		if err := auditService.Record(c.Request.Context(), record); err != nil {
@@ -140,7 +132,7 @@ func isImportantAdminOperation(method, path string) bool {
 		return false
 	}
 
-	return isPathWithin(path, "/api/admin") ||
+	return isPathWithin(path, "/api/platform") ||
 		isProjectAgentAdminPath(path)
 }
 

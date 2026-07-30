@@ -131,7 +131,7 @@ func TestGormUserRepositoryPreservesDomainUserStatuses(t *testing.T) {
 				Username:     fmt.Sprintf("status-user-%d", index),
 				Email:        fmt.Sprintf("status-user-%d@example.test", index),
 				PasswordHash: "hash",
-				Role:         RoleCustomer,
+				PlatformRole: PlatformRoleMember,
 				Status:       status,
 			}
 			if err := repository.Create(context.Background(), user); err != nil {
@@ -157,7 +157,7 @@ func TestGormUserRepositoryRejectsUnknownUserStatus(t *testing.T) {
 		Username:     "invalid-status-auth",
 		Email:        "invalid-status-auth@example.test",
 		PasswordHash: "hash",
-		Role:         RoleCustomer,
+		PlatformRole: PlatformRoleMember,
 		Status:       UserStatus("locked"),
 	}
 	if err := repository.Create(context.Background(), authUser); !errors.Is(err, ErrInvalidAccountState) {
@@ -168,7 +168,7 @@ func TestGormUserRepositoryRejectsUnknownUserStatus(t *testing.T) {
 		Username:     "invalid-status-persisted",
 		Email:        "invalid-status-persisted@example.test",
 		PasswordHash: "hash",
-		Role:         models.RoleCustomer,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatus("locked"),
 	}
 	if err := db.Create(persisted).Error; err != nil {
@@ -187,7 +187,7 @@ func TestResetFailedLoginClearsExpiredLockState(t *testing.T) {
 		Username:      "expired-lock",
 		Email:         "expired-lock@example.test",
 		PasswordHash:  "hash",
-		Role:          models.RoleCustomer,
+		PlatformRole:  models.PlatformRoleMember,
 		Status:        models.UserStatusActive,
 		LoginAttempts: 4,
 		LockedUntil:   &expired,
@@ -217,7 +217,7 @@ func TestResetFailedLoginClearsExpiredLockState(t *testing.T) {
 		Username:      "active-lock",
 		Email:         "active-lock@example.test",
 		PasswordHash:  "hash",
-		Role:          models.RoleCustomer,
+		PlatformRole:  models.PlatformRoleMember,
 		Status:        models.UserStatusActive,
 		LoginAttempts: 4,
 		LockedUntil:   &future,
@@ -238,37 +238,6 @@ func TestResetFailedLoginClearsExpiredLockState(t *testing.T) {
 			stored.LoginAttempts,
 			stored.LockedUntil,
 		)
-	}
-}
-
-func TestHasPermissionKeepsAdministratorAboveSupervisor(t *testing.T) {
-	tests := []struct {
-		name     string
-		role     UserRole
-		required UserRole
-		want     bool
-	}{
-		{name: "administrator can administer", role: RoleAdmin, required: RoleAdmin, want: true},
-		{name: "supervisor cannot administer", role: RoleSupervisor, required: RoleAdmin, want: false},
-		{name: "administrator can supervise", role: RoleAdmin, required: RoleSupervisor, want: true},
-		{name: "supervisor can supervise", role: RoleSupervisor, required: RoleSupervisor, want: true},
-		{name: "agent cannot supervise", role: RoleAgent, required: RoleSupervisor, want: false},
-		{name: "unknown role fails closed", role: UserRole("unknown"), required: RoleCustomer, want: false},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			user := &User{Role: test.role}
-			if got := user.HasPermission(test.required); got != test.want {
-				t.Fatalf(
-					"HasPermission(%q) for role %q = %t, want %t",
-					test.required,
-					test.role,
-					got,
-					test.want,
-				)
-			}
-		})
 	}
 }
 

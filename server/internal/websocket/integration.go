@@ -2,6 +2,7 @@ package websocket
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 
@@ -30,6 +31,59 @@ func SetGlobalNotificationService(service *NotificationWebSocketService) {
 // SetNotificationReadHandler sets the global notification read handler.
 func SetNotificationReadHandler(handler NotificationReadHandler) {
 	GlobalNotificationReadHandler = handler
+}
+
+// ProjectMembershipRevokedHook must be called after a membership revocation
+// commits. It actively closes idle sockets and invalidates every queued frame
+// for that user-project binding.
+func ProjectMembershipRevokedHook(
+	hub *Hub,
+	scope models.ProjectScope,
+	userID uint,
+) error {
+	if hub == nil {
+		return errors.New("WebSocket hub is required")
+	}
+	if err := scope.Validate(); err != nil {
+		return fmt.Errorf("WebSocket membership revocation scope: %w", err)
+	}
+	if userID == 0 {
+		return errors.New("WebSocket membership revocation user is required")
+	}
+	hub.evictUserScope(scope, userID)
+	return nil
+}
+
+// UserAccessRevokedHook must be called after a user is deactivated or deleted.
+func UserAccessRevokedHook(hub *Hub, userID uint) error {
+	if hub == nil {
+		return errors.New("WebSocket hub is required")
+	}
+	if userID == 0 {
+		return errors.New("WebSocket user revocation requires a user")
+	}
+	hub.evictMatching(func(client *Client) bool {
+		return client.UserID == userID
+	})
+	return nil
+}
+
+// ProjectAccessRevokedHook must be called after a project is archived,
+// deactivated, or deleted.
+func ProjectAccessRevokedHook(
+	hub *Hub,
+	scope models.ProjectScope,
+) error {
+	if hub == nil {
+		return errors.New("WebSocket hub is required")
+	}
+	if err := scope.Validate(); err != nil {
+		return fmt.Errorf("WebSocket project revocation scope: %w", err)
+	}
+	hub.evictMatching(func(client *Client) bool {
+		return client.scope == scope
+	})
+	return nil
 }
 
 // NotificationCreatedHook is called when a new notification is created

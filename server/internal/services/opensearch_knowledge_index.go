@@ -585,6 +585,12 @@ func (index *OpenSearchKnowledgeIndex) doRequestStatus(
 	if ctx == nil {
 		return 0, errors.New("OpenSearch request context is required")
 	}
+	if err := requireExternalIOOutsideProjectTransaction(
+		ctx,
+		"OpenSearch HTTP request",
+	); err != nil {
+		return 0, err
+	}
 	requestURL := strings.TrimRight(index.endpoint.String(), "/") + path
 	request, err := http.NewRequestWithContext(ctx, method, requestURL, body)
 	if err != nil {

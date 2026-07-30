@@ -25,9 +25,8 @@ import {
 import {
     Person as PersonIcon,
     AdminPanelSettings as AdminIcon,
-    Support as SupportIcon,
-    Business as CustomerIcon,
-    SupervisorAccount as SupervisorIcon,
+    Security as AuditIcon,
+    WarningAmber as EmergencyIcon,
     CheckCircle as ActiveIcon,
     Block as InactiveIcon,
     Pause as SuspendedIcon,
@@ -42,9 +41,9 @@ import {
 import { EnterpriseSearchInput } from '@/components/inputs/EnterpriseSearchInput';
 import { EnterpriseSelectFilterInput } from '@/components/inputs/EnterpriseFilterInputs';
 import {
-    getUserRoleLabel,
-    normalizeUserRole,
-    userRoleChoices,
+    getPlatformRoleLabel,
+    parsePlatformRole,
+    platformRoleChoices,
 } from '@/lib/accessControl';
 import { FocusSafeBulkDeleteWithConfirmButton } from '@/components/actions/FocusSafeDeleteButtons';
 
@@ -58,7 +57,7 @@ const statusChoices = [
 
 const userColumns: ResizableColumn[] = [
     { key: 'username', defaultWidth: 260, minWidth: 180, maxWidth: 440 },
-    { key: 'role', defaultWidth: 128, minWidth: 104, maxWidth: 200 },
+    { key: 'platform_role', defaultWidth: 144, minWidth: 120, maxWidth: 220 },
     { key: 'status', defaultWidth: 128, minWidth: 104, maxWidth: 200 },
     { key: 'column-4', defaultWidth: 260, minWidth: 180, maxWidth: 440 },
     { key: 'timezone', defaultWidth: 160, minWidth: 120, maxWidth: 260 },
@@ -122,10 +121,10 @@ const RoleChip: React.FC = () => {
     if (!record) return null;
 
     const getRoleConfig = (role: string) => {
-        const label = getUserRoleLabel(role);
+        const label = getPlatformRoleLabel(role);
 
-        switch (normalizeUserRole(role)) {
-            case 'admin':
+        switch (parsePlatformRole(role)) {
+            case 'platform_admin':
                 return {
                     label,
                     color: '#b91c1c',
@@ -133,29 +132,29 @@ const RoleChip: React.FC = () => {
                     border: '1px solid #fecaca',
                     icon: <AdminIcon sx={{ fontSize: '0.8rem' }} />
                 };
-            case 'agent':
+            case 'security_auditor':
                 return {
                     label,
                     color: '#1d4ed8',
                     backgroundColor: '#dbeafe',
                     border: '1px solid #bfdbfe',
-                    icon: <SupportIcon sx={{ fontSize: '0.8rem' }} />
+                    icon: <AuditIcon sx={{ fontSize: '0.8rem' }} />
                 };
-            case 'supervisor':
+            case 'emergency_operator':
                 return {
                     label,
-                    color: '#7e22ce',
-                    backgroundColor: '#f3e8ff',
-                    border: '1px solid #d8b4fe',
-                    icon: <SupervisorIcon sx={{ fontSize: '0.8rem' }} />
+                    color: '#b45309',
+                    backgroundColor: '#fef3c7',
+                    border: '1px solid #fde68a',
+                    icon: <EmergencyIcon sx={{ fontSize: '0.8rem' }} />
                 };
-            case 'customer':
+            case 'member':
                 return {
                     label,
                     color: '#15803d',
                     backgroundColor: '#dcfce7',
                     border: '1px solid #bbf7d0',
-                    icon: <CustomerIcon sx={{ fontSize: '0.8rem' }} />
+                    icon: <PersonIcon sx={{ fontSize: '0.8rem' }} />
                 };
             default:
                 return {
@@ -168,7 +167,8 @@ const RoleChip: React.FC = () => {
         }
     };
 
-    const { label, color, backgroundColor, border, icon } = getRoleConfig(record.role);
+    const { label, color, backgroundColor, border, icon } =
+        getRoleConfig(record.platform_role);
 
     return (
         <Chip
@@ -324,7 +324,11 @@ const LastLoginInfo: React.FC = () => {
  */
 const UserFilters = [
     <EnterpriseSearchInput source="q" placeholder="搜索用户" alwaysOn />,
-    <EnterpriseSelectFilterInput source="role" label="角色" choices={userRoleChoices} />,
+    <EnterpriseSelectFilterInput
+        source="platform_role"
+        label="平台职责"
+        choices={platformRoleChoices}
+    />,
     <EnterpriseSelectFilterInput source="status" label="状态" choices={statusChoices} />,
 ];
 
@@ -438,8 +442,8 @@ const UserList: React.FC = () => {
                     <UserAvatar />
                 </WrapperField>
 
-                {/* 角色 */}
-                <WrapperField label="角色" sortBy="role">
+                {/* 平台职责 */}
+                <WrapperField label="平台职责" sortBy="platform_role">
                     <RoleChip />
                 </WrapperField>
 

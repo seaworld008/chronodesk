@@ -23,7 +23,7 @@ func TestDeleteTicketExpectedVersionRejectsStaleSnapshot(t *testing.T) {
 		ctx,
 		ticket.ID,
 		actor.ID,
-		string(models.RoleAdmin),
+		string(models.ProjectRoleAdmin),
 		ticket.Version+1,
 	)
 	if !errors.Is(err, ErrVersionConflict) {
@@ -70,7 +70,7 @@ func TestDeleteTicketCleansRelatedData(t *testing.T) {
 		Username:     "agent-delete",
 		Email:        "agent-delete@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
@@ -249,7 +249,7 @@ func TestDeleteTicketCommitsAttachmentCleanupWithDefaultOutboxTargets(t *testing
 	}
 	user := models.User{
 		Username: "attachment-delete", Email: "attachment-delete@example.com",
-		PasswordHash: "hash", Role: models.RoleAdmin, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRolePlatformAdmin, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
@@ -292,6 +292,7 @@ func TestDeleteTicketCommitsAttachmentCleanupWithDefaultOutboxTargets(t *testing
 	}
 	native := NewAgentNativeService(db, AgentNativeOptions{
 		AttachmentStorage: storage,
+		AttachmentStaging: storage,
 		DefaultOutboxTargets: []OutboxTarget{
 			{Type: "event_stream", ID: "default", MaxAttempts: 8},
 			{Type: "webhook", ID: "configured", MaxAttempts: 8},

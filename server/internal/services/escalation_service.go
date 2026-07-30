@@ -730,12 +730,15 @@ func (s *EscalationService) resolveSLAManager(
 	ticketID uint,
 	configured *uint,
 ) (uint, error) {
-	if configured != nil && *configured > 0 {
-		return *configured, nil
-	}
 	scope, err := RequireProjectScope(ctx)
 	if err != nil {
 		return 0, err
+	}
+	if configured != nil && *configured > 0 {
+		if err := s.validateSLAHumanManager(ctx, scope, *configured); err != nil {
+			return 0, err
+		}
+		return *configured, nil
 	}
 	var current models.Ticket
 	if err := s.db.WithContext(ctx).
@@ -752,16 +755,68 @@ func (s *EscalationService) resolveSLAManager(
 	if current.IsEscalated &&
 		current.AssignedToID != nil &&
 		current.AssignedToActorType == models.ActorTypeHuman {
-		return *current.AssignedToID, nil
+		if err := s.validateSLAHumanManager(
+			ctx,
+			scope,
+			*current.AssignedToID,
+		); err == nil {
+			return *current.AssignedToID, nil
+		}
 	}
-	var manager models.User
+	var manager struct {
+		UserID uint
+	}
 	if err := s.db.WithContext(ctx).
-		Where("role = ? AND status = ?", models.RoleAdmin, models.UserStatusActive).
-		Order("id ASC").
+		Table("project_memberships").
+		Select("project_memberships.user_id").
+		Joins("JOIN users ON users.id = project_memberships.user_id").
+		Where(
+			"project_memberships.project_id = ? AND project_memberships.is_active = ? AND project_memberships.role IN ? AND users.status = ? AND users.deleted_at IS NULL",
+			scope.ProjectID,
+			true,
+			[]models.ProjectRole{
+				models.ProjectRoleAdmin,
+				models.ProjectRoleManager,
+			},
+			models.UserStatusActive,
+		).
+		Order("project_memberships.user_id ASC").
 		First(&manager).Error; err != nil {
 		return 0, fmt.Errorf("no active manager found for SLA escalation: %w", err)
 	}
-	return manager.ID, nil
+	return manager.UserID, nil
+}
+
+func (s *EscalationService) validateSLAHumanManager(
+	ctx context.Context,
+	scope models.ProjectScope,
+	userID uint,
+) error {
+	if userID == 0 {
+		return fmt.Errorf("SLA manager is required")
+	}
+	var count int64
+	if err := s.db.WithContext(ctx).
+		Table("project_memberships").
+		Joins("JOIN users ON users.id = project_memberships.user_id").
+		Where(
+			"project_memberships.project_id = ? AND project_memberships.user_id = ? AND project_memberships.is_active = ? AND project_memberships.role IN ? AND users.status = ? AND users.deleted_at IS NULL",
+			scope.ProjectID,
+			userID,
+			true,
+			[]models.ProjectRole{
+				models.ProjectRoleAdmin,
+				models.ProjectRoleManager,
+			},
+			models.UserStatusActive,
+		).
+		Count(&count).Error; err != nil {
+		return fmt.Errorf("validate SLA manager membership: %w", err)
+	}
+	if count != 1 {
+		return fmt.Errorf("SLA manager %d is not active in the project", userID)
+	}
+	return nil
 }
 
 func nextSLAPriority(priority models.TicketPriority) (models.TicketPriority, bool) {

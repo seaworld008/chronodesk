@@ -15,6 +15,8 @@ import (
 func auditedSeedOptions(options SeedOptions) SeedOptions {
 	options.EnsureInitialAdministratorMembership =
 		services.EnsureBootstrapProjectAdministratorMembership
+	options.EnsureSampleUserMembership =
+		services.EnsureSampleProjectMembership
 	return options
 }
 
@@ -147,7 +149,7 @@ func TestSeedDataIsTransactionalAndIdempotent(t *testing.T) {
 
 	var admins int64
 	if err := db.Model(&models.User{}).
-		Where("role = ?", models.RoleAdmin).
+		Where("platform_role = ?", models.PlatformRolePlatformAdmin).
 		Count(&admins).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +170,10 @@ func TestSeedDataIsTransactionalAndIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	var administrator models.User
-	if err := db.Where("role = ?", models.RoleAdmin).
+	if err := db.Where(
+		"platform_role = ?",
+		models.PlatformRolePlatformAdmin,
+	).
 		First(&administrator).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -218,10 +223,10 @@ func TestSeedDataGrantsExistingInitialAdministratorDefaultProjectAccess(
 		t.Fatalf("run schema migration: %v", err)
 	}
 	administrator := models.User{
-		Username:     "existing-admin",
-		Email:        "existing-admin@example.test",
+		Username:     "admin",
+		Email:        "admin@example.com",
 		PasswordHash: "existing-password-hash",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&administrator).Error; err != nil {
@@ -252,6 +257,168 @@ func TestSeedDataGrantsExistingInitialAdministratorDefaultProjectAccess(
 	}
 }
 
+func TestSeedDataRejectsUntrustedControlledAdministratorCandidates(
+	t *testing.T,
+) {
+	const configuredEmail = "break-glass@example.test"
+	tests := []struct {
+		name      string
+		wantError string
+		setup     func(*testing.T, *gorm.DB)
+	}{
+		{
+			name:      "unrelated active administrator is never selected",
+			wantError: "ADMIN_PASSWORD is required",
+			setup: func(t *testing.T, db *gorm.DB) {
+				t.Helper()
+				if err := db.Create(&models.User{
+					Username:     "unrelated-admin",
+					Email:        "unrelated-admin@example.test",
+					PasswordHash: "hash",
+					PlatformRole: models.PlatformRolePlatformAdmin,
+					Status:       models.UserStatusActive,
+				}).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:      "controlled identity is inactive",
+			wantError: "not the active break-glass account",
+			setup: func(t *testing.T, db *gorm.DB) {
+				t.Helper()
+				if err := db.Create(&models.User{
+					Username:     "admin",
+					Email:        configuredEmail,
+					PasswordHash: "hash",
+					PlatformRole: models.PlatformRolePlatformAdmin,
+					Status:       models.UserStatusInactive,
+				}).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:      "controlled identity is deleted",
+			wantError: "not the active break-glass account",
+			setup: func(t *testing.T, db *gorm.DB) {
+				t.Helper()
+				user := models.User{
+					Username:     "admin",
+					Email:        configuredEmail,
+					PasswordHash: "hash",
+					PlatformRole: models.PlatformRolePlatformAdmin,
+					Status:       models.UserStatusActive,
+				}
+				if err := db.Create(&user).Error; err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Delete(&user).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:      "controlled identity has wrong platform role",
+			wantError: "not the active break-glass account",
+			setup: func(t *testing.T, db *gorm.DB) {
+				t.Helper()
+				if err := db.Create(&models.User{
+					Username:     "admin",
+					Email:        configuredEmail,
+					PasswordHash: "hash",
+					PlatformRole: models.PlatformRoleMember,
+					Status:       models.UserStatusActive,
+				}).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:      "configured username and email are split identities",
+			wantError: "resolve to different retained identities",
+			setup: func(t *testing.T, db *gorm.DB) {
+				t.Helper()
+				users := []models.User{
+					{
+						Username:     "admin",
+						Email:        "other-admin@example.test",
+						PasswordHash: "hash",
+						PlatformRole: models.PlatformRolePlatformAdmin,
+						Status:       models.UserStatusActive,
+					},
+					{
+						Username:     "other-break-glass",
+						Email:        configuredEmail,
+						PasswordHash: "hash",
+						PlatformRole: models.PlatformRolePlatformAdmin,
+						Status:       models.UserStatusActive,
+					},
+				}
+				if err := db.Create(&users).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("ADMIN_EMAIL", configuredEmail)
+			t.Setenv("ADMIN_PASSWORD", "")
+			t.Setenv("ENVIRONMENT", "development")
+			db, err := gorm.Open(
+				sqlite.Open(
+					"file:seed-untrusted-"+
+						strings.ReplaceAll(test.name, " ", "-")+
+						"?mode=memory&cache=shared",
+				),
+				&gorm.Config{},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := RunMigrations(db); err != nil {
+				t.Fatalf("run schema migration: %v", err)
+			}
+			test.setup(t, db)
+
+			err = SeedData(db, auditedSeedOptions(SeedOptions{}))
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf(
+					"SeedData() error = %v, want %q",
+					err,
+					test.wantError,
+				)
+			}
+			for _, artifact := range []struct {
+				name  string
+				model any
+			}{
+				{name: "memberships", model: &models.ProjectMembership{}},
+				{name: "categories", model: &models.Category{}},
+				{name: "configs", model: &models.SystemConfig{}},
+				{name: "email configs", model: &models.EmailConfig{}},
+				{name: "events", model: &models.DomainEvent{}},
+				{name: "outbox", model: &models.OutboxDelivery{}},
+				{name: "audit ledger", model: &models.AuditLedgerEntry{}},
+			} {
+				var count int64
+				if countErr := db.Model(artifact.model).Count(&count).Error; countErr != nil {
+					t.Fatalf("count %s: %v", artifact.name, countErr)
+				}
+				if count != 0 {
+					t.Fatalf(
+						"failed seed retained %s = %d, want 0",
+						artifact.name,
+						count,
+					)
+				}
+			}
+		})
+	}
+}
+
 func TestSeedDataRejectsConflictingDefaultProjectMembershipWithoutOverwrite(
 	t *testing.T,
 ) {
@@ -269,10 +436,10 @@ func TestSeedDataRejectsConflictingDefaultProjectMembershipWithoutOverwrite(
 		t.Fatalf("run schema migration: %v", err)
 	}
 	administrator := models.User{
-		Username:     "configured-admin",
-		Email:        "configured-admin@example.test",
+		Username:     "admin",
+		Email:        "admin@example.com",
 		PasswordHash: "configured-password-hash",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&administrator).Error; err != nil {
@@ -363,7 +530,10 @@ func TestSeedDataRequiresTrustedDefaultProjectAndRollsBackAdministrator(
 		var count int64
 		query := db.Model(assertion.model)
 		if assertion.name == "administrators" {
-			query = query.Where("role = ?", models.RoleAdmin)
+			query = query.Where(
+				"platform_role = ?",
+				models.PlatformRolePlatformAdmin,
+			)
 		}
 		if err := query.Count(&count).Error; err != nil {
 			t.Fatalf("count %s: %v", assertion.name, err)
@@ -467,10 +637,11 @@ func TestRunMigrationsUpgradesLegacyHumanRolesBeforeInstallingConstraint(t *test
 	if err := db.AutoMigrate(&models.User{}); err != nil {
 		t.Fatalf("create users table: %v", err)
 	}
-	// The current model already carries the closed role constraint. Temporarily
-	// bypass it to reproduce a database created by an older binary.
-	if err := db.Exec("PRAGMA ignore_check_constraints = ON").Error; err != nil {
-		t.Fatalf("enable legacy fixture mode: %v", err)
+	if err := db.Exec(`
+		ALTER TABLE users
+		ADD COLUMN role TEXT NOT NULL DEFAULT 'customer'
+	`).Error; err != nil {
+		t.Fatalf("add legacy role column: %v", err)
 	}
 	if err := db.Exec(`
 		INSERT INTO users (username, email, password_hash, role, status) VALUES
@@ -495,10 +666,6 @@ func TestRunMigrationsUpgradesLegacyHumanRolesBeforeInstallingConstraint(t *test
 	`).Error; err != nil {
 		t.Fatalf("seed soft-deleted legacy user: %v", err)
 	}
-	if err := db.Exec("PRAGMA ignore_check_constraints = OFF").Error; err != nil {
-		t.Fatalf("restore role constraints: %v", err)
-	}
-
 	for run := 1; run <= 2; run++ {
 		if err := RunMigrations(
 			db,
@@ -512,27 +679,39 @@ func TestRunMigrationsUpgradesLegacyHumanRolesBeforeInstallingConstraint(t *test
 	if err := db.Unscoped().Order("id ASC").Find(&users).Error; err != nil {
 		t.Fatalf("read migrated users: %v", err)
 	}
-	wantRoles := []models.UserRole{
-		models.RoleCustomer,
-		models.RoleAdmin,
-		models.RoleAgent,
-		models.RoleSupervisor,
-		models.RoleCustomer,
+	wantRoles := []models.PlatformRole{
+		models.PlatformRoleMember,
+		models.PlatformRolePlatformAdmin,
+		models.PlatformRoleMember,
+		models.PlatformRoleMember,
+		models.PlatformRoleMember,
 	}
 	if len(users) != len(wantRoles) {
 		t.Fatalf("migrated user count = %d, want %d", len(users), len(wantRoles))
 	}
 	for index, wantRole := range wantRoles {
-		if users[index].Role != wantRole {
-			t.Errorf("user %d role = %q, want %q", index, users[index].Role, wantRole)
+		if users[index].PlatformRole != wantRole {
+			t.Errorf(
+				"user %d platform role = %q, want %q",
+				index,
+				users[index].PlatformRole,
+				wantRole,
+			)
 		}
+	}
+	hasLegacyRole, err := hasExactDatabaseColumn(db, "users", "role")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasLegacyRole {
+		t.Fatal("legacy users.role column remains after platform cutover")
 	}
 
 	if err := db.Exec(`
 		INSERT INTO users (username, email, password_hash, role, status)
 		VALUES ('invalid-legacy-role', 'invalid-legacy-role@example.test', 'hash', 'user', 'active')
 	`).Error; err == nil {
-		t.Fatal("expected the closed human-role constraint to reject a legacy role")
+		t.Fatal("expected removed legacy role column to reject old contract")
 	}
 }
 

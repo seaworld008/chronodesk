@@ -1,18 +1,48 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
 var e164PhonePattern = regexp.MustCompile(`^\+[1-9][0-9]{1,14}$`)
+
+type optionalCreatePhone struct {
+	present bool
+	value   string
+}
+
+func (phone *optionalCreatePhone) UnmarshalJSON(data []byte) error {
+	phone.present = true
+	if err := json.Unmarshal(data, &phone.value); err != nil {
+		return errors.New("phone must be an E.164 string")
+	}
+	return nil
+}
+
+type adminUserCreateRequest struct {
+	Username     string              `json:"username" binding:"required,min=3,max=50"`
+	Email        string              `json:"email" binding:"required,email"`
+	Phone        optionalCreatePhone `json:"phone"`
+	Password     string              `json:"password" binding:"required,min=8,max=128"`
+	FirstName    string              `json:"first_name" binding:"omitempty,max=50"`
+	LastName     string              `json:"last_name" binding:"omitempty,max=50"`
+	DisplayName  string              `json:"display_name" binding:"omitempty,max=100"`
+	PlatformRole models.PlatformRole `json:"platform_role" binding:"required,oneof=platform_admin security_auditor emergency_operator member"`
+	Department   string              `json:"department" binding:"omitempty,max=100"`
+	JobTitle     string              `json:"job_title" binding:"omitempty,max=100"`
+	ManagerID    *uint               `json:"manager_id" binding:"omitempty,gt=0"`
+}
 
 // AdminUserHandler 管理员用户管理处理器
 type AdminUserHandler struct {
@@ -35,7 +65,7 @@ func NewAdminUserHandler(adminUserService *services.AdminUserService) *AdminUser
 // @Security ApiKeyAuth
 // @Param page query int false "页码" default(1)
 // @Param page_size query int false "每页数量" default(20)
-// @Param role query string false "用户角色过滤" Enums(admin, agent, customer, supervisor)
+// @Param platform_role query string false "平台角色过滤" Enums(platform_admin, security_auditor, emergency_operator, member)
 // @Param status query string false "用户状态过滤" Enums(active, inactive, suspended, deleted)
 // @Param search query string false "搜索关键词（用户名、邮箱、姓名）"
 // @Param order_by query string false "排序字段" Enums(id, username, email, created_at, updated_at, last_login_at) default(created_at)
@@ -45,7 +75,7 @@ func NewAdminUserHandler(adminUserService *services.AdminUserService) *AdminUser
 // @Failure 401 {object} ApiResponse
 // @Failure 403 {object} ApiResponse
 // @Failure 500 {object} ApiResponse
-// @Router /api/admin/users [get]
+// @Router /api/platform/users [get]
 func (h *AdminUserHandler) GetUserList(c *gin.Context) {
 	var req services.UserListRequest
 	if err := c.ShouldBindQuery(&req); err != nil {
@@ -89,7 +119,7 @@ func (h *AdminUserHandler) GetUserList(c *gin.Context) {
 // @Failure 403 {object} ApiResponse
 // @Failure 404 {object} ApiResponse
 // @Failure 500 {object} ApiResponse
-// @Router /api/admin/users/{id} [get]
+// @Router /api/platform/users/{id} [get]
 func (h *AdminUserHandler) GetUser(c *gin.Context) {
 	userIDStr := c.Param("id")
 	userID, err := strconv.ParseUint(userIDStr, 10, 32)
@@ -142,10 +172,10 @@ func (h *AdminUserHandler) GetUser(c *gin.Context) {
 // @Failure 403 {object} ApiResponse
 // @Failure 409 {object} ApiResponse
 // @Failure 500 {object} ApiResponse
-// @Router /api/admin/users [post]
+// @Router /api/platform/users [post]
 func (h *AdminUserHandler) CreateUser(c *gin.Context) {
-	var req models.UserCreateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	var request adminUserCreateRequest
+	if err := decodeStrictAdminUserJSON(c, &request); err != nil {
 		c.JSON(http.StatusBadRequest, ApiResponse{
 			Code: 1,
 			Msg:  "请求参数错误",
@@ -155,7 +185,7 @@ func (h *AdminUserHandler) CreateUser(c *gin.Context) {
 	}
 
 	// 基本验证
-	if len(req.Username) < 3 {
+	if len(request.Username) < 3 {
 		c.JSON(http.StatusBadRequest, ApiResponse{
 			Code: 1,
 			Msg:  "用户名长度至少3位",
@@ -164,7 +194,7 @@ func (h *AdminUserHandler) CreateUser(c *gin.Context) {
 		return
 	}
 
-	if len(req.Password) < 8 {
+	if len(request.Password) < 8 {
 		c.JSON(http.StatusBadRequest, ApiResponse{
 			Code: 1,
 			Msg:  "密码长度至少8位",
@@ -172,7 +202,33 @@ func (h *AdminUserHandler) CreateUser(c *gin.Context) {
 		})
 		return
 	}
+	phone := ""
+	if request.Phone.present {
+		phone = strings.TrimSpace(request.Phone.value)
+	}
+	if request.Phone.present &&
+		(phone == "" || !e164PhonePattern.MatchString(phone)) {
+		c.JSON(http.StatusBadRequest, ApiResponse{
+			Code: 1,
+			Msg:  "电话号码必须是 E.164 格式，例如 +8613800138000",
+			Data: nil,
+		})
+		return
+	}
 
+	req := models.UserCreateRequest{
+		Username:     request.Username,
+		Email:        request.Email,
+		Phone:        phone,
+		Password:     request.Password,
+		FirstName:    request.FirstName,
+		LastName:     request.LastName,
+		DisplayName:  request.DisplayName,
+		PlatformRole: request.PlatformRole,
+		Department:   request.Department,
+		JobTitle:     request.JobTitle,
+		ManagerID:    request.ManagerID,
+	}
 	user, err := h.adminUserService.CreateUser(c.Request.Context(), &req)
 	if err != nil {
 		if errors.Is(err, services.ErrAdminUserIdentityConflict) {
@@ -215,7 +271,7 @@ func (h *AdminUserHandler) CreateUser(c *gin.Context) {
 // @Failure 404 {object} ApiResponse
 // @Failure 409 {object} ApiResponse
 // @Failure 500 {object} ApiResponse
-// @Router /api/admin/users/{id} [put]
+// @Router /api/platform/users/{id} [put]
 func (h *AdminUserHandler) UpdateUser(c *gin.Context) {
 	userIDStr := c.Param("id")
 	userID, err := strconv.ParseUint(userIDStr, 10, 32)
@@ -229,7 +285,7 @@ func (h *AdminUserHandler) UpdateUser(c *gin.Context) {
 	}
 
 	var req models.UserUpdateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictAdminUserJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, ApiResponse{
 			Code: 1,
 			Msg:  "请求参数错误",
@@ -268,10 +324,10 @@ func (h *AdminUserHandler) UpdateUser(c *gin.Context) {
 			})
 			return
 		}
-		if strings.Contains(err.Error(), "cannot deactivate") {
+		if errors.Is(err, services.ErrLastActivePlatformAdministrator) {
 			c.JSON(http.StatusConflict, ApiResponse{
 				Code: 1,
-				Msg:  "不能停用或降级最后一个活跃管理员",
+				Msg:  "不能停用或降级最后一个活跃平台管理员",
 				Data: nil,
 			})
 			return
@@ -307,7 +363,7 @@ func (h *AdminUserHandler) UpdateUser(c *gin.Context) {
 // @Failure 403 {object} ApiResponse
 // @Failure 404 {object} ApiResponse
 // @Failure 500 {object} ApiResponse
-// @Router /api/admin/users/{id}/reset-password [post]
+// @Router /api/platform/users/{id}/reset-password [post]
 func (h *AdminUserHandler) ResetUserPassword(c *gin.Context) {
 	userIDStr := c.Param("id")
 	userID, err := strconv.ParseUint(userIDStr, 10, 32)
@@ -321,7 +377,7 @@ func (h *AdminUserHandler) ResetUserPassword(c *gin.Context) {
 	}
 
 	var req ResetPasswordRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictAdminUserJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, ApiResponse{
 			Code: 1,
 			Msg:  "请求参数错误",
@@ -365,6 +421,25 @@ func (h *AdminUserHandler) ResetUserPassword(c *gin.Context) {
 	})
 }
 
+func decodeStrictAdminUserJSON(c *gin.Context, target any) error {
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		return errors.New("request body is required")
+	}
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("request body must contain one JSON value")
+		}
+		return err
+	}
+	return binding.Validator.ValidateStruct(target)
+}
+
 // DeleteUser 删除用户
 // @Summary 删除用户
 // @Description 管理员删除指定用户（软删除）
@@ -380,7 +455,7 @@ func (h *AdminUserHandler) ResetUserPassword(c *gin.Context) {
 // @Failure 404 {object} ApiResponse
 // @Failure 409 {object} ApiResponse
 // @Failure 500 {object} ApiResponse
-// @Router /api/admin/users/{id} [delete]
+// @Router /api/platform/users/{id} [delete]
 func (h *AdminUserHandler) DeleteUser(c *gin.Context) {
 	userIDStr := c.Param("id")
 	userID, err := strconv.ParseUint(userIDStr, 10, 32)
@@ -403,10 +478,10 @@ func (h *AdminUserHandler) DeleteUser(c *gin.Context) {
 			})
 			return
 		}
-		if strings.Contains(err.Error(), "cannot delete") {
+		if errors.Is(err, services.ErrLastActivePlatformAdministrator) {
 			c.JSON(http.StatusConflict, ApiResponse{
 				Code: 1,
-				Msg:  "不能删除最后一个活跃管理员",
+				Msg:  "不能删除最后一个活跃平台管理员",
 				Data: nil,
 			})
 			return
@@ -438,7 +513,7 @@ func (h *AdminUserHandler) DeleteUser(c *gin.Context) {
 // @Failure 401 {object} ApiResponse
 // @Failure 403 {object} ApiResponse
 // @Failure 500 {object} ApiResponse
-// @Router /api/admin/users/stats [get]
+// @Router /api/platform/users/stats [get]
 func (h *AdminUserHandler) GetUserStats(c *gin.Context) {
 	stats, err := h.adminUserService.GetUserStats(c.Request.Context())
 	if err != nil {

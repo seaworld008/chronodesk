@@ -20,6 +20,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
 	"github.com/seaworld008/chronodesk/server/internal/mcp"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"github.com/gin-gonic/gin"
@@ -47,7 +48,151 @@ type mcpAdapterFixture struct {
 	actor                mcp.Principal
 }
 
+type transactionRejectingExecutionGuard struct {
+	acquireCalled atomic.Bool
+	releaseCalled atomic.Bool
+	recordCalled  atomic.Bool
+	acquireCalls  atomic.Int64
+	releaseCalls  atomic.Int64
+	recordCalls   atomic.Int64
+}
+
+type renewalFailingExecutionGuard struct {
+	acquireCalls atomic.Int64
+	renewCalls   atomic.Int64
+	releaseCalls atomic.Int64
+}
+
+func (guard *renewalFailingExecutionGuard) Acquire(
+	ctx context.Context,
+	_ services.AgentExecutionGuardRequest,
+) (*services.AgentExecutionPermit, error) {
+	if scopeddb.HasTransaction(ctx) {
+		return nil, errors.New(
+			"MCP execution guard acquire ran inside a project transaction",
+		)
+	}
+	guard.acquireCalls.Add(1)
+	return &services.AgentExecutionPermit{}, nil
+}
+
+func (guard *renewalFailingExecutionGuard) Renew(
+	ctx context.Context,
+	_ services.AgentExecutionRenewRequest,
+) error {
+	if scopeddb.HasTransaction(ctx) {
+		return errors.New(
+			"MCP execution guard renewal ran inside a project transaction",
+		)
+	}
+	guard.renewCalls.Add(1)
+	return errors.New("forced MCP execution lease renewal failure")
+}
+
+func (guard *renewalFailingExecutionGuard) Release(
+	ctx context.Context,
+	_ *services.AgentExecutionPermit,
+) error {
+	if scopeddb.HasTransaction(ctx) {
+		return errors.New(
+			"MCP execution guard release ran inside a project transaction",
+		)
+	}
+	guard.releaseCalls.Add(1)
+	return nil
+}
+
+func (*renewalFailingExecutionGuard) RecordLoop(
+	ctx context.Context,
+	_ services.AgentLoopGuardRequest,
+) (bool, error) {
+	if scopeddb.HasTransaction(ctx) {
+		return false, errors.New(
+			"MCP execution loop guard ran inside a project transaction",
+		)
+	}
+	return false, nil
+}
+
+func (*renewalFailingExecutionGuard) IsDistributed() bool {
+	return false
+}
+
+func (guard *transactionRejectingExecutionGuard) Acquire(
+	ctx context.Context,
+	_ services.AgentExecutionGuardRequest,
+) (*services.AgentExecutionPermit, error) {
+	if scopeddb.HasTransaction(ctx) {
+		return nil, errors.New(
+			"MCP execution guard acquire ran inside a project transaction",
+		)
+	}
+	guard.acquireCalled.Store(true)
+	guard.acquireCalls.Add(1)
+	return &services.AgentExecutionPermit{}, nil
+}
+
+func (guard *transactionRejectingExecutionGuard) Release(
+	ctx context.Context,
+	_ *services.AgentExecutionPermit,
+) error {
+	if scopeddb.HasTransaction(ctx) {
+		return errors.New(
+			"MCP execution guard release ran inside a project transaction",
+		)
+	}
+	guard.releaseCalled.Store(true)
+	guard.releaseCalls.Add(1)
+	return nil
+}
+
+func (guard *transactionRejectingExecutionGuard) RecordLoop(
+	ctx context.Context,
+	_ services.AgentLoopGuardRequest,
+) (bool, error) {
+	if scopeddb.HasTransaction(ctx) {
+		return false, errors.New(
+			"MCP execution loop guard ran inside a project transaction",
+		)
+	}
+	guard.recordCalled.Store(true)
+	guard.recordCalls.Add(1)
+	return false, nil
+}
+
+func (*transactionRejectingExecutionGuard) IsDistributed() bool {
+	return false
+}
+
+func (guard *transactionRejectingExecutionGuard) resetCalls() {
+	guard.acquireCalled.Store(false)
+	guard.releaseCalled.Store(false)
+	guard.recordCalled.Store(false)
+	guard.acquireCalls.Store(0)
+	guard.releaseCalls.Store(0)
+	guard.recordCalls.Store(0)
+}
+
 func newMCPAdapterFixture(t *testing.T) *mcpAdapterFixture {
+	return newMCPAdapterFixtureWithExecutionGuard(t, nil)
+}
+
+func newMCPAdapterFixtureWithExecutionGuard(
+	t *testing.T,
+	executionGuard services.AgentExecutionGuard,
+) *mcpAdapterFixture {
+	return newMCPAdapterFixtureWithExecutionGuardAndLeaseTTL(
+		t,
+		executionGuard,
+		0,
+	)
+}
+
+func newMCPAdapterFixtureWithExecutionGuardAndLeaseTTL(
+	t *testing.T,
+	executionGuard services.AgentExecutionGuard,
+	executionLeaseTTL time.Duration,
+) *mcpAdapterFixture {
 	t.Helper()
 	dsn := fmt.Sprintf(
 		"file:mcp-adapter-%d?mode=memory&cache=shared",
@@ -66,6 +211,7 @@ func newMCPAdapterFixture(t *testing.T) *mcpAdapterFixture {
 		&models.WorkflowVersion{},
 		&models.ConfigurationRelease{},
 		&models.User{},
+		&models.ProjectMembership{},
 		&models.Category{},
 		&models.ServicePrincipal{},
 		&models.AgentCredential{},
@@ -127,20 +273,33 @@ func newMCPAdapterFixture(t *testing.T) *mcpAdapterFixture {
 		Username:     fmt.Sprintf("mcp-compat-%d", mcpAdapterTestSequence.Load()),
 		Email:        fmt.Sprintf("mcp-compat-%d@example.com", mcpAdapterTestSequence.Load()),
 		PasswordHash: "not-a-password",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatalf("seed actor user: %v", err)
 	}
+	if err := db.Create(&models.ProjectMembership{
+		ProjectID: project.ID,
+		UserID:    user.ID,
+		Role:      models.ProjectRoleAgent,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
+		t.Fatalf("seed assignable actor membership: %v", err)
+	}
 	storage, err := services.NewLocalAttachmentStorage(t.TempDir())
 	if err != nil {
 		t.Fatalf("create attachment storage: %v", err)
 	}
-	service := services.NewAgentNativeService(db, services.AgentNativeOptions{
+	nativeOptions := services.AgentNativeOptions{
 		AttachmentStorage:  storage,
+		AttachmentStaging:  storage,
 		AttachmentMaxBytes: 10 << 20,
-	})
+		ExecutionGuard:     executionGuard,
+		ExecutionLeaseTTL:  executionLeaseTTL,
+	}
+	service := services.NewAgentNativeService(db, nativeOptions)
 	scopes := append([]string(nil), models.SupportedAgentScopes...)
 	principal, err := service.CreateServicePrincipal(context.Background(), services.CreateServicePrincipalInput{
 		Name:               fmt.Sprintf("mcp-agent-%d", mcpAdapterTestSequence.Load()),
@@ -287,6 +446,414 @@ func (f *mcpAdapterFixture) authorize(
 		request.Arguments = withMCPProjectKey(request.Arguments, string(f.project.Key))
 	}
 	return f.adapter.Authorize(ctx, f.actor, request)
+}
+
+func TestMCPExecutionGuardRunsOutsideProjectTransaction(t *testing.T) {
+	guard := &transactionRejectingExecutionGuard{}
+	fixture := newMCPAdapterFixtureWithExecutionGuard(t, guard)
+	ticket := fixture.seedTicket(t, "MCP-GUARD-BOUNDARY", "")
+
+	result, err := fixture.callTool(
+		context.Background(),
+		"ticket_get",
+		map[string]any{"ticket_id": int64(ticket.ID)},
+	)
+	if err != nil {
+		t.Fatalf("ticket_get with transaction-rejecting execution guard: %v", err)
+	}
+	if result == nil {
+		t.Fatal("ticket_get returned no result")
+	}
+	if !guard.acquireCalled.Load() {
+		t.Fatal("MCP execution guard acquire was not called")
+	}
+	if !guard.releaseCalled.Load() {
+		t.Fatal("MCP execution guard release was not called")
+	}
+}
+
+func TestMCPTicketCreateUsesShortPolicyAndCommandOwnedTransactions(
+	t *testing.T,
+) {
+	guard := &transactionRejectingExecutionGuard{}
+	fixture := newMCPAdapterFixtureWithExecutionGuard(t, guard)
+	arguments := map[string]any{
+		"title":                   "MCP command-owned Ticket create",
+		"description":             "Policy and Redis guards run between short project transactions.",
+		"type":                    "request",
+		"priority":                "normal",
+		"request_type_version_id": fixture.requestTypeVersionID,
+		"workflow_version_id":     fixture.workflowVersionID,
+		"idempotency_key":         "mcp-command-owned-create-0001",
+	}
+	if err := fixture.authorize(
+		context.Background(),
+		mcp.AuthorizationRequest{
+			Action:         "ticket_create",
+			RequiredScopes: []string{models.ScopeTicketsCreate},
+			Arguments:      arguments,
+		},
+	); err != nil {
+		t.Fatalf("pre-authorize MCP ticket_create: %v", err)
+	}
+	result, err := fixture.callTool(
+		context.Background(),
+		"ticket_create",
+		arguments,
+	)
+	if err != nil {
+		t.Fatalf("MCP ticket_create: %v", err)
+	}
+	assertReceiptShape(t, result)
+	if !guard.acquireCalled.Load() ||
+		!guard.releaseCalled.Load() ||
+		!guard.recordCalled.Load() {
+		t.Fatalf(
+			"MCP create guard calls acquire=%t release=%t record=%t",
+			guard.acquireCalled.Load(),
+			guard.releaseCalled.Load(),
+			guard.recordCalled.Load(),
+		)
+	}
+}
+
+func TestMCPExecutionLeaseRenewalFailureRollsBackTicketEventAndOutbox(
+	t *testing.T,
+) {
+	guard := &renewalFailingExecutionGuard{}
+	fixture := newMCPAdapterFixtureWithExecutionGuardAndLeaseTTL(
+		t,
+		guard,
+		750*time.Millisecond,
+	)
+	sqlDB, err := fixture.db.DB()
+	if err != nil {
+		t.Fatalf("get MCP fixture SQL database: %v", err)
+	}
+	anchor, err := sqlDB.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("keep MCP in-memory database alive: %v", err)
+	}
+	defer anchor.Close()
+	callbackName := fmt.Sprintf(
+		"test:wait_for_mcp_execution_lease_loss:%d",
+		mcpAdapterTestSequence.Add(1),
+	)
+	if err := fixture.db.Callback().
+		Create().
+		Before("gorm:create").
+		Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement == nil ||
+				tx.Statement.Schema == nil ||
+				tx.Statement.Schema.Table != "tickets" {
+				return
+			}
+			select {
+			case <-tx.Statement.Context.Done():
+				tx.AddError(context.Cause(tx.Statement.Context))
+			case <-time.After(3 * time.Second):
+				tx.AddError(errors.New(
+					"timed out waiting for MCP execution lease loss",
+				))
+			}
+		}); err != nil {
+		t.Fatalf("register execution lease callback: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = fixture.db.Callback().
+			Create().
+			Remove(callbackName)
+	})
+
+	var (
+		ticketsBefore int64
+		eventsBefore  int64
+		outboxBefore  int64
+	)
+	if err := fixture.db.Model(&models.Ticket{}).
+		Count(&ticketsBefore).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.db.Model(&models.DomainEvent{}).
+		Count(&eventsBefore).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.db.Model(&models.OutboxDelivery{}).
+		Count(&outboxBefore).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = fixture.callTool(
+		context.Background(),
+		"ticket_create",
+		map[string]any{
+			"title": "MCP lease renewal must fail closed",
+			"description": "The transaction waits until the execution " +
+				"permit renewal fails.",
+			"type":                    "request",
+			"priority":                "normal",
+			"request_type_version_id": fixture.requestTypeVersionID,
+			"workflow_version_id":     fixture.workflowVersionID,
+			"idempotency_key": "mcp-renewal-failure-" +
+				strconv.FormatUint(
+					mcpAdapterTestSequence.Add(1),
+					10,
+				),
+		},
+	)
+	if err == nil {
+		t.Fatal("ticket_create succeeded after execution lease renewal loss")
+	}
+
+	var (
+		ticketsAfter int64
+		eventsAfter  int64
+		outboxAfter  int64
+	)
+	if err := fixture.db.Model(&models.Ticket{}).
+		Count(&ticketsAfter).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.db.Model(&models.DomainEvent{}).
+		Count(&eventsAfter).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.db.Model(&models.OutboxDelivery{}).
+		Count(&outboxAfter).Error; err != nil {
+		t.Fatal(err)
+	}
+	if ticketsAfter != ticketsBefore ||
+		eventsAfter != eventsBefore ||
+		outboxAfter != outboxBefore {
+		t.Fatalf(
+			"renewal loss committed mutation: tickets=%d->%d events=%d->%d outbox=%d->%d",
+			ticketsBefore,
+			ticketsAfter,
+			eventsBefore,
+			eventsAfter,
+			outboxBefore,
+			outboxAfter,
+		)
+	}
+	if guard.acquireCalls.Load() != 1 ||
+		guard.renewCalls.Load() == 0 ||
+		guard.releaseCalls.Load() != 1 {
+		t.Fatalf(
+			"execution lease calls acquire=%d renew=%d release=%d",
+			guard.acquireCalls.Load(),
+			guard.renewCalls.Load(),
+			guard.releaseCalls.Load(),
+		)
+	}
+}
+
+func TestMCPWriteCommandsKeepExecutionGuardOutsideProjectTransactions(
+	t *testing.T,
+) {
+	guard := &transactionRejectingExecutionGuard{}
+	fixture := newMCPAdapterFixtureWithExecutionGuard(t, guard)
+	allowAgentTicketAction(
+		t,
+		fixture,
+		models.ScopeTicketsAssign,
+		"ticket.assign",
+	)
+	allowAgentTicketAction(
+		t,
+		fixture,
+		models.ScopeTicketsTransition,
+		"ticket.transition",
+	)
+
+	var (
+		ticketID uint
+		leaseID  string
+	)
+	steps := []struct {
+		name      string
+		wantLoops int64
+		run       func()
+	}{
+		{
+			name:      "create",
+			wantLoops: 1,
+			run: func() {
+				result := callMCPTool(
+					t,
+					fixture,
+					"ticket_create",
+					map[string]any{
+						"title":                   "MCP guarded write matrix",
+						"description":             "Every Redis-equivalent loop guard runs without a project transaction.",
+						"type":                    "request",
+						"priority":                "normal",
+						"request_type_version_id": fixture.requestTypeVersionID,
+						"workflow_version_id":     fixture.workflowVersionID,
+						"idempotency_key":         "mcp-guard-matrix-create",
+					},
+				)
+				rawID, err := strconv.ParseUint(
+					result["resource_id"].(string),
+					10,
+					64,
+				)
+				if err != nil || rawID == 0 {
+					t.Fatalf("created ticket id=%v err=%v", result, err)
+				}
+				ticketID = uint(rawID)
+			},
+		},
+		{
+			name:      "claim",
+			wantLoops: 1,
+			run: func() {
+				result := callMCPTool(
+					t,
+					fixture,
+					"ticket_claim",
+					map[string]any{
+						"ticket_id":        int64(ticketID),
+						"expected_version": int64(1),
+						"lease_seconds":    int64(60),
+						"idempotency_key":  "mcp-guard-matrix-claim",
+					},
+				)
+				leaseID = result["lease_id"].(string)
+			},
+		},
+		{
+			name:      "heartbeat",
+			wantLoops: 1,
+			run: func() {
+				callMCPTool(t, fixture, "ticket_heartbeat", map[string]any{
+					"ticket_id":       int64(ticketID),
+					"lease_id":        leaseID,
+					"lease_seconds":   int64(60),
+					"idempotency_key": "mcp-guard-matrix-heartbeat",
+				})
+			},
+		},
+		{
+			name:      "update",
+			wantLoops: 1,
+			run: func() {
+				callMCPTool(t, fixture, "ticket_update", map[string]any{
+					"ticket_id":        int64(ticketID),
+					"expected_version": int64(1),
+					"lease_id":         leaseID,
+					"patch": map[string]any{
+						"title": "MCP guarded update",
+					},
+					"reason":          "guard boundary",
+					"idempotency_key": "mcp-guard-matrix-update",
+				})
+			},
+		},
+		{
+			name:      "assign",
+			wantLoops: 1,
+			run: func() {
+				callMCPTool(t, fixture, "ticket_assign", map[string]any{
+					"ticket_id":        int64(ticketID),
+					"expected_version": int64(2),
+					"lease_id":         leaseID,
+					"assignee": map[string]any{
+						"type": string(models.ActorTypeHuman),
+						"id": strconv.FormatUint(
+							uint64(fixture.user.ID),
+							10,
+						),
+					},
+					"reason":          "guard boundary",
+					"idempotency_key": "mcp-guard-matrix-assign",
+				})
+			},
+		},
+		{
+			name:      "transition",
+			wantLoops: 1,
+			run: func() {
+				callMCPTool(
+					t,
+					fixture,
+					"ticket_transition",
+					map[string]any{
+						"ticket_id":        int64(ticketID),
+						"expected_version": int64(3),
+						"lease_id":         leaseID,
+						"status":           "in_progress",
+						"reason":           "guard boundary",
+						"idempotency_key":  "mcp-guard-matrix-transition",
+					},
+				)
+			},
+		},
+		{
+			name:      "comment",
+			wantLoops: 1,
+			run: func() {
+				callMCPTool(t, fixture, "ticket_add_comment", map[string]any{
+					"ticket_id":        int64(ticketID),
+					"expected_version": int64(4),
+					"lease_id":         leaseID,
+					"visibility":       "internal",
+					"content":          "Guarded comment",
+					"content_type":     "text",
+					"reason":           "guard boundary",
+					"idempotency_key":  "mcp-guard-matrix-comment",
+				})
+			},
+		},
+		{
+			name:      "attachment",
+			wantLoops: 1,
+			run: func() {
+				callMCPTool(t, fixture, "ticket_attach_file", map[string]any{
+					"ticket_id":        int64(ticketID),
+					"expected_version": int64(5),
+					"lease_id":         leaseID,
+					"file_name":        "guard.txt",
+					"content_type":     "text/plain",
+					"content_base64":   "aGVsbG8=",
+					"sha256":           "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+					"visibility":       "internal",
+					"idempotency_key":  "mcp-guard-matrix-attachment",
+				})
+			},
+		},
+		{
+			name:      "release",
+			wantLoops: 1,
+			run: func() {
+				callMCPTool(t, fixture, "ticket_release", map[string]any{
+					"ticket_id":       int64(ticketID),
+					"lease_id":        leaseID,
+					"idempotency_key": "mcp-guard-matrix-release",
+				})
+			},
+		},
+	}
+	for _, step := range steps {
+		t.Run(step.name, func(t *testing.T) {
+			guard.resetCalls()
+			step.run()
+			if got := guard.recordCalls.Load(); got != step.wantLoops {
+				t.Fatalf(
+					"RecordLoop calls=%d, want %d",
+					got,
+					step.wantLoops,
+				)
+			}
+			if guard.acquireCalls.Load() != 1 ||
+				guard.releaseCalls.Load() != 1 {
+				t.Fatalf(
+					"execution guard acquire/release=%d/%d, want 1/1",
+					guard.acquireCalls.Load(),
+					guard.releaseCalls.Load(),
+				)
+			}
+		})
+	}
 }
 
 func TestTicketAssignedActorRejectsIncompleteAndContradictoryProjections(t *testing.T) {
@@ -841,6 +1408,105 @@ func TestMCPAdapterSubscriptionRevalidationIsReadOnlyAndQuotaFree(t *testing.T) 
 	release()
 }
 
+func TestMCPAdapterSubscriptionRevalidationNormalizesLiveRevocation(
+	t *testing.T,
+) {
+	tests := []struct {
+		name   string
+		revoke func(*testing.T, *mcpAdapterFixture)
+	}{
+		{
+			name: "project grant",
+			revoke: func(t *testing.T, fixture *mcpAdapterFixture) {
+				t.Helper()
+				if err := fixture.db.Model(
+					&models.ProjectPrincipalGrant{},
+				).Where(
+					"project_id = ? AND service_principal_id = ?",
+					fixture.project.ID,
+					fixture.principal.ID,
+				).Update("is_active", false).Error; err != nil {
+					t.Fatalf("revoke project grant: %v", err)
+				}
+			},
+		},
+		{
+			name: "principal",
+			revoke: func(t *testing.T, fixture *mcpAdapterFixture) {
+				t.Helper()
+				if err := fixture.db.Model(
+					&models.ServicePrincipal{},
+				).Where(
+					"id = ?",
+					fixture.principal.ID,
+				).Update(
+					"status",
+					models.ServicePrincipalStatusInactive,
+				).Error; err != nil {
+					t.Fatalf("disable principal: %v", err)
+				}
+			},
+		},
+		{
+			name: "credential",
+			revoke: func(t *testing.T, fixture *mcpAdapterFixture) {
+				t.Helper()
+				now := time.Now().UTC()
+				if err := fixture.db.Model(
+					&models.AgentCredential{},
+				).Where(
+					"id = ?",
+					fixture.credential.ID,
+				).Updates(map[string]any{
+					"status":     models.AgentCredentialStatusRevoked,
+					"revoked_at": &now,
+				}).Error; err != nil {
+					t.Fatalf("revoke credential: %v", err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newMCPAdapterFixture(t)
+			ticket := fixture.seedTicket(
+				t,
+				"MCP-SUBSCRIPTION-REVOKE",
+				"triage",
+			)
+			uri := fmt.Sprintf(
+				"ticket://projects/TEST/tickets/%d",
+				ticket.ID,
+			)
+			allowed, err := fixture.adapter.ValidateSubscription(
+				context.Background(),
+				fixture.actor,
+				uri,
+			)
+			if err != nil || !allowed {
+				t.Fatalf(
+					"initial ValidateSubscription allowed=%t err=%v",
+					allowed,
+					err,
+				)
+			}
+			test.revoke(t, fixture)
+			allowed, err = fixture.adapter.ValidateSubscription(
+				context.Background(),
+				fixture.actor,
+				uri,
+			)
+			if err != nil || allowed {
+				t.Fatalf(
+					"revoked ValidateSubscription allowed=%t err=%v, want false/nil",
+					allowed,
+					err,
+				)
+			}
+		})
+	}
+}
+
 func TestMCPAdapterAttachmentPolicyUsesFileNameContextAtBothChecks(t *testing.T) {
 	fixture := newMCPAdapterFixture(t)
 	ticket := fixture.seedTicket(t, "MCP-ATTACHMENT-CONTEXT", "triage")
@@ -1229,8 +1895,8 @@ func TestMCPAdapterCommentAndAttachmentRequireLeaseBeforeDomainWork(t *testing.T
 		t.Fatalf("count idempotency before: %v", err)
 	}
 
-	// A missing lease must be rejected before even the shared execution gate
-	// enters the domain service.
+	// A missing lease must be rejected before policy, Redis execution guards or
+	// any domain write is attempted.
 	fixture.service.SetGlobalEmergencyStop(true)
 	t.Cleanup(func() {
 		fixture.service.SetGlobalEmergencyStop(false)
@@ -1274,7 +1940,7 @@ func TestMCPAdapterCommentAndAttachmentRequireLeaseBeforeDomainWork(t *testing.T
 		)
 		var failure *mcp.BackendError
 		if !errors.As(err, &failure) ||
-			failure.Code != "invalid_params" ||
+			failure.Code != "lease_conflict" ||
 			failure.Details["field"] != "lease_id" {
 			t.Fatalf("%s missing lease error = %#v, err=%v", testCase.name, failure, err)
 		}
@@ -1386,8 +2052,18 @@ func TestMCPAdapterListTicketsUsesBoundedPolicyBatchAndRawCursor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first bounded ticket_list: %v", err)
 	}
-	if queries := queryCount.Load(); queries > 8 {
-		t.Fatalf("first bounded ticket_list used %d queries; possible N+1 authorization", queries)
+	firstPageQueries := queryCount.Load()
+	// Four fixed authorization reads deliberately lock Project, Principal,
+	// Grant, then Credential before the bounded list query. Keep a strict
+	// constant ceiling while proving below that scanning fewer raw candidates
+	// does not change the query count.
+	const maxBoundedTicketListQueries int64 = 12
+	if firstPageQueries > maxBoundedTicketListQueries {
+		t.Fatalf(
+			"first bounded ticket_list used %d queries (max %d); possible N+1 authorization",
+			firstPageQueries,
+			maxBoundedTicketListQueries,
+		)
 	}
 	if items := firstPage["items"].([]map[string]any); len(items) != 0 {
 		t.Fatalf("denied page returned items: %#v", items)
@@ -1431,8 +2107,20 @@ func TestMCPAdapterListTicketsUsesBoundedPolicyBatchAndRawCursor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second bounded ticket_list: %v", err)
 	}
-	if queries := queryCount.Load(); queries > 8 {
-		t.Fatalf("second bounded ticket_list used %d queries; possible N+1 authorization", queries)
+	secondPageQueries := queryCount.Load()
+	if secondPageQueries > maxBoundedTicketListQueries {
+		t.Fatalf(
+			"second bounded ticket_list used %d queries (max %d); possible N+1 authorization",
+			secondPageQueries,
+			maxBoundedTicketListQueries,
+		)
+	}
+	if secondPageQueries != firstPageQueries {
+		t.Fatalf(
+			"ticket_list query count changed with raw candidate count: first=%d (500 candidates), second=%d (101 candidates)",
+			firstPageQueries,
+			secondPageQueries,
+		)
 	}
 	if items := secondPage["items"].([]map[string]any); len(items) != 0 {
 		t.Fatalf("second denied page returned items: %#v", items)

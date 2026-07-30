@@ -26,16 +26,23 @@ type Hub struct {
 	// Mutex for thread-safe operations
 	mu sync.RWMutex
 
+	authorizer FanoutAuthorizer
+
 	done     chan struct{}
 	stopOnce sync.Once
 }
 
 // NewHub creates a new WebSocket hub
-func NewHub() *Hub {
+func NewHub(authorizers ...FanoutAuthorizer) *Hub {
+	var authorizer FanoutAuthorizer
+	if len(authorizers) == 1 {
+		authorizer = authorizers[0]
+	}
 	return &Hub{
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		clients:    make(map[*Client]bool),
+		authorizer: authorizer,
 		done:       make(chan struct{}),
 	}
 }
@@ -91,9 +98,13 @@ func (h *Hub) stop() {
 	h.stopOnce.Do(func() {
 		close(h.done)
 		h.mu.Lock()
-		defer h.mu.Unlock()
+		clients := make([]*Client, 0, len(h.clients))
 		for client := range h.clients {
 			delete(h.clients, client)
+			clients = append(clients, client)
+		}
+		h.mu.Unlock()
+		for _, client := range clients {
 			client.close()
 		}
 	})
@@ -129,6 +140,7 @@ func (h *Hub) unregisterClient(client *Client) {
 // BroadcastToUser sends a message only to connections for the same project
 // and user. Project scope is server-owned control data, never a message field.
 func (h *Hub) BroadcastToUser(
+	ctx context.Context,
 	scope models.ProjectScope,
 	userID uint,
 	messageType string,
@@ -148,6 +160,17 @@ func (h *Hub) BroadcastToUser(
 		return nil
 	default:
 	}
+	if h.authorizer == nil {
+		h.evictUserScope(scope, userID)
+		return fmt.Errorf(
+			"%w: authorizer is unavailable",
+			ErrFanoutAuthorizationDenied,
+		)
+	}
+	if err := h.authorizer.AuthorizeFanout(ctx, scope, userID); err != nil {
+		h.evictUserScope(scope, userID)
+		return fmt.Errorf("authorize WebSocket fan-out: %w", err)
+	}
 	message := map[string]interface{}{
 		"type":      messageType,
 		"data":      data,
@@ -159,20 +182,135 @@ func (h *Hub) BroadcastToUser(
 		return fmt.Errorf("marshal WebSocket message: %w", err)
 	}
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
+	h.mu.RLock()
+	clients := make([]*Client, 0)
 	for client := range h.clients {
 		if client.UserID == userID && client.scope == scope {
-			select {
-			case client.send <- messageBytes:
-			default:
-				delete(h.clients, client)
-				client.close()
-			}
+			clients = append(clients, client)
+		}
+	}
+	h.mu.RUnlock()
+	for _, client := range clients {
+		if !client.enqueue(messageBytes) {
+			h.evictClient(client)
 		}
 	}
 	return nil
+}
+
+func (h *Hub) evictUserScope(scope models.ProjectScope, userID uint) {
+	h.evictMatching(func(client *Client) bool {
+		return client.UserID == userID && client.scope == scope
+	})
+}
+
+func (h *Hub) evictClient(client *Client) {
+	if h == nil || client == nil {
+		return
+	}
+	h.mu.Lock()
+	delete(h.clients, client)
+	h.mu.Unlock()
+	client.close()
+}
+
+func (h *Hub) evictMatching(matches func(*Client) bool) {
+	if h == nil || matches == nil {
+		return
+	}
+	h.mu.Lock()
+	clients := make([]*Client, 0)
+	for client := range h.clients {
+		if matches(client) {
+			delete(h.clients, client)
+			clients = append(clients, client)
+		}
+	}
+	h.mu.Unlock()
+	for _, client := range clients {
+		client.close()
+	}
+}
+
+func (h *Hub) authorizeDelivery(
+	client *Client,
+	authorizationEpoch uint64,
+) error {
+	if h == nil || client == nil || client.hub != h {
+		return fmt.Errorf(
+			"%w: invalid client binding",
+			ErrFanoutAuthorizationDenied,
+		)
+	}
+	if h.authorizer == nil {
+		return fmt.Errorf(
+			"%w: authorizer is unavailable",
+			ErrFanoutAuthorizationDenied,
+		)
+	}
+	if client.authorizationEpoch.Load() != authorizationEpoch {
+		return fmt.Errorf(
+			"%w: stale authorization epoch",
+			ErrFanoutAuthorizationDenied,
+		)
+	}
+	select {
+	case <-client.done:
+		return fmt.Errorf(
+			"%w: client connection is closed",
+			ErrFanoutAuthorizationDenied,
+		)
+	default:
+	}
+	if client.ctx == nil {
+		return fmt.Errorf(
+			"%w: connection context is unavailable",
+			ErrFanoutAuthorizationDenied,
+		)
+	}
+	if err := h.authorizer.AuthorizeFanout(
+		client.ctx,
+		client.scope,
+		client.UserID,
+	); err != nil {
+		return fmt.Errorf("authorize final WebSocket delivery: %w", err)
+	}
+	if client.authorizationEpoch.Load() != authorizationEpoch {
+		return fmt.Errorf(
+			"%w: authorization changed before delivery",
+			ErrFanoutAuthorizationDenied,
+		)
+	}
+	select {
+	case <-client.done:
+		return fmt.Errorf(
+			"%w: client connection closed before delivery",
+			ErrFanoutAuthorizationDenied,
+		)
+	default:
+		return nil
+	}
+}
+
+// RevokeProjectMembership actively evicts every idle connection for one
+// committed membership revocation. Queued frames are invalidated and drained.
+func (h *Hub) RevokeProjectMembership(
+	scope models.ProjectScope,
+	userID uint,
+) error {
+	return ProjectMembershipRevokedHook(h, scope, userID)
+}
+
+// RevokeUser actively evicts a deactivated or deleted user's connections in
+// every project.
+func (h *Hub) RevokeUser(userID uint) error {
+	return UserAccessRevokedHook(h, userID)
+}
+
+// RevokeProject actively evicts every connection for a deactivated or deleted
+// project.
+func (h *Hub) RevokeProject(scope models.ProjectScope) error {
+	return ProjectAccessRevokedHook(h, scope)
 }
 
 // IsUserOnline checks whether the user has a connection in this project.
@@ -208,7 +346,8 @@ func validateClientBinding(client *Client) error {
 	if err := client.scope.Validate(); err != nil {
 		return fmt.Errorf("WebSocket client project scope: %w", err)
 	}
-	if client.send == nil || client.done == nil {
+	if client.send == nil || client.receive == nil || client.done == nil ||
+		client.ctx == nil || client.cancel == nil {
 		return errors.New("WebSocket client channels are required")
 	}
 	return nil

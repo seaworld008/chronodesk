@@ -146,7 +146,7 @@ func TestWebhookDeletionRetainsDeliveryAuditLog(t *testing.T) {
 	}
 	user := User{
 		Username: "webhook-delete-admin", Email: "webhook-delete@example.com",
-		PasswordHash: "hash", Role: RoleAdmin, Status: UserStatusActive,
+		PasswordHash: "hash", PlatformRole: PlatformRolePlatformAdmin, Status: UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
@@ -225,7 +225,7 @@ func TestWebhookDeliverySnapshotIsAppendOnly(t *testing.T) {
 		Username:     "webhook-snapshot-owner",
 		Email:        "webhook-snapshot-owner@example.test",
 		PasswordHash: "hash",
-		Role:         RoleAdmin,
+		PlatformRole: PlatformRolePlatformAdmin,
 		Status:       UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {

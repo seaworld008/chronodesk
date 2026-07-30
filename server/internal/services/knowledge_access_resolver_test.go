@@ -106,14 +106,14 @@ func newProjectKnowledgeAccessFixture(
 		Username:     "knowledge-member",
 		Email:        "knowledge-member@example.test",
 		PasswordHash: "hash",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	outsider := models.User{
 		Username:     "knowledge-outsider",
 		Email:        "knowledge-outsider@example.test",
 		PasswordHash: "hash",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&human).Error; err != nil {

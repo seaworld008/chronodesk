@@ -45,14 +45,14 @@ func TestTicketNotificationOutboxSupportsEveryAuthoritativeActorType(t *testing.
 				Username:     "notification-actor",
 				Email:        "notification-actor@example.com",
 				PasswordHash: "hash",
-				Role:         models.RoleAgent,
+				PlatformRole: models.PlatformRoleMember,
 				Status:       models.UserStatusActive,
 			}
 			recipient := models.User{
 				Username:     "notification-recipient",
 				Email:        "notification-recipient@example.com",
 				PasswordHash: "hash",
-				Role:         models.RoleAgent,
+				PlatformRole: models.PlatformRoleMember,
 				Status:       models.UserStatusActive,
 			}
 			if err := db.Create(&actorUser).Error; err != nil {

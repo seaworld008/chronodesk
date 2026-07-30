@@ -30,14 +30,14 @@ func TestQuarantineUnsupportedPasswordHashes(t *testing.T) {
 		Username:     "unsupported-active",
 		Email:        "unsupported-active@example.com",
 		PasswordHash: "unsupported-digest",
-		Role:         models.RoleCustomer,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	inactive := models.User{
 		Username:     "unsupported-inactive",
 		Email:        "unsupported-inactive@example.com",
 		PasswordHash: "another-unsupported-digest",
-		Role:         models.RoleCustomer,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusInactive,
 	}
 	if err := db.Create(&active).Error; err != nil {

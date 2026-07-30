@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test'
 import { authenticatePage } from './helpers/testData'
 import { assertDestructiveE2EAllowed } from './helpers/safety'
+import type { AuthorizedProject } from '../src/lib/generated/human-api'
 
 test.describe('我的跨项目工作台', () => {
   test.beforeAll(() => {
@@ -13,12 +14,15 @@ test.describe('我的跨项目工作台', () => {
     const project = {
       id: 73,
       public_id: '00000000-0000-7000-8000-000000000073',
+      created_at: '2026-07-30T07:00:00Z',
+      updated_at: '2026-07-30T07:00:00Z',
       organization_id: 1,
       business_unit_id: 1,
       key: 'OPS',
       name: '运营支持',
+      description: '跨项目工作台 E2E 授权项目',
       status: 'active',
-    }
+    } satisfies AuthorizedProject
 
     const requestedViews: string[] = []
     // authenticatePage first installs the global mutation guard. Feature mocks
@@ -38,7 +42,7 @@ test.describe('我的跨项目工作台', () => {
           msg: '获取授权项目成功',
           data: [{
             project,
-            role: 'agent',
+            project_role: 'agent',
             scope: {
               organization_id: project.organization_id,
               project_id: project.id,
@@ -132,7 +136,15 @@ test.describe('我的跨项目工作台', () => {
     await expect(page).toHaveURL(/#\/tickets\/987654\/show$/u)
     await expect.poll(
       () => page.evaluate(
-        () => localStorage.getItem('chronodesk.activeProjectKey'),
+        () => {
+          const stored = localStorage.getItem('chronodesk.activeProject')
+          if (!stored) return null
+          try {
+            return (JSON.parse(stored) as { project_key?: unknown }).project_key
+          } catch {
+            return null
+          }
+        },
       ),
     ).toBe(project.key)
   })

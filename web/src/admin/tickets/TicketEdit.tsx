@@ -29,68 +29,21 @@ import {
 import { minCharacters, maxCharacters } from '@/lib/validators';
 import {
     formatTagsInputValue,
-    normalizeTagsForSubmit,
-    normalizeCustomFieldsForSubmit,
     formatCustomFieldsInputValue,
     validateCustomFieldsInput,
 } from './tagUtils';
 import BackButton from '../common/BackButton';
-import { UpdateTicketRequest } from '@/types';
 import {
     canDeleteTicket,
-    canMutateTicket,
+    canEditTicket,
     type TicketAccessRecord,
     type TicketRolePermissions,
 } from './ticketAccess';
 import { FocusSafeDeleteButton } from '@/components/actions/FocusSafeDeleteButtons';
-
-type TicketEditFormValues = UpdateTicketRequest & {
-    tags?: unknown;
-    custom_fields?: unknown;
-    [key: string]: unknown;
-};
-
-const transformTicketUpdate = (data: TicketEditFormValues): Record<string, unknown> => {
-    const payload: Record<string, unknown> = {};
-    for (const field of [
-        'title',
-        'description',
-        'type',
-        'priority',
-        'status',
-        'source',
-        'assigned_to_id',
-        'category_id',
-        'subcategory_id',
-        'due_date',
-        'customer_name',
-        'customer_email',
-        'customer_phone',
-        'internal_notes',
-        'rating',
-        'rating_comment',
-    ] as const) {
-        if (typeof data[field] !== 'undefined') {
-            payload[field] = data[field];
-        }
-    }
-    const normalizedTags = normalizeTagsForSubmit(data.tags);
-
-    if (typeof normalizedTags !== 'undefined') {
-        payload.tags = normalizedTags;
-    } else {
-        delete payload.tags;
-    }
-
-    const normalizedCustomFields = normalizeCustomFieldsForSubmit(data.custom_fields);
-    if (typeof normalizedCustomFields !== 'undefined') {
-        payload.custom_fields = normalizedCustomFields;
-    } else {
-        delete payload.custom_fields;
-    }
-
-    return payload;
-};
+import {
+    parseProjectRole,
+} from '@/lib/projectScope';
+import { transformTicketUpdate } from './ticketTransforms';
 
 // 状态选项
 const statusChoices = [
@@ -148,7 +101,7 @@ const TicketEditActions = () => {
         <TopToolbar>
             <ShowButton label="查看详情" />
             <ListButton label="返回列表" />
-            {canDeleteTicket(permissions?.role) && (
+            {canDeleteTicket(permissions?.project_role) && (
                 <FocusSafeDeleteButton label="删除" mutationMode="pessimistic" />
             )}
         </TopToolbar>
@@ -163,7 +116,7 @@ const TicketEditAuthorization = ({ children }: React.PropsWithChildren) => {
     if (permissionsPending || identityPending || !record) {
         return null;
     }
-    if (!canMutateTicket(record, permissions?.role, identity?.id)) {
+    if (!canEditTicket(record, permissions?.project_role, identity?.id)) {
         return (
             <Alert severity="warning" sx={{ m: 2 }}>
                 <AlertTitle>当前工单为只读</AlertTitle>
@@ -191,6 +144,10 @@ const TicketEditToolbar = () => (
  * 编辑工单页面
  */
 const TicketEdit: React.FC = () => {
+    const { permissions } = usePermissions<TicketRolePermissions>();
+    const projectRole = parseProjectRole(permissions?.project_role);
+    const requester = projectRole === 'requester';
+
     return (
         <Box sx={{ p: 3 }}>
             <BackButton />
@@ -198,7 +155,12 @@ const TicketEdit: React.FC = () => {
                 actions={<TicketEditActions />}
                 title="编辑工单"
                 mutationMode="pessimistic"
-                transform={transformTicketUpdate}
+                transform={(data) =>
+                    transformTicketUpdate(
+                        data,
+                        projectRole,
+                    )
+                }
             >
                 <TicketEditAuthorization>
                     <TabbedForm
@@ -248,14 +210,16 @@ const TicketEdit: React.FC = () => {
                                         />
 
                                         <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
-                                            <Box sx={{ flex: 1, minWidth: '200px' }}>
-                                                <SelectInput
-                                                    source="status"
-                                                    label="状态"
-                                                    choices={statusChoices}
-                                                    required
-                                                />
-                                            </Box>
+                                            {!requester && (
+                                                <Box sx={{ flex: 1, minWidth: '200px' }}>
+                                                    <SelectInput
+                                                        source="status"
+                                                        label="状态"
+                                                        choices={statusChoices}
+                                                        required
+                                                    />
+                                                </Box>
+                                            )}
 
                                             <Box sx={{ flex: 1, minWidth: '200px' }}>
                                                 <SelectInput
@@ -291,30 +255,35 @@ const TicketEdit: React.FC = () => {
                     </FormTab>
 
                     {/* 分配和分类 */}
-                    <FormTab label="分配和分类" path="assignment">
+                    <FormTab
+                        label={requester ? '分类' : '分配和分类'}
+                        path="assignment"
+                    >
                         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
                             <Card sx={{ borderRadius: 3, boxShadow: '0 4px 20px rgba(0,0,0,0.05)' }}>
                                 <CardHeader
-                                    title="工单分配"
+                                    title={requester ? '工单分类' : '工单分配'}
                                     slotProps={{ title: { variant: 'h6', sx: { fontWeight: 600 } } }}
                                     sx={{ borderBottom: '1px solid #f1f5f9', bgcolor: '#f8fafc' }}
                                 />
                                 <CardContent>
                                     <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
-                                        <Box sx={{ flex: 1, minWidth: '250px' }}>
-                                            <ReferenceInput
-                                                source="assigned_to_id"
-                                                reference="assignees"
-                                                label="分配给"
-                                            >
-                                                <AutocompleteInput
+                                        {!requester && (
+                                            <Box sx={{ flex: 1, minWidth: '250px' }}>
+                                                <ReferenceInput
+                                                    source="assigned_to_id"
+                                                    reference="assignees"
                                                     label="分配给"
-                                                    optionText="username"
-                                                    optionValue="id"
-                                                    helperText="选择负责处理此工单的用户"
-                                                />
-                                            </ReferenceInput>
-                                        </Box>
+                                                >
+                                                    <AutocompleteInput
+                                                        label="分配给"
+                                                        optionText="username"
+                                                        optionValue="id"
+                                                        helperText="选择负责处理此工单的用户"
+                                                    />
+                                                </ReferenceInput>
+                                            </Box>
+                                        )}
 
                                         <Box sx={{ flex: 1, minWidth: '250px' }}>
                                             <ReferenceInput
@@ -431,13 +400,15 @@ const TicketEdit: React.FC = () => {
                                             format={formatTagsInputValue}
                                         />
 
-                                        <TextInput
-                                            source="internal_notes"
-                                            label="内部备注"
-                                            fullWidth
-                                            multiline
-                                            rows={4}
-                                        />
+                                        {!requester && (
+                                            <TextInput
+                                                source="internal_notes"
+                                                label="内部备注"
+                                                fullWidth
+                                                multiline
+                                                rows={4}
+                                            />
+                                        )}
                                         <TextInput
                                             source="custom_fields"
                                             label="扩展字段（JSON）"

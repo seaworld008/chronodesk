@@ -40,15 +40,15 @@ func newDurableNotificationFixture(t *testing.T, assigned bool) durableNotificat
 	users := []models.User{
 		{
 			Username: "notification-creator", Email: "notification-creator@example.com",
-			PasswordHash: "hash", Role: models.RoleCustomer, Status: models.UserStatusActive,
+			PasswordHash: "hash", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 		},
 		{
 			Username: "notification-assignee", Email: "notification-assignee@example.com",
-			PasswordHash: "hash", Role: models.RoleAgent, Status: models.UserStatusActive,
+			PasswordHash: "hash", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 		},
 		{
 			Username: "notification-actor", Email: "notification-actor@example.com",
-			PasswordHash: "hash", Role: models.RoleAgent, Status: models.UserStatusActive,
+			PasswordHash: "hash", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 		},
 	}
 	for i := range users {
@@ -84,6 +84,13 @@ func newDurableNotificationFixture(t *testing.T, assigned bool) durableNotificat
 		t,
 		db,
 		models.HumanActor(users[2].ID),
+	)
+	ensureTestHumanProjectRole(
+		t,
+		db,
+		ctx,
+		users[1].ID,
+		models.ProjectRoleAgent,
 	)
 	return durableNotificationFixture{
 		db:       db,

@@ -9,7 +9,12 @@ import time
 
 import pytest
 
-from tests.utils import APIClient, response_diagnostic, safe_diagnostic
+from tests.utils import (
+    APIClient,
+    assert_human_session_contract,
+    response_diagnostic,
+    safe_diagnostic,
+)
 
 
 def _generate_totp(secret: str, period: int = 30, digits: int = 6) -> str:
@@ -76,6 +81,10 @@ class TestAuthenticationFlows:
             authed_client.close()
 
         refreshed = api_client.refresh(refresh_token)
+        assert_human_session_contract(
+            refreshed,
+            expected_platform_role="member",
+        )
         new_access_token = refreshed.get("access_token")
         new_refresh_token = refreshed.get("refresh_token")
         assert new_access_token and new_refresh_token, "刷新令牌接口未返回新的令牌"
@@ -131,6 +140,10 @@ class TestAuthenticationFlows:
         second_session = api_client.login(
             registered_user["email"],
             registered_user["password"],
+        )
+        assert_human_session_contract(
+            second_session,
+            expected_platform_role="member",
         )
         second_access = second_session.get("access_token")
         second_refresh = second_session.get("refresh_token")

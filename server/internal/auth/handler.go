@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -383,34 +384,7 @@ func (h *AuthHandler) Login(c HTTPContext) {
 			"reason", authLogReason(err),
 		)
 
-		message := "登录失败"
-		status := http.StatusServiceUnavailable
-
-		switch {
-		case errors.Is(err, ErrInvalidCredentials):
-			message = "邮箱或密码错误"
-			status = http.StatusUnauthorized
-		case errors.Is(err, ErrUserNotFound):
-			message = "邮箱或密码错误"
-			status = http.StatusUnauthorized
-		case errors.Is(err, ErrAccountLocked):
-			message = "账号已锁定"
-			status = http.StatusForbidden
-		case errors.Is(err, ErrEmailNotVerified):
-			message = "邮箱尚未验证"
-			status = http.StatusForbidden
-		case errors.Is(err, ErrInvalidOTP):
-			message = "OTP 验证码错误"
-			status = http.StatusUnauthorized
-		default:
-			if strings.Contains(err.Error(), "OTP") {
-				message = "请输入 OTP 验证码"
-				status = http.StatusBadRequest
-			} else if strings.Contains(err.Error(), "too many") {
-				message = "登录失败次数过多，请稍后重试"
-				status = http.StatusTooManyRequests
-			}
-		}
+		status, message := loginFailureHTTPResponse(err)
 
 		c.JSON(status, map[string]interface{}{
 			"code": 1, // 错误码设为1
@@ -488,28 +462,7 @@ func (h *AuthHandler) RefreshToken(c HTTPContext) {
 			"reason", authLogReason(err),
 		)
 
-		code := "refresh_failed"
-		message := "刷新登录令牌失败"
-		status := http.StatusServiceUnavailable
-
-		switch {
-		case errors.Is(err, ErrInvalidToken):
-			code = "invalid_token"
-			message = "刷新令牌无效"
-			status = http.StatusUnauthorized
-		case errors.Is(err, ErrTokenExpired):
-			code = "token_expired"
-			message = "刷新令牌已过期"
-			status = http.StatusUnauthorized
-		case errors.Is(err, ErrUserNotFound):
-			code = "user_not_found"
-			message = "未找到用户"
-			status = http.StatusUnauthorized
-		case errors.Is(err, context.DeadlineExceeded):
-			code = "request_timeout"
-			message = "认证请求超时，请重试"
-			status = http.StatusRequestTimeout
-		}
+		status, code, message := refreshFailureHTTPResponse(err)
 
 		c.JSON(status, ErrorResponse{
 			Error:   code,
@@ -533,20 +486,58 @@ func (h *AuthHandler) RefreshToken(c HTTPContext) {
 	})
 }
 
+func loginFailureHTTPResponse(err error) (int, string) {
+	switch {
+	case errors.Is(err, ErrInvalidCredentials),
+		errors.Is(err, ErrUserNotFound):
+		return http.StatusUnauthorized, "邮箱或密码错误"
+	case errors.Is(err, ErrAccountLocked):
+		return http.StatusForbidden, "账号已锁定"
+	case errors.Is(err, ErrEmailNotVerified):
+		return http.StatusForbidden, "邮箱尚未验证"
+	case errors.Is(err, ErrInvalidOTP):
+		return http.StatusUnauthorized, "OTP 验证码错误"
+	case err != nil && strings.Contains(err.Error(), "OTP"):
+		return http.StatusBadRequest, "请输入 OTP 验证码"
+	case err != nil && strings.Contains(err.Error(), "too many"):
+		return http.StatusTooManyRequests, "登录失败次数过多，请稍后重试"
+	default:
+		return http.StatusServiceUnavailable, "登录失败"
+	}
+}
+
+func refreshFailureHTTPResponse(err error) (int, string, string) {
+	switch {
+	case errors.Is(err, ErrInvalidToken):
+		return http.StatusUnauthorized, "invalid_token", "刷新令牌无效"
+	case errors.Is(err, ErrTokenExpired):
+		return http.StatusUnauthorized, "token_expired", "刷新令牌已过期"
+	case errors.Is(err, ErrUserNotFound):
+		return http.StatusUnauthorized, "user_not_found", "未找到用户"
+	case errors.Is(err, context.DeadlineExceeded):
+		return http.StatusRequestTimeout, "request_timeout", "认证请求超时，请重试"
+	default:
+		return http.StatusServiceUnavailable, "refresh_failed", "刷新登录令牌失败"
+	}
+}
+
 // Logout 用户登出
 func (h *AuthHandler) Logout(c HTTPContext) {
 	h.clearTrustedDeviceCookie(c)
 
 	// 从头部获取刷新令牌
 	refreshToken := c.GetHeader("X-Refresh-Token")
-	if refreshToken == "" {
-		// 尝试从请求体获取
-		var req struct {
-			RefreshToken string `json:"refresh_token"`
-		}
-		if err := c.Bind(&req); err == nil {
+	var req LogoutRequest
+	if err := c.Bind(&req); err == nil {
+		if refreshToken == "" {
 			refreshToken = req.RefreshToken
 		}
+	} else if !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error:   "invalid_request",
+			Message: "请求格式无效",
+		})
+		return
 	}
 
 	ctx, cancel, ok := h.boundedRequestContext(c)
@@ -1312,27 +1303,19 @@ func GetUserFromContext(c HTTPContext) (*UserInfo, error) {
 		return nil, fmt.Errorf("invalid user ID")
 	}
 
-	roleValue, exists := c.Get("user_role_enum")
+	roleValue, exists := c.Get("platform_role")
 	if !exists {
-		roleValue, exists = c.Get("user_role")
-	}
-	if !exists {
-		return nil, fmt.Errorf("user role not found")
+		return nil, fmt.Errorf("platform role not found")
 	}
 
-	var userRole UserRole
-	switch v := roleValue.(type) {
-	case UserRole:
-		userRole = v
-	case string:
-		userRole = UserRole(v)
-	default:
-		return nil, fmt.Errorf("invalid user role")
+	platformRole, ok := roleValue.(PlatformRole)
+	if !ok || !platformRole.IsValid() {
+		return nil, fmt.Errorf("invalid platform role")
 	}
 
 	return &UserInfo{
-		ID:   userIDUint,
-		Role: userRole,
+		ID:           userIDUint,
+		PlatformRole: platformRole,
 	}, nil
 }
 
@@ -1458,12 +1441,12 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 		c.Abort()
 		return
 	}
-	if !currentUser.Role.IsValid() {
+	if !currentUser.PlatformRole.IsValid() {
 		h.logger.Warn(
-			"Access token principal has an invalid role",
+			"Access token principal has an invalid platform role",
 			"request_id", authLogRequestID(c),
 			"user_id", authLogUserID(currentUser.ID),
-			"reason", "invalid_human_role",
+			"reason", "invalid_platform_role",
 		)
 		c.JSON(http.StatusUnauthorized, ErrorResponse{
 			Error:   "invalid_token",
@@ -1472,7 +1455,7 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 		c.Abort()
 		return
 	}
-	if currentUser.Role != claims.Role {
+	if currentUser.PlatformRole != claims.PlatformRole {
 		h.logger.Warn(
 			"Access token role is stale",
 			"request_id", authLogRequestID(c),
@@ -1547,10 +1530,10 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 		return
 	}
 
-	// 设置用户信息到上下文
+	// 平台职责使用单一类型化 context 值。项目角色由后续项目中间件
+	// 每次从数据库实时解析，绝不写入 human JWT 或平台 context。
 	c.Set("user_id", currentUser.ID)
-	c.Set("user_role", string(currentUser.Role))
-	c.Set("user_role_enum", currentUser.Role)
+	c.Set("platform_role", currentUser.PlatformRole)
 	c.Set("token_jti", claims.Jti)
 	c.Set("session_id", claims.SessionID)
 
@@ -1558,13 +1541,19 @@ func (h *AuthHandler) RequireAuth(c HTTPContext) {
 	c.Next()
 }
 
-// RequireRole 角色权限中间件
-func (h *AuthHandler) RequireRole(requiredRole UserRole) func(HTTPContext) {
+// RequirePlatformRoles authorizes an exact, closed allowlist of platform
+// duties. Platform roles are deliberately unordered and have no inheritance.
+func (h *AuthHandler) RequirePlatformRoles(
+	allowedRoles ...PlatformRole,
+) func(HTTPContext) {
+	allowlist := make(map[PlatformRole]struct{}, len(allowedRoles))
+	for _, role := range allowedRoles {
+		if role.IsValid() {
+			allowlist[role] = struct{}{}
+		}
+	}
 	return func(c HTTPContext) {
-		roleValue, exists := c.Get("user_role_enum")
-		if !exists {
-			roleValue, exists = c.Get("user_role")
-		}
+		roleValue, exists := c.Get("platform_role")
 		if !exists {
 			c.JSON(http.StatusForbidden, ErrorResponse{
 				Error:   "access_denied",
@@ -1574,13 +1563,8 @@ func (h *AuthHandler) RequireRole(requiredRole UserRole) func(HTTPContext) {
 			return
 		}
 
-		var userRole UserRole
-		switch v := roleValue.(type) {
-		case UserRole:
-			userRole = v
-		case string:
-			userRole = UserRole(v)
-		default:
+		platformRole, ok := roleValue.(PlatformRole)
+		if !ok || !platformRole.IsValid() {
 			c.JSON(http.StatusForbidden, ErrorResponse{
 				Error:   "access_denied",
 				Message: "无权访问",
@@ -1589,9 +1573,7 @@ func (h *AuthHandler) RequireRole(requiredRole UserRole) func(HTTPContext) {
 			return
 		}
 
-		// 检查权限
-		user := &User{Role: userRole}
-		if !user.HasPermission(requiredRole) {
+		if _, allowed := allowlist[platformRole]; !allowed {
 			c.JSON(http.StatusForbidden, ErrorResponse{
 				Error:   "insufficient_permissions",
 				Message: "权限不足",

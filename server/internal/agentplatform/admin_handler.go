@@ -1249,15 +1249,13 @@ func (h *AdminHandler) DisablePolicy(c *gin.Context) {
 			); err != nil {
 				return adminMutationResult{}, err
 			}
-			update := tx.WithContext(txCtx).
-				Model(&models.AgentPolicy{}).
-				Where("id = ? AND service_principal_id = ?", c.Param("policy_id"), c.Param("id")).
-				Updates(map[string]any{"is_active": false, "updated_at": time.Now().UTC()})
-			if update.Error != nil {
-				return adminMutationResult{}, update.Error
-			}
-			if update.RowsAffected == 0 {
-				return adminMutationResult{}, gorm.ErrRecordNotFound
+			if _, err := h.native.SetAgentPolicyActive(
+				txCtx,
+				c.Param("id"),
+				c.Param("policy_id"),
+				false,
+			); err != nil {
+				return adminMutationResult{}, err
 			}
 			return adminMutationResult{
 				Data:          gin.H{"disabled": true},

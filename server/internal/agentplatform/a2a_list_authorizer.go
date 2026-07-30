@@ -40,61 +40,76 @@ func (a *A2ATaskListAuthorizer) AuthorizeTaskSnapshot(
 		return false, err
 	}
 	ticketIDs := a2aTaskSnapshotTicketIDs(task)
-	if len(ticketIDs) == 0 {
-		return true, nil
+	requiredTokenScopes := []string{models.ScopeTasksManage}
+	if len(ticketIDs) > 0 {
+		requiredTokenScopes = append(
+			requiredTokenScopes,
+			models.ScopeTicketsRead,
+		)
 	}
-	if !a2aTokenHasScopes(
-		identity,
-		models.ScopeTasksManage,
-		models.ScopeTicketsRead,
-	) {
+	if !a2aTokenHasScopes(identity, requiredTokenScopes...) {
 		return false, nil
 	}
-	var checkErr error
+	allowed := true
 	transactionErr := a.native.RunProjectOperation(
 		ctx,
 		func(scopedContext context.Context) error {
-			for _, ticketID := range ticketIDs {
-				if _, err := a.native.CheckAction(
+			access, revalidateErr :=
+				a.native.RevalidatePrincipalProjectOperation(
 					scopedContext,
-					services.PolicyCheckInput{
-						ServicePrincipalID: identity.Actor.ID,
-						CredentialID:       identity.CredentialID,
-						Scope:              models.ScopeTicketsRead,
-						Action:             "ticket.read",
-						ResourceType:       "ticket",
-						ResourceID: strconv.FormatUint(
-							uint64(ticketID),
-							10,
-						),
-						SourceProtocol: a2aSourceProtocol,
-						Context: map[string]any{
-							"a2a_task_id":     task.ID,
-							"a2a_context_id":  task.ContextID,
-							"stored_snapshot": true,
+					requiredTokenScopes...,
+				)
+			if revalidateErr != nil {
+				return revalidateErr
+			}
+			if access.Scope != identity.Scope ||
+				access.Project.Key !=
+					models.ProjectKey(identity.ProjectKey) {
+				return services.ErrProjectAccessDenied
+			}
+			for _, ticketID := range ticketIDs {
+				_, evaluateErr :=
+					a.native.CheckAction(
+						scopedContext,
+						services.PolicyCheckInput{
+							ServicePrincipalID: identity.Actor.ID,
+							CredentialID:       identity.CredentialID,
+							Scope:              models.ScopeTicketsRead,
+							Action:             "ticket.read",
+							ResourceType:       "ticket",
+							ResourceID: strconv.FormatUint(
+								uint64(ticketID),
+								10,
+							),
+							SourceProtocol: a2aSourceProtocol,
+							Context: map[string]any{
+								"a2a_task_id":     task.ID,
+								"a2a_context_id":  task.ContextID,
+								"stored_snapshot": true,
+							},
 						},
-					},
-				); err != nil {
-					checkErr = err
-					break
+					)
+				if errors.Is(
+					evaluateErr,
+					services.ErrPolicyDenied,
+				) {
+					allowed = false
+					return nil
+				}
+				if evaluateErr != nil {
+					return evaluateErr
 				}
 			}
-			// A denied snapshot is a durable authorization outcome. Commit its
-			// PolicyDecision and return the domain error after the short
-			// project transaction closes.
 			return nil
 		},
 	)
 	if transactionErr != nil {
-		return false, transactionErr
-	}
-	if checkErr != nil {
-		if errors.Is(checkErr, services.ErrPolicyDenied) {
+		if machineAuthorizationRevoked(transactionErr) {
 			return false, nil
 		}
-		return false, checkErr
+		return false, transactionErr
 	}
-	return true, nil
+	return allowed, nil
 }
 
 func (a *A2ATaskListAuthorizer) PrepareTaskList(

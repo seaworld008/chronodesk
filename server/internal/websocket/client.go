@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -112,10 +114,15 @@ func matchWildcard(pattern, value string) bool {
 // Client is a middleman between the websocket connection and the hub.
 type Client struct {
 	// The websocket connection.
-	conn *websocket.Conn
+	conn websocketConnection
 
 	// Buffered channel of outbound messages.
-	send chan []byte
+	send chan outboundMessage
+
+	// Buffered channel of inbound commands. Keeping command execution separate
+	// from socket reads lets a peer disconnect cancel an in-flight database
+	// command instead of leaving readPump blocked inside the command.
+	receive chan []byte
 
 	// User ID associated with this connection
 	UserID uint
@@ -128,12 +135,34 @@ type Client struct {
 	// Hub reference
 	hub *Hub
 
-	done      chan struct{}
-	closeOnce sync.Once
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	authorizationEpoch atomic.Uint64
+	outboundMu         sync.Mutex
+	done               chan struct{}
+	closeOnce          sync.Once
+}
+
+type outboundMessage struct {
+	payload            []byte
+	authorizationEpoch uint64
+}
+
+type websocketConnection interface {
+	Close() error
+	NextWriter(messageType int) (io.WriteCloser, error)
+	ReadMessage() (messageType int, payload []byte, err error)
+	SetPongHandler(handler func(string) error)
+	SetReadDeadline(deadline time.Time) error
+	SetReadLimit(limit int64)
+	SetWriteDeadline(deadline time.Time) error
+	WriteMessage(messageType int, payload []byte) error
 }
 
 // NewClient creates a new WebSocket client
 func NewClient(
+	ctx context.Context,
 	hub *Hub,
 	conn *websocket.Conn,
 	userID uint,
@@ -141,6 +170,9 @@ func NewClient(
 ) (*Client, error) {
 	if hub == nil {
 		return nil, errors.New("WebSocket hub is required")
+	}
+	if ctx == nil {
+		return nil, errors.New("WebSocket connection context is required")
 	}
 	if conn == nil {
 		return nil, errors.New("WebSocket connection is required")
@@ -151,13 +183,17 @@ func NewClient(
 	if err := scope.Validate(); err != nil {
 		return nil, errors.New("trusted WebSocket project scope is required")
 	}
+	connectionContext, cancel := context.WithCancel(ctx)
 	return &Client{
-		hub:    hub,
-		conn:   conn,
-		send:   make(chan []byte, 256),
-		UserID: userID,
-		scope:  scope,
-		done:   make(chan struct{}),
+		hub:     hub,
+		conn:    conn,
+		send:    make(chan outboundMessage, 256),
+		receive: make(chan []byte, 64),
+		UserID:  userID,
+		scope:   scope,
+		ctx:     connectionContext,
+		cancel:  cancel,
+		done:    make(chan struct{}),
 	}, nil
 }
 
@@ -170,12 +206,57 @@ func (c *Client) ProjectScope() models.ProjectScope {
 }
 
 func (c *Client) close() {
+	if c == nil {
+		return
+	}
 	c.closeOnce.Do(func() {
-		close(c.done)
+		c.outboundMu.Lock()
+		c.authorizationEpoch.Add(1)
+		if c.cancel != nil {
+			c.cancel()
+		}
+		if c.done != nil {
+			close(c.done)
+		}
+		for c.send != nil {
+			select {
+			case <-c.send:
+			default:
+				c.outboundMu.Unlock()
+				if c.conn != nil {
+					_ = c.conn.Close()
+				}
+				return
+			}
+		}
+		c.outboundMu.Unlock()
 		if c.conn != nil {
 			_ = c.conn.Close()
 		}
 	})
+}
+
+func (c *Client) enqueue(payload []byte) bool {
+	if c == nil || len(payload) == 0 {
+		return false
+	}
+	c.outboundMu.Lock()
+	defer c.outboundMu.Unlock()
+	select {
+	case <-c.done:
+		return false
+	default:
+	}
+	frame := outboundMessage{
+		payload:            append([]byte(nil), payload...),
+		authorizationEpoch: c.authorizationEpoch.Load(),
+	}
+	select {
+	case c.send <- frame:
+		return true
+	default:
+		return false
+	}
 }
 
 // readPump pumps messages from the websocket connection to the hub.
@@ -205,8 +286,29 @@ func (c *Client) readPump() {
 			break
 		}
 
-		// Handle incoming messages from client
-		c.handleMessage(message)
+		// Keep reading while the command pump performs bounded database work.
+		// A disconnect then reaches close(), cancels c.ctx, and rolls back the
+		// in-flight command's project-scoped transaction.
+		messageCopy := append([]byte(nil), message...)
+		select {
+		case <-c.done:
+			return
+		case c.receive <- messageCopy:
+		default:
+			log.Print("WebSocket client command queue is full")
+			return
+		}
+	}
+}
+
+func (c *Client) commandPump() {
+	for {
+		select {
+		case <-c.done:
+			return
+		case message := <-c.receive:
+			c.handleMessage(message)
+		}
 	}
 }
 
@@ -226,27 +328,23 @@ func (c *Client) writePump() {
 		select {
 		case <-c.done:
 			return
-		case message, ok := <-c.send:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if !ok {
-				// The hub closed the channel.
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+		case message := <-c.send:
+			if err := c.hub.authorizeDelivery(
+				c,
+				message.authorizationEpoch,
+			); err != nil {
+				c.hub.evictUserScope(c.scope, c.UserID)
 				return
 			}
-
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			w, err := c.conn.NextWriter(websocket.TextMessage)
 			if err != nil {
 				return
 			}
-			w.Write(message)
-
-			// Add queued messages to the current message.
-			n := len(c.send)
-			for i := 0; i < n; i++ {
-				w.Write([]byte{'\n'})
-				w.Write(<-c.send)
+			if _, err := w.Write(message.payload); err != nil {
+				_ = w.Close()
+				return
 			}
-
 			if err := w.Close(); err != nil {
 				return
 			}
@@ -298,11 +396,7 @@ func (c *Client) sendPong() {
 	}
 
 	responseBytes, _ := json.Marshal(response)
-	select {
-	case <-c.done:
-		return
-	case c.send <- responseBytes:
-	default:
+	if !c.enqueue(responseBytes) {
 		c.close()
 	}
 }
@@ -334,8 +428,16 @@ func (c *Client) handleMarkRead(msg map[string]interface{}) {
 			safeLogUint(c.UserID),
 			safeLogUint(notificationID),
 		)
+		if c.ctx == nil {
+			log.Printf(
+				"WebSocket mark-read failed: user_id=%s notification_id=%s reason=connection_context_unavailable",
+				safeLogUint(c.UserID),
+				safeLogUint(notificationID),
+			)
+			return
+		}
 		if err := MarkNotificationAsReadHook(
-			context.Background(),
+			c.ctx,
 			c.scope,
 			c.UserID,
 			notificationID,
@@ -403,7 +505,8 @@ func ServeWS(
 		return
 	}
 
-	client, err := NewClient(hub, conn, userID, scope)
+	connectionContext := context.WithoutCancel(c.Request.Context())
+	client, err := NewClient(connectionContext, hub, conn, userID, scope)
 	if err != nil {
 		_ = conn.Close()
 		log.Print("Rejected invalid WebSocket client binding")
@@ -416,5 +519,6 @@ func ServeWS(
 
 	// Start goroutines for reading and writing
 	go client.writePump()
+	go client.commandPump()
 	go client.readPump()
 }

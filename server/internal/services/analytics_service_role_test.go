@@ -8,23 +8,23 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
-func TestAnalyticsUserStatsCoversClosedHumanRoleSet(t *testing.T) {
+func TestAnalyticsUserStatsCoversClosedPlatformRoleSet(t *testing.T) {
 	db := openTestDB(t)
 	if err := db.AutoMigrate(&models.User{}, &models.LoginHistory{}); err != nil {
 		t.Fatal(err)
 	}
-	roles := []models.UserRole{
-		models.RoleAdmin,
-		models.RoleSupervisor,
-		models.RoleAgent,
-		models.RoleCustomer,
+	roles := []models.PlatformRole{
+		models.PlatformRolePlatformAdmin,
+		models.PlatformRoleSecurityAuditor,
+		models.PlatformRoleEmergencyOperator,
+		models.PlatformRoleMember,
 	}
 	for index, role := range roles {
 		user := models.User{
 			Username:     fmt.Sprintf("analytics-role-%d", index),
 			Email:        fmt.Sprintf("analytics-role-%d@example.test", index),
 			PasswordHash: "hash",
-			Role:         role,
+			PlatformRole: role,
 			Status:       models.UserStatusActive,
 		}
 		if err := db.Create(&user).Error; err != nil {
@@ -32,15 +32,15 @@ func TestAnalyticsUserStatsCoversClosedHumanRoleSet(t *testing.T) {
 		}
 	}
 
-	stats, err := NewAnalyticsService(db).getUserStats(context.Background())
+	stats, err := NewAnalyticsService(db).getPlatformUserStats(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stats.Total != 4 ||
-		stats.Admins != 1 ||
-		stats.Supervisors != 1 ||
-		stats.Agents != 1 ||
-		stats.Customers != 1 {
+		stats.PlatformAdmins != 1 ||
+		stats.SecurityAuditors != 1 ||
+		stats.EmergencyOperators != 1 ||
+		stats.Members != 1 {
 		t.Fatalf("unexpected user role stats: %+v", stats)
 	}
 }

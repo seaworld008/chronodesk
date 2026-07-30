@@ -37,11 +37,11 @@ func TestNotificationOutboxRecoversAfterSideEffectBeforeAcknowledgement(t *testi
 
 	actor := models.User{
 		Username: "notification-actor", Email: "notification-actor@example.com",
-		PasswordHash: "hash", Role: models.RoleAgent, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	recipient := models.User{
 		Username: "notification-recipient", Email: "notification-recipient@example.com",
-		PasswordHash: "hash", Role: models.RoleAgent, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&actor).Error; err != nil {
 		t.Fatal(err)

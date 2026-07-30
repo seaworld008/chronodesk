@@ -3,6 +3,7 @@ import {
     DEFAULT_ADMIN,
     E2E_MARKER,
     revokeE2ETrustedDevices,
+    selectDefaultProjectViaUI,
     trackTrustedDeviceByName,
     untrackE2EResource,
 } from './helpers/testData';
@@ -50,9 +51,7 @@ test.describe('可信设备管理', () => {
         expect(new URL(trustedDeviceCookieURL).pathname).toBe(
             '/api/auth/login',
         );
-        await page
-            .getByRole('menuitem', { name: '工单管理', exact: true })
-            .waitFor({ timeout: 15_000 });
+        await selectDefaultProjectViaUI(page);
 
         await expect
             .poll(

@@ -5,11 +5,13 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping
 from urllib.parse import parse_qs
+from uuid import UUID
 
 import pytest
 
 from tests.utils import (
-    HUMAN_ROLES,
+    PLATFORM_ROLES,
+    PROJECT_ROLES,
     APIClient,
     E2EResourceManager,
     HumanIdentity,
@@ -20,29 +22,34 @@ from tests.utils import (
 pytestmark = [pytest.mark.api, pytest.mark.integration]
 
 
-def test_human_role_change_audit_identifies_actor_target_result_and_redacts_query(
+def test_platform_role_change_audit_identifies_actor_target_result_and_redacts_query(
     e2e_manager: E2EResourceManager,
-    human_identities: Mapping[str, HumanIdentity],
+    platform_admin_identity: HumanIdentity,
 ) -> None:
-    """RBAC-012: Human admin audit is attributable without Agent-only fields."""
+    """RBAC-012: platform-role governance has attributable, redacted audit."""
 
-    admin = human_identities["admin"]
-    target = e2e_manager.create_user("agent", "role-audit-target")
-    target_path = f"/api/admin/users/{target.id}"
+    admin = platform_admin_identity
+    target = e2e_manager.create_platform_identity(
+        "member",
+        label="platform-role-audit-target",
+    )
+    target_path = f"/api/platform/users/{target.id}"
     updated = admin.api.put_json(
         (
-            f"/admin/users/{target.id}"
+            f"/platform/users/{target.id}"
             "?password=must-not-persist&token=must-not-persist&visible=evidence"
         ),
-        {"role": "supervisor"},
+        {"platform_role": "security_auditor"},
     )
     assert updated.status_code == 200, updated.text
-    assert updated.json().get("data", {}).get("role") == "supervisor"
+    updated_user = updated.json().get("data", {})
+    assert updated_user.get("platform_role") == "security_auditor"
+    assert "role" not in updated_user
 
     audit_item = None
     for _ in range(10):
         response = admin.api.get_json(
-            "/admin/audit-logs",
+            "/platform/audit-logs",
             params={
                 "method": "PUT",
                 "path": target_path,
@@ -70,7 +77,8 @@ def test_human_role_change_audit_identifies_actor_target_result_and_redacts_quer
     assert isinstance(audit_item, dict), "未找到 E2E 用户角色变更审计记录"
     assert audit_item.get("user_id") == admin.id
     assert audit_item.get("username") == admin.username
-    assert audit_item.get("role") == "admin"
+    assert audit_item.get("platform_role") == "platform_admin"
+    assert "role" not in audit_item
     assert audit_item.get("path") == target_path
     assert str(target.id) in audit_item.get("action", "")
     assert audit_item.get("method") == "PUT"
@@ -87,31 +95,226 @@ def test_human_role_change_audit_identifies_actor_target_result_and_redacts_quer
     assert "must-not-persist" not in audit_item.get("query", "")
 
 
-def test_four_human_roles_and_admin_only_surfaces(
+def test_platform_permission_matrix_never_grants_implicit_project_access(
+    platform_identities: Mapping[str, HumanIdentity],
+) -> None:
+    """Four platform duties authorize only their explicitly declared surfaces."""
+
+    assert set(platform_identities) == set(PLATFORM_ROLES)
+    platform_expectations = {
+        "platform_admin": {
+            "/platform/users?page=1&page_size=1": 200,
+            "/platform/configs?page=1": 200,
+            "/platform/audit-logs?page=1&limit=1": 200,
+        },
+        "security_auditor": {
+            "/platform/users?page=1&page_size=1": 403,
+            "/platform/configs?page=1": 403,
+            "/platform/audit-logs?page=1&limit=1": 200,
+        },
+        "emergency_operator": {
+            "/platform/users?page=1&page_size=1": 403,
+            "/platform/configs?page=1": 403,
+            "/platform/audit-logs?page=1&limit=1": 403,
+        },
+        "member": {
+            "/platform/users?page=1&page_size=1": 403,
+            "/platform/configs?page=1": 403,
+            "/platform/audit-logs?page=1&limit=1": 403,
+        },
+    }
+
+    for platform_role, identity in platform_identities.items():
+        assert identity.platform_role == platform_role
+        assert identity.project_role is None
+
+        projects = identity.api.get_json("/projects")
+        assert projects.status_code == 200, projects.text
+        assert projects.json().get("data") == [], projects.text
+
+        context = identity.api.get_json(identity.api.project_path("context"))
+        assert_error_contract(
+            context,
+            403,
+            machine_codes={"project_access_denied", "403"},
+        )
+        tickets = identity.api.get_json(
+            identity.api.project_path("tickets"),
+            params={"page": 1, "page_size": 1},
+        )
+        assert_error_contract(
+            tickets,
+            403,
+            machine_codes={"project_access_denied", "403"},
+        )
+
+        for path, expected_status in platform_expectations[platform_role].items():
+            response = identity.api.get_json(path)
+            if expected_status == 200:
+                assert response.status_code == 200, f"{path}: {response.text}"
+            else:
+                assert_error_contract(
+                    response,
+                    expected_status,
+                    machine_codes={
+                        "access_denied",
+                        "insufficient_permissions",
+                    },
+                )
+
+
+def test_platform_project_inventory_requires_active_platform_admin_not_membership(
+    e2e_manager: E2EResourceManager,
+    platform_identities: Mapping[str, HumanIdentity],
+) -> None:
+    """A zero-Membership platform admin sees only the closed governance DTO."""
+
+    administrator = platform_identities["platform_admin"]
+    assert administrator.project_role is None
+
+    membership_projects = administrator.api.get_json("/projects")
+    assert membership_projects.status_code == 200, membership_projects.text
+    assert membership_projects.json().get("data") == [], membership_projects.text
+
+    response = administrator.api.get_json("/platform/projects")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert set(payload) == {"code", "msg", "data"}, payload
+    assert payload.get("code") == 0, payload
+    projects = payload.get("data")
+    assert isinstance(projects, list) and projects, payload
+
+    expected_fields = {
+        "public_id",
+        "key",
+        "name",
+        "description",
+        "status",
+    }
+    for project in projects:
+        assert isinstance(project, dict), project
+        assert set(project) == expected_fields, project
+        public_id = project.get("public_id")
+        assert isinstance(public_id, str) and public_id
+        parsed_public_id = UUID(public_id)
+        assert parsed_public_id.version == 7, project
+        assert str(parsed_public_id) == public_id, project
+        assert isinstance(project.get("key"), str) and project["key"], project
+        assert isinstance(project.get("name"), str), project
+        assert isinstance(project.get("description"), str), project
+        assert project.get("status") in {"active", "archived"}, project
+
+    assert any(project.get("key") == e2e_manager.project_key for project in projects), (
+        projects
+    )
+
+    legacy_role = administrator.api.get_json(
+        "/platform/projects",
+        params={"role": "admin"},
+    )
+    assert_error_contract(legacy_role, 400)
+
+    for platform_role in ("security_auditor", "emergency_operator", "member"):
+        identity = platform_identities[platform_role]
+        direct = identity.api.get_json("/platform/projects")
+        assert_error_contract(
+            direct,
+            403,
+            machine_codes={"access_denied", "insufficient_permissions"},
+        )
+        smuggled = identity.api.get_json(
+            "/platform/projects",
+            params={"role": "admin"},
+        )
+        assert_error_contract(
+            smuggled,
+            403,
+            machine_codes={"access_denied", "insufficient_permissions"},
+        )
+
+
+def test_project_permission_matrix_uses_only_active_membership(
+    human_identities: Mapping[str, HumanIdentity],
+) -> None:
+    """All project personas are platform members with one explicit role."""
+
+    expected_roles = {
+        "admin": "project_admin",
+        "supervisor": "manager",
+        "agent_a": "agent",
+        "agent_b": "agent",
+        "customer_a": "requester",
+        "customer_b": "requester",
+        "observer": "observer",
+    }
+    assert set(expected_roles.values()) == set(PROJECT_ROLES)
+
+    for name, expected_project_role in expected_roles.items():
+        identity = human_identities[name]
+        assert identity.platform_role == "member"
+        assert identity.project_role == expected_project_role
+
+        projects = identity.api.get_json("/projects")
+        assert projects.status_code == 200, projects.text
+        accesses = projects.json().get("data")
+        assert isinstance(accesses, list) and len(accesses) == 1, projects.text
+        assert accesses[0].get("project_role") == expected_project_role
+        assert "role" not in accesses[0]
+
+        context = identity.api.get_json(identity.api.project_path("context"))
+        assert context.status_code == 200, context.text
+        project_access = context.json().get("data", {})
+        assert project_access.get("project_role") == expected_project_role
+        assert "role" not in project_access
+
+        platform_users = identity.api.get_json(
+            "/platform/users",
+            params={"page": 1, "page_size": 1},
+        )
+        assert_error_contract(
+            platform_users,
+            403,
+            machine_codes={"insufficient_permissions"},
+        )
+
+        memberships = identity.api.get_json(
+            identity.api.project_path("memberships"),
+        )
+        if expected_project_role in {"project_admin", "manager"}:
+            assert memberships.status_code == 200, memberships.text
+        else:
+            assert_error_contract(memberships, 403, machine_codes={"403"})
+
+        agent_control = identity.api.get_json(
+            identity.api.project_path("admin/agents/agent-control/overview"),
+        )
+        if expected_project_role == "project_admin":
+            assert agent_control.status_code == 200, agent_control.text
+        else:
+            assert_error_contract(
+                agent_control,
+                403,
+                machine_codes={"project_role_denied"},
+            )
+
+
+def test_unknown_roles_fail_closed(
     admin_api: APIClient,
     e2e_manager: E2EResourceManager,
     human_identities: Mapping[str, HumanIdentity],
 ) -> None:
-    """RBAC-008/RBAC-010: only the closed four-role enum reaches admin APIs."""
-
-    observed_roles = {
-        human_identities["admin"].role,
-        human_identities["supervisor"].role,
-        human_identities["agent_a"].role,
-        human_identities["customer_a"].role,
-    }
-    assert observed_roles == set(HUMAN_ROLES)
+    """Unknown platform and project role values are rejected."""
 
     invalid_username = f"e2e_{e2e_manager.run_id.replace('-', '')}_invalid_role"[:50]
     invalid_create = admin_api.post_json(
-        "/admin/users",
+        "/platform/users",
         {
             "username": invalid_username,
             "email": (
                 f"e2e+{e2e_manager.run_id.replace('-', '')}.invalid-role@example.com"
             ),
-            "password": "Aa1!invalid-roleZ",
-            "role": "operator",
+            "password": strong_password(),
+            "platform_role": "operator",
         },
     )
     if invalid_create.status_code == 201:
@@ -119,47 +322,75 @@ def test_four_human_roles_and_admin_only_surfaces(
         unexpected_id = unexpected_user.get("id")
         assert isinstance(unexpected_id, int) and unexpected_id > 0, unexpected_user
         e2e_manager.track_user(unexpected_id, invalid_username)
-        cleanup = admin_api.delete(f"/admin/users/{unexpected_id}")
+        cleanup = admin_api.delete(f"/platform/users/{unexpected_id}")
         assert cleanup.status_code in (200, 204), cleanup.text
     assert_error_contract(invalid_create, 400)
 
-    invalid_update = admin_api.put_json(
-        f"/admin/users/{human_identities['agent_a'].id}",
-        {"role": "superuser"},
+    invalid_platform_update = admin_api.put_json(
+        f"/platform/users/{human_identities['agent_a'].id}",
+        {"platform_role": "superuser"},
     )
-    if invalid_update.status_code == 200:
-        restored = admin_api.put_json(
-            f"/admin/users/{human_identities['agent_a'].id}",
-            {"role": "agent"},
+    assert_error_contract(invalid_platform_update, 400)
+
+    invalid_membership = admin_api.post_json(
+        admin_api.project_path("memberships"),
+        {
+            "user_id": human_identities["agent_a"].id,
+            "role": "unknown",
+        },
+    )
+    if invalid_membership.status_code == 200:
+        restored = admin_api.post_json(
+            admin_api.project_path("memberships"),
+            {
+                "user_id": human_identities["agent_a"].id,
+                "role": "agent",
+            },
         )
         assert restored.status_code == 200, restored.text
-    assert_error_contract(invalid_update, 400)
-    unchanged = admin_api.get_json(f"/admin/users/{human_identities['agent_a'].id}")
-    assert unchanged.status_code == 200, unchanged.text
-    assert unchanged.json().get("data", {}).get("role") == "agent"
+    assert_error_contract(invalid_membership, 400)
 
-    admin = human_identities["admin"].api
-    for path in (
-        "/admin/users?page=1&page_size=1",
-        "/admin/configs?page=1",
-        admin.project_path("admin/agents/agent-control/overview"),
-    ):
-        allowed = admin.get_json(path)
-        assert allowed.status_code == 200, f"{path}: {allowed.text}"
+    unchanged_context = human_identities["agent_a"].api.get_json(
+        human_identities["agent_a"].api.project_path("context"),
+    )
+    assert unchanged_context.status_code == 200, unchanged_context.text
+    assert unchanged_context.json().get("data", {}).get("project_role") == "agent"
 
-    for identity_name in ("supervisor", "agent_a", "customer_a"):
-        identity = human_identities[identity_name]
-        for path in (
-            "/admin/users?page=1&page_size=1",
-            "/admin/configs?page=1",
-            identity.api.project_path("admin/agents/agent-control/overview"),
-        ):
-            denied = identity.api.get_json(path)
-            assert_error_contract(
-                denied,
-                403,
-                machine_codes={"access_denied", "insufficient_permissions"},
-            )
+
+def test_revoked_membership_immediately_removes_project_access(
+    admin_api: APIClient,
+    e2e_manager: E2EResourceManager,
+) -> None:
+    """A valid platform session cannot retain project access after revocation."""
+
+    identity = e2e_manager.create_project_identity(
+        "observer",
+        label="revoked-membership",
+    )
+    revoked = admin_api.delete(
+        admin_api.project_path(f"memberships/{identity.id}"),
+    )
+    assert revoked.status_code in (200, 204), revoked.text
+
+    projects = identity.api.get_json("/projects")
+    assert projects.status_code == 200, projects.text
+    assert projects.json().get("data") == []
+
+    context = identity.api.get_json(identity.api.project_path("context"))
+    assert_error_contract(
+        context,
+        403,
+        machine_codes={"project_access_denied", "403"},
+    )
+    tickets = identity.api.get_json(
+        identity.api.project_path("tickets"),
+        params={"page": 1, "page_size": 1},
+    )
+    assert_error_contract(
+        tickets,
+        403,
+        machine_codes={"project_access_denied", "403"},
+    )
 
 
 def test_soft_deleted_human_identity_returns_stable_conflict(
@@ -168,18 +399,21 @@ def test_soft_deleted_human_identity_returns_stable_conflict(
 ) -> None:
     """RBAC-010: audit-retained usernames/emails remain unique and return 409."""
 
-    retained = e2e_manager.create_user("agent", "retained-identity")
-    deleted = admin_api.delete(f"/admin/users/{retained.id}")
+    retained = e2e_manager.create_platform_identity(
+        "member",
+        label="retained-identity",
+    )
+    deleted = admin_api.delete(f"/platform/users/{retained.id}")
     assert deleted.status_code == 200, deleted.text
 
     replacement_username = f"{retained.username[:36]}_replacement"
     response = admin_api.post_json(
-        "/admin/users",
+        "/platform/users",
         {
             "username": replacement_username,
             "email": retained.email,
             "password": strong_password(),
-            "role": "agent",
+            "platform_role": "member",
             "first_name": "E2E",
             "last_name": "Replacement",
             "department": "QA Automation",
@@ -204,6 +438,7 @@ def test_ticket_object_permission_matrix(
     agent_b = human_identities["agent_b"]
     customer_a = human_identities["customer_a"]
     customer_b = human_identities["customer_b"]
+    observer = human_identities["observer"]
 
     ticket_a = e2e_manager.create_ticket(customer_a, "rbac-customer-a")
     ticket_b = e2e_manager.create_ticket(customer_b, "rbac-customer-b")
@@ -217,6 +452,37 @@ def test_ticket_object_permission_matrix(
         {"internal_notes": e2e_manager.unique("admin-internal-note")},
     )
     assert admin_update.status_code == 200, admin_update.text
+
+    observer_read = observer.api.get_json(
+        e2e_manager.project_path(f"tickets/{ticket_a_id}")
+    )
+    assert observer_read.status_code == 200, observer_read.text
+    observer_update = observer.api.put_ticket(
+        ticket_a_id,
+        {"priority": "urgent"},
+    )
+    assert_error_contract(
+        observer_update,
+        403,
+        machine_codes={"ticket_access_denied"},
+    )
+    observer_create = observer.api.post_json(
+        observer.api.project_path("tickets"),
+        e2e_manager.ticket_create_payload(
+            {
+                "title": e2e_manager.unique("observer-create-denied"),
+                "description": "Observer must remain read-only.",
+                "type": "request",
+                "priority": "normal",
+                "source": "api",
+            }
+        ),
+    )
+    assert_error_contract(
+        observer_create,
+        403,
+        machine_codes={"ticket_create_access_denied"},
+    )
 
     supervisor_read = supervisor.api.get_json(
         e2e_manager.project_path(f"tickets/{ticket_a_id}")

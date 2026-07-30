@@ -914,6 +914,7 @@ paths:
         state is exposed for awareness only and cannot be mutated from this
         Project route. Convert a selected resource version to the strong ETag
         form `"v<number>"` when issuing an administrator command.
+      x-chronodesk-project-roles: [project_admin]
       security:
         - humanBearer: []
       responses:
@@ -946,6 +947,7 @@ paths:
         encrypted replay of the original one-time response. The Project is
         bound by the authorized path; the principal and its initial Project
         grant are committed atomically, with no implicit default authorization.
+      x-chronodesk-project-roles: [project_admin]
       security:
         - humanBearer: []
       parameters:
@@ -1010,6 +1012,7 @@ paths:
         Use the matching principal's `resource_version` from the administrator
         overview as `If-Match`. An exact idempotent replay returns the original
         body, status, and ETag.
+      x-chronodesk-project-roles: [project_admin]
       security:
         - humanBearer: []
       parameters:
@@ -1065,6 +1068,7 @@ paths:
         Use the principal's `resource_version` from the administrator overview
         as `If-Match`. Exact idempotent retries return the same one-time secret,
         body, status, cache headers, and ETag.
+      x-chronodesk-project-roles: [project_admin]
       security:
         - humanBearer: []
       parameters:
@@ -1123,6 +1127,7 @@ paths:
         Use the parent principal's `resource_version` from the administrator
         overview as `If-Match`. Exact idempotent retries return the original
         receipt and ETag.
+      x-chronodesk-project-roles: [project_admin]
       security:
         - humanBearer: []
       parameters:
@@ -1169,6 +1174,7 @@ paths:
       operationId: listServicePrincipalPoliciesV2
       summary: List explicit allow and deny policies
       description: Returns closed policy objects with the `resource_version` required for policy commands.
+      x-chronodesk-project-roles: [project_admin]
       security:
         - humanBearer: []
       parameters:
@@ -1195,6 +1201,7 @@ paths:
         overview as `If-Match`. The response ETag identifies the new policy at
         version 1; `X-Parent-ETag` identifies the advanced principal version.
         Exact idempotent retries preserve both validators.
+      x-chronodesk-project-roles: [project_admin]
       security:
         - humanBearer: []
       parameters:
@@ -1259,6 +1266,7 @@ paths:
         Use the matching policy's `resource_version` from the policy list as
         `If-Match`. Exact idempotent retries return the original receipt and
         policy ETag.
+      x-chronodesk-project-roles: [project_admin]
       security:
         - humanBearer: []
       parameters:
@@ -1308,6 +1316,7 @@ paths:
         Use the lease's `resource_version` from the administrator overview as
         `If-Match`. Exact idempotent retries return the original released lease
         snapshot, receipt, and ETag.
+      x-chronodesk-project-roles: [project_admin]
       security:
         - humanBearer: []
       parameters:
@@ -1356,6 +1365,7 @@ paths:
         Use the attachment's `resource_version` from the administrator overview
         as `If-Match`. Exact idempotent retries return the original scan result,
         receipt, and ETag.
+      x-chronodesk-project-roles: [project_admin]
       security:
         - humanBearer: []
       parameters:
@@ -1410,6 +1420,7 @@ paths:
         Use the delivery's `resource_version` from the administrator overview
         as `If-Match`. Exact idempotent retries return the original accepted
         response, receipt, and ETag without requeueing twice.
+      x-chronodesk-project-roles: [project_admin]
       security:
         - humanBearer: []
       parameters:
@@ -2166,7 +2177,10 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: Existing human administrator session token; not an Agent credential.
+      description: |
+        Human browser session token. Project Agent administration additionally
+        requires an active explicit `project_admin` Membership; platform duties
+        alone never authorize these operations. This is not an Agent credential.
     webhookHmac:
       type: apiKey
       in: header

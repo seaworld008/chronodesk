@@ -153,7 +153,7 @@ func automationHandlerProjectRouter(
 	projectGroup := router.Group("/api/projects/:projectKey")
 	projectGroup.Use(func(c *gin.Context) {
 		c.Set("user_id", user.ID)
-		c.Set("user_role", string(user.Role))
+		c.Set("platform_role", user.PlatformRole)
 		c.Next()
 	})
 	projectGroup.Use(ProjectScopeMiddleware(

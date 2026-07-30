@@ -32,7 +32,7 @@ func TestResetUserPasswordAtomicallyRevokesSessions(t *testing.T) {
 		Username:      "password-reset-agent",
 		Email:         "password-reset-agent@example.com",
 		PasswordHash:  "old-password-hash",
-		Role:          models.RoleAgent,
+		PlatformRole:  models.PlatformRoleMember,
 		Status:        models.UserStatusActive,
 		LoginAttempts: 4,
 		LockedUntil:   &lockedUntil,
@@ -118,7 +118,7 @@ func TestResetUserPasswordRollsBackWhenSessionRevocationFails(t *testing.T) {
 		Username:     "password-reset-rollback",
 		Email:        "password-reset-rollback@example.com",
 		PasswordHash: "original-password-hash",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {

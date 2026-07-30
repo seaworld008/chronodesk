@@ -18,14 +18,14 @@ func TestGetNotificationsPreservesRecipientAndReadFilters(t *testing.T) {
 		Username:     "notification-owner",
 		Email:        "notification-owner@example.com",
 		PasswordHash: "hash",
-		Role:         models.RoleCustomer,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	secondUser := models.User{
 		Username:     "notification-other",
 		Email:        "notification-other@example.com",
 		PasswordHash: "hash",
-		Role:         models.RoleCustomer,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&firstUser).Error; err != nil {
@@ -115,11 +115,11 @@ func TestDeliverTicketNotificationOutboxKeepsSnapshotAfterTicketDeletion(t *test
 	}
 	actor := models.User{
 		Username: "deleted-ticket-actor", Email: "deleted-ticket-actor@example.com",
-		PasswordHash: "hash", Role: models.RoleAgent, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	recipient := models.User{
 		Username: "deleted-ticket-recipient", Email: "deleted-ticket-recipient@example.com",
-		PasswordHash: "hash", Role: models.RoleCustomer, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&actor).Error; err != nil {
 		t.Fatal(err)

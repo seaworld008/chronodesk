@@ -52,7 +52,7 @@ func parseUnreadCountMessage(t *testing.T, raw []byte) int64 {
 }
 
 func TestNotificationMarkedAsReadHook_PushesProvidedUnreadCount(t *testing.T) {
-	hub := NewHub()
+	hub := newAuthorizedWebSocketTestHub()
 	client := newWebSocketTestClient(hub, 101, websocketTestScopeA, 1)
 	hub.clients[client] = true
 
@@ -72,7 +72,7 @@ func TestNotificationMarkedAsReadHook_PushesProvidedUnreadCount(t *testing.T) {
 
 	select {
 	case msg := <-client.send:
-		if got := parseUnreadCountMessage(t, msg); got != 5 {
+		if got := parseUnreadCountMessage(t, msg.payload); got != 5 {
 			t.Fatalf("expected unread count 5, got %d", got)
 		}
 	case <-time.After(200 * time.Millisecond):
@@ -81,7 +81,7 @@ func TestNotificationMarkedAsReadHook_PushesProvidedUnreadCount(t *testing.T) {
 }
 
 func TestNotificationPushesOnlyToSameProjectAndUser(t *testing.T) {
-	hub := NewHub()
+	hub := newAuthorizedWebSocketTestHub()
 	projectAClient := newWebSocketTestClient(
 		hub,
 		101,
@@ -147,7 +147,7 @@ func TestNotificationPushesOnlyToSameProjectAndUser(t *testing.T) {
 	}
 	select {
 	case message := <-projectBClient.send:
-		if got := parseUnreadCountMessage(t, message); got != 3 {
+		if got := parseUnreadCountMessage(t, message.payload); got != 3 {
 			t.Fatalf("project B unread count = %d", got)
 		}
 	default:
@@ -161,7 +161,7 @@ func TestNotificationPushesOnlyToSameProjectAndUser(t *testing.T) {
 }
 
 func TestHubRunClosesClientsAndReturnsOnContextCancellation(t *testing.T) {
-	hub := NewHub()
+	hub := newAuthorizedWebSocketTestHub()
 	client := newWebSocketTestClient(hub, 100, websocketTestScopeA, 1)
 	hub.clients[client] = true
 
@@ -189,7 +189,7 @@ func TestHubRunClosesClientsAndReturnsOnContextCancellation(t *testing.T) {
 }
 
 func TestClientHandleMarkRead_InvokesReadHandlerAndPushesUnreadCount(t *testing.T) {
-	hub := NewHub()
+	hub := newAuthorizedWebSocketTestHub()
 	client := newWebSocketTestClient(hub, 202, websocketTestScopeA, 2)
 	hub.clients[client] = true
 
@@ -233,7 +233,7 @@ func TestClientHandleMarkRead_InvokesReadHandlerAndPushesUnreadCount(t *testing.
 
 	select {
 	case msg := <-client.send:
-		if got := parseUnreadCountMessage(t, msg); got != 4 {
+		if got := parseUnreadCountMessage(t, msg.payload); got != 4 {
 			t.Fatalf("expected unread count 4, got %d", got)
 		}
 	case <-time.After(200 * time.Millisecond):
@@ -348,11 +348,29 @@ func newWebSocketTestClient(
 	scope models.ProjectScope,
 	sendCapacity int,
 ) *Client {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Client{
-		hub:    hub,
-		send:   make(chan []byte, sendCapacity),
-		UserID: userID,
-		scope:  scope,
-		done:   make(chan struct{}),
+		hub:     hub,
+		send:    make(chan outboundMessage, sendCapacity),
+		receive: make(chan []byte, 1),
+		UserID:  userID,
+		scope:   scope,
+		ctx:     ctx,
+		cancel:  cancel,
+		done:    make(chan struct{}),
 	}
+}
+
+type allowFanoutAuthorizer struct{}
+
+func (allowFanoutAuthorizer) AuthorizeFanout(
+	context.Context,
+	models.ProjectScope,
+	uint,
+) error {
+	return nil
+}
+
+func newAuthorizedWebSocketTestHub() *Hub {
+	return NewHub(allowFanoutAuthorizer{})
 }

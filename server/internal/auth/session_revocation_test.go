@@ -57,14 +57,14 @@ func setupSessionRevocationTest(t *testing.T) (*GormTokenRepository, *SimpleJWTM
 		userRepo: &sessionTestUserRepo{
 			users: map[uint]*User{
 				42: {
-					ID:     42,
-					Role:   RoleAdmin,
-					Status: StatusActive,
+					ID:           42,
+					PlatformRole: PlatformRolePlatformAdmin,
+					Status:       StatusActive,
 				},
 				84: {
-					ID:     84,
-					Role:   RoleCustomer,
-					Status: StatusActive,
+					ID:           84,
+					PlatformRole: PlatformRoleMember,
+					Status:       StatusActive,
 				},
 			},
 		},
@@ -84,11 +84,15 @@ func issueSessionTokens(
 	repository *GormTokenRepository,
 	manager *SimpleJWTManager,
 	userID uint,
-	role UserRole,
+	platformRole PlatformRole,
 	sessionID string,
 ) (string, string) {
 	t.Helper()
-	accessToken, refreshToken, err := manager.GenerateTokenPair(userID, role, sessionID)
+	accessToken, refreshToken, err := manager.GenerateTokenPair(
+		userID,
+		platformRole,
+		sessionID,
+	)
 	if err != nil {
 		t.Fatalf("generate session tokens: %v", err)
 	}
@@ -149,7 +153,7 @@ func TestLogoutRevokesAccessTokenSessionImmediately(t *testing.T) {
 		repository,
 		manager,
 		42,
-		RoleAdmin,
+		PlatformRolePlatformAdmin,
 		"session-single-device",
 	)
 
@@ -174,9 +178,15 @@ func TestLogoutRevokesAccessTokenSessionImmediately(t *testing.T) {
 
 func TestLogoutAllRevokesEveryUserSessionOnly(t *testing.T) {
 	repository, manager, handler := setupSessionRevocationTest(t)
-	firstAccess, _ := issueSessionTokens(t, repository, manager, 42, RoleAdmin, "session-admin-one")
-	secondAccess, _ := issueSessionTokens(t, repository, manager, 42, RoleAdmin, "session-admin-two")
-	otherAccess, _ := issueSessionTokens(t, repository, manager, 84, RoleCustomer, "session-other-user")
+	firstAccess, _ := issueSessionTokens(
+		t, repository, manager, 42, PlatformRolePlatformAdmin, "session-admin-one",
+	)
+	secondAccess, _ := issueSessionTokens(
+		t, repository, manager, 42, PlatformRolePlatformAdmin, "session-admin-two",
+	)
+	otherAccess, _ := issueSessionTokens(
+		t, repository, manager, 84, PlatformRoleMember, "session-other-user",
+	)
 
 	if err := handler.authService.LogoutAll(context.Background(), 42); err != nil {
 		t.Fatalf("logout all: %v", err)
@@ -204,7 +214,7 @@ func TestRevokedSessionCannotBeResurrectedByLateRefreshWrite(t *testing.T) {
 		repository,
 		manager,
 		42,
-		RoleAdmin,
+		PlatformRolePlatformAdmin,
 		"session-refresh-race",
 	)
 	if err := handler.authService.Logout(context.Background(), refreshToken); err != nil {
@@ -214,7 +224,11 @@ func TestRevokedSessionCannotBeResurrectedByLateRefreshWrite(t *testing.T) {
 	// Simulate a refresh request that passed its initial check immediately before
 	// logout and committed a new refresh token afterwards. The immutable sid is
 	// still revoked by login_histories, so this row must not reactivate access.
-	_, lateRefreshToken, err := manager.GenerateTokenPair(42, RoleAdmin, "session-refresh-race")
+	_, lateRefreshToken, err := manager.GenerateTokenPair(
+		42,
+		PlatformRolePlatformAdmin,
+		"session-refresh-race",
+	)
 	if err != nil {
 		t.Fatalf("generate late refresh token: %v", err)
 	}
@@ -242,10 +256,19 @@ func TestRevokedSessionCannotBeResurrectedByLateRefreshWrite(t *testing.T) {
 
 func TestJWTRequiresPersistentSessionIdentifier(t *testing.T) {
 	manager := mustTestJWTManager(t, time.Hour, 24*time.Hour)
-	if _, _, err := manager.GenerateTokenPair(42, RoleAdmin, ""); err == nil {
+	if _, _, err := manager.GenerateTokenPair(
+		42,
+		PlatformRolePlatformAdmin,
+		"",
+	); err == nil {
 		t.Fatal("token pair without session id succeeded")
 	}
-	for _, historicalRole := range []UserRole{UserRole("user"), UserRole("superuser")} {
+	for _, historicalRole := range []PlatformRole{
+		PlatformRole("admin"),
+		PlatformRole("supervisor"),
+		PlatformRole("agent"),
+		PlatformRole("customer"),
+	} {
 		if _, _, err := manager.GenerateTokenPair(
 			42,
 			historicalRole,
@@ -257,16 +280,16 @@ func TestJWTRequiresPersistentSessionIdentifier(t *testing.T) {
 
 	now := time.Now()
 	token, err := manager.generateToken(&JWTPayload{
-		UserID: 42,
-		Role:   RoleAdmin,
-		Type:   "access",
-		Iss:    manager.issuer,
-		Sub:    "42",
-		Aud:    manager.audience,
-		Exp:    now.Add(time.Hour).Unix(),
-		Nbf:    now.Unix(),
-		Iat:    now.Unix(),
-		Jti:    "legacy-token-without-session",
+		UserID:       42,
+		PlatformRole: PlatformRolePlatformAdmin,
+		Type:         "access",
+		Iss:          manager.issuer,
+		Sub:          "42",
+		Aud:          manager.audience,
+		Exp:          now.Add(time.Hour).Unix(),
+		Nbf:          now.Unix(),
+		Iat:          now.Unix(),
+		Jti:          "legacy-token-without-session",
 	}, manager.accessSecret)
 	if err != nil {
 		t.Fatalf("generate token: %v", err)
@@ -283,7 +306,7 @@ func TestRefreshTokenIssuedBeforePasswordChangeIsRejected(t *testing.T) {
 		repository,
 		manager,
 		42,
-		RoleAdmin,
+		PlatformRolePlatformAdmin,
 		"session-before-password-change",
 	)
 
@@ -313,19 +336,19 @@ func TestRefreshTokenIssuedBeforePasswordChangeIsRejected(t *testing.T) {
 	}
 }
 
-func TestRefreshTokenRoleMismatchIsRejectedAndRevokesSession(t *testing.T) {
+func TestRefreshTokenPlatformRoleMismatchIsRejectedAndRevokesSession(t *testing.T) {
 	repository, manager, handler := setupSessionRevocationTest(t)
 	_, refreshToken := issueSessionTokens(
 		t,
 		repository,
 		manager,
 		42,
-		RoleAdmin,
+		PlatformRolePlatformAdmin,
 		"session-before-role-change",
 	)
 
 	userRepo := handler.authService.userRepo.(*sessionTestUserRepo)
-	userRepo.users[42].Role = RoleCustomer
+	userRepo.users[42].PlatformRole = PlatformRoleMember
 
 	if _, err := handler.authService.RefreshToken(
 		context.Background(),
@@ -352,7 +375,7 @@ func TestRefreshTokenCanOnlyBeConsumedOnce(t *testing.T) {
 		repository,
 		manager,
 		42,
-		RoleAdmin,
+		PlatformRolePlatformAdmin,
 		"session-refresh-replay",
 	)
 

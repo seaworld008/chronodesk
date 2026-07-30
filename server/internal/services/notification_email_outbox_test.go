@@ -67,7 +67,7 @@ func newNotificationEmailOutboxTestService(
 		Username:     "notification-email-user",
 		Email:        "notification-email@example.test",
 		PasswordHash: "test-password-hash",
-		Role:         models.RoleCustomer,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {

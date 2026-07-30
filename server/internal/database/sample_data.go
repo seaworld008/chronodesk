@@ -14,15 +14,20 @@ import (
 
 // SampleDataGenerator 示例数据生成器
 type SampleDataGenerator struct {
-	db    *gorm.DB
-	users map[string]*models.User // 缓存用户，便于关联
+	db               *gorm.DB
+	membershipWriter ProjectScopeMembershipWriter
+	users            map[string]*models.User // 缓存用户，便于关联
 }
 
 // NewSampleDataGenerator 创建示例数据生成器
-func NewSampleDataGenerator(db *gorm.DB) *SampleDataGenerator {
+func NewSampleDataGenerator(
+	db *gorm.DB,
+	membershipWriter ProjectScopeMembershipWriter,
+) *SampleDataGenerator {
 	return &SampleDataGenerator{
-		db:    db,
-		users: make(map[string]*models.User),
+		db:               db,
+		membershipWriter: membershipWriter,
+		users:            make(map[string]*models.User),
 	}
 }
 
@@ -71,20 +76,20 @@ func (g *SampleDataGenerator) createSampleUsers() error {
 	}
 
 	sampleUsers := []struct {
-		Username   string
-		Email      string
-		FirstName  string
-		LastName   string
-		Role       models.UserRole
-		Department string
-		JobTitle   string
+		Username    string
+		Email       string
+		FirstName   string
+		LastName    string
+		ProjectRole models.ProjectRole
+		Department  string
+		JobTitle    string
 	}{
-		{"tech_support", "support@sample.com", "张", "技术", models.RoleAgent, "技术部", "技术支持专员"},
-		{"customer_service", "service@sample.com", "李", "客服", models.RoleAgent, "客服部", "客户服务专员"},
-		{"project_manager", "pm@sample.com", "王", "经理", models.RoleAgent, "项目部", "项目经理"},
-		{"demo_user1", "user1@sample.com", "陈", "用户", models.RoleCustomer, "销售部", "销售专员"},
-		{"demo_user2", "user2@sample.com", "刘", "测试", models.RoleCustomer, "研发部", "测试工程师"},
-		{"demo_user3", "user3@sample.com", "赵", "设计", models.RoleCustomer, "设计部", "UI设计师"},
+		{"tech_support", "support@sample.com", "张", "技术", models.ProjectRoleAgent, "技术部", "技术支持专员"},
+		{"customer_service", "service@sample.com", "李", "客服", models.ProjectRoleAgent, "客服部", "客户服务专员"},
+		{"project_manager", "pm@sample.com", "王", "经理", models.ProjectRoleManager, "项目部", "项目经理"},
+		{"demo_user1", "user1@sample.com", "陈", "用户", models.ProjectRoleRequester, "销售部", "销售专员"},
+		{"demo_user2", "user2@sample.com", "刘", "测试", models.ProjectRoleRequester, "研发部", "测试工程师"},
+		{"demo_user3", "user3@sample.com", "赵", "设计", models.ProjectRoleRequester, "研发部", "UI设计师"},
 	}
 
 	// 演示账号只允许由显式开发命令创建，仍使用运行时支持的当前哈希格式。
@@ -106,7 +111,7 @@ func (g *SampleDataGenerator) createSampleUsers() error {
 			Email:         userData.Email,
 			FirstName:     userData.FirstName,
 			LastName:      userData.LastName,
-			Role:          userData.Role,
+			PlatformRole:  models.PlatformRoleMember,
 			Status:        models.UserStatusActive,
 			EmailVerified: true,
 			Department:    userData.Department,
@@ -120,7 +125,14 @@ func (g *SampleDataGenerator) createSampleUsers() error {
 
 		// 缓存用户便于后续使用
 		g.users[userData.Email] = user
-		log.Printf("✓ 创建用户: %s (%s)", user.Email, user.Role)
+		if err := g.ensureSampleUserMembership(user, userData.ProjectRole); err != nil {
+			return err
+		}
+		log.Printf(
+			"✓ 创建用户: %s (%s)",
+			user.Email,
+			userData.ProjectRole,
+		)
 	}
 
 	log.Printf("✅ 创建了 %d 个示例用户", len(sampleUsers))
@@ -137,10 +149,51 @@ func (g *SampleDataGenerator) loadExistingUsers() error {
 	for _, user := range users {
 		userCopy := user // 避免循环变量指针问题
 		g.users[user.Email] = &userCopy
+		role, ok := sampleProjectRoleForEmail(user.Email)
+		if !ok {
+			return fmt.Errorf("示例用户 %s 缺少项目角色定义", user.Email)
+		}
+		if err := g.ensureSampleUserMembership(&userCopy, role); err != nil {
+			return err
+		}
 	}
 
 	log.Printf("✓ 加载了 %d 个已存在的示例用户", len(users))
 	return nil
+}
+
+func (g *SampleDataGenerator) ensureSampleUserMembership(
+	user *models.User,
+	role models.ProjectRole,
+) error {
+	if g.membershipWriter == nil {
+		return fmt.Errorf("示例用户项目成员写入器未配置")
+	}
+	scope, err := defaultPlatformRoleCutoverScope(g.db)
+	if err != nil {
+		return err
+	}
+	ctx := g.db.Statement.Context
+	if ctx == nil {
+		return fmt.Errorf("示例用户项目成员写入上下文未配置")
+	}
+	if err := g.membershipWriter(ctx, g.db, *user, scope, role); err != nil {
+		return fmt.Errorf("创建示例用户 %s 项目成员失败: %w", user.Email, err)
+	}
+	return nil
+}
+
+func sampleProjectRoleForEmail(email string) (models.ProjectRole, bool) {
+	switch email {
+	case "support@sample.com", "service@sample.com":
+		return models.ProjectRoleAgent, true
+	case "pm@sample.com":
+		return models.ProjectRoleManager, true
+	case "user1@sample.com", "user2@sample.com", "user3@sample.com":
+		return models.ProjectRoleRequester, true
+	default:
+		return "", false
+	}
 }
 
 // createSampleCategories 创建示例分类
@@ -160,7 +213,10 @@ func (g *SampleDataGenerator) createSampleCategories() error {
 
 	// 获取管理员用户作为创建者
 	var adminUser models.User
-	if err := g.db.Where("role = ?", models.RoleAdmin).First(&adminUser).Error; err != nil {
+	if err := g.db.Where(
+		"platform_role = ?",
+		models.PlatformRolePlatformAdmin,
+	).First(&adminUser).Error; err != nil {
 		return fmt.Errorf("获取管理员用户失败: %w", err)
 	}
 

@@ -37,7 +37,7 @@ func NewEmailConfigHandler(emailConfigService services.EmailConfigServiceInterfa
 // @Failure 401 {object} ErrorResponse
 // @Failure 403 {object} ErrorResponse
 // @Failure 500 {object} ErrorResponse
-// @Router /api/admin/email-config [get]
+// @Router /api/platform/email-config [get]
 func (h *EmailConfigHandler) GetEmailConfig(c *gin.Context) {
 	ctx := c.Request.Context()
 
@@ -65,7 +65,7 @@ func (h *EmailConfigHandler) GetEmailConfig(c *gin.Context) {
 // @Failure 401 {object} ErrorResponse
 // @Failure 403 {object} ErrorResponse
 // @Failure 500 {object} ErrorResponse
-// @Router /api/admin/email-config [put]
+// @Router /api/platform/email-config [put]
 func (h *EmailConfigHandler) UpdateEmailConfig(c *gin.Context) {
 	ctx := c.Request.Context()
 
@@ -78,7 +78,7 @@ func (h *EmailConfigHandler) UpdateEmailConfig(c *gin.Context) {
 
 	// 解析请求体
 	var req models.EmailConfigUpdateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		h.response.Error(c, http.StatusBadRequest, "invalid_request", "请求参数无效")
 		return
 	}
@@ -119,13 +119,13 @@ func (h *EmailConfigHandler) UpdateEmailConfig(c *gin.Context) {
 // @Failure 401 {object} ErrorResponse
 // @Failure 403 {object} ErrorResponse
 // @Failure 500 {object} ErrorResponse
-// @Router /api/admin/email-config/test [post]
+// @Router /api/platform/email-config/test [post]
 func (h *EmailConfigHandler) TestEmailConnection(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	// 解析请求体
 	var req models.EmailTestRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		h.response.Error(c, http.StatusBadRequest, "invalid_request", "请求参数无效")
 		return
 	}

@@ -26,7 +26,7 @@ class TestCleanupSettings:
             api_base_url,
             "修改全局 cleanup 配置",
         )
-        resp = admin_api.get_json("/admin/system/cleanup/config")
+        resp = admin_api.get_json("/platform/system/cleanup/config")
         assert resp.status_code == 200, response_diagnostic(resp)
         body = resp.json()
         assert body.get("success") is True, safe_diagnostic(body)
@@ -48,7 +48,7 @@ class TestCleanupSettings:
                 update_payload["cleanup_schedule"] = "0 3 * * *"
 
             update_resp = admin_api.put_json(
-                "/admin/system/cleanup/config", update_payload
+                "/platform/system/cleanup/config", update_payload
             )
             assert update_resp.status_code == 200, response_diagnostic(update_resp)
             update_body = update_resp.json()
@@ -56,7 +56,7 @@ class TestCleanupSettings:
 
             # Logs endpoint (may be empty but should succeed)
             logs_resp = admin_api.get_json(
-                "/admin/system/cleanup/logs",
+                "/platform/system/cleanup/logs",
                 params={"limit": 5},
             )
             assert logs_resp.status_code == 200, response_diagnostic(logs_resp)
@@ -64,7 +64,7 @@ class TestCleanupSettings:
             assert logs_body.get("success") is True, safe_diagnostic(logs_body)
 
             # Stats endpoint
-            stats_resp = admin_api.get_json("/admin/system/cleanup/stats")
+            stats_resp = admin_api.get_json("/platform/system/cleanup/stats")
             assert stats_resp.status_code == 200, response_diagnostic(stats_resp)
             stats_body = stats_resp.json()
             assert stats_body.get("success") is True, safe_diagnostic(stats_body)
@@ -73,7 +73,7 @@ class TestCleanupSettings:
             restore_resp = None
             for _ in range(2):
                 candidate = admin_api.put_json(
-                    "/admin/system/cleanup/config",
+                    "/platform/system/cleanup/config",
                     original,
                 )
                 restore_resp = candidate
@@ -91,7 +91,7 @@ class TestCleanupSettings:
             assert restore_resp.json().get("success") is True, response_diagnostic(
                 restore_resp
             )
-            verify_resp = admin_api.get_json("/admin/system/cleanup/config")
+            verify_resp = admin_api.get_json("/platform/system/cleanup/config")
             assert verify_resp.status_code == 200, response_diagnostic(verify_resp)
             restored = verify_resp.json().get("data")
             assert restored == original, (

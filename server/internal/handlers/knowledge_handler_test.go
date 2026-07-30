@@ -313,11 +313,39 @@ func TestKnowledgeHandlerFullAdministrativeAndACLSearchFlow(
 		http.MethodPost,
 		"/api/projects/OPS/knowledge/index-rebuilds",
 		nil,
+		http.StatusAccepted,
+	)
+	if indexState.Data.Status != models.KnowledgeIndexRebuildRequested {
+		t.Fatalf("index state = %+v", indexState.Data)
+	}
+	outboxWorkerContext, err := services.EnsureSystemProjectOperationContext(
+		context.Background(),
+		environment.operations.Scope(),
+		models.SystemActor("knowledge-index-outbox-test"),
+		"knowledge-index-outbox-test",
+		"knowledge-index-outbox-test",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := environment.knowledgeService.ExecuteIndexRebuildOutbox(
+		outboxWorkerContext,
+		indexState.Data.ID,
+		indexState.Data.DesiredGeneration,
+	); err != nil {
+		t.Fatalf("execute queued index rebuild: %v", err)
+	}
+	indexState, _ = performKnowledgeHandlerRequest[knowledgeIndexStateResponse](
+		t,
+		managerRouter,
+		http.MethodGet,
+		"/api/projects/OPS/knowledge/index-rebuilds/current",
+		nil,
 		http.StatusOK,
 	)
 	if indexState.Data.Status != models.KnowledgeIndexReady ||
 		indexState.Data.DocumentCount != 1 {
-		t.Fatalf("index state = %+v", indexState.Data)
+		t.Fatalf("completed index state = %+v", indexState.Data)
 	}
 
 	searchQuery := "UNIQUE_QUERY_不得回显 如何恢复服务"
@@ -584,6 +612,9 @@ func newKnowledgeHandlerTestEnvironment(
 		&models.KnowledgeFeedback{},
 		&models.KnowledgeIndexState{},
 		&models.ProjectModelPolicy{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
+		&models.AuditLedgerEntry{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -635,28 +666,28 @@ func newKnowledgeHandlerTestEnvironment(
 		}
 	}
 	manager := models.User{
-		Username: "knowledge-manager",
-		Email:    "knowledge-manager@example.test",
-		Role:     models.RoleAgent,
-		Status:   models.UserStatusActive,
+		Username:     "knowledge-manager",
+		Email:        "knowledge-manager@example.test",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
 	}
 	agent := models.User{
-		Username: "knowledge-agent",
-		Email:    "knowledge-agent@example.test",
-		Role:     models.RoleAgent,
-		Status:   models.UserStatusActive,
+		Username:     "knowledge-agent",
+		Email:        "knowledge-agent@example.test",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
 	}
 	requester := models.User{
-		Username: "knowledge-requester",
-		Email:    "knowledge-requester@example.test",
-		Role:     models.RoleCustomer,
-		Status:   models.UserStatusActive,
+		Username:     "knowledge-requester",
+		Email:        "knowledge-requester@example.test",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
 	}
 	observer := models.User{
-		Username: "knowledge-observer",
-		Email:    "knowledge-observer@example.test",
-		Role:     models.RoleCustomer,
-		Status:   models.UserStatusActive,
+		Username:     "knowledge-observer",
+		Email:        "knowledge-observer@example.test",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&manager).Error; err != nil {
 		t.Fatal(err)
@@ -704,7 +735,8 @@ func newKnowledgeHandlerTestEnvironment(
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
-	projectService, err := services.NewProjectService(db)
+	nativeService := services.NewAgentNativeService(db)
+	projectService, err := services.NewProjectService(db, nativeService)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -712,7 +744,9 @@ func newKnowledgeHandlerTestEnvironment(
 	knowledgeService, err := services.NewKnowledgeService(
 		db,
 		services.KnowledgeServiceDependencies{
-			SearchIndex: index,
+			SearchIndex:          index,
+			ProjectAuthorization: projectService,
+			Events:               nativeService,
 			ModelProviders: map[string]services.ModelProvider{
 				"handler-provider": knowledgeHandlerTestProvider{},
 			},
@@ -741,17 +775,26 @@ func knowledgeHandlerTestRouter(
 ) http.Handler {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	projectGroup := router.Group("/api/projects/:projectKey")
-	projectGroup.Use(func(c *gin.Context) {
+	authenticatedUser := func(c *gin.Context) {
 		c.Set("user_id", user.ID)
-		c.Set("user_role", string(user.Role))
+		c.Set("platform_role", user.PlatformRole)
 		c.Next()
-	})
+	}
+	handler := NewKnowledgeHandler(environment.knowledgeService)
+	projectGroup := router.Group("/api/projects/:projectKey")
+	projectGroup.Use(authenticatedUser)
 	projectGroup.Use(ProjectScopeMiddleware(
 		environment.projectService,
 		environment.db,
 	))
-	NewKnowledgeHandler(environment.knowledgeService).RegisterRoutes(projectGroup)
+	handler.RegisterRoutes(projectGroup)
+	externalGroup := router.Group("/api/projects/:projectKey")
+	externalGroup.Use(authenticatedUser)
+	externalGroup.Use(ProjectExternalScopeMiddleware(
+		environment.projectService,
+		environment.db,
+	))
+	handler.RegisterExternalRoutes(externalGroup)
 	return router
 }
 

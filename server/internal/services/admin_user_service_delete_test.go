@@ -38,14 +38,14 @@ func TestDeleteUserSoftDeletesAndRevokesSessions(t *testing.T) {
 		Username:     "remaining-admin",
 		Email:        "remaining-admin@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	user := models.User{
 		Username:     "deletable-agent",
 		Email:        "deletable-agent@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&admin).Error; err != nil {

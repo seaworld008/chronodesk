@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -16,6 +17,98 @@ import (
 type AutomationHandler struct {
 	automationService *services.AutomationService
 	schedulerService  *services.SchedulerService
+}
+
+type automationRuleLogSummary struct {
+	ID             uint      `json:"id"`
+	Name           string    `json:"name"`
+	Description    string    `json:"description"`
+	RuleType       string    `json:"rule_type"`
+	TriggerEvent   string    `json:"trigger_event"`
+	Priority       int       `json:"priority"`
+	IsActive       bool      `json:"is_active"`
+	SuccessCount   int64     `json:"success_count"`
+	FailureCount   int64     `json:"failure_count"`
+	ExecutionCount int64     `json:"execution_count"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+type automationTicketLogSummary struct {
+	ID           uint                `json:"id"`
+	TicketNumber string              `json:"ticket_number"`
+	Title        string              `json:"title"`
+	Status       models.TicketStatus `json:"status"`
+}
+
+type automationLogResponse struct {
+	ID              uint                        `json:"id"`
+	CreatedAt       time.Time                   `json:"created_at"`
+	OrganizationID  uint                        `json:"organization_id"`
+	ProjectID       uint                        `json:"project_id"`
+	RuleID          uint                        `json:"rule_id"`
+	Rule            *automationRuleLogSummary   `json:"rule,omitempty"`
+	TicketID        uint                        `json:"ticket_id"`
+	Ticket          *automationTicketLogSummary `json:"ticket,omitempty"`
+	TriggerEvent    string                      `json:"trigger_event"`
+	ExecutedAt      time.Time                   `json:"executed_at"`
+	Success         bool                        `json:"success"`
+	ErrorMessage    string                      `json:"error_message,omitempty"`
+	ExecutionTime   int64                       `json:"execution_time"`
+	ActionsExecuted string                      `json:"actions_executed"`
+	Changes         string                      `json:"changes"`
+}
+
+func automationLogResponses(
+	logs []*models.AutomationLog,
+) []automationLogResponse {
+	result := make([]automationLogResponse, 0, len(logs))
+	for _, log := range logs {
+		if log == nil {
+			continue
+		}
+		item := automationLogResponse{
+			ID:              log.ID,
+			CreatedAt:       log.CreatedAt,
+			OrganizationID:  log.OrganizationID,
+			ProjectID:       log.ProjectID,
+			RuleID:          log.RuleID,
+			TicketID:        log.TicketID,
+			TriggerEvent:    log.TriggerEvent,
+			ExecutedAt:      log.ExecutedAt,
+			Success:         log.Success,
+			ErrorMessage:    log.ErrorMessage,
+			ExecutionTime:   log.ExecutionTime,
+			ActionsExecuted: log.ActionsExecuted,
+			Changes:         log.Changes,
+		}
+		if log.Rule != nil {
+			item.Rule = &automationRuleLogSummary{
+				ID:             log.Rule.ID,
+				Name:           log.Rule.Name,
+				Description:    log.Rule.Description,
+				RuleType:       log.Rule.RuleType,
+				TriggerEvent:   log.Rule.TriggerEvent,
+				Priority:       log.Rule.Priority,
+				IsActive:       log.Rule.IsActive,
+				SuccessCount:   log.Rule.SuccessCount,
+				FailureCount:   log.Rule.FailureCount,
+				ExecutionCount: log.Rule.ExecutionCount,
+				CreatedAt:      log.Rule.CreatedAt,
+				UpdatedAt:      log.Rule.UpdatedAt,
+			}
+		}
+		if log.Ticket != nil {
+			item.Ticket = &automationTicketLogSummary{
+				ID:           log.Ticket.ID,
+				TicketNumber: log.Ticket.TicketNumber,
+				Title:        log.Ticket.Title,
+				Status:       log.Ticket.Status,
+			}
+		}
+		result = append(result, item)
+	}
+	return result
 }
 
 // NewAutomationHandler creates the HTTP adapter over the application-owned
@@ -116,7 +209,7 @@ func (h *AutomationHandler) requireProjectManager(c *gin.Context) {
 // @Router /api/projects/{projectKey}/admin/automation/rules [post]
 func (h *AutomationHandler) CreateRule(c *gin.Context) {
 	var req models.AutomationRuleRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数错误",
@@ -289,7 +382,7 @@ func (h *AutomationHandler) UpdateRule(c *gin.Context) {
 	}
 
 	var req models.AutomationRuleRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数错误",
@@ -483,7 +576,7 @@ func (h *AutomationHandler) GetExecutionLogs(c *gin.Context) {
 		"success": true,
 		"message": "获取执行日志成功",
 		"data": gin.H{
-			"logs":        logs,
+			"logs":        automationLogResponses(logs),
 			"total":       total,
 			"page":        page,
 			"page_size":   pageSize,
@@ -508,7 +601,7 @@ func (h *AutomationHandler) GetExecutionLogs(c *gin.Context) {
 // @Router /api/projects/{projectKey}/admin/automation/sla [post]
 func (h *AutomationHandler) CreateSLAConfig(c *gin.Context) {
 	var req models.SLAConfigRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数错误",
@@ -607,7 +700,7 @@ func (h *AutomationHandler) GetSLAConfigs(c *gin.Context) {
 // @Router /api/projects/{projectKey}/admin/automation/templates [post]
 func (h *AutomationHandler) CreateTemplate(c *gin.Context) {
 	var req models.TicketTemplateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数错误",
@@ -750,7 +843,7 @@ func (h *AutomationHandler) GetTemplate(c *gin.Context) {
 // @Router /api/projects/{projectKey}/admin/automation/quick-replies [post]
 func (h *AutomationHandler) CreateQuickReply(c *gin.Context) {
 	var req models.QuickReplyRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数错误",

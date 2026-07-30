@@ -105,7 +105,7 @@ func setupWorkflowHandlerTest(
 		Username:     "workflow-agent",
 		Email:        "workflow-agent@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&agent).Error; err != nil {
@@ -116,7 +116,7 @@ func setupWorkflowHandlerTest(
 		Username:     "workflow-other-agent",
 		Email:        "workflow-other-agent@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&otherAgent).Error; err != nil {
@@ -151,6 +151,31 @@ func setupWorkflowHandlerTest(
 	}
 	if err := db.Create(&otherTicket).Error; err != nil {
 		t.Fatalf("failed to create other ticket: %v", err)
+	}
+
+	scope := ensureHandlerTestProject(t, db)
+	if err := db.AutoMigrate(&models.ProjectMembership{}); err != nil {
+		t.Fatalf("migrate workflow memberships: %v", err)
+	}
+	for _, membership := range []models.ProjectMembership{
+		{
+			ProjectID: scope.ProjectID,
+			UserID:    agent.ID,
+			Role:      models.ProjectRoleAgent,
+			IsActive:  true,
+			Version:   1,
+		},
+		{
+			ProjectID: scope.ProjectID,
+			UserID:    otherAgent.ID,
+			Role:      models.ProjectRoleAgent,
+			IsActive:  true,
+			Version:   1,
+		},
+	} {
+		if err := db.Create(&membership).Error; err != nil {
+			t.Fatalf("create workflow membership: %v", err)
+		}
 	}
 
 	return NewTicketWorkflowHandler(newHandlerTicketService(t, db)), db, agent, otherAgent, assignedTicket, otherTicket
@@ -246,11 +271,21 @@ func TestCustomerQueueAndAggregateQueriesAreObjectScoped(t *testing.T) {
 		Username:     "workflow-customer",
 		Email:        "workflow-customer@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleCustomer,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&customer).Error; err != nil {
 		t.Fatalf("create customer: %v", err)
+	}
+	scope := ensureHandlerTestProject(t, db)
+	if err := db.Create(&models.ProjectMembership{
+		ProjectID: scope.ProjectID,
+		UserID:    customer.ID,
+		Role:      models.ProjectRoleRequester,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
+		t.Fatalf("create customer project membership: %v", err)
 	}
 	yesterday := time.Now().Add(-24 * time.Hour)
 	own := models.Ticket{
@@ -343,7 +378,7 @@ func TestCustomerSpecialListsUseSafeTicketDTO(t *testing.T) {
 	customer := models.User{
 		Username: "safe-customer", Email: "private-user-email@example.com",
 		Phone: "18800001111", PasswordHash: "hashed",
-		DisplayName: "Safe Customer", Role: models.RoleCustomer, Status: models.UserStatusActive,
+		DisplayName: "Safe Customer", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 		LastLoginIP: "10.10.10.10",
 	}
 	if err := db.Create(&customer).Error; err != nil {
@@ -414,7 +449,7 @@ func TestCustomerHistoryUsesVisibleNarrowDTO(t *testing.T) {
 	handler, db, _, _, _, _ := setupWorkflowHandlerTest(t)
 	customer := models.User{
 		Username: "history-customer", Email: "history-private@example.com",
-		PasswordHash: "hashed", Role: models.RoleCustomer, Status: models.UserStatusActive,
+		PasswordHash: "hashed", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&customer).Error; err != nil {
 		t.Fatal(err)

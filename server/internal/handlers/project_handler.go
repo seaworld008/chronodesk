@@ -2,12 +2,16 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
+	"github.com/google/uuid"
 	"github.com/seaworld008/chronodesk/server/internal/database"
 	"github.com/seaworld008/chronodesk/server/internal/middleware"
 	"github.com/seaworld008/chronodesk/server/internal/models"
@@ -45,7 +49,6 @@ func (handler *ProjectHandler) List(c *gin.Context) {
 	projects, err := handler.service.ListHumanProjects(
 		c.Request.Context(),
 		userID,
-		isPlatformAdministrator(c),
 	)
 	if err != nil {
 		writeProjectError(c, handler.response, err)
@@ -115,7 +118,7 @@ func (handler *ProjectHandler) UpsertMembership(c *gin.Context) {
 		return
 	}
 	var request upsertProjectMembershipRequest
-	if err := c.ShouldBindJSON(&request); err != nil ||
+	if err := decodeStrictProjectJSON(c, &request); err != nil ||
 		!request.Role.IsValid() {
 		handler.response.BadRequest(c, "项目成员参数无效")
 		return
@@ -172,13 +175,46 @@ type createProjectRequest struct {
 	DefaultQueueName string `json:"default_queue_name"`
 }
 
-func (handler *ProjectHandler) Create(c *gin.Context) {
-	if !isPlatformAdministrator(c) {
-		handler.response.Forbidden(c, "仅平台管理员可创建项目")
+// platformProjectSummary keeps the existing command-handler helper private
+// while sharing the exact closed DTO used by the platform list service.
+type platformProjectSummary = services.PlatformProjectSummary
+
+func newPlatformProjectSummary(
+	project models.Project,
+) platformProjectSummary {
+	return platformProjectSummary{
+		PublicID:    project.PublicID,
+		Key:         project.Key,
+		Name:        project.Name,
+		Description: project.Description,
+		Status:      project.Status,
+	}
+}
+
+func (handler *ProjectHandler) ListPlatform(c *gin.Context) {
+	if handler.service == nil {
+		handler.response.InternalServerError(c, "项目服务不可用")
 		return
 	}
+	if len(c.Request.URL.Query()) != 0 {
+		handler.response.BadRequest(c, "平台项目查询参数无效")
+		return
+	}
+	projects, err := handler.service.ListPlatformProjects(
+		c.Request.Context(),
+		c.GetUint("user_id"),
+	)
+	if err != nil {
+		writeProjectError(c, handler.response, err)
+		return
+	}
+	handler.response.Success(c, projects, "获取平台项目成功")
+}
+
+func (handler *ProjectHandler) Create(c *gin.Context) {
 	var request createProjectRequest
-	if err := c.ShouldBindJSON(&request); err != nil {
+	if err := decodeStrictProjectJSON(c, &request); err != nil ||
+		models.ValidateProjectKey(request.Key) != nil {
 		handler.response.BadRequest(c, "项目参数无效")
 		return
 	}
@@ -187,7 +223,7 @@ func (handler *ProjectHandler) Create(c *gin.Context) {
 		services.CreateProjectInput{
 			OrganizationID:   request.OrganizationID,
 			BusinessUnitID:   request.BusinessUnitID,
-			Key:              strings.TrimSpace(request.Key),
+			Key:              request.Key,
 			Name:             request.Name,
 			Description:      request.Description,
 			AdministratorID:  c.GetUint("user_id"),
@@ -199,7 +235,64 @@ func (handler *ProjectHandler) Create(c *gin.Context) {
 		writeProjectError(c, handler.response, err)
 		return
 	}
-	handler.response.Created(c, project, "项目创建成功")
+	handler.response.Created(
+		c,
+		newPlatformProjectSummary(project.Project),
+		"项目创建成功",
+	)
+}
+
+func (handler *ProjectHandler) Archive(c *gin.Context) {
+	projectPublicID := c.Param("projectPublicID")
+	parsedPublicID, err := uuid.Parse(projectPublicID)
+	if err != nil ||
+		parsedPublicID.Version() != 7 ||
+		parsedPublicID.Variant() != uuid.RFC4122 ||
+		parsedPublicID.String() != projectPublicID {
+		handler.response.BadRequest(c, "项目公共 ID 无效")
+		return
+	}
+	if handler.service == nil {
+		handler.response.InternalServerError(c, "项目服务不可用")
+		return
+	}
+	project, err := handler.service.ArchiveProject(
+		c.Request.Context(),
+		projectPublicID,
+		models.HumanActor(c.GetUint("user_id")),
+	)
+	if err != nil {
+		writeProjectArchiveError(c, handler.response, err)
+		return
+	}
+	if project == nil {
+		handler.response.InternalServerError(c, "项目归档失败")
+		return
+	}
+	handler.response.Success(
+		c,
+		newPlatformProjectSummary(*project),
+		"项目已归档",
+	)
+}
+
+func decodeStrictProjectJSON(c *gin.Context, target interface{}) error {
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		return errors.New("JSON request body is required")
+	}
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("JSON request body must contain exactly one value")
+		}
+		return err
+	}
+	return binding.Validator.ValidateStruct(target)
 }
 
 func ProjectScopeMiddleware(
@@ -219,7 +312,6 @@ func ProjectScopeMiddleware(
 			c.Request.Context(),
 			c.Param("projectKey"),
 			userID,
-			isPlatformAdministrator(c),
 		)
 		if err != nil {
 			response := middleware.NewResponseHelper()
@@ -245,8 +337,6 @@ func ProjectScopeMiddleware(
 			})
 			return
 		}
-		c.Set(projectAccessContextKey, *access)
-		c.Set(projectRoleContextKey, string(access.Role))
 		originalWriter := c.Writer
 		defer func() {
 			c.Writer = originalWriter
@@ -270,6 +360,20 @@ func ProjectScopeMiddleware(
 			db,
 			access.Scope,
 			func(scopedContext context.Context) error {
+				currentAccess, revalidateErr :=
+					service.RevalidateHumanProjectAccess(
+						scopedContext,
+						access.Scope,
+						userID,
+					)
+				if revalidateErr != nil {
+					return revalidateErr
+				}
+				c.Set(projectAccessContextKey, *currentAccess)
+				c.Set(
+					projectRoleContextKey,
+					string(currentAccess.Role),
+				)
 				c.Request = c.Request.WithContext(scopedContext)
 				c.Writer = bufferedWriter
 				c.Next()
@@ -301,6 +405,13 @@ func ProjectScopeMiddleware(
 					)
 				}
 			}
+			return
+		}
+		if errors.Is(scopedErr, services.ErrProjectAccessDenied) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"code": "project_access_denied",
+				"msg":  "无权访问该项目",
+			})
 			return
 		}
 		if scopedErr != nil {
@@ -341,11 +452,53 @@ func ProjectAccessFromGin(c *gin.Context) (services.ProjectAccess, bool) {
 	return resolved, ok
 }
 
-func isPlatformAdministrator(c *gin.Context) bool {
-	return strings.EqualFold(
-		strings.TrimSpace(c.GetString("user_role")),
-		string(models.RoleAdmin),
-	)
+// RequireProjectRoles authorizes an exact allowlist using the membership that
+// ProjectScopeMiddleware resolved for this request. Project roles are not a
+// hierarchy and platform duties never participate in this decision.
+func RequireProjectRoles(allowedRoles ...models.ProjectRole) gin.HandlerFunc {
+	allowlist := make(map[models.ProjectRole]struct{}, len(allowedRoles))
+	for _, role := range allowedRoles {
+		if role.IsValid() {
+			allowlist[role] = struct{}{}
+		}
+	}
+	return func(c *gin.Context) {
+		access, ok := ProjectAccessFromGin(c)
+		if !ok || !access.Role.IsValid() {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"code": "project_access_denied",
+				"msg":  "无权访问该项目",
+			})
+			return
+		}
+		if _, allowed := allowlist[access.Role]; !allowed {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"code": "project_role_denied",
+				"msg":  "项目权限不足",
+			})
+			return
+		}
+		c.Next()
+	}
+}
+
+func writeProjectArchiveError(
+	c *gin.Context,
+	response *middleware.ResponseHelper,
+	err error,
+) {
+	switch {
+	case errors.Is(err, services.ErrProjectPublicID):
+		response.BadRequest(c, "项目公共 ID 无效")
+	case errors.Is(err, services.ErrProjectAccessDenied):
+		response.Forbidden(c, "无权归档该项目")
+	case errors.Is(err, services.ErrProjectNotFound):
+		response.NotFound(c, "项目不存在")
+	case errors.Is(err, services.ErrProjectInactive):
+		response.Error(c, http.StatusConflict, "项目当前状态不允许归档")
+	default:
+		response.InternalServerError(c, "项目归档失败")
+	}
 }
 
 func writeProjectError(

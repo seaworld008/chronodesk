@@ -47,7 +47,7 @@ import TicketWorkflowActions from './TicketWorkflowActions';
 import { TicketConversationPanel } from './TicketConversationPanel';
 import {
     canDeleteTicket,
-    canMutateTicket,
+    canEditTicket,
     type TicketRolePermissions,
 } from './ticketAccess';
 import {
@@ -56,6 +56,7 @@ import {
     type ResizableColumn,
 } from '@/components/tables/EnterpriseTable';
 import { FocusSafeDeleteButton } from '@/components/actions/FocusSafeDeleteButtons';
+import { hasProjectCapability } from '@/lib/projectScope';
 
 const ticketHistoryColumns: ResizableColumn[] = [
     { key: 'action', defaultWidth: 180, minWidth: 128, maxWidth: 320 },
@@ -579,13 +580,17 @@ const TicketShowActions = () => {
     const record = useRecordContext<Ticket>();
     const { permissions } = usePermissions<TicketRolePermissions>();
     const { identity } = useGetIdentity();
-    const canMutate = canMutateTicket(record, permissions?.role, identity?.id);
+    const canEdit = canEditTicket(
+        record,
+        permissions?.project_role,
+        identity?.id,
+    );
 
     return (
         <TopToolbar>
             <ListButton label="返回列表" />
-            {canMutate && <EditButton label="编辑" />}
-            {canDeleteTicket(permissions?.role) && (
+            {canEdit && <EditButton label="编辑" />}
+            {canDeleteTicket(permissions?.project_role) && (
                 <FocusSafeDeleteButton label="删除" mutationMode="pessimistic" />
             )}
         </TopToolbar>
@@ -596,6 +601,12 @@ const TicketShowActions = () => {
  * 工单详情页面
  */
 const TicketShow: React.FC = () => {
+    const { permissions } = usePermissions<TicketRolePermissions>();
+    const canSeeInternalNotes = hasProjectCapability(
+        permissions?.project_role,
+        'write_internal_content',
+    );
+
     return (
         <Show actions={<TicketShowActions />} title="工单详情">
             <Box sx={{ p: 0 }}>
@@ -806,7 +817,9 @@ const TicketShow: React.FC = () => {
                     {/* 附加信息 */}
                     <Tab label="附加信息">
                         <SimpleShowLayout>
-                            <TextField source="internal_notes" label="内部备注" />
+                            {canSeeInternalNotes && (
+                                <TextField source="internal_notes" label="内部备注" />
+                            )}
                             <NumberField source="view_count" label="查看次数" />
                             <NumberField source="comment_count" label="评论数量" />
                             <NumberField source="rating" label="客户评分" />

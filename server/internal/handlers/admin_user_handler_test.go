@@ -24,7 +24,7 @@ func TestAdminUserUpdateAllowsClearingPhoneAndEmailVerification(t *testing.T) {
 	user := models.User{
 		Username: "update-user", Email: "update-user@example.com",
 		Phone: "+8613800138000", PasswordHash: "hashed",
-		Role: models.RoleAgent, Status: models.UserStatusActive,
+		PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatalf("create user: %v", err)
@@ -35,7 +35,7 @@ func TestAdminUserUpdateAllowsClearingPhoneAndEmailVerification(t *testing.T) {
 	router.PUT("/users/:id", handler.UpdateUser)
 
 	body, _ := json.Marshal(map[string]any{
-		"phone":          "",
+		"phone":          "   ",
 		"display_name":   "Updated Agent",
 		"email_verified": true,
 	})
@@ -77,6 +77,51 @@ func TestAdminUserUpdateAllowsClearingPhoneAndEmailVerification(t *testing.T) {
 		t.Fatalf("invalid phone status = %d, want %d", invalidResponse.Code, http.StatusBadRequest)
 	}
 
+	validPhoneRequest := httptest.NewRequest(
+		http.MethodPut,
+		fmt.Sprintf("/users/%d", user.ID),
+		bytes.NewBufferString(`{"phone":"+8613900139000"}`),
+	)
+	validPhoneRequest.Header.Set("Content-Type", "application/json")
+	validPhoneResponse := httptest.NewRecorder()
+	router.ServeHTTP(validPhoneResponse, validPhoneRequest)
+	if validPhoneResponse.Code != http.StatusOK {
+		t.Fatalf("valid phone status = %d, body=%s", validPhoneResponse.Code, validPhoneResponse.Body.String())
+	}
+	nullPhoneRequest := httptest.NewRequest(
+		http.MethodPut,
+		fmt.Sprintf("/users/%d", user.ID),
+		bytes.NewBufferString(`{"phone":null}`),
+	)
+	nullPhoneRequest.Header.Set("Content-Type", "application/json")
+	nullPhoneResponse := httptest.NewRecorder()
+	router.ServeHTTP(nullPhoneResponse, nullPhoneRequest)
+	if nullPhoneResponse.Code != http.StatusOK {
+		t.Fatalf("null phone status = %d, body=%s", nullPhoneResponse.Code, nullPhoneResponse.Body.String())
+	}
+	if err := db.First(&persisted, user.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Phone != "+8613900139000" {
+		t.Fatalf("null phone changed persisted value to %q", persisted.Phone)
+	}
+
+	invalidManagerRequest := httptest.NewRequest(
+		http.MethodPut,
+		fmt.Sprintf("/users/%d", user.ID),
+		bytes.NewBufferString(`{"manager_id":0}`),
+	)
+	invalidManagerRequest.Header.Set("Content-Type", "application/json")
+	invalidManagerResponse := httptest.NewRecorder()
+	router.ServeHTTP(invalidManagerResponse, invalidManagerRequest)
+	if invalidManagerResponse.Code != http.StatusBadRequest {
+		t.Fatalf(
+			"invalid manager_id status = %d, want %d",
+			invalidManagerResponse.Code,
+			http.StatusBadRequest,
+		)
+	}
+
 	for _, historicalRole := range []string{"user", "superuser"} {
 		roleRequest := httptest.NewRequest(
 			http.MethodPut,
@@ -108,7 +153,7 @@ func TestAdminUserCreateMapsRetainedIdentityConflictToChinese409(t *testing.T) {
 		Username:     "retained-handler-user",
 		Email:        "retained-handler-user@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusDeleted,
 	}
 	if err := db.Create(&deleted).Error; err != nil {
@@ -123,10 +168,10 @@ func TestAdminUserCreateMapsRetainedIdentityConflictToChinese409(t *testing.T) {
 	router.POST("/users", handler.CreateUser)
 
 	body, _ := json.Marshal(map[string]any{
-		"username": "new-handler-user",
-		"email":    deleted.Email,
-		"password": "StrongPassword123!",
-		"role":     "agent",
+		"username":      "new-handler-user",
+		"email":         deleted.Email,
+		"password":      "StrongPassword123!",
+		"platform_role": "member",
 	})
 	request := httptest.NewRequest(http.MethodPost, "/users", bytes.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
@@ -142,5 +187,139 @@ func TestAdminUserCreateMapsRetainedIdentityConflictToChinese409(t *testing.T) {
 	}
 	if strings.Contains(bodyText, "SQLSTATE") || strings.Contains(bodyText, "unique constraint") {
 		t.Fatalf("response leaked database details: %s", bodyText)
+	}
+}
+
+func TestAdminUserStrictCreateValidationRejectsBeforeServiceMutation(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(&models.User{}); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewAdminUserHandler(
+		services.NewAdminUserService(db),
+	)
+	router := gin.New()
+	router.POST("/users", handler.CreateUser)
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "platform_role",
+			body: `{"username":"invalid-role","email":"role@example.test","password":"StrongPassword123!","platform_role":"bogus"}`,
+		},
+		{
+			name: "email",
+			body: `{"username":"invalid-email","email":"not-an-email","password":"StrongPassword123!","platform_role":"member"}`,
+		},
+		{
+			name: "username_length",
+			body: `{"username":"` + strings.Repeat("u", 51) + `","email":"long@example.test","password":"StrongPassword123!","platform_role":"member"}`,
+		},
+		{
+			name: "phone_e164",
+			body: `{"username":"invalid-phone","email":"phone@example.test","phone":"13800138000","password":"StrongPassword123!","platform_role":"member"}`,
+		},
+		{
+			name: "phone_empty",
+			body: `{"username":"empty-phone","email":"empty-phone@example.test","phone":"","password":"StrongPassword123!","platform_role":"member"}`,
+		},
+		{
+			name: "phone_whitespace",
+			body: `{"username":"space-phone","email":"space-phone@example.test","phone":"   ","password":"StrongPassword123!","platform_role":"member"}`,
+		},
+		{
+			name: "phone_null",
+			body: `{"username":"null-phone","email":"null-phone@example.test","phone":null,"password":"StrongPassword123!","platform_role":"member"}`,
+		},
+		{
+			name: "manager_id",
+			body: `{"username":"invalid-manager","email":"manager@example.test","password":"StrongPassword123!","platform_role":"member","manager_id":0}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/users",
+				bytes.NewBufferString(test.body),
+			)
+			request.Header.Set(
+				"Content-Type",
+				"application/json",
+			)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf(
+					"status = %d, want 400; body=%s",
+					response.Code,
+					response.Body.String(),
+				)
+			}
+			var count int64
+			if err := db.Model(&models.User{}).
+				Count(&count).Error; err != nil {
+				t.Fatal(err)
+			}
+			if count != 0 {
+				t.Fatalf(
+					"invalid request reached service mutation; users=%d",
+					count,
+				)
+			}
+		})
+	}
+}
+
+func TestAdminUserHandlerAcceptsAllPublishedListQueryParameters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(&models.User{}); err != nil {
+		t.Fatalf("migrate users: %v", err)
+	}
+	user := models.User{
+		Username:     "query-user",
+		Email:        "query-user@example.test",
+		DisplayName:  "Query User",
+		PasswordHash: "hashed",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewAdminUserHandler(services.NewAdminUserService(db))
+	router := gin.New()
+	router.GET("/users", handler.GetUserList)
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/users?page=1"+
+			"&page_size=20"+
+			"&platform_role=member"+
+			"&status=active"+
+			"&search=query-user"+
+			"&order_by=username"+
+			"&order=asc",
+		nil,
+	)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", response.Code, response.Body.String())
+	}
+	for _, expected := range []string{
+		`"username":"query-user"`,
+		`"platform_role":"member"`,
+		`"page_size":20`,
+	} {
+		if !strings.Contains(response.Body.String(), expected) {
+			t.Errorf("response is missing %s: %s", expected, response.Body.String())
+		}
 	}
 }

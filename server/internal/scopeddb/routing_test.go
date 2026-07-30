@@ -2,7 +2,10 @@ package scopeddb
 
 import (
 	"context"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
@@ -15,6 +18,63 @@ type transactionScopeTestRecord struct {
 	OrganizationID uint
 	ProjectID      uint
 	Value          string
+}
+
+var transactionScopeTestDBSequence atomic.Uint64
+
+func TestInstallIsConcurrentSafeAndIdempotentAcrossDatabases(t *testing.T) {
+	databases := []*gorm.DB{
+		openUninstalledTransactionScopeTestDB(t),
+		openUninstalledTransactionScopeTestDB(t),
+	}
+
+	const installersPerDatabase = 16
+	start := make(chan struct{})
+	errs := make(chan error, len(databases)*installersPerDatabase)
+	var installers sync.WaitGroup
+	for _, db := range databases {
+		for index := 0; index < installersPerDatabase; index++ {
+			handle := db
+			if index%2 != 0 {
+				// GORM sessions shallow-copy Config: the clone has a distinct
+				// Config pointer but shares the plugin map and callbacks.
+				handle = db.Session(&gorm.Session{})
+			}
+			installers.Add(1)
+			go func() {
+				defer installers.Done()
+				<-start
+				errs <- Install(handle)
+			}()
+		}
+	}
+
+	close(start)
+	installers.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent install: %v", err)
+		}
+	}
+
+	for _, db := range databases {
+		if _, installed := db.Plugins[pluginName]; !installed {
+			t.Fatal("routing plugin was not installed")
+		}
+		for operation, callback := range map[string]func(*gorm.DB){
+			"create": db.Callback().Create().Get(pluginName + ":create"),
+			"update": db.Callback().Update().Get(pluginName + ":update"),
+			"delete": db.Callback().Delete().Get(pluginName + ":delete"),
+			"query":  db.Callback().Query().Get(pluginName + ":query"),
+			"row":    db.Callback().Row().Get(pluginName + ":row"),
+			"raw":    db.Callback().Raw().Get(pluginName + ":raw"),
+		} {
+			if callback == nil {
+				t.Fatalf("%s routing callback was not installed", operation)
+			}
+		}
+	}
 }
 
 func TestCanReuseProjectScopeTransactionRequiresExactSingleProject(
@@ -145,8 +205,22 @@ func TestCanReuseProjectScopeTransactionRejectsAuthorizedProjectSets(
 
 func openTransactionScopeTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
+	db := openUninstalledTransactionScopeTestDB(t)
+	if err := Install(db); err != nil {
+		t.Fatalf("install transaction routing: %v", err)
+	}
+	return db
+}
+
+func openUninstalledTransactionScopeTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	databaseID := transactionScopeTestDBSequence.Add(1)
 	db, err := gorm.Open(
-		sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"),
+		sqlite.Open(
+			"file:transaction-scope-test-"+
+				strconv.FormatUint(databaseID, 10)+
+				"?mode=memory&cache=shared",
+		),
 		&gorm.Config{},
 	)
 	if err != nil {
@@ -156,12 +230,14 @@ func openTransactionScopeTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open SQL database: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := sqlDB.Close(); err != nil {
+			t.Errorf("close transaction scope test database: %v", err)
+		}
+	})
 	sqlDB.SetMaxOpenConns(1)
 	if err := db.AutoMigrate(&transactionScopeTestRecord{}); err != nil {
 		t.Fatalf("migrate transaction scope test database: %v", err)
-	}
-	if err := Install(db); err != nil {
-		t.Fatalf("install transaction routing: %v", err)
 	}
 	return db
 }

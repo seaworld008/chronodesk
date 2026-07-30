@@ -32,7 +32,7 @@ func createProfileRepoTestUser(t *testing.T, db *gorm.DB) models.User {
 		Username:     "profile_repo_user",
 		Email:        "profile_repo_user@example.com",
 		PasswordHash: "$2a$10$7EqJtq98hPqEX7fNZaFWoOPKfN6obU6fY9w7NwQDJ5D6LzA6gW6Ga",
-		Role:         models.RoleCustomer,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 

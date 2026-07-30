@@ -1036,15 +1036,33 @@ func backfillDefaultProjectMemberships(
 	scope models.ProjectScope,
 	writer ProjectScopeMembershipWriter,
 ) error {
-	var users []models.User
+	// A fresh schema already has only platform_role and no users yet. Legacy
+	// project duties can be recovered only while the destructive users.role
+	// column still exists.
+	hasLegacyRole, err := hasExactDatabaseColumn(tx, "users", "role")
+	if err != nil {
+		return err
+	}
+	if !hasLegacyRole {
+		return nil
+	}
+	type legacyProjectScopeUser struct {
+		ID           uint
+		Role         string
+		PlatformRole models.PlatformRole
+		Status       models.UserStatus
+		DeletedAt    gorm.DeletedAt
+	}
+	var legacyUsers []legacyProjectScopeUser
 	if err := tx.Unscoped().
-		Select("id", "role", "status", "deleted_at").
+		Select("id", "role", "platform_role", "status", "deleted_at").
 		Where("status = ? AND deleted_at IS NULL", models.UserStatusActive).
 		Order("id ASC").
-		Find(&users).Error; err != nil {
+		Table("users").
+		Find(&legacyUsers).Error; err != nil {
 		return fmt.Errorf("load users for default project membership: %w", err)
 	}
-	if len(users) > 0 && writer == nil {
+	if len(legacyUsers) > 0 && writer == nil {
 		return errors.New(
 			"audited project scope membership writer is required for legacy users",
 		)
@@ -1053,17 +1071,17 @@ func backfillDefaultProjectMemberships(
 	if migrationContext == nil {
 		migrationContext = context.Background()
 	}
-	for i := range users {
-		role, err := defaultProjectRoleForUser(users[i].Role)
+	for i := range legacyUsers {
+		role, err := defaultProjectRoleForLegacyUser(legacyUsers[i].Role)
 		if err != nil {
-			return fmt.Errorf("user %d: %w", users[i].ID, err)
+			return fmt.Errorf("user %d: %w", legacyUsers[i].ID, err)
 		}
 		var existing models.ProjectMembership
 		query := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where(
 				"project_id = ? AND user_id = ?",
 				scope.ProjectID,
-				users[i].ID,
+				legacyUsers[i].ID,
 			).
 			First(&existing)
 		switch {
@@ -1074,20 +1092,29 @@ func backfillDefaultProjectMemberships(
 		case !errors.Is(query.Error, gorm.ErrRecordNotFound):
 			return fmt.Errorf(
 				"load existing default project membership for user %d: %w",
-				users[i].ID,
+				legacyUsers[i].ID,
 				query.Error,
 			)
 		}
+		user := models.User{
+			ID:           legacyUsers[i].ID,
+			PlatformRole: legacyUsers[i].PlatformRole,
+			Status:       legacyUsers[i].Status,
+		}
+		if !user.PlatformRole.IsValid() {
+			user.PlatformRole = models.PlatformRoleMember
+		}
+		user.DeletedAt = legacyUsers[i].DeletedAt
 		if err := writer(
 			migrationContext,
 			tx,
-			users[i],
+			user,
 			scope,
 			role,
 		); err != nil {
 			return fmt.Errorf(
 				"backfill audited default project membership for user %d: %w",
-				users[i].ID,
+				legacyUsers[i].ID,
 				err,
 			)
 		}
@@ -1095,15 +1122,15 @@ func backfillDefaultProjectMemberships(
 	return nil
 }
 
-func defaultProjectRoleForUser(role models.UserRole) (models.ProjectRole, error) {
-	switch role {
-	case models.RoleAdmin:
+func defaultProjectRoleForLegacyUser(role string) (models.ProjectRole, error) {
+	switch strings.TrimSpace(role) {
+	case "admin":
 		return models.ProjectRoleAdmin, nil
-	case models.RoleSupervisor:
+	case "supervisor":
 		return models.ProjectRoleManager, nil
-	case models.RoleAgent:
+	case "agent":
 		return models.ProjectRoleAgent, nil
-	case models.RoleCustomer:
+	case "customer":
 		return models.ProjectRoleRequester, nil
 	default:
 		return "", fmt.Errorf("unsupported human role %q", role)

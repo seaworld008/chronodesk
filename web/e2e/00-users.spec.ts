@@ -1,4 +1,9 @@
 import { expect, test } from '@playwright/test';
+import {
+    platformRoleValues,
+    type PlatformRole,
+    type StandardErrorEnvelope,
+} from '../src/lib/generated/human-api';
 import { apiRequest } from './helpers/api';
 import {
     authenticatePage,
@@ -17,18 +22,23 @@ import { expectChineseOperations } from './helpers/browserAudit';
 
 const accountStem = E2E_ACCOUNT_STEM;
 
-const roleCases = [
-    { role: 'admin', label: '管理员' },
-    { role: 'supervisor', label: '主管' },
-    { role: 'agent', label: '客服代理' },
-    { role: 'customer', label: '客户' },
-] as const;
+const platformRoleLabels: Record<PlatformRole, string> = {
+    platform_admin: '平台管理员',
+    security_auditor: '安全审计员',
+    emergency_operator: '紧急运维员',
+    member: '普通成员',
+};
 
-test.describe('用户管理四角色与管理员保护', () => {
+const roleCases = platformRoleValues.map((platformRole) => ({
+    platformRole,
+    label: platformRoleLabels[platformRole],
+}));
+
+test.describe('平台用户管理角色与最后平台管理员保护', () => {
     test.describe.configure({ mode: 'serial' });
 
     test.beforeAll(() => {
-        assertDestructiveE2EAllowed('用户管理角色 E2E');
+        assertDestructiveE2EAllowed('平台用户管理角色 E2E');
     });
 
     test.afterAll(async ({ request }) => {
@@ -40,7 +50,7 @@ test.describe('用户管理四角色与管理员保护', () => {
         });
     });
 
-    test('RBAC-011 UI-013：最后一个活跃管理员不能被降级且提示中文', async ({
+    test('RBAC-011 UI-013：最后一个活跃平台管理员不能被降级且提示中文', async ({
         page,
         request,
     }) => {
@@ -48,50 +58,65 @@ test.describe('用户管理四角色与管理员保护', () => {
         const response = await apiRequest<Record<string, unknown>>(
             request,
             token,
-            '/api/admin/users?role=admin&status=active&page=1&page_size=100',
+            '/api/platform/users?platform_role=platform_admin&status=active&page=1&page_size=100',
         );
         const activeAdmins = extractItems<Record<string, unknown>>(response);
         test.skip(
             activeAdmins.length !== 1,
-            `当前环境有 ${activeAdmins.length} 个活跃管理员，不能安全执行最后管理员真实变更测试`,
+            `当前环境有 ${activeAdmins.length} 个活跃平台管理员，不能安全执行最后平台管理员真实变更测试`,
         );
 
         const soleAdmin = activeAdmins[0];
         expect(typeof soleAdmin.id).toBe('number');
         await authenticatePage(page);
         await page.goto(`/#/users/${soleAdmin.id}`);
-        await page.getByRole('tab', { name: '角色和权限' }).click();
+        await expect(page).toHaveURL(
+            new RegExp(`#/users/${soleAdmin.id}$`),
+        );
+        await page
+            .getByRole('tab', { name: '平台职责', exact: true })
+            .click();
 
-        await page.getByLabel('用户角色').click();
-        await page.getByRole('option', { name: '客服代理' }).click();
+        await page
+            .getByRole('combobox', { name: '平台职责', exact: true })
+            .click();
+        await page
+            .getByRole('option', { name: '普通成员', exact: true })
+            .click();
         const update = page.waitForResponse(
             (candidate) =>
                 candidate.request().method() === 'PUT' &&
                 new URL(candidate.url()).pathname ===
-                    `/api/admin/users/${soleAdmin.id}`,
+                    `/api/platform/users/${soleAdmin.id}`,
         );
         await page.getByRole('button', { name: '保存更改' }).click();
         const updateResponse = await update;
         expect(updateResponse.status()).toBe(409);
+        const updateError =
+            (await updateResponse.json()) as StandardErrorEnvelope;
+        expect(updateError.code).toBe(1);
+        expect(updateError.msg).toBe(
+            '不能停用或降级最后一个活跃平台管理员',
+        );
         await expect(
-            page.getByText('不能停用或降级最后一个活跃管理员'),
+            page.getByText('不能停用或降级最后一个活跃平台管理员'),
         ).toBeVisible({ timeout: 10_000 });
         await expectChineseOperations(page);
 
         const persisted = await apiRequest<Record<string, unknown>>(
             request,
             token,
-            `/api/admin/users/${soleAdmin.id}`,
+            `/api/platform/users/${soleAdmin.id}`,
         );
         const persistedUser = (persisted.data ?? persisted) as Record<
             string,
             unknown
         >;
-        expect(persistedUser.role).toBe('admin');
+        expect(persistedUser.platform_role).toBe('platform_admin');
         expect(persistedUser.status).toBe('active');
     });
 
-    test('RBAC-010 UI-013：创建并编辑管理员、主管、客服代理、客户', async ({
+    test('RBAC-010 UI-013：创建并编辑四种平台角色', async ({
         page,
         request,
     }) => {
@@ -100,13 +125,13 @@ test.describe('用户管理四角色与管理员保护', () => {
 
         for (const roleCase of roleCases) {
             await test.step(roleCase.label, async () => {
-                const username = `${accountStem}_${roleCase.role}`;
+                const username = `${accountStem}_${roleCase.platformRole}`;
                 const email = `${username}@example.test`;
                 const displayName = `${E2E_MARKER}${roleCase.label}-已编辑`;
 
                 await page
                     .getByRole('menuitem', {
-                        name: '用户管理',
+                        name: '平台用户管理',
                         exact: true,
                     })
                     .click();
@@ -136,8 +161,15 @@ test.describe('用户管理四角色与管理员保护', () => {
                     })
                     .fill(email);
 
-                await page.getByRole('tab', { name: '角色和权限' }).click();
-                await page.getByLabel('用户角色').click();
+                await page
+                    .getByRole('tab', { name: '平台职责', exact: true })
+                    .click();
+                await page
+                    .getByRole('combobox', {
+                        name: '平台职责',
+                        exact: true,
+                    })
+                    .click();
                 await page
                     .getByRole('option', { name: roleCase.label, exact: true })
                     .click();
@@ -150,7 +182,7 @@ test.describe('用户管理四角色与管理员保护', () => {
                     (candidate) =>
                         candidate.request().method() === 'POST' &&
                         new URL(candidate.url()).pathname ===
-                            '/api/admin/users',
+                            '/api/platform/users',
                 );
                 await page.getByRole('button', { name: '创建用户' }).click();
                 const createResponse = await create;
@@ -165,7 +197,7 @@ test.describe('用户管理四角色与管理员保护', () => {
                 });
 
                 const created = await findUserByEmail(request, token, email);
-                expect(created?.role).toBe(roleCase.role);
+                expect(created?.platform_role).toBe(roleCase.platformRole);
                 expect(typeof created?.id).toBe('number');
                 expect(created?.id).toBe(createPayload.id);
 
@@ -176,14 +208,14 @@ test.describe('用户管理四角色与管理员保护', () => {
                     (candidate) =>
                         candidate.request().method() === 'PUT' &&
                         new URL(candidate.url()).pathname ===
-                            `/api/admin/users/${created!.id}`,
+                            `/api/platform/users/${created!.id}`,
                 );
                 await page.getByRole('button', { name: '保存更改' }).click();
                 expect((await update).status()).toBe(200);
 
                 const edited = await findUserByEmail(request, token, email);
                 expect(edited?.display_name).toBe(displayName);
-                expect(edited?.role).toBe(roleCase.role);
+                expect(edited?.platform_role).toBe(roleCase.platformRole);
             });
         }
     });

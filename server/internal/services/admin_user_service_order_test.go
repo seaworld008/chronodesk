@@ -17,7 +17,7 @@ func TestAdminUserListUsesAllowlistedOrderColumns(t *testing.T) {
 		Username:     "older-user",
 		Email:        "older@example.com",
 		PasswordHash: "hash",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 		CreatedAt:    time.Now().Add(-time.Hour),
 	}
@@ -25,7 +25,7 @@ func TestAdminUserListUsesAllowlistedOrderColumns(t *testing.T) {
 		Username:     "newer-user",
 		Email:        "newer@example.com",
 		PasswordHash: "hash",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 		CreatedAt:    time.Now(),
 	}

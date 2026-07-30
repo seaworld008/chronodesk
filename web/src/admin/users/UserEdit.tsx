@@ -34,7 +34,8 @@ import {
     Warning as WarningIcon,
 } from '@mui/icons-material';
 import BackButton from '../common/BackButton';
-import { userRoleChoices } from '@/lib/accessControl';
+import { platformRoleChoices } from '@/lib/accessControl';
+import { transformUpdateAdminUser } from './adminUserTransforms';
 
 // 状态选项
 const statusChoices = [
@@ -135,22 +136,22 @@ const UserAvatarDisplay: React.FC = () => {
  */
 const RoleChangeWarning: React.FC = () => (
     <Alert severity="warning" icon={<SecurityIcon />} sx={{ mb: 3 }}>
-        <AlertTitle>角色权限提醒</AlertTitle>
+        <AlertTitle>平台职责变更提醒</AlertTitle>
         <Typography variant="body2">
-            修改用户角色将立即影响其系统访问权限：
+            修改平台职责会立即影响平台治理权限，但不会增删任何项目成员关系：
         </Typography>
         <Box component="ul" sx={{ mt: 1, mb: 0, pl: 2 }}>
             <Typography component="li" variant="body2">
-                <strong>管理员</strong>：拥有系统完全控制权限
+                <strong>平台管理员</strong>：管理平台用户、邮件和全局配置
             </Typography>
             <Typography component="li" variant="body2">
-                <strong>主管</strong>：可管理团队和工单分配
+                <strong>安全审计员</strong>：只读查看平台审计记录
             </Typography>
             <Typography component="li" variant="body2">
-                <strong>客服代理</strong>：可处理工单和客户咨询
+                <strong>紧急运维员</strong>：仅执行明确声明的紧急操作
             </Typography>
             <Typography component="li" variant="body2">
-                <strong>客户</strong>：只能查看和创建自己的工单
+                <strong>普通成员</strong>：不具备平台治理能力
             </Typography>
         </Box>
     </Alert>
@@ -205,6 +206,7 @@ const UserEdit: React.FC = () => {
             actions={<UserEditActions />}
             title="编辑用户"
             mutationMode="pessimistic"
+            transform={transformUpdateAdminUser}
         >
             <Box sx={{ maxWidth: 1200, p: 3 }}>
                 <BackButton fallbackPath="/users" />
@@ -311,14 +313,14 @@ const UserEdit: React.FC = () => {
                         </Box>
                     </FormTab>
                     
-                    {/* 角色和权限 */}
-                    <FormTab label="角色和权限" path="role">
+                    {/* 平台职责 */}
+                    <FormTab label="平台职责" path="platform-role">
                         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
                             <RoleChangeWarning />
                             
                             <Card>
                                 <CardHeader 
-                                    title="角色设置" 
+                                    title="平台职责设置"
                                     avatar={<SecurityIcon color="primary" />}
                                 />
                                 <CardContent>
@@ -326,11 +328,11 @@ const UserEdit: React.FC = () => {
                                         <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
                                             <Box sx={{ flex: 1, minWidth: '250px' }}>
                                                 <SelectInput
-                                                    source="role"
-                                                    label="用户角色"
-                                                    choices={userRoleChoices}
+                                                    source="platform_role"
+                                                    label="平台职责"
+                                                    choices={platformRoleChoices}
                                                     required
-                                                    helperText="选择用户在系统中的角色权限"
+                                                    helperText="仅控制平台治理能力，不授予任何项目职责"
                                                 />
                                             </Box>
                                             

@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 )
 
 const (
@@ -50,6 +52,12 @@ type AgentExecutionPermit struct {
 	token    string
 }
 
+type AgentExecutionRenewRequest struct {
+	Permit            *AgentExecutionPermit
+	ConcurrencyTTL    time.Duration
+	ObservedAtForTest time.Time
+}
+
 // AgentExecutionGuard is the shared authority for per-principal request rate,
 // in-flight concurrency and automation-loop windows.
 type AgentExecutionGuard interface {
@@ -57,6 +65,10 @@ type AgentExecutionGuard interface {
 	Release(context.Context, *AgentExecutionPermit) error
 	RecordLoop(context.Context, AgentLoopGuardRequest) (bool, error)
 	IsDistributed() bool
+}
+
+type AgentExecutionPermitRenewer interface {
+	Renew(context.Context, AgentExecutionRenewRequest) error
 }
 
 // RedisAgentExecutionGuard uses Redis server time and Lua scripts. This avoids
@@ -111,7 +123,11 @@ if rate_limit > 0 then
   redis.call("PEXPIRE", KEYS[1], rate_window_ms + 1000)
 end
 redis.call("ZADD", KEYS[2], now_ms + concurrency_ttl_ms, token)
-redis.call("PEXPIRE", KEYS[2], concurrency_ttl_ms + 1000)
+local concurrency_max = redis.call("ZREVRANGE", KEYS[2], 0, 0, "WITHSCORES")
+if #concurrency_max == 2 then
+  local concurrency_key_ttl = math.max(1000, tonumber(concurrency_max[2]) - now_ms + 1000)
+  redis.call("PEXPIRE", KEYS[2], concurrency_key_ttl)
+end
 return 0
 `
 
@@ -119,8 +135,33 @@ const redisReleaseAgentExecutionScript = `
 local removed = redis.call("ZREM", KEYS[1], ARGV[1])
 if redis.call("ZCARD", KEYS[1]) == 0 then
   redis.call("DEL", KEYS[1])
+else
+  local server_time = redis.call("TIME")
+  local now_ms = (tonumber(server_time[1]) * 1000) + math.floor(tonumber(server_time[2]) / 1000)
+  local concurrency_max = redis.call("ZREVRANGE", KEYS[1], 0, 0, "WITHSCORES")
+  if #concurrency_max == 2 then
+    local concurrency_key_ttl = math.max(1000, tonumber(concurrency_max[2]) - now_ms + 1000)
+    redis.call("PEXPIRE", KEYS[1], concurrency_key_ttl)
+  end
 end
 return removed
+`
+
+const redisRenewAgentExecutionScript = `
+local current = redis.call("ZSCORE", KEYS[1], ARGV[2])
+if not current then
+  return 0
+end
+local server_time = redis.call("TIME")
+local now_ms = (tonumber(server_time[1]) * 1000) + math.floor(tonumber(server_time[2]) / 1000)
+local concurrency_ttl_ms = tonumber(ARGV[1])
+redis.call("ZADD", KEYS[1], now_ms + concurrency_ttl_ms, ARGV[2])
+local concurrency_max = redis.call("ZREVRANGE", KEYS[1], 0, 0, "WITHSCORES")
+if #concurrency_max == 2 then
+  local concurrency_key_ttl = math.max(1000, tonumber(concurrency_max[2]) - now_ms + 1000)
+  redis.call("PEXPIRE", KEYS[1], concurrency_key_ttl)
+end
+return 1
 `
 
 const redisRecordAgentLoopScript = `
@@ -143,6 +184,9 @@ func (g *RedisAgentExecutionGuard) Acquire(
 	ctx context.Context,
 	request AgentExecutionGuardRequest,
 ) (*AgentExecutionPermit, error) {
+	if scopeddb.HasTransaction(ctx) {
+		return nil, ErrExternalIOInsideProjectTransaction
+	}
 	if err := validateAgentExecutionGuardRequest(request); err != nil {
 		return nil, err
 	}
@@ -191,6 +235,9 @@ func (g *RedisAgentExecutionGuard) Release(
 	if permit == nil || permit.guardKey == "" || permit.token == "" {
 		return nil
 	}
+	if scopeddb.HasTransaction(ctx) {
+		return ErrExternalIOInsideProjectTransaction
+	}
 	if _, err := g.client.Eval(
 		ctx,
 		redisReleaseAgentExecutionScript,
@@ -202,10 +249,50 @@ func (g *RedisAgentExecutionGuard) Release(
 	return nil
 }
 
+func (g *RedisAgentExecutionGuard) Renew(
+	ctx context.Context,
+	request AgentExecutionRenewRequest,
+) error {
+	if scopeddb.HasTransaction(ctx) {
+		return ErrExternalIOInsideProjectTransaction
+	}
+	if request.Permit == nil ||
+		request.Permit.guardKey == "" ||
+		request.Permit.token == "" ||
+		request.ConcurrencyTTL < time.Second {
+		return errors.New("invalid Agent execution renewal request")
+	}
+	result, err := g.client.Eval(
+		ctx,
+		redisRenewAgentExecutionScript,
+		[]string{request.Permit.guardKey},
+		request.ConcurrencyTTL.Milliseconds(),
+		request.Permit.token,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"%w: renew Redis permit: %v",
+			ErrExecutionGuardUnavailable,
+			err,
+		)
+	}
+	code, err := redisInteger(result)
+	if err != nil || code != 1 {
+		return fmt.Errorf(
+			"%w: Redis execution permit was lost",
+			ErrExecutionGuardUnavailable,
+		)
+	}
+	return nil
+}
+
 func (g *RedisAgentExecutionGuard) RecordLoop(
 	ctx context.Context,
 	request AgentLoopGuardRequest,
 ) (bool, error) {
+	if scopeddb.HasTransaction(ctx) {
+		return false, ErrExternalIOInsideProjectTransaction
+	}
 	if request.Fingerprint == "" || request.Threshold <= 0 || request.Window <= 0 {
 		return false, errors.New("invalid Agent loop guard request")
 	}
@@ -385,6 +472,36 @@ func (g *InMemoryAgentExecutionGuard) Release(
 	inFlight := g.inFlight[permit.guardKey]
 	delete(inFlight, permit.token)
 	g.setInFlight(permit.guardKey, inFlight)
+	return nil
+}
+
+func (g *InMemoryAgentExecutionGuard) Renew(
+	_ context.Context,
+	request AgentExecutionRenewRequest,
+) error {
+	if request.Permit == nil ||
+		request.Permit.guardKey == "" ||
+		request.Permit.token == "" ||
+		request.ConcurrencyTTL < time.Second {
+		return errors.New("invalid Agent execution renewal request")
+	}
+	now := request.ObservedAtForTest
+	if now.IsZero() {
+		now = time.Now()
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	inFlight := g.inFlight[request.Permit.guardKey]
+	expiresAt, exists := inFlight[request.Permit.token]
+	if !exists || !expiresAt.After(now) {
+		delete(inFlight, request.Permit.token)
+		g.setInFlight(request.Permit.guardKey, inFlight)
+		return ErrExecutionGuardUnavailable
+	}
+	inFlight[request.Permit.token] = now.Add(
+		request.ConcurrencyTTL,
+	)
+	g.inFlight[request.Permit.guardKey] = inFlight
 	return nil
 }
 

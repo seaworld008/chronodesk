@@ -31,7 +31,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		Username:     "agent1",
 		Email:        "agent1@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
@@ -216,7 +216,7 @@ func TestEscalateTicketMarksTicketAsEscalated(t *testing.T) {
 		Username:     "manager",
 		Email:        "manager@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&manager).Error; err != nil {
@@ -228,6 +228,13 @@ func TestEscalateTicketMarksTicketAsEscalated(t *testing.T) {
 		t,
 		db,
 		models.HumanActor(*ticket.CreatedByID),
+	)
+	ensureTestHumanProjectRole(
+		t,
+		db,
+		ctx,
+		manager.ID,
+		models.ProjectRoleManager,
 	)
 	updated, err := svc.EscalateTicketExpectedVersion(
 		ctx,

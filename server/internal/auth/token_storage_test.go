@@ -41,7 +41,7 @@ func newTokenStorageTestRepository(t *testing.T) (*gorm.DB, TokenRepository, Use
 		Username:     "token-storage-user",
 		Email:        "token-storage@example.test",
 		PasswordHash: "not-a-real-password",
-		Role:         models.RoleCustomer,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&modelUser).Error; err != nil {
@@ -52,7 +52,7 @@ func newTokenStorageTestRepository(t *testing.T) (*gorm.DB, TokenRepository, Use
 		Username:     modelUser.Username,
 		Email:        modelUser.Email,
 		PasswordHash: modelUser.PasswordHash,
-		Role:         RoleCustomer,
+		PlatformRole: PlatformRoleMember,
 		Status:       StatusActive,
 	}
 	return db, NewGormTokenRepository(db), user

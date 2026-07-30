@@ -7,6 +7,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 )
 
 type scriptedRedisExecution struct {
@@ -67,14 +70,23 @@ func TestRedisAgentExecutionGuardUsesOpaqueClusterSlotAndAtomicRelease(t *testin
 	if err != nil {
 		t.Fatalf("Acquire() error = %v", err)
 	}
+	if err := guard.Renew(
+		context.Background(),
+		AgentExecutionRenewRequest{
+			Permit:         permit,
+			ConcurrencyTTL: 2 * time.Minute,
+		},
+	); err != nil {
+		t.Fatalf("Renew() error = %v", err)
+	}
 	if err := guard.Release(context.Background(), permit); err != nil {
 		t.Fatalf("Release() error = %v", err)
 	}
 
 	executor.mu.Lock()
 	defer executor.mu.Unlock()
-	if len(executor.calls) != 2 {
-		t.Fatalf("Redis calls = %d, want 2", len(executor.calls))
+	if len(executor.calls) != 3 {
+		t.Fatalf("Redis calls = %d, want 3", len(executor.calls))
 	}
 	acquire := executor.calls[0]
 	if len(acquire.keys) != 2 {
@@ -90,18 +102,30 @@ func TestRedisAgentExecutionGuardUsesOpaqueClusterSlotAndAtomicRelease(t *testin
 	}
 	if !strings.Contains(acquire.script, `redis.call("TIME")`) ||
 		!strings.Contains(acquire.script, "ZREMRANGEBYSCORE") ||
-		!strings.Contains(acquire.script, "PEXPIRE") {
+		!strings.Contains(acquire.script, "PEXPIRE") ||
+		!strings.Contains(acquire.script, "ZREVRANGE") {
 		t.Fatal("acquire script is missing atomic Redis-time/TTL controls")
 	}
 	if got := acquire.args[3]; got != int64((90 * time.Second).Milliseconds()) {
 		t.Fatalf("concurrency TTL argument = %#v", got)
 	}
-	release := executor.calls[1]
+	renew := executor.calls[1]
+	if len(renew.keys) != 1 ||
+		renew.keys[0] != acquire.keys[1] ||
+		!strings.Contains(renew.script, "ZSCORE") ||
+		!strings.Contains(renew.script, "ZADD") ||
+		!strings.Contains(renew.script, "ZREVRANGE") {
+		t.Fatalf("renew call = %#v", renew)
+	}
+	release := executor.calls[2]
 	if len(release.keys) != 1 || release.keys[0] != acquire.keys[1] {
 		t.Fatalf("release key = %#v, want concurrency key", release.keys)
 	}
 	if !strings.Contains(release.script, "ZREM") {
 		t.Fatal("release must remove only its opaque lease token atomically")
+	}
+	if !strings.Contains(release.script, "ZREVRANGE") {
+		t.Fatal("release must preserve the longest remaining permit TTL")
 	}
 }
 
@@ -193,6 +217,113 @@ func TestRedisAgentLoopWindowIsSharedAcrossGuardInstances(t *testing.T) {
 	}
 }
 
+func TestRedisAgentExecutionGuardRejectsProjectTransactionWithoutEval(
+	t *testing.T,
+) {
+	db := openTestDB(t)
+	tx := db.Begin()
+	if tx.Error != nil {
+		t.Fatal(tx.Error)
+	}
+	defer tx.Rollback()
+
+	executor := &scriptedRedisExecution{}
+	guard, err := NewRedisAgentExecutionGuard(
+		executor,
+		[]byte("0123456789abcdef-test-pepper"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := models.ProjectScope{
+		OrganizationID: 1,
+		ProjectID:      1,
+	}
+	err = scopeddb.WithTransactionBinding(
+		context.Background(),
+		db,
+		tx,
+		scope,
+		func(scopedContext context.Context) error {
+			permit := &AgentExecutionPermit{
+				guardKey: "guard-key",
+				token:    "guard-token",
+			}
+			if _, acquireErr := guard.Acquire(
+				scopedContext,
+				AgentExecutionGuardRequest{
+					SubjectID:        "principal",
+					ConcurrencyLimit: 1,
+					ConcurrencyTTL:   time.Minute,
+				},
+			); !errors.Is(
+				acquireErr,
+				ErrExternalIOInsideProjectTransaction,
+			) {
+				t.Fatalf(
+					"Acquire() error = %v, want external I/O boundary",
+					acquireErr,
+				)
+			}
+			if releaseErr := guard.Release(
+				scopedContext,
+				permit,
+			); !errors.Is(
+				releaseErr,
+				ErrExternalIOInsideProjectTransaction,
+			) {
+				t.Fatalf(
+					"Release() error = %v, want external I/O boundary",
+					releaseErr,
+				)
+			}
+			if renewErr := guard.Renew(
+				scopedContext,
+				AgentExecutionRenewRequest{
+					Permit:         permit,
+					ConcurrencyTTL: time.Minute,
+				},
+			); !errors.Is(
+				renewErr,
+				ErrExternalIOInsideProjectTransaction,
+			) {
+				t.Fatalf(
+					"Renew() error = %v, want external I/O boundary",
+					renewErr,
+				)
+			}
+			if _, loopErr := guard.RecordLoop(
+				scopedContext,
+				AgentLoopGuardRequest{
+					Fingerprint: "fingerprint",
+					Threshold:   2,
+					Window:      time.Minute,
+				},
+			); !errors.Is(
+				loopErr,
+				ErrExternalIOInsideProjectTransaction,
+			) {
+				t.Fatalf(
+					"RecordLoop() error = %v, want external I/O boundary",
+					loopErr,
+				)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if len(executor.calls) != 0 {
+		t.Fatalf(
+			"Redis Eval calls inside project transaction = %d, want 0",
+			len(executor.calls),
+		)
+	}
+}
+
 func TestRequiredDistributedExecutionGuardRejectsLocalFallback(t *testing.T) {
 	db := openAgentNativeTestDB(t)
 	user := seedActorUser(t, db, "distributed-required")
@@ -278,6 +409,199 @@ func TestInMemoryAgentExecutionLeaseExpiresAfterCrashWindow(t *testing.T) {
 	request.ObservedAtForTest = now.Add(time.Minute + time.Millisecond)
 	if _, err := guard.Acquire(context.Background(), request); err != nil {
 		t.Fatalf("expired crash lease should be reclaimed: %v", err)
+	}
+}
+
+func TestRenewedExecutionPermitIsReclaimedWithinFixedCrashTTL(
+	t *testing.T,
+) {
+	guard := NewInMemoryAgentExecutionGuardForTesting()
+	now := time.Date(2026, 7, 31, 3, 0, 0, 0, time.UTC)
+	request := AgentExecutionGuardRequest{
+		SubjectID:         "fixed-crash-ttl",
+		RateLimit:         100,
+		ConcurrencyLimit:  1,
+		ConcurrencyTTL:    time.Second,
+		ObservedAtForTest: now,
+	}
+	permit, err := guard.Acquire(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.Renew(
+		context.Background(),
+		AgentExecutionRenewRequest{
+			Permit:         permit,
+			ConcurrencyTTL: time.Second,
+			ObservedAtForTest: now.Add(
+				750 * time.Millisecond,
+			),
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	request.ObservedAtForTest = now.Add(1100 * time.Millisecond)
+	if _, err := guard.Acquire(
+		context.Background(),
+		request,
+	); !errors.Is(err, ErrConcurrencyLimit) {
+		t.Fatalf("renewed active permit error = %v", err)
+	}
+	// Simulate a hard process crash: no further heartbeat and no Release.
+	request.ObservedAtForTest = now.Add(1751 * time.Millisecond)
+	if _, err := guard.Acquire(
+		context.Background(),
+		request,
+	); err != nil {
+		t.Fatalf(
+			"permit was not reclaimed one fixed TTL after the last heartbeat: %v",
+			err,
+		)
+	}
+}
+
+func TestAgentExecutionContextRenewsPastConfiguredTTL(
+	t *testing.T,
+) {
+	db := openAgentNativeTestDB(t)
+	user := seedActorUser(t, db, "execution-renewal")
+	guard := NewInMemoryAgentExecutionGuardForTesting()
+	service := NewAgentNativeService(
+		db,
+		AgentNativeOptions{
+			ExecutionGuard:    guard,
+			ExecutionLeaseTTL: time.Second,
+		},
+	)
+	principal := createNativePrincipal(
+		t,
+		service,
+		user.ID,
+		"execution-renewal-agent",
+		modelsScopeTicketsReadForGuardTest,
+	)
+	if err := db.Model(&models.ServicePrincipal{}).
+		Where("id = ?", principal.ID).
+		Update("concurrent_limit", 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	leaseContext, release, err :=
+		service.AcquireAgentExecutionContext(
+			context.Background(),
+			principal.ID,
+		)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	time.Sleep(1300 * time.Millisecond)
+	if err := leaseContext.Err(); err != nil {
+		t.Fatalf("active renewed context was cancelled: %v", err)
+	}
+	if _, secondRelease, err :=
+		service.AcquireAgentExecutionContext(
+			context.Background(),
+			principal.ID,
+		); !errors.Is(err, ErrConcurrencyLimit) {
+		if secondRelease != nil {
+			secondRelease()
+		}
+		t.Fatalf(
+			"second command after initial TTL error = %v, want concurrency limit",
+			err,
+		)
+	}
+	release()
+	if _, nextRelease, err :=
+		service.AcquireAgentExecutionContext(
+			context.Background(),
+			principal.ID,
+		); err != nil {
+		t.Fatalf("command after release: %v", err)
+	} else {
+		nextRelease()
+	}
+}
+
+type renewalFailingExecutionGuard struct {
+	inner *InMemoryAgentExecutionGuard
+}
+
+func (guard *renewalFailingExecutionGuard) Acquire(
+	ctx context.Context,
+	request AgentExecutionGuardRequest,
+) (*AgentExecutionPermit, error) {
+	return guard.inner.Acquire(ctx, request)
+}
+
+func (guard *renewalFailingExecutionGuard) Release(
+	ctx context.Context,
+	permit *AgentExecutionPermit,
+) error {
+	return guard.inner.Release(ctx, permit)
+}
+
+func (guard *renewalFailingExecutionGuard) RecordLoop(
+	ctx context.Context,
+	request AgentLoopGuardRequest,
+) (bool, error) {
+	return guard.inner.RecordLoop(ctx, request)
+}
+
+func (*renewalFailingExecutionGuard) Renew(
+	context.Context,
+	AgentExecutionRenewRequest,
+) error {
+	return errors.New("renewal authority unavailable")
+}
+
+func (*renewalFailingExecutionGuard) IsDistributed() bool {
+	return false
+}
+
+func TestAgentExecutionContextCancelsWhenRenewalFails(
+	t *testing.T,
+) {
+	db := openAgentNativeTestDB(t)
+	user := seedActorUser(t, db, "execution-renewal-fail")
+	service := NewAgentNativeService(
+		db,
+		AgentNativeOptions{
+			ExecutionGuard: &renewalFailingExecutionGuard{
+				inner: NewInMemoryAgentExecutionGuardForTesting(),
+			},
+			ExecutionLeaseTTL: time.Second,
+		},
+	)
+	principal := createNativePrincipal(
+		t,
+		service,
+		user.ID,
+		"execution-renewal-fail-agent",
+		modelsScopeTicketsReadForGuardTest,
+	)
+	leaseContext, release, err :=
+		service.AcquireAgentExecutionContext(
+			context.Background(),
+			principal.ID,
+		)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	select {
+	case <-leaseContext.Done():
+		if !errors.Is(
+			context.Cause(leaseContext),
+			ErrExecutionGuardUnavailable,
+		) {
+			t.Fatalf(
+				"renewal cancellation cause = %v",
+				context.Cause(leaseContext),
+			)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("renewal failure did not cancel command context")
 	}
 }
 

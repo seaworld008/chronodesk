@@ -60,5 +60,6 @@ func (s *AgentNativeService) releaseTicketLease(
 	actor models.ActorRef,
 	reason string,
 ) error {
-	return s.releaseTicketLeaseOnDB(ctx, s.db, leaseID, actor, reason)
+	_, err := s.releaseTicketLeaseOnDB(ctx, s.db, leaseID, actor, reason)
+	return err
 }

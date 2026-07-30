@@ -1,8 +1,36 @@
+import { HttpError } from 'react-admin'
+import {
+  isProjectScopedApiPath,
+  signalProjectAccessInvalidated,
+  signalSessionInvalidated,
+} from './projectScopeEvents'
+import { joinApiUrl } from './apiUrl'
+
 export type ApiOptions = RequestInit & { rawResponse?: boolean }
 
 const API_BASE = (import.meta.env.VITE_API_URL ?? '/api').toString().replace(/\/$/, '')
 
-const toUrl = (path: string) => `${API_BASE}${path.startsWith('/') ? path : `/${path}`}`
+const toUrl = (path: string) => joinApiUrl(API_BASE, path)
+
+const requestPath = (input: RequestInfo | URL): string => {
+  if (typeof input === 'string') return input
+  if (input instanceof URL) return input.toString()
+  return input.url
+}
+
+export const sessionAwareFetch = async (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response> => {
+  const response = await fetch(input, init)
+  const path = requestPath(input)
+  if (response.status === 401) {
+    signalSessionInvalidated()
+  } else if (response.status === 403 && isProjectScopedApiPath(path)) {
+    signalProjectAccessInvalidated()
+  }
+  return response
+}
 
 type JsonRecord = Record<string, unknown>
 
@@ -132,7 +160,7 @@ export async function apiFetch<T = unknown>(path: string, options: ApiOptions = 
 
   let response: Response
   try {
-    response = await fetch(toUrl(path), {
+    response = await sessionAwareFetch(toUrl(path), {
       ...options,
       headers,
     })
@@ -156,7 +184,11 @@ export async function apiFetch<T = unknown>(path: string, options: ApiOptions = 
   }
 
   if (!response.ok) {
-    throw new Error(localizedApiErrorMessage(parsed, response.status))
+    throw new HttpError(
+      localizedApiErrorMessage(parsed, response.status),
+      response.status,
+      parsed,
+    )
   }
 
   if (isJsonRecord(parsed)) {

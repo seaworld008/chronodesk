@@ -10,7 +10,7 @@ import (
 	"gorm.io/gorm"
 )
 
-func TestGormUserRepositoryRejectsRolesOutsideClosedHumanEnum(t *testing.T) {
+func TestGormUserRepositoryRejectsRolesOutsideClosedPlatformEnum(t *testing.T) {
 	db, err := gorm.Open(
 		sqlite.Open("file:auth-closed-human-roles?mode=memory&cache=shared"),
 		&gorm.Config{},
@@ -23,22 +23,28 @@ func TestGormUserRepositoryRejectsRolesOutsideClosedHumanEnum(t *testing.T) {
 	}
 	repository := NewGormUserRepository(db).(*GormUserRepository)
 
-	for _, role := range []UserRole{UserRole("user"), UserRole("superuser"), UserRole("unknown")} {
+	for _, role := range []PlatformRole{
+		PlatformRole("admin"),
+		PlatformRole("supervisor"),
+		PlatformRole("agent"),
+		PlatformRole("customer"),
+		PlatformRole("unknown"),
+	} {
 		user := &User{
 			ID:           1,
 			Username:     "invalid-role",
 			Email:        "invalid-role@example.test",
 			PasswordHash: "hash",
-			Role:         role,
+			PlatformRole: role,
 			Status:       StatusActive,
 		}
 		if err := repository.Create(context.Background(), user); err == nil ||
-			!strings.Contains(err.Error(), "invalid human role") {
-			t.Errorf("Create role %q error = %v, want invalid human role", role, err)
+			!strings.Contains(err.Error(), "invalid platform role") {
+			t.Errorf("Create role %q error = %v, want invalid platform role", role, err)
 		}
 		if err := repository.Update(context.Background(), user); err == nil ||
-			!strings.Contains(err.Error(), "invalid human role") {
-			t.Errorf("Update role %q error = %v, want invalid human role", role, err)
+			!strings.Contains(err.Error(), "invalid platform role") {
+			t.Errorf("Update role %q error = %v, want invalid platform role", role, err)
 		}
 	}
 }

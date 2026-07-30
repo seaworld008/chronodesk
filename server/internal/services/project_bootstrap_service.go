@@ -12,6 +12,7 @@ import (
 
 const bootstrapProjectAdministratorActor = "chronodesk-bootstrap"
 const projectScopeMigrationMembershipActor = "chronodesk-project-scope-migration"
+const sampleProjectMembershipActor = "chronodesk-sample-data"
 
 // EnsureBootstrapProjectAdministratorMembership is the trusted composition
 // seam used by the explicit seed command. The caller supplies its open seed
@@ -23,7 +24,7 @@ func EnsureBootstrapProjectAdministratorMembership(
 	administrator models.User,
 	scope models.ProjectScope,
 ) error {
-	if administrator.Role != models.RoleAdmin {
+	if administrator.PlatformRole != models.PlatformRolePlatformAdmin {
 		return errors.New("bootstrap project administrator identity is invalid")
 	}
 	return ensureBootstrapProjectMembership(
@@ -57,6 +58,26 @@ func EnsureProjectScopeMigrationMembership(
 	)
 }
 
+// EnsureSampleProjectMembership gives development-only sample users explicit
+// project duties through the same event, Outbox and audit path as production
+// membership administration.
+func EnsureSampleProjectMembership(
+	ctx context.Context,
+	tx *gorm.DB,
+	user models.User,
+	scope models.ProjectScope,
+	role models.ProjectRole,
+) error {
+	return ensureBootstrapProjectMembership(
+		ctx,
+		tx,
+		user,
+		scope,
+		role,
+		sampleProjectMembershipActor,
+	)
+}
+
 func ensureBootstrapProjectMembership(
 	ctx context.Context,
 	tx *gorm.DB,
@@ -75,7 +96,7 @@ func ensureBootstrapProjectMembership(
 		return errors.New("bootstrap project membership requires an active transaction")
 	}
 	if user.ID == 0 ||
-		!user.Role.IsValid() ||
+		!user.PlatformRole.IsValid() ||
 		user.Status != models.UserStatusActive ||
 		!role.IsValid() {
 		return errors.New("bootstrap project membership identity or role is invalid")

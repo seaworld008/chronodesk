@@ -99,30 +99,30 @@ func TestSystemHandlerRegistersCleanupRoutesOnly(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	handler := &SystemHandler{}
-	handler.RegisterRoutes(router.Group("/api/admin"))
+	handler.RegisterRoutes(router.Group("/api/platform"))
 
 	paths := make([]string, 0)
 	for _, route := range router.Routes() {
 		paths = append(paths, route.Method+" "+route.Path)
 	}
 	for _, expected := range []string{
-		"GET /api/admin/system/cleanup/config",
-		"PUT /api/admin/system/cleanup/config",
-		"POST /api/admin/system/cleanup/execute",
-		"POST /api/admin/system/cleanup/execute-all",
-		"GET /api/admin/system/cleanup/logs",
-		"GET /api/admin/system/cleanup/stats",
+		"GET /api/platform/system/cleanup/config",
+		"PUT /api/platform/system/cleanup/config",
+		"POST /api/platform/system/cleanup/execute",
+		"POST /api/platform/system/cleanup/execute-all",
+		"GET /api/platform/system/cleanup/logs",
+		"GET /api/platform/system/cleanup/stats",
 	} {
 		if !slices.Contains(paths, expected) {
 			t.Errorf("missing route %q in %v", expected, paths)
 		}
 	}
 	for _, route := range paths {
-		if route == "GET /api/admin/system/configs" ||
-			route == "POST /api/admin/system/configs" ||
-			route == "GET /api/admin/system/configs/:key" ||
-			route == "PUT /api/admin/system/configs/:key" ||
-			route == "DELETE /api/admin/system/configs/:key" {
+		if route == "GET /api/platform/system/configs" ||
+			route == "POST /api/platform/system/configs" ||
+			route == "GET /api/platform/system/configs/:key" ||
+			route == "PUT /api/platform/system/configs/:key" ||
+			route == "DELETE /api/platform/system/configs/:key" {
 			t.Errorf("duplicate config route remains registered: %s", route)
 		}
 	}

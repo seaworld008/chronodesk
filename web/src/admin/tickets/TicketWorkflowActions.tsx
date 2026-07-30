@@ -34,7 +34,19 @@ import {
 } from 'react-admin';
 import { Ticket, TicketPriority, TicketStatus } from '@/types';
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient';
-import { canMutateTicket, type TicketRolePermissions } from './ticketAccess';
+import {
+    humanApiRoutes,
+    type AssignTicketRequest,
+    type EscalateTicketRequest,
+    type TransferTicketRequest,
+    type UpdateTicketStatusRequest,
+} from '@/lib/generated/human-api';
+import { resolveActiveProjectKey } from '@/lib/projectScope';
+import {
+    canAssignTicket,
+    canUseTicketWorkflow,
+    type TicketRolePermissions,
+} from './ticketAccess';
 
 // 工单状态流转定义
 const TICKET_WORKFLOWS: Record<TicketStatus, TicketStatus[]> = {
@@ -128,7 +140,10 @@ const TicketWorkflowActions: React.FC = () => {
         const actions: WorkflowAction[] = [];
         
         // 分配操作（未分配或重新分配）
-        if (!record.assigned_to_id || record.status === 'open') {
+        if (
+            canAssign &&
+            (!record.assigned_to_id || record.status === 'open')
+        ) {
             actions.push({
                 type: 'assign',
                 label: record.assigned_to_id ? '重新分配' : '分配工单',
@@ -139,7 +154,11 @@ const TicketWorkflowActions: React.FC = () => {
         }
 
         // 转移操作（已分配的工单）
-        if (record.assigned_to_id && ['open', 'in_progress'].includes(record.status)) {
+        if (
+            canAssign &&
+            record.assigned_to_id &&
+            ['open', 'in_progress'].includes(record.status)
+        ) {
             actions.push({
                 type: 'transfer', 
                 label: '转移工单',
@@ -150,7 +169,10 @@ const TicketWorkflowActions: React.FC = () => {
         }
 
         // 升级操作
-        if (['open', 'in_progress', 'pending'].includes(record.status)) {
+        if (
+            canAssign &&
+            ['open', 'in_progress', 'pending'].includes(record.status)
+        ) {
             actions.push({
                 type: 'escalate',
                 label: '升级工单',
@@ -162,7 +184,7 @@ const TicketWorkflowActions: React.FC = () => {
 
         // 状态变更
         const availableStatuses = TICKET_WORKFLOWS[record.status as keyof typeof TICKET_WORKFLOWS];
-        if (availableStatuses.length > 0) {
+        if (canUseWorkflow && availableStatuses.length > 0) {
             actions.push({
                 type: 'status_change',
                 label: '状态变更',
@@ -183,31 +205,69 @@ const TicketWorkflowActions: React.FC = () => {
             if (!Number.isSafeInteger(record.version) || record.version <= 0) {
                 throw new Error('工单版本信息缺失，请刷新页面后重试');
             }
+            const pathParameters = {
+                projectKey: await resolveActiveProjectKey(),
+                ticketID: Number(record.id),
+            };
             let endpoint = '';
-            const payload: Record<string, unknown> = { comment };
+            let payload:
+                | AssignTicketRequest
+                | TransferTicketRequest
+                | EscalateTicketRequest
+                | UpdateTicketStatusRequest;
 
             switch (currentAction.type) {
-                case 'assign':
-                    endpoint = `/tickets/${record.id}/assign`;
-                    payload.assigned_to_id = assigneeId;
+                case 'assign': {
+                    if (!assigneeId) {
+                        throw new Error('请选择工单负责人');
+                    }
+                    endpoint = humanApiRoutes.assignProjectTicket(pathParameters);
+                    payload = {
+                        assigned_to_id: assigneeId,
+                        ...(comment ? { comment } : {}),
+                    };
                     break;
-                
-                case 'transfer':
-                    endpoint = `/tickets/${record.id}/transfer`;
-                    payload.department = transferDepartment;
-                    payload.assigned_to_id = assigneeId;
+                }
+                case 'transfer': {
+                    if (!assigneeId) {
+                        throw new Error('请选择工单接收人');
+                    }
+                    endpoint = humanApiRoutes.transferProjectTicket(pathParameters);
+                    payload = {
+                        assigned_to_id: assigneeId,
+                        ...(transferDepartment
+                            ? { department: transferDepartment }
+                            : {}),
+                        ...(comment ? { comment } : {}),
+                    };
                     break;
-                
-                case 'escalate':
-                    endpoint = `/tickets/${record.id}/escalate`;
-                    payload.reason = escalationReason;
-                    payload.escalate_to_id = assigneeId;
+                }
+                case 'escalate': {
+                    if (!assigneeId) {
+                        throw new Error('请选择升级接收人');
+                    }
+                    endpoint = humanApiRoutes.escalateProjectTicket(pathParameters);
+                    payload = {
+                        reason: escalationReason,
+                        escalate_to_id: assigneeId,
+                        ...(comment ? { comment } : {}),
+                    };
                     break;
-                
-                case 'status_change':
-                    endpoint = `/tickets/${record.id}/status`;
-                    payload.status = newStatus;
+                }
+                case 'status_change': {
+                    if (!newStatus) {
+                        throw new Error('请选择新状态');
+                    }
+                    endpoint =
+                        humanApiRoutes.updateProjectTicketStatus(pathParameters);
+                    payload = {
+                        status: newStatus,
+                        ...(comment ? { comment } : {}),
+                    };
                     break;
+                }
+                default:
+                    throw new Error('不支持的工单工作流操作');
             }
 
             await apiFetch(endpoint, {
@@ -245,8 +305,18 @@ const TicketWorkflowActions: React.FC = () => {
         setDialogOpen(true);
     };
 
-    const canMutate = canMutateTicket(record, permissions?.role, identity?.id);
-    const availableActions = canMutate ? getAvailableActions() : [];
+    const canUseWorkflow = canUseTicketWorkflow(
+        record,
+        permissions?.project_role,
+        identity?.id,
+    );
+    const canAssign = canAssignTicket(
+        record,
+        permissions?.project_role,
+        identity?.id,
+    );
+    const availableActions =
+        canUseWorkflow || canAssign ? getAvailableActions() : [];
 
     return (
         <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
@@ -265,7 +335,13 @@ const TicketWorkflowActions: React.FC = () => {
                 {record.is_overdue && (
                     <Chip label="已逾期" color="error" size="small" />
                 )}
-                {!canMutate && <Chip label="只读" size="small" variant="outlined" />}
+                {!canUseWorkflow && !canAssign && (
+                    <Chip
+                        label="无工作流权限"
+                        size="small"
+                        variant="outlined"
+                    />
+                )}
             </Box>
 
             {/* 操作按钮 */}

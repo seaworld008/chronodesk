@@ -1,4 +1,10 @@
 import type { APIRequestContext } from '@playwright/test';
+import { platformRoleValues } from '../../src/lib/generated/human-api';
+import type {
+    AuthSession as GeneratedAuthSession,
+    HumanSessionUser as GeneratedHumanSessionUser,
+    PlatformRole as GeneratedPlatformRole,
+} from '../../src/lib/generated/human-api';
 import { assertDestructiveE2EAllowed } from './safety';
 
 export type Credentials = {
@@ -6,12 +12,32 @@ export type Credentials = {
     password: string;
 };
 
-export type AuthSession = {
-    access_token: string;
-    refresh_token?: string;
-    user?: Record<string, unknown>;
-    permissions?: unknown;
-    expires_in?: number;
+export type PlatformRole = GeneratedPlatformRole;
+export type HumanSessionUser = GeneratedHumanSessionUser;
+export type AuthSession = GeneratedAuthSession;
+
+const isPlatformRole = (value: unknown): value is PlatformRole =>
+    typeof value === 'string' &&
+    platformRoleValues.some((role) => role === value);
+
+const isHumanSessionUser = (value: unknown): value is HumanSessionUser => {
+    if (!value || typeof value !== 'object') {
+        return false;
+    }
+    const user = value as Record<string, unknown>;
+    return (
+        typeof user.id === 'number' &&
+        Number.isSafeInteger(user.id) &&
+        user.id > 0 &&
+        typeof user.username === 'string' &&
+        typeof user.email === 'string' &&
+        isPlatformRole(user.platform_role) &&
+        ['active', 'inactive', 'suspended', 'deleted'].includes(
+            typeof user.status === 'string' ? user.status : '',
+        ) &&
+        typeof user.email_verified === 'boolean' &&
+        typeof user.otp_enabled === 'boolean'
+    );
 };
 
 const extractErrorMessage = (payload: unknown): string => {
@@ -43,9 +69,22 @@ export const loginSession = async (
         throw new Error(extractErrorMessage(payload));
     }
 
-    const data = (payload.data ?? {}) as Partial<AuthSession>;
-    if (!data.access_token) {
+    const data = (payload.data ?? {}) as Record<string, unknown>;
+    if (typeof data.access_token !== 'string' || data.access_token.length === 0) {
         throw new Error('登录响应缺少 access_token');
+    }
+    if (!isHumanSessionUser(data.user)) {
+        throw new Error('登录响应缺少合法的 platform_role 用户身份');
+    }
+    if (
+        typeof data.refresh_token !== 'string' ||
+        data.refresh_token.length === 0 ||
+        typeof data.expires_in !== 'number' ||
+        !Number.isSafeInteger(data.expires_in) ||
+        data.expires_in <= 0 ||
+        data.token_type !== 'Bearer'
+    ) {
+        throw new Error('登录响应缺少合法的刷新令牌或过期信息');
     }
 
     return data as AuthSession;

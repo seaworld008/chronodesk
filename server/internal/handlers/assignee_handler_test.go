@@ -28,15 +28,15 @@ func TestAssigneeHandlerReturnsOnlyActiveAssignableUsers(t *testing.T) {
 	users := []models.User{
 		{
 			Username: "active-agent", Email: "active-agent@example.com",
-			PasswordHash: "hashed", Role: models.RoleAgent, Status: models.UserStatusActive,
+			PasswordHash: "hashed", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 		},
 		{
 			Username: "active-customer", Email: "active-customer@example.com",
-			PasswordHash: "hashed", Role: models.RoleCustomer, Status: models.UserStatusActive,
+			PasswordHash: "hashed", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 		},
 		{
 			Username: "inactive-agent", Email: "inactive-agent@example.com",
-			PasswordHash: "hashed", Role: models.RoleAgent, Status: models.UserStatusInactive,
+			PasswordHash: "hashed", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusInactive,
 		},
 	}
 	if err := db.Create(&users).Error; err != nil {

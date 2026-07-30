@@ -34,8 +34,8 @@ func (r *GormUserRepository) Create(ctx context.Context, user *User) error {
 	if user == nil {
 		return ErrUserNotFound
 	}
-	if !user.Role.IsValid() {
-		return errors.New("invalid human role")
+	if !user.PlatformRole.IsValid() {
+		return errors.New("invalid platform role")
 	}
 	if !isValidUserStatus(user.Status) {
 		return ErrInvalidAccountState
@@ -48,7 +48,7 @@ func (r *GormUserRepository) Create(ctx context.Context, user *User) error {
 		Username:         user.Username,
 		Email:            user.Email,
 		PasswordHash:     user.PasswordHash,
-		Role:             models.UserRole(user.Role),
+		PlatformRole:     models.PlatformRole(user.PlatformRole),
 		Status:           user.Status,
 		EmailVerified:    user.EmailVerified,
 		EmailVerifiedAt:  user.EmailVerifiedAt,
@@ -131,8 +131,8 @@ func (r *GormUserRepository) Update(ctx context.Context, user *User) error {
 	if user == nil || user.ID == 0 {
 		return ErrUserNotFound
 	}
-	if !user.Role.IsValid() {
-		return errors.New("invalid human role")
+	if !user.PlatformRole.IsValid() {
+		return errors.New("invalid platform role")
 	}
 	if !isValidUserStatus(user.Status) {
 		return ErrInvalidAccountState
@@ -142,7 +142,7 @@ func (r *GormUserRepository) Update(ctx context.Context, user *User) error {
 		"username":          user.Username,
 		"email":             user.Email,
 		"password_hash":     user.PasswordHash,
-		"role":              models.UserRole(user.Role),
+		"platform_role":     models.PlatformRole(user.PlatformRole),
 		"status":            user.Status,
 		"email_verified":    user.EmailVerified,
 		"email_verified_at": user.EmailVerifiedAt,
@@ -434,7 +434,7 @@ func (r *GormUserRepository) convertToAuthUser(modelUser *models.User) (*User, e
 		Username:          modelUser.Username,
 		Email:             modelUser.Email,
 		PasswordHash:      modelUser.PasswordHash,
-		Role:              UserRole(modelUser.Role),
+		PlatformRole:      PlatformRole(modelUser.PlatformRole),
 		Status:            modelUser.Status,
 		EmailVerified:     modelUser.EmailVerified,
 		EmailVerifiedAt:   modelUser.EmailVerifiedAt,

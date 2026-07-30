@@ -255,7 +255,7 @@ func newIntegrationHandlerEnvironment(t *testing.T) integrationHandlerEnvironmen
 		Username:     "integration-manager",
 		Email:        "integration-manager@example.test",
 		PasswordHash: "test-only",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {

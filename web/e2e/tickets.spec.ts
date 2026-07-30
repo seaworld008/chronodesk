@@ -110,7 +110,9 @@ test.describe('Navigation', () => {
     });
 
     test('should navigate to users page', async ({ page }) => {
-        await page.getByRole('menuitem', { name: '用户管理' }).click();
+        await page
+            .getByRole('menuitem', { name: '平台用户管理' })
+            .click();
         await expect(page).toHaveURL(/#\/users/);
     });
 

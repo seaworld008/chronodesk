@@ -52,6 +52,106 @@ func TestRedisAgentExecutionGuardIntegration(t *testing.T) {
 		_ = client.Close()
 	})
 
+	renewRequest := services.AgentExecutionGuardRequest{
+		SubjectID:        "release-gate-renew-" + randomID,
+		RateLimit:        100,
+		ConcurrencyLimit: 1,
+		ConcurrencyTTL:   2 * time.Second,
+	}
+	renewed, err := guard.Acquire(ctx, renewRequest)
+	if err != nil {
+		t.Fatalf("renew probe acquire failed: %v", err)
+	}
+	time.Sleep(1200 * time.Millisecond)
+	if err := guard.Renew(
+		ctx,
+		services.AgentExecutionRenewRequest{
+			Permit:         renewed,
+			ConcurrencyTTL: 2 * time.Second,
+		},
+	); err != nil {
+		t.Fatalf("renew probe failed: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if _, err := secondProcessGuard.Acquire(
+		ctx,
+		renewRequest,
+	); !errors.Is(err, services.ErrConcurrencyLimit) {
+		t.Fatalf(
+			"renewed permit was not shared across guard instances: %v",
+			err,
+		)
+	}
+	if err := guard.Release(ctx, renewed); err != nil {
+		t.Fatalf("renewed permit release failed: %v", err)
+	}
+	afterRenewRelease, err := secondProcessGuard.Acquire(
+		ctx,
+		renewRequest,
+	)
+	if err != nil {
+		t.Fatalf(
+			"acquire after renewed permit release failed: %v",
+			err,
+		)
+	}
+	if err := secondProcessGuard.Release(
+		ctx,
+		afterRenewRelease,
+	); err != nil {
+		t.Fatalf("post-renew release failed: %v", err)
+	}
+
+	mixedSubject := "release-gate-mixed-ttl-" + randomID
+	longPermit, err := guard.Acquire(
+		ctx,
+		services.AgentExecutionGuardRequest{
+			SubjectID:        mixedSubject,
+			RateLimit:        100,
+			ConcurrencyLimit: 2,
+			ConcurrencyTTL:   10 * time.Second,
+		},
+	)
+	if err != nil {
+		t.Fatalf("mixed TTL long acquire failed: %v", err)
+	}
+	shortPermit, err := secondProcessGuard.Acquire(
+		ctx,
+		services.AgentExecutionGuardRequest{
+			SubjectID:        mixedSubject,
+			RateLimit:        100,
+			ConcurrencyLimit: 2,
+			ConcurrencyTTL:   time.Second,
+		},
+	)
+	if err != nil {
+		t.Fatalf("mixed TTL short acquire failed: %v", err)
+	}
+	time.Sleep(2100 * time.Millisecond)
+	if _, err := secondProcessGuard.Acquire(
+		ctx,
+		services.AgentExecutionGuardRequest{
+			SubjectID:        mixedSubject,
+			RateLimit:        100,
+			ConcurrencyLimit: 1,
+			ConcurrencyTTL:   time.Second,
+		},
+	); !errors.Is(err, services.ErrConcurrencyLimit) {
+		t.Fatalf(
+			"short permit truncated long permit key TTL: %v",
+			err,
+		)
+	}
+	if err := guard.Release(ctx, longPermit); err != nil {
+		t.Fatalf("mixed TTL long release failed: %v", err)
+	}
+	if err := secondProcessGuard.Release(
+		ctx,
+		shortPermit,
+	); err != nil {
+		t.Fatalf("mixed TTL short release failed: %v", err)
+	}
+
 	request := services.AgentExecutionGuardRequest{
 		SubjectID:        principalID,
 		RateLimit:        2,

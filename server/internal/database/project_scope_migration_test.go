@@ -291,11 +291,11 @@ func TestMigrateProjectScopeBackfillsLegacyChildEventAndDeliveryRows(t *testing.
 
 func TestMigrateProjectScopeBackfillsDefaultAuthorizationIdempotently(t *testing.T) {
 	db := openProjectScopeMigrationDB(t, "idempotent")
-	users := []models.User{
-		projectScopeMigrationUser("admin", models.RoleAdmin),
-		projectScopeMigrationUser("supervisor", models.RoleSupervisor),
-		projectScopeMigrationUser("agent", models.RoleAgent),
-		projectScopeMigrationUser("customer", models.RoleCustomer),
+	users := []projectScopeMigrationLegacyUser{
+		projectScopeMigrationUser("admin", "admin"),
+		projectScopeMigrationUser("supervisor", "supervisor"),
+		projectScopeMigrationUser("agent", "agent"),
+		projectScopeMigrationUser("customer", "customer"),
 	}
 	if err := db.Create(&users).Error; err != nil {
 		t.Fatalf("seed users: %v", err)
@@ -424,7 +424,7 @@ func TestMigrateProjectScopeBackfillsDefaultAuthorizationIdempotently(t *testing
 		}).Error; err != nil {
 		t.Fatal(err)
 	}
-	newUser := projectScopeMigrationUser("late-agent", models.RoleAgent)
+	newUser := projectScopeMigrationUser("late-agent", "agent")
 	if err := db.Create(&newUser).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -576,7 +576,7 @@ func TestMigrateProjectScopeCheckpointProtectsLiveMultiProjectData(
 	}
 	originalPublicID := otherTicket.PublicID
 
-	lateUser := projectScopeMigrationUser("other-only-user", models.RoleAgent)
+	lateUser := projectScopeMigrationUser("other-only-user", "agent")
 	if err := db.Create(&lateUser).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -673,9 +673,9 @@ func TestMigrateProjectScopeWritesCheckpointOnlyAfterAtomicBackfill(
 	t *testing.T,
 ) {
 	db := openProjectScopeMigrationDB(t, "checkpoint-after-backfill")
-	users := []models.User{
-		projectScopeMigrationUser("first-legacy-user", models.RoleAdmin),
-		projectScopeMigrationUser("second-legacy-user", models.RoleAgent),
+	users := []projectScopeMigrationLegacyUser{
+		projectScopeMigrationUser("first-legacy-user", "admin"),
+		projectScopeMigrationUser("second-legacy-user", "agent"),
 	}
 	if err := db.Create(&users).Error; err != nil {
 		t.Fatal(err)
@@ -795,7 +795,7 @@ func TestMigrateProjectScopeRequiresAuditedWriterForLegacyUsers(
 	t *testing.T,
 ) {
 	db := openProjectScopeMigrationDB(t, "membership-writer-required")
-	user := projectScopeMigrationUser("legacy-admin", models.RoleAdmin)
+	user := projectScopeMigrationUser("legacy-admin", "admin")
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -887,18 +887,38 @@ func openProjectScopeMigrationDB(t *testing.T, suffix string) *gorm.DB {
 	); err != nil {
 		t.Fatalf("migrate project scope fixture: %v", err)
 	}
+	if err := db.Exec(
+		"ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'customer'",
+	).Error; err != nil {
+		t.Fatalf("add legacy user role fixture: %v", err)
+	}
 	return db
+}
+
+type projectScopeMigrationLegacyUser struct {
+	ID           uint                `gorm:"primaryKey;autoIncrement"`
+	Username     string              `gorm:"size:50;not null"`
+	Email        string              `gorm:"size:100;not null"`
+	PasswordHash string              `gorm:"size:255;not null"`
+	Role         string              `gorm:"size:20;not null"`
+	PlatformRole models.PlatformRole `gorm:"size:30;not null"`
+	Status       models.UserStatus   `gorm:"size:20;not null"`
+}
+
+func (projectScopeMigrationLegacyUser) TableName() string {
+	return "users"
 }
 
 func projectScopeMigrationUser(
 	name string,
-	role models.UserRole,
-) models.User {
-	return models.User{
+	role string,
+) projectScopeMigrationLegacyUser {
+	return projectScopeMigrationLegacyUser{
 		Username:     name,
 		Email:        name + "@example.test",
 		PasswordHash: "hash",
 		Role:         role,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 }

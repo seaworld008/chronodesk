@@ -5,7 +5,6 @@ Covers create -> update -> assign -> status changes -> notifications.
 
 from __future__ import annotations
 
-import secrets
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -98,73 +97,25 @@ class TestTicketLifecycle:
     @pytest.fixture
     def secondary_agent(
         self,
-        api_client: APIClient,
-        admin_api: APIClient,
-        project_key: str,
+        e2e_manager: E2EResourceManager,
     ) -> Iterator[dict[str, Any]]:
         """Create an isolated assignee and authenticate as that exact recipient."""
 
-        del project_key
-        suffix = time.time_ns()
-        password = _generate_strong_password()
-        response = admin_api.post_json(
-            "/admin/users",
-            {
-                "username": f"ticket_agent_{suffix}",
-                "email": f"ticket_agent_{suffix}@example.com",
-                "password": password,
-                "first_name": "Ticket",
-                "last_name": "Agent",
-                "display_name": "工单回归客服",
-                "role": "agent",
-                "department": "QA Automation",
-                "job_title": "Integration Agent",
-            },
+        identity = e2e_manager.create_project_identity(
+            "agent",
+            label="ticket-lifecycle-agent",
         )
-        assert response.status_code == 201, response.text
-        body = response.json()
-        assert body.get("code") == 0, body
-        agent: dict[str, Any] = body["data"]
-
-        agent_api: APIClient | None = None
+        agent: dict[str, Any] = {
+            "id": identity.id,
+            "platform_role": identity.platform_role,
+            "project_role": identity.project_role,
+            "api": identity.api,
+        }
         try:
-            membership = admin_api.post_json(
-                admin_api.project_path("memberships"),
-                {"user_id": agent["id"], "role": "agent"},
-            )
-            assert membership.status_code == 200, membership.text
-
-            verification = admin_api.put_json(
-                f"/admin/users/{agent['id']}",
-                {"email_verified": True},
-            )
-            assert verification.status_code == 200, verification.text
-
-            login = api_client.login(agent["email"], password)
-            token = login.get("access_token")
-            assert token, "临时客服登录响应缺少 access_token"
-            agent_api = api_client.with_auth(token)
-            agent["api"] = agent_api
             yield agent
         finally:
-            cleanup_errors: list[str] = []
-            if agent_api is not None:
-                agent_api.close()
             for notification_id in agent.get("_notification_ids", []):
-                notification_cleanup = admin_api.delete(
-                    admin_api.project_path(f"notifications/{notification_id}")
-                )
-                if notification_cleanup.status_code not in (200, 204, 404):
-                    cleanup_errors.append(notification_cleanup.text)
-            membership_cleanup = admin_api.delete(
-                admin_api.project_path(f"memberships/{agent['id']}")
-            )
-            if membership_cleanup.status_code not in (200, 204, 404):
-                cleanup_errors.append(membership_cleanup.text)
-            cleanup = admin_api.delete(f"/admin/users/{agent['id']}")
-            if cleanup.status_code not in (200, 204, 404):
-                cleanup_errors.append(cleanup.text)
-            assert not cleanup_errors, "\n".join(cleanup_errors)
+                e2e_manager.track_notification(notification_id)
 
     @pytest.fixture
     def created_ticket_ids(
@@ -186,7 +137,6 @@ class TestTicketLifecycle:
     def test_full_lifecycle(
         self,
         admin_api: APIClient,
-        admin_tokens: dict[str, object],
         ticket_payload: dict[str, object],
         secondary_agent: dict[str, Any],
         created_ticket_ids: list[int],
@@ -226,10 +176,6 @@ class TestTicketLifecycle:
         updated_ticket = update_body["data"]
         assert updated_ticket["priority"] == "high"
         assert "Updated description" in updated_ticket["description"]
-
-        admin_user = admin_tokens.get("user", {})
-        admin_id = admin_user.get("id")
-        assert admin_id, "Admin login payload缺少 user.id"
 
         # 3. Assign to automation agent for triage
         agent_id = secondary_agent["id"]
@@ -364,16 +310,3 @@ class TestTicketLifecycle:
             delete_body = delete_resp.json()
             assert delete_body.get("code") == 0, delete_body
         created_ticket_ids.remove(ticket_id)
-
-
-def _generate_strong_password() -> str:
-    """Generate a password accepted by the production authentication policy."""
-
-    while True:
-        password = f"Aa1!{secrets.token_hex(8)}Z"
-        if all(
-            password[index] != password[index + 1]
-            or password[index] != password[index + 2]
-            for index in range(len(password) - 2)
-        ):
-            return password

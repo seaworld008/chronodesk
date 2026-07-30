@@ -288,7 +288,7 @@ func TestListTicketsFiltersEachResourcePolicy(t *testing.T) {
 	}
 	user := models.User{
 		Username: "visibility-user", Email: "visibility@example.com", PasswordHash: "hash",
-		Role: models.RoleAgent, Status: models.UserStatusActive,
+		PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
@@ -384,7 +384,7 @@ func TestListTicketsUsesBoundedPolicyBatchAndAdvancingCandidateCursor(t *testing
 	}
 	user := models.User{
 		Username: "bounded-user", Email: "bounded@example.com", PasswordHash: "hash",
-		Role: models.RoleAgent, Status: models.UserStatusActive,
+		PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
@@ -1045,7 +1045,7 @@ func TestAPIHandlerRegistersAndServesLeaseCommandRoutes(t *testing.T) {
 		Username:     "lease-route-user",
 		Email:        "lease-route@example.com",
 		PasswordHash: "hash",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
@@ -1246,7 +1246,7 @@ func TestIdempotentCommentReplayMatchesInitialEnvelope(t *testing.T) {
 	}
 	user := models.User{
 		Username: "replay-user", Email: "replay@example.com", PasswordHash: "hash",
-		Role: models.RoleAgent, Status: models.UserStatusActive,
+		PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)

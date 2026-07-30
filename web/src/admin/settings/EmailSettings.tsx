@@ -19,36 +19,18 @@ import {
 } from '@mui/material'
 import { useNotify } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
+import {
+  humanApiRoutes,
+  type EmailConfig,
+  type TestEmailRequest,
+} from '@/lib/generated/human-api'
 import BackButton from '../common/BackButton'
 
-interface EmailConfigResponse {
-  id: number
-  email_verification_enabled: boolean
-  smtp_host: string
-  smtp_port: number
-  smtp_username: string
-  smtp_use_tls: boolean
-  smtp_use_ssl: boolean
-  from_email: string
-  from_name: string
-  welcome_email_subject: string
-  welcome_email_template: string
-  otp_email_subject: string
-  otp_email_template: string
-  is_active: boolean
-  is_configured: boolean
-  can_send_email: boolean
-}
-
-interface EmailForm extends EmailConfigResponse {
+interface EmailForm extends EmailConfig {
   smtp_password?: string
 }
 
-interface TestForm {
-  to_email: string
-  subject: string
-  content: string
-}
+type TestForm = TestEmailRequest
 
 const defaultTestForm: TestForm = {
   to_email: '',
@@ -74,7 +56,9 @@ const EmailSettings: React.FC = () => {
   const loadConfig = useCallback(async () => {
     try {
       setLoading(true)
-      const data = await apiFetch<EmailConfigResponse>('/admin/email-config')
+      const data = await apiFetch<EmailConfig>(
+        humanApiRoutes.getPlatformEmailConfig(),
+      )
       const mapped: EmailForm = {
         ...data,
       }
@@ -120,7 +104,7 @@ const EmailSettings: React.FC = () => {
         payload.smtp_password = config.smtp_password
       }
 
-      await apiFetch('/admin/email-config', {
+      await apiFetch(humanApiRoutes.updatePlatformEmailConfig(), {
         method: 'PUT',
         body: JSON.stringify(payload),
       })
@@ -140,7 +124,7 @@ const EmailSettings: React.FC = () => {
   const handleTest = async () => {
     setTesting(true)
     try {
-      await apiFetch('/admin/email-config/test', {
+      await apiFetch(humanApiRoutes.testPlatformEmailConfig(), {
         method: 'POST',
         body: JSON.stringify(testForm),
       })

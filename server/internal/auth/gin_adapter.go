@@ -1,10 +1,14 @@
 package auth
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 )
 
 // GinHTTPContext Gin框架的HTTPContext适配器
@@ -39,7 +43,10 @@ func (g *GinHTTPContext) GetParam(key string) string {
 
 // Bind 绑定请求体到结构体
 func (g *GinHTTPContext) Bind(obj interface{}) error {
-	return g.ginCtx.ShouldBindJSON(obj)
+	if g == nil || g.ginCtx == nil || g.ginCtx.Request == nil {
+		return errors.New("HTTP request is required")
+	}
+	return decodeStrictJSON(g.ginCtx.Request.Body, obj)
 }
 
 // JSON 返回JSON响应
@@ -119,7 +126,7 @@ func (g *GinHTTPContext) Success(data interface{}) {
 
 // BindJSON 绑定JSON请求体
 func (g *GinHTTPContext) BindJSON(obj interface{}) error {
-	return g.ginCtx.ShouldBindJSON(obj)
+	return g.Bind(obj)
 }
 
 // GetBody 获取请求体
@@ -133,5 +140,24 @@ func (g *GinHTTPContext) ParseJSON(obj interface{}) error {
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(body, obj)
+	return decodeStrictJSON(bytes.NewReader(body), obj)
+}
+
+func decodeStrictJSON(reader io.Reader, target interface{}) error {
+	if reader == nil {
+		return errors.New("JSON request body is required")
+	}
+	decoder := json.NewDecoder(reader)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("JSON request body must contain exactly one value")
+		}
+		return err
+	}
+	return binding.Validator.ValidateStruct(target)
 }

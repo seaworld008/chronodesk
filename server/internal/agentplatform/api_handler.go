@@ -73,25 +73,35 @@ func NewAPIHandler(
 func (h *APIHandler) RegisterRoutes(api *gin.RouterGroup) {
 	api.GET("/capabilities", h.tokens.Middleware(models.ScopeTicketsRead), h.bindProjectContext(), h.Capabilities)
 	api.GET("/tickets", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.bindProjectContext(), h.ListTickets)
-	api.POST("/tickets", h.tokens.Middleware(models.ScopeTicketsCreate), h.executionLimit(), h.bindProjectContext(), h.CreateTicket)
+	api.POST("/tickets", h.tokens.Middleware(models.ScopeTicketsCreate), h.executionLimit(), h.bindMachineWriteProjectContext(), h.CreateTicket)
 	api.GET("/tickets/:id", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.bindProjectContext(), h.GetTicket)
-	api.PATCH("/tickets/:id", h.tokens.Middleware(models.ScopeTicketsUpdate), h.executionLimit(), h.bindProjectContext(), h.UpdateTicket)
-	api.POST("/tickets/:id/commands/assign", h.tokens.Middleware(models.ScopeTicketsAssign), h.executionLimit(), h.bindProjectContext(), h.AssignTicket)
-	api.POST("/tickets/:id/commands/transition", h.tokens.Middleware(models.ScopeTicketsTransition), h.executionLimit(), h.bindProjectContext(), h.TransitionTicket)
-	api.POST("/tickets/:id/commands/escalate", h.tokens.Middleware(models.ScopeTicketsTransition), h.executionLimit(), h.bindProjectContext(), h.EscalateTicket)
+	api.PATCH("/tickets/:id", h.tokens.Middleware(models.ScopeTicketsUpdate), h.executionLimit(), h.bindMachineWriteProjectContext(), h.UpdateTicket)
+	api.POST("/tickets/:id/commands/assign", h.tokens.Middleware(models.ScopeTicketsAssign), h.executionLimit(), h.bindMachineWriteProjectContext(), h.AssignTicket)
+	api.POST("/tickets/:id/commands/transition", h.tokens.Middleware(models.ScopeTicketsTransition), h.executionLimit(), h.bindMachineWriteProjectContext(), h.TransitionTicket)
+	api.POST("/tickets/:id/commands/escalate", h.tokens.Middleware(models.ScopeTicketsTransition), h.executionLimit(), h.bindMachineWriteProjectContext(), h.EscalateTicket)
 	api.GET("/tickets/:id/history", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.bindProjectContext(), h.GetHistory)
 	api.GET("/tickets/:id/comments", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.bindProjectContext(), h.ListComments)
-	api.POST("/tickets/:id/comments", h.tokens.Middleware(models.ScopeCommentsWrite), h.executionLimit(), h.bindProjectContext(), h.CreateComment)
+	api.POST("/tickets/:id/comments", h.tokens.Middleware(models.ScopeCommentsWrite), h.executionLimit(), h.bindMachineWriteProjectContext(), h.CreateComment)
 	api.GET("/tickets/:id/attachments", h.tokens.Middleware(models.ScopeAttachmentsRead), h.executionLimit(), h.bindProjectContext(), h.ListAttachments)
-	api.POST("/tickets/:id/attachments", h.tokens.Middleware(models.ScopeAttachmentsWrite), h.executionLimit(), h.bindProjectContext(), h.StoreAttachment)
-	api.GET("/attachments/:id/content", h.tokens.Middleware(models.ScopeAttachmentsRead), h.executionLimit(), h.bindProjectContext(), h.DownloadAttachment)
-	api.POST("/tickets/:id/claim", h.tokens.Middleware(models.ScopeTasksManage), h.executionLimit(), h.bindProjectContext(), h.ClaimTicket)
-	api.POST("/leases/:id/heartbeat", h.tokens.Middleware(models.ScopeTasksManage), h.executionLimit(), h.bindProjectContext(), h.HeartbeatLease)
-	api.DELETE("/leases/:id", h.tokens.Middleware(models.ScopeTasksManage), h.executionLimit(), h.bindProjectContext(), h.ReleaseLease)
+	api.POST("/tickets/:id/attachments", h.tokens.Middleware(models.ScopeAttachmentsWrite), h.executionLimit(), h.bindExternalProjectContext(), h.StoreAttachment)
+	api.GET("/attachments/:id/content", h.tokens.Middleware(models.ScopeAttachmentsRead), h.executionLimit(), h.bindExternalProjectContext(), h.DownloadAttachment)
+	api.POST("/tickets/:id/claim", h.tokens.Middleware(models.ScopeTasksManage), h.executionLimit(), h.bindMachineWriteProjectContext(), h.ClaimTicket)
+	api.POST("/leases/:id/heartbeat", h.tokens.Middleware(models.ScopeTasksManage), h.executionLimit(), h.bindMachineWriteProjectContext(), h.HeartbeatLease)
+	api.DELETE("/leases/:id", h.tokens.Middleware(models.ScopeTasksManage), h.executionLimit(), h.bindMachineWriteProjectContext(), h.ReleaseLease)
 	api.GET("/events", h.tokens.Middleware(models.ScopeEventsSubscribe), h.executionLimit(), h.bindProjectContext(), h.ListEvents)
 }
 
 func (h *APIHandler) bindProjectContext() gin.HandlerFunc {
+	return h.bindProjectContextWithTransaction(true)
+}
+
+func (h *APIHandler) bindMachineWriteProjectContext() gin.HandlerFunc {
+	return h.bindProjectContextWithTransaction(false)
+}
+
+func (h *APIHandler) bindProjectContextWithTransaction(
+	transactional bool,
+) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if h.projects == nil {
 			WriteProblem(
@@ -111,6 +121,23 @@ func (h *APIHandler) bindProjectContext() gin.HandlerFunc {
 			c.GetString(agentauth.ContextCredentialID),
 		)
 		projectKey := strings.TrimSpace(c.Param("projectKey"))
+		tokenScopes, _ := c.Get(agentauth.ContextScopes)
+		verifiedTokenScopes, ok := tokenScopes.([]string)
+		if !ok {
+			WriteProblem(
+				c,
+				http.StatusUnauthorized,
+				ProblemUnauthorized,
+				"Verified Agent scopes are unavailable",
+				false,
+			)
+			c.Abort()
+			return
+		}
+		verifiedTokenScopes = append(
+			[]string(nil),
+			verifiedTokenScopes...,
+		)
 		access, err := h.projects.ResolvePrincipalProject(
 			c.Request.Context(),
 			projectKey,
@@ -162,8 +189,29 @@ func (h *APIHandler) bindProjectContext() gin.HandlerFunc {
 			apiPublicationBufferContextKey{},
 			publications,
 		)
-		originalWriter := c.Writer
 		originalRequest := c.Request
+		if !transactional {
+			c.Set(
+				agentauth.ContextScopes,
+				intersectScopes(
+					verifiedTokenScopes,
+					access.Scopes,
+				),
+			)
+			c.Request = originalRequest.WithContext(operationContext)
+			defer func() {
+				c.Request = originalRequest.WithContext(operationContext)
+			}()
+			c.Next()
+			for _, ticketID := range publications.ticketIDs {
+				if h.publisher != nil {
+					h.publisher.PublishTicket(projectKey, ticketID)
+				}
+			}
+			return
+		}
+
+		originalWriter := c.Writer
 		defer func() {
 			c.Writer = originalWriter
 			c.Request = originalRequest.WithContext(operationContext)
@@ -192,6 +240,25 @@ func (h *APIHandler) bindProjectContext() gin.HandlerFunc {
 			h.db,
 			access.Scope,
 			func(scopedContext context.Context) error {
+				currentAccess, revalidateErr :=
+					h.native.RevalidatePrincipalProjectOperation(
+						scopedContext,
+						verifiedTokenScopes...,
+					)
+				if revalidateErr != nil {
+					return revalidateErr
+				}
+				if currentAccess.Project.Key !=
+					models.ProjectKey(projectKey) {
+					return services.ErrProjectAccessDenied
+				}
+				c.Set(
+					agentauth.ContextScopes,
+					intersectScopes(
+						verifiedTokenScopes,
+						currentAccess.Scopes,
+					),
+				)
 				c.Request = originalRequest.WithContext(scopedContext)
 				c.Writer = responseBuffer
 				c.Next()
@@ -209,6 +276,35 @@ func (h *APIHandler) bindProjectContext() gin.HandlerFunc {
 		c.Request = originalRequest.WithContext(operationContext)
 		if transactionErr != nil {
 			_ = c.Error(transactionErr)
+			if errors.Is(
+				transactionErr,
+				services.ErrProjectAccessDenied,
+			) {
+				WriteProblem(
+					c,
+					http.StatusForbidden,
+					ProblemPolicyDenied,
+					"Project access is denied",
+					false,
+				)
+				c.Abort()
+				return
+			}
+			if errors.Is(transactionErr, services.ErrInvalidCredential) ||
+				errors.Is(transactionErr, services.ErrCredentialExpired) ||
+				errors.Is(transactionErr, services.ErrPrincipalNotFound) ||
+				errors.Is(transactionErr, services.ErrPrincipalDisabled) ||
+				errors.Is(transactionErr, services.ErrPrincipalExpired) {
+				WriteProblem(
+					c,
+					http.StatusUnauthorized,
+					ProblemUnauthorized,
+					"Agent credential is no longer active",
+					false,
+				)
+				c.Abort()
+				return
+			}
 			WriteProblem(
 				c,
 				http.StatusInternalServerError,
@@ -499,37 +595,75 @@ func (h *APIHandler) CreateTicket(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
+	tokenScopesValue, _ := c.Get(agentauth.ContextScopes)
+	tokenScopes, ok := tokenScopesValue.([]string)
+	if !ok {
+		h.writeNativeError(c, services.ErrInvalidScope)
+		return
+	}
+	authorization := services.NativeCommandAuthorizationInput{
+		Kind:           services.NativeCommandTicketCreate,
+		Actor:          actor,
+		CredentialID:   principal.CredentialID,
+		TokenScopes:    append([]string(nil), tokenScopes...),
+		RequestDigest:  digestBytes(fingerprint),
+		SourceProtocol: string(services.SourceProtocolAgentREST),
+	}
 	if reservation.Replayed {
-		if !h.authorizeReplay(c, principal, models.ScopeTicketsCreate, "ticket.create", "", true, false) {
+		if err := h.native.
+			AuthorizeNativeCommandReplayInShortProjectTransactions(
+				c.Request.Context(),
+				authorization,
+			); err != nil {
+			h.writeNativeError(c, err)
 			return
 		}
 		h.writeReplayedTicket(c, reservation.Record, http.StatusCreated)
 		return
 	}
 
-	result, err := h.native.CreateNativeTicket(c.Request.Context(), services.NativeTicketCreateInput{
-		Request: models.TicketCreateRequest{
-			Title:                request.Title,
-			Description:          request.Description,
-			Type:                 request.Type,
-			Priority:             request.Priority,
-			Source:               models.TicketSourceAgent,
-			RequestTypeVersionID: request.RequestTypeVersionID,
-			WorkflowVersionID:    request.WorkflowVersionID,
-			Tags:                 models.StringList(request.Tags),
-			AgentContext:         request.AgentContext,
-			CategoryID:           request.CategoryID,
-			DueDate:              request.DueDate,
+	authorizedContext, err :=
+		h.native.AuthorizeNativeCommandInShortProjectTransactions(
+			c.Request.Context(),
+			authorization,
+		)
+	if err != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(err),
+		)
+		h.writeNativeError(c, err)
+		return
+	}
+	result, err := runMachineTicketCreateDatabaseCommand(
+		authorizedContext,
+		h.db,
+		h.native,
+		services.NativeTicketCreateInput{
+			Request: models.TicketCreateRequest{
+				Title:                request.Title,
+				Description:          request.Description,
+				Type:                 request.Type,
+				Priority:             request.Priority,
+				Source:               models.TicketSourceAgent,
+				RequestTypeVersionID: request.RequestTypeVersionID,
+				WorkflowVersionID:    request.WorkflowVersionID,
+				Tags:                 models.StringList(request.Tags),
+				AgentContext:         request.AgentContext,
+				CategoryID:           request.CategoryID,
+				DueDate:              request.DueDate,
+			},
+			Actor:               actor,
+			CredentialID:        principal.CredentialID,
+			SourceProtocol:      string(services.SourceProtocolAgentREST),
+			RequestDigest:       digestBytes(fingerprint),
+			TrustLevel:          models.TicketTrustLevelUntrusted,
+			TraceID:             RequestID(c),
+			CorrelationID:       c.GetHeader("X-Correlation-ID"),
+			IdempotencyRecordID: reservation.Record.ID,
 		},
-		Actor:               actor,
-		CredentialID:        principal.CredentialID,
-		SourceProtocol:      "rest",
-		RequestDigest:       digestBytes(fingerprint),
-		TrustLevel:          models.TicketTrustLevelUntrusted,
-		TraceID:             RequestID(c),
-		CorrelationID:       c.GetHeader("X-Correlation-ID"),
-		IdempotencyRecordID: reservation.Record.ID,
-	})
+	)
 	if err != nil {
 		_ = h.native.FailIdempotency(c.Request.Context(), reservation.Record.ID, services.AgentNativeErrorCode(err))
 		h.writeNativeError(c, err)
@@ -586,37 +720,71 @@ func (h *APIHandler) UpdateTicket(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
+	authorization := services.NativeCommandAuthorizationInput{
+		Kind:          services.NativeCommandTicketUpdate,
+		TicketID:      ticketID,
+		RequestDigest: digestBytes(fingerprint),
+	}
 	if reservation.Replayed {
-		if !h.authorizeReplay(
+		if _, _, err := h.authorizeAgentRESTNativeCommand(
 			c,
 			principal,
-			models.ScopeTicketsUpdate,
-			"ticket.update",
-			strconv.FormatUint(uint64(ticketID), 10),
+			authorization,
 			true,
-			false,
-		) {
+		); err != nil {
+			h.writeNativeError(c, err)
 			return
 		}
 		h.writeReplayedTicket(c, reservation.Record, http.StatusOK)
 		return
 	}
-	result, err := h.native.UpdateTicketVersion(c.Request.Context(), services.VersionedTicketUpdateInput{
-		TicketID:            ticketID,
-		ExpectedVersion:     expectedVersion,
-		LeaseID:             leaseID,
-		Actor:               actor,
-		CredentialID:        principal.CredentialID,
-		SourceProtocol:      "rest",
-		RequestDigest:       digestBytes(fingerprint),
-		Changes:             changes,
-		RequiredScope:       models.ScopeTicketsUpdate,
-		Action:              "ticket.update",
-		IsRisky:             false,
-		TraceID:             RequestID(c),
-		CorrelationID:       c.GetHeader("X-Correlation-ID"),
-		IdempotencyRecordID: reservation.Record.ID,
-	})
+	authorizedContext, tokenScopes, err :=
+		h.authorizeAgentRESTNativeCommand(
+			c,
+			principal,
+			authorization,
+			false,
+		)
+	if err != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(err),
+		)
+		h.writeNativeError(c, err)
+		return
+	}
+	result, err := runMachineProjectCommand(
+		authorizedContext,
+		h.native,
+		tokenScopes,
+		models.ProjectKey(c.Param("projectKey")),
+		func(
+			scopedContext context.Context,
+		) (*services.VersionedTicketUpdateResult, error) {
+			return h.native.UpdateTicketVersion(
+				scopedContext,
+				services.VersionedTicketUpdateInput{
+					TicketID:        ticketID,
+					ExpectedVersion: expectedVersion,
+					LeaseID:         leaseID,
+					Actor:           actor,
+					CredentialID:    principal.CredentialID,
+					SourceProtocol: string(
+						services.SourceProtocolAgentREST,
+					),
+					RequestDigest:       digestBytes(fingerprint),
+					Changes:             changes,
+					RequiredScope:       models.ScopeTicketsUpdate,
+					Action:              "ticket.update",
+					IsRisky:             false,
+					TraceID:             RequestID(c),
+					CorrelationID:       c.GetHeader("X-Correlation-ID"),
+					IdempotencyRecordID: reservation.Record.ID,
+				},
+			)
+		},
+	)
 	if err != nil {
 		_ = h.native.FailIdempotency(c.Request.Context(), reservation.Record.ID, services.AgentNativeErrorCode(err))
 		h.writeNativeError(c, err)
@@ -715,37 +883,69 @@ func (h *APIHandler) AssignTicket(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
+	authorization := services.NativeCommandAuthorizationInput{
+		Kind:          services.NativeCommandTicketAssign,
+		TicketID:      commandRequest.ticketID,
+		Assignee:      request.Assignee,
+		RequestDigest: digestBytes(fingerprint),
+	}
 	if reservation.Replayed {
-		if !h.authorizeReplay(
+		if _, _, err := h.authorizeAgentRESTNativeCommand(
 			c,
 			commandRequest.principal,
-			models.ScopeTicketsAssign,
-			"ticket.assign",
-			strconv.FormatUint(uint64(commandRequest.ticketID), 10),
+			authorization,
 			true,
-			true,
-		) {
+		); err != nil {
+			h.writeNativeError(c, err)
 			return
 		}
 		h.writeReplayedTicket(c, reservation.Record, http.StatusOK)
 		return
 	}
 
-	result, err := h.native.AssignTicket(
-		c.Request.Context(),
-		services.AssignTicketCommand{
-			TicketID:            commandRequest.ticketID,
-			ExpectedVersion:     commandRequest.expectedVersion,
-			LeaseID:             commandRequest.leaseID,
-			Actor:               actor,
-			Assignee:            request.Assignee,
-			CredentialID:        commandRequest.principal.CredentialID,
-			SourceProtocol:      "rest",
-			RequestDigest:       digestBytes(fingerprint),
-			Reason:              request.Reason,
-			TraceID:             RequestID(c),
-			CorrelationID:       commandRequest.correlationID,
-			IdempotencyRecordID: reservation.Record.ID,
+	authorizedContext, tokenScopes, err :=
+		h.authorizeAgentRESTNativeCommand(
+			c,
+			commandRequest.principal,
+			authorization,
+			false,
+		)
+	if err != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(err),
+		)
+		h.writeNativeError(c, err)
+		return
+	}
+	result, err := runMachineProjectCommand(
+		authorizedContext,
+		h.native,
+		tokenScopes,
+		models.ProjectKey(c.Param("projectKey")),
+		func(
+			scopedContext context.Context,
+		) (*services.VersionedTicketUpdateResult, error) {
+			return h.native.AssignTicket(
+				scopedContext,
+				services.AssignTicketCommand{
+					TicketID:        commandRequest.ticketID,
+					ExpectedVersion: commandRequest.expectedVersion,
+					LeaseID:         commandRequest.leaseID,
+					Actor:           actor,
+					Assignee:        request.Assignee,
+					CredentialID:    commandRequest.principal.CredentialID,
+					SourceProtocol: string(
+						services.SourceProtocolAgentREST,
+					),
+					RequestDigest:       digestBytes(fingerprint),
+					Reason:              request.Reason,
+					TraceID:             RequestID(c),
+					CorrelationID:       commandRequest.correlationID,
+					IdempotencyRecordID: reservation.Record.ID,
+				},
+			)
 		},
 	)
 	if err != nil {
@@ -795,37 +995,68 @@ func (h *APIHandler) TransitionTicket(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
+	authorization := services.NativeCommandAuthorizationInput{
+		Kind:          services.NativeCommandTicketTransit,
+		TicketID:      commandRequest.ticketID,
+		RequestDigest: digestBytes(fingerprint),
+	}
 	if reservation.Replayed {
-		if !h.authorizeReplay(
+		if _, _, err := h.authorizeAgentRESTNativeCommand(
 			c,
 			commandRequest.principal,
-			models.ScopeTicketsTransition,
-			"ticket.transition",
-			strconv.FormatUint(uint64(commandRequest.ticketID), 10),
+			authorization,
 			true,
-			true,
-		) {
+		); err != nil {
+			h.writeNativeError(c, err)
 			return
 		}
 		h.writeReplayedTicket(c, reservation.Record, http.StatusOK)
 		return
 	}
 
-	result, err := h.native.TransitionTicket(
-		c.Request.Context(),
-		services.TransitionTicketCommand{
-			TicketID:            commandRequest.ticketID,
-			ExpectedVersion:     commandRequest.expectedVersion,
-			LeaseID:             commandRequest.leaseID,
-			Actor:               actor,
-			Status:              request.Status,
-			CredentialID:        commandRequest.principal.CredentialID,
-			SourceProtocol:      "rest",
-			RequestDigest:       digestBytes(fingerprint),
-			Reason:              request.Reason,
-			TraceID:             RequestID(c),
-			CorrelationID:       commandRequest.correlationID,
-			IdempotencyRecordID: reservation.Record.ID,
+	authorizedContext, tokenScopes, err :=
+		h.authorizeAgentRESTNativeCommand(
+			c,
+			commandRequest.principal,
+			authorization,
+			false,
+		)
+	if err != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(err),
+		)
+		h.writeNativeError(c, err)
+		return
+	}
+	result, err := runMachineProjectCommand(
+		authorizedContext,
+		h.native,
+		tokenScopes,
+		models.ProjectKey(c.Param("projectKey")),
+		func(
+			scopedContext context.Context,
+		) (*services.VersionedTicketUpdateResult, error) {
+			return h.native.TransitionTicket(
+				scopedContext,
+				services.TransitionTicketCommand{
+					TicketID:        commandRequest.ticketID,
+					ExpectedVersion: commandRequest.expectedVersion,
+					LeaseID:         commandRequest.leaseID,
+					Actor:           actor,
+					Status:          request.Status,
+					CredentialID:    commandRequest.principal.CredentialID,
+					SourceProtocol: string(
+						services.SourceProtocolAgentREST,
+					),
+					RequestDigest:       digestBytes(fingerprint),
+					Reason:              request.Reason,
+					TraceID:             RequestID(c),
+					CorrelationID:       commandRequest.correlationID,
+					IdempotencyRecordID: reservation.Record.ID,
+				},
+			)
 		},
 	)
 	if err != nil {
@@ -886,54 +1117,73 @@ func (h *APIHandler) EscalateTicket(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
+	authorization := services.NativeCommandAuthorizationInput{
+		Kind:          services.NativeCommandTicketEscalate,
+		TicketID:      commandRequest.ticketID,
+		Assignee:      request.Assignee,
+		RequestDigest: digestBytes(fingerprint),
+	}
 	if reservation.Replayed {
-		resourceID := strconv.FormatUint(uint64(commandRequest.ticketID), 10)
-		if !h.authorizeReplay(
+		if _, _, err := h.authorizeAgentRESTNativeCommand(
 			c,
 			commandRequest.principal,
-			models.ScopeTicketsTransition,
-			"ticket.escalate",
-			resourceID,
+			authorization,
 			true,
-			true,
-		) {
-			return
-		}
-		if request.Assignee != nil &&
-			!h.authorizeReplay(
-				c,
-				commandRequest.principal,
-				models.ScopeTicketsAssign,
-				"ticket.assign",
-				resourceID,
-				true,
-				true,
-			) {
+		); err != nil {
+			h.writeNativeError(c, err)
 			return
 		}
 		h.writeReplayedTicket(c, reservation.Record, http.StatusOK)
 		return
 	}
 
-	result, err := h.native.EscalateTicket(
-		c.Request.Context(),
-		services.EscalateTicketCommand{
-			TicketID:                   commandRequest.ticketID,
-			ExpectedVersion:            commandRequest.expectedVersion,
-			LeaseID:                    commandRequest.leaseID,
-			Actor:                      actor,
-			Priority:                   request.Priority,
-			Assignee:                   request.Assignee,
-			CredentialID:               commandRequest.principal.CredentialID,
-			SourceProtocol:             "rest",
-			RequestDigest:              digestBytes(fingerprint),
-			Reason:                     request.Reason,
-			TraceID:                    RequestID(c),
-			CorrelationID:              commandRequest.correlationID,
-			IdempotencyRecordID:        reservation.Record.ID,
-			IdempotencyCompletionTTL:   24 * time.Hour,
-			TransitionPolicyDecisionID: "",
-			AssignmentPolicyDecisionID: "",
+	authorizedContext, tokenScopes, err :=
+		h.authorizeAgentRESTNativeCommand(
+			c,
+			commandRequest.principal,
+			authorization,
+			false,
+		)
+	if err != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(err),
+		)
+		h.writeNativeError(c, err)
+		return
+	}
+	result, err := runMachineProjectCommand(
+		authorizedContext,
+		h.native,
+		tokenScopes,
+		models.ProjectKey(c.Param("projectKey")),
+		func(
+			scopedContext context.Context,
+		) (*services.VersionedTicketUpdateResult, error) {
+			return h.native.EscalateTicket(
+				scopedContext,
+				services.EscalateTicketCommand{
+					TicketID:        commandRequest.ticketID,
+					ExpectedVersion: commandRequest.expectedVersion,
+					LeaseID:         commandRequest.leaseID,
+					Actor:           actor,
+					Priority:        request.Priority,
+					Assignee:        request.Assignee,
+					CredentialID:    commandRequest.principal.CredentialID,
+					SourceProtocol: string(
+						services.SourceProtocolAgentREST,
+					),
+					RequestDigest:              digestBytes(fingerprint),
+					Reason:                     request.Reason,
+					TraceID:                    RequestID(c),
+					CorrelationID:              commandRequest.correlationID,
+					IdempotencyRecordID:        reservation.Record.ID,
+					IdempotencyCompletionTTL:   24 * time.Hour,
+					TransitionPolicyDecisionID: "",
+					AssignmentPolicyDecisionID: "",
+				},
+			)
 		},
 	)
 	if err != nil {
@@ -1009,34 +1259,65 @@ func (h *APIHandler) ClaimTicket(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
+	authorization := services.NativeCommandAuthorizationInput{
+		Kind:          services.NativeCommandTicketClaim,
+		TicketID:      ticketID,
+		RequestDigest: digestBytes(fingerprint),
+	}
 	if reservation.Replayed {
-		if !h.authorizeReplay(
+		if _, _, err := h.authorizeAgentRESTNativeCommand(
 			c,
 			principal,
-			models.ScopeTasksManage,
-			"ticket.claim",
-			strconv.FormatUint(uint64(ticketID), 10),
+			authorization,
 			true,
-			false,
-		) {
+		); err != nil {
+			h.writeNativeError(c, err)
 			return
 		}
 		h.writeReplayedLease(c, reservation.Record)
 		return
 	}
-	result, err := h.native.ClaimTicketLeaseCommand(
-		c.Request.Context(),
-		services.ClaimTicketLeaseCommandInput{
-			TicketID:            ticketID,
-			Actor:               actor,
-			ExpectedVersion:     expectedVersion,
-			TTL:                 time.Duration(request.TTLSeconds) * time.Second,
-			CredentialID:        principal.CredentialID,
-			SourceProtocol:      "rest",
-			RequestDigest:       digestBytes(fingerprint),
-			IdempotencyRecordID: reservation.Record.ID,
-			TraceID:             RequestID(c),
-			CorrelationID:       c.GetHeader("X-Correlation-ID"),
+	authorizedContext, tokenScopes, err :=
+		h.authorizeAgentRESTNativeCommand(
+			c,
+			principal,
+			authorization,
+			false,
+		)
+	if err != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(err),
+		)
+		h.writeNativeError(c, err)
+		return
+	}
+	result, err := runMachineProjectCommand(
+		authorizedContext,
+		h.native,
+		tokenScopes,
+		models.ProjectKey(c.Param("projectKey")),
+		func(
+			scopedContext context.Context,
+		) (*services.TicketLeaseCommandResult, error) {
+			return h.native.ClaimTicketLeaseCommand(
+				scopedContext,
+				services.ClaimTicketLeaseCommandInput{
+					TicketID:        ticketID,
+					Actor:           actor,
+					ExpectedVersion: expectedVersion,
+					TTL:             time.Duration(request.TTLSeconds) * time.Second,
+					CredentialID:    principal.CredentialID,
+					SourceProtocol: string(
+						services.SourceProtocolAgentREST,
+					),
+					RequestDigest:       digestBytes(fingerprint),
+					IdempotencyRecordID: reservation.Record.ID,
+					TraceID:             RequestID(c),
+					CorrelationID:       c.GetHeader("X-Correlation-ID"),
+				},
+			)
 		},
 	)
 	if err != nil {
@@ -1095,34 +1376,75 @@ func (h *APIHandler) HeartbeatLease(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
+	authorization := services.NativeCommandAuthorizationInput{
+		Kind:          services.NativeCommandLeaseHeartbeat,
+		LeaseID:       c.Param("id"),
+		RequestDigest: digestBytes(fingerprint),
+	}
 	if reservation.Replayed {
-		if !h.authorizeReplay(
+		replayedTicketID, parseErr := strconv.ParseUint(
+			reservation.Record.ResourceID,
+			10,
+			64,
+		)
+		if parseErr != nil || replayedTicketID == 0 {
+			h.writeNativeError(c, services.ErrIdempotencyConflict)
+			return
+		}
+		authorization.TicketID = uint(replayedTicketID)
+		if _, _, err := h.authorizeAgentRESTNativeCommand(
 			c,
 			principal,
-			models.ScopeTasksManage,
-			"ticket.lease.heartbeat",
-			reservation.Record.ResourceID,
+			authorization,
 			true,
-			false,
-		) {
+		); err != nil {
+			h.writeNativeError(c, err)
 			return
 		}
 		h.writeReplayedLease(c, reservation.Record)
 		return
 	}
-	result, err := h.native.HeartbeatTicketLeaseCommand(
-		c.Request.Context(),
-		services.HeartbeatTicketLeaseCommandInput{
-			LeaseID:             c.Param("id"),
-			Actor:               actor,
-			ExpectedVersion:     expectedVersion,
-			TTL:                 time.Duration(request.TTLSeconds) * time.Second,
-			CredentialID:        principal.CredentialID,
-			SourceProtocol:      "rest",
-			RequestDigest:       digestBytes(fingerprint),
-			IdempotencyRecordID: reservation.Record.ID,
-			TraceID:             RequestID(c),
-			CorrelationID:       c.GetHeader("X-Correlation-ID"),
+	authorizedContext, tokenScopes, err :=
+		h.authorizeAgentRESTNativeCommand(
+			c,
+			principal,
+			authorization,
+			false,
+		)
+	if err != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(err),
+		)
+		h.writeNativeError(c, err)
+		return
+	}
+	result, err := runMachineProjectCommand(
+		authorizedContext,
+		h.native,
+		tokenScopes,
+		models.ProjectKey(c.Param("projectKey")),
+		func(
+			scopedContext context.Context,
+		) (*services.TicketLeaseCommandResult, error) {
+			return h.native.HeartbeatTicketLeaseCommand(
+				scopedContext,
+				services.HeartbeatTicketLeaseCommandInput{
+					LeaseID:         c.Param("id"),
+					Actor:           actor,
+					ExpectedVersion: expectedVersion,
+					TTL:             time.Duration(request.TTLSeconds) * time.Second,
+					CredentialID:    principal.CredentialID,
+					SourceProtocol: string(
+						services.SourceProtocolAgentREST,
+					),
+					RequestDigest:       digestBytes(fingerprint),
+					IdempotencyRecordID: reservation.Record.ID,
+					TraceID:             RequestID(c),
+					CorrelationID:       c.GetHeader("X-Correlation-ID"),
+				},
+			)
 		},
 	)
 	if err != nil {
@@ -1158,33 +1480,74 @@ func (h *APIHandler) ReleaseLease(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
+	authorization := services.NativeCommandAuthorizationInput{
+		Kind:          services.NativeCommandLeaseRelease,
+		LeaseID:       c.Param("id"),
+		RequestDigest: digestBytes(fingerprint),
+	}
 	if reservation.Replayed {
-		if !h.authorizeReplay(
+		replayedTicketID, parseErr := strconv.ParseUint(
+			reservation.Record.ResourceID,
+			10,
+			64,
+		)
+		if parseErr != nil || replayedTicketID == 0 {
+			h.writeNativeError(c, services.ErrIdempotencyConflict)
+			return
+		}
+		authorization.TicketID = uint(replayedTicketID)
+		if _, _, err := h.authorizeAgentRESTNativeCommand(
 			c,
 			principal,
-			models.ScopeTasksManage,
-			"ticket.lease.release",
-			reservation.Record.ResourceID,
+			authorization,
 			true,
-			false,
-		) {
+		); err != nil {
+			h.writeNativeError(c, err)
 			return
 		}
 		h.writeReplayedLease(c, reservation.Record)
 		return
 	}
-	result, err := h.native.ReleaseTicketLeaseCommand(
-		c.Request.Context(),
-		services.ReleaseTicketLeaseCommandInput{
-			LeaseID:             c.Param("id"),
-			Actor:               actor,
-			Reason:              "released by REST client",
-			CredentialID:        principal.CredentialID,
-			SourceProtocol:      "rest",
-			RequestDigest:       digestBytes(fingerprint),
-			IdempotencyRecordID: reservation.Record.ID,
-			TraceID:             RequestID(c),
-			CorrelationID:       c.GetHeader("X-Correlation-ID"),
+	authorizedContext, tokenScopes, err :=
+		h.authorizeAgentRESTNativeCommand(
+			c,
+			principal,
+			authorization,
+			false,
+		)
+	if err != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(err),
+		)
+		h.writeNativeError(c, err)
+		return
+	}
+	result, err := runMachineProjectCommand(
+		authorizedContext,
+		h.native,
+		tokenScopes,
+		models.ProjectKey(c.Param("projectKey")),
+		func(
+			scopedContext context.Context,
+		) (*services.TicketLeaseCommandResult, error) {
+			return h.native.ReleaseTicketLeaseCommand(
+				scopedContext,
+				services.ReleaseTicketLeaseCommandInput{
+					LeaseID:      c.Param("id"),
+					Actor:        actor,
+					Reason:       "released by REST client",
+					CredentialID: principal.CredentialID,
+					SourceProtocol: string(
+						services.SourceProtocolAgentREST,
+					),
+					RequestDigest:       digestBytes(fingerprint),
+					IdempotencyRecordID: reservation.Record.ID,
+					TraceID:             RequestID(c),
+					CorrelationID:       c.GetHeader("X-Correlation-ID"),
+				},
+			)
 		},
 	)
 	if err != nil {
@@ -1249,38 +1612,72 @@ func (h *APIHandler) CreateComment(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
+	authorization := services.NativeCommandAuthorizationInput{
+		Kind:          services.NativeCommandCommentCreate,
+		TicketID:      ticketID,
+		RequestDigest: digestBytes(fingerprint),
+	}
 	if reservation.Replayed {
-		if !h.authorizeReplay(
+		if _, _, err := h.authorizeAgentRESTNativeCommand(
 			c,
 			principal,
-			models.ScopeCommentsWrite,
-			"ticket.comment.create",
-			strconv.FormatUint(uint64(ticketID), 10),
+			authorization,
 			true,
-			false,
-		) {
+		); err != nil {
+			h.writeNativeError(c, err)
 			return
 		}
 		h.writeReplayedComment(c, reservation.Record)
 		return
 	}
-	result, err := h.native.CreateComment(c.Request.Context(), services.NativeCommentInput{
-		TicketID:            ticketID,
-		ExpectedVersion:     expectedVersion,
-		LeaseID:             leaseID,
-		Actor:               actor,
-		CredentialID:        principal.CredentialID,
-		SourceProtocol:      "rest",
-		RequestDigest:       digestBytes(fingerprint),
-		Content:             request.Content,
-		ContentType:         request.ContentType,
-		Type:                request.Type,
-		Reason:              request.RationaleSummary,
-		EvidenceRefs:        request.Evidence,
-		InputSources:        request.InputSources,
-		TraceID:             RequestID(c),
-		IdempotencyRecordID: reservation.Record.ID,
-	})
+	authorizedContext, tokenScopes, err :=
+		h.authorizeAgentRESTNativeCommand(
+			c,
+			principal,
+			authorization,
+			false,
+		)
+	if err != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(err),
+		)
+		h.writeNativeError(c, err)
+		return
+	}
+	result, err := runMachineProjectCommand(
+		authorizedContext,
+		h.native,
+		tokenScopes,
+		models.ProjectKey(c.Param("projectKey")),
+		func(
+			scopedContext context.Context,
+		) (*services.NativeCommentResult, error) {
+			return h.native.CreateComment(
+				scopedContext,
+				services.NativeCommentInput{
+					TicketID:        ticketID,
+					ExpectedVersion: expectedVersion,
+					LeaseID:         leaseID,
+					Actor:           actor,
+					CredentialID:    principal.CredentialID,
+					SourceProtocol: string(
+						services.SourceProtocolAgentREST,
+					),
+					RequestDigest:       digestBytes(fingerprint),
+					Content:             request.Content,
+					ContentType:         request.ContentType,
+					Type:                request.Type,
+					Reason:              request.RationaleSummary,
+					EvidenceRefs:        request.Evidence,
+					InputSources:        request.InputSources,
+					TraceID:             RequestID(c),
+					IdempotencyRecordID: reservation.Record.ID,
+				},
+			)
+		},
+	)
 	if err != nil {
 		_ = h.native.FailIdempotency(c.Request.Context(), reservation.Record.ID, services.AgentNativeErrorCode(err))
 		h.writeNativeError(c, err)
@@ -1350,6 +1747,26 @@ func (h *APIHandler) StoreAttachment(c *gin.Context) {
 		idempotencyBody,
 	)
 	actor := models.ServicePrincipalActor(principal.ID)
+	attachmentInput := services.NativeAttachmentInput{
+		TicketID:        ticketID,
+		ExpectedVersion: expectedVersion,
+		LeaseID:         leaseID,
+		Actor:           actor,
+		CredentialID:    principal.CredentialID,
+		SourceProtocol: string(
+			services.SourceProtocolAgentREST,
+		),
+		RequestDigest: digestBytes(fingerprint),
+		OriginalName:  header.Filename,
+		ContentType: header.Header.Get(
+			"Content-Type",
+		),
+		Description: c.PostForm("description"),
+		IsPublic: c.PostForm("visibility") ==
+			"public",
+		TraceID:       RequestID(c),
+		CorrelationID: c.GetHeader("X-Correlation-ID"),
+	}
 	reservation, err := h.native.ReserveIdempotency(
 		c.Request.Context(), actor, "ticket.attachment.create", key, fingerprint, 24*time.Hour,
 	)
@@ -1358,36 +1775,62 @@ func (h *APIHandler) StoreAttachment(c *gin.Context) {
 		return
 	}
 	if reservation.Replayed {
-		if !h.authorizeReplay(
-			c,
-			principal,
-			models.ScopeAttachmentsWrite,
-			"ticket.attachment.create",
-			strconv.FormatUint(uint64(ticketID), 10),
-			true,
-			false,
-		) {
+		tokenScopesValue, _ := c.Get(agentauth.ContextScopes)
+		tokenScopes, ok := tokenScopesValue.([]string)
+		if !ok {
+			h.writeNativeError(c, services.ErrInvalidScope)
 			return
 		}
-		h.writeReplayedAttachment(c, reservation.Record)
+		replayAuthorization, replayErr :=
+			h.native.PrepareAttachmentReplayAuthorization(
+				c.Request.Context(),
+				attachmentInput,
+				append([]string(nil), tokenScopes...),
+			)
+		if replayErr != nil {
+			h.writeNativeError(c, replayErr)
+			return
+		}
+		replay, replayErr :=
+			h.native.
+				FinalizeAttachmentReplayInShortProjectTransaction(
+					c.Request.Context(),
+					services.AttachmentReplayFinalizationInput{
+						TicketID:      ticketID,
+						Record:        reservation.Record,
+						Authorization: *replayAuthorization,
+					},
+				)
+		if replayErr != nil {
+			h.writeNativeError(c, replayErr)
+			return
+		}
+		h.writeReplayedAttachment(
+			c,
+			reservation.Record,
+			replay.Attachment,
+		)
 		return
 	}
-	result, err := h.native.StoreAttachment(c.Request.Context(), services.NativeAttachmentInput{
-		TicketID:            ticketID,
-		ExpectedVersion:     expectedVersion,
-		LeaseID:             leaseID,
-		Actor:               actor,
-		CredentialID:        principal.CredentialID,
-		SourceProtocol:      "rest",
-		RequestDigest:       digestBytes(fingerprint),
-		OriginalName:        header.Filename,
-		ContentType:         header.Header.Get("Content-Type"),
-		Description:         c.PostForm("description"),
-		IsPublic:            c.PostForm("visibility") == "public",
-		Reader:              bytes.NewReader(content),
-		TraceID:             RequestID(c),
-		IdempotencyRecordID: reservation.Record.ID,
-	})
+	if err := h.native.PrepareAttachmentUploadAuthorization(
+		c.Request.Context(),
+		&attachmentInput,
+	); err != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(err),
+		)
+		h.writeNativeError(c, err)
+		return
+	}
+	attachmentInput.Reader = bytes.NewReader(content)
+	attachmentInput.IdempotencyRecordID =
+		reservation.Record.ID
+	result, err := h.native.StoreAttachment(
+		c.Request.Context(),
+		attachmentInput,
+	)
 	if err != nil {
 		_ = h.native.FailIdempotency(c.Request.Context(), reservation.Record.ID, services.AgentNativeErrorCode(err))
 		h.writeNativeError(c, err)
@@ -1395,7 +1838,12 @@ func (h *APIHandler) StoreAttachment(c *gin.Context) {
 	}
 	h.publishTicket(c, ticketID)
 	c.Header("ETag", httpcontract.FormatETag(result.Receipt.ResourceVersion))
-	WriteReceipt(c, http.StatusCreated, result.Attachment.ToResponse(), receiptFromService(result.Receipt))
+	WriteReceipt(
+		c,
+		http.StatusAccepted,
+		result.Attachment.ToResponse(),
+		receiptFromService(result.Receipt),
+	)
 }
 
 func (h *APIHandler) ListComments(c *gin.Context) {
@@ -1468,39 +1916,6 @@ func (h *APIHandler) ListAttachments(c *gin.Context) {
 func (h *APIHandler) DownloadAttachment(c *gin.Context) {
 	attachmentID, ok := parsePathUint(c, "id")
 	if !ok {
-		return
-	}
-	var metadata models.TicketAttachment
-	projectScope, err := services.RequireProjectScope(c.Request.Context())
-	if err != nil {
-		h.writeNativeError(c, err)
-		return
-	}
-	if err := h.db.WithContext(c.Request.Context()).
-		Where(
-			"id = ? AND organization_id = ? AND project_id = ?",
-			attachmentID,
-			projectScope.OrganizationID,
-			projectScope.ProjectID,
-		).
-		First(&metadata).Error; err != nil {
-		h.writeNativeError(c, err)
-		return
-	}
-	principal, ok := h.principal(c)
-	if !ok {
-		return
-	}
-	if _, err := h.native.CheckAction(c.Request.Context(), services.PolicyCheckInput{
-		ServicePrincipalID: principal.ID,
-		CredentialID:       principal.CredentialID,
-		Scope:              models.ScopeAttachmentsRead,
-		Action:             "ticket.attachment.read",
-		ResourceType:       "ticket",
-		ResourceID:         strconv.FormatUint(uint64(metadata.TicketID), 10),
-		SourceProtocol:     "rest",
-	}); err != nil {
-		h.writeNativeError(c, err)
 		return
 	}
 	attachment, reader, err := h.native.OpenAttachment(c.Request.Context(), attachmentID)
@@ -1701,13 +2116,18 @@ type authenticatedPrincipal struct {
 func (h *APIHandler) executionLimit() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		principalID := c.GetString(agentauth.ContextPrincipalID)
-		release, err := h.native.AcquireAgentExecution(c.Request.Context(), principalID)
+		leaseContext, release, err :=
+			h.native.AcquireAgentExecutionContext(
+				c.Request.Context(),
+				principalID,
+			)
 		if err != nil {
 			h.writeNativeError(c, err)
 			c.Abort()
 			return
 		}
 		defer release()
+		c.Request = c.Request.WithContext(leaseContext)
 		c.Next()
 	}
 }
@@ -1722,32 +2142,41 @@ func (h *APIHandler) principal(c *gin.Context) (authenticatedPrincipal, bool) {
 	return authenticatedPrincipal{ID: id, CredentialID: credentialID}, true
 }
 
-func (h *APIHandler) authorizeReplay(
+func (h *APIHandler) authorizeAgentRESTNativeCommand(
 	c *gin.Context,
 	principal authenticatedPrincipal,
-	scope string,
-	action string,
-	resourceID string,
-	write bool,
-	risky bool,
-) bool {
-	_, err := h.native.CheckAction(c.Request.Context(), services.PolicyCheckInput{
-		ServicePrincipalID: principal.ID,
-		CredentialID:       principal.CredentialID,
-		Scope:              scope,
-		Action:             action,
-		ResourceType:       "ticket",
-		ResourceID:         resourceID,
-		IsWrite:            write,
-		IsRisky:            risky,
-		SourceProtocol:     "rest",
-		Context:            map[string]any{"idempotent_replay": true},
-	})
-	if err != nil {
-		h.writeNativeError(c, err)
-		return false
+	command services.NativeCommandAuthorizationInput,
+	replay bool,
+) (context.Context, []string, error) {
+	tokenScopesValue, _ := c.Get(agentauth.ContextScopes)
+	tokenScopes, ok := tokenScopesValue.([]string)
+	if !ok {
+		return nil, nil, services.ErrInvalidScope
 	}
-	return true
+	tokenScopes = append([]string(nil), tokenScopes...)
+	command.Actor = models.ServicePrincipalActor(principal.ID)
+	command.CredentialID = principal.CredentialID
+	command.TokenScopes = tokenScopes
+	command.SourceProtocol = string(services.SourceProtocolAgentREST)
+	if replay {
+		if err := h.native.
+			AuthorizeNativeCommandReplayInShortProjectTransactions(
+				c.Request.Context(),
+				command,
+			); err != nil {
+			return nil, nil, err
+		}
+		return c.Request.Context(), tokenScopes, nil
+	}
+	authorizedContext, err :=
+		h.native.AuthorizeNativeCommandInShortProjectTransactions(
+			c.Request.Context(),
+			command,
+		)
+	if err != nil {
+		return nil, nil, err
+	}
+	return authorizedContext, tokenScopes, nil
 }
 
 func (h *APIHandler) loadAuthorizedTicket(c *gin.Context) (*models.Ticket, bool) {
@@ -2189,7 +2618,11 @@ func leaseResponseData(lease *models.TicketLease) gin.H {
 	}
 }
 
-func (h *APIHandler) writeReplayedAttachment(c *gin.Context, record *models.IdempotencyRecord) {
+func (h *APIHandler) writeReplayedAttachment(
+	c *gin.Context,
+	record *models.IdempotencyRecord,
+	fallback *models.TicketAttachment,
+) {
 	if !idempotencyRecordMatchesProject(c, record) {
 		WriteProblem(c, http.StatusConflict, ProblemIdempotencyConflict, "Idempotency record belongs to another project", false)
 		return
@@ -2204,23 +2637,16 @@ func (h *APIHandler) writeReplayedAttachment(c *gin.Context, record *models.Idem
 			return
 		}
 	}
-	resourceID, err := strconv.ParseUint(record.ResourceID, 10, 32)
-	if err != nil {
-		h.writeIdempotentBody(c, record)
-		return
-	}
-	var attachment models.TicketAttachment
-	if err := h.db.WithContext(c.Request.Context()).Where(
-		"id = ? AND organization_id = ? AND project_id = ?",
-		uint(resourceID),
-		record.OrganizationID,
-		record.ProjectID,
-	).First(&attachment).Error; err != nil {
+	if fallback == nil ||
+		fallback.OrganizationID != record.OrganizationID ||
+		fallback.ProjectID != record.ProjectID ||
+		strconv.FormatUint(uint64(fallback.ID), 10) !=
+			strings.TrimSpace(record.ResourceID) {
 		h.writeIdempotentBody(c, record)
 		return
 	}
 	c.Header("ETag", httpcontract.FormatETag(receipt.ResourceVersion))
-	WriteReceipt(c, record.ResponseCode, attachment.ToResponse(), receipt)
+	WriteReceipt(c, record.ResponseCode, fallback.ToResponse(), receipt)
 }
 
 func idempotencyRecordMatchesProject(
@@ -2285,7 +2711,8 @@ func writeNativeProblem(c *gin.Context, err error) {
 		errors.Is(err, services.ErrReadOnlyMode),
 		errors.Is(err, services.ErrGlobalEmergencyStop):
 		status = http.StatusForbidden
-	case errors.Is(err, services.ErrPolicyDenied):
+	case errors.Is(err, services.ErrPolicyDenied),
+		errors.Is(err, services.ErrProjectAccessDenied):
 		status, code = http.StatusForbidden, ProblemPolicyDenied
 	case errors.Is(err, services.ErrInvalidScope):
 		status, code = http.StatusForbidden, ProblemInsufficientScope

@@ -108,7 +108,7 @@ func seedAuthEmailOutboxUser(t *testing.T, db *gorm.DB) models.User {
 		Username:     "durable-email-user",
 		Email:        "durable-email@example.test",
 		PasswordHash: "test-password-hash",
-		Role:         models.RoleCustomer,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
@@ -464,7 +464,7 @@ func TestRegistrationRollsBackUserProfileCredentialEventAndOutbox(t *testing.T) 
 				Username:      "registration-rollback",
 				Email:         "registration-rollback@example.test",
 				PasswordHash:  "test-password-hash",
-				Role:          RoleCustomer,
+				PlatformRole:  PlatformRoleMember,
 				Status:        StatusActive,
 				EmailVerified: false,
 			}
@@ -539,7 +539,7 @@ func TestRegistrationCommitsUserProfileAndEmailIntentTogether(t *testing.T) {
 				Username:          "registration-success",
 				Email:             "registration-success@example.test",
 				PasswordHash:      "test-password-hash",
-				Role:              RoleCustomer,
+				PlatformRole:      PlatformRoleMember,
 				Status:            StatusActive,
 				EmailVerified:     !test.requireVerify,
 				PasswordChangedAt: &verifiedAt,
@@ -694,7 +694,7 @@ func TestAuthCredentialValidationRejectsPlaintextEmailDeliverySecret(t *testing.
 		Username:     "plaintext-delivery-secret",
 		Email:        "plaintext-delivery-secret@example.test",
 		PasswordHash: string(passwordHash),
-		Role:         models.RoleCustomer,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
@@ -727,7 +727,7 @@ func TestPublicEmailRequestsPreserveEnumerationResistance(t *testing.T) {
 		Username:      "already-verified-user",
 		Email:         "already-verified@example.test",
 		PasswordHash:  "test-password-hash",
-		Role:          models.RoleCustomer,
+		PlatformRole:  models.PlatformRoleMember,
 		Status:        models.UserStatusActive,
 		EmailVerified: true,
 	}

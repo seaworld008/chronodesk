@@ -35,6 +35,19 @@ jobs:
   go:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      CHRONODESK_REDIS_INTEGRATION: "1"
+      REDIS_URL: redis://localhost:6379/0
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     defaults:
       run:
         working-directory: server
@@ -51,6 +64,12 @@ jobs:
 
       - name: Test
         run: go test ./... -count=1
+
+      - name: Verify Redis Agent execution guard integration
+        run: >-
+          go test ./internal/services
+          -run '^TestRedisAgentExecutionGuardIntegration$'
+          -count=1
 
       - name: Scan reachable Go vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
@@ -81,10 +100,20 @@ jobs:
       - name: Validate OpenAPI 3.2 contract
         run: |
           npx --yes @redocly/cli@2.41.1 lint ../server/internal/openapi/openapi.yaml --format=stylish
+          npx --yes @redocly/cli@2.41.1 lint ../server/internal/humanopenapi/openapi.json --format=stylish
           npx --yes @stoplight/spectral-cli@6.16.2 lint \
             -r ../server/internal/openapi/.spectral.yaml \
             ../server/internal/openapi/openapi.yaml \
             --fail-severity=warn
+          npx --yes @stoplight/spectral-cli@6.16.2 lint \
+            -r ../server/internal/openapi/.spectral.yaml \
+            ../server/internal/humanopenapi/openapi.json \
+            --fail-severity=warn
+
+      - name: Verify generated Human Web API types
+        run: |
+          npm run check:human-api
+          npm run test:human-api
 
       - name: Validate AsyncAPI 3.1 contract
         run: npx --yes @asyncapi/cli@6.0.2 validate ../server/internal/asyncapi/asyncapi.yaml

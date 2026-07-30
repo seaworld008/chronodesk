@@ -31,7 +31,8 @@ import {
     Info as InfoIcon,
 } from '@mui/icons-material';
 import BackButton from '../common/BackButton';
-import { assignableUserRoleChoices } from '@/lib/accessControl';
+import { platformRoleChoices } from '@/lib/accessControl';
+import { transformCreateAdminUser } from './adminUserTransforms';
 
 // 状态选项
 const statusChoices = [
@@ -103,21 +104,24 @@ const CreateGuidance: React.FC = () => (
  */
 const RoleGuidance: React.FC = () => (
     <Alert severity="warning" icon={<SecurityIcon />} sx={{ mb: 2 }}>
-        <AlertTitle>角色权限说明</AlertTitle>
+        <AlertTitle>平台职责说明</AlertTitle>
         <Box component="ul" sx={{ mt: 1, mb: 0, pl: 2 }}>
             <Typography component="li" variant="body2">
-                <strong>客户</strong>：只能查看和创建自己的工单
+                <strong>平台管理员</strong>：管理平台用户、邮件和全局配置
             </Typography>
             <Typography component="li" variant="body2">
-                <strong>客服代理</strong>：可处理工单和客户咨询
+                <strong>安全审计员</strong>：只读查看平台审计记录
             </Typography>
             <Typography component="li" variant="body2">
-                <strong>主管</strong>：可管理团队和工单分配
+                <strong>紧急运维员</strong>：仅执行明确声明的紧急操作
             </Typography>
             <Typography component="li" variant="body2">
-                <strong>管理员</strong>：拥有系统完全控制权限
+                <strong>普通成员</strong>：不具备平台治理能力
             </Typography>
         </Box>
+        <Typography variant="body2" sx={{ mt: 1 }}>
+            项目职责不会在创建用户时自动授予，请在具体项目的成员管理中单独配置。
+        </Typography>
     </Alert>
 );
 
@@ -164,7 +168,7 @@ const UserCreateToolbar = () => (
  * 表单默认值
  */
 const defaultValues = {
-    role: 'customer',
+    platform_role: 'member',
     status: 'active',
     timezone: 'Asia/Shanghai',
     language: 'zh-CN',
@@ -181,6 +185,7 @@ const UserCreate: React.FC = () => {
             title="创建新用户"
             mutationMode="pessimistic"
             redirect="show"
+            transform={transformCreateAdminUser}
         >
             <Box sx={{ maxWidth: 1200, p: 3 }}>
                 <BackButton fallbackPath="/users" />
@@ -296,14 +301,14 @@ const UserCreate: React.FC = () => {
                         </Box>
                     </FormTab>
                     
-                    {/* 角色和权限 */}
-                    <FormTab label="角色和权限" path="role">
+                    {/* 平台职责 */}
+                    <FormTab label="平台职责" path="platform-role">
                         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
                             <RoleGuidance />
                             
                             <Card>
                                 <CardHeader 
-                                    title="角色设置" 
+                                    title="平台职责设置"
                                     avatar={<SecurityIcon color="primary" />}
                                 />
                                 <CardContent>
@@ -311,11 +316,11 @@ const UserCreate: React.FC = () => {
                                         <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
                                             <Box sx={{ flex: 1, minWidth: '250px' }}>
                                                 <SelectInput
-                                                    source="role"
-                                                    label="用户角色"
-                                                    choices={assignableUserRoleChoices}
+                                                    source="platform_role"
+                                                    label="平台职责"
+                                                    choices={platformRoleChoices}
                                                     required
-                                                    helperText="选择用户在系统中的角色权限"
+                                                    helperText="仅控制平台治理能力，不授予任何项目职责"
                                                 />
                                             </Box>
                                             
@@ -332,8 +337,8 @@ const UserCreate: React.FC = () => {
                                         
                                         <Alert severity="info" sx={{ mt: 2 }}>
                                             <Typography variant="body2">
-                                                <strong>建议：</strong>新客户账户在完成组织要求的身份与邮箱核验前保持“未激活”。
-                                                内部用户（代理、主管、管理员）可按授权流程直接设为“激活”。
+                                                <strong>建议：</strong>新账户在完成组织要求的身份与邮箱核验前保持“未激活”。
+                                                需要参与项目业务时，请在项目成员管理中另行授予项目职责。
                                             </Typography>
                                         </Alert>
                                     </Box>

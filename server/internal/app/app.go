@@ -22,6 +22,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/config"
 	"github.com/seaworld008/chronodesk/server/internal/database"
 	"github.com/seaworld008/chronodesk/server/internal/handlers"
+	"github.com/seaworld008/chronodesk/server/internal/humanopenapi"
 	"github.com/seaworld008/chronodesk/server/internal/mcp"
 	"github.com/seaworld008/chronodesk/server/internal/middleware"
 	"github.com/seaworld008/chronodesk/server/internal/models"
@@ -39,6 +40,18 @@ func ginAdapter(handler func(auth.HTTPContext)) gin.HandlerFunc {
 		ctx := auth.NewGinHTTPContext(c)
 		handler(ctx)
 	}
+}
+
+func registerPlatformProjectRoutes(
+	routes *gin.RouterGroup,
+	handler *handlers.ProjectHandler,
+) {
+	routes.GET("/projects", handler.ListPlatform)
+	routes.POST("/projects", handler.Create)
+	routes.POST(
+		"/projects/:projectPublicID/archive",
+		handler.Archive,
+	)
 }
 
 func migrateAndEnableProjectRLS(cfg *config.Config) error {
@@ -215,6 +228,7 @@ func Run() error {
 		EventSource:                      strings.TrimRight(cfg.Agent.Issuer, "/") + "/events",
 		DefaultCredentialTTL:             cfg.Agent.CredentialTTL,
 		AttachmentStorage:                attachmentStorage,
+		AttachmentStaging:                attachmentStorage,
 		AttachmentMaxBytes:               cfg.Agent.MaxAttachmentBytes,
 		LoopThreshold:                    cfg.Agent.LoopThreshold,
 		LoopWindow:                       cfg.Agent.LoopWindow,
@@ -340,9 +354,11 @@ func Run() error {
 	knowledgeService, err := services.NewKnowledgeService(
 		db.DB,
 		services.KnowledgeServiceDependencies{
-			SearchIndex:    knowledgeSearchIndex,
-			AccessResolver: knowledgeAccessResolver,
-			ModelProviders: knowledgeModelProviders,
+			SearchIndex:          knowledgeSearchIndex,
+			AccessResolver:       knowledgeAccessResolver,
+			ModelProviders:       knowledgeModelProviders,
+			ProjectAuthorization: projectService,
+			Events:               nativeService,
 		},
 	)
 	if err != nil {
@@ -474,7 +490,14 @@ func Run() error {
 	if err != nil {
 		log.Fatal("Failed to initialize A2A backend:", err)
 	}
-	a2aPushDispatcher, err := agentplatform.NewA2AOutboxPushDispatcher(db.DB, nativeService, 8)
+	a2aPushDispatcher, err := agentplatform.NewA2AOutboxPushDispatcher(
+		agentplatform.A2AOutboxPushDispatcherOptions{
+			DB:              db.DB,
+			Native:          nativeService,
+			SecretProtector: secretProtector,
+			MaxAttempts:     8,
+		},
+	)
 	if err != nil {
 		log.Fatal("Failed to initialize A2A push dispatcher:", err)
 	}
@@ -556,6 +579,7 @@ func Run() error {
 		)
 	}
 	openapiContract.RegisterRoutes(r)
+	humanopenapi.RegisterRoutes(r)
 	asyncapiContract.RegisterRoutes(r)
 
 	// 设置中间件配置
@@ -781,27 +805,33 @@ func Run() error {
 		projects.Use(ginAdapter(authModule.Handler.RequireAuth))
 		projects.Use(authenticatedRateLimit)
 		projects.GET("", projectHandler.List)
-		projects.POST(
-			"",
-			ginAdapter(authModule.Handler.RequireRole(auth.RoleAdmin)),
-			projectHandler.Create,
-		)
 		agentAdminRoutes := projects.Group("/:projectKey/admin/agents")
-		agentAdminRoutes.Use(
-			ginAdapter(authModule.Handler.RequireRole(auth.RoleAdmin)),
-		)
-		agentAdminRoutes.Use(middleware.LogAdminOperation(adminAuditService))
 		agentAdminRoutes.Use(
 			handlers.ProjectScopeMiddleware(projectService, db.DB),
 		)
+		agentAdminRoutes.Use(
+			handlers.RequireProjectRoles(models.ProjectRoleAdmin),
+		)
+		agentAdminRoutes.Use(middleware.LogAdminOperation(adminAuditService))
 		agentAdmin.RegisterRoutes(agentAdminRoutes)
 		projectScoped := projects.Group("/:projectKey")
 		projectScoped.Use(handlers.ProjectScopeMiddleware(projectService, db.DB))
+		projectCommands := projects.Group("/:projectKey")
+		projectCommands.Use(
+			handlers.ProjectCommandScopeMiddleware(projectService),
+		)
+		projectExternal := projects.Group("/:projectKey")
+		projectExternal.Use(
+			handlers.ProjectExternalScopeMiddleware(projectService, db.DB),
+		)
 		projectScoped.GET("/context", projectHandler.Current)
 		projectScoped.GET("/queues", projectHandler.ListQueues)
 		projectScoped.GET("/memberships", projectHandler.ListMemberships)
-		projectScoped.POST("/memberships", projectHandler.UpsertMembership)
-		projectScoped.DELETE(
+		projectCommands.POST(
+			"/memberships",
+			projectHandler.UpsertMembership,
+		)
+		projectCommands.DELETE(
 			"/memberships/:userID",
 			projectHandler.DeactivateMembership,
 		)
@@ -824,6 +854,7 @@ func Run() error {
 		agentCollaborationHandler.RegisterRoutes(projectScoped)
 		knowledgeHandler := handlers.NewKnowledgeHandler(knowledgeService)
 		knowledgeHandler.RegisterRoutes(projectScoped)
+		knowledgeHandler.RegisterExternalRoutes(projectExternal)
 		integrationHandler := handlers.NewIntegrationHandler(
 			integrationManagementService,
 		)
@@ -882,9 +913,10 @@ func Run() error {
 			).RegisterRoutes(projectScoped)
 
 			// 基础工单CRUD路由
-			tickets.GET("", ticketHandler.GetTickets)                       // 获取工单列表
-			tickets.GET("/:id", ticketHandler.GetTicket)                    // 获取单个工单
-			tickets.POST("", ticketHandler.CreateTicket)                    // 创建工单
+			tickets.GET("", ticketHandler.GetTickets)    // 获取工单列表
+			tickets.GET("/:id", ticketHandler.GetTicket) // 获取单个工单
+			commandTickets := projectCommands.Group("/tickets")
+			commandTickets.POST("", ticketHandler.CreateTicket)             // 创建工单
 			tickets.PUT("/:id", ticketHandler.UpdateTicket)                 // 更新工单
 			tickets.DELETE("/bulk-delete", ticketHandler.BulkDeleteTickets) // 批量删除工单
 			tickets.DELETE("/:id", ticketHandler.DeleteTicket)              // 删除工单
@@ -896,9 +928,11 @@ func Run() error {
 			tickets.POST("/:id/status", workflowHandler.UpdateTicketStatus) // 更新状态
 			tickets.GET("/:id/history", workflowHandler.GetTicketHistory)   // 获取工单历史
 			contentHandler.RegisterRoutes(tickets)                          // 评论与附件
+			externalTickets := projectExternal.Group("/tickets")
+			contentHandler.RegisterExternalRoutes(externalTickets)
 
 			// 统计和特殊查询路由
-			tickets.GET("/stats", workflowHandler.GetTicketStats)             // 获取工单统计
+			externalTickets.GET("/stats", workflowHandler.GetTicketStats)     // 获取工单统计（Redis 在项目事务外）
 			tickets.GET("/my-tickets", workflowHandler.GetMyTickets)          // 获取我的工单
 			tickets.GET("/unassigned", workflowHandler.GetUnassignedTickets)  // 获取未分配工单
 			tickets.GET("/overdue", workflowHandler.GetOverdueTickets)        // 获取逾期工单
@@ -935,39 +969,55 @@ func Run() error {
 			user.DELETE("/trusted-devices/:id", userHandler.RevokeTrustedDevice)
 		}
 
-		// 管理员路由（需要认证和管理员权限）
-		admin := api.Group("/admin")
-		admin.Use(ginAdapter(authModule.Handler.RequireAuth))
-		admin.Use(authenticatedRateLimit)
-		admin.Use(ginAdapter(authModule.Handler.RequireRole(auth.RoleAdmin)))
-		admin.Use(middleware.LogAdminOperation(adminAuditService))
+		// 平台治理与项目业务使用独立入口。平台角色只授权这里声明的
+		// 精确治理能力，绝不构造 ProjectAccess 或单项目 ProjectScope。
+		platform := api.Group("/platform")
+		platform.Use(ginAdapter(authModule.Handler.RequireAuth))
+		platform.Use(authenticatedRateLimit)
+
+		platformAdmin := platform.Group("")
+		platformAdmin.Use(ginAdapter(authModule.Handler.RequirePlatformRoles(
+			auth.PlatformRolePlatformAdmin,
+		)))
+		platformAdmin.Use(middleware.LogAdminOperation(adminAuditService))
 		{
+			registerPlatformProjectRoutes(platformAdmin, projectHandler)
+
 			// 邮箱配置管理
-			admin.GET("/email-config", emailConfigHandler.GetEmailConfig)
-			admin.PUT("/email-config", emailConfigHandler.UpdateEmailConfig)
-			admin.POST("/email-config/test", emailConfigHandler.TestEmailConnection)
+			platformAdmin.GET("/email-config", emailConfigHandler.GetEmailConfig)
+			platformAdmin.PUT("/email-config", emailConfigHandler.UpdateEmailConfig)
+			platformAdmin.POST("/email-config/test", emailConfigHandler.TestEmailConnection)
 
 			// 管理员用户管理路由
-			adminUserService := services.NewAdminUserService(db.DB)
+			adminUserService, err :=
+				services.NewAdminUserServiceWithAccessRevocationOutbox(
+					db.DB,
+					nativeService,
+				)
+			if err != nil {
+				log.Fatal(
+					"Failed to initialize admin user access-revocation Outbox:",
+					err,
+				)
+			}
 			adminUserHandler := handlers.NewAdminUserHandler(adminUserService)
 
 			// 用户管理路由
-			admin.GET("/users", adminUserHandler.GetUserList)
-			admin.GET("/users/stats", adminUserHandler.GetUserStats)
-			admin.GET("/users/:id", adminUserHandler.GetUser)
-			admin.POST("/users", adminUserHandler.CreateUser)
-			admin.PUT("/users/:id", adminUserHandler.UpdateUser)
-			admin.DELETE("/users/:id", adminUserHandler.DeleteUser)
-			admin.POST("/users/:id/reset-password", adminUserHandler.ResetUserPassword)
-			admin.GET("/audit-logs", adminAuditHandler.GetAuditLogs)
+			platformAdmin.GET("/users", adminUserHandler.GetUserList)
+			platformAdmin.GET("/users/stats", adminUserHandler.GetUserStats)
+			platformAdmin.GET("/users/:id", adminUserHandler.GetUser)
+			platformAdmin.POST("/users", adminUserHandler.CreateUser)
+			platformAdmin.PUT("/users/:id", adminUserHandler.UpdateUser)
+			platformAdmin.DELETE("/users/:id", adminUserHandler.DeleteUser)
+			platformAdmin.POST("/users/:id/reset-password", adminUserHandler.ResetUserPassword)
 
 			// 系统配置和清理管理路由
 			systemHandler := handlers.NewSystemHandler(db.DB)
-			systemHandler.RegisterRoutes(admin)
+			systemHandler.RegisterRoutes(platformAdmin)
 
 			// 系统全局配置管理路由
 			configHandler := handlers.NewConfigHandler(db.DB)
-			configs := admin.Group("/configs")
+			configs := platformAdmin.Group("/configs")
 			{
 				configs.GET("", configHandler.GetAllConfigs)                     // 获取所有配置
 				configs.GET("/:key", configHandler.GetConfig)                    // 获取单个配置
@@ -982,8 +1032,11 @@ func Run() error {
 			}
 
 			// 系统监控统计管理路由
-			analyticsHandler := handlers.NewAnalyticsHandler(db.DB)
-			analytics := admin.Group("/analytics")
+			analyticsHandler := handlers.NewAnalyticsHandler(
+				db.DB,
+				projectService,
+			)
+			analytics := platformAdmin.Group("/analytics")
 			{
 				analytics.GET("/system", analyticsHandler.GetSystemStats)       // 获取系统运行状态
 				analytics.GET("/business", analyticsHandler.GetBusinessStats)   // 获取业务数据统计
@@ -995,10 +1048,21 @@ func Run() error {
 
 		}
 
+		platformAudit := platform.Group("")
+		platformAudit.Use(ginAdapter(authModule.Handler.RequirePlatformRoles(
+			auth.PlatformRolePlatformAdmin,
+			auth.PlatformRoleSecurityAuditor,
+		)))
+		platformAudit.GET("/audit-logs", adminAuditHandler.GetAuditLogs)
+
 		// 通知系统服务和处理器
 		notificationService := services.NewNotificationServiceWithProtector(
 			db.DB,
 			secretProtector,
+		)
+		notificationService.ConfigureWebhookTestCommands(
+			projectService,
+			nativeService,
 		)
 
 		// 邮件配置服务 (使用前面已声明的变量)
@@ -1009,6 +1073,21 @@ func Run() error {
 
 		// 将邮件通知服务注入到通知服务中
 		notificationService.SetEmailNotificationService(emailNotificationService)
+
+		// WebSocket access revocation is an explicit Outbox consumer. The Hub
+		// is constructed before the worker so a committed revocation can never
+		// be acknowledged without a live close-and-drain target.
+		websocketPkg.ConfigureOriginCheck(
+			cfg.CORS.AllowedOrigins,
+			cfg.Server.Environment != "production",
+		)
+		wsHub := websocketPkg.NewHub(
+			websocketPkg.NewDatabaseFanoutAuthorizer(db.DB),
+		)
+		wsNotificationService := websocketPkg.NewNotificationWebSocketService(
+			wsHub,
+		)
+
 		outboxDeliverer, err := agentplatform.NewNativeOutboxDeliverer(
 			agentplatform.NativeOutboxDelivererOptions{
 				DB:                db.DB,
@@ -1017,7 +1096,10 @@ func Run() error {
 				Automation:        automationService,
 				SLAEscalation:     slaEscalationConsumer,
 				AttachmentStorage: attachmentStorage,
+				AttachmentUploads: nativeService,
+				Knowledge:         knowledgeService,
 				AuthEmails:        authModule.EmailOutboxConsumer,
+				AccessRevocations: wsHub,
 				SecretProtector:   secretProtector,
 			},
 		)
@@ -1032,11 +1114,6 @@ func Run() error {
 
 		notificationHandler := handlers.NewNotificationHandler(notificationService)
 
-		// 初始化 WebSocket Hub 和 WebSocket 通知服务
-		websocketPkg.ConfigureOriginCheck(cfg.CORS.AllowedOrigins, cfg.Server.Environment != "production")
-		wsHub := websocketPkg.NewHub()
-		wsNotificationService := websocketPkg.NewNotificationWebSocketService(wsHub)
-
 		agentWorkers.Add(1)
 		go func() {
 			defer agentWorkers.Done()
@@ -1045,56 +1122,38 @@ func Run() error {
 
 		// 设置全局WebSocket通知服务以供hook使用
 		websocketPkg.SetGlobalNotificationService(wsNotificationService)
-		websocketPkg.SetNotificationReadHandler(func(
-			ctx context.Context,
-			scope models.ProjectScope,
-			userID uint,
-			notificationID uint,
-		) (int64, error) {
-			// WebSocket 连接可能长于一次成员授权。每次写入前重新校验
-			// 当前用户仍是项目成员（平台管理员除外），再构造可信操作上下文。
-			var authorized int64
-			if err := db.DB.WithContext(ctx).
-				Table("projects").
-				Joins("JOIN users ON users.id = ?", userID).
-				Joins(
-					"LEFT JOIN project_memberships ON project_memberships.project_id = projects.id AND project_memberships.user_id = users.id AND project_memberships.is_active = ?",
-					true,
-				).
-				Where(
-					"projects.id = ? AND projects.organization_id = ? AND projects.status = ? AND users.status = ? AND (project_memberships.id IS NOT NULL OR users.role = ?)",
-					scope.ProjectID,
-					scope.OrganizationID,
-					models.ProjectStatusActive,
-					models.UserStatusActive,
-					models.RoleAdmin,
-				).
-				Count(&authorized).Error; err != nil {
-				return 0, fmt.Errorf("revalidate WebSocket project access: %w", err)
-			}
-			if authorized != 1 {
-				return 0, services.ErrProjectAccessDenied
-			}
-			operationContext, err := services.WithOperationContext(
-				ctx,
-				services.OperationContext{
-					Scope:  scope,
-					Actor:  models.HumanActor(userID),
-					Source: services.SourceProtocolHumanREST,
+		websocketPkg.SetNotificationReadHandler(
+			websocketPkg.NewDatabaseNotificationReadHandler(
+				db.DB,
+				func(
+					ctx context.Context,
+					scope models.ProjectScope,
+					userID uint,
+				) (context.Context, error) {
+					return services.WithOperationContext(
+						ctx,
+						services.OperationContext{
+							Scope:  scope,
+							Actor:  models.HumanActor(userID),
+							Source: services.SourceProtocolHumanREST,
+						},
+					)
 				},
-			)
-			if err != nil {
-				return 0, err
-			}
-			if err := notificationService.MarkAsRead(
-				operationContext,
-				notificationID,
-				userID,
-			); err != nil {
-				return 0, err
-			}
-			return notificationService.GetUnreadCount(operationContext, userID)
-		})
+				func(
+					ctx context.Context,
+					scope models.ProjectScope,
+					userID uint,
+				) error {
+					_, err := projectService.RevalidateHumanProjectAccess(
+						ctx,
+						scope,
+						userID,
+					)
+					return err
+				},
+				notificationService,
+			),
+		)
 
 		// 通知属于项目数据，读写必须经过显式项目路径与同一 RLS 事务。
 		notifications := projectScoped.Group("/notifications")
@@ -1123,10 +1182,6 @@ func Run() error {
 				c.Request.Context(),
 				c.Param("projectKey"),
 				c.GetUint("user_id"),
-				strings.EqualFold(
-					strings.TrimSpace(c.GetString("user_role")),
-					string(models.RoleAdmin),
-				),
 			)
 			if err != nil {
 				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
@@ -1139,25 +1194,26 @@ func Run() error {
 		})
 
 		// Webhook 是项目级出站连接，不再保留全局隐式项目路由。
+		webhookHandler := handlers.NewWebhookHandlerWithProtector(
+			db.DB,
+			secretProtector,
+			notificationService,
+		)
 		webhooks := projectScoped.Group("/webhooks")
 		webhooks.Use(middleware.LogAdminOperation(adminAuditService))
 		{
-			// 创建Webhook处理器
-			webhookHandler := handlers.NewWebhookHandlerWithProtector(
-				db.DB,
-				secretProtector,
-			)
-
 			// Webhook配置管理路由
 			webhooks.GET("", webhookHandler.ListWebhooks)              // 获取webhook列表
 			webhooks.POST("", webhookHandler.CreateWebhook)            // 创建webhook
 			webhooks.GET("/:id", webhookHandler.GetWebhook)            // 获取webhook详情
 			webhooks.PUT("/:id", webhookHandler.UpdateWebhook)         // 更新webhook
 			webhooks.DELETE("/:id", webhookHandler.DeleteWebhook)      // 删除webhook
-			webhooks.POST("/:id/test", webhookHandler.TestWebhook)     // 测试webhook
 			webhooks.GET("/:id/logs", webhookHandler.GetWebhookLogs)   // 获取webhook日志
 			webhooks.GET("/:id/stats", webhookHandler.GetWebhookStats) // 获取webhook统计
 		}
+		webhookCommands := projectCommands.Group("/webhooks")
+		webhookCommands.Use(middleware.LogAdminOperation(adminAuditService))
+		webhookCommands.POST("/:id/test", webhookHandler.TestWebhook)
 
 	}
 

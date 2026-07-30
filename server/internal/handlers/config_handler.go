@@ -15,6 +15,14 @@ type ConfigHandler struct {
 	configService *services.ConfigService
 }
 
+type systemConfigUpdateRequest struct {
+	Value       string `json:"value"`
+	ValueType   string `json:"value_type" binding:"required,oneof=string int bool json"`
+	Description string `json:"description" binding:"max=500"`
+	Category    string `json:"category" binding:"max=50"`
+	Group       string `json:"group" binding:"max=50"`
+}
+
 // NewConfigHandler 创建配置处理器
 func NewConfigHandler(db *gorm.DB) *ConfigHandler {
 	return &ConfigHandler{
@@ -31,7 +39,7 @@ func NewConfigHandler(db *gorm.DB) *ConfigHandler {
 // @Success 200 {object} map[string]interface{} "成功"
 // @Failure 401 {object} map[string]interface{} "未授权"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/configs [get]
+// @Router /api/platform/configs [get]
 func (h *ConfigHandler) GetAllConfigs(c *gin.Context) {
 	category := c.Query("category")
 
@@ -70,7 +78,7 @@ func (h *ConfigHandler) GetAllConfigs(c *gin.Context) {
 // @Success 200 {object} map[string]interface{} "成功"
 // @Failure 404 {object} map[string]interface{} "配置不存在"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/configs/{key} [get]
+// @Router /api/platform/configs/{key} [get]
 func (h *ConfigHandler) GetConfig(c *gin.Context) {
 	key := c.Param("key")
 
@@ -104,10 +112,10 @@ func (h *ConfigHandler) GetConfig(c *gin.Context) {
 // @Failure 400 {object} map[string]interface{} "请求参数错误"
 // @Failure 409 {object} map[string]interface{} "配置已存在"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/configs [post]
+// @Router /api/platform/configs [post]
 func (h *ConfigHandler) CreateConfig(c *gin.Context) {
 	var req models.SystemConfig
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数错误",
@@ -154,12 +162,12 @@ func (h *ConfigHandler) CreateConfig(c *gin.Context) {
 // @Failure 400 {object} map[string]interface{} "请求参数错误"
 // @Failure 404 {object} map[string]interface{} "配置不存在"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/configs/{key} [put]
+// @Router /api/platform/configs/{key} [put]
 func (h *ConfigHandler) UpdateConfig(c *gin.Context) {
 	key := c.Param("key")
 
-	var req models.SystemConfig
-	if err := c.ShouldBindJSON(&req); err != nil {
+	var req systemConfigUpdateRequest
+	if err := decodeStrictJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数错误",
@@ -169,10 +177,8 @@ func (h *ConfigHandler) UpdateConfig(c *gin.Context) {
 	}
 
 	// 确保 key 一致
-	req.Key = key
-
 	// 验证配置值类型
-	if err := h.configService.ValidateConfig(req.Key, req.Value, req.ValueType); err != nil {
+	if err := h.configService.ValidateConfig(key, req.Value, req.ValueType); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "配置值验证失败",
@@ -181,7 +187,7 @@ func (h *ConfigHandler) UpdateConfig(c *gin.Context) {
 		return
 	}
 
-	if err := h.configService.SetConfig(req.Key, req.Value, req.ValueType, req.Description, req.Category, req.Group); err != nil {
+	if err := h.configService.SetConfig(key, req.Value, req.ValueType, req.Description, req.Category, req.Group); err != nil {
 		logHandlerFailure(c, "config.update", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -207,7 +213,7 @@ func (h *ConfigHandler) UpdateConfig(c *gin.Context) {
 // @Success 200 {object} map[string]interface{} "删除成功"
 // @Failure 404 {object} map[string]interface{} "配置不存在"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/configs/{key} [delete]
+// @Router /api/platform/configs/{key} [delete]
 func (h *ConfigHandler) DeleteConfig(c *gin.Context) {
 	key := c.Param("key")
 
@@ -236,10 +242,10 @@ func (h *ConfigHandler) DeleteConfig(c *gin.Context) {
 // @Success 200 {object} map[string]interface{} "更新成功"
 // @Failure 400 {object} map[string]interface{} "请求参数错误"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/configs/batch [put]
+// @Router /api/platform/configs/batch [put]
 func (h *ConfigHandler) BatchUpdateConfigs(c *gin.Context) {
 	var configs []models.SystemConfig
-	if err := c.ShouldBindJSON(&configs); err != nil {
+	if err := decodeStrictJSON(c, &configs); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数错误",
@@ -286,7 +292,7 @@ func (h *ConfigHandler) BatchUpdateConfigs(c *gin.Context) {
 // @Security ApiKeyAuth
 // @Success 200 {object} map[string]interface{} "成功"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/configs/security-policy [get]
+// @Router /api/platform/configs/security-policy [get]
 func (h *ConfigHandler) GetSecurityPolicy(c *gin.Context) {
 	policy, err := h.configService.GetSecurityPolicy()
 	if err != nil {
@@ -315,7 +321,7 @@ func (h *ConfigHandler) GetSecurityPolicy(c *gin.Context) {
 // @Param format query string false "导出格式" Enums(json) default(json)
 // @Success 200 {object} map[string]interface{} "导出成功"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/configs/export [get]
+// @Router /api/platform/configs/export [get]
 func (h *ConfigHandler) ExportConfigs(c *gin.Context) {
 	category := c.Query("category")
 	format := c.DefaultQuery("format", "json")
@@ -355,7 +361,7 @@ func (h *ConfigHandler) ExportConfigs(c *gin.Context) {
 // @Success 200 {object} map[string]interface{} "导入成功"
 // @Failure 400 {object} map[string]interface{} "请求参数错误"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/configs/import [post]
+// @Router /api/platform/configs/import [post]
 func (h *ConfigHandler) ImportConfigs(c *gin.Context) {
 	file, err := c.FormFile("file")
 	if err != nil {
@@ -420,7 +426,7 @@ func (h *ConfigHandler) ImportConfigs(c *gin.Context) {
 // @Security ApiKeyAuth
 // @Success 200 {object} map[string]interface{} "成功"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
-// @Router /api/admin/configs/init [post]
+// @Router /api/platform/configs/init [post]
 func (h *ConfigHandler) InitDefaultConfigs(c *gin.Context) {
 	if err := h.configService.InitDefaultConfigs(); err != nil {
 		logHandlerFailure(c, "config.initialize_defaults", err)

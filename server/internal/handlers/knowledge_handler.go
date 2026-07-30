@@ -52,14 +52,25 @@ func (handler *KnowledgeHandler) RegisterRoutes(projectGroup *gin.RouterGroup) {
 		"/versions/:versionID/publication",
 		handler.PublishVersion,
 	)
-	knowledge.POST("/index-rebuilds", handler.RebuildIndex)
-	knowledge.POST("/searches", handler.Search)
 	knowledge.POST(
 		"/citations/:citationID/feedback",
 		handler.RecordFeedback,
 	)
+	knowledge.GET("/index-rebuilds/current", handler.GetIndexState)
 	knowledge.GET("/model-policy", handler.GetModelPolicy)
 	knowledge.PUT("/model-policy", handler.UpdateModelPolicy)
+}
+
+// RegisterExternalRoutes mounts knowledge operations that cross a model or
+// search-index boundary. The group must use
+// ProjectExternalScopeMiddleware; each service flow performs its own
+// snapshot -> external I/O -> final live revalidation sequence.
+func (handler *KnowledgeHandler) RegisterExternalRoutes(
+	projectGroup *gin.RouterGroup,
+) {
+	knowledge := projectGroup.Group("/knowledge")
+	knowledge.POST("/index-rebuilds", handler.RebuildIndex)
+	knowledge.POST("/searches", handler.Search)
 }
 
 type createKnowledgeArticleRequest struct {
@@ -424,10 +435,26 @@ func (handler *KnowledgeHandler) RebuildIndex(c *gin.Context) {
 		handler.writeError(c, err)
 		return
 	}
+	c.JSON(http.StatusAccepted, gin.H{
+		"code": 0,
+		"msg":  "知识索引重建已进入持久队列",
+		"data": newKnowledgeIndexStateResponse(*state),
+	})
+}
+
+func (handler *KnowledgeHandler) GetIndexState(c *gin.Context) {
+	if !handler.requireProjectAccess(c, false) {
+		return
+	}
+	state, err := handler.service.GetIndexState(c.Request.Context())
+	if err != nil {
+		handler.writeError(c, err)
+		return
+	}
 	handler.response.Success(
 		c,
 		newKnowledgeIndexStateResponse(*state),
-		"知识索引重建成功",
+		"获取知识索引状态成功",
 	)
 }
 

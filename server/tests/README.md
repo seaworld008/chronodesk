@@ -8,7 +8,7 @@
 ```text
 tests/
 ├── auth/          注册、登录、刷新、登出、OTP、可信设备与备用码
-├── human/         四角色 RBAC、对象权限、边界、评论、附件、通知与错误契约
+├── human/         平台/项目角色矩阵、对象权限、边界、评论、附件、通知与错误契约
 ├── tickets/       Ticket 生命周期、Assignment、通知隔离与清理
 ├── automation/    规则、SLA、模板与快速回复
 ├── system/        配置、健康与维护操作
@@ -75,6 +75,9 @@ make smoke
 Cookie、Authorization、client secret、password 与 DSN。
 
 Human REST 套件统一使用 `E2E-<run-id>-` 前缀，并在删除前重新校验资源所有权。
+业务人物固定以 `platform_role=member` 创建，再通过
+`/api/projects/{key}/memberships` 显式获得五种 `project_role` 之一；平台治理测试
+单独创建无 Membership 的四种平台身份。
 429 用例会耗尽一个本轮专用用户的单路由限流桶；默认最多发出 1000 次请求，
 如测试环境采用更高限额，需显式设置 `TEST_RATE_LIMIT_EXHAUSTION_CEILING`。
 完整映射与证据边界见 [CASE_MAPPING.md](CASE_MAPPING.md)。

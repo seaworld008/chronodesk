@@ -77,7 +77,7 @@ func TestCreateAutomationRuleDefaultsToInactive(t *testing.T) {
 		Username:     "automation-author",
 		Email:        "automation-author@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
@@ -114,7 +114,7 @@ func TestDeleteAutomationRuleRetainsExecutionAuditLog(t *testing.T) {
 	}
 	user := models.User{
 		Username: "automation-delete-author", Email: "automation-delete@example.com",
-		PasswordHash: "hashed", Role: models.RoleAdmin, Status: models.UserStatusActive,
+		PasswordHash: "hashed", PlatformRole: models.PlatformRolePlatformAdmin, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
@@ -193,7 +193,7 @@ func TestAutomationRuleWritesRequireCurrentCloudEventTypes(t *testing.T) {
 		Username:     "automation-contract-author",
 		Email:        "automation-contract-author@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
@@ -290,7 +290,7 @@ func TestClassifyTicketPersistsCanonicalType(t *testing.T) {
 		Username:     "automation-classifier",
 		Email:        "automation-classifier@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
@@ -418,7 +418,7 @@ func TestAutomationAndSLAResourcesAreStrictlyProjectScoped(t *testing.T) {
 		Username:     "automation-project-owner",
 		Email:        "automation-project-owner@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {

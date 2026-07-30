@@ -74,7 +74,7 @@ func (h *SystemHandler) GetCleanupConfig(c *gin.Context) {
 // UpdateCleanupConfig 更新清理配置
 func (h *SystemHandler) UpdateCleanupConfig(c *gin.Context) {
 	var req models.CleanupConfig
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":   "invalid_request",
 			"message": "请求体格式无效",
@@ -117,7 +117,7 @@ func (h *SystemHandler) ExecuteCleanup(c *gin.Context) {
 		TaskType string `json:"task_type" validate:"required"`
 	}
 
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":   "invalid_request",
 			"message": "请求体格式无效",

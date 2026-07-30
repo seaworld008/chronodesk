@@ -112,6 +112,7 @@ def test_ticket_create_input_boundaries(
 
 
 def test_ticket_pagination_and_identifier_bounds(
+    admin_api: APIClient,
     e2e_manager: E2EResourceManager,
     human_identities: Mapping[str, HumanIdentity],
 ) -> None:
@@ -140,8 +141,8 @@ def test_ticket_pagination_and_identifier_bounds(
     not_found = admin.api.get_json(e2e_manager.project_path("tickets/4294967295"))
     assert_error_contract(not_found, 404)
 
-    oversized_user_page = admin.api.get_json(
-        "/admin/users",
+    oversized_user_page = admin_api.get_json(
+        "/platform/users",
         params={"page": 1, "page_size": 101},
     )
     assert_error_contract(oversized_user_page, 400)

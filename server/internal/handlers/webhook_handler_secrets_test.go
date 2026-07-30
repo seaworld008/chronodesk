@@ -30,7 +30,7 @@ func TestWebhookHandlerEncryptsCredentialsAtRest(t *testing.T) {
 	}
 	user := models.User{
 		ID: 1, Username: "webhook-admin", Email: "webhook-admin@example.test",
-		PasswordHash: "hash", Role: models.RoleAdmin, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRolePlatformAdmin, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
@@ -272,7 +272,7 @@ func TestWebhookHandlerEnforcesCanonicalEventsAndTransitionPredicates(t *testing
 		Username:     "admin-contract",
 		Email:        "admin-contract@example.test",
 		PasswordHash: "hash",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}).Error; err != nil {
 		t.Fatal(err)

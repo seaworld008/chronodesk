@@ -22,6 +22,13 @@ func TestBulkUpdateTicketsWritesVersionedAuditAndOutboxAtomically(t *testing.T) 
 	native := NewAgentNativeService(db)
 	service := &TicketService{db: db, agentNative: native}
 	ctx := testProjectOperationContext(t, db, models.HumanActor(actor.ID))
+	ensureTestHumanProjectRole(
+		t,
+		db,
+		ctx,
+		assignee.ID,
+		models.ProjectRoleAgent,
+	)
 
 	status := string(models.TicketStatusInProgress)
 	priority := string(models.TicketPriorityHigh)

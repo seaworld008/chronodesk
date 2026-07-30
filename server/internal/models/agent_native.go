@@ -99,6 +99,11 @@ type ServicePrincipal struct {
 	ReadOnly           bool       `json:"read_only" gorm:"not null;default:false"`
 	EmergencyDisabled  bool       `json:"emergency_disabled" gorm:"not null;default:false;index"`
 	LastUsedAt         *time.Time `json:"last_used_at,omitempty"`
+	// PolicyEpoch is the serialized policy-set version. Every policy create,
+	// disable or future mutation locks this principal and increments the epoch;
+	// prepared PolicyDecisions must match it again in the final business
+	// transaction.
+	PolicyEpoch uint64 `json:"-" gorm:"not null;default:1"`
 
 	CreatedByID *uint `json:"created_by_id,omitempty" gorm:"index"`
 
@@ -219,6 +224,7 @@ type PolicyDecision struct {
 	Allowed            bool           `json:"allowed" gorm:"not null;index"`
 	ReasonCode         string         `json:"reason_code" gorm:"size:100;not null;index"`
 	MatchedPolicyID    string         `json:"matched_policy_id,omitempty" gorm:"size:36;index"`
+	PolicyEpoch        uint64         `json:"-" gorm:"not null;index"`
 	RequestDigest      string         `json:"request_digest,omitempty" gorm:"size:64"`
 	SourceProtocol     string         `json:"source_protocol,omitempty" gorm:"size:32"`
 	Context            datatypes.JSON `json:"context,omitempty" gorm:"type:jsonb"`
