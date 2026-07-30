@@ -20,8 +20,8 @@ AUTH-004	hybrid	pytest@server/tests/auth/test_auth_flows.py::test_register_refre
 AUTH-005	automated	pytest@server/tests/auth/test_auth_flows.py::test_wrong_password_and_unknown_email_are_indistinguishable_and_limited	not_recorded
 AUTH-006	automated	pytest@server/tests/auth/test_auth_flows.py::test_wrong_password_and_unknown_email_are_indistinguishable_and_limited	not_recorded
 AUTH-007	hybrid	go@server/internal/auth/handler_access_state_test.go::TestJWTManagerRejectsWrongAudienceAndSubject;pytest@server/tests/human/test_zz_error_contract.py::test_authentication_authorization_and_not_found_errors_are_machine_safe	not_recorded
-AUTH-008	automated	go@server/internal/auth/handler_access_state_test.go::TestRequireAuthRevalidatesCurrentUserStateAndRole	not_recorded
-AUTH-009	automated	go@server/internal/auth/handler_access_state_test.go::TestRequireAuthRevalidatesCurrentUserStateAndRole	not_recorded
+AUTH-008	automated	go@server/internal/auth/handler_access_state_test.go::TestRequireAuthRevalidatesCurrentUserStateAndPlatformRole	not_recorded
+AUTH-009	automated	go@server/internal/auth/handler_access_state_test.go::TestRequireAuthRevalidatesCurrentUserStateAndPlatformRole	not_recorded
 AUTH-010	hybrid	go@server/internal/auth/token_storage_test.go::TestRefreshRotationIsAtomicAndSingleWinner;pytest@server/tests/auth/test_auth_flows.py::test_register_refresh_and_logout	not_recorded
 AUTH-011	automated	go@server/internal/auth/session_revocation_test.go::TestRefreshTokenCanOnlyBeConsumedOnce	not_recorded
 AUTH-012	hybrid	go@server/internal/auth/session_revocation_test.go::TestLogoutRevokesAccessTokenSessionImmediately;pytest@server/tests/auth/test_auth_flows.py::test_register_refresh_and_logout	not_recorded
@@ -42,11 +42,11 @@ RBAC-004	automated	pytest@server/tests/human/test_failure_driven_contracts.py::t
 RBAC-005	automated	pytest@server/tests/human/test_rbac_matrix.py::test_ticket_object_permission_matrix	not_recorded
 RBAC-006	automated	pytest@server/tests/human/test_rbac_matrix.py::test_ticket_object_permission_matrix	not_recorded
 RBAC-007	automated	pytest@server/tests/human/test_content_and_notifications.py::test_public_and_internal_comment_permissions	not_recorded
-RBAC-008	automated	pytest@server/tests/human/test_rbac_matrix.py::test_four_human_roles_and_admin_only_surfaces	not_recorded
+RBAC-008	automated	pytest@server/tests/human/test_rbac_matrix.py::test_platform_permission_matrix_never_grants_implicit_project_access;pytest@server/tests/human/test_rbac_matrix.py::test_project_permission_matrix_uses_only_active_membership	not_recorded
 RBAC-009	automated	pytest@server/tests/human/test_zz_error_contract.py::test_suspended_account_invalidates_an_existing_access_token;pytest@server/tests/human/test_zz_error_contract.py::test_deleted_account_invalidates_an_existing_access_token	not_recorded
-RBAC-010	hybrid	go@server/internal/auth/gorm_repository_role_test.go::TestGormUserRepositoryRejectsRolesOutsideClosedHumanEnum;pytest@server/tests/human/test_rbac_matrix.py::test_four_human_roles_and_admin_only_surfaces;pytest@server/tests/human/test_rbac_matrix.py::test_soft_deleted_human_identity_returns_stable_conflict	not_recorded
-RBAC-011	hybrid	go@server/internal/services/admin_user_service_role_test.go::TestAdminUserServiceUpdatePreservesLastActiveAdmin;playwright@web/e2e/00-users.spec.ts::RBAC-011 UI-013：最后一个活跃管理员不能被降级且提示中文	not_recorded
-RBAC-012	automated	pytest@server/tests/human/test_rbac_matrix.py::test_human_role_change_audit_identifies_actor_target_result_and_redacts_query	not_recorded
+RBAC-010	hybrid	go@server/internal/auth/gorm_repository_role_test.go::TestGormUserRepositoryRejectsRolesOutsideClosedPlatformEnum;pytest@server/tests/human/test_rbac_matrix.py::test_unknown_roles_fail_closed;pytest@server/tests/human/test_rbac_matrix.py::test_soft_deleted_human_identity_returns_stable_conflict	not_recorded
+RBAC-011	hybrid	go@server/internal/services/admin_user_service_role_test.go::TestAdminUserServiceUpdatePreservesLastActiveAdmin;playwright@web/e2e/00-users.spec.ts::RBAC-011 UI-013：最后一个活跃平台管理员不能被降级且提示中文	not_recorded
+RBAC-012	automated	pytest@server/tests/human/test_rbac_matrix.py::test_platform_role_change_audit_identifies_actor_target_result_and_redacts_query	not_recorded
 TKT-001	hybrid	go@server/internal/services/agent_native_service_test.go::TestAgentNativeTicketCreateCommitsHistoryEventOutboxAndIdempotency;pytest@server/tests/human/test_ticket_boundaries.py::test_ticket_create_input_boundaries	not_recorded
 TKT-002	hybrid	go@server/internal/handlers/ticket_human_contract_test.go::TestHumanTicketCreateTrimsRequiredTextAndRejectsBlankValues;pytest@server/tests/human/test_ticket_boundaries.py::test_ticket_create_input_boundaries	not_recorded
 TKT-003	hybrid	go@server/internal/services/agent_native_service_test.go::TestAgentNativeIdempotencyReserveCompleteReplayAndConflict;pytest@server/tests/agent_protocol/test_oauth_and_agent_rest.py::test_agent_rest_ticket_idempotency_lease_version_and_event_cursor	not_recorded
@@ -188,16 +188,16 @@ A2A-016	automated	go@server/internal/agentplatform/assignment_adapter_test.go::T
 UI-001	hybrid	playwright@web/e2e/tickets.spec.ts::should allow user to login;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-001	not_recorded
 UI-002	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-002	not_recorded
 UI-003	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-003	not_recorded
-UI-004	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-004 UI-006 UI-028：全部 15 张企业表用真实数据验证实际单行布局;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-004	not_recorded
-UI-005	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-005 UI-026：全部 15 张表的键盘列宽可持久化且双击复位也持久化;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-005	not_recorded
-UI-006	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-004 UI-006 UI-028：全部 15 张企业表用真实数据验证实际单行布局;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-006	not_recorded
+UI-004	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-004 UI-006 UI-028：全部 13 张现存企业表用真实数据验证实际单行布局，平台用户详情不投影项目工单;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-004	not_recorded
+UI-005	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-005 UI-026：全部 13 张现存表的键盘列宽可持久化且双击复位也持久化;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-005	not_recorded
+UI-006	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-004 UI-006 UI-028：全部 13 张现存企业表用真实数据验证实际单行布局，平台用户详情不投影项目工单;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-006	not_recorded
 UI-007	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-007 UI-029：窄视口横向滚动后 sticky 右操作列仍贴边、命中且按钮有名称;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-007	not_recorded
 UI-008	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-008	not_recorded
 UI-009	hybrid	playwright@web/e2e/tickets.spec.ts::should view ticket details;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-009	not_recorded
 UI-010	hybrid	playwright@web/e2e/ticket-workflow.spec.ts::should create assign resolve close and delete ticket;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-010	not_recorded
 UI-011	hybrid	playwright@web/e2e/ticket-content.spec.ts::CNT-001 CNT-002 CNT-006 CNT-009 UI-011：评论、上传、扫描与下载;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-011	not_recorded
 UI-012	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-012	not_recorded
-UI-013	hybrid	playwright@web/e2e/00-users.spec.ts::RBAC-010 UI-013：创建并编辑管理员、主管、客服代理、客户;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-013	not_recorded
+UI-013	hybrid	playwright@web/e2e/00-users.spec.ts::RBAC-010 UI-013：创建并编辑四种平台角色;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-013	not_recorded
 UI-014	hybrid	playwright@web/e2e/notifications.spec.ts::应显示本轮真实创建的通知;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-014	not_recorded
 UI-015	hybrid	playwright@web/e2e/automation-rules.spec.ts::should create an automation rule;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-015	not_recorded
 UI-016	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-016	not_recorded
@@ -210,9 +210,9 @@ UI-022	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-022
 UI-023	hybrid	playwright@web/e2e/trusted-devices.spec.ts::AUTH-019 AUTH-022 UI-023：可信设备仅使用 HttpOnly Cookie 并可撤销;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-023	not_recorded
 UI-024	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-024	not_recorded
 UI-025	hybrid	playwright@web/e2e/00-site-health.spec.ts::UI-025 UI-030：无浏览器错误、失败资源或英文操作提示;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-025	not_recorded
-UI-026	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-005 UI-026：全部 15 张表的键盘列宽可持久化且双击复位也持久化;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-026	not_recorded
+UI-026	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-005 UI-026：全部 13 张现存表的键盘列宽可持久化且双击复位也持久化;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-026	not_recorded
 UI-027	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-027	not_recorded
-UI-028	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-004 UI-006 UI-028：全部 15 张企业表用真实数据验证实际单行布局;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-028	not_recorded
+UI-028	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-004 UI-006 UI-028：全部 13 张现存企业表用真实数据验证实际单行布局，平台用户详情不投影项目工单;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-028	not_recorded
 UI-029	fault_injection	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-029	not_recorded
 UI-030	hybrid	playwright@web/e2e/00-site-health.spec.ts::UI-025 UI-030：无浏览器错误、失败资源或英文操作提示;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-030	not_recorded
 SEC-001	hybrid	go@server/internal/services/ticket_service_filters_test.go::TestGetTickets_SortFieldInjectionFallsBackToCreatedAt;manual@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::SEC-001	not_recorded
