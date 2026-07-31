@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1117,6 +1118,18 @@ func TestAPIHandlerRegistersAndServesLeaseCommandRoutes(t *testing.T) {
 		router.ServeHTTP(recorder, request)
 		return recorder
 	}
+	doDeleteRequest := func(
+		path string,
+		idempotencyKey string,
+	) *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodDelete, path, nil)
+		request.Header.Set("Authorization", "Bearer "+accessToken)
+		request.Header.Set("Idempotency-Key", idempotencyKey)
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, request)
+		return recorder
+	}
 
 	claimBody := `{"ttl_seconds":60}`
 	claimPath := fmt.Sprintf("/api/v2/projects/TEST/tickets/%d/claim", ticket.ID)
@@ -1197,6 +1210,66 @@ func TestAPIHandlerRegistersAndServesLeaseCommandRoutes(t *testing.T) {
 		heartbeatRecord.ProjectID != projectFixture.project.ID {
 		t.Fatalf("heartbeat idempotency record lost project binding: %+v", heartbeatRecord)
 	}
+	t.Run("heartbeat replay", func(t *testing.T) {
+		assertLeaseReplayResourceIDValidation(
+			t,
+			db,
+			&heartbeatRecord,
+			heartbeatResponse,
+			func() *httptest.ResponseRecorder {
+				return doRequest(
+					heartbeatPath,
+					"heartbeat-route-key",
+					heartbeatBody,
+				)
+			},
+		)
+	})
+
+	releasePath := "/api/v2/projects/TEST/leases/" +
+		claimEnvelope.Data.LeaseID
+	releaseResponse := doDeleteRequest(
+		releasePath,
+		"release-route-key",
+	)
+	if releaseResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"release status=%d body=%s",
+			releaseResponse.Code,
+			releaseResponse.Body.String(),
+		)
+	}
+	var releaseRecord models.IdempotencyRecord
+	if err := db.Where(
+		"actor_id = ? AND operation = ? AND key = ?",
+		principal.ID,
+		"ticket.lease.release",
+		"release-route-key",
+	).First(&releaseRecord).Error; err != nil {
+		t.Fatal(err)
+	}
+	if releaseRecord.OrganizationID != projectFixture.organization.ID ||
+		releaseRecord.ProjectID != projectFixture.project.ID ||
+		releaseRecord.ResourceID != fmt.Sprint(ticket.ID) {
+		t.Fatalf(
+			"release idempotency record lost project or ticket binding: %+v",
+			releaseRecord,
+		)
+	}
+	t.Run("release replay", func(t *testing.T) {
+		assertLeaseReplayResourceIDValidation(
+			t,
+			db,
+			&releaseRecord,
+			releaseResponse,
+			func() *httptest.ResponseRecorder {
+				return doDeleteRequest(
+					releasePath,
+					"release-route-key",
+				)
+			},
+		)
+	})
 
 	mismatchPath := fmt.Sprintf(
 		"/api/v2/projects/OTHER/tickets/%d/claim",
@@ -1227,6 +1300,86 @@ func TestAPIHandlerRegistersAndServesLeaseCommandRoutes(t *testing.T) {
 	if mismatchRecords != 0 {
 		t.Fatalf("project mismatch reached domain work: records=%d", mismatchRecords)
 	}
+}
+
+func assertLeaseReplayResourceIDValidation(
+	t *testing.T,
+	db *gorm.DB,
+	record *models.IdempotencyRecord,
+	initial *httptest.ResponseRecorder,
+	replay func() *httptest.ResponseRecorder,
+) {
+	t.Helper()
+	if db == nil || record == nil || record.ID == "" ||
+		initial == nil || replay == nil {
+		t.Fatal("complete lease replay fixture is required")
+	}
+	validReplay := replay()
+	if validReplay.Code != initial.Code ||
+		validReplay.Body.String() != initial.Body.String() {
+		t.Fatalf(
+			"valid replay differs: initial status=%d body=%s; replay status=%d body=%s",
+			initial.Code,
+			initial.Body.String(),
+			validReplay.Code,
+			validReplay.Body.String(),
+		)
+	}
+
+	originalResourceID := record.ResourceID
+	for _, test := range []struct {
+		name       string
+		resourceID string
+	}{
+		{name: "zero", resourceID: "0"},
+		{name: "parse error", resourceID: "not-a-ticket-id"},
+		{
+			name:       "native uint overflow",
+			resourceID: leaseReplayNativeUintOverflow(),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := db.Model(&models.IdempotencyRecord{}).
+				Where("id = ?", record.ID).
+				Update("resource_id", test.resourceID).Error; err != nil {
+				t.Fatal(err)
+			}
+			response := replay()
+			if response.Code != http.StatusConflict {
+				t.Fatalf(
+					"status=%d, want 409; body=%s",
+					response.Code,
+					response.Body.String(),
+				)
+			}
+			var problem Problem
+			if err := json.Unmarshal(
+				response.Body.Bytes(),
+				&problem,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if problem.Code != ProblemIdempotencyConflict {
+				t.Fatalf(
+					"problem=%+v, want code %q",
+					problem,
+					ProblemIdempotencyConflict,
+				)
+			}
+		})
+	}
+	if err := db.Model(&models.IdempotencyRecord{}).
+		Where("id = ?", record.ID).
+		Update("resource_id", originalResourceID).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func leaseReplayNativeUintOverflow() string {
+	if strconv.IntSize == 32 {
+		return "4294967296"
+	}
+	return "18446744073709551616"
 }
 
 func TestIdempotentCommentReplayMatchesInitialEnvelope(t *testing.T) {

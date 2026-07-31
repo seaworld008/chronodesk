@@ -14,6 +14,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -21,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -5716,6 +5718,11 @@ type LocalAttachmentStorage struct {
 	root string
 }
 
+// NewLocalAttachmentStorage configures an operator-owned storage root. Child
+// access uses os.Root for every operation, so untrusted object keys cannot
+// escape through traversal or symlinks. The configured root tree and its
+// ancestors remain an operator boundary: they must not be mutable by an
+// untrusted same-UID process or redirected with mounts while the service runs.
 func NewLocalAttachmentStorage(root string) (*LocalAttachmentStorage, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, fmt.Errorf("attachment root is required")
@@ -5726,6 +5733,13 @@ func NewLocalAttachmentStorage(root string) (*LocalAttachmentStorage, error) {
 	}
 	if err := os.MkdirAll(absolute, 0o700); err != nil {
 		return nil, fmt.Errorf("create attachment root: %w", err)
+	}
+	storageRoot, err := os.OpenRoot(absolute)
+	if err != nil {
+		return nil, fmt.Errorf("open attachment root: %w", err)
+	}
+	if err := storageRoot.Close(); err != nil {
+		return nil, fmt.Errorf("close attachment root: %w", err)
 	}
 	return &LocalAttachmentStorage{root: absolute}, nil
 }
@@ -5748,26 +5762,54 @@ func (s *LocalAttachmentStorage) Put(
 	if maxBytes <= 0 {
 		return nil, ErrAttachmentTooLarge
 	}
-	path, err := s.resolve(key)
+	normalizedKey, err := normalizeLocalAttachmentKey(key)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	storageRoot, err := s.openRoot()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = storageRoot.Close()
+	}()
+	relativePath := filepath.FromSlash(normalizedKey)
+	parentsExist, err := verifyLocalAttachmentParents(
+		storageRoot,
+		normalizedKey,
+		true,
+	)
+	if err != nil {
+		return nil, err
+	}
+	parentPath := filepath.Dir(relativePath)
+	if !parentsExist && parentPath != "." {
+		if err := storageRoot.MkdirAll(parentPath, 0o700); err != nil {
+			return nil, fmt.Errorf("create attachment directory: %w", err)
+		}
+	}
+	if _, err := verifyLocalAttachmentParents(
+		storageRoot,
+		normalizedKey,
+		false,
+	); err != nil {
 		return nil, fmt.Errorf("create attachment directory: %w", err)
 	}
 	// The partial path is derived from the durable target key. A hard process
 	// crash can therefore be recovered by the staging-intent sweeper or by a
 	// retry of the same outbox delivery; random .upload-* names would be
 	// undiscoverable after restart.
-	tempPath := path + ".partial"
-	if err := os.Remove(tempPath); err != nil &&
-		!errors.Is(err, os.ErrNotExist) {
+	tempPath := relativePath + ".partial"
+	if err := removeLocalAttachmentRegularFileIfExists(
+		storageRoot,
+		tempPath,
+	); err != nil {
 		return nil, fmt.Errorf(
 			"remove stale attachment partial: %w",
 			err,
 		)
 	}
-	temp, err := os.OpenFile(
+	temp, err := storageRoot.OpenFile(
 		tempPath,
 		os.O_CREATE|os.O_EXCL|os.O_WRONLY,
 		0o600,
@@ -5777,11 +5819,8 @@ func (s *LocalAttachmentStorage) Put(
 	}
 	defer func() {
 		_ = temp.Close()
-		_ = os.Remove(tempPath)
+		_ = storageRoot.Remove(tempPath)
 	}()
-	if err := temp.Chmod(0o600); err != nil {
-		return nil, err
-	}
 
 	hash := sha256.New()
 	var size int64
@@ -5824,11 +5863,18 @@ func (s *LocalAttachmentStorage) Put(
 	if err := temp.Close(); err != nil {
 		return nil, err
 	}
-	if err := os.Rename(tempPath, path); err != nil {
+	if _, err := inspectLocalAttachmentRegularFile(
+		storageRoot,
+		relativePath,
+		true,
+	); err != nil {
+		return nil, err
+	}
+	if err := storageRoot.Rename(tempPath, relativePath); err != nil {
 		return nil, fmt.Errorf("commit attachment: %w", err)
 	}
 	return &StoredAttachmentObject{
-		Key:                 filepath.ToSlash(key),
+		Key:                 normalizedKey,
 		Size:                size,
 		SHA256:              hex.EncodeToString(hash.Sum(nil)),
 		DetectedContentType: http.DetectContentType(sample),
@@ -5881,13 +5927,51 @@ func (s *LocalAttachmentStorage) Open(ctx context.Context, key string) (io.ReadC
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	path, err := s.resolve(key)
+	normalizedKey, err := normalizeLocalAttachmentKey(key)
 	if err != nil {
 		return nil, err
 	}
-	file, err := os.Open(path)
+	storageRoot, err := s.openRoot()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = storageRoot.Close()
+	}()
+	if _, err := verifyLocalAttachmentParents(
+		storageRoot,
+		normalizedKey,
+		false,
+	); err != nil {
+		return nil, err
+	}
+	relativePath := filepath.FromSlash(normalizedKey)
+	if _, err := inspectLocalAttachmentRegularFile(
+		storageRoot,
+		relativePath,
+		false,
+	); err != nil {
+		return nil, err
+	}
+	// Non-blocking open prevents a same-UID filesystem race from replacing the
+	// inspected regular file with a FIFO and hanging a request. Regular files
+	// ignore O_NONBLOCK; the descriptor is checked again before it is returned.
+	file, err := storageRoot.OpenFile(
+		relativePath,
+		os.O_RDONLY|syscall.O_NONBLOCK,
+		0,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("open attachment: %w", err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("stat opened attachment: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		_ = file.Close()
+		return nil, ErrInvalidAttachmentName
 	}
 	return file, nil
 }
@@ -5902,35 +5986,161 @@ func (s *LocalAttachmentStorage) Delete(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	path, err := s.resolve(key)
+	normalizedKey, err := normalizeLocalAttachmentKey(key)
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("delete attachment: %w", err)
+	storageRoot, err := s.openRoot()
+	if err != nil {
+		return err
 	}
-	if err := os.Remove(path + ".partial"); err != nil &&
-		!errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf(
-			"delete attachment partial: %w",
-			err,
-		)
+	defer func() {
+		_ = storageRoot.Close()
+	}()
+	parentsExist, err := verifyLocalAttachmentParents(
+		storageRoot,
+		normalizedKey,
+		true,
+	)
+	if err != nil {
+		return err
+	}
+	if !parentsExist {
+		return nil
+	}
+	relativePath := filepath.FromSlash(normalizedKey)
+	tempPath := relativePath + ".partial"
+	objectExists, err := inspectLocalAttachmentRegularFile(
+		storageRoot,
+		relativePath,
+		true,
+	)
+	if err != nil {
+		return err
+	}
+	partialExists, err := inspectLocalAttachmentRegularFile(
+		storageRoot,
+		tempPath,
+		true,
+	)
+	if err != nil {
+		return err
+	}
+	if objectExists {
+		if err := storageRoot.Remove(relativePath); err != nil {
+			return fmt.Errorf("delete attachment: %w", err)
+		}
+	}
+	if partialExists {
+		if err := storageRoot.Remove(tempPath); err != nil {
+			return fmt.Errorf("delete attachment partial: %w", err)
+		}
 	}
 	return nil
 }
 
-func (s *LocalAttachmentStorage) resolve(key string) (string, error) {
-	normalized := filepath.Clean(filepath.FromSlash(strings.TrimSpace(key)))
-	if normalized == "." || filepath.IsAbs(normalized) || normalized == ".." ||
-		strings.HasPrefix(normalized, ".."+string(filepath.Separator)) {
+func (s *LocalAttachmentStorage) openRoot() (*os.Root, error) {
+	if s == nil || strings.TrimSpace(s.root) == "" {
+		return nil, ErrAttachmentStorageMissing
+	}
+	storageRoot, err := os.OpenRoot(s.root)
+	if err != nil {
+		return nil, fmt.Errorf("open attachment root: %w", err)
+	}
+	return storageRoot, nil
+}
+
+func normalizeLocalAttachmentKey(key string) (string, error) {
+	if key == "" || key != strings.TrimSpace(key) ||
+		strings.ContainsRune(key, '\x00') ||
+		strings.ContainsRune(key, '\\') ||
+		strings.HasPrefix(key, "/") ||
+		filepath.IsAbs(filepath.FromSlash(key)) ||
+		hasWindowsAttachmentVolumePrefix(key) {
 		return "", ErrInvalidAttachmentName
 	}
-	full := filepath.Join(s.root, normalized)
-	relative, err := filepath.Rel(s.root, full)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+	components := strings.Split(key, "/")
+	for _, component := range components {
+		if component == "" || component == "." || component == ".." {
+			return "", ErrInvalidAttachmentName
+		}
+	}
+	normalized := strings.Join(components, "/")
+	if path.Clean(normalized) != normalized {
 		return "", ErrInvalidAttachmentName
 	}
-	return full, nil
+	return normalized, nil
+}
+
+func hasWindowsAttachmentVolumePrefix(key string) bool {
+	if len(key) < 2 || key[1] != ':' {
+		return false
+	}
+	first := key[0]
+	return first >= 'a' && first <= 'z' || first >= 'A' && first <= 'Z'
+}
+
+// verifyLocalAttachmentParents rejects every existing symlink component. The
+// subsequent os.Root operation remains the containment boundary if a
+// service-local filesystem race occurs after this check.
+func verifyLocalAttachmentParents(
+	storageRoot *os.Root,
+	normalizedKey string,
+	allowMissing bool,
+) (bool, error) {
+	components := strings.Split(normalizedKey, "/")
+	for index := 1; index < len(components); index++ {
+		parentPath := filepath.FromSlash(
+			strings.Join(components[:index], "/"),
+		)
+		info, err := storageRoot.Lstat(parentPath)
+		if errors.Is(err, os.ErrNotExist) && allowMissing {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf(
+				"inspect attachment directory: %w",
+				err,
+			)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return false, ErrInvalidAttachmentName
+		}
+	}
+	return true, nil
+}
+
+func inspectLocalAttachmentRegularFile(
+	storageRoot *os.Root,
+	relativePath string,
+	allowMissing bool,
+) (bool, error) {
+	info, err := storageRoot.Lstat(relativePath)
+	if errors.Is(err, os.ErrNotExist) && allowMissing {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect attachment object: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return false, ErrInvalidAttachmentName
+	}
+	return true, nil
+}
+
+func removeLocalAttachmentRegularFileIfExists(
+	storageRoot *os.Root,
+	relativePath string,
+) error {
+	exists, err := inspectLocalAttachmentRegularFile(
+		storageRoot,
+		relativePath,
+		true,
+	)
+	if err != nil || !exists {
+		return err
+	}
+	return storageRoot.Remove(relativePath)
 }
 
 func validAttachmentStagingKey(key string) bool {

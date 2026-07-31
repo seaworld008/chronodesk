@@ -21,6 +21,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/middleware"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/observability"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
@@ -1382,16 +1383,14 @@ func (h *APIHandler) HeartbeatLease(c *gin.Context) {
 		RequestDigest: digestBytes(fingerprint),
 	}
 	if reservation.Replayed {
-		replayedTicketID, parseErr := strconv.ParseUint(
+		replayedTicketID, parseErr := safeconv.ParsePositiveUint(
 			reservation.Record.ResourceID,
-			10,
-			64,
 		)
-		if parseErr != nil || replayedTicketID == 0 {
+		if parseErr != nil {
 			h.writeNativeError(c, services.ErrIdempotencyConflict)
 			return
 		}
-		authorization.TicketID = uint(replayedTicketID)
+		authorization.TicketID = replayedTicketID
 		if _, _, err := h.authorizeAgentRESTNativeCommand(
 			c,
 			principal,
@@ -1486,16 +1485,14 @@ func (h *APIHandler) ReleaseLease(c *gin.Context) {
 		RequestDigest: digestBytes(fingerprint),
 	}
 	if reservation.Replayed {
-		replayedTicketID, parseErr := strconv.ParseUint(
+		replayedTicketID, parseErr := safeconv.ParsePositiveUint(
 			reservation.Record.ResourceID,
-			10,
-			64,
 		)
-		if parseErr != nil || replayedTicketID == 0 {
+		if parseErr != nil {
 			h.writeNativeError(c, services.ErrIdempotencyConflict)
 			return
 		}
-		authorization.TicketID = uint(replayedTicketID)
+		authorization.TicketID = replayedTicketID
 		if _, _, err := h.authorizeAgentRESTNativeCommand(
 			c,
 			principal,
