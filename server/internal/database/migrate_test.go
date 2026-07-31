@@ -75,7 +75,7 @@ func TestValidateRuntimeSchemaAcceptsMigratedModel(t *testing.T) {
 	}
 	for _, index := range []string{
 		"idx_tickets_scope_due_id",
-		"idx_tickets_scope_active_sla_created_id",
+		"idx_tickets_scope_sla_created_id",
 	} {
 		if !db.Migrator().HasIndex(&models.Ticket{}, index) {
 			t.Fatalf("migrated schema is missing ticket pagination index %q", index)
@@ -83,6 +83,9 @@ func TestValidateRuntimeSchemaAcceptsMigratedModel(t *testing.T) {
 	}
 	if db.Migrator().HasIndex(&models.Ticket{}, "idx_tickets_scope_sla_status_created_id") {
 		t.Fatal("migrated schema retained the ordering-incompatible SLA index")
+	}
+	if db.Migrator().HasIndex(&models.Ticket{}, "idx_tickets_scope_active_sla_created_id") {
+		t.Fatal("migrated schema retained the generic-plan-sensitive partial SLA index")
 	}
 }
 

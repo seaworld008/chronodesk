@@ -14,7 +14,7 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-const postgresActiveSLAIndex = "idx_tickets_scope_active_sla_created_id"
+const postgresSLAOrderIndex = "idx_tickets_scope_sla_created_id"
 
 func TestPostgresTicketPaginationIndexesSupportScopedQueries(t *testing.T) {
 	dsn := os.Getenv("CHRONODESK_POSTGRES_MIGRATION_TEST_DSN")
@@ -164,34 +164,83 @@ func TestPostgresTicketPaginationIndexesSupportScopedQueries(t *testing.T) {
 		`SELECT COUNT(*) FROM pg_indexes
 		 WHERE schemaname = ? AND indexname = ?`,
 		schemaName,
-		postgresActiveSLAIndex,
+		postgresSLAOrderIndex,
 	).Scan(&indexCount).Error; err != nil {
-		t.Fatalf("inspect index %s: %v", postgresActiveSLAIndex, err)
+		t.Fatalf("inspect index %s: %v", postgresSLAOrderIndex, err)
 	}
 	if indexCount != 1 {
-		t.Fatalf("PostgreSQL index %s count=%d", postgresActiveSLAIndex, indexCount)
+		t.Fatalf("PostgreSQL index %s count=%d", postgresSLAOrderIndex, indexCount)
 	}
 
-	const secondPageQuery = `
-		SELECT ticket_number, project_id, status
-		FROM tickets
-		WHERE organization_id = ? AND project_id = ?
-		  AND sla_breached = TRUE
-		  AND status IN ('open', 'in_progress', 'pending')
-		ORDER BY created_at ASC, id ASC
-		LIMIT 25 OFFSET 25
-	`
-	var secondPage []struct {
-		TicketNumber string              `gorm:"column:ticket_number"`
-		ProjectID    uint                `gorm:"column:project_id"`
-		Status       models.TicketStatus `gorm:"column:status"`
+	activeStatuses := []models.TicketStatus{
+		models.TicketStatusOpen,
+		models.TicketStatusInProgress,
+		models.TicketStatusPending,
 	}
-	if err := transaction.Raw(
-		secondPageQuery,
+	var dryRunPage []*models.Ticket
+	productionQuery := transaction.Session(&gorm.Session{DryRun: true}).
+		Model(&models.Ticket{}).
+		Where(
+			"tickets.organization_id = ? AND tickets.project_id = ?",
+			project.OrganizationID,
+			project.ID,
+		).
+		Where(
+			"tickets.sla_breached = ? AND tickets.status IN ?",
+			true,
+			activeStatuses,
+		).
+		Preload("CreatedBy").
+		Preload("AssignedTo").
+		Preload("Category").
+		Order("tickets.created_at ASC, tickets.id ASC").
+		Offset(25).
+		Limit(25).
+		Find(&dryRunPage)
+	if productionQuery.Error != nil {
+		t.Fatalf("build production-shape SLA query: %v", productionQuery.Error)
+	}
+	productionSQL := productionQuery.Statement.SQL.String()
+	if len(productionQuery.Statement.Vars) != 6 {
+		t.Fatalf(
+			"production-shape SLA bind count=%d, want 6; sql=%s",
+			len(productionQuery.Statement.Vars),
+			productionSQL,
+		)
+	}
+	if !strings.Contains(productionSQL, "sla_breached = $3") ||
+		!strings.Contains(productionSQL, "status IN ($4,$5,$6)") {
+		t.Fatalf("unexpected production-shape SLA SQL: %s", productionSQL)
+	}
+
+	if err := transaction.Exec("SET LOCAL plan_cache_mode = force_generic_plan").Error; err != nil {
+		t.Fatalf("force PostgreSQL generic plan: %v", err)
+	}
+	for _, setting := range []string{
+		"SET LOCAL enable_seqscan = off",
+		"SET LOCAL enable_bitmapscan = off",
+	} {
+		if err := transaction.Exec(setting).Error; err != nil {
+			t.Fatalf("configure ordered-index plan: %v", err)
+		}
+	}
+	const preparedStatement = "chronodesk_ticket_sla_page"
+	if err := transaction.Exec(
+		"PREPARE " + preparedStatement +
+			" (bigint, bigint, boolean, varchar, varchar, varchar) AS " +
+			productionSQL,
+	).Error; err != nil {
+		t.Fatalf("prepare production-shape SLA query: %v", err)
+	}
+	executeSQL := fmt.Sprintf(
+		"EXECUTE %s(%d, %d, TRUE, 'open', 'in_progress', 'pending')",
+		preparedStatement,
 		project.OrganizationID,
 		project.ID,
-	).Scan(&secondPage).Error; err != nil {
-		t.Fatalf("query second SLA page: %v", err)
+	)
+	var secondPage []models.Ticket
+	if err := transaction.Raw(executeSQL).Scan(&secondPage).Error; err != nil {
+		t.Fatalf("execute prepared generic-plan SLA page: %v", err)
 	}
 	if len(secondPage) != 25 {
 		t.Fatalf("second SLA page length=%d, want 25", len(secondPage))
@@ -224,28 +273,23 @@ func TestPostgresTicketPaginationIndexesSupportScopedQueries(t *testing.T) {
 		t.Fatalf("scoped SLA total=%d, want 180", total)
 	}
 
-	if err := transaction.Exec(`
-		SET LOCAL enable_seqscan = off;
-		SET LOCAL enable_bitmapscan = off
-	`).Error; err != nil {
-		t.Fatal(err)
-	}
 	var planRows []struct {
 		Plan string `gorm:"column:QUERY PLAN"`
 	}
 	if err := transaction.Raw(
-		"EXPLAIN (COSTS OFF) "+secondPageQuery,
-		project.OrganizationID,
-		project.ID,
+		"EXPLAIN (COSTS OFF) " + executeSQL,
 	).Scan(&planRows).Error; err != nil {
-		t.Fatalf("explain %s: %v", postgresActiveSLAIndex, err)
+		t.Fatalf("explain generic plan with %s: %v", postgresSLAOrderIndex, err)
 	}
 	plan := ""
 	for _, row := range planRows {
 		plan += row.Plan + "\n"
 	}
-	if !strings.Contains(plan, postgresActiveSLAIndex) {
-		t.Fatalf("query plan does not use %s:\n%s", postgresActiveSLAIndex, plan)
+	if !strings.Contains(plan, postgresSLAOrderIndex) {
+		t.Fatalf("query plan does not use %s:\n%s", postgresSLAOrderIndex, plan)
+	}
+	if !strings.Contains(plan, "$1") || !strings.Contains(plan, "$3") {
+		t.Fatalf("query plan is not a parameterized generic plan:\n%s", plan)
 	}
 	if strings.Contains(plan, "Sort") {
 		t.Fatalf("SLA pagination plan has an extra Sort:\n%s", plan)

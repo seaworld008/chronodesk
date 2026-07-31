@@ -1425,12 +1425,18 @@ func TestP0ListPaginationContractUsesStrictTwentyFiveToOneHundredBounds(t *testi
 		"get",
 	)
 	var notificationPageSize map[string]any
+	var notificationPageReference string
 	for _, raw := range notifications["parameters"].([]any) {
 		parameter := raw.(map[string]any)
+		if reference, _ := parameter["$ref"].(string); reference == "#/components/parameters/ContentPage" {
+			notificationPageReference = reference
+		}
 		if parameter["name"] == "page_size" {
 			notificationPageSize = parameter
-			break
 		}
+	}
+	if notificationPageReference != "#/components/parameters/ContentPage" {
+		t.Fatalf("notification page parameter ref=%q", notificationPageReference)
 	}
 	if notificationPageSize == nil {
 		t.Fatal("notification page_size parameter is missing")

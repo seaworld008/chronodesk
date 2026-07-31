@@ -2885,14 +2885,7 @@
             "$ref": "#/components/parameters/ProjectKey"
           },
           {
-            "name": "page",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "default": 1
-            }
+            "$ref": "#/components/parameters/ContentPage"
           },
           {
             "name": "page_size",

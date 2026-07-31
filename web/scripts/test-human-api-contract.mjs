@@ -844,6 +844,12 @@ const notificationListParameters =
 const notificationPageSize = notificationListParameters.find(
     (parameter) => parameter.name === 'page_size',
 )
+assert.ok(
+    notificationListParameters.some(
+        (parameter) =>
+            parameter.$ref === '#/components/parameters/ContentPage',
+    ),
+)
 assert.equal(notificationPageSize.schema.default, 25)
 assert.equal(notificationPageSize.schema.maximum, 100)
 assert.equal(contract.components.parameters.ContentPage.schema.minimum, 1)
