@@ -9,6 +9,7 @@ import (
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func TestWorkbenchDashboardDefaultAllAndExplicitFilters(t *testing.T) {
@@ -278,12 +279,68 @@ func TestWorkbenchDashboardQueryCountDoesNotGrowWithProjectCount(t *testing.T) {
 		t.Fatal(err)
 	}
 	singleProjectCount := count.Load()
-	if allProjectsCount != singleProjectCount || allProjectsCount > 6 {
+	if allProjectsCount != singleProjectCount || allProjectsCount > 8 {
 		t.Fatalf(
 			"query count all=%d single=%d; dashboard must remain fixed and bounded",
 			allProjectsCount,
 			singleProjectCount,
 		)
+	}
+}
+
+func TestWorkbenchDashboardUsesProjectUserMembershipLockOrder(t *testing.T) {
+	db := crossProjectWorkbenchTestDB(t)
+	seedCrossProjectWorkbench(t, db, 7)
+	service, err := NewCrossProjectWorkbenchService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type observedLock struct {
+		table    string
+		strength string
+	}
+	locks := make([]observedLock, 0, 3)
+	if err := db.Callback().Query().
+		After("gorm:query").
+		Register("test:dashboard-lock-order", func(query *gorm.DB) {
+			lockClause, exists := query.Statement.Clauses["FOR"]
+			if !exists {
+				return
+			}
+			locking, ok := lockClause.Expression.(clause.Locking)
+			if !ok {
+				return
+			}
+			locks = append(locks, observedLock{
+				table:    query.Statement.Table,
+				strength: locking.Strength,
+			})
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Dashboard(
+		context.Background(),
+		WorkbenchDashboardQuery{UserID: 7, Days: 30},
+	); err != nil {
+		t.Fatal(err)
+	}
+	want := []observedLock{
+		{table: "projects", strength: "SHARE"},
+		{table: "users", strength: "SHARE"},
+		{table: "project_memberships", strength: "SHARE"},
+	}
+	if len(locks) != len(want) {
+		t.Fatalf("dashboard locks = %+v, want %+v", locks, want)
+	}
+	for index := range want {
+		if locks[index] != want[index] {
+			t.Fatalf(
+				"dashboard lock %d = %+v, want %+v",
+				index,
+				locks[index],
+				want[index],
+			)
+		}
 	}
 }
 

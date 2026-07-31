@@ -51,9 +51,12 @@ import {
   type AuthorizedProject,
 } from '@/lib/projectScope'
 import type { WorkbenchDashboard as WorkbenchDashboardData } from '@/lib/types/workbenchDashboard'
+import {
+  parseWorkbenchDashboardURLRequest,
+  type DashboardDays,
+} from './workbenchDashboardRequest'
 
-const allowedDays = [7, 30, 90] as const
-type DashboardDays = typeof allowedDays[number]
+const allowedDays: DashboardDays[] = [7, 30, 90]
 
 const projectColumns: ResizableColumn[] = [
   { key: 'project', defaultWidth: 260, minWidth: 180, maxWidth: 420 },
@@ -93,31 +96,49 @@ const metricCards = (
   },
 ]
 
-const parseDays = (value: string | null): DashboardDays => {
-  const parsed = Number(value)
-  return allowedDays.includes(parsed as DashboardDays)
-    ? parsed as DashboardDays
-    : 30
-}
+type DashboardLoadState =
+  | { key: string; status: 'loading'; data: null; error: '' }
+  | { key: string; status: 'success'; data: WorkbenchDashboardData; error: '' }
+  | { key: string; status: 'error'; data: null; error: string }
 
 const WorkbenchDashboard: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams()
   const [projects, setProjects] = useState<AuthorizedProject[]>([])
   const [projectsLoading, setProjectsLoading] = useState(true)
-  const [dashboard, setDashboard] = useState<WorkbenchDashboardData | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
+  const [projectsError, setProjectsError] = useState('')
+  const [loadState, setLoadState] = useState<DashboardLoadState | null>(null)
   const [reloadToken, setReloadToken] = useState(0)
 
-  const days = parseDays(searchParams.get('days'))
   const serializedSearch = searchParams.toString()
-  const selectedKeys = useMemo(
-    () => {
-      const keys = new URLSearchParams(serializedSearch).getAll('project_keys')
-      return keys.length === 0 ? null : keys
-    },
+  const urlRequest = useMemo(
+    () => parseWorkbenchDashboardURLRequest(serializedSearch),
     [serializedSearch],
   )
+  const days = urlRequest.days
+  const selectedKeys = urlRequest.projectKeys
+  const requestInstanceKey = urlRequest.requestKey === null
+    ? null
+    : `${urlRequest.requestKey}#${reloadToken}`
+  const dashboardPath = urlRequest.requestKey === null || days === null
+    ? null
+    : humanApiRoutes.getWorkbenchDashboard({
+        ...(selectedKeys === null ? {} : { project_keys: selectedKeys }),
+        days,
+      })
+  const dashboard = loadState?.key === requestInstanceKey &&
+    loadState.status === 'success'
+    ? loadState.data
+    : null
+  const loading = requestInstanceKey !== null &&
+    (
+      loadState === null ||
+      loadState.key !== requestInstanceKey ||
+      loadState.status === 'loading'
+    )
+  const dashboardError = loadState?.key === requestInstanceKey &&
+    loadState.status === 'error'
+    ? loadState.error
+    : ''
   const activeProjects = useMemo(
     () => projects.filter(({ project }) => project.status === 'active'),
     [projects],
@@ -126,13 +147,14 @@ const WorkbenchDashboard: React.FC = () => {
   useEffect(() => {
     let active = true
     setProjectsLoading(true)
+    setProjectsError('')
     void loadAuthorizedProjects(true)
       .then((authorized) => {
         if (active) setProjects(authorized)
       })
       .catch((projectError: unknown) => {
         if (active) {
-          setError(localizedUnknownErrorMessage(
+          setProjectsError(localizedUnknownErrorMessage(
             projectError,
             '授权项目列表加载失败，请稍后重试',
           ))
@@ -147,37 +169,63 @@ const WorkbenchDashboard: React.FC = () => {
   }, [reloadToken])
 
   useEffect(() => {
+    if (
+      requestInstanceKey === null ||
+      dashboardPath === null
+    ) {
+      setLoadState(null)
+      return
+    }
     const controller = new AbortController()
-    setLoading(true)
-    setError('')
+    setLoadState({
+      key: requestInstanceKey,
+      status: 'loading',
+      data: null,
+      error: '',
+    })
     void apiFetch<WorkbenchDashboardData>(
-      humanApiRoutes.getWorkbenchDashboard({
-        ...(selectedKeys === null ? {} : { project_keys: selectedKeys }),
-        days,
-      }),
+      dashboardPath,
       { signal: controller.signal },
     )
-      .then(setDashboard)
+      .then((response) => {
+        setLoadState((current) =>
+          current?.key === requestInstanceKey
+            ? {
+                key: requestInstanceKey,
+                status: 'success',
+                data: response,
+                error: '',
+              }
+            : current,
+        )
+      })
       .catch((requestError: unknown) => {
         if (
           controller.signal.aborted ||
           (requestError instanceof DOMException &&
             requestError.name === 'AbortError')
         ) return
-        setError(localizedUnknownErrorMessage(
+        const message = localizedUnknownErrorMessage(
           requestError,
           '运营大屏加载失败，请检查项目授权后重试',
-        ))
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setLoading(false)
+        )
+        setLoadState((current) =>
+          current?.key === requestInstanceKey
+            ? {
+                key: requestInstanceKey,
+                status: 'error',
+                data: null,
+                error: message,
+              }
+            : current,
+        )
       })
     return () => controller.abort()
-  }, [days, reloadToken, selectedKeys])
+  }, [dashboardPath, requestInstanceKey])
 
   const updateURL = useCallback((
     nextKeys: string[] | null,
-    nextDays: DashboardDays = days,
+    nextDays: DashboardDays = days ?? 30,
   ) => {
     const next = new URLSearchParams()
     if (nextKeys !== null) {
@@ -195,9 +243,11 @@ const WorkbenchDashboard: React.FC = () => {
     updateURL(next.length === 0 ? null : next)
   }, [selectedKeys, updateURL])
 
-  const scopeLabel = selectedKeys === null
-    ? '全部授权项目'
-    : `已选 ${selectedKeys.length} 个项目`
+  const scopeLabel = urlRequest.error
+    ? '筛选参数无效'
+    : selectedKeys === null
+      ? '全部授权项目'
+      : `已选 ${selectedKeys.length} 个项目`
   const statusData = dashboard
     ? [
         { name: '待处理', value: dashboard.summary.status.open },
@@ -221,14 +271,27 @@ const WorkbenchDashboard: React.FC = () => {
   return (
     <>
       <Title title="运营大屏" />
-      <Box sx={{ p: { xs: 2, md: 3 }, minWidth: 0 }}>
+      <Box
+        data-testid="workbench-dashboard-page"
+        sx={{
+          p: { xs: 2, md: 3 },
+          minWidth: 0,
+          maxWidth: '100%',
+          overflowX: 'hidden',
+        }}
+      >
         <Stack
           direction={{ xs: 'column', md: 'row' }}
           spacing={2}
           sx={{ justifyContent: 'space-between', mb: 2 }}
         >
           <Box>
-            <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
+            <Stack
+              direction="row"
+              spacing={1}
+              useFlexGap
+              sx={{ alignItems: 'center', flexWrap: 'wrap', minWidth: 0 }}
+            >
               <DashboardIcon color="primary" />
               <Typography variant="h4">运营大屏</Typography>
               <Chip size="small" color="primary" label={scopeLabel} />
@@ -240,7 +303,11 @@ const WorkbenchDashboard: React.FC = () => {
           <Button
             startIcon={<RefreshIcon />}
             onClick={() => setReloadToken((current) => current + 1)}
-            disabled={loading || projectsLoading}
+            disabled={
+              urlRequest.error !== '' ||
+              loading ||
+              projectsLoading
+            }
           >
             刷新
           </Button>
@@ -289,13 +356,13 @@ const WorkbenchDashboard: React.FC = () => {
             <FormControlLabel
               control={(
                 <Checkbox
-                  checked={selectedKeys === null}
+                  checked={urlRequest.error === '' && selectedKeys === null}
                   onChange={() => updateURL(null)}
                 />
               )}
               label={`全部授权项目（${activeProjects.length}）`}
             />
-            {selectedKeys !== null && (
+            {urlRequest.error === '' && selectedKeys !== null && (
               <Stack
                 direction="row"
                 spacing={1}
@@ -315,6 +382,13 @@ const WorkbenchDashboard: React.FC = () => {
                         ? `${selected.project.name} · ${key}`
                         : key}
                       onDelete={() => toggleProject(key)}
+                      sx={{
+                        maxWidth: '100%',
+                        '& .MuiChip-label': {
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                        },
+                      }}
                     />
                   )
                 })}
@@ -347,7 +421,10 @@ const WorkbenchDashboard: React.FC = () => {
                   }}
                 >
                   <Checkbox
-                    checked={selectedKeys?.includes(project.key) ?? false}
+                    checked={
+                      urlRequest.error === '' &&
+                      (selectedKeys?.includes(project.key) ?? false)
+                    }
                     onChange={() => toggleProject(project.key)}
                     slotProps={{
                       input: { 'aria-label': `选择项目 ${project.name}` },
@@ -365,7 +442,25 @@ const WorkbenchDashboard: React.FC = () => {
           </Stack>
         </Paper>
 
-        {error && (
+        {urlRequest.error && (
+          <Alert
+            severity="error"
+            sx={{ mb: 2 }}
+            action={(
+              <Button
+                color="inherit"
+                size="small"
+                onClick={() => updateURL(null, 30)}
+              >
+                重置筛选
+              </Button>
+            )}
+          >
+            {urlRequest.error}
+          </Alert>
+        )}
+
+        {projectsError && (
           <Alert
             severity="error"
             sx={{ mb: 2 }}
@@ -379,11 +474,29 @@ const WorkbenchDashboard: React.FC = () => {
               </Button>
             )}
           >
-            {error}
+            {projectsError}
           </Alert>
         )}
 
-        {loading && !dashboard ? (
+        {dashboardError && (
+          <Alert
+            severity="error"
+            sx={{ mb: 2 }}
+            action={(
+              <Button
+                color="inherit"
+                size="small"
+                onClick={() => setReloadToken((current) => current + 1)}
+              >
+                重试
+              </Button>
+            )}
+          >
+            {dashboardError}
+          </Alert>
+        )}
+
+        {loading ? (
           <Box
             role="status"
             aria-label="正在加载运营大屏"
@@ -409,7 +522,12 @@ const WorkbenchDashboard: React.FC = () => {
               }}
             >
               {metricCards(dashboard).map((metric) => (
-                <Paper key={metric.label} variant="outlined" sx={{ p: 2 }}>
+                <Paper
+                  key={metric.label}
+                  variant="outlined"
+                  aria-label={`${metric.label}：${metric.value}`}
+                  sx={{ p: 2, minWidth: 0 }}
+                >
                   <Typography color="text.secondary" variant="body2">
                     {metric.label}
                   </Typography>

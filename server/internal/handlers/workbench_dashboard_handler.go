@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"context"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -43,21 +45,59 @@ func (handler *WorkbenchDashboardHandler) Get(c *gin.Context) {
 		handler.response.Unauthorized(c, "登录状态无效")
 		return
 	}
-	days, err := parseOptionalPositiveInt(c.Query("days"), 30)
-	if err != nil {
+	query, parseErr := url.ParseQuery(c.Request.URL.RawQuery)
+	if parseErr != nil {
 		handler.response.BadRequest(c, "运营大屏查询参数无效")
 		return
 	}
-	rawKeys, hasFilter := c.Request.URL.Query()["project_keys"]
+	for key := range query {
+		if key != "project_keys" && key != "days" {
+			handler.response.BadRequest(c, "运营大屏查询参数无效")
+			return
+		}
+	}
+	days := 30
+	if rawDays, present := query["days"]; present {
+		if len(rawDays) != 1 ||
+			rawDays[0] == "" ||
+			rawDays[0] != strings.TrimSpace(rawDays[0]) {
+			handler.response.BadRequest(c, "运营大屏查询参数无效")
+			return
+		}
+		parsedDays, parseErr := strconv.Atoi(rawDays[0])
+		if parseErr != nil ||
+			strconv.Itoa(parsedDays) != rawDays[0] ||
+			(parsedDays != 7 && parsedDays != 30 && parsedDays != 90) {
+			handler.response.BadRequest(c, "运营大屏查询参数无效")
+			return
+		}
+		days = parsedDays
+	}
+	rawKeys, hasFilter := query["project_keys"]
+	if len(rawKeys) > maxWorkbenchDashboardProjectKeys {
+		handler.response.BadRequest(c, "运营大屏查询参数无效")
+		return
+	}
 	projectKeys := make([]models.ProjectKey, 0, len(rawKeys))
+	seenKeys := make(map[models.ProjectKey]struct{}, len(rawKeys))
 	for _, rawKey := range rawKeys {
 		if rawKey == "" || rawKey != strings.TrimSpace(rawKey) {
 			handler.response.BadRequest(c, "运营大屏查询参数无效")
 			return
 		}
+		key := models.ProjectKey(rawKey)
+		if err := key.Validate(); err != nil {
+			handler.response.BadRequest(c, "运营大屏查询参数无效")
+			return
+		}
+		if _, duplicate := seenKeys[key]; duplicate {
+			handler.response.BadRequest(c, "运营大屏查询参数无效")
+			return
+		}
+		seenKeys[key] = struct{}{}
 		projectKeys = append(
 			projectKeys,
-			models.ProjectKey(rawKey),
+			key,
 		)
 	}
 	result, err := handler.service.Dashboard(
@@ -75,3 +115,5 @@ func (handler *WorkbenchDashboardHandler) Get(c *gin.Context) {
 	}
 	handler.response.Success(c, result, "获取跨项目运营大屏成功")
 }
+
+const maxWorkbenchDashboardProjectKeys = 500

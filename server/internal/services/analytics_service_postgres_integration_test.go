@@ -8,11 +8,14 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
@@ -221,6 +224,74 @@ func TestAnalyticsAuthorizedProjectSetUnderNonOwnerPostgresRLS(t *testing.T) {
 		len(dashboard.ProjectBreakdown) != 2 {
 		t.Fatalf("membership-scoped PostgreSQL dashboard = %+v", dashboard)
 	}
+	for _, race := range []dashboardAuthorizationRace{
+		{
+			name:      "project_archive",
+			waitTable: "projects",
+			lockMutation: func(tx *gorm.DB) error {
+				return tx.Raw(
+					"SELECT id FROM projects WHERE id = 2 FOR UPDATE",
+				).Scan(new(uint)).Error
+			},
+			commitMutation: func(tx *gorm.DB) error {
+				return tx.Table("projects").
+					Where("id = ?", 2).
+					Update("status", "archived").Error
+			},
+		},
+		{
+			name:      "membership_revocation",
+			waitTable: "projects",
+			lockMutation: func(tx *gorm.DB) error {
+				if err := tx.Raw(
+					"SELECT id FROM projects WHERE id = 2 FOR UPDATE",
+				).Scan(new(uint)).Error; err != nil {
+					return err
+				}
+				if err := tx.Raw(
+					"SELECT id FROM users WHERE id = 1 FOR SHARE",
+				).Scan(new(uint)).Error; err != nil {
+					return err
+				}
+				return tx.Raw(
+					`SELECT id FROM project_memberships
+					 WHERE project_id = 2 AND user_id = 1
+					 FOR UPDATE`,
+				).Scan(new(uint)).Error
+			},
+			commitMutation: func(tx *gorm.DB) error {
+				return tx.Table("project_memberships").
+					Where("project_id = ? AND user_id = ?", 2, 1).
+					Update("is_active", false).Error
+			},
+		},
+		{
+			name:      "user_suspension",
+			waitTable: "users",
+			lockMutation: func(tx *gorm.DB) error {
+				return tx.Raw(
+					"SELECT id FROM users WHERE id = 1 FOR UPDATE",
+				).Scan(new(uint)).Error
+			},
+			commitMutation: func(tx *gorm.DB) error {
+				return tx.Table("users").
+					Where("id = ?", 1).
+					Update("status", "suspended").Error
+			},
+		},
+	} {
+		t.Run(race.name, func(t *testing.T) {
+			resetDashboardAuthorizationRace(t, adminScoped)
+			assertDashboardAuthorizationRaceFailsClosed(
+				t,
+				adminScoped,
+				runtimeDB,
+				workbench,
+				race,
+			)
+		})
+	}
+	resetDashboardAuthorizationRace(t, adminScoped)
 
 	if err := adminScoped.Exec(`
 		UPDATE project_memberships
@@ -259,6 +330,185 @@ func TestAnalyticsAuthorizedProjectSetUnderNonOwnerPostgresRLS(t *testing.T) {
 		dashboard.SelectedProjects[0].Key != "OPS" {
 		t.Fatalf("dashboard revocation was not immediate: %+v", dashboard)
 	}
+}
+
+type dashboardAuthorizationRace struct {
+	name           string
+	waitTable      string
+	lockMutation   func(*gorm.DB) error
+	commitMutation func(*gorm.DB) error
+}
+
+func resetDashboardAuthorizationRace(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	if err := db.Exec(`
+		UPDATE projects SET status = 'active' WHERE id = 2;
+		UPDATE users SET status = 'active', deleted_at = NULL WHERE id = 1;
+		UPDATE project_memberships
+		SET is_active = TRUE
+		WHERE project_id = 2 AND user_id = 1;
+	`).Error; err != nil {
+		t.Fatalf("reset dashboard authorization race: %v", err)
+	}
+}
+
+func assertDashboardAuthorizationRaceFailsClosed(
+	t *testing.T,
+	admin *gorm.DB,
+	runtime *gorm.DB,
+	workbench *CrossProjectWorkbenchService,
+	race dashboardAuthorizationRace,
+) {
+	t.Helper()
+	mutationLocked := make(chan struct{})
+	commitMutation := make(chan struct{})
+	mutationDone := make(chan error, 1)
+	go func() {
+		mutationDone <- admin.Transaction(func(tx *gorm.DB) error {
+			if err := race.lockMutation(tx); err != nil {
+				return err
+			}
+			close(mutationLocked)
+			<-commitMutation
+			return race.commitMutation(tx)
+		})
+	}()
+	select {
+	case <-mutationLocked:
+	case err := <-mutationDone:
+		t.Fatalf("authorization mutator stopped before barrier: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("authorization mutator did not acquire its lock")
+	}
+
+	type dashboardLockBarrier struct {
+		pid int
+		err error
+	}
+	dashboardReachedLock := make(chan dashboardLockBarrier, 1)
+	allowDashboardLock := make(chan struct{})
+	var barrierOnce sync.Once
+	callbackName := "test:dashboard-authorization-race-" + race.name
+	if err := runtime.Callback().Query().
+		Before("gorm:query").
+		Register(callbackName, func(query *gorm.DB) {
+			lockClause, hasLock := query.Statement.Clauses["FOR"]
+			if !hasLock || query.Statement.Table != race.waitTable {
+				return
+			}
+			locking, ok := lockClause.Expression.(clause.Locking)
+			if !ok || locking.Strength != "SHARE" {
+				return
+			}
+			barrierOnce.Do(func() {
+				barrier := dashboardLockBarrier{}
+				rows, err := query.Statement.ConnPool.QueryContext(
+					query.Statement.Context,
+					"SELECT pg_backend_pid()",
+				)
+				if err != nil {
+					barrier.err = err
+				} else {
+					defer rows.Close()
+					if !rows.Next() {
+						barrier.err = errors.New(
+							"dashboard backend pid query returned no row",
+						)
+					} else {
+						barrier.err = rows.Scan(&barrier.pid)
+					}
+				}
+				dashboardReachedLock <- barrier
+				<-allowDashboardLock
+			})
+		}); err != nil {
+		close(commitMutation)
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = runtime.Callback().Query().Remove(callbackName)
+	}()
+
+	dashboardDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		_, err := workbench.Dashboard(ctx, WorkbenchDashboardQuery{
+			UserID:      1,
+			ProjectKeys: []models.ProjectKey{"FIN"},
+			HasFilter:   true,
+			Days:        7,
+		})
+		dashboardDone <- err
+	}()
+
+	var barrier dashboardLockBarrier
+	select {
+	case barrier = <-dashboardReachedLock:
+	case <-time.After(5 * time.Second):
+		close(commitMutation)
+		t.Fatal("dashboard did not reach the expected authorization lock")
+	}
+	if barrier.err != nil || barrier.pid == 0 {
+		close(allowDashboardLock)
+		close(commitMutation)
+		t.Fatalf("capture dashboard backend pid: %+v", barrier)
+	}
+	close(allowDashboardLock)
+	waitErr := waitForPostgresBackendLock(admin, barrier.pid, 5*time.Second)
+	close(commitMutation)
+
+	select {
+	case err := <-mutationDone:
+		if err != nil {
+			t.Fatalf("commit concurrent authorization mutation: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("authorization mutation did not commit")
+	}
+	select {
+	case err := <-dashboardDone:
+		if !errors.Is(err, ErrCrossProjectWorkbenchAccessDenied) {
+			t.Fatalf(
+				"dashboard race error = %v, want fail-closed access denial",
+				err,
+			)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dashboard did not resume after authorization mutation")
+	}
+	if waitErr != nil {
+		t.Fatal(waitErr)
+	}
+}
+
+func waitForPostgresBackendLock(
+	admin *gorm.DB,
+	pid int,
+	timeout time.Duration,
+) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		state := struct {
+			WaitEventType string `gorm:"column:wait_event_type"`
+		}{}
+		if err := admin.Raw(
+			`SELECT COALESCE(wait_event_type, '') AS wait_event_type
+			 FROM pg_stat_activity
+			 WHERE pid = ?`,
+			pid,
+		).Scan(&state).Error; err != nil {
+			return err
+		}
+		if state.WaitEventType == "Lock" {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return fmt.Errorf(
+		"PostgreSQL backend %d did not enter a lock wait",
+		pid,
+	)
 }
 
 const analyticsPostgresProjectPredicate = `

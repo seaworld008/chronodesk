@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -79,6 +80,14 @@ type dashboardProjectAggregateRow struct {
 	Overdue     int64
 }
 
+type authorizedDashboardProject struct {
+	ID             uint                 `gorm:"column:id"`
+	OrganizationID uint                 `gorm:"column:organization_id"`
+	Key            models.ProjectKey    `gorm:"column:key"`
+	Name           string               `gorm:"column:name"`
+	Status         models.ProjectStatus `gorm:"column:status"`
+}
+
 type WorkbenchDashboard struct {
 	GeneratedAt      time.Time                            `json:"generated_at"`
 	Days             int                                  `json:"days"`
@@ -153,21 +162,10 @@ func (service *CrossProjectWorkbenchService) Dashboard(
 	generatedAt := service.dashboardNow().UTC()
 	result := emptyWorkbenchDashboard(generatedAt, input.Days)
 	err := service.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		userQuery := tx.Table("users").
-			Select("id").
-			Where("id = ? AND status = ? AND deleted_at IS NULL", input.UserID, models.UserStatusActive)
-		if tx.Dialector.Name() == "postgres" {
-			userQuery = userQuery.Clauses(clause.Locking{Strength: "UPDATE"})
-		}
-		var activeUserID uint
-		if err := userQuery.Scan(&activeUserID).Error; err != nil {
-			return fmt.Errorf("lock workbench dashboard human: %w", err)
-		}
-		if activeUserID == 0 {
-			return ErrCrossProjectWorkbenchAccessDenied
-		}
-
-		projectQuery := tx.Table("projects AS projects").
+		// Discovery is deliberately lock-free. The authoritative snapshot is
+		// rebuilt below after acquiring Project -> User -> Membership locks,
+		// matching project archive and membership administration commands.
+		candidateQuery := tx.Table("projects AS projects").
 			Select("projects.id, projects.organization_id, projects.key, projects.name").
 			Joins("JOIN project_memberships AS memberships ON memberships.project_id = projects.id").
 			Where("memberships.user_id = ?", input.UserID).
@@ -175,43 +173,120 @@ func (service *CrossProjectWorkbenchService) Dashboard(
 			Where("projects.status = ?", models.ProjectStatusActive).
 			Order("projects.id ASC").
 			Limit(maxCrossProjectWorkbenchProjects + 1)
-		if tx.Dialector.Name() == "postgres" {
-			// Without an OF clause PostgreSQL locks matching rows from both
-			// memberships and projects, linearizing membership revocation and
-			// project archival against this authorization snapshot.
-			projectQuery = projectQuery.Clauses(
-				clause.Locking{Strength: "UPDATE"},
-			)
+		candidates := make([]authorizedDashboardProject, 0)
+		if err := candidateQuery.Scan(&candidates).Error; err != nil {
+			return fmt.Errorf("discover workbench dashboard memberships: %w", err)
 		}
-		authorizedProjects := make([]authorizedWorkbenchProject, 0)
-		if err := projectQuery.Scan(&authorizedProjects).Error; err != nil {
-			return fmt.Errorf("lock workbench dashboard memberships: %w", err)
-		}
-		if len(authorizedProjects) > maxCrossProjectWorkbenchProjects {
+		if len(candidates) > maxCrossProjectWorkbenchProjects {
 			return ErrCrossProjectWorkbenchProjectLimit
 		}
-		if len(authorizedProjects) == 0 {
+
+		candidateProjectIDs := make([]uint, 0, len(candidates))
+		for _, candidate := range candidates {
+			if candidate.ID == 0 {
+				return ErrCrossProjectWorkbenchAccessDenied
+			}
+			candidateProjectIDs = append(candidateProjectIDs, candidate.ID)
+		}
+		sort.Slice(candidateProjectIDs, func(left, right int) bool {
+			return candidateProjectIDs[left] < candidateProjectIDs[right]
+		})
+
+		lockedProjects := make([]authorizedDashboardProject, 0, len(candidates))
+		if len(candidateProjectIDs) > 0 {
+			if err := tx.Table("projects").
+				Select("id, organization_id, key, name, status").
+				Clauses(clause.Locking{Strength: "SHARE"}).
+				Where("id IN ?", candidateProjectIDs).
+				Order("id ASC").
+				Find(&lockedProjects).Error; err != nil {
+				return fmt.Errorf("lock workbench dashboard projects: %w", err)
+			}
+			if len(lockedProjects) != len(candidateProjectIDs) {
+				return ErrCrossProjectWorkbenchAccessDenied
+			}
+		}
+
+		var lockedUser models.User
+		if err := tx.
+			Unscoped().
+			Select("id", "status", "deleted_at").
+			Clauses(clause.Locking{Strength: "SHARE"}).
+			Where("id = ?", input.UserID).
+			Take(&lockedUser).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrCrossProjectWorkbenchAccessDenied
+			}
+			return fmt.Errorf("lock workbench dashboard human: %w", err)
+		}
+		if lockedUser.DeletedAt.Valid ||
+			lockedUser.Status != models.UserStatusActive {
+			return ErrCrossProjectWorkbenchAccessDenied
+		}
+
+		lockedMemberships := make([]models.ProjectMembership, 0, len(candidates))
+		if len(candidateProjectIDs) > 0 {
+			if err := tx.
+				Select("id", "project_id", "user_id", "is_active").
+				Clauses(clause.Locking{Strength: "SHARE"}).
+				Where(
+					"user_id = ? AND project_id IN ?",
+					input.UserID,
+					candidateProjectIDs,
+				).
+				Order("id ASC").
+				Find(&lockedMemberships).Error; err != nil {
+				return fmt.Errorf(
+					"lock workbench dashboard memberships: %w",
+					err,
+				)
+			}
+			if len(lockedMemberships) != len(candidateProjectIDs) {
+				return ErrCrossProjectWorkbenchAccessDenied
+			}
+		}
+
+		activeMembershipProjectIDs := make(
+			map[uint]struct{},
+			len(lockedMemberships),
+		)
+		for _, membership := range lockedMemberships {
+			if !membership.IsActive ||
+				membership.UserID != input.UserID {
+				return ErrCrossProjectWorkbenchAccessDenied
+			}
+			activeMembershipProjectIDs[membership.ProjectID] = struct{}{}
+		}
+		if len(activeMembershipProjectIDs) != len(candidateProjectIDs) {
+			return ErrCrossProjectWorkbenchAccessDenied
+		}
+
+		if len(lockedProjects) == 0 {
 			if input.HasFilter {
 				return ErrCrossProjectWorkbenchAccessDenied
 			}
 			return nil
 		}
-		organizationID := authorizedProjects[0].OrganizationID
+		organizationID := lockedProjects[0].OrganizationID
 		authorizedByKey := make(
-			map[models.ProjectKey]authorizedWorkbenchProject,
-			len(authorizedProjects),
+			map[models.ProjectKey]authorizedDashboardProject,
+			len(lockedProjects),
 		)
-		for _, project := range authorizedProjects {
+		for _, project := range lockedProjects {
 			if project.ID == 0 ||
 				project.OrganizationID == 0 ||
-				project.OrganizationID != organizationID {
+				project.OrganizationID != organizationID ||
+				project.Status != models.ProjectStatusActive {
+				return ErrCrossProjectWorkbenchAccessDenied
+			}
+			if _, active := activeMembershipProjectIDs[project.ID]; !active {
 				return ErrCrossProjectWorkbenchAccessDenied
 			}
 			authorizedByKey[project.Key] = project
 		}
-		projects := authorizedProjects
+		projects := lockedProjects
 		if input.HasFilter {
-			projects = make([]authorizedWorkbenchProject, 0, len(input.ProjectKeys))
+			projects = make([]authorizedDashboardProject, 0, len(input.ProjectKeys))
 			for _, key := range input.ProjectKeys {
 				project, authorized := authorizedByKey[key]
 				if !authorized {

@@ -15,12 +15,14 @@ type stubWorkbenchDashboardQuery struct {
 	input  services.WorkbenchDashboardQuery
 	result *services.WorkbenchDashboard
 	err    error
+	calls  int
 }
 
 func (stub *stubWorkbenchDashboardQuery) Dashboard(
 	_ context.Context,
 	input services.WorkbenchDashboardQuery,
 ) (*services.WorkbenchDashboard, error) {
+	stub.calls++
 	stub.input = input
 	return stub.result, stub.err
 }
@@ -53,6 +55,39 @@ func TestWorkbenchDashboardHandlerPreservesRepeatedProjectKeys(t *testing.T) {
 	}
 }
 
+func TestWorkbenchDashboardHandlerDefaultsToAllProjectsAndThirtyDays(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	stub := &stubWorkbenchDashboardQuery{
+		result: &services.WorkbenchDashboard{},
+	}
+	handler := NewWorkbenchDashboardHandler(stub)
+	router := gin.New()
+	router.GET("/api/workbench/dashboard", func(c *gin.Context) {
+		c.Set("user_id", uint(7))
+		handler.Get(c)
+	})
+	response := httptest.NewRecorder()
+	router.ServeHTTP(
+		response,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/api/workbench/dashboard",
+			nil,
+		),
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	if stub.calls != 1 ||
+		stub.input.Days != 30 ||
+		stub.input.HasFilter ||
+		len(stub.input.ProjectKeys) != 0 {
+		t.Fatalf("default dashboard input = %+v calls=%d", stub.input, stub.calls)
+	}
+}
+
 func TestWorkbenchDashboardHandlerMapsInvalidAndUnauthorizedQueries(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -68,6 +103,41 @@ func TestWorkbenchDashboardHandlerMapsInvalidAndUnauthorizedQueries(t *testing.T
 		{
 			name:       "whitespace is not canonicalized",
 			url:        "/api/workbench/dashboard?project_keys=%20OPS",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "duplicate project key",
+			url:        "/api/workbench/dashboard?project_keys=OPS&project_keys=OPS",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "invalid project key",
+			url:        "/api/workbench/dashboard?project_keys=ops",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "unknown query parameter",
+			url:        "/api/workbench/dashboard?unknown=OPS",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "malformed query encoding",
+			url:        "/api/workbench/dashboard?days=30;unknown=1",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "duplicate days",
+			url:        "/api/workbench/dashboard?days=7&days=30",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "noncanonical days",
+			url:        "/api/workbench/dashboard?days=030",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "unsupported 101 days",
+			url:        "/api/workbench/dashboard?days=101",
 			wantStatus: http.StatusBadRequest,
 		},
 		{
@@ -103,6 +173,9 @@ func TestWorkbenchDashboardHandlerMapsInvalidAndUnauthorizedQueries(t *testing.T
 					response.Code, test.wantStatus, response.Body.String(),
 					errors.Unwrap(test.serviceErr),
 				)
+			}
+			if test.wantStatus == http.StatusBadRequest && stub.calls != 0 {
+				t.Fatalf("invalid query reached service %d times", stub.calls)
 			}
 		})
 	}
