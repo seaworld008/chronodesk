@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
- * Generator: chronodesk-human-openapi-types@2.0.0.
- * Contract SHA-256: c998ba3ad08fcac6ec1d12390313558bee900ebd8cffb41763b3cee387243fbb.
+ * Generator: chronodesk-human-openapi-types@2.1.0.
+ * Contract SHA-256: 6b04789ca28be5c01654cb86c788e184c4943974f729a4164536faaa7454a742.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -1357,6 +1357,86 @@ export type AdminOverviewEnvelope = Envelope & {
     data?: AdminOverview
 }
 
+export type AdminPrincipalPage = {
+    items: Array<AdminServicePrincipalSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type AdminPolicyPage = {
+    items: Array<AdminAgentPolicy>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type AdminLeasePage = {
+    items: Array<AdminTicketLeaseSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type AdminOutboxPage = {
+    items: Array<AdminOutboxDeliverySummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type AdminAttachmentPage = {
+    items: Array<AdminAttachmentSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type AdminDomainEventCursorPage = {
+    items: Array<AdminDomainEventSummary>
+    next_cursor: string
+    has_more: boolean
+}
+
+export type AdminPolicyDecisionCursorPage = {
+    items: Array<AdminPolicyDecisionSummary>
+    next_cursor: string
+    has_more: boolean
+}
+
+export type AdminPrincipalPageEnvelope = Envelope & {
+    data?: AdminPrincipalPage
+}
+
+export type AdminPolicyPageEnvelope = Envelope & {
+    data?: AdminPolicyPage
+}
+
+export type AdminLeasePageEnvelope = Envelope & {
+    data?: AdminLeasePage
+}
+
+export type AdminOutboxPageEnvelope = Envelope & {
+    data?: AdminOutboxPage
+}
+
+export type AdminAttachmentPageEnvelope = Envelope & {
+    data?: AdminAttachmentPage
+}
+
+export type AdminDomainEventCursorEnvelope = Envelope & {
+    data?: AdminDomainEventCursorPage
+}
+
+export type AdminPolicyDecisionCursorEnvelope = Envelope & {
+    data?: AdminPolicyDecisionCursorPage
+}
+
 export type Envelope = {
     data: unknown
     meta: Meta
@@ -1382,15 +1462,13 @@ export type ResourceVersion = number
 
 export type AdminOverview = {
     global_read_only: boolean
-    global_read_only_version: ResourceVersion
     emergency_stop: boolean
-    emergency_stop_version: ResourceVersion
-    principals: Array<AdminServicePrincipalSummary>
-    leases: Array<AdminTicketLeaseSummary>
-    events: Array<AdminDomainEventSummary>
-    outbox: Array<AdminOutboxDeliverySummary>
-    attachments: Array<AdminAttachmentSummary>
-    policy_decisions: Array<AdminPolicyDecisionSummary>
+    principal_count: number
+    active_principal_count: number
+    active_lease_count: number
+    failed_outbox_count: number
+    recent_event_count: number
+    pending_attachment_scan_count: number
 }
 
 export type AdminServicePrincipalSummary = {
@@ -1408,6 +1486,17 @@ export type AdminServicePrincipalSummary = {
     read_only: boolean
     emergency_disabled: boolean
     resource_version: ResourceVersion
+    grant: AdminPrincipalGrantSummary
+}
+
+export type AdminPrincipalGrantSummary = {
+    id: number
+    project_id: number
+    role: ProjectRole
+    scopes: Array<AgentScope>
+    is_active: boolean
+    expires_at: string | null
+    created_at: string
 }
 
 export type AgentScope = "tickets:read" | "tickets:create" | "tickets:update" | "tickets:assign" | "tickets:transition" | "comments:write" | "attachments:read" | "attachments:write" | "events:subscribe" | "tasks:manage"
@@ -1416,7 +1505,9 @@ export type AdminTicketLeaseSummary = {
     id: string
     ticket_id: number
     ticket_number: string
-    principal_name: string
+    holder_actor_type: "human" | "service_principal" | "system"
+    holder_actor_id: string
+    holder_display_name: string
     acquired_at: string
     expires_at: string
     ticket_version: ResourceVersion
@@ -1425,6 +1516,7 @@ export type AdminTicketLeaseSummary = {
 
 export type AdminDomainEventSummary = {
     id: string
+    created_at: string
     type: string
     subject: string
     actor_type: "human" | "service_principal" | "system"
@@ -1435,8 +1527,10 @@ export type AdminDomainEventSummary = {
 
 export type AdminOutboxDeliverySummary = {
     id: string
+    created_at: string
     event_id: string
-    destination: string
+    destination_type: "webhook" | "event_stream" | "automation" | "notification" | "sla" | "sla_escalation" | "attachment_cleanup" | "attachment_staging_cleanup" | "a2a_push" | "email" | "other"
+    destination_label: string
     status: "pending" | "processing" | "succeeded" | "failed" | "dead"
     attempts: number
     next_attempt_at: string
@@ -1447,12 +1541,12 @@ export type AdminOutboxDeliverySummary = {
 
 export type AdminAttachmentSummary = {
     id: number
+    created_at: string
     ticket_id: number
     original_name: string
     mime_type: string
     file_size: number
     virus_scan: "pending" | "clean" | "infected" | "error"
-    scan_details: string
     scanned_at: string | null
     updated_at: string
     resource_version: ResourceVersion
@@ -1472,7 +1566,6 @@ export type AdminPolicyDecisionSummary = {
     reason_code: string
     matched_policy_id: string
     source_protocol: string
-    request_digest: string
 }
 
 export type Problem = {
@@ -1561,7 +1654,6 @@ export type AdminAgentPolicy = {
     action: string
     resource_type: string
     resource_id: string
-    conditions: AgentPolicyConditions
     priority: number
     is_active: boolean
     expires_at: string | null
@@ -2330,6 +2422,18 @@ export type GetAgentControlOverviewV2OperationQuery = Record<string, never>
 export type GetAgentControlOverviewV2OperationRequest = never
 export type GetAgentControlOverviewV2OperationResponse = AdminOverviewEnvelope
 
+export type ListAgentServicePrincipalsOperationPathParameters = {
+    projectKey: string
+}
+export type ListAgentServicePrincipalsOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at"
+    sort_order?: "desc"
+}
+export type ListAgentServicePrincipalsOperationRequest = never
+export type ListAgentServicePrincipalsOperationResponse = AdminPrincipalPageEnvelope
+
 export type CreateServicePrincipalV2OperationPathParameters = {
     projectKey: string
 }
@@ -2366,9 +2470,14 @@ export type ListServicePrincipalPoliciesV2OperationPathParameters = {
     projectKey: string
     principalId: string
 }
-export type ListServicePrincipalPoliciesV2OperationQuery = Record<string, never>
+export type ListServicePrincipalPoliciesV2OperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "priority"
+    sort_order?: "desc"
+}
 export type ListServicePrincipalPoliciesV2OperationRequest = never
-export type ListServicePrincipalPoliciesV2OperationResponse = AgentPolicyListEnvelope
+export type ListServicePrincipalPoliciesV2OperationResponse = AdminPolicyPageEnvelope
 
 export type CreateServicePrincipalPolicyV2OperationPathParameters = {
     projectKey: string
@@ -2387,6 +2496,18 @@ export type DisableServicePrincipalPolicyV2OperationQuery = Record<string, never
 export type DisableServicePrincipalPolicyV2OperationRequest = never
 export type DisableServicePrincipalPolicyV2OperationResponse = PolicyDisableEnvelope
 
+export type ListAgentTicketLeasesOperationPathParameters = {
+    projectKey: string
+}
+export type ListAgentTicketLeasesOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "expires_at"
+    sort_order?: "asc"
+}
+export type ListAgentTicketLeasesOperationRequest = never
+export type ListAgentTicketLeasesOperationResponse = AdminLeasePageEnvelope
+
 export type ForceReleaseTicketLeaseV2OperationPathParameters = {
     projectKey: string
     leaseId: string
@@ -2394,6 +2515,18 @@ export type ForceReleaseTicketLeaseV2OperationPathParameters = {
 export type ForceReleaseTicketLeaseV2OperationQuery = Record<string, never>
 export type ForceReleaseTicketLeaseV2OperationRequest = never
 export type ForceReleaseTicketLeaseV2OperationResponse = AdminTicketLeaseEnvelope
+
+export type ListAgentAttachmentScansOperationPathParameters = {
+    projectKey: string
+}
+export type ListAgentAttachmentScansOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at"
+    sort_order?: "desc"
+}
+export type ListAgentAttachmentScansOperationRequest = never
+export type ListAgentAttachmentScansOperationResponse = AdminAttachmentPageEnvelope
 
 export type RecordAttachmentVirusScanV2OperationPathParameters = {
     projectKey: string
@@ -2403,6 +2536,18 @@ export type RecordAttachmentVirusScanV2OperationQuery = Record<string, never>
 export type RecordAttachmentVirusScanV2OperationRequest = AttachmentScanUpdate
 export type RecordAttachmentVirusScanV2OperationResponse = AttachmentScanEnvelope
 
+export type ListAgentOutboxDeliveriesOperationPathParameters = {
+    projectKey: string
+}
+export type ListAgentOutboxDeliveriesOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at"
+    sort_order?: "desc"
+}
+export type ListAgentOutboxDeliveriesOperationRequest = never
+export type ListAgentOutboxDeliveriesOperationResponse = AdminOutboxPageEnvelope
+
 export type ReplayOutboxDeliveryV2OperationPathParameters = {
     projectKey: string
     deliveryId: string
@@ -2411,522 +2556,670 @@ export type ReplayOutboxDeliveryV2OperationQuery = Record<string, never>
 export type ReplayOutboxDeliveryV2OperationRequest = never
 export type ReplayOutboxDeliveryV2OperationResponse = ReplayEnvelope
 
+export type ListAgentDomainEventsOperationPathParameters = {
+    projectKey: string
+}
+export type ListAgentDomainEventsOperationQuery = {
+    cursor?: string
+    limit?: number
+}
+export type ListAgentDomainEventsOperationRequest = never
+export type ListAgentDomainEventsOperationResponse = AdminDomainEventCursorEnvelope
+
+export type ListAgentPolicyDecisionsOperationPathParameters = {
+    projectKey: string
+}
+export type ListAgentPolicyDecisionsOperationQuery = {
+    cursor?: string
+    limit?: number
+}
+export type ListAgentPolicyDecisionsOperationRequest = never
+export type ListAgentPolicyDecisionsOperationResponse = AdminPolicyDecisionCursorEnvelope
+
 export const humanApiOperations = {
     createHumanSession: {
         method: "POST",
         path: "/auth/login",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     refreshHumanSession: {
         method: "POST",
         path: "/auth/refresh",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     requestHumanPasswordReset: {
         method: "POST",
         path: "/auth/forgot-password",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     resetHumanPassword: {
         method: "POST",
         path: "/auth/reset-password",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     deleteHumanSession: {
         method: "POST",
         path: "/auth/logout",
         successStatus: 200,
         requestBody: "optional",
+        listStrategy: null,
     },
     deleteAllHumanSessions: {
         method: "POST",
         path: "/auth/logout-all",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     getHumanSessionUser: {
         method: "GET",
         path: "/auth/me",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     updateHumanProfile: {
         method: "PUT",
         path: "/auth/profile",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     listAuthorizedHumanProjects: {
         method: "GET",
         path: "/projects",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     getAuthorizedProjectContext: {
         method: "GET",
         path: "/projects/{projectKey}/context",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     listProjectMemberships: {
         method: "GET",
         path: "/projects/{projectKey}/memberships",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     upsertProjectMembership: {
         method: "POST",
         path: "/projects/{projectKey}/memberships",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     searchProjectMembershipCandidates: {
         method: "GET",
         path: "/projects/{projectKey}/membership-candidates",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     deactivateProjectMembership: {
         method: "DELETE",
         path: "/projects/{projectKey}/memberships/{userID}",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     listPlatformProjects: {
         method: "GET",
         path: "/platform/projects",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     createPlatformProject: {
         method: "POST",
         path: "/platform/projects",
         successStatus: 201,
         requestBody: "required",
+        listStrategy: null,
     },
     getPlatformProjectCreationContext: {
         method: "GET",
         path: "/platform/project-creation-context",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     listPlatformProjectBusinessUnits: {
         method: "GET",
         path: "/platform/project-business-units",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     archivePlatformProject: {
         method: "POST",
         path: "/platform/projects/{projectPublicID}/archive",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     listPlatformUsers: {
         method: "GET",
         path: "/platform/users",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     createPlatformUser: {
         method: "POST",
         path: "/platform/users",
         successStatus: 201,
         requestBody: "required",
+        listStrategy: null,
     },
     getPlatformUserStats: {
         method: "GET",
         path: "/platform/users/stats",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     getPlatformUser: {
         method: "GET",
         path: "/platform/users/{userID}",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     updatePlatformUser: {
         method: "PUT",
         path: "/platform/users/{userID}",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     deletePlatformUser: {
         method: "DELETE",
         path: "/platform/users/{userID}",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     resetPlatformUserPassword: {
         method: "POST",
         path: "/platform/users/{userID}/reset-password",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     listPlatformAuditLogs: {
         method: "GET",
         path: "/platform/audit-logs",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     getPlatformAuditLogDetail: {
         method: "GET",
         path: "/platform/audit-logs/{auditLogID}",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     getWorkbenchDashboard: {
         method: "GET",
         path: "/workbench/dashboard",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     listCrossProjectWorkbenchTickets: {
         method: "GET",
         path: "/workbench/tickets",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     listProjectTickets: {
         method: "GET",
         path: "/projects/{projectKey}/tickets",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     createProjectTicket: {
         method: "POST",
         path: "/projects/{projectKey}/tickets",
         successStatus: 201,
         requestBody: "required",
+        listStrategy: null,
     },
     listProjectOverdueTickets: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/overdue",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     listProjectSLABreachedTickets: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/sla-breach",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     getProjectTicket: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/{ticketID}",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     updateProjectTicket: {
         method: "PUT",
         path: "/projects/{projectKey}/tickets/{ticketID}",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     deleteProjectTicket: {
         method: "DELETE",
         path: "/projects/{projectKey}/tickets/{ticketID}",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     assignProjectTicket: {
         method: "POST",
         path: "/projects/{projectKey}/tickets/{ticketID}/assign",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     transferProjectTicket: {
         method: "POST",
         path: "/projects/{projectKey}/tickets/{ticketID}/transfer",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     escalateProjectTicket: {
         method: "POST",
         path: "/projects/{projectKey}/tickets/{ticketID}/escalate",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     updateProjectTicketStatus: {
         method: "POST",
         path: "/projects/{projectKey}/tickets/{ticketID}/status",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     listProjectTicketHistory: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/{ticketID}/history",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     listProjectTicketComments: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/{ticketID}/comments",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     createProjectTicketComment: {
         method: "POST",
         path: "/projects/{projectKey}/tickets/{ticketID}/comments",
         successStatus: 201,
         requestBody: "required",
+        listStrategy: null,
     },
     listProjectTicketCommentReplies: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/{ticketID}/comments/{commentID}/replies",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     listProjectTicketAttachments: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/{ticketID}/attachments",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     uploadProjectTicketAttachment: {
         method: "POST",
         path: "/projects/{projectKey}/tickets/{ticketID}/attachments",
         successStatus: 202,
         requestBody: "required",
+        listStrategy: null,
     },
     downloadProjectTicketAttachment: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/{ticketID}/attachments/{attachmentID}/content",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     listProjectNotifications: {
         method: "GET",
         path: "/projects/{projectKey}/notifications",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     createProjectNotification: {
         method: "POST",
         path: "/projects/{projectKey}/notifications",
         successStatus: 201,
         requestBody: "required",
+        listStrategy: null,
     },
     deleteProjectNotification: {
         method: "DELETE",
         path: "/projects/{projectKey}/notifications/{notificationID}",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     markProjectNotificationRead: {
         method: "PUT",
         path: "/projects/{projectKey}/notifications/{notificationID}/read",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     markAllProjectNotificationsRead: {
         method: "PUT",
         path: "/projects/{projectKey}/notifications/read-all",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     getProjectUnreadNotificationCount: {
         method: "GET",
         path: "/projects/{projectKey}/notifications/unread-count",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     getHumanNotificationPreferences: {
         method: "GET",
         path: "/notification-preferences",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     updateHumanNotificationPreferences: {
         method: "PUT",
         path: "/notification-preferences",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     listProjectAutomationRules: {
         method: "GET",
         path: "/projects/{projectKey}/admin/automation/rules",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     createProjectAutomationRule: {
         method: "POST",
         path: "/projects/{projectKey}/admin/automation/rules",
         successStatus: 201,
         requestBody: "required",
+        listStrategy: null,
     },
     getProjectAutomationRule: {
         method: "GET",
         path: "/projects/{projectKey}/admin/automation/rules/{ruleID}",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     updateProjectAutomationRule: {
         method: "PUT",
         path: "/projects/{projectKey}/admin/automation/rules/{ruleID}",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     deleteProjectAutomationRule: {
         method: "DELETE",
         path: "/projects/{projectKey}/admin/automation/rules/{ruleID}",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     listProjectAutomationLogs: {
         method: "GET",
         path: "/projects/{projectKey}/admin/automation/logs",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     getPlatformEmailConfig: {
         method: "GET",
         path: "/platform/email-config",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     updatePlatformEmailConfig: {
         method: "PUT",
         path: "/platform/email-config",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     testPlatformEmailConfig: {
         method: "POST",
         path: "/platform/email-config/test",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     listPlatformConfigs: {
         method: "GET",
         path: "/platform/configs",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     updatePlatformConfig: {
         method: "PUT",
         path: "/platform/configs/{configKey}",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     listProjectWebhooks: {
         method: "GET",
         path: "/projects/{projectKey}/webhooks",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     createProjectWebhook: {
         method: "POST",
         path: "/projects/{projectKey}/webhooks",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     getProjectWebhook: {
         method: "GET",
         path: "/projects/{projectKey}/webhooks/{webhookID}",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     updateProjectWebhook: {
         method: "PUT",
         path: "/projects/{projectKey}/webhooks/{webhookID}",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     deleteProjectWebhook: {
         method: "DELETE",
         path: "/projects/{projectKey}/webhooks/{webhookID}",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     queueProjectWebhookTest: {
         method: "POST",
         path: "/projects/{projectKey}/webhooks/{webhookID}/test",
         successStatus: 202,
         requestBody: "none",
+        listStrategy: null,
     },
     listProjectWebhookLogs: {
         method: "GET",
         path: "/projects/{projectKey}/webhooks/{webhookID}/logs",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     getProjectWebhookStats: {
         method: "GET",
         path: "/projects/{projectKey}/webhooks/{webhookID}/stats",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     getAgentControlOverviewV2: {
         method: "GET",
         path: "/projects/{projectKey}/admin/agents/agent-control/overview",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
+    },
+    listAgentServicePrincipals: {
+        method: "GET",
+        path: "/projects/{projectKey}/admin/agents/service-principals",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
     },
     createServicePrincipalV2: {
         method: "POST",
         path: "/projects/{projectKey}/admin/agents/service-principals",
         successStatus: 201,
         requestBody: "required",
+        listStrategy: null,
     },
     setServicePrincipalStatusV2: {
         method: "PUT",
         path: "/projects/{projectKey}/admin/agents/service-principals/{principalId}/status",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
     },
     rotateServicePrincipalCredentialV2: {
         method: "POST",
         path: "/projects/{projectKey}/admin/agents/service-principals/{principalId}/credentials/rotate",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     revokeServicePrincipalCredentialV2: {
         method: "DELETE",
         path: "/projects/{projectKey}/admin/agents/service-principals/{principalId}/credentials/{credentialId}",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
     },
     listServicePrincipalPoliciesV2: {
         method: "GET",
         path: "/projects/{projectKey}/admin/agents/service-principals/{principalId}/policies",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: "page",
     },
     createServicePrincipalPolicyV2: {
         method: "POST",
         path: "/projects/{projectKey}/admin/agents/service-principals/{principalId}/policies",
         successStatus: 201,
         requestBody: "required",
+        listStrategy: null,
     },
     disableServicePrincipalPolicyV2: {
         method: "DELETE",
         path: "/projects/{projectKey}/admin/agents/service-principals/{principalId}/policies/{policyId}",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
+    },
+    listAgentTicketLeases: {
+        method: "GET",
+        path: "/projects/{projectKey}/admin/agents/leases",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
     },
     forceReleaseTicketLeaseV2: {
         method: "POST",
         path: "/projects/{projectKey}/admin/agents/leases/{leaseId}/force-release",
         successStatus: 200,
         requestBody: "none",
+        listStrategy: null,
+    },
+    listAgentAttachmentScans: {
+        method: "GET",
+        path: "/projects/{projectKey}/admin/agents/attachments",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
     },
     recordAttachmentVirusScanV2: {
         method: "POST",
         path: "/projects/{projectKey}/admin/agents/attachments/{attachmentId}/scan",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: null,
+    },
+    listAgentOutboxDeliveries: {
+        method: "GET",
+        path: "/projects/{projectKey}/admin/agents/outbox",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
     },
     replayOutboxDeliveryV2: {
         method: "POST",
         path: "/projects/{projectKey}/admin/agents/outbox/{deliveryId}/replay",
         successStatus: 202,
         requestBody: "none",
+        listStrategy: null,
+    },
+    listAgentDomainEvents: {
+        method: "GET",
+        path: "/projects/{projectKey}/admin/agents/events",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "cursor",
+    },
+    listAgentPolicyDecisions: {
+        method: "GET",
+        path: "/projects/{projectKey}/admin/agents/policy-decisions",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "cursor",
     },
 } as const
 
@@ -3387,6 +3680,12 @@ export interface HumanApiOperationTypes {
         request: GetAgentControlOverviewV2OperationRequest
         response: GetAgentControlOverviewV2OperationResponse
     }
+    listAgentServicePrincipals: {
+        pathParameters: ListAgentServicePrincipalsOperationPathParameters
+        query: ListAgentServicePrincipalsOperationQuery
+        request: ListAgentServicePrincipalsOperationRequest
+        response: ListAgentServicePrincipalsOperationResponse
+    }
     createServicePrincipalV2: {
         pathParameters: CreateServicePrincipalV2OperationPathParameters
         query: CreateServicePrincipalV2OperationQuery
@@ -3429,11 +3728,23 @@ export interface HumanApiOperationTypes {
         request: DisableServicePrincipalPolicyV2OperationRequest
         response: DisableServicePrincipalPolicyV2OperationResponse
     }
+    listAgentTicketLeases: {
+        pathParameters: ListAgentTicketLeasesOperationPathParameters
+        query: ListAgentTicketLeasesOperationQuery
+        request: ListAgentTicketLeasesOperationRequest
+        response: ListAgentTicketLeasesOperationResponse
+    }
     forceReleaseTicketLeaseV2: {
         pathParameters: ForceReleaseTicketLeaseV2OperationPathParameters
         query: ForceReleaseTicketLeaseV2OperationQuery
         request: ForceReleaseTicketLeaseV2OperationRequest
         response: ForceReleaseTicketLeaseV2OperationResponse
+    }
+    listAgentAttachmentScans: {
+        pathParameters: ListAgentAttachmentScansOperationPathParameters
+        query: ListAgentAttachmentScansOperationQuery
+        request: ListAgentAttachmentScansOperationRequest
+        response: ListAgentAttachmentScansOperationResponse
     }
     recordAttachmentVirusScanV2: {
         pathParameters: RecordAttachmentVirusScanV2OperationPathParameters
@@ -3441,11 +3752,29 @@ export interface HumanApiOperationTypes {
         request: RecordAttachmentVirusScanV2OperationRequest
         response: RecordAttachmentVirusScanV2OperationResponse
     }
+    listAgentOutboxDeliveries: {
+        pathParameters: ListAgentOutboxDeliveriesOperationPathParameters
+        query: ListAgentOutboxDeliveriesOperationQuery
+        request: ListAgentOutboxDeliveriesOperationRequest
+        response: ListAgentOutboxDeliveriesOperationResponse
+    }
     replayOutboxDeliveryV2: {
         pathParameters: ReplayOutboxDeliveryV2OperationPathParameters
         query: ReplayOutboxDeliveryV2OperationQuery
         request: ReplayOutboxDeliveryV2OperationRequest
         response: ReplayOutboxDeliveryV2OperationResponse
+    }
+    listAgentDomainEvents: {
+        pathParameters: ListAgentDomainEventsOperationPathParameters
+        query: ListAgentDomainEventsOperationQuery
+        request: ListAgentDomainEventsOperationRequest
+        response: ListAgentDomainEventsOperationResponse
+    }
+    listAgentPolicyDecisions: {
+        pathParameters: ListAgentPolicyDecisionsOperationPathParameters
+        query: ListAgentPolicyDecisionsOperationQuery
+        request: ListAgentPolicyDecisionsOperationRequest
+        response: ListAgentPolicyDecisionsOperationResponse
     }
 }
 
@@ -3676,6 +4005,8 @@ export const humanApiRoutes = {
         humanApiRoute("getProjectWebhookStats", pathParameters, query),
     getAgentControlOverviewV2: (pathParameters: GetAgentControlOverviewV2OperationPathParameters, query: GetAgentControlOverviewV2OperationQuery = {}) =>
         humanApiRoute("getAgentControlOverviewV2", pathParameters, query),
+    listAgentServicePrincipals: (pathParameters: ListAgentServicePrincipalsOperationPathParameters, query: ListAgentServicePrincipalsOperationQuery = {}) =>
+        humanApiRoute("listAgentServicePrincipals", pathParameters, query),
     createServicePrincipalV2: (pathParameters: CreateServicePrincipalV2OperationPathParameters, query: CreateServicePrincipalV2OperationQuery = {}) =>
         humanApiRoute("createServicePrincipalV2", pathParameters, query),
     setServicePrincipalStatusV2: (pathParameters: SetServicePrincipalStatusV2OperationPathParameters, query: SetServicePrincipalStatusV2OperationQuery = {}) =>
@@ -3690,10 +4021,20 @@ export const humanApiRoutes = {
         humanApiRoute("createServicePrincipalPolicyV2", pathParameters, query),
     disableServicePrincipalPolicyV2: (pathParameters: DisableServicePrincipalPolicyV2OperationPathParameters, query: DisableServicePrincipalPolicyV2OperationQuery = {}) =>
         humanApiRoute("disableServicePrincipalPolicyV2", pathParameters, query),
+    listAgentTicketLeases: (pathParameters: ListAgentTicketLeasesOperationPathParameters, query: ListAgentTicketLeasesOperationQuery = {}) =>
+        humanApiRoute("listAgentTicketLeases", pathParameters, query),
     forceReleaseTicketLeaseV2: (pathParameters: ForceReleaseTicketLeaseV2OperationPathParameters, query: ForceReleaseTicketLeaseV2OperationQuery = {}) =>
         humanApiRoute("forceReleaseTicketLeaseV2", pathParameters, query),
+    listAgentAttachmentScans: (pathParameters: ListAgentAttachmentScansOperationPathParameters, query: ListAgentAttachmentScansOperationQuery = {}) =>
+        humanApiRoute("listAgentAttachmentScans", pathParameters, query),
     recordAttachmentVirusScanV2: (pathParameters: RecordAttachmentVirusScanV2OperationPathParameters, query: RecordAttachmentVirusScanV2OperationQuery = {}) =>
         humanApiRoute("recordAttachmentVirusScanV2", pathParameters, query),
+    listAgentOutboxDeliveries: (pathParameters: ListAgentOutboxDeliveriesOperationPathParameters, query: ListAgentOutboxDeliveriesOperationQuery = {}) =>
+        humanApiRoute("listAgentOutboxDeliveries", pathParameters, query),
     replayOutboxDeliveryV2: (pathParameters: ReplayOutboxDeliveryV2OperationPathParameters, query: ReplayOutboxDeliveryV2OperationQuery = {}) =>
         humanApiRoute("replayOutboxDeliveryV2", pathParameters, query),
+    listAgentDomainEvents: (pathParameters: ListAgentDomainEventsOperationPathParameters, query: ListAgentDomainEventsOperationQuery = {}) =>
+        humanApiRoute("listAgentDomainEvents", pathParameters, query),
+    listAgentPolicyDecisions: (pathParameters: ListAgentPolicyDecisionsOperationPathParameters, query: ListAgentPolicyDecisionsOperationQuery = {}) =>
+        humanApiRoute("listAgentPolicyDecisions", pathParameters, query),
 } as const

@@ -782,6 +782,16 @@ func Run() error {
 		cfg.Agent.CredentialTTL,
 		[]byte(cfg.Agent.CredentialPepper),
 	)
+	agentAdminLists, err := agentplatform.NewAdminListService(
+		db.DB,
+		[]byte(cfg.JWT.Secret),
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize Agent administrator lists:", err)
+	}
+	if err := agentAdmin.ConfigureListService(agentAdminLists); err != nil {
+		log.Fatal("Failed to configure Agent administrator lists:", err)
+	}
 
 	// API 路由组
 	api := r.Group("/api")

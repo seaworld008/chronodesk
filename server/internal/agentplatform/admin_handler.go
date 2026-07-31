@@ -299,6 +299,7 @@ type AdminHandler struct {
 	db            *gorm.DB
 	native        *services.AgentNativeService
 	control       *RuntimeControl
+	lists         *AdminListService
 	credentialTTL time.Duration
 	replayCipher  cipher.AEAD
 }
@@ -325,23 +326,40 @@ func NewAdminHandler(
 	return handler
 }
 
+func (h *AdminHandler) ConfigureListService(service *AdminListService) error {
+	if h == nil || service == nil || service.db == nil {
+		return errors.New("administrator list service is required")
+	}
+	if h.db != service.db {
+		return errors.New("administrator list service database does not match handler")
+	}
+	h.lists = service
+	return nil
+}
+
 func (h *AdminHandler) RegisterRoutes(group *gin.RouterGroup) {
 	group.Use(h.requireAdminCommandHeaders)
-	group.GET("/agent-control/overview", h.Overview)
+	group.GET("/agent-control/overview", h.OverviewMetrics)
 	// Global read-only and emergency-stop are platform resources persisted in
 	// SystemConfig. They are intentionally read-only from this project route:
 	// a project-scoped command must never emit an unscoped 0/0 DomainEvent or
 	// disguise a platform-wide mutation as project-local.
+	group.GET("/service-principals", h.ListPrincipalsPage)
 	group.POST("/service-principals", h.CreateServicePrincipal)
 	group.PUT("/service-principals/:id/status", h.SetServicePrincipalStatus)
 	group.POST("/service-principals/:id/credentials/rotate", h.RotateCredential)
 	group.DELETE("/service-principals/:id/credentials/:credential_id", h.RevokeCredential)
-	group.GET("/service-principals/:id/policies", h.ListPolicies)
+	group.GET("/service-principals/:id/policies", h.ListPoliciesPage)
 	group.POST("/service-principals/:id/policies", h.CreatePolicy)
 	group.DELETE("/service-principals/:id/policies/:policy_id", h.DisablePolicy)
+	group.GET("/leases", h.ListLeasesPage)
 	group.POST("/leases/:id/force-release", h.ForceReleaseLease)
+	group.GET("/attachments", h.ListAttachmentScansPage)
 	group.POST("/attachments/:id/scan", h.MarkAttachmentScan)
+	group.GET("/events", h.ListDomainEventsPage)
+	group.GET("/outbox", h.ListOutboxPage)
 	group.POST("/outbox/:id/replay", h.ReplayOutbox)
+	group.GET("/policy-decisions", h.ListPolicyDecisionsPage)
 }
 
 func (h *AdminHandler) requireProjectScope(
@@ -551,277 +569,7 @@ func bindAdminJSON(c *gin.Context, target any) error {
 }
 
 func (h *AdminHandler) Overview(c *gin.Context) {
-	scope, ok := h.requireProjectScope(c)
-	if !ok {
-		return
-	}
-	var principals []models.ServicePrincipal
-	if err := scopedAdminPrincipalQuery(
-		h.db.WithContext(c.Request.Context()),
-		scope,
-	).
-		Order("service_principals.created_at DESC").
-		Find(&principals).Error; err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load service principals", true)
-		return
-	}
-	var grants []models.ProjectPrincipalGrant
-	if err := h.db.WithContext(c.Request.Context()).
-		Where(
-			"project_id = ? AND is_active = ? AND (expires_at IS NULL OR expires_at > ?)",
-			scope.ProjectID,
-			true,
-			time.Now().UTC(),
-		).
-		Find(&grants).Error; err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load project principal grants", true)
-		return
-	}
-	projectScopes := make(map[string][]string, len(grants))
-	for i := range grants {
-		scopes, err := grants[i].ScopeList()
-		if err != nil {
-			WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to decode project principal grant", true)
-			return
-		}
-		projectScopes[grants[i].ServicePrincipalID] = scopes
-	}
-
-	now := time.Now().UTC()
-	var leases []models.TicketLease
-	if err := h.db.WithContext(c.Request.Context()).
-		Where(
-			"organization_id = ? AND project_id = ? AND released_at IS NULL AND expires_at > ?",
-			scope.OrganizationID,
-			scope.ProjectID,
-			now,
-		).
-		Order("expires_at ASC").
-		Limit(100).
-		Find(&leases).Error; err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load ticket leases", true)
-		return
-	}
-
-	var events []models.DomainEvent
-	if err := h.db.WithContext(c.Request.Context()).
-		Where(
-			"organization_id = ? AND project_id = ?",
-			scope.OrganizationID,
-			scope.ProjectID,
-		).
-		Order("created_at DESC").
-		Limit(100).
-		Find(&events).Error; err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load domain events", true)
-		return
-	}
-
-	var deliveries []models.OutboxDelivery
-	if err := h.db.WithContext(c.Request.Context()).
-		Where(
-			"organization_id = ? AND project_id = ?",
-			scope.OrganizationID,
-			scope.ProjectID,
-		).
-		Order("updated_at DESC").
-		Limit(100).
-		Find(&deliveries).Error; err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load Outbox deliveries", true)
-		return
-	}
-	var attachments []models.TicketAttachment
-	if err := h.db.WithContext(c.Request.Context()).
-		Where(
-			"organization_id = ? AND project_id = ?",
-			scope.OrganizationID,
-			scope.ProjectID,
-		).
-		Order("updated_at DESC").
-		Limit(100).
-		Find(&attachments).Error; err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load attachment scan state", true)
-		return
-	}
-	var decisions []models.PolicyDecision
-	if err := h.db.WithContext(c.Request.Context()).
-		Where(
-			"organization_id = ? AND project_id = ?",
-			scope.OrganizationID,
-			scope.ProjectID,
-		).
-		Order("created_at DESC").
-		Limit(100).
-		Find(&decisions).Error; err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load policy decisions", true)
-		return
-	}
-
-	versionSubjects := make([]string, 0, len(principals)+len(leases)+len(deliveries)+len(attachments))
-	for i := range principals {
-		versionSubjects = append(versionSubjects, "service-principal/"+principals[i].ID)
-	}
-	for i := range leases {
-		versionSubjects = append(versionSubjects, "lease/"+leases[i].ID)
-	}
-	for i := range deliveries {
-		versionSubjects = append(versionSubjects, "outbox/"+deliveries[i].ID)
-	}
-	for i := range attachments {
-		versionSubjects = append(
-			versionSubjects,
-			"attachment/"+strconv.FormatUint(uint64(attachments[i].ID), 10),
-		)
-	}
-	resourceVersions, err := h.adminResourceVersions(
-		c.Request.Context(),
-		h.db,
-		scope,
-		versionSubjects,
-	)
-	if err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load administrator resource versions", true)
-		return
-	}
-
-	principalRows := make([]gin.H, 0, len(principals))
-	for i := range principals {
-		principal := &principals[i]
-		principalRows = append(principalRows, gin.H{
-			"id":          principal.ID,
-			"client_id":   principal.ID,
-			"name":        principal.Name,
-			"description": principal.Description,
-			"status":      principal.Status,
-			"scopes": intersectAgentScopes(
-				principal.ScopeList(),
-				projectScopes[principal.ID],
-			),
-			"rate_limit":         principal.RateLimitPerMinute,
-			"concurrency_limit":  principal.ConcurrentLimit,
-			"last_used_at":       principal.LastUsedAt,
-			"expires_at":         principal.ExpiresAt,
-			"created_at":         principal.CreatedAt,
-			"read_only":          principal.ReadOnly,
-			"emergency_disabled": principal.EmergencyDisabled,
-			"resource_version":   resourceVersions["service-principal/"+principal.ID],
-		})
-	}
-
-	leaseRows := make([]gin.H, 0, len(leases))
-	for i := range leases {
-		lease := &leases[i]
-		var ticket models.Ticket
-		_ = h.db.WithContext(c.Request.Context()).
-			Select("id", "ticket_number").
-			Where(
-				"id = ? AND organization_id = ? AND project_id = ?",
-				lease.TicketID,
-				scope.OrganizationID,
-				scope.ProjectID,
-			).
-			First(&ticket).Error
-		principalName := lease.HolderActorID
-		if lease.HolderActorType == models.ActorTypeServicePrincipal {
-			principal, principalErr := requireScopedAdminPrincipal(
-				c.Request.Context(),
-				h.db,
-				scope,
-				lease.HolderActorID,
-			)
-			if principalErr == nil {
-				principalName = principal.Name
-			}
-		}
-		leaseRows = append(leaseRows, gin.H{
-			"id":               lease.ID,
-			"ticket_id":        lease.TicketID,
-			"ticket_number":    ticket.TicketNumber,
-			"principal_name":   principalName,
-			"acquired_at":      lease.CreatedAt,
-			"expires_at":       lease.ExpiresAt,
-			"ticket_version":   lease.TicketVersion,
-			"resource_version": resourceVersions["lease/"+lease.ID],
-		})
-	}
-
-	eventRows := make([]gin.H, 0, len(events))
-	for i := range events {
-		event := &events[i]
-		eventRows = append(eventRows, gin.H{
-			"id":               event.ID,
-			"type":             event.Type,
-			"subject":          event.Subject,
-			"actor_type":       event.ActorType,
-			"actor_id":         event.ActorID,
-			"resource_version": event.ResourceVersion,
-			"time":             event.Time,
-		})
-	}
-
-	outboxRows := make([]gin.H, 0, len(deliveries))
-	for i := range deliveries {
-		delivery := &deliveries[i]
-		outboxRows = append(outboxRows, gin.H{
-			"id":               delivery.ID,
-			"event_id":         delivery.EventID,
-			"destination":      delivery.DestinationType + ":" + delivery.DestinationID,
-			"status":           delivery.Status,
-			"attempts":         delivery.Attempts,
-			"next_attempt_at":  delivery.NextAttemptAt,
-			"last_error":       services.ScrubOutboxFailureText(delivery.LastError),
-			"updated_at":       delivery.UpdatedAt,
-			"resource_version": resourceVersions["outbox/"+delivery.ID],
-		})
-	}
-	attachmentRows := make([]gin.H, 0, len(attachments))
-	for i := range attachments {
-		attachment := &attachments[i]
-		subject := "attachment/" + strconv.FormatUint(uint64(attachment.ID), 10)
-		attachmentRows = append(attachmentRows, gin.H{
-			"id":               attachment.ID,
-			"ticket_id":        attachment.TicketID,
-			"original_name":    attachment.OriginalName,
-			"mime_type":        attachment.MimeType,
-			"file_size":        attachment.FileSize,
-			"virus_scan":       attachment.VirusScan,
-			"scan_details":     attachment.ScanDetails,
-			"scanned_at":       attachment.ScannedAt,
-			"updated_at":       attachment.UpdatedAt,
-			"resource_version": resourceVersions[subject],
-		})
-	}
-	decisionRows := make([]gin.H, 0, len(decisions))
-	for i := range decisions {
-		decision := &decisions[i]
-		decisionRows = append(decisionRows, gin.H{
-			"id":                decision.ID,
-			"created_at":        decision.CreatedAt,
-			"actor_type":        decision.ActorType,
-			"actor_id":          decision.ActorID,
-			"credential_id":     decision.CredentialID,
-			"scope":             decision.Scope,
-			"action":            decision.Action,
-			"resource_type":     decision.ResourceType,
-			"resource_id":       decision.ResourceID,
-			"allowed":           decision.Allowed,
-			"reason_code":       decision.ReasonCode,
-			"matched_policy_id": decision.MatchedPolicyID,
-			"source_protocol":   decision.SourceProtocol,
-			"request_digest":    decision.RequestDigest,
-		})
-	}
-
-	WriteData(c, http.StatusOK, gin.H{
-		"global_read_only": h.control != nil && h.control.ReadOnly(),
-		"emergency_stop":   h.control != nil && h.control.EmergencyStop(),
-		"principals":       principalRows,
-		"leases":           leaseRows,
-		"events":           eventRows,
-		"outbox":           outboxRows,
-		"attachments":      attachmentRows,
-		"policy_decisions": decisionRows,
-	}, Meta{})
+	h.OverviewMetrics(c)
 }
 
 func (h *AdminHandler) CreateServicePrincipal(c *gin.Context) {
@@ -1163,67 +911,7 @@ func (h *AdminHandler) CreatePolicy(c *gin.Context) {
 }
 
 func (h *AdminHandler) ListPolicies(c *gin.Context) {
-	scope, ok := h.requireProjectScope(c)
-	if !ok {
-		return
-	}
-	if _, err := requireScopedAdminPrincipal(
-		c.Request.Context(),
-		h.db,
-		scope,
-		c.Param("id"),
-	); err != nil {
-		h.writeNativeError(c, err)
-		return
-	}
-	var policies []models.AgentPolicy
-	if err := h.db.WithContext(c.Request.Context()).
-		Where("service_principal_id = ?", c.Param("id")).
-		Order("priority DESC, created_at DESC").
-		Find(&policies).Error; err != nil {
-		h.writeNativeError(c, err)
-		return
-	}
-	subjects := make([]string, 0, len(policies))
-	for i := range policies {
-		subjects = append(
-			subjects,
-			"service-principal/"+policies[i].ServicePrincipalID+"/policy/"+policies[i].ID,
-		)
-	}
-	versions, err := h.adminResourceVersions(
-		c.Request.Context(),
-		h.db,
-		scope,
-		subjects,
-	)
-	if err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load policy versions", true)
-		return
-	}
-	rows := make([]gin.H, 0, len(policies))
-	for i := range policies {
-		policy := &policies[i]
-		subject := "service-principal/" + policy.ServicePrincipalID + "/policy/" + policy.ID
-		rows = append(rows, gin.H{
-			"id":                   policy.ID,
-			"created_at":           policy.CreatedAt,
-			"updated_at":           policy.UpdatedAt,
-			"service_principal_id": policy.ServicePrincipalID,
-			"name":                 policy.Name,
-			"effect":               policy.Effect,
-			"scope":                policy.Scope,
-			"action":               policy.Action,
-			"resource_type":        policy.ResourceType,
-			"resource_id":          policy.ResourceID,
-			"conditions":           policy.Conditions,
-			"priority":             policy.Priority,
-			"is_active":            policy.IsActive,
-			"expires_at":           policy.ExpiresAt,
-			"resource_version":     versions[subject],
-		})
-	}
-	WriteData(c, http.StatusOK, rows, Meta{})
+	h.ListPoliciesPage(c)
 }
 
 func (h *AdminHandler) DisablePolicy(c *gin.Context) {

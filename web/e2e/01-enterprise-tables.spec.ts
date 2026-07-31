@@ -280,18 +280,15 @@ const releaseAgentLease = async (request: APIRequestContext) => {
         return;
     }
     const token = await getAdminToken(request);
-    const overviewResponse = await apiRequest<Record<string, unknown>>(
+    const leaseResponse = await apiRequest<Record<string, unknown>>(
         request,
         token,
-        projectAPIPath(
+        `${projectAPIPath(
             agentTicketFixture.projectKey,
-            'admin/agents/agent-control/overview',
-        ),
+            'admin/agents/leases',
+        )}?page=1&page_size=100&sort_by=expires_at&sort_order=asc`,
     );
-    const overview = extractData<Record<string, unknown>>(overviewResponse);
-    const leases = Array.isArray(overview.leases)
-        ? (overview.leases as Array<Record<string, unknown>>)
-        : [];
+    const leases = extractItems<Record<string, unknown>>(leaseResponse);
     const lease = leases.find((candidate) => candidate.id === agentLeaseID);
     if (!lease) {
         return;
@@ -894,25 +891,42 @@ test.describe('企业级列表表格', () => {
         await expect
             .poll(
                 async () => {
-                    const response = await apiRequest<Record<string, unknown>>(
-                        request,
-                        token,
-                        projectAPIPath(
-                            agentTicketFixture.projectKey,
-                            'admin/agents/agent-control/overview',
-                        ),
+                    const base = projectAPIPath(
+                        agentTicketFixture.projectKey,
+                        'admin/agents',
                     );
-                    const overview =
-                        extractData<Record<string, unknown>>(response);
-                    return (
-                        Array.isArray(overview.leases) &&
-                        overview.leases.length > 0 &&
-                        Array.isArray(overview.events) &&
-                        overview.events.length > 0 &&
-                        Array.isArray(overview.outbox) &&
-                        overview.outbox.length > 0 &&
-                        Array.isArray(overview.policy_decisions) &&
-                        overview.policy_decisions.length > 0
+                    const [leaseResponse, eventResponse, outboxResponse, decisionResponse] =
+                        await Promise.all([
+                            apiRequest<Record<string, unknown>>(
+                                request,
+                                token,
+                                `${base}/leases?page=1&page_size=25&sort_by=expires_at&sort_order=asc`,
+                            ),
+                            apiRequest<Record<string, unknown>>(
+                                request,
+                                token,
+                                `${base}/events?limit=25`,
+                            ),
+                            apiRequest<Record<string, unknown>>(
+                                request,
+                                token,
+                                `${base}/outbox?page=1&page_size=25&sort_by=created_at&sort_order=desc`,
+                            ),
+                            apiRequest<Record<string, unknown>>(
+                                request,
+                                token,
+                                `${base}/policy-decisions?limit=25`,
+                            ),
+                        ]);
+                    return [
+                        leaseResponse,
+                        eventResponse,
+                        outboxResponse,
+                        decisionResponse,
+                    ].every(
+                        (response) =>
+                            extractItems<Record<string, unknown>>(response)
+                                .length > 0,
                     );
                 },
                 {

@@ -51,10 +51,8 @@ test.describe('AI 智能体控制中心', () => {
         ).toBeVisible({ timeout: 15_000 });
 
         for (const helper of [
-            '可签发令牌的服务主体',
-            '正在处理的工单',
-            '最近一页领域事件',
-            '需要关注的事件投递记录',
+            '服务端统计的有效项目授权',
+            '服务端统计的活跃租约',
         ] as const) {
             await expect(
                 main.getByText(helper, { exact: true }),
@@ -64,8 +62,7 @@ test.describe('AI 智能体控制中心', () => {
         const tabs = [
             ['服务主体', '服务主体列表'],
             ['实时租约', '工单租约列表'],
-            ['领域事件', '领域事件列表'],
-            ['事件投递（Outbox）', '事件投递列表'],
+            ['附件扫描', '附件扫描列表'],
             ['策略审计', '智能体策略决策审计'],
         ] as const;
         for (const [tab, table] of tabs) {
@@ -96,6 +93,195 @@ test.describe('AI 智能体控制中心', () => {
             ),
         ).toBeVisible();
         await expectChineseOperations(page);
+    });
+
+    test('AGT-010：各标签只请求自己的严格分页或游标端点', async ({
+        page,
+    }) => {
+        await authenticatePage(page);
+        const requests: URL[] = [];
+        page.on('request', (request) => {
+            const url = new URL(request.url());
+            if (
+                request.method() === 'GET'
+                && url.pathname.includes('/admin/agents/')
+            ) {
+                requests.push(url);
+            }
+        });
+        await page.goto('/#/agent-control');
+        const main = page.getByRole('main');
+        await expect(
+            main.getByRole('table', { name: '服务主体列表', exact: true }),
+        ).toBeVisible({ timeout: 15_000 });
+
+        expect(
+            requests.some((url) =>
+                url.pathname.endsWith('/agent-control/overview'),
+            ),
+        ).toBe(true);
+        const principalRequest = requests.find((url) =>
+            url.pathname.endsWith('/service-principals'),
+        );
+        expect(principalRequest?.searchParams.get('page')).toBe('1');
+        expect(principalRequest?.searchParams.get('page_size')).toBe('25');
+        expect(principalRequest?.searchParams.get('sort_by')).toBe(
+            'created_at',
+        );
+        expect(
+            requests.some((url) => url.pathname.endsWith('/leases')),
+        ).toBe(false);
+
+        const leaseResponse = page.waitForResponse((response) => {
+            const url = new URL(response.url());
+            return response.request().method() === 'GET'
+                && url.pathname.endsWith('/admin/agents/leases');
+        });
+        await main.getByRole('tab', { name: '实时租约', exact: true }).click();
+        const leaseURL = new URL((await leaseResponse).url());
+        expect(leaseURL.searchParams.get('page')).toBe('1');
+        expect(leaseURL.searchParams.get('page_size')).toBe('25');
+        expect(leaseURL.searchParams.get('sort_by')).toBe('expires_at');
+        expect(leaseURL.searchParams.get('sort_order')).toBe('asc');
+
+        const decisionResponse = page.waitForResponse((response) => {
+            const url = new URL(response.url());
+            return response.request().method() === 'GET'
+                && url.pathname.endsWith('/admin/agents/policy-decisions');
+        });
+        await main.getByRole('tab', { name: '策略审计', exact: true }).click();
+        const decisionURL = new URL((await decisionResponse).url());
+        expect(decisionURL.searchParams.get('limit')).toBe('25');
+        expect(decisionURL.searchParams.has('page')).toBe(false);
+    });
+
+    test('AGT-011：标签错误局部展示且可独立重试', async ({ page }) => {
+        await authenticatePage(page);
+        let leaseAttempts = 0;
+        await page.route(
+            '**/api/projects/*/admin/agents/leases?*',
+            async (route) => {
+                leaseAttempts += 1;
+                if (leaseAttempts === 1) {
+                    await route.fulfill({
+                        status: 500,
+                        contentType: 'application/problem+json',
+                        body: JSON.stringify({
+                            type: 'https://chronodesk.local/problems/internal_error',
+                            title: 'internal error',
+                            status: 500,
+                            code: 'internal_error',
+                            request_id: 'e2e-agent-list-error',
+                            retryable: true,
+                        }),
+                    });
+                    return;
+                }
+                await route.continue();
+            },
+        );
+        await page.goto('/#/agent-control');
+        const main = page.getByRole('main');
+        await main.getByRole('tab', { name: '实时租约', exact: true }).click();
+        await expect(
+            main.getByText('服务暂时不可用，请稍后重试', { exact: true }),
+        ).toBeVisible();
+        const retryResponse = page.waitForResponse((response) =>
+            response.request().method() === 'GET'
+            && new URL(response.url()).pathname.endsWith(
+                '/admin/agents/leases',
+            ),
+        );
+        await main.getByRole('button', { name: '重试', exact: true }).click();
+        expect((await retryResponse).status()).toBe(200);
+        await expect(
+            main.getByRole('table', { name: '工单租约列表', exact: true }),
+        ).toBeVisible();
+        expect(leaseAttempts).toBe(2);
+    });
+
+    test('AGT-012：项目切换取消旧请求并清空旧行', async ({ page }) => {
+        await authenticatePage(page);
+        let firstProjectKey = '';
+        const pageEnvelope = (name: string, idSuffix: string) => ({
+            data: {
+                items: [{
+                    id: `00000000-0000-7000-8000-${idSuffix}`,
+                    client_id: `00000000-0000-7000-8000-${idSuffix}`,
+                    name,
+                    description: '',
+                    status: 'active',
+                    scopes: ['tickets:read'],
+                    rate_limit: 60,
+                    concurrency_limit: 4,
+                    last_used_at: null,
+                    expires_at: null,
+                    created_at: '2026-07-31T00:00:00Z',
+                    read_only: false,
+                    emergency_disabled: false,
+                    resource_version: 1,
+                    grant: {
+                        id: 1,
+                        project_id: 1,
+                        role: 'agent',
+                        scopes: ['tickets:read'],
+                        is_active: true,
+                        expires_at: null,
+                        created_at: '2026-07-31T00:00:00Z',
+                    },
+                }],
+                total: 1,
+                page: 1,
+                page_size: 25,
+                total_pages: 1,
+            },
+            meta: { request_id: `e2e-${name}` },
+        });
+        await page.route(
+            '**/api/projects/*/admin/agents/service-principals?*',
+            async (route) => {
+                const segments = new URL(route.request().url()).pathname
+                    .split('/')
+                    .filter(Boolean);
+                const key = decodeURIComponent(
+                    segments[segments.indexOf('projects') + 1],
+                );
+                if (key === 'SWITCHED') {
+                    await route.fulfill({
+                        status: 200,
+                        contentType: 'application/json',
+                        body: JSON.stringify(
+                            pageEnvelope('切换后智能体', '000000000002'),
+                        ),
+                    });
+                    return;
+                }
+                firstProjectKey = key;
+                await new Promise((resolve) => setTimeout(resolve, 600));
+                await route.fulfill({
+                    status: 200,
+                    contentType: 'application/json',
+                    body: JSON.stringify(
+                        pageEnvelope('旧项目智能体', '000000000001'),
+                    ),
+                }).catch(() => undefined);
+            },
+        );
+        await page.goto('/#/agent-control');
+        await expect.poll(() => firstProjectKey).not.toBe('');
+        await page.evaluate(() => {
+            window.dispatchEvent(new CustomEvent(
+                'chronodesk:project-scope-changed',
+                { detail: { project_key: 'SWITCHED' } },
+            ));
+        });
+        const table = page.getByRole('table', {
+            name: '服务主体列表',
+            exact: true,
+        });
+        await expect(table.getByText('切换后智能体', { exact: true })).toBeVisible();
+        await page.waitForTimeout(700);
+        await expect(table.getByText('旧项目智能体', { exact: true })).toHaveCount(0);
     });
 
     test('AGT-001 AGT-002 AGT-008 UI-020：服务主体、策略、凭据与单体熔断', async ({

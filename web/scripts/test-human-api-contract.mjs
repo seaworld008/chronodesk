@@ -71,7 +71,7 @@ const [
 ])
 
 assert.equal(contract.openapi, '3.2.0')
-assert.equal(contract['x-chronodesk-types-generator'], '2.0.0')
+assert.equal(contract['x-chronodesk-types-generator'], '2.1.0')
 assert.deepEqual(contract.components.schemas.PlatformRole.enum, [
     'platform_admin',
     'security_auditor',
@@ -967,6 +967,23 @@ for (const [operationPath, pathItem] of Object.entries(contract.paths)) {
 assert.ok(operationCount >= 77, `only ${operationCount} Human operations generated`)
 assert.equal(requestBodyCount, 32)
 assert.match(generated, /export const humanApiOperations = \{/)
+for (const [operationId, strategy] of [
+    ['listAgentServicePrincipals', 'page'],
+    ['listServicePrincipalPoliciesV2', 'page'],
+    ['listAgentTicketLeases', 'page'],
+    ['listAgentAttachmentScans', 'page'],
+    ['listAgentOutboxDeliveries', 'page'],
+    ['listAgentDomainEvents', 'cursor'],
+    ['listAgentPolicyDecisions', 'cursor'],
+]) {
+    assert.match(
+        generated,
+        new RegExp(
+            `${operationId}: \\{[\\s\\S]*?listStrategy: "${strategy}"`,
+        ),
+        `${operationId} list strategy was not retained`,
+    )
+}
 assert.match(generated, /export interface HumanApiOperationTypes \{/)
 assert.match(generated, /export const buildHumanApiRequest =/)
 assert.match(generated, /export const humanApiRoutes = \{/)
@@ -1040,10 +1057,25 @@ assert.match(webhookSettings, /type WebhookConfig,/)
 assert.match(webhookSettings, /humanApiRoutes\.queueProjectWebhookTest/)
 assert.doesNotMatch(webhookSettings, /interface WebhookConfig\b/)
 assert.doesNotMatch(webhookSettings, /projectResourcePath/)
-assert.match(agentControl, /type AgentControlSnapshot = AdminOverview/)
 assert.match(agentControl, /humanApiRoutes\.getAgentControlOverviewV2/)
+for (const routeHelper of [
+    'listAgentServicePrincipals',
+    'listServicePrincipalPoliciesV2',
+    'listAgentTicketLeases',
+    'listAgentAttachmentScans',
+    'listAgentOutboxDeliveries',
+    'listAgentDomainEvents',
+    'listAgentPolicyDecisions',
+]) {
+    assert.match(agentControl, new RegExp(`humanApiRoutes\\.${routeHelper}`))
+}
 assert.match(agentControl, /humanApiRoutes\.createServicePrincipalV2/)
-assert.doesNotMatch(agentControl, /interface AgentControlSnapshot\b/)
+assert.match(agentControl, /projectScopeChangedEvent/)
+assert.match(agentControl, /AbortController/)
+assert.match(agentControl, /loadingByKey/)
+assert.match(agentControl, /errorByKey/)
+assert.doesNotMatch(agentControl, /AgentControlSnapshot/)
+assert.doesNotMatch(agentControl, /snapshot\?/)
 assert.doesNotMatch(agentControl, /resolveAgentAdminPath/)
 assert.match(
     notificationCreate,

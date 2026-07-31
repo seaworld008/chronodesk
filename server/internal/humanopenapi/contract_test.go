@@ -47,8 +47,8 @@ func TestHumanWebContractPublishesClosedRoleAndSessionSchemas(t *testing.T) {
 	if got := document["openapi"]; got != "3.2.0" {
 		t.Fatalf("openapi = %v, want 3.2.0", got)
 	}
-	if got := document["x-chronodesk-types-generator"]; got != "2.0.0" {
-		t.Fatalf("types generator = %v, want 2.0.0", got)
+	if got := document["x-chronodesk-types-generator"]; got != "2.1.0" {
+		t.Fatalf("types generator = %v, want 2.1.0", got)
 	}
 
 	components := objectAt(t, document, "components")
@@ -2436,6 +2436,426 @@ func assertProjectKeySchema(
 		schema["pattern"] != pattern {
 		t.Errorf("%s = %v", name, schema)
 	}
+}
+
+func TestAgentControlListsPublishStrictStrategiesAndSafeEnvelopes(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	components := objectAt(t, document, "components")
+	parameters := objectAt(t, components, "parameters")
+	schemas := objectAt(t, components, "schemas")
+
+	for _, test := range []struct {
+		path         string
+		operationID  string
+		strategy     string
+		queryNames   []string
+		responseName string
+	}{
+		{
+			path:         "/projects/{projectKey}/admin/agents/service-principals",
+			operationID:  "listAgentServicePrincipals",
+			strategy:     "page",
+			queryNames:   []string{"page", "page_size", "sort_by", "sort_order"},
+			responseName: "AdminPrincipalPageEnvelope",
+		},
+		{
+			path:         "/projects/{projectKey}/admin/agents/service-principals/{principalId}/policies",
+			operationID:  "listServicePrincipalPoliciesV2",
+			strategy:     "page",
+			queryNames:   []string{"page", "page_size", "sort_by", "sort_order"},
+			responseName: "AdminPolicyPageEnvelope",
+		},
+		{
+			path:         "/projects/{projectKey}/admin/agents/leases",
+			operationID:  "listAgentTicketLeases",
+			strategy:     "page",
+			queryNames:   []string{"page", "page_size", "sort_by", "sort_order"},
+			responseName: "AdminLeasePageEnvelope",
+		},
+		{
+			path:         "/projects/{projectKey}/admin/agents/attachments",
+			operationID:  "listAgentAttachmentScans",
+			strategy:     "page",
+			queryNames:   []string{"page", "page_size", "sort_by", "sort_order"},
+			responseName: "AdminAttachmentPageEnvelope",
+		},
+		{
+			path:         "/projects/{projectKey}/admin/agents/outbox",
+			operationID:  "listAgentOutboxDeliveries",
+			strategy:     "page",
+			queryNames:   []string{"page", "page_size", "sort_by", "sort_order"},
+			responseName: "AdminOutboxPageEnvelope",
+		},
+		{
+			path:         "/projects/{projectKey}/admin/agents/events",
+			operationID:  "listAgentDomainEvents",
+			strategy:     "cursor",
+			queryNames:   []string{"cursor", "limit"},
+			responseName: "AdminDomainEventCursorEnvelope",
+		},
+		{
+			path:         "/projects/{projectKey}/admin/agents/policy-decisions",
+			operationID:  "listAgentPolicyDecisions",
+			strategy:     "cursor",
+			queryNames:   []string{"cursor", "limit"},
+			responseName: "AdminPolicyDecisionCursorEnvelope",
+		},
+	} {
+		t.Run(test.operationID, func(t *testing.T) {
+			pathItem := objectAt(t, paths, test.path)
+			operation := objectAt(t, pathItem, "get")
+			if operation["operationId"] != test.operationID {
+				t.Fatalf("operationId=%v", operation["operationId"])
+			}
+			if operation["x-list-strategy"] != test.strategy {
+				t.Fatalf(
+					"x-list-strategy=%v, want %s",
+					operation["x-list-strategy"],
+					test.strategy,
+				)
+			}
+			names := make([]string, 0, len(test.queryNames))
+			for _, raw := range operation["parameters"].([]any) {
+				parameter := raw.(map[string]any)
+				if reference, ok := parameter["$ref"].(string); ok {
+					const prefix = "#/components/parameters/"
+					parameter = objectAt(
+						t,
+						parameters,
+						strings.TrimPrefix(reference, prefix),
+					)
+				}
+				if parameter["in"] == "query" {
+					name := parameter["name"].(string)
+					names = append(names, name)
+					schema := objectAt(t, parameter, "schema")
+					switch name {
+					case "page":
+						if schema["minimum"] != float64(1) ||
+							schema["default"] != float64(1) {
+							t.Errorf("page schema=%v", schema)
+						}
+					case "page_size", "limit":
+						if schema["minimum"] != float64(1) ||
+							schema["maximum"] != float64(100) ||
+							schema["default"] != float64(25) {
+							t.Errorf("%s schema=%v", name, schema)
+						}
+					case "cursor":
+						if schema["maxLength"] != float64(2048) {
+							t.Errorf("cursor schema=%v", schema)
+						}
+					case "sort_by", "sort_order":
+						if schema["const"] == nil ||
+							schema["default"] != schema["const"] {
+							t.Errorf("%s schema=%v", name, schema)
+						}
+					}
+				}
+			}
+			sort.Strings(names)
+			sort.Strings(test.queryNames)
+			if !reflect.DeepEqual(names, test.queryNames) {
+				t.Fatalf("query parameters=%v, want %v", names, test.queryNames)
+			}
+			if got := responseSchemaRef(t, operation, "200"); got !=
+				"#/components/schemas/"+test.responseName {
+				t.Fatalf("response schema=%q", got)
+			}
+		})
+	}
+	for schemaName, fields := range map[string][]string{
+		"AdminPrincipalPage": {
+			"items", "total", "page", "page_size", "total_pages",
+		},
+		"AdminPolicyPage": {
+			"items", "total", "page", "page_size", "total_pages",
+		},
+		"AdminLeasePage": {
+			"items", "total", "page", "page_size", "total_pages",
+		},
+		"AdminAttachmentPage": {
+			"items", "total", "page", "page_size", "total_pages",
+		},
+		"AdminOutboxPage": {
+			"items", "total", "page", "page_size", "total_pages",
+		},
+		"AdminDomainEventCursorPage": {
+			"items", "next_cursor", "has_more",
+		},
+		"AdminPolicyDecisionCursorPage": {
+			"items", "next_cursor", "has_more",
+		},
+	} {
+		schema := objectAt(t, schemas, schemaName)
+		assertExactStringArray(t, schema["required"], fields)
+		assertExactObjectKeys(t, objectAt(t, schema, "properties"), fields)
+	}
+
+	overview := objectAt(t, schemas, "AdminOverview")
+	for name, raw := range objectAt(t, overview, "properties") {
+		property := raw.(map[string]any)
+		if property["type"] == "array" {
+			t.Errorf("AdminOverview.%s remains a dynamic array", name)
+		}
+	}
+	for schemaName, forbidden := range map[string][]string{
+		"AdminAgentPolicy": {
+			"conditions",
+		},
+		"AdminAttachmentSummary": {
+			"storage_path",
+			"storage_url",
+			"access_token",
+			"hash",
+			"metadata",
+			"scan_details",
+		},
+		"AdminDomainEventSummary": {
+			"data",
+		},
+		"AdminPolicyDecisionSummary": {
+			"context",
+			"request_digest",
+		},
+		"AdminOutboxDeliverySummary": {
+			"destination_id",
+			"locked_by",
+			"locked_at",
+		},
+	} {
+		properties := objectAt(
+			t,
+			objectAt(t, schemas, schemaName),
+			"properties",
+		)
+		for _, field := range forbidden {
+			if _, exists := properties[field]; exists {
+				t.Errorf("%s exposes forbidden field %s", schemaName, field)
+			}
+		}
+	}
+}
+
+func TestHumanListClassificationInventoryBlocksNewUnclassifiedLists(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	rawInventory, ok := document["x-chronodesk-legacy-list-inventory"].([]any)
+	if !ok {
+		t.Fatal("x-chronodesk-legacy-list-inventory must be an explicit array")
+	}
+	legacy := make(map[string]struct{}, len(rawInventory))
+	for _, raw := range rawInventory {
+		operationID, ok := raw.(string)
+		if !ok || operationID == "" {
+			t.Fatalf("invalid legacy list inventory entry %v", raw)
+		}
+		if _, duplicate := legacy[operationID]; duplicate {
+			t.Fatalf("duplicate legacy list inventory entry %q", operationID)
+		}
+		legacy[operationID] = struct{}{}
+	}
+	for _, required := range []string{
+		"listAuthorizedHumanProjects",
+		"listPlatformAuditLogs",
+		"listPlatformUsers",
+		"listProjectTickets",
+		"listCrossProjectWorkbenchTickets",
+		"listProjectAutomationRules",
+		"listProjectAutomationLogs",
+		"listProjectWebhookLogs",
+		"searchProjectMembershipCandidates",
+		"getPlatformProjectCreationContext",
+		"getWorkbenchDashboard",
+		"getProjectWebhookStats",
+	} {
+		if _, exists := legacy[required]; !exists {
+			t.Errorf("legacy inventory is missing %q", required)
+		}
+	}
+
+	paths := objectAt(t, document, "paths")
+	seenLegacyCandidates := make(map[string]struct{}, len(legacy))
+	for path, rawPathItem := range paths {
+		pathItem := rawPathItem.(map[string]any)
+		for _, method := range []string{"get", "post", "put", "patch", "delete"} {
+			rawOperation, exists := pathItem[method]
+			if !exists {
+				continue
+			}
+			operation := rawOperation.(map[string]any)
+			operationID, _ := operation["operationId"].(string)
+			unboundedArray := operationHasUnboundedResponseArray(
+				t,
+				document,
+				operation,
+			)
+			if !strings.HasPrefix(operationID, "list") && !unboundedArray {
+				continue
+			}
+			strategy, classified := operation["x-list-strategy"].(string)
+			_, inventoried := legacy[operationID]
+			if inventoried {
+				seenLegacyCandidates[operationID] = struct{}{}
+			}
+			if !classified && !inventoried {
+				t.Errorf(
+					"%s %s (%s) is neither classified nor inventoried",
+					strings.ToUpper(method),
+					path,
+					operationID,
+				)
+			}
+			if classified &&
+				strategy != "page" &&
+				strategy != "cursor" &&
+				strategy != "bounded" {
+				t.Errorf("%s has invalid x-list-strategy %q", operationID, strategy)
+			}
+			if classified && inventoried {
+				t.Errorf("%s is both migrated and legacy-inventoried", operationID)
+			}
+			if classified && strategy == "bounded" && unboundedArray {
+				t.Errorf(
+					"%s claims bounded but contains an array without maxItems <= 100",
+					operationID,
+				)
+			}
+		}
+	}
+	for operationID := range legacy {
+		if _, exists := seenLegacyCandidates[operationID]; !exists {
+			t.Errorf(
+				"legacy list inventory entry %q is stale or no longer dynamic",
+				operationID,
+			)
+		}
+	}
+	workbench := objectAt(
+		t,
+		objectAt(
+			t,
+			paths,
+			"/workbench/dashboard",
+		),
+		"get",
+	)
+	if !operationHasUnboundedResponseArray(t, document, workbench) {
+		t.Fatal("getWorkbenchDashboard no longer exercises non-list array detection")
+	}
+}
+
+func operationHasUnboundedResponseArray(
+	t *testing.T,
+	document map[string]any,
+	operation map[string]any,
+) bool {
+	t.Helper()
+	responses := objectAt(t, operation, "responses")
+	statuses := make([]string, 0, len(responses))
+	for status := range responses {
+		if regexp.MustCompile(`^2[0-9][0-9]$`).MatchString(status) {
+			statuses = append(statuses, status)
+		}
+	}
+	sort.Strings(statuses)
+	if len(statuses) == 0 {
+		return false
+	}
+	response, ok := responses[statuses[0]].(map[string]any)
+	if !ok {
+		return false
+	}
+	if reference, ok := response["$ref"].(string); ok {
+		const prefix = "#/components/responses/"
+		response = objectAt(
+			t,
+			objectAt(t, objectAt(t, document, "components"), "responses"),
+			strings.TrimPrefix(reference, prefix),
+		)
+	}
+	content, ok := response["content"].(map[string]any)
+	if !ok {
+		return false
+	}
+	media, ok := content["application/json"].(map[string]any)
+	if !ok {
+		return false
+	}
+	schema, ok := media["schema"].(map[string]any)
+	if !ok {
+		return false
+	}
+	return schemaHasUnboundedArray(
+		t,
+		document,
+		schema,
+		make(map[string]bool),
+	)
+}
+
+func schemaHasUnboundedArray(
+	t *testing.T,
+	document map[string]any,
+	schema map[string]any,
+	visiting map[string]bool,
+) bool {
+	t.Helper()
+	if reference, ok := schema["$ref"].(string); ok {
+		const prefix = "#/components/schemas/"
+		if !strings.HasPrefix(reference, prefix) || visiting[reference] {
+			return false
+		}
+		visiting[reference] = true
+		defer delete(visiting, reference)
+		return schemaHasUnboundedArray(
+			t,
+			document,
+			objectAt(
+				t,
+				objectAt(
+					t,
+					objectAt(t, document, "components"),
+					"schemas",
+				),
+				strings.TrimPrefix(reference, prefix),
+			),
+			visiting,
+		)
+	}
+	if schema["type"] == "array" {
+		maxItems, bounded := schema["maxItems"].(float64)
+		if !bounded || maxItems > 100 {
+			return true
+		}
+		if items, ok := schema["items"].(map[string]any); ok {
+			return schemaHasUnboundedArray(t, document, items, visiting)
+		}
+		return false
+	}
+	for _, keyword := range []string{"allOf", "oneOf", "anyOf"} {
+		if branches, ok := schema[keyword].([]any); ok {
+			for _, raw := range branches {
+				if branch, ok := raw.(map[string]any); ok &&
+					schemaHasUnboundedArray(t, document, branch, visiting) {
+					return true
+				}
+			}
+		}
+	}
+	if properties, ok := schema["properties"].(map[string]any); ok {
+		for _, raw := range properties {
+			if property, ok := raw.(map[string]any); ok &&
+				schemaHasUnboundedArray(t, document, property, visiting) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func decodeDocument(t *testing.T) map[string]any {

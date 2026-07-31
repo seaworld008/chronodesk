@@ -9,7 +9,46 @@
       "identifier": "Apache-2.0"
     }
   },
-  "x-chronodesk-types-generator": "2.0.0",
+  "x-chronodesk-types-generator": "2.1.0",
+  "x-chronodesk-legacy-list-inventory": [
+    "listAuthorizedHumanProjects",
+    "listProjectMemberships",
+    "listPlatformProjects",
+    "listPlatformProjectBusinessUnits",
+    "listPlatformUsers",
+    "listPlatformAuditLogs",
+    "listCrossProjectWorkbenchTickets",
+    "listProjectTickets",
+    "listProjectOverdueTickets",
+    "listProjectSLABreachedTickets",
+    "listProjectTicketHistory",
+    "listProjectTicketComments",
+    "listProjectTicketCommentReplies",
+    "listProjectTicketAttachments",
+    "listProjectNotifications",
+    "listProjectAutomationRules",
+    "listProjectAutomationLogs",
+    "listPlatformConfigs",
+    "listProjectWebhooks",
+    "listProjectWebhookLogs",
+    "searchProjectMembershipCandidates",
+    "getPlatformProjectCreationContext",
+    "getWorkbenchDashboard",
+    "getProjectWebhookStats",
+    "createProjectTicket",
+    "getProjectTicket",
+    "updateProjectTicket",
+    "assignProjectTicket",
+    "transferProjectTicket",
+    "escalateProjectTicket",
+    "updateProjectTicketStatus",
+    "createProjectTicketComment",
+    "createProjectNotification",
+    "getHumanNotificationPreferences",
+    "createProjectWebhook",
+    "getProjectWebhook",
+    "updateProjectWebhook"
+  ],
   "servers": [
     {
       "url": "/api"
@@ -5160,8 +5199,8 @@
           "Agent administration"
         ],
         "operationId": "getAgentControlOverviewV2",
-        "summary": "Inspect Agent identities, leases, events, and Outbox health",
-        "description": "Project-scoped human administrator control-plane endpoint. Every\nmutable resource belongs to the authorized Project and includes its\ncurrent `resource_version`. Platform-wide read-only and emergency-stop\nstate is exposed for awareness only and cannot be mutated from this\nProject route. Convert a selected resource version to the strong ETag\nform `\"v<number>\"` when issuing an administrator command.\n",
+        "summary": "Inspect bounded Agent control metrics",
+        "description": "Returns only server-computed scalar metrics for the authorized Organization and Project. Dynamic control-plane resources are loaded through their independent page or cursor operations.",
         "x-chronodesk-project-roles": [
           "project_admin"
         ],
@@ -5206,6 +5245,79 @@
           "$ref": "#/components/parameters/ProjectKey"
         }
       ],
+      "get": {
+        "tags": [
+          "Agent administration"
+        ],
+        "operationId": "listAgentServicePrincipals",
+        "summary": "List service principals and their Project grant",
+        "x-list-strategy": "page",
+        "x-chronodesk-project-roles": [
+          "project_admin"
+        ],
+        "security": [
+          {
+            "humanBearer": [
+
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AgentListPage"
+          },
+          {
+            "$ref": "#/components/parameters/AgentListPageSize"
+          },
+          {
+            "name": "sort_by",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "const": "created_at",
+              "default": "created_at"
+            }
+          },
+          {
+            "name": "sort_order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "const": "desc",
+              "default": "desc"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stable page ordered by created_at DESC, id DESC.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminPrincipalPageEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/AgentAdminBadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/AgentAdminUnauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/AgentAdminForbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/AgentAdminInternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/AgentAdminServiceUnavailable"
+          }
+        }
+      },
       "post": {
         "tags": [
           "Agent administration"
@@ -5603,7 +5715,8 @@
         ],
         "operationId": "listServicePrincipalPoliciesV2",
         "summary": "List explicit allow and deny policies",
-        "description": "Returns closed policy objects with the `resource_version` required for policy commands.",
+        "description": "Returns closed policy summaries without policy condition payloads. Every row includes the resource_version required for policy commands.",
+        "x-list-strategy": "page",
         "x-chronodesk-project-roles": [
           "project_admin"
         ],
@@ -5617,6 +5730,32 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/PrincipalId"
+          },
+          {
+            "$ref": "#/components/parameters/AgentListPage"
+          },
+          {
+            "$ref": "#/components/parameters/AgentListPageSize"
+          },
+          {
+            "name": "sort_by",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "const": "priority",
+              "default": "priority"
+            }
+          },
+          {
+            "name": "sort_order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "const": "desc",
+              "default": "desc"
+            }
           }
         ],
         "responses": {
@@ -5625,7 +5764,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AgentPolicyListEnvelope"
+                  "$ref": "#/components/schemas/AdminPolicyPageEnvelope"
                 }
               }
             }
@@ -5825,6 +5964,91 @@
         }
       }
     },
+    "/projects/{projectKey}/admin/agents/leases": {
+      "servers": [
+        {
+          "url": "/api"
+        }
+      ],
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ProjectKey"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Agent administration"
+        ],
+        "operationId": "listAgentTicketLeases",
+        "summary": "List active Agent ticket leases",
+        "x-list-strategy": "page",
+        "x-chronodesk-project-roles": [
+          "project_admin"
+        ],
+        "security": [
+          {
+            "humanBearer": [
+
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AgentListPage"
+          },
+          {
+            "$ref": "#/components/parameters/AgentListPageSize"
+          },
+          {
+            "name": "sort_by",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "const": "expires_at",
+              "default": "expires_at"
+            }
+          },
+          {
+            "name": "sort_order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "const": "asc",
+              "default": "asc"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stable page ordered by expires_at ASC, id ASC.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminLeasePageEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/AgentAdminBadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/AgentAdminUnauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/AgentAdminForbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/AgentAdminInternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/AgentAdminServiceUnavailable"
+          }
+        }
+      }
+    },
     "/projects/{projectKey}/admin/agents/leases/{leaseId}/force-release": {
       "servers": [
         {
@@ -5900,6 +6124,92 @@
           },
           "428": {
             "$ref": "#/components/responses/AgentAdminPreconditionRequired"
+          },
+          "500": {
+            "$ref": "#/components/responses/AgentAdminInternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/AgentAdminServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/projects/{projectKey}/admin/agents/attachments": {
+      "servers": [
+        {
+          "url": "/api"
+        }
+      ],
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ProjectKey"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Agent administration"
+        ],
+        "operationId": "listAgentAttachmentScans",
+        "summary": "List safe attachment scan summaries",
+        "description": "Storage paths, URLs, access tokens, hashes, metadata, and long scan details are omitted.",
+        "x-list-strategy": "page",
+        "x-chronodesk-project-roles": [
+          "project_admin"
+        ],
+        "security": [
+          {
+            "humanBearer": [
+
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AgentListPage"
+          },
+          {
+            "$ref": "#/components/parameters/AgentListPageSize"
+          },
+          {
+            "name": "sort_by",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "const": "created_at",
+              "default": "created_at"
+            }
+          },
+          {
+            "name": "sort_order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "const": "desc",
+              "default": "desc"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stable page ordered by created_at DESC, id DESC.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminAttachmentPageEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/AgentAdminBadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/AgentAdminUnauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/AgentAdminForbidden"
           },
           "500": {
             "$ref": "#/components/responses/AgentAdminInternalError"
@@ -6005,6 +6315,92 @@
         }
       }
     },
+    "/projects/{projectKey}/admin/agents/outbox": {
+      "servers": [
+        {
+          "url": "/api"
+        }
+      ],
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ProjectKey"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Agent administration"
+        ],
+        "operationId": "listAgentOutboxDeliveries",
+        "summary": "List safe Outbox delivery summaries",
+        "description": "Destination identifiers are replaced by controlled type labels and failure text is scrubbed and bounded.",
+        "x-list-strategy": "page",
+        "x-chronodesk-project-roles": [
+          "project_admin"
+        ],
+        "security": [
+          {
+            "humanBearer": [
+
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AgentListPage"
+          },
+          {
+            "$ref": "#/components/parameters/AgentListPageSize"
+          },
+          {
+            "name": "sort_by",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "const": "created_at",
+              "default": "created_at"
+            }
+          },
+          {
+            "name": "sort_order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "const": "desc",
+              "default": "desc"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stable page ordered by immutable created_at DESC, id DESC.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminOutboxPageEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/AgentAdminBadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/AgentAdminUnauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/AgentAdminForbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/AgentAdminInternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/AgentAdminServiceUnavailable"
+          }
+        }
+      }
+    },
     "/projects/{projectKey}/admin/agents/outbox/{deliveryId}/replay": {
       "servers": [
         {
@@ -6080,6 +6476,138 @@
           },
           "428": {
             "$ref": "#/components/responses/AgentAdminPreconditionRequired"
+          },
+          "500": {
+            "$ref": "#/components/responses/AgentAdminInternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/AgentAdminServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/projects/{projectKey}/admin/agents/events": {
+      "servers": [
+        {
+          "url": "/api"
+        }
+      ],
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ProjectKey"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Agent administration"
+        ],
+        "operationId": "listAgentDomainEvents",
+        "summary": "Continue through safe Domain Event summaries",
+        "description": "Event Data is omitted. The opaque cursor is HMAC-bound to the authorized Organization and Project, limit, filters, and sort version.",
+        "x-list-strategy": "cursor",
+        "x-chronodesk-project-roles": [
+          "project_admin"
+        ],
+        "security": [
+          {
+            "humanBearer": [
+
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AgentListCursor"
+          },
+          {
+            "$ref": "#/components/parameters/AgentListLimit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stable continuation ordered by created_at DESC, id DESC.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminDomainEventCursorEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/AgentAdminBadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/AgentAdminUnauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/AgentAdminForbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/AgentAdminInternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/AgentAdminServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/projects/{projectKey}/admin/agents/policy-decisions": {
+      "servers": [
+        {
+          "url": "/api"
+        }
+      ],
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ProjectKey"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Agent administration"
+        ],
+        "operationId": "listAgentPolicyDecisions",
+        "summary": "Continue through safe policy decision summaries",
+        "description": "Decision Context and request digests are omitted. The opaque cursor is HMAC-bound to the authorized Organization and Project, limit, filters, and sort version.",
+        "x-list-strategy": "cursor",
+        "x-chronodesk-project-roles": [
+          "project_admin"
+        ],
+        "security": [
+          {
+            "humanBearer": [
+
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AgentListCursor"
+          },
+          {
+            "$ref": "#/components/parameters/AgentListLimit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stable continuation ordered by created_at DESC, id DESC.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminPolicyDecisionCursorEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/AgentAdminBadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/AgentAdminUnauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/AgentAdminForbidden"
           },
           "500": {
             "$ref": "#/components/responses/AgentAdminInternalError"
@@ -6826,6 +7354,49 @@
         "schema": {
           "type": "string",
           "format": "uuid"
+        }
+      },
+      "AgentListPage": {
+        "name": "page",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        }
+      },
+      "AgentListPageSize": {
+        "name": "page_size",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 25
+        }
+      },
+      "AgentListLimit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 25
+        }
+      },
+      "AgentListCursor": {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "description": "Opaque HMAC-protected continuation bound to the Organization, Project, filters, limit, and sort version.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
         }
       },
       "IfMatch": {
@@ -7781,6 +8352,7 @@
           },
           "scopes": {
             "type": "array",
+            "maxItems": 100,
             "items": {
               "type": "string"
             }
@@ -12588,6 +13160,339 @@
           }
         ]
       },
+      "AdminPrincipalPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminServicePrincipalSummary"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "total_pages": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "AdminPolicyPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminAgentPolicy"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "total_pages": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "AdminLeasePage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminTicketLeaseSummary"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "total_pages": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "AdminOutboxPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminOutboxDeliverySummary"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "total_pages": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "AdminAttachmentPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminAttachmentSummary"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "total_pages": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "AdminDomainEventCursorPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "next_cursor",
+          "has_more"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminDomainEventSummary"
+            }
+          },
+          "next_cursor": {
+            "type": "string",
+            "maxLength": 2048
+          },
+          "has_more": {
+            "type": "boolean"
+          }
+        }
+      },
+      "AdminPolicyDecisionCursorPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "next_cursor",
+          "has_more"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminPolicyDecisionSummary"
+            }
+          },
+          "next_cursor": {
+            "type": "string",
+            "maxLength": 2048
+          },
+          "has_more": {
+            "type": "boolean"
+          }
+        }
+      },
+      "AdminPrincipalPageEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Envelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/AdminPrincipalPage"
+              }
+            }
+          }
+        ]
+      },
+      "AdminPolicyPageEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Envelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/AdminPolicyPage"
+              }
+            }
+          }
+        ]
+      },
+      "AdminLeasePageEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Envelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/AdminLeasePage"
+              }
+            }
+          }
+        ]
+      },
+      "AdminOutboxPageEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Envelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/AdminOutboxPage"
+              }
+            }
+          }
+        ]
+      },
+      "AdminAttachmentPageEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Envelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/AdminAttachmentPage"
+              }
+            }
+          }
+        ]
+      },
+      "AdminDomainEventCursorEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Envelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/AdminDomainEventCursorPage"
+              }
+            }
+          }
+        ]
+      },
+      "AdminPolicyDecisionCursorEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Envelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/AdminPolicyDecisionCursorPage"
+              }
+            }
+          }
+        ]
+      },
       "Envelope": {
         "type": "object",
         "additionalProperties": false,
@@ -12653,6 +13558,7 @@
           },
           "changed_fields": {
             "type": "array",
+            "maxItems": 100,
             "items": {
               "type": "string"
             }
@@ -12672,64 +13578,44 @@
         "additionalProperties": false,
         "required": [
           "global_read_only",
-          "global_read_only_version",
           "emergency_stop",
-          "emergency_stop_version",
-          "principals",
-          "leases",
-          "events",
-          "outbox",
-          "attachments",
-          "policy_decisions"
+          "principal_count",
+          "active_principal_count",
+          "active_lease_count",
+          "failed_outbox_count",
+          "recent_event_count",
+          "pending_attachment_scan_count"
         ],
         "properties": {
           "global_read_only": {
             "type": "boolean"
           },
-          "global_read_only_version": {
-            "$ref": "#/components/schemas/ResourceVersion"
-          },
           "emergency_stop": {
             "type": "boolean"
           },
-          "emergency_stop_version": {
-            "$ref": "#/components/schemas/ResourceVersion"
+          "principal_count": {
+            "type": "integer",
+            "minimum": 0
           },
-          "principals": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AdminServicePrincipalSummary"
-            }
+          "active_principal_count": {
+            "type": "integer",
+            "minimum": 0
           },
-          "leases": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AdminTicketLeaseSummary"
-            }
+          "active_lease_count": {
+            "type": "integer",
+            "minimum": 0
           },
-          "events": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AdminDomainEventSummary"
-            }
+          "failed_outbox_count": {
+            "type": "integer",
+            "minimum": 0
           },
-          "outbox": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AdminOutboxDeliverySummary"
-            }
+          "recent_event_count": {
+            "type": "integer",
+            "minimum": 0
           },
-          "attachments": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AdminAttachmentSummary"
-            }
-          },
-          "policy_decisions": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AdminPolicyDecisionSummary"
-            }
+          "pending_attachment_scan_count": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },
@@ -12750,7 +13636,8 @@
           "created_at",
           "read_only",
           "emergency_disabled",
-          "resource_version"
+          "resource_version",
+          "grant"
         ],
         "properties": {
           "id": {
@@ -12780,6 +13667,7 @@
           },
           "scopes": {
             "type": "array",
+            "maxItems": 10,
             "uniqueItems": true,
             "items": {
               "$ref": "#/components/schemas/AgentScope"
@@ -12821,6 +13709,57 @@
           },
           "resource_version": {
             "$ref": "#/components/schemas/ResourceVersion"
+          },
+          "grant": {
+            "$ref": "#/components/schemas/AdminPrincipalGrantSummary"
+          }
+        }
+      },
+      "AdminPrincipalGrantSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "project_id",
+          "role",
+          "scopes",
+          "is_active",
+          "expires_at",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "project_id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "role": {
+            "$ref": "#/components/schemas/ProjectRole"
+          },
+          "scopes": {
+            "type": "array",
+            "maxItems": 10,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/AgentScope"
+            }
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
           }
         }
       },
@@ -12844,9 +13783,12 @@
         "additionalProperties": false,
         "required": [
           "id",
+          "created_at",
           "ticket_id",
           "ticket_number",
-          "principal_name",
+          "holder_actor_type",
+          "holder_actor_id",
+          "holder_display_name",
           "acquired_at",
           "expires_at",
           "ticket_version",
@@ -12864,7 +13806,20 @@
           "ticket_number": {
             "type": "string"
           },
-          "principal_name": {
+          "holder_actor_type": {
+            "type": "string",
+            "enum": [
+              "human",
+              "service_principal",
+              "system"
+            ]
+          },
+          "holder_actor_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "holder_display_name": {
             "type": "string"
           },
           "acquired_at": {
@@ -12888,6 +13843,7 @@
         "additionalProperties": false,
         "required": [
           "id",
+          "created_at",
           "type",
           "subject",
           "actor_type",
@@ -12899,6 +13855,10 @@
           "id": {
             "type": "string",
             "format": "uuid"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
           },
           "type": {
             "type": "string",
@@ -12936,8 +13896,10 @@
         "additionalProperties": false,
         "required": [
           "id",
+          "created_at",
           "event_id",
-          "destination",
+          "destination_type",
+          "destination_label",
           "status",
           "attempts",
           "next_attempt_at",
@@ -12950,14 +13912,33 @@
             "type": "string",
             "format": "uuid"
           },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
           "event_id": {
             "type": "string",
             "format": "uuid"
           },
-          "destination": {
+          "destination_type": {
             "type": "string",
-            "minLength": 2,
-            "maxLength": 179
+            "enum": [
+              "webhook",
+              "event_stream",
+              "automation",
+              "notification",
+              "sla",
+              "sla_escalation",
+              "attachment_cleanup",
+              "attachment_staging_cleanup",
+              "a2a_push",
+              "email",
+              "other"
+            ]
+          },
+          "destination_label": {
+            "type": "string",
+            "maxLength": 40
           },
           "status": {
             "type": "string",
@@ -12978,7 +13959,8 @@
             "format": "date-time"
           },
           "last_error": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 500
           },
           "updated_at": {
             "type": "string",
@@ -12994,12 +13976,12 @@
         "additionalProperties": false,
         "required": [
           "id",
+          "created_at",
           "ticket_id",
           "original_name",
           "mime_type",
           "file_size",
           "virus_scan",
-          "scan_details",
           "scanned_at",
           "updated_at",
           "resource_version"
@@ -13008,6 +13990,10 @@
           "id": {
             "type": "integer",
             "minimum": 1
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
           },
           "ticket_id": {
             "type": "integer",
@@ -13033,9 +14019,6 @@
               "infected",
               "error"
             ]
-          },
-          "scan_details": {
-            "type": "string"
           },
           "scanned_at": {
             "type": [
@@ -13069,8 +14052,7 @@
           "allowed",
           "reason_code",
           "matched_policy_id",
-          "source_protocol",
-          "request_digest"
+          "source_protocol"
         ],
         "properties": {
           "id": {
@@ -13129,10 +14111,6 @@
           "source_protocol": {
             "type": "string",
             "maxLength": 32
-          },
-          "request_digest": {
-            "type": "string",
-            "maxLength": 64
           }
         }
       },
@@ -13228,6 +14206,7 @@
           "scopes": {
             "type": "array",
             "minItems": 1,
+            "maxItems": 10,
             "uniqueItems": true,
             "items": {
               "$ref": "#/components/schemas/AgentScope"
@@ -13408,6 +14387,7 @@
           "scopes": {
             "type": "array",
             "minItems": 1,
+            "maxItems": 10,
             "uniqueItems": true,
             "items": {
               "$ref": "#/components/schemas/AgentScope"
@@ -13518,7 +14498,6 @@
           "action",
           "resource_type",
           "resource_id",
-          "conditions",
           "priority",
           "is_active",
           "expires_at",
@@ -13566,9 +14545,6 @@
           "resource_id": {
             "type": "string",
             "maxLength": 128
-          },
-          "conditions": {
-            "$ref": "#/components/schemas/AgentPolicyConditions"
           },
           "priority": {
             "type": "integer"

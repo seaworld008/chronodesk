@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
-const generatorVersion = '2.0.0'
+const generatorVersion = '2.1.0'
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url))
 const webDirectory = path.resolve(scriptDirectory, '..')
 const repositoryDirectory = path.resolve(webDirectory, '..')
@@ -229,6 +229,15 @@ function collectOperations(document) {
 
             const response = successfulResponse(operation.responses)
             const requestBody = requestBodyDefinition(operation.requestBody)
+            const listStrategy = operation['x-list-strategy'] ?? null
+            if (
+                listStrategy !== null
+                && !['page', 'cursor', 'bounded'].includes(listStrategy)
+            ) {
+                throw new Error(
+                    `${method.toUpperCase()} ${operationPath} has invalid x-list-strategy`,
+                )
+            }
             result.push({
                 operationId,
                 typeName: `${pascalCase(operationId)}Operation`,
@@ -244,6 +253,7 @@ function collectOperations(document) {
                         : 'optional',
                 responseSchema: response.schema,
                 successStatus: response.status,
+                listStrategy,
             })
         }
     }
@@ -368,6 +378,7 @@ function generatedOperationRuntime(operations) {
             `        path: ${JSON.stringify(operation.path)},`,
             `        successStatus: ${operation.successStatus},`,
             `        requestBody: ${JSON.stringify(operation.requestBodyMode)},`,
+            `        listStrategy: ${JSON.stringify(operation.listStrategy)},`,
             '    },',
         ].join('\n'),
     )

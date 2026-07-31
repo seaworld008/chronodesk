@@ -19,7 +19,7 @@
 | `project-resource-isolation.spec.ts` | P1 项目资源与会话缓存隔离 | A/B 项目同 numeric ticket ID，撤销 A 后当前业务 URL fail closed 且绝不请求/修改 B；双向切换 project_admin/observer 后清 permissions、query 与资源缓存；direct `apiFetch` 401 清全部会话/项目缓存并跳登录 | Mock 后端，无持久数据 |
 | `project-membership.spec.ts` | P1 Project Membership UI | project_admin 通过项目作用域接口查看五种 ProjectRole、逐一授予、变更与撤销；manager/agent/requester/observer 均无菜单，直接路由也在请求前拒绝 | Mock 后端，无持久数据 |
 | `01-enterprise-tables.spec.ts` | UI-004～UI-007、UI-026、UI-028、UI-029 | 枚举全部 15 张企业表（含系统配置、Webhook、工单历史、用户详情两表与 Agent 五表）；每表必须有真实数据行，并用文本 Range 矩形和行高验证实际单行；全部表逐一验证键盘列宽持久化和双击复位持久化；820px 横滚后 8 张 sticky 右操作列仍贴边、可命中，按钮/链接有可访问名称且通过 trial click | 精确登记并删除本轮工单、通知、规则、Webhook；先强制释放登记租约，再停用登记服务主体及策略 |
-| `agent-control.spec.ts` | AGT-001、AGT-002、AGT-008、AGT-009、UI-020、UI-021 | 控制面五类数据；创建服务主体；一次性凭据；轮换；allow/deny 策略；单体熔断；停用；全局只读与紧急停止 | 每个用例保存原始全局开关快照，以最新版本 `If-Match` CAS 并在 `finally` 恢复；只停用登记 ID 的主体及其策略 |
+| `agent-control.spec.ts` | AGT-001、AGT-002、AGT-008～AGT-012、UI-020、UI-021 | 控制面指标与七类独立清单；每个标签只请求自己的严格页码/游标端点；局部错误重试；项目切换取消旧请求并清除旧行；创建服务主体；一次性凭据；轮换；allow/deny 策略；单体熔断；停用；全局只读与紧急停止 | 每个用例保存原始全局开关快照，以最新版本 `If-Match` CAS 并在 `finally` 恢复；只停用登记 ID 的主体及其策略 |
 | `webhook-settings.spec.ts` | EVT-002、EVT-007、EVT-008、EVT-010、UI-019 | 页面创建、编辑 canonical `ticket.transitioned` 与 resolved/closed 谓词；密钥不回显；异步 switch 与操作按钮有名称；中文站内确认对话框后测试 `.invalid` 保留域名并验证安全拒绝；API 核对 canonical 失败日志 | 删除 E2E Webhook 配置 |
 | `trusted-devices.spec.ts` | AUTH-019、AUTH-022、UI-023 | UI 登录创建可信设备；Cookie 为 HttpOnly/Strict 且 localStorage 无凭据；在具名设备 region 内通过中文站内确认对话框撤销 | 按登录后登记的精确设备 ID 撤销，不假定账号没有其他设备 |
 | `ticket-content.spec.ts` | CNT-001、CNT-002、CNT-006、CNT-009、UI-011 | 页面添加公开/内部评论；上传内存小文件；待扫描禁止下载；管理员标记 clean；浏览器真实下载 | 删除 E2E 工单，由附件清理 Outbox 回收对象 |

@@ -903,13 +903,21 @@ type AgentControlPrincipal = {
 type AgentControlSnapshot = {
     global_read_only: boolean;
     emergency_stop: boolean;
-    principals: AgentControlPrincipal[];
-    attachments?: Array<{
-        id: number;
-        original_name: string;
-        virus_scan: string;
-        resource_version: number;
-    }>;
+};
+
+type AgentControlPage<T> = {
+    items: T[];
+    total: number;
+    page: number;
+    page_size: number;
+    total_pages: number;
+};
+
+type AgentAttachmentScan = {
+    id: number;
+    original_name: string;
+    virus_scan: string;
+    resource_version: number;
 };
 
 const getAgentControlSnapshot = async (
@@ -924,6 +932,34 @@ const getAgentControlSnapshot = async (
         projectAPIPath(projectKey, 'admin/agents/agent-control/overview'),
     );
     return extractData<AgentControlSnapshot>(response);
+};
+
+const getAllAgentListItems = async <T>(
+    request: APIRequestContext,
+    token: string,
+    path: string,
+    sortBy: string,
+    sortOrder: 'asc' | 'desc',
+): Promise<T[]> => {
+    const items: T[] = [];
+    let page = 1;
+    while (true) {
+        const query = new URLSearchParams({
+            page: String(page),
+            page_size: '100',
+            sort_by: sortBy,
+            sort_order: sortOrder,
+        });
+        const response = await apiRequest<Record<string, unknown>>(
+            request,
+            token,
+            `${path}?${query.toString()}`,
+        );
+        const result = extractData<AgentControlPage<T>>(response);
+        items.push(...(result.items ?? []));
+        if (page >= result.total_pages) return items;
+        page += 1;
+    }
 };
 
 export type AgentGlobalControlSnapshot = Pick<
@@ -969,10 +1005,10 @@ const disableTrackedAgentPrincipals = async (
             token,
             `${agentAdminPath}/service-principals/${principalID}/policies`,
         );
-        const policies = extractData<Array<Record<string, unknown>>>(
+        const policyPage = extractData<AgentControlPage<Record<string, unknown>>>(
             policyResponse,
-        ) ?? [];
-        for (const policy of policies) {
+        );
+        for (const policy of policyPage.items ?? []) {
             if (
                 policy.is_active !== true ||
                 typeof policy.id !== 'string' ||
@@ -991,8 +1027,14 @@ const disableTrackedAgentPrincipals = async (
             );
         }
 
-        const snapshot = await getAgentControlSnapshot(request, token);
-        const principal = snapshot.principals.find(
+        const principals = await getAllAgentListItems<AgentControlPrincipal>(
+            request,
+            token,
+            `${agentAdminPath}/service-principals`,
+            'created_at',
+            'desc',
+        );
+        const principal = principals.find(
             (candidate) => candidate.id === principalID,
         );
         if (!principal) {
@@ -1040,8 +1082,14 @@ export const markE2EAttachmentClean = async (
     const token = await getAdminToken(request);
     const projectKey = await resolveE2EProjectKey(request, token);
     const agentAdminPath = projectAPIPath(projectKey, 'admin/agents');
-    const snapshot = await getAgentControlSnapshot(request, token);
-    const attachment = (snapshot.attachments ?? []).find(
+    const attachments = await getAllAgentListItems<AgentAttachmentScan>(
+        request,
+        token,
+        `${agentAdminPath}/attachments`,
+        'created_at',
+        'desc',
+    );
+    const attachment = attachments.find(
         (candidate) => candidate.original_name === originalName,
     );
     if (!attachment) {
@@ -1090,9 +1138,12 @@ export const trackTrustedDeviceByName = async (
     const response = await apiRequest<Record<string, unknown>>(
         request,
         token,
-        '/api/user/trusted-devices',
+        '/api/user/trusted-devices?page=1&page_size=100&sort_by=revoked&sort_order=asc',
     );
-    const devices = extractData<Array<Record<string, unknown>>>(response) ?? [];
+    const devicePage = extractData<{
+        items: Array<Record<string, unknown>>;
+    }>(response);
+    const devices = devicePage?.items ?? [];
     const device = devices.find(
         (candidate) => candidate.device_name === deviceName,
     );
@@ -1252,18 +1303,27 @@ export const captureSystemConfig = async (
     key: string,
 ): Promise<SystemConfigSnapshot> => {
     const token = await getAdminToken(request);
-    const response = await apiRequest<Record<string, unknown>>(
-        request,
-        token,
-        `/api/platform/configs?category=${encodeURIComponent(category)}`,
-    );
-    const config = extractData<SystemConfigSnapshot[]>(response).find(
-        (candidate) => candidate.key === key,
-    );
-    if (!config) {
-        throw new Error(`未找到系统配置：${key}`);
+    for (let page = 1; page <= 100; page += 1) {
+        const response = await apiRequest<Record<string, unknown>>(
+            request,
+            token,
+            `/api/platform/configs?category=${encodeURIComponent(category)}&page=${page}&page_size=100&sort_by=group&sort_order=asc`,
+        );
+        const configPage = extractData<{
+            items: SystemConfigSnapshot[];
+            total_pages: number;
+        }>(response);
+        const config = configPage?.items.find(
+            (candidate) => candidate.key === key,
+        );
+        if (config) {
+            return config;
+        }
+        if (!configPage || page >= configPage.total_pages) {
+            break;
+        }
     }
-    return config;
+    throw new Error(`未找到系统配置：${key}`);
 };
 
 export const restoreSystemConfig = async (

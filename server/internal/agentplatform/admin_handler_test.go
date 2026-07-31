@@ -232,6 +232,16 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		time.Hour,
 		[]byte("admin-handler-stable-replay-encryption-key"),
 	)
+	adminLists, err := NewAdminListService(
+		db,
+		[]byte("admin-handler-stable-list-cursor-key"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.ConfigureListService(adminLists); err != nil {
+		t.Fatal(err)
+	}
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", admin.ID)
@@ -590,50 +600,71 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		).Error; err != nil {
 		t.Fatal(err)
 	}
-	overviewRecorder := httptest.NewRecorder()
-	overviewRequest := httptest.NewRequest(
-		http.MethodGet,
-		"/api/projects/TEST/admin/agents/agent-control/overview",
-		nil,
-	)
-	router.ServeHTTP(overviewRecorder, overviewRequest)
-	if overviewRecorder.Code != http.StatusOK {
-		t.Fatalf("overview status=%d body=%s", overviewRecorder.Code, overviewRecorder.Body.String())
-	}
-	var overviewEnvelope struct {
-		Data struct {
-			Principals []struct {
-				ID              string `json:"id"`
-				ResourceVersion uint64 `json:"resource_version"`
-			} `json:"principals"`
-			Outbox []struct {
-				ID              string `json:"id"`
-				ResourceVersion uint64 `json:"resource_version"`
-				LastError       string `json:"last_error"`
-			} `json:"outbox"`
-			Attachments []struct {
-				ID              uint   `json:"id"`
-				ResourceVersion uint64 `json:"resource_version"`
-			} `json:"attachments"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(overviewRecorder.Body.Bytes(), &overviewEnvelope); err != nil {
-		t.Fatal(err)
-	}
 	assertVersion := func(name string, want uint64, found bool, got uint64) {
 		t.Helper()
 		if !found || got != want {
 			t.Fatalf("%s resource version found=%v got=%d want=%d", name, found, got, want)
 		}
 	}
+	requestList := func(path string, target any) {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(
+			recorder,
+			httptest.NewRequest(http.MethodGet, path, nil),
+		)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("list %s status=%d body=%s", path, recorder.Code, recorder.Body.String())
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), target); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var principalEnvelope struct {
+		Data struct {
+			Items []struct {
+				ID              string `json:"id"`
+				ResourceVersion uint64 `json:"resource_version"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	requestList(
+		"/api/projects/TEST/admin/agents/service-principals",
+		&principalEnvelope,
+	)
+	var outboxEnvelope struct {
+		Data struct {
+			Items []struct {
+				ID              string `json:"id"`
+				ResourceVersion uint64 `json:"resource_version"`
+				LastError       string `json:"last_error"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	requestList(
+		"/api/projects/TEST/admin/agents/outbox",
+		&outboxEnvelope,
+	)
+	var attachmentEnvelope struct {
+		Data struct {
+			Items []struct {
+				ID              uint   `json:"id"`
+				ResourceVersion uint64 `json:"resource_version"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	requestList(
+		"/api/projects/TEST/admin/agents/attachments",
+		&attachmentEnvelope,
+	)
 	var principalFound, deliveryFound, attachmentFound bool
 	var principalVersion, deliveryVersion, attachmentVersion uint64
-	for _, row := range overviewEnvelope.Data.Principals {
+	for _, row := range principalEnvelope.Data.Items {
 		if row.ID == principalID {
 			principalFound, principalVersion = true, row.ResourceVersion
 		}
 	}
-	for _, row := range overviewEnvelope.Data.Outbox {
+	for _, row := range outboxEnvelope.Data.Items {
 		if row.ID == replayDelivery.ID {
 			deliveryFound, deliveryVersion = true, row.ResourceVersion
 			if strings.Contains(row.LastError, legacyOutboxToken) ||
@@ -642,7 +673,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 			}
 		}
 	}
-	for _, row := range overviewEnvelope.Data.Attachments {
+	for _, row := range attachmentEnvelope.Data.Items {
 		if row.ID == attachment.ID {
 			attachmentFound, attachmentVersion = true, row.ResourceVersion
 		}
@@ -662,9 +693,11 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		t.Fatalf("policy list status=%d body=%s", policyRecorder.Code, policyRecorder.Body.String())
 	}
 	var policyEnvelope struct {
-		Data []struct {
-			ID              string `json:"id"`
-			ResourceVersion uint64 `json:"resource_version"`
+		Data struct {
+			Items []struct {
+				ID              string `json:"id"`
+				ResourceVersion uint64 `json:"resource_version"`
+			} `json:"items"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(policyRecorder.Body.Bytes(), &policyEnvelope); err != nil {
@@ -672,7 +705,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 	}
 	var listedPolicy bool
 	var listedPolicyVersion uint64
-	for _, row := range policyEnvelope.Data {
+	for _, row := range policyEnvelope.Data.Items {
 		if row.ID == policyID {
 			listedPolicy, listedPolicyVersion = true, row.ResourceVersion
 		}
@@ -802,6 +835,16 @@ func newAdminContractRouter(
 		time.Hour,
 		replayKey,
 	)
+	adminLists, err := NewAdminListService(
+		db,
+		[]byte("admin-contract-stable-list-cursor-key"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.ConfigureListService(adminLists); err != nil {
+		t.Fatal(err)
+	}
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", admin.ID)
