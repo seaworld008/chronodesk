@@ -51,7 +51,7 @@ test.describe('Email Settings', () => {
                 (response) =>
                     response.request().method() === 'PUT' &&
                     new URL(response.url()).pathname ===
-                        '/api/admin/email-config',
+                        '/api/platform/email-config',
             );
             await page.getByRole('button', { name: '保存配置' }).click();
             expect((await save).status()).toBe(200);

@@ -1,7 +1,20 @@
 import { DataProvider, fetchUtils, HttpError } from 'react-admin'
 import queryString from 'query-string'
 import { containsChineseText, localizedApiErrorMessage } from './apiClient'
-import { projectResourcePath } from './projectScope'
+import {
+    projectResourcePath,
+    resolveActiveProjectKey,
+} from './projectScope'
+import { humanApiRoutes } from './generated/human-api'
+import { joinApiUrl } from './apiUrl'
+import {
+    projectAccessInvalidatedEvent,
+    projectScopeChangedEvent,
+    sessionInvalidatedEvent,
+    shouldInvalidateActiveProjectAccess,
+    signalProjectAccessInvalidated,
+    signalSessionInvalidated,
+} from './projectScopeEvents'
 
 const apiUrl = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
 
@@ -17,10 +30,22 @@ const projectScopedResources = new Set([
 const scopedApiPath = async (
     resource: string,
     apiPath: string,
-): Promise<string> =>
-    projectScopedResources.has(resource)
-        ? projectResourcePath(apiPath)
-        : apiPath
+): Promise<string> => {
+    if (!projectScopedResources.has(resource)) return apiPath
+    const projectKey = await resolveActiveProjectKey()
+    switch (resource) {
+        case 'tickets':
+            return humanApiRoutes.listProjectTickets({ projectKey })
+        case 'notifications':
+            return humanApiRoutes.listProjectNotifications({ projectKey })
+        case 'automation-rules':
+            return humanApiRoutes.listProjectAutomationRules({ projectKey })
+        case 'automation-logs':
+            return humanApiRoutes.listProjectAutomationLogs({ projectKey })
+        default:
+            return projectResourcePath(apiPath)
+    }
+}
 
 /**
  * 自定义HTTP客户端，处理JWT认证和请求格式化
@@ -42,7 +67,7 @@ const httpClient = async (url: string, options: HttpClientOptions = {}) => {
     try {
         return await fetchUtils.fetchJson(url, { ...options, headers })
     } catch (error: unknown) {
-        return handleHttpError(error)
+        return handleHttpError(error, url)
     }
 }
 
@@ -88,8 +113,18 @@ const getTotalFromHeaders = (headers: Headers, defaultTotal: number = 0): number
 const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === 'object' && value !== null
 
-function handleHttpError(error: unknown): never {
+function handleHttpError(error: unknown, url?: string): never {
     if (error instanceof HttpError) {
+        if (error.status === 401) {
+            signalSessionInvalidated()
+        }
+        if (
+            error.status === 403 &&
+            typeof url === 'string' &&
+            shouldInvalidateActiveProjectAccess(url, error.body)
+        ) {
+            signalProjectAccessInvalidated()
+        }
         const message = localizedApiErrorMessage(error.body, error.status)
         throw new HttpError(message, error.status, error.body)
     }
@@ -145,6 +180,18 @@ const ticketIfMatchHeaders = (version: number): Headers => {
 }
 
 const ticketVersionCache = new Map<string, number>()
+
+if (typeof window !== 'undefined') {
+    const clearTicketVersionCache = () => {
+        ticketVersionCache.clear()
+    }
+    window.addEventListener(
+        projectAccessInvalidatedEvent,
+        clearTicketVersionCache,
+    )
+    window.addEventListener(projectScopeChangedEvent, clearTicketVersionCache)
+    window.addEventListener(sessionInvalidatedEvent, clearTicketVersionCache)
+}
 
 const rememberTicketVersions = (records: unknown[]): void => {
     for (const record of records) {
@@ -260,7 +307,7 @@ export const dataProvider: DataProvider = {
             } else if (resource === 'tickets') {
                 query.sort_by = field;
                 query.sort_order = normalizedOrder;
-            } else if (resource === 'users' || resource === 'admin/users') {
+            } else if (resource === 'users') {
                 query.order_by = field;
                 query.order = normalizedOrder;
             } else {
@@ -354,14 +401,14 @@ export const dataProvider: DataProvider = {
                     query.assigned_to_me = assignedToMe;
                     delete filter.assigned_to_me;
                 }
-            } else if (resource === 'users' || resource === 'admin/users') {
+            } else if (resource === 'users') {
                 const searchValue = extractSearchValue();
                 if (searchValue) {
                     query.search = searchValue;
                 }
-                if (filter.role) {
-                    query.role = filter.role;
-                    delete filter.role;
+                if (filter.platform_role) {
+                    query.platform_role = filter.platform_role;
+                    delete filter.platform_role;
                 }
                 if (filter.status) {
                     query.status = filter.status;
@@ -385,8 +432,8 @@ export const dataProvider: DataProvider = {
 
         // 特殊处理不同资源的API路径
         let apiPath = resource;
-        if (resource === 'users' || resource === 'user') {
-            apiPath = 'admin/users'; // 管理员用户管理API
+        if (resource === 'users') {
+            apiPath = humanApiRoutes.listPlatformUsers();
         } else if (resource === 'automation-rules') {
             apiPath = 'admin/automation/rules';
         } else if (resource === 'automation-logs') {
@@ -394,7 +441,7 @@ export const dataProvider: DataProvider = {
         }
 
         apiPath = await scopedApiPath(resource, apiPath)
-        const url = `${apiUrl}/${apiPath}?${queryString.stringify(query)}`;
+        const url = `${joinApiUrl(apiUrl, apiPath)}?${queryString.stringify(query)}`;
         const { json, headers } = await httpClient(url);
 
         const result = parseListResponse(resource, json, headers);
@@ -407,14 +454,23 @@ export const dataProvider: DataProvider = {
     // 获取单个资源
     getOne: async (resource, params) => {
         let apiPath = resource;
-        if (resource === 'users' || resource === 'user') {
-            apiPath = 'admin/users';
-        } else if (resource === 'automation-rules') {
+        if (resource === 'automation-rules') {
             apiPath = 'admin/automation/rules';
         }
 
         apiPath = await scopedApiPath(resource, apiPath)
-        const url = `${apiUrl}/${apiPath}/${params.id}`;
+        const urlPath = resource === 'users'
+            ? humanApiRoutes.getPlatformUser({ userID: Number(params.id) })
+            : resource === 'tickets'
+            ? humanApiRoutes.getProjectTicket(
+                { projectKey: await resolveActiveProjectKey(), ticketID: Number(params.id) },
+            )
+            : resource === 'automation-rules'
+                ? humanApiRoutes.getProjectAutomationRule(
+                    { projectKey: await resolveActiveProjectKey(), ruleID: Number(params.id) },
+                )
+                : `${apiPath}/${params.id}`
+        const url = joinApiUrl(apiUrl, urlPath);
         const { json } = await httpClient(url);
         const data = extractResponseData(json);
         if (resource === 'tickets') {
@@ -425,10 +481,17 @@ export const dataProvider: DataProvider = {
 
     // 获取多个资源
     getMany: async (resource, params) => {
-        if (resource === 'users' || resource === 'user') {
+        if (resource === 'users') {
             const records = await Promise.all(
                 params.ids.map(async (id) => {
-                    const { json } = await httpClient(`${apiUrl}/admin/users/${id}`)
+                    const { json } = await httpClient(
+                        joinApiUrl(
+                            apiUrl,
+                            humanApiRoutes.getPlatformUser({
+                                userID: Number(id),
+                            }),
+                        ),
+                    )
                     return extractTypedResponseData(json)
                 }),
             )
@@ -446,7 +509,7 @@ export const dataProvider: DataProvider = {
         }
 
         apiPath = await scopedApiPath(resource, apiPath)
-        const url = `${apiUrl}/${apiPath}?${queryString.stringify(query)}`;
+        const url = `${joinApiUrl(apiUrl, apiPath)}?${queryString.stringify(query)}`;
         const { json } = await httpClient(url);
         
         const payload = extractResponseData(json);
@@ -487,26 +550,27 @@ export const dataProvider: DataProvider = {
         query.filter = convertFilterToGoFormat(filter);
 
         if (params.target === 'ticket_id' && (resource === 'comments' || resource === 'ticket_history')) {
-            const nestedResource = resource === 'comments' ? 'comments' : 'history'
-            const ticketsPath = await projectResourcePath('tickets')
-            const url = `${apiUrl}/${ticketsPath}/${params.id}/${nestedResource}?${queryString.stringify({
-                page,
-                page_size: perPage,
-                sort: query.sort,
-            })}`
+            const pathParameters = {
+                projectKey: await resolveActiveProjectKey(),
+                ticketID: Number(params.id),
+            }
+            const route = resource === 'comments'
+                ? humanApiRoutes.listProjectTicketComments(pathParameters)
+                : humanApiRoutes.listProjectTicketHistory(pathParameters)
+            const url = joinApiUrl(apiUrl, route)
             const { json, headers } = await httpClient(url)
             return parseListResponse(resource, json, headers)
         }
 
         let apiPath = resource;
-        if (resource === 'users' || resource === 'user') {
-            apiPath = 'admin/users';
+        if (resource === 'users') {
+            apiPath = humanApiRoutes.listPlatformUsers();
         } else if (resource === 'automation-rules') {
             apiPath = 'admin/automation/rules';
         }
 
         apiPath = await scopedApiPath(resource, apiPath)
-        const url = `${apiUrl}/${apiPath}?${queryString.stringify(query)}`;
+        const url = `${joinApiUrl(apiUrl, apiPath)}?${queryString.stringify(query)}`;
         const { json, headers } = await httpClient(url);
 
         return parseListResponse(resource, json, headers);
@@ -515,16 +579,29 @@ export const dataProvider: DataProvider = {
     // 创建资源
     create: async (resource, params) => {
         let apiPath = resource;
-        if (resource === 'users' || resource === 'user') {
-            apiPath = 'admin/users';
-        } else if (resource === 'automation-rules') {
+        if (resource === 'automation-rules') {
             apiPath = 'admin/automation/rules';
         } else if (resource === 'automation-logs') {
             apiPath = 'admin/automation/logs';
         }
 
         apiPath = await scopedApiPath(resource, apiPath)
-        const url = `${apiUrl}/${apiPath}`;
+        const urlPath = resource === 'users'
+            ? humanApiRoutes.createPlatformUser()
+            : resource === 'tickets'
+            ? humanApiRoutes.createProjectTicket({
+                projectKey: await resolveActiveProjectKey(),
+            })
+            : resource === 'notifications'
+                ? humanApiRoutes.createProjectNotification({
+                    projectKey: await resolveActiveProjectKey(),
+                })
+                : resource === 'automation-rules'
+                    ? humanApiRoutes.createProjectAutomationRule({
+                        projectKey: await resolveActiveProjectKey(),
+                    })
+                    : apiPath
+        const url = joinApiUrl(apiUrl, urlPath);
         
         try {
             const { json } = await httpClient(url, {
@@ -544,16 +621,27 @@ export const dataProvider: DataProvider = {
     // 更新资源
     update: async (resource, params) => {
         let apiPath = resource;
-        if (resource === 'users' || resource === 'user') {
-            apiPath = 'admin/users';
-        } else if (resource === 'automation-rules') {
+        if (resource === 'automation-rules') {
             apiPath = 'admin/automation/rules';
         } else if (resource === 'automation-logs') {
             apiPath = 'admin/automation/logs';
         }
 
         apiPath = await scopedApiPath(resource, apiPath)
-        const url = `${apiUrl}/${apiPath}/${params.id}`;
+        const urlPath = resource === 'users'
+            ? humanApiRoutes.updatePlatformUser({
+                userID: Number(params.id),
+            })
+            : resource === 'tickets'
+            ? humanApiRoutes.updateProjectTicket(
+                { projectKey: await resolveActiveProjectKey(), ticketID: Number(params.id) },
+            )
+            : resource === 'automation-rules'
+                ? humanApiRoutes.updateProjectAutomationRule(
+                    { projectKey: await resolveActiveProjectKey(), ruleID: Number(params.id) },
+                )
+                : `${apiPath}/${params.id}`
+        const url = joinApiUrl(apiUrl, urlPath);
         
         try {
             const headers = resource === 'tickets'
@@ -586,7 +674,7 @@ export const dataProvider: DataProvider = {
             }
 
             const ticketsPath = await projectResourcePath('tickets')
-            const url = `${apiUrl}/${ticketsPath}/bulk-update`;
+            const url = joinApiUrl(apiUrl, `${ticketsPath}/bulk-update`);
             const { json } = await httpClient(url, {
                 method: 'POST',
                 body: JSON.stringify({
@@ -603,9 +691,7 @@ export const dataProvider: DataProvider = {
 
         // 否则逐个更新
         let apiPath = resource;
-        if (resource === 'users' || resource === 'user') {
-            apiPath = 'admin/users';
-        } else if (resource === 'automation-rules') {
+        if (resource === 'automation-rules') {
             apiPath = 'admin/automation/rules';
         } else if (resource === 'automation-logs') {
             apiPath = 'admin/automation/logs';
@@ -614,7 +700,14 @@ export const dataProvider: DataProvider = {
         apiPath = await scopedApiPath(resource, apiPath)
         await Promise.all(
             params.ids.map(id =>
-                httpClient(`${apiUrl}/${apiPath}/${id}`, {
+                httpClient(joinApiUrl(
+                    apiUrl,
+                    resource === 'users'
+                        ? humanApiRoutes.updatePlatformUser({
+                            userID: Number(id),
+                        })
+                        : `${apiPath}/${id}`,
+                ), {
                     method: 'PUT',
                     body: JSON.stringify(params.data),
                 })
@@ -627,16 +720,33 @@ export const dataProvider: DataProvider = {
     // 删除资源
     delete: async (resource, params) => {
         let apiPath = resource;
-        if (resource === 'users' || resource === 'user') {
-            apiPath = 'admin/users';
-        } else if (resource === 'automation-rules') {
+        if (resource === 'automation-rules') {
             apiPath = 'admin/automation/rules';
         } else if (resource === 'automation-logs') {
             apiPath = 'admin/automation/logs';
         }
 
         apiPath = await scopedApiPath(resource, apiPath)
-        const url = `${apiUrl}/${apiPath}/${params.id}`;
+        const urlPath = resource === 'users'
+            ? humanApiRoutes.deletePlatformUser({
+                userID: Number(params.id),
+            })
+            : resource === 'tickets'
+            ? humanApiRoutes.deleteProjectTicket(
+                { projectKey: await resolveActiveProjectKey(), ticketID: Number(params.id) },
+            )
+            : resource === 'notifications'
+                ? humanApiRoutes.deleteProjectNotification({
+                    projectKey: await resolveActiveProjectKey(),
+                    notificationID: Number(params.id),
+                })
+                : resource === 'automation-rules'
+                    ? humanApiRoutes.deleteProjectAutomationRule({
+                        projectKey: await resolveActiveProjectKey(),
+                        ruleID: Number(params.id),
+                    })
+                    : `${apiPath}/${params.id}`
+        const url = joinApiUrl(apiUrl, urlPath);
         const cachedVersion = resource === 'tickets'
             ? ticketVersionCache.get(String(params.id))
             : undefined
@@ -674,7 +784,7 @@ export const dataProvider: DataProvider = {
         // 如果后端支持批量删除
         if (resource === 'tickets') {
             const ticketsPath = await projectResourcePath('tickets')
-            const url = `${apiUrl}/${ticketsPath}/bulk-delete`;
+            const url = joinApiUrl(apiUrl, `${ticketsPath}/bulk-delete`);
             const { json } = await httpClient(url, {
                 method: 'DELETE',
                 body: JSON.stringify({
@@ -705,9 +815,7 @@ export const dataProvider: DataProvider = {
 
         // 否则逐个删除
         let apiPath = resource;
-        if (resource === 'users' || resource === 'user') {
-            apiPath = 'admin/users';
-        } else if (resource === 'automation-rules') {
+        if (resource === 'automation-rules') {
             apiPath = 'admin/automation/rules';
         } else if (resource === 'automation-logs') {
             apiPath = 'admin/automation/logs';
@@ -716,7 +824,14 @@ export const dataProvider: DataProvider = {
         apiPath = await scopedApiPath(resource, apiPath)
         await Promise.all(
             params.ids.map(id =>
-                httpClient(`${apiUrl}/${apiPath}/${id}`, {
+                httpClient(joinApiUrl(
+                    apiUrl,
+                    resource === 'users'
+                        ? humanApiRoutes.deletePlatformUser({
+                            userID: Number(id),
+                        })
+                        : `${apiPath}/${id}`,
+                ), {
                     method: 'DELETE',
                 })
             )

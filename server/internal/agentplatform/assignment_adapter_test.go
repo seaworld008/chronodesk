@@ -16,6 +16,18 @@ import (
 
 func TestAssignmentTargetErrorsMapConsistentlyAcrossMCPAndA2A(t *testing.T) {
 	fixture := newMCPAdapterFixture(t)
+	mcpContext, err := services.WithOperationContext(
+		context.Background(),
+		services.OperationContext{
+			Scope:        fixture.project.Scope(),
+			Actor:        models.ServicePrincipalActor(fixture.principal.ID),
+			Source:       services.SourceProtocolMCP,
+			CredentialID: fixture.credential.ID,
+		},
+	)
+	if err != nil {
+		t.Fatalf("build MCP assignment operation context: %v", err)
+	}
 	backend, err := NewA2ABackend(
 		fixture.db,
 		fixture.service,
@@ -92,7 +104,7 @@ func TestAssignmentTargetErrorsMapConsistentlyAcrossMCPAndA2A(t *testing.T) {
 	for index, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			_, mcpErr := fixture.adapter.assignTicket(
-				context.Background(),
+				mcpContext,
 				fixture.actor,
 				map[string]any{
 					"ticket_id":        int64(999999),
@@ -263,6 +275,15 @@ func createAssignmentTargetPrincipal(
 	)
 	if err != nil {
 		t.Fatalf("create assignment target principal: %v", err)
+	}
+	if err := fixture.db.Create(&models.ProjectPrincipalGrant{
+		ProjectID:          fixture.project.ID,
+		ServicePrincipalID: principal.ID,
+		Role:               models.ProjectRoleAgent,
+		Scopes:             []byte(`["tickets:assign"]`),
+		IsActive:           true,
+	}).Error; err != nil {
+		t.Fatalf("grant assignment target principal: %v", err)
 	}
 	return principal
 }

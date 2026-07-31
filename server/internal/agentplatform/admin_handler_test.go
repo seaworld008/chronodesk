@@ -208,7 +208,7 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 		Username:     "control-admin",
 		Email:        "control-admin@example.com",
 		PasswordHash: "not-a-real-password",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&admin).Error; err != nil {
@@ -750,13 +750,22 @@ func newAdminContractFixture(t *testing.T) *adminContractFixture {
 		Username:     "contract-admin",
 		Email:        "contract-admin@example.com",
 		PasswordHash: "not-a-real-password",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&admin).Error; err != nil {
 		t.Fatal(err)
 	}
 	projectFixture := ensureAPIHandlerTestProject(t, db)
+	if err := db.Create(&models.ProjectMembership{
+		ProjectID: projectFixture.project.ID,
+		UserID:    admin.ID,
+		Role:      models.ProjectRoleAdmin,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
+		t.Fatalf("seed administrator project membership: %v", err)
+	}
 	native := services.NewAgentNativeService(db, services.AgentNativeOptions{
 		CredentialPepper: []byte("admin-contract-credential-pepper"),
 	})
@@ -1036,7 +1045,7 @@ func TestAdminWriteRunsThroughHumanProjectScopeTransaction(t *testing.T) {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", fixture.admin.ID)
-		c.Set("user_role", string(models.RoleAdmin))
+		c.Set("platform_role", models.PlatformRolePlatformAdmin)
 		c.Set("request_id", "project-middleware-admin-request")
 		c.Next()
 	})
@@ -1820,7 +1829,7 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 		Username:     "rollback-admin",
 		Email:        "rollback-admin@example.com",
 		PasswordHash: "not-a-real-password",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&admin).Error; err != nil {

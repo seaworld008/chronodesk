@@ -37,7 +37,7 @@ func seedUser(t *testing.T, db *gorm.DB, username string) models.User {
 		Username:     username,
 		Email:        username + "@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 

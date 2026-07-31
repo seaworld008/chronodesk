@@ -11,7 +11,15 @@ from typing import Any
 import pytest
 import requests
 
-from .utils import APIClient, APIError, E2EResourceManager, HumanIdentity
+from .utils import (
+    PLATFORM_ROLES,
+    PROJECT_ROLES,
+    APIClient,
+    APIError,
+    E2EResourceManager,
+    HumanIdentity,
+    assert_human_session_contract,
+)
 from .utils.api import validate_project_key
 from .utils.safety import (
     TestSafetyError,
@@ -190,6 +198,16 @@ def admin_tokens(
             response_diagnostic(response) if response is not None else redact_text(exc)
         )
         pytest.fail(f"管理员登录失败，无法运行依赖测试: {detail}")
+    try:
+        assert_human_session_contract(
+            payload,
+            expected_platform_role="platform_admin",
+        )
+    except AssertionError:
+        pytest.fail(
+            "平台管理员 Auth/JWT 必须只使用 platform_role："
+            f"{safe_diagnostic(payload.get('user'))}"
+        )
     return payload
 
 
@@ -226,18 +244,25 @@ def project_key(
     rows = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
         pytest.fail(f"项目发现缺少 data：{safe_diagnostic(payload)}")
-    active_projects = [
-        row["project"]
+    active_accesses = [
+        row
         for row in rows
         if isinstance(row, dict)
         and isinstance(row.get("project"), dict)
         and row["project"].get("status") == "active"
     ]
-    if len(active_projects) != 1:
-        pytest.fail(f"隔离测试要求唯一 active 项目，实际 {len(active_projects)} 个")
-    selected = active_projects[0].get("key")
+    if len(active_accesses) != 1:
+        pytest.fail(f"隔离测试要求唯一 active 项目，实际 {len(active_accesses)} 个")
+    selected_access = active_accesses[0]
+    selected_role = selected_access.get("project_role")
+    if selected_role not in PROJECT_ROLES or "role" in selected_access:
+        pytest.fail(
+            f"项目发现必须只返回合法 project_role：{safe_diagnostic(selected_access)}"
+        )
+    selected_project = selected_access["project"]
+    selected = selected_project.get("key")
     if not isinstance(selected, str) or not selected:
-        pytest.fail(f"active 项目缺少 key：{safe_diagnostic(active_projects[0])}")
+        pytest.fail(f"active 项目缺少 key：{safe_diagnostic(selected_project)}")
     try:
         validate_project_key(selected)
     except AssertionError as exc:
@@ -274,12 +299,11 @@ def e2e_manager(
 
 
 @pytest.fixture(scope="session")
-def human_identities(
-    e2e_manager: E2EResourceManager,
+def platform_admin_identity(
     admin_api: APIClient,
     admin_credentials: dict[str, str],
     admin_tokens: dict[str, object],
-) -> Mapping[str, HumanIdentity]:
+) -> HumanIdentity:
     admin_user = admin_tokens.get("user")
     if not isinstance(admin_user, dict):
         pytest.fail("管理员登录响应缺少 user")
@@ -298,22 +322,85 @@ def human_identities(
     ):
         pytest.fail("管理员登录响应缺少完整身份或令牌字段")
 
+    context = admin_api.get_json(admin_api.project_path("context"))
+    if context.status_code != 200:
+        pytest.fail(
+            f"测试平台管理员缺少显式项目 Membership：{response_diagnostic(context)}"
+        )
+    project_access = context.json().get("data")
+    if (
+        not isinstance(project_access, dict)
+        or project_access.get("project_role") != "project_admin"
+        or "role" in project_access
+    ):
+        pytest.fail(
+            "测试平台管理员项目上下文必须显式为 project_admin："
+            f"{safe_diagnostic(project_access)}"
+        )
+
+    return HumanIdentity(
+        id=admin_id,
+        platform_role="platform_admin",
+        project_role="project_admin",
+        username=admin_username,
+        email=admin_email,
+        password=admin_credentials["password"],
+        access_token=admin_access_token,
+        refresh_token=admin_refresh_token,
+        api=admin_api,
+    )
+
+
+@pytest.fixture(scope="session")
+def human_identities(
+    e2e_manager: E2EResourceManager,
+) -> Mapping[str, HumanIdentity]:
+    """Project personas; names are labels, authority comes from Membership."""
+
     return {
-        "admin": HumanIdentity(
-            id=admin_id,
-            role="admin",
-            username=admin_username,
-            email=admin_email,
-            password=admin_credentials["password"],
-            access_token=admin_access_token,
-            refresh_token=admin_refresh_token,
-            api=admin_api,
+        "admin": e2e_manager.create_project_identity(
+            "project_admin",
+            label="project-admin",
         ),
-        "supervisor": e2e_manager.create_user("supervisor", "supervisor"),
-        "agent_a": e2e_manager.create_user("agent", "agent-a"),
-        "agent_b": e2e_manager.create_user("agent", "agent-b"),
-        "customer_a": e2e_manager.create_user("customer", "customer-a"),
-        "customer_b": e2e_manager.create_user("customer", "customer-b"),
+        "supervisor": e2e_manager.create_project_identity(
+            "manager",
+            label="manager",
+        ),
+        "agent_a": e2e_manager.create_project_identity(
+            "agent",
+            label="agent-a",
+        ),
+        "agent_b": e2e_manager.create_project_identity(
+            "agent",
+            label="agent-b",
+        ),
+        "customer_a": e2e_manager.create_project_identity(
+            "requester",
+            label="requester-a",
+        ),
+        "customer_b": e2e_manager.create_project_identity(
+            "requester",
+            label="requester-b",
+        ),
+        "observer": e2e_manager.create_project_identity(
+            "observer",
+            label="observer",
+        ),
+    }
+
+
+@pytest.fixture(scope="session")
+def platform_identities(
+    e2e_manager: E2EResourceManager,
+) -> Mapping[str, HumanIdentity]:
+    """Platform personas intentionally have no ProjectMembership."""
+
+    return {
+        platform_role: e2e_manager.create_platform_identity(
+            platform_role,
+            label=f"platform-{platform_role}",
+        )
+        for platform_role in PLATFORM_ROLES
     }
 
 
@@ -368,6 +455,22 @@ def registered_user(
     )
     if not isinstance(registered_id, int) or registered_id <= 0:
         pytest.fail("注册响应缺少 user.id，无法授权测试项目")
+    if (
+        not isinstance(registered_identity, dict)
+        or registered_identity.get("platform_role") != "member"
+        or "role" in registered_identity
+    ):
+        pytest.fail(
+            "注册身份必须只返回 platform_role=member："
+            f"{safe_diagnostic(registered_identity)}"
+        )
+    try:
+        assert_human_session_contract(data, expected_platform_role="member")
+    except AssertionError:
+        pytest.fail(
+            "注册 Auth/JWT 必须只使用 platform_role=member："
+            f"{safe_diagnostic(registered_identity)}"
+        )
     try:
         membership = admin_api.post_json(
             admin_api.project_path("memberships"),
@@ -389,7 +492,7 @@ def registered_user(
         user = registered.get("user", {})
         user_id = user.get("id") if isinstance(user, dict) else None
         if user_id:
-            response = admin_api.delete(f"/admin/users/{user_id}")
+            response = admin_api.delete(f"/platform/users/{user_id}")
             if response.status_code not in (200, 204, 404):
                 cleanup_errors.append(
                     f"Failed to clean up registered test user {user_id}: "

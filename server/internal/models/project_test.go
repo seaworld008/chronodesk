@@ -295,7 +295,7 @@ func TestProjectSchemaEnforcesScopedCompositeUniqueness(t *testing.T) {
 		Username:     "project-member",
 		Email:        "project-member@example.test",
 		PasswordHash: "hash",
-		Role:         RoleAgent,
+		PlatformRole: PlatformRoleMember,
 		Status:       UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {

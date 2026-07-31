@@ -53,6 +53,8 @@ type NotificationService struct {
 	environment              string
 	secretStore              security.Protector
 	webhookClients           WebhookClientFactory
+	webhookTestProjects      *ProjectService
+	webhookTestEvents        *AgentNativeService
 }
 
 func withNotificationProjectOperation[T any](
@@ -138,6 +140,12 @@ const (
 
 	notificationOutboxMaxAttempts  = 8
 	notificationSourceKeyMaxLength = 191
+)
+
+var (
+	ErrWebhookTestAccessDenied = errors.New("webhook test access denied")
+	ErrWebhookTestNotFound     = errors.New("webhook test configuration not found")
+	ErrWebhookTestUnavailable  = errors.New("webhook test command is unavailable")
 )
 
 // TicketAssignedNotificationOutboxTargets snapshots the intended recipient in
@@ -242,6 +250,21 @@ func NewNotificationServiceWithClientFactory(
 // SetEmailNotificationService 设置邮件通知服务（依赖注入）
 func (ns *NotificationService) SetEmailNotificationService(emailService EmailNotificationServiceInterface) {
 	ns.emailNotificationService = emailService
+}
+
+// ConfigureWebhookTestCommands installs the authorization and event-writing
+// collaborators used by the Human test-delivery command. The same
+// NotificationService remains the Outbox worker's delivery adapter; only the
+// command path uses these dependencies.
+func (ns *NotificationService) ConfigureWebhookTestCommands(
+	projects *ProjectService,
+	events *AgentNativeService,
+) {
+	if ns == nil {
+		return
+	}
+	ns.webhookTestProjects = projects
+	ns.webhookTestEvents = events
 }
 
 // NotificationEvent 通知事件
@@ -546,6 +569,12 @@ func (ns *NotificationService) sendWebhookAttempt(
 	}
 	if event == nil {
 		return errors.New("webhook事件不能为空")
+	}
+	if err := requireExternalIOOutsideProjectTransaction(
+		ctx,
+		"webhook HTTP delivery",
+	); err != nil {
+		return err
 	}
 	startTime := time.Now()
 
@@ -1232,77 +1261,224 @@ func (ns *NotificationService) saveLog(
 	}
 }
 
-// TestWebhook 测试webhook配置
+// WebhookTestReceipt is returned after the complete durable test-delivery
+// intent commits. Delivered is deliberately false: the external HTTP outcome
+// belongs to the Outbox worker and WebhookLog.
+type WebhookTestReceipt struct {
+	OperationID          string `json:"operation_id"`
+	EventID              string `json:"event_id"`
+	DeliveryID           string `json:"delivery_id"`
+	SnapshotID           string `json:"snapshot_id"`
+	ConfigID             uint   `json:"config_id"`
+	ConfigurationVersion string `json:"configuration_version"`
+	Status               string `json:"status"`
+	Queued               bool   `json:"queued"`
+	Delivered            bool   `json:"delivered"`
+}
+
+// TestWebhook commits one Human test-delivery intent. It performs no external
+// I/O and never reveals webhook credentials. The Outbox worker later hydrates
+// the immutable snapshot and owns the bounded HTTP attempt plus delivery log.
 func (ns *NotificationService) TestWebhook(
 	ctx context.Context,
 	scope models.ProjectScope,
 	configID uint,
-) error {
+) (*WebhookTestReceipt, error) {
+	if ns == nil || ns.db == nil ||
+		ns.webhookTestProjects == nil ||
+		ns.webhookTestEvents == nil {
+		return nil, ErrWebhookTestUnavailable
+	}
 	if err := scope.Validate(); err != nil {
-		return fmt.Errorf("invalid webhook project scope: %w", err)
+		return nil, fmt.Errorf("invalid webhook project scope: %w", err)
 	}
-	var config models.WebhookConfig
-	if err := ns.db.WithContext(ctx).Where(
-		"id = ? AND organization_id = ? AND project_id = ?",
-		configID,
-		scope.OrganizationID,
-		scope.ProjectID,
-	).First(&config).Error; err != nil {
-		return fmt.Errorf("webhook配置不存在: %w", err)
+	if configID == 0 {
+		return nil, ErrWebhookTestNotFound
 	}
-	if err := ns.revealWebhookSecrets(&config); err != nil {
-		return fmt.Errorf("无法读取webhook凭据: %w", err)
+	if scopeddb.HasTransaction(ctx) {
+		return nil, fmt.Errorf(
+			"%w: webhook test delivery must own its project transaction",
+			ErrWebhookTestUnavailable,
+		)
 	}
-
-	// 创建测试事件
-	now := time.Now().UTC()
-	eventID := fmt.Sprintf("webhook-test-%d", now.UnixNano())
-	actor := models.SystemActor("webhook-test")
-	cloudEventData, err := json.Marshal(map[string]any{
-		"actor":       actor,
-		"description": "这是一个测试消息，用于验证Webhook配置是否正常工作。",
-		"test":        true,
-		"title":       "Webhook测试通知",
-	})
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil ||
+		operation.Scope != scope ||
+		operation.Source != SourceProtocolHumanREST ||
+		operation.Actor.Type != models.ActorTypeHuman {
+		return nil, ErrWebhookTestAccessDenied
+	}
+	userID, err := humanActorUserID(operation.Actor)
 	if err != nil {
-		return fmt.Errorf("创建webhook测试事件失败: %w", err)
+		return nil, ErrWebhookTestAccessDenied
 	}
-	cloudEvent := CloudEventEnvelope{
-		SpecVersion:     "1.0",
-		ID:              eventID,
-		Source:          "urn:chronodesk:webhook-test",
-		Type:            string(models.WebhookEventSystemAlert),
-		Subject:         "webhook/test",
-		Time:            now,
-		DataContentType: "application/json",
-		DataSchema:      "urn:chronodesk:schema:webhook-test:v1",
-		ActorType:       actor.Type,
-		ActorID:         actor.ID,
-		ResourceVersion: 1,
-		OrganizationID:  scope.OrganizationID,
-		ProjectID:       scope.ProjectID,
-		Data:            cloudEventData,
-	}
-	testEvent := &NotificationEvent{
-		Type:         models.WebhookEventSystemAlert,
-		ResourceID:   0,
-		ResourceType: "test",
-		Title:        "Webhook测试通知",
-		Description:  "这是一个测试消息，用于验证Webhook配置是否正常工作。",
-		Data: map[string]interface{}{
-			"ticket_number": "TEST-001",
-			"test":          true,
-			"cloud_event":   cloudEvent,
-		},
-		Metadata: map[string]string{
-			"delivery_id": "webhook-test:" + eventID,
-			"event_id":    eventID,
-			"source":      "webhook_test",
-		},
-		Timestamp: now,
-	}
+	var receipt *WebhookTestReceipt
+	err = scopeddb.WithProjectScopeContextTransaction(
+		ctx,
+		ns.db,
+		scope,
+		func(scopedContext context.Context) error {
+			// The context binding makes root-handle repository calls use the
+			// scoped connection, but same-transaction appenders such as the
+			// audit ledger must receive an explicit *gorm.DB whose ConnPool is
+			// the real transaction. A nested savepoint provides that handle
+			// without widening or extending the project transaction.
+			return transactionForContext(
+				scopedContext,
+				ns.db,
+				func(tx *gorm.DB) error {
+					access, accessErr :=
+						ns.webhookTestProjects.RevalidateHumanProjectAccess(
+							scopedContext,
+							scope,
+							userID,
+						)
+					if accessErr != nil {
+						return fmt.Errorf(
+							"%w: %w",
+							ErrWebhookTestAccessDenied,
+							accessErr,
+						)
+					}
+					if access == nil ||
+						(access.Role != models.ProjectRoleAdmin &&
+							access.Role != models.ProjectRoleManager) {
+						return ErrWebhookTestAccessDenied
+					}
 
-	return ns.sendWebhookAttempt(ctx, &config, testEvent)
+					var config models.WebhookConfig
+					queryErr := tx.WithContext(scopedContext).
+						Clauses(clause.Locking{Strength: "UPDATE"}).
+						Where(
+							"id = ? AND organization_id = ? AND project_id = ? AND status = ?",
+							configID,
+							scope.OrganizationID,
+							scope.ProjectID,
+							models.WebhookStatusActive,
+						).
+						Take(&config).Error
+					if errors.Is(queryErr, gorm.ErrRecordNotFound) {
+						return fmt.Errorf(
+							"%w: %w",
+							ErrWebhookTestNotFound,
+							queryErr,
+						)
+					}
+					if queryErr != nil {
+						return fmt.Errorf(
+							"lock webhook test configuration: %w",
+							queryErr,
+						)
+					}
+
+					now := time.Now().UTC()
+					operationID := newNativeID()
+					eventID := newNativeID()
+					configurationVersion :=
+						webhookTestConfigurationVersion(config)
+					snapshot, snapshotErr :=
+						models.NewWebhookDeliverySnapshot(
+							config,
+							eventID,
+						)
+					if snapshotErr != nil {
+						return fmt.Errorf(
+							"freeze webhook test configuration: %w",
+							snapshotErr,
+						)
+					}
+					if createErr := tx.WithContext(scopedContext).
+						Create(snapshot).Error; createErr != nil {
+						return fmt.Errorf(
+							"create webhook test delivery snapshot: %w",
+							createErr,
+						)
+					}
+
+					maxAttempts := config.RetryCount + 1
+					if maxAttempts < 1 {
+						maxAttempts = 1
+					}
+					if maxAttempts > 11 {
+						maxAttempts = 11
+					}
+					event, appendErr :=
+						ns.webhookTestEvents.AppendDomainEventTx(
+							scopedContext,
+							tx,
+							DomainEventInput{
+								ID:         eventID,
+								Type:       eventcontract.SystemAlertEventType,
+								Subject:    fmt.Sprintf("webhook/%d/test", config.ID),
+								Time:       now,
+								DataSchema: "urn:chronodesk:schema:webhook-test-delivery:v1",
+								Data: map[string]any{
+									"operation_id":      operationID,
+									"test":              true,
+									"title":             "Webhook测试通知",
+									"description":       "这是一个测试消息，用于验证Webhook配置是否正常工作。",
+									"webhook_config_id": config.ID,
+								},
+								TraceID:              operation.TraceID,
+								CorrelationID:        operation.CorrelationID,
+								Actor:                operation.Actor,
+								ResourceVersion:      1,
+								Scope:                scope,
+								ConfigurationVersion: configurationVersion,
+							},
+							[]OutboxTarget{{
+								Type: "webhook",
+								ID: webhookSnapshotDestinationPrefix +
+									snapshot.ID,
+								MaxAttempts: maxAttempts,
+							}},
+						)
+					if appendErr != nil {
+						return fmt.Errorf(
+							"append webhook test delivery intent: %w",
+							appendErr,
+						)
+					}
+					if event == nil || event.ID != eventID ||
+						len(event.Deliveries) != 1 ||
+						event.Deliveries[0].DestinationType != "webhook" ||
+						event.Deliveries[0].DestinationID !=
+							webhookSnapshotDestinationPrefix+snapshot.ID {
+						return errors.New(
+							"webhook test delivery intent did not create one snapshot Outbox delivery",
+						)
+					}
+					receipt = &WebhookTestReceipt{
+						OperationID:          operationID,
+						EventID:              event.ID,
+						DeliveryID:           event.Deliveries[0].ID,
+						SnapshotID:           snapshot.ID,
+						ConfigID:             config.ID,
+						ConfigurationVersion: configurationVersion,
+						Status:               "queued",
+						Queued:               true,
+						Delivered:            false,
+					}
+					return nil
+				},
+			)
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if receipt == nil {
+		return nil, ErrWebhookTestUnavailable
+	}
+	return receipt, nil
+}
+
+func webhookTestConfigurationVersion(config models.WebhookConfig) string {
+	return fmt.Sprintf(
+		"webhook-config:%d@%s",
+		config.ID,
+		config.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	)
 }
 
 func (ns *NotificationService) revealWebhookSecrets(config *models.WebhookConfig) error {
@@ -1828,9 +2004,23 @@ func (ns *NotificationService) UpdateNotificationPreferences(ctx context.Context
 
 		// 插入新设置
 		for _, pref := range preferences {
-			pref.UserID = userID
-			pref.ID = 0 // 确保新建
-			if err := tx.Create(&pref).Error; err != nil {
+			now := time.Now()
+			persistedPreference := map[string]interface{}{
+				"created_at":           now,
+				"updated_at":           now,
+				"user_id":              userID,
+				"notification_type":    pref.NotificationType,
+				"email_enabled":        pref.EmailEnabled,
+				"in_app_enabled":       pref.InAppEnabled,
+				"webhook_enabled":      pref.WebhookEnabled,
+				"do_not_disturb_start": pref.DoNotDisturbStart,
+				"do_not_disturb_end":   pref.DoNotDisturbEnd,
+				"max_daily_count":      pref.MaxDailyCount,
+				"batch_delivery":       pref.BatchDelivery,
+				"batch_interval":       pref.BatchInterval,
+			}
+			if err := tx.Model(&models.NotificationPreference{}).
+				Create(persistedPreference).Error; err != nil {
 				return err
 			}
 		}

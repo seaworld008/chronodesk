@@ -87,7 +87,13 @@ func (s *AgentNativeService) DeleteTicket(
 
 		var attachments []models.TicketAttachment
 		if err := tx.
-			Select("id", "ticket_id", "storage_path").
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select(
+				"id",
+				"ticket_id",
+				"storage_path",
+				"storage_type",
+			).
 			Where(
 				"ticket_id = ? AND organization_id = ? AND project_id = ?",
 				ticket.ID,
@@ -101,6 +107,11 @@ func (s *AgentNativeService) DeleteTicket(
 		cleanupTargets := make([]OutboxTarget, 0, len(attachments))
 		cleanupObjects := make([]AttachmentCleanupObject, 0, len(attachments))
 		for i := range attachments {
+			if attachments[i].StorageType ==
+				attachmentUploadCancelledStorageType &&
+				attachments[i].StoragePath == "" {
+				continue
+			}
 			target, err := NewAttachmentCleanupOutboxTarget(
 				attachments[i].ID,
 				attachments[i].StoragePath,

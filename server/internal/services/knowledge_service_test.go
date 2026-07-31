@@ -3,12 +3,15 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -19,6 +22,7 @@ func TestKnowledgeIngestionBlocksUnscannedFilesAndRebuildsScopedIndex(
 	db := newKnowledgeServiceTestDB(t)
 	scope := models.ProjectScope{OrganizationID: 1, ProjectID: 10}
 	otherScope := models.ProjectScope{OrganizationID: 1, ProjectID: 20}
+	seedKnowledgeSearchAuthorization(t, db, scope)
 	ctx := knowledgeServiceTestContext(t, scope)
 	workerCtx := knowledgeServiceTestWorkerContext(t, scope)
 	index := &knowledgeServiceTestIndex{}
@@ -140,14 +144,66 @@ func TestKnowledgeIngestionBlocksUnscannedFilesAndRebuildsScopedIndex(
 		t.Fatalf("published status = %q", published.Status)
 	}
 
-	state, err := service.RebuildIndex(ctx)
+	var state models.KnowledgeIndexState
+	if err := db.Where(
+		"organization_id = ? AND project_id = ? AND index_name = ?",
+		scope.OrganizationID,
+		scope.ProjectID,
+		"knowledge",
+	).Take(&state).Error; err != nil {
+		t.Fatalf("load automatically queued index state: %v", err)
+	}
+	if state.Status != models.KnowledgeIndexRebuildRequested ||
+		state.Generation != 0 ||
+		state.DesiredGeneration != 1 {
+		t.Fatalf("automatically queued index state = %+v", state)
+	}
+	var automaticDelivery models.OutboxDelivery
+	if err := db.Where(
+		"organization_id = ? AND project_id = ? AND destination_type = ?",
+		scope.OrganizationID,
+		scope.ProjectID,
+		KnowledgeIndexRebuildOutboxDestination,
+	).Take(&automaticDelivery).Error; err != nil {
+		t.Fatalf("load automatic rebuild outbox delivery: %v", err)
+	}
+	if automaticDelivery.DestinationID != fmt.Sprintf("%s:1", state.ID) {
+		t.Fatalf(
+			"automatic rebuild destination = %q",
+			automaticDelivery.DestinationID,
+		)
+	}
+	if err := service.ExecuteIndexRebuildOutbox(
+		workerCtx,
+		state.ID,
+		state.DesiredGeneration,
+	); err != nil {
+		t.Fatalf("execute automatically queued index rebuild: %v", err)
+	}
+
+	queuedState, err := service.RebuildIndex(ctx)
 	if err != nil {
 		t.Fatalf("rebuild index: %v", err)
 	}
+	if queuedState.Status != models.KnowledgeIndexRebuildRequested ||
+		queuedState.Generation != 1 ||
+		queuedState.DesiredGeneration != 2 {
+		t.Fatalf("queued index state = %+v", queuedState)
+	}
+	if err := service.ExecuteIndexRebuildOutbox(
+		workerCtx,
+		queuedState.ID,
+		queuedState.DesiredGeneration,
+	); err != nil {
+		t.Fatalf("execute queued index rebuild: %v", err)
+	}
+	if err := db.First(&state, "id = ?", queuedState.ID).Error; err != nil {
+		t.Fatal(err)
+	}
 	if state.Status != models.KnowledgeIndexReady ||
-		state.Generation != 1 ||
+		state.Generation != 2 ||
 		state.DocumentCount != 1 {
-		t.Fatalf("index state = %+v", state)
+		t.Fatalf("completed index state = %+v", state)
 	}
 	if index.replacement.OrganizationID != scope.OrganizationID ||
 		index.replacement.ProjectID != scope.ProjectID ||
@@ -265,6 +321,7 @@ func TestKnowledgeSearchPushesScopeAndACLBeforeRerankAndReturnsCitations(
 ) {
 	db := newKnowledgeServiceTestDB(t)
 	scope := models.ProjectScope{OrganizationID: 7, ProjectID: 70}
+	seedKnowledgeSearchAuthorization(t, db, scope)
 	ctx := knowledgeServiceTestContext(t, scope)
 	callOrder := make([]string, 0, 3)
 	page := 8
@@ -281,6 +338,7 @@ func TestKnowledgeSearchPushesScopeAndACLBeforeRerankAndReturnsCitations(
 		Score:           0.72,
 		TokenCount:      15,
 	}
+	seedKnowledgeSearchHit(t, db, scope, hit)
 	index := &knowledgeServiceTestIndex{
 		calls: &callOrder,
 		hits:  []HybridSearchHit{hit},
@@ -412,6 +470,7 @@ func TestKnowledgeSearchFailsClosedOnIndexBoundaryViolationBeforeRerank(
 ) {
 	db := newKnowledgeServiceTestDB(t)
 	scope := models.ProjectScope{OrganizationID: 7, ProjectID: 70}
+	seedKnowledgeSearchAuthorization(t, db, scope)
 	ctx := knowledgeServiceTestContext(t, scope)
 	index := &knowledgeServiceTestIndex{
 		hits: []HybridSearchHit{
@@ -468,11 +527,73 @@ func TestKnowledgeSearchFailsClosedOnIndexBoundaryViolationBeforeRerank(
 	}
 }
 
+func TestKnowledgeSearchDiscardsExternalResultAfterMembershipRevocation(
+	t *testing.T,
+) {
+	db := newKnowledgeServiceTestDB(t)
+	scope := models.ProjectScope{OrganizationID: 7, ProjectID: 70}
+	seedKnowledgeSearchAuthorization(t, db, scope)
+	ctx := knowledgeServiceTestContext(t, scope)
+	index := &knowledgeServiceTestIndex{
+		afterSearch: func(externalContext context.Context) {
+			if scopeddb.HasTransaction(externalContext) {
+				t.Fatal("knowledge search index ran inside a project transaction")
+			}
+			if err := db.Model(&models.ProjectMembership{}).
+				Where("project_id = ? AND user_id = ?", scope.ProjectID, 42).
+				Updates(map[string]any{
+					"is_active": false,
+					"version":   gorm.Expr("version + 1"),
+				}).Error; err != nil {
+				t.Fatalf("revoke membership after external search: %v", err)
+			}
+		},
+	}
+	provider := &knowledgeServiceTestProvider{
+		descriptor: ModelProviderDescriptor{
+			Key:        "approved-external",
+			IsExternal: true,
+		},
+	}
+	service := newKnowledgeServiceForTest(
+		t,
+		db,
+		index,
+		nil,
+		map[string]ModelProvider{
+			"approved-external": provider,
+		},
+	)
+	setKnowledgeServiceTestPolicy(
+		t,
+		service,
+		ctx,
+		models.ModelDataEgressRedacted,
+	)
+
+	_, err := service.Search(ctx, KnowledgeSearchInput{
+		Query: "撤权后不能返回",
+		Limit: 1,
+	})
+	if !errors.Is(err, ErrProjectAccessDenied) {
+		t.Fatalf("post-search revocation error = %v", err)
+	}
+	var citations int64
+	if err := db.Model(&models.KnowledgeCitation{}).
+		Count(&citations).Error; err != nil {
+		t.Fatal(err)
+	}
+	if citations != 0 {
+		t.Fatalf("revoked knowledge search persisted %d citations", citations)
+	}
+}
+
 func TestKnowledgeSearchDeniesExternalProviderWhenDataEgressIsDisabled(
 	t *testing.T,
 ) {
 	db := newKnowledgeServiceTestDB(t)
 	scope := models.ProjectScope{OrganizationID: 7, ProjectID: 70}
+	seedKnowledgeSearchAuthorization(t, db, scope)
 	ctx := knowledgeServiceTestContext(t, scope)
 	index := &knowledgeServiceTestIndex{}
 	provider := &knowledgeServiceTestProvider{
@@ -599,6 +720,7 @@ func TestSetProjectModelPolicyRequiresRegisteredProviderAndScopesUpdates(
 type knowledgeServiceTestIndex struct {
 	calls         *[]string
 	hits          []HybridSearchHit
+	afterSearch   func(context.Context)
 	searchRequest HybridSearchRequest
 	searchCalls   int
 	replacement   HybridIndexReplacement
@@ -606,7 +728,7 @@ type knowledgeServiceTestIndex struct {
 }
 
 func (index *knowledgeServiceTestIndex) Search(
-	_ context.Context,
+	ctx context.Context,
 	request HybridSearchRequest,
 ) ([]HybridSearchHit, error) {
 	index.searchCalls++
@@ -616,6 +738,9 @@ func (index *knowledgeServiceTestIndex) Search(
 	}
 	if err := request.Filter.Validate(); err != nil {
 		return nil, err
+	}
+	if index.afterSearch != nil {
+		index.afterSearch(ctx)
 	}
 	return append([]HybridSearchHit(nil), index.hits...), nil
 }
@@ -710,6 +835,11 @@ func newKnowledgeServiceTestDB(t *testing.T) *gorm.DB {
 		t.Fatal(err)
 	}
 	if err := db.AutoMigrate(
+		&models.Organization{},
+		&models.BusinessUnit{},
+		&models.Project{},
+		&models.User{},
+		&models.ProjectMembership{},
 		&models.KnowledgeArticle{},
 		&models.KnowledgeArticleVersion{},
 		&models.KnowledgeArticleACL{},
@@ -719,10 +849,166 @@ func newKnowledgeServiceTestDB(t *testing.T) *gorm.DB {
 		&models.KnowledgeFeedback{},
 		&models.KnowledgeIndexState{},
 		&models.ProjectModelPolicy{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
+		&models.AuditLedgerEntry{},
 	); err != nil {
 		t.Fatal(err)
 	}
 	return db
+}
+
+func seedKnowledgeSearchAuthorization(
+	t *testing.T,
+	db *gorm.DB,
+	scope models.ProjectScope,
+) {
+	t.Helper()
+	organization := models.Organization{
+		ID:     scope.OrganizationID,
+		Slug:   fmt.Sprintf("knowledge-org-%d", scope.OrganizationID),
+		Name:   "Knowledge Search Organization",
+		Status: models.OrganizationStatusActive,
+	}
+	if err := db.Create(&organization).Error; err != nil {
+		t.Fatal(err)
+	}
+	businessUnit := models.BusinessUnit{
+		ID:             scope.ProjectID + 1000,
+		OrganizationID: scope.OrganizationID,
+		Key:            fmt.Sprintf("knowledge-%d", scope.ProjectID),
+		Name:           "Knowledge Search",
+		Status:         models.BusinessUnitStatusActive,
+	}
+	if err := db.Create(&businessUnit).Error; err != nil {
+		t.Fatal(err)
+	}
+	project := models.Project{
+		ID:             scope.ProjectID,
+		OrganizationID: scope.OrganizationID,
+		BusinessUnitID: businessUnit.ID,
+		Key:            models.ProjectKey(fmt.Sprintf("K%d", scope.ProjectID)),
+		Name:           "Knowledge Search Project",
+		Status:         models.ProjectStatusActive,
+	}
+	if err := db.Create(&project).Error; err != nil {
+		t.Fatal(err)
+	}
+	user := models.User{
+		ID:           42,
+		Username:     fmt.Sprintf("knowledge-search-%d", scope.ProjectID),
+		Email:        fmt.Sprintf("knowledge-search-%d@example.test", scope.ProjectID),
+		PasswordHash: "test-only",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.ProjectMembership{
+		ProjectID: scope.ProjectID,
+		UserID:    user.ID,
+		Role:      models.ProjectRoleManager,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedKnowledgeSearchHit(
+	t *testing.T,
+	db *gorm.DB,
+	scope models.ProjectScope,
+	hit HybridSearchHit,
+) {
+	t.Helper()
+	actor := models.HumanActor(42)
+	now := time.Now().UTC()
+	article := models.KnowledgeArticle{
+		ID:             hit.ArticleID,
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		Key:            "search-hit",
+		Title:          "Search hit",
+		Status:         models.KnowledgeArticleActive,
+		Revision:       1,
+		CreatedByType:  actor.Type,
+		CreatedByID:    actor.ID,
+		UpdatedByType:  actor.Type,
+		UpdatedByID:    actor.ID,
+	}
+	if err := db.Create(&article).Error; err != nil {
+		t.Fatal(err)
+	}
+	version := models.KnowledgeArticleVersion{
+		ID:               hit.VersionID,
+		OrganizationID:   scope.OrganizationID,
+		ProjectID:        scope.ProjectID,
+		ArticleID:        hit.ArticleID,
+		Version:          hit.DocumentVersion,
+		Status:           models.KnowledgeVersionPublished,
+		Title:            "Search hit",
+		ObjectProvider:   "test",
+		ObjectBucket:     "knowledge",
+		ObjectKey:        "search-hit.txt",
+		OriginalFileName: "search-hit.txt",
+		MimeType:         "text/plain",
+		SizeBytes:        int64(len(hit.Snippet)),
+		ContentHash:      hit.ContentHash,
+		VirusScan:        models.VirusScanClean,
+		ScannedAt:        &now,
+		CreatedByType:    actor.Type,
+		CreatedByID:      actor.ID,
+		PublishedAt:      &now,
+	}
+	if err := db.Create(&version).Error; err != nil {
+		t.Fatal(err)
+	}
+	task := models.KnowledgeIngestionTask{
+		ID:             uuid.Must(uuid.NewV7()).String(),
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		ArticleID:      hit.ArticleID,
+		VersionID:      hit.VersionID,
+		Attempt:        1,
+		Status:         models.KnowledgeIngestionCompleted,
+		ParserKey:      "test",
+		CreatedByType:  actor.Type,
+		CreatedByID:    actor.ID,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatal(err)
+	}
+	chunk := models.KnowledgeChunk{
+		ID:              hit.ChunkID,
+		OrganizationID:  scope.OrganizationID,
+		ProjectID:       scope.ProjectID,
+		ArticleID:       hit.ArticleID,
+		VersionID:       hit.VersionID,
+		IngestionTaskID: task.ID,
+		Ordinal:         1,
+		PageNumber:      hit.PageNumber,
+		Content:         hit.Snippet,
+		Snippet:         hit.Snippet,
+		ContentHash:     hit.ContentHash,
+		TokenCount:      hit.TokenCount,
+	}
+	if err := db.Create(&chunk).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.KnowledgeArticleACL{
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		ArticleID:      hit.ArticleID,
+		SubjectType:    models.KnowledgeACLAllProject,
+		SubjectID:      "*",
+		Permission:     models.KnowledgeACLRead,
+		GrantedByType:  actor.Type,
+		GrantedByID:    actor.ID,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func newKnowledgeServiceForTest(
@@ -737,6 +1023,7 @@ func newKnowledgeServiceForTest(
 		SearchIndex:    index,
 		AccessResolver: resolver,
 		ModelProviders: providers,
+		Events:         NewAgentNativeService(db),
 	})
 	if err != nil {
 		t.Fatal(err)

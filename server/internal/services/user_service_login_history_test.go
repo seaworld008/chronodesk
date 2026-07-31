@@ -44,7 +44,7 @@ func seedUserForLoginHistory(t *testing.T, db *gorm.DB, email string) uint {
 		Username:     email,
 		Email:        email,
 		PasswordHash: "hash",
-		Role:         models.RoleCustomer,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {

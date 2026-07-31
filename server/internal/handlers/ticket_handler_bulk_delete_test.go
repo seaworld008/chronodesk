@@ -209,7 +209,7 @@ func TestBulkDeleteTicketsHandler_RemovesRequestedTickets(t *testing.T) {
 		Username:     "admin-handler",
 		Email:        "admin-handler@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&admin).Error; err != nil {

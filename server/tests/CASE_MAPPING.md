@@ -18,18 +18,18 @@ CloudEvent、Outbox、Chrome 与故障注入证据统一以
 |---|---|---|---|
 | AUTH-005、AUTH-006 | HTTP 直接证据 | `auth/test_auth_flows.py::test_wrong_password_and_unknown_email_are_indistinguishable_and_limited` | 错误密码与未知邮箱首个响应相同且不回显账号；已存在账号连续五次失败后下一次为中文 429。 |
 | AUTH-007 | 复合证据 | `human/test_zz_error_contract.py::test_authentication_authorization_and_not_found_errors_are_machine_safe` | 缺 token、错误认证头和伪造签名为中文 JSON 401；过期、错误 audience 等由 manifest 中 Go 测试证明。 |
-| RBAC-001 | 复合证据 | `human/test_rbac_matrix.py::test_ticket_object_permission_matrix` | Admin 可读、可更新任意 E2E 工单；Actor/Event 审计另有领域及发布证据。 |
-| RBAC-002 | 复合证据 | 同上 | Supervisor 可读队列并分配；完整升级链与系统管理拒绝分别由其他证据证明。 |
+| RBAC-001 | 复合证据 | `human/test_rbac_matrix.py::test_ticket_object_permission_matrix` | `member + project_admin` 可读、可更新任意 E2E 工单；Actor/Event 审计另有领域及发布证据。 |
+| RBAC-002 | 复合证据 | 同上 | `member + manager` 可读队列并分配；完整升级链与平台治理拒绝分别由其他证据证明。 |
 | RBAC-003 | HTTP 直接证据（当前策略） | `human/test_failure_driven_contracts.py::test_agent_full_queue_read_remains_read_only_under_current_human_policy` | Human Agent 可只读完整队列；只有未分配/自己处理的工单可写，测试不虚构跨处理人读取 403。 |
 | RBAC-004 | HTTP 直接证据 | 同上及 `human/test_rbac_matrix.py::test_ticket_object_permission_matrix` | 非处理 Agent 的更新、流转和评论均为 403。 |
-| RBAC-005 | HTTP 直接证据 | `human/test_rbac_matrix.py::test_ticket_object_permission_matrix` | Customer 读取本人工单，处理人、内部上下文与附件投影被裁剪。 |
-| RBAC-006 | HTTP 直接证据 | 同上 | Customer 跨客户读取拒绝，响应不回显目标 ID。 |
-| RBAC-007 | HTTP 直接证据 | `human/test_content_and_notifications.py::test_public_and_internal_comment_permissions` | Customer 可写公开评论，internal/system 均为 403。 |
-| RBAC-008 | HTTP 直接证据 | `human/test_rbac_matrix.py::test_four_human_roles_and_admin_only_surfaces` | Supervisor、Agent、Customer 不能访问用户、系统配置和 Agent 控制面。 |
-| RBAC-009 | HTTP 直接证据 | `human/test_zz_error_contract.py::{test_suspended_account_invalidates_an_existing_access_token,test_deleted_account_invalidates_an_existing_access_token}` | 停用和删除后，已签发 access token 立即为 401。 |
-| RBAC-010 | 复合证据 | `human/test_rbac_matrix.py::test_four_human_roles_and_admin_only_surfaces`、`human/test_rbac_matrix.py::test_soft_deleted_human_identity_returns_stable_conflict` | 创建/更新未知角色为 400；审计保留身份复用为中文 409；数据库 CHECK 由 manifest 中 Go 测试证明。 |
+| RBAC-005 | HTTP 直接证据 | `human/test_rbac_matrix.py::test_ticket_object_permission_matrix` | `requester` 读取本人工单，处理人、内部上下文与附件投影被裁剪。 |
+| RBAC-006 | HTTP 直接证据 | 同上 | `requester` 跨用户读取拒绝，响应不回显目标 ID。 |
+| RBAC-007 | HTTP 直接证据 | `human/test_content_and_notifications.py::test_public_and_internal_comment_permissions` | `requester` 可写公开评论，internal/system 均为 403。 |
+| RBAC-008 | HTTP 直接证据 | `human/test_rbac_matrix.py::{test_platform_permission_matrix_never_grants_implicit_project_access,test_project_permission_matrix_uses_only_active_membership,test_revoked_membership_immediately_removes_project_access}` | 四个平台角色不隐式获得项目；五个项目角色只来自 active Membership，平台矩阵与项目矩阵独立验证；`/api/workbench` 只能聚合 active Membership 项目。 |
+| RBAC-009 | HTTP 直接证据 | `human/test_zz_error_contract.py::{test_suspended_account_invalidates_an_existing_access_token,test_deleted_account_invalidates_an_existing_access_token}` | 停用和删除后，已签发 access token 立即为 401。平台角色失配导致的 `stale_token` 以及 JWT 不含项目角色由 manifest 中 auth Go 契约补充证明。 |
+| RBAC-010 | 复合证据 | `human/test_rbac_matrix.py::test_unknown_roles_fail_closed`、`human/test_rbac_matrix.py::test_soft_deleted_human_identity_returns_stable_conflict` | 未知平台/项目角色为 400；审计保留身份复用为中文 409；数据库 CHECK、旧字段移除、角色切换 checkpoint 与路由不存在性由 manifest 中静态及 Go 迁移/契约证明。 |
 | RBAC-011 | 复合证据 | `internal/services/admin_user_service_role_test.go::TestAdminUserServiceUpdatePreservesLastActiveAdmin`、`web/e2e/00-users.spec.ts` | 服务层与浏览器共同验证最后活跃管理员不能降级；不破坏共享云管理员来构造黑盒前置条件。 |
-| RBAC-012 | HTTP 直接证据 | `human/test_rbac_matrix.py::test_human_role_change_audit_identifies_actor_target_result_and_redacts_query` | Human 角色变更审计包含操作者、目标路径/ID、方法、结果、时间和来源；password/token query 被脱敏。该接口不冒充 Agent diff/event 审计。 |
+| RBAC-012 | HTTP 直接证据 | `human/test_rbac_matrix.py::test_platform_role_change_audit_identifies_actor_target_result_and_redacts_query` | 平台角色变更审计包含 `platform_role`、操作者、目标路径/ID、方法、结果、时间和来源；password/token query 被脱敏。该接口不冒充 Agent diff/event 审计。 |
 
 ## 工单输入、并发、生命周期与列表
 
@@ -76,7 +76,9 @@ JSON、机器判别字段、中文反馈和敏感字段；不能把“某个 401
 ## 数据隔离与执行
 
 `utils/human.py::E2EResourceManager` 为每次 session 生成唯一
-`E2E-<run-id>-` 前缀。清理前重新读取并验证所有权，只删除明确跟踪的本轮资源。
+`E2E-<run-id>-` 前缀。平台用户先独立创建，项目身份再通过
+`create_project_identity(project_role, platform_role="member")` 显式授予
+Membership；清理前重新读取并验证所有权，只删除明确跟踪的本轮资源。
 
 ```bash
 cd server

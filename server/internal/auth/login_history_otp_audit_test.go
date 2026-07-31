@@ -98,7 +98,7 @@ func TestOTPRequiredLoginPersistsAuditWithoutChangingResponse(t *testing.T) {
 		Username:      "otp-audit",
 		Email:         email,
 		PasswordHash:  passwordHash,
-		Role:          models.RoleCustomer,
+		PlatformRole:  models.PlatformRoleMember,
 		Status:        models.UserStatusActive,
 		EmailVerified: true,
 	}).Error; err != nil {
@@ -110,7 +110,7 @@ func TestOTPRequiredLoginPersistsAuditWithoutChangingResponse(t *testing.T) {
 		Username:      "otp-audit",
 		Email:         email,
 		PasswordHash:  passwordHash,
-		Role:          RoleCustomer,
+		PlatformRole:  PlatformRoleMember,
 		Status:        StatusActive,
 		EmailVerified: true,
 		OTPEnabled:    true,

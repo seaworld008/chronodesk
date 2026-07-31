@@ -40,8 +40,8 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      - name: Install Python dependencies
-        run: pip install -r server/requirements-test.txt
+      - name: Install repository Python dependencies
+        run: make install-test-deps
 
       - name: Validate Python tests and release evidence
         run: make test-python-static
@@ -145,7 +145,7 @@ jobs:
             exit 0
           fi
 
-          if ! python - "$report" <<'PY'
+          if ! ./.venv/bin/python - "$report" <<'PY'
           import html
           import os
           import re

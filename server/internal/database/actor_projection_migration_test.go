@@ -445,7 +445,7 @@ func seedActorProjectionUser(t *testing.T, db *gorm.DB, suffix string) models.Us
 		Username:     "actor-" + suffix,
 		Email:        "actor-" + suffix + "@example.com",
 		PasswordHash: "hash",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {

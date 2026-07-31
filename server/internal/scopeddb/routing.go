@@ -8,12 +8,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
 )
 
 const pluginName = "chronodesk_project_scope_transaction_routing"
+
+// GORM sessions copy Config while sharing its Plugins map and callback
+// processors. GORM does not synchronize Use or callback registration, so a
+// process-wide lock is required to make the identity check and initialization
+// atomic even when callers hold different session clones. The lock is used
+// only while installing the plugin; database operations never acquire it.
+var installMu sync.Mutex
 
 type transactionContextKey struct{}
 
@@ -31,6 +39,9 @@ func Install(db *gorm.DB) error {
 	if err := requireDatabase(db); err != nil {
 		return err
 	}
+	installMu.Lock()
+	defer installMu.Unlock()
+
 	err := db.Use(routingPlugin{})
 	if errors.Is(err, gorm.ErrRegistered) {
 		return nil

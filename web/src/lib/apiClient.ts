@@ -1,8 +1,39 @@
+import { HttpError } from 'react-admin'
+import {
+  shouldInvalidateActiveProjectAccess,
+  signalProjectAccessInvalidated,
+  signalSessionInvalidated,
+} from './projectScopeEvents'
+import { joinApiUrl } from './apiUrl'
+
 export type ApiOptions = RequestInit & { rawResponse?: boolean }
 
 const API_BASE = (import.meta.env.VITE_API_URL ?? '/api').toString().replace(/\/$/, '')
 
-const toUrl = (path: string) => `${API_BASE}${path.startsWith('/') ? path : `/${path}`}`
+const toUrl = (path: string) => joinApiUrl(API_BASE, path)
+
+const requestPath = (input: RequestInfo | URL): string => {
+  if (typeof input === 'string') return input
+  if (input instanceof URL) return input.toString()
+  return input.url
+}
+
+export const sessionAwareFetch = async (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response> => {
+  const response = await fetch(input, init)
+  const path = requestPath(input)
+  if (response.status === 401) {
+    signalSessionInvalidated()
+  } else if (response.status === 403) {
+    const payload = await response.clone().json().catch(() => null)
+    if (shouldInvalidateActiveProjectAccess(path, payload)) {
+      signalProjectAccessInvalidated()
+    }
+  }
+  return response
+}
 
 type JsonRecord = Record<string, unknown>
 
@@ -13,6 +44,7 @@ const problemMessages: Record<string, string> = {
   invalid_actor: '操作身份无效，请重新认证后重试',
   invalid_scope: '请求的权限范围无效',
   unauthorized: '登录状态已失效，请重新登录',
+  project_access_revoked: '当前项目访问权限已失效',
   insufficient_scope: '当前凭据缺少执行此操作所需的权限范围',
   scope_not_granted: '当前服务主体未被授予所需权限范围',
   scope_allowed: '权限范围校验通过',
@@ -132,7 +164,7 @@ export async function apiFetch<T = unknown>(path: string, options: ApiOptions = 
 
   let response: Response
   try {
-    response = await fetch(toUrl(path), {
+    response = await sessionAwareFetch(toUrl(path), {
       ...options,
       headers,
     })
@@ -156,7 +188,11 @@ export async function apiFetch<T = unknown>(path: string, options: ApiOptions = 
   }
 
   if (!response.ok) {
-    throw new Error(localizedApiErrorMessage(parsed, response.status))
+    throw new HttpError(
+      localizedApiErrorMessage(parsed, response.status),
+      response.status,
+      parsed,
+    )
   }
 
   if (isJsonRecord(parsed)) {

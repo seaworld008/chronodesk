@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -88,7 +90,11 @@ func TestNewSimpleJWTManagerFailsClosedOnInvalidTrustConfig(t *testing.T) {
 
 func TestJWTManagerIssuesCanonicalHumanRESTClaims(t *testing.T) {
 	manager := mustTestJWTManager(t, time.Hour, 24*time.Hour)
-	accessToken, _, err := manager.GenerateTokenPair(42, RoleAdmin, "canonical-session")
+	accessToken, _, err := manager.GenerateTokenPair(
+		42,
+		PlatformRolePlatformAdmin,
+		"canonical-session",
+	)
 	if err != nil {
 		t.Fatalf("generate token pair: %v", err)
 	}
@@ -101,5 +107,62 @@ func TestJWTManagerIssuesCanonicalHumanRESTClaims(t *testing.T) {
 	}
 	if payload.Aud != testHumanJWTAudience {
 		t.Fatalf("audience = %q, want %q", payload.Aud, testHumanJWTAudience)
+	}
+	segments := strings.Split(accessToken, ".")
+	if len(segments) != 3 {
+		t.Fatalf("JWT segments = %d, want 3", len(segments))
+	}
+	rawPayload, err := base64.RawURLEncoding.DecodeString(segments[1])
+	if err != nil {
+		t.Fatalf("decode JWT payload: %v", err)
+	}
+	var claims map[string]json.RawMessage
+	if err := json.Unmarshal(rawPayload, &claims); err != nil {
+		t.Fatalf("decode JWT claims: %v", err)
+	}
+	if _, exists := claims["platform_role"]; !exists {
+		t.Fatal("human JWT is missing platform_role")
+	}
+	if _, exists := claims["role"]; exists {
+		t.Fatal("human JWT retained destructive legacy role claim")
+	}
+}
+
+func TestJWTManagerRejectsLegacyRoleClaimsForBothTokenTypes(t *testing.T) {
+	manager := mustTestJWTManager(t, time.Hour, 24*time.Hour)
+	tests := []struct {
+		name      string
+		tokenType string
+		secret    string
+		verify    func(string) (*Claims, error)
+	}{
+		{
+			name:      "access",
+			tokenType: "access",
+			secret:    manager.accessSecret,
+			verify:    manager.VerifyAccessToken,
+		},
+		{
+			name:      "refresh",
+			tokenType: "refresh",
+			secret:    manager.refreshSecret,
+			verify:    manager.VerifyRefreshToken,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			token, err := signedLegacyRoleToken(
+				manager,
+				"admin",
+				test.tokenType,
+				test.secret,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := test.verify(token); err == nil {
+				t.Fatalf("legacy %s token was accepted", test.tokenType)
+			}
+		})
 	}
 }

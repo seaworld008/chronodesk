@@ -23,7 +23,7 @@ const TEST_USER = {
 
 test.describe('Ticket Workflow', () => {
     test.describe.configure({ mode: 'serial' });
-    let customerNotificationId: number | null = null;
+    let requesterNotificationId: number | null = null;
     let roleAccounts: TemporaryRoleAccounts;
 
     test.beforeAll(async ({ request }) => {
@@ -45,8 +45,8 @@ test.describe('Ticket Workflow', () => {
     });
 
     test.afterAll(async ({ request }) => {
-        if (customerNotificationId) {
-            await deleteNotification(request, customerNotificationId);
+        if (requesterNotificationId) {
+            await deleteNotification(request, requesterNotificationId);
         }
         await cleanupE2EData(request, {
             automationRules: false,
@@ -234,22 +234,22 @@ test.describe('Ticket Workflow', () => {
         await waitForTicketList();
     });
 
-    test('should not load user-management filters for customer notifications', async ({ page, request }) => {
-        const adminUserRequests: string[] = [];
+    test('requester 通知筛选不加载平台用户管理接口', async ({ page, request }) => {
+        const platformUserRequests: string[] = [];
         page.on('request', (request) => {
-            if (new URL(request.url()).pathname.includes('/admin/users')) {
-                adminUserRequests.push(request.url());
+            if (new URL(request.url()).pathname.includes('/platform/users')) {
+                platformUserRequests.push(request.url());
             }
         });
 
-        const notificationTitle = `${E2E_MARKER}客户通知`;
-        customerNotificationId = await createNotification(request, {
+        const notificationTitle = `${E2E_MARKER}请求者通知`;
+        requesterNotificationId = await createNotification(request, {
             title: notificationTitle,
-            content: '用于验证客户通知筛选不会读取用户管理接口',
-            recipientEmail: roleAccounts.customer.email,
+            content: '用于验证请求者通知筛选不会读取平台用户管理接口',
+            recipientEmail: roleAccounts.requester.email,
         });
 
-        await authenticatePage(page, roleAccounts.customer);
+        await authenticatePage(page, roleAccounts.requester);
         await page.goto('/#/notifications');
         await expect(page.getByText(notificationTitle)).toBeVisible();
         await expect(page.getByPlaceholder('搜索通知')).toBeVisible();
@@ -259,10 +259,10 @@ test.describe('Ticket Workflow', () => {
         await expect(page.getByRole('menuitemcheckbox', { name: '通知类型' })).toBeVisible();
         await expect(page.getByRole('menuitemcheckbox', { name: '接收者' })).toHaveCount(0);
         await expect(page.getByRole('menuitemcheckbox', { name: '发送者' })).toHaveCount(0);
-        expect(adminUserRequests).toEqual([]);
+        expect(platformUserRequests).toEqual([]);
     });
 
-    test('should hide and guard agent control from customer role', async ({ page }) => {
+    test('requester 项目角色隐藏并拦截 Agent 控制面', async ({ page }) => {
         const agentAdminRequests: string[] = [];
         page.on('request', (request) => {
             if (
@@ -274,7 +274,7 @@ test.describe('Ticket Workflow', () => {
             }
         });
 
-        await authenticatePage(page, roleAccounts.customer);
+        await authenticatePage(page, roleAccounts.requester);
 
         await expect(
             page.getByRole('menuitem', { name: 'AI 智能体控制' }),

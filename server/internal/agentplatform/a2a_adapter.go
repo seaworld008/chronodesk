@@ -20,7 +20,9 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
+	"github.com/seaworld008/chronodesk/server/internal/security"
 	"github.com/seaworld008/chronodesk/server/internal/services"
+	"gorm.io/gorm/clause"
 )
 
 const a2aSourceProtocol = "a2a"
@@ -546,11 +548,16 @@ func (b *A2ABackend) Process(
 	}
 
 	if identity.Actor.Type == models.ActorTypeServicePrincipal {
-		release, acquireErr := b.native.AcquireAgentExecution(ctx, identity.Actor.ID)
+		leaseContext, release, acquireErr :=
+			b.native.AcquireAgentExecutionContext(
+				ctx,
+				identity.Actor.ID,
+			)
 		if acquireErr != nil {
 			return b.reportDomainError(ctx, reporter, acquireErr)
 		}
 		defer release()
+		ctx = leaseContext
 	}
 
 	skill, payload, parseErr := structuredA2ACommand(task, message)
@@ -603,6 +610,12 @@ func (b *A2ABackend) processA2ACommand(
 	reserveErr := b.native.RunProjectOperation(
 		ctx,
 		func(scopedContext context.Context) error {
+			if err := b.revalidateA2AExecution(
+				scopedContext,
+				identity,
+			); err != nil {
+				return err
+			}
 			var err error
 			reservation, replayed, err = b.reserveA2ACommand(
 				scopedContext,
@@ -658,6 +671,34 @@ func (b *A2ABackend) processA2ACommand(
 		b.failA2ACommand(ctx, reservation, authorizeErr)
 		return b.reportDomainError(ctx, reporter, authorizeErr)
 	}
+	if skill == "ticket-intake" {
+		commandErr := b.ticketIntake(
+			authorizedContext,
+			task,
+			message,
+			identity,
+			payload,
+			reporter,
+		)
+		if commandErr == nil {
+			return nil
+		}
+		if deferred, ok := reporter.(*deferredA2AReporter); ok {
+			deferred.Discard()
+		}
+		b.failA2ACommand(ctx, reservation, commandErr)
+		var invalid *a2aCommandInputError
+		if errors.As(commandErr, &invalid) {
+			return reportA2AState(
+				ctx,
+				reporter,
+				a2a.TaskStateInputRequired,
+				"structured_input_required",
+				invalid.required,
+			)
+		}
+		return b.reportDomainError(ctx, reporter, commandErr)
+	}
 
 	var (
 		outcomeErr error
@@ -666,6 +707,12 @@ func (b *A2ABackend) processA2ACommand(
 	transactionErr := b.native.RunProjectOperation(
 		authorizedContext,
 		func(scopedContext context.Context) error {
+			if err := b.revalidateA2AExecution(
+				scopedContext,
+				identity,
+			); err != nil {
+				return err
+			}
 			outcomeErr, commandErr = b.executeA2ACommandScoped(
 				scopedContext,
 				task,
@@ -709,8 +756,6 @@ func (b *A2ABackend) executeA2ACommandScoped(
 ) (outcomeErr error, commandErr error) {
 	var err error
 	switch skill {
-	case "ticket-intake":
-		err = b.ticketIntake(ctx, task, message, identity, payload, reporter)
 	case "ticket-query":
 		err = b.ticketQuery(ctx, task, message, identity, payload, reporter)
 	case "ticket-work":
@@ -929,16 +974,42 @@ func (b *A2ABackend) failA2ACommand(
 	if reservation.ID == "" {
 		return
 	}
-	_ = b.native.RunProjectOperation(
+	operation, err := services.OperationContextFromContext(ctx)
+	if err != nil ||
+		operation.Actor.Type != models.ActorTypeServicePrincipal {
+		return
+	}
+	_ = b.native.FinalizeRevokedActorIdempotency(
 		ctx,
-		func(scopedContext context.Context) error {
-			return b.native.FailIdempotency(
-				scopedContext,
-				reservation.ID,
-				services.AgentNativeErrorCode(outcomeErr),
-			)
-		},
+		operation.Scope,
+		operation.Actor,
+		reservation.ID,
+		services.AgentNativeErrorCode(outcomeErr),
 	)
+}
+
+func (b *A2ABackend) revalidateA2AExecution(
+	ctx context.Context,
+	identity A2AExecutionIdentity,
+) error {
+	if b == nil || b.native == nil {
+		return errors.New("A2A project authorization is unavailable")
+	}
+	if identity.Actor.Type != models.ActorTypeServicePrincipal {
+		return services.ErrInvalidActor
+	}
+	access, err := b.native.RevalidatePrincipalProjectOperation(
+		ctx,
+		models.ScopeTasksManage,
+	)
+	if err != nil {
+		return err
+	}
+	if access.Scope != identity.Scope ||
+		access.Project.Key != models.ProjectKey(identity.ProjectKey) {
+		return services.ErrProjectAccessDenied
+	}
+	return nil
 }
 
 func validateA2AExecutionIdentity(
@@ -1310,17 +1381,22 @@ func (b *A2ABackend) ticketIntake(
 		AgentContext:         command.AgentContext,
 	}
 	reservation := a2aReservationFromContext(ctx)
-	result, err := b.native.CreateNativeTicket(ctx, services.NativeTicketCreateInput{
-		Request:             request,
-		Actor:               identity.Actor,
-		CredentialID:        identity.CredentialID,
-		SourceProtocol:      a2aSourceProtocol,
-		RequestDigest:       reservation.RequestDigest,
-		TrustLevel:          models.TicketTrustLevelUntrusted,
-		TraceID:             task.ID,
-		CorrelationID:       task.ContextID,
-		IdempotencyRecordID: reservation.ID,
-	})
+	result, err := runMachineTicketCreateDatabaseCommand(
+		ctx,
+		b.db,
+		b.native,
+		services.NativeTicketCreateInput{
+			Request:             request,
+			Actor:               identity.Actor,
+			CredentialID:        identity.CredentialID,
+			SourceProtocol:      a2aSourceProtocol,
+			RequestDigest:       reservation.RequestDigest,
+			TrustLevel:          models.TicketTrustLevelUntrusted,
+			TraceID:             task.ID,
+			CorrelationID:       task.ContextID,
+			IdempotencyRecordID: reservation.ID,
+		},
+	)
 	if err != nil {
 		return err
 	}
@@ -1986,6 +2062,7 @@ func (b *A2ABackend) reportDomainError(ctx context.Context, reporter a2a.Reporte
 		errors.Is(err, services.ErrPrincipalExpired):
 		return reportA2AState(ctx, reporter, a2a.TaskStateAuthRequired, "authentication_required", nil)
 	case errors.Is(err, services.ErrPolicyDenied),
+		errors.Is(err, services.ErrProjectAccessDenied),
 		errors.Is(err, services.ErrInvalidScope),
 		errors.Is(err, services.ErrGlobalEmergencyStop),
 		errors.Is(err, services.ErrReadOnlyMode):
@@ -2143,26 +2220,37 @@ func cloneA2AMap(source map[string]any) map[string]any {
 type A2AOutboxPushDispatcher struct {
 	db          *gorm.DB
 	native      *services.AgentNativeService
+	protector   security.Protector
 	actor       models.ActorRef
 	maxAttempts int
 }
 
+type A2AOutboxPushDispatcherOptions struct {
+	DB              *gorm.DB
+	Native          *services.AgentNativeService
+	SecretProtector security.Protector
+	MaxAttempts     int
+}
+
 func NewA2AOutboxPushDispatcher(
-	db *gorm.DB,
-	native *services.AgentNativeService,
-	maxAttempts int,
+	options A2AOutboxPushDispatcherOptions,
 ) (*A2AOutboxPushDispatcher, error) {
-	if db == nil || native == nil {
-		return nil, errors.New("A2A push dispatcher requires database and AgentNativeService")
+	if options.DB == nil ||
+		options.Native == nil ||
+		options.SecretProtector == nil {
+		return nil, errors.New(
+			"A2A push dispatcher requires database, AgentNativeService and secret protector",
+		)
 	}
-	if maxAttempts <= 0 {
-		maxAttempts = 8
+	if options.MaxAttempts <= 0 {
+		options.MaxAttempts = 8
 	}
 	return &A2AOutboxPushDispatcher{
-		db:          db,
-		native:      native,
+		db:          options.DB,
+		native:      options.Native,
+		protector:   options.SecretProtector,
 		actor:       models.SystemActor("a2a-push-dispatcher"),
-		maxAttempts: maxAttempts,
+		maxAttempts: options.MaxAttempts,
 	}, nil
 }
 
@@ -2237,6 +2325,98 @@ func (d *A2AOutboxPushDispatcher) EnqueueTx(
 	if existing > 0 {
 		return nil
 	}
+	var source models.AgentPushNotificationConfig
+	if err := tx.WithContext(workerContext).
+		Clauses(clause.Locking{Strength: "SHARE"}).
+		Where(
+			"id = ? AND task_id = ? AND organization_id = ? AND project_id = ?",
+			config.ID,
+			event.TaskID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		Take(&source).Error; err != nil {
+		return fmt.Errorf(
+			"load A2A push configuration for snapshot: %w",
+			err,
+		)
+	}
+	requestBody, err := json.Marshal(event.Payload)
+	if err != nil {
+		return fmt.Errorf("encode A2A push request snapshot: %w", err)
+	}
+	snapshot, err := models.NewA2APushDeliverySnapshot(
+		scope,
+		eventID,
+		event.TaskID,
+		source.ID,
+		source.UpdatedAt,
+		source.URL,
+		requestBody,
+		"application/a2a+json",
+		a2a.ProtocolVersion,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"create A2A push delivery snapshot: %w",
+			err,
+		)
+	}
+	snapshot.TokenCiphertext, err = rewrapA2APushSnapshotSecret(
+		d.protector,
+		source.Token,
+		security.FieldAAD(
+			"agent_push_notification_configs",
+			source.ID,
+			"token",
+		),
+		a2aPushSnapshotSecretAAD(*snapshot, "token"),
+		false,
+	)
+	if err != nil {
+		return fmt.Errorf("freeze A2A push token: %w", err)
+	}
+	var authenticationEnvelope string
+	if len(source.Authentication) > 0 &&
+		string(source.Authentication) != "null" {
+		if err := json.Unmarshal(
+			source.Authentication,
+			&authenticationEnvelope,
+		); err != nil {
+			return fmt.Errorf(
+				"freeze A2A push authentication: %w",
+				security.ErrPlaintextSecret,
+			)
+		}
+	}
+	snapshot.AuthenticationCiphertext, err =
+		rewrapA2APushSnapshotSecret(
+			d.protector,
+			authenticationEnvelope,
+			security.FieldAAD(
+				"agent_push_notification_configs",
+				source.ID,
+				"authentication",
+			),
+			a2aPushSnapshotSecretAAD(
+				*snapshot,
+				"authentication",
+			),
+			true,
+		)
+	if err != nil {
+		return fmt.Errorf(
+			"freeze A2A push authentication: %w",
+			err,
+		)
+	}
+	if err := tx.WithContext(workerContext).
+		Create(snapshot).Error; err != nil {
+		return fmt.Errorf(
+			"persist A2A push delivery snapshot: %w",
+			err,
+		)
+	}
 	resourceVersion := event.ResourceVersion
 	if resourceVersion == 0 && event.Payload.Task != nil && event.Payload.Task.Version > 0 {
 		resourceVersion = event.Payload.Task.Version
@@ -2258,22 +2438,84 @@ func (d *A2AOutboxPushDispatcher) EnqueueTx(
 			CorrelationID:   event.ContextID,
 			CausationID:     event.Cursor,
 			Data: map[string]any{
-				"a2a_task_id":      event.TaskID,
-				"a2a_context_id":   event.ContextID,
-				"a2a_event_cursor": event.Cursor,
-				"push_config_id":   config.ID,
-				"callback_url":     config.URL,
-				"stream_response":  event.Payload,
-				"contains_secrets": false,
+				"a2a_task_id":          event.TaskID,
+				"a2a_context_id":       event.ContextID,
+				"a2a_event_cursor":     event.Cursor,
+				"push_config_id":       source.ID,
+				"push_snapshot_id":     snapshot.ID,
+				"stream_response":      event.Payload,
+				"contains_secrets":     false,
+				"destination_snapshot": true,
 			},
 		},
 		[]services.OutboxTarget{{
-			Type:        "a2a_push",
-			ID:          config.ID,
+			Type: "a2a_push",
+			ID: a2aPushSnapshotDestinationPrefix +
+				snapshot.ID,
 			MaxAttempts: d.maxAttempts,
 		}},
 	)
 	return err
+}
+
+const a2aPushSnapshotDestinationPrefix = "snapshot:"
+
+func a2aPushSnapshotSecretAAD(
+	snapshot models.A2APushDeliverySnapshot,
+	field string,
+) []byte {
+	compositeID := fmt.Sprintf(
+		"organization=%d;project=%d;config_length=%d;config=%s;snapshot=%s",
+		snapshot.OrganizationID,
+		snapshot.ProjectID,
+		len(snapshot.PushConfigID),
+		snapshot.PushConfigID,
+		snapshot.ID,
+	)
+	return security.FieldAAD(
+		snapshot.TableName(),
+		compositeID,
+		field,
+	)
+}
+
+func rewrapA2APushSnapshotSecret(
+	protector security.Protector,
+	sourceEnvelope string,
+	sourceAAD []byte,
+	snapshotAAD []byte,
+	authentication bool,
+) (string, error) {
+	if sourceEnvelope == "" {
+		return "", nil
+	}
+	if protector == nil {
+		return "", security.ErrKeyringUnavailable
+	}
+	plaintext, err := protector.Open(sourceEnvelope, sourceAAD)
+	if err != nil {
+		return "", err
+	}
+	defer clear(plaintext)
+	if authentication {
+		var value a2a.AuthenticationInfo
+		if err := json.Unmarshal(plaintext, &value); err != nil {
+			return "", err
+		}
+		if strings.ContainsAny(
+			value.Scheme+value.Credentials,
+			"\r\n",
+		) {
+			return "", errors.New(
+				"A2A push authentication contains invalid characters",
+			)
+		}
+	} else if bytes.ContainsAny(plaintext, "\r\n") {
+		return "", errors.New(
+			"A2A push token contains invalid characters",
+		)
+	}
+	return protector.Seal(plaintext, snapshotAAD)
 }
 
 func stableA2APushEventID(taskID, cursor, pushConfigID string) string {

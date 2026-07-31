@@ -132,7 +132,7 @@ func TestHumanTicketDetailReturnsStrongETag(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	workflow, _, agent, _, ticket, _ := setupWorkflowHandlerTest(t)
 	handler := NewTicketHandler(workflow.ticketService)
-	router := humanTicketTestRouter(agent, func(router *gin.Engine) {
+	router := humanTicketTestRouter(agent, models.ProjectRoleAgent, func(router *gin.Engine) {
 		router.GET("/tickets/:id", handler.GetTicket)
 	})
 
@@ -165,7 +165,7 @@ func TestHumanTicketPutEnforcesIfMatch(t *testing.T) {
 				currentVersion:         ticket.Version,
 			}
 			handler := NewTicketHandler(service)
-			router := humanTicketTestRouter(agent, func(router *gin.Engine) {
+			router := humanTicketTestRouter(agent, models.ProjectRoleAgent, func(router *gin.Engine) {
 				router.PUT("/tickets/:id", handler.UpdateTicket)
 			})
 			request := httptest.NewRequest(
@@ -254,7 +254,7 @@ func TestHumanWorkflowCommandsEnforceIfMatch(t *testing.T) {
 					currentVersion:         ticket.Version,
 				}
 				handler := NewTicketWorkflowHandler(service)
-				router := humanTicketTestRouter(agent, func(router *gin.Engine) {
+				router := humanTicketTestRouter(agent, models.ProjectRoleAgent, func(router *gin.Engine) {
 					action.register(router, handler)
 				})
 				request := httptest.NewRequest(
@@ -313,8 +313,8 @@ func TestHumanTicketCreateTrimsRequiredTextAndRejectsBlankValues(t *testing.T) {
 			gin.SetMode(gin.TestMode)
 			service := &recordingCreateTicketService{}
 			handler := NewTicketHandler(service)
-			user := models.User{ID: 7, Role: models.RoleAdmin}
-			router := humanTicketTestRouter(user, func(router *gin.Engine) {
+			user := models.User{ID: 7, PlatformRole: models.PlatformRolePlatformAdmin}
+			router := humanTicketTestRouter(user, models.ProjectRoleAdmin, func(router *gin.Engine) {
 				router.POST("/tickets", handler.CreateTicket)
 			})
 			request := httptest.NewRequest(
@@ -355,8 +355,8 @@ func TestHumanTicketCreateMapsDomainMembershipDenialToForbidden(t *testing.T) {
 		err: services.ErrTicketCreateAccessDenied,
 	}
 	handler := NewTicketHandler(service)
-	user := models.User{ID: 7, Role: models.RoleAdmin}
-	router := humanTicketTestRouter(user, func(router *gin.Engine) {
+	user := models.User{ID: 7, PlatformRole: models.PlatformRolePlatformAdmin}
+	router := humanTicketTestRouter(user, models.ProjectRoleAdmin, func(router *gin.Engine) {
 		router.POST("/tickets", handler.CreateTicket)
 	})
 	request := httptest.NewRequest(
@@ -528,21 +528,13 @@ func assertHumanProblem(
 
 func humanTicketTestRouter(
 	user models.User,
+	projectRole models.ProjectRole,
 	register func(*gin.Engine),
 ) *gin.Engine {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", user.ID)
-		c.Set("user_role", string(user.Role))
-		projectRole := models.ProjectRoleRequester
-		switch user.Role {
-		case models.RoleAdmin:
-			projectRole = models.ProjectRoleAdmin
-		case models.RoleSupervisor:
-			projectRole = models.ProjectRoleManager
-		case models.RoleAgent:
-			projectRole = models.ProjectRoleAgent
-		}
+		c.Set("platform_role", user.PlatformRole)
 		c.Set(projectRoleContextKey, string(projectRole))
 		requestContext, err := services.WithOperationContext(
 			c.Request.Context(),

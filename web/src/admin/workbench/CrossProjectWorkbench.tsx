@@ -38,6 +38,7 @@ import {
   loadAuthorizedProjects,
   setActiveProjectKey,
 } from '@/lib/projectScope'
+import { humanApiRoutes } from '@/lib/generated/human-api'
 import type {
   CrossProjectTicketPriority,
   CrossProjectTicketStatus,
@@ -149,13 +150,12 @@ const CrossProjectWorkbench: React.FC = () => {
     const controller = new AbortController()
     setLoading(true)
     setError('')
-    const params = new URLSearchParams({
-      view,
-      page: String(page),
-      page_size: String(pageSize),
-    })
     void apiFetch<CrossProjectWorkbenchPage>(
-      `/workbench/tickets?${params.toString()}`,
+      humanApiRoutes.listCrossProjectWorkbenchTickets({
+        view,
+        page,
+        page_size: pageSize,
+      }),
       { signal: controller.signal },
     )
       .then((response) => {

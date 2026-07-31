@@ -101,7 +101,10 @@ func TestPostgresSeedDataCreatesDefaultAdministratorMembership(t *testing.T) {
 		t.Fatalf("load default project: %v", err)
 	}
 	var administrator models.User
-	if err := db.Where("role = ?", models.RoleAdmin).
+	if err := db.Where(
+		"platform_role = ?",
+		models.PlatformRolePlatformAdmin,
+	).
 		First(&administrator).Error; err != nil {
 		t.Fatalf("load initial administrator: %v", err)
 	}

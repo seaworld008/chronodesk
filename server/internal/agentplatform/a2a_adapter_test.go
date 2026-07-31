@@ -22,6 +22,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
+	"github.com/seaworld008/chronodesk/server/internal/security"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
@@ -338,6 +339,7 @@ func newA2AAdapterFixtureWithOptions(
 		&models.WorkflowVersion{},
 		&models.ConfigurationRelease{},
 		&models.User{},
+		&models.ProjectMembership{},
 		&models.Category{},
 		&models.ServicePrincipal{},
 		&models.AgentCredential{},
@@ -413,11 +415,20 @@ func newA2AAdapterFixtureWithOptions(
 		Username:     "a2a-compat",
 		Email:        "a2a-compat@example.com",
 		PasswordHash: "not-a-real-password",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatalf("create actor user: %v", err)
+	}
+	if err := db.Create(&models.ProjectMembership{
+		ProjectID: project.ID,
+		UserID:    user.ID,
+		Role:      models.ProjectRoleAgent,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
+		t.Fatalf("create assignable actor membership: %v", err)
 	}
 	native := services.NewAgentNativeService(db, options)
 	principal, err := native.CreateServicePrincipal(context.Background(), services.CreateServicePrincipalInput{
@@ -3089,7 +3100,21 @@ func TestA2ABackendPolicyDenialBecomesRejectedWithoutMutation(t *testing.T) {
 
 func TestA2APushDispatcherCreatesOnlyDurableOutboxWork(t *testing.T) {
 	fixture := newA2AAdapterFixture(t)
-	dispatcher, err := NewA2AOutboxPushDispatcher(fixture.db, fixture.native, 5)
+	protector := newA2APushTestProtector(t)
+	if err := fixture.db.AutoMigrate(
+		&models.AgentPushNotificationConfig{},
+		&models.A2APushDeliverySnapshot{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	dispatcher, err := NewA2AOutboxPushDispatcher(
+		A2AOutboxPushDispatcherOptions{
+			DB:              fixture.db,
+			Native:          fixture.native,
+			SecretProtector: protector,
+			MaxAttempts:     5,
+		},
+	)
 	if err != nil {
 		t.Fatalf("create push dispatcher: %v", err)
 	}
@@ -3109,13 +3134,61 @@ func TestA2APushDispatcherCreatesOnlyDurableOutboxWork(t *testing.T) {
 		}},
 	}
 	config := a2a.PushNotificationConfig{
-		ID:    "push-config-1",
-		URL:   "https://hooks.example.com/a2a",
-		Token: "secret-token",
+		ID:     "push-config-1",
+		TaskID: event.TaskID,
+		URL:    "https://hooks.example.com/a2a",
+		Token:  "secret-token",
 		Authentication: &a2a.AuthenticationInfo{
 			Scheme:      "Bearer",
 			Credentials: "secret-credential",
 		},
+	}
+	tokenEnvelope, err := security.ProtectOptional(
+		protector,
+		config.Token,
+		security.FieldAAD(
+			"agent_push_notification_configs",
+			config.ID,
+			"token",
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authentication, err := json.Marshal(config.Authentication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticationEnvelope, err := security.ProtectOptional(
+		protector,
+		string(authentication),
+		security.FieldAAD(
+			"agent_push_notification_configs",
+			config.ID,
+			"authentication",
+		),
+	)
+	clear(authentication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedAuthentication, err := json.Marshal(
+		authenticationEnvelope,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := models.AgentPushNotificationConfig{
+		ID:             config.ID,
+		OrganizationID: fixture.project.OrganizationID,
+		ProjectID:      fixture.project.ID,
+		TaskID:         config.TaskID,
+		URL:            config.URL,
+		Token:          tokenEnvelope,
+		Authentication: datatypes.JSON(storedAuthentication),
+	}
+	if err := fixture.db.Create(&source).Error; err != nil {
+		t.Fatal(err)
 	}
 	ctx := a2aFixtureContext(t, fixture)
 	if err := dispatcher.Enqueue(ctx, config, event); err != nil {
@@ -3148,16 +3221,103 @@ func TestA2APushDispatcherCreatesOnlyDurableOutboxWork(t *testing.T) {
 			event.ResourceVersion,
 		)
 	}
-	if strings.Contains(string(events[0].Data), "secret-token") ||
-		strings.Contains(string(events[0].Data), "secret-credential") {
-		t.Fatalf("push secrets leaked into domain event: %s", events[0].Data)
+	for _, forbidden := range []string{
+		"secret-token",
+		"secret-credential",
+		config.URL,
+	} {
+		if strings.Contains(string(events[0].Data), forbidden) {
+			t.Fatalf(
+				"push delivery data leaked into domain event: %s",
+				events[0].Data,
+			)
+		}
+	}
+	var snapshot models.A2APushDeliverySnapshot
+	if err := fixture.db.First(
+		&snapshot,
+		"event_id = ? AND push_config_id = ?",
+		events[0].ID,
+		config.ID,
+	).Error; err != nil {
+		t.Fatalf("load A2A push delivery snapshot: %v", err)
+	}
+	if snapshot.CallbackURL != config.URL ||
+		!snapshot.ConfigVersionAt.Equal(source.UpdatedAt.UTC()) ||
+		snapshot.TokenCiphertext == tokenEnvelope ||
+		snapshot.AuthenticationCiphertext ==
+			authenticationEnvelope {
+		t.Fatalf(
+			"A2A push snapshot did not freeze/re-wrap source: %+v",
+			snapshot,
+		)
+	}
+	revealedToken, err := security.RevealOptional(
+		protector,
+		snapshot.TokenCiphertext,
+		a2aPushSnapshotSecretAAD(snapshot, "token"),
+	)
+	if err != nil || revealedToken != config.Token {
+		t.Fatalf(
+			"reveal frozen A2A token = %q, %v",
+			revealedToken,
+			err,
+		)
+	}
+	revealedAuthentication, err := security.RevealOptional(
+		protector,
+		snapshot.AuthenticationCiphertext,
+		a2aPushSnapshotSecretAAD(
+			snapshot,
+			"authentication",
+		),
+	)
+	if err != nil ||
+		!strings.Contains(
+			revealedAuthentication,
+			"secret-credential",
+		) {
+		t.Fatalf(
+			"reveal frozen A2A authentication = %q, %v",
+			revealedAuthentication,
+			err,
+		)
+	}
+	for _, altered := range []models.A2APushDeliverySnapshot{
+		func() models.A2APushDeliverySnapshot {
+			value := snapshot
+			value.ProjectID++
+			return value
+		}(),
+		func() models.A2APushDeliverySnapshot {
+			value := snapshot
+			value.PushConfigID += "-other"
+			return value
+		}(),
+		func() models.A2APushDeliverySnapshot {
+			value := snapshot
+			value.ID = "019fb4a6-0000-7000-8000-000000000099"
+			return value
+		}(),
+	} {
+		if _, err := security.RevealOptional(
+			protector,
+			snapshot.TokenCiphertext,
+			a2aPushSnapshotSecretAAD(altered, "token"),
+		); !errors.Is(err, security.ErrAuthentication) {
+			t.Fatalf(
+				"altered snapshot AAD error = %v",
+				err,
+			)
+		}
 	}
 	var delivery models.OutboxDelivery
 	if err := fixture.db.First(&delivery, "event_id = ?", events[0].ID).Error; err != nil {
 		t.Fatalf("load push outbox delivery: %v", err)
 	}
 	if delivery.DestinationType != "a2a_push" ||
-		delivery.DestinationID != config.ID ||
+		delivery.DestinationID !=
+			a2aPushSnapshotDestinationPrefix+snapshot.ID ||
 		delivery.OrganizationID != fixture.project.OrganizationID ||
 		delivery.ProjectID != fixture.project.ID ||
 		delivery.Status != models.OutboxDeliveryPending ||
@@ -3212,6 +3372,148 @@ func TestA2ATaskEventRollsBackWhenPushOutboxCannotBeCreated(t *testing.T) {
 	}
 	if eventCount != 0 {
 		t.Fatalf("task event committed without its push Outbox: %d", eventCount)
+	}
+}
+
+func TestA2APushSnapshotRollsBackWithEventAndOutbox(t *testing.T) {
+	fixture := newA2AAdapterFixture(t)
+	protector := newA2APushTestProtector(t)
+	store := a2a.NewGormStoreWithProtector(
+		fixture.db,
+		protector,
+	)
+	if err := store.AutoMigrate(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	task := a2a.Task{
+		ID:        "task-snapshot-rollback",
+		ContextID: "context-snapshot-rollback",
+		Status: a2a.TaskStatus{
+			State:     a2a.TaskStateWorking,
+			Timestamp: now,
+		},
+		StatusHistory: []a2a.TaskStatus{{
+			State:     a2a.TaskStateWorking,
+			Timestamp: now,
+		}},
+		CreatedAt:    now,
+		LastModified: now,
+		Version:      1,
+	}
+	ctx := a2aFixtureContext(t, fixture)
+	if err := store.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreatePushConfig(
+		ctx,
+		a2a.PushNotificationConfig{
+			ID:     "push-snapshot-rollback",
+			TaskID: task.ID,
+			URL:    "https://rollback.example.test/a2a",
+			Token:  "rollback-token",
+			Authentication: &a2a.AuthenticationInfo{
+				Scheme:      "Bearer",
+				Credentials: "rollback-credential",
+			},
+			CreatedAt: now,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	dispatcher, err := NewA2AOutboxPushDispatcher(
+		A2AOutboxPushDispatcherOptions{
+			DB:              fixture.db,
+			Native:          fixture.native,
+			SecretProtector: protector,
+			MaxAttempts:     3,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	countModels := map[string]any{
+		"task events":       &models.AgentTaskEvent{},
+		"domain events":     &models.DomainEvent{},
+		"outbox deliveries": &models.OutboxDelivery{},
+		"push snapshots":    &models.A2APushDeliverySnapshot{},
+	}
+	countsBefore := make(map[string]int64, len(countModels))
+	for name, model := range countModels {
+		var count int64
+		if err := fixture.db.Model(model).
+			Where(
+				"organization_id = ? AND project_id = ?",
+				fixture.project.OrganizationID,
+				fixture.project.ID,
+			).
+			Count(&count).Error; err != nil {
+			t.Fatalf("count %s before rollback: %v", name, err)
+		}
+		countsBefore[name] = count
+	}
+	callbackName := "test:fail_a2a_push_outbox_after_snapshot"
+	if err := fixture.db.Callback().
+		Create().
+		Before("gorm:create").
+		Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement != nil &&
+				tx.Statement.Schema != nil &&
+				tx.Statement.Schema.Table ==
+					"outbox_deliveries" {
+				tx.AddError(errors.New(
+					"simulated A2A push Outbox failure",
+				))
+			}
+		}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = fixture.db.Callback().
+			Create().
+			Remove(callbackName)
+	})
+
+	_, err = store.AppendEventWithPush(
+		ctx,
+		a2a.StoredEvent{
+			TaskID:    task.ID,
+			ContextID: task.ContextID,
+			Payload: a2a.StreamResponse{
+				StatusUpdate: &a2a.TaskStatusUpdateEvent{
+					TaskID:    task.ID,
+					ContextID: task.ContextID,
+					Status: a2a.TaskStatus{
+						State:     a2a.TaskStateWorking,
+						Timestamp: now,
+					},
+				},
+			},
+			CreatedAt: now,
+		},
+		dispatcher,
+	)
+	if err == nil {
+		t.Fatal("A2A push event committed after Outbox failure")
+	}
+	for name, model := range countModels {
+		var count int64
+		if err := fixture.db.Model(model).
+			Where("organization_id = ? AND project_id = ?",
+				fixture.project.OrganizationID,
+				fixture.project.ID,
+			).
+			Count(&count).Error; err != nil {
+			t.Fatalf("count %s: %v", name, err)
+		}
+		if count != countsBefore[name] {
+			t.Fatalf(
+				"A2A push rollback changed %s count %d -> %d",
+				name,
+				countsBefore[name],
+				count,
+			)
+		}
 	}
 }
 

@@ -94,7 +94,7 @@ func TestInternalHandlerErrorsStayInServerLogs(t *testing.T) {
 		router := gin.New()
 		router.GET("/tickets/stats", func(c *gin.Context) {
 			c.Set("user_id", uint(7))
-			c.Set("user_role", string(models.RoleAdmin))
+			c.Set("platform_role", models.PlatformRolePlatformAdmin)
 			handler.GetTicketStats(c)
 		})
 

@@ -278,7 +278,7 @@ func (h *TicketHandler) CreateTicket(c *gin.Context) {
 
 	// 解析请求体
 	var req models.TicketCreateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		h.response.BadRequest(c, "请求格式错误")
 		return
 	}
@@ -386,7 +386,7 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 
 	// 解析请求体
 	var req models.TicketUpdateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		h.response.BadRequest(c, "请求格式错误")
 		return
 	}
@@ -528,7 +528,7 @@ func (h *TicketHandler) BulkUpdateTickets(c *gin.Context) {
 		Tickets []services.TicketVersionPrecondition `json:"tickets" binding:"required,min=1,max=100,dive"`
 		Updates models.TicketUpdateRequest           `json:"updates" binding:"required"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		h.response.Error(c, http.StatusBadRequest, "invalid_request", "请求格式无效")
 		return
 	}
@@ -597,7 +597,7 @@ func (h *TicketHandler) BulkDeleteTickets(c *gin.Context) {
 	var req struct {
 		Tickets []services.TicketVersionPrecondition `json:"tickets" binding:"required,min=1,max=100,dive"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		h.response.Error(c, http.StatusBadRequest, "invalid_request", "请求格式无效")
 		return
 	}

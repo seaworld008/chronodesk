@@ -64,7 +64,7 @@ func (h *TicketWorkflowHandler) AssignTicket(c *gin.Context) {
 	}
 
 	var req AssignRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数无效",
@@ -125,7 +125,7 @@ func (h *TicketWorkflowHandler) TransferTicket(c *gin.Context) {
 	}
 
 	var req TransferRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数无效",
@@ -187,7 +187,7 @@ func (h *TicketWorkflowHandler) EscalateTicket(c *gin.Context) {
 	}
 
 	var req EscalationRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数无效",
@@ -249,7 +249,7 @@ func (h *TicketWorkflowHandler) UpdateTicketStatus(c *gin.Context) {
 	}
 
 	var req StatusUpdateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "请求参数无效",

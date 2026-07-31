@@ -22,7 +22,7 @@ func setupStatsTestDB(t *testing.T) *gorm.DB {
 		Username:     "admin",
 		Email:        "admin@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
@@ -94,6 +94,13 @@ func TestGetTicketStatistics_Aggregates(t *testing.T) {
 	db := setupStatsTestDB(t)
 	svc := newTicketServiceForTest(t, db)
 	ctx := testProjectOperationContext(t, db, models.HumanActor(1))
+	ensureTestHumanProjectRole(
+		t,
+		db,
+		ctx,
+		1,
+		models.ProjectRoleAdmin,
+	)
 
 	stats, err := svc.GetTicketStatistics(ctx, 1, string(models.ProjectRoleAdmin))
 	if err != nil {

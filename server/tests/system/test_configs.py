@@ -34,7 +34,7 @@ _RESTORABLE_CONFIG_FIELDS = {
 
 def _export_configs(admin_api: APIClient) -> bytes:
     response = admin_api.get_json(
-        "/admin/configs/export",
+        "/platform/configs/export",
         params={"format": "json"},
     )
     assert response.status_code == 200, response_diagnostic(response)
@@ -51,7 +51,7 @@ def _import_configs(
     operation: str,
 ) -> None:
     response = admin_api.post_multipart(
-        "/admin/configs/import",
+        "/platform/configs/import",
         files={
             "file": (
                 "configs.json",
@@ -86,7 +86,7 @@ def _config_state(snapshot: bytes) -> dict[str, dict[str, Any]]:
 
 
 def _delete_config(admin_api: APIClient, key: str) -> None:
-    response = admin_api.delete(f"/admin/configs/{quote(key, safe='')}")
+    response = admin_api.delete(f"/platform/configs/{quote(key, safe='')}")
     assert response.status_code in (200, 404), response_diagnostic(response)
     if response.status_code == 200:
         assert response.json().get("success") is True, response_diagnostic(response)
@@ -172,31 +172,33 @@ class TestSystemConfigs:
         original_snapshot = _export_configs(admin_api)
         original_state = _config_state(original_snapshot)
 
-        list_resp = admin_api.get_json("/admin/configs", params={"page": 1})
+        list_resp = admin_api.get_json("/platform/configs", params={"page": 1})
         assert list_resp.status_code == 200, response_diagnostic(list_resp)
         assert list_resp.json().get("success") is True, response_diagnostic(list_resp)
 
         try:
-            create_resp = admin_api.post_json("/admin/configs", config_payload)
+            create_resp = admin_api.post_json("/platform/configs", config_payload)
             assert create_resp.status_code == 201, response_diagnostic(create_resp)
             created = create_resp.json().get("data", {})
             created_key = created.get("key")
             assert created_key == config_payload["key"], safe_diagnostic(created)
 
             encoded_key = quote(created_key, safe="")
-            detail_resp = admin_api.get_json(f"/admin/configs/{encoded_key}")
+            detail_resp = admin_api.get_json(f"/platform/configs/{encoded_key}")
             assert detail_resp.status_code == 200, response_diagnostic(detail_resp)
             detail_body = detail_resp.json()
             assert detail_body.get("success") is True, response_diagnostic(detail_resp)
             assert detail_body.get("data", {}).get("value") == config_payload["value"]
 
             update_payload = {
-                **config_payload,
                 "value": "pytest-updated",
+                "value_type": config_payload["value_type"],
                 "description": "Updated via automated test.",
+                "category": config_payload["category"],
+                "group": config_payload["group"],
             }
             update_resp = admin_api.put_json(
-                f"/admin/configs/{encoded_key}", update_payload
+                f"/platform/configs/{encoded_key}", update_payload
             )
             assert update_resp.status_code == 200, response_diagnostic(update_resp)
             assert (
@@ -214,11 +216,14 @@ class TestSystemConfigs:
                     "group": "pytest",
                 }
             ]
-            batch_resp = admin_api.put_json("/admin/configs/batch", batch_payload)
+            batch_resp = admin_api.put_json(
+                "/platform/configs/batch",
+                batch_payload,
+            )
             assert batch_resp.status_code == 200, response_diagnostic(batch_resp)
             assert batch_resp.json().get("data", {}).get("updated_count") == 1
 
-            detail_resp = admin_api.get_json(f"/admin/configs/{encoded_key}")
+            detail_resp = admin_api.get_json(f"/platform/configs/{encoded_key}")
             assert detail_resp.status_code == 200, response_diagnostic(detail_resp)
             value = detail_resp.json().get("data", {}).get("value")
             if isinstance(value, str):
@@ -226,7 +231,7 @@ class TestSystemConfigs:
             else:
                 assert value is True
 
-            policy_resp = admin_api.get_json("/admin/configs/security-policy")
+            policy_resp = admin_api.get_json("/platform/configs/security-policy")
             assert policy_resp.status_code == 200, response_diagnostic(policy_resp)
             assert "password_policy" in policy_resp.json().get("data", {})
 
@@ -237,7 +242,7 @@ class TestSystemConfigs:
                 operation="回灌本轮导出配置",
             )
 
-            init_resp = admin_api.post_json("/admin/configs/init", {})
+            init_resp = admin_api.post_json("/platform/configs/init", {})
             assert init_resp.status_code == 200, response_diagnostic(init_resp)
             assert init_resp.json().get("success") is True, response_diagnostic(
                 init_resp

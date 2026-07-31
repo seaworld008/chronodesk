@@ -37,6 +37,365 @@ type recordingSLAEscalationConsumer struct {
 	event services.CloudEventEnvelope
 }
 
+type recordingWebSocketAccessRevoker struct {
+	membershipScope models.ProjectScope
+	membershipUser  uint
+	user            uint
+	projectScope    models.ProjectScope
+}
+
+type recordingAttachmentOutboxConsumer struct {
+	uploaded uint
+	cleaned  uint
+}
+
+func (consumer *recordingAttachmentOutboxConsumer) ExecuteAttachmentUploadOutbox(
+	_ context.Context,
+	attachmentID uint,
+) error {
+	consumer.uploaded = attachmentID
+	return nil
+}
+
+func (consumer *recordingAttachmentOutboxConsumer) ExecuteAttachmentStagingCleanupOutbox(
+	_ context.Context,
+	attachmentID uint,
+) error {
+	consumer.cleaned = attachmentID
+	return nil
+}
+
+func (revoker *recordingWebSocketAccessRevoker) RevokeProjectMembership(
+	scope models.ProjectScope,
+	userID uint,
+) error {
+	revoker.membershipScope = scope
+	revoker.membershipUser = userID
+	return nil
+}
+
+func (revoker *recordingWebSocketAccessRevoker) RevokeUser(
+	userID uint,
+) error {
+	revoker.user = userID
+	return nil
+}
+
+func (revoker *recordingWebSocketAccessRevoker) RevokeProject(
+	scope models.ProjectScope,
+) error {
+	revoker.projectScope = scope
+	return nil
+}
+
+func TestEventStreamOutboxDispatchesCommittedWebSocketAccessRevocations(
+	t *testing.T,
+) {
+	db, err := gorm.Open(
+		sqlite.Open("file:websocket-access-revocation-outbox?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := models.ProjectScope{OrganizationID: 7, ProjectID: 70}
+	tests := []struct {
+		name      string
+		eventType string
+		data      string
+		assert    func(*testing.T, *recordingWebSocketAccessRevoker)
+	}{
+		{
+			name:      "membership",
+			eventType: services.ProjectMembershipDeactivatedEventType,
+			data:      `{"user_id":101}`,
+			assert: func(
+				t *testing.T,
+				revoker *recordingWebSocketAccessRevoker,
+			) {
+				t.Helper()
+				if revoker.membershipScope != scope ||
+					revoker.membershipUser != 101 {
+					t.Fatalf(
+						"membership revocation = scope %+v user %d",
+						revoker.membershipScope,
+						revoker.membershipUser,
+					)
+				}
+			},
+		},
+		{
+			name:      "user",
+			eventType: services.UserAccessRevokedEventType,
+			data:      `{"user_id":202}`,
+			assert: func(
+				t *testing.T,
+				revoker *recordingWebSocketAccessRevoker,
+			) {
+				t.Helper()
+				if revoker.user != 202 {
+					t.Fatalf("user revocation = %d, want 202", revoker.user)
+				}
+			},
+		},
+		{
+			name:      "project",
+			eventType: services.ProjectAccessRevokedEventType,
+			data:      `{}`,
+			assert: func(
+				t *testing.T,
+				revoker *recordingWebSocketAccessRevoker,
+			) {
+				t.Helper()
+				if revoker.projectScope != scope {
+					t.Fatalf(
+						"project revocation = %+v, want %+v",
+						revoker.projectScope,
+						scope,
+					)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			revoker := &recordingWebSocketAccessRevoker{}
+			deliverer, err := NewNativeOutboxDeliverer(
+				NativeOutboxDelivererOptions{
+					DB:                db,
+					AccessRevocations: revoker,
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			delivery := &models.OutboxDelivery{
+				ID:              "access-revocation-" + test.name,
+				OrganizationID:  scope.OrganizationID,
+				ProjectID:       scope.ProjectID,
+				EventID:         "access-event-" + test.name,
+				DestinationType: "event_stream",
+				DestinationID:   "access-revocation",
+			}
+			event := services.CloudEventEnvelope{
+				ID:             delivery.EventID,
+				Type:           test.eventType,
+				OrganizationID: scope.OrganizationID,
+				ProjectID:      scope.ProjectID,
+				Data:           []byte(test.data),
+			}
+			if err := deliverer.Deliver(
+				agentplatformTestOutboxWorkerContext(t, scope),
+				delivery,
+				event,
+			); err != nil {
+				t.Fatalf("deliver committed revocation: %v", err)
+			}
+			test.assert(t, revoker)
+		})
+	}
+
+	deliverer, err := NewNativeOutboxDeliverer(
+		NativeOutboxDelivererOptions{DB: db},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery := &models.OutboxDelivery{
+		ID:              "missing-access-revoker",
+		OrganizationID:  scope.OrganizationID,
+		ProjectID:       scope.ProjectID,
+		EventID:         "missing-access-revoker-event",
+		DestinationType: "event_stream",
+		DestinationID:   "access-revocation",
+	}
+	event := services.CloudEventEnvelope{
+		ID:             delivery.EventID,
+		Type:           services.UserAccessRevokedEventType,
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		Data:           []byte(`{"user_id":303}`),
+	}
+	if err := deliverer.Deliver(
+		agentplatformTestOutboxWorkerContext(t, scope),
+		delivery,
+		event,
+	); err == nil || !strings.Contains(err.Error(), "consumer is unavailable") {
+		t.Fatalf("missing access-revocation consumer error = %v", err)
+	}
+}
+
+func TestProjectArchiveOutboxWorkerRevokesWebSocketProjectAccess(
+	t *testing.T,
+) {
+	db, err := gorm.Open(
+		sqlite.Open("file:project-archive-websocket-outbox?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.Organization{},
+		&models.BusinessUnit{},
+		&models.Project{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
+		&models.AuditChainHead{},
+		&models.AuditLedgerEntry{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	organization := models.Organization{
+		Slug:   "archive-ws",
+		Name:   "Archive WebSocket",
+		Status: models.OrganizationStatusActive,
+	}
+	if err := db.Create(&organization).Error; err != nil {
+		t.Fatal(err)
+	}
+	unit := models.BusinessUnit{
+		OrganizationID: organization.ID,
+		Key:            "ARCHIVE",
+		Name:           "Archive",
+		Status:         models.BusinessUnitStatusActive,
+	}
+	if err := db.Create(&unit).Error; err != nil {
+		t.Fatal(err)
+	}
+	project := models.Project{
+		OrganizationID: organization.ID,
+		BusinessUnitID: unit.ID,
+		Key:            "ARCHIVE",
+		Name:           "Archive",
+		Status:         models.ProjectStatusActive,
+	}
+	if err := db.Create(&project).Error; err != nil {
+		t.Fatal(err)
+	}
+	user := models.User{
+		Username:     "archive-ws-admin",
+		Email:        "archive-ws-admin@example.test",
+		PasswordHash: "hash",
+		PlatformRole: models.PlatformRolePlatformAdmin,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := services.NewAuditLedgerService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	native := services.NewAgentNativeService(
+		db,
+		services.AgentNativeOptions{AuditLedger: ledger},
+	)
+	projectService, err := services.NewProjectService(db, native)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := projectService.ArchiveProject(
+		context.Background(),
+		project.PublicID,
+		models.HumanActor(user.ID),
+	); err != nil {
+		t.Fatalf("archive project: %v", err)
+	}
+	revoker := &recordingWebSocketAccessRevoker{}
+	deliverer, err := NewNativeOutboxDeliverer(
+		NativeOutboxDelivererOptions{
+			DB:                db,
+			AccessRevocations: revoker,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := native.ProcessOutboxBatch(
+		context.Background(),
+		"project-archive-websocket-worker",
+		10,
+		deliverer,
+	)
+	if err != nil {
+		t.Fatalf("process project archive Outbox: %v", err)
+	}
+	if batch.Claimed != 1 ||
+		batch.Delivered != 1 ||
+		batch.Failed != 0 {
+		t.Fatalf("project archive Outbox batch = %+v", batch)
+	}
+	if revoker.projectScope != project.Scope() {
+		t.Fatalf(
+			"project revocation scope = %+v, want %+v",
+			revoker.projectScope,
+			project.Scope(),
+		)
+	}
+}
+
+func TestAttachmentStagingCleanupOutboxUsesDedicatedConsumerMethod(
+	t *testing.T,
+) {
+	db, err := gorm.Open(
+		sqlite.Open("file:attachment-staging-cleanup-routing?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer := &recordingAttachmentOutboxConsumer{}
+	deliverer, err := NewNativeOutboxDeliverer(
+		NativeOutboxDelivererOptions{
+			DB:                db,
+			AttachmentUploads: consumer,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := models.ProjectScope{OrganizationID: 7, ProjectID: 70}
+	delivery := &models.OutboxDelivery{
+		ID:              "attachment-staging-cleanup",
+		OrganizationID:  scope.OrganizationID,
+		ProjectID:       scope.ProjectID,
+		EventID:         "attachment-staging-cleanup-event",
+		DestinationType: services.AttachmentStagingCleanupOutboxDestination,
+		DestinationID:   "42",
+	}
+	event := services.CloudEventEnvelope{
+		ID:             delivery.EventID,
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+	}
+	if err := deliverer.Deliver(
+		agentplatformTestOutboxWorkerContext(t, scope),
+		delivery,
+		event,
+	); err != nil {
+		t.Fatalf("deliver attachment staging cleanup: %v", err)
+	}
+	if consumer.cleaned != 42 || consumer.uploaded != 0 {
+		t.Fatalf(
+			"attachment consumer calls = cleanup %d upload %d",
+			consumer.cleaned,
+			consumer.uploaded,
+		)
+	}
+
+	delivery.DestinationID = "0"
+	if err := deliverer.Deliver(
+		agentplatformTestOutboxWorkerContext(t, scope),
+		delivery,
+		event,
+	); err == nil || !strings.Contains(err.Error(), "destination is invalid") {
+		t.Fatalf("invalid staging cleanup destination error = %v", err)
+	}
+}
+
 func TestNativeOutboxDelivererRequiresTrustedMatchingWorkerBoundary(
 	t *testing.T,
 ) {
@@ -201,7 +560,7 @@ func TestAttachmentCleanupOutboxRetriesAfterCommitAndIsIdempotent(t *testing.T) 
 	}
 	user := models.User{
 		Username: "cleanup-owner", Email: "cleanup-owner@example.com",
-		PasswordHash: "hash", Role: models.RoleAdmin, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRolePlatformAdmin, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
@@ -244,6 +603,7 @@ func TestAttachmentCleanupOutboxRetriesAfterCommitAndIsIdempotent(t *testing.T) 
 	native := services.NewAgentNativeService(db, services.AgentNativeOptions{
 		Now:               func() time.Time { return now },
 		AttachmentStorage: local,
+		AttachmentStaging: local,
 		DefaultOutboxTargets: []services.OutboxTarget{{
 			Type: "event_stream", ID: "default", MaxAttempts: 8,
 		}},
@@ -382,7 +742,7 @@ func TestAttachmentCleanupOutboxRejectsPathTraversal(t *testing.T) {
 	}
 	user := models.User{
 		Username: "traversal-owner", Email: "traversal-owner@example.com",
-		PasswordHash: "hash", Role: models.RoleAdmin, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRolePlatformAdmin, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
@@ -623,7 +983,7 @@ func TestOutboxWebhookDeliveryUsesOneBoundedAttemptWithoutLocalRetry(t *testing.
 		Username:     "outbox-owner",
 		Email:        "outbox-owner@example.com",
 		PasswordHash: "not-a-real-password",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
@@ -845,7 +1205,7 @@ func TestCommittedWebhookDeliveriesUseImmutableSnapshots(t *testing.T) {
 		Username:     "snapshot-owner",
 		Email:        "snapshot-owner@example.test",
 		PasswordHash: "not-a-real-password",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {

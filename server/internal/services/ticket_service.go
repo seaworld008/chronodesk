@@ -12,6 +12,7 @@ import (
 
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 
 	"gorm.io/gorm"
 )
@@ -137,6 +138,16 @@ type TicketStatisticsResponse struct {
 	Escalated    int64            `json:"escalated"`
 	ByPriority   map[string]int64 `json:"by_priority"`
 	ByCategory   map[string]int64 `json:"by_category"`
+}
+
+type ticketStatisticsCacheEnvelope struct {
+	OrganizationID    uint                     `json:"organization_id"`
+	ProjectID         uint                     `json:"project_id"`
+	UserID            uint                     `json:"user_id"`
+	ProjectRole       models.ProjectRole       `json:"project_role"`
+	MembershipID      uint                     `json:"membership_id"`
+	MembershipVersion uint64                   `json:"membership_version"`
+	Statistics        TicketStatisticsResponse `json:"statistics"`
 }
 
 // TicketVersionPrecondition binds a bulk command to the exact list snapshot
@@ -349,24 +360,6 @@ func (s *TicketService) CreateTicket(ctx context.Context, req *models.TicketCrea
 			"human ticket actor does not match operation context",
 		)
 	}
-	role, err := s.projects.activeHumanMembershipRole(
-		ctx,
-		operation.Scope,
-		userID,
-	)
-	if err != nil {
-		if errors.Is(err, ErrProjectAccessDenied) {
-			return nil, ErrTicketCreateAccessDenied
-		}
-		return nil, err
-	}
-	if !humanProjectRoleCanCreateTicket(role) {
-		return nil, ErrTicketCreateAccessDenied
-	}
-	if role == models.ProjectRoleRequester &&
-		(req.Status != nil || req.AssignedToID != nil) {
-		return nil, ErrTicketCreateAccessDenied
-	}
 	request := *req
 	if request.Source == "" {
 		request.Source = models.TicketSourceWeb
@@ -376,17 +369,50 @@ func (s *TicketService) CreateTicket(ctx context.Context, req *models.TicketCrea
 		actor := models.HumanActor(*request.AssignedToID)
 		assignedActor = &actor
 	}
-	result, err := s.agentNative.CreateNativeTicket(ctx, NativeTicketCreateInput{
-		Request:        request,
-		Actor:          models.HumanActor(userID),
-		AssignedActor:  assignedActor,
-		SourceProtocol: "rest-human",
-		TrustLevel:     models.TicketTrustLevelUntrusted,
-	})
+	var created *models.Ticket
+	_, err = s.projects.RunHumanTicketCreateDatabaseCommand(
+		ctx,
+		operation.Scope,
+		userID,
+		func(
+			commandContext context.Context,
+			_ *gorm.DB,
+			access *ProjectAccess,
+		) error {
+			if access == nil ||
+				(access.Role == models.ProjectRoleRequester &&
+					(request.Status != nil ||
+						request.AssignedToID != nil)) {
+				return ErrTicketCreateAccessDenied
+			}
+			result, createErr :=
+				s.agentNative.CreateNativeTicket(
+					commandContext,
+					NativeTicketCreateInput{
+						Request: request,
+						Actor: models.HumanActor(
+							userID,
+						),
+						AssignedActor:  assignedActor,
+						SourceProtocol: "rest-human",
+						TrustLevel: models.
+							TicketTrustLevelUntrusted,
+					},
+				)
+			if createErr != nil {
+				return createErr
+			}
+			created, createErr = s.GetTicket(
+				commandContext,
+				result.Ticket.ID,
+			)
+			return createErr
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
-	return s.GetTicket(ctx, result.Ticket.ID)
+	return created, nil
 }
 
 func humanProjectRoleCanCreateTicket(role models.ProjectRole) bool {
@@ -737,32 +763,152 @@ func (s *TicketService) GetTicketStatistics(
 	userID uint,
 	role string,
 ) (*TicketStatisticsResponse, error) {
-	scope, err := RequireProjectScope(ctx)
+	if err := requireExternalIOOutsideProjectTransaction(
+		ctx,
+		"ticket statistics operation",
+	); err != nil {
+		return nil, err
+	}
+	operation, err := OperationContextFromContext(ctx)
 	if err != nil {
 		return nil, err
 	}
+	actorUserID, err := humanActorUserID(operation.Actor)
+	if err != nil ||
+		operation.Source != SourceProtocolHumanREST ||
+		actorUserID != userID {
+		return nil, ErrProjectAccessDenied
+	}
+	projectRole := models.ProjectRole(strings.TrimSpace(role))
+	if !projectRole.IsValid() {
+		return nil, ErrProjectAccessDenied
+	}
+	scope := operation.Scope
+	initialAccess, err := s.revalidateTicketStatisticsAccess(
+		ctx,
+		scope,
+		userID,
+		projectRole,
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	cacheKey := ""
 	if s.statsCache != nil && s.statsCacheTTL > 0 {
-		cacheKey = fmt.Sprintf(
-			"ticket_stats:%d:%s:%d",
-			scope.ProjectID,
-			role,
-			userID,
-		)
+		cacheKey = ticketStatisticsCacheKey(initialAccess, userID)
 		if cached, err := s.statsCache.Get(ctx, cacheKey); err == nil && cached != "" {
-			var cachedStats TicketStatisticsResponse
-			if err := json.Unmarshal([]byte(cached), &cachedStats); err == nil {
-				if cachedStats.ByPriority == nil {
-					cachedStats.ByPriority = make(map[string]int64)
+			var envelope ticketStatisticsCacheEnvelope
+			if err := json.Unmarshal([]byte(cached), &envelope); err == nil &&
+				envelope.matches(initialAccess, userID) {
+				finalAccess, finalErr :=
+					s.revalidateTicketStatisticsAccess(
+						ctx,
+						scope,
+						userID,
+						projectRole,
+					)
+				if finalErr != nil {
+					return nil, finalErr
 				}
-				if cachedStats.ByCategory == nil {
-					cachedStats.ByCategory = make(map[string]int64)
+				if !initialAccess.AuthorizationSnapshot.Matches(
+					finalAccess.AuthorizationSnapshot,
+				) {
+					return nil, ErrProjectAccessDenied
 				}
-				return &cachedStats, nil
+				if envelope.Statistics.ByPriority == nil {
+					envelope.Statistics.ByPriority =
+						make(map[string]int64)
+				}
+				if envelope.Statistics.ByCategory == nil {
+					envelope.Statistics.ByCategory =
+						make(map[string]int64)
+				}
+				return &envelope.Statistics, nil
 			}
 		}
 	}
 
+	var stats *TicketStatisticsResponse
+	err = scopeddb.WithProjectScopeContextTransaction(
+		ctx,
+		s.db,
+		scope,
+		func(scopedContext context.Context) error {
+			currentAccess, revalidateErr :=
+				s.projects.RevalidateHumanProjectAccess(
+					scopedContext,
+					scope,
+					userID,
+				)
+			if revalidateErr != nil {
+				return revalidateErr
+			}
+			if currentAccess.Role != projectRole ||
+				!initialAccess.AuthorizationSnapshot.Matches(
+					currentAccess.AuthorizationSnapshot,
+				) {
+				return ErrProjectAccessDenied
+			}
+			var queryErr error
+			stats, queryErr = s.queryTicketStatistics(
+				scopedContext,
+				userID,
+				projectRole,
+			)
+			return queryErr
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if cacheKey != "" {
+		envelope := ticketStatisticsCacheEnvelope{
+			OrganizationID:    scope.OrganizationID,
+			ProjectID:         scope.ProjectID,
+			UserID:            userID,
+			ProjectRole:       projectRole,
+			MembershipID:      initialAccess.AuthorizationSnapshot.MembershipID,
+			MembershipVersion: initialAccess.AuthorizationSnapshot.MembershipVersion,
+			Statistics:        *stats,
+		}
+		if payload, marshalErr := json.Marshal(envelope); marshalErr == nil {
+			_ = s.statsCache.Set(
+				ctx,
+				cacheKey,
+				string(payload),
+				s.statsCacheTTL,
+			)
+		}
+	}
+
+	finalAccess, err := s.revalidateTicketStatisticsAccess(
+		ctx,
+		scope,
+		userID,
+		projectRole,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if !initialAccess.AuthorizationSnapshot.Matches(
+		finalAccess.AuthorizationSnapshot,
+	) {
+		return nil, ErrProjectAccessDenied
+	}
+	return stats, nil
+}
+
+func (s *TicketService) queryTicketStatistics(
+	ctx context.Context,
+	userID uint,
+	role models.ProjectRole,
+) (*TicketStatisticsResponse, error) {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
 	stats := &TicketStatisticsResponse{
 		ByPriority: make(map[string]int64),
 		ByCategory: make(map[string]int64),
@@ -773,7 +919,7 @@ func (s *TicketService) GetTicketStatistics(
 		s.db.WithContext(ctx).Model(&models.Ticket{}),
 		scope,
 	)
-	query = scopeHumanTicketQuery(query, userID, role)
+	query = scopeHumanTicketQuery(query, userID, string(role))
 
 	var aggregated struct {
 		Total        int64
@@ -816,9 +962,9 @@ func (s *TicketService) GetTicketStatistics(
 	stats.HighPriority = aggregated.HighPriority
 	stats.SLABreached = aggregated.SLABreached
 	stats.Escalated = aggregated.Escalated
-	switch strings.ToLower(strings.TrimSpace(role)) {
-	case string(models.ProjectRoleAgent),
-		string(models.ProjectRoleRequester):
+	switch role {
+	case models.ProjectRoleAgent,
+		models.ProjectRoleRequester:
 		stats.MyTickets = stats.Total
 	}
 
@@ -831,7 +977,11 @@ func (s *TicketService) GetTicketStatistics(
 		s.db.WithContext(ctx).Model(&models.Ticket{}),
 		scope,
 	)
-	priorityQuery = scopeHumanTicketQuery(priorityQuery, userID, role)
+	priorityQuery = scopeHumanTicketQuery(
+		priorityQuery,
+		userID,
+		string(role),
+	)
 
 	if err := priorityQuery.
 		Select("priority, count(*) as count").
@@ -842,13 +992,76 @@ func (s *TicketService) GetTicketStatistics(
 		}
 	}
 
-	if cacheKey != "" {
-		if payload, err := json.Marshal(stats); err == nil {
-			_ = s.statsCache.Set(ctx, cacheKey, string(payload), s.statsCacheTTL)
-		}
-	}
-
 	return stats, nil
+}
+
+func (s *TicketService) revalidateTicketStatisticsAccess(
+	ctx context.Context,
+	scope models.ProjectScope,
+	userID uint,
+	role models.ProjectRole,
+) (*ProjectAccess, error) {
+	var access *ProjectAccess
+	err := scopeddb.WithProjectScopeContextTransaction(
+		ctx,
+		s.db,
+		scope,
+		func(scopedContext context.Context) error {
+			var revalidateErr error
+			access, revalidateErr =
+				s.projects.RevalidateHumanProjectAccess(
+					scopedContext,
+					scope,
+					userID,
+				)
+			if revalidateErr != nil {
+				return revalidateErr
+			}
+			if access.Role != role {
+				return ErrProjectAccessDenied
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return access, nil
+}
+
+func ticketStatisticsCacheKey(
+	access *ProjectAccess,
+	userID uint,
+) string {
+	if access == nil {
+		return ""
+	}
+	snapshot := access.AuthorizationSnapshot
+	return fmt.Sprintf(
+		"ticket_stats:v2:%d:%d:human:%d:%s:membership:%d:%d",
+		access.Scope.OrganizationID,
+		access.Scope.ProjectID,
+		userID,
+		access.Role,
+		snapshot.MembershipID,
+		snapshot.MembershipVersion,
+	)
+}
+
+func (envelope ticketStatisticsCacheEnvelope) matches(
+	access *ProjectAccess,
+	userID uint,
+) bool {
+	if access == nil {
+		return false
+	}
+	snapshot := access.AuthorizationSnapshot
+	return envelope.OrganizationID == access.Scope.OrganizationID &&
+		envelope.ProjectID == access.Scope.ProjectID &&
+		envelope.UserID == userID &&
+		envelope.ProjectRole == access.Role &&
+		envelope.MembershipID == snapshot.MembershipID &&
+		envelope.MembershipVersion == snapshot.MembershipVersion
 }
 
 // GetUserTickets gets tickets assigned to a specific user in one project.

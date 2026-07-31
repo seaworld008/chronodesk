@@ -1,9 +1,14 @@
 import type { APIRequestContext, Page } from '@playwright/test';
 import {
+    projectRoleValues,
+    type UpdatePlatformConfigOperationRequest,
+} from '../../src/lib/generated/human-api';
+import {
     apiRequest,
     loginSession,
     type AuthSession,
     type Credentials,
+    type PlatformRole,
 } from './api';
 import {
     assertDestructiveE2EAllowed,
@@ -108,8 +113,51 @@ type TicketIntakeConfiguration = {
     }>;
 };
 
+type HumanSessionBinding = {
+    subject: string;
+    sessionID: string;
+};
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === 'object' && value !== null;
+
+const humanSessionBinding = (
+    session: AuthSession,
+): HumanSessionBinding => {
+    const parts = session.access_token.split('.');
+    if (parts.length !== 3) {
+        throw new Error('E2E 登录响应 access_token 不是合法 JWT');
+    }
+    try {
+        const normalized = parts[1]
+            .replace(/-/g, '+')
+            .replace(/_/g, '/');
+        const padded = normalized.padEnd(
+            normalized.length + ((4 - (normalized.length % 4)) % 4),
+            '=',
+        );
+        const payload = JSON.parse(atob(padded)) as Record<string, unknown>;
+        if (
+            typeof payload.sub !== 'string' ||
+            payload.sub.length === 0 ||
+            typeof payload.sid !== 'string' ||
+            payload.sid.length === 0 ||
+            payload.platform_role !== session.user.platform_role
+        ) {
+            throw new Error('JWT 主体、会话或 platform_role 与登录用户不一致');
+        }
+        return {
+            subject: payload.sub,
+            sessionID: payload.sid,
+        };
+    } catch (error) {
+        throw new Error(
+            `E2E 登录响应缺少可绑定项目缓存的会话声明：${
+                error instanceof Error ? error.message : String(error)
+            }`,
+        );
+    }
+};
 
 export const extractData = <T>(payload: unknown): T => {
     if (
@@ -157,8 +205,15 @@ const getAuthSession = (
     return pending;
 };
 
-export const getAdminToken = async (request: APIRequestContext) =>
-    (await getAuthSession(request, DEFAULT_ADMIN)).access_token;
+export const getAdminToken = async (request: APIRequestContext) => {
+    const session = await getAuthSession(request, DEFAULT_ADMIN);
+    if (session.user.platform_role !== 'platform_admin') {
+        throw new Error(
+            `E2E 默认治理账号必须是 platform_admin，实际为 ${session.user.platform_role}`,
+        );
+    }
+    return session.access_token;
+};
 
 export const resolveE2EProjectKey = (
     request: APIRequestContext,
@@ -177,11 +232,17 @@ export const resolveE2EProjectKey = (
         const accesses =
             extractData<Array<Record<string, unknown>>>(response) ?? [];
         const selected = accesses
+            .filter((access) =>
+                typeof access.project_role === 'string' &&
+                projectRoleValues.some(
+                    (projectRole) =>
+                        projectRole === access.project_role,
+                ),
+            )
             .map((access) => access.project)
             .find(
                 (project): project is Record<string, unknown> =>
-                    typeof project === 'object' &&
-                    project !== null &&
+                    isRecord(project) &&
                     project.status === 'active' &&
                     project.key === 'DEFAULT',
             );
@@ -262,35 +323,86 @@ export const authenticatePage = async (
     credentials: Credentials = DEFAULT_ADMIN,
 ) => {
     const session = await getAuthSession(page.request, credentials);
+    const binding = humanSessionBinding(session);
     const projectKey = await resolveE2EProjectKey(
         page.request,
         session.access_token,
     );
     await installBrowserMutationGuard(page);
-    await page.addInitScript(({ auth, activeProjectKey }) => {
+    await page.addInitScript(({ auth, activeProjectKey, sessionBinding }) => {
+        if (localStorage.getItem('token') === auth.access_token) {
+            return;
+        }
+        for (const key of [
+            'token',
+            'refreshToken',
+            'user',
+            'tokenExpiresAt',
+            'chronodesk.activeProject',
+        ]) {
+            localStorage.removeItem(key);
+        }
         localStorage.setItem('token', auth.access_token);
         localStorage.setItem(
-            'chronodesk.activeProjectKey',
-            activeProjectKey,
+            'chronodesk.activeProject',
+            JSON.stringify({
+                subject: sessionBinding.subject,
+                session_id: sessionBinding.sessionID,
+                project_key: activeProjectKey,
+            }),
         );
         if (auth.refresh_token) {
             localStorage.setItem('refreshToken', auth.refresh_token);
         }
-        if (auth.user) {
-            localStorage.setItem('user', JSON.stringify(auth.user));
-        }
-        if (auth.permissions) {
-            localStorage.setItem('permissions', JSON.stringify(auth.permissions));
-        }
+        localStorage.setItem('user', JSON.stringify(auth.user));
         if (auth.expires_in) {
             localStorage.setItem(
                 'tokenExpiresAt',
                 String(Date.now() + auth.expires_in * 1000),
             );
         }
-    }, { auth: session, activeProjectKey: projectKey });
+    }, {
+        auth: session,
+        activeProjectKey: projectKey,
+        sessionBinding: binding,
+    });
     await page.goto('/#/');
     await page.getByRole('menuitem', { name: '工单管理' }).waitFor({ timeout: 15000 });
+};
+
+export const selectDefaultProjectViaUI = async (page: Page) => {
+    const projectSelection = page.getByTestId(
+        'active-project-selection-required',
+    );
+    await projectSelection.waitFor({ timeout: 15_000 });
+    await projectSelection
+        .getByTestId('select-project-DEFAULT')
+        .click();
+    await page
+        .getByRole('menuitem', { name: '工单管理', exact: true })
+        .waitFor({ timeout: 15_000 });
+
+    const selectedProjectKey = await page.evaluate(() => {
+        const serialized = localStorage.getItem('chronodesk.activeProject');
+        if (!serialized) {
+            return null;
+        }
+        try {
+            const selection = JSON.parse(serialized) as {
+                project_key?: unknown;
+            };
+            return typeof selection.project_key === 'string'
+                ? selection.project_key
+                : null;
+        } catch {
+            return null;
+        }
+    });
+    if (selectedProjectKey !== 'DEFAULT') {
+        throw new Error(
+            `E2E 登录后必须显式选择 DEFAULT 项目，实际为 ${String(selectedProjectKey)}`,
+        );
+    }
 };
 
 export const loginViaUI = async (page: Page, credentials: Credentials = DEFAULT_ADMIN) => {
@@ -299,7 +411,7 @@ export const loginViaUI = async (page: Page, credentials: Credentials = DEFAULT_
     await page.getByLabel('邮箱').fill(credentials.email);
     await page.getByLabel('密码').fill(credentials.password);
     await page.getByRole('button', { name: '登录系统' }).click();
-    await page.getByRole('menuitem', { name: '工单管理' }).waitFor({ timeout: 15000 });
+    await selectDefaultProjectViaUI(page);
 };
 
 export const findUserByEmail = async (
@@ -310,7 +422,7 @@ export const findUserByEmail = async (
     const response = await apiRequest<Record<string, unknown>>(
         request,
         token,
-        `/api/admin/users?search=${encodeURIComponent(email)}&page=1&page_size=50`,
+        `/api/platform/users?search=${encodeURIComponent(email)}&page=1&page_size=50`,
     );
     const users = extractItems<Record<string, unknown>>(response);
     return users.find((user) => user.email === email);
@@ -342,13 +454,14 @@ const adminCommand = async <T>(
 type TemporaryRoleAccount = Credentials & {
     id: number;
     username: string;
-    role: 'agent' | 'customer';
+    platformRole: PlatformRole;
+    projectRole: 'agent' | 'requester';
     optionLabel: string;
 };
 
 export type TemporaryRoleAccounts = {
     agent: TemporaryRoleAccount;
-    customer: TemporaryRoleAccount;
+    requester: TemporaryRoleAccount;
 };
 
 let temporaryRoleAccounts: Promise<TemporaryRoleAccounts> | undefined;
@@ -410,7 +523,7 @@ const compensateTemporaryUsers = async (
             await apiRequest(
                 request,
                 token,
-                `/api/admin/users/${encodeURIComponent(id)}`,
+                `/api/platform/users/${encodeURIComponent(id)}`,
                 { method: 'DELETE' },
             );
             untrackE2EResource('users', id);
@@ -439,25 +552,27 @@ export const ensureRoleAccounts = async (
         const token = await getAdminToken(request);
         const projectKey = await resolveE2EProjectKey(request, token);
         const agentIdentity = temporaryRoleAccountIdentity('agent');
-        const customerIdentity = temporaryRoleAccountIdentity('customer');
+        const requesterIdentity = temporaryRoleAccountIdentity('requester');
         const definitions = [
             {
                 key: 'agent',
                 ...agentIdentity,
-                role: 'agent',
+                platformRole: 'member',
+                projectRole: 'agent',
                 first_name: 'Support',
                 last_name: 'Agent',
                 department: 'Support',
                 job_title: 'Support Agent',
             },
             {
-                key: 'customer',
-                ...customerIdentity,
-                role: 'customer',
+                key: 'requester',
+                ...requesterIdentity,
+                platformRole: 'member',
+                projectRole: 'requester',
                 first_name: 'Demo',
-                last_name: 'Customer',
-                department: 'Customer',
-                job_title: 'Customer',
+                last_name: 'Requester',
+                department: 'Request',
+                job_title: 'Requester',
             },
         ] as const;
 
@@ -479,14 +594,14 @@ export const ensureRoleAccounts = async (
                 const response = await apiRequest<Record<string, unknown>>(
                     request,
                     token,
-                    '/api/admin/users',
+                    '/api/platform/users',
                     {
                         method: 'POST',
                         data: {
                             username: definition.username,
                             email: definition.email,
                             password: DEFAULT_PASSWORD,
-                            role: definition.role,
+                            platform_role: definition.platformRole,
                             first_name: definition.first_name,
                             last_name: definition.last_name,
                             department: definition.department,
@@ -510,10 +625,7 @@ export const ensureRoleAccounts = async (
                         method: 'POST',
                         data: {
                             user_id: created.id,
-                            role:
-                                definition.role === 'agent'
-                                    ? 'agent'
-                                    : 'requester',
+                            role: definition.projectRole,
                         },
                     },
                 );
@@ -522,7 +634,8 @@ export const ensureRoleAccounts = async (
                     username: definition.username,
                     email: definition.email,
                     password: DEFAULT_PASSWORD,
-                    role: definition.role,
+                    platformRole: definition.platformRole,
+                    projectRole: definition.projectRole,
                     optionLabel: `${definition.username} (${definition.first_name} ${definition.last_name})`,
                 };
             }
@@ -1002,7 +1115,7 @@ const deleteTestUsers = async (request: APIRequestContext, token: string) => {
         await apiRequest(
             request,
             token,
-            `/api/admin/users/${encodeURIComponent(id)}`,
+            `/api/platform/users/${encodeURIComponent(id)}`,
             { method: 'DELETE' },
         );
         untrackE2EResource('users', id);
@@ -1011,7 +1124,7 @@ const deleteTestUsers = async (request: APIRequestContext, token: string) => {
         const accounts = await temporaryRoleAccounts.catch(() => undefined);
         if (accounts) {
             authSessions.delete(accounts.agent.email.toLowerCase());
-            authSessions.delete(accounts.customer.email.toLowerCase());
+            authSessions.delete(accounts.requester.email.toLowerCase());
         }
         temporaryRoleAccounts = undefined;
     }
@@ -1061,7 +1174,7 @@ export const captureEmailConfig = async (
     const response = await apiRequest<Record<string, unknown>>(
         request,
         token,
-        '/api/admin/email-config',
+        '/api/platform/email-config',
     );
     return extractData<EmailConfigSnapshot>(response);
 };
@@ -1104,7 +1217,7 @@ export const restoreEmailConfig = async (
     }
 
     assertGlobalE2EAllowed('恢复邮件配置');
-    await apiRequest(request, token, '/api/admin/email-config', {
+    await apiRequest(request, token, '/api/platform/email-config', {
         method: 'PUT',
         data: {
             ...originalComparable,
@@ -1142,7 +1255,7 @@ export const captureSystemConfig = async (
     const response = await apiRequest<Record<string, unknown>>(
         request,
         token,
-        `/api/admin/configs?category=${encodeURIComponent(category)}`,
+        `/api/platform/configs?category=${encodeURIComponent(category)}`,
     );
     const config = extractData<SystemConfigSnapshot[]>(response).find(
         (candidate) => candidate.key === key,
@@ -1174,22 +1287,20 @@ export const restoreSystemConfig = async (
 
     assertGlobalE2EAllowed(`恢复系统配置 ${original.key}`);
     const token = await getAdminToken(request);
+    const restoreRequest: UpdatePlatformConfigOperationRequest = {
+        value: original.value,
+        value_type: original.value_type,
+        description: original.description,
+        category: original.category,
+        group: original.group,
+    };
     await apiRequest(
         request,
         token,
-        `/api/admin/configs/${encodeURIComponent(original.key)}`,
+        `/api/platform/configs/${encodeURIComponent(original.key)}`,
         {
             method: 'PUT',
-            data: {
-                key: original.key,
-                value: original.value,
-                value_type: original.value_type,
-                description: original.description,
-                category: original.category,
-                group: original.group,
-                is_required: original.is_required,
-                is_active: original.is_active,
-            },
+            data: restoreRequest,
         },
     );
     const restored = await captureSystemConfig(

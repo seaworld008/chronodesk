@@ -17,7 +17,7 @@ flowchart LR
     System["External business system"]
 
     subgraph Interfaces["Protocol Interfaces"]
-        HumanREST["Human REST + WebSocket"]
+        HumanREST["Human REST + WebSocket\n/api/platform, /api/projects, /api/workbench"]
         AgentREST["Agent REST /api/v2/projects/{projectKey}"]
         MCP["MCP 2026-07-28"]
         A2A["A2A 1.0"]
@@ -146,6 +146,13 @@ portion of these rules.
 - Human and machine credentials use separate issuers/resources and storage.
 - MCP, Agent REST, and A2A tokens have distinct audiences.
 - OAuth client-credential tokens bind exactly one Project and one audience.
+- A Human JWT carries only `PlatformRole`, which is revalidated against the
+  active identity for every request. `ProjectRole` is resolved from active
+  Membership for each project request and never inherited from a platform role.
+- `/api/platform/*` provides explicit platform governance; `/api/projects/*`
+  requires one resolved ProjectScope; `/api/workbench/*` aggregates only active
+  Membership scopes. The Human Web contract at `/human-openapi.json` documents
+  that boundary without becoming an Agent machine contract.
 - Project membership/grant checks and PostgreSQL RLS independently prevent
   cross-project reads and writes.
 - Attachment content is size-limited, hashed, scan-state gated, and authorized

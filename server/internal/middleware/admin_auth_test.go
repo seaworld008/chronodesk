@@ -51,12 +51,13 @@ func TestImportantAdminOperationCoversPlatformAndProjectAgentControlPlanes(t *te
 		path   string
 		want   bool
 	}{
-		{name: "legacy write", method: http.MethodPost, path: "/api/admin/users", want: true},
-		{name: "legacy nested write", method: http.MethodDelete, path: "/api/admin/webhooks/42", want: true},
+		{name: "platform write", method: http.MethodPost, path: "/api/platform/users", want: true},
+		{name: "platform nested write", method: http.MethodDelete, path: "/api/platform/configs/security", want: true},
+		{name: "removed legacy write", method: http.MethodPost, path: "/api/admin/users", want: false},
 		{name: "agent principal write", method: http.MethodPost, path: "/api/projects/OPS/admin/agents/service-principals", want: true},
 		{name: "agent credential write", method: http.MethodPost, path: "/api/projects/OPS/admin/agents/service-principals/p1/credentials/rotate", want: true},
 		{name: "agent read", method: http.MethodGet, path: "/api/projects/OPS/admin/agents/agent-control/overview", want: false},
-		{name: "head is read", method: http.MethodHead, path: "/api/admin/users", want: false},
+		{name: "head is read", method: http.MethodHead, path: "/api/platform/users", want: false},
 		{name: "options is read", method: http.MethodOptions, path: "/api/projects/OPS/admin/agents/service-principals", want: false},
 		{name: "project admin prefix boundary", method: http.MethodPost, path: "/api/projects/OPS/admin/agent/service-principals", want: false},
 		{name: "legacy prefix boundary", method: http.MethodPost, path: "/api/administrator/users", want: false},
@@ -79,7 +80,7 @@ func TestLogAdminOperationRecordsProjectAgentManagementWrite(t *testing.T) {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", uint(7))
-		c.Set("user_role", "admin")
+		c.Set("platform_role", models.PlatformRolePlatformAdmin)
 		c.Next()
 	})
 	router.Use(LogAdminOperation(audit))
@@ -124,17 +125,17 @@ func TestAdminWriteFailsClosedBeforeHandlerWhenAuditAnchorCannotPersist(t *testi
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", uint(7))
-		c.Set("user_role", "admin")
+		c.Set("platform_role", models.PlatformRolePlatformAdmin)
 		c.Next()
 	})
 	router.Use(LogAdminOperation(audit))
-	router.POST("/api/admin/users", func(c *gin.Context) {
+	router.POST("/api/platform/users", func(c *gin.Context) {
 		handlerCalled = true
 		c.Status(http.StatusCreated)
 	})
 
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/api/admin/users", nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/platform/users", nil)
 	router.ServeHTTP(recorder, request)
 
 	if recorder.Code != http.StatusServiceUnavailable {
@@ -158,16 +159,16 @@ func TestAdminWriteRetainsPendingAnchorWhenFinalizationFails(t *testing.T) {
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", uint(7))
-		c.Set("user_role", "admin")
+		c.Set("platform_role", models.PlatformRolePlatformAdmin)
 		c.Next()
 	})
 	router.Use(LogAdminOperation(audit))
-	router.POST("/api/admin/users", func(c *gin.Context) {
+	router.POST("/api/platform/users", func(c *gin.Context) {
 		c.Status(http.StatusCreated)
 	})
 
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/api/admin/users", nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/platform/users", nil)
 	router.ServeHTTP(recorder, request)
 
 	if recorder.Code != http.StatusCreated {
@@ -192,16 +193,16 @@ func TestAdminWritePanicFinalizesDurableAuditAsError(t *testing.T) {
 	})))
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", uint(7))
-		c.Set("user_role", "admin")
+		c.Set("platform_role", models.PlatformRolePlatformAdmin)
 		c.Next()
 	})
 	router.Use(LogAdminOperation(audit))
-	router.POST("/api/admin/users", func(*gin.Context) {
+	router.POST("/api/platform/users", func(*gin.Context) {
 		panic("handler panic")
 	})
 
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/api/admin/users", nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/platform/users", nil)
 	router.ServeHTTP(recorder, request)
 
 	if recorder.Code != http.StatusInternalServerError {

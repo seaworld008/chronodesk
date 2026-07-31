@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -12,8 +13,9 @@ import (
 )
 
 type fakeRedis struct {
-	mu    sync.RWMutex
-	store map[string]string
+	mu       sync.RWMutex
+	store    map[string]string
+	afterGet func()
 }
 
 func (f *fakeRedis) Ping(ctx context.Context) error { return nil }
@@ -27,8 +29,13 @@ func (f *fakeRedis) Set(ctx context.Context, key string, value interface{}, expi
 
 func (f *fakeRedis) Get(ctx context.Context, key string) (string, error) {
 	f.mu.RLock()
-	defer f.mu.RUnlock()
-	if val, ok := f.store[key]; ok {
+	val, ok := f.store[key]
+	afterGet := f.afterGet
+	f.mu.RUnlock()
+	if afterGet != nil {
+		afterGet()
+	}
+	if ok {
 		return val, nil
 	}
 	return "", gorm.ErrRecordNotFound
@@ -80,7 +87,7 @@ func setupCacheTestDB(t *testing.T) *gorm.DB {
 		Username:     "admin",
 		Email:        "admin@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
@@ -115,6 +122,13 @@ func TestGetTicketStatistics_Cache(t *testing.T) {
 		30*time.Second,
 	)
 	ctx := testProjectOperationContext(t, db, models.HumanActor(1))
+	ensureTestHumanProjectRole(
+		t,
+		db,
+		ctx,
+		1,
+		models.ProjectRoleAdmin,
+	)
 
 	stats1, err := svc.GetTicketStatistics(ctx, 1, string(models.ProjectRoleAdmin))
 	if err != nil {
@@ -132,5 +146,59 @@ func TestGetTicketStatistics_Cache(t *testing.T) {
 
 	if stats1.Open != stats2.Open {
 		t.Fatalf("expected cached stats, open=%d vs %d", stats1.Open, stats2.Open)
+	}
+}
+
+func TestGetTicketStatistics_CacheHitRevalidatesAfterRevocation(
+	t *testing.T,
+) {
+	db := setupCacheTestDB(t)
+	cache := &fakeRedis{store: map[string]string{}}
+	svc := newTicketServiceWithDependenciesForTest(
+		t,
+		db,
+		NewAgentNativeService(db),
+		cache,
+		30*time.Second,
+	)
+	ctx := testProjectOperationContext(t, db, models.HumanActor(1))
+	ensureTestHumanProjectRole(
+		t,
+		db,
+		ctx,
+		1,
+		models.ProjectRoleAdmin,
+	)
+	if _, err := svc.GetTicketStatistics(
+		ctx,
+		1,
+		string(models.ProjectRoleAdmin),
+	); err != nil {
+		t.Fatalf("prime ticket statistics cache: %v", err)
+	}
+
+	cache.mu.Lock()
+	cache.afterGet = func() {
+		cache.mu.Lock()
+		cache.afterGet = nil
+		cache.mu.Unlock()
+		if err := db.Model(&models.ProjectMembership{}).
+			Where("user_id = ?", 1).
+			Updates(map[string]any{
+				"is_active": false,
+				"version":   gorm.Expr("version + 1"),
+			}).Error; err != nil {
+			t.Errorf("revoke membership after cache read: %v", err)
+		}
+	}
+	cache.mu.Unlock()
+
+	_, err := svc.GetTicketStatistics(
+		ctx,
+		1,
+		string(models.ProjectRoleAdmin),
+	)
+	if !errors.Is(err, ErrProjectAccessDenied) {
+		t.Fatalf("cache hit after revocation error = %v", err)
 	}
 }

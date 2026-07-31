@@ -55,7 +55,7 @@ func TestUploadAvatarPersistsSanitizedObjectAndReplacesPreviousObject(t *testing
 	}
 	user := models.User{
 		Username: "avatar-user", Email: "avatar@example.com", PasswordHash: "hash",
-		Role: models.RoleCustomer, Status: models.UserStatusActive,
+		PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
@@ -116,7 +116,7 @@ func TestUploadAvatarRejectsSpoofedAndOversizedPayloads(t *testing.T) {
 	}
 	user := models.User{
 		Username: "avatar-invalid", Email: "avatar-invalid@example.com", PasswordHash: "hash",
-		Role: models.RoleCustomer, Status: models.UserStatusActive,
+		PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)

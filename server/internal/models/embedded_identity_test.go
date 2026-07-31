@@ -28,7 +28,9 @@ func TestTicketEmbeddedHumanIdentityOmitsAccountAndContactData(t *testing.T) {
 	lastLogin := time.Now()
 	user := &User{
 		ID: 7, Username: "support", DisplayName: "支持工程师", Avatar: "/avatar.png",
-		Email: "private@example.com", Phone: "18800001111", Role: RoleAdmin,
+		Email:            "private@example.com",
+		Phone:            "18800001111",
+		PlatformRole:     PlatformRolePlatformAdmin,
 		TwoFactorEnabled: true, LastLoginAt: &lastLogin,
 	}
 	ticket := (&Ticket{

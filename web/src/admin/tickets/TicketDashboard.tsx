@@ -29,9 +29,17 @@ import { usePermissions } from 'react-admin'
 import { useNavigate } from 'react-router-dom'
 import { alpha } from '@mui/material/styles'
 import { RatioRow } from '@/components/layout/RatioRow'
-import { API_BASE, localizedUnknownErrorMessage } from '@/lib/apiClient'
-import { isAgentRole, type RolePermissions } from '@/lib/accessControl'
-import { projectResourcePath } from '@/lib/projectScope'
+import {
+  API_BASE,
+  localizedUnknownErrorMessage,
+  sessionAwareFetch,
+} from '@/lib/apiClient'
+import { joinApiUrl } from '@/lib/apiUrl'
+import type { AccessPermissions } from '@/lib/accessControl'
+import {
+  parseProjectRole,
+  projectResourcePath,
+} from '@/lib/projectScope'
 import {
   PieChart,
   Pie,
@@ -185,7 +193,7 @@ const renderActiveShape = (props: PieActiveShapeProps) => {
 }
 
 const TicketDashboard: React.FC = () => {
-  const { permissions } = usePermissions<RolePermissions>()
+  const { permissions } = usePermissions<AccessPermissions>()
   const navigate = useNavigate()
   const theme = useTheme()
   const [stats, setStats] = useState<TicketStats>({
@@ -207,7 +215,7 @@ const TicketDashboard: React.FC = () => {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
-  const isAgent = isAgentRole(permissions?.role)
+  const isAgent = parseProjectRole(permissions?.project_role) === 'agent'
 
   useEffect(() => {
     const controller = new AbortController()
@@ -219,16 +227,16 @@ const TicketDashboard: React.FC = () => {
           Authorization: `Bearer ${localStorage.getItem('token') || ''}`,
         }
         const ticketsPath = await projectResourcePath('tickets')
-        const ticketsURL = `${API_BASE}/${ticketsPath}`
+        const ticketsURL = joinApiUrl(API_BASE, ticketsPath)
         const [statsRes, urgentRes, recentRes, myRes] = await Promise.all([
-          fetch(`${ticketsURL}/stats`, { headers, signal: controller.signal }),
-          fetch(`${ticketsURL}?priority=urgent,critical&status=open,in_progress&page_size=10`, {
+          sessionAwareFetch(`${ticketsURL}/stats`, { headers, signal: controller.signal }),
+          sessionAwareFetch(`${ticketsURL}?priority=urgent,critical&status=open,in_progress&page_size=10`, {
             headers,
             signal: controller.signal,
           }),
-          fetch(`${ticketsURL}?page_size=10&sort_by=created_at&sort_order=desc`, { headers, signal: controller.signal }),
+          sessionAwareFetch(`${ticketsURL}?page_size=10&sort_by=created_at&sort_order=desc`, { headers, signal: controller.signal }),
           isAgent
-            ? fetch(`${ticketsURL}/my-tickets?limit=10`, { headers, signal: controller.signal })
+            ? sessionAwareFetch(`${ticketsURL}/my-tickets?limit=10`, { headers, signal: controller.signal })
             : Promise.resolve(null),
         ])
 

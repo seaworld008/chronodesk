@@ -56,7 +56,7 @@ func TestCrossProjectWorkbenchHandlerIgnoresPlatformRoleByContract(
 	router := gin.New()
 	router.GET("/api/workbench/tickets", func(c *gin.Context) {
 		c.Set("user_id", uint(7))
-		c.Set("user_role", string(models.RoleAdmin))
+		c.Set("platform_role", models.PlatformRolePlatformAdmin)
 		c.Next()
 	}, handler.ListTickets)
 

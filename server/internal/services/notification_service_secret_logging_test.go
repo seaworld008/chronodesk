@@ -37,7 +37,7 @@ func TestWebhookAuditLogNeverPersistsCredentialsOrSignatures(t *testing.T) {
 	}
 	owner := models.User{
 		Username: "webhook-log-owner", Email: "webhook-log-owner@example.test",
-		PasswordHash: "hash", Role: models.RoleAdmin, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRolePlatformAdmin, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&owner).Error; err != nil {
 		t.Fatal(err)

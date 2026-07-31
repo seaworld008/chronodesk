@@ -17,7 +17,7 @@ const SimpleWorkingSystemSettings: React.FC = () => {
             color: "text.secondary",
             marginBottom: "16px"
           }}>
-          统一管理邮件、Webhook 以及系统基础配置。
+          统一管理平台邮件和全局基础配置。项目集成与智能体控制仅在具备相应项目职责时显示。
         </Typography>
         <Grid container spacing={3}>
           <Grid
@@ -50,28 +50,6 @@ const SimpleWorkingSystemSettings: React.FC = () => {
             }}>
             <Paper sx={{ p: 3, height: '100%' }}>
               <Typography variant="h6" gutterBottom>
-                Webhook 集成
-              </Typography>
-              <Typography
-                sx={{
-                  color: "text.secondary",
-                  marginBottom: "16px"
-                }}>
-                管理企业即时通讯渠道的自动通知。
-              </Typography>
-              <Button variant="contained" size="small" onClick={() => navigate('/webhook-settings')}>
-                打开
-              </Button>
-            </Paper>
-          </Grid>
-          <Grid
-            size={{
-              xs: 12,
-              md: 6,
-              lg: 4
-            }}>
-            <Paper sx={{ p: 3, height: '100%' }}>
-              <Typography variant="h6" gutterBottom>
                 系统概览
               </Typography>
               <Typography
@@ -82,28 +60,6 @@ const SimpleWorkingSystemSettings: React.FC = () => {
                 查看并调整系统基础、安全、通知等配置。
               </Typography>
               <Button variant="contained" size="small" onClick={() => navigate('/system-settings/overview')}>
-                打开
-              </Button>
-            </Paper>
-          </Grid>
-          <Grid
-            size={{
-              xs: 12,
-              md: 6,
-              lg: 4
-            }}>
-            <Paper sx={{ p: 3, height: '100%' }}>
-              <Typography variant="h6" gutterBottom>
-                AI 智能体控制
-              </Typography>
-              <Typography
-                sx={{
-                  color: "text.secondary",
-                  marginBottom: "16px"
-                }}>
-                管理服务主体、权限范围、工单租约、领域事件和安全熔断。
-              </Typography>
-              <Button variant="contained" size="small" onClick={() => navigate('/agent-control')}>
                 打开
               </Button>
             </Paper>

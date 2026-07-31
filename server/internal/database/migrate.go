@@ -42,6 +42,9 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 		if err := ValidateProjectScopeCutoverMarker(db); err != nil {
 			return err
 		}
+		if err := ValidatePlatformRoleCutover(db); err != nil {
+			return err
+		}
 		return ValidateProjectRLSReadiness(db)
 	}
 
@@ -67,6 +70,9 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 		return err
 	}
 	if err := ValidateProjectScopeCutoverMarker(db); err != nil {
+		return err
+	}
+	if err := ValidatePlatformRoleCutover(db); err != nil {
 		return err
 	}
 	return ValidateProjectRLSReadiness(db)
@@ -150,9 +156,12 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 			"key", "version", "checksum", "completed_at",
 		}},
 		{&models.User{}, "users", []string{
-			"id", "role", "status", "password_hash", "password_reset_at",
+			"id", "platform_role", "status", "password_hash", "password_reset_at",
 			"two_factor_enabled", "two_factor_secret", "backup_codes",
 			"welcome_email_delivered_at",
+		}},
+		{&models.AdminAuditLog{}, "admin_audit_logs", []string{
+			"id", "user_id", "platform_role", "action", "status_code",
 		}},
 		{&models.UserProfile{}, "user_profiles", []string{"user_id"}},
 		{&models.EmailConfig{}, "email_configs", []string{
@@ -173,10 +182,10 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 		}},
 		{&auth.OTPCode{}, "otp_codes", []string{"user_id", "code", "type", "expires_at", "used", "used_at"}},
 		{&models.LoginHistory{}, "login_histories", []string{"user_id", "session_id", "is_active"}},
-		{&models.ServicePrincipal{}, "service_principals", []string{"id", "status", "scopes", "read_only", "emergency_disabled", "expires_at"}},
+		{&models.ServicePrincipal{}, "service_principals", []string{"id", "status", "scopes", "read_only", "emergency_disabled", "expires_at", "policy_epoch"}},
 		{&models.AgentCredential{}, "agent_credentials", []string{"service_principal_id", "secret_hash", "status", "expires_at", "revoked_at"}},
 		{&models.AgentPolicy{}, "agent_policies", []string{"service_principal_id", "effect", "scope", "action", "conditions", "is_active"}},
-		{&models.PolicyDecision{}, "policy_decisions", []string{"actor_type", "actor_id", "credential_id", "allowed", "reason_code", "request_digest"}},
+		{&models.PolicyDecision{}, "policy_decisions", []string{"actor_type", "actor_id", "credential_id", "allowed", "reason_code", "policy_epoch", "request_digest"}},
 		{&models.IdempotencyRecord{}, "idempotency_records", []string{
 			"organization_id", "project_id", "actor_type", "actor_id",
 			"operation", "key", "request_hash", "state",
@@ -231,6 +240,11 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 		{&models.AgentTaskStatusHistory{}, "agent_task_status_history", []string{"task_id", "sequence", "state", "status"}},
 		{&models.AgentTaskEvent{}, "agent_task_events", []string{"task_id", "context_id", "resource_version", "payload"}},
 		{&models.AgentPushNotificationConfig{}, "agent_push_notification_configs", []string{"task_id", "url", "token", "authentication"}},
+		{&models.A2APushDeliverySnapshot{}, "a2a_push_delivery_snapshots", []string{
+			"event_id", "task_id", "push_config_id", "config_version_at",
+			"callback_url", "token_ciphertext", "authentication_ciphertext",
+			"request_body", "content_type", "protocol_version",
+		}},
 		{&models.Notification{}, "notifications", []string{"recipient_id", "type", "channel", "related_ticket_id", "source_event_key"}},
 	}
 }
@@ -277,20 +291,47 @@ func validateMigrationResumePoint(firstModel, modelCount int) error {
 // runs even for resumed migrations because an operator may resume after the
 // user model while still pointing at legacy data.
 func migrateLegacyHumanRoles(db *gorm.DB) error {
-	if !db.Migrator().HasTable(&models.User{}) ||
-		!db.Migrator().HasColumn(&models.User{}, "role") {
+	if !db.Migrator().HasTable(&models.User{}) {
+		return nil
+	}
+	hasLegacyRole, err := hasExactDatabaseColumn(db, "users", "role")
+	if err != nil {
+		return err
+	}
+	if !hasLegacyRole {
 		return nil
 	}
 
 	return db.Transaction(func(tx *gorm.DB) error {
+		var unsupported []string
+		if err := tx.Table("users").
+			Distinct("role").
+			Where("role IS NULL OR role NOT IN ?", []string{
+				"admin",
+				"supervisor",
+				"agent",
+				"customer",
+				"user",
+				"superuser",
+			}).
+			Order("role ASC").
+			Pluck("role", &unsupported).Error; err != nil {
+			return fmt.Errorf("inspect legacy human roles: %w", err)
+		}
+		if len(unsupported) > 0 {
+			return fmt.Errorf(
+				"unsupported legacy human role(s): %s",
+				strings.Join(unsupported, ", "),
+			)
+		}
 		if err := tx.Table("users").
 			Where("role = ?", "user").
-			Update("role", models.RoleCustomer).Error; err != nil {
+			Update("role", "customer").Error; err != nil {
 			return fmt.Errorf("migrate legacy customer role: %w", err)
 		}
 		if err := tx.Table("users").
 			Where("role = ?", "superuser").
-			Update("role", models.RoleAdmin).Error; err != nil {
+			Update("role", "admin").Error; err != nil {
 			return fmt.Errorf("migrate legacy administrator role: %w", err)
 		}
 		return nil
@@ -428,6 +469,9 @@ func schemaMigrationModels() []any {
 		// One-time destructive backfills use committed markers so a later
 		// structural migration cannot reinterpret live multi-project data.
 		&models.SchemaMigrationCheckpoint{},
+		// New models append here to preserve every existing one-based resume
+		// position used by controlled production migrations.
+		&models.A2APushDeliverySnapshot{},
 	}
 }
 
@@ -439,7 +483,7 @@ func CreateIndexes(db *gorm.DB) error {
 	indexes := []string{
 		"CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);",
 		"CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);",
-		"CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);",
+		"CREATE INDEX IF NOT EXISTS idx_users_platform_role ON users(platform_role);",
 		"CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);",
 		"CREATE INDEX IF NOT EXISTS idx_users_department ON users(department);",
 		"CREATE INDEX IF NOT EXISTS idx_users_last_login_at ON users(last_login_at);",
@@ -641,6 +685,9 @@ type SeedOptions struct {
 	// service and writes its ActorRef, CloudEvent, Outbox and audit ledger
 	// entry in this same seed transaction.
 	EnsureInitialAdministratorMembership InitialAdministratorMembershipWriter
+	// EnsureSampleUserMembership keeps optional demonstration project duties
+	// explicit and audited instead of encoding them as platform roles.
+	EnsureSampleUserMembership ProjectScopeMembershipWriter
 }
 
 type InitialAdministratorMembershipWriter func(
@@ -661,6 +708,9 @@ func SeedData(db *gorm.DB, options SeedOptions) error {
 			"audited initial administrator membership writer is required",
 		)
 	}
+	if options.IncludeSampleData && options.EnsureSampleUserMembership == nil {
+		return errors.New("audited sample user membership writer is required")
+	}
 	log.Println("Seeding initial data...")
 	return db.Transaction(func(tx *gorm.DB) error {
 		if err := seedInitialData(tx, options); err != nil {
@@ -672,16 +722,25 @@ func SeedData(db *gorm.DB, options SeedOptions) error {
 }
 
 func seedInitialData(db *gorm.DB, options SeedOptions) error {
-	// 检查是否已有管理员用户
-	var adminUser models.User
-	var adminCount int64
-	if err := db.Model(&models.User{}).
-		Where("role = ?", models.RoleAdmin).
-		Count(&adminCount).Error; err != nil {
-		return fmt.Errorf("failed to check initial administrator: %w", err)
+	adminEmail := strings.TrimSpace(os.Getenv("ADMIN_EMAIL"))
+	if adminEmail == "" {
+		adminEmail = "admin@example.com"
 	}
+	const adminUsername = "admin"
 
-	if adminCount == 0 {
+	// Break-glass identity is stable and explicit. An unrelated platform
+	// administrator must never be silently selected and expanded into a
+	// default-project administrator.
+	var adminUser models.User
+	var bootstrapCandidates []models.User
+	if err := db.Unscoped().
+		Where("username = ? OR email = ?", adminUsername, adminEmail).
+		Order("id ASC").
+		Find(&bootstrapCandidates).Error; err != nil {
+		return fmt.Errorf("failed to check controlled initial administrator: %w", err)
+	}
+	switch len(bootstrapCandidates) {
+	case 0:
 		adminPassword := os.Getenv("ADMIN_PASSWORD")
 		if adminPassword == "" {
 			return fmt.Errorf("ADMIN_PASSWORD is required when seeding the initial administrator")
@@ -697,18 +756,13 @@ func seedInitialData(db *gorm.DB, options SeedOptions) error {
 		if err != nil {
 			return fmt.Errorf("failed to hash initial administrator password: %w", err)
 		}
-		adminEmail := os.Getenv("ADMIN_EMAIL")
-		if adminEmail == "" {
-			adminEmail = "admin@example.com"
-		}
-
 		adminUser = models.User{
-			Username:      "admin",
+			Username:      adminUsername,
 			Email:         adminEmail,
 			PasswordHash:  passwordHash,
 			FirstName:     "System",
 			LastName:      "Administrator",
-			Role:          models.RoleAdmin,
+			PlatformRole:  models.PlatformRolePlatformAdmin,
 			Status:        models.UserStatusActive,
 			EmailVerified: true,
 			Department:    "IT",
@@ -718,12 +772,26 @@ func seedInitialData(db *gorm.DB, options SeedOptions) error {
 		if err := db.Create(&adminUser).Error; err != nil {
 			return fmt.Errorf("failed to create admin user: %w", err)
 		}
-		log.Printf("Created initial administrator (username: admin, email: %s)", adminEmail)
-	} else {
-		// 获取现有的管理员用户
-		if err := db.Where("role = ?", models.RoleAdmin).First(&adminUser).Error; err != nil {
-			return fmt.Errorf("failed to get admin user: %w", err)
+		log.Printf(
+			"Created controlled initial administrator (username: %s, email: %s)",
+			adminUsername,
+			adminEmail,
+		)
+	case 1:
+		adminUser = bootstrapCandidates[0]
+		if adminUser.Username != adminUsername ||
+			adminUser.Email != adminEmail ||
+			adminUser.DeletedAt.Valid ||
+			adminUser.PlatformRole != models.PlatformRolePlatformAdmin ||
+			adminUser.Status != models.UserStatusActive {
+			return errors.New(
+				"controlled initial administrator identity exists but is not the active break-glass account",
+			)
 		}
+	default:
+		return errors.New(
+			"controlled initial administrator username and email resolve to different retained identities",
+		)
 	}
 	if err := seedInitialAdministratorMembership(
 		db,
@@ -820,7 +888,10 @@ func seedInitialData(db *gorm.DB, options SeedOptions) error {
 				"sample data is only allowed when ENVIRONMENT=development",
 			)
 		}
-		if err := generateSampleDataIfNeeded(db); err != nil {
+		if err := generateSampleDataIfNeeded(
+			db,
+			options.EnsureSampleUserMembership,
+		); err != nil {
 			return err
 		}
 	}
@@ -833,7 +904,7 @@ func seedInitialAdministratorMembership(
 	writer InitialAdministratorMembershipWriter,
 ) error {
 	if administrator.ID == 0 ||
-		administrator.Role != models.RoleAdmin ||
+		administrator.PlatformRole != models.PlatformRolePlatformAdmin ||
 		administrator.Status != models.UserStatusActive {
 		return errors.New("initial administrator identity is invalid")
 	}
@@ -881,7 +952,10 @@ func seedInitialAdministratorMembership(
 
 // generateSampleDataIfNeeded generates optional demonstration records. The
 // caller has already enforced the explicit development-only gate.
-func generateSampleDataIfNeeded(db *gorm.DB) error {
+func generateSampleDataIfNeeded(
+	db *gorm.DB,
+	membershipWriter ProjectScopeMembershipWriter,
+) error {
 	// 检查是否已有示例数据
 	var sampleTicketCount int64
 	if err := db.Model(&models.Ticket{}).Where("title LIKE ?", "%示例%").Count(&sampleTicketCount).Error; err != nil {
@@ -894,7 +968,7 @@ func generateSampleDataIfNeeded(db *gorm.DB) error {
 	}
 
 	// 生成示例数据
-	generator := NewSampleDataGenerator(db)
+	generator := NewSampleDataGenerator(db, membershipWriter)
 	if err := generator.GenerateAllSampleData(); err != nil {
 		return fmt.Errorf("failed to generate sample data: %w", err)
 	}
@@ -929,6 +1003,38 @@ func RunMigrationsContext(
 // still running all index and runtime-schema gates. It is intended for a
 // bounded operator retry after a network timeout; normal callers start at 1.
 func RunMigrationsFromModel(
+	ctx context.Context,
+	db *gorm.DB,
+	firstModel int,
+	membershipWriters ...ProjectScopeMembershipWriter,
+) error {
+	if ctx == nil {
+		return errors.New("migration context is required")
+	}
+	if db == nil {
+		return errors.New("migration database is required")
+	}
+	if db.Config == nil || db.Statement == nil {
+		return errors.New("migration database is not initialized")
+	}
+	db = db.WithContext(ctx)
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := lockLegacyPlatformRoleTables(tx); err != nil {
+			return err
+		}
+		if err := preflightLegacyPlatformRoleValues(tx); err != nil {
+			return err
+		}
+		return runMigrationsFromModelLocked(
+			ctx,
+			tx,
+			firstModel,
+			membershipWriters...,
+		)
+	})
+}
+
+func runMigrationsFromModelLocked(
 	ctx context.Context,
 	db *gorm.DB,
 	firstModel int,
@@ -1040,7 +1146,14 @@ func RunMigrationsFromModel(
 		return fmt.Errorf("project RLS migration failed: %w", err)
 	}
 
-	// 18. 验证运行时所需的关键表、列、索引与 RLS policy readiness。
+	// 18. 所有其他持久迁移成功后，最后切换平台角色、删除旧 role
+	// 列并写入 checkpoint。随后的 runtime gate 只读，因此 checkpoint 是
+	// 该外层事务的最后一笔 durable write。
+	if err := MigratePlatformRoles(db, membershipWriters...); err != nil {
+		return fmt.Errorf("platform role migration failed: %w", err)
+	}
+
+	// 19. 验证运行时所需的关键表、列、索引与 RLS policy readiness。
 	if err := ValidateRuntimeSchema(db); err != nil {
 		return fmt.Errorf("runtime schema validation failed: %w", err)
 	}

@@ -40,14 +40,14 @@ var (
 	defaultTrustedDeviceMaxPerUser = 5
 )
 
-// UserRole 与领域用户模型共享同一组人类角色，避免认证与业务授权漂移。
-type UserRole = models.UserRole
+// PlatformRole 与领域用户模型共享同一组平台职责，避免认证与治理授权漂移。
+type PlatformRole = models.PlatformRole
 
 const (
-	RoleCustomer   = models.RoleCustomer
-	RoleAgent      = models.RoleAgent
-	RoleSupervisor = models.RoleSupervisor
-	RoleAdmin      = models.RoleAdmin
+	PlatformRolePlatformAdmin     = models.PlatformRolePlatformAdmin
+	PlatformRoleSecurityAuditor   = models.PlatformRoleSecurityAuditor
+	PlatformRoleEmergencyOperator = models.PlatformRoleEmergencyOperator
+	PlatformRoleMember            = models.PlatformRoleMember
 )
 
 // UserStatus 与领域用户模型共享同一组持久化状态。临时锁定只由
@@ -67,7 +67,7 @@ type User struct {
 	Username          string         `json:"username" gorm:"uniqueIndex;not null"`
 	Email             string         `json:"email" gorm:"uniqueIndex;not null"`
 	PasswordHash      string         `json:"-" gorm:"not null"`
-	Role              UserRole       `json:"role" gorm:"default:'customer'"`
+	PlatformRole      PlatformRole   `json:"platform_role" gorm:"column:platform_role;default:'member'"`
 	Status            UserStatus     `json:"status" gorm:"default:'active'"`
 	EmailVerified     bool           `json:"email_verified" gorm:"default:false"`
 	EmailVerifiedAt   *time.Time     `json:"email_verified_at"`
@@ -98,7 +98,7 @@ type UserProfile struct {
 	Language    string      `json:"language" gorm:"default:'en'"`
 	CreatedAt   time.Time   `json:"created_at"`
 	UpdatedAt   time.Time   `json:"updated_at"`
-	User        models.User `json:"user" gorm:"foreignKey:UserID"`
+	User        models.User `json:"-" gorm:"foreignKey:UserID"`
 }
 
 // LoginAttempt 登录尝试记录
@@ -203,6 +203,12 @@ type RefreshTokenRequest struct {
 	RefreshToken string `json:"refresh_token" binding:"required"`
 }
 
+// LogoutRequest optionally identifies the browser session to revoke when the
+// refresh token is not supplied through the X-Refresh-Token header.
+type LogoutRequest struct {
+	RefreshToken string `json:"refresh_token,omitempty"`
+}
+
 // ChangePasswordRequest 修改密码请求
 type ChangePasswordRequest struct {
 	CurrentPassword string `json:"current_password" binding:"required"`
@@ -266,7 +272,7 @@ type UserInfo struct {
 	ID            uint         `json:"id"`
 	Username      string       `json:"username"`
 	Email         string       `json:"email"`
-	Role          UserRole     `json:"role"`
+	PlatformRole  PlatformRole `json:"platform_role"`
 	Status        UserStatus   `json:"status"`
 	EmailVerified bool         `json:"email_verified"`
 	OTPEnabled    bool         `json:"otp_enabled"`
@@ -496,10 +502,10 @@ type AuthConfig struct {
 
 // JWTManager JWT管理器接口
 type JWTManager interface {
-	GenerateTokenPair(userID uint, role UserRole, sessionID string) (accessToken, refreshToken string, err error)
+	GenerateTokenPair(userID uint, platformRole PlatformRole, sessionID string) (accessToken, refreshToken string, err error)
 	GenerateRefreshTokenPair(
 		userID uint,
-		role UserRole,
+		platformRole PlatformRole,
 		sessionID, rotationSeed string,
 		issuedAt time.Time,
 	) (accessToken, refreshToken string, err error)
@@ -510,13 +516,13 @@ type JWTManager interface {
 
 // Claims JWT声明
 type Claims struct {
-	UserID    uint     `json:"user_id"`
-	Role      UserRole `json:"role"`
-	Type      string   `json:"type"` // access, refresh
-	SessionID string   `json:"sid"`
-	Exp       int64    `json:"exp"`
-	Iat       int64    `json:"iat"`
-	Jti       string   `json:"jti"`
+	UserID       uint         `json:"user_id"`
+	PlatformRole PlatformRole `json:"platform_role"`
+	Type         string       `json:"type"` // access, refresh
+	SessionID    string       `json:"sid"`
+	Exp          int64        `json:"exp"`
+	Iat          int64        `json:"iat"`
+	Jti          string       `json:"jti"`
 }
 
 // NewAuthService 创建认证服务
@@ -601,7 +607,7 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 		Username:          req.Username,
 		Email:             req.Email,
 		PasswordHash:      hashedPassword,
-		Role:              RoleCustomer,
+		PlatformRole:      PlatformRoleMember,
 		Status:            StatusActive,
 		EmailVerified:     !emailVerificationEnabled,
 		PasswordChangedAt: timePtr(time.Now()),
@@ -654,7 +660,11 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 	}
 	// 访问令牌与刷新令牌必须绑定同一个持久化会话。先生成会话 ID，
 	// 再签发令牌，旧的不含 sid 的令牌会按最新安全契约失效。
-	accessToken, refreshToken, err := s.jwtManager.GenerateTokenPair(user.ID, user.Role, sessionID)
+	accessToken, refreshToken, err := s.jwtManager.GenerateTokenPair(
+		user.ID,
+		user.PlatformRole,
+		sessionID,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate tokens: %w", err)
 	}
@@ -911,7 +921,11 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate session id: %w", err)
 	}
-	accessToken, refreshToken, err := s.jwtManager.GenerateTokenPair(user.ID, user.Role, sessionID)
+	accessToken, refreshToken, err := s.jwtManager.GenerateTokenPair(
+		user.ID,
+		user.PlatformRole,
+		sessionID,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate tokens: %w", err)
 	}
@@ -1038,7 +1052,8 @@ func (s *AuthService) refreshToken(
 	if err := s.checkUserStatus(ctx, user); err != nil {
 		return nil, err
 	}
-	if !user.Role.IsValid() || user.Role != claims.Role {
+	if !user.PlatformRole.IsValid() ||
+		user.PlatformRole != claims.PlatformRole {
 		_ = s.tokenRepo.RevokeSession(ctx, tokenRecord.UserID, sessionID)
 		return nil, ErrInvalidToken
 	}
@@ -1062,7 +1077,7 @@ func (s *AuthService) refreshToken(
 
 	accessToken, refreshToken, err := s.jwtManager.GenerateRefreshTokenPair(
 		user.ID,
-		user.Role,
+		user.PlatformRole,
 		sessionID,
 		req.RefreshToken,
 		issuedAt,
@@ -1906,7 +1921,7 @@ func (s *AuthService) buildUserInfo(user *User, profile *UserProfile) *UserInfo 
 		ID:            user.ID,
 		Username:      user.Username,
 		Email:         user.Email,
-		Role:          user.Role,
+		PlatformRole:  user.PlatformRole,
 		Status:        user.Status,
 		EmailVerified: user.EmailVerified,
 		OTPEnabled:    user.OTPEnabled,
@@ -1932,28 +1947,6 @@ func generateSecureToken(length int) (string, error) {
 
 func timePtr(t time.Time) *time.Time {
 	return &t
-}
-
-// HasPermission 检查用户是否有指定权限
-func (u *User) HasPermission(requiredRole UserRole) bool {
-	roleHierarchy := map[UserRole]int{
-		RoleCustomer:   1,
-		RoleAgent:      2,
-		RoleSupervisor: 3,
-		RoleAdmin:      4,
-	}
-
-	userLevel, exists := roleHierarchy[u.Role]
-	if !exists {
-		return false
-	}
-
-	requiredLevel, exists := roleHierarchy[requiredRole]
-	if !exists {
-		return false
-	}
-
-	return userLevel >= requiredLevel
 }
 
 // IsActive 检查用户是否处于活跃状态

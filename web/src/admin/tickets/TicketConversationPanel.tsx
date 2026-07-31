@@ -32,45 +32,25 @@ import {
 } from 'react-admin'
 import type { Ticket } from '@/types'
 import {
+    humanApiRoutes,
+    type CreateTicketCommentRequest,
+    type TicketAttachment,
+    type TicketComment,
+} from '@/lib/generated/human-api'
+import {
     localizedApiErrorMessage,
     localizedUnknownErrorMessage,
+    sessionAwareFetch,
 } from '@/lib/apiClient'
-import { projectResourcePath } from '@/lib/projectScope'
-import { canMutateTicket, type TicketRolePermissions } from './ticketAccess'
+import { joinApiUrl } from '@/lib/apiUrl'
+import { resolveActiveProjectKey } from '@/lib/projectScope'
+import {
+    canWriteInternalTicketContent,
+    canWritePublicTicketContent,
+    type TicketRolePermissions,
+} from './ticketAccess'
 
 const apiBase = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
-
-type ActorRef = {
-    type?: string
-    id?: string
-}
-
-type TicketComment = {
-    id: number
-    content: string
-    type: 'public' | 'internal' | 'system'
-    created_at: string
-    actor?: ActorRef
-    user?: {
-        username?: string
-        first_name?: string
-        last_name?: string
-    }
-    service_principal?: {
-        name?: string
-    }
-}
-
-type TicketAttachment = {
-    id: number
-    original_name: string
-    file_size: number
-    mime_type?: string
-    hash?: string
-    virus_scan: 'pending' | 'clean' | 'infected' | 'error'
-    is_public: boolean
-    created_at: string
-}
 
 const authHeaders = (contentType?: string) => {
     const headers = new Headers({ Accept: 'application/json' })
@@ -183,16 +163,25 @@ export const TicketConversationPanel = () => {
         setLoading(true)
         setError('')
         try {
-            const ticketPath = await projectResourcePath(
-                `tickets/${encodeURIComponent(String(ticket.id))}`,
-            )
+            const pathParameters = {
+                projectKey: await resolveActiveProjectKey(),
+                ticketID: Number(ticket.id),
+            }
             const [commentsResponse, attachmentsResponse] = await Promise.all([
-                fetch(`${apiBase}/${ticketPath}/comments`, {
-                    headers: authHeaders(),
-                }),
-                fetch(`${apiBase}/${ticketPath}/attachments`, {
-                    headers: authHeaders(),
-                }),
+                sessionAwareFetch(
+                    joinApiUrl(
+                        apiBase,
+                        humanApiRoutes.listProjectTicketComments(pathParameters),
+                    ),
+                    { headers: authHeaders() },
+                ),
+                sessionAwareFetch(
+                    joinApiUrl(
+                        apiBase,
+                        humanApiRoutes.listProjectTicketAttachments(pathParameters),
+                    ),
+                    { headers: authHeaders() },
+                ),
             ])
             if (!commentsResponse.ok) {
                 throw new Error(
@@ -224,7 +213,22 @@ export const TicketConversationPanel = () => {
     if (!ticket) {
         return null
     }
-    const canWrite = canMutateTicket(ticket, permissions?.role, identity?.id)
+    const canWritePublic = canWritePublicTicketContent(
+        ticket,
+        permissions?.project_role,
+        identity?.id,
+    )
+    const canWriteInternal = canWriteInternalTicketContent(
+        ticket,
+        permissions?.project_role,
+        identity?.id,
+    )
+    const visibleComments = canWriteInternal
+        ? comments
+        : comments.filter((item) => item.type !== 'internal')
+    const visibleAttachments = canWriteInternal
+        ? attachments
+        : attachments.filter((attachment) => attachment.is_public)
 
     const submitComment = async (event: FormEvent) => {
         event.preventDefault()
@@ -234,19 +238,23 @@ export const TicketConversationPanel = () => {
         try {
             const headers = authHeaders('application/json')
             headers.set('If-Match', `"v${resourceVersion}"`)
-            const ticketPath = await projectResourcePath(
-                `tickets/${encodeURIComponent(String(ticket.id))}`,
-            )
-            const response = await fetch(
-                `${apiBase}/${ticketPath}/comments`,
+            const request: CreateTicketCommentRequest = {
+                content,
+                content_type: 'text',
+                type: canWriteInternal ? commentType : 'public',
+            }
+            const response = await sessionAwareFetch(
+                joinApiUrl(
+                    apiBase,
+                    humanApiRoutes.createProjectTicketComment({
+                        projectKey: await resolveActiveProjectKey(),
+                        ticketID: Number(ticket.id),
+                    }),
+                ),
                 {
                     method: 'POST',
                     headers,
-                    body: JSON.stringify({
-                        content,
-                        content_type: 'text',
-                        type: commentType,
-                    }),
+                    body: JSON.stringify(request),
                 },
             )
             if (!response.ok) {
@@ -276,14 +284,20 @@ export const TicketConversationPanel = () => {
         try {
             const form = new FormData()
             form.append('file', file)
-            form.append('visibility', attachmentPublic ? 'public' : 'internal')
+            form.append(
+                'visibility',
+                canWriteInternal && !attachmentPublic ? 'internal' : 'public',
+            )
             const headers = authHeaders()
             headers.set('If-Match', `"v${resourceVersion}"`)
-            const ticketPath = await projectResourcePath(
-                `tickets/${encodeURIComponent(String(ticket.id))}`,
-            )
-            const response = await fetch(
-                `${apiBase}/${ticketPath}/attachments`,
+            const response = await sessionAwareFetch(
+                joinApiUrl(
+                    apiBase,
+                    humanApiRoutes.uploadProjectTicketAttachment({
+                        projectKey: await resolveActiveProjectKey(),
+                        ticketID: Number(ticket.id),
+                    }),
+                ),
                 {
                     method: 'POST',
                     headers,
@@ -313,12 +327,14 @@ export const TicketConversationPanel = () => {
 
     const downloadAttachment = async (attachment: TicketAttachment) => {
         try {
-            const attachmentPath = await projectResourcePath(
-                `tickets/${encodeURIComponent(String(ticket.id))}` +
-                    `/attachments/${encodeURIComponent(String(attachment.id))}/content`,
-            )
-            const response = await fetch(
-                `${apiBase}/${attachmentPath}`,
+            const attachmentPath =
+                humanApiRoutes.downloadProjectTicketAttachment({
+                    projectKey: await resolveActiveProjectKey(),
+                    ticketID: Number(ticket.id),
+                    attachmentID: attachment.id,
+                })
+            const response = await sessionAwareFetch(
+                joinApiUrl(apiBase, attachmentPath),
                 { headers: authHeaders() },
             )
             if (!response.ok) {
@@ -341,7 +357,7 @@ export const TicketConversationPanel = () => {
 
     return (
         <Stack spacing={3}>
-            {canWrite ? (
+            {canWritePublic ? (
                 <Card variant="outlined" role="region" aria-label="添加工单评论">
                     <CardContent>
                         <Typography variant="h6" gutterBottom>
@@ -359,20 +375,24 @@ export const TicketConversationPanel = () => {
                                     slotProps={{ htmlInput: { maxLength: 10000 } }}
                                 />
                                 <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
-                                    <FormControl sx={{ minWidth: 180 }}>
-                                        <InputLabel id="comment-visibility-label">可见性</InputLabel>
-                                        <Select
-                                            labelId="comment-visibility-label"
-                                            label="可见性"
-                                            value={commentType}
-                                            onChange={(event) =>
-                                                setCommentType(event.target.value as 'public' | 'internal')
-                                            }
-                                        >
-                                            <MenuItem value="public">公开评论</MenuItem>
-                                            <MenuItem value="internal">内部评论</MenuItem>
-                                        </Select>
-                                    </FormControl>
+                                    {canWriteInternal ? (
+                                        <FormControl sx={{ minWidth: 180 }}>
+                                            <InputLabel id="comment-visibility-label">可见性</InputLabel>
+                                            <Select
+                                                labelId="comment-visibility-label"
+                                                label="可见性"
+                                                value={commentType}
+                                                onChange={(event) =>
+                                                    setCommentType(event.target.value as 'public' | 'internal')
+                                                }
+                                            >
+                                                <MenuItem value="public">公开评论</MenuItem>
+                                                <MenuItem value="internal">内部评论</MenuItem>
+                                            </Select>
+                                        </FormControl>
+                                    ) : (
+                                        <Chip label="公开评论" variant="outlined" />
+                                    )}
                                     <Button
                                         type="submit"
                                         variant="contained"
@@ -405,13 +425,13 @@ export const TicketConversationPanel = () => {
                 <Card variant="outlined" role="region" aria-label="工单评论记录">
                     <CardContent>
                         <Typography variant="h6">评论记录</Typography>
-                        {comments.length === 0 ? (
+                        {visibleComments.length === 0 ? (
                             <Typography color="text.secondary" sx={{ mt: 2 }}>
                                 暂无评论
                             </Typography>
                         ) : (
                             <List disablePadding>
-                                {comments.map((item, index) => (
+                                {visibleComments.map((item, index) => (
                                     <Box key={item.id}>
                                         {index > 0 && <Divider />}
                                         <ListItem alignItems="flex-start">
@@ -474,7 +494,7 @@ export const TicketConversationPanel = () => {
                         附件
                     </Typography>
                     <Stack spacing={2}>
-                        {canWrite && <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+                        {canWritePublic && <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
                             <Button
                                 component="label"
                                 variant="outlined"
@@ -490,20 +510,24 @@ export const TicketConversationPanel = () => {
                             <Typography sx={{ alignSelf: 'center' }} color="text.secondary">
                                 {file?.name ?? '未选择文件'}
                             </Typography>
-                            <FormControl sx={{ minWidth: 160 }}>
-                                <InputLabel id="attachment-visibility-label">可见性</InputLabel>
-                                <Select
-                                    labelId="attachment-visibility-label"
-                                    label="可见性"
-                                    value={attachmentPublic ? 'public' : 'internal'}
-                                    onChange={(event) =>
-                                        setAttachmentPublic(event.target.value === 'public')
-                                    }
-                                >
-                                    <MenuItem value="internal">内部附件</MenuItem>
-                                    <MenuItem value="public">公开附件</MenuItem>
-                                </Select>
-                            </FormControl>
+                            {canWriteInternal ? (
+                                <FormControl sx={{ minWidth: 160 }}>
+                                    <InputLabel id="attachment-visibility-label">可见性</InputLabel>
+                                    <Select
+                                        labelId="attachment-visibility-label"
+                                        label="可见性"
+                                        value={attachmentPublic ? 'public' : 'internal'}
+                                        onChange={(event) =>
+                                            setAttachmentPublic(event.target.value === 'public')
+                                        }
+                                    >
+                                        <MenuItem value="internal">内部附件</MenuItem>
+                                        <MenuItem value="public">公开附件</MenuItem>
+                                    </Select>
+                                </FormControl>
+                            ) : (
+                                <Chip label="公开附件" variant="outlined" />
+                            )}
                             <Button
                                 variant="contained"
                                 onClick={submitAttachment}
@@ -513,11 +537,11 @@ export const TicketConversationPanel = () => {
                             </Button>
                         </Stack>}
 
-                        {attachments.length === 0 ? (
+                        {visibleAttachments.length === 0 ? (
                             <Typography color="text.secondary">暂无附件</Typography>
                         ) : (
                             <List disablePadding>
-                                {attachments.map((attachment, index) => (
+                                {visibleAttachments.map((attachment, index) => (
                                     <Box key={attachment.id}>
                                         {index > 0 && <Divider />}
                                         <ListItem

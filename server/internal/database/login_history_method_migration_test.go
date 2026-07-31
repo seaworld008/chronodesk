@@ -30,7 +30,7 @@ func TestLoginHistoryMethodModelEnforcesClosedEnum(t *testing.T) {
 		Username:     "login-method-model",
 		Email:        "login-method-model@example.test",
 		PasswordHash: "hash",
-		Role:         models.RoleCustomer,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}).Error; err != nil {
 		t.Fatalf("seed login history user: %v", err)

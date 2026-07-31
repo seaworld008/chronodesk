@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
@@ -22,6 +23,8 @@ func testProjectOperationContext(
 		&models.Organization{},
 		&models.BusinessUnit{},
 		&models.Project{},
+		&models.ProjectMembership{},
+		&models.ProjectPrincipalGrant{},
 		&models.Team{},
 		&models.Queue{},
 		&models.RequestTypeVersion{},
@@ -177,4 +180,45 @@ func sourceProtocolForTestActor(actor models.ActorRef) SourceProtocol {
 		return SourceProtocolWorker
 	}
 	return SourceProtocolHumanREST
+}
+
+func ensureTestHumanProjectRole(
+	t *testing.T,
+	db *gorm.DB,
+	ctx context.Context,
+	userID uint,
+	role models.ProjectRole,
+) {
+	t.Helper()
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var membership models.ProjectMembership
+	result := db.Where(
+		"project_id = ? AND user_id = ?",
+		operation.Scope.ProjectID,
+		userID,
+	).First(&membership)
+	switch {
+	case result.Error == nil:
+		if err := db.Model(&membership).Updates(map[string]any{
+			"role":      role,
+			"is_active": true,
+		}).Error; err != nil {
+			t.Fatalf("update test project membership: %v", err)
+		}
+	case errors.Is(result.Error, gorm.ErrRecordNotFound):
+		if err := db.Create(&models.ProjectMembership{
+			ProjectID: operation.Scope.ProjectID,
+			UserID:    userID,
+			Role:      role,
+			IsActive:  true,
+			Version:   1,
+		}).Error; err != nil {
+			t.Fatalf("create test project membership: %v", err)
+		}
+	default:
+		t.Fatalf("load test project membership: %v", result.Error)
+	}
 }

@@ -148,6 +148,7 @@ server/ticket-system
 # Python bytecode and caches
 __pycache__/
 *.py[cod]
+.venv/
 
 # Backup files
 *.bak

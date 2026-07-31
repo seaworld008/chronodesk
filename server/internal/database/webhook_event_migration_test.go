@@ -34,7 +34,7 @@ func openWebhookMigrationTestDB(t *testing.T) *gorm.DB {
 		Username:     "webhook-migration-owner",
 		Email:        "webhook-migration-owner@example.test",
 		PasswordHash: "hash",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}).Error; err != nil {
 		t.Fatal(err)
@@ -259,6 +259,12 @@ func TestMigrateWebhookEventTaxonomyRejectsPublisherlessHistoricalLog(t *testing
 
 func TestRunMigrationsInvokesWebhookEventTaxonomyMigration(t *testing.T) {
 	db := openWebhookMigrationTestDB(t)
+	if err := db.Exec(`
+		ALTER TABLE users
+		ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'
+	`).Error; err != nil {
+		t.Fatalf("prepare provable legacy human role state: %v", err)
+	}
 	insertLegacyWebhookConfig(t, db, 1, "closed", `["ticket.closed"]`)
 
 	if err := RunMigrations(

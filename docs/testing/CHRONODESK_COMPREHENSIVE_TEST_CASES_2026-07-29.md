@@ -63,10 +63,11 @@
 
 | 代号 | 身份 | 权限用途 |
 |---|---|---|
-| H-ADMIN | 人类管理员 | 系统配置、用户、Agent 控制、全部工单 |
-| H-SUP | 人类主管 | 队列、分配、升级、内部评论、统计 |
-| H-AGENT-A/B | 两个人类客服 | 并发、对象级权限、分配与处理 |
-| H-CUSTOMER-A/B | 两个客户 | 仅本人工单、公开评论、越权验证 |
+| H-PLATFORM-ADMIN | `platform_admin` 人类账号 | 平台系统配置、用户与 Agent 控制；不因平台角色隐式获得项目工单 |
+| H-PROJECT-ADMIN | `member` + 显式 `project_admin` Membership | 当前项目成员、队列、全部项目工单与项目配置 |
+| H-MANAGER | `member` + 显式 `manager` Membership | 当前项目队列、分配、升级、内部评论与统计 |
+| H-AGENT-A/B | `member` + 显式 `agent` Membership | 并发、对象级权限、分配与处理 |
+| H-REQUESTER-A/B | `member` + 显式 `requester` Membership | 仅本人创建的工单、公开评论与越权验证 |
 | SP-FULL | 服务主体 | 最小工作 scope + 显式策略 |
 | SP-READ | 只读服务主体 | 查询与订阅，所有写入应拒绝 |
 | SP-DISABLED | 停用服务主体 | 所有 token/操作应拒绝 |
@@ -97,7 +98,7 @@
 
 | ID | P | 操作 | 预期 | 自动化 |
 |---|---:|---|---|---|
-| AUTH-001 | P0 | 使用合法资料注册 | 默认 `customer`，密码仅存 bcrypt，返回无敏感字段 | GO/PY |
+| AUTH-001 | P0 | 使用合法资料注册 | 默认平台角色 `member`，不自动授予项目 Membership；密码仅存 bcrypt，返回无敏感字段 | GO/PY |
 | AUTH-002 | P0 | 注册缺字段、错误邮箱、弱密码、超长输入 | 400，稳定中文错误，不写库 | GO/PY |
 | AUTH-003 | P0 | 重复邮箱并发注册 | 仅一个账号成功，其余 409 | GO |
 | AUTH-004 | P0 | 正确账号密码登录 | 签发绑定 session 的短期 access/refresh token | GO/PY/PW |
@@ -124,18 +125,18 @@
 
 | ID | P | 操作 | 预期 | 自动化 |
 |---|---:|---|---|---|
-| RBAC-001 | P0 | Admin 读取/修改全部工单 | 允许并写审计 | GO/PY |
-| RBAC-002 | P0 | Supervisor 查看队列、分配与升级 | 允许；系统管理仍拒绝 | GO/PY |
-| RBAC-003 | P0 | Agent 读取未分配/分配给自己的工单 | 按可见性规则返回 | GO/PY |
-| RBAC-004 | P0 | Agent 修改无权工单 | 403，不泄露内部字段 | GO/PY |
-| RBAC-005 | P0 | Customer 读取本人创建工单 | 允许，内部评论/内部字段过滤 | GO/PY |
-| RBAC-006 | P0 | Customer 读取另一客户工单 | 404 或策略化 403，不泄露是否存在 | GO/PY |
-| RBAC-007 | P0 | Customer 添加公开评论 | 允许；内部评论类型拒绝 | GO/PY/PW |
-| RBAC-008 | P0 | 非 Admin 访问用户/系统/Agent 控制 API | 403 | GO/PY/PW |
+| RBAC-001 | P0 | `project_admin` 读取/修改项目工单 | 允许并写审计，不扩大到其他项目 | GO/PY |
+| RBAC-002 | P0 | `manager` 查看队列、分配与升级 | 允许；平台系统管理仍拒绝 | GO/PY |
+| RBAC-003 | P0 | `agent` 读取未分配/分配给自己的工单 | 按可见性规则返回 | GO/PY |
+| RBAC-004 | P0 | `agent` 修改无权工单 | 403，不泄露内部字段 | GO/PY |
+| RBAC-005 | P0 | `requester` 读取本人创建工单 | 允许，内部评论/内部字段过滤 | GO/PY |
+| RBAC-006 | P0 | `requester` 读取另一请求人工单 | 404 或策略化 403，不泄露是否存在 | GO/PY |
+| RBAC-007 | P0 | `requester` 添加公开评论 | 允许；内部评论类型拒绝 | GO/PY/PW |
+| RBAC-008 | P0 | 非 `platform_admin` 访问用户写入/系统配置/Agent 控制 API | 按各端点平台角色白名单返回 403 | GO/PY/PW |
 | RBAC-009 | P0 | 停用/删除用户继续使用 token | 401 | GO |
-| RBAC-010 | P0 | 四种人类角色之外创建/更新用户 | 400；数据库 CHECK 也拒绝 | GO/PY |
-| RBAC-011 | P1 | 管理员不能删除/降级最后一个管理员 | 明确拒绝，避免管理面失联 | GO/PY |
-| RBAC-012 | P1 | Human 管理员角色变更审计 | 操作者、目标用户路径/ID、方法、结果、时间与来源完整；敏感 query 脱敏（Agent 写操作的 diff/event 契约不强加给 Human 管理面） | GO/PY |
+| RBAC-010 | P0 | 封闭平台角色或项目角色枚举之外的写入 | 400；数据库 CHECK 也拒绝 | GO/PY |
+| RBAC-011 | P1 | 不能删除、停用或降级最后一个活跃 `platform_admin` | 明确拒绝，避免管理面失联 | GO/PY |
+| RBAC-012 | P1 | Human 平台角色变更审计 | 操作者、目标用户路径/ID、方法、结果、时间与来源完整；敏感 query 脱敏（Agent 写操作的 diff/event 契约不强加给 Human 管理面） | GO/PY |
 
 ## 7. 工单生命周期、查询与并发
 
@@ -177,8 +178,8 @@
 | ID | P | 操作 | 预期 | 自动化 |
 |---|---:|---|---|---|
 | CNT-001 | P0 | 添加公开评论 | version+1、评论/事件/历史/通知同事务 | GO/PY/PW |
-| CNT-002 | P0 | 添加内部评论 | 仅 Agent/Supervisor/Admin 可见 | GO/PY/PW |
-| CNT-003 | P0 | Customer 尝试内部/系统评论 | 403 | GO/PY |
+| CNT-002 | P0 | 添加内部评论 | 仅当前项目 `project_admin`、`manager`、`agent` 可见 | GO/PY/PW |
+| CNT-003 | P0 | `requester` 尝试内部/系统评论 | 403 | GO/PY |
 | CNT-004 | P0 | 空、超长、HTML/提示注入评论 | 边界拒绝或作为不可信文本保存，不执行指令 | GO/PY |
 | CNT-005 | P1 | 回复评论与 reply_count | 父评论必须属于同工单，计数原子更新 | GO/PY |
 | CNT-006 | P0 | 上传合法小文件 | SHA-256、真实 MIME、scan=pending、事件一致 | GO/PY/PW |
@@ -326,7 +327,7 @@
 | UI-010 | P0 | 编辑/分配/状态/升级/删除 | 成功提示中文，数据刷新，无双击重复 | PW/CH |
 | UI-011 | P0 | 评论和附件真实操作 | 上传进度、扫描状态、下载与失败提示正确 | PW/CH |
 | UI-012 | P1 | 工单筛选/搜索/清空/分页 | URL/状态一致，刷新可恢复 | PW/CH |
-| UI-013 | P0 | 用户列表/创建/详情/编辑 | 四角色、Tab、状态、敏感信息隐藏 | PW/CH |
+| UI-013 | P0 | 用户列表/创建/详情/编辑 | 平台角色、Tab、状态、敏感信息隐藏 | PW/CH |
 | UI-014 | P0 | 通知列表/已读/全部已读 | 未读数同步，无英文残留 | PW/CH |
 | UI-015 | P0 | 自动化规则列表/创建/详情/编辑 | 仅 canonical 事件，中文名+机器类型 | PW/CH |
 | UI-016 | P1 | 自动化日志 | 时间、状态、错误、空态完整 | PW/CH |
@@ -390,13 +391,13 @@
 
 ### E2E-HUMAN-001：人类客服后台完整处理工单
 
-1. Admin 创建 Agent 与 Customer；
-2. Customer 创建工单和公开评论；
-3. Agent 在列表筛选到工单、调整列宽、打开详情；
-4. Agent 分配给自己、添加内部评论、上传附件；
-5. Supervisor 升级并转移；
-6. Agent 解决，Customer 查看并关闭；
-7. 所有页面提示为中文，客户永远看不到内部评论。
+1. `platform_admin` 创建三个 `member` 账号，但不自动授予项目访问；
+2. `project_admin` 为三个账号分别建立 `manager`、`agent`、`requester` Membership；
+3. `requester` 创建工单和公开评论；
+4. `agent` 在列表筛选到工单、调整列宽、打开详情，随后分配给自己、添加内部评论并上传附件；
+5. `manager` 升级并转移；
+6. `agent` 解决，`requester` 查看并关闭；
+7. 所有页面提示为中文，`requester` 永远看不到内部评论，平台角色不扩大项目范围。
 
 ### E2E-RECOVERY-001：事务成功后进程退出
 

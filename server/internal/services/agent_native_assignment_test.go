@@ -5,8 +5,10 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"gorm.io/datatypes"
 )
 
 func TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules(t *testing.T) {
@@ -34,6 +36,99 @@ func TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules(t *testing.T
 		true,
 	); err != nil {
 		t.Fatalf("emergency-disable assignment principal: %v", err)
+	}
+	ctx := testProjectOperationContext(t, db, models.HumanActor(user.ID))
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.ProjectMembership{
+		ProjectID: operation.Scope.ProjectID,
+		UserID:    user.ID,
+		Role:      models.ProjectRoleAgent,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, principal := range []*models.ServicePrincipal{active, inactive, emergency} {
+		if err := db.Create(&models.ProjectPrincipalGrant{
+			ProjectID:          operation.Scope.ProjectID,
+			ServicePrincipalID: principal.ID,
+			Role:               models.ProjectRoleAgent,
+			Scopes:             datatypes.JSON(`["tickets:assign"]`),
+			IsActive:           true,
+		}).Error; err != nil {
+			t.Fatalf("grant assignment principal %s: %v", principal.ID, err)
+		}
+	}
+	requester := seedActorUser(t, db, "assignment-requester")
+	if err := db.Create(&models.ProjectMembership{
+		ProjectID: operation.Scope.ProjectID,
+		UserID:    requester.ID,
+		Role:      models.ProjectRoleRequester,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	crossProjectUser := seedActorUser(t, db, "assignment-other-project")
+	var currentProject models.Project
+	if err := db.First(&currentProject, operation.Scope.ProjectID).Error; err != nil {
+		t.Fatal(err)
+	}
+	otherProject := models.Project{
+		OrganizationID: currentProject.OrganizationID,
+		BusinessUnitID: currentProject.BusinessUnitID,
+		Key:            models.ProjectKey("OTHER"),
+		Name:           "Other",
+		Status:         models.ProjectStatusActive,
+	}
+	if err := db.Create(&otherProject).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.ProjectMembership{
+		ProjectID: otherProject.ID,
+		UserID:    crossProjectUser.ID,
+		Role:      models.ProjectRoleAgent,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	integrationOnly := createNativePrincipal(
+		t,
+		service,
+		user.ID,
+		"assignment-integration-only",
+		models.ScopeTicketsRead,
+	)
+	if err := db.Create(&models.ProjectPrincipalGrant{
+		ProjectID:          operation.Scope.ProjectID,
+		ServicePrincipalID: integrationOnly.ID,
+		Role:               models.ProjectRoleAgent,
+		Scopes:             datatypes.JSON(`["tickets:read"]`),
+		IsActive:           true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	expiredGrantPrincipal := createNativePrincipal(
+		t,
+		service,
+		user.ID,
+		"assignment-expired-grant",
+		models.ScopeTicketsAssign,
+	)
+	expiredAt := time.Now().Add(-time.Minute)
+	if err := db.Create(&models.ProjectPrincipalGrant{
+		ProjectID:          operation.Scope.ProjectID,
+		ServicePrincipalID: expiredGrantPrincipal.ID,
+		Role:               models.ProjectRoleAgent,
+		Scopes:             datatypes.JSON(`["tickets:assign"]`),
+		IsActive:           true,
+		ExpiresAt:          &expiredAt,
+	}).Error; err != nil {
+		t.Fatal(err)
 	}
 	tests := []struct {
 		name     string
@@ -73,10 +168,30 @@ func TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules(t *testing.T
 			assignee: models.ServicePrincipalActor(emergency.ID),
 			wantErr:  ErrAssigneePolicyDenied,
 		},
+		{
+			name:     "requester is not assignable",
+			assignee: models.HumanActor(requester.ID),
+			wantErr:  ErrAssigneePolicyDenied,
+		},
+		{
+			name:     "other project human is not assignable",
+			assignee: models.HumanActor(crossProjectUser.ID),
+			wantErr:  ErrAssigneePolicyDenied,
+		},
+		{
+			name:     "integration-only principal is not assignable",
+			assignee: models.ServicePrincipalActor(integrationOnly.ID),
+			wantErr:  ErrAssigneePolicyDenied,
+		},
+		{
+			name:     "expired project grant is not assignable",
+			assignee: models.ServicePrincipalActor(expiredGrantPrincipal.ID),
+			wantErr:  ErrAssigneePolicyDenied,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			changes, err := service.ResolveTicketAssignmentChanges(context.Background(), &test.assignee)
+			changes, err := service.ResolveTicketAssignmentChanges(ctx, &test.assignee)
 			if !errors.Is(err, test.wantErr) {
 				t.Fatalf("ResolveTicketAssignmentChanges() error = %v, want %v", err, test.wantErr)
 			}
@@ -88,7 +203,7 @@ func TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules(t *testing.T
 
 	t.Run("human", func(t *testing.T) {
 		assignee := models.HumanActor(user.ID)
-		got, err := service.ResolveTicketAssignmentChanges(context.Background(), &assignee)
+		got, err := service.ResolveTicketAssignmentChanges(ctx, &assignee)
 		if err != nil {
 			t.Fatalf("resolve human assignment: %v", err)
 		}
@@ -105,7 +220,7 @@ func TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules(t *testing.T
 
 	t.Run("active service principal", func(t *testing.T) {
 		assignee := models.ServicePrincipalActor(active.ID)
-		got, err := service.ResolveTicketAssignmentChanges(context.Background(), &assignee)
+		got, err := service.ResolveTicketAssignmentChanges(ctx, &assignee)
 		if err != nil {
 			t.Fatalf("resolve principal assignment: %v", err)
 		}
@@ -122,7 +237,7 @@ func TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules(t *testing.T
 
 	t.Run("release", func(t *testing.T) {
 		got, err := service.ResolveTicketAssignmentChanges(
-			context.Background(),
+			ctx,
 			nil,
 		)
 		if err != nil {
@@ -141,7 +256,7 @@ func TestResolveTicketAssignmentChangesEnforcesCanonicalDomainRules(t *testing.T
 
 	t.Run("system is not an assignment target", func(t *testing.T) {
 		assignee := models.SystemActor("scheduler")
-		got, err := service.ResolveTicketAssignmentChanges(context.Background(), &assignee)
+		got, err := service.ResolveTicketAssignmentChanges(ctx, &assignee)
 		if !errors.Is(err, ErrInvalidAssignee) {
 			t.Fatalf("ResolveTicketAssignmentChanges() error = %v, want %v", err, ErrInvalidAssignee)
 		}

@@ -9,23 +9,23 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
-func TestAdminUserServiceRejectsRolesOutsideClosedHumanEnum(t *testing.T) {
+func TestAdminUserServiceRejectsRolesOutsideClosedPlatformEnum(t *testing.T) {
 	service := NewAdminUserService(openTestDB(t))
-	invalidRole := models.UserRole("user")
+	invalidRole := models.PlatformRole("admin")
 
 	if _, err := service.GetUserList(context.Background(), &UserListRequest{
-		Role: &invalidRole,
-	}); err == nil || !strings.Contains(err.Error(), "invalid human role") {
+		PlatformRole: &invalidRole,
+	}); err == nil || !strings.Contains(err.Error(), "invalid platform role") {
 		t.Errorf("GetUserList invalid role error = %v", err)
 	}
 	if _, err := service.CreateUser(context.Background(), &models.UserCreateRequest{
-		Role: invalidRole,
-	}); err == nil || !strings.Contains(err.Error(), "invalid human role") {
+		PlatformRole: invalidRole,
+	}); err == nil || !strings.Contains(err.Error(), "invalid platform role") {
 		t.Errorf("CreateUser invalid role error = %v", err)
 	}
-	if _, err := service.UpdateUser(context.Background(), 1, &models.UserUpdateRequest{
-		Role: &invalidRole,
-	}); err == nil || !strings.Contains(err.Error(), "invalid human role") {
+	if _, err := service.UpdateUser(context.Background(), models.HumanActor(1), 1, &models.UserUpdateRequest{
+		PlatformRole: &invalidRole,
+	}); err == nil || !strings.Contains(err.Error(), "invalid platform role") {
 		t.Errorf("UpdateUser invalid role error = %v", err)
 	}
 }
@@ -39,7 +39,7 @@ func TestAdminUserServiceUpdatePreservesLastActiveAdmin(t *testing.T) {
 		Username:     "last-admin",
 		Email:        "last-admin@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&admin).Error; err != nil {
@@ -50,9 +50,10 @@ func TestAdminUserServiceUpdatePreservesLastActiveAdmin(t *testing.T) {
 	service := NewAdminUserService(db)
 	if _, err := service.UpdateUser(
 		context.Background(),
+		models.HumanActor(admin.ID),
 		admin.ID,
 		&models.UserUpdateRequest{Status: &suspended},
-	); err == nil || !strings.Contains(err.Error(), "cannot deactivate") {
+	); !errors.Is(err, ErrLastActivePlatformAdministrator) {
 		t.Fatalf("last admin update error = %v", err)
 	}
 
@@ -74,7 +75,7 @@ func TestAdminUserServiceTreatsSoftDeletedIdentityAsConflict(t *testing.T) {
 		Username:     "retained-identity",
 		Email:        "retained-identity@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusDeleted,
 	}
 	if err := db.Create(&deleted).Error; err != nil {
@@ -86,10 +87,10 @@ func TestAdminUserServiceTreatsSoftDeletedIdentityAsConflict(t *testing.T) {
 
 	service := NewAdminUserService(db)
 	_, err := service.CreateUser(context.Background(), &models.UserCreateRequest{
-		Username: "new-identity",
-		Email:    deleted.Email,
-		Password: "StrongPassword123!",
-		Role:     models.RoleAgent,
+		Username:     "new-identity",
+		Email:        deleted.Email,
+		Password:     "StrongPassword123!",
+		PlatformRole: models.PlatformRoleMember,
 	})
 	if !errors.Is(err, ErrAdminUserIdentityConflict) {
 		t.Fatalf("CreateUser error = %v, want identity conflict", err)
@@ -99,7 +100,7 @@ func TestAdminUserServiceTreatsSoftDeletedIdentityAsConflict(t *testing.T) {
 		Username:     "active-identity",
 		Email:        "active-identity@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&active).Error; err != nil {
@@ -107,6 +108,7 @@ func TestAdminUserServiceTreatsSoftDeletedIdentityAsConflict(t *testing.T) {
 	}
 	_, err = service.UpdateUser(
 		context.Background(),
+		models.HumanActor(active.ID),
 		active.ID,
 		&models.UserUpdateRequest{Email: &deleted.Email},
 	)

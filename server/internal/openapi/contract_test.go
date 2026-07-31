@@ -122,6 +122,37 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 				path,
 			)
 		}
+		for _, method := range []string{
+			"get",
+			"post",
+			"put",
+			"patch",
+			"delete",
+		} {
+			rawOperation, exists := pathItem[method]
+			if !exists {
+				continue
+			}
+			operation := contractMap(
+				t,
+				rawOperation,
+				"paths."+path+"."+method,
+			)
+			roles := contractSlice(
+				t,
+				operation["x-chronodesk-project-roles"],
+				"paths."+path+"."+method+
+					".x-chronodesk-project-roles",
+			)
+			if len(roles) != 1 || roles[0] != "project_admin" {
+				t.Errorf(
+					"project Agent administrator operation %s %s roles = %v, want [project_admin]",
+					strings.ToUpper(method),
+					path,
+					roles,
+				)
+			}
+		}
 	}
 	for _, removed := range []string{
 		"/projects/{projectKey}/admin/agents/agent-control/read-only",

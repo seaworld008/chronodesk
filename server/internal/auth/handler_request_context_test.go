@@ -98,7 +98,7 @@ func requestContextAuthHandler(
 	manager := mustTestJWTManager(t, time.Hour, time.Hour)
 	accessToken, _, err := manager.GenerateTokenPair(
 		42,
-		RoleAdmin,
+		PlatformRolePlatformAdmin,
 		"request-context-session",
 	)
 	if err != nil {
@@ -142,9 +142,9 @@ func executeRequestContextAuth(
 
 func TestRequireAuthDoesNotWriteJSONAfterReadRequestContextEnds(t *testing.T) {
 	activeUser := &User{
-		ID:     42,
-		Role:   RoleAdmin,
-		Status: StatusActive,
+		ID:           42,
+		PlatformRole: PlatformRolePlatformAdmin,
+		Status:       StatusActive,
 	}
 	tests := []struct {
 		name            string
@@ -224,9 +224,9 @@ func TestRequireAuthDoesNotWriteJSONAfterReadRequestContextEnds(t *testing.T) {
 
 func TestRequireAuthKeepsRepositoryFailuresFailClosed(t *testing.T) {
 	activeUser := &User{
-		ID:     42,
-		Role:   RoleAdmin,
-		Status: StatusActive,
+		ID:           42,
+		PlatformRole: PlatformRolePlatformAdmin,
+		Status:       StatusActive,
 	}
 	tests := []struct {
 		name            string

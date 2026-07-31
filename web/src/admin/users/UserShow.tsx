@@ -12,9 +12,7 @@ import {
     ListButton,
     TabbedShowLayout,
     Tab,
-    ReferenceManyField,
     NumberField,
-    FunctionField,
 } from 'react-admin';
 import { FocusSafeDeleteButton } from '@/components/actions/FocusSafeDeleteButtons';
 import {
@@ -38,9 +36,6 @@ import {
     Language as LanguageIcon,
     Schedule as TimezoneIcon,
     AdminPanelSettings as AdminIcon,
-    Support as SupportIcon,
-    Business as CustomerIcon,
-    SupervisorAccount as SupervisorIcon,
     CheckCircle as CheckCircleIcon,
     Cancel as CancelIcon,
     Warning as WarningIcon,
@@ -49,22 +44,10 @@ import {
 import BackButton from '../common/BackButton';
 import { User } from '@/types';
 import {
-    EnterpriseDatagrid,
-    TruncatedText,
-    type ResizableColumn,
-} from '@/components/tables/EnterpriseTable';
-import {
-    getUserRoleLabel,
-    normalizeUserRole,
-    userRoleChoices,
+    getPlatformRoleLabel,
+    parsePlatformRole,
+    platformRoleChoices,
 } from '@/lib/accessControl';
-
-const relatedTicketColumns: ResizableColumn[] = [
-    { key: 'ticket_number', defaultWidth: 156, minWidth: 120, maxWidth: 240 },
-    { key: 'title', defaultWidth: 360, minWidth: 200, maxWidth: 640 },
-    { key: 'status', defaultWidth: 132, minWidth: 104, maxWidth: 220 },
-    { key: 'timestamp', defaultWidth: 188, minWidth: 144, maxWidth: 280 },
-];
 
 // 状态选项（与UserList保持一致）
 const statusChoices = [
@@ -105,16 +88,16 @@ const UserHeader: React.FC = () => {
     const fullName = `${record.first_name || ''} ${record.last_name || ''}`.trim();
     const displayName = record.display_name || fullName || record.username;
 
-    const getRoleConfig = (role: User['role']): ChipConfig => {
-        switch (normalizeUserRole(role)) {
-            case 'admin':
+    const getRoleConfig = (role: User['platform_role']): ChipConfig => {
+        switch (parsePlatformRole(role)) {
+            case 'platform_admin':
                 return { color: 'error', icon: <AdminIcon /> };
-            case 'agent':
-                return { color: 'primary', icon: <SupportIcon /> };
-            case 'supervisor':
-                return { color: 'secondary', icon: <SupervisorIcon /> };
-            case 'customer':
-                return { color: 'success', icon: <CustomerIcon /> };
+            case 'security_auditor':
+                return { color: 'primary', icon: <SecurityIcon /> };
+            case 'emergency_operator':
+                return { color: 'warning', icon: <WarningIcon /> };
+            case 'member':
+                return { color: 'default', icon: <PersonIcon /> };
             default:
                 return { color: 'default', icon: <PersonIcon /> };
         }
@@ -137,8 +120,8 @@ const UserHeader: React.FC = () => {
 
     const typedStatusConfig = getStatusConfig(record.status);
 
-    const roleConfig = getRoleConfig(record.role);
-    const roleName = getUserRoleLabel(record.role);
+    const roleConfig = getRoleConfig(record.platform_role);
+    const roleName = getPlatformRoleLabel(record.platform_role);
     const statusName = statusChoices.find(s => s.id === record.status)?.name || '未知状态';
 
     return (
@@ -491,9 +474,12 @@ const UserShow: React.FC = () => {
                                                     <Typography variant="subtitle2" gutterBottom sx={{
                                                         color: "text.secondary"
                                                     }}>
-                                                        角色
+                                                        平台职责
                                                     </Typography>
-                                                    <SelectField source="role" choices={userRoleChoices} />
+                                                    <SelectField
+                                                        source="platform_role"
+                                                        choices={platformRoleChoices}
+                                                    />
                                                 </Box>
                                                 
                                                 <Box sx={{ flex: 1, minWidth: '150px' }}>
@@ -535,98 +521,6 @@ const UserShow: React.FC = () => {
                                     <AccountStatusCard />
                                 </Stack>
                             </Box>
-                        </Box>
-                    </Tab>
-                    
-                    {/* 工单历史 */}
-                    <Tab label="相关工单">
-                        <ReferenceManyField
-                            reference="tickets"
-                            target="created_by_id"
-                            label="创建的工单"
-                            perPage={10}
-                            sort={{ field: 'created_at', order: 'DESC' }}
-                        >
-                            <EnterpriseDatagrid
-                                tableId="users.show.created-tickets"
-                                columns={relatedTicketColumns}
-                                aria-label="该用户创建的工单列表"
-                                bulkActionButtons={false}
-                            >
-                                <TextField source="ticket_number" label="工单编号" />
-                                <FunctionField
-                                    label="标题"
-                                    sortBy="title"
-                                    render={(record) => (
-                                        <TruncatedText title={record?.title}>{record?.title || '—'}</TruncatedText>
-                                    )}
-                                />
-                                <SelectField 
-                                    source="status" 
-                                    label="状态" 
-                                    choices={[
-                                        { id: 'open', name: '待处理' },
-                                        { id: 'in_progress', name: '处理中' },
-                                        { id: 'pending', name: '等待中' },
-                                        { id: 'resolved', name: '已解决' },
-                                        { id: 'closed', name: '已关闭' },
-                                        { id: 'cancelled', name: '已取消' },
-                                    ]}
-                                />
-                                <DateField 
-                                    source="created_at" 
-                                    label="创建时间" 
-                                    showTime 
-                                    locales="zh-CN"
-                                />
-                            </EnterpriseDatagrid>
-                        </ReferenceManyField>
-                        
-                        <Box sx={{ mt: 4 }}>
-                            <Typography variant="h6" gutterBottom>
-                                分配的工单
-                            </Typography>
-                            <ReferenceManyField
-                                reference="tickets"
-                                target="assigned_to_id"
-                                label=""
-                                perPage={10}
-                                sort={{ field: 'created_at', order: 'DESC' }}
-                            >
-                                <EnterpriseDatagrid
-                                    tableId="users.show.assigned-tickets"
-                                    columns={relatedTicketColumns}
-                                    aria-label="该用户负责的工单列表"
-                                    bulkActionButtons={false}
-                                >
-                                    <TextField source="ticket_number" label="工单编号" />
-                                    <FunctionField
-                                        label="标题"
-                                        sortBy="title"
-                                        render={(record) => (
-                                            <TruncatedText title={record?.title}>{record?.title || '—'}</TruncatedText>
-                                        )}
-                                    />
-                                    <SelectField 
-                                        source="status" 
-                                        label="状态" 
-                                        choices={[
-                                            { id: 'open', name: '待处理' },
-                                            { id: 'in_progress', name: '处理中' },
-                                            { id: 'pending', name: '等待中' },
-                                            { id: 'resolved', name: '已解决' },
-                                            { id: 'closed', name: '已关闭' },
-                                            { id: 'cancelled', name: '已取消' },
-                                        ]}
-                                    />
-                                    <DateField 
-                                        source="updated_at" 
-                                        label="最后更新" 
-                                        showTime 
-                                        locales="zh-CN"
-                                    />
-                                </EnterpriseDatagrid>
-                            </ReferenceManyField>
                         </Box>
                     </Tab>
                     

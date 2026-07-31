@@ -46,7 +46,7 @@ func newOTPSecretStorageTest(
 		Username:     "otp-storage-user",
 		Email:        "otp-storage@example.test",
 		PasswordHash: "$2a$10$3fG2XevM/i0vGg3tnBFDGuE6PoIgto7HGMlZosX8KCOj4I8tC9q2a",
-		Role:         RoleCustomer,
+		PlatformRole: PlatformRoleMember,
 		Status:       StatusActive,
 	}
 	if err := repository.Create(context.Background(), user); err != nil {

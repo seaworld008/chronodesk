@@ -19,6 +19,22 @@ type NotificationHandler struct {
 	notificationService services.NotificationServiceInterface
 }
 
+type notificationPreferenceUpdateItem struct {
+	NotificationType  models.NotificationType `json:"notification_type" binding:"required,oneof=ticket_assigned ticket_status_changed ticket_commented ticket_created ticket_overdue ticket_resolved ticket_closed system_maintenance user_mention system_alert"`
+	EmailEnabled      *bool                   `json:"email_enabled" binding:"required"`
+	InAppEnabled      *bool                   `json:"in_app_enabled" binding:"required"`
+	WebhookEnabled    *bool                   `json:"webhook_enabled" binding:"required"`
+	DoNotDisturbStart *time.Time              `json:"do_not_disturb_start"`
+	DoNotDisturbEnd   *time.Time              `json:"do_not_disturb_end"`
+	MaxDailyCount     *int                    `json:"max_daily_count" binding:"required,gte=0,lte=10000"`
+	BatchDelivery     *bool                   `json:"batch_delivery" binding:"required"`
+	BatchInterval     *int                    `json:"batch_interval" binding:"required,gte=1,lte=1440"`
+}
+
+type updateNotificationPreferencesRequest struct {
+	Preferences []notificationPreferenceUpdateItem `json:"preferences" binding:"required,min=1,max=50,dive"`
+}
+
 func NewNotificationHandler(notificationService services.NotificationServiceInterface) *NotificationHandler {
 	return &NotificationHandler{
 		notificationService: notificationService,
@@ -519,7 +535,7 @@ func (h *NotificationHandler) CreateNotification(c *gin.Context) {
 		return
 	}
 	var req models.NotificationCreateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := decodeStrictJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
 		return
 	}
@@ -610,10 +626,34 @@ func (h *NotificationHandler) UpdateNotificationPreferences(c *gin.Context) {
 		return
 	}
 
-	var preferences []models.NotificationPreference
-	if err := c.ShouldBindJSON(&preferences); err != nil {
+	var request updateNotificationPreferencesRequest
+	if err := decodeStrictJSON(c, &request); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
 		return
+	}
+	preferences := make([]models.NotificationPreference, 0, len(request.Preferences))
+	seenTypes := make(map[models.NotificationType]struct{}, len(request.Preferences))
+	for _, item := range request.Preferences {
+		if _, duplicate := seenTypes[item.NotificationType]; duplicate {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "通知类型不能重复"})
+			return
+		}
+		seenTypes[item.NotificationType] = struct{}{}
+		if (item.DoNotDisturbStart == nil) != (item.DoNotDisturbEnd == nil) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "免打扰开始和结束时间必须同时提供"})
+			return
+		}
+		preferences = append(preferences, models.NotificationPreference{
+			NotificationType:  item.NotificationType,
+			EmailEnabled:      *item.EmailEnabled,
+			InAppEnabled:      *item.InAppEnabled,
+			WebhookEnabled:    *item.WebhookEnabled,
+			DoNotDisturbStart: item.DoNotDisturbStart,
+			DoNotDisturbEnd:   item.DoNotDisturbEnd,
+			MaxDailyCount:     *item.MaxDailyCount,
+			BatchDelivery:     *item.BatchDelivery,
+			BatchInterval:     *item.BatchInterval,
+		})
 	}
 
 	err := h.notificationService.UpdateNotificationPreferences(c.Request.Context(), userID.(uint), preferences)

@@ -1,64 +1,72 @@
-const userRoles = [
-    'admin',
-    'supervisor',
-    'agent',
-    'customer',
-] as const
+import type {
+    PlatformRole,
+    ProjectRole,
+} from '@/lib/generated/human-api'
+import { platformRoleValues } from '@/lib/generated/human-api'
+/*
+ * Keep this as a runtime import from the generated contract. The parser and
+ * choices must never grow a second handwritten role registry.
+ */
 
-export type UserRole = (typeof userRoles)[number]
+export type { PlatformRole, ProjectRole }
+export { platformRoleValues }
 
-export type RolePermissions = {
-    role?: string | null
+const knownPlatformRoles = new Set<string>(platformRoleValues)
+
+export const parsePlatformRole = (value: unknown): PlatformRole | null =>
+    typeof value === 'string' && knownPlatformRoles.has(value)
+        ? (value as PlatformRole)
+        : null
+
+export type PlatformCapability =
+    | 'manage_platform_users'
+    | 'manage_platform_settings'
+    | 'manage_email_settings'
+    | 'view_platform_audit'
+    | 'operate_emergency_controls'
+
+const platformCapabilities: Record<
+    PlatformRole,
+    ReadonlySet<PlatformCapability>
+> = {
+    platform_admin: new Set([
+        'manage_platform_users',
+        'manage_platform_settings',
+        'manage_email_settings',
+        'view_platform_audit',
+    ]),
+    security_auditor: new Set(['view_platform_audit']),
+    emergency_operator: new Set(['operate_emergency_controls']),
+    member: new Set(),
 }
 
-const knownRoles = new Set<string>(userRoles)
-const administrativeRoles = new Set<UserRole>([
-    'admin',
-    'supervisor',
-])
-
-export const normalizeUserRole = (role: unknown): UserRole | null => {
-    const normalized = typeof role === 'string' ? role.trim().toLowerCase() : ''
-    return knownRoles.has(normalized) ? (normalized as UserRole) : null
+export const hasPlatformCapability = (
+    role: unknown,
+    capability: PlatformCapability,
+): boolean => {
+    const parsed = parsePlatformRole(role)
+    return parsed !== null && platformCapabilities[parsed].has(capability)
 }
 
-export const isAdministrativeRole = (role: unknown) => {
-    const normalized = normalizeUserRole(role)
-    return normalized !== null && administrativeRoles.has(normalized)
+const platformRoleLabels: Record<PlatformRole, string> = {
+    platform_admin: '平台管理员',
+    security_auditor: '安全审计员',
+    emergency_operator: '紧急运维员',
+    member: '普通成员',
 }
 
-export const isPlatformAdministrator = (role: unknown) =>
-    normalizeUserRole(role) === 'admin'
-
-export const isAgentRole = (role: unknown) => normalizeUserRole(role) === 'agent'
-
-export const isCustomerRole = (role: unknown) => {
-    return normalizeUserRole(role) === 'customer'
+export const getPlatformRoleLabel = (role: unknown): string => {
+    const parsed = parsePlatformRole(role)
+    return parsed === null ? '未知平台角色' : platformRoleLabels[parsed]
 }
 
-const userRoleLabels: Record<UserRole, string> = {
-    admin: '管理员',
-    supervisor: '主管',
-    agent: '客服代理',
-    customer: '客户',
-}
-
-export const getUserRoleLabel = (role: unknown) => {
-    const normalized = normalizeUserRole(role)
-    if (normalized === null) {
-        return '未知角色'
-    }
-    return userRoleLabels[normalized]
-}
-
-export const userRoleChoices = userRoles.map((role) => ({
+export const platformRoleChoices = platformRoleValues.map((role) => ({
     id: role,
-    name: userRoleLabels[role],
+    name: platformRoleLabels[role],
 }))
 
-const assignableRoles = ['customer', 'agent', 'supervisor', 'admin'] as const
-
-export const assignableUserRoleChoices = assignableRoles.map((role) => ({
-    id: role,
-    name: userRoleLabels[role],
-}))
+export type AccessPermissions = {
+    platform_role: PlatformRole
+    project_role: ProjectRole | null
+    project_key: string | null
+}

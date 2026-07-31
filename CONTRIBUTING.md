@@ -24,7 +24,15 @@
 
 ## 架构与协议约束
 
-领域服务是业务语义的唯一来源。REST、MCP 和 A2A Adapter 只负责认证上下文绑定、协议校验、输入输出转换与调用领域服务，不得复制状态迁移、权限、幂等、审计或副作用规则。一个业务动作经不同入口调用时必须得到一致的授权与结果。
+领域服务是业务语义的唯一来源。Human REST、Agent REST、MCP、A2A 和 Connector Adapter 只负责认证上下文绑定、协议校验、输入输出转换与调用领域服务，不得复制状态迁移、权限、幂等、审计或副作用规则。一个业务动作经不同入口调用时必须得到一致的授权与结果。
+
+平台角色和项目角色不得混用：`platform_admin`、`security_auditor`、
+`emergency_operator`、`member` 只授权窄平台治理；项目业务必须从 active
+`ProjectMembership` 解析 `project_admin`、`manager`、`agent`、`requester` 或
+`observer`。Human JWT 不携带项目角色；平台角色不能成为 `/api/projects/*` 或
+`/api/workbench/*` 的访问捷径。涉及这条边界、`/api/platform/*`、
+`/human-openapi.json` 或迁移 checkpoint 的改动，必须更新
+[ADR-0008](docs/adr/0008-separate-platform-and-project-roles.md)、相关契约和负向授权测试。
 
 当前 Agent 协议基线仅包括：
 

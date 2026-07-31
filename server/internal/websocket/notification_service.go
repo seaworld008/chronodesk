@@ -60,7 +60,7 @@ func (s *NotificationWebSocketService) PushNotification(ctx context.Context, not
 	notificationData := notification.ToResponse()
 
 	// Send the notification via WebSocket
-	if err := s.hub.BroadcastToUser(scope, notification.RecipientID, "notification", map[string]interface{}{
+	if err := s.hub.BroadcastToUser(ctx, scope, notification.RecipientID, "notification", map[string]interface{}{
 		"id":             notificationData.ID,
 		"type":           notificationData.Type,
 		"title":          notificationData.Title,
@@ -113,7 +113,7 @@ func (s *NotificationWebSocketService) PushUnreadCount(
 		return nil
 	}
 
-	if err := s.hub.BroadcastToUser(scope, userID, "unread_count", map[string]interface{}{
+	if err := s.hub.BroadcastToUser(ctx, scope, userID, "unread_count", map[string]interface{}{
 		"count":     count,
 		"timestamp": time.Now().Unix(),
 	}); err != nil {

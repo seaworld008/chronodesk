@@ -6,6 +6,7 @@ import {
     type Locator,
     type Page,
 } from '@playwright/test';
+import type { CreateWebhookRequest } from '../src/lib/generated/human-api';
 import { apiRequest } from './helpers/api';
 import {
     authenticatePage,
@@ -142,28 +143,29 @@ const createWebhookFixture = async (
     token: string,
 ) => {
     const projectKey = await resolveE2EProjectKey(request, token);
+    const payload: CreateWebhookRequest = {
+        name: webhookName,
+        description: '企业表格与 Outbox 可视化测试',
+        provider: 'custom',
+        webhook_url:
+            'https://chronodesk-enterprise-table.invalid/callback',
+        enabled_events: ['io.chronodesk.ticket.created.v1'],
+        filter_rules: { transition_statuses: [] },
+        message_format: 'json',
+        retry_count: 1,
+        retry_interval: 60,
+        timeout_seconds: 5,
+        is_async: true,
+        rate_limit: 10,
+        rate_limit_window: 60,
+    };
     const response = await apiRequest<Record<string, unknown>>(
         request,
         token,
         projectAPIPath(projectKey, 'webhooks'),
         {
             method: 'POST',
-            data: {
-                name: webhookName,
-                description: '企业表格与 Outbox 可视化测试',
-                provider: 'custom',
-                webhook_url: 'https://chronodesk-enterprise-table.invalid/callback',
-                enabled_events: ['io.chronodesk.ticket.created.v1'],
-                filter_rules: { transition_statuses: [] },
-                message_format: 'json',
-                retry_count: 1,
-                retry_interval: 60,
-                timeout_seconds: 5,
-                is_async: true,
-                rate_limit: 10,
-                rate_limit_window: 60,
-                status: 'active',
-            },
+            data: payload,
         },
     );
     const webhook = extractData<Record<string, unknown>>(response);
@@ -335,6 +337,26 @@ const tableCases = (): EnterpriseTableCase[] => [
         requireActionButton: true,
     },
     {
+        name: '平台项目治理列表',
+        path: () => '/#/platform/projects',
+        tableName: '平台项目治理列表',
+        columnName: '项目',
+        defaultWidth: 360,
+        stickyHeader: '平台操作',
+        // 全新环境只有不可归档的 DEFAULT 项目；专用归档套件另以
+        // 非默认项目验证可操作按钮，这里仍验证 sticky 数据单元格。
+        requireActionButton: false,
+    },
+    {
+        name: '项目成员列表',
+        path: () => '/#/project-memberships',
+        tableName: '项目成员列表',
+        columnName: '用户',
+        defaultWidth: 300,
+        stickyHeader: '操作',
+        requireActionButton: true,
+    },
+    {
         name: '通知列表',
         path: () => '/#/notifications',
         tableName: '通知列表',
@@ -413,24 +435,6 @@ const tableCases = (): EnterpriseTableCase[] => [
         defaultWidth: 180,
         expectedText: () => '创建工单',
         tabName: '历史记录',
-    },
-    {
-        name: '该用户创建的工单列表',
-        path: () => `/#/users/${adminUserID}/show`,
-        tableName: '该用户创建的工单列表',
-        columnName: '工单编号',
-        defaultWidth: 156,
-        expectedText: () => ticketFixture.ticketNumber,
-        tabName: '相关工单',
-    },
-    {
-        name: '该用户负责的工单列表',
-        path: () => `/#/users/${adminUserID}/show`,
-        tableName: '该用户负责的工单列表',
-        columnName: '工单编号',
-        defaultWidth: 156,
-        expectedText: () => ticketFixture.ticketNumber,
-        tabName: '相关工单',
     },
     {
         name: '服务主体列表',
@@ -933,7 +937,7 @@ test.describe('企业级列表表格', () => {
         }
     });
 
-    test('UI-004 UI-006 UI-028：全部 15 张企业表用真实数据验证实际单行布局', async ({
+    test('UI-004 UI-006 UI-028：全部 15 张现存企业表用真实数据验证实际单行布局，平台用户详情不投影项目工单', async ({
         page,
     }) => {
         test.setTimeout(180_000);
@@ -947,6 +951,54 @@ test.describe('企业级列表表格', () => {
                 await expectActualSingleLineRows(table, target.tableName);
             });
         }
+
+        await test.step(
+            '平台用户详情不提供隐式项目工单视图',
+            async () => {
+                await page.goto(`/#/users/${adminUserID}/show`);
+                await waitForPrimaryPage(page);
+                await expect(
+                    page
+                        .getByRole('main')
+                        .getByRole('tab', {
+                            name: '基本信息',
+                            exact: true,
+                        }),
+                ).toBeVisible();
+                await expect(
+                    page
+                        .getByRole('main')
+                        .getByRole('tab', {
+                            name: '活动日志',
+                            exact: true,
+                        }),
+                ).toBeVisible();
+                await expect(
+                    page
+                        .getByRole('main')
+                        .getByRole('tab', {
+                            name: '相关工单',
+                            exact: true,
+                        }),
+                ).toHaveCount(0);
+                await expect(
+                    page
+                        .getByRole('main')
+                        .getByRole('table', {
+                            name: '该用户创建的工单列表',
+                            exact: true,
+                        }),
+                ).toHaveCount(0);
+                await expect(
+                    page
+                        .getByRole('main')
+                        .getByRole('table', {
+                            name: '该用户负责的工单列表',
+                            exact: true,
+                        }),
+                ).toHaveCount(0);
+            },
+        );
     });
 
     test('UI-007 UI-029：窄视口横向滚动后 sticky 右操作列仍贴边、命中且按钮有名称', async ({
@@ -959,7 +1011,7 @@ test.describe('企业级列表表格', () => {
         const stickyCases = tableCases().filter(
             (target) => target.stickyHeader,
         );
-        expect(stickyCases).toHaveLength(8);
+        expect(stickyCases).toHaveLength(10);
         for (const target of stickyCases) {
             await test.step(target.name, async () => {
                 const table = await openEnterpriseTable(page, target);
@@ -968,7 +1020,7 @@ test.describe('企业级列表表格', () => {
         }
     });
 
-    test('UI-005 UI-026：全部 15 张表的键盘列宽可持久化且双击复位也持久化', async ({
+    test('UI-005 UI-026：全部 15 张现存表的键盘列宽可持久化且双击复位也持久化', async ({
         page,
     }) => {
         test.setTimeout(300_000);

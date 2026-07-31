@@ -29,8 +29,11 @@ func TestBootstrapProjectAdministratorGrantIsAtomicAuditedAndIdempotent(
 		t.Fatal(err)
 	}
 	_, _, project, administrator := seedProjectAccessFixture(t, db)
-	administrator.Role = models.RoleAdmin
-	if err := db.Model(&administrator).Update("role", models.RoleAdmin).Error; err != nil {
+	administrator.PlatformRole = models.PlatformRolePlatformAdmin
+	if err := db.Model(&administrator).Update(
+		"platform_role",
+		models.PlatformRolePlatformAdmin,
+	).Error; err != nil {
 		t.Fatal(err)
 	}
 
@@ -116,8 +119,11 @@ func TestBootstrapProjectAdministratorGrantRejectsExistingDifferentRole(
 		t.Fatal(err)
 	}
 	_, _, project, administrator := seedProjectAccessFixture(t, db)
-	administrator.Role = models.RoleAdmin
-	if err := db.Model(&administrator).Update("role", models.RoleAdmin).Error; err != nil {
+	administrator.PlatformRole = models.PlatformRolePlatformAdmin
+	if err := db.Model(&administrator).Update(
+		"platform_role",
+		models.PlatformRolePlatformAdmin,
+	).Error; err != nil {
 		t.Fatal(err)
 	}
 	membership := models.ProjectMembership{

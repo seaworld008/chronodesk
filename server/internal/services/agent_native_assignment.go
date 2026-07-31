@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/safeconv"
@@ -31,6 +32,10 @@ func (s *AgentNativeService) ResolveTicketAssignmentChanges(
 	ctx context.Context,
 	assignee *models.ActorRef,
 ) (map[string]any, error) {
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve assignment project scope: %w", err)
+	}
 	if assignee == nil {
 		return map[string]any{
 			"assigned_to_actor_type":           "",
@@ -56,17 +61,48 @@ func (s *AgentNativeService) ResolveTicketAssignmentChanges(
 			return nil, fmt.Errorf("%w: human assignee id must be a user id", ErrInvalidAssignee)
 		}
 		var user models.User
-		if err := s.db.WithContext(ctx).Select("id").First(&user, userID).Error; err != nil {
+		if err := s.db.WithContext(ctx).
+			Select("id", "status").
+			Where("id = ? AND deleted_at IS NULL", userID).
+			First(&user).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil, fmt.Errorf("%w: human %s", ErrAssigneeNotFound, assignee.ID)
 			}
 			return nil, fmt.Errorf("validate human assignee: %w", err)
 		}
-		changes["assigned_to_id"] = user.ID
+		if user.Status != models.UserStatusActive {
+			return nil, fmt.Errorf(
+				"%w: human %s is %s",
+				ErrAssigneePolicyDenied,
+				assignee.ID,
+				user.Status,
+			)
+		}
+		var membership models.ProjectMembership
+		if err := s.db.WithContext(ctx).
+			Where(
+				"project_id = ? AND user_id = ? AND is_active = ? AND role IN ?",
+				scope.ProjectID,
+				userID,
+				true,
+				assignableHumanProjectRoles(),
+			).
+			First(&membership).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, fmt.Errorf(
+					"%w: human %s has no assignable membership in project %d",
+					ErrAssigneePolicyDenied,
+					assignee.ID,
+					scope.ProjectID,
+				)
+			}
+			return nil, fmt.Errorf("validate human assignee membership: %w", err)
+		}
+		changes["assigned_to_id"] = membership.UserID
 	case models.ActorTypeServicePrincipal:
 		var principal models.ServicePrincipal
 		if err := s.db.WithContext(ctx).
-			Select("id", "status", "emergency_disabled").
+			Select("id", "status", "expires_at", "read_only", "emergency_disabled").
 			Where("id = ? AND deleted_at IS NULL", assignee.ID).
 			First(&principal).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -82,12 +118,21 @@ func (s *AgentNativeService) ResolveTicketAssignmentChanges(
 				principal.Status,
 			)
 		}
-		if principal.EmergencyDisabled {
+		if principal.EmergencyDisabled ||
+			principal.ReadOnly ||
+			(principal.ExpiresAt != nil && !principal.ExpiresAt.After(time.Now())) {
 			return nil, fmt.Errorf(
-				"%w: service principal %s is emergency disabled",
+				"%w: service principal %s is unavailable for assignment",
 				ErrAssigneePolicyDenied,
 				principal.ID,
 			)
+		}
+		if err := validateAssignablePrincipalGrant(
+			s.db.WithContext(ctx),
+			scope,
+			principal.ID,
+		); err != nil {
+			return nil, err
 		}
 		changes["assigned_to_service_principal_id"] = principal.ID
 	case models.ActorTypeSystem:
@@ -119,6 +164,10 @@ func validateCanonicalAssignmentChangesTx(
 ) error {
 	if tx == nil {
 		return errors.New("assignment validation transaction is required")
+	}
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		return fmt.Errorf("validate assignment project scope: %w", err)
 	}
 	required := []string{
 		"assigned_to_actor_type",
@@ -155,14 +204,38 @@ func validateCanonicalAssignmentChangesTx(
 			changes["assigned_to_service_principal_id"] != nil {
 			return fmt.Errorf("%w: human assignment projections do not match ActorRef", ErrInvalidAssignee)
 		}
-		var count int64
-		if err := tx.WithContext(ctx).Model(&models.User{}).
-			Where("id = ?", userID).
-			Count(&count).Error; err != nil {
+		var user models.User
+		if err := tx.WithContext(ctx).
+			Select("id", "status").
+			Where("id = ? AND deleted_at IS NULL", userID).
+			First(&user).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("%w: human %s", ErrAssigneeNotFound, assignee.ID)
+			}
 			return fmt.Errorf("validate human assignee: %w", err)
 		}
-		if count != 1 {
-			return fmt.Errorf("%w: human %s", ErrAssigneeNotFound, assignee.ID)
+		if user.Status != models.UserStatusActive {
+			return fmt.Errorf("%w: human %s is unavailable", ErrAssigneePolicyDenied, assignee.ID)
+		}
+		var membershipCount int64
+		if err := tx.WithContext(ctx).Model(&models.ProjectMembership{}).
+			Where(
+				"project_id = ? AND user_id = ? AND is_active = ? AND role IN ?",
+				scope.ProjectID,
+				userID,
+				true,
+				assignableHumanProjectRoles(),
+			).
+			Count(&membershipCount).Error; err != nil {
+			return fmt.Errorf("validate human assignee membership: %w", err)
+		}
+		if membershipCount != 1 {
+			return fmt.Errorf(
+				"%w: human %s has no assignable membership in project %d",
+				ErrAssigneePolicyDenied,
+				assignee.ID,
+				scope.ProjectID,
+			)
 		}
 	case models.ActorTypeServicePrincipal:
 		projectedID, ok := changes["assigned_to_service_principal_id"].(string)
@@ -171,7 +244,7 @@ func validateCanonicalAssignmentChangesTx(
 		}
 		var principal models.ServicePrincipal
 		if err := tx.WithContext(ctx).
-			Select("id", "status", "emergency_disabled").
+			Select("id", "status", "expires_at", "read_only", "emergency_disabled").
 			Where("id = ? AND deleted_at IS NULL", assignee.ID).
 			First(&principal).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -180,11 +253,63 @@ func validateCanonicalAssignmentChangesTx(
 			return fmt.Errorf("validate service principal assignee: %w", err)
 		}
 		if principal.Status != models.ServicePrincipalStatusActive ||
-			principal.EmergencyDisabled {
+			principal.EmergencyDisabled ||
+			principal.ReadOnly ||
+			(principal.ExpiresAt != nil && !principal.ExpiresAt.After(time.Now())) {
 			return fmt.Errorf("%w: service principal %s is unavailable", ErrAssigneePolicyDenied, principal.ID)
+		}
+		if err := validateAssignablePrincipalGrant(
+			tx.WithContext(ctx),
+			scope,
+			principal.ID,
+		); err != nil {
+			return err
 		}
 	case models.ActorTypeSystem:
 		return fmt.Errorf("%w: system actors cannot be assignment targets", ErrInvalidAssignee)
+	}
+	return nil
+}
+
+func assignableHumanProjectRoles() []models.ProjectRole {
+	return []models.ProjectRole{
+		models.ProjectRoleAdmin,
+		models.ProjectRoleManager,
+		models.ProjectRoleAgent,
+	}
+}
+
+func validateAssignablePrincipalGrant(
+	db *gorm.DB,
+	scope models.ProjectScope,
+	principalID string,
+) error {
+	var grant models.ProjectPrincipalGrant
+	if err := db.Where(
+		"project_id = ? AND service_principal_id = ? AND is_active = ? AND role IN ? AND (expires_at IS NULL OR expires_at > ?)",
+		scope.ProjectID,
+		principalID,
+		true,
+		assignableHumanProjectRoles(),
+		time.Now(),
+	).First(&grant).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf(
+				"%w: service principal %s has no assignable grant in project %d",
+				ErrAssigneePolicyDenied,
+				principalID,
+				scope.ProjectID,
+			)
+		}
+		return fmt.Errorf("validate service principal assignment grant: %w", err)
+	}
+	if !grant.HasScope(models.ScopeTicketsAssign) {
+		return fmt.Errorf(
+			"%w: service principal %s grant lacks %s",
+			ErrAssigneePolicyDenied,
+			principalID,
+			models.ScopeTicketsAssign,
+		)
 	}
 	return nil
 }

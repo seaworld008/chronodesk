@@ -125,7 +125,7 @@ func TestWebhookNon2xxAlwaysPropagatesToOutboxCaller(t *testing.T) {
 	}
 	user := models.User{
 		Username: "webhook-owner", Email: "webhook-owner@example.com",
-		PasswordHash: "hash", Role: models.RoleAdmin, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRolePlatformAdmin, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
@@ -185,7 +185,7 @@ func TestWebhookOutboxAttemptHasHardTimeoutAndNoLegacyRetry(t *testing.T) {
 	}
 	user := models.User{
 		Username: "webhook-timeout", Email: "webhook-timeout@example.com",
-		PasswordHash: "hash", Role: models.RoleAdmin, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRolePlatformAdmin, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
@@ -299,7 +299,7 @@ func TestCustomWebhookSendsExactSignedStructuredCloudEvent(t *testing.T) {
 		Username:     "signed-webhook-owner",
 		Email:        "signed-webhook-owner@example.test",
 		PasswordHash: "hash",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&owner).Error; err != nil {
@@ -411,7 +411,7 @@ func TestCustomWebhookWithoutSecretFailsClosed(t *testing.T) {
 		Username:     "unsigned-webhook-owner",
 		Email:        "unsigned-webhook-owner@example.test",
 		PasswordHash: "hash",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&owner).Error; err != nil {
@@ -480,7 +480,7 @@ func TestListWebhookOutboxTargetsAppliesTransitionPredicate(t *testing.T) {
 		Username:     "webhook-filter-owner",
 		Email:        "webhook-filter-owner@example.com",
 		PasswordHash: "hash",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {

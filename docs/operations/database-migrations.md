@@ -86,6 +86,32 @@ checkpoint 后会跳过全部数据与授权回填，因此不会重置项目编
 `ALTER TABLE`。checkpoint 内容不匹配会 fail closed；在项目 RLS 已启用后发现
 checkpoint 缺失同样拒绝自动认领，必须先人工审计数据库。
 
+## 平台角色与项目角色一次性切换
+
+项目范围切换完成后，标准迁移还会执行一次破坏性角色切换。它以
+`20260730_platform_roles_v1_cutover` 作为最终 checkpoint，使用事务级 advisory
+lock、版本和编译期 checksum 串行化；任何校验、Membership、审计或 schema 操作
+失败都会回滚，不能通过重跑悄悄“认领”一个来源不明的旧库。
+
+切换的目的不是重命名角色，而是拆开两种不同的授权事实：
+
+- `users.platform_role` 与 `admin_audit_logs.platform_role` 只能是
+  `platform_admin`、`security_auditor`、`emergency_operator`、`member`；旧
+  `users.role` 和旧审计 `role` 列会在同一事务中删除。
+- 旧 `admin` 只映射为 `platform_admin`；其他可迁移的人类身份在平台层为
+  `member`。平台角色不生成项目访问权。
+- 已激活且未删除的旧 Human，仅在默认 Project 没有显式 Membership 时，按
+  `admin → project_admin`、`supervisor → manager`、`agent → agent`、
+  `customer → requester` 回填一次项目职责。已有 Membership 不会被覆盖；停用或
+  已删除用户不会被重新激活或授予 Membership。
+- 不支持、空缺或无法证明来源的旧角色、缺失前置项目范围 checkpoint、已有切换
+  checkpoint 却仍有旧列、以及 checkpoint 的版本/checksum 不匹配，全部 fail
+  closed。先备份并人工审计，切勿直接删除 checkpoint 或角色列。
+
+切换后人类 JWT 只携带平台角色声明；服务在每次认证请求中实时复核用户状态和
+`platform_role`，失配会使会话变为 `stale_token`。项目角色从 active
+`ProjectMembership` 实时解析，不写入 JWT，也不由平台管理员身份推导。
+
 对于真正的旧库，迁移在 GORM 应用最终模型契约前，仅给原本不存在的
 `organization_id/project_id` 加入非空 `0` 哨兵，并移除列默认值；Ticket 的
 公共 ID 使用唯一、可识别的临时哨兵。一次性回填会把这些值替换为可信项目范围

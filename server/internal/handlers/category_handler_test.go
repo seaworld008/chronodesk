@@ -24,7 +24,7 @@ func TestCategoryHandlerVisibilityAndReferenceFilters(t *testing.T) {
 		Username:     "category-admin",
 		Email:        "category-admin@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&admin).Error; err != nil {

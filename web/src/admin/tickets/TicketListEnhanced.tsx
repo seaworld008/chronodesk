@@ -38,7 +38,8 @@ import { parseTagsToArray } from './tagUtils';
 import { Ticket } from '@/types';
 import {
     canDeleteTicket,
-    canMutateTicket,
+    canEditTicket,
+    canUseTicketWorkflow,
     type TicketRolePermissions,
 } from './ticketAccess';
 import {
@@ -54,6 +55,7 @@ import {
     EnterpriseTextFilterInput,
 } from '@/components/inputs/EnterpriseFilterInputs';
 import { FocusSafeBulkDeleteWithConfirmButton } from '@/components/actions/FocusSafeDeleteButtons';
+import { hasProjectCapability } from '@/lib/projectScope';
 
 // 过滤器选项
 const statusChoices = [
@@ -371,7 +373,16 @@ const QuickActionsField: React.FC = () => {
     const { identity } = useGetIdentity();
 
     if (!record) return null;
-    const canMutate = canMutateTicket(record, permissions?.role, identity?.id);
+    const canEdit = canEditTicket(
+        record,
+        permissions?.project_role,
+        identity?.id,
+    );
+    const canUseWorkflow = canUseTicketWorkflow(
+        record,
+        permissions?.project_role,
+        identity?.id,
+    );
 
     const openWorkflow = (e: React.MouseEvent) => {
         e.stopPropagation();
@@ -380,7 +391,7 @@ const QuickActionsField: React.FC = () => {
 
     return (
         <Box className="cd-table-actions" sx={{ alignItems: 'center' }}>
-            {canMutate && (
+            {canUseWorkflow && (
                 <>
                     <Tooltip title="在详情页分配工单">
                         <IconButton
@@ -415,7 +426,7 @@ const QuickActionsField: React.FC = () => {
                 </>
             )}
             <ShowButton label="查看" />
-            {canMutate && <EditButton label="编辑" />}
+            {canEdit && <EditButton label="编辑" />}
         </Box>
     );
 };
@@ -437,14 +448,21 @@ const TicketFilters = [
 /**
  * 列表操作工具栏
  */
-const TicketListActions = () => (
-    <TopToolbar>
-        <SelectColumnsButton />
-        <FilterButton />
-        <CreateButton label="创建工单" />
-        <ExportButton label="导出" />
-    </TopToolbar>
-);
+const TicketListActions = () => {
+    const { permissions } = usePermissions<TicketRolePermissions>();
+    const canCreate = hasProjectCapability(
+        permissions?.project_role,
+        'create_ticket',
+    );
+    return (
+        <TopToolbar>
+            <SelectColumnsButton />
+            <FilterButton />
+            {canCreate && <CreateButton label="创建工单" />}
+            <ExportButton label="导出" />
+        </TopToolbar>
+    );
+};
 
 /**
  * 批量操作按钮
@@ -459,20 +477,27 @@ const TicketBulkActionButtons = () => (
 /**
  * 空状态组件
  */
-const TicketListEmpty = () => (
-    <Box sx={{ textAlign: 'center', mt: 4 }}>
-        <Assignment sx={{ fontSize: 64, color: 'text.secondary', mb: 2 }} />
-        <Typography variant="h5" component="h2" gutterBottom>
-            暂无工单
-        </Typography>
-        <Typography variant="body1" sx={{
-            color: "text.secondary"
-        }}>
-            创建第一个工单开始管理客户请求
-        </Typography>
-        <CreateButton label="创建工单" sx={{ mt: 2 }} />
-    </Box>
-);
+const TicketListEmpty = () => {
+    const { permissions } = usePermissions<TicketRolePermissions>();
+    const canCreate = hasProjectCapability(
+        permissions?.project_role,
+        'create_ticket',
+    );
+    return (
+        <Box sx={{ textAlign: 'center', mt: 4 }}>
+            <Assignment sx={{ fontSize: 64, color: 'text.secondary', mb: 2 }} />
+            <Typography variant="h5" component="h2" gutterBottom>
+                暂无工单
+            </Typography>
+            <Typography variant="body1" sx={{ color: 'text.secondary' }}>
+                {canCreate
+                    ? '创建第一个工单开始管理客户请求'
+                    : '当前项目职责仅允许查看工单'}
+            </Typography>
+            {canCreate && <CreateButton label="创建工单" sx={{ mt: 2 }} />}
+        </Box>
+    );
+};
 
 /**
  * 增强的工单列表组件
@@ -480,7 +505,7 @@ const TicketListEmpty = () => (
  */
 const TicketListEnhanced: React.FC = () => {
     const { permissions } = usePermissions<TicketRolePermissions>();
-    const canBulkManage = canDeleteTicket(permissions?.role);
+    const canBulkManage = canDeleteTicket(permissions?.project_role);
 
     return (
         <List

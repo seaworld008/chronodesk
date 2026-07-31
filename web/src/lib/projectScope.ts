@@ -1,38 +1,277 @@
 import { HttpError } from 'react-admin'
-import { localizedApiErrorMessage } from './apiClient'
+import {
+    humanApiRoutes,
+    type AuthorizedProjectAccess,
+    type PlatformRole,
+    type ProjectRole,
+} from '@/lib/generated/human-api'
+import { projectRoleValues } from '@/lib/generated/human-api'
+import {
+    localizedApiErrorMessage,
+    sessionAwareFetch,
+} from './apiClient'
+import { parsePlatformRole } from './accessControl'
+import {
+    projectAccessInvalidatedEvent,
+    projectScopeChangedEvent,
+    signalProjectAccessInvalidated,
+    signalProjectScopeChanged,
+} from './projectScopeEvents'
+import {
+    activeProjectStorageKey,
+    clearStoredProjectSelection,
+    legacyActiveProjectStorageKey,
+} from './humanSessionStorage'
+import { joinApiUrl } from './apiUrl'
 
 const apiBase = (import.meta.env.VITE_API_URL ?? '/api').toString().replace(/\/$/, '')
-const activeProjectStorageKey = 'chronodesk.activeProjectKey'
+export { projectAccessInvalidatedEvent }
 
-export type ProjectRole =
-    | 'project_admin'
-    | 'manager'
-    | 'agent'
-    | 'requester'
-    | 'observer'
+export type AuthorizedProject = AuthorizedProjectAccess
+export type { ProjectRole }
+export { projectRoleValues }
 
-export interface AuthorizedProject {
-    project: {
-        id: number
-        public_id: string
-        key: string
-        name: string
-        description?: string
-        business_unit_id: number
-        organization_id: number
-        status: 'active' | 'archived'
-    }
-    role: ProjectRole
-    scope: {
-        organization_id: number
-        project_id: number
-    }
+const knownProjectRoles = new Set<string>(projectRoleValues)
+
+export const parseProjectRole = (value: unknown): ProjectRole | null =>
+    typeof value === 'string' && knownProjectRoles.has(value)
+        ? (value as ProjectRole)
+        : null
+
+const projectRoleLabels: Record<ProjectRole, string> = {
+    project_admin: '项目管理员',
+    manager: '项目经理',
+    agent: '项目处理人',
+    requester: '项目请求人',
+    observer: '项目观察员',
 }
 
-let projectRequest: Promise<AuthorizedProject[]> | undefined
+export const getProjectRoleLabel = (role: unknown): string => {
+    const parsed = parseProjectRole(role)
+    return parsed === null ? '未知项目角色' : projectRoleLabels[parsed]
+}
+
+export type ProjectCapability =
+    | 'view_project'
+    | 'create_ticket'
+    | 'edit_ticket_safe_fields'
+    | 'manage_ticket_workflow'
+    | 'assign_ticket'
+    | 'delete_ticket'
+    | 'write_public_content'
+    | 'write_internal_content'
+    | 'manage_notifications'
+    | 'manage_automation'
+    | 'manage_integrations'
+    | 'manage_memberships'
+    | 'manage_agents'
+
+const projectCapabilities: Record<
+    ProjectRole,
+    ReadonlySet<ProjectCapability>
+> = {
+    project_admin: new Set([
+        'view_project',
+        'create_ticket',
+        'edit_ticket_safe_fields',
+        'manage_ticket_workflow',
+        'assign_ticket',
+        'delete_ticket',
+        'write_public_content',
+        'write_internal_content',
+        'manage_notifications',
+        'manage_automation',
+        'manage_integrations',
+        'manage_memberships',
+        'manage_agents',
+    ]),
+    manager: new Set([
+        'view_project',
+        'create_ticket',
+        'edit_ticket_safe_fields',
+        'manage_ticket_workflow',
+        'assign_ticket',
+        'delete_ticket',
+        'write_public_content',
+        'write_internal_content',
+        'manage_notifications',
+        'manage_automation',
+        'manage_integrations',
+    ]),
+    agent: new Set([
+        'view_project',
+        'create_ticket',
+        'edit_ticket_safe_fields',
+        'manage_ticket_workflow',
+        'assign_ticket',
+        'write_public_content',
+        'write_internal_content',
+    ]),
+    requester: new Set([
+        'view_project',
+        'create_ticket',
+        'edit_ticket_safe_fields',
+        'write_public_content',
+    ]),
+    observer: new Set(['view_project']),
+}
+
+export const hasProjectCapability = (
+    role: unknown,
+    capability: ProjectCapability,
+): boolean => {
+    const parsed = parseProjectRole(role)
+    return parsed !== null && projectCapabilities[parsed].has(capability)
+}
+
+export const hasExactProjectRole = (
+    role: unknown,
+    allowed: readonly ProjectRole[],
+): role is ProjectRole => {
+    const parsed = parseProjectRole(role)
+    return parsed !== null && allowed.includes(parsed)
+}
+
+export type HumanSessionBinding = {
+    subject: string
+    session_id: string
+    platform_role: PlatformRole
+    expires_at: number
+}
+
+type ActiveProjectRecord = {
+    subject: string
+    session_id: string
+    project_key: string
+}
+
+let projectRequest:
+    | Promise<AuthorizedProject[]>
+    | undefined
+let projectRequestBinding: string | undefined
+
+if (typeof window !== 'undefined') {
+    window.addEventListener(projectAccessInvalidatedEvent, () => {
+        projectRequest = undefined
+        projectRequestBinding = undefined
+    })
+    window.addEventListener(projectScopeChangedEvent, () => {
+        projectRequest = undefined
+        projectRequestBinding = undefined
+    })
+}
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === 'object' && value !== null
+
+const positiveInteger = (value: unknown): value is number =>
+    typeof value === 'number' &&
+    Number.isSafeInteger(value) &&
+    value > 0
+
+const nonEmptyString = (value: unknown): value is string =>
+    typeof value === 'string' && value.length > 0
+
+const decodeBase64Url = (value: string): string => {
+    const normalized = value.replace(/-/g, '+').replace(/_/g, '/')
+    const padded = normalized.padEnd(
+        normalized.length + ((4 - (normalized.length % 4)) % 4),
+        '=',
+    )
+    return atob(padded)
+}
+
+export const readHumanSessionBinding = (
+    token = localStorage.getItem('token'),
+): HumanSessionBinding | null => {
+    if (!token) return null
+    const parts = token.split('.')
+    if (parts.length !== 3) return null
+    try {
+        const payload: unknown = JSON.parse(decodeBase64Url(parts[1]))
+        if (!isRecord(payload)) return null
+        const platformRole = parsePlatformRole(payload.platform_role)
+        if (
+            !nonEmptyString(payload.sub) ||
+            !nonEmptyString(payload.sid) ||
+            platformRole === null ||
+            !positiveInteger(payload.exp)
+        ) {
+            return null
+        }
+        return {
+            subject: payload.sub,
+            session_id: payload.sid,
+            platform_role: platformRole,
+            expires_at: payload.exp * 1000,
+        }
+    } catch {
+        return null
+    }
+}
+
+const bindingKey = (binding: HumanSessionBinding): string =>
+    `${binding.subject}\u0000${binding.session_id}`
+
+const sameBinding = (
+    left: Pick<HumanSessionBinding, 'subject' | 'session_id'>,
+    right: Pick<HumanSessionBinding, 'subject' | 'session_id'>,
+): boolean =>
+    left.subject === right.subject &&
+    left.session_id === right.session_id
+
+const parseActiveProjectRecord = (value: unknown): ActiveProjectRecord | null => {
+    if (
+        !isRecord(value) ||
+        !nonEmptyString(value.subject) ||
+        !nonEmptyString(value.session_id) ||
+        !nonEmptyString(value.project_key)
+    ) {
+        return null
+    }
+    return {
+        subject: value.subject,
+        session_id: value.session_id,
+        project_key: value.project_key,
+    }
+}
+
+const readActiveProjectRecord = (): ActiveProjectRecord | null => {
+    const serialized = localStorage.getItem(activeProjectStorageKey)
+    if (!serialized) return null
+    try {
+        return parseActiveProjectRecord(JSON.parse(serialized))
+    } catch {
+        return null
+    }
+}
+
+const parseAuthorizedProject = (value: unknown): AuthorizedProject | null => {
+    if (!isRecord(value)) return null
+    const project = value.project
+    const scope = value.scope
+    const projectRole = parseProjectRole(value.project_role)
+    if (
+        !isRecord(project) ||
+        !positiveInteger(project.id) ||
+        !nonEmptyString(project.public_id) ||
+        !nonEmptyString(project.key) ||
+        !nonEmptyString(project.name) ||
+        typeof project.description !== 'string' ||
+        !positiveInteger(project.business_unit_id) ||
+        !positiveInteger(project.organization_id) ||
+        (project.status !== 'active' && project.status !== 'archived') ||
+        !isRecord(scope) ||
+        !positiveInteger(scope.organization_id) ||
+        !positiveInteger(scope.project_id) ||
+        scope.organization_id !== project.organization_id ||
+        scope.project_id !== project.id ||
+        projectRole === null
+    ) {
+        return null
+    }
+    return value as AuthorizedProject
+}
 
 const responseData = (value: unknown): unknown => {
     if (isRecord(value) && 'data' in value) return value.data
@@ -42,17 +281,37 @@ const responseData = (value: unknown): unknown => {
 export const loadAuthorizedProjects = async (
     force = false,
 ): Promise<AuthorizedProject[]> => {
-    if (!force && projectRequest) return projectRequest
+    const binding = readHumanSessionBinding()
+    if (!binding) {
+        projectRequest = undefined
+        projectRequestBinding = undefined
+        localStorage.removeItem(activeProjectStorageKey)
+        localStorage.removeItem(legacyActiveProjectStorageKey)
+        throw new HttpError('登录会话无效，请重新登录', 401, {
+            code: 'invalid_human_session',
+        })
+    }
+    const currentBindingKey = bindingKey(binding)
+    if (
+        !force &&
+        projectRequest &&
+        projectRequestBinding === currentBindingKey
+    ) {
+        return projectRequest
+    }
 
-    projectRequest = (async () => {
+    projectRequestBinding = currentBindingKey
+    const request = (async () => {
         const token = localStorage.getItem('token')
-        if (!token) return []
-        const response = await fetch(`${apiBase}/projects`, {
+        const response = await sessionAwareFetch(
+            joinApiUrl(apiBase, humanApiRoutes.listAuthorizedHumanProjects()),
+            {
             headers: {
                 Accept: 'application/json',
                 Authorization: `Bearer ${token}`,
             },
-        })
+            },
+        )
         const body: unknown = await response.json().catch(() => ({}))
         if (!response.ok) {
             throw new HttpError(
@@ -65,35 +324,65 @@ export const loadAuthorizedProjects = async (
         if (!Array.isArray(payload)) {
             throw new HttpError('授权项目响应格式无效', 502, body)
         }
-        return payload as AuthorizedProject[]
+        const projects = payload.map(parseAuthorizedProject)
+        if (projects.some((project) => project === null)) {
+            throw new HttpError('授权项目响应包含无效项目角色或范围', 502, body)
+        }
+        const latestBinding = readHumanSessionBinding()
+        if (!latestBinding || !sameBinding(binding, latestBinding)) {
+            throw new HttpError('登录账号已变化，已拒绝复用旧项目缓存', 401, {
+                code: 'project_cache_subject_mismatch',
+            })
+        }
+        return projects as AuthorizedProject[]
     })()
+    projectRequest = request
 
     try {
-        return await projectRequest
+        return await request
     } catch (error) {
-        projectRequest = undefined
+        if (projectRequest === request) {
+            projectRequest = undefined
+            projectRequestBinding = undefined
+        }
         throw error
     }
 }
 
 export const activeProjectKey = (): string | undefined => {
-    const value = localStorage.getItem(activeProjectStorageKey)?.trim()
-    return value || undefined
+    localStorage.removeItem(legacyActiveProjectStorageKey)
+    const binding = readHumanSessionBinding()
+    const stored = readActiveProjectRecord()
+    if (!binding || !stored || !sameBinding(binding, stored)) {
+        localStorage.removeItem(activeProjectStorageKey)
+        return undefined
+    }
+    return stored.project_key
 }
 
 export const resolveActiveProjectAccess = async (): Promise<AuthorizedProject> => {
     const projects = await loadAuthorizedProjects()
     const stored = activeProjectKey()
-    const selected =
-        projects.find(({ project }) => project.key === stored) ??
-        projects[0]
-    if (!selected) {
-        throw new HttpError('当前账号没有可访问的项目', 403, {
-            code: 'project_access_required',
-        })
+    if (!stored) {
+        throw new HttpError(
+            projects.length === 0
+                ? '当前账号没有可访问的项目'
+                : '请选择要进入的项目',
+            projects.length === 0 ? 403 : 409,
+            {
+                code:
+                    projects.length === 0
+                        ? 'project_access_required'
+                        : 'active_project_required',
+            },
+        )
     }
-    if (selected.project.key !== stored) {
-        localStorage.setItem(activeProjectStorageKey, selected.project.key)
+    const selected = projects.find(({ project }) => project.key === stored)
+    if (!selected) {
+        clearActiveProjectSelection()
+        throw new HttpError('当前账号没有可访问的项目', 403, {
+            code: 'active_project_access_lost',
+        })
     }
     return selected
 }
@@ -101,19 +390,31 @@ export const resolveActiveProjectAccess = async (): Promise<AuthorizedProject> =
 export const resolveActiveProjectKey = async (): Promise<string> =>
     (await resolveActiveProjectAccess()).project.key
 
-export const isProjectManagementRole = (
-    role: unknown,
-): role is Extract<ProjectRole, 'project_admin' | 'manager'> =>
-    role === 'project_admin' || role === 'manager'
-
 export const setActiveProjectKey = (
     projectKey: string,
     projects: AuthorizedProject[],
 ): void => {
-    if (!projects.some(({ project }) => project.key === projectKey)) {
+    const binding = readHumanSessionBinding()
+    if (
+        !binding ||
+        !projects.some(({ project }) => project.key === projectKey)
+    ) {
         throw new Error('不能切换到未授权项目')
     }
-    localStorage.setItem(activeProjectStorageKey, projectKey)
+    const record: ActiveProjectRecord = {
+        subject: binding.subject,
+        session_id: binding.session_id,
+        project_key: projectKey,
+    }
+    const previousProjectKey = activeProjectKey()
+    localStorage.setItem(activeProjectStorageKey, JSON.stringify(record))
+    if (previousProjectKey !== projectKey) {
+        signalProjectScopeChanged(projectKey)
+    }
+}
+
+export const clearActiveProjectSelection = (): void => {
+    clearStoredProjectSelection()
 }
 
 export const projectResourcePath = async (resourcePath: string): Promise<string> => {
@@ -121,6 +422,13 @@ export const projectResourcePath = async (resourcePath: string): Promise<string>
     return `projects/${encodeURIComponent(projectKey)}/${resourcePath.replace(/^\/+/, '')}`
 }
 
-export const clearProjectScopeCache = (): void => {
+export const invalidateProjectAccessCache = (): void => {
     projectRequest = undefined
+    projectRequestBinding = undefined
+    signalProjectAccessInvalidated()
+}
+
+export const clearProjectScopeCache = (): void => {
+    invalidateProjectAccessCache()
+    clearActiveProjectSelection()
 }

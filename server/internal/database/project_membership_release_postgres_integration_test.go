@@ -59,7 +59,7 @@ func TestPostgresFreshSeedMembershipSurvivesForceRLS(t *testing.T) {
 		Username:     "other-only-" + suffix,
 		Email:        "other-only-" + suffix + "@example.test",
 		PasswordHash: "test-only-hash",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&lateUser).Error; err != nil {
@@ -114,6 +114,7 @@ func TestPostgresFreshSeedMembershipSurvivesForceRLS(t *testing.T) {
 	assertSingleAuditedPostgresMembership(
 		t,
 		db,
+		"admin",
 		"chronodesk-bootstrap",
 	)
 
@@ -173,7 +174,7 @@ func TestPostgresLegacyAdministratorMigrationOwnsSingleAuditedMembership(
 		"legacy-admin",
 		"legacy-release-"+suffix+"@example.test",
 		"legacy-password-hash",
-		models.RoleAdmin,
+		"admin",
 		models.UserStatusActive,
 	).Error; err != nil {
 		t.Fatalf("insert legacy administrator: %v", err)
@@ -261,7 +262,14 @@ func TestPostgresLegacyAdministratorMigrationOwnsSingleAuditedMembership(
 	assertSingleAuditedPostgresMembership(
 		t,
 		db,
+		"legacy-admin",
 		"chronodesk-project-scope-migration",
+	)
+	assertSingleAuditedPostgresMembership(
+		t,
+		db,
+		"admin",
+		"chronodesk-bootstrap",
 	)
 }
 
@@ -294,7 +302,7 @@ func TestPostgresPartialProjectScopeMigrationRetry(t *testing.T) {
 		"partial-retry-admin",
 		"partial-retry-"+suffix+"@example.test",
 		"partial-retry-password-hash",
-		models.RoleAdmin,
+		"admin",
 		models.UserStatusActive,
 	).Error; err != nil {
 		t.Fatalf("insert partial-retry administrator: %v", err)
@@ -796,6 +804,7 @@ func assertPostgresReleaseTestOwnershipAndRLS(
 func assertSingleAuditedPostgresMembership(
 	t *testing.T,
 	db *gorm.DB,
+	wantUsername string,
 	wantActorID string,
 ) {
 	t.Helper()
@@ -813,9 +822,14 @@ func assertSingleAuditedPostgresMembership(
 		t.Fatalf("load default project: %v", err)
 	}
 	var administrator models.User
-	if err := db.Where("role = ?", models.RoleAdmin).
+	if err := db.Where(
+		"username = ? AND platform_role = ? AND status = ?",
+		wantUsername,
+		models.PlatformRolePlatformAdmin,
+		models.UserStatusActive,
+	).
 		First(&administrator).Error; err != nil {
-		t.Fatalf("load initial administrator: %v", err)
+		t.Fatalf("load active platform administrator %q: %v", wantUsername, err)
 	}
 
 	err := WithProjectScopeTransaction(
@@ -841,7 +855,15 @@ func assertSingleAuditedPostgresMembership(
 			}
 
 			var events []models.DomainEvent
-			if err := scoped.Find(&events).Error; err != nil {
+			if err := scoped.Where(
+				"type = ? AND subject = ?",
+				projectMembershipUpsertedEventType,
+				fmt.Sprintf(
+					"project/%d/memberships/%d",
+					project.ID,
+					administrator.ID,
+				),
+			).Find(&events).Error; err != nil {
 				return fmt.Errorf("load scoped domain events: %w", err)
 			}
 			if len(events) != 1 ||
@@ -858,7 +880,10 @@ func assertSingleAuditedPostgresMembership(
 			}
 
 			var deliveries []models.OutboxDelivery
-			if err := scoped.Find(&deliveries).Error; err != nil {
+			if err := scoped.Where(
+				"event_id = ?",
+				events[0].ID,
+			).Find(&deliveries).Error; err != nil {
 				return fmt.Errorf("load scoped Outbox deliveries: %w", err)
 			}
 			if len(deliveries) != 1 ||
@@ -872,7 +897,10 @@ func assertSingleAuditedPostgresMembership(
 			}
 
 			var auditEntries []models.AuditLedgerEntry
-			if err := scoped.Find(&auditEntries).Error; err != nil {
+			if err := scoped.Where(
+				"domain_event_id = ?",
+				events[0].ID,
+			).Find(&auditEntries).Error; err != nil {
 				return fmt.Errorf("load scoped audit entries: %w", err)
 			}
 			if len(auditEntries) != 1 ||

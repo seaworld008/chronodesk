@@ -1,13 +1,13 @@
 # ChronoDesk 项目权威手册
 
-> 更新时间：2026-07-29
+> 更新时间：2026-07-31
 > 适用分支：`main`（当前仓库工作区）
 
 ## 1. 项目定位
 
-ChronoDesk 是面向单组织私有化部署的企业工单自动化平台。它为客服和运营人员提供中文管理后台，也为外部 AI Agent 提供独立身份、稳定机器契约和原生协议入口。
+ChronoDesk 是面向单 Organization、多个相互隔离 Project 的 AI 原生企业工单自动化平台。它为客服和运营人员提供中文管理后台，也为外部 AI Agent 和企业系统提供独立身份、稳定机器契约和原生协议入口。
 
-人类后台与 Agent REST、MCP、A2A 直接复用同一套领域服务、策略引擎、事务事件和审计模型；系统不内置 LLM、RAG、提示词平台或自治规划器。
+Human REST、Agent REST、MCP、A2A 与 Connector 五类 Adapter 直接复用同一套领域服务、策略引擎、事务事件和审计模型。系统不提供进程内模型运行时、提示词编排平台或自治规划器；项目范围的知识生命周期、ACL 过滤混合检索、引用反馈和模型策略由 ChronoDesk 管理，搜索与模型网关由部署方提供。
 
 ## 2. 当前能力
 
@@ -19,7 +19,15 @@ ChronoDesk 是面向单组织私有化部署的企业工单自动化平台。它
 - 运营能力：自动化规则、通知中心、邮件、Webhook、WebSocket、统计分析、系统配置与管理员审计。
 - 企业界面：全中文操作提示；工单、用户、通知、自动化、Webhook、系统配置和 Agent 控制列表使用单行省略、悬停全文、横向滚动、固定操作列和可持久化的手动列宽。
 
-### 2.2 Agent 原生底座（P0-P1）
+### 2.2 组织、项目与角色边界
+
+- `Project` 是工单、配置、知识、Agent 授权、Connection 和后台任务的唯一运行边界；一个 Organization 的多个 Project 不共享访问权。
+- 平台角色只有 `platform_admin`、`security_auditor`、`emergency_operator`、`member`；项目角色只有 `project_admin`、`manager`、`agent`、`requester`、`observer`。两者均为封闭、无序集合，互不继承。
+- Human JWT 仅含平台角色声明；认证中间件实时复核 active 用户与平台角色，声明陈旧或身份失效时拒绝为 `stale_token`。项目角色由每次请求实时查询的 active `ProjectMembership` 决定，绝不写入 JWT。
+- `/api/platform/*` 只承载显式平台治理，不能形成 `ProjectScope`；`/api/projects/{projectKey}/*` 必须先解析单一 active Membership；`/api/workbench/*` 只汇总调用者 active Membership 所覆盖的项目。
+- Human Web P1 的类型化契约由 `/human-openapi.json` 发布；它不替代 Agent REST OpenAPI，也不把未列入的遗留路由宣布为稳定契约。
+
+### 2.3 Agent 原生底座（P0-P1）
 
 - 工单、评论、附件、租约、事件与幂等记录由事务化领域服务统一提交。
 - 领域事件采用 CloudEvents 1.0；`domain_events` 与 `outbox_deliveries` 支持失败重试、回放和可观测投递。
@@ -29,7 +37,13 @@ ChronoDesk 是面向单组织私有化部署的企业工单自动化平台。它
 - PostgreSQL 记录服务主体、凭据、策略决策、Actor、请求摘要、变更集、事件和管理员接管；不存储模型思维链。
 - Redis 提供跨实例限流、并发保护、调度器租约和 Agent 运行控制；支持全局/单主体紧急停止与只读模式。
 
-### 2.3 MCP 原生入口（P2）
+### 2.4 项目知识与检索基础
+
+- 知识文章、不可变版本、ACL、摄取任务、分块、索引状态、引用和反馈均绑定单一 `ProjectScope`。
+- 混合检索通过 ACL 过滤的 OpenSearch 索引执行；模型选择、外部传输、保留策略和预算由版本化项目策略约束。
+- 生产对象存储、病毒扫描、解析/摄取 Worker 和模型推理由部署方接入；这些外部依赖不改变 ChronoDesk 对授权、引用和审计的所有权。
+
+### 2.5 MCP 原生入口（P2）
 
 - `POST /mcp` 只实现 MCP `2026-07-28` 无状态 Streamable HTTP。
 - 工具覆盖工单查询/创建/更新、领取/续租/释放、分配/流转、评论、附件、历史和策略预检。
@@ -39,7 +53,7 @@ ChronoDesk 是面向单组织私有化部署的企业工单自动化平台。它
 
 完整约束见 [MCP 2026-07-28 接入说明](reference/MCP_2026_07_28.md)。
 
-### 2.4 A2A 服务端入口（P3）
+### 2.6 A2A 服务端入口（P3）
 
 - `GET /.well-known/agent-card.json` 发布支持 ETag 的 Agent Card。
 - `POST /a2a/v1` 实现 A2A 官方最新发布 `v1.0.1`，线协议固定为
@@ -55,7 +69,7 @@ ChronoDesk 是面向单组织私有化部署的企业工单自动化平台。它
 | 层级 | 当前版本/组件 |
 | --- | --- |
 | 后端 | Go 1.26.5、Gin 1.12、GORM 1.31 |
-| 数据 | PostgreSQL 18（Compose 18.4）、Redis 8（Compose 8.8） |
+| 数据 | PostgreSQL 18（Compose 18.4）、Redis 8（Compose 8.8）、OpenSearch 3.5 |
 | 前端 | React 19.2.8、React Admin 5.15.1、MUI 7.3.11 |
 | 路由与构建 | React Router 7.18.2、TypeScript 6、Vite 8.1.5 |
 | 机器契约 | OpenAPI 3.2.0、CloudEvents 1.0 |
@@ -80,9 +94,13 @@ ChronoDesk 是面向单组织私有化部署的企业工单自动化平台。它
 │   │   ├── auth/                 # 人类账号与凭据安全
 │   │   ├── database/             # PostgreSQL、Redis 与 Schema 校验
 │   │   ├── handlers/             # 人类后台 HTTP Handler
+│   │   ├── humanopenapi/          # Human Web OpenAPI 3.2 契约
 │   │   ├── mcp/                  # MCP 2026-07-28 Server
 │   │   ├── models/               # 业务、Actor、事件与 Agent 模型
 │   │   ├── openapi/              # 内嵌 OpenAPI 3.2 权威契约
+│   │   ├── asyncapi/             # 内嵌 CloudEvents/流契约
+│   │   ├── eventcontract/        # 规范 CloudEvent 类型目录
+│   │   ├── scopeddb/             # 项目范围事务路由
 │   │   ├── security/             # AES-GCM keyring、SSRF 与迁移校验
 │   │   ├── services/             # 事务化领域服务与 Outbox
 │   │   └── websocket/            # 人类实时通知
@@ -169,6 +187,8 @@ go run ./cmd/credential-maintain -validate-only
 
 - PostgreSQL：`DATABASE_URL` 或 `DB_*`。
 - Redis：`REDIS_*`；Redis 是运行、限流、调度和 Agent 控制的必要依赖。
+- 知识检索：`OPENSEARCH_*` 与 `MODEL_GATEWAY_*`；搜索索引和模型网关由部署方
+  管理，未配置模型网关时不会执行向量嵌入或模型推理。
 - 人类认证：`JWT_SECRET`、`JWT_REFRESH_SECRET` 均至少 32 个字符且彼此独立；
   issuer 固定为 `APP_URL`，REST audience 固定为 `${APP_URL}/api`。
   `BCRYPT_COST` 必须在 10–16，默认及推荐值为 12，非法值会阻止启动。
@@ -194,7 +214,14 @@ go run ./cmd/credential-maintain -validate-only
 
 `/api/v2/projects/{projectKey}` 是供 Agent 与 SDK 使用的项目显式机器入口；`/api` 是供 React Admin 和人类会话使用的业务入口，不提供旧 Agent 协议兼容层。所有 Schema、scope、错误码、示例和 Webhook 定义以运行时 `/openapi.yaml` 为准。
 
-### 6.2 Agent REST 契约
+### 6.2 Human REST 与工作台契约
+
+- `/human-openapi.json` 是 Human Web P1 的公开类型化契约；页面类型和路由必须从该契约生成或校验。
+- `/api/platform/*` 使用精确平台角色 allowlist，适用于平台项目治理、用户和安全审计等治理资源，且不返回或授予项目角色。
+- `/api/projects/{projectKey}/*` 是明确项目范围的人类工作入口；项目 key 只是授权输入，可信范围来自服务端解析的 active Membership。
+- `/api/workbench/tickets` 只在已授权项目集合内做跨项目聚合，不能被平台角色或客户端项目列表扩大范围。
+
+### 6.3 Agent REST 契约
 
 `/api/v2/projects/{projectKey}` 提供工单、历史、评论、附件、租约和事件游标；Human 管理员的 Agent 控制面位于 `/api/projects/{projectKey}/admin/agents`，同样只能访问路径所绑定的已授权项目。最小 scope 为：
 
@@ -213,11 +240,11 @@ tasks:manage
 
 写请求按操作要求携带 `Idempotency-Key`、`If-Match` 和 `X-Ticket-Lease`。成功响应包含操作 ID、资源 ID/版本、事件 ID、变更字段和策略决策 ID；版本或租约冲突返回稳定的 `409` 机器错误。
 
-### 6.3 人类后台 REST
+### 6.4 人类后台 REST
 
 `/api` 使用人类 JWT 会话与角色/对象级授权，覆盖认证、工单、评论、附件、分类、处理人、通知、用户中心、自动化、系统设置、统计、邮件、Webhook、WebSocket 与 Agent 管理后台。客户只能访问授权工单和公开协作内容，内部评论、扫描状态、凭据和策略由更高权限控制。
 
-### 6.4 只保留当前协议
+### 6.5 只保留当前协议
 
 ChronoDesk 不保留 MCP、A2A 或 OpenAPI 的旧版本协商、旧路径别名和降级实现：
 
@@ -262,7 +289,9 @@ make e2e
 ## 9. 当前范围边界
 
 - 单组织私有化部署；当前不包含多租户、计费和租户隔离。
-- Agent 智能模型、RAG 和规划器由外部平台承载。
+- Agent 模型推理和规划器由外部平台或部署方网关承载；ChronoDesk 已实现项目知识、
+  ACL 过滤检索、引用反馈和模型策略基础。
+- 生产对象存储、病毒扫描、解析/摄取 Worker 与完整 Copilot 工作台仍需闭环。
 - A2A 首期只提供服务端，不主动发现或委派给外部 Agent。
 - MCP Apps 与 MCP Tasks 未声明；A2A Task 是独立协议模型。
 

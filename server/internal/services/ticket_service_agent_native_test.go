@@ -14,7 +14,7 @@ func TestHumanTicketCASCannotOverwriteConcurrentAgentVersion(t *testing.T) {
 	}
 	user := models.User{
 		Username: "cas-human", Email: "cas-human@example.com",
-		PasswordHash: "hash", Role: models.RoleAgent, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
@@ -76,7 +76,7 @@ func TestHumanTicketLifecycleUsesNativeEventOutboxTransaction(t *testing.T) {
 	}
 	user := models.User{
 		Username: "human-native", Email: "human-native@example.com",
-		PasswordHash: "hash", Role: models.RoleAgent, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)

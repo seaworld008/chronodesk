@@ -2,7 +2,14 @@
 
 from .api import APIClient, APIError
 from .assertions import assert_error_contract, assert_no_sensitive_fields
-from .human import HUMAN_ROLES, E2EResourceManager, HumanIdentity, strong_password
+from .human import (
+    PLATFORM_ROLES,
+    PROJECT_ROLES,
+    E2EResourceManager,
+    HumanIdentity,
+    assert_human_session_contract,
+    strong_password,
+)
 from .intake import PublishedRequestType, PublishedTicketIntake
 from .safety import (
     TestSafetyError,
@@ -13,7 +20,8 @@ from .safety import (
 )
 
 __all__ = [
-    "HUMAN_ROLES",
+    "PLATFORM_ROLES",
+    "PROJECT_ROLES",
     "APIClient",
     "APIError",
     "E2EResourceManager",
@@ -22,6 +30,7 @@ __all__ = [
     "PublishedTicketIntake",
     "TestSafetyError",
     "assert_error_contract",
+    "assert_human_session_contract",
     "assert_local_ephemeral_target",
     "assert_no_sensitive_fields",
     "response_diagnostic",

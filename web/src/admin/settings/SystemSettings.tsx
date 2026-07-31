@@ -21,6 +21,11 @@ import {
 import { Save as SaveIcon, Refresh as RefreshIcon } from '@mui/icons-material'
 import { useNotify } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
+import {
+  humanApiRoutes,
+  type SystemConfig as HumanSystemConfig,
+  type UpdateSystemConfigRequest,
+} from '@/lib/generated/human-api'
 import BackButton from '../common/BackButton'
 import {
   InlineDetails,
@@ -36,20 +41,7 @@ const systemConfigColumns: ResizableColumn[] = [
   { key: 'actions', defaultWidth: 120, minWidth: 104, maxWidth: 180, sticky: 'right' },
 ]
 
-interface SystemConfig {
-  id: number
-  key: string
-  value: string
-  value_type: 'string' | 'int' | 'bool' | 'json'
-  description: string
-  category: string
-  group: string
-  is_required: boolean
-  is_active: boolean
-  default_value?: string
-  min_value?: number
-  max_value?: number
-}
+type SystemConfig = HumanSystemConfig
 
 interface EditableConfig extends SystemConfig {
   dirty?: boolean
@@ -114,7 +106,9 @@ const SystemSettings: React.FC = () => {
   const loadConfigs = useCallback(async (category: string, silent = false) => {
     try {
       if (!silent) setLoading(true)
-      const data = await apiFetch<SystemConfig[]>(`/admin/configs?category=${category}`)
+      const data = await apiFetch<SystemConfig[]>(
+        humanApiRoutes.listPlatformConfigs({ category }),
+      )
       setConfigs((prev) => ({
         ...prev,
         [category]: data.map(parseInitialValue),
@@ -165,17 +159,16 @@ const SystemSettings: React.FC = () => {
   const handleSave = async (config: EditableConfig, silent = false) => {
     try {
       setSavingKey(config.key)
-      const payload = {
-        key: config.key,
+      const payload: UpdateSystemConfigRequest = {
         value: config.value,
         value_type: config.value_type,
         description: config.description,
         category: config.category,
         group: config.group,
-        is_required: config.is_required,
-        is_active: config.is_active,
       }
-      await apiFetch(`/admin/configs/${encodeURIComponent(config.key)}`, {
+      await apiFetch(humanApiRoutes.updatePlatformConfig({
+        configKey: config.key,
+      }), {
         method: 'PUT',
         body: JSON.stringify(payload),
       })

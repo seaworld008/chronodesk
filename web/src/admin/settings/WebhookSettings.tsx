@@ -37,7 +37,13 @@ import {
 } from '@mui/icons-material'
 import { useNotify } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
-import { projectResourcePath } from '@/lib/projectScope'
+import { resolveActiveProjectKey } from '@/lib/projectScope'
+import {
+  humanApiRoutes,
+  type WebhookConfig,
+  type WebhookPage,
+  type WebhookTestReceipt,
+} from '@/lib/generated/human-api'
 import BackButton from '../common/BackButton'
 import {
   InlineDetails,
@@ -56,40 +62,20 @@ const webhookColumns: ResizableColumn[] = [
   { key: 'actions', defaultWidth: 152, minWidth: 136, maxWidth: 220, sticky: 'right' },
 ]
 
-interface WebhookConfig {
-  id: number
-  name: string
-  description: string
-  provider: string
-  webhook_url: string
-  status: string
-  enabled_events_list?: string[]
-  filter_rules_obj?: {
-    transition_statuses?: string[]
-  }
-  message_format?: string
-  retry_count: number
-  retry_interval: number
-  timeout_seconds: number
-  is_async: boolean
-  rate_limit: number
-  rate_limit_window: number
-  secret?: string
-  access_token?: string
-  last_triggered_at?: string
-  last_success_at?: string
-  last_error_at?: string
-  last_error?: string
-  total_sent: number
-  total_success: number
-  total_failed: number
-}
-
-interface WebhookListResponse {
-  items: WebhookConfig[]
-  total: number
-  page: number
-  size: number
+const isQueuedWebhookTestReceipt = (
+  value: unknown,
+  configId: number,
+): value is WebhookTestReceipt => {
+  if (typeof value !== 'object' || value === null) return false
+  const receipt = value as Record<string, unknown>
+  return (
+    receipt.config_id === configId
+    && receipt.status === 'queued'
+    && receipt.queued === true
+    && receipt.delivered === false
+    && ['operation_id', 'event_id', 'delivery_id', 'snapshot_id', 'configuration_version']
+      .every((field) => typeof receipt[field] === 'string' && receipt[field].trim() !== '')
+  )
 }
 
 interface WebhookForm {
@@ -242,8 +228,12 @@ const WebhookSettings: React.FC = () => {
   const fetchWebhooks = useCallback(async () => {
     try {
       setLoading(true)
-      const path = await projectResourcePath('webhooks?page=1&page_size=100')
-      const data = await apiFetch<WebhookListResponse>(path)
+      const projectKey = await resolveActiveProjectKey()
+      const path = humanApiRoutes.listProjectWebhooks(
+        { projectKey },
+        { page: 1, page_size: 100 },
+      )
+      const data = await apiFetch<WebhookPage>(path)
       setItems(data.items ?? [])
     } catch (error: unknown) {
       notify(extractErrorMessage(error, '加载 Webhook 列表失败'), { type: 'error' })
@@ -270,8 +260,8 @@ const WebhookSettings: React.FC = () => {
       description: webhook.description || '',
       provider: webhook.provider,
       webhook_url: webhook.webhook_url,
-      secret: webhook.secret || '',
-      access_token: webhook.access_token || '',
+      secret: '',
+      access_token: '',
       enabled_events: webhook.enabled_events_list ?? [],
       transition_statuses: webhook.filter_rules_obj?.transition_statuses ?? [],
       message_format: webhook.message_format || 'markdown',
@@ -348,7 +338,7 @@ const WebhookSettings: React.FC = () => {
     return Object.keys(next).length === 0
   }
 
-  const buildPayload = () => {
+  const buildPayload = (includeStatus: boolean) => {
     const payload: Record<string, unknown> = {
       name: form.name.trim(),
       description: form.description.trim(),
@@ -367,8 +357,8 @@ const WebhookSettings: React.FC = () => {
       is_async: form.is_async,
       rate_limit: Number(form.rate_limit || 0),
       rate_limit_window: Number(form.rate_limit_window || 0),
-      status: form.status,
     }
+    if (includeStatus) payload.status = form.status
 
     if (form.secret && form.secret.trim() !== '') {
       payload.secret = form.secret.trim()
@@ -385,16 +375,20 @@ const WebhookSettings: React.FC = () => {
 
     setSaving(true)
     try {
-      const payload = buildPayload()
+      const payload = buildPayload(currentId !== null)
+      const projectKey = await resolveActiveProjectKey()
       if (currentId) {
-        const path = await projectResourcePath(`webhooks/${currentId}`)
+        const path = humanApiRoutes.updateProjectWebhook({
+          projectKey,
+          webhookID: currentId,
+        })
         await apiFetch(path, {
           method: 'PUT',
           body: JSON.stringify(payload),
         })
         notify('Webhook 更新成功', { type: 'success' })
       } else {
-        const path = await projectResourcePath('webhooks')
+        const path = humanApiRoutes.createProjectWebhook({ projectKey })
         await apiFetch(path, {
           method: 'POST',
           body: JSON.stringify(payload),
@@ -412,7 +406,11 @@ const WebhookSettings: React.FC = () => {
 
   const executeDelete = async (id: number) => {
     try {
-      const path = await projectResourcePath(`webhooks/${id}`)
+      const projectKey = await resolveActiveProjectKey()
+      const path = humanApiRoutes.deleteProjectWebhook({
+        projectKey,
+        webhookID: id,
+      })
       await apiFetch(path, { method: 'DELETE' })
       notify('删除成功', { type: 'success' })
       fetchWebhooks()
@@ -424,11 +422,18 @@ const WebhookSettings: React.FC = () => {
   const executeTest = async (id: number) => {
     setTestId(id)
     try {
-      const path = await projectResourcePath(`webhooks/${id}/test`)
-      await apiFetch(path, { method: 'POST' })
-      notify('Webhook 测试成功', { type: 'success' })
+      const projectKey = await resolveActiveProjectKey()
+      const path = humanApiRoutes.queueProjectWebhookTest({
+        projectKey,
+        webhookID: id,
+      })
+      const receipt = await apiFetch<unknown>(path, { method: 'POST' })
+      if (!isQueuedWebhookTestReceipt(receipt, id)) {
+        throw new Error('Webhook 测试入队响应无效，请稍后重试')
+      }
+      notify('Webhook 测试已入队，请等待投递结果', { type: 'info' })
     } catch (error: unknown) {
-      notify(extractErrorMessage(error, 'Webhook 测试失败'), { type: 'error' })
+      notify(extractErrorMessage(error, 'Webhook 测试入队失败'), { type: 'error' })
     } finally {
       setTestId(null)
     }
@@ -560,7 +565,7 @@ const WebhookSettings: React.FC = () => {
                     <IconButton
                       size="small"
                       aria-label={`测试 Webhook：${item.name}`}
-                      title="发送测试请求"
+                      title="将测试请求加入投递队列"
                       onClick={() => setPendingAction({
                         kind: 'test',
                         id: item.id,
@@ -604,7 +609,7 @@ const WebhookSettings: React.FC = () => {
             <Grid
               size={{
                 xs: 12,
-                md: 6
+                md: currentId === null ? 12 : 6
               }}>
               <TextField
                 fullWidth
@@ -615,28 +620,30 @@ const WebhookSettings: React.FC = () => {
                 helperText={errors.name || '用于区分不同 Webhook 规则'}
               />
             </Grid>
-            <Grid
-              size={{
-                xs: 12,
-                md: 6
-              }}>
-              <FormControl fullWidth error={Boolean(errors.status)}>
-                <InputLabel id={`${webhookFormFieldIDs.status}-label`}>状态</InputLabel>
-                <Select
-                  id={webhookFormFieldIDs.status}
-                  labelId={`${webhookFormFieldIDs.status}-label`}
-                  label="状态"
-                  value={form.status}
-                  onChange={(e) => handleFormChange('status', e.target.value)}
-                >
-                  {statusOptions.map((opt) => (
-                    <MenuItem key={opt.value} value={opt.value}>
-                      {opt.label}
-                    </MenuItem>
-                  ))}
-                </Select>
-              </FormControl>
-            </Grid>
+            {currentId !== null && (
+              <Grid
+                size={{
+                  xs: 12,
+                  md: 6
+                }}>
+                <FormControl fullWidth error={Boolean(errors.status)}>
+                  <InputLabel id={`${webhookFormFieldIDs.status}-label`}>状态</InputLabel>
+                  <Select
+                    id={webhookFormFieldIDs.status}
+                    labelId={`${webhookFormFieldIDs.status}-label`}
+                    label="状态"
+                    value={form.status}
+                    onChange={(e) => handleFormChange('status', e.target.value)}
+                  >
+                    {statusOptions.map((opt) => (
+                      <MenuItem key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+              </Grid>
+            )}
             <Grid size={12}>
               <TextField
                 fullWidth
@@ -896,7 +903,7 @@ const WebhookSettings: React.FC = () => {
         <DialogContent>
           {pendingAction?.kind === 'delete'
             ? `确定删除“${pendingAction.name}”吗？删除后将停止对应事件投递。`
-            : `测试将立即向“${pendingAction?.name || ''}”配置的地址发送一条真实请求，确定继续吗？`}
+            : `测试会将一条真实请求加入“${pendingAction?.name || ''}”的投递队列。入队不代表发送成功，请随后查看投递日志，确定继续吗？`}
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setPendingAction(null)}>取消</Button>
@@ -905,7 +912,7 @@ const WebhookSettings: React.FC = () => {
             variant="contained"
             onClick={() => void confirmPendingAction()}
           >
-            {pendingAction?.kind === 'delete' ? '确认删除' : '确认发送测试'}
+            {pendingAction?.kind === 'delete' ? '确认删除' : '确认入队'}
           </Button>
         </DialogActions>
       </Dialog>

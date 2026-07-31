@@ -230,6 +230,17 @@ func runMCPProjectOperation[T any](
 		adapter.db,
 		scope,
 		func(scopedContext context.Context) error {
+			currentAccess, revalidateErr :=
+				adapter.service.RevalidatePrincipalProjectOperation(
+					scopedContext,
+					principal.Scopes...,
+				)
+			if revalidateErr != nil {
+				return revalidateErr
+			}
+			if currentAccess.Project.Key != models.ProjectKey(projectKey) {
+				return services.ErrProjectAccessDenied
+			}
 			result, operationErr = run(
 				scopedContext,
 				projectKey,
@@ -258,12 +269,98 @@ func runMCPProjectOperation[T any](
 	return result, operationErr
 }
 
+// runMCPExternalProjectOperation performs only the first short authorization
+// transaction, then executes an operation-specific two-phase service outside
+// it. The service must revalidate the same Grant/credential snapshot in its
+// final project transaction before returning or persisting a result.
+func runMCPExternalProjectOperation[T any](
+	adapter *MCPAdapter,
+	ctx context.Context,
+	principal mcp.Principal,
+	run func(
+		context.Context,
+		string,
+		models.ProjectScope,
+	) (T, error),
+) (T, error) {
+	var zero T
+	if adapter == nil || adapter.db == nil || run == nil {
+		return zero, errors.New(
+			"MCP external project operation is unavailable",
+		)
+	}
+	operationContext, projectKey, scope, err :=
+		mcpOperationContext(ctx, principal)
+	if err != nil {
+		return zero, err
+	}
+	publications := &mcpPublicationBuffer{}
+	operationContext = context.WithValue(
+		operationContext,
+		mcpPublicationBufferContextKey{},
+		publications,
+	)
+	err = scopeddb.WithProjectScopeContextTransaction(
+		operationContext,
+		adapter.db,
+		scope,
+		func(scopedContext context.Context) error {
+			currentAccess, revalidateErr :=
+				adapter.service.
+					RevalidatePrincipalProjectOperation(
+						scopedContext,
+						principal.Scopes...,
+					)
+			if revalidateErr != nil {
+				return revalidateErr
+			}
+			if currentAccess.Project.Key !=
+				models.ProjectKey(projectKey) {
+				return services.ErrProjectAccessDenied
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return zero, err
+	}
+	result, operationErr := run(
+		operationContext,
+		projectKey,
+		scope,
+	)
+	if operationErr == nil {
+		for _, publication := range publications.items {
+			adapter.publishTicketResourcesNow(
+				publication.principal,
+				publication.ticketID,
+				publication.oldQueue,
+				publication.newQueue,
+			)
+		}
+	}
+	return result, operationErr
+}
+
 func (a *MCPAdapter) Authorize(
 	ctx context.Context,
 	principal mcp.Principal,
 	request mcp.AuthorizationRequest,
 ) error {
-	_, err := runMCPProjectOperation(
+	if err := validateMCPPrincipal(principal); err != nil {
+		return err
+	}
+	if err := validateMCPPolicyPreauthorizationInput(
+		request.Action,
+		request.Arguments,
+	); err != nil {
+		return err
+	}
+	projectOperation := runMCPProjectOperation[struct{}]
+	if policySpecForMCPAction(request.Action).write {
+		projectOperation = runMCPExternalProjectOperation[struct{}]
+	}
+	_, err := projectOperation(
 		a,
 		ctx,
 		principal,
@@ -334,7 +431,11 @@ func (a *MCPAdapter) authorizeScoped(
 		if domainAction == "" {
 			domainAction = request.Action
 		}
-		decision, err := a.service.CheckAction(ctx, services.PolicyCheckInput{
+		check := a.service.CheckAction
+		if spec.write {
+			check = a.service.CheckActionInShortProjectTransactions
+		}
+		decision, err := check(ctx, services.PolicyCheckInput{
 			ServicePrincipalID: principal.ID,
 			CredentialID:       principal.CredentialID,
 			Scope:              scope,
@@ -433,7 +534,62 @@ func (a *MCPAdapter) CallTool(
 	name string,
 	arguments map[string]any,
 ) (map[string]any, error) {
-	result, err := runMCPProjectOperation(
+	if err := validateMCPPrincipal(principal); err != nil {
+		return nil, backendError(err)
+	}
+	if err := validateMCPToolPreauthorizationInput(
+		name,
+		arguments,
+	); err != nil {
+		return nil, err
+	}
+	command, commandReady, err :=
+		mcpNativeCommandAuthorizationInput(
+			principal,
+			name,
+			arguments,
+		)
+	if err != nil {
+		return nil, err
+	}
+	if commandReady {
+		operationContext, projectKey, _, contextErr :=
+			mcpOperationContext(ctx, principal)
+		if contextErr != nil {
+			return nil, backendError(contextErr)
+		}
+		if contextErr = validateMCPProjectArgument(
+			arguments,
+			projectKey,
+		); contextErr != nil {
+			return nil, contextErr
+		}
+		ctx, err = a.service.
+			AuthorizeNativeCommandInShortProjectTransactions(
+				operationContext,
+				command,
+			)
+		if err != nil {
+			return nil, backendError(err)
+		}
+	}
+	leaseContext, release, err :=
+		a.service.AcquireAgentExecutionContext(
+			ctx,
+			principal.ID,
+		)
+	if err != nil {
+		return nil, backendError(err)
+	}
+	defer release()
+	ctx = leaseContext
+
+	projectOperation := runMCPProjectOperation[map[string]any]
+	if name == "ticket_attach_file" || name == "ticket_create" {
+		projectOperation =
+			runMCPExternalProjectOperation[map[string]any]
+	}
+	result, err := projectOperation(
 		a,
 		ctx,
 		principal,
@@ -470,14 +626,12 @@ func (a *MCPAdapter) callToolScoped(
 	if err := validateMCPProjectArgument(arguments, projectKey); err != nil {
 		return nil, err
 	}
-	if mcpToolRequiresLease(name) && argumentString(arguments, "lease_id") == "" {
-		return nil, invalidParams("lease_id is required", "lease_id")
+	if err := validateMCPToolPreauthorizationInput(
+		name,
+		arguments,
+	); err != nil {
+		return nil, err
 	}
-	release, err := a.service.AcquireAgentExecution(ctx, principal.ID)
-	if err != nil {
-		return nil, backendError(err)
-	}
-	defer release()
 
 	switch name {
 	case "ticket_list":
@@ -545,6 +699,84 @@ func mcpToolRequiresLease(name string) bool {
 	}
 }
 
+func validateMCPToolPreauthorizationInput(
+	name string,
+	arguments map[string]any,
+) error {
+	if !mcpToolRequiresLease(name) ||
+		argumentString(arguments, "lease_id") != "" {
+		return nil
+	}
+	failure := backendError(services.ErrLeaseConflict)
+	failure.Details = map[string]any{"field": "lease_id"}
+	return failure
+}
+
+func validateMCPPolicyPreauthorizationInput(
+	name string,
+	arguments map[string]any,
+) error {
+	switch name {
+	case "ticket_add_comment", "ticket_attach_file":
+		return validateMCPToolPreauthorizationInput(name, arguments)
+	default:
+		return nil
+	}
+}
+
+func mcpNativeCommandAuthorizationInput(
+	principal mcp.Principal,
+	name string,
+	arguments map[string]any,
+) (services.NativeCommandAuthorizationInput, bool, error) {
+	command := services.NativeCommandAuthorizationInput{
+		Actor:          principalActor(principal),
+		CredentialID:   principal.CredentialID,
+		TokenScopes:    append([]string(nil), principal.Scopes...),
+		RequestDigest:  requestDigest(arguments),
+		SourceProtocol: mcpSourceProtocol,
+	}
+	switch name {
+	case "ticket_update":
+		command.Kind = services.NativeCommandTicketUpdate
+	case "ticket_assign":
+		command.Kind = services.NativeCommandTicketAssign
+		rawAssignee, ok := arguments["assignee"].(map[string]any)
+		if !ok {
+			return command, false, invalidArgument(
+				"assignee is required",
+			)
+		}
+		assignee := models.ActorRef{
+			Type: models.ActorType(
+				argumentString(rawAssignee, "type"),
+			),
+			ID: argumentString(rawAssignee, "id"),
+		}
+		command.Assignee = &assignee
+	case "ticket_transition":
+		command.Kind = services.NativeCommandTicketTransit
+	case "ticket_add_comment":
+		command.Kind = services.NativeCommandCommentCreate
+	case "ticket_claim":
+		command.Kind = services.NativeCommandTicketClaim
+	case "ticket_heartbeat":
+		command.Kind = services.NativeCommandLeaseHeartbeat
+		command.LeaseID = argumentString(arguments, "lease_id")
+	case "ticket_release":
+		command.Kind = services.NativeCommandLeaseRelease
+		command.LeaseID = argumentString(arguments, "lease_id")
+	default:
+		return command, false, nil
+	}
+	ticketID, err := argumentUint(arguments, "ticket_id")
+	if err != nil {
+		return command, false, err
+	}
+	command.TicketID = ticketID
+	return command, true, nil
+}
+
 func (a *MCPAdapter) createTicket(
 	ctx context.Context,
 	principal mcp.Principal,
@@ -593,33 +825,53 @@ func (a *MCPAdapter) createTicket(
 		request.CustomFields = &customFields
 	}
 
-	decision, err := a.checkPolicy(ctx, principal, policyRequest{
-		scope:        models.ScopeTicketsCreate,
-		action:       "ticket.create",
-		resourceType: "ticket",
-		write:        true,
-		digest:       requestDigest(arguments),
-	})
-	if err != nil {
-		return nil, err
-	}
 	reservation, err := a.reserveIdempotency(ctx, principal, "ticket.create", arguments)
 	if err != nil {
 		return nil, err
 	}
+	digest := requestDigest(arguments)
+	authorization := services.NativeCommandAuthorizationInput{
+		Kind:           services.NativeCommandTicketCreate,
+		Actor:          principalActor(principal),
+		CredentialID:   principal.CredentialID,
+		TokenScopes:    append([]string(nil), principal.Scopes...),
+		RequestDigest:  digest,
+		SourceProtocol: mcpSourceProtocol,
+	}
 	if reservation.Replayed {
+		if err := a.service.
+			AuthorizeNativeCommandReplayInShortProjectTransactions(
+				ctx,
+				authorization,
+			); err != nil {
+			return nil, backendError(err)
+		}
 		return replayReceipt(reservation.Record)
 	}
 
-	result, err := a.service.CreateNativeTicket(ctx, services.NativeTicketCreateInput{
-		Request:             request,
-		Actor:               principalActor(principal),
-		CredentialID:        principal.CredentialID,
-		PolicyDecisionID:    decision.ID,
-		SourceProtocol:      mcpSourceProtocol,
-		TrustLevel:          models.TicketTrustLevelUntrusted,
-		IdempotencyRecordID: reservation.Record.ID,
-	})
+	authorizedContext, err :=
+		a.service.AuthorizeNativeCommandInShortProjectTransactions(
+			ctx,
+			authorization,
+		)
+	if err != nil {
+		a.failReservation(ctx, reservation, err)
+		return nil, backendError(err)
+	}
+	result, err := runMachineTicketCreateDatabaseCommand(
+		authorizedContext,
+		a.db,
+		a.service,
+		services.NativeTicketCreateInput{
+			Request:             request,
+			Actor:               principalActor(principal),
+			CredentialID:        principal.CredentialID,
+			SourceProtocol:      mcpSourceProtocol,
+			RequestDigest:       digest,
+			TrustLevel:          models.TicketTrustLevelUntrusted,
+			IdempotencyRecordID: reservation.Record.ID,
+		},
+	)
 	if err != nil {
 		a.failReservation(ctx, reservation, err)
 		return nil, backendError(err)
@@ -647,38 +899,20 @@ func (a *MCPAdapter) updateTicket(
 	if !ok || len(patch) == 0 {
 		return nil, invalidArgument("patch is required")
 	}
-	policyFields := make([]string, 0, len(patch))
 	for field, value := range patch {
 		switch field {
 		case "title", "description", "type", "priority":
-			policyFields = append(policyFields, field)
 		case "tags":
-			policyFields = append(policyFields, field)
 		case "agent_context":
-			policyFields = append(policyFields, field)
 		case "queue":
 			queue, _ := value.(string)
 			queue = strings.TrimSpace(queue)
 			if !mcpQueuePattern.MatchString(queue) {
 				return nil, invalidArgument("invalid queue")
 			}
-			policyFields = append(policyFields, "custom_fields")
 		default:
 			return nil, invalidArgument("unsupported ticket patch field")
 		}
-	}
-	sort.Strings(policyFields)
-	decision, err := a.checkPolicy(ctx, principal, policyRequest{
-		scope:        models.ScopeTicketsUpdate,
-		action:       "ticket.update",
-		resourceType: "ticket",
-		resourceID:   strconv.FormatUint(uint64(ticketID), 10),
-		write:        true,
-		digest:       requestDigest(arguments),
-		context:      map[string]any{"changed_fields": policyFields},
-	})
-	if err != nil {
-		return nil, err
 	}
 	scope, err := services.RequireProjectScope(ctx)
 	if err != nil {
@@ -728,10 +962,10 @@ func (a *MCPAdapter) updateTicket(
 		LeaseID:             leaseID,
 		Actor:               principalActor(principal),
 		CredentialID:        principal.CredentialID,
-		PolicyDecisionID:    decision.ID,
 		RequiredScope:       models.ScopeTicketsUpdate,
 		Action:              "ticket.update",
 		SourceProtocol:      mcpSourceProtocol,
+		RequestDigest:       requestDigest(arguments),
 		Changes:             changes,
 		IdempotencyRecordID: reservation.Record.ID,
 		EventData: map[string]any{
@@ -785,18 +1019,6 @@ func (a *MCPAdapter) assignTicket(
 		return nil, err
 	}
 	if reservation.Replayed {
-		if _, err := a.checkPolicy(ctx, principal, policyRequest{
-			scope:        models.ScopeTicketsAssign,
-			action:       "ticket.assign",
-			resourceType: "ticket",
-			resourceID:   strconv.FormatUint(uint64(ticketID), 10),
-			write:        true,
-			risky:        true,
-			digest:       requestDigest(arguments),
-			context:      map[string]any{"assignee_type": assignee.Type, "assignee_id": assignee.ID},
-		}); err != nil {
-			return nil, err
-		}
 		return replayReceipt(reservation.Record)
 	}
 	result, err := a.service.AssignTicket(ctx, services.AssignTicketCommand{
@@ -843,18 +1065,6 @@ func (a *MCPAdapter) transitionTicket(
 		return nil, err
 	}
 	if reservation.Replayed {
-		if _, err := a.checkPolicy(ctx, principal, policyRequest{
-			scope:        models.ScopeTicketsTransition,
-			action:       "ticket.transition",
-			resourceType: "ticket",
-			resourceID:   strconv.FormatUint(uint64(ticketID), 10),
-			write:        true,
-			risky:        true,
-			digest:       requestDigest(arguments),
-			context:      map[string]any{"target_status": status},
-		}); err != nil {
-			return nil, err
-		}
 		return replayReceipt(reservation.Record)
 	}
 	result, err := a.service.TransitionTicket(ctx, services.TransitionTicketCommand{
@@ -893,17 +1103,6 @@ func (a *MCPAdapter) addComment(
 		return nil, err
 	}
 	commentType := models.CommentType(argumentString(arguments, "visibility"))
-	decision, err := a.checkPolicy(ctx, principal, policyRequest{
-		scope:        models.ScopeCommentsWrite,
-		action:       "ticket.comment.create",
-		resourceType: "ticket",
-		resourceID:   strconv.FormatUint(uint64(ticketID), 10),
-		write:        true,
-		digest:       requestDigest(arguments),
-	})
-	if err != nil {
-		return nil, err
-	}
 	reservation, err := a.reserveIdempotency(ctx, principal, "ticket.comment.create", arguments)
 	if err != nil {
 		return nil, err
@@ -917,8 +1116,8 @@ func (a *MCPAdapter) addComment(
 		LeaseID:             leaseID,
 		Actor:               principalActor(principal),
 		CredentialID:        principal.CredentialID,
-		PolicyDecisionID:    decision.ID,
 		SourceProtocol:      mcpSourceProtocol,
+		RequestDigest:       requestDigest(arguments),
 		Content:             argumentString(arguments, "content"),
 		ContentType:         argumentString(arguments, "content_type"),
 		Type:                commentType,
@@ -952,19 +1151,31 @@ func (a *MCPAdapter) attachFile(
 	if err != nil {
 		return nil, err
 	}
-	decision, err := a.checkPolicy(ctx, principal, policyRequest{
-		scope:        models.ScopeAttachmentsWrite,
-		action:       "ticket.attachment.create",
-		resourceType: "ticket",
-		resourceID:   strconv.FormatUint(uint64(ticketID), 10),
-		write:        true,
-		digest:       requestDigest(arguments),
-		context: map[string]any{
-			"file_name":    argumentString(arguments, "file_name"),
-			"content_type": argumentString(arguments, "content_type"),
-		},
-	})
-	if err != nil {
+	attachmentInput := services.NativeAttachmentInput{
+		TicketID:        ticketID,
+		ExpectedVersion: expectedVersion,
+		LeaseID:         leaseID,
+		Actor:           principalActor(principal),
+		CredentialID:    principal.CredentialID,
+		SourceProtocol:  mcpSourceProtocol,
+		RequestDigest:   requestDigest(arguments),
+		OriginalName: argumentString(
+			arguments,
+			"file_name",
+		),
+		ContentType: argumentString(
+			arguments,
+			"content_type",
+		),
+		IsPublic: argumentString(
+			arguments,
+			"visibility",
+		) == "public",
+	}
+	if err := a.service.PrepareAttachmentUploadAuthorization(
+		ctx,
+		&attachmentInput,
+	); err != nil {
 		return nil, err
 	}
 	reservation, err := a.reserveIdempotency(ctx, principal, "ticket.attachment.create", arguments)
@@ -974,20 +1185,13 @@ func (a *MCPAdapter) attachFile(
 	if reservation.Replayed {
 		return a.replayAttachment(ctx, reservation.Record)
 	}
-	result, err := a.service.StoreAttachment(ctx, services.NativeAttachmentInput{
-		TicketID:            ticketID,
-		ExpectedVersion:     expectedVersion,
-		LeaseID:             leaseID,
-		Actor:               principalActor(principal),
-		CredentialID:        principal.CredentialID,
-		PolicyDecisionID:    decision.ID,
-		SourceProtocol:      mcpSourceProtocol,
-		OriginalName:        argumentString(arguments, "file_name"),
-		ContentType:         argumentString(arguments, "content_type"),
-		IsPublic:            argumentString(arguments, "visibility") == "public",
-		Reader:              bytes.NewReader(content),
-		IdempotencyRecordID: reservation.Record.ID,
-	})
+	attachmentInput.Reader = bytes.NewReader(content)
+	attachmentInput.IdempotencyRecordID =
+		reservation.Record.ID
+	result, err := a.service.StoreAttachment(
+		ctx,
+		attachmentInput,
+	)
 	if err != nil {
 		a.failReservation(ctx, reservation, err)
 		return nil, backendError(err)
@@ -1016,17 +1220,6 @@ func (a *MCPAdapter) claimTicket(
 	if err != nil {
 		return nil, err
 	}
-	decision, err := a.checkPolicy(ctx, principal, policyRequest{
-		scope:        models.ScopeTasksManage,
-		action:       "ticket.claim",
-		resourceType: "ticket",
-		resourceID:   strconv.FormatUint(uint64(ticketID), 10),
-		write:        true,
-		digest:       requestDigest(arguments),
-	})
-	if err != nil {
-		return nil, err
-	}
 	reservation, err := a.reserveIdempotency(ctx, principal, "ticket.lease.claim", arguments)
 	if err != nil {
 		return nil, err
@@ -1040,7 +1233,6 @@ func (a *MCPAdapter) claimTicket(
 		ExpectedVersion:     expectedVersion,
 		TTL:                 time.Duration(leaseSeconds) * time.Second,
 		CredentialID:        principal.CredentialID,
-		PolicyDecisionID:    decision.ID,
 		SourceProtocol:      mcpSourceProtocol,
 		RequestDigest:       requestDigest(arguments),
 		IdempotencyRecordID: reservation.Record.ID,
@@ -1064,17 +1256,6 @@ func (a *MCPAdapter) heartbeatTicket(
 	}
 	leaseID := argumentString(arguments, "lease_id")
 	leaseSeconds, err := argumentInt(arguments, "lease_seconds", 120, 10, 900)
-	if err != nil {
-		return nil, err
-	}
-	decision, err := a.checkPolicy(ctx, principal, policyRequest{
-		scope:        models.ScopeTasksManage,
-		action:       "ticket.lease.heartbeat",
-		resourceType: "ticket",
-		resourceID:   strconv.FormatUint(uint64(ticketID), 10),
-		write:        true,
-		digest:       requestDigest(arguments),
-	})
 	if err != nil {
 		return nil, err
 	}
@@ -1109,7 +1290,6 @@ func (a *MCPAdapter) heartbeatTicket(
 		ExpectedVersion:     existing.TicketVersion,
 		TTL:                 time.Duration(leaseSeconds) * time.Second,
 		CredentialID:        principal.CredentialID,
-		PolicyDecisionID:    decision.ID,
 		SourceProtocol:      mcpSourceProtocol,
 		RequestDigest:       requestDigest(arguments),
 		IdempotencyRecordID: reservation.Record.ID,
@@ -1132,17 +1312,6 @@ func (a *MCPAdapter) releaseTicket(
 		return nil, err
 	}
 	leaseID := argumentString(arguments, "lease_id")
-	decision, err := a.checkPolicy(ctx, principal, policyRequest{
-		scope:        models.ScopeTasksManage,
-		action:       "ticket.lease.release",
-		resourceType: "ticket",
-		resourceID:   strconv.FormatUint(uint64(ticketID), 10),
-		write:        true,
-		digest:       requestDigest(arguments),
-	})
-	if err != nil {
-		return nil, err
-	}
 	reservation, err := a.reserveIdempotency(ctx, principal, "ticket.lease.release", arguments)
 	if err != nil {
 		return nil, err
@@ -1173,7 +1342,6 @@ func (a *MCPAdapter) releaseTicket(
 		Actor:               principalActor(principal),
 		Reason:              "released by MCP agent",
 		CredentialID:        principal.CredentialID,
-		PolicyDecisionID:    decision.ID,
 		SourceProtocol:      mcpSourceProtocol,
 		RequestDigest:       requestDigest(arguments),
 		IdempotencyRecordID: reservation.Record.ID,
@@ -1191,6 +1359,17 @@ func (a *MCPAdapter) ReadResource(
 	principal mcp.Principal,
 	resourceURI string,
 ) (mcp.ResourceContent, error) {
+	leaseContext, release, err :=
+		a.service.AcquireAgentExecutionContext(
+			ctx,
+			principal.ID,
+		)
+	if err != nil {
+		return mcp.ResourceContent{}, backendError(err)
+	}
+	defer release()
+	ctx = leaseContext
+
 	result, err := runMCPProjectOperation(
 		a,
 		ctx,
@@ -1224,11 +1403,6 @@ func (a *MCPAdapter) readResourceScoped(
 	if err != nil || reference.ProjectKey != projectKey {
 		return mcp.ResourceContent{}, invalidArgument("resource project does not match access token")
 	}
-	release, err := a.service.AcquireAgentExecution(ctx, principal.ID)
-	if err != nil {
-		return mcp.ResourceContent{}, backendError(err)
-	}
-	defer release()
 
 	var payload any
 	switch reference.Kind {
@@ -1271,7 +1445,7 @@ func (a *MCPAdapter) ValidateSubscription(
 	if _, _, _, err := mcpOperationContext(ctx, principal); err != nil {
 		return false, nil
 	}
-	return runMCPProjectOperation(
+	allowed, err := runMCPProjectOperation(
 		a,
 		ctx,
 		principal,
@@ -1289,6 +1463,10 @@ func (a *MCPAdapter) ValidateSubscription(
 			)
 		},
 	)
+	if err != nil && machineAuthorizationRevoked(err) {
+		return false, nil
+	}
+	return allowed, err
 }
 
 func (a *MCPAdapter) validateSubscriptionScoped(
@@ -2613,6 +2791,7 @@ func backendError(err error) *mcp.BackendError {
 		errors.Is(err, services.ErrLeaseNotOwned):
 		code, message, retryable = services.AgentNativeErrorCode(err), "ticket lease conflict", true
 	case errors.Is(err, services.ErrPolicyDenied),
+		errors.Is(err, services.ErrProjectAccessDenied),
 		errors.Is(err, services.ErrGlobalEmergencyStop),
 		errors.Is(err, services.ErrReadOnlyMode),
 		errors.Is(err, services.ErrPrincipalDisabled),
@@ -2646,6 +2825,7 @@ func backendError(err error) *mcp.BackendError {
 
 func isServicePolicyError(err error) bool {
 	return errors.Is(err, services.ErrPolicyDenied) ||
+		errors.Is(err, services.ErrProjectAccessDenied) ||
 		errors.Is(err, services.ErrGlobalEmergencyStop) ||
 		errors.Is(err, services.ErrReadOnlyMode) ||
 		errors.Is(err, services.ErrPrincipalDisabled) ||

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .api import APIClient
@@ -16,13 +18,55 @@ from .safety import (
     safe_diagnostic,
 )
 
-HUMAN_ROLES = ("admin", "supervisor", "agent", "customer")
-PROJECT_ROLE_BY_HUMAN_ROLE = {
-    "admin": "project_admin",
-    "supervisor": "manager",
-    "agent": "agent",
-    "customer": "requester",
-}
+PLATFORM_ROLES = (
+    "platform_admin",
+    "security_auditor",
+    "emergency_operator",
+    "member",
+)
+PROJECT_ROLES = (
+    "project_admin",
+    "manager",
+    "agent",
+    "requester",
+    "observer",
+)
+
+
+def assert_human_session_contract(
+    session: dict[str, Any],
+    *,
+    expected_platform_role: str,
+) -> None:
+    """Assert Auth/JWT identity uses only the closed platform-role claim."""
+
+    assert expected_platform_role in PLATFORM_ROLES
+    user = session.get("user")
+    assert isinstance(user, dict), safe_diagnostic(session)
+    assert user.get("platform_role") == expected_platform_role, safe_diagnostic(user)
+    assert "role" not in user, safe_diagnostic(user)
+    assert "project_role" not in user, safe_diagnostic(user)
+
+    for token_name in ("access_token", "refresh_token"):
+        token = session.get(token_name)
+        assert isinstance(token, str) and token
+        segments = token.split(".")
+        assert len(segments) == 3, f"{token_name} is not a compact JWT"
+        encoded_payload = segments[1]
+        padding = "=" * (-len(encoded_payload) % 4)
+        try:
+            claims = json.loads(
+                base64.urlsafe_b64decode(encoded_payload + padding).decode("utf-8")
+            )
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise AssertionError(f"{token_name} payload is not valid JSON") from exc
+        assert isinstance(claims, dict)
+        assert claims.get("platform_role") == expected_platform_role, safe_diagnostic(
+            claims
+        )
+        assert "role" not in claims, safe_diagnostic(claims)
+        assert "project_role" not in claims, safe_diagnostic(claims)
+
 
 _WEAK_PASSWORD_PATTERNS = (
     "password",
@@ -84,13 +128,20 @@ def strong_password() -> str:
 @dataclass(frozen=True)
 class HumanIdentity:
     id: int
-    role: str
+    platform_role: str
+    project_role: str | None
     username: str
     email: str
     password: str = field(repr=False)
     access_token: str = field(repr=False)
     refresh_token: str = field(repr=False)
     api: APIClient = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if self.platform_role not in PLATFORM_ROLES:
+            raise ValueError(f"unsupported platform role {self.platform_role!r}")
+        if self.project_role is not None and self.project_role not in PROJECT_ROLES:
+            raise ValueError(f"unsupported project role {self.project_role!r}")
 
 
 class E2EResourceManager:
@@ -147,8 +198,17 @@ class E2EResourceManager:
             work_class=work_class,
         )
 
-    def create_user(self, role: str, label: str) -> HumanIdentity:
-        assert role in HUMAN_ROLES, f"unsupported Human role {role!r}"
+    def create_platform_identity(
+        self,
+        platform_role: str,
+        *,
+        label: str,
+    ) -> HumanIdentity:
+        """Create one platform user without granting any project access."""
+
+        assert platform_role in PLATFORM_ROLES, (
+            f"unsupported platform role {platform_role!r}"
+        )
         safe_label = "".join(
             character if character.isalnum() else "_" for character in label.lower()
         )
@@ -164,72 +224,34 @@ class E2EResourceManager:
             f"E2E-{self._user_run_token}-{compact_label}-"
             f"{time.time_ns()}-{secrets.token_hex(2)}"
         )
-        if role == "customer":
-            response = self.api_client.post_json(
-                "/auth/register",
-                {
-                    "username": username,
-                    "email": email,
-                    "password": password,
-                    "confirm_password": password,
-                    "first_name": "E2E",
-                    "last_name": label,
-                    "department": "QA Automation",
-                    "position": "Human REST Black-box",
-                },
-            )
-            assert response.status_code == 201, response_diagnostic(response)
-            body = response.json()
-            assert body.get("code") == 0, safe_diagnostic(body)
-            tokens = body.get("data")
-            assert isinstance(tokens, dict), safe_diagnostic(body)
-            created = tokens.get("user")
-            assert isinstance(created, dict), safe_diagnostic(body)
-        else:
-            response = self.admin_api.post_json(
-                "/admin/users",
-                {
-                    "username": username,
-                    "email": email,
-                    "password": password,
-                    "first_name": "E2E",
-                    "last_name": label,
-                    "display_name": display_name,
-                    "role": role,
-                    "department": "QA Automation",
-                    "job_title": "Human REST Black-box",
-                },
-            )
-            assert response.status_code == 201, response_diagnostic(response)
-            body = response.json()
-            assert body.get("code") == 0, safe_diagnostic(body)
-            created = body.get("data")
-            assert isinstance(created, dict), safe_diagnostic(body)
-            tokens = {}
+        response = self.admin_api.post_json(
+            "/platform/users",
+            {
+                "username": username,
+                "email": email,
+                "password": password,
+                "first_name": "E2E",
+                "last_name": label,
+                "display_name": display_name,
+                "platform_role": platform_role,
+                "department": "QA Automation",
+                "job_title": "Human REST Black-box",
+            },
+        )
+        assert response.status_code == 201, response_diagnostic(response)
+        body = response.json()
+        assert body.get("code") == 0, safe_diagnostic(body)
+        created = body.get("data")
+        assert isinstance(created, dict), safe_diagnostic(body)
 
         user_id = created.get("id")
         assert isinstance(user_id, int) and user_id > 0, safe_diagnostic(body)
-        assert created.get("role") == role, safe_diagnostic(body)
+        assert created.get("platform_role") == platform_role, safe_diagnostic(body)
+        assert "role" not in created, safe_diagnostic(body)
         self._users.append((user_id, username))
 
-        membership = self.admin_api.post_json(
-            self.project_path("memberships"),
-            {
-                "user_id": user_id,
-                "role": PROJECT_ROLE_BY_HUMAN_ROLE[role],
-            },
-        )
-        assert membership.status_code == 200, response_diagnostic(membership)
-        self._memberships.append(user_id)
-        granted = membership.json().get("data")
-        assert isinstance(granted, dict), response_diagnostic(membership)
-        assert granted.get("user_id") == user_id, safe_diagnostic(granted)
-        assert granted.get("role") == PROJECT_ROLE_BY_HUMAN_ROLE[role], safe_diagnostic(
-            granted
-        )
-
         verification = self.admin_api.put_json(
-            f"/admin/users/{user_id}",
+            f"/platform/users/{user_id}",
             {
                 "display_name": display_name,
                 "email_verified": True,
@@ -237,8 +259,11 @@ class E2EResourceManager:
         )
         assert verification.status_code == 200, response_diagnostic(verification)
 
-        if role != "customer":
-            tokens = self.api_client.login(email, password)
+        tokens = self.api_client.login(email, password)
+        assert_human_session_contract(
+            tokens,
+            expected_platform_role=platform_role,
+        )
         access_token = tokens.get("access_token")
         refresh_token = tokens.get("refresh_token")
         assert isinstance(access_token, str) and access_token, safe_diagnostic(tokens)
@@ -247,13 +272,55 @@ class E2EResourceManager:
         self._clients.append(api)
         return HumanIdentity(
             id=user_id,
-            role=role,
+            platform_role=platform_role,
+            project_role=None,
             username=username,
             email=email,
             password=password,
             access_token=access_token,
             refresh_token=refresh_token,
             api=api,
+        )
+
+    def create_project_identity(
+        self,
+        project_role: str,
+        platform_role: str = "member",
+        *,
+        label: str | None = None,
+    ) -> HumanIdentity:
+        """Create a user, then explicitly grant one project Membership."""
+
+        assert project_role in PROJECT_ROLES, (
+            f"unsupported project role {project_role!r}"
+        )
+        identity = self.create_platform_identity(
+            platform_role,
+            label=label or project_role,
+        )
+        membership = self.admin_api.post_json(
+            self.project_path("memberships"),
+            {
+                "user_id": identity.id,
+                "role": project_role,
+            },
+        )
+        assert membership.status_code == 200, response_diagnostic(membership)
+        self._memberships.append(identity.id)
+        granted = membership.json().get("data")
+        assert isinstance(granted, dict), response_diagnostic(membership)
+        assert granted.get("user_id") == identity.id, safe_diagnostic(granted)
+        assert granted.get("role") == project_role, safe_diagnostic(granted)
+
+        context = identity.api.get_json(identity.api.project_path("context"))
+        assert context.status_code == 200, response_diagnostic(context)
+        access = context.json().get("data")
+        assert isinstance(access, dict), response_diagnostic(context)
+        assert access.get("project_role") == project_role, safe_diagnostic(access)
+        assert "role" not in access, safe_diagnostic(access)
+        return replace(
+            identity,
+            project_role=project_role,
         )
 
     def create_ticket(
@@ -306,6 +373,13 @@ class E2EResourceManager:
         assert username.startswith("e2e_")
         if all(existing_id != user_id for existing_id, _ in self._users):
             self._users.append((user_id, username))
+
+    def track_notification(self, notification_id: int) -> None:
+        """Track a notification created asynchronously for precise cleanup."""
+
+        assert isinstance(notification_id, int) and notification_id > 0
+        if notification_id not in self._notifications:
+            self._notifications.append(notification_id)
 
     def create_notification(
         self,
@@ -398,7 +472,7 @@ class E2EResourceManager:
                 )
 
         for user_id, expected_username in reversed(self._users):
-            detail = self.admin_api.get_json(f"/admin/users/{user_id}")
+            detail = self.admin_api.get_json(f"/platform/users/{user_id}")
             if detail.status_code == 404:
                 continue
             if detail.status_code != 200:
@@ -414,7 +488,7 @@ class E2EResourceManager:
                     f"expected={expected_username!r} actual={actual_username!r}"
                 )
                 continue
-            deleted = self.admin_api.delete(f"/admin/users/{user_id}")
+            deleted = self.admin_api.delete(f"/platform/users/{user_id}")
             if deleted.status_code not in (200, 204, 404):
                 errors.append(f"delete user {user_id}: {response_diagnostic(deleted)}")
 

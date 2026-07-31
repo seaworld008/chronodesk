@@ -10,10 +10,12 @@ import (
 	"net/url"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/seaworld008/chronodesk/server/internal/agentplatform"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"github.com/seaworld008/chronodesk/server/internal/services"
@@ -50,7 +52,7 @@ func TestWebhookHandlerGetWebhookLogsReturnsCountedRows(t *testing.T) {
 		Username:     "webhook-log-admin",
 		Email:        "webhook-log-admin@example.test",
 		PasswordHash: "hash",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}).Error; err != nil {
 		t.Fatal(err)
@@ -67,53 +69,16 @@ func TestWebhookHandlerGetWebhookLogsReturnsCountedRows(t *testing.T) {
 	if err := db.Create(&config).Error; err != nil {
 		t.Fatal(err)
 	}
-
-	handler := NewWebhookHandlerWithProtector(db, nil)
-	router := gin.New()
-	router.POST("/webhooks/:id/test", func(c *gin.Context) {
-		bindWebhookProjectTestContext(t, c)
-		handler.TestWebhook(c)
-	})
-	router.GET("/webhooks/:id/logs", func(c *gin.Context) {
-		bindWebhookProjectTestContext(t, c)
-		handler.GetWebhookLogs(c)
-	})
-	configPath := "/webhooks/" + strconv.FormatUint(uint64(config.ID), 10)
-	testRequest := httptest.NewRequest(
-		http.MethodPost,
-		configPath+"/test",
-		nil,
-	)
-	testResponse := httptest.NewRecorder()
-	router.ServeHTTP(testResponse, testRequest)
-	if testResponse.Code != http.StatusOK {
-		t.Fatalf(
-			"test webhook status=%d body=%s",
-			testResponse.Code,
-			testResponse.Body.String(),
-		)
+	testLog := models.WebhookLog{
+		OrganizationID: 1,
+		ProjectID:      10,
+		ConfigID:       config.ID,
+		EventType:      models.WebhookEventSystemAlert,
+		Status:         "failed",
+		RequestMethod:  http.MethodPost,
 	}
-	var testPayload struct {
-		Code int               `json:"code"`
-		Data TestWebhookResult `json:"data"`
-	}
-	if err := json.Unmarshal(testResponse.Body.Bytes(), &testPayload); err != nil {
+	if err := db.Create(&testLog).Error; err != nil {
 		t.Fatal(err)
-	}
-	if testPayload.Code != 1 ||
-		testPayload.Data.Status != "failed" ||
-		testPayload.Data.Delivered {
-		t.Fatalf("unexpected failed test result: %s", testResponse.Body.String())
-	}
-
-	var testLog models.WebhookLog
-	if err := db.Where(
-		"organization_id = ? AND project_id = ? AND config_id = ?",
-		1,
-		10,
-		config.ID,
-	).First(&testLog).Error; err != nil {
-		t.Fatalf("load log written by test webhook request: %v", err)
 	}
 	decoyLogs := []models.WebhookLog{
 		{
@@ -136,6 +101,14 @@ func TestWebhookHandlerGetWebhookLogsReturnsCountedRows(t *testing.T) {
 	if err := db.Create(&decoyLogs).Error; err != nil {
 		t.Fatal(err)
 	}
+
+	handler := NewWebhookHandlerWithProtector(db, nil)
+	router := gin.New()
+	router.GET("/webhooks/:id/logs", func(c *gin.Context) {
+		bindWebhookProjectTestContext(t, c)
+		handler.GetWebhookLogs(c)
+	})
+	configPath := "/webhooks/" + strconv.FormatUint(uint64(config.ID), 10)
 
 	var countStatement *gorm.Statement
 	var listStatement *gorm.Statement
@@ -218,14 +191,17 @@ func TestWebhookHandlerGetWebhookLogsReturnsCountedRows(t *testing.T) {
 	}
 }
 
-func TestWebhookHandlerFailedDeliveryCommitsLogThroughProjectMiddleware(
+func TestWebhookHandlerQueuesThenWorkerCommitsFailedDeliveryLog(
 	t *testing.T,
 ) {
 	gin.SetMode(gin.TestMode)
 	projectService, project, user, db := projectHandlerTestService(t)
 	if err := db.AutoMigrate(
 		&models.WebhookConfig{},
+		&models.WebhookDeliverySnapshot{},
 		&models.WebhookLog{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +218,11 @@ func TestWebhookHandlerFailedDeliveryCommitsLogThroughProjectMiddleware(
 		Provider:       models.WebhookProviderCustom,
 		WebhookURL:     "https://webhook.example.test/callback",
 		Status:         models.WebhookStatusActive,
-		CreatedBy:      user.ID,
+		EnabledEventsObj: []models.WebhookEventType{
+			models.WebhookEventSystemAlert,
+		},
+		RetryCount: 1,
+		CreatedBy:  user.ID,
 	}
 	if err := db.Create(&config).Error; err != nil {
 		t.Fatal(err)
@@ -274,33 +254,45 @@ func TestWebhookHandlerFailedDeliveryCommitsLogThroughProjectMiddleware(
 		t.Fatal(err)
 	}
 
-	handler := NewWebhookHandlerWithProtector(db, protector)
-	handler.notificationService = services.NewNotificationServiceWithClientFactory(
+	native := services.NewAgentNativeService(db)
+	var httpAttempts atomic.Int32
+	deliveredTargets := make(chan string, 1)
+	notificationService := services.NewNotificationServiceWithClientFactory(
 		db,
 		protector,
 		services.WebhookClientFactoryFunc(func(
-			context.Context,
-			*url.URL,
-			time.Duration,
+			_ context.Context,
+			target *url.URL,
+			_ time.Duration,
 		) (*http.Client, error) {
+			deliveredTargets <- target.String()
 			return &http.Client{
 				Transport: webhookTestRoundTripFunc(
 					func(*http.Request) (*http.Response, error) {
-						return nil, errors.New("target connection failed")
+						httpAttempts.Add(1)
+						return nil, errors.New(
+							"target connection failed",
+						)
 					},
 				),
 			}, nil
 		}),
+	)
+	notificationService.ConfigureWebhookTestCommands(projectService, native)
+	handler := NewWebhookHandlerWithProtector(
+		db,
+		protector,
+		notificationService,
 	)
 
 	router := gin.New()
 	group := router.Group("/api/projects/:projectKey")
 	group.Use(func(c *gin.Context) {
 		c.Set("user_id", user.ID)
-		c.Set("user_role", string(models.RoleAgent))
+		c.Set("platform_role", models.PlatformRoleMember)
 		c.Next()
 	})
-	group.Use(ProjectScopeMiddleware(projectService, db))
+	group.Use(ProjectCommandScopeMiddleware(projectService))
 	group.POST("/webhooks/:id/test", handler.TestWebhook)
 
 	response := httptest.NewRecorder()
@@ -312,9 +304,9 @@ func TestWebhookHandlerFailedDeliveryCommitsLogThroughProjectMiddleware(
 		nil,
 	)
 	router.ServeHTTP(response, request)
-	if response.Code != http.StatusOK {
+	if response.Code != http.StatusAccepted {
 		t.Fatalf(
-			"status=%d, want command result 200; body=%s",
+			"status=%d, want queued result 202; body=%s",
 			response.Code,
 			response.Body.String(),
 		)
@@ -327,13 +319,20 @@ func TestWebhookHandlerFailedDeliveryCommitsLogThroughProjectMiddleware(
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.Code != 1 ||
-		payload.Data.Status != "failed" ||
-		payload.Data.Delivered {
-		t.Fatalf("unexpected failed delivery result: %s", response.Body.String())
+	if payload.Code != 0 ||
+		payload.Data.Status != "queued" ||
+		!payload.Data.Queued ||
+		payload.Data.Delivered ||
+		payload.Data.EventID == "" ||
+		payload.Data.DeliveryID == "" ||
+		payload.Data.SnapshotID == "" {
+		t.Fatalf("unexpected queued delivery result: %s", response.Body.String())
 	}
-	if payload.Msg != "Webhook 测试失败，请检查配置和目标服务状态" {
-		t.Fatalf("unstable UI failure message: %q", payload.Msg)
+	if payload.Msg != "Webhook 测试已入队" {
+		t.Fatalf("unstable queued UI message: %q", payload.Msg)
+	}
+	if httpAttempts.Load() != 0 || len(deliveredTargets) != 0 {
+		t.Fatal("Webhook handler performed synchronous external HTTP")
 	}
 
 	var logs []models.WebhookLog
@@ -345,16 +344,195 @@ func TestWebhookHandlerFailedDeliveryCommitsLogThroughProjectMiddleware(
 	).Find(&logs).Error; err != nil {
 		t.Fatal(err)
 	}
-	if len(logs) != 1 {
+	if len(logs) != 0 {
 		t.Fatalf(
-			"failed delivery committed %d logs, want 1; response=%s",
+			"queued command committed %d delivery logs before worker, want 0; response=%s",
 			len(logs),
 			response.Body.String(),
 		)
 	}
-	if logs[0].Status != "failed" ||
+
+	const changedURL = "https://changed.example.test/ignored"
+	if err := db.Model(&models.WebhookConfig{}).
+		Where("id = ?", config.ID).
+		Updates(map[string]any{
+			"webhook_url": changedURL,
+			"status":      models.WebhookStatusDisabled,
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
+	deliverer, err := agentplatform.NewNativeOutboxDeliverer(
+		agentplatform.NativeOutboxDelivererOptions{
+			DB:            db,
+			Notifications: notificationService,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := native.ProcessOutboxBatch(
+		context.Background(),
+		"webhook-handler-test-worker",
+		10,
+		deliverer,
+	)
+	if err != nil {
+		t.Fatalf("process committed webhook test delivery: %v", err)
+	}
+	if result.Claimed != 1 ||
+		result.Delivered != 0 ||
+		result.Failed != 1 ||
+		httpAttempts.Load() != 1 {
+		t.Fatalf(
+			"worker result=%+v HTTP attempts=%d",
+			result,
+			httpAttempts.Load(),
+		)
+	}
+	select {
+	case target := <-deliveredTargets:
+		if target != config.WebhookURL || target == changedURL {
+			t.Fatalf(
+				"worker used mutable target %q instead of snapshot %q",
+				target,
+				config.WebhookURL,
+			)
+		}
+	default:
+		t.Fatal("worker did not resolve the frozen webhook target")
+	}
+
+	if err := db.Where(
+		"organization_id = ? AND project_id = ? AND config_id = ?",
+		project.OrganizationID,
+		project.ID,
+		config.ID,
+	).Find(&logs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 ||
+		logs[0].Status != "failed" ||
 		logs[0].EventType != models.WebhookEventSystemAlert ||
 		logs[0].ErrorMessage != "webhook请求发送失败" {
-		t.Fatalf("unexpected committed failed delivery log: %+v", logs[0])
+		t.Fatalf("unexpected worker delivery log: %+v", logs)
+	}
+	var delivery models.OutboxDelivery
+	if err := db.Where("id = ?", payload.Data.DeliveryID).
+		Take(&delivery).Error; err != nil {
+		t.Fatal(err)
+	}
+	if delivery.Status != models.OutboxDeliveryFailed ||
+		delivery.DeliveredAt != nil ||
+		delivery.Attempts != 1 {
+		t.Fatalf("worker did not finalize Outbox delivery: %+v", delivery)
+	}
+}
+
+func TestWebhookHandlerRejectsRevocationAfterPreflightWithoutHTTP(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	projectService, project, user, db := projectHandlerTestService(t)
+	if err := db.AutoMigrate(
+		&models.WebhookConfig{},
+		&models.WebhookDeliverySnapshot{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.ProjectMembership{}).
+		Where("project_id = ? AND user_id = ?", project.ID, user.ID).
+		Update("role", models.ProjectRoleManager).Error; err != nil {
+		t.Fatal(err)
+	}
+	config := models.WebhookConfig{
+		OrganizationID: project.OrganizationID,
+		ProjectID:      project.ID,
+		Name:           "revoked after preflight",
+		Provider:       models.WebhookProviderCustom,
+		WebhookURL:     "https://revoked.example.test/callback",
+		Status:         models.WebhookStatusActive,
+		EnabledEventsObj: []models.WebhookEventType{
+			models.WebhookEventSystemAlert,
+		},
+		CreatedBy: user.ID,
+	}
+	if err := db.Create(&config).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	native := services.NewAgentNativeService(db)
+	var httpAttempts atomic.Int32
+	notificationService := services.NewNotificationServiceWithClientFactory(
+		db,
+		nil,
+		services.WebhookClientFactoryFunc(func(
+			context.Context,
+			*url.URL,
+			time.Duration,
+		) (*http.Client, error) {
+			httpAttempts.Add(1)
+			return nil, nil
+		}),
+	)
+	notificationService.ConfigureWebhookTestCommands(projectService, native)
+	handler := NewWebhookHandlerWithProtector(
+		db,
+		nil,
+		notificationService,
+	)
+
+	router := gin.New()
+	group := router.Group("/api/projects/:projectKey")
+	group.Use(func(c *gin.Context) {
+		c.Set("user_id", user.ID)
+		c.Set("platform_role", models.PlatformRoleMember)
+		c.Next()
+	})
+	group.Use(ProjectCommandScopeMiddleware(projectService))
+	group.Use(func(c *gin.Context) {
+		if err := db.Model(&models.ProjectMembership{}).
+			Where(
+				"project_id = ? AND user_id = ?",
+				project.ID,
+				user.ID,
+			).
+			Update("is_active", false).Error; err != nil {
+			t.Fatal(err)
+		}
+		c.Next()
+	})
+	group.POST("/webhooks/:id/test", handler.TestWebhook)
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/projects/OPS/webhooks/"+
+			strconv.FormatUint(uint64(config.ID), 10)+
+			"/test",
+		nil,
+	)
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf(
+			"revoked status=%d, want 403; body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	if httpAttempts.Load() != 0 {
+		t.Fatalf(
+			"revoked handler performed %d HTTP attempts",
+			httpAttempts.Load(),
+		)
+	}
+	var deliveries int64
+	if err := db.Model(&models.OutboxDelivery{}).
+		Count(&deliveries).Error; err != nil {
+		t.Fatal(err)
+	}
+	if deliveries != 0 {
+		t.Fatalf("revoked handler committed %d Outbox deliveries", deliveries)
 	}
 }

@@ -2,7 +2,9 @@ package agentplatform
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,9 +15,429 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/httpcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"github.com/gin-gonic/gin"
 )
+
+func TestAgentRESTTicketCreateUsesCommandOwnedTransaction(t *testing.T) {
+	guard := &transactionRejectingExecutionGuard{}
+	fixture := newMCPAdapterFixtureWithExecutionGuard(t, guard)
+	router := newAgentRESTCommandRouter(fixture)
+	response := performAgentRESTJSON(
+		t,
+		router,
+		http.MethodPost,
+		"/api/v2/projects/TEST/tickets",
+		fixture.token,
+		map[string]string{
+			"Idempotency-Key": "rest-command-owned-create-0001",
+		},
+		map[string]any{
+			"title":                   "REST command-owned Ticket create",
+			"description":             "Project UPDATE ownership starts in the services command.",
+			"type":                    string(models.TicketTypeRequest),
+			"priority":                string(models.TicketPriorityNormal),
+			"request_type_version_id": fixture.requestTypeVersionID,
+			"workflow_version_id":     fixture.workflowVersionID,
+		},
+	)
+	if response.Code != http.StatusCreated {
+		t.Fatalf(
+			"REST create status=%d body=%s, want 201",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	var count int64
+	if err := fixture.db.Model(&models.Ticket{}).
+		Where("title = ?", "REST command-owned Ticket create").
+		Count(&count).Error; err != nil || count != 1 {
+		t.Fatalf("created Ticket count=%d err=%v", count, err)
+	}
+}
+
+func TestMachineTicketCreateRejectsLegacyOuterProjectTransaction(t *testing.T) {
+	fixture := newMCPAdapterFixture(t)
+	ctx, _, _, err := mcpOperationContext(
+		context.Background(),
+		fixture.actor,
+	)
+	if err != nil {
+		t.Fatalf("bind MCP operation context: %v", err)
+	}
+	var commandErr error
+	if err := fixture.service.RunProjectOperation(
+		ctx,
+		func(scopedContext context.Context) error {
+			_, commandErr = runMachineTicketCreateDatabaseCommand(
+				scopedContext,
+				fixture.db,
+				fixture.service,
+				services.NativeTicketCreateInput{},
+			)
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("open legacy outer project transaction: %v", err)
+	}
+	if !errors.Is(commandErr, services.ErrTicketCreateAccessDenied) {
+		t.Fatalf(
+			"legacy outer transaction error=%v, want ticket create access denial",
+			commandErr,
+		)
+	}
+}
+
+func TestAgentRESTWriteCommandsKeepExecutionGuardOutsideProjectTransactions(
+	t *testing.T,
+) {
+	guard := &transactionRejectingExecutionGuard{}
+	fixture := newMCPAdapterFixtureWithExecutionGuard(t, guard)
+	for _, permission := range []struct {
+		scope  string
+		action string
+	}{
+		{models.ScopeTicketsAssign, "ticket.assign"},
+		{models.ScopeTicketsTransition, "ticket.transition"},
+		{models.ScopeTicketsTransition, "ticket.escalate"},
+	} {
+		allowAgentTicketAction(
+			t,
+			fixture,
+			permission.scope,
+			permission.action,
+		)
+	}
+	router := newAgentRESTCommandRouter(fixture)
+	var (
+		ticketID uint
+		leaseID  string
+	)
+	request := func(
+		method string,
+		path string,
+		headers map[string]string,
+		body any,
+		wantStatus int,
+	) *httptest.ResponseRecorder {
+		response := performAgentRESTJSON(
+			t,
+			router,
+			method,
+			path,
+			fixture.token,
+			headers,
+			body,
+		)
+		if response.Code != wantStatus {
+			t.Fatalf(
+				"%s %s status=%d body=%s, want %d",
+				method,
+				path,
+				response.Code,
+				response.Body.String(),
+				wantStatus,
+			)
+		}
+		return response
+	}
+	headers := func(
+		version uint64,
+		idempotencyKey string,
+		withLease bool,
+		withCorrelation bool,
+	) map[string]string {
+		result := map[string]string{
+			"If-Match":        httpcontract.FormatETag(version),
+			"Idempotency-Key": idempotencyKey,
+		}
+		if withLease {
+			result["X-Ticket-Lease"] = leaseID
+		}
+		if withCorrelation {
+			result["X-Correlation-ID"] = "corr-" + idempotencyKey
+		}
+		return result
+	}
+	steps := []struct {
+		name      string
+		wantLoops int64
+		run       func()
+	}{
+		{
+			name:      "create",
+			wantLoops: 1,
+			run: func() {
+				response := request(
+					http.MethodPost,
+					"/api/v2/projects/TEST/tickets",
+					map[string]string{
+						"Idempotency-Key": "rest-guard-matrix-create",
+					},
+					map[string]any{
+						"title":                   "REST guarded write matrix",
+						"description":             "Every Redis-equivalent loop guard runs without a project transaction.",
+						"type":                    "request",
+						"priority":                "normal",
+						"request_type_version_id": fixture.requestTypeVersionID,
+						"workflow_version_id":     fixture.workflowVersionID,
+					},
+					http.StatusCreated,
+				)
+				var envelope struct {
+					Data models.TicketResponse `json:"data"`
+				}
+				if err := json.Unmarshal(
+					response.Body.Bytes(),
+					&envelope,
+				); err != nil || envelope.Data.ID == 0 {
+					t.Fatalf(
+						"decode create response=%s err=%v",
+						response.Body.String(),
+						err,
+					)
+				}
+				ticketID = envelope.Data.ID
+			},
+		},
+		{
+			name:      "claim",
+			wantLoops: 1,
+			run: func() {
+				response := request(
+					http.MethodPost,
+					fmt.Sprintf(
+						"/api/v2/projects/TEST/tickets/%d/claim",
+						ticketID,
+					),
+					headers(
+						1,
+						"rest-guard-matrix-claim",
+						false,
+						false,
+					),
+					map[string]any{"ttl_seconds": 60},
+					http.StatusOK,
+				)
+				var envelope struct {
+					Data struct {
+						LeaseID string `json:"lease_id"`
+					} `json:"data"`
+				}
+				if err := json.Unmarshal(
+					response.Body.Bytes(),
+					&envelope,
+				); err != nil || envelope.Data.LeaseID == "" {
+					t.Fatalf(
+						"decode claim response=%s err=%v",
+						response.Body.String(),
+						err,
+					)
+				}
+				leaseID = envelope.Data.LeaseID
+			},
+		},
+		{
+			name:      "heartbeat",
+			wantLoops: 1,
+			run: func() {
+				request(
+					http.MethodPost,
+					"/api/v2/projects/TEST/leases/"+leaseID+
+						"/heartbeat",
+					headers(
+						1,
+						"rest-guard-matrix-heartbeat",
+						false,
+						false,
+					),
+					map[string]any{"ttl_seconds": 60},
+					http.StatusOK,
+				)
+			},
+		},
+		{
+			name:      "update",
+			wantLoops: 1,
+			run: func() {
+				request(
+					http.MethodPatch,
+					fmt.Sprintf(
+						"/api/v2/projects/TEST/tickets/%d",
+						ticketID,
+					),
+					headers(
+						1,
+						"rest-guard-matrix-update",
+						true,
+						false,
+					),
+					map[string]any{
+						"title": "REST guarded update",
+					},
+					http.StatusOK,
+				)
+			},
+		},
+		{
+			name:      "assign",
+			wantLoops: 1,
+			run: func() {
+				request(
+					http.MethodPost,
+					fmt.Sprintf(
+						"/api/v2/projects/TEST/tickets/%d/commands/assign",
+						ticketID,
+					),
+					headers(
+						2,
+						"rest-guard-matrix-assign",
+						true,
+						true,
+					),
+					map[string]any{
+						"assignee": map[string]any{
+							"type": string(
+								models.ActorTypeHuman,
+							),
+							"id": strconv.FormatUint(
+								uint64(fixture.user.ID),
+								10,
+							),
+						},
+						"reason": "guard boundary",
+					},
+					http.StatusOK,
+				)
+			},
+		},
+		{
+			name:      "transition",
+			wantLoops: 1,
+			run: func() {
+				request(
+					http.MethodPost,
+					fmt.Sprintf(
+						"/api/v2/projects/TEST/tickets/%d/commands/transition",
+						ticketID,
+					),
+					headers(
+						3,
+						"rest-guard-matrix-transition",
+						true,
+						true,
+					),
+					map[string]any{
+						"status": string(
+							models.TicketStatusInProgress,
+						),
+						"reason": "guard boundary",
+					},
+					http.StatusOK,
+				)
+			},
+		},
+		{
+			name:      "escalate with assignment",
+			wantLoops: 2,
+			run: func() {
+				request(
+					http.MethodPost,
+					fmt.Sprintf(
+						"/api/v2/projects/TEST/tickets/%d/commands/escalate",
+						ticketID,
+					),
+					headers(
+						4,
+						"rest-guard-matrix-escalate",
+						true,
+						true,
+					),
+					map[string]any{
+						"priority": string(
+							models.TicketPriorityUrgent,
+						),
+						"assignee": map[string]any{
+							"type": string(
+								models.ActorTypeHuman,
+							),
+							"id": strconv.FormatUint(
+								uint64(fixture.user.ID),
+								10,
+							),
+						},
+						"reason": "guard boundary",
+					},
+					http.StatusOK,
+				)
+			},
+		},
+		{
+			name:      "comment",
+			wantLoops: 1,
+			run: func() {
+				request(
+					http.MethodPost,
+					fmt.Sprintf(
+						"/api/v2/projects/TEST/tickets/%d/comments",
+						ticketID,
+					),
+					headers(
+						5,
+						"rest-guard-matrix-comment",
+						true,
+						false,
+					),
+					map[string]any{
+						"content":      "Guarded REST comment",
+						"content_type": "text",
+						"type": string(
+							models.CommentTypeInternal,
+						),
+					},
+					http.StatusCreated,
+				)
+			},
+		},
+		{
+			name:      "release",
+			wantLoops: 1,
+			run: func() {
+				request(
+					http.MethodDelete,
+					"/api/v2/projects/TEST/leases/"+leaseID,
+					map[string]string{
+						"Idempotency-Key": "rest-guard-matrix-release",
+					},
+					nil,
+					http.StatusOK,
+				)
+			},
+		},
+	}
+	for _, step := range steps {
+		t.Run(step.name, func(t *testing.T) {
+			guard.resetCalls()
+			step.run()
+			if got := guard.recordCalls.Load(); got != step.wantLoops {
+				t.Fatalf(
+					"RecordLoop calls=%d, want %d",
+					got,
+					step.wantLoops,
+				)
+			}
+			if guard.acquireCalls.Load() != 1 ||
+				guard.releaseCalls.Load() != 1 {
+				t.Fatalf(
+					"execution guard acquire/release=%d/%d, want 1/1",
+					guard.acquireCalls.Load(),
+					guard.releaseCalls.Load(),
+				)
+			}
+		})
+	}
+}
 
 func TestAgentRESTTicketCommandsCommitTypedAuditableChanges(t *testing.T) {
 	fixture := newMCPAdapterFixture(t)

@@ -10,8 +10,13 @@ const (
 	TicketEscalatedEventType         = "io.chronodesk.ticket.escalated.v1"
 	TicketCommentCreatedEventType    = "io.chronodesk.ticket.comment.created.v1"
 	TicketAttachmentCreatedEventType = "io.chronodesk.ticket.attachment.created.v1"
-	TicketSLABreachedEventType       = "io.chronodesk.ticket.sla.breached.v1"
-	TicketDeletedEventType           = "io.chronodesk.ticket.deleted.v1"
+	// TicketAttachmentUploadCancelledEventType is an internal terminal event
+	// for a committed upload intent cancelled by the archived-project cleanup
+	// worker. It is deliberately not an Automation or Webhook subscription
+	// type.
+	TicketAttachmentUploadCancelledEventType = "io.chronodesk.ticket.attachment.upload-cancelled.v1"
+	TicketSLABreachedEventType               = "io.chronodesk.ticket.sla.breached.v1"
+	TicketDeletedEventType                   = "io.chronodesk.ticket.deleted.v1"
 
 	// AutomationScheduledCheckEventType is the durable scheduler request
 	// consumed by the automation Outbox destination. It is a CloudEvent type,

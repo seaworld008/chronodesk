@@ -135,7 +135,7 @@ func (r *GormAuthEmailOutboxRepository) Register(
 	if user == nil || profile == nil {
 		return errors.New("user and profile are required")
 	}
-	if !user.Role.IsValid() || !isValidUserStatus(user.Status) {
+	if !user.PlatformRole.IsValid() || !isValidUserStatus(user.Status) {
 		return ErrInvalidAccountState
 	}
 	if verification != nil && strings.TrimSpace(verification.Token) == "" {
@@ -489,7 +489,7 @@ func authUserToModel(user *User, profile *UserProfile) models.User {
 		FirstName:        profile.FirstName,
 		LastName:         profile.LastName,
 		DisplayName:      profile.DisplayName,
-		Role:             models.UserRole(user.Role),
+		PlatformRole:     models.PlatformRole(user.PlatformRole),
 		Status:           user.Status,
 		EmailVerified:    user.EmailVerified,
 		EmailVerifiedAt:  user.EmailVerifiedAt,

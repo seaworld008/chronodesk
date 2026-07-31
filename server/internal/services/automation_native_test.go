@@ -427,9 +427,18 @@ func TestAutomationRetryContinuesActionsAfterConditionWasChanged(t *testing.T) {
 	delayedAssignee := models.User{
 		ID: delayedAssigneeID, Username: "delayed-automation-assignee",
 		Email: "delayed-automation-assignee@example.com", PasswordHash: "hash",
-		Role: models.RoleAgent, Status: models.UserStatusActive,
+		PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := automation.db.Create(&delayedAssignee).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := automation.db.Create(&models.ProjectMembership{
+		ProjectID: created.Ticket.ProjectID,
+		UserID:    delayedAssignee.ID,
+		Role:      models.ProjectRoleAgent,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := automation.db.Model(&models.OutboxDelivery{}).
@@ -989,10 +998,19 @@ func TestAutomationRetryUsesFrozenRuleAfterModificationAndDisable(t *testing.T) 
 		Username:     "frozen-rule-assignee",
 		Email:        "frozen-rule-assignee@example.com",
 		PasswordHash: "hash",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := automation.db.Create(&delayedAssignee).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := automation.db.Create(&models.ProjectMembership{
+		ProjectID: created.Ticket.ProjectID,
+		UserID:    delayedAssignee.ID,
+		Role:      models.ProjectRoleAgent,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
 		t.Fatal(err)
 	}
 	expireAutomationRuleExecutionClaim(t, automation, created.Event.ID, rule.ID)

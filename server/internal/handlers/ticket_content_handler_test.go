@@ -38,11 +38,11 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 	}
 	owner := models.User{
 		Username: "content-owner", Email: "content-owner@example.com",
-		PasswordHash: "hashed", Role: models.RoleCustomer, Status: models.UserStatusActive,
+		PasswordHash: "hashed", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	other := models.User{
 		Username: "content-other", Email: "content-other@example.com",
-		PasswordHash: "hashed", Role: models.RoleCustomer, Status: models.UserStatusActive,
+		PasswordHash: "hashed", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&owner).Error; err != nil {
 		t.Fatal(err)
@@ -53,7 +53,7 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 	lastLogin := time.Now().Add(-time.Hour)
 	agent := models.User{
 		Username: "private-support-user", Email: "support-private@example.com",
-		Phone: "18899990000", PasswordHash: "hashed", Role: models.RoleAgent,
+		Phone: "18899990000", PasswordHash: "hashed", PlatformRole: models.PlatformRoleMember,
 		Status: models.UserStatusActive, TwoFactorEnabled: true, LastLoginAt: &lastLogin,
 	}
 	if err := db.Create(&agent).Error; err != nil {
@@ -246,15 +246,20 @@ func TestCustomerCannotReferenceInternalDeletedOrCrossTicketComment(t *testing.T
 	db := openHandlerTestDB(t)
 	if err := db.AutoMigrate(
 		&models.User{},
+		&models.ServicePrincipal{},
 		&models.Ticket{},
 		&models.TicketComment{},
 		&models.TicketAttachment{},
+		&models.TicketHistory{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
+		&models.ProjectMembership{},
 	); err != nil {
 		t.Fatalf("migrate content schemas: %v", err)
 	}
 	customer := models.User{
 		Username: "reference-owner", Email: "reference-owner@example.com",
-		PasswordHash: "hashed", Role: models.RoleCustomer, Status: models.UserStatusActive,
+		PasswordHash: "hashed", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&customer).Error; err != nil {
 		t.Fatal(err)
@@ -285,7 +290,26 @@ func TestCustomerCannotReferenceInternalDeletedOrCrossTicketComment(t *testing.T
 		t.Fatal(err)
 	}
 
-	handler := NewTicketContentHandler(db, newHandlerTicketService(t, db), nil, 1024)
+	ticketService := newHandlerTicketService(t, db)
+	scope := ensureHandlerTestProject(t, db)
+	if err := db.Create(&models.ProjectMembership{
+		ProjectID: scope.ProjectID,
+		UserID:    customer.ID,
+		Role:      models.ProjectRoleRequester,
+		IsActive:  true,
+	}).Error; err != nil {
+		t.Fatalf("seed requester project membership: %v", err)
+	}
+	storage, err := services.NewLocalAttachmentStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	native := services.NewAgentNativeService(db, services.AgentNativeOptions{
+		AttachmentStorage:  storage,
+		AttachmentStaging:  storage,
+		AttachmentMaxBytes: 1024,
+	})
+	handler := NewTicketContentHandler(db, ticketService, native, 1024)
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set("user_id", customer.ID)
@@ -343,6 +367,52 @@ func TestCustomerCannotReferenceInternalDeletedOrCrossTicketComment(t *testing.T
 			}
 		})
 	}
+
+	publicComment := models.TicketComment{
+		TicketID:  tickets[0].ID,
+		UserID:    &customer.ID,
+		ActorType: models.ActorTypeHuman,
+		ActorID: strconv.FormatUint(
+			uint64(customer.ID),
+			10,
+		),
+		Content: "public",
+		Type:    models.CommentTypePublic,
+	}
+	if err := db.Create(&publicComment).Error; err != nil {
+		t.Fatal(err)
+	}
+	var payload bytes.Buffer
+	writer := multipart.NewWriter(&payload)
+	part, err := writer.CreateFormFile("file", "public-proof.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte("proof")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteField("comment_id", jsonNumber(publicComment.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/tickets/"+jsonNumber(tickets[0].ID)+"/attachments",
+		&payload,
+	)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	request.Header.Set("If-Match", httpcontract.FormatETag(tickets[0].Version))
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf(
+			"public comment attachment status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
 }
 
 func TestCustomerCannotCreateCommentWorklog(t *testing.T) {
@@ -353,7 +423,7 @@ func TestCustomerCannotCreateCommentWorklog(t *testing.T) {
 	}
 	customer := models.User{
 		Username: "worklog-owner", Email: "worklog-owner@example.com",
-		PasswordHash: "hashed", Role: models.RoleCustomer, Status: models.UserStatusActive,
+		PasswordHash: "hashed", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&customer).Error; err != nil {
 		t.Fatal(err)
@@ -409,7 +479,7 @@ func TestStoreAttachmentRejectsInvalidMultipartAsBadRequest(t *testing.T) {
 	}
 	admin := models.User{
 		Username: "attachment-contract-admin", Email: "attachment-contract@example.com",
-		PasswordHash: "hashed", Role: models.RoleAdmin, Status: models.UserStatusActive,
+		PasswordHash: "hashed", PlatformRole: models.PlatformRolePlatformAdmin, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&admin).Error; err != nil {
 		t.Fatal(err)
@@ -518,6 +588,7 @@ func TestTicketContentWritesEnforceIfMatch(t *testing.T) {
 				&models.DomainEvent{},
 				&models.OutboxDelivery{},
 				&models.TicketHistory{},
+				&models.ProjectMembership{},
 			); err != nil {
 				t.Fatalf("migrate content concurrency schemas: %v", err)
 			}
@@ -525,7 +596,7 @@ func TestTicketContentWritesEnforceIfMatch(t *testing.T) {
 				Username:     "content-version-" + operation.name,
 				Email:        "content-version-" + operation.name + "@example.com",
 				PasswordHash: "hashed",
-				Role:         models.RoleCustomer,
+				PlatformRole: models.PlatformRoleMember,
 				Status:       models.UserStatusActive,
 			}
 			if err := db.Create(&customer).Error; err != nil {
@@ -551,11 +622,22 @@ func TestTicketContentWritesEnforceIfMatch(t *testing.T) {
 			}
 			native := services.NewAgentNativeService(db, services.AgentNativeOptions{
 				AttachmentStorage:  storage,
+				AttachmentStaging:  storage,
 				AttachmentMaxBytes: 1024,
 			})
+			ticketService := newHandlerTicketService(t, db)
+			scope := ensureHandlerTestProject(t, db)
+			if err := db.Create(&models.ProjectMembership{
+				ProjectID: scope.ProjectID,
+				UserID:    customer.ID,
+				Role:      models.ProjectRoleRequester,
+				IsActive:  true,
+			}).Error; err != nil {
+				t.Fatalf("seed requester project membership: %v", err)
+			}
 			handler := NewTicketContentHandler(
 				db,
-				newHandlerTicketService(t, db),
+				ticketService,
 				native,
 				1024,
 			)
@@ -569,6 +651,10 @@ func TestTicketContentWritesEnforceIfMatch(t *testing.T) {
 			operation.register(router, handler)
 			path := "/tickets/" + jsonNumber(ticket.ID) + operation.pathSuffix
 
+			currentStatus := http.StatusCreated
+			if operation.name == "attachment" {
+				currentStatus = http.StatusAccepted
+			}
 			tests := []struct {
 				name        string
 				ifMatch     string
@@ -593,7 +679,7 @@ func TestTicketContentWritesEnforceIfMatch(t *testing.T) {
 				{
 					name:        "current",
 					ifMatch:     httpcontract.FormatETag(2),
-					wantStatus:  http.StatusCreated,
+					wantStatus:  currentStatus,
 					wantRecords: 1,
 					wantVersion: 3,
 				},
@@ -653,7 +739,7 @@ func TestTicketContentWritesEnforceIfMatch(t *testing.T) {
 					if current.Version != test.wantVersion {
 						t.Fatalf("ticket version=%d, want %d", current.Version, test.wantVersion)
 					}
-					if operation.name == "attachment" && test.wantStatus == http.StatusCreated {
+					if operation.name == "attachment" && test.wantRecords == 1 {
 						for _, forbidden := range []string{
 							`"uploaded_by"`, `"actor_type"`, `"actor_id"`,
 							`"service_principal_id"`, `"file_name"`,
@@ -693,7 +779,7 @@ func TestCreateCommentRejectsInvalidInputWithChineseContract(t *testing.T) {
 	}
 	admin := models.User{
 		Username: "comment-contract-admin", Email: "comment-contract@example.com",
-		PasswordHash: "hashed", Role: models.RoleAdmin, Status: models.UserStatusActive,
+		PasswordHash: "hashed", PlatformRole: models.PlatformRolePlatformAdmin, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&admin).Error; err != nil {
 		t.Fatal(err)
@@ -898,7 +984,7 @@ func TestCreateCommentKeepsHumanVisibilityDenial(t *testing.T) {
 	}
 	admin := models.User{
 		Username: "comment-system-admin", Email: "comment-system-admin@example.com",
-		PasswordHash: "hashed", Role: models.RoleAdmin, Status: models.UserStatusActive,
+		PasswordHash: "hashed", PlatformRole: models.PlatformRolePlatformAdmin, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&admin).Error; err != nil {
 		t.Fatal(err)
@@ -945,7 +1031,7 @@ func TestCreateCommentKeepsNotFoundConflictAndInternalErrorsSafe(t *testing.T) {
 	}
 	admin := models.User{
 		Username: "comment-error-admin", Email: "comment-error-admin@example.com",
-		PasswordHash: "hashed", Role: models.RoleAdmin, Status: models.UserStatusActive,
+		PasswordHash: "hashed", PlatformRole: models.PlatformRolePlatformAdmin, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&admin).Error; err != nil {
 		t.Fatal(err)

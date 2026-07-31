@@ -16,14 +16,15 @@ type PrimaryPageCase = {
 const mainContent = (page: Page) => page.getByRole('main');
 
 const navigationItems = [
-    '仪表盘',
+    '项目仪表盘',
     '工单管理',
     '通知中心',
-    '用户管理',
+    '平台用户管理',
     '自动化规则',
     '自动化日志',
     'Webhook 集成',
     '系统设置',
+    '平台审计',
     'AI 智能体控制',
     '账号安全',
 ] as const;
@@ -115,7 +116,7 @@ const primaryPages: PrimaryPageCase[] = [
     },
     {
         caseID: 'UI-013',
-        name: '用户管理',
+        name: '平台用户管理',
         path: '/#/users',
         ready: (page) =>
             mainContent(page).getByPlaceholder('搜索用户', { exact: true }),
@@ -172,6 +173,16 @@ const primaryPages: PrimaryPageCase[] = [
         ready: (page) =>
             mainContent(page).getByRole('heading', {
                 name: '邮件通知配置',
+                exact: true,
+            }),
+    },
+    {
+        caseID: 'P1-PLATFORM-AUDIT',
+        name: '平台审计',
+        path: '/#/platform/audit',
+        ready: (page) =>
+            mainContent(page).getByRole('heading', {
+                name: '平台审计',
                 exact: true,
             }),
     },
@@ -414,11 +425,11 @@ test.describe('全站一级页面健康巡航', () => {
     }) => {
         await authenticatePage(page);
 
-        await page.route('**/api/admin/configs**', async (route) => {
+        await page.route('**/api/platform/configs**', async (route) => {
             const url = new URL(route.request().url());
             if (
                 route.request().method() === 'GET' &&
-                url.pathname === '/api/admin/configs' &&
+                url.pathname === '/api/platform/configs' &&
                 url.searchParams.get('category') === 'system'
             ) {
                 await route.abort('connectionfailed');

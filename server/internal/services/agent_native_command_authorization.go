@@ -19,6 +19,7 @@ const (
 	NativeCommandTicketCreate   NativeCommandAuthorizationKind = "ticket.create"
 	NativeCommandTicketQuery    NativeCommandAuthorizationKind = "ticket.query"
 	NativeCommandTicketClaim    NativeCommandAuthorizationKind = "ticket.claim"
+	NativeCommandLeaseHeartbeat NativeCommandAuthorizationKind = "ticket.lease.heartbeat"
 	NativeCommandLeaseRelease   NativeCommandAuthorizationKind = "ticket.lease.release"
 	NativeCommandTicketUpdate   NativeCommandAuthorizationKind = "ticket.update"
 	NativeCommandTicketTransit  NativeCommandAuthorizationKind = "ticket.transition"
@@ -146,6 +147,30 @@ func (s *AgentNativeService) AuthorizeNativeCommandInShortProjectTransactions(
 		Input:      primary,
 		DecisionID: primaryDecision.ID,
 	}}
+	additional, err := nativeCommandAdditionalPolicyChecks(input)
+	if err != nil {
+		return nil, err
+	}
+	for _, check := range additional {
+		if err := validateAgentTokenScope(
+			input.TokenScopes,
+			check.Scope,
+		); err != nil {
+			return nil, err
+		}
+		decision, checkErr :=
+			s.CheckActionInShortProjectTransactions(ctx, check)
+		if checkErr != nil {
+			return nil, checkErr
+		}
+		authorizations = append(
+			authorizations,
+			PolicyDecisionAuthorization{
+				Input:      check,
+				DecisionID: decision.ID,
+			},
+		)
+	}
 	if external != nil {
 		var (
 			externalDecision *models.PolicyDecision
@@ -192,6 +217,33 @@ func (s *AgentNativeService) AuthorizeNativeCommandInShortProjectTransactions(
 	)
 }
 
+func nativeCommandAdditionalPolicyChecks(
+	input NativeCommandAuthorizationInput,
+) ([]PolicyCheckInput, error) {
+	if input.Kind != NativeCommandTicketEscalate ||
+		input.Assignee == nil {
+		return nil, nil
+	}
+	if err := input.Assignee.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidAssignee, err)
+	}
+	return []PolicyCheckInput{{
+		ServicePrincipalID: input.Actor.ID,
+		CredentialID:       input.CredentialID,
+		Scope:              models.ScopeTicketsAssign,
+		Action:             "ticket.assign",
+		ResourceType:       "ticket",
+		ResourceID: strconv.FormatUint(
+			uint64(input.TicketID),
+			10,
+		),
+		IsWrite:        true,
+		IsRisky:        true,
+		RequestDigest:  input.RequestDigest,
+		SourceProtocol: input.SourceProtocol,
+	}}, nil
+}
+
 // AuthorizeNativeCommandReplayInShortProjectTransactions rechecks only the
 // canonical primary command policy for an idempotent replay. Replays never
 // authorize or emit a second external notification.
@@ -218,8 +270,31 @@ func (s *AgentNativeService) AuthorizeNativeCommandReplayInShortProjectTransacti
 	if err != nil {
 		return err
 	}
-	_, err = s.CheckActionInShortProjectTransactions(ctx, primary)
-	return err
+	if _, err = s.CheckActionInShortProjectTransactions(
+		ctx,
+		primary,
+	); err != nil {
+		return err
+	}
+	additional, err := nativeCommandAdditionalPolicyChecks(input)
+	if err != nil {
+		return err
+	}
+	for _, check := range additional {
+		if err := validateAgentTokenScope(
+			input.TokenScopes,
+			check.Scope,
+		); err != nil {
+			return err
+		}
+		if _, err := s.CheckActionInShortProjectTransactions(
+			ctx,
+			check,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *AgentNativeService) denyPolicyCheckForTokenScopeInShortProjectTransactions(
@@ -302,7 +377,7 @@ func (s *AgentNativeService) prepareNativeCommandAuthorizationResource(
 				return err
 			},
 		)
-	case NativeCommandLeaseRelease:
+	case NativeCommandLeaseHeartbeat, NativeCommandLeaseRelease:
 		leaseID := strings.TrimSpace(input.LeaseID)
 		if leaseID == "" {
 			return errors.New("lease release authorization requires a lease id")
@@ -386,6 +461,10 @@ func nativeCommandPrimaryPolicyCheck(
 		primary.Scope = models.ScopeTasksManage
 		primary.Action = "ticket.claim"
 		primary.IsWrite = true
+	case NativeCommandLeaseHeartbeat:
+		primary.Scope = models.ScopeTasksManage
+		primary.Action = "ticket.lease.heartbeat"
+		primary.IsWrite = true
 	case NativeCommandLeaseRelease:
 		primary.Scope = models.ScopeTasksManage
 		primary.Action = "ticket.lease.release"
@@ -451,6 +530,8 @@ func nativeLeaseCommandKind(
 	switch action {
 	case "ticket.claim":
 		return NativeCommandTicketClaim, true
+	case "ticket.lease.heartbeat":
+		return NativeCommandLeaseHeartbeat, true
 	case "ticket.lease.release":
 		return NativeCommandLeaseRelease, true
 	default:

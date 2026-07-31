@@ -48,7 +48,7 @@ def test_authentication_authorization_and_not_found_errors_are_machine_safe(
         machine_codes={"invalid_token"},
     )
 
-    forbidden = human_identities["customer_a"].api.get_json("/admin/users")
+    forbidden = human_identities["customer_a"].api.get_json("/platform/users")
     assert_error_contract(forbidden, 403)
 
     customer_api = human_identities["customer_a"].api
@@ -63,7 +63,7 @@ def test_suspended_account_invalidates_an_existing_access_token(
     identity = human_identities["customer_a"]
 
     suspended = admin_api.put_json(
-        f"/admin/users/{identity.id}",
+        f"/platform/users/{identity.id}",
         {"status": "suspended"},
     )
     assert suspended.status_code == 200, suspended.text
@@ -77,7 +77,7 @@ def test_suspended_account_invalidates_an_existing_access_token(
         )
     finally:
         restored = admin_api.put_json(
-            f"/admin/users/{identity.id}",
+            f"/platform/users/{identity.id}",
             {"status": "active"},
         )
         assert restored.status_code == 200, restored.text
@@ -90,9 +90,12 @@ def test_deleted_account_invalidates_an_existing_access_token(
     admin_api: APIClient,
     e2e_manager: E2EResourceManager,
 ) -> None:
-    identity = e2e_manager.create_user("customer", "deleted-token")
+    identity = e2e_manager.create_project_identity(
+        "requester",
+        label="deleted-token",
+    )
 
-    deleted = admin_api.delete(f"/admin/users/{identity.id}")
+    deleted = admin_api.delete(f"/platform/users/{identity.id}")
     assert deleted.status_code in (200, 204), deleted.text
 
     rejected = identity.api.get_json("/auth/me")

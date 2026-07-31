@@ -71,6 +71,7 @@ func MigrationModels() []any {
 		&models.AgentTaskStatusHistory{},
 		&models.AgentTaskEvent{},
 		&models.AgentPushNotificationConfig{},
+		&models.A2APushDeliverySnapshot{},
 	}
 }
 

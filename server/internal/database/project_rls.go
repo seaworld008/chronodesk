@@ -53,6 +53,7 @@ var requiredProjectOwnedTableNames = []string{
 	"agent_task_status_history",
 	"agent_task_events",
 	"agent_push_notification_configs",
+	"a2a_push_delivery_snapshots",
 
 	// Observable AI collaboration state.
 	"agent_runs",

@@ -451,16 +451,16 @@ func newProjectConfigurationHandlerEnvironment(
 		}
 	}
 	manager := models.User{
-		Username: "configuration-manager",
-		Email:    "configuration-manager@example.test",
-		Role:     models.RoleAgent,
-		Status:   models.UserStatusActive,
+		Username:     "configuration-manager",
+		Email:        "configuration-manager@example.test",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
 	}
 	agent := models.User{
-		Username: "configuration-agent",
-		Email:    "configuration-agent@example.test",
-		Role:     models.RoleAgent,
-		Status:   models.UserStatusActive,
+		Username:     "configuration-agent",
+		Email:        "configuration-agent@example.test",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
 	}
 	if err := database.Create(&manager).Error; err != nil {
 		t.Fatal(err)
@@ -522,7 +522,7 @@ func projectConfigurationHandlerRouter(
 	projectGroup := router.Group("/api/projects/:projectKey")
 	projectGroup.Use(func(c *gin.Context) {
 		c.Set("user_id", user.ID)
-		c.Set("user_role", string(user.Role))
+		c.Set("platform_role", user.PlatformRole)
 		c.Next()
 	})
 	projectGroup.Use(ProjectScopeMiddleware(

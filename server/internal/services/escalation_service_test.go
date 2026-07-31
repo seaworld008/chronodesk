@@ -23,7 +23,7 @@ func TestHasFirstResponseIgnoresSystemComments(t *testing.T) {
 		Username:     "agent-response",
 		Email:        "agent-response@example.com",
 		PasswordHash: "hashed",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
@@ -106,11 +106,11 @@ func TestSLAViolationUsesNativeCommandsAndIsStableAcrossScans(t *testing.T) {
 	}
 	systemUser := models.User{
 		Username: "sla-system", Email: "sla-system@example.com",
-		PasswordHash: "hash", Role: models.RoleAgent, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	manager := models.User{
 		Username: "sla-manager", Email: "sla-manager@example.com",
-		PasswordHash: "hash", Role: models.RoleAdmin, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRolePlatformAdmin, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&systemUser).Error; err != nil {
 		t.Fatal(err)
@@ -151,6 +151,13 @@ func TestSLAViolationUsesNativeCommandsAndIsStableAcrossScans(t *testing.T) {
 		t,
 		db,
 		models.SystemActor(slaMonitorActorID),
+	)
+	ensureTestHumanProjectRole(
+		t,
+		db,
+		ctx,
+		manager.ID,
+		models.ProjectRoleManager,
 	)
 	if err := db.First(&ticket, ticket.ID).Error; err != nil {
 		t.Fatal(err)
@@ -348,7 +355,7 @@ func TestSLARuleCanTriggerAfterBreachWasAlreadyRecorded(t *testing.T) {
 	}
 	user := models.User{
 		Username: "sla-threshold", Email: "sla-threshold@example.com",
-		PasswordHash: "hash", Role: models.RoleAgent, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
@@ -440,7 +447,7 @@ func TestSLABreachOutboxRecoversFromSnapshotAfterStateAndConfigChange(t *testing
 		Username:     "sla-recovery",
 		Email:        "sla-recovery@example.com",
 		PasswordHash: "hash",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&systemUser).Error; err != nil {
@@ -673,7 +680,7 @@ func TestSLAViolationRequiresNativeServiceAndSLAFieldsAreSystemControlled(t *tes
 	}
 	user := models.User{
 		Username: "sla-guard", Email: "sla-guard@example.com",
-		PasswordHash: "hash", Role: models.RoleAgent, Status: models.UserStatusActive,
+		PasswordHash: "hash", PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)

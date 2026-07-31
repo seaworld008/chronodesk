@@ -135,7 +135,7 @@ test.describe('工单评论与附件真实交互', () => {
         await attachmentRegion
             .getByRole('button', { name: '上传附件', exact: true })
             .click();
-        expect((await uploadResponse).status()).toBe(201);
+        expect((await uploadResponse).status()).toBe(202);
         await expect(
             page.getByText('附件已上传，等待安全扫描', { exact: true }),
         ).toBeVisible();

@@ -7,6 +7,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -67,13 +70,68 @@ func seedActorUser(t *testing.T, db *gorm.DB, suffix string) models.User {
 		Username:     "compat-" + suffix,
 		Email:        "compat-" + suffix + "@example.com",
 		PasswordHash: "not-a-real-password",
-		Role:         models.RoleAgent,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatalf("failed to seed actor user: %v", err)
 	}
 	return user
+}
+
+func ensureAttachmentTestAuthorization(
+	t *testing.T,
+	db *gorm.DB,
+	ctx context.Context,
+	actor models.ActorRef,
+) {
+	t.Helper()
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch actor.Type {
+	case models.ActorTypeHuman:
+		userID, err := humanActorUserID(actor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ensureTestHumanProjectRole(
+			t,
+			db,
+			ctx,
+			userID,
+			models.ProjectRoleAdmin,
+		)
+	case models.ActorTypeServicePrincipal:
+		var principal models.ServicePrincipal
+		if err := db.Where("id = ?", actor.ID).
+			Take(&principal).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Create(&models.ProjectPrincipalGrant{
+			ProjectID:          operation.Scope.ProjectID,
+			ServicePrincipalID: actor.ID,
+			Role:               models.ProjectRoleAgent,
+			Scopes:             principal.Scopes,
+			IsActive:           true,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Create(&models.AgentCredential{
+			ID:                 operation.CredentialID,
+			ServicePrincipalID: actor.ID,
+			Name:               "attachment-test",
+			SecretHash:         strings.Repeat("a", 64),
+			Status:             models.AgentCredentialStatusActive,
+			ExpiresAt:          time.Now().Add(time.Hour),
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	case models.ActorTypeSystem:
+	default:
+		t.Fatalf("unsupported attachment test actor: %+v", actor)
+	}
 }
 
 func createNativePrincipal(
@@ -1796,6 +1854,7 @@ func TestAgentNativeServicePrincipalCommentAndAttachmentLeaseEnforcement(t *test
 	}
 	service := NewAgentNativeService(db, AgentNativeOptions{
 		AttachmentStorage: storage,
+		AttachmentStaging: storage,
 		Now:               func() time.Time { return now },
 	})
 	principal := createNativePrincipal(
@@ -1811,6 +1870,7 @@ func TestAgentNativeServicePrincipalCommentAndAttachmentLeaseEnforcement(t *test
 	otherActor := models.ServicePrincipalActor(otherPrincipal.ID)
 	actorCtx := testProjectOperationContext(t, db, actor)
 	otherActorCtx := testProjectOperationContext(t, db, otherActor)
+	ensureAttachmentTestAuthorization(t, db, actorCtx, actor)
 
 	callComment := func(ticketID uint, expectedVersion uint64, leaseID string) error {
 		t.Helper()
@@ -2005,6 +2065,7 @@ func TestAgentNativeHumanAndSystemCommentAndAttachmentWritesRemainLeaseOptional(
 	}
 	service := NewAgentNativeService(db, AgentNativeOptions{
 		AttachmentStorage: storage,
+		AttachmentStaging: storage,
 	})
 	actors := []struct {
 		name  string
@@ -2016,6 +2077,12 @@ func TestAgentNativeHumanAndSystemCommentAndAttachmentWritesRemainLeaseOptional(
 	for _, test := range actors {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := testProjectOperationContext(t, db, test.actor)
+			ensureAttachmentTestAuthorization(
+				t,
+				db,
+				ctx,
+				test.actor,
+			)
 			commentTicket := seedNativeTicket(t, db, user.ID, "LEASE-OPTIONAL-COMMENT-"+strings.ToUpper(test.name))
 			if _, err := service.CreateComment(ctx, NativeCommentInput{
 				TicketID:        commentTicket.ID,
@@ -2042,6 +2109,96 @@ func TestAgentNativeHumanAndSystemCommentAndAttachmentWritesRemainLeaseOptional(
 	}
 }
 
+func TestHumanAgentCannotUploadAttachmentAssignedToAnotherHuman(
+	t *testing.T,
+) {
+	db := openAgentNativeTestDB(t)
+	agent := seedActorUser(t, db, "attachment-object-agent")
+	other := seedActorUser(t, db, "attachment-object-other")
+	storage, err := NewLocalAttachmentStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewAgentNativeService(db, AgentNativeOptions{
+		AttachmentStorage:  storage,
+		AttachmentStaging:  storage,
+		AttachmentMaxBytes: 1024,
+	})
+	actor := models.HumanActor(agent.ID)
+	ctx := testProjectOperationContext(t, db, actor)
+	ensureTestHumanProjectRole(
+		t,
+		db,
+		ctx,
+		agent.ID,
+		models.ProjectRoleAgent,
+	)
+	ticket := seedNativeTicket(
+		t,
+		db,
+		other.ID,
+		"AI-ATTACH-OBJECT-AUTHORIZATION",
+	)
+	if err := db.Model(&ticket).
+		Update("assigned_to_id", other.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var eventsBefore, outboxBefore int64
+	if err := db.Model(&models.DomainEvent{}).
+		Count(&eventsBefore).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.OutboxDelivery{}).
+		Count(&outboxBefore).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = service.StoreAttachment(ctx, NativeAttachmentInput{
+		TicketID:        ticket.ID,
+		ExpectedVersion: ticket.Version,
+		Actor:           actor,
+		OriginalName:    "other-assignee.txt",
+		IsPublic:        true,
+		Reader:          bytes.NewBufferString("untrusted evidence"),
+	})
+	if !errors.Is(err, ErrProjectAccessDenied) {
+		t.Fatalf(
+			"attachment assigned to another human error = %v, want project access denied",
+			err,
+		)
+	}
+	var attachments int64
+	if err := db.Model(&models.TicketAttachment{}).
+		Where("ticket_id = ?", ticket.ID).
+		Count(&attachments).Error; err != nil {
+		t.Fatal(err)
+	}
+	if attachments != 0 {
+		t.Fatalf(
+			"denied attachment persisted %d records",
+			attachments,
+		)
+	}
+	var eventsAfter, outboxAfter int64
+	if err := db.Model(&models.DomainEvent{}).
+		Count(&eventsAfter).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.OutboxDelivery{}).
+		Count(&outboxAfter).Error; err != nil {
+		t.Fatal(err)
+	}
+	if eventsAfter != eventsBefore || outboxAfter != outboxBefore {
+		t.Fatalf(
+			"denied attachment changed events/outbox: events %d->%d outbox %d->%d",
+			eventsBefore,
+			eventsAfter,
+			outboxBefore,
+			outboxAfter,
+		)
+	}
+}
+
 func TestAgentNativeLocalAttachmentSecurityHashScanAndLimit(t *testing.T) {
 	db := openAgentNativeTestDB(t)
 	user := seedActorUser(t, db, "attachment")
@@ -2051,12 +2208,21 @@ func TestAgentNativeLocalAttachmentSecurityHashScanAndLimit(t *testing.T) {
 	}
 	service := NewAgentNativeService(db, AgentNativeOptions{
 		AttachmentStorage:  storage,
+		AttachmentStaging:  storage,
 		AttachmentMaxBytes: 5,
 	})
-	principal := createNativePrincipal(t, service, user.ID, "attachment-agent", models.ScopeAttachmentsWrite)
+	principal := createNativePrincipal(
+		t,
+		service,
+		user.ID,
+		"attachment-agent",
+		models.ScopeAttachmentsWrite,
+		models.ScopeAttachmentsRead,
+	)
 	ticket := seedNativeTicket(t, db, user.ID, "AI-ATTACH-001")
 	actor := models.ServicePrincipalActor(principal.ID)
 	ctx := testProjectOperationContext(t, db, actor)
+	ensureAttachmentTestAuthorization(t, db, ctx, actor)
 	lease, err := service.claimTicketLease(ctx, ticket.ID, actor, 1, time.Minute)
 	if err != nil {
 		t.Fatalf("claim attachment lease: %v", err)
@@ -2072,22 +2238,30 @@ func TestAgentNativeLocalAttachmentSecurityHashScanAndLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reserve attachment idempotency: %v", err)
 	}
-
-	result, err := service.StoreAttachment(ctx, NativeAttachmentInput{
+	attachmentInput := NativeAttachmentInput{
 		TicketID:            ticket.ID,
 		ExpectedVersion:     1,
 		LeaseID:             lease.ID,
 		Actor:               actor,
+		CredentialID:        "test-credential",
 		OriginalName:        "../../report.txt",
 		Reader:              bytes.NewBufferString("hello"),
 		IdempotencyRecordID: reservation.Record.ID,
-	})
+	}
+	if err := service.PrepareAttachmentUploadAuthorization(
+		ctx,
+		&attachmentInput,
+	); err != nil {
+		t.Fatalf("prepare attachment authorization: %v", err)
+	}
+	result, err := service.StoreAttachment(ctx, attachmentInput)
 	if err != nil {
 		t.Fatalf("store attachment: %v", err)
 	}
 	if result.Attachment.OriginalName != "report.txt" ||
 		result.Attachment.Hash != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" ||
-		result.Attachment.VirusScan != models.VirusScanPending {
+		result.Attachment.VirusScan != models.VirusScanPending ||
+		result.Attachment.StorageType != "staging" {
 		t.Fatalf("unexpected stored attachment: %+v", result.Attachment)
 	}
 	if strings.Contains(result.Attachment.StoragePath, "..") || strings.HasPrefix(result.Attachment.StoragePath, "/") {
@@ -2109,6 +2283,97 @@ func TestAgentNativeLocalAttachmentSecurityHashScanAndLimit(t *testing.T) {
 	assertTicketHistoryEventLink(t, &attachmentHistory, result.Event)
 	if _, _, err := service.OpenAttachment(ctx, result.Attachment.ID); !errors.Is(err, ErrAttachmentNotClean) {
 		t.Fatalf("pending attachment must not be downloadable, got %v", err)
+	}
+	var uploadDelivery models.OutboxDelivery
+	if err := db.Where(
+		"event_id = ? AND destination_type = ?",
+		result.Event.ID,
+		AttachmentUploadOutboxDestination,
+	).Take(&uploadDelivery).Error; err != nil {
+		t.Fatalf("load attachment upload outbox: %v", err)
+	}
+	if uploadDelivery.DestinationID !=
+		strconv.FormatUint(uint64(result.Attachment.ID), 10) {
+		t.Fatalf("upload destination = %q", uploadDelivery.DestinationID)
+	}
+	var stagingCleanupDelivery models.OutboxDelivery
+	if err := db.Where(
+		"destination_type = ? AND destination_id = ?",
+		AttachmentStagingCleanupOutboxDestination,
+		strconv.FormatUint(uint64(result.Attachment.ID), 10),
+	).Take(&stagingCleanupDelivery).Error; err != nil {
+		t.Fatalf("load staging cleanup outbox: %v", err)
+	}
+	if stagingCleanupDelivery.Status !=
+		models.OutboxDeliverySucceeded ||
+		stagingCleanupDelivery.DeliveredAt == nil {
+		t.Fatalf(
+			"committed upload did not retire orphan cleanup: %+v",
+			stagingCleanupDelivery,
+		)
+	}
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerCtx, err := WithOperationContext(
+		context.Background(),
+		OperationContext{
+			Scope:  operation.Scope,
+			Actor:  models.SystemActor(outboxSystemActorID),
+			Source: SourceProtocolWorker,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalPartialPath := filepath.Join(
+		storage.root,
+		"tickets",
+		strconv.FormatUint(uint64(ticket.ID), 10),
+		result.Attachment.FileName,
+	) + ".partial"
+	if err := os.MkdirAll(
+		filepath.Dir(finalPartialPath),
+		0o700,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		finalPartialPath,
+		[]byte("partial final object from crashed worker"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ExecuteAttachmentUploadOutbox(
+		workerCtx,
+		result.Attachment.ID,
+	); err != nil {
+		t.Fatalf("execute attachment upload outbox: %v", err)
+	}
+	if err := db.First(
+		result.Attachment,
+		"id = ?",
+		result.Attachment.ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if result.Attachment.StorageType != "local" ||
+		strings.HasPrefix(
+			result.Attachment.StoragePath,
+			".staging/",
+		) {
+		t.Fatalf(
+			"finalized attachment storage = %+v",
+			result.Attachment,
+		)
+	}
+	if _, err := os.Stat(finalPartialPath); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("final upload retry left partial object: %v", err)
 	}
 	if err := service.MarkAttachmentScan(ctx, result.Attachment.ID, models.VirusScanClean, "scanner ok"); err != nil {
 		t.Fatalf("mark attachment clean: %v", err)
@@ -2137,8 +2402,25 @@ func TestAgentNativeLocalAttachmentSecurityHashScanAndLimit(t *testing.T) {
 	}
 	var afterEmpty int64
 	_ = db.Model(&models.TicketAttachment{}).Count(&afterEmpty).Error
-	if afterEmpty != before {
-		t.Fatalf("empty attachment must not create a database record: before=%d after=%d", before, afterEmpty)
+	if afterEmpty != before+1 {
+		t.Fatalf(
+			"empty attachment must leave one durable cleanup intent: before=%d after=%d",
+			before,
+			afterEmpty,
+		)
+	}
+	var emptyIntent models.TicketAttachment
+	if err := db.Where(
+		"storage_type = ?",
+		attachmentStagingIntentStorageType,
+	).Order("id DESC").Take(&emptyIntent).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ExecuteAttachmentStagingCleanupOutbox(
+		workerCtx,
+		emptyIntent.ID,
+	); err != nil {
+		t.Fatalf("cleanup empty attachment intent: %v", err)
 	}
 	if _, err := service.StoreAttachment(ctx, NativeAttachmentInput{
 		TicketID:        ticket.ID,
@@ -2152,7 +2434,33 @@ func TestAgentNativeLocalAttachmentSecurityHashScanAndLimit(t *testing.T) {
 	}
 	var after int64
 	_ = db.Model(&models.TicketAttachment{}).Count(&after).Error
-	if after != before {
-		t.Fatalf("oversized attachment must not create a database record: before=%d after=%d", before, after)
+	if after != before+1 {
+		t.Fatalf(
+			"oversized attachment must leave one durable cleanup intent: before=%d after=%d",
+			before,
+			after,
+		)
+	}
+	var oversizedIntent models.TicketAttachment
+	if err := db.Where(
+		"storage_type = ?",
+		attachmentStagingIntentStorageType,
+	).Order("id DESC").Take(&oversizedIntent).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ExecuteAttachmentStagingCleanupOutbox(
+		workerCtx,
+		oversizedIntent.ID,
+	); err != nil {
+		t.Fatalf("cleanup oversized attachment intent: %v", err)
+	}
+	var afterCleanup int64
+	_ = db.Model(&models.TicketAttachment{}).Count(&afterCleanup).Error
+	if afterCleanup != before {
+		t.Fatalf(
+			"cleanup worker left attachment intents: before=%d after=%d",
+			before,
+			afterCleanup,
+		)
 	}
 }

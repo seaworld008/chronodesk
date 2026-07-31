@@ -53,7 +53,7 @@ func newCollaborationFixture(t *testing.T) collaborationFixture {
 		Username:     "approver",
 		Email:        "approver@example.test",
 		PasswordHash: "hash",
-		Role:         models.RoleSupervisor,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&human).Error; err != nil {

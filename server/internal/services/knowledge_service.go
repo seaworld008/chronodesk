@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -213,9 +214,11 @@ type ModelProvider interface {
 }
 
 type KnowledgeServiceDependencies struct {
-	SearchIndex    HybridSearchIndex
-	AccessResolver KnowledgeAccessResolver
-	ModelProviders map[string]ModelProvider
+	SearchIndex          HybridSearchIndex
+	AccessResolver       KnowledgeAccessResolver
+	ModelProviders       map[string]ModelProvider
+	ProjectAuthorization *ProjectService
+	Events               projectDomainEventAppender
 }
 
 type KnowledgeService struct {
@@ -223,6 +226,8 @@ type KnowledgeService struct {
 	searchIndex    HybridSearchIndex
 	accessResolver KnowledgeAccessResolver
 	modelProviders map[string]ModelProvider
+	projects       *ProjectService
+	events         projectDomainEventAppender
 	now            func() time.Time
 }
 
@@ -232,6 +237,9 @@ func NewKnowledgeService(
 ) (*KnowledgeService, error) {
 	if db == nil {
 		return nil, errors.New("knowledge database is required")
+	}
+	if dependencies.Events == nil {
+		return nil, errors.New("knowledge domain event pipeline is required")
 	}
 	providers := make(map[string]ModelProvider, len(dependencies.ModelProviders))
 	for key, provider := range dependencies.ModelProviders {
@@ -245,11 +253,24 @@ func NewKnowledgeService(
 		}
 		providers[key] = provider
 	}
+	projects := dependencies.ProjectAuthorization
+	if projects == nil {
+		var err error
+		projects, err = NewProjectService(db)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"initialize knowledge project authorization: %w",
+				err,
+			)
+		}
+	}
 	return &KnowledgeService{
 		db:             db,
 		searchIndex:    dependencies.SearchIndex,
 		accessResolver: dependencies.AccessResolver,
 		modelProviders: providers,
+		projects:       projects,
+		events:         dependencies.Events,
 		now:            time.Now,
 	}, nil
 }
@@ -752,8 +773,10 @@ func (service *KnowledgeService) PublishVersion(
 			}).Error; err != nil {
 			return fmt.Errorf("activate knowledge version: %w", err)
 		}
-		if err := requestKnowledgeIndexRebuildTx(
+		if _, err := service.requestKnowledgeIndexRebuildTx(
+			ctx,
 			tx,
+			operation,
 			operation.Scope,
 			"knowledge",
 		); err != nil {
@@ -929,17 +952,22 @@ func (service *KnowledgeService) Search(
 	if service.searchIndex == nil {
 		return nil, ErrKnowledgeIndexUnavailable
 	}
-	subjects, err := service.resolveKnowledgeSubjects(ctx, operation)
-	if err != nil {
+	if err := requireExternalIOOutsideProjectTransaction(
+		ctx,
+		"knowledge search orchestration",
+	); err != nil {
 		return nil, err
 	}
-	policy, provider, err := service.resolveKnowledgeModelPolicy(
+	snapshot, err := service.captureKnowledgeSearchSnapshot(
 		ctx,
-		operation.Scope,
+		operation,
 	)
 	if err != nil {
 		return nil, err
 	}
+	subjects := snapshot.subjects
+	policy := snapshot.policy
+	provider := snapshot.provider
 	modelQuery, err := prepareKnowledgeModelContent(
 		query,
 		policy,
@@ -949,6 +977,12 @@ func (service *KnowledgeService) Search(
 		return nil, err
 	}
 	limits := modelLimitsFromPolicy(policy)
+	if err := requireExternalIOOutsideProjectTransaction(
+		ctx,
+		"knowledge query embedding",
+	); err != nil {
+		return nil, err
+	}
 	embedding, err := provider.Embed(ctx, ModelEmbedRequest{
 		Scope:  operation.Scope,
 		Model:  policy.EmbeddingModel,
@@ -976,6 +1010,12 @@ func (service *KnowledgeService) Search(
 	if err := filter.Validate(); err != nil {
 		return nil, err
 	}
+	if err := requireExternalIOOutsideProjectTransaction(
+		ctx,
+		"knowledge hybrid search",
+	); err != nil {
+		return nil, err
+	}
 	hits, err := service.searchIndex.Search(ctx, HybridSearchRequest{
 		Query:          modelQuery,
 		QueryEmbedding: embedding.Embeddings[0],
@@ -988,6 +1028,15 @@ func (service *KnowledgeService) Search(
 	if len(hits) == 0 {
 		searchID, err := newKnowledgeSearchID()
 		if err != nil {
+			return nil, err
+		}
+		if err := service.finalizeKnowledgeSearch(
+			ctx,
+			operation,
+			snapshot.epoch,
+			nil,
+			nil,
+		); err != nil {
 			return nil, err
 		}
 		return &KnowledgeSearchResult{
@@ -1018,6 +1067,12 @@ func (service *KnowledgeService) Search(
 			Content: content,
 		})
 	}
+	if err := requireExternalIOOutsideProjectTransaction(
+		ctx,
+		"knowledge result rerank",
+	); err != nil {
+		return nil, err
+	}
 	reranked, err := provider.Rerank(ctx, ModelRerankRequest{
 		Scope:      operation.Scope,
 		Model:      policy.RerankModel,
@@ -1037,6 +1092,7 @@ func (service *KnowledgeService) Search(
 		return nil, err
 	}
 	citations := make([]models.KnowledgeCitation, 0, len(reranked.Items))
+	selectedHits := make([]HybridSearchHit, 0, len(reranked.Items))
 	seen := make(map[string]struct{}, len(reranked.Items))
 	for index, item := range reranked.Items {
 		hit, exists := hitsByID[item.ID]
@@ -1047,6 +1103,7 @@ func (service *KnowledgeService) Search(
 			return nil, ErrKnowledgeModelResponseInvalid
 		}
 		seen[item.ID] = struct{}{}
+		selectedHits = append(selectedHits, hit)
 		citations = append(citations, models.KnowledgeCitation{
 			OrganizationID:  operation.Scope.OrganizationID,
 			ProjectID:       operation.Scope.ProjectID,
@@ -1064,8 +1121,14 @@ func (service *KnowledgeService) Search(
 			CreatedByID:     operation.Actor.ID,
 		})
 	}
-	if err := service.db.WithContext(ctx).Create(&citations).Error; err != nil {
-		return nil, fmt.Errorf("persist knowledge citations: %w", err)
+	if err := service.finalizeKnowledgeSearch(
+		ctx,
+		operation,
+		snapshot.epoch,
+		selectedHits,
+		citations,
+	); err != nil {
+		return nil, err
 	}
 	return &KnowledgeSearchResult{
 		SearchID: searchID,
@@ -1115,122 +1178,67 @@ func (service *KnowledgeService) RebuildIndex(
 	if service.searchIndex == nil {
 		return nil, ErrKnowledgeIndexUnavailable
 	}
+	if service.events == nil || service.projects == nil {
+		return nil, errors.New(
+			"knowledge index rebuild event pipeline is unavailable",
+		)
+	}
+	if operation.Actor.Type != models.ActorTypeHuman {
+		return nil, ErrProjectKnowledgeAccessDenied
+	}
+	userID, err := parseKnowledgeHumanID(operation.Actor.ID)
+	if err != nil {
+		return nil, ErrProjectKnowledgeAccessDenied
+	}
 	var state models.KnowledgeIndexState
-	err = transactionForContext(ctx, service.db, func(tx *gorm.DB) error {
-		err := knowledgeScopedQuery(tx, operation.Scope).
-			Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("index_name = ?", "knowledge").
-			First(&state).Error
-		switch {
-		case err == nil:
-			if state.DesiredGeneration <= state.Generation {
-				state.DesiredGeneration = state.Generation + 1
+	err = scopeddb.WithProjectScopeContextTransaction(
+		ctx,
+		service.db,
+		operation.Scope,
+		func(scopedContext context.Context) error {
+			access, revalidateErr :=
+				service.projects.RevalidateHumanProjectAccess(
+					scopedContext,
+					operation.Scope,
+					userID,
+				)
+			if revalidateErr != nil {
+				return revalidateErr
 			}
-		case errors.Is(err, gorm.ErrRecordNotFound):
-			state = models.KnowledgeIndexState{
-				OrganizationID:    operation.Scope.OrganizationID,
-				ProjectID:         operation.Scope.ProjectID,
-				IndexName:         "knowledge",
-				Generation:        0,
-				DesiredGeneration: 1,
-				Status:            models.KnowledgeIndexRebuildRequested,
+			if access.Role != models.ProjectRoleAdmin &&
+				access.Role != models.ProjectRoleManager {
+				return ErrProjectKnowledgeAccessDenied
 			}
-			if err := tx.Create(&state).Error; err != nil {
-				return fmt.Errorf("create knowledge index state: %w", err)
-			}
-		default:
-			return fmt.Errorf("load knowledge index state: %w", err)
-		}
-		now := service.now().UTC()
-		state.Status = models.KnowledgeIndexBuilding
-		state.StartedAt = &now
-		state.CompletedAt = nil
-		state.FailureDetail = ""
-		if err := tx.Save(&state).Error; err != nil {
-			return fmt.Errorf("start knowledge index rebuild: %w", err)
-		}
-		return nil
-	})
+			var requestErr error
+			state, requestErr = service.requestKnowledgeIndexRebuildTx(
+				scopedContext,
+				service.db.WithContext(scopedContext),
+				operation,
+				operation.Scope,
+				"knowledge",
+			)
+			return requestErr
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
+	return &state, nil
+}
 
-	documents, sourceDigest, err := service.loadKnowledgeIndexDocuments(
-		ctx,
-		operation.Scope,
-	)
-	if err == nil && len(documents) > 0 {
-		var policy models.ProjectModelPolicy
-		var provider ModelProvider
-		policy, provider, err = service.resolveKnowledgeModelPolicy(
-			ctx,
-			operation.Scope,
-		)
-		if err == nil {
-			documents, err = embedKnowledgeIndexDocuments(
-				ctx,
-				operation.Scope,
-				documents,
-				policy,
-				provider,
-			)
-		}
-	}
-	if err == nil {
-		err = service.searchIndex.ReplaceProject(ctx, HybridIndexReplacement{
-			OrganizationID: operation.Scope.OrganizationID,
-			ProjectID:      operation.Scope.ProjectID,
-			Generation:     state.DesiredGeneration,
-			SourceDigest:   sourceDigest,
-			Documents:      documents,
-		})
-	}
-	now := service.now().UTC()
+func (service *KnowledgeService) GetIndexState(
+	ctx context.Context,
+) (*models.KnowledgeIndexState, error) {
+	operation, err := knowledgeOperation(ctx)
 	if err != nil {
-		failure := knowledgeScopedQuery(
-			service.db.WithContext(ctx).Model(&models.KnowledgeIndexState{}),
-			operation.Scope,
-		).Where("id = ?", state.ID).UpdateColumns(map[string]any{
-			"status":         models.KnowledgeIndexFailed,
-			"failure_detail": "知识索引重建失败",
-			"completed_at":   now,
-			"updated_at":     now,
-		})
-		if failure.Error != nil {
-			return nil, fmt.Errorf(
-				"knowledge index rebuild failed (%v), persist failure: %w",
-				err,
-				failure.Error,
-			)
-		}
-		return nil, fmt.Errorf("replace project knowledge index: %w", err)
+		return nil, err
 	}
-	result := knowledgeScopedQuery(
-		service.db.WithContext(ctx).Model(&models.KnowledgeIndexState{}),
-		operation.Scope,
-	).Where(
-		"id = ? AND status = ?",
-		state.ID,
-		models.KnowledgeIndexBuilding,
-	).UpdateColumns(map[string]any{
-		"generation":     state.DesiredGeneration,
-		"status":         models.KnowledgeIndexReady,
-		"source_digest":  sourceDigest,
-		"document_count": len(documents),
-		"failure_detail": "",
-		"completed_at":   now,
-		"updated_at":     now,
-	})
-	if result.Error != nil {
-		return nil, fmt.Errorf("complete knowledge index rebuild: %w", result.Error)
-	}
-	if result.RowsAffected != 1 {
-		return nil, ErrKnowledgeIngestionState
-	}
+	var state models.KnowledgeIndexState
 	if err := knowledgeScopedQuery(
 		service.db.WithContext(ctx),
 		operation.Scope,
-	).Where("id = ?", state.ID).First(&state).Error; err != nil {
+	).Where("index_name = ?", "knowledge").
+		Take(&state).Error; err != nil {
 		return nil, knowledgeLookupError(err)
 	}
 	return &state, nil
@@ -1539,13 +1547,16 @@ func validateKnowledgeSearchHit(
 	return nil
 }
 
-func requestKnowledgeIndexRebuildTx(
+func (service *KnowledgeService) requestKnowledgeIndexRebuildTx(
+	ctx context.Context,
 	tx *gorm.DB,
+	operation OperationContext,
 	scope models.ProjectScope,
 	indexName string,
-) error {
+) (models.KnowledgeIndexState, error) {
 	var state models.KnowledgeIndexState
 	err := knowledgeScopedQuery(tx, scope).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("index_name = ?", indexName).
 		First(&state).Error
 	switch {
@@ -1559,28 +1570,65 @@ func requestKnowledgeIndexRebuildTx(
 			Status:            models.KnowledgeIndexRebuildRequested,
 		}
 		if err := tx.Create(&state).Error; err != nil {
-			return fmt.Errorf("create knowledge index rebuild request: %w", err)
+			return models.KnowledgeIndexState{}, fmt.Errorf(
+				"create knowledge index rebuild request: %w",
+				err,
+			)
 		}
-		return nil
 	case err != nil:
-		return fmt.Errorf("load knowledge index rebuild state: %w", err)
+		return models.KnowledgeIndexState{}, fmt.Errorf(
+			"load knowledge index rebuild state: %w",
+			err,
+		)
+	default:
+		if state.DesiredGeneration <= state.Generation {
+			state.DesiredGeneration = state.Generation + 1
+		} else {
+			state.DesiredGeneration++
+		}
+		state.Status = models.KnowledgeIndexRebuildRequested
+		state.CompletedAt = nil
+		state.FailureDetail = ""
+		if err := tx.Save(&state).Error; err != nil {
+			return models.KnowledgeIndexState{}, fmt.Errorf(
+				"request knowledge index rebuild: %w",
+				err,
+			)
+		}
 	}
-	desired := state.DesiredGeneration
-	if desired <= state.Generation {
-		desired = state.Generation + 1
+	_, err = service.events.AppendDomainEventTx(
+		ctx,
+		tx,
+		DomainEventInput{
+			Type: "io.chronodesk.knowledge.index-rebuild.requested.v1",
+			Subject: fmt.Sprintf(
+				"knowledge/index-rebuild/%s",
+				state.ID,
+			),
+			Actor:           operation.Actor,
+			Scope:           scope,
+			TraceID:         operation.TraceID,
+			CorrelationID:   operation.CorrelationID,
+			ResourceVersion: state.DesiredGeneration,
+			Data: map[string]any{
+				"state_id":   state.ID,
+				"generation": state.DesiredGeneration,
+			},
+		},
+		[]OutboxTarget{{
+			Type: KnowledgeIndexRebuildOutboxDestination,
+			ID: fmt.Sprintf(
+				"%s:%d",
+				state.ID,
+				state.DesiredGeneration,
+			),
+			MaxAttempts: 8,
+		}},
+	)
+	if err != nil {
+		return models.KnowledgeIndexState{}, err
 	}
-	if err := knowledgeScopedQuery(
-		tx.Model(&models.KnowledgeIndexState{}),
-		scope,
-	).Where("id = ?", state.ID).UpdateColumns(map[string]any{
-		"desired_generation": desired,
-		"status":             models.KnowledgeIndexRebuildRequested,
-		"failure_detail":     "",
-		"updated_at":         time.Now().UTC(),
-	}).Error; err != nil {
-		return fmt.Errorf("request knowledge index rebuild: %w", err)
-	}
-	return nil
+	return state, nil
 }
 
 func knowledgeSubjectsDigest(subjects []models.KnowledgeACLSubject) string {

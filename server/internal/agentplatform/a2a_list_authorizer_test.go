@@ -239,6 +239,43 @@ func TestA2ATaskSnapshotsRequireTokenTicketReadScope(t *testing.T) {
 	}
 }
 
+func TestA2AUnlinkedTaskSnapshotRevalidatesLiveProjectGrant(
+	t *testing.T,
+) {
+	fixture := newA2AAdapterFixture(t)
+	ctx := context.WithoutCancel(a2aFixtureContext(t, fixture))
+	task := a2a.Task{
+		ID:        "task-unlinked-live-grant",
+		ContextID: "context-unlinked-live-grant",
+	}
+	authorizer := NewA2ATaskListAuthorizer(fixture.native)
+	allowed, err := authorizer.AuthorizeTaskSnapshot(ctx, task)
+	if err != nil || !allowed {
+		t.Fatalf(
+			"initial unlinked snapshot allowed=%t err=%v",
+			allowed,
+			err,
+		)
+	}
+	if err := fixture.db.Model(
+		&models.ProjectPrincipalGrant{},
+	).Where(
+		"project_id = ? AND service_principal_id = ?",
+		fixture.project.ID,
+		fixture.principal.ID,
+	).Update("is_active", false).Error; err != nil {
+		t.Fatalf("revoke A2A project grant: %v", err)
+	}
+	allowed, err = authorizer.AuthorizeTaskSnapshot(ctx, task)
+	if err != nil || allowed {
+		t.Fatalf(
+			"revoked unlinked snapshot allowed=%t err=%v, want false/nil",
+			allowed,
+			err,
+		)
+	}
+}
+
 func TestTrustedA2AIdentityRejectsOperationScopeMismatch(t *testing.T) {
 	fixture := newA2AAdapterFixture(t)
 	ctx := a2aFixtureContext(t, fixture)

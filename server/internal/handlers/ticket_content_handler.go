@@ -130,6 +130,13 @@ func (h *TicketContentHandler) RegisterRoutes(tickets *gin.RouterGroup) {
 	tickets.GET("/:id/comments", h.ListComments)
 	tickets.POST("/:id/comments", h.CreateComment)
 	tickets.GET("/:id/attachments", h.ListAttachments)
+}
+
+// RegisterExternalRoutes mounts attachment object-storage and streaming
+// operations on a group that uses ProjectExternalScopeMiddleware.
+func (h *TicketContentHandler) RegisterExternalRoutes(
+	tickets *gin.RouterGroup,
+) {
 	tickets.POST("/:id/attachments", h.StoreAttachment)
 	tickets.GET("/:id/attachments/:attachment_id/content", h.DownloadAttachment)
 }
@@ -389,8 +396,13 @@ func (h *TicketContentHandler) ListAttachments(c *gin.Context) {
 }
 
 func (h *TicketContentHandler) StoreAttachment(c *gin.Context) {
-	ticket, ok := h.authorizedTicket(c, ticketAccessUpdate)
-	if !ok {
+	ticketID, err := strconv.ParseUint(c.Param("id"), 10, 32)
+	if err != nil || ticketID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"code":    "invalid_request",
+			"message": "工单 ID 无效",
+		})
 		return
 	}
 	expectedVersion, ok := requireTicketIfMatch(c)
@@ -446,13 +458,9 @@ func (h *TicketContentHandler) StoreAttachment(c *gin.Context) {
 		parsed := uint(value)
 		commentID = &parsed
 	}
-	if isRequesterRole(normalizedProjectRole(c)) && commentID != nil &&
-		!h.customerCanReferenceComment(c, ticket.ID, *commentID) {
-		return
-	}
 	userID := c.GetUint("user_id")
 	result, err := h.native.StoreAttachment(c.Request.Context(), services.NativeAttachmentInput{
-		TicketID:        ticket.ID,
+		TicketID:        uint(ticketID),
 		CommentID:       commentID,
 		ExpectedVersion: expectedVersion,
 		Actor:           models.HumanActor(userID),
@@ -474,7 +482,7 @@ func (h *TicketContentHandler) StoreAttachment(c *gin.Context) {
 	if isRequesterRole(normalizedProjectRole(c)) {
 		responseData = customerAttachmentFromModel(result.Attachment)
 	}
-	c.JSON(http.StatusCreated, gin.H{
+	c.JSON(http.StatusAccepted, gin.H{
 		"success": true,
 		"data":    responseData,
 		"receipt": result.Receipt,
@@ -516,47 +524,26 @@ func (h *TicketContentHandler) customerCanReferenceComment(c *gin.Context, ticke
 }
 
 func (h *TicketContentHandler) DownloadAttachment(c *gin.Context) {
+	ticketID, err := strconv.ParseUint(c.Param("id"), 10, 32)
+	if err != nil || ticketID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "code": "invalid_request", "message": "工单 ID 无效"})
+		return
+	}
 	attachmentID, err := strconv.ParseUint(c.Param("attachment_id"), 10, 32)
 	if err != nil || attachmentID == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "code": "invalid_request", "message": "附件 ID 无效"})
 		return
 	}
-	ticket, ok := h.authorizedTicket(c, ticketAccessRead)
-	if !ok {
-		return
-	}
-	var metadata models.TicketAttachment
-	if err := h.db.WithContext(c.Request.Context()).
-		Where(
-			"id = ? AND ticket_id = ? AND organization_id = ? AND project_id = ?",
-			uint(attachmentID),
-			ticket.ID,
-			ticket.OrganizationID,
-			ticket.ProjectID,
-		).
-		First(&metadata).Error; err != nil {
-		h.writeError(c, err)
-		return
-	}
-	if isRequesterRole(normalizedProjectRole(c)) && !metadata.IsPublic {
-		c.JSON(http.StatusForbidden, gin.H{"success": false, "code": "ticket_access_denied", "message": "无权下载该附件"})
-		return
-	}
-	attachment, reader, err := h.native.OpenAttachment(c.Request.Context(), uint(attachmentID))
+	attachment, reader, err := h.native.OpenTicketAttachment(
+		c.Request.Context(),
+		uint(ticketID),
+		uint(attachmentID),
+	)
 	if err != nil {
 		h.writeError(c, err)
 		return
 	}
 	defer reader.Close()
-	_ = h.db.WithContext(c.Request.Context()).Model(&models.TicketAttachment{}).
-		Where(
-			"id = ? AND ticket_id = ? AND organization_id = ? AND project_id = ?",
-			attachment.ID,
-			ticket.ID,
-			ticket.OrganizationID,
-			ticket.ProjectID,
-		).
-		UpdateColumn("download_count", gorm.Expr("download_count + 1")).Error
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, attachment.OriginalName))
 	c.DataFromReader(http.StatusOK, attachment.FileSize, attachment.MimeType, reader, nil)
 }
@@ -594,6 +581,8 @@ func (h *TicketContentHandler) writeError(c *gin.Context, err error) {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "code": "attachment_rejected", "message": "附件名称无效"})
 	case errors.Is(err, services.ErrInvalidAttachment):
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "code": "attachment_rejected", "message": "附件内容不能为空"})
+	case errors.Is(err, services.ErrProjectAccessDenied):
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "code": "ticket_access_denied", "message": "无权访问或修改该工单"})
 	case err.Error() == "attachment comment not found":
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "code": "invalid_request", "message": "关联评论不存在或不属于当前工单"})
 	default:

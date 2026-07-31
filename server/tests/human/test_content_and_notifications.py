@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Mapping
 
 import pytest
@@ -12,9 +13,69 @@ from tests.utils import (
     HumanIdentity,
     assert_error_contract,
     assert_no_sensitive_fields,
+    response_diagnostic,
+    safe_diagnostic,
 )
 
 pytestmark = [pytest.mark.api, pytest.mark.integration]
+
+
+def _wait_for_attachment_upload_worker(
+    e2e_manager: E2EResourceManager,
+    admin: HumanIdentity,
+    attachment_id: int,
+) -> int:
+    """Wait for durable staging migration and return the scan-command version."""
+
+    overview_path = e2e_manager.project_path("admin/agents/agent-control/overview")
+    destination = f"attachment_upload:{attachment_id}"
+    deadline = time.monotonic() + 10
+    last_state: dict[str, object] = {}
+
+    while time.monotonic() < deadline:
+        response = admin.api.get_json(overview_path)
+        assert response.status_code == 200, response_diagnostic(response)
+        data = response.json().get("data", {})
+        assert isinstance(data, dict), safe_diagnostic(data)
+        outbox = data.get("outbox", [])
+        attachments = data.get("attachments", [])
+        assert isinstance(outbox, list), safe_diagnostic(outbox)
+        assert isinstance(attachments, list), safe_diagnostic(attachments)
+
+        delivery = next(
+            (
+                row
+                for row in outbox
+                if isinstance(row, dict) and row.get("destination") == destination
+            ),
+            None,
+        )
+        attachment = next(
+            (
+                row
+                for row in attachments
+                if isinstance(row, dict) and row.get("id") == attachment_id
+            ),
+            None,
+        )
+        last_state = {
+            "delivery": delivery,
+            "attachment": attachment,
+        }
+        if isinstance(delivery, dict) and delivery.get("status") == "succeeded":
+            assert isinstance(attachment, dict), safe_diagnostic(last_state)
+            resource_version = attachment.get("resource_version")
+            assert isinstance(resource_version, int) and resource_version > 0, (
+                safe_diagnostic(last_state)
+            )
+            return resource_version
+        if isinstance(delivery, dict) and delivery.get("status") in {"failed", "dead"}:
+            raise AssertionError(
+                f"附件上传 worker 未成功完成：{safe_diagnostic(last_state)}"
+            )
+        time.sleep(0.25)
+
+    raise AssertionError(f"等待附件上传 worker 超时：{safe_diagnostic(last_state)}")
 
 
 def test_public_and_internal_comment_permissions(
@@ -184,7 +245,7 @@ def test_attachment_rejection_name_safety_and_download_authorization(
             )
         },
     )
-    assert uploaded.status_code == 201, uploaded.text
+    assert uploaded.status_code == 202, uploaded.text
     attachment = uploaded.json().get("data", {})
     attachment_id = attachment.get("id")
     assert isinstance(attachment_id, int) and attachment_id > 0, attachment
@@ -209,6 +270,33 @@ def test_attachment_rejection_name_safety_and_download_authorization(
         409,
         machine_codes={"attachment_not_clean"},
     )
+
+    attachment_resource_version = _wait_for_attachment_upload_worker(
+        e2e_manager,
+        admin,
+        attachment_id,
+    )
+    scan = admin.api.post_json(
+        e2e_manager.project_path(f"admin/agents/attachments/{attachment_id}/scan"),
+        {
+            "status": "clean",
+            "details": "E2E trusted scanner completed after upload worker finalization.",
+        },
+        headers={
+            "Idempotency-Key": e2e_manager.unique("attachment-scan"),
+            "If-Match": f'"v{attachment_resource_version}"',
+        },
+    )
+    assert scan.status_code == 200, response_diagnostic(scan)
+
+    clean_download = admin.api.get_json(
+        e2e_manager.project_path(
+            f"tickets/{ticket_id}/attachments/{attachment_id}/content"
+        )
+    )
+    assert clean_download.status_code == 200, response_diagnostic(clean_download)
+    assert clean_download.content == b"ChronoDesk attachment security evidence"
+
     owner_download = owner.api.get_json(
         e2e_manager.project_path(
             f"tickets/{ticket_id}/attachments/{attachment_id}/content"

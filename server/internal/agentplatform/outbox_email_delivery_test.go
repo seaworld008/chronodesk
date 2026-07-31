@@ -169,7 +169,7 @@ func newAuthEmailOutboxFixture(
 		Username:     "outbox-reset-user",
 		Email:        "outbox-reset@example.test",
 		PasswordHash: "test-password-hash",
-		Role:         models.RoleCustomer,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
@@ -382,7 +382,7 @@ func TestNotificationEmailOutboxRetriesFailedAttemptAndSkipsReplay(t *testing.T)
 		Username:     "notification-outbox-user",
 		Email:        "notification-outbox@example.test",
 		PasswordHash: "test-password-hash",
-		Role:         models.RoleCustomer,
+		PlatformRole: models.PlatformRoleMember,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {

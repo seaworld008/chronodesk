@@ -1,5 +1,12 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { apiRequest } from './helpers/api';
+import {
+    authorizedProjectAccess,
+    defaultMockIdentity,
+    fulfillJSON,
+    installMockSession,
+    projectA,
+} from './helpers/mockHumanSession';
 import {
     authenticatePage,
     cleanupE2EData,
@@ -18,6 +25,147 @@ import { expectChineseOperations } from './helpers/browserAudit';
 const runID = e2eRunID();
 const webhookName = `${E2E_PREFIX}${runID}-Canonical-Webhook`;
 const markerSecret = `${E2E_PREFIX}${runID}-仅用于密文测试`;
+
+const mockWebhook = {
+    id: 731,
+    name: '异步测试 Webhook',
+    description: '仅验证浏览器异步入队契约',
+    provider: 'custom',
+    webhook_url: 'https://webhook.example.test/callback',
+    status: 'active',
+    enabled_events_list: ['io.chronodesk.system.alert.v1'],
+    filter_rules_obj: { transition_statuses: [] },
+    message_format: 'markdown',
+    retry_count: 0,
+    retry_interval: 60,
+    timeout_seconds: 30,
+    is_async: true,
+    rate_limit: 60,
+    rate_limit_window: 60,
+    last_triggered_at: null,
+    last_success_at: null,
+    last_error_at: null,
+    last_error: '',
+    total_sent: 0,
+    total_success: 0,
+    total_failed: 0,
+};
+
+const installWebhookAsyncMockBackend = async (page: Page) => {
+    const access = authorizedProjectAccess(projectA, 'manager');
+    const webhooksPath = `/api/projects/${projectA.key}/webhooks`;
+    let testCalls = 0;
+
+    await page.route('**/api/**', async (route) => {
+        const request = route.request();
+        const pathname = new URL(request.url()).pathname;
+        if (pathname === '/api/projects') {
+            await fulfillJSON(route, { code: 0, data: [access] });
+            return;
+        }
+        if (pathname === webhooksPath && request.method() === 'GET') {
+            await fulfillJSON(route, {
+                code: 0,
+                data: {
+                    items: [mockWebhook],
+                    total: 1,
+                    page: 1,
+                    size: 100,
+                },
+            });
+            return;
+        }
+        if (
+            pathname === `${webhooksPath}/${mockWebhook.id}/test`
+            && request.method() === 'POST'
+        ) {
+            testCalls += 1;
+            await fulfillJSON(
+                route,
+                {
+                    code: 0,
+                    msg: 'Webhook 测试已入队',
+                    data: {
+                        operation_id: '019fb64a-38ac-7a01-8000-000000000001',
+                        event_id: '019fb64a-38ac-7a01-8000-000000000002',
+                        delivery_id: '019fb64a-38ac-7a01-8000-000000000003',
+                        snapshot_id: '019fb64a-38ac-7a01-8000-000000000004',
+                        config_id: mockWebhook.id,
+                        configuration_version:
+                            'webhook-config:731@2026-07-31T08:00:00Z',
+                        status: 'queued',
+                        queued: true,
+                        delivered: false,
+                    },
+                },
+                202,
+            );
+            return;
+        }
+        await fulfillJSON(route, { code: 0, data: [] });
+    });
+
+    return {
+        webhooksPath,
+        testCalls: () => testCalls,
+    };
+};
+
+test.describe('Webhook 测试异步入队浏览器契约（mock）', () => {
+    test('HTTP 202 queued receipt 只提示已入队并等待投递结果', async ({
+        page,
+    }) => {
+        await installMockSession(
+            page,
+            {
+                ...defaultMockIdentity,
+                sessionID: 'e2e-webhook-async-contract',
+            },
+            projectA,
+        );
+        const backend = await installWebhookAsyncMockBackend(page);
+        await page.goto('/#/webhook-settings');
+
+        const row = page.getByRole('row', { name: /异步测试 Webhook/u });
+        await expect(row).toBeVisible();
+        await row
+            .getByRole('button', { name: '测试 Webhook：异步测试 Webhook' })
+            .click();
+
+        const confirmation = page.getByRole('dialog', {
+            name: '测试 Webhook',
+            exact: true,
+        });
+        await expect(confirmation).toContainText(
+            '入队不代表发送成功，请随后查看投递日志',
+        );
+        const responsePromise = page.waitForResponse(
+            (response) =>
+                response.request().method() === 'POST'
+                && new URL(response.url()).pathname
+                    === `${backend.webhooksPath}/${mockWebhook.id}/test`,
+        );
+        await confirmation
+            .getByRole('button', { name: '确认入队', exact: true })
+            .click();
+
+        const response = await responsePromise;
+        expect(response.status()).toBe(202);
+        const payload = await response.json() as Record<string, unknown>;
+        expect(payload.code).toBe(0);
+        expect(extractData<Record<string, unknown>>(payload)).toMatchObject({
+            config_id: mockWebhook.id,
+            status: 'queued',
+            queued: true,
+            delivered: false,
+        });
+        await expect(
+            page.getByText('Webhook 测试已入队，请等待投递结果'),
+        ).toBeVisible();
+        await expect(page.getByText('Webhook 测试成功')).toHaveCount(0);
+        expect(backend.testCalls()).toBe(1);
+    });
+});
 
 test.describe('Webhook canonical CloudEvent 管理', () => {
     test.beforeAll(() => {
@@ -63,6 +211,8 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
         await form
             .getByLabel('签名密钥（可选）', { exact: true })
             .fill(markerSecret);
+        await expect(form.getByLabel('状态', { exact: true })).toHaveCount(0);
+        await form.getByLabel('最大重试', { exact: true }).fill('0');
         await expect(
             form.getByLabel('异步发送', { exact: true }),
         ).toBeVisible();
@@ -75,10 +225,16 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
         await form.getByRole('button', { name: '保存' }).click();
         const createResponse = await create;
         expect(createResponse.status()).toBe(200);
+        const createBody = createResponse.request().postDataJSON() as Record<
+            string,
+            unknown
+        >;
+        expect(createBody).not.toHaveProperty('status');
         const createdWebhook = extractData<Record<string, unknown>>(
             await createResponse.json(),
         );
         expect(typeof createdWebhook.id).toBe('number');
+        expect(createdWebhook.status).toBe('active');
         trackE2EResource('webhooks', createdWebhook.id as number);
         const row = page.getByRole('row', { name: new RegExp(webhookName) });
         await expect(row).toBeVisible({ timeout: 15_000 });
@@ -146,7 +302,7 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
             exact: true,
         });
         await expect(confirmation).toContainText(
-            `测试将立即向“${webhookName}”配置的地址发送一条真实请求，确定继续吗？`,
+            `测试会将一条真实请求加入“${webhookName}”的投递队列。入队不代表发送成功，请随后查看投递日志，确定继续吗？`,
         );
         const testResponse = page.waitForResponse(
             (response) =>
@@ -156,23 +312,43 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
         );
         await confirmation
             .getByRole('button', {
-                name: '确认发送测试',
+                name: '确认入队',
                 exact: true,
             })
             .click();
         const tested = await testResponse;
-        expect(tested.status()).toBe(200);
+        expect(tested.status()).toBe(202);
         const testPayload = await tested.json() as Record<string, unknown>;
-        expect(testPayload.code).toBe(1);
-        expect(extractData<Record<string, unknown>>(testPayload).status).toBe(
-            'failed',
-        );
+        expect(testPayload.code).toBe(0);
+        expect(testPayload.msg).toBe('Webhook 测试已入队');
+        const queuedReceipt =
+            extractData<Record<string, unknown>>(testPayload);
+        expect(queuedReceipt).toMatchObject({
+            config_id: webhook!.id,
+            status: 'queued',
+            queued: true,
+            delivered: false,
+        });
+        for (
+            const field of [
+                'operation_id',
+                'event_id',
+                'delivery_id',
+                'snapshot_id',
+                'configuration_version',
+            ]
+        ) {
+            expect(queuedReceipt[field]).toEqual(expect.any(String));
+            expect((queuedReceipt[field] as string).length).toBeGreaterThan(0);
+        }
         await expect(
-            page.getByText(/测试失败|webhook目标地址未通过安全校验/i),
+            page.getByText('Webhook 测试已入队，请等待投递结果'),
         ).toBeVisible({ timeout: 10_000 });
+        await expect(page.getByText('Webhook 测试成功')).toHaveCount(0);
         await expectChineseOperations(page);
 
         let logs: Record<string, unknown>[] = [];
+        let finalLog: Record<string, unknown> | undefined;
         await expect
             .poll(
                 async () => {
@@ -182,16 +358,27 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
                         `${webhooksPath}/${webhook!.id}/logs?page=1&page_size=20`,
                     );
                     logs = extractItems<Record<string, unknown>>(logsResponse);
-                    return logs.length;
+                    finalLog = logs.find(
+                        (entry) =>
+                            entry.event_type
+                                === 'io.chronodesk.system.alert.v1'
+                            && ['success', 'failed'].includes(
+                                String(entry.status),
+                            ),
+                    );
+                    return finalLog?.status ?? 'waiting';
                 },
                 {
-                    message: 'Webhook 测试失败日志应在项目作用域内持久化',
-                    timeout: 10_000,
+                    message:
+                        'Webhook worker 应在提交后执行投递并持久化最终日志',
+                    timeout: 15_000,
                 },
             )
-            .toBeGreaterThan(0);
-        expect(logs[0].event_type).toBe('io.chronodesk.system.alert.v1');
-        expect(logs[0].status).toBe('failed');
+            .toBe('failed');
+        expect(finalLog?.event_type).toBe(
+            'io.chronodesk.system.alert.v1',
+        );
+        expect(finalLog?.status).toBe('failed');
         expect(JSON.stringify(logs)).not.toContain(markerSecret);
     });
 });

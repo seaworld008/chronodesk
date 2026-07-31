@@ -51,11 +51,17 @@ import {
   type ResizableColumn,
 } from '../../components/tables/EnterpriseTable'
 import { resolveActiveProjectKey } from '../../lib/projectScope'
-
-const resolveAgentAdminPath = async (): Promise<string> => {
-  const projectKey = await resolveActiveProjectKey()
-  return `/projects/${encodeURIComponent(projectKey)}/admin/agents`
-}
+import {
+  humanApiRoutes,
+  type AdminAgentPolicy,
+  type AdminOutboxDeliverySummary,
+  type AdminOverview,
+  type AdminServicePrincipalSummary,
+  type AdminTicketLeaseSummary,
+  type AgentPolicyCreate,
+  type IssuedCredential,
+  type ServicePrincipalCreate,
+} from '../../lib/generated/human-api'
 
 const AVAILABLE_SCOPES = [
   'tickets:read',
@@ -115,116 +121,25 @@ const policyAuditColumns: ResizableColumn[] = [
   { key: 'decision', defaultWidth: 160, minWidth: 112, maxWidth: 240 },
 ]
 
-type PrincipalStatus = 'active' | 'inactive' | 'revoked'
-
-interface ServicePrincipal {
-  id: string
-  client_id: string
-  name: string
-  description?: string
-  status: PrincipalStatus
-  scopes: string[]
-  rate_limit: number
-  concurrency_limit: number
-  last_used_at?: string
-  expires_at?: string
-  created_at: string
-  read_only: boolean
-  emergency_disabled: boolean
-  resource_version: number
-}
-
-interface TicketLease {
-  id: string
-  ticket_id: number
-  ticket_number?: string
-  principal_name: string
-  acquired_at: string
-  expires_at: string
-  ticket_version: number
-  resource_version: number
-}
-
-interface DomainEvent {
-  id: string
-  type: string
-  subject: string
-  actor_type: string
-  actor_id?: string
-  resource_version: number
-  time: string
-}
-
-interface OutboxDelivery {
-  id: string
-  event_id: string
-  destination: string
-  status: string
-  attempts: number
-  next_attempt_at?: string
-  last_error?: string
-  updated_at: string
-  resource_version: number
-}
-
-interface PolicyDecision {
-  id: string
-  created_at: string
-  actor_id: string
-  credential_id?: string
-  scope: string
-  action: string
-  resource_type: string
-  resource_id: string
-  allowed: boolean
-  reason_code: string
-  source_protocol: string
-  request_digest?: string
-}
-
-interface AgentPolicy {
-  id: string
-  name: string
-  effect: 'allow' | 'deny'
-  scope: string
-  action?: string
-  resource_type?: string
-  resource_id?: string
-  is_active: boolean
-  resource_version: number
-}
-
-interface AgentControlSnapshot {
-  global_read_only: boolean
-  emergency_stop: boolean
-  principals: ServicePrincipal[]
-  leases: TicketLease[]
-  events: DomainEvent[]
-  outbox: OutboxDelivery[]
-  policy_decisions: PolicyDecision[]
-}
-
-interface CreatePrincipalForm {
-  name: string
-  description: string
-  scopes: string[]
-  rate_limit: number
-  concurrency_limit: number
-}
-
-interface CredentialResult {
-  client_id: string
-  client_secret: string
-  expires_at?: string
-}
-
-interface PolicyForm {
-  effect: 'allow' | 'deny'
-  scope: string
-  action: string
-  resource_type: string
-  resource_id: string
-}
+type PrincipalStatus = AdminServicePrincipalSummary['status']
+type ServicePrincipal = AdminServicePrincipalSummary
+type TicketLease = AdminTicketLeaseSummary
+type OutboxDelivery = AdminOutboxDeliverySummary
+type AgentPolicy = AdminAgentPolicy
+type AgentControlSnapshot = AdminOverview
+type CreatePrincipalForm = Required<
+  Pick<
+    ServicePrincipalCreate,
+    'name' | 'description' | 'scopes' | 'rate_limit' | 'concurrency_limit'
+  >
+>
+type CredentialResult = IssuedCredential
+type PolicyForm = Required<
+  Pick<
+    AgentPolicyCreate,
+    'effect' | 'scope' | 'action' | 'resource_type' | 'resource_id'
+  >
+>
 
 interface ConfirmationRequest {
   title: string
@@ -250,7 +165,7 @@ const initialPolicyForm: PolicyForm = {
   resource_id: '',
 }
 
-const formatDate = (value?: string) => {
+const formatDate = (value?: string | null) => {
   if (!value) return '—'
   const parsed = new Date(value)
   return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString('zh-CN')
@@ -500,15 +415,19 @@ const AgentControlCenter: React.FC = () => {
     setLoading(true)
     setError('')
     try {
-      const agentAdminPath = await resolveAgentAdminPath()
-      const result = await apiFetch<AgentControlSnapshot>(`${agentAdminPath}/agent-control/overview`)
+      const projectKey = await resolveActiveProjectKey()
+      const result = await apiFetch<AgentControlSnapshot>(
+        humanApiRoutes.getAgentControlOverviewV2({ projectKey }),
+      )
       const normalized: AgentControlSnapshot = {
+        ...result,
         global_read_only: Boolean(result.global_read_only),
         emergency_stop: Boolean(result.emergency_stop),
         principals: result.principals ?? [],
         leases: result.leases ?? [],
         events: result.events ?? [],
         outbox: result.outbox ?? [],
+        attachments: result.attachments ?? [],
         policy_decisions: result.policy_decisions ?? [],
       }
       setSnapshot(normalized)
@@ -544,15 +463,18 @@ const AgentControlCenter: React.FC = () => {
 
     setSubmitting(true)
     try {
-      const agentAdminPath = await resolveAgentAdminPath()
-      const result = await adminWrite<CredentialResult>(`${agentAdminPath}/service-principals`, {
+      const projectKey = await resolveActiveProjectKey()
+      const result = await adminWrite<CredentialResult>(
+        humanApiRoutes.createServicePrincipalV2({ projectKey }),
+        {
         method: 'POST',
         body: JSON.stringify({
           ...createForm,
           name: createForm.name.trim(),
           description: createForm.description.trim(),
         }),
-      })
+        },
+      )
       setCredential(result)
       setCreateOpen(false)
       setCreateForm(initialCreateForm)
@@ -568,9 +490,12 @@ const AgentControlCenter: React.FC = () => {
   const rotateCredential = async (principal: ServicePrincipal) => {
     setSubmitting(true)
     try {
-      const agentAdminPath = await resolveAgentAdminPath()
+      const projectKey = await resolveActiveProjectKey()
       const result = await adminWrite<CredentialResult>(
-        `${agentAdminPath}/service-principals/${principal.id}/credentials/rotate`,
+        humanApiRoutes.rotateServicePrincipalCredentialV2({
+          projectKey,
+          principalId: principal.id,
+        }),
         { method: 'POST' },
         principal.resource_version,
       )
@@ -587,8 +512,11 @@ const AgentControlCenter: React.FC = () => {
   const togglePrincipal = async (principal: ServicePrincipal) => {
     const nextStatus: PrincipalStatus = principal.status === 'active' ? 'inactive' : 'active'
     try {
-      const agentAdminPath = await resolveAgentAdminPath()
-      await adminWrite(`${agentAdminPath}/service-principals/${principal.id}/status`, {
+      const projectKey = await resolveActiveProjectKey()
+      await adminWrite(humanApiRoutes.setServicePrincipalStatusV2({
+        projectKey,
+        principalId: principal.id,
+      }), {
         method: 'PUT',
         body: JSON.stringify({ status: nextStatus }),
       }, principal.resource_version)
@@ -601,8 +529,11 @@ const AgentControlCenter: React.FC = () => {
 
   const togglePrincipalEmergency = async (principal: ServicePrincipal) => {
     try {
-      const agentAdminPath = await resolveAgentAdminPath()
-      await adminWrite(`${agentAdminPath}/service-principals/${principal.id}/status`, {
+      const projectKey = await resolveActiveProjectKey()
+      await adminWrite(humanApiRoutes.setServicePrincipalStatusV2({
+        projectKey,
+        principalId: principal.id,
+      }), {
         method: 'PUT',
         body: JSON.stringify({ emergency_disabled: !principal.emergency_disabled }),
       }, principal.resource_version)
@@ -619,8 +550,13 @@ const AgentControlCenter: React.FC = () => {
     setPolicyPrincipal(principal)
     setPolicyForm(initialPolicyForm)
     try {
-      const agentAdminPath = await resolveAgentAdminPath()
-      const result = await apiFetch<AgentPolicy[]>(`${agentAdminPath}/service-principals/${principal.id}/policies`)
+      const projectKey = await resolveActiveProjectKey()
+      const result = await apiFetch<AgentPolicy[]>(
+        humanApiRoutes.listServicePrincipalPoliciesV2({
+          projectKey,
+          principalId: principal.id,
+        }),
+      )
       setPolicies(result ?? [])
     } catch (requestError) {
       notify(localizedUnknownErrorMessage(requestError, '策略加载失败'), { type: 'error' })
@@ -631,12 +567,20 @@ const AgentControlCenter: React.FC = () => {
     if (!policyPrincipal) return
     setSubmitting(true)
     try {
-      const agentAdminPath = await resolveAgentAdminPath()
-      await adminWrite(`${agentAdminPath}/service-principals/${policyPrincipal.id}/policies`, {
+      const projectKey = await resolveActiveProjectKey()
+      await adminWrite(humanApiRoutes.createServicePrincipalPolicyV2({
+        projectKey,
+        principalId: policyPrincipal.id,
+      }), {
         method: 'POST',
         body: JSON.stringify(policyForm),
       }, policyPrincipal.resource_version)
-      const result = await apiFetch<AgentPolicy[]>(`${agentAdminPath}/service-principals/${policyPrincipal.id}/policies`)
+      const result = await apiFetch<AgentPolicy[]>(
+        humanApiRoutes.listServicePrincipalPoliciesV2({
+          projectKey,
+          principalId: policyPrincipal.id,
+        }),
+      )
       setPolicies(result ?? [])
       setPolicyForm(initialPolicyForm)
       const refreshed = await loadSnapshot()
@@ -653,8 +597,12 @@ const AgentControlCenter: React.FC = () => {
   const disablePolicy = async (policy: AgentPolicy) => {
     if (!policyPrincipal) return
     try {
-      const agentAdminPath = await resolveAgentAdminPath()
-      await adminWrite(`${agentAdminPath}/service-principals/${policyPrincipal.id}/policies/${policy.id}`, {
+      const projectKey = await resolveActiveProjectKey()
+      await adminWrite(humanApiRoutes.disableServicePrincipalPolicyV2({
+        projectKey,
+        principalId: policyPrincipal.id,
+        policyId: policy.id,
+      }), {
         method: 'DELETE',
       }, policy.resource_version)
       setPolicies(policies.map((item) => (item.id === policy.id ? { ...item, is_active: false } : item)))
@@ -666,9 +614,12 @@ const AgentControlCenter: React.FC = () => {
 
   const forceReleaseLease = async (lease: TicketLease) => {
     try {
-      const agentAdminPath = await resolveAgentAdminPath()
+      const projectKey = await resolveActiveProjectKey()
       await adminWrite(
-        `${agentAdminPath}/leases/${lease.id}/force-release`,
+        humanApiRoutes.forceReleaseTicketLeaseV2({
+          projectKey,
+          leaseId: lease.id,
+        }),
         { method: 'POST' },
         lease.resource_version,
       )
@@ -681,9 +632,12 @@ const AgentControlCenter: React.FC = () => {
 
   const replayDelivery = async (delivery: OutboxDelivery) => {
     try {
-      const agentAdminPath = await resolveAgentAdminPath()
+      const projectKey = await resolveActiveProjectKey()
       await adminWrite(
-        `${agentAdminPath}/outbox/${delivery.id}/replay`,
+        humanApiRoutes.replayOutboxDeliveryV2({
+          projectKey,
+          deliveryId: delivery.id,
+        }),
         { method: 'POST' },
         delivery.resource_version,
       )
@@ -1286,7 +1240,10 @@ const AgentControlCenter: React.FC = () => {
                 multiple
                 label="权限范围（Scope）"
                 value={createForm.scopes}
-                onChange={(event) => setCreateForm({ ...createForm, scopes: event.target.value as string[] })}
+                onChange={(event) => setCreateForm({
+                  ...createForm,
+                  scopes: event.target.value as CreatePrincipalForm['scopes'],
+                })}
                 renderValue={(selected) => selected.join(', ')}
               >
                 {AVAILABLE_SCOPES.map((scope) => (

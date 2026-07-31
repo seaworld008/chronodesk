@@ -95,14 +95,5 @@ test.describe('通知中心', () => {
         });
         expect(legacyList.status()).toBe(404);
 
-        // 空负载保证旧创建路由意外存在时也不会产生通知。
-        const legacyAdminCreate = await request.post(
-            '/api/admin/notifications',
-            {
-                headers,
-                data: {},
-            },
-        );
-        expect(legacyAdminCreate.status()).toBe(404);
     });
 });

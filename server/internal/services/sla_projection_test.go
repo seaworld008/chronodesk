@@ -27,7 +27,7 @@ func TestSLAProjectionUnifiesBackgroundRESTAndDashboards(t *testing.T) {
 		Username:     "sla-projection-admin",
 		Email:        "sla-projection-admin@example.com",
 		PasswordHash: "hash",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&admin).Error; err != nil {
@@ -78,6 +78,13 @@ func TestSLAProjectionUnifiesBackgroundRESTAndDashboards(t *testing.T) {
 		t.Fatalf("create SLA projection tickets: %v", err)
 	}
 	ctx := testProjectOperationContext(t, db, models.HumanActor(admin.ID))
+	ensureTestHumanProjectRole(
+		t,
+		db,
+		ctx,
+		admin.ID,
+		models.ProjectRoleAdmin,
+	)
 
 	ticketService := newTicketServiceForTest(t, db)
 	before, beforeTotal, err := ticketService.GetSLABreachedTickets(
@@ -200,7 +207,7 @@ func TestTicketMutationRefreshesSLAProjectionInDomainTransaction(t *testing.T) {
 		Username:     "sla-mutation-actor",
 		Email:        "sla-mutation-actor@example.com",
 		PasswordHash: "hash",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&actor).Error; err != nil {
@@ -234,6 +241,13 @@ func TestTicketMutationRefreshesSLAProjectionInDomainTransaction(t *testing.T) {
 	now := time.Date(2026, time.August, 3, 10, 0, 0, 0, location)
 	native := NewAgentNativeService(db, AgentNativeOptions{Now: func() time.Time { return now }})
 	ctx := testProjectOperationContext(t, db, models.HumanActor(actor.ID))
+	ensureTestHumanProjectRole(
+		t,
+		db,
+		ctx,
+		actor.ID,
+		models.ProjectRoleAdmin,
+	)
 	created, err := native.CreateNativeTicket(ctx, NativeTicketCreateInput{
 		Request: models.TicketCreateRequest{
 			Title:       "SLA mutation projection",

@@ -28,7 +28,7 @@ test.describe('System Settings', () => {
         assertDestructiveE2EAllowed('系统安全配置 E2E');
         assertGlobalE2EAllowed('系统安全配置 E2E');
         const token = await getAdminToken(request);
-        await apiRequest(request, token, '/api/admin/configs', {
+        await apiRequest(request, token, '/api/platform/configs', {
             method: 'POST',
             data: {
                 key: configKey,
@@ -53,7 +53,7 @@ test.describe('System Settings', () => {
         await apiRequest(
             request,
             token,
-            `/api/admin/configs/${encodeURIComponent(configKey)}`,
+            `/api/platform/configs/${encodeURIComponent(configKey)}`,
             { method: 'DELETE' },
         );
     });
@@ -90,7 +90,7 @@ test.describe('System Settings', () => {
                 (response) =>
                     response.request().method() === 'PUT' &&
                     new URL(response.url()).pathname ===
-                        `/api/admin/configs/${key}`,
+                        `/api/platform/configs/${key}`,
             );
             await row
                 .getByRole('button', {

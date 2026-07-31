@@ -403,6 +403,12 @@ func (provider *HTTPModelGatewayProvider) post(
 	payload any,
 	destination any,
 ) error {
+	if err := requireExternalIOOutsideProjectTransaction(
+		ctx,
+		"model Gateway HTTP "+operation,
+	); err != nil {
+		return err
+	}
 	encoded, err := json.Marshal(payload)
 	if err != nil ||
 		int64(len(encoded)) > provider.maxRequestBytes {

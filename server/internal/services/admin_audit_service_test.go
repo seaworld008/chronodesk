@@ -26,7 +26,7 @@ func TestAdminAuditLifecyclePersistsAnchorBeforeFinalization(t *testing.T) {
 		Username:     "audit-admin",
 		Email:        "audit-admin@example.com",
 		PasswordHash: "hash",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&admin).Error; err != nil {
@@ -34,14 +34,14 @@ func TestAdminAuditLifecyclePersistsAnchorBeforeFinalization(t *testing.T) {
 	}
 	service := NewAdminAuditService(db)
 	record := &AdminAuditRecord{
-		UserID:     &admin.ID,
-		Role:       string(admin.Role),
-		Action:     "POST /api/admin/users",
-		Method:     "POST",
-		Path:       "/api/admin/users",
-		StatusCode: 0,
-		Result:     "pending",
-		Notes:      "管理员写操作已进入执行阶段",
+		UserID:       &admin.ID,
+		PlatformRole: admin.PlatformRole,
+		Action:       "POST /api/admin/users",
+		Method:       "POST",
+		Path:         "/api/admin/users",
+		StatusCode:   0,
+		Result:       "pending",
+		Notes:        "管理员写操作已进入执行阶段",
 	}
 	if err := service.Record(context.Background(), record); err != nil {
 		t.Fatalf("Record() error = %v", err)

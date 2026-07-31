@@ -14,6 +14,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -21,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -74,6 +76,15 @@ const (
 	// the configured AttachmentStorage. The destination identifier contains an
 	// attachment ID and a hash of its storage key, never a path or URL.
 	AttachmentCleanupOutboxDestination = "attachment_cleanup"
+	// AttachmentUploadOutboxDestination copies a committed inbound staging
+	// object into managed attachment storage. Its destination ID is only the
+	// numeric Attachment record ID; staging and storage paths remain private.
+	AttachmentUploadOutboxDestination = "attachment_upload"
+	// AttachmentStagingCleanupOutboxDestination is registered before inbound
+	// bytes are staged. If the process dies before the final attachment
+	// transaction commits, its delayed worker can claim the durable intent,
+	// delete the staged object and remove the placeholder row.
+	AttachmentStagingCleanupOutboxDestination = "attachment_staging_cleanup"
 	// AttachmentCleanupObjectsDataField is persisted only for Outbox recovery.
 	// CloudEventFromModel removes it from every externally serialized envelope.
 	AttachmentCleanupObjectsDataField = "_attachment_cleanup_objects"
@@ -112,6 +123,8 @@ func AgentNativeErrorCode(err error) string {
 	case errors.Is(err, ErrCredentialExpired):
 		return "credential_expired"
 	case errors.Is(err, ErrPolicyDenied):
+		return "policy_denied"
+	case errors.Is(err, ErrProjectAccessDenied):
 		return "policy_denied"
 	case errors.Is(err, ErrGlobalEmergencyStop):
 		return "agent_emergency_stop"
@@ -242,6 +255,7 @@ type AgentNativeOptions struct {
 	MaxLeaseTTL                time.Duration
 	IdempotencyProcessingLease time.Duration
 	AttachmentStorage          AttachmentStorage
+	AttachmentStaging          AttachmentStagingStore
 	AttachmentMaxBytes         int64
 	OutboxLockTTL              time.Duration
 	OutboxDeliveryTimeout      time.Duration
@@ -272,6 +286,7 @@ type AgentNativeService struct {
 	maxLeaseTTL                time.Duration
 	idempotencyProcessingLease time.Duration
 	attachmentStorage          AttachmentStorage
+	attachmentStaging          AttachmentStagingStore
 	attachmentMaxBytes         int64
 	outboxLockTTL              time.Duration
 	outboxDeliveryTimeout      time.Duration
@@ -403,6 +418,7 @@ func NewAgentNativeService(db *gorm.DB, provided ...AgentNativeOptions) *AgentNa
 		maxLeaseTTL:                options.MaxLeaseTTL,
 		idempotencyProcessingLease: options.IdempotencyProcessingLease,
 		attachmentStorage:          options.AttachmentStorage,
+		attachmentStaging:          options.AttachmentStaging,
 		attachmentMaxBytes:         options.AttachmentMaxBytes,
 		outboxLockTTL:              options.OutboxLockTTL,
 		outboxDeliveryTimeout:      options.OutboxDeliveryTimeout,
@@ -791,9 +807,6 @@ type CreateAgentPolicyInput struct {
 }
 
 func (s *AgentNativeService) CreateAgentPolicy(ctx context.Context, input CreateAgentPolicyInput) (*models.AgentPolicy, error) {
-	if _, err := s.GetServicePrincipal(ctx, input.ServicePrincipalID); err != nil {
-		return nil, err
-	}
 	if input.Effect != models.AgentPolicyEffectAllow && input.Effect != models.AgentPolicyEffectDeny {
 		return nil, fmt.Errorf("invalid policy effect %q", input.Effect)
 	}
@@ -823,10 +836,142 @@ func (s *AgentNativeService) CreateAgentPolicy(ctx context.Context, input Create
 	if policy.Name == "" {
 		policy.Name = string(policy.Effect) + " " + policy.Scope
 	}
-	if err := s.dbForContext(ctx).Create(policy).Error; err != nil {
+	err = s.InTransaction(
+		ctx,
+		func(txCtx context.Context, tx *gorm.DB) error {
+			var principal models.ServicePrincipal
+			if lockErr := tx.WithContext(txCtx).
+				Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ?", input.ServicePrincipalID).
+				Take(&principal).Error; lockErr != nil {
+				if errors.Is(lockErr, gorm.ErrRecordNotFound) {
+					return ErrPrincipalNotFound
+				}
+				return lockErr
+			}
+			if createErr := tx.WithContext(txCtx).
+				Create(policy).Error; createErr != nil {
+				return createErr
+			}
+			currentEpoch := principal.PolicyEpoch
+			if currentEpoch == 0 {
+				currentEpoch = 1
+			}
+			update := tx.WithContext(txCtx).
+				Model(&models.ServicePrincipal{}).
+				Where(
+					"id = ? AND policy_epoch = ?",
+					principal.ID,
+					principal.PolicyEpoch,
+				).
+				Updates(map[string]any{
+					"policy_epoch": currentEpoch + 1,
+					"updated_at":   s.now().UTC(),
+				})
+			if update.Error != nil {
+				return update.Error
+			}
+			if update.RowsAffected != 1 {
+				return ErrPolicyDenied
+			}
+			return nil
+		},
+	)
+	if err != nil {
 		return nil, fmt.Errorf("create agent policy: %w", err)
 	}
 	return policy, nil
+}
+
+func (s *AgentNativeService) SetAgentPolicyActive(
+	ctx context.Context,
+	principalID string,
+	policyID string,
+	active bool,
+) (*models.AgentPolicy, error) {
+	principalID = strings.TrimSpace(principalID)
+	policyID = strings.TrimSpace(policyID)
+	if s == nil || s.db == nil ||
+		principalID == "" ||
+		policyID == "" {
+		return nil, ErrPrincipalNotFound
+	}
+	var policy models.AgentPolicy
+	err := s.InTransaction(
+		ctx,
+		func(txCtx context.Context, tx *gorm.DB) error {
+			var principal models.ServicePrincipal
+			if lockErr := tx.WithContext(txCtx).
+				Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ?", principalID).
+				Take(&principal).Error; lockErr != nil {
+				if errors.Is(lockErr, gorm.ErrRecordNotFound) {
+					return ErrPrincipalNotFound
+				}
+				return lockErr
+			}
+			if lockErr := tx.WithContext(txCtx).
+				Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where(
+					"id = ? AND service_principal_id = ?",
+					policyID,
+					principalID,
+				).
+				Take(&policy).Error; lockErr != nil {
+				return lockErr
+			}
+			if policy.IsActive == active {
+				return nil
+			}
+			now := s.now().UTC()
+			updatePolicy := tx.WithContext(txCtx).
+				Model(&models.AgentPolicy{}).
+				Where(
+					"id = ? AND service_principal_id = ? AND is_active = ?",
+					policy.ID,
+					principalID,
+					policy.IsActive,
+				).
+				Updates(map[string]any{
+					"is_active":  active,
+					"updated_at": now,
+				})
+			if updatePolicy.Error != nil {
+				return updatePolicy.Error
+			}
+			if updatePolicy.RowsAffected != 1 {
+				return ErrPolicyDenied
+			}
+			currentEpoch := principal.PolicyEpoch
+			if currentEpoch == 0 {
+				currentEpoch = 1
+			}
+			updatePrincipal := tx.WithContext(txCtx).
+				Model(&models.ServicePrincipal{}).
+				Where(
+					"id = ? AND policy_epoch = ?",
+					principal.ID,
+					principal.PolicyEpoch,
+				).
+				Updates(map[string]any{
+					"policy_epoch": currentEpoch + 1,
+					"updated_at":   now,
+				})
+			if updatePrincipal.Error != nil {
+				return updatePrincipal.Error
+			}
+			if updatePrincipal.RowsAffected != 1 {
+				return ErrPolicyDenied
+			}
+			policy.IsActive = active
+			policy.UpdatedAt = now
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &policy, nil
 }
 
 type PolicyCheckInput struct {
@@ -993,15 +1138,30 @@ func (s *AgentNativeService) CheckActionInShortProjectTransactions(
 		)
 	}
 
-	var prepared *preparedPolicyCheck
+	var (
+		prepared      *preparedPolicyCheck
+		initialAccess *ProjectAccess
+	)
 	if err := s.RunProjectOperation(
 		ctx,
 		func(scopedContext context.Context) error {
+			var revalidateErr error
+			initialAccess, revalidateErr =
+				s.RevalidatePrincipalProjectOperation(
+					scopedContext,
+				)
+			if revalidateErr != nil {
+				return revalidateErr
+			}
 			var prepareErr error
 			prepared, prepareErr = s.preparePolicyCheck(
 				scopedContext,
 				input,
 			)
+			if prepareErr == nil &&
+				!projectAccessHasScope(initialAccess, input.Scope) {
+				denyPreparedPolicyForMissingGrantScope(prepared)
+			}
 			return prepareErr
 		},
 	); err != nil {
@@ -1017,6 +1177,22 @@ func (s *AgentNativeService) CheckActionInShortProjectTransactions(
 	transactionErr := s.RunProjectOperation(
 		ctx,
 		func(scopedContext context.Context) error {
+			currentAccess, revalidateErr :=
+				s.RevalidatePrincipalProjectOperation(
+					scopedContext,
+				)
+			if revalidateErr != nil {
+				return revalidateErr
+			}
+			if initialAccess == nil ||
+				!initialAccess.AuthorizationSnapshot.Matches(
+					currentAccess.AuthorizationSnapshot,
+				) {
+				return ErrProjectAccessDenied
+			}
+			if !projectAccessHasScope(currentAccess, input.Scope) {
+				denyPreparedPolicyForMissingGrantScope(prepared)
+			}
 			var persistErr error
 			decision, persistErr = s.persistPreparedPolicyCheck(
 				scopedContext,
@@ -1035,6 +1211,30 @@ func (s *AgentNativeService) CheckActionInShortProjectTransactions(
 		return nil, transactionErr
 	}
 	return decision, outcomeErr
+}
+
+func projectAccessHasScope(access *ProjectAccess, required string) bool {
+	if access == nil || strings.TrimSpace(required) == "" {
+		return false
+	}
+	for _, scope := range access.Scopes {
+		if scope == required {
+			return true
+		}
+	}
+	return false
+}
+
+func denyPreparedPolicyForMissingGrantScope(
+	prepared *preparedPolicyCheck,
+) {
+	if prepared == nil {
+		return
+	}
+	prepared.decision.Allowed = false
+	prepared.decision.ReasonCode = "scope_not_granted"
+	prepared.decision.MatchedPolicyID = ""
+	prepared.guardRequired = false
 }
 
 func (s *AgentNativeService) preparePolicyCheck(
@@ -1126,6 +1326,7 @@ func (s *AgentNativeService) preparePolicyCheck(
 			Allowed:            allowed,
 			ReasonCode:         reason,
 			MatchedPolicyID:    matchedPolicyID,
+			PolicyEpoch:        principal.PolicyEpoch,
 			RequestDigest:      input.RequestDigest,
 			SourceProtocol:     input.SourceProtocol,
 			Context:            datatypes.JSON(contextJSON),
@@ -1305,12 +1506,6 @@ func (s *AgentNativeService) loadMatchingPolicyDecision(
 	if err != nil {
 		return nil, err
 	}
-	if !principal.HasScope(input.Scope) {
-		return nil, fmt.Errorf(
-			"%w: scope is no longer granted",
-			ErrPolicyDenied,
-		)
-	}
 	if input.CredentialID != "" {
 		if err := s.ValidateCredentialReference(ctx, input.ServicePrincipalID, input.CredentialID); err != nil {
 			return nil, err
@@ -1362,6 +1557,33 @@ func (s *AgentNativeService) loadMatchingPolicyDecision(
 	if s.now().Sub(decision.CreatedAt) > 5*time.Minute {
 		return nil, fmt.Errorf(
 			"%w: policy decision expired",
+			ErrPolicyDenied,
+		)
+	}
+	if decision.PolicyEpoch == 0 ||
+		principal.PolicyEpoch != decision.PolicyEpoch {
+		return nil, fmt.Errorf(
+			"%w: policy set changed after authorization",
+			ErrPolicyDenied,
+		)
+	}
+	if decision.Allowed &&
+		decision.IsWrite &&
+		!scopeddb.HasTransaction(ctx) {
+		return nil, fmt.Errorf(
+			"%w: allowed write decision requires a live project transaction",
+			ErrPolicyDenied,
+		)
+	}
+	// A denied decision is a conservative outcome, not authority. In
+	// particular, optional external notifications deliberately persist a
+	// scope_not_granted denial when the principal lacks events:subscribe.
+	// Requiring that absent scope before loading the denial would incorrectly
+	// fail the primary business command. Allowed decisions still fail closed
+	// if the principal has since lost the scope.
+	if decision.Allowed && !principal.HasScope(input.Scope) {
+		return nil, fmt.Errorf(
+			"%w: scope is no longer granted",
 			ErrPolicyDenied,
 		)
 	}
@@ -1422,17 +1644,33 @@ func policyMatches(policy *models.AgentPolicy, input PolicyCheckInput) bool {
 // Redis outage fails closed instead of silently creating one bucket per
 // process. The returned release function is safe to call more than once.
 func (s *AgentNativeService) AcquireAgentExecution(ctx context.Context, principalID string) (func(), error) {
+	_, release, err := s.AcquireAgentExecutionContext(
+		ctx,
+		principalID,
+	)
+	return release, err
+}
+
+// AcquireAgentExecutionContext returns the context that every admitted
+// command must use. Distributed permits are renewed while the command is
+// active; a lost renewal cancels this context so external I/O and database
+// work fail closed instead of continuing after the Redis concurrency lease
+// expires.
+func (s *AgentNativeService) AcquireAgentExecutionContext(
+	ctx context.Context,
+	principalID string,
+) (context.Context, func(), error) {
 	principal, err := s.getUsablePrincipal(ctx, principalID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if s.globalEmergencyStop.Load() {
-		return nil, ErrGlobalEmergencyStop
+		return nil, nil, ErrGlobalEmergencyStop
 	}
 	if !s.executionGuardReady() {
-		return nil, ErrExecutionGuardUnavailable
+		return nil, nil, ErrExecutionGuardUnavailable
 	}
-	return s.acquireAgentExecutionSubject(
+	return s.acquireAgentExecutionSubjectContext(
 		ctx,
 		principalID,
 		principal.RateLimitPerMinute,
@@ -1558,6 +1796,105 @@ func (s *AgentNativeService) acquireAgentExecutionSubject(
 	}, nil
 }
 
+func (s *AgentNativeService) acquireAgentExecutionSubjectContext(
+	ctx context.Context,
+	subjectID string,
+	rateLimit int,
+	concurrencyLimit int,
+	concurrencyTTL time.Duration,
+) (context.Context, func(), error) {
+	permit, err := s.executionGuard.Acquire(
+		ctx,
+		AgentExecutionGuardRequest{
+			SubjectID:         subjectID,
+			RateLimit:         rateLimit,
+			ConcurrencyLimit:  concurrencyLimit,
+			ConcurrencyTTL:    concurrencyTTL,
+			ObservedAtForTest: s.now(),
+		},
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	leaseContext, cancelLease := context.WithCancelCause(ctx)
+	stopRenewal := make(chan struct{})
+	renewer, canRenew := s.executionGuard.(AgentExecutionPermitRenewer)
+	if s.requireDistributedGuard && !canRenew {
+		_ = s.executionGuard.Release(ctx, permit)
+		cancelLease(ErrExecutionGuardUnavailable)
+		return nil, nil, ErrExecutionGuardUnavailable
+	}
+	if canRenew {
+		interval := concurrencyTTL / 3
+		if interval < 250*time.Millisecond {
+			interval = 250 * time.Millisecond
+		}
+		if interval > 30*time.Second {
+			interval = 30 * time.Second
+		}
+		go func() {
+			timer := time.NewTicker(interval)
+			defer timer.Stop()
+			for {
+				select {
+				case <-stopRenewal:
+					return
+				case <-leaseContext.Done():
+					return
+				case <-timer.C:
+					timeout := concurrencyTTL / 4
+					if timeout < 100*time.Millisecond {
+						timeout = 100 * time.Millisecond
+					}
+					if timeout > 3*time.Second {
+						timeout = 3 * time.Second
+					}
+					renewContext, cancelRenew :=
+						context.WithTimeout(
+							context.WithoutCancel(ctx),
+							timeout,
+						)
+					renewErr := renewer.Renew(
+						renewContext,
+						AgentExecutionRenewRequest{
+							Permit:            permit,
+							ConcurrencyTTL:    concurrencyTTL,
+							ObservedAtForTest: s.now(),
+						},
+					)
+					cancelRenew()
+					if renewErr != nil {
+						cancelLease(fmt.Errorf(
+							"%w: %v",
+							ErrExecutionGuardUnavailable,
+							renewErr,
+						))
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			close(stopRenewal)
+			cancelLease(context.Canceled)
+			releaseCtx, cancelRelease := context.WithTimeout(
+				context.WithoutCancel(ctx),
+				3*time.Second,
+			)
+			defer cancelRelease()
+			_ = s.executionGuard.Release(
+				releaseCtx,
+				permit,
+			)
+		})
+	}
+	return leaseContext, release, nil
+}
+
 // ValidateExecutionGuardConfiguration is a startup gate for production
 // wiring. It intentionally does not probe Redis; database.New already performs
 // that connectivity check before constructing the guard.
@@ -1579,6 +1916,55 @@ type IdempotencyReservation struct {
 }
 
 func (s *AgentNativeService) ReserveIdempotency(
+	ctx context.Context,
+	actor models.ActorRef,
+	operation string,
+	key string,
+	requestBody []byte,
+	ttl time.Duration,
+) (*IdempotencyReservation, error) {
+	boundTransaction, hasAgentNativeTransaction :=
+		ctx.Value(agentNativeTransactionContextKey{}).(*gorm.DB)
+	hasAgentNativeTransaction =
+		hasAgentNativeTransaction && boundTransaction != nil
+	if !scopeddb.HasTransaction(ctx) &&
+		!hasAgentNativeTransaction {
+		if operationContext, contextErr :=
+			OperationContextFromContext(ctx); contextErr == nil &&
+			operationContext.Actor == actor &&
+			!operationContext.Scope.IsZero() {
+			var reservation *IdempotencyReservation
+			err := runProjectOperation(
+				ctx,
+				s.db,
+				func(scopedContext context.Context) error {
+					var reserveErr error
+					reservation, reserveErr =
+						s.reserveIdempotencyScoped(
+							scopedContext,
+							actor,
+							operation,
+							key,
+							requestBody,
+							ttl,
+						)
+					return reserveErr
+				},
+			)
+			return reservation, err
+		}
+	}
+	return s.reserveIdempotencyScoped(
+		ctx,
+		actor,
+		operation,
+		key,
+		requestBody,
+		ttl,
+	)
+}
+
+func (s *AgentNativeService) reserveIdempotencyScoped(
 	ctx context.Context,
 	actor models.ActorRef,
 	operation string,
@@ -1842,10 +2228,35 @@ func (s *AgentNativeService) storeIdempotencySnapshotTx(
 }
 
 func (s *AgentNativeService) FailIdempotency(ctx context.Context, recordID string, code string) error {
+	if !scopeddb.HasTransaction(ctx) {
+		if operation, contextErr :=
+			OperationContextFromContext(ctx); contextErr == nil &&
+			!operation.Scope.IsZero() {
+			return runProjectOperation(
+				ctx,
+				s.db,
+				func(scopedContext context.Context) error {
+					return s.failIdempotencyScoped(
+						scopedContext,
+						recordID,
+						code,
+					)
+				},
+			)
+		}
+	}
+	return s.failIdempotencyScoped(ctx, recordID, code)
+}
+
+func (s *AgentNativeService) failIdempotencyScoped(
+	ctx context.Context,
+	recordID string,
+	code string,
+) error {
 	now := s.now()
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), idempotencyFailureCleanupTimeout)
 	defer cancel()
-	result := s.db.WithContext(cleanupCtx).Model(&models.IdempotencyRecord{}).
+	result := s.dbForContext(cleanupCtx).Model(&models.IdempotencyRecord{}).
 		Where("id = ? AND state = ?", recordID, models.IdempotencyStateProcessing).
 		Updates(map[string]any{
 			"state":           models.IdempotencyStateFailed,
@@ -1857,6 +2268,81 @@ func (s *AgentNativeService) FailIdempotency(ctx context.Context, recordID strin
 		return fmt.Errorf("fail idempotency key: %w", result.Error)
 	}
 	return nil
+}
+
+// FinalizeRevokedActorIdempotency closes a processing reservation after the
+// caller's live project Grant has been revoked. It runs as a narrowly scoped
+// system finalizer and can update only the exact project, actor and record that
+// created the reservation; it never restores business authorization.
+func (s *AgentNativeService) FinalizeRevokedActorIdempotency(
+	ctx context.Context,
+	scope models.ProjectScope,
+	actor models.ActorRef,
+	recordID string,
+	code string,
+) error {
+	if s == nil || s.db == nil {
+		return errors.New("idempotency finalizer is unavailable")
+	}
+	if err := scope.Validate(); err != nil {
+		return err
+	}
+	if err := actor.Validate(); err != nil ||
+		actor.Type != models.ActorTypeServicePrincipal {
+		return ErrInvalidActor
+	}
+	recordID = strings.TrimSpace(recordID)
+	code = strings.TrimSpace(code)
+	if recordID == "" || code == "" {
+		return errors.New("idempotency finalizer record and code are required")
+	}
+	cleanupCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		idempotencyFailureCleanupTimeout,
+	)
+	defer cancel()
+	systemContext, err := WithOperationContext(
+		cleanupCtx,
+		OperationContext{
+			Scope:  scope,
+			Actor:  models.SystemActor("agent-idempotency-finalizer"),
+			Source: SourceProtocolWorker,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	now := s.now()
+	return runProjectOperation(
+		systemContext,
+		s.db,
+		func(scopedContext context.Context) error {
+			result := s.dbForContext(scopedContext).
+				Model(&models.IdempotencyRecord{}).
+				Where(
+					"id = ? AND organization_id = ? AND project_id = ? AND actor_type = ? AND actor_id = ? AND state = ?",
+					recordID,
+					scope.OrganizationID,
+					scope.ProjectID,
+					actor.Type,
+					actor.ID,
+					models.IdempotencyStateProcessing,
+				).
+				Updates(map[string]any{
+					"state":           models.IdempotencyStateFailed,
+					"last_error_code": code,
+					"completed_at":    now,
+					"updated_at":      now,
+				})
+			if result.Error != nil {
+				return fmt.Errorf(
+					"finalize revoked actor idempotency: %w",
+					result.Error,
+				)
+			}
+			return nil
+		},
+	)
 }
 
 type DomainEventInput struct {
@@ -1940,6 +2426,7 @@ func publicCloudEventData(raw json.RawMessage, actor models.ActorRef) json.RawMe
 		return append(json.RawMessage(nil), raw...)
 	}
 	delete(object, AttachmentCleanupObjectsDataField)
+	delete(object, AttachmentUploadMigrationDataField)
 	actorData, err := json.Marshal(actor)
 	if err != nil {
 		return json.RawMessage(`{}`)
@@ -2312,6 +2799,24 @@ func (s *AgentNativeService) ClaimPendingOutbox(
 	limit int,
 	lockTTL time.Duration,
 ) ([]*models.OutboxDelivery, error) {
+	return s.claimPendingOutbox(
+		ctx,
+		workerID,
+		limit,
+		lockTTL,
+		archivedProjectOutboxDestinations(),
+		archivedProjectOutboxEventTypes(),
+	)
+}
+
+func (s *AgentNativeService) claimPendingOutbox(
+	ctx context.Context,
+	workerID string,
+	limit int,
+	lockTTL time.Duration,
+	archivedAllowedDestinations []string,
+	archivedAllowedEventTypes []string,
+) ([]*models.OutboxDelivery, error) {
 	if strings.TrimSpace(workerID) == "" {
 		return nil, fmt.Errorf("worker id is required")
 	}
@@ -2331,6 +2836,44 @@ func (s *AgentNativeService) ClaimPendingOutbox(
 	if err != nil {
 		return nil, err
 	}
+	applyAllowlist := func(query *gorm.DB) *gorm.DB {
+		if len(archivedAllowedDestinations) == 0 &&
+			len(archivedAllowedEventTypes) == 0 {
+			return query
+		}
+		const allowedEventExists = `
+			destination_type = ?
+			AND EXISTS (
+				SELECT 1
+				FROM domain_events AS allowed_event
+				WHERE allowed_event.id = outbox_deliveries.event_id
+				  AND allowed_event.organization_id =
+					outbox_deliveries.organization_id
+				  AND allowed_event.project_id =
+					outbox_deliveries.project_id
+				  AND allowed_event.type IN ?
+			)
+		`
+		if len(archivedAllowedDestinations) == 0 {
+			return query.Where(
+				"("+allowedEventExists+")",
+				"event_stream",
+				archivedAllowedEventTypes,
+			)
+		}
+		if len(archivedAllowedEventTypes) == 0 {
+			return query.Where(
+				"destination_type IN ?",
+				archivedAllowedDestinations,
+			)
+		}
+		return query.Where(
+			"(destination_type IN ? OR ("+allowedEventExists+"))",
+			archivedAllowedDestinations,
+			"event_stream",
+			archivedAllowedEventTypes,
+		)
+	}
 	err = runSystemProjectOperation(
 		ctx,
 		s.db,
@@ -2343,10 +2886,62 @@ func (s *AgentNativeService) ClaimPendingOutbox(
 				projectCtx,
 				s.db,
 				func(tx *gorm.DB) error {
-					var candidates []models.OutboxDelivery
+					var project models.Project
 					if err := tx.
+						Select("id", "organization_id", "status").
+						Clauses(clause.Locking{Strength: "SHARE"}).
 						Where(
-							"organization_id = ? AND project_id = ? AND ((status IN ? AND next_attempt_at <= ?) OR (status = ? AND locked_at < ?))",
+							"id = ? AND organization_id = ?",
+							operation.Scope.ProjectID,
+							operation.Scope.OrganizationID,
+						).
+						Take(&project).Error; err != nil {
+						return fmt.Errorf(
+							"lock outbox project status: %w",
+							err,
+						)
+					}
+					if project.Status != models.ProjectStatusActive &&
+						project.Status != models.ProjectStatusArchived {
+						return ErrProjectInactive
+					}
+					applyCurrentProjectPolicy := func(
+						query *gorm.DB,
+					) *gorm.DB {
+						if project.Status !=
+							models.ProjectStatusArchived {
+							return query
+						}
+						return applyAllowlist(query)
+					}
+					var candidates []models.OutboxDelivery
+					candidateQuery := tx.Where(
+						"organization_id = ? AND project_id = ? AND ((status IN ? AND next_attempt_at <= ?) OR (status = ? AND locked_at < ?))",
+						operation.Scope.OrganizationID,
+						operation.Scope.ProjectID,
+						[]models.OutboxDeliveryStatus{
+							models.OutboxDeliveryPending,
+							models.OutboxDeliveryFailed,
+						},
+						now,
+						models.OutboxDeliveryProcessing,
+						lockCutoff,
+					)
+					candidateQuery =
+						applyCurrentProjectPolicy(candidateQuery)
+					if err := candidateQuery.
+						Order("next_attempt_at ASC, created_at ASC").
+						Limit(limit).
+						Find(&candidates).Error; err != nil {
+						return err
+					}
+					for index := range candidates {
+						candidate := &candidates[index]
+						updateQuery := tx.Model(
+							&models.OutboxDelivery{},
+						).Where(
+							"id = ? AND organization_id = ? AND project_id = ? AND ((status IN ? AND next_attempt_at <= ?) OR (status = ? AND locked_at < ?))",
+							candidate.ID,
 							operation.Scope.OrganizationID,
 							operation.Scope.ProjectID,
 							[]models.OutboxDeliveryStatus{
@@ -2356,28 +2951,10 @@ func (s *AgentNativeService) ClaimPendingOutbox(
 							now,
 							models.OutboxDeliveryProcessing,
 							lockCutoff,
-						).
-						Order("next_attempt_at ASC, created_at ASC").
-						Limit(limit).
-						Find(&candidates).Error; err != nil {
-						return err
-					}
-					for index := range candidates {
-						candidate := &candidates[index]
-						result := tx.Model(&models.OutboxDelivery{}).
-							Where(
-								"id = ? AND organization_id = ? AND project_id = ? AND ((status IN ? AND next_attempt_at <= ?) OR (status = ? AND locked_at < ?))",
-								candidate.ID,
-								operation.Scope.OrganizationID,
-								operation.Scope.ProjectID,
-								[]models.OutboxDeliveryStatus{
-									models.OutboxDeliveryPending,
-									models.OutboxDeliveryFailed,
-								},
-								now,
-								models.OutboxDeliveryProcessing,
-								lockCutoff,
-							).
+						)
+						updateQuery =
+							applyCurrentProjectPolicy(updateQuery)
+						result := updateQuery.
 							Updates(map[string]any{
 								"status":     models.OutboxDeliveryProcessing,
 								"attempts":   gorm.Expr("attempts + 1"),
@@ -2669,6 +3246,83 @@ type OutboxBatchResult struct {
 	Dead      int
 }
 
+type outboxWorkerProject struct {
+	Scope models.ProjectScope
+	Key   models.ProjectKey
+}
+
+func archivedProjectOutboxDestinations() []string {
+	return []string{
+		AttachmentStagingCleanupOutboxDestination,
+		AttachmentCleanupOutboxDestination,
+		AttachmentUploadOutboxDestination,
+	}
+}
+
+func archivedProjectOutboxEventTypes() []string {
+	return []string{
+		ProjectMembershipDeactivatedEventType,
+		UserAccessRevokedEventType,
+		ProjectAccessRevokedEventType,
+	}
+}
+
+func outboxWorkerProjects(
+	ctx context.Context,
+	db *gorm.DB,
+	actor models.ActorRef,
+) ([]outboxWorkerProject, error) {
+	if ctx == nil || db == nil ||
+		actor != models.SystemActor(outboxSystemActorID) {
+		return nil, ErrSystemWorkerContext
+	}
+	query := db.WithContext(ctx).
+		Select("id", "organization_id", "key", "status").
+		Where(
+			"status IN ?",
+			[]models.ProjectStatus{
+				models.ProjectStatusActive,
+				models.ProjectStatusArchived,
+			},
+		)
+	if operation, err := OperationContextFromContext(ctx); err == nil {
+		if operation.Actor != actor ||
+			operation.Source != SourceProtocolWorker {
+			return nil, ErrSystemWorkerContext
+		}
+		query = query.Where(
+			"id = ? AND organization_id = ?",
+			operation.Scope.ProjectID,
+			operation.Scope.OrganizationID,
+		)
+	}
+	var projects []models.Project
+	if err := query.
+		Order("organization_id ASC, id ASC").
+		Limit(maxSystemWorkerProjects + 1).
+		Find(&projects).Error; err != nil {
+		return nil, fmt.Errorf(
+			"list outbox worker projects: %w",
+			err,
+		)
+	}
+	if len(projects) > maxSystemWorkerProjects {
+		return nil, ErrSystemWorkerProjectLimit
+	}
+	result := make([]outboxWorkerProject, 0, len(projects))
+	for index := range projects {
+		scope := projects[index].Scope()
+		if err := scope.Validate(); err != nil {
+			return nil, err
+		}
+		result = append(result, outboxWorkerProject{
+			Scope: scope,
+			Key:   projects[index].Key,
+		})
+	}
+	return result, nil
+}
+
 func (s *AgentNativeService) ProcessOutboxBatch(
 	ctx context.Context,
 	workerID string,
@@ -2686,7 +3340,7 @@ func (s *AgentNativeService) ProcessOutboxBatch(
 		limit = 200
 	}
 	actor := models.SystemActor(outboxSystemActorID)
-	projects, err := systemWorkerProjects(ctx, s.db, actor)
+	projects, err := outboxWorkerProjects(ctx, s.db, actor)
 	if err != nil {
 		return result, err
 	}
@@ -2714,11 +3368,14 @@ func (s *AgentNativeService) ProcessOutboxBatch(
 			if contextErr != nil {
 				return result, contextErr
 			}
-			claimed, claimErr := s.ClaimPendingOutbox(
+			var claimed []*models.OutboxDelivery
+			claimed, claimErr := s.claimPendingOutbox(
 				projectCtx,
 				workerID,
 				limit-len(deliveries),
 				s.outboxLockTTL,
+				archivedProjectOutboxDestinations(),
+				archivedProjectOutboxEventTypes(),
 			)
 			if claimErr != nil {
 				return result, fmt.Errorf(
@@ -3047,18 +3704,14 @@ func (s *AgentNativeService) claimTicketLeaseOnDB(
 	if expectedVersion == 0 {
 		return nil, fmt.Errorf("%w: expected version is required", ErrVersionConflict)
 	}
-	now := s.now()
 	var claimed *models.TicketLease
 	err = transactionForContext(ctx, db, func(tx *gorm.DB) error {
-		var ticket models.Ticket
-		if err := tx.Select("id", "version", "organization_id", "project_id").
-			Where(
-				"id = ? AND organization_id = ? AND project_id = ?",
-				ticketID,
-				projectScope.OrganizationID,
-				projectScope.ProjectID,
-			).
-			First(&ticket).Error; err != nil {
+		ticket, err := lockTicketForLeaseTx(
+			tx.WithContext(ctx),
+			projectScope,
+			ticketID,
+		)
+		if err != nil {
 			return err
 		}
 		if ticket.Version != expectedVersion {
@@ -3066,13 +3719,20 @@ func (s *AgentNativeService) claimTicketLeaseOnDB(
 		}
 
 		var lease models.TicketLease
-		err := tx.Where(
-			"organization_id = ? AND project_id = ? AND ticket_id = ?",
-			projectScope.OrganizationID,
-			projectScope.ProjectID,
-			ticketID,
-		).First(&lease).Error
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		leaseErr := tx.WithContext(ctx).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where(
+				"organization_id = ? AND project_id = ? AND ticket_id = ?",
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+				ticketID,
+			).
+			First(&lease).Error
+		// Lease expiry must be evaluated only after the final revocable row has
+		// been locked. Otherwise a waiter can revive a lease that expired while
+		// another transaction held the row.
+		now := s.now()
+		if errors.Is(leaseErr, gorm.ErrRecordNotFound) {
 			lease = models.TicketLease{
 				ID:              newNativeID(),
 				OrganizationID:  projectScope.OrganizationID,
@@ -3093,8 +3753,8 @@ func (s *AgentNativeService) claimTicketLeaseOnDB(
 			claimed = &lease
 			return nil
 		}
-		if err != nil {
-			return err
+		if leaseErr != nil {
+			return leaseErr
 		}
 
 		if lease.IsActive(now) {
@@ -3199,33 +3859,35 @@ func (s *AgentNativeService) heartbeatTicketLeaseOnDB(
 	if err != nil {
 		return nil, err
 	}
-	now := s.now()
+	ticketID, err := ticketIDForLease(
+		ctx,
+		db,
+		projectScope,
+		leaseID,
+	)
+	if err != nil {
+		return nil, err
+	}
 	var lease models.TicketLease
 	err = transactionForContext(ctx, db, func(tx *gorm.DB) error {
-		if err := tx.Where(
-			"id = ? AND organization_id = ? AND project_id = ?",
+		ticket, lockedLease, lockErr := lockTicketLeaseTx(
+			tx.WithContext(ctx),
+			projectScope,
+			ticketID,
 			leaseID,
-			projectScope.OrganizationID,
-			projectScope.ProjectID,
-		).First(&lease).Error; err != nil {
-			return err
+		)
+		if lockErr != nil {
+			return lockErr
 		}
+		lease = *lockedLease
+		// Sample the clock after Ticket and Lease are both locked so a lease
+		// cannot be revived after expiring behind either lock.
+		now := s.now()
 		if lease.HolderActorType != actor.Type || lease.HolderActorID != actor.ID {
 			return ErrLeaseNotOwned
 		}
 		if !lease.IsActive(now) {
 			return ErrLeaseExpired
-		}
-		var ticket models.Ticket
-		if err := tx.Select("id", "version").
-			Where(
-				"id = ? AND organization_id = ? AND project_id = ?",
-				lease.TicketID,
-				projectScope.OrganizationID,
-				projectScope.ProjectID,
-			).
-			First(&ticket).Error; err != nil {
-			return err
 		}
 		if expectedVersion == 0 || ticket.Version != expectedVersion || lease.TicketVersion != expectedVersion {
 			return fmt.Errorf("%w: expected %d, actual %d", ErrVersionConflict, expectedVersion, ticket.Version)
@@ -3265,71 +3927,89 @@ func (s *AgentNativeService) releaseTicketLeaseOnDB(
 	leaseID string,
 	actor models.ActorRef,
 	reason string,
-) error {
+) (*models.TicketLease, error) {
 	projectScope, err := commandProjectScope(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := actor.Validate(); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidActor, err)
+		return nil, fmt.Errorf("%w: %v", ErrInvalidActor, err)
 	}
-	now := s.now()
-	query := db.WithContext(ctx).Model(&models.TicketLease{}).Where(
-		"organization_id = ? AND project_id = ?",
-		projectScope.OrganizationID,
-		projectScope.ProjectID,
+	ticketID, err := ticketIDForLease(
+		ctx,
+		db,
+		projectScope,
+		leaseID,
 	)
-	if actor.Type == models.ActorTypeSystem {
-		query = query.Where("id = ? AND released_at IS NULL", leaseID)
-	} else {
-		query = query.Where(
-			"id = ? AND holder_actor_type = ? AND holder_actor_id = ? AND released_at IS NULL",
+	if err != nil {
+		return nil, err
+	}
+	var released models.TicketLease
+	err = transactionForContext(ctx, db, func(tx *gorm.DB) error {
+		_, lease, lockErr := lockTicketLeaseTx(
+			tx.WithContext(ctx),
+			projectScope,
+			ticketID,
 			leaseID,
-			actor.Type,
-			actor.ID,
 		)
-	}
-	result := query.Updates(map[string]any{
-		"released_at":    now,
-		"release_reason": truncateText(strings.TrimSpace(reason), 255),
-		"updated_at":     now,
-	})
-	if result.Error != nil {
-		return fmt.Errorf("release ticket lease: %w", result.Error)
-	}
-	if result.RowsAffected == 0 {
-		var lease models.TicketLease
-		if err := db.WithContext(ctx).Where(
-			"id = ? AND organization_id = ? AND project_id = ?",
-			leaseID,
-			projectScope.OrganizationID,
-			projectScope.ProjectID,
-		).First(&lease).Error; err != nil {
-			return err
+		if lockErr != nil {
+			return lockErr
 		}
+		released = *lease
 		if actor.Type != models.ActorTypeSystem &&
 			(lease.HolderActorType != actor.Type || lease.HolderActorID != actor.ID) {
 			return ErrLeaseNotOwned
 		}
-		return ErrLeaseExpired
+		if lease.ReleasedAt != nil {
+			return ErrLeaseExpired
+		}
+		now := s.now()
+		releaseReason := truncateText(strings.TrimSpace(reason), 255)
+		result := tx.WithContext(ctx).
+			Model(&models.TicketLease{}).
+			Where(
+				"id = ? AND organization_id = ? AND project_id = ? AND released_at IS NULL",
+				leaseID,
+				projectScope.OrganizationID,
+				projectScope.ProjectID,
+			).
+			Updates(map[string]any{
+				"released_at":    now,
+				"release_reason": releaseReason,
+				"updated_at":     now,
+			})
+		if result.Error != nil {
+			return fmt.Errorf("release ticket lease: %w", result.Error)
+		}
+		if result.RowsAffected != 1 {
+			return ErrLeaseExpired
+		}
+		released.ReleasedAt = &now
+		released.ReleaseReason = releaseReason
+		released.UpdatedAt = now
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	return &released, nil
 }
 
 type ClaimTicketLeaseCommandInput struct {
-	TicketID            uint
-	Actor               models.ActorRef
-	ExpectedVersion     uint64
-	TTL                 time.Duration
-	CredentialID        string
-	PolicyDecisionID    string
-	SourceProtocol      string
-	RequestDigest       string
-	IdempotencyRecordID string
-	TraceID             string
-	CorrelationID       string
-	CausationID         string
-	OutboxTargets       []OutboxTarget
+	TicketID                             uint
+	Actor                                models.ActorRef
+	ExpectedVersion                      uint64
+	TTL                                  time.Duration
+	CredentialID                         string
+	PolicyDecisionID                     string
+	ExternalNotificationPolicyDecisionID string
+	SourceProtocol                       string
+	RequestDigest                        string
+	IdempotencyRecordID                  string
+	TraceID                              string
+	CorrelationID                        string
+	CausationID                          string
+	OutboxTargets                        []OutboxTarget
 }
 
 type HeartbeatTicketLeaseCommandInput struct {
@@ -3576,17 +4256,19 @@ func (s *AgentNativeService) ReleaseTicketLeaseCommand(
 	}
 	var event *models.DomainEvent
 	var receipt OperationReceipt
-	var lease models.TicketLease
+	var lease *models.TicketLease
 	err = transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
-		if err := tx.First(&lease, "id = ?", input.LeaseID).Error; err != nil {
-			return err
+		var releaseErr error
+		lease, releaseErr = s.releaseTicketLeaseOnDB(
+			ctx,
+			tx,
+			input.LeaseID,
+			input.Actor,
+			input.Reason,
+		)
+		if releaseErr != nil {
+			return releaseErr
 		}
-		if err := s.releaseTicketLeaseOnDB(ctx, tx, input.LeaseID, input.Actor, input.Reason); err != nil {
-			return err
-		}
-		now := s.now()
-		lease.ReleasedAt = &now
-		lease.ReleaseReason = truncateText(input.Reason, 255)
 		var appendErr error
 		event, appendErr = s.AppendDomainEventWithAdditionalTargetsTx(ctx, tx, DomainEventInput{
 			Type:            "io.chronodesk.ticket.lease.released.v1",
@@ -3606,7 +4288,7 @@ func (s *AgentNativeService) ReleaseTicketLeaseCommand(
 		if appendErr != nil {
 			return appendErr
 		}
-		receipt = leaseOperationReceipt(&lease, event, policyDecisionID)
+		receipt = leaseOperationReceipt(lease, event, policyDecisionID)
 		if input.IdempotencyRecordID != "" {
 			if err := s.CompleteIdempotencyTx(
 				ctx,
@@ -3623,7 +4305,7 @@ func (s *AgentNativeService) ReleaseTicketLeaseCommand(
 				ctx,
 				tx,
 				input.IdempotencyRecordID,
-				leaseSnapshot(&lease),
+				leaseSnapshot(lease),
 			); err != nil {
 				return err
 			}
@@ -3633,7 +4315,7 @@ func (s *AgentNativeService) ReleaseTicketLeaseCommand(
 	if err != nil {
 		return nil, err
 	}
-	return &TicketLeaseCommandResult{Lease: &lease, Event: event, Receipt: receipt}, nil
+	return &TicketLeaseCommandResult{Lease: lease, Event: event, Receipt: receipt}, nil
 }
 
 func (s *AgentNativeService) authorizeLeaseCommand(
@@ -3719,6 +4401,94 @@ func leaseSnapshot(lease *models.TicketLease) map[string]any {
 	}
 }
 
+func ticketIDForLease(
+	ctx context.Context,
+	db *gorm.DB,
+	scope models.ProjectScope,
+	leaseID string,
+) (uint, error) {
+	if db == nil {
+		return 0, errors.New("ticket lease database is required")
+	}
+	var identity struct {
+		TicketID uint
+	}
+	if err := db.WithContext(ctx).
+		Model(&models.TicketLease{}).
+		Select("ticket_id").
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			leaseID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		Take(&identity).Error; err != nil {
+		return 0, err
+	}
+	return identity.TicketID, nil
+}
+
+func lockTicketForLeaseTx(
+	tx *gorm.DB,
+	scope models.ProjectScope,
+	ticketID uint,
+) (*models.Ticket, error) {
+	if tx == nil {
+		return nil, errors.New("ticket lease transaction is required")
+	}
+	var ticket models.Ticket
+	if err := tx.
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Select(
+			"id",
+			"version",
+			"organization_id",
+			"project_id",
+			"created_by_id",
+			"assigned_to_id",
+		).
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ?",
+			ticketID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		First(&ticket).Error; err != nil {
+		return nil, err
+	}
+	return &ticket, nil
+}
+
+// lockTicketLeaseTx is the one row-lock order for every lease lifecycle and
+// lease-consuming command: Ticket first, then Lease. Callers may perform
+// non-locking identity reads before this helper, but no mutation or time-based
+// decision is allowed until both rows are locked.
+func lockTicketLeaseTx(
+	tx *gorm.DB,
+	scope models.ProjectScope,
+	ticketID uint,
+	leaseID string,
+) (*models.Ticket, *models.TicketLease, error) {
+	ticket, err := lockTicketForLeaseTx(tx, scope, ticketID)
+	if err != nil {
+		return nil, nil, err
+	}
+	var lease models.TicketLease
+	if err := tx.
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"id = ? AND ticket_id = ? AND organization_id = ? AND project_id = ?",
+			leaseID,
+			ticketID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		First(&lease).Error; err != nil {
+		return nil, nil, err
+	}
+	return ticket, &lease, nil
+}
+
 func (s *AgentNativeService) validateTicketLeaseTx(
 	tx *gorm.DB,
 	leaseID string,
@@ -3726,23 +4496,40 @@ func (s *AgentNativeService) validateTicketLeaseTx(
 	actor models.ActorRef,
 	expectedVersion uint64,
 ) (*models.TicketLease, error) {
-	var lease models.TicketLease
-	if err := tx.First(&lease, "id = ? AND ticket_id = ?", leaseID, ticketID).Error; err != nil {
+	if tx == nil {
+		return nil, errors.New("ticket lease transaction is required")
+	}
+	scope, err := commandProjectScope(tx.Statement.Context)
+	if err != nil {
+		return nil, err
+	}
+	ticket, lease, err := lockTicketLeaseTx(
+		tx,
+		scope,
+		ticketID,
+		leaseID,
+	)
+	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, ErrLeaseConflict
 		}
 		return nil, err
 	}
+	// The final revocable row is now locked. Sampling earlier lets an operation
+	// queued behind a Lease lock use a stale pre-expiry timestamp.
+	now := s.now()
 	if lease.HolderActorType != actor.Type || lease.HolderActorID != actor.ID {
 		return nil, ErrLeaseNotOwned
 	}
-	if !lease.IsActive(s.now()) {
+	if !lease.IsActive(now) {
 		return nil, ErrLeaseExpired
 	}
-	if expectedVersion == 0 || lease.TicketVersion != expectedVersion {
+	if expectedVersion == 0 ||
+		ticket.Version != expectedVersion ||
+		lease.TicketVersion != expectedVersion {
 		return nil, fmt.Errorf("%w: lease version %d, expected %d", ErrVersionConflict, lease.TicketVersion, expectedVersion)
 	}
-	return &lease, nil
+	return lease, nil
 }
 
 type OperationReceipt struct {
@@ -3864,10 +4651,6 @@ func (s *AgentNativeService) CreateNativeTicket(
 			assignedActor.ID != models.HumanActor(*input.Request.AssignedToID).ID) {
 		return nil, fmt.Errorf("%w: assigned actor conflicts with assigned_to_id", ErrInvalidAssignee)
 	}
-	assignmentChanges, err := s.ResolveTicketAssignmentChanges(ctx, assignedActor)
-	if err != nil {
-		return nil, err
-	}
 	if input.Actor.Type == models.ActorTypeServicePrincipal {
 		if status != models.TicketStatusOpen ||
 			assignedActor != nil ||
@@ -3884,6 +4667,10 @@ func (s *AgentNativeService) CreateNativeTicket(
 				ErrCommandScopeMismatch,
 			)
 		}
+	}
+	assignmentChanges, err := s.ResolveTicketAssignmentChanges(ctx, assignedActor)
+	if err != nil {
+		return nil, err
 	}
 
 	policyDecisionID := input.PolicyDecisionID
@@ -4901,6 +5688,25 @@ type AttachmentStorage interface {
 	Delete(ctx context.Context, key string) error
 }
 
+// AttachmentStagingStore durably buffers an authenticated inbound body before
+// the business transaction persists its upload intent. Only the Outbox worker
+// may copy a staged object into AttachmentStorage after that transaction
+// commits.
+type AttachmentStagingStore interface {
+	Stage(
+		ctx context.Context,
+		key string,
+		reader io.Reader,
+		maxBytes int64,
+	) (*StoredAttachmentObject, error)
+	OpenStaged(ctx context.Context, key string) (io.ReadCloser, error)
+	DeleteStaged(ctx context.Context, key string) error
+}
+
+type attachmentStorageTyper interface {
+	AttachmentStorageType() string
+}
+
 type StoredAttachmentObject struct {
 	Key                 string
 	Size                int64
@@ -4912,6 +5718,11 @@ type LocalAttachmentStorage struct {
 	root string
 }
 
+// NewLocalAttachmentStorage configures an operator-owned storage root. Child
+// access uses os.Root for every operation, so untrusted object keys cannot
+// escape through traversal or symlinks. The configured root tree and its
+// ancestors remain an operator boundary: they must not be mutable by an
+// untrusted same-UID process or redirected with mounts while the service runs.
 func NewLocalAttachmentStorage(root string) (*LocalAttachmentStorage, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, fmt.Errorf("attachment root is required")
@@ -4923,6 +5734,13 @@ func NewLocalAttachmentStorage(root string) (*LocalAttachmentStorage, error) {
 	if err := os.MkdirAll(absolute, 0o700); err != nil {
 		return nil, fmt.Errorf("create attachment root: %w", err)
 	}
+	storageRoot, err := os.OpenRoot(absolute)
+	if err != nil {
+		return nil, fmt.Errorf("open attachment root: %w", err)
+	}
+	if err := storageRoot.Close(); err != nil {
+		return nil, fmt.Errorf("close attachment root: %w", err)
+	}
 	return &LocalAttachmentStorage{root: absolute}, nil
 }
 
@@ -4932,31 +5750,77 @@ func (s *LocalAttachmentStorage) Put(
 	reader io.Reader,
 	maxBytes int64,
 ) (*StoredAttachmentObject, error) {
+	if err := requireExternalIOOutsideProjectTransaction(
+		ctx,
+		"local attachment write",
+	); err != nil {
+		return nil, err
+	}
 	if reader == nil {
 		return nil, fmt.Errorf("attachment reader is required")
 	}
 	if maxBytes <= 0 {
 		return nil, ErrAttachmentTooLarge
 	}
-	path, err := s.resolve(key)
+	normalizedKey, err := normalizeLocalAttachmentKey(key)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	storageRoot, err := s.openRoot()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = storageRoot.Close()
+	}()
+	relativePath := filepath.FromSlash(normalizedKey)
+	parentsExist, err := verifyLocalAttachmentParents(
+		storageRoot,
+		normalizedKey,
+		true,
+	)
+	if err != nil {
+		return nil, err
+	}
+	parentPath := filepath.Dir(relativePath)
+	if !parentsExist && parentPath != "." {
+		if err := storageRoot.MkdirAll(parentPath, 0o700); err != nil {
+			return nil, fmt.Errorf("create attachment directory: %w", err)
+		}
+	}
+	if _, err := verifyLocalAttachmentParents(
+		storageRoot,
+		normalizedKey,
+		false,
+	); err != nil {
 		return nil, fmt.Errorf("create attachment directory: %w", err)
 	}
-	temp, err := os.CreateTemp(filepath.Dir(path), ".upload-*")
+	// The partial path is derived from the durable target key. A hard process
+	// crash can therefore be recovered by the staging-intent sweeper or by a
+	// retry of the same outbox delivery; random .upload-* names would be
+	// undiscoverable after restart.
+	tempPath := relativePath + ".partial"
+	if err := removeLocalAttachmentRegularFileIfExists(
+		storageRoot,
+		tempPath,
+	); err != nil {
+		return nil, fmt.Errorf(
+			"remove stale attachment partial: %w",
+			err,
+		)
+	}
+	temp, err := storageRoot.OpenFile(
+		tempPath,
+		os.O_CREATE|os.O_EXCL|os.O_WRONLY,
+		0o600,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("create attachment temp file: %w", err)
 	}
-	tempPath := temp.Name()
 	defer func() {
 		_ = temp.Close()
-		_ = os.Remove(tempPath)
+		_ = storageRoot.Remove(tempPath)
 	}()
-	if err := temp.Chmod(0o600); err != nil {
-		return nil, err
-	}
 
 	hash := sha256.New()
 	var size int64
@@ -4999,80 +5863,319 @@ func (s *LocalAttachmentStorage) Put(
 	if err := temp.Close(); err != nil {
 		return nil, err
 	}
-	if err := os.Rename(tempPath, path); err != nil {
+	if _, err := inspectLocalAttachmentRegularFile(
+		storageRoot,
+		relativePath,
+		true,
+	); err != nil {
+		return nil, err
+	}
+	if err := storageRoot.Rename(tempPath, relativePath); err != nil {
 		return nil, fmt.Errorf("commit attachment: %w", err)
 	}
 	return &StoredAttachmentObject{
-		Key:                 filepath.ToSlash(key),
+		Key:                 normalizedKey,
 		Size:                size,
 		SHA256:              hex.EncodeToString(hash.Sum(nil)),
 		DetectedContentType: http.DetectContentType(sample),
 	}, nil
 }
 
+func (s *LocalAttachmentStorage) AttachmentStorageType() string {
+	return "local"
+}
+
+func (s *LocalAttachmentStorage) Stage(
+	ctx context.Context,
+	key string,
+	reader io.Reader,
+	maxBytes int64,
+) (*StoredAttachmentObject, error) {
+	if !validAttachmentStagingKey(key) {
+		return nil, ErrInvalidAttachmentName
+	}
+	return s.Put(ctx, key, reader, maxBytes)
+}
+
+func (s *LocalAttachmentStorage) OpenStaged(
+	ctx context.Context,
+	key string,
+) (io.ReadCloser, error) {
+	if !validAttachmentStagingKey(key) {
+		return nil, ErrInvalidAttachmentName
+	}
+	return s.Open(ctx, key)
+}
+
+func (s *LocalAttachmentStorage) DeleteStaged(
+	ctx context.Context,
+	key string,
+) error {
+	if !validAttachmentStagingKey(key) {
+		return ErrInvalidAttachmentName
+	}
+	return s.Delete(ctx, key)
+}
+
 func (s *LocalAttachmentStorage) Open(ctx context.Context, key string) (io.ReadCloser, error) {
+	if err := requireExternalIOOutsideProjectTransaction(
+		ctx,
+		"local attachment read",
+	); err != nil {
+		return nil, err
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	path, err := s.resolve(key)
+	normalizedKey, err := normalizeLocalAttachmentKey(key)
 	if err != nil {
 		return nil, err
 	}
-	file, err := os.Open(path)
+	storageRoot, err := s.openRoot()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = storageRoot.Close()
+	}()
+	if _, err := verifyLocalAttachmentParents(
+		storageRoot,
+		normalizedKey,
+		false,
+	); err != nil {
+		return nil, err
+	}
+	relativePath := filepath.FromSlash(normalizedKey)
+	if _, err := inspectLocalAttachmentRegularFile(
+		storageRoot,
+		relativePath,
+		false,
+	); err != nil {
+		return nil, err
+	}
+	// Non-blocking open prevents a same-UID filesystem race from replacing the
+	// inspected regular file with a FIFO and hanging a request. Regular files
+	// ignore O_NONBLOCK; the descriptor is checked again before it is returned.
+	file, err := storageRoot.OpenFile(
+		relativePath,
+		os.O_RDONLY|syscall.O_NONBLOCK,
+		0,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("open attachment: %w", err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("stat opened attachment: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		_ = file.Close()
+		return nil, ErrInvalidAttachmentName
 	}
 	return file, nil
 }
 
 func (s *LocalAttachmentStorage) Delete(ctx context.Context, key string) error {
+	if err := requireExternalIOOutsideProjectTransaction(
+		ctx,
+		"local attachment delete",
+	); err != nil {
+		return err
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	path, err := s.resolve(key)
+	normalizedKey, err := normalizeLocalAttachmentKey(key)
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("delete attachment: %w", err)
+	storageRoot, err := s.openRoot()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = storageRoot.Close()
+	}()
+	parentsExist, err := verifyLocalAttachmentParents(
+		storageRoot,
+		normalizedKey,
+		true,
+	)
+	if err != nil {
+		return err
+	}
+	if !parentsExist {
+		return nil
+	}
+	relativePath := filepath.FromSlash(normalizedKey)
+	tempPath := relativePath + ".partial"
+	objectExists, err := inspectLocalAttachmentRegularFile(
+		storageRoot,
+		relativePath,
+		true,
+	)
+	if err != nil {
+		return err
+	}
+	partialExists, err := inspectLocalAttachmentRegularFile(
+		storageRoot,
+		tempPath,
+		true,
+	)
+	if err != nil {
+		return err
+	}
+	if objectExists {
+		if err := storageRoot.Remove(relativePath); err != nil {
+			return fmt.Errorf("delete attachment: %w", err)
+		}
+	}
+	if partialExists {
+		if err := storageRoot.Remove(tempPath); err != nil {
+			return fmt.Errorf("delete attachment partial: %w", err)
+		}
 	}
 	return nil
 }
 
-func (s *LocalAttachmentStorage) resolve(key string) (string, error) {
-	normalized := filepath.Clean(filepath.FromSlash(strings.TrimSpace(key)))
-	if normalized == "." || filepath.IsAbs(normalized) || normalized == ".." ||
-		strings.HasPrefix(normalized, ".."+string(filepath.Separator)) {
+func (s *LocalAttachmentStorage) openRoot() (*os.Root, error) {
+	if s == nil || strings.TrimSpace(s.root) == "" {
+		return nil, ErrAttachmentStorageMissing
+	}
+	storageRoot, err := os.OpenRoot(s.root)
+	if err != nil {
+		return nil, fmt.Errorf("open attachment root: %w", err)
+	}
+	return storageRoot, nil
+}
+
+func normalizeLocalAttachmentKey(key string) (string, error) {
+	if key == "" || key != strings.TrimSpace(key) ||
+		strings.ContainsRune(key, '\x00') ||
+		strings.ContainsRune(key, '\\') ||
+		strings.HasPrefix(key, "/") ||
+		filepath.IsAbs(filepath.FromSlash(key)) ||
+		hasWindowsAttachmentVolumePrefix(key) {
 		return "", ErrInvalidAttachmentName
 	}
-	full := filepath.Join(s.root, normalized)
-	relative, err := filepath.Rel(s.root, full)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+	components := strings.Split(key, "/")
+	for _, component := range components {
+		if component == "" || component == "." || component == ".." {
+			return "", ErrInvalidAttachmentName
+		}
+	}
+	normalized := strings.Join(components, "/")
+	if path.Clean(normalized) != normalized {
 		return "", ErrInvalidAttachmentName
 	}
-	return full, nil
+	return normalized, nil
+}
+
+func hasWindowsAttachmentVolumePrefix(key string) bool {
+	if len(key) < 2 || key[1] != ':' {
+		return false
+	}
+	first := key[0]
+	return first >= 'a' && first <= 'z' || first >= 'A' && first <= 'Z'
+}
+
+// verifyLocalAttachmentParents rejects every existing symlink component. The
+// subsequent os.Root operation remains the containment boundary if a
+// service-local filesystem race occurs after this check.
+func verifyLocalAttachmentParents(
+	storageRoot *os.Root,
+	normalizedKey string,
+	allowMissing bool,
+) (bool, error) {
+	components := strings.Split(normalizedKey, "/")
+	for index := 1; index < len(components); index++ {
+		parentPath := filepath.FromSlash(
+			strings.Join(components[:index], "/"),
+		)
+		info, err := storageRoot.Lstat(parentPath)
+		if errors.Is(err, os.ErrNotExist) && allowMissing {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf(
+				"inspect attachment directory: %w",
+				err,
+			)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return false, ErrInvalidAttachmentName
+		}
+	}
+	return true, nil
+}
+
+func inspectLocalAttachmentRegularFile(
+	storageRoot *os.Root,
+	relativePath string,
+	allowMissing bool,
+) (bool, error) {
+	info, err := storageRoot.Lstat(relativePath)
+	if errors.Is(err, os.ErrNotExist) && allowMissing {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect attachment object: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return false, ErrInvalidAttachmentName
+	}
+	return true, nil
+}
+
+func removeLocalAttachmentRegularFileIfExists(
+	storageRoot *os.Root,
+	relativePath string,
+) error {
+	exists, err := inspectLocalAttachmentRegularFile(
+		storageRoot,
+		relativePath,
+		true,
+	)
+	if err != nil || !exists {
+		return err
+	}
+	return storageRoot.Remove(relativePath)
+}
+
+func validAttachmentStagingKey(key string) bool {
+	key = filepath.ToSlash(strings.TrimSpace(key))
+	if !strings.HasPrefix(key, ".staging/") {
+		return false
+	}
+	name := strings.TrimPrefix(key, ".staging/")
+	return name != "" &&
+		name == filepath.Base(name) &&
+		!strings.ContainsAny(name, `/\\`) &&
+		!strings.Contains(name, "..")
 }
 
 type NativeAttachmentInput struct {
-	TicketID            uint
-	CommentID           *uint
-	ExpectedVersion     uint64
-	LeaseID             string
-	Actor               models.ActorRef
-	CredentialID        string
-	PolicyDecisionID    string
-	SourceProtocol      string
-	RequestDigest       string
-	OriginalName        string
-	ContentType         string
-	FileType            models.AttachmentType
-	Description         string
-	IsPublic            bool
-	Reader              io.Reader
-	TraceID             string
-	CorrelationID       string
-	IdempotencyRecordID string
-	OutboxTargets       []OutboxTarget
+	TicketID                             uint
+	CommentID                            *uint
+	ExpectedVersion                      uint64
+	LeaseID                              string
+	Actor                                models.ActorRef
+	CredentialID                         string
+	PolicyDecisionID                     string
+	ExternalNotificationPolicyDecisionID string
+	SourceProtocol                       string
+	RequestDigest                        string
+	OriginalName                         string
+	ContentType                          string
+	FileType                             models.AttachmentType
+	Description                          string
+	IsPublic                             bool
+	Reader                               io.Reader
+	TraceID                              string
+	CorrelationID                        string
+	IdempotencyRecordID                  string
+	OutboxTargets                        []OutboxTarget
 }
 
 type NativeAttachmentResult struct {
@@ -5085,12 +6188,22 @@ func (s *AgentNativeService) StoreAttachment(
 	ctx context.Context,
 	input NativeAttachmentInput,
 ) (*NativeAttachmentResult, error) {
+	if s == nil {
+		return nil, ErrAttachmentStorageMissing
+	}
 	operation, err := commandOperationContext(ctx, input.Actor)
 	if err != nil {
 		return nil, err
 	}
 	projectScope := operation.Scope
-	if s.attachmentStorage == nil {
+	if input.Actor.Type == models.ActorTypeServicePrincipal {
+		if strings.TrimSpace(input.CredentialID) == "" {
+			input.CredentialID = operation.CredentialID
+		} else if input.CredentialID != operation.CredentialID {
+			return nil, ErrInvalidCredential
+		}
+	}
+	if s.attachmentStorage == nil || s.attachmentStaging == nil {
 		return nil, ErrAttachmentStorageMissing
 	}
 	if err := input.Actor.Validate(); err != nil {
@@ -5107,66 +6220,84 @@ func (s *AgentNativeService) StoreAttachment(
 	if err != nil {
 		return nil, err
 	}
-	policyDecisionID := input.PolicyDecisionID
-	if input.Actor.Type == models.ActorTypeServicePrincipal {
-		check := PolicyCheckInput{
-			ServicePrincipalID: input.Actor.ID,
-			CredentialID:       input.CredentialID,
-			Scope:              models.ScopeAttachmentsWrite,
-			Action:             "ticket.attachment.create",
-			ResourceType:       "ticket",
-			ResourceID:         strconv.FormatUint(uint64(input.TicketID), 10),
-			IsWrite:            true,
-			RequestDigest:      input.RequestDigest,
-			SourceProtocol:     input.SourceProtocol,
-		}
-		if policyDecisionID != "" {
-			if err := s.validatePolicyDecision(ctx, policyDecisionID, input.Actor, check); err != nil {
-				return nil, err
-			}
-		} else {
-			decision, checkErr := s.CheckAction(ctx, check)
-			if decision != nil {
-				policyDecisionID = decision.ID
-			}
-			if checkErr != nil {
-				return nil, checkErr
-			}
-		}
-	}
-	allowExternalNotifications, err := s.externalNotificationsAllowed(
+	if err := s.PrepareAttachmentUploadAuthorization(
 		ctx,
-		input.Actor,
-		input.CredentialID,
-		strconv.FormatUint(uint64(input.TicketID), 10),
-		input.RequestDigest,
-		input.SourceProtocol,
+		&input,
+	); err != nil {
+		return nil, err
+	}
+	initialAccess, err := s.captureAttachmentAuthorization(
+		ctx,
+		models.ScopeAttachmentsWrite,
 	)
 	if err != nil {
 		return nil, err
 	}
-	humanUserID, err := s.humanUserProjection(ctx, input.Actor)
-	if err != nil {
+	policyCheck := attachmentUploadPolicyCheck(
+		operation,
+		input,
+		safeName,
+	)
+	policyDecisionID := strings.TrimSpace(input.PolicyDecisionID)
+	extension := safeAttachmentExtension(safeName)
+	storageName := newNativeID() + extension
+	stagingKey := ".staging/" + storageName
+	attachment := &models.TicketAttachment{
+		TicketID:           input.TicketID,
+		CommentID:          input.CommentID,
+		ActorType:          input.Actor.Type,
+		ActorID:            input.Actor.ID,
+		ServicePrincipalID: actorServicePrincipalID(input.Actor),
+		FileName:           storageName,
+		OriginalName:       safeName,
+		FileType:           input.FileType,
+		Extension:          extension,
+		StoragePath:        stagingKey,
+		StorageType:        attachmentStagingIntentStorageType,
+		IsPublic:           input.IsPublic,
+		VirusScan:          models.VirusScanPending,
+		Description:        truncateText(input.Description, 4000),
+	}
+	if err := s.registerAttachmentStagingIntent(
+		ctx,
+		operation,
+		input,
+		initialAccess,
+		policyCheck,
+		attachment,
+	); err != nil {
 		return nil, err
 	}
-	extension := safeAttachmentExtension(safeName)
-	key := fmt.Sprintf("tickets/%d/%s%s", input.TicketID, newNativeID(), extension)
-	stored, err := s.attachmentStorage.Put(ctx, key, input.Reader, s.attachmentMaxBytes)
+	if err := requireExternalIOOutsideProjectTransaction(
+		ctx,
+		"attachment inbound staging",
+	); err != nil {
+		return nil, err
+	}
+	staged, err := s.attachmentStaging.Stage(
+		ctx,
+		stagingKey,
+		input.Reader,
+		s.attachmentMaxBytes,
+	)
 	if err != nil {
 		return nil, err
 	}
 	removeOnFailure := true
 	defer func() {
 		if removeOnFailure {
-			_ = s.attachmentStorage.Delete(context.Background(), stored.Key)
+			_ = s.attachmentStaging.DeleteStaged(
+				context.Background(),
+				staged.Key,
+			)
 		}
 	}()
-	if stored.Size == 0 {
+	if staged.Size == 0 {
 		return nil, ErrInvalidAttachment
 	}
 	contentType := strings.TrimSpace(input.ContentType)
 	if contentType == "" || contentType == "application/octet-stream" {
-		contentType = stored.DetectedContentType
+		contentType = staged.DetectedContentType
 	}
 	if parsedType, _, parseErr := mime.ParseMediaType(contentType); parseErr == nil {
 		contentType = parsedType
@@ -5177,175 +6308,263 @@ func (s *AgentNativeService) StoreAttachment(
 	if fileType == "" {
 		fileType = attachmentTypeForMIME(contentType)
 	}
-	attachment := &models.TicketAttachment{
-		TicketID:           input.TicketID,
-		CommentID:          input.CommentID,
-		UploadedBy:         humanUserID,
-		ActorType:          input.Actor.Type,
-		ActorID:            input.Actor.ID,
-		ServicePrincipalID: actorServicePrincipalID(input.Actor),
-		FileName:           filepath.Base(stored.Key),
-		OriginalName:       safeName,
-		FileSize:           stored.Size,
-		MimeType:           contentType,
-		FileType:           fileType,
-		Extension:          extension,
-		StoragePath:        stored.Key,
-		StorageType:        "local",
-		IsPublic:           input.IsPublic,
-		Hash:               stored.SHA256,
-		VirusScan:          models.VirusScanPending,
-		Description:        truncateText(input.Description, 4000),
+	attachment.FileSize = staged.Size
+	attachment.MimeType = contentType
+	attachment.FileType = fileType
+	attachment.StoragePath = staged.Key
+	attachment.StorageType = "staging"
+	attachment.Hash = staged.SHA256
+	uploadMigration, err := newAttachmentUploadMigrationIntent(
+		*attachment,
+	)
+	if err != nil {
+		return nil, err
 	}
 	var event *models.DomainEvent
 	var resourceVersion uint64
 	var receipt OperationReceipt
-	err = transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
-		var ticket models.Ticket
-		if err := tx.Select("id", "organization_id", "project_id", "version").
-			Where(
-				"id = ? AND organization_id = ? AND project_id = ?",
-				input.TicketID,
-				projectScope.OrganizationID,
-				projectScope.ProjectID,
-			).
-			First(&ticket).Error; err != nil {
-			return err
-		}
-		if ticket.Version != input.ExpectedVersion {
-			return fmt.Errorf("%w: expected %d, actual %d", ErrVersionConflict, input.ExpectedVersion, ticket.Version)
-		}
-		if input.LeaseID != "" {
-			if _, err := s.validateTicketLeaseTx(tx, input.LeaseID, input.TicketID, input.Actor, input.ExpectedVersion); err != nil {
-				return err
+	var allowExternalNotifications bool
+	var humanUserID *uint
+	err = scopeddb.WithProjectScopeContextTransaction(
+		ctx,
+		s.db,
+		projectScope,
+		func(scopedContext context.Context) error {
+			currentAccess, revalidateErr :=
+				s.revalidateAttachmentAuthorizationInTransaction(
+					scopedContext,
+					models.ScopeAttachmentsWrite,
+				)
+			if revalidateErr != nil {
+				return revalidateErr
 			}
-		}
-		if input.CommentID != nil {
-			var count int64
-			if err := tx.Model(&models.TicketComment{}).
-				Where(
-					"id = ? AND ticket_id = ? AND organization_id = ? AND project_id = ?",
-					*input.CommentID,
-					input.TicketID,
-					projectScope.OrganizationID,
-					projectScope.ProjectID,
-				).
-				Count(&count).Error; err != nil {
-				return err
+			if !initialAccess.AuthorizationSnapshot.Matches(
+				currentAccess.AuthorizationSnapshot,
+			) {
+				return ErrProjectAccessDenied
 			}
-			if count != 1 {
-				return fmt.Errorf("attachment comment not found")
+			allowExternalNotifications, revalidateErr =
+				s.validateAttachmentPolicyDecisionsInTransaction(
+					scopedContext,
+					operation,
+					input,
+					policyCheck,
+				)
+			if revalidateErr != nil {
+				return revalidateErr
 			}
-		}
-		if err := tx.Create(attachment).Error; err != nil {
-			return fmt.Errorf("create attachment: %w", err)
-		}
-		resourceVersion = input.ExpectedVersion + 1
-		update := tx.Model(&models.Ticket{}).
-			Where(
-				"id = ? AND organization_id = ? AND project_id = ? AND version = ?",
-				input.TicketID,
-				projectScope.OrganizationID,
-				projectScope.ProjectID,
-				input.ExpectedVersion,
-			).
-			Updates(map[string]any{"version": resourceVersion, "updated_at": s.now()})
-		if update.Error != nil {
-			return update.Error
-		}
-		if update.RowsAffected != 1 {
-			return ErrVersionConflict
-		}
-		history := &models.TicketHistory{
-			TicketID:           input.TicketID,
-			UserID:             humanUserID,
-			ActorType:          input.Actor.Type,
-			ActorID:            input.Actor.ID,
-			ServicePrincipalID: actorServicePrincipalID(input.Actor),
-			Action:             models.HistoryActionAttachment,
-			Description:        "添加了附件",
-			AttachmentID:       &attachment.ID,
-			IsVisible:          input.IsPublic,
-			IsSystem:           input.Actor.Type == models.ActorTypeSystem,
-			IsAutomated:        input.Actor.Type != models.ActorTypeHuman,
-			Metadata:           policyMetadata(policyDecisionID),
-		}
-		var appendErr error
-		event, appendErr = s.AppendDomainEventWithAdditionalTargetsTx(ctx, tx, DomainEventInput{
-			Type:                       eventcontract.TicketAttachmentCreatedEventType,
-			Subject:                    fmt.Sprintf("ticket/%d", input.TicketID),
-			Actor:                      input.Actor,
-			ResourceVersion:            resourceVersion,
-			AllowExternalNotifications: allowExternalNotifications,
-			TraceID:                    input.TraceID,
-			CorrelationID:              input.CorrelationID,
-			Data: map[string]any{
-				"ticket_id":         input.TicketID,
-				"attachment_id":     attachment.ID,
-				"file_name":         safeName,
-				"file_size":         attachment.FileSize,
-				"sha256":            attachment.Hash,
-				"virus_scan":        attachment.VirusScan,
-				"content_untrusted": true,
-			},
-		}, input.OutboxTargets)
-		if appendErr != nil {
-			return appendErr
-		}
-		if err := linkTicketHistoryToDomainEvent(history, event); err != nil {
-			return err
-		}
-		if err := tx.Create(history).Error; err != nil {
-			return err
-		}
-		if !input.IsPublic {
-			if err := tx.Model(history).UpdateColumn("is_visible", false).Error; err != nil {
-				return err
+			humanUserID, revalidateErr = s.humanUserProjection(
+				scopedContext,
+				input.Actor,
+			)
+			if revalidateErr != nil {
+				return revalidateErr
 			}
-		}
-		if input.LeaseID != "" {
-			if err := tx.Model(&models.TicketLease{}).
-				Where(
-					"id = ? AND organization_id = ? AND project_id = ?",
-					input.LeaseID,
-					projectScope.OrganizationID,
-					projectScope.ProjectID,
-				).
-				Update("ticket_version", resourceVersion).Error; err != nil {
-				return err
+			if (attachment.UploadedBy == nil) !=
+				(humanUserID == nil) ||
+				(attachment.UploadedBy != nil &&
+					humanUserID != nil &&
+					*attachment.UploadedBy != *humanUserID) {
+				return ErrProjectAccessDenied
 			}
-		}
-		receipt = OperationReceipt{
-			OperationID:      newNativeID(),
-			ResourceID:       strconv.FormatUint(uint64(attachment.ID), 10),
-			ResourceVersion:  resourceVersion,
-			EventID:          event.ID,
-			ChangedFields:    []string{"attachments"},
-			PolicyDecisionID: policyDecisionID,
-		}
-		if input.IdempotencyRecordID != "" {
-			if err := s.CompleteIdempotencyTx(
-				ctx,
-				tx,
-				input.IdempotencyRecordID,
-				http.StatusCreated,
-				receipt,
-				receipt.ResourceID,
-				event.ID,
-			); err != nil {
-				return err
-			}
-			if err := s.storeIdempotencySnapshotTx(
-				ctx,
-				tx,
-				input.IdempotencyRecordID,
-				attachment,
-			); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+			return transactionForContext(
+				scopedContext,
+				s.db,
+				func(tx *gorm.DB) error {
+					if _, err := s.validateAttachmentCommandStateTx(
+						scopedContext,
+						tx,
+						currentAccess,
+						operation,
+						input,
+					); err != nil {
+						return err
+					}
+					var persistedIntent models.TicketAttachment
+					if err := tx.
+						Clauses(clause.Locking{
+							Strength: "UPDATE",
+						}).
+						Where(
+							"id = ? AND organization_id = ? AND project_id = ? AND storage_type = ?",
+							attachment.ID,
+							projectScope.OrganizationID,
+							projectScope.ProjectID,
+							attachmentStagingIntentStorageType,
+						).
+						Take(&persistedIntent).Error; err != nil {
+						return fmt.Errorf(
+							"lock attachment staging intent: %w",
+							err,
+						)
+					}
+					if persistedIntent.TicketID !=
+						attachment.TicketID ||
+						persistedIntent.ActorType !=
+							attachment.ActorType ||
+						persistedIntent.ActorID !=
+							attachment.ActorID ||
+						persistedIntent.FileName !=
+							attachment.FileName ||
+						persistedIntent.StoragePath !=
+							attachment.StoragePath {
+						return ErrInvalidAttachment
+					}
+					now := s.now().UTC()
+					updateIntent := tx.Model(
+						&models.TicketAttachment{},
+					).Where(
+						"id = ? AND storage_type = ?",
+						attachment.ID,
+						attachmentStagingIntentStorageType,
+					).Updates(map[string]any{
+						"file_size":    attachment.FileSize,
+						"mime_type":    attachment.MimeType,
+						"file_type":    attachment.FileType,
+						"storage_type": attachment.StorageType,
+						"hash":         attachment.Hash,
+						"updated_at":   now,
+					})
+					if updateIntent.Error != nil {
+						return updateIntent.Error
+					}
+					if updateIntent.RowsAffected != 1 {
+						return ErrInvalidAttachment
+					}
+					attachment.UpdatedAt = now
+					if err := completeAttachmentStagingCleanupIntentTx(
+						tx,
+						attachment.ID,
+						now,
+					); err != nil {
+						return err
+					}
+					resourceVersion = input.ExpectedVersion + 1
+					update := tx.Model(&models.Ticket{}).
+						Where(
+							"id = ? AND organization_id = ? AND project_id = ? AND version = ?",
+							input.TicketID,
+							projectScope.OrganizationID,
+							projectScope.ProjectID,
+							input.ExpectedVersion,
+						).
+						Updates(map[string]any{
+							"version":    resourceVersion,
+							"updated_at": now,
+						})
+					if update.Error != nil {
+						return update.Error
+					}
+					if update.RowsAffected != 1 {
+						return ErrVersionConflict
+					}
+					history := &models.TicketHistory{
+						TicketID:           input.TicketID,
+						UserID:             humanUserID,
+						ActorType:          input.Actor.Type,
+						ActorID:            input.Actor.ID,
+						ServicePrincipalID: actorServicePrincipalID(input.Actor),
+						Action:             models.HistoryActionAttachment,
+						Description:        "添加了附件",
+						AttachmentID:       &attachment.ID,
+						IsVisible:          input.IsPublic,
+						IsSystem:           input.Actor.Type == models.ActorTypeSystem,
+						IsAutomated:        input.Actor.Type != models.ActorTypeHuman,
+						Metadata:           policyMetadata(policyDecisionID),
+					}
+					var appendErr error
+					uploadTargets := append(
+						[]OutboxTarget(nil),
+						input.OutboxTargets...,
+					)
+					uploadTargets = append(uploadTargets, OutboxTarget{
+						Type: AttachmentUploadOutboxDestination,
+						ID: strconv.FormatUint(
+							uint64(attachment.ID),
+							10,
+						),
+						MaxAttempts: 8,
+					})
+					event, appendErr = s.AppendDomainEventWithAdditionalTargetsTx(scopedContext, tx, DomainEventInput{
+						Type:                       "io.chronodesk.ticket.attachment.upload-requested.v1",
+						Subject:                    fmt.Sprintf("ticket/%d", input.TicketID),
+						Actor:                      input.Actor,
+						ResourceVersion:            resourceVersion,
+						AllowExternalNotifications: allowExternalNotifications,
+						TraceID:                    input.TraceID,
+						CorrelationID:              input.CorrelationID,
+						Data: map[string]any{
+							"ticket_id":                        input.TicketID,
+							"attachment_id":                    attachment.ID,
+							"file_name":                        safeName,
+							"file_size":                        attachment.FileSize,
+							"sha256":                           attachment.Hash,
+							"virus_scan":                       attachment.VirusScan,
+							"storage_state":                    attachment.StorageType,
+							"content_untrusted":                true,
+							AttachmentUploadMigrationDataField: uploadMigration,
+						},
+					}, uploadTargets)
+					if appendErr != nil {
+						return appendErr
+					}
+					if err := linkTicketHistoryToDomainEvent(history, event); err != nil {
+						return err
+					}
+					if err := tx.Create(history).Error; err != nil {
+						return err
+					}
+					if !input.IsPublic {
+						if err := tx.Model(history).UpdateColumn("is_visible", false).Error; err != nil {
+							return err
+						}
+					}
+					if input.LeaseID != "" {
+						if err := tx.Model(&models.TicketLease{}).
+							Where(
+								"id = ? AND organization_id = ? AND project_id = ?",
+								input.LeaseID,
+								projectScope.OrganizationID,
+								projectScope.ProjectID,
+							).
+							Update("ticket_version", resourceVersion).Error; err != nil {
+							return err
+						}
+					}
+					receipt = OperationReceipt{
+						OperationID:      newNativeID(),
+						ResourceID:       strconv.FormatUint(uint64(attachment.ID), 10),
+						ResourceVersion:  resourceVersion,
+						EventID:          event.ID,
+						ChangedFields:    []string{"attachments"},
+						PolicyDecisionID: policyDecisionID,
+					}
+					if input.IdempotencyRecordID != "" {
+						if err := s.CompleteIdempotencyTx(
+							ctx,
+							tx,
+							input.IdempotencyRecordID,
+							http.StatusAccepted,
+							receipt,
+							receipt.ResourceID,
+							event.ID,
+						); err != nil {
+							return err
+						}
+						if err := s.storeIdempotencySnapshotTx(
+							ctx,
+							tx,
+							input.IdempotencyRecordID,
+							attachment,
+						); err != nil {
+							return err
+						}
+					}
+					return nil
+				},
+			)
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -5361,30 +6580,26 @@ func (s *AgentNativeService) OpenAttachment(
 	ctx context.Context,
 	attachmentID uint,
 ) (*models.TicketAttachment, io.ReadCloser, error) {
-	projectScope, err := commandProjectScope(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	if s.attachmentStorage == nil {
-		return nil, nil, ErrAttachmentStorageMissing
-	}
-	var attachment models.TicketAttachment
-	if err := s.db.WithContext(ctx).Where(
-		"id = ? AND organization_id = ? AND project_id = ?",
+	return s.openAttachmentWithRevalidation(
+		ctx,
+		0,
 		attachmentID,
-		projectScope.OrganizationID,
-		projectScope.ProjectID,
-	).First(&attachment).Error; err != nil {
-		return nil, nil, err
+	)
+}
+
+func (s *AgentNativeService) OpenTicketAttachment(
+	ctx context.Context,
+	ticketID uint,
+	attachmentID uint,
+) (*models.TicketAttachment, io.ReadCloser, error) {
+	if ticketID == 0 {
+		return nil, nil, ErrInvalidAttachment
 	}
-	if attachment.VirusScan != models.VirusScanClean {
-		return nil, nil, fmt.Errorf("%w: %s", ErrAttachmentNotClean, attachment.VirusScan)
-	}
-	reader, err := s.attachmentStorage.Open(ctx, attachment.StoragePath)
-	if err != nil {
-		return nil, nil, err
-	}
-	return &attachment, reader, nil
+	return s.openAttachmentWithRevalidation(
+		ctx,
+		ticketID,
+		attachmentID,
+	)
 }
 
 func (s *AgentNativeService) MarkAttachmentScan(

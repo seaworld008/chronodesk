@@ -72,8 +72,11 @@ tickets = client.list_tickets(limit=20)
 
 ```bash
 PYTHONPATH=sdk/python \
-  python3 -m unittest discover -s sdk/python/tests -p 'test_*.py'
+  ./.venv/bin/python -m unittest discover -s sdk/python/tests -p 'test_*.py'
 ```
+
+先运行 `make install-deps` 创建仓库 `.venv`。也可以直接运行 `make test-sdk`，
+它会使用同一虚拟环境执行 Python SDK 门禁。
 
 可执行示例位于 `sdk/python/examples/list_tickets.py`。
 

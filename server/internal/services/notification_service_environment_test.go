@@ -21,7 +21,7 @@ func TestSendWebhookLogEnvironment(t *testing.T) {
 		Username:     "webhook-env",
 		Email:        "webhook-env@example.com",
 		PasswordHash: "hash",
-		Role:         models.RoleAdmin,
+		PlatformRole: models.PlatformRolePlatformAdmin,
 		Status:       models.UserStatusActive,
 	}
 	if err := db.Create(&creator).Error; err != nil {

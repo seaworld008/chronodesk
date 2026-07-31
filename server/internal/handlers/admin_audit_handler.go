@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 )
@@ -32,16 +33,16 @@ func (h *AdminAuditHandler) GetAuditLogs(c *gin.Context) {
 	}
 
 	query := struct {
-		UserID    string `form:"user_id"`
-		Role      string `form:"role"`
-		Method    string `form:"method"`
-		Path      string `form:"path"`
-		Status    string `form:"status"`
-		Keyword   string `form:"keyword"`
-		StartTime string `form:"start_time"`
-		EndTime   string `form:"end_time"`
-		Page      int    `form:"page"`
-		Limit     int    `form:"limit"`
+		UserID       string              `form:"user_id"`
+		PlatformRole models.PlatformRole `form:"platform_role"`
+		Method       string              `form:"method"`
+		Path         string              `form:"path"`
+		Status       string              `form:"status"`
+		Keyword      string              `form:"keyword"`
+		StartTime    string              `form:"start_time"`
+		EndTime      string              `form:"end_time"`
+		Page         int                 `form:"page"`
+		Limit        int                 `form:"limit"`
 	}{}
 
 	if err := c.ShouldBindQuery(&query); err != nil {
@@ -52,14 +53,22 @@ func (h *AdminAuditHandler) GetAuditLogs(c *gin.Context) {
 		})
 		return
 	}
+	if query.PlatformRole != "" && !query.PlatformRole.IsValid() {
+		c.JSON(http.StatusBadRequest, ApiResponse{
+			Code: 1,
+			Msg:  "平台角色筛选值无效",
+			Data: nil,
+		})
+		return
+	}
 
 	filter := &services.AdminAuditFilter{
-		Role:    query.Role,
-		Method:  query.Method,
-		Path:    query.Path,
-		Keyword: query.Keyword,
-		Page:    query.Page,
-		Limit:   query.Limit,
+		PlatformRole: query.PlatformRole,
+		Method:       query.Method,
+		Path:         query.Path,
+		Keyword:      query.Keyword,
+		Page:         query.Page,
+		Limit:        query.Limit,
 	}
 
 	if query.UserID != "" {

@@ -5,6 +5,7 @@ import {
     ReferenceField,
     FilterButton,
     ExportButton,
+    CreateButton,
     ReferenceInput,
     TopToolbar,
     useRecordContext,
@@ -61,9 +62,9 @@ import {
     EnterpriseSelectFilterInput,
 } from '@/components/inputs/EnterpriseFilterInputs';
 import {
-    isAdministrativeRole,
-    type RolePermissions,
+    type AccessPermissions,
 } from '@/lib/accessControl';
+import { hasProjectCapability } from '@/lib/projectScope';
 
 // 通知类型选项
 const notificationTypeChoices = [
@@ -368,7 +369,7 @@ type NotificationRecord = {
     retry_count?: number
 }
 
-const buildNotificationFilters = (canAdminister: boolean) => [
+const buildNotificationFilters = (canManageNotifications: boolean) => [
     <EnterpriseSearchInput key="q" source="q" placeholder="搜索通知" alwaysOn />,
     <EnterpriseSelectFilterInput
         key="type"
@@ -390,12 +391,12 @@ const buildNotificationFilters = (canAdminister: boolean) => [
     />,
     <EnterpriseBooleanFilterInput key="is_read" source="is_read" label="已读" />,
     <EnterpriseBooleanFilterInput key="is_sent" source="is_sent" label="已发送" />,
-    ...(canAdminister
+    ...(canManageNotifications
         ? [
             <ReferenceInput
                 key="recipient_id"
                 source="recipient_id"
-                reference="users"
+                reference="assignees"
                 label="接收者"
             >
                 <EnterpriseReferenceAutocompleteInput label="接收者" optionText="username" />
@@ -403,7 +404,7 @@ const buildNotificationFilters = (canAdminister: boolean) => [
             <ReferenceInput
                 key="sender_id"
                 source="sender_id"
-                reference="users"
+                reference="assignees"
                 label="发送者"
             >
                 <EnterpriseReferenceAutocompleteInput label="发送者" optionText="username" />
@@ -425,8 +426,13 @@ const buildNotificationFilters = (canAdminister: boolean) => [
 /**
  * 列表工具栏
  */
-const NotificationListActions = () => (
+const NotificationListActions = ({
+    canCreate,
+}: {
+    canCreate: boolean;
+}) => (
     <TopToolbar>
+        {canCreate && <CreateButton label="创建通知" />}
         <FilterButton />
         <ExportButton label="导出" />
     </TopToolbar>
@@ -435,7 +441,11 @@ const NotificationListActions = () => (
 /**
  * 空状态组件
  */
-const NotificationEmpty = () => (
+const NotificationEmpty = ({
+    canCreate,
+}: {
+    canCreate: boolean;
+}) => (
     <Box sx={{ textAlign: 'center', mt: 4 }}>
         <Card sx={{ maxWidth: 600, mx: 'auto', p: 4 }}>
             <CardContent>
@@ -448,6 +458,13 @@ const NotificationEmpty = () => (
                 }}>
                     当前没有任何通知记录。当系统产生通知时，它们会出现在这里。
                 </Typography>
+                {canCreate && (
+                    <CreateButton
+                        label="创建通知"
+                        variant="contained"
+                        sx={{ mt: 3 }}
+                    />
+                )}
             </CardContent>
         </Card>
     </Box>
@@ -457,18 +474,29 @@ const NotificationEmpty = () => (
  * 通知列表组件
  */
 const NotificationList: React.FC = () => {
-    const { permissions } = usePermissions<RolePermissions>();
-    const canAdminister = isAdministrativeRole(permissions?.role);
+    const { permissions } = usePermissions<AccessPermissions>();
+    const canManageNotifications = hasProjectCapability(
+        permissions?.project_role,
+        'manage_notifications',
+    );
     const filters = useMemo(
-        () => buildNotificationFilters(canAdminister),
-        [canAdminister],
+        () => buildNotificationFilters(canManageNotifications),
+        [canManageNotifications],
     );
 
     return (
         <List
             filters={filters}
-            actions={<NotificationListActions />}
-            empty={<NotificationEmpty />}
+            actions={
+                <NotificationListActions
+                    canCreate={canManageNotifications}
+                />
+            }
+            empty={
+                <NotificationEmpty
+                    canCreate={canManageNotifications}
+                />
+            }
             perPage={25}
             sort={{ field: 'created_at', order: 'DESC' }}
             title="通知管理"

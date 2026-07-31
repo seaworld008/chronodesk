@@ -116,6 +116,8 @@ func main() {
 			IncludeSampleData: samples,
 			EnsureInitialAdministratorMembership: services.
 				EnsureBootstrapProjectAdministratorMembership,
+			EnsureSampleUserMembership: services.
+				EnsureSampleProjectMembership,
 		}); err != nil {
 			log.Fatalf("初始化业务数据失败：%v", err)
 		}

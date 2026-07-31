@@ -2,7 +2,15 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
 COMPOSE ?= docker compose
+# PYTHON remains a backwards-compatible alias for the interpreter that creates
+# the repository virtual environment. Python tooling itself always runs inside
+# VENV so Homebrew's externally managed interpreter is never modified.
 PYTHON ?= python3
+BOOTSTRAP_PYTHON ?= $(PYTHON)
+VENV ?= $(CURDIR)/.venv
+PYTHON_REQUIREMENTS ?= server/requirements-test.txt
+VENV_PYTHON := $(VENV)/bin/python
+PYTHON_REQUIREMENTS_SNAPSHOT := $(VENV)/.requirements-test.txt
 NPM_TOOL_CACHE ?= $(CURDIR)/.cache/npm-tools
 VERSION ?= 0.1.0
 COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
@@ -16,8 +24,8 @@ GO_LDFLAGS := -s -w \
 	help doctor install-deps install-server-deps install-web-deps install-test-deps install-sdk-deps \
 	dev server-dev web-dev docker-up docker-down docker-logs \
 	build build-server build-web build-sdk clean \
-	fmt fmt-check test test-server test-race test-web test-sdk test-python-static security verify \
-	openapi-lint asyncapi-lint smoke e2e db-migrate db-migrate-seed db-migrate-sample \
+	fmt fmt-check test test-server test-race test-redis-integration test-web test-sdk test-python-static test-python-toolchain python-toolchain security verify \
+	openapi-lint human-openapi-generate human-openapi-check asyncapi-lint smoke e2e db-migrate db-migrate-seed db-migrate-sample \
 	credential-validate credential-rotate credential-quarantine
 
 help:
@@ -33,9 +41,12 @@ help:
 	@echo ""
 	@echo "质量"
 	@echo "  fmt             格式化 Go 源码"
+	@echo "  test-python-toolchain 验证仓库 Python 虚拟环境与依赖刷新"
 	@echo "  test            执行 Go、Web、OpenAPI 与 AsyncAPI 标准门禁"
 	@echo "  test-race       执行 Go 竞态检测"
+	@echo "  test-redis-integration 使用显式 Redis 配置验证 Agent execution guard"
 	@echo "  test-sdk        编译并测试 Go、Python、TypeScript 项目绑定 SDK"
+	@echo "  human-openapi-check 验证 Human Web OpenAPI 与生成类型一致"
 	@echo "  security        执行 Go 与 Web 依赖安全检查"
 	@echo "  verify          执行格式、测试、安全与生产构建门禁"
 	@echo "  smoke           对运行中的 API 执行全部 Python 黑盒测试"
@@ -55,7 +66,7 @@ doctor:
 	@command -v go >/dev/null && go version
 	@command -v node >/dev/null && node --version
 	@command -v npm >/dev/null && npm --version
-	@command -v $(PYTHON) >/dev/null && $(PYTHON) --version
+	@command -v $(BOOTSTRAP_PYTHON) >/dev/null && $(BOOTSTRAP_PYTHON) --version
 	@$(COMPOSE) version
 
 install-deps: install-server-deps install-web-deps install-test-deps install-sdk-deps
@@ -66,8 +77,19 @@ install-server-deps:
 install-web-deps:
 	cd web && npm ci
 
-install-test-deps:
-	$(PYTHON) -m pip install -r server/requirements-test.txt
+install-test-deps: python-toolchain
+
+# Keep VENV-derived paths out of Make's target graph: GNU Make tokenizes target
+# names before recipes run, so a configurable VENV may safely contain spaces.
+python-toolchain:
+	@if [[ ! -x "$(VENV_PYTHON)" ]]; then \
+		"$(BOOTSTRAP_PYTHON)" -m venv "$(VENV)"; \
+	fi
+	@if ! cmp -s "$(PYTHON_REQUIREMENTS)" "$(PYTHON_REQUIREMENTS_SNAPSHOT)"; then \
+		"$(VENV_PYTHON)" -m pip install -r "$(PYTHON_REQUIREMENTS)" && \
+		cp "$(PYTHON_REQUIREMENTS)" "$(PYTHON_REQUIREMENTS_SNAPSHOT)"; \
+	fi
+	"$(VENV_PYTHON)" -m pip check
 
 install-sdk-deps:
 	cd sdk/typescript && npm ci
@@ -92,7 +114,7 @@ docker-down:
 docker-logs:
 	$(COMPOSE) logs -f
 
-build: build-server build-web build-sdk
+build: python-toolchain build-server build-web build-sdk
 
 build-server:
 	cd server && mkdir -p bin
@@ -104,9 +126,9 @@ build-server:
 build-web:
 	cd web && npm run build
 
-build-sdk:
+build-sdk: python-toolchain
 	cd sdk/go && go build ./...
-	$(PYTHON) -m compileall -q sdk/python/chronodesk sdk/python/examples
+	"$(VENV_PYTHON)" -m compileall -q sdk/python/chronodesk sdk/python/examples
 	cd sdk/typescript && npm run build
 
 clean:
@@ -116,20 +138,20 @@ clean:
 	rm -rf sdk/python/build sdk/python/*.egg-info
 	find sdk/python -type d -name __pycache__ -prune -exec rm -rf {} +
 
-fmt:
+fmt: python-toolchain
 	cd server && gofmt -w .
 	gofmt -w $$(rg --files sdk/go -g '*.go')
-	$(PYTHON) -m ruff format sdk/python
+	"$(VENV_PYTHON)" -m ruff format sdk/python
 
-fmt-check:
+fmt-check: python-toolchain
 	@test -z "$$(cd server && gofmt -l .)" || \
 		{ echo "存在未格式化的 Go 文件："; cd server && gofmt -l .; exit 1; }
 	@test -z "$$(gofmt -l $$(rg --files sdk/go -g '*.go'))" || \
 		{ echo "SDK 存在未格式化的 Go 文件："; \
 		  gofmt -l $$(rg --files sdk/go -g '*.go'); exit 1; }
-	$(PYTHON) -m ruff format --check sdk/python
+	"$(VENV_PYTHON)" -m ruff format --check sdk/python
 
-test: test-server test-web test-sdk test-python-static openapi-lint asyncapi-lint
+test: python-toolchain test-server test-web test-sdk test-python-static openapi-lint asyncapi-lint
 
 test-server:
 	cd server && go test ./... -count=1
@@ -138,25 +160,39 @@ test-server:
 test-race:
 	cd server && go test -race ./... -count=1
 
+test-redis-integration:
+	@test "$(CHRONODESK_REDIS_INTEGRATION)" = "1" || \
+		{ echo "CHRONODESK_REDIS_INTEGRATION 必须显式设为 1"; exit 1; }
+	@test -n "$(REDIS_URL)" || \
+		{ echo "REDIS_URL 未配置，拒绝跳过 Redis execution guard 集成测试"; exit 1; }
+	cd server && CHRONODESK_REDIS_INTEGRATION=1 REDIS_URL="$(REDIS_URL)" \
+		go test ./internal/services \
+		-run '^TestRedisAgentExecutionGuardIntegration$$' -count=1
+
 test-web:
+	cd web && npm run check:human-api
+	cd web && npm run test:human-api
 	cd web && npm run typecheck
 	cd web && npm run lint
 	cd web && npm run audit:security
 
-test-sdk:
+test-sdk: python-toolchain
 	cd sdk/go && go test ./... -count=1
-	$(PYTHON) -m ruff check sdk/python
-	PYTHONPATH=$(CURDIR)/sdk/python $(PYTHON) -m unittest discover \
+	"$(VENV_PYTHON)" -m ruff check sdk/python
+	PYTHONPATH=$(CURDIR)/sdk/python "$(VENV_PYTHON)" -m unittest discover \
 		-s sdk/python/tests -p 'test_*.py'
 	cd sdk/typescript && npm test
 
-test-python-static:
-	$(PYTHON) -m ruff format --check server/tests
-	$(PYTHON) -m ruff check server/tests
-	$(PYTHON) -m compileall -q server/tests
-	$(PYTHON) server/tests/validate_case_evidence_manifest.py
-	$(PYTHON) server/tests/validate_case_evidence_manifest.py --self-test
-	$(PYTHON) -m pytest -c server/pytest.ini --collect-only -q server/tests
+test-python-static: python-toolchain test-python-toolchain
+	"$(VENV_PYTHON)" -m ruff format --check server/tests
+	"$(VENV_PYTHON)" -m ruff check server/tests
+	"$(VENV_PYTHON)" -m compileall -q server/tests
+	"$(VENV_PYTHON)" server/tests/validate_case_evidence_manifest.py
+	"$(VENV_PYTHON)" server/tests/validate_case_evidence_manifest.py --self-test
+	"$(VENV_PYTHON)" -m pytest -c server/pytest.ini --collect-only -q server/tests
+
+test-python-toolchain:
+	bash server/tests/test_python_toolchain.sh
 
 security:
 	cd server && go run golang.org/x/vuln/cmd/govulncheck@latest ./...
@@ -164,23 +200,37 @@ security:
 	cd web && npm run audit:security
 	cd sdk/typescript && npm audit --audit-level=high
 
-verify: fmt-check test security build
+verify: python-toolchain fmt-check test security build
 
 openapi-lint:
 	NPM_CONFIG_CACHE=$(NPM_TOOL_CACHE) npx --yes @redocly/cli@2.41.1 \
 		lint server/internal/openapi/openapi.yaml --format=stylish
+	NPM_CONFIG_CACHE=$(NPM_TOOL_CACHE) npx --yes @redocly/cli@2.41.1 \
+		lint server/internal/humanopenapi/openapi.json --format=stylish
 	NPM_CONFIG_CACHE=$(NPM_TOOL_CACHE) npx --yes @stoplight/spectral-cli@6.16.2 \
 		lint -r server/internal/openapi/.spectral.yaml \
 		server/internal/openapi/openapi.yaml \
 		--fail-severity=warn
+	NPM_CONFIG_CACHE=$(NPM_TOOL_CACHE) npx --yes @stoplight/spectral-cli@6.16.2 \
+		lint -r server/internal/openapi/.spectral.yaml \
+		server/internal/humanopenapi/openapi.json \
+		--fail-severity=warn
+
+human-openapi-generate:
+	cd web && npm run generate:human-api
+
+human-openapi-check:
+	cd server && go test ./internal/humanopenapi -count=1
+	cd web && npm run check:human-api
+	cd web && npm run test:human-api
 
 asyncapi-lint:
 	NPM_CONFIG_CACHE=$(NPM_TOOL_CACHE) npx --yes @asyncapi/cli@6.0.2 \
 		validate server/internal/asyncapi/asyncapi.yaml
 
-smoke:
+smoke: python-toolchain
 	mkdir -p server/reports
-	$(PYTHON) -m pytest -c server/pytest.ini server/tests -v \
+	"$(VENV_PYTHON)" -m pytest -c server/pytest.ini server/tests -v \
 		--html=server/reports/smoke.html \
 		--self-contained-html
 

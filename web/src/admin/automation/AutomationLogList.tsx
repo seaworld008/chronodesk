@@ -55,7 +55,9 @@ const actionTypeLabels: Record<string, string> = {
   notify: '发送通知',
 }
 
-const parseActions = (rawActions: AutomationLog['actions_executed']): AutomationLogActionExecution[] => {
+const parseActions = (
+  rawActions: AutomationLog['actions_executed'] | undefined,
+): AutomationLogActionExecution[] => {
   if (!rawActions) {
     return []
   }

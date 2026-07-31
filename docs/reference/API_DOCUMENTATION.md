@@ -10,10 +10,11 @@ ChronoDesk 面向外部 Agent 的权威机器契约由服务内嵌的 OpenAPI 3.
 - A2A：`POST http://localhost:8081/a2a/v1`
 - A2A Agent Card：`GET http://localhost:8081/.well-known/agent-card.json`
 
-`/openapi.yaml` 覆盖项目显式 `/api/v2/projects/{projectKey}`、OAuth/发现入口和 Agent 管理控制面；浏览器
-后台使用的人类 REST 接口 `/api` 不属于对外机器契约。Agent SDK 生成、
-契约测试和外部接入都必须直接读取 `/openapi.yaml`，不得从本文件复制请求或
-响应 Schema。
+`/openapi.yaml` 覆盖项目显式 `/api/v2/projects/{projectKey}`、OAuth/发现入口和
+Agent 管理控制面。Agent SDK 生成、契约测试和外部接入都必须直接读取
+`/openapi.yaml`，不得从本文件复制请求或响应 Schema。浏览器后台使用的 Human
+P1 契约单独发布在 `http://localhost:8081/human-openapi.json`，只供同仓库 Web
+客户端生成类型和路由，不得替代对外 Agent 机器契约。
 
 ## Agent REST 契约
 
@@ -31,16 +32,27 @@ ChronoDesk 面向外部 Agent 的权威机器契约由服务内嵌的 OpenAPI 3.
 
 ## 人类管理端
 
-`/api` 由浏览器管理后台使用，采用人类 JWT 会话、对象级工单授权和角色权限。
-人类账号角色是封闭枚举，仅允许 `admin`、`supervisor`、`agent`、`customer`；
-服务主体身份不复用人类角色。数据库迁移会将历史角色值一次性收敛到当前枚举，
-旧角色令牌不会继续获得访问权限。
+`/api` 由浏览器管理后台使用，采用人类 JWT 会话、对象级工单授权和两层角色权限。
+平台角色是封闭枚举 `platform_admin`、`security_auditor`、
+`emergency_operator`、`member`；项目职责只来自显式 Membership 中的
+`project_admin`、`manager`、`agent`、`requester`、`observer`。平台角色不会
+隐式扩大普通项目或跨项目工作台范围，服务主体身份也不复用人类角色。数据库迁移
+会将历史角色值一次性收敛到当前枚举，旧角色令牌不会继续获得访问权限。
 评论、附件、通知、自动化、用户、系统设置和 Agent 控制中心均复用领域服务，
 不通过 MCP 或 A2A 回调自身的 HTTP 接口。
 
-该人类 REST 接口只服务同仓库 Web 客户端，以后端路由、处理器回归测试和
-`web/src/lib/dataProvider.ts` 的调用契约为准；不承诺供第三方 SDK 生成。需要
-机器稳定能力时应使用项目显式 Agent REST v2、MCP 或 A2A。
+该人类 REST 接口只服务同仓库 Web 客户端。`/human-openapi.json` 是当前发布的
+完整 Human Web P1 机器契约，也是请求/响应 Schema 的唯一来源；Web 必须使用由
+该契约生成的 `humanApiOperations`、`humanApiRoutes` 和 TypeScript 类型，不得
+手写重复的 P1 路径或 DTO。生成 freshness、处理器契约测试和 CI 门禁共同阻止
+契约与实现漂移。未列入该文档的 Human 路由属于未契约遗留面，不应被推断为已
+发布能力，也不承诺供第三方 SDK 生成。需要机器稳定能力时应使用项目显式 Agent
+REST v2、MCP 或 A2A。
+
+项目范围解析或即时重校验失败时，Human Web 返回稳定错误码
+`project_access_revoked`。浏览器只有在响应路径中的 Project Key 与当前选择
+一致时才清理该选择；`project_role_denied`、工单对象 ACL 和其他普通 `403`
+只拒绝当前操作，不改变仍然有效的项目上下文。
 
 ## 协议版本
 

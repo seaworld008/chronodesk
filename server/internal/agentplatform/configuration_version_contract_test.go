@@ -53,6 +53,10 @@ func TestAgentRESTCreateRequiresAndPersistsConfigurationVersions(t *testing.T) {
 	router.Use(func(c *gin.Context) {
 		c.Set(agentauth.ContextPrincipalID, fixture.principal.ID)
 		c.Set(agentauth.ContextCredentialID, fixture.credential.ID)
+		c.Set(
+			agentauth.ContextScopes,
+			append([]string(nil), fixture.actor.Scopes...),
+		)
 		c.Request = c.Request.WithContext(operationContext)
 		c.Next()
 	})
