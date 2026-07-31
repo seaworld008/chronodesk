@@ -1879,7 +1879,8 @@ func openPostgresAuthorizationBarrierFixture(
 	}
 
 	var project models.Project
-	if err := db.Where("key = ?", DefaultProjectKey).
+	if err := db.Preload("BusinessUnit").
+		Where("key = ?", DefaultProjectKey).
 		Take(&project).Error; err != nil {
 		t.Fatalf("load default project scope: %v", err)
 	}

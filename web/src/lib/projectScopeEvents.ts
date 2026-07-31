@@ -1,5 +1,7 @@
 export const projectAccessInvalidatedEvent =
     'chronodesk:project-access-invalidated'
+export const projectInventoryChangedEvent =
+    'chronodesk:project-inventory-changed'
 export const projectScopeChangedEvent = 'chronodesk:project-scope-changed'
 export const sessionInvalidatedEvent = 'chronodesk:session-invalidated'
 export const projectAccessRevokedCode = 'project_access_revoked'
@@ -78,6 +80,12 @@ export const shouldInvalidateActiveProjectAccess = (
 export const signalProjectAccessInvalidated = (): void => {
     if (typeof window !== 'undefined') {
         window.dispatchEvent(new Event(projectAccessInvalidatedEvent))
+    }
+}
+
+export const signalProjectInventoryChanged = (): void => {
+    if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event(projectInventoryChangedEvent))
     }
 }
 

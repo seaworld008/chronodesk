@@ -47,6 +47,14 @@ func registerPlatformProjectRoutes(
 	handler *handlers.ProjectHandler,
 ) {
 	routes.GET("/projects", handler.ListPlatform)
+	routes.GET(
+		"/project-creation-context",
+		handler.CreationContext,
+	)
+	routes.GET(
+		"/project-business-units",
+		handler.ListPlatformBusinessUnits,
+	)
 	routes.POST("/projects", handler.Create)
 	routes.POST(
 		"/projects/:projectPublicID/archive",
@@ -852,6 +860,10 @@ func Run() error {
 		projectScoped.GET("/context", projectHandler.Current)
 		projectScoped.GET("/queues", projectHandler.ListQueues)
 		projectScoped.GET("/memberships", projectHandler.ListMemberships)
+		projectScoped.GET(
+			"/membership-candidates",
+			projectHandler.SearchMembershipCandidates,
+		)
 		projectCommands.POST(
 			"/memberships",
 			projectHandler.UpsertMembership,

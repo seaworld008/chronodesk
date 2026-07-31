@@ -207,7 +207,7 @@ func TestPlatformProjectListRouteUsesExactPlatformAdminMatrix(t *testing.T) {
 	}
 }
 
-func TestRegisterPlatformProjectRoutesPublishesListCreateAndArchive(
+func TestRegisterPlatformProjectRoutesPublishesListContextCreateAndArchive(
 	t *testing.T,
 ) {
 	gin.SetMode(gin.TestMode)
@@ -221,6 +221,8 @@ func TestRegisterPlatformProjectRoutesPublishesListCreateAndArchive(
 	}
 	for _, expected := range []string{
 		"GET /api/platform/projects",
+		"GET /api/platform/project-creation-context",
+		"GET /api/platform/project-business-units",
 		"POST /api/platform/projects",
 		"POST /api/platform/projects/:projectPublicID/archive",
 	} {

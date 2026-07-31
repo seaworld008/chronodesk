@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -128,7 +129,7 @@ func seedProjectAccessFixture(
 
 func TestProjectServiceCreateProjectPersistsEventOutboxAndAudit(t *testing.T) {
 	db := newProjectServiceTestDB(t)
-	organization, unit, _, administrator := seedProjectAccessFixture(t, db)
+	_, unit, _, administrator := seedProjectAccessFixture(t, db)
 	if err := db.Model(&models.User{}).
 		Where("id = ?", administrator.ID).
 		Update(
@@ -152,12 +153,12 @@ func TestProjectServiceCreateProjectPersistsEventOutboxAndAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	access, err := service.CreateProject(context.Background(), CreateProjectInput{
-		OrganizationID:  organization.ID,
-		BusinessUnitID:  unit.ID,
-		Key:             "NEW",
-		Name:            "New Project",
-		AdministratorID: administrator.ID,
+	project, err := service.CreateProject(context.Background(), CreateProjectInput{
+		ActorUserID:             administrator.ID,
+		BusinessUnitPublicID:    unit.PublicID,
+		Key:                     "NEW",
+		Name:                    "New Project",
+		InitialAdministratorIDs: []uint{administrator.ID},
 	})
 	if err != nil {
 		t.Fatalf("CreateProject(): %v", err)
@@ -170,20 +171,20 @@ func TestProjectServiceCreateProjectPersistsEventOutboxAndAudit(t *testing.T) {
 	).First(&event).Error; err != nil {
 		t.Fatal(err)
 	}
-	if event.OrganizationID != access.Scope.OrganizationID ||
-		event.ProjectID != access.Scope.ProjectID ||
+	if event.OrganizationID != project.OrganizationID ||
+		event.ProjectID != project.ID ||
 		event.ActorType != models.ActorTypeHuman ||
 		event.ActorID != models.HumanActor(administrator.ID).ID ||
 		event.Subject != "project/"+
-			strconv.FormatUint(uint64(access.Project.ID), 10) ||
+			strconv.FormatUint(uint64(project.ID), 10) ||
 		event.ResourceVersion != 1 {
 		t.Fatalf("project event identity = %+v", event)
 	}
 	var release models.ConfigurationRelease
 	if err := db.Where(
 		"organization_id = ? AND project_id = ?",
-		access.Scope.OrganizationID,
-		access.Scope.ProjectID,
+		project.OrganizationID,
+		project.ID,
 	).First(&release).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +199,8 @@ func TestProjectServiceCreateProjectPersistsEventOutboxAndAudit(t *testing.T) {
 		OrganizationID              uint              `json:"organization_id"`
 		ProjectID                   uint              `json:"project_id"`
 		ProjectKey                  models.ProjectKey `json:"project_key"`
-		AdministratorID             string            `json:"administrator_id"`
+		CreatorUserID               string            `json:"creator_user_id"`
+		InitialProjectAdminUserIDs  []uint            `json:"initial_project_admin_user_ids"`
 		DefaultQueueID              uint              `json:"default_queue_id"`
 		ConfigurationReleaseID      string            `json:"configuration_release_id"`
 		ConfigurationReleaseVersion uint64            `json:"configuration_release_version"`
@@ -206,10 +208,14 @@ func TestProjectServiceCreateProjectPersistsEventOutboxAndAudit(t *testing.T) {
 	if err := json.Unmarshal(event.Data, &data); err != nil {
 		t.Fatal(err)
 	}
-	if data.OrganizationID != access.Scope.OrganizationID ||
-		data.ProjectID != access.Scope.ProjectID ||
-		data.ProjectKey != access.Project.Key ||
-		data.AdministratorID != models.HumanActor(administrator.ID).ID ||
+	if data.OrganizationID != project.OrganizationID ||
+		data.ProjectID != project.ID ||
+		data.ProjectKey != project.Key ||
+		data.CreatorUserID != models.HumanActor(administrator.ID).ID ||
+		!slices.Equal(
+			data.InitialProjectAdminUserIDs,
+			[]uint{administrator.ID},
+		) ||
 		data.DefaultQueueID == 0 ||
 		data.ConfigurationReleaseID != release.ID ||
 		data.ConfigurationReleaseVersion != release.Version {
@@ -219,8 +225,8 @@ func TestProjectServiceCreateProjectPersistsEventOutboxAndAudit(t *testing.T) {
 	if err := db.Where("event_id = ?", event.ID).First(&delivery).Error; err != nil {
 		t.Fatal(err)
 	}
-	if delivery.OrganizationID != access.Scope.OrganizationID ||
-		delivery.ProjectID != access.Scope.ProjectID ||
+	if delivery.OrganizationID != project.OrganizationID ||
+		delivery.ProjectID != project.ID ||
 		delivery.DestinationType != "event_stream" {
 		t.Fatalf("project event outbox = %+v", delivery)
 	}
@@ -458,9 +464,11 @@ func TestProjectServiceArchiveProjectPreservesDefaultControlPlaneEnvelope(
 ) {
 	db := newProjectServiceTestDB(t)
 	_, _, project, administrator := seedProjectAccessFixture(t, db)
-	if err := db.Model(&models.Project{}).
-		Where("id = ?", project.ID).
-		Update("key", models.ProjectKey("DEFAULT")).Error; err != nil {
+	if err := db.Exec(
+		"UPDATE projects SET key = ? WHERE id = ?",
+		models.ProjectKey("DEFAULT"),
+		project.ID,
+	).Error; err != nil {
 		t.Fatal(err)
 	}
 	project.Key = models.ProjectKey("DEFAULT")
@@ -535,11 +543,11 @@ func TestProjectServiceCreateProjectRequiresEventWriterAndRollsBackOnFailure(
 		t.Fatal(err)
 	}
 	input := CreateProjectInput{
-		OrganizationID:  organization.ID,
-		BusinessUnitID:  unit.ID,
-		Key:             "FAIL",
-		Name:            "Rollback Project",
-		AdministratorID: administrator.ID,
+		ActorUserID:             administrator.ID,
+		BusinessUnitPublicID:    unit.PublicID,
+		Key:                     "FAIL",
+		Name:                    "Rollback Project",
+		InitialAdministratorIDs: []uint{administrator.ID},
 	}
 	withoutEvents, err := NewProjectService(db)
 	if err != nil {
@@ -614,11 +622,11 @@ func TestProjectServiceCreateProjectRevalidatesPlatformAdministrator(
 	if _, err := service.CreateProject(
 		context.Background(),
 		CreateProjectInput{
-			OrganizationID:  organization.ID,
-			BusinessUnitID:  unit.ID,
-			Key:             "DENIED",
-			Name:            "Denied Project",
-			AdministratorID: member.ID,
+			ActorUserID:             member.ID,
+			BusinessUnitPublicID:    unit.PublicID,
+			Key:                     "DENIED",
+			Name:                    "Denied Project",
+			InitialAdministratorIDs: []uint{member.ID},
 		},
 	); !errors.Is(err, ErrProjectAccessDenied) {
 		t.Fatalf(

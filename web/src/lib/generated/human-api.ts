@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.0.0.
- * Contract SHA-256: ea1dcd4226f0fc6ebfe48c10cb676ec3f80c556aed17d612e2323485324fcbf2.
+ * Contract SHA-256: c998ba3ad08fcac6ec1d12390313558bee900ebd8cffb41763b3cee387243fbb.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -14,6 +14,8 @@ export type ProjectRole = (typeof projectRoleValues)[number]
 export type UserStatus = "active" | "inactive" | "suspended" | "deleted"
 
 export type ProjectStatus = "active" | "archived"
+
+export type PublicUUIDv7 = string
 
 export type LoginRequest = {
     email: string
@@ -55,13 +57,13 @@ export type UpsertProjectMembershipRequest = {
 }
 
 export type CreatePlatformProjectRequest = {
-    organization_id: number
-    business_unit_id: number
+    business_unit_public_id: PublicUUIDv7
     key: string
     name: string
     description?: string
-    default_queue_key?: string
-    default_queue_name?: string
+    initial_project_admin_user_ids: Array<number>
+    default_queue_key: string
+    default_queue_name: string
 }
 
 export type CreateAdminUserRequest = {
@@ -136,11 +138,64 @@ export type AuthSession = {
 }
 
 export type PlatformProjectSummary = {
-    public_id: string
+    public_id: PublicUUIDv7
+    created_at: string
+    updated_at: string
     key: string
     name: string
     description: string
     status: ProjectStatus
+    business_unit: PlatformBusinessUnitSummary
+}
+
+export type PlatformOrganizationSummary = {
+    public_id: PublicUUIDv7
+    name: string
+}
+
+export type PlatformBusinessUnitSummary = {
+    public_id: PublicUUIDv7
+    key: string
+    name: string
+    description: string
+}
+
+export type ProjectUserOption = {
+    id: number
+    username: string
+    display_name: string
+    avatar: string
+}
+
+export type ProjectUserOptionPage = {
+    items: Array<ProjectUserOption>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type PlatformBusinessUnitPage = {
+    items: Array<PlatformBusinessUnitSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type ProjectCreationContext = {
+    organization: PlatformOrganizationSummary
+    business_units: PlatformBusinessUnitPage
+    creator: ProjectUserOption
+    users: ProjectUserOptionPage
+}
+
+export type PlatformProjectPage = {
+    items: Array<PlatformProjectSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
 }
 
 export type AuthorizedProject = {
@@ -295,10 +350,28 @@ export type PlatformProjectSummaryEnvelope = {
     data: PlatformProjectSummary
 }
 
-export type PlatformProjectSummaryListEnvelope = {
+export type PlatformProjectPageEnvelope = {
     code: 0
     msg: string
-    data: Array<PlatformProjectSummary>
+    data: PlatformProjectPage
+}
+
+export type PlatformBusinessUnitPageEnvelope = {
+    code: 0
+    msg: string
+    data: PlatformBusinessUnitPage
+}
+
+export type ProjectCreationContextEnvelope = {
+    code: 0
+    msg: string
+    data: ProjectCreationContext
+}
+
+export type ProjectUserOptionPageEnvelope = {
+    code: 0
+    msg: string
+    data: ProjectUserOptionPage
 }
 
 export type StandardErrorEnvelope = {
@@ -1655,6 +1728,17 @@ export type UpsertProjectMembershipOperationQuery = Record<string, never>
 export type UpsertProjectMembershipOperationRequest = UpsertProjectMembershipRequest
 export type UpsertProjectMembershipOperationResponse = ProjectMembershipEnvelope
 
+export type SearchProjectMembershipCandidatesOperationPathParameters = {
+    projectKey: string
+}
+export type SearchProjectMembershipCandidatesOperationQuery = {
+    page?: number
+    page_size?: number
+    search?: string
+}
+export type SearchProjectMembershipCandidatesOperationRequest = never
+export type SearchProjectMembershipCandidatesOperationResponse = ProjectUserOptionPageEnvelope
+
 export type DeactivateProjectMembershipOperationPathParameters = {
     projectKey: string
     userID: number
@@ -1664,14 +1748,43 @@ export type DeactivateProjectMembershipOperationRequest = never
 export type DeactivateProjectMembershipOperationResponse = ProjectMembershipEnvelope
 
 export type ListPlatformProjectsOperationPathParameters = Record<string, never>
-export type ListPlatformProjectsOperationQuery = Record<string, never>
+export type ListPlatformProjectsOperationQuery = {
+    page?: number
+    page_size?: number
+    search?: string
+    status?: ProjectStatus
+    business_unit_public_id?: PublicUUIDv7
+    order_by?: "name" | "key" | "status" | "business_unit" | "created_at" | "updated_at"
+    order?: "asc" | "desc"
+}
 export type ListPlatformProjectsOperationRequest = never
-export type ListPlatformProjectsOperationResponse = PlatformProjectSummaryListEnvelope
+export type ListPlatformProjectsOperationResponse = PlatformProjectPageEnvelope
 
 export type CreatePlatformProjectOperationPathParameters = Record<string, never>
 export type CreatePlatformProjectOperationQuery = Record<string, never>
 export type CreatePlatformProjectOperationRequest = CreatePlatformProjectRequest
 export type CreatePlatformProjectOperationResponse = PlatformProjectSummaryEnvelope
+
+export type GetPlatformProjectCreationContextOperationPathParameters = Record<string, never>
+export type GetPlatformProjectCreationContextOperationQuery = {
+    page?: number
+    page_size?: number
+    search?: string
+    business_unit_page?: number
+    business_unit_page_size?: number
+    business_unit_search?: string
+}
+export type GetPlatformProjectCreationContextOperationRequest = never
+export type GetPlatformProjectCreationContextOperationResponse = ProjectCreationContextEnvelope
+
+export type ListPlatformProjectBusinessUnitsOperationPathParameters = Record<string, never>
+export type ListPlatformProjectBusinessUnitsOperationQuery = {
+    page?: number
+    page_size?: number
+    search?: string
+}
+export type ListPlatformProjectBusinessUnitsOperationRequest = never
+export type ListPlatformProjectBusinessUnitsOperationResponse = PlatformBusinessUnitPageEnvelope
 
 export type ArchivePlatformProjectOperationPathParameters = {
     projectPublicID: string
@@ -2371,6 +2484,12 @@ export const humanApiOperations = {
         successStatus: 200,
         requestBody: "required",
     },
+    searchProjectMembershipCandidates: {
+        method: "GET",
+        path: "/projects/{projectKey}/membership-candidates",
+        successStatus: 200,
+        requestBody: "none",
+    },
     deactivateProjectMembership: {
         method: "DELETE",
         path: "/projects/{projectKey}/memberships/{userID}",
@@ -2388,6 +2507,18 @@ export const humanApiOperations = {
         path: "/platform/projects",
         successStatus: 201,
         requestBody: "required",
+    },
+    getPlatformProjectCreationContext: {
+        method: "GET",
+        path: "/platform/project-creation-context",
+        successStatus: 200,
+        requestBody: "none",
+    },
+    listPlatformProjectBusinessUnits: {
+        method: "GET",
+        path: "/platform/project-business-units",
+        successStatus: 200,
+        requestBody: "none",
     },
     archivePlatformProject: {
         method: "POST",
@@ -2872,6 +3003,12 @@ export interface HumanApiOperationTypes {
         request: UpsertProjectMembershipOperationRequest
         response: UpsertProjectMembershipOperationResponse
     }
+    searchProjectMembershipCandidates: {
+        pathParameters: SearchProjectMembershipCandidatesOperationPathParameters
+        query: SearchProjectMembershipCandidatesOperationQuery
+        request: SearchProjectMembershipCandidatesOperationRequest
+        response: SearchProjectMembershipCandidatesOperationResponse
+    }
     deactivateProjectMembership: {
         pathParameters: DeactivateProjectMembershipOperationPathParameters
         query: DeactivateProjectMembershipOperationQuery
@@ -2889,6 +3026,18 @@ export interface HumanApiOperationTypes {
         query: CreatePlatformProjectOperationQuery
         request: CreatePlatformProjectOperationRequest
         response: CreatePlatformProjectOperationResponse
+    }
+    getPlatformProjectCreationContext: {
+        pathParameters: GetPlatformProjectCreationContextOperationPathParameters
+        query: GetPlatformProjectCreationContextOperationQuery
+        request: GetPlatformProjectCreationContextOperationRequest
+        response: GetPlatformProjectCreationContextOperationResponse
+    }
+    listPlatformProjectBusinessUnits: {
+        pathParameters: ListPlatformProjectBusinessUnitsOperationPathParameters
+        query: ListPlatformProjectBusinessUnitsOperationQuery
+        request: ListPlatformProjectBusinessUnitsOperationRequest
+        response: ListPlatformProjectBusinessUnitsOperationResponse
     }
     archivePlatformProject: {
         pathParameters: ArchivePlatformProjectOperationPathParameters
@@ -3399,12 +3548,18 @@ export const humanApiRoutes = {
         humanApiRoute("listProjectMemberships", pathParameters, query),
     upsertProjectMembership: (pathParameters: UpsertProjectMembershipOperationPathParameters, query: UpsertProjectMembershipOperationQuery = {}) =>
         humanApiRoute("upsertProjectMembership", pathParameters, query),
+    searchProjectMembershipCandidates: (pathParameters: SearchProjectMembershipCandidatesOperationPathParameters, query: SearchProjectMembershipCandidatesOperationQuery = {}) =>
+        humanApiRoute("searchProjectMembershipCandidates", pathParameters, query),
     deactivateProjectMembership: (pathParameters: DeactivateProjectMembershipOperationPathParameters, query: DeactivateProjectMembershipOperationQuery = {}) =>
         humanApiRoute("deactivateProjectMembership", pathParameters, query),
     listPlatformProjects: (query: ListPlatformProjectsOperationQuery = {}) =>
         humanApiRoute("listPlatformProjects", {}, query),
     createPlatformProject: (query: CreatePlatformProjectOperationQuery = {}) =>
         humanApiRoute("createPlatformProject", {}, query),
+    getPlatformProjectCreationContext: (query: GetPlatformProjectCreationContextOperationQuery = {}) =>
+        humanApiRoute("getPlatformProjectCreationContext", {}, query),
+    listPlatformProjectBusinessUnits: (query: ListPlatformProjectBusinessUnitsOperationQuery = {}) =>
+        humanApiRoute("listPlatformProjectBusinessUnits", {}, query),
     archivePlatformProject: (pathParameters: ArchivePlatformProjectOperationPathParameters, query: ArchivePlatformProjectOperationQuery = {}) =>
         humanApiRoute("archivePlatformProject", pathParameters, query),
     listPlatformUsers: (query: ListPlatformUsersOperationQuery = {}) =>

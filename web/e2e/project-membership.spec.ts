@@ -47,6 +47,7 @@ type MembershipMockState = {
     upserts: UpsertProjectMembershipRequest[];
     revokedUserIDs: number[];
     membershipReads: number;
+    candidateReads: number;
 };
 
 const installMembershipBackend = async (
@@ -60,6 +61,7 @@ const installMembershipBackend = async (
         upserts: [],
         revokedUserIDs: [],
         membershipReads: 0,
+        candidateReads: 0,
     };
     const access = authorizedProjectAccess(projectA, projectRole);
     const collectionPath =
@@ -81,6 +83,42 @@ const installMembershipBackend = async (
             await fulfillJSON(route, {
                 code: 0,
                 data: state.memberships,
+            });
+            return;
+        }
+        if (
+            url.pathname ===
+                `/api/projects/${projectA.key}/membership-candidates` &&
+            request.method() === 'GET'
+        ) {
+            state.candidateReads += 1;
+            const rawSearch = url.searchParams.get('search') ?? '';
+            const numericID = Number(rawSearch.replace(/\D/gu, ''));
+            const items = Number.isSafeInteger(numericID) && numericID > 0
+                ? [{
+                    id: numericID,
+                    username: `candidate-${numericID}`,
+                    display_name: `候选用户 ${numericID}`,
+                    avatar: '',
+                }]
+                : state.memberships
+                    .filter(({ user }) => user)
+                    .slice(0, 25)
+                    .map(({ user }) => ({
+                        id: user!.id,
+                        username: user!.username,
+                        display_name: user!.display_name,
+                        avatar: user!.avatar,
+                    }));
+            await fulfillJSON(route, {
+                code: 0,
+                data: {
+                    items,
+                    total: items.length,
+                    page: 1,
+                    page_size: 25,
+                    total_pages: items.length > 0 ? 1 : 0,
+                },
             });
             return;
         }
@@ -216,13 +254,13 @@ test.describe('项目成员管理五角色 UI', () => {
         await page.goto('/#/');
         await page
             .getByRole('menuitem', {
-                name: '项目成员管理',
+                name: '项目配置',
                 exact: true,
             })
             .click();
         await expect(page).toHaveURL(/#\/project-memberships$/u);
         await expect(
-            page.getByRole('heading', {
+            page.getByTestId('project-membership-page').getByRole('heading', {
                 name: '项目成员管理',
                 exact: true,
             }),
@@ -247,7 +285,7 @@ test.describe('项目成员管理五角色 UI', () => {
         await userResizeHandle.press('ArrowRight');
         await expect(userResizeHandle).toHaveAttribute(
             'aria-valuenow',
-            '308',
+            '328',
         );
         await expect.poll(() =>
             page.evaluate(() => {
@@ -258,7 +296,7 @@ test.describe('项目成员管理五角色 UI', () => {
                     ? (JSON.parse(raw) as { user?: unknown }).user
                     : null;
             }),
-        ).toBe(308);
+        ).toBe(328);
         const firstMembershipCells = table
             .getByRole('row')
             .filter({ hasText: roleLabels.project_admin })
@@ -274,7 +312,13 @@ test.describe('项目成员管理五角色 UI', () => {
 
         for (const [index, role] of projectRoleValues.entries()) {
             const userID = 201 + index;
-            await page.getByLabel('用户 ID').fill(String(userID));
+            const userSearch = page.getByLabel('搜索用户');
+            await userSearch.fill(`候选 ${userID}`);
+            await page
+                .getByRole('option', {
+                    name: new RegExp(`候选用户 ${userID}`, 'u'),
+                })
+                .click();
             await selectRole(page, role);
             const saveRequest = page.waitForRequest(
                 (request) =>
@@ -310,8 +354,8 @@ test.describe('项目成员管理五角色 UI', () => {
                 exact: true,
             })
             .click();
-        await expect(page.getByLabel('用户 ID')).toHaveValue(
-            String(observerUserID),
+        await expect(page.getByLabel('搜索用户')).toHaveValue(
+            `${roleLabels.observer} ${observerUserID}`,
         );
         await selectRole(page, 'manager');
         await page
@@ -357,10 +401,50 @@ test.describe('项目成员管理五角色 UI', () => {
         expect(state.upserts).toHaveLength(6);
         expect(state.revokedUserIDs).toEqual([201]);
         expect(state.membershipReads).toBeGreaterThanOrEqual(8);
+        expect(state.candidateReads).toBeGreaterThan(0);
+    });
+
+    test('manager 可查看成员但没有候选搜索或成员写操作', async ({ page }) => {
+        await installMockSession(
+            page,
+            {
+                ...defaultMockIdentity,
+                sessionID: 'e2e-project-membership-manager',
+            },
+            projectA,
+        );
+        const state = await installMembershipBackend(page, 'manager');
+        await page.goto('/#/');
+        await page
+            .getByRole('menuitem', {
+                name: '项目配置',
+                exact: true,
+            })
+            .click();
+        await expect(page).toHaveURL(/#\/project-memberships$/u);
+        await expect(
+            page.getByTestId('project-membership-read-only'),
+        ).toBeVisible();
+        await expect(
+            page.getByRole('table', { name: '项目成员列表' }),
+        ).toBeVisible();
+        await expect(page.getByLabel('搜索用户')).toHaveCount(0);
+        await expect(
+            page.getByRole('button', { name: '变更职责', exact: true }),
+        ).toHaveCount(0);
+        await expect(
+            page.getByRole('button', {
+                name: '撤销项目职责',
+                exact: true,
+            }),
+        ).toHaveCount(0);
+        expect(state.membershipReads).toBeGreaterThan(0);
+        expect(state.candidateReads).toBe(0);
     });
 
     for (const role of projectRoleValues.filter(
-        (candidate) => candidate !== 'project_admin',
+        (candidate) =>
+            candidate !== 'project_admin' && candidate !== 'manager',
     )) {
         test(`${role} 无项目成员管理菜单且直接路由不发 memberships 请求`, async ({
             page,
@@ -378,7 +462,7 @@ test.describe('项目成员管理五角色 UI', () => {
 
             await expect(
                 page.getByRole('menuitem', {
-                    name: '项目成员管理',
+                    name: '项目配置',
                     exact: true,
                 }),
             ).toHaveCount(0);

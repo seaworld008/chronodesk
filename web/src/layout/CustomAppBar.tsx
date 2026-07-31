@@ -34,7 +34,10 @@ import {
   setActiveProjectKey,
   type AuthorizedProject,
 } from '@/lib/projectScope'
-import { projectScopeChangedEvent } from '@/lib/projectScopeEvents'
+import {
+  projectInventoryChangedEvent,
+  projectScopeChangedEvent,
+} from '@/lib/projectScopeEvents'
 import { logoutAllSessions } from '@/lib/authProvider'
 import { visibleNavigationItems } from '@/navigation/navigationRegistry'
 import { resolveRoutePageScope } from './routePageScope'
@@ -261,9 +264,9 @@ const AppBarContextControls: React.FC = () => {
 
   React.useEffect(() => {
     let active = true
-    const loadProjects = () => {
+    const loadProjects = (force: boolean) => {
       setLoading(true)
-      void loadAuthorizedProjects(true)
+      void loadAuthorizedProjects(force)
         .then((authorized) => {
           if (!active) return
           setProjects(authorized)
@@ -288,13 +291,20 @@ const AppBarContextControls: React.FC = () => {
           if (active) setLoading(false)
         })
     }
-    loadProjects()
-    window.addEventListener(projectAccessInvalidatedEvent, loadProjects)
-    window.addEventListener(projectScopeChangedEvent, loadProjects)
+    const reloadProjects = () => loadProjects(true)
+    const loadCachedProjects = () => loadProjects(false)
+    reloadProjects()
+    window.addEventListener(projectAccessInvalidatedEvent, reloadProjects)
+    window.addEventListener(projectInventoryChangedEvent, loadCachedProjects)
+    window.addEventListener(projectScopeChangedEvent, reloadProjects)
     return () => {
       active = false
-      window.removeEventListener(projectAccessInvalidatedEvent, loadProjects)
-      window.removeEventListener(projectScopeChangedEvent, loadProjects)
+      window.removeEventListener(projectAccessInvalidatedEvent, reloadProjects)
+      window.removeEventListener(
+        projectInventoryChangedEvent,
+        loadCachedProjects,
+      )
+      window.removeEventListener(projectScopeChangedEvent, reloadProjects)
     }
   }, [])
 

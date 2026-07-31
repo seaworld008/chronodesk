@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
@@ -20,18 +22,26 @@ import (
 )
 
 var (
-	ErrProjectNotFound           = errors.New("project not found")
-	ErrProjectAccessDenied       = errors.New("project access denied")
-	ErrProjectInactive           = errors.New("project is not active")
-	ErrQueueNotFound             = errors.New("queue not found")
-	ErrProjectMembershipNotFound = errors.New("project membership not found")
-	ErrProjectMembershipUser     = errors.New("project membership user is unavailable")
-	ErrProjectMembershipConflict = errors.New("project membership conflicts with required grant")
-	ErrLastProjectAdministrator  = errors.New("project requires an active administrator")
-	ErrProjectEventWriter        = errors.New("project event writer is unavailable")
-	ErrProjectPublicID           = errors.New("invalid project public id")
-	ErrDefaultProjectArchive     = errors.New("default project cannot be archived")
-	ErrProjectSequenceConflict   = errors.New("project ticket sequence conflict")
+	ErrProjectNotFound            = errors.New("project not found")
+	ErrProjectAccessDenied        = errors.New("project access denied")
+	ErrProjectInactive            = errors.New("project is not active")
+	ErrQueueNotFound              = errors.New("queue not found")
+	ErrProjectMembershipNotFound  = errors.New("project membership not found")
+	ErrProjectMembershipUser      = errors.New("project membership user is unavailable")
+	ErrProjectMembershipConflict  = errors.New("project membership conflicts with required grant")
+	ErrLastProjectAdministrator   = errors.New("project requires an active administrator")
+	ErrProjectEventWriter         = errors.New("project event writer is unavailable")
+	ErrProjectPublicID            = errors.New("invalid project public id")
+	ErrDefaultProjectArchive      = errors.New("default project cannot be archived")
+	ErrProjectSequenceConflict    = errors.New("project ticket sequence conflict")
+	ErrProjectGovernanceQuery     = errors.New("invalid project governance query")
+	ErrProjectOrganizationContext = errors.New(
+		"authenticated organization context is unavailable",
+	)
+	ErrBusinessUnitPublicID        = errors.New("invalid business unit public id")
+	ErrInitialProjectAdministrator = errors.New(
+		"at least one active initial project administrator is required",
+	)
 )
 
 const projectAccessRevocationOutboxDestinationID = "access-revocation"
@@ -195,11 +205,94 @@ type AuthorizedProject struct {
 // Platform governance must be able to discover every Project independently of
 // Membership, but that does not mint a ProjectRole or a trusted numeric scope.
 type PlatformProjectSummary struct {
-	PublicID    string               `json:"public_id"`
-	Key         models.ProjectKey    `json:"key"`
-	Name        string               `json:"name"`
-	Description string               `json:"description"`
-	Status      models.ProjectStatus `json:"status"`
+	PublicID     string                      `json:"public_id"`
+	CreatedAt    time.Time                   `json:"created_at"`
+	UpdatedAt    time.Time                   `json:"updated_at"`
+	Key          models.ProjectKey           `json:"key"`
+	Name         string                      `json:"name"`
+	Description  string                      `json:"description"`
+	Status       models.ProjectStatus        `json:"status"`
+	BusinessUnit PlatformBusinessUnitSummary `json:"business_unit"`
+}
+
+// PlatformOrganizationSummary and PlatformBusinessUnitSummary expose public
+// governance identities only. Numeric trusted scope never crosses the Human
+// Web project-creation boundary.
+type PlatformOrganizationSummary struct {
+	PublicID string `json:"public_id"`
+	Name     string `json:"name"`
+}
+
+type PlatformBusinessUnitSummary struct {
+	PublicID    string `json:"public_id"`
+	Key         string `json:"key"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+type PlatformProjectListRequest struct {
+	Page                 int
+	PageSize             int
+	Search               string
+	Status               *models.ProjectStatus
+	BusinessUnitPublicID string
+	OrderBy              string
+	Order                string
+}
+
+type PlatformProjectPage struct {
+	Items      []PlatformProjectSummary `json:"items"`
+	Total      int64                    `json:"total"`
+	Page       int                      `json:"page"`
+	PageSize   int                      `json:"page_size"`
+	TotalPages int                      `json:"total_pages"`
+}
+
+type ProjectUserSearchRequest struct {
+	Page     int
+	PageSize int
+	Search   string
+}
+
+type ProjectUserOption struct {
+	ID          uint   `json:"id"`
+	Username    string `json:"username"`
+	DisplayName string `json:"display_name"`
+	Avatar      string `json:"avatar"`
+}
+
+type ProjectUserOptionPage struct {
+	Items      []ProjectUserOption `json:"items"`
+	Total      int64               `json:"total"`
+	Page       int                 `json:"page"`
+	PageSize   int                 `json:"page_size"`
+	TotalPages int                 `json:"total_pages"`
+}
+
+type PlatformBusinessUnitSearchRequest struct {
+	Page     int
+	PageSize int
+	Search   string
+}
+
+type PlatformBusinessUnitPage struct {
+	Items      []PlatformBusinessUnitSummary `json:"items"`
+	Total      int64                         `json:"total"`
+	Page       int                           `json:"page"`
+	PageSize   int                           `json:"page_size"`
+	TotalPages int                           `json:"total_pages"`
+}
+
+type ProjectCreationContextRequest struct {
+	Users         ProjectUserSearchRequest
+	BusinessUnits PlatformBusinessUnitSearchRequest
+}
+
+type ProjectCreationContext struct {
+	Organization  PlatformOrganizationSummary `json:"organization"`
+	BusinessUnits PlatformBusinessUnitPage    `json:"business_units"`
+	Creator       ProjectUserOption           `json:"creator"`
+	Users         ProjectUserOptionPage       `json:"users"`
 }
 
 func (access ProjectAccess) MarshalJSON() ([]byte, error) {
@@ -847,15 +940,38 @@ func (service *ProjectService) ListHumanProjects(
 	return result, nil
 }
 
-// ListPlatformProjects returns the platform governance inventory without
-// resolving any ProjectScope or consulting ProjectMembership. The current
-// persisted account state is locked and revalidated in the same read
-// transaction, so a stale platform_admin token cannot authorize this query
-// after the account is disabled, deleted, or assigned another platform duty.
+// ListPlatformProjects retains the small service seam used by non-HTTP
+// platform authorization tests. Browser governance uses
+// ListPlatformProjectPage so every request is bounded.
 func (service *ProjectService) ListPlatformProjects(
 	ctx context.Context,
 	userID uint,
 ) ([]PlatformProjectSummary, error) {
+	page, err := service.ListPlatformProjectPage(
+		ctx,
+		userID,
+		PlatformProjectListRequest{
+			Page:     1,
+			PageSize: 100,
+			OrderBy:  "status",
+			Order:    "asc",
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return page.Items, nil
+}
+
+// ListPlatformProjectPage returns the bounded platform governance inventory
+// without resolving ProjectScope or consulting ProjectMembership. The current
+// account and the single authenticated Organization context are revalidated
+// inside the same read transaction.
+func (service *ProjectService) ListPlatformProjectPage(
+	ctx context.Context,
+	userID uint,
+	request PlatformProjectListRequest,
+) (*PlatformProjectPage, error) {
 	if service == nil ||
 		service.db == nil ||
 		ctx == nil ||
@@ -863,64 +979,542 @@ func (service *ProjectService) ListPlatformProjects(
 		scopeddb.HasTransaction(ctx) {
 		return nil, ErrProjectAccessDenied
 	}
+	normalized, err := normalizePlatformProjectListRequest(request)
+	if err != nil {
+		return nil, err
+	}
 
-	projects := make([]PlatformProjectSummary, 0)
-	err := service.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var administrator struct {
-			ID uint
+	result := &PlatformProjectPage{
+		Items:    make([]PlatformProjectSummary, 0),
+		Page:     normalized.Page,
+		PageSize: normalized.PageSize,
+	}
+	err = service.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, lockErr := lockPlatformProjectAdministrator(
+			tx,
+			userID,
+			"SHARE",
+		); lockErr != nil {
+			return lockErr
 		}
-		err := tx.
-			Unscoped().
-			Model(&models.User{}).
-			Select("id").
-			Clauses(clause.Locking{Strength: "SHARE"}).
-			Where(
-				"id = ? AND deleted_at IS NULL AND status = ? AND platform_role = ?",
-				userID,
-				models.UserStatusActive,
-				models.PlatformRolePlatformAdmin,
+		organization, organizationErr := resolveAuthenticatedOrganizationTx(tx)
+		if organizationErr != nil {
+			return organizationErr
+		}
+
+		query := tx.
+			Table("projects").
+			Joins(
+				"JOIN business_units ON business_units.id = projects.business_unit_id AND business_units.organization_id = projects.organization_id",
 			).
-			Take(&administrator).Error
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return ErrProjectAccessDenied
-		}
-		if err != nil {
-			return fmt.Errorf(
-				"revalidate platform project administrator: %w",
-				err,
+			Where("projects.organization_id = ?", organization.ID)
+		if normalized.Search != "" {
+			pattern := "%" + escapeSQLLike(
+				strings.ToLower(normalized.Search),
+			) + "%"
+			query = query.Where(
+				"(LOWER(CAST(projects.key AS TEXT)) LIKE ? ESCAPE '\\' OR LOWER(projects.name) LIKE ? ESCAPE '\\' OR LOWER(projects.description) LIKE ? ESCAPE '\\')",
+				pattern,
+				pattern,
+				pattern,
 			)
 		}
-		if administrator.ID != userID {
-			return ErrProjectAccessDenied
+		if normalized.Status != nil {
+			query = query.Where("projects.status = ?", *normalized.Status)
+		}
+		if normalized.BusinessUnitPublicID != "" {
+			query = query.Where(
+				"business_units.public_id = ?",
+				normalized.BusinessUnitPublicID,
+			)
+		}
+		if err := query.Count(&result.Total).Error; err != nil {
+			return fmt.Errorf("count platform projects: %w", err)
 		}
 
-		if err := tx.
-			Table("projects").
-			Select("public_id, key, name, description, status").
-			Order("status ASC, name ASC, public_id ASC").
-			Scan(&projects).Error; err != nil {
+		orderColumn := clause.Column{Table: "projects", Name: normalized.OrderBy}
+		if normalized.OrderBy == "business_unit" {
+			orderColumn = clause.Column{Table: "business_units", Name: "name"}
+		}
+		descending := normalized.Order == "desc"
+		query = query.
+			Select(
+				"projects.public_id, projects.created_at, projects.updated_at, projects.key, projects.name, projects.description, projects.status, business_units.public_id AS business_unit_public_id, business_units.key AS business_unit_key, business_units.name AS business_unit_name, business_units.description AS business_unit_description",
+			).
+			Clauses(clause.OrderBy{
+				Columns: []clause.OrderByColumn{
+					{Column: orderColumn, Desc: descending},
+					{
+						Column: clause.Column{
+							Table: "projects",
+							Name:  "id",
+						},
+						Desc: descending,
+					},
+				},
+			}).
+			Offset((normalized.Page - 1) * normalized.PageSize).
+			Limit(normalized.PageSize)
+		var rows []struct {
+			PublicID                string
+			CreatedAt               time.Time
+			UpdatedAt               time.Time
+			Key                     models.ProjectKey
+			Name                    string
+			Description             string
+			Status                  models.ProjectStatus
+			BusinessUnitPublicID    string
+			BusinessUnitKey         string
+			BusinessUnitName        string
+			BusinessUnitDescription string
+		}
+		if err := query.Scan(&rows).Error; err != nil {
 			return fmt.Errorf("list platform projects: %w", err)
 		}
-		for _, project := range projects {
-			parsedPublicID, parseErr := uuid.Parse(project.PublicID)
-			if parseErr != nil ||
-				parsedPublicID.Version() != 7 ||
-				parsedPublicID.Variant() != uuid.RFC4122 ||
-				parsedPublicID.String() != project.PublicID ||
-				!project.Key.IsValid() ||
-				(project.Status != models.ProjectStatusActive &&
-					project.Status != models.ProjectStatusArchived) {
-				return errors.New(
-					"platform project inventory contains invalid project identity",
-				)
+		for _, row := range rows {
+			item := PlatformProjectSummary{
+				PublicID:    row.PublicID,
+				CreatedAt:   row.CreatedAt,
+				UpdatedAt:   row.UpdatedAt,
+				Key:         row.Key,
+				Name:        row.Name,
+				Description: row.Description,
+				Status:      row.Status,
+				BusinessUnit: PlatformBusinessUnitSummary{
+					PublicID:    row.BusinessUnitPublicID,
+					Key:         row.BusinessUnitKey,
+					Name:        row.BusinessUnitName,
+					Description: row.BusinessUnitDescription,
+				},
 			}
+			if err := validatePlatformProjectSummary(item); err != nil {
+				return err
+			}
+			result.Items = append(result.Items, item)
 		}
+		result.TotalPages = pageCount(result.Total, result.PageSize)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return projects, nil
+	return result, nil
+}
+
+func normalizePlatformProjectListRequest(
+	request PlatformProjectListRequest,
+) (PlatformProjectListRequest, error) {
+	if request.Page < 1 ||
+		request.PageSize < 1 ||
+		request.PageSize > 100 {
+		return PlatformProjectListRequest{}, ErrProjectGovernanceQuery
+	}
+	request.Search = strings.TrimSpace(request.Search)
+	if utf8.RuneCountInString(request.Search) > 100 {
+		return PlatformProjectListRequest{}, ErrProjectGovernanceQuery
+	}
+	if request.Status != nil &&
+		*request.Status != models.ProjectStatusActive &&
+		*request.Status != models.ProjectStatusArchived {
+		return PlatformProjectListRequest{}, ErrProjectGovernanceQuery
+	}
+	request.BusinessUnitPublicID =
+		strings.TrimSpace(request.BusinessUnitPublicID)
+	if request.BusinessUnitPublicID != "" &&
+		!isCanonicalUUIDv7(request.BusinessUnitPublicID) {
+		return PlatformProjectListRequest{}, ErrProjectGovernanceQuery
+	}
+	if request.OrderBy == "" {
+		request.OrderBy = "name"
+	}
+	switch request.OrderBy {
+	case "name", "key", "status", "business_unit", "created_at", "updated_at":
+	default:
+		return PlatformProjectListRequest{}, ErrProjectGovernanceQuery
+	}
+	if request.Order == "" {
+		request.Order = "asc"
+	}
+	if request.Order != "asc" && request.Order != "desc" {
+		return PlatformProjectListRequest{}, ErrProjectGovernanceQuery
+	}
+	return request, nil
+}
+
+func validatePlatformProjectSummary(project PlatformProjectSummary) error {
+	if !isCanonicalUUIDv7(project.PublicID) ||
+		!isCanonicalUUIDv7(project.BusinessUnit.PublicID) ||
+		!project.Key.IsValid() ||
+		(project.Status != models.ProjectStatusActive &&
+			project.Status != models.ProjectStatusArchived) {
+		return errors.New(
+			"platform project inventory contains invalid project identity",
+		)
+	}
+	return nil
+}
+
+func (service *ProjectService) GetProjectCreationContext(
+	ctx context.Context,
+	userID uint,
+	request ProjectCreationContextRequest,
+) (*ProjectCreationContext, error) {
+	if service == nil ||
+		service.db == nil ||
+		ctx == nil ||
+		userID == 0 ||
+		scopeddb.HasTransaction(ctx) {
+		return nil, ErrProjectAccessDenied
+	}
+	usersRequest, err := normalizeProjectUserSearchRequest(request.Users)
+	if err != nil {
+		return nil, err
+	}
+	businessUnitsRequest, err := normalizeBusinessUnitSearchRequest(
+		request.BusinessUnits,
+	)
+	if err != nil {
+		return nil, err
+	}
+	var result ProjectCreationContext
+	err = service.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		creator, lockErr := lockPlatformProjectAdministrator(
+			tx,
+			userID,
+			"SHARE",
+		)
+		if lockErr != nil {
+			return lockErr
+		}
+		organization, organizationErr := resolveAuthenticatedOrganizationTx(tx)
+		if organizationErr != nil {
+			return organizationErr
+		}
+		result.Organization = PlatformOrganizationSummary{
+			PublicID: organization.PublicID,
+			Name:     organization.Name,
+		}
+		result.Creator = projectUserOption(creator)
+
+		businessUnits, businessUnitErr := searchBusinessUnitsTx(
+			tx,
+			organization.ID,
+			businessUnitsRequest,
+			true,
+		)
+		if businessUnitErr != nil {
+			return businessUnitErr
+		}
+		result.BusinessUnits = *businessUnits
+		users, userErr := searchProjectUsersTx(tx, usersRequest)
+		if userErr != nil {
+			return userErr
+		}
+		result.Users = *users
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// ListPlatformProjectBusinessUnits returns every current and historical
+// Business Unit as a bounded governance filter dimension. Project creation
+// deliberately uses GetProjectCreationContext instead, whose options remain
+// active-only.
+func (service *ProjectService) ListPlatformProjectBusinessUnits(
+	ctx context.Context,
+	userID uint,
+	request PlatformBusinessUnitSearchRequest,
+) (*PlatformBusinessUnitPage, error) {
+	if service == nil ||
+		service.db == nil ||
+		ctx == nil ||
+		userID == 0 ||
+		scopeddb.HasTransaction(ctx) {
+		return nil, ErrProjectAccessDenied
+	}
+	normalized, err := normalizeBusinessUnitSearchRequest(request)
+	if err != nil {
+		return nil, err
+	}
+	var result *PlatformBusinessUnitPage
+	err = service.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, lockErr := lockPlatformProjectAdministrator(
+			tx,
+			userID,
+			"SHARE",
+		); lockErr != nil {
+			return lockErr
+		}
+		organization, organizationErr := resolveAuthenticatedOrganizationTx(tx)
+		if organizationErr != nil {
+			return organizationErr
+		}
+		var searchErr error
+		result, searchErr = searchBusinessUnitsTx(
+			tx,
+			organization.ID,
+			normalized,
+			false,
+		)
+		return searchErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func normalizeBusinessUnitSearchRequest(
+	request PlatformBusinessUnitSearchRequest,
+) (PlatformBusinessUnitSearchRequest, error) {
+	if request.Page < 1 ||
+		request.PageSize < 1 ||
+		request.PageSize > 100 {
+		return PlatformBusinessUnitSearchRequest{}, ErrProjectGovernanceQuery
+	}
+	request.Search = strings.TrimSpace(request.Search)
+	if utf8.RuneCountInString(request.Search) > 100 {
+		return PlatformBusinessUnitSearchRequest{}, ErrProjectGovernanceQuery
+	}
+	return request, nil
+}
+
+func searchBusinessUnitsTx(
+	tx *gorm.DB,
+	organizationID uint,
+	request PlatformBusinessUnitSearchRequest,
+	activeOnly bool,
+) (*PlatformBusinessUnitPage, error) {
+	query := tx.
+		Model(&models.BusinessUnit{}).
+		Where("organization_id = ?", organizationID)
+	if activeOnly {
+		query = query.Where("status = ?", models.BusinessUnitStatusActive)
+	}
+	if request.Search != "" {
+		pattern := "%" + escapeSQLLike(
+			strings.ToLower(request.Search),
+		) + "%"
+		query = query.Where(
+			"(LOWER(key) LIKE ? ESCAPE '\\' OR LOWER(name) LIKE ? ESCAPE '\\' OR LOWER(description) LIKE ? ESCAPE '\\')",
+			pattern,
+			pattern,
+			pattern,
+		)
+	}
+	result := &PlatformBusinessUnitPage{
+		Items:    make([]PlatformBusinessUnitSummary, 0),
+		Page:     request.Page,
+		PageSize: request.PageSize,
+	}
+	if err := query.Count(&result.Total).Error; err != nil {
+		return nil, fmt.Errorf("count project creation business units: %w", err)
+	}
+	var units []models.BusinessUnit
+	if err := query.
+		Order("LOWER(name) ASC").
+		Order("id ASC").
+		Offset((request.Page - 1) * request.PageSize).
+		Limit(request.PageSize).
+		Find(&units).Error; err != nil {
+		return nil, fmt.Errorf("list project creation business units: %w", err)
+	}
+	for _, unit := range units {
+		if !isCanonicalUUIDv7(unit.PublicID) {
+			return nil, ErrProjectOrganizationContext
+		}
+		result.Items = append(
+			result.Items,
+			platformBusinessUnitSummary(unit),
+		)
+	}
+	result.TotalPages = pageCount(result.Total, result.PageSize)
+	return result, nil
+}
+
+func (service *ProjectService) SearchHumanMembershipCandidates(
+	ctx context.Context,
+	scope models.ProjectScope,
+	request ProjectUserSearchRequest,
+) (*ProjectUserOptionPage, error) {
+	if err := requireMatchingProjectOperation(ctx, scope); err != nil {
+		return nil, err
+	}
+	normalized, err := normalizeProjectUserSearchRequest(request)
+	if err != nil {
+		return nil, err
+	}
+	return searchProjectUsersTx(
+		service.db.WithContext(ctx),
+		normalized,
+	)
+}
+
+func normalizeProjectUserSearchRequest(
+	request ProjectUserSearchRequest,
+) (ProjectUserSearchRequest, error) {
+	if request.Page < 1 ||
+		request.PageSize < 1 ||
+		request.PageSize > 100 {
+		return ProjectUserSearchRequest{}, ErrProjectGovernanceQuery
+	}
+	request.Search = strings.TrimSpace(request.Search)
+	if utf8.RuneCountInString(request.Search) > 100 {
+		return ProjectUserSearchRequest{}, ErrProjectGovernanceQuery
+	}
+	return request, nil
+}
+
+func searchProjectUsersTx(
+	tx *gorm.DB,
+	request ProjectUserSearchRequest,
+) (*ProjectUserOptionPage, error) {
+	query := tx.
+		Unscoped().
+		Model(&models.User{}).
+		Where(
+			"deleted_at IS NULL AND status = ?",
+			models.UserStatusActive,
+		)
+	if request.Search != "" {
+		pattern := "%" + escapeSQLLike(
+			strings.ToLower(request.Search),
+		) + "%"
+		query = query.Where(
+			"(LOWER(username) LIKE ? ESCAPE '\\' OR LOWER(email) LIKE ? ESCAPE '\\' OR LOWER(first_name) LIKE ? ESCAPE '\\' OR LOWER(last_name) LIKE ? ESCAPE '\\' OR LOWER(display_name) LIKE ? ESCAPE '\\')",
+			pattern,
+			pattern,
+			pattern,
+			pattern,
+			pattern,
+		)
+	}
+	result := &ProjectUserOptionPage{
+		Items:    make([]ProjectUserOption, 0),
+		Page:     request.Page,
+		PageSize: request.PageSize,
+	}
+	if err := query.Count(&result.Total).Error; err != nil {
+		return nil, fmt.Errorf("count project user options: %w", err)
+	}
+	var users []models.User
+	if err := query.
+		Order("LOWER(display_name) ASC").
+		Order("LOWER(username) ASC").
+		Order("id ASC").
+		Offset((request.Page - 1) * request.PageSize).
+		Limit(request.PageSize).
+		Find(&users).Error; err != nil {
+		return nil, fmt.Errorf("list project user options: %w", err)
+	}
+	for _, user := range users {
+		result.Items = append(result.Items, projectUserOption(user))
+	}
+	result.TotalPages = pageCount(result.Total, result.PageSize)
+	return result, nil
+}
+
+func lockPlatformProjectAdministrator(
+	tx *gorm.DB,
+	userID uint,
+	lockStrength string,
+) (models.User, error) {
+	if tx == nil || userID == 0 {
+		return models.User{}, ErrProjectAccessDenied
+	}
+	var administrator models.User
+	query := tx.
+		Unscoped().
+		Where(
+			"id = ? AND deleted_at IS NULL AND status = ? AND platform_role = ?",
+			userID,
+			models.UserStatusActive,
+			models.PlatformRolePlatformAdmin,
+		)
+	if lockStrength != "" {
+		query = query.Clauses(clause.Locking{Strength: lockStrength})
+	}
+	if err := query.Take(&administrator).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return models.User{}, ErrProjectAccessDenied
+		}
+		return models.User{}, fmt.Errorf(
+			"revalidate platform project administrator: %w",
+			err,
+		)
+	}
+	return administrator, nil
+}
+
+func resolveAuthenticatedOrganizationTx(
+	tx *gorm.DB,
+) (models.Organization, error) {
+	var organizations []models.Organization
+	if err := tx.
+		Where("status = ?", models.OrganizationStatusActive).
+		Order("id ASC").
+		Limit(2).
+		Find(&organizations).Error; err != nil {
+		return models.Organization{}, fmt.Errorf(
+			"resolve authenticated organization: %w",
+			err,
+		)
+	}
+	if len(organizations) != 1 ||
+		!isCanonicalUUIDv7(organizations[0].PublicID) {
+		return models.Organization{}, ErrProjectOrganizationContext
+	}
+	return organizations[0], nil
+}
+
+func platformBusinessUnitSummary(
+	unit models.BusinessUnit,
+) PlatformBusinessUnitSummary {
+	return PlatformBusinessUnitSummary{
+		PublicID:    unit.PublicID,
+		Key:         unit.Key,
+		Name:        unit.Name,
+		Description: unit.Description,
+	}
+}
+
+func projectUserOption(user models.User) ProjectUserOption {
+	return ProjectUserOption{
+		ID:          user.ID,
+		Username:    user.Username,
+		DisplayName: user.GetFullName(),
+		Avatar:      user.Avatar,
+	}
+}
+
+func pageCount(total int64, pageSize int) int {
+	if total <= 0 || pageSize <= 0 {
+		return 0
+	}
+	return int((total + int64(pageSize) - 1) / int64(pageSize))
+}
+
+func escapeSQLLike(value string) string {
+	replacer := strings.NewReplacer(
+		"\\", "\\\\",
+		"%", "\\%",
+		"_", "\\_",
+	)
+	return replacer.Replace(value)
+}
+
+func isCanonicalUUIDv7(value string) bool {
+	if strings.TrimSpace(value) != value {
+		return false
+	}
+	parsed, err := uuid.Parse(value)
+	return err == nil &&
+		parsed.Version() == 7 &&
+		parsed.Variant() == uuid.RFC4122 &&
+		parsed.String() == value
 }
 
 func (service *ProjectService) ResolveHumanProject(
@@ -1624,26 +2218,36 @@ func (service *ProjectService) AllocateTicketIdentityTx(
 }
 
 type CreateProjectInput struct {
-	OrganizationID   uint
-	BusinessUnitID   uint
-	Key              string
-	Name             string
-	Description      string
-	AdministratorID  uint
-	DefaultQueueKey  string
-	DefaultQueueName string
+	ActorUserID             uint
+	BusinessUnitPublicID    string
+	Key                     string
+	Name                    string
+	Description             string
+	InitialAdministratorIDs []uint
+	DefaultQueueKey         string
+	DefaultQueueName        string
 }
 
 func (service *ProjectService) CreateProject(
 	ctx context.Context,
 	input CreateProjectInput,
-) (*ProjectAccess, error) {
-	if input.OrganizationID == 0 ||
-		input.BusinessUnitID == 0 ||
-		input.AdministratorID == 0 ||
+) (*models.Project, error) {
+	input.BusinessUnitPublicID = strings.TrimSpace(
+		input.BusinessUnitPublicID,
+	)
+	if input.ActorUserID == 0 ||
+		!isCanonicalUUIDv7(input.BusinessUnitPublicID) ||
 		models.ValidateProjectKey(input.Key) != nil ||
 		strings.TrimSpace(input.Name) == "" {
-		return nil, errors.New("complete project identity and administrator are required")
+		return nil, errors.New(
+			"complete public project identity and creator are required",
+		)
+	}
+	administratorIDs, err := normalizeInitialProjectAdministrators(
+		input.InitialAdministratorIDs,
+	)
+	if err != nil {
+		return nil, err
 	}
 	if input.DefaultQueueKey == "" {
 		input.DefaultQueueKey = "default"
@@ -1657,58 +2261,75 @@ func (service *ProjectService) CreateProject(
 	if service.events == nil {
 		return nil, ErrProjectEventWriter
 	}
-	project := models.Project{
-		OrganizationID: input.OrganizationID,
-		BusinessUnitID: input.BusinessUnitID,
-		Key:            models.ProjectKey(input.Key),
-		Name:           strings.TrimSpace(input.Name),
-		Description:    strings.TrimSpace(input.Description),
-		Status:         models.ProjectStatusActive,
-	}
+	var project models.Project
 	var queue models.Queue
 	var bootstrapRelease models.ConfigurationRelease
-	err := transactionForContext(ctx, service.db, func(tx *gorm.DB) error {
+	err = transactionForContext(ctx, service.db, func(tx *gorm.DB) error {
+		creator, creatorErr := lockPlatformProjectAdministrator(
+			tx.WithContext(ctx),
+			input.ActorUserID,
+			"SHARE",
+		)
+		if creatorErr != nil {
+			return creatorErr
+		}
+		organization, organizationErr := resolveAuthenticatedOrganizationTx(
+			tx.WithContext(ctx),
+		)
+		if organizationErr != nil {
+			return organizationErr
+		}
 		var unit models.BusinessUnit
 		if err := tx.WithContext(ctx).
 			Where(
-				"id = ? AND organization_id = ? AND status = ?",
-				input.BusinessUnitID,
-				input.OrganizationID,
+				"public_id = ? AND organization_id = ? AND status = ?",
+				input.BusinessUnitPublicID,
+				organization.ID,
 				models.BusinessUnitStatusActive,
 			).
 			First(&unit).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrBusinessUnitPublicID
+			}
+			return fmt.Errorf("resolve project business unit: %w", err)
+		}
+		if err := lockInitialProjectAdministrators(
+			tx.WithContext(ctx),
+			administratorIDs,
+		); err != nil {
 			return err
 		}
-		var administrator models.User
-		if err := tx.WithContext(ctx).
-			Unscoped().
-			Clauses(clause.Locking{Strength: "SHARE"}).
-			Where(
-				"id = ? AND deleted_at IS NULL AND status = ? AND platform_role = ?",
-				input.AdministratorID,
-				models.UserStatusActive,
-				models.PlatformRolePlatformAdmin,
-			).
-			Take(&administrator).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrProjectAccessDenied
-			}
-			return fmt.Errorf(
-				"lock project creation administrator: %w",
-				err,
-			)
+		project = models.Project{
+			OrganizationID: organization.ID,
+			BusinessUnitID: unit.ID,
+			BusinessUnit:   unit,
+			Key:            models.ProjectKey(input.Key),
+			Name:           strings.TrimSpace(input.Name),
+			Description:    strings.TrimSpace(input.Description),
+			Status:         models.ProjectStatusActive,
 		}
 		if err := tx.WithContext(ctx).Create(&project).Error; err != nil {
 			return fmt.Errorf("create project: %w", err)
 		}
-		membership := models.ProjectMembership{
-			ProjectID: project.ID,
-			UserID:    input.AdministratorID,
-			Role:      models.ProjectRoleAdmin,
-			IsActive:  true,
+		memberships := make(
+			[]models.ProjectMembership,
+			0,
+			len(administratorIDs),
+		)
+		for _, administratorID := range administratorIDs {
+			memberships = append(memberships, models.ProjectMembership{
+				ProjectID: project.ID,
+				UserID:    administratorID,
+				Role:      models.ProjectRoleAdmin,
+				IsActive:  true,
+			})
 		}
-		if err := tx.WithContext(ctx).Create(&membership).Error; err != nil {
-			return fmt.Errorf("create project administrator membership: %w", err)
+		if err := tx.WithContext(ctx).
+			Create(&memberships).Error; err != nil {
+			return fmt.Errorf(
+				"create initial project administrator memberships: %w",
+				err,
+			)
 		}
 		queue = models.Queue{
 			ProjectID: project.ID,
@@ -1726,7 +2347,7 @@ func (service *ProjectService) CreateProject(
 		}
 		operation := OperationContext{
 			Scope:  scope,
-			Actor:  models.HumanActor(input.AdministratorID),
+			Actor:  models.HumanActor(creator.ID),
 			Source: SourceProtocolHumanREST,
 		}
 		projectContext, err := WithOperationContext(ctx, operation)
@@ -1749,16 +2370,67 @@ func (service *ProjectService) CreateProject(
 			&project,
 			&queue,
 			&bootstrapRelease,
+			administratorIDs,
 		)
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &ProjectAccess{
-		Project: project,
-		Role:    models.ProjectRoleAdmin,
-		Scope:   project.Scope(),
-	}, nil
+	return &project, nil
+}
+
+func normalizeInitialProjectAdministrators(
+	userIDs []uint,
+) ([]uint, error) {
+	if len(userIDs) == 0 || len(userIDs) > 100 {
+		return nil, ErrInitialProjectAdministrator
+	}
+	unique := make(map[uint]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID == 0 {
+			return nil, ErrInitialProjectAdministrator
+		}
+		unique[userID] = struct{}{}
+	}
+	result := make([]uint, 0, len(unique))
+	for userID := range unique {
+		result = append(result, userID)
+	}
+	sort.Slice(result, func(left, right int) bool {
+		return result[left] < result[right]
+	})
+	return result, nil
+}
+
+func lockInitialProjectAdministrators(
+	tx *gorm.DB,
+	userIDs []uint,
+) error {
+	var administrators []struct {
+		ID uint
+	}
+	if err := tx.
+		Unscoped().
+		Model(&models.User{}).
+		Clauses(clause.Locking{Strength: "SHARE"}).
+		Where(
+			"id IN ? AND deleted_at IS NULL AND status = ?",
+			userIDs,
+			models.UserStatusActive,
+		).
+		Order("id ASC").
+		Find(&administrators).Error; err != nil {
+		return fmt.Errorf("lock initial project administrators: %w", err)
+	}
+	if len(administrators) != len(userIDs) {
+		return ErrInitialProjectAdministrator
+	}
+	for index, administrator := range administrators {
+		if administrator.ID != userIDs[index] {
+			return ErrInitialProjectAdministrator
+		}
+	}
+	return nil
 }
 
 // ArchiveProject is the platform control-plane command that revokes every
@@ -1803,25 +2475,33 @@ func (service *ProjectService) ArchiveProject(
 			}
 			return fmt.Errorf("lock project for archive: %w", err)
 		}
-		var administrator models.User
-		if err := tx.WithContext(ctx).
-			Unscoped().
-			Clauses(clause.Locking{Strength: "SHARE"}).
-			Where(
-				"id = ? AND deleted_at IS NULL AND status = ? AND platform_role = ?",
-				actorID,
-				models.UserStatusActive,
-				models.PlatformRolePlatformAdmin,
-			).
-			Take(&administrator).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrProjectAccessDenied
-			}
-			return fmt.Errorf(
-				"lock project archive administrator: %w",
-				err,
-			)
+		if _, err := lockPlatformProjectAdministrator(
+			tx.WithContext(ctx),
+			actorID,
+			"SHARE",
+		); err != nil {
+			return err
 		}
+		organization, err := resolveAuthenticatedOrganizationTx(
+			tx.WithContext(ctx),
+		)
+		if err != nil {
+			return err
+		}
+		if project.OrganizationID != organization.ID {
+			return ErrProjectNotFound
+		}
+		var unit models.BusinessUnit
+		if err := tx.WithContext(ctx).
+			Where(
+				"id = ? AND organization_id = ?",
+				project.BusinessUnitID,
+				project.OrganizationID,
+			).
+			Take(&unit).Error; err != nil {
+			return fmt.Errorf("load archived project business unit: %w", err)
+		}
+		project.BusinessUnit = unit
 		if project.Key == models.ProjectKey("DEFAULT") {
 			return ErrDefaultProjectArchive
 		}
@@ -1912,6 +2592,7 @@ func (service *ProjectService) appendProjectCreatedEventTx(
 	project *models.Project,
 	queue *models.Queue,
 	release *models.ConfigurationRelease,
+	initialAdministratorIDs []uint,
 ) error {
 	if service.events == nil {
 		return ErrProjectEventWriter
@@ -1931,16 +2612,17 @@ func (service *ProjectService) appendProjectCreatedEventTx(
 			Subject: fmt.Sprintf("project/%d", project.ID),
 			Time:    eventTime,
 			Data: map[string]any{
-				"organization_id":               project.OrganizationID,
-				"project_id":                    project.ID,
-				"project_public_id":             project.PublicID,
-				"project_key":                   project.Key,
-				"business_unit_id":              project.BusinessUnitID,
-				"administrator_id":              operation.Actor.ID,
-				"default_queue_id":              queue.ID,
-				"default_queue_key":             queue.Key,
-				"configuration_release_id":      release.ID,
-				"configuration_release_version": release.Version,
+				"organization_id":                project.OrganizationID,
+				"project_id":                     project.ID,
+				"project_public_id":              project.PublicID,
+				"project_key":                    project.Key,
+				"business_unit_id":               project.BusinessUnitID,
+				"creator_user_id":                operation.Actor.ID,
+				"initial_project_admin_user_ids": initialAdministratorIDs,
+				"default_queue_id":               queue.ID,
+				"default_queue_key":              queue.Key,
+				"configuration_release_id":       release.ID,
+				"configuration_release_version":  release.Version,
 			},
 			Scope:                operation.Scope,
 			TraceID:              operation.TraceID,

@@ -315,8 +315,11 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 activePathPrefixes: ['/project-memberships'],
                 order: 10,
                 scope: 'project',
-                capability: { kind: 'project', value: 'manage_memberships' },
-                roles: { kind: 'project', values: ['project_admin'] },
+                capability: { kind: 'project', value: 'view_memberships' },
+                roles: {
+                    kind: 'project',
+                    values: ['project_admin', 'manager'],
+                },
                 icon: 'memberships',
                 route: { kind: 'custom', component: 'projectMemberships' },
             }),
@@ -597,6 +600,7 @@ const allowedProjectCapabilities = new Set<ProjectCapability>([
     'manage_notifications',
     'manage_automation',
     'manage_integrations',
+    'view_memberships',
     'manage_memberships',
     'manage_agents',
 ])

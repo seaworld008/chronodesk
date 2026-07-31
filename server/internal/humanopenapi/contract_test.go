@@ -66,7 +66,7 @@ func TestHumanWebContractPublishesClosedRoleAndSessionSchemas(t *testing.T) {
 		"ProjectMembership",
 		"AdminUser",
 		"PlatformProjectSummary",
-		"PlatformProjectSummaryListEnvelope",
+		"PlatformProjectPageEnvelope",
 	} {
 		if _, ok := schemas[name]; !ok {
 			t.Errorf("components.schemas.%s is missing", name)
@@ -613,9 +613,12 @@ func TestHumanWebContractCoversRequiredBrowserOperations(t *testing.T) {
 		{"/projects/{projectKey}/context", "get"},
 		{"/projects/{projectKey}/memberships", "get"},
 		{"/projects/{projectKey}/memberships", "post"},
+		{"/projects/{projectKey}/membership-candidates", "get"},
 		{"/projects/{projectKey}/memberships/{userID}", "delete"},
 		{"/platform/projects", "get"},
 		{"/platform/projects", "post"},
+		{"/platform/project-creation-context", "get"},
+		{"/platform/project-business-units", "get"},
 		{"/platform/projects/{projectPublicID}/archive", "post"},
 		{"/platform/users", "get"},
 		{"/platform/users", "post"},
@@ -631,6 +634,305 @@ func TestHumanWebContractCoversRequiredBrowserOperations(t *testing.T) {
 		if _, ok := pathItem[expected.method]; !ok {
 			t.Errorf("%s %s is missing", expected.method, expected.path)
 		}
+	}
+}
+
+func TestProjectGovernanceContractUsesPublicScopeBoundedQueriesAndExplicitAdmins(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+
+	list := objectAt(t, objectAt(t, paths, "/platform/projects"), "get")
+	listParameters, ok := list["parameters"].([]any)
+	if !ok {
+		t.Fatal("platform project list parameters are missing")
+	}
+	listNames := make([]string, 0, len(listParameters))
+	for _, rawParameter := range listParameters {
+		parameter := rawParameter.(map[string]any)
+		listNames = append(listNames, parameter["name"].(string))
+		if parameter["in"] != "query" {
+			t.Fatalf("platform project list parameter = %v", parameter)
+		}
+	}
+	if want := []string{
+		"page",
+		"page_size",
+		"search",
+		"status",
+		"business_unit_public_id",
+		"order_by",
+		"order",
+	}; !reflect.DeepEqual(listNames, want) {
+		t.Fatalf("platform project list parameters = %v, want %v", listNames, want)
+	}
+	pageSizeSchema := objectAt(
+		t,
+		listParameters[1].(map[string]any),
+		"schema",
+	)
+	if pageSizeSchema["default"] != float64(25) ||
+		pageSizeSchema["minimum"] != float64(1) ||
+		pageSizeSchema["maximum"] != float64(100) {
+		t.Fatalf("platform project page_size schema = %v", pageSizeSchema)
+	}
+
+	request := objectAt(t, schemas, "CreatePlatformProjectRequest")
+	if request["additionalProperties"] != false {
+		t.Fatal("CreatePlatformProjectRequest must reject numeric trusted scope")
+	}
+	required := []string{
+		"business_unit_public_id",
+		"key",
+		"name",
+		"initial_project_admin_user_ids",
+		"default_queue_key",
+		"default_queue_name",
+	}
+	assertExactStringArray(t, request["required"], required)
+	assertExactObjectKeys(
+		t,
+		objectAt(t, request, "properties"),
+		append(required, "description"),
+	)
+	for _, forbidden := range []string{
+		"organization_id",
+		"business_unit_id",
+		"administrator_id",
+	} {
+		if _, ok := objectAt(t, request, "properties")[forbidden]; ok {
+			t.Errorf(
+				"CreatePlatformProjectRequest exposes trusted field %q",
+				forbidden,
+			)
+		}
+	}
+	initialAdmins := objectAt(
+		t,
+		objectAt(t, request, "properties"),
+		"initial_project_admin_user_ids",
+	)
+	if initialAdmins["minItems"] != float64(1) ||
+		initialAdmins["uniqueItems"] != true {
+		t.Fatalf("initial administrator schema = %v", initialAdmins)
+	}
+
+	for _, schemaName := range []string{
+		"ProjectCreationContext",
+		"PlatformProjectPage",
+		"PlatformProjectSummary",
+		"PlatformBusinessUnitPageEnvelope",
+		"PlatformBusinessUnitPage",
+		"PlatformBusinessUnitSummary",
+		"ProjectUserOptionPage",
+	} {
+		if objectAt(t, schemas, schemaName)["additionalProperties"] != false {
+			t.Errorf("%s must be a closed DTO", schemaName)
+		}
+	}
+
+	pageFields := []string{
+		"items",
+		"total",
+		"page",
+		"page_size",
+		"total_pages",
+	}
+	for _, schemaName := range []string{
+		"PlatformProjectPage",
+		"PlatformBusinessUnitPage",
+		"ProjectUserOptionPage",
+	} {
+		page := objectAt(t, schemas, schemaName)
+		assertExactStringArray(t, page["required"], pageFields)
+		assertExactObjectKeys(
+			t,
+			objectAt(t, page, "properties"),
+			pageFields,
+		)
+	}
+
+	contextOperation := objectAt(
+		t,
+		objectAt(t, paths, "/platform/project-creation-context"),
+		"get",
+	)
+	contextParameters, ok := contextOperation["parameters"].([]any)
+	if !ok {
+		t.Fatal("project creation context parameters are missing")
+	}
+	contextNames := make([]string, 0, len(contextParameters))
+	for _, rawParameter := range contextParameters {
+		parameter := rawParameter.(map[string]any)
+		contextNames = append(
+			contextNames,
+			parameter["name"].(string),
+		)
+		if parameter["in"] != "query" {
+			t.Fatalf("project creation context parameter = %v", parameter)
+		}
+	}
+	if want := []string{
+		"page",
+		"page_size",
+		"search",
+		"business_unit_page",
+		"business_unit_page_size",
+		"business_unit_search",
+	}; !reflect.DeepEqual(contextNames, want) {
+		t.Fatalf(
+			"project creation context parameters = %v, want %v",
+			contextNames,
+			want,
+		)
+	}
+	for _, index := range []int{1, 4} {
+		pageSize := objectAt(
+			t,
+			contextParameters[index].(map[string]any),
+			"schema",
+		)
+		if pageSize["default"] != float64(25) ||
+			pageSize["minimum"] != float64(1) ||
+			pageSize["maximum"] != float64(100) {
+			t.Errorf(
+				"project creation context page size = %v",
+				pageSize,
+			)
+		}
+	}
+
+	contextProperties := objectAt(
+		t,
+		objectAt(t, schemas, "ProjectCreationContext"),
+		"properties",
+	)
+	for propertyName, wantReference := range map[string]string{
+		"business_units": "#/components/schemas/PlatformBusinessUnitPage",
+		"users":          "#/components/schemas/ProjectUserOptionPage",
+	} {
+		property := objectAt(t, contextProperties, propertyName)
+		if got, _ := property["$ref"].(string); got != wantReference {
+			t.Errorf(
+				"ProjectCreationContext.%s = %q, want %q",
+				propertyName,
+				got,
+				wantReference,
+			)
+		}
+	}
+
+	businessUnitsOperation := objectAt(
+		t,
+		objectAt(t, paths, "/platform/project-business-units"),
+		"get",
+	)
+	assertExactStringArray(
+		t,
+		businessUnitsOperation["x-chronodesk-platform-roles"],
+		[]string{"platform_admin"},
+	)
+	businessUnitParameters :=
+		businessUnitsOperation["parameters"].([]any)
+	businessUnitNames := make([]string, 0, len(businessUnitParameters))
+	for _, rawParameter := range businessUnitParameters {
+		parameter := rawParameter.(map[string]any)
+		businessUnitNames = append(
+			businessUnitNames,
+			parameter["name"].(string),
+		)
+	}
+	if want := []string{"page", "page_size", "search"}; !reflect.DeepEqual(
+		businessUnitNames,
+		want,
+	) {
+		t.Fatalf(
+			"platform Business Unit query = %v, want %v",
+			businessUnitNames,
+			want,
+		)
+	}
+	if got := responseSchemaRef(
+		t,
+		businessUnitsOperation,
+		"200",
+	); got != "#/components/schemas/PlatformBusinessUnitPageEnvelope" {
+		t.Fatalf("platform Business Unit page response = %q", got)
+	}
+	businessUnitEnvelope := objectAt(
+		t,
+		schemas,
+		"PlatformBusinessUnitPageEnvelope",
+	)
+	if businessUnitEnvelope["additionalProperties"] != false {
+		t.Fatal("PlatformBusinessUnitPageEnvelope must be closed")
+	}
+	businessUnitData := objectAt(
+		t,
+		objectAt(t, businessUnitEnvelope, "properties"),
+		"data",
+	)
+	if got, _ := businessUnitData["$ref"].(string); got !=
+		"#/components/schemas/PlatformBusinessUnitPage" {
+		t.Fatalf("platform Business Unit envelope data = %q", got)
+	}
+
+	createOperation := objectAt(
+		t,
+		objectAt(t, paths, "/platform/projects"),
+		"post",
+	)
+	assertExactObjectKeys(
+		t,
+		objectAt(t, createOperation, "responses"),
+		[]string{"201", "400", "401", "403", "429", "500", "503"},
+	)
+}
+
+func TestProjectMembershipCandidateContractIsRemoteBoundedAndAdminOnly(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	operation := objectAt(
+		t,
+		objectAt(
+			t,
+			paths,
+			"/projects/{projectKey}/membership-candidates",
+		),
+		"get",
+	)
+	assertExactStringArray(
+		t,
+		operation["x-chronodesk-project-roles"],
+		[]string{"project_admin"},
+	)
+	parameters := operation["parameters"].([]any)
+	if len(parameters) != 4 {
+		t.Fatalf("membership candidate parameters = %v", parameters)
+	}
+	queryNames := make([]string, 0, 3)
+	for _, rawParameter := range parameters[1:] {
+		parameter := rawParameter.(map[string]any)
+		queryNames = append(queryNames, parameter["name"].(string))
+	}
+	if want := []string{"page", "page_size", "search"}; !reflect.DeepEqual(
+		queryNames,
+		want,
+	) {
+		t.Fatalf("membership candidate query = %v, want %v", queryNames, want)
+	}
+	pageSize := objectAt(t, parameters[2].(map[string]any), "schema")
+	if pageSize["default"] != float64(25) ||
+		pageSize["maximum"] != float64(100) {
+		t.Fatalf("membership candidate page size = %v", pageSize)
 	}
 }
 
@@ -964,7 +1266,7 @@ func TestSessionAndPlatformProjectResponsesMatchRuntimeEnvelopes(t *testing.T) {
 		objectAt(t, objectAt(t, paths, "/platform/projects"), "get"),
 		"200",
 	)
-	if list != "#/components/schemas/PlatformProjectSummaryListEnvelope" {
+	if list != "#/components/schemas/PlatformProjectPageEnvelope" {
 		t.Fatalf("platform project list response schema = %q", list)
 	}
 
@@ -1020,12 +1322,12 @@ func TestSessionAndPlatformProjectResponsesMatchRuntimeEnvelopes(t *testing.T) {
 	listEnvelope := objectAt(
 		t,
 		schemas,
-		"PlatformProjectSummaryListEnvelope",
+		"PlatformProjectPageEnvelope",
 	)
 	if listEnvelope["type"] != "object" ||
 		listEnvelope["additionalProperties"] != false {
 		t.Fatalf(
-			"PlatformProjectSummaryListEnvelope = %v",
+			"PlatformProjectPageEnvelope = %v",
 			listEnvelope,
 		)
 	}
@@ -1039,12 +1341,9 @@ func TestSessionAndPlatformProjectResponsesMatchRuntimeEnvelopes(t *testing.T) {
 		objectAt(t, listEnvelope, "properties"),
 		"data",
 	)
-	if listData["type"] != "array" {
+	if reference, _ := listData["$ref"].(string); reference !=
+		"#/components/schemas/PlatformProjectPage" {
 		t.Fatalf("platform project list data = %v", listData)
-	}
-	items := objectAt(t, listData, "items")
-	if reference, _ := items["$ref"].(string); reference != "#/components/schemas/PlatformProjectSummary" {
-		t.Fatalf("platform project list item schema = %q", reference)
 	}
 }
 
@@ -1065,9 +1364,10 @@ func TestPlatformProjectListPublishesExactReadContract(t *testing.T) {
 			operation["operationId"],
 		)
 	}
-	if _, published := operation["parameters"]; published {
+	parameters, published := operation["parameters"].([]any)
+	if !published || len(parameters) != 7 {
 		t.Fatalf(
-			"GET /platform/projects publishes unsupported parameters: %v",
+			"GET /platform/projects parameters = %v",
 			operation["parameters"],
 		)
 	}
@@ -1126,14 +1426,19 @@ func TestPlatformProjectArchivePublishesUUIDv7AndStableStatuses(t *testing.T) {
 		"PlatformProjectSummary",
 		"AuthorizedProject",
 	} {
-		publicID := objectAt(
+		publicID := resolveComponentObject(
 			t,
+			document,
 			objectAt(
 				t,
-				objectAt(t, schemas, schemaName),
-				"properties",
+				objectAt(
+					t,
+					objectAt(t, schemas, schemaName),
+					"properties",
+				),
+				"public_id",
 			),
-			"public_id",
+			"schemas",
 		)
 		if publicID["format"] != "uuid" ||
 			publicID["pattern"] != schema["pattern"] {

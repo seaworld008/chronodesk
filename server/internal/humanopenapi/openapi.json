@@ -668,6 +668,88 @@
         }
       }
     },
+    "/projects/{projectKey}/membership-candidates": {
+      "get": {
+        "operationId": "searchProjectMembershipCandidates",
+        "summary": "Search active users for project membership",
+        "description": "Returns a bounded remote-search page of active human identities. Only a project administrator may use the results to mutate memberships.",
+        "tags": [
+          "Project access"
+        ],
+        "security": [
+          {
+            "humanBearer": [
+
+            ]
+          }
+        ],
+        "x-chronodesk-project-roles": [
+          "project_admin"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ProjectKey"
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 25
+            }
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 100
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded active user candidates",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectUserOptionPageEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
     "/projects/{projectKey}/memberships/{userID}": {
       "delete": {
         "operationId": "deactivateProjectMembership",
@@ -735,13 +817,91 @@
         "x-chronodesk-platform-roles": [
           "platform_admin"
         ],
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 25
+            }
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 100
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ProjectStatus"
+            }
+          },
+          {
+            "name": "business_unit_public_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/PublicUUIDv7"
+            }
+          },
+          {
+            "name": "order_by",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "name",
+                "key",
+                "status",
+                "business_unit",
+                "created_at",
+                "updated_at"
+              ],
+              "default": "name"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "default": "asc"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Closed platform project inventory",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PlatformProjectSummaryListEnvelope"
+                  "$ref": "#/components/schemas/PlatformProjectPageEnvelope"
                 }
               }
             }
@@ -812,6 +972,209 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/platform/project-creation-context": {
+      "get": {
+        "operationId": "getPlatformProjectCreationContext",
+        "summary": "Get server-resolved project creation context",
+        "description": "Resolves the authenticated single-organization context, active business units by public ID, the creator, and one bounded remote-search page of active human identities.",
+        "tags": [
+          "Platform governance"
+        ],
+        "security": [
+          {
+            "humanBearer": [
+
+            ]
+          }
+        ],
+        "x-chronodesk-platform-roles": [
+          "platform_admin"
+        ],
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 25
+            }
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 100
+            }
+          },
+          {
+            "name": "business_unit_page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          },
+          {
+            "name": "business_unit_page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 25
+            }
+          },
+          {
+            "name": "business_unit_search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 100
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Project creation context",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectCreationContextEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/platform/project-business-units": {
+      "get": {
+        "operationId": "listPlatformProjectBusinessUnits",
+        "summary": "List current and historical project business units",
+        "description": "Returns a bounded remote-search dimension for platform project governance, including archived Business Units. Project creation options remain active-only.",
+        "tags": [
+          "Platform governance"
+        ],
+        "security": [
+          {
+            "humanBearer": [
+
+            ]
+          }
+        ],
+        "x-chronodesk-platform-roles": [
+          "platform_admin"
+        ],
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 25
+            }
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 100
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded current and historical Business Unit page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlatformBusinessUnitPageEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
           }
         }
       }
@@ -6560,6 +6923,11 @@
           "archived"
         ]
       },
+      "PublicUUIDv7": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      },
       "LoginRequest": {
         "type": "object",
         "additionalProperties": false,
@@ -6706,21 +7074,16 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "organization_id",
-          "business_unit_id",
+          "business_unit_public_id",
           "key",
-          "name"
+          "name",
+          "initial_project_admin_user_ids",
+          "default_queue_key",
+          "default_queue_name"
         ],
         "properties": {
-          "organization_id": {
-            "type": "integer",
-            "format": "uint64",
-            "minimum": 1
-          },
-          "business_unit_id": {
-            "type": "integer",
-            "format": "uint64",
-            "minimum": 1
+          "business_unit_public_id": {
+            "$ref": "#/components/schemas/PublicUUIDv7"
           },
           "key": {
             "type": "string",
@@ -6737,11 +7100,27 @@
             "type": "string",
             "maxLength": 500
           },
+          "initial_project_admin_user_ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "uniqueItems": true,
+            "items": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 1
+            }
+          },
           "default_queue_key": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
           },
           "default_queue_name": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
           }
         }
       },
@@ -7051,16 +7430,25 @@
         "additionalProperties": false,
         "required": [
           "public_id",
+          "created_at",
+          "updated_at",
           "key",
           "name",
           "description",
-          "status"
+          "status",
+          "business_unit"
         ],
         "properties": {
           "public_id": {
+            "$ref": "#/components/schemas/PublicUUIDv7"
+          },
+          "created_at": {
             "type": "string",
-            "format": "uuid",
-            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
           },
           "key": {
             "type": "string",
@@ -7078,6 +7466,222 @@
           },
           "status": {
             "$ref": "#/components/schemas/ProjectStatus"
+          },
+          "business_unit": {
+            "$ref": "#/components/schemas/PlatformBusinessUnitSummary"
+          }
+        }
+      },
+      "PlatformOrganizationSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "public_id",
+          "name"
+        ],
+        "properties": {
+          "public_id": {
+            "$ref": "#/components/schemas/PublicUUIDv7"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          }
+        }
+      },
+      "PlatformBusinessUnitSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "public_id",
+          "key",
+          "name",
+          "description"
+        ],
+        "properties": {
+          "public_id": {
+            "$ref": "#/components/schemas/PublicUUIDv7"
+          },
+          "key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 500
+          }
+        }
+      },
+      "ProjectUserOption": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "username",
+          "display_name",
+          "avatar"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "username": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 50
+          },
+          "display_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "avatar": {
+            "type": "string",
+            "maxLength": 255
+          }
+        }
+      },
+      "ProjectUserOptionPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProjectUserOption"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "total_pages": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "PlatformBusinessUnitPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlatformBusinessUnitSummary"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "total_pages": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "ProjectCreationContext": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "organization",
+          "business_units",
+          "creator",
+          "users"
+        ],
+        "properties": {
+          "organization": {
+            "$ref": "#/components/schemas/PlatformOrganizationSummary"
+          },
+          "business_units": {
+            "$ref": "#/components/schemas/PlatformBusinessUnitPage"
+          },
+          "creator": {
+            "$ref": "#/components/schemas/ProjectUserOption"
+          },
+          "users": {
+            "$ref": "#/components/schemas/ProjectUserOptionPage"
+          }
+        }
+      },
+      "PlatformProjectPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlatformProjectSummary"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "total_pages": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },
@@ -7708,7 +8312,7 @@
           }
         }
       },
-      "PlatformProjectSummaryListEnvelope": {
+      "PlatformProjectPageEnvelope": {
         "type": "object",
         "additionalProperties": false,
         "required": [
@@ -7725,10 +8329,70 @@
             "type": "string"
           },
           "data": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/PlatformProjectSummary"
-            }
+            "$ref": "#/components/schemas/PlatformProjectPage"
+          }
+        }
+      },
+      "PlatformBusinessUnitPageEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "msg",
+          "data"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer",
+            "const": 0
+          },
+          "msg": {
+            "type": "string"
+          },
+          "data": {
+            "$ref": "#/components/schemas/PlatformBusinessUnitPage"
+          }
+        }
+      },
+      "ProjectCreationContextEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "msg",
+          "data"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer",
+            "const": 0
+          },
+          "msg": {
+            "type": "string"
+          },
+          "data": {
+            "$ref": "#/components/schemas/ProjectCreationContext"
+          }
+        }
+      },
+      "ProjectUserOptionPageEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "msg",
+          "data"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer",
+            "const": 0
+          },
+          "msg": {
+            "type": "string"
+          },
+          "data": {
+            "$ref": "#/components/schemas/ProjectUserOptionPage"
           }
         }
       },

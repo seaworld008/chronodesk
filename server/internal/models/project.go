@@ -240,7 +240,7 @@ type Project struct {
 	Organization   Organization  `json:"organization,omitempty" gorm:"constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
 	BusinessUnitID uint          `json:"business_unit_id" gorm:"not null;index"`
 	BusinessUnit   BusinessUnit  `json:"business_unit,omitempty" gorm:"constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
-	Key            ProjectKey    `json:"key" gorm:"size:32;not null;uniqueIndex:idx_projects_organization_key,priority:2"`
+	Key            ProjectKey    `json:"key" gorm:"size:32;not null;uniqueIndex:idx_projects_organization_key,priority:2;<-:create"`
 	Name           string        `json:"name" gorm:"size:120;not null"`
 	Description    string        `json:"description" gorm:"size:500"`
 	Status         ProjectStatus `json:"status" gorm:"size:20;not null;default:'active';index;check:chk_projects_status,status IN ('active','archived')"`
@@ -259,17 +259,14 @@ func (project *Project) BeforeCreate(_ *gorm.DB) error {
 }
 
 func (project *Project) BeforeUpdate(tx *gorm.DB) error {
-	changedKey, changed, err := stableKeyUpdateValue(tx)
+	changedKey, attempted, err := attemptedProjectKeyUpdateValue(tx)
 	if err != nil {
 		return err
 	}
-	if changed {
-		return ProjectKey(changedKey).Validate()
-	}
-	if project.Key == "" {
+	if !attempted {
 		return nil
 	}
-	return project.Key.Validate()
+	return ProjectKey(changedKey).Validate()
 }
 
 func (project Project) Scope() ProjectScope {
@@ -492,6 +489,45 @@ func stableKeyUpdateValue(tx *gorm.DB) (string, bool, error) {
 		}
 	}
 	return "", true, fmt.Errorf("updated key must be a string")
+}
+
+func attemptedProjectKeyUpdateValue(
+	tx *gorm.DB,
+) (string, bool, error) {
+	if tx == nil || tx.Statement == nil {
+		return "", false, nil
+	}
+	value := reflect.ValueOf(tx.Statement.Dest)
+	for value.IsValid() &&
+		(value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer) {
+		if value.IsNil() {
+			return "", false, nil
+		}
+		value = value.Elem()
+	}
+	if !value.IsValid() {
+		return "", false, nil
+	}
+
+	switch value.Kind() {
+	case reflect.Map:
+		for _, candidate := range []string{"key", "Key"} {
+			entry := value.MapIndex(reflect.ValueOf(candidate))
+			if entry.IsValid() {
+				return stableKeyString(entry)
+			}
+		}
+	case reflect.Struct:
+		field := value.FieldByName("Key")
+		if field.IsValid() {
+			key, attempted, err := stableKeyString(field)
+			if err != nil || !attempted || key == "" {
+				return "", false, err
+			}
+			return key, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 func stableKeyString(value reflect.Value) (string, bool, error) {

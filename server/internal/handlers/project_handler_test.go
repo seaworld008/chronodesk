@@ -543,17 +543,29 @@ func TestPlatformProjectListReturnsClosedInventoryWithoutMembership(
 		)
 	}
 	var body struct {
-		Code int                          `json:"code"`
-		Msg  string                       `json:"msg"`
-		Data []map[string]json.RawMessage `json:"data"`
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			Items      []map[string]json.RawMessage `json:"items"`
+			Total      int64                        `json:"total"`
+			Page       int                          `json:"page"`
+			PageSize   int                          `json:"page_size"`
+			TotalPages int                          `json:"total_pages"`
+		} `json:"data"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Code != 0 || body.Msg == "" || len(body.Data) != 2 {
+	if body.Code != 0 ||
+		body.Msg == "" ||
+		len(body.Data.Items) != 2 ||
+		body.Data.Total != 2 ||
+		body.Data.Page != 1 ||
+		body.Data.PageSize != 25 ||
+		body.Data.TotalPages != 1 {
 		t.Fatalf("platform project list response = %+v", body)
 	}
-	for _, item := range body.Data {
+	for _, item := range body.Data.Items {
 		for _, required := range []string{
 			"public_id",
 			"key",
@@ -683,7 +695,7 @@ func TestPlatformProjectListRejectsUndocumentedQueryParameters(t *testing.T) {
 		response,
 		httptest.NewRequest(
 			http.MethodGet,
-			"/platform/projects?page=1",
+			"/platform/projects?unknown=1",
 			nil,
 		),
 	)

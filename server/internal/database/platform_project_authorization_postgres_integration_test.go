@@ -93,12 +93,12 @@ func TestPostgresPlatformProjectOperationsRevalidateActiveAdministratorAfterUser
 				created, err := service.CreateProject(
 					ctx,
 					services.CreateProjectInput{
-						OrganizationID:  project.OrganizationID,
-						BusinessUnitID:  project.BusinessUnitID,
-						Key:             "P" + suffix,
-						Name:            "Rejected concurrent project",
-						Description:     "must not persist",
-						AdministratorID: administrator.ID,
+						ActorUserID:             administrator.ID,
+						BusinessUnitPublicID:    project.BusinessUnit.PublicID,
+						Key:                     "P" + suffix,
+						Name:                    "Rejected concurrent project",
+						Description:             "must not persist",
+						InitialAdministratorIDs: []uint{administrator.ID},
 					},
 				)
 				return created != nil, err

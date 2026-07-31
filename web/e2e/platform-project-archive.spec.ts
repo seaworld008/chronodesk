@@ -24,7 +24,9 @@ type PlatformProjectBackend = {
 };
 
 type PlatformProjectBackendOptions = {
+    archiveResponseData?: unknown;
     authorizedProjects?: AuthorizedProjectAccess[];
+    lastPageShrinksOnArchive?: boolean;
 };
 
 const platformAdmin = {
@@ -37,23 +39,44 @@ const platformAdmin = {
 
 const accessA = authorizedProjectAccess(projectA, 'project_admin');
 const accessB = authorizedProjectAccess(projectB, 'observer');
+const businessUnit = {
+    public_id: '00000000-0000-7000-8000-000000000074',
+    key: 'OPS',
+    name: '运营中心',
+    description: '运营业务单元',
+};
+const historicalBusinessUnit = {
+    public_id: '00000000-0000-7000-8000-000000000076',
+    key: 'HISTORICAL',
+    name: '历史业务单元',
+    description: '已归档但仍用于治理筛选',
+};
+const platformProjectListRequest =
+    'GET /api/platform/projects?page=1&page_size=25&order_by=name&order=asc';
 const defaultPlatformProject: PlatformProjectSummary = {
     public_id: '00000000-0000-7000-8000-000000000075',
+    created_at: '2026-07-30T08:00:00Z',
+    updated_at: '2026-07-30T08:00:00Z',
     key: 'DEFAULT',
     name: '默认项目',
     description: '系统默认项目',
     status: 'active',
+    business_unit: businessUnit,
 };
 
 const platformProjectSummary = (
     project: AuthorizedProject,
     status: PlatformProjectSummary['status'] = 'active',
+    unit = businessUnit,
 ): PlatformProjectSummary => ({
     public_id: project.public_id,
+    created_at: project.created_at,
+    updated_at: project.updated_at,
     key: project.key,
     name: project.name,
     description: project.description,
     status,
+    business_unit: unit,
 });
 
 const emptyTicketStats = (total: number) => ({
@@ -73,7 +96,9 @@ const emptyTicketStats = (total: number) => ({
 const installPlatformProjectBackend = async (
     page: Page,
     {
+        archiveResponseData,
         authorizedProjects = [accessA, accessB],
+        lastPageShrinksOnArchive = false,
     }: PlatformProjectBackendOptions = {},
 ): Promise<PlatformProjectBackend> => {
     const state: PlatformProjectBackend = {
@@ -117,16 +142,111 @@ const installPlatformProjectBackend = async (
             request.method() === 'GET'
         ) {
             state.platformProjectReads.push(requestTarget);
-            await fulfillJSON(route, {
-                code: 0,
-                data: [
+            if (lastPageShrinksOnArchive) {
+                const requestedPage = Number(
+                    url.searchParams.get('page') ?? '1',
+                );
+                const items = state.archived
+                    ? requestedPage === 1
+                        ? [platformProjectSummary(projectB)]
+                        : []
+                    : requestedPage === 1
+                      ? [platformProjectSummary(projectB)]
+                      : [platformProjectSummary(projectA)];
+                await fulfillJSON(route, {
+                    code: 0,
+                    data: {
+                        items,
+                        total: state.archived ? 25 : 26,
+                        page: requestedPage,
+                        page_size: 25,
+                        total_pages: state.archived ? 1 : 2,
+                    },
+                });
+                return;
+            }
+            const historicalFilter =
+                url.searchParams.get('business_unit_public_id') ===
+                historicalBusinessUnit.public_id;
+            const items = historicalFilter
+                ? [
+                    platformProjectSummary(
+                        projectA,
+                        state.archived ? 'archived' : 'active',
+                        historicalBusinessUnit,
+                    ),
+                ]
+                : [
                     defaultPlatformProject,
                     platformProjectSummary(
                         projectA,
                         state.archived ? 'archived' : 'active',
                     ),
                     platformProjectSummary(projectB),
-                ],
+                ];
+            await fulfillJSON(route, {
+                code: 0,
+                data: {
+                    items,
+                    total: items.length,
+                    page: 1,
+                    page_size: 25,
+                    total_pages: 1,
+                },
+            });
+            return;
+        }
+
+        if (
+            url.pathname === '/api/platform/project-business-units' &&
+            request.method() === 'GET'
+        ) {
+            await fulfillJSON(route, {
+                code: 0,
+                data: {
+                    items: [businessUnit, historicalBusinessUnit],
+                    total: 2,
+                    page: 1,
+                    page_size: 25,
+                    total_pages: 1,
+                },
+            });
+            return;
+        }
+
+        if (
+            url.pathname === '/api/platform/project-creation-context' &&
+            request.method() === 'GET'
+        ) {
+            await fulfillJSON(route, {
+                code: 0,
+                data: {
+                    organization: {
+                        public_id:
+                            '00000000-0000-7000-8000-000000000073',
+                        name: 'ChronoDesk',
+                    },
+                    business_units: {
+                        items: [businessUnit],
+                        total: 1,
+                        page: 1,
+                        page_size: 25,
+                        total_pages: 1,
+                    },
+                    creator: {
+                        id: platformAdmin.id,
+                        username: 'platform-admin',
+                        display_name: '平台管理员',
+                        avatar: '',
+                    },
+                    users: {
+                        items: [],
+                        total: 0,
+                        page: 1,
+                        page_size: 25,
+                        total_pages: 0,
+                    },
+                },
             });
             return;
         }
@@ -144,7 +264,9 @@ const installPlatformProjectBackend = async (
                 {
                     code: 0,
                     msg: '项目已归档',
-                    data: platformProjectSummary(projectA, 'archived'),
+                    data:
+                        archiveResponseData ??
+                        platformProjectSummary(projectA, 'archived'),
                 },
                 200,
             );
@@ -194,14 +316,20 @@ test.describe('平台项目归档浏览器闭环', () => {
         ).toBe(true);
 
         await page
+            .getByRole('button', {
+                name: '治理中心',
+                exact: true,
+            })
+            .click();
+        await page
             .getByRole('menuitem', {
-                name: '平台项目治理',
+                name: '项目治理',
                 exact: true,
             })
             .click();
         await expect(page).toHaveURL(/#\/platform\/projects$/u);
         await expect(
-            page.getByRole('heading', {
+            page.getByTestId('platform-project-governance-page').getByRole('heading', {
                 name: '平台项目治理',
                 exact: true,
             }),
@@ -210,22 +338,20 @@ test.describe('平台项目归档浏览器闭环', () => {
             () => backend.platformProjectReads.length,
         ).toBeGreaterThan(0);
         expect(new Set(backend.platformProjectReads)).toEqual(
-            new Set(['GET /api/platform/projects']),
+            new Set([platformProjectListRequest]),
         );
         const governanceTable = page.getByRole('table', {
             name: '平台项目治理列表',
             exact: true,
         });
-        await expect(governanceTable.getByRole('separator')).toHaveCount(4);
-        const projectResizeHandle = governanceTable.getByRole(
-            'separator',
-            { name: /调整“?项目”?列宽/u },
-        );
+        await expect(governanceTable.getByRole('separator')).toHaveCount(6);
+        const projectResizeHandle =
+            governanceTable.getByRole('separator').first();
         await projectResizeHandle.focus();
         await projectResizeHandle.press('ArrowRight');
         await expect(projectResizeHandle).toHaveAttribute(
             'aria-valuenow',
-            '368',
+            '328',
         );
         await expect.poll(() =>
             page.evaluate(() => {
@@ -236,7 +362,7 @@ test.describe('平台项目归档浏览器闭环', () => {
                     ? (JSON.parse(raw) as { project?: unknown }).project
                     : null;
             }),
-        ).toBe(368);
+        ).toBe(328);
         const defaultProjectRow = governanceTable
             .getByRole('row')
             .filter({ hasText: defaultPlatformProject.public_id });
@@ -299,7 +425,7 @@ test.describe('平台项目归档浏览器闭环', () => {
         ).toBe(true);
         await expect(
             page.getByRole('menuitem', {
-                name: '项目成员管理',
+                name: '项目配置',
                 exact: true,
             }),
         ).toHaveCount(0);
@@ -335,14 +461,20 @@ test.describe('平台项目归档浏览器闭环', () => {
             backend.authorizedProjectReads;
 
         await page
+            .getByRole('button', {
+                name: '治理中心',
+                exact: true,
+            })
+            .click();
+        await page
             .getByRole('menuitem', {
-                name: '平台项目治理',
+                name: '项目治理',
                 exact: true,
             })
             .click();
         await expect(page).toHaveURL(/#\/platform\/projects$/u);
         await expect(
-            page.getByRole('heading', {
+            page.getByTestId('platform-project-governance-page').getByRole('heading', {
                 name: '平台项目治理',
                 exact: true,
             }),
@@ -353,7 +485,7 @@ test.describe('平台项目归档浏览器闭环', () => {
             () => backend.platformProjectReads.length,
         ).toBeGreaterThan(0);
         expect(new Set(backend.platformProjectReads)).toEqual(
-            new Set(['GET /api/platform/projects']),
+            new Set([platformProjectListRequest]),
         );
         expect(backend.authorizedProjectReads).toBe(
             authorizedReadsBeforeGovernance,
@@ -384,31 +516,233 @@ test.describe('平台项目归档浏览器闭环', () => {
         expect((await archiveResponse).status()).toBe(200);
 
         await expect(page).toHaveURL(/#\/platform\/projects$/u);
-        await expect(projectRow.getByText('已归档', { exact: true }))
+        await expect(
+            projectRow.getByText(
+                '已归档，当前版本暂不支持恢复',
+                { exact: true },
+            ),
+        )
             .toBeVisible();
         await expect(
             projectRow.getByRole('button', {
                 name: '归档项目',
                 exact: true,
             }),
-        ).toBeDisabled();
+        ).toHaveCount(0);
         await expect.poll(
             () => backend.platformProjectReads.length,
         ).toBeGreaterThan(platformReadsBeforeArchive);
         expect(new Set(backend.platformProjectReads)).toEqual(
-            new Set(['GET /api/platform/projects']),
+            new Set([platformProjectListRequest]),
         );
         expect(backend.archiveRequests).toEqual([
             `POST /api/platform/projects/${projectA.public_id}/archive`,
         ]);
-        expect(backend.authorizedProjectReads).toBe(
-            authorizedReadsBeforeGovernance,
-        );
+        await expect.poll(
+            () => backend.authorizedProjectReads,
+        ).toBeGreaterThan(authorizedReadsBeforeGovernance);
         await expect.poll(() =>
             page.evaluate(
                 () => localStorage.getItem('chronodesk.activeProject'),
             ),
         ).toBeNull();
+    });
+
+    test('归档非当前项目后保留当前项目选择并停留在治理页', async ({
+        page,
+    }) => {
+        await installMockSession(
+            page,
+            {
+                ...platformAdmin,
+                id: 13,
+                sessionID: 'e2e-platform-project-preserve-active',
+                email: 'platform-project-preserve-active@example.test',
+            },
+            projectB,
+        );
+        const backend = await installPlatformProjectBackend(page);
+
+        await page.goto('/#/');
+        await expect(page.getByTestId('project-home')).toBeVisible();
+        await page
+            .getByRole('button', {
+                name: '治理中心',
+                exact: true,
+            })
+            .click();
+        await page
+            .getByRole('menuitem', {
+                name: '项目治理',
+                exact: true,
+            })
+            .click();
+        await expect(page).toHaveURL(/#\/platform\/projects$/u);
+
+        const authorizedReadsBeforeArchive =
+            backend.authorizedProjectReads;
+        const projectRow = page
+            .getByRole('row')
+            .filter({ hasText: projectA.public_id });
+        await projectRow
+            .getByRole('button', { name: '归档项目', exact: true })
+            .click();
+        await page
+            .getByRole('dialog', { name: '确认归档项目' })
+            .getByRole('button', { name: '确认归档', exact: true })
+            .click();
+
+        await expect(page).toHaveURL(/#\/platform\/projects$/u);
+        await expect(
+            projectRow.getByText(
+                '已归档，当前版本暂不支持恢复',
+                { exact: true },
+            ),
+        ).toBeVisible();
+        await expect(
+            projectRow.getByRole('button', {
+                name: '查看详情',
+                exact: true,
+            }),
+        ).toBeVisible();
+        await expect.poll(
+            () => backend.authorizedProjectReads,
+        ).toBeGreaterThan(authorizedReadsBeforeArchive);
+        await expect.poll(() =>
+            page.evaluate(() => {
+                const raw = localStorage.getItem(
+                    'chronodesk.activeProject',
+                );
+                if (!raw) return null;
+                return (JSON.parse(raw) as { project_key?: unknown })
+                    .project_key;
+            }),
+        ).toBe(projectB.key);
+    });
+
+    test('归档最后一页最后一个项目后回到新的最后有效页', async ({
+        page,
+    }) => {
+        await installMockSession(page, {
+            ...platformAdmin,
+            id: 16,
+            sessionID: 'e2e-platform-project-clamp-last-page',
+            email: 'platform-project-clamp-page@example.test',
+        });
+        const backend = await installPlatformProjectBackend(page, {
+            authorizedProjects: [],
+            lastPageShrinksOnArchive: true,
+        });
+
+        await page.goto('/#/platform/projects');
+        await expect(page.getByText(projectB.public_id)).toBeVisible();
+        await page
+            .getByRole('button', { name: /下一页|next page/iu })
+            .click();
+        await expect(page.getByText(projectA.public_id)).toBeVisible();
+        const readsBeforeArchive = backend.platformProjectReads.length;
+
+        await page
+            .getByTestId(
+                `archive-platform-project-${projectA.public_id}`,
+            )
+            .click();
+        await page
+            .getByRole('dialog', { name: '确认归档项目' })
+            .getByRole('button', { name: '确认归档', exact: true })
+            .click();
+
+        await expect(page.getByText(projectB.public_id)).toBeVisible();
+        await expect.poll(
+            () => backend.platformProjectReads.length,
+        ).toBeGreaterThan(readsBeforeArchive + 1);
+        expect(
+            backend.platformProjectReads.at(-1),
+        ).toContain('page=1&page_size=25');
+    });
+
+    test('已归档业务单元仍可作为平台项目治理筛选维度', async ({
+        page,
+    }) => {
+        await installMockSession(page, {
+            ...platformAdmin,
+            id: 15,
+            sessionID: 'e2e-platform-project-historical-business-unit',
+            email: 'platform-project-historical-unit@example.test',
+        });
+        const backend = await installPlatformProjectBackend(page, {
+            authorizedProjects: [],
+        });
+
+        await page.goto('/#/platform/projects');
+        const businessUnitFilter = page.getByLabel('业务单元');
+        await businessUnitFilter.fill('历史');
+        await page
+            .getByRole('option', {
+                name: historicalBusinessUnit.name,
+                exact: true,
+            })
+            .click();
+
+        await expect.poll(() =>
+            backend.platformProjectReads.some((request) =>
+                request.includes(
+                    `business_unit_public_id=${historicalBusinessUnit.public_id}`,
+                ),
+            ),
+        ).toBe(true);
+        await expect(
+            page
+                .getByRole('row')
+                .filter({ hasText: projectA.public_id })
+                .getByText(historicalBusinessUnit.name, { exact: true }),
+        ).toBeVisible();
+    });
+
+    test('归档 HTTP 成功但响应投影异常时不误报不可逆操作失败', async ({
+        page,
+    }) => {
+        await installMockSession(page, {
+            ...platformAdmin,
+            id: 14,
+            sessionID: 'e2e-platform-project-archive-response-mismatch',
+            email: 'platform-project-archive-mismatch@example.test',
+        });
+        await installPlatformProjectBackend(page, {
+            archiveResponseData: {
+                public_id: projectB.public_id,
+                status: 'active',
+            },
+            authorizedProjects: [],
+        });
+
+        await page.goto('/#/platform/projects');
+        const projectRow = page
+            .getByRole('row')
+            .filter({ hasText: projectA.public_id });
+        await projectRow
+            .getByRole('button', { name: '归档项目', exact: true })
+            .click();
+        await page
+            .getByRole('dialog', { name: '确认归档项目' })
+            .getByRole('button', { name: '确认归档', exact: true })
+            .click();
+
+        await expect(
+            page.getByText(
+                `项目“${projectA.name}”的归档请求已成功提交，但响应校验异常，请刷新确认状态`,
+                { exact: true },
+            ),
+        ).toBeVisible();
+        await expect(
+            page.getByText('归档项目失败，请稍后重试', { exact: true }),
+        ).toHaveCount(0);
+        await expect(
+            projectRow.getByText(
+                '已归档，当前版本暂不支持恢复',
+                { exact: true },
+            ),
+        ).toBeVisible();
     });
 
     for (const platformRole of [
@@ -435,7 +769,7 @@ test.describe('平台项目归档浏览器闭环', () => {
             await page.goto('/#/');
             await expect(
                 page.getByRole('menuitem', {
-                    name: '平台项目治理',
+                    name: '项目治理',
                     exact: true,
                 }),
             ).toHaveCount(0);

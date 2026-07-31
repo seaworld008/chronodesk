@@ -15,6 +15,7 @@ import {
     projectAccessInvalidatedEvent,
     projectScopeChangedEvent,
     signalProjectAccessInvalidated,
+    signalProjectInventoryChanged,
     signalProjectScopeChanged,
 } from './projectScopeEvents'
 import {
@@ -63,6 +64,7 @@ export type ProjectCapability =
     | 'manage_notifications'
     | 'manage_automation'
     | 'manage_integrations'
+    | 'view_memberships'
     | 'manage_memberships'
     | 'manage_agents'
 
@@ -82,6 +84,7 @@ const projectCapabilities: Record<
         'manage_notifications',
         'manage_automation',
         'manage_integrations',
+        'view_memberships',
         'manage_memberships',
         'manage_agents',
     ]),
@@ -97,6 +100,7 @@ const projectCapabilities: Record<
         'manage_notifications',
         'manage_automation',
         'manage_integrations',
+        'view_memberships',
     ]),
     agent: new Set([
         'view_project',
@@ -347,6 +351,14 @@ export const loadAuthorizedProjects = async (
         }
         throw error
     }
+}
+
+export const refreshAuthorizedProjectInventory = async (): Promise<
+    AuthorizedProject[]
+> => {
+    const projects = await loadAuthorizedProjects(true)
+    signalProjectInventoryChanged()
+    return projects
 }
 
 export const activeProjectKey = (): string | undefined => {

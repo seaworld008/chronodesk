@@ -114,7 +114,11 @@ for (const name of [
     'AdminAuditLogPage',
     'PlatformProjectSummary',
     'PlatformProjectSummaryEnvelope',
-    'PlatformProjectSummaryListEnvelope',
+    'PlatformProjectPage',
+    'PlatformProjectPageEnvelope',
+    'ProjectCreationContext',
+    'PlatformBusinessUnitPage',
+    'ProjectUserOptionPage',
     'StandardErrorEnvelope',
     'AuthErrorEnvelope',
     'CodedErrorEnvelope',
@@ -470,7 +474,7 @@ assert.equal(
     contract.paths['/platform/projects'].get.responses['200'].content[
         'application/json'
     ].schema.$ref,
-    '#/components/schemas/PlatformProjectSummaryListEnvelope',
+    '#/components/schemas/PlatformProjectPageEnvelope',
 )
 assert.equal(
     contract.paths['/platform/projects'].post.responses['201'].content[
@@ -501,27 +505,32 @@ assert.equal(
     '#/components/schemas/PlatformProjectSummary',
 )
 assert.equal(
-    contract.components.schemas.PlatformProjectSummaryListEnvelope
+    contract.components.schemas.PlatformProjectPageEnvelope
         .additionalProperties,
     false,
 )
 assert.deepEqual(
-    contract.components.schemas.PlatformProjectSummaryListEnvelope.required,
+    contract.components.schemas.PlatformProjectPageEnvelope.required,
     ['code', 'msg', 'data'],
 )
 assert.equal(
-    contract.components.schemas.PlatformProjectSummaryListEnvelope.properties
-        .data.type,
-    'array',
+    contract.components.schemas.PlatformProjectPageEnvelope.properties
+        .data.$ref,
+    '#/components/schemas/PlatformProjectPage',
 )
-assert.equal(
-    contract.components.schemas.PlatformProjectSummaryListEnvelope.properties
-        .data.items.$ref,
-    '#/components/schemas/PlatformProjectSummary',
-)
-assert.equal(
-    Object.hasOwn(contract.paths['/platform/projects'].get, 'parameters'),
-    false,
+assert.deepEqual(
+    contract.paths['/platform/projects'].get.parameters.map(
+        (parameter) => parameter.name,
+    ),
+    [
+        'page',
+        'page_size',
+        'search',
+        'status',
+        'business_unit_public_id',
+        'order_by',
+        'order',
+    ],
 )
 assert.deepEqual(
     Object.keys(contract.paths['/platform/projects'].get.responses),
@@ -685,7 +694,7 @@ assert.equal(
     projectPublicIDPattern,
 )
 for (const schema of [
-    contract.components.schemas.PlatformProjectSummary.properties.public_id,
+    contract.components.schemas.PublicUUIDv7,
     contract.components.schemas.AuthorizedProject.properties.public_id,
 ]) {
     assert.equal(schema.format, 'uuid')

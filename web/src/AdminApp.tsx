@@ -56,6 +56,7 @@ import {
     type ProjectRole,
 } from './lib/projectScope'
 import {
+    projectInventoryChangedEvent,
     projectScopeChangedEvent,
     sessionInvalidatedEvent,
 } from './lib/projectScopeEvents'
@@ -298,11 +299,16 @@ const useActiveProjectAccess = (): ActiveProjectAccessState => {
         void loadAccess()
         const reloadAccess = () => void loadAccess()
         window.addEventListener(projectAccessInvalidatedEvent, reloadAccess)
+        window.addEventListener(projectInventoryChangedEvent, reloadAccess)
         window.addEventListener(projectScopeChangedEvent, reloadAccess)
         return () => {
             active = false
             window.removeEventListener(
                 projectAccessInvalidatedEvent,
+                reloadAccess,
+            )
+            window.removeEventListener(
+                projectInventoryChangedEvent,
                 reloadAccess,
             )
             window.removeEventListener(projectScopeChangedEvent, reloadAccess)
@@ -526,6 +532,11 @@ const PlatformHome = ({ permissions }: { permissions: AccessPermissions }) => {
             visible: platformRole === 'platform_admin',
             label: '平台项目治理',
             path: '/platform/projects',
+        },
+        {
+            visible: platformRole === 'platform_admin',
+            label: '创建项目',
+            path: '/platform/projects?create=1',
         },
         {
             visible: hasPlatformCapability(
@@ -947,6 +958,10 @@ const AppRuntimeCoordinator = () => {
         }
 
         window.addEventListener(
+            projectInventoryChangedEvent,
+            handleProjectScopeChanged,
+        )
+        window.addEventListener(
             projectScopeChangedEvent,
             handleProjectScopeChanged,
         )
@@ -959,6 +974,10 @@ const AppRuntimeCoordinator = () => {
             handleSessionInvalidated,
         )
         return () => {
+            window.removeEventListener(
+                projectInventoryChangedEvent,
+                handleProjectScopeChanged,
+            )
             window.removeEventListener(
                 projectScopeChangedEvent,
                 handleProjectScopeChanged,
