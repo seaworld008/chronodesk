@@ -30,6 +30,7 @@ var (
 	ErrLastProjectAdministrator  = errors.New("project requires an active administrator")
 	ErrProjectEventWriter        = errors.New("project event writer is unavailable")
 	ErrProjectPublicID           = errors.New("invalid project public id")
+	ErrDefaultProjectArchive     = errors.New("default project cannot be archived")
 	ErrProjectSequenceConflict   = errors.New("project ticket sequence conflict")
 )
 
@@ -1820,6 +1821,9 @@ func (service *ProjectService) ArchiveProject(
 				"lock project archive administrator: %w",
 				err,
 			)
+		}
+		if project.Key == models.ProjectKey("DEFAULT") {
+			return ErrDefaultProjectArchive
 		}
 		if project.Status == models.ProjectStatusArchived {
 			return nil

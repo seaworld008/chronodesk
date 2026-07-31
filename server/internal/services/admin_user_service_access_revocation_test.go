@@ -84,8 +84,10 @@ func TestAdminUserStatusRevocationCommitsEventAndOutboxAtomically(
 	}
 
 	suspended := models.UserStatusSuspended
+	actor := models.HumanActor(9001)
 	updated, err := service.UpdateUser(
 		context.Background(),
+		actor,
 		user.ID,
 		&models.UserUpdateRequest{Status: &suspended},
 	)
@@ -120,6 +122,15 @@ func TestAdminUserStatusRevocationCommitsEventAndOutboxAtomically(
 			event.ProjectID,
 		)
 	}
+	if event.ActorType != actor.Type || event.ActorID != actor.ID {
+		t.Fatalf(
+			"access-revoked actor = %s/%s, want %s/%s",
+			event.ActorType,
+			event.ActorID,
+			actor.Type,
+			actor.ID,
+		)
+	}
 	var delivery models.OutboxDelivery
 	if err := db.Where("event_id = ?", event.ID).
 		First(&delivery).Error; err != nil {
@@ -147,6 +158,7 @@ func TestAdminUserRevocationRollsBackWhenOutboxAppendFails(t *testing.T) {
 	suspended := models.UserStatusSuspended
 	if _, err := service.UpdateUser(
 		context.Background(),
+		models.HumanActor(9002),
 		user.ID,
 		&models.UserUpdateRequest{Status: &suspended},
 	); !errors.Is(err, appendFailure) {
@@ -181,7 +193,12 @@ func TestAdminUserDeleteCommitsAccessRevocationOutbox(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.DeleteUser(context.Background(), user.ID); err != nil {
+	actor := models.HumanActor(9003)
+	if err := service.DeleteUser(
+		context.Background(),
+		actor,
+		user.ID,
+	); err != nil {
 		t.Fatalf("delete user with access-revocation Outbox: %v", err)
 	}
 
@@ -202,6 +219,15 @@ func TestAdminUserDeleteCommitsAccessRevocationOutbox(t *testing.T) {
 	if data.UserID != user.ID || data.Status != models.UserStatusDeleted {
 		t.Fatalf("delete access-revoked event data = %+v", data)
 	}
+	if event.ActorType != actor.Type || event.ActorID != actor.ID {
+		t.Fatalf(
+			"delete access-revoked actor = %s/%s, want %s/%s",
+			event.ActorType,
+			event.ActorID,
+			actor.Type,
+			actor.ID,
+		)
+	}
 	var deliveryCount int64
 	if err := db.Model(&models.OutboxDelivery{}).
 		Where(
@@ -217,6 +243,78 @@ func TestAdminUserDeleteCommitsAccessRevocationOutbox(t *testing.T) {
 			"delete access-revocation deliveries = %d, want 1",
 			deliveryCount,
 		)
+	}
+}
+
+func TestAdminUserMutationsRejectNonHumanOrInvalidActors(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		actor models.ActorRef
+	}{
+		{
+			name:  "system",
+			actor: models.SystemActor("spoofed-platform-user"),
+		},
+		{
+			name:  "service principal",
+			actor: models.ServicePrincipalActor("spoofed-agent"),
+		},
+		{
+			name:  "zero human",
+			actor: models.HumanActor(0),
+		},
+		{
+			name: "noncanonical human",
+			actor: models.ActorRef{
+				Type: models.ActorTypeHuman,
+				ID:   "01",
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := openAdminUserAccessRevocationTestDB(t)
+			user := seedAdminUserAccessRevocationUser(t, db)
+			appender := &persistingAdminUserAccessEventAppender{}
+			service, err := NewAdminUserServiceWithAccessRevocationOutbox(
+				db,
+				appender,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			suspended := models.UserStatusSuspended
+			if _, err := service.UpdateUser(
+				context.Background(),
+				test.actor,
+				user.ID,
+				&models.UserUpdateRequest{Status: &suspended},
+			); err == nil {
+				t.Fatal("UpdateUser accepted an invalid Human ActorRef")
+			}
+			if err := service.DeleteUser(
+				context.Background(),
+				test.actor,
+				user.ID,
+			); err == nil {
+				t.Fatal("DeleteUser accepted an invalid Human ActorRef")
+			}
+			var persisted models.User
+			if err := db.First(&persisted, user.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if persisted.Status != models.UserStatusActive {
+				t.Fatalf(
+					"invalid actor changed user status to %q",
+					persisted.Status,
+				)
+			}
+			if appender.sequence.Load() != 0 {
+				t.Fatalf(
+					"invalid actor appended %d event(s)",
+					appender.sequence.Load(),
+				)
+			}
+		})
 	}
 }
 

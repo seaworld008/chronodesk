@@ -25,9 +25,9 @@ CloudEvent、Outbox、Chrome 与故障注入证据统一以
 | RBAC-005 | HTTP 直接证据 | `human/test_rbac_matrix.py::test_ticket_object_permission_matrix` | `requester` 读取本人工单，处理人、内部上下文与附件投影被裁剪。 |
 | RBAC-006 | HTTP 直接证据 | 同上 | `requester` 跨用户读取拒绝，响应不回显目标 ID。 |
 | RBAC-007 | HTTP 直接证据 | `human/test_content_and_notifications.py::test_public_and_internal_comment_permissions` | `requester` 可写公开评论，internal/system 均为 403。 |
-| RBAC-008 | HTTP 直接证据 | `human/test_rbac_matrix.py::{test_platform_permission_matrix_never_grants_implicit_project_access,test_project_permission_matrix_uses_only_active_membership,test_revoked_membership_immediately_removes_project_access}` | 四个平台角色不隐式获得项目；五个项目角色只来自 active Membership，平台矩阵与项目矩阵独立验证。 |
-| RBAC-009 | HTTP 直接证据 | `human/test_zz_error_contract.py::{test_suspended_account_invalidates_an_existing_access_token,test_deleted_account_invalidates_an_existing_access_token}` | 停用和删除后，已签发 access token 立即为 401。 |
-| RBAC-010 | 复合证据 | `human/test_rbac_matrix.py::test_unknown_roles_fail_closed`、`human/test_rbac_matrix.py::test_soft_deleted_human_identity_returns_stable_conflict` | 未知平台/项目角色为 400；审计保留身份复用为中文 409；数据库 CHECK 与旧字段/路由不存在性由 manifest 中静态及 Go 契约证明。 |
+| RBAC-008 | HTTP 直接证据 | `human/test_rbac_matrix.py::{test_platform_permission_matrix_never_grants_implicit_project_access,test_project_permission_matrix_uses_only_active_membership,test_revoked_membership_immediately_removes_project_access}` | 四个平台角色不隐式获得项目；五个项目角色只来自 active Membership，平台矩阵与项目矩阵独立验证；`/api/workbench` 只能聚合 active Membership 项目。 |
+| RBAC-009 | HTTP 直接证据 | `human/test_zz_error_contract.py::{test_suspended_account_invalidates_an_existing_access_token,test_deleted_account_invalidates_an_existing_access_token}` | 停用和删除后，已签发 access token 立即为 401。平台角色失配导致的 `stale_token` 以及 JWT 不含项目角色由 manifest 中 auth Go 契约补充证明。 |
+| RBAC-010 | 复合证据 | `human/test_rbac_matrix.py::test_unknown_roles_fail_closed`、`human/test_rbac_matrix.py::test_soft_deleted_human_identity_returns_stable_conflict` | 未知平台/项目角色为 400；审计保留身份复用为中文 409；数据库 CHECK、旧字段移除、角色切换 checkpoint 与路由不存在性由 manifest 中静态及 Go 迁移/契约证明。 |
 | RBAC-011 | 复合证据 | `internal/services/admin_user_service_role_test.go::TestAdminUserServiceUpdatePreservesLastActiveAdmin`、`web/e2e/00-users.spec.ts` | 服务层与浏览器共同验证最后活跃管理员不能降级；不破坏共享云管理员来构造黑盒前置条件。 |
 | RBAC-012 | HTTP 直接证据 | `human/test_rbac_matrix.py::test_platform_role_change_audit_identifies_actor_target_result_and_redacts_query` | 平台角色变更审计包含 `platform_role`、操作者、目标路径/ID、方法、结果、时间和来源；password/token query 被脱敏。该接口不冒充 Agent diff/event 审计。 |
 

@@ -35,6 +35,7 @@ func TestPostgresLastPlatformAdministratorInvariantIsConcurrentSafe(
 				role := models.PlatformRoleMember
 				_, err := service.UpdateUser(
 					ctx,
+					models.HumanActor(userID),
 					userID,
 					&models.UserUpdateRequest{PlatformRole: &role},
 				)
@@ -51,6 +52,7 @@ func TestPostgresLastPlatformAdministratorInvariantIsConcurrentSafe(
 				status := models.UserStatusSuspended
 				_, err := service.UpdateUser(
 					ctx,
+					models.HumanActor(userID),
 					userID,
 					&models.UserUpdateRequest{Status: &status},
 				)
@@ -64,7 +66,11 @@ func TestPostgresLastPlatformAdministratorInvariantIsConcurrentSafe(
 				service *AdminUserService,
 				userID uint,
 			) error {
-				return service.DeleteUser(ctx, userID)
+				return service.DeleteUser(
+					ctx,
+					models.HumanActor(userID),
+					userID,
+				)
 			},
 		},
 	}

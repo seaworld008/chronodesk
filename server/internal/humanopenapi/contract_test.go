@@ -793,6 +793,54 @@ func TestProtectedOperationsMatchRuntimeRoleAllowlists(t *testing.T) {
 			[]string{"project_admin"},
 		},
 		{
+			"/projects/{projectKey}/webhooks",
+			"get",
+			"x-chronodesk-project-roles",
+			[]string{"project_admin", "manager"},
+		},
+		{
+			"/projects/{projectKey}/webhooks",
+			"post",
+			"x-chronodesk-project-roles",
+			[]string{"project_admin", "manager"},
+		},
+		{
+			"/projects/{projectKey}/webhooks/{webhookID}",
+			"get",
+			"x-chronodesk-project-roles",
+			[]string{"project_admin", "manager"},
+		},
+		{
+			"/projects/{projectKey}/webhooks/{webhookID}",
+			"put",
+			"x-chronodesk-project-roles",
+			[]string{"project_admin", "manager"},
+		},
+		{
+			"/projects/{projectKey}/webhooks/{webhookID}",
+			"delete",
+			"x-chronodesk-project-roles",
+			[]string{"project_admin", "manager"},
+		},
+		{
+			"/projects/{projectKey}/webhooks/{webhookID}/test",
+			"post",
+			"x-chronodesk-project-roles",
+			[]string{"project_admin", "manager"},
+		},
+		{
+			"/projects/{projectKey}/webhooks/{webhookID}/logs",
+			"get",
+			"x-chronodesk-project-roles",
+			[]string{"project_admin", "manager"},
+		},
+		{
+			"/projects/{projectKey}/webhooks/{webhookID}/stats",
+			"get",
+			"x-chronodesk-project-roles",
+			[]string{"project_admin", "manager"},
+		},
+		{
 			"/platform/projects",
 			"get",
 			"x-chronodesk-platform-roles",
@@ -1449,6 +1497,134 @@ func TestAutomationLogAndWebhookSchemasAreClosedRuntimeDTOs(t *testing.T) {
 	if _, exposed := objectAt(t, updateWebhook, "properties")["status"]; !exposed {
 		t.Error("UpdateWebhookRequest omits persisted status control")
 	}
+
+	webhookConfig := objectAt(t, schemas, "WebhookConfig")
+	if webhookConfig["additionalProperties"] != false {
+		t.Fatal("WebhookConfig must not rely on persistence-model properties")
+	}
+	assertExactObjectKeys(
+		t,
+		objectAt(t, webhookConfig, "properties"),
+		[]string{
+			"id",
+			"created_at",
+			"updated_at",
+			"organization_id",
+			"project_id",
+			"name",
+			"description",
+			"provider",
+			"webhook_url",
+			"status",
+			"previous_secret_expires_at",
+			"enabled_events",
+			"enabled_events_list",
+			"message_template",
+			"message_format",
+			"filter_rules",
+			"filter_rules_obj",
+			"retry_count",
+			"retry_interval",
+			"timeout_seconds",
+			"is_async",
+			"rate_limit",
+			"rate_limit_window",
+			"last_triggered_at",
+			"last_success_at",
+			"last_error_at",
+			"last_error",
+			"total_sent",
+			"total_success",
+			"total_failed",
+			"created_by",
+			"updated_by",
+		},
+	)
+
+	paths := objectAt(t, document, "paths")
+	logSchema := successResponseSchema(
+		t,
+		objectAt(
+			t,
+			objectAt(
+				t,
+				paths,
+				"/projects/{projectKey}/webhooks/{webhookID}/logs",
+			),
+			"get",
+		),
+		"200",
+	)
+	logData := objectAt(t, objectAt(t, logSchema, "properties"), "data")
+	logItems := objectAt(
+		t,
+		objectAt(t, objectAt(t, logData, "properties"), "items"),
+		"items",
+	)
+	if logData["additionalProperties"] != false ||
+		logItems["additionalProperties"] != false {
+		t.Fatal("Webhook log page and items must be closed")
+	}
+	assertExactObjectKeys(
+		t,
+		objectAt(t, logItems, "properties"),
+		[]string{
+			"id",
+			"created_at",
+			"config_id",
+			"event_type",
+			"status",
+			"response_status",
+			"response_time",
+			"error_message",
+		},
+	)
+
+	statsSchema := successResponseSchema(
+		t,
+		objectAt(
+			t,
+			objectAt(
+				t,
+				paths,
+				"/projects/{projectKey}/webhooks/{webhookID}/stats",
+			),
+			"get",
+		),
+		"200",
+	)
+	statsData := objectAt(t, objectAt(t, statsSchema, "properties"), "data")
+	if statsData["additionalProperties"] != false {
+		t.Fatal("Webhook stats data must be closed")
+	}
+	assertExactObjectKeys(
+		t,
+		objectAt(t, statsData, "properties"),
+		[]string{"summary", "daily_stats", "period"},
+	)
+	statsProperties := objectAt(t, statsData, "properties")
+	summary := objectAt(t, statsProperties, "summary")
+	if summary["additionalProperties"] != false {
+		t.Fatal("Webhook stats summary must be closed")
+	}
+	assertExactObjectKeys(
+		t,
+		objectAt(t, summary, "properties"),
+		[]string{"total_sent", "total_success", "total_failed"},
+	)
+	dailyStats := objectAt(
+		t,
+		objectAt(t, statsProperties, "daily_stats"),
+		"items",
+	)
+	if dailyStats["additionalProperties"] != false {
+		t.Fatal("Webhook daily stats items must be closed")
+	}
+	assertExactObjectKeys(
+		t,
+		objectAt(t, dailyStats, "properties"),
+		[]string{"date", "sent", "success", "failed"},
+	)
 }
 
 func TestPublishedHumanWriteSchemasRejectUnpublishedFields(t *testing.T) {
@@ -1852,6 +2028,19 @@ func responseSchemaRef(
 	schema := objectAt(t, media, "schema")
 	reference, _ := schema["$ref"].(string)
 	return reference
+}
+
+func successResponseSchema(
+	t *testing.T,
+	operation map[string]any,
+	status string,
+) map[string]any {
+	t.Helper()
+	responses := objectAt(t, operation, "responses")
+	response := objectAt(t, responses, status)
+	content := objectAt(t, response, "content")
+	media := objectAt(t, content, "application/json")
+	return objectAt(t, media, "schema")
 }
 
 func responseDataReference(

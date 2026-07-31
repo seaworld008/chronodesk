@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,7 +20,6 @@ const (
 	UserAccessRevokedEventType            = "io.chronodesk.user.access-revoked.v1"
 	ProjectAccessRevokedEventType         = "io.chronodesk.project.access-revoked.v1"
 	adminUserAccessEventDestinationID     = "access-revocation"
-	adminUserAccessEventActorID           = "platform-user-access"
 )
 
 var (
@@ -315,9 +315,23 @@ func (s *AdminUserService) CreateUser(ctx context.Context, req *models.UserCreat
 }
 
 // UpdateUser 更新用户信息
-func (s *AdminUserService) UpdateUser(ctx context.Context, userID uint, req *models.UserUpdateRequest) (*models.User, error) {
+func (s *AdminUserService) UpdateUser(
+	ctx context.Context,
+	actor models.ActorRef,
+	userID uint,
+	req *models.UserUpdateRequest,
+) (*models.User, error) {
+	if err := validateAdminUserHumanActor(actor); err != nil {
+		return nil, err
+	}
+	if req == nil {
+		return nil, errors.New("user update request is required")
+	}
+	if req.PlatformRole != nil && !req.PlatformRole.IsValid() {
+		return nil, fmt.Errorf("invalid platform role")
+	}
 	var updated *models.User
-	err := s.withMutationTransaction(ctx, func(commandContext context.Context, tx *gorm.DB) error {
+	err := s.withMutationTransaction(ctx, actor, func(commandContext context.Context, tx *gorm.DB) error {
 		if err := lockPlatformAdministratorInvariant(tx); err != nil {
 			return err
 		}
@@ -345,10 +359,14 @@ func (s *AdminUserService) UpdateUser(ctx context.Context, userID uint, req *mod
 
 func (s *AdminUserService) withMutationTransaction(
 	ctx context.Context,
+	actor models.ActorRef,
 	run func(context.Context, *gorm.DB) error,
 ) error {
 	if s == nil || s.db == nil || run == nil {
 		return errors.New("admin user mutation is unavailable")
+	}
+	if err := validateAdminUserHumanActor(actor); err != nil {
+		return err
 	}
 	if s.events == nil {
 		return transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
@@ -364,7 +382,7 @@ func (s *AdminUserService) withMutationTransaction(
 		ctx,
 		OperationContext{
 			Scope:  s.eventScope,
-			Actor:  models.SystemActor(adminUserAccessEventActorID),
+			Actor:  actor,
 			Source: SourceProtocolHumanREST,
 		},
 	)
@@ -400,7 +418,7 @@ func (s *AdminUserService) appendAccessRevokedEventTx(
 	}
 	operation, err := OperationContextFromContext(ctx)
 	if err != nil || operation.Scope != s.eventScope ||
-		operation.Actor != models.SystemActor(adminUserAccessEventActorID) {
+		validateAdminUserHumanActor(operation.Actor) != nil {
 		return ErrAdminUserAccessEventWriter
 	}
 	_, err = s.events.AppendDomainEventTx(
@@ -624,9 +642,17 @@ func (s *AdminUserService) ResetUserPassword(ctx context.Context, userID uint, n
 }
 
 // DeleteUser 删除用户（软删除）
-func (s *AdminUserService) DeleteUser(ctx context.Context, userID uint) error {
+func (s *AdminUserService) DeleteUser(
+	ctx context.Context,
+	actor models.ActorRef,
+	userID uint,
+) error {
+	if err := validateAdminUserHumanActor(actor); err != nil {
+		return err
+	}
 	return s.withMutationTransaction(
 		ctx,
+		actor,
 		func(commandContext context.Context, tx *gorm.DB) error {
 			if err := lockPlatformAdministratorInvariant(tx); err != nil {
 				return err
@@ -698,6 +724,19 @@ func (s *AdminUserService) DeleteUser(ctx context.Context, userID uint) error {
 			)
 		},
 	)
+}
+
+func validateAdminUserHumanActor(actor models.ActorRef) error {
+	if actor.Type != models.ActorTypeHuman || actor.Validate() != nil {
+		return errors.New("authenticated human actor is required")
+	}
+	userID, err := strconv.ParseUint(actor.ID, 10, strconv.IntSize)
+	if err != nil ||
+		userID == 0 ||
+		models.HumanActor(uint(userID)) != actor {
+		return errors.New("authenticated human actor is invalid")
+	}
+	return nil
 }
 
 func lockPlatformAdministratorInvariant(tx *gorm.DB) error {

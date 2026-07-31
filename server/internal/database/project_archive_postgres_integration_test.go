@@ -31,14 +31,7 @@ func TestPostgresProjectArchiveRevocationOutboxRunsAfterForceRLS(
 	); err != nil {
 		t.Fatalf("migrate project archive fixture: %v", err)
 	}
-	var project models.Project
-	if err := db.Where(
-		"key = ? AND status = ?",
-		DefaultProjectKey,
-		models.ProjectStatusActive,
-	).Take(&project).Error; err != nil {
-		t.Fatal(err)
-	}
+	project := createArchivablePostgresProject(t, db)
 	administrator := models.User{
 		Username:     "archive-admin-" + suffix,
 		Email:        "archive-admin-" + suffix + "@example.test",
@@ -151,14 +144,7 @@ func TestPostgresOutboxClaimWaitsForArchiveAndAppliesArchivedAllowlist(
 	); err != nil {
 		t.Fatalf("migrate archived Outbox claim fixture: %v", err)
 	}
-	var project models.Project
-	if err := ownerDB.Where(
-		"key = ? AND status = ?",
-		DefaultProjectKey,
-		models.ProjectStatusActive,
-	).Take(&project).Error; err != nil {
-		t.Fatal(err)
-	}
+	project := createArchivablePostgresProject(t, ownerDB)
 	administrator := models.User{
 		Username:     "archive-claim-admin-" + suffix,
 		Email:        "archive-claim-admin-" + suffix + "@example.test",
@@ -453,6 +439,32 @@ func TestPostgresOutboxClaimWaitsForArchiveAndAppliesArchivedAllowlist(
 	); err != nil {
 		t.Fatalf("verify archived Outbox claim under FORCE RLS: %v", err)
 	}
+}
+
+func createArchivablePostgresProject(
+	t *testing.T,
+	db *gorm.DB,
+) models.Project {
+	t.Helper()
+	var defaultProject models.Project
+	if err := db.Where(
+		"key = ? AND status = ?",
+		DefaultProjectKey,
+		models.ProjectStatusActive,
+	).Take(&defaultProject).Error; err != nil {
+		t.Fatalf("load default project hierarchy: %v", err)
+	}
+	project := models.Project{
+		OrganizationID: defaultProject.OrganizationID,
+		BusinessUnitID: defaultProject.BusinessUnitID,
+		Key:            models.ProjectKey("ARCHIVE"),
+		Name:           "Archivable Project",
+		Status:         models.ProjectStatusActive,
+	}
+	if err := db.Create(&project).Error; err != nil {
+		t.Fatalf("create non-default archive fixture: %v", err)
+	}
+	return project
 }
 
 func openPostgresArchiveRuntimeDB(

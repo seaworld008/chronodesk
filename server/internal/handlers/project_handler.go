@@ -496,6 +496,8 @@ func writeProjectArchiveError(
 		response.NotFound(c, "项目不存在")
 	case errors.Is(err, services.ErrProjectInactive):
 		response.Error(c, http.StatusConflict, "项目当前状态不允许归档")
+	case errors.Is(err, services.ErrDefaultProjectArchive):
+		response.Error(c, http.StatusConflict, "系统默认项目不能归档")
 	default:
 		response.InternalServerError(c, "项目归档失败")
 	}

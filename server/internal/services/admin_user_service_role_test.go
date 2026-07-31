@@ -23,7 +23,7 @@ func TestAdminUserServiceRejectsRolesOutsideClosedPlatformEnum(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), "invalid platform role") {
 		t.Errorf("CreateUser invalid role error = %v", err)
 	}
-	if _, err := service.UpdateUser(context.Background(), 1, &models.UserUpdateRequest{
+	if _, err := service.UpdateUser(context.Background(), models.HumanActor(1), 1, &models.UserUpdateRequest{
 		PlatformRole: &invalidRole,
 	}); err == nil || !strings.Contains(err.Error(), "invalid platform role") {
 		t.Errorf("UpdateUser invalid role error = %v", err)
@@ -50,6 +50,7 @@ func TestAdminUserServiceUpdatePreservesLastActiveAdmin(t *testing.T) {
 	service := NewAdminUserService(db)
 	if _, err := service.UpdateUser(
 		context.Background(),
+		models.HumanActor(admin.ID),
 		admin.ID,
 		&models.UserUpdateRequest{Status: &suspended},
 	); !errors.Is(err, ErrLastActivePlatformAdministrator) {
@@ -107,6 +108,7 @@ func TestAdminUserServiceTreatsSoftDeletedIdentityAsConflict(t *testing.T) {
 	}
 	_, err = service.UpdateUser(
 		context.Background(),
+		models.HumanActor(active.ID),
 		active.ID,
 		&models.UserUpdateRequest{Email: &deleted.Email},
 	)

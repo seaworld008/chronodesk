@@ -54,6 +54,20 @@ func registerPlatformProjectRoutes(
 	)
 }
 
+func configureProjectAgentAdminMiddleware(
+	routes *gin.RouterGroup,
+	audit gin.HandlerFunc,
+	projectScope gin.HandlerFunc,
+	projectRole gin.HandlerFunc,
+) {
+	// Keep the attempt anchor outside both project authorization and its
+	// rollback-capable transaction. Denied and failed privileged requests must
+	// remain observable even when the project transaction is rolled back.
+	routes.Use(audit)
+	routes.Use(projectScope)
+	routes.Use(projectRole)
+}
+
 func migrateAndEnableProjectRLS(cfg *config.Config) error {
 	migrationDB, closeMigration, err :=
 		database.OpenProjectMigrationDatabase(cfg)
@@ -806,13 +820,12 @@ func Run() error {
 		projects.Use(authenticatedRateLimit)
 		projects.GET("", projectHandler.List)
 		agentAdminRoutes := projects.Group("/:projectKey/admin/agents")
-		agentAdminRoutes.Use(
+		configureProjectAgentAdminMiddleware(
+			agentAdminRoutes,
+			middleware.LogAdminOperation(adminAuditService),
 			handlers.ProjectScopeMiddleware(projectService, db.DB),
-		)
-		agentAdminRoutes.Use(
 			handlers.RequireProjectRoles(models.ProjectRoleAdmin),
 		)
-		agentAdminRoutes.Use(middleware.LogAdminOperation(adminAuditService))
 		agentAdmin.RegisterRoutes(agentAdminRoutes)
 		projectScoped := projects.Group("/:projectKey")
 		projectScoped.Use(handlers.ProjectScopeMiddleware(projectService, db.DB))

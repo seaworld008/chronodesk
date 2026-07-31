@@ -86,7 +86,11 @@ func TestDeleteUserSoftDeletesAndRevokesSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := NewAdminUserService(db).DeleteUser(context.Background(), user.ID); err != nil {
+	if err := NewAdminUserService(db).DeleteUser(
+		context.Background(),
+		models.HumanActor(admin.ID),
+		user.ID,
+	); err != nil {
 		t.Fatalf("delete logged-in user: %v", err)
 	}
 

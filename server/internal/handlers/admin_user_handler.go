@@ -306,7 +306,12 @@ func (h *AdminUserHandler) UpdateUser(c *gin.Context) {
 		req.Phone = &phone
 	}
 
-	user, err := h.adminUserService.UpdateUser(c.Request.Context(), uint(userID), &req)
+	user, err := h.adminUserService.UpdateUser(
+		c.Request.Context(),
+		models.HumanActor(c.GetUint("user_id")),
+		uint(userID),
+		&req,
+	)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			c.JSON(http.StatusNotFound, ApiResponse{
@@ -468,7 +473,11 @@ func (h *AdminUserHandler) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	err = h.adminUserService.DeleteUser(c.Request.Context(), uint(userID))
+	err = h.adminUserService.DeleteUser(
+		c.Request.Context(),
+		models.HumanActor(c.GetUint("user_id")),
+		uint(userID),
+	)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			c.JSON(http.StatusNotFound, ApiResponse{

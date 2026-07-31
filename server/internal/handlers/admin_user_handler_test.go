@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,7 +14,28 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
+
+type adminUserActorEventAppender struct {
+	input     services.DomainEventInput
+	operation services.OperationContext
+	calls     int
+}
+
+func (appender *adminUserActorEventAppender) AppendDomainEventTx(
+	ctx context.Context,
+	_ *gorm.DB,
+	input services.DomainEventInput,
+	_ []services.OutboxTarget,
+) (*models.DomainEvent, error) {
+	appender.calls++
+	appender.input = input
+	if operation, err := services.OperationContextFromContext(ctx); err == nil {
+		appender.operation = operation
+	}
+	return &models.DomainEvent{ID: "handler-user-access-event"}, nil
+}
 
 func TestAdminUserUpdateAllowsClearingPhoneAndEmailVerification(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -32,6 +54,10 @@ func TestAdminUserUpdateAllowsClearingPhoneAndEmailVerification(t *testing.T) {
 
 	handler := NewAdminUserHandler(services.NewAdminUserService(db))
 	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", uint(77))
+		c.Next()
+	})
 	router.PUT("/users/:id", handler.UpdateUser)
 
 	body, _ := json.Marshal(map[string]any{
@@ -140,6 +166,102 @@ func TestAdminUserUpdateAllowsClearingPhoneAndEmailVerification(t *testing.T) {
 				roleResponse.Body.String(),
 			)
 		}
+	}
+}
+
+func TestAdminUserUpdateUsesAuthenticatedHumanActorForRevocationEvent(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.Organization{},
+		&models.BusinessUnit{},
+		&models.Project{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	organization := models.Organization{
+		Slug:   "admin-user-actor",
+		Name:   "Admin User Actor",
+		Status: models.OrganizationStatusActive,
+	}
+	if err := db.Create(&organization).Error; err != nil {
+		t.Fatal(err)
+	}
+	unit := models.BusinessUnit{
+		OrganizationID: organization.ID,
+		Key:            "ADMIN",
+		Name:           "Admin",
+		Status:         models.BusinessUnitStatusActive,
+	}
+	if err := db.Create(&unit).Error; err != nil {
+		t.Fatal(err)
+	}
+	project := models.Project{
+		OrganizationID: organization.ID,
+		BusinessUnitID: unit.ID,
+		Key:            models.ProjectKey("DEFAULT"),
+		Name:           "Default",
+		Status:         models.ProjectStatusActive,
+	}
+	if err := db.Create(&project).Error; err != nil {
+		t.Fatal(err)
+	}
+	target := models.User{
+		Username:     "actor-target",
+		Email:        "actor-target@example.test",
+		PasswordHash: "hash",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&target).Error; err != nil {
+		t.Fatal(err)
+	}
+	appender := &adminUserActorEventAppender{}
+	service, err := services.NewAdminUserServiceWithAccessRevocationOutbox(
+		db,
+		appender,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewAdminUserHandler(service)
+	const operatorID = uint(77)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", operatorID)
+		c.Next()
+	})
+	router.PUT("/users/:id", handler.UpdateUser)
+
+	request := httptest.NewRequest(
+		http.MethodPut,
+		fmt.Sprintf("/users/%d", target.ID),
+		bytes.NewBufferString(`{"status":"suspended"}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"status = %d, want 200; body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	wantActor := models.HumanActor(operatorID)
+	if appender.calls != 1 ||
+		appender.input.Actor != wantActor ||
+		appender.operation.Actor != wantActor {
+		t.Fatalf(
+			"revocation actor input=%+v operation=%+v calls=%d, want %+v",
+			appender.input.Actor,
+			appender.operation.Actor,
+			appender.calls,
+			wantActor,
+		)
 	}
 }
 

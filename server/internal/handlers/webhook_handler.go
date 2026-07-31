@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -89,12 +90,191 @@ type UpdateWebhookRequest struct {
 	Status               *models.WebhookStatus      `json:"status"`
 }
 
+// WebhookConfigResponse is the closed Human Web projection of a persisted
+// Webhook configuration. Persistence relations and secret material must never
+// cross the HTTP boundary.
+type WebhookConfigResponse struct {
+	ID                      uint                       `json:"id"`
+	CreatedAt               time.Time                  `json:"created_at"`
+	UpdatedAt               time.Time                  `json:"updated_at"`
+	OrganizationID          uint                       `json:"organization_id"`
+	ProjectID               uint                       `json:"project_id"`
+	Name                    string                     `json:"name"`
+	Description             string                     `json:"description"`
+	Provider                models.WebhookProvider     `json:"provider"`
+	WebhookURL              string                     `json:"webhook_url"`
+	Status                  models.WebhookStatus       `json:"status"`
+	PreviousSecretExpiresAt *time.Time                 `json:"previous_secret_expires_at,omitempty"`
+	EnabledEvents           string                     `json:"enabled_events"`
+	EnabledEventsList       []models.WebhookEventType  `json:"enabled_events_list,omitempty"`
+	MessageTemplate         string                     `json:"message_template"`
+	MessageFormat           string                     `json:"message_format"`
+	FilterRules             string                     `json:"filter_rules"`
+	FilterRulesObject       *models.WebhookFilterRules `json:"filter_rules_obj,omitempty"`
+	RetryCount              int                        `json:"retry_count"`
+	RetryInterval           int                        `json:"retry_interval"`
+	TimeoutSeconds          int                        `json:"timeout_seconds"`
+	IsAsync                 bool                       `json:"is_async"`
+	RateLimit               int                        `json:"rate_limit"`
+	RateLimitWindow         int                        `json:"rate_limit_window"`
+	LastTriggeredAt         *time.Time                 `json:"last_triggered_at,omitempty"`
+	LastSuccessAt           *time.Time                 `json:"last_success_at,omitempty"`
+	LastErrorAt             *time.Time                 `json:"last_error_at,omitempty"`
+	LastError               string                     `json:"last_error"`
+	TotalSent               int64                      `json:"total_sent"`
+	TotalSuccess            int64                      `json:"total_success"`
+	TotalFailed             int64                      `json:"total_failed"`
+	CreatedBy               uint                       `json:"created_by"`
+	UpdatedBy               *uint                      `json:"updated_by,omitempty"`
+}
+
 // ListWebhooksResponse 列表响应结构
 type ListWebhooksResponse struct {
-	Items []models.WebhookConfig `json:"items"`
-	Total int64                  `json:"total"`
-	Page  int                    `json:"page"`
-	Size  int                    `json:"size"`
+	Items []WebhookConfigResponse `json:"items"`
+	Total int64                   `json:"total"`
+	Page  int                     `json:"page"`
+	Size  int                     `json:"size"`
+}
+
+// WebhookLogResponse exposes only the non-sensitive delivery diagnostics
+// published by the Human OpenAPI contract.
+type WebhookLogResponse struct {
+	ID             uint                    `json:"id"`
+	CreatedAt      time.Time               `json:"created_at"`
+	ConfigID       uint                    `json:"config_id"`
+	EventType      models.WebhookEventType `json:"event_type"`
+	Status         string                  `json:"status"`
+	ResponseStatus int                     `json:"response_status,omitempty"`
+	ResponseTime   int64                   `json:"response_time,omitempty"`
+	ErrorMessage   string                  `json:"error_message,omitempty"`
+}
+
+type ListWebhookLogsResponse struct {
+	Items []WebhookLogResponse `json:"items"`
+	Total int64                `json:"total"`
+	Page  int                  `json:"page"`
+	Size  int                  `json:"size"`
+}
+
+type WebhookStatsSummaryResponse struct {
+	TotalSent    int64 `json:"total_sent"`
+	TotalSuccess int64 `json:"total_success"`
+	TotalFailed  int64 `json:"total_failed"`
+}
+
+// WebhookDateOnly normalizes SQL DATE values without relying on PostgreSQL's
+// session DateStyle. Its string representation is always ISO YYYY-MM-DD.
+type WebhookDateOnly string
+
+var _ sql.Scanner = (*WebhookDateOnly)(nil)
+
+func (date *WebhookDateOnly) Scan(value any) error {
+	if date == nil {
+		return errors.New("scan Webhook date into nil receiver")
+	}
+	switch typed := value.(type) {
+	case time.Time:
+		*date = WebhookDateOnly(typed.Format(time.DateOnly))
+		return nil
+	case string:
+		return date.scanString(typed)
+	case []byte:
+		return date.scanString(string(typed))
+	default:
+		return fmt.Errorf("scan Webhook date from unsupported %T", value)
+	}
+}
+
+func (date *WebhookDateOnly) scanString(value string) error {
+	if len(value) != len(time.DateOnly) {
+		return fmt.Errorf("scan Webhook date %q: expected YYYY-MM-DD", value)
+	}
+	parsed, err := time.Parse(time.DateOnly, value)
+	if err != nil || parsed.Format(time.DateOnly) != value {
+		if err == nil {
+			err = errors.New("date is not in canonical YYYY-MM-DD form")
+		}
+		return fmt.Errorf("scan Webhook date %q: %w", value, err)
+	}
+	*date = WebhookDateOnly(value)
+	return nil
+}
+
+type WebhookDailyStatsResponse struct {
+	Date    WebhookDateOnly `json:"date"`
+	Sent    int64           `json:"sent"`
+	Success int64           `json:"success"`
+	Failed  int64           `json:"failed"`
+}
+
+type WebhookStatsResponse struct {
+	Summary    WebhookStatsSummaryResponse `json:"summary"`
+	DailyStats []WebhookDailyStatsResponse `json:"daily_stats"`
+	Period     string                      `json:"period"`
+}
+
+func newWebhookConfigResponse(
+	webhook models.WebhookConfig,
+) WebhookConfigResponse {
+	var filterRules *models.WebhookFilterRules
+	if webhook.FilterRulesObj != nil {
+		copied := *webhook.FilterRulesObj
+		copied.TransitionStatuses = append(
+			[]models.TicketStatus(nil),
+			webhook.FilterRulesObj.TransitionStatuses...,
+		)
+		filterRules = &copied
+	}
+	return WebhookConfigResponse{
+		ID:                      webhook.ID,
+		CreatedAt:               webhook.CreatedAt,
+		UpdatedAt:               webhook.UpdatedAt,
+		OrganizationID:          webhook.OrganizationID,
+		ProjectID:               webhook.ProjectID,
+		Name:                    webhook.Name,
+		Description:             webhook.Description,
+		Provider:                webhook.Provider,
+		WebhookURL:              webhook.WebhookURL,
+		Status:                  webhook.Status,
+		PreviousSecretExpiresAt: webhook.PreviousSecretExpiresAt,
+		EnabledEvents:           webhook.EnabledEvents,
+		EnabledEventsList: append(
+			[]models.WebhookEventType(nil),
+			webhook.EnabledEventsObj...,
+		),
+		MessageTemplate:   webhook.MessageTemplate,
+		MessageFormat:     webhook.MessageFormat,
+		FilterRules:       webhook.FilterRules,
+		FilterRulesObject: filterRules,
+		RetryCount:        webhook.RetryCount,
+		RetryInterval:     webhook.RetryInterval,
+		TimeoutSeconds:    webhook.TimeoutSeconds,
+		IsAsync:           webhook.IsAsync,
+		RateLimit:         webhook.RateLimit,
+		RateLimitWindow:   webhook.RateLimitWindow,
+		LastTriggeredAt:   webhook.LastTriggeredAt,
+		LastSuccessAt:     webhook.LastSuccessAt,
+		LastErrorAt:       webhook.LastErrorAt,
+		LastError:         webhook.LastError,
+		TotalSent:         webhook.TotalSent,
+		TotalSuccess:      webhook.TotalSuccess,
+		TotalFailed:       webhook.TotalFailed,
+		CreatedBy:         webhook.CreatedBy,
+		UpdatedBy:         webhook.UpdatedBy,
+	}
+}
+
+func newWebhookLogResponse(log models.WebhookLog) WebhookLogResponse {
+	return WebhookLogResponse{
+		ID:             log.ID,
+		CreatedAt:      log.CreatedAt,
+		ConfigID:       log.ConfigID,
+		EventType:      log.EventType,
+		Status:         log.Status,
+		ResponseStatus: log.ResponseStatus,
+		ResponseTime:   log.ResponseTime,
+		ErrorMessage:   log.ErrorMessage,
+	}
 }
 
 // TestWebhookResult is a queued operation receipt. External delivery and its
@@ -127,13 +307,13 @@ func decodeStrictWebhookJSON(c *gin.Context, target any) error {
 // @Produce json
 // @Param projectKey path string true "项目 Key"
 // @Param webhook body CreateWebhookRequest true "Webhook配置"
-// @Success 200 {object} models.WebhookConfig
+// @Success 200 {object} WebhookConfigResponse
 // @Failure 400 {object} map[string]interface{}
 // @Failure 500 {object} map[string]interface{}
 // @Router /api/projects/{projectKey}/webhooks [post]
 // @Security BearerAuth
 func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
-	operation, ok := requireWebhookProjectAccess(c, true)
+	operation, ok := requireWebhookManagerAccess(c)
 	if !ok {
 		return
 	}
@@ -241,15 +421,14 @@ func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
 		return
 	}
 
-	// 加载关联数据
-	if err := h.db.WithContext(c.Request.Context()).Preload("Creator").First(&webhook, webhook.ID).Error; err != nil {
+	if err := h.db.WithContext(c.Request.Context()).First(&webhook, webhook.ID).Error; err != nil {
 		logHandlerFailure(c, "webhook.reload_after_create", err)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"msg":  "创建成功",
-		"data": webhook,
+		"data": newWebhookConfigResponse(webhook),
 	})
 }
 
@@ -269,7 +448,7 @@ func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
 // @Router /api/projects/{projectKey}/webhooks [get]
 // @Security BearerAuth
 func (h *WebhookHandler) ListWebhooks(c *gin.Context) {
-	operation, ok := requireWebhookProjectAccess(c, false)
+	operation, ok := requireWebhookManagerAccess(c)
 	if !ok {
 		return
 	}
@@ -317,8 +496,7 @@ func (h *WebhookHandler) ListWebhooks(c *gin.Context) {
 
 	// 获取数据
 	var webhooks []models.WebhookConfig
-	if err := query.Preload("Creator").
-		Order("created_at DESC").
+	if err := query.Order("created_at DESC").
 		Offset(offset).
 		Limit(pageSize).
 		Find(&webhooks).Error; err != nil {
@@ -331,8 +509,12 @@ func (h *WebhookHandler) ListWebhooks(c *gin.Context) {
 		return
 	}
 
+	items := make([]WebhookConfigResponse, 0, len(webhooks))
+	for _, webhook := range webhooks {
+		items = append(items, newWebhookConfigResponse(webhook))
+	}
 	response := ListWebhooksResponse{
-		Items: webhooks,
+		Items: items,
 		Total: total,
 		Page:  page,
 		Size:  pageSize,
@@ -353,13 +535,13 @@ func (h *WebhookHandler) ListWebhooks(c *gin.Context) {
 // @Produce json
 // @Param projectKey path string true "项目 Key"
 // @Param id path int true "Webhook ID"
-// @Success 200 {object} models.WebhookConfig
+// @Success 200 {object} WebhookConfigResponse
 // @Failure 404 {object} map[string]interface{}
 // @Failure 500 {object} map[string]interface{}
 // @Router /api/projects/{projectKey}/webhooks/{id} [get]
 // @Security BearerAuth
 func (h *WebhookHandler) GetWebhook(c *gin.Context) {
-	operation, ok := requireWebhookProjectAccess(c, false)
+	operation, ok := requireWebhookManagerAccess(c)
 	if !ok {
 		return
 	}
@@ -375,8 +557,6 @@ func (h *WebhookHandler) GetWebhook(c *gin.Context) {
 
 	var webhook models.WebhookConfig
 	if err := h.db.WithContext(c.Request.Context()).
-		Preload("Creator").
-		Preload("Updater").
 		Where(
 			"id = ? AND organization_id = ? AND project_id = ?",
 			uint(id),
@@ -404,7 +584,7 @@ func (h *WebhookHandler) GetWebhook(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"msg":  "获取成功",
-		"data": webhook,
+		"data": newWebhookConfigResponse(webhook),
 	})
 }
 
@@ -417,14 +597,14 @@ func (h *WebhookHandler) GetWebhook(c *gin.Context) {
 // @Param projectKey path string true "项目 Key"
 // @Param id path int true "Webhook ID"
 // @Param webhook body UpdateWebhookRequest true "更新数据"
-// @Success 200 {object} models.WebhookConfig
+// @Success 200 {object} WebhookConfigResponse
 // @Failure 400 {object} map[string]interface{}
 // @Failure 404 {object} map[string]interface{}
 // @Failure 500 {object} map[string]interface{}
 // @Router /api/projects/{projectKey}/webhooks/{id} [put]
 // @Security BearerAuth
 func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
-	operation, ok := requireWebhookProjectAccess(c, true)
+	operation, ok := requireWebhookManagerAccess(c)
 	if !ok {
 		return
 	}
@@ -658,8 +838,6 @@ func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 
 	// 重新获取更新后的数据
 	if err := h.db.WithContext(c.Request.Context()).
-		Preload("Creator").
-		Preload("Updater").
 		Where(
 			"id = ? AND organization_id = ? AND project_id = ?",
 			webhook.ID,
@@ -673,7 +851,7 @@ func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"msg":  "更新成功",
-		"data": webhook,
+		"data": newWebhookConfigResponse(webhook),
 	})
 }
 
@@ -707,7 +885,7 @@ func (h *WebhookHandler) protectWebhookSecret(
 // @Router /api/projects/{projectKey}/webhooks/{id} [delete]
 // @Security BearerAuth
 func (h *WebhookHandler) DeleteWebhook(c *gin.Context) {
-	operation, ok := requireWebhookProjectAccess(c, true)
+	operation, ok := requireWebhookManagerAccess(c)
 	if !ok {
 		return
 	}
@@ -785,7 +963,7 @@ func (h *WebhookHandler) DeleteWebhook(c *gin.Context) {
 // @Router /api/projects/{projectKey}/webhooks/{id}/test [post]
 // @Security BearerAuth
 func (h *WebhookHandler) TestWebhook(c *gin.Context) {
-	operation, ok := requireWebhookProjectAccess(c, true)
+	operation, ok := requireWebhookManagerAccess(c)
 	if !ok {
 		return
 	}
@@ -853,7 +1031,7 @@ func (h *WebhookHandler) TestWebhook(c *gin.Context) {
 // @Router /api/projects/{projectKey}/webhooks/{id}/logs [get]
 // @Security BearerAuth
 func (h *WebhookHandler) GetWebhookLogs(c *gin.Context) {
-	operation, ok := requireWebhookProjectAccess(c, false)
+	operation, ok := requireWebhookManagerAccess(c)
 	if !ok {
 		return
 	}
@@ -923,14 +1101,18 @@ func (h *WebhookHandler) GetWebhookLogs(c *gin.Context) {
 		return
 	}
 
+	items := make([]WebhookLogResponse, 0, len(logs))
+	for _, log := range logs {
+		items = append(items, newWebhookLogResponse(log))
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"msg":  "获取成功",
-		"data": gin.H{
-			"items": logs,
-			"total": total,
-			"page":  page,
-			"size":  pageSize,
+		"data": ListWebhookLogsResponse{
+			Items: items,
+			Total: total,
+			Page:  page,
+			Size:  pageSize,
 		},
 	})
 }
@@ -949,7 +1131,7 @@ func (h *WebhookHandler) GetWebhookLogs(c *gin.Context) {
 // @Router /api/projects/{projectKey}/webhooks/{id}/stats [get]
 // @Security BearerAuth
 func (h *WebhookHandler) GetWebhookStats(c *gin.Context) {
-	operation, ok := requireWebhookProjectAccess(c, false)
+	operation, ok := requireWebhookManagerAccess(c)
 	if !ok {
 		return
 	}
@@ -971,11 +1153,7 @@ func (h *WebhookHandler) GetWebhookStats(c *gin.Context) {
 	startTime := time.Now().AddDate(0, 0, -days)
 
 	// 获取基础统计
-	var stats struct {
-		TotalSent    int64 `json:"total_sent"`
-		TotalSuccess int64 `json:"total_success"`
-		TotalFailed  int64 `json:"total_failed"`
-	}
+	var stats WebhookStatsSummaryResponse
 
 	var webhook models.WebhookConfig
 	if err := h.db.WithContext(c.Request.Context()).
@@ -1009,16 +1187,11 @@ func (h *WebhookHandler) GetWebhookStats(c *gin.Context) {
 	stats.TotalFailed = webhook.TotalFailed
 
 	// 获取近期趋势数据
-	var dailyStats []struct {
-		Date    string `json:"date"`
-		Sent    int64  `json:"sent"`
-		Success int64  `json:"success"`
-		Failed  int64  `json:"failed"`
-	}
+	dailyStats := make([]WebhookDailyStatsResponse, 0)
 
 	rows, err := h.db.WithContext(c.Request.Context()).Raw(`
 		SELECT 
-			DATE(created_at) as date,
+			DATE(created_at) AS date,
 			COUNT(*) as sent,
 			COUNT(CASE WHEN status = 'success' THEN 1 END) as success,
 			COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed
@@ -1046,12 +1219,7 @@ func (h *WebhookHandler) GetWebhookStats(c *gin.Context) {
 	defer rows.Close()
 
 	for rows.Next() {
-		var stat struct {
-			Date    string `json:"date"`
-			Sent    int64  `json:"sent"`
-			Success int64  `json:"success"`
-			Failed  int64  `json:"failed"`
-		}
+		var stat WebhookDailyStatsResponse
 		if err := h.db.ScanRows(rows, &stat); err != nil {
 			logHandlerFailure(c, "webhook.scan_stats", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -1076,17 +1244,16 @@ func (h *WebhookHandler) GetWebhookStats(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"msg":  "获取成功",
-		"data": gin.H{
-			"summary":     stats,
-			"daily_stats": dailyStats,
-			"period":      fmt.Sprintf("最近%d天", days),
+		"data": WebhookStatsResponse{
+			Summary:    stats,
+			DailyStats: dailyStats,
+			Period:     fmt.Sprintf("最近%d天", days),
 		},
 	})
 }
 
-func requireWebhookProjectAccess(
+func requireWebhookManagerAccess(
 	c *gin.Context,
-	manage bool,
 ) (services.OperationContext, bool) {
 	if c == nil || c.Request == nil {
 		return services.OperationContext{}, false
@@ -1110,9 +1277,7 @@ func requireWebhookProjectAccess(
 		})
 		return services.OperationContext{}, false
 	}
-	if manage &&
-		access.Role != models.ProjectRoleAdmin &&
-		access.Role != models.ProjectRoleManager {
+	if !webhookManagerRoleAllowed(access.Role) {
 		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
 			"code": 1,
 			"msg":  "仅项目管理员或经理可管理 Webhook",
@@ -1121,4 +1286,13 @@ func requireWebhookProjectAccess(
 		return services.OperationContext{}, false
 	}
 	return operation, true
+}
+
+func webhookManagerRoleAllowed(role models.ProjectRole) bool {
+	switch role {
+	case models.ProjectRoleAdmin, models.ProjectRoleManager:
+		return true
+	default:
+		return false
+	}
 }

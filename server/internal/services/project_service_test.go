@@ -453,6 +453,74 @@ func TestProjectServiceArchiveProjectRevalidatesPlatformAdministrator(
 	}
 }
 
+func TestProjectServiceArchiveProjectPreservesDefaultControlPlaneEnvelope(
+	t *testing.T,
+) {
+	db := newProjectServiceTestDB(t)
+	_, _, project, administrator := seedProjectAccessFixture(t, db)
+	if err := db.Model(&models.Project{}).
+		Where("id = ?", project.ID).
+		Update("key", models.ProjectKey("DEFAULT")).Error; err != nil {
+		t.Fatal(err)
+	}
+	project.Key = models.ProjectKey("DEFAULT")
+	if err := db.Model(&models.User{}).
+		Where("id = ?", administrator.ID).
+		Update(
+			"platform_role",
+			models.PlatformRolePlatformAdmin,
+		).Error; err != nil {
+		t.Fatal(err)
+	}
+	events := &projectEventAppenderStub{}
+	service, err := NewProjectService(db, events)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.ArchiveProject(
+		context.Background(),
+		project.PublicID,
+		models.HumanActor(administrator.ID),
+	); !errors.Is(err, ErrDefaultProjectArchive) {
+		t.Fatalf(
+			"ArchiveProject(DEFAULT) error = %v, want %v",
+			err,
+			ErrDefaultProjectArchive,
+		)
+	}
+	var persisted models.Project
+	if err := db.First(&persisted, project.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != models.ProjectStatusActive {
+		t.Fatalf(
+			"DEFAULT project status = %q, want active",
+			persisted.Status,
+		)
+	}
+	if events.calls != 0 {
+		t.Fatalf("DEFAULT archive appended %d event(s)", events.calls)
+	}
+	adminUsers, err := NewAdminUserServiceWithAccessRevocationOutbox(
+		db,
+		events,
+	)
+	if err != nil {
+		t.Fatalf(
+			"initialize admin-user access Outbox after denied archive: %v",
+			err,
+		)
+	}
+	if adminUsers.eventScope != project.Scope() {
+		t.Fatalf(
+			"admin-user event scope = %+v, want %+v",
+			adminUsers.eventScope,
+			project.Scope(),
+		)
+	}
+}
+
 func TestProjectServiceCreateProjectRequiresEventWriterAndRollsBackOnFailure(
 	t *testing.T,
 ) {

@@ -294,6 +294,11 @@ func TestProjectArchiveErrorMappingIsStable(t *testing.T) {
 			wantStatus: http.StatusConflict,
 		},
 		{
+			name:       "default project conflict",
+			err:        services.ErrDefaultProjectArchive,
+			wantStatus: http.StatusConflict,
+		},
+		{
 			name:       "event writer unavailable",
 			err:        services.ErrProjectEventWriter,
 			wantStatus: http.StatusInternalServerError,

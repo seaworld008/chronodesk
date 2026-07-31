@@ -234,6 +234,54 @@ const exactRoleAllowlists = [
         ['project_admin'],
     ],
     [
+        '/projects/{projectKey}/webhooks',
+        'get',
+        'x-chronodesk-project-roles',
+        ['project_admin', 'manager'],
+    ],
+    [
+        '/projects/{projectKey}/webhooks',
+        'post',
+        'x-chronodesk-project-roles',
+        ['project_admin', 'manager'],
+    ],
+    [
+        '/projects/{projectKey}/webhooks/{webhookID}',
+        'get',
+        'x-chronodesk-project-roles',
+        ['project_admin', 'manager'],
+    ],
+    [
+        '/projects/{projectKey}/webhooks/{webhookID}',
+        'put',
+        'x-chronodesk-project-roles',
+        ['project_admin', 'manager'],
+    ],
+    [
+        '/projects/{projectKey}/webhooks/{webhookID}',
+        'delete',
+        'x-chronodesk-project-roles',
+        ['project_admin', 'manager'],
+    ],
+    [
+        '/projects/{projectKey}/webhooks/{webhookID}/test',
+        'post',
+        'x-chronodesk-project-roles',
+        ['project_admin', 'manager'],
+    ],
+    [
+        '/projects/{projectKey}/webhooks/{webhookID}/logs',
+        'get',
+        'x-chronodesk-project-roles',
+        ['project_admin', 'manager'],
+    ],
+    [
+        '/projects/{projectKey}/webhooks/{webhookID}/stats',
+        'get',
+        'x-chronodesk-project-roles',
+        ['project_admin', 'manager'],
+    ],
+    [
         '/platform/projects',
         'get',
         'x-chronodesk-platform-roles',
@@ -1141,6 +1189,95 @@ assert.equal(
         'status',
     ),
     true,
+)
+assert.equal(
+    contract.components.schemas.WebhookConfig.additionalProperties,
+    false,
+)
+assert.deepEqual(
+    Object.keys(contract.components.schemas.WebhookConfig.properties).sort(),
+    [
+        'id',
+        'created_at',
+        'updated_at',
+        'organization_id',
+        'project_id',
+        'name',
+        'description',
+        'provider',
+        'webhook_url',
+        'status',
+        'previous_secret_expires_at',
+        'enabled_events',
+        'enabled_events_list',
+        'message_template',
+        'message_format',
+        'filter_rules',
+        'filter_rules_obj',
+        'retry_count',
+        'retry_interval',
+        'timeout_seconds',
+        'is_async',
+        'rate_limit',
+        'rate_limit_window',
+        'last_triggered_at',
+        'last_success_at',
+        'last_error_at',
+        'last_error',
+        'total_sent',
+        'total_success',
+        'total_failed',
+        'created_by',
+        'updated_by',
+    ].sort(),
+)
+const webhookLogResponse =
+    contract.paths['/projects/{projectKey}/webhooks/{webhookID}/logs'].get
+        .responses['200'].content['application/json'].schema
+const webhookLogData = webhookLogResponse.properties.data
+const webhookLogItem = webhookLogData.properties.items.items
+assert.equal(webhookLogResponse.additionalProperties, false)
+assert.equal(webhookLogData.additionalProperties, false)
+assert.equal(webhookLogItem.additionalProperties, false)
+assert.deepEqual(Object.keys(webhookLogItem.properties).sort(), [
+    'config_id',
+    'created_at',
+    'error_message',
+    'event_type',
+    'id',
+    'response_status',
+    'response_time',
+    'status',
+])
+const webhookStatsResponse =
+    contract.paths['/projects/{projectKey}/webhooks/{webhookID}/stats'].get
+        .responses['200'].content['application/json'].schema
+const webhookStatsData = webhookStatsResponse.properties.data
+const webhookStatsSummary = webhookStatsData.properties.summary
+const webhookDailyStats = webhookStatsData.properties.daily_stats.items
+assert.equal(webhookStatsResponse.additionalProperties, false)
+assert.equal(webhookStatsData.additionalProperties, false)
+assert.deepEqual(Object.keys(webhookStatsData.properties).sort(), [
+    'daily_stats',
+    'period',
+    'summary',
+])
+assert.equal(webhookStatsSummary.additionalProperties, false)
+assert.deepEqual(Object.keys(webhookStatsSummary.properties).sort(), [
+    'total_failed',
+    'total_sent',
+    'total_success',
+])
+assert.equal(webhookDailyStats.additionalProperties, false)
+assert.deepEqual(Object.keys(webhookDailyStats.properties).sort(), [
+    'date',
+    'failed',
+    'sent',
+    'success',
+])
+assert.match(
+    generated,
+    /summary: \{[\s\S]*total_sent: number[\s\S]*total_success: number[\s\S]*total_failed: number[\s\S]*daily_stats: Array<\{[\s\S]*sent: number/,
 )
 assert.match(webhookSettings, /buildPayload\(currentId !== null\)/)
 assert.doesNotMatch(

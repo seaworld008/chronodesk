@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.0.0.
- * Contract SHA-256: 07ec2883a32b5c3d005818eb8e0122a7c944f3166be86c9eeb80e3fd846e4e44.
+ * Contract SHA-256: bb3ec9a3d6ecb0d2fba795507d065839f32cbe43aaeb4c5be95dc6375a77d1de.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -2022,14 +2022,14 @@ export type GetProjectWebhookStatsOperationResponse = {
     code: 0
     msg: string
     data: {
-        total: number
-        success: number
-        failed: number
-        success_rate: number
-        average_response_time: number
+        summary: {
+            total_sent: number
+            total_success: number
+            total_failed: number
+        }
         daily_stats: Array<{
             date: string
-            total: number
+            sent: number
             success: number
             failed: number
         }>

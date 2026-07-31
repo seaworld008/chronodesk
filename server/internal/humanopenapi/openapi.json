@@ -3746,7 +3746,7 @@
       "get": {
         "operationId": "listProjectWebhooks",
         "summary": "List Webhook configurations in one Project",
-        "description": "Returns Webhook configurations for an authorized Project with secret values omitted from the response.",
+        "description": "Returns Webhook configurations to Project administrators or managers with secret values and persistence relations omitted from the response.",
         "tags": [
           "Webhooks"
         ],
@@ -3824,10 +3824,7 @@
         },
         "x-chronodesk-project-roles": [
           "project_admin",
-          "manager",
-          "agent",
-          "requester",
-          "observer"
+          "manager"
         ]
       },
       "post": {
@@ -3893,7 +3890,7 @@
       "get": {
         "operationId": "getProjectWebhook",
         "summary": "Get one Webhook configuration",
-        "description": "Returns one Webhook configuration only within its authorized Project and omits stored secret values.",
+        "description": "Returns one Webhook configuration to Project administrators or managers and omits stored secret values and persistence relations.",
         "tags": [
           "Webhooks"
         ],
@@ -3941,10 +3938,7 @@
         },
         "x-chronodesk-project-roles": [
           "project_admin",
-          "manager",
-          "agent",
-          "requester",
-          "observer"
+          "manager"
         ]
       },
       "put": {
@@ -4126,7 +4120,7 @@
       "get": {
         "operationId": "listProjectWebhookLogs",
         "summary": "List delivery attempts for one Webhook configuration",
-        "description": "Returns paginated delivery attempts for one Webhook configuration within its authorized Project.",
+        "description": "Returns a closed, non-sensitive delivery-attempt projection to Project administrators or managers.",
         "tags": [
           "Webhooks"
         ],
@@ -4207,7 +4201,7 @@
                           "type": "array",
                           "items": {
                             "type": "object",
-                            "additionalProperties": true,
+                            "additionalProperties": false,
                             "required": [
                               "id",
                               "created_at",
@@ -4281,10 +4275,7 @@
         },
         "x-chronodesk-project-roles": [
           "project_admin",
-          "manager",
-          "agent",
-          "requester",
-          "observer"
+          "manager"
         ]
       }
     },
@@ -4292,7 +4283,7 @@
       "get": {
         "operationId": "getProjectWebhookStats",
         "summary": "Get delivery statistics for one Webhook configuration",
-        "description": "Returns aggregate delivery statistics for one Webhook configuration within its authorized Project.",
+        "description": "Returns cumulative configuration counters and daily delivery counts for the selected period to Project administrators or managers.",
         "tags": [
           "Webhooks"
         ],
@@ -4345,35 +4336,33 @@
                       "type": "object",
                       "additionalProperties": false,
                       "required": [
-                        "total",
-                        "success",
-                        "failed",
-                        "success_rate",
-                        "average_response_time",
+                        "summary",
                         "daily_stats",
                         "period"
                       ],
                       "properties": {
-                        "total": {
-                          "type": "integer",
-                          "minimum": 0
-                        },
-                        "success": {
-                          "type": "integer",
-                          "minimum": 0
-                        },
-                        "failed": {
-                          "type": "integer",
-                          "minimum": 0
-                        },
-                        "success_rate": {
-                          "type": "number",
-                          "minimum": 0,
-                          "maximum": 100
-                        },
-                        "average_response_time": {
-                          "type": "number",
-                          "minimum": 0
+                        "summary": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "total_sent",
+                            "total_success",
+                            "total_failed"
+                          ],
+                          "properties": {
+                            "total_sent": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "total_success": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "total_failed": {
+                              "type": "integer",
+                              "minimum": 0
+                            }
+                          }
                         },
                         "daily_stats": {
                           "type": "array",
@@ -4382,7 +4371,7 @@
                             "additionalProperties": false,
                             "required": [
                               "date",
-                              "total",
+                              "sent",
                               "success",
                               "failed"
                             ],
@@ -4391,7 +4380,7 @@
                                 "type": "string",
                                 "format": "date"
                               },
-                              "total": {
+                              "sent": {
                                 "type": "integer",
                                 "minimum": 0
                               },
@@ -4435,10 +4424,7 @@
         },
         "x-chronodesk-project-roles": [
           "project_admin",
-          "manager",
-          "agent",
-          "requester",
-          "observer"
+          "manager"
         ]
       }
     },
@@ -10659,7 +10645,7 @@
       },
       "WebhookConfig": {
         "type": "object",
-        "additionalProperties": true,
+        "additionalProperties": false,
         "required": [
           "id",
           "created_at",
