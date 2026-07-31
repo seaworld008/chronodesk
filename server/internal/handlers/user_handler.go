@@ -60,7 +60,40 @@ func (h *UserHandler) GetTrustedDevices(c *gin.Context) {
 		return
 	}
 
-	devices, err := h.trustedDeviceService.ListTrustedDevices(c.Request.Context(), userID)
+	query, err := parseDirectoryListQuery(
+		c.Request.URL.Query(),
+		directoryListQuerySpec{
+			DefaultSortBy:    "revoked",
+			DefaultSortOrder: "asc",
+			SortFields: map[string]struct{}{
+				"created_at":   {},
+				"updated_at":   {},
+				"last_used_at": {},
+				"expires_at":   {},
+				"revoked":      {},
+				"device_name":  {},
+			},
+		},
+	)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, ApiResponse{
+			Code: 1,
+			Msg:  "可信设备查询参数无效",
+			Data: nil,
+		})
+		return
+	}
+
+	devices, err := h.trustedDeviceService.ListTrustedDevicePage(
+		c.Request.Context(),
+		userID,
+		services.DirectoryPageRequest{
+			Page:      query.Page,
+			PageSize:  query.PageSize,
+			SortBy:    query.SortBy,
+			SortOrder: query.SortOrder,
+		},
+	)
 	if err != nil {
 		logHandlerFailure(c, "user.list_trusted_devices", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
@@ -71,8 +104,8 @@ func (h *UserHandler) GetTrustedDevices(c *gin.Context) {
 		return
 	}
 
-	responses := make([]TrustedDeviceResponse, len(devices))
-	for i, device := range devices {
+	responses := make([]TrustedDeviceResponse, len(devices.Items))
+	for i, device := range devices.Items {
 		responses[i] = TrustedDeviceResponse{
 			ID:         device.ID,
 			DeviceName: device.DeviceName,
@@ -89,7 +122,13 @@ func (h *UserHandler) GetTrustedDevices(c *gin.Context) {
 	c.JSON(http.StatusOK, ApiResponse{
 		Code: 0,
 		Msg:  "获取可信设备成功",
-		Data: responses,
+		Data: services.DirectoryPage[TrustedDeviceResponse]{
+			Items:      responses,
+			Total:      devices.Total,
+			Page:       devices.Page,
+			PageSize:   devices.PageSize,
+			TotalPages: devices.TotalPages,
+		},
 	})
 }
 

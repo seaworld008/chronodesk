@@ -52,12 +52,15 @@ func (s *cleanupServiceStub) ExecuteAllCleanupTasks(
 	return s.executeErr
 }
 
-func (s *cleanupServiceStub) GetCleanupLogs(
+func (s *cleanupServiceStub) ListCleanupLogPage(
 	context.Context,
 	string,
-	int,
-) ([]*models.CleanupLogResponse, error) {
-	return nil, nil
+	services.DirectoryPageRequest,
+) (*services.DirectoryPage[*models.CleanupLogResponse], error) {
+	return &services.DirectoryPage[*models.CleanupLogResponse]{
+		Items: make([]*models.CleanupLogResponse, 0),
+		Page:  1,
+	}, nil
 }
 
 func (s *cleanupServiceStub) GetCleanupStats(
@@ -92,6 +95,40 @@ func TestSystemHandlerInvalidRequestMessageIsChinese(t *testing.T) {
 	}
 	if payload.Message != "请求体格式无效" {
 		t.Fatalf("message = %q", payload.Message)
+	}
+}
+
+func TestSystemCleanupLogsRejectInvalidDirectoryQueries(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := &SystemHandler{cleanupSvc: &cleanupServiceStub{}}
+	router := gin.New()
+	router.GET("/cleanup/logs", handler.GetCleanupLogs)
+	for _, query := range []string{
+		"limit=20",
+		"page=0",
+		"page_size=101",
+		"sort_by=error_message",
+		"sort_order=ASC",
+		"task_type=",
+		"task_type=login_history&task_type=other",
+	} {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(
+			response,
+			httptest.NewRequest(
+				http.MethodGet,
+				"/cleanup/logs?"+query,
+				nil,
+			),
+		)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf(
+				"query %q status = %d, body=%s",
+				query,
+				response.Code,
+				response.Body.String(),
+			)
+		}
 	}
 }
 

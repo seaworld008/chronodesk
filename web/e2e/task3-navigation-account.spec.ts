@@ -118,13 +118,25 @@ const installLayoutMocks = async (page: Page) => {
         } else if (url.pathname === '/api/auth/me') {
             data = user
         } else if (url.pathname === '/api/platform/configs') {
-            data = []
+            data = {
+                items: [],
+                total: 0,
+                page: 1,
+                page_size: 25,
+                total_pages: 0,
+            }
         } else if (url.pathname === '/api/platform/email-config') {
             data = emailConfig
         } else if (url.pathname === '/api/projects/OPS/webhooks') {
             data = { items: [], total: 0, page: 1, page_size: 100 }
         } else if (url.pathname === '/api/user/trusted-devices') {
-            data = []
+            data = {
+                items: [],
+                total: 0,
+                page: 1,
+                page_size: 25,
+                total_pages: 0,
+            }
         } else if (url.pathname === '/api/user/login-history') {
             data = { items: [], total: 0, page: 1, page_size: 20 }
         } else if (url.pathname === '/api/workbench/tickets') {
@@ -823,7 +835,13 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             } else if (url.pathname === '/api/auth/me') {
                 data = longUser
             } else if (url.pathname === '/api/platform/configs') {
-                data = []
+                data = {
+                    items: [],
+                    total: 0,
+                    page: 1,
+                    page_size: 25,
+                    total_pages: 0,
+                }
             } else if (url.pathname === '/api/projects/OPS/webhooks') {
                 data = { items: [], total: 0, page: 1, page_size: 100 }
             }

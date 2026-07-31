@@ -21,6 +21,41 @@ type configRouteAuditCapture struct {
 	records []*services.AdminAuditRecord
 }
 
+func TestPlatformConfigListRejectsInvalidDirectoryQueries(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	handler := NewConfigHandler(db)
+	router := gin.New()
+	router.GET("/configs", handler.GetAllConfigs)
+	for _, query := range []string{
+		"page=0",
+		"page_size=101",
+		"sort_by=value",
+		"sort_order=ASC",
+		"category=unknown",
+		"category=system&category=security",
+		"unknown=value",
+	} {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(
+			response,
+			httptest.NewRequest(
+				http.MethodGet,
+				"/configs?"+query,
+				nil,
+			),
+		)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf(
+				"query %q status = %d, body=%s",
+				query,
+				response.Code,
+				response.Body.String(),
+			)
+		}
+	}
+}
+
 func (capture *configRouteAuditCapture) Record(
 	_ context.Context,
 	record *services.AdminAuditRecord,

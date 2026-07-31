@@ -557,9 +557,11 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_projects_business_unit_status ON projects(business_unit_id, status);",
 		"CREATE INDEX IF NOT EXISTS idx_project_memberships_user_active ON project_memberships(user_id, is_active);",
 		"CREATE INDEX IF NOT EXISTS idx_project_memberships_project_role_active ON project_memberships(project_id, role, is_active);",
+		"CREATE INDEX IF NOT EXISTS idx_project_memberships_directory ON project_memberships(project_id, is_active DESC, role, user_id, id);",
 		"CREATE INDEX IF NOT EXISTS idx_teams_project_status ON teams(project_id, status);",
 		"CREATE INDEX IF NOT EXISTS idx_team_memberships_user_active ON team_memberships(user_id, is_active);",
 		"CREATE INDEX IF NOT EXISTS idx_queues_project_status ON queues(project_id, status);",
+		"CREATE INDEX IF NOT EXISTS idx_queues_directory ON queues(project_id, status, is_default DESC, name, id);",
 		"CREATE INDEX IF NOT EXISTS idx_queues_team_status ON queues(team_id, status);",
 		"CREATE INDEX IF NOT EXISTS idx_project_principal_grants_principal_active ON project_principal_grants(service_principal_id, is_active);",
 		"CREATE INDEX IF NOT EXISTS idx_project_principal_grants_project_active ON project_principal_grants(project_id, is_active);",
@@ -569,6 +571,7 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_otp_codes_code ON otp_codes(code);",
 		"CREATE INDEX IF NOT EXISTS idx_otp_codes_expires_at ON otp_codes(expires_at);",
 		"CREATE INDEX IF NOT EXISTS idx_otp_codes_type ON otp_codes(type);",
+		"CREATE INDEX IF NOT EXISTS idx_otp_trusted_devices_directory ON otp_trusted_devices(user_id, revoked, expires_at DESC, id DESC);",
 
 		// 刷新令牌表索引
 		"CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id);",
@@ -617,6 +620,7 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_system_configs_group ON system_configs(\"group\");",
 		"CREATE INDEX IF NOT EXISTS idx_system_configs_is_active ON system_configs(is_active);",
 		"CREATE INDEX IF NOT EXISTS idx_system_configs_category_group ON system_configs(category, \"group\");",
+		"CREATE INDEX IF NOT EXISTS idx_system_configs_directory ON system_configs(category, \"group\", key, id);",
 
 		// 清理日志表索引
 		"CREATE INDEX IF NOT EXISTS idx_cleanup_logs_task_type ON cleanup_logs(task_type);",
@@ -625,6 +629,8 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_cleanup_logs_trigger_type ON cleanup_logs(trigger_type);",
 		"CREATE INDEX IF NOT EXISTS idx_cleanup_logs_trigger_by ON cleanup_logs(trigger_by);",
 		"CREATE INDEX IF NOT EXISTS idx_cleanup_logs_task_status ON cleanup_logs(task_type, status);",
+		"CREATE INDEX IF NOT EXISTS idx_cleanup_logs_directory ON cleanup_logs(created_at DESC, id DESC);",
+		"CREATE INDEX IF NOT EXISTS idx_cleanup_logs_task_directory ON cleanup_logs(task_type, created_at DESC, id DESC);",
 	}
 
 	var indexErrors []error

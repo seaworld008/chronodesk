@@ -74,7 +74,34 @@ func (handler *ProjectHandler) ListQueues(c *gin.Context) {
 		handler.response.Forbidden(c, "未解析可信项目范围")
 		return
 	}
-	queues, err := handler.service.ListQueues(c.Request.Context(), access.Scope)
+	query, err := parseDirectoryListQuery(
+		c.Request.URL.Query(),
+		directoryListQuerySpec{
+			DefaultSortBy:    "is_default",
+			DefaultSortOrder: "desc",
+			SortFields: map[string]struct{}{
+				"created_at": {},
+				"updated_at": {},
+				"name":       {},
+				"key":        {},
+				"is_default": {},
+			},
+		},
+	)
+	if err != nil {
+		handler.response.BadRequest(c, "项目队列查询参数无效")
+		return
+	}
+	queues, err := handler.service.ListQueuePage(
+		c.Request.Context(),
+		access.Scope,
+		services.DirectoryPageRequest{
+			Page:      query.Page,
+			PageSize:  query.PageSize,
+			SortBy:    query.SortBy,
+			SortOrder: query.SortOrder,
+		},
+	)
 	if err != nil {
 		writeProjectError(c, handler.response, err)
 		return
@@ -93,9 +120,33 @@ func (handler *ProjectHandler) ListMemberships(c *gin.Context) {
 		handler.response.Forbidden(c, "仅项目管理员或经理可查看项目成员")
 		return
 	}
-	memberships, err := handler.service.ListHumanMemberships(
+	query, err := parseDirectoryListQuery(
+		c.Request.URL.Query(),
+		directoryListQuerySpec{
+			DefaultSortBy:    "is_active",
+			DefaultSortOrder: "desc",
+			SortFields: map[string]struct{}{
+				"created_at": {},
+				"updated_at": {},
+				"role":       {},
+				"is_active":  {},
+				"user_id":    {},
+			},
+		},
+	)
+	if err != nil {
+		handler.response.BadRequest(c, "项目成员查询参数无效")
+		return
+	}
+	memberships, err := handler.service.ListHumanMembershipPage(
 		c.Request.Context(),
 		access.Scope,
+		services.DirectoryPageRequest{
+			Page:      query.Page,
+			PageSize:  query.PageSize,
+			SortBy:    query.SortBy,
+			SortOrder: query.SortOrder,
+		},
 	)
 	if err != nil {
 		writeProjectError(c, handler.response, err)
@@ -888,6 +939,7 @@ func writeProjectError(
 ) {
 	switch {
 	case errors.Is(err, services.ErrProjectGovernanceQuery),
+		errors.Is(err, services.ErrDirectoryListQuery),
 		errors.Is(err, services.ErrBusinessUnitPublicID),
 		errors.Is(err, services.ErrInitialProjectAdministrator):
 		response.BadRequest(c, "项目治理参数无效")

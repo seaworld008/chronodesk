@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
@@ -345,22 +348,44 @@ func (s *CleanupService) ExecuteAllCleanupTasks(ctx context.Context, triggerType
 	return nil
 }
 
-// GetCleanupLogs 获取清理日志
-func (s *CleanupService) GetCleanupLogs(ctx context.Context, taskType string, limit int) ([]*models.CleanupLogResponse, error) {
+// ListCleanupLogPage returns a bounded, stable page. Error details remain
+// bounded by the CleanupLogResponse projection and the task filter is data,
+// never interpolated into SQL.
+func (s *CleanupService) ListCleanupLogPage(
+	ctx context.Context,
+	taskType string,
+	request DirectoryPageRequest,
+) (*DirectoryPage[*models.CleanupLogResponse], error) {
+	sortFields := map[string]struct{}{
+		"created_at":      {},
+		"start_time":      {},
+		"end_time":        {},
+		"status":          {},
+		"task_type":       {},
+		"records_deleted": {},
+	}
+	if err := validateDirectoryPageRequest(request, sortFields); err != nil {
+		return nil, err
+	}
+	if !validCleanupTaskFilter(taskType) {
+		return nil, ErrDirectoryListQuery
+	}
 	query := s.db.WithContext(ctx).Model(&models.CleanupLog{})
 
 	if taskType != "" {
 		query = query.Where("task_type = ?", taskType)
 	}
 
-	if limit <= 0 || limit > 100 {
-		limit = 20
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, fmt.Errorf("failed to count cleanup logs: %w", err)
 	}
 
-	var logs []models.CleanupLog
-	err := query.Order("created_at DESC").
-		Limit(limit).
-		Preload("TriggerUser").
+	logs := make([]models.CleanupLog, 0, request.PageSize)
+	err := query.
+		Order(cleanupLogDirectoryOrder(request)).
+		Offset(directoryPageOffset(request)).
+		Limit(request.PageSize).
 		Find(&logs).Error
 
 	if err != nil {
@@ -370,9 +395,63 @@ func (s *CleanupService) GetCleanupLogs(ctx context.Context, taskType string, li
 	responses := make([]*models.CleanupLogResponse, len(logs))
 	for i, log := range logs {
 		responses[i] = log.ToResponse()
+		responses[i].ErrorMessage = truncateCleanupLogError(
+			responses[i].ErrorMessage,
+			500,
+		)
 	}
 
-	return responses, nil
+	return &DirectoryPage[*models.CleanupLogResponse]{
+		Items:      responses,
+		Total:      total,
+		Page:       request.Page,
+		PageSize:   request.PageSize,
+		TotalPages: directoryTotalPages(total, request.PageSize),
+	}, nil
+}
+
+func truncateCleanupLogError(value string, maximumRunes int) string {
+	if maximumRunes <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= maximumRunes {
+		return value
+	}
+	return string(runes[:maximumRunes]) + "…"
+}
+
+func validCleanupTaskFilter(taskType string) bool {
+	if taskType == "" {
+		return true
+	}
+	if !utf8.ValidString(taskType) ||
+		strings.TrimSpace(taskType) != taskType ||
+		utf8.RuneCountInString(taskType) > 50 {
+		return false
+	}
+	for _, char := range taskType {
+		if unicode.IsControl(char) {
+			return false
+		}
+	}
+	return true
+}
+
+func cleanupLogDirectoryOrder(request DirectoryPageRequest) string {
+	direction := "ASC"
+	if request.SortOrder == "desc" {
+		direction = "DESC"
+	}
+	column := map[string]string{
+		"created_at":      "created_at",
+		"start_time":      "start_time",
+		"end_time":        "end_time",
+		"status":          "status",
+		"task_type":       "task_type",
+		"records_deleted": "records_deleted",
+	}[request.SortBy]
+	return column + " " + direction + ", id " + direction
 }
 
 // GetCleanupStats 获取清理统计信息

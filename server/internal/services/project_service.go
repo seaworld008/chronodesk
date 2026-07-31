@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -35,6 +36,7 @@ var (
 	ErrDefaultProjectArchive      = errors.New("default project cannot be archived")
 	ErrProjectSequenceConflict    = errors.New("project ticket sequence conflict")
 	ErrProjectGovernanceQuery     = errors.New("invalid project governance query")
+	ErrDirectoryListQuery         = errors.New("invalid directory list query")
 	ErrProjectOrganizationContext = errors.New(
 		"authenticated organization context is unavailable",
 	)
@@ -248,6 +250,53 @@ type PlatformProjectPage struct {
 	TotalPages int                      `json:"total_pages"`
 }
 
+// DirectoryPageRequest is the shared, bounded contract for mutable
+// administrative directories. Every caller must supply a transport-validated
+// page and a closed sort field; each service still validates its own sort
+// allowlist before constructing SQL.
+type DirectoryPageRequest struct {
+	Page      int
+	PageSize  int
+	SortBy    string
+	SortOrder string
+}
+
+type DirectoryPage[T any] struct {
+	Items      []T   `json:"items"`
+	Total      int64 `json:"total"`
+	Page       int   `json:"page"`
+	PageSize   int   `json:"page_size"`
+	TotalPages int   `json:"total_pages"`
+}
+
+func validateDirectoryPageRequest(
+	request DirectoryPageRequest,
+	sortFields map[string]struct{},
+) error {
+	if request.Page < 1 || request.PageSize < 1 || request.PageSize > 100 ||
+		(request.SortOrder != "asc" && request.SortOrder != "desc") {
+		return ErrDirectoryListQuery
+	}
+	if _, ok := sortFields[request.SortBy]; !ok {
+		return ErrDirectoryListQuery
+	}
+	if request.Page > math.MaxInt/request.PageSize {
+		return ErrDirectoryListQuery
+	}
+	return nil
+}
+
+func directoryPageOffset(request DirectoryPageRequest) int {
+	return (request.Page - 1) * request.PageSize
+}
+
+func directoryTotalPages(total int64, pageSize int) int {
+	if total == 0 {
+		return 0
+	}
+	return int((total + int64(pageSize) - 1) / int64(pageSize))
+}
+
 type ProjectUserSearchRequest struct {
 	Page     int
 	PageSize int
@@ -386,18 +435,41 @@ func projectMembershipView(
 	}
 }
 
-func (service *ProjectService) ListHumanMemberships(
+func (service *ProjectService) ListHumanMembershipPage(
 	ctx context.Context,
 	scope models.ProjectScope,
-) ([]ProjectMembershipView, error) {
+	request DirectoryPageRequest,
+) (*DirectoryPage[ProjectMembershipView], error) {
 	if err := requireMatchingProjectOperation(ctx, scope); err != nil {
 		return nil, err
 	}
-	var memberships []models.ProjectMembership
-	if err := service.db.WithContext(ctx).
+	sortFields := map[string]struct{}{
+		"created_at": {},
+		"updated_at": {},
+		"role":       {},
+		"is_active":  {},
+		"user_id":    {},
+	}
+	if err := validateDirectoryPageRequest(request, sortFields); err != nil {
+		return nil, err
+	}
+	query := service.db.WithContext(ctx).
+		Model(&models.ProjectMembership{}).
+		Where("project_id = ?", scope.ProjectID)
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, fmt.Errorf("count project memberships: %w", err)
+	}
+	memberships := make(
+		[]models.ProjectMembership,
+		0,
+		request.PageSize,
+	)
+	if err := query.
 		Preload("User").
-		Where("project_id = ?", scope.ProjectID).
-		Order("is_active DESC, role ASC, user_id ASC").
+		Order(projectMembershipDirectoryOrder(request)).
+		Offset(directoryPageOffset(request)).
+		Limit(request.PageSize).
 		Find(&memberships).Error; err != nil {
 		return nil, fmt.Errorf("list project memberships: %w", err)
 	}
@@ -405,7 +477,31 @@ func (service *ProjectService) ListHumanMemberships(
 	for index := range memberships {
 		result = append(result, projectMembershipView(&memberships[index]))
 	}
-	return result, nil
+	return &DirectoryPage[ProjectMembershipView]{
+		Items:      result,
+		Total:      total,
+		Page:       request.Page,
+		PageSize:   request.PageSize,
+		TotalPages: directoryTotalPages(total, request.PageSize),
+	}, nil
+}
+
+func projectMembershipDirectoryOrder(request DirectoryPageRequest) string {
+	if request.SortBy == "is_active" && request.SortOrder == "desc" {
+		return "is_active DESC, role ASC, user_id ASC, id ASC"
+	}
+	direction := "ASC"
+	if request.SortOrder == "desc" {
+		direction = "DESC"
+	}
+	column := map[string]string{
+		"created_at": "created_at",
+		"updated_at": "updated_at",
+		"role":       "role",
+		"is_active":  "is_active",
+		"user_id":    "user_id",
+	}[request.SortBy]
+	return column + " " + direction + ", id " + direction
 }
 
 type UpsertProjectMembershipInput struct {
@@ -2122,25 +2218,68 @@ func (service *ProjectService) GrantPrincipalProject(
 	}, nil
 }
 
-func (service *ProjectService) ListQueues(
+func (service *ProjectService) ListQueuePage(
 	ctx context.Context,
 	scope models.ProjectScope,
-) ([]models.Queue, error) {
-	if err := scope.Validate(); err != nil {
+	request DirectoryPageRequest,
+) (*DirectoryPage[models.Queue], error) {
+	if err := requireMatchingProjectOperation(ctx, scope); err != nil {
 		return nil, err
 	}
-	var queues []models.Queue
-	if err := service.db.WithContext(ctx).
+	sortFields := map[string]struct{}{
+		"created_at": {},
+		"updated_at": {},
+		"name":       {},
+		"key":        {},
+		"is_default": {},
+	}
+	if err := validateDirectoryPageRequest(request, sortFields); err != nil {
+		return nil, err
+	}
+	query := service.db.WithContext(ctx).
+		Model(&models.Queue{}).
 		Where(
 			"project_id = ? AND status = ?",
 			scope.ProjectID,
 			models.QueueStatusActive,
-		).
-		Order("is_default DESC, name ASC, id ASC").
+		)
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, fmt.Errorf("count project queues: %w", err)
+	}
+	queues := make([]models.Queue, 0, request.PageSize)
+	if err := query.
+		Order(projectQueueDirectoryOrder(request)).
+		Offset(directoryPageOffset(request)).
+		Limit(request.PageSize).
 		Find(&queues).Error; err != nil {
 		return nil, fmt.Errorf("list project queues: %w", err)
 	}
-	return queues, nil
+	return &DirectoryPage[models.Queue]{
+		Items:      queues,
+		Total:      total,
+		Page:       request.Page,
+		PageSize:   request.PageSize,
+		TotalPages: directoryTotalPages(total, request.PageSize),
+	}, nil
+}
+
+func projectQueueDirectoryOrder(request DirectoryPageRequest) string {
+	if request.SortBy == "is_default" && request.SortOrder == "desc" {
+		return "is_default DESC, name ASC, id ASC"
+	}
+	direction := "ASC"
+	if request.SortOrder == "desc" {
+		direction = "DESC"
+	}
+	column := map[string]string{
+		"created_at": "created_at",
+		"updated_at": "updated_at",
+		"name":       "name",
+		"key":        "\"key\"",
+		"is_default": "is_default",
+	}[request.SortBy]
+	return column + " " + direction + ", id " + direction
 }
 
 func (service *ProjectService) ResolveQueue(

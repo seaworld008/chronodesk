@@ -65,6 +65,52 @@ func TestPlatformProjectSummaryNeverExposesTrustedScopeOrProjectRole(
 	}
 }
 
+func TestProjectDirectoryAuthorizationPrecedesQueryValidation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewProjectHandler(nil)
+	router := gin.New()
+	router.GET("/memberships", func(c *gin.Context) {
+		c.Set(projectAccessContextKey, services.ProjectAccess{
+			Role: models.ProjectRoleObserver,
+		})
+		handler.ListMemberships(c)
+	})
+	router.GET("/queues", handler.ListQueues)
+
+	memberships := httptest.NewRecorder()
+	router.ServeHTTP(
+		memberships,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/memberships?page_size=101",
+			nil,
+		),
+	)
+	if memberships.Code != http.StatusForbidden {
+		t.Fatalf(
+			"membership status = %d, body=%s",
+			memberships.Code,
+			memberships.Body.String(),
+		)
+	}
+	queues := httptest.NewRecorder()
+	router.ServeHTTP(
+		queues,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/queues?page_size=101",
+			nil,
+		),
+	)
+	if queues.Code != http.StatusForbidden {
+		t.Fatalf(
+			"queue status = %d, body=%s",
+			queues.Code,
+			queues.Body.String(),
+		)
+	}
+}
+
 func TestProjectArchiveHandlerRequiresCanonicalRFCUUIDv7(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	handler := NewProjectHandler(nil)

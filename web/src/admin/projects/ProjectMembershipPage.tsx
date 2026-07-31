@@ -26,6 +26,7 @@ import {
     TableCell,
     TableContainer,
     TableHead,
+    TablePagination,
     TableRow,
     TextField,
     Typography,
@@ -71,11 +72,28 @@ const projectMembershipColumns: ResizableColumn[] = [
 const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === 'object' && value !== null
 
-const parseMemberships = (value: unknown): ProjectMembership[] => {
-    if (!Array.isArray(value)) {
+interface DirectoryPage<T> {
+    items: T[]
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+const parseMembershipPage = (
+    value: unknown,
+): DirectoryPage<ProjectMembership> => {
+    if (
+        !isRecord(value) ||
+        !Array.isArray(value.items) ||
+        typeof value.total !== 'number' ||
+        typeof value.page !== 'number' ||
+        typeof value.page_size !== 'number' ||
+        typeof value.total_pages !== 'number'
+    ) {
         throw new Error('项目成员响应格式无效')
     }
-    return value.map((item) => {
+    const items = value.items.map((item) => {
         if (
             !isRecord(item) ||
             typeof item.id !== 'number' ||
@@ -91,6 +109,13 @@ const parseMemberships = (value: unknown): ProjectMembership[] => {
         }
         return item as ProjectMembership
     })
+    return {
+        items,
+        total: value.total,
+        page: value.page,
+        page_size: value.page_size,
+        total_pages: value.total_pages,
+    }
 }
 
 const roleChoices = projectRoleValues.map((role) => ({
@@ -118,9 +143,13 @@ const ProjectMembershipPage = () => {
     const isProjectAdmin = projectRole === 'project_admin'
     const canRead = isProjectAdmin || projectRole === 'manager'
     const [memberships, setMemberships] = React.useState<ProjectMembership[]>([])
+    const [page, setPage] = React.useState(0)
+    const [pageSize, setPageSize] = React.useState(25)
+    const [total, setTotal] = React.useState(0)
     const [loading, setLoading] = React.useState(true)
     const [saving, setSaving] = React.useState(false)
     const [error, setError] = React.useState('')
+    const [listError, setListError] = React.useState('')
     const [selectedUser, setSelectedUser] =
         React.useState<ProjectUserOption | null>(null)
     const [candidateOptions, setCandidateOptions] =
@@ -130,34 +159,67 @@ const ProjectMembershipPage = () => {
     const [role, setRole] = React.useState<ProjectRole>('requester')
     const [membershipToRevoke, setMembershipToRevoke] =
         React.useState<ProjectMembership | null>(null)
+    const listAbortController = React.useRef<AbortController | null>(null)
 
     const loadMemberships = React.useCallback(async () => {
         if (!canRead) return
+        listAbortController.current?.abort()
+        const controller = new AbortController()
+        listAbortController.current = controller
         setLoading(true)
-        setError('')
+        setListError('')
         try {
-            const path = humanApiRoutes.listProjectMemberships({
+            const basePath = humanApiRoutes.listProjectMemberships({
                 projectKey: await resolveActiveProjectKey(),
             })
-            const response = await apiFetch<unknown>(path)
-            setMemberships(parseMemberships(response))
+            if (controller.signal.aborted) return
+            const query = new URLSearchParams({
+                page: String(page + 1),
+                page_size: String(pageSize),
+                sort_by: 'is_active',
+                sort_order: 'desc',
+            })
+            const response = await apiFetch<unknown>(
+                `${basePath}?${query.toString()}`,
+                { signal: controller.signal },
+            )
+            if (controller.signal.aborted) return
+            const parsed = parseMembershipPage(response)
+            if (
+                parsed.total_pages > 0 &&
+                page + 1 > parsed.total_pages
+            ) {
+                setPage(parsed.total_pages - 1)
+                return
+            }
+            setMemberships(parsed.items)
+            setTotal(parsed.total)
         } catch (requestError) {
-            setError(
+            if (controller.signal.aborted) return
+            setListError(
                 localizedUnknownErrorMessage(
                     requestError,
                     '项目成员加载失败，请稍后重试',
                 ),
             )
         } finally {
-            setLoading(false)
+            if (
+                !controller.signal.aborted &&
+                listAbortController.current === controller
+            ) {
+                setLoading(false)
+            }
         }
-    }, [canRead])
+    }, [canRead, page, pageSize])
 
     React.useEffect(() => {
         if (!permissionsPending && canRead) {
             void loadMemberships()
         } else if (!permissionsPending) {
             setLoading(false)
+        }
+        return () => {
+            listAbortController.current?.abort()
         }
     }, [canRead, loadMemberships, permissionsPending])
 
@@ -313,6 +375,23 @@ const ProjectMembershipPage = () => {
                     {error}
                 </Alert>
             )}
+            {listError && (
+                <Alert
+                    severity="error"
+                    sx={{ mb: 2 }}
+                    action={
+                        <Button
+                            color="inherit"
+                            size="small"
+                            onClick={() => void loadMemberships()}
+                        >
+                            重试
+                        </Button>
+                    }
+                >
+                    {listError}
+                </Alert>
+            )}
             {!isProjectAdmin && (
                 <Alert
                     severity="info"
@@ -440,12 +519,13 @@ const ProjectMembershipPage = () => {
                 </Paper>
             )}
 
-            <TableContainer component={Paper} variant="outlined">
-                <ResizableMuiTable
-                    tableId="projects.memberships"
-                    columns={projectMembershipColumns}
-                    aria-label="项目成员列表"
-                >
+            <Paper variant="outlined">
+                <TableContainer>
+                    <ResizableMuiTable
+                        tableId="projects.memberships"
+                        columns={projectMembershipColumns}
+                        aria-label="项目成员列表"
+                    >
                     <TableHead>
                         <TableRow>
                             <TableCell>用户</TableCell>
@@ -564,8 +644,32 @@ const ProjectMembershipPage = () => {
                             })
                         )}
                     </TableBody>
-                </ResizableMuiTable>
-            </TableContainer>
+                    </ResizableMuiTable>
+                </TableContainer>
+                <TablePagination
+                    component="div"
+                    count={total}
+                    page={page}
+                    rowsPerPage={pageSize}
+                    rowsPerPageOptions={[25, 50, 100]}
+                    onPageChange={(_, nextPage) => setPage(nextPage)}
+                    onRowsPerPageChange={(event) => {
+                        setPageSize(Number(event.target.value))
+                        setPage(0)
+                    }}
+                    labelRowsPerPage="每页行数"
+                    labelDisplayedRows={({ from, to, count }) =>
+                        `${from}–${to} / ${count}`
+                    }
+                    slotProps={{
+                        select: {
+                            inputProps: {
+                                'aria-label': '项目成员每页行数',
+                            },
+                        },
+                    }}
+                />
+            </Paper>
 
             <Dialog
                 open={membershipToRevoke !== null}

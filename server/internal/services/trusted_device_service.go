@@ -20,17 +20,69 @@ func NewTrustedDeviceService(db *gorm.DB) *TrustedDeviceService {
 	return &TrustedDeviceService{db: db}
 }
 
-// ListTrustedDevices 返回用户的可信设备列表（按最近使用排序）。
-func (s *TrustedDeviceService) ListTrustedDevices(ctx context.Context, userID uint) ([]*models.OTPTrustedDevice, error) {
-	var devices []*models.OTPTrustedDevice
-	err := s.db.WithContext(ctx).
-		Where("user_id = ?", userID).
-		Order("revoked ASC, expires_at DESC").
+// ListTrustedDevicePage returns one bounded page for the authenticated owner.
+// The user predicate is applied to both COUNT and page queries.
+func (s *TrustedDeviceService) ListTrustedDevicePage(
+	ctx context.Context,
+	userID uint,
+	request DirectoryPageRequest,
+) (*DirectoryPage[*models.OTPTrustedDevice], error) {
+	if userID == 0 {
+		return nil, ErrDirectoryListQuery
+	}
+	sortFields := map[string]struct{}{
+		"created_at":   {},
+		"updated_at":   {},
+		"last_used_at": {},
+		"expires_at":   {},
+		"revoked":      {},
+		"device_name":  {},
+	}
+	if err := validateDirectoryPageRequest(request, sortFields); err != nil {
+		return nil, err
+	}
+	query := s.db.WithContext(ctx).
+		Model(&models.OTPTrustedDevice{}).
+		Where("user_id = ?", userID)
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, fmt.Errorf("failed to count trusted devices: %w", err)
+	}
+	devices := make([]*models.OTPTrustedDevice, 0, request.PageSize)
+	err := query.
+		Order(trustedDeviceDirectoryOrder(request)).
+		Offset(directoryPageOffset(request)).
+		Limit(request.PageSize).
 		Find(&devices).Error
 	if err != nil {
 		return nil, fmt.Errorf("failed to list trusted devices: %w", err)
 	}
-	return devices, nil
+	return &DirectoryPage[*models.OTPTrustedDevice]{
+		Items:      devices,
+		Total:      total,
+		Page:       request.Page,
+		PageSize:   request.PageSize,
+		TotalPages: directoryTotalPages(total, request.PageSize),
+	}, nil
+}
+
+func trustedDeviceDirectoryOrder(request DirectoryPageRequest) string {
+	if request.SortBy == "revoked" && request.SortOrder == "asc" {
+		return "revoked ASC, expires_at DESC, id DESC"
+	}
+	direction := "ASC"
+	if request.SortOrder == "desc" {
+		direction = "DESC"
+	}
+	column := map[string]string{
+		"created_at":   "created_at",
+		"updated_at":   "updated_at",
+		"last_used_at": "last_used_at",
+		"expires_at":   "expires_at",
+		"revoked":      "revoked",
+		"device_name":  "device_name",
+	}[request.SortBy]
+	return column + " " + direction + ", id " + direction
 }
 
 // RevokeTrustedDevice 撤销指定的可信设备访问权。

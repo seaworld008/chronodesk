@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -249,24 +250,85 @@ func (s *ConfigService) DeleteConfig(key string) error {
 	return nil
 }
 
-// GetConfigsByCategory 按分类获取配置
-func (s *ConfigService) GetConfigsByCategory(category string) ([]models.SystemConfig, error) {
-	var configs []models.SystemConfig
-	if err := s.db.Where("category = ?", category).Order("\"group\", key").Find(&configs).Error; err != nil {
+// ListConfigPage returns one bounded page of platform configuration. Values
+// remain editable control data, so the platform authorization middleware must
+// run before this service is reached.
+func (s *ConfigService) ListConfigPage(
+	ctx context.Context,
+	category string,
+	request DirectoryPageRequest,
+) (*DirectoryPage[models.SystemConfig], error) {
+	sortFields := map[string]struct{}{
+		"created_at": {},
+		"updated_at": {},
+		"key":        {},
+		"category":   {},
+		"group":      {},
+	}
+	if err := validateDirectoryPageRequest(request, sortFields); err != nil {
 		return nil, err
 	}
-
-	return configs, nil
+	if category != "" && !validSystemConfigCategory(category) {
+		return nil, ErrDirectoryListQuery
+	}
+	query := s.db.WithContext(ctx).Model(&models.SystemConfig{})
+	if category != "" {
+		query = query.Where("category = ?", category)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, fmt.Errorf("count system configs: %w", err)
+	}
+	configs := make([]models.SystemConfig, 0, request.PageSize)
+	if err := query.
+		Order(systemConfigDirectoryOrder(request)).
+		Offset(directoryPageOffset(request)).
+		Limit(request.PageSize).
+		Find(&configs).Error; err != nil {
+		return nil, fmt.Errorf("list system configs: %w", err)
+	}
+	return &DirectoryPage[models.SystemConfig]{
+		Items:      configs,
+		Total:      total,
+		Page:       request.Page,
+		PageSize:   request.PageSize,
+		TotalPages: directoryTotalPages(total, request.PageSize),
+	}, nil
 }
 
-// GetAllConfigs 获取所有配置
-func (s *ConfigService) GetAllConfigs() ([]models.SystemConfig, error) {
-	var configs []models.SystemConfig
-	if err := s.db.Order("category, \"group\", key").Find(&configs).Error; err != nil {
-		return nil, err
+func validSystemConfigCategory(category string) bool {
+	switch category {
+	case CategorySystem,
+		CategorySecurity,
+		CategoryEmail,
+		CategoryTicket,
+		CategoryNotify,
+		CategoryUI:
+		return true
+	default:
+		return false
 	}
+}
 
-	return configs, nil
+func systemConfigDirectoryOrder(request DirectoryPageRequest) string {
+	if request.SortBy == "category" && request.SortOrder == "asc" {
+		return "category ASC, \"group\" ASC, key ASC, id ASC"
+	}
+	if request.SortBy == "group" && request.SortOrder == "asc" {
+		return "\"group\" ASC, key ASC, id ASC"
+	}
+	direction := "ASC"
+	if request.SortOrder == "desc" {
+		direction = "DESC"
+	}
+	column := map[string]string{
+		"created_at": "created_at",
+		"updated_at": "updated_at",
+		"key":        "key",
+		"category":   "category",
+		"group":      "\"group\"",
+	}[request.SortBy]
+	return column + " " + direction + ", id " + direction
 }
 
 // BatchUpdateConfigs 批量更新配置

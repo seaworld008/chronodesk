@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -125,6 +126,204 @@ func seedProjectAccessFixture(
 		t.Fatal(err)
 	}
 	return organization, unit, project, user
+}
+
+func TestProjectDirectoryPagesAreBoundedStableAndScopeChecked(t *testing.T) {
+	db := newProjectServiceTestDB(t)
+	organization, unit, project, actor := seedProjectAccessFixture(t, db)
+	otherProject := models.Project{
+		OrganizationID: organization.ID,
+		BusinessUnitID: unit.ID,
+		Key:            "OTHER",
+		Name:           "Other",
+		Status:         models.ProjectStatusActive,
+	}
+	if err := db.Create(&otherProject).Error; err != nil {
+		t.Fatal(err)
+	}
+	users := make([]models.User, 0, 152)
+	for index := 0; index < 152; index++ {
+		users = append(users, models.User{
+			Username:     fmt.Sprintf("directory-%03d", index),
+			Email:        fmt.Sprintf("directory-%03d@example.test", index),
+			PlatformRole: models.PlatformRoleMember,
+			Status:       models.UserStatusActive,
+		})
+	}
+	if err := db.Create(&users).Error; err != nil {
+		t.Fatal(err)
+	}
+	memberships := make([]models.ProjectMembership, 0, 152)
+	for index := 0; index < 151; index++ {
+		memberships = append(memberships, models.ProjectMembership{
+			ProjectID: project.ID,
+			UserID:    users[index].ID,
+			Role:      models.ProjectRoleObserver,
+			IsActive:  true,
+		})
+	}
+	memberships = append(memberships, models.ProjectMembership{
+		ProjectID: otherProject.ID,
+		UserID:    users[151].ID,
+		Role:      models.ProjectRoleAdmin,
+		IsActive:  true,
+	})
+	if err := db.Create(&memberships).Error; err != nil {
+		t.Fatal(err)
+	}
+	queues := make([]models.Queue, 0, 152)
+	for index := 0; index < 151; index++ {
+		queues = append(queues, models.Queue{
+			ProjectID: project.ID,
+			Key:       models.QueueKey(fmt.Sprintf("queue-%03d", index)),
+			Name:      fmt.Sprintf("Queue %03d", index),
+			Status:    models.QueueStatusActive,
+		})
+	}
+	queues = append(queues, models.Queue{
+		ProjectID: otherProject.ID,
+		Key:       "other-queue",
+		Name:      "Other Queue",
+		Status:    models.QueueStatusActive,
+	})
+	if err := db.Create(&queues).Error; err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := WithOperationContext(
+		context.Background(),
+		OperationContext{
+			Scope:  project.Scope(),
+			Actor:  models.HumanActor(actor.ID),
+			Source: SourceProtocolHumanREST,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewProjectService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := DirectoryPageRequest{
+		Page:      1,
+		PageSize:  100,
+		SortBy:    "user_id",
+		SortOrder: "asc",
+	}
+	firstMemberships, err := service.ListHumanMembershipPage(
+		ctx,
+		project.Scope(),
+		request,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Page = 2
+	secondMemberships, err := service.ListHumanMembershipPage(
+		ctx,
+		project.Scope(),
+		request,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDirectoryPageIDs(
+		t,
+		firstMemberships.Total,
+		firstMemberships.TotalPages,
+		membershipViewIDs(firstMemberships.Items),
+		membershipViewIDs(secondMemberships.Items),
+	)
+
+	queueRequest := DirectoryPageRequest{
+		Page:      1,
+		PageSize:  100,
+		SortBy:    "name",
+		SortOrder: "asc",
+	}
+	firstQueues, err := service.ListQueuePage(
+		ctx,
+		project.Scope(),
+		queueRequest,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queueRequest.Page = 2
+	secondQueues, err := service.ListQueuePage(
+		ctx,
+		project.Scope(),
+		queueRequest,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDirectoryPageIDs(
+		t,
+		firstQueues.Total,
+		firstQueues.TotalPages,
+		queueIDs(firstQueues.Items),
+		queueIDs(secondQueues.Items),
+	)
+
+	invalid := DirectoryPageRequest{}
+	if _, err := service.ListHumanMembershipPage(
+		context.Background(),
+		project.Scope(),
+		invalid,
+	); !errors.Is(err, ErrProjectAccessDenied) {
+		t.Fatalf("membership authorization-before-pagination error = %v", err)
+	}
+	if _, err := service.ListQueuePage(
+		context.Background(),
+		project.Scope(),
+		invalid,
+	); !errors.Is(err, ErrProjectAccessDenied) {
+		t.Fatalf("queue authorization-before-pagination error = %v", err)
+	}
+}
+
+func membershipViewIDs(items []ProjectMembershipView) []uint {
+	result := make([]uint, 0, len(items))
+	for _, item := range items {
+		result = append(result, item.ID)
+	}
+	return result
+}
+
+func queueIDs(items []models.Queue) []uint {
+	result := make([]uint, 0, len(items))
+	for _, item := range items {
+		result = append(result, item.ID)
+	}
+	return result
+}
+
+func assertDirectoryPageIDs(
+	t *testing.T,
+	total int64,
+	totalPages int,
+	first []uint,
+	second []uint,
+) {
+	t.Helper()
+	if total != 151 || totalPages != 2 ||
+		len(first) != 100 || len(second) != 51 {
+		t.Fatalf(
+			"unexpected page sizes: total=%d pages=%d first=%d second=%d",
+			total,
+			totalPages,
+			len(first),
+			len(second),
+		)
+	}
+	seen := make(map[uint]struct{}, 151)
+	for _, id := range append(first, second...) {
+		if _, duplicate := seen[id]; duplicate {
+			t.Fatalf("directory row %d appears on multiple pages", id)
+		}
+		seen[id] = struct{}{}
+	}
 }
 
 func TestProjectServiceCreateProjectPersistsEventOutboxAndAudit(t *testing.T) {

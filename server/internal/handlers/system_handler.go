@@ -2,8 +2,8 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -22,7 +22,11 @@ type cleanupService interface {
 	SetCleanupConfig(context.Context, *models.CleanupConfig, uint) error
 	ExecuteCleanup(context.Context, string, string, *uint) error
 	ExecuteAllCleanupTasks(context.Context, string, *uint) error
-	GetCleanupLogs(context.Context, string, int) ([]*models.CleanupLogResponse, error)
+	ListCleanupLogPage(
+		context.Context,
+		string,
+		services.DirectoryPageRequest,
+	) (*services.DirectoryPage[*models.CleanupLogResponse], error)
 	GetCleanupStats(context.Context) (*services.CleanupStatsResponse, error)
 }
 
@@ -204,20 +208,54 @@ func (h *SystemHandler) ExecuteAllCleanup(c *gin.Context) {
 
 // GetCleanupLogs 获取清理日志
 func (h *SystemHandler) GetCleanupLogs(c *gin.Context) {
-	taskType := c.Query("task_type")
-	limitStr := c.Query("limit")
-
-	limit := 20
-	if limitStr != "" {
-		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
-			limit = l
-		}
+	query, err := parseDirectoryListQuery(
+		c.Request.URL.Query(),
+		directoryListQuerySpec{
+			DefaultSortBy:    "created_at",
+			DefaultSortOrder: "desc",
+			SortFields: map[string]struct{}{
+				"created_at":      {},
+				"start_time":      {},
+				"end_time":        {},
+				"status":          {},
+				"task_type":       {},
+				"records_deleted": {},
+			},
+			FilterFields: map[string]struct{}{"task_type": {}},
+		},
+	)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "invalid_query",
+			"message": "清理日志查询参数无效",
+		})
+		return
 	}
+	taskType, _ := directoryQueryValue(
+		c.Request.URL.Query(),
+		"task_type",
+	)
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
-	logs, err := h.cleanupSvc.GetCleanupLogs(ctx, taskType, limit)
+	logs, err := h.cleanupSvc.ListCleanupLogPage(
+		ctx,
+		taskType,
+		services.DirectoryPageRequest{
+			Page:      query.Page,
+			PageSize:  query.PageSize,
+			SortBy:    query.SortBy,
+			SortOrder: query.SortOrder,
+		},
+	)
+	if errors.Is(err, services.ErrDirectoryListQuery) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "invalid_query",
+			"message": "清理日志查询参数无效",
+		})
+		return
+	}
 	if err != nil {
 		logHandlerFailure(c, "system_cleanup.get_logs", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -230,7 +268,6 @@ func (h *SystemHandler) GetCleanupLogs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data":    logs,
-		"total":   len(logs),
 	})
 }
 

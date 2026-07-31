@@ -47,7 +47,9 @@ type MembershipMockState = {
     upserts: UpsertProjectMembershipRequest[];
     revokedUserIDs: number[];
     membershipReads: number;
+    membershipQueries: string[];
     candidateReads: number;
+    pageTwoDelayMs: number;
 };
 
 const installMembershipBackend = async (
@@ -61,7 +63,9 @@ const installMembershipBackend = async (
         upserts: [],
         revokedUserIDs: [],
         membershipReads: 0,
+        membershipQueries: [],
         candidateReads: 0,
+        pageTwoDelayMs: 0,
     };
     const access = authorizedProjectAccess(projectA, projectRole);
     const collectionPath =
@@ -80,9 +84,29 @@ const installMembershipBackend = async (
             request.method() === 'GET'
         ) {
             state.membershipReads += 1;
+            state.membershipQueries.push(url.search);
+            const pageNumber = Number(url.searchParams.get('page') ?? '1');
+            const pageSize = Number(
+                url.searchParams.get('page_size') ?? '25',
+            );
+            const start = (pageNumber - 1) * pageSize;
+            const items = state.memberships.slice(start, start + pageSize);
+            if (pageNumber === 2 && state.pageTwoDelayMs > 0) {
+                await new Promise((resolve) =>
+                    setTimeout(resolve, state.pageTwoDelayMs),
+                );
+            }
             await fulfillJSON(route, {
                 code: 0,
-                data: state.memberships,
+                data: {
+                    items,
+                    total: state.memberships.length,
+                    page: pageNumber,
+                    page_size: pageSize,
+                    total_pages: state.memberships.length === 0
+                        ? 0
+                        : Math.ceil(state.memberships.length / pageSize),
+                },
             });
             return;
         }
@@ -440,6 +464,63 @@ test.describe('项目成员管理五角色 UI', () => {
         ).toHaveCount(0);
         expect(state.membershipReads).toBeGreaterThan(0);
         expect(state.candidateReads).toBe(0);
+    });
+
+    test('成员目录使用有界分页并取消过期翻页请求', async ({ page }) => {
+        await installMockSession(
+            page,
+            {
+                ...defaultMockIdentity,
+                sessionID: 'e2e-project-membership-pagination',
+            },
+            projectA,
+        );
+        const state = await installMembershipBackend(
+            page,
+            'project_admin',
+        );
+        state.memberships = Array.from({ length: 30 }, (_, index) =>
+            membership(
+                index + 1,
+                1001 + index,
+                'observer',
+            ),
+        );
+        state.pageTwoDelayMs = 250;
+
+        await page.goto('/#/project-memberships');
+        const table = page.getByRole('table', {
+            name: '项目成员列表',
+            exact: true,
+        });
+        await expect(table.getByText('项目观察员 1001')).toBeVisible();
+        expect(state.membershipQueries[0]).toContain('page=1');
+        expect(state.membershipQueries[0]).toContain('page_size=25');
+        expect(state.membershipQueries[0]).toContain('sort_by=is_active');
+        expect(state.membershipQueries[0]).toContain('sort_order=desc');
+
+        await page
+            .getByRole('button', { name: /下一页|next page/iu })
+            .click();
+        await expect.poll(() => state.membershipQueries).toContainEqual(
+            expect.stringContaining('page=2'),
+        );
+        await page
+            .getByRole('combobox', {
+                name: '每页行数',
+                exact: true,
+            })
+            .click();
+        await page.getByRole('option', { name: '50' }).click();
+
+        await expect(table.getByText('项目观察员 1001')).toBeVisible();
+        await expect(table.getByText('项目观察员 1030')).toBeVisible();
+        await expect(
+            page.getByText('请求已取消', { exact: true }),
+        ).toHaveCount(0);
+        expect(state.membershipQueries).toContainEqual(
+            expect.stringContaining('page_size=50'),
+        );
     });
 
     for (const role of projectRoleValues.filter(

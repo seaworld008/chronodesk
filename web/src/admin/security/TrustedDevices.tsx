@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+    Alert,
     Box,
     Button,
     Card,
@@ -12,6 +13,7 @@ import {
     DialogTitle,
     IconButton,
     Stack,
+    TablePagination,
     Tooltip,
     Typography,
 } from '@mui/material'
@@ -33,6 +35,26 @@ interface TrustedDevice {
     updated_at: string
 }
 
+interface TrustedDevicePage {
+    items: TrustedDevice[]
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+const isTrustedDevicePage = (value: unknown): value is TrustedDevicePage => {
+    if (!value || typeof value !== 'object') return false
+    const page = value as Partial<TrustedDevicePage>
+    return (
+        Array.isArray(page.items) &&
+        typeof page.total === 'number' &&
+        typeof page.page === 'number' &&
+        typeof page.page_size === 'number' &&
+        typeof page.total_pages === 'number'
+    )
+}
+
 const formatDateTime = (value: string) => {
     if (!value) return '—'
     const date = new Date(value)
@@ -45,26 +67,64 @@ const formatDateTime = (value: string) => {
 const TrustedDevices = () => {
     const notify = useNotify()
     const [devices, setDevices] = useState<TrustedDevice[]>([])
+    const [page, setPage] = useState(0)
+    const [pageSize, setPageSize] = useState(25)
+    const [total, setTotal] = useState(0)
     const [loading, setLoading] = useState(true)
+    const [error, setError] = useState('')
     const [refreshFlag, setRefreshFlag] = useState(0)
     const [revokeTarget, setRevokeTarget] = useState<TrustedDevice | null>(null)
     const [revoking, setRevoking] = useState(false)
+    const requestController = useRef<AbortController | null>(null)
 
     const fetchDevices = useCallback(async () => {
+        requestController.current?.abort()
+        const controller = new AbortController()
+        requestController.current = controller
         setLoading(true)
+        setError('')
         try {
-            const result = await apiFetch<TrustedDevice[]>('/user/trusted-devices')
-            setDevices(result ?? [])
+            const query = new URLSearchParams({
+                page: String(page + 1),
+                page_size: String(pageSize),
+                sort_by: 'revoked',
+                sort_order: 'asc',
+            })
+            const result = await apiFetch<unknown>(
+                `/user/trusted-devices?${query.toString()}`,
+                { signal: controller.signal },
+            )
+            if (controller.signal.aborted) return
+            if (!isTrustedDevicePage(result)) {
+                throw new Error('可信设备响应格式无效')
+            }
+            if (result.total_pages > 0 && page + 1 > result.total_pages) {
+                setPage(result.total_pages - 1)
+                return
+            }
+            setDevices(result.items)
+            setTotal(result.total)
         } catch (error) {
-            console.error(error)
-            notify('获取可信设备失败，请稍后重试', { type: 'warning' })
+            if (controller.signal.aborted) return
+            setError(
+                localizedUnknownErrorMessage(
+                    error,
+                    '获取可信设备失败，请稍后重试',
+                ),
+            )
         } finally {
-            setLoading(false)
+            if (
+                !controller.signal.aborted &&
+                requestController.current === controller
+            ) {
+                setLoading(false)
+            }
         }
-    }, [notify])
+    }, [page, pageSize])
 
     useEffect(() => {
-        fetchDevices()
+        void fetchDevices()
+        return () => requestController.current?.abort()
     }, [fetchDevices, refreshFlag])
 
     const handleRevoke = async () => {
@@ -107,6 +167,23 @@ const TrustedDevices = () => {
                     </Tooltip>
                 )}
             />
+            {error && (
+                <Alert
+                    severity="error"
+                    sx={{ maxWidth: 960, mt: 3, width: '100%' }}
+                    action={
+                        <Button
+                            color="inherit"
+                            size="small"
+                            onClick={() => void fetchDevices()}
+                        >
+                            重试
+                        </Button>
+                    }
+                >
+                    {error}
+                </Alert>
+            )}
             <Card sx={{ maxWidth: 960, mt: 3, width: '100%' }}>
                 <CardContent>
                     {loading ? (
@@ -167,6 +244,29 @@ const TrustedDevices = () => {
                         </Stack>
                     )}
                 </CardContent>
+                <TablePagination
+                    component="div"
+                    count={total}
+                    page={page}
+                    rowsPerPage={pageSize}
+                    rowsPerPageOptions={[25, 50, 100]}
+                    onPageChange={(_, nextPage) => setPage(nextPage)}
+                    onRowsPerPageChange={(event) => {
+                        setPageSize(Number(event.target.value))
+                        setPage(0)
+                    }}
+                    labelRowsPerPage="每页设备数"
+                    labelDisplayedRows={({ from, to, count }) =>
+                        `${from}–${to} / ${count}`
+                    }
+                    slotProps={{
+                        select: {
+                            inputProps: {
+                                'aria-label': '可信设备每页数量',
+                            },
+                        },
+                    }}
+                />
             </Card>
             <Dialog
                 open={Boolean(revokeTarget)}

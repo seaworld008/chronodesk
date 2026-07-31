@@ -2,14 +2,98 @@ package services
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"testing"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 )
+
+func TestConfigServiceListConfigPageIsBoundedAndStable(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	configs := make([]models.SystemConfig, 0, 152)
+	for index := 0; index < 151; index++ {
+		configs = append(configs, models.SystemConfig{
+			Key:       fmt.Sprintf("security.directory.%03d", index),
+			Value:     "false",
+			ValueType: "bool",
+			Category:  CategorySecurity,
+			Group:     fmt.Sprintf("group-%02d", index%7),
+		})
+	}
+	configs = append(configs, models.SystemConfig{
+		Key:       "system.directory.other",
+		Value:     "other",
+		ValueType: "string",
+		Category:  CategorySystem,
+		Group:     "other",
+	})
+	if err := db.Create(&configs).Error; err != nil {
+		t.Fatal(err)
+	}
+	service := NewConfigService(db)
+	request := DirectoryPageRequest{
+		Page:      1,
+		PageSize:  100,
+		SortBy:    "group",
+		SortOrder: "asc",
+	}
+	first, err := service.ListConfigPage(
+		context.Background(),
+		CategorySecurity,
+		request,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Page = 2
+	second, err := service.ListConfigPage(
+		context.Background(),
+		CategorySecurity,
+		request,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Total != 151 || first.TotalPages != 2 ||
+		len(first.Items) != 100 || len(second.Items) != 51 {
+		t.Fatalf("unexpected pages: first=%+v second=%+v", first, second)
+	}
+	seen := make(map[uint]struct{}, 151)
+	for _, page := range []*DirectoryPage[models.SystemConfig]{
+		first,
+		second,
+	} {
+		for _, config := range page.Items {
+			if config.Category != CategorySecurity {
+				t.Fatalf("category filter leaked row: %+v", config)
+			}
+			if _, duplicate := seen[config.ID]; duplicate {
+				t.Fatalf("config %d appears on multiple pages", config.ID)
+			}
+			seen[config.ID] = struct{}{}
+		}
+	}
+	if _, err := service.ListConfigPage(
+		context.Background(),
+		"unknown",
+		DirectoryPageRequest{
+			Page:      1,
+			PageSize:  25,
+			SortBy:    "category",
+			SortOrder: "asc",
+		},
+	); !errors.Is(err, ErrDirectoryListQuery) {
+		t.Fatalf("invalid category error = %v", err)
+	}
+}
 
 func TestValidateSystemConfigKeyUsesUnicodeCodePointContract(t *testing.T) {
 	t.Parallel()

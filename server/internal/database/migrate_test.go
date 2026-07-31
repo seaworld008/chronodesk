@@ -81,6 +81,42 @@ func TestValidateRuntimeSchemaAcceptsMigratedModel(t *testing.T) {
 			t.Fatalf("migrated schema is missing ticket pagination index %q", index)
 		}
 	}
+	for _, required := range []struct {
+		model any
+		index string
+	}{
+		{
+			model: &models.ProjectMembership{},
+			index: "idx_project_memberships_directory",
+		},
+		{
+			model: &models.Queue{},
+			index: "idx_queues_directory",
+		},
+		{
+			model: &models.OTPTrustedDevice{},
+			index: "idx_otp_trusted_devices_directory",
+		},
+		{
+			model: &models.SystemConfig{},
+			index: "idx_system_configs_directory",
+		},
+		{
+			model: &models.CleanupLog{},
+			index: "idx_cleanup_logs_directory",
+		},
+		{
+			model: &models.CleanupLog{},
+			index: "idx_cleanup_logs_task_directory",
+		},
+	} {
+		if !db.Migrator().HasIndex(required.model, required.index) {
+			t.Fatalf(
+				"migrated schema is missing directory pagination index %q",
+				required.index,
+			)
+		}
+	}
 	if db.Migrator().HasIndex(&models.Ticket{}, "idx_tickets_scope_sla_status_created_id") {
 		t.Fatal("migrated schema retained the ordering-incompatible SLA index")
 	}

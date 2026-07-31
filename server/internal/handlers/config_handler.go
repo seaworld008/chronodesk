@@ -42,17 +42,48 @@ func NewConfigHandler(db *gorm.DB) *ConfigHandler {
 // @Failure 500 {object} map[string]interface{} "服务器错误"
 // @Router /api/platform/configs [get]
 func (h *ConfigHandler) GetAllConfigs(c *gin.Context) {
-	category := c.Query("category")
-
-	var configs []models.SystemConfig
-	var err error
-
-	if category != "" {
-		configs, err = h.configService.GetConfigsByCategory(category)
-	} else {
-		configs, err = h.configService.GetAllConfigs()
+	query, err := parseDirectoryListQuery(
+		c.Request.URL.Query(),
+		directoryListQuerySpec{
+			DefaultSortBy:    "category",
+			DefaultSortOrder: "asc",
+			SortFields: map[string]struct{}{
+				"created_at": {},
+				"updated_at": {},
+				"key":        {},
+				"category":   {},
+				"group":      {},
+			},
+			FilterFields: map[string]struct{}{"category": {}},
+		},
+	)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "系统配置查询参数无效",
+			"error":   "invalid_query",
+		})
+		return
 	}
-
+	category, _ := directoryQueryValue(c.Request.URL.Query(), "category")
+	configs, err := h.configService.ListConfigPage(
+		c.Request.Context(),
+		category,
+		services.DirectoryPageRequest{
+			Page:      query.Page,
+			PageSize:  query.PageSize,
+			SortBy:    query.SortBy,
+			SortOrder: query.SortOrder,
+		},
+	)
+	if errors.Is(err, services.ErrDirectoryListQuery) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "系统配置查询参数无效",
+			"error":   "invalid_query",
+		})
+		return
+	}
 	if err != nil {
 		logHandlerFailure(c, "config.list", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
