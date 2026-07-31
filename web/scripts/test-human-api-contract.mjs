@@ -846,6 +846,9 @@ const notificationPageSize = notificationListParameters.find(
 )
 assert.equal(notificationPageSize.schema.default, 25)
 assert.equal(notificationPageSize.schema.maximum, 100)
+assert.equal(contract.components.parameters.ContentPage.schema.minimum, 1)
+assert.equal(contract.components.parameters.ContentPage.schema.maximum, 1_000_000)
+assert.equal(contract.components.parameters.ContentPage.schema.default, 1)
 for (const path of [
     '/projects/{projectKey}/tickets/overdue',
     '/projects/{projectKey}/tickets/sla-breach',

@@ -1443,6 +1443,12 @@ func TestP0ListPaginationContractUsesStrictTwentyFiveToOneHundredBounds(t *testi
 
 	components := objectAt(t, document, "components")
 	parameters := objectAt(t, components, "parameters")
+	contentPage := objectAt(t, objectAt(t, parameters, "ContentPage"), "schema")
+	if contentPage["default"] != float64(1) ||
+		contentPage["minimum"] != float64(1) ||
+		contentPage["maximum"] != float64(1_000_000) {
+		t.Fatalf("ContentPage schema=%v", contentPage)
+	}
 	contentPageSize := objectAt(t, objectAt(t, parameters, "ContentPageSize"), "schema")
 	if contentPageSize["default"] != float64(25) ||
 		contentPageSize["maximum"] != float64(100) {
