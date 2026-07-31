@@ -211,3 +211,35 @@ func TestNotificationListRejectsRemovedDirectFilterParameters(t *testing.T) {
 		}
 	}
 }
+
+func TestNotificationListUsesStrictBoundedPagination(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(&models.Notification{}); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewNotificationHandler(services.NewNotificationServiceWithProtector(db, nil))
+	router := gin.New()
+	router.GET("/notifications", func(c *gin.Context) {
+		c.Set("user_id", uint(7))
+		handler.GetNotifications(c)
+	})
+
+	for _, query := range []string{
+		"page=0",
+		"page=-1",
+		"page_size=0",
+		"page_size=-1",
+		"page_size=101",
+		"page_size=unbounded",
+	} {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(
+			response,
+			httptest.NewRequest(http.MethodGet, "/notifications?"+query, nil),
+		)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("%s status=%d body=%s", query, response.Code, response.Body.String())
+		}
+	}
+}

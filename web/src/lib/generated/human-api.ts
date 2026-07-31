@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.0.0.
- * Contract SHA-256: a052e509e3859ab431df95fe24074feb19a5468300766caf85ddc10692bccca4.
+ * Contract SHA-256: b2aac2da675a268928b9ccda5c2449c9deeb8ddbcc703547de7ce60e7866c35c.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -530,6 +530,9 @@ export type TicketHistoryListEnvelope = {
     success: true
     data: Array<TicketHistory>
     total: number
+    page: number
+    page_size: number
+    total_pages: number
 }
 
 export type TicketCommentType = "public" | "internal" | "system"
@@ -564,7 +567,7 @@ export type TicketComment = {
     deleted_by?: HumanUserSummary
     parent_id?: number | null
     replies?: Array<TicketComment>
-    reply_count?: number
+    reply_count: number
     time_spent?: number | null
     billable_time?: number | null
     work_type?: string
@@ -578,6 +581,9 @@ export type TicketCommentListEnvelope = {
     success: true
     data: Array<TicketComment>
     total: number
+    page: number
+    page_size: number
+    total_pages: number
 }
 
 export type TicketCommentEnvelope = {
@@ -632,6 +638,9 @@ export type TicketAttachmentListEnvelope = {
     success: true
     data: Array<TicketAttachment>
     total: number
+    page: number
+    page_size: number
+    total_pages: number
 }
 
 export type TicketAttachmentEnvelope = {
@@ -1780,7 +1789,10 @@ export type ListProjectTicketHistoryOperationPathParameters = {
     projectKey: string
     ticketID: number
 }
-export type ListProjectTicketHistoryOperationQuery = Record<string, never>
+export type ListProjectTicketHistoryOperationQuery = {
+    page?: number
+    page_size?: number
+}
 export type ListProjectTicketHistoryOperationRequest = never
 export type ListProjectTicketHistoryOperationResponse = TicketHistoryListEnvelope
 
@@ -1788,7 +1800,10 @@ export type ListProjectTicketCommentsOperationPathParameters = {
     projectKey: string
     ticketID: number
 }
-export type ListProjectTicketCommentsOperationQuery = Record<string, never>
+export type ListProjectTicketCommentsOperationQuery = {
+    page?: number
+    page_size?: number
+}
 export type ListProjectTicketCommentsOperationRequest = never
 export type ListProjectTicketCommentsOperationResponse = TicketCommentListEnvelope
 
@@ -1800,11 +1815,26 @@ export type CreateProjectTicketCommentOperationQuery = Record<string, never>
 export type CreateProjectTicketCommentOperationRequest = CreateTicketCommentRequest
 export type CreateProjectTicketCommentOperationResponse = TicketCommentEnvelope
 
+export type ListProjectTicketCommentRepliesOperationPathParameters = {
+    projectKey: string
+    ticketID: number
+    commentID: number
+}
+export type ListProjectTicketCommentRepliesOperationQuery = {
+    page?: number
+    page_size?: number
+}
+export type ListProjectTicketCommentRepliesOperationRequest = never
+export type ListProjectTicketCommentRepliesOperationResponse = TicketCommentListEnvelope
+
 export type ListProjectTicketAttachmentsOperationPathParameters = {
     projectKey: string
     ticketID: number
 }
-export type ListProjectTicketAttachmentsOperationQuery = Record<string, never>
+export type ListProjectTicketAttachmentsOperationQuery = {
+    page?: number
+    page_size?: number
+}
 export type ListProjectTicketAttachmentsOperationRequest = never
 export type ListProjectTicketAttachmentsOperationResponse = TicketAttachmentListEnvelope
 
@@ -2396,6 +2426,12 @@ export const humanApiOperations = {
         successStatus: 201,
         requestBody: "required",
     },
+    listProjectTicketCommentReplies: {
+        method: "GET",
+        path: "/projects/{projectKey}/tickets/{ticketID}/comments/{commentID}/replies",
+        successStatus: 200,
+        requestBody: "none",
+    },
     listProjectTicketAttachments: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/{ticketID}/attachments",
@@ -2873,6 +2909,12 @@ export interface HumanApiOperationTypes {
         request: CreateProjectTicketCommentOperationRequest
         response: CreateProjectTicketCommentOperationResponse
     }
+    listProjectTicketCommentReplies: {
+        pathParameters: ListProjectTicketCommentRepliesOperationPathParameters
+        query: ListProjectTicketCommentRepliesOperationQuery
+        request: ListProjectTicketCommentRepliesOperationRequest
+        response: ListProjectTicketCommentRepliesOperationResponse
+    }
     listProjectTicketAttachments: {
         pathParameters: ListProjectTicketAttachmentsOperationPathParameters
         query: ListProjectTicketAttachmentsOperationQuery
@@ -3272,6 +3314,8 @@ export const humanApiRoutes = {
         humanApiRoute("listProjectTicketComments", pathParameters, query),
     createProjectTicketComment: (pathParameters: CreateProjectTicketCommentOperationPathParameters, query: CreateProjectTicketCommentOperationQuery = {}) =>
         humanApiRoute("createProjectTicketComment", pathParameters, query),
+    listProjectTicketCommentReplies: (pathParameters: ListProjectTicketCommentRepliesOperationPathParameters, query: ListProjectTicketCommentRepliesOperationQuery = {}) =>
+        humanApiRoute("listProjectTicketCommentReplies", pathParameters, query),
     listProjectTicketAttachments: (pathParameters: ListProjectTicketAttachmentsOperationPathParameters, query: ListProjectTicketAttachmentsOperationQuery = {}) =>
         humanApiRoute("listProjectTicketAttachments", pathParameters, query),
     uploadProjectTicketAttachment: (pathParameters: UploadProjectTicketAttachmentOperationPathParameters, query: UploadProjectTicketAttachmentOperationQuery = {}) =>

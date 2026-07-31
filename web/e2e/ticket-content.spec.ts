@@ -60,8 +60,14 @@ test.describe('工单评论与附件真实交互', () => {
         await main
             .getByRole('tab', { name: '评论历史', exact: true })
             .click();
-        expect((await commentsListResponse).status()).toBe(200);
-        expect((await attachmentsListResponse).status()).toBe(200);
+        const loadedComments = await commentsListResponse;
+        const loadedAttachments = await attachmentsListResponse;
+        expect(loadedComments.status()).toBe(200);
+        expect(loadedAttachments.status()).toBe(200);
+        expect(new URL(loadedComments.url()).searchParams.get('page')).toBe('1');
+        expect(new URL(loadedComments.url()).searchParams.get('page_size')).toBe('25');
+        expect(new URL(loadedAttachments.url()).searchParams.get('page')).toBe('1');
+        expect(new URL(loadedAttachments.url()).searchParams.get('page_size')).toBe('25');
         const commentFormRegion = main.getByRole('region', {
             name: '添加工单评论',
             exact: true,

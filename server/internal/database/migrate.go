@@ -520,12 +520,16 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_ticket_comments_type ON ticket_comments(type);",
 		"CREATE INDEX IF NOT EXISTS idx_ticket_comments_parent_id ON ticket_comments(parent_id);",
 		"CREATE INDEX IF NOT EXISTS idx_ticket_comments_created_at ON ticket_comments(created_at);",
+		"CREATE INDEX IF NOT EXISTS idx_ticket_comments_scope_ticket_parent_created ON ticket_comments(organization_id, project_id, ticket_id, parent_id, created_at, id);",
 
 		// 工单历史表索引
 		"CREATE INDEX IF NOT EXISTS idx_ticket_histories_ticket_id ON ticket_histories(ticket_id);",
 		"CREATE INDEX IF NOT EXISTS idx_ticket_histories_user_id ON ticket_histories(user_id);",
 		"CREATE INDEX IF NOT EXISTS idx_ticket_histories_action ON ticket_histories(action);",
 		"CREATE INDEX IF NOT EXISTS idx_ticket_histories_created_at ON ticket_histories(created_at);",
+		"CREATE INDEX IF NOT EXISTS idx_ticket_histories_scope_ticket_created ON ticket_histories(organization_id, project_id, ticket_id, created_at, id);",
+		"CREATE INDEX IF NOT EXISTS idx_ticket_attachments_scope_ticket_created ON ticket_attachments(organization_id, project_id, ticket_id, created_at, id);",
+		"CREATE INDEX IF NOT EXISTS idx_notifications_scope_recipient_created ON notifications(organization_id, project_id, recipient_id, created_at, id);",
 
 		// Agent-native identity, policy, event and lease indexes
 		"CREATE INDEX IF NOT EXISTS idx_service_principals_controls ON service_principals(status, emergency_disabled, expires_at);",

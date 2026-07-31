@@ -150,17 +150,22 @@ func TestGetTicketHistoryFiltersEveryQueryByProjectScope(t *testing.T) {
 	if err := db.Where("ticket_number = ?", "T-001").First(&ticket).Error; err != nil {
 		t.Fatalf("load scoped ticket: %v", err)
 	}
-	local := models.TicketHistory{
-		TicketID:    ticket.ID,
-		ActorType:   models.ActorTypeHuman,
-		ActorID:     "1",
-		Action:      models.HistoryActionUpdate,
-		Description: "local project history",
-		IsVisible:   true,
-		Provenance:  models.TicketHistoryProvenancePreEvent,
+	createdAt := time.Now().UTC().Truncate(time.Second)
+	locals := make([]models.TicketHistory, 150)
+	for index := range locals {
+		locals[index] = models.TicketHistory{
+			CreatedAt:   createdAt,
+			TicketID:    ticket.ID,
+			ActorType:   models.ActorTypeHuman,
+			ActorID:     "1",
+			Action:      models.HistoryActionUpdate,
+			Description: fmt.Sprintf("local project history %03d", index),
+			IsVisible:   true,
+			Provenance:  models.TicketHistoryProvenancePreEvent,
+		}
 	}
-	if err := db.Create(&local).Error; err != nil {
-		t.Fatalf("seed local history: %v", err)
+	if err := db.Create(&locals).Error; err != nil {
+		t.Fatalf("seed 150 local histories: %v", err)
 	}
 	foreign := models.TicketHistory{
 		OrganizationID: operation.Scope.OrganizationID + 100,
@@ -177,12 +182,104 @@ func TestGetTicketHistoryFiltersEveryQueryByProjectScope(t *testing.T) {
 		t.Fatalf("seed cross-project history: %v", err)
 	}
 
-	histories, total, err := (&TicketService{db: db}).GetTicketHistory(ctx, ticket.ID)
+	histories, total, err := (&TicketService{db: db}).GetTicketHistory(
+		ctx,
+		ticket.ID,
+		PageRequest{Page: 2, PageSize: 25},
+	)
 	if err != nil {
 		t.Fatalf("GetTicketHistory: %v", err)
 	}
-	if total != 1 || len(histories) != 1 || histories[0].ID != local.ID {
+	if total != 150 || len(histories) != 25 {
 		t.Fatalf("cross-project history leaked: total=%d histories=%+v", total, histories)
+	}
+	for index := range histories {
+		want := locals[149-(25+index)].ID
+		if histories[index].ID != want {
+			t.Fatalf(
+				"unstable history order at %d: id=%d want=%d",
+				index,
+				histories[index].ID,
+				want,
+			)
+		}
+	}
+}
+
+func TestOverdueAndSLABreachListsPageOneHundredFiftyRowsStably(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := testProjectOperationContext(t, db, models.HumanActor(1))
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dueDate := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	createdAt := dueDate.Add(-time.Hour)
+	userID := uint(1)
+	tickets := make([]models.Ticket, 150)
+	for index := range tickets {
+		tickets[index] = models.Ticket{
+			CreatedAt:      createdAt,
+			OrganizationID: operation.Scope.OrganizationID,
+			ProjectID:      operation.Scope.ProjectID,
+			TicketNumber:   fmt.Sprintf("PAGE-%03d", index),
+			Title:          "pagination",
+			Description:    "pagination",
+			Priority:       models.TicketPriorityNormal,
+			Status:         models.TicketStatusOpen,
+			Type:           models.TicketTypeRequest,
+			Source:         models.TicketSourceWeb,
+			CreatedByID:    &userID,
+			DueDate:        &dueDate,
+			SLABreached:    true,
+			SLADueDate:     &dueDate,
+			Version:        1,
+		}
+	}
+	if err := db.Create(&tickets).Error; err != nil {
+		t.Fatalf("seed 150 paginated tickets: %v", err)
+	}
+	service := &TicketService{db: db}
+	page := PageRequest{Page: 2, PageSize: 25}
+	overdue, overdueTotal, err := service.GetOverdueTickets(
+		ctx,
+		1,
+		string(models.ProjectRoleAdmin),
+		page,
+	)
+	if err != nil {
+		t.Fatalf("GetOverdueTickets: %v", err)
+	}
+	breached, breachedTotal, err := service.GetSLABreachedTickets(
+		ctx,
+		1,
+		string(models.ProjectRoleAdmin),
+		page,
+	)
+	if err != nil {
+		t.Fatalf("GetSLABreachedTickets: %v", err)
+	}
+	if overdueTotal != 150 || breachedTotal != 150 ||
+		len(overdue) != 25 || len(breached) != 25 {
+		t.Fatalf(
+			"unexpected bounded pages: overdue=%d/%d breached=%d/%d",
+			len(overdue),
+			overdueTotal,
+			len(breached),
+			breachedTotal,
+		)
+	}
+	for index := range overdue {
+		wantID := tickets[index+25].ID
+		if overdue[index].ID != wantID || breached[index].ID != wantID {
+			t.Fatalf(
+				"unstable special-list order at %d: overdue=%d breached=%d want=%d",
+				index,
+				overdue[index].ID,
+				breached[index].ID,
+				wantID,
+			)
+		}
 	}
 }
 

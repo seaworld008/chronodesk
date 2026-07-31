@@ -557,7 +557,7 @@ export const dataProvider: DataProvider = {
             const route = resource === 'comments'
                 ? humanApiRoutes.listProjectTicketComments(pathParameters)
                 : humanApiRoutes.listProjectTicketHistory(pathParameters)
-            const url = joinApiUrl(apiUrl, route)
+            const url = `${joinApiUrl(apiUrl, route)}?${queryString.stringify(query)}`
             const { json, headers } = await httpClient(url)
             return parseListResponse(resource, json, headers)
         }

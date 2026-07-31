@@ -1318,6 +1318,7 @@ func TestP1HumanWebOperationsAreTypedAndMachineAddressable(t *testing.T) {
 		{"/projects/{projectKey}/tickets/{ticketID}/history", "get"},
 		{"/projects/{projectKey}/tickets/{ticketID}/comments", "get"},
 		{"/projects/{projectKey}/tickets/{ticketID}/comments", "post"},
+		{"/projects/{projectKey}/tickets/{ticketID}/comments/{commentID}/replies", "get"},
 		{"/projects/{projectKey}/tickets/{ticketID}/attachments", "get"},
 		{"/projects/{projectKey}/tickets/{ticketID}/attachments", "post"},
 		{

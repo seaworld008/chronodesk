@@ -820,6 +820,10 @@ const p1Operations = [
     ['/projects/{projectKey}/tickets/{ticketID}/history', 'get'],
     ['/projects/{projectKey}/tickets/{ticketID}/comments', 'get'],
     ['/projects/{projectKey}/tickets/{ticketID}/comments', 'post'],
+    [
+        '/projects/{projectKey}/tickets/{ticketID}/comments/{commentID}/replies',
+        'get',
+    ],
     ['/projects/{projectKey}/tickets/{ticketID}/attachments', 'get'],
     ['/projects/{projectKey}/tickets/{ticketID}/attachments', 'post'],
     [
@@ -1035,6 +1039,7 @@ for (const routeHelper of [
 }
 for (const routeHelper of [
     'listProjectTicketComments',
+    'listProjectTicketCommentReplies',
     'createProjectTicketComment',
     'listProjectTicketAttachments',
     'uploadProjectTicketAttachment',
@@ -1048,6 +1053,10 @@ for (const routeHelper of [
 assert.doesNotMatch(ticketConversation, /type TicketComment\s*=/)
 assert.doesNotMatch(ticketConversation, /type TicketAttachment\s*=/)
 assert.doesNotMatch(ticketConversation, /projectResourcePath/)
+assert.match(ticketConversation, /<Pagination/)
+assert.match(ticketConversation, /aria-label="评论分页"/)
+assert.match(ticketConversation, /aria-label="附件分页"/)
+assert.match(dataProvider, /queryString\.stringify\(query\)/)
 for (const routeHelper of [
     'assignProjectTicket',
     'transferProjectTicket',

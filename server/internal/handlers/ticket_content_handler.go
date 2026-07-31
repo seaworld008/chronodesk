@@ -42,6 +42,7 @@ type customerCommentResponse struct {
 	ContentType string             `json:"content_type"`
 	Type        models.CommentType `json:"type"`
 	ParentID    *uint              `json:"parent_id,omitempty"`
+	ReplyCount  int                `json:"reply_count"`
 	IsEdited    bool               `json:"is_edited"`
 	EditedAt    *time.Time         `json:"edited_at,omitempty"`
 }
@@ -128,6 +129,7 @@ func NewTicketContentHandler(
 
 func (h *TicketContentHandler) RegisterRoutes(tickets *gin.RouterGroup) {
 	tickets.GET("/:id/comments", h.ListComments)
+	tickets.GET("/:id/comments/:comment_id/replies", h.ListCommentReplies)
 	tickets.POST("/:id/comments", h.CreateComment)
 	tickets.GET("/:id/attachments", h.ListAttachments)
 }
@@ -146,13 +148,118 @@ func (h *TicketContentHandler) ListComments(c *gin.Context) {
 	if !ok {
 		return
 	}
+	page, pageSize, ok := parseStrictPagePagination(c, 25, 100)
+	if !ok {
+		return
+	}
 	customer := isRequesterRole(normalizedProjectRole(c))
 	query := h.db.WithContext(c.Request.Context()).
+		Model(&models.TicketComment{}).
 		Where(
-			"ticket_id = ? AND organization_id = ? AND project_id = ? AND is_deleted = ?",
+			"ticket_comments.ticket_id = ? AND ticket_comments.organization_id = ? AND ticket_comments.project_id = ? AND ticket_comments.is_deleted = ? AND ticket_comments.parent_id IS NULL",
 			ticket.ID,
 			ticket.OrganizationID,
 			ticket.ProjectID,
+			false,
+		)
+	if customer {
+		query = query.Where("ticket_comments.type = ?", models.CommentTypePublic)
+	} else {
+		query = query.Preload("User").Preload("ServicePrincipal")
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		h.writeError(c, err)
+		return
+	}
+	replyVisibility := ""
+	replyArguments := []any{
+		ticket.ID,
+		ticket.OrganizationID,
+		ticket.ProjectID,
+		false,
+	}
+	if customer {
+		replyVisibility = " AND replies.type = ?"
+		replyArguments = append(replyArguments, models.CommentTypePublic)
+	}
+	replyCountSQL := `(SELECT COUNT(*) FROM ticket_comments AS replies
+		WHERE replies.parent_id = ticket_comments.id
+		  AND replies.ticket_id = ?
+		  AND replies.organization_id = ?
+		  AND replies.project_id = ?
+		  AND replies.is_deleted = ?` + replyVisibility + `) AS reply_count`
+	var comments []models.TicketComment
+	if err := query.
+		Select("ticket_comments.*, "+replyCountSQL, replyArguments...).
+		Order("ticket_comments.created_at ASC, ticket_comments.id ASC").
+		Offset((page - 1) * pageSize).
+		Limit(pageSize).
+		Find(&comments).Error; err != nil {
+		h.writeError(c, err)
+		return
+	}
+	if customer {
+		writePageEnvelope(c, customerCommentResponses(comments), total, page, pageSize)
+		return
+	}
+	result := make([]*models.TicketCommentResponse, 0, len(comments))
+	for i := range comments {
+		result = append(result, comments[i].ToResponse())
+	}
+	writePageEnvelope(c, result, total, page, pageSize)
+}
+
+func (h *TicketContentHandler) ListCommentReplies(c *gin.Context) {
+	ticket, ok := h.authorizedTicket(c, ticketAccessRead)
+	if !ok {
+		return
+	}
+	commentID, err := strconv.ParseUint(c.Param("comment_id"), 10, 32)
+	if err != nil || commentID == 0 {
+		writeHumanCommentRequestError(c, "invalid_request", "父评论 ID 无效")
+		return
+	}
+	page, pageSize, ok := parseStrictPagePagination(c, 25, 100)
+	if !ok {
+		return
+	}
+	customer := isRequesterRole(normalizedProjectRole(c))
+	parentQuery := h.db.WithContext(c.Request.Context()).
+		Model(&models.TicketComment{}).
+		Where(
+			"id = ? AND ticket_id = ? AND organization_id = ? AND project_id = ? AND parent_id IS NULL AND is_deleted = ?",
+			uint(commentID),
+			ticket.ID,
+			ticket.OrganizationID,
+			ticket.ProjectID,
+			false,
+		)
+	if customer {
+		parentQuery = parentQuery.Where("type = ?", models.CommentTypePublic)
+	}
+	var parentCount int64
+	if err := parentQuery.Count(&parentCount).Error; err != nil {
+		h.writeError(c, err)
+		return
+	}
+	if parentCount != 1 {
+		c.JSON(http.StatusNotFound, gin.H{
+			"success": false,
+			"code":    "not_found",
+			"message": "父评论不存在",
+		})
+		return
+	}
+
+	query := h.db.WithContext(c.Request.Context()).
+		Model(&models.TicketComment{}).
+		Where(
+			"ticket_id = ? AND organization_id = ? AND project_id = ? AND parent_id = ? AND is_deleted = ?",
+			ticket.ID,
+			ticket.OrganizationID,
+			ticket.ProjectID,
+			uint(commentID),
 			false,
 		)
 	if customer {
@@ -160,34 +267,29 @@ func (h *TicketContentHandler) ListComments(c *gin.Context) {
 	} else {
 		query = query.Preload("User").Preload("ServicePrincipal")
 	}
-	var comments []models.TicketComment
-	if err := query.Order("created_at ASC, id ASC").Find(&comments).Error; err != nil {
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		h.writeError(c, err)
+		return
+	}
+	var replies []models.TicketComment
+	if err := query.
+		Order("created_at ASC, id ASC").
+		Offset((page - 1) * pageSize).
+		Limit(pageSize).
+		Find(&replies).Error; err != nil {
 		h.writeError(c, err)
 		return
 	}
 	if customer {
-		result := make([]customerCommentResponse, 0, len(comments))
-		for i := range comments {
-			result = append(result, customerCommentResponse{
-				ID:          comments[i].ID,
-				CreatedAt:   comments[i].CreatedAt,
-				TicketID:    comments[i].TicketID,
-				Content:     comments[i].Content,
-				ContentType: comments[i].ContentType,
-				Type:        comments[i].Type,
-				ParentID:    comments[i].ParentID,
-				IsEdited:    comments[i].IsEdited,
-				EditedAt:    comments[i].EditedAt,
-			})
-		}
-		c.JSON(http.StatusOK, gin.H{"success": true, "data": result, "total": len(result)})
+		writePageEnvelope(c, customerCommentResponses(replies), total, page, pageSize)
 		return
 	}
-	result := make([]*models.TicketCommentResponse, 0, len(comments))
-	for i := range comments {
-		result = append(result, comments[i].ToResponse())
+	result := make([]*models.TicketCommentResponse, 0, len(replies))
+	for i := range replies {
+		result = append(result, replies[i].ToResponse())
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": result, "total": len(result)})
+	writePageEnvelope(c, result, total, page, pageSize)
 }
 
 func (h *TicketContentHandler) CreateComment(c *gin.Context) {
@@ -365,7 +467,12 @@ func (h *TicketContentHandler) ListAttachments(c *gin.Context) {
 	if !ok {
 		return
 	}
+	page, pageSize, ok := parseStrictPagePagination(c, 25, 100)
+	if !ok {
+		return
+	}
 	query := h.db.WithContext(c.Request.Context()).
+		Model(&models.TicketAttachment{}).
 		Where(
 			"ticket_id = ? AND organization_id = ? AND project_id = ?",
 			ticket.ID,
@@ -375,8 +482,17 @@ func (h *TicketContentHandler) ListAttachments(c *gin.Context) {
 	if isRequesterRole(normalizedProjectRole(c)) {
 		query = query.Where("is_public = ?", true)
 	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		h.writeError(c, err)
+		return
+	}
 	var attachments []models.TicketAttachment
-	if err := query.Order("created_at DESC, id DESC").Find(&attachments).Error; err != nil {
+	if err := query.
+		Order("created_at DESC, id DESC").
+		Offset((page - 1) * pageSize).
+		Limit(pageSize).
+		Find(&attachments).Error; err != nil {
 		h.writeError(c, err)
 		return
 	}
@@ -385,14 +501,79 @@ func (h *TicketContentHandler) ListAttachments(c *gin.Context) {
 		for i := range attachments {
 			result = append(result, customerAttachmentFromModel(&attachments[i]))
 		}
-		c.JSON(http.StatusOK, gin.H{"success": true, "data": result, "total": len(result)})
+		writePageEnvelope(c, result, total, page, pageSize)
 		return
 	}
 	result := make([]*models.TicketAttachmentResponse, 0, len(attachments))
 	for i := range attachments {
 		result = append(result, attachments[i].ToResponse())
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": result, "total": len(result)})
+	writePageEnvelope(c, result, total, page, pageSize)
+}
+
+func customerCommentResponses(comments []models.TicketComment) []customerCommentResponse {
+	result := make([]customerCommentResponse, 0, len(comments))
+	for i := range comments {
+		result = append(result, customerCommentResponse{
+			ID:          comments[i].ID,
+			CreatedAt:   comments[i].CreatedAt,
+			TicketID:    comments[i].TicketID,
+			Content:     comments[i].Content,
+			ContentType: comments[i].ContentType,
+			Type:        comments[i].Type,
+			ParentID:    comments[i].ParentID,
+			ReplyCount:  comments[i].ReplyCount,
+			IsEdited:    comments[i].IsEdited,
+			EditedAt:    comments[i].EditedAt,
+		})
+	}
+	return result
+}
+
+func parseStrictPagePagination(
+	c *gin.Context,
+	defaultPageSize int,
+	maxPageSize int,
+) (int, int, bool) {
+	page := 1
+	pageSize := defaultPageSize
+	for name, destination := range map[string]*int{
+		"page":      &page,
+		"page_size": &pageSize,
+	} {
+		raw := strings.TrimSpace(c.Query(name))
+		if raw == "" {
+			continue
+		}
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 ||
+			(name == "page" && value > 1_000_000) ||
+			(name == "page_size" && value > maxPageSize) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"code":    "invalid_pagination",
+				"message": "分页参数无效，page 必须为正整数，page_size 必须在 1 到 100 之间",
+			})
+			return 0, 0, false
+		}
+		*destination = value
+	}
+	return page, pageSize, true
+}
+
+func writePageEnvelope(c *gin.Context, data any, total int64, page, pageSize int) {
+	totalPages := int64(0)
+	if total > 0 {
+		totalPages = (total + int64(pageSize) - 1) / int64(pageSize)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success":     true,
+		"data":        data,
+		"total":       total,
+		"page":        page,
+		"page_size":   pageSize,
+		"total_pages": totalPages,
+	})
 }
 
 func (h *TicketContentHandler) StoreAttachment(c *gin.Context) {

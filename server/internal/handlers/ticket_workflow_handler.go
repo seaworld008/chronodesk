@@ -460,11 +460,16 @@ func (h *TicketWorkflowHandler) GetUnassignedTickets(c *gin.Context) {
 func (h *TicketWorkflowHandler) GetOverdueTickets(c *gin.Context) {
 	userID := c.GetUint("user_id")
 	role := normalizedProjectRole(c)
+	page, pageSize, ok := parseStrictPagePagination(c, 25, 100)
+	if !ok {
+		return
+	}
 
 	tickets, total, err := h.ticketService.GetOverdueTickets(
 		c.Request.Context(),
 		userID,
 		role,
+		services.PageRequest{Page: page, PageSize: pageSize},
 	)
 	if err != nil {
 		logHandlerFailure(c, "ticket_workflow.get_overdue_tickets", err)
@@ -476,21 +481,22 @@ func (h *TicketWorkflowHandler) GetOverdueTickets(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    ticketListResponseForRole(tickets, role),
-		"total":   total,
-	})
+	writePageEnvelope(c, ticketListResponseForRole(tickets, role), total, page, pageSize)
 }
 
 func (h *TicketWorkflowHandler) GetSLABreachedTickets(c *gin.Context) {
 	userID := c.GetUint("user_id")
 	role := normalizedProjectRole(c)
+	page, pageSize, ok := parseStrictPagePagination(c, 25, 100)
+	if !ok {
+		return
+	}
 
 	tickets, total, err := h.ticketService.GetSLABreachedTickets(
 		c.Request.Context(),
 		userID,
 		role,
+		services.PageRequest{Page: page, PageSize: pageSize},
 	)
 	if err != nil {
 		logHandlerFailure(c, "ticket_workflow.get_sla_breached_tickets", err)
@@ -502,11 +508,7 @@ func (h *TicketWorkflowHandler) GetSLABreachedTickets(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    ticketListResponseForRole(tickets, role),
-		"total":   total,
-	})
+	writePageEnvelope(c, ticketListResponseForRole(tickets, role), total, page, pageSize)
 }
 
 func (h *TicketWorkflowHandler) GetTicketHistory(c *gin.Context) {
@@ -524,10 +526,19 @@ func (h *TicketWorkflowHandler) GetTicketHistory(c *gin.Context) {
 		}
 		return
 	}
+	page, pageSize, ok := parseStrictPagePagination(c, 25, 100)
+	if !ok {
+		return
+	}
 
-	history, _, err := h.ticketService.GetTicketHistory(
+	history, total, err := h.ticketService.GetTicketHistory(
 		c.Request.Context(),
 		uint(ticketID),
+		services.PageRequest{
+			Page:            page,
+			PageSize:        pageSize,
+			CustomerVisible: isRequesterRole(normalizedProjectRole(c)),
+		},
 	)
 	if err != nil {
 		logHandlerFailure(c, "ticket_workflow.get_history", err)
@@ -541,9 +552,5 @@ func (h *TicketWorkflowHandler) GetTicketHistory(c *gin.Context) {
 	customer := isRequesterRole(normalizedProjectRole(c))
 	responses := ticketHistoryResponses(history, customer)
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    responses,
-		"total":   len(responses),
-	})
+	writePageEnvelope(c, responses, total, page, pageSize)
 }

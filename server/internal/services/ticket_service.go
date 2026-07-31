@@ -39,10 +39,10 @@ type TicketServiceInterface interface {
 	GetTicketStatistics(ctx context.Context, userID uint, role string) (*TicketStatisticsResponse, error)
 	GetUserTickets(ctx context.Context, userID uint, status string, priority string, limit int) ([]*models.Ticket, int64, error)
 	GetUnassignedTickets(ctx context.Context, priority string, categoryID string, limit int) ([]*models.Ticket, int64, error)
-	GetOverdueTickets(ctx context.Context, userID uint, role string) ([]*models.Ticket, int64, error)
-	GetSLABreachedTickets(ctx context.Context, userID uint, role string) ([]*models.Ticket, int64, error)
+	GetOverdueTickets(ctx context.Context, userID uint, role string, pagination ...PageRequest) ([]*models.Ticket, int64, error)
+	GetSLABreachedTickets(ctx context.Context, userID uint, role string, pagination ...PageRequest) ([]*models.Ticket, int64, error)
 	BulkUpdateTickets(ctx context.Context, req *BulkUpdateRequest, userID uint) (*BulkUpdateResult, error)
-	GetTicketHistory(ctx context.Context, ticketID uint) ([]*models.TicketHistory, int64, error)
+	GetTicketHistory(ctx context.Context, ticketID uint, pagination ...PageRequest) ([]*models.TicketHistory, int64, error)
 }
 
 // TicketService implements TicketServiceInterface
@@ -120,6 +120,26 @@ type TicketFilters struct {
 	Limit       int
 	SortBy      string
 	SortOrder   string
+}
+
+type PageRequest struct {
+	Page            int
+	PageSize        int
+	CustomerVisible bool
+}
+
+func normalizedPageRequest(pagination []PageRequest) PageRequest {
+	result := PageRequest{Page: 1, PageSize: 25}
+	if len(pagination) > 0 {
+		result.CustomerVisible = pagination[0].CustomerVisible
+		if pagination[0].Page > 0 {
+			result.Page = pagination[0].Page
+		}
+		if pagination[0].PageSize > 0 && pagination[0].PageSize <= 100 {
+			result.PageSize = pagination[0].PageSize
+		}
+	}
+	return result
 }
 
 // TicketStatisticsResponse represents enhanced ticket statistics for dashboard
@@ -1163,6 +1183,7 @@ func (s *TicketService) GetOverdueTickets(
 	ctx context.Context,
 	userID uint,
 	role string,
+	pagination ...PageRequest,
 ) ([]*models.Ticket, int64, error) {
 	var tickets []*models.Ticket
 	var total int64
@@ -1183,8 +1204,11 @@ func (s *TicketService) GetOverdueTickets(
 		return nil, 0, fmt.Errorf("failed to count overdue tickets: %w", err)
 	}
 
+	page := normalizedPageRequest(pagination)
 	query = query.Preload("CreatedBy").Preload("AssignedTo").Preload("Category").
-		Order("due_date ASC")
+		Order("due_date ASC, tickets.id ASC").
+		Offset((page.Page - 1) * page.PageSize).
+		Limit(page.PageSize)
 
 	if err := query.Find(&tickets).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to get overdue tickets: %w", err)
@@ -1198,6 +1222,7 @@ func (s *TicketService) GetSLABreachedTickets(
 	ctx context.Context,
 	userID uint,
 	role string,
+	pagination ...PageRequest,
 ) ([]*models.Ticket, int64, error) {
 	var tickets []*models.Ticket
 	var total int64
@@ -1217,8 +1242,11 @@ func (s *TicketService) GetSLABreachedTickets(
 		return nil, 0, fmt.Errorf("failed to count SLA breached tickets: %w", err)
 	}
 
+	page := normalizedPageRequest(pagination)
 	query = query.Preload("CreatedBy").Preload("AssignedTo").Preload("Category").
-		Order("tickets.created_at ASC")
+		Order("tickets.created_at ASC, tickets.id ASC").
+		Offset((page.Page - 1) * page.PageSize).
+		Limit(page.PageSize)
 
 	if err := query.Find(&tickets).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to get SLA breached tickets: %w", err)
@@ -1248,6 +1276,7 @@ func scopeHumanTicketQuery(query *gorm.DB, userID uint, role string) *gorm.DB {
 func (s *TicketService) GetTicketHistory(
 	ctx context.Context,
 	ticketID uint,
+	pagination ...PageRequest,
 ) ([]*models.TicketHistory, int64, error) {
 	var histories []*models.TicketHistory
 	var total int64
@@ -1272,12 +1301,39 @@ func (s *TicketService) GetTicketHistory(
 			scope.OrganizationID,
 			scope.ProjectID,
 		)
+	page := normalizedPageRequest(pagination)
+	if page.CustomerVisible {
+		query = query.
+			Where("is_visible = ?", true).
+			Where(
+				"action NOT IN ?",
+				[]models.HistoryAction{
+					models.HistoryActionAssign,
+					models.HistoryActionUnassign,
+					models.HistoryActionTransfer,
+					models.HistoryActionEscalate,
+				},
+			).
+			Where(
+				"LOWER(TRIM(field_name)) NOT IN ?",
+				[]string{
+					"assigned_to_id",
+					"assigned_to_actor_type",
+					"assigned_to_actor_id",
+					"assigned_to_service_principal_id",
+					"internal_notes",
+				},
+			)
+	}
 
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to count ticket history: %w", err)
 	}
 
-	query = query.Preload("User").Order("created_at DESC")
+	query = query.Preload("User").
+		Order("created_at DESC, id DESC").
+		Offset((page.Page - 1) * page.PageSize).
+		Limit(page.PageSize)
 
 	if err := query.Find(&histories).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to get ticket history: %w", err)

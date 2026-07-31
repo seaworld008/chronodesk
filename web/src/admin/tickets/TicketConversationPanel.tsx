@@ -14,6 +14,8 @@ import {
     ListItem,
     ListItemText,
     MenuItem,
+    Pagination,
+    Paper,
     Select,
     Stack,
     TextField,
@@ -83,6 +85,26 @@ const listPayload = <T,>(payload: unknown): T[] => {
     return []
 }
 
+const pagePayload = <T,>(payload: unknown) => {
+    const items = listPayload<T>(payload)
+    if (!payload || typeof payload !== 'object') {
+        return { items, total: items.length, totalPages: items.length > 0 ? 1 : 0 }
+    }
+    const total = 'total' in payload && typeof payload.total === 'number'
+        ? payload.total
+        : items.length
+    const totalPages = 'total_pages' in payload && typeof payload.total_pages === 'number'
+        ? payload.total_pages
+        : total > 0 ? 1 : 0
+    return { items, total, totalPages }
+}
+
+const pagedURL = (path: string, page: number, pageSize = 25) =>
+    `${joinApiUrl(apiBase, path)}?${new URLSearchParams({
+        page: String(page),
+        page_size: String(pageSize),
+    })}`
+
 const operationResourceVersion = (
     response: Response,
     payload: unknown,
@@ -137,6 +159,15 @@ const scanLabel = {
     error: '扫描失败',
 }
 
+type ReplyPageState = {
+    items: TicketComment[]
+    page: number
+    total: number
+    totalPages: number
+    loading: boolean
+    error: string
+}
+
 export const TicketConversationPanel = () => {
     const ticket = useRecordContext<Ticket>()
     const notify = useNotify()
@@ -144,6 +175,13 @@ export const TicketConversationPanel = () => {
     const { identity } = useGetIdentity()
     const [comments, setComments] = useState<TicketComment[]>([])
     const [attachments, setAttachments] = useState<TicketAttachment[]>([])
+    const [commentsPage, setCommentsPage] = useState(1)
+    const [commentsTotal, setCommentsTotal] = useState(0)
+    const [commentsTotalPages, setCommentsTotalPages] = useState(0)
+    const [attachmentsPage, setAttachmentsPage] = useState(1)
+    const [attachmentsTotal, setAttachmentsTotal] = useState(0)
+    const [attachmentsTotalPages, setAttachmentsTotalPages] = useState(0)
+    const [replyPages, setReplyPages] = useState<Record<number, ReplyPageState>>({})
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState('')
     const [comment, setComment] = useState('')
@@ -169,16 +207,16 @@ export const TicketConversationPanel = () => {
             }
             const [commentsResponse, attachmentsResponse] = await Promise.all([
                 sessionAwareFetch(
-                    joinApiUrl(
-                        apiBase,
+                    pagedURL(
                         humanApiRoutes.listProjectTicketComments(pathParameters),
+                        commentsPage,
                     ),
                     { headers: authHeaders() },
                 ),
                 sessionAwareFetch(
-                    joinApiUrl(
-                        apiBase,
+                    pagedURL(
                         humanApiRoutes.listProjectTicketAttachments(pathParameters),
+                        attachmentsPage,
                     ),
                     { headers: authHeaders() },
                 ),
@@ -197,18 +235,82 @@ export const TicketConversationPanel = () => {
                 commentsResponse.json(),
                 attachmentsResponse.json(),
             ])
-            setComments(listPayload<TicketComment>(commentsPayload))
-            setAttachments(listPayload<TicketAttachment>(attachmentsPayload))
+            const commentPage = pagePayload<TicketComment>(commentsPayload)
+            const attachmentPage = pagePayload<TicketAttachment>(attachmentsPayload)
+            setComments(commentPage.items)
+            setCommentsTotal(commentPage.total)
+            setCommentsTotalPages(commentPage.totalPages)
+            setAttachments(attachmentPage.items)
+            setAttachmentsTotal(attachmentPage.total)
+            setAttachmentsTotalPages(attachmentPage.totalPages)
         } catch (loadError) {
             setError(localizedUnknownErrorMessage(loadError, '加载工单会话失败'))
         } finally {
             setLoading(false)
         }
-    }, [ticket?.id])
+    }, [attachmentsPage, commentsPage, ticket?.id])
 
     useEffect(() => {
         void loadConversation()
     }, [loadConversation])
+
+    useEffect(() => {
+        setCommentsPage(1)
+        setAttachmentsPage(1)
+        setReplyPages({})
+    }, [ticket?.id])
+
+    const loadReplies = useCallback(async (commentID: number, page: number) => {
+        if (!ticket?.id) return
+        setReplyPages((current) => ({
+            ...current,
+            [commentID]: {
+                items: current[commentID]?.items ?? [],
+                page,
+                total: current[commentID]?.total ?? 0,
+                totalPages: current[commentID]?.totalPages ?? 0,
+                loading: true,
+                error: '',
+            },
+        }))
+        try {
+            const path = humanApiRoutes.listProjectTicketCommentReplies({
+                projectKey: await resolveActiveProjectKey(),
+                ticketID: Number(ticket.id),
+                commentID,
+            })
+            const response = await sessionAwareFetch(pagedURL(path, page), {
+                headers: authHeaders(),
+            })
+            if (!response.ok) {
+                throw new Error(await responseMessage(response, '加载回复失败'))
+            }
+            const payload = pagePayload<TicketComment>(await response.json())
+            setReplyPages((current) => ({
+                ...current,
+                [commentID]: {
+                    items: payload.items,
+                    page,
+                    total: payload.total,
+                    totalPages: payload.totalPages,
+                    loading: false,
+                    error: '',
+                },
+            }))
+        } catch (replyError) {
+            setReplyPages((current) => ({
+                ...current,
+                [commentID]: {
+                    items: current[commentID]?.items ?? [],
+                    page,
+                    total: current[commentID]?.total ?? 0,
+                    totalPages: current[commentID]?.totalPages ?? 0,
+                    loading: false,
+                    error: localizedUnknownErrorMessage(replyError, '加载回复失败'),
+                },
+            }))
+        }
+    }, [ticket?.id])
 
     if (!ticket) {
         return null
@@ -267,7 +369,11 @@ export const TicketConversationPanel = () => {
             }
             setComment('')
             notify('评论已添加', { type: 'success' })
-            await loadConversation()
+            if (commentsPage === 1) {
+                await loadConversation()
+            } else {
+                setCommentsPage(1)
+            }
         } catch (submitError) {
             notify(
                 localizedUnknownErrorMessage(submitError, '添加评论失败'),
@@ -314,7 +420,11 @@ export const TicketConversationPanel = () => {
             }
             setFile(undefined)
             notify('附件已上传，等待安全扫描', { type: 'success' })
-            await loadConversation()
+            if (attachmentsPage === 1) {
+                await loadConversation()
+            } else {
+                setAttachmentsPage(1)
+            }
         } catch (uploadError) {
             notify(
                 localizedUnknownErrorMessage(uploadError, '上传附件失败'),
@@ -416,7 +526,18 @@ export const TicketConversationPanel = () => {
                 <Alert severity="info">当前工单为只读，不能添加评论或上传附件。</Alert>
             )}
 
-            {error && <Alert severity="error">{error}</Alert>}
+            {error && (
+                <Alert
+                    severity="error"
+                    action={
+                        <Button color="inherit" size="small" onClick={() => void loadConversation()}>
+                            重试
+                        </Button>
+                    }
+                >
+                    {error}
+                </Alert>
+            )}
             {loading ? (
                 <Box sx={{ display: 'flex', justifyContent: 'center', py: 3 }}>
                     <CircularProgress size={28} />
@@ -424,7 +545,7 @@ export const TicketConversationPanel = () => {
             ) : (
                 <Card variant="outlined" role="region" aria-label="工单评论记录">
                     <CardContent>
-                        <Typography variant="h6">评论记录</Typography>
+                        <Typography variant="h6">评论记录（{commentsTotal}）</Typography>
                         {visibleComments.length === 0 ? (
                             <Typography color="text.secondary" sx={{ mt: 2 }}>
                                 暂无评论
@@ -476,13 +597,104 @@ export const TicketConversationPanel = () => {
                                                             {item.content}
                                                         </Box>
                                                         {new Date(item.created_at).toLocaleString('zh-CN')}
+                                                        {item.reply_count > 0 && (
+                                                            <Box component="span" sx={{ display: 'block', mt: 1 }}>
+                                                                <Button
+                                                                    size="small"
+                                                                    onClick={() => {
+                                                                        if (replyPages[item.id]) {
+                                                                            setReplyPages((current) => {
+                                                                                const next = { ...current }
+                                                                                delete next[item.id]
+                                                                                return next
+                                                                            })
+                                                                        } else {
+                                                                            void loadReplies(item.id, 1)
+                                                                        }
+                                                                    }}
+                                                                >
+                                                                    {replyPages[item.id]
+                                                                        ? '收起回复'
+                                                                        : `查看 ${item.reply_count} 条回复`}
+                                                                </Button>
+                                                            </Box>
+                                                        )}
                                                     </>
                                                 }
                                             />
                                         </ListItem>
+                                        {replyPages[item.id] && (
+                                            <Box sx={{ pl: { xs: 2, sm: 6 }, pb: 2 }}>
+                                                {replyPages[item.id].error ? (
+                                                    <Alert
+                                                        severity="error"
+                                                        action={
+                                                            <Button
+                                                                color="inherit"
+                                                                size="small"
+                                                                onClick={() =>
+                                                                    void loadReplies(
+                                                                        item.id,
+                                                                        replyPages[item.id].page,
+                                                                    )
+                                                                }
+                                                            >
+                                                                重试
+                                                            </Button>
+                                                        }
+                                                    >
+                                                        {replyPages[item.id].error}
+                                                    </Alert>
+                                                ) : replyPages[item.id].loading ? (
+                                                    <CircularProgress size={20} aria-label="正在加载回复" />
+                                                ) : replyPages[item.id].items.length === 0 ? (
+                                                    <Typography color="text.secondary">暂无回复</Typography>
+                                                ) : (
+                                                    <Stack spacing={1}>
+                                                        {replyPages[item.id].items.map((reply) => (
+                                                            <Paper
+                                                                key={reply.id}
+                                                                variant="outlined"
+                                                                sx={{ p: 1.5 }}
+                                                            >
+                                                                <Typography sx={{ fontWeight: 600 }}>
+                                                                    {actorName(reply)}
+                                                                </Typography>
+                                                                <Typography sx={{ whiteSpace: 'pre-wrap' }}>
+                                                                    {reply.content}
+                                                                </Typography>
+                                                                <Typography variant="caption" color="text.secondary">
+                                                                    {new Date(reply.created_at).toLocaleString('zh-CN')}
+                                                                </Typography>
+                                                            </Paper>
+                                                        ))}
+                                                        {replyPages[item.id].totalPages > 1 && (
+                                                            <Pagination
+                                                                page={replyPages[item.id].page}
+                                                                count={replyPages[item.id].totalPages}
+                                                                onChange={(_event, nextPage) =>
+                                                                    void loadReplies(item.id, nextPage)
+                                                                }
+                                                                size="small"
+                                                                aria-label={`评论 ${item.id} 的回复分页`}
+                                                            />
+                                                        )}
+                                                    </Stack>
+                                                )}
+                                            </Box>
+                                        )}
                                     </Box>
                                 ))}
                             </List>
+                        )}
+                        {commentsTotalPages > 1 && (
+                            <Pagination
+                                page={commentsPage}
+                                count={commentsTotalPages}
+                                onChange={(_event, page) => setCommentsPage(page)}
+                                sx={{ mt: 2 }}
+                                aria-label="评论分页"
+                            />
                         )}
                     </CardContent>
                 </Card>
@@ -491,7 +703,7 @@ export const TicketConversationPanel = () => {
             <Card variant="outlined" role="region" aria-label="工单附件">
                 <CardContent>
                     <Typography variant="h6" gutterBottom>
-                        附件
+                        附件（{attachmentsTotal}）
                     </Typography>
                     <Stack spacing={2}>
                         {canWritePublic && <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
@@ -570,6 +782,14 @@ export const TicketConversationPanel = () => {
                                     </Box>
                                 ))}
                             </List>
+                        )}
+                        {attachmentsTotalPages > 1 && (
+                            <Pagination
+                                page={attachmentsPage}
+                                count={attachmentsTotalPages}
+                                onChange={(_event, page) => setAttachmentsPage(page)}
+                                aria-label="附件分页"
+                            />
                         )}
                     </Stack>
                 </CardContent>

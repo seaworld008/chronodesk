@@ -65,20 +65,9 @@ func (h *NotificationHandler) GetNotifications(c *gin.Context) {
 		return
 	}
 
-	// 分页参数
-	page := 1
-	pageSize := 10
-
-	if pageStr := c.Query("page"); pageStr != "" {
-		if p, err := strconv.Atoi(pageStr); err == nil && p > 0 {
-			page = p
-		}
-	}
-
-	if pageSizeStr := c.Query("page_size"); pageSizeStr != "" {
-		if ps, err := strconv.Atoi(pageSizeStr); err == nil && ps > 0 {
-			pageSize = ps
-		}
+	page, pageSize, ok := parseStrictPagePagination(c, 25, 100)
+	if !ok {
+		return
 	}
 
 	filter.Limit = pageSize

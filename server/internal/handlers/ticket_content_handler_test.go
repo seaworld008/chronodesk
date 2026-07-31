@@ -18,10 +18,209 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/datatypes"
+	"gorm.io/gorm"
 )
 
 func intPtr(value int) *int {
 	return &value
+}
+
+func TestTicketContentPaginationIsBoundedStableAndSeparatesReplies(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.ServicePrincipal{},
+		&models.Ticket{},
+		&models.TicketComment{},
+		&models.TicketAttachment{},
+	); err != nil {
+		t.Fatalf("migrate paginated content schemas: %v", err)
+	}
+	admin := models.User{
+		Username:     "content-pagination-admin",
+		Email:        "content-pagination@example.com",
+		PasswordHash: "hashed",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&admin).Error; err != nil {
+		t.Fatal(err)
+	}
+	ticket := models.Ticket{
+		TicketNumber: "CONTENT-PAGE",
+		Title:        "content pagination",
+		Description:  "content pagination",
+		Type:         models.TicketTypeRequest,
+		Priority:     models.TicketPriorityNormal,
+		Status:       models.TicketStatusOpen,
+		Source:       models.TicketSourceWeb,
+		CreatedByID:  &admin.ID,
+		Version:      1,
+	}
+	if err := db.Create(&ticket).Error; err != nil {
+		t.Fatal(err)
+	}
+	sameCreatedAt := time.Now().UTC().Truncate(time.Second)
+	comments := make([]models.TicketComment, 150)
+	for index := range comments {
+		comments[index] = models.TicketComment{
+			CreatedAt:   sameCreatedAt,
+			TicketID:    ticket.ID,
+			UserID:      &admin.ID,
+			ActorType:   models.ActorTypeHuman,
+			ActorID:     strconv.FormatUint(uint64(admin.ID), 10),
+			Content:     "top-level-" + strconv.Itoa(index+1),
+			ContentType: "text",
+			Type:        models.CommentTypePublic,
+		}
+	}
+	if err := db.Create(&comments).Error; err != nil {
+		t.Fatalf("seed 150 top-level comments: %v", err)
+	}
+	replies := make([]models.TicketComment, 3)
+	for index := range replies {
+		replies[index] = models.TicketComment{
+			CreatedAt:   sameCreatedAt,
+			TicketID:    ticket.ID,
+			UserID:      &admin.ID,
+			ActorType:   models.ActorTypeHuman,
+			ActorID:     strconv.FormatUint(uint64(admin.ID), 10),
+			Content:     "reply-" + strconv.Itoa(index+1),
+			ContentType: "text",
+			Type:        models.CommentTypePublic,
+			ParentID:    &comments[0].ID,
+		}
+	}
+	if err := db.Create(&replies).Error; err != nil {
+		t.Fatalf("seed replies: %v", err)
+	}
+
+	ticketService := newHandlerTicketService(t, db)
+	scope := ensureHandlerTestProject(t, db)
+	foreignComment := models.TicketComment{
+		OrganizationID: scope.OrganizationID + 100,
+		ProjectID:      scope.ProjectID + 100,
+		TicketID:       ticket.ID,
+		UserID:         &admin.ID,
+		ActorType:      models.ActorTypeHuman,
+		ActorID:        strconv.FormatUint(uint64(admin.ID), 10),
+		Content:        "foreign-project-comment",
+		ContentType:    "text",
+		Type:           models.CommentTypePublic,
+	}
+	if err := db.Session(&gorm.Session{SkipHooks: true}).Create(&foreignComment).Error; err != nil {
+		t.Fatalf("seed foreign-project comment: %v", err)
+	}
+	foreignReply := foreignComment
+	foreignReply.ID = 0
+	foreignReply.Content = "foreign-project-reply"
+	foreignReply.ParentID = &comments[0].ID
+	if err := db.Session(&gorm.Session{SkipHooks: true}).Create(&foreignReply).Error; err != nil {
+		t.Fatalf("seed foreign-project reply: %v", err)
+	}
+
+	handler := NewTicketContentHandler(db, ticketService, nil, 0)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", admin.ID)
+		c.Set(projectRoleContextKey, string(models.ProjectRoleAdmin))
+		c.Next()
+	})
+	router.Use(handlerTestProjectMiddleware(t, db))
+	router.GET("/tickets/:id/comments", handler.ListComments)
+	router.GET("/tickets/:id/comments/:comment_id/replies", handler.ListCommentReplies)
+	router.GET("/tickets/:id/attachments", handler.ListAttachments)
+
+	path := "/tickets/" + strconv.FormatUint(uint64(ticket.ID), 10)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(
+		response,
+		httptest.NewRequest(http.MethodGet, path+"/comments?page=2&page_size=25", nil),
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("comments page status=%d body=%s", response.Code, response.Body.String())
+	}
+	var page struct {
+		Data       []models.TicketCommentResponse `json:"data"`
+		Total      int64                          `json:"total"`
+		Page       int                            `json:"page"`
+		PageSize   int                            `json:"page_size"`
+		TotalPages int64                          `json:"total_pages"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Data) != 25 || page.Total != 150 || page.Page != 2 ||
+		page.PageSize != 25 || page.TotalPages != 6 {
+		t.Fatalf("unexpected comments page: %+v", page)
+	}
+	for index := range page.Data {
+		if page.Data[index].ID != comments[index+25].ID ||
+			page.Data[index].ParentID != nil {
+			t.Fatalf("unstable or nested comment at %d: %+v", index, page.Data[index])
+		}
+	}
+
+	firstPageResponse := httptest.NewRecorder()
+	router.ServeHTTP(
+		firstPageResponse,
+		httptest.NewRequest(http.MethodGet, path+"/comments?page=1&page_size=25", nil),
+	)
+	if firstPageResponse.Code != http.StatusOK {
+		t.Fatalf("first comments page status=%d body=%s", firstPageResponse.Code, firstPageResponse.Body.String())
+	}
+	if err := json.Unmarshal(firstPageResponse.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Data[0].ReplyCount != 3 || len(page.Data[0].Replies) != 0 {
+		t.Fatalf("top-level reply projection=%+v", page.Data[0])
+	}
+
+	replyResponse := httptest.NewRecorder()
+	router.ServeHTTP(
+		replyResponse,
+		httptest.NewRequest(
+			http.MethodGet,
+			path+"/comments/"+strconv.FormatUint(uint64(comments[0].ID), 10)+"/replies?page=2&page_size=2",
+			nil,
+		),
+	)
+	if replyResponse.Code != http.StatusOK {
+		t.Fatalf("reply page status=%d body=%s", replyResponse.Code, replyResponse.Body.String())
+	}
+	if err := json.Unmarshal(replyResponse.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Data) != 1 || page.Total != 3 || page.TotalPages != 2 ||
+		page.Data[0].ID != replies[2].ID {
+		t.Fatalf("unexpected reply page: %+v", page)
+	}
+
+	for _, suffix := range []string{
+		"/comments?page=0",
+		"/comments?page=-1",
+		"/comments?page_size=0",
+		"/comments?page_size=-1",
+		"/comments?page_size=101",
+		"/comments?page_size=abc",
+		"/attachments?page_size=101",
+	} {
+		invalidResponse := httptest.NewRecorder()
+		router.ServeHTTP(
+			invalidResponse,
+			httptest.NewRequest(http.MethodGet, path+suffix, nil),
+		)
+		if invalidResponse.Code != http.StatusBadRequest ||
+			!strings.Contains(invalidResponse.Body.String(), `"code":"invalid_pagination"`) {
+			t.Fatalf(
+				"%s status=%d body=%s",
+				suffix,
+				invalidResponse.Code,
+				invalidResponse.Body.String(),
+			)
+		}
+	}
 }
 
 func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {

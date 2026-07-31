@@ -19,6 +19,7 @@ import {
     FunctionField,
     useGetIdentity,
     usePermissions,
+    Pagination as RaPagination,
 } from 'react-admin';
 import {
     Box,
@@ -720,9 +721,10 @@ const TicketShow: React.FC = () => {
                             reference="ticket_history"
                             target="ticket_id"
                             label="历史记录"
-                            perPage={20}
+                            perPage={25}
                             sort={{ field: 'created_at', order: 'DESC' }}
                         >
+                            <>
                             <EnterpriseDatagrid
                                 tableId="tickets.show.history"
                                 columns={ticketHistoryColumns}
@@ -811,6 +813,8 @@ const TicketShow: React.FC = () => {
                                     locales="zh-CN"
                                 />
                             </EnterpriseDatagrid>
+                            <RaPagination rowsPerPageOptions={[25, 50, 100]} />
+                            </>
                         </ReferenceManyField>
                     </Tab>
 
