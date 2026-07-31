@@ -337,6 +337,26 @@ const tableCases = (): EnterpriseTableCase[] => [
         requireActionButton: true,
     },
     {
+        name: '平台项目治理列表',
+        path: () => '/#/platform/projects',
+        tableName: '平台项目治理列表',
+        columnName: '项目',
+        defaultWidth: 360,
+        stickyHeader: '平台操作',
+        // 全新环境只有不可归档的 DEFAULT 项目；专用归档套件另以
+        // 非默认项目验证可操作按钮，这里仍验证 sticky 数据单元格。
+        requireActionButton: false,
+    },
+    {
+        name: '项目成员列表',
+        path: () => '/#/project-memberships',
+        tableName: '项目成员列表',
+        columnName: '用户',
+        defaultWidth: 300,
+        stickyHeader: '操作',
+        requireActionButton: true,
+    },
+    {
         name: '通知列表',
         path: () => '/#/notifications',
         tableName: '通知列表',
@@ -917,14 +937,14 @@ test.describe('企业级列表表格', () => {
         }
     });
 
-    test('UI-004 UI-006 UI-028：全部 13 张现存企业表用真实数据验证实际单行布局，平台用户详情不投影项目工单', async ({
+    test('UI-004 UI-006 UI-028：全部 15 张现存企业表用真实数据验证实际单行布局，平台用户详情不投影项目工单', async ({
         page,
     }) => {
         test.setTimeout(180_000);
         await authenticatePage(page);
 
         const cases = tableCases();
-        expect(cases).toHaveLength(13);
+        expect(cases).toHaveLength(15);
         for (const target of cases) {
             await test.step(target.name, async () => {
                 const table = await openEnterpriseTable(page, target);
@@ -991,7 +1011,7 @@ test.describe('企业级列表表格', () => {
         const stickyCases = tableCases().filter(
             (target) => target.stickyHeader,
         );
-        expect(stickyCases).toHaveLength(8);
+        expect(stickyCases).toHaveLength(10);
         for (const target of stickyCases) {
             await test.step(target.name, async () => {
                 const table = await openEnterpriseTable(page, target);
@@ -1000,7 +1020,7 @@ test.describe('企业级列表表格', () => {
         }
     });
 
-    test('UI-005 UI-026：全部 13 张现存表的键盘列宽可持久化且双击复位也持久化', async ({
+    test('UI-005 UI-026：全部 15 张现存表的键盘列宽可持久化且双击复位也持久化', async ({
         page,
     }) => {
         test.setTimeout(300_000);

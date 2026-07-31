@@ -139,9 +139,15 @@ type Client struct {
 	cancel context.CancelFunc
 
 	authorizationEpoch atomic.Uint64
-	outboundMu         sync.Mutex
-	done               chan struct{}
-	closeOnce          sync.Once
+	closing            atomic.Bool
+	// deliveryMu keeps the final authorization state check and complete socket
+	// write in one section. close publishes revocation, interrupts the socket,
+	// then uses this mutex as a completion barrier. outboundMu deliberately
+	// remains separate so a slow peer does not block unrelated queueing.
+	deliveryMu sync.Mutex
+	outboundMu sync.Mutex
+	done       chan struct{}
+	closeOnce  sync.Once
 }
 
 type outboundMessage struct {
@@ -210,7 +216,10 @@ func (c *Client) close() {
 		return
 	}
 	c.closeOnce.Do(func() {
-		c.outboundMu.Lock()
+		// Publish revocation before touching the connection. A delivery still
+		// outside deliveryMu will fail its final state check, while an in-flight
+		// socket operation is interrupted by Close below.
+		c.closing.Store(true)
 		c.authorizationEpoch.Add(1)
 		if c.cancel != nil {
 			c.cancel()
@@ -218,22 +227,33 @@ func (c *Client) close() {
 		if c.done != nil {
 			close(c.done)
 		}
-		for c.send != nil {
-			select {
-			case <-c.send:
-			default:
-				c.outboundMu.Unlock()
-				if c.conn != nil {
-					_ = c.conn.Close()
-				}
-				return
-			}
-		}
-		c.outboundMu.Unlock()
+
+		// gorilla/websocket permits Close concurrently with the writer. Do not
+		// hold either client mutex here: Close is the interruption mechanism for
+		// a slow NextWriter/Write, not an operation that should wait behind it.
 		if c.conn != nil {
 			_ = c.conn.Close()
 		}
+
+		c.drainOutbound()
+		// Wait for a writer that had already entered its delivery critical
+		// section. Since the socket is now closed, real network I/O is
+		// interrupted instead of consuming writeWait.
+		c.deliveryMu.Lock()
+		c.deliveryMu.Unlock()
 	})
+}
+
+func (c *Client) drainOutbound() {
+	c.outboundMu.Lock()
+	defer c.outboundMu.Unlock()
+	for c.send != nil {
+		select {
+		case <-c.send:
+		default:
+			return
+		}
+	}
 }
 
 func (c *Client) enqueue(payload []byte) bool {
@@ -242,6 +262,9 @@ func (c *Client) enqueue(payload []byte) bool {
 	}
 	c.outboundMu.Lock()
 	defer c.outboundMu.Unlock()
+	if c.closing.Load() {
+		return false
+	}
 	select {
 	case <-c.done:
 		return false
@@ -329,33 +352,67 @@ func (c *Client) writePump() {
 		case <-c.done:
 			return
 		case message := <-c.send:
-			if err := c.hub.authorizeDelivery(
-				c,
-				message.authorizationEpoch,
-			); err != nil {
-				c.hub.evictUserScope(c.scope, c.UserID)
-				return
-			}
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			w, err := c.conn.NextWriter(websocket.TextMessage)
-			if err != nil {
-				return
-			}
-			if _, err := w.Write(message.payload); err != nil {
-				_ = w.Close()
-				return
-			}
-			if err := w.Close(); err != nil {
+			if err := c.writeAuthorizedFrame(message); err != nil {
 				return
 			}
 
 		case <-ticker.C:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			if err := c.writePing(); err != nil {
 				return
 			}
 		}
 	}
+}
+
+func (c *Client) writeAuthorizedFrame(message outboundMessage) error {
+	// Authoritative state can involve database I/O, so keep it outside
+	// deliveryMu. close may then cancel a blocked check instead of waiting for
+	// external I/O while holding the revocation boundary.
+	if err := c.hub.authorizeDelivery(
+		c,
+		message.authorizationEpoch,
+	); err != nil {
+		c.hub.evictUserScope(c.scope, c.UserID)
+		return err
+	}
+
+	c.deliveryMu.Lock()
+	if err := c.hub.validateDeliveryState(
+		c,
+		message.authorizationEpoch,
+	); err != nil {
+		c.deliveryMu.Unlock()
+		c.hub.evictUserScope(c.scope, c.UserID)
+		return err
+	}
+	defer c.deliveryMu.Unlock()
+
+	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+	w, err := c.conn.NextWriter(websocket.TextMessage)
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write(message.payload); err != nil {
+		_ = w.Close()
+		return err
+	}
+	return w.Close()
+}
+
+func (c *Client) writePing() error {
+	c.deliveryMu.Lock()
+	defer c.deliveryMu.Unlock()
+
+	if c.closing.Load() {
+		return context.Canceled
+	}
+	select {
+	case <-c.done:
+		return context.Canceled
+	default:
+	}
+	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+	return c.conn.WriteMessage(websocket.PingMessage, nil)
 }
 
 // handleMessage processes incoming messages from the client

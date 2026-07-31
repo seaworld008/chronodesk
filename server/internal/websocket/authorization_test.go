@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -212,6 +213,233 @@ func TestWritePumpRevalidatesAfterEnqueueAndDropsFrameRevokedWhileBlocked(
 		t.Fatalf(
 			"authorization calls = %d, want enqueue and final-write checks",
 			authorizer.calls.Load(),
+		)
+	}
+}
+
+func TestWritePumpRevocationInterruptsBlockedSocketWrite(t *testing.T) {
+	for _, stage := range []socketWriteBlockStage{
+		blockAtNextWriter,
+		blockAtFrameWrite,
+	} {
+		t.Run(string(stage), func(t *testing.T) {
+			hub := newAuthorizedWebSocketTestHub()
+			connection := newInterruptibleWebSocketConnection(stage)
+			client := newWebSocketTestClient(
+				hub,
+				101,
+				websocketTestScopeA,
+				1,
+			)
+			client.conn = connection
+			hub.clients[client] = true
+			defer client.close()
+
+			writeReturned := make(chan struct{})
+			go func() {
+				defer close(writeReturned)
+				client.writePump()
+			}()
+
+			if err := hub.BroadcastToUser(
+				context.Background(),
+				websocketTestScopeA,
+				101,
+				"notification",
+				map[string]any{"sequence": 1},
+			); err != nil {
+				t.Fatalf("enqueue authorized WebSocket frame: %v", err)
+			}
+			select {
+			case <-connection.blocked:
+			case <-time.After(time.Second):
+				t.Fatalf("writePump did not block at %s", stage)
+			}
+			if client.deliveryMu.TryLock() {
+				client.deliveryMu.Unlock()
+				t.Fatal("blocked socket write did not retain deliveryMu")
+			}
+
+			revokeReturned := make(chan error, 1)
+			go func() {
+				revokeReturned <- hub.RevokeProjectMembership(
+					websocketTestScopeA,
+					101,
+				)
+			}()
+			select {
+			case err := <-revokeReturned:
+				if err != nil {
+					t.Fatalf("revoke project membership: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("revocation waited for the socket write deadline")
+			}
+			select {
+			case <-writeReturned:
+			case <-time.After(time.Second):
+				t.Fatal("interrupted writePump did not return")
+			}
+
+			if !client.closing.Load() || !connection.closed.Load() {
+				t.Fatal("revocation did not close the client and connection")
+			}
+			if connection.successfulFrames.Load() != 0 {
+				t.Fatalf(
+					"revoked slow writer completed %d frame(s)",
+					connection.successfulFrames.Load(),
+				)
+			}
+			if connection.writesAfterClose.Load() != 0 {
+				t.Fatalf(
+					"revoked writer attempted %d frame(s) after close",
+					connection.writesAfterClose.Load(),
+				)
+			}
+			if len(client.send) != 0 {
+				t.Fatalf(
+					"revocation retained %d queued frame(s)",
+					len(client.send),
+				)
+			}
+		})
+	}
+}
+
+func TestHubStopInterruptsAllBlockedWriters(t *testing.T) {
+	hub := newAuthorizedWebSocketTestHub()
+	clients := make([]*Client, 0, 3)
+	connections := make([]*interruptibleWebSocketConnection, 0, 3)
+	writeReturned := make([]chan struct{}, 0, 3)
+	for range 3 {
+		connection := newInterruptibleWebSocketConnection(blockAtFrameWrite)
+		client := newWebSocketTestClient(
+			hub,
+			101,
+			websocketTestScopeA,
+			1,
+		)
+		client.conn = connection
+		hub.clients[client] = true
+		returned := make(chan struct{})
+		go func() {
+			defer close(returned)
+			client.writePump()
+		}()
+		clients = append(clients, client)
+		connections = append(connections, connection)
+		writeReturned = append(writeReturned, returned)
+	}
+	defer func() {
+		for _, client := range clients {
+			client.close()
+		}
+	}()
+
+	if err := hub.BroadcastToUser(
+		context.Background(),
+		websocketTestScopeA,
+		101,
+		"notification",
+		map[string]any{"sequence": 1},
+	); err != nil {
+		t.Fatalf("enqueue frames for blocked writers: %v", err)
+	}
+	for index, connection := range connections {
+		select {
+		case <-connection.blocked:
+		case <-time.After(time.Second):
+			t.Fatalf("writer %d did not reach its blocking write", index)
+		}
+	}
+
+	stopReturned := make(chan struct{})
+	go func() {
+		hub.stop()
+		close(stopReturned)
+	}()
+	select {
+	case <-stopReturned:
+	case <-time.After(time.Second):
+		t.Fatal("Hub.stop serialized blocked clients through writeWait")
+	}
+	for index, returned := range writeReturned {
+		select {
+		case <-returned:
+		case <-time.After(time.Second):
+			t.Fatalf("writer %d did not return after Hub.stop", index)
+		}
+		if connections[index].successfulFrames.Load() != 0 {
+			t.Fatalf(
+				"writer %d completed %d frame(s) during Hub.stop",
+				index,
+				connections[index].successfulFrames.Load(),
+			)
+		}
+	}
+}
+
+func TestWritePumpCompletedFramePrecedesRevocationClose(t *testing.T) {
+	hub := newAuthorizedWebSocketTestHub()
+	var eventOrder atomic.Int32
+	connection := &orderedWebSocketConnection{
+		eventOrder:     &eventOrder,
+		frameCompleted: make(chan struct{}),
+	}
+	client := newWebSocketTestClient(
+		hub,
+		101,
+		websocketTestScopeA,
+		1,
+	)
+	client.conn = connection
+	hub.clients[client] = true
+	defer client.close()
+
+	writeReturned := make(chan struct{})
+	go func() {
+		defer close(writeReturned)
+		client.writePump()
+	}()
+	if err := hub.BroadcastToUser(
+		context.Background(),
+		websocketTestScopeA,
+		101,
+		"notification",
+		map[string]any{"sequence": 1},
+	); err != nil {
+		t.Fatalf("enqueue authorized WebSocket frame: %v", err)
+	}
+	select {
+	case <-connection.frameCompleted:
+	case <-time.After(time.Second):
+		t.Fatal("authorized frame did not complete")
+	}
+	if err := hub.RevokeProjectMembership(
+		websocketTestScopeA,
+		101,
+	); err != nil {
+		t.Fatalf("revoke project membership: %v", err)
+	}
+	select {
+	case <-writeReturned:
+	case <-time.After(time.Second):
+		t.Fatal("writePump did not stop after revocation")
+	}
+
+	frameOrder := connection.frameOrder.Load()
+	closeOrder := connection.closeOrder.Load()
+	if frameOrder == 0 || closeOrder <= frameOrder {
+		t.Fatalf(
+			"frame order = %d, connection close order = %d",
+			frameOrder,
+			closeOrder,
+		)
+	}
+	if connection.writesAfterClose.Load() != 0 {
+		t.Fatalf(
+			"connection wrote %d frame(s) after close",
+			connection.writesAfterClose.Load(),
 		)
 	}
 }
@@ -529,6 +757,184 @@ func (*recordingWebSocketConnection) SetWriteDeadline(time.Time) error {
 }
 
 func (*recordingWebSocketConnection) WriteMessage(int, []byte) error {
+	return nil
+}
+
+type socketWriteBlockStage string
+
+const (
+	blockAtNextWriter socketWriteBlockStage = "next_writer"
+	blockAtFrameWrite socketWriteBlockStage = "frame_write"
+)
+
+type interruptibleWebSocketConnection struct {
+	stage            socketWriteBlockStage
+	blocked          chan struct{}
+	closedSignal     chan struct{}
+	blockedOnce      sync.Once
+	closeOnce        sync.Once
+	closed           atomic.Bool
+	successfulFrames atomic.Int32
+	writesAfterClose atomic.Int32
+}
+
+func newInterruptibleWebSocketConnection(
+	stage socketWriteBlockStage,
+) *interruptibleWebSocketConnection {
+	return &interruptibleWebSocketConnection{
+		stage:        stage,
+		blocked:      make(chan struct{}),
+		closedSignal: make(chan struct{}),
+	}
+}
+
+func (connection *interruptibleWebSocketConnection) signalBlocked() {
+	connection.blockedOnce.Do(func() {
+		close(connection.blocked)
+	})
+}
+
+func (connection *interruptibleWebSocketConnection) Close() error {
+	connection.closed.Store(true)
+	connection.closeOnce.Do(func() {
+		close(connection.closedSignal)
+	})
+	return nil
+}
+
+func (connection *interruptibleWebSocketConnection) NextWriter(
+	int,
+) (io.WriteCloser, error) {
+	if connection.stage == blockAtNextWriter {
+		connection.signalBlocked()
+		<-connection.closedSignal
+		return nil, net.ErrClosed
+	}
+	return interruptibleFrameWriter{connection: connection}, nil
+}
+
+func (*interruptibleWebSocketConnection) ReadMessage() (
+	int,
+	[]byte,
+	error,
+) {
+	return 0, nil, errors.New("test connection has no inbound messages")
+}
+
+func (*interruptibleWebSocketConnection) SetPongHandler(
+	func(string) error,
+) {
+}
+
+func (*interruptibleWebSocketConnection) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (*interruptibleWebSocketConnection) SetReadLimit(int64) {}
+
+func (*interruptibleWebSocketConnection) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+func (*interruptibleWebSocketConnection) WriteMessage(int, []byte) error {
+	return nil
+}
+
+type interruptibleFrameWriter struct {
+	connection *interruptibleWebSocketConnection
+}
+
+func (writer interruptibleFrameWriter) Write(payload []byte) (int, error) {
+	if writer.connection.stage == blockAtFrameWrite {
+		writer.connection.signalBlocked()
+		<-writer.connection.closedSignal
+		return 0, net.ErrClosed
+	}
+	if writer.connection.closed.Load() {
+		writer.connection.writesAfterClose.Add(1)
+		return 0, net.ErrClosed
+	}
+	return len(payload), nil
+}
+
+func (writer interruptibleFrameWriter) Close() error {
+	if writer.connection.closed.Load() {
+		return net.ErrClosed
+	}
+	writer.connection.successfulFrames.Add(1)
+	return nil
+}
+
+type orderedWebSocketConnection struct {
+	eventOrder       *atomic.Int32
+	frameCompleted   chan struct{}
+	frameOrder       atomic.Int32
+	closeOrder       atomic.Int32
+	writesAfterClose atomic.Int32
+	closed           atomic.Bool
+}
+
+func (connection *orderedWebSocketConnection) Close() error {
+	connection.closed.Store(true)
+	connection.closeOrder.Store(connection.eventOrder.Add(1))
+	return nil
+}
+
+func (connection *orderedWebSocketConnection) NextWriter(
+	int,
+) (io.WriteCloser, error) {
+	return &orderedFrameWriter{connection: connection}, nil
+}
+
+func (*orderedWebSocketConnection) ReadMessage() (
+	int,
+	[]byte,
+	error,
+) {
+	return 0, nil, errors.New("test connection has no inbound messages")
+}
+
+func (*orderedWebSocketConnection) SetPongHandler(func(string) error) {}
+
+func (*orderedWebSocketConnection) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (*orderedWebSocketConnection) SetReadLimit(int64) {}
+
+func (*orderedWebSocketConnection) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+func (*orderedWebSocketConnection) WriteMessage(int, []byte) error {
+	return nil
+}
+
+type orderedFrameWriter struct {
+	connection *orderedWebSocketConnection
+	wrote      bool
+}
+
+func (writer *orderedFrameWriter) Write(payload []byte) (int, error) {
+	if writer.connection.closed.Load() {
+		writer.connection.writesAfterClose.Add(1)
+		return 0, net.ErrClosed
+	}
+	writer.wrote = true
+	return len(payload), nil
+}
+
+func (writer *orderedFrameWriter) Close() error {
+	if writer.connection.closed.Load() {
+		writer.connection.writesAfterClose.Add(1)
+		return net.ErrClosed
+	}
+	if writer.wrote {
+		writer.connection.frameOrder.Store(
+			writer.connection.eventOrder.Add(1),
+		)
+		close(writer.connection.frameCompleted)
+	}
 	return nil
 }
 

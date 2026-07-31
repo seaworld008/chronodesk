@@ -5405,7 +5405,7 @@
         }
       },
       "Forbidden": {
-        "description": "Authenticated identity lacks the required explicit capability",
+        "description": "Authenticated identity lacks the required explicit capability, or the requested project scope is unavailable. `project_access_revoked` is reserved for project-scope resolution or revalidation; role and object authorization denials do not invalidate the active project.",
         "content": {
           "application/json": {
             "schema": {
@@ -7193,7 +7193,8 @@
         ],
         "properties": {
           "code": {
-            "type": "string"
+            "type": "string",
+            "description": "`project_access_revoked` means the requested project scope is unavailable to the authenticated human. A browser may clear its active selection only when that response names the same project; role and object authorization denials use other codes."
           },
           "msg": {
             "type": "string"

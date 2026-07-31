@@ -37,6 +37,13 @@ const platformAdmin = {
 
 const accessA = authorizedProjectAccess(projectA, 'project_admin');
 const accessB = authorizedProjectAccess(projectB, 'observer');
+const defaultPlatformProject: PlatformProjectSummary = {
+    public_id: '00000000-0000-7000-8000-000000000075',
+    key: 'DEFAULT',
+    name: '默认项目',
+    description: '系统默认项目',
+    status: 'active',
+};
 
 const platformProjectSummary = (
     project: AuthorizedProject,
@@ -113,6 +120,7 @@ const installPlatformProjectBackend = async (
             await fulfillJSON(route, {
                 code: 0,
                 data: [
+                    defaultPlatformProject,
                     platformProjectSummary(
                         projectA,
                         state.archived ? 'archived' : 'active',
@@ -204,6 +212,40 @@ test.describe('平台项目归档浏览器闭环', () => {
         expect(new Set(backend.platformProjectReads)).toEqual(
             new Set(['GET /api/platform/projects']),
         );
+        const governanceTable = page.getByRole('table', {
+            name: '平台项目治理列表',
+            exact: true,
+        });
+        await expect(governanceTable.getByRole('separator')).toHaveCount(4);
+        const projectResizeHandle = governanceTable.getByRole(
+            'separator',
+            { name: /调整“?项目”?列宽/u },
+        );
+        await projectResizeHandle.focus();
+        await projectResizeHandle.press('ArrowRight');
+        await expect(projectResizeHandle).toHaveAttribute(
+            'aria-valuenow',
+            '368',
+        );
+        await expect.poll(() =>
+            page.evaluate(() => {
+                const raw = localStorage.getItem(
+                    'chronodesk.table-columns.v1.platform.projects.governance',
+                );
+                return raw
+                    ? (JSON.parse(raw) as { project?: unknown }).project
+                    : null;
+            }),
+        ).toBe(368);
+        const defaultProjectRow = governanceTable
+            .getByRole('row')
+            .filter({ hasText: defaultPlatformProject.public_id });
+        await expect(
+            defaultProjectRow.getByRole('button', {
+                name: '归档项目',
+                exact: true,
+            }),
+        ).toBeDisabled();
 
         await page
             .getByTestId(`archive-platform-project-${projectA.public_id}`)

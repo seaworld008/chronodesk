@@ -379,8 +379,8 @@ func TestRuntimeErrorResponsesConformToPublishedClosedBranches(t *testing.T) {
 		{
 			schemaName: "CodedErrorEnvelope",
 			value: map[string]any{
-				"code": "project_access_denied",
-				"msg":  "无权访问该项目",
+				"code": "project_access_revoked",
+				"msg":  "当前项目访问权限已失效",
 			},
 		},
 	} {

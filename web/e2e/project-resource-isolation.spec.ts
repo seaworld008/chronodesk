@@ -21,6 +21,7 @@ type ObservedRequest = {
 type MockState = {
     accesses: AuthorizedProjectAccess[];
     deniedProjectKeys: Set<string>;
+    forbiddenCodes: Map<string, string>;
     unauthorizedPaths: Set<string>;
     requests: ObservedRequest[];
 };
@@ -75,6 +76,7 @@ const mockProjectBackend = async (
     const state: MockState = {
         accesses,
         deniedProjectKeys: new Set(),
+        forbiddenCodes: new Map(),
         unauthorizedPaths: new Set(),
         requests: [],
     };
@@ -120,6 +122,18 @@ const mockProjectBackend = async (
             /^\/api\/projects\/([^/]+)\/(.+)$/u,
         );
         if (projectMatch) {
+            const forbiddenCode = state.forbiddenCodes.get(url.pathname);
+            if (forbiddenCode) {
+                await fulfillJSON(
+                    route,
+                    {
+                        code: forbiddenCode,
+                        msg: '当前操作权限不足',
+                    },
+                    403,
+                );
+                return;
+            }
             const projectKey = decodeURIComponent(projectMatch[1]);
             const access = state.accesses.find(
                 (candidate) => candidate.project.key === projectKey,
@@ -128,7 +142,7 @@ const mockProjectBackend = async (
                 await fulfillJSON(
                     route,
                     {
-                        code: 'project_access_denied',
+                        code: 'project_access_revoked',
                         msg: '无权访问该项目',
                     },
                     403,
@@ -286,7 +300,7 @@ test.describe('项目资源缓存与会话失效隔离', () => {
             .click();
         expect(
             (await (await deniedResponse).json() as { code?: unknown }).code,
-        ).toBe('project_access_denied');
+        ).toBe('project_access_revoked');
 
         await expect(page).toHaveURL(/#\/?$/u);
         await expect(
@@ -316,6 +330,138 @@ test.describe('项目资源缓存与会话失效隔离', () => {
                     ),
             ),
         ).toBe(false);
+    });
+
+    for (const forbiddenCode of [
+        'project_role_denied',
+        'ticket_access_denied',
+    ]) {
+        test(`普通 403 ${forbiddenCode} 不清除当前项目选择`, async ({
+            page,
+        }) => {
+            await installMockSession(page, defaultMockIdentity, projectA);
+            const backend = await mockProjectBackend(page, [
+                authorizedProjectAccess(projectA, 'project_admin'),
+            ]);
+            const overviewPath =
+                `/api/projects/${projectA.key}/admin/agents/agent-control/overview`;
+
+            await page.goto('/#/agent-control');
+            await expect(
+                page.getByRole('heading', {
+                    name: 'AI 智能体控制中心',
+                    exact: true,
+                }),
+            ).toBeVisible();
+
+            backend.forbiddenCodes.set(overviewPath, forbiddenCode);
+            const projectListRequestsBefore = backend.requests.filter(
+                ({ pathname }) => pathname === '/api/projects',
+            ).length;
+            const forbiddenResponse = page.waitForResponse((response) =>
+                response.status() === 403 &&
+                new URL(response.url()).pathname === overviewPath,
+            );
+            await page
+                .getByRole('main')
+                .getByRole('button', {
+                    name: '刷新控制面',
+                    exact: true,
+                })
+                .click();
+
+            expect(
+                (await (await forbiddenResponse).json() as {
+                    code?: unknown;
+                }).code,
+            ).toBe(forbiddenCode);
+            await expect.poll(() =>
+                page.evaluate(() => {
+                    const raw = localStorage.getItem(
+                        'chronodesk.activeProject',
+                    );
+                    return raw
+                        ? (JSON.parse(raw) as { project_key?: unknown })
+                            .project_key
+                        : null;
+                }),
+            ).toBe(projectA.key);
+            expect(
+                backend.requests.filter(
+                    ({ pathname }) => pathname === '/api/projects',
+                ).length,
+            ).toBe(projectListRequestsBefore);
+            await expect(
+                page.getByRole('heading', {
+                    name: '请选择要进入的项目',
+                    exact: true,
+                }),
+            ).toHaveCount(0);
+        });
+    }
+
+    test('active OPS 收到 OTHER 的 project_access_revoked 时保留当前项目', async ({
+        page,
+    }) => {
+        await installMockSession(page, defaultMockIdentity, projectA);
+        const backend = await mockProjectBackend(page, [
+            authorizedProjectAccess(projectA, 'project_admin'),
+        ]);
+
+        await page.goto('/#/');
+        await expect(page.getByTestId('project-home')).toBeVisible();
+        const projectListRequestsBefore = backend.requests.filter(
+            ({ pathname }) => pathname === '/api/projects',
+        ).length;
+        const otherProjectPath =
+            '/api/projects/OTHER/admin/agents/agent-control/overview';
+        const revokedResponse = page.waitForResponse((response) =>
+            response.status() === 403 &&
+            new URL(response.url()).pathname === otherProjectPath,
+        );
+
+        const status = await page.evaluate(
+            async ({ modulePath, requestPath }) => {
+                const apiClient = await import(
+                    /* @vite-ignore */ modulePath
+                ) as {
+                    sessionAwareFetch: (
+                        input: RequestInfo | URL,
+                        init?: RequestInit,
+                    ) => Promise<Response>;
+                };
+                const response = await apiClient.sessionAwareFetch(
+                    requestPath,
+                );
+                return response.status;
+            },
+            {
+                modulePath: '/src/lib/apiClient.ts',
+                requestPath: otherProjectPath,
+            },
+        );
+        expect(status).toBe(403);
+        expect(
+            (await (await revokedResponse).json() as {
+                code?: unknown;
+            }).code,
+        ).toBe('project_access_revoked');
+        await expect.poll(() =>
+            page.evaluate(() => {
+                const raw = localStorage.getItem(
+                    'chronodesk.activeProject',
+                );
+                return raw
+                    ? (JSON.parse(raw) as { project_key?: unknown })
+                        .project_key
+                    : null;
+            }),
+        ).toBe(projectA.key);
+        expect(
+            backend.requests.filter(
+                ({ pathname }) => pathname === '/api/projects',
+            ).length,
+        ).toBe(projectListRequestsBefore);
     });
 
     for (const roleSwitch of [

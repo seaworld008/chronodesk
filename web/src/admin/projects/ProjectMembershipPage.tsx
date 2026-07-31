@@ -20,7 +20,6 @@ import {
     Paper,
     Select,
     Stack,
-    Table,
     TableBody,
     TableCell,
     TableContainer,
@@ -46,6 +45,24 @@ import {
     apiFetch,
     localizedUnknownErrorMessage,
 } from '@/lib/apiClient'
+import {
+    InlineDetails,
+    ResizableMuiTable,
+    type ResizableColumn,
+} from '@/components/tables/EnterpriseTable'
+
+const projectMembershipColumns: ResizableColumn[] = [
+    { key: 'user', defaultWidth: 300, minWidth: 220, maxWidth: 520 },
+    { key: 'role', defaultWidth: 160, minWidth: 128, maxWidth: 240 },
+    { key: 'status', defaultWidth: 112, minWidth: 96, maxWidth: 160 },
+    {
+        key: 'actions',
+        defaultWidth: 260,
+        minWidth: 220,
+        maxWidth: 360,
+        sticky: 'right',
+    },
+]
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === 'object' && value !== null
@@ -261,7 +278,11 @@ const ProjectMembershipPage = () => {
             </Paper>
 
             <TableContainer component={Paper} variant="outlined">
-                <Table aria-label="项目成员列表">
+                <ResizableMuiTable
+                    tableId="projects.memberships"
+                    columns={projectMembershipColumns}
+                    aria-label="项目成员列表"
+                >
                     <TableHead>
                         <TableRow>
                             <TableCell>用户</TableCell>
@@ -290,17 +311,19 @@ const ProjectMembershipPage = () => {
                             memberships.map((membership) => (
                                 <TableRow key={membership.id}>
                                     <TableCell>
-                                        <Typography sx={{ fontWeight: 600 }}>
-                                            {membership.user?.display_name ||
+                                        <InlineDetails
+                                            primary={
+                                                membership.user?.display_name ||
                                                 membership.user?.username ||
-                                                `用户 ${membership.user_id}`}
-                                        </Typography>
-                                        <Typography
-                                            variant="body2"
-                                            color="text.secondary"
-                                        >
-                                            ID {membership.user_id}
-                                        </Typography>
+                                                `用户 ${membership.user_id}`
+                                            }
+                                            secondary={`ID ${membership.user_id}`}
+                                            title={`${
+                                                membership.user?.display_name ||
+                                                membership.user?.username ||
+                                                `用户 ${membership.user_id}`
+                                            } · ID ${membership.user_id}`}
+                                        />
                                     </TableCell>
                                     <TableCell>
                                         {getProjectRoleLabel(membership.role)}
@@ -351,7 +374,7 @@ const ProjectMembershipPage = () => {
                             ))
                         )}
                     </TableBody>
-                </Table>
+                </ResizableMuiTable>
             </TableContainer>
 
             <Dialog

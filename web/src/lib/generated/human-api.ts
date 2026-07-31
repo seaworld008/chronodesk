@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.0.0.
- * Contract SHA-256: bb3ec9a3d6ecb0d2fba795507d065839f32cbe43aaeb4c5be95dc6375a77d1de.
+ * Contract SHA-256: 6bac64b34db412e033cb8750c3b0b79142d81141ab7d55e64bdaeb57c91e4ff7.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 

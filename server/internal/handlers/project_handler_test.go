@@ -945,9 +945,93 @@ func TestProjectScopeMiddlewareRejectsCrossProjectAccess(t *testing.T) {
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	if body := response.Body.String(); !strings.Contains(body, `"code":403`) ||
-		!strings.Contains(body, `"msg":"无权访问该项目"`) {
+	if body := response.Body.String(); !strings.Contains(
+		body,
+		`"code":"project_access_revoked"`,
+	) || !strings.Contains(
+		body,
+		`"msg":"当前项目访问权限已失效"`,
+	) {
 		t.Fatalf("unexpected cross-project error contract: %s", body)
+	}
+}
+
+func TestProjectScopeResolutionErrorIsDistinctFromDomainDenial(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, test := range []struct {
+		name           string
+		write          func(*gin.Context)
+		wantCode       any
+		wantMessage    string
+		wantStatusCode int
+	}{
+		{
+			name: "scope access revoked",
+			write: func(c *gin.Context) {
+				writeProjectScopeResolutionError(
+					c,
+					middleware.NewResponseHelper(),
+					services.ErrProjectAccessDenied,
+				)
+			},
+			wantCode:       "project_access_revoked",
+			wantMessage:    "当前项目访问权限已失效",
+			wantStatusCode: http.StatusForbidden,
+		},
+		{
+			name: "inactive scope revoked",
+			write: func(c *gin.Context) {
+				writeProjectScopeResolutionError(
+					c,
+					middleware.NewResponseHelper(),
+					services.ErrProjectInactive,
+				)
+			},
+			wantCode:       "project_access_revoked",
+			wantMessage:    "当前项目访问权限已失效",
+			wantStatusCode: http.StatusForbidden,
+		},
+		{
+			name: "domain authorization denial",
+			write: func(c *gin.Context) {
+				writeProjectError(
+					c,
+					middleware.NewResponseHelper(),
+					services.ErrProjectAccessDenied,
+				)
+			},
+			wantCode:       float64(http.StatusForbidden),
+			wantMessage:    "无权访问该项目",
+			wantStatusCode: http.StatusForbidden,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(response)
+			test.write(c)
+
+			if response.Code != test.wantStatusCode {
+				t.Fatalf(
+					"status = %d, want %d; body=%s",
+					response.Code,
+					test.wantStatusCode,
+					response.Body.String(),
+				)
+			}
+			var body map[string]any
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if body["code"] != test.wantCode ||
+				body["msg"] != test.wantMessage {
+				t.Fatalf(
+					"response = %#v, want code=%#v msg=%q",
+					body,
+					test.wantCode,
+					test.wantMessage,
+				)
+			}
+		})
 	}
 }
 

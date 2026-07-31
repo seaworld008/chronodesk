@@ -2,7 +2,6 @@ import { DataProvider, fetchUtils, HttpError } from 'react-admin'
 import queryString from 'query-string'
 import { containsChineseText, localizedApiErrorMessage } from './apiClient'
 import {
-    invalidateProjectAccessCache,
     projectResourcePath,
     resolveActiveProjectKey,
 } from './projectScope'
@@ -12,6 +11,8 @@ import {
     projectAccessInvalidatedEvent,
     projectScopeChangedEvent,
     sessionInvalidatedEvent,
+    shouldInvalidateActiveProjectAccess,
+    signalProjectAccessInvalidated,
     signalSessionInvalidated,
 } from './projectScopeEvents'
 
@@ -120,9 +121,9 @@ function handleHttpError(error: unknown, url?: string): never {
         if (
             error.status === 403 &&
             typeof url === 'string' &&
-            /\/projects\/[^/]+\//.test(url)
+            shouldInvalidateActiveProjectAccess(url, error.body)
         ) {
-            invalidateProjectAccessCache()
+            signalProjectAccessInvalidated()
         }
         const message = localizedApiErrorMessage(error.body, error.status)
         throw new HttpError(message, error.status, error.body)

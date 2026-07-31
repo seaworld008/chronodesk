@@ -236,9 +236,9 @@ func (h *Hub) authorizeDelivery(
 	client *Client,
 	authorizationEpoch uint64,
 ) error {
-	if h == nil || client == nil || client.hub != h {
+	if h == nil {
 		return fmt.Errorf(
-			"%w: invalid client binding",
+			"%w: hub is unavailable",
 			ErrFanoutAuthorizationDenied,
 		)
 	}
@@ -248,25 +248,8 @@ func (h *Hub) authorizeDelivery(
 			ErrFanoutAuthorizationDenied,
 		)
 	}
-	if client.authorizationEpoch.Load() != authorizationEpoch {
-		return fmt.Errorf(
-			"%w: stale authorization epoch",
-			ErrFanoutAuthorizationDenied,
-		)
-	}
-	select {
-	case <-client.done:
-		return fmt.Errorf(
-			"%w: client connection is closed",
-			ErrFanoutAuthorizationDenied,
-		)
-	default:
-	}
-	if client.ctx == nil {
-		return fmt.Errorf(
-			"%w: connection context is unavailable",
-			ErrFanoutAuthorizationDenied,
-		)
+	if err := h.validateDeliveryState(client, authorizationEpoch); err != nil {
+		return err
 	}
 	if err := h.authorizer.AuthorizeFanout(
 		client.ctx,
@@ -275,16 +258,51 @@ func (h *Hub) authorizeDelivery(
 	); err != nil {
 		return fmt.Errorf("authorize final WebSocket delivery: %w", err)
 	}
+	return h.validateDeliveryState(client, authorizationEpoch)
+}
+
+// validateDeliveryState performs only process-local checks. writePump repeats
+// it while holding Client.deliveryMu; Client.close publishes the revocation,
+// interrupts the socket, then waits on that mutex before returning.
+func (h *Hub) validateDeliveryState(
+	client *Client,
+	authorizationEpoch uint64,
+) error {
+	if h == nil || client == nil || client.hub != h {
+		return fmt.Errorf(
+			"%w: invalid client binding",
+			ErrFanoutAuthorizationDenied,
+		)
+	}
+	if client.closing.Load() {
+		return fmt.Errorf(
+			"%w: client connection is closing",
+			ErrFanoutAuthorizationDenied,
+		)
+	}
 	if client.authorizationEpoch.Load() != authorizationEpoch {
 		return fmt.Errorf(
-			"%w: authorization changed before delivery",
+			"%w: stale authorization epoch",
 			ErrFanoutAuthorizationDenied,
+		)
+	}
+	if client.ctx == nil {
+		return fmt.Errorf(
+			"%w: connection context is unavailable",
+			ErrFanoutAuthorizationDenied,
+		)
+	}
+	if err := client.ctx.Err(); err != nil {
+		return fmt.Errorf(
+			"%w: connection context is closed: %v",
+			ErrFanoutAuthorizationDenied,
+			err,
 		)
 	}
 	select {
 	case <-client.done:
 		return fmt.Errorf(
-			"%w: client connection closed before delivery",
+			"%w: client connection is closed",
 			ErrFanoutAuthorizationDenied,
 		)
 	default:

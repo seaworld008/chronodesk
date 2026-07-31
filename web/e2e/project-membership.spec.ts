@@ -239,6 +239,38 @@ test.describe('项目成员管理五角色 UI', () => {
                 }),
             ).toBeVisible();
         }
+        await expect(table.getByRole('separator')).toHaveCount(4);
+        const userResizeHandle = table.getByRole('separator', {
+            name: /调整“?用户”?列宽/u,
+        });
+        await userResizeHandle.focus();
+        await userResizeHandle.press('ArrowRight');
+        await expect(userResizeHandle).toHaveAttribute(
+            'aria-valuenow',
+            '308',
+        );
+        await expect.poll(() =>
+            page.evaluate(() => {
+                const raw = localStorage.getItem(
+                    'chronodesk.table-columns.v1.projects.memberships',
+                );
+                return raw
+                    ? (JSON.parse(raw) as { user?: unknown }).user
+                    : null;
+            }),
+        ).toBe(308);
+        const firstMembershipCells = table
+            .getByRole('row')
+            .filter({ hasText: roleLabels.project_admin })
+            .first()
+            .getByRole('cell');
+        for (const cell of await firstMembershipCells.all()) {
+            expect(
+                await cell.evaluate(
+                    (element) => getComputedStyle(element).whiteSpace,
+                ),
+            ).toBe('nowrap');
+        }
 
         for (const [index, role] of projectRoleValues.entries()) {
             const userID = 201 + index;

@@ -48,7 +48,7 @@ func ProjectExternalScopeMiddleware(
 		)
 		if err != nil {
 			response := middleware.NewResponseHelper()
-			writeProjectError(c, response, err)
+			writeProjectScopeResolutionError(c, response, err)
 			c.Abort()
 			return
 		}
@@ -92,7 +92,7 @@ func ProjectExternalScopeMiddleware(
 			if err == nil {
 				err = services.ErrProjectAccessDenied
 			}
-			writeProjectError(c, response, err)
+			writeProjectScopeResolutionError(c, response, err)
 			c.Abort()
 			return
 		}

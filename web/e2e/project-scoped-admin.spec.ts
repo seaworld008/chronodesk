@@ -25,6 +25,7 @@ type SessionIdentity = {
 type MockBackendState = {
     accesses: ProjectAccess[];
     accessesByToken: Map<string, ProjectAccess[]>;
+    forbiddenCodes: Map<string, string>;
     projectListRequests: string[];
     scopedProjectRequests: string[];
     deniedProjectRequests: string[];
@@ -306,6 +307,7 @@ const mockBackend = async (
     const state: MockBackendState = {
         accesses,
         accessesByToken,
+        forbiddenCodes: new Map(),
         projectListRequests: [],
         scopedProjectRequests: [],
         deniedProjectRequests: [],
@@ -340,6 +342,18 @@ const mockBackend = async (
         );
         if (scopedMatch) {
             state.scopedProjectRequests.push(requestLabel);
+            const forbiddenCode = state.forbiddenCodes.get(url.pathname);
+            if (forbiddenCode) {
+                await fulfillJSON(
+                    route,
+                    {
+                        code: forbiddenCode,
+                        msg: '当前操作权限不足',
+                    },
+                    403,
+                );
+                return;
+            }
             const projectKey = decodeURIComponent(scopedMatch[1]);
             const access = requestAccesses.find(
                 (candidate) => candidate.project.key === projectKey,
@@ -349,7 +363,7 @@ const mockBackend = async (
                 await fulfillJSON(
                     route,
                     {
-                        code: 'project_access_denied',
+                        code: 'project_access_revoked',
                         msg: '无权访问该项目',
                     },
                     403,
@@ -1048,7 +1062,7 @@ test.describe('项目授权缓存与撤销', () => {
 
         expect(
             (await (await deniedResponse).json() as { code?: unknown }).code,
-        ).toBe('project_access_denied');
+        ).toBe('project_access_revoked');
         await expect.poll(() => backend.deniedProjectRequests.length).toBe(1);
         await expect(
             page.getByTestId('no-authorized-projects'),
@@ -1058,5 +1072,42 @@ test.describe('项目授权缓存与撤销', () => {
         await expect.poll(() => backend.projectListRequests.length).toBeGreaterThan(
             1,
         );
+    });
+
+    test('数据 Provider 收到普通对象级 403 时保留当前项目', async ({
+        page,
+    }) => {
+        await installSession(page, defaultIdentity, project);
+        const backend = await mockBackend(page, [
+            projectAccess(project, 'project_admin'),
+        ]);
+        const ticketsPath = '/api/projects/OPS/tickets';
+        backend.forbiddenCodes.set(ticketsPath, 'ticket_access_denied');
+
+        const forbiddenResponse = page.waitForResponse((response) =>
+            response.status() === 403 &&
+            new URL(response.url()).pathname === ticketsPath,
+        );
+        await page.goto('/#/tickets');
+        expect(
+            (await (await forbiddenResponse).json() as { code?: unknown }).code,
+        ).toBe('ticket_access_denied');
+
+        await expect.poll(() =>
+            page.evaluate(() => {
+                const raw = localStorage.getItem(
+                    'chronodesk.activeProject',
+                );
+                if (!raw) return null;
+                return (JSON.parse(raw) as { project_key?: unknown })
+                    .project_key;
+            }),
+        ).toBe(project.key);
+        await expect(
+            page.getByRole('heading', {
+                name: '请选择要进入的项目',
+                exact: true,
+            }),
+        ).toHaveCount(0);
     });
 });

@@ -1,6 +1,6 @@
 import { HttpError } from 'react-admin'
 import {
-  isProjectScopedApiPath,
+  shouldInvalidateActiveProjectAccess,
   signalProjectAccessInvalidated,
   signalSessionInvalidated,
 } from './projectScopeEvents'
@@ -26,8 +26,11 @@ export const sessionAwareFetch = async (
   const path = requestPath(input)
   if (response.status === 401) {
     signalSessionInvalidated()
-  } else if (response.status === 403 && isProjectScopedApiPath(path)) {
-    signalProjectAccessInvalidated()
+  } else if (response.status === 403) {
+    const payload = await response.clone().json().catch(() => null)
+    if (shouldInvalidateActiveProjectAccess(path, payload)) {
+      signalProjectAccessInvalidated()
+    }
   }
   return response
 }
@@ -41,6 +44,7 @@ const problemMessages: Record<string, string> = {
   invalid_actor: '操作身份无效，请重新认证后重试',
   invalid_scope: '请求的权限范围无效',
   unauthorized: '登录状态已失效，请重新登录',
+  project_access_revoked: '当前项目访问权限已失效',
   insufficient_scope: '当前凭据缺少执行此操作所需的权限范围',
   scope_not_granted: '当前服务主体未被授予所需权限范围',
   scope_allowed: '权限范围校验通过',

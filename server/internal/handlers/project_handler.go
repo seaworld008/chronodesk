@@ -315,7 +315,7 @@ func ProjectScopeMiddleware(
 		)
 		if err != nil {
 			response := middleware.NewResponseHelper()
-			writeProjectError(c, response, err)
+			writeProjectScopeResolutionError(c, response, err)
 			c.Abort()
 			return
 		}
@@ -407,11 +407,13 @@ func ProjectScopeMiddleware(
 			}
 			return
 		}
-		if errors.Is(scopedErr, services.ErrProjectAccessDenied) {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-				"code": "project_access_denied",
-				"msg":  "无权访问该项目",
-			})
+		if errors.Is(scopedErr, services.ErrProjectAccessDenied) ||
+			errors.Is(scopedErr, services.ErrProjectInactive) {
+			writeProjectScopeResolutionError(
+				c,
+				middleware.NewResponseHelper(),
+				scopedErr,
+			)
 			return
 		}
 		if scopedErr != nil {
@@ -522,5 +524,22 @@ func writeProjectError(
 		response.Error(c, http.StatusConflict, "项目必须保留至少一名有效管理员")
 	default:
 		response.InternalServerError(c, "项目操作失败")
+	}
+}
+
+func writeProjectScopeResolutionError(
+	c *gin.Context,
+	response *middleware.ResponseHelper,
+	err error,
+) {
+	switch {
+	case errors.Is(err, services.ErrProjectAccessDenied),
+		errors.Is(err, services.ErrProjectInactive):
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+			"code": "project_access_revoked",
+			"msg":  "当前项目访问权限已失效",
+		})
+	default:
+		writeProjectError(c, response, err)
 	}
 }

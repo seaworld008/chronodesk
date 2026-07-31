@@ -136,7 +136,7 @@ def test_platform_permission_matrix_never_grants_implicit_project_access(
         assert_error_contract(
             context,
             403,
-            machine_codes={"project_access_denied", "403"},
+            machine_codes={"project_access_revoked"},
         )
         tickets = identity.api.get_json(
             identity.api.project_path("tickets"),
@@ -145,7 +145,7 @@ def test_platform_permission_matrix_never_grants_implicit_project_access(
         assert_error_contract(
             tickets,
             403,
-            machine_codes={"project_access_denied", "403"},
+            machine_codes={"project_access_revoked"},
         )
 
         for path, expected_status in platform_expectations[platform_role].items():
@@ -380,7 +380,7 @@ def test_revoked_membership_immediately_removes_project_access(
     assert_error_contract(
         context,
         403,
-        machine_codes={"project_access_denied", "403"},
+        machine_codes={"project_access_revoked"},
     )
     tickets = identity.api.get_json(
         identity.api.project_path("tickets"),
@@ -389,7 +389,7 @@ def test_revoked_membership_immediately_removes_project_access(
     assert_error_contract(
         tickets,
         403,
-        machine_codes={"project_access_denied", "403"},
+        machine_codes={"project_access_revoked"},
     )
 
 

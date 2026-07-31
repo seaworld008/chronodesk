@@ -18,7 +18,6 @@ import {
     DialogContentText,
     DialogTitle,
     Paper,
-    Table,
     TableBody,
     TableCell,
     TableContainer,
@@ -43,6 +42,24 @@ import {
     apiFetch,
     localizedUnknownErrorMessage,
 } from '@/lib/apiClient'
+import {
+    InlineDetails,
+    ResizableMuiTable,
+    type ResizableColumn,
+} from '@/components/tables/EnterpriseTable'
+
+const platformProjectColumns: ResizableColumn[] = [
+    { key: 'project', defaultWidth: 360, minWidth: 240, maxWidth: 560 },
+    { key: 'key', defaultWidth: 160, minWidth: 112, maxWidth: 240 },
+    { key: 'status', defaultWidth: 120, minWidth: 96, maxWidth: 180 },
+    {
+        key: 'actions',
+        defaultWidth: 168,
+        minWidth: 144,
+        maxWidth: 220,
+        sticky: 'right',
+    },
+]
 
 const fetchPlatformProjects = (signal?: AbortSignal) =>
     apiFetch<PlatformProjectSummary[]>(
@@ -107,6 +124,7 @@ const PlatformProjectGovernancePage = () => {
     const archiveProject = async () => {
         if (!projectToArchive || !isPlatformAdmin || archiving) return
         const target = projectToArchive
+        if (target.key === 'DEFAULT') return
         const isActiveProject = activeProjectKey() === target.key
         setArchiving(true)
         setError('')
@@ -206,7 +224,11 @@ const PlatformProjectGovernancePage = () => {
             )}
 
             <TableContainer component={Paper} variant="outlined">
-                <Table aria-label="平台项目治理列表">
+                <ResizableMuiTable
+                    tableId="platform.projects.governance"
+                    columns={platformProjectColumns}
+                    aria-label="平台项目治理列表"
+                >
                     <TableHead>
                         <TableRow>
                             <TableCell>项目</TableCell>
@@ -226,15 +248,11 @@ const PlatformProjectGovernancePage = () => {
                             projects.map((project) => (
                                 <TableRow key={project.public_id}>
                                     <TableCell>
-                                        <Typography sx={{ fontWeight: 600 }}>
-                                            {project.name}
-                                        </Typography>
-                                        <Typography
-                                            variant="body2"
-                                            color="text.secondary"
-                                        >
-                                            {project.public_id}
-                                        </Typography>
+                                        <InlineDetails
+                                            primary={project.name}
+                                            secondary={project.public_id}
+                                            title={`${project.name} · ${project.public_id}`}
+                                        />
                                     </TableCell>
                                     <TableCell>{project.key}</TableCell>
                                     <TableCell>
@@ -258,7 +276,8 @@ const PlatformProjectGovernancePage = () => {
                                             variant="outlined"
                                             disabled={
                                                 archiving ||
-                                                project.status !== 'active'
+                                                project.status !== 'active' ||
+                                                project.key === 'DEFAULT'
                                             }
                                             data-testid={`archive-platform-project-${project.public_id}`}
                                             onClick={() =>
@@ -272,7 +291,7 @@ const PlatformProjectGovernancePage = () => {
                             ))
                         )}
                     </TableBody>
-                </Table>
+                </ResizableMuiTable>
             </TableContainer>
 
             <Dialog

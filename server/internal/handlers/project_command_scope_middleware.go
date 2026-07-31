@@ -43,7 +43,7 @@ func ProjectCommandScopeMiddleware(
 			userID,
 		)
 		if err != nil {
-			writeProjectError(
+			writeProjectScopeResolutionError(
 				c,
 				middleware.NewResponseHelper(),
 				err,
