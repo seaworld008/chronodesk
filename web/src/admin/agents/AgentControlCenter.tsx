@@ -395,12 +395,32 @@ const EmptyRow = ({ colSpan, message }: { colSpan: number; message: string }) =>
   </TableRow>
 )
 
-const AgentControlCenter: React.FC = () => {
+export type AgentControlSurface = 'agent' | 'integration'
+type AgentControlTab = 'principals' | 'leases' | 'events' | 'outbox' | 'policy'
+
+const surfaceTabs: Record<
+  AgentControlSurface,
+  readonly { id: AgentControlTab; label: string }[]
+> = {
+  agent: [
+    { id: 'principals', label: '服务主体' },
+    { id: 'leases', label: '实时租约' },
+    { id: 'policy', label: '策略审计' },
+  ],
+  integration: [
+    { id: 'events', label: '领域事件' },
+    { id: 'outbox', label: '事件投递（Outbox）' },
+  ],
+}
+
+export const AgentControlCenter: React.FC<{
+  surface?: AgentControlSurface
+}> = ({ surface = 'agent' }) => {
   const notify = useNotify()
   const [snapshot, setSnapshot] = useState<AgentControlSnapshot | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [tab, setTab] = useState(0)
+  const [tab, setTab] = useState<AgentControlTab>(surfaceTabs[surface][0].id)
   const [createOpen, setCreateOpen] = useState(false)
   const [createForm, setCreateForm] = useState<CreatePrincipalForm>(initialCreateForm)
   const [submitting, setSubmitting] = useState(false)
@@ -750,7 +770,7 @@ const AgentControlCenter: React.FC = () => {
 
   return (
     <>
-      <Title title="AI 智能体控制中心" />
+      <Title title={surface === 'agent' ? 'AI 智能体控制中心' : '集成运行监控'} />
       <Box sx={{ p: { xs: 2, md: 3 } }}>
         <Stack
           direction={{ xs: 'column', md: 'row' }}
@@ -765,41 +785,49 @@ const AgentControlCenter: React.FC = () => {
               alignItems: "center"
             }}>
               <AgentIcon color="primary" />
-              <Typography variant="h4">AI 智能体控制中心</Typography>
+              <Typography variant="h4">
+                {surface === 'agent' ? 'AI 智能体控制中心' : '集成运行监控'}
+              </Typography>
             </Stack>
             <Typography
               sx={{
                 color: "text.secondary",
                 mt: 0.5
               }}>
-              管理服务主体、最小权限、实时租约与事件投递。
+              {surface === 'agent'
+                ? '管理服务主体、最小权限、实时租约与策略决策。'
+                : '查看项目领域事件与 Outbox 投递状态。'}
             </Typography>
           </Box>
           <Stack direction="row" spacing={1} sx={{
             alignItems: "center"
           }}>
-            <FormControlLabel
-              control={
-                <Switch
-                  checked={snapshot?.emergency_stop ?? false}
-                  color="error"
-                  disabled
-                  slotProps={{ input: { 'aria-label': '智能体全局紧急停止' } }}
+            {surface === 'agent' && (
+              <>
+                <FormControlLabel
+                  control={
+                    <Switch
+                      checked={snapshot?.emergency_stop ?? false}
+                      color="error"
+                      disabled
+                      slotProps={{ input: { 'aria-label': '智能体全局紧急停止' } }}
+                    />
+                  }
+                  label="紧急停止"
                 />
-              }
-              label="紧急停止"
-            />
-            <FormControlLabel
-              control={
-                <Switch
-                  checked={snapshot?.global_read_only ?? false}
-                  color="warning"
-                  disabled
-                  slotProps={{ input: { 'aria-label': '智能体全局只读模式' } }}
+                <FormControlLabel
+                  control={
+                    <Switch
+                      checked={snapshot?.global_read_only ?? false}
+                      color="warning"
+                      disabled
+                      slotProps={{ input: { 'aria-label': '智能体全局只读模式' } }}
+                    />
+                  }
+                  label="全局只读"
                 />
-              }
-              label="全局只读"
-            />
+              </>
+            )}
             <Tooltip title="刷新">
               <span>
                 <IconButton onClick={() => void loadSnapshot()} disabled={loading} aria-label="刷新控制面">
@@ -807,22 +835,26 @@ const AgentControlCenter: React.FC = () => {
                 </IconButton>
               </span>
             </Tooltip>
-            <Button variant="contained" startIcon={<AddIcon />} onClick={() => setCreateOpen(true)}>
-              新建智能体
-            </Button>
+            {surface === 'agent' && (
+              <Button variant="contained" startIcon={<AddIcon />} onClick={() => setCreateOpen(true)}>
+                新建智能体
+              </Button>
+            )}
           </Stack>
         </Stack>
 
-        <Alert severity="info" sx={{ mb: 3 }}>
-          全局只读和紧急停止属于平台级安全控制，本项目页面仅展示状态；变更入口已与项目业务操作隔离。
-        </Alert>
+        {surface === 'agent' && (
+          <Alert severity="info" sx={{ mb: 3 }}>
+            全局只读和紧急停止属于平台级安全控制，本项目页面仅展示状态；变更入口已与项目业务操作隔离。
+          </Alert>
+        )}
 
-        {snapshot?.global_read_only && (
+        {surface === 'agent' && snapshot?.global_read_only && (
           <Alert severity="warning" icon={<PausedIcon />} sx={{ mb: 3 }}>
             智能体全局只读模式已开启。MCP 与 A2A 查询仍可用，所有智能体写操作将被策略层拒绝。
           </Alert>
         )}
-        {snapshot?.emergency_stop && (
+        {surface === 'agent' && snapshot?.emergency_stop && (
           <Alert severity="error" icon={<StopIcon />} sx={{ mb: 3 }}>
             智能体全局紧急停止已启用。所有智能体请求都会被拒绝，管理员仍可检查审计并接管租约。
           </Alert>
@@ -834,49 +866,38 @@ const AgentControlCenter: React.FC = () => {
         )}
 
         <Grid container spacing={2} sx={{ mb: 3 }}>
-          <Grid
-            size={{
-              xs: 6,
-              lg: 3
-            }}>
-            <MetricCard label="活跃智能体" value={metrics.active} helper="可签发令牌的服务主体" />
-          </Grid>
-          <Grid
-            size={{
-              xs: 6,
-              lg: 3
-            }}>
-            <MetricCard label="实时租约" value={metrics.leases} helper="正在处理的工单" />
-          </Grid>
-          <Grid
-            size={{
-              xs: 6,
-              lg: 3
-            }}>
-            <MetricCard label="近期事件" value={metrics.recentEvents} helper="最近一页领域事件" />
-          </Grid>
-          <Grid
-            size={{
-              xs: 6,
-              lg: 3
-            }}>
-            <MetricCard label="投递失败" value={metrics.failedDeliveries} helper="需要关注的事件投递记录" />
-          </Grid>
+          {surface === 'agent' ? (
+            <>
+              <Grid size={{ xs: 12, sm: 6 }}>
+                <MetricCard label="活跃智能体" value={metrics.active} helper="可签发令牌的服务主体" />
+              </Grid>
+              <Grid size={{ xs: 12, sm: 6 }}>
+                <MetricCard label="实时租约" value={metrics.leases} helper="正在处理的工单" />
+              </Grid>
+            </>
+          ) : (
+            <>
+              <Grid size={{ xs: 12, sm: 6 }}>
+                <MetricCard label="近期事件" value={metrics.recentEvents} helper="最近一页领域事件" />
+              </Grid>
+              <Grid size={{ xs: 12, sm: 6 }}>
+                <MetricCard label="投递失败" value={metrics.failedDeliveries} helper="需要关注的事件投递记录" />
+              </Grid>
+            </>
+          )}
         </Grid>
 
         <Paper variant="outlined">
           <Tabs
             value={tab}
-            onChange={(_, nextTab: number) => setTab(nextTab)}
+            onChange={(_, nextTab: AgentControlTab) => setTab(nextTab)}
             variant="scrollable"
             scrollButtons="auto"
-            aria-label="AI 智能体控制面数据"
+            aria-label={surface === 'agent' ? 'AI 智能体控制面数据' : '集成运行监控数据'}
           >
-            <Tab label="服务主体" />
-            <Tab label="实时租约" />
-            <Tab label="领域事件" />
-            <Tab label="事件投递（Outbox）" />
-            <Tab label="策略审计" />
+            {surfaceTabs[surface].map((item) => (
+              <Tab key={item.id} value={item.id} label={item.label} />
+            ))}
           </Tabs>
           <Divider />
 
@@ -898,7 +919,7 @@ const AgentControlCenter: React.FC = () => {
             </Stack>
           ) : (
             <TableContainer>
-              {tab === 0 && (
+              {tab === 'principals' && (
                 <ResizableMuiTable tableId="agent-control.principals" columns={principalColumns} size="small" aria-label="服务主体列表">
                   <TableHead>
                     <TableRow>
@@ -1008,7 +1029,7 @@ const AgentControlCenter: React.FC = () => {
                 </ResizableMuiTable>
               )}
 
-              {tab === 1 && (
+              {tab === 'leases' && (
                 <ResizableMuiTable tableId="agent-control.leases" columns={leaseColumns} size="small" aria-label="工单租约列表">
                   <TableHead>
                     <TableRow>
@@ -1046,7 +1067,7 @@ const AgentControlCenter: React.FC = () => {
                 </ResizableMuiTable>
               )}
 
-              {tab === 2 && (
+              {tab === 'events' && (
                 <ResizableMuiTable tableId="agent-control.events" columns={eventColumns} size="small" aria-label="领域事件列表">
                   <TableHead>
                     <TableRow>
@@ -1082,7 +1103,7 @@ const AgentControlCenter: React.FC = () => {
                 </ResizableMuiTable>
               )}
 
-              {tab === 3 && (
+              {tab === 'outbox' && (
                 <ResizableMuiTable tableId="agent-control.outbox" columns={outboxColumns} size="small" aria-label="事件投递列表">
                   <TableHead>
                     <TableRow>
@@ -1138,7 +1159,7 @@ const AgentControlCenter: React.FC = () => {
                 </ResizableMuiTable>
               )}
 
-              {tab === 4 && (
+              {tab === 'policy' && (
                 <ResizableMuiTable tableId="agent-control.policy-audit" columns={policyAuditColumns} size="small" aria-label="智能体策略决策审计">
                   <TableHead>
                     <TableRow>

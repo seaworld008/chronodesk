@@ -27,6 +27,7 @@ import {
   automationTriggerEventChoices,
   automationTriggerEventLabel,
 } from './triggerEvents'
+import AutomationTabs from './AutomationTabs'
 
 const ruleTypeChoices = [
   { id: 'assignment', name: '自动分配' },
@@ -55,7 +56,9 @@ const ListActions = () => (
 )
 
 const AutomationRuleList: React.FC = () => (
-  <List
+  <>
+    <AutomationTabs />
+    <List
     perPage={25}
     sort={{ field: 'priority', order: 'ASC' }}
     actions={<ListActions />}
@@ -129,7 +132,8 @@ const AutomationRuleList: React.FC = () => (
         </Stack>
       </WrapperField>
     </EnterpriseDatagrid>
-  </List>
+    </List>
+  </>
 )
 
 export default AutomationRuleList

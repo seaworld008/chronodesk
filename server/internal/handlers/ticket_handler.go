@@ -322,6 +322,16 @@ func (h *TicketHandler) CreateTicket(c *gin.Context) {
 	ticket, err := h.ticketService.CreateTicket(ctx, &req, userID.(uint))
 	if err != nil {
 		switch {
+		case errors.Is(err, services.ErrInvalidTicketTags):
+			writeHumanTicketProblem(
+				c,
+				http.StatusUnprocessableEntity,
+				"invalid_request",
+				"工单标签无效",
+				"标签最多 20 个，且每个标签不能超过 50 个字符",
+				false,
+			)
+			return
 		case errors.Is(err, services.ErrTicketCreateAccessDenied):
 			writeHumanTicketProblem(
 				c,
@@ -439,6 +449,17 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 	if err != nil {
 		if errors.Is(err, services.ErrVersionConflict) {
 			writeTicketVersionConflict(c)
+			return
+		}
+		if errors.Is(err, services.ErrInvalidTicketTags) {
+			writeHumanTicketProblem(
+				c,
+				http.StatusUnprocessableEntity,
+				"invalid_request",
+				"工单标签无效",
+				"标签最多 20 个，且每个标签不能超过 50 个字符",
+				false,
+			)
 			return
 		}
 		if errors.Is(err, services.ErrInvalidTicketTransition) {

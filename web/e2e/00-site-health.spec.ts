@@ -15,18 +15,25 @@ type PrimaryPageCase = {
 
 const mainContent = (page: Page) => page.getByRole('main');
 
-const navigationItems = [
-    '项目仪表盘',
-    '工单管理',
-    '通知中心',
-    '平台用户管理',
-    '自动化规则',
-    '自动化日志',
-    'Webhook 集成',
-    '系统设置',
-    '平台审计',
-    'AI 智能体控制',
-    '账号安全',
+const navigationTree = [
+    { label: '工作台', children: ['跨项目工作台'] },
+    {
+        label: '项目运营',
+        children: ['项目概览', '工单管理', '项目通知'],
+    },
+    { label: '智能运营', children: ['AI 智能体', '自动化'] },
+    { label: '集成中心', children: ['Webhook', '事件投递'] },
+    { label: '项目配置', children: ['项目成员'] },
+    {
+        label: '治理中心',
+        children: [
+            '项目治理',
+            '平台身份与访问',
+            '公共配置',
+            '系统设置',
+            '审计中心',
+        ],
+    },
 ] as const;
 
 type NavigationViewport = {
@@ -152,7 +159,7 @@ const primaryPages: PrimaryPageCase[] = [
         path: '/#/system-settings',
         ready: (page) =>
             mainContent(page).getByRole('heading', {
-                name: '系统设置入口',
+                name: '平台公共配置',
                 exact: true,
             }),
     },
@@ -162,7 +169,7 @@ const primaryPages: PrimaryPageCase[] = [
         path: '/#/system-settings/overview',
         ready: (page) =>
             mainContent(page).getByRole('heading', {
-                name: '系统设置概览',
+                name: '平台公共配置',
                 exact: true,
             }),
     },
@@ -172,7 +179,7 @@ const primaryPages: PrimaryPageCase[] = [
         path: '/#/email-settings',
         ready: (page) =>
             mainContent(page).getByRole('heading', {
-                name: '邮件通知配置',
+                name: '平台邮件设置',
                 exact: true,
             }),
     },
@@ -322,40 +329,53 @@ const expectSidebarUsable = async (
         ).toBeGreaterThan(scrollMetrics!.clientHeight);
     }
 
-    for (const itemName of navigationItems) {
-        const item = menu.getByRole('menuitem', {
-            name: itemName,
-            exact: true,
+    for (const group of navigationTree) {
+        const toggle = menu.getByRole('button', {
+            name: new RegExp(`^${group.label}`),
         });
-        await item.scrollIntoViewIfNeeded();
-        await expect(item).toBeVisible();
-        await expect(item).toBeInViewport({ ratio: 0.5 });
-        const itemBox = await item.boundingBox();
-        expect(itemBox, `${itemName} 必须具有可交互矩形`).not.toBeNull();
-        expect(itemBox!.x).toBeGreaterThanOrEqual(scrollMetrics!.left - 1);
-        expect(itemBox!.x + itemBox!.width).toBeLessThanOrEqual(
-            scrollMetrics!.right + 1,
-        );
-        expect(itemBox!.y).toBeGreaterThanOrEqual(
-            Math.max(0, scrollMetrics!.top) - 1,
-        );
-        expect(itemBox!.y + itemBox!.height).toBeLessThanOrEqual(
-            Math.min(page.viewportSize()!.height, scrollMetrics!.bottom) + 1,
-        );
-        expect(
-            await item.evaluate((element) => {
-                const box = element.getBoundingClientRect();
-                const hit = document.elementFromPoint(
-                    box.left + box.width / 2,
-                    box.top + box.height / 2,
-                );
-                return (
-                    hit === element ||
-                    (hit !== null && element.contains(hit))
-                );
-            }),
-            `${itemName} 的中心点不能被内容层或遮罩挡住`,
-        ).toBe(true);
+        await toggle.scrollIntoViewIfNeeded();
+        await expect(toggle).toBeVisible();
+        await expect(toggle).toHaveAttribute('aria-controls');
+        if ((await toggle.getAttribute('aria-expanded')) !== 'true') {
+            await toggle.click();
+        }
+        await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+
+        for (const itemName of group.children) {
+            const item = menu.getByRole('menuitem', {
+                name: itemName,
+                exact: true,
+            });
+            await item.scrollIntoViewIfNeeded();
+            await expect(item).toBeVisible();
+            await expect(item).toBeInViewport({ ratio: 0.5 });
+            const itemBox = await item.boundingBox();
+            expect(itemBox, `${itemName} 必须具有可交互矩形`).not.toBeNull();
+            expect(itemBox!.x).toBeGreaterThanOrEqual(scrollMetrics!.left - 1);
+            expect(itemBox!.x + itemBox!.width).toBeLessThanOrEqual(
+                scrollMetrics!.right + 1,
+            );
+            expect(itemBox!.y).toBeGreaterThanOrEqual(
+                Math.max(0, scrollMetrics!.top) - 1,
+            );
+            expect(itemBox!.y + itemBox!.height).toBeLessThanOrEqual(
+                Math.min(page.viewportSize()!.height, scrollMetrics!.bottom) + 1,
+            );
+            expect(
+                await item.evaluate((element) => {
+                    const box = element.getBoundingClientRect();
+                    const hit = document.elementFromPoint(
+                        box.left + box.width / 2,
+                        box.top + box.height / 2,
+                    );
+                    return (
+                        hit === element ||
+                        (hit !== null && element.contains(hit))
+                    );
+                }),
+                `${itemName} 的中心点不能被内容层或遮罩挡住`,
+            ).toBe(true);
+        }
     }
 
     // 大于 MUI `sm` 断点时使用永久侧栏，内容区不能覆盖导航；

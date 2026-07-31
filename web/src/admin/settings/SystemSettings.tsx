@@ -32,6 +32,7 @@ import {
   ResizableMuiTable,
   type ResizableColumn,
 } from '@/components/tables/EnterpriseTable'
+import SettingsTabs from './SettingsTabs'
 
 const systemConfigColumns: ResizableColumn[] = [
   { key: 'config', defaultWidth: 260, minWidth: 180, maxWidth: 460 },
@@ -263,6 +264,7 @@ const SystemSettings: React.FC = () => {
 
   return (
     <Box sx={{ p: 3 }}>
+      <SettingsTabs />
       <Stack
         direction="row"
         sx={{
@@ -274,7 +276,12 @@ const SystemSettings: React.FC = () => {
           alignItems: "center"
         }}>
           <BackButton fallbackPath="/system-settings" />
-          <Typography variant="h4">系统设置概览</Typography>
+          <Box>
+            <Typography variant="h4">平台公共配置</Typography>
+            <Typography color="text.secondary">
+              仅管理平台级公共默认与安全基线，不修改当前项目的版本化配置。
+            </Typography>
+          </Box>
         </Stack>
         <Stack direction="row" spacing={1}>
           <Button startIcon={<RefreshIcon />} onClick={handleRefresh}>刷新</Button>

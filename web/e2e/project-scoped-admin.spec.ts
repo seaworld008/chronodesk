@@ -446,7 +446,33 @@ const expectMenuItem = async (
     name: string,
     visible: boolean,
 ) => {
-    const item = page.getByRole('menuitem', { name, exact: true });
+    const navigationNames: Record<string, { group: string; leaf: string }> = {
+        平台用户管理: { group: '治理中心', leaf: '平台身份与访问' },
+        系统设置: { group: '治理中心', leaf: '系统设置' },
+        平台审计: { group: '治理中心', leaf: '审计中心' },
+        工单管理: { group: '项目运营', leaf: '工单管理' },
+        通知中心: { group: '项目运营', leaf: '项目通知' },
+        自动化规则: { group: '智能运营', leaf: '自动化' },
+        自动化日志: { group: '智能运营', leaf: '自动化' },
+        'Webhook 集成': { group: '集成中心', leaf: 'Webhook' },
+        'AI 智能体控制': { group: '智能运营', leaf: 'AI 智能体' },
+    };
+    const target = navigationNames[name] ?? { group: '', leaf: name };
+    if (target.group) {
+        const toggle = page.getByRole('button', {
+            name: new RegExp(`^${target.group}`),
+        });
+        if (
+            (await toggle.count()) > 0 &&
+            (await toggle.getAttribute('aria-expanded')) !== 'true'
+        ) {
+            await toggle.click();
+        }
+    }
+    const item = page.getByRole('menuitem', {
+        name: target.leaf,
+        exact: true,
+    });
     if (visible) {
         await expect(item).toBeVisible();
         return;

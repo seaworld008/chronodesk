@@ -103,6 +103,8 @@ const (
 // AgentNativeErrorCode turns exported sentinel errors into stable API codes.
 func AgentNativeErrorCode(err error) string {
 	switch {
+	case errors.Is(err, ErrInvalidTicketTags):
+		return "invalid_request"
 	case errors.Is(err, ErrInvalidAssignee):
 		return "invalid_assignee"
 	case errors.Is(err, ErrAssigneeNotFound):
@@ -4638,6 +4640,11 @@ func (s *AgentNativeService) CreateNativeTicket(
 	if !status.IsValid() {
 		return nil, fmt.Errorf("invalid ticket status %q", status)
 	}
+	normalizedTags, err := normalizeTicketTags(input.Request.Tags)
+	if err != nil {
+		return nil, err
+	}
+	input.Request.Tags = normalizedTags
 	if input.TrustLevel == "" {
 		input.TrustLevel = models.TicketTrustLevelUntrusted
 	} else if !validTrustLevel(input.TrustLevel) {

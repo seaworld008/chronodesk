@@ -28,10 +28,10 @@ import {
 } from '@mui/material';
 import { minCharacters, maxCharacters } from '@/lib/validators';
 import {
-    formatTagsInputValue,
     formatCustomFieldsInputValue,
     validateCustomFieldsInput,
 } from './tagUtils';
+import TagChipInput from './TagChipInput';
 import BackButton from '../common/BackButton';
 import {
     canDeleteTicket,
@@ -392,12 +392,11 @@ const TicketEdit: React.FC = () => {
                                 />
                                 <CardContent>
                                     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                                        <TextInput
+                                        <TagChipInput
                                             source="tags"
                                             label="标签"
                                             fullWidth
-                                            helperText="用逗号分隔多个标签"
-                                            format={formatTagsInputValue}
+                                            helperText="输入标签后按回车"
                                         />
 
                                         {!requester && (

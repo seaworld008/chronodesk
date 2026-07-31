@@ -110,14 +110,22 @@ test.describe('Navigation', () => {
     });
 
     test('should navigate to users page', async ({ page }) => {
+        const governance = page.getByRole('button', { name: /^治理中心/ });
+        if ((await governance.getAttribute('aria-expanded')) !== 'true') {
+            await governance.click();
+        }
         await page
-            .getByRole('menuitem', { name: '平台用户管理' })
+            .getByRole('menuitem', { name: '平台身份与访问' })
             .click();
         await expect(page).toHaveURL(/#\/users/);
     });
 
     test('should navigate to system settings', async ({ page }) => {
+        const governance = page.getByRole('button', { name: /^治理中心/ });
+        if ((await governance.getAttribute('aria-expanded')) !== 'true') {
+            await governance.click();
+        }
         await page.getByRole('menuitem', { name: '系统设置' }).click();
-        await expect(page).toHaveURL(/#\/system-settings/);
+        await expect(page).toHaveURL(/#\/system-settings\/email/);
     });
 });

@@ -27,6 +27,10 @@ import {
   Typography,
 } from '@mui/material'
 import type { TableProps } from '@mui/material'
+import {
+  currentPageSelectionState,
+  updateCurrentPageSelection,
+} from './currentPageSelection'
 
 export interface ResizableColumn {
   key: string
@@ -234,6 +238,7 @@ interface DatagridFieldProps {
 type DatagridField = React.ReactElement<DatagridFieldProps>
 
 interface ResizableDatagridHeaderProps extends DatagridHeaderProps {
+  tableId: string
   columns: NormalizedColumn[]
   widths: Record<string, number>
   resizingKey: string | null
@@ -249,6 +254,7 @@ const ResizableDatagridHeader = ({
   hasExpand = false,
   hasBulkActions = false,
   isRowSelectable,
+  tableId,
   columns,
   widths,
   resizingKey,
@@ -261,26 +267,27 @@ const ResizableDatagridHeader = ({
   const tableHeadRef = useRef<HTMLTableSectionElement>(null)
   const { sort, data, onSelect, selectedIds, setSort } = useListContextWithProps(listContextProps)
 
-  const selectableIds = Array.isArray(data)
-    ? data
-      .filter((record) => !isRowSelectable || isRowSelectable(record))
-      .map((record) => record.id)
-    : []
+  const selectableIds = useMemo(
+    () => Array.isArray(data)
+      ? data
+        .filter((record) => !isRowSelectable || isRowSelectable(record))
+        .map((record) => record.id)
+      : [],
+    [data, isRowSelectable],
+  )
+  const currentPageSelection = currentPageSelectionState(
+    selectableIds,
+    selectedIds ?? [],
+  )
 
   const handleSelectAll = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
-    if (!onSelect || !selectedIds || !data) return
-    onSelect(
-      event.target.checked
-        ? selectedIds.concat(
-          data
-            .filter((record) =>
-              !selectedIds.includes(record.id) &&
-              (!isRowSelectable || isRowSelectable(record)))
-            .map((record) => record.id),
-        )
-        : selectedIds.filter((id) => !data.some((record) => record.id === id)),
-    )
-  }, [data, isRowSelectable, onSelect, selectedIds])
+    if (!onSelect || !selectedIds) return
+    onSelect(updateCurrentPageSelection(
+      selectedIds,
+      selectableIds,
+      event.target.checked,
+    ))
+  }, [onSelect, selectableIds, selectedIds])
 
   const fields = Children.toArray(children).filter(isValidElement) as DatagridField[]
   const totalWidth = columns.reduce(
@@ -311,18 +318,31 @@ const ResizableDatagridHeader = ({
             padding="checkbox"
             className="RaDatagrid-headerCell cd-table-selection-column"
           >
-            <Checkbox
-              slotProps={{ input: { 'aria-label': '选择当前页全部记录' } }}
-              className="select-all"
-              color="primary"
-              checked={
-                selectedIds.length > 0 &&
-                selectableIds.length > 0 &&
-                selectableIds.every((id) => selectedIds.includes(id))
-              }
-              onChange={handleSelectAll}
-              onClick={(event) => event.stopPropagation()}
-            />
+            <Tooltip title="仅选择当前页可选记录，不会选择其他分页中的记录">
+              <span>
+                <Checkbox
+                  slotProps={{
+                    input: {
+                      'aria-label': '选择当前页全部可选记录',
+                      'aria-describedby': `${tableId}-current-page-selection-help`,
+                    },
+                  }}
+                  className="select-all"
+                  color="primary"
+                  checked={currentPageSelection.allSelected}
+                  indeterminate={currentPageSelection.indeterminate}
+                  disabled={selectableIds.length === 0}
+                  onChange={handleSelectAll}
+                  onClick={(event) => event.stopPropagation()}
+                />
+                <span
+                  id={`${tableId}-current-page-selection-help`}
+                  hidden
+                >
+                  批量选择仅应用于当前页，不会选择全部匹配结果
+                </span>
+              </span>
+            </Tooltip>
           </TableCell>
         )}
         {fields.map((field, index) => {
@@ -433,6 +453,7 @@ export const PersistentResizableDatagridHeader = ({
   return (
     <ResizableDatagridHeader
       {...props}
+      tableId={tableId}
       children={children}
       columns={columns}
       widths={widths}
@@ -488,6 +509,7 @@ export const EnterpriseDatagrid = React.forwardRef<HTMLTableElement, EnterpriseD
     // and dropping keyboard focus after every width update.
     const header = (
       <ResizableDatagridHeader
+        tableId={tableId}
         columns={columns}
         widths={widths}
         resizingKey={resizingKey}

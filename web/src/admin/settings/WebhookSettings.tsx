@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Box,
   Button,
+  Checkbox,
   Chip,
   CircularProgress,
   Dialog,
@@ -13,6 +14,7 @@ import {
   Grid,
   IconButton,
   InputLabel,
+  ListItemText,
   MenuItem,
   Paper,
   Select,
@@ -149,6 +151,37 @@ const transitionStatusOptions = [
 
 const transitionStatusLabel = (status: string) =>
   transitionStatusOptions.find((item) => item.value === status)?.label ?? '未知状态'
+
+const renderSelectedValues = (
+  selected: readonly string[],
+  label: (value: string) => string,
+  emptyLabel = '未选择',
+) => {
+  if (selected.length === 0) {
+    return <Typography color="text.secondary">{emptyLabel}</Typography>
+  }
+  const visible = selected.slice(0, 3)
+  return (
+    <Stack
+      component="span"
+      direction="row"
+      spacing={0.5}
+      sx={{ alignItems: 'center', minWidth: 0, overflow: 'hidden' }}
+    >
+      {visible.map((value) => (
+        <Chip
+          key={value}
+          size="small"
+          label={label(value)}
+          sx={{ maxWidth: 180 }}
+        />
+      ))}
+      {selected.length > visible.length && (
+        <Chip size="small" label={`+${selected.length - visible.length}`} />
+      )}
+    </Stack>
+  )
+}
 
 const webhookEventSummary = (webhook: WebhookConfig) => {
   const statuses = webhook.filter_rules_obj?.transition_statuses ?? []
@@ -731,17 +764,47 @@ const WebhookSettings: React.FC = () => {
                   multiple
                   value={form.enabled_events}
                   onChange={handleEventsChange}
-                  renderValue={(selected) => selected.map(eventLabel).join('、')}
+                  renderValue={(selected) =>
+                    renderSelectedValues(selected, eventLabel)
+                  }
+                  inputProps={{
+                    'aria-describedby': `${webhookFormFieldIDs.enabledEvents}-help`,
+                  }}
                 >
                   {eventOptions.map((evt) => (
                     <MenuItem key={evt} value={evt}>
-                      {eventLabel(evt)}（{evt}）
+                      <Checkbox
+                        checked={form.enabled_events.includes(evt)}
+                        tabIndex={-1}
+                        disableRipple
+                      />
+                      <ListItemText
+                        primary={eventLabel(evt)}
+                        secondary={evt}
+                      />
                     </MenuItem>
                   ))}
                 </Select>
-                <Typography variant="caption" color={errors.enabled_events ? 'error' : 'text.secondary'}>
-                  {errors.enabled_events || '仅支持当前完整 CloudEvent 类型；事件标识会原样写入投递日志和请求体。'}
-                </Typography>
+                <Stack
+                  id={`${webhookFormFieldIDs.enabledEvents}-help`}
+                  direction={{ xs: 'column', sm: 'row' }}
+                  spacing={1}
+                  sx={{ alignItems: { sm: 'center' }, justifyContent: 'space-between', mt: 0.5 }}
+                >
+                  <Typography variant="caption" color={errors.enabled_events ? 'error' : 'text.secondary'}>
+                    {errors.enabled_events
+                      || `已选择 ${form.enabled_events.length} 个；仅支持当前完整 CloudEvent 类型。`}
+                  </Typography>
+                  {form.enabled_events.length > 0 && (
+                    <Button
+                      size="small"
+                      onClick={() => handleFormChange('enabled_events', [])}
+                      aria-label="清空已选订阅事件"
+                    >
+                      清空
+                    </Button>
+                  )}
+                </Stack>
               </FormControl>
             </Grid>
             {form.enabled_events.includes(ticketTransitionedEvent) && (
@@ -758,23 +821,49 @@ const WebhookSettings: React.FC = () => {
                     value={form.transition_statuses}
                     onChange={handleTransitionStatusesChange}
                     renderValue={(selected) =>
-                      selected.length > 0
-                        ? selected.map(transitionStatusLabel).join('、')
-                        : '全部状态'
+                      renderSelectedValues(
+                        selected,
+                        transitionStatusLabel,
+                        '全部状态',
+                      )
                     }
+                    inputProps={{
+                      'aria-describedby': `${webhookFormFieldIDs.transitionStatuses}-help`,
+                    }}
                   >
                     {transitionStatusOptions.map((status) => (
                       <MenuItem key={status.value} value={status.value}>
-                        {status.label}（{status.value}）
+                        <Checkbox
+                          checked={form.transition_statuses.includes(status.value)}
+                          tabIndex={-1}
+                          disableRipple
+                        />
+                        <ListItemText
+                          primary={status.label}
+                          secondary={status.value}
+                        />
                       </MenuItem>
                     ))}
                   </Select>
-                  <Typography variant="caption" color="text.secondary">
-                    留空表示订阅全部状态流转。若只关心已解决或已关闭，请在此明确选择，事件类型仍为
-                    {' '}
-                    {ticketTransitionedEvent}
-                    。
-                  </Typography>
+                  <Stack
+                    id={`${webhookFormFieldIDs.transitionStatuses}-help`}
+                    direction={{ xs: 'column', sm: 'row' }}
+                    spacing={1}
+                    sx={{ alignItems: { sm: 'center' }, justifyContent: 'space-between', mt: 0.5 }}
+                  >
+                    <Typography variant="caption" color="text.secondary">
+                      已选择 {form.transition_statuses.length} 个；留空表示订阅全部状态流转。
+                    </Typography>
+                    {form.transition_statuses.length > 0 && (
+                      <Button
+                        size="small"
+                        onClick={() => handleFormChange('transition_statuses', [])}
+                        aria-label="清空已选状态流转筛选"
+                      >
+                        清空
+                      </Button>
+                    )}
+                  </Stack>
                 </FormControl>
               </Grid>
             )}

@@ -8,12 +8,22 @@ import {
     type LayoutProps,
     usePermissions,
 } from 'react-admin'
-import { Navigate, Route, useNavigate } from 'react-router-dom'
+import {
+    Navigate,
+    Route,
+    useLocation,
+    useNavigate,
+} from 'react-router-dom'
 import {
     Alert,
     Box,
     Button,
     CircularProgress,
+    Collapse,
+    List,
+    ListItemButton,
+    ListItemIcon,
+    ListItemText,
     Paper,
     Stack,
     Typography,
@@ -40,6 +50,7 @@ import {
     projectRoleValues,
     clearActiveProjectSelection,
     resolveActiveProjectAccess,
+    readHumanSessionBinding,
     setActiveProjectKey,
     type AuthorizedProject,
     type ProjectCapability,
@@ -61,6 +72,10 @@ import {
     Notifications as NotificationIcon,
     People as UsersIcon,
     AccountTree as PlatformProjectsIcon,
+    ExpandLess,
+    ExpandMore,
+    Home as HomeIcon,
+    Hub as IntegrationRuntimeIcon,
     Security as SecurityIcon,
     SmartToy as AgentIcon,
     Webhook as WebhookIcon,
@@ -71,6 +86,22 @@ import { CustomAppBar } from './layout/CustomAppBar'
 import LoginPage from './components/auth/LoginPage'
 import { AppNotification } from './components/layout/AppNotification'
 import { i18nProvider, muiZhCN } from './i18n'
+import {
+    visibleNavigationNodes,
+    type NavigationIcon,
+} from './navigation/navigationRegistry'
+import {
+    expandActiveNavigationGroup,
+    findActiveNavigationGroupID,
+    isNavigationItemActive,
+    isNavigationToggleKey,
+    loadNavigationGroupState,
+    navigationStateStorageKey,
+    saveNavigationGroupState,
+    toggleNavigationGroup,
+    validNavigationGroupIDs,
+    type NavigationGroupState,
+} from './navigation/navigationTreeState'
 
 const PageLoading = () => (
     <Box
@@ -125,15 +156,16 @@ const AutomationRuleEdit = lazyPage(
 const AutomationLogList = lazyPage(
     () => import('./admin/automation/AutomationLogList'),
 )
-const SimpleWorkingSystemSettings = lazyPage(
-    () => import('./admin/settings/SimpleWorkingSystemSettings'),
-)
 const EmailSettings = lazyPage(() => import('./admin/settings/EmailSettings'))
 const WebhookSettings = lazyPage(() => import('./admin/settings/WebhookSettings'))
 const SystemSettings = lazyPage(() => import('./admin/settings/SystemSettings'))
 const TrustedDevices = lazyPage(() => import('./admin/security/TrustedDevices'))
+const LoginHistory = lazyPage(() => import('./admin/security/LoginHistory'))
 const AgentControlCenter = lazyPage(
     () => import('./admin/agents/AgentControlCenter'),
+)
+const IntegrationRuntime = lazyPage(
+    () => import('./admin/integrations/IntegrationRuntime'),
 )
 const CrossProjectWorkbench = lazyPage(
     () => import('./admin/workbench/CrossProjectWorkbench'),
@@ -503,7 +535,7 @@ const PlatformHome = ({ permissions }: { permissions: AccessPermissions }) => {
                 platformRole,
                 'manage_platform_settings',
             ),
-            label: '系统设置',
+            label: '平台公共配置',
             path: '/system-settings',
         },
         {
@@ -591,114 +623,228 @@ const HomeDashboard = () => {
     return <NoAuthorizedProjects />
 }
 
+const navigationIcons: Record<NavigationIcon, React.ReactElement> = {
+    home: <HomeIcon />,
+    workbench: <WorkbenchIcon />,
+    tickets: <TicketIcon />,
+    notifications: <NotificationIcon />,
+    automation: <AutomationIcon />,
+    agents: <AgentIcon />,
+    webhook: <WebhookIcon />,
+    integrationRuntime: <IntegrationRuntimeIcon />,
+    memberships: <MembershipIcon />,
+    users: <UsersIcon />,
+    projects: <PlatformProjectsIcon />,
+    settings: <AdminIcon />,
+    audit: <AuditIcon />,
+    security: <SecurityIcon />,
+    loginHistory: <HistoryIcon />,
+}
+
+const useNavigationTreeState = (
+    nodes: ReturnType<typeof visibleNavigationNodes>,
+) => {
+    const { pathname } = useLocation()
+    const session = readHumanSessionBinding()
+    const sessionSubject = session?.subject ?? ''
+    const sessionID = session?.session_id ?? ''
+    const binding = React.useMemo(
+        () => sessionSubject && sessionID
+            ? { subject: sessionSubject, session_id: sessionID }
+            : null,
+        [sessionID, sessionSubject],
+    )
+    const bindingKey = binding ? navigationStateStorageKey(binding) : ''
+    const groupIDs = React.useMemo(
+        () => validNavigationGroupIDs(nodes),
+        [nodes],
+    )
+    const activeGroupID = React.useMemo(
+        () => findActiveNavigationGroupID(nodes, pathname),
+        [nodes, pathname],
+    )
+    const loadState = React.useCallback(() => {
+        const stored = binding
+            ? loadNavigationGroupState(localStorage, binding, groupIDs)
+            : {}
+        return expandActiveNavigationGroup(stored, activeGroupID)
+    }, [activeGroupID, binding, groupIDs])
+    const [expanded, setExpanded] =
+        React.useState<NavigationGroupState>(loadState)
+    const loadedBindingKey = React.useRef(bindingKey)
+
+    React.useEffect(() => {
+        if (loadedBindingKey.current === bindingKey) return
+        loadedBindingKey.current = bindingKey
+        setExpanded(loadState())
+    }, [bindingKey, loadState])
+
+    React.useEffect(() => {
+        setExpanded((current) => {
+            const next = expandActiveNavigationGroup(
+                current,
+                activeGroupID,
+            )
+            if (next !== current && binding) {
+                saveNavigationGroupState(
+                    localStorage,
+                    binding,
+                    next,
+                    groupIDs,
+                )
+            }
+            return next
+        })
+    }, [activeGroupID, binding, groupIDs])
+
+    const toggleGroup = React.useCallback((groupID: string) => {
+        setExpanded((current) => {
+            const next = toggleNavigationGroup(
+                current,
+                groupID,
+                activeGroupID,
+            )
+            if (binding) {
+                saveNavigationGroupState(
+                    localStorage,
+                    binding,
+                    next,
+                    groupIDs,
+                )
+            }
+            return next
+        })
+    }, [activeGroupID, binding, groupIDs])
+
+    return { activeGroupID, expanded, pathname, toggleGroup }
+}
+
 const CustomMenu: React.FC = () => {
     const { permissions } = usePermissions<AccessPermissions>()
     const { access, isPending } = useActiveProjectAccess()
     const projectRole = parseProjectRole(access?.project_role)
     const hasProject = !isPending && projectRole !== null
+    const platformRole = parsePlatformRole(permissions?.platform_role)
+    const nodes = React.useMemo(
+        () => visibleNavigationNodes('sidebar', {
+            platformRole,
+            projectRole,
+            hasProject,
+        }),
+        [hasProject, platformRole, projectRole],
+    )
+    const {
+        activeGroupID,
+        expanded,
+        pathname,
+        toggleGroup,
+    } = useNavigationTreeState(nodes)
 
     return (
         <Menu aria-label="主导航">
-            <Menu.DashboardItem
-                primaryText={hasProject ? '项目仪表盘' : '首页'}
-            />
-            {hasProject && (
-                <>
-                    <Menu.Item
-                        to="/workbench"
-                        primaryText="我的跨项目工作台"
-                        leftIcon={<WorkbenchIcon />}
-                    />
-                    <Menu.Item
-                        to="/tickets"
-                        primaryText="工单管理"
-                        leftIcon={<TicketIcon />}
-                    />
-                    <Menu.Item
-                        to="/notifications"
-                        primaryText="通知中心"
-                        leftIcon={<NotificationIcon />}
-                    />
-                </>
-            )}
-            {hasProjectCapability(projectRole, 'manage_automation') && (
-                <>
-                    <Menu.Item
-                        to="/automation-rules"
-                        primaryText="自动化规则"
-                        leftIcon={<AutomationIcon />}
-                    />
-                    <Menu.Item
-                        to="/automation-logs"
-                        primaryText="自动化日志"
-                        leftIcon={<HistoryIcon />}
-                    />
-                </>
-            )}
-            {hasProjectCapability(projectRole, 'manage_integrations') && (
-                <Menu.Item
-                    to="/webhook-settings"
-                    primaryText="Webhook 集成"
-                    leftIcon={<WebhookIcon />}
-                />
-            )}
-            {projectRole === 'project_admin' && (
-                <Menu.Item
-                    to="/project-memberships"
-                    primaryText="项目成员管理"
-                    leftIcon={<MembershipIcon />}
-                />
-            )}
-            {projectRole === 'project_admin' && (
-                <Menu.Item
-                    to="/agent-control"
-                    primaryText="AI 智能体控制"
-                    leftIcon={<AgentIcon />}
-                />
-            )}
-            {hasPlatformCapability(
-                permissions?.platform_role,
-                'manage_platform_users',
-            ) && (
-                <Menu.Item
-                    to="/users"
-                    primaryText="平台用户管理"
-                    leftIcon={<UsersIcon />}
-                />
-            )}
-            {parsePlatformRole(permissions?.platform_role) ===
-                'platform_admin' && (
-                <Menu.Item
-                    to="/platform/projects"
-                    primaryText="平台项目治理"
-                    leftIcon={<PlatformProjectsIcon />}
-                />
-            )}
-            {hasPlatformCapability(
-                permissions?.platform_role,
-                'manage_platform_settings',
-            ) && (
-                <Menu.Item
-                    to="/system-settings"
-                    primaryText="系统设置"
-                    leftIcon={<AdminIcon />}
-                />
-            )}
-            {hasPlatformCapability(
-                permissions?.platform_role,
-                'view_platform_audit',
-            ) && (
-                <Menu.Item
-                    to="/platform/audit"
-                    primaryText="平台审计"
-                    leftIcon={<AuditIcon />}
-                />
-            )}
-            <Menu.Item
-                to="/account/trusted-devices"
-                primaryText="账号安全"
-                leftIcon={<SecurityIcon />}
-            />
+            {nodes.map((node, nodeIndex) => {
+                if (node.kind === 'leaf') {
+                    const active = isNavigationItemActive(node, pathname)
+                    return (
+                        <Menu.Item
+                            key={node.id}
+                            to={node.path}
+                            primaryText={node.label}
+                            leftIcon={navigationIcons[node.icon]}
+                            aria-current={active ? 'page' : undefined}
+                            sx={{
+                                py: 0.75,
+                                bgcolor: active
+                                    ? 'action.selected'
+                                    : undefined,
+                            }}
+                        />
+                    )
+                }
+                const contentID = `navigation-group-${node.id}-children`
+                const isExpanded = expanded[node.id] === true
+                const isActive = activeGroupID === node.id
+                return (
+                    <Box component="li" key={node.id} sx={{ listStyle: 'none' }}>
+                        <ListItemButton
+                            component="button"
+                            type="button"
+                            aria-expanded={isExpanded}
+                            aria-controls={contentID}
+                            data-testid={`navigation-group-${nodeIndex}-toggle`}
+                            onClick={() => toggleGroup(node.id)}
+                            onKeyDown={(event) => {
+                                if (!isNavigationToggleKey(event.key)) return
+                                event.preventDefault()
+                                toggleGroup(node.id)
+                            }}
+                            sx={{
+                                width: '100%',
+                                color: isActive
+                                    ? 'primary.main'
+                                    : 'text.secondary',
+                                bgcolor: isActive
+                                    ? 'action.selected'
+                                    : undefined,
+                                py: 0.75,
+                            }}
+                        >
+                            <ListItemIcon sx={{ minWidth: 36 }}>
+                                {navigationIcons[node.icon]}
+                            </ListItemIcon>
+                            <ListItemText
+                                primary={node.label}
+                                slotProps={{
+                                    primary: {
+                                        variant: 'body2',
+                                        sx: {
+                                            fontWeight: isActive ? 700 : 600,
+                                        },
+                                    },
+                                }}
+                            />
+                            {isExpanded ? <ExpandLess /> : <ExpandMore />}
+                        </ListItemButton>
+                        <Collapse
+                            in={isExpanded}
+                            timeout="auto"
+                            unmountOnExit
+                            id={contentID}
+                        >
+                            <List
+                                component="div"
+                                role="group"
+                                aria-label={`${node.label}导航`}
+                                disablePadding
+                            >
+                                {node.children.map((item) => {
+                                    const active = isNavigationItemActive(
+                                        item,
+                                        pathname,
+                                    )
+                                    return (
+                                        <Menu.Item
+                                            key={item.id}
+                                            to={item.path}
+                                            primaryText={item.label}
+                                            leftIcon={navigationIcons[item.icon]}
+                                            aria-current={
+                                                active ? 'page' : undefined
+                                            }
+                                            sx={{
+                                                pl: 4,
+                                                bgcolor: active
+                                                    ? 'action.selected'
+                                                    : undefined,
+                                            }}
+                                        />
+                                    )
+                                })}
+                            </List>
+                        </Collapse>
+                    </Box>
+                )
+            })}
         </Menu>
     )
 }
@@ -840,22 +986,18 @@ const AdminApp: React.FC = () => (
         <CustomRoutes>
             <Route
                 path="/workbench"
-                element={
-                    <ProjectRequiredRoute>
-                        <CrossProjectWorkbench />
-                    </ProjectRequiredRoute>
-                }
+                element={<CrossProjectWorkbench />}
             />
             <Route
                 path="/system-settings"
                 element={
                     <PlatformCapabilityRoute capability="manage_platform_settings">
-                        <SimpleWorkingSystemSettings />
+                        <SystemSettings />
                     </PlatformCapabilityRoute>
                 }
             />
             <Route
-                path="/email-settings"
+                path="/system-settings/email"
                 element={
                     <PlatformCapabilityRoute capability="manage_email_settings">
                         <EmailSettings />
@@ -863,11 +1005,30 @@ const AdminApp: React.FC = () => (
                 }
             />
             <Route
+                path="/email-settings"
+                element={
+                    <PlatformCapabilityRoute capability="manage_email_settings">
+                        <Navigate to="/system-settings/email" replace />
+                    </PlatformCapabilityRoute>
+                }
+            />
+            <Route
                 path="/system-settings/overview"
                 element={
                     <PlatformCapabilityRoute capability="manage_platform_settings">
-                        <SystemSettings />
+                        <Navigate to="/system-settings" replace />
                     </PlatformCapabilityRoute>
+                }
+            />
+            <Route
+                path="/automation"
+                element={
+                    <ExactProjectRoleRoute
+                        roles={projectRoleValues}
+                        capability="manage_automation"
+                    >
+                        <Navigate to="/automation-rules" replace />
+                    </ExactProjectRoleRoute>
                 }
             />
             <Route
@@ -920,8 +1081,23 @@ const AdminApp: React.FC = () => (
                 }
             />
             <Route
+                path="/integration-runtime"
+                element={
+                    <ExactProjectRoleRoute
+                        roles={['project_admin']}
+                        capability="manage_agents"
+                    >
+                        <IntegrationRuntime />
+                    </ExactProjectRoleRoute>
+                }
+            />
+            <Route
                 path="/account/trusted-devices"
                 element={<TrustedDevices />}
+            />
+            <Route
+                path="/account/login-history"
+                element={<LoginHistory />}
             />
         </CustomRoutes>
     </Admin>

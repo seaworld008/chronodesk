@@ -238,7 +238,11 @@ func (s *AgentNativeService) buildHumanTicketUpdate(
 		add("subcategory_id", current.SubcategoryID, request.SubcategoryID, models.HistoryActionUpdate, "子分类已更新", false)
 	}
 	if request.Tags != nil {
-		add("tags", []string(current.Tags), []string(request.Tags), models.HistoryActionUpdate, "标签已更新", false)
+		normalizedTags, err := normalizeTicketTags(request.Tags)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		add("tags", []string(current.Tags), []string(normalizedTags), models.HistoryActionUpdate, "标签已更新", false)
 	}
 	if request.DueDate != nil {
 		add("due_date", current.DueDate, request.DueDate, models.HistoryActionUpdate, "截止时间已更新", true)

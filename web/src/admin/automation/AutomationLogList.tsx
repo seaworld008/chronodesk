@@ -19,6 +19,7 @@ import {
   EnterpriseBooleanFilterInput,
   EnterpriseReferenceAutocompleteInput,
 } from '@/components/inputs/EnterpriseFilterInputs'
+import AutomationTabs from './AutomationTabs'
 
 const SuccessChip: React.FC<{ value?: boolean }> = ({ value }) => (
   <Chip
@@ -101,7 +102,9 @@ const ActionsCell: React.FC<{ record?: AutomationLog }> = ({ record }) => {
 }
 
 const AutomationLogList: React.FC = () => (
-  <List
+  <>
+    <AutomationTabs />
+    <List
     perPage={25}
     sort={{ field: 'executed_at', order: 'DESC' }}
     actions={<LogListActions />}
@@ -163,7 +166,8 @@ const AutomationLogList: React.FC = () => (
       />
       <FunctionField<AutomationLog> label="动作" render={(record) => <ActionsCell record={record} />} />
     </EnterpriseDatagrid>
-  </List>
+    </List>
+  </>
 )
 
 export default AutomationLogList

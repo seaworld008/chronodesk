@@ -25,6 +25,7 @@ import {
   type TestEmailRequest,
 } from '@/lib/generated/human-api'
 import BackButton from '../common/BackButton'
+import SettingsTabs from './SettingsTabs'
 
 interface EmailForm extends EmailConfig {
   smtp_password?: string
@@ -174,6 +175,7 @@ const EmailSettings: React.FC = () => {
 
   return (
     <Box sx={{ p: 3 }}>
+      <SettingsTabs />
       <Stack
         direction="row"
         sx={{
@@ -187,12 +189,12 @@ const EmailSettings: React.FC = () => {
           <BackButton fallbackPath="/system-settings" />
           <Box>
             <Typography variant="h4" gutterBottom>
-              邮件通知配置
+              平台邮件设置
             </Typography>
             <Typography sx={{
               color: "text.secondary"
             }}>
-              配置 SMTP 服务器与模板，用于系统通知邮件发送。
+              配置平台级 SMTP 服务器与邮件模板，不修改项目配置快照。
             </Typography>
           </Box>
         </Stack>

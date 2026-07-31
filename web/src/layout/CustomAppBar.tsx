@@ -9,11 +9,19 @@ import {
 import { useNavigate } from 'react-router-dom'
 import {
   Box,
+  Chip,
   CircularProgress,
+  ListItemIcon,
+  ListItemText,
   MenuItem,
   Select,
+  Stack,
   Typography,
 } from '@mui/material'
+import {
+  History as HistoryIcon,
+  Security as SecurityIcon,
+} from '@mui/icons-material'
 import {
   activeProjectKey,
   clearActiveProjectSelection,
@@ -25,6 +33,7 @@ import {
 } from '@/lib/projectScope'
 import { projectScopeChangedEvent } from '@/lib/projectScopeEvents'
 import { logoutAllSessions } from '@/lib/authProvider'
+import { visibleNavigationItems } from '@/navigation/navigationRegistry'
 
 const LogoutAllMenuItem: React.FC = () => {
   const notify = useNotify()
@@ -47,9 +56,36 @@ const LogoutAllMenuItem: React.FC = () => {
   )
 }
 
+const accountIcons = {
+  security: <SecurityIcon fontSize="small" />,
+  loginHistory: <HistoryIcon fontSize="small" />,
+}
+
+const AccountNavigationItems: React.FC = () => {
+  const navigate = useNavigate()
+  const items = visibleNavigationItems('account', {
+    platformRole: null,
+    projectRole: null,
+    hasProject: false,
+  })
+  return items.map((item) => (
+    <MenuItem
+      key={item.id}
+      onClick={() => navigate(item.path)}
+      data-testid={`account-menu-${item.id}`}
+    >
+      <ListItemIcon>
+        {accountIcons[item.icon as keyof typeof accountIcons]}
+      </ListItemIcon>
+      <ListItemText>{item.label}</ListItemText>
+    </MenuItem>
+  ))
+}
+
 const CustomUserMenu: React.FC = () => (
   <Box data-testid="account-menu">
     <UserMenu label="账号">
+      <AccountNavigationItems />
       <LogoutAllMenuItem />
       <Logout data-testid="logout-current-session" />
     </UserMenu>
@@ -103,24 +139,72 @@ const ProjectSwitcher: React.FC = () => {
 
   if (loading) {
     return (
-      <CircularProgress
-        color="inherit"
-        size={20}
-        aria-label="正在加载项目"
-        data-testid="project-switcher-loading"
-      />
+      <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
+        <Chip
+          label="平台级"
+          size="small"
+          color="default"
+          data-testid="scope-badge"
+        />
+        <CircularProgress
+          color="inherit"
+          size={20}
+          aria-label="正在加载项目"
+          data-testid="project-switcher-loading"
+        />
+      </Stack>
     )
   }
   if (projects.length === 0) {
     return (
-      <Typography variant="body2" data-testid="no-project-switcher">
-        暂无授权项目
-      </Typography>
+      <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
+        <Chip
+          label="平台级"
+          size="small"
+          color="default"
+          data-testid="scope-badge"
+        />
+        <Typography
+          variant="body2"
+          data-testid="no-project-switcher"
+          sx={{ display: { xs: 'none', sm: 'block' } }}
+        >
+          暂无授权项目
+        </Typography>
+      </Stack>
     )
   }
 
+  const selectedProject = projects.find(
+    ({ project }) => project.key === selected,
+  )
+
   return (
-    <Box sx={{ minWidth: 220 }}>
+    <Stack
+      direction="row"
+      spacing={1}
+      sx={{ alignItems: 'center', minWidth: 0 }}
+    >
+      <Chip
+        label={
+          selectedProject
+            ? `当前项目：${selectedProject.project.name}`
+            : '平台级'
+        }
+        size="small"
+        color={selectedProject ? 'primary' : 'default'}
+        data-testid="scope-badge"
+        sx={{
+          maxWidth: { xs: 96, sm: 240 },
+          bgcolor: 'rgba(255, 255, 255, 0.92)',
+          color: 'primary.dark',
+          '& .MuiChip-label': {
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+          },
+        }}
+      />
+      <Box sx={{ minWidth: { xs: 96, sm: 220 } }}>
       <Select
         aria-label="当前项目"
         data-testid="active-project-switcher"
@@ -133,7 +217,7 @@ const ProjectSwitcher: React.FC = () => {
           navigate('/')
         }}
         sx={{
-          minWidth: 220,
+          width: '100%',
           color: 'inherit',
           '& .MuiOutlinedInput-notchedOutline': {
             borderColor: 'rgba(255,255,255,0.45)',
@@ -150,7 +234,8 @@ const ProjectSwitcher: React.FC = () => {
           </MenuItem>
         ))}
       </Select>
-    </Box>
+      </Box>
+    </Stack>
   )
 }
 

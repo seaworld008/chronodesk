@@ -29,9 +29,9 @@ import {
 import { minCharacters, maxCharacters } from '@/lib/validators';
 import {
     normalizeTagsForSubmit,
-    formatTagsInputValue,
     normalizeCustomFieldsForSubmit,
 } from './tagUtils';
+import TagChipInput from './TagChipInput';
 import BackButton from '../common/BackButton';
 import { CreateTicketRequest } from '@/types';
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient';
@@ -506,12 +506,11 @@ const TicketCreate: React.FC = () => {
                                         />
                                     </ReferenceInput>
 
-                                    <TextInput
+                                    <TagChipInput
                                         source="tags"
                                         label="标签"
                                         fullWidth
-                                        helperText="用逗号分隔多个标签，便于分类和搜索"
-                                        format={formatTagsInputValue}
+                                        helperText="输入标签后按回车，便于分类和搜索"
                                     />
                                 </Box>
                             </CardContent>
