@@ -41,6 +41,14 @@ const defaultTestForm: TestForm = {
   content: '这是一封来自 ChronoDesk 的测试邮件，如果您收到此邮件说明配置已生效。',
 }
 
+const EmailSettingsHeader = () => (
+  <PageHeader
+    title="平台邮件设置"
+    description="配置平台级 SMTP 服务器与邮件模板，不修改项目配置快照。"
+    leading={<BackButton fallbackPath="/system-settings" />}
+  />
+)
+
 const EmailSettings: React.FC = () => {
   const notify = useNotify()
   const [loading, setLoading] = useState(true)
@@ -162,9 +170,11 @@ const EmailSettings: React.FC = () => {
   if (loading) {
     return (
       <PageShell title="平台邮件设置" testId="email-settings-page-shell">
+        <EmailSettingsHeader />
         <Box
           role="status"
-          sx={{ display: 'flex', justifyContent: 'center', py: 6 }}
+          aria-label="正在加载平台邮件设置"
+          sx={{ display: 'flex', justifyContent: 'center', pb: 6, pt: 9 }}
         >
           <CircularProgress aria-label="正在加载平台邮件设置" />
         </Box>
@@ -175,7 +185,12 @@ const EmailSettings: React.FC = () => {
   if (!config) {
     return (
       <PageShell title="平台邮件设置" testId="email-settings-page-shell">
-        <Alert severity="error" action={<Button onClick={loadConfig}>重试</Button>}>
+        <EmailSettingsHeader />
+        <Alert
+          severity="error"
+          action={<Button onClick={loadConfig}>重试</Button>}
+          sx={{ mt: 2 }}
+        >
           无法加载邮件配置
         </Alert>
       </PageShell>
@@ -184,11 +199,7 @@ const EmailSettings: React.FC = () => {
 
   return (
     <PageShell title="平台邮件设置" testId="email-settings-page-shell">
-      <PageHeader
-        title="平台邮件设置"
-        description="配置平台级 SMTP 服务器与邮件模板，不修改项目配置快照。"
-        leading={<BackButton fallbackPath="/system-settings" />}
-      />
+      <EmailSettingsHeader />
       <Box sx={{ mt: 2 }}>
         <SettingsTabs />
       </Box>

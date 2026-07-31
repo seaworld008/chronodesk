@@ -3,7 +3,11 @@ import { expect, test, type Locator, type Page } from '@playwright/test'
 const encode = (value: unknown) =>
     Buffer.from(JSON.stringify(value)).toString('base64url')
 
-const installSession = async (page: Page, sessionID = 'task3-session') => {
+const installSession = async (
+    page: Page,
+    sessionID = 'task3-session',
+    displayName = '',
+) => {
     const expiresAt = Math.floor(Date.now() / 1000) + 3600
     const token = `${encode({ alg: 'none', typ: 'JWT' })}.${encode({
         sub: '1',
@@ -11,14 +15,14 @@ const installSession = async (page: Page, sessionID = 'task3-session') => {
         platform_role: 'platform_admin',
         exp: expiresAt,
     })}.signature`
-    await page.addInitScript(({ accessToken, exp, sid }) => {
+    await page.addInitScript(({ accessToken, exp, sid, fullName }) => {
         if (sessionStorage.getItem('task3-preserve-session') === 'true') {
             return
         }
         localStorage.setItem('token', accessToken)
         localStorage.setItem('refreshToken', 'task3-refresh')
         localStorage.setItem('tokenExpiresAt', String(exp * 1000))
-        localStorage.setItem('user', JSON.stringify({
+        const storedUser: Record<string, unknown> = {
             id: 1,
             username: 'task3-admin',
             email: 'task3@example.invalid',
@@ -26,13 +30,27 @@ const installSession = async (page: Page, sessionID = 'task3-session') => {
             status: 'active',
             email_verified: true,
             otp_enabled: false,
-        }))
+        }
+        if (fullName) {
+            storedUser.profile = {
+                first_name: '',
+                last_name: '',
+                display_name: fullName,
+                avatar: '',
+            }
+        }
+        localStorage.setItem('user', JSON.stringify(storedUser))
         localStorage.setItem('chronodesk.activeProject', JSON.stringify({
             subject: '1',
             session_id: sid,
             project_key: 'OPS',
         }))
-    }, { accessToken: token, exp: expiresAt, sid: sessionID })
+    }, {
+        accessToken: token,
+        exp: expiresAt,
+        fullName: displayName,
+        sid: sessionID,
+    })
 }
 
 const projectAccess = [{
@@ -136,6 +154,14 @@ const navigateFromAccountMenu = async (page: Page, itemID: string) => {
     await expect(temporarySidebar).toBeHidden()
     await page.getByTestId('account-menu').locator('button').first().click()
     await page.getByTestId(`account-menu-${itemID}`).click()
+}
+
+const deferred = () => {
+    let resolve!: () => void
+    const promise = new Promise<void>((done) => {
+        resolve = done
+    })
+    return { promise, resolve }
 }
 
 test.describe('Task 3 导航、账号与多选回归（mock）', () => {
@@ -738,5 +764,324 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         expect(profileGeometry.form!.width).toBeLessThanOrEqual(760)
         expect(profileGeometry.avatar!.left)
             .toBeGreaterThan(profileGeometry.form!.right)
+    })
+
+    test('超长账号名、项目名与项目加载态保持 AppBar 三段几何', async ({ page }) => {
+        test.setTimeout(60_000)
+        const longDisplayName =
+            '企业全球支持与自动化平台主管-超长账号展示名称-'.repeat(8)
+        const longProjectName =
+            '全球企业服务与智能自动化联合运营项目-超长项目名称-'.repeat(6)
+        const longProjectAccess = [{
+            ...projectAccess[0],
+            project: {
+                ...projectAccess[0].project,
+                name: longProjectName,
+            },
+        }]
+        const longUser = {
+            id: 1,
+            username: 'task3-admin',
+            email: 'task3@example.invalid',
+            platform_role: 'platform_admin',
+            status: 'active',
+            email_verified: true,
+            otp_enabled: false,
+            profile: {
+                first_name: '',
+                last_name: '',
+                display_name: longDisplayName,
+                avatar: '',
+            },
+        }
+
+        await installSession(
+            page,
+            'task3-long-appbar-session',
+            longDisplayName,
+        )
+
+        let projectGate = deferred()
+        let projectRequestStarted = deferred()
+        let reportedProjectRequest = false
+        const armProjectLoading = () => {
+            projectGate = deferred()
+            projectRequestStarted = deferred()
+            reportedProjectRequest = false
+        }
+
+        await page.route('**/api/**', async (route) => {
+            const url = new URL(route.request().url())
+            let data: unknown = []
+            if (url.pathname === '/api/projects') {
+                if (!reportedProjectRequest) {
+                    reportedProjectRequest = true
+                    projectRequestStarted.resolve()
+                }
+                await projectGate.promise
+                data = longProjectAccess
+            } else if (url.pathname === '/api/auth/me') {
+                data = longUser
+            } else if (url.pathname === '/api/platform/configs') {
+                data = []
+            } else if (url.pathname === '/api/projects/OPS/webhooks') {
+                data = { items: [], total: 0, page: 1, page_size: 100 }
+            }
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({ code: 0, msg: 'ok', data }),
+            })
+        })
+
+        for (const [index, viewport] of [
+            { width: 1280, height: 800 },
+            { width: 1024, height: 768 },
+            { width: 640, height: 720 },
+        ].entries()) {
+            armProjectLoading()
+            await page.setViewportSize(viewport)
+            await page.goto('/#/system-settings')
+            if (index > 0) {
+                await page.reload()
+            }
+            await projectRequestStarted.promise
+            await expect(page.getByTestId('project-switcher-loading'))
+                .toBeVisible()
+            await expect(
+                page.getByTestId('account-menu').locator('button').first(),
+            ).toContainText(longDisplayName)
+
+            const loadingGeometry = await page.evaluate(() => {
+                const bounds = (selector: string) => {
+                    const element = document.querySelector(selector)
+                    if (!(element instanceof HTMLElement)) return null
+                    const rect = element.getBoundingClientRect()
+                    return {
+                        bottom: rect.bottom,
+                        height: rect.height,
+                        left: rect.left,
+                        right: rect.right,
+                        top: rect.top,
+                        width: rect.width,
+                    }
+                }
+                return {
+                    account: bounds('[data-testid="account-menu"] button'),
+                    controls: bounds('[data-testid="appbar-context-controls"]'),
+                    loading: bounds('[data-testid="project-switcher-loading"]'),
+                    scrollWidth: document.documentElement.scrollWidth,
+                    toolbar: bounds('.RaAppBar-toolbar'),
+                    viewportWidth: window.innerWidth,
+                }
+            })
+            expect(loadingGeometry.account).not.toBeNull()
+            expect(loadingGeometry.controls).not.toBeNull()
+            expect(loadingGeometry.loading).not.toBeNull()
+            expect(loadingGeometry.toolbar).not.toBeNull()
+            expect(loadingGeometry.viewportWidth - loadingGeometry.account!.right)
+                .toBeGreaterThanOrEqual(0)
+            expect(loadingGeometry.viewportWidth - loadingGeometry.account!.right)
+                .toBeLessThanOrEqual(16)
+            expect(loadingGeometry.controls!.width).toBeGreaterThan(96)
+            expect(loadingGeometry.loading!.width).toBeGreaterThanOrEqual(44)
+            expect(loadingGeometry.controls!.right)
+                .toBeLessThanOrEqual(loadingGeometry.account!.left + 0.5)
+            expect(loadingGeometry.account!.top)
+                .toBeGreaterThanOrEqual(loadingGeometry.toolbar!.top)
+            expect(loadingGeometry.account!.bottom)
+                .toBeLessThanOrEqual(loadingGeometry.toolbar!.bottom)
+            expect(loadingGeometry.scrollWidth)
+                .toBeLessThanOrEqual(viewport.width + 1)
+
+            projectGate.resolve()
+            await expect(page.getByTestId('active-project-switcher'))
+                .toBeVisible()
+            await page.goto('/#/webhook-settings')
+            await expect(page.getByRole('heading', {
+                name: 'Webhook 集成',
+                level: 1,
+            })).toBeVisible()
+            await expect(page.getByTestId('scope-badge'))
+                .toContainText(`当前项目：${longProjectName}`)
+            await expect(page.getByTestId('active-project-switcher'))
+                .toContainText(longProjectName)
+            const accountTrigger =
+                page.getByTestId('account-menu').locator('button').first()
+            await expect(accountTrigger).toContainText(longDisplayName)
+
+            const longTextGeometry = await page.evaluate(() => {
+                const bounds = (selector: string) => {
+                    const element = document.querySelector(selector)
+                    if (!(element instanceof HTMLElement)) return null
+                    const rect = element.getBoundingClientRect()
+                    return {
+                        clientWidth: element.clientWidth,
+                        fontSize: getComputedStyle(element).fontSize,
+                        left: rect.left,
+                        overflow: getComputedStyle(element).overflow,
+                        right: rect.right,
+                        scrollWidth: element.scrollWidth,
+                        textOverflow: getComputedStyle(element).textOverflow,
+                        width: rect.width,
+                    }
+                }
+                return {
+                    account: bounds('[data-testid="account-menu"] button'),
+                    controls: bounds('[data-testid="appbar-context-controls"]'),
+                    scope: bounds(
+                        '[data-testid="page-scope-badge"] .MuiChip-label',
+                    ),
+                    scrollWidth: document.documentElement.scrollWidth,
+                    select: bounds(
+                        '[data-testid="active-project-switcher"] .MuiSelect-select',
+                    ),
+                    viewportWidth: window.innerWidth,
+                }
+            })
+            expect(longTextGeometry.account).not.toBeNull()
+            expect(longTextGeometry.controls).not.toBeNull()
+            expect(longTextGeometry.scope).not.toBeNull()
+            expect(longTextGeometry.select).not.toBeNull()
+            expect(longTextGeometry.viewportWidth - longTextGeometry.account!.right)
+                .toBeGreaterThanOrEqual(0)
+            expect(longTextGeometry.viewportWidth - longTextGeometry.account!.right)
+                .toBeLessThanOrEqual(16)
+            expect(longTextGeometry.account!.width).toBeGreaterThanOrEqual(40)
+            expect(longTextGeometry.account!.width).toBeLessThanOrEqual(192)
+            expect(longTextGeometry.controls!.width).toBeGreaterThan(96)
+            expect(longTextGeometry.controls!.right)
+                .toBeLessThanOrEqual(longTextGeometry.account!.left + 0.5)
+            expect(longTextGeometry.scope!.right)
+                .toBeLessThanOrEqual(longTextGeometry.select!.left + 0.5)
+            expect(longTextGeometry.scope!.scrollWidth)
+                .toBeGreaterThan(longTextGeometry.scope!.clientWidth)
+            expect(longTextGeometry.select!.scrollWidth)
+                .toBeGreaterThan(longTextGeometry.select!.clientWidth)
+            expect(longTextGeometry.scrollWidth)
+                .toBeLessThanOrEqual(viewport.width + 1)
+
+            if (viewport.width >= 1200) {
+                expect(longTextGeometry.account!.textOverflow).toBe('ellipsis')
+                expect(longTextGeometry.account!.overflow).toBe('hidden')
+                expect(longTextGeometry.account!.scrollWidth)
+                    .toBeGreaterThan(longTextGeometry.account!.clientWidth)
+            } else {
+                expect(longTextGeometry.account!.fontSize).toBe('0px')
+                expect(longTextGeometry.account!.width).toBeLessThanOrEqual(44)
+            }
+
+            await accountTrigger.click()
+            await expect(page.getByTestId('account-menu-account-profile'))
+                .toBeVisible()
+            await page.keyboard.press('Escape')
+            await expect(page.getByTestId('account-menu-account-profile'))
+                .toBeHidden()
+        }
+    })
+
+    test('个人资料和邮件设置在 loading/error 分支保留统一 PageHeader', async ({ page }) => {
+        await installSession(page, 'task3-page-header-session')
+        const profileGate = deferred()
+        const profileStarted = deferred()
+        const emailGate = deferred()
+        const emailStarted = deferred()
+        const user = {
+            id: 1,
+            username: 'task3-admin',
+            email: 'task3@example.invalid',
+            platform_role: 'platform_admin',
+            status: 'active',
+            email_verified: true,
+            otp_enabled: false,
+            profile: {
+                first_name: 'Chrono',
+                last_name: 'Desk',
+                display_name: 'Chrono Desk',
+                avatar: '',
+                phone: '',
+                timezone: 'Asia/Shanghai',
+                language: 'zh-CN',
+            },
+        }
+
+        await page.route('**/api/**', async (route) => {
+            const url = new URL(route.request().url())
+            if (url.pathname === '/api/projects') {
+                await route.fulfill({
+                    status: 200,
+                    contentType: 'application/json',
+                    body: JSON.stringify({
+                        code: 0,
+                        msg: 'ok',
+                        data: projectAccess,
+                    }),
+                })
+                return
+            }
+            if (url.pathname === '/api/auth/me') {
+                profileStarted.resolve()
+                await profileGate.promise
+                await route.fulfill({
+                    status: 200,
+                    contentType: 'application/json',
+                    body: JSON.stringify({ code: 0, msg: 'ok', data: user }),
+                })
+                return
+            }
+            if (url.pathname === '/api/platform/email-config') {
+                emailStarted.resolve()
+                await emailGate.promise
+                await route.fulfill({
+                    status: 500,
+                    contentType: 'application/json',
+                    body: JSON.stringify({
+                        code: 500,
+                        msg: 'mock failure',
+                        data: null,
+                    }),
+                })
+                return
+            }
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({ code: 0, msg: 'ok', data: [] }),
+            })
+        })
+
+        await page.goto('/#/account/profile')
+        await profileStarted.promise
+        await expect(page.getByTestId('account-page-header')).toBeVisible()
+        await expect(page.getByRole('heading', {
+            name: '个人资料',
+            level: 1,
+        })).toBeVisible()
+        await expect(page.getByRole('status', {
+            name: '正在加载个人资料',
+        })).toBeVisible()
+        profileGate.resolve()
+        await expect(page.getByTestId('account-profile-page')).toBeVisible()
+
+        await page.goto('/#/system-settings/email')
+        await emailStarted.promise
+        await expect(page.getByTestId('page-header')).toBeVisible()
+        await expect(page.getByRole('heading', {
+            name: '平台邮件设置',
+            level: 1,
+        })).toBeVisible()
+        await expect(page.getByRole('status', {
+            name: '正在加载平台邮件设置',
+        })).toBeVisible()
+        emailGate.resolve()
+        await expect(
+            page.getByTestId('email-settings-page-shell')
+                .getByText('无法加载邮件配置'),
+        ).toBeVisible()
+        await expect(page.getByTestId('page-header')).toBeVisible()
+        await expect(page.getByRole('heading', {
+            name: '平台邮件设置',
+            level: 1,
+        })).toBeVisible()
     })
 })

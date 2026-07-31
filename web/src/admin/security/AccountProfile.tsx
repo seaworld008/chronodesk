@@ -38,6 +38,9 @@ const storeCurrentUser = (user: HumanSessionUser) => {
     localStorage.setItem('user', JSON.stringify(user))
 }
 
+const profileDescription =
+    '仅可修改个人展示名称与本地化偏好；身份、职责和验证状态由专用流程管理。'
+
 const AccountProfile = () => {
     const notify = useNotify()
     const { refetch: refetchIdentity } = useGetIdentity()
@@ -132,9 +135,19 @@ const AccountProfile = () => {
                 title="个人资料"
                 testId="account-page-shell"
             >
+                <AccountPageHeader
+                    title="个人资料"
+                    description={profileDescription}
+                />
                 <Box
                     role="status"
-                    sx={{ display: 'grid', minHeight: 320, placeItems: 'center' }}
+                    aria-label="正在加载个人资料"
+                    sx={{
+                        display: 'grid',
+                        minHeight: 320,
+                        mt: 3,
+                        placeItems: 'center',
+                    }}
                 >
                     <CircularProgress aria-label="正在加载个人资料" />
                 </Box>
@@ -149,7 +162,7 @@ const AccountProfile = () => {
         >
             <AccountPageHeader
                 title="个人资料"
-                description="仅可修改个人展示名称与本地化偏好；身份、职责和验证状态由专用流程管理。"
+                description={profileDescription}
                 action={(
                     <Stack
                         data-testid="profile-avatar-panel"

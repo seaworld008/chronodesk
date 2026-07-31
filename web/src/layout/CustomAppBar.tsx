@@ -94,8 +94,16 @@ const AccountNavigationItems: React.FC = () => {
 }
 
 const CustomUserMenu: React.FC = () => (
-  <Box data-testid="account-menu" sx={{ flex: '0 0 auto', minWidth: 0 }}>
-    <UserMenu label="账号">
+  <Box
+    data-testid="account-menu"
+    sx={{
+      flex: '0 1 auto',
+      maxWidth: { xs: 44, lg: 192 },
+      minWidth: 0,
+      overflow: 'hidden',
+    }}
+  >
+    <UserMenu label="账号" className="ChronoDeskUserMenu">
       <AccountNavigationItems />
       <LogoutAllMenuItem />
       <Logout data-testid="logout-current-session" />
@@ -341,16 +349,38 @@ export const CustomAppBar: React.FC<AppBarProps> = ({
           minWidth: 0,
           overflow: 'hidden',
         },
-        '& .RaAppBar-menuButton, & .RaLoadingIndicator-root, & .RaUserMenu-root': {
+        '& .RaAppBar-menuButton, & .RaLoadingIndicator-root': {
           flex: '0 0 auto',
         },
-        '@media (min-width:600px) and (max-width:899.95px)': {
-          '& .RaUserMenu-userButton': {
+        '& .ChronoDeskUserMenu': {
+          maxWidth: 192,
+          minWidth: 0,
+          overflow: 'hidden',
+        },
+        '& .ChronoDeskUserMenu .RaUserMenu-userButton': {
+          boxSizing: 'border-box',
+          maxWidth: '100%',
+          minWidth: 44,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        },
+        '& .ChronoDeskUserMenu .RaUserMenu-userButton .MuiButton-startIcon': {
+          flex: '0 0 auto',
+        },
+        '@media (max-width:1199.95px)': {
+          '& .ChronoDeskUserMenu': {
+            maxWidth: 44,
+            width: 44,
+          },
+          '& .ChronoDeskUserMenu .RaUserMenu-userButton': {
             fontSize: 0,
+            maxWidth: 44,
             minWidth: 44,
             px: 1,
+            width: 44,
           },
-          '& .RaUserMenu-userButton .MuiButton-startIcon': {
+          '& .ChronoDeskUserMenu .RaUserMenu-userButton .MuiButton-startIcon': {
             m: 0,
           },
         },
