@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 )
@@ -101,6 +102,78 @@ func TestGetNotificationsPreservesRecipientAndReadFilters(t *testing.T) {
 	}
 	if total != 2 || len(items) != 1 || items[0].ID != notifications[0].ID {
 		t.Fatalf("pagination changed filters: len=%d total=%d first=%v", len(items), total, items)
+	}
+}
+
+func TestGetNotificationsUsesIDTieBreakerInRequestedDirection(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.User{}, &models.Notification{}); err != nil {
+		t.Fatal(err)
+	}
+	user := models.User{
+		Username:     "notification-stable-owner",
+		Email:        "notification-stable-owner@example.com",
+		PasswordHash: "hash",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Now().UTC().Truncate(time.Second)
+	notifications := make([]models.Notification, 30)
+	for index := range notifications {
+		notifications[index] = models.Notification{
+			CreatedAt:      createdAt,
+			OrganizationID: 1,
+			ProjectID:      1,
+			Type:           models.NotificationTypeSystemAlert,
+			Title:          fmt.Sprintf("stable-%02d", index),
+			Content:        "stable",
+			RecipientID:    user.ID,
+		}
+	}
+	if err := db.Create(&notifications).Error; err != nil {
+		t.Fatal(err)
+	}
+	service := NewNotificationServiceWithProtector(db, nil)
+	ctx := notificationTestOperationContext(
+		t,
+		models.ProjectScope{OrganizationID: 1, ProjectID: 1},
+		models.HumanActor(user.ID),
+	)
+	for _, direction := range []string{"asc", "desc"} {
+		items, total, err := service.GetNotifications(
+			ctx,
+			&models.NotificationFilter{
+				RecipientID: &user.ID,
+				Limit:       10,
+				Offset:      10,
+				OrderBy:     "created_at",
+				OrderDir:    direction,
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if total != 30 || len(items) != 10 {
+			t.Fatalf("%s page len=%d total=%d", direction, len(items), total)
+		}
+		for index := range items {
+			want := notifications[index+10].ID
+			if direction == "desc" {
+				want = notifications[19-index].ID
+			}
+			if items[index].ID != want {
+				t.Fatalf(
+					"%s stable order at %d: id=%d want=%d",
+					direction,
+					index,
+					items[index].ID,
+					want,
+				)
+			}
+		}
 	}
 }
 

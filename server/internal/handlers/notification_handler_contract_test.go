@@ -2,15 +2,31 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 )
+
+type capturingNotificationListService struct {
+	services.NotificationServiceInterface
+	filter *models.NotificationFilter
+}
+
+func (service *capturingNotificationListService) GetNotifications(
+	_ context.Context,
+	filter *models.NotificationFilter,
+) ([]*models.Notification, int64, error) {
+	copy := *filter
+	service.filter = &copy
+	return []*models.Notification{}, 0, nil
+}
 
 func TestNotificationListAcceptsOnlyCurrentQueryContract(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -240,6 +256,53 @@ func TestNotificationListUsesStrictBoundedPagination(t *testing.T) {
 		)
 		if response.Code != http.StatusBadRequest {
 			t.Fatalf("%s status=%d body=%s", query, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestNotificationListDefaultsToTwentyFiveAndAllowsOneHundred(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service := &capturingNotificationListService{}
+	handler := NewNotificationHandler(service)
+	router := gin.New()
+	router.GET("/notifications", func(c *gin.Context) {
+		c.Set("user_id", uint(7))
+		handler.GetNotifications(c)
+	})
+
+	for _, test := range []struct {
+		query      string
+		wantLimit  int
+		wantOffset int
+		wantPage   string
+		wantSize   string
+	}{
+		{wantLimit: 25, wantPage: `"page":1`, wantSize: `"page_size":25`},
+		{
+			query:      "page=2&page_size=100",
+			wantLimit:  100,
+			wantOffset: 100,
+			wantPage:   `"page":2`,
+			wantSize:   `"page_size":100`,
+		},
+	} {
+		response := httptest.NewRecorder()
+		path := "/notifications"
+		if test.query != "" {
+			path += "?" + test.query
+		}
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", path, response.Code, response.Body.String())
+		}
+		if service.filter == nil ||
+			service.filter.Limit != test.wantLimit ||
+			service.filter.Offset != test.wantOffset {
+			t.Fatalf("%s filter=%+v", path, service.filter)
+		}
+		if !strings.Contains(response.Body.String(), test.wantPage) ||
+			!strings.Contains(response.Body.String(), test.wantSize) {
+			t.Fatalf("%s body=%s", path, response.Body.String())
 		}
 	}
 }

@@ -446,6 +446,8 @@ func writeHumanCommentRequestError(c *gin.Context, code, message string) {
 
 func (h *TicketContentHandler) writeCommentError(c *gin.Context, err error) {
 	switch {
+	case errors.Is(err, services.ErrNestedCommentReply):
+		writeHumanCommentRequestError(c, "nested_comment_reply", "仅支持单层回复，不能回复已有父评论的回复")
 	case errors.Is(err, services.ErrInvalidComment):
 		writeHumanCommentRequestError(c, "validation_error", "评论请求不符合要求")
 	case errors.Is(err, services.ErrInvalidActor):
@@ -676,9 +678,9 @@ func (h *TicketContentHandler) customerCanReferenceComment(c *gin.Context, ticke
 		h.writeError(c, err)
 		return false
 	}
-	var count int64
+	var parent models.TicketComment
 	err = h.db.WithContext(c.Request.Context()).
-		Model(&models.TicketComment{}).
+		Select("id", "parent_id").
 		Where(
 			"id = ? AND ticket_id = ? AND organization_id = ? AND project_id = ? AND type = ? AND is_deleted = ?",
 			commentID,
@@ -688,16 +690,24 @@ func (h *TicketContentHandler) customerCanReferenceComment(c *gin.Context, ticke
 			models.CommentTypePublic,
 			false,
 		).
-		Count(&count).Error
-	if err != nil {
-		h.writeError(c, err)
-		return false
-	}
-	if count != 1 {
+		First(&parent).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		c.JSON(http.StatusForbidden, gin.H{
 			"success": false,
 			"code":    "comment_reference_denied",
 			"message": "客户只能关联当前工单中未删除的公开评论",
+		})
+		return false
+	}
+	if err != nil {
+		h.writeError(c, err)
+		return false
+	}
+	if parent.ParentID != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"code":    "nested_comment_reply",
+			"message": "仅支持单层回复，不能回复已有父评论的回复",
 		})
 		return false
 	}

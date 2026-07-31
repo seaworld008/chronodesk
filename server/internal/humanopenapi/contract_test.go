@@ -1308,6 +1308,8 @@ func TestP1HumanWebOperationsAreTypedAndMachineAddressable(t *testing.T) {
 		{"/workbench/tickets", "get"},
 		{"/projects/{projectKey}/tickets", "get"},
 		{"/projects/{projectKey}/tickets", "post"},
+		{"/projects/{projectKey}/tickets/overdue", "get"},
+		{"/projects/{projectKey}/tickets/sla-breach", "get"},
 		{"/projects/{projectKey}/tickets/{ticketID}", "get"},
 		{"/projects/{projectKey}/tickets/{ticketID}", "put"},
 		{"/projects/{projectKey}/tickets/{ticketID}", "delete"},
@@ -1411,6 +1413,77 @@ func TestP1HumanWebOperationsAreTypedAndMachineAddressable(t *testing.T) {
 	}
 	if operationCount < 77 {
 		t.Fatalf("operation count = %d, want at least 77", operationCount)
+	}
+}
+
+func TestP0ListPaginationContractUsesStrictTwentyFiveToOneHundredBounds(t *testing.T) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	notifications := objectAt(
+		t,
+		objectAt(t, paths, "/projects/{projectKey}/notifications"),
+		"get",
+	)
+	var notificationPageSize map[string]any
+	for _, raw := range notifications["parameters"].([]any) {
+		parameter := raw.(map[string]any)
+		if parameter["name"] == "page_size" {
+			notificationPageSize = parameter
+			break
+		}
+	}
+	if notificationPageSize == nil {
+		t.Fatal("notification page_size parameter is missing")
+	}
+	notificationPageSizeSchema := objectAt(t, notificationPageSize, "schema")
+	if notificationPageSizeSchema["default"] != float64(25) ||
+		notificationPageSizeSchema["maximum"] != float64(100) {
+		t.Fatalf("notification page_size schema=%v", notificationPageSizeSchema)
+	}
+
+	components := objectAt(t, document, "components")
+	parameters := objectAt(t, components, "parameters")
+	contentPageSize := objectAt(t, objectAt(t, parameters, "ContentPageSize"), "schema")
+	if contentPageSize["default"] != float64(25) ||
+		contentPageSize["maximum"] != float64(100) {
+		t.Fatalf("ContentPageSize schema=%v", contentPageSize)
+	}
+	schemas := objectAt(t, components, "schemas")
+	notificationPage := objectAt(t, objectAt(t, schemas, "NotificationPage"), "properties")
+	pageSize := objectAt(t, notificationPage, "page_size")
+	if pageSize["maximum"] != float64(100) {
+		t.Fatalf("NotificationPage.page_size=%v", pageSize)
+	}
+
+	for _, path := range []string{
+		"/projects/{projectKey}/tickets/overdue",
+		"/projects/{projectKey}/tickets/sla-breach",
+	} {
+		operation := objectAt(t, objectAt(t, paths, path), "get")
+		rawParameters := operation["parameters"].([]any)
+		refs := make(map[string]bool, len(rawParameters))
+		for _, raw := range rawParameters {
+			parameter := raw.(map[string]any)
+			reference, _ := parameter["$ref"].(string)
+			refs[reference] = true
+		}
+		for _, required := range []string{
+			"#/components/parameters/ProjectKey",
+			"#/components/parameters/ContentPage",
+			"#/components/parameters/ContentPageSize",
+		} {
+			if !refs[required] {
+				t.Errorf("%s is missing %s", path, required)
+			}
+		}
+		responses := objectAt(t, operation, "responses")
+		okResponse := objectAt(t, responses, "200")
+		content := objectAt(t, okResponse, "content")
+		jsonContent := objectAt(t, content, "application/json")
+		schema := objectAt(t, jsonContent, "schema")
+		if schema["$ref"] != "#/components/schemas/TicketListPageEnvelope" {
+			t.Errorf("%s response schema=%v", path, schema)
+		}
 	}
 }
 

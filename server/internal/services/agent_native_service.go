@@ -66,6 +66,7 @@ var (
 	ErrInvalidAttachment         = errors.New("invalid attachment")
 	ErrInvalidAttachmentName     = errors.New("invalid attachment name")
 	ErrInvalidComment            = errors.New("invalid comment")
+	ErrNestedCommentReply        = errors.New("nested comment replies are not supported")
 	ErrInvalidAttachmentCleanup  = errors.New("invalid attachment cleanup destination")
 	ErrOutboxLockLost            = errors.New("outbox delivery lock lost")
 	ErrOutboxReplayConflict      = errors.New("outbox delivery is actively being processed")
@@ -160,6 +161,8 @@ func AgentNativeErrorCode(err error) string {
 		return "invalid_attachment"
 	case errors.Is(err, ErrInvalidAttachmentName):
 		return "invalid_attachment_name"
+	case errors.Is(err, ErrNestedCommentReply):
+		return "nested_comment_reply"
 	case errors.Is(err, ErrInvalidComment):
 		return "invalid_comment"
 	case errors.Is(err, ErrOutboxReplayConflict):
@@ -5495,8 +5498,9 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 			}
 		}
 		if input.ParentID != nil {
-			var count int64
-			if err := tx.Model(&models.TicketComment{}).
+			var parent models.TicketComment
+			if err := tx.
+				Select("id", "parent_id").
 				Where(
 					"id = ? AND ticket_id = ? AND organization_id = ? AND project_id = ? AND is_deleted = ?",
 					*input.ParentID,
@@ -5505,11 +5509,13 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 					projectScope.ProjectID,
 					false,
 				).
-				Count(&count).Error; err != nil {
+				First(&parent).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("%w: parent comment not found", ErrInvalidComment)
+			} else if err != nil {
 				return err
 			}
-			if count != 1 {
-				return fmt.Errorf("%w: parent comment not found", ErrInvalidComment)
+			if parent.ParentID != nil {
+				return fmt.Errorf("%w: %w", ErrInvalidComment, ErrNestedCommentReply)
 			}
 		}
 		if err := tx.Create(comment).Error; err != nil {

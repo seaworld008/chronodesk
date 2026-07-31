@@ -193,6 +193,70 @@ func seedNativeTicket(t *testing.T, db *gorm.DB, userID uint, number string) mod
 	return ticket
 }
 
+func TestCreateCommentRejectsReplyToReplyBeforeMutation(t *testing.T) {
+	db := openAgentNativeTestDB(t)
+	user := seedActorUser(t, db, "single-level-reply")
+	ticket := seedNativeTicket(t, db, user.ID, "SINGLE-LEVEL-REPLY")
+	actor := models.HumanActor(user.ID)
+	ctx := testProjectOperationContext(t, db, actor)
+	root := models.TicketComment{
+		TicketID: ticket.ID, UserID: &user.ID,
+		ActorType: actor.Type, ActorID: actor.ID,
+		Content: "root", ContentType: "text", Type: models.CommentTypePublic,
+	}
+	if err := db.Create(&root).Error; err != nil {
+		t.Fatal(err)
+	}
+	reply := root
+	reply.ID = 0
+	reply.Content = "reply"
+	reply.ParentID = &root.ID
+	if err := db.Create(&reply).Error; err != nil {
+		t.Fatal(err)
+	}
+	beforeComments := int64(0)
+	if err := db.Model(&models.TicketComment{}).
+		Where("ticket_id = ?", ticket.ID).
+		Count(&beforeComments).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	service := NewAgentNativeService(db)
+	_, err := service.CreateComment(ctx, NativeCommentInput{
+		TicketID:        ticket.ID,
+		ExpectedVersion: ticket.Version,
+		Actor:           actor,
+		SourceProtocol:  "test",
+		Content:         "must not become unreachable",
+		ContentType:     "text",
+		Type:            models.CommentTypePublic,
+		ParentID:        &reply.ID,
+	})
+	if !errors.Is(err, ErrNestedCommentReply) ||
+		AgentNativeErrorCode(err) != "nested_comment_reply" {
+		t.Fatalf("nested reply error=%v code=%q", err, AgentNativeErrorCode(err))
+	}
+	var afterComments int64
+	if err := db.Model(&models.TicketComment{}).
+		Where("ticket_id = ?", ticket.ID).
+		Count(&afterComments).Error; err != nil {
+		t.Fatal(err)
+	}
+	var persisted models.Ticket
+	if err := db.First(&persisted, ticket.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if afterComments != beforeComments || persisted.Version != ticket.Version {
+		t.Fatalf(
+			"nested reply mutated state: comments=%d->%d version=%d->%d",
+			beforeComments,
+			afterComments,
+			ticket.Version,
+			persisted.Version,
+		)
+	}
+}
+
 func TestAgentNativeCredentialHashValidationAndRevocation(t *testing.T) {
 	db := openAgentNativeTestDB(t)
 	user := seedActorUser(t, db, "credential")

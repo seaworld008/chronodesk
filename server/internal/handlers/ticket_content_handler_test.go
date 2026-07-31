@@ -338,7 +338,11 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 	router.Use(func(c *gin.Context) {
 		userID, _ := strconv.ParseUint(c.GetHeader("X-Test-User"), 10, 32)
 		c.Set("user_id", uint(userID))
-		c.Set(projectRoleContextKey, string(models.ProjectRoleRequester))
+		role := c.GetHeader("X-Test-Role")
+		if role == "" {
+			role = string(models.ProjectRoleRequester)
+		}
+		c.Set(projectRoleContextKey, role)
 		c.Next()
 	})
 	router.Use(handlerTestProjectMiddleware(t, db))
@@ -357,16 +361,44 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 		t.Fatalf("owner response = %d: %s", ownerResponse.Code, ownerResponse.Body.String())
 	}
 	var body struct {
-		Data []models.TicketCommentResponse `json:"data"`
+		Data  []models.TicketCommentResponse `json:"data"`
+		Total int64                          `json:"total"`
 	}
 	if err := json.Unmarshal(ownerResponse.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body.Data) != 3 ||
+	if body.Total != 3 || len(body.Data) != 3 ||
 		body.Data[0].Content != "public" ||
 		body.Data[1].Content != "support public" ||
 		body.Data[2].Content != "service public" {
 		t.Fatalf("customer saw non-public comments: %#v", body.Data)
+	}
+	for _, role := range []models.ProjectRole{
+		models.ProjectRoleAgent,
+		models.ProjectRoleObserver,
+	} {
+		roleRequest := httptest.NewRequest(
+			http.MethodGet,
+			"/tickets/"+strconv.FormatUint(uint64(ticket.ID), 10)+"/comments",
+			nil,
+		)
+		roleRequest.Header.Set("X-Test-User", strconv.FormatUint(uint64(owner.ID), 10))
+		roleRequest.Header.Set("X-Test-Role", string(role))
+		roleResponse := httptest.NewRecorder()
+		router.ServeHTTP(roleResponse, roleRequest)
+		if roleResponse.Code != http.StatusOK {
+			t.Fatalf("%s comments status=%d body=%s", role, roleResponse.Code, roleResponse.Body.String())
+		}
+		var roleBody struct {
+			Data  []models.TicketCommentResponse `json:"data"`
+			Total int64                          `json:"total"`
+		}
+		if err := json.Unmarshal(roleResponse.Body.Bytes(), &roleBody); err != nil {
+			t.Fatal(err)
+		}
+		if roleBody.Total != 4 || len(roleBody.Data) != 4 {
+			t.Fatalf("%s comment page=%+v", role, roleBody)
+		}
 	}
 	rawBody := ownerResponse.Body.String()
 	for _, forbidden := range []string{
@@ -400,15 +432,43 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 		)
 	}
 	var attachmentBody struct {
-		Data []customerAttachmentResponse `json:"data"`
+		Data  []customerAttachmentResponse `json:"data"`
+		Total int64                        `json:"total"`
 	}
 	if err := json.Unmarshal(attachmentResponse.Body.Bytes(), &attachmentBody); err != nil {
 		t.Fatal(err)
 	}
-	if len(attachmentBody.Data) != 1 ||
+	if attachmentBody.Total != 1 || len(attachmentBody.Data) != 1 ||
 		attachmentBody.Data[0].OriginalName != "customer-visible.txt" ||
 		attachmentBody.Data[0].VirusScan != models.VirusScanClean {
 		t.Fatalf("customer attachment data=%+v", attachmentBody.Data)
+	}
+	for _, role := range []models.ProjectRole{
+		models.ProjectRoleAgent,
+		models.ProjectRoleObserver,
+	} {
+		roleRequest := httptest.NewRequest(
+			http.MethodGet,
+			"/tickets/"+strconv.FormatUint(uint64(ticket.ID), 10)+"/attachments",
+			nil,
+		)
+		roleRequest.Header.Set("X-Test-User", strconv.FormatUint(uint64(owner.ID), 10))
+		roleRequest.Header.Set("X-Test-Role", string(role))
+		roleResponse := httptest.NewRecorder()
+		router.ServeHTTP(roleResponse, roleRequest)
+		if roleResponse.Code != http.StatusOK {
+			t.Fatalf("%s attachments status=%d body=%s", role, roleResponse.Code, roleResponse.Body.String())
+		}
+		var roleBody struct {
+			Data  []models.TicketAttachmentResponse `json:"data"`
+			Total int64                             `json:"total"`
+		}
+		if err := json.Unmarshal(roleResponse.Body.Bytes(), &roleBody); err != nil {
+			t.Fatal(err)
+		}
+		if roleBody.Total != 2 || len(roleBody.Data) != 2 {
+			t.Fatalf("%s attachment page=%+v", role, roleBody)
+		}
 	}
 	rawAttachmentBody := attachmentResponse.Body.String()
 	for _, forbidden := range []string{
@@ -580,6 +640,36 @@ func TestCustomerCannotReferenceInternalDeletedOrCrossTicketComment(t *testing.T
 	}
 	if err := db.Create(&publicComment).Error; err != nil {
 		t.Fatal(err)
+	}
+	nestedParent := models.TicketComment{
+		TicketID: tickets[0].ID, UserID: &customer.ID,
+		ActorType: models.ActorTypeHuman,
+		ActorID:   strconv.FormatUint(uint64(customer.ID), 10),
+		Content:   "existing reply", ContentType: "text",
+		Type: models.CommentTypePublic, ParentID: &publicComment.ID,
+	}
+	if err := db.Create(&nestedParent).Error; err != nil {
+		t.Fatal(err)
+	}
+	nestedRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/tickets/"+jsonNumber(tickets[0].ID)+"/comments",
+		bytes.NewBufferString(
+			`{"content":"nested reply","parent_id":`+
+				jsonNumber(nestedParent.ID)+`}`,
+		),
+	)
+	nestedRequest.Header.Set("Content-Type", "application/json")
+	nestedRequest.Header.Set("If-Match", httpcontract.FormatETag(tickets[0].Version))
+	nestedResponse := httptest.NewRecorder()
+	router.ServeHTTP(nestedResponse, nestedRequest)
+	if nestedResponse.Code != http.StatusBadRequest ||
+		!strings.Contains(nestedResponse.Body.String(), `"code":"nested_comment_reply"`) {
+		t.Fatalf(
+			"nested requester reply status=%d body=%s",
+			nestedResponse.Code,
+			nestedResponse.Body.String(),
+		)
 	}
 	var payload bytes.Buffer
 	writer := multipart.NewWriter(&payload)

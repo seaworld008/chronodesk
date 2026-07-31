@@ -510,6 +510,8 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_tickets_closed_at ON tickets(closed_at);",
 		"CREATE INDEX IF NOT EXISTS idx_tickets_status_priority ON tickets(status, priority);",
 		"CREATE INDEX IF NOT EXISTS idx_tickets_created_at ON tickets(created_at);",
+		"CREATE INDEX IF NOT EXISTS idx_tickets_scope_due_id ON tickets(organization_id, project_id, due_date, id);",
+		"CREATE INDEX IF NOT EXISTS idx_tickets_scope_sla_status_created_id ON tickets(organization_id, project_id, sla_breached, status, created_at, id);",
 		"CREATE INDEX IF NOT EXISTS idx_tickets_version ON tickets(id, version);",
 		"CREATE INDEX IF NOT EXISTS idx_tickets_creator_actor ON tickets(created_by_actor_type, created_by_actor_id);",
 		"CREATE INDEX IF NOT EXISTS idx_tickets_assignee_actor ON tickets(assigned_to_actor_type, assigned_to_actor_id);",
@@ -1131,28 +1133,33 @@ func runMigrationsFromModelLocked(
 		return fmt.Errorf("ticket history event-link migration failed: %w", err)
 	}
 
-	// 14. 收口删除语义明确的外键策略
+	// 14. 将旧的多层回复链扁平化到顶层评论，确保分页端点仍可读取。
+	if err := MigrateNestedCommentReplies(db); err != nil {
+		return fmt.Errorf("nested comment reply migration failed: %w", err)
+	}
+
+	// 15. 收口删除语义明确的外键策略
 	if err := EnsureForeignKeyPolicies(db); err != nil {
 		return fmt.Errorf("foreign-key policy migration failed: %w", err)
 	}
 
-	// 15. 创建额外索引
+	// 16. 创建额外索引
 	if err := CreateIndexes(db); err != nil {
 		return fmt.Errorf("index creation failed: %w", err)
 	}
 
-	// 16. 为项目审计账本安装数据库级追加写与链连续性约束。
+	// 17. 为项目审计账本安装数据库级追加写与链连续性约束。
 	if err := InstallAuditLedgerConstraints(db); err != nil {
 		return fmt.Errorf("audit ledger constraint migration failed: %w", err)
 	}
 
-	// 17. 为 scope-ready 的项目业务表安装 PostgreSQL RLS policy。
+	// 18. 为 scope-ready 的项目业务表安装 PostgreSQL RLS policy。
 	// ENABLE/FORCE 是所有写路径切换到 scoped transaction 后的显式部署步骤。
 	if err := MigrateProjectRLS(db); err != nil {
 		return fmt.Errorf("project RLS migration failed: %w", err)
 	}
 
-	// 18. 所有其他持久迁移成功后，最后切换平台角色、删除旧 role
+	// 19. 所有其他持久迁移成功后，最后切换平台角色、删除旧 role
 	// 列并写入 checkpoint。随后的 runtime gate 只读，因此 checkpoint 是
 	// 该外层事务的最后一笔 durable write。
 	if err := MigratePlatformRoles(db, membershipWriters...); err != nil {

@@ -1843,7 +1843,14 @@ func (ns *NotificationService) GetNotifications(ctx context.Context, filter *mod
 	if strings.EqualFold(filter.OrderDir, "asc") {
 		order.Desc = false
 	}
-	dataQuery = dataQuery.Clauses(clause.OrderBy{Columns: []clause.OrderByColumn{order}})
+	orderColumns := []clause.OrderByColumn{order}
+	if order.Column.Name != "id" {
+		orderColumns = append(orderColumns, clause.OrderByColumn{
+			Column: clause.Column{Name: "id"},
+			Desc:   order.Desc,
+		})
+	}
+	dataQuery = dataQuery.Clauses(clause.OrderBy{Columns: orderColumns})
 
 	// 分页
 	if filter.Limit > 0 {

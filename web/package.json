@@ -11,9 +11,10 @@
     "generate:human-api": "node ./scripts/generate-human-api-types.mjs",
     "check:human-api": "node ./scripts/generate-human-api-types.mjs --check",
     "test:human-api": "node ./scripts/test-human-api-contract.mjs",
+    "test:ticket-pagination": "node --test ./src/admin/tickets/pagedRequestGate.test.mjs",
     "test:audit-explorer": "node --test ./src/admin/audit/*.test.mjs",
     "audit:security": "node ./scripts/audit-security.mjs",
-    "check": "npm run check:human-api && npm run test:human-api && npm run test:audit-explorer && npm run typecheck && npm run lint && npm run audit:security && npm run build",
+    "check": "npm run check:human-api && npm run test:human-api && npm run test:ticket-pagination && npm run test:audit-explorer && npm run typecheck && npm run lint && npm run audit:security && npm run build",
     "test:e2e": "playwright test",
     "test:e2e:list": "playwright test --list",
     "preview": "vite preview"

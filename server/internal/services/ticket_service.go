@@ -128,11 +128,13 @@ type PageRequest struct {
 	CustomerVisible bool
 }
 
+const maxTicketPage = 1_000_000
+
 func normalizedPageRequest(pagination []PageRequest) PageRequest {
 	result := PageRequest{Page: 1, PageSize: 25}
 	if len(pagination) > 0 {
 		result.CustomerVisible = pagination[0].CustomerVisible
-		if pagination[0].Page > 0 {
+		if pagination[0].Page > 0 && pagination[0].Page <= maxTicketPage {
 			result.Page = pagination[0].Page
 		}
 		if pagination[0].PageSize > 0 && pagination[0].PageSize <= 100 {
@@ -140,6 +142,10 @@ func normalizedPageRequest(pagination []PageRequest) PageRequest {
 		}
 	}
 	return result
+}
+
+func pageRequestOffset(page PageRequest) int {
+	return (page.Page - 1) * page.PageSize
 }
 
 // TicketStatisticsResponse represents enhanced ticket statistics for dashboard
@@ -1207,7 +1213,7 @@ func (s *TicketService) GetOverdueTickets(
 	page := normalizedPageRequest(pagination)
 	query = query.Preload("CreatedBy").Preload("AssignedTo").Preload("Category").
 		Order("due_date ASC, tickets.id ASC").
-		Offset((page.Page - 1) * page.PageSize).
+		Offset(pageRequestOffset(page)).
 		Limit(page.PageSize)
 
 	if err := query.Find(&tickets).Error; err != nil {
@@ -1245,7 +1251,7 @@ func (s *TicketService) GetSLABreachedTickets(
 	page := normalizedPageRequest(pagination)
 	query = query.Preload("CreatedBy").Preload("AssignedTo").Preload("Category").
 		Order("tickets.created_at ASC, tickets.id ASC").
-		Offset((page.Page - 1) * page.PageSize).
+		Offset(pageRequestOffset(page)).
 		Limit(page.PageSize)
 
 	if err := query.Find(&tickets).Error; err != nil {
@@ -1315,7 +1321,7 @@ func (s *TicketService) GetTicketHistory(
 				},
 			).
 			Where(
-				"LOWER(TRIM(field_name)) NOT IN ?",
+				"COALESCE(LOWER(TRIM(field_name)), '') NOT IN ?",
 				[]string{
 					"assigned_to_id",
 					"assigned_to_actor_type",
@@ -1332,7 +1338,7 @@ func (s *TicketService) GetTicketHistory(
 
 	query = query.Preload("User").
 		Order("created_at DESC, id DESC").
-		Offset((page.Page - 1) * page.PageSize).
+		Offset(pageRequestOffset(page)).
 		Limit(page.PageSize)
 
 	if err := query.Find(&histories).Error; err != nil {

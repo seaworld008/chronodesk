@@ -139,6 +139,26 @@ func TestGetTicketsSupportsMultiValueFilters(t *testing.T) {
 	}
 }
 
+func TestNormalizedPageRequestRejectsOverflowingPage(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	normalized := normalizedPageRequest([]PageRequest{{
+		Page:     maxInt,
+		PageSize: 100,
+	}})
+	if normalized.Page != 1 || normalized.PageSize != 100 ||
+		pageRequestOffset(normalized) != 0 {
+		t.Fatalf("overflowing page normalized to %+v", normalized)
+	}
+	maximum := normalizedPageRequest([]PageRequest{{
+		Page:     maxTicketPage,
+		PageSize: 100,
+	}})
+	if maximum.Page != maxTicketPage ||
+		pageRequestOffset(maximum) != 99_999_900 {
+		t.Fatalf("maximum safe page normalized to %+v", maximum)
+	}
+}
+
 func TestGetTicketHistoryFiltersEveryQueryByProjectScope(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := testProjectOperationContext(t, db, models.HumanActor(1))

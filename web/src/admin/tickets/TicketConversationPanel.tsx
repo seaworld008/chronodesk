@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useState } from 'react'
+import { FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 import {
     Alert,
     Box,
@@ -51,6 +51,10 @@ import {
     canWritePublicTicketContent,
     type TicketRolePermissions,
 } from './ticketAccess'
+import {
+    LatestRequestGate,
+    lastPageAfterAppend,
+} from './pagedRequestGate'
 
 const apiBase = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
 
@@ -191,6 +195,8 @@ export const TicketConversationPanel = () => {
     const [attachmentPublic, setAttachmentPublic] = useState(false)
     const [attachmentSubmitting, setAttachmentSubmitting] = useState(false)
     const [resourceVersion, setResourceVersion] = useState(ticket?.version ?? 0)
+    const conversationGate = useRef(new LatestRequestGate())
+    const replyGates = useRef(new Map<number, LatestRequestGate>())
 
     useEffect(() => {
         setResourceVersion(ticket?.version ?? 0)
@@ -198,6 +204,7 @@ export const TicketConversationPanel = () => {
 
     const loadConversation = useCallback(async () => {
         if (!ticket?.id) return
+        const request = conversationGate.current.start()
         setLoading(true)
         setError('')
         try {
@@ -211,14 +218,14 @@ export const TicketConversationPanel = () => {
                         humanApiRoutes.listProjectTicketComments(pathParameters),
                         commentsPage,
                     ),
-                    { headers: authHeaders() },
+                    { headers: authHeaders(), signal: request.signal },
                 ),
                 sessionAwareFetch(
                     pagedURL(
                         humanApiRoutes.listProjectTicketAttachments(pathParameters),
                         attachmentsPage,
                     ),
-                    { headers: authHeaders() },
+                    { headers: authHeaders(), signal: request.signal },
                 ),
             ])
             if (!commentsResponse.ok) {
@@ -237,6 +244,7 @@ export const TicketConversationPanel = () => {
             ])
             const commentPage = pagePayload<TicketComment>(commentsPayload)
             const attachmentPage = pagePayload<TicketAttachment>(attachmentsPayload)
+            if (!conversationGate.current.isCurrent(request.token)) return
             setComments(commentPage.items)
             setCommentsTotal(commentPage.total)
             setCommentsTotalPages(commentPage.totalPages)
@@ -244,9 +252,12 @@ export const TicketConversationPanel = () => {
             setAttachmentsTotal(attachmentPage.total)
             setAttachmentsTotalPages(attachmentPage.totalPages)
         } catch (loadError) {
+            if (!conversationGate.current.isCurrent(request.token)) return
             setError(localizedUnknownErrorMessage(loadError, '加载工单会话失败'))
         } finally {
-            setLoading(false)
+            if (conversationGate.current.isCurrent(request.token)) {
+                setLoading(false)
+            }
         }
     }, [attachmentsPage, commentsPage, ticket?.id])
 
@@ -260,8 +271,30 @@ export const TicketConversationPanel = () => {
         setReplyPages({})
     }, [ticket?.id])
 
+    useEffect(() => () => {
+        conversationGate.current.abort()
+        for (const gate of replyGates.current.values()) {
+            gate.abort()
+        }
+        replyGates.current.clear()
+    }, [])
+
+    useEffect(() => {
+        for (const gate of replyGates.current.values()) {
+            gate.abort()
+        }
+        replyGates.current.clear()
+        setReplyPages({})
+    }, [commentsPage, ticket?.id])
+
     const loadReplies = useCallback(async (commentID: number, page: number) => {
         if (!ticket?.id) return
+        let gate = replyGates.current.get(commentID)
+        if (!gate) {
+            gate = new LatestRequestGate()
+            replyGates.current.set(commentID, gate)
+        }
+        const request = gate.start()
         setReplyPages((current) => ({
             ...current,
             [commentID]: {
@@ -281,11 +314,13 @@ export const TicketConversationPanel = () => {
             })
             const response = await sessionAwareFetch(pagedURL(path, page), {
                 headers: authHeaders(),
+                signal: request.signal,
             })
             if (!response.ok) {
                 throw new Error(await responseMessage(response, '加载回复失败'))
             }
             const payload = pagePayload<TicketComment>(await response.json())
+            if (!gate.isCurrent(request.token)) return
             setReplyPages((current) => ({
                 ...current,
                 [commentID]: {
@@ -298,6 +333,7 @@ export const TicketConversationPanel = () => {
                 },
             }))
         } catch (replyError) {
+            if (!gate.isCurrent(request.token)) return
             setReplyPages((current) => ({
                 ...current,
                 [commentID]: {
@@ -325,13 +361,6 @@ export const TicketConversationPanel = () => {
         permissions?.project_role,
         identity?.id,
     )
-    const visibleComments = canWriteInternal
-        ? comments
-        : comments.filter((item) => item.type !== 'internal')
-    const visibleAttachments = canWriteInternal
-        ? attachments
-        : attachments.filter((attachment) => attachment.is_public)
-
     const submitComment = async (event: FormEvent) => {
         event.preventDefault()
         const content = comment.trim()
@@ -369,10 +398,11 @@ export const TicketConversationPanel = () => {
             }
             setComment('')
             notify('评论已添加', { type: 'success' })
-            if (commentsPage === 1) {
+            const lastPage = lastPageAfterAppend(commentsTotal)
+            if (commentsPage === lastPage) {
                 await loadConversation()
             } else {
-                setCommentsPage(1)
+                setCommentsPage(lastPage)
             }
         } catch (submitError) {
             notify(
@@ -546,13 +576,13 @@ export const TicketConversationPanel = () => {
                 <Card variant="outlined" role="region" aria-label="工单评论记录">
                     <CardContent>
                         <Typography variant="h6">评论记录（{commentsTotal}）</Typography>
-                        {visibleComments.length === 0 ? (
+                        {comments.length === 0 ? (
                             <Typography color="text.secondary" sx={{ mt: 2 }}>
                                 暂无评论
                             </Typography>
                         ) : (
                             <List disablePadding>
-                                {visibleComments.map((item, index) => (
+                                {comments.map((item, index) => (
                                     <Box key={item.id}>
                                         {index > 0 && <Divider />}
                                         <ListItem alignItems="flex-start">
@@ -603,6 +633,8 @@ export const TicketConversationPanel = () => {
                                                                     size="small"
                                                                     onClick={() => {
                                                                         if (replyPages[item.id]) {
+                                                                            replyGates.current.get(item.id)?.abort()
+                                                                            replyGates.current.delete(item.id)
                                                                             setReplyPages((current) => {
                                                                                 const next = { ...current }
                                                                                 delete next[item.id]
@@ -749,11 +781,11 @@ export const TicketConversationPanel = () => {
                             </Button>
                         </Stack>}
 
-                        {visibleAttachments.length === 0 ? (
+                        {attachments.length === 0 ? (
                             <Typography color="text.secondary">暂无附件</Typography>
                         ) : (
                             <List disablePadding>
-                                {visibleAttachments.map((attachment, index) => (
+                                {attachments.map((attachment, index) => (
                                     <Box key={attachment.id}>
                                         {index > 0 && <Divider />}
                                         <ListItem

@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.0.0.
- * Contract SHA-256: b2aac2da675a268928b9ccda5c2449c9deeb8ddbcc703547de7ce60e7866c35c.
+ * Contract SHA-256: 2aaa9d9987562e589d9ab3659816623bba1ba2071b8305710cd90551747ebaec.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -710,6 +710,15 @@ export type TicketPage = {
 
 export type TicketEnvelope = SuccessEnvelope & {
     data: Ticket
+}
+
+export type TicketListPageEnvelope = {
+    success: true
+    data: Array<Ticket>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
 }
 
 export type TicketPageEnvelope = SuccessEnvelope & {
@@ -1729,6 +1738,26 @@ export type CreateProjectTicketOperationQuery = Record<string, never>
 export type CreateProjectTicketOperationRequest = CreateTicketRequest
 export type CreateProjectTicketOperationResponse = TicketEnvelope
 
+export type ListProjectOverdueTicketsOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectOverdueTicketsOperationQuery = {
+    page?: number
+    page_size?: number
+}
+export type ListProjectOverdueTicketsOperationRequest = never
+export type ListProjectOverdueTicketsOperationResponse = TicketListPageEnvelope
+
+export type ListProjectSLABreachedTicketsOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectSLABreachedTicketsOperationQuery = {
+    page?: number
+    page_size?: number
+}
+export type ListProjectSLABreachedTicketsOperationRequest = never
+export type ListProjectSLABreachedTicketsOperationResponse = TicketListPageEnvelope
+
 export type GetProjectTicketOperationPathParameters = {
     projectKey: string
     ticketID: number
@@ -2366,6 +2395,18 @@ export const humanApiOperations = {
         successStatus: 201,
         requestBody: "required",
     },
+    listProjectOverdueTickets: {
+        method: "GET",
+        path: "/projects/{projectKey}/tickets/overdue",
+        successStatus: 200,
+        requestBody: "none",
+    },
+    listProjectSLABreachedTickets: {
+        method: "GET",
+        path: "/projects/{projectKey}/tickets/sla-breach",
+        successStatus: 200,
+        requestBody: "none",
+    },
     getProjectTicket: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/{ticketID}",
@@ -2849,6 +2890,18 @@ export interface HumanApiOperationTypes {
         request: CreateProjectTicketOperationRequest
         response: CreateProjectTicketOperationResponse
     }
+    listProjectOverdueTickets: {
+        pathParameters: ListProjectOverdueTicketsOperationPathParameters
+        query: ListProjectOverdueTicketsOperationQuery
+        request: ListProjectOverdueTicketsOperationRequest
+        response: ListProjectOverdueTicketsOperationResponse
+    }
+    listProjectSLABreachedTickets: {
+        pathParameters: ListProjectSLABreachedTicketsOperationPathParameters
+        query: ListProjectSLABreachedTicketsOperationQuery
+        request: ListProjectSLABreachedTicketsOperationRequest
+        response: ListProjectSLABreachedTicketsOperationResponse
+    }
     getProjectTicket: {
         pathParameters: GetProjectTicketOperationPathParameters
         query: GetProjectTicketOperationQuery
@@ -3294,6 +3347,10 @@ export const humanApiRoutes = {
         humanApiRoute("listProjectTickets", pathParameters, query),
     createProjectTicket: (pathParameters: CreateProjectTicketOperationPathParameters, query: CreateProjectTicketOperationQuery = {}) =>
         humanApiRoute("createProjectTicket", pathParameters, query),
+    listProjectOverdueTickets: (pathParameters: ListProjectOverdueTicketsOperationPathParameters, query: ListProjectOverdueTicketsOperationQuery = {}) =>
+        humanApiRoute("listProjectOverdueTickets", pathParameters, query),
+    listProjectSLABreachedTickets: (pathParameters: ListProjectSLABreachedTicketsOperationPathParameters, query: ListProjectSLABreachedTicketsOperationQuery = {}) =>
+        humanApiRoute("listProjectSLABreachedTickets", pathParameters, query),
     getProjectTicket: (pathParameters: GetProjectTicketOperationPathParameters, query: GetProjectTicketOperationQuery = {}) =>
         humanApiRoute("getProjectTicket", pathParameters, query),
     updateProjectTicket: (pathParameters: UpdateProjectTicketOperationPathParameters, query: UpdateProjectTicketOperationQuery = {}) =>

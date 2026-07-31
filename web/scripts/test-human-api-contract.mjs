@@ -748,6 +748,8 @@ const p1Operations = [
     ['/projects/{projectKey}/tickets/{ticketID}', 'get'],
     ['/projects/{projectKey}/tickets/{ticketID}', 'put'],
     ['/projects/{projectKey}/tickets/{ticketID}', 'delete'],
+    ['/projects/{projectKey}/tickets/overdue', 'get'],
+    ['/projects/{projectKey}/tickets/sla-breach', 'get'],
     ['/projects/{projectKey}/notifications', 'get'],
     ['/projects/{projectKey}/notifications', 'post'],
     ['/projects/{projectKey}/notifications/{notificationID}', 'delete'],
@@ -835,6 +837,23 @@ for (const [operationPath, method] of p1Operations) {
     assert.ok(
         contract.paths[operationPath]?.[method],
         `${method.toUpperCase()} ${operationPath} is missing from the P1 contract`,
+    )
+}
+const notificationListParameters =
+    contract.paths['/projects/{projectKey}/notifications'].get.parameters
+const notificationPageSize = notificationListParameters.find(
+    (parameter) => parameter.name === 'page_size',
+)
+assert.equal(notificationPageSize.schema.default, 25)
+assert.equal(notificationPageSize.schema.maximum, 100)
+for (const path of [
+    '/projects/{projectKey}/tickets/overdue',
+    '/projects/{projectKey}/tickets/sla-breach',
+]) {
+    const operation = contract.paths[path].get
+    assert.equal(
+        operation.responses['200'].content['application/json'].schema.$ref,
+        '#/components/schemas/TicketListPageEnvelope',
     )
 }
 
@@ -1056,6 +1075,12 @@ assert.doesNotMatch(ticketConversation, /projectResourcePath/)
 assert.match(ticketConversation, /<Pagination/)
 assert.match(ticketConversation, /aria-label="评论分页"/)
 assert.match(ticketConversation, /aria-label="附件分页"/)
+assert.match(ticketConversation, /LatestRequestGate/)
+assert.match(ticketConversation, /signal: request\.signal/)
+assert.match(ticketConversation, /lastPageAfterAppend\(commentsTotal\)/)
+assert.match(ticketConversation, />\s*重试\s*</)
+assert.doesNotMatch(ticketConversation, /comments\.filter\(/)
+assert.doesNotMatch(ticketConversation, /attachments\.filter\(/)
 assert.match(dataProvider, /queryString\.stringify\(query\)/)
 for (const routeHelper of [
     'assignProjectTicket',

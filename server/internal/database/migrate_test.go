@@ -73,6 +73,14 @@ func TestValidateRuntimeSchemaAcceptsMigratedModel(t *testing.T) {
 	if err := ValidateRuntimeSchema(db); err != nil {
 		t.Fatalf("validate migrated schema: %v", err)
 	}
+	for _, index := range []string{
+		"idx_tickets_scope_due_id",
+		"idx_tickets_scope_sla_status_created_id",
+	} {
+		if !db.Migrator().HasIndex(&models.Ticket{}, index) {
+			t.Fatalf("migrated schema is missing ticket pagination index %q", index)
+		}
+	}
 }
 
 func TestValidateRuntimeSchemaRejectsMissingTicketAgentColumns(t *testing.T) {

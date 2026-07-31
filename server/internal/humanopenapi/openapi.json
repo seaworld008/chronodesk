@@ -1752,6 +1752,124 @@
         ]
       }
     },
+    "/projects/{projectKey}/tickets/overdue": {
+      "get": {
+        "operationId": "listProjectOverdueTickets",
+        "summary": "List visible overdue Tickets in one authorized Project",
+        "description": "Returns one bounded page of overdue Tickets after Project and Ticket visibility filtering.",
+        "tags": [
+          "Tickets"
+        ],
+        "security": [
+          {
+            "humanBearer": [
+
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ProjectKey"
+          },
+          {
+            "$ref": "#/components/parameters/ContentPage"
+          },
+          {
+            "$ref": "#/components/parameters/ContentPageSize"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Visible overdue Tickets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketListPageEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "x-chronodesk-project-roles": [
+          "project_admin",
+          "manager",
+          "agent",
+          "requester",
+          "observer"
+        ]
+      }
+    },
+    "/projects/{projectKey}/tickets/sla-breach": {
+      "get": {
+        "operationId": "listProjectSLABreachedTickets",
+        "summary": "List visible SLA-breached Tickets in one authorized Project",
+        "description": "Returns one bounded page of active SLA-breached Tickets after Project and Ticket visibility filtering.",
+        "tags": [
+          "Tickets"
+        ],
+        "security": [
+          {
+            "humanBearer": [
+
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ProjectKey"
+          },
+          {
+            "$ref": "#/components/parameters/ContentPage"
+          },
+          {
+            "$ref": "#/components/parameters/ContentPageSize"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Visible SLA-breached Tickets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketListPageEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "x-chronodesk-project-roles": [
+          "project_admin",
+          "manager",
+          "agent",
+          "requester",
+          "observer"
+        ]
+      }
+    },
     "/projects/{projectKey}/tickets/{ticketID}": {
       "get": {
         "operationId": "getProjectTicket",
@@ -2783,7 +2901,8 @@
             "schema": {
               "type": "integer",
               "minimum": 1,
-              "default": 10
+              "maximum": 100,
+              "default": 25
             }
           },
           {
@@ -9313,6 +9432,47 @@
           }
         ]
       },
+      "TicketListPageEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "data",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "const": true
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Ticket"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "total_pages": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
       "TicketPageEnvelope": {
         "allOf": [
           {
@@ -9757,7 +9917,8 @@
           },
           "page_size": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 1,
+            "maximum": 100
           },
           "total": {
             "type": "integer",
