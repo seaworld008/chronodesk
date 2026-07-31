@@ -236,7 +236,7 @@ func openProfileAvatarPostgresFixture(
 	}
 	parsed, err := url.Parse(rawDSN)
 	if err != nil {
-		t.Fatalf("parse PostgreSQL integration DSN: %v", err)
+		t.Fatal("parse PostgreSQL integration DSN: invalid URL")
 	}
 	host := parsed.Hostname()
 	if host != "localhost" {
