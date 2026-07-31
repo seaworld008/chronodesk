@@ -1,5 +1,12 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import {
+  Alert,
   Box,
   Button,
   Checkbox,
@@ -9,6 +16,7 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
+  Drawer,
   FormControl,
   FormControlLabel,
   Grid,
@@ -25,6 +33,7 @@ import {
   TableCell,
   TableContainer,
   TableHead,
+  TablePagination,
   TableRow,
   TextField,
   Tooltip,
@@ -36,6 +45,7 @@ import {
   Edit as EditIcon,
   Science as TestIcon,
   Refresh as RefreshIcon,
+  ReceiptLong as DeliveryIcon,
 } from '@mui/icons-material'
 import { useNotify } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
@@ -43,7 +53,6 @@ import { resolveActiveProjectKey } from '@/lib/projectScope'
 import {
   humanApiRoutes,
   type WebhookConfig,
-  type WebhookPage,
   type WebhookTestReceipt,
 } from '@/lib/generated/human-api'
 import BackButton from '../common/BackButton'
@@ -63,7 +72,7 @@ const webhookColumns: ResizableColumn[] = [
   { key: 'events', defaultWidth: 360, minWidth: 200, maxWidth: 640 },
   { key: 'delivery', defaultWidth: 180, minWidth: 140, maxWidth: 280 },
   { key: 'last-success', defaultWidth: 188, minWidth: 150, maxWidth: 280 },
-  { key: 'actions', defaultWidth: 152, minWidth: 136, maxWidth: 220, sticky: 'right' },
+  { key: 'actions', defaultWidth: 200, minWidth: 184, maxWidth: 280, sticky: 'right' },
 ]
 
 const isQueuedWebhookTestReceipt = (
@@ -244,10 +253,39 @@ type PendingWebhookAction = {
   name: string
 }
 
+type WebhookDefinitionPage = {
+  items: WebhookConfig[]
+  total: number
+  page: number
+  page_size: number
+  total_pages: number
+}
+
+type WebhookDelivery = {
+  id: number
+  created_at: string
+  config_id: number
+  event_type: string
+  status: string
+  response_status?: number
+  response_time?: number
+  error_message?: string
+}
+
+type WebhookDeliveryPage = {
+  items: WebhookDelivery[]
+  next_cursor: string
+  has_more: boolean
+}
+
 const WebhookSettings: React.FC = () => {
   const notify = useNotify()
   const [loading, setLoading] = useState(false)
   const [items, setItems] = useState<WebhookConfig[]>([])
+  const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(0)
+  const [pageSize, setPageSize] = useState(25)
+  const [listError, setListError] = useState('')
   const [formOpen, setFormOpen] = useState(false)
   const [currentId, setCurrentId] = useState<number | null>(null)
   const [form, setForm] = useState<WebhookForm>(defaultForm)
@@ -255,6 +293,17 @@ const WebhookSettings: React.FC = () => {
   const [testId, setTestId] = useState<number | null>(null)
   const [saving, setSaving] = useState(false)
   const [pendingAction, setPendingAction] = useState<PendingWebhookAction | null>(null)
+  const [deliveryWebhook, setDeliveryWebhook] = useState<WebhookConfig | null>(null)
+  const [deliveries, setDeliveries] = useState<WebhookDelivery[]>([])
+  const [deliveryLoading, setDeliveryLoading] = useState(false)
+  const [deliveryError, setDeliveryError] = useState('')
+  const [deliveryStatus, setDeliveryStatus] = useState('')
+  const [deliveryEventType, setDeliveryEventType] = useState('')
+  const [deliveryCursor, setDeliveryCursor] = useState('')
+  const [deliveryHasMore, setDeliveryHasMore] = useState(false)
+  const [selectedDelivery, setSelectedDelivery] = useState<WebhookDelivery | null>(null)
+  const lastDefinitionQuery = useRef('')
+  const lastDeliveryQuery = useRef('')
 
   const extractErrorMessage = useCallback((error: unknown, fallback: string) => {
     return localizedUnknownErrorMessage(error, fallback)
@@ -263,23 +312,78 @@ const WebhookSettings: React.FC = () => {
   const fetchWebhooks = useCallback(async () => {
     try {
       setLoading(true)
+      setListError('')
       const projectKey = await resolveActiveProjectKey()
       const path = humanApiRoutes.listProjectWebhooks(
         { projectKey },
-        { page: 1, page_size: 100 },
+        { page: page + 1, page_size: pageSize },
       )
-      const data = await apiFetch<WebhookPage>(path)
+      const data = await apiFetch<WebhookDefinitionPage>(path)
       setItems(data.items ?? [])
+      setTotal(data.total ?? 0)
     } catch (error: unknown) {
-      notify(extractErrorMessage(error, '加载 Webhook 列表失败'), { type: 'error' })
+      setListError(extractErrorMessage(error, '加载 Webhook 列表失败'))
     } finally {
       setLoading(false)
     }
-  }, [notify, extractErrorMessage])
+  }, [extractErrorMessage, page, pageSize])
 
   useEffect(() => {
-    fetchWebhooks()
-  }, [fetchWebhooks])
+    const queryKey = `${page}:${pageSize}`
+    if (lastDefinitionQuery.current === queryKey) return
+    lastDefinitionQuery.current = queryKey
+    void fetchWebhooks()
+  }, [fetchWebhooks, page, pageSize])
+
+  const fetchDeliveries = useCallback(async (
+    webhook: WebhookConfig,
+    cursor = '',
+    append = false,
+  ) => {
+    try {
+      setDeliveryLoading(true)
+      setDeliveryError('')
+      const projectKey = await resolveActiveProjectKey()
+      const parameters = new URLSearchParams({ limit: '25' })
+      if (cursor) parameters.set('cursor', cursor)
+      if (deliveryStatus) parameters.set('status', deliveryStatus)
+      if (deliveryEventType) parameters.set('event_type', deliveryEventType)
+      const basePath = humanApiRoutes.listProjectWebhookLogs(
+        { projectKey, webhookID: webhook.id },
+        {},
+      )
+      const data = await apiFetch<WebhookDeliveryPage>(
+        `${basePath}?${parameters.toString()}`,
+      )
+      setDeliveries((previous) => append
+        ? [...previous, ...(data.items ?? [])]
+        : (data.items ?? []))
+      setDeliveryCursor(data.next_cursor ?? '')
+      setDeliveryHasMore(Boolean(data.has_more))
+    } catch (error: unknown) {
+      setDeliveryError(extractErrorMessage(error, '加载 Webhook 投递记录失败'))
+    } finally {
+      setDeliveryLoading(false)
+    }
+  }, [deliveryEventType, deliveryStatus, extractErrorMessage])
+
+  useEffect(() => {
+    if (!deliveryWebhook) return
+    const queryKey = [
+      deliveryWebhook.id,
+      deliveryStatus,
+      deliveryEventType,
+    ].join(':')
+    if (lastDeliveryQuery.current === queryKey) return
+    lastDeliveryQuery.current = queryKey
+    setSelectedDelivery(null)
+    void fetchDeliveries(deliveryWebhook)
+  }, [
+    deliveryEventType,
+    deliveryStatus,
+    deliveryWebhook,
+    fetchDeliveries,
+  ])
 
   const openCreate = () => {
     setCurrentId(null)
@@ -470,6 +574,7 @@ const WebhookSettings: React.FC = () => {
       if (!isQueuedWebhookTestReceipt(receipt, id)) {
         throw new Error('Webhook 测试入队响应无效，请稍后重试')
       }
+      lastDeliveryQuery.current = ''
       notify('Webhook 测试已入队，请等待投递结果', { type: 'info' })
     } catch (error: unknown) {
       notify(extractErrorMessage(error, 'Webhook 测试入队失败'), { type: 'error' })
@@ -502,7 +607,12 @@ const WebhookSettings: React.FC = () => {
         leading={<BackButton fallbackPath="/" />}
         action={(
           <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
-            <Button variant="outlined" startIcon={<RefreshIcon />} onClick={fetchWebhooks}>
+            <Button
+              variant="outlined"
+              startIcon={<RefreshIcon />}
+              onClick={() => void fetchWebhooks()}
+              disabled={loading}
+            >
               刷新
             </Button>
             <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
@@ -512,6 +622,19 @@ const WebhookSettings: React.FC = () => {
         )}
       />
       <Box sx={{ mt: 3 }}>
+      {listError && (
+        <Alert
+          severity="error"
+          sx={{ mb: 2 }}
+          action={(
+            <Button color="inherit" size="small" onClick={() => void fetchWebhooks()}>
+              重试
+            </Button>
+          )}
+        >
+          {listError}
+        </Alert>
+      )}
       <TableContainer component={Paper}>
         <ResizableMuiTable
           tableId="settings.webhooks"
@@ -586,6 +709,14 @@ const WebhookSettings: React.FC = () => {
                   }}>
                     <IconButton
                       size="small"
+                      aria-label={`查看投递记录：${item.name}`}
+                      title="查看投递记录"
+                      onClick={() => setDeliveryWebhook(item)}
+                    >
+                      <DeliveryIcon fontSize="small" />
+                    </IconButton>
+                    <IconButton
+                      size="small"
                       aria-label={`测试 Webhook：${item.name}`}
                       title="将测试请求加入投递队列"
                       onClick={() => setPendingAction({
@@ -623,8 +754,170 @@ const WebhookSettings: React.FC = () => {
             ))}
           </TableBody>
         </ResizableMuiTable>
+        <TablePagination
+          component="div"
+          count={total}
+          page={page}
+          rowsPerPage={pageSize}
+          rowsPerPageOptions={[25, 50, 100]}
+          labelRowsPerPage="每页行数"
+          labelDisplayedRows={({ from, to, count }) => `${from}–${to} / ${count}`}
+          onPageChange={(_, nextPage) => setPage(nextPage)}
+          onRowsPerPageChange={(event) => {
+            setPage(0)
+            setPageSize(Number(event.target.value))
+          }}
+        />
       </TableContainer>
       </Box>
+      <Drawer
+        anchor="right"
+        open={Boolean(deliveryWebhook)}
+        onClose={() => setDeliveryWebhook(null)}
+        sx={{ '& .MuiDrawer-paper': { width: { xs: '100%', md: 720 }, p: 3 } }}
+      >
+        <Stack spacing={2} sx={{ minHeight: '100%' }}>
+          <Stack
+            direction="row"
+            sx={{ justifyContent: 'space-between', alignItems: 'center' }}
+          >
+            <Box>
+              <Typography variant="h6">投递记录</Typography>
+              <Typography variant="body2" color="text.secondary">
+                {deliveryWebhook?.name || 'Webhook'}
+              </Typography>
+            </Box>
+            <Button onClick={() => setDeliveryWebhook(null)}>关闭</Button>
+          </Stack>
+          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+            <TextField
+              select
+              fullWidth
+              size="small"
+              label="投递状态"
+              value={deliveryStatus}
+              onChange={(event) => setDeliveryStatus(event.target.value)}
+            >
+              <MenuItem value="">全部状态</MenuItem>
+              <MenuItem value="pending">等待中</MenuItem>
+              <MenuItem value="success">成功</MenuItem>
+              <MenuItem value="failed">失败</MenuItem>
+            </TextField>
+            <TextField
+              select
+              fullWidth
+              size="small"
+              label="事件类型"
+              value={deliveryEventType}
+              onChange={(event) => setDeliveryEventType(event.target.value)}
+            >
+              <MenuItem value="">全部事件</MenuItem>
+              {eventOptions.map((eventType) => (
+                <MenuItem key={eventType} value={eventType}>
+                  {eventLabel(eventType)}
+                </MenuItem>
+              ))}
+            </TextField>
+          </Stack>
+          {deliveryError && (
+            <Alert
+              severity="error"
+              action={(
+                <Button
+                  color="inherit"
+                  size="small"
+                  onClick={() => deliveryWebhook
+                    && void fetchDeliveries(deliveryWebhook)}
+                >
+                  重试
+                </Button>
+              )}
+            >
+              {deliveryError}
+            </Alert>
+          )}
+          <Paper variant="outlined" sx={{ overflow: 'hidden' }}>
+            {deliveries.map((delivery) => (
+              <Button
+                key={delivery.id}
+                fullWidth
+                color="inherit"
+                onClick={() => setSelectedDelivery(delivery)}
+                sx={{
+                  display: 'grid',
+                  gridTemplateColumns: { xs: '1fr', sm: '160px 1fr 88px' },
+                  gap: 1,
+                  justifyItems: 'start',
+                  px: 2,
+                  py: 1.5,
+                  borderRadius: 0,
+                  borderBottom: '1px solid',
+                  borderColor: 'divider',
+                  textAlign: 'left',
+                  textTransform: 'none',
+                }}
+              >
+                <Typography variant="body2">
+                  {new Date(delivery.created_at).toLocaleString('zh-CN')}
+                </Typography>
+                <TruncatedText title={delivery.event_type}>
+                  {eventLabel(delivery.event_type)}
+                </TruncatedText>
+                <Chip
+                  size="small"
+                  label={delivery.status === 'success'
+                    ? '成功'
+                    : delivery.status === 'failed' ? '失败' : '等待中'}
+                  color={delivery.status === 'success'
+                    ? 'success'
+                    : delivery.status === 'failed' ? 'error' : 'default'}
+                />
+              </Button>
+            ))}
+            {!deliveryLoading && deliveries.length === 0 && !deliveryError && (
+              <Typography sx={{ p: 4, textAlign: 'center' }} color="text.secondary">
+                暂无投递记录
+              </Typography>
+            )}
+            {deliveryLoading && deliveries.length === 0 && (
+              <Stack sx={{ p: 4, alignItems: 'center' }}>
+                <CircularProgress size={24} aria-label="正在加载投递记录" />
+              </Stack>
+            )}
+          </Paper>
+          {deliveryHasMore && (
+            <Button
+              variant="outlined"
+              disabled={deliveryLoading}
+              onClick={() => deliveryWebhook
+                && void fetchDeliveries(deliveryWebhook, deliveryCursor, true)}
+            >
+              {deliveryLoading ? '加载中…' : '加载更多'}
+            </Button>
+          )}
+          {selectedDelivery && (
+            <Paper variant="outlined" sx={{ p: 2 }} aria-live="polite">
+              <Typography component="h3" variant="subtitle1" gutterBottom>
+                投递详情 #{selectedDelivery.id}
+              </Typography>
+              <Stack spacing={0.5}>
+                <Typography variant="body2">
+                  事件：{selectedDelivery.event_type}
+                </Typography>
+                <Typography variant="body2">
+                  HTTP 状态：{selectedDelivery.response_status || '—'}
+                </Typography>
+                <Typography variant="body2">
+                  耗时：{selectedDelivery.response_time ?? '—'} 毫秒
+                </Typography>
+                <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+                  诊断：{selectedDelivery.error_message || '无'}
+                </Typography>
+              </Stack>
+            </Paper>
+          )}
+        </Stack>
+      </Drawer>
       <Dialog open={formOpen} onClose={closeForm} maxWidth="md" fullWidth>
         <DialogTitle>{currentId ? '编辑 Webhook' : '新增 Webhook'}</DialogTitle>
         <DialogContent dividers>

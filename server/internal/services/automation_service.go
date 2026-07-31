@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
+	"github.com/seaworld008/chronodesk/server/internal/listcursor"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"gorm.io/datatypes"
@@ -23,9 +24,10 @@ import (
 
 // AutomationService 自动化服务
 type AutomationService struct {
-	db     *gorm.DB
-	native *AgentNativeService
-	sla    *SLAService
+	db             *gorm.DB
+	native         *AgentNativeService
+	sla            *SLAService
+	logCursorCodec *listcursor.Codec
 }
 
 // NewAutomationService 创建自动化服务实例
@@ -44,6 +46,21 @@ func NewAutomationServiceWithAgentNative(db *gorm.DB, native *AgentNativeService
 	return &AutomationService{db: db, native: native, sla: NewSLAService(db)}
 }
 
+// ConfigureListCursor derives an Automation-log-only signing key from the
+// deployment-owned root. Execution-log reads remain unavailable until this is
+// configured explicitly.
+func (s *AutomationService) ConfigureListCursor(root []byte) error {
+	if s == nil || s.db == nil || len(root) == 0 {
+		return ErrAutomationListCursorKey
+	}
+	codec, err := listcursor.NewCodec(root, "automation-execution-logs.v1")
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrAutomationListCursorKey, err)
+	}
+	s.logCursorCodec = codec
+	return nil
+}
+
 func (s *AutomationService) slaDomainService() *SLAService {
 	if s.sla == nil {
 		s.sla = NewSLAService(s.db)
@@ -60,11 +77,43 @@ const (
 	automationReservationTTL         = 2 * time.Minute
 	automationFailureRetryDelay      = 2 * time.Second
 	automationCompletedRetentionTTL  = 365 * 24 * time.Hour
+	DefaultAutomationListSize        = 25
+	MaxAutomationListSize            = 100
+	automationLogCursorVersion       = 1
+	automationLogSortVersion         = "executed_at_desc_id_desc.v1"
 )
 
 var (
 	ErrInvalidAutomationTriggerType = errors.New("invalid automation trigger event type")
+	ErrInvalidAutomationListQuery   = errors.New("automation list query is invalid")
+	ErrInvalidAutomationListCursor  = errors.New("automation list cursor is invalid")
+	ErrAutomationListCursorKey      = errors.New("automation list cursor signing key is unavailable")
 )
+
+type AutomationExecutionLogQuery struct {
+	Cursor   string
+	Limit    int
+	RuleID   *uint
+	TicketID *uint
+	Success  *bool
+}
+
+type AutomationExecutionLogPage struct {
+	Items      []*models.AutomationLog
+	NextCursor string
+	HasMore    bool
+}
+
+type automationExecutionLogCursor struct {
+	Version      int    `json:"v"`
+	Organization uint   `json:"organization_id"`
+	Project      uint   `json:"project_id"`
+	Limit        int    `json:"limit"`
+	FilterHash   string `json:"filter_hash"`
+	SortVersion  string `json:"sort_version"`
+	ExecutedAt   string `json:"executed_at"`
+	ID           uint   `json:"id"`
+}
 
 func automationProjectScope(ctx context.Context) (models.ProjectScope, error) {
 	scope, err := RequireProjectScope(ctx)
@@ -140,6 +189,9 @@ func (s *AutomationService) GetRules(ctx context.Context, ruleType string, trigg
 	if err != nil {
 		return nil, 0, err
 	}
+	if page < 1 || pageSize < 1 || pageSize > MaxAutomationListSize {
+		return nil, 0, ErrInvalidAutomationListQuery
+	}
 	query := scopedAutomationQuery(
 		s.db.WithContext(ctx).Model(&models.AutomationRule{}),
 		scope,
@@ -170,7 +222,13 @@ func (s *AutomationService) GetRules(ctx context.Context, ruleType string, trigg
 
 	var rules []*models.AutomationRule
 	offset := (page - 1) * pageSize
-	if err := query.Order("priority ASC, created_at DESC").Offset(offset).Limit(pageSize).Find(&rules).Error; err != nil {
+	if err := query.
+		Order("priority ASC").
+		Order("created_at DESC").
+		Order("id DESC").
+		Offset(offset).
+		Limit(pageSize).
+		Find(&rules).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to get rules: %w", err)
 	}
 
@@ -2126,6 +2184,161 @@ func (s *AutomationService) toUint(value interface{}) (uint, error) {
 	}
 }
 
+// ListExecutionLogs returns a stable, project-bound execution timeline.
+func (s *AutomationService) ListExecutionLogs(
+	ctx context.Context,
+	query AutomationExecutionLogQuery,
+) (*AutomationExecutionLogPage, error) {
+	scope, err := automationProjectScope(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if s == nil || s.db == nil || s.logCursorCodec == nil {
+		return nil, ErrAutomationListCursorKey
+	}
+	if query.Limit < 1 || query.Limit > MaxAutomationListSize ||
+		(query.RuleID != nil && *query.RuleID == 0) ||
+		(query.TicketID != nil && *query.TicketID == 0) {
+		return nil, ErrInvalidAutomationListQuery
+	}
+	filterHash := automationExecutionLogFilterHash(query)
+	cursor, err := s.decodeExecutionLogCursor(
+		query.Cursor,
+		scope,
+		query.Limit,
+		filterHash,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	logsQuery := scopedAutomationQuery(
+		s.db.WithContext(ctx).Model(&models.AutomationLog{}),
+		scope,
+	).
+		Preload(
+			"Rule",
+			"organization_id = ? AND project_id = ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		Preload(
+			"Ticket",
+			"organization_id = ? AND project_id = ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+		)
+	if query.RuleID != nil {
+		logsQuery = logsQuery.Where("rule_id = ?", *query.RuleID)
+	}
+	if query.TicketID != nil {
+		logsQuery = logsQuery.Where("ticket_id = ?", *query.TicketID)
+	}
+	if query.Success != nil {
+		logsQuery = logsQuery.Where("success = ?", *query.Success)
+	}
+	if cursor != nil {
+		logsQuery = logsQuery.Where(
+			"executed_at < ? OR (executed_at = ? AND id < ?)",
+			cursor.ExecutedAt,
+			cursor.ExecutedAt,
+			cursor.ID,
+		)
+	}
+
+	var logs []*models.AutomationLog
+	if err := logsQuery.
+		Order("executed_at DESC").
+		Order("id DESC").
+		Limit(query.Limit + 1).
+		Find(&logs).Error; err != nil {
+		return nil, fmt.Errorf("list automation execution logs: %w", err)
+	}
+	hasMore := len(logs) > query.Limit
+	if hasMore {
+		logs = logs[:query.Limit]
+	}
+	nextCursor := ""
+	if hasMore && len(logs) > 0 {
+		last := logs[len(logs)-1]
+		nextCursor, err = s.logCursorCodec.Encode(
+			automationExecutionLogCursor{
+				Version:      automationLogCursorVersion,
+				Organization: scope.OrganizationID,
+				Project:      scope.ProjectID,
+				Limit:        query.Limit,
+				FilterHash:   filterHash,
+				SortVersion:  automationLogSortVersion,
+				ExecutedAt:   last.ExecutedAt.UTC().Format(time.RFC3339Nano),
+				ID:           last.ID,
+			},
+		)
+		if err != nil {
+			return nil, ErrAutomationListCursorKey
+		}
+	}
+	if logs == nil {
+		logs = []*models.AutomationLog{}
+	}
+	return &AutomationExecutionLogPage{
+		Items:      logs,
+		NextCursor: nextCursor,
+		HasMore:    hasMore,
+	}, nil
+}
+
+func automationExecutionLogFilterHash(
+	query AutomationExecutionLogQuery,
+) string {
+	raw, _ := json.Marshal(struct {
+		RuleID   *uint `json:"rule_id"`
+		TicketID *uint `json:"ticket_id"`
+		Success  *bool `json:"success"`
+	}{
+		RuleID:   query.RuleID,
+		TicketID: query.TicketID,
+		Success:  query.Success,
+	})
+	sum := sha256.Sum256(raw)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func (s *AutomationService) decodeExecutionLogCursor(
+	raw string,
+	scope models.ProjectScope,
+	limit int,
+	filterHash string,
+) (*struct {
+	ExecutedAt time.Time
+	ID         uint
+}, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	var cursor automationExecutionLogCursor
+	if err := s.logCursorCodec.Decode(raw, &cursor); err != nil {
+		return nil, ErrInvalidAutomationListCursor
+	}
+	executedAt, err := time.Parse(time.RFC3339Nano, cursor.ExecutedAt)
+	if err != nil || executedAt.IsZero() || cursor.ID == 0 ||
+		cursor.Version != automationLogCursorVersion ||
+		cursor.Organization != scope.OrganizationID ||
+		cursor.Project != scope.ProjectID ||
+		cursor.Limit != limit ||
+		cursor.FilterHash != filterHash ||
+		cursor.SortVersion != automationLogSortVersion ||
+		strings.TrimSpace(cursor.ExecutedAt) != cursor.ExecutedAt {
+		return nil, ErrInvalidAutomationListCursor
+	}
+	return &struct {
+		ExecutedAt time.Time
+		ID         uint
+	}{
+		ExecutedAt: executedAt.UTC(),
+		ID:         cursor.ID,
+	}, nil
+}
+
 // GetExecutionLogs 获取执行日志
 func (s *AutomationService) GetExecutionLogs(ctx context.Context, ruleID, ticketID *uint, success *bool, page, pageSize int) ([]*models.AutomationLog, int64, error) {
 	scope, err := automationProjectScope(ctx)
@@ -2166,7 +2379,12 @@ func (s *AutomationService) GetExecutionLogs(ctx context.Context, ruleID, ticket
 
 	var logs []*models.AutomationLog
 	offset := (page - 1) * pageSize
-	if err := query.Order("executed_at DESC").Offset(offset).Limit(pageSize).Find(&logs).Error; err != nil {
+	if err := query.
+		Order("executed_at DESC").
+		Order("id DESC").
+		Offset(offset).
+		Limit(pageSize).
+		Find(&logs).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to get logs: %w", err)
 	}
 

@@ -3,6 +3,7 @@ package handlers
 import (
 	"errors"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -42,21 +43,17 @@ type automationTicketLogSummary struct {
 }
 
 type automationLogResponse struct {
-	ID              uint                        `json:"id"`
-	CreatedAt       time.Time                   `json:"created_at"`
-	OrganizationID  uint                        `json:"organization_id"`
-	ProjectID       uint                        `json:"project_id"`
-	RuleID          uint                        `json:"rule_id"`
-	Rule            *automationRuleLogSummary   `json:"rule,omitempty"`
-	TicketID        uint                        `json:"ticket_id"`
-	Ticket          *automationTicketLogSummary `json:"ticket,omitempty"`
-	TriggerEvent    string                      `json:"trigger_event"`
-	ExecutedAt      time.Time                   `json:"executed_at"`
-	Success         bool                        `json:"success"`
-	ErrorMessage    string                      `json:"error_message,omitempty"`
-	ExecutionTime   int64                       `json:"execution_time"`
-	ActionsExecuted string                      `json:"actions_executed"`
-	Changes         string                      `json:"changes"`
+	ID            uint                        `json:"id"`
+	CreatedAt     time.Time                   `json:"created_at"`
+	RuleID        uint                        `json:"rule_id"`
+	Rule          *automationRuleLogSummary   `json:"rule,omitempty"`
+	TicketID      uint                        `json:"ticket_id"`
+	Ticket        *automationTicketLogSummary `json:"ticket,omitempty"`
+	TriggerEvent  string                      `json:"trigger_event"`
+	ExecutedAt    time.Time                   `json:"executed_at"`
+	Success       bool                        `json:"success"`
+	ErrorMessage  string                      `json:"error_message,omitempty"`
+	ExecutionTime int64                       `json:"execution_time"`
 }
 
 func automationLogResponses(
@@ -68,19 +65,15 @@ func automationLogResponses(
 			continue
 		}
 		item := automationLogResponse{
-			ID:              log.ID,
-			CreatedAt:       log.CreatedAt,
-			OrganizationID:  log.OrganizationID,
-			ProjectID:       log.ProjectID,
-			RuleID:          log.RuleID,
-			TicketID:        log.TicketID,
-			TriggerEvent:    log.TriggerEvent,
-			ExecutedAt:      log.ExecutedAt,
-			Success:         log.Success,
-			ErrorMessage:    log.ErrorMessage,
-			ExecutionTime:   log.ExecutionTime,
-			ActionsExecuted: log.ActionsExecuted,
-			Changes:         log.Changes,
+			ID:            log.ID,
+			CreatedAt:     log.CreatedAt,
+			RuleID:        log.RuleID,
+			TicketID:      log.TicketID,
+			TriggerEvent:  log.TriggerEvent,
+			ExecutedAt:    log.ExecutedAt,
+			Success:       log.Success,
+			ErrorMessage:  scrubAutomationDiagnostic(log.ErrorMessage),
+			ExecutionTime: log.ExecutionTime,
 		}
 		if log.Rule != nil {
 			item.Rule = &automationRuleLogSummary{
@@ -111,6 +104,60 @@ func automationLogResponses(
 	return result
 }
 
+type automationRuleListResponse struct {
+	ID              uint       `json:"id"`
+	Name            string     `json:"name"`
+	Description     string     `json:"description"`
+	RuleType        string     `json:"rule_type"`
+	IsActive        bool       `json:"is_active"`
+	Priority        int        `json:"priority"`
+	TriggerEvent    string     `json:"trigger_event"`
+	ExecutionCount  int64      `json:"execution_count"`
+	LastExecutedAt  *time.Time `json:"last_executed_at,omitempty"`
+	SuccessCount    int64      `json:"success_count"`
+	FailureCount    int64      `json:"failure_count"`
+	AverageExecTime int64      `json:"average_exec_time"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+}
+
+func automationRuleListResponses(
+	rules []*models.AutomationRule,
+) []automationRuleListResponse {
+	result := make([]automationRuleListResponse, 0, len(rules))
+	for _, rule := range rules {
+		if rule == nil {
+			continue
+		}
+		result = append(result, automationRuleListResponse{
+			ID:              rule.ID,
+			Name:            rule.Name,
+			Description:     rule.Description,
+			RuleType:        rule.RuleType,
+			IsActive:        rule.IsActive,
+			Priority:        rule.Priority,
+			TriggerEvent:    rule.TriggerEvent,
+			ExecutionCount:  rule.ExecutionCount,
+			LastExecutedAt:  rule.LastExecutedAt,
+			SuccessCount:    rule.SuccessCount,
+			FailureCount:    rule.FailureCount,
+			AverageExecTime: rule.AverageExecTime,
+			CreatedAt:       rule.CreatedAt,
+			UpdatedAt:       rule.UpdatedAt,
+		})
+	}
+	return result
+}
+
+func scrubAutomationDiagnostic(value string) string {
+	value = services.ScrubOutboxFailureText(value)
+	runes := []rune(value)
+	if len(runes) > 500 {
+		return string(runes[:500])
+	}
+	return value
+}
+
 // NewAutomationHandler creates the HTTP adapter over the application-owned
 // automation service. The adapter never constructs a second service graph.
 func NewAutomationHandler(
@@ -127,6 +174,13 @@ func NewAutomationHandler(
 		automationService: automationService,
 		schedulerService:  schedulerService,
 	}, nil
+}
+
+func (h *AutomationHandler) ConfigureListCursor(root []byte) error {
+	if h == nil || h.automationService == nil {
+		return services.ErrAutomationListCursorKey
+	}
+	return h.automationService.ConfigureListCursor(root)
 }
 
 // RegisterProjectRoutes mounts automation administration below the trusted
@@ -256,26 +310,25 @@ func (h *AutomationHandler) CreateRule(c *gin.Context) {
 // @Param rule_type query string false "规则类型"
 // @Param is_active query boolean false "是否激活"
 // @Param page query int false "页码" default(1)
-// @Param page_size query int false "页大小" default(20)
+// @Param page_size query int false "页大小" default(25)
 // @Success 200 {object} map[string]interface{} "成功"
 // @Failure 401 {object} map[string]interface{} "未授权"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
 // @Router /api/projects/{projectKey}/admin/automation/rules [get]
 func (h *AutomationHandler) GetRules(c *gin.Context) {
-	ruleType := strings.TrimSpace(c.Query("rule_type"))
-	triggerEvent := strings.TrimSpace(c.Query("trigger_event"))
-	search := strings.TrimSpace(c.Query("search"))
-	var isActive *bool
-	if activeStr := c.Query("is_active"); activeStr != "" {
-		active := activeStr == "true"
-		isActive = &active
+	query, ok := requireAutomationRuleListQuery(c)
+	if !ok {
+		return
 	}
-
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
-	page, pageSize = normalizePagination(page, pageSize, 100)
-
-	rules, total, err := h.automationService.GetRules(c.Request.Context(), ruleType, triggerEvent, isActive, search, page, pageSize)
+	rules, total, err := h.automationService.GetRules(
+		c.Request.Context(),
+		query.ruleType,
+		query.triggerEvent,
+		query.isActive,
+		query.search,
+		query.page,
+		query.pageSize,
+	)
 	if err != nil {
 		status := http.StatusInternalServerError
 		message := "获取规则列表失败"
@@ -284,6 +337,10 @@ func (h *AutomationHandler) GetRules(c *gin.Context) {
 			status = http.StatusBadRequest
 			message = "触发事件筛选值无效"
 			code = "invalid_trigger_type"
+		} else if errors.Is(err, services.ErrInvalidAutomationListQuery) {
+			status = http.StatusBadRequest
+			message = "列表查询参数无效"
+			code = "invalid_request"
 		} else {
 			logHandlerFailure(c, "automation.list_rules", err)
 		}
@@ -299,11 +356,11 @@ func (h *AutomationHandler) GetRules(c *gin.Context) {
 		"success": true,
 		"message": "获取规则列表成功",
 		"data": gin.H{
-			"rules":       rules,
+			"items":       automationRuleListResponses(rules),
 			"total":       total,
-			"page":        page,
-			"page_size":   pageSize,
-			"total_pages": (total + int64(pageSize) - 1) / int64(pageSize),
+			"page":        query.page,
+			"page_size":   query.pageSize,
+			"total_pages": automationTotalPages(total, query.pageSize),
 		},
 	})
 }
@@ -521,7 +578,7 @@ func (h *AutomationHandler) GetRuleStats(c *gin.Context) {
 
 // GetExecutionLogs 获取执行日志
 // @Summary 获取自动化执行日志
-// @Description 获取自动化规则的执行日志
+// @Description 使用不透明游标获取自动化规则执行日志
 // @Tags 自动化
 // @Security ApiKeyAuth
 // @Accept json
@@ -529,46 +586,39 @@ func (h *AutomationHandler) GetRuleStats(c *gin.Context) {
 // @Param rule_id query int false "规则ID"
 // @Param ticket_id query int false "工单ID"
 // @Param success query boolean false "是否成功"
-// @Param page query int false "页码" default(1)
-// @Param page_size query int false "页大小" default(20)
+// @Param cursor query string false "不透明续页游标"
+// @Param limit query int false "页大小" default(25)
 // @Success 200 {object} map[string]interface{} "成功"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
 // @Router /api/projects/{projectKey}/admin/automation/logs [get]
 func (h *AutomationHandler) GetExecutionLogs(c *gin.Context) {
-	var ruleID, ticketID *uint
-	var success *bool
-
-	if ruleIDStr := c.Query("rule_id"); ruleIDStr != "" {
-		if id, err := strconv.ParseUint(ruleIDStr, 10, 32); err == nil {
-			ruleIDUint := uint(id)
-			ruleID = &ruleIDUint
-		}
+	query, ok := requireAutomationExecutionLogQuery(c)
+	if !ok {
+		return
 	}
-
-	if ticketIDStr := c.Query("ticket_id"); ticketIDStr != "" {
-		if id, err := strconv.ParseUint(ticketIDStr, 10, 32); err == nil {
-			ticketIDUint := uint(id)
-			ticketID = &ticketIDUint
-		}
-	}
-
-	if successStr := c.Query("success"); successStr != "" {
-		successBool := successStr == "true"
-		success = &successBool
-	}
-
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
-	page, pageSize = normalizePagination(page, pageSize, 100)
-
-	logs, total, err := h.automationService.GetExecutionLogs(c.Request.Context(), ruleID, ticketID, success, page, pageSize)
+	page, err := h.automationService.ListExecutionLogs(
+		c.Request.Context(),
+		query,
+	)
 	if err != nil {
-		logHandlerFailure(c, "automation.list_execution_logs", err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "获取执行日志失败",
-			"error":   "internal_error",
-		})
+		switch {
+		case errors.Is(err, services.ErrInvalidAutomationListQuery),
+			errors.Is(err, services.ErrInvalidAutomationListCursor):
+			writeInvalidAutomationListQuery(c)
+		case errors.Is(err, services.ErrAutomationListCursorKey):
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"success": false,
+				"message": "自动化执行日志暂不可用",
+				"error":   "service_unavailable",
+			})
+		default:
+			logHandlerFailure(c, "automation.list_execution_logs", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"success": false,
+				"message": "获取执行日志失败",
+				"error":   "internal_error",
+			})
+		}
 		return
 	}
 
@@ -576,12 +626,250 @@ func (h *AutomationHandler) GetExecutionLogs(c *gin.Context) {
 		"success": true,
 		"message": "获取执行日志成功",
 		"data": gin.H{
-			"logs":        automationLogResponses(logs),
-			"total":       total,
-			"page":        page,
-			"page_size":   pageSize,
-			"total_pages": (total + int64(pageSize) - 1) / int64(pageSize),
+			"items":       automationLogResponses(page.Items),
+			"next_cursor": page.NextCursor,
+			"has_more":    page.HasMore,
 		},
+	})
+}
+
+type automationRuleListQuery struct {
+	ruleType     string
+	triggerEvent string
+	search       string
+	isActive     *bool
+	page         int
+	pageSize     int
+}
+
+func requireAutomationRuleListQuery(
+	c *gin.Context,
+) (automationRuleListQuery, bool) {
+	values, ok := strictAutomationQueryValues(c, map[string]struct{}{
+		"rule_type":     {},
+		"trigger_event": {},
+		"is_active":     {},
+		"search":        {},
+		"page":          {},
+		"page_size":     {},
+		"sort":          {},
+	})
+	if !ok {
+		return automationRuleListQuery{}, false
+	}
+	query := automationRuleListQuery{
+		page:     1,
+		pageSize: services.DefaultAutomationListSize,
+	}
+	if raw, exists := values["page"]; exists {
+		value, valid := strictAutomationPositiveInt(raw, int(^uint(0)>>1))
+		if !valid {
+			writeInvalidAutomationListQuery(c)
+			return automationRuleListQuery{}, false
+		}
+		query.page = value
+	}
+	if raw, exists := values["page_size"]; exists {
+		value, valid := strictAutomationPositiveInt(
+			raw,
+			services.MaxAutomationListSize,
+		)
+		if !valid {
+			writeInvalidAutomationListQuery(c)
+			return automationRuleListQuery{}, false
+		}
+		query.pageSize = value
+	}
+	if raw, exists := values["sort"]; exists &&
+		raw != `["priority","ASC"]` {
+		writeInvalidAutomationListQuery(c)
+		return automationRuleListQuery{}, false
+	}
+	if raw, exists := values["rule_type"]; exists {
+		if !validAutomationRuleTypeFilter(raw) {
+			writeInvalidAutomationListQuery(c)
+			return automationRuleListQuery{}, false
+		}
+		query.ruleType = raw
+	}
+	if raw, exists := values["trigger_event"]; exists {
+		if len([]rune(raw)) > 128 {
+			writeInvalidAutomationListQuery(c)
+			return automationRuleListQuery{}, false
+		}
+		query.triggerEvent = raw
+	}
+	if raw, exists := values["search"]; exists {
+		if len([]rune(raw)) > 200 {
+			writeInvalidAutomationListQuery(c)
+			return automationRuleListQuery{}, false
+		}
+		query.search = raw
+	}
+	if raw, exists := values["is_active"]; exists {
+		value, valid := strictAutomationBool(raw)
+		if !valid {
+			writeInvalidAutomationListQuery(c)
+			return automationRuleListQuery{}, false
+		}
+		query.isActive = &value
+	}
+	return query, true
+}
+
+func requireAutomationExecutionLogQuery(
+	c *gin.Context,
+) (services.AutomationExecutionLogQuery, bool) {
+	values, ok := strictAutomationQueryValues(c, map[string]struct{}{
+		"cursor":    {},
+		"limit":     {},
+		"rule_id":   {},
+		"ticket_id": {},
+		"success":   {},
+	})
+	if !ok {
+		return services.AutomationExecutionLogQuery{}, false
+	}
+	query := services.AutomationExecutionLogQuery{
+		Cursor: values["cursor"],
+		Limit:  services.DefaultAutomationListSize,
+	}
+	if raw, exists := values["limit"]; exists {
+		value, valid := strictAutomationPositiveInt(
+			raw,
+			services.MaxAutomationListSize,
+		)
+		if !valid {
+			writeInvalidAutomationListQuery(c)
+			return services.AutomationExecutionLogQuery{}, false
+		}
+		query.Limit = value
+	}
+	if raw, exists := values["rule_id"]; exists {
+		value, valid := strictAutomationPositiveUint(raw)
+		if !valid {
+			writeInvalidAutomationListQuery(c)
+			return services.AutomationExecutionLogQuery{}, false
+		}
+		query.RuleID = &value
+	}
+	if raw, exists := values["ticket_id"]; exists {
+		value, valid := strictAutomationPositiveUint(raw)
+		if !valid {
+			writeInvalidAutomationListQuery(c)
+			return services.AutomationExecutionLogQuery{}, false
+		}
+		query.TicketID = &value
+	}
+	if raw, exists := values["success"]; exists {
+		value, valid := strictAutomationBool(raw)
+		if !valid {
+			writeInvalidAutomationListQuery(c)
+			return services.AutomationExecutionLogQuery{}, false
+		}
+		query.Success = &value
+	}
+	return query, true
+}
+
+func strictAutomationQueryValues(
+	c *gin.Context,
+	allowed map[string]struct{},
+) (map[string]string, bool) {
+	if c == nil || c.Request == nil || c.Request.URL == nil {
+		return nil, false
+	}
+	parsed, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil {
+		writeInvalidAutomationListQuery(c)
+		return nil, false
+	}
+	result := make(map[string]string, len(parsed))
+	for key, values := range parsed {
+		if _, exists := allowed[key]; !exists || len(values) != 1 {
+			writeInvalidAutomationListQuery(c)
+			return nil, false
+		}
+		value := values[0]
+		if value == "" || strings.TrimSpace(value) != value {
+			writeInvalidAutomationListQuery(c)
+			return nil, false
+		}
+		result[key] = value
+	}
+	return result, true
+}
+
+func strictAutomationPositiveInt(raw string, maximum int) (int, bool) {
+	if raw == "" || maximum < 1 {
+		return 0, false
+	}
+	for _, character := range raw {
+		if character < '0' || character > '9' {
+			return 0, false
+		}
+	}
+	value, err := strconv.ParseUint(raw, 10, 31)
+	if err != nil || value == 0 || value > uint64(maximum) {
+		return 0, false
+	}
+	return int(value), true
+}
+
+func strictAutomationPositiveUint(raw string) (uint, bool) {
+	if raw == "" {
+		return 0, false
+	}
+	for _, character := range raw {
+		if character < '0' || character > '9' {
+			return 0, false
+		}
+	}
+	value, err := strconv.ParseUint(raw, 10, 32)
+	if err != nil || value == 0 {
+		return 0, false
+	}
+	return uint(value), true
+}
+
+func strictAutomationBool(raw string) (bool, bool) {
+	switch raw {
+	case "true":
+		return true, true
+	case "false":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func validAutomationRuleTypeFilter(raw string) bool {
+	if len(raw) == 0 || len(raw) > 50 ||
+		raw[0] < 'a' || raw[0] > 'z' {
+		return false
+	}
+	for _, character := range raw[1:] {
+		if (character < 'a' || character > 'z') &&
+			(character < '0' || character > '9') &&
+			character != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func automationTotalPages(total int64, pageSize int) int {
+	if total <= 0 || pageSize <= 0 {
+		return 0
+	}
+	return int((total + int64(pageSize) - 1) / int64(pageSize))
+}
+
+func writeInvalidAutomationListQuery(c *gin.Context) {
+	c.JSON(http.StatusBadRequest, gin.H{
+		"success": false,
+		"message": "列表查询参数无效",
+		"error":   "invalid_request",
 	})
 }
 

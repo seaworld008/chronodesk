@@ -69,10 +69,16 @@ const mockWebhook = {
     total_failed: 0,
 };
 
-const installWebhookAsyncMockBackend = async (page: Page) => {
+const installWebhookAsyncMockBackend = async (
+    page: Page,
+    options: { failFirstDelivery?: boolean; emptyDeliveries?: boolean } = {},
+) => {
     const access = authorizedProjectAccess(projectA, 'manager');
     const webhooksPath = `/api/projects/${projectA.key}/webhooks`;
     let testCalls = 0;
+    let deliveryCalls = 0;
+    const listQueries: string[] = [];
+    const deliveryQueries: string[] = [];
 
     await page.route('**/api/**', async (route) => {
         const request = route.request();
@@ -82,13 +88,63 @@ const installWebhookAsyncMockBackend = async (page: Page) => {
             return;
         }
         if (pathname === webhooksPath && request.method() === 'GET') {
+            listQueries.push(new URL(request.url()).search);
             await fulfillJSON(route, {
                 code: 0,
                 data: {
                     items: [mockWebhook],
                     total: 1,
                     page: 1,
-                    size: 100,
+                    page_size: 25,
+                    total_pages: 1,
+                },
+            });
+            return;
+        }
+        if (
+            pathname === `${webhooksPath}/${mockWebhook.id}/logs`
+            && request.method() === 'GET'
+        ) {
+            deliveryCalls += 1;
+            const target = new URL(request.url());
+            deliveryQueries.push(target.search);
+            if (options.failFirstDelivery && deliveryCalls === 1) {
+                await fulfillJSON(route, {
+                    code: 1,
+                    error: 'internal_error',
+                    msg: '服务暂时不可用',
+                }, 500);
+                return;
+            }
+            if (options.emptyDeliveries) {
+                await fulfillJSON(route, {
+                    code: 0,
+                    data: {
+                        items: [],
+                        next_cursor: '',
+                        has_more: false,
+                    },
+                });
+                return;
+            }
+            const continuation = target.searchParams.get('cursor');
+            await fulfillJSON(route, {
+                code: 0,
+                data: {
+                    items: [{
+                        id: continuation ? 730 : 731,
+                        created_at: continuation
+                            ? '2026-07-31T07:59:00Z'
+                            : '2026-07-31T08:00:00Z',
+                        config_id: mockWebhook.id,
+                        event_type: 'io.chronodesk.system.alert.v1',
+                        status: continuation ? 'failed' : 'success',
+                        response_status: continuation ? 503 : 204,
+                        response_time: continuation ? 99 : 12,
+                        error_message: continuation ? '上游暂不可用' : '',
+                    }],
+                    next_cursor: continuation ? '' : 'signed-next-page',
+                    has_more: !continuation,
                 },
             });
             return;
@@ -126,6 +182,9 @@ const installWebhookAsyncMockBackend = async (page: Page) => {
     return {
         webhooksPath,
         testCalls: () => testCalls,
+        deliveryCalls: () => deliveryCalls,
+        listQueries,
+        deliveryQueries,
     };
 };
 
@@ -217,6 +276,100 @@ test.describe('Webhook 测试异步入队浏览器契约（mock）', () => {
         await expect(
             form.getByLabel('状态流转筛选', { exact: true }),
         ).toHaveCount(0);
+    });
+
+    test('真实分页请求与键盘可达投递抽屉使用游标续页', async ({ page }) => {
+        await installMockSession(
+            page,
+            {
+                ...defaultMockIdentity,
+                sessionID: 'e2e-webhook-cursor-drawer',
+            },
+            projectA,
+        );
+        const backend = await installWebhookAsyncMockBackend(page);
+        await page.goto('/#/webhook-settings');
+        const row = page.getByRole('row', { name: /异步测试 Webhook/u });
+        await expect(row).toBeVisible();
+        expect(backend.listQueries.at(-1)).toContain('page=1');
+        expect(backend.listQueries.at(-1)).toContain('page_size=25');
+
+        const deliveryButton = row.getByRole('button', {
+            name: '查看投递记录：异步测试 Webhook',
+        });
+        await deliveryButton.focus();
+        await page.keyboard.press('Enter');
+        await expect(
+            page.getByRole('heading', { name: '投递记录' }),
+        ).toBeVisible();
+        const firstDelivery = page.getByRole('button')
+            .filter({ hasText: '系统警报' })
+            .filter({ hasText: '成功' });
+        await expect(firstDelivery).toBeVisible();
+        expect(backend.deliveryQueries[0]).toBe('?limit=25');
+
+        await firstDelivery.focus();
+        await page.keyboard.press('Enter');
+        await expect(
+            page.getByRole('heading', { name: '投递详情 #731' }),
+        ).toBeVisible();
+
+        await page.getByRole('button', { name: '加载更多' }).click();
+        await expect(
+            page.getByRole('button')
+                .filter({ hasText: '系统警报' })
+                .filter({ hasText: '失败' }),
+        ).toBeVisible();
+        expect(backend.deliveryQueries.at(-1)).toContain(
+            'cursor=signed-next-page',
+        );
+        expect(backend.deliveryCalls()).toBe(2);
+    });
+
+    test('投递抽屉展示错误并可重试', async ({ page }) => {
+        await installMockSession(
+            page,
+            {
+                ...defaultMockIdentity,
+                sessionID: 'e2e-webhook-delivery-retry',
+            },
+            projectA,
+        );
+        const backend = await installWebhookAsyncMockBackend(page, {
+            failFirstDelivery: true,
+        });
+        await page.goto('/#/webhook-settings');
+        await page.getByRole('button', {
+            name: '查看投递记录：异步测试 Webhook',
+        }).click();
+        const alert = page.getByRole('alert');
+        await expect(alert).toContainText('服务暂时不可用');
+        await alert.getByRole('button', { name: '重试' }).click();
+        await expect(
+            page.getByRole('button')
+                .filter({ hasText: '系统警报' })
+                .filter({ hasText: '成功' }),
+        ).toBeVisible();
+        expect(backend.deliveryCalls()).toBe(2);
+    });
+
+    test('投递抽屉有明确空状态', async ({ page }) => {
+        await installMockSession(
+            page,
+            {
+                ...defaultMockIdentity,
+                sessionID: 'e2e-webhook-delivery-empty',
+            },
+            projectA,
+        );
+        await installWebhookAsyncMockBackend(page, {
+            emptyDeliveries: true,
+        });
+        await page.goto('/#/webhook-settings');
+        await page.getByRole('button', {
+            name: '查看投递记录：异步测试 Webhook',
+        }).click();
+        await expect(page.getByText('暂无投递记录')).toBeVisible();
     });
 });
 
@@ -329,7 +482,7 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
         const listResponse = await apiRequest<Record<string, unknown>>(
             request,
             token,
-            `${webhooksPath}?page=1&page_size=100&name=${encodeURIComponent(webhookName)}`,
+            `${webhooksPath}?page=1&page_size=100`,
         );
         expect(JSON.stringify(listResponse)).not.toContain(markerSecret);
         const webhook = extractItems<Record<string, unknown>>(listResponse).find(
@@ -404,7 +557,7 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
                     const logsResponse = await apiRequest<Record<string, unknown>>(
                         request,
                         token,
-                        `${webhooksPath}/${webhook!.id}/logs?page=1&page_size=20`,
+                        `${webhooksPath}/${webhook!.id}/logs?limit=20`,
                     );
                     logs = extractItems<Record<string, unknown>>(logsResponse);
                     finalLog = logs.find(

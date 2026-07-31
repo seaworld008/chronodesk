@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +26,7 @@ type WebhookHandler struct {
 	db                  *gorm.DB
 	notificationService *services.NotificationService
 	secretStore         security.Protector
+	queryService        *services.WebhookQueryService
 }
 
 // NewWebhookHandlerWithProtector injects the application data-encryption
@@ -45,7 +47,17 @@ func NewWebhookHandlerWithProtector(
 		db:                  db,
 		notificationService: notificationService,
 		secretStore:         protector,
+		queryService:        services.NewWebhookQueryService(db),
 	}
+}
+
+// ConfigureListCursor installs the deployment-owned root used only to derive
+// the Webhook delivery timeline cursor key. An empty key fails closed.
+func (h *WebhookHandler) ConfigureListCursor(root []byte) error {
+	if h == nil || h.queryService == nil {
+		return services.ErrWebhookListCursorKey
+	}
+	return h.queryService.ConfigureListCursor(root)
 }
 
 // CreateWebhookRequest 创建webhook请求结构
@@ -130,10 +142,11 @@ type WebhookConfigResponse struct {
 
 // ListWebhooksResponse 列表响应结构
 type ListWebhooksResponse struct {
-	Items []WebhookConfigResponse `json:"items"`
-	Total int64                   `json:"total"`
-	Page  int                     `json:"page"`
-	Size  int                     `json:"size"`
+	Items      []WebhookConfigResponse `json:"items"`
+	Total      int64                   `json:"total"`
+	Page       int                     `json:"page"`
+	PageSize   int                     `json:"page_size"`
+	TotalPages int                     `json:"total_pages"`
 }
 
 // WebhookLogResponse exposes only the non-sensitive delivery diagnostics
@@ -150,10 +163,9 @@ type WebhookLogResponse struct {
 }
 
 type ListWebhookLogsResponse struct {
-	Items []WebhookLogResponse `json:"items"`
-	Total int64                `json:"total"`
-	Page  int                  `json:"page"`
-	Size  int                  `json:"size"`
+	Items      []WebhookLogResponse `json:"items"`
+	NextCursor string               `json:"next_cursor"`
+	HasMore    bool                 `json:"has_more"`
 }
 
 type WebhookStatsSummaryResponse struct {
@@ -255,7 +267,7 @@ func newWebhookConfigResponse(
 		LastTriggeredAt:   webhook.LastTriggeredAt,
 		LastSuccessAt:     webhook.LastSuccessAt,
 		LastErrorAt:       webhook.LastErrorAt,
-		LastError:         webhook.LastError,
+		LastError:         scrubWebhookDiagnostic(webhook.LastError),
 		TotalSent:         webhook.TotalSent,
 		TotalSuccess:      webhook.TotalSuccess,
 		TotalFailed:       webhook.TotalFailed,
@@ -273,8 +285,17 @@ func newWebhookLogResponse(log models.WebhookLog) WebhookLogResponse {
 		Status:         log.Status,
 		ResponseStatus: log.ResponseStatus,
 		ResponseTime:   log.ResponseTime,
-		ErrorMessage:   log.ErrorMessage,
+		ErrorMessage:   scrubWebhookDiagnostic(log.ErrorMessage),
 	}
+}
+
+func scrubWebhookDiagnostic(value string) string {
+	value = services.ScrubOutboxFailureText(value)
+	runes := []rune(value)
+	if len(runes) > 500 {
+		return string(runes[:500])
+	}
+	return value
 }
 
 // TestWebhookResult is a queued operation receipt. External delivery and its
@@ -440,7 +461,7 @@ func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
 // @Produce json
 // @Param projectKey path string true "项目 Key"
 // @Param page query int false "页码" default(1)
-// @Param page_size query int false "每页数量" default(10)
+// @Param page_size query int false "每页数量" default(25)
 // @Param provider query string false "提供商过滤"
 // @Param status query string false "状态过滤"
 // @Success 200 {object} ListWebhooksResponse
@@ -448,58 +469,20 @@ func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
 // @Router /api/projects/{projectKey}/webhooks [get]
 // @Security BearerAuth
 func (h *WebhookHandler) ListWebhooks(c *gin.Context) {
-	operation, ok := requireWebhookManagerAccess(c)
+	_, ok := requireWebhookManagerAccess(c)
 	if !ok {
 		return
 	}
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "10"))
-	provider := c.Query("provider")
-	status := c.Query("status")
-
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 || pageSize > 100 {
-		pageSize = 10
-	}
-
-	offset := (page - 1) * pageSize
-
-	// 构建查询
-	query := h.db.WithContext(c.Request.Context()).
-		Model(&models.WebhookConfig{}).
-		Where(
-			"organization_id = ? AND project_id = ?",
-			operation.Scope.OrganizationID,
-			operation.Scope.ProjectID,
-		)
-
-	if provider != "" {
-		query = query.Where("provider = ?", provider)
-	}
-	if status != "" {
-		query = query.Where("status = ?", status)
-	}
-
-	// 获取总数
-	var total int64
-	if err := query.Count(&total).Error; err != nil {
-		logHandlerFailure(c, "webhook.count", err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"code": 1,
-			"msg":  "获取webhook列表失败",
-			"data": nil,
-		})
+	query, ok := requireWebhookDefinitionQuery(c)
+	if !ok {
 		return
 	}
-
-	// 获取数据
-	var webhooks []models.WebhookConfig
-	if err := query.Order("created_at DESC").
-		Offset(offset).
-		Limit(pageSize).
-		Find(&webhooks).Error; err != nil {
+	page, err := h.queryService.ListDefinitions(c.Request.Context(), query)
+	if err != nil {
+		if errors.Is(err, services.ErrInvalidWebhookListQuery) {
+			writeInvalidWebhookListQuery(c)
+			return
+		}
 		logHandlerFailure(c, "webhook.list", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code": 1,
@@ -509,15 +492,16 @@ func (h *WebhookHandler) ListWebhooks(c *gin.Context) {
 		return
 	}
 
-	items := make([]WebhookConfigResponse, 0, len(webhooks))
-	for _, webhook := range webhooks {
+	items := make([]WebhookConfigResponse, 0, len(page.Items))
+	for _, webhook := range page.Items {
 		items = append(items, newWebhookConfigResponse(webhook))
 	}
 	response := ListWebhooksResponse{
-		Items: items,
-		Total: total,
-		Page:  page,
-		Size:  pageSize,
+		Items:      items,
+		Total:      page.Total,
+		Page:       page.Page,
+		PageSize:   page.PageSize,
+		TotalPages: page.TotalPages,
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -545,8 +529,8 @@ func (h *WebhookHandler) GetWebhook(c *gin.Context) {
 	if !ok {
 		return
 	}
-	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
-	if err != nil {
+	id, validID := strictWebhookPositiveUint32(c.Param("id"))
+	if !validID {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"code": 1,
 			"msg":  "无效的ID",
@@ -1017,26 +1001,27 @@ func (h *WebhookHandler) TestWebhook(c *gin.Context) {
 
 // GetWebhookLogs 获取webhook日志
 // @Summary 获取webhook日志
-// @Description 分页获取webhook执行日志
+// @Description 使用不透明游标获取webhook投递记录
 // @Tags webhook
 // @Accept json
 // @Produce json
 // @Param projectKey path string true "项目 Key"
 // @Param id path int true "Webhook ID"
-// @Param page query int false "页码" default(1)
-// @Param page_size query int false "每页数量" default(20)
+// @Param cursor query string false "不透明续页游标"
+// @Param limit query int false "每页数量" default(25)
 // @Param status query string false "状态过滤"
+// @Param event_type query string false "事件类型过滤"
 // @Success 200 {object} map[string]interface{}
 // @Failure 500 {object} map[string]interface{}
 // @Router /api/projects/{projectKey}/webhooks/{id}/logs [get]
 // @Security BearerAuth
 func (h *WebhookHandler) GetWebhookLogs(c *gin.Context) {
-	operation, ok := requireWebhookManagerAccess(c)
+	_, ok := requireWebhookManagerAccess(c)
 	if !ok {
 		return
 	}
-	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
-	if err != nil {
+	id, validID := strictWebhookPositiveUint32(c.Param("id"))
+	if !validID {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"code": 1,
 			"msg":  "无效的ID",
@@ -1044,75 +1029,57 @@ func (h *WebhookHandler) GetWebhookLogs(c *gin.Context) {
 		})
 		return
 	}
-
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
-	status := c.Query("status")
-
-	if page < 1 {
-		page = 1
+	query, ok := requireWebhookDeliveryQuery(c)
+	if !ok {
+		return
 	}
-	if pageSize < 1 || pageSize > 100 {
-		pageSize = 20
-	}
-
-	offset := (page - 1) * pageSize
-
-	// Count 和 Find 必须使用独立 Statement，避免 GORM 的终结方法污染后续查询。
-	newLogQuery := func() *gorm.DB {
-		query := h.db.WithContext(c.Request.Context()).
-			Model(&models.WebhookLog{}).
-			Where(
-				"organization_id = ? AND project_id = ? AND config_id = ?",
-				operation.Scope.OrganizationID,
-				operation.Scope.ProjectID,
-				uint(id),
-			)
-		if status != "" {
-			query = query.Where("status = ?", status)
+	page, err := h.queryService.ListDeliveries(
+		c.Request.Context(),
+		uint(id),
+		query,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, services.ErrInvalidWebhookListCursor),
+			errors.Is(err, services.ErrInvalidWebhookListQuery):
+			writeInvalidWebhookListQuery(c)
+		case errors.Is(err, services.ErrWebhookConfigNotFound):
+			c.JSON(http.StatusNotFound, gin.H{
+				"code":  1,
+				"msg":   "Webhook 不存在",
+				"error": "not_found",
+				"data":  nil,
+			})
+		case errors.Is(err, services.ErrWebhookListCursorKey):
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"code":  1,
+				"msg":   "Webhook 投递记录暂不可用",
+				"error": "service_unavailable",
+				"data":  nil,
+			})
+		default:
+			logHandlerFailure(c, "webhook.list_logs", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"code":  1,
+				"msg":   "获取日志失败",
+				"error": "internal_error",
+				"data":  nil,
+			})
 		}
-		return query
-	}
-
-	// 获取总数
-	var total int64
-	if err := newLogQuery().Count(&total).Error; err != nil {
-		logHandlerFailure(c, "webhook.count_logs", err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"code": 1,
-			"msg":  "获取日志失败",
-			"data": nil,
-		})
 		return
 	}
 
-	// 获取数据
-	var logs []models.WebhookLog
-	if err := newLogQuery().Order("created_at DESC").
-		Offset(offset).
-		Limit(pageSize).
-		Find(&logs).Error; err != nil {
-		logHandlerFailure(c, "webhook.list_logs", err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"code": 1,
-			"msg":  "获取日志失败",
-			"data": nil,
-		})
-		return
-	}
-
-	items := make([]WebhookLogResponse, 0, len(logs))
-	for _, log := range logs {
+	items := make([]WebhookLogResponse, 0, len(page.Items))
+	for _, log := range page.Items {
 		items = append(items, newWebhookLogResponse(log))
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"msg":  "获取成功",
 		"data": ListWebhookLogsResponse{
-			Items: items,
-			Total: total,
-			Page:  page,
-			Size:  pageSize,
+			Items:      items,
+			NextCursor: page.NextCursor,
+			HasMore:    page.HasMore,
 		},
 	})
 }
@@ -1286,6 +1253,201 @@ func requireWebhookManagerAccess(
 		return services.OperationContext{}, false
 	}
 	return operation, true
+}
+
+func requireWebhookDefinitionQuery(
+	c *gin.Context,
+) (services.WebhookDefinitionQuery, bool) {
+	values, ok := strictWebhookQueryValues(c, map[string]struct{}{
+		"page":      {},
+		"page_size": {},
+		"provider":  {},
+		"status":    {},
+	})
+	if !ok {
+		return services.WebhookDefinitionQuery{}, false
+	}
+	query := services.WebhookDefinitionQuery{
+		Page:     1,
+		PageSize: services.DefaultWebhookListSize,
+	}
+	if raw, exists := values["page"]; exists {
+		value, valid := strictWebhookPositiveInt(raw, int(^uint(0)>>1))
+		if !valid {
+			writeInvalidWebhookListQuery(c)
+			return services.WebhookDefinitionQuery{}, false
+		}
+		query.Page = value
+	}
+	if raw, exists := values["page_size"]; exists {
+		value, valid := strictWebhookPositiveInt(
+			raw,
+			services.MaxWebhookListSize,
+		)
+		if !valid {
+			writeInvalidWebhookListQuery(c)
+			return services.WebhookDefinitionQuery{}, false
+		}
+		query.PageSize = value
+	}
+	if raw, exists := values["provider"]; exists {
+		query.Provider = models.WebhookProvider(raw)
+		if !validWebhookProvider(query.Provider) {
+			writeInvalidWebhookListQuery(c)
+			return services.WebhookDefinitionQuery{}, false
+		}
+	}
+	if raw, exists := values["status"]; exists {
+		query.Status = models.WebhookStatus(raw)
+		if !validWebhookStatus(query.Status) {
+			writeInvalidWebhookListQuery(c)
+			return services.WebhookDefinitionQuery{}, false
+		}
+	}
+	return query, true
+}
+
+func requireWebhookDeliveryQuery(
+	c *gin.Context,
+) (services.WebhookDeliveryQuery, bool) {
+	values, ok := strictWebhookQueryValues(c, map[string]struct{}{
+		"cursor":     {},
+		"limit":      {},
+		"status":     {},
+		"event_type": {},
+	})
+	if !ok {
+		return services.WebhookDeliveryQuery{}, false
+	}
+	query := services.WebhookDeliveryQuery{
+		Limit: services.DefaultWebhookListSize,
+	}
+	if raw, exists := values["limit"]; exists {
+		value, valid := strictWebhookPositiveInt(
+			raw,
+			services.MaxWebhookListSize,
+		)
+		if !valid {
+			writeInvalidWebhookListQuery(c)
+			return services.WebhookDeliveryQuery{}, false
+		}
+		query.Limit = value
+	}
+	query.Cursor = values["cursor"]
+	if raw, exists := values["status"]; exists {
+		switch raw {
+		case "pending", "success", "failed":
+			query.Status = raw
+		default:
+			writeInvalidWebhookListQuery(c)
+			return services.WebhookDeliveryQuery{}, false
+		}
+	}
+	if raw, exists := values["event_type"]; exists {
+		eventType := models.WebhookEventType(raw)
+		if err := models.ValidateWebhookSubscriptions(
+			[]models.WebhookEventType{eventType},
+			nil,
+			true,
+		); err != nil {
+			writeInvalidWebhookListQuery(c)
+			return services.WebhookDeliveryQuery{}, false
+		}
+		query.EventType = eventType
+	}
+	return query, true
+}
+
+func strictWebhookQueryValues(
+	c *gin.Context,
+	allowed map[string]struct{},
+) (map[string]string, bool) {
+	if c == nil || c.Request == nil || c.Request.URL == nil {
+		return nil, false
+	}
+	parsed, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil {
+		writeInvalidWebhookListQuery(c)
+		return nil, false
+	}
+	result := make(map[string]string, len(parsed))
+	for key, values := range parsed {
+		if _, exists := allowed[key]; !exists || len(values) != 1 {
+			writeInvalidWebhookListQuery(c)
+			return nil, false
+		}
+		value := values[0]
+		if value == "" || strings.TrimSpace(value) != value {
+			writeInvalidWebhookListQuery(c)
+			return nil, false
+		}
+		result[key] = value
+	}
+	return result, true
+}
+
+func strictWebhookPositiveInt(raw string, maximum int) (int, bool) {
+	if raw == "" || maximum < 1 {
+		return 0, false
+	}
+	for _, character := range raw {
+		if character < '0' || character > '9' {
+			return 0, false
+		}
+	}
+	value, err := strconv.ParseUint(raw, 10, 31)
+	if err != nil || value == 0 || value > uint64(maximum) {
+		return 0, false
+	}
+	return int(value), true
+}
+
+func strictWebhookPositiveUint32(raw string) (uint64, bool) {
+	if raw == "" {
+		return 0, false
+	}
+	for _, character := range raw {
+		if character < '0' || character > '9' {
+			return 0, false
+		}
+	}
+	value, err := strconv.ParseUint(raw, 10, 32)
+	return value, err == nil && value > 0
+}
+
+func validWebhookProvider(provider models.WebhookProvider) bool {
+	switch provider {
+	case models.WebhookProviderWeChat,
+		models.WebhookProviderDingTalk,
+		models.WebhookProviderLark,
+		models.WebhookProviderSlack,
+		models.WebhookProviderTeams,
+		models.WebhookProviderCustom:
+		return true
+	default:
+		return false
+	}
+}
+
+func validWebhookStatus(status models.WebhookStatus) bool {
+	switch status {
+	case models.WebhookStatusActive,
+		models.WebhookStatusInactive,
+		models.WebhookStatusDisabled,
+		models.WebhookStatusError:
+		return true
+	default:
+		return false
+	}
+}
+
+func writeInvalidWebhookListQuery(c *gin.Context) {
+	c.JSON(http.StatusBadRequest, gin.H{
+		"code":  1,
+		"msg":   "列表查询参数无效",
+		"error": "invalid_request",
+		"data":  nil,
+	})
 }
 
 func webhookManagerRoleAllowed(role models.ProjectRole) bool {
