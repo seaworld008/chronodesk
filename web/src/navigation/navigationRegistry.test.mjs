@@ -43,7 +43,21 @@ test('连续功能树按产品顺序输出且不保留视觉分区节点', () =>
     assert.equal(nodes[0].kind, 'group')
     assert.deepEqual(
         nodes[0].children.map((item) => item.path),
-        ['/workbench'],
+        ['/workbench/dashboard', '/workbench'],
+    )
+    assert.equal(
+        stateModule.isNavigationItemActive(
+            nodes[0].children[0],
+            '/workbench/dashboard',
+        ),
+        true,
+    )
+    assert.equal(
+        stateModule.isNavigationItemActive(
+            nodes[0].children[1],
+            '/workbench/dashboard',
+        ),
+        false,
     )
 })
 
@@ -196,6 +210,7 @@ test('custom route contract 完整承载 path、权限、角色和兼容重定�
             'trustedDevices',
             'webhookSettings',
             'workbench',
+            'workbenchDashboard',
         ].sort(),
     )
     const email = custom.find((node) => node.route.component === 'platformEmail')

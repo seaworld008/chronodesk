@@ -43,6 +43,7 @@ export type NavigationRoles =
 
 export type CustomNavigationComponent =
     | 'workbench'
+    | 'workbenchDashboard'
     | 'automationIndex'
     | 'agentControl'
     | 'webhookSettings'
@@ -80,6 +81,7 @@ export interface NavigationLeafNode extends NavigationNodeBase {
     kind: 'leaf'
     path: string
     activePathPrefixes: readonly string[]
+    activePathExclusions?: readonly string[]
     route: NavigationRouteContract
     children?: never
 }
@@ -138,11 +140,27 @@ export const navigationRegistry: readonly NavigationNode[] = [
         placement: 'sidebar',
         children: [
             leaf('sidebar', {
+                id: 'workbench-dashboard',
+                label: '运营大屏',
+                path: '/workbench/dashboard',
+                activePathPrefixes: ['/workbench/dashboard'],
+                order: 10,
+                scope: 'global',
+                capability: null,
+                roles: null,
+                icon: 'workbench',
+                route: {
+                    kind: 'custom',
+                    component: 'workbenchDashboard',
+                },
+            }),
+            leaf('sidebar', {
                 id: 'cross-project-workbench',
                 label: '跨项目工作台',
                 path: '/workbench',
                 activePathPrefixes: ['/workbench'],
-                order: 10,
+                activePathExclusions: ['/workbench/dashboard'],
+                order: 20,
                 scope: 'global',
                 capability: null,
                 roles: null,
@@ -591,6 +609,7 @@ const allowedPlatformRoles = new Set<PlatformRole>([
 const allowedProjectRoles = new Set<ProjectRole>(projectRoleValues)
 const allowedCustomComponents = new Set<CustomNavigationComponent>([
     'workbench',
+    'workbenchDashboard',
     'automationIndex',
     'agentControl',
     'webhookSettings',
@@ -756,6 +775,15 @@ export const validateNavigationRegistry = (value: unknown): string[] => {
                 new Set(node.activePathPrefixes).size !==
                 node.activePathPrefixes.length
             ) errors.push(`导航 leaf ${id} 的 active path 重复`)
+            if (
+                node.activePathExclusions !== undefined &&
+                (
+                    !Array.isArray(node.activePathExclusions) ||
+                    node.activePathExclusions.some((prefix) =>
+                        typeof prefix !== 'string' || !prefix.startsWith('/'),
+                    )
+                )
+            ) errors.push(`导航 leaf ${id} 包含非法 active path exclusion`)
         } else {
             errors.push(`导航节点 ${id || '(unknown)'} 的 kind 非法`)
         }

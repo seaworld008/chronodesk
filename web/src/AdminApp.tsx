@@ -177,6 +177,9 @@ const IntegrationRuntime = lazyPage(
 const CrossProjectWorkbench = lazyPage(
     () => import('./admin/workbench/CrossProjectWorkbench'),
 )
+const WorkbenchDashboard = lazyPage(
+    () => import('./admin/workbench/WorkbenchDashboard'),
+)
 const ProjectMembershipPage = lazyPage(
     () => import('./admin/projects/ProjectMembershipPage'),
 )
@@ -640,6 +643,7 @@ const customNavigationComponents: Record<
     React.ComponentType
 > = {
     workbench: CrossProjectWorkbench,
+    workbenchDashboard: WorkbenchDashboard,
     automationIndex: () => <Navigate to="/automation-rules" replace />,
     agentControl: AgentControlCenter,
     webhookSettings: WebhookSettings,

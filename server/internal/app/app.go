@@ -818,6 +818,12 @@ func Run() error {
 		workbench.Use(ginAdapter(authModule.Handler.RequireAuth))
 		workbench.Use(authenticatedRateLimit)
 		workbench.GET("/tickets", crossProjectWorkbenchHandler.ListTickets)
+		workbench.GET(
+			"/dashboard",
+			handlers.NewWorkbenchDashboardHandler(
+				crossProjectWorkbenchService,
+			).Get,
+		)
 
 		// 项目是所有工单、配置与集成资源的唯一运行边界。
 		projectHandler := handlers.NewProjectHandler(projectService)

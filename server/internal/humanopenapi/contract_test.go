@@ -679,6 +679,15 @@ func TestProtectedOperationsDeclareExactRoleAllowlist(t *testing.T) {
 				}
 				continue
 			}
+			if path == "/workbench/dashboard" && method == "get" {
+				if hasPlatform || hasProject {
+					t.Error("GET /workbench/dashboard must filter memberships without a role precondition")
+				}
+				if operation["x-chronodesk-project-membership-filtered"] != true {
+					t.Error("GET /workbench/dashboard must declare membership filtering")
+				}
+				continue
+			}
 			if hasPlatform == hasProject {
 				t.Errorf(
 					"%s %s must declare exactly one role allowlist",
@@ -1306,6 +1315,7 @@ func TestP1HumanWebOperationsAreTypedAndMachineAddressable(t *testing.T) {
 		{"/auth/reset-password", "post"},
 		{"/platform/projects/{projectPublicID}/archive", "post"},
 		{"/workbench/tickets", "get"},
+		{"/workbench/dashboard", "get"},
 		{"/projects/{projectKey}/tickets", "get"},
 		{"/projects/{projectKey}/tickets", "post"},
 		{"/projects/{projectKey}/tickets/overdue", "get"},
@@ -1520,6 +1530,10 @@ func TestP1RuntimeDTOFieldsMatchPublishedSchemas(t *testing.T) {
 		{
 			"CrossProjectWorkbenchPage",
 			services.CrossProjectWorkbenchPage{},
+		},
+		{
+			"WorkbenchDashboard",
+			services.WorkbenchDashboard{},
 		},
 		{"WebhookTestReceipt", services.WebhookTestReceipt{}},
 	} {

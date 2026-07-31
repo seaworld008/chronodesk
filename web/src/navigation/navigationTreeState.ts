@@ -55,12 +55,16 @@ export const findActiveNavigationGroupID = (
 export const isNavigationItemActive = (
     item: NavigationLeafNode,
     pathname: string,
-): boolean =>
-    item.activePathPrefixes.some((prefix) =>
+): boolean => {
+    const excluded = item.activePathExclusions?.some((prefix) =>
+        pathname === prefix || pathname.startsWith(`${prefix}/`),
+    ) ?? false
+    return !excluded && item.activePathPrefixes.some((prefix) =>
         prefix === '/'
             ? pathname === '/'
             : pathname === prefix || pathname.startsWith(`${prefix}/`),
     )
+}
 
 export const loadNavigationGroupState = (
     storage: NavigationStateStorage,

@@ -204,6 +204,23 @@ func TestAnalyticsAuthorizedProjectSetUnderNonOwnerPostgresRLS(t *testing.T) {
 	if stats.TicketStats.Total != 2 || stats.ActivityStats.TotalComments != 2 {
 		t.Fatalf("authorized PostgreSQL stats = %+v", stats)
 	}
+	workbench, err := NewCrossProjectWorkbenchService(runtimeDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workbench.now = analyticsFixtureNow
+	dashboard, err := workbench.Dashboard(
+		context.Background(),
+		WorkbenchDashboardQuery{UserID: 1, Days: 7},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dashboard.Summary.Total != 2 ||
+		len(dashboard.SelectedProjects) != 2 ||
+		len(dashboard.ProjectBreakdown) != 2 {
+		t.Fatalf("membership-scoped PostgreSQL dashboard = %+v", dashboard)
+	}
 
 	if err := adminScoped.Exec(`
 		UPDATE project_memberships
@@ -229,6 +246,18 @@ func TestAnalyticsAuthorizedProjectSetUnderNonOwnerPostgresRLS(t *testing.T) {
 	}
 	if stats.TicketStats.Total != 1 || stats.ActivityStats.TotalComments != 1 {
 		t.Fatalf("PostgreSQL revocation was not immediate: %+v", stats)
+	}
+	dashboard, err = workbench.Dashboard(
+		context.Background(),
+		WorkbenchDashboardQuery{UserID: 1, Days: 7},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dashboard.Summary.Total != 1 ||
+		len(dashboard.SelectedProjects) != 1 ||
+		dashboard.SelectedProjects[0].Key != "OPS" {
+		t.Fatalf("dashboard revocation was not immediate: %+v", dashboard)
 	}
 }
 
@@ -256,6 +285,8 @@ func createAnalyticsPostgresSchema(t *testing.T, db *gorm.DB) {
 		`CREATE TABLE projects (
 			id BIGINT PRIMARY KEY,
 			organization_id BIGINT NOT NULL,
+			key TEXT NOT NULL,
+			name TEXT NOT NULL,
 			status TEXT NOT NULL
 		)`,
 		`CREATE TABLE tickets (
@@ -268,6 +299,10 @@ func createAnalyticsPostgresSchema(t *testing.T, db *gorm.DB) {
 			created_at TIMESTAMPTZ NOT NULL,
 			updated_at TIMESTAMPTZ NOT NULL,
 			deleted_at TIMESTAMPTZ,
+			due_date TIMESTAMPTZ,
+			sla_breached BOOLEAN NOT NULL DEFAULT FALSE,
+			assigned_to_actor_type TEXT,
+			assigned_to_actor_id TEXT,
 			response_time BIGINT,
 			resolution_time BIGINT
 		)`,
@@ -311,8 +346,10 @@ func seedAnalyticsPostgresFixtures(t *testing.T, db *gorm.DB) {
 		args  []any
 	}{
 		{
-			query: `INSERT INTO projects (id, organization_id, status) VALUES
-				(1, 10, 'active'), (2, 10, 'active'), (3, 20, 'active')`,
+			query: `INSERT INTO projects (id, organization_id, key, name, status) VALUES
+				(1, 10, 'OPS', 'Operations', 'active'),
+				(2, 10, 'FIN', 'Finance', 'active'),
+				(3, 20, 'OTHER', 'Other organization', 'active')`,
 		},
 		{
 			query: `INSERT INTO categories (id, name) VALUES

@@ -164,10 +164,17 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         await expect(settingsToggle).toHaveAttribute('aria-expanded', 'true')
         await expect(settingsToggle).toHaveAttribute('aria-controls')
 
-        await expect(page.getByRole('button', { name: /^工作台/ })).toHaveCount(0)
-        const workbench = page.getByRole('menuitem', { name: '工作台', exact: true })
+        const workbench = page.getByRole('button', { name: /^工作台/ })
         await expect(workbench).toBeVisible()
         await workbench.click()
+        const crossProjectWorkbench = page.getByRole('menuitem', {
+            name: '跨项目工作台',
+            exact: true,
+        })
+        await expect(crossProjectWorkbench).toHaveAttribute('href', /workbench$/)
+        await crossProjectWorkbench.evaluate((element) =>
+            (element as HTMLElement).click(),
+        )
         await expect(page).toHaveURL(/#\/workbench$/)
 
         await page.goto('/#/system-settings')

@@ -280,7 +280,9 @@ func crossProjectWorkbenchTestDB(t *testing.T) *gorm.DB {
 		`CREATE TABLE users (
 			id INTEGER PRIMARY KEY,
 			username TEXT NOT NULL,
-			display_name TEXT
+			display_name TEXT,
+			status TEXT NOT NULL DEFAULT 'active',
+			deleted_at DATETIME
 		)`,
 		`CREATE TABLE tickets (
 			id INTEGER PRIMARY KEY,

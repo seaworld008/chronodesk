@@ -14,6 +14,12 @@ ChronoDesk 的平台配置与项目配置是不同控制面。独立一级“系
 项目只可在平台 guardrail 允许的范围内覆盖公共模板或默认值。项目配置遵循草稿、
 模拟、审批和不可变 release 语义；发布后的 snapshot 是项目运行时事实。
 
+当前已实现的导航壳严格区分范围：`/system-settings` 与
+`/system-settings/email` 使用平台级权限、文案和 scope 标识；“项目配置”只登记
+已经存在且必须经过 `ProjectScope` 授权的能力。公共模板或默认值被项目采用时形成
+版本化 snapshot，而不是运行时继续引用可变的公共记录。尚未实现的配置产品不会以
+占位链接或伪公共配置 API 出现在导航中。
+
 现有 Ticket 继续绑定创建时采用的 Request Type、Workflow、SLA、路由、自动化、
 审批和策略版本。公共默认后续变化不会让已有 Ticket 漂移到新 release。本文只
 描述现有范围和优先级，不定义新的配置 API；新增配置能力必须先在领域服务和受保护

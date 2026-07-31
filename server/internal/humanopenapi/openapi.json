@@ -1418,6 +1418,84 @@
         }
       }
     },
+    "/workbench/dashboard": {
+      "get": {
+        "operationId": "getWorkbenchDashboard",
+        "summary": "Get membership-filtered operations analytics across authorized Projects",
+        "description": "Aggregates only active Projects for which the authenticated human has an active membership. Platform roles never expand this set. Omitting project_keys selects every authorized Project; any unknown, archived, cross-organization, or unauthorized key fails closed.",
+        "tags": [
+          "Cross-project workbench"
+        ],
+        "security": [
+          {
+            "humanBearer": [
+
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "project_keys",
+            "in": "query",
+            "required": false,
+            "style": "form",
+            "explode": true,
+            "schema": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 500,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Z][A-Z0-9_-]{0,31}$"
+              }
+            }
+          },
+          {
+            "name": "days",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "enum": [
+                7,
+                30,
+                90
+              ],
+              "default": 30
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Human Web operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkbenchDashboardEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "x-chronodesk-project-membership-filtered": true
+      }
+    },
     "/workbench/tickets": {
       "get": {
         "operationId": "listCrossProjectWorkbenchTickets",
@@ -9661,6 +9739,276 @@
             "properties": {
               "data": {
                 "$ref": "#/components/schemas/CrossProjectWorkbenchPage"
+              }
+            }
+          }
+        ]
+      },
+      "WorkbenchDashboardProject": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key",
+          "name"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_-]{0,31}$"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "WorkbenchDashboardStatusCounts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "open",
+          "in_progress",
+          "pending",
+          "resolved",
+          "closed",
+          "cancelled"
+        ],
+        "properties": {
+          "open": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "in_progress": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "pending": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "resolved": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "closed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cancelled": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "WorkbenchDashboardPriorityCounts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "low",
+          "normal",
+          "high",
+          "urgent",
+          "critical"
+        ],
+        "properties": {
+          "low": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "normal": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "high": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "urgent": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "critical": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "WorkbenchDashboardAssignmentCounts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "assigned",
+          "unassigned",
+          "human",
+          "service_principal"
+        ],
+        "properties": {
+          "assigned": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "unassigned": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "human": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "service_principal": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "WorkbenchDashboardSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "total",
+          "status",
+          "priority",
+          "sla_breached",
+          "overdue",
+          "assignment"
+        ],
+        "properties": {
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkbenchDashboardStatusCounts"
+          },
+          "priority": {
+            "$ref": "#/components/schemas/WorkbenchDashboardPriorityCounts"
+          },
+          "sla_breached": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "overdue": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "assignment": {
+            "$ref": "#/components/schemas/WorkbenchDashboardAssignmentCounts"
+          }
+        }
+      },
+      "WorkbenchDashboardDailyPoint": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "date",
+          "created"
+        ],
+        "properties": {
+          "date": {
+            "type": "string",
+            "format": "date"
+          },
+          "created": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "WorkbenchDashboardProjectBreakdown": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "project_key",
+          "project_name",
+          "total",
+          "sla_breached",
+          "overdue"
+        ],
+        "properties": {
+          "project_key": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_-]{0,31}$"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sla_breached": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "overdue": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "WorkbenchDashboard": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "generated_at",
+          "days",
+          "selected_projects",
+          "summary",
+          "daily_trend",
+          "project_breakdown"
+        ],
+        "properties": {
+          "generated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "days": {
+            "type": "integer",
+            "enum": [
+              7,
+              30,
+              90
+            ]
+          },
+          "selected_projects": {
+            "type": "array",
+            "maxItems": 500,
+            "items": {
+              "$ref": "#/components/schemas/WorkbenchDashboardProject"
+            }
+          },
+          "summary": {
+            "$ref": "#/components/schemas/WorkbenchDashboardSummary"
+          },
+          "daily_trend": {
+            "type": "array",
+            "maxItems": 90,
+            "items": {
+              "$ref": "#/components/schemas/WorkbenchDashboardDailyPoint"
+            }
+          },
+          "project_breakdown": {
+            "type": "array",
+            "maxItems": 500,
+            "items": {
+              "$ref": "#/components/schemas/WorkbenchDashboardProjectBreakdown"
+            }
+          }
+        }
+      },
+      "WorkbenchDashboardEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SuccessEnvelope"
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "data"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/WorkbenchDashboard"
               }
             }
           }

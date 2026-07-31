@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.0.0.
- * Contract SHA-256: 31b4b1dbfe4878c66520cca1ef89270055009c1a94fb41aae9b92a13cce9a4e4.
+ * Contract SHA-256: ea1dcd4226f0fc6ebfe48c10cb676ec3f80c556aed17d612e2323485324fcbf2.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -761,6 +761,70 @@ export type CrossProjectWorkbenchPage = {
 
 export type CrossProjectWorkbenchPageEnvelope = SuccessEnvelope & {
     data: CrossProjectWorkbenchPage
+}
+
+export type WorkbenchDashboardProject = {
+    key: string
+    name: string
+}
+
+export type WorkbenchDashboardStatusCounts = {
+    open: number
+    in_progress: number
+    pending: number
+    resolved: number
+    closed: number
+    cancelled: number
+}
+
+export type WorkbenchDashboardPriorityCounts = {
+    low: number
+    normal: number
+    high: number
+    urgent: number
+    critical: number
+}
+
+export type WorkbenchDashboardAssignmentCounts = {
+    assigned: number
+    unassigned: number
+    human: number
+    service_principal: number
+}
+
+export type WorkbenchDashboardSummary = {
+    total: number
+    status: WorkbenchDashboardStatusCounts
+    priority: WorkbenchDashboardPriorityCounts
+    sla_breached: number
+    overdue: number
+    assignment: WorkbenchDashboardAssignmentCounts
+}
+
+export type WorkbenchDashboardDailyPoint = {
+    date: string
+    created: number
+}
+
+export type WorkbenchDashboardProjectBreakdown = {
+    project_key: string
+    project_name: string
+    total: number
+    sla_breached: number
+    overdue: number
+}
+
+export type WorkbenchDashboard = {
+    generated_at: string
+    days: 7 | 30 | 90
+    selected_projects: Array<WorkbenchDashboardProject>
+    summary: WorkbenchDashboardSummary
+    daily_trend: Array<WorkbenchDashboardDailyPoint>
+    project_breakdown: Array<WorkbenchDashboardProjectBreakdown>
+}
+
+export type WorkbenchDashboardEnvelope = SuccessEnvelope & {
+    data: WorkbenchDashboard
 }
 
 export const notificationTypeValues = ["ticket_assigned","ticket_status_changed","ticket_commented","ticket_created","ticket_overdue","ticket_resolved","ticket_closed","system_maintenance","user_mention","system_alert"] as const
@@ -1698,6 +1762,14 @@ export type GetPlatformAuditLogDetailOperationQuery = Record<string, never>
 export type GetPlatformAuditLogDetailOperationRequest = never
 export type GetPlatformAuditLogDetailOperationResponse = AdminAuditLogDetailEnvelope
 
+export type GetWorkbenchDashboardOperationPathParameters = Record<string, never>
+export type GetWorkbenchDashboardOperationQuery = {
+    project_keys?: Array<string>
+    days?: 7 | 30 | 90
+}
+export type GetWorkbenchDashboardOperationRequest = never
+export type GetWorkbenchDashboardOperationResponse = WorkbenchDashboardEnvelope
+
 export type ListCrossProjectWorkbenchTicketsOperationPathParameters = Record<string, never>
 export type ListCrossProjectWorkbenchTicketsOperationQuery = {
     view?: CrossProjectWorkbenchView
@@ -2377,6 +2449,12 @@ export const humanApiOperations = {
         successStatus: 200,
         requestBody: "none",
     },
+    getWorkbenchDashboard: {
+        method: "GET",
+        path: "/workbench/dashboard",
+        successStatus: 200,
+        requestBody: "none",
+    },
     listCrossProjectWorkbenchTickets: {
         method: "GET",
         path: "/workbench/tickets",
@@ -2872,6 +2950,12 @@ export interface HumanApiOperationTypes {
         request: GetPlatformAuditLogDetailOperationRequest
         response: GetPlatformAuditLogDetailOperationResponse
     }
+    getWorkbenchDashboard: {
+        pathParameters: GetWorkbenchDashboardOperationPathParameters
+        query: GetWorkbenchDashboardOperationQuery
+        request: GetWorkbenchDashboardOperationRequest
+        response: GetWorkbenchDashboardOperationResponse
+    }
     listCrossProjectWorkbenchTickets: {
         pathParameters: ListCrossProjectWorkbenchTicketsOperationPathParameters
         query: ListCrossProjectWorkbenchTicketsOperationQuery
@@ -3341,6 +3425,8 @@ export const humanApiRoutes = {
         humanApiRoute("listPlatformAuditLogs", {}, query),
     getPlatformAuditLogDetail: (pathParameters: GetPlatformAuditLogDetailOperationPathParameters, query: GetPlatformAuditLogDetailOperationQuery = {}) =>
         humanApiRoute("getPlatformAuditLogDetail", pathParameters, query),
+    getWorkbenchDashboard: (query: GetWorkbenchDashboardOperationQuery = {}) =>
+        humanApiRoute("getWorkbenchDashboard", {}, query),
     listCrossProjectWorkbenchTickets: (query: ListCrossProjectWorkbenchTicketsOperationQuery = {}) =>
         humanApiRoute("listCrossProjectWorkbenchTickets", {}, query),
     listProjectTickets: (pathParameters: ListProjectTicketsOperationPathParameters, query: ListProjectTicketsOperationQuery = {}) =>
