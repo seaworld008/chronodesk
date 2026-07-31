@@ -4,19 +4,21 @@ import {
     Button,
     Card,
     CardContent,
-    CardHeader,
     Chip,
     CircularProgress,
     Dialog,
     DialogActions,
     DialogContent,
     DialogTitle,
+    IconButton,
     Stack,
+    Tooltip,
     Typography,
 } from '@mui/material'
-import SecurityIcon from '@mui/icons-material/Security'
-import { useNotify } from 'react-admin'
+import RefreshIcon from '@mui/icons-material/Refresh'
+import { Title, useNotify } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
+import AccountPageHeader from './AccountPageHeader'
 
 interface TrustedDevice {
     id: number
@@ -82,35 +84,47 @@ const TrustedDevices = () => {
         }
     }
 
-    if (loading) {
-        return (
-            <Box
-                sx={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    minHeight: "60vh"
-                }}>
-                <CircularProgress />
-            </Box>
-        );
-    }
-
     return (
         <Box
             sx={{
-                padding: 3,
+                p: { xs: 2, md: 3 },
                 display: "flex",
                 justifyContent: "center"
             }}>
+            <Title title="可信设备" />
             <Card sx={{ maxWidth: 960, width: '100%' }}>
-                <CardHeader
-                    avatar={<SecurityIcon color="primary" />}
-                    title="可信设备管理"
-                    subheader="查看并管理已记住的登录设备"
-                />
                 <CardContent>
-                    {devices.length === 0 ? (
+                    <Box sx={{ mb: 3 }}>
+                        <AccountPageHeader
+                            title="可信设备"
+                            description="查看并管理已记住的登录设备。"
+                            action={(
+                                <Tooltip title="刷新">
+                                    <span>
+                                        <IconButton
+                                            aria-label="刷新可信设备"
+                                            disabled={loading}
+                                            onClick={() => setRefreshFlag((flag) => flag + 1)}
+                                        >
+                                            <RefreshIcon />
+                                        </IconButton>
+                                    </span>
+                                </Tooltip>
+                            )}
+                        />
+                    </Box>
+                    {loading ? (
+                        <Box
+                            role="status"
+                            sx={{
+                                display: 'grid',
+                                minHeight: 240,
+                                placeItems: 'center',
+                            }}
+                        >
+                            <CircularProgress aria-label="正在加载可信设备" />
+                        </Box>
+                    ) : devices.length === 0 ? (
                         <Typography sx={{
                             color: "text.secondary"
                         }}>暂无可信设备记录。</Typography>

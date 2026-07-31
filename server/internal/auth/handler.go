@@ -961,11 +961,11 @@ func profileValidationHTTPError(err error) (string, string, bool) {
 	case errors.Is(err, ErrInvalidProfileZone):
 		return "invalid_profile_timezone", "时区必须是有效的 IANA 时区名称", true
 	case errors.Is(err, ErrInvalidProfileLocale):
-		return "unsupported_profile_language", "当前仅支持简体中文（zh-CN）", true
+		return "unsupported_profile_language", "当前仅支持简体中文（zh-CN）或英文（en）", true
 	case errors.Is(err, ErrInvalidProfilePhone):
 		return "invalid_profile_phone", "手机号码必须为空或使用 E.164 格式", true
 	case errors.Is(err, ErrInvalidProfileAvatar):
-		return "invalid_profile_avatar", "头像只能使用当前账号通过头像上传接口生成的本地路径", true
+		return "invalid_profile_avatar", "头像字段只能省略、清空或保持当前值；更换头像请使用上传接口", true
 	default:
 		return "", "", false
 	}

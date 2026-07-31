@@ -1043,7 +1043,7 @@ func (r *GormProfileRepository) Create(ctx context.Context, profile *UserProfile
 		modelProfile.Timezone = "Asia/Shanghai"
 	}
 	if modelProfile.Language == "" {
-		modelProfile.Language = "zh-CN"
+		modelProfile.Language = DefaultProfileLanguage
 	}
 
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -1183,7 +1183,7 @@ func legacyUserProfileProjection(user *models.User) models.UserProfile {
 	}
 	language := user.Language
 	if language == "" {
-		language = "zh-CN"
+		language = DefaultProfileLanguage
 	}
 	return models.UserProfile{
 		UserID:   user.ID,

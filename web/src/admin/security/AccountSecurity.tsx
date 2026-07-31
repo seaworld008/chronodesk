@@ -4,6 +4,10 @@ import {
     Box,
     Button,
     Chip,
+    Dialog,
+    DialogActions,
+    DialogContent,
+    DialogTitle,
     Grid,
     Paper,
     Stack,
@@ -11,7 +15,8 @@ import {
     Typography,
 } from '@mui/material'
 import { Link as RouterLink, useNavigate } from 'react-router-dom'
-import { Title, useNotify } from 'react-admin'
+import { Title, useBlocker, useNotify } from 'react-admin'
+import QRCode from 'react-qr-code'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
 import { clearAuthenticationState } from '@/lib/authProvider'
 import {
@@ -36,7 +41,14 @@ const AccountSecurity = () => {
     const [mfaPassword, setMfaPassword] = useState('')
     const [otpCode, setOtpCode] = useState('')
     const [otpSetup, setOtpSetup] = useState<OTPSetup | null>(null)
+    const [otpMaterialsAcknowledged, setOtpMaterialsAcknowledged] = useState(true)
     const [busy, setBusy] = useState(false)
+    const hasUnacknowledgedOTPMaterials =
+        otpSetup !== null && !otpMaterialsAcknowledged
+    const blocker = useBlocker(({ currentLocation, nextLocation }) =>
+        hasUnacknowledgedOTPMaterials &&
+        currentLocation.pathname !== nextLocation.pathname,
+    )
 
     const load = useCallback(async () => {
         const current = await apiFetch<HumanSessionUser>(
@@ -52,14 +64,14 @@ const AccountSecurity = () => {
     }, [load, notify])
 
     useEffect(() => {
-        if (!otpSetup) return
+        if (!hasUnacknowledgedOTPMaterials) return
         const warnBeforeLeaving = (event: BeforeUnloadEvent) => {
             event.preventDefault()
             event.returnValue = ''
         }
         window.addEventListener('beforeunload', warnBeforeLeaving)
         return () => window.removeEventListener('beforeunload', warnBeforeLeaving)
-    }, [otpSetup])
+    }, [hasUnacknowledgedOTPMaterials])
 
     const changePassword = async () => {
         if (newPassword.length < 8 || newPassword !== confirmPassword) {
@@ -100,6 +112,7 @@ const AccountSecurity = () => {
                 body: JSON.stringify({ password: mfaPassword }),
             })
             setOtpSetup(setup)
+            setOtpMaterialsAcknowledged(false)
             await load()
             notify('MFA 已立即启用，请立即配置验证器并安全保存备用码', {
                 type: 'success',
@@ -141,6 +154,7 @@ const AccountSecurity = () => {
             })
             setMfaPassword('')
             setOtpSetup(null)
+            setOtpMaterialsAcknowledged(true)
             await load()
             notify('MFA 已关闭', { type: 'success' })
         } catch (error) {
@@ -192,6 +206,22 @@ const AccountSecurity = () => {
                             <Typography sx={{ mt: 0.5 }}>
                                 此页面关闭后不会再次显示密钥和备用码。离开前请完成验证器配置，并把备用码保存到安全位置。
                             </Typography>
+                            <Box
+                                data-testid="mfa-setup-qr-code"
+                                sx={{
+                                    bgcolor: 'common.white',
+                                    display: 'inline-flex',
+                                    mt: 2,
+                                    p: 1.5,
+                                    borderRadius: 1,
+                                }}
+                            >
+                                <QRCode
+                                    value={otpSetup.qr_code}
+                                    size={180}
+                                    title="MFA 验证器配置二维码"
+                                />
+                            </Box>
                             <TextField
                                 label="验证器配置 URI（qr_code）"
                                 value={otpSetup.qr_code}
@@ -229,6 +259,28 @@ const AccountSecurity = () => {
                             <Typography sx={{ mt: 1 }}>
                                 手机丢失时可使用一个未使用的备用码恢复登录；每个备用码只能使用一次。
                             </Typography>
+                            <Stack
+                                direction={{ xs: 'column', sm: 'row' }}
+                                spacing={1}
+                                sx={{ alignItems: { sm: 'center' }, mt: 2 }}
+                            >
+                                <Button
+                                    variant="outlined"
+                                    disabled={otpMaterialsAcknowledged}
+                                    onClick={() => setOtpMaterialsAcknowledged(true)}
+                                >
+                                    我已安全保存
+                                </Button>
+                                <Chip
+                                    size="small"
+                                    color={otpMaterialsAcknowledged ? 'success' : 'warning'}
+                                    label={
+                                        otpMaterialsAcknowledged
+                                            ? '恢复材料已确认保存'
+                                            : '尚未确认保存恢复材料'
+                                    }
+                                />
+                            </Stack>
                             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mt: 2 }}>
                                 <TextField label="测试 6 位验证码（不改变启用状态）" value={otpCode} onChange={(event) => setOtpCode(event.target.value)} slotProps={{ htmlInput: { maxLength: 6, inputMode: 'numeric' } }} />
                                 <Button variant="contained" disabled={busy || otpCode.length !== 6} onClick={() => void verifyMFA()}>测试验证码</Button>
@@ -244,6 +296,38 @@ const AccountSecurity = () => {
                     </Stack>
                 </Paper>
             </Stack>
+            <Dialog
+                open={blocker.state === 'blocked'}
+                aria-labelledby="mfa-leave-confirmation-title"
+            >
+                <DialogTitle id="mfa-leave-confirmation-title">
+                    MFA 恢复材料尚未确认保存
+                </DialogTitle>
+                <DialogContent>
+                    离开后将无法再次查看本次密钥和备用码。请先安全保存；若已完成，可确认离开。
+                </DialogContent>
+                <DialogActions>
+                    <Button
+                        onClick={() => {
+                            if (blocker.state === 'blocked') blocker.reset()
+                        }}
+                    >
+                        继续留在本页
+                    </Button>
+                    <Button
+                        variant="contained"
+                        color="warning"
+                        onClick={() => {
+                            if (blocker.state === 'blocked') {
+                                setOtpMaterialsAcknowledged(true)
+                                blocker.proceed()
+                            }
+                        }}
+                    >
+                        我已保存并离开
+                    </Button>
+                </DialogActions>
+            </Dialog>
         </Box>
     )
 }

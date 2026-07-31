@@ -46,6 +46,7 @@ func TestAdminUserUpdateAllowsClearingPhoneAndEmailVerification(t *testing.T) {
 	user := models.User{
 		Username: "update-user", Email: "update-user@example.com",
 		Phone: "+8613800138000", PasswordHash: "hashed",
+		Avatar:       "https://legacy.example.test/avatar.png",
 		PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
@@ -151,37 +152,37 @@ func TestAdminUserUpdateAllowsClearingPhoneAndEmailVerification(t *testing.T) {
 	avatarRequest := httptest.NewRequest(
 		http.MethodPut,
 		fmt.Sprintf("/users/%d", user.ID),
-		bytes.NewBufferString(`{"avatar":"https://example.test/untrusted.png"}`),
+		bytes.NewBufferString(`{"avatar":"https://legacy.example.test/avatar.png"}`),
 	)
 	avatarRequest.Header.Set("Content-Type", "application/json")
 	avatarResponse := httptest.NewRecorder()
 	router.ServeHTTP(avatarResponse, avatarRequest)
-	if avatarResponse.Code != http.StatusBadRequest {
+	if avatarResponse.Code != http.StatusOK {
 		t.Fatalf(
-			"avatar status = %d, want %d; body=%s",
+			"legacy avatar no-op status = %d, want %d; body=%s",
 			avatarResponse.Code,
-			http.StatusBadRequest,
+			http.StatusOK,
 			avatarResponse.Body.String(),
 		)
 	}
 
-	validAvatar := fmt.Sprintf(
+	forgedAvatar := fmt.Sprintf(
 		"/uploads/avatars/%d/00000000-0000-4000-8000-000000000001.png",
 		user.ID,
 	)
-	validAvatarRequest := httptest.NewRequest(
+	forgedAvatarRequest := httptest.NewRequest(
 		http.MethodPut,
 		fmt.Sprintf("/users/%d", user.ID),
-		bytes.NewBufferString(fmt.Sprintf(`{"avatar":%q}`, validAvatar)),
+		bytes.NewBufferString(fmt.Sprintf(`{"avatar":%q}`, forgedAvatar)),
 	)
-	validAvatarRequest.Header.Set("Content-Type", "application/json")
-	validAvatarResponse := httptest.NewRecorder()
-	router.ServeHTTP(validAvatarResponse, validAvatarRequest)
-	if validAvatarResponse.Code != http.StatusOK {
+	forgedAvatarRequest.Header.Set("Content-Type", "application/json")
+	forgedAvatarResponse := httptest.NewRecorder()
+	router.ServeHTTP(forgedAvatarResponse, forgedAvatarRequest)
+	if forgedAvatarResponse.Code != http.StatusBadRequest {
 		t.Fatalf(
-			"valid avatar status = %d, body=%s",
-			validAvatarResponse.Code,
-			validAvatarResponse.Body.String(),
+			"forged avatar status = %d, body=%s",
+			forgedAvatarResponse.Code,
+			forgedAvatarResponse.Body.String(),
 		)
 	}
 

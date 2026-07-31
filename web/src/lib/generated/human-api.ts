@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.0.0.
- * Contract SHA-256: 07900b73ce97eadca06a1721b184216d2606dec9d4c90962d1d6e28bece30e17.
+ * Contract SHA-256: 31b4b1dbfe4878c66520cca1ef89270055009c1a94fb41aae9b92a13cce9a4e4.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -46,7 +46,7 @@ export type UpdateHumanProfileRequest = {
     phone_number?: string | string
     avatar?: string
     timezone?: string
-    language?: "zh-CN"
+    language?: "zh-CN" | "en"
 }
 
 export type UpsertProjectMembershipRequest = {

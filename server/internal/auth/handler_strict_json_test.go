@@ -12,6 +12,27 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+type profileValidationRepository struct{}
+
+func (profileValidationRepository) Create(context.Context, *UserProfile) error {
+	return nil
+}
+
+func (profileValidationRepository) GetByUserID(
+	_ context.Context,
+	userID uint,
+) (*UserProfile, error) {
+	return &UserProfile{UserID: userID}, nil
+}
+
+func (profileValidationRepository) Update(context.Context, *UserProfile) error {
+	return nil
+}
+
+func (profileValidationRepository) Delete(context.Context, uint) error {
+	return nil
+}
+
 func TestAuthFailureMappingsPublishContractedRuntimeStatuses(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -254,7 +275,9 @@ func TestHumanAuthHandlersRejectUnknownAndTrailingJSON(t *testing.T) {
 
 func TestUpdateProfileReturnsStableChineseValidationErrors(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	handler := NewAuthHandler(&AuthService{}, nil)
+	handler := NewAuthHandler(&AuthService{
+		profileRepo: profileValidationRepository{},
+	}, nil)
 	tests := []struct {
 		name     string
 		payload  string
@@ -272,7 +295,7 @@ func TestUpdateProfileReturnsStableChineseValidationErrors(t *testing.T) {
 		},
 		{
 			name:     "language",
-			payload:  `{"language":"en"}`,
+			payload:  `{"language":"fr"}`,
 			wantCode: "unsupported_profile_language",
 		},
 		{

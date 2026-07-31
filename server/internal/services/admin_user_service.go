@@ -338,9 +338,6 @@ func (s *AdminUserService) UpdateUser(
 	if req.PlatformRole != nil && !req.PlatformRole.IsValid() {
 		return nil, fmt.Errorf("invalid platform role")
 	}
-	if req.Avatar != nil && !IsControlledUserAvatarURL(userID, *req.Avatar) {
-		return nil, ErrInvalidAdminUserAvatar
-	}
 	var updated *models.User
 	err := s.withMutationTransaction(ctx, actor, func(commandContext context.Context, tx *gorm.DB) error {
 		if err := lockPlatformAdministratorInvariant(tx); err != nil {
@@ -474,6 +471,22 @@ func (s *AdminUserService) updateUserOnDB(
 			return nil, fmt.Errorf("user not found")
 		}
 		return nil, fmt.Errorf("failed to find user: %w", err)
+	}
+	if req.Avatar != nil {
+		currentAvatar := user.Avatar
+		var authoritativeProfile models.UserProfile
+		profileErr := db.WithContext(ctx).
+			Select("id", "avatar").
+			Where("user_id = ?", userID).
+			First(&authoritativeProfile).Error
+		if profileErr == nil {
+			currentAvatar = authoritativeProfile.Avatar
+		} else if !errors.Is(profileErr, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("failed to load authoritative avatar: %w", profileErr)
+		}
+		if *req.Avatar != "" && *req.Avatar != currentAvatar {
+			return nil, ErrInvalidAdminUserAvatar
+		}
 	}
 
 	if user.PlatformRole == models.PlatformRolePlatformAdmin {

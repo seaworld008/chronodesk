@@ -26,6 +26,24 @@ const runID = e2eRunID();
 const webhookName = `${E2E_PREFIX}${runID}-Canonical-Webhook`;
 const markerSecret = `${E2E_PREFIX}${runID}-仅用于密文测试`;
 
+const selectOptionByRenderedText = async (
+    page: Page,
+    primary: string,
+    secondary: string,
+) => {
+    const option = page
+        .getByRole('option')
+        .filter({ hasText: primary })
+        .filter({ hasText: secondary });
+    await expect(option).toHaveCount(1);
+    await expect(option.getByText(primary, { exact: true })).toBeVisible();
+    await expect(option.getByText(secondary, { exact: true })).toBeVisible();
+    const checkbox = option.getByRole('checkbox');
+    await expect(checkbox).toHaveCount(1);
+    await option.click();
+    await expect(checkbox).toBeChecked();
+};
+
 const mockWebhook = {
     id: 731,
     name: '异步测试 Webhook',
@@ -165,6 +183,41 @@ test.describe('Webhook 测试异步入队浏览器契约（mock）', () => {
         await expect(page.getByText('Webhook 测试成功')).toHaveCount(0);
         expect(backend.testCalls()).toBe(1);
     });
+
+    test('Checkbox 与 ListItemText 结构可独立选择 canonical 事件和状态', async ({
+        page,
+    }) => {
+        await installMockSession(
+            page,
+            {
+                ...defaultMockIdentity,
+                sessionID: 'e2e-webhook-canonical-selector',
+            },
+            projectA,
+        );
+        await installWebhookAsyncMockBackend(page);
+        await page.goto('/#/webhook-settings');
+        await page.getByRole('button', { name: '新增 Webhook' }).click();
+        const form = page.getByRole('dialog', { name: '新增 Webhook' });
+
+        await form.getByLabel('订阅事件', { exact: true }).click();
+        await selectOptionByRenderedText(
+            page,
+            '工单状态流转',
+            'io.chronodesk.ticket.transitioned.v1',
+        );
+        await page.keyboard.press('Escape');
+
+        await form.getByLabel('状态流转筛选', { exact: true }).click();
+        await selectOptionByRenderedText(page, '已解决', 'resolved');
+        await page.keyboard.press('Escape');
+        await form
+            .getByRole('button', { name: '清空已选订阅事件' })
+            .click();
+        await expect(
+            form.getByLabel('状态流转筛选', { exact: true }),
+        ).toHaveCount(0);
+    });
 });
 
 test.describe('Webhook canonical CloudEvent 管理', () => {
@@ -245,25 +298,21 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
             .click();
         form = page.getByRole('dialog', { name: '编辑 Webhook' });
         await form.getByLabel('订阅事件', { exact: true }).click();
-        await page
-            .getByRole('option', {
-                name: /工单创建（io\.chronodesk\.ticket\.created\.v1）/,
-            })
-            .click();
-        await page
-            .getByRole('option', {
-                name: /工单状态流转（io\.chronodesk\.ticket\.transitioned\.v1）/,
-            })
-            .click();
+        await selectOptionByRenderedText(
+            page,
+            '工单创建',
+            'io.chronodesk.ticket.created.v1',
+        );
+        await selectOptionByRenderedText(
+            page,
+            '工单状态流转',
+            'io.chronodesk.ticket.transitioned.v1',
+        );
         await page.keyboard.press('Escape');
 
         await form.getByLabel('状态流转筛选', { exact: true }).click();
-        await page
-            .getByRole('option', { name: '已解决（resolved）' })
-            .click();
-        await page
-            .getByRole('option', { name: '已关闭（closed）' })
-            .click();
+        await selectOptionByRenderedText(page, '已解决', 'resolved');
+        await selectOptionByRenderedText(page, '已关闭', 'closed');
         await page.keyboard.press('Escape');
 
         const update = page.waitForResponse(

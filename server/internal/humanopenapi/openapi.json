@@ -6589,8 +6589,9 @@
           },
           "avatar": {
             "type": "string",
-            "pattern": "^$|^/uploads/avatars/[1-9][0-9]*/[0-9a-fA-F-]+\\.(jpg|png)$",
-            "description": "Empty, or the opaque local path returned by the authenticated user's controlled avatar upload endpoint."
+            "pattern": "^$|^/uploads/avatars/[1-9][0-9]*/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.(jpg|png)$",
+            "deprecated": true,
+            "description": "Deprecated compatibility field. Omit it when editing other fields. Runtime accepts empty to clear or the exact current value as a no-op; only the controlled avatar upload endpoint may persist a new value."
           },
           "timezone": {
             "type": "string",
@@ -6599,7 +6600,8 @@
           "language": {
             "type": "string",
             "enum": [
-              "zh-CN"
+              "zh-CN",
+              "en"
             ]
           }
         }
@@ -6765,8 +6767,9 @@
           },
           "avatar": {
             "type": "string",
-            "pattern": "^$|^/uploads/avatars/[1-9][0-9]*/[0-9a-fA-F-]+\\.(jpg|png)$",
-            "description": "Compatibility field. Empty, or the opaque local path returned by that user's controlled avatar upload endpoint."
+            "pattern": "^$|^/uploads/avatars/[1-9][0-9]*/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.(jpg|png)$",
+            "deprecated": true,
+            "description": "Deprecated compatibility field. Omit it when editing other fields. Runtime accepts empty to clear or the exact current value as a no-op; only a dedicated avatar upload endpoint may persist a new value."
           },
           "timezone": {
             "type": "string",

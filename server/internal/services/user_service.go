@@ -440,28 +440,6 @@ func avatarStorageKey(avatarURL string) (string, bool) {
 	return "avatars/" + cleaned, true
 }
 
-// IsControlledUserAvatarURL accepts only the opaque local avatar path emitted
-// by UploadAvatar for the same user. Empty clears the compatibility projection.
-func IsControlledUserAvatarURL(userID uint, avatarURL string) bool {
-	if avatarURL == "" {
-		return true
-	}
-	prefix := avatarURLPrefix + fmt.Sprintf("%d/", userID)
-	if !strings.HasPrefix(avatarURL, prefix) {
-		return false
-	}
-	filename := strings.TrimPrefix(avatarURL, prefix)
-	if filename == "" || filepath.Base(filename) != filename {
-		return false
-	}
-	extension := strings.ToLower(filepath.Ext(filename))
-	if extension != ".jpg" && extension != ".png" {
-		return false
-	}
-	_, err := uuid.Parse(strings.TrimSuffix(filename, extension))
-	return err == nil
-}
-
 // calculateSecurityScore 计算安全评分
 func (s *UserService) calculateSecurityScore(user *models.User, stats *models.UserProfileStats) int {
 	score := 0

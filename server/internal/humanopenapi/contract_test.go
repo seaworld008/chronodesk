@@ -1873,9 +1873,10 @@ func TestAdminUserPhoneAndManagerConstraintsMatchRuntime(t *testing.T) {
 		"properties",
 	)
 	adminAvatar := objectAt(t, update, "avatar")
-	if pattern, _ := adminAvatar["pattern"].(string); !strings.HasPrefix(
+	assertDeprecatedAvatarCompatibilitySchema(t, adminAvatar)
+	if pattern, _ := adminAvatar["pattern"].(string); !strings.Contains(
 		pattern,
-		"^$|^/uploads/avatars/",
+		"-4[0-9a-f]{3}-[89ab]",
 	) {
 		t.Fatalf("UpdateAdminUserRequest.avatar = %v", adminAvatar)
 	}
@@ -1937,7 +1938,7 @@ func TestHumanProfileUpdatePublishesValidatedCompatibilityFields(t *testing.T) {
 		t.Errorf("timezone schema = %v", timezone)
 	}
 	language := objectAt(t, properties, "language")
-	if !reflect.DeepEqual(language["enum"], []any{"zh-CN"}) {
+	if !reflect.DeepEqual(language["enum"], []any{"zh-CN", "en"}) {
 		t.Errorf("language schema = %v", language)
 	}
 	phone := objectAt(t, properties, "phone_number")
@@ -1945,11 +1946,27 @@ func TestHumanProfileUpdatePublishesValidatedCompatibilityFields(t *testing.T) {
 		t.Errorf("phone_number schema = %v", phone)
 	}
 	avatar := objectAt(t, properties, "avatar")
-	if pattern, _ := avatar["pattern"].(string); !strings.HasPrefix(
+	assertDeprecatedAvatarCompatibilitySchema(t, avatar)
+	if pattern, _ := avatar["pattern"].(string); !strings.Contains(
 		pattern,
-		"^$|^/uploads/avatars/",
+		"-4[0-9a-f]{3}-[89ab]",
 	) {
 		t.Errorf("avatar schema = %v", avatar)
+	}
+}
+
+func assertDeprecatedAvatarCompatibilitySchema(
+	t *testing.T,
+	schema map[string]any,
+) {
+	t.Helper()
+	if schema["deprecated"] != true {
+		t.Errorf("avatar compatibility field is not deprecated: %v", schema)
+	}
+	description, _ := schema["description"].(string)
+	if !strings.Contains(description, "exact current value") ||
+		!strings.Contains(description, "upload endpoint") {
+		t.Errorf("avatar compatibility description = %q", description)
 	}
 }
 

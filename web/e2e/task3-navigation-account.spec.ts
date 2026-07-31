@@ -69,7 +69,7 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             department: '',
             position: '',
             timezone: 'Asia/Shanghai',
-            language: 'zh-CN',
+            language: 'en',
             created_at: '2026-01-01T00:00:00Z',
             updated_at: '2026-01-01T00:00:00Z',
         }
@@ -211,6 +211,7 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         await expect(page.getByRole('heading', { name: '个人资料' })).toBeVisible()
         await expect(page.getByLabel('邮箱（只读）')).toBeDisabled()
         await expect(page.getByLabel('手机（只读）')).toBeDisabled()
+        await expect(page.getByLabel('语言')).toHaveValue('en')
         await page.getByLabel('名字').fill('Updated')
         await page.getByRole('button', { name: '保存个人资料' }).click()
         await expect.poll(() => profileWrites.length).toBe(1)
@@ -220,6 +221,7 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             'last_name',
             'timezone',
         ])
+        expect(profileWrites[0].language).toBe('en')
         await page.keyboard.press('Escape')
         await expect(page.getByText('个人资料已更新')).toHaveCount(0)
         const desktopAvatar = await page.getByTestId('profile-avatar-panel')
@@ -265,7 +267,31 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             .toBeLessThan(4)
         expect(mobileLayout.avatar!.y).toBeLessThan(mobileLayout.form!.y)
         await expect(page).toHaveScreenshot('account-profile-mobile.png')
+        for (const accountPage of [
+            { path: 'profile', title: '个人资料' },
+            { path: 'security', title: '账号安全' },
+            { path: 'trusted-devices', title: '可信设备' },
+            { path: 'login-history', title: '登录历史' },
+        ]) {
+            await page.goto(`/#/account/${accountPage.path}`)
+            const header = page.getByTestId('account-page-header')
+            await expect(header).toHaveCount(1)
+            await expect(header).toHaveCSS('flex-direction', 'column')
+            await expect(header).toContainText(accountPage.title)
+        }
         await page.setViewportSize({ width: 1280, height: 720 })
+        for (const accountPage of [
+            { path: 'profile', title: '个人资料' },
+            { path: 'security', title: '账号安全' },
+            { path: 'trusted-devices', title: '可信设备' },
+            { path: 'login-history', title: '登录历史' },
+        ]) {
+            await page.goto(`/#/account/${accountPage.path}`)
+            const header = page.getByTestId('account-page-header')
+            await expect(header).toHaveCount(1)
+            await expect(header).toHaveCSS('flex-direction', 'row')
+            await expect(header).toContainText(accountPage.title)
+        }
 
         await page.goto('/#/account/login-history')
         await expect(page.getByRole('heading', { name: '登录历史' })).toBeVisible()
@@ -299,12 +325,56 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         await expect(page.getByLabel('手动输入密钥')).toHaveValue('TASK3SECRET')
         await expect(page.getByRole('list', { name: 'MFA 备用码' }))
             .toContainText('BACKUP-01')
+        const qrCode = page.getByTestId('mfa-setup-qr-code')
+        await expect(qrCode).toBeVisible()
+        await expect(qrCode.locator('svg')).toHaveCount(1)
+        await expect(
+            qrCode.getByRole('img', {
+                name: 'MFA 验证器配置二维码',
+            }),
+        ).toBeVisible()
+        await expect(qrCode.locator('svg rect, svg path').first()).toBeVisible()
         await expect(page.getByText(/离开前请完成验证器配置/)).toBeVisible()
+        await expect(page.getByRole('button', { name: '我已安全保存' }))
+            .toBeVisible()
+        await expect(page.getByText('尚未确认保存恢复材料')).toBeVisible()
         await page.getByLabel('测试 6 位验证码（不改变启用状态）')
             .fill('123456')
         await page.getByRole('button', { name: '测试验证码' }).click()
         await expect.poll(() => otpVerifications).toContain('123456')
 
+        const leaveDialog = page.getByRole('dialog', {
+            name: 'MFA 恢复材料尚未确认保存',
+        })
+        const integrationToggle = page.getByRole('button', {
+            name: /^集成中心/,
+        })
+        if (await integrationToggle.getAttribute('aria-expanded') !== 'true') {
+            await integrationToggle.click()
+        }
+        await page.getByRole('menuitem', { name: 'Webhook', exact: true }).click()
+        await expect(leaveDialog).toBeVisible()
+        await expect(page).toHaveURL(/#\/account\/security$/)
+        await leaveDialog
+            .getByRole('button', { name: '继续留在本页' })
+            .click()
+        await expect(leaveDialog).toHaveCount(0)
+
+        await page.getByRole('link', { name: '可信设备' }).click()
+        await expect(leaveDialog).toBeVisible()
+        await expect(page).toHaveURL(/#\/account\/security$/)
+        await leaveDialog
+            .getByRole('button', { name: '继续留在本页' })
+            .click()
+        await expect(leaveDialog).toHaveCount(0)
+        await page.getByRole('link', { name: '可信设备' }).click()
+        await leaveDialog
+            .getByRole('button', { name: '我已保存并离开' })
+            .click()
+        await expect(page).toHaveURL(/#\/account\/trusted-devices$/)
+        await expect(page.getByText('暂无可信设备记录。')).toBeVisible()
+
+        await page.goto('/#/account/security')
         await page.getByLabel('当前密码').first().fill('CurrentPassword123!')
         await page.getByLabel('新密码', { exact: true })
             .fill('ChangedPassword123!')

@@ -23,7 +23,7 @@ type ProfileForm = {
     first_name: string
     last_name: string
     timezone: string
-    language: 'zh-CN'
+    language: 'zh-CN' | 'en'
 }
 
 const emptyForm: ProfileForm = {
@@ -56,7 +56,7 @@ const AccountProfile = () => {
                 first_name: current.profile?.first_name ?? '',
                 last_name: current.profile?.last_name ?? '',
                 timezone: current.profile?.timezone || 'Asia/Shanghai',
-                language: 'zh-CN',
+                language: current.profile?.language === 'en' ? 'en' : 'zh-CN',
             })
             storeCurrentUser(current)
         } catch (error) {
@@ -227,11 +227,15 @@ const AccountProfile = () => {
                             select
                             label="语言"
                             value={form.language}
-                            onChange={() => setForm((current) => ({ ...current, language: 'zh-CN' }))}
+                            onChange={(event) => setForm((current) => ({
+                                ...current,
+                                language: event.target.value === 'en' ? 'en' : 'zh-CN',
+                            }))}
                             fullWidth
                             slotProps={{ select: { native: true } }}
                         >
                             <option value="zh-CN">简体中文</option>
+                            <option value="en">English</option>
                         </TextField>
                     </Grid>
                 </Grid>

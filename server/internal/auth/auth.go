@@ -50,6 +50,16 @@ var (
 	profilePhonePattern            = regexp.MustCompile(`^\+[1-9][0-9]{1,14}$`)
 )
 
+const (
+	DefaultProfileLanguage = "zh-CN"
+	EnglishProfileLanguage = "en"
+)
+
+func isSupportedProfileLanguage(language string) bool {
+	return language == DefaultProfileLanguage ||
+		language == EnglishProfileLanguage
+}
+
 // PlatformRole 与领域用户模型共享同一组平台职责，避免认证与治理授权漂移。
 type PlatformRole = models.PlatformRole
 
@@ -636,7 +646,7 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 		Department:  req.Department,
 		Position:    req.Position,
 		Timezone:    "UTC",
-		Language:    "en",
+		Language:    DefaultProfileLanguage,
 	}
 	var verification *EmailVerification
 	if emailVerificationEnabled {
@@ -1339,13 +1349,18 @@ func (s *AuthService) UpdateProfile(ctx context.Context, userID uint, req *Updat
 	if req == nil {
 		return ErrInvalidProfileName
 	}
-	if err := validateUpdateProfileRequest(userID, req); err != nil {
+	if err := validateUpdateProfileRequest(req); err != nil {
 		return err
 	}
 	// 获取用户资料
 	profile, err := s.profileRepo.GetByUserID(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("failed to get profile: %w", err)
+	}
+	if req.Avatar != nil &&
+		*req.Avatar != "" &&
+		*req.Avatar != profile.Avatar {
+		return ErrInvalidProfileAvatar
 	}
 
 	// 更新字段
@@ -1381,10 +1396,7 @@ func (s *AuthService) UpdateProfile(ctx context.Context, userID uint, req *Updat
 	return nil
 }
 
-func validateUpdateProfileRequest(
-	userID uint,
-	req *UpdateProfileRequest,
-) error {
+func validateUpdateProfileRequest(req *UpdateProfileRequest) error {
 	for _, name := range []*string{req.FirstName, req.LastName} {
 		if name == nil {
 			continue
@@ -1405,7 +1417,7 @@ func validateUpdateProfileRequest(
 	}
 	if req.Language != nil {
 		*req.Language = strings.TrimSpace(*req.Language)
-		if *req.Language != "zh-CN" {
+		if !isSupportedProfileLanguage(*req.Language) {
 			return ErrInvalidProfileLocale
 		}
 	}
@@ -1417,10 +1429,9 @@ func validateUpdateProfileRequest(
 		}
 	}
 	if req.Avatar != nil {
-		*req.Avatar = strings.TrimSpace(*req.Avatar)
-		if !services.IsControlledUserAvatarURL(userID, *req.Avatar) {
-			return ErrInvalidProfileAvatar
-		}
+		// Compatibility only: new avatar bytes must flow through UploadAvatar.
+		// The legacy request field may preserve the exact current value or clear it.
+		// Do not normalize it before the equality check.
 	}
 	return nil
 }

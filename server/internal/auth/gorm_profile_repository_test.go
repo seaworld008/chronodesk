@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -223,10 +224,68 @@ func TestAuthProfileUpdateValidatesAndClearsPhoneVerification(t *testing.T) {
 	}); !errors.Is(err, ErrInvalidProfileZone) {
 		t.Fatalf("invalid timezone error = %v", err)
 	}
-	unsupported := "en"
+	english := "en"
+	firstName := "English"
+	if err := service.UpdateProfile(context.Background(), user.ID, &UpdateProfileRequest{
+		FirstName: &firstName,
+		Language:  &english,
+	}); err != nil {
+		t.Fatalf("existing en roundtrip: %v", err)
+	}
+	roundTripped, err := repo.GetByUserID(context.Background(), user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roundTripped.Language != english || roundTripped.FirstName != firstName {
+		t.Fatalf("existing en roundtrip profile = %+v", roundTripped)
+	}
+
+	unsupported := "fr"
 	if err := service.UpdateProfile(context.Background(), user.ID, &UpdateProfileRequest{
 		Language: &unsupported,
 	}); !errors.Is(err, ErrInvalidProfileLocale) {
 		t.Fatalf("unsupported language error = %v", err)
+	}
+}
+
+func TestAuthProfileAvatarCompatibilityCannotForgeUploadResult(t *testing.T) {
+	db := setupProfileRepoTestDB(t)
+	user := createProfileRepoTestUser(t, db)
+	legacyAvatar := "https://legacy.example.test/avatar.png"
+	if err := db.Model(&user).Update("avatar", legacyAvatar).Error; err != nil {
+		t.Fatal(err)
+	}
+	repo := NewGormProfileRepository(db)
+	service := &AuthService{profileRepo: repo}
+	firstName := "Preserved"
+	if err := service.UpdateProfile(context.Background(), user.ID, &UpdateProfileRequest{
+		FirstName: &firstName,
+		Avatar:    &legacyAvatar,
+	}); err != nil {
+		t.Fatalf("legacy avatar exact no-op: %v", err)
+	}
+
+	forged := fmt.Sprintf(
+		"/uploads/avatars/%d/00000000-0000-4000-8000-000000000001.png",
+		user.ID,
+	)
+	if err := service.UpdateProfile(context.Background(), user.ID, &UpdateProfileRequest{
+		Avatar: &forged,
+	}); !errors.Is(err, ErrInvalidProfileAvatar) {
+		t.Fatalf("forged uploaded path error = %v", err)
+	}
+
+	clear := ""
+	if err := service.UpdateProfile(context.Background(), user.ID, &UpdateProfileRequest{
+		Avatar: &clear,
+	}); err != nil {
+		t.Fatalf("clear avatar: %v", err)
+	}
+	profile, err := repo.GetByUserID(context.Background(), user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.Avatar != "" {
+		t.Fatalf("cleared avatar = %q", profile.Avatar)
 	}
 }
