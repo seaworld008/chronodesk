@@ -15,6 +15,7 @@ const validLeaf: NavigationLeafNode = {
     placement: 'sidebar',
     path: '/valid',
     activePathPrefixes: ['/valid'],
+    route: { kind: 'existing' },
 }
 
 const invalidLeaf: NavigationLeafNode = {

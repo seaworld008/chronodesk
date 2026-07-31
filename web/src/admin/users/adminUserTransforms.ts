@@ -87,7 +87,6 @@ export const transformUpdateAdminUser = (
         'first_name',
         'last_name',
         'display_name',
-        'avatar',
         'timezone',
         'language',
         'department',

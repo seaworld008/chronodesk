@@ -334,6 +334,16 @@ func (s *UserService) UploadAvatar(ctx context.Context, userID uint, file multip
 	if err := s.db.WithContext(ctx).Select("id", "avatar").First(&user, userID).Error; err != nil {
 		return "", fmt.Errorf("find avatar owner: %w", err)
 	}
+	oldAvatarURL := user.Avatar
+	var profile models.UserProfile
+	if err := s.db.WithContext(ctx).
+		Select("id", "avatar").
+		Where("user_id = ?", userID).
+		First(&profile).Error; err == nil && profile.Avatar != "" {
+		oldAvatarURL = profile.Avatar
+	} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", fmt.Errorf("find avatar profile: %w", err)
+	}
 
 	filename := uuid.NewString() + extension
 	key := filepath.ToSlash(filepath.Join("avatars", fmt.Sprintf("%d", userID), filename))
@@ -343,14 +353,33 @@ func (s *UserService) UploadAvatar(ctx context.Context, userID uint, file multip
 	}
 	avatarURL := avatarURLPrefix + fmt.Sprintf("%d/%s", userID, filename)
 
-	if err := s.db.WithContext(ctx).Model(&models.User{}).
-		Where("id = ?", userID).
-		Update("avatar", avatarURL).Error; err != nil {
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&models.User{}).
+			Where("id = ?", userID).
+			Update("avatar", avatarURL).Error; err != nil {
+			return err
+		}
+		result := tx.Model(&models.UserProfile{}).
+			Where("user_id = ?", userID).
+			Update("avatar", avatarURL)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return tx.Create(&models.UserProfile{
+				UserID:   userID,
+				Avatar:   avatarURL,
+				Timezone: "Asia/Shanghai",
+				Language: "zh-CN",
+			}).Error
+		}
+		return nil
+	}); err != nil {
 		_ = s.avatarStorage.Delete(context.Background(), stored.Key)
 		return "", fmt.Errorf("update avatar: %w", err)
 	}
 
-	if oldKey, ok := avatarStorageKey(user.Avatar); ok && oldKey != stored.Key {
+	if oldKey, ok := avatarStorageKey(oldAvatarURL); ok && oldKey != stored.Key {
 		_ = s.avatarStorage.Delete(context.Background(), oldKey)
 	}
 	return avatarURL, nil

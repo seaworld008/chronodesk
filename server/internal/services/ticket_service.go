@@ -1564,7 +1564,7 @@ func bulkTicketChanges(req *BulkUpdateRequest) (map[string]any, []string, error)
 	}
 	changes, fields, err := sanitizeTicketChanges(raw)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", ErrInvalidBulkTicketUpdate, err)
+		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidBulkTicketUpdate, err)
 	}
 	return changes, fields, nil
 }

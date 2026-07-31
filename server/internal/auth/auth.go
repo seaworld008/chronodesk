@@ -233,12 +233,10 @@ type ResendVerificationRequest struct {
 
 // UpdateProfileRequest 更新用户资料请求
 type UpdateProfileRequest struct {
-	FirstName   *string `json:"first_name,omitempty"`
-	LastName    *string `json:"last_name,omitempty"`
-	PhoneNumber *string `json:"phone_number,omitempty"`
-	Avatar      *string `json:"avatar,omitempty"`
-	Timezone    *string `json:"timezone,omitempty"`
-	Language    *string `json:"language,omitempty"`
+	FirstName *string `json:"first_name,omitempty"`
+	LastName  *string `json:"last_name,omitempty"`
+	Timezone  *string `json:"timezone,omitempty"`
+	Language  *string `json:"language,omitempty"`
 }
 
 // VerifyEmailRequest 验证邮箱请求
@@ -1338,12 +1336,6 @@ func (s *AuthService) UpdateProfile(ctx context.Context, userID uint, req *Updat
 	}
 	if req.LastName != nil {
 		profile.LastName = *req.LastName
-	}
-	if req.PhoneNumber != nil {
-		profile.Phone = *req.PhoneNumber
-	}
-	if req.Avatar != nil {
-		profile.Avatar = *req.Avatar
 	}
 	if req.Timezone != nil {
 		profile.Timezone = *req.Timezone

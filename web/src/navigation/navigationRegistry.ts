@@ -7,6 +7,7 @@ import {
 import {
     hasProjectCapability,
     parseProjectRole,
+    projectRoleValues,
     type ProjectCapability,
     type ProjectRole,
 } from '@/lib/projectScope'
@@ -40,6 +41,30 @@ export type NavigationRoles =
     | { kind: 'project'; values: readonly ProjectRole[] }
     | null
 
+export type CustomNavigationComponent =
+    | 'workbench'
+    | 'automationIndex'
+    | 'agentControl'
+    | 'webhookSettings'
+    | 'integrationRuntime'
+    | 'projectMemberships'
+    | 'platformProjects'
+    | 'platformAudit'
+    | 'platformConfig'
+    | 'platformEmail'
+    | 'accountProfile'
+    | 'accountSecurity'
+    | 'trustedDevices'
+    | 'loginHistory'
+
+export type NavigationRouteContract =
+    | { kind: 'existing' }
+    | {
+        kind: 'custom'
+        component: CustomNavigationComponent
+        legacyPaths?: readonly string[]
+    }
+
 interface NavigationNodeBase {
     id: string
     label: string
@@ -55,6 +80,7 @@ export interface NavigationLeafNode extends NavigationNodeBase {
     kind: 'leaf'
     path: string
     activePathPrefixes: readonly string[]
+    route: NavigationRouteContract
     children?: never
 }
 
@@ -68,8 +94,15 @@ export type NavigationNode = NavigationGroupNode | NavigationLeafNode
 
 const leaf = (
     placement: NavigationPlacement,
-    node: Omit<NavigationLeafNode, 'kind' | 'placement'>,
-): NavigationLeafNode => ({ kind: 'leaf', placement, ...node })
+    node: Omit<NavigationLeafNode, 'kind' | 'placement' | 'route'> & {
+        route?: NavigationRouteContract
+    },
+): NavigationLeafNode => ({
+    kind: 'leaf',
+    placement,
+    route: { kind: 'existing' },
+    ...node,
+})
 
 export const navigationRegistry: readonly NavigationNode[] = [
     {
@@ -94,6 +127,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 capability: null,
                 roles: null,
                 icon: 'workbench',
+                route: { kind: 'custom', component: 'workbench' },
             }),
         ],
     },
@@ -166,6 +200,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 capability: { kind: 'project', value: 'manage_agents' },
                 roles: { kind: 'project', values: ['project_admin'] },
                 icon: 'agents',
+                route: { kind: 'custom', component: 'agentControl' },
             }),
             leaf('sidebar', {
                 id: 'automation',
@@ -181,6 +216,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 capability: { kind: 'project', value: 'manage_automation' },
                 roles: null,
                 icon: 'automation',
+                route: { kind: 'custom', component: 'automationIndex' },
             }),
         ],
     },
@@ -206,6 +242,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 capability: { kind: 'project', value: 'manage_integrations' },
                 roles: null,
                 icon: 'webhook',
+                route: { kind: 'custom', component: 'webhookSettings' },
             }),
             leaf('sidebar', {
                 id: 'integration-runtime',
@@ -217,6 +254,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 capability: { kind: 'project', value: 'manage_agents' },
                 roles: { kind: 'project', values: ['project_admin'] },
                 icon: 'integrationRuntime',
+                route: { kind: 'custom', component: 'integrationRuntime' },
             }),
         ],
     },
@@ -242,6 +280,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 capability: { kind: 'project', value: 'manage_memberships' },
                 roles: { kind: 'project', values: ['project_admin'] },
                 icon: 'memberships',
+                route: { kind: 'custom', component: 'projectMemberships' },
             }),
         ],
     },
@@ -267,6 +306,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 capability: null,
                 roles: { kind: 'platform', values: ['platform_admin'] },
                 icon: 'projects',
+                route: { kind: 'custom', component: 'platformProjects' },
             }),
             leaf('sidebar', {
                 id: 'users',
@@ -280,37 +320,62 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 icon: 'users',
             }),
             leaf('sidebar', {
-                id: 'platform-config',
-                label: '公共配置',
-                path: '/system-settings',
-                activePathPrefixes: ['/system-settings'],
-                order: 30,
-                scope: 'platform',
-                capability: { kind: 'platform', value: 'manage_platform_settings' },
-                roles: null,
-                icon: 'settings',
-            }),
-            leaf('sidebar', {
-                id: 'system-settings',
-                label: '系统设置',
-                path: '/system-settings/email',
-                activePathPrefixes: ['/system-settings/email', '/email-settings'],
-                order: 40,
-                scope: 'platform',
-                capability: { kind: 'platform', value: 'manage_email_settings' },
-                roles: null,
-                icon: 'settings',
-            }),
-            leaf('sidebar', {
                 id: 'platform-audit',
                 label: '审计中心',
                 path: '/platform/audit',
                 activePathPrefixes: ['/platform/audit'],
-                order: 50,
+                order: 30,
                 scope: 'platform',
                 capability: { kind: 'platform', value: 'view_platform_audit' },
                 roles: null,
                 icon: 'audit',
+                route: { kind: 'custom', component: 'platformAudit' },
+            }),
+        ],
+    },
+    {
+        kind: 'group',
+        id: 'system-settings',
+        label: '系统设置',
+        icon: 'settings',
+        order: 70,
+        scope: 'platform',
+        capability: null,
+        roles: null,
+        path: null,
+        placement: 'sidebar',
+        children: [
+            leaf('sidebar', {
+                id: 'platform-config',
+                label: '公共配置',
+                path: '/system-settings',
+                activePathPrefixes: ['/system-settings'],
+                order: 10,
+                scope: 'platform',
+                capability: { kind: 'platform', value: 'manage_platform_settings' },
+                roles: null,
+                icon: 'settings',
+                route: {
+                    kind: 'custom',
+                    component: 'platformConfig',
+                    legacyPaths: ['/system-settings/overview'],
+                },
+            }),
+            leaf('sidebar', {
+                id: 'platform-email-settings',
+                label: '邮件外发',
+                path: '/system-settings/email',
+                activePathPrefixes: ['/system-settings/email', '/email-settings'],
+                order: 20,
+                scope: 'platform',
+                capability: { kind: 'platform', value: 'manage_email_settings' },
+                roles: null,
+                icon: 'notifications',
+                route: {
+                    kind: 'custom',
+                    component: 'platformEmail',
+                    legacyPaths: ['/email-settings'],
+                },
             }),
         ],
     },
@@ -327,26 +392,52 @@ export const navigationRegistry: readonly NavigationNode[] = [
         placement: 'account',
         children: [
             leaf('account', {
-                id: 'trusted-devices',
-                label: '可信设备',
-                path: '/account/trusted-devices',
-                activePathPrefixes: ['/account/trusted-devices'],
+                id: 'account-profile',
+                label: '个人资料',
+                path: '/account/profile',
+                activePathPrefixes: ['/account/profile'],
                 order: 10,
                 scope: 'global',
                 capability: null,
                 roles: null,
+                icon: 'users',
+                route: { kind: 'custom', component: 'accountProfile' },
+            }),
+            leaf('account', {
+                id: 'account-security',
+                label: '账号安全',
+                path: '/account/security',
+                activePathPrefixes: ['/account/security'],
+                order: 20,
+                scope: 'global',
+                capability: null,
+                roles: null,
                 icon: 'security',
+                route: { kind: 'custom', component: 'accountSecurity' },
+            }),
+            leaf('account', {
+                id: 'trusted-devices',
+                label: '可信设备',
+                path: '/account/trusted-devices',
+                activePathPrefixes: ['/account/trusted-devices'],
+                order: 30,
+                scope: 'global',
+                capability: null,
+                roles: null,
+                icon: 'security',
+                route: { kind: 'custom', component: 'trustedDevices' },
             }),
             leaf('account', {
                 id: 'login-history',
                 label: '登录历史',
                 path: '/account/login-history',
                 activePathPrefixes: ['/account/login-history'],
-                order: 20,
+                order: 40,
                 scope: 'global',
                 capability: null,
                 roles: null,
                 icon: 'loginHistory',
+                route: { kind: 'custom', component: 'loginHistory' },
             }),
         ],
     },
@@ -354,6 +445,56 @@ export const navigationRegistry: readonly NavigationNode[] = [
 
 const allowedScopes = new Set(['global', 'project', 'platform'])
 const allowedPlacements = new Set(['sidebar', 'account'])
+const allowedIcons = new Set<NavigationIcon>([
+    'home', 'workbench', 'tickets', 'notifications', 'automation', 'agents',
+    'webhook', 'integrationRuntime', 'memberships', 'users', 'projects',
+    'settings', 'audit', 'security', 'loginHistory',
+])
+const allowedPlatformCapabilities = new Set<PlatformCapability>([
+    'manage_platform_users',
+    'manage_platform_settings',
+    'manage_email_settings',
+    'view_platform_audit',
+    'operate_emergency_controls',
+])
+const allowedProjectCapabilities = new Set<ProjectCapability>([
+    'view_project',
+    'create_ticket',
+    'edit_ticket_safe_fields',
+    'manage_ticket_workflow',
+    'assign_ticket',
+    'delete_ticket',
+    'write_public_content',
+    'write_internal_content',
+    'manage_notifications',
+    'manage_automation',
+    'manage_integrations',
+    'manage_memberships',
+    'manage_agents',
+])
+const allowedPlatformRoles = new Set<PlatformRole>([
+    'platform_admin',
+    'security_auditor',
+    'emergency_operator',
+    'member',
+])
+const allowedProjectRoles = new Set<ProjectRole>(projectRoleValues)
+const allowedCustomComponents = new Set<CustomNavigationComponent>([
+    'workbench',
+    'automationIndex',
+    'agentControl',
+    'webhookSettings',
+    'integrationRuntime',
+    'projectMemberships',
+    'platformProjects',
+    'platformAudit',
+    'platformConfig',
+    'platformEmail',
+    'accountProfile',
+    'accountSecurity',
+    'trustedDevices',
+    'loginHistory',
+])
 const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === 'object' && value !== null
 
@@ -363,7 +504,11 @@ export const validateNavigationRegistry = (value: unknown): string[] => {
     const paths = new Set<string>()
     const visiting = new WeakSet<object>()
 
-    const visit = (node: unknown, depth: number) => {
+    const visit = (
+        node: unknown,
+        depth: number,
+        parent?: Record<string, unknown>,
+    ) => {
         if (!isRecord(node)) {
             errors.push('导航节点必须是对象')
             return
@@ -382,6 +527,21 @@ export const validateNavigationRegistry = (value: unknown): string[] => {
         if (!allowedPlacements.has(String(node.placement))) {
             errors.push(`导航节点 ${id} 的 placement 非法`)
         }
+        if (!allowedIcons.has(node.icon as NavigationIcon)) {
+            errors.push(`导航节点 ${id} 的 icon 非法`)
+        }
+        if (
+            typeof node.order !== 'number' ||
+            !Number.isSafeInteger(node.order) ||
+            node.order <= 0
+        ) errors.push(`导航节点 ${id} 的 order 非法`)
+        if (
+            parent &&
+            (
+                node.scope !== parent.scope ||
+                node.placement !== parent.placement
+            )
+        ) errors.push(`导航节点 ${id} 与 parent 的 scope/placement 不一致`)
         const capability = node.capability
         if (
             capability !== null &&
@@ -390,10 +550,18 @@ export const validateNavigationRegistry = (value: unknown): string[] => {
                 !['project', 'platform'].includes(String(capability.kind))
             )
         ) errors.push(`导航节点 ${id} 的 capability 非法`)
-        else if (isRecord(capability) && (
-            (capability.kind === 'project' && scope !== 'project') ||
-            (capability.kind === 'platform' && scope !== 'platform')
-        )) errors.push(`导航节点 ${id} 的 capability 与 scope 不匹配`)
+        else if (isRecord(capability)) {
+            if (
+                (capability.kind === 'project' && scope !== 'project') ||
+                (capability.kind === 'platform' && scope !== 'platform')
+            ) errors.push(`导航节点 ${id} 的 capability 与 scope 不匹配`)
+            const allowed = capability.kind === 'project'
+                ? allowedProjectCapabilities
+                : allowedPlatformCapabilities
+            if (!allowed.has(capability.value as never)) {
+                errors.push(`导航节点 ${id} 的 capability value 非法`)
+            }
+        }
         const roles = node.roles
         if (
             roles !== null &&
@@ -403,10 +571,20 @@ export const validateNavigationRegistry = (value: unknown): string[] => {
                 !Array.isArray(roles.values)
             )
         ) errors.push(`导航节点 ${id} 的 roles 非法`)
-        else if (isRecord(roles) && (
-            (roles.kind === 'project' && scope !== 'project') ||
-            (roles.kind === 'platform' && scope !== 'platform')
-        )) errors.push(`导航节点 ${id} 的 roles 与 scope 不匹配`)
+        else if (isRecord(roles)) {
+            if (
+                (roles.kind === 'project' && scope !== 'project') ||
+                (roles.kind === 'platform' && scope !== 'platform')
+            ) errors.push(`导航节点 ${id} 的 roles 与 scope 不匹配`)
+            const allowed = roles.kind === 'project'
+                ? allowedProjectRoles
+                : allowedPlatformRoles
+            if (
+                (roles.values as unknown[]).some((role) =>
+                    !allowed.has(role as never),
+                )
+            ) errors.push(`导航节点 ${id} 包含非法 role`)
+        }
 
         if (node.kind === 'group') {
             if (depth !== 0) errors.push(`导航分组 ${id} 只能位于第一层`)
@@ -414,7 +592,7 @@ export const validateNavigationRegistry = (value: unknown): string[] => {
             if (!Array.isArray(node.children) || node.children.length === 0) {
                 errors.push(`导航分组 ${id} 必须至少包含一个 leaf`)
             } else {
-                for (const child of node.children) visit(child, depth + 1)
+                for (const child of node.children) visit(child, depth + 1, node)
             }
         } else if (node.kind === 'leaf') {
             if (depth > 1) errors.push(`导航 leaf ${id} 最多只能位于第二层`)
@@ -423,10 +601,51 @@ export const validateNavigationRegistry = (value: unknown): string[] => {
             if (!path.startsWith('/')) errors.push(`导航 leaf ${id} 的 path 非法`)
             else if (paths.has(path)) errors.push(`导航 path 重复：${path}`)
             else paths.add(path)
+            const route = node.route
+            if (
+                !isRecord(route) ||
+                !['existing', 'custom'].includes(String(route.kind))
+            ) errors.push(`导航 leaf ${id} 的 route contract 非法`)
+            else if (
+                route.kind === 'custom' &&
+                !allowedCustomComponents.has(
+                    route.component as CustomNavigationComponent,
+                )
+            ) errors.push(`导航 leaf ${id} 的 component mapping 非法`)
+            else if (
+                route.kind === 'custom' &&
+                route.legacyPaths !== undefined
+            ) {
+                if (!Array.isArray(route.legacyPaths)) {
+                    errors.push(`导航 leaf ${id} 的 legacyPaths 非法`)
+                } else {
+                    for (const legacyPath of route.legacyPaths) {
+                        if (
+                            typeof legacyPath !== 'string' ||
+                            !legacyPath.startsWith('/')
+                        ) {
+                            errors.push(`导航 leaf ${id} 包含非法 legacy path`)
+                        } else if (paths.has(legacyPath)) {
+                            errors.push(`导航 path 重复：${legacyPath}`)
+                        } else {
+                            paths.add(legacyPath)
+                        }
+                    }
+                }
+            }
             if (
                 !Array.isArray(node.activePathPrefixes) ||
                 node.activePathPrefixes.length === 0
             ) errors.push(`导航 leaf ${id} 必须声明 activePathPrefixes`)
+            else if (
+                node.activePathPrefixes.some((prefix) =>
+                    typeof prefix !== 'string' || !prefix.startsWith('/'),
+                )
+            ) errors.push(`导航 leaf ${id} 包含非法 active path`)
+            else if (
+                new Set(node.activePathPrefixes).size !==
+                node.activePathPrefixes.length
+            ) errors.push(`导航 leaf ${id} 的 active path 重复`)
         } else {
             errors.push(`导航节点 ${id || '(unknown)'} 的 kind 非法`)
         }

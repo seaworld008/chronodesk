@@ -20,6 +20,7 @@ import {
 } from '@mui/material'
 import {
   History as HistoryIcon,
+  Person as PersonIcon,
   Security as SecurityIcon,
 } from '@mui/icons-material'
 import {
@@ -57,6 +58,7 @@ const LogoutAllMenuItem: React.FC = () => {
 }
 
 const accountIcons = {
+  users: <PersonIcon fontSize="small" />,
   security: <SecurityIcon fontSize="small" />,
   loginHistory: <HistoryIcon fontSize="small" />,
 }

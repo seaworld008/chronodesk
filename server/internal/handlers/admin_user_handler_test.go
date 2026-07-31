@@ -148,6 +148,23 @@ func TestAdminUserUpdateAllowsClearingPhoneAndEmailVerification(t *testing.T) {
 		)
 	}
 
+	avatarRequest := httptest.NewRequest(
+		http.MethodPut,
+		fmt.Sprintf("/users/%d", user.ID),
+		bytes.NewBufferString(`{"avatar":"https://example.test/untrusted.png"}`),
+	)
+	avatarRequest.Header.Set("Content-Type", "application/json")
+	avatarResponse := httptest.NewRecorder()
+	router.ServeHTTP(avatarResponse, avatarRequest)
+	if avatarResponse.Code != http.StatusBadRequest {
+		t.Fatalf(
+			"avatar status = %d, want %d; body=%s",
+			avatarResponse.Code,
+			http.StatusBadRequest,
+			avatarResponse.Body.String(),
+		)
+	}
+
 	for _, historicalRole := range []string{"user", "superuser"} {
 		roleRequest := httptest.NewRequest(
 			http.MethodPut,

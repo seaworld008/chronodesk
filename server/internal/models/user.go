@@ -157,7 +157,6 @@ type UserUpdateRequest struct {
 	FirstName     *string       `json:"first_name" binding:"omitempty,max=50"`
 	LastName      *string       `json:"last_name" binding:"omitempty,max=50"`
 	DisplayName   *string       `json:"display_name" binding:"omitempty,max=100"`
-	Avatar        *string       `json:"avatar"`
 	Timezone      *string       `json:"timezone" binding:"omitempty,max=50"`
 	Language      *string       `json:"language" binding:"omitempty,max=10"`
 	PlatformRole  *PlatformRole `json:"platform_role" binding:"omitempty,oneof=platform_admin security_auditor emergency_operator member"`

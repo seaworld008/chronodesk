@@ -301,12 +301,6 @@ const UserEdit: React.FC = () => {
                                             </Box>
                                         </Box>
                                         
-                                        <TextInput
-                                            source="avatar"
-                                            label="头像URL"
-                                            fullWidth
-                                            helperText="头像图片的网络地址"
-                                        />
                                     </Box>
                                 </CardContent>
                             </Card>

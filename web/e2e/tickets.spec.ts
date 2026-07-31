@@ -121,11 +121,11 @@ test.describe('Navigation', () => {
     });
 
     test('should navigate to system settings', async ({ page }) => {
-        const governance = page.getByRole('button', { name: /^治理中心/ });
-        if ((await governance.getAttribute('aria-expanded')) !== 'true') {
-            await governance.click();
+        const settings = page.getByRole('button', { name: /^系统设置/ });
+        if ((await settings.getAttribute('aria-expanded')) !== 'true') {
+            await settings.click();
         }
-        await page.getByRole('menuitem', { name: '系统设置' }).click();
+        await page.getByRole('menuitem', { name: '邮件外发' }).click();
         await expect(page).toHaveURL(/#\/system-settings\/email/);
     });
 });

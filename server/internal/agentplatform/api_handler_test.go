@@ -270,6 +270,31 @@ func TestWriteNativeProblemRejectsEmptyAttachmentWithStableContract(t *testing.T
 	}
 }
 
+func TestInvalidTicketTagsUseStableRESTAndMCPContracts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	err := fmt.Errorf("%w: each tag must contain at most 50 characters", services.ErrInvalidTicketTags)
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPatch, "/agent/tickets/1", nil)
+	writeNativeProblem(context, err)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+	var problem Problem
+	if decodeErr := json.Unmarshal(recorder.Body.Bytes(), &problem); decodeErr != nil {
+		t.Fatalf("decode problem response: %v", decodeErr)
+	}
+	if problem.Code != "invalid_request" || problem.Retryable {
+		t.Fatalf("unexpected REST problem: %+v", problem)
+	}
+
+	mcpProblem := backendError(err)
+	if mcpProblem.Code != "invalid_argument" || mcpProblem.Retryable {
+		t.Fatalf("unexpected MCP problem: %+v", mcpProblem)
+	}
+}
+
 func TestListTicketsFiltersEachResourcePolicy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))

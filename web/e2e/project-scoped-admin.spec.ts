@@ -448,7 +448,7 @@ const expectMenuItem = async (
 ) => {
     const navigationNames: Record<string, { group: string; leaf: string }> = {
         平台用户管理: { group: '治理中心', leaf: '平台身份与访问' },
-        系统设置: { group: '治理中心', leaf: '系统设置' },
+        系统设置: { group: '系统设置', leaf: '公共配置' },
         平台审计: { group: '治理中心', leaf: '审计中心' },
         工单管理: { group: '项目运营', leaf: '工单管理' },
         通知中心: { group: '项目运营', leaf: '项目通知' },

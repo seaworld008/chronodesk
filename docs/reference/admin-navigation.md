@@ -12,20 +12,25 @@ ChronoDesk 管理端侧栏是一棵连续的企业功能树。导航数据只在
 4. 集成中心
 5. 项目配置
 6. 治理中心
+7. 系统设置
 
 一级节点使用相同视觉样式，不渲染“我的工作”“平台管理”等分区标题或分隔卡。
-一级节点点击只展开或收起二级列表；当前路由所在分组会强制保持展开，同时保留用户
-手动展开的其他分组。当前只有一个“跨项目工作台”子项，后续运营大屏实现后只需
-在该分组登记新的 leaf，不能提前登记死链。
+children 多于一个的一级节点点击只展开或收起二级列表；只有一个 child 时，通用
+renderer 将一级节点直接渲染为该 child 的链接。当前路由所在多子项分组会强制保持
+展开，同时保留用户手动展开的其他分组。工作台当前只有“跨项目工作台”，因此直接
+导航；后续运营大屏实现后只需在该分组登记新的 leaf，renderer 会自然切换为
+Collapse，不能提前登记死链。
 
 项目运营、智能运营、集成中心和项目配置都要求已解析的 `ProjectScope`。没有
-当前项目时，这些分组整体隐藏。治理中心只承载平台面功能；平台角色不能推导项目
-scope 或项目职责。
+当前项目时，这些分组整体隐藏。治理中心只承载项目治理、平台身份与访问、审计和
+已有的安全应急入口；系统设置作为独立一级，只承载真实的平台公共配置、邮件外发等
+路由。平台角色不能推导项目 scope 或项目职责。
 
 ## 节点模板
 
 registry 使用 `kind: 'group' | 'leaf'` 判别联合。当前 UX 最多两层，group 只能
-包含 leaf。
+包含 leaf。每个 leaf 的 `route` 同时声明 `existing` 或 custom component mapping；
+custom route、guard 和旧 URL redirect 都从同一 contract 生成。
 
 ```ts
 {
@@ -55,6 +60,7 @@ registry 使用 `kind: 'group' | 'leaf'` 判别联合。当前 UX 最多两层�
             placement: 'sidebar',
             path: '/project-examples',
             activePathPrefixes: ['/project-examples'],
+            route: { kind: 'existing' },
         },
     ],
 }
@@ -66,14 +72,16 @@ registry 使用 `kind: 'group' | 'leaf'` 判别联合。当前 UX 最多两层�
 
 ## 路由和权限边界
 
-registry 只决定入口是否可见，route guard 始终是授权权威。新增入口时必须同步
-登记受保护 route，且不能因为平台角色显示入口而构造 `ProjectScope`。旧 URL
-兼容应在 route 层做受相同 capability 保护的 `Navigate replace`，保留一个版本，
-不要在 renderer 写别名判断。
+registry 同时提供入口可见性与 custom route guard contract，route guard 始终是
+授权权威。新增 custom 页面只登记 leaf 的 path/scope/capability/roles/route，
+并在 exhaustive component map 提供组件，不能因为平台角色显示入口而构造
+`ProjectScope`。旧 URL 写在同一 leaf 的 `legacyPaths`，由相同 guard 生成
+`Navigate replace`，保留一个版本，不在 renderer 写别名判断。React Admin
+Resource 仍由框架注册，但测试必须逐项核对其 registry contract。
 
-展开状态使用版本化 key，并绑定现有认证会话公开的 `subject + session_id`。只
-持久化当前 registry 中合法的 group ID；换账号、换会话不会复用，已删除的 group
-ID 会在读取和写入时丢弃。
+展开状态使用版本化 key，并绑定现有认证会话公开的 `subject + session_id`。合法
+group ID 始终来自完整 registry，而非异步权限过滤后的首屏子集；换账号、换会话
+不会复用，已删除的 group ID 会在读取和写入时丢弃，新增 group 与旧状态安全合并。
 
 ## 自动校验与测试
 

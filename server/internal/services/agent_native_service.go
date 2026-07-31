@@ -6851,7 +6851,11 @@ func sanitizeTicketChanges(input map[string]any) (map[string]any, []string, erro
 			if err := json.Unmarshal(encoded, &tags); err != nil {
 				return nil, nil, fmt.Errorf("decode tags: %w", err)
 			}
-			value = datatypes.NewJSONSlice(tags)
+			normalizedTags, err := normalizeTicketTags(tags)
+			if err != nil {
+				return nil, nil, err
+			}
+			value = datatypes.NewJSONSlice([]string(normalizedTags))
 		}
 		changes[field] = value
 		fields = append(fields, field)

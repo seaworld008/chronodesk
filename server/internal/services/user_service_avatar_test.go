@@ -50,7 +50,7 @@ func validAvatarPNG(t *testing.T) []byte {
 
 func TestUploadAvatarPersistsSanitizedObjectAndReplacesPreviousObject(t *testing.T) {
 	db := openTestDB(t)
-	if err := db.AutoMigrate(&models.User{}); err != nil {
+	if err := db.AutoMigrate(&models.User{}, &models.UserProfile{}); err != nil {
 		t.Fatal(err)
 	}
 	user := models.User{
@@ -75,6 +75,22 @@ func TestUploadAvatarPersistsSanitizedObjectAndReplacesPreviousObject(t *testing
 	}
 	if !strings.HasPrefix(firstURL, "/uploads/avatars/") || !strings.HasSuffix(firstURL, ".png") {
 		t.Fatalf("avatar URL must use detected format and opaque key: %q", firstURL)
+	}
+	var storedUser models.User
+	var storedProfile models.UserProfile
+	if err := db.First(&storedUser, user.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Where("user_id = ?", user.ID).First(&storedProfile).Error; err != nil {
+		t.Fatal(err)
+	}
+	if storedUser.Avatar != firstURL || storedProfile.Avatar != firstURL {
+		t.Fatalf(
+			"avatar projections diverged: user=%q profile=%q want=%q",
+			storedUser.Avatar,
+			storedProfile.Avatar,
+			firstURL,
+		)
 	}
 
 	filename := firstURL[strings.LastIndex(firstURL, "/")+1:]
@@ -111,7 +127,7 @@ func TestUploadAvatarPersistsSanitizedObjectAndReplacesPreviousObject(t *testing
 
 func TestUploadAvatarRejectsSpoofedAndOversizedPayloads(t *testing.T) {
 	db := openTestDB(t)
-	if err := db.AutoMigrate(&models.User{}); err != nil {
+	if err := db.AutoMigrate(&models.User{}, &models.UserProfile{}); err != nil {
 		t.Fatal(err)
 	}
 	user := models.User{

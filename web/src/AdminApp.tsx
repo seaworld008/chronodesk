@@ -87,8 +87,11 @@ import LoginPage from './components/auth/LoginPage'
 import { AppNotification } from './components/layout/AppNotification'
 import { i18nProvider, muiZhCN } from './i18n'
 import {
+    navigationRegistry,
     visibleNavigationNodes,
+    type CustomNavigationComponent,
     type NavigationIcon,
+    type NavigationLeafNode,
 } from './navigation/navigationRegistry'
 import {
     expandActiveNavigationGroup,
@@ -161,6 +164,8 @@ const WebhookSettings = lazyPage(() => import('./admin/settings/WebhookSettings'
 const SystemSettings = lazyPage(() => import('./admin/settings/SystemSettings'))
 const TrustedDevices = lazyPage(() => import('./admin/security/TrustedDevices'))
 const LoginHistory = lazyPage(() => import('./admin/security/LoginHistory'))
+const AccountProfile = lazyPage(() => import('./admin/security/AccountProfile'))
+const AccountSecurity = lazyPage(() => import('./admin/security/AccountSecurity'))
 const AgentControlCenter = lazyPage(
     () => import('./admin/agents/AgentControlCenter'),
 )
@@ -311,15 +316,6 @@ export const PlatformCapabilityRoute = ({
     if (
         !hasPlatformCapability(permissions?.platform_role, capability)
     ) {
-        return <Navigate to="/" replace />
-    }
-    return <>{children}</>
-}
-
-const PlatformAdminRoute = ({ children }: React.PropsWithChildren) => {
-    const { permissions, isPending } = usePermissions<AccessPermissions>()
-    if (isPending) return <PageLoading />
-    if (parsePlatformRole(permissions?.platform_role) !== 'platform_admin') {
         return <Navigate to="/" replace />
     }
     return <>{children}</>
@@ -641,6 +637,104 @@ const navigationIcons: Record<NavigationIcon, React.ReactElement> = {
     loginHistory: <HistoryIcon />,
 }
 
+const customNavigationComponents: Record<
+    CustomNavigationComponent,
+    React.ComponentType
+> = {
+    workbench: CrossProjectWorkbench,
+    automationIndex: () => <Navigate to="/automation-rules" replace />,
+    agentControl: AgentControlCenter,
+    webhookSettings: WebhookSettings,
+    integrationRuntime: IntegrationRuntime,
+    projectMemberships: ProjectMembershipPage,
+    platformProjects: PlatformProjectGovernancePage,
+    platformAudit: PlatformAuditPage,
+    platformConfig: SystemSettings,
+    platformEmail: EmailSettings,
+    accountProfile: AccountProfile,
+    accountSecurity: AccountSecurity,
+    trustedDevices: TrustedDevices,
+    loginHistory: LoginHistory,
+}
+
+const customNavigationLeaves = navigationRegistry.flatMap((node) =>
+    node.kind === 'leaf'
+        ? node.route.kind === 'custom' ? [node] : []
+        : node.children.filter((child) => child.route.kind === 'custom'),
+)
+
+const PlatformNavigationRoute = ({
+    node,
+    children,
+}: React.PropsWithChildren<{ node: NavigationLeafNode }>) => {
+    const { permissions, isPending } = usePermissions<AccessPermissions>()
+    if (isPending) return <PageLoading />
+    const role = parsePlatformRole(permissions?.platform_role)
+    const allowedRoles = node.roles?.kind === 'platform'
+        ? node.roles.values
+        : null
+    const capability = node.capability?.kind === 'platform'
+        ? node.capability.value
+        : null
+    if (
+        role === null ||
+        (allowedRoles && !allowedRoles.includes(role)) ||
+        (capability && !hasPlatformCapability(role, capability))
+    ) {
+        return <Navigate to="/" replace />
+    }
+    return <>{children}</>
+}
+
+const NavigationContractGuard = ({
+    node,
+    children,
+}: React.PropsWithChildren<{ node: NavigationLeafNode }>) => {
+    if (node.scope === 'project') {
+        return (
+            <ExactProjectRoleRoute
+                roles={
+                    node.roles?.kind === 'project'
+                        ? node.roles.values
+                        : projectRoleValues
+                }
+                capability={
+                    node.capability?.kind === 'project'
+                        ? node.capability.value
+                        : undefined
+                }
+            >
+                {children}
+            </ExactProjectRoleRoute>
+        )
+    }
+    if (node.scope === 'platform') {
+        return (
+            <PlatformNavigationRoute node={node}>
+                {children}
+            </PlatformNavigationRoute>
+        )
+    }
+    return <>{children}</>
+}
+
+const navigationRouteElement = (
+    node: NavigationLeafNode,
+    legacy = false,
+) => {
+    if (node.route.kind !== 'custom') return null
+    const Component = customNavigationComponents[node.route.component]
+    return (
+        <NavigationContractGuard node={node}>
+            {legacy ? <Navigate to={node.path} replace /> : <Component />}
+        </NavigationContractGuard>
+    )
+}
+
+const persistedNavigationGroupIDs = validNavigationGroupIDs(
+    navigationRegistry.filter((node) => node.placement === 'sidebar'),
+)
+
 const useNavigationTreeState = (
     nodes: ReturnType<typeof visibleNavigationNodes>,
 ) => {
@@ -655,20 +749,20 @@ const useNavigationTreeState = (
         [sessionID, sessionSubject],
     )
     const bindingKey = binding ? navigationStateStorageKey(binding) : ''
-    const groupIDs = React.useMemo(
-        () => validNavigationGroupIDs(nodes),
-        [nodes],
-    )
     const activeGroupID = React.useMemo(
         () => findActiveNavigationGroupID(nodes, pathname),
         [nodes, pathname],
     )
     const loadState = React.useCallback(() => {
         const stored = binding
-            ? loadNavigationGroupState(localStorage, binding, groupIDs)
+            ? loadNavigationGroupState(
+                localStorage,
+                binding,
+                persistedNavigationGroupIDs,
+            )
             : {}
         return expandActiveNavigationGroup(stored, activeGroupID)
-    }, [activeGroupID, binding, groupIDs])
+    }, [activeGroupID, binding])
     const [expanded, setExpanded] =
         React.useState<NavigationGroupState>(loadState)
     const loadedBindingKey = React.useRef(bindingKey)
@@ -690,12 +784,12 @@ const useNavigationTreeState = (
                     localStorage,
                     binding,
                     next,
-                    groupIDs,
+                    persistedNavigationGroupIDs,
                 )
             }
             return next
         })
-    }, [activeGroupID, binding, groupIDs])
+    }, [activeGroupID, binding])
 
     const toggleGroup = React.useCallback((groupID: string) => {
         setExpanded((current) => {
@@ -709,12 +803,12 @@ const useNavigationTreeState = (
                     localStorage,
                     binding,
                     next,
-                    groupIDs,
+                    persistedNavigationGroupIDs,
                 )
             }
             return next
         })
-    }, [activeGroupID, binding, groupIDs])
+    }, [activeGroupID, binding])
 
     return { activeGroupID, expanded, pathname, toggleGroup }
 }
@@ -749,6 +843,25 @@ const CustomMenu: React.FC = () => {
                         <Menu.Item
                             key={node.id}
                             to={node.path}
+                            primaryText={node.label}
+                            leftIcon={navigationIcons[node.icon]}
+                            aria-current={active ? 'page' : undefined}
+                            sx={{
+                                py: 0.75,
+                                bgcolor: active
+                                    ? 'action.selected'
+                                    : undefined,
+                            }}
+                        />
+                    )
+                }
+                if (node.children.length === 1) {
+                    const child = node.children[0]
+                    const active = isNavigationItemActive(child, pathname)
+                    return (
+                        <Menu.Item
+                            key={node.id}
+                            to={child.path}
                             primaryText={node.label}
                             leftIcon={navigationIcons[node.icon]}
                             aria-current={active ? 'page' : undefined}
@@ -984,121 +1097,23 @@ const AdminApp: React.FC = () => (
         />
 
         <CustomRoutes>
-            <Route
-                path="/workbench"
-                element={<CrossProjectWorkbench />}
-            />
-            <Route
-                path="/system-settings"
-                element={
-                    <PlatformCapabilityRoute capability="manage_platform_settings">
-                        <SystemSettings />
-                    </PlatformCapabilityRoute>
-                }
-            />
-            <Route
-                path="/system-settings/email"
-                element={
-                    <PlatformCapabilityRoute capability="manage_email_settings">
-                        <EmailSettings />
-                    </PlatformCapabilityRoute>
-                }
-            />
-            <Route
-                path="/email-settings"
-                element={
-                    <PlatformCapabilityRoute capability="manage_email_settings">
-                        <Navigate to="/system-settings/email" replace />
-                    </PlatformCapabilityRoute>
-                }
-            />
-            <Route
-                path="/system-settings/overview"
-                element={
-                    <PlatformCapabilityRoute capability="manage_platform_settings">
-                        <Navigate to="/system-settings" replace />
-                    </PlatformCapabilityRoute>
-                }
-            />
-            <Route
-                path="/automation"
-                element={
-                    <ExactProjectRoleRoute
-                        roles={projectRoleValues}
-                        capability="manage_automation"
-                    >
-                        <Navigate to="/automation-rules" replace />
-                    </ExactProjectRoleRoute>
-                }
-            />
-            <Route
-                path="/platform/audit"
-                element={
-                    <PlatformCapabilityRoute capability="view_platform_audit">
-                        <PlatformAuditPage />
-                    </PlatformCapabilityRoute>
-                }
-            />
-            <Route
-                path="/platform/projects"
-                element={
-                    <PlatformAdminRoute>
-                        <PlatformProjectGovernancePage />
-                    </PlatformAdminRoute>
-                }
-            />
-            <Route
-                path="/webhook-settings"
-                element={
-                    <ExactProjectRoleRoute
-                        roles={projectRoleValues}
-                        capability="manage_integrations"
-                    >
-                        <WebhookSettings />
-                    </ExactProjectRoleRoute>
-                }
-            />
-            <Route
-                path="/project-memberships"
-                element={
-                    <ExactProjectRoleRoute
-                        roles={['project_admin']}
-                        capability="manage_memberships"
-                    >
-                        <ProjectMembershipPage />
-                    </ExactProjectRoleRoute>
-                }
-            />
-            <Route
-                path="/agent-control"
-                element={
-                    <ExactProjectRoleRoute
-                        roles={['project_admin']}
-                        capability="manage_agents"
-                    >
-                        <AgentControlCenter />
-                    </ExactProjectRoleRoute>
-                }
-            />
-            <Route
-                path="/integration-runtime"
-                element={
-                    <ExactProjectRoleRoute
-                        roles={['project_admin']}
-                        capability="manage_agents"
-                    >
-                        <IntegrationRuntime />
-                    </ExactProjectRoleRoute>
-                }
-            />
-            <Route
-                path="/account/trusted-devices"
-                element={<TrustedDevices />}
-            />
-            <Route
-                path="/account/login-history"
-                element={<LoginHistory />}
-            />
+            {customNavigationLeaves.flatMap((node) => {
+                if (node.route.kind !== 'custom') return []
+                return [
+                    <Route
+                        key={node.path}
+                        path={node.path}
+                        element={navigationRouteElement(node)}
+                    />,
+                    ...(node.route.legacyPaths ?? []).map((legacyPath) => (
+                        <Route
+                            key={legacyPath}
+                            path={legacyPath}
+                            element={navigationRouteElement(node, true)}
+                        />
+                    )),
+                ]
+            })}
         </CustomRoutes>
     </Admin>
 )

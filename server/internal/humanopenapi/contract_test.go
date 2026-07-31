@@ -1872,6 +1872,9 @@ func TestAdminUserPhoneAndManagerConstraintsMatchRuntime(t *testing.T) {
 		objectAt(t, schemas, "UpdateAdminUserRequest"),
 		"properties",
 	)
+	if _, exists := update["avatar"]; exists {
+		t.Fatal("UpdateAdminUserRequest must not expose direct avatar writes")
+	}
 	updatePhone := objectAt(t, update, "phone")
 	branches, ok := updatePhone["oneOf"].([]any)
 	if !ok || len(branches) != 3 {

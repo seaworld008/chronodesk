@@ -35,6 +35,7 @@ test('连续功能树按产品顺序输出且不保留视觉分区节点', () =>
         '集成中心',
         '项目配置',
         '治理中心',
+        '系统设置',
     ])
     assert.ok(nodes.every((node) =>
         node.label !== '我的工作' && node.label !== '平台管理',
@@ -52,7 +53,10 @@ test('无当前项目隐藏全部项目树但保留工作台和精确治理入�
         projectRole: null,
         hasProject: false,
     })
-    assert.deepEqual(nodes.map((node) => node.label), ['工作台', '治理中心'])
+    assert.deepEqual(
+        nodes.map((node) => node.label),
+        ['工作台', '治理中心', '系统设置'],
+    )
     assert.ok(nodes.every((node) => node.scope !== 'project'))
 })
 
@@ -80,6 +84,7 @@ test('registry validator 拒绝重复 ID/path、非法 scope、非法 children �
         placement: 'sidebar',
         path: '/same',
         activePathPrefixes: ['/same'],
+        route: { kind: 'existing' },
     }
     const errors = registryModule.validateNavigationRegistry([
         baseLeaf,
@@ -126,6 +131,118 @@ test('registry validator 拒绝重复 ID/path、非法 scope、非法 children �
     )
 })
 
+test('validator 检查 capability/role/icon/order/active path 与 parent taxonomy', () => {
+    const badLeaf = {
+        kind: 'leaf',
+        id: 'bad-taxonomy',
+        label: '非法',
+        icon: 'unknown-icon',
+        order: 0,
+        scope: 'platform',
+        capability: { kind: 'platform', value: 'unknown-capability' },
+        roles: { kind: 'platform', values: ['unknown-role'] },
+        placement: 'account',
+        path: '/bad-taxonomy',
+        activePathPrefixes: ['bad-prefix'],
+        route: { kind: 'custom', component: 'unknown-component' },
+    }
+    const errors = registryModule.validateNavigationRegistry([{
+        kind: 'group',
+        id: 'parent',
+        label: '父级',
+        icon: 'home',
+        order: 1,
+        scope: 'global',
+        capability: null,
+        roles: null,
+        placement: 'sidebar',
+        path: null,
+        children: [badLeaf],
+    }])
+    for (const expected of [
+        'icon 非法',
+        'order 非法',
+        'capability value 非法',
+        '非法 role',
+        'scope/placement 不一致',
+        '非法 active path',
+        'component mapping 非法',
+    ]) {
+        assert.ok(
+            errors.some((error) => error.includes(expected)),
+            `${expected}: ${errors.join('；')}`,
+        )
+    }
+})
+
+test('custom route contract 完整承载 path、权限、角色和兼容重定向', () => {
+    const custom = registryModule.navigationRegistry
+        .flatMap((node) => node.kind === 'leaf' ? [node] : node.children)
+        .filter((node) => node.route.kind === 'custom')
+    assert.deepEqual(
+        custom.map((node) => node.route.component).sort(),
+        [
+            'accountProfile',
+            'accountSecurity',
+            'agentControl',
+            'automationIndex',
+            'integrationRuntime',
+            'loginHistory',
+            'platformAudit',
+            'platformConfig',
+            'platformEmail',
+            'platformProjects',
+            'projectMemberships',
+            'trustedDevices',
+            'webhookSettings',
+            'workbench',
+        ].sort(),
+    )
+    const email = custom.find((node) => node.route.component === 'platformEmail')
+    assert.deepEqual(email.route.legacyPaths, ['/email-settings'])
+    assert.equal(email.scope, 'platform')
+    assert.deepEqual(email.capability, {
+        kind: 'platform',
+        value: 'manage_email_settings',
+    })
+})
+
+test('React Admin Resource 入口与 registry scope/capability 契约一致', () => {
+    const existing = registryModule.navigationRegistry
+        .flatMap((node) => node.kind === 'leaf' ? [node] : node.children)
+        .filter((node) => node.route.kind === 'existing')
+    const contracts = Object.fromEntries(existing.map((node) => [
+        node.id,
+        {
+            path: node.path,
+            scope: node.scope,
+            capability: node.capability,
+            roles: node.roles,
+        },
+    ]))
+    assert.deepEqual(contracts.tickets, {
+        path: '/tickets',
+        scope: 'project',
+        capability: null,
+        roles: null,
+    })
+    assert.deepEqual(contracts.notifications, {
+        path: '/notifications',
+        scope: 'project',
+        capability: null,
+        roles: null,
+    })
+    assert.deepEqual(contracts.users, {
+        path: '/users',
+        scope: 'platform',
+        capability: {
+            kind: 'platform',
+            value: 'manage_platform_users',
+        },
+        roles: null,
+    })
+})
+
 test('未来新增 leaf 只登记 registry 数据即可进入通用过滤结果', () => {
     const future = {
         kind: 'leaf',
@@ -139,6 +256,7 @@ test('未来新增 leaf 只登记 registry 数据即可进入通用过滤结果'
         placement: 'sidebar',
         path: '/future-governance',
         activePathPrefixes: ['/future-governance'],
+        route: { kind: 'existing' },
     }
     const registry = registryModule.navigationRegistry.map((node) =>
         node.id === 'governance-center'
@@ -228,6 +346,6 @@ test('树节点键盘约定覆盖 Enter/Space 且账号节点不进入侧栏', (
             projectRole: null,
             hasProject: false,
         }).map((item) => item.id),
-        ['trusted-devices', 'login-history'],
+        ['account-profile', 'account-security', 'trusted-devices', 'login-history'],
     )
 })

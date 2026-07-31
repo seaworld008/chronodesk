@@ -204,6 +204,22 @@ func TestHumanAuthHandlersRejectUnknownAndTrailingJSON(t *testing.T) {
 			}`,
 		},
 		{
+			name:   "profile rejects direct avatar mutation",
+			handle: handler.UpdateProfile,
+			setup:  setStrictJSONAuthenticatedHuman,
+			payload: `{
+				"avatar":"/untrusted/avatar.png"
+			}`,
+		},
+		{
+			name:   "profile rejects unverified phone mutation",
+			handle: handler.UpdateProfile,
+			setup:  setStrictJSONAuthenticatedHuman,
+			payload: `{
+				"phone_number":"+8613800138000"
+			}`,
+		},
+		{
 			name:    "profile rejects trailing JSON",
 			handle:  handler.UpdateProfile,
 			setup:   setStrictJSONAuthenticatedHuman,

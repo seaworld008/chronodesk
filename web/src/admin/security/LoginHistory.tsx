@@ -12,6 +12,7 @@ import {
     TableBody,
     TableCell,
     TableHead,
+    TablePagination,
     TableRow,
     Tooltip,
     Typography,
@@ -71,13 +72,15 @@ const LoginHistory = () => {
     const [page, setPage] = useState<LoginHistoryPage | null>(null)
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState('')
+    const [pageIndex, setPageIndex] = useState(0)
+    const [pageSize, setPageSize] = useState(20)
 
     const load = useCallback(async () => {
         setLoading(true)
         setError('')
         try {
             const result = await apiFetch<LoginHistoryPage>(
-                '/user/login-history?page=1&page_size=50&order_by=login_time&order=desc',
+                `/user/login-history?page=${pageIndex + 1}&page_size=${pageSize}&order_by=login_time&order=desc`,
             )
             setPage({ ...result, items: result.items ?? [] })
         } catch (requestError) {
@@ -85,7 +88,7 @@ const LoginHistory = () => {
         } finally {
             setLoading(false)
         }
-    }, [])
+    }, [pageIndex, pageSize])
 
     useEffect(() => {
         void load()
@@ -201,6 +204,24 @@ const LoginHistory = () => {
                                 )}
                             </TableBody>
                         </ResizableMuiTable>
+                        <TablePagination
+                            component="div"
+                            count={page?.total ?? 0}
+                            page={pageIndex}
+                            onPageChange={(_, nextPage) => setPageIndex(nextPage)}
+                            rowsPerPage={pageSize}
+                            onRowsPerPageChange={(event) => {
+                                setPageSize(Number(event.target.value))
+                                setPageIndex(0)
+                            }}
+                            rowsPerPageOptions={[10, 20, 50, 100]}
+                            labelRowsPerPage="每页记录数"
+                            labelDisplayedRows={({ from, to, count }) =>
+                                `${from}–${to} / ${count}`
+                            }
+                            showFirstButton
+                            showLastButton
+                        />
                     </Box>
                 )}
             </Paper>

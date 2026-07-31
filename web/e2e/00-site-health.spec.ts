@@ -16,24 +16,23 @@ type PrimaryPageCase = {
 const mainContent = (page: Page) => page.getByRole('main');
 
 const navigationTree = [
-    { label: '工作台', children: ['跨项目工作台'] },
+    { label: '工作台', children: [] },
     {
         label: '项目运营',
         children: ['项目概览', '工单管理', '项目通知'],
     },
     { label: '智能运营', children: ['AI 智能体', '自动化'] },
     { label: '集成中心', children: ['Webhook', '事件投递'] },
-    { label: '项目配置', children: ['项目成员'] },
+    { label: '项目配置', children: [] },
     {
         label: '治理中心',
         children: [
             '项目治理',
             '平台身份与访问',
-            '公共配置',
-            '系统设置',
             '审计中心',
         ],
     },
+    { label: '系统设置', children: ['公共配置', '邮件外发'] },
 ] as const;
 
 type NavigationViewport = {
@@ -330,6 +329,15 @@ const expectSidebarUsable = async (
     }
 
     for (const group of navigationTree) {
+        if (group.children.length === 0) {
+            const leaf = menu.getByRole('menuitem', {
+                name: group.label,
+                exact: true,
+            });
+            await leaf.scrollIntoViewIfNeeded();
+            await expect(leaf).toBeVisible();
+            continue;
+        }
         const toggle = menu.getByRole('button', {
             name: new RegExp(`^${group.label}`),
         });

@@ -534,10 +534,6 @@ func (s *AdminUserService) updateUserOnDB(
 		updates["display_name"] = *req.DisplayName
 	}
 
-	if req.Avatar != nil {
-		updates["avatar"] = *req.Avatar
-	}
-
 	if req.Timezone != nil {
 		updates["timezone"] = *req.Timezone
 	}

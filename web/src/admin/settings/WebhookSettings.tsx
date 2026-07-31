@@ -322,8 +322,7 @@ const WebhookSettings: React.FC = () => {
     setErrors((prev) => ({ ...prev, [key]: '' }))
   }
 
-  const handleEventsChange = (event: SelectChangeEvent<string[]>) => {
-    const value = typeof event.target.value === 'string' ? event.target.value.split(',') : event.target.value
+  const applyEnabledEvents = (value: string[]) => {
     setForm((previous) => ({
       ...previous,
       enabled_events: value,
@@ -332,6 +331,11 @@ const WebhookSettings: React.FC = () => {
         : [],
     }))
     setErrors((previous) => ({ ...previous, enabled_events: '' }))
+  }
+
+  const handleEventsChange = (event: SelectChangeEvent<string[]>) => {
+    const value = typeof event.target.value === 'string' ? event.target.value.split(',') : event.target.value
+    applyEnabledEvents(value)
   }
 
   const handleTransitionStatusesChange = (event: SelectChangeEvent<string[]>) => {
@@ -798,7 +802,7 @@ const WebhookSettings: React.FC = () => {
                   {form.enabled_events.length > 0 && (
                     <Button
                       size="small"
-                      onClick={() => handleFormChange('enabled_events', [])}
+                      onClick={() => applyEnabledEvents([])}
                       aria-label="清空已选订阅事件"
                     >
                       清空

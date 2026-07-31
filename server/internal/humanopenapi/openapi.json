@@ -6573,12 +6573,6 @@
           "last_name": {
             "type": "string"
           },
-          "phone_number": {
-            "type": "string"
-          },
-          "avatar": {
-            "type": "string"
-          },
           "timezone": {
             "type": "string"
           },
@@ -6745,9 +6739,6 @@
           "display_name": {
             "type": "string",
             "maxLength": 100
-          },
-          "avatar": {
-            "type": "string"
           },
           "timezone": {
             "type": "string",
