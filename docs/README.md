@@ -43,7 +43,8 @@ P1 另由 `server/internal/humanopenapi/openapi.json` 和运行时
 
 ## 测试证据
 
-- [Agent 原生化完整测试报告](testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-30.md)
+- [P1 平台角色与项目角色切换发布证据](testing/P1_PLATFORM_ROLES_RELEASE_EVIDENCE_2026-07-31.md)
+- [Agent 原生化历史完整测试报告](testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-30.md)
 
 ## 维护规则
 

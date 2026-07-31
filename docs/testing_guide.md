@@ -177,4 +177,7 @@ Pytest 默认访问 `http://localhost:8081/api`；可通过 `TEST_API_BASE_URL`�
 - [ ] Chrome 插件逐页实测控制台、网络、中文提示、真实增删改和页面完整性。
 - [ ] PR 的 Checks 列出实际执行命令与结果，不包含凭据、数据库连接串或 token。
 
-完整验收结果记录在 [Agent 原生化完整测试报告](testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-30.md)。
+当前验收结果记录在
+[P1 平台角色与项目角色切换发布证据](testing/P1_PLATFORM_ROLES_RELEASE_EVIDENCE_2026-07-31.md)；
+[Agent 原生化完整测试报告](testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-30.md)
+保留为前一候选的历史证据。

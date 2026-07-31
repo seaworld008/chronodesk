@@ -49,6 +49,11 @@ P1 契约单独发布在 `http://localhost:8081/human-openapi.json`，只供同�
 发布能力，也不承诺供第三方 SDK 生成。需要机器稳定能力时应使用项目显式 Agent
 REST v2、MCP 或 A2A。
 
+项目范围解析或即时重校验失败时，Human Web 返回稳定错误码
+`project_access_revoked`。浏览器只有在响应路径中的 Project Key 与当前选择
+一致时才清理该选择；`project_role_denied`、工单对象 ACL 和其他普通 `403`
+只拒绝当前操作，不改变仍然有效的项目上下文。
+
 ## 协议版本
 
 ChronoDesk 只实现当前单版本协议，不包含旧协议兼容分支：

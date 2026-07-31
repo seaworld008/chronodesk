@@ -288,7 +288,8 @@ docs/
 - [Integration tooling](docs/reference/INTEGRATION_TOOLING.md)
 - [Database migrations](docs/operations/database-migrations.md)
 - [Testing guide](docs/testing_guide.md)
-- [Full Agent-native verification report](docs/testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-30.md)
+- [P1 platform/project role cutover evidence](docs/testing/P1_PLATFORM_ROLES_RELEASE_EVIDENCE_2026-07-31.md)
+- [Historical Agent-native verification report](docs/testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-30.md)
 
 ## Project status
 

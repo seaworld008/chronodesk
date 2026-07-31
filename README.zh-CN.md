@@ -256,7 +256,8 @@ docs/
 - [集成工具](docs/reference/INTEGRATION_TOOLING.md)
 - [数据库迁移](docs/operations/database-migrations.md)
 - [测试指南](docs/testing_guide.md)
-- [Agent 原生化完整测试报告](docs/testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-30.md)
+- [P1 平台角色与项目角色切换发布证据](docs/testing/P1_PLATFORM_ROLES_RELEASE_EVIDENCE_2026-07-31.md)
+- [Agent 原生化历史完整测试报告](docs/testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-30.md)
 
 ## 项目状态
 
