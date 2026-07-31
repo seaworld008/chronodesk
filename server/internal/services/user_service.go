@@ -331,17 +331,24 @@ func (s *UserService) UploadAvatar(ctx context.Context, userID uint, file multip
 	}
 
 	var user models.User
-	if err := s.db.WithContext(ctx).Select("id", "avatar").First(&user, userID).Error; err != nil {
+	if err := s.db.WithContext(ctx).
+		Select("id", "avatar", "phone", "timezone", "language").
+		First(&user, userID).Error; err != nil {
 		return "", fmt.Errorf("find avatar owner: %w", err)
 	}
-	oldAvatarURL := user.Avatar
+	oldAvatarURL := ""
 	var profile models.UserProfile
 	if err := s.db.WithContext(ctx).
-		Select("id", "avatar").
 		Where("user_id = ?", userID).
-		First(&profile).Error; err == nil && profile.Avatar != "" {
+		First(&profile).Error; err == nil {
 		oldAvatarURL = profile.Avatar
-	} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+	} else if errors.Is(err, gorm.ErrRecordNotFound) {
+		// Legacy users may predate user_profiles. Preserve the old users.avatar
+		// object for cleanup, then create the complete compatibility projection
+		// in the upload transaction.
+		oldAvatarURL = user.Avatar
+		profile = *userProfileProjection(&user)
+	} else {
 		return "", fmt.Errorf("find avatar profile: %w", err)
 	}
 
@@ -359,21 +366,11 @@ func (s *UserService) UploadAvatar(ctx context.Context, userID uint, file multip
 			Update("avatar", avatarURL).Error; err != nil {
 			return err
 		}
-		result := tx.Model(&models.UserProfile{}).
-			Where("user_id = ?", userID).
-			Update("avatar", avatarURL)
-		if result.Error != nil {
-			return result.Error
+		profile.Avatar = avatarURL
+		if profile.ID == 0 {
+			return tx.Create(&profile).Error
 		}
-		if result.RowsAffected == 0 {
-			return tx.Create(&models.UserProfile{
-				UserID:   userID,
-				Avatar:   avatarURL,
-				Timezone: "Asia/Shanghai",
-				Language: "zh-CN",
-			}).Error
-		}
-		return nil
+		return tx.Save(&profile).Error
 	}); err != nil {
 		_ = s.avatarStorage.Delete(context.Background(), stored.Key)
 		return "", fmt.Errorf("update avatar: %w", err)
@@ -441,6 +438,28 @@ func avatarStorageKey(avatarURL string) (string, bool) {
 		return "", false
 	}
 	return "avatars/" + cleaned, true
+}
+
+// IsControlledUserAvatarURL accepts only the opaque local avatar path emitted
+// by UploadAvatar for the same user. Empty clears the compatibility projection.
+func IsControlledUserAvatarURL(userID uint, avatarURL string) bool {
+	if avatarURL == "" {
+		return true
+	}
+	prefix := avatarURLPrefix + fmt.Sprintf("%d/", userID)
+	if !strings.HasPrefix(avatarURL, prefix) {
+		return false
+	}
+	filename := strings.TrimPrefix(avatarURL, prefix)
+	if filename == "" || filepath.Base(filename) != filename {
+		return false
+	}
+	extension := strings.ToLower(filepath.Ext(filename))
+	if extension != ".jpg" && extension != ".png" {
+		return false
+	}
+	_, err := uuid.Parse(strings.TrimSuffix(filename, extension))
+	return err == nil
 }
 
 // calculateSecurityScore 计算安全评分

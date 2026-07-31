@@ -8,7 +8,6 @@ import {
     Paper,
     Stack,
     TextField,
-    Typography,
 } from '@mui/material'
 import { Save as SaveIcon, Upload as UploadIcon } from '@mui/icons-material'
 import { Title, useNotify } from 'react-admin'
@@ -18,10 +17,14 @@ import {
     type HumanSessionUser,
     type UpdateHumanProfileRequest,
 } from '@/lib/generated/human-api'
+import AccountPageHeader from './AccountPageHeader'
 
-type ProfileForm = Required<
-    Pick<UpdateHumanProfileRequest, 'first_name' | 'last_name' | 'timezone' | 'language'>
->
+type ProfileForm = {
+    first_name: string
+    last_name: string
+    timezone: string
+    language: 'zh-CN'
+}
 
 const emptyForm: ProfileForm = {
     first_name: '',
@@ -53,7 +56,7 @@ const AccountProfile = () => {
                 first_name: current.profile?.first_name ?? '',
                 last_name: current.profile?.last_name ?? '',
                 timezone: current.profile?.timezone || 'Asia/Shanghai',
-                language: current.profile?.language || 'zh-CN',
+                language: 'zh-CN',
             })
             storeCurrentUser(current)
         } catch (error) {
@@ -130,35 +133,56 @@ const AccountProfile = () => {
     return (
         <Box sx={{ p: { xs: 2, md: 3 } }}>
             <Title title="个人资料" />
-            <Paper sx={{ p: { xs: 2, md: 3 }, maxWidth: 960, mx: 'auto' }}>
-                <Typography variant="h4" gutterBottom>个人资料</Typography>
-                <Typography color="text.secondary" sx={{ mb: 3 }}>
-                    仅可修改个人展示名称与本地化偏好；身份、职责和验证状态由专用流程管理。
-                </Typography>
-                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} sx={{ alignItems: { sm: 'center' }, mb: 3 }}>
-                    <Avatar src={user?.profile?.avatar || undefined} sx={{ width: 72, height: 72 }}>
-                        {user?.username?.slice(0, 1).toUpperCase()}
-                    </Avatar>
-                    <Button
-                        component="label"
-                        variant="outlined"
-                        startIcon={uploading ? <CircularProgress size={18} /> : <UploadIcon />}
-                        disabled={uploading}
-                    >
-                        上传头像
-                        <input
-                            hidden
-                            type="file"
-                            accept="image/png,image/jpeg"
-                            onChange={(event) => {
-                                const file = event.target.files?.[0]
-                                if (file) void uploadAvatar(file)
-                                event.target.value = ''
+            <Paper
+                data-testid="account-profile-page"
+                sx={{ p: { xs: 2, md: 3 }, maxWidth: 1040, mx: 'auto' }}
+            >
+                <AccountPageHeader
+                    title="个人资料"
+                    description="仅可修改个人展示名称与本地化偏好；身份、职责和验证状态由专用流程管理。"
+                    action={(
+                        <Stack
+                            data-testid="profile-avatar-panel"
+                            direction="row"
+                            spacing={1.5}
+                            sx={{
+                                alignItems: 'center',
+                                justifyContent: { xs: 'flex-start', md: 'flex-end' },
                             }}
-                        />
-                    </Button>
-                </Stack>
-                <Grid container spacing={2}>
+                        >
+                            <Avatar
+                                src={user?.profile?.avatar || undefined}
+                                sx={{ width: 64, height: 64 }}
+                            >
+                                {user?.username?.slice(0, 1).toUpperCase()}
+                            </Avatar>
+                            <Button
+                                component="label"
+                                variant="outlined"
+                                startIcon={uploading ? <CircularProgress size={18} /> : <UploadIcon />}
+                                disabled={uploading}
+                            >
+                                更换头像
+                                <input
+                                    hidden
+                                    type="file"
+                                    accept="image/png,image/jpeg"
+                                    onChange={(event) => {
+                                        const file = event.target.files?.[0]
+                                        if (file) void uploadAvatar(file)
+                                        event.target.value = ''
+                                    }}
+                                />
+                            </Button>
+                        </Stack>
+                    )}
+                />
+                <Grid
+                    container
+                    spacing={2}
+                    data-testid="profile-main-form"
+                    sx={{ mt: 2, maxWidth: 760 }}
+                >
                     <Grid size={{ xs: 12, sm: 6 }}>
                         <TextField
                             label="名字"
@@ -203,24 +227,24 @@ const AccountProfile = () => {
                             select
                             label="语言"
                             value={form.language}
-                            onChange={(event) => setForm((current) => ({ ...current, language: event.target.value }))}
+                            onChange={() => setForm((current) => ({ ...current, language: 'zh-CN' }))}
                             fullWidth
                             slotProps={{ select: { native: true } }}
                         >
                             <option value="zh-CN">简体中文</option>
-                            <option value="en">English</option>
                         </TextField>
                     </Grid>
                 </Grid>
-                <Button
-                    variant="contained"
-                    startIcon={<SaveIcon />}
-                    disabled={saving}
-                    onClick={() => void save()}
-                    sx={{ mt: 3 }}
-                >
-                    {saving ? '保存中…' : '保存个人资料'}
-                </Button>
+                <Stack sx={{ mt: 3, maxWidth: 760, alignItems: 'flex-end' }}>
+                    <Button
+                        variant="contained"
+                        startIcon={<SaveIcon />}
+                        disabled={saving}
+                        onClick={() => void save()}
+                    >
+                        {saving ? '保存中…' : '保存个人资料'}
+                    </Button>
+                </Stack>
             </Paper>
         </Box>
     )

@@ -329,6 +329,14 @@ func (h *AdminUserHandler) UpdateUser(c *gin.Context) {
 			})
 			return
 		}
+		if errors.Is(err, services.ErrInvalidAdminUserAvatar) {
+			c.JSON(http.StatusBadRequest, ApiResponse{
+				Code: 1,
+				Msg:  "头像只能使用该用户通过头像上传接口生成的本地路径",
+				Data: nil,
+			})
+			return
+		}
 		if errors.Is(err, services.ErrLastActivePlatformAdministrator) {
 			c.JSON(http.StatusConflict, ApiResponse{
 				Code: 1,

@@ -92,6 +92,26 @@ export interface NavigationGroupNode extends NavigationNodeBase {
 
 export type NavigationNode = NavigationGroupNode | NavigationLeafNode
 
+export type AdminResourceName =
+    | 'tickets'
+    | 'users'
+    | 'notifications'
+    | 'automation-rules'
+    | 'automation-logs'
+
+export type AdminResourceView = 'list' | 'show' | 'edit' | 'create'
+
+type ResourceViewAccessOverride = {
+    capability?: NavigationCapability
+    roles?: NavigationRoles
+}
+
+export interface ResourceAccessContract {
+    resource: AdminResourceName
+    navigationNodeID: string
+    views: Partial<Record<AdminResourceView, ResourceViewAccessOverride>>
+}
+
 const leaf = (
     placement: NavigationPlacement,
     node: Omit<NavigationLeafNode, 'kind' | 'placement' | 'route'> & {
@@ -443,6 +463,96 @@ export const navigationRegistry: readonly NavigationNode[] = [
     },
 ] as const
 
+export const resourceAccessContracts: readonly ResourceAccessContract[] = [
+    {
+        resource: 'tickets',
+        navigationNodeID: 'tickets',
+        views: {
+            list: {},
+            show: {},
+            edit: {
+                capability: {
+                    kind: 'project',
+                    value: 'edit_ticket_safe_fields',
+                },
+            },
+            create: {
+                capability: { kind: 'project', value: 'create_ticket' },
+            },
+        },
+    },
+    {
+        resource: 'users',
+        navigationNodeID: 'users',
+        views: { list: {}, show: {}, edit: {}, create: {} },
+    },
+    {
+        resource: 'notifications',
+        navigationNodeID: 'notifications',
+        views: {
+            list: {},
+            create: {
+                capability: {
+                    kind: 'project',
+                    value: 'manage_notifications',
+                },
+                roles: {
+                    kind: 'project',
+                    values: ['project_admin', 'manager'],
+                },
+            },
+        },
+    },
+    {
+        resource: 'automation-rules',
+        navigationNodeID: 'automation',
+        views: {
+            list: {},
+            show: {},
+            edit: {},
+            create: {},
+        },
+    },
+    {
+        resource: 'automation-logs',
+        navigationNodeID: 'automation',
+        views: { list: {} },
+    },
+] as const
+
+const allNavigationLeaves = (): NavigationLeafNode[] =>
+    navigationRegistry.flatMap((node) =>
+        node.kind === 'leaf' ? [node] : [...node.children],
+    )
+
+export const resourceViewNavigationNode = (
+    resource: AdminResourceName,
+    view: AdminResourceView,
+): NavigationLeafNode => {
+    const contract = resourceAccessContracts.find(
+        (candidate) => candidate.resource === resource,
+    )
+    if (!contract || !(view in contract.views)) {
+        throw new Error(`资源 ${resource} 未声明 ${view} 访问契约`)
+    }
+    const node = allNavigationLeaves().find(
+        (candidate) => candidate.id === contract.navigationNodeID,
+    )
+    if (!node) {
+        throw new Error(
+            `资源 ${resource} 引用了不存在的导航节点 ${contract.navigationNodeID}`,
+        )
+    }
+    const override = contract.views[view] ?? {}
+    return {
+        ...node,
+        capability: override.capability === undefined
+            ? node.capability
+            : override.capability,
+        roles: override.roles === undefined ? node.roles : override.roles,
+    }
+}
+
 const allowedScopes = new Set(['global', 'project', 'platform'])
 const allowedPlacements = new Set(['sidebar', 'account'])
 const allowedIcons = new Set<NavigationIcon>([
@@ -660,6 +770,16 @@ export const validateNavigationRegistry = (value: unknown): string[] => {
 const registryErrors = validateNavigationRegistry(navigationRegistry)
 if (registryErrors.length > 0) {
     throw new Error(`导航 registry 无效：${registryErrors.join('；')}`)
+}
+const resourceNames = new Set<AdminResourceName>()
+for (const contract of resourceAccessContracts) {
+    if (resourceNames.has(contract.resource)) {
+        throw new Error(`资源访问契约重复：${contract.resource}`)
+    }
+    resourceNames.add(contract.resource)
+    for (const view of Object.keys(contract.views) as AdminResourceView[]) {
+        resourceViewNavigationNode(contract.resource, view)
+    }
 }
 
 export interface NavigationAccessContext {

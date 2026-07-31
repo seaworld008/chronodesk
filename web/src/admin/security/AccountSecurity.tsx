@@ -10,13 +10,15 @@ import {
     TextField,
     Typography,
 } from '@mui/material'
-import { Link as RouterLink } from 'react-router-dom'
+import { Link as RouterLink, useNavigate } from 'react-router-dom'
 import { Title, useNotify } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
+import { clearAuthenticationState } from '@/lib/authProvider'
 import {
     humanApiRoutes,
     type HumanSessionUser,
 } from '@/lib/generated/human-api'
+import AccountPageHeader from './AccountPageHeader'
 
 interface OTPSetup {
     secret: string
@@ -26,6 +28,7 @@ interface OTPSetup {
 
 const AccountSecurity = () => {
     const notify = useNotify()
+    const navigate = useNavigate()
     const [user, setUser] = useState<HumanSessionUser | null>(null)
     const [currentPassword, setCurrentPassword] = useState('')
     const [newPassword, setNewPassword] = useState('')
@@ -48,6 +51,16 @@ const AccountSecurity = () => {
         })
     }, [load, notify])
 
+    useEffect(() => {
+        if (!otpSetup) return
+        const warnBeforeLeaving = (event: BeforeUnloadEvent) => {
+            event.preventDefault()
+            event.returnValue = ''
+        }
+        window.addEventListener('beforeunload', warnBeforeLeaving)
+        return () => window.removeEventListener('beforeunload', warnBeforeLeaving)
+    }, [otpSetup])
+
     const changePassword = async () => {
         if (newPassword.length < 8 || newPassword !== confirmPassword) {
             notify('新密码至少 8 位，且两次输入必须一致', { type: 'warning' })
@@ -65,7 +78,11 @@ const AccountSecurity = () => {
             setCurrentPassword('')
             setNewPassword('')
             setConfirmPassword('')
-            notify('密码已修改，其他会话已失效', { type: 'success' })
+            notify('密码已修改，所有会话（包括当前会话）均已失效，请重新登录', {
+                type: 'success',
+            })
+            clearAuthenticationState()
+            navigate('/login', { replace: true })
         } catch (error) {
             notify(localizedUnknownErrorMessage(error, '密码修改失败'), {
                 type: 'error',
@@ -84,7 +101,7 @@ const AccountSecurity = () => {
             })
             setOtpSetup(setup)
             await load()
-            notify('MFA 密钥已生成，请完成验证码确认并安全保存备用码', {
+            notify('MFA 已立即启用，请立即配置验证器并安全保存备用码', {
                 type: 'success',
             })
         } catch (error) {
@@ -105,7 +122,7 @@ const AccountSecurity = () => {
             })
             setOtpCode('')
             await load()
-            notify('MFA 验证成功', { type: 'success' })
+            notify('验证码有效；MFA 在生成密钥时已经启用', { type: 'success' })
         } catch (error) {
             notify(localizedUnknownErrorMessage(error, 'MFA 验证失败'), {
                 type: 'error',
@@ -140,10 +157,10 @@ const AccountSecurity = () => {
             <Title title="账号安全" />
             <Stack spacing={3} sx={{ maxWidth: 960, mx: 'auto' }}>
                 <Paper sx={{ p: { xs: 2, md: 3 } }}>
-                    <Typography variant="h4" gutterBottom>账号安全</Typography>
-                    <Typography color="text.secondary">
-                        管理当前账号的密码、MFA、可信设备和登录记录。
-                    </Typography>
+                    <AccountPageHeader
+                        title="账号安全"
+                        description="管理当前账号的密码、MFA、可信设备和登录记录。"
+                    />
                 </Paper>
                 <Paper sx={{ p: { xs: 2, md: 3 } }}>
                     <Typography variant="h6" gutterBottom>修改密码</Typography>
@@ -169,11 +186,52 @@ const AccountSecurity = () => {
                     </Stack>
                     {otpSetup && (
                         <Alert severity="warning" sx={{ mt: 2 }}>
-                            <Typography>密钥：{otpSetup.secret}</Typography>
-                            <Typography>备用码：{otpSetup.backup_codes.join('、')}</Typography>
-                            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mt: 1 }}>
-                                <TextField label="6 位验证码" value={otpCode} onChange={(event) => setOtpCode(event.target.value)} slotProps={{ htmlInput: { maxLength: 6, inputMode: 'numeric' } }} />
-                                <Button variant="contained" disabled={busy || otpCode.length !== 6} onClick={() => void verifyMFA()}>验证</Button>
+                            <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
+                                MFA 已立即启用
+                            </Typography>
+                            <Typography sx={{ mt: 0.5 }}>
+                                此页面关闭后不会再次显示密钥和备用码。离开前请完成验证器配置，并把备用码保存到安全位置。
+                            </Typography>
+                            <TextField
+                                label="验证器配置 URI（qr_code）"
+                                value={otpSetup.qr_code}
+                                multiline
+                                minRows={2}
+                                fullWidth
+                                sx={{ mt: 2 }}
+                                slotProps={{ htmlInput: { readOnly: true } }}
+                            />
+                            <TextField
+                                label="手动输入密钥"
+                                value={otpSetup.secret}
+                                fullWidth
+                                sx={{ mt: 2 }}
+                                slotProps={{ htmlInput: { readOnly: true } }}
+                            />
+                            <Typography variant="subtitle2" sx={{ mt: 2 }}>
+                                一次性备用码
+                            </Typography>
+                            <Box
+                                component="ul"
+                                aria-label="MFA 备用码"
+                                sx={{
+                                    columns: { xs: 1, sm: 2 },
+                                    m: 0,
+                                    mt: 1,
+                                    pl: 3,
+                                    fontFamily: 'monospace',
+                                }}
+                            >
+                                {otpSetup.backup_codes.map((code) => (
+                                    <li key={code}>{code}</li>
+                                ))}
+                            </Box>
+                            <Typography sx={{ mt: 1 }}>
+                                手机丢失时可使用一个未使用的备用码恢复登录；每个备用码只能使用一次。
+                            </Typography>
+                            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mt: 2 }}>
+                                <TextField label="测试 6 位验证码（不改变启用状态）" value={otpCode} onChange={(event) => setOtpCode(event.target.value)} slotProps={{ htmlInput: { maxLength: 6, inputMode: 'numeric' } }} />
+                                <Button variant="contained" disabled={busy || otpCode.length !== 6} onClick={() => void verifyMFA()}>测试验证码</Button>
                             </Stack>
                         </Alert>
                     )}

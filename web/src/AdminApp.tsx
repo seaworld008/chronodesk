@@ -38,7 +38,6 @@ import {
     hasPlatformCapability,
     parsePlatformRole,
     type AccessPermissions,
-    type PlatformCapability,
 } from './lib/accessControl'
 import {
     getProjectRoleLabel,
@@ -88,7 +87,10 @@ import { AppNotification } from './components/layout/AppNotification'
 import { i18nProvider, muiZhCN } from './i18n'
 import {
     navigationRegistry,
+    resourceViewNavigationNode,
     visibleNavigationNodes,
+    type AdminResourceName,
+    type AdminResourceView,
     type CustomNavigationComponent,
     type NavigationIcon,
     type NavigationLeafNode,
@@ -307,31 +309,6 @@ const useActiveProjectAccess = (): ActiveProjectAccessState => {
     return state
 }
 
-export const PlatformCapabilityRoute = ({
-    capability,
-    children,
-}: React.PropsWithChildren<{ capability: PlatformCapability }>) => {
-    const { permissions, isPending } = usePermissions<AccessPermissions>()
-    if (isPending) return <PageLoading />
-    if (
-        !hasPlatformCapability(permissions?.platform_role, capability)
-    ) {
-        return <Navigate to="/" replace />
-    }
-    return <>{children}</>
-}
-
-export const ProjectRequiredRoute = ({
-    children,
-}: React.PropsWithChildren) => {
-    const { access, isPending } = useActiveProjectAccess()
-    if (isPending) return <PageLoading />
-    if (!access || parseProjectRole(access.project_role) === null) {
-        return <Navigate to="/" replace />
-    }
-    return <>{children}</>
-}
-
 export const ExactProjectRoleRoute = ({
     roles,
     capability,
@@ -354,99 +331,120 @@ export const ExactProjectRoleRoute = ({
     return <>{children}</>
 }
 
-const withPlatformCapability = <P extends object>(
+const PlatformNavigationRoute = ({
+    node,
+    children,
+}: React.PropsWithChildren<{ node: NavigationLeafNode }>) => {
+    const { permissions, isPending } = usePermissions<AccessPermissions>()
+    if (isPending) return <PageLoading />
+    const role = parsePlatformRole(permissions?.platform_role)
+    const allowedRoles = node.roles?.kind === 'platform'
+        ? node.roles.values
+        : null
+    const capability = node.capability?.kind === 'platform'
+        ? node.capability.value
+        : null
+    if (
+        role === null ||
+        (allowedRoles && !allowedRoles.includes(role)) ||
+        (capability && !hasPlatformCapability(role, capability))
+    ) {
+        return <Navigate to="/" replace />
+    }
+    return <>{children}</>
+}
+
+const NavigationContractGuard = ({
+    node,
+    children,
+}: React.PropsWithChildren<{ node: NavigationLeafNode }>) => {
+    if (node.scope === 'project') {
+        return (
+            <ExactProjectRoleRoute
+                roles={
+                    node.roles?.kind === 'project'
+                        ? node.roles.values
+                        : projectRoleValues
+                }
+                capability={
+                    node.capability?.kind === 'project'
+                        ? node.capability.value
+                        : undefined
+                }
+            >
+                {children}
+            </ExactProjectRoleRoute>
+        )
+    }
+    if (node.scope === 'platform') {
+        return (
+            <PlatformNavigationRoute node={node}>
+                {children}
+            </PlatformNavigationRoute>
+        )
+    }
+    return <>{children}</>
+}
+
+const withResourceViewContract = <P extends object>(
     Component: React.ComponentType<P>,
-    capability: PlatformCapability,
+    resource: AdminResourceName,
+    view: AdminResourceView,
 ) => {
+    const node = resourceViewNavigationNode(resource, view)
     const GuardedView = (props: P) => (
-        <PlatformCapabilityRoute capability={capability}>
+        <NavigationContractGuard node={node}>
             <Component {...props} />
-        </PlatformCapabilityRoute>
+        </NavigationContractGuard>
     )
-    GuardedView.displayName = `PlatformCapability${
+    GuardedView.displayName = `ResourceContract${
         Component.displayName || Component.name || 'View'
     }`
     return GuardedView
 }
 
-const withProjectRequired = <P extends object>(
-    Component: React.ComponentType<P>,
-) => {
-    const GuardedView = (props: P) => (
-        <ProjectRequiredRoute>
-            <Component {...props} />
-        </ProjectRequiredRoute>
-    )
-    GuardedView.displayName = `ProjectRequired${
-        Component.displayName || Component.name || 'View'
-    }`
-    return GuardedView
-}
-
-const withProjectCapability = <P extends object>(
-    Component: React.ComponentType<P>,
-    capability: ProjectCapability,
-    roles: readonly ProjectRole[] = projectRoleValues,
-) => {
-    const GuardedView = (props: P) => (
-        <ExactProjectRoleRoute roles={roles} capability={capability}>
-            <Component {...props} />
-        </ExactProjectRoleRoute>
-    )
-    GuardedView.displayName = `ProjectCapability${
-        Component.displayName || Component.name || 'View'
-    }`
-    return GuardedView
-}
-
-const PlatformUserList = withPlatformCapability(
-    UserList,
-    'manage_platform_users',
+const PlatformUserList = withResourceViewContract(UserList, 'users', 'list')
+const PlatformUserShow = withResourceViewContract(UserShow, 'users', 'show')
+const PlatformUserEdit = withResourceViewContract(UserEdit, 'users', 'edit')
+const PlatformUserCreate = withResourceViewContract(UserCreate, 'users', 'create')
+const ProjectTicketList = withResourceViewContract(TicketList, 'tickets', 'list')
+const ProjectTicketShow = withResourceViewContract(TicketShow, 'tickets', 'show')
+const ProjectTicketEdit = withResourceViewContract(TicketEdit, 'tickets', 'edit')
+const ProjectTicketCreate = withResourceViewContract(TicketCreate, 'tickets', 'create')
+const ProjectNotificationList = withResourceViewContract(
+    NotificationList,
+    'notifications',
+    'list',
 )
-const PlatformUserShow = withPlatformCapability(
-    UserShow,
-    'manage_platform_users',
-)
-const PlatformUserEdit = withPlatformCapability(
-    UserEdit,
-    'manage_platform_users',
-)
-const PlatformUserCreate = withPlatformCapability(
-    UserCreate,
-    'manage_platform_users',
-)
-const ProjectTicketList = withProjectRequired(TicketList)
-const ProjectTicketShow = withProjectRequired(TicketShow)
-const ProjectTicketEdit = withProjectCapability(
-    TicketEdit,
-    'edit_ticket_safe_fields',
-)
-const ProjectTicketCreate = withProjectCapability(TicketCreate, 'create_ticket')
-const ProjectNotificationList = withProjectRequired(NotificationList)
-const ProjectNotificationCreate = withProjectCapability(
+const ProjectNotificationCreate = withResourceViewContract(
     NotificationCreate,
-    'manage_notifications',
-    ['project_admin', 'manager'],
+    'notifications',
+    'create',
 )
-const ProjectAutomationRuleList = withProjectCapability(
+const ProjectAutomationRuleList = withResourceViewContract(
     AutomationRuleList,
-    'manage_automation',
+    'automation-rules',
+    'list',
 )
-const ProjectAutomationRuleShow = withProjectCapability(
+const ProjectAutomationRuleShow = withResourceViewContract(
     AutomationRuleShow,
-    'manage_automation',
+    'automation-rules',
+    'show',
 )
-const ProjectAutomationRuleEdit = withProjectCapability(
+const ProjectAutomationRuleEdit = withResourceViewContract(
     AutomationRuleEdit,
-    'manage_automation',
+    'automation-rules',
+    'edit',
 )
-const ProjectAutomationRuleCreate = withProjectCapability(
+const ProjectAutomationRuleCreate = withResourceViewContract(
     AutomationRuleCreate,
-    'manage_automation',
+    'automation-rules',
+    'create',
 )
-const ProjectAutomationLogList = withProjectCapability(
+const ProjectAutomationLogList = withResourceViewContract(
     AutomationLogList,
-    'manage_automation',
+    'automation-logs',
+    'list',
 )
 
 const NoAuthorizedProjects = () => (
@@ -662,61 +660,6 @@ const customNavigationLeaves = navigationRegistry.flatMap((node) =>
         ? node.route.kind === 'custom' ? [node] : []
         : node.children.filter((child) => child.route.kind === 'custom'),
 )
-
-const PlatformNavigationRoute = ({
-    node,
-    children,
-}: React.PropsWithChildren<{ node: NavigationLeafNode }>) => {
-    const { permissions, isPending } = usePermissions<AccessPermissions>()
-    if (isPending) return <PageLoading />
-    const role = parsePlatformRole(permissions?.platform_role)
-    const allowedRoles = node.roles?.kind === 'platform'
-        ? node.roles.values
-        : null
-    const capability = node.capability?.kind === 'platform'
-        ? node.capability.value
-        : null
-    if (
-        role === null ||
-        (allowedRoles && !allowedRoles.includes(role)) ||
-        (capability && !hasPlatformCapability(role, capability))
-    ) {
-        return <Navigate to="/" replace />
-    }
-    return <>{children}</>
-}
-
-const NavigationContractGuard = ({
-    node,
-    children,
-}: React.PropsWithChildren<{ node: NavigationLeafNode }>) => {
-    if (node.scope === 'project') {
-        return (
-            <ExactProjectRoleRoute
-                roles={
-                    node.roles?.kind === 'project'
-                        ? node.roles.values
-                        : projectRoleValues
-                }
-                capability={
-                    node.capability?.kind === 'project'
-                        ? node.capability.value
-                        : undefined
-                }
-            >
-                {children}
-            </ExactProjectRoleRoute>
-        )
-    }
-    if (node.scope === 'platform') {
-        return (
-            <PlatformNavigationRoute node={node}>
-                {children}
-            </PlatformNavigationRoute>
-        )
-    }
-    return <>{children}</>
-}
 
 const navigationRouteElement = (
     node: NavigationLeafNode,

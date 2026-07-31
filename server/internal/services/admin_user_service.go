@@ -30,6 +30,9 @@ var (
 	ErrAdminUserAccessEventWriter = errors.New(
 		"admin user access revocation event writer is unavailable",
 	)
+	ErrInvalidAdminUserAvatar = errors.New(
+		"admin user avatar must be an uploaded local avatar path",
+	)
 )
 
 // AdminUserService 管理员用户管理服务
@@ -296,7 +299,12 @@ func (s *AdminUserService) CreateUser(ctx context.Context, req *models.UserCreat
 		Language:     "zh-CN",
 	}
 
-	if err := s.db.WithContext(ctx).Create(user).Error; err != nil {
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(user).Error; err != nil {
+			return err
+		}
+		return tx.Create(userProfileProjection(user)).Error
+	}); err != nil {
 		// 预检查不能替代数据库约束；并发创建时由唯一索引裁决，并映射为
 		// 稳定冲突而不是把数据库细节泄漏成 500。
 		if errors.Is(err, gorm.ErrDuplicatedKey) {
@@ -329,6 +337,9 @@ func (s *AdminUserService) UpdateUser(
 	}
 	if req.PlatformRole != nil && !req.PlatformRole.IsValid() {
 		return nil, fmt.Errorf("invalid platform role")
+	}
+	if req.Avatar != nil && !IsControlledUserAvatarURL(userID, *req.Avatar) {
+		return nil, ErrInvalidAdminUserAvatar
 	}
 	var updated *models.User
 	err := s.withMutationTransaction(ctx, actor, func(commandContext context.Context, tx *gorm.DB) error {
@@ -534,6 +545,10 @@ func (s *AdminUserService) updateUserOnDB(
 		updates["display_name"] = *req.DisplayName
 	}
 
+	if req.Avatar != nil {
+		updates["avatar"] = *req.Avatar
+	}
+
 	if req.Timezone != nil {
 		updates["timezone"] = *req.Timezone
 	}
@@ -575,6 +590,34 @@ func (s *AdminUserService) updateUserOnDB(
 		}
 	}
 
+	if req.Avatar != nil || req.Phone != nil ||
+		req.Timezone != nil || req.Language != nil {
+		var profile models.UserProfile
+		err := db.WithContext(ctx).
+			Where("user_id = ?", user.ID).
+			First(&profile).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			profile = *userProfileProjection(user)
+		} else if err != nil {
+			return nil, fmt.Errorf("failed to load user profile: %w", err)
+		}
+		if req.Avatar != nil {
+			profile.Avatar = *req.Avatar
+		}
+		if req.Phone != nil {
+			profile.Phone = *req.Phone
+		}
+		if req.Timezone != nil {
+			profile.Timezone = *req.Timezone
+		}
+		if req.Language != nil {
+			profile.Language = *req.Language
+		}
+		if err := db.WithContext(ctx).Save(&profile).Error; err != nil {
+			return nil, fmt.Errorf("failed to update user profile: %w", err)
+		}
+	}
+
 	// 重新加载用户信息
 	err := db.WithContext(ctx).Preload("Manager").First(user, user.ID).Error
 	if err != nil {
@@ -582,6 +625,24 @@ func (s *AdminUserService) updateUserOnDB(
 	}
 
 	return user, nil
+}
+
+func userProfileProjection(user *models.User) *models.UserProfile {
+	timezone := user.Timezone
+	if timezone == "" {
+		timezone = "Asia/Shanghai"
+	}
+	language := user.Language
+	if language == "" {
+		language = "zh-CN"
+	}
+	return &models.UserProfile{
+		UserID:   user.ID,
+		Avatar:   user.Avatar,
+		Phone:    user.Phone,
+		Timezone: timezone,
+		Language: language,
+	}
 }
 
 // ResetUserPassword 重置用户密码

@@ -241,6 +241,51 @@ test('React Admin Resource 入口与 registry scope/capability 契约一致', ()
         },
         roles: null,
     })
+
+    assert.deepEqual(
+        registryModule.resourceAccessContracts.map((contract) =>
+            contract.resource,
+        ),
+        [
+            'tickets',
+            'users',
+            'notifications',
+            'automation-rules',
+            'automation-logs',
+        ],
+    )
+    assert.deepEqual(
+        registryModule.resourceViewNavigationNode('tickets', 'edit').capability,
+        { kind: 'project', value: 'edit_ticket_safe_fields' },
+    )
+    assert.deepEqual(
+        registryModule.resourceViewNavigationNode(
+            'notifications',
+            'create',
+        ).roles,
+        {
+            kind: 'project',
+            values: ['project_admin', 'manager'],
+        },
+    )
+    assert.deepEqual(
+        registryModule.resourceViewNavigationNode(
+            'automation-rules',
+            'create',
+        ).capability,
+        { kind: 'project', value: 'manage_automation' },
+    )
+    assert.deepEqual(
+        registryModule.resourceViewNavigationNode('users', 'edit').capability,
+        { kind: 'platform', value: 'manage_platform_users' },
+    )
+    assert.throws(
+        () => registryModule.resourceViewNavigationNode(
+            'automation-logs',
+            'edit',
+        ),
+        /未声明 edit 访问契约/,
+    )
 })
 
 test('未来新增 leaf 只登记 registry 数据即可进入通用过滤结果', () => {

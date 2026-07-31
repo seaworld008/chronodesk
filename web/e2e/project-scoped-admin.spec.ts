@@ -474,7 +474,16 @@ const expectMenuItem = async (
         exact: true,
     });
     if (visible) {
-        await expect(item).toBeVisible();
+        if ((await item.count()) > 0) {
+            await expect(item).toBeVisible();
+        } else {
+            await expect(
+                page.getByRole('menuitem', {
+                    name: target.group,
+                    exact: true,
+                }),
+            ).toBeVisible();
+        }
         return;
     }
     await expect(item).toHaveCount(0);
@@ -677,7 +686,7 @@ test.describe('平台职责与项目 Membership 入口隔离', () => {
 
         await page.goto('/#/');
         await page
-            .getByRole('menuitem', { name: '平台审计', exact: true })
+            .getByRole('menuitem', { name: '治理中心', exact: true })
             .click();
         await expect(page.getByTestId('platform-audit-page')).toBeVisible();
         await expect(

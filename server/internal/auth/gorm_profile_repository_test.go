@@ -2,7 +2,9 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/driver/sqlite"
@@ -131,5 +133,100 @@ func TestGormProfileRepository_UpdateSyncsUserFields(t *testing.T) {
 	}
 	if got.Phone != "18800001111" {
 		t.Fatalf("expected updated phone, got %q", got.Phone)
+	}
+}
+
+func TestGormProfileRepositoryBackfillsLegacyUserWithoutDroppingFields(t *testing.T) {
+	db := setupProfileRepoTestDB(t)
+	user := createProfileRepoTestUser(t, db)
+	if err := db.Model(&user).Updates(map[string]any{
+		"first_name":     "Legacy",
+		"last_name":      "User",
+		"avatar":         "/uploads/avatars/1/00000000-0000-4000-8000-000000000001.png",
+		"phone":          "+8613800138000",
+		"timezone":       "Asia/Tokyo",
+		"language":       "zh-CN",
+		"phone_verified": true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	repo := NewGormProfileRepository(db)
+	profile, err := repo.GetByUserID(context.Background(), user.ID)
+	if err != nil {
+		t.Fatalf("GetByUserID legacy backfill: %v", err)
+	}
+	if profile.FirstName != "Legacy" ||
+		profile.LastName != "User" ||
+		profile.Phone != "+8613800138000" ||
+		profile.Timezone != "Asia/Tokyo" ||
+		profile.Language != "zh-CN" {
+		t.Fatalf("legacy profile projection lost fields: %+v", profile)
+	}
+
+	var count int64
+	if err := db.Model(&models.UserProfile{}).
+		Where("user_id = ?", user.ID).
+		Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("profile backfill rows = %d, want 1", count)
+	}
+	if _, err := repo.GetByUserID(context.Background(), user.ID); err != nil {
+		t.Fatalf("idempotent profile read: %v", err)
+	}
+	if err := db.Model(&models.UserProfile{}).
+		Where("user_id = ?", user.ID).
+		Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("idempotent profile rows = %d, want 1", count)
+	}
+}
+
+func TestAuthProfileUpdateValidatesAndClearsPhoneVerification(t *testing.T) {
+	db := setupProfileRepoTestDB(t)
+	user := createProfileRepoTestUser(t, db)
+	if err := db.Model(&user).Updates(map[string]any{
+		"phone":             "+8613800138000",
+		"phone_verified":    true,
+		"phone_verified_at": time.Now(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	repo := NewGormProfileRepository(db)
+	service := &AuthService{profileRepo: repo}
+	phone := "+8613900139000"
+	timezone := "Asia/Tokyo"
+	language := "zh-CN"
+	if err := service.UpdateProfile(context.Background(), user.ID, &UpdateProfileRequest{
+		PhoneNumber: &phone,
+		Timezone:    &timezone,
+		Language:    &language,
+	}); err != nil {
+		t.Fatalf("UpdateProfile: %v", err)
+	}
+	var persisted models.User
+	if err := db.First(&persisted, user.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Phone != phone || persisted.PhoneVerified ||
+		persisted.PhoneVerifiedAt != nil {
+		t.Fatalf("phone verification projection = %+v", persisted)
+	}
+
+	invalidZone := "Mars/Olympus"
+	if err := service.UpdateProfile(context.Background(), user.ID, &UpdateProfileRequest{
+		Timezone: &invalidZone,
+	}); !errors.Is(err, ErrInvalidProfileZone) {
+		t.Fatalf("invalid timezone error = %v", err)
+	}
+	unsupported := "en"
+	if err := service.UpdateProfile(context.Background(), user.ID, &UpdateProfileRequest{
+		Language: &unsupported,
+	}); !errors.Is(err, ErrInvalidProfileLocale) {
+		t.Fatalf("unsupported language error = %v", err)
 	}
 }

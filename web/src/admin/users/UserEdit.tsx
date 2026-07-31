@@ -300,7 +300,9 @@ const UserEdit: React.FC = () => {
                                                 />
                                             </Box>
                                         </Box>
-                                        
+                                        <Alert severity="info" sx={{ mt: 2 }}>
+                                            头像请由用户在“个人资料”中通过受控上传更新。管理员接口仅兼容该上传流程生成的本地头像路径，不接受外部 URL。
+                                        </Alert>
                                     </Box>
                                 </CardContent>
                             </Card>

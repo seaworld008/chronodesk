@@ -12,6 +12,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // GormUserRepository GORM用户仓库实现
@@ -1045,28 +1046,50 @@ func (r *GormProfileRepository) Create(ctx context.Context, profile *UserProfile
 		modelProfile.Language = "zh-CN"
 	}
 
-	if err := r.db.WithContext(ctx).Create(modelProfile).Error; err != nil {
-		return err
-	}
-
-	profile.ID = modelProfile.ID
-	profile.CreatedAt = modelProfile.CreatedAt
-	profile.UpdatedAt = modelProfile.UpdatedAt
-
-	return r.syncUserFields(ctx, profile)
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(modelProfile).Error; err != nil {
+			return err
+		}
+		profile.ID = modelProfile.ID
+		profile.CreatedAt = modelProfile.CreatedAt
+		profile.UpdatedAt = modelProfile.UpdatedAt
+		return syncProfileToUser(tx, profile, false)
+	})
 }
 
 // GetByUserID 根据用户ID获取资料
 func (r *GormProfileRepository) GetByUserID(ctx context.Context, userID uint) (*UserProfile, error) {
-	var modelProfile models.UserProfile
-	if err := r.db.WithContext(ctx).Where("user_id = ?", userID).First(&modelProfile).Error; err != nil {
+	var user models.User
+	if err := r.db.WithContext(ctx).
+		Select("id", "first_name", "last_name", "display_name", "avatar",
+			"phone", "department", "job_title", "timezone", "language").
+		Where("id = ?", userID).
+		First(&user).Error; err != nil {
 		return nil, err
 	}
 
-	var user models.User
-	if err := r.db.WithContext(ctx).Select("id, first_name, last_name, display_name, department, job_title").
-		Where("id = ?", userID).
-		First(&user).Error; err != nil {
+	var modelProfile models.UserProfile
+	err := r.db.WithContext(ctx).
+		Where("user_id = ?", userID).
+		First(&modelProfile).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		modelProfile = legacyUserProfileProjection(&user)
+		if err := r.db.WithContext(ctx).
+			Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "user_id"}},
+				DoNothing: true,
+			}).
+			Create(&modelProfile).Error; err != nil {
+			return nil, err
+		}
+		if modelProfile.ID == 0 {
+			if err := r.db.WithContext(ctx).
+				Where("user_id = ?", userID).
+				First(&modelProfile).Error; err != nil {
+				return nil, err
+			}
+		}
+	} else if err != nil {
 		return nil, err
 	}
 
@@ -1094,34 +1117,33 @@ func (r *GormProfileRepository) GetByUserID(ctx context.Context, userID uint) (*
 
 // Update 更新用户资料
 func (r *GormProfileRepository) Update(ctx context.Context, profile *UserProfile) error {
-	var modelProfile models.UserProfile
-	err := r.db.WithContext(ctx).Where("user_id = ?", profile.UserID).First(&modelProfile).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		modelProfile = models.UserProfile{
-			UserID: profile.UserID,
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var user models.User
+		if err := tx.Where("id = ?", profile.UserID).First(&user).Error; err != nil {
+			return err
 		}
-	} else if err != nil {
-		return err
-	}
+		var modelProfile models.UserProfile
+		err := tx.Where("user_id = ?", profile.UserID).First(&modelProfile).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			modelProfile = legacyUserProfileProjection(&user)
+		} else if err != nil {
+			return err
+		}
 
-	modelProfile.Avatar = profile.Avatar
-	modelProfile.Phone = profile.Phone
-	if profile.Timezone != "" {
+		phoneChanged := modelProfile.Phone != profile.Phone
+		modelProfile.Avatar = profile.Avatar
+		modelProfile.Phone = profile.Phone
 		modelProfile.Timezone = profile.Timezone
-	}
-	if profile.Language != "" {
 		modelProfile.Language = profile.Language
-	}
 
-	if err := r.db.WithContext(ctx).Save(&modelProfile).Error; err != nil {
-		return err
-	}
-
-	profile.ID = modelProfile.ID
-	profile.CreatedAt = modelProfile.CreatedAt
-	profile.UpdatedAt = modelProfile.UpdatedAt
-
-	return r.syncUserFields(ctx, profile)
+		if err := tx.Save(&modelProfile).Error; err != nil {
+			return err
+		}
+		profile.ID = modelProfile.ID
+		profile.CreatedAt = modelProfile.CreatedAt
+		profile.UpdatedAt = modelProfile.UpdatedAt
+		return syncProfileToUser(tx, profile, phoneChanged)
+	})
 }
 
 // Delete 删除用户资料
@@ -1129,15 +1151,47 @@ func (r *GormProfileRepository) Delete(ctx context.Context, userID uint) error {
 	return r.db.WithContext(ctx).Where("user_id = ?", userID).Delete(&models.UserProfile{}).Error
 }
 
-func (r *GormProfileRepository) syncUserFields(ctx context.Context, profile *UserProfile) error {
+func syncProfileToUser(
+	db *gorm.DB,
+	profile *UserProfile,
+	phoneChanged bool,
+) error {
 	updates := map[string]interface{}{
 		"first_name":   profile.FirstName,
 		"last_name":    profile.LastName,
 		"display_name": profile.DisplayName,
+		"avatar":       profile.Avatar,
+		"phone":        profile.Phone,
 		"department":   profile.Department,
 		"job_title":    profile.Position,
+		"timezone":     profile.Timezone,
+		"language":     profile.Language,
 	}
-	return r.db.WithContext(ctx).Model(&models.User{}).Where("id = ?", profile.UserID).Updates(updates).Error
+	if phoneChanged {
+		updates["phone_verified"] = false
+		updates["phone_verified_at"] = nil
+	}
+	return db.Model(&models.User{}).
+		Where("id = ?", profile.UserID).
+		Updates(updates).Error
+}
+
+func legacyUserProfileProjection(user *models.User) models.UserProfile {
+	timezone := user.Timezone
+	if timezone == "" {
+		timezone = "Asia/Shanghai"
+	}
+	language := user.Language
+	if language == "" {
+		language = "zh-CN"
+	}
+	return models.UserProfile{
+		UserID:   user.ID,
+		Avatar:   user.Avatar,
+		Phone:    user.Phone,
+		Timezone: timezone,
+		Language: language,
+	}
 }
 
 func profileDisplayName(firstName, lastName string) string {

@@ -40,7 +40,7 @@ func (appender *adminUserActorEventAppender) AppendDomainEventTx(
 func TestAdminUserUpdateAllowsClearingPhoneAndEmailVerification(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := openHandlerTestDB(t)
-	if err := db.AutoMigrate(&models.User{}); err != nil {
+	if err := db.AutoMigrate(&models.User{}, &models.UserProfile{}); err != nil {
 		t.Fatalf("migrate users: %v", err)
 	}
 	user := models.User{
@@ -162,6 +162,26 @@ func TestAdminUserUpdateAllowsClearingPhoneAndEmailVerification(t *testing.T) {
 			avatarResponse.Code,
 			http.StatusBadRequest,
 			avatarResponse.Body.String(),
+		)
+	}
+
+	validAvatar := fmt.Sprintf(
+		"/uploads/avatars/%d/00000000-0000-4000-8000-000000000001.png",
+		user.ID,
+	)
+	validAvatarRequest := httptest.NewRequest(
+		http.MethodPut,
+		fmt.Sprintf("/users/%d", user.ID),
+		bytes.NewBufferString(fmt.Sprintf(`{"avatar":%q}`, validAvatar)),
+	)
+	validAvatarRequest.Header.Set("Content-Type", "application/json")
+	validAvatarResponse := httptest.NewRecorder()
+	router.ServeHTTP(validAvatarResponse, validAvatarRequest)
+	if validAvatarResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"valid avatar status = %d, body=%s",
+			validAvatarResponse.Code,
+			validAvatarResponse.Body.String(),
 		)
 	}
 

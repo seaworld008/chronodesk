@@ -204,22 +204,6 @@ func TestHumanAuthHandlersRejectUnknownAndTrailingJSON(t *testing.T) {
 			}`,
 		},
 		{
-			name:   "profile rejects direct avatar mutation",
-			handle: handler.UpdateProfile,
-			setup:  setStrictJSONAuthenticatedHuman,
-			payload: `{
-				"avatar":"/untrusted/avatar.png"
-			}`,
-		},
-		{
-			name:   "profile rejects unverified phone mutation",
-			handle: handler.UpdateProfile,
-			setup:  setStrictJSONAuthenticatedHuman,
-			payload: `{
-				"phone_number":"+8613800138000"
-			}`,
-		},
-		{
 			name:    "profile rejects trailing JSON",
 			handle:  handler.UpdateProfile,
 			setup:   setStrictJSONAuthenticatedHuman,
@@ -264,6 +248,71 @@ func TestHumanAuthHandlersRejectUnknownAndTrailingJSON(t *testing.T) {
 				)
 			}
 			assertClosedRuntimeAuthError(t, response.Body.Bytes(), "invalid_request")
+		})
+	}
+}
+
+func TestUpdateProfileReturnsStableChineseValidationErrors(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewAuthHandler(&AuthService{}, nil)
+	tests := []struct {
+		name     string
+		payload  string
+		wantCode string
+	}{
+		{
+			name:     "name",
+			payload:  `{"first_name":"` + strings.Repeat("名", 51) + `"}`,
+			wantCode: "invalid_profile_name",
+		},
+		{
+			name:     "timezone",
+			payload:  `{"timezone":"Mars/Olympus"}`,
+			wantCode: "invalid_profile_timezone",
+		},
+		{
+			name:     "language",
+			payload:  `{"language":"en"}`,
+			wantCode: "unsupported_profile_language",
+		},
+		{
+			name:     "phone",
+			payload:  `{"phone_number":"13800138000"}`,
+			wantCode: "invalid_profile_phone",
+		},
+		{
+			name:     "avatar",
+			payload:  `{"avatar":"https://example.test/avatar.png"}`,
+			wantCode: "invalid_profile_avatar",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			router := gin.New()
+			router.PUT("/", func(c *gin.Context) {
+				setStrictJSONAuthenticatedHuman(c)
+				handler.UpdateProfile(NewGinHTTPContext(c))
+			})
+			request := httptest.NewRequest(
+				http.MethodPut,
+				"/",
+				strings.NewReader(test.payload),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d; body=%s", response.Code, response.Body.String())
+			}
+			var body ErrorResponse
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Error != test.wantCode ||
+				body.Code != test.wantCode ||
+				!strings.ContainsAny(body.Message, "的一是个效区名机文码持当仅最") {
+				t.Fatalf("validation response = %+v", body)
+			}
 		})
 	}
 }

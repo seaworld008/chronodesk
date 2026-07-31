@@ -1872,8 +1872,12 @@ func TestAdminUserPhoneAndManagerConstraintsMatchRuntime(t *testing.T) {
 		objectAt(t, schemas, "UpdateAdminUserRequest"),
 		"properties",
 	)
-	if _, exists := update["avatar"]; exists {
-		t.Fatal("UpdateAdminUserRequest must not expose direct avatar writes")
+	adminAvatar := objectAt(t, update, "avatar")
+	if pattern, _ := adminAvatar["pattern"].(string); !strings.HasPrefix(
+		pattern,
+		"^$|^/uploads/avatars/",
+	) {
+		t.Fatalf("UpdateAdminUserRequest.avatar = %v", adminAvatar)
 	}
 	updatePhone := objectAt(t, update, "phone")
 	branches, ok := updatePhone["oneOf"].([]any)
@@ -1907,6 +1911,45 @@ func TestAdminUserPhoneAndManagerConstraintsMatchRuntime(t *testing.T) {
 		if manager["minimum"] != float64(1) {
 			t.Errorf("%s.manager_id = %v", schemaName, manager)
 		}
+	}
+}
+
+func TestHumanProfileUpdatePublishesValidatedCompatibilityFields(t *testing.T) {
+	document := decodeDocument(t)
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+	properties := objectAt(
+		t,
+		objectAt(t, schemas, "UpdateHumanProfileRequest"),
+		"properties",
+	)
+	for _, name := range []string{"first_name", "last_name"} {
+		property := objectAt(t, properties, name)
+		if property["maxLength"] != float64(50) {
+			t.Errorf("%s maxLength = %v", name, property["maxLength"])
+		}
+	}
+	timezone := objectAt(t, properties, "timezone")
+	if timezone["format"] != "iana-timezone" {
+		t.Errorf("timezone schema = %v", timezone)
+	}
+	language := objectAt(t, properties, "language")
+	if !reflect.DeepEqual(language["enum"], []any{"zh-CN"}) {
+		t.Errorf("language schema = %v", language)
+	}
+	phone := objectAt(t, properties, "phone_number")
+	if len(phone["oneOf"].([]any)) != 2 {
+		t.Errorf("phone_number schema = %v", phone)
+	}
+	avatar := objectAt(t, properties, "avatar")
+	if pattern, _ := avatar["pattern"].(string); !strings.HasPrefix(
+		pattern,
+		"^$|^/uploads/avatars/",
+	) {
+		t.Errorf("avatar schema = %v", avatar)
 	}
 }
 

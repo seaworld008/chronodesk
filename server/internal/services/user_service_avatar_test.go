@@ -156,3 +156,50 @@ func TestUploadAvatarRejectsSpoofedAndOversizedPayloads(t *testing.T) {
 		t.Fatalf("oversized image error = %v, want ErrAttachmentTooLarge", err)
 	}
 }
+
+func TestUploadAvatarBackfillsLegacyProfileWithoutDroppingContactPreferences(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.User{}, &models.UserProfile{}); err != nil {
+		t.Fatal(err)
+	}
+	user := models.User{
+		Username:     "legacy-avatar",
+		Email:        "legacy-avatar@example.test",
+		Phone:        "+8613800138000",
+		PasswordHash: "hashed",
+		Timezone:     "Asia/Tokyo",
+		Language:     "zh-CN",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	storage, err := NewLocalAttachmentStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewUserService(db)
+	service.SetAvatarStorage(storage, defaultAvatarMaxBytes)
+	file, header := avatarUploadFile(t, validAvatarPNG(t), "legacy.png")
+	defer file.Close()
+	avatarURL, err := service.UploadAvatar(
+		context.Background(),
+		user.ID,
+		file,
+		header,
+	)
+	if err != nil {
+		t.Fatalf("UploadAvatar: %v", err)
+	}
+	var profile models.UserProfile
+	if err := db.Where("user_id = ?", user.ID).First(&profile).Error; err != nil {
+		t.Fatal(err)
+	}
+	if profile.Avatar != avatarURL ||
+		profile.Phone != user.Phone ||
+		profile.Timezone != user.Timezone ||
+		profile.Language != user.Language {
+		t.Fatalf("legacy upload profile lost fields: %+v", profile)
+	}
+}

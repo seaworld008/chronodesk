@@ -6568,16 +6568,39 @@
         "additionalProperties": false,
         "properties": {
           "first_name": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 50
           },
           "last_name": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 50
+          },
+          "phone_number": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^\\+[1-9][0-9]{1,14}$"
+              },
+              {
+                "type": "string",
+                "maxLength": 0
+              }
+            ]
+          },
+          "avatar": {
+            "type": "string",
+            "pattern": "^$|^/uploads/avatars/[1-9][0-9]*/[0-9a-fA-F-]+\\.(jpg|png)$",
+            "description": "Empty, or the opaque local path returned by the authenticated user's controlled avatar upload endpoint."
           },
           "timezone": {
-            "type": "string"
+            "type": "string",
+            "format": "iana-timezone"
           },
           "language": {
-            "type": "string"
+            "type": "string",
+            "enum": [
+              "zh-CN"
+            ]
           }
         }
       },
@@ -6739,6 +6762,11 @@
           "display_name": {
             "type": "string",
             "maxLength": 100
+          },
+          "avatar": {
+            "type": "string",
+            "pattern": "^$|^/uploads/avatars/[1-9][0-9]*/[0-9a-fA-F-]+\\.(jpg|png)$",
+            "description": "Compatibility field. Empty, or the opaque local path returned by that user's controlled avatar upload endpoint."
           },
           "timezone": {
             "type": "string",

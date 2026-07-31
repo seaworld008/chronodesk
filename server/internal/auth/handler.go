@@ -933,6 +933,14 @@ func (h *AuthHandler) UpdateProfile(c HTTPContext) {
 			"user_id", authLogUserID(userInfo.ID),
 			"reason", authLogReason(err),
 		)
+		if code, message, ok := profileValidationHTTPError(err); ok {
+			c.JSON(http.StatusBadRequest, ErrorResponse{
+				Error:   code,
+				Code:    code,
+				Message: message,
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, ErrorResponse{
 			Error:   "update_failed",
 			Message: "更新个人资料失败",
@@ -944,6 +952,23 @@ func (h *AuthHandler) UpdateProfile(c HTTPContext) {
 		Success: true,
 		Message: "个人资料更新成功",
 	})
+}
+
+func profileValidationHTTPError(err error) (string, string, bool) {
+	switch {
+	case errors.Is(err, ErrInvalidProfileName):
+		return "invalid_profile_name", "名字和姓氏最多 50 个字符", true
+	case errors.Is(err, ErrInvalidProfileZone):
+		return "invalid_profile_timezone", "时区必须是有效的 IANA 时区名称", true
+	case errors.Is(err, ErrInvalidProfileLocale):
+		return "unsupported_profile_language", "当前仅支持简体中文（zh-CN）", true
+	case errors.Is(err, ErrInvalidProfilePhone):
+		return "invalid_profile_phone", "手机号码必须为空或使用 E.164 格式", true
+	case errors.Is(err, ErrInvalidProfileAvatar):
+		return "invalid_profile_avatar", "头像只能使用当前账号通过头像上传接口生成的本地路径", true
+	default:
+		return "", "", false
+	}
 }
 
 // ChangePassword 修改密码
@@ -1006,7 +1031,7 @@ func (h *AuthHandler) ChangePassword(c HTTPContext) {
 
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
-		Message: "密码修改成功",
+		Message: "密码修改成功，所有会话（包括当前会话）均已失效",
 	})
 }
 

@@ -8,9 +8,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/services"
@@ -19,25 +21,33 @@ import (
 
 // 错误定义
 var (
-	ErrInvalidCredentials  = errors.New("invalid credentials")
-	ErrUserNotFound        = errors.New("user not found")
-	ErrUserExists          = errors.New("user already exists")
-	ErrInvalidToken        = errors.New("invalid token")
-	ErrTokenExpired        = errors.New("token expired")
-	ErrInvalidOTP          = errors.New("invalid OTP")
-	ErrOTPExpired          = errors.New("OTP expired")
-	ErrEmailNotVerified    = errors.New("email not verified")
-	ErrAccountLocked       = errors.New("account locked")
-	ErrAccountInactive     = errors.New("account is inactive")
-	ErrAccountSuspended    = errors.New("account is suspended")
-	ErrAccountDeleted      = errors.New("account is deleted")
-	ErrInvalidAccountState = errors.New("invalid account state")
-	ErrPasswordTooWeak     = errors.New("password too weak")
+	ErrInvalidCredentials   = errors.New("invalid credentials")
+	ErrUserNotFound         = errors.New("user not found")
+	ErrUserExists           = errors.New("user already exists")
+	ErrInvalidToken         = errors.New("invalid token")
+	ErrTokenExpired         = errors.New("token expired")
+	ErrInvalidOTP           = errors.New("invalid OTP")
+	ErrOTPExpired           = errors.New("OTP expired")
+	ErrEmailNotVerified     = errors.New("email not verified")
+	ErrAccountLocked        = errors.New("account locked")
+	ErrAccountInactive      = errors.New("account is inactive")
+	ErrAccountSuspended     = errors.New("account is suspended")
+	ErrAccountDeleted       = errors.New("account is deleted")
+	ErrInvalidAccountState  = errors.New("invalid account state")
+	ErrPasswordTooWeak      = errors.New("password too weak")
+	ErrInvalidProfileName   = errors.New("profile name is invalid")
+	ErrInvalidProfileZone   = errors.New("profile timezone is invalid")
+	ErrInvalidProfileLocale = errors.New(
+		"profile language is not supported",
+	)
+	ErrInvalidProfilePhone  = errors.New("profile phone is invalid")
+	ErrInvalidProfileAvatar = errors.New("profile avatar is invalid")
 )
 
 var (
 	defaultTrustedDeviceTTL        = 30 * 24 * time.Hour
 	defaultTrustedDeviceMaxPerUser = 5
+	profilePhonePattern            = regexp.MustCompile(`^\+[1-9][0-9]{1,14}$`)
 )
 
 // PlatformRole 与领域用户模型共享同一组平台职责，避免认证与治理授权漂移。
@@ -233,10 +243,12 @@ type ResendVerificationRequest struct {
 
 // UpdateProfileRequest 更新用户资料请求
 type UpdateProfileRequest struct {
-	FirstName *string `json:"first_name,omitempty"`
-	LastName  *string `json:"last_name,omitempty"`
-	Timezone  *string `json:"timezone,omitempty"`
-	Language  *string `json:"language,omitempty"`
+	FirstName   *string `json:"first_name,omitempty"`
+	LastName    *string `json:"last_name,omitempty"`
+	PhoneNumber *string `json:"phone_number,omitempty"`
+	Avatar      *string `json:"avatar,omitempty"`
+	Timezone    *string `json:"timezone,omitempty"`
+	Language    *string `json:"language,omitempty"`
 }
 
 // VerifyEmailRequest 验证邮箱请求
@@ -1324,6 +1336,12 @@ func (s *AuthService) ResendVerification(ctx context.Context, email string) erro
 
 // UpdateProfile 更新用户资料
 func (s *AuthService) UpdateProfile(ctx context.Context, userID uint, req *UpdateProfileRequest) error {
+	if req == nil {
+		return ErrInvalidProfileName
+	}
+	if err := validateUpdateProfileRequest(userID, req); err != nil {
+		return err
+	}
 	// 获取用户资料
 	profile, err := s.profileRepo.GetByUserID(ctx, userID)
 	if err != nil {
@@ -1336,6 +1354,12 @@ func (s *AuthService) UpdateProfile(ctx context.Context, userID uint, req *Updat
 	}
 	if req.LastName != nil {
 		profile.LastName = *req.LastName
+	}
+	if req.PhoneNumber != nil {
+		profile.Phone = *req.PhoneNumber
+	}
+	if req.Avatar != nil {
+		profile.Avatar = *req.Avatar
 	}
 	if req.Timezone != nil {
 		profile.Timezone = *req.Timezone
@@ -1354,6 +1378,50 @@ func (s *AuthService) UpdateProfile(ctx context.Context, userID uint, req *Updat
 		return fmt.Errorf("failed to update profile: %w", err)
 	}
 
+	return nil
+}
+
+func validateUpdateProfileRequest(
+	userID uint,
+	req *UpdateProfileRequest,
+) error {
+	for _, name := range []*string{req.FirstName, req.LastName} {
+		if name == nil {
+			continue
+		}
+		*name = strings.TrimSpace(*name)
+		if utf8.RuneCountInString(*name) > 50 {
+			return ErrInvalidProfileName
+		}
+	}
+	if req.Timezone != nil {
+		*req.Timezone = strings.TrimSpace(*req.Timezone)
+		if *req.Timezone == "" || *req.Timezone == "Local" {
+			return ErrInvalidProfileZone
+		}
+		if _, err := time.LoadLocation(*req.Timezone); err != nil {
+			return ErrInvalidProfileZone
+		}
+	}
+	if req.Language != nil {
+		*req.Language = strings.TrimSpace(*req.Language)
+		if *req.Language != "zh-CN" {
+			return ErrInvalidProfileLocale
+		}
+	}
+	if req.PhoneNumber != nil {
+		*req.PhoneNumber = strings.TrimSpace(*req.PhoneNumber)
+		if *req.PhoneNumber != "" &&
+			!profilePhonePattern.MatchString(*req.PhoneNumber) {
+			return ErrInvalidProfilePhone
+		}
+	}
+	if req.Avatar != nil {
+		*req.Avatar = strings.TrimSpace(*req.Avatar)
+		if !services.IsControlledUserAvatarURL(userID, *req.Avatar) {
+			return ErrInvalidProfileAvatar
+		}
+	}
 	return nil
 }
 

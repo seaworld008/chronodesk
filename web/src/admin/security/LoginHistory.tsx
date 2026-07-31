@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { History as HistoryIcon, Refresh as RefreshIcon } from '@mui/icons-material'
+import { Refresh as RefreshIcon } from '@mui/icons-material'
 import {
     Alert,
     Box,
@@ -15,7 +15,6 @@ import {
     TablePagination,
     TableRow,
     Tooltip,
-    Typography,
 } from '@mui/material'
 import { Title } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
@@ -24,6 +23,7 @@ import {
     TruncatedText,
     type ResizableColumn,
 } from '@/components/tables/EnterpriseTable'
+import AccountPageHeader from './AccountPageHeader'
 
 interface LoginHistoryRecord {
     id: number
@@ -98,32 +98,25 @@ const LoginHistory = () => {
         <Box sx={{ p: { xs: 2, md: 3 } }}>
             <Title title="登录历史" />
             <Paper sx={{ p: { xs: 2, md: 3 } }}>
-                <Stack
-                    direction="row"
-                    spacing={1}
-                    sx={{ alignItems: 'center', justifyContent: 'space-between', mb: 2 }}
-                >
-                    <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
-                        <HistoryIcon color="primary" />
-                        <Box>
-                            <Typography variant="h4">登录历史</Typography>
-                            <Typography color="text.secondary">
-                                最近 {page?.items.length ?? 0} 条记录（共 {page?.total ?? 0} 条）
-                            </Typography>
-                        </Box>
-                    </Stack>
-                    <Tooltip title="刷新">
-                        <span>
-                            <IconButton
-                                aria-label="刷新登录历史"
-                                disabled={loading}
-                                onClick={() => void load()}
-                            >
-                                <RefreshIcon />
-                            </IconButton>
-                        </span>
-                    </Tooltip>
-                </Stack>
+                <Box sx={{ mb: 2 }}>
+                    <AccountPageHeader
+                        title="登录历史"
+                        description={`最近 ${page?.items.length ?? 0} 条记录（共 ${page?.total ?? 0} 条）`}
+                        action={(
+                            <Tooltip title="刷新">
+                                <span>
+                                    <IconButton
+                                        aria-label="刷新登录历史"
+                                        disabled={loading}
+                                        onClick={() => void load()}
+                                    >
+                                        <RefreshIcon />
+                                    </IconButton>
+                                </span>
+                            </Tooltip>
+                        )}
+                    />
+                </Box>
 
                 {error && (
                     <Alert
