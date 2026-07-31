@@ -78,3 +78,17 @@ test('invalid URL filters are explicit and cannot expand into an unfiltered quer
         )
     }
 })
+
+test('unknown duplicate and mutually exclusive URL parameters are rejected', () => {
+    for (const query of [
+        'role=admin',
+        'platform_role=member&platform_role=security_auditor',
+        'time_preset=24h&start_time=2026-07-31T00%3A00%3A00Z',
+    ]) {
+        const filters = auditFiltersFromSearchParams(
+            new URLSearchParams(query),
+        )
+        assert.match(filters.urlError, /参数|不能同时使用/u)
+        assert.throws(() => auditFiltersToQuery(filters))
+    }
+})

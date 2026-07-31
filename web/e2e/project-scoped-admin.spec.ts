@@ -871,14 +871,29 @@ test.describe('平台职责与项目 Membership 入口隔离', () => {
         };
         await installSession(page, identity);
         const backend = await mockBackend(page);
-        await page.goto(
-            '/#/platform/audit?platform_role=administrator&limit=500',
-        );
-        await expect(
-            page.getByText(
-                /URL 中的平台角色、每页数量参数无效/u,
-            ),
-        ).toBeVisible();
+        for (const testCase of [
+            {
+                query: 'platform_role=administrator&limit=500',
+                message: /平台角色、每页数量/u,
+            },
+            {
+                query: 'role=admin',
+                message: /未知参数 role/u,
+            },
+            {
+                query:
+                    'platform_role=member&platform_role=security_auditor',
+                message: /重复参数 platform_role/u,
+            },
+            {
+                query:
+                    'time_preset=24h&start_time=2026-07-31T00%3A00%3A00Z',
+                message: /时间预设与自定义时间范围不能同时使用/u,
+            },
+        ]) {
+            await page.goto(`/#/platform/audit?${testCase.query}`);
+            await expect(page.getByText(testCase.message)).toBeVisible();
+        }
         expect(
             backend.platformRequests.filter((request) =>
                 request.includes('/api/platform/audit-logs'),

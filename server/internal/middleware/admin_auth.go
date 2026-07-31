@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/seaworld008/chronodesk/server/internal/models"
@@ -272,17 +274,14 @@ func adminAuditMetadataForRoute(
 
 func boundedAdminAuditResourceID(value string) string {
 	value = strings.TrimSpace(value)
-	if value == "" || len(value) > 255 {
+	if value == "" || len(value) > 255 || !utf8.ValidString(value) ||
+		utf8.RuneCountInString(value) > 128 {
 		return ""
 	}
 	for _, char := range value {
-		if (char >= 'a' && char <= 'z') ||
-			(char >= 'A' && char <= 'Z') ||
-			(char >= '0' && char <= '9') ||
-			char == '-' || char == '_' || char == '.' || char == ':' {
-			continue
+		if unicode.IsControl(char) {
+			return ""
 		}
-		return ""
 	}
 	return value
 }

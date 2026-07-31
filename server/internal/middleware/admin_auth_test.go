@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
@@ -156,6 +157,56 @@ func TestLogAdminOperationUsesTrustedRouteTemplateForResourceMetadata(
 		record.ResourceType != "user" ||
 		record.ResourcePublicID != "42" {
 		t.Fatalf("structured audit metadata = %+v", record)
+	}
+}
+
+func TestLogAdminOperationAcceptsUnicodeConfigResourceKeys(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, test := range []struct {
+		method     string
+		actionCode string
+	}{
+		{method: http.MethodPut, actionCode: "platform.config.update"},
+		{method: http.MethodDelete, actionCode: "platform.config.delete"},
+	} {
+		t.Run(test.method, func(t *testing.T) {
+			audit := &recordingAdminAuditService{}
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				c.Set("user_id", uint(7))
+				c.Set("platform_role", models.PlatformRolePlatformAdmin)
+				c.Next()
+			})
+			router.Use(LogAdminOperation(audit))
+			router.Handle(
+				test.method,
+				"/api/platform/configs/:key",
+				func(c *gin.Context) { c.Status(http.StatusOK) },
+			)
+			const configKey = "通知.保留天数"
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(
+				recorder,
+				httptest.NewRequest(
+					test.method,
+					"/api/platform/configs/"+url.PathEscape(configKey),
+					nil,
+				),
+			)
+			if recorder.Code != http.StatusOK || len(audit.records) != 1 {
+				t.Fatalf(
+					"status=%d records=%d",
+					recorder.Code,
+					len(audit.records),
+				)
+			}
+			record := audit.records[0]
+			if record.ActionCode != test.actionCode ||
+				record.ResourceType != "system_config" ||
+				record.ResourcePublicID != configKey {
+				t.Fatalf("unicode config audit metadata = %+v", record)
+			}
+		})
 	}
 }
 

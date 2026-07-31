@@ -39,6 +39,21 @@ const methods = new Set([
 ])
 const results = new Set(['pending', 'success', 'error'])
 const presets = new Set(['1h', '24h', '7d', '30d'])
+const supportedParameters = new Set([
+    'actor',
+    'platform_role',
+    'action',
+    'method',
+    'path_prefix',
+    'status',
+    'result',
+    'keyword',
+    'time_preset',
+    'start_time',
+    'end_time',
+    'cursor',
+    'limit',
+])
 
 export const auditFiltersFromSearchParams = (
     searchParams: URLSearchParams,
@@ -51,6 +66,20 @@ export const auditFiltersFromSearchParams = (
     const rawLimit = Number(limitValue ?? 25)
     const status = searchParams.get('status') ?? ''
     const invalidFields: string[] = []
+    for (const key of new Set(searchParams.keys())) {
+        if (!supportedParameters.has(key)) {
+            invalidFields.push(`未知参数 ${key}`)
+        }
+        if (searchParams.getAll(key).length !== 1) {
+            invalidFields.push(`重复参数 ${key}`)
+        }
+    }
+    if (
+        timePreset &&
+        (searchParams.has('start_time') || searchParams.has('end_time'))
+    ) {
+        invalidFields.push('时间预设与自定义时间范围不能同时使用')
+    }
     if (platformRole && !platformRoles.has(platformRole)) {
         invalidFields.push('平台角色')
     }
