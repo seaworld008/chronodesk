@@ -543,7 +543,13 @@ func Run() error {
 	if err != nil {
 		log.Fatal("Failed to initialize A2A server:", err)
 	}
-	adminAuditService := services.NewAdminAuditService(db.DB)
+	adminAuditService, err := services.NewAdminAuditServiceWithCursorKey(
+		db.DB,
+		[]byte(cfg.JWT.Secret),
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize admin audit service:", err)
+	}
 	automationService := services.NewAutomationServiceWithAgentNative(db.DB, nativeService)
 	slaEscalationConsumer := services.NewEscalationService(db.DB)
 	slaEscalationConsumer.SetAgentNativeService(nativeService)

@@ -73,21 +73,36 @@ func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.Han
 		platformRole, _ := GetCurrentPlatformRole(c)
 
 		action := fmt.Sprintf("%s %s", strings.ToUpper(method), path)
+		metadata, ok := adminAuditMetadataForRoute(
+			strings.ToUpper(method),
+			c.FullPath(),
+			c.Params,
+		)
+		if !ok {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"code": 1,
+				"msg":  "管理员审计操作映射不可用",
+			})
+			return
+		}
 		record := &services.AdminAuditRecord{
-			UserID:        userIDPtr,
-			PlatformRole:  platformRole,
-			Action:        action,
-			Method:        method,
-			Path:          path,
-			RequestID:     c.GetString("request_id"),
-			TraceID:       TraceID(c),
-			CorrelationID: CorrelationID(c),
-			StatusCode:    0,
-			ClientIP:      clientIP,
-			UserAgent:     userAgent,
-			Query:         query,
-			Result:        "pending",
-			Notes:         "管理员写操作已进入执行阶段",
+			UserID:           userIDPtr,
+			PlatformRole:     platformRole,
+			Action:           action,
+			ActionCode:       metadata.ActionCode,
+			ResourceType:     metadata.ResourceType,
+			ResourcePublicID: metadata.ResourcePublicID,
+			Method:           method,
+			Path:             path,
+			RequestID:        c.GetString("request_id"),
+			TraceID:          TraceID(c),
+			CorrelationID:    CorrelationID(c),
+			StatusCode:       0,
+			ClientIP:         clientIP,
+			UserAgent:        userAgent,
+			Query:            query,
+			Result:           "pending",
+			Notes:            "管理员写操作已进入执行阶段",
 		}
 
 		if err := auditService.Record(c.Request.Context(), record); err != nil {
@@ -126,6 +141,150 @@ func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.Han
 		c.Next()
 		completed = true
 	}
+}
+
+type adminAuditMetadata struct {
+	ActionCode       string
+	ResourceType     string
+	ResourcePublicID string
+}
+
+type adminAuditRouteMetadata struct {
+	actionCode    string
+	resourceType  string
+	publicIDParam string
+	fixedPublicID string
+}
+
+var adminAuditRouteMetadataByOperation = map[string]adminAuditRouteMetadata{
+	"POST /api/platform/projects": {
+		"platform.project.create", "project", "", "new",
+	},
+	"POST /api/platform/projects/:projectPublicID/archive": {
+		"platform.project.archive", "project", "projectPublicID", "",
+	},
+	"PUT /api/platform/email-config": {
+		"platform.email_config.update", "email_config", "", "global",
+	},
+	"POST /api/platform/email-config/test": {
+		"platform.email_config.test", "email_config", "", "global",
+	},
+	"POST /api/platform/users": {
+		"platform.user.create", "user", "", "new",
+	},
+	"PUT /api/platform/users/:id": {
+		"platform.user.update", "user", "id", "",
+	},
+	"DELETE /api/platform/users/:id": {
+		"platform.user.delete", "user", "id", "",
+	},
+	"POST /api/platform/users/:id/reset-password": {
+		"platform.user.reset_password", "user", "id", "",
+	},
+	"PUT /api/platform/system/cleanup/config": {
+		"platform.cleanup_config.update", "cleanup_config", "", "global",
+	},
+	"POST /api/platform/system/cleanup/execute": {
+		"platform.cleanup.execute", "cleanup_job", "", "requested",
+	},
+	"POST /api/platform/system/cleanup/execute-all": {
+		"platform.cleanup.execute_all", "cleanup_job", "", "all",
+	},
+	"POST /api/platform/configs": {
+		"platform.config.create", "system_config", "", "new",
+	},
+	"PUT /api/platform/configs/:key": {
+		"platform.config.update", "system_config", "key", "",
+	},
+	"DELETE /api/platform/configs/:key": {
+		"platform.config.delete", "system_config", "key", "",
+	},
+	"PUT /api/platform/configs/batch": {
+		"platform.config.batch_update", "system_config", "", "batch",
+	},
+	"POST /api/platform/configs/import": {
+		"platform.config.import", "system_config", "", "import",
+	},
+	"POST /api/platform/configs/init": {
+		"platform.config.initialize", "system_config", "", "defaults",
+	},
+	"POST /api/projects/:projectKey/admin/agents/service-principals": {
+		"project.agent.service_principal.create",
+		"service_principal",
+		"",
+		"new",
+	},
+	"PUT /api/projects/:projectKey/admin/agents/service-principals/:id/status": {
+		"project.agent.service_principal.update_status",
+		"service_principal",
+		"id",
+		"",
+	},
+	"POST /api/projects/:projectKey/admin/agents/service-principals/:id/credentials/rotate": {
+		"project.agent.credential.rotate", "service_principal", "id", "",
+	},
+	"DELETE /api/projects/:projectKey/admin/agents/service-principals/:id/credentials/:credential_id": {
+		"project.agent.credential.revoke", "agent_credential", "credential_id", "",
+	},
+	"POST /api/projects/:projectKey/admin/agents/service-principals/:id/policies": {
+		"project.agent.policy.create", "service_principal", "id", "",
+	},
+	"DELETE /api/projects/:projectKey/admin/agents/service-principals/:id/policies/:policy_id": {
+		"project.agent.policy.disable", "agent_policy", "policy_id", "",
+	},
+	"POST /api/projects/:projectKey/admin/agents/leases/:id/force-release": {
+		"project.agent.lease.force_release", "ticket_lease", "id", "",
+	},
+	"POST /api/projects/:projectKey/admin/agents/attachments/:id/scan": {
+		"project.agent.attachment.scan", "ticket_attachment", "id", "",
+	},
+	"POST /api/projects/:projectKey/admin/agents/outbox/:id/replay": {
+		"project.agent.outbox.replay", "outbox_delivery", "id", "",
+	},
+}
+
+func adminAuditMetadataForRoute(
+	method string,
+	routeTemplate string,
+	params gin.Params,
+) (adminAuditMetadata, bool) {
+	operation := strings.TrimSpace(method) + " " +
+		strings.TrimSpace(routeTemplate)
+	config, ok := adminAuditRouteMetadataByOperation[operation]
+	if !ok {
+		return adminAuditMetadata{}, false
+	}
+	publicID := config.fixedPublicID
+	if config.publicIDParam != "" {
+		publicID = boundedAdminAuditResourceID(
+			params.ByName(config.publicIDParam),
+		)
+		if publicID == "" {
+			return adminAuditMetadata{}, false
+		}
+	}
+	return adminAuditMetadata{
+		ActionCode:       config.actionCode,
+		ResourceType:     config.resourceType,
+		ResourcePublicID: publicID,
+	}, true
+}
+
+func boundedAdminAuditResourceID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 255 {
+		return ""
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '-' || char == '_' || char == '.' || char == ':' {
+			continue
+		}
+		return ""
+	}
+	return value
 }
 
 // isImportantAdminOperation 判断是否为重要的管理操作

@@ -4,6 +4,7 @@ import type {
 } from '@/lib/generated/human-api'
 
 export interface AuditExplorerFilters {
+    urlError: string
     actor: string
     platformRole: PlatformRole | ''
     action: string
@@ -46,8 +47,41 @@ export const auditFiltersFromSearchParams = (
     const method = (searchParams.get('method') ?? '').toUpperCase()
     const result = searchParams.get('result') ?? ''
     const timePreset = searchParams.get('time_preset') ?? ''
-    const rawLimit = Number(searchParams.get('limit') ?? 25)
+    const limitValue = searchParams.get('limit')
+    const rawLimit = Number(limitValue ?? 25)
+    const status = searchParams.get('status') ?? ''
+    const invalidFields: string[] = []
+    if (platformRole && !platformRoles.has(platformRole)) {
+        invalidFields.push('平台角色')
+    }
+    if (method && !methods.has(method)) {
+        invalidFields.push('请求方法')
+    }
+    if (result && !results.has(result)) {
+        invalidFields.push('操作结果')
+    }
+    if (timePreset && !presets.has(timePreset)) {
+        invalidFields.push('时间范围')
+    }
+    if (
+        limitValue !== null &&
+        (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 100)
+    ) {
+        invalidFields.push('每页数量')
+    }
+    if (
+        status &&
+        (!/^\d{3}$/u.test(status) ||
+            Number(status) < 100 ||
+            Number(status) > 599)
+    ) {
+        invalidFields.push('HTTP 状态')
+    }
     return {
+        urlError:
+            invalidFields.length === 0
+                ? ''
+                : `URL 中的${invalidFields.join('、')}参数无效，请清除或修正筛选条件`,
         actor: searchParams.get('actor') ?? '',
         platformRole: platformRoles.has(platformRole)
             ? (platformRole as PlatformRole)
@@ -57,7 +91,7 @@ export const auditFiltersFromSearchParams = (
             ? (method as AuditExplorerFilters['method'])
             : '',
         pathPrefix: searchParams.get('path_prefix') ?? '',
-        status: searchParams.get('status') ?? '',
+        status,
         result: results.has(result)
             ? (result as AuditExplorerFilters['result'])
             : '',
@@ -105,6 +139,9 @@ export const auditFiltersToSearchParams = (
 export const auditFiltersToQuery = (
     filters: AuditExplorerFilters,
 ): ListPlatformAuditLogsOperationQuery => {
+    if (filters.urlError) {
+        throw new Error(filters.urlError)
+    }
     const query: ListPlatformAuditLogsOperationQuery = {
         limit: filters.limit,
     }

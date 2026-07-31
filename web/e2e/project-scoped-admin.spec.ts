@@ -32,6 +32,11 @@ type MockBackendState = {
     platformRequests: string[];
 };
 
+type AuditRouteResponder = (
+    route: Route,
+    url: URL,
+) => Promise<boolean>;
+
 const contractTimestamp = '2026-07-30T08:00:00Z';
 
 const organization: Organization = {
@@ -303,6 +308,7 @@ const mockBackend = async (
     page: Page,
     accesses: ProjectAccess[] = [],
     accessesByToken = new Map<string, ProjectAccess[]>(),
+    auditRouteResponder?: AuditRouteResponder,
 ): Promise<MockBackendState> => {
     const state: MockBackendState = {
         accesses,
@@ -379,6 +385,13 @@ const mockBackend = async (
 
         if (url.pathname.startsWith('/api/platform/')) {
             state.platformRequests.push(requestLabel);
+            if (
+                url.pathname.startsWith('/api/platform/audit-logs') &&
+                auditRouteResponder &&
+                (await auditRouteResponder(route, url))
+            ) {
+                return;
+            }
             if (url.pathname === '/api/platform/audit-logs') {
                 await fulfillJSON(route, {
                     code: 0,
@@ -386,7 +399,7 @@ const mockBackend = async (
                         items: [],
                         total: 0,
                         page: 1,
-                        page_size: 25,
+                        limit: 25,
                     },
                 });
                 return;
@@ -642,7 +655,10 @@ test.describe('平台职责与项目 Membership 入口隔离', () => {
             .click();
         await expect(page.getByTestId('platform-audit-page')).toBeVisible();
         await expect(
-            page.getByRole('heading', { name: '平台审计', exact: true }),
+            page.getByRole('heading', {
+                name: '平台审计探索器',
+                exact: true,
+            }),
         ).toBeVisible();
         await expect.poll(() =>
             backend.platformRequests.some((request) =>
@@ -668,6 +684,212 @@ test.describe('平台职责与项目 Membership 入口隔离', () => {
                 request.includes('/api/platform/users'),
             ),
         ).toEqual([]);
+    });
+
+    test('平台审计展示加载、错误重试与空状态且不会越权请求', async ({
+        page,
+    }) => {
+        const identity: SessionIdentity = {
+            ...defaultIdentity,
+            subject: String(defaultIdentity.id),
+            sessionID: 'session-audit-states',
+            email: 'audit-states@example.test',
+            platformRole: 'security_auditor',
+        };
+        await installSession(page, identity);
+        let releaseFirstRequest = () => {};
+        const firstRequestGate = new Promise<void>((resolve) => {
+            releaseFirstRequest = resolve;
+        });
+        let listCalls = 0;
+        const backend = await mockBackend(
+            page,
+            [],
+            new Map(),
+            async (route, url) => {
+                if (url.pathname !== '/api/platform/audit-logs') {
+                    return false;
+                }
+                listCalls += 1;
+                if (listCalls <= 2) {
+                    await firstRequestGate;
+                    await fulfillJSON(
+                        route,
+                        { code: 1, msg: '平台审计暂时不可用' },
+                        500,
+                    );
+                    return true;
+                }
+                await fulfillJSON(route, {
+                    code: 0,
+                    data: {
+                        items: [],
+                        total: 0,
+                        page: 1,
+                        limit: 25,
+                    },
+                });
+                return true;
+            },
+        );
+
+        await page.goto('/#/platform/audit');
+        await expect(
+            page.getByRole('status', {
+                name: '正在加载平台审计记录',
+            }),
+        ).toBeVisible();
+        releaseFirstRequest();
+        await expect(
+            page.getByText('平台审计暂时不可用', { exact: true }),
+        ).toBeVisible();
+        await page.getByRole('button', { name: '重试', exact: true }).click();
+        await expect(
+            page.getByText('暂无符合条件的平台审计记录', {
+                exact: true,
+            }),
+        ).toBeVisible();
+        expect(listCalls).toBeGreaterThanOrEqual(3);
+        expect(
+            backend.platformRequests.filter((request) =>
+                !request.startsWith('GET /api/platform/audit-logs'),
+            ),
+        ).toEqual([]);
+    });
+
+    test('平台审计支持键盘打开详情抽屉并使用游标翻页', async ({
+        page,
+    }) => {
+        const identity: SessionIdentity = {
+            ...defaultIdentity,
+            subject: String(defaultIdentity.id),
+            sessionID: 'session-audit-keyboard-pagination',
+            email: 'audit-keyboard@example.test',
+            platformRole: 'security_auditor',
+        };
+        await installSession(page, identity);
+        const listQueries: string[] = [];
+        const auditItem = (
+            id: number,
+            username: string,
+        ) => ({
+            id,
+            created_at: `2026-07-31T08:00:0${id}Z`,
+            username,
+            platform_role: 'security_auditor',
+            action: 'platform.user.update',
+            action_code: 'platform.user.update',
+            resource_type: 'user',
+            resource_public_id: String(id),
+            method: 'PUT',
+            path: `/api/platform/users/${id}`,
+            status_code: 200,
+            masked_ip: '192.0.*.*',
+            latency_ms: 12,
+            result: 'success',
+        });
+        await mockBackend(
+            page,
+            [],
+            new Map(),
+            async (route, url) => {
+                if (url.pathname === '/api/platform/audit-logs') {
+                    listQueries.push(url.search);
+                    const cursor = url.searchParams.get('cursor');
+                    await fulfillJSON(route, {
+                        code: 0,
+                        data: {
+                            items: cursor
+                                ? [auditItem(2, 'Bob')]
+                                : [auditItem(1, 'Alice')],
+                            total: 2,
+                            page: 1,
+                            limit: 25,
+                            ...(cursor
+                                ? {}
+                                : { next_cursor: 'cursor-page-2' }),
+                        },
+                    });
+                    return true;
+                }
+                if (url.pathname === '/api/platform/audit-logs/1') {
+                    await fulfillJSON(route, {
+                        code: 0,
+                        data: {
+                            ...auditItem(1, 'Alice'),
+                            query: 'view=compact',
+                            user_agent: 'browser',
+                            notes: '',
+                            request_id: 'request-1',
+                        },
+                    });
+                    return true;
+                }
+                return false;
+            },
+        );
+
+        await page.goto('/#/platform/audit');
+        const firstRow = page.getByRole('button', {
+            name: /查看 Alice/u,
+        });
+        await expect(firstRow).toBeVisible();
+        await firstRow.focus();
+        await firstRow.press('Enter');
+        await expect(page.getByLabel('平台审计详情')).toBeVisible();
+        await expect(
+            page.getByText('view=compact', { exact: true }),
+        ).toBeVisible();
+        await page.getByRole('button', { name: '关闭', exact: true }).click();
+
+        await page
+            .getByRole('button', { name: '下一页', exact: true })
+            .click();
+        await expect(
+            page.getByRole('button', { name: /查看 Bob/u }),
+        ).toBeVisible();
+        expect(
+            listQueries.filter((query) => query === '?limit=25').length,
+        ).toBeGreaterThanOrEqual(1);
+        expect(listQueries[listQueries.length - 1]).toBe(
+            '?limit=25&cursor=cursor-page-2',
+        );
+        await expect(
+            page.getByRole('button', { name: '上一页', exact: true }),
+        ).toBeEnabled();
+    });
+
+    test('平台审计拒绝非法 URL 筛选且不发起扩大查询', async ({
+        page,
+    }) => {
+        const identity: SessionIdentity = {
+            ...defaultIdentity,
+            subject: String(defaultIdentity.id),
+            sessionID: 'session-audit-invalid-url',
+            email: 'audit-invalid-url@example.test',
+            platformRole: 'security_auditor',
+        };
+        await installSession(page, identity);
+        const backend = await mockBackend(page);
+        await page.goto(
+            '/#/platform/audit?platform_role=administrator&limit=500',
+        );
+        await expect(
+            page.getByText(
+                /URL 中的平台角色、每页数量参数无效/u,
+            ),
+        ).toBeVisible();
+        expect(
+            backend.platformRequests.filter((request) =>
+                request.includes('/api/platform/audit-logs'),
+            ),
+        ).toEqual([]);
+        await expect(
+            page.getByRole('button', {
+                name: '清除无效筛选',
+                exact: true,
+            }),
+        ).toBeVisible();
     });
 
     test('emergency_operator 不继承未声明的平台或项目入口', async ({

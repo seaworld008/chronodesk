@@ -108,6 +108,9 @@ func TestLogAdminOperationRecordsProjectAgentManagementWrite(t *testing.T) {
 	record := audit.records[0]
 	if record.Path != "/api/projects/OPS/admin/agents/service-principals" ||
 		record.Method != http.MethodPost ||
+		record.ActionCode != "project.agent.service_principal.create" ||
+		record.ResourceType != "service_principal" ||
+		record.ResourcePublicID != "new" ||
 		record.StatusCode != http.StatusCreated ||
 		record.UserID == nil ||
 		*record.UserID != 7 {
@@ -115,6 +118,77 @@ func TestLogAdminOperationRecordsProjectAgentManagementWrite(t *testing.T) {
 	}
 	if record.Query != "client_secret=%5BREDACTED%5D&view=compact" {
 		t.Fatalf("audit query was not safely redacted: %q", record.Query)
+	}
+}
+
+func TestLogAdminOperationUsesTrustedRouteTemplateForResourceMetadata(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	audit := &recordingAdminAuditService{}
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", uint(7))
+		c.Set("platform_role", models.PlatformRolePlatformAdmin)
+		c.Next()
+	})
+	router.Use(LogAdminOperation(audit))
+	router.PUT("/api/platform/users/:id", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPut,
+		"/api/platform/users/42",
+		nil,
+	)
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || len(audit.records) != 1 {
+		t.Fatalf(
+			"status=%d records=%d",
+			recorder.Code,
+			len(audit.records),
+		)
+	}
+	record := audit.records[0]
+	if record.ActionCode != "platform.user.update" ||
+		record.ResourceType != "user" ||
+		record.ResourcePublicID != "42" {
+		t.Fatalf("structured audit metadata = %+v", record)
+	}
+}
+
+func TestLogAdminOperationFailsClosedWithoutTrustedOperationMapping(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	audit := &recordingAdminAuditService{}
+	handlerCalled := false
+	router := gin.New()
+	router.Use(LogAdminOperation(audit))
+	router.POST("/api/platform/unmapped", func(c *gin.Context) {
+		handlerCalled = true
+		c.Status(http.StatusCreated)
+	})
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(
+		recorder,
+		httptest.NewRequest(
+			http.MethodPost,
+			"/api/platform/unmapped",
+			nil,
+		),
+	)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503", recorder.Code)
+	}
+	if handlerCalled || len(audit.records) != 0 {
+		t.Fatalf(
+			"unmapped handler=%t audit records=%d",
+			handlerCalled,
+			len(audit.records),
+		)
 	}
 }
 

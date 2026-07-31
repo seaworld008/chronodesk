@@ -118,6 +118,12 @@ const PlatformAuditExplorer = () => {
     React.useEffect(() => setDraft(filters), [filters])
 
     React.useEffect(() => {
+        if (filters.urlError) {
+            setPage(null)
+            setLoading(false)
+            setError(filters.urlError)
+            return
+        }
         const controller = new AbortController()
         setLoading(true)
         setError('')
@@ -186,7 +192,13 @@ const PlatformAuditExplorer = () => {
     const updateDraft = <K extends keyof AuditExplorerFilters>(
         key: K,
         value: AuditExplorerFilters[K],
-    ) => setDraft((current) => ({ ...current, [key]: value, cursor: '' }))
+    ) =>
+        setDraft((current) => ({
+            ...current,
+            [key]: value,
+            cursor: '',
+            urlError: '',
+        }))
 
     const applyFilters = (event: React.FormEvent) => {
         event.preventDefault()
@@ -416,12 +428,20 @@ const PlatformAuditExplorer = () => {
                 <Alert
                     severity="error"
                     action={
-                        <Button
-                            color="inherit"
-                            onClick={() => setRetryNonce((value) => value + 1)}
-                        >
-                            重试
-                        </Button>
+                        filters.urlError ? (
+                            <Button color="inherit" onClick={clearFilters}>
+                                清除无效筛选
+                            </Button>
+                        ) : (
+                            <Button
+                                color="inherit"
+                                onClick={() =>
+                                    setRetryNonce((value) => value + 1)
+                                }
+                            >
+                                重试
+                            </Button>
+                        )
                     }
                     sx={{ mb: 2 }}
                 >

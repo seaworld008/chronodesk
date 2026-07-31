@@ -16,6 +16,7 @@ test('audit explorer filters round-trip through the browser URL', () => {
     const filters = auditFiltersFromSearchParams(source)
     assert.equal(filters.method, 'POST')
     assert.equal(filters.limit, 50)
+    assert.equal(filters.urlError, '')
     assert.equal(
         auditFiltersToSearchParams(filters).toString(),
         'actor=alice&platform_role=security_auditor&action=platform.user.update' +
@@ -40,7 +41,7 @@ test('audit explorer filters round-trip through the browser URL', () => {
 test('audit explorer uses bounded defaults and custom ranges', () => {
     const filters = auditFiltersFromSearchParams(
         new URLSearchParams(
-            'limit=999&start_time=2026-07-01T00%3A00%3A00Z' +
+            'start_time=2026-07-01T00%3A00%3A00Z' +
                 '&end_time=2026-07-31T00%3A00%3A00Z',
         ),
     )
@@ -50,4 +51,30 @@ test('audit explorer uses bounded defaults and custom ranges', () => {
         start_time: '2026-07-01T00:00:00.000Z',
         end_time: '2026-07-31T00:00:00.000Z',
     })
+})
+
+test('invalid URL filters are explicit and cannot expand into an unfiltered query', () => {
+    for (const query of [
+        'platform_role=administrator',
+        'method=CONNECT',
+        'result=maybe',
+        'time_preset=forever',
+        'limit=101',
+        'limit=not-a-number',
+    ]) {
+        const filters = auditFiltersFromSearchParams(
+            new URLSearchParams(query),
+        )
+        assert.match(filters.urlError, /URL 中的/u)
+        assert.throws(
+            () => auditFiltersToQuery(filters),
+            /参数无效/u,
+        )
+        assert.equal(
+            auditFiltersToSearchParams(filters).get(
+                new URLSearchParams(query).keys().next().value,
+            ),
+            null,
+        )
+    }
 })

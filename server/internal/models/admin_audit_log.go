@@ -4,8 +4,8 @@ import "time"
 
 // AdminAuditLog 管理员操作审计日志
 type AdminAuditLog struct {
-	ID               uint         `json:"id" gorm:"primaryKey;autoIncrement"`
-	CreatedAt        time.Time    `json:"created_at" gorm:"autoCreateTime"`
+	ID               uint         `json:"id" gorm:"primaryKey;autoIncrement;index:idx_admin_audit_logs_created_id,priority:2,sort:desc"`
+	CreatedAt        time.Time    `json:"created_at" gorm:"autoCreateTime;index:idx_admin_audit_logs_created_id,priority:1,sort:desc"`
 	UserID           *uint        `json:"user_id" gorm:"index"`
 	Username         string       `json:"username" gorm:"size:100"`
 	PlatformRole     PlatformRole `json:"platform_role" gorm:"column:platform_role;size:30;not null;default:'member';index;check:chk_admin_audit_logs_platform_role,platform_role IN ('platform_admin','security_auditor','emergency_operator','member')"`

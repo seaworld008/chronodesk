@@ -1,13 +1,15 @@
 package services
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"regexp"
@@ -104,6 +106,7 @@ type AdminAuditPage struct {
 var (
 	ErrInvalidAdminAuditCursor = errors.New("admin audit cursor is invalid")
 	ErrAdminAuditNotFound      = errors.New("admin audit log was not found")
+	ErrAdminAuditCursorKey     = errors.New("admin audit cursor signing key is invalid")
 )
 
 const (
@@ -118,7 +121,7 @@ type adminAuditCursor struct {
 	FilterHash string `json:"filter_hash"`
 	StartTime  string `json:"start_time,omitempty"`
 	EndTime    string `json:"end_time,omitempty"`
-	Checksum   string `json:"checksum"`
+	Total      int64  `json:"total"`
 }
 
 // AdminAuditServiceInterface 定义服务接口
@@ -130,12 +133,31 @@ type AdminAuditServiceInterface interface {
 
 // AdminAuditService 管理员审计日志服务
 type AdminAuditService struct {
-	db *gorm.DB
+	db               *gorm.DB
+	cursorSigningKey []byte
 }
 
 // NewAdminAuditService 创建新的审计日志服务
 func NewAdminAuditService(db *gorm.DB) *AdminAuditService {
 	return &AdminAuditService{db: db}
+}
+
+// NewAdminAuditServiceWithCursorKey derives a domain-separated HMAC key from a
+// stable deployment-owned secret. Tests inject an explicit key through the
+// same constructor; no cursor key is hard-coded or generated at process start.
+func NewAdminAuditServiceWithCursorKey(
+	db *gorm.DB,
+	rootKey []byte,
+) (*AdminAuditService, error) {
+	if db == nil || len(rootKey) < 32 {
+		return nil, ErrAdminAuditCursorKey
+	}
+	deriver := hmac.New(sha256.New, rootKey)
+	_, _ = deriver.Write([]byte("chronodesk/admin-audit-cursor/v1"))
+	return &AdminAuditService{
+		db:               db,
+		cursorSigningKey: deriver.Sum(nil),
+	}, nil
 }
 
 // Record 记录管理员操作日志
@@ -318,15 +340,19 @@ func (s *AdminAuditService) Explore(
 	if filter.Limit == 0 {
 		filter.Limit = DefaultAdminAuditLimit
 	}
+	if len(s.cursorSigningKey) != sha256.Size {
+		return nil, ErrAdminAuditCursorKey
+	}
 
 	var cursorTime time.Time
 	var cursorID uint
+	var total int64
 	if filter.Cursor != "" {
 		var cursorStart *time.Time
 		var cursorEnd *time.Time
 		var err error
-		cursorTime, cursorID, cursorStart, cursorEnd, err =
-			decodeAdminAuditCursor(
+		cursorTime, cursorID, cursorStart, cursorEnd, total, err =
+			s.decodeAdminAuditCursor(
 				filter.Cursor,
 				adminAuditFilterHash(filter),
 			)
@@ -340,9 +366,10 @@ func (s *AdminAuditService) Explore(
 	}
 
 	query := s.filteredQuery(ctx, filter)
-	var total int64
-	if err := query.Count(&total).Error; err != nil {
-		return nil, err
+	if filter.Cursor == "" {
+		if err := query.Count(&total).Error; err != nil {
+			return nil, err
+		}
 	}
 
 	if filter.Cursor != "" {
@@ -352,6 +379,9 @@ func (s *AdminAuditService) Explore(
 			cursorTime,
 			cursorID,
 		)
+	}
+	if filter.Cursor == "" && filter.Page > 1 {
+		query = query.Offset((filter.Page - 1) * filter.Limit)
 	}
 
 	var logs []*models.AdminAuditLog
@@ -365,12 +395,13 @@ func (s *AdminAuditService) Explore(
 	nextCursor := ""
 	if len(logs) > filter.Limit {
 		last := logs[filter.Limit-1]
-		nextCursor = encodeAdminAuditCursor(
+		nextCursor = s.encodeAdminAuditCursor(
 			last.CreatedAt,
 			last.ID,
 			adminAuditFilterHash(filter),
 			filter.StartTime,
 			filter.EndTime,
+			total,
 		)
 		logs = logs[:filter.Limit]
 	}
@@ -547,21 +578,23 @@ func adminAuditFilterHash(filter *AdminAuditFilter) string {
 	}
 	payload, _ := json.Marshal(input)
 	sum := sha256.Sum256(payload)
-	return hex.EncodeToString(sum[:])
+	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
-func encodeAdminAuditCursor(
+func (s *AdminAuditService) encodeAdminAuditCursor(
 	createdAt time.Time,
 	id uint,
 	filterHash string,
 	startTime *time.Time,
 	endTime *time.Time,
+	total int64,
 ) string {
 	cursor := adminAuditCursor{
 		Version:    1,
 		CreatedAt:  createdAt.UTC().Format(time.RFC3339Nano),
 		ID:         id,
 		FilterHash: filterHash,
+		Total:      total,
 	}
 	if startTime != nil {
 		cursor.StartTime = startTime.UTC().Format(time.RFC3339Nano)
@@ -569,40 +602,68 @@ func encodeAdminAuditCursor(
 	if endTime != nil {
 		cursor.EndTime = endTime.UTC().Format(time.RFC3339Nano)
 	}
-	cursor.Checksum = adminAuditCursorChecksum(cursor)
 	payload, _ := json.Marshal(cursor)
-	return base64.RawURLEncoding.EncodeToString(payload)
+	mac := hmac.New(sha256.New, s.cursorSigningKey)
+	_, _ = mac.Write(payload)
+	return base64.RawURLEncoding.EncodeToString(payload) + "." +
+		base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-func decodeAdminAuditCursor(
+func (s *AdminAuditService) decodeAdminAuditCursor(
 	raw string,
 	filterHash string,
-) (time.Time, uint, *time.Time, *time.Time, error) {
-	payload, err := base64.RawURLEncoding.DecodeString(raw)
+) (time.Time, uint, *time.Time, *time.Time, int64, error) {
+	parts := strings.Split(raw, ".")
+	if len(parts) != 2 {
+		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil || len(payload) > 1024 {
-		return time.Time{}, 0, nil, nil, ErrInvalidAdminAuditCursor
+		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
+	}
+	providedMAC, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil || len(providedMAC) != sha256.Size {
+		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
+	}
+	expectedMAC := hmac.New(sha256.New, s.cursorSigningKey)
+	_, _ = expectedMAC.Write(payload)
+	if !hmac.Equal(providedMAC, expectedMAC.Sum(nil)) {
+		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
 	}
 	var cursor adminAuditCursor
-	if err := json.Unmarshal(payload, &cursor); err != nil ||
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cursor); err != nil ||
 		cursor.Version != 1 ||
 		cursor.ID == 0 ||
-		cursor.FilterHash != filterHash ||
-		cursor.Checksum != adminAuditCursorChecksum(cursor) {
-		return time.Time{}, 0, nil, nil, ErrInvalidAdminAuditCursor
+		cursor.Total < 0 ||
+		cursor.FilterHash != filterHash {
+		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
+	}
+	if err := ensureAdminAuditCursorEOF(decoder); err != nil {
+		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
 	}
 	createdAt, err := time.Parse(time.RFC3339Nano, cursor.CreatedAt)
 	if err != nil {
-		return time.Time{}, 0, nil, nil, ErrInvalidAdminAuditCursor
+		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
 	}
 	startTime, err := optionalAdminAuditCursorTime(cursor.StartTime)
 	if err != nil {
-		return time.Time{}, 0, nil, nil, ErrInvalidAdminAuditCursor
+		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
 	}
 	endTime, err := optionalAdminAuditCursorTime(cursor.EndTime)
 	if err != nil {
-		return time.Time{}, 0, nil, nil, ErrInvalidAdminAuditCursor
+		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
 	}
-	return createdAt, cursor.ID, startTime, endTime, nil
+	return createdAt, cursor.ID, startTime, endTime, cursor.Total, nil
+}
+
+func ensureAdminAuditCursorEOF(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return ErrInvalidAdminAuditCursor
+	}
+	return nil
 }
 
 func optionalAdminAuditCursorTime(value string) (*time.Time, error) {
@@ -614,19 +675,6 @@ func optionalAdminAuditCursorTime(value string) (*time.Time, error) {
 		return nil, err
 	}
 	return &parsed, nil
-}
-
-func adminAuditCursorChecksum(cursor adminAuditCursor) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf(
-		"chronodesk-admin-audit-cursor-v1\x00%d\x00%s\x00%d\x00%s\x00%s\x00%s",
-		cursor.Version,
-		cursor.CreatedAt,
-		cursor.ID,
-		cursor.FilterHash,
-		cursor.StartTime,
-		cursor.EndTime,
-	)))
-	return hex.EncodeToString(sum[:])
 }
 
 func maskAuditIP(value string) string {
@@ -645,7 +693,10 @@ func maskAuditIP(value string) string {
 }
 
 var auditSecretPattern = regexp.MustCompile(
-	`(?i)(authorization|cookie|password|passwd|token|secret|api[_-]?key)(\s*[:=]\s*)([^\s,;]+)`,
+	`(?i)["']?(authorization|set[_-]?cookie|cookie|password|passwd|access[_-]?token|refresh[_-]?token|token|secret|credential|api[_-]?key)["']?(\s*[:=]\s*)["']?([^\s"',;}\]]+)`,
+)
+var auditCookiePattern = regexp.MustCompile(
+	`(?i)\b(set-cookie|cookie)(\s*:\s*)[^\r\n]+`,
 )
 
 func redactAuditText(value string, maxLength int) string {
@@ -655,6 +706,11 @@ func redactAuditText(value string, maxLength int) string {
 		}
 		return -1
 	}, value)
+	if structured, ok := redactStructuredAuditText(value); ok {
+		value = structured
+	}
+	value = ScrubOutboxFailureText(value)
+	value = auditCookiePattern.ReplaceAllString(value, "$1$2[凭据已隐藏]")
 	value = auditSecretPattern.ReplaceAllString(value, "$1$2[已隐藏]")
 	runes := []rune(value)
 	if len(runes) > maxLength {
@@ -663,13 +719,91 @@ func redactAuditText(value string, maxLength int) string {
 	return value
 }
 
+func redactStructuredAuditText(value string) (string, bool) {
+	if len(value) == 0 || len(value) > 64*1024 {
+		return "", false
+	}
+	decoder := json.NewDecoder(strings.NewReader(value))
+	decoder.UseNumber()
+	var decoded any
+	if err := decoder.Decode(&decoded); err != nil {
+		return "", false
+	}
+	if err := ensureAdminAuditCursorEOF(decoder); err != nil {
+		return "", false
+	}
+	switch decoded.(type) {
+	case map[string]any, []any:
+	default:
+		return "", false
+	}
+	redacted := redactAuditStructuredValue(decoded, 0)
+	encoded, err := json.Marshal(redacted)
+	if err != nil {
+		return "", false
+	}
+	return string(encoded), true
+}
+
+func redactAuditStructuredValue(value any, depth int) any {
+	if depth >= 12 {
+		return "[内容已隐藏]"
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		result := make(map[string]any, len(typed))
+		for key, item := range typed {
+			if sensitiveAuditField(key) {
+				result[key] = "[已隐藏]"
+				continue
+			}
+			result[key] = redactAuditStructuredValue(item, depth+1)
+		}
+		return result
+	case []any:
+		result := make([]any, len(typed))
+		for index, item := range typed {
+			result[index] = redactAuditStructuredValue(item, depth+1)
+		}
+		return result
+	case string:
+		return redactAuditText(typed, 2000)
+	case json.Number, bool, nil:
+		return typed
+	default:
+		return "[内容已隐藏]"
+	}
+}
+
+func sensitiveAuditField(key string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	normalized = strings.NewReplacer("-", "_", " ", "_").Replace(normalized)
+	for _, fragment := range []string{
+		"authorization",
+		"cookie",
+		"password",
+		"passwd",
+		"token",
+		"secret",
+		"credential",
+		"api_key",
+		"access_key",
+		"private_key",
+	} {
+		if strings.Contains(normalized, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
 func redactAuditQuery(raw string) string {
 	values, err := url.ParseQuery(raw)
 	if err != nil {
 		return "[内容已隐藏]"
 	}
 	for key := range values {
-		if auditSecretPattern.MatchString(key + "=value") {
+		if sensitiveAuditField(key) {
 			values[key] = []string{"[已隐藏]"}
 		} else {
 			for index, value := range values[key] {

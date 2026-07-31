@@ -66,13 +66,13 @@ func TestProjectAgentAdminFailuresRetainAuditOutsideProjectTransaction(
 				handlers.RequireProjectRoles(models.ProjectRoleAdmin),
 			)
 			handlerCalled := false
-			routes.POST("/failure", func(c *gin.Context) {
+			routes.POST("/outbox/:id/replay", func(c *gin.Context) {
 				handlerCalled = true
 				c.Status(test.handlerStatus)
 			})
 
 			path := fmt.Sprintf(
-				"/api/projects/%s/admin/agents/failure",
+				"/api/projects/%s/admin/agents/outbox/outbox-failure/replay",
 				project.Key,
 			)
 			response := httptest.NewRecorder()

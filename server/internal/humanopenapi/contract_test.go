@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	authcontract "github.com/seaworld008/chronodesk/server/internal/auth"
@@ -1445,6 +1446,57 @@ func TestP1RuntimeDTOFieldsMatchPublishedSchemas(t *testing.T) {
 	}
 }
 
+func TestAdminAuditDetailRuntimeProjectionMatchesClosedSchema(t *testing.T) {
+	document := decodeDocument(t)
+	schema := objectAt(
+		t,
+		objectAt(t, objectAt(t, document, "components"), "schemas"),
+		"AdminAuditLogDetail",
+	)
+	userID := uint(42)
+	detail := services.AdminAuditDetail{
+		AdminAuditListItem: services.AdminAuditListItem{
+			ID:               7,
+			CreatedAt:        time.Date(2026, 7, 31, 8, 0, 0, 0, time.UTC),
+			UserID:           &userID,
+			Username:         "security-auditor",
+			PlatformRole:     models.PlatformRoleSecurityAuditor,
+			Action:           "platform.user.update",
+			ActionCode:       "platform.user.update",
+			ResourceType:     "user",
+			ResourcePublicID: "42",
+			Method:           "PUT",
+			Path:             "/api/platform/users/42",
+			StatusCode:       200,
+			MaskedIP:         "192.0.*.*",
+			LatencyMs:        12,
+			Result:           "success",
+		},
+		Query:         "view=compact",
+		UserAgent:     "browser",
+		Notes:         "",
+		RequestID:     "request-1",
+		TraceID:       "trace-1",
+		CorrelationID: "correlation-1",
+	}
+	encoded, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var instance map[string]any
+	if err := json.Unmarshal(encoded, &instance); err != nil {
+		t.Fatal(err)
+	}
+	assertClosedObjectInstance(t, schema, instance)
+
+	instance["unpublished_secret"] = "must be rejected"
+	properties := objectAt(t, schema, "properties")
+	if _, published := properties["unpublished_secret"]; published ||
+		schema["additionalProperties"] != false {
+		t.Fatal("detail schema accepted an unpublished property")
+	}
+}
+
 func TestPlatformAuditContractCoversRuntimeFailureStatuses(t *testing.T) {
 	document := decodeDocument(t)
 	operation := objectAt(
@@ -2011,6 +2063,36 @@ func assertExactObjectKeys(
 	for _, key := range want {
 		if _, ok := object[key]; !ok {
 			t.Errorf("object is missing %q", key)
+		}
+	}
+}
+
+func assertClosedObjectInstance(
+	t *testing.T,
+	schema map[string]any,
+	instance map[string]any,
+) {
+	t.Helper()
+	if schema["type"] != "object" || schema["additionalProperties"] != false {
+		t.Fatalf("schema is not a closed object: %v", schema)
+	}
+	properties := objectAt(t, schema, "properties")
+	for key := range instance {
+		if _, ok := properties[key]; !ok {
+			t.Errorf("runtime instance has unpublished property %q", key)
+		}
+	}
+	required, ok := schema["required"].([]any)
+	if !ok {
+		t.Fatal("closed object schema has no required list")
+	}
+	for _, raw := range required {
+		key, ok := raw.(string)
+		if !ok {
+			t.Fatalf("required field name = %T", raw)
+		}
+		if _, exists := instance[key]; !exists {
+			t.Errorf("runtime instance is missing required property %q", key)
 		}
 	}
 }

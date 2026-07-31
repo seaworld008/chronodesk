@@ -7215,39 +7215,98 @@
         }
       },
       "AdminAuditLogDetail": {
-        "allOf": [
-          {
-            "$ref": "#/components/schemas/AdminAuditLog"
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "created_at",
+          "username",
+          "platform_role",
+          "action",
+          "method",
+          "path",
+          "status_code",
+          "masked_ip",
+          "latency_ms",
+          "result",
+          "query",
+          "user_agent",
+          "notes"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
           },
-          {
-            "type": "object",
-            "required": [
-              "query",
-              "user_agent",
-              "notes"
-            ],
-            "properties": {
-              "query": {
-                "type": "string"
-              },
-              "user_agent": {
-                "type": "string"
-              },
-              "notes": {
-                "type": "string"
-              },
-              "request_id": {
-                "type": "string"
-              },
-              "trace_id": {
-                "type": "string"
-              },
-              "correlation_id": {
-                "type": "string"
-              }
-            }
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "user_id": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "username": {
+            "type": "string"
+          },
+          "platform_role": {
+            "$ref": "#/components/schemas/PlatformRole"
+          },
+          "action": {
+            "type": "string"
+          },
+          "action_code": {
+            "type": "string"
+          },
+          "resource_type": {
+            "type": "string"
+          },
+          "resource_public_id": {
+            "type": "string"
+          },
+          "method": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "status_code": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 599
+          },
+          "masked_ip": {
+            "type": "string"
+          },
+          "latency_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "result": {
+            "type": "string"
+          },
+          "query": {
+            "type": "string"
+          },
+          "user_agent": {
+            "type": "string"
+          },
+          "notes": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "trace_id": {
+            "type": "string"
+          },
+          "correlation_id": {
+            "type": "string"
           }
-        ]
+        }
       },
       "AdminAuditLogPage": {
         "type": "object",

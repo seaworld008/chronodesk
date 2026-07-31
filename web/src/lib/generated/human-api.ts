@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.0.0.
- * Contract SHA-256: b8802501bdde224ce7fe0395abd90c51a46d98d5b78f3915112832b5150ce8b7.
+ * Contract SHA-256: a052e509e3859ab431df95fe24074feb19a5468300766caf85ddc10692bccca4.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -252,7 +252,22 @@ export type AdminAuditLog = {
     result: string
 }
 
-export type AdminAuditLogDetail = AdminAuditLog & {
+export type AdminAuditLogDetail = {
+    id: number
+    created_at: string
+    user_id?: number
+    username: string
+    platform_role: PlatformRole
+    action: string
+    action_code?: string
+    resource_type?: string
+    resource_public_id?: string
+    method: string
+    path: string
+    status_code: number
+    masked_ip: string
+    latency_ms: number
+    result: string
     query: string
     user_agent: string
     notes: string
