@@ -25,12 +25,58 @@ func (profileValidationRepository) GetByUserID(
 	return &UserProfile{UserID: userID}, nil
 }
 
-func (profileValidationRepository) Update(context.Context, *UserProfile) error {
+func (profileValidationRepository) Patch(
+	_ context.Context,
+	_ uint,
+	patch ProfilePatch,
+) error {
+	if patch.Avatar != nil && *patch.Avatar != "" {
+		return ErrInvalidProfileAvatar
+	}
 	return nil
 }
 
 func (profileValidationRepository) Delete(context.Context, uint) error {
 	return nil
+}
+
+func TestUpdateProfileRequestPreservesOmittedAndExplicitEmptyFields(t *testing.T) {
+	var omitted UpdateProfileRequest
+	if err := json.Unmarshal([]byte(`{}`), &omitted); err != nil {
+		t.Fatal(err)
+	}
+	if omitted.FirstName != nil ||
+		omitted.LastName != nil ||
+		omitted.PhoneNumber != nil ||
+		omitted.Avatar != nil ||
+		omitted.Timezone != nil ||
+		omitted.Language != nil {
+		t.Fatalf("omitted profile fields became present: %+v", omitted)
+	}
+
+	var explicit UpdateProfileRequest
+	if err := json.Unmarshal([]byte(`{
+		"first_name":"",
+		"last_name":"",
+		"phone_number":"",
+		"avatar":"",
+		"timezone":"",
+		"language":""
+	}`), &explicit); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]*string{
+		"first_name":   explicit.FirstName,
+		"last_name":    explicit.LastName,
+		"phone_number": explicit.PhoneNumber,
+		"avatar":       explicit.Avatar,
+		"timezone":     explicit.Timezone,
+		"language":     explicit.Language,
+	} {
+		if value == nil || *value != "" {
+			t.Errorf("%s explicit empty value = %v", name, value)
+		}
+	}
 }
 
 func TestAuthFailureMappingsPublishContractedRuntimeStatuses(t *testing.T) {

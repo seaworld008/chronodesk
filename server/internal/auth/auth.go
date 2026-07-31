@@ -261,6 +261,18 @@ type UpdateProfileRequest struct {
 	Language    *string `json:"language,omitempty"`
 }
 
+// ProfilePatch preserves the JSON field-presence contract through the
+// persistence boundary. A nil pointer means "not requested"; a non-nil empty
+// string is an explicit clear where that field permits it.
+type ProfilePatch struct {
+	FirstName *string
+	LastName  *string
+	Phone     *string
+	Avatar    *string
+	Timezone  *string
+	Language  *string
+}
+
 // VerifyEmailRequest 验证邮箱请求
 type VerifyEmailRequest struct {
 	Token string `json:"token" binding:"required"`
@@ -334,7 +346,7 @@ type UserRepository interface {
 type ProfileRepository interface {
 	Create(ctx context.Context, profile *UserProfile) error
 	GetByUserID(ctx context.Context, userID uint) (*UserProfile, error)
-	Update(ctx context.Context, profile *UserProfile) error
+	Patch(ctx context.Context, userID uint, patch ProfilePatch) error
 	Delete(ctx context.Context, userID uint) error
 }
 
@@ -1352,44 +1364,14 @@ func (s *AuthService) UpdateProfile(ctx context.Context, userID uint, req *Updat
 	if err := validateUpdateProfileRequest(req); err != nil {
 		return err
 	}
-	// 获取用户资料
-	profile, err := s.profileRepo.GetByUserID(ctx, userID)
-	if err != nil {
-		return fmt.Errorf("failed to get profile: %w", err)
-	}
-	if req.Avatar != nil &&
-		*req.Avatar != "" &&
-		*req.Avatar != profile.Avatar {
-		return ErrInvalidProfileAvatar
-	}
-
-	// 更新字段
-	if req.FirstName != nil {
-		profile.FirstName = *req.FirstName
-	}
-	if req.LastName != nil {
-		profile.LastName = *req.LastName
-	}
-	if req.PhoneNumber != nil {
-		profile.Phone = *req.PhoneNumber
-	}
-	if req.Avatar != nil {
-		profile.Avatar = *req.Avatar
-	}
-	if req.Timezone != nil {
-		profile.Timezone = *req.Timezone
-	}
-	if req.Language != nil {
-		profile.Language = *req.Language
-	}
-
-	// 更新显示名称
-	if profile.FirstName != "" || profile.LastName != "" {
-		profile.DisplayName = strings.TrimSpace(profile.FirstName + " " + profile.LastName)
-	}
-
-	err = s.profileRepo.Update(ctx, profile)
-	if err != nil {
+	if err := s.profileRepo.Patch(ctx, userID, ProfilePatch{
+		FirstName: req.FirstName,
+		LastName:  req.LastName,
+		Phone:     req.PhoneNumber,
+		Avatar:    req.Avatar,
+		Timezone:  req.Timezone,
+		Language:  req.Language,
+	}); err != nil {
 		return fmt.Errorf("failed to update profile: %w", err)
 	}
 

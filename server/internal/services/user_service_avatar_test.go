@@ -10,10 +10,13 @@ import (
 	"io"
 	"mime/multipart"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func avatarUploadFile(t *testing.T, payload []byte, name string) (*os.File, *multipart.FileHeader) {
@@ -154,6 +157,201 @@ func TestUploadAvatarRejectsSpoofedAndOversizedPayloads(t *testing.T) {
 	defer oversized.Close()
 	if _, err := service.UploadAvatar(context.Background(), user.ID, oversized, oversizedHeader); !errors.Is(err, ErrAttachmentTooLarge) {
 		t.Fatalf("oversized image error = %v, want ErrAttachmentTooLarge", err)
+	}
+}
+
+func TestUploadAvatarLocksRowsAndUpdatesOnlyAvatarColumns(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.User{}, &models.UserProfile{}); err != nil {
+		t.Fatal(err)
+	}
+	user := models.User{
+		Username:     "avatar-field-mask",
+		Email:        "avatar-field-mask@example.test",
+		PasswordHash: "hash",
+		Avatar:       "/uploads/avatars/1/00000000-0000-4000-8000-000000000001.png",
+		Phone:        "+8613800138000",
+		Timezone:     "Asia/Tokyo",
+		Language:     "en",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	profile := models.UserProfile{
+		UserID:   user.ID,
+		Avatar:   user.Avatar,
+		Phone:    user.Phone,
+		Timezone: user.Timezone,
+		Language: user.Language,
+	}
+	if err := db.Create(&profile).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	var lockTables []string
+	if err := db.Callback().Query().After("gorm:query").Register(
+		"test:avatar-upload-locks",
+		func(query *gorm.DB) {
+			lockClause, exists := query.Statement.Clauses["FOR"]
+			if !exists {
+				return
+			}
+			locking, ok := lockClause.Expression.(clause.Locking)
+			if !ok || locking.Strength != "UPDATE" {
+				return
+			}
+			lockTables = append(lockTables, query.Statement.Table)
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	type updateStatement struct {
+		table string
+		sql   string
+	}
+	var updates []updateStatement
+	if err := db.Callback().Update().After("gorm:update").Register(
+		"test:avatar-upload-columns",
+		func(update *gorm.DB) {
+			if update.Statement.Table != "users" &&
+				update.Statement.Table != "user_profiles" {
+				return
+			}
+			updates = append(updates, updateStatement{
+				table: update.Statement.Table,
+				sql: strings.ToLower(update.Dialector.Explain(
+					update.Statement.SQL.String(),
+					update.Statement.Vars...,
+				)),
+			})
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	storage, err := NewLocalAttachmentStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewUserService(db)
+	service.SetAvatarStorage(storage, defaultAvatarMaxBytes)
+	file, header := avatarUploadFile(t, validAvatarPNG(t), "replacement.png")
+	defer file.Close()
+	avatarURL, err := service.UploadAvatar(
+		context.Background(),
+		user.ID,
+		file,
+		header,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Join(lockTables, ",") != "users,user_profiles" {
+		t.Fatalf("avatar upload lock order = %v", lockTables)
+	}
+	if len(updates) != 2 {
+		t.Fatalf("avatar update statements = %+v, want two projections", updates)
+	}
+	for _, update := range updates {
+		if !strings.Contains(update.sql, "avatar") {
+			t.Errorf("%s update omits avatar: %s", update.table, update.sql)
+		}
+		for _, forbidden := range []string{
+			"phone",
+			"timezone",
+			"language",
+			"first_name",
+			"last_name",
+			"department",
+			"job_title",
+		} {
+			if strings.Contains(update.sql, forbidden) {
+				t.Errorf(
+					"%s avatar update writes omitted %s: %s",
+					update.table,
+					forbidden,
+					update.sql,
+				)
+			}
+		}
+	}
+
+	var gotUser models.User
+	var gotProfile models.UserProfile
+	if err := db.First(&gotUser, user.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Where("user_id = ?", user.ID).First(&gotProfile).Error; err != nil {
+		t.Fatal(err)
+	}
+	if gotUser.Avatar != avatarURL || gotProfile.Avatar != avatarURL {
+		t.Fatalf(
+			"avatar projections = (%q, %q), want %q",
+			gotUser.Avatar,
+			gotProfile.Avatar,
+			avatarURL,
+		)
+	}
+	if gotUser.Phone != user.Phone ||
+		gotUser.Timezone != user.Timezone ||
+		gotUser.Language != user.Language ||
+		gotProfile.Phone != profile.Phone ||
+		gotProfile.Timezone != profile.Timezone ||
+		gotProfile.Language != profile.Language {
+		t.Fatalf(
+			"avatar update overwrote profile fields: user=%+v profile=%+v",
+			gotUser,
+			gotProfile,
+		)
+	}
+	storedKey := strings.TrimPrefix(avatarURL, "/uploads/")
+	reader, err := storage.Open(context.Background(), storedKey)
+	if err != nil {
+		t.Fatalf("open committed avatar object: %v", err)
+	}
+	_ = reader.Close()
+}
+
+func TestUploadAvatarDeletesNewObjectWhenDatabaseTransactionFails(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.User{}, &models.UserProfile{}); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	storage, err := NewLocalAttachmentStorage(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewUserService(db)
+	service.SetAvatarStorage(storage, defaultAvatarMaxBytes)
+	file, header := avatarUploadFile(t, validAvatarPNG(t), "orphan.png")
+	defer file.Close()
+	if _, err := service.UploadAvatar(
+		context.Background(),
+		999,
+		file,
+		header,
+	); err == nil {
+		t.Fatal("missing avatar owner unexpectedly succeeded")
+	}
+
+	var storedFiles []string
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.Type().IsRegular() {
+			storedFiles = append(storedFiles, path)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(storedFiles) != 0 {
+		t.Fatalf("failed transaction left new avatar objects: %v", storedFiles)
 	}
 }
 

@@ -1927,6 +1927,13 @@ func TestHumanProfileUpdatePublishesValidatedCompatibilityFields(t *testing.T) {
 		objectAt(t, schemas, "UpdateHumanProfileRequest"),
 		"properties",
 	)
+	updateSchema := objectAt(t, schemas, "UpdateHumanProfileRequest")
+	if required, exists := updateSchema["required"]; exists {
+		t.Errorf(
+			"UpdateHumanProfileRequest fields must remain optional: %v",
+			required,
+		)
+	}
 	for _, name := range []string{"first_name", "last_name"} {
 		property := objectAt(t, properties, name)
 		if property["maxLength"] != float64(50) {

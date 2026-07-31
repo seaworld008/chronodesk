@@ -1115,34 +1115,137 @@ func (r *GormProfileRepository) GetByUserID(ctx context.Context, userID uint) (*
 	}, nil
 }
 
-// Update 更新用户资料
-func (r *GormProfileRepository) Update(ctx context.Context, profile *UserProfile) error {
+// Patch atomically applies only explicitly requested profile fields. Both this
+// path and the controlled avatar upload path lock users first and user_profiles
+// second so PostgreSQL serializes compatibility-projection writes without
+// deadlocks. SQLite ignores the locking clause but retains identical SQL
+// construction for focused repository tests.
+func (r *GormProfileRepository) Patch(
+	ctx context.Context,
+	userID uint,
+	patch ProfilePatch,
+) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var user models.User
-		if err := tx.Where("id = ?", profile.UserID).First(&user).Error; err != nil {
+		if err := tx.
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select(
+				"id",
+				"first_name",
+				"last_name",
+				"display_name",
+				"avatar",
+				"phone",
+				"timezone",
+				"language",
+			).
+			Where("id = ?", userID).
+			First(&user).Error; err != nil {
 			return err
 		}
+
 		var modelProfile models.UserProfile
-		err := tx.Where("user_id = ?", profile.UserID).First(&modelProfile).Error
+		err := tx.
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("user_id = ?", userID).
+			First(&modelProfile).Error
+		profileExists := true
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			modelProfile = legacyUserProfileProjection(&user)
+			profileExists = false
 		} else if err != nil {
 			return err
 		}
 
-		phoneChanged := modelProfile.Phone != profile.Phone
-		modelProfile.Avatar = profile.Avatar
-		modelProfile.Phone = profile.Phone
-		modelProfile.Timezone = profile.Timezone
-		modelProfile.Language = profile.Language
-
-		if err := tx.Save(&modelProfile).Error; err != nil {
-			return err
+		if patch.Avatar != nil &&
+			*patch.Avatar != "" &&
+			*patch.Avatar != modelProfile.Avatar {
+			return ErrInvalidProfileAvatar
 		}
-		profile.ID = modelProfile.ID
-		profile.CreatedAt = modelProfile.CreatedAt
-		profile.UpdatedAt = modelProfile.UpdatedAt
-		return syncProfileToUser(tx, profile, phoneChanged)
+
+		userUpdates := make(map[string]any)
+		profileUpdates := make(map[string]any)
+
+		firstName := user.FirstName
+		lastName := user.LastName
+		namesChanged := false
+		if patch.FirstName != nil && *patch.FirstName != user.FirstName {
+			firstName = *patch.FirstName
+			userUpdates["first_name"] = firstName
+			namesChanged = true
+		}
+		if patch.LastName != nil && *patch.LastName != user.LastName {
+			lastName = *patch.LastName
+			userUpdates["last_name"] = lastName
+			namesChanged = true
+		}
+		if namesChanged {
+			userUpdates["display_name"] = profileDisplayName(firstName, lastName)
+		}
+
+		if patch.Phone != nil && *patch.Phone != modelProfile.Phone {
+			profileUpdates["phone"] = *patch.Phone
+			userUpdates["phone"] = *patch.Phone
+			userUpdates["phone_verified"] = false
+			userUpdates["phone_verified_at"] = nil
+		}
+		if patch.Avatar != nil {
+			switch {
+			case *patch.Avatar == "":
+				// Empty is an explicit clear. Clear both projections even if a
+				// legacy users row drifted from the authoritative profile.
+				if modelProfile.Avatar != "" {
+					profileUpdates["avatar"] = ""
+				}
+				if user.Avatar != "" {
+					userUpdates["avatar"] = ""
+				}
+			case *patch.Avatar == modelProfile.Avatar:
+				// Preserving the exact authoritative value is a persistent
+				// no-op; it must never restore a stale compatibility value.
+			}
+		}
+		if patch.Timezone != nil && *patch.Timezone != modelProfile.Timezone {
+			profileUpdates["timezone"] = *patch.Timezone
+			userUpdates["timezone"] = *patch.Timezone
+		}
+		if patch.Language != nil && *patch.Language != modelProfile.Language {
+			profileUpdates["language"] = *patch.Language
+			userUpdates["language"] = *patch.Language
+		}
+
+		if !profileExists {
+			if avatar, ok := profileUpdates["avatar"]; ok {
+				modelProfile.Avatar = avatar.(string)
+			}
+			if phone, ok := profileUpdates["phone"]; ok {
+				modelProfile.Phone = phone.(string)
+			}
+			if timezone, ok := profileUpdates["timezone"]; ok {
+				modelProfile.Timezone = timezone.(string)
+			}
+			if language, ok := profileUpdates["language"]; ok {
+				modelProfile.Language = language.(string)
+			}
+			if err := tx.Create(&modelProfile).Error; err != nil {
+				return err
+			}
+		} else if len(profileUpdates) > 0 {
+			if err := tx.Model(&models.UserProfile{}).
+				Where("user_id = ?", userID).
+				Updates(profileUpdates).Error; err != nil {
+				return err
+			}
+		}
+
+		if len(userUpdates) > 0 {
+			if err := tx.Model(&models.User{}).
+				Where("id = ?", userID).
+				Updates(userUpdates).Error; err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 

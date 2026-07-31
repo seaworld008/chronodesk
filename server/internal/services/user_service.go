@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // UserService 用户服务
@@ -330,28 +331,6 @@ func (s *UserService) UploadAvatar(ctx context.Context, userID uint, file multip
 		return "", ErrAttachmentTooLarge
 	}
 
-	var user models.User
-	if err := s.db.WithContext(ctx).
-		Select("id", "avatar", "phone", "timezone", "language").
-		First(&user, userID).Error; err != nil {
-		return "", fmt.Errorf("find avatar owner: %w", err)
-	}
-	oldAvatarURL := ""
-	var profile models.UserProfile
-	if err := s.db.WithContext(ctx).
-		Where("user_id = ?", userID).
-		First(&profile).Error; err == nil {
-		oldAvatarURL = profile.Avatar
-	} else if errors.Is(err, gorm.ErrRecordNotFound) {
-		// Legacy users may predate user_profiles. Preserve the old users.avatar
-		// object for cleanup, then create the complete compatibility projection
-		// in the upload transaction.
-		oldAvatarURL = user.Avatar
-		profile = *userProfileProjection(&user)
-	} else {
-		return "", fmt.Errorf("find avatar profile: %w", err)
-	}
-
 	filename := uuid.NewString() + extension
 	key := filepath.ToSlash(filepath.Join("avatars", fmt.Sprintf("%d", userID), filename))
 	stored, err := s.avatarStorage.Put(ctx, key, bytes.NewReader(sanitized.Bytes()), maxBytes)
@@ -360,17 +339,48 @@ func (s *UserService) UploadAvatar(ctx context.Context, userID uint, file multip
 	}
 	avatarURL := avatarURLPrefix + fmt.Sprintf("%d/%s", userID, filename)
 
+	oldAvatarURL := ""
 	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var user models.User
+		if err := tx.
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id", "avatar", "phone", "timezone", "language").
+			Where("id = ?", userID).
+			First(&user).Error; err != nil {
+			return fmt.Errorf("find avatar owner: %w", err)
+		}
+
+		var profile models.UserProfile
+		err := tx.
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("user_id = ?", userID).
+			First(&profile).Error
+		profileExists := true
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// Locking users serializes the absent-profile case. Build the one
+			// compatibility row from the now-locked user without carrying that
+			// snapshot into any later update.
+			profile = *userProfileProjection(&user)
+			profileExists = false
+			oldAvatarURL = user.Avatar
+		} else if err != nil {
+			return fmt.Errorf("find avatar profile: %w", err)
+		} else {
+			oldAvatarURL = profile.Avatar
+		}
+
 		if err := tx.Model(&models.User{}).
 			Where("id = ?", userID).
 			Update("avatar", avatarURL).Error; err != nil {
 			return err
 		}
-		profile.Avatar = avatarURL
-		if profile.ID == 0 {
+		if !profileExists {
+			profile.Avatar = avatarURL
 			return tx.Create(&profile).Error
 		}
-		return tx.Save(&profile).Error
+		return tx.Model(&models.UserProfile{}).
+			Where("user_id = ?", userID).
+			Update("avatar", avatarURL).Error
 	}); err != nil {
 		_ = s.avatarStorage.Delete(context.Background(), stored.Key)
 		return "", fmt.Errorf("update avatar: %w", err)
