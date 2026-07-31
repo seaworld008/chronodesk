@@ -12,7 +12,7 @@ type AdminAuditLog struct {
 	Action           string       `json:"action" gorm:"size:255"`
 	ActionCode       string       `json:"action_code,omitempty" gorm:"size:100;index"`
 	ResourceType     string       `json:"resource_type,omitempty" gorm:"size:100;index"`
-	ResourcePublicID string       `json:"resource_public_id,omitempty" gorm:"size:255;index"`
+	ResourcePublicID string       `json:"resource_public_id,omitempty" gorm:"size:512;index"`
 	Method           string       `json:"method" gorm:"size:20"`
 	Path             string       `json:"path" gorm:"size:255;index"`
 	StatusCode       int          `json:"status_code"`

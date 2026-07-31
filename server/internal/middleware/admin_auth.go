@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log"
 	"net/http"
@@ -274,16 +275,24 @@ func adminAuditMetadataForRoute(
 
 func boundedAdminAuditResourceID(value string) string {
 	value = strings.TrimSpace(value)
-	if value == "" || len(value) > 255 || !utf8.ValidString(value) ||
-		utf8.RuneCountInString(value) > 128 {
+	if value == "" {
 		return ""
+	}
+	if len(value) > 512 || !utf8.ValidString(value) ||
+		utf8.RuneCountInString(value) > 128 {
+		return digestAdminAuditResourceID(value)
 	}
 	for _, char := range value {
 		if unicode.IsControl(char) {
-			return ""
+			return digestAdminAuditResourceID(value)
 		}
 	}
 	return value
+}
+
+func digestAdminAuditResourceID(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("sha256:%x", digest)
 }
 
 // isImportantAdminOperation 判断是否为重要的管理操作
