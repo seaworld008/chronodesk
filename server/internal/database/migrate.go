@@ -162,6 +162,8 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 		}},
 		{&models.AdminAuditLog{}, "admin_audit_logs", []string{
 			"id", "user_id", "platform_role", "action", "status_code",
+			"action_code", "resource_type", "resource_public_id", "request_id",
+			"trace_id", "correlation_id",
 		}},
 		{&models.UserProfile{}, "user_profiles", []string{"user_id"}},
 		{&models.EmailConfig{}, "email_configs", []string{

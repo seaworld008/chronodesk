@@ -1,0 +1,53 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+
+import {
+    auditFiltersFromSearchParams,
+    auditFiltersToQuery,
+    auditFiltersToSearchParams,
+} from './auditExplorerState.ts'
+
+test('audit explorer filters round-trip through the browser URL', () => {
+    const source = new URLSearchParams(
+        'actor=alice&platform_role=security_auditor&action=platform.user.update' +
+            '&method=post&path_prefix=%2Fapi%2Fplatform&status=403&result=error' +
+            '&keyword=denied&time_preset=24h&cursor=opaque&limit=50',
+    )
+    const filters = auditFiltersFromSearchParams(source)
+    assert.equal(filters.method, 'POST')
+    assert.equal(filters.limit, 50)
+    assert.equal(
+        auditFiltersToSearchParams(filters).toString(),
+        'actor=alice&platform_role=security_auditor&action=platform.user.update' +
+            '&method=POST&path_prefix=%2Fapi%2Fplatform&status=403&result=error' +
+            '&keyword=denied&time_preset=24h&cursor=opaque&limit=50',
+    )
+    assert.deepEqual(auditFiltersToQuery(filters), {
+        limit: 50,
+        actor: 'alice',
+        platform_role: 'security_auditor',
+        action: 'platform.user.update',
+        method: 'POST',
+        path_prefix: '/api/platform',
+        status: 403,
+        result: 'error',
+        keyword: 'denied',
+        time_preset: '24h',
+        cursor: 'opaque',
+    })
+})
+
+test('audit explorer uses bounded defaults and custom ranges', () => {
+    const filters = auditFiltersFromSearchParams(
+        new URLSearchParams(
+            'limit=999&start_time=2026-07-01T00%3A00%3A00Z' +
+                '&end_time=2026-07-31T00%3A00%3A00Z',
+        ),
+    )
+    assert.equal(filters.limit, 25)
+    assert.deepEqual(auditFiltersToQuery(filters), {
+        limit: 25,
+        start_time: '2026-07-01T00:00:00.000Z',
+        end_time: '2026-07-31T00:00:00.000Z',
+    })
+})

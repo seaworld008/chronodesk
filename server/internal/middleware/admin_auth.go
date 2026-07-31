@@ -74,17 +74,20 @@ func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.Han
 
 		action := fmt.Sprintf("%s %s", strings.ToUpper(method), path)
 		record := &services.AdminAuditRecord{
-			UserID:       userIDPtr,
-			PlatformRole: platformRole,
-			Action:       action,
-			Method:       method,
-			Path:         path,
-			StatusCode:   0,
-			ClientIP:     clientIP,
-			UserAgent:    userAgent,
-			Query:        query,
-			Result:       "pending",
-			Notes:        "管理员写操作已进入执行阶段",
+			UserID:        userIDPtr,
+			PlatformRole:  platformRole,
+			Action:        action,
+			Method:        method,
+			Path:          path,
+			RequestID:     c.GetString("request_id"),
+			TraceID:       TraceID(c),
+			CorrelationID: CorrelationID(c),
+			StatusCode:    0,
+			ClientIP:      clientIP,
+			UserAgent:     userAgent,
+			Query:         query,
+			Result:        "pending",
+			Notes:         "管理员写操作已进入执行阶段",
 		}
 
 		if err := auditService.Record(c.Request.Context(), record); err != nil {

@@ -40,6 +40,7 @@ const [
     ticketTypes,
     workbenchTypes,
     adminApp,
+    auditExplorer,
     workbenchPage,
     emailSettings,
     systemSettings,
@@ -55,6 +56,7 @@ const [
     readWebSource('types', 'index.ts'),
     readWebSource('lib', 'types', 'crossProjectWorkbench.ts'),
     readWebSource('AdminApp.tsx'),
+    readWebSource('admin', 'audit', 'PlatformAuditExplorer.tsx'),
     readWebSource('admin', 'workbench', 'CrossProjectWorkbench.tsx'),
     readWebSource('admin', 'settings', 'EmailSettings.tsx'),
     readWebSource('admin', 'settings', 'SystemSettings.tsx'),
@@ -155,6 +157,7 @@ const requiredOperations = [
     ['/platform/users/{userID}', 'delete'],
     ['/platform/users/{userID}/reset-password', 'post'],
     ['/platform/audit-logs', 'get'],
+    ['/platform/audit-logs/{auditLogID}', 'get'],
 ]
 for (const [operationPath, method] of requiredOperations) {
     assert.ok(
@@ -343,6 +346,12 @@ const exactRoleAllowlists = [
     ],
     [
         '/platform/audit-logs',
+        'get',
+        'x-chronodesk-platform-roles',
+        ['platform_admin', 'security_auditor'],
+    ],
+    [
+        '/platform/audit-logs/{auditLogID}',
         'get',
         'x-chronodesk-platform-roles',
         ['platform_admin', 'security_auditor'],
@@ -637,15 +646,21 @@ assert.deepEqual(
     ),
     [
         'user_id',
+        'actor',
         'platform_role',
+        'action',
         'method',
         'path',
+        'path_prefix',
         'status',
         'keyword',
+        'result',
+        'time_preset',
         'start_time',
         'end_time',
         'page',
         'limit',
+        'cursor',
     ],
 )
 
@@ -969,7 +984,9 @@ assert.doesNotMatch(ticketTypes, /export interface CreateTicketRequest\b/)
 assert.doesNotMatch(ticketTypes, /export interface UpdateTicketRequest\b/)
 assert.match(workbenchTypes, /CrossProjectWorkbenchTicket/)
 assert.doesNotMatch(workbenchTypes, /export interface CrossProjectWorkbench/)
-assert.match(adminApp, /humanApiRoutes\.listPlatformAuditLogs/)
+assert.match(adminApp, /admin\/audit\/PlatformAuditExplorer/)
+assert.match(auditExplorer, /humanApiRoutes\.listPlatformAuditLogs/)
+assert.match(auditExplorer, /humanApiRoutes\.getPlatformAuditLogDetail/)
 assert.doesNotMatch(adminApp, /type PlatformAuditItem\b/)
 assert.match(workbenchPage, /humanApiRoutes\.listCrossProjectWorkbenchTickets/)
 assert.doesNotMatch(workbenchPage, /["'`]\/workbench\/tickets/)

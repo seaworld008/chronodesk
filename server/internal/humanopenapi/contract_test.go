@@ -624,6 +624,7 @@ func TestHumanWebContractCoversRequiredBrowserOperations(t *testing.T) {
 		{"/platform/users/{userID}", "delete"},
 		{"/platform/users/{userID}/reset-password", "post"},
 		{"/platform/audit-logs", "get"},
+		{"/platform/audit-logs/{auditLogID}", "get"},
 	} {
 		pathItem := objectAt(t, paths, expected.path)
 		if _, ok := pathItem[expected.method]; !ok {
@@ -902,6 +903,12 @@ func TestProtectedOperationsMatchRuntimeRoleAllowlists(t *testing.T) {
 		},
 		{
 			"/platform/audit-logs",
+			"get",
+			"x-chronodesk-platform-roles",
+			[]string{"platform_admin", "security_auditor"},
+		},
+		{
+			"/platform/audit-logs/{auditLogID}",
 			"get",
 			"x-chronodesk-platform-roles",
 			[]string{"platform_admin", "security_auditor"},
@@ -1200,15 +1207,21 @@ func TestHumanQueryParametersMatchRuntimeAdapters(t *testing.T) {
 			path: "/platform/audit-logs",
 			want: []string{
 				"user_id",
+				"actor",
 				"platform_role",
+				"action",
 				"method",
 				"path",
+				"path_prefix",
 				"status",
 				"keyword",
+				"result",
+				"time_preset",
 				"start_time",
 				"end_time",
 				"page",
 				"limit",
+				"cursor",
 			},
 		},
 	} {

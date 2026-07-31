@@ -1067,6 +1067,7 @@ func Run() error {
 			auth.PlatformRoleSecurityAuditor,
 		)))
 		platformAudit.GET("/audit-logs", adminAuditHandler.GetAuditLogs)
+		platformAudit.GET("/audit-logs/:id", adminAuditHandler.GetAuditLog)
 
 		// 通知系统服务和处理器
 		notificationService := services.NewNotificationServiceWithProtector(

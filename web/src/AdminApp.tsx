@@ -49,11 +49,6 @@ import {
     projectScopeChangedEvent,
     sessionInvalidatedEvent,
 } from './lib/projectScopeEvents'
-import { apiFetch, localizedUnknownErrorMessage } from './lib/apiClient'
-import {
-    humanApiRoutes,
-    type AdminAuditLog,
-} from './lib/generated/human-api'
 
 import {
     AdminPanelSettings as AdminIcon,
@@ -148,6 +143,9 @@ const ProjectMembershipPage = lazyPage(
 )
 const PlatformProjectGovernancePage = lazyPage(
     () => import('./admin/projects/PlatformProjectGovernancePage'),
+)
+const PlatformAuditPage = lazyPage(
+    () => import('./admin/audit/PlatformAuditExplorer'),
 )
 
 const theme = createTheme(
@@ -591,111 +589,6 @@ const HomeDashboard = () => {
         return <PlatformHome permissions={permissions} />
     }
     return <NoAuthorizedProjects />
-}
-
-const parsePlatformAuditItems = (value: unknown): AdminAuditLog[] => {
-    if (
-        typeof value !== 'object' ||
-        value === null ||
-        !('items' in value) ||
-        !Array.isArray(value.items)
-    ) {
-        throw new Error('平台审计响应格式无效')
-    }
-    return value.items.map((item) => {
-        if (
-            typeof item !== 'object' ||
-            item === null ||
-            typeof item.id !== 'number' ||
-            typeof item.created_at !== 'string' ||
-            typeof item.username !== 'string' ||
-            parsePlatformRole(item.platform_role) === null ||
-            typeof item.method !== 'string' ||
-            typeof item.path !== 'string' ||
-            typeof item.status_code !== 'number'
-        ) {
-            throw new Error('平台审计响应包含无效字段')
-        }
-        return item as AdminAuditLog
-    })
-}
-
-const PlatformAuditPage = () => {
-    const [items, setItems] = React.useState<AdminAuditLog[]>([])
-    const [loading, setLoading] = React.useState(true)
-    const [error, setError] = React.useState('')
-
-    React.useEffect(() => {
-        const controller = new AbortController()
-        void apiFetch<unknown>(
-            humanApiRoutes.listPlatformAuditLogs({ page: 1, limit: 50 }),
-            { signal: controller.signal },
-        )
-            .then((value) => setItems(parsePlatformAuditItems(value)))
-            .catch((requestError: unknown) => {
-                if (
-                    controller.signal.aborted ||
-                    (requestError instanceof DOMException &&
-                        requestError.name === 'AbortError')
-                ) {
-                    return
-                }
-                setError(
-                    localizedUnknownErrorMessage(
-                        requestError,
-                        '平台审计记录加载失败',
-                    ),
-                )
-            })
-            .finally(() => {
-                if (!controller.signal.aborted) setLoading(false)
-            })
-        return () => controller.abort()
-    }, [])
-
-    return (
-        <Box data-testid="platform-audit-page" sx={{ p: 3 }}>
-            <Title title="平台审计" />
-            <Typography variant="h4" gutterBottom>
-                平台审计
-            </Typography>
-            <Typography color="text.secondary" sx={{ mb: 2 }}>
-                只读查看平台治理操作，不提供任何修改入口。
-            </Typography>
-            {loading && <PageLoading />}
-            {error && <Alert severity="error">{error}</Alert>}
-            {!loading && !error && (
-                <Stack spacing={1.5}>
-                    {items.length === 0 && (
-                        <Alert severity="info">暂无平台审计记录</Alert>
-                    )}
-                    {items.map((item) => (
-                        <Paper key={item.id} variant="outlined" sx={{ p: 2 }}>
-                            <Stack
-                                direction={{ xs: 'column', md: 'row' }}
-                                spacing={1}
-                                sx={{ justifyContent: 'space-between' }}
-                            >
-                                <Typography sx={{ fontWeight: 600 }}>
-                                    {item.method} {item.path}
-                                </Typography>
-                                <Typography color="text.secondary">
-                                    {new Date(item.created_at).toLocaleString(
-                                        'zh-CN',
-                                    )}
-                                </Typography>
-                            </Stack>
-                            <Typography variant="body2" color="text.secondary">
-                                {item.username} ·{' '}
-                                {getPlatformRoleLabel(item.platform_role)} · HTTP{' '}
-                                {item.status_code}
-                            </Typography>
-                        </Paper>
-                    ))}
-                </Stack>
-            )}
-        </Box>
-    )
 }
 
 const CustomMenu: React.FC = () => {

@@ -1282,7 +1282,13 @@
             "$ref": "#/components/parameters/AuditUserID"
           },
           {
+            "$ref": "#/components/parameters/AuditActor"
+          },
+          {
             "$ref": "#/components/parameters/AuditPlatformRole"
+          },
+          {
+            "$ref": "#/components/parameters/AuditAction"
           },
           {
             "$ref": "#/components/parameters/AuditMethod"
@@ -1291,10 +1297,19 @@
             "$ref": "#/components/parameters/AuditPath"
           },
           {
+            "$ref": "#/components/parameters/AuditPathPrefix"
+          },
+          {
             "$ref": "#/components/parameters/AuditStatus"
           },
           {
             "$ref": "#/components/parameters/AuditKeyword"
+          },
+          {
+            "$ref": "#/components/parameters/AuditResult"
+          },
+          {
+            "$ref": "#/components/parameters/AuditTimePreset"
           },
           {
             "$ref": "#/components/parameters/AuditStartTime"
@@ -1307,6 +1322,9 @@
           },
           {
             "$ref": "#/components/parameters/AuditLimit"
+          },
+          {
+            "$ref": "#/components/parameters/AuditCursor"
           }
         ],
         "responses": {
@@ -1328,6 +1346,65 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/platform/audit-logs/{auditLogID}": {
+      "get": {
+        "operationId": "getPlatformAuditLogDetail",
+        "summary": "Get one platform audit log detail",
+        "description": "Returns a read-time-redacted detail projection to administrators and security auditors.",
+        "tags": [
+          "Platform governance"
+        ],
+        "security": [
+          {
+            "humanBearer": [
+
+            ]
+          }
+        ],
+        "x-chronodesk-platform-roles": [
+          "platform_admin",
+          "security_auditor"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AuditLogID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Redacted platform audit log detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminAuditLogDetailEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
           },
           "500": {
             "$ref": "#/components/responses/InternalServerError"
@@ -5832,11 +5909,19 @@
         "name": "user_id",
         "in": "query",
         "required": false,
-        "description": "Invalid or non-positive values are ignored by the current read adapter.",
         "schema": {
           "type": "integer",
           "format": "uint64",
           "minimum": 1
+        }
+      },
+      "AuditActor": {
+        "name": "actor",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "maxLength": 100
         }
       },
       "AuditPlatformRole": {
@@ -5852,7 +5937,25 @@
         "in": "query",
         "required": false,
         "schema": {
-          "type": "string"
+          "type": "string",
+          "enum": [
+            "GET",
+            "HEAD",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "OPTIONS"
+          ]
+        }
+      },
+      "AuditAction": {
+        "name": "action",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "maxLength": 255
         }
       },
       "AuditPath": {
@@ -5863,13 +5966,25 @@
           "type": "string"
         }
       },
+      "AuditPathPrefix": {
+        "name": "path_prefix",
+        "in": "query",
+        "required": false,
+        "description": "Preferred resource path prefix filter. It cannot be combined with the legacy path parameter.",
+        "schema": {
+          "type": "string",
+          "maxLength": 255,
+          "pattern": "^/"
+        }
+      },
       "AuditStatus": {
         "name": "status",
         "in": "query",
         "required": false,
-        "description": "Integer status-code filter; non-integer values are ignored.",
         "schema": {
-          "type": "integer"
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599
         }
       },
       "AuditKeyword": {
@@ -5880,11 +5995,38 @@
           "type": "string"
         }
       },
+      "AuditResult": {
+        "name": "result",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "success",
+            "error"
+          ]
+        }
+      },
+      "AuditTimePreset": {
+        "name": "time_preset",
+        "in": "query",
+        "required": false,
+        "description": "Relative UTC range ending at request time; cannot be combined with start_time or end_time.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "1h",
+            "24h",
+            "7d",
+            "30d"
+          ]
+        }
+      },
       "AuditStartTime": {
         "name": "start_time",
         "in": "query",
         "required": false,
-        "description": "RFC3339, YYYY-MM-DD HH:MM:SS, or YYYY-MM-DD; invalid values are ignored.",
         "schema": {
           "type": "string"
         }
@@ -5893,7 +6035,6 @@
         "name": "end_time",
         "in": "query",
         "required": false,
-        "description": "RFC3339, YYYY-MM-DD HH:MM:SS, or YYYY-MM-DD; invalid values are ignored.",
         "schema": {
           "type": "string"
         }
@@ -5902,20 +6043,42 @@
         "name": "page",
         "in": "query",
         "required": false,
-        "description": "Values below one are normalized to the first page.",
         "schema": {
           "type": "integer",
-          "default": 1
+          "default": 1,
+          "minimum": 1
         }
       },
       "AuditLimit": {
         "name": "limit",
         "in": "query",
         "required": false,
-        "description": "Values outside 1 through 200 are normalized to 20.",
         "schema": {
           "type": "integer",
-          "default": 20
+          "default": 25,
+          "minimum": 1,
+          "maximum": 100
+        }
+      },
+      "AuditCursor": {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "description": "Opaque stable pagination cursor. It cannot be combined with page or reused with different filters.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        }
+      },
+      "AuditLogID": {
+        "name": "auditLogID",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
         }
       },
       "TicketID": {
@@ -6990,12 +7153,9 @@
           "method",
           "path",
           "status_code",
-          "client_ip",
-          "user_agent",
-          "query",
+          "masked_ip",
           "latency_ms",
-          "result",
-          "notes"
+          "result"
         ],
         "properties": {
           "id": {
@@ -7021,6 +7181,15 @@
           "action": {
             "type": "string"
           },
+          "action_code": {
+            "type": "string"
+          },
+          "resource_type": {
+            "type": "string"
+          },
+          "resource_public_id": {
+            "type": "string"
+          },
           "method": {
             "type": "string"
           },
@@ -7029,16 +7198,10 @@
           },
           "status_code": {
             "type": "integer",
-            "minimum": 100,
+            "minimum": 0,
             "maximum": 599
           },
-          "client_ip": {
-            "type": "string"
-          },
-          "user_agent": {
-            "type": "string"
-          },
-          "query": {
+          "masked_ip": {
             "type": "string"
           },
           "latency_ms": {
@@ -7048,11 +7211,43 @@
           },
           "result": {
             "type": "string"
-          },
-          "notes": {
-            "type": "string"
           }
         }
+      },
+      "AdminAuditLogDetail": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/AdminAuditLog"
+          },
+          {
+            "type": "object",
+            "required": [
+              "query",
+              "user_agent",
+              "notes"
+            ],
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "user_agent": {
+                "type": "string"
+              },
+              "notes": {
+                "type": "string"
+              },
+              "request_id": {
+                "type": "string"
+              },
+              "trace_id": {
+                "type": "string"
+              },
+              "correlation_id": {
+                "type": "string"
+              }
+            }
+          }
+        ]
       },
       "AdminAuditLogPage": {
         "type": "object",
@@ -7082,6 +7277,9 @@
           "limit": {
             "type": "integer",
             "minimum": 1
+          },
+          "next_cursor": {
+            "type": "string"
           }
         }
       },
@@ -7414,6 +7612,24 @@
             "properties": {
               "data": {
                 "$ref": "#/components/schemas/AdminAuditLogPage"
+              }
+            }
+          }
+        ]
+      },
+      "AdminAuditLogDetailEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SuccessEnvelope"
+          },
+          {
+            "type": "object",
+            "required": [
+              "data"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/AdminAuditLogDetail"
               }
             }
           }

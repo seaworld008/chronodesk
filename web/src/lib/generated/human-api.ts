@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.0.0.
- * Contract SHA-256: 6bac64b34db412e033cb8750c3b0b79142d81141ab7d55e64bdaeb57c91e4ff7.
+ * Contract SHA-256: b8802501bdde224ce7fe0395abd90c51a46d98d5b78f3915112832b5150ce8b7.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -241,15 +241,24 @@ export type AdminAuditLog = {
     username: string
     platform_role: PlatformRole
     action: string
+    action_code?: string
+    resource_type?: string
+    resource_public_id?: string
     method: string
     path: string
     status_code: number
-    client_ip: string
-    user_agent: string
-    query: string
+    masked_ip: string
     latency_ms: number
     result: string
+}
+
+export type AdminAuditLogDetail = AdminAuditLog & {
+    query: string
+    user_agent: string
     notes: string
+    request_id?: string
+    trace_id?: string
+    correlation_id?: string
 }
 
 export type AdminAuditLogPage = {
@@ -257,6 +266,7 @@ export type AdminAuditLogPage = {
     total: number
     page: number
     limit: number
+    next_cursor?: string
 }
 
 export type SuccessEnvelope = {
@@ -343,6 +353,10 @@ export type EmptySuccessEnvelope = SuccessEnvelope & {
 
 export type AdminAuditLogPageEnvelope = SuccessEnvelope & {
     data: AdminAuditLogPage
+}
+
+export type AdminAuditLogDetailEnvelope = SuccessEnvelope & {
+    data: AdminAuditLogDetail
 }
 
 export const ticketStatusValues = ["open","in_progress","pending","resolved","closed","cancelled"] as const
@@ -1625,18 +1639,31 @@ export type ResetPlatformUserPasswordOperationResponse = EmptySuccessEnvelope
 export type ListPlatformAuditLogsOperationPathParameters = Record<string, never>
 export type ListPlatformAuditLogsOperationQuery = {
     user_id?: number
+    actor?: string
     platform_role?: PlatformRole
-    method?: string
+    action?: string
+    method?: "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"
     path?: string
+    path_prefix?: string
     status?: number
     keyword?: string
+    result?: "pending" | "success" | "error"
+    time_preset?: "1h" | "24h" | "7d" | "30d"
     start_time?: string
     end_time?: string
     page?: number
     limit?: number
+    cursor?: string
 }
 export type ListPlatformAuditLogsOperationRequest = never
 export type ListPlatformAuditLogsOperationResponse = AdminAuditLogPageEnvelope
+
+export type GetPlatformAuditLogDetailOperationPathParameters = {
+    auditLogID: number
+}
+export type GetPlatformAuditLogDetailOperationQuery = Record<string, never>
+export type GetPlatformAuditLogDetailOperationRequest = never
+export type GetPlatformAuditLogDetailOperationResponse = AdminAuditLogDetailEnvelope
 
 export type ListCrossProjectWorkbenchTicketsOperationPathParameters = Record<string, never>
 export type ListCrossProjectWorkbenchTicketsOperationQuery = {
@@ -2270,6 +2297,12 @@ export const humanApiOperations = {
         successStatus: 200,
         requestBody: "none",
     },
+    getPlatformAuditLogDetail: {
+        method: "GET",
+        path: "/platform/audit-logs/{auditLogID}",
+        successStatus: 200,
+        requestBody: "none",
+    },
     listCrossProjectWorkbenchTickets: {
         method: "GET",
         path: "/workbench/tickets",
@@ -2741,6 +2774,12 @@ export interface HumanApiOperationTypes {
         request: ListPlatformAuditLogsOperationRequest
         response: ListPlatformAuditLogsOperationResponse
     }
+    getPlatformAuditLogDetail: {
+        pathParameters: GetPlatformAuditLogDetailOperationPathParameters
+        query: GetPlatformAuditLogDetailOperationQuery
+        request: GetPlatformAuditLogDetailOperationRequest
+        response: GetPlatformAuditLogDetailOperationResponse
+    }
     listCrossProjectWorkbenchTickets: {
         pathParameters: ListCrossProjectWorkbenchTicketsOperationPathParameters
         query: ListCrossProjectWorkbenchTicketsOperationQuery
@@ -3190,6 +3229,8 @@ export const humanApiRoutes = {
         humanApiRoute("resetPlatformUserPassword", pathParameters, query),
     listPlatformAuditLogs: (query: ListPlatformAuditLogsOperationQuery = {}) =>
         humanApiRoute("listPlatformAuditLogs", {}, query),
+    getPlatformAuditLogDetail: (pathParameters: GetPlatformAuditLogDetailOperationPathParameters, query: GetPlatformAuditLogDetailOperationQuery = {}) =>
+        humanApiRoute("getPlatformAuditLogDetail", pathParameters, query),
     listCrossProjectWorkbenchTickets: (query: ListCrossProjectWorkbenchTicketsOperationQuery = {}) =>
         humanApiRoute("listCrossProjectWorkbenchTickets", {}, query),
     listProjectTickets: (pathParameters: ListProjectTicketsOperationPathParameters, query: ListProjectTicketsOperationQuery = {}) =>
