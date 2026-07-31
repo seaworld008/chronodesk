@@ -12,15 +12,21 @@ that need trustworthy human-agent collaboration across support, IT service,
 SRE, security operations, internal services, and field operations. Humans work
 in a Chinese enterprise console; external Agents use stable REST, MCP, or A2A
 Interfaces backed by the same authorization, concurrency, event, and audit
-semantics.
+semantics. One private Organization can operate multiple isolated Projects;
+each Project is the runtime boundary for data, configuration, Agent authority,
+and external Connections.
 
 The project is a single-organization, self-hosted modular monolith. It does not
-embed an LLM, RAG system, prompt platform, or autonomous planner.
+ship an in-process model runtime, prompt-authoring platform, or autonomous
+planner. It does include project-scoped knowledge lifecycle, ACL-filtered
+hybrid retrieval, citations, feedback, and model-policy foundations that connect
+to deployment-owned search and model gateways.
 
 ## Why ChronoDesk
 
-- **One Ticket domain, four Interfaces**: human REST/WebSocket, Agent REST,
-  MCP, and A2A share the same domain Implementation.
+- **One Ticket domain, five Adapters**: Human REST/WebSocket, Agent REST,
+  MCP, A2A, and Connector/Inbox adapters share the same domain
+  Implementation.
 - **Machine identity is first-class**: Service Principals, short-lived tokens,
   minimum scopes, policy decisions, rate/concurrency limits, emergency stops,
   and delegated audit trails.
@@ -91,13 +97,39 @@ Email / alert / human / external Agent creates a Ticket
 
 ### Current boundaries
 
-- The current deployment model is single-organization and self-hosted. Models,
-  RAG, and autonomous planning live in an external Agent platform.
+- The current deployment model is single-organization and self-hosted. Model
+  inference and autonomous planning live in an external Agent platform or
+  deployment-owned gateway. ChronoDesk owns the project-scoped knowledge,
+  retrieval-policy, citation, and audit boundary.
 - ChronoDesk can coordinate exceptions produced by real-time control, clinical,
   trading, or other specialist systems, but it does not replace those systems
   or their professional decisions.
-- Multi-tenancy, billing, embedded models, knowledge retrieval, and outbound
-  delegation are later phases.
+- Multi-tenancy, billing, embedded model execution, production ingestion/object
+  storage/scanning workers, and outbound delegation are later phases.
+
+### Organization, Project, and access boundaries
+
+ChronoDesk is AI-native in the operational sense: humans and Agents can use the
+same project-scoped domain operations, while identity and authorization remain
+server-owned. A single Organization can contain multiple Projects, but a
+Project never inherits another Project's data or authority.
+
+- Platform roles are exactly `platform_admin`, `security_auditor`,
+  `emergency_operator`, and `member`. They govern platform operations only.
+- Project roles are exactly `project_admin`, `manager`, `agent`, `requester`,
+  and `observer`, and exist only on an active `ProjectMembership`.
+- These two closed role sets are independent and unordered: a platform role
+  never grants a Project role or project access.
+- A Human JWT contains only its platform-role assertion. Every authenticated
+  request revalidates the active user and platform role; a changed assertion is
+  rejected as `stale_token`. Project access and project role are resolved from
+  active Membership on each project request.
+
+The Human REST surface reflects this split: `/api/platform/*` is narrow
+platform governance, `/api/projects/*` is project-scoped work, and
+`/api/workbench/*` aggregates only the caller's active Membership projects.
+The Human Web contract is published at `/human-openapi.json`; Agent machine
+contracts remain separate from it.
 
 ## Current protocol baseline
 
@@ -120,10 +152,12 @@ flowchart LR
     Agents["External AI Agents"] --> REST["Agent REST /api/v2/projects/{projectKey}"]
     Agents --> MCP["MCP 2026-07-28"]
     Agents --> A2A["A2A 1.0"]
+    Systems["External systems"] --> Connector["Connector / signed Inbox"]
     Human --> Adapters["Protocol Adapters"]
     REST --> Adapters
     MCP --> Adapters
     A2A --> Adapters
+    Connector --> Adapters
     Adapters --> Domain["Ticket / policy / lease Domain"]
     Domain --> PG["PostgreSQL"]
     Domain --> Redis["Redis"]
@@ -150,6 +184,10 @@ Open:
 - Console: <http://localhost:3000>
 - Health: <http://localhost:8081/healthz>
 - OpenAPI: <http://localhost:8081/openapi.yaml>
+- Human Web OpenAPI: <http://localhost:8081/human-openapi.json>
+- Platform governance: `http://localhost:8081/api/platform/*`
+- Project work: `http://localhost:8081/api/projects/{projectKey}/*`
+- Membership-scoped workbench: `http://localhost:8081/api/workbench/*`
 - Agent REST: `http://localhost:8081/api/v2/projects/{projectKey}`
 - MCP: <http://localhost:8081/mcp>
 - A2A Agent Card: <http://localhost:8081/.well-known/agent-card.json>
@@ -211,16 +249,25 @@ server/
   cmd/chronodesk/       minimal executable
   cmd/migrate/          explicit migration/seed command
   cmd/credential-maintain/ current-format validation, rotation, and quarantine
+  cmd/chronodeskctl/     connection and machine-contract diagnostics
   internal/app/         composition root and graceful lifecycle
   internal/services/    shared domain/application rules
   internal/agentplatform/
                         Agent REST and MCP/A2A domain Adapters
+  internal/eventcontract/ canonical CloudEvent type catalog
+  internal/scopeddb/     project-scoped transaction routing
   internal/mcp/         MCP protocol Module
   internal/a2a/         A2A protocol Module
   internal/openapi/     embedded OpenAPI 3.2 contract
+  internal/humanopenapi/ Human Web OpenAPI 3.2 contract
+  internal/asyncapi/     embedded CloudEvents/stream contract
 web/
   src/admin/            React Admin feature slices
   src/components/       shared enterprise UI Modules
+sdk/
+  go/                   generated Go Agent SDK
+  typescript/           generated TypeScript Agent SDK
+  python/               generated Python Agent SDK
 docs/
   adr/                  accepted architecture decisions
   operations/           deployment and migration guides
@@ -232,9 +279,13 @@ docs/
 
 - [Project manual](docs/PROJECT_MANUAL.md)
 - [Architecture decisions](docs/adr/README.md)
+- [AI-native multi-project status](docs/reference/AI_NATIVE_UPGRADE_PROGRESS.md)
 - [Agent REST and machine contract](docs/reference/API_DOCUMENTATION.md)
 - [MCP integration](docs/reference/MCP_2026_07_28.md)
 - [A2A integration](docs/reference/A2A_1_0.md)
+- [CloudEvents 1.0](docs/reference/CLOUDEVENTS_1_0.md)
+- [Integration SDKs](docs/reference/INTEGRATION_SDKS.md)
+- [Integration tooling](docs/reference/INTEGRATION_TOOLING.md)
 - [Database migrations](docs/operations/database-migrations.md)
 - [Testing guide](docs/testing_guide.md)
 - [Full Agent-native verification report](docs/testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-30.md)

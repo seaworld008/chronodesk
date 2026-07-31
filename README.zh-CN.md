@@ -10,15 +10,18 @@
 ChronoDesk 是面向 AI Agent 与人类协作的原生工单和任务执行平台，适用于客服、
 IT 服务、SRE、安全运营、企业内部服务、设备运维等需要可信任务流转的团队。人类
 在全中文企业管理后台中工作；外部 Agent 通过稳定的 REST、MCP 或 A2A Interface
-接入，并共享完全一致的权限、并发控制、事件和审计语义。
+接入，并共享完全一致的权限、并发控制、事件和审计语义。一个私有 Organization 可
+管理多个相互隔离的 Project；Project 是数据、配置、Agent 权限和外部 Connection 的
+运行边界。
 
-项目采用面向单组织私有化部署的模块化单体架构，不内置 LLM、RAG、提示词平台或
-自治规划器。
+项目采用面向单组织私有化部署的模块化单体架构，不提供进程内模型运行时、提示词
+编排平台或自治规划器。仓库已具备项目范围的知识生命周期、ACL 过滤混合检索、引用、
+反馈与模型策略基础，并连接由部署方管理的搜索和模型网关。
 
 ## 为什么选择 ChronoDesk
 
-- **一套 Ticket 领域，四种 Interface**：人类 REST/WebSocket、Agent REST、
-  MCP 与 A2A 共用同一领域 Implementation。
+- **一套 Ticket 领域，五类 Adapter**：Human REST/WebSocket、Agent REST、MCP、
+  A2A 与 Connector/Inbox 共用同一领域 Implementation。
 - **机器身份是一等公民**：Service Principal、短期令牌、最小 scope、策略决策、
   限流/并发限制、紧急停用和完整委托审计。
 - **并行自动化安全**：`Idempotency-Key`、资源版本、`ETag` / `If-Match` 和
@@ -77,10 +80,31 @@ ChronoDesk 支持从辅助决策到策略内自主执行的多种协作方式：
 
 ### 当前边界
 
-- 当前面向单组织私有化部署；模型、RAG 和自治规划由外部 Agent 平台承载。
+- 当前面向单组织私有化部署；模型推理与自治规划由外部 Agent 平台或部署方模型网关
+  承载，ChronoDesk 负责项目范围的知识、检索策略、引用与审计边界。
 - ChronoDesk 管理实时控制、临床、交易等专业系统产生的异常和处置流程，但不替代
   工业实时控制、临床诊断、高频交易或其他行业核心决策系统。
-- 多租户、计费、内置模型、知识库检索和主动对外委派属于后续阶段。
+- 多租户、计费、内置模型执行、生产化摄取/对象存储/扫描 Worker 和主动对外委派
+  属于后续阶段。
+
+### Organization、Project 与访问边界
+
+ChronoDesk 的 AI 原生含义是：人类与 Agent 可以调用同一套项目范围领域能力，而身份
+与授权始终由服务端决定。一个 Organization 可以有多个 Project，但 Project 之间绝不
+继承数据或权限。
+
+- 平台角色严格限定为 `platform_admin`、`security_auditor`、
+  `emergency_operator`、`member`，只用于平台治理。
+- 项目角色严格限定为 `project_admin`、`manager`、`agent`、`requester`、
+  `observer`，只存在于 active `ProjectMembership`。
+- 两套封闭且无序的角色完全独立；平台角色不会赋予项目角色或项目访问权。
+- Human JWT 只携带平台角色声明。每次认证请求都会实时复核 active 用户和平台
+  角色；声明失效时返回 `stale_token`。项目角色和访问权在每次项目请求中从 active
+  Membership 实时解析。
+
+Human REST 也按此分层：`/api/platform/*` 是窄平台治理面，`/api/projects/*` 是项目
+工作面，`/api/workbench/*` 只聚合当前用户具有 active Membership 的项目。Human Web
+契约发布于 `/human-openapi.json`，不与 Agent 机器契约混为一谈。
 
 ## 当前协议基线
 
@@ -103,10 +127,12 @@ flowchart LR
     Agents["外部 AI Agent"] --> REST["Agent REST /api/v2/projects/{projectKey}"]
     Agents --> MCP["MCP 2026-07-28"]
     Agents --> A2A["A2A 1.0"]
+    Systems["外部业务系统"] --> Connector["Connector / 签名 Inbox"]
     Human --> Adapters["协议 Adapter"]
     REST --> Adapters
     MCP --> Adapters
     A2A --> Adapters
+    Connector --> Adapters
     Adapters --> Domain["Ticket / 策略 / 租约领域"]
     Domain --> PG["PostgreSQL"]
     Domain --> Redis["Redis"]
@@ -133,6 +159,10 @@ docker compose exec server chronodesk-migrate -seed
 - 管理后台：<http://localhost:3000>
 - 健康检查：<http://localhost:8081/healthz>
 - OpenAPI：<http://localhost:8081/openapi.yaml>
+- Human Web OpenAPI：<http://localhost:8081/human-openapi.json>
+- 平台治理：`http://localhost:8081/api/platform/*`
+- 项目工作：`http://localhost:8081/api/projects/{projectKey}/*`
+- Membership 范围工作台：`http://localhost:8081/api/workbench/*`
 - Agent REST：`http://localhost:8081/api/v2/projects/{projectKey}`
 - MCP：<http://localhost:8081/mcp>
 - A2A Agent Card：<http://localhost:8081/.well-known/agent-card.json>
@@ -187,16 +217,25 @@ server/
   cmd/chronodesk/       最小可执行入口
   cmd/migrate/          显式迁移/种子命令
   cmd/credential-maintain/ 当前格式验证、轮换与密码隔离
+  cmd/chronodeskctl/     Connection 与机器契约诊断
   internal/app/         组合根与优雅生命周期
   internal/services/    共享领域/应用规则
   internal/agentplatform/
                         Agent REST 与 MCP/A2A 领域 Adapter
+  internal/eventcontract/ CloudEvent 类型目录
+  internal/scopeddb/     项目范围事务路由
   internal/mcp/         MCP 协议 Module
   internal/a2a/         A2A 协议 Module
   internal/openapi/     内嵌 OpenAPI 3.2 契约
+  internal/humanopenapi/ Human Web OpenAPI 3.2 契约
+  internal/asyncapi/     内嵌 CloudEvents/流契约
 web/
   src/admin/            React Admin 功能切片
   src/components/       共享企业 UI Module
+sdk/
+  go/                   生成的 Go Agent SDK
+  typescript/           生成的 TypeScript Agent SDK
+  python/               生成的 Python Agent SDK
 docs/
   adr/                  已接受的架构决策
   operations/           运维与迁移指南
@@ -208,9 +247,13 @@ docs/
 
 - [项目权威手册](docs/PROJECT_MANUAL.md)
 - [架构决策](docs/adr/README.md)
+- [AI 原生多项目状态](docs/reference/AI_NATIVE_UPGRADE_PROGRESS.md)
 - [Agent REST 与机器契约](docs/reference/API_DOCUMENTATION.md)
 - [MCP 接入](docs/reference/MCP_2026_07_28.md)
 - [A2A 接入](docs/reference/A2A_1_0.md)
+- [CloudEvents 1.0](docs/reference/CLOUDEVENTS_1_0.md)
+- [集成 SDK](docs/reference/INTEGRATION_SDKS.md)
+- [集成工具](docs/reference/INTEGRATION_TOOLING.md)
 - [数据库迁移](docs/operations/database-migrations.md)
 - [测试指南](docs/testing_guide.md)
 - [Agent 原生化完整测试报告](docs/testing/CHRONODESK_AGENT_NATIVE_FULL_TEST_REPORT_2026-07-30.md)

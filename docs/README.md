@@ -18,6 +18,8 @@
 - [统一 Actor 与 Assignment 模型](adr/0002-actor-and-assignment-model.md)
 - [事务 Domain Event 与 Outbox](adr/0003-transactional-events-and-outbox.md)
 - [最小可执行入口与应用组合根](adr/0004-application-composition-root.md)
+- [Project 是运行时安全与配置边界](adr/0005-project-is-the-runtime-boundary.md)
+- [平台角色与项目角色分离](adr/0008-separate-platform-and-project-roles.md)
 
 ## 运维
 
@@ -32,9 +34,12 @@
 - [CloudEvents 1.0](reference/CLOUDEVENTS_1_0.md)
 - [OpenAPI 3.2](reference/OPENAPI_3_2.md)
 - [Reference 索引](reference/README.md)
+- [AI 原生多项目状态](reference/AI_NATIVE_UPGRADE_PROGRESS.md)
 
-请求/响应 Schema 的唯一权威来源是
-`server/internal/openapi/openapi.yaml`，运行时由 `/openapi.yaml` 提供。
+Agent 请求/响应 Schema 的唯一权威来源是
+`server/internal/openapi/openapi.yaml`，运行时由 `/openapi.yaml` 提供。Human Web
+P1 另由 `server/internal/humanopenapi/openapi.json` 和运行时
+`/human-openapi.json` 提供；两个契约分别服务不同调用方，不应相互推断覆盖范围。
 
 ## 测试证据
 
@@ -44,5 +49,5 @@
 
 1. 领域术语变化先更新 `CONTEXT.md`。
 2. 跨 Module 的持久架构选择必须增加 ADR。
-3. Interface 或运行命令变化同步更新 `PROJECT_MANUAL.md`、根 README 和测试指南。
+3. Interface、角色、路由、迁移或运行命令变化同步更新 `PROJECT_MANUAL.md`、根 README、测试指南和相应 ADR/参考页。
 4. 失效计划、提示词、一次性报告和本机路径不得继续留在当前文档树。

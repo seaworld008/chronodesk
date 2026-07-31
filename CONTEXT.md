@@ -23,6 +23,25 @@ construct the trusted numeric scope.
 set. Platform administrators may enter an explicit management overview, while
 ordinary cross-project work uses only active memberships.
 
+### Platform role and Project role
+
+`PlatformRole` and `ProjectRole` are separate, closed, unordered vocabularies.
+They must never be converted into each other or interpreted through inheritance:
+
+- Platform identity uses only `platform_admin`, `security_auditor`,
+  `emergency_operator`, and `member`.
+- Human project Membership uses only `project_admin`, `manager`, `agent`,
+  `requester`, and `observer`.
+
+A Human JWT carries a platform-role assertion only. Authentication re-reads the
+active Human and compares that assertion on every request; a role change,
+suspension, or deletion invalidates the session and returns the stable
+`stale_token` result where applicable. A Project role never appears in the JWT
+or platform context: each project request resolves the active Membership and
+its role afresh. A platform role can authorize narrow `/api/platform/*`
+governance, but it never fabricates `ProjectScope`, `ProjectAccess`, or a
+project role for `/api/projects/*` or `/api/workbench/*`.
+
 ### Team and Queue
 
 A Team groups human workers. A Queue is the project-local routing and
@@ -97,7 +116,9 @@ Assignment rules.
 and project authorization. It carries `ProjectScope`, `ActorRef`, source
 protocol, credential identity, trace ID, and correlation ID. Human REST, Agent
 REST, MCP, A2A, Connector, and Worker adapters all call the same scoped domain
-interfaces with this context.
+interfaces with this context. `/api/platform/*` is deliberately outside this
+project context; `/api/workbench/*` derives a bounded set of contexts from
+active Human Memberships and never from a platform role alone.
 
 PostgreSQL Row-Level Security is an independent enforcement layer. Project
 repositories and workers must still include explicit scope predicates and use

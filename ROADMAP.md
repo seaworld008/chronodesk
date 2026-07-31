@@ -4,7 +4,7 @@
 
 ## 当前基线
 
-ChronoDesk 正在建设统一的人类与 Agent 工单平台。领域服务维护唯一业务语义，REST、MCP 和 A2A 作为共享语义之上的协议 Adapter。
+ChronoDesk 正在建设单 Organization、多 Project 的统一人类与 Agent 工单平台。领域服务维护唯一业务语义，Human REST、Agent REST、MCP、A2A 和 Connector 作为共享语义之上的五类 Adapter。
 
 当前协议基线仅支持：
 
@@ -15,6 +15,8 @@ ChronoDesk 正在建设统一的人类与 Agent 工单平台。领域服务维�
 
 ## Now — 稳定 Agent-native 核心
 
+- 持续验证平台角色与项目 Membership 的分离：平台治理、项目工作和跨项目工作台不能相互越权。
+- 维护 Human Web OpenAPI 与 Agent OpenAPI 的独立边界，避免将遗留人类路由或 Human 契约误作 Agent 公共 API。
 - 加固服务主体、最小权限策略、凭据生命周期和管理员紧急控制。
 - 完成工单租约、幂等、审计、领域事件与 Outbox 的端到端可靠性验证。
 - 保证 REST、MCP、A2A 和人类操作共享状态迁移、权限与副作用语义。
@@ -28,6 +30,7 @@ ChronoDesk 正在建设统一的人类与 Agent 工单平台。领域服务维�
 - 建立可重复的 MCP `2026-07-28` 与 A2A wire `1.0` 互操作测试矩阵。
 - 明确第三方 Adapter/集成的稳定扩展点，保持领域规则集中。
 - 强化数据库迁移、备份恢复和滚动升级路径。
+- 完成 OIDC/SAML/SCIM 等身份接入，但不让外部身份同步隐式生成项目管理员 Membership。
 
 ## Later — 生态与规模化
 

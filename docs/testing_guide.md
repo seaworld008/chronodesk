@@ -65,6 +65,12 @@ make verify
 3. Redocly 2.41.1 与 Spectral 6.16.2 的 OpenAPI 3.2 严格校验
 4. `chronodesk`、数据库迁移、凭据维护命令与 Web 生产资源构建
 
+涉及平台/项目角色、Human 会话、路由边界或迁移时，还必须执行对应的 Go 契约与
+迁移测试，并确认：平台角色没有隐式项目访问，项目角色必须来自 active
+Membership，Membership 撤销立即失效，过期平台角色声明返回 `stale_token`，以及
+`20260730_platform_roles_v1_cutover` 的前置 checkpoint、映射和不匹配路径 fail
+closed。不要把 `make verify` 的格式/构建结果写成已完成真实 PostgreSQL 切换的证据。
+
 `make build` 输出 `server/bin/chronodesk`、
 `server/bin/chronodesk-migrate` 和 `web/dist/`。
 
@@ -109,6 +115,10 @@ make e2e
 
 - 登录、工单生命周期、公开/内部评论和附件。
 - 用户、通知、自动化、系统设置、邮件、Webhook 与 Agent 控制中心。
+- 平台治理、项目切换与跨项目工作台：没有 Membership 的平台角色不能读取项目
+  Ticket，撤销 Membership 后项目入口和工作台都立即拒绝或移除该项目。
+- Human Web 从 `/human-openapi.json` 使用的路由、角色和 DTO 与 Agent
+  `/openapi.yaml` 保持独立，不将一个契约的未覆盖路径当成另一个的公开能力。
 - 页面提示和错误信息均为中文。
 - 工单及其他列表不自动换行，长内容省略并可查看全文。
 - 表头列宽可通过鼠标或键盘调整，刷新后仍保持；操作列固定，横向滚动不遮挡侧栏。
@@ -154,6 +164,10 @@ Pytest 默认访问 `http://localhost:8081/api`；可通过 `TEST_API_BASE_URL`�
 ## 7. 发布前检查清单
 
 - [ ] PostgreSQL/Redis 健康检查通过，结构迁移与密钥验证完成。
+- [ ] 涉及角色切换时，已在备份/隔离环境复核
+  `20260730_platform_roles_v1_cutover` checkpoint、旧列删除和 active Membership
+  映射；异常来源保持 fail closed。
+- [ ] 平台/项目角色矩阵、`stale_token`、Membership 撤销及工作台范围的负向授权测试通过。
 - [ ] 236 Case Evidence Manifest 校验通过，且当次报告记录所有发布规程结果。
 - [ ] `make verify` 通过。
 - [ ] Go race、vet 和真实 Redis 集成测试通过。
