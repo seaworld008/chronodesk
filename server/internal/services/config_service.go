@@ -4,8 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -15,6 +19,29 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/observability"
 	"github.com/seaworld008/chronodesk/server/internal/version"
 )
+
+// ErrInvalidSystemConfigKey is stable so every transport can map the shared
+// key invariant without depending on a persistence error.
+var ErrInvalidSystemConfigKey = errors.New("配置键无效")
+
+// ValidateSystemConfigKey enforces the persisted SystemConfig key contract.
+// Keys are Unicode data: they are not normalized or restricted to ASCII.
+func ValidateSystemConfigKey(key string) error {
+	if !utf8.ValidString(key) {
+		return ErrInvalidSystemConfigKey
+	}
+	codePoints := utf8.RuneCountInString(key)
+	if codePoints < 1 || codePoints > 100 ||
+		strings.TrimSpace(key) != key {
+		return ErrInvalidSystemConfigKey
+	}
+	for _, char := range key {
+		if unicode.IsControl(char) {
+			return ErrInvalidSystemConfigKey
+		}
+	}
+	return nil
+}
 
 // ConfigService 系统配置服务
 type ConfigService struct {
@@ -85,9 +112,13 @@ func NewConfigService(db *gorm.DB) *ConfigService {
 func (s *ConfigService) InitDefaultConfigs() error {
 	log.Println("🔧 初始化系统默认配置...")
 
+	defaults := models.DefaultSystemConfigs(version.Version)
+	if err := validateSystemConfigKeys(defaults); err != nil {
+		return err
+	}
 	created := make([]models.SystemConfig, 0)
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
-		for _, config := range models.DefaultSystemConfigs(version.Version) {
+		for _, config := range defaults {
 			result := tx.Clauses(clause.OnConflict{
 				Columns:   []clause.Column{{Name: "key"}},
 				DoNothing: true,
@@ -157,6 +188,9 @@ func (s *ConfigService) GetConfigBool(key string) (bool, error) {
 
 // SetConfig 设置配置值
 func (s *ConfigService) SetConfig(key, value, valueType, description, category, group string) error {
+	if err := ValidateSystemConfigKey(key); err != nil {
+		return err
+	}
 	var existingConfig models.SystemConfig
 	err := s.db.Where("key = ?", key).First(&existingConfig).Error
 
@@ -202,6 +236,9 @@ func (s *ConfigService) SetConfig(key, value, valueType, description, category, 
 
 // DeleteConfig 删除配置
 func (s *ConfigService) DeleteConfig(key string) error {
+	if err := ValidateSystemConfigKey(key); err != nil {
+		return err
+	}
 	if err := s.db.Where("key = ?", key).Delete(&models.SystemConfig{}).Error; err != nil {
 		return err
 	}
@@ -234,6 +271,9 @@ func (s *ConfigService) GetAllConfigs() ([]models.SystemConfig, error) {
 
 // BatchUpdateConfigs 批量更新配置
 func (s *ConfigService) BatchUpdateConfigs(configs []models.SystemConfig) error {
+	if err := validateSystemConfigKeys(configs); err != nil {
+		return err
+	}
 	changes := make([]configAuditChange, 0, len(configs))
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
 		for _, config := range configs {
@@ -329,6 +369,9 @@ func (s *ConfigService) ImportConfigs(data []byte) error {
 	if err := json.Unmarshal(data, &configs); err != nil {
 		return fmt.Errorf("JSON格式错误: %v", err)
 	}
+	if err := validateSystemConfigKeys(configs); err != nil {
+		return err
+	}
 
 	changes := make([]configAuditChange, 0, len(configs))
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
@@ -354,6 +397,9 @@ func (s *ConfigService) ImportConfigs(data []byte) error {
 
 // ValidateConfig 验证配置值
 func (s *ConfigService) ValidateConfig(key, value, valueType string) error {
+	if err := ValidateSystemConfigKey(key); err != nil {
+		return err
+	}
 	switch valueType {
 	case "int":
 		var intValue int
@@ -376,6 +422,15 @@ func (s *ConfigService) ValidateConfig(key, value, valueType string) error {
 		return fmt.Errorf("不支持的配置值类型: %s", valueType)
 	}
 
+	return nil
+}
+
+func validateSystemConfigKeys(configs []models.SystemConfig) error {
+	for _, config := range configs {
+		if err := ValidateSystemConfigKey(config.Key); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

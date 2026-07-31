@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -126,6 +127,9 @@ func (h *ConfigHandler) CreateConfig(c *gin.Context) {
 
 	// 验证配置值类型
 	if err := h.configService.ValidateConfig(req.Key, req.Value, req.ValueType); err != nil {
+		if rejectInvalidSystemConfigKey(c, err) {
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "配置值验证失败",
@@ -135,6 +139,9 @@ func (h *ConfigHandler) CreateConfig(c *gin.Context) {
 	}
 
 	if err := h.configService.SetConfig(req.Key, req.Value, req.ValueType, req.Description, req.Category, req.Group); err != nil {
+		if rejectInvalidSystemConfigKey(c, err) {
+			return
+		}
 		logHandlerFailure(c, "config.create", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -179,6 +186,9 @@ func (h *ConfigHandler) UpdateConfig(c *gin.Context) {
 	// 确保 key 一致
 	// 验证配置值类型
 	if err := h.configService.ValidateConfig(key, req.Value, req.ValueType); err != nil {
+		if rejectInvalidSystemConfigKey(c, err) {
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "配置值验证失败",
@@ -188,6 +198,9 @@ func (h *ConfigHandler) UpdateConfig(c *gin.Context) {
 	}
 
 	if err := h.configService.SetConfig(key, req.Value, req.ValueType, req.Description, req.Category, req.Group); err != nil {
+		if rejectInvalidSystemConfigKey(c, err) {
+			return
+		}
 		logHandlerFailure(c, "config.update", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -218,6 +231,9 @@ func (h *ConfigHandler) DeleteConfig(c *gin.Context) {
 	key := c.Param("key")
 
 	if err := h.configService.DeleteConfig(key); err != nil {
+		if rejectInvalidSystemConfigKey(c, err) {
+			return
+		}
 		logHandlerFailure(c, "config.delete", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -257,6 +273,9 @@ func (h *ConfigHandler) BatchUpdateConfigs(c *gin.Context) {
 	// 验证所有配置
 	for _, config := range configs {
 		if err := h.configService.ValidateConfig(config.Key, config.Value, config.ValueType); err != nil {
+			if rejectInvalidSystemConfigKey(c, err) {
+				return
+			}
 			c.JSON(http.StatusBadRequest, gin.H{
 				"success": false,
 				"message": "配置验证失败",
@@ -267,6 +286,9 @@ func (h *ConfigHandler) BatchUpdateConfigs(c *gin.Context) {
 	}
 
 	if err := h.configService.BatchUpdateConfigs(configs); err != nil {
+		if rejectInvalidSystemConfigKey(c, err) {
+			return
+		}
 		logHandlerFailure(c, "config.batch_update", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -400,6 +422,9 @@ func (h *ConfigHandler) ImportConfigs(c *gin.Context) {
 
 	// 导入配置
 	if err := h.configService.ImportConfigs(data); err != nil {
+		if rejectInvalidSystemConfigKey(c, err) {
+			return
+		}
 		logHandlerFailure(c, "config.import", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -417,6 +442,18 @@ func (h *ConfigHandler) ImportConfigs(c *gin.Context) {
 			"size":     file.Size,
 		},
 	})
+}
+
+func rejectInvalidSystemConfigKey(c *gin.Context, err error) bool {
+	if !errors.Is(err, services.ErrInvalidSystemConfigKey) {
+		return false
+	}
+	c.JSON(http.StatusBadRequest, gin.H{
+		"success": false,
+		"message": services.ErrInvalidSystemConfigKey.Error(),
+		"error":   "invalid_config_key",
+	})
+	return true
 }
 
 // InitDefaultConfigs 初始化默认配置

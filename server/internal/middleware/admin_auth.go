@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -54,6 +55,29 @@ func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.Han
 			c.Next()
 			return
 		}
+		metadata, ok, metadataErr := adminAuditMetadataForRoute(
+			strings.ToUpper(method),
+			c.FullPath(),
+			c.Params,
+		)
+		if errors.Is(
+			metadataErr,
+			services.ErrInvalidSystemConfigKey,
+		) {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"message": services.ErrInvalidSystemConfigKey.Error(),
+				"error":   "invalid_config_key",
+			})
+			return
+		}
+		if metadataErr != nil || !ok {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"code": 1,
+				"msg":  "管理员审计操作映射不可用",
+			})
+			return
+		}
 		if auditService == nil {
 			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
 				"code": 1,
@@ -76,18 +100,6 @@ func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.Han
 		platformRole, _ := GetCurrentPlatformRole(c)
 
 		action := fmt.Sprintf("%s %s", strings.ToUpper(method), path)
-		metadata, ok := adminAuditMetadataForRoute(
-			strings.ToUpper(method),
-			c.FullPath(),
-			c.Params,
-		)
-		if !ok {
-			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
-				"code": 1,
-				"msg":  "管理员审计操作映射不可用",
-			})
-			return
-		}
 		record := &services.AdminAuditRecord{
 			UserID:           userIDPtr,
 			PlatformRole:     platformRole,
@@ -250,32 +262,38 @@ func adminAuditMetadataForRoute(
 	method string,
 	routeTemplate string,
 	params gin.Params,
-) (adminAuditMetadata, bool) {
+) (adminAuditMetadata, bool, error) {
 	operation := strings.TrimSpace(method) + " " +
 		strings.TrimSpace(routeTemplate)
 	config, ok := adminAuditRouteMetadataByOperation[operation]
 	if !ok {
-		return adminAuditMetadata{}, false
+		return adminAuditMetadata{}, false, nil
 	}
 	publicID := config.fixedPublicID
 	if config.publicIDParam != "" {
-		publicID = boundedAdminAuditResourceID(
-			params.ByName(config.publicIDParam),
-		)
+		rawPublicID := params.ByName(config.publicIDParam)
+		if config.resourceType == "system_config" &&
+			config.publicIDParam == "key" {
+			if err := services.ValidateSystemConfigKey(rawPublicID); err != nil {
+				return adminAuditMetadata{}, true, err
+			}
+			publicID = rawPublicID
+		} else {
+			publicID = boundedAdminAuditResourceID(rawPublicID)
+		}
 		if publicID == "" {
-			return adminAuditMetadata{}, false
+			return adminAuditMetadata{}, false, nil
 		}
 	}
 	return adminAuditMetadata{
 		ActionCode:       config.actionCode,
 		ResourceType:     config.resourceType,
 		ResourcePublicID: publicID,
-	}, true
+	}, true, nil
 }
 
 func boundedAdminAuditResourceID(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
+	if value == "" || strings.TrimSpace(value) == "" {
 		return ""
 	}
 	if len(value) > 512 || !utf8.ValidString(value) ||

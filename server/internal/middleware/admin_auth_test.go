@@ -2,14 +2,13 @@ package middleware
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/services"
@@ -213,45 +212,39 @@ func TestLogAdminOperationAcceptsUnicodeConfigResourceKeys(t *testing.T) {
 	}
 }
 
-func TestLogAdminOperationLetsConfigHandlerRejectInvalidUnicodeKeys(
+func TestLogAdminOperationRejectsInvalidConfigKeysBeforeHandler(
 	t *testing.T,
 ) {
 	gin.SetMode(gin.TestMode)
 	for _, test := range []struct {
-		name               string
-		configKey          string
-		wantDigestPublicID bool
+		name      string
+		configKey string
 	}{
 		{
-			name:               "control character",
-			configKey:          "配置\u0001键",
-			wantDigestPublicID: true,
+			name:      "control character",
+			configKey: "配置\u0001键",
 		},
 		{
 			name:      "more than one hundred characters",
 			configKey: strings.Repeat("配", 101),
 		},
+		{
+			name:      "leading whitespace",
+			configKey: " 配置",
+		},
+		{
+			name:      "trailing whitespace",
+			configKey: "配置\u3000",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			audit := &recordingAdminAuditService{}
 			handlerCalled := false
 			router := gin.New()
-			router.Use(func(c *gin.Context) {
-				c.Set("user_id", uint(7))
-				c.Set("platform_role", models.PlatformRolePlatformAdmin)
-				c.Next()
-			})
-			router.Use(LogAdminOperation(audit))
+			router.Use(LogAdminOperation(nil))
 			router.PUT(
 				"/api/platform/configs/:key",
 				func(c *gin.Context) {
 					handlerCalled = true
-					key := c.Param("key")
-					if strings.IndexFunc(key, unicode.IsControl) >= 0 ||
-						utf8.RuneCountInString(key) > 100 {
-						c.Status(http.StatusBadRequest)
-						return
-					}
 					c.Status(http.StatusOK)
 				},
 			)
@@ -265,23 +258,26 @@ func TestLogAdminOperationLetsConfigHandlerRejectInvalidUnicodeKeys(
 					nil,
 				),
 			)
-			if recorder.Code != http.StatusBadRequest ||
-				!handlerCalled ||
-				len(audit.records) != 1 {
+			if recorder.Code != http.StatusBadRequest || handlerCalled {
 				t.Fatalf(
-					"status=%d handler=%t records=%d",
+					"status=%d handler=%t body=%s",
 					recorder.Code,
 					handlerCalled,
-					len(audit.records),
+					recorder.Body.String(),
 				)
 			}
-			publicID := audit.records[0].ResourcePublicID
-			if test.wantDigestPublicID {
-				if !strings.HasPrefix(publicID, "sha256:") {
-					t.Fatalf("control public id = %q", publicID)
-				}
-			} else if publicID != test.configKey {
-				t.Fatalf("101-character public id = %q", publicID)
+			var payload struct {
+				Success bool   `json:"success"`
+				Message string `json:"message"`
+				Error   string `json:"error"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if payload.Success ||
+				payload.Message != "配置键无效" ||
+				payload.Error != "invalid_config_key" {
+				t.Fatalf("unstable invalid-key response: %+v", payload)
 			}
 		})
 	}
