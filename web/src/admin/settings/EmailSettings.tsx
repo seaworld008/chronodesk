@@ -24,6 +24,8 @@ import {
   type EmailConfig,
   type TestEmailRequest,
 } from '@/lib/generated/human-api'
+import PageHeader from '@/components/layout/PageHeader'
+import PageShell from '@/components/layout/PageShell'
 import BackButton from '../common/BackButton'
 import SettingsTabs from './SettingsTabs'
 
@@ -159,46 +161,37 @@ const EmailSettings: React.FC = () => {
 
   if (loading) {
     return (
-      <Box sx={{ display: 'flex', justifyContent: 'center', mt: 6 }}>
-        <CircularProgress />
-      </Box>
+      <PageShell title="平台邮件设置" testId="email-settings-page-shell">
+        <Box
+          role="status"
+          sx={{ display: 'flex', justifyContent: 'center', py: 6 }}
+        >
+          <CircularProgress aria-label="正在加载平台邮件设置" />
+        </Box>
+      </PageShell>
     )
   }
 
   if (!config) {
     return (
-      <Alert severity="error" action={<Button onClick={loadConfig}>重试</Button>}>
-        无法加载邮件配置
-      </Alert>
+      <PageShell title="平台邮件设置" testId="email-settings-page-shell">
+        <Alert severity="error" action={<Button onClick={loadConfig}>重试</Button>}>
+          无法加载邮件配置
+        </Alert>
+      </PageShell>
     )
   }
 
   return (
-    <Box sx={{ p: 3 }}>
-      <SettingsTabs />
-      <Stack
-        direction="row"
-        sx={{
-          alignItems: "center",
-          justifyContent: "space-between",
-          mb: 2
-        }}>
-        <Stack direction="row" spacing={2} sx={{
-          alignItems: "center"
-        }}>
-          <BackButton fallbackPath="/system-settings" />
-          <Box>
-            <Typography variant="h4" gutterBottom>
-              平台邮件设置
-            </Typography>
-            <Typography sx={{
-              color: "text.secondary"
-            }}>
-              配置平台级 SMTP 服务器与邮件模板，不修改项目配置快照。
-            </Typography>
-          </Box>
-        </Stack>
-      </Stack>
+    <PageShell title="平台邮件设置" testId="email-settings-page-shell">
+      <PageHeader
+        title="平台邮件设置"
+        description="配置平台级 SMTP 服务器与邮件模板，不修改项目配置快照。"
+        leading={<BackButton fallbackPath="/system-settings" />}
+      />
+      <Box sx={{ mt: 2 }}>
+        <SettingsTabs />
+      </Box>
       <Paper sx={{ p: 3, mb: 3 }}>
         <Stack
           direction="row"
@@ -371,7 +364,12 @@ const EmailSettings: React.FC = () => {
           </Grid>
         </Grid>
       </Paper>
-      <Stack direction="row" spacing={2}>
+      <Stack
+        direction="row"
+        spacing={2}
+        useFlexGap
+        sx={{ flexWrap: 'wrap' }}
+      >
         <Button
           variant="contained"
           onClick={handleSave}
@@ -431,7 +429,7 @@ const EmailSettings: React.FC = () => {
           </Button>
         </DialogActions>
       </Dialog>
-    </Box>
+    </PageShell>
   );
 }
 

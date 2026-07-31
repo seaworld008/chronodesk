@@ -16,13 +16,13 @@ import {
     TableRow,
     Tooltip,
 } from '@mui/material'
-import { Title } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
 import {
     ResizableMuiTable,
     TruncatedText,
     type ResizableColumn,
 } from '@/components/tables/EnterpriseTable'
+import PageShell from '@/components/layout/PageShell'
 import AccountPageHeader from './AccountPageHeader'
 
 interface LoginHistoryRecord {
@@ -95,28 +95,28 @@ const LoginHistory = () => {
     }, [load])
 
     return (
-        <Box sx={{ p: { xs: 2, md: 3 } }}>
-            <Title title="登录历史" />
-            <Paper sx={{ p: { xs: 2, md: 3 } }}>
-                <Box sx={{ mb: 2 }}>
-                    <AccountPageHeader
-                        title="登录历史"
-                        description={`最近 ${page?.items.length ?? 0} 条记录（共 ${page?.total ?? 0} 条）`}
-                        action={(
-                            <Tooltip title="刷新">
-                                <span>
-                                    <IconButton
-                                        aria-label="刷新登录历史"
-                                        disabled={loading}
-                                        onClick={() => void load()}
-                                    >
-                                        <RefreshIcon />
-                                    </IconButton>
-                                </span>
-                            </Tooltip>
-                        )}
-                    />
-                </Box>
+        <PageShell
+            title="登录历史"
+            testId="account-page-shell"
+        >
+            <AccountPageHeader
+                title="登录历史"
+                description={`最近 ${page?.items.length ?? 0} 条记录（共 ${page?.total ?? 0} 条）`}
+                action={(
+                    <Tooltip title="刷新">
+                        <span>
+                            <IconButton
+                                aria-label="刷新登录历史"
+                                disabled={loading}
+                                onClick={() => void load()}
+                            >
+                                <RefreshIcon />
+                            </IconButton>
+                        </span>
+                    </Tooltip>
+                )}
+            />
+            <Paper sx={{ maxWidth: 960, mt: 3, p: { xs: 2, md: 3 } }}>
 
                 {error && (
                     <Alert
@@ -218,7 +218,7 @@ const LoginHistory = () => {
                     </Box>
                 )}
             </Paper>
-        </Box>
+        </PageShell>
     )
 }
 

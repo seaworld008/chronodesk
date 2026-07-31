@@ -2,11 +2,13 @@ import * as React from 'react'
 import {
   AppBar,
   Logout,
+  TitlePortal,
   UserMenu,
-  AppBarProps,
   useNotify,
+  useUserMenu,
+  type AppBarProps,
 } from 'react-admin'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import {
   Box,
   Chip,
@@ -35,10 +37,13 @@ import {
 import { projectScopeChangedEvent } from '@/lib/projectScopeEvents'
 import { logoutAllSessions } from '@/lib/authProvider'
 import { visibleNavigationItems } from '@/navigation/navigationRegistry'
+import { resolveRoutePageScope } from './routePageScope'
 
 const LogoutAllMenuItem: React.FC = () => {
   const notify = useNotify()
+  const onClose = useUserMenu()?.onClose
   const handleLogoutAll = async () => {
+    onClose?.()
     try {
       await logoutAllSessions()
       window.location.assign('/login')
@@ -65,6 +70,7 @@ const accountIcons = {
 
 const AccountNavigationItems: React.FC = () => {
   const navigate = useNavigate()
+  const onClose = useUserMenu()?.onClose
   const items = visibleNavigationItems('account', {
     platformRole: null,
     projectRole: null,
@@ -73,7 +79,10 @@ const AccountNavigationItems: React.FC = () => {
   return items.map((item) => (
     <MenuItem
       key={item.id}
-      onClick={() => navigate(item.path)}
+      onClick={() => {
+        onClose?.()
+        navigate(item.path)
+      }}
       data-testid={`account-menu-${item.id}`}
     >
       <ListItemIcon>
@@ -85,7 +94,7 @@ const AccountNavigationItems: React.FC = () => {
 }
 
 const CustomUserMenu: React.FC = () => (
-  <Box data-testid="account-menu">
+  <Box data-testid="account-menu" sx={{ flex: '0 0 auto', minWidth: 0 }}>
     <UserMenu label="账号">
       <AccountNavigationItems />
       <LogoutAllMenuItem />
@@ -94,8 +103,150 @@ const CustomUserMenu: React.FC = () => (
   </Box>
 )
 
-const ProjectSwitcher: React.FC = () => {
+interface PageScopeBadgeProps {
+  pathname: string
+  selectedProject?: AuthorizedProject
+}
+
+const PageScopeBadge = ({
+  pathname,
+  selectedProject,
+}: PageScopeBadgeProps) => {
+  const resolution = resolveRoutePageScope(pathname)
+  const visibleLabel = resolution.kind === 'project'
+    ? selectedProject
+      ? `当前项目：${selectedProject.project.name}`
+      : '当前项目未选择'
+    : resolution.kind === 'platform'
+      ? '平台级'
+      : resolution.kind === 'account'
+        ? '个人账号'
+        : resolution.navigationNodeID?.includes('workbench')
+          ? '跨项目'
+          : '全局聚合'
+  const accessibleLabel = `页面作用域：${visibleLabel}`
+
+  return (
+    <Box
+      data-testid="page-scope-badge"
+      data-page-scope={resolution.kind}
+      data-navigation-node={resolution.navigationNodeID ?? ''}
+      sx={{ flex: '0 0 auto', minWidth: 0 }}
+    >
+      <Chip
+        aria-label={accessibleLabel}
+        data-testid="scope-badge"
+        label={visibleLabel}
+        size="small"
+        title={accessibleLabel}
+        sx={{
+          bgcolor: 'rgba(255, 255, 255, 0.94)',
+          color: 'primary.dark',
+          maxWidth: { xs: 96, sm: 220 },
+          '& .MuiChip-label': {
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+          },
+        }}
+      />
+    </Box>
+  )
+}
+
+interface WorkProjectSwitcherProps {
+  loading: boolean
+  projects: AuthorizedProject[]
+  selected: string
+  onChange: (projectKey: string) => void
+}
+
+const WorkProjectSwitcher = ({
+  loading,
+  projects,
+  selected,
+  onChange,
+}: WorkProjectSwitcherProps) => {
+  if (loading) {
+    return (
+      <Box
+        data-testid="project-switcher-loading"
+        role="status"
+        aria-label="正在加载工作项目"
+        sx={{ display: 'grid', flex: '1 1 10rem', minWidth: 44, placeItems: 'center' }}
+      >
+        <CircularProgress color="inherit" size={20} />
+      </Box>
+    )
+  }
+  if (projects.length === 0) {
+    return (
+      <Typography
+        data-testid="no-project-switcher"
+        noWrap
+        title="暂无授权项目"
+        variant="body2"
+        sx={{ flex: '1 1 10rem', minWidth: 0 }}
+      >
+        暂无授权项目
+      </Typography>
+    )
+  }
+
+  const selectedProject = projects.find(
+    ({ project }) => project.key === selected,
+  )
+
+  return (
+    <Box
+      data-testid="work-project-control"
+      sx={{
+        flex: '1 1 13rem',
+        maxWidth: 280,
+        minWidth: 0,
+      }}
+    >
+      <Select
+        aria-label="工作项目选择"
+        data-testid="active-project-switcher"
+        displayEmpty
+        value={selected}
+        size="small"
+        onChange={(event) => onChange(event.target.value)}
+        renderValue={() => selectedProject?.project.name ?? '选择工作项目'}
+        sx={{
+          width: '100%',
+          color: 'inherit',
+          '& .MuiOutlinedInput-notchedOutline': {
+            borderColor: 'rgba(255,255,255,0.55)',
+          },
+          '&:hover .MuiOutlinedInput-notchedOutline': {
+            borderColor: 'rgba(255,255,255,0.82)',
+          },
+          '& .MuiSelect-select': {
+            minWidth: '0 !important',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          },
+          '& .MuiSvgIcon-root': { color: 'inherit' },
+        }}
+      >
+        <MenuItem value="" disabled>
+          请选择工作项目
+        </MenuItem>
+        {projects.map(({ project, project_role }) => (
+          <MenuItem key={project.public_id} value={project.key}>
+            {project.name} · {getProjectRoleLabel(project_role)}
+          </MenuItem>
+        ))}
+      </Select>
+    </Box>
+  )
+}
+
+const AppBarContextControls: React.FC = () => {
   const navigate = useNavigate()
+  const { pathname } = useLocation()
   const [projects, setProjects] = React.useState<AuthorizedProject[]>([])
   const [selected, setSelected] = React.useState(activeProjectKey() ?? '')
   const [loading, setLoading] = React.useState(true)
@@ -139,110 +290,113 @@ const ProjectSwitcher: React.FC = () => {
     }
   }, [])
 
-  if (loading) {
-    return (
-      <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
-        <Chip
-          label="平台级"
-          size="small"
-          color="default"
-          data-testid="scope-badge"
-        />
-        <CircularProgress
-          color="inherit"
-          size={20}
-          aria-label="正在加载项目"
-          data-testid="project-switcher-loading"
-        />
-      </Stack>
-    )
-  }
-  if (projects.length === 0) {
-    return (
-      <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
-        <Chip
-          label="平台级"
-          size="small"
-          color="default"
-          data-testid="scope-badge"
-        />
-        <Typography
-          variant="body2"
-          data-testid="no-project-switcher"
-          sx={{ display: { xs: 'none', sm: 'block' } }}
-        >
-          暂无授权项目
-        </Typography>
-      </Stack>
-    )
-  }
-
   const selectedProject = projects.find(
     ({ project }) => project.key === selected,
   )
 
   return (
     <Stack
+      data-testid="appbar-context-controls"
       direction="row"
-      spacing={1}
-      sx={{ alignItems: 'center', minWidth: 0 }}
+      spacing={0.75}
+      sx={{
+        alignItems: 'center',
+        justifyContent: 'center',
+        minWidth: 0,
+        width: '100%',
+      }}
     >
-      <Chip
-        label={
-          selectedProject
-            ? `当前项目：${selectedProject.project.name}`
-            : '平台级'
-        }
-        size="small"
-        color={selectedProject ? 'primary' : 'default'}
-        data-testid="scope-badge"
-        sx={{
-          maxWidth: { xs: 96, sm: 240 },
-          bgcolor: 'rgba(255, 255, 255, 0.92)',
-          color: 'primary.dark',
-          '& .MuiChip-label': {
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-          },
-        }}
+      <PageScopeBadge
+        pathname={pathname}
+        selectedProject={selectedProject}
       />
-      <Box sx={{ minWidth: { xs: 96, sm: 220 } }}>
-      <Select
-        aria-label="当前项目"
-        data-testid="active-project-switcher"
-        value={selected}
-        size="small"
-        onChange={(event) => {
-          const projectKey = event.target.value
+      <WorkProjectSwitcher
+        loading={loading}
+        projects={projects}
+        selected={selected}
+        onChange={(projectKey) => {
           setActiveProjectKey(projectKey, projects)
           setSelected(projectKey)
           navigate('/')
         }}
-        sx={{
-          width: '100%',
-          color: 'inherit',
-          '& .MuiOutlinedInput-notchedOutline': {
-            borderColor: 'rgba(255,255,255,0.45)',
-          },
-          '& .MuiSvgIcon-root': { color: 'inherit' },
-        }}
-      >
-        <MenuItem value="" disabled>
-          请选择项目
-        </MenuItem>
-        {projects.map(({ project, project_role }) => (
-          <MenuItem key={project.public_id} value={project.key}>
-            {project.name} · {getProjectRoleLabel(project_role)}
-          </MenuItem>
-        ))}
-      </Select>
-      </Box>
+      />
     </Stack>
   )
 }
 
-export const CustomAppBar: React.FC<AppBarProps> = (props) => (
-  <AppBar {...props} userMenu={<CustomUserMenu />}>
-    <ProjectSwitcher />
+export const CustomAppBar: React.FC<AppBarProps> = ({
+  sx,
+  ...props
+}) => (
+  <AppBar
+    {...props}
+    userMenu={<CustomUserMenu />}
+    sx={[
+      {
+        '& .RaAppBar-toolbar': {
+          boxSizing: 'border-box',
+          columnGap: { xs: 0.25, sm: 0.5 },
+          flexWrap: 'nowrap',
+          maxWidth: '100%',
+          minWidth: 0,
+          overflow: 'hidden',
+        },
+        '& .RaAppBar-menuButton, & .RaLoadingIndicator-root, & .RaUserMenu-root': {
+          flex: '0 0 auto',
+        },
+        '@media (min-width:600px) and (max-width:899.95px)': {
+          '& .RaUserMenu-userButton': {
+            fontSize: 0,
+            minWidth: 44,
+            px: 1,
+          },
+          '& .RaUserMenu-userButton .MuiButton-startIcon': {
+            m: 0,
+          },
+        },
+      },
+      ...(sx ? (Array.isArray(sx) ? sx : [sx]) : []),
+    ]}
+  >
+    <Box
+      data-testid="appbar-three-segment-layout"
+      sx={{
+        alignItems: 'center',
+        display: 'grid',
+        flex: '1 1 auto',
+        gridTemplateColumns: {
+          xs: 'minmax(0, 1fr)',
+          md: 'minmax(0, 1fr) minmax(240px, min(48vw, 560px)) minmax(0, 1fr)',
+        },
+        height: '100%',
+        minWidth: 0,
+      }}
+    >
+      <TitlePortal
+        data-testid="appbar-title-portal"
+        sx={{
+          display: { xs: 'none', md: 'block' },
+          gridColumn: 1,
+          minWidth: 0,
+          pr: 1,
+        }}
+      />
+      <Box
+        sx={{
+          gridColumn: { xs: 1, md: 2 },
+          minWidth: 0,
+        }}
+      >
+        <AppBarContextControls />
+      </Box>
+      <Box
+        aria-hidden="true"
+        sx={{
+          display: { xs: 'none', md: 'block' },
+          gridColumn: 3,
+          minWidth: 0,
+        }}
+      />
+    </Box>
   </AppBar>
 )

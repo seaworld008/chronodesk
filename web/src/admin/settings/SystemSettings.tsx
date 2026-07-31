@@ -15,7 +15,6 @@ import {
   Tabs,
   Tab,
   TextField,
-  Typography,
   Tooltip,
 } from '@mui/material'
 import { Save as SaveIcon, Refresh as RefreshIcon } from '@mui/icons-material'
@@ -32,6 +31,8 @@ import {
   ResizableMuiTable,
   type ResizableColumn,
 } from '@/components/tables/EnterpriseTable'
+import PageHeader from '@/components/layout/PageHeader'
+import PageShell from '@/components/layout/PageShell'
 import SettingsTabs from './SettingsTabs'
 
 const systemConfigColumns: ResizableColumn[] = [
@@ -263,38 +264,28 @@ const SystemSettings: React.FC = () => {
   }
 
   return (
-    <Box sx={{ p: 3 }}>
-      <SettingsTabs />
-      <Stack
-        direction="row"
-        sx={{
-          justifyContent: "space-between",
-          alignItems: "center",
-          mb: 2
-        }}>
-        <Stack direction="row" spacing={2} sx={{
-          alignItems: "center"
-        }}>
-          <BackButton fallbackPath="/system-settings" />
-          <Box>
-            <Typography variant="h4">平台公共配置</Typography>
-            <Typography color="text.secondary">
-              仅管理平台级公共默认与安全基线，不修改当前项目的版本化配置。
-            </Typography>
-          </Box>
-        </Stack>
-        <Stack direction="row" spacing={1}>
-          <Button startIcon={<RefreshIcon />} onClick={handleRefresh}>刷新</Button>
-          <Button
-            startIcon={<SaveIcon />}
-            onClick={bulkSave}
-            disabled={dirtyCount === 0 || bulkSaving}
-            variant="contained"
-          >
-            {bulkSaving ? '保存中…' : `保存全部 (${dirtyCount})`}
-          </Button>
-        </Stack>
-      </Stack>
+    <PageShell title="平台公共配置" testId="system-settings-page-shell">
+      <PageHeader
+        title="平台公共配置"
+        description="仅管理平台级公共默认与安全基线，不修改当前项目的版本化配置。"
+        leading={<BackButton fallbackPath="/system-settings" />}
+        action={(
+          <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
+            <Button startIcon={<RefreshIcon />} onClick={handleRefresh}>刷新</Button>
+            <Button
+              startIcon={<SaveIcon />}
+              onClick={bulkSave}
+              disabled={dirtyCount === 0 || bulkSaving}
+              variant="contained"
+            >
+              {bulkSaving ? '保存中…' : `保存全部 (${dirtyCount})`}
+            </Button>
+          </Stack>
+        )}
+      />
+      <Box sx={{ mt: 2 }}>
+        <SettingsTabs />
+      </Box>
       <Paper sx={{ mb: 2 }}>
         <Tabs value={activeTab} onChange={(_, value) => setActiveTab(value)} textColor="primary" indicatorColor="primary" variant="scrollable">
           {categories.map((category) => (
@@ -372,7 +363,7 @@ const SystemSettings: React.FC = () => {
           </ResizableMuiTable>
         </TableContainer>
       )}
-    </Box>
+    </PageShell>
   );
 }
 

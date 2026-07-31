@@ -16,8 +16,9 @@ import {
     Typography,
 } from '@mui/material'
 import RefreshIcon from '@mui/icons-material/Refresh'
-import { Title, useNotify } from 'react-admin'
+import { useNotify } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
+import PageShell from '@/components/layout/PageShell'
 import AccountPageHeader from './AccountPageHeader'
 
 interface TrustedDevice {
@@ -85,34 +86,29 @@ const TrustedDevices = () => {
     }
 
     return (
-        <Box
-            sx={{
-                p: { xs: 2, md: 3 },
-                display: "flex",
-                justifyContent: "center"
-            }}>
-            <Title title="可信设备" />
-            <Card sx={{ maxWidth: 960, width: '100%' }}>
+        <PageShell
+            title="可信设备"
+            testId="account-page-shell"
+        >
+            <AccountPageHeader
+                title="可信设备"
+                description="查看并管理已记住的登录设备。"
+                action={(
+                    <Tooltip title="刷新">
+                        <span>
+                            <IconButton
+                                aria-label="刷新可信设备"
+                                disabled={loading}
+                                onClick={() => setRefreshFlag((flag) => flag + 1)}
+                            >
+                                <RefreshIcon />
+                            </IconButton>
+                        </span>
+                    </Tooltip>
+                )}
+            />
+            <Card sx={{ maxWidth: 960, mt: 3, width: '100%' }}>
                 <CardContent>
-                    <Box sx={{ mb: 3 }}>
-                        <AccountPageHeader
-                            title="可信设备"
-                            description="查看并管理已记住的登录设备。"
-                            action={(
-                                <Tooltip title="刷新">
-                                    <span>
-                                        <IconButton
-                                            aria-label="刷新可信设备"
-                                            disabled={loading}
-                                            onClick={() => setRefreshFlag((flag) => flag + 1)}
-                                        >
-                                            <RefreshIcon />
-                                        </IconButton>
-                                    </span>
-                                </Tooltip>
-                            )}
-                        />
-                    </Box>
                     {loading ? (
                         <Box
                             role="status"
@@ -198,7 +194,7 @@ const TrustedDevices = () => {
                     </Button>
                 </DialogActions>
             </Dialog>
-        </Box>
+        </PageShell>
     );
 }
 

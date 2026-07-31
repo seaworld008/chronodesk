@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Locator, type Page } from '@playwright/test'
 
 const encode = (value: unknown) =>
     Buffer.from(JSON.stringify(value)).toString('base64url')
@@ -50,6 +50,94 @@ const projectAccess = [{
     project_role: 'project_admin',
 }]
 
+const installLayoutMocks = async (page: Page) => {
+    const user = {
+        id: 1,
+        username: 'task3-admin',
+        email: 'task3@example.invalid',
+        platform_role: 'platform_admin',
+        status: 'active',
+        email_verified: true,
+        otp_enabled: false,
+        profile: {
+            id: 1,
+            user_id: 1,
+            first_name: 'Chrono',
+            last_name: 'Desk',
+            display_name: 'Chrono Desk',
+            avatar: '',
+            phone: '',
+            department: '',
+            position: '',
+            timezone: 'Asia/Shanghai',
+            language: 'zh-CN',
+            created_at: '2026-01-01T00:00:00Z',
+            updated_at: '2026-01-01T00:00:00Z',
+        },
+    }
+    const emailConfig = {
+        email_verification_enabled: false,
+        smtp_host: '',
+        smtp_port: 587,
+        smtp_username: '',
+        smtp_use_tls: true,
+        smtp_use_ssl: false,
+        from_email: '',
+        from_name: 'ChronoDesk',
+        welcome_email_subject: '欢迎使用 ChronoDesk',
+        welcome_email_template: '',
+        otp_email_subject: '验证码',
+        otp_email_template: '',
+        is_configured: false,
+        can_send_email: false,
+    }
+
+    await page.route('**/api/**', async (route) => {
+        const url = new URL(route.request().url())
+        let data: unknown = []
+        if (url.pathname === '/api/projects') {
+            data = projectAccess
+        } else if (url.pathname === '/api/auth/me') {
+            data = user
+        } else if (url.pathname === '/api/platform/configs') {
+            data = []
+        } else if (url.pathname === '/api/platform/email-config') {
+            data = emailConfig
+        } else if (url.pathname === '/api/projects/OPS/webhooks') {
+            data = { items: [], total: 0, page: 1, page_size: 100 }
+        } else if (url.pathname === '/api/user/trusted-devices') {
+            data = []
+        } else if (url.pathname === '/api/user/login-history') {
+            data = { items: [], total: 0, page: 1, page_size: 20 }
+        } else if (url.pathname === '/api/workbench/tickets') {
+            data = { items: [], total: 0, page: 1, page_size: 20, total_pages: 0 }
+        }
+        await route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ code: 0, msg: 'ok', data }),
+        })
+    })
+}
+
+const expectReachable = async (locator: Locator, viewportWidth: number) => {
+    await expect(locator).toBeVisible()
+    await locator.scrollIntoViewIfNeeded()
+    await expect(locator).toBeInViewport()
+    const box = await locator.boundingBox()
+    expect(box).not.toBeNull()
+    expect(box!.x).toBeGreaterThanOrEqual(0)
+    expect(box!.x + box!.width).toBeLessThanOrEqual(viewportWidth + 0.5)
+    await locator.click({ trial: true })
+}
+
+const navigateFromAccountMenu = async (page: Page, itemID: string) => {
+    const temporarySidebar = page.locator('.RaSidebar-modal')
+    await expect(temporarySidebar).toBeHidden()
+    await page.getByTestId('account-menu').locator('button').first().click()
+    await page.getByTestId(`account-menu-${itemID}`).click()
+}
+
 test.describe('Task 3 导航、账号与多选回归（mock）', () => {
     test('树契约、单叶直达、持久化、账号白名单、Webhook clear 和登录分页', async ({ page }) => {
         await installSession(page)
@@ -57,6 +145,8 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         const loginPages: number[] = []
         const passwordWrites: Array<Record<string, unknown>> = []
         const otpVerifications: string[] = []
+        const uploadedAvatarURL =
+            'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
         let otpEnabled = false
         let profile = {
             id: 1,
@@ -101,6 +191,12 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
                 profileWrites.push(payload)
                 profile = { ...profile, ...payload }
                 data = null
+            } else if (
+                url.pathname === '/api/user/avatar' &&
+                request.method() === 'POST'
+            ) {
+                profile = { ...profile, avatar: uploadedAvatarURL }
+                data = { avatar_url: uploadedAvatarURL }
             } else if (url.pathname === '/api/user/login-history') {
                 const requestedPage = Number(url.searchParams.get('page'))
                 loginPages.push(requestedPage)
@@ -159,7 +255,13 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         })
 
         await page.goto('/#/system-settings')
-        await expect(page.getByRole('heading', { name: '平台公共配置' })).toBeVisible()
+        await expect(page.getByRole('heading', {
+            name: '平台公共配置',
+            level: 1,
+        })).toBeVisible()
+        await expect(page.getByTestId('page-scope-badge'))
+            .toHaveAttribute('data-page-scope', 'platform')
+        await expect(page.getByTestId('scope-badge')).toContainText('平台级')
         const settingsToggle = page.getByRole('button', { name: /^系统设置/ })
         await expect(settingsToggle).toHaveAttribute('aria-expanded', 'true')
         await expect(settingsToggle).toHaveAttribute('aria-controls')
@@ -176,6 +278,9 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             (element as HTMLElement).click(),
         )
         await expect(page).toHaveURL(/#\/workbench$/)
+        await expect(page.getByTestId('page-scope-badge'))
+            .toHaveAttribute('data-page-scope', 'global')
+        await expect(page.getByTestId('scope-badge')).toContainText('跨项目')
 
         await page.goto('/#/system-settings')
         const governance = page.getByRole('button', { name: /^治理中心/ })
@@ -214,8 +319,20 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         await expect(page.getByRole('button', { name: /^系统设置/ }))
             .toHaveAttribute('aria-expanded', 'true')
 
-        await page.goto('/#/account/profile')
-        await expect(page.getByRole('heading', { name: '个人资料' })).toBeVisible()
+        const accountTrigger = page.getByTestId('account-menu').locator('button').first()
+        await accountTrigger.click()
+        const profileMenuItem = page.getByTestId('account-menu-account-profile')
+        await expect(profileMenuItem).toBeVisible()
+        await profileMenuItem.click()
+        await expect(profileMenuItem).toBeHidden()
+        await expect(page).toHaveURL(/#\/account\/profile$/)
+        await expect(page.getByTestId('page-scope-badge'))
+            .toHaveAttribute('data-page-scope', 'account')
+        await expect(page.getByTestId('scope-badge')).toContainText('个人账号')
+        await expect(page.getByRole('heading', {
+            name: '个人资料',
+            level: 1,
+        })).toBeVisible()
         await expect(page.getByLabel('邮箱（只读）')).toBeDisabled()
         await expect(page.getByLabel('手机（只读）')).toBeDisabled()
         await expect(page.getByLabel('语言')).toHaveValue('en')
@@ -229,6 +346,8 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             'timezone',
         ])
         expect(profileWrites[0].language).toBe('en')
+        await expect(page.getByTestId('account-menu').locator('button').first())
+            .toContainText('Updated Desk')
         await page.keyboard.press('Escape')
         await expect(page.getByText('个人资料已更新')).toHaveCount(0)
         const desktopAvatar = await page.getByTestId('profile-avatar-panel')
@@ -239,7 +358,7 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         expect(desktopForm).not.toBeNull()
         expect(desktopAvatar!.x).toBeGreaterThan(desktopForm!.x + 400)
         expect(desktopAvatar!.y).toBeLessThan(desktopForm!.y)
-        await expect(page.getByTestId('account-profile-page'))
+        await expect(page.getByTestId('account-page-shell'))
             .toHaveScreenshot('account-profile-desktop.png')
         await expect(page.locator('.MuiSnackbar-root')).toBeHidden({
             timeout: 7_000,
@@ -262,7 +381,7 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             return {
                 header: rect('account-page-header'),
                 avatar: rect('profile-avatar-panel'),
-                form: rect('profile-main-form'),
+                form: rect('account-profile-page'),
             }
         })
         expect(mobileLayout.header).not.toBeNull()
@@ -275,12 +394,12 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         expect(mobileLayout.avatar!.y).toBeLessThan(mobileLayout.form!.y)
         await expect(page).toHaveScreenshot('account-profile-mobile.png')
         for (const accountPage of [
-            { path: 'profile', title: '个人资料' },
-            { path: 'security', title: '账号安全' },
-            { path: 'trusted-devices', title: '可信设备' },
-            { path: 'login-history', title: '登录历史' },
+            { id: 'account-profile', title: '个人资料' },
+            { id: 'account-security', title: '账号安全' },
+            { id: 'trusted-devices', title: '可信设备' },
+            { id: 'login-history', title: '登录历史' },
         ]) {
-            await page.goto(`/#/account/${accountPage.path}`)
+            await navigateFromAccountMenu(page, accountPage.id)
             const header = page.getByTestId('account-page-header')
             await expect(header).toHaveCount(1)
             await expect(header).toHaveCSS('flex-direction', 'column')
@@ -288,25 +407,50 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         }
         await page.setViewportSize({ width: 1280, height: 720 })
         for (const accountPage of [
-            { path: 'profile', title: '个人资料' },
-            { path: 'security', title: '账号安全' },
-            { path: 'trusted-devices', title: '可信设备' },
-            { path: 'login-history', title: '登录历史' },
+            { id: 'account-profile', title: '个人资料' },
+            { id: 'account-security', title: '账号安全' },
+            { id: 'trusted-devices', title: '可信设备' },
+            { id: 'login-history', title: '登录历史' },
         ]) {
-            await page.goto(`/#/account/${accountPage.path}`)
+            await navigateFromAccountMenu(page, accountPage.id)
             const header = page.getByTestId('account-page-header')
             await expect(header).toHaveCount(1)
             await expect(header).toHaveCSS('flex-direction', 'row')
             await expect(header).toContainText(accountPage.title)
         }
 
+        await page.goto('/#/account/profile')
+        await page.locator('input[type="file"][accept="image/png,image/jpeg"]')
+            .setInputFiles({
+                name: 'avatar.png',
+                mimeType: 'image/png',
+                buffer: Buffer.from(
+                    uploadedAvatarURL.split(',')[1],
+                    'base64',
+                ),
+            })
+        await expect(page.getByTestId('profile-avatar-panel').locator('img'))
+            .toHaveAttribute('src', uploadedAvatarURL)
+        await expect(page.getByTestId('account-menu').locator('img'))
+            .toHaveAttribute('src', uploadedAvatarURL)
+
         await page.goto('/#/account/login-history')
-        await expect(page.getByRole('heading', { name: '登录历史' })).toBeVisible()
+        await expect(page.getByRole('heading', {
+            name: '登录历史',
+            level: 1,
+        })).toBeVisible()
         await page.getByRole('button', { name: /下一页|next page/i }).click()
         await expect.poll(() => loginPages).toContain(2)
 
         await page.goto('/#/webhook-settings')
-        await expect(page.getByRole('heading', { name: 'Webhook 集成' })).toBeVisible()
+        await expect(page.getByRole('heading', {
+            name: 'Webhook 集成',
+            level: 1,
+        })).toBeVisible()
+        await expect(page.getByTestId('page-scope-badge'))
+            .toHaveAttribute('data-page-scope', 'project')
+        await expect(page.getByTestId('scope-badge'))
+            .toContainText('当前项目：运营项目')
         await page.getByRole('button', { name: '新增 Webhook' }).click()
         await page.getByRole('combobox', { name: '订阅事件' }).click()
         const transitioned = page.getByRole('option', {
@@ -323,7 +467,10 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         ).toHaveCount(0)
 
         await page.goto('/#/account/security')
-        await expect(page.getByRole('heading', { name: '账号安全' })).toBeVisible()
+        await expect(page.getByRole('heading', {
+            name: '账号安全',
+            level: 1,
+        })).toBeVisible()
         await page.getByLabel('当前密码').last().fill('CurrentPassword123!')
         await page.getByRole('button', { name: '启用 MFA' }).click()
         await expect(page.getByText('MFA 已立即启用', { exact: true })).toBeVisible()
@@ -398,5 +545,198 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             refreshToken: null,
             user: null,
         })
+    })
+
+    test('AppBar、响应式侧栏、页面操作与头像使用真实几何矩阵', async ({ page }) => {
+        await installSession(page, 'task3-layout-session')
+        await installLayoutMocks(page)
+
+        for (const viewport of [
+            { width: 320, height: 720 },
+            { width: 390, height: 844 },
+            { width: 640, height: 720 },
+            { width: 720, height: 800 },
+            { width: 1280, height: 800 },
+        ]) {
+            await page.setViewportSize(viewport)
+            await page.goto('/#/system-settings')
+            await expect(page.getByRole('heading', {
+                name: '平台公共配置',
+                level: 1,
+            })).toBeVisible()
+            await expect(page.getByTestId('active-project-switcher')).toBeVisible()
+            await expect(page.getByTestId('page-scope-badge'))
+                .toHaveAttribute('data-page-scope', 'platform')
+            await expect(page.getByTestId('scope-badge')).toContainText('平台级')
+            await expect(page.getByTestId('appbar-context-controls')
+                .locator('.MuiChip-root')).toHaveCount(1)
+
+            const geometry = await page.evaluate(() => {
+                const rect = (selector: string) => {
+                    const element = document.querySelector(selector)
+                    if (!(element instanceof HTMLElement)) return null
+                    const box = element.getBoundingClientRect()
+                    return {
+                        bottom: box.bottom,
+                        height: box.height,
+                        left: box.left,
+                        right: box.right,
+                        top: box.top,
+                        width: box.width,
+                    }
+                }
+                const permanentSidebar = document.querySelector(
+                    '.RaSidebar-root:not(.ChronoDeskSidebar-temporary)',
+                )
+                return {
+                    account: rect('[data-testid="account-menu"] button'),
+                    controls: rect('[data-testid="appbar-context-controls"]'),
+                    main: rect('#main-content'),
+                    permanentSidebar: permanentSidebar instanceof HTMLElement
+                        ? rect('.RaSidebar-root:not(.ChronoDeskSidebar-temporary)')
+                        : null,
+                    scope: rect('[data-testid="page-scope-badge"]'),
+                    scrollWidth: document.documentElement.scrollWidth,
+                    switcher: rect('[data-testid="work-project-control"]'),
+                    titleDisplay: getComputedStyle(
+                        document.querySelector(
+                            '[data-testid="appbar-title-portal"]',
+                        )!,
+                    ).display,
+                    toolbar: rect('.RaAppBar-toolbar'),
+                    viewportWidth: window.innerWidth,
+                }
+            })
+
+            expect(geometry.toolbar).not.toBeNull()
+            expect(geometry.account).not.toBeNull()
+            expect(geometry.controls).not.toBeNull()
+            expect(geometry.scope).not.toBeNull()
+            expect(geometry.switcher).not.toBeNull()
+            expect(geometry.main).not.toBeNull()
+            expect(geometry.toolbar!.height).toBeLessThanOrEqual(64)
+            expect(geometry.toolbar!.height).toBeGreaterThanOrEqual(44)
+            expect(geometry.viewportWidth - geometry.account!.right)
+                .toBeGreaterThanOrEqual(0)
+            expect(geometry.viewportWidth - geometry.account!.right)
+                .toBeLessThanOrEqual(16)
+            expect(geometry.controls!.right)
+                .toBeLessThanOrEqual(geometry.account!.left + 0.5)
+            expect(geometry.scope!.right)
+                .toBeLessThanOrEqual(geometry.switcher!.left + 0.5)
+            expect(geometry.account!.top)
+                .toBeGreaterThanOrEqual(geometry.toolbar!.top)
+            expect(geometry.account!.bottom)
+                .toBeLessThanOrEqual(geometry.toolbar!.bottom)
+            expect(geometry.scrollWidth)
+                .toBeLessThanOrEqual(geometry.viewportWidth + 1)
+
+            if (viewport.width <= 720) {
+                expect(geometry.permanentSidebar).toBeNull()
+                expect(geometry.main!.left).toBeLessThanOrEqual(1)
+                expect(geometry.main!.width)
+                    .toBeGreaterThanOrEqual(viewport.width - 1)
+                expect(geometry.titleDisplay).toBe('none')
+            } else {
+                expect(geometry.titleDisplay).not.toBe('none')
+            }
+
+            if (viewport.width === 390 || viewport.width === 640) {
+                await page.locator('.RaAppBar-menuButton').click()
+                await expect(page.locator('.RaSidebar-modal')).toBeVisible()
+                await page.keyboard.press('Escape')
+                await expect(page.locator('.RaSidebar-modal')).toBeHidden()
+            }
+        }
+
+        for (const width of [320, 640]) {
+            await page.setViewportSize({ width, height: 800 })
+            await page.goto('/#/system-settings')
+            await expectReachable(
+                page.getByTestId('page-header-action')
+                    .getByRole('button', { name: '刷新', exact: true }),
+                width,
+            )
+
+            await page.goto('/#/webhook-settings')
+            await expect(page.getByRole('heading', {
+                name: 'Webhook 集成',
+                level: 1,
+            })).toBeVisible()
+            await expect(page.getByTestId('page-scope-badge'))
+                .toHaveAttribute('data-page-scope', 'project')
+            for (const buttonName of ['刷新', '新增 Webhook']) {
+                await expectReachable(
+                    page.getByTestId('page-header-action')
+                        .getByRole('button', {
+                            name: buttonName,
+                            exact: true,
+                        }),
+                    width,
+                )
+            }
+
+            await page.goto('/#/system-settings/email')
+            await expect(page.getByRole('heading', {
+                name: '平台邮件设置',
+                level: 1,
+            })).toBeVisible()
+            await expectReachable(
+                page.getByTestId('email-settings-page-shell')
+                    .getByRole('button', { name: '刷新', exact: true }),
+                width,
+            )
+
+            await page.goto('/#/account/profile')
+            await expect(page.getByRole('heading', {
+                name: '个人资料',
+                level: 1,
+            })).toBeVisible()
+            await expectReachable(
+                page.getByRole('button', { name: '更换头像' }),
+                width,
+            )
+            await expectReachable(
+                page.getByRole('button', { name: '保存个人资料' }),
+                width,
+            )
+        }
+
+        await page.setViewportSize({ width: 1280, height: 800 })
+        await page.goto('/#/account/profile')
+        await expect(page.getByTestId('profile-avatar-panel')).toBeVisible()
+        const profileGeometry = await page.evaluate(() => {
+            const bounds = (testID: string) => {
+                const element = document.querySelector(
+                    `[data-testid="${testID}"]`,
+                )
+                if (!(element instanceof HTMLElement)) return null
+                const rect = element.getBoundingClientRect()
+                return {
+                    left: rect.left,
+                    right: rect.right,
+                    width: rect.width,
+                }
+            }
+            const main = document.querySelector('#main-content')
+                ?.getBoundingClientRect()
+            return {
+                avatar: bounds('profile-avatar-panel'),
+                form: bounds('account-profile-page'),
+                main: main
+                    ? { left: main.left, right: main.right, width: main.width }
+                    : null,
+            }
+        })
+        expect(profileGeometry.avatar).not.toBeNull()
+        expect(profileGeometry.form).not.toBeNull()
+        expect(profileGeometry.main).not.toBeNull()
+        expect(profileGeometry.main!.right - profileGeometry.avatar!.right)
+            .toBeGreaterThanOrEqual(16)
+        expect(profileGeometry.main!.right - profileGeometry.avatar!.right)
+            .toBeLessThanOrEqual(24.5)
+        expect(profileGeometry.form!.width).toBeLessThanOrEqual(760)
+        expect(profileGeometry.avatar!.left)
+            .toBeGreaterThan(profileGeometry.form!.right)
     })
 })

@@ -15,7 +15,7 @@ import {
     Typography,
 } from '@mui/material'
 import { Link as RouterLink, useNavigate } from 'react-router-dom'
-import { Title, useBlocker, useNotify } from 'react-admin'
+import { useBlocker, useNotify } from 'react-admin'
 import QRCode from 'react-qr-code'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
 import { clearAuthenticationState } from '@/lib/authProvider'
@@ -23,6 +23,7 @@ import {
     humanApiRoutes,
     type HumanSessionUser,
 } from '@/lib/generated/human-api'
+import PageShell from '@/components/layout/PageShell'
 import AccountPageHeader from './AccountPageHeader'
 
 interface OTPSetup {
@@ -167,15 +168,15 @@ const AccountSecurity = () => {
     }
 
     return (
-        <Box sx={{ p: { xs: 2, md: 3 } }}>
-            <Title title="账号安全" />
-            <Stack spacing={3} sx={{ maxWidth: 960, mx: 'auto' }}>
-                <Paper sx={{ p: { xs: 2, md: 3 } }}>
-                    <AccountPageHeader
-                        title="账号安全"
-                        description="管理当前账号的密码、MFA、可信设备和登录记录。"
-                    />
-                </Paper>
+        <PageShell
+            title="账号安全"
+            testId="account-page-shell"
+        >
+            <AccountPageHeader
+                title="账号安全"
+                description="管理当前账号的密码、MFA、可信设备和登录记录。"
+            />
+            <Stack spacing={3} sx={{ maxWidth: 960, mt: 3 }}>
                 <Paper sx={{ p: { xs: 2, md: 3 } }}>
                     <Typography variant="h6" gutterBottom>修改密码</Typography>
                     <Grid container spacing={2}>
@@ -328,7 +329,7 @@ const AccountSecurity = () => {
                     </Button>
                 </DialogActions>
             </Dialog>
-        </Box>
+        </PageShell>
     )
 }
 

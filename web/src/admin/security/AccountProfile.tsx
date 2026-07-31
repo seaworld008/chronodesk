@@ -10,13 +10,14 @@ import {
     TextField,
 } from '@mui/material'
 import { Save as SaveIcon, Upload as UploadIcon } from '@mui/icons-material'
-import { Title, useNotify } from 'react-admin'
+import { useGetIdentity, useNotify } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
 import {
     humanApiRoutes,
     type HumanSessionUser,
     type UpdateHumanProfileRequest,
 } from '@/lib/generated/human-api'
+import PageShell from '@/components/layout/PageShell'
 import AccountPageHeader from './AccountPageHeader'
 
 type ProfileForm = {
@@ -39,6 +40,7 @@ const storeCurrentUser = (user: HumanSessionUser) => {
 
 const AccountProfile = () => {
     const notify = useNotify()
+    const { refetch: refetchIdentity } = useGetIdentity()
     const [user, setUser] = useState<HumanSessionUser | null>(null)
     const [form, setForm] = useState<ProfileForm>(emptyForm)
     const [loading, setLoading] = useState(true)
@@ -85,6 +87,7 @@ const AccountProfile = () => {
                 } satisfies UpdateHumanProfileRequest),
             })
             await load()
+            await refetchIdentity()
             notify('个人资料已更新', { type: 'success' })
         } catch (error) {
             notify(localizedUnknownErrorMessage(error, '个人资料保存失败'), {
@@ -112,6 +115,7 @@ const AccountProfile = () => {
             }
             setUser(current)
             storeCurrentUser(current)
+            await refetchIdentity()
             notify('头像已更新', { type: 'success' })
         } catch (error) {
             notify(localizedUnknownErrorMessage(error, '头像上传失败'), {
@@ -124,64 +128,79 @@ const AccountProfile = () => {
 
     if (loading && !user) {
         return (
-            <Box role="status" sx={{ display: 'grid', minHeight: 320, placeItems: 'center' }}>
-                <CircularProgress aria-label="正在加载个人资料" />
-            </Box>
+            <PageShell
+                title="个人资料"
+                testId="account-page-shell"
+            >
+                <Box
+                    role="status"
+                    sx={{ display: 'grid', minHeight: 320, placeItems: 'center' }}
+                >
+                    <CircularProgress aria-label="正在加载个人资料" />
+                </Box>
+            </PageShell>
         )
     }
 
     return (
-        <Box sx={{ p: { xs: 2, md: 3 } }}>
-            <Title title="个人资料" />
+        <PageShell
+            title="个人资料"
+            testId="account-page-shell"
+        >
+            <AccountPageHeader
+                title="个人资料"
+                description="仅可修改个人展示名称与本地化偏好；身份、职责和验证状态由专用流程管理。"
+                action={(
+                    <Stack
+                        data-testid="profile-avatar-panel"
+                        direction="row"
+                        spacing={1.5}
+                        sx={{
+                            alignItems: 'center',
+                            justifyContent: { xs: 'flex-start', md: 'flex-end' },
+                        }}
+                    >
+                        <Avatar
+                            src={user?.profile?.avatar || undefined}
+                            sx={{ width: 64, height: 64 }}
+                        >
+                            {user?.username?.slice(0, 1).toUpperCase()}
+                        </Avatar>
+                        <Button
+                            component="label"
+                            variant="outlined"
+                            startIcon={uploading ? <CircularProgress size={18} /> : <UploadIcon />}
+                            disabled={uploading}
+                        >
+                            更换头像
+                            <input
+                                hidden
+                                type="file"
+                                accept="image/png,image/jpeg"
+                                onChange={(event) => {
+                                    const file = event.target.files?.[0]
+                                    if (file) void uploadAvatar(file)
+                                    event.target.value = ''
+                                }}
+                            />
+                        </Button>
+                    </Stack>
+                )}
+            />
             <Paper
                 data-testid="account-profile-page"
-                sx={{ p: { xs: 2, md: 3 }, maxWidth: 1040, mx: 'auto' }}
+                sx={{
+                    boxSizing: 'border-box',
+                    maxWidth: 760,
+                    mt: 3,
+                    p: { xs: 2, md: 3 },
+                    width: '100%',
+                }}
             >
-                <AccountPageHeader
-                    title="个人资料"
-                    description="仅可修改个人展示名称与本地化偏好；身份、职责和验证状态由专用流程管理。"
-                    action={(
-                        <Stack
-                            data-testid="profile-avatar-panel"
-                            direction="row"
-                            spacing={1.5}
-                            sx={{
-                                alignItems: 'center',
-                                justifyContent: { xs: 'flex-start', md: 'flex-end' },
-                            }}
-                        >
-                            <Avatar
-                                src={user?.profile?.avatar || undefined}
-                                sx={{ width: 64, height: 64 }}
-                            >
-                                {user?.username?.slice(0, 1).toUpperCase()}
-                            </Avatar>
-                            <Button
-                                component="label"
-                                variant="outlined"
-                                startIcon={uploading ? <CircularProgress size={18} /> : <UploadIcon />}
-                                disabled={uploading}
-                            >
-                                更换头像
-                                <input
-                                    hidden
-                                    type="file"
-                                    accept="image/png,image/jpeg"
-                                    onChange={(event) => {
-                                        const file = event.target.files?.[0]
-                                        if (file) void uploadAvatar(file)
-                                        event.target.value = ''
-                                    }}
-                                />
-                            </Button>
-                        </Stack>
-                    )}
-                />
                 <Grid
                     container
                     spacing={2}
                     data-testid="profile-main-form"
-                    sx={{ mt: 2, maxWidth: 760 }}
                 >
                     <Grid size={{ xs: 12, sm: 6 }}>
                         <TextField
@@ -239,7 +258,13 @@ const AccountProfile = () => {
                         </TextField>
                     </Grid>
                 </Grid>
-                <Stack sx={{ mt: 3, maxWidth: 760, alignItems: 'flex-end' }}>
+                <Stack
+                    sx={{
+                        mt: 3,
+                        maxWidth: 760,
+                        alignItems: { xs: 'stretch', sm: 'flex-end' },
+                    }}
+                >
                     <Button
                         variant="contained"
                         startIcon={<SaveIcon />}
@@ -250,7 +275,7 @@ const AccountProfile = () => {
                     </Button>
                 </Stack>
             </Paper>
-        </Box>
+        </PageShell>
     )
 }
 

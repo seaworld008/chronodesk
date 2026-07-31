@@ -53,6 +53,8 @@ import {
   TruncatedText,
   type ResizableColumn,
 } from '@/components/tables/EnterpriseTable'
+import PageHeader from '@/components/layout/PageHeader'
+import PageShell from '@/components/layout/PageShell'
 
 const webhookColumns: ResizableColumn[] = [
   { key: 'name', defaultWidth: 280, minWidth: 180, maxWidth: 480 },
@@ -493,40 +495,23 @@ const WebhookSettings: React.FC = () => {
   }, [form.provider])
 
   return (
-    <Box sx={{ p: 3 }}>
-      <Stack
-        direction="row"
-        sx={{
-          justifyContent: "space-between",
-          alignItems: "center",
-          mb: 3
-        }}>
-        <Stack direction="row" spacing={1.5} sx={{
-          alignItems: "center"
-        }}>
-          <BackButton fallbackPath="/" />
-          <Box>
-            <Typography variant="h4" sx={{ fontWeight: 600 }}>
-              Webhook 集成
-            </Typography>
-            <Typography variant="body2" sx={{
-              color: "text.secondary"
-            }}>
-              管理企业微信、钉钉、飞书等即时通讯渠道的自动通知。
-            </Typography>
-          </Box>
-        </Stack>
-        <Stack direction="row" spacing={1} sx={{
-          alignItems: "center"
-        }}>
-          <Button variant="outlined" startIcon={<RefreshIcon />} onClick={fetchWebhooks}>
-            刷新
-          </Button>
-          <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
-            新增 Webhook
-          </Button>
-        </Stack>
-      </Stack>
+    <PageShell title="Webhook 集成" testId="webhook-settings-page-shell">
+      <PageHeader
+        title="Webhook 集成"
+        description="管理企业微信、钉钉、飞书等即时通讯渠道的自动通知。"
+        leading={<BackButton fallbackPath="/" />}
+        action={(
+          <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
+            <Button variant="outlined" startIcon={<RefreshIcon />} onClick={fetchWebhooks}>
+              刷新
+            </Button>
+            <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
+              新增 Webhook
+            </Button>
+          </Stack>
+        )}
+      />
+      <Box sx={{ mt: 3 }}>
       <TableContainer component={Paper}>
         <ResizableMuiTable
           tableId="settings.webhooks"
@@ -639,6 +624,7 @@ const WebhookSettings: React.FC = () => {
           </TableBody>
         </ResizableMuiTable>
       </TableContainer>
+      </Box>
       <Dialog open={formOpen} onClose={closeForm} maxWidth="md" fullWidth>
         <DialogTitle>{currentId ? '编辑 Webhook' : '新增 Webhook'}</DialogTitle>
         <DialogContent dividers>
@@ -1009,7 +995,7 @@ const WebhookSettings: React.FC = () => {
           </Button>
         </DialogActions>
       </Dialog>
-    </Box>
+    </PageShell>
   );
 }
 
