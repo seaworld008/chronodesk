@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { randomUUID } from 'node:crypto';
 import {
     expect,
     test,
@@ -75,7 +76,7 @@ const escapeRegExp = (value: string) =>
     value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 
 const idempotencyKey = (operation: string) =>
-    `e2e-enterprise-table-${process.pid}-${++commandSequence}-${operation}`;
+    `e2e-enterprise-table-${randomUUID()}-${++commandSequence}-${operation}`;
 
 const backendRoot = () => {
     const configured =
@@ -518,6 +519,15 @@ const openEnterpriseTable = async (
             timeout: 15_000,
         });
     }
+    await expect
+        .poll(
+            async () => (await actualDataRows(table)).length,
+            {
+                message: `${target.name} 等待真实数据行`,
+                timeout: 15_000,
+            },
+        )
+        .toBeGreaterThan(0);
     return table;
 };
 
@@ -828,7 +838,14 @@ const resizeHandle = (
     });
 
 test.describe('企业级列表表格', () => {
-    test.describe.configure({ mode: 'serial' });
+    const cases = tableCases();
+    const stickyCases = cases.filter((target) => target.stickyHeader);
+
+    if (cases.length !== 15 || stickyCases.length !== 9) {
+        throw new Error(
+            `企业表格覆盖清单不完整：全部 ${cases.length}/15，sticky ${stickyCases.length}/9`,
+        );
+    }
 
     test.beforeAll(async ({ request }) => {
         test.setTimeout(120_000);
@@ -950,137 +967,122 @@ test.describe('企业级列表表格', () => {
         }
     });
 
-    test('UI-004 UI-006 UI-028：全部 15 张现存企业表用真实数据验证实际单行布局，平台用户详情不投影项目工单', async ({
-        page,
-    }) => {
-        test.setTimeout(180_000);
+    for (const target of cases) {
+        test(`UI-004 UI-006：${target.name}使用真实数据验证实际单行布局`, async ({
+            page,
+        }) => {
+            test.setTimeout(45_000);
+            await authenticatePage(page);
+            const table = await openEnterpriseTable(page, target);
+            await expectActualSingleLineRows(table, target.tableName);
+        });
+    }
+
+    test('UI-028：平台用户详情不投影项目工单', async ({ page }) => {
+        test.setTimeout(45_000);
         await authenticatePage(page);
-
-        const cases = tableCases();
-        expect(cases).toHaveLength(15);
-        for (const target of cases) {
-            await test.step(target.name, async () => {
-                const table = await openEnterpriseTable(page, target);
-                await expectActualSingleLineRows(table, target.tableName);
-            });
-        }
-
-        await test.step(
-            '平台用户详情不提供隐式项目工单视图',
-            async () => {
-                await page.goto(`/#/users/${adminUserID}/show`);
-                await waitForPrimaryPage(page);
-                await expect(
-                    page
-                        .getByRole('main')
-                        .getByRole('tab', {
-                            name: '基本信息',
-                            exact: true,
-                        }),
-                ).toBeVisible();
-                await expect(
-                    page
-                        .getByRole('main')
-                        .getByRole('tab', {
-                            name: '活动日志',
-                            exact: true,
-                        }),
-                ).toBeVisible();
-                await expect(
-                    page
-                        .getByRole('main')
-                        .getByRole('tab', {
-                            name: '相关工单',
-                            exact: true,
-                        }),
-                ).toHaveCount(0);
-                await expect(
-                    page
-                        .getByRole('main')
-                        .getByRole('table', {
-                            name: '该用户创建的工单列表',
-                            exact: true,
-                        }),
-                ).toHaveCount(0);
-                await expect(
-                    page
-                        .getByRole('main')
-                        .getByRole('table', {
-                            name: '该用户负责的工单列表',
-                            exact: true,
-                        }),
-                ).toHaveCount(0);
-            },
-        );
+        await page.goto(`/#/users/${adminUserID}/show`);
+        await waitForPrimaryPage(page);
+        await expect(
+            page
+                .getByRole('main')
+                .getByRole('tab', {
+                    name: '基本信息',
+                    exact: true,
+                }),
+        ).toBeVisible();
+        await expect(
+            page
+                .getByRole('main')
+                .getByRole('tab', {
+                    name: '活动日志',
+                    exact: true,
+                }),
+        ).toBeVisible();
+        await expect(
+            page
+                .getByRole('main')
+                .getByRole('tab', {
+                    name: '相关工单',
+                    exact: true,
+                }),
+        ).toHaveCount(0);
+        await expect(
+            page
+                .getByRole('main')
+                .getByRole('table', {
+                    name: '该用户创建的工单列表',
+                    exact: true,
+                }),
+        ).toHaveCount(0);
+        await expect(
+            page
+                .getByRole('main')
+                .getByRole('table', {
+                    name: '该用户负责的工单列表',
+                    exact: true,
+                }),
+        ).toHaveCount(0);
     });
 
-    test('UI-007 UI-029：窄视口横向滚动后 sticky 右操作列仍贴边、命中且按钮有名称', async ({
-        page,
-    }) => {
-        test.setTimeout(150_000);
-        await page.setViewportSize({ width: 820, height: 720 });
-        await authenticatePage(page);
+    for (const target of stickyCases) {
+        test(`UI-007 UI-029：${target.name}窄视口 sticky 右操作列仍贴边、命中且按钮有名称`, async ({
+            page,
+        }) => {
+            test.setTimeout(45_000);
+            await page.setViewportSize({ width: 820, height: 720 });
+            await authenticatePage(page);
+            const table = await openEnterpriseTable(page, target);
+            await expectStickyActionColumn(table, target);
+        });
+    }
 
-        const stickyCases = tableCases().filter(
-            (target) => target.stickyHeader,
-        );
-        expect(stickyCases).toHaveLength(9);
-        for (const target of stickyCases) {
-            await test.step(target.name, async () => {
-                const table = await openEnterpriseTable(page, target);
-                await expectStickyActionColumn(table, target);
-            });
-        }
-    });
+    for (const target of cases) {
+        test(`UI-005 UI-026：${target.name}键盘列宽可持久化且双击复位也持久化`, async ({
+            page,
+        }) => {
+            test.setTimeout(60_000);
+            await page.setViewportSize({ width: 1280, height: 800 });
+            await authenticatePage(page);
 
-    test('UI-005 UI-026：全部 15 张现存表的键盘列宽可持久化且双击复位也持久化', async ({
-        page,
-    }) => {
-        test.setTimeout(300_000);
-        await page.setViewportSize({ width: 1280, height: 800 });
-        await authenticatePage(page);
+            let table = await openEnterpriseTable(page, target);
+            let handle = resizeHandle(table, target.columnName);
+            await expect(handle).toHaveCount(1);
+            await handle.dblclick();
+            await expect(handle).toHaveAttribute(
+                'aria-valuenow',
+                String(target.defaultWidth),
+            );
 
-        for (const target of tableCases()) {
-            await test.step(target.name, async () => {
-                let table = await openEnterpriseTable(page, target);
-                let handle = resizeHandle(table, target.columnName);
-                await expect(handle).toHaveCount(1);
-                await handle.dblclick();
-                await expect(handle).toHaveAttribute(
-                    'aria-valuenow',
-                    String(target.defaultWidth),
-                );
+            await handle.focus();
+            await handle.press('ArrowRight');
+            await expect(handle).toHaveAttribute(
+                'aria-valuenow',
+                String(target.defaultWidth + 8),
+            );
 
-                await handle.focus();
-                await handle.press('ArrowRight');
-                await expect(handle).toHaveAttribute(
-                    'aria-valuenow',
-                    String(target.defaultWidth + 8),
-                );
+            table = await reopenEnterpriseTable(page, target);
+            handle = resizeHandle(table, target.columnName);
+            await expect(handle).toHaveAttribute(
+                'aria-valuenow',
+                String(target.defaultWidth + 8),
+            );
 
-                table = await reopenEnterpriseTable(page, target);
-                handle = resizeHandle(table, target.columnName);
-                await expect(handle).toHaveAttribute(
-                    'aria-valuenow',
-                    String(target.defaultWidth + 8),
-                );
+            await handle.dblclick();
+            await expect(handle).toHaveAttribute(
+                'aria-valuenow',
+                String(target.defaultWidth),
+            );
 
-                await handle.dblclick();
-                await expect(handle).toHaveAttribute(
-                    'aria-valuenow',
-                    String(target.defaultWidth),
-                );
-
-                table = await reopenEnterpriseTable(page, target);
-                await expect(
-                    resizeHandle(table, target.columnName),
-                ).toHaveAttribute(
-                    'aria-valuenow',
-                    String(target.defaultWidth),
-                );
-            });
-        }
-    });
+            table = await reopenEnterpriseTable(page, target);
+            await expect(
+                resizeHandle(table, target.columnName),
+            ).toHaveAttribute(
+                'aria-valuenow',
+                String(target.defaultWidth),
+            );
+        });
+    }
 
     test('UI-029：操作按钮、系统配置控件和 Webhook switch 都有稳定可访问名称', async ({
         page,
