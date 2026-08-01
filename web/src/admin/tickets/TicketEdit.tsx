@@ -5,7 +5,6 @@ import {
     SelectInput,
     DateTimeInput,
     ReferenceInput,
-    AutocompleteInput,
     required,
     TopToolbar,
     ListButton,
@@ -293,10 +292,11 @@ const TicketEdit: React.FC = () => {
                                                 reference="categories"
                                                 label="工单分类"
                                             >
-                                                <AutocompleteInput
+                                                <EnterpriseReferenceAutocompleteInput
                                                     label="工单分类"
                                                     optionText="name"
                                                     optionValue="id"
+                                                    fullWidth
                                                     helperText="选择工单所属分类"
                                                 />
                                             </ReferenceInput>

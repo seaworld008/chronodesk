@@ -7,7 +7,6 @@ import {
     BooleanInput,
     DateTimeInput,
     ReferenceInput,
-    AutocompleteInput,
     required,
     TopToolbar,
     ListButton,
@@ -513,9 +512,10 @@ const TicketCreate: React.FC = () => {
                             <CardContent>
                                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                                     <ReferenceInput source="category_id" reference="categories" label="工单类别" >
-                                        <AutocompleteInput
+                                        <EnterpriseReferenceAutocompleteInput
                                             label="工单类别"
                                             optionText="name"
+                                            optionValue="id"
                                             fullWidth
                                             helperText="选择工单所属的主要类别"
                                         />
