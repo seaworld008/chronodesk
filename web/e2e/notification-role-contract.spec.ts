@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import type { ProjectRole } from '../src/lib/generated/human-api';
+import { monitorBrowserHealth } from './helpers/browserAudit';
 import {
     authorizedProjectAccess,
     defaultMockIdentity,
@@ -10,13 +11,19 @@ import {
 
 type NotificationMockState = {
     creates: Record<string, unknown>[];
+    notificationListURLs: string[];
+    assigneeListURLs: string[];
 };
 
 const installNotificationBackend = async (
     page: Page,
     projectRole: ProjectRole,
 ): Promise<NotificationMockState> => {
-    const state: NotificationMockState = { creates: [] };
+    const state: NotificationMockState = {
+        creates: [],
+        notificationListURLs: [],
+        assigneeListURLs: [],
+    };
     const access = authorizedProjectAccess(projectA, projectRole);
     const notificationsPath =
         `/api/projects/${projectA.key}/notifications`;
@@ -33,6 +40,7 @@ const installNotificationBackend = async (
             url.pathname === notificationsPath &&
             request.method() === 'GET'
         ) {
+            state.notificationListURLs.push(request.url());
             await fulfillJSON(route, {
                 code: 0,
                 data: {
@@ -74,6 +82,7 @@ const installNotificationBackend = async (
             url.pathname ===
                 `/api/projects/${projectA.key}/assignees`
         ) {
+            state.assigneeListURLs.push(request.url());
             await fulfillJSON(route, {
                 code: 0,
                 data: [
@@ -118,9 +127,62 @@ const installNotificationBackend = async (
 
 test.describe('通知创建项目职责边界', () => {
     for (const role of ['project_admin', 'manager'] as const) {
+        test(`${role} 通知中心不展示或发送跨用户死筛选`, async ({
+            page,
+        }) => {
+            await installMockSession(
+                page,
+                {
+                    ...defaultMockIdentity,
+                    sessionID: `e2e-notification-filter-${role}`,
+                },
+                projectA,
+            );
+            const state = await installNotificationBackend(page, role);
+            const staleFilter = encodeURIComponent(
+                JSON.stringify({
+                    recipient_id: 88,
+                    sender_id: 89,
+                }),
+            );
+
+            await page.goto(
+                `/#/notifications?filter=${staleFilter}`,
+            );
+            await expect(
+                page.getByPlaceholder('搜索通知'),
+            ).toBeVisible();
+
+            await page
+                .getByRole('button', { name: '添加筛选条件' })
+                .click();
+            await expect(
+                page.getByRole('menuitemcheckbox', {
+                    name: '接收者',
+                }),
+            ).toHaveCount(0);
+            await expect(
+                page.getByRole('menuitemcheckbox', {
+                    name: '发送者',
+                }),
+            ).toHaveCount(0);
+
+            expect(state.assigneeListURLs).toEqual([]);
+            expect(state.notificationListURLs.length).toBeGreaterThan(0);
+            for (const requestURL of state.notificationListURLs) {
+                const serializedFilter =
+                    new URL(requestURL).searchParams.get('filter') ?? '';
+                expect(serializedFilter).not.toContain('recipient_id');
+                expect(serializedFilter).not.toContain('sender_id');
+            }
+        });
+    }
+
+    for (const role of ['project_admin', 'manager'] as const) {
         test(`${role} 可从通知列表创建且只提交严格六字段`, async ({
             page,
         }) => {
+            const browserHealth = monitorBrowserHealth(page);
             await installMockSession(
                 page,
                 {
@@ -177,6 +239,7 @@ test.describe('通知创建项目职责边界', () => {
                     recipient_id: 88,
                 },
             ]);
+            browserHealth.assertClean();
         });
     }
 

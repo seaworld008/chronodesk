@@ -300,11 +300,11 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         await expect(page.getByTestId('page-scope-badge'))
             .toHaveAttribute('data-page-scope', 'platform')
         await expect(page.getByTestId('scope-badge')).toContainText('平台级')
-        const settingsToggle = page.getByRole('button', { name: /^系统设置/ })
+        const settingsToggle = page.getByRole('menuitem', { name: /^系统设置/ })
         await expect(settingsToggle).toHaveAttribute('aria-expanded', 'true')
         await expect(settingsToggle).toHaveAttribute('aria-controls')
 
-        const workbench = page.getByRole('button', { name: /^工作台/ })
+        const workbench = page.getByRole('menuitem', { name: /^工作台/ })
         await expect(workbench).toBeVisible()
         await workbench.click()
         const crossProjectWorkbench = page.getByRole('menuitem', {
@@ -321,7 +321,7 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         await expect(page.getByTestId('scope-badge')).toContainText('跨项目')
 
         await page.goto('/#/system-settings')
-        const governance = page.getByRole('button', { name: /^治理中心/ })
+        const governance = page.getByRole('menuitem', { name: /^治理中心/ })
         await governance.focus()
         await governance.press('Enter')
         await expect(governance).toHaveAttribute('aria-expanded', 'true')
@@ -332,7 +332,7 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         )
         expect(storedKey).toBeTruthy()
         await page.reload()
-        await expect(page.getByRole('button', { name: /^治理中心/ }))
+        await expect(page.getByRole('menuitem', { name: /^治理中心/ }))
             .toHaveAttribute('aria-expanded', 'true')
         const otherExpiry = Math.floor(Date.now() / 1000) + 3600
         const otherToken = `${encode({ alg: 'none', typ: 'JWT' })}.${encode({
@@ -352,9 +352,9 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             }))
         }, { token: otherToken, exp: otherExpiry })
         await page.reload()
-        await expect(page.getByRole('button', { name: /^治理中心/ }))
+        await expect(page.getByRole('menuitem', { name: /^治理中心/ }))
             .toHaveAttribute('aria-expanded', 'false')
-        await expect(page.getByRole('button', { name: /^系统设置/ }))
+        await expect(page.getByRole('menuitem', { name: /^系统设置/ }))
             .toHaveAttribute('aria-expanded', 'true')
 
         const accountTrigger = page.getByTestId('account-menu').locator('button').first()
@@ -538,7 +538,7 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         const leaveDialog = page.getByRole('dialog', {
             name: 'MFA 恢复材料尚未确认保存',
         })
-        const integrationToggle = page.getByRole('button', {
+        const integrationToggle = page.getByRole('menuitem', {
             name: /^集成中心/,
         })
         if (await integrationToggle.getAttribute('aria-expanded') !== 'true') {

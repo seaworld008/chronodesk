@@ -91,7 +91,7 @@ const installSession = async (
       },
     }),
   }))
-  await page.route('**/api/projects', async (route) => {
+  await page.route('**/api/projects?*', async (route) => {
     if (route.request().method() !== 'GET') {
       await route.fallback()
       return
@@ -133,6 +133,8 @@ const dashboardEnvelope = (
     generated_at: '2026-07-31T12:00:00Z',
     days: Number(url.searchParams.get('days') ?? 30),
     selected_projects: selectedProjects.map(({ key, name }) => ({ key, name })),
+    selected_project_count: selectedProjects.length,
+    selected_projects_truncated: false,
     summary: {
       total,
       status: {
@@ -170,6 +172,7 @@ const dashboardEnvelope = (
       sla_breached: 0,
       overdue: 0,
     })),
+    project_breakdown_truncated: false,
   },
 })
 

@@ -122,7 +122,10 @@ test.describe('可信设备管理', () => {
         );
         const main = page.getByRole('main');
         await expect(
-            main.getByText('可信设备管理', { exact: true }),
+            main.getByRole('heading', {
+                name: '可信设备',
+                exact: true,
+            }),
         ).toBeVisible({ timeout: 15_000 });
         const deviceRegion = main.getByRole('region', {
             name: `可信设备：${deviceName}`,
@@ -183,6 +186,7 @@ test.describe('可信设备目录分页 mock', () => {
         );
         const queries: string[] = [];
         let failListRequests = true;
+        let failPageTwo = false;
         const devices = Array.from({ length: 30 }, (_, index) => ({
             id: index + 1,
             device_name: `可信设备 ${index + 1}`,
@@ -214,20 +218,25 @@ test.describe('可信设备目录分页 mock', () => {
                 request.method() === 'GET'
             ) {
                 queries.push(url.search);
-                if (failListRequests) {
+                const pageNumber = Number(
+                    url.searchParams.get('page') ?? '1',
+                );
+                if (
+                    failListRequests ||
+                    (failPageTwo && pageNumber === 2)
+                ) {
                     await route.fulfill({
                         status: 503,
                         contentType: 'application/json',
                         body: JSON.stringify({
                             code: 'service_unavailable',
-                            msg: '服务暂时不可用，请稍后重试',
+                            msg: pageNumber === 2
+                                ? '第二页暂时不可用'
+                                : '服务暂时不可用，请稍后重试',
                         }),
                     });
                     return;
                 }
-                const pageNumber = Number(
-                    url.searchParams.get('page') ?? '1',
-                );
                 const pageSize = Number(
                     url.searchParams.get('page_size') ?? '25',
                 );
@@ -266,8 +275,29 @@ test.describe('可信设备目录分页 mock', () => {
         expect(queries.at(-1)).toContain('page_size=25');
         expect(queries.at(-1)).toContain('sort_by=revoked');
 
+        failPageTwo = true;
         await page
             .getByRole('button', { name: /下一页|next page/iu })
+            .click();
+        await expect(page.getByRole('alert')).toContainText(
+            '安全执行保护暂时不可用',
+        );
+        await expect(
+            page.getByRole('region', {
+                name: '可信设备：可信设备 1',
+                exact: true,
+            }),
+        ).toHaveCount(0);
+        await expect(
+            page.getByRole('button', {
+                name: '撤销该设备',
+                exact: true,
+            }),
+        ).toHaveCount(0);
+
+        failPageTwo = false;
+        await page
+            .getByRole('button', { name: '重试', exact: true })
             .click();
         await expect(
             page.getByRole('region', {

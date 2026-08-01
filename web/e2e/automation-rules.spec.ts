@@ -25,13 +25,21 @@ const TEST_USER = {
 
 const installAutomationLogMockBackend = async (
     page: Page,
-    options: { failFirst?: boolean; empty?: boolean } = {},
+    options: {
+        failFirst?: boolean;
+        empty?: boolean;
+        holdContinuation?: boolean;
+    } = {},
 ) => {
     const access = authorizedProjectAccess(projectA, 'manager');
     const logsPath =
         `/api/projects/${projectA.key}/admin/automation/logs`;
     const queries: string[] = [];
     let calls = 0;
+    let releaseContinuation: (() => void) | undefined;
+    const continuationGate = new Promise<void>((resolve) => {
+        releaseContinuation = resolve;
+    });
     await page.route('**/api/**', async (route) => {
         const request = route.request();
         const target = new URL(request.url());
@@ -62,34 +70,59 @@ const installAutomationLogMockBackend = async (
                 return;
             }
             const continuation = target.searchParams.get('cursor');
-            await fulfillJSON(route, {
-                success: true,
-                data: {
-                    items: [{
-                        id: continuation ? 300 : 301,
-                        created_at: '2026-07-31T08:00:00Z',
-                        rule_id: 7,
-                        rule: { id: 7, name: '自动分派' },
-                        ticket_id: continuation ? 41 : 42,
-                        ticket: {
-                            id: continuation ? 41 : 42,
-                            ticket_number: continuation ? 'OPS-41' : 'OPS-42',
-                            title: '示例工单',
-                            status: 'open',
-                        },
-                        trigger_event:
-                            'io.chronodesk.ticket.created.v1',
-                        executed_at: continuation
-                            ? '2026-07-31T07:59:00Z'
-                            : '2026-07-31T08:00:00Z',
-                        success: !continuation,
-                        error_message: continuation ? '动作执行失败' : '',
-                        execution_time: continuation ? 24 : 12,
-                    }],
-                    next_cursor: continuation ? '' : 'automation-next',
-                    has_more: !continuation,
-                },
-            });
+            const filtered = target.searchParams.get('success') === 'false';
+            if (
+                options.holdContinuation
+                && continuation
+                && !filtered
+            ) {
+                await continuationGate;
+            }
+            try {
+                await fulfillJSON(route, {
+                    success: true,
+                    data: {
+                        items: [{
+                            id: filtered ? 399 : continuation ? 300 : 301,
+                            created_at: '2026-07-31T08:00:00Z',
+                            rule_id: 7,
+                            rule: { id: 7, name: '自动分派' },
+                            ticket_id: filtered
+                                ? 49
+                                : continuation ? 41 : 42,
+                            ticket: {
+                                id: filtered
+                                    ? 49
+                                    : continuation ? 41 : 42,
+                                ticket_number: filtered
+                                    ? 'OPS-49'
+                                    : continuation ? 'OPS-41' : 'OPS-42',
+                                title: '示例工单',
+                                status: 'open',
+                            },
+                            trigger_event:
+                                'io.chronodesk.ticket.created.v1',
+                            executed_at: continuation
+                                ? '2026-07-31T07:59:00Z'
+                                : '2026-07-31T08:00:00Z',
+                            success: !(continuation || filtered),
+                            error_message:
+                                continuation || filtered
+                                    ? '动作执行失败'
+                                    : '',
+                            execution_time:
+                                continuation || filtered ? 24 : 12,
+                        }],
+                        next_cursor:
+                            continuation || filtered
+                                ? ''
+                                : 'automation-next',
+                        has_more: !(continuation || filtered),
+                    },
+                });
+            } catch {
+                // 被新筛选或项目切换取消的旧请求没有可写响应体。
+            }
             return;
         }
         await fulfillJSON(route, { code: 0, data: [] });
@@ -97,6 +130,7 @@ const installAutomationLogMockBackend = async (
     return {
         calls: () => calls,
         queries,
+        releaseContinuation: () => releaseContinuation?.(),
     };
 };
 
@@ -122,9 +156,12 @@ test.describe('Automation execution cursor timeline（mock）', () => {
             page.getByRole('heading', { name: '执行详情 #301' }),
         ).toBeVisible();
 
-        await page.getByRole('button', { name: '加载更多' }).click();
+        await page.getByRole('button', { name: '下一页' }).click();
         await expect(page.getByText('OPS-41')).toBeVisible();
         expect(backend.queries.at(-1)).toContain('cursor=automation-next');
+        await expect(
+            page.getByRole('button', { name: '上一页' }),
+        ).toBeEnabled();
 
         await page.getByLabel('规则 ID').fill('7');
         await page.getByLabel('执行结果').click();
@@ -134,6 +171,37 @@ test.describe('Automation execution cursor timeline（mock）', () => {
         expect(backend.queries.at(-1)).toContain('rule_id=7');
         expect(backend.queries.at(-1)).toContain('success=false');
         expect(backend.queries.at(-1)).not.toContain('page=');
+    });
+
+    test('新筛选会取消旧续页请求且旧响应不能覆盖当前页', async ({
+        page,
+    }) => {
+        await installMockSession(
+            page,
+            {
+                ...defaultMockIdentity,
+                sessionID: 'e2e-automation-request-identity',
+            },
+            projectA,
+        );
+        const backend = await installAutomationLogMockBackend(page, {
+            holdContinuation: true,
+        });
+        await page.goto('/#/automation-logs');
+        await expect(page.getByText('OPS-42')).toBeVisible();
+
+        await page.getByRole('button', { name: '下一页' }).click();
+        await expect.poll(() => backend.calls()).toBe(2);
+        await page.getByLabel('执行结果').click();
+        await page.getByRole('option', { name: '失败' }).click();
+        await page.getByRole('button', { name: '应用筛选' }).click();
+        await expect(page.getByText('OPS-49')).toBeVisible();
+
+        backend.releaseContinuation();
+        await expect(page.getByText('OPS-49')).toBeVisible();
+        await expect(page.getByText('OPS-41')).toHaveCount(0);
+        expect(backend.queries.at(-1)).toContain('success=false');
+        expect(backend.queries.at(-1)).not.toContain('cursor=');
     });
 
     test('错误态可重试', async ({ page }) => {

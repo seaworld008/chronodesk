@@ -51,7 +51,7 @@ test.describe('Ticket Management', () => {
             exact: true,
         });
         const ticketInfoHeader = table.getByRole('columnheader', {
-            name: /^“工单信息”/u,
+            name: /^工单信息/u,
         });
         await expect(ticketInfoHeader).toBeVisible({ timeout: 10000 });
         const search = page.getByPlaceholder('搜索工单');
@@ -110,7 +110,7 @@ test.describe('Navigation', () => {
     });
 
     test('should navigate to users page', async ({ page }) => {
-        const governance = page.getByRole('button', { name: /^治理中心/ });
+        const governance = page.getByRole('menuitem', { name: /^治理中心/ });
         if ((await governance.getAttribute('aria-expanded')) !== 'true') {
             await governance.click();
         }
@@ -121,7 +121,7 @@ test.describe('Navigation', () => {
     });
 
     test('should navigate to system settings', async ({ page }) => {
-        const settings = page.getByRole('button', { name: /^系统设置/ });
+        const settings = page.getByRole('menuitem', { name: /^系统设置/ });
         if ((await settings.getAttribute('aria-expanded')) !== 'true') {
             await settings.click();
         }

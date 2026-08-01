@@ -17,6 +17,7 @@ const ticketTitle = `${E2E_MARKER}评论附件工单`;
 const publicComment = `${E2E_MARKER}公开评论`;
 const internalComment = `${E2E_MARKER}内部处理记录`;
 const fileName = `${E2E_MARKER}small.txt`;
+const fileContents = 'ChronoDesk Playwright E2E attachment\n';
 
 test.describe('工单评论与附件真实交互', () => {
     let ticketID = 0;
@@ -128,7 +129,7 @@ test.describe('工单评论与附件真实交互', () => {
         await attachmentRegion.getByLabel('选择附件').setInputFiles({
             name: fileName,
             mimeType: 'text/plain',
-            buffer: Buffer.from('ChronoDesk Playwright E2E attachment\n', 'utf8'),
+            buffer: Buffer.from(fileContents, 'utf8'),
         });
         await expect(
             attachmentRegion.getByText(fileName, { exact: true }),
@@ -155,6 +156,10 @@ test.describe('工单评论与附件真实交互', () => {
         await expect(
             attachmentItem.getByRole('button', { name: '下载' }),
         ).toBeDisabled();
+        await expect(
+            attachmentItem.getByRole('button', { name: '预览' }),
+        ).toBeDisabled();
+        await expect(attachmentItem).toContainText('安全扫描通过后可预览');
 
         const attachmentID = await markE2EAttachmentClean(request, fileName);
         await page.reload();
@@ -171,6 +176,31 @@ test.describe('工单评论与附件真实交互', () => {
             name: '下载',
         });
         await expect(downloadButton).toBeEnabled();
+        const previewButton = cleanAttachment.getByRole('button', {
+            name: '预览',
+        });
+        await expect(previewButton).toBeEnabled();
+
+        const previewResponse = page.waitForResponse(
+            (response) =>
+                response.request().method() === 'GET' &&
+                new URL(response.url()).pathname ===
+                    `${attachmentsPath}/${attachmentID}/content`,
+        );
+        await previewButton.click();
+        const previewed = await previewResponse;
+        expect(previewed.status()).toBe(200);
+        const previewDialog = page.getByRole('dialog', {
+            name: '附件预览',
+        });
+        await expect(previewDialog).toBeVisible();
+        await expect(
+            previewDialog.getByTestId('text-attachment-preview'),
+        ).toContainText(fileContents.trim());
+        await previewDialog
+            .getByRole('button', { name: '关闭', exact: true })
+            .click();
+        await expect(previewDialog).toBeHidden();
 
         const downloadPromise = page.waitForEvent('download');
         const downloadResponse = page.waitForResponse(

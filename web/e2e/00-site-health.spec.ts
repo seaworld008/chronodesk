@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import AxeBuilder from '@axe-core/playwright';
 import {
     expectChineseOperations,
     monitorBrowserHealth,
@@ -10,23 +11,43 @@ type PrimaryPageCase = {
     caseID: string;
     name: string;
     path: string;
+    navigation?: {
+        group: string;
+        leaf: string;
+    };
     ready: (page: Page) => Locator;
 };
 
 const mainContent = (page: Page) => page.getByRole('main');
 
 const navigationTree = [
-    { label: '工作台', children: [] },
+    { label: '工作台', children: ['运营大屏', '跨项目工作台'] },
     {
         label: '项目运营',
-        children: ['项目概览', '工单管理', '项目通知'],
+        children: ['项目概览', '工单管理', '知识库', '项目通知'],
     },
-    { label: '智能运营', children: ['AI 智能体', '自动化'] },
-    { label: '集成中心', children: ['Webhook', '事件投递'] },
-    { label: '项目配置', children: [] },
+    {
+        label: '智能运营',
+        children: ['人机协作', '自动化', '智能体管理'],
+    },
+    { label: '集成中心', children: ['Webhook', '集成运行'] },
+    {
+        label: '项目设置',
+        children: [
+            '基本信息',
+            '项目成员',
+            '建单配置',
+            'SLA 策略',
+            '受理队列',
+            '工单模板',
+            '快捷回复',
+            '通知与外发',
+        ],
+    },
     {
         label: '治理中心',
         children: [
+            '平台工作台',
             '项目治理',
             '平台身份与访问',
             '审计中心',
@@ -121,9 +142,42 @@ const primaryPages: PrimaryPageCase[] = [
                 ),
     },
     {
+        caseID: 'UI-KNOWLEDGE',
+        name: '项目知识库',
+        path: '/#/knowledge',
+        navigation: {
+            group: '项目运营',
+            leaf: '知识库',
+        },
+        ready: (page) =>
+            mainContent(page).getByRole('heading', {
+                name: '知识库',
+                exact: true,
+                level: 1,
+            }),
+    },
+    {
+        caseID: 'UI-KNOWLEDGE-PERMISSION',
+        name: '项目成员与知识贡献授权',
+        path: '/#/project-memberships',
+        navigation: {
+            group: '项目设置',
+            leaf: '项目成员',
+        },
+        ready: (page) =>
+            mainContent(page).getByRole('heading', {
+                name: '项目成员管理',
+                exact: true,
+            }),
+    },
+    {
         caseID: 'UI-013',
         name: '平台用户管理',
         path: '/#/users',
+        navigation: {
+            group: '治理中心',
+            leaf: '平台身份与访问',
+        },
         ready: (page) =>
             mainContent(page).getByPlaceholder('搜索用户', { exact: true }),
     },
@@ -156,16 +210,10 @@ const primaryPages: PrimaryPageCase[] = [
         caseID: 'UI-017',
         name: '系统设置',
         path: '/#/system-settings',
-        ready: (page) =>
-            mainContent(page).getByRole('heading', {
-                name: '平台公共配置',
-                exact: true,
-            }),
-    },
-    {
-        caseID: 'UI-017',
-        name: '系统设置概览',
-        path: '/#/system-settings/overview',
+        navigation: {
+            group: '系统设置',
+            leaf: '公共配置',
+        },
         ready: (page) =>
             mainContent(page).getByRole('heading', {
                 name: '平台公共配置',
@@ -175,7 +223,11 @@ const primaryPages: PrimaryPageCase[] = [
     {
         caseID: 'UI-018',
         name: '邮件设置',
-        path: '/#/email-settings',
+        path: '/#/system-settings/email',
+        navigation: {
+            group: '系统设置',
+            leaf: '邮件外发',
+        },
         ready: (page) =>
             mainContent(page).getByRole('heading', {
                 name: '平台邮件设置',
@@ -184,11 +236,15 @@ const primaryPages: PrimaryPageCase[] = [
     },
     {
         caseID: 'P1-PLATFORM-AUDIT',
-        name: '平台审计',
+        name: '平台审计探索器',
         path: '/#/platform/audit',
+        navigation: {
+            group: '治理中心',
+            leaf: '审计中心',
+        },
         ready: (page) =>
             mainContent(page).getByRole('heading', {
-                name: '平台审计',
+                name: '平台审计探索器',
                 exact: true,
             }),
     },
@@ -217,7 +273,11 @@ const primaryPages: PrimaryPageCase[] = [
         name: '可信设备',
         path: '/#/account/trusted-devices',
         ready: (page) =>
-            mainContent(page).getByText('可信设备管理', { exact: true }),
+            mainContent(page).getByRole('heading', {
+                name: '可信设备',
+                exact: true,
+                level: 1,
+            }),
     },
 ];
 
@@ -338,7 +398,7 @@ const expectSidebarUsable = async (
             await expect(leaf).toBeVisible();
             continue;
         }
-        const toggle = menu.getByRole('button', {
+        const toggle = menu.getByRole('menuitem', {
             name: new RegExp(`^${group.label}`),
         });
         await toggle.scrollIntoViewIfNeeded();
@@ -348,6 +408,13 @@ const expectSidebarUsable = async (
             await toggle.click();
         }
         await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+        const contentID = await toggle.getAttribute('aria-controls');
+        if (!contentID) {
+            throw new Error(`${group.label} 导航组缺少 aria-controls`);
+        }
+        await expect(page.locator(`#${contentID}`)).toHaveClass(
+            /MuiCollapse-entered/u,
+        );
 
         for (const itemName of group.children) {
             const item = menu.getByRole('menuitem', {
@@ -386,9 +453,9 @@ const expectSidebarUsable = async (
         }
     }
 
-    // 大于 MUI `sm` 断点时使用永久侧栏，内容区不能覆盖导航；
+    // 达到 MUI `md` 断点时使用永久侧栏，内容区不能覆盖导航；
     // 临时抽屉按设计覆盖内容，因此只校验上面的可见性与命中测试。
-    if (viewport.width > 600) {
+    if (viewport.width >= 900) {
         const contentBox = await content.boundingBox();
         expect(contentBox).not.toBeNull();
         expect(
@@ -403,9 +470,9 @@ const expectSidebarUsable = async (
         );
     }
 
-    // 每个视口独立验证。若保持打开状态跨越 `sm` 断点，永久侧栏会变成
+    // 每个视口独立验证。若保持打开状态跨越 `md` 断点，永久侧栏会变成
     // 模态抽屉并按设计隐藏底层 main，污染下一档的页面就绪判断。
-    if (viewport.width <= 600) {
+    if (viewport.width < 900) {
         await page.keyboard.press('Escape');
         await expect(menu).toBeHidden();
         await expect(page.getByRole('main')).toBeVisible();
@@ -425,10 +492,74 @@ const expectSidebarUsable = async (
     }
 };
 
+const navigateToPrimaryPage = async (
+    page: Page,
+    target: PrimaryPageCase,
+) => {
+    if (!target.navigation) {
+        await page.goto(target.path);
+        return;
+    }
+
+    const menu = page.getByRole('menu', { name: '主导航', exact: true });
+    const groupToggle = menu.getByRole('menuitem', {
+        name: target.navigation.group,
+        exact: true,
+    });
+    if ((await groupToggle.getAttribute('aria-expanded')) !== 'true') {
+        await groupToggle.click();
+    }
+    await expect(groupToggle).toHaveAttribute('aria-expanded', 'true');
+    await menu
+        .getByRole('group', {
+            name: `${target.navigation.group}导航`,
+            exact: true,
+        })
+        .getByRole('menuitem', {
+            name: target.navigation.leaf,
+            exact: true,
+        })
+        .click();
+};
+
+const assertNoSeriousOrCriticalAccessibilityIssues = async (
+    page: Page,
+    pageName: string,
+) => {
+    const scan = await new AxeBuilder({ page })
+        .withTags([
+            'wcag2a',
+            'wcag2aa',
+            'wcag21a',
+            'wcag21aa',
+        ])
+        .analyze();
+    const blockingViolations = scan.violations
+        .filter(
+            (violation) =>
+                violation.impact === 'critical' ||
+                violation.impact === 'serious',
+        )
+        .map((violation) => ({
+            id: violation.id,
+            impact: violation.impact,
+            help: violation.help,
+            targets: violation.nodes
+                .flatMap((node) => node.target)
+                .slice(0, 10),
+        }));
+
+    expect(
+        blockingViolations,
+        `${pageName} 不得存在 axe serious/critical 无障碍问题`,
+    ).toEqual([]);
+};
+
 test.describe('全站一级页面健康巡航', () => {
     test('UI-002：左侧导航在多视口与 200% 等效重排下无遮挡且全部可达', async ({
         page,
     }) => {
+        test.setTimeout(90_000);
         await page.setViewportSize({ width: 1440, height: 900 });
         await authenticatePage(page);
 
@@ -501,9 +632,10 @@ test.describe('全站一级页面健康巡航', () => {
         await expectChineseOperations(page);
     });
 
-    test('UI-025 UI-030：无浏览器错误、失败资源或英文操作提示', async ({
+    test('UI-025 UI-030 UI-031：页面健康、中文反馈与无障碍门禁', async ({
         page,
     }) => {
+        test.setTimeout(180_000);
         const health = monitorBrowserHealth(page);
         await authenticatePage(page);
 
@@ -511,12 +643,16 @@ test.describe('全站一级页面健康巡航', () => {
             await test.step(
                 `${target.caseID} ${target.name}`,
                 async () => {
-                    await page.goto(target.path);
+                    await navigateToPrimaryPage(page, target);
                     await waitForPrimaryPage(page);
                     await expect(target.ready(page)).toBeVisible({
                         timeout: 15_000,
                     });
                     await expectChineseOperations(page);
+                    await assertNoSeriousOrCriticalAccessibilityIssues(
+                        page,
+                        target.name,
+                    );
                 },
             );
         }

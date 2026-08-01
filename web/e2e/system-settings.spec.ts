@@ -43,7 +43,9 @@ test.describe('System Settings', () => {
                 value_type: 'int',
                 description: 'Playwright 本轮密码长度配置',
                 category: 'security',
-                group: 'e2e',
+                // 放在稳定排序的首组，避免其他 E2E 生成的大量安全配置
+                // 把本用例目标挤到后续页；跨页草稿另由下方 mock 用例覆盖。
+                group: '00-e2e',
                 is_required: false,
                 is_active: true,
                 default_value: '8',
@@ -85,6 +87,7 @@ test.describe('System Settings', () => {
             );
             await page.goto('/#/system-settings');
             await page
+                .getByRole('main')
                 .getByRole('heading', {
                     name: '平台公共配置',
                     exact: true,
@@ -158,8 +161,8 @@ test.describe('System Settings', () => {
                 .getByRole('spinbutton')
                 .fill(String(Number(updatedValue) + 1));
             await page
-                .getByRole('tab', {
-                    name: '平台邮件设置',
+                .getByRole('menuitem', {
+                    name: '邮件外发',
                     exact: true,
                 })
                 .click();
@@ -176,8 +179,8 @@ test.describe('System Settings', () => {
                 .click();
             await expect(page).toHaveURL(/#\/system-settings$/u);
             await page
-                .getByRole('tab', {
-                    name: '平台邮件设置',
+                .getByRole('menuitem', {
+                    name: '邮件外发',
                     exact: true,
                 })
                 .click();

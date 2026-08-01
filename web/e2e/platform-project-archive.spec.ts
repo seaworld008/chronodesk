@@ -316,7 +316,7 @@ test.describe('平台项目归档浏览器闭环', () => {
         ).toBe(true);
 
         await page
-            .getByRole('button', {
+            .getByRole('menuitem', {
                 name: '治理中心',
                 exact: true,
             })
@@ -356,7 +356,7 @@ test.describe('平台项目归档浏览器闭环', () => {
         await expect.poll(() =>
             page.evaluate(() => {
                 const raw = localStorage.getItem(
-                    'chronodesk.table-columns.v1.platform.projects.governance',
+                    'chronodesk.table-columns.v1.11.platform.projects.governance',
                 );
                 return raw
                     ? (JSON.parse(raw) as { project?: unknown }).project
@@ -425,8 +425,7 @@ test.describe('平台项目归档浏览器闭环', () => {
         ).toBe(true);
         await expect(
             page.getByRole('menuitem', {
-                name: '项目配置',
-                exact: true,
+                name: /^项目设置/u,
             }),
         ).toHaveCount(0);
         await expect.poll(() =>
@@ -461,7 +460,7 @@ test.describe('平台项目归档浏览器闭环', () => {
             backend.authorizedProjectReads;
 
         await page
-            .getByRole('button', {
+            .getByRole('menuitem', {
                 name: '治理中心',
                 exact: true,
             })
@@ -566,7 +565,7 @@ test.describe('平台项目归档浏览器闭环', () => {
         await page.goto('/#/');
         await expect(page.getByTestId('project-home')).toBeVisible();
         await page
-            .getByRole('button', {
+            .getByRole('menuitem', {
                 name: '治理中心',
                 exact: true,
             })
@@ -675,7 +674,10 @@ test.describe('平台项目归档浏览器闭环', () => {
         });
 
         await page.goto('/#/platform/projects');
-        const businessUnitFilter = page.getByLabel('业务单元');
+        const businessUnitFilter = page.getByRole('combobox', {
+            name: '业务单元',
+            exact: true,
+        });
         await businessUnitFilter.fill('历史');
         await page
             .getByRole('option', {

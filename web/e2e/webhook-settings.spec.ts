@@ -26,10 +26,11 @@ const runID = e2eRunID();
 const webhookName = `${E2E_PREFIX}${runID}-Canonical-Webhook`;
 const markerSecret = `${E2E_PREFIX}${runID}-仅用于密文测试`;
 
-const selectOptionByRenderedText = async (
+const setOptionSelectionByRenderedText = async (
     page: Page,
     primary: string,
     secondary: string,
+    selected = true,
 ) => {
     const option = page
         .getByRole('option')
@@ -40,8 +41,14 @@ const selectOptionByRenderedText = async (
     await expect(option.getByText(secondary, { exact: true })).toBeVisible();
     const checkbox = option.getByRole('checkbox');
     await expect(checkbox).toHaveCount(1);
-    await option.click();
-    await expect(checkbox).toBeChecked();
+    if ((await checkbox.isChecked()) !== selected) {
+        await option.click();
+    }
+    if (selected) {
+        await expect(checkbox).toBeChecked();
+    } else {
+        await expect(checkbox).not.toBeChecked();
+    }
 };
 
 const mockWebhook = {
@@ -49,7 +56,8 @@ const mockWebhook = {
     name: '异步测试 Webhook',
     description: '仅验证浏览器异步入队契约',
     provider: 'custom',
-    webhook_url: 'https://webhook.example.test/callback',
+    webhook_url_masked: 'https://webhook.example.test/…',
+    has_webhook_url: true,
     status: 'active',
     enabled_events_list: ['io.chronodesk.system.alert.v1'],
     filter_rules_obj: { transition_statuses: [] },
@@ -71,7 +79,11 @@ const mockWebhook = {
 
 const installWebhookAsyncMockBackend = async (
     page: Page,
-    options: { failFirstDelivery?: boolean; emptyDeliveries?: boolean } = {},
+    options: {
+        failFirstDelivery?: boolean;
+        emptyDeliveries?: boolean;
+        holdContinuation?: boolean;
+    } = {},
 ) => {
     const access = authorizedProjectAccess(projectA, 'manager');
     const webhooksPath = `/api/projects/${projectA.key}/webhooks`;
@@ -79,6 +91,10 @@ const installWebhookAsyncMockBackend = async (
     let deliveryCalls = 0;
     const listQueries: string[] = [];
     const deliveryQueries: string[] = [];
+    let releaseContinuation: (() => void) | undefined;
+    const continuationGate = new Promise<void>((resolve) => {
+        releaseContinuation = resolve;
+    });
 
     await page.route('**/api/**', async (route) => {
         const request = route.request();
@@ -128,25 +144,49 @@ const installWebhookAsyncMockBackend = async (
                 return;
             }
             const continuation = target.searchParams.get('cursor');
-            await fulfillJSON(route, {
-                code: 0,
-                data: {
-                    items: [{
-                        id: continuation ? 730 : 731,
-                        created_at: continuation
-                            ? '2026-07-31T07:59:00Z'
-                            : '2026-07-31T08:00:00Z',
-                        config_id: mockWebhook.id,
-                        event_type: 'io.chronodesk.system.alert.v1',
-                        status: continuation ? 'failed' : 'success',
-                        response_status: continuation ? 503 : 204,
-                        response_time: continuation ? 99 : 12,
-                        error_message: continuation ? '上游暂不可用' : '',
-                    }],
-                    next_cursor: continuation ? '' : 'signed-next-page',
-                    has_more: !continuation,
-                },
-            });
+            const failedFilter =
+                target.searchParams.get('status') === 'failed';
+            if (
+                options.holdContinuation
+                && continuation
+                && !failedFilter
+            ) {
+                await continuationGate;
+            }
+            try {
+                await fulfillJSON(route, {
+                    code: 0,
+                    data: {
+                        items: [{
+                            id: failedFilter ? 732 : continuation ? 730 : 731,
+                            created_at: continuation
+                                ? '2026-07-31T07:59:00Z'
+                                : '2026-07-31T08:00:00Z',
+                            config_id: mockWebhook.id,
+                            event_type: 'io.chronodesk.system.alert.v1',
+                            status:
+                                continuation || failedFilter
+                                    ? 'failed'
+                                    : 'success',
+                            response_status:
+                                continuation || failedFilter ? 503 : 204,
+                            response_time:
+                                continuation || failedFilter ? 99 : 12,
+                            error_message:
+                                failedFilter
+                                    ? '筛选后的失败记录'
+                                    : continuation ? '上游暂不可用' : '',
+                        }],
+                        next_cursor:
+                            continuation || failedFilter
+                                ? ''
+                                : 'signed-next-page',
+                        has_more: !(continuation || failedFilter),
+                    },
+                });
+            } catch {
+                // 被新筛选或抽屉关闭取消的旧请求没有可写响应体。
+            }
             return;
         }
         if (
@@ -185,6 +225,7 @@ const installWebhookAsyncMockBackend = async (
         deliveryCalls: () => deliveryCalls,
         listQueries,
         deliveryQueries,
+        releaseContinuation: () => releaseContinuation?.(),
     };
 };
 
@@ -260,7 +301,7 @@ test.describe('Webhook 测试异步入队浏览器契约（mock）', () => {
         const form = page.getByRole('dialog', { name: '新增 Webhook' });
 
         await form.getByLabel('订阅事件', { exact: true }).click();
-        await selectOptionByRenderedText(
+        await setOptionSelectionByRenderedText(
             page,
             '工单状态流转',
             'io.chronodesk.ticket.transitioned.v1',
@@ -268,7 +309,7 @@ test.describe('Webhook 测试异步入队浏览器契约（mock）', () => {
         await page.keyboard.press('Escape');
 
         await form.getByLabel('状态流转筛选', { exact: true }).click();
-        await selectOptionByRenderedText(page, '已解决', 'resolved');
+        await setOptionSelectionByRenderedText(page, '已解决', 'resolved');
         await page.keyboard.press('Escape');
         await form
             .getByRole('button', { name: '清空已选订阅事件' })
@@ -314,7 +355,7 @@ test.describe('Webhook 测试异步入队浏览器契约（mock）', () => {
             page.getByRole('heading', { name: '投递详情 #731' }),
         ).toBeVisible();
 
-        await page.getByRole('button', { name: '加载更多' }).click();
+        await page.getByRole('button', { name: '下一页' }).click();
         await expect(
             page.getByRole('button')
                 .filter({ hasText: '系统警报' })
@@ -324,6 +365,9 @@ test.describe('Webhook 测试异步入队浏览器契约（mock）', () => {
             'cursor=signed-next-page',
         );
         expect(backend.deliveryCalls()).toBe(2);
+        await expect(
+            page.getByRole('button', { name: '上一页' }),
+        ).toBeEnabled();
     });
 
     test('投递抽屉展示错误并可重试', async ({ page }) => {
@@ -351,6 +395,53 @@ test.describe('Webhook 测试异步入队浏览器契约（mock）', () => {
                 .filter({ hasText: '成功' }),
         ).toBeVisible();
         expect(backend.deliveryCalls()).toBe(2);
+    });
+
+    test('投递筛选会取消旧续页请求且旧响应不能覆盖当前页', async ({
+        page,
+    }) => {
+        await installMockSession(
+            page,
+            {
+                ...defaultMockIdentity,
+                sessionID: 'e2e-webhook-request-identity',
+            },
+            projectA,
+        );
+        const backend = await installWebhookAsyncMockBackend(page, {
+            holdContinuation: true,
+        });
+        await page.goto('/#/webhook-settings');
+        await page.getByRole('button', {
+            name: '查看投递记录：异步测试 Webhook',
+        }).click();
+        await expect(
+            page.getByRole('heading', { name: '投递详情 #731' }),
+        ).toHaveCount(0);
+
+        await page.getByRole('button', { name: '下一页' }).click();
+        await expect.poll(() => backend.deliveryCalls()).toBe(2);
+        await page.getByLabel('投递状态').click();
+        await page.getByRole('option', { name: '失败' }).click();
+        const filteredDelivery = page.getByRole('button')
+            .filter({ hasText: '系统警报' })
+            .filter({ hasText: '失败' });
+        await expect(filteredDelivery).toBeVisible();
+        await filteredDelivery.click();
+        await expect(
+            page.getByRole('heading', { name: '投递详情 #732' }),
+        ).toBeVisible();
+        await expect(page.getByText(/筛选后的失败记录/u)).toBeVisible();
+
+        backend.releaseContinuation();
+        await expect(
+            page.getByRole('heading', { name: '投递详情 #732' }),
+        ).toBeVisible();
+        await expect(
+            page.getByRole('heading', { name: '投递详情 #730' }),
+        ).toHaveCount(0);
+        expect(backend.deliveryQueries.at(-1)).toContain('status=failed');
+        expect(backend.deliveryQueries.at(-1)).not.toContain('cursor=');
     });
 
     test('投递抽屉有明确空状态', async ({ page }) => {
@@ -400,6 +491,7 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
         await authenticatePage(page);
         await page.goto('/#/webhook-settings');
         await page
+            .getByRole('main')
             .getByRole('heading', { name: 'Webhook 集成' })
             .waitFor({ timeout: 15_000 });
 
@@ -450,13 +542,17 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
             .getByRole('button', { name: `编辑 Webhook：${webhookName}` })
             .click();
         form = page.getByRole('dialog', { name: '编辑 Webhook' });
+        await expect(
+            form.getByLabel('Webhook 地址', { exact: true }),
+        ).toHaveValue('');
         await form.getByLabel('订阅事件', { exact: true }).click();
-        await selectOptionByRenderedText(
+        await setOptionSelectionByRenderedText(
             page,
             '工单创建',
             'io.chronodesk.ticket.created.v1',
+            false,
         );
-        await selectOptionByRenderedText(
+        await setOptionSelectionByRenderedText(
             page,
             '工单状态流转',
             'io.chronodesk.ticket.transitioned.v1',
@@ -464,8 +560,8 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
         await page.keyboard.press('Escape');
 
         await form.getByLabel('状态流转筛选', { exact: true }).click();
-        await selectOptionByRenderedText(page, '已解决', 'resolved');
-        await selectOptionByRenderedText(page, '已关闭', 'closed');
+        await setOptionSelectionByRenderedText(page, '已解决', 'resolved');
+        await setOptionSelectionByRenderedText(page, '已关闭', 'closed');
         await page.keyboard.press('Escape');
 
         const update = page.waitForResponse(
@@ -474,7 +570,11 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
                 new URL(response.url()).pathname.startsWith(`${webhooksPath}/`),
         );
         await form.getByRole('button', { name: '保存' }).click();
-        expect((await update).status()).toBe(200);
+        const updateResponse = await update;
+        expect(updateResponse.status()).toBe(200);
+        expect(
+            updateResponse.request().postDataJSON() as Record<string, unknown>,
+        ).not.toHaveProperty('webhook_url');
         await expect(row).toContainText('工单状态流转（已解决、已关闭）', {
             timeout: 15_000,
         });
@@ -489,6 +589,11 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
             (candidate) => candidate.name === webhookName,
         );
         expect(typeof webhook?.id).toBe('number');
+        expect(webhook).not.toHaveProperty('webhook_url');
+        expect(webhook?.webhook_url_masked).toBe(
+            'https://chronodesk-e2e.invalid/…',
+        );
+        expect(webhook?.has_webhook_url).toBe(true);
         expect(webhook?.enabled_events_list).toEqual([
             'io.chronodesk.ticket.transitioned.v1',
         ]);

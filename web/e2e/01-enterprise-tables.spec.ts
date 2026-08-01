@@ -338,7 +338,7 @@ const tableCases = (): EnterpriseTableCase[] => [
         path: () => '/#/platform/projects',
         tableName: '平台项目治理列表',
         columnName: '项目',
-        defaultWidth: 360,
+        defaultWidth: 320,
         stickyHeader: '平台操作',
         // 全新环境只有不可归档的 DEFAULT 项目；专用归档套件另以
         // 非默认项目验证可操作按钮，这里仍验证 sticky 数据单元格。
@@ -349,7 +349,7 @@ const tableCases = (): EnterpriseTableCase[] => [
         path: () => '/#/project-memberships',
         tableName: '项目成员列表',
         columnName: '用户',
-        defaultWidth: 300,
+        defaultWidth: 320,
         stickyHeader: '操作',
         requireActionButton: true,
     },
@@ -374,7 +374,7 @@ const tableCases = (): EnterpriseTableCase[] => [
     {
         name: '自动化日志列表',
         path: () => '/#/automation-logs',
-        tableName: '自动化日志列表',
+        tableName: '自动化日志时间线',
         columnName: 'ID',
         defaultWidth: 88,
         expectedText: () => ruleName,
@@ -457,7 +457,7 @@ const tableCases = (): EnterpriseTableCase[] => [
     },
     {
         name: '领域事件列表',
-        path: () => '/#/agent-control',
+        path: () => '/#/integration-runtime',
         tableName: '领域事件列表',
         columnName: '时间',
         defaultWidth: 188,
@@ -465,12 +465,11 @@ const tableCases = (): EnterpriseTableCase[] => [
     },
     {
         name: '事件投递列表',
-        path: () => '/#/agent-control',
-        tableName: '事件投递列表',
+        path: () => '/#/integration-runtime',
+        tableName: 'Outbox 投递列表',
         columnName: '事件',
-        defaultWidth: 280,
-        tabName: '事件投递（Outbox）',
-        stickyHeader: '操作',
+        defaultWidth: 300,
+        tabName: 'Outbox',
         requireActionButton: false,
     },
     {
@@ -871,7 +870,7 @@ test.describe('企业级列表表格', () => {
                         `${projectAPIPath(
                             projectKey,
                             'admin/automation/logs',
-                        )}?page=1&page_size=100`,
+                        )}?limit=100`,
                     );
                     return extractItems<Record<string, unknown>>(response).some(
                         (item) =>
@@ -1025,7 +1024,7 @@ test.describe('企业级列表表格', () => {
         const stickyCases = tableCases().filter(
             (target) => target.stickyHeader,
         );
-        expect(stickyCases).toHaveLength(10);
+        expect(stickyCases).toHaveLength(9);
         for (const target of stickyCases) {
             await test.step(target.name, async () => {
                 const table = await openEnterpriseTable(page, target);

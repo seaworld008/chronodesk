@@ -34,6 +34,30 @@ const roleCases = platformRoleValues.map((platformRole) => ({
     label: platformRoleLabels[platformRole],
 }));
 
+const openPlatformIdentityFromNavigation = async (
+    page: Parameters<typeof authenticatePage>[0],
+) => {
+    const menu = page.getByRole('menu', { name: '主导航', exact: true });
+    const governanceToggle = menu.getByRole('menuitem', {
+        name: '治理中心',
+        exact: true,
+    });
+    if ((await governanceToggle.getAttribute('aria-expanded')) !== 'true') {
+        await governanceToggle.click();
+    }
+    await expect(governanceToggle).toHaveAttribute('aria-expanded', 'true');
+    const governanceNavigation = menu.getByRole('group', {
+        name: '治理中心导航',
+        exact: true,
+    });
+    await governanceNavigation
+        .getByRole('menuitem', {
+            name: '平台身份与访问',
+            exact: true,
+        })
+        .click();
+};
+
 test.describe('平台用户管理角色与最后平台管理员保护', () => {
     test.describe.configure({ mode: 'serial' });
 
@@ -129,12 +153,7 @@ test.describe('平台用户管理角色与最后平台管理员保护', () => {
                 const email = `${username}@example.test`;
                 const displayName = `${E2E_MARKER}${roleCase.label}-已编辑`;
 
-                await page
-                    .getByRole('menuitem', {
-                        name: '平台用户管理',
-                        exact: true,
-                    })
-                    .click();
+                await openPlatformIdentityFromNavigation(page);
                 await expect(page).toHaveURL(/#\/users$/);
                 await page
                     .getByRole('link', {
