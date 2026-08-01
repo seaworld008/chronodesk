@@ -42,6 +42,11 @@ export default defineConfig({
     reporter: isPublishingCI
         ? 'line'
         : [['html', { open: 'never' }]],
+    // Keep visual baselines isolated by browser project and operating system.
+    // Contributors can update their local baseline without overwriting the
+    // canonical Linux baseline exercised by CI.
+    snapshotPathTemplate:
+        '{testDir}/{testFilePath}-snapshots/{arg}{-projectName}{-snapshotSuffix}{ext}',
 
     use: {
         // Base URL for all tests
