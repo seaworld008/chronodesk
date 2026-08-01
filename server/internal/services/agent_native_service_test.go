@@ -2528,3 +2528,71 @@ func TestAgentNativeLocalAttachmentSecurityHashScanAndLimit(t *testing.T) {
 		)
 	}
 }
+
+func TestAgentNativeAttachmentUsesDetectedMIMEInsteadOfClientClaims(
+	t *testing.T,
+) {
+	db := openAgentNativeTestDB(t)
+	user := seedActorUser(t, db, "attachment-detected-mime")
+	storage, err := NewLocalAttachmentStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	service := NewAgentNativeService(db, AgentNativeOptions{
+		AttachmentStorage:  storage,
+		AttachmentStaging:  storage,
+		AttachmentMaxBytes: 1024,
+	})
+	ticket := seedNativeTicket(
+		t,
+		db,
+		user.ID,
+		"AI-ATTACH-DETECTED-MIME",
+	)
+	actor := models.HumanActor(user.ID)
+	ctx := testProjectOperationContext(t, db, actor)
+	ensureAttachmentTestAuthorization(t, db, ctx, actor)
+
+	result, err := service.StoreAttachment(ctx, NativeAttachmentInput{
+		TicketID:        ticket.ID,
+		ExpectedVersion: ticket.Version,
+		Actor:           actor,
+		OriginalName:    "forged.png",
+		ContentType:     "image/png",
+		FileType:        models.AttachmentTypeImage,
+		Reader: bytes.NewBufferString(
+			"plain text that is not a PNG image",
+		),
+	})
+	if err != nil {
+		t.Fatalf("store attachment with forged client type: %v", err)
+	}
+	if result.Attachment.MimeType != "text/plain" {
+		t.Fatalf(
+			"persisted MIME = %q, want Stage-detected text/plain",
+			result.Attachment.MimeType,
+		)
+	}
+	if result.Attachment.FileType != models.AttachmentTypeDocument {
+		t.Fatalf(
+			"persisted FileType = %q, want %q",
+			result.Attachment.FileType,
+			models.AttachmentTypeDocument,
+		)
+	}
+
+	var persisted models.TicketAttachment
+	if err := db.First(
+		&persisted,
+		result.Attachment.ID,
+	).Error; err != nil {
+		t.Fatalf("reload detected attachment metadata: %v", err)
+	}
+	if persisted.MimeType != "text/plain" ||
+		persisted.FileType != models.AttachmentTypeDocument {
+		t.Fatalf(
+			"database retained client attachment claims: %+v",
+			persisted,
+		)
+	}
+}

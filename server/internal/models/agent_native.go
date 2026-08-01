@@ -68,6 +68,8 @@ const (
 	ScopeAttachmentsWrite  = agentcontract.ScopeAttachmentsWrite
 	ScopeEventsSubscribe   = agentcontract.ScopeEventsSubscribe
 	ScopeTasksManage       = agentcontract.ScopeTasksManage
+	ScopeKnowledgeRead     = agentcontract.ScopeKnowledgeRead
+	ScopeKnowledgeWrite    = agentcontract.ScopeKnowledgeWrite
 )
 
 var SupportedAgentScopes = agentcontract.SupportedScopes()

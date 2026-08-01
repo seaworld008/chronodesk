@@ -15,7 +15,7 @@ func TestAdminUserServiceRejectsRolesOutsideClosedPlatformEnum(t *testing.T) {
 
 	if _, err := service.GetUserList(context.Background(), &UserListRequest{
 		PlatformRole: &invalidRole,
-	}); err == nil || !strings.Contains(err.Error(), "invalid platform role") {
+	}); !errors.Is(err, ErrInvalidAdminUserListQuery) {
 		t.Errorf("GetUserList invalid role error = %v", err)
 	}
 	if _, err := service.CreateUser(context.Background(), &models.UserCreateRequest{

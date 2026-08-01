@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -108,6 +109,223 @@ func TestWorkbenchDashboardDefaultAllAndExplicitFilters(t *testing.T) {
 	if multi.Summary.Total != all.Summary.Total ||
 		len(multi.SelectedProjects) != 2 {
 		t.Fatalf("multi-project dashboard = %+v", multi)
+	}
+}
+
+func TestWorkbenchDashboardExcludesOldSevenDayTicketsAndHonorsNinetyDayBoundary(
+	t *testing.T,
+) {
+	db := crossProjectWorkbenchTestDB(t)
+	seedCrossProjectWorkbench(t, db, 7)
+	seedWorkbenchDashboardProject(t, db)
+	service, err := NewCrossProjectWorkbenchService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+
+	insertTicket := func(
+		id uint,
+		createdAt time.Time,
+		status, priority string,
+		slaBreached bool,
+		assignedType, assignedID any,
+	) {
+		t.Helper()
+		if err := db.Exec(`
+			INSERT INTO tickets (
+				id, public_id, organization_id, project_id, ticket_number, title,
+				type, priority, status, created_by_actor_type,
+				created_by_actor_id, assigned_to_actor_type,
+				assigned_to_actor_id, due_date, sla_breached, version,
+				created_at, updated_at
+			) VALUES (
+				?, ?, 1, 10, ?, ?, 'request', ?, ?, 'human', '7', ?, ?,
+				?, ?, 1, ?, ?
+			)
+		`,
+			id,
+			fmt.Sprintf("dashboard-window-%d", id),
+			fmt.Sprintf("OPS-%d", id),
+			fmt.Sprintf("Window ticket %d", id),
+			priority,
+			status,
+			assignedType,
+			assignedID,
+			time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+			slaBreached,
+			createdAt,
+			createdAt,
+		).Error; err != nil {
+			t.Fatalf("insert dashboard window ticket %d: %v", id, err)
+		}
+	}
+
+	sevenDayStart := dashboardDay(now).AddDate(0, 0, -6)
+	ninetyDayStart := dashboardDay(now).AddDate(0, 0, -89)
+	insertTicket(
+		601,
+		sevenDayStart.Add(-time.Second),
+		"pending",
+		"high",
+		true,
+		nil,
+		nil,
+	)
+	insertTicket(
+		602,
+		ninetyDayStart,
+		"in_progress",
+		"critical",
+		true,
+		"human",
+		"7",
+	)
+	insertTicket(
+		603,
+		ninetyDayStart.Add(-time.Second),
+		"cancelled",
+		"low",
+		true,
+		nil,
+		nil,
+	)
+	insertTicket(
+		604,
+		now.Add(time.Second),
+		"open",
+		"urgent",
+		true,
+		nil,
+		nil,
+	)
+
+	sevenDays, err := service.Dashboard(
+		context.Background(),
+		WorkbenchDashboardQuery{UserID: 7, Days: 7},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sevenDays.Summary.Total != 7 ||
+		sevenDays.Summary.Status.Pending != 0 ||
+		sevenDays.Summary.Status.InProgress != 0 ||
+		sevenDays.Summary.Priority.High != 0 ||
+		sevenDays.Summary.Priority.Critical != 0 ||
+		sevenDays.Summary.Priority.Low != 0 ||
+		sevenDays.Summary.Priority.Urgent != 0 ||
+		sevenDays.Summary.SLABreached != 1 ||
+		sevenDays.Summary.Overdue != 1 ||
+		sevenDays.Summary.Assignment.Human != 4 ||
+		sevenDays.Summary.Assignment.ServicePrincipal != 2 ||
+		sevenDays.Summary.Assignment.Unassigned != 1 {
+		t.Fatalf(
+			"seven-day summary included out-of-window tickets: %+v",
+			sevenDays.Summary,
+		)
+	}
+	sevenProjectTotals := make(map[models.ProjectKey]int64)
+	var sevenTrendTotal int64
+	for _, row := range sevenDays.ProjectBreakdown {
+		sevenProjectTotals[row.ProjectKey] = row.Total
+	}
+	for _, point := range sevenDays.DailyTrend {
+		sevenTrendTotal += point.Created
+	}
+	if sevenProjectTotals["OPS"] != 4 ||
+		sevenProjectTotals["FIN"] != 3 ||
+		sevenTrendTotal != 7 {
+		t.Fatalf("seven-day breakdowns are inconsistent: %+v", sevenDays)
+	}
+
+	ninetyDays, err := service.Dashboard(
+		context.Background(),
+		WorkbenchDashboardQuery{UserID: 7, Days: 90},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ninetyDays.Summary.Total != 9 ||
+		ninetyDays.Summary.Status.Pending != 1 ||
+		ninetyDays.Summary.Status.InProgress != 1 ||
+		ninetyDays.Summary.Priority.High != 1 ||
+		ninetyDays.Summary.Priority.Critical != 1 ||
+		ninetyDays.Summary.Priority.Low != 0 ||
+		ninetyDays.Summary.Priority.Urgent != 0 ||
+		ninetyDays.Summary.SLABreached != 3 ||
+		ninetyDays.Summary.Overdue != 3 ||
+		ninetyDays.Summary.Assignment.Human != 5 ||
+		ninetyDays.Summary.Assignment.ServicePrincipal != 2 ||
+		ninetyDays.Summary.Assignment.Unassigned != 2 {
+		t.Fatalf(
+			"ninety-day boundary summary = %+v",
+			ninetyDays.Summary,
+		)
+	}
+	ninetyProjectTotals := make(map[models.ProjectKey]int64)
+	var ninetyTrendTotal int64
+	for _, row := range ninetyDays.ProjectBreakdown {
+		ninetyProjectTotals[row.ProjectKey] = row.Total
+	}
+	for _, point := range ninetyDays.DailyTrend {
+		ninetyTrendTotal += point.Created
+	}
+	if ninetyProjectTotals["OPS"] != 6 ||
+		ninetyProjectTotals["FIN"] != 3 ||
+		ninetyTrendTotal != 9 {
+		t.Fatalf("ninety-day breakdowns are inconsistent: %+v", ninetyDays)
+	}
+}
+
+func TestWorkbenchDashboardAggregatesAllButBoundsProjectArrays(t *testing.T) {
+	db := crossProjectWorkbenchTestDB(t)
+	if err := db.Exec(
+		"INSERT INTO users (id, username, display_name) VALUES (7, 'owner', 'Owner')",
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 101; index++ {
+		projectID := 1_000 + index
+		if err := db.Exec(
+			`INSERT INTO projects (id, organization_id, key, name, status)
+			 VALUES (?, 1, ?, ?, 'active')`,
+			projectID,
+			fmt.Sprintf("P%03d", index),
+			fmt.Sprintf("Project %03d", index),
+		).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Exec(
+			`INSERT INTO project_memberships
+			 (id, project_id, user_id, role, is_active)
+			 VALUES (?, ?, 7, 'observer', TRUE)`,
+			projectID,
+			projectID,
+		).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	service, err := NewCrossProjectWorkbenchService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Dashboard(
+		context.Background(),
+		WorkbenchDashboardQuery{UserID: 7, Days: 7},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SelectedProjectCount != 101 ||
+		len(result.SelectedProjects) != 100 ||
+		!result.SelectedProjectsTruncated ||
+		len(result.ProjectBreakdown) != 100 ||
+		!result.ProjectBreakdownTruncated {
+		t.Fatalf("dashboard project arrays are not bounded: %+v", result)
+	}
+	if result.Summary.Total != 0 || len(result.DailyTrend) != 7 {
+		t.Fatalf("bounded response changed aggregate semantics: %+v", result)
 	}
 }
 

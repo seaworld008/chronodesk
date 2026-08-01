@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -50,14 +51,18 @@ func TestRuntimeSafetyControlsSurviveRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := newTestRuntimeControl(t, db, nil, false)
-	if err := first.persistOnDB(context.Background(), db, agentReadOnlyConfigKey, true, 0); err != nil {
+	enabled := true
+	if _, err := first.UpdateCAS(
+		context.Background(),
+		1,
+		RuntimeControlPatch{
+			GlobalReadOnly: &enabled,
+			EmergencyStop:  &enabled,
+		},
+		models.HumanActor(7),
+	); err != nil {
 		t.Fatal(err)
 	}
-	first.SetReadOnly(true)
-	if err := first.persistOnDB(context.Background(), db, agentEmergencyConfigKey, true, 0); err != nil {
-		t.Fatal(err)
-	}
-	first.SetEmergencyStop(true)
 
 	restarted := newTestRuntimeControl(t, db, nil, false)
 	if !restarted.ReadOnly() || !restarted.EmergencyStop() {
@@ -66,6 +71,300 @@ func TestRuntimeSafetyControlsSurviveRestart(t *testing.T) {
 			restarted.ReadOnly(),
 			restarted.EmergencyStop(),
 		)
+	}
+}
+
+func TestRuntimeSafetyControlsUseOneCASForIndependentSwitches(t *testing.T) {
+	dsn := fmt.Sprintf(
+		"file:%s?mode=memory&cache=shared",
+		strings.ReplaceAll(t.Name(), "/", "_"),
+	)
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	control := newTestRuntimeControl(t, db, nil, false)
+	initial, err := control.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.Version != 1 ||
+		initial.GlobalReadOnly ||
+		initial.EmergencyStop {
+		t.Fatalf("initial snapshot = %+v", initial)
+	}
+
+	enableReadOnly := true
+	readOnlySnapshot, err := control.UpdateCAS(
+		context.Background(),
+		initial.Version,
+		RuntimeControlPatch{GlobalReadOnly: &enableReadOnly},
+		models.HumanActor(17),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readOnlySnapshot.Version != 2 ||
+		!readOnlySnapshot.GlobalReadOnly ||
+		readOnlySnapshot.EmergencyStop ||
+		!control.ReadOnly() ||
+		control.EmergencyStop() {
+		t.Fatalf("read-only snapshot/runtime = %+v", readOnlySnapshot)
+	}
+
+	enableEmergency := true
+	emergencySnapshot, err := control.UpdateCAS(
+		context.Background(),
+		readOnlySnapshot.Version,
+		RuntimeControlPatch{EmergencyStop: &enableEmergency},
+		models.HumanActor(17),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if emergencySnapshot.Version != 3 ||
+		!emergencySnapshot.GlobalReadOnly ||
+		!emergencySnapshot.EmergencyStop ||
+		!control.ReadOnly() ||
+		!control.EmergencyStop() {
+		t.Fatalf("emergency snapshot/runtime = %+v", emergencySnapshot)
+	}
+
+	var rows []models.SystemConfig
+	if err := db.Where(
+		"key IN ?",
+		[]string{agentReadOnlyConfigKey, agentEmergencyConfigKey},
+	).Order("key ASC").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("protected control rows = %d, want 2", len(rows))
+	}
+	for _, row := range rows {
+		if row.Version != 3 || row.UpdatedBy == nil || *row.UpdatedBy != 17 {
+			t.Fatalf("protected row metadata = %+v", row)
+		}
+	}
+
+	disableEmergency := false
+	_, err = control.UpdateCAS(
+		context.Background(),
+		initial.Version,
+		RuntimeControlPatch{EmergencyStop: &disableEmergency},
+		models.HumanActor(17),
+	)
+	var conflict *RuntimeControlVersionConflict
+	if !errors.As(err, &conflict) ||
+		conflict.Expected != 1 ||
+		conflict.Current != 3 {
+		t.Fatalf("stale CAS error = %#v, want current version 3", err)
+	}
+	unchanged, err := control.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged != emergencySnapshot {
+		t.Fatalf(
+			"stale CAS changed snapshot: got %+v want %+v",
+			unchanged,
+			emergencySnapshot,
+		)
+	}
+}
+
+func TestRuntimeSafetyControlCASRejectsMissingPatchAndNonHumanActor(
+	t *testing.T,
+) {
+	db, err := gorm.Open(
+		sqlite.Open("file:runtime_control_validation?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	control := newTestRuntimeControl(t, db, nil, false)
+	if _, err := control.UpdateCAS(
+		context.Background(),
+		1,
+		RuntimeControlPatch{},
+		models.HumanActor(7),
+	); !errors.Is(err, ErrRuntimeControlPatchRequired) {
+		t.Fatalf("empty patch error = %v", err)
+	}
+	enabled := true
+	if _, err := control.UpdateCAS(
+		context.Background(),
+		1,
+		RuntimeControlPatch{EmergencyStop: &enabled},
+		models.ServicePrincipalActor("agent-7"),
+	); !errors.Is(err, ErrRuntimeControlHumanActorRequired) {
+		t.Fatalf("service-principal actor error = %v", err)
+	}
+}
+
+func TestRuntimeSafetyControlCASAllowsOnlyOneConcurrentWriter(t *testing.T) {
+	db, err := gorm.Open(
+		sqlite.Open("file:runtime_control_concurrent_cas?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Serialize SQLite transactions so this unit test exercises the same
+	// compare-after-commit outcome as PostgreSQL row locks without accepting a
+	// SQLite-specific "database locked" branch.
+	sqlDB.SetMaxOpenConns(1)
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	control := newTestRuntimeControl(t, db, nil, false)
+	enabled := true
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, patch := range []RuntimeControlPatch{
+		{GlobalReadOnly: &enabled},
+		{EmergencyStop: &enabled},
+	} {
+		patch := patch
+		go func() {
+			<-start
+			_, updateErr := control.UpdateCAS(
+				context.Background(),
+				1,
+				patch,
+				models.HumanActor(23),
+			)
+			results <- updateErr
+		}()
+	}
+	close(start)
+
+	successes := 0
+	conflicts := 0
+	for range 2 {
+		updateErr := <-results
+		if updateErr == nil {
+			successes++
+			continue
+		}
+		var conflict *RuntimeControlVersionConflict
+		if errors.As(updateErr, &conflict) && conflict.Current == 2 {
+			conflicts++
+			continue
+		}
+		t.Fatalf("concurrent CAS error = %v", updateErr)
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf(
+			"concurrent CAS successes=%d conflicts=%d",
+			successes,
+			conflicts,
+		)
+	}
+	snapshot, err := control.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Version != 2 {
+		t.Fatalf("concurrent CAS snapshot = %+v", snapshot)
+	}
+}
+
+func TestRuntimeSafetyControlSerializesRefreshBeforeCommittedCAS(t *testing.T) {
+	dsn := fmt.Sprintf(
+		"file:%s_%d?mode=memory&cache=shared",
+		strings.ReplaceAll(t.Name(), "/", "_"),
+		time.Now().UnixNano(),
+	)
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	control := newTestRuntimeControl(t, db, nil, false)
+
+	refreshRead := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var pauseFirstRuntimeQuery sync.Once
+	if err := db.Callback().Query().
+		After("gorm:query").
+		Register(
+			"chronodesk:test:pause_runtime_refresh",
+			func(tx *gorm.DB) {
+				if tx.Statement == nil ||
+					tx.Statement.Table != "system_configs" {
+					return
+				}
+				pauseFirstRuntimeQuery.Do(func() {
+					close(refreshRead)
+					<-releaseRefresh
+				})
+			},
+		); err != nil {
+		t.Fatal(err)
+	}
+
+	refreshDone := make(chan error, 1)
+	go func() {
+		refreshDone <- control.Refresh(context.Background())
+	}()
+	<-refreshRead
+
+	updateStarted := make(chan struct{})
+	updateDone := make(chan error, 1)
+	enabled := true
+	go func() {
+		close(updateStarted)
+		_, updateErr := control.UpdateCAS(
+			context.Background(),
+			1,
+			RuntimeControlPatch{EmergencyStop: &enabled},
+			models.HumanActor(29),
+		)
+		updateDone <- updateErr
+	}()
+	<-updateStarted
+	select {
+	case updateErr := <-updateDone:
+		t.Fatalf(
+			"CAS bypassed in-flight refresh serialization: %v",
+			updateErr,
+		)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseRefresh)
+	if err := <-refreshDone; err != nil {
+		t.Fatalf("paused refresh failed: %v", err)
+	}
+	if err := <-updateDone; err != nil {
+		t.Fatalf("serialized CAS failed: %v", err)
+	}
+	if !control.EmergencyStop() || !control.Healthy() {
+		t.Fatalf(
+			"stale refresh overwrote committed safety state: healthy=%v emergency=%v",
+			control.Healthy(),
+			control.EmergencyStop(),
+		)
+	}
+	snapshot, err := control.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Version != 2 || !snapshot.EmergencyStop {
+		t.Fatalf("final serialized snapshot = %+v", snapshot)
 	}
 }
 
@@ -136,6 +435,15 @@ func TestRuntimeSafetyControlRefreshFailureStopsWritesUntilRecovery(t *testing.T
 	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
 		t.Fatal(err)
 	}
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		return control.ensureRuntimeControlRowsTx(
+			context.Background(),
+			tx,
+			0,
+		)
+	}); err != nil {
+		t.Fatalf("restore persisted safety controls: %v", err)
+	}
 	if err := control.Refresh(context.Background()); err != nil {
 		t.Fatalf("refresh after persistence recovery: %v", err)
 	}
@@ -146,6 +454,88 @@ func TestRuntimeSafetyControlRefreshFailureStopsWritesUntilRecovery(t *testing.T
 			control.EmergencyStop(),
 			control.ReadOnly(),
 		)
+	}
+}
+
+func TestRuntimeSafetyControlCorruptionAlwaysFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		corrupt func(*gorm.DB) error
+	}{
+		{
+			name: "missing emergency row",
+			corrupt: func(db *gorm.DB) error {
+				return db.Delete(
+					&models.SystemConfig{},
+					"key = ?",
+					agentEmergencyConfigKey,
+				).Error
+			},
+		},
+		{
+			name: "inactive emergency row",
+			corrupt: func(db *gorm.DB) error {
+				return db.Model(&models.SystemConfig{}).
+					Where("key = ?", agentEmergencyConfigKey).
+					Update("is_active", false).Error
+			},
+		},
+		{
+			name: "invalid emergency boolean",
+			corrupt: func(db *gorm.DB) error {
+				return db.Model(&models.SystemConfig{}).
+					Where("key = ?", agentEmergencyConfigKey).
+					Update("value", "TRUE").Error
+			},
+		},
+		{
+			name: "invalid value type",
+			corrupt: func(db *gorm.DB) error {
+				return db.Model(&models.SystemConfig{}).
+					Where("key = ?", agentEmergencyConfigKey).
+					Update("value_type", "string").Error
+			},
+		},
+		{
+			name: "inconsistent versions",
+			corrupt: func(db *gorm.DB) error {
+				return db.Model(&models.SystemConfig{}).
+					Where("key = ?", agentReadOnlyConfigKey).
+					Update("version", 2).Error
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dsn := fmt.Sprintf(
+				"file:%s_%d?mode=memory&cache=shared",
+				strings.ReplaceAll(t.Name(), "/", "_"),
+				time.Now().UnixNano(),
+			)
+			db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			control := newTestRuntimeControl(t, db, nil, false)
+			if err := test.corrupt(db); err != nil {
+				t.Fatal(err)
+			}
+			if err := control.Refresh(context.Background()); err == nil {
+				t.Fatal("corrupt persisted controls unexpectedly refreshed")
+			}
+			if control.Healthy() || !control.EmergencyStop() {
+				t.Fatalf(
+					"corruption did not fail closed: healthy=%v emergency=%v",
+					control.Healthy(),
+					control.EmergencyStop(),
+				)
+			}
+			if _, err := control.Snapshot(context.Background()); err == nil {
+				t.Fatal("corrupt persisted controls unexpectedly returned a snapshot")
+			}
+		})
 	}
 }
 
@@ -2057,14 +2447,30 @@ func TestAdminMutationsRollbackWhenEventOutboxAppendFails(t *testing.T) {
 	if control.ReadOnly() || control.EmergencyStop() {
 		t.Fatalf("runtime memory changed before rollback: read_only=%v emergency=%v", control.ReadOnly(), control.EmergencyStop())
 	}
-	var controlRows int64
-	if err := db.Model(&models.SystemConfig{}).
+	var controlRows []models.SystemConfig
+	if err := db.
 		Where("key IN ?", []string{agentReadOnlyConfigKey, agentEmergencyConfigKey}).
-		Count(&controlRows).Error; err != nil {
+		Order("key ASC").
+		Find(&controlRows).Error; err != nil {
 		t.Fatal(err)
 	}
-	if controlRows != 0 {
-		t.Fatalf("runtime control DB rows survived rollback: %d", controlRows)
+	if len(controlRows) != 2 {
+		t.Fatalf(
+			"runtime control bootstrap rows = %d, want 2",
+			len(controlRows),
+		)
+	}
+	for _, row := range controlRows {
+		if row.Value != "false" ||
+			row.ValueType != "bool" ||
+			!row.IsActive ||
+			row.Version != 1 ||
+			row.UpdatedBy != nil {
+			t.Fatalf(
+				"administrator rollback changed safety baseline: %+v",
+				row,
+			)
+		}
 	}
 
 	ticket := models.Ticket{

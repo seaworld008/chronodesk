@@ -86,17 +86,21 @@ func TestValidateProductionRequiresStrongIndependentSecrets(t *testing.T) {
 		},
 		Security: SecurityConfig{BcryptCost: 12},
 		Agent: AgentConfig{
-			Issuer:             "https://desk.internal.example",
-			MCPResourceURL:     "https://desk.internal.example/mcp",
-			APIResourceURL:     "https://desk.internal.example/api/v2",
-			A2AResourceURL:     "https://desk.internal.example/a2a/v1",
-			JWTSecret:          "agent-access-0123456789-abcdef-XYZ",
-			CredentialPepper:   "agent-pepper-0123456789-abcdef-XYZ",
-			TokenTTL:           15 * time.Minute,
-			CredentialTTL:      24 * time.Hour,
-			MaxAttachmentBytes: 1,
-			LoopThreshold:      1,
-			LoopWindow:         time.Minute,
+			Issuer:                        "https://desk.internal.example",
+			MCPResourceURL:                "https://desk.internal.example/mcp",
+			APIResourceURL:                "https://desk.internal.example/api/v2",
+			A2AResourceURL:                "https://desk.internal.example/a2a/v1",
+			JWTSecret:                     "agent-access-0123456789-abcdef-XYZ",
+			CredentialPepper:              "agent-pepper-0123456789-abcdef-XYZ",
+			TokenTTL:                      15 * time.Minute,
+			CredentialTTL:                 24 * time.Hour,
+			AttachmentStorageBackend:      "local",
+			AttachmentDir:                 "/srv/chronodesk/attachments",
+			AttachmentStagingDir:          "/srv/chronodesk/attachment-staging",
+			AttachmentLocalDeploymentMode: "single",
+			MaxAttachmentBytes:            1,
+			LoopThreshold:                 1,
+			LoopWindow:                    time.Minute,
 		},
 		Database: DatabaseConfig{
 			RuntimeURL: testRuntimeDatabaseURL,
@@ -111,6 +115,15 @@ func TestValidateProductionRequiresStrongIndependentSecrets(t *testing.T) {
 			AnonymousIdentityRequests: 20,
 			AnonymousIPRequests:       200,
 			AnonymousWindow:           time.Minute,
+		},
+		AuditExport: AuditExportConfig{
+			StorageBackend:      "local",
+			StorageDir:          "/srv/chronodesk/audit-exports",
+			LocalDeploymentMode: "single",
+			ReplicaCount:        1,
+			WorkerID:            "audit-export-test-worker",
+			PollInterval:        5 * time.Second,
+			CleanupInterval:     15 * time.Minute,
 		},
 	}
 	if err := valid.Validate(); err != nil {
@@ -160,6 +173,76 @@ func TestValidateProductionRequiresStrongIndependentSecrets(t *testing.T) {
 				t.Fatal("expected production secret validation to fail")
 			}
 		})
+	}
+}
+
+func TestValidateAuditExportLocalDeploymentTopology(t *testing.T) {
+	base := Config{
+		Server: ServerConfig{Environment: "development"},
+		App:    AppConfig{URL: "https://desk.internal.example"},
+		JWT: JWTConfig{
+			Secret:           "human-access-0123456789-abcdef-XYZ",
+			RefreshSecret:    "human-refresh-0123456789-abcdef-XYZ",
+			ExpiresIn:        time.Hour,
+			RefreshExpiresIn: 24 * time.Hour,
+			Issuer:           "https://desk.internal.example",
+			Audience:         "https://desk.internal.example/api",
+		},
+		Security: SecurityConfig{BcryptCost: 12},
+		Agent: AgentConfig{
+			Issuer:                        "https://desk.internal.example",
+			MCPResourceURL:                "https://desk.internal.example/mcp",
+			APIResourceURL:                "https://desk.internal.example/api/v2",
+			A2AResourceURL:                "https://desk.internal.example/a2a/v1",
+			JWTSecret:                     "agent-access-0123456789-abcdef-XYZ",
+			CredentialPepper:              "agent-pepper-0123456789-abcdef-XYZ",
+			TokenTTL:                      15 * time.Minute,
+			CredentialTTL:                 24 * time.Hour,
+			AttachmentStorageBackend:      "local",
+			AttachmentDir:                 "/srv/chronodesk/attachments",
+			AttachmentStagingDir:          "/srv/chronodesk/attachment-staging",
+			AttachmentLocalDeploymentMode: "shared-rwx",
+			MaxAttachmentBytes:            1,
+			LoopThreshold:                 1,
+			LoopWindow:                    time.Minute,
+		},
+		Database: DatabaseConfig{
+			RuntimeURL: testRuntimeDatabaseURL,
+			Host:       "localhost",
+			User:       "user",
+			Name:       "db",
+		},
+		Redis: RedisConfig{Host: "localhost"},
+		RateLimit: RateLimitConfig{
+			Requests:                  100,
+			Window:                    time.Hour,
+			AnonymousIdentityRequests: 20,
+			AnonymousIPRequests:       200,
+			AnonymousWindow:           time.Minute,
+		},
+		AuditExport: AuditExportConfig{
+			StorageBackend:      "local",
+			StorageDir:          "/srv/chronodesk/audit-exports",
+			LocalDeploymentMode: "single",
+			ReplicaCount:        2,
+			WorkerID:            "audit-export-test-worker",
+			PollInterval:        5 * time.Second,
+			CleanupInterval:     15 * time.Minute,
+		},
+	}
+	if err := base.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "shared-rwx") {
+		t.Fatalf("unsafe multi-replica local mode error = %v", err)
+	}
+	base.AuditExport.LocalDeploymentMode = "shared-rwx"
+	if err := base.Validate(); err != nil {
+		t.Fatalf("shared RWX audit export config rejected: %v", err)
+	}
+	base.Server.Environment = "production"
+	base.AuditExport.LocalDeploymentMode = ""
+	if err := base.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "single or shared-rwx") {
+		t.Fatalf("implicit production audit export mode error = %v", err)
 	}
 }
 
@@ -213,6 +296,167 @@ func TestLoadConfig_DefaultsUseCanonicalAgentResourceURLs(t *testing.T) {
 		if resource.got != cfg.App.URL+resource.path {
 			t.Errorf("default %s resource = %q, want %q", name, resource.got, cfg.App.URL+resource.path)
 		}
+	}
+}
+
+func TestLoadConfigAttachmentStorageDefaultsToLocal(t *testing.T) {
+	for _, key := range []string{
+		"AGENT_ATTACHMENT_STORAGE_BACKEND",
+		"AGENT_ATTACHMENT_DIR",
+		"AGENT_ATTACHMENT_STAGING_DIR",
+		"AGENT_ATTACHMENT_LOCAL_DEPLOYMENT_MODE",
+		"AGENT_ATTACHMENT_S3_ENDPOINT",
+		"AGENT_ATTACHMENT_S3_BUCKET",
+	} {
+		t.Setenv(key, "")
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if cfg.Agent.AttachmentStorageBackend != "local" ||
+		cfg.Agent.AttachmentLocalStoreID != "local-default" ||
+		cfg.Agent.AttachmentS3StoreID != "s3-default" ||
+		cfg.Agent.AttachmentS3VersioningMode != "auto" ||
+		cfg.Agent.AttachmentDir != "./data/agent-attachments" ||
+		cfg.Agent.AttachmentStagingDir !=
+			"./data/agent-attachment-staging" ||
+		cfg.Agent.AttachmentLocalDeploymentMode != "single" {
+		t.Fatalf(
+			"unexpected attachment defaults: %+v",
+			cfg.Agent,
+		)
+	}
+}
+
+func TestLoadAttachmentHistoricalS3RegistryIsStrictBoundedAndUnique(
+	t *testing.T,
+) {
+	t.Setenv(
+		"AGENT_ATTACHMENT_S3_HISTORICAL_STORES_JSON",
+		`[{"store_id":"s3-2025","endpoint":"https://objects.example.test","region":"us-east-1","bucket":"chronodesk-old","prefix":"attachments","versioning_mode":"required"}]`,
+	)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if len(cfg.Agent.AttachmentS3HistoricalStores) != 1 ||
+		cfg.Agent.AttachmentS3HistoricalStores[0].StoreID !=
+			"s3-2025" ||
+		cfg.Agent.AttachmentS3HistoricalStores[0].VersioningMode !=
+			"required" {
+		t.Fatalf(
+			"unexpected historical stores: %+v",
+			cfg.Agent.AttachmentS3HistoricalStores,
+		)
+	}
+
+	t.Setenv(
+		"AGENT_ATTACHMENT_S3_HISTORICAL_STORES_JSON",
+		`[{"store_id":"s3-2025","endpoint":"https://objects.example.test","region":"us-east-1","bucket":"chronodesk-old","prefix":"attachments","unexpected":true}]`,
+	)
+	if _, err := Load(); err == nil ||
+		!strings.Contains(err.Error(), "strict JSON array") {
+		t.Fatalf("unknown historical field error = %v", err)
+	}
+}
+
+func TestValidateAttachmentStoreIDsRejectGenerationCollision(
+	t *testing.T,
+) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Agent.AttachmentS3HistoricalStores = []AttachmentS3StoreConfig{{
+		StoreID:              "s3-default",
+		Endpoint:             "https://objects.example.test",
+		Region:               "us-east-1",
+		Bucket:               "chronodesk-old",
+		Prefix:               "attachments",
+		ServerSideEncryption: "bucket-default",
+		VersioningMode:       "auto",
+	}}
+	if err := cfg.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "duplicated") {
+		t.Fatalf("duplicate store_id error = %v", err)
+	}
+}
+
+func TestValidateAttachmentS3Configuration(t *testing.T) {
+	base, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	base.Agent.AttachmentStorageBackend = "s3"
+	base.Agent.AttachmentS3Endpoint = "http://minio:9000"
+	base.Agent.AttachmentS3AllowInsecure = true
+	base.Agent.AttachmentS3Region = "us-east-1"
+	base.Agent.AttachmentS3Bucket = "chronodesk-private"
+	base.Agent.AttachmentS3Prefix = "tenant/attachments"
+	base.Agent.AttachmentS3UsePathStyle = true
+	base.Agent.AttachmentS3AccessKeyID = "minio-access"
+	base.Agent.AttachmentS3SecretAccessKey = "minio-secret"
+	base.Agent.AttachmentS3SSE = "bucket-default"
+	if err := base.Validate(); err != nil {
+		t.Fatalf("valid MinIO-compatible config rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		match  string
+	}{
+		{
+			name: "plaintext endpoint needs explicit development opt in",
+			mutate: func(cfg *Config) {
+				cfg.Agent.AttachmentS3AllowInsecure = false
+			},
+			match: "ALLOW_INSECURE",
+		},
+		{
+			name: "credential pair is atomic",
+			mutate: func(cfg *Config) {
+				cfg.Agent.AttachmentS3SecretAccessKey = ""
+			},
+			match: "configured together",
+		},
+		{
+			name: "object prefix cannot traverse",
+			mutate: func(cfg *Config) {
+				cfg.Agent.AttachmentS3Prefix = "tenant/../private"
+			},
+			match: "safe relative path",
+		},
+		{
+			name: "kms key needs kms mode",
+			mutate: func(cfg *Config) {
+				cfg.Agent.AttachmentS3KMSKeyID = "alias/desk"
+			},
+			match: "requires aws:kms",
+		},
+		{
+			name: "multi replica staging needs shared storage",
+			mutate: func(cfg *Config) {
+				cfg.AuditExport.ReplicaCount = 2
+				cfg.Agent.AttachmentLocalDeploymentMode = "single"
+			},
+			match: "shared-rwx",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := *base
+			test.mutate(&cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.match) {
+				t.Fatalf(
+					"Validate() error = %v, want %q",
+					err,
+					test.match,
+				)
+			}
+		})
 	}
 }
 
@@ -301,6 +545,8 @@ func TestProductionMetricsRequireStrongBearerToken(t *testing.T) {
 		"agent-pepper-0123456789-abcdef-XYZ",
 	)
 	t.Setenv("METRICS_ENABLED", "false")
+	t.Setenv("AUDIT_EXPORT_LOCAL_DEPLOYMENT_MODE", "single")
+	t.Setenv("AGENT_ATTACHMENT_LOCAL_DEPLOYMENT_MODE", "single")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -512,15 +758,19 @@ func TestValidate_AgentEndpointContract(t *testing.T) {
 		},
 		Security: SecurityConfig{BcryptCost: 12},
 		Agent: AgentConfig{
-			Issuer:             "https://desk.internal.example",
-			MCPResourceURL:     "https://desk.internal.example/mcp",
-			APIResourceURL:     "https://desk.internal.example/api/v2",
-			A2AResourceURL:     "https://desk.internal.example/a2a/v1",
-			TokenTTL:           15 * time.Minute,
-			CredentialTTL:      24 * time.Hour,
-			MaxAttachmentBytes: 1,
-			LoopThreshold:      1,
-			LoopWindow:         time.Minute,
+			Issuer:                        "https://desk.internal.example",
+			MCPResourceURL:                "https://desk.internal.example/mcp",
+			APIResourceURL:                "https://desk.internal.example/api/v2",
+			A2AResourceURL:                "https://desk.internal.example/a2a/v1",
+			TokenTTL:                      15 * time.Minute,
+			CredentialTTL:                 24 * time.Hour,
+			AttachmentStorageBackend:      "local",
+			AttachmentDir:                 "/srv/chronodesk/attachments",
+			AttachmentStagingDir:          "/srv/chronodesk/attachment-staging",
+			AttachmentLocalDeploymentMode: "single",
+			MaxAttachmentBytes:            1,
+			LoopThreshold:                 1,
+			LoopWindow:                    time.Minute,
 		},
 		Database: DatabaseConfig{
 			RuntimeURL: testRuntimeDatabaseURL,

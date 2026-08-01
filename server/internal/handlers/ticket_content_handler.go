@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
+	"math"
+	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -537,30 +539,50 @@ func parseStrictPagePagination(
 	defaultPageSize int,
 	maxPageSize int,
 ) (int, int, bool) {
-	page := 1
-	pageSize := defaultPageSize
-	for name, destination := range map[string]*int{
-		"page":      &page,
-		"page_size": &pageSize,
-	} {
-		raw := strings.TrimSpace(c.Query(name))
-		if raw == "" {
-			continue
-		}
-		value, err := strconv.Atoi(raw)
-		if err != nil || value < 1 ||
-			(name == "page" && value > 1_000_000) ||
-			(name == "page_size" && value > maxPageSize) {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"success": false,
-				"code":    "invalid_pagination",
-				"message": "分页参数无效，page 必须为正整数，page_size 必须在 1 到 100 之间",
-			})
+	values, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil || defaultPageSize < 1 || defaultPageSize > maxPageSize {
+		writeInvalidPagePagination(c)
+		return 0, 0, false
+	}
+	for key, entries := range values {
+		if (key != "page" && key != "page_size") ||
+			len(entries) != 1 ||
+			strings.TrimSpace(entries[0]) == "" ||
+			strings.TrimSpace(entries[0]) != entries[0] ||
+			containsDirectoryQueryControl(entries[0]) {
+			writeInvalidPagePagination(c)
 			return 0, 0, false
 		}
-		*destination = value
+	}
+	page, err := parseDirectoryPositiveInt(
+		values,
+		"page",
+		1,
+		math.MaxInt/defaultPageSize,
+	)
+	if err != nil {
+		writeInvalidPagePagination(c)
+		return 0, 0, false
+	}
+	pageSize, err := parseDirectoryPositiveInt(
+		values,
+		"page_size",
+		defaultPageSize,
+		maxPageSize,
+	)
+	if err != nil || page > math.MaxInt/pageSize {
+		writeInvalidPagePagination(c)
+		return 0, 0, false
 	}
 	return page, pageSize, true
+}
+
+func writeInvalidPagePagination(c *gin.Context) {
+	c.JSON(http.StatusBadRequest, gin.H{
+		"success": false,
+		"code":    "invalid_pagination",
+		"message": "分页参数无效，page 必须为正整数，page_size 必须在 1 到 100 之间",
+	})
 }
 
 func writePageEnvelope(c *gin.Context, data any, total int64, page, pageSize int) {
@@ -735,8 +757,29 @@ func (h *TicketContentHandler) DownloadAttachment(c *gin.Context) {
 		return
 	}
 	defer reader.Close()
-	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, attachment.OriginalName))
+	setHumanAttachmentDownloadHeaders(c, attachment.OriginalName)
 	c.DataFromReader(http.StatusOK, attachment.FileSize, attachment.MimeType, reader, nil)
+}
+
+func setHumanAttachmentDownloadHeaders(
+	c *gin.Context,
+	originalName string,
+) {
+	disposition := mime.FormatMediaType(
+		"attachment",
+		map[string]string{"filename": originalName},
+	)
+	if disposition == "" {
+		disposition = "attachment"
+	}
+	c.Header("Cache-Control", "private, no-store")
+	c.Header("Pragma", "no-cache")
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.Header(
+		"Content-Security-Policy",
+		"default-src 'none'; sandbox",
+	)
+	c.Header("Content-Disposition", disposition)
 }
 
 func (h *TicketContentHandler) authorizedTicket(

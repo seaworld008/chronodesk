@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -40,10 +41,59 @@ const (
 	adminMaximumRequestBytes   = 1 << 20
 )
 
+var (
+	ErrRuntimeControlPatchRequired = errors.New(
+		"at least one runtime safety control is required",
+	)
+	ErrRuntimeControlHumanActorRequired = errors.New(
+		"runtime safety controls require a human actor",
+	)
+)
+
+// RuntimeControlSnapshot is the authoritative platform-wide Agent safety
+// state. Version is shared by both switches so one strong ETag protects the
+// complete resource while each boolean can still be patched independently.
+type RuntimeControlSnapshot struct {
+	GlobalReadOnly bool      `json:"global_read_only"`
+	EmergencyStop  bool      `json:"emergency_stop"`
+	Version        uint64    `json:"version"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+// RuntimeControlPatch preserves omission separately from false. Transports
+// must reject a patch with neither field present.
+type RuntimeControlPatch struct {
+	GlobalReadOnly *bool
+	EmergencyStop  *bool
+}
+
+// RuntimeControlVersionConflict carries the current durable version so the
+// HTTP adapter can return a fresh ETag without disclosing persistence details.
+type RuntimeControlVersionConflict struct {
+	Expected uint64
+	Current  uint64
+}
+
+func (e *RuntimeControlVersionConflict) Error() string {
+	return fmt.Sprintf(
+		"runtime safety control version conflict: expected %d, current %d",
+		e.Expected,
+		e.Current,
+	)
+}
+
+func (e *RuntimeControlVersionConflict) CurrentVersion() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.Current
+}
+
 type RuntimeControl struct {
 	native           *services.AgentNativeService
 	db               *gorm.DB
 	fallbackReadOnly bool
+	mu               sync.Mutex
 	readOnly         atomic.Bool
 	emergency        atomic.Bool
 	healthy          atomic.Bool
@@ -69,14 +119,22 @@ func NewRuntimeControl(
 		db:               db,
 		fallbackReadOnly: readOnly,
 	}
-	control.SetReadOnly(readOnly)
+	control.setReadOnly(readOnly)
+	if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return control.ensureRuntimeControlRowsTx(ctx, tx, 0)
+	}); err != nil {
+		return nil, fmt.Errorf(
+			"bootstrap persisted Agent safety controls: %w",
+			err,
+		)
+	}
 	if err := control.Refresh(ctx); err != nil {
 		return nil, fmt.Errorf("load persisted Agent safety controls: %w", err)
 	}
 	return control, nil
 }
 
-func (c *RuntimeControl) SetReadOnly(enabled bool) {
+func (c *RuntimeControl) setReadOnly(enabled bool) {
 	c.readOnly.Store(enabled)
 	if c.native != nil {
 		c.native.SetGlobalReadOnly(enabled)
@@ -87,7 +145,7 @@ func (c *RuntimeControl) ReadOnly() bool {
 	return c != nil && c.readOnly.Load()
 }
 
-func (c *RuntimeControl) SetEmergencyStop(enabled bool) {
+func (c *RuntimeControl) setEmergencyStop(enabled bool) {
 	c.emergency.Store(enabled)
 	if c.native != nil {
 		c.native.SetGlobalEmergencyStop(enabled)
@@ -102,80 +160,373 @@ func (c *RuntimeControl) Healthy() bool {
 	return c != nil && c.healthy.Load()
 }
 
-func (c *RuntimeControl) persistTx(
+// Snapshot reads the durable platform resource. It never serves atomics as an
+// authoritative management response because another process may have already
+// committed a newer value that the refresh loop has not observed yet.
+func (c *RuntimeControl) Snapshot(
 	ctx context.Context,
-	tx *gorm.DB,
-	key string,
-	enabled bool,
-	updatedBy uint,
-) error {
-	return c.persistOnDB(ctx, tx, key, enabled, updatedBy)
+) (RuntimeControlSnapshot, error) {
+	if c == nil || c.db == nil {
+		return RuntimeControlSnapshot{},
+			errors.New("runtime control persistence is unavailable")
+	}
+	if ctx == nil {
+		return RuntimeControlSnapshot{},
+			errors.New("runtime control context is required")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var rows []models.SystemConfig
+	if err := c.db.WithContext(ctx).
+		Where(
+			"key IN ? AND is_active = ?",
+			[]string{agentReadOnlyConfigKey, agentEmergencyConfigKey},
+			true,
+		).
+		Find(&rows).Error; err != nil {
+		c.failClosed()
+		return RuntimeControlSnapshot{}, err
+	}
+	snapshot, err := c.snapshotFromRows(rows)
+	if err != nil {
+		c.failClosed()
+		return RuntimeControlSnapshot{}, err
+	}
+	return snapshot, nil
 }
 
-func (c *RuntimeControl) persistOnDB(
+// ReadPlatformControls exposes a cycle-free primitive contract to the Human
+// HTTP adapter while Snapshot remains the typed in-package API.
+func (c *RuntimeControl) ReadPlatformControls(
 	ctx context.Context,
-	db *gorm.DB,
-	key string,
-	enabled bool,
+) (bool, bool, uint64, time.Time, error) {
+	snapshot, err := c.Snapshot(ctx)
+	return snapshot.GlobalReadOnly,
+		snapshot.EmergencyStop,
+		snapshot.Version,
+		snapshot.UpdatedAt,
+		err
+}
+
+// UpdateCAS performs one platform-wide compare-and-swap. The emergency-stop
+// row is the aggregate version anchor and both protected rows are advanced to
+// the same version in one transaction. No generic SystemConfig path can write
+// either row.
+func (c *RuntimeControl) UpdateCAS(
+	ctx context.Context,
+	expectedVersion uint64,
+	patch RuntimeControlPatch,
+	actor models.ActorRef,
+) (RuntimeControlSnapshot, error) {
+	if c == nil || c.db == nil {
+		return RuntimeControlSnapshot{},
+			errors.New("runtime control persistence is unavailable")
+	}
+	if ctx == nil {
+		return RuntimeControlSnapshot{},
+			errors.New("runtime control context is required")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if expectedVersion == 0 {
+		return RuntimeControlSnapshot{},
+			&RuntimeControlVersionConflict{Expected: 0, Current: 1}
+	}
+	if patch.GlobalReadOnly == nil && patch.EmergencyStop == nil {
+		return RuntimeControlSnapshot{}, ErrRuntimeControlPatchRequired
+	}
+	if err := actor.Validate(); err != nil ||
+		actor.Type != models.ActorTypeHuman {
+		return RuntimeControlSnapshot{},
+			ErrRuntimeControlHumanActorRequired
+	}
+	actorID, err := strconv.ParseUint(actor.ID, 10, 64)
+	if err != nil || actorID == 0 || actorID > uint64(^uint(0)) {
+		return RuntimeControlSnapshot{},
+			ErrRuntimeControlHumanActorRequired
+	}
+	updatedBy := uint(actorID)
+
+	var snapshot RuntimeControlSnapshot
+	err = c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var emergencyRow models.SystemConfig
+		if err := tx.WithContext(ctx).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("key = ?", agentEmergencyConfigKey).
+			First(&emergencyRow).Error; err != nil {
+			return err
+		}
+		var readOnlyRow models.SystemConfig
+		if err := tx.WithContext(ctx).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("key = ?", agentReadOnlyConfigKey).
+			First(&readOnlyRow).Error; err != nil {
+			return err
+		}
+		current, err := c.snapshotFromRows(
+			[]models.SystemConfig{readOnlyRow, emergencyRow},
+		)
+		if err != nil {
+			return err
+		}
+		currentVersion := current.Version
+		if currentVersion != expectedVersion {
+			return &RuntimeControlVersionConflict{
+				Expected: expectedVersion,
+				Current:  currentVersion,
+			}
+		}
+
+		nextReadOnly := current.GlobalReadOnly
+		if patch.GlobalReadOnly != nil {
+			nextReadOnly = *patch.GlobalReadOnly
+		}
+		nextEmergency := current.EmergencyStop
+		if patch.EmergencyStop != nil {
+			nextEmergency = *patch.EmergencyStop
+		}
+		nextVersion := currentVersion + 1
+		now := time.Now().UTC()
+		anchor := tx.WithContext(ctx).
+			Model(&models.SystemConfig{}).
+			Where(
+				"id = ? AND version = ?",
+				emergencyRow.ID,
+				emergencyRow.Version,
+			).
+			Updates(map[string]any{
+				"value":      strconv.FormatBool(nextEmergency),
+				"value_type": "bool",
+				"is_active":  true,
+				"updated_by": updatedBy,
+				"version":    nextVersion,
+				"updated_at": now,
+			})
+		if anchor.Error != nil {
+			return anchor.Error
+		}
+		if anchor.RowsAffected != 1 {
+			var current models.SystemConfig
+			if err := tx.WithContext(ctx).
+				Where("key = ?", agentEmergencyConfigKey).
+				First(&current).Error; err != nil {
+				return err
+			}
+			return &RuntimeControlVersionConflict{
+				Expected: expectedVersion,
+				Current:  positiveRuntimeControlVersion(current.Version),
+			}
+		}
+		readOnlyUpdate := tx.WithContext(ctx).
+			Model(&models.SystemConfig{}).
+			Where("id = ?", readOnlyRow.ID).
+			Updates(map[string]any{
+				"value":      strconv.FormatBool(nextReadOnly),
+				"value_type": "bool",
+				"is_active":  true,
+				"updated_by": updatedBy,
+				"version":    nextVersion,
+				"updated_at": now,
+			})
+		if readOnlyUpdate.Error != nil {
+			return readOnlyUpdate.Error
+		}
+		if readOnlyUpdate.RowsAffected != 1 {
+			return errors.New("runtime read-only control was not updated")
+		}
+		snapshot = RuntimeControlSnapshot{
+			GlobalReadOnly: nextReadOnly,
+			EmergencyStop:  nextEmergency,
+			Version:        nextVersion,
+			UpdatedAt:      now,
+		}
+		return nil
+	})
+	if err != nil {
+		var conflict *RuntimeControlVersionConflict
+		if !errors.As(err, &conflict) &&
+			!errors.Is(err, ErrRuntimeControlPatchRequired) &&
+			!errors.Is(err, ErrRuntimeControlHumanActorRequired) {
+			c.failClosed()
+		}
+		return RuntimeControlSnapshot{}, err
+	}
+	c.setReadOnly(snapshot.GlobalReadOnly)
+	c.setEmergencyStop(snapshot.EmergencyStop)
+	c.healthy.Store(true)
+	return snapshot, nil
+}
+
+// CompareAndSwapPlatformControls exposes the dedicated platform adapter
+// contract without coupling the handlers package back to agentplatform types.
+func (c *RuntimeControl) CompareAndSwapPlatformControls(
+	ctx context.Context,
+	expectedVersion uint64,
+	globalReadOnly *bool,
+	emergencyStop *bool,
+	actor models.ActorRef,
+) (bool, bool, uint64, time.Time, error) {
+	snapshot, err := c.UpdateCAS(
+		ctx,
+		expectedVersion,
+		RuntimeControlPatch{
+			GlobalReadOnly: globalReadOnly,
+			EmergencyStop:  emergencyStop,
+		},
+		actor,
+	)
+	return snapshot.GlobalReadOnly,
+		snapshot.EmergencyStop,
+		snapshot.Version,
+		snapshot.UpdatedAt,
+		err
+}
+
+func (c *RuntimeControl) ensureRuntimeControlRowsTx(
+	ctx context.Context,
+	tx *gorm.DB,
 	updatedBy uint,
 ) error {
-	if c == nil || db == nil {
-		return nil
-	}
-	value := strconv.FormatBool(enabled)
 	var userID *uint
 	if updatedBy > 0 {
 		userID = &updatedBy
 	}
-	row := models.SystemConfig{
-		Key: key, Value: value, ValueType: "bool",
-		Description: "Agent-native runtime safety control",
-		Category:    "security", Group: "agent", IsActive: true,
-		DefaultValue: "false", UpdatedBy: userID, Version: 1,
+	rows := []models.SystemConfig{
+		{
+			Key: agentReadOnlyConfigKey, Value: strconv.FormatBool(c.fallbackReadOnly),
+			ValueType: "bool", Description: "Agent-native runtime safety control",
+			Category: "security", Group: "agent", IsActive: true,
+			DefaultValue: strconv.FormatBool(c.fallbackReadOnly),
+			UpdatedBy:    userID, Version: 1,
+		},
+		{
+			Key: agentEmergencyConfigKey, Value: "false",
+			ValueType: "bool", Description: "Agent-native runtime safety control",
+			Category: "security", Group: "agent", IsActive: true,
+			DefaultValue: "false", UpdatedBy: userID, Version: 1,
+		},
 	}
-	return db.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "key"}},
-		DoUpdates: clause.Assignments(map[string]any{
-			"value":       value,
-			"value_type":  "bool",
-			"is_active":   true,
-			"updated_by":  userID,
-			"version":     gorm.Expr("system_configs.version + 1"),
-			"updated_at":  time.Now().UTC(),
-			"description": row.Description,
-			"category":    row.Category,
-			"group":       row.Group,
-		}),
-	}).Create(&row).Error
+	for i := range rows {
+		if err := tx.WithContext(ctx).
+			Clauses(clause.OnConflict{DoNothing: true}).
+			Create(&rows[i]).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *RuntimeControl) snapshotFromRows(
+	rows []models.SystemConfig,
+) (RuntimeControlSnapshot, error) {
+	if len(rows) != 2 {
+		return RuntimeControlSnapshot{},
+			errors.New("runtime safety controls are incomplete")
+	}
+	snapshot := RuntimeControlSnapshot{}
+	seenReadOnly := false
+	seenEmergency := false
+	var readOnlyVersion uint64
+	var emergencyVersion uint64
+	for i := range rows {
+		row := rows[i]
+		if !row.IsActive || row.ValueType != "bool" {
+			return RuntimeControlSnapshot{},
+				errors.New("runtime safety control metadata is invalid")
+		}
+		if row.Version < 1 {
+			return RuntimeControlSnapshot{},
+				errors.New("runtime safety control version is invalid")
+		}
+		enabled, err := parseRuntimeControlBool(row.Value)
+		if err != nil {
+			return RuntimeControlSnapshot{}, err
+		}
+		switch row.Key {
+		case agentReadOnlyConfigKey:
+			if seenReadOnly {
+				return RuntimeControlSnapshot{},
+					errors.New("runtime read-only control is duplicated")
+			}
+			seenReadOnly = true
+			snapshot.GlobalReadOnly = enabled
+			readOnlyVersion = positiveRuntimeControlVersion(row.Version)
+			if row.UpdatedAt.After(snapshot.UpdatedAt) {
+				snapshot.UpdatedAt = row.UpdatedAt
+			}
+		case agentEmergencyConfigKey:
+			if seenEmergency {
+				return RuntimeControlSnapshot{},
+					errors.New("runtime emergency control is duplicated")
+			}
+			seenEmergency = true
+			snapshot.EmergencyStop = enabled
+			emergencyVersion = positiveRuntimeControlVersion(row.Version)
+			if row.UpdatedAt.After(snapshot.UpdatedAt) {
+				snapshot.UpdatedAt = row.UpdatedAt
+			}
+		default:
+			return RuntimeControlSnapshot{},
+				errors.New("unexpected runtime safety control key")
+		}
+	}
+	if !seenReadOnly || !seenEmergency {
+		return RuntimeControlSnapshot{},
+			errors.New("runtime safety controls are incomplete")
+	}
+	if readOnlyVersion != emergencyVersion {
+		return RuntimeControlSnapshot{},
+			errors.New("runtime safety control versions are inconsistent")
+	}
+	snapshot.Version = emergencyVersion
+	return snapshot, nil
+}
+
+func positiveRuntimeControlVersion(version int) uint64 {
+	if version < 1 {
+		return 1
+	}
+	return uint64(version)
+}
+
+func parseRuntimeControlBool(value string) (bool, error) {
+	switch value {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, errors.New("runtime safety control value is invalid")
+	}
+}
+
+func (c *RuntimeControl) failClosed() {
+	c.healthy.Store(false)
+	c.setEmergencyStop(true)
 }
 
 func (c *RuntimeControl) Refresh(ctx context.Context) error {
 	if c == nil || c.db == nil {
 		return errors.New("runtime control persistence is unavailable")
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	var rows []models.SystemConfig
 	if err := c.db.WithContext(ctx).
 		Where("key IN ? AND is_active = ?", []string{agentReadOnlyConfigKey, agentEmergencyConfigKey}, true).
 		Find(&rows).Error; err != nil {
 		// Persistence is authoritative for the emergency switch. A stale open
 		// value is unsafe, so any refresh failure immediately stops Agent writes.
-		c.healthy.Store(false)
-		c.SetEmergencyStop(true)
+		c.failClosed()
 		return err
 	}
-	nextReadOnly := c.fallbackReadOnly
-	nextEmergency := false
-	for i := range rows {
-		enabled := rows[i].GetBoolValue()
-		switch rows[i].Key {
-		case agentReadOnlyConfigKey:
-			nextReadOnly = enabled
-		case agentEmergencyConfigKey:
-			nextEmergency = enabled
-		}
+	snapshot, err := c.snapshotFromRows(rows)
+	if err != nil {
+		c.failClosed()
+		return err
 	}
-	c.SetReadOnly(nextReadOnly)
-	c.SetEmergencyStop(nextEmergency)
+	c.setReadOnly(snapshot.GlobalReadOnly)
+	c.setEmergencyStop(snapshot.EmergencyStop)
 	c.healthy.Store(true)
 	return nil
 }

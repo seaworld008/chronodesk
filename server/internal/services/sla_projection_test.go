@@ -12,6 +12,7 @@ func TestSLAProjectionUnifiesBackgroundRESTAndDashboards(t *testing.T) {
 	db := openTestDB(t)
 	if err := db.AutoMigrate(
 		&models.User{},
+		&models.Category{},
 		&models.SLAConfig{},
 		&models.Ticket{},
 		&models.TicketComment{},
@@ -193,6 +194,7 @@ func TestTicketMutationRefreshesSLAProjectionInDomainTransaction(t *testing.T) {
 	db := openTestDB(t)
 	if err := db.AutoMigrate(
 		&models.User{},
+		&models.Category{},
 		&models.SLAConfig{},
 		&models.Ticket{},
 		&models.TicketComment{},

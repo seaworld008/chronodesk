@@ -162,6 +162,46 @@ func TestLogAdminOperationUsesTrustedRouteTemplateForResourceMetadata(
 	}
 }
 
+func TestLogAdminOperationAuditsEmergencyControlActorAndResource(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	audit := &recordingAdminAuditService{}
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", uint(17))
+		c.Set("platform_role", models.PlatformRoleEmergencyOperator)
+		c.Next()
+	})
+	router.Use(LogAdminOperation(audit))
+	router.PUT("/api/platform/emergency-controls", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(
+		recorder,
+		httptest.NewRequest(
+			http.MethodPut,
+			"/api/platform/emergency-controls",
+			nil,
+		),
+	)
+	if recorder.Code != http.StatusOK || len(audit.records) != 1 {
+		t.Fatalf(
+			"status=%d records=%d",
+			recorder.Code,
+			len(audit.records),
+		)
+	}
+	record := audit.records[0]
+	if record.Actor != models.HumanActor(17) ||
+		record.PlatformRole != models.PlatformRoleEmergencyOperator ||
+		record.ActionCode != "platform.emergency_controls.update" ||
+		record.ResourceType != "emergency_controls" ||
+		record.ResourcePublicID != "global" {
+		t.Fatalf("emergency control audit metadata = %+v", record)
+	}
+}
+
 func TestLogAdminOperationAcceptsUnicodeConfigResourceKeys(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, test := range []struct {

@@ -164,8 +164,10 @@ func TestRunMigrationsRollsBackRealAuditedMembershipAndPlatformCutover(
 		t.Fatal(err)
 	}
 	if err := db.Exec(`
-		INSERT INTO admin_audit_logs (role, platform_role)
-		VALUES ('user', 'member')
+		INSERT INTO admin_audit_logs (
+			role, platform_role, actor_type, actor_id
+		)
+		VALUES ('user', 'member', 'human', 'rollback-user')
 	`).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -548,9 +550,10 @@ func TestMigratePlatformRolesRejectsUnprovenCutoverWithoutLegacyRole(
 				if err := tableOnly.AutoMigrate(&models.AdminAuditLog{}); err != nil {
 					t.Fatal(err)
 				}
+				role := models.PlatformRoleMember
 				if err := db.Create(&models.AdminAuditLog{
 					Username:     "retained-audit",
-					PlatformRole: models.PlatformRoleMember,
+					PlatformRole: &role,
 					Action:       "legacy_action",
 				}).Error; err != nil {
 					t.Fatal(err)
@@ -604,9 +607,10 @@ func TestMigratePlatformRolesRejectsUnprovenCutoverWithoutLegacyRole(
 				if err := tableOnly.AutoMigrate(&models.AdminAuditLog{}); err != nil {
 					t.Fatal(err)
 				}
+				role := models.PlatformRoleMember
 				if err := db.Create(&models.AdminAuditLog{
 					Username:     "asymmetric-audit",
-					PlatformRole: models.PlatformRoleMember,
+					PlatformRole: &role,
 					Action:       "legacy_admin_action",
 				}).Error; err != nil {
 					t.Fatal(err)

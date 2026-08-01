@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 // swagger:model AdminAuditRecord
 type AdminAuditRecord struct {
 	ID               uint
+	Actor            models.ActorRef
 	UserID           *uint
 	Username         string
 	PlatformRole     models.PlatformRole
@@ -68,9 +70,11 @@ type AdminAuditFilter struct {
 type AdminAuditListItem struct {
 	ID               uint                `json:"id"`
 	CreatedAt        time.Time           `json:"created_at"`
+	ActorType        models.ActorType    `json:"actor_type"`
+	ActorID          string              `json:"actor_id"`
 	UserID           *uint               `json:"user_id,omitempty"`
 	Username         string              `json:"username"`
-	PlatformRole     models.PlatformRole `json:"platform_role"`
+	PlatformRole     models.PlatformRole `json:"platform_role,omitempty"`
 	Action           string              `json:"action"`
 	ActionCode       string              `json:"action_code,omitempty"`
 	ResourceType     string              `json:"resource_type,omitempty"`
@@ -97,14 +101,13 @@ type AdminAuditDetail struct {
 
 type AdminAuditPage struct {
 	Items      []*AdminAuditListItem `json:"items"`
-	Total      int64                 `json:"total"`
-	Page       int                   `json:"page"`
-	Limit      int                   `json:"limit"`
-	NextCursor string                `json:"next_cursor,omitempty"`
+	NextCursor string                `json:"next_cursor"`
+	HasMore    bool                  `json:"has_more"`
 }
 
 var (
 	ErrInvalidAdminAuditCursor = errors.New("admin audit cursor is invalid")
+	ErrInvalidAdminAuditLimit  = errors.New("admin audit limit is invalid")
 	ErrAdminAuditNotFound      = errors.New("admin audit log was not found")
 	ErrAdminAuditCursorKey     = errors.New("admin audit cursor signing key is invalid")
 )
@@ -112,6 +115,25 @@ var (
 const (
 	DefaultAdminAuditLimit = 25
 	MaxAdminAuditLimit     = 100
+
+	adminAuditActorTypeMaxRunes        = 32
+	adminAuditActorIDMaxRunes          = 128
+	adminAuditUsernameMaxRunes         = 100
+	adminAuditPlatformRoleMaxRunes     = 30
+	adminAuditActionMaxRunes           = 255
+	adminAuditActionCodeMaxRunes       = 100
+	adminAuditResourceTypeMaxRunes     = 100
+	adminAuditResourcePublicIDMaxRunes = 512
+	adminAuditMethodMaxRunes           = 20
+	adminAuditPathMaxRunes             = 512
+	adminAuditResultMaxRunes           = 100
+	adminAuditQueryMaxRunes            = 2000
+	adminAuditUserAgentMaxRunes        = 512
+	adminAuditNotesMaxRunes            = 4000
+	adminAuditRequestIDMaxRunes        = 128
+	adminAuditTraceIDMaxRunes          = 128
+	adminAuditCorrelationIDMaxRunes    = 255
+	adminAuditStructuredValueMaxRunes  = 2000
 )
 
 type adminAuditCursor struct {
@@ -121,7 +143,6 @@ type adminAuditCursor struct {
 	FilterHash string `json:"filter_hash"`
 	StartTime  string `json:"start_time,omitempty"`
 	EndTime    string `json:"end_time,omitempty"`
-	Total      int64  `json:"total"`
 }
 
 // AdminAuditServiceInterface 定义服务接口
@@ -165,11 +186,17 @@ func (s *AdminAuditService) Record(ctx context.Context, record *AdminAuditRecord
 	if record == nil {
 		return errors.New("audit record cannot be nil")
 	}
+	actor, userID, platformRole, username, err :=
+		s.normalizeAdminAuditActor(ctx, record)
+	if err != nil {
+		return err
+	}
 
 	auditLog := &models.AdminAuditLog{
-		UserID:           record.UserID,
-		Username:         strings.TrimSpace(record.Username),
-		PlatformRole:     record.PlatformRole,
+		ActorType:        actor.Type,
+		ActorID:          actor.ID,
+		UserID:           userID,
+		Username:         username,
 		Action:           strings.TrimSpace(record.Action),
 		ActionCode:       strings.TrimSpace(record.ActionCode),
 		ResourceType:     strings.TrimSpace(record.ResourceType),
@@ -187,28 +214,12 @@ func (s *AdminAuditService) Record(ctx context.Context, record *AdminAuditRecord
 		TraceID:          strings.TrimSpace(record.TraceID),
 		CorrelationID:    strings.TrimSpace(record.CorrelationID),
 	}
+	if platformRole != "" {
+		auditLog.PlatformRole = &platformRole
+	}
 
 	if auditLog.Method == "" {
 		auditLog.Method = "UNKNOWN"
-	}
-
-	// 如果未提供用户名或角色，则尝试从数据库读取
-	if auditLog.UserID != nil &&
-		(auditLog.Username == "" || !auditLog.PlatformRole.IsValid()) {
-		var user models.User
-		if err := s.db.WithContext(ctx).
-			Select("id", "username", "platform_role").
-			First(&user, *auditLog.UserID).Error; err == nil {
-			if auditLog.Username == "" {
-				auditLog.Username = user.Username
-			}
-			if !auditLog.PlatformRole.IsValid() {
-				auditLog.PlatformRole = user.PlatformRole
-			}
-		}
-	}
-	if !auditLog.PlatformRole.IsValid() {
-		return errors.New("audit platform role is invalid")
 	}
 
 	if err := s.db.WithContext(ctx).Create(auditLog).Error; err != nil {
@@ -216,6 +227,83 @@ func (s *AdminAuditService) Record(ctx context.Context, record *AdminAuditRecord
 	}
 	record.ID = auditLog.ID
 	return nil
+}
+
+func (s *AdminAuditService) normalizeAdminAuditActor(
+	ctx context.Context,
+	record *AdminAuditRecord,
+) (
+	models.ActorRef,
+	*uint,
+	models.PlatformRole,
+	string,
+	error,
+) {
+	actor := record.Actor
+	if actor.Type == "" && strings.TrimSpace(actor.ID) == "" &&
+		record.UserID != nil {
+		actor = models.HumanActor(*record.UserID)
+	}
+	if err := actor.Validate(); err != nil {
+		return models.ActorRef{}, nil, "", "", fmt.Errorf(
+			"audit actor is invalid: %w",
+			err,
+		)
+	}
+	username := strings.TrimSpace(record.Username)
+	platformRole := record.PlatformRole
+	switch actor.Type {
+	case models.ActorTypeHuman:
+		parsed, err := strconv.ParseUint(actor.ID, 10, 64)
+		if err != nil || parsed == 0 || uint64(uint(parsed)) != parsed {
+			return models.ActorRef{}, nil, "", "", errors.New(
+				"human audit actor id is invalid",
+			)
+		}
+		humanID := uint(parsed)
+		if record.UserID != nil && *record.UserID != humanID {
+			return models.ActorRef{}, nil, "", "", errors.New(
+				"human audit actor does not match user id",
+			)
+		}
+		userID := &humanID
+		if username == "" || !platformRole.IsValid() {
+			var user models.User
+			if err := s.db.WithContext(ctx).
+				Select("id", "username", "platform_role").
+				First(&user, humanID).Error; err != nil {
+				return models.ActorRef{}, nil, "", "", errors.New(
+					"human audit actor could not be resolved",
+				)
+			}
+			if username == "" {
+				username = user.Username
+			}
+			if !platformRole.IsValid() {
+				platformRole = user.PlatformRole
+			}
+		}
+		if !platformRole.IsValid() {
+			return models.ActorRef{}, nil, "", "", errors.New(
+				"audit platform role is invalid",
+			)
+		}
+		return actor, userID, platformRole, username, nil
+	case models.ActorTypeSystem, models.ActorTypeServicePrincipal:
+		if record.UserID != nil || platformRole != "" {
+			return models.ActorRef{}, nil, "", "", errors.New(
+				"non-human audit actors cannot claim a human platform role",
+			)
+		}
+		if username == "" {
+			username = actor.ID
+		}
+		return actor, nil, "", username, nil
+	default:
+		return models.ActorRef{}, nil, "", "", errors.New(
+			"audit actor type is invalid",
+		)
+	}
 }
 
 // Finalize completes a durable pre-write audit anchor after the handler
@@ -325,8 +413,9 @@ func (s *AdminAuditService) List(ctx context.Context, filter *AdminAuditFilter) 
 	return logs, total, nil
 }
 
-// Explore returns either the legacy numbered page or a stable opaque-cursor
-// page. Cursor pages use the same filters and (created_at DESC, id DESC) order.
+// Explore returns a stable opaque-cursor page in
+// (created_at DESC, id DESC) order. The cursor binds the scope, filters,
+// effective time window, limit and order so it cannot be reused elsewhere.
 func (s *AdminAuditService) Explore(
 	ctx context.Context,
 	filter *AdminAuditFilter,
@@ -334,11 +423,11 @@ func (s *AdminAuditService) Explore(
 	if filter == nil {
 		filter = &AdminAuditFilter{}
 	}
-	if filter.Page == 0 {
-		filter.Page = 1
-	}
 	if filter.Limit == 0 {
 		filter.Limit = DefaultAdminAuditLimit
+	}
+	if filter.Limit < 1 || filter.Limit > MaxAdminAuditLimit {
+		return nil, ErrInvalidAdminAuditLimit
 	}
 	if len(s.cursorSigningKey) != sha256.Size {
 		return nil, ErrAdminAuditCursorKey
@@ -346,12 +435,11 @@ func (s *AdminAuditService) Explore(
 
 	var cursorTime time.Time
 	var cursorID uint
-	var total int64
 	if filter.Cursor != "" {
 		var cursorStart *time.Time
 		var cursorEnd *time.Time
 		var err error
-		cursorTime, cursorID, cursorStart, cursorEnd, total, err =
+		cursorTime, cursorID, cursorStart, cursorEnd, err =
 			s.decodeAdminAuditCursor(
 				filter.Cursor,
 				adminAuditFilterHash(filter),
@@ -366,12 +454,6 @@ func (s *AdminAuditService) Explore(
 	}
 
 	query := s.filteredQuery(ctx, filter)
-	if filter.Cursor == "" {
-		if err := query.Count(&total).Error; err != nil {
-			return nil, err
-		}
-	}
-
 	if filter.Cursor != "" {
 		query = query.Where(
 			"(created_at < ? OR (created_at = ? AND id < ?))",
@@ -379,9 +461,6 @@ func (s *AdminAuditService) Explore(
 			cursorTime,
 			cursorID,
 		)
-	}
-	if filter.Cursor == "" && filter.Page > 1 {
-		query = query.Offset((filter.Page - 1) * filter.Limit)
 	}
 
 	var logs []*models.AdminAuditLog
@@ -392,8 +471,9 @@ func (s *AdminAuditService) Explore(
 		Find(&logs).Error; err != nil {
 		return nil, err
 	}
+	hasMore := len(logs) > filter.Limit
 	nextCursor := ""
-	if len(logs) > filter.Limit {
+	if hasMore {
 		last := logs[filter.Limit-1]
 		nextCursor = s.encodeAdminAuditCursor(
 			last.CreatedAt,
@@ -401,16 +481,13 @@ func (s *AdminAuditService) Explore(
 			adminAuditFilterHash(filter),
 			filter.StartTime,
 			filter.EndTime,
-			total,
 		)
 		logs = logs[:filter.Limit]
 	}
 	return &AdminAuditPage{
 		Items:      ConvertAuditLogs(logs),
-		Total:      total,
-		Page:       filter.Page,
-		Limit:      filter.Limit,
 		NextCursor: nextCursor,
+		HasMore:    hasMore,
 	}, nil
 }
 
@@ -429,11 +506,26 @@ func (s *AdminAuditService) GetDetail(
 	return &AdminAuditDetail{
 		AdminAuditListItem: *item,
 		Query:              redactAuditQuery(log.Query),
-		UserAgent:          redactAuditText(log.UserAgent, 512),
-		Notes:              redactAuditText(log.Notes, 4000),
-		RequestID:          redactAuditIdentifier(log.RequestID),
-		TraceID:            redactAuditIdentifier(log.TraceID),
-		CorrelationID:      redactAuditIdentifier(log.CorrelationID),
+		UserAgent: redactAuditText(
+			log.UserAgent,
+			adminAuditUserAgentMaxRunes,
+		),
+		Notes: redactAuditText(
+			log.Notes,
+			adminAuditNotesMaxRunes,
+		),
+		RequestID: redactAuditIdentifier(
+			log.RequestID,
+			adminAuditRequestIDMaxRunes,
+		),
+		TraceID: redactAuditIdentifier(
+			log.TraceID,
+			adminAuditTraceIDMaxRunes,
+		),
+		CorrelationID: redactAuditIdentifier(
+			log.CorrelationID,
+			adminAuditCorrelationIDMaxRunes,
+		),
 	}, nil
 }
 
@@ -503,37 +595,80 @@ func ConvertAuditLogs(logs []*models.AdminAuditLog) []*AdminAuditListItem {
 }
 
 func convertAuditLog(log *models.AdminAuditLog) *AdminAuditListItem {
-	action := strings.TrimSpace(log.ActionCode)
-	if action == "" {
-		action = strings.TrimSpace(log.Action)
+	actorType := models.ActorType(redactAuditText(
+		string(log.ActorType),
+		adminAuditActorTypeMaxRunes,
+	))
+	actorID := redactAuditText(log.ActorID, adminAuditActorIDMaxRunes)
+	if actorType == "" && log.UserID != nil {
+		actorType = models.ActorTypeHuman
+		actorID = strconv.FormatUint(uint64(*log.UserID), 10)
 	}
-	if action == "" {
-		action = strings.TrimSpace(log.Method + " " + log.Path)
-	}
+
+	username := redactAuditText(
+		log.Username,
+		adminAuditUsernameMaxRunes,
+	)
+	actionCode := redactAuditText(
+		log.ActionCode,
+		adminAuditActionCodeMaxRunes,
+	)
+	resourceType := redactAuditText(
+		log.ResourceType,
+		adminAuditResourceTypeMaxRunes,
+	)
+	resourcePublicID := redactAuditText(
+		log.ResourcePublicID,
+		adminAuditResourcePublicIDMaxRunes,
+	)
+	method := redactAuditText(log.Method, adminAuditMethodMaxRunes)
 	path := strings.TrimSpace(log.Path)
-	if path == "" && log.ResourceType != "" {
-		path = log.ResourceType
-		if log.ResourcePublicID != "" {
-			path += "/" + log.ResourcePublicID
+	if path == "" && resourceType != "" {
+		path = resourceType
+		if resourcePublicID != "" {
+			path += "/" + resourcePublicID
 		}
 	}
-	return &AdminAuditListItem{
+	path = redactAuditText(path, adminAuditPathMaxRunes)
+
+	action := actionCode
+	if action == "" {
+		action = redactAuditText(log.Action, adminAuditActionMaxRunes)
+	}
+	if action == "" {
+		action = redactAuditText(
+			strings.TrimSpace(method+" "+path),
+			adminAuditActionMaxRunes,
+		)
+	}
+	item := &AdminAuditListItem{
 		ID:               log.ID,
 		CreatedAt:        log.CreatedAt,
+		ActorType:        actorType,
+		ActorID:          actorID,
 		UserID:           log.UserID,
-		Username:         log.Username,
-		PlatformRole:     log.PlatformRole,
+		Username:         username,
 		Action:           action,
-		ActionCode:       log.ActionCode,
-		ResourceType:     log.ResourceType,
-		ResourcePublicID: log.ResourcePublicID,
-		Method:           log.Method,
+		ActionCode:       actionCode,
+		ResourceType:     resourceType,
+		ResourcePublicID: resourcePublicID,
+		Method:           method,
 		Path:             path,
 		StatusCode:       log.StatusCode,
 		MaskedIP:         maskAuditIP(log.ClientIP),
 		LatencyMs:        log.LatencyMs,
-		Result:           log.Result,
+		Result: redactAuditText(
+			log.Result,
+			adminAuditResultMaxRunes,
+		),
 	}
+	if log.PlatformRole != nil {
+		item.PlatformRole = models.PlatformRole(redactAuditText(
+			string(*log.PlatformRole),
+			adminAuditPlatformRoleMaxRunes,
+		))
+	}
+	return item
 }
 
 func escapeAuditLike(value string) string {
@@ -587,14 +722,12 @@ func (s *AdminAuditService) encodeAdminAuditCursor(
 	filterHash string,
 	startTime *time.Time,
 	endTime *time.Time,
-	total int64,
 ) string {
 	cursor := adminAuditCursor{
-		Version:    1,
+		Version:    2,
 		CreatedAt:  createdAt.UTC().Format(time.RFC3339Nano),
 		ID:         id,
 		FilterHash: filterHash,
-		Total:      total,
 	}
 	if startTime != nil {
 		cursor.StartTime = startTime.UTC().Format(time.RFC3339Nano)
@@ -612,50 +745,50 @@ func (s *AdminAuditService) encodeAdminAuditCursor(
 func (s *AdminAuditService) decodeAdminAuditCursor(
 	raw string,
 	filterHash string,
-) (time.Time, uint, *time.Time, *time.Time, int64, error) {
+) (time.Time, uint, *time.Time, *time.Time, error) {
 	parts := strings.Split(raw, ".")
 	if len(parts) != 2 {
-		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
+		return time.Time{}, 0, nil, nil, ErrInvalidAdminAuditCursor
 	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	encoding := base64.RawURLEncoding.Strict()
+	payload, err := encoding.DecodeString(parts[0])
 	if err != nil || len(payload) > 1024 {
-		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
+		return time.Time{}, 0, nil, nil, ErrInvalidAdminAuditCursor
 	}
-	providedMAC, err := base64.RawURLEncoding.DecodeString(parts[1])
+	providedMAC, err := encoding.DecodeString(parts[1])
 	if err != nil || len(providedMAC) != sha256.Size {
-		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
+		return time.Time{}, 0, nil, nil, ErrInvalidAdminAuditCursor
 	}
 	expectedMAC := hmac.New(sha256.New, s.cursorSigningKey)
 	_, _ = expectedMAC.Write(payload)
 	if !hmac.Equal(providedMAC, expectedMAC.Sum(nil)) {
-		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
+		return time.Time{}, 0, nil, nil, ErrInvalidAdminAuditCursor
 	}
 	var cursor adminAuditCursor
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&cursor); err != nil ||
-		cursor.Version != 1 ||
+		cursor.Version != 2 ||
 		cursor.ID == 0 ||
-		cursor.Total < 0 ||
 		cursor.FilterHash != filterHash {
-		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
+		return time.Time{}, 0, nil, nil, ErrInvalidAdminAuditCursor
 	}
 	if err := ensureAdminAuditCursorEOF(decoder); err != nil {
-		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
+		return time.Time{}, 0, nil, nil, ErrInvalidAdminAuditCursor
 	}
 	createdAt, err := time.Parse(time.RFC3339Nano, cursor.CreatedAt)
 	if err != nil {
-		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
+		return time.Time{}, 0, nil, nil, ErrInvalidAdminAuditCursor
 	}
 	startTime, err := optionalAdminAuditCursorTime(cursor.StartTime)
 	if err != nil {
-		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
+		return time.Time{}, 0, nil, nil, ErrInvalidAdminAuditCursor
 	}
 	endTime, err := optionalAdminAuditCursorTime(cursor.EndTime)
 	if err != nil {
-		return time.Time{}, 0, nil, nil, 0, ErrInvalidAdminAuditCursor
+		return time.Time{}, 0, nil, nil, ErrInvalidAdminAuditCursor
 	}
-	return createdAt, cursor.ID, startTime, endTime, cursor.Total, nil
+	return createdAt, cursor.ID, startTime, endTime, nil
 }
 
 func ensureAdminAuditCursorEOF(decoder *json.Decoder) error {
@@ -699,6 +832,30 @@ var auditCookiePattern = regexp.MustCompile(
 	`(?i)\b(set-cookie|cookie)(\s*:\s*)[^\r\n]+`,
 )
 
+const (
+	auditCredentialRedactionPlaceholder = "\ue000"
+	auditQueryRedactionPlaceholder      = "\ue001"
+	auditValueRedactionPlaceholder      = "\ue002"
+	auditURLRedactionPlaceholder        = "\ue003"
+	auditContentRedactionPlaceholder    = "\ue004"
+)
+
+var protectAuditRedactionMarkers = strings.NewReplacer(
+	"[凭据已隐藏]", auditCredentialRedactionPlaceholder,
+	"[查询参数已隐藏]", auditQueryRedactionPlaceholder,
+	"[已隐藏]", auditValueRedactionPlaceholder,
+	"[URL 已隐藏]", auditURLRedactionPlaceholder,
+	"[内容已隐藏]", auditContentRedactionPlaceholder,
+)
+
+var restoreAuditRedactionMarkers = strings.NewReplacer(
+	auditCredentialRedactionPlaceholder, "[凭据已隐藏]",
+	auditQueryRedactionPlaceholder, "[查询参数已隐藏]",
+	auditValueRedactionPlaceholder, "[已隐藏]",
+	auditURLRedactionPlaceholder, "[URL 已隐藏]",
+	auditContentRedactionPlaceholder, "[内容已隐藏]",
+)
+
 func redactAuditText(value string, maxLength int) string {
 	value = strings.Map(func(r rune) rune {
 		if r == '\r' || r == '\n' || r == '\t' || (r >= 0x20 && r != 0x7f) {
@@ -709,14 +866,19 @@ func redactAuditText(value string, maxLength int) string {
 	if structured, ok := redactStructuredAuditText(value); ok {
 		value = structured
 	}
+	value = protectAuditRedactionMarkers.Replace(value)
 	value = ScrubOutboxFailureText(value)
-	value = auditCookiePattern.ReplaceAllString(value, "$1$2[凭据已隐藏]")
-	value = auditSecretPattern.ReplaceAllString(value, "$1$2[已隐藏]")
-	runes := []rune(value)
-	if len(runes) > maxLength {
-		value = string(runes[:maxLength]) + "…"
-	}
-	return value
+	value = protectAuditRedactionMarkers.Replace(value)
+	value = auditCookiePattern.ReplaceAllString(
+		value,
+		"$1$2"+auditCredentialRedactionPlaceholder,
+	)
+	value = auditSecretPattern.ReplaceAllString(
+		value,
+		"$1$2"+auditValueRedactionPlaceholder,
+	)
+	value = restoreAuditRedactionMarkers.Replace(value)
+	return truncateAuditText(value, maxLength)
 }
 
 func redactStructuredAuditText(value string) (string, bool) {
@@ -767,7 +929,7 @@ func redactAuditStructuredValue(value any, depth int) any {
 		}
 		return result
 	case string:
-		return redactAuditText(typed, 2000)
+		return redactAuditText(typed, adminAuditStructuredValueMaxRunes)
 	case json.Number, bool, nil:
 		return typed
 	default:
@@ -811,9 +973,23 @@ func redactAuditQuery(raw string) string {
 			}
 		}
 	}
-	return values.Encode()
+	return truncateAuditText(values.Encode(), adminAuditQueryMaxRunes)
 }
 
-func redactAuditIdentifier(value string) string {
-	return redactAuditText(strings.TrimSpace(value), 255)
+func redactAuditIdentifier(value string, maxLength int) string {
+	return redactAuditText(strings.TrimSpace(value), maxLength)
+}
+
+func truncateAuditText(value string, maxLength int) string {
+	if maxLength <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= maxLength {
+		return value
+	}
+	if maxLength == 1 {
+		return "…"
+	}
+	return string(runes[:maxLength-1]) + "…"
 }

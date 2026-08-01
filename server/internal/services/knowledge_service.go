@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"gorm.io/datatypes"
@@ -26,8 +28,14 @@ var (
 	ErrKnowledgeIndexUnavailable       = errors.New("knowledge search index is unavailable")
 	ErrKnowledgeIndexBoundaryViolation = errors.New("knowledge index returned an out-of-scope result")
 	ErrKnowledgeModelPolicyDenied      = errors.New("knowledge model policy denied the operation")
+	ErrKnowledgeModelPolicyUnavailable = errors.New("knowledge model policy or provider is unavailable")
 	ErrKnowledgeModelResponseInvalid   = errors.New("knowledge model provider response is invalid")
 	ErrKnowledgeWorkerRequired         = errors.New("trusted knowledge worker operation is required")
+)
+
+const (
+	knowledgeIndexRebuildDefaultBatchSize = 500
+	knowledgeIndexRebuildMaxBatchSize     = 500
 )
 
 type KnowledgeAccessResolver interface {
@@ -115,6 +123,14 @@ type HybridIndexReplacement struct {
 	Documents      []HybridIndexDocument `json:"documents"`
 }
 
+// HybridIndexBatchSource returns one bounded, strictly chunk-ID-ordered batch.
+// An empty batch marks EOF. Implementations must not retain a returned batch
+// after the next call, so callers can release document bodies and embeddings
+// as soon as the backend has accepted them.
+type HybridIndexBatchSource func(
+	ctx context.Context,
+) ([]HybridIndexDocument, error)
+
 // HybridSearchIndex requires tenancy and ACL filters in the backend request.
 // Implementations must apply Filter while retrieving candidates.
 type HybridSearchIndex interface {
@@ -125,6 +141,17 @@ type HybridSearchIndex interface {
 	ReplaceProject(
 		ctx context.Context,
 		replacement HybridIndexReplacement,
+	) error
+}
+
+// HybridSearchIndexBatchReplacer is the fail-closed rebuild contract. The
+// Outbox worker requires this capability instead of falling back to an
+// unbounded in-memory replacement.
+type HybridSearchIndexBatchReplacer interface {
+	ReplaceProjectBatches(
+		ctx context.Context,
+		replacement HybridIndexReplacement,
+		source HybridIndexBatchSource,
 	) error
 }
 
@@ -219,6 +246,12 @@ type KnowledgeServiceDependencies struct {
 	ModelProviders       map[string]ModelProvider
 	ProjectAuthorization *ProjectService
 	Events               projectDomainEventAppender
+	AttachmentStorage    AttachmentStorage
+	StorageBucket        string
+	IdempotencyCompleter KnowledgeIdempotencyCompleter
+	// IndexRebuildBatchSize is injectable for deterministic tests. Runtime
+	// composition should leave it zero to use the bounded default.
+	IndexRebuildBatchSize int
 }
 
 type KnowledgeService struct {
@@ -228,6 +261,10 @@ type KnowledgeService struct {
 	modelProviders map[string]ModelProvider
 	projects       *ProjectService
 	events         projectDomainEventAppender
+	storage        AttachmentStorage
+	storageBucket  string
+	idempotency    KnowledgeIdempotencyCompleter
+	indexBatchSize int
 	now            func() time.Time
 }
 
@@ -240,6 +277,14 @@ func NewKnowledgeService(
 	}
 	if dependencies.Events == nil {
 		return nil, errors.New("knowledge domain event pipeline is required")
+	}
+	indexBatchSize := dependencies.IndexRebuildBatchSize
+	if indexBatchSize == 0 {
+		indexBatchSize = knowledgeIndexRebuildDefaultBatchSize
+	}
+	if indexBatchSize < 1 ||
+		indexBatchSize > knowledgeIndexRebuildMaxBatchSize {
+		return nil, errors.New("knowledge index rebuild batch size is invalid")
 	}
 	providers := make(map[string]ModelProvider, len(dependencies.ModelProviders))
 	for key, provider := range dependencies.ModelProviders {
@@ -271,6 +316,10 @@ func NewKnowledgeService(
 		modelProviders: providers,
 		projects:       projects,
 		events:         dependencies.Events,
+		storage:        dependencies.AttachmentStorage,
+		storageBucket:  strings.TrimSpace(dependencies.StorageBucket),
+		idempotency:    dependencies.IdempotencyCompleter,
+		indexBatchSize: indexBatchSize,
 		now:            time.Now,
 	}, nil
 }
@@ -280,6 +329,439 @@ type CreateKnowledgeArticleInput struct {
 	Title              string
 	Summary            string
 	GrantProjectAccess bool
+}
+
+type KnowledgeArticleListFilter struct {
+	Status           models.KnowledgeArticleStatus
+	Query            string
+	ManageAll        bool
+	ManagedByActor   bool
+	PolicyDecisionID string
+}
+
+func (service *KnowledgeService) ListArticles(
+	ctx context.Context,
+	filter KnowledgeArticleListFilter,
+	request DirectoryPageRequest,
+) (*DirectoryPage[models.KnowledgeArticle], error) {
+	operation, err := knowledgeOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if validateDirectoryPageRequest(
+		request,
+		map[string]struct{}{
+			"created_at": {},
+			"updated_at": {},
+			"key":        {},
+			"title":      {},
+			"status":     {},
+		},
+	) != nil ||
+		(filter.Status != "" && !filter.Status.IsValid()) ||
+		(filter.ManageAll && filter.ManagedByActor) {
+		return nil, ErrDirectoryListQuery
+	}
+	filter.Query = strings.TrimSpace(filter.Query)
+	if len([]rune(filter.Query)) > 200 {
+		return nil, ErrDirectoryListQuery
+	}
+	page := &DirectoryPage[models.KnowledgeArticle]{
+		Items:    make([]models.KnowledgeArticle, 0, request.PageSize),
+		Page:     request.Page,
+		PageSize: request.PageSize,
+	}
+	err = runProjectOperation(
+		ctx,
+		service.db,
+		func(scopedContext context.Context) error {
+			tx := service.db.WithContext(scopedContext)
+			subjects, err := service.revalidateKnowledgeListAccess(
+				scopedContext,
+				operation,
+				filter.ManageAll,
+				filter.ManagedByActor,
+				filter.PolicyDecisionID,
+			)
+			if err != nil {
+				return err
+			}
+			query := knowledgeScopedQuery(
+				tx.Model(&models.KnowledgeArticle{}),
+				operation.Scope,
+			)
+			switch {
+			case filter.ManageAll:
+			case filter.ManagedByActor:
+				query = applyKnowledgeArticleHumanManageVisibility(
+					query,
+					operation.Scope,
+					operation.Actor.ID,
+				)
+			default:
+				query = applyKnowledgeArticleReadVisibility(
+					query,
+					operation.Scope,
+					subjects,
+				)
+			}
+			if filter.Status != "" {
+				query = query.Where("status = ?", filter.Status)
+			}
+			if filter.Query != "" {
+				like := "%" + escapeKnowledgeDirectoryLike(
+					strings.ToLower(filter.Query),
+				) + "%"
+				query = query.Where(
+					"(lower(key) LIKE ? ESCAPE '\\' OR lower(title) LIKE ? ESCAPE '\\' OR lower(summary) LIKE ? ESCAPE '\\')",
+					like,
+					like,
+					like,
+				)
+			}
+			if err := query.Count(&page.Total).Error; err != nil {
+				return fmt.Errorf("count knowledge articles: %w", err)
+			}
+			if err := query.
+				Order(knowledgeArticleDirectoryOrder(
+					request,
+					filter.ManagedByActor,
+				)).
+				Offset(directoryPageOffset(request)).
+				Limit(request.PageSize).
+				Find(&page.Items).Error; err != nil {
+				return fmt.Errorf("list knowledge articles: %w", err)
+			}
+			if (filter.ManageAll || filter.ManagedByActor) &&
+				len(page.Items) > 0 {
+				if err := hydrateKnowledgeDraftActivity(
+					tx,
+					operation.Scope,
+					page.Items,
+				); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	page.TotalPages = directoryTotalPages(page.Total, request.PageSize)
+	return page, nil
+}
+
+type KnowledgeVersionListFilter struct {
+	Status    models.KnowledgeVersionStatus
+	VirusScan models.VirusScanStatus
+}
+
+func (service *KnowledgeService) ListArticleVersions(
+	ctx context.Context,
+	articleID string,
+	filter KnowledgeVersionListFilter,
+	request DirectoryPageRequest,
+) (*DirectoryPage[models.KnowledgeArticleVersion], error) {
+	operation, err := knowledgeOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	articleID = strings.TrimSpace(articleID)
+	if articleID == "" ||
+		validateDirectoryPageRequest(
+			request,
+			map[string]struct{}{
+				"created_at": {},
+				"updated_at": {},
+				"version":    {},
+				"status":     {},
+			},
+		) != nil ||
+		(filter.Status != "" && !filter.Status.IsValid()) ||
+		(filter.VirusScan != "" &&
+			!knowledgeVirusScanStatusIsValid(filter.VirusScan)) {
+		return nil, ErrDirectoryListQuery
+	}
+	page := &DirectoryPage[models.KnowledgeArticleVersion]{
+		Items:    make([]models.KnowledgeArticleVersion, 0, request.PageSize),
+		Page:     request.Page,
+		PageSize: request.PageSize,
+	}
+	err = runProjectOperation(
+		ctx,
+		service.db,
+		func(scopedContext context.Context) error {
+			if _, err := service.revalidateKnowledgeListAccess(
+				scopedContext,
+				operation,
+				true,
+				false,
+				"",
+			); err != nil {
+				return err
+			}
+			tx := service.db.WithContext(scopedContext)
+			var articleCount int64
+			if err := knowledgeScopedQuery(
+				tx.Model(&models.KnowledgeArticle{}),
+				operation.Scope,
+			).Where("id = ?", articleID).
+				Count(&articleCount).Error; err != nil {
+				return fmt.Errorf("verify knowledge article: %w", err)
+			}
+			if articleCount != 1 {
+				return ErrKnowledgeNotFound
+			}
+			query := knowledgeScopedQuery(
+				tx.Model(&models.KnowledgeArticleVersion{}),
+				operation.Scope,
+			).Where("article_id = ?", articleID)
+			if filter.Status != "" {
+				query = query.Where("status = ?", filter.Status)
+			}
+			if filter.VirusScan != "" {
+				query = query.Where("virus_scan = ?", filter.VirusScan)
+			}
+			if err := query.Count(&page.Total).Error; err != nil {
+				return fmt.Errorf(
+					"count knowledge article versions: %w",
+					err,
+				)
+			}
+			if err := query.
+				Order(knowledgeVersionDirectoryOrder(request)).
+				Offset(directoryPageOffset(request)).
+				Limit(request.PageSize).
+				Find(&page.Items).Error; err != nil {
+				return fmt.Errorf(
+					"list knowledge article versions: %w",
+					err,
+				)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	page.TotalPages = directoryTotalPages(page.Total, request.PageSize)
+	return page, nil
+}
+
+type KnowledgeIngestionListFilter struct {
+	Status    models.KnowledgeIngestionStatus
+	VersionID string
+}
+
+func (service *KnowledgeService) ListIngestions(
+	ctx context.Context,
+	filter KnowledgeIngestionListFilter,
+	request DirectoryPageRequest,
+) (*DirectoryPage[models.KnowledgeIngestionTask], error) {
+	operation, err := knowledgeOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	filter.VersionID = strings.TrimSpace(filter.VersionID)
+	if validateDirectoryPageRequest(
+		request,
+		map[string]struct{}{
+			"created_at": {},
+			"updated_at": {},
+			"attempt":    {},
+			"status":     {},
+		},
+	) != nil ||
+		(filter.Status != "" && !filter.Status.IsValid()) ||
+		len(filter.VersionID) > 64 {
+		return nil, ErrDirectoryListQuery
+	}
+	page := &DirectoryPage[models.KnowledgeIngestionTask]{
+		Items:    make([]models.KnowledgeIngestionTask, 0, request.PageSize),
+		Page:     request.Page,
+		PageSize: request.PageSize,
+	}
+	err = runProjectOperation(
+		ctx,
+		service.db,
+		func(scopedContext context.Context) error {
+			if _, err := service.revalidateKnowledgeListAccess(
+				scopedContext,
+				operation,
+				true,
+				false,
+				"",
+			); err != nil {
+				return err
+			}
+			query := knowledgeScopedQuery(
+				service.db.WithContext(scopedContext).
+					Model(&models.KnowledgeIngestionTask{}),
+				operation.Scope,
+			)
+			if filter.Status != "" {
+				query = query.Where("status = ?", filter.Status)
+			}
+			if filter.VersionID != "" {
+				query = query.Where("version_id = ?", filter.VersionID)
+			}
+			if err := query.Count(&page.Total).Error; err != nil {
+				return fmt.Errorf("count knowledge ingestions: %w", err)
+			}
+			if err := query.
+				Order(knowledgeIngestionDirectoryOrder(request)).
+				Offset(directoryPageOffset(request)).
+				Limit(request.PageSize).
+				Find(&page.Items).Error; err != nil {
+				return fmt.Errorf("list knowledge ingestions: %w", err)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	page.TotalPages = directoryTotalPages(page.Total, request.PageSize)
+	return page, nil
+}
+
+func knowledgeArticleDirectoryOrder(
+	request DirectoryPageRequest,
+	managedByActor bool,
+) string {
+	if managedByActor && request.SortBy == "updated_at" {
+		direction := "ASC"
+		if request.SortOrder == "desc" {
+			direction = "DESC"
+		}
+		return `COALESCE((
+			SELECT MAX(latest_draft.created_at)
+			FROM knowledge_article_versions AS latest_draft
+			WHERE latest_draft.organization_id =
+			      knowledge_articles.organization_id
+			  AND latest_draft.project_id = knowledge_articles.project_id
+			  AND latest_draft.article_id = knowledge_articles.id
+			  AND latest_draft.status = 'draft'
+		), knowledge_articles.updated_at) ` + direction +
+			", knowledge_articles.id " + direction
+	}
+	return knowledgeDirectoryOrder(request, map[string]string{
+		"created_at": "created_at",
+		"updated_at": "updated_at",
+		"key":        "key",
+		"title":      "title",
+		"status":     "status",
+	})
+}
+
+type knowledgeDraftActivityRow struct {
+	ArticleID          string    `gorm:"column:article_id"`
+	LatestDraftAt      time.Time `gorm:"column:latest_draft_at"`
+	LatestDraftVersion uint64    `gorm:"column:latest_draft_version"`
+}
+
+func hydrateKnowledgeDraftActivity(
+	tx *gorm.DB,
+	scope models.ProjectScope,
+	articles []models.KnowledgeArticle,
+) error {
+	if tx == nil || len(articles) == 0 {
+		return nil
+	}
+	articleIDs := make([]string, 0, len(articles))
+	for index := range articles {
+		articleIDs = append(articleIDs, articles[index].ID)
+	}
+	rows := make([]knowledgeDraftActivityRow, 0, len(articles))
+	rankedDrafts := knowledgeScopedQuery(
+		tx.Model(&models.KnowledgeArticleVersion{}),
+		scope,
+	).Select(
+		"article_id, created_at, version, ROW_NUMBER() OVER (PARTITION BY article_id ORDER BY created_at DESC, id DESC) AS draft_rank",
+	).
+		Where(
+			"article_id IN ? AND status = ?",
+			articleIDs,
+			models.KnowledgeVersionDraft,
+		)
+	if err := tx.Table("(?) AS ranked_drafts", rankedDrafts).
+		Select(
+			"article_id, created_at AS latest_draft_at, version AS latest_draft_version",
+		).
+		Where("draft_rank = 1").
+		Scan(&rows).Error; err != nil {
+		return fmt.Errorf(
+			"load knowledge draft activity projection: %w",
+			err,
+		)
+	}
+	byArticleID := make(
+		map[string]knowledgeDraftActivityRow,
+		len(rows),
+	)
+	for _, row := range rows {
+		byArticleID[row.ArticleID] = row
+	}
+	for index := range articles {
+		row, ok := byArticleID[articles[index].ID]
+		if !ok {
+			continue
+		}
+		latestAt := row.LatestDraftAt
+		latestVersion := row.LatestDraftVersion
+		articles[index].HasUnpublishedDraft = true
+		articles[index].LatestDraftAt = &latestAt
+		articles[index].LatestDraftVersion = &latestVersion
+	}
+	return nil
+}
+
+func knowledgeVersionDirectoryOrder(request DirectoryPageRequest) string {
+	return knowledgeDirectoryOrder(request, map[string]string{
+		"created_at": "created_at",
+		"updated_at": "updated_at",
+		"version":    "version",
+		"status":     "status",
+	})
+}
+
+func knowledgeIngestionDirectoryOrder(request DirectoryPageRequest) string {
+	return knowledgeDirectoryOrder(request, map[string]string{
+		"created_at": "created_at",
+		"updated_at": "updated_at",
+		"attempt":    "attempt",
+		"status":     "status",
+	})
+}
+
+func knowledgeDirectoryOrder(
+	request DirectoryPageRequest,
+	columns map[string]string,
+) string {
+	direction := "ASC"
+	if request.SortOrder == "desc" {
+		direction = "DESC"
+	}
+	return columns[request.SortBy] + " " + direction + ", id " + direction
+}
+
+func escapeKnowledgeDirectoryLike(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `%`, `\%`)
+	return strings.ReplaceAll(value, `_`, `\_`)
+}
+
+func knowledgeVirusScanStatusIsValid(status models.VirusScanStatus) bool {
+	switch status {
+	case models.VirusScanPending,
+		models.VirusScanClean,
+		models.VirusScanInfected,
+		models.VirusScanError:
+		return true
+	default:
+		return false
+	}
 }
 
 func (service *KnowledgeService) CreateArticle(
@@ -403,10 +885,40 @@ func (service *KnowledgeService) GrantArticleAccess(
 	if err != nil {
 		return nil, err
 	}
+	if operation.Actor.Type != models.ActorTypeHuman ||
+		subject.Validate() != nil ||
+		!permission.IsValid() {
+		return nil, ErrProjectKnowledgeAccessDenied
+	}
+	userID, err := parseKnowledgeHumanID(operation.Actor.ID)
+	if err != nil {
+		return nil, ErrProjectKnowledgeAccessDenied
+	}
 	var acl models.KnowledgeArticleACL
-	err = transactionForContext(ctx, service.db, func(tx *gorm.DB) error {
+	err = runProjectOperation(ctx, service.db, func(scopedContext context.Context) error {
+		tx := service.db.WithContext(scopedContext)
+		access, revalidateErr := service.projects.RevalidateHumanProjectAccess(
+			scopedContext,
+			operation.Scope,
+			userID,
+		)
+		if revalidateErr != nil {
+			return revalidateErr
+		}
+		if access.Role != models.ProjectRoleAdmin &&
+			access.Role != models.ProjectRoleManager {
+			return ErrProjectKnowledgeAccessDenied
+		}
+		if err := validateKnowledgeACLSubjectTx(
+			tx,
+			operation.Scope,
+			subject,
+		); err != nil {
+			return err
+		}
 		var article models.KnowledgeArticle
 		if err := knowledgeScopedQuery(tx, operation.Scope).
+			Clauses(clause.Locking{Strength: "SHARE"}).
 			Where("id = ?", articleID).
 			First(&article).Error; err != nil {
 			return knowledgeLookupError(err)
@@ -430,6 +942,98 @@ func (service *KnowledgeService) GrantArticleAccess(
 		return nil, err
 	}
 	return &acl, nil
+}
+
+func validateKnowledgeACLSubjectTx(
+	tx *gorm.DB,
+	scope models.ProjectScope,
+	subject models.KnowledgeACLSubject,
+) error {
+	if tx == nil || subject.Validate() != nil {
+		return ErrProjectKnowledgeAccessDenied
+	}
+	switch subject.Type {
+	case models.KnowledgeACLAllProject:
+		return nil
+	case models.KnowledgeACLProjectRole:
+		if !models.ProjectRole(subject.ID).IsValid() {
+			return ErrProjectKnowledgeAccessDenied
+		}
+		return nil
+	case models.KnowledgeACLHuman:
+		userID, err := strconv.ParseUint(
+			strings.TrimSpace(subject.ID),
+			10,
+			strconv.IntSize,
+		)
+		if err != nil || userID == 0 {
+			return ErrProjectKnowledgeAccessDenied
+		}
+		var count int64
+		if err := tx.Table("project_memberships AS memberships").
+			Joins(
+				"JOIN users AS users ON users.id = memberships.user_id",
+			).
+			Where(
+				"memberships.project_id = ? AND memberships.user_id = ? AND memberships.is_active = ?",
+				scope.ProjectID,
+				uint(userID),
+				true,
+			).
+			Where(
+				"users.status = ? AND users.deleted_at IS NULL",
+				models.UserStatusActive,
+			).
+			Count(&count).Error; err != nil {
+			return fmt.Errorf("validate knowledge Human ACL subject: %w", err)
+		}
+		if count != 1 {
+			return ErrProjectKnowledgeAccessDenied
+		}
+	case models.KnowledgeACLServicePrincipal:
+		var count int64
+		if err := tx.Table("project_principal_grants AS grants").
+			Joins(
+				"JOIN service_principals AS principals ON principals.id = grants.service_principal_id",
+			).
+			Where(
+				"grants.project_id = ? AND grants.service_principal_id = ? AND grants.is_active = ?",
+				scope.ProjectID,
+				strings.TrimSpace(subject.ID),
+				true,
+			).
+			Where(
+				"principals.status = ? AND principals.deleted_at IS NULL",
+				models.ServicePrincipalStatusActive,
+			).
+			Count(&count).Error; err != nil {
+			return fmt.Errorf(
+				"validate knowledge Service Principal ACL subject: %w",
+				err,
+			)
+		}
+		if count != 1 {
+			return ErrProjectKnowledgeAccessDenied
+		}
+	case models.KnowledgeACLTeam:
+		var count int64
+		if err := tx.Model(&models.Team{}).
+			Where(
+				"project_id = ? AND public_id = ? AND status = ?",
+				scope.ProjectID,
+				strings.TrimSpace(subject.ID),
+				models.TeamStatusActive,
+			).
+			Count(&count).Error; err != nil {
+			return fmt.Errorf("validate knowledge Team ACL subject: %w", err)
+		}
+		if count != 1 {
+			return ErrProjectKnowledgeAccessDenied
+		}
+	default:
+		return ErrProjectKnowledgeAccessDenied
+	}
+	return nil
 }
 
 func (service *KnowledgeService) QueueIngestion(
@@ -701,91 +1305,192 @@ func (service *KnowledgeService) PublishVersion(
 	if err != nil {
 		return nil, err
 	}
+	if operation.Actor.Type != models.ActorTypeHuman {
+		return nil, ErrProjectKnowledgeAccessDenied
+	}
+	userID, err := parseKnowledgeHumanID(operation.Actor.ID)
+	if err != nil {
+		return nil, ErrProjectKnowledgeAccessDenied
+	}
 	var published models.KnowledgeArticleVersion
-	err = transactionForContext(ctx, service.db, func(tx *gorm.DB) error {
-		if err := knowledgeScopedQuery(tx, operation.Scope).
-			Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ?", versionID).
-			First(&published).Error; err != nil {
-			return knowledgeLookupError(err)
-		}
-		if published.Status != models.KnowledgeVersionDraft ||
-			published.VirusScan != models.VirusScanClean {
-			return ErrKnowledgeIngestionState
-		}
-		var completed int64
-		if err := knowledgeScopedQuery(
-			tx.Model(&models.KnowledgeIngestionTask{}),
-			operation.Scope,
-		).Where(
-			"version_id = ? AND status = ?",
-			published.ID,
-			models.KnowledgeIngestionCompleted,
-		).Count(&completed).Error; err != nil {
-			return fmt.Errorf("check completed knowledge ingestion: %w", err)
-		}
-		if completed == 0 {
-			return ErrKnowledgeIngestionState
-		}
-		now := service.now().UTC()
-		if err := knowledgeScopedQuery(
-			tx.Model(&models.KnowledgeArticleVersion{}),
-			operation.Scope,
-		).Where(
-			"article_id = ? AND status = ? AND id <> ?",
-			published.ArticleID,
-			models.KnowledgeVersionPublished,
-			published.ID,
-		).UpdateColumns(map[string]any{
-			"status":     models.KnowledgeVersionSuperseded,
-			"updated_at": now,
-		}).Error; err != nil {
-			return fmt.Errorf("supersede knowledge version: %w", err)
-		}
-		result := knowledgeScopedQuery(
-			tx.Model(&models.KnowledgeArticleVersion{}),
-			operation.Scope,
-		).Where(
-			"id = ? AND status = ?",
-			published.ID,
-			models.KnowledgeVersionDraft,
-		).UpdateColumns(map[string]any{
-			"status":       models.KnowledgeVersionPublished,
-			"published_at": now,
-			"updated_at":   now,
-		})
-		if result.Error != nil {
-			return fmt.Errorf("publish knowledge version: %w", result.Error)
-		}
-		if result.RowsAffected != 1 {
-			return ErrKnowledgeIngestionState
-		}
-		if err := knowledgeScopedQuery(
-			tx.Model(&models.KnowledgeArticle{}),
-			operation.Scope,
-		).Where("id = ?", published.ArticleID).
-			UpdateColumns(map[string]any{
-				"current_version_id": published.ID,
-				"revision":           gorm.Expr("revision + 1"),
-				"updated_by_type":    operation.Actor.Type,
-				"updated_by_id":      operation.Actor.ID,
-				"updated_at":         now,
+	err = runProjectOperation(
+		ctx,
+		service.db,
+		func(scopedContext context.Context) error {
+			tx := service.db.WithContext(scopedContext)
+			access, revalidateErr := service.projects.RevalidateHumanProjectAccess(
+				scopedContext,
+				operation.Scope,
+				userID,
+			)
+			if revalidateErr != nil {
+				return revalidateErr
+			}
+			if access.Role != models.ProjectRoleAdmin &&
+				access.Role != models.ProjectRoleManager {
+				return ErrProjectKnowledgeAccessDenied
+			}
+			var target struct {
+				ArticleID string
+			}
+			if err := knowledgeScopedQuery(
+				tx.Model(&models.KnowledgeArticleVersion{}),
+				operation.Scope,
+			).Select("article_id").
+				Where("id = ?", versionID).
+				Take(&target).Error; err != nil {
+				return knowledgeLookupError(err)
+			}
+			var article models.KnowledgeArticle
+			if err := knowledgeScopedQuery(tx, operation.Scope).
+				Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where(
+					"id = ? AND status = ?",
+					target.ArticleID,
+					models.KnowledgeArticleActive,
+				).
+				First(&article).Error; err != nil {
+				return knowledgeLookupError(err)
+			}
+			if err := knowledgeScopedQuery(tx, operation.Scope).
+				Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where(
+					"id = ? AND article_id = ?",
+					versionID,
+					article.ID,
+				).
+				First(&published).Error; err != nil {
+				return knowledgeLookupError(err)
+			}
+			if published.Status != models.KnowledgeVersionDraft ||
+				published.VirusScan != models.VirusScanClean {
+				return ErrKnowledgeIngestionState
+			}
+			var completed int64
+			if err := knowledgeScopedQuery(
+				tx.Model(&models.KnowledgeIngestionTask{}),
+				operation.Scope,
+			).Where(
+				"version_id = ? AND status = ?",
+				published.ID,
+				models.KnowledgeIngestionCompleted,
+			).Count(&completed).Error; err != nil {
+				return fmt.Errorf("check completed knowledge ingestion: %w", err)
+			}
+			if completed == 0 {
+				return ErrKnowledgeIngestionState
+			}
+			now := service.now().UTC()
+			projectReadACL := models.KnowledgeArticleACL{
+				OrganizationID: operation.Scope.OrganizationID,
+				ProjectID:      operation.Scope.ProjectID,
+				ArticleID:      published.ArticleID,
+				SubjectType:    models.KnowledgeACLAllProject,
+				SubjectID:      "*",
+				Permission:     models.KnowledgeACLRead,
+				GrantedByType:  operation.Actor.Type,
+				GrantedByID:    operation.Actor.ID,
+			}
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).
+				Create(&projectReadACL).Error; err != nil {
+				return fmt.Errorf(
+					"grant published knowledge project access: %w",
+					err,
+				)
+			}
+			if err := knowledgeScopedQuery(
+				tx.Model(&models.KnowledgeArticleVersion{}),
+				operation.Scope,
+			).Where(
+				"article_id = ? AND status = ? AND id <> ?",
+				published.ArticleID,
+				models.KnowledgeVersionPublished,
+				published.ID,
+			).UpdateColumns(map[string]any{
+				"status":     models.KnowledgeVersionSuperseded,
+				"updated_at": now,
 			}).Error; err != nil {
-			return fmt.Errorf("activate knowledge version: %w", err)
-		}
-		if _, err := service.requestKnowledgeIndexRebuildTx(
-			ctx,
-			tx,
-			operation,
-			operation.Scope,
-			"knowledge",
-		); err != nil {
-			return err
-		}
-		published.Status = models.KnowledgeVersionPublished
-		published.PublishedAt = &now
-		return nil
-	})
+				return fmt.Errorf("supersede knowledge version: %w", err)
+			}
+			result := knowledgeScopedQuery(
+				tx.Model(&models.KnowledgeArticleVersion{}),
+				operation.Scope,
+			).Where(
+				"id = ? AND status = ?",
+				published.ID,
+				models.KnowledgeVersionDraft,
+			).UpdateColumns(map[string]any{
+				"status":       models.KnowledgeVersionPublished,
+				"published_at": now,
+				"updated_at":   now,
+			})
+			if result.Error != nil {
+				return fmt.Errorf("publish knowledge version: %w", result.Error)
+			}
+			if result.RowsAffected != 1 {
+				return ErrKnowledgeIngestionState
+			}
+			articleUpdate := knowledgeScopedQuery(
+				tx.Model(&models.KnowledgeArticle{}),
+				operation.Scope,
+			).Where("id = ?", published.ArticleID).
+				UpdateColumns(map[string]any{
+					"current_version_id": published.ID,
+					"revision":           gorm.Expr("revision + 1"),
+					"updated_by_type":    operation.Actor.Type,
+					"updated_by_id":      operation.Actor.ID,
+					"updated_at":         now,
+				})
+			if articleUpdate.Error != nil {
+				return fmt.Errorf(
+					"activate knowledge version: %w",
+					articleUpdate.Error,
+				)
+			}
+			if articleUpdate.RowsAffected != 1 {
+				return ErrKnowledgeIngestionState
+			}
+			if _, err := service.events.AppendDomainEventTx(
+				scopedContext,
+				tx,
+				DomainEventInput{
+					Type: eventcontract.
+						KnowledgeVersionPublishedEventType,
+					Subject: fmt.Sprintf(
+						"knowledge/articles/%s/versions/%s",
+						published.ArticleID,
+						published.ID,
+					),
+					Actor:           operation.Actor,
+					Scope:           operation.Scope,
+					TraceID:         operation.TraceID,
+					CorrelationID:   operation.CorrelationID,
+					ResourceVersion: published.Version,
+					Data: map[string]any{
+						"article_id":       published.ArticleID,
+						"version_id":       published.ID,
+						"document_version": published.Version,
+						"audience":         "project",
+					},
+				},
+				nil,
+			); err != nil {
+				return err
+			}
+			if _, err := service.requestKnowledgeIndexRebuildTx(
+				scopedContext,
+				tx,
+				operation,
+				operation.Scope,
+				"knowledge",
+			); err != nil {
+				return err
+			}
+			published.Status = models.KnowledgeVersionPublished
+			published.PublishedAt = &now
+			return nil
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -815,6 +1520,13 @@ func (service *KnowledgeService) SetProjectModelPolicy(
 	operation, err := knowledgeOperation(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if operation.Actor.Type != models.ActorTypeHuman {
+		return nil, ErrKnowledgeModelPolicyDenied
+	}
+	userID, err := parseKnowledgeHumanID(operation.Actor.ID)
+	if err != nil {
+		return nil, ErrKnowledgeModelPolicyDenied
 	}
 	providerKey := strings.TrimSpace(input.ProviderKey)
 	provider, registered := service.modelProviders[providerKey]
@@ -862,58 +1574,123 @@ func (service *KnowledgeService) SetProjectModelPolicy(
 		return nil, fmt.Errorf("%w: %v", ErrKnowledgeModelPolicyDenied, err)
 	}
 	var policy models.ProjectModelPolicy
-	err = transactionForContext(ctx, service.db, func(tx *gorm.DB) error {
-		query := knowledgeScopedQuery(tx, operation.Scope).
-			Where("policy_key = ?", policyKey).
-			First(&policy)
-		switch {
-		case query.Error == nil:
-			update := knowledgeScopedQuery(
-				tx.Model(&policy),
+	err = runProjectOperation(
+		ctx,
+		service.db,
+		func(scopedContext context.Context) error {
+			access, err := service.projects.RevalidateHumanProjectAccess(
+				scopedContext,
 				operation.Scope,
-			).Where(
-				"id = ? AND policy_key = ?",
-				policy.ID,
-				policyKey,
-			).Updates(map[string]any{
-				"provider_key":               desired.ProviderKey,
-				"generate_model":             desired.GenerateModel,
-				"embedding_model":            desired.EmbeddingModel,
-				"rerank_model":               desired.RerankModel,
-				"data_egress":                desired.DataEgress,
-				"redaction_rules":            desired.RedactionRules,
-				"provider_allowlist":         desired.ProviderAllowlist,
-				"model_allowlist":            desired.ModelAllowlist,
-				"monthly_token_budget":       desired.MonthlyTokenBudget,
-				"monthly_cost_budget_micros": desired.MonthlyCostBudgetMicros,
-				"requests_per_minute":        desired.RequestsPerMinute,
-				"tokens_per_minute":          desired.TokensPerMinute,
-				"is_active":                  true,
-			})
-			if update.Error != nil {
+				userID,
+			)
+			if err != nil {
+				return err
+			}
+			if access.Role != models.ProjectRoleAdmin &&
+				access.Role != models.ProjectRoleManager {
+				return ErrKnowledgeModelPolicyDenied
+			}
+			tx := service.db.WithContext(scopedContext)
+			var previousDigest string
+			var previousEgress models.ModelDataEgressMode
+			action := "created"
+			query := knowledgeScopedQuery(tx, operation.Scope).
+				Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("policy_key = ?", policyKey).
+				First(&policy)
+			switch {
+			case query.Error == nil:
+				action = "updated"
+				previousDigest = knowledgeModelPolicyAuditDigest(policy)
+				previousEgress = policy.DataEgress
+				update := knowledgeScopedQuery(
+					tx.Model(&policy),
+					operation.Scope,
+				).Where(
+					"id = ? AND policy_key = ?",
+					policy.ID,
+					policyKey,
+				).Updates(map[string]any{
+					"provider_key":               desired.ProviderKey,
+					"generate_model":             desired.GenerateModel,
+					"embedding_model":            desired.EmbeddingModel,
+					"rerank_model":               desired.RerankModel,
+					"data_egress":                desired.DataEgress,
+					"redaction_rules":            desired.RedactionRules,
+					"provider_allowlist":         desired.ProviderAllowlist,
+					"model_allowlist":            desired.ModelAllowlist,
+					"monthly_token_budget":       desired.MonthlyTokenBudget,
+					"monthly_cost_budget_micros": desired.MonthlyCostBudgetMicros,
+					"requests_per_minute":        desired.RequestsPerMinute,
+					"tokens_per_minute":          desired.TokensPerMinute,
+					"is_active":                  true,
+				})
+				if update.Error != nil {
+					return fmt.Errorf(
+						"update project model policy: %w",
+						update.Error,
+					)
+				}
+				if update.RowsAffected != 1 {
+					return ErrKnowledgeNotFound
+				}
+				if err := knowledgeScopedQuery(tx, operation.Scope).
+					Where("id = ?", policy.ID).
+					First(&policy).Error; err != nil {
+					return fmt.Errorf(
+						"reload project model policy: %w",
+						err,
+					)
+				}
+			case !errors.Is(query.Error, gorm.ErrRecordNotFound):
 				return fmt.Errorf(
-					"update project model policy: %w",
-					update.Error,
+					"load project model policy: %w",
+					query.Error,
+				)
+			default:
+				policy = desired
+				if err := tx.Create(&policy).Error; err != nil {
+					return fmt.Errorf(
+						"create project model policy: %w",
+						err,
+					)
+				}
+			}
+			resourceVersion := uint64(policy.UpdatedAt.UTC().UnixNano())
+			_, err = service.events.AppendDomainEventTx(
+				scopedContext,
+				tx,
+				DomainEventInput{
+					Type: "io.chronodesk.knowledge.model-policy." +
+						action + ".v1",
+					Subject:         "knowledge/model-policies/" + policy.ID,
+					Actor:           operation.Actor,
+					Scope:           operation.Scope,
+					TraceID:         operation.TraceID,
+					CorrelationID:   operation.CorrelationID,
+					ResourceVersion: resourceVersion,
+					Data: map[string]any{
+						"policy_key":      policy.PolicyKey,
+						"provider_key":    policy.ProviderKey,
+						"previous_digest": previousDigest,
+						"current_digest": knowledgeModelPolicyAuditDigest(
+							policy,
+						),
+						"previous_data_egress": previousEgress,
+						"current_data_egress":  policy.DataEgress,
+					},
+				},
+				nil,
+			)
+			if err != nil {
+				return fmt.Errorf(
+					"append knowledge model policy event: %w",
+					err,
 				)
 			}
-			if update.RowsAffected != 1 {
-				return ErrKnowledgeNotFound
-			}
-			if err := knowledgeScopedQuery(tx, operation.Scope).
-				Where("id = ?", policy.ID).
-				First(&policy).Error; err != nil {
-				return fmt.Errorf("reload project model policy: %w", err)
-			}
 			return nil
-		case !errors.Is(query.Error, gorm.ErrRecordNotFound):
-			return fmt.Errorf("load project model policy: %w", query.Error)
-		}
-		policy = desired
-		if err := tx.Create(&policy).Error; err != nil {
-			return fmt.Errorf("create project model policy: %w", err)
-		}
-		return nil
-	})
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -921,8 +1698,9 @@ func (service *KnowledgeService) SetProjectModelPolicy(
 }
 
 type KnowledgeSearchInput struct {
-	Query string
-	Limit int
+	Query            string `json:"query"`
+	Limit            int    `json:"limit"`
+	PolicyDecisionID string `json:"-"`
 }
 
 type KnowledgeSearchResult struct {
@@ -961,6 +1739,7 @@ func (service *KnowledgeService) Search(
 	snapshot, err := service.captureKnowledgeSearchSnapshot(
 		ctx,
 		operation,
+		input.PolicyDecisionID,
 	)
 	if err != nil {
 		return nil, err
@@ -968,37 +1747,48 @@ func (service *KnowledgeService) Search(
 	subjects := snapshot.subjects
 	policy := snapshot.policy
 	provider := snapshot.provider
-	modelQuery, err := prepareKnowledgeModelContent(
-		query,
-		policy,
-		provider.Descriptor(),
-	)
-	if err != nil {
-		return nil, err
-	}
-	limits := modelLimitsFromPolicy(policy)
-	if err := requireExternalIOOutsideProjectTransaction(
-		ctx,
-		"knowledge query embedding",
-	); err != nil {
-		return nil, err
-	}
-	embedding, err := provider.Embed(ctx, ModelEmbedRequest{
-		Scope:  operation.Scope,
-		Model:  policy.EmbeddingModel,
-		Inputs: []string{modelQuery},
-		Limits: limits,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("embed knowledge query: %w", err)
-	}
-	if len(embedding.Embeddings) != 1 ||
-		len(embedding.Embeddings[0]) == 0 {
-		return nil, ErrKnowledgeModelResponseInvalid
-	}
-	candidateLimit := limit * 4
-	if candidateLimit > 100 {
-		candidateLimit = 100
+	modelQuery := query
+	var queryEmbedding []float32
+	hybrid := provider != nil
+	limits := ModelCallLimits{}
+	candidateLimit := limit
+	if hybrid {
+		modelQuery, err = prepareKnowledgeModelContent(
+			query,
+			policy,
+			provider.Descriptor(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		limits = modelLimitsFromPolicy(policy)
+		if err := requireExternalIOOutsideProjectTransaction(
+			ctx,
+			"knowledge query embedding",
+		); err != nil {
+			return nil, err
+		}
+		embedding, embedErr := provider.Embed(ctx, ModelEmbedRequest{
+			Scope:  operation.Scope,
+			Model:  policy.EmbeddingModel,
+			Inputs: []string{modelQuery},
+			Limits: limits,
+		})
+		if embedErr != nil {
+			return nil, fmt.Errorf("embed knowledge query: %w", embedErr)
+		}
+		if len(embedding.Embeddings) != 1 ||
+			len(embedding.Embeddings[0]) == 0 {
+			return nil, ErrKnowledgeModelResponseInvalid
+		}
+		queryEmbedding = append(
+			[]float32(nil),
+			embedding.Embeddings[0]...,
+		)
+		candidateLimit = limit * 4
+		if candidateLimit > 100 {
+			candidateLimit = 100
+		}
 	}
 	filter := HybridSearchFilter{
 		OrganizationID: operation.Scope.OrganizationID,
@@ -1012,18 +1802,18 @@ func (service *KnowledgeService) Search(
 	}
 	if err := requireExternalIOOutsideProjectTransaction(
 		ctx,
-		"knowledge hybrid search",
+		"knowledge index search",
 	); err != nil {
 		return nil, err
 	}
 	hits, err := service.searchIndex.Search(ctx, HybridSearchRequest{
 		Query:          modelQuery,
-		QueryEmbedding: embedding.Embeddings[0],
+		QueryEmbedding: queryEmbedding,
 		Limit:          candidateLimit,
 		Filter:         filter,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("hybrid knowledge search: %w", err)
+		return nil, fmt.Errorf("knowledge index search: %w", err)
 	}
 	if len(hits) == 0 {
 		searchID, err := newKnowledgeSearchID()
@@ -1034,6 +1824,7 @@ func (service *KnowledgeService) Search(
 			ctx,
 			operation,
 			snapshot.epoch,
+			input.PolicyDecisionID,
 			nil,
 			nil,
 		); err != nil {
@@ -1042,6 +1833,83 @@ func (service *KnowledgeService) Search(
 		return &KnowledgeSearchResult{
 			SearchID: searchID,
 			Items:    []models.KnowledgeCitation{},
+		}, nil
+	}
+	indexChunkIDs := make(map[string]struct{}, len(hits))
+	for _, hit := range hits {
+		if err := validateKnowledgeSearchHit(operation.Scope, hit); err != nil {
+			return nil, err
+		}
+		if _, duplicate := indexChunkIDs[hit.ChunkID]; duplicate {
+			return nil, ErrKnowledgeModelResponseInvalid
+		}
+		indexChunkIDs[hit.ChunkID] = struct{}{}
+	}
+	hits, err = service.prevalidateKnowledgeSearchHits(
+		ctx,
+		operation,
+		snapshot.epoch,
+		input.PolicyDecisionID,
+		hits,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if !hybrid {
+		if len(hits) > limit {
+			hits = hits[:limit]
+		}
+		searchID, err := newKnowledgeSearchID()
+		if err != nil {
+			return nil, err
+		}
+		citations := make(
+			[]models.KnowledgeCitation,
+			0,
+			len(hits),
+		)
+		seen := make(map[string]struct{}, len(hits))
+		for index, hit := range hits {
+			if err := validateKnowledgeSearchHit(
+				operation.Scope,
+				hit,
+			); err != nil {
+				return nil, err
+			}
+			if _, duplicate := seen[hit.ChunkID]; duplicate {
+				return nil, ErrKnowledgeModelResponseInvalid
+			}
+			seen[hit.ChunkID] = struct{}{}
+			citations = append(citations, models.KnowledgeCitation{
+				OrganizationID:  operation.Scope.OrganizationID,
+				ProjectID:       operation.Scope.ProjectID,
+				SearchID:        searchID,
+				ArticleID:       hit.ArticleID,
+				VersionID:       hit.VersionID,
+				DocumentVersion: hit.DocumentVersion,
+				ChunkID:         hit.ChunkID,
+				PageNumber:      hit.PageNumber,
+				Snippet:         hit.Snippet,
+				ContentHash:     hit.ContentHash,
+				Rank:            index + 1,
+				Score:           hit.Score,
+				CreatedByType:   operation.Actor.Type,
+				CreatedByID:     operation.Actor.ID,
+			})
+		}
+		if err := service.finalizeKnowledgeSearch(
+			ctx,
+			operation,
+			snapshot.epoch,
+			input.PolicyDecisionID,
+			hits,
+			citations,
+		); err != nil {
+			return nil, err
+		}
+		return &KnowledgeSearchResult{
+			SearchID: searchID,
+			Items:    citations,
 		}, nil
 	}
 	candidates := make([]ModelRerankCandidate, 0, len(hits))
@@ -1125,6 +1993,7 @@ func (service *KnowledgeService) Search(
 		ctx,
 		operation,
 		snapshot.epoch,
+		input.PolicyDecisionID,
 		selectedHits,
 		citations,
 	); err != nil {
@@ -1306,16 +2175,23 @@ func embedKnowledgeIndexDocuments(
 	return documents, nil
 }
 
-func (service *KnowledgeService) loadKnowledgeIndexDocuments(
+func (service *KnowledgeService) loadKnowledgeIndexDocumentBatch(
 	ctx context.Context,
 	scope models.ProjectScope,
-) ([]HybridIndexDocument, string, error) {
+	afterChunkID string,
+	limit int,
+) ([]HybridIndexDocument, string, bool, error) {
+	if limit < 1 || limit > knowledgeIndexRebuildMaxBatchSize {
+		return nil, "", false, errors.New(
+			"knowledge index rebuild batch size is invalid",
+		)
+	}
 	type indexedChunk struct {
 		models.KnowledgeChunk
 		DocumentVersion uint64 `gorm:"column:document_version"`
 	}
 	var rows []indexedChunk
-	err := service.db.WithContext(ctx).
+	query := service.db.WithContext(ctx).
 		Table("knowledge_chunks AS chunks").
 		Select("chunks.*, versions.version AS document_version").
 		Joins(
@@ -1324,18 +2200,40 @@ func (service *KnowledgeService) loadKnowledgeIndexDocuments(
 				"AND versions.organization_id = chunks.organization_id "+
 				"AND versions.project_id = chunks.project_id",
 		).
+		Joins(
+			"JOIN knowledge_articles AS articles "+
+				"ON articles.id = versions.article_id "+
+				"AND articles.organization_id = versions.organization_id "+
+				"AND articles.project_id = versions.project_id "+
+				"AND articles.current_version_id = versions.id",
+		).
 		Where(
 			"chunks.organization_id = ? AND chunks.project_id = ? "+
+				"AND articles.status = ? "+
 				"AND versions.status = ? AND versions.virus_scan = ?",
 			scope.OrganizationID,
 			scope.ProjectID,
+			models.KnowledgeArticleActive,
 			models.KnowledgeVersionPublished,
 			models.VirusScanClean,
-		).
-		Order("chunks.article_id ASC, versions.version ASC, chunks.ordinal ASC").
+		)
+	if afterChunkID = strings.TrimSpace(afterChunkID); afterChunkID != "" {
+		query = query.Where("chunks.id > ?", afterChunkID)
+	}
+	err := query.
+		Order("chunks.id ASC").
+		Limit(limit).
 		Scan(&rows).Error
 	if err != nil {
-		return nil, "", fmt.Errorf("load knowledge index chunks: %w", err)
+		return nil, "", false, fmt.Errorf(
+			"load knowledge index chunk batch: %w",
+			err,
+		)
+	}
+	exhausted := len(rows) < limit
+	nextChunkID := afterChunkID
+	if len(rows) > 0 {
+		nextChunkID = rows[len(rows)-1].ID
 	}
 	articleIDs := make([]string, 0)
 	seenArticles := make(map[string]struct{})
@@ -1359,7 +2257,10 @@ func (service *KnowledgeService) loadKnowledgeIndexDocuments(
 			},
 		).Order("article_id ASC, subject_type ASC, subject_id ASC").
 			Find(&aclRows).Error; err != nil {
-			return nil, "", fmt.Errorf("load knowledge index ACL: %w", err)
+			return nil, "", false, fmt.Errorf(
+				"load knowledge index ACL batch: %w",
+				err,
+			)
 		}
 	}
 	aclByArticle := make(map[string][]models.KnowledgeACLSubject)
@@ -1370,7 +2271,6 @@ func (service *KnowledgeService) loadKnowledgeIndexDocuments(
 		)
 	}
 	documents := make([]HybridIndexDocument, 0, len(rows))
-	digestInput := make([]string, 0, len(rows))
 	for _, row := range rows {
 		subjects := aclByArticle[row.ArticleID]
 		if len(subjects) == 0 {
@@ -1390,13 +2290,8 @@ func (service *KnowledgeService) loadKnowledgeIndexDocuments(
 			TokenCount:      row.TokenCount,
 			ACLSubjects:     append([]models.KnowledgeACLSubject(nil), subjects...),
 		})
-		digestInput = append(
-			digestInput,
-			row.ID+":"+row.ContentHash+":"+knowledgeSubjectsDigest(subjects),
-		)
 	}
-	digest := sha256.Sum256([]byte(strings.Join(digestInput, "\n")))
-	return documents, hex.EncodeToString(digest[:]), nil
+	return documents, nextChunkID, exhausted, nil
 }
 
 func (service *KnowledgeService) resolveKnowledgeSubjects(
@@ -1463,7 +2358,7 @@ func (service *KnowledgeService) resolveKnowledgeModelPolicy(
 		true,
 	).First(&policy).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return policy, nil, ErrKnowledgeModelPolicyDenied
+			return policy, nil, ErrKnowledgeModelPolicyUnavailable
 		}
 		return policy, nil, fmt.Errorf("load knowledge model policy: %w", err)
 	}
@@ -1472,7 +2367,7 @@ func (service *KnowledgeService) resolveKnowledgeModelPolicy(
 	}
 	provider, exists := service.modelProviders[policy.ProviderKey]
 	if !exists || provider == nil {
-		return policy, nil, ErrKnowledgeModelPolicyDenied
+		return policy, nil, ErrKnowledgeModelPolicyUnavailable
 	}
 	descriptor := provider.Descriptor()
 	if descriptor.Key != policy.ProviderKey {
@@ -1520,6 +2415,44 @@ func modelLimitsFromPolicy(
 		RequestsPerMinute:       policy.RequestsPerMinute,
 		TokensPerMinute:         policy.TokensPerMinute,
 	}
+}
+
+func knowledgeModelPolicyAuditDigest(
+	policy models.ProjectModelPolicy,
+) string {
+	payload, _ := json.Marshal(struct {
+		PolicyKey               string
+		ProviderKey             string
+		GenerateModel           string
+		EmbeddingModel          string
+		RerankModel             string
+		DataEgress              models.ModelDataEgressMode
+		RedactionRules          json.RawMessage
+		ProviderAllowlist       json.RawMessage
+		ModelAllowlist          json.RawMessage
+		MonthlyTokenBudget      int64
+		MonthlyCostBudgetMicros int64
+		RequestsPerMinute       int
+		TokensPerMinute         int
+		IsActive                bool
+	}{
+		PolicyKey:               policy.PolicyKey,
+		ProviderKey:             policy.ProviderKey,
+		GenerateModel:           policy.GenerateModel,
+		EmbeddingModel:          policy.EmbeddingModel,
+		RerankModel:             policy.RerankModel,
+		DataEgress:              policy.DataEgress,
+		RedactionRules:          json.RawMessage(policy.RedactionRules),
+		ProviderAllowlist:       json.RawMessage(policy.ProviderAllowlist),
+		ModelAllowlist:          json.RawMessage(policy.ModelAllowlist),
+		MonthlyTokenBudget:      policy.MonthlyTokenBudget,
+		MonthlyCostBudgetMicros: policy.MonthlyCostBudgetMicros,
+		RequestsPerMinute:       policy.RequestsPerMinute,
+		TokensPerMinute:         policy.TokensPerMinute,
+		IsActive:                policy.IsActive,
+	})
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
 }
 
 func validateKnowledgeSearchHit(
@@ -1600,7 +2533,7 @@ func (service *KnowledgeService) requestKnowledgeIndexRebuildTx(
 		ctx,
 		tx,
 		DomainEventInput{
-			Type: "io.chronodesk.knowledge.index-rebuild.requested.v1",
+			Type: eventcontract.KnowledgeIndexRebuildRequestedEventType,
 			Subject: fmt.Sprintf(
 				"knowledge/index-rebuild/%s",
 				state.ID,

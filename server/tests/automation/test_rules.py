@@ -83,13 +83,29 @@ class TestAutomationRules:
 
             # List rules and ensure new rule present
             list_resp = admin_api.get_json(
-                admin_api.project_path("admin/automation/rules")
+                admin_api.project_path("admin/automation/rules"),
+                params={"page": 1, "page_size": 50},
             )
             assert list_resp.status_code == 200, list_resp.text
             list_body = list_resp.json()
             assert list_body.get("success") is True, list_body
-            list_data = list_body.get("data", {})
-            rules: list[dict[str, object]] = list_data.get("rules", [])
+            assert set(list_body) == {"success", "message", "data"}, list_body
+            list_data = list_body["data"]
+            assert isinstance(list_data, dict), list_body
+            assert set(list_data) == {
+                "items",
+                "total",
+                "page",
+                "page_size",
+                "total_pages",
+            }, list_data
+            assert list_data["page"] == 1, list_data
+            assert list_data["page_size"] == 50, list_data
+            assert isinstance(list_data["total"], int), list_data
+            assert isinstance(list_data["total_pages"], int), list_data
+            rules = list_data["items"]
+            assert isinstance(rules, list), list_data
+            assert len(rules) <= 50, list_data
             assert any(rule.get("id") == created_rule_id for rule in rules), (
                 "规则列表未包含新建规则"
             )
@@ -134,11 +150,19 @@ class TestAutomationRules:
             # Execution logs (likely empty but endpoint should succeed)
             logs_resp = admin_api.get_json(
                 admin_api.project_path("admin/automation/logs"),
-                params={"rule_id": created_rule_id, "page_size": 5},
+                params={"rule_id": created_rule_id, "limit": 5},
             )
             assert logs_resp.status_code == 200, logs_resp.text
             logs_body = logs_resp.json()
             assert logs_body.get("success") is True, logs_body
+            assert set(logs_body) == {"success", "message", "data"}, logs_body
+            logs_data = logs_body["data"]
+            assert isinstance(logs_data, dict), logs_body
+            assert set(logs_data) == {"items", "next_cursor", "has_more"}, logs_data
+            assert isinstance(logs_data["items"], list), logs_data
+            assert len(logs_data["items"]) <= 5, logs_data
+            assert isinstance(logs_data["next_cursor"], str), logs_data
+            assert isinstance(logs_data["has_more"], bool), logs_data
 
         finally:
             if created_rule_id is not None:

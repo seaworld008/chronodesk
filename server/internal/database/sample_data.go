@@ -199,10 +199,21 @@ func sampleProjectRoleForEmail(email string) (models.ProjectRole, bool) {
 // createSampleCategories 创建示例分类
 func (g *SampleDataGenerator) createSampleCategories() error {
 	log.Println("📁 创建示例分类...")
+	scope, err := defaultPlatformRoleCutoverScope(g.db)
+	if err != nil {
+		return fmt.Errorf("获取示例分类项目范围失败: %w", err)
+	}
 
 	// 检查是否已有示例分类
 	var count int64
-	if err := g.db.Model(&models.Category{}).Where("name LIKE ?", "%示例%").Count(&count).Error; err != nil {
+	if err := g.db.Model(&models.Category{}).
+		Where(
+			"organization_id = ? AND project_id = ? AND name LIKE ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+			"%示例%",
+		).
+		Count(&count).Error; err != nil {
 		return err
 	}
 
@@ -222,34 +233,40 @@ func (g *SampleDataGenerator) createSampleCategories() error {
 
 	categories := []models.Category{
 		{
-			Name:        "系统故障示例",
-			Slug:        "system-issues-sample",
-			Description: "系统相关故障和问题示例分类",
-			Type:        models.CategoryTypeIncident,
-			Status:      models.CategoryStatusActive,
-			IsPublic:    true,
-			SortOrder:   10,
-			CreatedBy:   adminUser.ID,
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			Name:           "系统故障示例",
+			Slug:           "system-issues-sample",
+			Description:    "系统相关故障和问题示例分类",
+			Type:           models.CategoryTypeIncident,
+			Status:         models.CategoryStatusActive,
+			IsPublic:       true,
+			SortOrder:      10,
+			CreatedBy:      adminUser.ID,
 		},
 		{
-			Name:        "功能请求示例",
-			Slug:        "feature-requests-sample",
-			Description: "新功能和改进请求示例分类",
-			Type:        models.CategoryTypeRequest,
-			Status:      models.CategoryStatusActive,
-			IsPublic:    true,
-			SortOrder:   20,
-			CreatedBy:   adminUser.ID,
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			Name:           "功能请求示例",
+			Slug:           "feature-requests-sample",
+			Description:    "新功能和改进请求示例分类",
+			Type:           models.CategoryTypeRequest,
+			Status:         models.CategoryStatusActive,
+			IsPublic:       true,
+			SortOrder:      20,
+			CreatedBy:      adminUser.ID,
 		},
 		{
-			Name:        "用户咨询示例",
-			Slug:        "user-inquiry-sample",
-			Description: "用户咨询和使用问题示例分类",
-			Type:        models.CategoryTypeSupport,
-			Status:      models.CategoryStatusActive,
-			IsPublic:    true,
-			SortOrder:   30,
-			CreatedBy:   adminUser.ID,
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			Name:           "用户咨询示例",
+			Slug:           "user-inquiry-sample",
+			Description:    "用户咨询和使用问题示例分类",
+			Type:           models.CategoryTypeSupport,
+			Status:         models.CategoryStatusActive,
+			IsPublic:       true,
+			SortOrder:      30,
+			CreatedBy:      adminUser.ID,
 		},
 	}
 
@@ -267,6 +284,10 @@ func (g *SampleDataGenerator) createSampleCategories() error {
 // createSampleTickets 创建示例工单
 func (g *SampleDataGenerator) createSampleTickets() error {
 	log.Println("🎫 创建示例工单...")
+	scope, err := defaultPlatformRoleCutoverScope(g.db)
+	if err != nil {
+		return fmt.Errorf("获取示例工单项目范围失败: %w", err)
+	}
 
 	// 检查是否已有示例工单
 	var count int64
@@ -281,7 +302,12 @@ func (g *SampleDataGenerator) createSampleTickets() error {
 
 	// 获取分类
 	var categories []models.Category
-	if err := g.db.Where("name LIKE ?", "%示例%").Find(&categories).Error; err != nil {
+	if err := g.db.Where(
+		"organization_id = ? AND project_id = ? AND name LIKE ?",
+		scope.OrganizationID,
+		scope.ProjectID,
+		"%示例%",
+	).Find(&categories).Error; err != nil {
 		return fmt.Errorf("获取示例分类失败: %w", err)
 	}
 
@@ -379,6 +405,8 @@ func (g *SampleDataGenerator) createSampleTickets() error {
 		ticketNumber := fmt.Sprintf("TK%s%03d", time.Now().Format("20060102"), i+1)
 
 		ticket := models.Ticket{
+			OrganizationID:     scope.OrganizationID,
+			ProjectID:          scope.ProjectID,
 			TicketNumber:       ticketNumber,
 			Title:              template.Title,
 			Description:        template.Description,

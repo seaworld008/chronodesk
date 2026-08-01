@@ -1,11 +1,14 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/safeconv"
@@ -33,29 +36,85 @@ type categoryListFilter struct {
 	Search   string `json:"search"`
 }
 
+type categoryResponse struct {
+	ID          uint                  `json:"id"`
+	Name        string                `json:"name"`
+	Slug        string                `json:"slug"`
+	Description string                `json:"description"`
+	Icon        string                `json:"icon"`
+	Color       string                `json:"color"`
+	Type        models.CategoryType   `json:"type"`
+	Status      models.CategoryStatus `json:"status"`
+	SortOrder   int                   `json:"sort_order"`
+	ParentID    *uint                 `json:"parent_id"`
+	Level       int                   `json:"level"`
+	Path        string                `json:"path"`
+	IsDefault   bool                  `json:"is_default"`
+	IsPublic    bool                  `json:"is_public"`
+}
+
+var categoryListQuerySpec = directoryListQuerySpec{
+	DefaultSortBy:    "sort_order",
+	DefaultSortOrder: "asc",
+	SortFields: map[string]struct{}{
+		"id":         {},
+		"name":       {},
+		"slug":       {},
+		"sort_order": {},
+		"status":     {},
+		"type":       {},
+	},
+	FilterFields: map[string]struct{}{
+		"filter": {},
+		"search": {},
+		"sort":   {},
+		"status": {},
+	},
+}
+
 func (h *CategoryHandler) List(c *gin.Context) {
-	page := parsePositiveInt(c.Query("page"), 1, 1_000_000)
-	pageSize := parsePositiveInt(c.Query("page_size"), 25, 100)
+	query, ok := h.visibleQuery(c)
+	if !ok {
+		return
+	}
+	listQuery, err := parseDirectoryListQuery(
+		c.Request.URL.RawQuery,
+		categoryListQuerySpec,
+	)
+	if err != nil {
+		writeInvalidCategoryListQuery(c)
+		return
+	}
+	sortBy, sortOrder, err := categoryListSort(listQuery)
+	if err != nil {
+		writeInvalidCategoryListQuery(c)
+		return
+	}
 
 	var filter categoryListFilter
-	if rawFilter := strings.TrimSpace(c.Query("filter")); rawFilter != "" {
-		if err := json.Unmarshal([]byte(rawFilter), &filter); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"code": 1,
-				"msg":  "分类筛选条件无效",
-			})
+	if rawFilter, ok := listQuery.value("filter"); ok {
+		if err := decodeCategoryListFilter(rawFilter, &filter); err != nil {
+			writeInvalidCategoryListQuery(c)
 			return
 		}
 	}
-
-	query := h.visibleQuery(c).Model(&models.Category{})
-	if len(filter.IDs) > 0 {
-		query = query.Where("id IN ?", filter.IDs)
+	if err := validateCategoryListFilter(filter); err != nil {
+		writeInvalidCategoryListQuery(c)
+		return
 	}
 
-	status := strings.TrimSpace(c.Query("status"))
-	if status == "" {
-		status = strings.TrimSpace(filter.Status)
+	query = query.Model(&models.Category{})
+	if len(filter.IDs) > 0 {
+		query = query.Where("categories.id IN ?", filter.IDs)
+	}
+
+	status, directStatus := listQuery.value("status")
+	if directStatus && filter.Status != "" {
+		writeInvalidCategoryListQuery(c)
+		return
+	}
+	if !directStatus {
+		status = filter.Status
 	}
 	if status != "" {
 		switch models.CategoryStatus(status) {
@@ -74,12 +133,18 @@ func (h *CategoryHandler) List(c *gin.Context) {
 		query = query.Where("parent_id = ?", *filter.ParentID)
 	}
 
-	search := strings.TrimSpace(c.Query("search"))
-	if search == "" {
-		search = strings.TrimSpace(filter.Search)
+	search, directSearch := listQuery.value("search")
+	filterSearch, err := categoryFilterSearch(filter)
+	if err != nil || directSearch && filterSearch != "" {
+		writeInvalidCategoryListQuery(c)
+		return
 	}
-	if search == "" {
-		search = strings.TrimSpace(filter.Q)
+	if !directSearch {
+		search = filterSearch
+	}
+	if err := validateDirectorySearch(search); err != nil {
+		writeInvalidCategoryListQuery(c)
+		return
 	}
 	if search != "" {
 		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(search)
@@ -102,9 +167,9 @@ func (h *CategoryHandler) List(c *gin.Context) {
 
 	var categories []models.Category
 	if err := query.
-		Order("sort_order ASC, name ASC, id ASC").
-		Limit(pageSize).
-		Offset((page - 1) * pageSize).
+		Order(categoryOrderClause(sortBy, sortOrder)).
+		Limit(listQuery.PageSize).
+		Offset((listQuery.Page - 1) * listQuery.PageSize).
 		Find(&categories).Error; err != nil {
 		logHandlerFailure(c, "category.list", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -114,17 +179,28 @@ func (h *CategoryHandler) List(c *gin.Context) {
 		return
 	}
 
+	items := make([]categoryResponse, 0, len(categories))
+	for i := range categories {
+		items = append(items, categoryDTO(&categories[i]))
+	}
 	c.Header("X-Total-Count", strconv.FormatInt(total, 10))
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"data": gin.H{
-			"items": categories,
-			"total": total,
+			"items":       items,
+			"total":       total,
+			"page":        listQuery.Page,
+			"page_size":   listQuery.PageSize,
+			"total_pages": directoryTotalPages(total, listQuery.PageSize),
 		},
 	})
 }
 
 func (h *CategoryHandler) Get(c *gin.Context) {
+	query, ok := h.visibleQuery(c)
+	if !ok {
+		return
+	}
 	id, err := safeconv.ParsePositiveUint(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -135,7 +211,8 @@ func (h *CategoryHandler) Get(c *gin.Context) {
 	}
 
 	var category models.Category
-	if err := h.visibleQuery(c).First(&category, id).Error; err != nil {
+	if err := query.Where("categories.id = ?", id).
+		First(&category).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{
 				"code": 1,
@@ -153,28 +230,200 @@ func (h *CategoryHandler) Get(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
-		"data": category,
+		"data": categoryDTO(&category),
 	})
 }
 
-func (h *CategoryHandler) visibleQuery(c *gin.Context) *gorm.DB {
-	query := h.db.WithContext(c.Request.Context()).Model(&models.Category{})
-	switch normalizedProjectRole(c) {
-	case string(models.ProjectRoleAdmin),
-		string(models.ProjectRoleManager):
-		return query
+func (h *CategoryHandler) visibleQuery(
+	c *gin.Context,
+) (*gorm.DB, bool) {
+	access, ok := ProjectAccessFromGin(c)
+	if !ok || access.Scope.Validate() != nil {
+		c.JSON(http.StatusForbidden, gin.H{
+			"code": "project_access_denied",
+			"msg":  "无权访问该项目",
+		})
+		return nil, false
+	}
+	query := h.db.WithContext(c.Request.Context()).
+		Model(&models.Category{}).
+		Where(
+			"categories.organization_id = ? AND categories.project_id = ?",
+			access.Scope.OrganizationID,
+			access.Scope.ProjectID,
+		)
+	switch access.Role {
+	case models.ProjectRoleAdmin,
+		models.ProjectRoleManager:
+		return query, true
 	default:
-		return query.Where("status = ? AND is_public = ?", models.CategoryStatusActive, true)
+		return query.Where(
+			"categories.status = ? AND categories.is_public = ?",
+			models.CategoryStatusActive,
+			true,
+		), true
 	}
 }
 
-func parsePositiveInt(value string, fallback, max int) int {
-	parsed, err := strconv.Atoi(value)
-	if err != nil || parsed < 1 {
-		return fallback
+func writeInvalidCategoryListQuery(c *gin.Context) {
+	c.JSON(http.StatusBadRequest, gin.H{
+		"code": 1,
+		"msg":  "分类筛选条件无效",
+	})
+}
+
+func decodeCategoryListFilter(
+	raw string,
+	filter *categoryListFilter,
+) error {
+	if len(raw) > 8_192 || raw == "" || raw[0] != '{' {
+		return errInvalidDirectoryListQuery
 	}
-	if parsed > max {
-		return max
+	decoder := json.NewDecoder(bytes.NewBufferString(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(filter); err != nil {
+		return errInvalidDirectoryListQuery
 	}
-	return parsed
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errInvalidDirectoryListQuery
+	}
+	return nil
+}
+
+func validateCategoryListFilter(filter categoryListFilter) error {
+	if len(filter.IDs) > 100 {
+		return errInvalidDirectoryListQuery
+	}
+	seen := make(map[uint]struct{}, len(filter.IDs))
+	for _, id := range filter.IDs {
+		if id == 0 {
+			return errInvalidDirectoryListQuery
+		}
+		if _, exists := seen[id]; exists {
+			return errInvalidDirectoryListQuery
+		}
+		seen[id] = struct{}{}
+	}
+	if filter.ParentID != nil && *filter.ParentID == 0 {
+		return errInvalidDirectoryListQuery
+	}
+	if filter.Status != "" {
+		switch models.CategoryStatus(filter.Status) {
+		case models.CategoryStatusActive,
+			models.CategoryStatusInactive,
+			models.CategoryStatusArchived:
+		default:
+			return errInvalidDirectoryListQuery
+		}
+	}
+	_, err := categoryFilterSearch(filter)
+	return err
+}
+
+func categoryFilterSearch(filter categoryListFilter) (string, error) {
+	if filter.Q != "" && filter.Search != "" {
+		return "", errInvalidDirectoryListQuery
+	}
+	search := filter.Search
+	if search == "" {
+		search = filter.Q
+	}
+	if err := validateDirectorySearch(search); err != nil {
+		return "", err
+	}
+	return search, nil
+}
+
+func validateDirectorySearch(search string) error {
+	if search == "" {
+		return nil
+	}
+	if strings.TrimSpace(search) != search ||
+		!utf8.ValidString(search) ||
+		utf8.RuneCountInString(search) > 200 ||
+		containsDirectoryQueryControl(search) {
+		return errInvalidDirectoryListQuery
+	}
+	return nil
+}
+
+func categoryListSort(
+	query directoryListQuery,
+) (string, string, error) {
+	legacySort, legacy := query.value("sort")
+	_, hasSortBy := query.value("sort_by")
+	_, hasSortOrder := query.value("sort_order")
+	if !legacy {
+		return query.SortBy, query.SortOrder, nil
+	}
+	if hasSortBy || hasSortOrder {
+		return "", "", errInvalidDirectoryListQuery
+	}
+	var values []string
+	decoder := json.NewDecoder(bytes.NewBufferString(legacySort))
+	if err := decoder.Decode(&values); err != nil || len(values) != 2 {
+		return "", "", errInvalidDirectoryListQuery
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return "", "", errInvalidDirectoryListQuery
+	}
+	if _, ok := categoryListQuerySpec.SortFields[values[0]]; !ok {
+		return "", "", errInvalidDirectoryListQuery
+	}
+	order := strings.ToLower(values[1])
+	if order != "asc" && order != "desc" {
+		return "", "", errInvalidDirectoryListQuery
+	}
+	return values[0], order, nil
+}
+
+func categoryOrderClause(sortBy, sortOrder string) string {
+	columns := map[string]string{
+		"id":         "categories.id",
+		"name":       "categories.name",
+		"slug":       "categories.slug",
+		"sort_order": "categories.sort_order",
+		"status":     "categories.status",
+		"type":       "categories.type",
+	}
+	order := "ASC"
+	if sortOrder == "desc" {
+		order = "DESC"
+	}
+	if sortBy == "id" {
+		return columns[sortBy] + " " + order
+	}
+	if sortBy == "sort_order" {
+		return columns[sortBy] + " " + order +
+			", categories.name " + order +
+			", categories.id " + order
+	}
+	return columns[sortBy] + " " + order +
+		", categories.id " + order
+}
+
+func categoryDTO(category *models.Category) categoryResponse {
+	return categoryResponse{
+		ID:          category.ID,
+		Name:        category.Name,
+		Slug:        category.Slug,
+		Description: category.Description,
+		Icon:        category.Icon,
+		Color:       category.Color,
+		Type:        category.Type,
+		Status:      category.Status,
+		SortOrder:   category.SortOrder,
+		ParentID:    category.ParentID,
+		Level:       category.Level,
+		Path:        category.Path,
+		IsDefault:   category.IsDefault,
+		IsPublic:    category.IsPublic,
+	}
+}
+
+func directoryTotalPages(total int64, pageSize int) int64 {
+	if total == 0 {
+		return 0
+	}
+	return (total-1)/int64(pageSize) + 1
 }

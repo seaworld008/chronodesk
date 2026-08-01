@@ -20,6 +20,34 @@ const (
 	NotificationTypeSystemAlert         NotificationType = "system_alert"          // 系统警报
 )
 
+var notificationTypes = [...]NotificationType{
+	NotificationTypeTicketAssigned,
+	NotificationTypeTicketStatusChanged,
+	NotificationTypeTicketCommented,
+	NotificationTypeTicketCreated,
+	NotificationTypeTicketOverdue,
+	NotificationTypeTicketResolved,
+	NotificationTypeTicketClosed,
+	NotificationTypeSystemMaintenance,
+	NotificationTypeUserMention,
+	NotificationTypeSystemAlert,
+}
+
+func (value NotificationType) IsValid() bool {
+	for _, allowed := range notificationTypes {
+		if value == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func NotificationTypes() []NotificationType {
+	values := make([]NotificationType, len(notificationTypes))
+	copy(values, notificationTypes[:])
+	return values
+}
+
 // NotificationPriority 通知优先级
 type NotificationPriority string
 

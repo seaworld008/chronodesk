@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -27,12 +29,17 @@ type directoryListQuery struct {
 	PageSize  int
 	SortBy    string
 	SortOrder string
+	values    url.Values
 }
 
 func parseDirectoryListQuery(
-	values url.Values,
+	rawQuery string,
 	spec directoryListQuerySpec,
 ) (directoryListQuery, error) {
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return directoryListQuery{}, errInvalidDirectoryListQuery
+	}
 	if spec.DefaultSortBy == "" ||
 		(spec.DefaultSortOrder != "asc" &&
 			spec.DefaultSortOrder != "desc") {
@@ -53,7 +60,12 @@ func parseDirectoryListQuery(
 	}
 	for key, entries := range values {
 		if _, ok := allowed[key]; !ok || len(entries) != 1 ||
-			strings.TrimSpace(entries[0]) == "" {
+			!utf8.ValidString(key) ||
+			!utf8.ValidString(entries[0]) ||
+			containsDirectoryQueryControl(key) ||
+			containsDirectoryQueryControl(entries[0]) ||
+			strings.TrimSpace(entries[0]) == "" ||
+			strings.TrimSpace(entries[0]) != entries[0] {
 			return directoryListQuery{}, errInvalidDirectoryListQuery
 		}
 	}
@@ -100,7 +112,17 @@ func parseDirectoryListQuery(
 		PageSize:  pageSize,
 		SortBy:    sortBy,
 		SortOrder: sortOrder,
+		values:    values,
 	}, nil
+}
+
+func containsDirectoryQueryControl(value string) bool {
+	for _, char := range value {
+		if unicode.IsControl(char) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseDirectoryPositiveInt(
@@ -126,11 +148,8 @@ func parseDirectoryPositiveInt(
 	return int(parsed), nil
 }
 
-func directoryQueryValue(
-	values url.Values,
-	key string,
-) (string, bool) {
-	entry, ok := values[key]
+func (query directoryListQuery) value(key string) (string, bool) {
+	entry, ok := query.values[key]
 	if !ok {
 		return "", false
 	}

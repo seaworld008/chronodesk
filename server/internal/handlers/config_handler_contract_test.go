@@ -35,6 +35,7 @@ func TestPlatformConfigListRejectsInvalidDirectoryQueries(t *testing.T) {
 		"category=unknown",
 		"category=system&category=security",
 		"unknown=value",
+		"page=%ZZ",
 	} {
 		response := httptest.NewRecorder()
 		router.ServeHTTP(
@@ -53,6 +54,79 @@ func TestPlatformConfigListRejectsInvalidDirectoryQueries(t *testing.T) {
 				response.Body.String(),
 			)
 		}
+	}
+}
+
+func TestPlatformConfigExportRejectsAmbiguousQueriesAndOversizedData(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewConfigHandler(db)
+	router := gin.New()
+	router.GET("/configs/export", handler.ExportConfigs)
+
+	for _, query := range []string{
+		"category=",
+		"category=system&category=security",
+		"format=",
+		"format=csv",
+		"format=json&format=json",
+		"unknown=value",
+		"category=%20system",
+		"category=%ZZ",
+	} {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(
+			response,
+			httptest.NewRequest(
+				http.MethodGet,
+				"/configs/export?"+query,
+				nil,
+			),
+		)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf(
+				"query %q status=%d body=%s",
+				query,
+				response.Code,
+				response.Body,
+			)
+		}
+	}
+
+	if err := db.Create(&models.SystemConfig{
+		Key:       "system.export.handler.large",
+		Value:     strings.Repeat("x", services.MaxConfigExportBytes),
+		ValueType: "string",
+		Category:  services.CategorySystem,
+		Group:     "export",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	router.ServeHTTP(
+		response,
+		httptest.NewRequest(http.MethodGet, "/configs/export", nil),
+	)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body)
+	}
+	var payload struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Success ||
+		payload.Error != "export_too_large" ||
+		payload.Message != "系统配置导出超过大小限制" {
+		t.Fatalf("oversized export response = %+v", payload)
 	}
 }
 
@@ -335,6 +409,45 @@ func TestPlatformConfigUpdateUsesClosedRuntimeDTO(t *testing.T) {
 		if _, ok := payload.Data[key]; !ok {
 			t.Errorf("response data omits %q: %v", key, payload.Data)
 		}
+	}
+}
+
+func TestPlatformConfigRejectsProtectedRuntimeControlKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewConfigHandler(db)
+	router := gin.New()
+	router.PUT("/configs/:key", handler.UpdateConfig)
+
+	request := httptest.NewRequest(
+		http.MethodPut,
+		"/configs/agent.global_read_only",
+		strings.NewReader(
+			`{"value":"true","value_type":"bool","category":"security","group":"agent"}`,
+		),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf(
+			"status = %d, want 403; body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	var payload struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Success || payload.Error != "protected_config_key" {
+		t.Fatalf("protected config response = %+v", payload)
 	}
 }
 

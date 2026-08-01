@@ -94,7 +94,8 @@ func TestPostgresTicketPaginationIndexesSupportScopedQueries(t *testing.T) {
 			public_id, organization_id, project_id, queue_id,
 			request_type_version_id, workflow_version_id, ticket_number,
 			title, description, type, priority, status, source,
-			version, trust_level, sla_breached, created_at, updated_at
+			version, trust_level, created_by_actor_type, created_by_actor_id,
+			sla_breached, created_at, updated_at
 		)
 		SELECT
 			? || LPAD(series::text, 32, '0'), ?, ?, ?, '', '',
@@ -102,7 +103,7 @@ func TestPostgresTicketPaginationIndexesSupportScopedQueries(t *testing.T) {
 			'SLA pagination fixture', 'SLA pagination fixture',
 			'request', 'normal',
 			(ARRAY['open', 'in_progress', 'pending'])[((series - 1) % 3) + 1],
-			'web', 1, 'untrusted', TRUE,
+			'web', 1, 'untrusted', 'system', 'ticket-pagination-test', TRUE,
 			TIMESTAMPTZ '2026-01-01 00:00:00+00' + series * INTERVAL '1 minute',
 			TIMESTAMPTZ '2026-01-01 00:00:00+00' + series * INTERVAL '1 minute'
 		FROM generate_series(1, ?) AS series
@@ -124,13 +125,15 @@ func TestPostgresTicketPaginationIndexesSupportScopedQueries(t *testing.T) {
 			public_id, organization_id, project_id, queue_id,
 			request_type_version_id, workflow_version_id, ticket_number,
 			title, description, type, priority, status, source,
-			version, trust_level, sla_breached, created_at, updated_at
+			version, trust_level, created_by_actor_type, created_by_actor_id,
+			sla_breached, created_at, updated_at
 		)
 		SELECT
 			'p1r-' || LPAD(series::text, 32, '0'), ?, ?, ?, '', '',
 			'P1-R-' || LPAD(series::text, 3, '0'),
 			'Resolved SLA fixture', 'Resolved SLA fixture',
-			'request', 'normal', 'resolved', 'web', 1, 'untrusted', TRUE,
+			'request', 'normal', 'resolved', 'web', 1, 'untrusted',
+			'system', 'ticket-pagination-test', TRUE,
 			TIMESTAMPTZ '2026-02-01 00:00:00+00' + series * INTERVAL '1 minute',
 			TIMESTAMPTZ '2026-02-01 00:00:00+00' + series * INTERVAL '1 minute'
 		FROM generate_series(1, 30) AS series
@@ -142,13 +145,15 @@ func TestPostgresTicketPaginationIndexesSupportScopedQueries(t *testing.T) {
 			public_id, organization_id, project_id, queue_id,
 			request_type_version_id, workflow_version_id, ticket_number,
 			title, description, type, priority, status, source,
-			version, trust_level, sla_breached, created_at, updated_at
+			version, trust_level, created_by_actor_type, created_by_actor_id,
+			sla_breached, created_at, updated_at
 		)
 		SELECT
 			'p1u-' || LPAD(series::text, 32, '0'), ?, ?, ?, '', '',
 			'P1-U-' || LPAD(series::text, 3, '0'),
 			'Unbreached SLA fixture', 'Unbreached SLA fixture',
-			'request', 'normal', 'open', 'web', 1, 'untrusted', FALSE,
+			'request', 'normal', 'open', 'web', 1, 'untrusted',
+			'system', 'ticket-pagination-test', FALSE,
 			TIMESTAMPTZ '2026-03-01 00:00:00+00' + series * INTERVAL '1 minute',
 			TIMESTAMPTZ '2026-03-01 00:00:00+00' + series * INTERVAL '1 minute'
 		FROM generate_series(1, 30) AS series
@@ -201,15 +206,16 @@ func TestPostgresTicketPaginationIndexesSupportScopedQueries(t *testing.T) {
 		t.Fatalf("build production-shape SLA query: %v", productionQuery.Error)
 	}
 	productionSQL := productionQuery.Statement.SQL.String()
-	if len(productionQuery.Statement.Vars) != 6 {
+	if len(productionQuery.Statement.Vars) != 8 {
 		t.Fatalf(
-			"production-shape SLA bind count=%d, want 6; sql=%s",
+			"production-shape SLA bind count=%d, want 8; sql=%s",
 			len(productionQuery.Statement.Vars),
 			productionSQL,
 		)
 	}
 	if !strings.Contains(productionSQL, "sla_breached = $3") ||
-		!strings.Contains(productionSQL, "status IN ($4,$5,$6)") {
+		!strings.Contains(productionSQL, "status IN ($4,$5,$6)") ||
+		!strings.Contains(productionSQL, "LIMIT $7 OFFSET $8") {
 		t.Fatalf("unexpected production-shape SLA SQL: %s", productionSQL)
 	}
 
@@ -227,13 +233,13 @@ func TestPostgresTicketPaginationIndexesSupportScopedQueries(t *testing.T) {
 	const preparedStatement = "chronodesk_ticket_sla_page"
 	if err := transaction.Exec(
 		"PREPARE " + preparedStatement +
-			" (bigint, bigint, boolean, varchar, varchar, varchar) AS " +
+			" (bigint, bigint, boolean, varchar, varchar, varchar, bigint, bigint) AS " +
 			productionSQL,
 	).Error; err != nil {
 		t.Fatalf("prepare production-shape SLA query: %v", err)
 	}
 	executeSQL := fmt.Sprintf(
-		"EXECUTE %s(%d, %d, TRUE, 'open', 'in_progress', 'pending')",
+		"EXECUTE %s(%d, %d, TRUE, 'open', 'in_progress', 'pending', 25, 25)",
 		preparedStatement,
 		project.OrganizationID,
 		project.ID,

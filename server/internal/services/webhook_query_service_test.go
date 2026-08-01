@@ -22,6 +22,15 @@ func TestWebhookQueryServiceStableCursorAndBindings(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	for _, index := range []string{
+		"idx_webhook_logs_timeline",
+		"idx_webhook_logs_status_timeline",
+		"idx_webhook_logs_event_timeline",
+	} {
+		if !db.Migrator().HasIndex(&models.WebhookLog{}, index) {
+			t.Fatalf("Webhook log index %q is missing", index)
+		}
+	}
 	ctxA := webhookQueryTestContext(t, 7, 11)
 	ctxB := webhookQueryTestContext(t, 7, 12)
 	configA := models.WebhookConfig{
@@ -89,6 +98,17 @@ func TestWebhookQueryServiceStableCursorAndBindings(t *testing.T) {
 			logs[51].ID,
 		)
 	}
+	concurrentLog := models.WebhookLog{
+		CreatedAt:      at,
+		OrganizationID: 7,
+		ProjectID:      11,
+		ConfigID:       configA.ID,
+		EventType:      models.WebhookEventSystemAlert,
+		Status:         "failed",
+	}
+	if err := db.Create(&concurrentLog).Error; err != nil {
+		t.Fatal(err)
+	}
 	second, err := service.ListDeliveries(
 		ctxA,
 		configA.ID,
@@ -106,6 +126,14 @@ func TestWebhookQueryServiceStableCursorAndBindings(t *testing.T) {
 		second.Items[0].ID != logs[50].ID ||
 		second.Items[50].ID != logs[0].ID {
 		t.Fatalf("second page = %+v", second)
+	}
+	for _, item := range second.Items {
+		if item.ID == concurrentLog.ID {
+			t.Fatalf(
+				"concurrent insert %d leaked into continuation",
+				concurrentLog.ID,
+			)
+		}
 	}
 
 	tampered := first.NextCursor[:len(first.NextCursor)-1] + "A"
@@ -221,6 +249,82 @@ func TestWebhookQueryServiceDefinitionPageAndFailClosedCursor(t *testing.T) {
 		WebhookDeliveryQuery{Limit: 25},
 	); !errors.Is(err, ErrWebhookListCursorKey) {
 		t.Fatalf("unconfigured cursor error = %v", err)
+	}
+}
+
+func TestWebhookDefinitionPageIsStableAcross151Ties(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.WebhookConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := webhookQueryTestContext(t, 13, 21)
+	createdAt := time.Date(2026, time.July, 31, 15, 0, 0, 0, time.UTC)
+	configs := make([]models.WebhookConfig, 0, 151)
+	for index := 0; index < 151; index++ {
+		configs = append(configs, models.WebhookConfig{
+			CreatedAt:      createdAt,
+			OrganizationID: 13,
+			ProjectID:      21,
+			Name:           fmt.Sprintf("stable-webhook-%03d", index),
+			Provider:       models.WebhookProviderCustom,
+			WebhookURL:     "https://example.test/callback",
+			Status:         models.WebhookStatusActive,
+			CreatedBy:      1,
+		})
+	}
+	if err := db.CreateInBatches(&configs, 50).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.WebhookConfig{
+		CreatedAt:      createdAt,
+		OrganizationID: 13,
+		ProjectID:      22,
+		Name:           "cross-project-decoy",
+		Provider:       models.WebhookProviderCustom,
+		WebhookURL:     "https://example.test/decoy",
+		Status:         models.WebhookStatusActive,
+		CreatedBy:      1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	service := NewWebhookQueryService(db)
+	first, err := service.ListDefinitions(ctx, WebhookDefinitionQuery{
+		Page:     1,
+		PageSize: 100,
+		Provider: models.WebhookProviderCustom,
+		Status:   models.WebhookStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.ListDefinitions(ctx, WebhookDefinitionQuery{
+		Page:     2,
+		PageSize: 100,
+		Provider: models.WebhookProviderCustom,
+		Status:   models.WebhookStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Total != 151 || second.Total != first.Total ||
+		first.TotalPages != 2 || second.TotalPages != 2 ||
+		len(first.Items) != 100 || len(second.Items) != 51 ||
+		first.Items[0].ID != configs[150].ID ||
+		first.Items[99].ID != configs[51].ID ||
+		second.Items[0].ID != configs[50].ID ||
+		second.Items[50].ID != configs[0].ID {
+		t.Fatalf(
+			"unstable Webhook directory: first=%+v second=%+v",
+			first,
+			second,
+		)
+	}
+	if !db.Migrator().HasIndex(
+		&models.WebhookConfig{},
+		"idx_webhook_configs_directory",
+	) {
+		t.Fatal("Webhook definition directory index is missing")
 	}
 }
 

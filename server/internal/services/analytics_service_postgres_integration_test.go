@@ -565,6 +565,8 @@ func createAnalyticsPostgresSchema(t *testing.T, db *gorm.DB) {
 		)`,
 		`CREATE TABLE categories (
 			id BIGINT PRIMARY KEY,
+			organization_id BIGINT NOT NULL,
+			project_id BIGINT NOT NULL,
 			name TEXT NOT NULL
 		)`,
 		`CREATE TABLE users (
@@ -602,8 +604,12 @@ func seedAnalyticsPostgresFixtures(t *testing.T, db *gorm.DB) {
 				(3, 20, 'OTHER', 'Other organization', 'active')`,
 		},
 		{
-			query: `INSERT INTO categories (id, name) VALUES
-				(1, 'Incident'), (2, 'Request'), (3, 'Foreign')`,
+			query: `INSERT INTO categories (
+				id, organization_id, project_id, name
+			) VALUES
+				(1, 10, 1, 'Incident'),
+				(2, 10, 2, 'Request'),
+				(3, 20, 3, 'Foreign')`,
 		},
 		{
 			query: `INSERT INTO users (id, status, platform_role) VALUES

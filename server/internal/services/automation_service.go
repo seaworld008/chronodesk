@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/listcursor"
@@ -69,25 +71,30 @@ func (s *AutomationService) slaDomainService() *SLAService {
 }
 
 const (
-	automationActorID                = "automation-rule-engine"
-	automationActionOperation        = "automation.rule.action"
-	automationRuleExecutionOperation = "automation.rule.execution"
-	automationTriggerOperation       = "automation.trigger.enqueue"
-	maxAutomationCausalDepth         = 16
-	automationReservationTTL         = 2 * time.Minute
-	automationFailureRetryDelay      = 2 * time.Second
-	automationCompletedRetentionTTL  = 365 * 24 * time.Hour
-	DefaultAutomationListSize        = 25
-	MaxAutomationListSize            = 100
-	automationLogCursorVersion       = 1
-	automationLogSortVersion         = "executed_at_desc_id_desc.v1"
+	automationActorID                 = "automation-rule-engine"
+	automationActionOperation         = "automation.rule.action"
+	automationRuleExecutionOperation  = "automation.rule.execution"
+	automationTriggerOperation        = "automation.trigger.enqueue"
+	maxAutomationCausalDepth          = 16
+	automationReservationTTL          = 2 * time.Minute
+	automationFailureRetryDelay       = 2 * time.Second
+	automationCompletedRetentionTTL   = 365 * 24 * time.Hour
+	DefaultAutomationListSize         = 25
+	MaxAutomationListSize             = 100
+	MaxAutomationCategoryFilterLength = 50
+	MaxAutomationKeywordFilterLength  = 200
+	automationLogCursorVersion        = 1
+	automationLogSortVersion          = "executed_at_desc_id_desc.v1"
 )
 
 var (
 	ErrInvalidAutomationTriggerType = errors.New("invalid automation trigger event type")
+	ErrInvalidAutomationRuleType    = errors.New("invalid automation rule type")
 	ErrInvalidAutomationListQuery   = errors.New("automation list query is invalid")
 	ErrInvalidAutomationListCursor  = errors.New("automation list cursor is invalid")
 	ErrAutomationListCursorKey      = errors.New("automation list cursor signing key is unavailable")
+	ErrQuickReplyNotFound           = errors.New("quick reply not found")
+	ErrInvalidQuickReplyTags        = errors.New("quick reply tags are invalid")
 )
 
 type AutomationExecutionLogQuery struct {
@@ -145,6 +152,9 @@ func (s *AutomationService) CreateRule(ctx context.Context, req *models.Automati
 	if err != nil {
 		return nil, err
 	}
+	if req == nil || !validAutomationRuleType(req.RuleType) {
+		return nil, ErrInvalidAutomationRuleType
+	}
 	triggerEvent, err := normalizeAutomationRuleTriggerEvent(req.TriggerEvent)
 	if err != nil {
 		return nil, err
@@ -191,6 +201,9 @@ func (s *AutomationService) GetRules(ctx context.Context, ruleType string, trigg
 	}
 	if page < 1 || pageSize < 1 || pageSize > MaxAutomationListSize {
 		return nil, 0, ErrInvalidAutomationListQuery
+	}
+	if ruleType != "" && !validAutomationRuleType(ruleType) {
+		return nil, 0, ErrInvalidAutomationRuleType
 	}
 	query := scopedAutomationQuery(
 		s.db.WithContext(ctx).Model(&models.AutomationRule{}),
@@ -259,6 +272,9 @@ func (s *AutomationService) GetRuleByID(ctx context.Context, ruleID uint) (*mode
 
 // UpdateRule 更新规则
 func (s *AutomationService) UpdateRule(ctx context.Context, ruleID uint, req *models.AutomationRuleRequest, userID uint) error {
+	if req == nil || !validAutomationRuleType(req.RuleType) {
+		return ErrInvalidAutomationRuleType
+	}
 	rule, err := s.GetRuleByID(ctx, ruleID)
 	if err != nil {
 		return err
@@ -309,6 +325,15 @@ func (s *AutomationService) UpdateRule(ctx context.Context, ruleID uint, req *mo
 		return errors.New("rule not found")
 	}
 	return nil
+}
+
+func validAutomationRuleType(ruleType string) bool {
+	switch ruleType {
+	case "assignment", "classification", "escalation", "sla":
+		return true
+	default:
+		return false
+	}
 }
 
 // DeleteRule 删除规则
@@ -2339,58 +2364,6 @@ func (s *AutomationService) decodeExecutionLogCursor(
 	}, nil
 }
 
-// GetExecutionLogs 获取执行日志
-func (s *AutomationService) GetExecutionLogs(ctx context.Context, ruleID, ticketID *uint, success *bool, page, pageSize int) ([]*models.AutomationLog, int64, error) {
-	scope, err := automationProjectScope(ctx)
-	if err != nil {
-		return nil, 0, err
-	}
-	query := scopedAutomationQuery(
-		s.db.WithContext(ctx).Model(&models.AutomationLog{}),
-		scope,
-	).
-		Preload(
-			"Rule",
-			"organization_id = ? AND project_id = ?",
-			scope.OrganizationID,
-			scope.ProjectID,
-		).
-		Preload(
-			"Ticket",
-			"organization_id = ? AND project_id = ?",
-			scope.OrganizationID,
-			scope.ProjectID,
-		)
-
-	if ruleID != nil {
-		query = query.Where("rule_id = ?", *ruleID)
-	}
-	if ticketID != nil {
-		query = query.Where("ticket_id = ?", *ticketID)
-	}
-	if success != nil {
-		query = query.Where("success = ?", *success)
-	}
-
-	var total int64
-	if err := query.Count(&total).Error; err != nil {
-		return nil, 0, fmt.Errorf("failed to count logs: %w", err)
-	}
-
-	var logs []*models.AutomationLog
-	offset := (page - 1) * pageSize
-	if err := query.
-		Order("executed_at DESC").
-		Order("id DESC").
-		Offset(offset).
-		Limit(pageSize).
-		Find(&logs).Error; err != nil {
-		return nil, 0, fmt.Errorf("failed to get logs: %w", err)
-	}
-
-	return logs, total, nil
-}
-
 // GetRuleStats 获取规则统计
 func (s *AutomationService) GetRuleStats(ctx context.Context, ruleID uint) (map[string]interface{}, error) {
 	rule, err := s.GetRuleByID(ctx, ruleID)
@@ -2502,6 +2475,10 @@ func (s *AutomationService) GetSLAConfigs(ctx context.Context, isActive *bool, p
 	if err != nil {
 		return nil, 0, err
 	}
+	offset, err := validateAutomationConfigListQuery(page, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
 	query := scopedAutomationQuery(
 		s.db.WithContext(ctx).Model(&models.SLAConfig{}),
 		scope,
@@ -2517,8 +2494,13 @@ func (s *AutomationService) GetSLAConfigs(ctx context.Context, isActive *bool, p
 	}
 
 	var configs []*models.SLAConfig
-	offset := (page - 1) * pageSize
-	if err := query.Order("is_default DESC, created_at DESC").Offset(offset).Limit(pageSize).Find(&configs).Error; err != nil {
+	if err := query.
+		Order("is_default DESC").
+		Order("created_at DESC").
+		Order("id DESC").
+		Offset(offset).
+		Limit(pageSize).
+		Find(&configs).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to get SLA configs: %w", err)
 	}
 
@@ -2698,6 +2680,14 @@ func (s *AutomationService) GetTemplates(ctx context.Context, category string, i
 	if err != nil {
 		return nil, 0, err
 	}
+	offset, err := validateAutomationConfigListQuery(page, pageSize)
+	if err != nil ||
+		!validAutomationConfigFilter(
+			category,
+			MaxAutomationCategoryFilterLength,
+		) {
+		return nil, 0, ErrInvalidAutomationListQuery
+	}
 	query := scopedAutomationQuery(
 		s.db.WithContext(ctx).Model(&models.TicketTemplate{}),
 		scope,
@@ -2716,8 +2706,12 @@ func (s *AutomationService) GetTemplates(ctx context.Context, category string, i
 	}
 
 	var templates []*models.TicketTemplate
-	offset := (page - 1) * pageSize
-	if err := query.Order("created_at DESC").Offset(offset).Limit(pageSize).Find(&templates).Error; err != nil {
+	if err := query.
+		Order("created_at DESC").
+		Order("id DESC").
+		Offset(offset).
+		Limit(pageSize).
+		Find(&templates).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to get templates: %w", err)
 	}
 
@@ -2754,13 +2748,21 @@ func (s *AutomationService) CreateQuickReply(ctx context.Context, req *models.Qu
 	if err != nil {
 		return nil, err
 	}
+	if req == nil || userID == 0 ||
+		!automationHumanActorMatches(ctx, userID) {
+		return nil, ErrInvalidQuickReplyTags
+	}
+	tags, err := normalizeQuickReplyTags(req.Tags)
+	if err != nil {
+		return nil, err
+	}
 	reply := &models.QuickReply{
 		OrganizationID: scope.OrganizationID,
 		ProjectID:      scope.ProjectID,
 		Name:           req.Name,
 		Category:       req.Category,
 		Content:        req.Content,
-		Tags:           req.Tags,
+		Tags:           tags,
 		IsPublic:       false,
 		CreatedBy:      userID,
 	}
@@ -2782,6 +2784,20 @@ func (s *AutomationService) GetQuickReplies(ctx context.Context, category, keywo
 	if err != nil {
 		return nil, 0, err
 	}
+	offset, err := validateAutomationConfigListQuery(page, pageSize)
+	if err != nil ||
+		userID == 0 ||
+		!automationHumanActorMatches(ctx, userID) ||
+		!validAutomationConfigFilter(
+			category,
+			MaxAutomationCategoryFilterLength,
+		) ||
+		!validAutomationConfigFilter(
+			keyword,
+			MaxAutomationKeywordFilterLength,
+		) {
+		return nil, 0, ErrInvalidAutomationListQuery
+	}
 	query := scopedAutomationQuery(
 		s.db.WithContext(ctx).Model(&models.QuickReply{}),
 		scope,
@@ -2799,8 +2815,13 @@ func (s *AutomationService) GetQuickReplies(ctx context.Context, category, keywo
 	}
 
 	if keyword != "" {
-		query = query.Where("name LIKE ? OR content LIKE ? OR tags LIKE ?",
-			"%"+keyword+"%", "%"+keyword+"%", "%"+keyword+"%")
+		like := "%" + escapeAutomationLike(strings.ToLower(keyword)) + "%"
+		query = query.Where(
+			"(lower(name) LIKE ? ESCAPE '\\' OR lower(content) LIKE ? ESCAPE '\\' OR lower(tags) LIKE ? ESCAPE '\\')",
+			like,
+			like,
+			like,
+		)
 	}
 
 	var total int64
@@ -2809,8 +2830,12 @@ func (s *AutomationService) GetQuickReplies(ctx context.Context, category, keywo
 	}
 
 	var replies []*models.QuickReply
-	offset := (page - 1) * pageSize
-	if err := query.Order("created_at DESC").Offset(offset).Limit(pageSize).Find(&replies).Error; err != nil {
+	if err := query.
+		Order("created_at DESC").
+		Order("id DESC").
+		Offset(offset).
+		Limit(pageSize).
+		Find(&replies).Error; err != nil {
 		return nil, 0, fmt.Errorf("failed to get quick replies: %w", err)
 	}
 
@@ -2818,23 +2843,117 @@ func (s *AutomationService) GetQuickReplies(ctx context.Context, category, keywo
 }
 
 // UseQuickReply 使用快速回复（增加使用计数）
-func (s *AutomationService) UseQuickReply(ctx context.Context, replyID uint) error {
+func (s *AutomationService) UseQuickReply(
+	ctx context.Context,
+	replyID uint,
+	userID uint,
+) error {
 	scope, err := automationProjectScope(ctx)
 	if err != nil {
 		return err
 	}
+	if replyID == 0 || userID == 0 {
+		return ErrQuickReplyNotFound
+	}
+	if !automationHumanActorMatches(ctx, userID) {
+		return ErrQuickReplyNotFound
+	}
 	result := scopedAutomationQuery(
 		s.db.WithContext(ctx).Model(&models.QuickReply{}),
 		scope,
-	).Where("id = ?", replyID).
+	).Where(
+		"id = ? AND (created_by = ? OR is_public = ?)",
+		replyID,
+		userID,
+		true,
+	).
 		UpdateColumn("usage_count", gorm.Expr("usage_count + ?", 1))
 	if result.Error != nil {
 		return result.Error
 	}
 	if result.RowsAffected != 1 {
-		return errors.New("quick reply not found")
+		return ErrQuickReplyNotFound
 	}
 	return nil
+}
+
+func validateAutomationConfigListQuery(page, pageSize int) (int, error) {
+	if page < 1 ||
+		pageSize < 1 ||
+		pageSize > MaxAutomationListSize ||
+		page > math.MaxInt/pageSize {
+		return 0, ErrInvalidAutomationListQuery
+	}
+	return (page - 1) * pageSize, nil
+}
+
+func validAutomationConfigFilter(value string, maximum int) bool {
+	if value == "" {
+		return true
+	}
+	if maximum < 1 ||
+		!utf8.ValidString(value) ||
+		strings.TrimSpace(value) != value ||
+		len([]rune(value)) > maximum {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
+}
+
+func escapeAutomationLike(value string) string {
+	return strings.NewReplacer(
+		`\`, `\\`,
+		`%`, `\%`,
+		`_`, `\_`,
+	).Replace(value)
+}
+
+func automationHumanActorMatches(ctx context.Context, userID uint) bool {
+	operation, err := OperationContextFromContext(ctx)
+	return err == nil &&
+		operation.Source == SourceProtocolHumanREST &&
+		operation.Actor == models.HumanActor(userID)
+}
+
+func normalizeQuickReplyTags(value string) (string, error) {
+	if strings.TrimSpace(value) == "" {
+		return "", nil
+	}
+	const (
+		maxTags       = 20
+		maxTagRunes   = 50
+		maxStoredSize = 200
+	)
+	seen := make(map[string]struct{})
+	tags := make([]string, 0, maxTags)
+	for _, raw := range strings.Split(value, ",") {
+		tag := strings.TrimSpace(raw)
+		if tag == "" {
+			continue
+		}
+		if !validAutomationConfigFilter(tag, maxTagRunes) {
+			return "", ErrInvalidQuickReplyTags
+		}
+		key := strings.ToLower(tag)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		tags = append(tags, tag)
+		if len(tags) > maxTags {
+			return "", ErrInvalidQuickReplyTags
+		}
+	}
+	normalized := strings.Join(tags, ",")
+	if len([]rune(normalized)) > maxStoredSize {
+		return "", ErrInvalidQuickReplyTags
+	}
+	return normalized, nil
 }
 
 // ClassifyTicket 工单自动分类

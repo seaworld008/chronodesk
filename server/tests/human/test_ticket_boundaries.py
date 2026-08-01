@@ -116,19 +116,43 @@ def test_ticket_pagination_and_identifier_bounds(
     e2e_manager: E2EResourceManager,
     human_identities: Mapping[str, HumanIdentity],
 ) -> None:
-    """TKT-006/TKT-024/SEC-005: cap pages and reject unsafe identifiers."""
+    """TKT-006/TKT-024/SEC-005: reject invalid pages and unsafe identifiers."""
 
     admin = human_identities["admin"]
     ticket = e2e_manager.create_ticket(admin, "pagination")
 
     oversized = admin.api.get_json(
         e2e_manager.project_path("tickets"),
-        params={"page": -99, "page_size": 100000},
+        params={"page": 1, "page_size": 101},
     )
-    assert oversized.status_code == 200, oversized.text
-    page = oversized.json().get("data", {})
+    assert_error_contract(oversized, 400)
+
+    invalid_page = admin.api.get_json(
+        e2e_manager.project_path("tickets"),
+        params={"page": 0, "page_size": 25},
+    )
+    assert_error_contract(invalid_page, 400)
+
+    valid_page = admin.api.get_json(
+        e2e_manager.project_path("tickets"),
+        params={"page": 1, "page_size": 100},
+    )
+    assert valid_page.status_code == 200, valid_page.text
+    valid_body = valid_page.json()
+    assert set(valid_body) == {"code", "msg", "data"}, valid_body
+    assert valid_body.get("code") == 0, valid_body
+    page = valid_body.get("data", {})
+    assert set(page) == {
+        "items",
+        "total",
+        "page",
+        "page_size",
+        "total_pages",
+    }, valid_body
     assert page.get("page") == 1
     assert page.get("page_size") == 100
+    assert isinstance(page.get("total"), int) and page["total"] >= 1
+    assert isinstance(page.get("total_pages"), int) and page["total_pages"] >= 1
     assert len(page.get("items", [])) <= 100
     assert ticket["id"] in {item.get("id") for item in page.get("items", [])}
 

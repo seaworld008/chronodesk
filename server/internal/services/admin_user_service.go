@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -128,23 +129,44 @@ type UserListResponse struct {
 	Pages    int                    `json:"pages"`
 }
 
+var ErrInvalidAdminUserListQuery = errors.New(
+	"invalid admin user list query",
+)
+
 // GetUserList 获取用户列表
 func (s *AdminUserService) GetUserList(ctx context.Context, req *UserListRequest) (*UserListResponse, error) {
+	if s == nil || s.db == nil || req == nil {
+		return nil, ErrInvalidAdminUserListQuery
+	}
 	if req.PlatformRole != nil && !req.PlatformRole.IsValid() {
-		return nil, fmt.Errorf("invalid platform role")
+		return nil, ErrInvalidAdminUserListQuery
 	}
 	// 设置默认值
-	if req.Page <= 0 {
+	if req.Page == 0 {
 		req.Page = 1
 	}
-	if req.PageSize <= 0 {
-		req.PageSize = 20
+	if req.PageSize == 0 {
+		req.PageSize = 25
 	}
 	if req.OrderBy == "" {
 		req.OrderBy = "created_at"
 	}
 	if req.Order == "" {
 		req.Order = "desc"
+	}
+	if req.Page < 1 || req.PageSize < 1 || req.PageSize > 100 ||
+		req.Page > math.MaxInt/req.PageSize ||
+		len([]rune(req.Search)) > 100 {
+		return nil, ErrInvalidAdminUserListQuery
+	}
+	switch req.OrderBy {
+	case "id", "username", "email", "created_at", "updated_at",
+		"last_login_at":
+	default:
+		return nil, ErrInvalidAdminUserListQuery
+	}
+	if req.Order != "asc" && req.Order != "desc" {
+		return nil, ErrInvalidAdminUserListQuery
 	}
 
 	query := s.db.WithContext(ctx).Model(&models.User{})
@@ -190,12 +212,17 @@ func (s *AdminUserService) GetUserList(ctx context.Context, req *UserListRequest
 	case "created_at":
 		orderColumn.Name = "created_at"
 	}
-	query = query.Clauses(clause.OrderBy{
-		Columns: []clause.OrderByColumn{{
-			Column: orderColumn,
+	orderColumns := []clause.OrderByColumn{{
+		Column: orderColumn,
+		Desc:   !strings.EqualFold(req.Order, "asc"),
+	}}
+	if orderColumn.Name != "id" {
+		orderColumns = append(orderColumns, clause.OrderByColumn{
+			Column: clause.Column{Name: "id"},
 			Desc:   !strings.EqualFold(req.Order, "asc"),
-		}},
-	})
+		})
+	}
+	query = query.Clauses(clause.OrderBy{Columns: orderColumns})
 
 	// 分页
 	offset := (req.Page - 1) * req.PageSize

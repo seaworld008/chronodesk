@@ -3,6 +3,9 @@ package handlers
 import (
 	"errors"
 	"net/http"
+	"net/url"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -43,7 +46,7 @@ func NewConfigHandler(db *gorm.DB) *ConfigHandler {
 // @Router /api/platform/configs [get]
 func (h *ConfigHandler) GetAllConfigs(c *gin.Context) {
 	query, err := parseDirectoryListQuery(
-		c.Request.URL.Query(),
+		c.Request.URL.RawQuery,
 		directoryListQuerySpec{
 			DefaultSortBy:    "category",
 			DefaultSortOrder: "asc",
@@ -65,7 +68,7 @@ func (h *ConfigHandler) GetAllConfigs(c *gin.Context) {
 		})
 		return
 	}
-	category, _ := directoryQueryValue(c.Request.URL.Query(), "category")
+	category, _ := query.value("category")
 	configs, err := h.configService.ListConfigPage(
 		c.Request.Context(),
 		category,
@@ -367,27 +370,36 @@ func (h *ConfigHandler) GetSecurityPolicy(c *gin.Context) {
 
 // ExportConfigs 导出配置
 // @Summary 导出配置
-// @Description 导出系统配置为JSON格式
+// @Description 完整导出最多10000项且不超过10MiB的系统配置JSON
 // @Tags 系统配置
 // @Security ApiKeyAuth
 // @Param category query string false "配置分类"
 // @Param format query string false "导出格式" Enums(json) default(json)
 // @Success 200 {object} map[string]interface{} "导出成功"
+// @Failure 400 {object} map[string]interface{} "请求参数错误"
+// @Failure 413 {object} map[string]interface{} "导出超过大小限制"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
 // @Router /api/platform/configs/export [get]
 func (h *ConfigHandler) ExportConfigs(c *gin.Context) {
-	category := c.Query("category")
-	format := c.DefaultQuery("format", "json")
-
-	if format != "json" {
+	category, err := parseConfigExportQuery(c.Request.URL.RawQuery)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
-			"message": "不支持的导出格式",
+			"message": "系统配置导出查询参数无效",
+			"error":   "invalid_query",
 		})
 		return
 	}
 
 	data, err := h.configService.ExportConfigs(category)
+	if errors.Is(err, services.ErrConfigExportTooLarge) {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"success": false,
+			"message": "系统配置导出超过大小限制",
+			"error":   "export_too_large",
+		})
+		return
+	}
 	if err != nil {
 		logHandlerFailure(c, "config.export", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -403,6 +415,38 @@ func (h *ConfigHandler) ExportConfigs(c *gin.Context) {
 	c.Header("Content-Disposition", "attachment; filename=system_configs.json")
 
 	c.Data(http.StatusOK, "application/json", data)
+}
+
+func parseConfigExportQuery(rawQuery string) (string, error) {
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return "", errInvalidDirectoryListQuery
+	}
+	allowed := map[string]struct{}{
+		"category": {},
+		"format":   {},
+	}
+	for key, entries := range values {
+		if _, ok := allowed[key]; !ok || len(entries) != 1 ||
+			!utf8.ValidString(key) ||
+			!utf8.ValidString(entries[0]) ||
+			containsDirectoryQueryControl(key) ||
+			containsDirectoryQueryControl(entries[0]) ||
+			entries[0] == "" ||
+			strings.TrimSpace(entries[0]) != entries[0] {
+			return "", errInvalidDirectoryListQuery
+		}
+	}
+	if format, exists := values["format"]; exists && format[0] != "json" {
+		return "", errInvalidDirectoryListQuery
+	}
+	if category, exists := values["category"]; exists {
+		if utf8.RuneCountInString(category[0]) > 50 {
+			return "", errInvalidDirectoryListQuery
+		}
+		return category[0], nil
+	}
+	return "", nil
 }
 
 // ImportConfigs 导入配置
@@ -476,15 +520,24 @@ func (h *ConfigHandler) ImportConfigs(c *gin.Context) {
 }
 
 func rejectInvalidSystemConfigKey(c *gin.Context, err error) bool {
-	if !errors.Is(err, services.ErrInvalidSystemConfigKey) {
+	switch {
+	case errors.Is(err, services.ErrProtectedSystemConfigKey):
+		c.JSON(http.StatusForbidden, gin.H{
+			"success": false,
+			"message": "该安全控制只能通过“安全与应急”页面修改",
+			"error":   "protected_config_key",
+		})
+		return true
+	case errors.Is(err, services.ErrInvalidSystemConfigKey):
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": services.ErrInvalidSystemConfigKey.Error(),
+			"error":   "invalid_config_key",
+		})
+		return true
+	default:
 		return false
 	}
-	c.JSON(http.StatusBadRequest, gin.H{
-		"success": false,
-		"message": services.ErrInvalidSystemConfigKey.Error(),
-		"error":   "invalid_config_key",
-	})
-	return true
 }
 
 // InitDefaultConfigs 初始化默认配置

@@ -553,3 +553,19 @@ func TestParseAdminListQueriesIsStrict(t *testing.T) {
 		})
 	}
 }
+
+func TestAdminOutboxDestinationProjectionKeepsAttachmentUploadUsable(t *testing.T) {
+	if got := adminOutboxDestinationType(
+		services.AttachmentUploadOutboxDestination,
+	); got != "attachment_upload" {
+		t.Fatalf("attachment upload destination type=%q", got)
+	}
+	if got := adminOutboxDestinationLabel(
+		services.AttachmentUploadOutboxDestination,
+	); got != "附件入库" {
+		t.Fatalf("attachment upload destination label=%q", got)
+	}
+	if got := adminOutboxDestinationType("private-callback-token"); got != "other" {
+		t.Fatalf("unknown destination type=%q, want other", got)
+	}
+}

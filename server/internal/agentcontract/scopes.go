@@ -13,6 +13,8 @@ const (
 	ScopeAttachmentsWrite  = "attachments:write"
 	ScopeEventsSubscribe   = "events:subscribe"
 	ScopeTasksManage       = "tasks:manage"
+	ScopeKnowledgeRead     = "knowledge:read"
+	ScopeKnowledgeWrite    = "knowledge:write"
 )
 
 var supportedScopes = []string{
@@ -26,6 +28,8 @@ var supportedScopes = []string{
 	ScopeAttachmentsWrite,
 	ScopeEventsSubscribe,
 	ScopeTasksManage,
+	ScopeKnowledgeRead,
+	ScopeKnowledgeWrite,
 }
 
 var scopeDescriptions = map[string]string{
@@ -39,6 +43,8 @@ var scopeDescriptions = map[string]string{
 	ScopeAttachmentsWrite:  "Attach content to tickets.",
 	ScopeEventsSubscribe:   "Subscribe to task and ticket events.",
 	ScopeTasksManage:       "Create, inspect, continue, and cancel Agent tasks.",
+	ScopeKnowledgeRead:     "Read authorized project knowledge.",
+	ScopeKnowledgeWrite:    "Create and update knowledge drafts without publishing.",
 }
 
 // SupportedScopes returns a copy so callers cannot mutate the shared contract.

@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
@@ -35,6 +37,19 @@ type ProjectHandler struct {
 	response *middleware.ResponseHelper
 }
 
+type projectQueueResponse struct {
+	PublicID     string             `json:"public_id"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+	TeamPublicID *string            `json:"team_public_id,omitempty"`
+	TeamName     *string            `json:"team_name,omitempty"`
+	Key          models.QueueKey    `json:"key"`
+	Name         string             `json:"name"`
+	Description  string             `json:"description"`
+	Status       models.QueueStatus `json:"status"`
+	IsDefault    bool               `json:"is_default"`
+}
+
 func NewProjectHandler(service *services.ProjectService) *ProjectHandler {
 	return &ProjectHandler{
 		service:  service,
@@ -48,9 +63,34 @@ func (handler *ProjectHandler) List(c *gin.Context) {
 		return
 	}
 	userID := c.GetUint("user_id")
-	projects, err := handler.service.ListHumanProjects(
+	query, err := parseDirectoryListQuery(
+		c.Request.URL.RawQuery,
+		directoryListQuerySpec{
+			DefaultSortBy:    "name",
+			DefaultSortOrder: "asc",
+			SortFields: map[string]struct{}{
+				"name":       {},
+				"key":        {},
+				"created_at": {},
+			},
+			FilterFields: map[string]struct{}{"search": {}},
+		},
+	)
+	if err != nil {
+		handler.response.BadRequest(c, "授权项目查询参数无效")
+		return
+	}
+	search, _ := query.value("search")
+	projects, err := handler.service.ListHumanProjectPage(
 		c.Request.Context(),
 		userID,
+		services.HumanProjectListRequest{
+			Page:      query.Page,
+			PageSize:  query.PageSize,
+			Search:    search,
+			SortBy:    query.SortBy,
+			SortOrder: query.SortOrder,
+		},
 	)
 	if err != nil {
 		writeProjectError(c, handler.response, err)
@@ -75,7 +115,7 @@ func (handler *ProjectHandler) ListQueues(c *gin.Context) {
 		return
 	}
 	query, err := parseDirectoryListQuery(
-		c.Request.URL.Query(),
+		c.Request.URL.RawQuery,
 		directoryListQuerySpec{
 			DefaultSortBy:    "is_default",
 			DefaultSortOrder: "desc",
@@ -106,7 +146,40 @@ func (handler *ProjectHandler) ListQueues(c *gin.Context) {
 		writeProjectError(c, handler.response, err)
 		return
 	}
-	handler.response.Success(c, queues, "获取项目队列成功")
+	items := make([]projectQueueResponse, 0, len(queues.Items))
+	for _, queue := range queues.Items {
+		var teamPublicID *string
+		var teamName *string
+		if queue.Team != nil && queue.Team.PublicID != "" {
+			publicID := queue.Team.PublicID
+			name := queue.Team.Name
+			teamPublicID = &publicID
+			teamName = &name
+		}
+		items = append(items, projectQueueResponse{
+			PublicID:     queue.PublicID,
+			CreatedAt:    queue.CreatedAt,
+			UpdatedAt:    queue.UpdatedAt,
+			TeamPublicID: teamPublicID,
+			TeamName:     teamName,
+			Key:          queue.Key,
+			Name:         queue.Name,
+			Description:  queue.Description,
+			Status:       queue.Status,
+			IsDefault:    queue.IsDefault,
+		})
+	}
+	handler.response.Success(
+		c,
+		services.DirectoryPage[projectQueueResponse]{
+			Items:      items,
+			Total:      queues.Total,
+			Page:       queues.Page,
+			PageSize:   queues.PageSize,
+			TotalPages: queues.TotalPages,
+		},
+		"获取项目队列成功",
+	)
 }
 
 func (handler *ProjectHandler) ListMemberships(c *gin.Context) {
@@ -121,7 +194,7 @@ func (handler *ProjectHandler) ListMemberships(c *gin.Context) {
 		return
 	}
 	query, err := parseDirectoryListQuery(
-		c.Request.URL.Query(),
+		c.Request.URL.RawQuery,
 		directoryListQuerySpec{
 			DefaultSortBy:    "is_active",
 			DefaultSortOrder: "desc",
@@ -183,8 +256,10 @@ func (handler *ProjectHandler) SearchMembershipCandidates(c *gin.Context) {
 }
 
 type upsertProjectMembershipRequest struct {
-	UserID uint               `json:"user_id" binding:"required"`
-	Role   models.ProjectRole `json:"role" binding:"required"`
+	UserID               uint               `json:"user_id" binding:"required"`
+	Role                 models.ProjectRole `json:"role" binding:"required"`
+	KnowledgeContributor *bool              `json:"knowledge_contributor"`
+	ExpectedVersion      *uint64            `json:"expected_version"`
 }
 
 func (handler *ProjectHandler) UpsertMembership(c *gin.Context) {
@@ -203,12 +278,22 @@ func (handler *ProjectHandler) UpsertMembership(c *gin.Context) {
 		handler.response.BadRequest(c, "项目成员参数无效")
 		return
 	}
+	if request.ExpectedVersion == nil {
+		handler.response.Error(
+			c,
+			http.StatusPreconditionRequired,
+			"缺少成员版本，请刷新成员列表后重试",
+		)
+		return
+	}
 	membership, err := handler.service.UpsertHumanMembership(
 		c.Request.Context(),
 		access.Scope,
 		services.UpsertProjectMembershipInput{
-			UserID: request.UserID,
-			Role:   request.Role,
+			UserID:               request.UserID,
+			Role:                 request.Role,
+			KnowledgeContributor: request.KnowledgeContributor,
+			ExpectedVersion:      *request.ExpectedVersion,
 		},
 	)
 	if err != nil {
@@ -233,10 +318,39 @@ func (handler *ProjectHandler) DeactivateMembership(c *gin.Context) {
 		handler.response.BadRequest(c, "用户 ID 无效")
 		return
 	}
+	query := c.Request.URL.Query()
+	if err := requireExactProjectQueryKeys(
+		query,
+		"expected_version",
+	); err != nil {
+		handler.response.BadRequest(c, "成员版本参数无效")
+		return
+	}
+	expectedVersionValues, exists := query["expected_version"]
+	if !exists ||
+		len(expectedVersionValues) != 1 ||
+		strings.TrimSpace(expectedVersionValues[0]) == "" {
+		handler.response.Error(
+			c,
+			http.StatusPreconditionRequired,
+			"缺少成员版本，请刷新成员列表后重试",
+		)
+		return
+	}
+	expectedVersion, err := strconv.ParseUint(
+		expectedVersionValues[0],
+		10,
+		64,
+	)
+	if err != nil {
+		handler.response.BadRequest(c, "成员版本参数无效")
+		return
+	}
 	membership, err := handler.service.DeactivateHumanMembership(
 		c.Request.Context(),
 		access.Scope,
 		uint(userID),
+		expectedVersion,
 	)
 	if err != nil {
 		writeProjectError(c, handler.response, err)
@@ -471,6 +585,11 @@ func parsePlatformProjectListQuery(
 	if err != nil {
 		return services.PlatformProjectListRequest{}, err
 	}
+	if page > math.MaxInt/pageSize {
+		return services.PlatformProjectListRequest{}, errors.New(
+			"project page offset overflows",
+		)
+	}
 	search, err := singleProjectQueryValue(query, "search", "")
 	if err != nil || utf8.RuneCountInString(strings.TrimSpace(search)) > 100 {
 		return services.PlatformProjectListRequest{}, errors.New(
@@ -555,6 +674,11 @@ func parseProjectUserSearchQuery(
 	)
 	if err != nil {
 		return services.ProjectUserSearchRequest{}, err
+	}
+	if page > math.MaxInt/pageSize {
+		return services.ProjectUserSearchRequest{}, errors.New(
+			"project user page offset overflows",
+		)
 	}
 	search, err := singleProjectQueryValue(query, "search", "")
 	if err != nil || utf8.RuneCountInString(strings.TrimSpace(search)) > 100 {
@@ -954,6 +1078,12 @@ func writeProjectError(
 		response.Forbidden(c, "项目已停用")
 	case errors.Is(err, services.ErrLastProjectAdministrator):
 		response.Error(c, http.StatusConflict, "项目必须保留至少一名有效管理员")
+	case errors.Is(err, services.ErrProjectMembershipVersionConflict):
+		response.Error(
+			c,
+			http.StatusConflict,
+			"成员关系已被其他操作更新，请刷新成员列表后重试",
+		)
 	default:
 		response.InternalServerError(c, "项目操作失败")
 	}

@@ -29,27 +29,33 @@ const (
 
 // Category 分类模型
 type Category struct {
-	ID        uint       `json:"id" gorm:"primaryKey;autoIncrement"`
+	ID        uint       `json:"id" gorm:"primaryKey;autoIncrement;uniqueIndex:idx_categories_scope_id,priority:3;index:idx_categories_scope_status_sort,priority:5;index:idx_categories_scope_type,priority:4"`
 	CreatedAt time.Time  `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time  `json:"updated_at" gorm:"autoUpdateTime"`
 	DeletedAt *time.Time `json:"deleted_at,omitempty" gorm:"index"`
 
+	// Project is the only runtime boundary for the category catalogue. These
+	// values are migration-owned/trusted control data and are never accepted
+	// from category or Ticket request bodies.
+	OrganizationID uint `json:"organization_id" gorm:"not null;index:idx_categories_scope_status_sort,priority:1;index:idx_categories_scope_parent,priority:1;index:idx_categories_scope_type,priority:1;uniqueIndex:idx_categories_project_slug,priority:1;uniqueIndex:idx_categories_scope_id,priority:1"`
+	ProjectID      uint `json:"project_id" gorm:"not null;index:idx_categories_scope_status_sort,priority:2;index:idx_categories_scope_parent,priority:2;index:idx_categories_scope_type,priority:2;uniqueIndex:idx_categories_project_slug,priority:2;uniqueIndex:idx_categories_scope_id,priority:2"`
+
 	// 基本信息
-	Name        string `json:"name" gorm:"size:100;not null;uniqueIndex" validate:"required,max=100"`
-	Slug        string `json:"slug" gorm:"size:100;not null;uniqueIndex" validate:"required,max=100"`
+	Name        string `json:"name" gorm:"size:100;not null" validate:"required,max=100"`
+	Slug        string `json:"slug" gorm:"size:100;not null;uniqueIndex:idx_categories_project_slug,priority:3" validate:"required,max=100"`
 	Description string `json:"description" gorm:"type:text"`
 	Icon        string `json:"icon" gorm:"size:50"`  // 图标名称
 	Color       string `json:"color" gorm:"size:20"` // 颜色代码
 
 	// 分类属性
-	Type      CategoryType   `json:"type" gorm:"size:20;not null;default:'general'" validate:"required,oneof=general technical business support incident request"`
-	Status    CategoryStatus `json:"status" gorm:"size:20;not null;default:'active'" validate:"required,oneof=active inactive archived"`
-	SortOrder int            `json:"sort_order" gorm:"default:0;index"` // 排序顺序
+	Type      CategoryType   `json:"type" gorm:"size:20;not null;default:'general';index:idx_categories_scope_type,priority:3" validate:"required,oneof=general technical business support incident request"`
+	Status    CategoryStatus `json:"status" gorm:"size:20;not null;default:'active';index:idx_categories_scope_status_sort,priority:3" validate:"required,oneof=active inactive archived"`
+	SortOrder int            `json:"sort_order" gorm:"default:0;index:idx_categories_scope_status_sort,priority:4"` // 排序顺序
 
 	// 层级结构
-	ParentID *uint      `json:"parent_id" gorm:"index"`
-	Parent   *Category  `json:"parent,omitempty" gorm:"foreignKey:ParentID"`
-	Children []Category `json:"children,omitempty" gorm:"foreignKey:ParentID"`
+	ParentID *uint      `json:"parent_id" gorm:"index:idx_categories_scope_parent,priority:3"`
+	Parent   *Category  `json:"parent,omitempty" gorm:"foreignKey:OrganizationID,ProjectID,ParentID;references:OrganizationID,ProjectID,ID;-:migration"`
+	Children []Category `json:"children,omitempty" gorm:"foreignKey:OrganizationID,ProjectID,ParentID;references:OrganizationID,ProjectID,ID;-:migration"`
 	Level    int        `json:"level" gorm:"default:0"` // 层级深度
 	Path     string     `json:"path" gorm:"size:500"`   // 层级路径，如 "/1/2/3"
 
@@ -82,12 +88,30 @@ type Category struct {
 	Updater   *User `json:"updater,omitempty" gorm:"foreignKey:UpdatedBy"`
 
 	// 关联工单
-	Tickets []Ticket `json:"tickets,omitempty" gorm:"foreignKey:CategoryID"`
+	Tickets []Ticket `json:"tickets,omitempty" gorm:"foreignKey:OrganizationID,ProjectID,CategoryID;references:OrganizationID,ProjectID,ID;-:migration"`
 }
 
 // TableName 指定表名
 func (Category) TableName() string {
 	return "categories"
+}
+
+// CategoryScopeMigrationMapping is an explicit operator-supplied input for a
+// legacy category whose project cannot be proven from Ticket references. It is
+// not a runtime authorization source: the one-time cutover validates every
+// target against projects and persists the resulting scope on Category.
+//
+// More than one row may be supplied for a legacy category when the catalogue
+// must be cloned into several projects.
+type CategoryScopeMigrationMapping struct {
+	CategoryID     uint      `json:"category_id" gorm:"primaryKey;not null"`
+	OrganizationID uint      `json:"organization_id" gorm:"not null"`
+	ProjectID      uint      `json:"project_id" gorm:"primaryKey;not null"`
+	CreatedAt      time.Time `json:"created_at" gorm:"autoCreateTime"`
+}
+
+func (CategoryScopeMigrationMapping) TableName() string {
+	return "category_scope_migration_mappings"
 }
 
 // CategoryCreateRequest 分类创建请求

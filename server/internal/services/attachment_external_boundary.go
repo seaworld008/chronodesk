@@ -1,20 +1,33 @@
 package services
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+const (
+	defaultAttachmentDownloadConcurrency         = 8
+	defaultAttachmentDownloadPerActorConcurrency = 2
+	maxAttachmentDownloadConcurrency             = 64
+	maxAttachmentDownloadPerActorConcurrency     = 8
+	attachmentDownloadCleanupTimeout             = 5 * time.Second
+)
+
+type attachmentDownloadActorSlots struct {
+	slots      chan struct{}
+	references int
+}
 
 type PreparedAttachmentReplayAuthorization struct {
 	DecisionID string
@@ -361,7 +374,10 @@ func (s *AgentNativeService) openAttachmentWithRevalidation(
 	expectedTicketID uint,
 	attachmentID uint,
 ) (*models.TicketAttachment, io.ReadCloser, error) {
-	if s == nil || s.db == nil || s.attachmentStorage == nil {
+	if s == nil ||
+		s.db == nil ||
+		s.attachmentStorage == nil ||
+		s.attachmentStaging == nil {
 		return nil, nil, ErrAttachmentStorageMissing
 	}
 	if attachmentID == 0 {
@@ -409,11 +425,43 @@ func (s *AgentNativeService) openAttachmentWithRevalidation(
 	if err != nil {
 		return nil, nil, err
 	}
-
-	reader, err := s.attachmentStorage.Open(
+	releaseDownload, err := s.acquireAttachmentDownload(
 		ctx,
-		attachment.StoragePath,
+		operation.Actor,
 	)
+	if err != nil {
+		return nil, nil, err
+	}
+	releaseDownloadOnFailure := true
+	defer func() {
+		if releaseDownloadOnFailure {
+			releaseDownload()
+		}
+	}()
+
+	var source io.ReadCloser
+	if routed, ok := s.attachmentStorage.(ReferencedAttachmentStorage); ok {
+		source, err = routed.OpenStoredObject(
+			ctx,
+			AttachmentStoredReference{
+				StorageType: attachment.StorageType,
+				StoreID:     attachment.StorageStoreID,
+				Key:         attachment.StoragePath,
+				VersionID:   attachment.StorageVersionID,
+			},
+		)
+	} else if routed, ok := s.attachmentStorage.(TypedAttachmentStorage); ok {
+		source, err = routed.OpenStored(
+			ctx,
+			attachment.StorageType,
+			attachment.StoragePath,
+		)
+	} else {
+		source, err = s.attachmentStorage.Open(
+			ctx,
+			attachment.StoragePath,
+		)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -421,23 +469,54 @@ func (s *AgentNativeService) openAttachmentWithRevalidation(
 	if maxBytes <= 0 || maxBytes > attachment.FileSize {
 		maxBytes = attachment.FileSize
 	}
-	content, readErr := io.ReadAll(
-		io.LimitReader(reader, maxBytes+1),
+	stagingKey := ".staging/download-" + newNativeID() + ".spool"
+	staged, stageErr := s.attachmentStaging.Stage(
+		ctx,
+		stagingKey,
+		source,
+		maxBytes,
 	)
-	closeErr := reader.Close()
-	if readErr != nil {
-		return nil, nil, readErr
+	sourceCloseErr := source.Close()
+	if stageErr != nil || sourceCloseErr != nil {
+		cleanupErr := cleanupAttachmentDownloadStaging(
+			ctx,
+			s.attachmentStaging,
+			stagingKey,
+			nil,
+		)
+		return nil, nil, errors.Join(
+			stageErr,
+			sourceCloseErr,
+			cleanupErr,
+		)
 	}
-	if closeErr != nil {
-		return nil, nil, closeErr
+	if staged == nil ||
+		staged.Key != stagingKey ||
+		staged.Size != attachment.FileSize ||
+		!strings.EqualFold(staged.SHA256, attachment.Hash) {
+		cleanupErr := cleanupAttachmentDownloadStaging(
+			ctx,
+			s.attachmentStaging,
+			stagingKey,
+			nil,
+		)
+		return nil, nil, errors.Join(
+			ErrInvalidAttachment,
+			cleanupErr,
+		)
 	}
-	digest := sha256.Sum256(content)
-	if int64(len(content)) != attachment.FileSize ||
-		!strings.EqualFold(
-			fmt.Sprintf("%x", digest[:]),
-			attachment.Hash,
-		) {
-		return nil, nil, ErrInvalidAttachment
+	stagedReader, err := s.attachmentStaging.OpenStaged(
+		ctx,
+		stagingKey,
+	)
+	if err != nil {
+		cleanupErr := cleanupAttachmentDownloadStaging(
+			ctx,
+			s.attachmentStaging,
+			stagingKey,
+			nil,
+		)
+		return nil, nil, errors.Join(err, cleanupErr)
 	}
 
 	var finalized models.TicketAttachment
@@ -473,6 +552,10 @@ func (s *AgentNativeService) openAttachmentWithRevalidation(
 			}
 			if finalized.StoragePath != attachment.StoragePath ||
 				finalized.StorageType != attachment.StorageType ||
+				finalized.StorageStoreID !=
+					attachment.StorageStoreID ||
+				finalized.StorageVersionID !=
+					attachment.StorageVersionID ||
 				finalized.FileSize != attachment.FileSize ||
 				!strings.EqualFold(
 					finalized.Hash,
@@ -505,9 +588,186 @@ func (s *AgentNativeService) openAttachmentWithRevalidation(
 		},
 	)
 	if err != nil {
-		return nil, nil, err
+		cleanupErr := cleanupAttachmentDownloadStaging(
+			ctx,
+			s.attachmentStaging,
+			stagingKey,
+			stagedReader,
+		)
+		return nil, nil, errors.Join(err, cleanupErr)
 	}
-	return &finalized, io.NopCloser(bytes.NewReader(content)), nil
+	if err := ctx.Err(); err != nil {
+		cleanupErr := cleanupAttachmentDownloadStaging(
+			ctx,
+			s.attachmentStaging,
+			stagingKey,
+			stagedReader,
+		)
+		return nil, nil, errors.Join(err, cleanupErr)
+	}
+	downloadReader := newAttachmentDownloadReader(
+		ctx,
+		stagedReader,
+		s.attachmentStaging,
+		stagingKey,
+		releaseDownload,
+	)
+	releaseDownloadOnFailure = false
+	return &finalized, downloadReader, nil
+}
+
+func (s *AgentNativeService) acquireAttachmentDownload(
+	ctx context.Context,
+	actor models.ActorRef,
+) (func(), error) {
+	if s == nil ||
+		s.attachmentDownloadSlots == nil ||
+		s.attachmentDownloadPerActor <= 0 {
+		return nil, ErrAttachmentStorageMissing
+	}
+	if err := actor.Validate(); err != nil {
+		return nil, ErrInvalidActor
+	}
+	actorKey := string(actor.Type) + "\x00" + actor.ID
+	s.attachmentDownloadActorsMu.Lock()
+	actorSlots := s.attachmentDownloadActors[actorKey]
+	if actorSlots == nil {
+		actorSlots = &attachmentDownloadActorSlots{
+			slots: make(
+				chan struct{},
+				s.attachmentDownloadPerActor,
+			),
+		}
+		s.attachmentDownloadActors[actorKey] = actorSlots
+	}
+	actorSlots.references++
+	s.attachmentDownloadActorsMu.Unlock()
+
+	releaseActorReference := func() {
+		s.attachmentDownloadActorsMu.Lock()
+		actorSlots.references--
+		if actorSlots.references == 0 &&
+			s.attachmentDownloadActors[actorKey] == actorSlots {
+			delete(s.attachmentDownloadActors, actorKey)
+		}
+		s.attachmentDownloadActorsMu.Unlock()
+	}
+	select {
+	case actorSlots.slots <- struct{}{}:
+	case <-ctx.Done():
+		releaseActorReference()
+		return nil, ctx.Err()
+	}
+	select {
+	case s.attachmentDownloadSlots <- struct{}{}:
+	case <-ctx.Done():
+		<-actorSlots.slots
+		releaseActorReference()
+		return nil, ctx.Err()
+	}
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			<-s.attachmentDownloadSlots
+			<-actorSlots.slots
+			releaseActorReference()
+		})
+	}, nil
+}
+
+type attachmentDownloadReader struct {
+	ctx     context.Context
+	reader  io.ReadCloser
+	staging AttachmentStagingStore
+	key     string
+	release func()
+
+	closed    chan struct{}
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func newAttachmentDownloadReader(
+	ctx context.Context,
+	reader io.ReadCloser,
+	staging AttachmentStagingStore,
+	key string,
+	release func(),
+) *attachmentDownloadReader {
+	download := &attachmentDownloadReader{
+		ctx:     ctx,
+		reader:  reader,
+		staging: staging,
+		key:     key,
+		release: release,
+		closed:  make(chan struct{}),
+	}
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = download.Close()
+		case <-download.closed:
+		}
+	}()
+	return download
+}
+
+func (reader *attachmentDownloadReader) Read(
+	buffer []byte,
+) (int, error) {
+	if err := reader.ctx.Err(); err != nil {
+		return 0, errors.Join(err, reader.Close())
+	}
+	count, readErr := reader.reader.Read(buffer)
+	if readErr == nil {
+		return count, nil
+	}
+	closeErr := reader.Close()
+	if errors.Is(readErr, io.EOF) && closeErr == nil {
+		return count, io.EOF
+	}
+	return count, errors.Join(readErr, closeErr)
+}
+
+func (reader *attachmentDownloadReader) Close() error {
+	reader.closeOnce.Do(func() {
+		close(reader.closed)
+		reader.closeErr = cleanupAttachmentDownloadStaging(
+			reader.ctx,
+			reader.staging,
+			reader.key,
+			reader.reader,
+		)
+		if reader.release != nil {
+			reader.release()
+		}
+	})
+	return reader.closeErr
+}
+
+func cleanupAttachmentDownloadStaging(
+	ctx context.Context,
+	staging AttachmentStagingStore,
+	key string,
+	reader io.ReadCloser,
+) error {
+	var closeErr error
+	if reader != nil {
+		closeErr = reader.Close()
+	}
+	if staging == nil || strings.TrimSpace(key) == "" {
+		return closeErr
+	}
+	cleanupContext, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		attachmentDownloadCleanupTimeout,
+	)
+	defer cancel()
+	return errors.Join(
+		closeErr,
+		staging.DeleteStaged(cleanupContext, key),
+	)
 }
 
 func (s *AgentNativeService) loadAndAuthorizeAttachmentDownload(

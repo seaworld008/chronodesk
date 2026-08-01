@@ -791,6 +791,7 @@ func TestAttachmentUploadAmbiguousCommitPreservesLiveFinalObject(
 	)
 	intent, err := newAttachmentUploadMigrationIntent(
 		*uploadResult.Attachment,
+		fixture.service.attachmentStorage,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -798,6 +799,7 @@ func TestAttachmentUploadAmbiguousCommitPreservesLiveFinalObject(
 	if err := fixture.service.cleanupObsoleteAttachmentUpload(
 		workerContext,
 		intent,
+		nil,
 	); !errors.Is(err, errAttachmentUploadStillReferenced) {
 		t.Fatalf(
 			"live-reference compensation proof error = %v, want %v",

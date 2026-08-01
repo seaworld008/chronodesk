@@ -22,6 +22,22 @@ var (
 	ErrAnalyticsInvalidTimeRange = errors.New(
 		"analytics time range is invalid",
 	)
+	ErrAnalyticsResultTooLarge = errors.New(
+		"analytics result exceeds bounded series limit",
+	)
+	ErrAnalyticsExportTooLarge = errors.New(
+		"analytics export exceeds bounded response limit",
+	)
+	ErrAnalyticsProjectLimit = errors.New(
+		"analytics authorized project set exceeds bounded limit",
+	)
+)
+
+const (
+	AnalyticsMaxTimeRangeDays  = 90
+	AnalyticsMaxCategoryValues = 1_000
+	AnalyticsMaxExportBytes    = 1 << 20
+	AnalyticsMaxProjects       = 500
 )
 
 // AnalyticsAuthorizedProjectSet is trusted control data resolved by a
@@ -37,6 +53,19 @@ type AnalyticsAuthorizedProjectSet struct {
 func (authorized AnalyticsAuthorizedProjectSet) validate() error {
 	if authorized.OrganizationID == 0 || authorized.humanUserID == 0 {
 		return ErrAnalyticsAuthorizedProjectSetRequired
+	}
+	if len(authorized.ProjectIDs) > AnalyticsMaxProjects {
+		return ErrAnalyticsProjectLimit
+	}
+	seen := make(map[uint]struct{}, len(authorized.ProjectIDs))
+	for _, projectID := range authorized.ProjectIDs {
+		if projectID == 0 {
+			return ErrAnalyticsAuthorizedProjectSetRequired
+		}
+		if _, duplicate := seen[projectID]; duplicate {
+			return ErrAnalyticsAuthorizedProjectSetRequired
+		}
+		seen[projectID] = struct{}{}
 	}
 	return nil
 }
@@ -496,13 +525,23 @@ func (s *AnalyticsService) getTicketStats(
 	if err := s.db.WithContext(ctx).
 		Table("tickets AS tickets").
 		Select("categories.name AS category_name, count(*) AS count").
-		Joins("JOIN categories ON categories.id = tickets.category_id").
+		Joins(`
+			JOIN categories
+			  ON categories.id = tickets.category_id
+			 AND categories.organization_id = tickets.organization_id
+			 AND categories.project_id = tickets.project_id
+		`).
 		Where("tickets.deleted_at IS NULL").
 		Where("tickets.organization_id = ?", authorized.OrganizationID).
 		Where("tickets.project_id IN ?", authorized.ProjectIDs).
 		Group("categories.name").
+		Order("categories.name ASC").
+		Limit(AnalyticsMaxCategoryValues + 1).
 		Scan(&categoryCounts).Error; err != nil {
 		return nil, err
+	}
+	if len(categoryCounts) > AnalyticsMaxCategoryValues {
+		return nil, ErrAnalyticsResultTooLarge
 	}
 	for _, value := range categoryCounts {
 		if value.CategoryName != "" {
@@ -798,8 +837,8 @@ func (s *AnalyticsService) GetTimeRangeStats(
 		return nil, err
 	}
 	authorized = authorized.snapshot()
-	if startDate.IsZero() || endDate.IsZero() || endDate.Before(startDate) {
-		return nil, ErrAnalyticsInvalidTimeRange
+	if err := ValidateAnalyticsTimeRange(startDate, endDate); err != nil {
+		return nil, err
 	}
 	stats := &TimeRangeStats{
 		StartDate:         startDate,
@@ -923,6 +962,7 @@ func (s *AnalyticsService) dailyTrend(
 		Select("DATE(" + timeColumn + ") AS date, COUNT(*) AS count").
 		Group("DATE(" + timeColumn + ")").
 		Order("date").
+		Limit(AnalyticsMaxTimeRangeDays + 1).
 		Scan(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -944,6 +984,7 @@ func (s *AnalyticsService) dailyDistinctUserTrend(
 		).
 		Group("DATE(" + timeColumn + ")").
 		Order("date").
+		Limit(AnalyticsMaxTimeRangeDays + 1).
 		Scan(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -956,6 +997,9 @@ func parseDailyCounts(
 		Count int64
 	},
 ) ([]DailyCount, error) {
+	if len(rows) > AnalyticsMaxTimeRangeDays {
+		return nil, ErrAnalyticsResultTooLarge
+	}
 	values := make([]DailyCount, 0, len(rows))
 	for _, row := range rows {
 		date, err := time.Parse("2006-01-02", row.Date)
@@ -977,8 +1021,16 @@ func (s *AnalyticsService) ExportStats(
 	if format != "json" {
 		return nil, fmt.Errorf("unsupported export format: %s", format)
 	}
+	if err := authorized.validate(); err != nil {
+		return nil, err
+	}
 	if (startDate == nil) != (endDate == nil) {
 		return nil, ErrAnalyticsInvalidTimeRange
+	}
+	if startDate != nil {
+		if err := ValidateAnalyticsTimeRange(*startDate, *endDate); err != nil {
+			return nil, err
+		}
 	}
 	platformStats, err := s.GetPlatformStats(ctx)
 	if err != nil {
@@ -1005,7 +1057,54 @@ func (s *AnalyticsService) ExportStats(
 		}
 		exportData["time_range_stats"] = timeRangeStats
 	}
-	return json.MarshalIndent(exportData, "", "  ")
+	return marshalAnalyticsExport(exportData)
+}
+
+// ValidateAnalyticsTimeRange applies the same inclusive UTC date-bucket
+// contract to HTTP and direct service callers. A valid range can therefore
+// produce no more than AnalyticsMaxTimeRangeDays daily values per series.
+func ValidateAnalyticsTimeRange(startDate, endDate time.Time) error {
+	if startDate.IsZero() || endDate.IsZero() || endDate.Before(startDate) {
+		return ErrAnalyticsInvalidTimeRange
+	}
+	startYear, startMonth, startDay := startDate.UTC().Date()
+	endYear, endMonth, endDay := endDate.UTC().Date()
+	startBucket := time.Date(
+		startYear,
+		startMonth,
+		startDay,
+		0,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	endBucket := time.Date(
+		endYear,
+		endMonth,
+		endDay,
+		0,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	inclusiveDays := int(endBucket.Sub(startBucket)/(24*time.Hour)) + 1
+	if inclusiveDays < 1 || inclusiveDays > AnalyticsMaxTimeRangeDays {
+		return ErrAnalyticsInvalidTimeRange
+	}
+	return nil
+}
+
+func marshalAnalyticsExport(exportData map[string]any) ([]byte, error) {
+	data, err := json.MarshalIndent(exportData, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > AnalyticsMaxExportBytes {
+		return nil, ErrAnalyticsExportTooLarge
+	}
+	return data, nil
 }
 
 func dayStart(value time.Time) time.Time {

@@ -87,6 +87,36 @@ func TestOutboxRelativeCallbackQueryIsScrubbed(t *testing.T) {
 	}
 }
 
+func TestOutboxCredentialScrubCoversQuotedJSONAndAuthorizationSchemes(
+	t *testing.T,
+) {
+	const (
+		jsonToken       = "quoted-json-token-must-not-return"
+		jsonBasic       = "json-basic-credential-must-not-return"
+		standaloneBasic = "standalone-basic-must-not-return"
+		standaloneToken = "standalone-bearer-must-not-return"
+	)
+	got := ScrubOutboxFailureText(
+		`provider rejected {"access_token":"` + jsonToken +
+			`","Authorization":"Basic ` + jsonBasic +
+			`"} Basic ` + standaloneBasic +
+			` Bearer ` + standaloneToken,
+	)
+	for _, forbidden := range []string{
+		jsonToken,
+		jsonBasic,
+		standaloneBasic,
+		standaloneToken,
+	} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("credential scrub leaked %q: %q", forbidden, got)
+		}
+	}
+	if !strings.Contains(got, "[凭据已隐藏]") {
+		t.Fatalf("credential scrub lost safe marker: %q", got)
+	}
+}
+
 func TestOutboxErrorScrubIsRuneBounded(t *testing.T) {
 	message := strings.Repeat("工", maxOutboxFailureRunes+10)
 	scrubbed := scrubOutboxFailure(errors.New(message))

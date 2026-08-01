@@ -109,6 +109,50 @@ func TestValidateRuntimeSchemaAcceptsMigratedModel(t *testing.T) {
 			model: &models.CleanupLog{},
 			index: "idx_cleanup_logs_task_directory",
 		},
+		{
+			model: &models.SLAConfig{},
+			index: "idx_sla_configs_scope_directory",
+		},
+		{
+			model: &models.TicketTemplate{},
+			index: "idx_ticket_templates_scope_directory",
+		},
+		{
+			model: &models.QuickReply{},
+			index: "idx_quick_replies_scope_directory",
+		},
+		{
+			model: &models.AgentRun{},
+			index: "idx_agent_runs_scope_timeline",
+		},
+		{
+			model: &models.ActionProposal{},
+			index: "idx_action_proposals_scope_timeline",
+		},
+		{
+			model: &models.ApprovalTask{},
+			index: "idx_approval_tasks_scope_timeline",
+		},
+		{
+			model: &models.Handoff{},
+			index: "idx_handoffs_scope_timeline",
+		},
+		{
+			model: &models.KnowledgeArticle{},
+			index: "idx_knowledge_articles_scope_directory",
+		},
+		{
+			model: &models.KnowledgeArticleVersion{},
+			index: "idx_knowledge_versions_article_directory",
+		},
+		{
+			model: &models.KnowledgeIngestionTask{},
+			index: "idx_knowledge_ingestions_scope_directory",
+		},
+		{
+			model: &models.KnowledgeSourceLink{},
+			index: "idx_knowledge_source_ordinal",
+		},
 	} {
 		if !db.Migrator().HasIndex(required.model, required.index) {
 			t.Fatalf(

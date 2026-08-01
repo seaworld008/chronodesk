@@ -76,6 +76,10 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 
 	for _, path := range []string{
 		"/capabilities",
+		"/knowledge/articles",
+		"/knowledge/articles/{knowledgeArticleId}/document",
+		"/knowledge/articles/{knowledgeArticleId}/drafts",
+		"/knowledge/searches",
 		"/tickets",
 		"/tickets/{ticketId}",
 		"/tickets/{ticketId}/commands/assign",
@@ -98,6 +102,10 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 		}
 	}
 	for path := range paths {
+		if strings.Contains(path, "/knowledge/") &&
+			strings.Contains(path, "publication") {
+			t.Errorf("Agent REST must not expose knowledge publication path: %s", path)
+		}
 		if strings.HasPrefix(path, "/admin/agents/") {
 			t.Errorf("removed global Agent administrator path remains: %s", path)
 		}
@@ -195,6 +203,61 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 	if !hasOAuthScopeAlternative(capabilities, "tickets:read") {
 		t.Error("project capabilities discovery has no tickets:read scope")
 	}
+	for _, test := range []struct {
+		path   string
+		method string
+		scope  string
+	}{
+		{
+			path:   "/knowledge/articles",
+			method: "get",
+			scope:  agentcontract.ScopeKnowledgeRead,
+		},
+		{
+			path:   "/knowledge/articles/{knowledgeArticleId}/document",
+			method: "get",
+			scope:  agentcontract.ScopeKnowledgeRead,
+		},
+		{
+			path:   "/knowledge/searches",
+			method: "post",
+			scope:  agentcontract.ScopeKnowledgeRead,
+		},
+		{
+			path:   "/knowledge/articles",
+			method: "post",
+			scope:  agentcontract.ScopeKnowledgeWrite,
+		},
+		{
+			path:   "/knowledge/articles/{knowledgeArticleId}/drafts",
+			method: "post",
+			scope:  agentcontract.ScopeKnowledgeWrite,
+		},
+	} {
+		operation := contractOperation(t, paths, test.path, test.method)
+		if !hasOAuthScopeAlternative(operation, test.scope) {
+			t.Errorf(
+				"%s %s has no %s scope",
+				strings.ToUpper(test.method),
+				test.path,
+				test.scope,
+			)
+		}
+	}
+	assertHeaderRefs(
+		t,
+		paths,
+		"/knowledge/articles",
+		"post",
+		"IdempotencyKey",
+	)
+	assertHeaderRefs(
+		t,
+		paths,
+		"/knowledge/articles/{knowledgeArticleId}/drafts",
+		"post",
+		"IdempotencyKey",
+	)
 	for _, forbiddenScope := range []string{"tickets:assign", "tickets:transition"} {
 		if hasOAuthScopeAlternative(patch, forbiddenScope) {
 			t.Errorf("ordinary ticket patch still advertises %s", forbiddenScope)
@@ -320,6 +383,119 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 		{path: "/projects/{projectKey}/admin/agents/outbox/{deliveryId}/replay", method: "post", status: "202", schemaName: "ReplayEnvelope"},
 	}
 	schemas := contractMap(t, components["schemas"], "components.schemas")
+	for _, schemaName := range []string{
+		"KnowledgeArticleDraftCreate",
+		"KnowledgeVersionDraftCreate",
+		"KnowledgeSearchRequest",
+		"KnowledgeArticle",
+		"KnowledgeVersion",
+		"KnowledgeSource",
+		"KnowledgeDocumentSection",
+		"KnowledgeDocument",
+		"KnowledgeArticlePage",
+		"KnowledgeCitation",
+		"KnowledgeSearchResult",
+	} {
+		schema := contractMap(
+			t,
+			schemas[schemaName],
+			"components.schemas."+schemaName,
+		)
+		if schema["additionalProperties"] != false {
+			t.Errorf(
+				"Agent knowledge schema %s is not closed",
+				schemaName,
+			)
+		}
+	}
+	for schemaName, forbiddenFields := range map[string][]string{
+		"KnowledgeArticleDraftCreate": {
+			"grant_project_access",
+		},
+		"KnowledgeVersion": {
+			"organization_id",
+			"project_id",
+			"object_provider",
+			"object_bucket",
+			"object_key",
+			"object_version_id",
+			"original_file_name",
+			"scan_detail",
+			"scanned_at",
+			"created_by_type",
+			"created_by_id",
+		},
+		"KnowledgeSource": {
+			"id",
+			"article_id",
+			"version_id",
+			"created_at",
+			"organization_id",
+			"project_id",
+			"created_by",
+			"created_by_type",
+			"created_by_id",
+		},
+	} {
+		schema := contractMap(
+			t,
+			schemas[schemaName],
+			"components.schemas."+schemaName,
+		)
+		properties := contractMap(
+			t,
+			schema["properties"],
+			"components.schemas."+schemaName+".properties",
+		)
+		for _, field := range forbiddenFields {
+			if _, exists := properties[field]; exists {
+				t.Errorf(
+					"Agent %s exposes internal field %s",
+					schemaName,
+					field,
+				)
+			}
+		}
+	}
+	knowledgeSource := contractMap(
+		t,
+		schemas["KnowledgeSource"],
+		"components.schemas.KnowledgeSource",
+	)
+	for _, field := range []string{
+		"ordinal",
+		"kind",
+		"visibility",
+		"reference_label",
+	} {
+		if !contractSliceContains(
+			knowledgeSource["required"],
+			field,
+		) {
+			t.Errorf(
+				"Agent KnowledgeSource does not require safe field %s",
+				field,
+			)
+		}
+	}
+	for _, protected := range []string{
+		"source_ticket_id",
+		"source_attachment_id",
+		"ticket_number",
+		"ticket_title",
+		"attachment_name",
+		"attachment_hash",
+	} {
+		if contractSliceContains(
+			knowledgeSource["required"],
+			protected,
+		) {
+			t.Errorf(
+				"Agent KnowledgeSource requires protected field %s",
+				protected,
+			)
+		}
+	}
 	for _, schemaName := range []string{"Ticket", "TicketCreate", "TicketFieldPatch", "Comment", "CommentCreate"} {
 		schema := contractMap(t, schemas[schemaName], "components.schemas."+schemaName)
 		properties := contractMap(t, schema["properties"], "components.schemas."+schemaName+".properties")

@@ -239,12 +239,14 @@ func TestAgentCreateUsesAuthoritativeSLAConfigProjection(t *testing.T) {
 	)
 	slaHours := 1
 	category := models.Category{
-		Name:      "Agent SLA contract",
-		Slug:      "agent-sla-contract",
-		Type:      models.CategoryTypeSupport,
-		Status:    models.CategoryStatusActive,
-		SLAHours:  &slaHours,
-		CreatedBy: fixture.user.ID,
+		OrganizationID: fixture.organization.ID,
+		ProjectID:      fixture.project.ID,
+		Name:           "Agent SLA contract",
+		Slug:           "agent-sla-contract",
+		Type:           models.CategoryTypeSupport,
+		Status:         models.CategoryStatusActive,
+		SLAHours:       &slaHours,
+		CreatedBy:      fixture.user.ID,
 	}
 	if err := fixture.db.Create(&category).Error; err != nil {
 		t.Fatalf("create SLA category: %v", err)

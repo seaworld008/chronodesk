@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -322,13 +323,27 @@ func TestAgentCollaborationQueriesEnforceProjectScopeAndSafeDTOs(
 	runs, err := fixture.service.ListAgentRuns(
 		fixture.context,
 		fixture.access,
-		CollaborationPagination{Page: 1, PageSize: 500},
+		CollaborationPagination{Page: 1, PageSize: 100},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if runs.Total != 2 || len(runs.Items) != 2 || runs.PageSize != 100 {
-		t.Fatalf("scoped/capped runs = %+v", runs)
+		t.Fatalf("scoped/bounded runs = %+v", runs)
+	}
+	for _, invalid := range []CollaborationPagination{
+		{Page: -1, PageSize: 25},
+		{Page: 1, PageSize: -1},
+		{Page: 1, PageSize: 101},
+		{Page: math.MaxInt, PageSize: 100},
+	} {
+		if _, listErr := fixture.service.ListAgentRuns(
+			fixture.context,
+			fixture.access,
+			invalid,
+		); !errors.Is(listErr, ErrCollaborationPagination) {
+			t.Fatalf("invalid pagination %+v error = %v", invalid, listErr)
+		}
 	}
 	proposals, err := fixture.service.ListActionProposals(
 		fixture.context,
@@ -361,6 +376,26 @@ func TestAgentCollaborationQueriesEnforceProjectScopeAndSafeDTOs(
 			approvals.Total,
 			handoffs.Total,
 		)
+	}
+	for _, item := range runs.Items {
+		if item.TicketNumber == "" || item.TicketTitle == "" {
+			t.Fatalf("run omitted ticket projection: %+v", item)
+		}
+	}
+	for _, item := range proposals.Items {
+		if item.TicketNumber == "" || item.TicketTitle == "" {
+			t.Fatalf("proposal omitted ticket projection: %+v", item)
+		}
+	}
+	for _, item := range approvals.Items {
+		if item.TicketNumber == "" || item.TicketTitle == "" {
+			t.Fatalf("approval omitted ticket projection: %+v", item)
+		}
+	}
+	for _, item := range handoffs.Items {
+		if item.TicketNumber == "" || item.TicketTitle == "" {
+			t.Fatalf("handoff omitted ticket projection: %+v", item)
+		}
 	}
 
 	for name, check := range map[string]func() error{

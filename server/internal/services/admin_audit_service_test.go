@@ -114,11 +114,12 @@ func TestAdminAuditExploreUsesStableCursorAndListProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	createdAt := time.Date(2026, 7, 31, 10, 0, 0, 0, time.UTC)
+	auditorRole := models.PlatformRoleSecurityAuditor
 	for index := 1; index <= 4; index++ {
 		log := &models.AdminAuditLog{
 			CreatedAt:    createdAt,
 			Username:     "auditor",
-			PlatformRole: models.PlatformRoleSecurityAuditor,
+			PlatformRole: &auditorRole,
 			Action:       "POST /api/platform/users",
 			Method:       "POST",
 			Path:         "/api/platform/users",
@@ -134,7 +135,7 @@ func TestAdminAuditExploreUsesStableCursorAndListProjection(t *testing.T) {
 		}
 	}
 	service := newAdminAuditExplorerForTest(t, db)
-	filter := &AdminAuditFilter{Page: 1, Limit: 2}
+	filter := &AdminAuditFilter{Limit: 2}
 	first, err := service.Explore(context.Background(), filter)
 	if err != nil {
 		t.Fatal(err)
@@ -213,7 +214,26 @@ func TestAdminAuditExploreUsesStableCursorAndListProjection(t *testing.T) {
 	}
 }
 
-func TestAdminAuditExploreNumberedPagesUseStableNonOverlappingOffsets(
+func TestAdminAuditExploreRejectsInvalidServiceLimits(t *testing.T) {
+	db, err := gorm.Open(
+		sqlite.Open("file:admin_audit_invalid_limits?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newAdminAuditExplorerForTest(t, db)
+	for _, limit := range []int{-1, MaxAdminAuditLimit + 1} {
+		if _, err := service.Explore(
+			context.Background(),
+			&AdminAuditFilter{Limit: limit},
+		); !errors.Is(err, ErrInvalidAdminAuditLimit) {
+			t.Fatalf("limit %d error = %v", limit, err)
+		}
+	}
+}
+
+func TestAdminAuditExploreCursorPagesUseStableNonOverlappingOrdering(
 	t *testing.T,
 ) {
 	db, err := gorm.Open(
@@ -227,11 +247,12 @@ func TestAdminAuditExploreNumberedPagesUseStableNonOverlappingOffsets(
 		t.Fatal(err)
 	}
 	createdAt := time.Date(2026, 7, 31, 11, 0, 0, 0, time.UTC)
+	auditorRole := models.PlatformRoleSecurityAuditor
 	for index := 0; index < 6; index++ {
 		if err := db.Create(&models.AdminAuditLog{
 			CreatedAt:    createdAt.Add(-time.Duration(index/2) * time.Minute),
 			Username:     "numbered-page-auditor",
-			PlatformRole: models.PlatformRoleSecurityAuditor,
+			PlatformRole: &auditorRole,
 			Action:       "GET /api/platform/audit-logs",
 			Method:       "GET",
 			Path:         "/api/platform/audit-logs",
@@ -244,21 +265,22 @@ func TestAdminAuditExploreNumberedPagesUseStableNonOverlappingOffsets(
 	service := newAdminAuditExplorerForTest(t, db)
 	first, err := service.Explore(
 		context.Background(),
-		&AdminAuditFilter{Page: 1, Limit: 3},
+		&AdminAuditFilter{Limit: 3},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	second, err := service.Explore(
 		context.Background(),
-		&AdminAuditFilter{Page: 2, Limit: 3},
+		&AdminAuditFilter{Limit: 3, Cursor: first.NextCursor},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Page != 1 || second.Page != 2 ||
+	if !first.HasMore || first.NextCursor == "" ||
+		second.HasMore || second.NextCursor != "" ||
 		len(first.Items) != 3 || len(second.Items) != 3 {
-		t.Fatalf("numbered pages = first:%+v second:%+v", first, second)
+		t.Fatalf("cursor pages = first:%+v second:%+v", first, second)
 	}
 	seen := map[uint]struct{}{}
 	var previous *AdminAuditListItem
@@ -311,9 +333,10 @@ func TestAdminAuditDetailRedactsLongFieldsAtReadTime(t *testing.T) {
 	if err := db.AutoMigrate(&models.AdminAuditLog{}); err != nil {
 		t.Fatal(err)
 	}
+	platformAdminRole := models.PlatformRolePlatformAdmin
 	log := &models.AdminAuditLog{
 		Username:     "admin",
-		PlatformRole: models.PlatformRolePlatformAdmin,
+		PlatformRole: &platformAdminRole,
 		Action:       "",
 		Method:       "DELETE",
 		Path:         "/api/platform/users/42",
@@ -365,6 +388,297 @@ func TestAdminAuditDetailRedactsLongFieldsAtReadTime(t *testing.T) {
 	}
 	if detail.MaskedIP != "2001:db8:abcd::/48" {
 		t.Fatalf("masked ipv6 = %q", detail.MaskedIP)
+	}
+}
+
+func TestAdminAuditExploreAndDetailRedactHistoricalTextProjections(
+	t *testing.T,
+) {
+	db, err := gorm.Open(
+		sqlite.Open(
+			"file:admin_audit_historical_projection_redaction?mode=memory&cache=shared",
+		),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&models.AdminAuditLog{}); err != nil {
+		t.Fatal(err)
+	}
+
+	longText := strings.Repeat("界", 5000)
+	queryValues := url.Values{
+		"safe":  []string{"visible"},
+		"token": []string{"query-secret"},
+		"nested": []string{
+			`{"keep":"visible","password":"nested-query-secret"}`,
+		},
+	}
+	for index := 0; index < 5; index++ {
+		queryValues.Set(
+			"long-"+string(rune('a'+index)),
+			strings.Repeat("q", 700),
+		)
+	}
+	role := models.PlatformRoleSecurityAuditor
+	log := &models.AdminAuditLog{
+		CreatedAt:        time.Now().UTC(),
+		ActorType:        models.ActorTypeServicePrincipal,
+		ActorID:          "token=actor-id-secret " + longText,
+		Username:         "password=username-secret " + longText,
+		PlatformRole:     &role,
+		Action:           "password=raw-action-secret " + longText,
+		ActionCode:       "token=action-code-secret " + longText,
+		ResourceType:     "password=resource-type-secret " + longText,
+		ResourcePublicID: "token=resource-public-id-secret " + longText,
+		Method:           "token=method-secret " + longText,
+		Path:             "token=path-secret /api/platform/audit/" + longText,
+		StatusCode:       500,
+		ClientIP:         "192.168.88.99",
+		Query:            queryValues.Encode(),
+		UserAgent: "browser Authorization: Bearer user-agent-secret " +
+			longText,
+		Notes: `{"keep":"visible","password":"notes-secret","long":"` +
+			longText + `"}`,
+		RequestID:     "token=request-id-secret " + longText,
+		TraceID:       "password=trace-id-secret " + longText,
+		CorrelationID: "token=correlation-id-secret " + longText,
+		Result:        "password=result-secret " + longText,
+	}
+	if err := db.Create(log).Error; err != nil {
+		t.Fatal(err)
+	}
+	fallback := &models.AdminAuditLog{
+		CreatedAt:  log.CreatedAt.Add(-time.Second),
+		ActorType:  models.ActorTypeSystem,
+		ActorID:    "system",
+		Username:   "system",
+		Action:     "password=fallback-action-secret " + longText,
+		Method:     "POST",
+		Path:       "/api/platform/fallback",
+		StatusCode: 200,
+		ClientIP:   "127.0.0.1",
+		Result:     "success",
+	}
+	if err := db.Create(fallback).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	service := newAdminAuditExplorerForTest(t, db)
+	page, err := service.Explore(
+		context.Background(),
+		&AdminAuditFilter{Limit: 2},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("Explore() items = %d, want 2", len(page.Items))
+	}
+	item := page.Items[0]
+	if item.ID != log.ID {
+		t.Fatalf("Explore() first id = %d, want %d", item.ID, log.ID)
+	}
+	if strings.Contains(page.Items[1].Action, "fallback-action-secret") {
+		t.Fatalf(
+			"Explore() fallback action leaked: %q",
+			page.Items[1].Action,
+		)
+	}
+	if len([]rune(page.Items[1].Action)) >
+		adminAuditActionMaxRunes {
+		t.Fatalf(
+			"Explore() fallback action length = %d",
+			len([]rune(page.Items[1].Action)),
+		)
+	}
+
+	detail, err := service.GetDetail(context.Background(), log.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projected, err := json.Marshal(struct {
+		Page   *AdminAuditPage   `json:"page"`
+		Detail *AdminAuditDetail `json:"detail"`
+	}{
+		Page:   page,
+		Detail: detail,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{
+		"actor-id-secret",
+		"username-secret",
+		"action-code-secret",
+		"resource-type-secret",
+		"resource-public-id-secret",
+		"method-secret",
+		"path-secret",
+		"result-secret",
+		"query-secret",
+		"nested-query-secret",
+		"user-agent-secret",
+		"notes-secret",
+		"request-id-secret",
+		"trace-id-secret",
+		"correlation-id-secret",
+		"fallback-action-secret",
+	} {
+		if strings.Contains(string(projected), secret) {
+			t.Fatalf("read projection leaked %q: %s", secret, projected)
+		}
+	}
+
+	assertAuditProjectionLimit := func(
+		field string,
+		value string,
+		limit int,
+	) {
+		t.Helper()
+		if got := len([]rune(value)); got > limit {
+			t.Errorf("%s length = %d, want <= %d", field, got, limit)
+		}
+	}
+	for field, projection := range map[string]struct {
+		value string
+		limit int
+	}{
+		"actor_type": {
+			value: string(item.ActorType),
+			limit: adminAuditActorTypeMaxRunes,
+		},
+		"actor_id": {
+			value: item.ActorID,
+			limit: adminAuditActorIDMaxRunes,
+		},
+		"username": {
+			value: item.Username,
+			limit: adminAuditUsernameMaxRunes,
+		},
+		"platform_role": {
+			value: string(item.PlatformRole),
+			limit: adminAuditPlatformRoleMaxRunes,
+		},
+		"action": {
+			value: item.Action,
+			limit: adminAuditActionMaxRunes,
+		},
+		"action_code": {
+			value: item.ActionCode,
+			limit: adminAuditActionCodeMaxRunes,
+		},
+		"resource_type": {
+			value: item.ResourceType,
+			limit: adminAuditResourceTypeMaxRunes,
+		},
+		"resource_public_id": {
+			value: item.ResourcePublicID,
+			limit: adminAuditResourcePublicIDMaxRunes,
+		},
+		"method": {
+			value: item.Method,
+			limit: adminAuditMethodMaxRunes,
+		},
+		"path": {
+			value: item.Path,
+			limit: adminAuditPathMaxRunes,
+		},
+		"result": {
+			value: item.Result,
+			limit: adminAuditResultMaxRunes,
+		},
+		"query": {
+			value: detail.Query,
+			limit: adminAuditQueryMaxRunes,
+		},
+		"user_agent": {
+			value: detail.UserAgent,
+			limit: adminAuditUserAgentMaxRunes,
+		},
+		"notes": {
+			value: detail.Notes,
+			limit: adminAuditNotesMaxRunes,
+		},
+		"request_id": {
+			value: detail.RequestID,
+			limit: adminAuditRequestIDMaxRunes,
+		},
+		"trace_id": {
+			value: detail.TraceID,
+			limit: adminAuditTraceIDMaxRunes,
+		},
+		"correlation_id": {
+			value: detail.CorrelationID,
+			limit: adminAuditCorrelationIDMaxRunes,
+		},
+	} {
+		assertAuditProjectionLimit(field, projection.value, projection.limit)
+	}
+
+	csvRow := adminAuditExportCSVRow(log)
+	for _, secret := range []string{
+		"username-secret",
+		"action-code-secret",
+		"resource-type-secret",
+		"resource-public-id-secret",
+		"method-secret",
+		"path-secret",
+		"result-secret",
+		"request-id-secret",
+		"trace-id-secret",
+		"correlation-id-secret",
+	} {
+		if strings.Contains(strings.Join(csvRow, ","), secret) {
+			t.Fatalf("CSV projection leaked %q: %#v", secret, csvRow)
+		}
+	}
+	if csvRow[1] != detail.Username ||
+		csvRow[3] != detail.Action ||
+		csvRow[4] != detail.Method ||
+		csvRow[5] != detail.Path ||
+		csvRow[6] != detail.Result ||
+		csvRow[10] != detail.ResourceType ||
+		csvRow[11] != detail.ResourcePublicID ||
+		csvRow[12] != detail.RequestID ||
+		csvRow[13] != detail.TraceID ||
+		csvRow[14] != detail.CorrelationID {
+		t.Fatalf(
+			"CSV does not reuse the list/detail redaction boundary: %#v",
+			csvRow,
+		)
+	}
+
+	var persisted models.AdminAuditLog
+	if err := db.First(&persisted, log.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	rawEvidence, err := json.Marshal(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{
+		"actor-id-secret",
+		"username-secret",
+		"raw-action-secret",
+		"action-code-secret",
+		"resource-type-secret",
+		"resource-public-id-secret",
+		"method-secret",
+		"path-secret",
+		"result-secret",
+		"query-secret",
+		"nested-query-secret",
+		"user-agent-secret",
+		"notes-secret",
+		"request-id-secret",
+		"trace-id-secret",
+		"correlation-id-secret",
+	} {
+		if !strings.Contains(string(rawEvidence), secret) {
+			t.Fatalf("raw audit evidence lost %q: %s", secret, rawEvidence)
+		}
 	}
 }
 

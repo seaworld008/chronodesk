@@ -60,6 +60,7 @@ func NewProjectConfigurationService(
 }
 
 const projectConfigurationBootstrapActorID = "project-configuration-bootstrap"
+const projectConfigurationBootstrapBatchSize = 100
 
 // BootstrapActiveProjects guarantees every active project has one immutable
 // published configuration before any ticket intake is accepted. Project
@@ -71,45 +72,70 @@ func (service *ProjectConfigurationService) BootstrapActiveProjects(
 	if service == nil || service.db == nil {
 		return errors.New("project configuration service is unavailable")
 	}
-	var projects []models.Project
-	if err := service.db.WithContext(ctx).
-		Select("id", "organization_id", "key", "status").
-		Where("status = ?", models.ProjectStatusActive).
-		Order("organization_id ASC, id ASC").
-		Find(&projects).Error; err != nil {
-		return fmt.Errorf("list projects for configuration bootstrap: %w", err)
-	}
 	actor := models.SystemActor(projectConfigurationBootstrapActorID)
-	for _, project := range projects {
-		scope := project.Scope()
-		operationContext, err := EnsureSystemProjectOperationContext(
-			ctx,
-			scope,
-			actor,
-			"configuration-bootstrap:"+string(project.Key),
-			"configuration-bootstrap:"+string(project.Key),
-		)
-		if err != nil {
-			return err
+	var lastOrganizationID uint
+	var lastProjectID uint
+	for {
+		var projects []models.Project
+		query := service.db.WithContext(ctx).
+			Select("id", "organization_id", "key", "status").
+			Where("status = ?", models.ProjectStatusActive)
+		if lastOrganizationID != 0 {
+			query = query.Where(
+				"organization_id > ? OR (organization_id = ? AND id > ?)",
+				lastOrganizationID,
+				lastOrganizationID,
+				lastProjectID,
+			)
 		}
-		if err := scopeddb.WithProjectScopeContextTransaction(
-			operationContext,
-			service.db,
-			scope,
-			func(scopedContext context.Context) error {
-				_, bootstrapErr :=
-					service.BootstrapProjectConfiguration(scopedContext)
-				return bootstrapErr
-			},
-		); err != nil {
+		if err := query.
+			Order("organization_id ASC, id ASC").
+			Limit(projectConfigurationBootstrapBatchSize).
+			Find(&projects).Error; err != nil {
 			return fmt.Errorf(
-				"bootstrap project %s configuration: %w",
-				project.Key,
+				"list projects for configuration bootstrap: %w",
 				err,
 			)
 		}
+		if len(projects) == 0 {
+			return nil
+		}
+		for _, project := range projects {
+			scope := project.Scope()
+			operationContext, err := EnsureSystemProjectOperationContext(
+				ctx,
+				scope,
+				actor,
+				"configuration-bootstrap:"+string(project.Key),
+				"configuration-bootstrap:"+string(project.Key),
+			)
+			if err != nil {
+				return err
+			}
+			if err := scopeddb.WithProjectScopeContextTransaction(
+				operationContext,
+				service.db,
+				scope,
+				func(scopedContext context.Context) error {
+					_, bootstrapErr :=
+						service.BootstrapProjectConfiguration(scopedContext)
+					return bootstrapErr
+				},
+			); err != nil {
+				return fmt.Errorf(
+					"bootstrap project %s configuration: %w",
+					project.Key,
+					err,
+				)
+			}
+		}
+		last := projects[len(projects)-1]
+		lastOrganizationID = last.OrganizationID
+		lastProjectID = last.ID
+		if len(projects) < projectConfigurationBootstrapBatchSize {
+			return nil
+		}
 	}
-	return nil
 }
 
 type RequestTypeDraftInput struct {

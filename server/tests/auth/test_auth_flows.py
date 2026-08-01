@@ -72,11 +72,44 @@ class TestAuthenticationFlows:
             history_body = history_resp.json()
             assert history_body.get("code") == 0, safe_diagnostic(history_body)
 
-            items = history_body.get("data", {}).get("items", [])
+            assert set(history_body) == {"code", "msg", "data"}, safe_diagnostic(
+                history_body
+            )
+            history_page = history_body.get("data", {})
+            assert set(history_page) == {
+                "items",
+                "total",
+                "page",
+                "page_size",
+                "total_pages",
+            }, safe_diagnostic(history_body)
+            assert history_page.get("page") == 1, safe_diagnostic(history_body)
+            assert history_page.get("page_size") == 5, safe_diagnostic(history_body)
+            assert isinstance(history_page.get("total"), int), safe_diagnostic(
+                history_body
+            )
+            assert isinstance(history_page.get("total_pages"), int), safe_diagnostic(
+                history_body
+            )
+
+            items = history_page.get("items", [])
             assert items, "注册后应记录至少一条登录历史"
             first_entry = items[0]
             assert first_entry.get("login_status") == "success"
-            assert first_entry.get("session_id"), "登录历史缺少会话 ID"
+            assert "session_id" not in first_entry, "安全登录历史 DTO 不得暴露会话 ID"
+            assert {
+                "id",
+                "ip_address",
+                "login_time",
+                "logout_time",
+                "login_status",
+                "login_method",
+                "location",
+                "device_info",
+                "session_duration",
+                "is_current_session",
+                "is_active",
+            }.issubset(first_entry), safe_diagnostic(first_entry)
         finally:
             authed_client.close()
 
@@ -385,8 +418,17 @@ class TestAuthenticationFlows:
             assert list_resp.status_code == 200, response_diagnostic(list_resp)
             list_body = list_resp.json()
             assert list_body.get("code") == 0, safe_diagnostic(list_body)
-            devices = list_body.get("data", [])
+            devices_page = list_body.get("data", {})
+            devices = devices_page.get("items", [])
             assert devices, "启用记住设备后应存在可信设备记录"
+            assert devices_page.get("page") == 1, safe_diagnostic(list_body)
+            assert devices_page.get("page_size") == 25, safe_diagnostic(list_body)
+            assert isinstance(devices_page.get("total"), int), safe_diagnostic(
+                list_body
+            )
+            assert isinstance(devices_page.get("total_pages"), int), safe_diagnostic(
+                list_body
+            )
             device_id = devices[0]["id"]
 
             revoke_resp = authed.delete(f"/user/trusted-devices/{device_id}")

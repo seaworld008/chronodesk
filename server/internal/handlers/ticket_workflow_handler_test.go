@@ -93,6 +93,7 @@ func setupWorkflowHandlerTest(
 	db := openHandlerTestDB(t)
 	if err := db.AutoMigrate(
 		&models.User{},
+		&models.Category{},
 		&models.Ticket{},
 		&models.TicketComment{},
 		&models.TicketHistory{},

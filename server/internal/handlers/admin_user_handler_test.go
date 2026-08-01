@@ -483,3 +483,45 @@ func TestAdminUserHandlerAcceptsAllPublishedListQueryParameters(t *testing.T) {
 		}
 	}
 }
+
+func TestAdminUserHandlerRejectsUnpublishedAndInvalidListQueries(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(&models.User{}); err != nil {
+		t.Fatalf("migrate users: %v", err)
+	}
+	handler := NewAdminUserHandler(services.NewAdminUserService(db))
+	for _, query := range []string{
+		"page=0",
+		"page_size=101",
+		"page=1&page=2",
+		"search=%20alice",
+		"order_by=role",
+		"order=ASC",
+		"unknown=value",
+		"search=%ZZ",
+	} {
+		t.Run(query, func(t *testing.T) {
+			router := gin.New()
+			router.GET("/users", handler.GetUserList)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(
+				response,
+				httptest.NewRequest(
+					http.MethodGet,
+					"/users?"+query,
+					nil,
+				),
+			)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf(
+					"status = %d, want 400; body=%s",
+					response.Code,
+					response.Body,
+				)
+			}
+		})
+	}
+}

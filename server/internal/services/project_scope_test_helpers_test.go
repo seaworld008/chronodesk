@@ -84,6 +84,7 @@ func testProjectOperationContext(
 		t.Fatalf("create test queue: %v", err)
 	}
 	for _, scopedModel := range []any{
+		&models.Category{},
 		&models.TicketComment{},
 		&models.TicketAttachment{},
 		&models.TicketHistory{},

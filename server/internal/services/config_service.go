@@ -21,9 +21,25 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/version"
 )
 
-// ErrInvalidSystemConfigKey is stable so every transport can map the shared
-// key invariant without depending on a persistence error.
-var ErrInvalidSystemConfigKey = errors.New("配置键无效")
+var (
+	// ErrInvalidSystemConfigKey is stable so every transport can map the shared
+	// key invariant without depending on a persistence error.
+	ErrInvalidSystemConfigKey = errors.New("配置键无效")
+	// ErrProtectedSystemConfigKey prevents the generic configuration surface
+	// from bypassing the Agent platform's audited runtime-control workflow. It
+	// wraps ErrInvalidSystemConfigKey so existing transports fail closed as a
+	// bad generic-config request while callers can still match this sentinel.
+	ErrProtectedSystemConfigKey = fmt.Errorf(
+		"%w: Agent 全局安全控制必须通过专用接口修改",
+		ErrInvalidSystemConfigKey,
+	)
+	ErrConfigExportTooLarge = errors.New("系统配置导出超过大小限制")
+)
+
+const (
+	MaxConfigExportRecords = 10_000
+	MaxConfigExportBytes   = 10 << 20
+)
 
 // ValidateSystemConfigKey enforces the persisted SystemConfig key contract.
 // Keys are Unicode data: they are not normalized or restricted to ASCII.
@@ -99,6 +115,11 @@ const (
 	KeyNotifyEmailEnabled     = "notify.email_enabled"
 	KeyNotifyWebSocketEnabled = "notify.websocket_enabled"
 	KeyNotifyInAppEnabled     = "notify.inapp_enabled"
+
+	// Agent 全局安全控制由 agentplatform.RuntimeControl 独占修改。它们仍存放
+	// 在 system_configs 中以支持持久化恢复，但不是通用系统配置。
+	KeyAgentGlobalReadOnly = "agent.global_read_only"
+	KeyAgentEmergencyStop  = "agent.emergency_stop"
 )
 
 // NewConfigService 创建配置服务
@@ -189,7 +210,7 @@ func (s *ConfigService) GetConfigBool(key string) (bool, error) {
 
 // SetConfig 设置配置值
 func (s *ConfigService) SetConfig(key, value, valueType, description, category, group string) error {
-	if err := ValidateSystemConfigKey(key); err != nil {
+	if err := validateMutableSystemConfigKey(key); err != nil {
 		return err
 	}
 	var existingConfig models.SystemConfig
@@ -237,7 +258,7 @@ func (s *ConfigService) SetConfig(key, value, valueType, description, category, 
 
 // DeleteConfig 删除配置
 func (s *ConfigService) DeleteConfig(key string) error {
-	if err := ValidateSystemConfigKey(key); err != nil {
+	if err := validateMutableSystemConfigKey(key); err != nil {
 		return err
 	}
 	if err := s.db.Where("key = ?", key).Delete(&models.SystemConfig{}).Error; err != nil {
@@ -271,7 +292,9 @@ func (s *ConfigService) ListConfigPage(
 	if category != "" && !validSystemConfigCategory(category) {
 		return nil, ErrDirectoryListQuery
 	}
-	query := s.db.WithContext(ctx).Model(&models.SystemConfig{})
+	query := editableSystemConfigs(
+		s.db.WithContext(ctx).Model(&models.SystemConfig{}),
+	)
 	if category != "" {
 		query = query.Where("category = ?", category)
 	}
@@ -333,7 +356,7 @@ func systemConfigDirectoryOrder(request DirectoryPageRequest) string {
 
 // BatchUpdateConfigs 批量更新配置
 func (s *ConfigService) BatchUpdateConfigs(configs []models.SystemConfig) error {
-	if err := validateSystemConfigKeys(configs); err != nil {
+	if err := validateMutableSystemConfigKeys(configs); err != nil {
 		return err
 	}
 	changes := make([]configAuditChange, 0, len(configs))
@@ -411,9 +434,11 @@ func (s *ConfigService) logConfigChange(key, value, operation string) {
 
 // ExportConfigs 导出配置到JSON
 func (s *ConfigService) ExportConfigs(category string) ([]byte, error) {
-	var configs []models.SystemConfig
+	configs := make([]models.SystemConfig, 0, MaxConfigExportRecords+1)
 
-	query := s.db.Order("category, \"group\", key")
+	query := editableSystemConfigs(s.db).
+		Order("category ASC, \"group\" ASC, key ASC, id ASC").
+		Limit(MaxConfigExportRecords + 1)
 	if category != "" {
 		query = query.Where("category = ?", category)
 	}
@@ -421,8 +446,26 @@ func (s *ConfigService) ExportConfigs(category string) ([]byte, error) {
 	if err := query.Find(&configs).Error; err != nil {
 		return nil, err
 	}
+	if len(configs) > MaxConfigExportRecords {
+		return nil, fmt.Errorf(
+			"%w: record limit is %d",
+			ErrConfigExportTooLarge,
+			MaxConfigExportRecords,
+		)
+	}
 
-	return json.MarshalIndent(configs, "", "  ")
+	data, err := json.MarshalIndent(configs, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > MaxConfigExportBytes {
+		return nil, fmt.Errorf(
+			"%w: byte limit is %d",
+			ErrConfigExportTooLarge,
+			MaxConfigExportBytes,
+		)
+	}
+	return data, nil
 }
 
 // ImportConfigs 从JSON导入配置
@@ -431,7 +474,7 @@ func (s *ConfigService) ImportConfigs(data []byte) error {
 	if err := json.Unmarshal(data, &configs); err != nil {
 		return fmt.Errorf("JSON格式错误: %v", err)
 	}
-	if err := validateSystemConfigKeys(configs); err != nil {
+	if err := validateMutableSystemConfigKeys(configs); err != nil {
 		return err
 	}
 
@@ -459,7 +502,7 @@ func (s *ConfigService) ImportConfigs(data []byte) error {
 
 // ValidateConfig 验证配置值
 func (s *ConfigService) ValidateConfig(key, value, valueType string) error {
-	if err := ValidateSystemConfigKey(key); err != nil {
+	if err := validateMutableSystemConfigKey(key); err != nil {
 		return err
 	}
 	switch valueType {
@@ -494,6 +537,41 @@ func validateSystemConfigKeys(configs []models.SystemConfig) error {
 		}
 	}
 	return nil
+}
+
+func validateMutableSystemConfigKey(key string) error {
+	if err := ValidateSystemConfigKey(key); err != nil {
+		return err
+	}
+	if isProtectedSystemConfigKey(key) {
+		return ErrProtectedSystemConfigKey
+	}
+	return nil
+}
+
+func validateMutableSystemConfigKeys(configs []models.SystemConfig) error {
+	for _, config := range configs {
+		if err := validateMutableSystemConfigKey(config.Key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isProtectedSystemConfigKey(key string) bool {
+	switch key {
+	case KeyAgentGlobalReadOnly, KeyAgentEmergencyStop:
+		return true
+	default:
+		return false
+	}
+}
+
+func editableSystemConfigs(query *gorm.DB) *gorm.DB {
+	return query.Where(
+		"key NOT IN ?",
+		[]string{KeyAgentGlobalReadOnly, KeyAgentEmergencyStop},
+	)
 }
 
 // GetSecurityPolicy 获取安全策略配置

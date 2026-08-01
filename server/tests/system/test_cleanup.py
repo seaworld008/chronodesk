@@ -57,11 +57,24 @@ class TestCleanupSettings:
             # Logs endpoint (may be empty but should succeed)
             logs_resp = admin_api.get_json(
                 "/platform/system/cleanup/logs",
-                params={"limit": 5},
+                params={
+                    "page": 1,
+                    "page_size": 5,
+                    "sort_by": "created_at",
+                    "sort_order": "desc",
+                },
             )
             assert logs_resp.status_code == 200, response_diagnostic(logs_resp)
             logs_body = logs_resp.json()
             assert logs_body.get("success") is True, safe_diagnostic(logs_body)
+            logs_page = logs_body.get("data", {})
+            assert isinstance(logs_page.get("items"), list), safe_diagnostic(logs_body)
+            assert logs_page.get("page") == 1, safe_diagnostic(logs_body)
+            assert logs_page.get("page_size") == 5, safe_diagnostic(logs_body)
+            assert isinstance(logs_page.get("total"), int), safe_diagnostic(logs_body)
+            assert isinstance(logs_page.get("total_pages"), int), safe_diagnostic(
+                logs_body
+            )
 
             # Stats endpoint
             stats_resp = admin_api.get_json("/platform/system/cleanup/stats")

@@ -282,12 +282,13 @@ type ProjectMembership struct {
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 	Version   uint64    `json:"version" gorm:"not null;default:1"`
 
-	ProjectID uint        `json:"project_id" gorm:"not null;index;uniqueIndex:idx_project_memberships_project_user,priority:1"`
-	Project   Project     `json:"project,omitempty" gorm:"constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
-	UserID    uint        `json:"user_id" gorm:"not null;index;uniqueIndex:idx_project_memberships_project_user,priority:2"`
-	User      User        `json:"user,omitempty" gorm:"constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
-	Role      ProjectRole `json:"role" gorm:"size:20;not null;default:'observer';index;check:chk_project_memberships_role,role IN ('project_admin','manager','agent','requester','observer')"`
-	IsActive  bool        `json:"is_active" gorm:"not null;default:true;index"`
+	ProjectID            uint        `json:"project_id" gorm:"not null;index;uniqueIndex:idx_project_memberships_project_user,priority:1"`
+	Project              Project     `json:"project,omitempty" gorm:"constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	UserID               uint        `json:"user_id" gorm:"not null;index;uniqueIndex:idx_project_memberships_project_user,priority:2"`
+	User                 User        `json:"user,omitempty" gorm:"constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	Role                 ProjectRole `json:"role" gorm:"size:20;not null;default:'observer';index;check:chk_project_memberships_role,role IN ('project_admin','manager','agent','requester','observer')"`
+	IsActive             bool        `json:"is_active" gorm:"not null;default:true;index"`
+	KnowledgeContributor bool        `json:"knowledge_contributor" gorm:"not null;default:false"`
 }
 
 func (ProjectMembership) TableName() string {

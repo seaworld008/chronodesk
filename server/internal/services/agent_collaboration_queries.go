@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"time"
 
@@ -15,13 +16,14 @@ import (
 )
 
 const (
-	defaultCollaborationPageSize = 20
+	defaultCollaborationPageSize = 25
 	maxCollaborationPageSize     = 100
 )
 
 var (
 	ErrCollaborationAccessDenied = errors.New("collaboration access denied")
 	ErrCollaborationNotFound     = errors.New("collaboration record not found")
+	ErrCollaborationPagination   = errors.New("collaboration pagination is invalid")
 )
 
 // CollaborationPagination is normalized again inside the query service so a
@@ -41,11 +43,13 @@ type CollaborationPage[T any] struct {
 // AgentRunSummary contains only observable execution state. In particular it
 // deliberately omits PolicySnapshot and all hidden model reasoning.
 type AgentRunSummary struct {
-	ID        string                `json:"id"`
-	CreatedAt time.Time             `json:"created_at"`
-	UpdatedAt time.Time             `json:"updated_at"`
-	TicketID  uint                  `json:"ticket_id"`
-	Status    models.AgentRunStatus `json:"status"`
+	ID           string                `json:"id"`
+	CreatedAt    time.Time             `json:"created_at"`
+	UpdatedAt    time.Time             `json:"updated_at"`
+	TicketID     uint                  `json:"ticket_id"`
+	TicketNumber string                `json:"ticket_number"`
+	TicketTitle  string                `json:"ticket_title"`
+	Status       models.AgentRunStatus `json:"status"`
 }
 
 type AgentRunDetail struct {
@@ -70,6 +74,8 @@ type ActionProposalSummary struct {
 	CreatedAt     time.Time                   `json:"created_at"`
 	UpdatedAt     time.Time                   `json:"updated_at"`
 	TicketID      uint                        `json:"ticket_id"`
+	TicketNumber  string                      `json:"ticket_number"`
+	TicketTitle   string                      `json:"ticket_title"`
 	AgentRunID    string                      `json:"agent_run_id"`
 	ActionType    string                      `json:"action_type"`
 	RiskLevel     models.ActionRiskLevel      `json:"risk_level"`
@@ -91,6 +97,8 @@ type ApprovalTaskSummary struct {
 	CreatedAt         time.Time                 `json:"created_at"`
 	UpdatedAt         time.Time                 `json:"updated_at"`
 	TicketID          uint                      `json:"ticket_id"`
+	TicketNumber      string                    `json:"ticket_number"`
+	TicketTitle       string                    `json:"ticket_title"`
 	ProposalID        string                    `json:"proposal_id"`
 	TargetVersion     uint64                    `json:"target_ticket_version"`
 	RequiredApprovals int                       `json:"required_approvals"`
@@ -106,11 +114,13 @@ type ApprovalTaskDetail struct {
 }
 
 type HandoffSummary struct {
-	ID         string                  `json:"id"`
-	CreatedAt  time.Time               `json:"created_at"`
-	TicketID   uint                    `json:"ticket_id"`
-	AgentRunID string                  `json:"agent_run_id,omitempty"`
-	Direction  models.HandoffDirection `json:"direction"`
+	ID           string                  `json:"id"`
+	CreatedAt    time.Time               `json:"created_at"`
+	TicketID     uint                    `json:"ticket_id"`
+	TicketNumber string                  `json:"ticket_number"`
+	TicketTitle  string                  `json:"ticket_title"`
+	AgentRunID   string                  `json:"agent_run_id,omitempty"`
+	Direction    models.HandoffDirection `json:"direction"`
 }
 
 type HandoffDetail struct {
@@ -142,7 +152,10 @@ func (service *AgentCollaborationQueryService) ListAgentRuns(
 	if err != nil {
 		return nil, err
 	}
-	page, pageSize := normalizeCollaborationPagination(pagination)
+	page, pageSize, err := validateCollaborationPagination(pagination)
+	if err != nil {
+		return nil, err
+	}
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
 		return nil, fmt.Errorf("count scoped Agent runs: %w", err)
@@ -157,6 +170,9 @@ func (service *AgentCollaborationQueryService) ListAgentRuns(
 		Limit(pageSize).
 		Scan(&items).Error; err != nil {
 		return nil, fmt.Errorf("list scoped Agent runs: %w", err)
+	}
+	if err := service.populateAgentRunTickets(ctx, access.Scope, items); err != nil {
+		return nil, err
 	}
 	return &CollaborationPage[AgentRunSummary]{
 		Items: items, Total: total, Page: page, PageSize: pageSize,
@@ -189,6 +205,18 @@ func (service *AgentCollaborationQueryService) GetAgentRun(
 	if err != nil {
 		return nil, fmt.Errorf("get scoped Agent run: %w", err)
 	}
+	projection, err := service.collaborationTicketProjections(
+		ctx,
+		access.Scope,
+		[]uint{result.TicketID},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if ticket, ok := projection[result.TicketID]; ok {
+		result.TicketNumber = ticket.TicketNumber
+		result.TicketTitle = ticket.Title
+	}
 	return &result, nil
 }
 
@@ -201,7 +229,10 @@ func (service *AgentCollaborationQueryService) ListActionProposals(
 	if err != nil {
 		return nil, err
 	}
-	page, pageSize := normalizeCollaborationPagination(pagination)
+	page, pageSize, err := validateCollaborationPagination(pagination)
+	if err != nil {
+		return nil, err
+	}
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
 		return nil, fmt.Errorf("count scoped action proposals: %w", err)
@@ -218,6 +249,13 @@ func (service *AgentCollaborationQueryService) ListActionProposals(
 		Limit(pageSize).
 		Scan(&items).Error; err != nil {
 		return nil, fmt.Errorf("list scoped action proposals: %w", err)
+	}
+	if err := service.populateActionProposalTickets(
+		ctx,
+		access.Scope,
+		items,
+	); err != nil {
+		return nil, err
 	}
 	return &CollaborationPage[ActionProposalSummary]{
 		Items: items, Total: total, Page: page, PageSize: pageSize,
@@ -248,10 +286,23 @@ func (service *AgentCollaborationQueryService) GetActionProposal(
 	if err != nil {
 		return nil, fmt.Errorf("get scoped action proposal: %w", err)
 	}
-	return &ActionProposalDetail{
+	result := &ActionProposalDetail{
 		ActionProposalSummary: row.ActionProposalSummary,
 		Preview:               safeProposalPreview(row.ChangePreview),
-	}, nil
+	}
+	projection, err := service.collaborationTicketProjections(
+		ctx,
+		access.Scope,
+		[]uint{result.TicketID},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if ticket, ok := projection[result.TicketID]; ok {
+		result.TicketNumber = ticket.TicketNumber
+		result.TicketTitle = ticket.Title
+	}
+	return result, nil
 }
 
 func (service *AgentCollaborationQueryService) ListApprovalTasks(
@@ -263,7 +314,10 @@ func (service *AgentCollaborationQueryService) ListApprovalTasks(
 	if err != nil {
 		return nil, err
 	}
-	page, pageSize := normalizeCollaborationPagination(pagination)
+	page, pageSize, err := validateCollaborationPagination(pagination)
+	if err != nil {
+		return nil, err
+	}
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
 		return nil, fmt.Errorf("count scoped approval tasks: %w", err)
@@ -280,6 +334,13 @@ func (service *AgentCollaborationQueryService) ListApprovalTasks(
 		Limit(pageSize).
 		Scan(&items).Error; err != nil {
 		return nil, fmt.Errorf("list scoped approval tasks: %w", err)
+	}
+	if err := service.populateApprovalTaskTickets(
+		ctx,
+		access.Scope,
+		items,
+	); err != nil {
+		return nil, err
 	}
 	return &CollaborationPage[ApprovalTaskSummary]{
 		Items: items, Total: total, Page: page, PageSize: pageSize,
@@ -309,6 +370,18 @@ func (service *AgentCollaborationQueryService) GetApprovalTask(
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get scoped approval task: %w", err)
+	}
+	projection, err := service.collaborationTicketProjections(
+		ctx,
+		access.Scope,
+		[]uint{result.TicketID},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if ticket, ok := projection[result.TicketID]; ok {
+		result.TicketNumber = ticket.TicketNumber
+		result.TicketTitle = ticket.Title
 	}
 	scope := access.Scope
 	var counts []struct {
@@ -348,7 +421,10 @@ func (service *AgentCollaborationQueryService) ListHandoffs(
 	if err != nil {
 		return nil, err
 	}
-	page, pageSize := normalizeCollaborationPagination(pagination)
+	page, pageSize, err := validateCollaborationPagination(pagination)
+	if err != nil {
+		return nil, err
+	}
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
 		return nil, fmt.Errorf("count scoped handoffs: %w", err)
@@ -361,6 +437,13 @@ func (service *AgentCollaborationQueryService) ListHandoffs(
 		Limit(pageSize).
 		Scan(&items).Error; err != nil {
 		return nil, fmt.Errorf("list scoped handoffs: %w", err)
+	}
+	if err := service.populateHandoffTickets(
+		ctx,
+		access.Scope,
+		items,
+	); err != nil {
+		return nil, err
 	}
 	return &CollaborationPage[HandoffSummary]{
 		Items: items, Total: total, Page: page, PageSize: pageSize,
@@ -390,12 +473,25 @@ func (service *AgentCollaborationQueryService) GetHandoff(
 	if err != nil {
 		return nil, fmt.Errorf("get scoped handoff: %w", err)
 	}
-	return &HandoffDetail{
+	result := &HandoffDetail{
 		HandoffSummary:     row.HandoffSummary,
 		Reason:             row.Reason,
 		CompletedSummary:   row.CompletedSummary,
 		MissingInformation: safeMissingInformation(row.MissingInfo),
-	}, nil
+	}
+	projection, err := service.collaborationTicketProjections(
+		ctx,
+		access.Scope,
+		[]uint{result.TicketID},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if ticket, ok := projection[result.TicketID]; ok {
+		result.TicketNumber = ticket.TicketNumber
+		result.TicketTitle = ticket.Title
+	}
+	return result, nil
 }
 
 type actionProposalDetailRow struct {
@@ -460,21 +556,181 @@ func (service *AgentCollaborationQueryService) scopedQuery(
 	return query, nil
 }
 
-func normalizeCollaborationPagination(
+func validateCollaborationPagination(
 	pagination CollaborationPagination,
-) (int, int) {
+) (int, int, error) {
 	page := pagination.Page
-	if page < 1 {
+	if page == 0 {
 		page = 1
 	}
 	pageSize := pagination.PageSize
-	if pageSize < 1 {
+	if pageSize == 0 {
 		pageSize = defaultCollaborationPageSize
 	}
-	if pageSize > maxCollaborationPageSize {
-		pageSize = maxCollaborationPageSize
+	if page < 1 ||
+		pageSize < 1 ||
+		pageSize > maxCollaborationPageSize ||
+		page > math.MaxInt/pageSize {
+		return 0, 0, ErrCollaborationPagination
 	}
-	return page, pageSize
+	return page, pageSize, nil
+}
+
+type collaborationTicketProjection struct {
+	ID           uint
+	TicketNumber string
+	Title        string
+}
+
+func (service *AgentCollaborationQueryService) collaborationTicketProjections(
+	ctx context.Context,
+	scope models.ProjectScope,
+	ticketIDs []uint,
+) (map[uint]collaborationTicketProjection, error) {
+	uniqueIDs := make([]uint, 0, len(ticketIDs))
+	seen := make(map[uint]struct{}, len(ticketIDs))
+	for _, ticketID := range ticketIDs {
+		if ticketID == 0 {
+			continue
+		}
+		if _, exists := seen[ticketID]; exists {
+			continue
+		}
+		seen[ticketID] = struct{}{}
+		uniqueIDs = append(uniqueIDs, ticketID)
+	}
+	if len(uniqueIDs) == 0 {
+		return map[uint]collaborationTicketProjection{}, nil
+	}
+	var items []collaborationTicketProjection
+	if err := service.db.WithContext(ctx).
+		Model(&models.Ticket{}).
+		Select("id", "ticket_number", "title").
+		Where(
+			"organization_id = ? AND project_id = ? AND id IN ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+			uniqueIDs,
+		).
+		Find(&items).Error; err != nil {
+		return nil, fmt.Errorf("load collaboration ticket projections: %w", err)
+	}
+	result := make(
+		map[uint]collaborationTicketProjection,
+		len(items),
+	)
+	for index := range items {
+		result[items[index].ID] = items[index]
+	}
+	return result, nil
+}
+
+func (service *AgentCollaborationQueryService) populateAgentRunTickets(
+	ctx context.Context,
+	scope models.ProjectScope,
+	items []AgentRunSummary,
+) error {
+	ids := make([]uint, 0, len(items))
+	for index := range items {
+		ids = append(ids, items[index].TicketID)
+	}
+	projections, err := service.collaborationTicketProjections(ctx, scope, ids)
+	if err != nil {
+		return err
+	}
+	for index := range items {
+		ticket, exists := projections[items[index].TicketID]
+		if !exists {
+			return fmt.Errorf(
+				"collaboration ticket %d is unavailable",
+				items[index].TicketID,
+			)
+		}
+		items[index].TicketNumber = ticket.TicketNumber
+		items[index].TicketTitle = ticket.Title
+	}
+	return nil
+}
+
+func (service *AgentCollaborationQueryService) populateActionProposalTickets(
+	ctx context.Context,
+	scope models.ProjectScope,
+	items []ActionProposalSummary,
+) error {
+	ids := make([]uint, 0, len(items))
+	for index := range items {
+		ids = append(ids, items[index].TicketID)
+	}
+	projections, err := service.collaborationTicketProjections(ctx, scope, ids)
+	if err != nil {
+		return err
+	}
+	for index := range items {
+		ticket, exists := projections[items[index].TicketID]
+		if !exists {
+			return fmt.Errorf(
+				"collaboration ticket %d is unavailable",
+				items[index].TicketID,
+			)
+		}
+		items[index].TicketNumber = ticket.TicketNumber
+		items[index].TicketTitle = ticket.Title
+	}
+	return nil
+}
+
+func (service *AgentCollaborationQueryService) populateApprovalTaskTickets(
+	ctx context.Context,
+	scope models.ProjectScope,
+	items []ApprovalTaskSummary,
+) error {
+	ids := make([]uint, 0, len(items))
+	for index := range items {
+		ids = append(ids, items[index].TicketID)
+	}
+	projections, err := service.collaborationTicketProjections(ctx, scope, ids)
+	if err != nil {
+		return err
+	}
+	for index := range items {
+		ticket, exists := projections[items[index].TicketID]
+		if !exists {
+			return fmt.Errorf(
+				"collaboration ticket %d is unavailable",
+				items[index].TicketID,
+			)
+		}
+		items[index].TicketNumber = ticket.TicketNumber
+		items[index].TicketTitle = ticket.Title
+	}
+	return nil
+}
+
+func (service *AgentCollaborationQueryService) populateHandoffTickets(
+	ctx context.Context,
+	scope models.ProjectScope,
+	items []HandoffSummary,
+) error {
+	ids := make([]uint, 0, len(items))
+	for index := range items {
+		ids = append(ids, items[index].TicketID)
+	}
+	projections, err := service.collaborationTicketProjections(ctx, scope, ids)
+	if err != nil {
+		return err
+	}
+	for index := range items {
+		ticket, exists := projections[items[index].TicketID]
+		if !exists {
+			return fmt.Errorf(
+				"collaboration ticket %d is unavailable",
+				items[index].TicketID,
+			)
+		}
+		items[index].TicketNumber = ticket.TicketNumber
+		items[index].TicketTitle = ticket.Title
+	}
+	return nil
 }
 
 func safeProposalPreview(raw datatypes.JSON) map[string]any {

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/seaworld008/chronodesk/server/internal/middleware"
@@ -16,6 +17,38 @@ import (
 )
 
 const projectConfigurationRequestBodyLimit = 4 << 20
+
+type intakeRequestTypeResponse struct {
+	ID          string                            `json:"id"`
+	Version     uint64                            `json:"version"`
+	Status      models.ConfigurationVersionStatus `json:"status"`
+	Key         string                            `json:"key"`
+	Name        string                            `json:"name"`
+	Description string                            `json:"description"`
+	WorkClass   models.WorkClass                  `json:"work_class"`
+	JSONSchema  json.RawMessage                   `json:"json_schema"`
+	UISchema    json.RawMessage                   `json:"ui_schema"`
+	PublishedAt *time.Time                        `json:"published_at,omitempty"`
+}
+
+type intakeWorkflowResponse struct {
+	ID          string                            `json:"id"`
+	Version     uint64                            `json:"version"`
+	Status      models.ConfigurationVersionStatus `json:"status"`
+	Key         string                            `json:"key"`
+	Name        string                            `json:"name"`
+	Description string                            `json:"description"`
+	States      json.RawMessage                   `json:"states"`
+	Transitions json.RawMessage                   `json:"transitions"`
+	PublishedAt *time.Time                        `json:"published_at,omitempty"`
+}
+
+type projectIntakeConfigurationResponse struct {
+	ReleaseID      string                      `json:"release_id"`
+	ReleaseVersion uint64                      `json:"release_version"`
+	RequestTypes   []intakeRequestTypeResponse `json:"request_types"`
+	Workflows      []intakeWorkflowResponse    `json:"workflows"`
+}
 
 // ProjectConfigurationHandler adapts project-scoped human REST requests to the
 // same ProjectConfigurationService used by other protocol adapters. The
@@ -377,7 +410,65 @@ func (handler *ProjectConfigurationHandler) CurrentIntakeConfiguration(
 		handler.writeError(c, err)
 		return
 	}
-	handler.response.Success(c, configuration, "获取当前建单配置成功")
+	handler.response.Success(
+		c,
+		projectIntakeConfigurationDTO(configuration),
+		"获取当前建单配置成功",
+	)
+}
+
+func projectIntakeConfigurationDTO(
+	configuration *services.ProjectIntakeConfiguration,
+) projectIntakeConfigurationResponse {
+	if configuration == nil {
+		return projectIntakeConfigurationResponse{
+			RequestTypes: []intakeRequestTypeResponse{},
+			Workflows:    []intakeWorkflowResponse{},
+		}
+	}
+	requestTypes := make(
+		[]intakeRequestTypeResponse,
+		0,
+		len(configuration.RequestTypes),
+	)
+	for _, version := range configuration.RequestTypes {
+		requestTypes = append(requestTypes, intakeRequestTypeResponse{
+			ID:          version.ID,
+			Version:     version.Version,
+			Status:      version.Status,
+			Key:         version.Key,
+			Name:        version.Name,
+			Description: version.Description,
+			WorkClass:   version.WorkClass,
+			JSONSchema:  json.RawMessage(version.JSONSchema),
+			UISchema:    json.RawMessage(version.UISchema),
+			PublishedAt: version.PublishedAt,
+		})
+	}
+	workflows := make(
+		[]intakeWorkflowResponse,
+		0,
+		len(configuration.Workflows),
+	)
+	for _, version := range configuration.Workflows {
+		workflows = append(workflows, intakeWorkflowResponse{
+			ID:          version.ID,
+			Version:     version.Version,
+			Status:      version.Status,
+			Key:         version.Key,
+			Name:        version.Name,
+			Description: version.Description,
+			States:      json.RawMessage(version.States),
+			Transitions: json.RawMessage(version.Transitions),
+			PublishedAt: version.PublishedAt,
+		})
+	}
+	return projectIntakeConfigurationResponse{
+		ReleaseID:      configuration.ReleaseID,
+		ReleaseVersion: configuration.ReleaseVersion,
+		RequestTypes:   requestTypes,
+		Workflows:      workflows,
+	}
 }
 
 func (handler *ProjectConfigurationHandler) RollbackConfigurationRelease(

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -44,6 +45,13 @@ type NotificationServiceInterface interface {
 	// 邮件通知相关方法
 	SetEmailNotificationService(emailService EmailNotificationServiceInterface)
 }
+
+var ErrInvalidNotificationPreferences = errors.New(
+	"invalid notification preferences",
+)
+var ErrInvalidNotificationListQuery = errors.New(
+	"invalid notification list query",
+)
 
 // NotificationService 通知服务
 type NotificationService struct {
@@ -350,6 +358,7 @@ func (ns *NotificationService) getActiveWebhooks(
 		scope.ProjectID,
 		models.WebhookStatusActive,
 	).
+		Order("id ASC").
 		Find(&configs).Error; err != nil {
 		return nil, err
 	}
@@ -1733,6 +1742,10 @@ func (ns *NotificationService) GetNotifications(ctx context.Context, filter *mod
 	if err != nil {
 		return nil, 0, fmt.Errorf("notification project scope: %w", err)
 	}
+	filter, err = normalizeNotificationListFilter(filter)
+	if err != nil {
+		return nil, 0, err
+	}
 	if !scopeddb.HasTransaction(ctx) {
 		type result struct {
 			items []*models.Notification
@@ -1751,9 +1764,6 @@ func (ns *NotificationService) GetNotifications(ctx context.Context, filter *mod
 			},
 		)
 		return value.items, value.total, operationErr
-	}
-	if filter == nil {
-		filter = &models.NotificationFilter{}
 	}
 	baseQuery := ns.db.WithContext(ctx).
 		Model(&models.Notification{}).
@@ -1837,6 +1847,10 @@ func (ns *NotificationService) GetNotifications(ctx context.Context, filter *mod
 		order.Column.Name = "channel"
 	case "is_read":
 		order.Column.Name = "is_read"
+	case "recipient_id":
+		order.Column.Name = "recipient_id"
+	case "sender_id":
+		order.Column.Name = "sender_id"
 	case "created_at":
 		order.Column.Name = "created_at"
 	}
@@ -1869,6 +1883,78 @@ func (ns *NotificationService) GetNotifications(ctx context.Context, filter *mod
 	}
 
 	return notifications, total, nil
+}
+
+func normalizeNotificationListFilter(
+	filter *models.NotificationFilter,
+) (*models.NotificationFilter, error) {
+	normalized := models.NotificationFilter{}
+	if filter != nil {
+		normalized = *filter
+		normalized.Types = append([]models.NotificationType(nil), filter.Types...)
+		normalized.Priorities = append(
+			[]models.NotificationPriority(nil),
+			filter.Priorities...,
+		)
+		normalized.Channels = append(
+			[]models.NotificationChannel(nil),
+			filter.Channels...,
+		)
+	}
+	if normalized.Limit == 0 {
+		normalized.Limit = 25
+	}
+	if normalized.OrderBy == "" {
+		normalized.OrderBy = "created_at"
+	}
+	if normalized.OrderDir == "" {
+		normalized.OrderDir = "desc"
+	}
+	if normalized.Limit < 1 || normalized.Limit > 100 ||
+		normalized.Offset < 0 ||
+		normalized.Offset > math.MaxInt-normalized.Limit ||
+		len([]rune(normalized.Query)) > 200 {
+		return nil, ErrInvalidNotificationListQuery
+	}
+	switch normalized.OrderBy {
+	case "id", "created_at", "updated_at", "priority", "type", "channel",
+		"is_read", "recipient_id", "sender_id":
+	default:
+		return nil, ErrInvalidNotificationListQuery
+	}
+	if normalized.OrderDir != "asc" && normalized.OrderDir != "desc" {
+		return nil, ErrInvalidNotificationListQuery
+	}
+	if len(normalized.Types) > len(models.NotificationTypes()) ||
+		len(normalized.Priorities) > 4 || len(normalized.Channels) > 4 {
+		return nil, ErrInvalidNotificationListQuery
+	}
+	for _, value := range normalized.Types {
+		if !value.IsValid() {
+			return nil, ErrInvalidNotificationListQuery
+		}
+	}
+	for _, value := range normalized.Priorities {
+		switch value {
+		case models.NotificationPriorityLow,
+			models.NotificationPriorityNormal,
+			models.NotificationPriorityHigh,
+			models.NotificationPriorityUrgent:
+		default:
+			return nil, ErrInvalidNotificationListQuery
+		}
+	}
+	for _, value := range normalized.Channels {
+		switch value {
+		case models.NotificationChannelInApp,
+			models.NotificationChannelEmail,
+			models.NotificationChannelWebhook,
+			models.NotificationChannelWebSocket:
+		default:
+			return nil, ErrInvalidNotificationListQuery
+		}
+	}
+	return &normalized, nil
 }
 
 // MarkAsRead 标记通知为已读
@@ -1994,8 +2080,16 @@ func (ns *NotificationService) GetUnreadCount(ctx context.Context, userID uint) 
 
 // GetNotificationPreferences 获取用户通知偏好设置
 func (ns *NotificationService) GetNotificationPreferences(ctx context.Context, userID uint) ([]*models.NotificationPreference, error) {
+	if ns == nil || ns.db == nil || userID == 0 {
+		return nil, ErrInvalidNotificationPreferences
+	}
 	var preferences []*models.NotificationPreference
-	if err := ns.db.Where("user_id = ?", userID).Find(&preferences).Error; err != nil {
+	allowed := models.NotificationTypes()
+	if err := ns.db.WithContext(ctx).
+		Where("user_id = ? AND notification_type IN ?", userID, allowed).
+		Order("notification_type ASC").
+		Limit(len(allowed)).
+		Find(&preferences).Error; err != nil {
 		return nil, fmt.Errorf("获取通知偏好设置失败: %w", err)
 	}
 	return preferences, nil
@@ -2003,7 +2097,21 @@ func (ns *NotificationService) GetNotificationPreferences(ctx context.Context, u
 
 // UpdateNotificationPreferences 更新用户通知偏好设置
 func (ns *NotificationService) UpdateNotificationPreferences(ctx context.Context, userID uint, preferences []models.NotificationPreference) error {
-	return ns.db.Transaction(func(tx *gorm.DB) error {
+	if ns == nil || ns.db == nil || userID == 0 ||
+		len(preferences) > len(models.NotificationTypes()) {
+		return ErrInvalidNotificationPreferences
+	}
+	seen := make(map[models.NotificationType]struct{}, len(preferences))
+	for _, preference := range preferences {
+		if !preference.NotificationType.IsValid() {
+			return ErrInvalidNotificationPreferences
+		}
+		if _, duplicate := seen[preference.NotificationType]; duplicate {
+			return ErrInvalidNotificationPreferences
+		}
+		seen[preference.NotificationType] = struct{}{}
+	}
+	return ns.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// 删除现有设置
 		if err := tx.Where("user_id = ?", userID).Delete(&models.NotificationPreference{}).Error; err != nil {
 			return err

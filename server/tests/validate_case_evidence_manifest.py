@@ -1,4 +1,4 @@
-"""Validate the 236-case evidence manifest without requiring a running API."""
+"""Validate the canonical case-evidence manifest without a running API."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CASE_DOCUMENT = ROOT / "docs/testing/CHRONODESK_COMPREHENSIVE_TEST_CASES_2026-07-29.md"
 MANIFEST = ROOT / "docs/testing/CASE_EVIDENCE_MANIFEST.tsv"
+EXPECTED_CASE_COUNT = 237
 
 CASE_PATTERN = re.compile(
     r"^\| ((?:INF|AUTH|RBAC|TKT|CNT|AUT|EVT|AGT|MCP|A2A|UI|SEC|PERF|RES)-\d{3}) \|",
@@ -93,11 +94,14 @@ def validate(
 ) -> list[str]:
     errors: list[str] = []
     canonical_ids = CASE_PATTERN.findall(case_document.read_text(encoding="utf-8"))
-    if len(canonical_ids) != 236 or len(set(canonical_ids)) != 236:
+    if (
+        len(canonical_ids) != EXPECTED_CASE_COUNT
+        or len(set(canonical_ids)) != EXPECTED_CASE_COUNT
+    ):
         _fail(
             errors,
             (
-                "正式用例文档必须包含 236 个唯一 Case ID，"
+                f"正式用例文档必须包含 {EXPECTED_CASE_COUNT} 个唯一 Case ID，"
                 f"实际总数={len(canonical_ids)} 唯一数={len(set(canonical_ids))}"
             ),
         )
@@ -132,8 +136,11 @@ def validate(
         _fail(errors, f"manifest 缺少 Case ID：{missing}")
     if unknown:
         _fail(errors, f"manifest 存在未知 Case ID：{unknown}")
-    if len(rows) != 236:
-        _fail(errors, f"manifest 必须恰有 236 行，实际为 {len(rows)}")
+    if len(rows) != EXPECTED_CASE_COUNT:
+        _fail(
+            errors,
+            f"manifest 必须恰有 {EXPECTED_CASE_COUNT} 行，实际为 {len(rows)}",
+        )
 
     for row in rows:
         case_id = row.get("case_id", "").strip()
@@ -236,7 +243,10 @@ def main() -> int:
         for error in errors:
             print(f"- {error}", file=sys.stderr)
         return 1
-    print("Case Evidence Manifest 校验通过：236/236 Case ID 均有可定位证据。")
+    print(
+        "Case Evidence Manifest 校验通过："
+        f"{EXPECTED_CASE_COUNT}/{EXPECTED_CASE_COUNT} Case ID 均有可定位证据。"
+    )
     print("说明：execution_record=not_recorded，不代表相关测试已经执行或通过。")
     return 0
 

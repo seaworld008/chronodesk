@@ -25,9 +25,9 @@ func (service *captureAdminAuditService) Explore(
 		service.filter = *filter
 	}
 	return &services.AdminAuditPage{
-		Items: []*services.AdminAuditListItem{},
-		Page:  filter.Page,
-		Limit: filter.Limit,
+		Items:      []*services.AdminAuditListItem{},
+		NextCursor: "",
+		HasMore:    false,
 	}, nil
 }
 
@@ -58,7 +58,6 @@ func TestAdminAuditHandlerBindsAllPublishedQueryParameters(t *testing.T) {
 			"&keyword=denied"+
 			"&start_time=2026-07-01"+
 			"&end_time=2026-07-30T12%3A30%3A00Z"+
-			"&page=2"+
 			"&limit=50",
 		nil,
 	)
@@ -96,8 +95,8 @@ func TestAdminAuditHandlerBindsAllPublishedQueryParameters(t *testing.T) {
 	if filter.EndTime == nil || !filter.EndTime.Equal(wantEnd) {
 		t.Errorf("end_time = %v", filter.EndTime)
 	}
-	if filter.Page != 2 || filter.Limit != 50 {
-		t.Errorf("pagination = page %d limit %d", filter.Page, filter.Limit)
+	if filter.Limit != 50 {
+		t.Errorf("pagination limit = %d", filter.Limit)
 	}
 }
 
@@ -109,12 +108,17 @@ func TestAdminAuditHandlerUsesStrictPaginationDefaultsAndValidation(t *testing.T
 		want  int
 	}{
 		{name: "defaults", query: "", want: http.StatusOK},
-		{name: "zero page", query: "?page=0", want: http.StatusBadRequest},
+		{name: "numbered page removed", query: "?page=1", want: http.StatusBadRequest},
 		{name: "oversized limit", query: "?limit=101", want: http.StatusBadRequest},
+		{name: "empty limit", query: "?limit=", want: http.StatusBadRequest},
+		{name: "empty cursor", query: "?cursor=", want: http.StatusBadRequest},
+		{name: "empty actor", query: "?actor=", want: http.StatusBadRequest},
+		{name: "empty status", query: "?status=", want: http.StatusBadRequest},
+		{name: "padded actor", query: "?actor=%20admin", want: http.StatusBadRequest},
 		{name: "bad status", query: "?status=ok", want: http.StatusBadRequest},
 		{name: "bad date", query: "?start_time=yesterday", want: http.StatusBadRequest},
 		{name: "unknown filter", query: "?role=admin", want: http.StatusBadRequest},
-		{name: "page cursor conflict", query: "?page=1&cursor=opaque", want: http.StatusBadRequest},
+		{name: "invalid encoding", query: "?action=%ZZ", want: http.StatusBadRequest},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			service := &captureAdminAuditService{}
@@ -141,8 +145,7 @@ func TestAdminAuditHandlerUsesStrictPaginationDefaultsAndValidation(t *testing.T
 				)
 			}
 			if test.name == "defaults" &&
-				(service.filter.Page != 1 ||
-					service.filter.Limit != services.DefaultAdminAuditLimit) {
+				service.filter.Limit != services.DefaultAdminAuditLimit {
 				t.Fatalf("defaults = %+v", service.filter)
 			}
 		})

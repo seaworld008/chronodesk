@@ -13,7 +13,10 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-const defaultWorkbenchDashboardDays = 30
+const (
+	defaultWorkbenchDashboardDays         = 30
+	maxWorkbenchDashboardResponseProjects = 100
+)
 
 type WorkbenchDashboardQuery struct {
 	UserID      uint
@@ -89,12 +92,15 @@ type authorizedDashboardProject struct {
 }
 
 type WorkbenchDashboard struct {
-	GeneratedAt      time.Time                            `json:"generated_at"`
-	Days             int                                  `json:"days"`
-	SelectedProjects []WorkbenchDashboardProject          `json:"selected_projects"`
-	Summary          WorkbenchDashboardSummary            `json:"summary"`
-	DailyTrend       []WorkbenchDashboardDailyPoint       `json:"daily_trend"`
-	ProjectBreakdown []WorkbenchDashboardProjectBreakdown `json:"project_breakdown"`
+	GeneratedAt               time.Time                            `json:"generated_at"`
+	Days                      int                                  `json:"days"`
+	SelectedProjectCount      int                                  `json:"selected_project_count"`
+	SelectedProjects          []WorkbenchDashboardProject          `json:"selected_projects"`
+	SelectedProjectsTruncated bool                                 `json:"selected_projects_truncated"`
+	Summary                   WorkbenchDashboardSummary            `json:"summary"`
+	DailyTrend                []WorkbenchDashboardDailyPoint       `json:"daily_trend"`
+	ProjectBreakdown          []WorkbenchDashboardProjectBreakdown `json:"project_breakdown"`
+	ProjectBreakdownTruncated bool                                 `json:"project_breakdown_truncated"`
 }
 
 type dashboardAggregateRow struct {
@@ -296,12 +302,19 @@ func (service *CrossProjectWorkbenchService) Dashboard(
 			}
 		}
 		projectIDs := make([]uint, 0, len(projects))
-		for _, project := range projects {
+		result.SelectedProjectCount = len(projects)
+		result.SelectedProjectsTruncated =
+			len(projects) > maxWorkbenchDashboardResponseProjects
+		for index, project := range projects {
 			projectIDs = append(projectIDs, project.ID)
-			result.SelectedProjects = append(
-				result.SelectedProjects,
-				WorkbenchDashboardProject{Key: project.Key, Name: project.Name},
-			)
+			if index < maxWorkbenchDashboardResponseProjects {
+				result.SelectedProjects = append(
+					result.SelectedProjects,
+					WorkbenchDashboardProject{
+						Key: project.Key, Name: project.Name,
+					},
+				)
+			}
 		}
 		if err := scopeddb.ConfigureAuthorizedProjectScopeTransaction(
 			tx,
@@ -311,11 +324,24 @@ func (service *CrossProjectWorkbenchService) Dashboard(
 			return fmt.Errorf("configure workbench dashboard scope: %w", err)
 		}
 
+		windowStart := dashboardDay(generatedAt).
+			AddDate(0, 0, -(input.Days - 1))
+		windowPredicate :=
+			"tickets.created_at >= ? AND tickets.created_at <= ?"
+		if tx.Dialector.Name() == "sqlite" {
+			// SQLite fixtures can contain both RFC3339 and driver-formatted
+			// DATETIME values. Normalize them before comparison so tests enforce
+			// the same inclusive UTC window used by PostgreSQL.
+			windowPredicate =
+				"datetime(tickets.created_at) >= datetime(?) AND " +
+					"datetime(tickets.created_at) <= datetime(?)"
+		}
 		base := func() *gorm.DB {
 			return tx.Table("tickets AS tickets").
 				Where("tickets.organization_id = ?", organizationID).
 				Where("tickets.project_id IN ?", projectIDs).
-				Where("tickets.deleted_at IS NULL")
+				Where("tickets.deleted_at IS NULL").
+				Where(windowPredicate, windowStart, generatedAt)
 		}
 		var aggregate dashboardAggregateRow
 		if err := base().Select(`
@@ -343,15 +369,13 @@ func (service *CrossProjectWorkbenchService) Dashboard(
 		}
 		result.Summary = workbenchDashboardSummary(aggregate)
 
-		trendStart := dashboardDay(generatedAt).AddDate(0, 0, -(input.Days - 1))
 		dailyRows := make([]dashboardDailyRow, 0, input.Days)
 		dateExpression := "DATE(tickets.created_at)"
 		if tx.Dialector.Name() == "postgres" {
 			dateExpression = "TO_CHAR(tickets.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')"
 		}
 		if err := base().
-			Select(dateExpression+" AS date, COUNT(*) AS created").
-			Where("tickets.created_at >= ?", trendStart).
+			Select(dateExpression + " AS date, COUNT(*) AS created").
 			Group(dateExpression).
 			Order(dateExpression + " ASC").
 			Scan(&dailyRows).Error; err != nil {
@@ -362,7 +386,7 @@ func (service *CrossProjectWorkbenchService) Dashboard(
 			dailyByDate[row.Date] = row.Created
 		}
 		for day := 0; day < input.Days; day++ {
-			date := trendStart.AddDate(0, 0, day).Format("2006-01-02")
+			date := windowStart.AddDate(0, 0, day).Format("2006-01-02")
 			result.DailyTrend = append(result.DailyTrend, WorkbenchDashboardDailyPoint{
 				Date: date, Created: dailyByDate[date],
 			})
@@ -410,6 +434,12 @@ func (service *CrossProjectWorkbenchService) Dashboard(
 			return result.ProjectBreakdown[left].ProjectKey <
 				result.ProjectBreakdown[right].ProjectKey
 		})
+		if len(result.ProjectBreakdown) >
+			maxWorkbenchDashboardResponseProjects {
+			result.ProjectBreakdown =
+				result.ProjectBreakdown[:maxWorkbenchDashboardResponseProjects]
+			result.ProjectBreakdownTruncated = true
+		}
 		return nil
 	})
 	if err != nil {

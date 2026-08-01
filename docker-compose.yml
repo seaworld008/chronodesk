@@ -65,7 +65,9 @@ services:
       - discovery.type=single-node
       - DISABLE_INSTALL_DEMO_CONFIG=true
       - DISABLE_SECURITY_PLUGIN=true
-      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+      # 仅用于约 2 GiB Docker VM 的单节点开发栈；生产环境必须按节点内存、
+      # 索引规模与查询负载独立做容量规划，不得照搬此堆大小。
+      - OPENSEARCH_JAVA_OPTS=-Xms256m -Xmx256m
     ports:
       - "9200:9200"
     volumes:
@@ -113,9 +115,18 @@ services:
       - OPENSEARCH_SEARCH_PIPELINE=chronodesk-knowledge-hybrid
       - OPENSEARCH_VECTOR_DIMENSION=384
       - METRICS_ENABLED=true
+      - AUDIT_EXPORT_STORAGE_BACKEND=local
+      - AUDIT_EXPORT_STORAGE_DIR=/app/data/audit-exports
+      - AUDIT_EXPORT_LOCAL_DEPLOYMENT_MODE=single
+      - CHRONODESK_REPLICA_COUNT=1
+      - AUDIT_EXPORT_WORKER_ID=chronodesk-compose-audit-export-1
       - JWT_SECRET=your-super-secret-jwt-key-change-in-production
       - AGENT_JWT_SECRET=development-agent-jwt-secret-not-for-production-2026
       - AGENT_CREDENTIAL_PEPPER=development-agent-credential-pepper-not-for-production-2026
+      - AGENT_ATTACHMENT_STORAGE_BACKEND=local
+      - AGENT_ATTACHMENT_DIR=/app/data/agent-attachments
+      - AGENT_ATTACHMENT_STAGING_DIR=/app/data/agent-attachment-staging
+      - AGENT_ATTACHMENT_LOCAL_DEPLOYMENT_MODE=single
       - ADMIN_EMAIL=${ADMIN_EMAIL:-admin@example.com}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-Admin123!}
     depends_on:
@@ -155,6 +166,9 @@ services:
     environment:
       - VITE_API_URL=/api
       - VITE_PROXY_TARGET=http://server:8081
+      # 约 2 GiB 的本地 Docker VM 同时运行 OpenSearch 时，限制 Vite 首次
+      # 依赖优化的堆峰值，避免健康检查期间触发整容器 OOM 重启。
+      - NODE_OPTIONS=--max-old-space-size=512
     depends_on:
       server:
         condition: service_healthy

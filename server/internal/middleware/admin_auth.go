@@ -46,6 +46,44 @@ func GetCurrentUserID(c *gin.Context) (uint, bool) {
 	return id, true
 }
 
+const adminAuditRecordIDContextKey = "admin_audit_record_id"
+const adminAuditOutcomeContextKey = "admin_audit_operation_outcome"
+
+type adminAuditOperationOutcome struct {
+	result string
+	notes  string
+}
+
+// GetCurrentAdminAuditRecordID returns the durable pre-write anchor created by
+// LogAdminOperation for the current request. Export creation uses this exact
+// row as an exclusive upper bound, so the export cannot recursively include
+// its own creation/status/download audit records.
+func GetCurrentAdminAuditRecordID(c *gin.Context) (uint, bool) {
+	value, exists := c.Get(adminAuditRecordIDContextKey)
+	if !exists {
+		return 0, false
+	}
+	id, ok := value.(uint)
+	return id, ok && id > 0
+}
+
+// SetAdminAuditOperationOutcome lets a streaming handler report completion
+// after headers have already been written. Values are a closed internal
+// vocabulary; raw transport/storage errors must never be supplied as notes.
+func SetAdminAuditOperationOutcome(
+	c *gin.Context,
+	result string,
+	notes string,
+) {
+	if c == nil || (result != "success" && result != "error") {
+		return
+	}
+	c.Set(adminAuditOutcomeContextKey, adminAuditOperationOutcome{
+		result: result,
+		notes:  notes,
+	})
+}
+
 // LogAdminOperation 记录管理员操作日志的中间件
 func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -101,6 +139,7 @@ func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.Han
 
 		action := fmt.Sprintf("%s %s", strings.ToUpper(method), path)
 		record := &services.AdminAuditRecord{
+			Actor:            models.HumanActor(userID),
 			UserID:           userIDPtr,
 			PlatformRole:     platformRole,
 			Action:           action,
@@ -127,6 +166,7 @@ func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.Han
 			})
 			return
 		}
+		c.Set(adminAuditRecordIDContextKey, record.ID)
 
 		completed := false
 		defer func() {
@@ -140,6 +180,12 @@ func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.Han
 				record.Notes = "管理员写操作异常终止"
 			} else if record.StatusCode >= http.StatusBadRequest {
 				record.Result = "error"
+			}
+			if value, exists := c.Get(adminAuditOutcomeContextKey); exists {
+				if outcome, ok := value.(adminAuditOperationOutcome); ok {
+					record.Result = outcome.result
+					record.Notes = outcome.notes
+				}
 			}
 
 			finalizeContext, cancel := context.WithTimeout(
@@ -172,6 +218,21 @@ type adminAuditRouteMetadata struct {
 }
 
 var adminAuditRouteMetadataByOperation = map[string]adminAuditRouteMetadata{
+	"PUT /api/platform/emergency-controls": {
+		"platform.emergency_controls.update",
+		"emergency_controls",
+		"",
+		"global",
+	},
+	"POST /api/platform/audit-exports": {
+		"platform.audit_export.create", "audit_export", "", "new",
+	},
+	"GET /api/platform/audit-exports/:publicID": {
+		"platform.audit_export.status", "audit_export", "publicID", "",
+	},
+	"GET /api/platform/audit-exports/:publicID/download": {
+		"platform.audit_export.download", "audit_export", "publicID", "",
+	},
 	"POST /api/platform/projects": {
 		"platform.project.create", "project", "", "new",
 	},
@@ -316,7 +377,9 @@ func digestAdminAuditResourceID(value string) string {
 // isImportantAdminOperation 判断是否为重要的管理操作
 func isImportantAdminOperation(method, path string) bool {
 	switch strings.ToUpper(strings.TrimSpace(method)) {
-	case http.MethodGet, http.MethodHead, http.MethodOptions:
+	case http.MethodGet:
+		return isPathWithin(path, "/api/platform/audit-exports")
+	case http.MethodHead, http.MethodOptions:
 		return false
 	}
 

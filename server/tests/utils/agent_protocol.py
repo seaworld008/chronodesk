@@ -38,6 +38,8 @@ MINIMAL_AGENT_SCOPES = (
     "comments:write",
     "attachments:read",
     "attachments:write",
+    "knowledge:read",
+    "knowledge:write",
     "events:subscribe",
     "tasks:manage",
 )
@@ -96,6 +98,48 @@ def envelope_data(
         f"{operation} 响应缺少 data；{response_diagnostic(response)}"
     )
     return payload["data"]
+
+
+def page_envelope_data(
+    response: requests.Response,
+    *,
+    operation: str,
+    expected_page: int,
+    expected_page_size: int,
+) -> dict[str, Any]:
+    """Validate one strict server-side page before a test consumes its rows."""
+
+    data = envelope_data(response, operation=operation)
+    assert isinstance(data, dict), f"{operation} data 必须为严格分页对象"
+    items = data.get("items")
+    total = data.get("total")
+    page = data.get("page")
+    page_size = data.get("page_size")
+    total_pages = data.get("total_pages")
+    assert isinstance(items, list), f"{operation} 缺少 items 列表"
+    assert isinstance(total, int) and not isinstance(total, bool) and total >= 0, (
+        f"{operation} total 必须为非负整数"
+    )
+    assert page == expected_page, f"{operation} page={page!r}，期望 {expected_page}"
+    assert page_size == expected_page_size, (
+        f"{operation} page_size={page_size!r}，期望 {expected_page_size}"
+    )
+    assert (
+        isinstance(total_pages, int)
+        and not isinstance(total_pages, bool)
+        and total_pages >= 0
+    ), f"{operation} total_pages 必须为非负整数"
+    expected_total_pages = (
+        (total + expected_page_size - 1) // expected_page_size if total else 0
+    )
+    assert total_pages == expected_total_pages, (
+        f"{operation} total_pages 与 total/page_size 不一致"
+    )
+    assert len(items) <= expected_page_size, f"{operation} 单页条目数超过 page_size"
+    assert len(items) <= total, f"{operation} items 条目数超过 total"
+    if total_pages == 0:
+        assert not items, f"{operation} 空目录不得返回 items"
+    return data
 
 
 def parse_etag(value: str) -> int:
@@ -270,6 +314,8 @@ class AgentProtocolHarness:
         return {"Authorization": f"Bearer {self._admin_access_token}"}
 
     def overview(self) -> dict[str, Any]:
+        """Return only bounded Agent control-plane metrics."""
+
         response = self.request(
             "GET",
             self.agent_admin_path("agent-control/overview"),
@@ -280,19 +326,81 @@ class AgentProtocolHarness:
         assert isinstance(data, dict), "Agent 控制总览 data 必须为对象"
         return data
 
+    def _admin_directory_rows(
+        self,
+        suffix: str,
+        *,
+        sort_by: str,
+        sort_order: str,
+        operation: str,
+        wanted_ids: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read a strict administrator directory without client-side slicing."""
+
+        page_size = 100
+        page = 1
+        rows: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        while True:
+            response = self.request(
+                "GET",
+                self.agent_admin_path(suffix),
+                headers=self.admin_read_headers(),
+                params={
+                    "page": page,
+                    "page_size": page_size,
+                    "sort_by": sort_by,
+                    "sort_order": sort_order,
+                },
+            )
+            assert_status(response, 200, operation=operation)
+            directory = page_envelope_data(
+                response,
+                operation=operation,
+                expected_page=page,
+                expected_page_size=page_size,
+            )
+            items = directory["items"]
+            for item in items:
+                assert isinstance(item, dict), f"{operation} items 必须只包含对象"
+                item_id = item.get("id")
+                assert isinstance(item_id, str) and item_id, (
+                    f"{operation} 条目缺少不透明 id"
+                )
+                assert item_id not in seen_ids, (
+                    f"{operation} 跨页出现重复条目 {item_id}"
+                )
+                seen_ids.add(item_id)
+                rows.append(item)
+
+            if wanted_ids is not None and wanted_ids.issubset(seen_ids):
+                return rows
+            total_pages = directory["total_pages"]
+            if page >= total_pages:
+                assert len(rows) == directory["total"], (
+                    f"{operation} 遍历条目数与 total 不一致"
+                )
+                return rows
+            assert items, f"{operation} 在末页前返回空 items"
+            page += 1
+
     def principal_row(self, principal: ServicePrincipalFixture) -> dict[str, Any]:
-        rows = self.overview().get("principals")
-        assert isinstance(rows, list), "Agent 控制总览缺少 principals 列表"
+        rows = self._admin_directory_rows(
+            "service-principals",
+            sort_by="created_at",
+            sort_order="desc",
+            operation="分页读取 Agent 服务主体",
+            wanted_ids={principal.client_id},
+        )
         row = next(
-            (
-                item
-                for item in rows
-                if isinstance(item, dict) and item.get("id") == principal.client_id
-            ),
+            (item for item in rows if item.get("id") == principal.client_id),
             None,
         )
         assert isinstance(row, dict), (
-            f"Agent 控制总览中找不到 E2E 服务主体 {principal.client_id}"
+            f"Agent 服务主体分页目录中找不到 E2E 服务主体 {principal.client_id}"
+        )
+        assert row.get("client_id") == principal.client_id, (
+            "服务主体 id/client_id 不一致"
         )
         version = row.get("resource_version")
         assert isinstance(version, int) and version > 0, (
@@ -300,6 +408,21 @@ class AgentProtocolHarness:
         )
         principal.resource_version = version
         return row
+
+    def policy_rows(
+        self,
+        principal: ServicePrincipalFixture,
+    ) -> list[dict[str, Any]]:
+        rows = self._admin_directory_rows(
+            f"service-principals/{principal.client_id}/policies",
+            sort_by="priority",
+            sort_order="desc",
+            operation="分页读取 E2E Agent 策略",
+        )
+        assert all(
+            row.get("service_principal_id") == principal.client_id for row in rows
+        ), "策略分页目录返回了其它服务主体的数据"
+        return rows
 
     def create_principal(
         self,
@@ -523,22 +646,21 @@ class AgentProtocolHarness:
         """Release leases, disable policies, and deactivate E2E principals."""
 
         errors: list[str] = []
-        try:
-            overview = self.overview()
-        except Exception as exc:  # noqa: BLE001 - teardown must aggregate safely
-            overview = {}
-            errors.append(f"读取 Agent 清理总览失败：{type(exc).__name__}")
-
-        lease_rows = overview.get("leases")
-        if not isinstance(lease_rows, list):
-            lease_rows = []
+        lease_rows: list[dict[str, Any]] = []
+        if self._leases:
+            try:
+                lease_rows = self._admin_directory_rows(
+                    "leases",
+                    sort_by="expires_at",
+                    sort_order="asc",
+                    operation="分页读取 E2E Agent 租约用于清理",
+                    wanted_ids=set(self._leases),
+                )
+            except (AssertionError, requests.RequestException) as exc:
+                errors.append(f"读取 Agent 清理租约失败：{type(exc).__name__}")
         for lease_id in reversed(self._leases):
             row = next(
-                (
-                    item
-                    for item in lease_rows
-                    if isinstance(item, dict) and item.get("id") == lease_id
-                ),
+                (item for item in lease_rows if item.get("id") == lease_id),
                 None,
             )
             if not isinstance(row, dict):
@@ -563,44 +685,32 @@ class AgentProtocolHarness:
 
         for principal in reversed(self._principals):
             try:
-                policies_response = self.request(
-                    "GET",
-                    self.agent_admin_path(
-                        f"service-principals/{principal.client_id}/policies"
-                    ),
-                    headers=self.admin_read_headers(),
-                )
-                if policies_response.status_code == 200:
-                    policies = envelope_data(
-                        policies_response,
-                        operation="读取 E2E 策略用于清理",
+                policies = self.policy_rows(principal)
+                tracked_policy_ids = set(principal.policy_ids)
+                for policy in policies:
+                    policy_id = policy.get("id")
+                    if policy_id not in tracked_policy_ids or not policy.get(
+                        "is_active"
+                    ):
+                        continue
+                    version = policy.get("resource_version")
+                    if not isinstance(version, int) or version <= 0:
+                        errors.append(f"E2E 策略 {policy_id} 缺少清理版本")
+                        continue
+                    disabled = self.admin_request(
+                        "DELETE",
+                        self.agent_admin_path(
+                            "service-principals/"
+                            f"{principal.client_id}/policies/{policy_id}"
+                        ),
+                        if_match=version,
+                        operation="cleanup-disable-policy",
                     )
-                    if isinstance(policies, list):
-                        for policy in policies:
-                            if not isinstance(policy, dict) or not policy.get(
-                                "is_active"
-                            ):
-                                continue
-                            policy_id = policy.get("id")
-                            version = policy.get("resource_version")
-                            if not isinstance(policy_id, str) or not isinstance(
-                                version, int
-                            ):
-                                continue
-                            disabled = self.admin_request(
-                                "DELETE",
-                                self.agent_admin_path(
-                                    "service-principals/"
-                                    f"{principal.client_id}/policies/{policy_id}"
-                                ),
-                                if_match=version,
-                                operation="cleanup-disable-policy",
-                            )
-                            if disabled.status_code not in (200, 404, 409):
-                                errors.append(
-                                    f"停用 E2E 策略 {policy_id} 失败："
-                                    f"HTTP {disabled.status_code}"
-                                )
+                    if disabled.status_code not in (200, 404, 409):
+                        errors.append(
+                            f"停用 E2E 策略 {policy_id} 失败："
+                            f"HTTP {disabled.status_code}"
+                        )
                 row = self.principal_row(principal)
                 if (
                     row.get("status") != "inactive"

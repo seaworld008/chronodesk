@@ -111,6 +111,7 @@ func TestSystemCleanupLogsRejectInvalidDirectoryQueries(t *testing.T) {
 		"sort_order=ASC",
 		"task_type=",
 		"task_type=login_history&task_type=other",
+		"page=%ZZ",
 	} {
 		response := httptest.NewRecorder()
 		router.ServeHTTP(

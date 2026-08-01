@@ -5,9 +5,10 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strconv"
+	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/seaworld008/chronodesk/server/internal/middleware"
@@ -63,10 +64,18 @@ func (handler *IntegrationHandler) RegisterRoutes(projectGroup *gin.RouterGroup)
 	integrations.POST("/mappings/:mappingID/publication", handler.PublishMapping)
 
 	integrations.GET("/overview", handler.Overview)
+	integrations.GET("/inbox", handler.ListInboxMessages)
+	integrations.GET(
+		"/inbox/:messageID/receipts",
+		handler.ListInboxReceipts,
+	)
+	integrations.GET("/sync-runs", handler.ListSyncRuns)
 	integrations.GET("/conflicts", handler.ListConflicts)
 	integrations.POST("/conflicts/:conflictID/resolution", handler.ResolveConflict)
 	integrations.GET("/dead-letters", handler.ListDeadLetters)
 	integrations.POST("/dead-letters/:deadLetterID/replays", handler.ReplayDeadLetter)
+	integrations.GET("/domain-events", handler.ListDomainEvents)
+	integrations.GET("/outbox", handler.ListOutboxDeliveries)
 }
 
 type connectorDefinitionRequest struct {
@@ -160,7 +169,7 @@ func (handler *IntegrationHandler) ListConnectorDefinitions(c *gin.Context) {
 	if !handler.requireIntegrationReader(c) {
 		return
 	}
-	options, ok := handler.listOptions(c)
+	options, ok := handler.listOptions(c, integrationConnectorDefinitionListSpec)
 	if !ok {
 		return
 	}
@@ -169,9 +178,9 @@ func (handler *IntegrationHandler) ListConnectorDefinitions(c *gin.Context) {
 		handler.writeError(c, err, nil)
 		return
 	}
-	items := make([]connectorDefinitionView, 0, len(page.Items))
+	items := make([]connectorDefinitionSummaryView, 0, len(page.Items))
 	for _, item := range page.Items {
-		items = append(items, connectorDefinitionViewOf(item))
+		items = append(items, connectorDefinitionSummaryViewOf(item))
 	}
 	handler.response.List(
 		c,
@@ -268,7 +277,7 @@ func (handler *IntegrationHandler) ListConnections(c *gin.Context) {
 	if !handler.requireIntegrationReader(c) {
 		return
 	}
-	options, ok := handler.listOptions(c)
+	options, ok := handler.listOptions(c, integrationConnectionListSpec)
 	if !ok {
 		return
 	}
@@ -433,7 +442,7 @@ func (handler *IntegrationHandler) ListMappings(c *gin.Context) {
 	if !ok {
 		return
 	}
-	options, ok := handler.listOptions(c)
+	options, ok := handler.listOptions(c, integrationMappingListSpec)
 	if !ok {
 		return
 	}
@@ -446,9 +455,9 @@ func (handler *IntegrationHandler) ListMappings(c *gin.Context) {
 		handler.writeError(c, err, nil)
 		return
 	}
-	items := make([]mappingView, 0, len(page.Items))
+	items := make([]mappingSummaryView, 0, len(page.Items))
 	for _, item := range page.Items {
-		items = append(items, mappingViewOf(item))
+		items = append(items, mappingSummaryViewOf(item))
 	}
 	handler.response.List(
 		c,
@@ -472,11 +481,167 @@ func (handler *IntegrationHandler) Overview(c *gin.Context) {
 	handler.response.Success(c, overviewViewOf(*overview), "获取集成运行概览成功")
 }
 
+func (handler *IntegrationHandler) ListInboxMessages(c *gin.Context) {
+	if !handler.requireIntegrationReader(c) {
+		return
+	}
+	options, ok := handler.listOptions(c, integrationInboxListSpec)
+	if !ok {
+		return
+	}
+	page, err := handler.service.ListInboxMessages(
+		c.Request.Context(),
+		options,
+	)
+	if err != nil {
+		handler.writeError(c, err, nil)
+		return
+	}
+	items := make([]inboxMessageView, 0, len(page.Items))
+	for index := range page.Items {
+		items = append(items, inboxMessageViewOf(page.Items[index]))
+	}
+	handler.response.List(
+		c,
+		items,
+		page.Total,
+		page.Page,
+		page.PageSize,
+		"获取 Inbox 消息成功",
+	)
+}
+
+func (handler *IntegrationHandler) ListInboxReceipts(c *gin.Context) {
+	if !handler.requireIntegrationReader(c) {
+		return
+	}
+	messageID, ok := handler.requiredPathID(c, "messageID")
+	if !ok {
+		return
+	}
+	options, ok := handler.listOptions(c, integrationReceiptListSpec)
+	if !ok {
+		return
+	}
+	page, err := handler.service.ListInboxReceipts(
+		c.Request.Context(),
+		messageID,
+		options,
+	)
+	if err != nil {
+		handler.writeError(c, err, nil)
+		return
+	}
+	items := make([]inboxReceiptView, 0, len(page.Items))
+	for index := range page.Items {
+		items = append(items, inboxReceiptViewOf(page.Items[index]))
+	}
+	handler.response.List(
+		c,
+		items,
+		page.Total,
+		page.Page,
+		page.PageSize,
+		"获取 Inbox 处理回执成功",
+	)
+}
+
+func (handler *IntegrationHandler) ListSyncRuns(c *gin.Context) {
+	if !handler.requireIntegrationReader(c) {
+		return
+	}
+	options, ok := handler.listOptions(c, integrationSyncRunListSpec)
+	if !ok {
+		return
+	}
+	page, err := handler.service.ListSyncRuns(c.Request.Context(), options)
+	if err != nil {
+		handler.writeError(c, err, nil)
+		return
+	}
+	items := make([]syncRunView, 0, len(page.Items))
+	for index := range page.Items {
+		items = append(items, syncRunViewOf(page.Items[index]))
+	}
+	handler.response.List(
+		c,
+		items,
+		page.Total,
+		page.Page,
+		page.PageSize,
+		"获取同步运行记录成功",
+	)
+}
+
+func (handler *IntegrationHandler) ListOutboxDeliveries(c *gin.Context) {
+	if !handler.requireIntegrationReader(c) {
+		return
+	}
+	options, ok := handler.listOptions(c, integrationOutboxListSpec)
+	if !ok {
+		return
+	}
+	page, err := handler.service.ListOutboxDeliveries(
+		c.Request.Context(),
+		options,
+	)
+	if err != nil {
+		handler.writeError(c, err, nil)
+		return
+	}
+	items := make([]integrationOutboxView, 0, len(page.Items))
+	for index := range page.Items {
+		items = append(items, integrationOutboxViewOf(page.Items[index]))
+	}
+	handler.response.List(
+		c,
+		items,
+		page.Total,
+		page.Page,
+		page.PageSize,
+		"获取 Outbox 投递记录成功",
+	)
+}
+
+func (handler *IntegrationHandler) ListDomainEvents(c *gin.Context) {
+	if !handler.requireIntegrationReader(c) {
+		return
+	}
+	options, ok := handler.domainEventCursorOptions(c)
+	if !ok {
+		return
+	}
+	page, err := handler.service.ListDomainEvents(
+		c.Request.Context(),
+		options,
+	)
+	if err != nil {
+		handler.writeError(c, err, nil)
+		return
+	}
+	items := make([]integrationDomainEventView, 0, len(page.Items))
+	for index := range page.Items {
+		items = append(
+			items,
+			integrationDomainEventViewOf(page.Items[index]),
+		)
+	}
+	handler.response.Success(
+		c,
+		integrationDomainEventPageView{
+			Items:      items,
+			NextCursor: page.NextCursor,
+			HasMore:    page.HasMore,
+		},
+		"获取领域事件成功",
+	)
+}
+
 func (handler *IntegrationHandler) ListConflicts(c *gin.Context) {
 	if !handler.requireIntegrationReader(c) {
 		return
 	}
-	options, ok := handler.listOptions(c)
+	options, ok := handler.listOptions(c, integrationConflictListSpec)
 	if !ok {
 		return
 	}
@@ -528,7 +693,7 @@ func (handler *IntegrationHandler) ListDeadLetters(c *gin.Context) {
 	if !handler.requireIntegrationReader(c) {
 		return
 	}
-	options, ok := handler.listOptions(c)
+	options, ok := handler.listOptions(c, integrationDeadLetterListSpec)
 	if !ok {
 		return
 	}
@@ -656,33 +821,242 @@ func (handler *IntegrationHandler) requiredPathID(
 	return value, true
 }
 
+type integrationHandlerListSpec struct {
+	query            directoryListQuerySpec
+	typeFilter       string
+	connectionFilter string
+}
+
+var (
+	integrationConnectorDefinitionListSpec = integrationHandlerListSpec{
+		query: directoryListQuerySpec{
+			DefaultSortBy:    "created_at",
+			DefaultSortOrder: "desc",
+			SortFields: integrationQueryFieldSet(
+				"created_at",
+				"updated_at",
+				"name",
+				"status",
+				"id",
+			),
+			FilterFields: integrationQueryFieldSet("search", "status"),
+		},
+	}
+	integrationConnectionListSpec = integrationHandlerListSpec{
+		query: directoryListQuerySpec{
+			DefaultSortBy:    "created_at",
+			DefaultSortOrder: "desc",
+			SortFields: integrationQueryFieldSet(
+				"created_at",
+				"updated_at",
+				"name",
+				"status",
+				"id",
+			),
+			FilterFields: integrationQueryFieldSet("search", "status"),
+		},
+	}
+	integrationMappingListSpec = integrationHandlerListSpec{
+		query: directoryListQuerySpec{
+			DefaultSortBy:    "created_at",
+			DefaultSortOrder: "desc",
+			SortFields: integrationQueryFieldSet(
+				"created_at",
+				"updated_at",
+				"key",
+				"version",
+				"status",
+				"id",
+			),
+			FilterFields: integrationQueryFieldSet("search", "status"),
+		},
+	}
+	integrationInboxListSpec = integrationHandlerListSpec{
+		query: directoryListQuerySpec{
+			DefaultSortBy:    "received_at",
+			DefaultSortOrder: "desc",
+			SortFields: integrationQueryFieldSet(
+				"received_at",
+				"processed_at",
+				"status",
+				"created_at",
+				"id",
+			),
+			FilterFields: integrationQueryFieldSet(
+				"search",
+				"status",
+				"connection_id",
+			),
+		},
+		connectionFilter: "connection_id",
+	}
+	integrationReceiptListSpec = integrationHandlerListSpec{
+		query: directoryListQuerySpec{
+			DefaultSortBy:    "created_at",
+			DefaultSortOrder: "desc",
+			SortFields: integrationQueryFieldSet(
+				"created_at",
+				"processed_at",
+				"status",
+				"id",
+			),
+			FilterFields: integrationQueryFieldSet("status"),
+		},
+	}
+	integrationSyncRunListSpec = integrationHandlerListSpec{
+		query: directoryListQuerySpec{
+			DefaultSortBy:    "created_at",
+			DefaultSortOrder: "desc",
+			SortFields: integrationQueryFieldSet(
+				"created_at",
+				"updated_at",
+				"started_at",
+				"finished_at",
+				"status",
+				"id",
+			),
+			FilterFields: integrationQueryFieldSet(
+				"search",
+				"status",
+				"direction",
+				"connection_id",
+			),
+		},
+		typeFilter:       "direction",
+		connectionFilter: "connection_id",
+	}
+	integrationConflictListSpec = integrationHandlerListSpec{
+		query: directoryListQuerySpec{
+			DefaultSortBy:    "created_at",
+			DefaultSortOrder: "desc",
+			SortFields: integrationQueryFieldSet(
+				"created_at",
+				"updated_at",
+				"status",
+				"type",
+				"id",
+			),
+			FilterFields: integrationQueryFieldSet(
+				"search",
+				"status",
+				"type",
+			),
+		},
+		typeFilter: "type",
+	}
+	integrationDeadLetterListSpec = integrationHandlerListSpec{
+		query: directoryListQuerySpec{
+			DefaultSortBy:    "created_at",
+			DefaultSortOrder: "desc",
+			SortFields: integrationQueryFieldSet(
+				"created_at",
+				"updated_at",
+				"status",
+				"attempt_count",
+				"id",
+			),
+			FilterFields: integrationQueryFieldSet("search", "status"),
+		},
+	}
+	integrationOutboxListSpec = integrationHandlerListSpec{
+		query: directoryListQuerySpec{
+			DefaultSortBy:    "created_at",
+			DefaultSortOrder: "desc",
+			SortFields: integrationQueryFieldSet(
+				"created_at",
+				"updated_at",
+				"status",
+				"next_attempt_at",
+				"id",
+			),
+			FilterFields: integrationQueryFieldSet(
+				"search",
+				"status",
+				"destination_type",
+			),
+		},
+		typeFilter: "destination_type",
+	}
+)
+
+func integrationQueryFieldSet(fields ...string) map[string]struct{} {
+	result := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		result[field] = struct{}{}
+	}
+	return result
+}
+
 func (handler *IntegrationHandler) listOptions(
 	c *gin.Context,
+	spec integrationHandlerListSpec,
 ) (services.IntegrationListOptions, bool) {
-	options := services.IntegrationListOptions{Page: 1, PageSize: 20}
-	allowed := map[string]struct{}{"page": {}, "pageSize": {}}
-	for name, values := range c.Request.URL.Query() {
-		if _, ok := allowed[name]; !ok || len(values) != 1 {
-			handler.response.BadRequest(c, "分页参数无效")
-			return services.IntegrationListOptions{}, false
-		}
+	query, err := parseDirectoryListQuery(c.Request.URL.RawQuery, spec.query)
+	if err != nil {
+		handler.response.BadRequest(c, "集成列表查询参数无效")
+		return services.IntegrationListOptions{}, false
 	}
-	for name, destination := range map[string]*int{
-		"page":     &options.Page,
-		"pageSize": &options.PageSize,
-	} {
-		raw := strings.TrimSpace(c.Query(name))
-		if raw == "" {
-			continue
-		}
-		value, err := strconv.Atoi(raw)
-		if err != nil || value <= 0 {
-			handler.response.BadRequest(c, "分页参数无效")
-			return services.IntegrationListOptions{}, false
-		}
-		*destination = value
+	options := services.IntegrationListOptions{
+		Page:      query.Page,
+		PageSize:  query.PageSize,
+		SortBy:    query.SortBy,
+		SortOrder: query.SortOrder,
+	}
+	options.Search, _ = query.value("search")
+	options.Status, _ = query.value("status")
+	if spec.typeFilter != "" {
+		options.Type, _ = query.value(spec.typeFilter)
+	}
+	if spec.connectionFilter != "" {
+		options.ConnectionPublicID, _ =
+			query.value(spec.connectionFilter)
 	}
 	return options, true
+}
+
+func (handler *IntegrationHandler) domainEventCursorOptions(
+	c *gin.Context,
+) (services.IntegrationDomainEventCursorOptions, bool) {
+	values, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil {
+		handler.response.BadRequest(c, "领域事件查询参数无效")
+		return services.IntegrationDomainEventCursorOptions{}, false
+	}
+	allowed := integrationQueryFieldSet(
+		"cursor",
+		"limit",
+		"event_type",
+		"search",
+	)
+	for key, entries := range values {
+		if _, ok := allowed[key]; !ok ||
+			len(entries) != 1 ||
+			!utf8.ValidString(key) ||
+			!utf8.ValidString(entries[0]) ||
+			strings.TrimSpace(entries[0]) == "" ||
+			strings.TrimSpace(entries[0]) != entries[0] ||
+			containsDirectoryQueryControl(key) ||
+			containsDirectoryQueryControl(entries[0]) {
+			handler.response.BadRequest(c, "领域事件查询参数无效")
+			return services.IntegrationDomainEventCursorOptions{}, false
+		}
+	}
+	limit, err := parseDirectoryPositiveInt(
+		values,
+		"limit",
+		defaultDirectoryPageSize,
+		maxDirectoryPageSize,
+	)
+	if err != nil {
+		handler.response.BadRequest(c, "领域事件查询参数无效")
+		return services.IntegrationDomainEventCursorOptions{}, false
+	}
+	return services.IntegrationDomainEventCursorOptions{
+		Cursor:    values.Get("cursor"),
+		Limit:     limit,
+		EventType: values.Get("event_type"),
+		Search:    values.Get("search"),
+	}, true
 }
 
 func (handler *IntegrationHandler) writeError(
@@ -693,7 +1067,8 @@ func (handler *IntegrationHandler) writeError(
 	switch {
 	case errors.Is(err, services.ErrIntegrationManagementInvalidInput),
 		errors.Is(err, services.ErrIntegrationInvalidInput),
-		errors.Is(err, services.ErrIntegrationTargetCommandDenied):
+		errors.Is(err, services.ErrIntegrationTargetCommandDenied),
+		errors.Is(err, services.ErrIntegrationListCursorInvalid):
 		handler.response.BadRequest(c, "集成管理参数无效")
 	case errors.Is(err, services.ErrIntegrationManagementNotFound),
 		errors.Is(err, services.ErrIntegrationDeadLetterNotFound),
@@ -735,6 +1110,42 @@ type connectorDefinitionView struct {
 	MappingSchema       json.RawMessage                  `json:"mapping_schema"`
 	CreatedAt           time.Time                        `json:"created_at"`
 	UpdatedAt           time.Time                        `json:"updated_at"`
+}
+
+type connectorDefinitionSummaryView struct {
+	PublicID               string                           `json:"id"`
+	Key                    string                           `json:"key"`
+	Name                   string                           `json:"name"`
+	Description            string                           `json:"description"`
+	Kind                   string                           `json:"kind"`
+	Direction              models.ConnectorDirection        `json:"direction"`
+	Status                 models.ConnectorDefinitionStatus `json:"status"`
+	SignatureScheme        string                           `json:"signature_scheme"`
+	DefaultReplayWindow    int                              `json:"default_replay_window_seconds"`
+	HasConfigurationSchema bool                             `json:"has_configuration_schema"`
+	HasMappingSchema       bool                             `json:"has_mapping_schema"`
+	CreatedAt              time.Time                        `json:"created_at"`
+	UpdatedAt              time.Time                        `json:"updated_at"`
+}
+
+func connectorDefinitionSummaryViewOf(
+	model models.ConnectorDefinition,
+) connectorDefinitionSummaryView {
+	return connectorDefinitionSummaryView{
+		PublicID:               model.PublicID,
+		Key:                    model.Key,
+		Name:                   model.Name,
+		Description:            model.Description,
+		Kind:                   model.Kind,
+		Direction:              model.Direction,
+		Status:                 model.Status,
+		SignatureScheme:        model.SignatureScheme,
+		DefaultReplayWindow:    model.DefaultReplayWindowSeconds,
+		HasConfigurationSchema: hasIntegrationJSON(model.ConfigurationSchema),
+		HasMappingSchema:       hasIntegrationJSON(model.MappingSchema),
+		CreatedAt:              model.CreatedAt,
+		UpdatedAt:              model.UpdatedAt,
+	}
 }
 
 func connectorDefinitionViewOf(model models.ConnectorDefinition) connectorDefinitionView {
@@ -806,6 +1217,34 @@ type mappingView struct {
 	UpdatedAt     time.Time                   `json:"updated_at"`
 }
 
+type mappingSummaryView struct {
+	PublicID      string                      `json:"id"`
+	Key           string                      `json:"key"`
+	Version       uint                        `json:"version"`
+	Status        models.MappingVersionStatus `json:"status"`
+	TargetCommand string                      `json:"target_command"`
+	Digest        string                      `json:"definition_digest"`
+	PublishedAt   *time.Time                  `json:"published_at,omitempty"`
+	PublishedBy   string                      `json:"published_by,omitempty"`
+	CreatedAt     time.Time                   `json:"created_at"`
+	UpdatedAt     time.Time                   `json:"updated_at"`
+}
+
+func mappingSummaryViewOf(model models.MappingVersion) mappingSummaryView {
+	return mappingSummaryView{
+		PublicID:      model.PublicID,
+		Key:           model.Key,
+		Version:       model.Version,
+		Status:        model.Status,
+		TargetCommand: model.TargetCommand,
+		Digest:        model.DefinitionDigest,
+		PublishedAt:   model.PublishedAt,
+		PublishedBy:   model.PublishedByID,
+		CreatedAt:     model.CreatedAt,
+		UpdatedAt:     model.UpdatedAt,
+	}
+}
+
 func mappingViewOf(model models.MappingVersion) mappingView {
 	return mappingView{
 		PublicID:      model.PublicID,
@@ -851,28 +1290,36 @@ type connectionHealthView struct {
 }
 
 type overviewView struct {
-	ConnectorDefinitions int64                  `json:"connector_definitions"`
-	Connections          int64                  `json:"connections"`
-	ActiveConnections    int64                  `json:"active_connections"`
-	ErrorConnections     int64                  `json:"error_connections"`
-	OpenConflicts        int64                  `json:"open_conflicts"`
-	OpenDeadLetters      int64                  `json:"open_dead_letters"`
-	RunningSyncRuns      int64                  `json:"running_sync_runs"`
-	RecentRuns           []syncRunView          `json:"recent_runs"`
-	ConnectionHealth     []connectionHealthView `json:"connection_health"`
+	ConnectorDefinitions      int64                  `json:"connector_definitions"`
+	Connections               int64                  `json:"connections"`
+	ActiveConnections         int64                  `json:"active_connections"`
+	ErrorConnections          int64                  `json:"error_connections"`
+	OpenConflicts             int64                  `json:"open_conflicts"`
+	OpenDeadLetters           int64                  `json:"open_dead_letters"`
+	RunningSyncRuns           int64                  `json:"running_sync_runs"`
+	RecentRuns                []syncRunView          `json:"recent_runs"`
+	RecentRunsLimit           int                    `json:"recent_runs_limit"`
+	RecentRunsTruncated       bool                   `json:"recent_runs_truncated"`
+	ConnectionHealth          []connectionHealthView `json:"connection_health"`
+	ConnectionHealthLimit     int                    `json:"connection_health_limit"`
+	ConnectionHealthTruncated bool                   `json:"connection_health_truncated"`
 }
 
 func overviewViewOf(model services.IntegrationOverview) overviewView {
 	view := overviewView{
-		ConnectorDefinitions: model.ConnectorDefinitions,
-		Connections:          model.Connections,
-		ActiveConnections:    model.ActiveConnections,
-		ErrorConnections:     model.ErrorConnections,
-		OpenConflicts:        model.OpenConflicts,
-		OpenDeadLetters:      model.OpenDeadLetters,
-		RunningSyncRuns:      model.RunningSyncRuns,
-		RecentRuns:           make([]syncRunView, 0, len(model.RecentRuns)),
-		ConnectionHealth:     make([]connectionHealthView, 0, len(model.ConnectionHealth)),
+		ConnectorDefinitions:      model.ConnectorDefinitions,
+		Connections:               model.Connections,
+		ActiveConnections:         model.ActiveConnections,
+		ErrorConnections:          model.ErrorConnections,
+		OpenConflicts:             model.OpenConflicts,
+		OpenDeadLetters:           model.OpenDeadLetters,
+		RunningSyncRuns:           model.RunningSyncRuns,
+		RecentRunsLimit:           model.RecentRunsLimit,
+		RecentRunsTruncated:       model.RecentRunsTruncated,
+		ConnectionHealthLimit:     model.ConnectionHealthLimit,
+		ConnectionHealthTruncated: model.ConnectionHealthTruncated,
+		RecentRuns:                make([]syncRunView, 0, len(model.RecentRuns)),
+		ConnectionHealth:          make([]connectionHealthView, 0, len(model.ConnectionHealth)),
 	}
 	for _, run := range model.RecentRuns {
 		view.RecentRuns = append(view.RecentRuns, syncRunViewOf(run))
@@ -894,6 +1341,160 @@ func overviewViewOf(model services.IntegrationOverview) overviewView {
 		view.ConnectionHealth = append(view.ConnectionHealth, item)
 	}
 	return view
+}
+
+type inboxMessageView struct {
+	PublicID             string                    `json:"id"`
+	ConnectionID         uint                      `json:"connection_id"`
+	ExternalMessageID    string                    `json:"external_message_id"`
+	ExternalResourceType string                    `json:"external_resource_type"`
+	ExternalResourceID   string                    `json:"external_resource_id"`
+	SignedAt             time.Time                 `json:"signed_at"`
+	ReceivedAt           time.Time                 `json:"received_at"`
+	ContentType          string                    `json:"content_type"`
+	PayloadDigest        string                    `json:"payload_digest"`
+	Status               models.InboxMessageStatus `json:"status"`
+	ProcessedAt          *time.Time                `json:"processed_at,omitempty"`
+	CreatedAt            time.Time                 `json:"created_at"`
+	UpdatedAt            time.Time                 `json:"updated_at"`
+}
+
+func inboxMessageViewOf(model models.InboxMessage) inboxMessageView {
+	return inboxMessageView{
+		PublicID:             model.PublicID,
+		ConnectionID:         model.ConnectionID,
+		ExternalMessageID:    model.ExternalMessageID,
+		ExternalResourceType: model.ExternalResourceType,
+		ExternalResourceID:   model.ExternalResourceID,
+		SignedAt:             model.SignedAt,
+		ReceivedAt:           model.ReceivedAt,
+		ContentType:          model.ContentType,
+		PayloadDigest:        model.PayloadDigest,
+		Status:               model.Status,
+		ProcessedAt:          model.ProcessedAt,
+		CreatedAt:            model.CreatedAt,
+		UpdatedAt:            model.UpdatedAt,
+	}
+}
+
+type inboxReceiptView struct {
+	PublicID        string                    `json:"id"`
+	Status          models.InboxReceiptStatus `json:"status"`
+	ResourceType    string                    `json:"resource_type"`
+	ResourceID      string                    `json:"resource_id"`
+	ResourceVersion uint64                    `json:"resource_version"`
+	EventID         string                    `json:"event_id,omitempty"`
+	OperationID     string                    `json:"operation_id,omitempty"`
+	ActorType       models.ActorType          `json:"actor_type"`
+	ActorID         string                    `json:"actor_id"`
+	ProcessedAt     time.Time                 `json:"processed_at"`
+	CreatedAt       time.Time                 `json:"created_at"`
+}
+
+func inboxReceiptViewOf(model models.InboxReceipt) inboxReceiptView {
+	return inboxReceiptView{
+		PublicID:        model.PublicID,
+		Status:          model.Status,
+		ResourceType:    model.ResourceType,
+		ResourceID:      model.ResourceID,
+		ResourceVersion: model.ResourceVersion,
+		EventID:         model.EventID,
+		OperationID:     model.OperationID,
+		ActorType:       model.ActorType,
+		ActorID:         model.ActorID,
+		ProcessedAt:     model.ProcessedAt,
+		CreatedAt:       model.CreatedAt,
+	}
+}
+
+type integrationOutboxView struct {
+	PublicID         string                      `json:"id"`
+	EventID          string                      `json:"event_id"`
+	DestinationType  string                      `json:"destination_type"`
+	DestinationLabel string                      `json:"destination_label"`
+	Status           models.OutboxDeliveryStatus `json:"status"`
+	Attempts         int                         `json:"attempts"`
+	MaxAttempts      int                         `json:"max_attempts"`
+	NextAttemptAt    time.Time                   `json:"next_attempt_at"`
+	LastError        string                      `json:"last_error,omitempty"`
+	DeliveredAt      *time.Time                  `json:"delivered_at,omitempty"`
+	CreatedAt        time.Time                   `json:"created_at"`
+	UpdatedAt        time.Time                   `json:"updated_at"`
+}
+
+func integrationOutboxViewOf(
+	model models.OutboxDelivery,
+) integrationOutboxView {
+	return integrationOutboxView{
+		PublicID:         model.ID,
+		EventID:          model.EventID,
+		DestinationType:  model.DestinationType,
+		DestinationLabel: integrationDestinationLabel(model.DestinationType),
+		Status:           model.Status,
+		Attempts:         model.Attempts,
+		MaxAttempts:      model.MaxAttempts,
+		NextAttemptAt:    model.NextAttemptAt,
+		LastError:        services.ScrubOutboxFailureText(model.LastError),
+		DeliveredAt:      model.DeliveredAt,
+		CreatedAt:        model.CreatedAt,
+		UpdatedAt:        model.UpdatedAt,
+	}
+}
+
+type integrationDomainEventView struct {
+	PublicID        string           `json:"id"`
+	CreatedAt       time.Time        `json:"created_at"`
+	Type            string           `json:"type"`
+	Subject         string           `json:"subject"`
+	ActorType       models.ActorType `json:"actor_type"`
+	ActorID         string           `json:"actor_id"`
+	ResourceVersion uint64           `json:"resource_version"`
+	Time            time.Time        `json:"time"`
+}
+
+type integrationDomainEventPageView struct {
+	Items      []integrationDomainEventView `json:"items"`
+	NextCursor string                       `json:"next_cursor"`
+	HasMore    bool                         `json:"has_more"`
+}
+
+func integrationDomainEventViewOf(
+	model models.DomainEvent,
+) integrationDomainEventView {
+	return integrationDomainEventView{
+		PublicID:        model.ID,
+		CreatedAt:       model.CreatedAt,
+		Type:            model.Type,
+		Subject:         model.Subject,
+		ActorType:       model.ActorType,
+		ActorID:         model.ActorID,
+		ResourceVersion: model.ResourceVersion,
+		Time:            model.Time,
+	}
+}
+
+func integrationDestinationLabel(destinationType string) string {
+	switch destinationType {
+	case "webhook":
+		return "Webhook"
+	case "notification":
+		return "项目通知"
+	case "automation":
+		return "自动化"
+	case "email":
+		return "邮件"
+	case "mcp":
+		return "MCP"
+	case "a2a":
+		return "A2A"
+	default:
+		return "其他投递目标"
+	}
+}
+
+func hasIntegrationJSON(value []byte) bool {
+	normalized := strings.TrimSpace(string(value))
+	return normalized != "" && normalized != "{}" && normalized != "null"
 }
 
 func syncRunViewOf(model models.SyncRun) syncRunView {

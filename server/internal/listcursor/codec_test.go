@@ -2,6 +2,7 @@ package listcursor
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -70,5 +71,87 @@ func TestCodecRejectsMissingKeyOrPurpose(t *testing.T) {
 	}
 	if _, err := NewCodec([]byte("key"), " "); !errors.Is(err, ErrInvalidKey) {
 		t.Fatalf("missing purpose error=%v", err)
+	}
+}
+
+func TestCodecRejectsNonCanonicalBase64TrailingBits(t *testing.T) {
+	codec, err := NewCodec(
+		[]byte("chronodesk-list-cursor-canonical-base64-test-root"),
+		"canonical-base64.v1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := codec.Encode(testPayload{Version: 1, Scope: 7, ID: "row-25"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacements := map[byte]byte{
+		'A': 'B',
+		'E': 'F',
+		'I': 'J',
+		'M': 'N',
+		'Q': 'R',
+		'U': 'V',
+		'Y': 'Z',
+		'c': 'd',
+		'g': 'h',
+		'k': 'l',
+		'o': 'p',
+		's': 't',
+		'w': 'x',
+		'0': '1',
+		'4': '5',
+		'8': '9',
+	}
+	last := encoded[len(encoded)-1]
+	replacement, ok := replacements[last]
+	if !ok {
+		t.Fatalf("unexpected canonical base64 suffix %q in %q", last, encoded)
+	}
+	nonCanonical := encoded[:len(encoded)-1] + string(replacement)
+	var decoded testPayload
+	if err := codec.Decode(
+		nonCanonical,
+		&decoded,
+	); !errors.Is(err, ErrInvalidCursor) {
+		t.Fatalf("non-canonical cursor error=%v", err)
+	}
+}
+
+func TestCodecRejectsPaddedStandardAndWhitespaceBase64URL(t *testing.T) {
+	codec, err := NewCodec(
+		[]byte("chronodesk-list-cursor-strict-alphabet-test-root"),
+		"strict-base64url.v1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := codec.Encode(testPayload{Version: 1, Scope: 8, ID: "row-26"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(encoded, ".")
+	if len(parts) != 2 {
+		t.Fatalf("cursor parts=%d", len(parts))
+	}
+	cases := map[string]string{
+		"padded payload": parts[0] + "=." + parts[1],
+		"padded mac":     parts[0] + "." + parts[1] + "=",
+		"standard plus":  "+" + parts[0][1:] + "." + parts[1],
+		"standard slash": "/" + parts[0][1:] + "." + parts[1],
+		"leading space":  " " + encoded,
+		"trailing line":  encoded + "\n",
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			var decoded testPayload
+			if err := codec.Decode(
+				raw,
+				&decoded,
+			); !errors.Is(err, ErrInvalidCursor) {
+				t.Fatalf("strict cursor error=%v", err)
+			}
+		})
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -23,13 +24,16 @@ import (
 )
 
 var (
-	ErrProjectNotFound            = errors.New("project not found")
-	ErrProjectAccessDenied        = errors.New("project access denied")
-	ErrProjectInactive            = errors.New("project is not active")
-	ErrQueueNotFound              = errors.New("queue not found")
-	ErrProjectMembershipNotFound  = errors.New("project membership not found")
-	ErrProjectMembershipUser      = errors.New("project membership user is unavailable")
-	ErrProjectMembershipConflict  = errors.New("project membership conflicts with required grant")
+	ErrProjectNotFound                  = errors.New("project not found")
+	ErrProjectAccessDenied              = errors.New("project access denied")
+	ErrProjectInactive                  = errors.New("project is not active")
+	ErrQueueNotFound                    = errors.New("queue not found")
+	ErrProjectMembershipNotFound        = errors.New("project membership not found")
+	ErrProjectMembershipUser            = errors.New("project membership user is unavailable")
+	ErrProjectMembershipConflict        = errors.New("project membership conflicts with required grant")
+	ErrProjectMembershipVersionConflict = errors.New(
+		"project membership version conflict",
+	)
 	ErrLastProjectAdministrator   = errors.New("project requires an active administrator")
 	ErrProjectEventWriter         = errors.New("project event writer is unavailable")
 	ErrProjectPublicID            = errors.New("invalid project public id")
@@ -80,11 +84,12 @@ func defaultRequestTypeVersionID(ticketType models.TicketType) string {
 }
 
 type ProjectAccess struct {
-	Project               models.Project        `json:"project"`
-	Role                  models.ProjectRole    `json:"project_role"`
-	Scope                 models.ProjectScope   `json:"scope"`
-	Scopes                []string              `json:"scopes,omitempty"`
-	AuthorizationSnapshot AuthorizationSnapshot `json:"-"`
+	Project                  models.Project        `json:"project"`
+	Role                     models.ProjectRole    `json:"project_role"`
+	CanCreateKnowledgeDrafts bool                  `json:"can_create_knowledge_drafts"`
+	Scope                    models.ProjectScope   `json:"scope"`
+	Scopes                   []string              `json:"scopes,omitempty"`
+	AuthorizationSnapshot    AuthorizationSnapshot `json:"-"`
 }
 
 // AuthorizationSnapshot is an internal, immutable comparison value produced
@@ -94,23 +99,24 @@ type ProjectAccess struct {
 // snapshots. Every field is excluded from JSON so authorization control state
 // cannot become a browser or machine-protocol contract by accident.
 type AuthorizationSnapshot struct {
-	Scope               models.ProjectScope `json:"-"`
-	ActorType           models.ActorType    `json:"-"`
-	ProjectUpdatedAt    time.Time           `json:"-"`
-	UserID              uint                `json:"-"`
-	UserUpdatedAt       time.Time           `json:"-"`
-	MembershipID        uint                `json:"-"`
-	MembershipVersion   uint64              `json:"-"`
-	MembershipUpdatedAt time.Time           `json:"-"`
-	MembershipRole      models.ProjectRole  `json:"-"`
-	PrincipalID         string              `json:"-"`
-	PrincipalUpdatedAt  time.Time           `json:"-"`
-	GrantID             uint                `json:"-"`
-	GrantUpdatedAt      time.Time           `json:"-"`
-	GrantRole           models.ProjectRole  `json:"-"`
-	GrantScopes         []string            `json:"-"`
-	CredentialID        string              `json:"-"`
-	CredentialUpdatedAt time.Time           `json:"-"`
+	Scope                          models.ProjectScope `json:"-"`
+	ActorType                      models.ActorType    `json:"-"`
+	ProjectUpdatedAt               time.Time           `json:"-"`
+	UserID                         uint                `json:"-"`
+	UserUpdatedAt                  time.Time           `json:"-"`
+	MembershipID                   uint                `json:"-"`
+	MembershipVersion              uint64              `json:"-"`
+	MembershipUpdatedAt            time.Time           `json:"-"`
+	MembershipRole                 models.ProjectRole  `json:"-"`
+	MembershipKnowledgeContributor bool                `json:"-"`
+	PrincipalID                    string              `json:"-"`
+	PrincipalUpdatedAt             time.Time           `json:"-"`
+	GrantID                        uint                `json:"-"`
+	GrantUpdatedAt                 time.Time           `json:"-"`
+	GrantRole                      models.ProjectRole  `json:"-"`
+	GrantScopes                    []string            `json:"-"`
+	CredentialID                   string              `json:"-"`
+	CredentialUpdatedAt            time.Time           `json:"-"`
 }
 
 // Matches performs an exact comparison between two successful live
@@ -132,6 +138,8 @@ func (snapshot AuthorizationSnapshot) Matches(
 		snapshot.MembershipVersion == current.MembershipVersion &&
 		snapshot.MembershipUpdatedAt.Equal(current.MembershipUpdatedAt) &&
 		snapshot.MembershipRole == current.MembershipRole &&
+		snapshot.MembershipKnowledgeContributor ==
+			current.MembershipKnowledgeContributor &&
 		snapshot.PrincipalID == current.PrincipalID &&
 		snapshot.PrincipalUpdatedAt.Equal(current.PrincipalUpdatedAt) &&
 		snapshot.GrantID == current.GrantID &&
@@ -149,15 +157,16 @@ func newHumanAuthorizationSnapshot(
 	membership models.ProjectMembership,
 ) AuthorizationSnapshot {
 	return AuthorizationSnapshot{
-		Scope:               scope,
-		ActorType:           models.ActorTypeHuman,
-		ProjectUpdatedAt:    project.UpdatedAt,
-		UserID:              user.ID,
-		UserUpdatedAt:       user.UpdatedAt,
-		MembershipID:        membership.ID,
-		MembershipVersion:   membership.Version,
-		MembershipUpdatedAt: membership.UpdatedAt,
-		MembershipRole:      membership.Role,
+		Scope:                          scope,
+		ActorType:                      models.ActorTypeHuman,
+		ProjectUpdatedAt:               project.UpdatedAt,
+		UserID:                         user.ID,
+		UserUpdatedAt:                  user.UpdatedAt,
+		MembershipID:                   membership.ID,
+		MembershipVersion:              membership.Version,
+		MembershipUpdatedAt:            membership.UpdatedAt,
+		MembershipRole:                 membership.Role,
+		MembershipKnowledgeContributor: membership.KnowledgeContributor,
 	}
 }
 
@@ -269,6 +278,14 @@ type DirectoryPage[T any] struct {
 	TotalPages int   `json:"total_pages"`
 }
 
+type HumanProjectListRequest struct {
+	Page      int
+	PageSize  int
+	Search    string
+	SortBy    string
+	SortOrder string
+}
+
 func validateDirectoryPageRequest(
 	request DirectoryPageRequest,
 	sortFields map[string]struct{},
@@ -346,10 +363,11 @@ type ProjectCreationContext struct {
 
 func (access ProjectAccess) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		Project AuthorizedProject   `json:"project"`
-		Role    models.ProjectRole  `json:"project_role"`
-		Scope   models.ProjectScope `json:"scope"`
-		Scopes  []string            `json:"scopes,omitempty"`
+		Project                  AuthorizedProject   `json:"project"`
+		Role                     models.ProjectRole  `json:"project_role"`
+		CanCreateKnowledgeDrafts bool                `json:"can_create_knowledge_drafts"`
+		Scope                    models.ProjectScope `json:"scope"`
+		Scopes                   []string            `json:"scopes,omitempty"`
 	}{
 		Project: AuthorizedProject{
 			ID:             access.Project.ID,
@@ -363,9 +381,10 @@ func (access ProjectAccess) MarshalJSON() ([]byte, error) {
 			Description:    access.Project.Description,
 			Status:         access.Project.Status,
 		},
-		Role:   access.Role,
-		Scope:  access.Scope,
-		Scopes: access.Scopes,
+		Role:                     access.Role,
+		CanCreateKnowledgeDrafts: access.CanCreateKnowledgeDrafts,
+		Scope:                    access.Scope,
+		Scopes:                   access.Scopes,
 	})
 }
 
@@ -405,15 +424,16 @@ func NewProjectService(
 }
 
 type ProjectMembershipView struct {
-	ID        uint                `json:"id"`
-	ProjectID uint                `json:"project_id"`
-	UserID    uint                `json:"user_id"`
-	User      *models.UserSummary `json:"user,omitempty"`
-	Role      models.ProjectRole  `json:"role"`
-	IsActive  bool                `json:"is_active"`
-	Version   uint64              `json:"version"`
-	CreatedAt time.Time           `json:"created_at"`
-	UpdatedAt time.Time           `json:"updated_at"`
+	ID                   uint                `json:"id"`
+	ProjectID            uint                `json:"project_id"`
+	UserID               uint                `json:"user_id"`
+	User                 *models.UserSummary `json:"user,omitempty"`
+	Role                 models.ProjectRole  `json:"role"`
+	IsActive             bool                `json:"is_active"`
+	KnowledgeContributor bool                `json:"knowledge_contributor"`
+	Version              uint64              `json:"version"`
+	CreatedAt            time.Time           `json:"created_at"`
+	UpdatedAt            time.Time           `json:"updated_at"`
 }
 
 func projectMembershipView(
@@ -423,15 +443,16 @@ func projectMembershipView(
 		return ProjectMembershipView{}
 	}
 	return ProjectMembershipView{
-		ID:        membership.ID,
-		ProjectID: membership.ProjectID,
-		UserID:    membership.UserID,
-		User:      membership.User.ToSummary(),
-		Role:      membership.Role,
-		IsActive:  membership.IsActive,
-		Version:   membership.Version,
-		CreatedAt: membership.CreatedAt,
-		UpdatedAt: membership.UpdatedAt,
+		ID:                   membership.ID,
+		ProjectID:            membership.ProjectID,
+		UserID:               membership.UserID,
+		User:                 membership.User.ToSummary(),
+		Role:                 membership.Role,
+		IsActive:             membership.IsActive,
+		KnowledgeContributor: membership.KnowledgeContributor,
+		Version:              membership.Version,
+		CreatedAt:            membership.CreatedAt,
+		UpdatedAt:            membership.UpdatedAt,
 	}
 }
 
@@ -505,8 +526,34 @@ func projectMembershipDirectoryOrder(request DirectoryPageRequest) string {
 }
 
 type UpsertProjectMembershipInput struct {
-	UserID uint
-	Role   models.ProjectRole
+	UserID               uint
+	Role                 models.ProjectRole
+	KnowledgeContributor *bool
+	// ExpectedVersion is required for interactive membership administration:
+	// zero means the caller observed no persisted Membership, while an
+	// existing Membership must match its current positive version exactly.
+	// EnsureHumanMembership intentionally ignores this field because it is a
+	// trusted idempotent bootstrap operation.
+	ExpectedVersion uint64
+}
+
+func requestedKnowledgeContributor(
+	role models.ProjectRole,
+	requested *bool,
+	current bool,
+	reactivating bool,
+) bool {
+	if role == models.ProjectRoleAdmin ||
+		role == models.ProjectRoleManager {
+		return false
+	}
+	if requested != nil {
+		return *requested
+	}
+	if reactivating {
+		return false
+	}
+	return current
 }
 
 // UpsertHumanMembership is the complete authorization-and-command boundary
@@ -634,13 +681,22 @@ func (service *ProjectService) writeHumanMembership(
 			First(&membership)
 		switch {
 		case errors.Is(query.Error, gorm.ErrRecordNotFound):
+			if !ensureOnly && input.ExpectedVersion != 0 {
+				return ErrProjectMembershipVersionConflict
+			}
 			membership = models.ProjectMembership{
 				ProjectID: scope.ProjectID,
 				UserID:    input.UserID,
 				User:      user,
 				Role:      input.Role,
 				IsActive:  true,
-				Version:   1,
+				KnowledgeContributor: requestedKnowledgeContributor(
+					input.Role,
+					input.KnowledgeContributor,
+					false,
+					true,
+				),
+				Version: 1,
 			}
 			if err := tx.Create(&membership).Error; err != nil {
 				return fmt.Errorf("create project membership: %w", err)
@@ -650,7 +706,16 @@ func (service *ProjectService) writeHumanMembership(
 			return fmt.Errorf("lock project membership: %w", query.Error)
 		default:
 			if ensureOnly {
-				if membership.Role != input.Role || !membership.IsActive {
+				expectedContributor := requestedKnowledgeContributor(
+					input.Role,
+					input.KnowledgeContributor,
+					membership.KnowledgeContributor,
+					false,
+				)
+				if membership.Role != input.Role ||
+					!membership.IsActive ||
+					membership.KnowledgeContributor !=
+						expectedContributor {
 					return fmt.Errorf(
 						"%w: existing role %q active=%t",
 						ErrProjectMembershipConflict,
@@ -660,6 +725,9 @@ func (service *ProjectService) writeHumanMembership(
 				}
 				membership.User = user
 				return nil
+			}
+			if input.ExpectedVersion != membership.Version {
+				return ErrProjectMembershipVersionConflict
 			}
 			if membership.Role == models.ProjectRoleAdmin &&
 				input.Role != models.ProjectRoleAdmin &&
@@ -672,14 +740,23 @@ func (service *ProjectService) writeHumanMembership(
 					return err
 				}
 			}
+			wasActive := membership.IsActive
 			membership.Role = input.Role
 			membership.IsActive = true
+			membership.KnowledgeContributor =
+				requestedKnowledgeContributor(
+					input.Role,
+					input.KnowledgeContributor,
+					membership.KnowledgeContributor,
+					!wasActive,
+				)
 			membership.Version++
 			if err := tx.Model(&membership).Updates(map[string]any{
-				"role":       membership.Role,
-				"is_active":  true,
-				"version":    membership.Version,
-				"updated_at": service.now().UTC(),
+				"role":                  membership.Role,
+				"is_active":             true,
+				"knowledge_contributor": membership.KnowledgeContributor,
+				"version":               membership.Version,
+				"updated_at":            service.now().UTC(),
 			}).Error; err != nil {
 				return fmt.Errorf("update project membership: %w", err)
 			}
@@ -714,6 +791,7 @@ func (service *ProjectService) DeactivateHumanMembership(
 	ctx context.Context,
 	scope models.ProjectScope,
 	userID uint,
+	expectedVersion uint64,
 ) (*ProjectMembershipView, error) {
 	if scopeddb.HasTransaction(ctx) {
 		return nil, fmt.Errorf(
@@ -757,6 +835,9 @@ func (service *ProjectService) DeactivateHumanMembership(
 					return ErrProjectMembershipNotFound
 				}
 				membership.User = locked.usersByID[userID]
+				if expectedVersion != membership.Version {
+					return ErrProjectMembershipVersionConflict
+				}
 				if !membership.IsActive {
 					return nil
 				}
@@ -974,10 +1055,11 @@ func (service *ProjectService) appendMembershipEventTx(
 				membership.UserID,
 			),
 			Data: map[string]any{
-				"membership_id": membership.ID,
-				"user_id":       membership.UserID,
-				"role":          membership.Role,
-				"is_active":     membership.IsActive,
+				"membership_id":         membership.ID,
+				"user_id":               membership.UserID,
+				"role":                  membership.Role,
+				"is_active":             membership.IsActive,
+				"knowledge_contributor": membership.KnowledgeContributor,
 			},
 			Scope:           operation.Scope,
 			TraceID:         operation.TraceID,
@@ -1004,11 +1086,15 @@ func (service *ProjectService) ListHumanProjects(
 	}
 	var rows []struct {
 		models.Project
-		MembershipRole models.ProjectRole `gorm:"column:membership_role"`
+		MembershipRole                 models.ProjectRole `gorm:"column:membership_role"`
+		MembershipKnowledgeContributor bool               `gorm:"column:membership_knowledge_contributor"`
 	}
 	query := service.db.WithContext(ctx).
 		Table("projects").
-		Select("projects.*, project_memberships.role AS membership_role").
+		Select(
+			"projects.*, project_memberships.role AS membership_role, "+
+				"project_memberships.knowledge_contributor AS membership_knowledge_contributor",
+		).
 		Joins(
 			"JOIN project_memberships ON project_memberships.project_id = projects.id AND project_memberships.user_id = ? AND project_memberships.is_active = ?",
 			userID,
@@ -1030,10 +1116,121 @@ func (service *ProjectService) ListHumanProjects(
 		result = append(result, ProjectAccess{
 			Project: row.Project,
 			Role:    row.MembershipRole,
-			Scope:   row.Project.Scope(),
+			CanCreateKnowledgeDrafts: row.MembershipKnowledgeContributor ||
+				row.MembershipRole == models.ProjectRoleAdmin ||
+				row.MembershipRole == models.ProjectRoleManager,
+			Scope: row.Project.Scope(),
 		})
 	}
 	return result, nil
+}
+
+// ListHumanProjectPage is the bounded browser inventory. It uses only the
+// current active human membership and user status; platform duties never
+// widen the result.
+func (service *ProjectService) ListHumanProjectPage(
+	ctx context.Context,
+	userID uint,
+	request HumanProjectListRequest,
+) (*DirectoryPage[ProjectAccess], error) {
+	if userID == 0 {
+		return nil, ErrProjectAccessDenied
+	}
+	if err := validateDirectoryPageRequest(
+		DirectoryPageRequest{
+			Page:      request.Page,
+			PageSize:  request.PageSize,
+			SortBy:    request.SortBy,
+			SortOrder: request.SortOrder,
+		},
+		map[string]struct{}{
+			"name":       {},
+			"key":        {},
+			"created_at": {},
+		},
+	); err != nil {
+		return nil, err
+	}
+	search := strings.TrimSpace(request.Search)
+	if utf8.RuneCountInString(search) > 100 ||
+		strings.IndexFunc(search, unicode.IsControl) >= 0 {
+		return nil, ErrDirectoryListQuery
+	}
+	base := service.db.WithContext(ctx).
+		Table("projects").
+		Joins(
+			"JOIN project_memberships ON project_memberships.project_id = projects.id AND project_memberships.user_id = ? AND project_memberships.is_active = ?",
+			userID,
+			true,
+		).
+		Joins(
+			"JOIN users ON users.id = project_memberships.user_id AND users.status = ? AND users.deleted_at IS NULL",
+			models.UserStatusActive,
+		).
+		Where("projects.status = ?", models.ProjectStatusActive)
+	if search != "" {
+		escaped := strings.NewReplacer(
+			`\`, `\\`,
+			`%`, `\%`,
+			`_`, `\_`,
+		).Replace(strings.ToLower(search))
+		like := "%" + escaped + "%"
+		base = base.Where(
+			"(LOWER(projects.name) LIKE ? ESCAPE '\\' OR LOWER(projects.key) LIKE ? ESCAPE '\\')",
+			like,
+			like,
+		)
+	}
+	var total int64
+	if err := base.Count(&total).Error; err != nil {
+		return nil, fmt.Errorf("count authorized projects: %w", err)
+	}
+	var rows []struct {
+		models.Project
+		MembershipRole                 models.ProjectRole `gorm:"column:membership_role"`
+		MembershipKnowledgeContributor bool               `gorm:"column:membership_knowledge_contributor"`
+	}
+	direction := "ASC"
+	if request.SortOrder == "desc" {
+		direction = "DESC"
+	}
+	orderColumn := map[string]string{
+		"name":       "projects.name",
+		"key":        "projects.key",
+		"created_at": "projects.created_at",
+	}[request.SortBy]
+	if err := base.
+		Select(
+			"projects.*, project_memberships.role AS membership_role, " +
+				"project_memberships.knowledge_contributor AS membership_knowledge_contributor",
+		).
+		Order(orderColumn + " " + direction + ", projects.id " + direction).
+		Offset((request.Page - 1) * request.PageSize).
+		Limit(request.PageSize).
+		Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf("list authorized project page: %w", err)
+	}
+	items := make([]ProjectAccess, 0, len(rows))
+	for _, row := range rows {
+		if !row.MembershipRole.IsValid() {
+			return nil, ErrProjectAccessDenied
+		}
+		items = append(items, ProjectAccess{
+			Project: row.Project,
+			Role:    row.MembershipRole,
+			CanCreateKnowledgeDrafts: row.MembershipKnowledgeContributor ||
+				row.MembershipRole == models.ProjectRoleAdmin ||
+				row.MembershipRole == models.ProjectRoleManager,
+			Scope: row.Project.Scope(),
+		})
+	}
+	return &DirectoryPage[ProjectAccess]{
+		Items:      items,
+		Total:      total,
+		Page:       request.Page,
+		PageSize:   request.PageSize,
+		TotalPages: directoryTotalPages(total, request.PageSize),
+	}, nil
 }
 
 // ListPlatformProjects retains the small service seam used by non-HTTP
@@ -1202,7 +1399,8 @@ func normalizePlatformProjectListRequest(
 ) (PlatformProjectListRequest, error) {
 	if request.Page < 1 ||
 		request.PageSize < 1 ||
-		request.PageSize > 100 {
+		request.PageSize > 100 ||
+		request.Page > math.MaxInt/request.PageSize {
 		return PlatformProjectListRequest{}, ErrProjectGovernanceQuery
 	}
 	request.Search = strings.TrimSpace(request.Search)
@@ -1368,7 +1566,8 @@ func normalizeBusinessUnitSearchRequest(
 ) (PlatformBusinessUnitSearchRequest, error) {
 	if request.Page < 1 ||
 		request.PageSize < 1 ||
-		request.PageSize > 100 {
+		request.PageSize > 100 ||
+		request.Page > math.MaxInt/request.PageSize {
 		return PlatformBusinessUnitSearchRequest{}, ErrProjectGovernanceQuery
 	}
 	request.Search = strings.TrimSpace(request.Search)
@@ -1454,7 +1653,8 @@ func normalizeProjectUserSearchRequest(
 ) (ProjectUserSearchRequest, error) {
 	if request.Page < 1 ||
 		request.PageSize < 1 ||
-		request.PageSize > 100 {
+		request.PageSize > 100 ||
+		request.Page > math.MaxInt/request.PageSize {
 		return ProjectUserSearchRequest{}, ErrProjectGovernanceQuery
 	}
 	request.Search = strings.TrimSpace(request.Search)
@@ -1623,11 +1823,15 @@ func (service *ProjectService) ResolveHumanProject(
 	}
 	var candidates []struct {
 		models.Project
-		MembershipRole models.ProjectRole `gorm:"column:membership_role"`
+		MembershipRole                 models.ProjectRole `gorm:"column:membership_role"`
+		MembershipKnowledgeContributor bool               `gorm:"column:membership_knowledge_contributor"`
 	}
 	query := service.db.WithContext(ctx).
 		Table("projects").
-		Select("projects.*, project_memberships.role AS membership_role").
+		Select(
+			"projects.*, project_memberships.role AS membership_role, "+
+				"project_memberships.knowledge_contributor AS membership_knowledge_contributor",
+		).
 		Joins(
 			"JOIN project_memberships ON project_memberships.project_id = projects.id AND project_memberships.user_id = ? AND project_memberships.is_active = ?",
 			userID,
@@ -1661,7 +1865,10 @@ func (service *ProjectService) ResolveHumanProject(
 	return &ProjectAccess{
 		Project: project,
 		Role:    role,
-		Scope:   project.Scope(),
+		CanCreateKnowledgeDrafts: candidates[0].MembershipKnowledgeContributor ||
+			role == models.ProjectRoleAdmin ||
+			role == models.ProjectRoleManager,
+		Scope: project.Scope(),
 	}, nil
 }
 
@@ -1888,7 +2095,10 @@ func lockHumanProjectAuthorizationAfterProject(
 	return &ProjectAccess{
 		Project: project,
 		Role:    membership.Role,
-		Scope:   scope,
+		CanCreateKnowledgeDrafts: membership.KnowledgeContributor ||
+			membership.Role == models.ProjectRoleAdmin ||
+			membership.Role == models.ProjectRoleManager,
+		Scope: scope,
 		AuthorizationSnapshot: newHumanAuthorizationSnapshot(
 			scope,
 			project,
@@ -2249,6 +2459,7 @@ func (service *ProjectService) ListQueuePage(
 	}
 	queues := make([]models.Queue, 0, request.PageSize)
 	if err := query.
+		Preload("Team", "project_id = ?", scope.ProjectID).
 		Order(projectQueueDirectoryOrder(request)).
 		Offset(directoryPageOffset(request)).
 		Limit(request.PageSize).

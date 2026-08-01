@@ -1,6 +1,7 @@
 package services
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 
 	if err := db.AutoMigrate(
 		&models.User{},
+		&models.Category{},
 		&models.Ticket{},
 		&models.TicketComment{},
 		&models.DomainEvent{},
@@ -136,6 +138,57 @@ func TestGetTicketsSupportsMultiValueFilters(t *testing.T) {
 	}
 	if singleTickets[0].Priority != models.TicketPriorityUrgent {
 		t.Fatalf("expected urgent ticket, got %s", singleTickets[0].Priority)
+	}
+}
+
+func TestGetTicketKeepsBaseDetailBoundedWhenCommentsGrow(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := testProjectOperationContext(t, db, models.HumanActor(1))
+	var ticket models.Ticket
+	if err := db.Where("ticket_number = ?", "T-001").First(&ticket).Error; err != nil {
+		t.Fatal(err)
+	}
+	userID := uint(1)
+	comments := make([]models.TicketComment, 150)
+	for index := range comments {
+		comments[index] = models.TicketComment{
+			TicketID:    ticket.ID,
+			UserID:      &userID,
+			ActorType:   models.ActorTypeHuman,
+			ActorID:     "1",
+			Content:     fmt.Sprintf("bounded comment %03d", index),
+			ContentType: "text",
+			Type:        models.CommentTypePublic,
+		}
+	}
+	if err := db.Create(&comments).Error; err != nil {
+		t.Fatal(err)
+	}
+	queryCount := 0
+	const callbackName = "test:count-bounded-ticket-detail"
+	if err := db.Callback().Query().Before("gorm:query").Register(
+		callbackName,
+		func(*gorm.DB) {
+			queryCount++
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = db.Callback().Query().Remove(callbackName)
+	})
+	loaded, err := (&TicketService{db: db}).GetTicket(ctx, ticket.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Comments) != 0 {
+		t.Fatalf("base ticket detail preloaded %d comments", len(loaded.Comments))
+	}
+	if queryCount > 3 {
+		t.Fatalf(
+			"base ticket detail issued %d queries after 150 comments, want at most 3",
+			queryCount,
+		)
 	}
 }
 
@@ -460,6 +513,36 @@ func TestCreateTicketDerivesSLAProjectionFromSLAConfig(t *testing.T) {
 		creator.ID,
 		models.ProjectRoleAgent,
 	)
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignCategory := models.Category{
+		OrganizationID: operation.Scope.OrganizationID,
+		ProjectID:      operation.Scope.ProjectID + 1,
+		Name:           "Foreign create category",
+		Slug:           "foreign-create-category",
+		Type:           models.CategoryTypeSupport,
+		Status:         models.CategoryStatusActive,
+		CreatedBy:      creator.ID,
+	}
+	if err := db.Create(&foreignCategory).Error; err != nil {
+		t.Fatalf("create foreign category: %v", err)
+	}
+	if _, err := svc.CreateTicket(
+		ctx,
+		&models.TicketCreateRequest{
+			Title:       "Cross-project category",
+			Description: "must fail before persistence",
+			Type:        models.TicketTypeRequest,
+			Priority:    models.TicketPriorityNormal,
+			Source:      models.TicketSourceWeb,
+			CategoryID:  &foreignCategory.ID,
+		},
+		creator.ID,
+	); !errors.Is(err, ErrTicketCategoryScope) {
+		t.Fatalf("human create accepted foreign category: %v", err)
+	}
 	ticket, err := svc.CreateTicket(ctx, &models.TicketCreateRequest{
 		Title:       "SLA-backed ticket",
 		Description: "deadline should be derived",

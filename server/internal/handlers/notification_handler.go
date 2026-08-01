@@ -1,12 +1,17 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/seaworld008/chronodesk/server/internal/models"
@@ -32,7 +37,7 @@ type notificationPreferenceUpdateItem struct {
 }
 
 type updateNotificationPreferencesRequest struct {
-	Preferences []notificationPreferenceUpdateItem `json:"preferences" binding:"required,min=1,max=50,dive"`
+	Preferences []notificationPreferenceUpdateItem `json:"preferences" binding:"required,min=1,max=10,dive"`
 }
 
 func NewNotificationHandler(notificationService services.NotificationServiceInterface) *NotificationHandler {
@@ -54,46 +59,77 @@ func (h *NotificationHandler) GetNotifications(c *gin.Context) {
 	}
 
 	userID := userIDValue.(uint)
-	filter := models.NotificationFilter{}
-	filter.RecipientID = &userID
-	if unsupported := unsupportedNotificationListQuery(c); unsupported != "" {
+	values, err := strictNotificationListQueryValues(
+		c.Request.URL.RawQuery,
+	)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"code": 1,
-			"msg":  "通知列表包含不支持的查询参数",
+			"msg":  "通知列表查询参数无效",
 			"data": nil,
 		})
 		return
 	}
 
-	page, pageSize, ok := parseStrictPagePagination(c, 25, 100)
-	if !ok {
+	page, err := parseDirectoryPositiveInt(
+		values,
+		"page",
+		1,
+		math.MaxInt/defaultDirectoryPageSize,
+	)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code": 1,
+			"msg":  "通知列表查询参数无效",
+			"data": nil,
+		})
+		return
+	}
+	pageSize, err := parseDirectoryPositiveInt(
+		values,
+		"page_size",
+		defaultDirectoryPageSize,
+		maxDirectoryPageSize,
+	)
+	if err != nil || page > math.MaxInt/pageSize {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code": 1,
+			"msg":  "通知列表查询参数无效",
+			"data": nil,
+		})
 		return
 	}
 
+	filter := models.NotificationFilter{RecipientID: &userID}
 	filter.Limit = pageSize
 	filter.Offset = (page - 1) * pageSize
 
 	// 解析排序参数
-	if sortParam := c.Query("sort"); sortParam != "" {
+	if sortParam := values.Get("sort"); sortParam != "" {
 		var sortFields []string
-		if err := json.Unmarshal([]byte(sortParam), &sortFields); err == nil && len(sortFields) == 2 {
-			field := sortFields[0]
-			if !isValidNotificationSortField(field) {
-				field = "created_at"
-			}
-			direction := strings.ToLower(sortFields[1])
-			if direction != "asc" && direction != "desc" {
-				direction = "desc"
-			}
-			filter.OrderBy = field
-			filter.OrderDir = direction
+		if err := decodeStrictNotificationJSON(sortParam, &sortFields); err != nil ||
+			len(sortFields) != 2 ||
+			!isValidNotificationSortField(sortFields[0]) ||
+			(sortFields[1] != "ASC" && sortFields[1] != "DESC") {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code": 1,
+				"msg":  "通知列表排序参数无效",
+				"data": nil,
+			})
+			return
 		}
+		filter.OrderBy = sortFields[0]
+		filter.OrderDir = strings.ToLower(sortFields[1])
 	}
 
 	// 解析过滤参数(filter=...)
-	if filterParam := c.Query("filter"); filterParam != "" {
+	if filterParam := values.Get("filter"); filterParam != "" {
 		var filterMap map[string]interface{}
-		if err := json.Unmarshal([]byte(filterParam), &filterMap); err != nil {
+		if err := decodeStrictNotificationJSON(
+			filterParam,
+			&filterMap,
+		); err != nil ||
+			validateNotificationFilterMap(filterMap, userID) != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"code": 1,
 				"msg":  "过滤参数格式错误",
@@ -113,6 +149,14 @@ func (h *NotificationHandler) GetNotifications(c *gin.Context) {
 
 	notifications, total, err := h.notificationService.GetNotifications(c.Request.Context(), &filter)
 	if err != nil {
+		if errors.Is(err, services.ErrInvalidNotificationListQuery) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code": 1,
+				"msg":  "通知列表查询参数无效",
+				"data": nil,
+			})
+			return
+		}
 		logHandlerFailure(c, "notification.list", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code": 1,
@@ -145,9 +189,12 @@ func (h *NotificationHandler) GetNotifications(c *gin.Context) {
 	})
 }
 
-func unsupportedNotificationListQuery(c *gin.Context) string {
-	if c == nil || c.Request == nil || c.Request.URL == nil {
-		return ""
+func strictNotificationListQueryValues(
+	rawQuery string,
+) (url.Values, error) {
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return nil, err
 	}
 	allowed := map[string]struct{}{
 		"page":      {},
@@ -155,12 +202,139 @@ func unsupportedNotificationListQuery(c *gin.Context) string {
 		"sort":      {},
 		"filter":    {},
 	}
-	for name := range c.Request.URL.Query() {
-		if _, ok := allowed[name]; !ok {
-			return name
+	for name, entries := range values {
+		if _, ok := allowed[name]; !ok || len(entries) != 1 ||
+			!utf8.ValidString(name) || !utf8.ValidString(entries[0]) ||
+			containsDirectoryQueryControl(name) ||
+			containsDirectoryQueryControl(entries[0]) ||
+			strings.TrimSpace(entries[0]) == "" ||
+			strings.TrimSpace(entries[0]) != entries[0] {
+			return nil, errors.New("invalid notification list query")
 		}
 	}
-	return ""
+	return values, nil
+}
+
+func decodeStrictNotificationJSON(raw string, target any) error {
+	if len(raw) > 8192 {
+		return errors.New("notification list JSON is too large")
+	}
+	decoder := json.NewDecoder(bytes.NewBufferString(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("notification list JSON must contain one value")
+	}
+	return nil
+}
+
+func validateNotificationFilterMap(
+	filterMap map[string]interface{},
+	currentUserID uint,
+) error {
+	allowed := map[string]struct{}{
+		"q": {}, "type": {}, "types": {}, "priority": {}, "channel": {},
+		"is_read": {}, "is_sent": {}, "is_delivered": {},
+		"related_type": {}, "related_id": {}, "related_ticket_id": {},
+		"sender_id": {}, "recipient_id": {}, "created_at_gte": {},
+		"created_at_lte": {},
+	}
+	for key := range filterMap {
+		if _, ok := allowed[key]; !ok {
+			return errors.New("unsupported notification filter")
+		}
+	}
+	if raw, ok := filterMap["q"]; ok {
+		value, valid := raw.(string)
+		if !valid || strings.TrimSpace(value) != value ||
+			value == "" || len([]rune(value)) > 200 {
+			return errors.New("invalid notification search")
+		}
+	}
+	for _, key := range []string{"type", "types"} {
+		if raw, ok := filterMap[key]; ok {
+			values := parseNotificationTypes(raw)
+			if len(values) == 0 || len(values) > len(models.NotificationTypes()) {
+				return errors.New("invalid notification type")
+			}
+			for _, value := range values {
+				if !value.IsValid() {
+					return errors.New("invalid notification type")
+				}
+			}
+		}
+	}
+	if raw, ok := filterMap["priority"]; ok {
+		values := parseNotificationPriorities(raw)
+		if len(values) == 0 || len(values) > 4 {
+			return errors.New("invalid notification priority")
+		}
+		for _, value := range values {
+			switch value {
+			case models.NotificationPriorityLow,
+				models.NotificationPriorityNormal,
+				models.NotificationPriorityHigh,
+				models.NotificationPriorityUrgent:
+			default:
+				return errors.New("invalid notification priority")
+			}
+		}
+	}
+	if raw, ok := filterMap["channel"]; ok {
+		values := parseNotificationChannels(raw)
+		if len(values) == 0 || len(values) > 4 {
+			return errors.New("invalid notification channel")
+		}
+		for _, value := range values {
+			switch value {
+			case models.NotificationChannelInApp,
+				models.NotificationChannelEmail,
+				models.NotificationChannelWebhook,
+				models.NotificationChannelWebSocket:
+			default:
+				return errors.New("invalid notification channel")
+			}
+		}
+	}
+	for _, key := range []string{"is_read", "is_sent", "is_delivered"} {
+		if raw, ok := filterMap[key]; ok {
+			if _, valid := parseBoolValue(raw); !valid {
+				return errors.New("invalid notification boolean")
+			}
+		}
+	}
+	for _, key := range []string{
+		"related_id",
+		"related_ticket_id",
+		"sender_id",
+		"recipient_id",
+	} {
+		if raw, ok := filterMap[key]; ok {
+			value, valid := parseUintValue(raw)
+			if !valid || value == 0 ||
+				(key == "recipient_id" && value != currentUserID) {
+				return errors.New("invalid notification identity filter")
+			}
+		}
+	}
+	if raw, ok := filterMap["related_type"]; ok {
+		value, valid := raw.(string)
+		if !valid || strings.TrimSpace(value) != value ||
+			value == "" || len([]rune(value)) > 50 {
+			return errors.New("invalid notification relation filter")
+		}
+	}
+	for _, key := range []string{"created_at_gte", "created_at_lte"} {
+		if raw, ok := filterMap[key]; ok {
+			if _, valid := parseDateValue(raw); !valid {
+				return errors.New("invalid notification date filter")
+			}
+		}
+	}
+	return nil
 }
 
 func applyNotificationFilters(filterMap map[string]interface{}, filter *models.NotificationFilter, currentUserID uint) {
@@ -366,6 +540,13 @@ func parseUintValue(value interface{}) (uint, bool) {
 	case uint64:
 		parsed, err := safeconv.Uint(v)
 		return parsed, err == nil
+	case json.Number:
+		parsed, err := strconv.ParseUint(string(v), 10, 0)
+		if err != nil || parsed == 0 {
+			return 0, false
+		}
+		value, convertErr := safeconv.Uint(parsed)
+		return value, convertErr == nil
 	case string:
 		trimmed := strings.TrimSpace(v)
 		if trimmed == "" {
@@ -404,7 +585,8 @@ func parseDateValue(value interface{}) (*time.Time, bool) {
 
 func isValidNotificationSortField(field string) bool {
 	switch field {
-	case "created_at", "priority", "type", "channel", "recipient_id", "sender_id", "is_read", "is_sent":
+	case "id", "created_at", "updated_at", "priority", "type", "channel",
+		"is_read", "recipient_id", "sender_id":
 		return true
 	default:
 		return false
@@ -647,6 +829,10 @@ func (h *NotificationHandler) UpdateNotificationPreferences(c *gin.Context) {
 
 	err := h.notificationService.UpdateNotificationPreferences(c.Request.Context(), userID.(uint), preferences)
 	if err != nil {
+		if errors.Is(err, services.ErrInvalidNotificationPreferences) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "通知偏好设置无效"})
+			return
+		}
 		logHandlerFailure(c, "notification.update_preferences", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新偏好设置失败"})
 		return

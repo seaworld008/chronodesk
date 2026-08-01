@@ -41,10 +41,12 @@ func TestPostgresConcurrentAttachmentDownloadsSerializeFinalCountUpdate(
 				2,
 			)
 			t.Cleanup(storage.release)
+			staging := newPostgresAttachmentDownloadStaging(t)
 			service := services.NewAgentNativeService(
 				fixture.runtimeDB,
 				services.AgentNativeOptions{
 					AttachmentStorage: storage,
+					AttachmentStaging: staging,
 				},
 			)
 			updateBarrier := registerPostgresAttachmentFinalUpdateBarrier(
@@ -178,10 +180,12 @@ func TestPostgresAttachmentDownloadFinalRevalidationFailsClosed(
 					1,
 				)
 				t.Cleanup(storage.release)
+				staging := newPostgresAttachmentDownloadStaging(t)
 				service := services.NewAgentNativeService(
 					fixture.runtimeDB,
 					services.AgentNativeOptions{
 						AttachmentStorage: storage,
+						AttachmentStaging: staging,
 					},
 				)
 				operationContext, cancel := context.WithTimeout(
@@ -230,10 +234,12 @@ func TestPostgresAttachmentDownloadFinalRevalidationFailsClosed(
 					1,
 				)
 				t.Cleanup(storage.release)
+				staging := newPostgresAttachmentDownloadStaging(t)
 				service := services.NewAgentNativeService(
 					fixture.runtimeDB,
 					services.AgentNativeOptions{
 						AttachmentStorage: storage,
+						AttachmentStaging: staging,
 					},
 				)
 				operationContext, cancel := context.WithTimeout(
@@ -1021,6 +1027,17 @@ type postgresAttachmentDownloadBarrierStorage struct {
 	arrivals    chan struct{}
 	released    chan struct{}
 	releaseOnce sync.Once
+}
+
+func newPostgresAttachmentDownloadStaging(
+	t *testing.T,
+) services.AttachmentStagingStore {
+	t.Helper()
+	staging, err := services.NewLocalAttachmentStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("create PostgreSQL attachment download staging: %v", err)
+	}
+	return staging
 }
 
 func newPostgresAttachmentDownloadBarrierStorage(

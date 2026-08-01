@@ -36,7 +36,74 @@ type knowledgeHandlerEnvelope[T any] struct {
 	Data T      `json:"data"`
 }
 
-func TestKnowledgeHandlerFullAdministrativeAndACLSearchFlow(
+func TestKnowledgeVersionResponseExposesCreatorClassWithoutIdentity(
+	t *testing.T,
+) {
+	response := newKnowledgeVersionResponse(
+		models.KnowledgeArticleVersion{
+			CreatedByType: models.ActorTypeServicePrincipal,
+			CreatedByID:   "private-principal-id",
+		},
+	)
+	payload, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(payload)
+	if !strings.Contains(
+		text,
+		`"created_by_type":"service_principal"`,
+	) {
+		t.Fatalf("creator class missing: %s", text)
+	}
+	if strings.Contains(text, "private-principal-id") ||
+		strings.Contains(text, "created_by_id") {
+		t.Fatalf("creator identity leaked: %s", text)
+	}
+}
+
+func TestKnowledgeSourceResponseDoesNotSerializeRestrictedSnapshotFields(
+	t *testing.T,
+) {
+	response := newKnowledgeSourceResponse(
+		services.KnowledgeSourceView{
+			Ordinal:        3,
+			Kind:           services.KnowledgeSourceAttachment,
+			Visibility:     services.KnowledgeSourceRestricted,
+			ReferenceLabel: "受限附件来源",
+		},
+	)
+	payload, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(payload)
+	for _, protected := range []string{
+		"source_ticket_id",
+		"source_attachment_id",
+		"ticket_number",
+		"ticket_title",
+		"attachment_name",
+		"attachment_hash",
+	} {
+		if strings.Contains(text, `"`+protected+`"`) {
+			t.Fatalf(
+				"restricted knowledge source leaked %q: %s",
+				protected,
+				text,
+			)
+		}
+	}
+	if !strings.Contains(text, `"visibility":"restricted"`) ||
+		!strings.Contains(text, `"reference_label":"受限附件来源"`) {
+		t.Fatalf(
+			"restricted knowledge source lost safe state: %s",
+			text,
+		)
+	}
+}
+
+func TestKnowledgeHandlerContractedAuthoredPublishAndSearchFlow(
 	t *testing.T,
 ) {
 	environment := newKnowledgeHandlerTestEnvironment(t)
@@ -49,191 +116,63 @@ func TestKnowledgeHandlerFullAdministrativeAndACLSearchFlow(
 		environment.agent,
 	)
 
-	policyRequest := updateKnowledgeModelPolicyRequest{
-		ProviderKey:    "handler-provider",
-		GenerateModel:  "generate-v1",
-		EmbeddingModel: "embed-v1",
-		RerankModel:    "rerank-v1",
-		DataEgress:     models.ModelDataEgressRedacted,
-		RedactionRules: []models.ModelRedactionRule{
-			{
-				Literal:     "secret-internal-pattern",
-				Replacement: "[REDACTED]",
-			},
-		},
-		ProviderAllowlist: []string{"handler-provider"},
-		ModelAllowlist: []string{
-			"generate-v1",
-			"embed-v1",
-			"rerank-v1",
-		},
-		MonthlyTokenBudget:      100000,
-		MonthlyCostBudgetMicros: 500000,
-		RequestsPerMinute:       30,
-		TokensPerMinute:         10000,
-	}
-	policy, policyBody := performKnowledgeHandlerRequest[knowledgeModelPolicyResponse](
-		t,
-		managerRouter,
-		http.MethodPut,
-		"/api/projects/OPS/knowledge/model-policy",
-		policyRequest,
-		http.StatusOK,
-	)
-	if policy.Data.RedactionRuleCount != 1 ||
-		policy.Data.ProviderAllowlistCount != 1 ||
-		policy.Data.ModelAllowlistCount != 3 {
-		t.Fatalf("safe policy response = %+v", policy.Data)
-	}
-	var policyJSON struct {
-		Data map[string]json.RawMessage `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(policyBody), &policyJSON); err != nil {
-		t.Fatal(err)
-	}
-	for _, sensitive := range []string{
-		"redaction_rules",
-		"provider_allowlist",
-		"model_allowlist",
-	} {
-		if _, exposed := policyJSON.Data[sensitive]; exposed {
-			t.Errorf("policy response exposed %q", sensitive)
-		}
-	}
-	if strings.Contains(policyBody, "secret-internal-pattern") {
-		t.Fatal("policy response exposed a redaction literal")
-	}
-	performKnowledgeHandlerRequest[knowledgeModelPolicyResponse](
-		t,
-		managerRouter,
-		http.MethodGet,
-		"/api/projects/OPS/knowledge/model-policy",
-		nil,
-		http.StatusOK,
-	)
-	performKnowledgeHandlerRequest[json.RawMessage](
-		t,
-		agentRouter,
-		http.MethodGet,
-		"/api/projects/OPS/knowledge/model-policy",
-		nil,
-		http.StatusForbidden,
-	)
-	performKnowledgeHandlerRequest[json.RawMessage](
-		t,
-		managerRouter,
-		http.MethodGet,
-		"/api/projects/SEC/knowledge/model-policy",
-		nil,
-		http.StatusNotFound,
-	)
-
-	article, _ := performKnowledgeHandlerRequest[knowledgeArticleResponse](
+	authored, authoredBody := performKnowledgeHandlerRequest[knowledgeAuthoredResponse](
 		t,
 		managerRouter,
 		http.MethodPost,
 		"/api/projects/OPS/knowledge/articles",
 		createKnowledgeArticleRequest{
-			Key:                "service-recovery",
-			Title:              "服务恢复手册",
-			Summary:            "生产服务恢复知识",
-			GrantProjectAccess: true,
+			Key:     "service-recovery",
+			Title:   "服务恢复手册",
+			Summary: "生产服务恢复知识",
+			Markdown: `## 现象
+
+服务恢复前必须确认数据库健康状态。
+
+## 解决步骤
+
+1. 检查数据库连接和错误率。
+2. 逐步恢复服务流量。
+
+## 验证
+
+确认请求成功率恢复并持续观察。`,
 		},
 		http.StatusCreated,
 	)
-
-	_, versionBody := performKnowledgeHandlerRequest[knowledgeVersionResponse](
-		t,
-		managerRouter,
-		http.MethodPost,
-		fmt.Sprintf(
-			"/api/projects/OPS/knowledge/articles/%s/versions",
-			article.Data.ID,
-		),
-		registerKnowledgeVersionRequest{
-			Title:           "服务恢复手册 v1",
-			ObjectProvider:  "s3",
-			ObjectBucket:    "knowledge-private",
-			ObjectKey:       "projects/ops/service-recovery.pdf",
-			ObjectVersionID: "object-v1",
-			FileName:        "service-recovery.pdf",
-			MimeType:        "application/pdf",
-			SizeBytes:       4096,
-			ContentHash:     strings.Repeat("a", 64),
-		},
-		http.StatusCreated,
-	)
-	if strings.Contains(versionBody, "knowledge-private") ||
-		strings.Contains(versionBody, "projects/ops/service-recovery.pdf") ||
-		strings.Contains(versionBody, `"object_provider"`) {
-		t.Fatalf("version response exposed object location: %s", versionBody)
+	if strings.Contains(authoredBody, "chronodesk-managed") ||
+		strings.Contains(authoredBody, `"object_provider"`) ||
+		strings.Contains(authoredBody, `"object_store_id"`) ||
+		strings.Contains(authoredBody, `"object_version_id"`) ||
+		authored.Data.Receipt.EventID == "" {
+		t.Fatalf("authored response leaked storage or missed receipt: %s", authoredBody)
 	}
-	var versionEnvelope knowledgeHandlerEnvelope[knowledgeVersionResponse]
-	if err := json.Unmarshal([]byte(versionBody), &versionEnvelope); err != nil {
-		t.Fatal(err)
-	}
-	version := versionEnvelope.Data
-
-	performKnowledgeHandlerRequest[json.RawMessage](
+	article := authored.Data.Article
+	version := authored.Data.Version
+	document, documentBody := performKnowledgeHandlerRequest[knowledgeDocumentResponse](
 		t,
 		managerRouter,
-		http.MethodPost,
+		http.MethodGet,
 		fmt.Sprintf(
-			"/api/projects/OPS/knowledge/articles/%s/versions",
-			article.Data.ID,
-		),
-		registerKnowledgeVersionRequest{
-			Title:          "URL 注入",
-			ObjectProvider: "s3",
-			ObjectBucket:   "knowledge-private",
-			ObjectKey:      "https://attacker.example/file.pdf",
-			FileName:       "file.pdf",
-			MimeType:       "application/pdf",
-			SizeBytes:      10,
-			ContentHash:    strings.Repeat("b", 64),
-		},
-		http.StatusBadRequest,
-	)
-	performKnowledgeHandlerRequest[json.RawMessage](
-		t,
-		managerRouter,
-		http.MethodPost,
-		fmt.Sprintf(
-			"/api/projects/SEC/knowledge/articles/%s/versions",
-			article.Data.ID,
-		),
-		registerKnowledgeVersionRequest{
-			Title:          "跨项目版本",
-			ObjectProvider: "s3",
-			ObjectBucket:   "knowledge-private",
-			ObjectKey:      "projects/sec/forbidden.pdf",
-			FileName:       "forbidden.pdf",
-			MimeType:       "application/pdf",
-			SizeBytes:      10,
-			ContentHash:    strings.Repeat("c", 64),
-		},
-		http.StatusNotFound,
-	)
-
-	task, _ := performKnowledgeHandlerRequest[knowledgeIngestionResponse](
-		t,
-		managerRouter,
-		http.MethodPost,
-		fmt.Sprintf(
-			"/api/projects/OPS/knowledge/versions/%s/ingestions",
+			"/api/projects/OPS/knowledge/articles/%s/document?version_id=%s",
+			article.ID,
 			version.ID,
 		),
-		queueKnowledgeIngestionRequest{ParserKey: "pdf"},
-		http.StatusCreated,
+		nil,
+		http.StatusOK,
 	)
+	if document.Data.Markdown == "" || len(document.Data.Sections) != 3 ||
+		strings.Contains(documentBody, `"object_provider"`) ||
+		strings.Contains(documentBody, `"object_store_id"`) ||
+		strings.Contains(documentBody, `"object_version_id"`) {
+		t.Fatalf("authored document response = %+v body=%s", document.Data, documentBody)
+	}
+
 	performKnowledgeHandlerRequest[json.RawMessage](
 		t,
 		managerRouter,
 		http.MethodPost,
-		fmt.Sprintf(
-			"/api/projects/OPS/knowledge/ingestions/%s/parsing",
-			task.Data.ID,
-		),
+		"/api/projects/OPS/knowledge/ingestions/not-browser-owned/parsing",
 		nil,
 		http.StatusNotFound,
 	)
@@ -251,51 +190,6 @@ func TestKnowledgeHandlerFullAdministrativeAndACLSearchFlow(
 		},
 		http.StatusNotFound,
 	)
-	workerContext, err := services.EnsureSystemProjectOperationContext(
-		context.Background(),
-		environment.operations.Scope(),
-		models.SystemActor("knowledge-ingestion-worker"),
-		"knowledge-handler-worker",
-		"knowledge-handler-worker",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := environment.knowledgeService.MarkVersionVirusScan(
-		workerContext,
-		version.ID,
-		models.VirusScanClean,
-		"scanner clean",
-	); err != nil {
-		t.Fatalf("worker records virus scan: %v", err)
-	}
-	if _, err := environment.knowledgeService.StartParsing(
-		workerContext,
-		task.Data.ID,
-	); err != nil {
-		t.Fatalf("worker starts parsing: %v", err)
-	}
-	page := 4
-	if _, err := environment.knowledgeService.StoreChunks(
-		workerContext,
-		task.Data.ID,
-		[]services.KnowledgeChunkInput{
-			{
-				PageNumber: &page,
-				Content:    "完整内部内容不可原样返回；服务恢复前检查数据库健康状态。",
-				Snippet:    "服务恢复前检查数据库健康状态。",
-				TokenCount: 18,
-			},
-		},
-	); err != nil {
-		t.Fatalf("worker stores chunks: %v", err)
-	}
-	if _, err := environment.knowledgeService.CompleteIngestion(
-		workerContext,
-		task.Data.ID,
-	); err != nil {
-		t.Fatalf("worker completes ingestion: %v", err)
-	}
 	performKnowledgeHandlerRequest[knowledgeVersionResponse](
 		t,
 		managerRouter,
@@ -344,7 +238,7 @@ func TestKnowledgeHandlerFullAdministrativeAndACLSearchFlow(
 		http.StatusOK,
 	)
 	if indexState.Data.Status != models.KnowledgeIndexReady ||
-		indexState.Data.DocumentCount != 1 {
+		indexState.Data.DocumentCount != 3 {
 		t.Fatalf("completed index state = %+v", indexState.Data)
 	}
 
@@ -369,8 +263,6 @@ func TestKnowledgeHandlerFullAdministrativeAndACLSearchFlow(
 	citation := search.Data.Items[0]
 	if citation.VersionID != version.ID ||
 		citation.DocumentVersion != version.Version ||
-		citation.PageNumber == nil ||
-		*citation.PageNumber != page ||
 		citation.ContentHash == "" ||
 		citation.Snippet == "" {
 		t.Fatalf("citation = %+v", citation)
@@ -385,20 +277,6 @@ func TestKnowledgeHandlerFullAdministrativeAndACLSearchFlow(
 			environment.index.lastSearch.Filter,
 		)
 	}
-	performKnowledgeHandlerRequest[knowledgeFeedbackResponse](
-		t,
-		agentRouter,
-		http.MethodPost,
-		fmt.Sprintf(
-			"/api/projects/OPS/knowledge/citations/%s/feedback",
-			citation.ID,
-		),
-		knowledgeFeedbackRequest{
-			Rating:  models.KnowledgeFeedbackHelpful,
-			Comment: "引用准确",
-		},
-		http.StatusCreated,
-	)
 	for role, user := range map[string]models.User{
 		"requester": environment.requester,
 		"observer":  environment.observer,
@@ -435,7 +313,316 @@ func TestKnowledgeHandlerFullAdministrativeAndACLSearchFlow(
 	)
 }
 
-func TestKnowledgeHandlerRejectsScopeActorAndURLFields(
+func TestKnowledgeHandlerDoesNotExposeAdvancedKnowledgeMutationRoutes(
+	t *testing.T,
+) {
+	environment := newKnowledgeHandlerTestEnvironment(t)
+	router := knowledgeHandlerTestRouter(environment, environment.manager)
+	for _, test := range []struct {
+		method string
+		path   string
+	}{
+		{
+			method: http.MethodPost,
+			path:   "/api/projects/OPS/knowledge/articles/article-id/versions",
+		},
+		{
+			method: http.MethodPost,
+			path: "/api/projects/OPS/knowledge/articles/article-id/" +
+				"access-grants",
+		},
+		{
+			method: http.MethodPost,
+			path: "/api/projects/OPS/knowledge/versions/version-id/" +
+				"ingestions",
+		},
+		{
+			method: http.MethodPost,
+			path: "/api/projects/OPS/knowledge/citations/citation-id/" +
+				"feedback",
+		},
+		{
+			method: http.MethodGet,
+			path:   "/api/projects/OPS/knowledge/model-policy",
+		},
+		{
+			method: http.MethodPut,
+			path:   "/api/projects/OPS/knowledge/model-policy",
+		},
+	} {
+		t.Run(test.method+"_"+test.path, func(t *testing.T) {
+			performKnowledgeHandlerRequest[json.RawMessage](
+				t,
+				router,
+				test.method,
+				test.path,
+				nil,
+				http.StatusNotFound,
+			)
+		})
+	}
+}
+
+func TestKnowledgeHandlerDirectoriesAreStrictSafeAndManagerOnly(t *testing.T) {
+	environment := newKnowledgeHandlerTestEnvironment(t)
+	managerRouter := knowledgeHandlerTestRouter(
+		environment,
+		environment.manager,
+	)
+	agentRouter := knowledgeHandlerTestRouter(
+		environment,
+		environment.agent,
+	)
+	created, _ := performKnowledgeHandlerRequest[knowledgeAuthoredResponse](
+		t,
+		managerRouter,
+		http.MethodPost,
+		"/api/projects/OPS/knowledge/articles",
+		createKnowledgeArticleRequest{
+			Key:      "directory-contract",
+			Title:    "目录契约",
+			Summary:  "安全列表",
+			Markdown: "## 现象\n\n目录契约正文。",
+		},
+		http.StatusCreated,
+	)
+	type articlePage struct {
+		Items      []knowledgeArticleResponse `json:"items"`
+		Total      int64                      `json:"total"`
+		Page       int                        `json:"page"`
+		PageSize   int                        `json:"page_size"`
+		TotalPages int                        `json:"total_pages"`
+	}
+	page, body := performKnowledgeHandlerRequest[articlePage](
+		t,
+		managerRouter,
+		http.MethodGet,
+		"/api/projects/OPS/knowledge/articles?page=1&page_size=25&sort_by=updated_at&sort_order=desc&view=manage",
+		nil,
+		http.StatusOK,
+	)
+	if page.Data.Total != 1 || len(page.Data.Items) != 1 ||
+		page.Data.Page != 1 || page.Data.PageSize != 25 ||
+		page.Data.TotalPages != 1 {
+		t.Fatalf("article directory = %+v", page.Data)
+	}
+	for _, forbidden := range []string{
+		"organization_id",
+		"project_id",
+		"created_by_id",
+		"updated_by_id",
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("article directory exposed %q: %s", forbidden, body)
+		}
+	}
+	for _, path := range []string{
+		"/api/projects/OPS/knowledge/articles?page=0",
+		"/api/projects/OPS/knowledge/articles?page_size=101",
+		"/api/projects/OPS/knowledge/articles?page_size=",
+		"/api/projects/OPS/knowledge/articles?page=1&page=2",
+		"/api/projects/OPS/knowledge/articles?unknown=value",
+		"/api/projects/OPS/knowledge/articles?status=unknown",
+		"/api/projects/OPS/knowledge/articles?view=unknown",
+		"/api/projects/OPS/knowledge/articles/" + created.Data.Article.ID +
+			"/versions?page_size=101",
+		"/api/projects/OPS/knowledge/articles/" + created.Data.Article.ID +
+			"/versions?virus_scan=unknown",
+		"/api/projects/OPS/knowledge/ingestions?page_size=101",
+		"/api/projects/OPS/knowledge/ingestions?status=unknown",
+	} {
+		performKnowledgeHandlerRequest[json.RawMessage](
+			t,
+			managerRouter,
+			http.MethodGet,
+			path,
+			nil,
+			http.StatusBadRequest,
+		)
+	}
+	type readerArticlePage struct {
+		Items []knowledgeArticleResponse `json:"items"`
+		Total int64                      `json:"total"`
+	}
+	readerPage, _ := performKnowledgeHandlerRequest[readerArticlePage](
+		t,
+		agentRouter,
+		http.MethodGet,
+		"/api/projects/OPS/knowledge/articles?page=1&page_size=25",
+		nil,
+		http.StatusOK,
+	)
+	if readerPage.Data.Total != 0 || len(readerPage.Data.Items) != 0 {
+		t.Fatalf("unpublished article leaked to project reader: %+v", readerPage.Data)
+	}
+	for _, path := range []string{
+		"/api/projects/OPS/knowledge/articles/" +
+			created.Data.Article.ID + "/versions",
+		"/api/projects/OPS/knowledge/ingestions",
+	} {
+		performKnowledgeHandlerRequest[json.RawMessage](
+			t,
+			agentRouter,
+			http.MethodGet,
+			path,
+			nil,
+			http.StatusForbidden,
+		)
+	}
+}
+
+func TestKnowledgeHandlerExplicitContributorCanManageOnlyOwnDrafts(
+	t *testing.T,
+) {
+	environment := newKnowledgeHandlerTestEnvironment(t)
+	if err := environment.db.Model(&models.ProjectMembership{}).
+		Where(
+			"project_id = ? AND user_id = ?",
+			environment.operations.ID,
+			environment.agent.ID,
+		).
+		Updates(map[string]any{
+			"knowledge_contributor": true,
+			"version":               gorm.Expr("version + 1"),
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
+	contributorRouter := knowledgeHandlerTestRouter(
+		environment,
+		environment.agent,
+	)
+	created, _ := performKnowledgeHandlerRequest[knowledgeAuthoredResponse](
+		t,
+		contributorRouter,
+		http.MethodPost,
+		"/api/projects/OPS/knowledge/articles",
+		createKnowledgeArticleRequest{
+			Key:      "agent-contribution",
+			Title:    "处理人提交的排障草稿",
+			Markdown: "## 现象\n\n连接失败。\n\n## 处理\n\n复核配置。",
+		},
+		http.StatusCreated,
+	)
+	if created.Data.Version.Status != models.KnowledgeVersionDraft {
+		t.Fatalf("contributor version = %+v", created.Data.Version)
+	}
+	type articlePage struct {
+		Items []knowledgeArticleResponse `json:"items"`
+		Total int64                      `json:"total"`
+	}
+	browse, _ := performKnowledgeHandlerRequest[articlePage](
+		t,
+		contributorRouter,
+		http.MethodGet,
+		"/api/projects/OPS/knowledge/articles?page=1&page_size=25",
+		nil,
+		http.StatusOK,
+	)
+	if browse.Data.Total != 0 {
+		t.Fatalf("contributor draft leaked into browse: %+v", browse.Data)
+	}
+	mine, _ := performKnowledgeHandlerRequest[articlePage](
+		t,
+		contributorRouter,
+		http.MethodGet,
+		"/api/projects/OPS/knowledge/articles?page=1&page_size=25&view=mine",
+		nil,
+		http.StatusOK,
+	)
+	if mine.Data.Total != 1 ||
+		len(mine.Data.Items) != 1 ||
+		mine.Data.Items[0].ID != created.Data.Article.ID ||
+		mine.Data.Items[0].HasUnpublishedDraft == nil ||
+		!*mine.Data.Items[0].HasUnpublishedDraft ||
+		mine.Data.Items[0].LatestDraftAt == nil ||
+		mine.Data.Items[0].LatestDraftVersion == nil ||
+		*mine.Data.Items[0].LatestDraftVersion != 1 {
+		t.Fatalf("contributor personal view = %+v", mine.Data)
+	}
+	performKnowledgeHandlerRequest[json.RawMessage](
+		t,
+		contributorRouter,
+		http.MethodGet,
+		"/api/projects/OPS/knowledge/articles?view=manage",
+		nil,
+		http.StatusForbidden,
+	)
+	performKnowledgeHandlerRequest[json.RawMessage](
+		t,
+		contributorRouter,
+		http.MethodGet,
+		"/api/projects/OPS/knowledge/articles?view=invalid",
+		nil,
+		http.StatusBadRequest,
+	)
+	revised, _ := performKnowledgeHandlerRequest[knowledgeAuthoredResponse](
+		t,
+		contributorRouter,
+		http.MethodPost,
+		"/api/projects/OPS/knowledge/articles/"+
+			created.Data.Article.ID+"/drafts",
+		createKnowledgeArticleDraftRequest{
+			Title:    "处理人补充后的草稿",
+			Markdown: "## 补充\n\n复核前补充验证步骤。",
+		},
+		http.StatusCreated,
+	)
+	if revised.Data.Version.Version != 2 {
+		t.Fatalf("contributor revision = %+v", revised.Data.Version)
+	}
+	latestDraft, _ := performKnowledgeHandlerRequest[knowledgeDocumentResponse](
+		t,
+		contributorRouter,
+		http.MethodGet,
+		"/api/projects/OPS/knowledge/articles/"+
+			created.Data.Article.ID+
+			"/document?prefer_latest_draft=true",
+		nil,
+		http.StatusOK,
+	)
+	if latestDraft.Data.Version.ID != revised.Data.Version.ID ||
+		!strings.Contains(
+			latestDraft.Data.Markdown,
+			"复核前补充验证步骤",
+		) {
+		t.Fatalf("contributor latest draft = %+v", latestDraft.Data)
+	}
+	performKnowledgeHandlerRequest[json.RawMessage](
+		t,
+		contributorRouter,
+		http.MethodGet,
+		"/api/projects/OPS/knowledge/articles/"+
+			created.Data.Article.ID+
+			"/document?version_id="+revised.Data.Version.ID+
+			"&prefer_latest_draft=true",
+		nil,
+		http.StatusBadRequest,
+	)
+	performKnowledgeHandlerRequest[json.RawMessage](
+		t,
+		contributorRouter,
+		http.MethodPost,
+		"/api/projects/OPS/knowledge/versions/"+
+			revised.Data.Version.ID+"/publication",
+		nil,
+		http.StatusForbidden,
+	)
+	performKnowledgeHandlerRequest[json.RawMessage](
+		t,
+		contributorRouter,
+		http.MethodPost,
+		"/api/projects/OPS/knowledge/articles",
+		json.RawMessage(`{
+			"key":"agent-public-grant",
+			"title":"不允许自行指定发布范围",
+			"markdown":"## body\n",
+			"grant_project_access":true
+		}`),
+		http.StatusBadRequest,
+	)
+}
+
+func TestKnowledgeHandlerRejectsScopeAndActorFields(
 	t *testing.T,
 ) {
 	environment := newKnowledgeHandlerTestEnvironment(t)
@@ -467,26 +654,6 @@ func TestKnowledgeHandlerRejectsScopeActorAndURLFields(
 	if count != 0 {
 		t.Fatalf("articles created after scope injection = %d", count)
 	}
-
-	withURL := json.RawMessage(`{
-		"title":"URL 字段注入",
-		"object_provider":"s3",
-		"object_bucket":"knowledge",
-		"object_key":"projects/ops/file.pdf",
-		"file_name":"file.pdf",
-		"mime_type":"application/pdf",
-		"size_bytes":10,
-		"content_hash":"` + strings.Repeat("a", 64) + `",
-		"object_storage_url":"https://attacker.example/file.pdf"
-	}`)
-	performKnowledgeHandlerRequest[json.RawMessage](
-		t,
-		router,
-		http.MethodPost,
-		"/api/projects/OPS/knowledge/articles/missing/versions",
-		withURL,
-		http.StatusBadRequest,
-	)
 }
 
 type knowledgeHandlerTestIndex struct {
@@ -543,6 +710,24 @@ func (index *knowledgeHandlerTestIndex) ReplaceProject(
 	return nil
 }
 
+func (index *knowledgeHandlerTestIndex) ReplaceProjectBatches(
+	ctx context.Context,
+	_ services.HybridIndexReplacement,
+	source services.HybridIndexBatchSource,
+) error {
+	index.documents = nil
+	for {
+		batch, err := source(ctx)
+		if err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+		index.documents = append(index.documents, batch...)
+	}
+}
+
 type knowledgeHandlerTestProvider struct{}
 
 func (knowledgeHandlerTestProvider) Descriptor() services.ModelProviderDescriptor {
@@ -561,10 +746,14 @@ func (knowledgeHandlerTestProvider) Generate(
 
 func (knowledgeHandlerTestProvider) Embed(
 	_ context.Context,
-	_ services.ModelEmbedRequest,
+	request services.ModelEmbedRequest,
 ) (services.ModelEmbedResponse, error) {
+	embeddings := make([][]float32, 0, len(request.Inputs))
+	for range request.Inputs {
+		embeddings = append(embeddings, []float32{0.1, 0.2})
+	}
 	return services.ModelEmbedResponse{
-		Embeddings: [][]float32{{0.1, 0.2}},
+		Embeddings: embeddings,
 	}, nil
 }
 
@@ -605,6 +794,8 @@ func newKnowledgeHandlerTestEnvironment(
 		&models.Queue{},
 		&models.KnowledgeArticle{},
 		&models.KnowledgeArticleVersion{},
+		&models.KnowledgeObjectWriteIntent{},
+		&models.KnowledgeSourceLink{},
 		&models.KnowledgeArticleACL{},
 		&models.KnowledgeIngestionTask{},
 		&models.KnowledgeChunk{},
@@ -741,6 +932,10 @@ func newKnowledgeHandlerTestEnvironment(
 		t.Fatal(err)
 	}
 	index := &knowledgeHandlerTestIndex{}
+	storage, err := services.NewLocalAttachmentStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	knowledgeService, err := services.NewKnowledgeService(
 		db,
 		services.KnowledgeServiceDependencies{
@@ -750,6 +945,8 @@ func newKnowledgeHandlerTestEnvironment(
 			ModelProviders: map[string]services.ModelProvider{
 				"handler-provider": knowledgeHandlerTestProvider{},
 			},
+			AttachmentStorage: storage,
+			StorageBucket:     "chronodesk-managed",
 		},
 	)
 	if err != nil {

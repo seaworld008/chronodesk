@@ -141,16 +141,7 @@ def test_admin_provisions_e2e_principal_and_explicit_policy(
     assert "compatibility_user_id" not in row
     _assert_no_secret_fields(row)
 
-    response = protocol_harness.request(
-        "GET",
-        protocol_harness.agent_admin_path(
-            f"service-principals/{full_service_principal.client_id}/policies"
-        ),
-        headers=protocol_harness.admin_read_headers(),
-    )
-    assert_status(response, 200, operation="读取 E2E Agent 策略")
-    policies = envelope_data(response, operation="读取 E2E Agent 策略")
-    assert isinstance(policies, list)
+    policies = protocol_harness.policy_rows(full_service_principal)
     policy = next(
         (
             item

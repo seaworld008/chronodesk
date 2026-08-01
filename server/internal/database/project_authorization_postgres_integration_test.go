@@ -626,6 +626,7 @@ func TestPostgresHumanPreflightToMembershipCommandsCannotDeadlock(
 					ctx,
 					scope,
 					targetID,
+					1,
 				)
 				return err
 			},
@@ -643,8 +644,9 @@ func TestPostgresHumanPreflightToMembershipCommandsCannotDeadlock(
 					ctx,
 					scope,
 					services.UpsertProjectMembershipInput{
-						UserID: targetID,
-						Role:   models.ProjectRoleManager,
+						UserID:          targetID,
+						Role:            models.ProjectRoleManager,
+						ExpectedVersion: 1,
 					},
 				)
 				return err
@@ -659,6 +661,154 @@ func TestPostgresHumanPreflightToMembershipCommandsCannotDeadlock(
 				testCase.command,
 			)
 		})
+	}
+}
+
+func TestPostgresConcurrentMembershipUpdatesAcceptExactlyOneVersion(
+	t *testing.T,
+) {
+	db, _, project, suffix := openPostgresAuthorizationBarrierFixture(
+		t,
+		"membership_version",
+	)
+	administrator := models.User{
+		Username:     "membership-version-admin-" + suffix,
+		Email:        "membership-version-admin-" + suffix + "@example.test",
+		PasswordHash: "test-only-password-hash",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	target := models.User{
+		Username:     "membership-version-target-" + suffix,
+		Email:        "membership-version-target-" + suffix + "@example.test",
+		PasswordHash: "test-only-password-hash",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&administrator).Error; err != nil {
+		t.Fatalf("create project administrator: %v", err)
+	}
+	if err := db.Create(&target).Error; err != nil {
+		t.Fatalf("create membership target: %v", err)
+	}
+	if err := db.Create(&[]models.ProjectMembership{
+		{
+			ProjectID: project.ID,
+			UserID:    administrator.ID,
+			Role:      models.ProjectRoleAdmin,
+			IsActive:  true,
+			Version:   1,
+		},
+		{
+			ProjectID:            project.ID,
+			UserID:               target.ID,
+			Role:                 models.ProjectRoleRequester,
+			IsActive:             true,
+			KnowledgeContributor: true,
+			Version:              1,
+		},
+	}).Error; err != nil {
+		t.Fatalf("create project memberships: %v", err)
+	}
+
+	_, commandDatabases, _ :=
+		openPostgresAuthorizationCommandDatabases(t, db, 2)
+	commandServices := make([]*services.ProjectService, 2)
+	for index := range commandServices {
+		commandService, err := services.NewProjectService(
+			commandDatabases[index],
+			postgresAuthorizationEventAppender{},
+		)
+		if err != nil {
+			t.Fatalf("create membership service %d: %v", index, err)
+		}
+		commandServices[index] = commandService
+	}
+	operationContext, err := services.WithOperationContext(
+		context.Background(),
+		services.OperationContext{
+			Scope:  project.Scope(),
+			Actor:  models.HumanActor(administrator.ID),
+			Source: services.SourceProtocolHumanREST,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type updateResult struct {
+		membership *services.ProjectMembershipView
+		err        error
+	}
+	start := make(chan struct{})
+	results := make(chan updateResult, 2)
+	roles := []models.ProjectRole{
+		models.ProjectRoleAgent,
+		models.ProjectRoleObserver,
+	}
+	for index := range commandServices {
+		service := commandServices[index]
+		role := roles[index]
+		go func() {
+			<-start
+			membership, updateErr := service.UpsertHumanMembership(
+				operationContext,
+				project.Scope(),
+				services.UpsertProjectMembershipInput{
+					UserID:          target.ID,
+					Role:            role,
+					ExpectedVersion: 1,
+				},
+			)
+			results <- updateResult{
+				membership: membership,
+				err:        updateErr,
+			}
+		}()
+	}
+	close(start)
+
+	successes := 0
+	conflicts := 0
+	for range commandServices {
+		select {
+		case result := <-results:
+			switch {
+			case result.err == nil:
+				successes++
+				if result.membership == nil ||
+					result.membership.Version != 2 {
+					t.Fatalf("successful membership = %+v", result.membership)
+				}
+			case errors.Is(
+				result.err,
+				services.ErrProjectMembershipVersionConflict,
+			):
+				conflicts++
+			default:
+				t.Fatalf("concurrent membership update error = %v", result.err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent membership updates did not complete")
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf(
+			"concurrent results successes=%d conflicts=%d, want 1/1",
+			successes,
+			conflicts,
+		)
+	}
+	var persisted models.ProjectMembership
+	if err := db.Where(
+		"project_id = ? AND user_id = ?",
+		project.ID,
+		target.ID,
+	).Take(&persisted).Error; err != nil {
+		t.Fatalf("load persisted membership: %v", err)
+	}
+	if persisted.Version != 2 || !persisted.IsActive {
+		t.Fatalf("persisted membership = %+v", persisted)
 	}
 }
 

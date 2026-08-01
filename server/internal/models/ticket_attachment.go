@@ -59,10 +59,12 @@ type TicketAttachment struct {
 	Extension    string         `json:"extension" gorm:"size:20"`
 
 	// 存储信息
-	StoragePath  string `json:"storage_path" gorm:"size:500;not null"`
-	StorageType  string `json:"storage_type" gorm:"size:20;default:'local'"` // local, s3, gcs, azure
-	StorageUrl   string `json:"storage_url" gorm:"size:500"`
-	ThumbnailUrl string `json:"thumbnail_url" gorm:"size:500"`
+	StoragePath      string `json:"storage_path" gorm:"size:500;not null"`
+	StorageType      string `json:"storage_type" gorm:"size:20;default:'local'"` // local, s3, gcs, azure
+	StorageStoreID   string `json:"-" gorm:"size:63;not null;default:'';index"`
+	StorageVersionID string `json:"-" gorm:"size:1024;not null;default:''"`
+	StorageUrl       string `json:"storage_url" gorm:"size:500"`
+	ThumbnailUrl     string `json:"thumbnail_url" gorm:"size:500"`
 
 	// 访问控制
 	IsPublic      bool   `json:"is_public" gorm:"default:false"`

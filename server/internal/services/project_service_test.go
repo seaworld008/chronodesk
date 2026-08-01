@@ -128,6 +128,123 @@ func seedProjectAccessFixture(
 	return organization, unit, project, user
 }
 
+func TestHumanProjectDirectoryIsBoundedStableAndMembershipScoped(t *testing.T) {
+	db := newProjectServiceTestDB(t)
+	organization, unit, _, user := seedProjectAccessFixture(t, db)
+	projects := make([]models.Project, 0, 152)
+	for index := 0; index < 152; index++ {
+		status := models.ProjectStatusActive
+		if index == 151 {
+			status = models.ProjectStatusArchived
+		}
+		projects = append(projects, models.Project{
+			OrganizationID: organization.ID,
+			BusinessUnitID: unit.ID,
+			Key:            models.ProjectKey(fmt.Sprintf("P%03d", index)),
+			Name:           fmt.Sprintf("Project %03d", index),
+			Status:         status,
+		})
+	}
+	if err := db.Create(&projects).Error; err != nil {
+		t.Fatal(err)
+	}
+	memberships := make([]models.ProjectMembership, 0, len(projects))
+	for _, project := range projects {
+		memberships = append(memberships, models.ProjectMembership{
+			ProjectID: project.ID,
+			UserID:    user.ID,
+			Role:      models.ProjectRoleObserver,
+			IsActive:  true,
+		})
+	}
+	if err := db.Create(&memberships).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.ProjectMembership{}).
+		Where("id = ?", memberships[150].ID).
+		Update("is_active", false).Error; err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewProjectService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := service.ListHumanProjectPage(
+		context.Background(),
+		user.ID,
+		HumanProjectListRequest{
+			Page: 1, PageSize: 100, SortBy: "name", SortOrder: "asc",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Total != 150 || first.TotalPages != 2 ||
+		len(first.Items) != 100 || first.Items[0].Project.Key != "P000" {
+		t.Fatalf("unexpected first authorized project page: %+v", first)
+	}
+	second, err := service.ListHumanProjectPage(
+		context.Background(),
+		user.ID,
+		HumanProjectListRequest{
+			Page: 2, PageSize: 100, SortBy: "name", SortOrder: "asc",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Items) != 50 ||
+		second.Items[0].Project.Key != "P100" ||
+		second.Items[49].Project.Key != "P149" {
+		t.Fatalf("unexpected second authorized project page: %+v", second)
+	}
+	for _, item := range append(first.Items, second.Items...) {
+		if item.Project.Key == "P150" || item.Project.Key == "P151" {
+			t.Fatalf("inactive membership or archived project leaked: %+v", item)
+		}
+	}
+
+	filtered, err := service.ListHumanProjectPage(
+		context.Background(),
+		user.ID,
+		HumanProjectListRequest{
+			Page:      1,
+			PageSize:  25,
+			Search:    "project 14",
+			SortBy:    "key",
+			SortOrder: "desc",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filtered.Total != 10 ||
+		filtered.Items[0].Project.Key != "P149" ||
+		filtered.Items[9].Project.Key != "P140" {
+		t.Fatalf("unexpected filtered authorized project page: %+v", filtered)
+	}
+
+	for _, invalid := range []HumanProjectListRequest{
+		{Page: 0, PageSize: 25, SortBy: "name", SortOrder: "asc"},
+		{Page: 1, PageSize: 101, SortBy: "name", SortOrder: "asc"},
+		{Page: 1, PageSize: 25, SortBy: "id", SortOrder: "asc"},
+		{Page: 1, PageSize: 25, SortBy: "name", SortOrder: "sideways"},
+		{
+			Page: 1, PageSize: 25, SortBy: "name", SortOrder: "asc",
+			Search: strings.Repeat("界", 101),
+		},
+	} {
+		if _, listErr := service.ListHumanProjectPage(
+			context.Background(),
+			user.ID,
+			invalid,
+		); !errors.Is(listErr, ErrDirectoryListQuery) {
+			t.Fatalf("invalid request %+v error = %v", invalid, listErr)
+		}
+	}
+}
+
 func TestProjectDirectoryPagesAreBoundedStableAndScopeChecked(t *testing.T) {
 	db := newProjectServiceTestDB(t)
 	organization, unit, project, actor := seedProjectAccessFixture(t, db)
@@ -171,10 +288,24 @@ func TestProjectDirectoryPagesAreBoundedStableAndScopeChecked(t *testing.T) {
 	if err := db.Create(&memberships).Error; err != nil {
 		t.Fatal(err)
 	}
+	team := models.Team{
+		ProjectID: project.ID,
+		Key:       "support",
+		Name:      "一线支持",
+		Status:    models.TeamStatusActive,
+	}
+	if err := db.Create(&team).Error; err != nil {
+		t.Fatal(err)
+	}
 	queues := make([]models.Queue, 0, 152)
 	for index := 0; index < 151; index++ {
+		var teamID *uint
+		if index == 0 {
+			teamID = &team.ID
+		}
 		queues = append(queues, models.Queue{
 			ProjectID: project.ID,
+			TeamID:    teamID,
 			Key:       models.QueueKey(fmt.Sprintf("queue-%03d", index)),
 			Name:      fmt.Sprintf("Queue %03d", index),
 			Status:    models.QueueStatusActive,
@@ -248,6 +379,15 @@ func TestProjectDirectoryPagesAreBoundedStableAndScopeChecked(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(firstQueues.Items) == 0 ||
+		firstQueues.Items[0].Team == nil ||
+		firstQueues.Items[0].Team.PublicID != team.PublicID ||
+		firstQueues.Items[0].Team.Name != team.Name {
+		t.Fatalf(
+			"queue team projection was not loaded safely: %+v",
+			firstQueues.Items,
+		)
 	}
 	queueRequest.Page = 2
 	secondQueues, err := service.ListQueuePage(
@@ -1545,7 +1685,8 @@ func TestProjectAccessUsesExplicitProjectRoleJSONField(t *testing.T) {
 				Name: "must-not-leak",
 			},
 		},
-		Role: models.ProjectRoleManager,
+		Role:                     models.ProjectRoleManager,
+		CanCreateKnowledgeDrafts: true,
 		AuthorizationSnapshot: AuthorizationSnapshot{
 			Scope:             models.ProjectScope{OrganizationID: 5, ProjectID: 3},
 			ActorType:         models.ActorTypeHuman,
@@ -1562,6 +1703,16 @@ func TestProjectAccessUsesExplicitProjectRoleJSONField(t *testing.T) {
 	}
 	if _, exists := fields["project_role"]; !exists {
 		t.Fatalf("ProjectAccess JSON is missing project_role: %s", payload)
+	}
+	var canCreateKnowledgeDrafts bool
+	if err := json.Unmarshal(
+		fields["can_create_knowledge_drafts"],
+		&canCreateKnowledgeDrafts,
+	); err != nil || !canCreateKnowledgeDrafts {
+		t.Fatalf(
+			"ProjectAccess JSON is missing effective knowledge draft capability: %s",
+			payload,
+		)
 	}
 	if _, exists := fields["role"]; exists {
 		t.Fatalf("ProjectAccess JSON retained ambiguous role: %s", payload)
@@ -1804,6 +1955,7 @@ func TestProjectServiceMembershipAdministrationUsesStableSubjectLockOrder(
 				scopedContext,
 				project.Scope(),
 				target.ID,
+				1,
 			)
 			return deactivateErr
 		},
@@ -1824,6 +1976,7 @@ func TestProjectServiceMembershipAdministrationUsesStableSubjectLockOrder(
 		ctx,
 		project.Scope(),
 		target.ID,
+		1,
 	)
 	if err != nil {
 		t.Fatalf("deactivate membership with stable locks: %v", err)
@@ -1884,6 +2037,7 @@ func TestProjectServiceMembershipAdministrationUsesStableSubjectLockOrder(
 		reverseContext,
 		project.Scope(),
 		requester.ID,
+		1,
 	); !errors.Is(err, ErrProjectAccessDenied) {
 		t.Fatalf("revoked administrator reverse mutation error = %v", err)
 	}
@@ -2121,6 +2275,7 @@ func TestProjectServiceMembershipGrantAndRevocationAreScopedAndAudited(
 		ctx,
 		project.Scope(),
 		target.ID,
+		granted.Version,
 	)
 	if err != nil {
 		t.Fatalf("revoke membership: %v", err)
@@ -2131,6 +2286,288 @@ func TestProjectServiceMembershipGrantAndRevocationAreScopedAndAudited(
 	if events.calls != 2 ||
 		events.input.Type != "io.chronodesk.project.membership.deactivated.v1" {
 		t.Fatalf("unexpected revocation event: %+v", events.input)
+	}
+}
+
+func TestProjectServiceMembershipVersionPreconditionRejectsStaleWrites(
+	t *testing.T,
+) {
+	db := newProjectServiceTestDB(t)
+	_, _, project, administrator := seedProjectAccessFixture(t, db)
+	if err := db.Create(&models.ProjectMembership{
+		ProjectID: project.ID,
+		UserID:    administrator.ID,
+		Role:      models.ProjectRoleAdmin,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	target := models.User{
+		Username:     "membership-version-target",
+		Email:        "membership-version-target@example.test",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&target).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.ProjectMembership{
+		ProjectID:            project.ID,
+		UserID:               target.ID,
+		Role:                 models.ProjectRoleRequester,
+		IsActive:             true,
+		KnowledgeContributor: true,
+		Version:              5,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	events := &projectEventAppenderStub{}
+	service, err := NewProjectService(db, events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := WithOperationContext(context.Background(), OperationContext{
+		Scope:  project.Scope(),
+		Actor:  models.HumanActor(administrator.ID),
+		Source: SourceProtocolHumanREST,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	disabled := false
+	updated, err := service.UpsertHumanMembership(
+		ctx,
+		project.Scope(),
+		UpsertProjectMembershipInput{
+			UserID:               target.ID,
+			Role:                 models.ProjectRoleObserver,
+			KnowledgeContributor: &disabled,
+			ExpectedVersion:      5,
+		},
+	)
+	if err != nil {
+		t.Fatalf("update membership with current version: %v", err)
+	}
+	if updated.Version != 6 ||
+		updated.Role != models.ProjectRoleObserver ||
+		updated.KnowledgeContributor {
+		t.Fatalf("updated membership = %+v", updated)
+	}
+
+	enabled := true
+	if _, err := service.UpsertHumanMembership(
+		ctx,
+		project.Scope(),
+		UpsertProjectMembershipInput{
+			UserID:               target.ID,
+			Role:                 models.ProjectRoleRequester,
+			KnowledgeContributor: &enabled,
+			ExpectedVersion:      5,
+		},
+	); !errors.Is(err, ErrProjectMembershipVersionConflict) {
+		t.Fatalf("stale update error = %v, want version conflict", err)
+	}
+	if _, err := service.DeactivateHumanMembership(
+		ctx,
+		project.Scope(),
+		target.ID,
+		5,
+	); !errors.Is(err, ErrProjectMembershipVersionConflict) {
+		t.Fatalf("stale revocation error = %v, want version conflict", err)
+	}
+
+	var persisted models.ProjectMembership
+	if err := db.Where(
+		"project_id = ? AND user_id = ?",
+		project.ID,
+		target.ID,
+	).Take(&persisted).Error; err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Version != 6 ||
+		persisted.Role != models.ProjectRoleObserver ||
+		persisted.KnowledgeContributor ||
+		!persisted.IsActive ||
+		events.calls != 1 {
+		t.Fatalf(
+			"stale writes changed membership=%+v events=%d",
+			persisted,
+			events.calls,
+		)
+	}
+
+	missingTarget := models.User{
+		Username:     "membership-version-missing",
+		Email:        "membership-version-missing@example.test",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&missingTarget).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UpsertHumanMembership(
+		ctx,
+		project.Scope(),
+		UpsertProjectMembershipInput{
+			UserID:          missingTarget.ID,
+			Role:            models.ProjectRoleObserver,
+			ExpectedVersion: 1,
+		},
+	); !errors.Is(err, ErrProjectMembershipVersionConflict) {
+		t.Fatalf(
+			"non-zero create precondition error = %v, want version conflict",
+			err,
+		)
+	}
+}
+
+func TestProjectServiceKnowledgeContributorGrantIsExplicitAndFailClosed(
+	t *testing.T,
+) {
+	db := newProjectServiceTestDB(t)
+	_, _, project, administrator := seedProjectAccessFixture(t, db)
+	if err := db.Create(&models.ProjectMembership{
+		ProjectID: project.ID,
+		UserID:    administrator.ID,
+		Role:      models.ProjectRoleAdmin,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	target := models.User{
+		Username:     "knowledge-contributor-target",
+		Email:        "knowledge-contributor-target@example.test",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&target).Error; err != nil {
+		t.Fatal(err)
+	}
+	events := &projectEventAppenderStub{}
+	service, err := NewProjectService(db, events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	administratorContext, err := WithOperationContext(
+		context.Background(),
+		OperationContext{
+			Scope:  project.Scope(),
+			Actor:  models.HumanActor(administrator.ID),
+			Source: SourceProtocolHumanREST,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabled := true
+	granted, err := service.UpsertHumanMembership(
+		administratorContext,
+		project.Scope(),
+		UpsertProjectMembershipInput{
+			UserID:               target.ID,
+			Role:                 models.ProjectRoleRequester,
+			KnowledgeContributor: &enabled,
+		},
+	)
+	if err != nil {
+		t.Fatalf("grant knowledge contribution: %v", err)
+	}
+	if !granted.KnowledgeContributor {
+		t.Fatalf("knowledge contribution was not persisted: %+v", granted)
+	}
+	eventData, ok := events.input.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("membership event data type = %T", events.input.Data)
+	}
+	if value, ok := eventData["knowledge_contributor"].(bool); !ok || !value {
+		t.Fatalf("membership event omitted contribution grant: %+v", events.input.Data)
+	}
+	var access *ProjectAccess
+	err = scopeddb.WithProjectScopeContextTransaction(
+		administratorContext,
+		db,
+		project.Scope(),
+		func(scopedContext context.Context) error {
+			var revalidateErr error
+			access, revalidateErr = service.RevalidateHumanProjectAccess(
+				scopedContext,
+				project.Scope(),
+				target.ID,
+			)
+			return revalidateErr
+		},
+	)
+	if err != nil {
+		t.Fatalf("revalidate contributor access: %v", err)
+	}
+	if !access.CanCreateKnowledgeDrafts ||
+		!access.AuthorizationSnapshot.MembershipKnowledgeContributor {
+		t.Fatalf("contributor capability/snapshot = %+v", access)
+	}
+
+	deactivated, err := service.DeactivateHumanMembership(
+		administratorContext,
+		project.Scope(),
+		target.ID,
+		granted.Version,
+	)
+	if err != nil {
+		t.Fatalf("deactivate contributor: %v", err)
+	}
+	reactivated, err := service.UpsertHumanMembership(
+		administratorContext,
+		project.Scope(),
+		UpsertProjectMembershipInput{
+			UserID:          target.ID,
+			Role:            models.ProjectRoleRequester,
+			ExpectedVersion: deactivated.Version,
+		},
+	)
+	if err != nil {
+		t.Fatalf("reactivate contributor: %v", err)
+	}
+	if reactivated.KnowledgeContributor {
+		t.Fatalf("reactivation retained a stale contribution grant: %+v", reactivated)
+	}
+
+	manager, err := service.UpsertHumanMembership(
+		administratorContext,
+		project.Scope(),
+		UpsertProjectMembershipInput{
+			UserID:               target.ID,
+			Role:                 models.ProjectRoleManager,
+			KnowledgeContributor: &enabled,
+			ExpectedVersion:      reactivated.Version,
+		},
+	)
+	if err != nil {
+		t.Fatalf("promote manager: %v", err)
+	}
+	if manager.KnowledgeContributor {
+		t.Fatalf("manager stored redundant contribution grant: %+v", manager)
+	}
+	err = scopeddb.WithProjectScopeContextTransaction(
+		administratorContext,
+		db,
+		project.Scope(),
+		func(scopedContext context.Context) error {
+			var revalidateErr error
+			access, revalidateErr = service.RevalidateHumanProjectAccess(
+				scopedContext,
+				project.Scope(),
+				target.ID,
+			)
+			return revalidateErr
+		},
+	)
+	if err != nil {
+		t.Fatalf("revalidate manager access: %v", err)
+	}
+	if !access.CanCreateKnowledgeDrafts {
+		t.Fatalf("manager lost role-derived draft capability: %+v", access)
 	}
 }
 
@@ -2289,6 +2726,7 @@ func TestProjectServiceProtectsLastActiveProjectAdministrator(t *testing.T) {
 		ctx,
 		project.Scope(),
 		administrator.ID,
+		1,
 	); !errors.Is(err, ErrLastProjectAdministrator) {
 		t.Fatalf("last administrator revocation error = %v", err)
 	}

@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -36,7 +37,7 @@ func TestAdminUserListUsesAllowlistedOrderColumns(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := NewAdminUserService(db).GetUserList(
+	_, err := NewAdminUserService(db).GetUserList(
 		context.Background(),
 		&UserListRequest{
 			Page:     1,
@@ -45,11 +46,8 @@ func TestAdminUserListUsesAllowlistedOrderColumns(t *testing.T) {
 			Order:    "asc; DROP TABLE users",
 		},
 	)
-	if err != nil {
+	if !errors.Is(err, ErrInvalidAdminUserListQuery) {
 		t.Fatalf("GetUserList() error = %v", err)
-	}
-	if len(result.Items) != 2 || result.Items[0].ID != newer.ID {
-		t.Fatalf("fallback order IDs = %#v, want newest first", result.Items)
 	}
 
 	var count int64

@@ -1358,6 +1358,7 @@ func adminOutboxDestinationType(value string) string {
 		"notification",
 		"sla",
 		"sla_escalation",
+		"attachment_upload",
 		"attachment_cleanup",
 		"attachment_staging_cleanup",
 		"a2a_push",
@@ -1380,6 +1381,8 @@ func adminOutboxDestinationLabel(value string) string {
 		return "系统通知"
 	case "sla", "sla_escalation":
 		return "SLA 升级"
+	case "attachment_upload":
+		return "附件入库"
 	case "attachment_cleanup":
 		return "附件清理"
 	case "attachment_staging_cleanup":

@@ -276,6 +276,9 @@ func (s *AgentNativeService) buildHumanTicketUpdate(
 		)
 	}
 	if request.AgentContext != nil {
+		if err := validateAgentContext(request.AgentContext); err != nil {
+			return nil, nil, false, err
+		}
 		add(
 			"agent_context",
 			current.AgentContext.Data(),

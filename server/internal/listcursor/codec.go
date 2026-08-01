@@ -23,8 +23,9 @@ const (
 )
 
 var (
-	ErrInvalidCursor = errors.New("list cursor is invalid")
-	ErrInvalidKey    = errors.New("list cursor key is invalid")
+	ErrInvalidCursor   = errors.New("list cursor is invalid")
+	ErrInvalidKey      = errors.New("list cursor key is invalid")
+	strictRawURLBase64 = base64.RawURLEncoding.Strict()
 )
 
 type Codec struct {
@@ -70,11 +71,11 @@ func (c *Codec) Decode(raw string, target any) error {
 	if len(parts) != 2 {
 		return ErrInvalidCursor
 	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	payload, err := strictRawURLBase64.DecodeString(parts[0])
 	if err != nil || len(payload) == 0 || len(payload) > maxPayloadBytes {
 		return ErrInvalidCursor
 	}
-	providedMAC, err := base64.RawURLEncoding.DecodeString(parts[1])
+	providedMAC, err := strictRawURLBase64.DecodeString(parts[1])
 	if err != nil || len(providedMAC) != sha256.Size {
 		return ErrInvalidCursor
 	}

@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -72,8 +73,8 @@ func TestGetNotificationsPreservesRecipientAndReadFilters(t *testing.T) {
 			RecipientID: &firstUser.ID,
 			IsRead:      &unread,
 			Limit:       10,
-			OrderBy:     "created_at; DROP TABLE notifications",
-			OrderDir:    "desc; DROP TABLE users",
+			OrderBy:     "created_at",
+			OrderDir:    "desc",
 		},
 	)
 	if err != nil {
@@ -86,6 +87,17 @@ func TestGetNotificationsPreservesRecipientAndReadFilters(t *testing.T) {
 		items[0].RecipientID != firstUser.ID ||
 		items[0].IsRead {
 		t.Fatalf("object-level notification filter leaked data: %+v", items[0])
+	}
+	if _, _, err := service.GetNotifications(
+		ctx,
+		&models.NotificationFilter{
+			RecipientID: &firstUser.ID,
+			Limit:       10,
+			OrderBy:     "created_at; DROP TABLE notifications",
+			OrderDir:    "desc; DROP TABLE users",
+		},
+	); !errors.Is(err, ErrInvalidNotificationListQuery) {
+		t.Fatalf("invalid notification sort error = %v", err)
 	}
 
 	items, total, err = service.GetNotifications(

@@ -3,6 +3,8 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -173,7 +175,9 @@ func TestGetLoginHistoryFilters(t *testing.T) {
 	}
 }
 
-func TestGetLoginHistory_InvalidOrderByFallsBackToDefault(t *testing.T) {
+func TestGetLoginHistoryRejectsInvalidOrderInsteadOfSilentlyFallingBack(
+	t *testing.T,
+) {
 	db := setupUserServiceLoginHistoryDB(t)
 	svc := NewUserService(db)
 
@@ -218,15 +222,94 @@ func TestGetLoginHistory_InvalidOrderByFallsBackToDefault(t *testing.T) {
 		OrderBy:  "login_time; DROP TABLE login_histories;--",
 		Order:    "ASC INVALID",
 	}
-	records, _, err := svc.GetLoginHistory(context.Background(), userID, req)
+	if _, _, err := svc.GetLoginHistory(
+		context.Background(),
+		userID,
+		req,
+	); !errors.Is(err, ErrInvalidLoginHistoryQuery) {
+		t.Fatalf("invalid login history order error = %v", err)
+	}
+}
+
+func TestGetLoginHistoryIsBoundedAndUsesStableIDTieBreaker(t *testing.T) {
+	db := setupUserServiceLoginHistoryDB(t)
+	svc := NewUserService(db)
+	userID := seedUserForLoginHistory(t, db, "stable@example.com")
+	now := time.Now().UTC().Truncate(time.Second)
+	rows := make([]models.LoginHistory, 0, 150)
+	for index := 0; index < 150; index++ {
+		rows = append(rows, models.LoginHistory{
+			UserID:      userID,
+			Username:    "stable",
+			Email:       "stable@example.com",
+			IPAddress:   "127.0.0.1",
+			LoginTime:   now,
+			LoginStatus: models.LoginStatusSuccess,
+			LoginMethod: models.LoginMethodPassword,
+			SessionID:   fmt.Sprintf("stable-%03d", index),
+		})
+	}
+	if err := db.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	first, total, err := svc.GetLoginHistory(
+		context.Background(),
+		userID,
+		&models.LoginHistoryRequest{
+			Page: 1, PageSize: 100, OrderBy: "login_time", Order: "desc",
+		},
+	)
 	if err != nil {
-		t.Fatalf("GetLoginHistory returned error: %v", err)
+		t.Fatal(err)
 	}
-	if len(records) != 2 {
-		t.Fatalf("expected 2 records, got %d", len(records))
+	second, secondTotal, err := svc.GetLoginHistory(
+		context.Background(),
+		userID,
+		&models.LoginHistoryRequest{
+			Page: 2, PageSize: 100, OrderBy: "login_time", Order: "desc",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if records[0].SessionID != "sort-sess-new" {
-		t.Fatalf("expected fallback default order by latest login_time first, got %s", records[0].SessionID)
+	if total != 150 || secondTotal != 150 ||
+		len(first) != 100 || len(second) != 50 {
+		t.Fatalf(
+			"login history pages len=%d/%d total=%d/%d",
+			len(first),
+			len(second),
+			total,
+			secondTotal,
+		)
+	}
+	seen := make(map[uint]struct{}, 150)
+	var previous uint
+	for _, record := range append(first, second...) {
+		if _, duplicate := seen[record.ID]; duplicate {
+			t.Fatalf("duplicate login history ID %d", record.ID)
+		}
+		seen[record.ID] = struct{}{}
+		if previous != 0 && previous <= record.ID {
+			t.Fatalf(
+				"login history ID order is not descending: %d then %d",
+				previous,
+				record.ID,
+			)
+		}
+		previous = record.ID
+	}
+	for _, request := range []*models.LoginHistoryRequest{
+		{Page: 0, PageSize: 25, OrderBy: "login_time", Order: "desc"},
+		{Page: 1, PageSize: 101, OrderBy: "login_time", Order: "desc"},
+		{Page: math.MaxInt, PageSize: 100, OrderBy: "login_time", Order: "desc"},
+	} {
+		if _, _, err := svc.GetLoginHistory(
+			context.Background(),
+			userID,
+			request,
+		); !errors.Is(err, ErrInvalidLoginHistoryQuery) {
+			t.Fatalf("invalid request %+v error = %v", request, err)
+		}
 	}
 }
 

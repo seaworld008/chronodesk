@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"regexp"
 	"strings"
 	"time"
 	"unicode"
 
+	"github.com/seaworld008/chronodesk/server/internal/listcursor"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
@@ -27,12 +29,16 @@ var (
 	ErrIntegrationManagementImmutable    = models.ErrPublishedMappingImmutable
 	ErrIntegrationTargetCommandDenied    = errors.New("integration target command is not allowed")
 	ErrIntegrationManagementUnavailable  = errors.New("integration management dependency is unavailable")
+	ErrIntegrationListCursorInvalid      = errors.New("integration list cursor is invalid")
 )
 
 const (
 	integrationManagementMaximumJSONBytes = 2 << 20
-	integrationManagementDefaultPageSize  = 20
+	integrationManagementDefaultPageSize  = 25
 	integrationManagementMaximumPageSize  = 100
+	integrationManagementMaximumSearch    = 200
+	integrationDomainEventCursorVersion   = 1
+	integrationDomainEventSortVersion     = "created_at_desc_id_desc.v1"
 )
 
 var (
@@ -53,9 +59,10 @@ var (
 // recovery. Organization, Project and Actor values are accepted only through a
 // validated OperationContext.
 type IntegrationManagementService struct {
-	db    *gorm.DB
-	inbox *IntegrationInboxService
-	now   func() time.Time
+	db                *gorm.DB
+	inbox             *IntegrationInboxService
+	domainEventCursor *listcursor.Codec
+	now               func() time.Time
 }
 
 func NewIntegrationManagementService(
@@ -72,9 +79,38 @@ func NewIntegrationManagementService(
 	}, nil
 }
 
+// ConfigureCursorSigningKey enables scope-bound, tamper-evident timeline
+// cursors. The application root must pass an existing server secret; cursor
+// material is derived for this list purpose and is never returned to callers.
+func (service *IntegrationManagementService) ConfigureCursorSigningKey(
+	rootKey []byte,
+) error {
+	if service == nil {
+		return ErrIntegrationManagementUnavailable
+	}
+	codec, err := listcursor.NewCodec(
+		rootKey,
+		"integration-domain-events.v1",
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"%w: configure integration cursor",
+			ErrIntegrationManagementUnavailable,
+		)
+	}
+	service.domainEventCursor = codec
+	return nil
+}
+
 type IntegrationListOptions struct {
-	Page     int
-	PageSize int
+	Page               int
+	PageSize           int
+	SortBy             string
+	SortOrder          string
+	Search             string
+	Status             string
+	Type               string
+	ConnectionPublicID string
 }
 
 type IntegrationPage[T any] struct {
@@ -82,6 +118,38 @@ type IntegrationPage[T any] struct {
 	Total    int64 `json:"total"`
 	Page     int   `json:"page"`
 	PageSize int   `json:"page_size"`
+}
+
+type IntegrationDomainEventCursorOptions struct {
+	Cursor    string
+	Limit     int
+	EventType string
+	Search    string
+}
+
+type IntegrationCursorPage[T any] struct {
+	Items      []T    `json:"items"`
+	NextCursor string `json:"next_cursor"`
+	HasMore    bool   `json:"has_more"`
+}
+
+type integrationListSpec struct {
+	defaultSortBy    string
+	defaultSortOrder string
+	sortColumns      map[string]string
+	statuses         map[string]struct{}
+	types            map[string]struct{}
+}
+
+type integrationDomainEventCursorPayload struct {
+	Version        int       `json:"v"`
+	OrganizationID uint      `json:"organization_id"`
+	ProjectID      uint      `json:"project_id"`
+	Limit          int       `json:"limit"`
+	FilterDigest   string    `json:"filter_digest"`
+	SortVersion    string    `json:"sort_version"`
+	CreatedAt      time.Time `json:"created_at"`
+	ID             string    `json:"id"`
 }
 
 type ConnectorDefinitionInput struct {
@@ -223,24 +291,73 @@ func (service *IntegrationManagementService) ListConnectorDefinitions(
 	if err != nil {
 		return IntegrationPage[models.ConnectorDefinition]{}, err
 	}
-	page, pageSize := normalizeIntegrationPage(options)
+	options, err = normalizeIntegrationListOptions(
+		options,
+		integrationListSpec{
+			defaultSortBy:    "created_at",
+			defaultSortOrder: "desc",
+			sortColumns: map[string]string{
+				"created_at": "created_at",
+				"updated_at": "updated_at",
+				"name":       "name",
+				"status":     "status",
+				"id":         "id",
+			},
+			statuses: integrationStringSet(
+				string(models.ConnectorDefinitionStatusActive),
+				string(models.ConnectorDefinitionStatusDisabled),
+				string(models.ConnectorDefinitionStatusArchived),
+			),
+		},
+	)
+	if err != nil {
+		return IntegrationPage[models.ConnectorDefinition]{}, err
+	}
 	query := scopedIntegrationQuery(
 		service.db.WithContext(ctx).Model(&models.ConnectorDefinition{}),
 		operation.Scope,
 	)
+	if options.Status != "" {
+		query = query.Where("status = ?", options.Status)
+	}
+	if options.Search != "" {
+		pattern := "%" + escapeIntegrationLike(options.Search) + "%"
+		query = query.Where(
+			"(LOWER(key) LIKE LOWER(?) ESCAPE '\\' OR LOWER(name) LIKE LOWER(?) ESCAPE '\\' OR LOWER(kind) LIKE LOWER(?) ESCAPE '\\')",
+			pattern,
+			pattern,
+			pattern,
+		)
+	}
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
 		return IntegrationPage[models.ConnectorDefinition]{}, err
 	}
 	var items []models.ConnectorDefinition
-	if err := query.Order("created_at DESC, id DESC").
-		Offset((page - 1) * pageSize).
-		Limit(pageSize).
+	listQuery := query.Select(
+		"id, public_id, created_at, updated_at, organization_id, project_id, key, name, description, kind, direction, status, signature_scheme, default_replay_window_seconds, " +
+			"CASE WHEN configuration_schema IS NULL OR CAST(configuration_schema AS TEXT) IN ('', '{}', 'null') THEN NULL ELSE '{}' END AS configuration_schema, " +
+			"CASE WHEN mapping_schema IS NULL OR CAST(mapping_schema AS TEXT) IN ('', '{}', 'null') THEN NULL ELSE '{}' END AS mapping_schema",
+	)
+	if err := applyIntegrationOrder(listQuery, options, integrationListSpec{
+		sortColumns: map[string]string{
+			"created_at": "created_at",
+			"updated_at": "updated_at",
+			"name":       "name",
+			"status":     "status",
+			"id":         "id",
+		},
+	}).
+		Offset(integrationPageOffset(options)).
+		Limit(options.PageSize).
 		Find(&items).Error; err != nil {
 		return IntegrationPage[models.ConnectorDefinition]{}, err
 	}
 	return IntegrationPage[models.ConnectorDefinition]{
-		Items: items, Total: total, Page: page, PageSize: pageSize,
+		Items:    items,
+		Total:    total,
+		Page:     options.Page,
+		PageSize: options.PageSize,
 	}, nil
 }
 
@@ -386,24 +503,63 @@ func (service *IntegrationManagementService) ListConnections(
 	if err != nil {
 		return IntegrationPage[models.Connection]{}, err
 	}
-	page, pageSize := normalizeIntegrationPage(options)
+	spec := integrationListSpec{
+		defaultSortBy:    "created_at",
+		defaultSortOrder: "desc",
+		sortColumns: map[string]string{
+			"created_at": "created_at",
+			"updated_at": "updated_at",
+			"name":       "name",
+			"status":     "status",
+			"id":         "id",
+		},
+		statuses: integrationStringSet(
+			string(models.ConnectionStatusActive),
+			string(models.ConnectionStatusInactive),
+			string(models.ConnectionStatusError),
+			string(models.ConnectionStatusArchived),
+		),
+	}
+	options, err = normalizeIntegrationListOptions(options, spec)
+	if err != nil {
+		return IntegrationPage[models.Connection]{}, err
+	}
 	query := scopedIntegrationQuery(
 		service.db.WithContext(ctx).Model(&models.Connection{}),
 		operation.Scope,
 	)
+	if options.Status != "" {
+		query = query.Where("status = ?", options.Status)
+	}
+	if options.Search != "" {
+		pattern := "%" + escapeIntegrationLike(options.Search) + "%"
+		query = query.Where(
+			"(LOWER(key) LIKE LOWER(?) ESCAPE '\\' OR LOWER(name) LIKE LOWER(?) ESCAPE '\\')",
+			pattern,
+			pattern,
+		)
+	}
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
 		return IntegrationPage[models.Connection]{}, err
 	}
 	var items []models.Connection
-	if err := query.Order("created_at DESC, id DESC").
-		Offset((page - 1) * pageSize).
-		Limit(pageSize).
+	listQuery := query.Select(
+		"id, public_id, created_at, updated_at, organization_id, project_id, connector_definition_id, key, name, description, status, replay_window_seconds, actor_type, actor_id, actor_credential_id, last_verified_at, last_error_at, last_error_code, " +
+			"CASE WHEN configuration IS NULL OR CAST(configuration AS TEXT) IN ('', '{}', 'null') THEN NULL ELSE '{}' END AS configuration, " +
+			"CASE WHEN TRIM(verification_key_ref) = '' THEN '' ELSE 'configured' END AS verification_key_ref",
+	)
+	if err := applyIntegrationOrder(listQuery, options, spec).
+		Offset(integrationPageOffset(options)).
+		Limit(options.PageSize).
 		Find(&items).Error; err != nil {
 		return IntegrationPage[models.Connection]{}, err
 	}
 	return IntegrationPage[models.Connection]{
-		Items: items, Total: total, Page: page, PageSize: pageSize,
+		Items:    items,
+		Total:    total,
+		Page:     options.Page,
+		PageSize: options.PageSize,
 	}, nil
 }
 
@@ -661,24 +817,61 @@ func (service *IntegrationManagementService) ListMappings(
 	).First(&connection).Error; err != nil {
 		return IntegrationPage[models.MappingVersion]{}, integrationManagementLookupError(err)
 	}
-	page, pageSize := normalizeIntegrationPage(options)
+	spec := integrationListSpec{
+		defaultSortBy:    "created_at",
+		defaultSortOrder: "desc",
+		sortColumns: map[string]string{
+			"created_at": "created_at",
+			"updated_at": "updated_at",
+			"key":        "key",
+			"version":    "version",
+			"status":     "status",
+			"id":         "id",
+		},
+		statuses: integrationStringSet(
+			string(models.MappingVersionStatusDraft),
+			string(models.MappingVersionStatusPublished),
+			string(models.MappingVersionStatusRetired),
+		),
+	}
+	options, err = normalizeIntegrationListOptions(options, spec)
+	if err != nil {
+		return IntegrationPage[models.MappingVersion]{}, err
+	}
 	query := scopedIntegrationQuery(
 		service.db.WithContext(ctx).Model(&models.MappingVersion{}),
 		operation.Scope,
 	).Where("connection_id = ?", connection.ID)
+	if options.Status != "" {
+		query = query.Where("status = ?", options.Status)
+	}
+	if options.Search != "" {
+		pattern := "%" + escapeIntegrationLike(options.Search) + "%"
+		query = query.Where(
+			"(LOWER(key) LIKE LOWER(?) ESCAPE '\\' OR LOWER(target_command) LIKE LOWER(?) ESCAPE '\\')",
+			pattern,
+			pattern,
+		)
+	}
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
 		return IntegrationPage[models.MappingVersion]{}, err
 	}
 	var items []models.MappingVersion
-	if err := query.Order("key ASC, version DESC, id DESC").
-		Offset((page - 1) * pageSize).
-		Limit(pageSize).
+	listQuery := query.Select(
+		"id, public_id, created_at, updated_at, organization_id, project_id, connection_id, key, version, status, target_command, definition_digest, published_at, published_by_type, published_by_id",
+	)
+	if err := applyIntegrationOrder(listQuery, options, spec).
+		Offset(integrationPageOffset(options)).
+		Limit(options.PageSize).
 		Find(&items).Error; err != nil {
 		return IntegrationPage[models.MappingVersion]{}, err
 	}
 	return IntegrationPage[models.MappingVersion]{
-		Items: items, Total: total, Page: page, PageSize: pageSize,
+		Items:    items,
+		Total:    total,
+		Page:     options.Page,
+		PageSize: options.PageSize,
 	}, nil
 }
 
@@ -766,15 +959,19 @@ type IntegrationConnectionHealth struct {
 }
 
 type IntegrationOverview struct {
-	ConnectorDefinitions int64                         `json:"connector_definitions"`
-	Connections          int64                         `json:"connections"`
-	ActiveConnections    int64                         `json:"active_connections"`
-	ErrorConnections     int64                         `json:"error_connections"`
-	OpenConflicts        int64                         `json:"open_conflicts"`
-	OpenDeadLetters      int64                         `json:"open_dead_letters"`
-	RunningSyncRuns      int64                         `json:"running_sync_runs"`
-	RecentRuns           []models.SyncRun              `json:"recent_runs"`
-	ConnectionHealth     []IntegrationConnectionHealth `json:"connection_health"`
+	ConnectorDefinitions      int64                         `json:"connector_definitions"`
+	Connections               int64                         `json:"connections"`
+	ActiveConnections         int64                         `json:"active_connections"`
+	ErrorConnections          int64                         `json:"error_connections"`
+	OpenConflicts             int64                         `json:"open_conflicts"`
+	OpenDeadLetters           int64                         `json:"open_dead_letters"`
+	RunningSyncRuns           int64                         `json:"running_sync_runs"`
+	RecentRuns                []models.SyncRun              `json:"recent_runs"`
+	RecentRunsLimit           int                           `json:"recent_runs_limit"`
+	RecentRunsTruncated       bool                          `json:"recent_runs_truncated"`
+	ConnectionHealth          []IntegrationConnectionHealth `json:"connection_health"`
+	ConnectionHealthLimit     int                           `json:"connection_health_limit"`
+	ConnectionHealthTruncated bool                          `json:"connection_health_truncated"`
 }
 
 func (service *IntegrationManagementService) Overview(
@@ -812,23 +1009,62 @@ func (service *IntegrationManagementService) Overview(
 			return nil, err
 		}
 	}
+	const recentRunLimit = 20
 	if err := scopedIntegrationQuery(
 		service.db.WithContext(ctx),
 		scope,
+	).Select(
+		"id, public_id, created_at, updated_at, organization_id, project_id, connection_id, run_key, direction, status, started_at, finished_at, processed_count, succeeded_count, failed_count, conflict_count, error_code",
 	).Order("created_at DESC, id DESC").
-		Limit(20).
+		Limit(recentRunLimit + 1).
 		Find(&overview.RecentRuns).Error; err != nil {
 		return nil, err
+	}
+	overview.RecentRunsLimit = recentRunLimit
+	overview.RecentRunsTruncated = len(overview.RecentRuns) > recentRunLimit
+	if overview.RecentRunsTruncated {
+		overview.RecentRuns = overview.RecentRuns[:recentRunLimit]
 	}
 	var connections []models.Connection
 	if err := scopedIntegrationQuery(
 		service.db.WithContext(ctx),
 		scope,
+	).Select(
+		"id, public_id, created_at, updated_at, organization_id, project_id, key, name, status, last_verified_at, last_error_at, last_error_code",
 	).Where("status <> ?", models.ConnectionStatusArchived).
 		Order("name ASC, id ASC").
-		Limit(integrationManagementMaximumPageSize).
+		Limit(integrationManagementMaximumPageSize + 1).
 		Find(&connections).Error; err != nil {
 		return nil, err
+	}
+	overview.ConnectionHealthLimit = integrationManagementMaximumPageSize
+	overview.ConnectionHealthTruncated =
+		len(connections) > integrationManagementMaximumPageSize
+	if overview.ConnectionHealthTruncated {
+		connections = connections[:integrationManagementMaximumPageSize]
+	}
+	connectionIDs := make([]uint, 0, len(connections))
+	for index := range connections {
+		connectionIDs = append(connectionIDs, connections[index].ID)
+	}
+	latestRuns := make(map[uint]models.SyncRun, len(connectionIDs))
+	if len(connectionIDs) > 0 {
+		ranked := scopedIntegrationQuery(
+			service.db.WithContext(ctx).Model(&models.SyncRun{}),
+			scope,
+		).Select(
+			"id, public_id, created_at, updated_at, organization_id, project_id, connection_id, run_key, direction, status, started_at, finished_at, processed_count, succeeded_count, failed_count, conflict_count, error_code, ROW_NUMBER() OVER (PARTITION BY connection_id ORDER BY created_at DESC, id DESC) AS integration_row_number",
+		).Where("connection_id IN ?", connectionIDs)
+		var runs []models.SyncRun
+		if err := service.db.WithContext(ctx).
+			Table("(?) AS ranked_sync_runs", ranked).
+			Where("integration_row_number = 1").
+			Find(&runs).Error; err != nil {
+			return nil, err
+		}
+		for index := range runs {
+			latestRuns[runs[index].ConnectionID] = runs[index]
+		}
 	}
 	overview.ConnectionHealth = make([]IntegrationConnectionHealth, 0, len(connections))
 	for _, connection := range connections {
@@ -841,17 +1077,8 @@ func (service *IntegrationManagementService) Overview(
 			LastErrorAt:   connection.LastErrorAt,
 			LastErrorCode: connection.LastErrorCode,
 		}
-		var run models.SyncRun
-		runErr := scopedIntegrationQuery(
-			service.db.WithContext(ctx),
-			scope,
-		).Where("connection_id = ?", connection.ID).
-			Order("created_at DESC, id DESC").
-			First(&run).Error
-		if runErr == nil {
+		if run, ok := latestRuns[connection.ID]; ok {
 			health.LastRun = &run
-		} else if !errors.Is(runErr, gorm.ErrRecordNotFound) {
-			return nil, runErr
 		}
 		overview.ConnectionHealth = append(overview.ConnectionHealth, health)
 	}
@@ -866,24 +1093,68 @@ func (service *IntegrationManagementService) ListConflicts(
 	if err != nil {
 		return IntegrationPage[models.IntegrationConflict]{}, err
 	}
-	page, pageSize := normalizeIntegrationPage(options)
+	spec := integrationListSpec{
+		defaultSortBy:    "created_at",
+		defaultSortOrder: "desc",
+		sortColumns: map[string]string{
+			"created_at": "created_at",
+			"updated_at": "updated_at",
+			"status":     "status",
+			"type":       "type",
+			"id":         "id",
+		},
+		statuses: integrationStringSet(
+			string(models.IntegrationConflictStatusOpen),
+			string(models.IntegrationConflictStatusResolved),
+			string(models.IntegrationConflictStatusIgnored),
+		),
+		types: integrationStringSet(
+			string(models.IntegrationConflictMessageIdentityReuse),
+			string(models.IntegrationConflictExternalLinkMismatch),
+			string(models.IntegrationConflictInternalLinkCollision),
+		),
+	}
+	options, err = normalizeIntegrationListOptions(options, spec)
+	if err != nil {
+		return IntegrationPage[models.IntegrationConflict]{}, err
+	}
 	query := scopedIntegrationQuery(
 		service.db.WithContext(ctx).Model(&models.IntegrationConflict{}),
 		operation.Scope,
 	)
+	if options.Status != "" {
+		query = query.Where("status = ?", options.Status)
+	}
+	if options.Type != "" {
+		query = query.Where("type = ?", options.Type)
+	}
+	if options.Search != "" {
+		pattern := "%" + escapeIntegrationLike(options.Search) + "%"
+		query = query.Where(
+			"(LOWER(external_resource_type) LIKE LOWER(?) ESCAPE '\\' OR LOWER(external_resource_id) LIKE LOWER(?) ESCAPE '\\')",
+			pattern,
+			pattern,
+		)
+	}
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
 		return IntegrationPage[models.IntegrationConflict]{}, err
 	}
 	var items []models.IntegrationConflict
-	if err := query.Order("created_at DESC, id DESC").
-		Offset((page - 1) * pageSize).
-		Limit(pageSize).
+	listQuery := query.Select(
+		"id, public_id, created_at, updated_at, organization_id, project_id, connection_id, inbox_message_id, conflict_key, type, status, external_resource_type, external_resource_id, existing_internal_resource_type, existing_internal_resource_id, incoming_internal_resource_type, incoming_internal_resource_id, resolved_at, resolved_by_type, resolved_by_id",
+	)
+	if err := applyIntegrationOrder(listQuery, options, spec).
+		Offset(integrationPageOffset(options)).
+		Limit(options.PageSize).
 		Find(&items).Error; err != nil {
 		return IntegrationPage[models.IntegrationConflict]{}, err
 	}
 	return IntegrationPage[models.IntegrationConflict]{
-		Items: items, Total: total, Page: page, PageSize: pageSize,
+		Items:    items,
+		Total:    total,
+		Page:     options.Page,
+		PageSize: options.PageSize,
 	}, nil
 }
 
@@ -976,24 +1247,470 @@ func (service *IntegrationManagementService) ListDeadLetters(
 	if err != nil {
 		return IntegrationPage[models.DeadLetter]{}, err
 	}
-	page, pageSize := normalizeIntegrationPage(options)
+	spec := integrationListSpec{
+		defaultSortBy:    "created_at",
+		defaultSortOrder: "desc",
+		sortColumns: map[string]string{
+			"created_at":    "created_at",
+			"updated_at":    "updated_at",
+			"status":        "status",
+			"attempt_count": "attempt_count",
+			"id":            "id",
+		},
+		statuses: integrationStringSet(
+			string(models.DeadLetterStatusOpen),
+			string(models.DeadLetterStatusRequeued),
+			string(models.DeadLetterStatusResolved),
+		),
+	}
+	options, err = normalizeIntegrationListOptions(options, spec)
+	if err != nil {
+		return IntegrationPage[models.DeadLetter]{}, err
+	}
 	query := scopedIntegrationQuery(
 		service.db.WithContext(ctx).Model(&models.DeadLetter{}),
 		operation.Scope,
 	)
+	if options.Status != "" {
+		query = query.Where("status = ?", options.Status)
+	}
+	if options.Search != "" {
+		pattern := "%" + escapeIntegrationLike(options.Search) + "%"
+		query = query.Where(
+			"LOWER(reason_code) LIKE LOWER(?) ESCAPE '\\'",
+			pattern,
+		)
+	}
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
 		return IntegrationPage[models.DeadLetter]{}, err
 	}
 	var items []models.DeadLetter
-	if err := query.Order("created_at DESC, id DESC").
-		Offset((page - 1) * pageSize).
-		Limit(pageSize).
+	listQuery := query.Select(
+		"id, public_id, created_at, updated_at, organization_id, project_id, connection_id, inbox_message_id, status, reason_code, attempt_count, next_attempt_at, resolved_at, resolved_by_type, resolved_by_id",
+	)
+	if err := applyIntegrationOrder(listQuery, options, spec).
+		Offset(integrationPageOffset(options)).
+		Limit(options.PageSize).
 		Find(&items).Error; err != nil {
 		return IntegrationPage[models.DeadLetter]{}, err
 	}
 	return IntegrationPage[models.DeadLetter]{
-		Items: items, Total: total, Page: page, PageSize: pageSize,
+		Items:    items,
+		Total:    total,
+		Page:     options.Page,
+		PageSize: options.PageSize,
+	}, nil
+}
+
+func (service *IntegrationManagementService) ListInboxMessages(
+	ctx context.Context,
+	options IntegrationListOptions,
+) (IntegrationPage[models.InboxMessage], error) {
+	operation, err := integrationManagementOperation(ctx)
+	if err != nil {
+		return IntegrationPage[models.InboxMessage]{}, err
+	}
+	spec := integrationListSpec{
+		defaultSortBy:    "received_at",
+		defaultSortOrder: "desc",
+		sortColumns: map[string]string{
+			"received_at":  "received_at",
+			"processed_at": "processed_at",
+			"status":       "status",
+			"created_at":   "created_at",
+			"id":           "id",
+		},
+		statuses: integrationStringSet(
+			string(models.InboxMessageStatusProcessing),
+			string(models.InboxMessageStatusCompleted),
+			string(models.InboxMessageStatusConflict),
+			string(models.InboxMessageStatusDeadLetter),
+		),
+	}
+	options, err = normalizeIntegrationListOptions(options, spec)
+	if err != nil {
+		return IntegrationPage[models.InboxMessage]{}, err
+	}
+	query := scopedIntegrationQuery(
+		service.db.WithContext(ctx).Model(&models.InboxMessage{}),
+		operation.Scope,
+	)
+	if options.ConnectionPublicID != "" {
+		connectionID, lookupErr := service.integrationConnectionID(
+			ctx,
+			operation.Scope,
+			options.ConnectionPublicID,
+		)
+		if lookupErr != nil {
+			return IntegrationPage[models.InboxMessage]{}, lookupErr
+		}
+		query = query.Where("connection_id = ?", connectionID)
+	}
+	if options.Status != "" {
+		query = query.Where("status = ?", options.Status)
+	}
+	if options.Search != "" {
+		pattern := "%" + escapeIntegrationLike(options.Search) + "%"
+		query = query.Where(
+			"(LOWER(external_message_id) LIKE LOWER(?) ESCAPE '\\' OR LOWER(external_resource_type) LIKE LOWER(?) ESCAPE '\\' OR LOWER(external_resource_id) LIKE LOWER(?) ESCAPE '\\')",
+			pattern,
+			pattern,
+			pattern,
+		)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return IntegrationPage[models.InboxMessage]{}, err
+	}
+	var items []models.InboxMessage
+	listQuery := query.Select(
+		"id, public_id, created_at, updated_at, organization_id, project_id, connection_id, mapping_version_id, external_message_id, external_resource_type, external_resource_id, signed_at, received_at, content_type, payload_digest, status, processed_at",
+	)
+	if err := applyIntegrationOrder(listQuery, options, spec).
+		Offset(integrationPageOffset(options)).
+		Limit(options.PageSize).
+		Find(&items).Error; err != nil {
+		return IntegrationPage[models.InboxMessage]{}, err
+	}
+	return IntegrationPage[models.InboxMessage]{
+		Items:    items,
+		Total:    total,
+		Page:     options.Page,
+		PageSize: options.PageSize,
+	}, nil
+}
+
+func (service *IntegrationManagementService) ListInboxReceipts(
+	ctx context.Context,
+	inboxMessagePublicID string,
+	options IntegrationListOptions,
+) (IntegrationPage[models.InboxReceipt], error) {
+	operation, err := integrationManagementOperation(ctx)
+	if err != nil {
+		return IntegrationPage[models.InboxReceipt]{}, err
+	}
+	inboxMessagePublicID = strings.TrimSpace(inboxMessagePublicID)
+	if inboxMessagePublicID == "" || len(inboxMessagePublicID) > 64 {
+		return IntegrationPage[models.InboxReceipt]{},
+			ErrIntegrationManagementInvalidInput
+	}
+	var message models.InboxMessage
+	if err := scopedIntegrationQuery(
+		service.db.WithContext(ctx),
+		operation.Scope,
+	).Where("public_id = ?", inboxMessagePublicID).
+		First(&message).Error; err != nil {
+		return IntegrationPage[models.InboxReceipt]{},
+			integrationManagementLookupError(err)
+	}
+	spec := integrationListSpec{
+		defaultSortBy:    "created_at",
+		defaultSortOrder: "desc",
+		sortColumns: map[string]string{
+			"created_at":   "created_at",
+			"processed_at": "processed_at",
+			"status":       "status",
+			"id":           "id",
+		},
+		statuses: integrationStringSet(
+			string(models.InboxReceiptStatusApplied),
+			string(models.InboxReceiptStatusNoop),
+		),
+	}
+	options, err = normalizeIntegrationListOptions(options, spec)
+	if err != nil {
+		return IntegrationPage[models.InboxReceipt]{}, err
+	}
+	query := scopedIntegrationQuery(
+		service.db.WithContext(ctx).Model(&models.InboxReceipt{}),
+		operation.Scope,
+	).Where("inbox_message_id = ?", message.ID)
+	if options.Status != "" {
+		query = query.Where("status = ?", options.Status)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return IntegrationPage[models.InboxReceipt]{}, err
+	}
+	var items []models.InboxReceipt
+	listQuery := query.Select(
+		"id, public_id, created_at, organization_id, project_id, connection_id, inbox_message_id, status, resource_type, resource_id, resource_version, event_id, operation_id, actor_type, actor_id, processed_at",
+	)
+	if err := applyIntegrationOrder(listQuery, options, spec).
+		Offset(integrationPageOffset(options)).
+		Limit(options.PageSize).
+		Find(&items).Error; err != nil {
+		return IntegrationPage[models.InboxReceipt]{}, err
+	}
+	return IntegrationPage[models.InboxReceipt]{
+		Items:    items,
+		Total:    total,
+		Page:     options.Page,
+		PageSize: options.PageSize,
+	}, nil
+}
+
+func (service *IntegrationManagementService) ListSyncRuns(
+	ctx context.Context,
+	options IntegrationListOptions,
+) (IntegrationPage[models.SyncRun], error) {
+	operation, err := integrationManagementOperation(ctx)
+	if err != nil {
+		return IntegrationPage[models.SyncRun]{}, err
+	}
+	spec := integrationListSpec{
+		defaultSortBy:    "created_at",
+		defaultSortOrder: "desc",
+		sortColumns: map[string]string{
+			"created_at":  "created_at",
+			"updated_at":  "updated_at",
+			"started_at":  "started_at",
+			"finished_at": "finished_at",
+			"status":      "status",
+			"id":          "id",
+		},
+		statuses: integrationStringSet(
+			string(models.SyncRunStatusPending),
+			string(models.SyncRunStatusRunning),
+			string(models.SyncRunStatusSucceeded),
+			string(models.SyncRunStatusFailed),
+			string(models.SyncRunStatusConflict),
+			string(models.SyncRunStatusCancelled),
+		),
+		types: integrationStringSet(
+			string(models.SyncDirectionInbound),
+			string(models.SyncDirectionOutbound),
+		),
+	}
+	options, err = normalizeIntegrationListOptions(options, spec)
+	if err != nil {
+		return IntegrationPage[models.SyncRun]{}, err
+	}
+	query := scopedIntegrationQuery(
+		service.db.WithContext(ctx).Model(&models.SyncRun{}),
+		operation.Scope,
+	)
+	if options.ConnectionPublicID != "" {
+		connectionID, lookupErr := service.integrationConnectionID(
+			ctx,
+			operation.Scope,
+			options.ConnectionPublicID,
+		)
+		if lookupErr != nil {
+			return IntegrationPage[models.SyncRun]{}, lookupErr
+		}
+		query = query.Where("connection_id = ?", connectionID)
+	}
+	if options.Status != "" {
+		query = query.Where("status = ?", options.Status)
+	}
+	if options.Type != "" {
+		query = query.Where("direction = ?", options.Type)
+	}
+	if options.Search != "" {
+		pattern := "%" + escapeIntegrationLike(options.Search) + "%"
+		query = query.Where(
+			"(LOWER(run_key) LIKE LOWER(?) ESCAPE '\\' OR LOWER(error_code) LIKE LOWER(?) ESCAPE '\\')",
+			pattern,
+			pattern,
+		)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return IntegrationPage[models.SyncRun]{}, err
+	}
+	var items []models.SyncRun
+	listQuery := query.Select(
+		"id, public_id, created_at, updated_at, organization_id, project_id, connection_id, run_key, direction, status, started_at, finished_at, processed_count, succeeded_count, failed_count, conflict_count, error_code",
+	)
+	if err := applyIntegrationOrder(listQuery, options, spec).
+		Offset(integrationPageOffset(options)).
+		Limit(options.PageSize).
+		Find(&items).Error; err != nil {
+		return IntegrationPage[models.SyncRun]{}, err
+	}
+	return IntegrationPage[models.SyncRun]{
+		Items:    items,
+		Total:    total,
+		Page:     options.Page,
+		PageSize: options.PageSize,
+	}, nil
+}
+
+func (service *IntegrationManagementService) ListOutboxDeliveries(
+	ctx context.Context,
+	options IntegrationListOptions,
+) (IntegrationPage[models.OutboxDelivery], error) {
+	operation, err := integrationManagementOperation(ctx)
+	if err != nil {
+		return IntegrationPage[models.OutboxDelivery]{}, err
+	}
+	spec := integrationListSpec{
+		defaultSortBy:    "created_at",
+		defaultSortOrder: "desc",
+		sortColumns: map[string]string{
+			"created_at":      "created_at",
+			"updated_at":      "updated_at",
+			"status":          "status",
+			"next_attempt_at": "next_attempt_at",
+			"id":              "id",
+		},
+		statuses: integrationStringSet(
+			string(models.OutboxDeliveryPending),
+			string(models.OutboxDeliveryProcessing),
+			string(models.OutboxDeliverySucceeded),
+			string(models.OutboxDeliveryFailed),
+			string(models.OutboxDeliveryDead),
+		),
+	}
+	options, err = normalizeIntegrationListOptions(options, spec)
+	if err != nil {
+		return IntegrationPage[models.OutboxDelivery]{}, err
+	}
+	query := scopedIntegrationQuery(
+		service.db.WithContext(ctx).Model(&models.OutboxDelivery{}),
+		operation.Scope,
+	)
+	if options.Status != "" {
+		query = query.Where("status = ?", options.Status)
+	}
+	if options.Type != "" {
+		query = query.Where("destination_type = ?", options.Type)
+	}
+	if options.Search != "" {
+		pattern := "%" + escapeIntegrationLike(options.Search) + "%"
+		query = query.Where(
+			"(LOWER(event_id) LIKE LOWER(?) ESCAPE '\\' OR LOWER(destination_type) LIKE LOWER(?) ESCAPE '\\')",
+			pattern,
+			pattern,
+		)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return IntegrationPage[models.OutboxDelivery]{}, err
+	}
+	var items []models.OutboxDelivery
+	listQuery := query.Select(
+		"id, created_at, updated_at, organization_id, project_id, event_id, destination_type, status, attempts, max_attempts, next_attempt_at, last_error, delivered_at",
+	)
+	if err := applyIntegrationOrder(listQuery, options, spec).
+		Offset(integrationPageOffset(options)).
+		Limit(options.PageSize).
+		Find(&items).Error; err != nil {
+		return IntegrationPage[models.OutboxDelivery]{}, err
+	}
+	return IntegrationPage[models.OutboxDelivery]{
+		Items:    items,
+		Total:    total,
+		Page:     options.Page,
+		PageSize: options.PageSize,
+	}, nil
+}
+
+func (service *IntegrationManagementService) ListDomainEvents(
+	ctx context.Context,
+	options IntegrationDomainEventCursorOptions,
+) (IntegrationCursorPage[models.DomainEvent], error) {
+	operation, err := integrationManagementOperation(ctx)
+	if err != nil {
+		return IntegrationCursorPage[models.DomainEvent]{}, err
+	}
+	if service.domainEventCursor == nil {
+		return IntegrationCursorPage[models.DomainEvent]{},
+			ErrIntegrationManagementUnavailable
+	}
+	options.EventType = strings.TrimSpace(options.EventType)
+	options.Search = strings.TrimSpace(options.Search)
+	if options.Limit == 0 {
+		options.Limit = integrationManagementDefaultPageSize
+	}
+	if options.Limit < 1 ||
+		options.Limit > integrationManagementMaximumPageSize ||
+		len(options.EventType) > 255 ||
+		len(options.Search) > integrationManagementMaximumSearch ||
+		containsIntegrationControl(options.EventType) ||
+		containsIntegrationControl(options.Search) {
+		return IntegrationCursorPage[models.DomainEvent]{},
+			ErrIntegrationManagementInvalidInput
+	}
+	filterDigest := integrationDomainEventFilterDigest(options)
+	var cursor *integrationDomainEventCursorPayload
+	if options.Cursor != "" {
+		decoded := &integrationDomainEventCursorPayload{}
+		if err := service.domainEventCursor.Decode(options.Cursor, decoded); err != nil ||
+			decoded.Version != integrationDomainEventCursorVersion ||
+			decoded.OrganizationID != operation.Scope.OrganizationID ||
+			decoded.ProjectID != operation.Scope.ProjectID ||
+			decoded.Limit != options.Limit ||
+			decoded.FilterDigest != filterDigest ||
+			decoded.SortVersion != integrationDomainEventSortVersion ||
+			decoded.CreatedAt.IsZero() ||
+			strings.TrimSpace(decoded.ID) == "" {
+			return IntegrationCursorPage[models.DomainEvent]{},
+				ErrIntegrationListCursorInvalid
+		}
+		cursor = decoded
+	}
+	query := scopedIntegrationQuery(
+		service.db.WithContext(ctx).Model(&models.DomainEvent{}),
+		operation.Scope,
+	)
+	if options.EventType != "" {
+		query = query.Where("type = ?", options.EventType)
+	}
+	if options.Search != "" {
+		pattern := "%" + escapeIntegrationLike(options.Search) + "%"
+		query = query.Where(
+			"(LOWER(subject) LIKE LOWER(?) ESCAPE '\\' OR LOWER(actor_id) LIKE LOWER(?) ESCAPE '\\')",
+			pattern,
+			pattern,
+		)
+	}
+	if cursor != nil {
+		query = query.Where(
+			"created_at < ? OR (created_at = ? AND id < ?)",
+			cursor.CreatedAt,
+			cursor.CreatedAt,
+			cursor.ID,
+		)
+	}
+	var events []models.DomainEvent
+	if err := query.Select(
+		"id, created_at, organization_id, project_id, type, subject, time, actor_type, actor_id, resource_version",
+	).Order("created_at DESC, id DESC").
+		Limit(options.Limit + 1).
+		Find(&events).Error; err != nil {
+		return IntegrationCursorPage[models.DomainEvent]{}, err
+	}
+	hasMore := len(events) > options.Limit
+	if hasMore {
+		events = events[:options.Limit]
+	}
+	nextCursor := ""
+	if hasMore && len(events) > 0 {
+		last := events[len(events)-1]
+		nextCursor, err = service.domainEventCursor.Encode(
+			integrationDomainEventCursorPayload{
+				Version:        integrationDomainEventCursorVersion,
+				OrganizationID: operation.Scope.OrganizationID,
+				ProjectID:      operation.Scope.ProjectID,
+				Limit:          options.Limit,
+				FilterDigest:   filterDigest,
+				SortVersion:    integrationDomainEventSortVersion,
+				CreatedAt:      last.CreatedAt.UTC(),
+				ID:             last.ID,
+			},
+		)
+		if err != nil {
+			return IntegrationCursorPage[models.DomainEvent]{},
+				ErrIntegrationManagementUnavailable
+		}
+	}
+	return IntegrationCursorPage[models.DomainEvent]{
+		Items:      events,
+		NextCursor: nextCursor,
+		HasMore:    hasMore,
 	}, nil
 }
 
@@ -1062,19 +1779,136 @@ func scopedIntegrationQuery(
 	)
 }
 
-func normalizeIntegrationPage(options IntegrationListOptions) (int, int) {
-	page := options.Page
-	if page <= 0 {
-		page = 1
+func normalizeIntegrationListOptions(
+	options IntegrationListOptions,
+	spec integrationListSpec,
+) (IntegrationListOptions, error) {
+	if options.Page == 0 {
+		options.Page = 1
+	} else if options.Page < 1 {
+		return IntegrationListOptions{}, ErrIntegrationManagementInvalidInput
 	}
-	pageSize := options.PageSize
-	if pageSize <= 0 {
-		pageSize = integrationManagementDefaultPageSize
+	if options.PageSize == 0 {
+		options.PageSize = integrationManagementDefaultPageSize
+	} else if options.PageSize < 1 ||
+		options.PageSize > integrationManagementMaximumPageSize {
+		return IntegrationListOptions{}, ErrIntegrationManagementInvalidInput
 	}
-	if pageSize > integrationManagementMaximumPageSize {
-		pageSize = integrationManagementMaximumPageSize
+	if options.Page > math.MaxInt/options.PageSize {
+		return IntegrationListOptions{}, ErrIntegrationManagementInvalidInput
 	}
-	return page, pageSize
+	if options.SortBy == "" {
+		options.SortBy = spec.defaultSortBy
+	}
+	if _, ok := spec.sortColumns[options.SortBy]; !ok {
+		return IntegrationListOptions{}, ErrIntegrationManagementInvalidInput
+	}
+	if options.SortOrder == "" {
+		options.SortOrder = spec.defaultSortOrder
+	}
+	if options.SortOrder != "asc" && options.SortOrder != "desc" {
+		return IntegrationListOptions{}, ErrIntegrationManagementInvalidInput
+	}
+	for _, value := range []string{
+		options.Search,
+		options.Status,
+		options.Type,
+		options.ConnectionPublicID,
+	} {
+		if strings.TrimSpace(value) != value ||
+			containsIntegrationControl(value) {
+			return IntegrationListOptions{}, ErrIntegrationManagementInvalidInput
+		}
+	}
+	if len(options.Search) > integrationManagementMaximumSearch ||
+		len(options.Status) > 64 ||
+		len(options.Type) > 128 ||
+		len(options.ConnectionPublicID) > 64 {
+		return IntegrationListOptions{}, ErrIntegrationManagementInvalidInput
+	}
+	if options.Status != "" {
+		if _, ok := spec.statuses[options.Status]; !ok {
+			return IntegrationListOptions{}, ErrIntegrationManagementInvalidInput
+		}
+	}
+	if options.Type != "" && len(spec.types) > 0 {
+		if _, ok := spec.types[options.Type]; !ok {
+			return IntegrationListOptions{}, ErrIntegrationManagementInvalidInput
+		}
+	}
+	return options, nil
+}
+
+func applyIntegrationOrder(
+	query *gorm.DB,
+	options IntegrationListOptions,
+	spec integrationListSpec,
+) *gorm.DB {
+	column := spec.sortColumns[options.SortBy]
+	direction := "ASC"
+	if options.SortOrder == "desc" {
+		direction = "DESC"
+	}
+	query = query.Order(column + " " + direction)
+	if column != "id" {
+		query = query.Order("id " + direction)
+	}
+	return query
+}
+
+func integrationPageOffset(options IntegrationListOptions) int {
+	return (options.Page - 1) * options.PageSize
+}
+
+func integrationStringSet(values ...string) map[string]struct{} {
+	result := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		result[value] = struct{}{}
+	}
+	return result
+}
+
+func containsIntegrationControl(value string) bool {
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return true
+		}
+	}
+	return false
+}
+
+func escapeIntegrationLike(value string) string {
+	replacer := strings.NewReplacer(
+		`\`, `\\`,
+		`%`, `\%`,
+		`_`, `\_`,
+	)
+	return replacer.Replace(value)
+}
+
+func (service *IntegrationManagementService) integrationConnectionID(
+	ctx context.Context,
+	scope models.ProjectScope,
+	publicID string,
+) (uint, error) {
+	var connection models.Connection
+	if err := scopedIntegrationQuery(
+		service.db.WithContext(ctx),
+		scope,
+	).Select("id").Where("public_id = ?", publicID).
+		First(&connection).Error; err != nil {
+		return 0, integrationManagementLookupError(err)
+	}
+	return connection.ID, nil
+}
+
+func integrationDomainEventFilterDigest(
+	options IntegrationDomainEventCursorOptions,
+) string {
+	sum := sha256.Sum256([]byte(
+		options.EventType + "\x00" + options.Search,
+	))
+	return hex.EncodeToString(sum[:])
 }
 
 func normalizeConnectorDefinitionInput(

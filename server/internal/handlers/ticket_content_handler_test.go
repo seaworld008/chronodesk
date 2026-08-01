@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -23,6 +25,180 @@ import (
 
 func intPtr(value int) *int {
 	return &value
+}
+
+func TestDownloadAttachmentReturnsContentWithSafeHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	scope := ensureHandlerTestProject(t, db)
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.ProjectMembership{},
+		&models.Ticket{},
+		&models.TicketAttachment{},
+	); err != nil {
+		t.Fatalf("migrate attachment download schemas: %v", err)
+	}
+	var queue models.Queue
+	if err := db.Where(
+		"project_id = ? AND is_default = ?",
+		scope.ProjectID,
+		true,
+	).First(&queue).Error; err != nil {
+		t.Fatalf("load default queue: %v", err)
+	}
+	user := models.User{
+		Username:     "attachment-download-admin",
+		Email:        "attachment-download-admin@example.com",
+		PasswordHash: "hashed",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("seed attachment download user: %v", err)
+	}
+	if err := db.Create(&models.ProjectMembership{
+		ProjectID: scope.ProjectID,
+		UserID:    user.ID,
+		Role:      models.ProjectRoleAdmin,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
+		t.Fatalf("seed attachment download membership: %v", err)
+	}
+	ticket := models.Ticket{
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		QueueID:        queue.ID,
+		TicketNumber:   "ATTACHMENT-DOWNLOAD",
+		Title:          "attachment download",
+		Description:    "attachment download",
+		Type:           models.TicketTypeRequest,
+		Priority:       models.TicketPriorityNormal,
+		Status:         models.TicketStatusOpen,
+		Source:         models.TicketSourceWeb,
+		CreatedByID:    &user.ID,
+		Version:        1,
+	}
+	if err := db.Create(&ticket).Error; err != nil {
+		t.Fatalf("seed attachment download ticket: %v", err)
+	}
+	storage, err := services.NewLocalAttachmentStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("create attachment download storage: %v", err)
+	}
+	content := []byte("human attachment content")
+	stored, err := storage.Put(
+		context.Background(),
+		"tickets/human-download.txt",
+		bytes.NewReader(content),
+		1024,
+	)
+	if err != nil {
+		t.Fatalf("store attachment download content: %v", err)
+	}
+	originalName := `财务报告 "Q4".txt`
+	attachment := models.TicketAttachment{
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		TicketID:       ticket.ID,
+		UploadedBy:     &user.ID,
+		ActorType:      models.ActorTypeHuman,
+		ActorID:        models.HumanActor(user.ID).ID,
+		FileName:       "human-download.txt",
+		OriginalName:   originalName,
+		FileSize:       stored.Size,
+		MimeType:       "text/plain",
+		FileType:       models.AttachmentTypeDocument,
+		Extension:      ".txt",
+		StoragePath:    stored.Key,
+		StorageType:    storage.AttachmentStorageType(),
+		Hash:           stored.SHA256,
+		VirusScan:      models.VirusScanClean,
+	}
+	if err := db.Create(&attachment).Error; err != nil {
+		t.Fatalf("seed clean attachment: %v", err)
+	}
+	native := services.NewAgentNativeService(
+		db,
+		services.AgentNativeOptions{
+			AttachmentStorage: storage,
+		},
+	)
+	handler := NewTicketContentHandler(db, nil, native, 1024)
+	router := gin.New()
+	router.GET(
+		"/tickets/:id/attachments/:attachment_id/content",
+		func(c *gin.Context) {
+			ctx, contextErr := services.WithOperationContext(
+				c.Request.Context(),
+				services.OperationContext{
+					Scope:  scope,
+					Actor:  models.HumanActor(user.ID),
+					Source: services.SourceProtocolHumanREST,
+				},
+			)
+			if contextErr != nil {
+				t.Fatalf("build human attachment context: %v", contextErr)
+			}
+			c.Request = c.Request.WithContext(ctx)
+			handler.DownloadAttachment(c)
+		},
+	)
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/tickets/"+strconv.FormatUint(uint64(ticket.ID), 10)+
+			"/attachments/"+
+			strconv.FormatUint(uint64(attachment.ID), 10)+
+			"/content",
+		nil,
+	)
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"download status = %d, body = %s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	if response.Body.String() != string(content) {
+		t.Fatalf(
+			"download content = %q, want %q",
+			response.Body.String(),
+			content,
+		)
+	}
+	for name, want := range map[string]string{
+		"Cache-Control":           "private, no-store",
+		"Pragma":                  "no-cache",
+		"X-Content-Type-Options":  "nosniff",
+		"Content-Security-Policy": "default-src 'none'; sandbox",
+		"Content-Type":            "text/plain",
+	} {
+		if got := response.Header().Get(name); got != want {
+			t.Fatalf("%s = %q, want %q", name, got, want)
+		}
+	}
+	if got := response.Header().Get("Accept-Ranges"); got != "" {
+		t.Fatalf("Accept-Ranges = %q, want absent", got)
+	}
+	disposition, parameters, err := mime.ParseMediaType(
+		response.Header().Get("Content-Disposition"),
+	)
+	if err != nil {
+		t.Fatalf("parse Content-Disposition: %v", err)
+	}
+	if disposition != "attachment" ||
+		parameters["filename"] != originalName {
+		t.Fatalf(
+			"Content-Disposition = %q params=%v",
+			disposition,
+			parameters,
+		)
+	}
 }
 
 func TestTicketContentPaginationIsBoundedStableAndSeparatesReplies(t *testing.T) {
@@ -204,6 +380,11 @@ func TestTicketContentPaginationIsBoundedStableAndSeparatesReplies(t *testing.T)
 		"/comments?page_size=-1",
 		"/comments?page_size=101",
 		"/comments?page_size=abc",
+		"/comments?page=",
+		"/comments?page=1&page=2",
+		"/comments?page=%ZZ",
+		"/comments?page=%201",
+		"/comments?unknown=value",
 		"/attachments?page_size=101",
 	} {
 		invalidResponse := httptest.NewRecorder()

@@ -3,9 +3,13 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"testing"
+	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -133,13 +137,30 @@ func TestTicketRelationshipsAreVersionedAuditedAndProjectScoped(t *testing.T) {
 		t.Fatalf("failed cross-project relation changed version to %d", unchanged.Version)
 	}
 
-	links, err := service.ListEntityLinks(ctx, source.ID)
-	if err != nil || len(links) != 1 || links[0].ProjectID != operation.Scope.ProjectID {
+	links, err := service.ListEntityLinks(
+		ctx,
+		source.ID,
+		DirectoryPageRequest{
+			Page: 1, PageSize: 25, SortBy: "created_at", SortOrder: "desc",
+		},
+	)
+	if err != nil || len(links.Items) != 1 ||
+		links.Items[0].ProjectID != operation.Scope.ProjectID {
 		t.Fatalf("scoped entity links = %+v, %v", links, err)
 	}
-	relations, err := service.ListTicketRelations(ctx, source.ID)
-	if err != nil || len(relations) != 1 ||
-		relations[0].ProjectID != operation.Scope.ProjectID {
+	relations, err := service.ListTicketRelations(
+		ctx,
+		source.ID,
+		DirectoryPageRequest{
+			Page: 1, PageSize: 25, SortBy: "created_at", SortOrder: "desc",
+		},
+	)
+	if err != nil || len(relations.Items) != 1 ||
+		relations.Items[0].Relation.ProjectID != operation.Scope.ProjectID ||
+		relations.Items[0].Direction != TicketRelationDirectionOutgoing ||
+		relations.Items[0].RelatedTicketID != target.ID ||
+		relations.Items[0].RelatedTicketNumber != target.TicketNumber ||
+		relations.Items[0].RelatedTicketTitle != target.Title {
 		t.Fatalf("scoped ticket relations = %+v, %v", relations, err)
 	}
 }
@@ -153,7 +174,13 @@ func TestTicketRelationshipServiceRejectsMissingTrustedScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.ListEntityLinks(context.Background(), 1); err == nil {
+	if _, err := service.ListEntityLinks(
+		context.Background(),
+		1,
+		DirectoryPageRequest{
+			Page: 1, PageSize: 25, SortBy: "created_at", SortOrder: "desc",
+		},
+	); err == nil {
 		t.Fatal("unscoped entity link query was accepted")
 	}
 	if _, err := service.AddTicketRelation(
@@ -166,6 +193,113 @@ func TestTicketRelationshipServiceRejectsMissingTrustedScope(t *testing.T) {
 		},
 	); err == nil {
 		t.Fatal("unscoped relation command was accepted")
+	}
+}
+
+func TestEntityLinkDirectoryIsBoundedAndStableAcrossPages(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(
+		&models.Ticket{},
+		&models.EntityLink{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	ctx := testProjectOperationContext(t, db, models.HumanActor(17))
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var queue models.Queue
+	if err := db.Where(
+		"project_id = ? AND is_default = ?",
+		operation.Scope.ProjectID,
+		true,
+	).First(&queue).Error; err != nil {
+		t.Fatal(err)
+	}
+	ticket := relationshipTestTicket(
+		operation.Scope,
+		queue.ID,
+		"REL-PAGE-1",
+	)
+	if err := db.Create(&ticket).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	links := make([]models.EntityLink, 0, 150)
+	for index := 0; index < 150; index++ {
+		links = append(links, models.EntityLink{
+			CreatedAt:      now,
+			OrganizationID: operation.Scope.OrganizationID,
+			ProjectID:      operation.Scope.ProjectID,
+			TicketID:       ticket.ID,
+			Kind:           models.EntityKindDevice,
+			ReferenceID:    fmt.Sprintf("device-%03d", index),
+			DisplayName:    fmt.Sprintf("Device %03d", index),
+			Metadata:       datatypes.JSON([]byte(`{}`)),
+			CreatedByType:  models.ActorTypeHuman,
+			CreatedByID:    "17",
+		})
+	}
+	if err := db.Create(&links).Error; err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewTicketRelationshipService(
+		db,
+		NewAgentNativeService(db),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := DirectoryPageRequest{
+		Page: 1, PageSize: 100, SortBy: "created_at", SortOrder: "desc",
+	}
+	first, err := service.ListEntityLinks(ctx, ticket.ID, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Page = 2
+	second, err := service.ListEntityLinks(ctx, ticket.ID, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Total != 150 || second.Total != 150 ||
+		first.TotalPages != 2 || second.TotalPages != 2 ||
+		len(first.Items) != 100 || len(second.Items) != 50 {
+		t.Fatalf("entity link pages = %+v / %+v", first, second)
+	}
+	seen := make(map[string]struct{}, 150)
+	var previous string
+	for _, link := range append(first.Items, second.Items...) {
+		if _, duplicate := seen[link.ID]; duplicate {
+			t.Fatalf("duplicate entity link %s", link.ID)
+		}
+		seen[link.ID] = struct{}{}
+		if previous != "" && previous <= link.ID {
+			t.Fatalf(
+				"entity link ID order is not descending: %s then %s",
+				previous,
+				link.ID,
+			)
+		}
+		previous = link.ID
+	}
+	for _, invalid := range []DirectoryPageRequest{
+		{Page: 0, PageSize: 25, SortBy: "created_at", SortOrder: "desc"},
+		{Page: 1, PageSize: 101, SortBy: "created_at", SortOrder: "desc"},
+		{
+			Page: math.MaxInt, PageSize: 100,
+			SortBy: "created_at", SortOrder: "desc",
+		},
+		{Page: 1, PageSize: 25, SortBy: "ticket_id", SortOrder: "desc"},
+	} {
+		if _, err := service.ListEntityLinks(
+			ctx,
+			ticket.ID,
+			invalid,
+		); !errors.Is(err, ErrDirectoryListQuery) {
+			t.Fatalf("invalid relationship page %+v error = %v", invalid, err)
+		}
 	}
 }
 

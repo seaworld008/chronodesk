@@ -4,27 +4,29 @@ import "time"
 
 // AdminAuditLog 管理员操作审计日志
 type AdminAuditLog struct {
-	ID               uint         `json:"id" gorm:"primaryKey;autoIncrement;index:idx_admin_audit_logs_created_id,priority:2,sort:desc"`
-	CreatedAt        time.Time    `json:"created_at" gorm:"autoCreateTime;index:idx_admin_audit_logs_created_id,priority:1,sort:desc"`
-	UserID           *uint        `json:"user_id" gorm:"index"`
-	Username         string       `json:"username" gorm:"size:100"`
-	PlatformRole     PlatformRole `json:"platform_role" gorm:"column:platform_role;size:30;not null;default:'member';index;check:chk_admin_audit_logs_platform_role,platform_role IN ('platform_admin','security_auditor','emergency_operator','member')"`
-	Action           string       `json:"action" gorm:"size:255"`
-	ActionCode       string       `json:"action_code,omitempty" gorm:"size:100;index"`
-	ResourceType     string       `json:"resource_type,omitempty" gorm:"size:100;index"`
-	ResourcePublicID string       `json:"resource_public_id,omitempty" gorm:"size:512;index"`
-	Method           string       `json:"method" gorm:"size:20"`
-	Path             string       `json:"path" gorm:"size:255;index"`
-	StatusCode       int          `json:"status_code"`
-	ClientIP         string       `json:"client_ip" gorm:"size:64"`
-	UserAgent        string       `json:"user_agent" gorm:"size:255"`
-	Query            string       `json:"query" gorm:"size:500"`
-	LatencyMs        int64        `json:"latency_ms"`
-	Result           string       `json:"result" gorm:"size:100"`
-	Notes            string       `json:"notes" gorm:"type:text"`
-	RequestID        string       `json:"request_id,omitempty" gorm:"size:128;index"`
-	TraceID          string       `json:"trace_id,omitempty" gorm:"size:128;index"`
-	CorrelationID    string       `json:"correlation_id,omitempty" gorm:"size:255;index"`
+	ID               uint          `json:"id" gorm:"primaryKey;autoIncrement;index:idx_admin_audit_logs_created_id,priority:2,sort:desc"`
+	CreatedAt        time.Time     `json:"created_at" gorm:"autoCreateTime;index:idx_admin_audit_logs_created_id,priority:1,sort:desc"`
+	UserID           *uint         `json:"user_id" gorm:"index"`
+	Username         string        `json:"username" gorm:"size:100"`
+	ActorType        ActorType     `json:"actor_type" gorm:"size:32;not null;default:'human';index"`
+	ActorID          string        `json:"actor_id" gorm:"size:128;not null;index"`
+	PlatformRole     *PlatformRole `json:"platform_role,omitempty" gorm:"column:platform_role;size:30;index;check:chk_admin_audit_logs_platform_role,platform_role IS NULL OR platform_role IN ('platform_admin','security_auditor','emergency_operator','member')"`
+	Action           string        `json:"action" gorm:"size:255"`
+	ActionCode       string        `json:"action_code,omitempty" gorm:"size:100;index"`
+	ResourceType     string        `json:"resource_type,omitempty" gorm:"size:100;index"`
+	ResourcePublicID string        `json:"resource_public_id,omitempty" gorm:"size:512;index"`
+	Method           string        `json:"method" gorm:"size:20"`
+	Path             string        `json:"path" gorm:"size:255;index"`
+	StatusCode       int           `json:"status_code"`
+	ClientIP         string        `json:"client_ip" gorm:"size:64"`
+	UserAgent        string        `json:"user_agent" gorm:"size:255"`
+	Query            string        `json:"query" gorm:"size:500"`
+	LatencyMs        int64         `json:"latency_ms"`
+	Result           string        `json:"result" gorm:"size:100"`
+	Notes            string        `json:"notes" gorm:"type:text"`
+	RequestID        string        `json:"request_id,omitempty" gorm:"size:128;index"`
+	TraceID          string        `json:"trace_id,omitempty" gorm:"size:128;index"`
+	CorrelationID    string        `json:"correlation_id,omitempty" gorm:"size:255;index"`
 }
 
 // TableName 指定表名

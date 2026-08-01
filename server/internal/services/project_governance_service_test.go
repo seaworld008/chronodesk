@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
@@ -134,6 +135,12 @@ func TestProjectServiceListPlatformProjectsRejectsInvalidBoundsAndFilters(
 		{
 			name:    "page size over maximum",
 			request: PlatformProjectListRequest{Page: 1, PageSize: 101},
+		},
+		{
+			name: "page offset overflow",
+			request: PlatformProjectListRequest{
+				Page: math.MaxInt, PageSize: 100,
+			},
 		},
 		{
 			name: "unknown status",

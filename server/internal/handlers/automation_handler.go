@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -187,9 +189,9 @@ func (h *AutomationHandler) ConfigureListCursor(root []byte) error {
 // ProjectScopeMiddleware boundary. There is deliberately no global alias.
 func (h *AutomationHandler) RegisterProjectRoutes(projectGroup *gin.RouterGroup) {
 	automation := projectGroup.Group("/admin/automation")
-	automation.Use(h.requireProjectManager)
 
 	rules := automation.Group("/rules")
+	rules.Use(h.requireProjectManager)
 	rules.POST("", h.CreateRule)
 	rules.GET("", h.GetRules)
 	rules.GET("/:id", h.GetRule)
@@ -197,21 +199,28 @@ func (h *AutomationHandler) RegisterProjectRoutes(projectGroup *gin.RouterGroup)
 	rules.DELETE("/:id", h.DeleteRule)
 	rules.GET("/:id/stats", h.GetRuleStats)
 
-	automation.GET("/logs", h.GetExecutionLogs)
+	automation.GET("/logs", h.requireProjectManager, h.GetExecutionLogs)
 
 	sla := automation.Group("/sla")
+	sla.Use(h.requireProjectManager)
 	sla.POST("", h.CreateSLAConfig)
 	sla.GET("", h.GetSLAConfigs)
 
 	templates := automation.Group("/templates")
+	templates.Use(h.requireProjectManager)
 	templates.POST("", h.CreateTemplate)
 	templates.GET("", h.GetTemplates)
 	templates.GET("/:id", h.GetTemplate)
 
 	quickReplies := automation.Group("/quick-replies")
+	quickReplies.Use(h.requireProjectManager)
 	quickReplies.POST("", h.CreateQuickReply)
 	quickReplies.GET("", h.GetQuickReplies)
-	quickReplies.POST("/:id/use", h.UseQuickReply)
+	automation.POST(
+		"/quick-replies/:id/use",
+		h.requireQuickReplyConsumer,
+		h.UseQuickReply,
+	)
 }
 
 func (h *AutomationHandler) requireProjectManager(c *gin.Context) {
@@ -241,6 +250,39 @@ func (h *AutomationHandler) requireProjectManager(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
 			"success": false,
 			"message": "仅项目管理员或经理可管理自动化",
+			"error":   "project_role_forbidden",
+		})
+	}
+}
+
+func (h *AutomationHandler) requireQuickReplyConsumer(c *gin.Context) {
+	access, ok := ProjectAccessFromGin(c)
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+			"success": false,
+			"message": "未解析可信项目范围",
+			"error":   "project_scope_required",
+		})
+		return
+	}
+	operation, err := services.OperationContextFromContext(c.Request.Context())
+	if err != nil ||
+		operation.Scope != access.Scope ||
+		operation.Source != services.SourceProtocolHumanREST ||
+		operation.Actor != models.HumanActor(c.GetUint("user_id")) {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+			"success": false,
+			"message": "项目操作上下文无效",
+			"error":   "invalid_project_context",
+		})
+		return
+	}
+	if access.Role != models.ProjectRoleAdmin &&
+		access.Role != models.ProjectRoleManager &&
+		access.Role != models.ProjectRoleAgent {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+			"success": false,
+			"message": "当前项目角色不能使用快捷回复",
 			"error":   "project_role_forbidden",
 		})
 	}
@@ -278,7 +320,11 @@ func (h *AutomationHandler) CreateRule(c *gin.Context) {
 		status := http.StatusInternalServerError
 		message := "创建规则失败"
 		code := "internal_error"
-		if errors.Is(err, services.ErrInvalidAutomationTriggerType) {
+		if errors.Is(err, services.ErrInvalidAutomationRuleType) {
+			status = http.StatusBadRequest
+			message = "规则类型无效"
+			code = "invalid_rule_type"
+		} else if errors.Is(err, services.ErrInvalidAutomationTriggerType) {
 			status = http.StatusBadRequest
 			message = "触发事件类型无效"
 			code = "invalid_trigger_type"
@@ -333,7 +379,11 @@ func (h *AutomationHandler) GetRules(c *gin.Context) {
 		status := http.StatusInternalServerError
 		message := "获取规则列表失败"
 		code := "internal_error"
-		if errors.Is(err, services.ErrInvalidAutomationTriggerType) {
+		if errors.Is(err, services.ErrInvalidAutomationRuleType) {
+			status = http.StatusBadRequest
+			message = "规则类型无效"
+			code = "invalid_rule_type"
+		} else if errors.Is(err, services.ErrInvalidAutomationTriggerType) {
 			status = http.StatusBadRequest
 			message = "触发事件筛选值无效"
 			code = "invalid_trigger_type"
@@ -458,6 +508,10 @@ func (h *AutomationHandler) UpdateRule(c *gin.Context) {
 			status = http.StatusNotFound
 			message = "规则不存在"
 			code = "rule_not_found"
+		} else if errors.Is(err, services.ErrInvalidAutomationRuleType) {
+			status = http.StatusBadRequest
+			message = "规则类型无效"
+			code = "invalid_rule_type"
 		} else if errors.Is(err, services.ErrInvalidAutomationTriggerType) {
 			status = http.StatusBadRequest
 			message = "触发事件类型无效"
@@ -791,13 +845,27 @@ func strictAutomationQueryValues(
 			return nil, false
 		}
 		value := values[0]
-		if value == "" || strings.TrimSpace(value) != value {
+		if value == "" ||
+			!utf8.ValidString(key) ||
+			!utf8.ValidString(value) ||
+			containsAutomationQueryControl(key) ||
+			containsAutomationQueryControl(value) ||
+			strings.TrimSpace(value) != value {
 			writeInvalidAutomationListQuery(c)
 			return nil, false
 		}
 		result[key] = value
 	}
 	return result, true
+}
+
+func containsAutomationQueryControl(value string) bool {
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return true
+		}
+	}
+	return false
 }
 
 func strictAutomationPositiveInt(raw string, maximum int) (int, bool) {
@@ -844,18 +912,12 @@ func strictAutomationBool(raw string) (bool, bool) {
 }
 
 func validAutomationRuleTypeFilter(raw string) bool {
-	if len(raw) == 0 || len(raw) > 50 ||
-		raw[0] < 'a' || raw[0] > 'z' {
+	switch raw {
+	case "assignment", "classification", "escalation", "sla":
+		return true
+	default:
 		return false
 	}
-	for _, character := range raw[1:] {
-		if (character < 'a' || character > 'z') &&
-			(character < '0' || character > '9') &&
-			character != '_' {
-			return false
-		}
-	}
-	return true
 }
 
 func automationTotalPages(total int64, pageSize int) int {
@@ -871,6 +933,125 @@ func writeInvalidAutomationListQuery(c *gin.Context) {
 		"message": "列表查询参数无效",
 		"error":   "invalid_request",
 	})
+}
+
+type automationConfigListQuery struct {
+	page     int
+	pageSize int
+	category string
+	keyword  string
+	isActive *bool
+	isPublic *bool
+}
+
+func requireSLAConfigListQuery(
+	c *gin.Context,
+) (automationConfigListQuery, bool) {
+	return requireAutomationConfigListQuery(
+		c,
+		map[string]struct{}{
+			"is_active": {},
+			"page":      {},
+			"page_size": {},
+		},
+	)
+}
+
+func requireTicketTemplateListQuery(
+	c *gin.Context,
+) (automationConfigListQuery, bool) {
+	return requireAutomationConfigListQuery(
+		c,
+		map[string]struct{}{
+			"category":  {},
+			"is_active": {},
+			"page":      {},
+			"page_size": {},
+		},
+	)
+}
+
+func requireQuickReplyListQuery(
+	c *gin.Context,
+) (automationConfigListQuery, bool) {
+	return requireAutomationConfigListQuery(
+		c,
+		map[string]struct{}{
+			"category":  {},
+			"keyword":   {},
+			"is_public": {},
+			"page":      {},
+			"page_size": {},
+		},
+	)
+}
+
+func requireAutomationConfigListQuery(
+	c *gin.Context,
+	allowed map[string]struct{},
+) (automationConfigListQuery, bool) {
+	values, ok := strictAutomationQueryValues(c, allowed)
+	if !ok {
+		return automationConfigListQuery{}, false
+	}
+	query := automationConfigListQuery{
+		page:     1,
+		pageSize: services.DefaultAutomationListSize,
+	}
+	if raw, exists := values["page"]; exists {
+		value, valid := strictAutomationPositiveInt(raw, int(^uint(0)>>1))
+		if !valid {
+			writeInvalidAutomationListQuery(c)
+			return automationConfigListQuery{}, false
+		}
+		query.page = value
+	}
+	if raw, exists := values["page_size"]; exists {
+		value, valid := strictAutomationPositiveInt(
+			raw,
+			services.MaxAutomationListSize,
+		)
+		if !valid {
+			writeInvalidAutomationListQuery(c)
+			return automationConfigListQuery{}, false
+		}
+		query.pageSize = value
+	}
+	if query.page > int(^uint(0)>>1)/query.pageSize {
+		writeInvalidAutomationListQuery(c)
+		return automationConfigListQuery{}, false
+	}
+	if raw, exists := values["category"]; exists {
+		if len([]rune(raw)) > services.MaxAutomationCategoryFilterLength {
+			writeInvalidAutomationListQuery(c)
+			return automationConfigListQuery{}, false
+		}
+		query.category = raw
+	}
+	if raw, exists := values["keyword"]; exists {
+		if len([]rune(raw)) > services.MaxAutomationKeywordFilterLength {
+			writeInvalidAutomationListQuery(c)
+			return automationConfigListQuery{}, false
+		}
+		query.keyword = raw
+	}
+	if raw, exists := values["is_active"]; exists {
+		value, valid := strictAutomationBool(raw)
+		if !valid {
+			writeInvalidAutomationListQuery(c)
+			return automationConfigListQuery{}, false
+		}
+		query.isActive = &value
+	}
+	if raw, exists := values["is_public"]; exists {
+		value, valid := strictAutomationBool(raw)
+		if !valid {
+			writeInvalidAutomationListQuery(c)
+			return automationConfigListQuery{}, false
+		}
+		query.isPublic = &value
+	}
+	return query, true
 }
 
 // SLA配置相关接口
@@ -920,7 +1101,7 @@ func (h *AutomationHandler) CreateSLAConfig(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{
 		"success": true,
 		"message": "创建SLA配置成功",
-		"data":    config,
+		"data":    slaConfigDTO(config),
 	})
 }
 
@@ -933,23 +1114,28 @@ func (h *AutomationHandler) CreateSLAConfig(c *gin.Context) {
 // @Produce json
 // @Param is_active query boolean false "是否激活"
 // @Param page query int false "页码" default(1)
-// @Param page_size query int false "页大小" default(20)
+// @Param page_size query int false "页大小" default(25) maximum(100)
 // @Success 200 {object} map[string]interface{} "成功"
+// @Failure 400 {object} map[string]interface{} "查询参数错误"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
 // @Router /api/projects/{projectKey}/admin/automation/sla [get]
 func (h *AutomationHandler) GetSLAConfigs(c *gin.Context) {
-	var isActive *bool
-	if activeStr := c.Query("is_active"); activeStr != "" {
-		active := activeStr == "true"
-		isActive = &active
+	query, ok := requireSLAConfigListQuery(c)
+	if !ok {
+		return
 	}
 
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
-	page, pageSize = normalizePagination(page, pageSize, 100)
-
-	configs, total, err := h.automationService.GetSLAConfigs(c.Request.Context(), isActive, page, pageSize)
+	configs, total, err := h.automationService.GetSLAConfigs(
+		c.Request.Context(),
+		query.isActive,
+		query.page,
+		query.pageSize,
+	)
 	if err != nil {
+		if errors.Is(err, services.ErrInvalidAutomationListQuery) {
+			writeInvalidAutomationListQuery(c)
+			return
+		}
 		logHandlerFailure(c, "automation.list_sla_configs", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -963,11 +1149,11 @@ func (h *AutomationHandler) GetSLAConfigs(c *gin.Context) {
 		"success": true,
 		"message": "获取SLA配置列表成功",
 		"data": gin.H{
-			"configs":     configs,
+			"items":       slaConfigDTOs(configs),
 			"total":       total,
-			"page":        page,
-			"page_size":   pageSize,
-			"total_pages": (total + int64(pageSize) - 1) / int64(pageSize),
+			"page":        query.page,
+			"page_size":   query.pageSize,
+			"total_pages": automationTotalPages(total, query.pageSize),
 		},
 	})
 }
@@ -1012,7 +1198,7 @@ func (h *AutomationHandler) CreateTemplate(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{
 		"success": true,
 		"message": "创建模板成功",
-		"data":    template,
+		"data":    ticketTemplateDTO(template),
 	})
 }
 
@@ -1026,24 +1212,29 @@ func (h *AutomationHandler) CreateTemplate(c *gin.Context) {
 // @Param category query string false "分类"
 // @Param is_active query boolean false "是否激活"
 // @Param page query int false "页码" default(1)
-// @Param page_size query int false "页大小" default(20)
+// @Param page_size query int false "页大小" default(25) maximum(100)
 // @Success 200 {object} map[string]interface{} "成功"
+// @Failure 400 {object} map[string]interface{} "查询参数错误"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
 // @Router /api/projects/{projectKey}/admin/automation/templates [get]
 func (h *AutomationHandler) GetTemplates(c *gin.Context) {
-	category := c.Query("category")
-	var isActive *bool
-	if activeStr := c.Query("is_active"); activeStr != "" {
-		active := activeStr == "true"
-		isActive = &active
+	query, ok := requireTicketTemplateListQuery(c)
+	if !ok {
+		return
 	}
 
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
-	page, pageSize = normalizePagination(page, pageSize, 100)
-
-	templates, total, err := h.automationService.GetTemplates(c.Request.Context(), category, isActive, page, pageSize)
+	templates, total, err := h.automationService.GetTemplates(
+		c.Request.Context(),
+		query.category,
+		query.isActive,
+		query.page,
+		query.pageSize,
+	)
 	if err != nil {
+		if errors.Is(err, services.ErrInvalidAutomationListQuery) {
+			writeInvalidAutomationListQuery(c)
+			return
+		}
 		logHandlerFailure(c, "automation.list_templates", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -1057,11 +1248,11 @@ func (h *AutomationHandler) GetTemplates(c *gin.Context) {
 		"success": true,
 		"message": "获取模板列表成功",
 		"data": gin.H{
-			"templates":   templates,
+			"items":       ticketTemplateDTOs(templates),
 			"total":       total,
-			"page":        page,
-			"page_size":   pageSize,
-			"total_pages": (total + int64(pageSize) - 1) / int64(pageSize),
+			"page":        query.page,
+			"page_size":   query.pageSize,
+			"total_pages": automationTotalPages(total, query.pageSize),
 		},
 	})
 }
@@ -1111,7 +1302,7 @@ func (h *AutomationHandler) GetTemplate(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "获取模板详情成功",
-		"data":    template,
+		"data":    ticketTemplateDTO(template),
 	})
 }
 
@@ -1143,6 +1334,14 @@ func (h *AutomationHandler) CreateQuickReply(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 	reply, err := h.automationService.CreateQuickReply(c.Request.Context(), &req, userID.(uint))
 	if err != nil {
+		if errors.Is(err, services.ErrInvalidQuickReplyTags) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"message": "标签格式无效",
+				"error":   "invalid_tags",
+			})
+			return
+		}
 		logHandlerFailure(c, "automation.create_quick_reply", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -1155,7 +1354,7 @@ func (h *AutomationHandler) CreateQuickReply(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{
 		"success": true,
 		"message": "创建快速回复成功",
-		"data":    reply,
+		"data":    quickReplyDTO(reply),
 	})
 }
 
@@ -1170,26 +1369,32 @@ func (h *AutomationHandler) CreateQuickReply(c *gin.Context) {
 // @Param keyword query string false "关键词搜索"
 // @Param is_public query boolean false "是否公开"
 // @Param page query int false "页码" default(1)
-// @Param page_size query int false "页大小" default(20)
+// @Param page_size query int false "页大小" default(25) maximum(100)
 // @Success 200 {object} map[string]interface{} "成功"
+// @Failure 400 {object} map[string]interface{} "查询参数错误"
 // @Failure 500 {object} map[string]interface{} "服务器错误"
 // @Router /api/projects/{projectKey}/admin/automation/quick-replies [get]
 func (h *AutomationHandler) GetQuickReplies(c *gin.Context) {
-	category := c.Query("category")
-	keyword := c.Query("keyword")
-	var isPublic *bool
-	if publicStr := c.Query("is_public"); publicStr != "" {
-		public := publicStr == "true"
-		isPublic = &public
+	query, ok := requireQuickReplyListQuery(c)
+	if !ok {
+		return
 	}
 
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
-	page, pageSize = normalizePagination(page, pageSize, 100)
-
 	userID, _ := c.Get("user_id")
-	replies, total, err := h.automationService.GetQuickReplies(c.Request.Context(), category, keyword, isPublic, userID.(uint), page, pageSize)
+	replies, total, err := h.automationService.GetQuickReplies(
+		c.Request.Context(),
+		query.category,
+		query.keyword,
+		query.isPublic,
+		userID.(uint),
+		query.page,
+		query.pageSize,
+	)
 	if err != nil {
+		if errors.Is(err, services.ErrInvalidAutomationListQuery) {
+			writeInvalidAutomationListQuery(c)
+			return
+		}
 		logHandlerFailure(c, "automation.list_quick_replies", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -1203,11 +1408,11 @@ func (h *AutomationHandler) GetQuickReplies(c *gin.Context) {
 		"success": true,
 		"message": "获取快速回复列表成功",
 		"data": gin.H{
-			"replies":     replies,
+			"items":       quickReplyDTOs(replies),
 			"total":       total,
-			"page":        page,
-			"page_size":   pageSize,
-			"total_pages": (total + int64(pageSize) - 1) / int64(pageSize),
+			"page":        query.page,
+			"page_size":   query.pageSize,
+			"total_pages": automationTotalPages(total, query.pageSize),
 		},
 	})
 }
@@ -1234,8 +1439,20 @@ func (h *AutomationHandler) UseQuickReply(c *gin.Context) {
 		return
 	}
 
-	err = h.automationService.UseQuickReply(c.Request.Context(), uint(replyID))
+	err = h.automationService.UseQuickReply(
+		c.Request.Context(),
+		uint(replyID),
+		c.GetUint("user_id"),
+	)
 	if err != nil {
+		if errors.Is(err, services.ErrQuickReplyNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{
+				"success": false,
+				"message": "快速回复不存在或当前账号无权使用",
+				"error":   "quick_reply_not_found",
+			})
+			return
+		}
 		logHandlerFailure(c, "automation.use_quick_reply", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -1249,4 +1466,149 @@ func (h *AutomationHandler) UseQuickReply(c *gin.Context) {
 		"success": true,
 		"message": "使用快速回复成功",
 	})
+}
+
+// automation directory responses deliberately project only browser-facing
+// scalar fields. The persistence models carry Organization/Project foreign
+// keys and may have preloaded User associations; returning those models
+// directly would expose internal scope identifiers and account secrets.
+type slaConfigResponse struct {
+	ID              uint      `json:"id"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	Name            string    `json:"name"`
+	Description     string    `json:"description"`
+	IsActive        bool      `json:"is_active"`
+	IsDefault       bool      `json:"is_default"`
+	TicketType      *string   `json:"ticket_type,omitempty"`
+	Priority        *string   `json:"priority,omitempty"`
+	Category        *string   `json:"category,omitempty"`
+	AssignedUserID  *uint     `json:"assigned_user_id,omitempty"`
+	ResponseTime    int       `json:"response_time"`
+	ResolutionTime  int       `json:"resolution_time"`
+	ExcludeWeekends bool      `json:"exclude_weekends"`
+	ExcludeHolidays bool      `json:"exclude_holidays"`
+	AppliedCount    int64     `json:"applied_count"`
+	ViolationCount  int64     `json:"violation_count"`
+	ComplianceRate  float64   `json:"compliance_rate"`
+}
+
+type ticketTemplateResponse struct {
+	ID              uint      `json:"id"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	Name            string    `json:"name"`
+	Description     string    `json:"description"`
+	Category        string    `json:"category"`
+	IsActive        bool      `json:"is_active"`
+	TitleTemplate   string    `json:"title_template"`
+	ContentTemplate string    `json:"content_template"`
+	DefaultType     string    `json:"default_type"`
+	DefaultPriority string    `json:"default_priority"`
+	DefaultStatus   string    `json:"default_status"`
+	AssignToUserID  *uint     `json:"assign_to_user_id,omitempty"`
+	UsageCount      int64     `json:"usage_count"`
+}
+
+type quickReplyResponse struct {
+	ID         uint      `json:"id"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+	Name       string    `json:"name"`
+	Category   string    `json:"category"`
+	Content    string    `json:"content"`
+	Tags       string    `json:"tags"`
+	IsPublic   bool      `json:"is_public"`
+	UsageCount int64     `json:"usage_count"`
+}
+
+func slaConfigDTO(config *models.SLAConfig) slaConfigResponse {
+	if config == nil {
+		return slaConfigResponse{}
+	}
+	return slaConfigResponse{
+		ID:              config.ID,
+		CreatedAt:       config.CreatedAt,
+		UpdatedAt:       config.UpdatedAt,
+		Name:            config.Name,
+		Description:     config.Description,
+		IsActive:        config.IsActive,
+		IsDefault:       config.IsDefault,
+		TicketType:      config.TicketType,
+		Priority:        config.Priority,
+		Category:        config.Category,
+		AssignedUserID:  config.AssignedUserID,
+		ResponseTime:    config.ResponseTime,
+		ResolutionTime:  config.ResolutionTime,
+		ExcludeWeekends: config.ExcludeWeekends,
+		ExcludeHolidays: config.ExcludeHolidays,
+		AppliedCount:    config.AppliedCount,
+		ViolationCount:  config.ViolationCount,
+		ComplianceRate:  config.ComplianceRate,
+	}
+}
+
+func slaConfigDTOs(configs []*models.SLAConfig) []slaConfigResponse {
+	items := make([]slaConfigResponse, 0, len(configs))
+	for _, config := range configs {
+		items = append(items, slaConfigDTO(config))
+	}
+	return items
+}
+
+func ticketTemplateDTO(template *models.TicketTemplate) ticketTemplateResponse {
+	if template == nil {
+		return ticketTemplateResponse{}
+	}
+	return ticketTemplateResponse{
+		ID:              template.ID,
+		CreatedAt:       template.CreatedAt,
+		UpdatedAt:       template.UpdatedAt,
+		Name:            template.Name,
+		Description:     template.Description,
+		Category:        template.Category,
+		IsActive:        template.IsActive,
+		TitleTemplate:   template.TitleTemplate,
+		ContentTemplate: template.ContentTemplate,
+		DefaultType:     template.DefaultType,
+		DefaultPriority: template.DefaultPriority,
+		DefaultStatus:   template.DefaultStatus,
+		AssignToUserID:  template.AssignToUserID,
+		UsageCount:      template.UsageCount,
+	}
+}
+
+func ticketTemplateDTOs(
+	templates []*models.TicketTemplate,
+) []ticketTemplateResponse {
+	items := make([]ticketTemplateResponse, 0, len(templates))
+	for _, template := range templates {
+		items = append(items, ticketTemplateDTO(template))
+	}
+	return items
+}
+
+func quickReplyDTO(reply *models.QuickReply) quickReplyResponse {
+	if reply == nil {
+		return quickReplyResponse{}
+	}
+	return quickReplyResponse{
+		ID:         reply.ID,
+		CreatedAt:  reply.CreatedAt,
+		UpdatedAt:  reply.UpdatedAt,
+		Name:       reply.Name,
+		Category:   reply.Category,
+		Content:    reply.Content,
+		Tags:       reply.Tags,
+		IsPublic:   reply.IsPublic,
+		UsageCount: reply.UsageCount,
+	}
+}
+
+func quickReplyDTOs(replies []*models.QuickReply) []quickReplyResponse {
+	items := make([]quickReplyResponse, 0, len(replies))
+	for _, reply := range replies {
+		items = append(items, quickReplyDTO(reply))
+	}
+	return items
 }

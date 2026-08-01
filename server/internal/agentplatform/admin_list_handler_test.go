@@ -1,11 +1,15 @@
 package agentplatform
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
 func TestAdminListHandlersRejectStrictQueryErrors(t *testing.T) {
@@ -102,6 +106,105 @@ func TestAdminListHandlersRejectStrictQueryErrors(t *testing.T) {
 					response.Code,
 					response.Body.String(),
 				)
+			}
+		})
+	}
+}
+
+func TestAdminListHandlersServeAllSevenBoundedListContracts(t *testing.T) {
+	fixture := newAdminContractFixture(t)
+	principal, err := fixture.native.CreateServicePrincipal(
+		context.Background(),
+		services.CreateServicePrincipalInput{
+			Name:   "administrator-list-contract-agent",
+			Scopes: []string{models.ScopeTicketsRead},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grantAPIHandlerTestProject(
+		t,
+		fixture.db,
+		fixture.project,
+		principal.ID,
+		principal.ScopeList(),
+	)
+	if err := fixture.db.Create(&models.AgentPolicy{
+		ID:                 "00000000-0000-7000-8e00-000000000001",
+		ServicePrincipalID: principal.ID,
+		Name:               "administrator list contract policy",
+		Effect:             models.AgentPolicyEffectAllow,
+		Scope:              models.ScopeTicketsRead,
+		Action:             "ticket.read",
+		ResourceType:       "ticket",
+		Priority:           10,
+		IsActive:           true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	base := "/api/projects/TEST/admin/agents"
+	for _, test := range []struct {
+		name string
+		path string
+	}{
+		{
+			name: "principals page",
+			path: base + "/service-principals?page=1&page_size=25&sort_by=created_at&sort_order=desc",
+		},
+		{
+			name: "policies page",
+			path: base + "/service-principals/" + principal.ID +
+				"/policies?page=1&page_size=25&sort_by=priority&sort_order=desc",
+		},
+		{
+			name: "leases page",
+			path: base + "/leases?page=1&page_size=25&sort_by=expires_at&sort_order=asc",
+		},
+		{
+			name: "attachments page",
+			path: base + "/attachments?page=1&page_size=25&sort_by=created_at&sort_order=desc",
+		},
+		{
+			name: "events cursor",
+			path: base + "/events?limit=25",
+		},
+		{
+			name: "outbox page",
+			path: base + "/outbox?page=1&page_size=25&sort_by=created_at&sort_order=desc",
+		},
+		{
+			name: "policy decisions cursor",
+			path: base + "/policy-decisions?limit=25",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := performAdminContractRequest(
+				fixture.router,
+				http.MethodGet,
+				test.path,
+				"",
+				"",
+				"",
+				"admin-list-success",
+			)
+			if response.Code != http.StatusOK {
+				t.Fatalf(
+					"GET %s status=%d body=%s, want 200",
+					test.path,
+					response.Code,
+					response.Body.String(),
+				)
+			}
+			var envelope struct {
+				Data json.RawMessage `json:"data"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+				t.Fatalf("decode GET %s response: %v", test.path, err)
+			}
+			if len(envelope.Data) == 0 || string(envelope.Data) == "null" {
+				t.Fatalf("GET %s returned no data envelope", test.path)
 			}
 		})
 	}

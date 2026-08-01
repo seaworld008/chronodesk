@@ -31,32 +31,82 @@ func (service *capturingNotificationListService) GetNotifications(
 func TestNotificationListAcceptsOnlyCurrentQueryContract(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tests := []struct {
-		name        string
-		query       string
-		unsupported string
+		name  string
+		query string
+		valid bool
 	}{
 		{
 			name:  "current react admin contract",
 			query: "page=1&page_size=20&sort=%5B%22created_at%22%2C%22DESC%22%5D&filter=%7B%22is_read%22%3Afalse%7D",
+			valid: true,
 		},
-		{name: "old limit", query: "limit=20", unsupported: "limit"},
-		{name: "old offset", query: "offset=0", unsupported: "offset"},
-		{name: "old direct read filter", query: "is_read=false", unsupported: "is_read"},
-		{name: "old direct type filter", query: "type=system_alert", unsupported: "type"},
-		{name: "old direct priority filter", query: "priority=normal", unsupported: "priority"},
+		{
+			name:  "recipient column sort",
+			query: "page=1&page_size=25&sort=%5B%22recipient_id%22%2C%22ASC%22%5D",
+			valid: true,
+		},
+		{
+			name:  "sender column sort",
+			query: "page=1&page_size=25&sort=%5B%22sender_id%22%2C%22DESC%22%5D",
+			valid: true,
+		},
+		{name: "old limit", query: "limit=20"},
+		{name: "old offset", query: "offset=0"},
+		{name: "old direct read filter", query: "is_read=false"},
+		{name: "old direct type filter", query: "type=system_alert"},
+		{name: "old direct priority filter", query: "priority=normal"},
+		{name: "duplicate page", query: "page=1&page=2"},
+		{name: "empty sort", query: "sort="},
+		{name: "invalid encoding", query: "filter=%ZZ"},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			recorder := httptest.NewRecorder()
-			context, _ := gin.CreateTestContext(recorder)
-			context.Request = httptest.NewRequest(
-				http.MethodGet,
-				"/notifications?"+test.query,
-				nil,
+			_, err := strictNotificationListQueryValues(test.query)
+			if test.valid && err != nil {
+				t.Fatalf("valid query rejected: %v", err)
+			}
+			if !test.valid && err == nil {
+				t.Fatal("invalid query was accepted")
+			}
+		})
+	}
+}
+
+func TestNotificationListRejectsInvalidSortAndFilterValues(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service := &capturingNotificationListService{}
+	handler := NewNotificationHandler(service)
+	for _, query := range []string{
+		"sort=%5B%22organization_id%22%2C%22ASC%22%5D",
+		"sort=%5B%22created_at%22%2C%22down%22%5D",
+		"sort=%7B%22field%22%3A%22created_at%22%7D",
+		"filter=%7B%22unknown%22%3Atrue%7D",
+		"filter=%7B%22type%22%3A%22unknown%22%7D",
+		"filter=%7B%22recipient_id%22%3A8%7D",
+		"filter=%7B%22is_read%22%3A1%7D",
+	} {
+		t.Run(query, func(t *testing.T) {
+			router := gin.New()
+			router.GET("/notifications", func(c *gin.Context) {
+				c.Set("user_id", uint(7))
+				handler.GetNotifications(c)
+			})
+			response := httptest.NewRecorder()
+			router.ServeHTTP(
+				response,
+				httptest.NewRequest(
+					http.MethodGet,
+					"/notifications?"+query,
+					nil,
+				),
 			)
-			if got := unsupportedNotificationListQuery(context); got != test.unsupported {
-				t.Fatalf("unsupported query = %q, want %q", got, test.unsupported)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf(
+					"status=%d body=%s",
+					response.Code,
+					response.Body,
+				)
 			}
 		})
 	}

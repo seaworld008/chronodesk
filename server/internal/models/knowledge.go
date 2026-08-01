@@ -19,8 +19,9 @@ import (
 )
 
 var (
-	knowledgeKeyPattern  = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,63}$`)
-	knowledgeHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	knowledgeKeyPattern     = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,63}$`)
+	knowledgeHashPattern    = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	knowledgeStoreIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 )
 
 var ErrPublishedKnowledgeVersionImmutable = errors.New(
@@ -52,10 +53,16 @@ type KnowledgeArticle struct {
 	Status         KnowledgeArticleStatus `json:"status" gorm:"size:20;not null;default:'active';index"`
 	CurrentVersion *string                `json:"current_version_id,omitempty" gorm:"column:current_version_id;size:36;index"`
 	Revision       uint64                 `json:"revision" gorm:"not null;default:1"`
-	CreatedByType  ActorType              `json:"created_by_type" gorm:"size:32;not null;<-:create"`
-	CreatedByID    string                 `json:"created_by_id" gorm:"size:128;not null;<-:create"`
-	UpdatedByType  ActorType              `json:"updated_by_type" gorm:"size:32;not null"`
-	UpdatedByID    string                 `json:"updated_by_id" gorm:"size:128;not null"`
+	// Draft activity is a bounded directory projection, never persisted and
+	// never serialized through machine contracts. Human management views opt
+	// in to exposing it through a closed response DTO.
+	HasUnpublishedDraft bool       `json:"-" gorm:"-"`
+	LatestDraftAt       *time.Time `json:"-" gorm:"-"`
+	LatestDraftVersion  *uint64    `json:"-" gorm:"-"`
+	CreatedByType       ActorType  `json:"created_by_type" gorm:"size:32;not null;<-:create"`
+	CreatedByID         string     `json:"created_by_id" gorm:"size:128;not null;<-:create"`
+	UpdatedByType       ActorType  `json:"updated_by_type" gorm:"size:32;not null"`
+	UpdatedByID         string     `json:"updated_by_id" gorm:"size:128;not null"`
 }
 
 func (KnowledgeArticle) TableName() string {
@@ -156,6 +163,10 @@ func (reference KnowledgeObjectReference) Validate() error {
 	if strings.Contains(reference.Key, "\x00") {
 		return errors.New("knowledge object key is invalid")
 	}
+	if len(reference.VersionID) > 1024 ||
+		strings.ContainsRune(reference.VersionID, '\x00') {
+		return errors.New("knowledge object version ID is invalid")
+	}
 	if strings.TrimSpace(reference.FileName) == "" ||
 		strings.TrimSpace(reference.MimeType) == "" {
 		return errors.New("knowledge source requires file name and MIME type")
@@ -174,9 +185,9 @@ type KnowledgeArticleVersion struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
-	OrganizationID uint                   `json:"organization_id" gorm:"not null;index;uniqueIndex:idx_knowledge_version_article_number,priority:1"`
-	ProjectID      uint                   `json:"project_id" gorm:"not null;index;uniqueIndex:idx_knowledge_version_article_number,priority:2"`
-	ArticleID      string                 `json:"article_id" gorm:"size:36;not null;index;uniqueIndex:idx_knowledge_version_article_number,priority:3"`
+	OrganizationID uint                   `json:"organization_id" gorm:"not null;index;uniqueIndex:idx_knowledge_version_article_number,priority:1;index:idx_knowledge_one_published,unique,where:status = 'published',priority:1"`
+	ProjectID      uint                   `json:"project_id" gorm:"not null;index;uniqueIndex:idx_knowledge_version_article_number,priority:2;index:idx_knowledge_one_published,unique,where:status = 'published',priority:2"`
+	ArticleID      string                 `json:"article_id" gorm:"size:36;not null;index;uniqueIndex:idx_knowledge_version_article_number,priority:3;index:idx_knowledge_one_published,unique,where:status = 'published',priority:3"`
 	Version        uint64                 `json:"version" gorm:"not null;uniqueIndex:idx_knowledge_version_article_number,priority:4"`
 	Status         KnowledgeVersionStatus `json:"status" gorm:"size:20;not null;default:'draft';index"`
 	Title          string                 `json:"title" gorm:"size:240;not null"`
@@ -184,7 +195,8 @@ type KnowledgeArticleVersion struct {
 	ObjectProvider   string `json:"object_provider" gorm:"size:64;not null"`
 	ObjectBucket     string `json:"object_bucket" gorm:"size:255;not null"`
 	ObjectKey        string `json:"object_key" gorm:"size:1000;not null"`
-	ObjectVersionID  string `json:"object_version_id,omitempty" gorm:"size:255"`
+	ObjectStoreID    string `json:"-" gorm:"size:63;not null;default:'';index"`
+	ObjectVersionID  string `json:"object_version_id,omitempty" gorm:"size:1024"`
 	OriginalFileName string `json:"original_file_name" gorm:"size:255;not null"`
 	MimeType         string `json:"mime_type" gorm:"size:160;not null"`
 	SizeBytes        int64  `json:"size_bytes" gorm:"not null"`
@@ -261,6 +273,14 @@ func (version KnowledgeArticleVersion) Validate() error {
 	}
 	if err := version.ObjectReference().Validate(); err != nil {
 		return err
+	}
+	if version.ObjectStoreID != "" &&
+		!knowledgeStoreIDPattern.MatchString(version.ObjectStoreID) {
+		return errors.New("knowledge object store_id is invalid")
+	}
+	if len(version.ObjectVersionID) > 1024 ||
+		strings.ContainsRune(version.ObjectVersionID, '\x00') {
+		return errors.New("knowledge object version ID is invalid")
 	}
 	if !isKnowledgeVirusScanStatus(version.VirusScan) {
 		return fmt.Errorf("knowledge virus scan status %q is invalid", version.VirusScan)
@@ -341,12 +361,12 @@ type KnowledgeArticleACL struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
-	OrganizationID uint                    `json:"organization_id" gorm:"not null;index;uniqueIndex:idx_knowledge_acl_subject,priority:1"`
-	ProjectID      uint                    `json:"project_id" gorm:"not null;index;uniqueIndex:idx_knowledge_acl_subject,priority:2"`
-	ArticleID      string                  `json:"article_id" gorm:"size:36;not null;index;uniqueIndex:idx_knowledge_acl_subject,priority:3"`
-	SubjectType    KnowledgeACLSubjectType `json:"subject_type" gorm:"size:32;not null;index;uniqueIndex:idx_knowledge_acl_subject,priority:4"`
-	SubjectID      string                  `json:"subject_id" gorm:"size:128;not null;index;uniqueIndex:idx_knowledge_acl_subject,priority:5"`
-	Permission     KnowledgeACLPermission  `json:"permission" gorm:"size:20;not null;uniqueIndex:idx_knowledge_acl_subject,priority:6"`
+	OrganizationID uint                    `json:"organization_id" gorm:"not null;index;uniqueIndex:idx_knowledge_acl_subject,priority:1;index:idx_knowledge_acl_manage_lookup,priority:1"`
+	ProjectID      uint                    `json:"project_id" gorm:"not null;index;uniqueIndex:idx_knowledge_acl_subject,priority:2;index:idx_knowledge_acl_manage_lookup,priority:2"`
+	ArticleID      string                  `json:"article_id" gorm:"size:36;not null;index;uniqueIndex:idx_knowledge_acl_subject,priority:3;index:idx_knowledge_acl_manage_lookup,priority:6"`
+	SubjectType    KnowledgeACLSubjectType `json:"subject_type" gorm:"size:32;not null;index;uniqueIndex:idx_knowledge_acl_subject,priority:4;index:idx_knowledge_acl_manage_lookup,priority:3"`
+	SubjectID      string                  `json:"subject_id" gorm:"size:128;not null;index;uniqueIndex:idx_knowledge_acl_subject,priority:5;index:idx_knowledge_acl_manage_lookup,priority:4"`
+	Permission     KnowledgeACLPermission  `json:"permission" gorm:"size:20;not null;uniqueIndex:idx_knowledge_acl_subject,priority:6;index:idx_knowledge_acl_manage_lookup,priority:5"`
 	GrantedByType  ActorType               `json:"granted_by_type" gorm:"size:32;not null;<-:create"`
 	GrantedByID    string                  `json:"granted_by_id" gorm:"size:128;not null;<-:create"`
 }
@@ -549,10 +569,13 @@ type KnowledgeCitation struct {
 	ProjectID       uint      `json:"project_id" gorm:"not null;index"`
 	SearchID        string    `json:"search_id" gorm:"size:36;not null;index"`
 	ArticleID       string    `json:"article_id" gorm:"size:36;not null;index"`
+	ArticleKey      string    `json:"article_key" gorm:"-"`
+	ArticleTitle    string    `json:"article_title" gorm:"-"`
 	VersionID       string    `json:"version_id" gorm:"size:36;not null;index"`
 	DocumentVersion uint64    `json:"document_version" gorm:"not null"`
 	ChunkID         string    `json:"chunk_id" gorm:"size:36;not null;index"`
 	PageNumber      *int      `json:"page_number,omitempty"`
+	SectionPath     string    `json:"section_path" gorm:"-"`
 	Snippet         string    `json:"snippet" gorm:"size:1000;not null"`
 	ContentHash     string    `json:"content_hash" gorm:"size:64;not null;index"`
 	Rank            int       `json:"rank" gorm:"not null"`

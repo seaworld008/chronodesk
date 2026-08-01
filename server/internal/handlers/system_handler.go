@@ -209,7 +209,7 @@ func (h *SystemHandler) ExecuteAllCleanup(c *gin.Context) {
 // GetCleanupLogs 获取清理日志
 func (h *SystemHandler) GetCleanupLogs(c *gin.Context) {
 	query, err := parseDirectoryListQuery(
-		c.Request.URL.Query(),
+		c.Request.URL.RawQuery,
 		directoryListQuerySpec{
 			DefaultSortBy:    "created_at",
 			DefaultSortOrder: "desc",
@@ -231,10 +231,7 @@ func (h *SystemHandler) GetCleanupLogs(c *gin.Context) {
 		})
 		return
 	}
-	taskType, _ := directoryQueryValue(
-		c.Request.URL.Query(),
-		"task_type",
-	)
+	taskType, _ := query.value("task_type")
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()

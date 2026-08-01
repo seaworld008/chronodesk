@@ -559,14 +559,36 @@ func (d *NativeOutboxDeliverer) deliverAttachmentCleanup(
 		return errors.New("attachment cleanup event is missing ticket_id")
 	}
 
-	storagePath, err := services.AttachmentCleanupStoragePath(
+	storageReference, err := services.AttachmentCleanupStorageReference(
 		event,
 		delivery.DestinationID,
 	)
 	if err != nil {
 		return err
 	}
-	if err := d.attachments.Delete(ctx, storagePath); err != nil {
+	if routed, ok := d.attachments.(services.ReferencedAttachmentStorage); ok {
+		err = routed.DeleteStoredObject(
+			ctx,
+			services.AttachmentStoredReference{
+				StorageType: storageReference.StorageType,
+				StoreID:     storageReference.StoreID,
+				Key:         storageReference.StoragePath,
+				VersionID:   storageReference.VersionID,
+			},
+		)
+	} else if routed, ok := d.attachments.(services.TypedAttachmentStorage); ok {
+		err = routed.DeleteStored(
+			ctx,
+			storageReference.StorageType,
+			storageReference.StoragePath,
+		)
+	} else {
+		err = d.attachments.Delete(
+			ctx,
+			storageReference.StoragePath,
+		)
+	}
+	if err != nil {
 		return fmt.Errorf("delete attachment object: %w", err)
 	}
 	return nil

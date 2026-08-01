@@ -2814,6 +2814,9 @@ func backendError(err error) *mcp.BackendError {
 		code, message = "attachment_rejected", "attachment was rejected"
 	case errors.Is(err, services.ErrInvalidActor),
 		errors.Is(err, services.ErrInvalidScope),
+		errors.Is(err, services.ErrInvalidAgentContext),
+		errors.Is(err, services.ErrTicketCategoryScope),
+		errors.Is(err, services.ErrInvalidTicketCategorySelection),
 		errors.Is(err, services.ErrInvalidTicketTags),
 		errors.Is(err, services.ErrInvalidTicketTransition):
 		code, message = "invalid_argument", "request is invalid"

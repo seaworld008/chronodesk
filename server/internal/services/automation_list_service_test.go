@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -22,6 +23,16 @@ func TestAutomationExecutionLogsStableCursorAndBindings(t *testing.T) {
 		&models.AutomationLog{},
 	); err != nil {
 		t.Fatal(err)
+	}
+	for _, index := range []string{
+		"idx_automation_logs_timeline",
+		"idx_automation_logs_rule_timeline",
+		"idx_automation_logs_ticket_timeline",
+		"idx_automation_logs_success_timeline",
+	} {
+		if !db.Migrator().HasIndex(&models.AutomationLog{}, index) {
+			t.Fatalf("automation log index %q is missing", index)
+		}
 	}
 	ctxA := automationListTestContext(t, 5, 8)
 	ctxB := automationListTestContext(t, 5, 9)
@@ -58,6 +69,18 @@ func TestAutomationExecutionLogsStableCursorAndBindings(t *testing.T) {
 		first.Items[99].ID != logs[51].ID {
 		t.Fatalf("first page = %+v", first)
 	}
+	concurrentLog := models.AutomationLog{
+		OrganizationID: 5,
+		ProjectID:      8,
+		RuleID:         17,
+		TicketID:       29,
+		TriggerEvent:   "io.chronodesk.ticket.created.v1",
+		ExecutedAt:     executedAt,
+		Success:        true,
+	}
+	if err := db.Create(&concurrentLog).Error; err != nil {
+		t.Fatal(err)
+	}
 	second, err := service.ListExecutionLogs(
 		ctxA,
 		AutomationExecutionLogQuery{
@@ -72,6 +95,14 @@ func TestAutomationExecutionLogsStableCursorAndBindings(t *testing.T) {
 		second.Items[0].ID != logs[50].ID ||
 		second.Items[50].ID != logs[0].ID {
 		t.Fatalf("second page = %+v", second)
+	}
+	for _, item := range second.Items {
+		if item.ID == concurrentLog.ID {
+			t.Fatalf(
+				"concurrent insert %d leaked into continuation",
+				concurrentLog.ID,
+			)
+		}
 	}
 
 	tampered := first.NextCursor[:len(first.NextCursor)-1] + "A"
@@ -142,6 +173,150 @@ func TestAutomationExecutionLogsRequireConfiguredCursorKey(t *testing.T) {
 		ErrAutomationListCursorKey,
 	) {
 		t.Fatalf("empty key error = %v", err)
+	}
+}
+
+func TestAutomationRuleTypeIsClosedAtServiceBoundary(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.AutomationRule{}); err != nil {
+		t.Fatal(err)
+	}
+	service := NewAutomationService(db)
+	ctx := automationListTestContext(t, 2, 3)
+
+	if _, err := service.CreateRule(
+		ctx,
+		&models.AutomationRuleRequest{
+			Name:         "unsupported rule",
+			RuleType:     "notification",
+			TriggerEvent: "io.chronodesk.ticket.created.v1",
+		},
+		1,
+	); !errors.Is(err, ErrInvalidAutomationRuleType) {
+		t.Fatalf("CreateRule unsupported type error = %v", err)
+	}
+	if err := service.UpdateRule(
+		ctx,
+		1,
+		&models.AutomationRuleRequest{
+			Name:         "unsupported rule",
+			RuleType:     "notification",
+			TriggerEvent: "io.chronodesk.ticket.created.v1",
+		},
+		1,
+	); !errors.Is(err, ErrInvalidAutomationRuleType) {
+		t.Fatalf("UpdateRule unsupported type error = %v", err)
+	}
+	if _, _, err := service.GetRules(
+		ctx,
+		"notification",
+		"",
+		nil,
+		"",
+		1,
+		25,
+	); !errors.Is(err, ErrInvalidAutomationRuleType) {
+		t.Fatalf("GetRules unsupported type error = %v", err)
+	}
+	if _, err := service.CreateRule(
+		ctx,
+		nil,
+		1,
+	); !errors.Is(err, ErrInvalidAutomationRuleType) {
+		t.Fatalf("CreateRule nil request error = %v", err)
+	}
+}
+
+func TestAutomationRulePageIsStableAcross151Ties(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.User{}, &models.AutomationRule{}); err != nil {
+		t.Fatal(err)
+	}
+	user := models.User{
+		Username:     "automation-directory-owner",
+		Email:        "automation-directory-owner@example.test",
+		PasswordHash: "hash",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, time.July, 31, 14, 0, 0, 0, time.UTC)
+	rules := make([]models.AutomationRule, 0, 151)
+	for index := 0; index < 151; index++ {
+		rules = append(rules, models.AutomationRule{
+			CreatedAt:      createdAt,
+			OrganizationID: 5,
+			ProjectID:      8,
+			Name:           fmt.Sprintf("stable-rule-%03d", index),
+			RuleType:       "assignment",
+			Priority:       10,
+			TriggerEvent:   "io.chronodesk.ticket.created.v1",
+			CreatedBy:      user.ID,
+		})
+	}
+	if err := db.CreateInBatches(&rules, 50).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.AutomationRule{
+		CreatedAt:      createdAt,
+		OrganizationID: 5,
+		ProjectID:      9,
+		Name:           "cross-project-decoy",
+		RuleType:       "assignment",
+		Priority:       10,
+		TriggerEvent:   "io.chronodesk.ticket.created.v1",
+		CreatedBy:      user.ID,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	service := NewAutomationService(db)
+	ctx := automationListTestContext(t, 5, 8)
+	first, total, err := service.GetRules(
+		ctx,
+		"assignment",
+		"",
+		nil,
+		"",
+		1,
+		100,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, secondTotal, err := service.GetRules(
+		ctx,
+		"assignment",
+		"",
+		nil,
+		"",
+		2,
+		100,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 151 || secondTotal != total ||
+		len(first) != 100 || len(second) != 51 ||
+		first[0].ID != rules[150].ID ||
+		first[99].ID != rules[51].ID ||
+		second[0].ID != rules[50].ID ||
+		second[50].ID != rules[0].ID {
+		t.Fatalf(
+			"unstable automation directory: total=%d/%d first=%d second=%d",
+			total,
+			secondTotal,
+			len(first),
+			len(second),
+		)
+	}
+	if !db.Migrator().HasIndex(
+		&models.AutomationRule{},
+		"idx_automation_rules_directory",
+	) {
+		t.Fatal("automation rule directory index is missing")
 	}
 }
 

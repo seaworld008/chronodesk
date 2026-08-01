@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -29,6 +30,153 @@ type apiHandlerTestProject struct {
 	organization models.Organization
 	project      models.Project
 	queue        models.Queue
+}
+
+func TestAgentDownloadAttachmentReturnsContentWithSafeHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dsn := fmt.Sprintf(
+		"file:%s?mode=memory&cache=shared",
+		strings.ReplaceAll(t.Name(), "/", "_"),
+	)
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open Agent attachment download database: %v", err)
+	}
+	project := ensureAPIHandlerTestProject(t, db)
+	if err := db.AutoMigrate(
+		&models.Ticket{},
+		&models.TicketAttachment{},
+	); err != nil {
+		t.Fatalf("migrate Agent attachment download schemas: %v", err)
+	}
+	ticket := models.Ticket{
+		OrganizationID: project.organization.ID,
+		ProjectID:      project.project.ID,
+		QueueID:        project.queue.ID,
+		TicketNumber:   "AGENT-ATTACHMENT-DOWNLOAD",
+		Title:          "Agent attachment download",
+		Description:    "Agent attachment download",
+		Type:           models.TicketTypeRequest,
+		Priority:       models.TicketPriorityNormal,
+		Status:         models.TicketStatusOpen,
+		Source:         models.TicketSourceAgent,
+		Version:        1,
+	}
+	if err := db.Create(&ticket).Error; err != nil {
+		t.Fatalf("seed Agent attachment download ticket: %v", err)
+	}
+	storage, err := services.NewLocalAttachmentStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("create Agent attachment download storage: %v", err)
+	}
+	content := []byte("Agent attachment content")
+	stored, err := storage.Put(
+		context.Background(),
+		"tickets/agent-download.txt",
+		bytes.NewReader(content),
+		1024,
+	)
+	if err != nil {
+		t.Fatalf("store Agent attachment download content: %v", err)
+	}
+	originalName := `Agent "evidence"; final.txt`
+	systemActor := models.SystemActor("agent-download-header-test")
+	attachment := models.TicketAttachment{
+		OrganizationID: project.organization.ID,
+		ProjectID:      project.project.ID,
+		TicketID:       ticket.ID,
+		ActorType:      systemActor.Type,
+		ActorID:        systemActor.ID,
+		FileName:       "agent-download.txt",
+		OriginalName:   originalName,
+		FileSize:       stored.Size,
+		MimeType:       "text/plain",
+		FileType:       models.AttachmentTypeDocument,
+		Extension:      ".txt",
+		StoragePath:    stored.Key,
+		StorageType:    storage.AttachmentStorageType(),
+		Hash:           stored.SHA256,
+		VirusScan:      models.VirusScanClean,
+	}
+	if err := db.Create(&attachment).Error; err != nil {
+		t.Fatalf("seed clean Agent attachment: %v", err)
+	}
+	native := services.NewAgentNativeService(
+		db,
+		services.AgentNativeOptions{
+			AttachmentStorage: storage,
+		},
+	)
+	handler := NewAPIHandler(db, native, nil, 1024, nil)
+	router := gin.New()
+	router.GET("/attachments/:id/content", func(c *gin.Context) {
+		ctx, contextErr := services.WithOperationContext(
+			c.Request.Context(),
+			services.OperationContext{
+				Scope:  project.project.Scope(),
+				Actor:  systemActor,
+				Source: services.SourceProtocolWorker,
+			},
+		)
+		if contextErr != nil {
+			t.Fatalf("build Agent attachment context: %v", contextErr)
+		}
+		c.Request = c.Request.WithContext(ctx)
+		handler.DownloadAttachment(c)
+	})
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/attachments/"+
+			strconv.FormatUint(uint64(attachment.ID), 10)+
+			"/content",
+		nil,
+	)
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"Agent download status = %d, body = %s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	if response.Body.String() != string(content) {
+		t.Fatalf(
+			"Agent download content = %q, want %q",
+			response.Body.String(),
+			content,
+		)
+	}
+	for name, want := range map[string]string{
+		"Cache-Control":           "private, no-store",
+		"Pragma":                  "no-cache",
+		"X-Content-Type-Options":  "nosniff",
+		"Content-Security-Policy": "default-src 'none'; sandbox",
+		"Content-Type":            "text/plain",
+	} {
+		if got := response.Header().Get(name); got != want {
+			t.Fatalf("%s = %q, want %q", name, got, want)
+		}
+	}
+	if got := response.Header().Get("Accept-Ranges"); got != "" {
+		t.Fatalf("Accept-Ranges = %q, want absent", got)
+	}
+	disposition, parameters, err := mime.ParseMediaType(
+		response.Header().Get("Content-Disposition"),
+	)
+	if err != nil {
+		t.Fatalf("parse Agent Content-Disposition: %v", err)
+	}
+	if disposition != "attachment" ||
+		parameters["filename"] != originalName {
+		t.Fatalf(
+			"Agent Content-Disposition = %q params=%v",
+			disposition,
+			parameters,
+		)
+	}
 }
 
 func ensureAPIHandlerTestProject(
@@ -292,6 +440,75 @@ func TestInvalidTicketTagsUseStableRESTAndMCPContracts(t *testing.T) {
 	mcpProblem := backendError(err)
 	if mcpProblem.Code != "invalid_argument" || mcpProblem.Retryable {
 		t.Fatalf("unexpected MCP problem: %+v", mcpProblem)
+	}
+}
+
+func TestInvalidAgentContextUsesStableRESTAndMCPContracts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	err := fmt.Errorf(
+		"%w: constraints must contain at most 20 items",
+		services.ErrInvalidAgentContext,
+	)
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPatch, "/agent/tickets/1", nil)
+	writeNativeProblem(context, err)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+	var problem Problem
+	if decodeErr := json.Unmarshal(recorder.Body.Bytes(), &problem); decodeErr != nil {
+		t.Fatalf("decode problem response: %v", decodeErr)
+	}
+	if problem.Code != ProblemInvalidRequest || problem.Retryable {
+		t.Fatalf("unexpected REST problem: %+v", problem)
+	}
+
+	mcpProblem := backendError(err)
+	if mcpProblem.Code != "invalid_argument" ||
+		mcpProblem.Message != "request is invalid" ||
+		mcpProblem.Retryable {
+		t.Fatalf("unexpected MCP problem: %+v", mcpProblem)
+	}
+}
+
+func TestInvalidTicketCategoryUsesStableRESTAndMCPContracts(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	err := fmt.Errorf(
+		"%w: category is outside the authorized project",
+		services.ErrTicketCategoryScope,
+	)
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(
+		http.MethodPatch,
+		"/agent/tickets/1",
+		nil,
+	)
+	writeNativeProblem(context, err)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+	var problem Problem
+	if decodeErr := json.Unmarshal(
+		recorder.Body.Bytes(),
+		&problem,
+	); decodeErr != nil {
+		t.Fatalf("decode category problem response: %v", decodeErr)
+	}
+	if problem.Code != ProblemInvalidRequest || problem.Retryable {
+		t.Fatalf("unexpected category REST problem: %+v", problem)
+	}
+
+	mcpProblem := backendError(err)
+	if mcpProblem.Code != "invalid_argument" ||
+		mcpProblem.Message != "request is invalid" ||
+		mcpProblem.Retryable {
+		t.Fatalf("unexpected category MCP problem: %+v", mcpProblem)
 	}
 }
 

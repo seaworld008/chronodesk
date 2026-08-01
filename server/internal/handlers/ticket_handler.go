@@ -1,12 +1,17 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
+	"math"
 	"net/http"
 	"net/mail"
+	"net/url"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/seaworld008/chronodesk/server/internal/middleware"
@@ -31,15 +36,14 @@ func NewTicketHandler(ticketService services.TicketServiceInterface) *TicketHand
 // GetTickets 获取工单列表
 func (h *TicketHandler) GetTickets(c *gin.Context) {
 	ctx := c.Request.Context()
+	if err := validateTicketListRawQuery(c.Request.URL.RawQuery); err != nil {
+		h.response.BadRequest(c, "工单列表查询参数无效")
+		return
+	}
 
 	// 解析查询参数
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSizeRaw := c.Query("page_size")
-	if pageSizeRaw == "" {
-		pageSizeRaw = c.DefaultQuery("limit", "20")
-	}
-	pageSize, _ := strconv.Atoi(pageSizeRaw)
-	page, pageSize = normalizePagination(page, pageSize, 100)
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "25"))
 	status := strings.TrimSpace(c.Query("status"))
 	priority := strings.TrimSpace(c.Query("priority"))
 	ticketType := c.Query("type")
@@ -167,6 +171,10 @@ func (h *TicketHandler) GetTickets(c *gin.Context) {
 	// 获取工单列表
 	tickets, total, err := h.ticketService.GetTickets(ctx, filters)
 	if err != nil {
+		if errors.Is(err, services.ErrInvalidTicketListQuery) {
+			h.response.BadRequest(c, "工单列表查询参数无效")
+			return
+		}
 		logHandlerFailure(c, "ticket.list", err)
 		h.response.InternalServerError(c, "获取工单列表失败")
 		return
@@ -175,6 +183,219 @@ func (h *TicketHandler) GetTickets(c *gin.Context) {
 	responses := ticketListResponseForRole(tickets, normalizedProjectRole(c))
 
 	h.response.List(c, responses, total, page, pageSize, "获取工单列表成功")
+}
+
+var ticketListQueryKeys = map[string]struct{}{
+	"page": {}, "page_size": {}, "status": {}, "priority": {},
+	"type": {}, "source": {}, "assigned_to": {}, "created_by": {},
+	"search": {}, "sort_by": {}, "sort_order": {}, "sla_breached": {},
+	"is_overdue": {}, "unassigned": {}, "assigned_to_me": {}, "filter": {},
+}
+
+func validateTicketListRawQuery(rawQuery string) error {
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return services.ErrInvalidTicketListQuery
+	}
+	for key, entries := range values {
+		if _, ok := ticketListQueryKeys[key]; !ok || len(entries) != 1 ||
+			!utf8.ValidString(key) || !utf8.ValidString(entries[0]) ||
+			containsDirectoryQueryControl(key) ||
+			containsDirectoryQueryControl(entries[0]) ||
+			strings.TrimSpace(entries[0]) == "" ||
+			strings.TrimSpace(entries[0]) != entries[0] {
+			return services.ErrInvalidTicketListQuery
+		}
+	}
+	page, err := parseDirectoryPositiveInt(
+		values,
+		"page",
+		1,
+		math.MaxInt/defaultDirectoryPageSize,
+	)
+	if err != nil {
+		return services.ErrInvalidTicketListQuery
+	}
+	pageSize, err := parseDirectoryPositiveInt(
+		values,
+		"page_size",
+		defaultDirectoryPageSize,
+		maxDirectoryPageSize,
+	)
+	if err != nil || page > math.MaxInt/pageSize {
+		return services.ErrInvalidTicketListQuery
+	}
+	for _, key := range []string{"assigned_to", "created_by"} {
+		if raw, ok := values[key]; ok {
+			value, parseErr := strconv.ParseUint(raw[0], 10, 32)
+			if parseErr != nil || value == 0 {
+				return services.ErrInvalidTicketListQuery
+			}
+		}
+	}
+	for _, key := range []string{
+		"sla_breached",
+		"is_overdue",
+		"unassigned",
+		"assigned_to_me",
+	} {
+		if raw, ok := values[key]; ok &&
+			raw[0] != "true" && raw[0] != "false" {
+			return services.ErrInvalidTicketListQuery
+		}
+	}
+	if raw, ok := values["sort_by"]; ok {
+		if _, exists := services.TicketSortableColumn(raw[0]); !exists {
+			return services.ErrInvalidTicketListQuery
+		}
+	}
+	if raw, ok := values["sort_order"]; ok &&
+		raw[0] != "asc" && raw[0] != "desc" {
+		return services.ErrInvalidTicketListQuery
+	}
+	if raw, ok := values["status"]; ok &&
+		!validTicketListValues(raw[0], validTicketStatusFilter) {
+		return services.ErrInvalidTicketListQuery
+	}
+	if raw, ok := values["priority"]; ok &&
+		!validTicketListValues(raw[0], validTicketPriorityFilter) {
+		return services.ErrInvalidTicketListQuery
+	}
+	if raw, ok := values["type"]; ok &&
+		!models.TicketType(raw[0]).IsValid() {
+		return services.ErrInvalidTicketListQuery
+	}
+	if raw, ok := values["source"]; ok &&
+		!models.TicketSource(raw[0]).IsValid() {
+		return services.ErrInvalidTicketListQuery
+	}
+	if raw, ok := values["search"]; ok && len([]rune(raw[0])) > 200 {
+		return services.ErrInvalidTicketListQuery
+	}
+	if raw, ok := values["filter"]; ok {
+		if err := validateTicketListJSONFilter(raw[0]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validTicketListValues(
+	raw string,
+	valid func(string) bool,
+) bool {
+	parts := strings.Split(raw, ",")
+	if len(parts) == 0 || len(parts) > 20 {
+		return false
+	}
+	for _, part := range parts {
+		value := strings.TrimSpace(part)
+		if value == "" || !valid(value) {
+			return false
+		}
+	}
+	return true
+}
+
+func validTicketStatusFilter(value string) bool {
+	return models.TicketStatus(value).IsValid()
+}
+
+func validTicketPriorityFilter(value string) bool {
+	return models.TicketPriority(value).IsValid()
+}
+
+func validateTicketListJSONFilter(raw string) error {
+	if len(raw) > 8192 {
+		return services.ErrInvalidTicketListQuery
+	}
+	decoder := json.NewDecoder(bytes.NewBufferString(raw))
+	decoder.UseNumber()
+	var filter map[string]any
+	if err := decoder.Decode(&filter); err != nil {
+		return services.ErrInvalidTicketListQuery
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return services.ErrInvalidTicketListQuery
+	}
+	allowed := map[string]struct{}{
+		"q": {}, "status": {}, "priority": {}, "type": {}, "source": {},
+		"tags": {}, "tag": {}, "sla_breached": {}, "is_overdue": {},
+		"unassigned": {},
+	}
+	for key, value := range filter {
+		if _, ok := allowed[key]; !ok {
+			return services.ErrInvalidTicketListQuery
+		}
+		switch key {
+		case "q":
+			if text, ok := value.(string); !ok ||
+				strings.TrimSpace(text) != text ||
+				text == "" || len([]rune(text)) > 200 {
+				return services.ErrInvalidTicketListQuery
+			}
+		case "type":
+			text, ok := value.(string)
+			if !ok || !models.TicketType(text).IsValid() {
+				return services.ErrInvalidTicketListQuery
+			}
+		case "source":
+			text, ok := value.(string)
+			if !ok || !models.TicketSource(text).IsValid() {
+				return services.ErrInvalidTicketListQuery
+			}
+		case "status":
+			if !validTicketFilterStringOrArray(
+				value,
+				validTicketStatusFilter,
+			) {
+				return services.ErrInvalidTicketListQuery
+			}
+		case "priority":
+			if !validTicketFilterStringOrArray(
+				value,
+				validTicketPriorityFilter,
+			) {
+				return services.ErrInvalidTicketListQuery
+			}
+		case "tags", "tag":
+			if !validTicketFilterStringOrArray(value, func(tag string) bool {
+				return strings.TrimSpace(tag) != "" &&
+					len([]rune(strings.TrimSpace(tag))) <= 50
+			}) {
+				return services.ErrInvalidTicketListQuery
+			}
+		default:
+			if _, ok := parseFilterBool(value); !ok {
+				return services.ErrInvalidTicketListQuery
+			}
+		}
+	}
+	return nil
+}
+
+func validTicketFilterStringOrArray(
+	value any,
+	valid func(string) bool,
+) bool {
+	switch typed := value.(type) {
+	case string:
+		return valid(typed)
+	case []any:
+		if len(typed) == 0 || len(typed) > 20 {
+			return false
+		}
+		for _, item := range typed {
+			text, ok := item.(string)
+			if !ok || !valid(text) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 func extractFilterStrings(value interface{}) []string {
@@ -332,6 +553,27 @@ func (h *TicketHandler) CreateTicket(c *gin.Context) {
 				false,
 			)
 			return
+		case errors.Is(err, services.ErrInvalidAgentContext):
+			writeHumanTicketProblem(
+				c,
+				http.StatusUnprocessableEntity,
+				"invalid_request",
+				"Agent 上下文无效",
+				"Agent 上下文条目过多或内容超过允许长度",
+				false,
+			)
+			return
+		case errors.Is(err, services.ErrTicketCategoryScope),
+			errors.Is(err, services.ErrInvalidTicketCategorySelection):
+			writeHumanTicketProblem(
+				c,
+				http.StatusUnprocessableEntity,
+				"invalid_request",
+				"工单分类无效",
+				"请选择当前项目中有效的主分类及其直属子分类",
+				false,
+			)
+			return
 		case errors.Is(err, services.ErrTicketCreateAccessDenied):
 			writeHumanTicketProblem(
 				c,
@@ -458,6 +700,29 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 				"invalid_request",
 				"工单标签无效",
 				"标签最多 20 个，且每个标签不能超过 50 个字符",
+				false,
+			)
+			return
+		}
+		if errors.Is(err, services.ErrInvalidAgentContext) {
+			writeHumanTicketProblem(
+				c,
+				http.StatusUnprocessableEntity,
+				"invalid_request",
+				"Agent 上下文无效",
+				"Agent 上下文条目过多或内容超过允许长度",
+				false,
+			)
+			return
+		}
+		if errors.Is(err, services.ErrTicketCategoryScope) ||
+			errors.Is(err, services.ErrInvalidTicketCategorySelection) {
+			writeHumanTicketProblem(
+				c,
+				http.StatusUnprocessableEntity,
+				"invalid_request",
+				"工单分类无效",
+				"请选择当前项目中有效的主分类及其直属子分类",
 				false,
 			)
 			return

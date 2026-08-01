@@ -95,6 +95,77 @@ func TestConfigServiceListConfigPageIsBoundedAndStable(t *testing.T) {
 	}
 }
 
+func TestConfigExportFailsClosedAtRecordAndByteLimits(t *testing.T) {
+	t.Run("record limit", func(t *testing.T) {
+		db := openTestDB(t)
+		if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+			t.Fatal(err)
+		}
+		configs := make([]models.SystemConfig, 0, MaxConfigExportRecords+1)
+		for index := 0; index < MaxConfigExportRecords; index++ {
+			configs = append(configs, models.SystemConfig{
+				Key:       fmt.Sprintf("system.export.%05d", index),
+				Value:     "x",
+				ValueType: "string",
+				Category:  CategorySystem,
+				Group:     "export",
+			})
+		}
+		if err := db.CreateInBatches(configs, 250).Error; err != nil {
+			t.Fatal(err)
+		}
+		data, err := NewConfigService(db).ExportConfigs("")
+		if err != nil {
+			t.Fatalf("exact record limit rejected: %v", err)
+		}
+		var exported []models.SystemConfig
+		if err := json.Unmarshal(data, &exported); err != nil {
+			t.Fatal(err)
+		}
+		if len(exported) != MaxConfigExportRecords {
+			t.Fatalf("exported records = %d", len(exported))
+		}
+
+		if err := db.Create(&models.SystemConfig{
+			Key:       "system.export.overflow",
+			Value:     "x",
+			ValueType: "string",
+			Category:  CategorySystem,
+			Group:     "export",
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if _, err := NewConfigService(db).ExportConfigs(""); !errors.Is(
+			err,
+			ErrConfigExportTooLarge,
+		) {
+			t.Fatalf("record overflow error = %v", err)
+		}
+	})
+
+	t.Run("serialized byte limit", func(t *testing.T) {
+		db := openTestDB(t)
+		if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Create(&models.SystemConfig{
+			Key:       "system.export.large",
+			Value:     strings.Repeat("x", MaxConfigExportBytes),
+			ValueType: "string",
+			Category:  CategorySystem,
+			Group:     "export",
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if _, err := NewConfigService(db).ExportConfigs(""); !errors.Is(
+			err,
+			ErrConfigExportTooLarge,
+		) {
+			t.Fatalf("byte overflow error = %v", err)
+		}
+	})
+}
+
 func TestValidateSystemConfigKeyUsesUnicodeCodePointContract(t *testing.T) {
 	t.Parallel()
 
@@ -209,6 +280,222 @@ func TestConfigServiceWritePathsRejectInvalidKeysBeforePersistence(t *testing.T)
 				)
 			}
 		})
+	}
+}
+
+func TestConfigServiceProtectedAgentControlsRejectGenericWriteBypasses(
+	t *testing.T,
+) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatalf("migrate system configs: %v", err)
+	}
+	protected := []models.SystemConfig{
+		{
+			Key:         KeyAgentGlobalReadOnly,
+			Value:       "false",
+			ValueType:   "bool",
+			Description: "runtime control",
+			Category:    CategorySecurity,
+			Group:       "agent",
+		},
+		{
+			Key:         KeyAgentEmergencyStop,
+			Value:       "false",
+			ValueType:   "bool",
+			Description: "runtime control",
+			Category:    CategorySecurity,
+			Group:       "agent",
+		},
+	}
+	if err := db.Create(&protected).Error; err != nil {
+		t.Fatalf("seed protected controls: %v", err)
+	}
+
+	service := NewConfigService(db)
+	service.auditLogger = log.New(&bytes.Buffer{}, "", 0)
+	assertProtected := func(t *testing.T, err error) {
+		t.Helper()
+		if !errors.Is(err, ErrProtectedSystemConfigKey) {
+			t.Fatalf(
+				"error = %v, want ErrProtectedSystemConfigKey",
+				err,
+			)
+		}
+		// Existing handlers already map invalid generic configuration keys to
+		// a client error. The protected sentinel deliberately preserves that
+		// fail-closed compatibility.
+		if !errors.Is(err, ErrInvalidSystemConfigKey) {
+			t.Fatalf(
+				"error = %v, want compatibility with ErrInvalidSystemConfigKey",
+				err,
+			)
+		}
+	}
+	assertControlsUnchanged := func(t *testing.T) {
+		t.Helper()
+		for _, key := range []string{
+			KeyAgentGlobalReadOnly,
+			KeyAgentEmergencyStop,
+		} {
+			var persisted models.SystemConfig
+			if err := db.Where("key = ?", key).First(&persisted).Error; err != nil {
+				t.Fatalf("load protected control %q: %v", key, err)
+			}
+			if persisted.Value != "false" || persisted.ValueType != "bool" {
+				t.Fatalf(
+					"protected control %q changed: %+v",
+					key,
+					persisted,
+				)
+			}
+		}
+	}
+
+	for _, key := range []string{
+		KeyAgentGlobalReadOnly,
+		KeyAgentEmergencyStop,
+	} {
+		t.Run("single-key/"+key, func(t *testing.T) {
+			assertProtected(t, service.ValidateConfig(key, "true", "bool"))
+			assertProtected(t, service.SetConfig(
+				key,
+				"true",
+				"bool",
+				"generic bypass",
+				CategorySecurity,
+				"agent",
+			))
+			assertControlsUnchanged(t)
+		})
+
+		t.Run("delete/"+key, func(t *testing.T) {
+			assertProtected(t, service.DeleteConfig(key))
+			assertControlsUnchanged(t)
+		})
+	}
+
+	t.Run("batch is atomic", func(t *testing.T) {
+		err := service.BatchUpdateConfigs([]models.SystemConfig{
+			{
+				Key:       "system.safe-batch",
+				Value:     "created",
+				ValueType: "string",
+				Category:  CategorySystem,
+			},
+			{
+				Key:       KeyAgentEmergencyStop,
+				Value:     "true",
+				ValueType: "bool",
+				Category:  CategorySecurity,
+			},
+		})
+		assertProtected(t, err)
+		assertControlsUnchanged(t)
+		var count int64
+		if err := db.Model(&models.SystemConfig{}).
+			Where("key = ?", "system.safe-batch").
+			Count(&count).Error; err != nil {
+			t.Fatalf("count ordinary batch row: %v", err)
+		}
+		if count != 0 {
+			t.Fatal("rejected batch persisted an ordinary row")
+		}
+	})
+
+	t.Run("import is atomic", func(t *testing.T) {
+		payload, err := json.Marshal([]models.SystemConfig{
+			{
+				Key:       "system.safe-import",
+				Value:     "created",
+				ValueType: "string",
+				Category:  CategorySystem,
+			},
+			{
+				Key:       KeyAgentGlobalReadOnly,
+				Value:     "true",
+				ValueType: "bool",
+				Category:  CategorySecurity,
+			},
+		})
+		if err != nil {
+			t.Fatalf("marshal import: %v", err)
+		}
+		assertProtected(t, service.ImportConfigs(payload))
+		assertControlsUnchanged(t)
+		var count int64
+		if err := db.Model(&models.SystemConfig{}).
+			Where("key = ?", "system.safe-import").
+			Count(&count).Error; err != nil {
+			t.Fatalf("count ordinary import row: %v", err)
+		}
+		if count != 0 {
+			t.Fatal("rejected import persisted an ordinary row")
+		}
+	})
+}
+
+func TestConfigServiceGenericListAndExportHideAgentRuntimeControls(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatalf("migrate system configs: %v", err)
+	}
+	configs := []models.SystemConfig{
+		{
+			Key:       "security.visible",
+			Value:     "true",
+			ValueType: "bool",
+			Category:  CategorySecurity,
+			Group:     "visible",
+		},
+		{
+			Key:       KeyAgentGlobalReadOnly,
+			Value:     "true",
+			ValueType: "bool",
+			Category:  CategorySecurity,
+			Group:     "agent",
+		},
+		{
+			Key:       KeyAgentEmergencyStop,
+			Value:     "true",
+			ValueType: "bool",
+			Category:  CategorySecurity,
+			Group:     "agent",
+		},
+	}
+	if err := db.Create(&configs).Error; err != nil {
+		t.Fatalf("seed configs: %v", err)
+	}
+	service := NewConfigService(db)
+
+	page, err := service.ListConfigPage(
+		context.Background(),
+		CategorySecurity,
+		DirectoryPageRequest{
+			Page:      1,
+			PageSize:  25,
+			SortBy:    "key",
+			SortOrder: "asc",
+		},
+	)
+	if err != nil {
+		t.Fatalf("list generic configs: %v", err)
+	}
+	if page.Total != 1 || len(page.Items) != 1 ||
+		page.Items[0].Key != "security.visible" {
+		t.Fatalf("generic list exposed protected controls: %+v", page)
+	}
+
+	data, err := service.ExportConfigs(CategorySecurity)
+	if err != nil {
+		t.Fatalf("export generic configs: %v", err)
+	}
+	var exported []models.SystemConfig
+	if err := json.Unmarshal(data, &exported); err != nil {
+		t.Fatalf("decode export: %v", err)
+	}
+	if len(exported) != 1 || exported[0].Key != "security.visible" {
+		t.Fatalf("generic export exposed protected controls: %+v", exported)
 	}
 }
 

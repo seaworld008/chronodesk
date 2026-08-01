@@ -155,6 +155,25 @@ type AddTicketRelationResult struct {
 	EventID       string                 `json:"event_id"`
 }
 
+type TicketRelationDirection string
+
+const (
+	TicketRelationDirectionOutgoing TicketRelationDirection = "outgoing"
+	TicketRelationDirectionIncoming TicketRelationDirection = "incoming"
+)
+
+// TicketRelationDirectoryItem keeps the immutable relation together with the
+// project-local ticket projection needed by human list views. The projection
+// is loaded in one bounded query for the current page so callers never need an
+// N+1 lookup or expose a bare database identifier to operators.
+type TicketRelationDirectoryItem struct {
+	Relation            models.TicketRelation
+	Direction           TicketRelationDirection
+	RelatedTicketID     uint
+	RelatedTicketNumber string
+	RelatedTicketTitle  string
+}
+
 func (service *TicketRelationshipService) AddTicketRelation(
 	ctx context.Context,
 	input AddTicketRelationInput,
@@ -253,52 +272,162 @@ func (service *TicketRelationshipService) AddTicketRelation(
 func (service *TicketRelationshipService) ListEntityLinks(
 	ctx context.Context,
 	ticketID uint,
-) ([]models.EntityLink, error) {
+	request DirectoryPageRequest,
+) (*DirectoryPage[models.EntityLink], error) {
 	scope, err := RequireProjectScope(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var links []models.EntityLink
+	if ticketID == 0 || validateDirectoryPageRequest(
+		request,
+		map[string]struct{}{"created_at": {}},
+	) != nil {
+		return nil, ErrDirectoryListQuery
+	}
+	page := &DirectoryPage[models.EntityLink]{
+		Items:    make([]models.EntityLink, 0, request.PageSize),
+		Page:     request.Page,
+		PageSize: request.PageSize,
+	}
 	if err := runProjectOperation(ctx, service.db, func(projectCtx context.Context) error {
-		return service.db.WithContext(projectCtx).
+		query := service.db.WithContext(projectCtx).
+			Model(&models.EntityLink{}).
 			Where(
 				"organization_id = ? AND project_id = ? AND ticket_id = ?",
 				scope.OrganizationID,
 				scope.ProjectID,
 				ticketID,
-			).
-			Order("created_at ASC, id ASC").
-			Find(&links).Error
+			)
+		if countErr := query.Count(&page.Total).Error; countErr != nil {
+			return countErr
+		}
+		return query.
+			Order(ticketRelationshipDirectoryOrder(request)).
+			Offset(directoryPageOffset(request)).
+			Limit(request.PageSize).
+			Find(&page.Items).Error
 	}); err != nil {
 		return nil, err
 	}
-	return links, nil
+	page.TotalPages = directoryTotalPages(page.Total, request.PageSize)
+	return page, nil
 }
 
 func (service *TicketRelationshipService) ListTicketRelations(
 	ctx context.Context,
 	ticketID uint,
-) ([]models.TicketRelation, error) {
+	request DirectoryPageRequest,
+) (*DirectoryPage[TicketRelationDirectoryItem], error) {
 	scope, err := RequireProjectScope(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var relations []models.TicketRelation
+	if ticketID == 0 || validateDirectoryPageRequest(
+		request,
+		map[string]struct{}{"created_at": {}},
+	) != nil {
+		return nil, ErrDirectoryListQuery
+	}
+	page := &DirectoryPage[TicketRelationDirectoryItem]{
+		Items:    make([]TicketRelationDirectoryItem, 0, request.PageSize),
+		Page:     request.Page,
+		PageSize: request.PageSize,
+	}
 	if err := runProjectOperation(ctx, service.db, func(projectCtx context.Context) error {
-		return service.db.WithContext(projectCtx).
+		query := service.db.WithContext(projectCtx).
+			Model(&models.TicketRelation{}).
 			Where(
 				"organization_id = ? AND project_id = ? AND (source_ticket_id = ? OR target_ticket_id = ?)",
 				scope.OrganizationID,
 				scope.ProjectID,
 				ticketID,
 				ticketID,
+			)
+		if countErr := query.Count(&page.Total).Error; countErr != nil {
+			return countErr
+		}
+		relations := make([]models.TicketRelation, 0, request.PageSize)
+		if findErr := query.
+			Order(ticketRelationshipDirectoryOrder(request)).
+			Offset(directoryPageOffset(request)).
+			Limit(request.PageSize).
+			Find(&relations).Error; findErr != nil {
+			return findErr
+		}
+		if len(relations) == 0 {
+			return nil
+		}
+		relatedIDs := make([]uint, 0, len(relations))
+		seenIDs := make(map[uint]struct{}, len(relations))
+		for index := range relations {
+			relatedID := relations[index].TargetTicketID
+			if relatedID == ticketID {
+				relatedID = relations[index].SourceTicketID
+			}
+			if _, seen := seenIDs[relatedID]; seen {
+				continue
+			}
+			seenIDs[relatedID] = struct{}{}
+			relatedIDs = append(relatedIDs, relatedID)
+		}
+		type relatedTicketProjection struct {
+			ID           uint
+			TicketNumber string
+			Title        string
+		}
+		var projections []relatedTicketProjection
+		if projectionErr := service.db.WithContext(projectCtx).
+			Model(&models.Ticket{}).
+			Select("id", "ticket_number", "title").
+			Where(
+				"organization_id = ? AND project_id = ? AND id IN ?",
+				scope.OrganizationID,
+				scope.ProjectID,
+				relatedIDs,
 			).
-			Order("created_at ASC, id ASC").
-			Find(&relations).Error
+			Find(&projections).Error; projectionErr != nil {
+			return projectionErr
+		}
+		byID := make(map[uint]relatedTicketProjection, len(projections))
+		for index := range projections {
+			byID[projections[index].ID] = projections[index]
+		}
+		for index := range relations {
+			relation := relations[index]
+			direction := TicketRelationDirectionOutgoing
+			relatedID := relation.TargetTicketID
+			if relation.TargetTicketID == ticketID {
+				direction = TicketRelationDirectionIncoming
+				relatedID = relation.SourceTicketID
+			}
+			related, exists := byID[relatedID]
+			if !exists {
+				return fmt.Errorf(
+					"related project ticket %d is unavailable",
+					relatedID,
+				)
+			}
+			page.Items = append(page.Items, TicketRelationDirectoryItem{
+				Relation:            relation,
+				Direction:           direction,
+				RelatedTicketID:     related.ID,
+				RelatedTicketNumber: related.TicketNumber,
+				RelatedTicketTitle:  related.Title,
+			})
+		}
+		return nil
 	}); err != nil {
 		return nil, err
 	}
-	return relations, nil
+	page.TotalPages = directoryTotalPages(page.Total, request.PageSize)
+	return page, nil
+}
+
+func ticketRelationshipDirectoryOrder(request DirectoryPageRequest) string {
+	if request.SortOrder == "asc" {
+		return "created_at ASC, id ASC"
+	}
+	return "created_at DESC, id DESC"
 }
 
 func lockedScopedTicket(

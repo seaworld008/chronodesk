@@ -18,7 +18,15 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/models"
 )
 
-const openSearchKnowledgeMaxResponseBytes = 8 << 20
+const (
+	openSearchKnowledgeMaxResponseBytes    = 8 << 20
+	openSearchKnowledgeBulkMaxDocuments    = 500
+	openSearchKnowledgeBulkMaxPayloadBytes = 8 << 20
+)
+
+var ErrOpenSearchKnowledgeBulkDocumentTooLarge = errors.New(
+	"OpenSearch knowledge bulk document exceeds the payload limit",
+)
 
 var openSearchControlNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
 
@@ -135,36 +143,34 @@ func (index *OpenSearchKnowledgeIndex) Search(
 	if err := request.Filter.Validate(); err != nil {
 		return nil, fmt.Errorf("OpenSearch knowledge filter: %w", err)
 	}
+	hasEmbedding := len(request.QueryEmbedding) > 0
 	if strings.TrimSpace(request.Query) == "" ||
 		request.Limit < 1 ||
 		request.Limit > 100 ||
-		len(request.QueryEmbedding) != index.vectorDimension {
+		(hasEmbedding &&
+			len(request.QueryEmbedding) != index.vectorDimension) {
 		return nil, errors.New("OpenSearch knowledge search request is invalid")
 	}
 	aclValues := make([]string, 0, len(request.Filter.ACLSubjects))
 	for _, subject := range request.Filter.ACLSubjects {
 		aclValues = append(aclValues, openSearchACLSubject(subject))
 	}
-	commonFilter := map[string]any{
-		"bool": map[string]any{
-			"filter": []any{
-				map[string]any{"term": map[string]any{
-					"organization_id": request.Filter.OrganizationID,
-				}},
-				map[string]any{"term": map[string]any{
-					"project_id": request.Filter.ProjectID,
-				}},
-				map[string]any{"term": map[string]any{
-					"published": request.Filter.PublishedOnly,
-				}},
-				map[string]any{"term": map[string]any{
-					"virus_scan": request.Filter.VirusScan,
-				}},
-				map[string]any{"terms": map[string]any{
-					"acl_subjects": aclValues,
-				}},
-			},
-		},
+	filterClauses := []any{
+		map[string]any{"term": map[string]any{
+			"organization_id": request.Filter.OrganizationID,
+		}},
+		map[string]any{"term": map[string]any{
+			"project_id": request.Filter.ProjectID,
+		}},
+		map[string]any{"term": map[string]any{
+			"published": request.Filter.PublishedOnly,
+		}},
+		map[string]any{"term": map[string]any{
+			"virus_scan": request.Filter.VirusScan,
+		}},
+		map[string]any{"terms": map[string]any{
+			"acl_subjects": aclValues,
+		}},
 	}
 	body := map[string]any{
 		"size": request.Limit,
@@ -172,6 +178,27 @@ func (index *OpenSearchKnowledgeIndex) Search(
 			"excludes": []string{"embedding", "content", "acl_subjects"},
 		},
 		"query": map[string]any{
+			"bool": map[string]any{
+				"must": []any{map[string]any{
+					"match": map[string]any{
+						"content": map[string]any{
+							"query": request.Query,
+						},
+					},
+				}},
+				"filter": filterClauses,
+			},
+		},
+	}
+	searchPath := "/" + index.projectAlias(
+		request.Filter.OrganizationID,
+		request.Filter.ProjectID,
+	) + "/_search"
+	if hasEmbedding {
+		commonFilter := map[string]any{
+			"bool": map[string]any{"filter": filterClauses},
+		}
+		body["query"] = map[string]any{
 			"hybrid": map[string]any{
 				"filter": commonFilter,
 				"queries": []any{
@@ -192,7 +219,9 @@ func (index *OpenSearchKnowledgeIndex) Search(
 					},
 				},
 			},
-		},
+		}
+		searchPath += "?search_pipeline=" +
+			url.QueryEscape(index.searchPipeline)
 	}
 	response := struct {
 		Hits struct {
@@ -213,14 +242,10 @@ func (index *OpenSearchKnowledgeIndex) Search(
 			} `json:"hits"`
 		} `json:"hits"`
 	}{}
-	path := "/" + index.projectAlias(
-		request.Filter.OrganizationID,
-		request.Filter.ProjectID,
-	) + "/_search?search_pipeline=" + url.QueryEscape(index.searchPipeline)
 	if err := index.doJSON(
 		ctx,
 		http.MethodPost,
-		path,
+		searchPath,
 		body,
 		&response,
 		http.StatusOK,
@@ -251,6 +276,36 @@ func (index *OpenSearchKnowledgeIndex) ReplaceProject(
 	ctx context.Context,
 	replacement HybridIndexReplacement,
 ) error {
+	if strings.TrimSpace(replacement.SourceDigest) == "" {
+		return errors.New("OpenSearch replacement digest is required")
+	}
+	delivered := false
+	return index.ReplaceProjectBatches(
+		ctx,
+		HybridIndexReplacement{
+			OrganizationID: replacement.OrganizationID,
+			ProjectID:      replacement.ProjectID,
+			Generation:     replacement.Generation,
+		},
+		func(context.Context) ([]HybridIndexDocument, error) {
+			if delivered {
+				return nil, nil
+			}
+			delivered = true
+			return replacement.Documents, nil
+		},
+	)
+}
+
+// ReplaceProjectBatches builds a never-current generation from a bounded
+// source and moves the project alias only after every bulk request succeeds.
+// Any pre-activation failure removes the incomplete generation while leaving
+// the old alias untouched.
+func (index *OpenSearchKnowledgeIndex) ReplaceProjectBatches(
+	ctx context.Context,
+	replacement HybridIndexReplacement,
+	source HybridIndexBatchSource,
+) (returnErr error) {
 	scope := models.ProjectScope{
 		OrganizationID: replacement.OrganizationID,
 		ProjectID:      replacement.ProjectID,
@@ -261,30 +316,34 @@ func (index *OpenSearchKnowledgeIndex) ReplaceProject(
 	if err := scope.Validate(); err != nil {
 		return fmt.Errorf("OpenSearch replacement scope: %w", err)
 	}
-	if replacement.Generation == 0 ||
-		strings.TrimSpace(replacement.SourceDigest) == "" {
-		return errors.New("OpenSearch replacement generation and digest are required")
+	if replacement.Generation == 0 {
+		return errors.New("OpenSearch replacement generation is required")
 	}
-	seenChunks := make(map[string]struct{}, len(replacement.Documents))
-	for _, document := range replacement.Documents {
-		if document.OrganizationID != replacement.OrganizationID ||
-			document.ProjectID != replacement.ProjectID ||
-			strings.TrimSpace(document.ChunkID) == "" ||
-			len(document.Embedding) != index.vectorDimension {
-			return errors.New("OpenSearch replacement contains an invalid document")
-		}
-		if _, duplicate := seenChunks[document.ChunkID]; duplicate {
-			return errors.New("OpenSearch replacement contains duplicate chunks")
-		}
-		seenChunks[document.ChunkID] = struct{}{}
-		for _, subject := range document.ACLSubjects {
-			if err := subject.Validate(); err != nil {
-				return fmt.Errorf("OpenSearch document ACL: %w", err)
-			}
-		}
+	if source == nil {
+		return errors.New("OpenSearch replacement batch source is required")
 	}
-	if err := index.EnsureSearchPipeline(ctx); err != nil {
+	firstBatch, err := source(ctx)
+	if err != nil {
+		return fmt.Errorf("load first OpenSearch replacement batch: %w", err)
+	}
+	var (
+		lastChunkID      string
+		embeddingMode    bool
+		embeddingModeSet bool
+	)
+	if err := index.validateReplacementBatch(
+		replacement,
+		firstBatch,
+		&lastChunkID,
+		&embeddingMode,
+		&embeddingModeSet,
+	); err != nil {
 		return err
+	}
+	if embeddingMode {
+		if err := index.EnsureSearchPipeline(ctx); err != nil {
+			return err
+		}
 	}
 	indexName := index.projectGenerationIndex(
 		replacement.OrganizationID,
@@ -298,21 +357,121 @@ func (index *OpenSearchKnowledgeIndex) ReplaceProject(
 		return err
 	}
 	if err := index.createGenerationIndex(ctx, indexName); err != nil {
+		cleanupErr := index.deleteGenerationIndex(ctx, indexName)
+		if cleanupErr != nil {
+			return errors.Join(err, fmt.Errorf(
+				"clean incomplete OpenSearch generation: %w",
+				cleanupErr,
+			))
+		}
 		return err
 	}
+	activated := false
+	defer func() {
+		if returnErr == nil || activated {
+			return
+		}
+		if cleanupErr := index.deleteGenerationIndex(
+			ctx,
+			indexName,
+		); cleanupErr != nil {
+			returnErr = errors.Join(
+				returnErr,
+				fmt.Errorf(
+					"clean incomplete OpenSearch generation: %w",
+					cleanupErr,
+				),
+			)
+		}
+	}()
 	if err := index.bulkIndexDocuments(
 		ctx,
 		indexName,
-		replacement.Documents,
+		firstBatch,
 	); err != nil {
 		return err
 	}
-	return index.moveProjectAlias(
+	firstBatch = nil
+	for {
+		documents, err := source(ctx)
+		if err != nil {
+			return fmt.Errorf(
+				"load OpenSearch replacement batch: %w",
+				err,
+			)
+		}
+		if len(documents) == 0 {
+			break
+		}
+		if err := index.validateReplacementBatch(
+			replacement,
+			documents,
+			&lastChunkID,
+			&embeddingMode,
+			&embeddingModeSet,
+		); err != nil {
+			return err
+		}
+		if err := index.bulkIndexDocuments(
+			ctx,
+			indexName,
+			documents,
+		); err != nil {
+			return err
+		}
+	}
+	if err := index.moveProjectAlias(
 		ctx,
 		indexName,
 		replacement.OrganizationID,
 		replacement.ProjectID,
-	)
+	); err != nil {
+		return err
+	}
+	activated = true
+	return nil
+}
+
+func (index *OpenSearchKnowledgeIndex) validateReplacementBatch(
+	replacement HybridIndexReplacement,
+	documents []HybridIndexDocument,
+	lastChunkID *string,
+	embeddingMode *bool,
+	embeddingModeSet *bool,
+) error {
+	for _, document := range documents {
+		chunkID := strings.TrimSpace(document.ChunkID)
+		if document.OrganizationID != replacement.OrganizationID ||
+			document.ProjectID != replacement.ProjectID ||
+			chunkID == "" ||
+			(len(document.Embedding) != 0 &&
+				len(document.Embedding) != index.vectorDimension) {
+			return errors.New(
+				"OpenSearch replacement contains an invalid document",
+			)
+		}
+		if *lastChunkID != "" && chunkID <= *lastChunkID {
+			return errors.New(
+				"OpenSearch replacement chunks are not strictly ordered",
+			)
+		}
+		hasEmbedding := len(document.Embedding) > 0
+		if !*embeddingModeSet {
+			*embeddingMode = hasEmbedding
+			*embeddingModeSet = true
+		} else if hasEmbedding != *embeddingMode {
+			return errors.New(
+				"OpenSearch replacement mixes lexical and vector documents",
+			)
+		}
+		for _, subject := range document.ACLSubjects {
+			if err := subject.Validate(); err != nil {
+				return fmt.Errorf("OpenSearch document ACL: %w", err)
+			}
+		}
+		*lastChunkID = chunkID
+	}
+	return nil
 }
 
 func (index *OpenSearchKnowledgeIndex) deleteGenerationIndex(
@@ -391,59 +550,103 @@ func (index *OpenSearchKnowledgeIndex) bulkIndexDocuments(
 		return nil
 	}
 	var payload bytes.Buffer
+	documentCount := 0
+	flush := func() error {
+		if documentCount == 0 {
+			return nil
+		}
+		response := struct {
+			Errors bool `json:"errors"`
+		}{}
+		if err := index.doRequest(
+			ctx,
+			http.MethodPost,
+			"/_bulk?refresh=wait_for",
+			"application/x-ndjson",
+			bytes.NewReader(payload.Bytes()),
+			&response,
+			http.StatusOK,
+		); err != nil {
+			return err
+		}
+		if response.Errors {
+			return errors.New(
+				"OpenSearch bulk replacement contains failed items",
+			)
+		}
+		payload.Reset()
+		documentCount = 0
+		return nil
+	}
+	for _, document := range documents {
+		encoded, err := encodeOpenSearchKnowledgeBulkDocument(
+			indexName,
+			document,
+		)
+		if err != nil {
+			return err
+		}
+		if len(encoded) > openSearchKnowledgeBulkMaxPayloadBytes {
+			return ErrOpenSearchKnowledgeBulkDocumentTooLarge
+		}
+		if documentCount >= openSearchKnowledgeBulkMaxDocuments ||
+			(documentCount > 0 &&
+				payload.Len()+len(encoded) >
+					openSearchKnowledgeBulkMaxPayloadBytes) {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		if _, err := payload.Write(encoded); err != nil {
+			return err
+		}
+		documentCount++
+	}
+	return flush()
+}
+
+func encodeOpenSearchKnowledgeBulkDocument(
+	indexName string,
+	document HybridIndexDocument,
+) ([]byte, error) {
+	var payload bytes.Buffer
 	encoder := json.NewEncoder(&payload)
 	encoder.SetEscapeHTML(true)
-	for _, document := range documents {
-		if err := encoder.Encode(map[string]any{
-			"index": map[string]any{
-				"_index": indexName,
-				"_id":    document.ChunkID,
-			},
-		}); err != nil {
-			return err
-		}
-		aclSubjects := make([]string, 0, len(document.ACLSubjects))
-		for _, subject := range document.ACLSubjects {
-			aclSubjects = append(aclSubjects, openSearchACLSubject(subject))
-		}
-		if err := encoder.Encode(map[string]any{
-			"organization_id":  document.OrganizationID,
-			"project_id":       document.ProjectID,
-			"article_id":       document.ArticleID,
-			"version_id":       document.VersionID,
-			"document_version": document.DocumentVersion,
-			"chunk_id":         document.ChunkID,
-			"page_number":      document.PageNumber,
-			"content":          document.Content,
-			"snippet":          document.Snippet,
-			"content_hash":     document.ContentHash,
-			"token_count":      document.TokenCount,
-			"acl_subjects":     aclSubjects,
-			"published":        true,
-			"virus_scan":       models.VirusScanClean,
-			"embedding":        document.Embedding,
-		}); err != nil {
-			return err
-		}
+	if err := encoder.Encode(map[string]any{
+		"index": map[string]any{
+			"_index": indexName,
+			"_id":    document.ChunkID,
+		},
+	}); err != nil {
+		return nil, err
 	}
-	response := struct {
-		Errors bool `json:"errors"`
-	}{}
-	if err := index.doRequest(
-		ctx,
-		http.MethodPost,
-		"/_bulk?refresh=wait_for",
-		"application/x-ndjson",
-		&payload,
-		&response,
-		http.StatusOK,
-	); err != nil {
-		return err
+	aclSubjects := make([]string, 0, len(document.ACLSubjects))
+	for _, subject := range document.ACLSubjects {
+		aclSubjects = append(aclSubjects, openSearchACLSubject(subject))
 	}
-	if response.Errors {
-		return errors.New("OpenSearch bulk replacement contains failed items")
+	source := map[string]any{
+		"organization_id":  document.OrganizationID,
+		"project_id":       document.ProjectID,
+		"article_id":       document.ArticleID,
+		"version_id":       document.VersionID,
+		"document_version": document.DocumentVersion,
+		"chunk_id":         document.ChunkID,
+		"page_number":      document.PageNumber,
+		"content":          document.Content,
+		"snippet":          document.Snippet,
+		"content_hash":     document.ContentHash,
+		"token_count":      document.TokenCount,
+		"acl_subjects":     aclSubjects,
+		"published":        true,
+		"virus_scan":       models.VirusScanClean,
 	}
-	return nil
+	if len(document.Embedding) > 0 {
+		source["embedding"] = document.Embedding
+	}
+	if err := encoder.Encode(source); err != nil {
+		return nil, err
+	}
+	return payload.Bytes(), nil
 }
 
 func (index *OpenSearchKnowledgeIndex) moveProjectAlias(

@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -40,6 +42,7 @@ func TestAutomationRuleListQueryIsStrict(t *testing.T) {
 		"is_active=0",
 		"is_active=TRUE",
 		"rule_type=bad-type",
+		"rule_type=unknown",
 		"sort=%5B%22created_at%22%2C%22DESC%22%5D",
 	} {
 		t.Run(raw, func(t *testing.T) {
@@ -90,6 +93,123 @@ func TestAutomationExecutionLogQueryIsStrict(t *testing.T) {
 			}
 			if response.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d body=%s", response.Code, response.Body)
+			}
+		})
+	}
+}
+
+func TestAutomationConfigurationListQueriesAreStrict(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name  string
+		raw   string
+		parse func(*gin.Context) (automationConfigListQuery, bool)
+		check func(*testing.T, automationConfigListQuery)
+	}{
+		{
+			name:  "SLA defaults",
+			parse: requireSLAConfigListQuery,
+			check: func(t *testing.T, query automationConfigListQuery) {
+				t.Helper()
+				if query.page != 1 ||
+					query.pageSize != services.DefaultAutomationListSize {
+					t.Fatalf("defaults = %+v", query)
+				}
+			},
+		},
+		{
+			name:  "SLA filters",
+			raw:   "page=2&page_size=100&is_active=false",
+			parse: requireSLAConfigListQuery,
+			check: func(t *testing.T, query automationConfigListQuery) {
+				t.Helper()
+				if query.page != 2 || query.pageSize != 100 ||
+					query.isActive == nil || *query.isActive {
+					t.Fatalf("query = %+v", query)
+				}
+			},
+		},
+		{
+			name:  "template filters",
+			raw:   "category=incident&is_active=true&page=3&page_size=50",
+			parse: requireTicketTemplateListQuery,
+			check: func(t *testing.T, query automationConfigListQuery) {
+				t.Helper()
+				if query.category != "incident" ||
+					query.isActive == nil || !*query.isActive ||
+					query.page != 3 || query.pageSize != 50 {
+					t.Fatalf("query = %+v", query)
+				}
+			},
+		},
+		{
+			name:  "quick reply filters",
+			raw:   "category=network&keyword=timeout&is_public=true",
+			parse: requireQuickReplyListQuery,
+			check: func(t *testing.T, query automationConfigListQuery) {
+				t.Helper()
+				if query.category != "network" ||
+					query.keyword != "timeout" ||
+					query.isPublic == nil || !*query.isPublic {
+					t.Fatalf("query = %+v", query)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			context, response := automationListQueryTestContext(t, test.raw)
+			query, ok := test.parse(context)
+			if !ok || response.Code != http.StatusOK {
+				t.Fatalf("query = %+v ok=%v status=%d body=%s", query, ok, response.Code, response.Body)
+			}
+			test.check(t, query)
+		})
+	}
+
+	for _, test := range []struct {
+		name  string
+		raw   string
+		parse func(*gin.Context) (automationConfigListQuery, bool)
+	}{
+		{name: "unknown", raw: "unknown=value", parse: requireSLAConfigListQuery},
+		{name: "duplicate", raw: "page=1&page=2", parse: requireSLAConfigListQuery},
+		{name: "empty", raw: "page=", parse: requireSLAConfigListQuery},
+		{name: "zero", raw: "page=0", parse: requireSLAConfigListQuery},
+		{name: "negative", raw: "page=-1", parse: requireSLAConfigListQuery},
+		{name: "oversize", raw: "page_size=101", parse: requireSLAConfigListQuery},
+		{name: "invalid boolean", raw: "is_active=TRUE", parse: requireSLAConfigListQuery},
+		{name: "empty filter", raw: "category=", parse: requireTicketTemplateListQuery},
+		{name: "trimmed filter", raw: "category=%20incident", parse: requireTicketTemplateListQuery},
+		{name: "control filter", raw: "keyword=line%0Abreak", parse: requireQuickReplyListQuery},
+		{name: "invalid UTF8", raw: "keyword=%FF", parse: requireQuickReplyListQuery},
+		{
+			name:  "category too long",
+			raw:   "category=" + strings.Repeat("x", services.MaxAutomationCategoryFilterLength+1),
+			parse: requireTicketTemplateListQuery,
+		},
+		{
+			name:  "keyword too long",
+			raw:   "keyword=" + strings.Repeat("x", services.MaxAutomationKeywordFilterLength+1),
+			parse: requireQuickReplyListQuery,
+		},
+		{
+			name:  "offset overflow",
+			raw:   "page=999999999999999999999999&page_size=100",
+			parse: requireQuickReplyListQuery,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			context, response := automationListQueryTestContext(t, test.raw)
+			if _, ok := test.parse(context); ok {
+				t.Fatal("invalid query accepted")
+			}
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf(
+					"status=%d body=%s",
+					response.Code,
+					response.Body.String(),
+				)
 			}
 		})
 	}
@@ -152,6 +272,75 @@ func TestWebhookListQueriesAreStrict(t *testing.T) {
 				t.Fatalf("status = %d body=%s", response.Code, response.Body)
 			}
 		})
+	}
+}
+
+func TestWebhookStatsDaysQueryIsStrict(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, test := range []struct {
+		raw  string
+		want int
+	}{
+		{raw: "", want: 7},
+		{raw: "days=1", want: 1},
+		{raw: "days=90", want: 90},
+	} {
+		t.Run("valid "+test.raw, func(t *testing.T) {
+			ctx, _ := automationListQueryTestContext(t, test.raw)
+			days, ok := requireWebhookStatsDays(ctx)
+			if !ok || days != test.want {
+				t.Fatalf("days=%d ok=%v, want %d", days, ok, test.want)
+			}
+		})
+	}
+
+	for _, raw := range []string{
+		"days=",
+		"days=0",
+		"days=-1",
+		"days=91",
+		"days=abc",
+		"days=%207",
+		"days=7&days=8",
+		"page=1",
+		"days=%ZZ",
+	} {
+		t.Run("invalid "+raw, func(t *testing.T) {
+			ctx, response := automationListQueryTestContext(t, raw)
+			if _, ok := requireWebhookStatsDays(ctx); ok {
+				t.Fatal("invalid stats query accepted")
+			}
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf(
+					"status=%d body=%s",
+					response.Code,
+					response.Body.String(),
+				)
+			}
+		})
+	}
+}
+
+func TestWebhookListQueryErrorUsesClosedStandardEnvelope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, response := automationListQueryTestContext(t, "unknown=value")
+	if _, ok := requireWebhookDefinitionQuery(ctx); ok {
+		t.Fatal("invalid Webhook query accepted")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) != 3 ||
+		payload["code"] != float64(1) ||
+		payload["msg"] != "列表查询参数无效" {
+		t.Fatalf("Webhook error envelope = %#v", payload)
+	}
+	if _, present := payload["data"]; !present {
+		t.Fatalf("Webhook error envelope omits data: %#v", payload)
+	}
+	if _, present := payload["error"]; present {
+		t.Fatalf("Webhook error envelope exposes unpublished error: %#v", payload)
 	}
 }
 

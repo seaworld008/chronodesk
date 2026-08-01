@@ -114,7 +114,8 @@ type WebhookConfigResponse struct {
 	Name                    string                     `json:"name"`
 	Description             string                     `json:"description"`
 	Provider                models.WebhookProvider     `json:"provider"`
-	WebhookURL              string                     `json:"webhook_url"`
+	WebhookURLMasked        string                     `json:"webhook_url_masked"`
+	HasWebhookURL           bool                       `json:"has_webhook_url"`
 	Status                  models.WebhookStatus       `json:"status"`
 	PreviousSecretExpiresAt *time.Time                 `json:"previous_secret_expires_at,omitempty"`
 	EnabledEvents           string                     `json:"enabled_events"`
@@ -246,7 +247,8 @@ func newWebhookConfigResponse(
 		Name:                    webhook.Name,
 		Description:             webhook.Description,
 		Provider:                webhook.Provider,
-		WebhookURL:              webhook.WebhookURL,
+		WebhookURLMasked:        maskWebhookURL(webhook.WebhookURL),
+		HasWebhookURL:           strings.TrimSpace(webhook.WebhookURL) != "",
 		Status:                  webhook.Status,
 		PreviousSecretExpiresAt: webhook.PreviousSecretExpiresAt,
 		EnabledEvents:           webhook.EnabledEvents,
@@ -274,6 +276,15 @@ func newWebhookConfigResponse(
 		CreatedBy:         webhook.CreatedBy,
 		UpdatedBy:         webhook.UpdatedBy,
 	}
+}
+
+func maskWebhookURL(value string) string {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || !strings.EqualFold(parsed.Scheme, "https") ||
+		strings.TrimSpace(parsed.Host) == "" {
+		return ""
+	}
+	return "https://" + parsed.Host + "/…"
 }
 
 func newWebhookLogResponse(log models.WebhookLog) WebhookLogResponse {
@@ -1045,25 +1056,22 @@ func (h *WebhookHandler) GetWebhookLogs(c *gin.Context) {
 			writeInvalidWebhookListQuery(c)
 		case errors.Is(err, services.ErrWebhookConfigNotFound):
 			c.JSON(http.StatusNotFound, gin.H{
-				"code":  1,
-				"msg":   "Webhook 不存在",
-				"error": "not_found",
-				"data":  nil,
+				"code": 1,
+				"msg":  "Webhook 不存在",
+				"data": nil,
 			})
 		case errors.Is(err, services.ErrWebhookListCursorKey):
 			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"code":  1,
-				"msg":   "Webhook 投递记录暂不可用",
-				"error": "service_unavailable",
-				"data":  nil,
+				"code": 1,
+				"msg":  "Webhook 投递记录暂不可用",
+				"data": nil,
 			})
 		default:
 			logHandlerFailure(c, "webhook.list_logs", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
-				"code":  1,
-				"msg":   "获取日志失败",
-				"error": "internal_error",
-				"data":  nil,
+				"code": 1,
+				"msg":  "获取日志失败",
+				"data": nil,
 			})
 		}
 		return
@@ -1092,8 +1100,9 @@ func (h *WebhookHandler) GetWebhookLogs(c *gin.Context) {
 // @Produce json
 // @Param projectKey path string true "项目 Key"
 // @Param id path int true "Webhook ID"
-// @Param days query int false "统计天数" default(7)
+// @Param days query int false "统计天数（1-90）" default(7) minimum(1) maximum(90)
 // @Success 200 {object} map[string]interface{}
+// @Failure 400 {object} map[string]interface{}
 // @Failure 500 {object} map[string]interface{}
 // @Router /api/projects/{projectKey}/webhooks/{id}/stats [get]
 // @Security BearerAuth
@@ -1112,12 +1121,12 @@ func (h *WebhookHandler) GetWebhookStats(c *gin.Context) {
 		return
 	}
 
-	days, _ := strconv.Atoi(c.DefaultQuery("days", "7"))
-	if days < 1 || days > 365 {
-		days = 7
+	days, validDays := requireWebhookStatsDays(c)
+	if !validDays {
+		return
 	}
 
-	startTime := time.Now().AddDate(0, 0, -days)
+	startTime := time.Now().UTC().AddDate(0, 0, -days)
 
 	// 获取基础统计
 	var stats WebhookStatsSummaryResponse
@@ -1358,7 +1367,39 @@ func requireWebhookDeliveryQuery(
 	return query, true
 }
 
+func requireWebhookStatsDays(c *gin.Context) (int, bool) {
+	values, ok := parseStrictWebhookQueryValues(c, map[string]struct{}{
+		"days": {},
+	})
+	if !ok {
+		writeInvalidWebhookStatsQuery(c)
+		return 0, false
+	}
+	days := 7
+	if raw, exists := values["days"]; exists {
+		value, valid := strictWebhookPositiveInt(raw, 90)
+		if !valid {
+			writeInvalidWebhookStatsQuery(c)
+			return 0, false
+		}
+		days = value
+	}
+	return days, true
+}
+
 func strictWebhookQueryValues(
+	c *gin.Context,
+	allowed map[string]struct{},
+) (map[string]string, bool) {
+	result, ok := parseStrictWebhookQueryValues(c, allowed)
+	if !ok {
+		writeInvalidWebhookListQuery(c)
+		return nil, false
+	}
+	return result, true
+}
+
+func parseStrictWebhookQueryValues(
 	c *gin.Context,
 	allowed map[string]struct{},
 ) (map[string]string, bool) {
@@ -1367,18 +1408,15 @@ func strictWebhookQueryValues(
 	}
 	parsed, err := url.ParseQuery(c.Request.URL.RawQuery)
 	if err != nil {
-		writeInvalidWebhookListQuery(c)
 		return nil, false
 	}
 	result := make(map[string]string, len(parsed))
 	for key, values := range parsed {
 		if _, exists := allowed[key]; !exists || len(values) != 1 {
-			writeInvalidWebhookListQuery(c)
 			return nil, false
 		}
 		value := values[0]
 		if value == "" || strings.TrimSpace(value) != value {
-			writeInvalidWebhookListQuery(c)
 			return nil, false
 		}
 		result[key] = value
@@ -1443,10 +1481,17 @@ func validWebhookStatus(status models.WebhookStatus) bool {
 
 func writeInvalidWebhookListQuery(c *gin.Context) {
 	c.JSON(http.StatusBadRequest, gin.H{
-		"code":  1,
-		"msg":   "列表查询参数无效",
-		"error": "invalid_request",
-		"data":  nil,
+		"code": 1,
+		"msg":  "列表查询参数无效",
+		"data": nil,
+	})
+}
+
+func writeInvalidWebhookStatsQuery(c *gin.Context) {
+	c.JSON(http.StatusBadRequest, gin.H{
+		"code": 1,
+		"msg":  "Webhook 统计查询参数无效，days 必须为 1 到 90 的整数",
+		"data": nil,
 	})
 }
 
