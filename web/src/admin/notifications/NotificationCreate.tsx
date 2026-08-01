@@ -1,5 +1,4 @@
 import {
-    AutocompleteInput,
     Create,
     ReferenceInput,
     SelectInput,
@@ -7,6 +6,7 @@ import {
     TextInput,
     required,
 } from 'react-admin'
+import { EnterpriseReferenceAutocompleteInput } from '@/components/inputs/EnterpriseFilterInputs'
 import type {
     CreateNotificationRequest,
     NotificationChannel,
@@ -149,7 +149,7 @@ const NotificationCreate = () => (
                 reference="assignees"
                 label="接收者"
             >
-                <AutocompleteInput
+                <EnterpriseReferenceAutocompleteInput
                     label="接收者"
                     optionText="username"
                     validate={required()}

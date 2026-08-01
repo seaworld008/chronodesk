@@ -48,6 +48,7 @@ import {
     auditFiltersToSearchParams,
     type AuditExplorerFilters,
 } from './auditExplorerState'
+import AuditExportDialog from './AuditExportDialog'
 
 const columns: ResizableColumn[] = [
     { key: 'time', defaultWidth: 176, minWidth: 152, maxWidth: 240 },
@@ -61,6 +62,26 @@ const columns: ResizableColumn[] = [
     { key: 'ip', defaultWidth: 144, minWidth: 120, maxWidth: 200 },
 ]
 
+const maxAuditCursorHistory = 100
+
+const auditActorType = (item: object): string =>
+    'actor_type' in item && typeof item.actor_type === 'string'
+        ? item.actor_type
+        : ''
+
+const isNonHumanAuditActor = (item: object): boolean => {
+    const actorType = auditActorType(item)
+    return actorType === 'system' || actorType === 'service_principal'
+}
+
+const auditRoleLabel = (
+    item: AdminAuditLog | AdminAuditLogDetail,
+): string => {
+    const role = parsePlatformRole(item.platform_role)
+    if (role) return getPlatformRoleLabel(role)
+    return auditActorType(item) === 'system' ? '系统' : '—'
+}
+
 const validPage = (value: unknown): value is AdminAuditLogPage =>
     typeof value === 'object' &&
     value !== null &&
@@ -73,7 +94,8 @@ const validPage = (value: unknown): value is AdminAuditLogPage =>
             typeof item.id === 'number' &&
             typeof item.created_at === 'string' &&
             typeof item.username === 'string' &&
-            parsePlatformRole(item.platform_role) !== null &&
+            (parsePlatformRole(item.platform_role) !== null ||
+                isNonHumanAuditActor(item)) &&
             typeof item.action === 'string' &&
             typeof item.method === 'string' &&
             typeof item.path === 'string' &&
@@ -82,10 +104,13 @@ const validPage = (value: unknown): value is AdminAuditLogPage =>
             typeof item.latency_ms === 'number' &&
             typeof item.result === 'string',
     ) &&
-    'total' in value &&
-    typeof value.total === 'number' &&
-    'limit' in value &&
-    typeof value.limit === 'number'
+    'next_cursor' in value &&
+    typeof value.next_cursor === 'string' &&
+    'has_more' in value &&
+    typeof value.has_more === 'boolean' &&
+    (value.has_more
+        ? value.next_cursor.length > 0
+        : value.next_cursor.length === 0)
 
 const detailLine = (label: string, value?: string | number) => (
     <Box>
@@ -114,6 +139,7 @@ const PlatformAuditExplorer = () => {
     const [detailLoading, setDetailLoading] = React.useState(false)
     const [detailError, setDetailError] = React.useState('')
     const [retryNonce, setRetryNonce] = React.useState(0)
+    const [exportOpen, setExportOpen] = React.useState(false)
 
     React.useEffect(() => setDraft(filters), [filters])
 
@@ -214,8 +240,10 @@ const PlatformAuditExplorer = () => {
     }
 
     const openNextPage = () => {
-        if (!page?.next_cursor) return
-        setCursorHistory((history) => [...history, filters.cursor])
+        if (!page?.has_more || !page.next_cursor) return
+        setCursorHistory((history) =>
+            [...history, filters.cursor].slice(-maxAuditCursorHistory),
+        )
         setSearchParams(
             auditFiltersToSearchParams({
                 ...filters,
@@ -233,18 +261,50 @@ const PlatformAuditExplorer = () => {
         )
     }
 
+    const changePageSize = (value: number) => {
+        if (![25, 50, 100].includes(value)) return
+        setCursorHistory([])
+        setSearchParams(
+            auditFiltersToSearchParams({
+                ...filters,
+                cursor: '',
+                limit: value,
+            }),
+        )
+    }
+
     return (
         <Box
             data-testid="platform-audit-page"
             sx={{ p: { xs: 2, md: 3 }, minWidth: 0 }}
         >
             <Title title="平台审计" />
-            <Typography variant="h4" gutterBottom>
-                平台审计探索器
-            </Typography>
-            <Typography color="text.secondary" sx={{ mb: 2 }}>
-                只读查看平台治理操作。列表仅展示脱敏摘要，选择记录后按需读取脱敏详情。
-            </Typography>
+            <Stack
+                direction={{ xs: 'column', sm: 'row' }}
+                spacing={1.5}
+                sx={{
+                    alignItems: { xs: 'stretch', sm: 'flex-start' },
+                    justifyContent: 'space-between',
+                    mb: 2,
+                }}
+            >
+                <Box>
+                    <Typography variant="h4" gutterBottom>
+                        平台审计探索器
+                    </Typography>
+                    <Typography color="text.secondary">
+                        只读查看平台治理操作。列表仅展示脱敏摘要，选择记录后按需读取脱敏详情。
+                    </Typography>
+                </Box>
+                <Button
+                    variant="outlined"
+                    onClick={() => setExportOpen(true)}
+                    disabled={Boolean(filters.urlError)}
+                    sx={{ flexShrink: 0 }}
+                >
+                    导出 CSV
+                </Button>
+            </Stack>
 
             <Paper
                 component="form"
@@ -460,7 +520,7 @@ const PlatformAuditExplorer = () => {
             {!loading && !error && page && (
                 <>
                     <Typography color="text.secondary" sx={{ mb: 1 }}>
-                        共 {page.total} 条匹配记录
+                        当前显示 {page.items.length} 条记录，按稳定游标翻页
                     </Typography>
                     <TableContainer component={Paper} variant="outlined">
                         <ResizableMuiTable
@@ -515,9 +575,7 @@ const PlatformAuditExplorer = () => {
                                             </TableCell>
                                             <TableCell>{item.username}</TableCell>
                                             <TableCell>
-                                                {getPlatformRoleLabel(
-                                                    item.platform_role,
-                                                )}
+                                                {auditRoleLabel(item)}
                                             </TableCell>
                                             <TableCell>{item.action}</TableCell>
                                             <TableCell>{item.method}</TableCell>
@@ -552,8 +610,33 @@ const PlatformAuditExplorer = () => {
                     <Stack
                         direction="row"
                         spacing={1}
-                        sx={{ mt: 2, justifyContent: 'flex-end' }}
+                        sx={{
+                            mt: 2,
+                            alignItems: 'center',
+                            justifyContent: 'flex-end',
+                        }}
                     >
+                        <FormControl size="small" sx={{ minWidth: 120 }}>
+                            <InputLabel id="audit-page-size-label">
+                                每页条数
+                            </InputLabel>
+                            <Select
+                                labelId="audit-page-size-label"
+                                label="每页条数"
+                                value={filters.limit}
+                                onChange={(event) =>
+                                    changePageSize(
+                                        Number(event.target.value),
+                                    )
+                                }
+                            >
+                                {[25, 50, 100].map((size) => (
+                                    <MenuItem key={size} value={size}>
+                                        {size} 条
+                                    </MenuItem>
+                                ))}
+                            </Select>
+                        </FormControl>
                         <Button
                             disabled={cursorHistory.length === 0}
                             onClick={openPreviousPage}
@@ -562,7 +645,7 @@ const PlatformAuditExplorer = () => {
                         </Button>
                         <Button
                             variant="outlined"
-                            disabled={!page.next_cursor}
+                            disabled={!page.has_more}
                             onClick={openNextPage}
                         >
                             下一页
@@ -603,7 +686,7 @@ const PlatformAuditExplorer = () => {
                         {detailLine('操作人', detail.username)}
                         {detailLine(
                             '平台角色',
-                            getPlatformRoleLabel(detail.platform_role),
+                            auditRoleLabel(detail),
                         )}
                         {detailLine('操作', detail.action)}
                         {detailLine(
@@ -630,6 +713,11 @@ const PlatformAuditExplorer = () => {
                     </Stack>
                 )}
             </Drawer>
+            <AuditExportDialog
+                open={exportOpen}
+                filters={filters}
+                onClose={() => setExportOpen(false)}
+            />
         </Box>
     )
 }

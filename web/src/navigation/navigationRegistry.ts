@@ -21,6 +21,8 @@ export type NavigationIcon =
     | 'notifications'
     | 'automation'
     | 'agents'
+    | 'collaboration'
+    | 'knowledge'
     | 'webhook'
     | 'integrationRuntime'
     | 'memberships'
@@ -45,12 +47,23 @@ export type CustomNavigationComponent =
     | 'workbench'
     | 'workbenchDashboard'
     | 'automationIndex'
+    | 'automationSLA'
+    | 'automationTemplates'
+    | 'automationQuickReplies'
     | 'agentControl'
+    | 'agentCollaboration'
+    | 'knowledgeManagement'
     | 'webhookSettings'
     | 'integrationRuntime'
+    | 'projectBasicSettings'
     | 'projectMemberships'
+    | 'projectIntakeSettings'
+    | 'projectQueueSettings'
+    | 'projectNotificationChannels'
+    | 'platformHome'
     | 'platformProjects'
     | 'platformAudit'
+    | 'emergencyControls'
     | 'platformConfig'
     | 'platformEmail'
     | 'accountProfile'
@@ -64,6 +77,10 @@ export type NavigationRouteContract =
         kind: 'custom'
         component: CustomNavigationComponent
         legacyPaths?: readonly string[]
+        subroutes?: readonly {
+            path: string
+            component: CustomNavigationComponent
+        }[]
     }
 
 interface NavigationNodeBase {
@@ -204,11 +221,30 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 icon: 'tickets',
             }),
             leaf('sidebar', {
+                id: 'knowledge-management',
+                label: '知识库',
+                path: '/knowledge',
+                activePathPrefixes: [
+                    '/knowledge',
+                    '/project-settings/knowledge',
+                ],
+                order: 30,
+                scope: 'project',
+                capability: { kind: 'project', value: 'view_project' },
+                roles: null,
+                icon: 'knowledge',
+                route: {
+                    kind: 'custom',
+                    component: 'knowledgeManagement',
+                    legacyPaths: ['/project-settings/knowledge'],
+                },
+            }),
+            leaf('sidebar', {
                 id: 'notifications',
                 label: '项目通知',
                 path: '/notifications',
                 activePathPrefixes: ['/notifications'],
-                order: 30,
+                order: 40,
                 scope: 'project',
                 capability: null,
                 roles: null,
@@ -229,16 +265,19 @@ export const navigationRegistry: readonly NavigationNode[] = [
         placement: 'sidebar',
         children: [
             leaf('sidebar', {
-                id: 'agents',
-                label: 'AI 智能体',
-                path: '/agent-control',
-                activePathPrefixes: ['/agent-control'],
+                id: 'agent-collaboration',
+                label: '人机协作',
+                path: '/agent-collaboration',
+                activePathPrefixes: ['/agent-collaboration'],
                 order: 10,
                 scope: 'project',
-                capability: { kind: 'project', value: 'manage_agents' },
-                roles: { kind: 'project', values: ['project_admin'] },
-                icon: 'agents',
-                route: { kind: 'custom', component: 'agentControl' },
+                capability: { kind: 'project', value: 'view_project' },
+                roles: null,
+                icon: 'collaboration',
+                route: {
+                    kind: 'custom',
+                    component: 'agentCollaboration',
+                },
             }),
             leaf('sidebar', {
                 id: 'automation',
@@ -254,7 +293,22 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 capability: { kind: 'project', value: 'manage_automation' },
                 roles: null,
                 icon: 'automation',
-                route: { kind: 'custom', component: 'automationIndex' },
+                route: {
+                    kind: 'custom',
+                    component: 'automationIndex',
+                },
+            }),
+            leaf('sidebar', {
+                id: 'agents',
+                label: '智能体管理',
+                path: '/agent-control',
+                activePathPrefixes: ['/agent-control'],
+                order: 30,
+                scope: 'project',
+                capability: { kind: 'project', value: 'manage_agents' },
+                roles: { kind: 'project', values: ['project_admin'] },
+                icon: 'agents',
+                route: { kind: 'custom', component: 'agentControl' },
             }),
         ],
     },
@@ -278,19 +332,25 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 order: 10,
                 scope: 'project',
                 capability: { kind: 'project', value: 'manage_integrations' },
-                roles: null,
+                roles: {
+                    kind: 'project',
+                    values: ['project_admin', 'manager'],
+                },
                 icon: 'webhook',
                 route: { kind: 'custom', component: 'webhookSettings' },
             }),
             leaf('sidebar', {
                 id: 'integration-runtime',
-                label: '事件投递',
+                label: '集成运行',
                 path: '/integration-runtime',
                 activePathPrefixes: ['/integration-runtime'],
                 order: 20,
                 scope: 'project',
-                capability: { kind: 'project', value: 'manage_agents' },
-                roles: { kind: 'project', values: ['project_admin'] },
+                capability: { kind: 'project', value: 'view_integrations' },
+                roles: {
+                    kind: 'project',
+                    values: ['project_admin', 'manager', 'observer'],
+                },
                 icon: 'integrationRuntime',
                 route: { kind: 'custom', component: 'integrationRuntime' },
             }),
@@ -299,7 +359,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
     {
         kind: 'group',
         id: 'project-configuration',
-        label: '项目配置',
+        label: '项目设置',
         icon: 'memberships',
         order: 50,
         scope: 'project',
@@ -309,11 +369,29 @@ export const navigationRegistry: readonly NavigationNode[] = [
         placement: 'sidebar',
         children: [
             leaf('sidebar', {
+                id: 'project-basic-settings',
+                label: '基本信息',
+                path: '/project-settings/basic',
+                activePathPrefixes: ['/project-settings/basic'],
+                order: 10,
+                scope: 'project',
+                capability: { kind: 'project', value: 'view_project' },
+                roles: {
+                    kind: 'project',
+                    values: ['project_admin', 'manager'],
+                },
+                icon: 'settings',
+                route: {
+                    kind: 'custom',
+                    component: 'projectBasicSettings',
+                },
+            }),
+            leaf('sidebar', {
                 id: 'memberships',
                 label: '项目成员',
                 path: '/project-memberships',
                 activePathPrefixes: ['/project-memberships'],
-                order: 10,
+                order: 20,
                 scope: 'project',
                 capability: { kind: 'project', value: 'view_memberships' },
                 roles: {
@@ -322,6 +400,126 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 },
                 icon: 'memberships',
                 route: { kind: 'custom', component: 'projectMemberships' },
+            }),
+            leaf('sidebar', {
+                id: 'project-intake-settings',
+                label: '建单配置',
+                path: '/project-settings/intake',
+                activePathPrefixes: ['/project-settings/intake'],
+                order: 30,
+                scope: 'project',
+                capability: { kind: 'project', value: 'view_project' },
+                roles: {
+                    kind: 'project',
+                    values: ['project_admin', 'manager'],
+                },
+                icon: 'settings',
+                route: {
+                    kind: 'custom',
+                    component: 'projectIntakeSettings',
+                },
+            }),
+            leaf('sidebar', {
+                id: 'project-sla-settings',
+                label: 'SLA 策略',
+                path: '/project-settings/sla',
+                activePathPrefixes: [
+                    '/project-settings/sla',
+                    '/automation-sla',
+                ],
+                order: 40,
+                scope: 'project',
+                capability: { kind: 'project', value: 'manage_automation' },
+                roles: {
+                    kind: 'project',
+                    values: ['project_admin', 'manager'],
+                },
+                icon: 'automation',
+                route: {
+                    kind: 'custom',
+                    component: 'automationSLA',
+                    legacyPaths: ['/automation-sla'],
+                },
+            }),
+            leaf('sidebar', {
+                id: 'project-queue-settings',
+                label: '受理队列',
+                path: '/project-settings/queues',
+                activePathPrefixes: ['/project-settings/queues'],
+                order: 50,
+                scope: 'project',
+                capability: { kind: 'project', value: 'view_project' },
+                roles: {
+                    kind: 'project',
+                    values: ['project_admin', 'manager'],
+                },
+                icon: 'integrationRuntime',
+                route: {
+                    kind: 'custom',
+                    component: 'projectQueueSettings',
+                },
+            }),
+            leaf('sidebar', {
+                id: 'project-ticket-templates',
+                label: '工单模板',
+                path: '/project-settings/templates',
+                activePathPrefixes: [
+                    '/project-settings/templates',
+                    '/automation-templates',
+                ],
+                order: 60,
+                scope: 'project',
+                capability: { kind: 'project', value: 'manage_automation' },
+                roles: {
+                    kind: 'project',
+                    values: ['project_admin', 'manager'],
+                },
+                icon: 'settings',
+                route: {
+                    kind: 'custom',
+                    component: 'automationTemplates',
+                    legacyPaths: ['/automation-templates'],
+                },
+            }),
+            leaf('sidebar', {
+                id: 'project-quick-replies',
+                label: '快捷回复',
+                path: '/project-settings/quick-replies',
+                activePathPrefixes: [
+                    '/project-settings/quick-replies',
+                    '/automation-quick-replies',
+                ],
+                order: 70,
+                scope: 'project',
+                capability: { kind: 'project', value: 'manage_automation' },
+                roles: {
+                    kind: 'project',
+                    values: ['project_admin', 'manager'],
+                },
+                icon: 'settings',
+                route: {
+                    kind: 'custom',
+                    component: 'automationQuickReplies',
+                    legacyPaths: ['/automation-quick-replies'],
+                },
+            }),
+            leaf('sidebar', {
+                id: 'project-notification-channels',
+                label: '通知与外发',
+                path: '/project-settings/notifications',
+                activePathPrefixes: ['/project-settings/notifications'],
+                order: 80,
+                scope: 'project',
+                capability: { kind: 'project', value: 'view_project' },
+                roles: {
+                    kind: 'project',
+                    values: ['project_admin', 'manager'],
+                },
+                icon: 'notifications',
+                route: {
+                    kind: 'custom',
+                    component: 'projectNotificationChannels',
+                },
             }),
         ],
     },
@@ -338,11 +536,30 @@ export const navigationRegistry: readonly NavigationNode[] = [
         placement: 'sidebar',
         children: [
             leaf('sidebar', {
+                id: 'platform-home',
+                label: '平台工作台',
+                path: '/platform/home',
+                activePathPrefixes: ['/platform/home'],
+                order: 10,
+                scope: 'platform',
+                capability: null,
+                roles: {
+                    kind: 'platform',
+                    values: [
+                        'platform_admin',
+                        'security_auditor',
+                        'emergency_operator',
+                    ],
+                },
+                icon: 'workbench',
+                route: { kind: 'custom', component: 'platformHome' },
+            }),
+            leaf('sidebar', {
                 id: 'platform-projects',
                 label: '项目治理',
                 path: '/platform/projects',
                 activePathPrefixes: ['/platform/projects'],
-                order: 10,
+                order: 20,
                 scope: 'platform',
                 capability: null,
                 roles: { kind: 'platform', values: ['platform_admin'] },
@@ -354,7 +571,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 label: '平台身份与访问',
                 path: '/users',
                 activePathPrefixes: ['/users'],
-                order: 20,
+                order: 30,
                 scope: 'platform',
                 capability: { kind: 'platform', value: 'manage_platform_users' },
                 roles: null,
@@ -365,12 +582,30 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 label: '审计中心',
                 path: '/platform/audit',
                 activePathPrefixes: ['/platform/audit'],
-                order: 30,
+                order: 40,
                 scope: 'platform',
                 capability: { kind: 'platform', value: 'view_platform_audit' },
                 roles: null,
                 icon: 'audit',
                 route: { kind: 'custom', component: 'platformAudit' },
+            }),
+            leaf('sidebar', {
+                id: 'emergency-controls',
+                label: '安全与应急',
+                path: '/platform/emergency-controls',
+                activePathPrefixes: ['/platform/emergency-controls'],
+                order: 50,
+                scope: 'platform',
+                capability: {
+                    kind: 'platform',
+                    value: 'operate_emergency_controls',
+                },
+                roles: null,
+                icon: 'security',
+                route: {
+                    kind: 'custom',
+                    component: 'emergencyControls',
+                },
             }),
         ],
     },
@@ -391,6 +626,7 @@ export const navigationRegistry: readonly NavigationNode[] = [
                 label: '公共配置',
                 path: '/system-settings',
                 activePathPrefixes: ['/system-settings'],
+                activePathExclusions: ['/system-settings/email'],
                 order: 10,
                 scope: 'platform',
                 capability: { kind: 'platform', value: 'manage_platform_settings' },
@@ -578,7 +814,8 @@ const allowedScopes = new Set(['global', 'project', 'platform'])
 const allowedPlacements = new Set(['sidebar', 'account'])
 const allowedIcons = new Set<NavigationIcon>([
     'home', 'workbench', 'tickets', 'notifications', 'automation', 'agents',
-    'webhook', 'integrationRuntime', 'memberships', 'users', 'projects',
+    'collaboration', 'knowledge', 'webhook', 'integrationRuntime',
+    'memberships', 'users', 'projects',
     'settings', 'audit', 'security', 'loginHistory',
 ])
 const allowedPlatformCapabilities = new Set<PlatformCapability>([
@@ -599,10 +836,12 @@ const allowedProjectCapabilities = new Set<ProjectCapability>([
     'write_internal_content',
     'manage_notifications',
     'manage_automation',
+    'view_integrations',
     'manage_integrations',
     'view_memberships',
     'manage_memberships',
     'manage_agents',
+    'manage_knowledge',
 ])
 const allowedPlatformRoles = new Set<PlatformRole>([
     'platform_admin',
@@ -615,12 +854,23 @@ const allowedCustomComponents = new Set<CustomNavigationComponent>([
     'workbench',
     'workbenchDashboard',
     'automationIndex',
+    'automationSLA',
+    'automationTemplates',
+    'automationQuickReplies',
     'agentControl',
+    'agentCollaboration',
+    'knowledgeManagement',
     'webhookSettings',
     'integrationRuntime',
+    'projectBasicSettings',
     'projectMemberships',
+    'projectIntakeSettings',
+    'projectQueueSettings',
+    'projectNotificationChannels',
+    'platformHome',
     'platformProjects',
     'platformAudit',
+    'emergencyControls',
     'platformConfig',
     'platformEmail',
     'accountProfile',
@@ -762,6 +1012,32 @@ export const validateNavigationRegistry = (value: unknown): string[] => {
                             errors.push(`导航 path 重复：${legacyPath}`)
                         } else {
                             paths.add(legacyPath)
+                        }
+                    }
+                }
+            }
+            if (
+                isRecord(route) &&
+                route.kind === 'custom' &&
+                route.subroutes !== undefined
+            ) {
+                if (!Array.isArray(route.subroutes)) {
+                    errors.push(`导航 leaf ${id} 的 subroutes 非法`)
+                } else {
+                    for (const subroute of route.subroutes) {
+                        if (
+                            !isRecord(subroute) ||
+                            typeof subroute.path !== 'string' ||
+                            !subroute.path.startsWith('/') ||
+                            !allowedCustomComponents.has(
+                                subroute.component as CustomNavigationComponent,
+                            )
+                        ) {
+                            errors.push(`导航 leaf ${id} 包含非法 subroute`)
+                        } else if (paths.has(subroute.path)) {
+                            errors.push(`导航 path 重复：${subroute.path}`)
+                        } else {
+                            paths.add(subroute.path)
                         }
                     }
                 }

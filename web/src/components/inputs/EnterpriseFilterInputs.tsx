@@ -6,9 +6,11 @@ import {
   TextField,
 } from '@mui/material'
 import {
+  InputHelperText,
   useChoicesContext,
   useInput,
   type RaRecord,
+  type Validator,
 } from 'react-admin'
 
 interface FilterInputBaseProps {
@@ -235,8 +237,10 @@ export const EnterpriseDateFilterInput = ({
 export interface EnterpriseReferenceAutocompleteInputProps
   extends Omit<FilterInputBaseProps, 'source'> {
   source?: string
+  fullWidth?: boolean
   optionText?: string | ((choice: RaRecord) => string)
   optionValue?: string
+  validate?: Validator | Validator[]
 }
 
 export const EnterpriseReferenceAutocompleteInput = ({
@@ -245,11 +249,14 @@ export const EnterpriseReferenceAutocompleteInput = ({
   className,
   defaultValue,
   disabled,
+  fullWidth = false,
+  helperText,
   optionText = 'name',
   optionValue = 'id',
   readOnly,
   resource: resourceProp,
   size = 'small',
+  validate,
 }: EnterpriseReferenceAutocompleteInputProps) => {
   const {
     allChoices,
@@ -260,12 +267,18 @@ export const EnterpriseReferenceAutocompleteInput = ({
   } = useChoicesContext()
   const finalSource = sourceProp ?? source
   const finalResource = resourceProp ?? resource
-  const { field, id } = useInput({
+  const {
+    field,
+    fieldState: { error, invalid },
+    id,
+    isRequired,
+  } = useInput({
     source: finalSource,
     resource: finalResource,
     defaultValue,
     disabled,
     readOnly,
+    validate,
   })
   const choices = allChoices ?? []
   const selectedChoice = choices.find(
@@ -283,6 +296,7 @@ export const EnterpriseReferenceAutocompleteInput = ({
       options={choices}
       value={selectedChoice}
       disabled={disabled}
+      fullWidth={fullWidth}
       loading={isPending}
       readOnly={readOnly}
       size={size}
@@ -307,6 +321,16 @@ export const EnterpriseReferenceAutocompleteInput = ({
           label={label}
           inputRef={field.ref}
           margin="dense"
+          required={isRequired}
+          error={invalid}
+          helperText={
+            helperText !== false || invalid ? (
+              <InputHelperText
+                error={error?.message}
+                helperText={helperText}
+              />
+            ) : undefined
+          }
           slotProps={{
             ...params.slotProps,
             htmlInput: {

@@ -2,11 +2,22 @@ FROM node:24.18.0-alpine
 
 WORKDIR /app
 
+ENV NODE_OPTIONS=--max-old-space-size=512
+ENV VITE_API_URL=/api
+ENV VITE_PROXY_TARGET=http://server:8081
+
 COPY package.json package-lock.json ./
+COPY patches ./patches
 RUN npm ci
 
 COPY --chown=node:node . .
 
+# Vite 会按 lockfile 与配置哈希复用预构建依赖。镜像构建期生成只读种子，
+# 启动时复制到受限 tmpfs，避免与 OpenSearch 并发冷启动时重复占用峰值内存。
+RUN rm -rf /app/patches \
+    && npx vite optimize \
+    && mv /app/node_modules/.vite /app/.vite-seed
+
 USER node
 
-CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+CMD ["sh", "-c", "cp -R /app/.vite-seed/. /app/node_modules/.vite/ && exec npm run dev -- --host 0.0.0.0"]

@@ -200,7 +200,7 @@ const StatusChip: React.FC = () => {
             case 'active':
                 return {
                     label: '激活',
-                    color: '#059669',
+                    color: '#047857',
                     backgroundColor: '#f0fdf4',
                     icon: <ActiveIcon sx={{ fontSize: '0.8rem' }} />
                 };

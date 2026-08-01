@@ -8,14 +8,16 @@
     "build": "vite build",
     "lint": "eslint . --report-unused-disable-directives --max-warnings 0",
     "typecheck": "tsc --noEmit",
+    "postinstall": "patch-package --error-on-fail",
     "generate:human-api": "node ./scripts/generate-human-api-types.mjs",
     "check:human-api": "node ./scripts/generate-human-api-types.mjs --check",
     "test:human-api": "node ./scripts/test-human-api-contract.mjs",
     "test:ticket-pagination": "node --test ./src/admin/tickets/pagedRequestGate.test.mjs",
+    "test:attachment-preview": "node --test ./src/admin/tickets/attachmentPreviewPolicy.test.mjs",
     "test:audit-explorer": "node --test ./src/admin/audit/*.test.mjs",
     "test:layout": "node --test ./src/layout/*.test.mjs",
     "audit:security": "node ./scripts/audit-security.mjs",
-    "check": "npm run check:human-api && npm run test:human-api && npm run test:ticket-pagination && npm run test:audit-explorer && npm run test:layout && npm run typecheck && npm run lint && npm run audit:security && npm run build",
+    "check": "npm run check:human-api && npm run test:human-api && npm run test:ticket-pagination && npm run test:attachment-preview && npm run test:audit-explorer && npm run test:layout && npm run typecheck && npm run lint && npm run audit:security && npm run build",
     "test:e2e": "playwright test",
     "test:e2e:list": "playwright test --list",
     "preview": "vite preview"
@@ -31,11 +33,14 @@
     "react": "^19.2.8",
     "react-admin": "^5.15.1",
     "react-dom": "^19.2.8",
+    "react-markdown": "10.1.0",
     "react-qr-code": "2.2.0",
     "react-router-dom": "7.18.2",
-    "recharts": "^3.10.1"
+    "recharts": "^3.10.1",
+    "remark-gfm": "4.0.1"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.11.0",
     "@playwright/test": "^1.62.0",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
@@ -44,6 +49,7 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.3",
     "globals": "^17.8.0",
+    "patch-package": "^8.0.1",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.65.0",
     "vite": "^8.1.5"

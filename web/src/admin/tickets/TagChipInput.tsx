@@ -42,6 +42,8 @@ const TagChipInput = ({
             fullWidth={fullWidth}
             options={[] as string[]}
             value={tags}
+            limitTags={3}
+            getLimitTagsText={(more) => `+${more}`}
             onBlur={field.onBlur}
             onChange={(_, nextTags) => field.onChange(normalizeTagList(nextTags))}
             clearText="清空全部标签"
@@ -75,7 +77,7 @@ const TagChipInput = ({
                     helperText={
                         <InputHelperText
                             error={error?.message}
-                            helperText={`${helperText}（${tags.length}/${MAX_TICKET_TAGS}）`}
+                            helperText={`已选择 ${tags.length} 项 · ${helperText}（最多 ${MAX_TICKET_TAGS} 项）`}
                         />
                     }
                     slotProps={{

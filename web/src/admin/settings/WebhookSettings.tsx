@@ -50,10 +50,16 @@ import {
 import { useNotify } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
 import { resolveActiveProjectKey } from '@/lib/projectScope'
+import { projectScopeChangedEvent } from '@/lib/projectScopeEvents'
 import {
   humanApiRoutes,
   type WebhookConfig,
+  type WebhookEventType,
+  type WebhookLog,
+  type WebhookLogPage,
+  type WebhookPage,
   type WebhookTestReceipt,
+  type ListProjectWebhookLogsOperationQuery,
 } from '@/lib/generated/human-api'
 import BackButton from '../common/BackButton'
 import {
@@ -194,7 +200,9 @@ const renderSelectedValues = (
   )
 }
 
-const webhookEventSummary = (webhook: WebhookConfig) => {
+const webhookEventSummary = (
+  webhook: Pick<WebhookConfig, 'enabled_events_list' | 'filter_rules_obj'>,
+) => {
   const statuses = webhook.filter_rules_obj?.transition_statuses ?? []
   return (webhook.enabled_events_list ?? [])
     .map((event) => {
@@ -253,30 +261,11 @@ type PendingWebhookAction = {
   name: string
 }
 
-type WebhookDefinitionPage = {
-  items: WebhookConfig[]
-  total: number
-  page: number
-  page_size: number
-  total_pages: number
-}
+const maxWebhookDeliveryCursorPages = 100
 
-type WebhookDelivery = {
-  id: number
-  created_at: string
-  config_id: number
-  event_type: string
-  status: string
-  response_status?: number
-  response_time?: number
-  error_message?: string
-}
-
-type WebhookDeliveryPage = {
-  items: WebhookDelivery[]
-  next_cursor: string
-  has_more: boolean
-}
+const isAbortedRequest = (error: unknown, signal: AbortSignal) =>
+  signal.aborted
+  || (error instanceof DOMException && error.name === 'AbortError')
 
 const WebhookSettings: React.FC = () => {
   const notify = useNotify()
@@ -294,96 +283,236 @@ const WebhookSettings: React.FC = () => {
   const [saving, setSaving] = useState(false)
   const [pendingAction, setPendingAction] = useState<PendingWebhookAction | null>(null)
   const [deliveryWebhook, setDeliveryWebhook] = useState<WebhookConfig | null>(null)
-  const [deliveries, setDeliveries] = useState<WebhookDelivery[]>([])
+  const [deliveries, setDeliveries] = useState<WebhookLog[]>([])
   const [deliveryLoading, setDeliveryLoading] = useState(false)
   const [deliveryError, setDeliveryError] = useState('')
   const [deliveryStatus, setDeliveryStatus] = useState('')
   const [deliveryEventType, setDeliveryEventType] = useState('')
   const [deliveryCursor, setDeliveryCursor] = useState('')
   const [deliveryHasMore, setDeliveryHasMore] = useState(false)
-  const [selectedDelivery, setSelectedDelivery] = useState<WebhookDelivery | null>(null)
-  const lastDefinitionQuery = useRef('')
-  const lastDeliveryQuery = useRef('')
+  const [deliveryPageIndex, setDeliveryPageIndex] = useState(0)
+  const [deliveryCursorHistory, setDeliveryCursorHistory] = useState<string[]>([''])
+  const [selectedDelivery, setSelectedDelivery] = useState<WebhookLog | null>(null)
+  const [scopeVersion, setScopeVersion] = useState(0)
+  const definitionController = useRef<AbortController | null>(null)
+  const definitionSequence = useRef(0)
+  const deliveryController = useRef<AbortController | null>(null)
+  const deliverySequence = useRef(0)
+  const deliveryRetryTarget = useRef({
+    cursor: '',
+    pageIndex: 0,
+  })
 
   const extractErrorMessage = useCallback((error: unknown, fallback: string) => {
     return localizedUnknownErrorMessage(error, fallback)
   }, [])
 
   const fetchWebhooks = useCallback(async () => {
+    definitionController.current?.abort()
+    const controller = new AbortController()
+    const sequence = definitionSequence.current + 1
+    definitionSequence.current = sequence
+    definitionController.current = controller
     try {
       setLoading(true)
       setListError('')
       const projectKey = await resolveActiveProjectKey()
+      if (
+        controller.signal.aborted
+        || definitionSequence.current !== sequence
+      ) return
       const path = humanApiRoutes.listProjectWebhooks(
         { projectKey },
         { page: page + 1, page_size: pageSize },
       )
-      const data = await apiFetch<WebhookDefinitionPage>(path)
+      const data = await apiFetch<WebhookPage>(
+        path,
+        { signal: controller.signal },
+      )
+      if (
+        controller.signal.aborted
+        || definitionSequence.current !== sequence
+      ) return
       setItems(data.items ?? [])
       setTotal(data.total ?? 0)
     } catch (error: unknown) {
+      if (
+        isAbortedRequest(error, controller.signal)
+        || definitionSequence.current !== sequence
+      ) return
       setListError(extractErrorMessage(error, '加载 Webhook 列表失败'))
     } finally {
-      setLoading(false)
+      if (
+        !controller.signal.aborted
+        && definitionSequence.current === sequence
+      ) {
+        setLoading(false)
+      }
     }
   }, [extractErrorMessage, page, pageSize])
 
   useEffect(() => {
-    const queryKey = `${page}:${pageSize}`
-    if (lastDefinitionQuery.current === queryKey) return
-    lastDefinitionQuery.current = queryKey
     void fetchWebhooks()
-  }, [fetchWebhooks, page, pageSize])
+    return () => definitionController.current?.abort()
+  }, [fetchWebhooks, page, pageSize, scopeVersion])
 
   const fetchDeliveries = useCallback(async (
     webhook: WebhookConfig,
-    cursor = '',
-    append = false,
+    targetCursor = '',
+    targetPageIndex = 0,
   ) => {
+    if (
+      targetPageIndex < 0
+      || targetPageIndex >= maxWebhookDeliveryCursorPages
+    ) {
+      setDeliveryError('本次浏览已达到 100 页上限，请缩小筛选范围后继续')
+      return
+    }
+    deliveryController.current?.abort()
+    const controller = new AbortController()
+    const sequence = deliverySequence.current + 1
+    deliverySequence.current = sequence
+    deliveryController.current = controller
+    deliveryRetryTarget.current = {
+      cursor: targetCursor,
+      pageIndex: targetPageIndex,
+    }
     try {
       setDeliveryLoading(true)
       setDeliveryError('')
       const projectKey = await resolveActiveProjectKey()
-      const parameters = new URLSearchParams({ limit: '25' })
-      if (cursor) parameters.set('cursor', cursor)
-      if (deliveryStatus) parameters.set('status', deliveryStatus)
-      if (deliveryEventType) parameters.set('event_type', deliveryEventType)
-      const basePath = humanApiRoutes.listProjectWebhookLogs(
+      if (
+        controller.signal.aborted
+        || deliverySequence.current !== sequence
+      ) return
+      const query: ListProjectWebhookLogsOperationQuery = {
+        limit: 25,
+        ...(targetCursor ? { cursor: targetCursor } : {}),
+        ...(deliveryStatus
+          ? { status: deliveryStatus as WebhookLog['status'] }
+          : {}),
+        ...(deliveryEventType
+          ? { event_type: deliveryEventType as WebhookEventType }
+          : {}),
+      }
+      const path = humanApiRoutes.listProjectWebhookLogs(
         { projectKey, webhookID: webhook.id },
-        {},
+        query,
       )
-      const data = await apiFetch<WebhookDeliveryPage>(
-        `${basePath}?${parameters.toString()}`,
+      const data = await apiFetch<WebhookLogPage>(
+        path,
+        { signal: controller.signal },
       )
-      setDeliveries((previous) => append
-        ? [...previous, ...(data.items ?? [])]
-        : (data.items ?? []))
-      setDeliveryCursor(data.next_cursor ?? '')
+      if (
+        controller.signal.aborted
+        || deliverySequence.current !== sequence
+      ) return
+      const continuation = data.next_cursor ?? ''
+      setDeliveries(data.items ?? [])
+      setDeliveryCursor(continuation)
       setDeliveryHasMore(Boolean(data.has_more))
+      setDeliveryPageIndex(targetPageIndex)
+      setDeliveryCursorHistory((previous) => {
+        const history = targetPageIndex === 0
+          ? ['']
+          : previous.slice(0, targetPageIndex + 1)
+        if (
+          data.has_more
+          && continuation
+          && targetPageIndex + 1 < maxWebhookDeliveryCursorPages
+        ) {
+          history[targetPageIndex + 1] = continuation
+        }
+        return history.slice(0, maxWebhookDeliveryCursorPages)
+      })
+      setSelectedDelivery(null)
     } catch (error: unknown) {
+      if (
+        isAbortedRequest(error, controller.signal)
+        || deliverySequence.current !== sequence
+      ) return
       setDeliveryError(extractErrorMessage(error, '加载 Webhook 投递记录失败'))
     } finally {
-      setDeliveryLoading(false)
+      if (
+        !controller.signal.aborted
+        && deliverySequence.current === sequence
+      ) {
+        setDeliveryLoading(false)
+      }
     }
   }, [deliveryEventType, deliveryStatus, extractErrorMessage])
 
   useEffect(() => {
     if (!deliveryWebhook) return
-    const queryKey = [
-      deliveryWebhook.id,
-      deliveryStatus,
-      deliveryEventType,
-    ].join(':')
-    if (lastDeliveryQuery.current === queryKey) return
-    lastDeliveryQuery.current = queryKey
+    setDeliveries([])
+    setDeliveryCursor('')
+    setDeliveryHasMore(false)
+    setDeliveryPageIndex(0)
+    setDeliveryCursorHistory([''])
     setSelectedDelivery(null)
-    void fetchDeliveries(deliveryWebhook)
+    void fetchDeliveries(deliveryWebhook, '', 0)
+    return () => deliveryController.current?.abort()
   }, [
     deliveryEventType,
     deliveryStatus,
     deliveryWebhook,
     fetchDeliveries,
+    scopeVersion,
   ])
+
+  const closeDeliveries = useCallback(() => {
+    deliveryController.current?.abort()
+    deliverySequence.current += 1
+    setDeliveryWebhook(null)
+    setDeliveries([])
+    setDeliveryError('')
+    setDeliveryStatus('')
+    setDeliveryEventType('')
+    setDeliveryCursor('')
+    setDeliveryHasMore(false)
+    setDeliveryPageIndex(0)
+    setDeliveryCursorHistory([''])
+    setSelectedDelivery(null)
+    setDeliveryLoading(false)
+  }, [])
+
+  const openDeliveries = useCallback((webhook: WebhookConfig) => {
+    deliveryController.current?.abort()
+    deliverySequence.current += 1
+    setDeliveries([])
+    setDeliveryError('')
+    setDeliveryStatus('')
+    setDeliveryEventType('')
+    setDeliveryCursor('')
+    setDeliveryHasMore(false)
+    setDeliveryPageIndex(0)
+    setDeliveryCursorHistory([''])
+    setSelectedDelivery(null)
+    setDeliveryWebhook(webhook)
+  }, [])
+
+  useEffect(() => {
+    const handleProjectScopeChanged = () => {
+      definitionController.current?.abort()
+      definitionSequence.current += 1
+      closeDeliveries()
+      setItems([])
+      setTotal(0)
+      setPage(0)
+      setScopeVersion((version) => version + 1)
+    }
+    window.addEventListener(projectScopeChangedEvent, handleProjectScopeChanged)
+    return () => {
+      definitionController.current?.abort()
+      definitionSequence.current += 1
+      deliveryController.current?.abort()
+      deliverySequence.current += 1
+      window.removeEventListener(
+        projectScopeChangedEvent,
+        handleProjectScopeChanged,
+      )
+    }
+  }, [closeDeliveries])
 
   const openCreate = () => {
     setCurrentId(null)
@@ -398,7 +527,7 @@ const WebhookSettings: React.FC = () => {
       name: webhook.name,
       description: webhook.description || '',
       provider: webhook.provider,
-      webhook_url: webhook.webhook_url,
+      webhook_url: '',
       secret: '',
       access_token: '',
       enabled_events: webhook.enabled_events_list ?? [],
@@ -454,9 +583,12 @@ const WebhookSettings: React.FC = () => {
     if (!form.name.trim()) {
       next.name = '请输入名称'
     }
-    if (!form.webhook_url.trim()) {
+    if (currentId === null && !form.webhook_url.trim()) {
       next.webhook_url = '请输入Webhook URL'
-    } else if (!/^https:\/\//i.test(form.webhook_url)) {
+    } else if (
+      form.webhook_url.trim()
+      && !/^https:\/\//i.test(form.webhook_url)
+    ) {
       next.webhook_url = 'Webhook 地址必须使用公网 HTTPS'
     }
     if (form.enabled_events.length === 0) {
@@ -486,7 +618,6 @@ const WebhookSettings: React.FC = () => {
       name: form.name.trim(),
       description: form.description.trim(),
       provider: form.provider,
-      webhook_url: form.webhook_url.trim(),
       enabled_events: form.enabled_events,
       filter_rules: {
         transition_statuses: form.enabled_events.includes(ticketTransitionedEvent)
@@ -500,6 +631,9 @@ const WebhookSettings: React.FC = () => {
       is_async: form.is_async,
       rate_limit: Number(form.rate_limit || 0),
       rate_limit_window: Number(form.rate_limit_window || 0),
+    }
+    if (currentId === null || form.webhook_url.trim()) {
+      payload.webhook_url = form.webhook_url.trim()
     }
     if (includeStatus) payload.status = form.status
 
@@ -574,8 +708,13 @@ const WebhookSettings: React.FC = () => {
       if (!isQueuedWebhookTestReceipt(receipt, id)) {
         throw new Error('Webhook 测试入队响应无效，请稍后重试')
       }
-      lastDeliveryQuery.current = ''
       notify('Webhook 测试已入队，请等待投递结果', { type: 'info' })
+      if (deliveryWebhook?.id === id) {
+        setDeliveries([])
+        setDeliveryPageIndex(0)
+        setDeliveryCursorHistory([''])
+        void fetchDeliveries(deliveryWebhook, '', 0)
+      }
     } catch (error: unknown) {
       notify(extractErrorMessage(error, 'Webhook 测试入队失败'), { type: 'error' })
     } finally {
@@ -711,7 +850,7 @@ const WebhookSettings: React.FC = () => {
                       size="small"
                       aria-label={`查看投递记录：${item.name}`}
                       title="查看投递记录"
-                      onClick={() => setDeliveryWebhook(item)}
+                      onClick={() => openDeliveries(item)}
                     >
                       <DeliveryIcon fontSize="small" />
                     </IconButton>
@@ -773,7 +912,7 @@ const WebhookSettings: React.FC = () => {
       <Drawer
         anchor="right"
         open={Boolean(deliveryWebhook)}
-        onClose={() => setDeliveryWebhook(null)}
+        onClose={closeDeliveries}
         sx={{ '& .MuiDrawer-paper': { width: { xs: '100%', md: 720 }, p: 3 } }}
       >
         <Stack spacing={2} sx={{ minHeight: '100%' }}>
@@ -787,7 +926,7 @@ const WebhookSettings: React.FC = () => {
                 {deliveryWebhook?.name || 'Webhook'}
               </Typography>
             </Box>
-            <Button onClick={() => setDeliveryWebhook(null)}>关闭</Button>
+            <Button onClick={closeDeliveries}>关闭</Button>
           </Stack>
           <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
             <TextField
@@ -826,8 +965,13 @@ const WebhookSettings: React.FC = () => {
                 <Button
                   color="inherit"
                   size="small"
+                  disabled={deliveryLoading}
                   onClick={() => deliveryWebhook
-                    && void fetchDeliveries(deliveryWebhook)}
+                    && void fetchDeliveries(
+                      deliveryWebhook,
+                      deliveryRetryTarget.current.cursor,
+                      deliveryRetryTarget.current.pageIndex,
+                    )}
                 >
                   重试
                 </Button>
@@ -885,16 +1029,52 @@ const WebhookSettings: React.FC = () => {
               </Stack>
             )}
           </Paper>
-          {deliveryHasMore && (
-            <Button
-              variant="outlined"
-              disabled={deliveryLoading}
-              onClick={() => deliveryWebhook
-                && void fetchDeliveries(deliveryWebhook, deliveryCursor, true)}
+          {(deliveryPageIndex > 0 || deliveryHasMore) && (
+            <Stack
+              direction="row"
+              spacing={1}
+              sx={{ alignItems: 'center', justifyContent: 'center' }}
             >
-              {deliveryLoading ? '加载中…' : '加载更多'}
-            </Button>
+              <Button
+                variant="outlined"
+                disabled={deliveryLoading || deliveryPageIndex === 0}
+                onClick={() => deliveryWebhook
+                  && void fetchDeliveries(
+                    deliveryWebhook,
+                    deliveryCursorHistory[deliveryPageIndex - 1] ?? '',
+                    deliveryPageIndex - 1,
+                  )}
+              >
+                上一页
+              </Button>
+              <Typography variant="body2" color="text.secondary">
+                第 {deliveryPageIndex + 1} 页
+              </Typography>
+              <Button
+                variant="outlined"
+                disabled={
+                  deliveryLoading
+                  || !deliveryHasMore
+                  || !deliveryCursor
+                  || deliveryPageIndex >= maxWebhookDeliveryCursorPages - 1
+                }
+                onClick={() => deliveryWebhook
+                  && void fetchDeliveries(
+                    deliveryWebhook,
+                    deliveryCursor,
+                    deliveryPageIndex + 1,
+                  )}
+              >
+                {deliveryLoading ? '加载中…' : '下一页'}
+              </Button>
+            </Stack>
           )}
+          {deliveryHasMore
+            && deliveryPageIndex >= maxWebhookDeliveryCursorPages - 1 && (
+              <Alert severity="info">
+                本次浏览已达到 100 页上限，请按投递状态或事件类型缩小范围。
+              </Alert>
+            )}
           {selectedDelivery && (
             <Paper variant="outlined" sx={{ p: 2 }} aria-live="polite">
               <Typography component="h3" variant="subtitle1" gutterBottom>
@@ -1009,7 +1189,11 @@ const WebhookSettings: React.FC = () => {
                 value={form.webhook_url}
                 onChange={(e) => handleFormChange('webhook_url', e.target.value)}
                 error={Boolean(errors.webhook_url)}
-                helperText={errors.webhook_url || '复制自各渠道机器人配置界面'}
+                helperText={errors.webhook_url || (
+                  currentId === null
+                    ? '复制自各渠道机器人配置界面；保存后仅显示脱敏地址'
+                    : `留空保留当前地址（${items.find((item) => item.id === currentId)?.webhook_url_masked || '已配置'}）；填写新地址才会替换`
+                )}
               />
             </Grid>
             <Grid

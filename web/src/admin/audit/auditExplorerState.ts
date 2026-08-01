@@ -1,4 +1,5 @@
 import type {
+    CreatePlatformAuditExportOperationQuery,
     ListPlatformAuditLogsOperationQuery,
     PlatformRole,
 } from '@/lib/generated/human-api'
@@ -39,6 +40,7 @@ const methods = new Set([
 ])
 const results = new Set(['pending', 'success', 'error'])
 const presets = new Set(['1h', '24h', '7d', '30d'])
+const supportedPageSizes = new Set([25, 50, 100])
 const supportedParameters = new Set([
     'actor',
     'platform_role',
@@ -94,7 +96,7 @@ export const auditFiltersFromSearchParams = (
     }
     if (
         limitValue !== null &&
-        (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 100)
+        (!Number.isInteger(rawLimit) || !supportedPageSizes.has(rawLimit))
     ) {
         invalidFields.push('每页数量')
     }
@@ -132,7 +134,7 @@ export const auditFiltersFromSearchParams = (
         endTime: searchParams.get('end_time') ?? '',
         cursor: searchParams.get('cursor') ?? '',
         limit:
-            Number.isInteger(rawLimit) && rawLimit >= 1 && rawLimit <= 100
+            Number.isInteger(rawLimit) && supportedPageSizes.has(rawLimit)
                 ? rawLimit
                 : 25,
     }
@@ -198,7 +200,42 @@ export const auditFiltersToQuery = (
     return query
 }
 
-const normalizedAuditTime = (value: string): string => {
+export const auditFiltersToExportQuery = (
+    filters: AuditExplorerFilters,
+    startTime: string,
+    endTime: string,
+): CreatePlatformAuditExportOperationQuery => {
+    if (filters.urlError) {
+        throw new Error(filters.urlError)
+    }
+    const start = new Date(startTime)
+    const end = new Date(endTime)
+    if (
+        Number.isNaN(start.getTime()) ||
+        Number.isNaN(end.getTime()) ||
+        start.getTime() > end.getTime() ||
+        end.getTime() - start.getTime() > 30 * 24 * 60 * 60 * 1000
+    ) {
+        throw new Error('导出时间范围必须完整且不超过 30 天')
+    }
+    const query: CreatePlatformAuditExportOperationQuery = {
+        start_time: start.toISOString(),
+        end_time: end.toISOString(),
+    }
+    if (filters.actor.trim()) query.actor = filters.actor.trim()
+    if (filters.platformRole) query.platform_role = filters.platformRole
+    if (filters.action.trim()) query.action = filters.action.trim()
+    if (filters.method) query.method = filters.method
+    if (filters.pathPrefix.trim()) {
+        query.path_prefix = filters.pathPrefix.trim()
+    }
+    if (filters.status.trim()) query.status = Number(filters.status)
+    if (filters.result) query.result = filters.result
+    if (filters.keyword.trim()) query.keyword = filters.keyword.trim()
+    return query
+}
+
+export const normalizedAuditTime = (value: string): string => {
     const parsed = new Date(value)
     return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString()
 }

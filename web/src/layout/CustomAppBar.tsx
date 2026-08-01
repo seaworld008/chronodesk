@@ -32,6 +32,7 @@ import {
   loadAuthorizedProjects,
   projectAccessInvalidatedEvent,
   setActiveProjectKey,
+  subscribeActiveProjectSelection,
   type AuthorizedProject,
 } from '@/lib/projectScope'
 import {
@@ -259,44 +260,54 @@ const AppBarContextControls: React.FC = () => {
   const navigate = useNavigate()
   const { pathname } = useLocation()
   const [projects, setProjects] = React.useState<AuthorizedProject[]>([])
-  const [selected, setSelected] = React.useState(activeProjectKey() ?? '')
+  const selected = React.useSyncExternalStore(
+    subscribeActiveProjectSelection,
+    () => activeProjectKey() ?? '',
+    () => '',
+  )
   const [loading, setLoading] = React.useState(true)
+  const loadSequence = React.useRef(0)
 
   React.useEffect(() => {
     let active = true
     const loadProjects = (force: boolean) => {
+      const sequence = ++loadSequence.current
       setLoading(true)
       void loadAuthorizedProjects(force)
         .then((authorized) => {
-          if (!active) return
+          if (!active || sequence !== loadSequence.current) return
           setProjects(authorized)
           const storedProjectKey = activeProjectKey()
           const resolved = authorized.find(
             ({ project }) => project.key === storedProjectKey,
           )
-          if (resolved) {
-            setSelected(resolved.project.key)
-          } else {
+          if (!resolved) {
             clearActiveProjectSelection()
-            setSelected('')
           }
         })
         .catch(() => {
-          if (!active) return
-          clearActiveProjectSelection()
+          if (!active || sequence !== loadSequence.current) return
+          // A navigation abort or transient inventory failure is not proof
+          // that access was revoked. Preserve the bound project selection;
+          // confirmed inventory responses and 403 revocation flows own removal.
           setProjects([])
-          setSelected('')
         })
         .finally(() => {
-          if (active) setLoading(false)
+          if (active && sequence === loadSequence.current) {
+            setLoading(false)
+          }
         })
     }
     const reloadProjects = () => loadProjects(true)
     const loadCachedProjects = () => loadProjects(false)
+    const handleProjectScopeChanged = () => reloadProjects()
     reloadProjects()
     window.addEventListener(projectAccessInvalidatedEvent, reloadProjects)
     window.addEventListener(projectInventoryChangedEvent, loadCachedProjects)
-    window.addEventListener(projectScopeChangedEvent, reloadProjects)
+    window.addEventListener(
+      projectScopeChangedEvent,
+      handleProjectScopeChanged,
+    )
     return () => {
       active = false
       window.removeEventListener(projectAccessInvalidatedEvent, reloadProjects)
@@ -304,7 +315,10 @@ const AppBarContextControls: React.FC = () => {
         projectInventoryChangedEvent,
         loadCachedProjects,
       )
-      window.removeEventListener(projectScopeChangedEvent, reloadProjects)
+      window.removeEventListener(
+        projectScopeChangedEvent,
+        handleProjectScopeChanged,
+      )
     }
   }, [])
 
@@ -334,7 +348,6 @@ const AppBarContextControls: React.FC = () => {
         selected={selected}
         onChange={(projectKey) => {
           setActiveProjectKey(projectKey, projects)
-          setSelected(projectKey)
           navigate('/')
         }}
       />

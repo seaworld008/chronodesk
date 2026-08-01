@@ -68,7 +68,9 @@ import {
     DashboardCustomize as WorkbenchIcon,
     FactCheck as AuditIcon,
     GroupAdd as MembershipIcon,
+    Handshake as CollaborationIcon,
     History as HistoryIcon,
+    MenuBook as KnowledgeIcon,
     Notifications as NotificationIcon,
     People as UsersIcon,
     AccountTree as PlatformProjectsIcon,
@@ -162,6 +164,15 @@ const AutomationRuleEdit = lazyPage(
 const AutomationLogList = lazyPage(
     () => import('./admin/automation/AutomationLogList'),
 )
+const AutomationSLAList = lazyPage(
+    () => import('./admin/automation/AutomationSLAList'),
+)
+const AutomationTemplateList = lazyPage(
+    () => import('./admin/automation/AutomationTemplateList'),
+)
+const AutomationQuickReplyList = lazyPage(
+    () => import('./admin/automation/AutomationQuickReplyList'),
+)
 const EmailSettings = lazyPage(() => import('./admin/settings/EmailSettings'))
 const WebhookSettings = lazyPage(() => import('./admin/settings/WebhookSettings'))
 const SystemSettings = lazyPage(() => import('./admin/settings/SystemSettings'))
@@ -169,8 +180,17 @@ const TrustedDevices = lazyPage(() => import('./admin/security/TrustedDevices'))
 const LoginHistory = lazyPage(() => import('./admin/security/LoginHistory'))
 const AccountProfile = lazyPage(() => import('./admin/security/AccountProfile'))
 const AccountSecurity = lazyPage(() => import('./admin/security/AccountSecurity'))
+const EmergencyControls = lazyPage(
+    () => import('./admin/security/EmergencyControls'),
+)
 const AgentControlCenter = lazyPage(
     () => import('./admin/agents/AgentControlCenter'),
+)
+const AgentCollaborationWorkspace = lazyPage(
+    () => import('./admin/agents/AgentCollaborationWorkspace'),
+)
+const KnowledgeManagementPage = lazyPage(
+    () => import('./admin/knowledge/KnowledgeManagementPage'),
 )
 const IntegrationRuntime = lazyPage(
     () => import('./admin/integrations/IntegrationRuntime'),
@@ -184,6 +204,18 @@ const WorkbenchDashboard = lazyPage(
 const ProjectMembershipPage = lazyPage(
     () => import('./admin/projects/ProjectMembershipPage'),
 )
+const ProjectBasicSettingsPage = lazyPage(
+    () => import('./admin/projects/ProjectBasicSettingsPage'),
+)
+const ProjectIntakeSettingsPage = lazyPage(
+    () => import('./admin/projects/ProjectIntakeSettingsPage'),
+)
+const ProjectQueueSettingsPage = lazyPage(
+    () => import('./admin/projects/ProjectQueueSettingsPage'),
+)
+const ProjectNotificationChannelsPage = lazyPage(
+    () => import('./admin/projects/ProjectNotificationChannelsPage'),
+)
 const PlatformProjectGovernancePage = lazyPage(
     () => import('./admin/projects/PlatformProjectGovernancePage'),
 )
@@ -196,7 +228,7 @@ const theme = createTheme(
         palette: {
             mode: 'light',
             primary: {
-                main: '#3b82f6',
+                main: '#2563eb',
                 light: '#60a5fa',
                 dark: '#1d4ed8',
                 contrastText: '#ffffff',
@@ -206,6 +238,12 @@ const theme = createTheme(
                 light: '#94a3b8',
                 dark: '#475569',
                 contrastText: '#ffffff',
+            },
+            warning: {
+                main: '#ed6c02',
+                light: '#ff9800',
+                dark: '#e65100',
+                contrastText: 'rgba(0, 0, 0, 0.87)',
             },
             background: {
                 default: '#f8fafc',
@@ -225,6 +263,17 @@ const theme = createTheme(
             ].join(','),
         },
         shape: { borderRadius: 12 },
+        components: {
+            RaEmpty: {
+                styleOverrides: {
+                    root: {
+                        '& .RaEmpty-message': {
+                            color: 'rgba(0, 0, 0, 0.6)',
+                        },
+                    },
+                },
+            },
+        },
     },
     muiZhCN,
 )
@@ -258,16 +307,19 @@ const useActiveProjectAccess = (): ActiveProjectAccessState => {
         errorCode: null,
         isPending: true,
     })
+    const loadSequence = React.useRef(0)
 
     React.useEffect(() => {
         let active = true
         const loadAccess = async () => {
+            const sequence = ++loadSequence.current
             setState((current) => ({ ...current, isPending: true }))
             try {
                 const projects = await loadAuthorizedProjects()
+                if (!active || sequence !== loadSequence.current) return
                 try {
                     const access = await resolveActiveProjectAccess()
-                    if (active) {
+                    if (active && sequence === loadSequence.current) {
                         setState({
                             access,
                             projects,
@@ -276,7 +328,7 @@ const useActiveProjectAccess = (): ActiveProjectAccessState => {
                         })
                     }
                 } catch (requestError) {
-                    if (active) {
+                    if (active && sequence === loadSequence.current) {
                         setState({
                             access: null,
                             projects,
@@ -286,7 +338,7 @@ const useActiveProjectAccess = (): ActiveProjectAccessState => {
                     }
                 }
             } catch (requestError) {
-                if (active) {
+                if (active && sequence === loadSequence.current) {
                     setState({
                         access: null,
                         projects: [],
@@ -303,6 +355,7 @@ const useActiveProjectAccess = (): ActiveProjectAccessState => {
         window.addEventListener(projectScopeChangedEvent, reloadAccess)
         return () => {
             active = false
+            loadSequence.current += 1
             window.removeEventListener(
                 projectAccessInvalidatedEvent,
                 reloadAccess,
@@ -541,27 +594,27 @@ const PlatformHome = ({ permissions }: { permissions: AccessPermissions }) => {
         {
             visible: hasPlatformCapability(
                 platformRole,
-                'manage_platform_settings',
-            ),
-            label: '平台公共配置',
-            path: '/system-settings',
-        },
-        {
-            visible: hasPlatformCapability(
-                platformRole,
                 'view_platform_audit',
             ),
             label: '平台审计',
             path: '/platform/audit',
         },
+        {
+            visible: hasPlatformCapability(
+                platformRole,
+                'operate_emergency_controls',
+            ),
+            label: '安全与应急',
+            path: '/platform/emergency-controls',
+        },
     ].filter(({ visible }) => visible)
 
     return (
         <Box data-testid="platform-home" sx={{ p: 4 }}>
-            <Title title="平台治理中心" />
+            <Title title="平台工作台" />
             <Paper sx={{ p: 4 }}>
                 <Typography variant="h4" gutterBottom>
-                    平台治理中心
+                    平台工作台
                 </Typography>
                 <Typography color="text.secondary">
                     当前平台职责：
@@ -597,6 +650,16 @@ const PlatformHome = ({ permissions }: { permissions: AccessPermissions }) => {
     )
 }
 
+const PlatformHomeRoute = () => {
+    const { permissions, isPending } = usePermissions<AccessPermissions>()
+    if (isPending) return <PageLoading />
+    const role = parsePlatformRole(permissions?.platform_role)
+    if (role === null || role === 'member' || !permissions) {
+        return <Navigate to="/" replace />
+    }
+    return <PlatformHome permissions={permissions} />
+}
+
 const HomeDashboard = () => {
     const { permissions, isPending: permissionsPending } =
         usePermissions<AccessPermissions>()
@@ -626,7 +689,7 @@ const HomeDashboard = () => {
     }
     const platformRole = parsePlatformRole(permissions?.platform_role)
     if (permissions && platformRole !== null && platformRole !== 'member') {
-        return <PlatformHome permissions={permissions} />
+        return <Navigate to="/platform/home" replace />
     }
     return <NoAuthorizedProjects />
 }
@@ -638,6 +701,8 @@ const navigationIcons: Record<NavigationIcon, React.ReactElement> = {
     notifications: <NotificationIcon />,
     automation: <AutomationIcon />,
     agents: <AgentIcon />,
+    collaboration: <CollaborationIcon />,
+    knowledge: <KnowledgeIcon />,
     webhook: <WebhookIcon />,
     integrationRuntime: <IntegrationRuntimeIcon />,
     memberships: <MembershipIcon />,
@@ -656,12 +721,23 @@ const customNavigationComponents: Record<
     workbench: CrossProjectWorkbench,
     workbenchDashboard: WorkbenchDashboard,
     automationIndex: () => <Navigate to="/automation-rules" replace />,
+    automationSLA: AutomationSLAList,
+    automationTemplates: AutomationTemplateList,
+    automationQuickReplies: AutomationQuickReplyList,
     agentControl: AgentControlCenter,
+    agentCollaboration: AgentCollaborationWorkspace,
+    knowledgeManagement: KnowledgeManagementPage,
     webhookSettings: WebhookSettings,
     integrationRuntime: IntegrationRuntime,
+    projectBasicSettings: ProjectBasicSettingsPage,
     projectMemberships: ProjectMembershipPage,
+    projectIntakeSettings: ProjectIntakeSettingsPage,
+    projectQueueSettings: ProjectQueueSettingsPage,
+    projectNotificationChannels: ProjectNotificationChannelsPage,
+    platformHome: PlatformHomeRoute,
     platformProjects: PlatformProjectGovernancePage,
     platformAudit: PlatformAuditPage,
+    emergencyControls: EmergencyControls,
     platformConfig: SystemSettings,
     platformEmail: EmailSettings,
     accountProfile: AccountProfile,
@@ -679,9 +755,12 @@ const customNavigationLeaves = navigationRegistry.flatMap((node) =>
 const navigationRouteElement = (
     node: NavigationLeafNode,
     legacy = false,
+    component?: CustomNavigationComponent,
 ) => {
     if (node.route.kind !== 'custom') return null
-    const Component = customNavigationComponents[node.route.component]
+    const Component = customNavigationComponents[
+        component ?? node.route.component
+    ]
     return (
         <NavigationContractGuard node={node}>
             {legacy ? <Navigate to={node.path} replace /> : <Component />}
@@ -836,10 +915,11 @@ const CustomMenu: React.FC = () => {
                 const isExpanded = expanded[node.id] === true
                 const isActive = activeGroupID === node.id
                 return (
-                    <Box component="li" key={node.id} sx={{ listStyle: 'none' }}>
+                    <Box component="div" key={node.id}>
                         <ListItemButton
                             component="button"
                             type="button"
+                            role="menuitem"
                             aria-expanded={isExpanded}
                             aria-controls={contentID}
                             data-testid={`navigation-group-${nodeIndex}-toggle`}
@@ -852,7 +932,7 @@ const CustomMenu: React.FC = () => {
                             sx={{
                                 width: '100%',
                                 color: isActive
-                                    ? 'primary.main'
+                                    ? 'primary.dark'
                                     : 'text.secondary',
                                 bgcolor: isActive
                                     ? 'action.selected'
@@ -933,6 +1013,12 @@ const AppRuntimeCoordinator = () => {
         const handleProjectScopeChanged = () => {
             clearRuntimeCaches()
         }
+        const handleProjectInventoryChanged = () => {
+            void queryClient.refetchQueries({
+                queryKey: ['auth', 'getPermissions'],
+                type: 'active',
+            })
+        }
         const handleProjectAccessInvalidated = () => {
             if (
                 handlingSessionInvalidation.current ||
@@ -959,7 +1045,7 @@ const AppRuntimeCoordinator = () => {
 
         window.addEventListener(
             projectInventoryChangedEvent,
-            handleProjectScopeChanged,
+            handleProjectInventoryChanged,
         )
         window.addEventListener(
             projectScopeChangedEvent,
@@ -976,7 +1062,7 @@ const AppRuntimeCoordinator = () => {
         return () => {
             window.removeEventListener(
                 projectInventoryChangedEvent,
-                handleProjectScopeChanged,
+                handleProjectInventoryChanged,
             )
             window.removeEventListener(
                 projectScopeChangedEvent,
@@ -1076,6 +1162,17 @@ const AdminApp: React.FC = () => (
                             key={legacyPath}
                             path={legacyPath}
                             element={navigationRouteElement(node, true)}
+                        />
+                    )),
+                    ...(node.route.subroutes ?? []).map((subroute) => (
+                        <Route
+                            key={subroute.path}
+                            path={subroute.path}
+                            element={navigationRouteElement(
+                                node,
+                                false,
+                                subroute.component,
+                            )}
                         />
                     )),
                 ]

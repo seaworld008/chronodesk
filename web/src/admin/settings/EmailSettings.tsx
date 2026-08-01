@@ -27,7 +27,6 @@ import {
 import PageHeader from '@/components/layout/PageHeader'
 import PageShell from '@/components/layout/PageShell'
 import BackButton from '../common/BackButton'
-import SettingsTabs from './SettingsTabs'
 
 interface EmailForm extends EmailConfig {
   smtp_password?: string
@@ -200,9 +199,6 @@ const EmailSettings: React.FC = () => {
   return (
     <PageShell title="平台邮件设置" testId="email-settings-page-shell">
       <EmailSettingsHeader />
-      <Box sx={{ mt: 2 }}>
-        <SettingsTabs />
-      </Box>
       <Paper sx={{ p: 3, mb: 3 }}>
         <Stack
           direction="row"

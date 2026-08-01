@@ -33,7 +33,7 @@ test('连续功能树按产品顺序输出且不保留视觉分区节点', () =>
         '项目运营',
         '智能运营',
         '集成中心',
-        '项目配置',
+        '项目设置',
         '治理中心',
         '系统设置',
     ])
@@ -72,6 +72,16 @@ test('无当前项目隐藏全部项目树但保留工作台和精确治理入�
         ['工作台', '治理中心', '系统设置'],
     )
     assert.ok(nodes.every((node) => node.scope !== 'project'))
+    const governance = nodes.find((node) => node.id === 'governance-center')
+    assert.deepEqual(
+        governance.children.map((item) => item.id),
+        [
+            'platform-home',
+            'platform-projects',
+            'users',
+            'platform-audit',
+        ],
+    )
 })
 
 test('平台职责不会推导项目 scope', () => {
@@ -83,6 +93,68 @@ test('平台职责不会推导项目 scope', () => {
     assert.ok(items.some((item) => item.id === 'users'))
     assert.ok(!items.some((item) => item.id === 'tickets'))
     assert.ok(!items.some((item) => item.id === 'agents'))
+})
+
+test('安全与应急仅紧急运维员可见且平台职责共享平台工作台', () => {
+    for (const platformRole of [
+        'platform_admin',
+        'security_auditor',
+        'emergency_operator',
+    ]) {
+        const items = registryModule.visibleNavigationItems('sidebar', {
+            platformRole,
+            projectRole: null,
+            hasProject: false,
+        })
+        assert.ok(
+            items.some((item) => item.id === 'platform-home'),
+            `${platformRole} should see platform workbench`,
+        )
+        assert.equal(
+            items.some((item) => item.id === 'emergency-controls'),
+            platformRole === 'emergency_operator',
+        )
+    }
+    const member = registryModule.visibleNavigationItems('sidebar', {
+        platformRole: 'member',
+        projectRole: null,
+        hasProject: false,
+    })
+    assert.ok(!member.some((item) => item.id === 'platform-home'))
+    assert.ok(!member.some((item) => item.id === 'emergency-controls'))
+})
+
+test('观察员只有集成读取能力，系统设置子项保持单一激活', () => {
+    const observerItems = registryModule.visibleNavigationItems('sidebar', {
+        platformRole: 'member',
+        projectRole: 'observer',
+        hasProject: true,
+    })
+    const integrationRuntime = observerItems.find(
+        (item) => item.id === 'integration-runtime',
+    )
+    assert.deepEqual(integrationRuntime.capability, {
+        kind: 'project',
+        value: 'view_integrations',
+    })
+    assert.ok(!observerItems.some((item) => item.id === 'webhook'))
+
+    const platformItems = registryModule.visibleNavigationItems(
+        'sidebar',
+        platformProjectAdmin,
+    )
+    const config = platformItems.find((item) => item.id === 'platform-config')
+    const email = platformItems.find(
+        (item) => item.id === 'platform-email-settings',
+    )
+    assert.equal(
+        stateModule.isNavigationItemActive(config, '/system-settings/email'),
+        false,
+    )
+    assert.equal(
+        stateModule.isNavigationItemActive(email, '/system-settings/email'),
+        true,
+    )
 })
 
 test('registry validator 拒绝重复 ID/path、非法 scope、非法 children 和循环', () => {
@@ -187,6 +259,31 @@ test('validator 检查 capability/role/icon/order/active path 与 parent taxonom
             `${expected}: ${errors.join('；')}`,
         )
     }
+    const invalidSubroutes = registryModule.validateNavigationRegistry([
+        {
+            ...badLeaf,
+            id: 'bad-subroutes',
+            icon: 'home',
+            order: 1,
+            scope: 'global',
+            placement: 'sidebar',
+            capability: null,
+            roles: null,
+            activePathPrefixes: ['/bad-taxonomy'],
+            route: {
+                kind: 'custom',
+                component: 'workbench',
+                subroutes: [
+                    { path: 'missing-slash', component: 'workbench' },
+                    { path: '/bad-taxonomy', component: 'unknown-component' },
+                ],
+            },
+        },
+    ])
+    assert.ok(
+        invalidSubroutes.some((error) => error.includes('非法 subroute')),
+        invalidSubroutes.join('；'),
+    )
 })
 
 test('custom route contract 完整承载 path、权限、角色和兼容重定向', () => {
@@ -199,14 +296,25 @@ test('custom route contract 完整承载 path、权限、角色和兼容重定�
             'accountProfile',
             'accountSecurity',
             'agentControl',
+            'agentCollaboration',
             'automationIndex',
+            'automationQuickReplies',
+            'automationSLA',
+            'automationTemplates',
+            'emergencyControls',
             'integrationRuntime',
+            'knowledgeManagement',
             'loginHistory',
             'platformAudit',
             'platformConfig',
             'platformEmail',
+            'platformHome',
             'platformProjects',
+            'projectBasicSettings',
+            'projectIntakeSettings',
             'projectMemberships',
+            'projectNotificationChannels',
+            'projectQueueSettings',
             'trustedDevices',
             'webhookSettings',
             'workbench',
@@ -219,6 +327,146 @@ test('custom route contract 完整承载 path、权限、角色和兼容重定�
     assert.deepEqual(email.capability, {
         kind: 'platform',
         value: 'manage_email_settings',
+    })
+    const automation = custom.find(
+        (node) => node.route.component === 'automationIndex',
+    )
+    assert.equal(automation.route.subroutes, undefined)
+    assert.deepEqual(automation.capability, {
+        kind: 'project',
+        value: 'manage_automation',
+    })
+    for (const [component, canonical, legacy] of [
+        ['automationSLA', '/project-settings/sla', '/automation-sla'],
+        [
+            'automationTemplates',
+            '/project-settings/templates',
+            '/automation-templates',
+        ],
+        [
+            'automationQuickReplies',
+            '/project-settings/quick-replies',
+            '/automation-quick-replies',
+        ],
+    ]) {
+        const setting = custom.find(
+            (node) => node.route.component === component,
+        )
+        assert.equal(setting.path, canonical)
+        assert.deepEqual(setting.route.legacyPaths, [legacy])
+        assert.equal(setting.scope, 'project')
+    }
+})
+
+test('自动化只承载规则与日志，服务策略严格归入项目设置', () => {
+    const managerItems = registryModule.visibleNavigationItems('sidebar', {
+        platformRole: 'member',
+        projectRole: 'manager',
+        hasProject: true,
+    })
+    const agentItems = registryModule.visibleNavigationItems('sidebar', {
+        platformRole: 'member',
+        projectRole: 'agent',
+        hasProject: true,
+    })
+    assert.ok(managerItems.some((item) => item.id === 'automation'))
+    assert.ok(!agentItems.some((item) => item.id === 'automation'))
+    const managerNodes = registryModule.visibleNavigationNodes('sidebar', {
+        platformRole: 'member',
+        projectRole: 'manager',
+        hasProject: true,
+    })
+    assert.equal(
+        stateModule.findActiveNavigationGroupID(
+            managerNodes,
+            '/automation-logs',
+        ),
+        'intelligent-operations',
+    )
+    assert.equal(
+        stateModule.findActiveNavigationGroupID(
+            managerNodes,
+            '/project-settings/quick-replies',
+        ),
+        'project-configuration',
+    )
+    assert.equal(
+        stateModule.findActiveNavigationGroupID(
+            managerNodes,
+            '/automation-quick-replies',
+        ),
+        'project-configuration',
+    )
+})
+
+test('人机协作与知识库对所有项目成员可见且知识库只有一个运营入口', () => {
+    for (const projectRole of [
+        'project_admin',
+        'manager',
+        'agent',
+        'requester',
+        'observer',
+    ]) {
+        const items = registryModule.visibleNavigationItems('sidebar', {
+            platformRole: 'member',
+            projectRole,
+            hasProject: true,
+        })
+        assert.ok(
+            items.some((item) => item.id === 'agent-collaboration'),
+            `${projectRole} should see safe collaboration workspace`,
+        )
+        assert.equal(
+            items.some((item) => item.id === 'knowledge-management'),
+            true,
+        )
+    }
+    const managerNodes = registryModule.visibleNavigationNodes('sidebar', {
+        platformRole: 'member',
+        projectRole: 'manager',
+        hasProject: true,
+    })
+    const projectSettings = managerNodes.find(
+        (node) => node.id === 'project-configuration',
+    )
+    assert.equal(projectSettings.label, '项目设置')
+    assert.deepEqual(
+        projectSettings.children.map((item) => item.id),
+        [
+            'project-basic-settings',
+            'memberships',
+            'project-intake-settings',
+            'project-sla-settings',
+            'project-queue-settings',
+            'project-ticket-templates',
+            'project-quick-replies',
+            'project-notification-channels',
+        ],
+    )
+    const projectOperations = managerNodes.find(
+        (node) => node.id === 'project-operations',
+    )
+    assert.deepEqual(
+        projectOperations.children.map((item) => item.id),
+        [
+            'project-overview',
+            'tickets',
+            'knowledge-management',
+            'notifications',
+        ],
+    )
+    const knowledge = projectOperations.children.find(
+        (item) => item.id === 'knowledge-management',
+    )
+    assert.equal(knowledge.label, '知识库')
+    assert.equal(knowledge.path, '/knowledge')
+    assert.deepEqual(
+        knowledge.route.legacyPaths,
+        ['/project-settings/knowledge'],
+    )
+    assert.deepEqual(knowledge.capability, {
+        kind: 'project',
+        value: 'view_project',
     })
 })
 

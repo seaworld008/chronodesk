@@ -12,3 +12,6 @@
 *.woff binary
 *.woff2 binary
 *.pdf binary
+
+# Unified diffs require a single context marker on otherwise blank lines.
+web/patches/*.patch whitespace=-blank-at-eol

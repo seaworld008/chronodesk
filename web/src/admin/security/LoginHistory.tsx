@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Refresh as RefreshIcon } from '@mui/icons-material'
 import {
     Alert,
@@ -18,33 +18,17 @@ import {
 } from '@mui/material'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
 import {
+    humanApiRoutes,
+    type LoginHistoryPage,
+    type LoginHistoryRecord,
+} from '@/lib/generated/human-api'
+import {
     ResizableMuiTable,
     TruncatedText,
     type ResizableColumn,
 } from '@/components/tables/EnterpriseTable'
 import PageShell from '@/components/layout/PageShell'
 import AccountPageHeader from './AccountPageHeader'
-
-interface LoginHistoryRecord {
-    id: number
-    ip_address: string
-    login_time: string
-    login_status: string
-    login_method: string
-    failure_reason?: string
-    location: string
-    device_info: string
-    session_duration: string
-    is_current_session: boolean
-    is_active: boolean
-}
-
-interface LoginHistoryPage {
-    items: LoginHistoryRecord[]
-    total: number
-    page: number
-    page_size: number
-}
 
 const columns: ResizableColumn[] = [
     { key: 'time', defaultWidth: 190, minWidth: 150, maxWidth: 300 },
@@ -73,26 +57,58 @@ const LoginHistory = () => {
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState('')
     const [pageIndex, setPageIndex] = useState(0)
-    const [pageSize, setPageSize] = useState(20)
+    const [pageSize, setPageSize] = useState(25)
+    const requestController = useRef<AbortController | null>(null)
+    const requestSequence = useRef(0)
 
     const load = useCallback(async () => {
+        requestController.current?.abort()
+        const controller = new AbortController()
+        const sequence = requestSequence.current + 1
+        requestSequence.current = sequence
+        requestController.current = controller
         setLoading(true)
         setError('')
         try {
             const result = await apiFetch<LoginHistoryPage>(
-                `/user/login-history?page=${pageIndex + 1}&page_size=${pageSize}&order_by=login_time&order=desc`,
+                humanApiRoutes.listLoginHistory({
+                    page: pageIndex + 1,
+                    page_size: pageSize,
+                    sort_by: 'login_time',
+                    sort_order: 'desc',
+                }),
+                { signal: controller.signal },
             )
+            if (
+                controller.signal.aborted
+                || requestSequence.current !== sequence
+            ) return
             setPage({ ...result, items: result.items ?? [] })
         } catch (requestError) {
+            if (
+                controller.signal.aborted
+                || requestSequence.current !== sequence
+            ) return
             setError(localizedUnknownErrorMessage(requestError, '登录历史加载失败'))
         } finally {
-            setLoading(false)
+            if (
+                !controller.signal.aborted
+                && requestSequence.current === sequence
+            ) {
+                setLoading(false)
+            }
         }
     }, [pageIndex, pageSize])
 
     useEffect(() => {
         void load()
+        return () => requestController.current?.abort()
     }, [load])
+
+    useEffect(() => () => {
+        requestController.current?.abort()
+        requestSequence.current += 1
+    }, [])
 
     return (
         <PageShell
@@ -207,7 +223,7 @@ const LoginHistory = () => {
                                 setPageSize(Number(event.target.value))
                                 setPageIndex(0)
                             }}
-                            rowsPerPageOptions={[10, 20, 50, 100]}
+                            rowsPerPageOptions={[25, 50, 100]}
                             labelRowsPerPage="每页记录数"
                             labelDisplayedRows={({ from, to, count }) =>
                                 `${from}–${to} / ${count}`

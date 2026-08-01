@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.1.0.
- * Contract SHA-256: 6b04789ca28be5c01654cb86c788e184c4943974f729a4164536faaa7454a742.
+ * Contract SHA-256: 3851c27205f5db8e02d18396de3c930ada3da06391c448a02ba21a1700b0ee4f.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -54,6 +54,8 @@ export type UpdateHumanProfileRequest = {
 export type UpsertProjectMembershipRequest = {
     user_id: number
     role: ProjectRole
+    knowledge_contributor?: boolean
+    expected_version: number
 }
 
 export type CreatePlatformProjectRequest = {
@@ -219,8 +221,21 @@ export type ProjectScope = {
 export type AuthorizedProjectAccess = {
     project: AuthorizedProject
     project_role: ProjectRole
+    can_create_knowledge_drafts: boolean
     scope: ProjectScope
     scopes?: Array<string>
+}
+
+export type AuthorizedProjectPage = {
+    items: Array<AuthorizedProjectAccess>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type AuthorizedProjectPageEnvelope = SuccessEnvelope & {
+    data: AuthorizedProjectPage
 }
 
 export type ProjectMembership = {
@@ -230,9 +245,73 @@ export type ProjectMembership = {
     user?: HumanUserSummary
     role: ProjectRole
     is_active: boolean
+    knowledge_contributor: boolean
     version: number
     created_at: string
     updated_at: string
+}
+
+export type ProjectMembershipPage = {
+    items: Array<ProjectMembership>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type ProjectMembershipPageEnvelope = SuccessEnvelope & {
+    data: ProjectMembershipPage
+}
+
+export type TrustedDevice = {
+    id: number
+    device_name: string
+    last_used_at: string
+    last_ip: string
+    user_agent: string
+    expires_at: string
+    revoked: boolean
+    created_at: string
+    updated_at: string
+}
+
+export type TrustedDevicePage = {
+    items: Array<TrustedDevice>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type TrustedDevicePageEnvelope = SuccessEnvelope & {
+    data: TrustedDevicePage
+}
+
+export type QueueStatus = "active" | "archived"
+
+export type ProjectQueue = {
+    public_id: string
+    created_at: string
+    updated_at: string
+    team_public_id?: string
+    team_name?: string
+    key: string
+    name: string
+    description: string
+    status: QueueStatus
+    is_default: boolean
+}
+
+export type ProjectQueuePage = {
+    items: Array<ProjectQueue>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type ProjectQueuePageEnvelope = SuccessEnvelope & {
+    data: ProjectQueuePage
 }
 
 export type HumanUserSummary = {
@@ -292,9 +371,11 @@ export type AdminUserStats = {
 export type AdminAuditLog = {
     id: number
     created_at: string
+    actor_type: ActorType
+    actor_id: string
     user_id?: number
     username: string
-    platform_role: PlatformRole
+    platform_role?: PlatformRole
     action: string
     action_code?: string
     resource_type?: string
@@ -310,9 +391,11 @@ export type AdminAuditLog = {
 export type AdminAuditLogDetail = {
     id: number
     created_at: string
+    actor_type: ActorType
+    actor_id: string
     user_id?: number
     username: string
-    platform_role: PlatformRole
+    platform_role?: PlatformRole
     action: string
     action_code?: string
     resource_type?: string
@@ -333,10 +416,29 @@ export type AdminAuditLogDetail = {
 
 export type AdminAuditLogPage = {
     items: Array<AdminAuditLog>
-    total: number
-    page: number
-    limit: number
-    next_cursor?: string
+    next_cursor: string
+    has_more: boolean
+}
+
+export const adminAuditExportStateValues = ["queued","processing","completed","failed","expired"] as const
+export type AdminAuditExportState = (typeof adminAuditExportStateValues)[number]
+
+export type AdminAuditExport = {
+    public_id: PublicUUIDv7
+    state: AdminAuditExportState
+    requested_at: string
+    started_at?: string
+    completed_at?: string
+    expires_at?: string
+    row_count: number
+    truncated: boolean
+    sha256?: string
+    size_bytes: number
+    failure_code?: "storage_unavailable" | "query_failed" | "generation_failed" | "lease_lost"
+}
+
+export type AdminAuditExportEnvelope = SuccessEnvelope & {
+    data: AdminAuditExport
 }
 
 export type SuccessEnvelope = {
@@ -639,7 +741,6 @@ export type TicketComment = {
     is_deleted?: boolean
     deleted_by?: HumanUserSummary
     parent_id?: number | null
-    replies?: Array<TicketComment>
     reply_count: number
     time_spent?: number | null
     billable_time?: number | null
@@ -891,9 +992,12 @@ export type WorkbenchDashboard = {
     generated_at: string
     days: 7 | 30 | 90
     selected_projects: Array<WorkbenchDashboardProject>
+    selected_project_count: number
+    selected_projects_truncated: boolean
     summary: WorkbenchDashboardSummary
     daily_trend: Array<WorkbenchDashboardDailyPoint>
     project_breakdown: Array<WorkbenchDashboardProjectBreakdown>
+    project_breakdown_truncated: boolean
 }
 
 export type WorkbenchDashboardEnvelope = SuccessEnvelope & {
@@ -1063,8 +1167,25 @@ export type AutomationRule = {
     updated_by?: number
 }
 
+export type AutomationRuleListItem = {
+    id: number
+    name: string
+    description: string
+    rule_type: "assignment" | "classification" | "escalation" | "sla"
+    is_active: boolean
+    priority: number
+    trigger_event: string
+    execution_count: number
+    last_executed_at?: string
+    success_count: number
+    failure_count: number
+    average_exec_time: number
+    created_at: string
+    updated_at: string
+}
+
 export type AutomationRulePage = {
-    rules: Array<AutomationRule>
+    items: Array<AutomationRuleListItem>
     total: number
     page: number
     page_size: number
@@ -1096,8 +1217,6 @@ export type AutomationTicketLogSummary = {
 export type AutomationLog = {
     id: number
     created_at: string
-    organization_id: number
-    project_id: number
     rule_id: number
     rule?: AutomationRuleLogSummary
     ticket_id: number
@@ -1107,16 +1226,12 @@ export type AutomationLog = {
     success: boolean
     error_message?: string
     execution_time: number
-    actions_executed: string
-    changes: string
 }
 
 export type AutomationLogPage = {
-    logs: Array<AutomationLog>
-    total: number
-    page: number
-    page_size: number
-    total_pages: number
+    items: Array<AutomationLog>
+    next_cursor: string
+    has_more: boolean
 }
 
 export type AutomationRuleEnvelope = {
@@ -1197,6 +1312,59 @@ export type EmailConfigEnvelope = SuccessEnvelope & {
     data: EmailConfig
 }
 
+export type CleanupLog = {
+    id: number
+    created_at: string
+    task_type: string
+    status: "started" | "completed" | "failed"
+    start_time: string
+    end_time?: string
+    duration: string
+    records_processed: number
+    records_deleted: number
+    error_message?: string
+    retention_days: number
+    cutoff_date: string
+    trigger_type: "manual" | "scheduled"
+    trigger_by?: number
+}
+
+export type CleanupLogPage = {
+    items: Array<CleanupLog>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type CleanupLogPageEnvelope = {
+    success: true
+    data: CleanupLogPage
+}
+
+export type CleanupErrorEnvelope = {
+    error: string
+    message: string
+}
+
+export type EmergencyControlSnapshot = {
+    global_read_only: boolean
+    emergency_stop: boolean
+    version: number
+    updated_at: string
+}
+
+export type UpdateEmergencyControlsRequest = {
+    global_read_only?: boolean
+    emergency_stop?: boolean
+}
+
+export type EmergencyControlEnvelope = {
+    code: 0
+    msg: string
+    data: EmergencyControlSnapshot
+}
+
 export type SystemConfig = {
     id: number
     created_at: string
@@ -1231,10 +1399,18 @@ export type SystemConfigUpdateEnvelope = {
     data: UpdateSystemConfigRequest
 }
 
+export type SystemConfigPage = {
+    items: Array<SystemConfig>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
 export type SystemConfigListEnvelope = {
     success: true
     message: string
-    data: Array<SystemConfig>
+    data: SystemConfigPage
 }
 
 export const webhookProviderValues = ["wechat","dingtalk","lark","slack","teams","custom"] as const
@@ -1242,6 +1418,8 @@ export type WebhookProvider = (typeof webhookProviderValues)[number]
 
 export const webhookStatusValues = ["active","inactive","disabled","error"] as const
 export type WebhookStatus = (typeof webhookStatusValues)[number]
+
+export type WebhookEventType = "io.chronodesk.ticket.created.v1" | "io.chronodesk.ticket.updated.v1" | "io.chronodesk.ticket.assigned.v1" | "io.chronodesk.ticket.transitioned.v1" | "io.chronodesk.ticket.escalated.v1" | "io.chronodesk.ticket.comment.created.v1" | "io.chronodesk.ticket.attachment.created.v1" | "io.chronodesk.ticket.sla.breached.v1" | "io.chronodesk.ticket.deleted.v1" | "io.chronodesk.automation.notification.requested.v1" | "io.chronodesk.system.alert.v1"
 
 export type WebhookFilterRules = {
     transition_statuses?: Array<TicketStatus>
@@ -1252,7 +1430,7 @@ export type CreateWebhookRequest = {
     description?: string
     provider: WebhookProvider
     webhook_url: string
-    enabled_events?: Array<string>
+    enabled_events?: Array<WebhookEventType>
     message_template?: string
     message_format?: string
     filter_rules?: WebhookFilterRules
@@ -1271,7 +1449,7 @@ export type UpdateWebhookRequest = {
     description?: string
     provider?: WebhookProvider
     webhook_url?: string
-    enabled_events?: Array<string>
+    enabled_events?: Array<WebhookEventType>
     message_template?: string
     message_format?: string
     filter_rules?: WebhookFilterRules
@@ -1291,7 +1469,8 @@ export type WebhookConfig = {
     name: string
     description: string
     provider: WebhookProvider
-    webhook_url: string
+    webhook_url_masked: string
+    has_webhook_url: boolean
     enabled_events: string
     message_template: string
     message_format: string
@@ -1309,7 +1488,7 @@ export type WebhookConfig = {
     project_id: number
     status: WebhookStatus
     previous_secret_expires_at?: string
-    enabled_events_list?: Array<string>
+    enabled_events_list?: Array<WebhookEventType>
     filter_rules_obj?: WebhookFilterRules
     last_triggered_at?: string
     last_success_at?: string
@@ -1326,7 +1505,25 @@ export type WebhookPage = {
     items: Array<WebhookConfig>
     total: number
     page: number
-    size: number
+    page_size: number
+    total_pages: number
+}
+
+export type WebhookLog = {
+    id: number
+    created_at: string
+    config_id: number
+    event_type: WebhookEventType
+    status: "pending" | "success" | "failed"
+    response_status?: number
+    response_time?: number
+    error_message?: string
+}
+
+export type WebhookLogPage = {
+    items: Array<WebhookLog>
+    next_cursor: string
+    has_more: boolean
 }
 
 export type WebhookTestReceipt = {
@@ -1347,6 +1544,10 @@ export type WebhookEnvelope = SuccessEnvelope & {
 
 export type WebhookPageEnvelope = SuccessEnvelope & {
     data: WebhookPage
+}
+
+export type WebhookLogPageEnvelope = SuccessEnvelope & {
+    data: WebhookLogPage
 }
 
 export type WebhookTestReceiptEnvelope = SuccessEnvelope & {
@@ -1529,7 +1730,7 @@ export type AdminOutboxDeliverySummary = {
     id: string
     created_at: string
     event_id: string
-    destination_type: "webhook" | "event_stream" | "automation" | "notification" | "sla" | "sla_escalation" | "attachment_cleanup" | "attachment_staging_cleanup" | "a2a_push" | "email" | "other"
+    destination_type: "webhook" | "event_stream" | "automation" | "notification" | "sla" | "sla_escalation" | "attachment_upload" | "attachment_cleanup" | "attachment_staging_cleanup" | "a2a_push" | "email" | "other"
     destination_label: string
     status: "pending" | "processing" | "succeeded" | "failed" | "dead"
     attempts: number
@@ -1639,10 +1840,6 @@ export type CredentialRevocationResult = {
     revoked: true
 }
 
-export type AgentPolicyListEnvelope = Envelope & {
-    data?: Array<AdminAgentPolicy>
-}
-
 export type AdminAgentPolicy = {
     id: string
     created_at: string
@@ -1748,6 +1945,1386 @@ export type ReplayEnvelope = Envelope & {
     receipt: Receipt
 }
 
+export type LoginStatus = "success" | "failed" | "blocked" | "suspended" | "expired"
+
+export type LoginMethod = "password" | "password+trusted" | "password+otp" | "password+otp_required"
+
+export type LoginHistoryRecord = {
+    id: number
+    ip_address: string
+    login_time: string
+    logout_time: string | null
+    login_status: LoginStatus
+    login_method: LoginMethod
+    failure_reason?: string
+    location: string
+    device_info: string
+    session_duration: string
+    is_current_session: boolean
+    is_active: boolean
+}
+
+export type LoginHistoryPage = {
+    items: Array<LoginHistoryRecord>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type LoginHistoryPageEnvelope = {
+    code: 0
+    msg: string
+    data: LoginHistoryPage
+}
+
+export type CategoryStatus = "active" | "inactive" | "archived"
+
+export type CategoryType = "general" | "technical" | "business" | "support" | "incident" | "request" | "billing" | "complaint"
+
+export type ProjectCategory = {
+    id: number
+    name: string
+    slug: string
+    description: string
+    icon: string
+    color: string
+    type: CategoryType
+    status: CategoryStatus
+    sort_order: number
+    parent_id: number | null
+    level: number
+    path: string
+    is_default: boolean
+    is_public: boolean
+}
+
+export type ProjectCategoryPage = {
+    items: Array<ProjectCategory>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type ProjectCategoryPageEnvelope = {
+    code: 0
+    msg: string
+    data: ProjectCategoryPage
+}
+
+export type ProjectCategoryEnvelope = {
+    code: 0
+    msg: string
+    data: ProjectCategory
+}
+
+export type ProjectAssignee = {
+    id: number
+    username: string
+    first_name: string
+    last_name: string
+    display_name: string
+    role: ProjectRole
+}
+
+export type ProjectAssigneePage = {
+    items: Array<ProjectAssignee>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type ProjectAssigneePageEnvelope = {
+    code: 0
+    msg: string
+    data: ProjectAssigneePage
+}
+
+export type ProjectAssigneeEnvelope = {
+    code: 0
+    msg: string
+    data: ProjectAssignee
+}
+
+export type EntityKind = "asset" | "device" | "application" | "contract" | "customer" | "location" | "other"
+
+export type TicketRelationType = "parent_of" | "duplicate_of" | "blocks" | "collaborates_with"
+
+export type TicketRelationDirection = "outgoing" | "incoming"
+
+export type TicketEntityLink = {
+    id: string
+    created_at: string
+    ticket_id: number
+    kind: EntityKind
+    reference_id: string
+    display_name: string
+    metadata: unknown
+}
+
+export type TicketRelation = {
+    id: string
+    created_at: string
+    source_ticket_id: number
+    target_ticket_id: number
+    direction: TicketRelationDirection
+    related_ticket_id: number
+    related_ticket_number: string
+    related_ticket_title: string
+    relation: TicketRelationType
+    reason: string
+}
+
+export type TicketEntityLinkPage = {
+    items: Array<TicketEntityLink>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+    ticket_version: number
+}
+
+export type TicketRelationPage = {
+    items: Array<TicketRelation>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+    ticket_version: number
+}
+
+export type TicketEntityLinkPageEnvelope = {
+    success: true
+    data: TicketEntityLinkPage
+}
+
+export type TicketRelationPageEnvelope = {
+    success: true
+    data: TicketRelationPage
+}
+
+export type AddTicketEntityLinkRequest = {
+    expected_version: number
+    kind: EntityKind
+    reference_id: string
+    display_name: string
+    metadata?: unknown
+}
+
+export type AddTicketRelationRequest = {
+    expected_version: number
+    target_ticket_id: number
+    relation: TicketRelationType
+    reason?: string
+}
+
+export type AddTicketEntityLinkResult = {
+    link: TicketEntityLink
+    ticket_version: number
+    event_id: string
+}
+
+export type AddTicketRelationResult = {
+    relation: TicketRelation
+    ticket_version: number
+    event_id: string
+}
+
+export type AddTicketEntityLinkEnvelope = {
+    success: true
+    data: AddTicketEntityLinkResult
+}
+
+export type AddTicketRelationEnvelope = {
+    success: true
+    data: AddTicketRelationResult
+}
+
+export type AgentRunStatus = "queued" | "running" | "waiting_approval" | "succeeded" | "failed" | "cancelled" | "taken_over"
+
+export type ActionRiskLevel = "low" | "medium" | "high" | "critical"
+
+export type ActionProposalStatus = "pending" | "approved" | "rejected" | "executed" | "invalidated" | "expired"
+
+export type ApprovalTaskStatus = "pending" | "approved" | "rejected" | "invalidated" | "expired"
+
+export type HandoffDirection = "human_to_agent" | "agent_to_human" | "queue_to_team"
+
+export type AgentRunSummary = {
+    id: string
+    created_at: string
+    ticket_id: number
+    ticket_number: string
+    ticket_title: string
+    updated_at: string
+    status: AgentRunStatus
+}
+
+export type AgentRunDetail = {
+    id: string
+    created_at: string
+    ticket_id: number
+    ticket_number: string
+    ticket_title: string
+    updated_at: string
+    status: AgentRunStatus
+    model_provider: string
+    model_name: string
+    prompt_version: string
+    toolset_version: string
+    policy_version: string
+    input_summary?: string
+    output_summary?: string
+    prompt_tokens: number
+    completion_tokens: number
+    cost_micros: number
+    started_at?: string
+    finished_at?: string
+    termination_reason?: string
+}
+
+export type ActionProposalSummary = {
+    id: string
+    created_at: string
+    ticket_id: number
+    ticket_number: string
+    ticket_title: string
+    updated_at: string
+    agent_run_id: string
+    action_type: string
+    risk_level: ActionRiskLevel
+    target_ticket_version: number
+    status: ActionProposalStatus
+    expires_at: string
+    executed_at?: string
+}
+
+export type ActionProposalDetail = {
+    id: string
+    created_at: string
+    ticket_id: number
+    ticket_number: string
+    ticket_title: string
+    updated_at: string
+    agent_run_id: string
+    action_type: string
+    risk_level: ActionRiskLevel
+    target_ticket_version: number
+    status: ActionProposalStatus
+    expires_at: string
+    executed_at?: string
+    preview: unknown
+}
+
+export type ApprovalTaskSummary = {
+    id: string
+    created_at: string
+    ticket_id: number
+    ticket_number: string
+    ticket_title: string
+    updated_at: string
+    proposal_id: string
+    target_ticket_version: number
+    required_approvals: number
+    status: ApprovalTaskStatus
+    expires_at: string
+    completed_at?: string
+}
+
+export type ApprovalTaskDetail = {
+    id: string
+    created_at: string
+    ticket_id: number
+    ticket_number: string
+    ticket_title: string
+    updated_at: string
+    proposal_id: string
+    target_ticket_version: number
+    required_approvals: number
+    status: ApprovalTaskStatus
+    expires_at: string
+    completed_at?: string
+    approvals_recorded: number
+    rejections_recorded: number
+}
+
+export type HandoffSummary = {
+    id: string
+    created_at: string
+    ticket_id: number
+    ticket_number: string
+    ticket_title: string
+    agent_run_id?: string
+    direction: HandoffDirection
+}
+
+export type HandoffDetail = {
+    id: string
+    created_at: string
+    ticket_id: number
+    ticket_number: string
+    ticket_title: string
+    agent_run_id?: string
+    direction: HandoffDirection
+    reason: string
+    completed_summary?: string
+    missing_information: Array<string>
+}
+
+export type AgentRunPage = {
+    items: Array<AgentRunSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type AgentRunPageEnvelope = {
+    code: 0
+    msg: string
+    data: AgentRunPage
+}
+
+export type ActionProposalPage = {
+    items: Array<ActionProposalSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type ActionProposalPageEnvelope = {
+    code: 0
+    msg: string
+    data: ActionProposalPage
+}
+
+export type ApprovalTaskPage = {
+    items: Array<ApprovalTaskSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type ApprovalTaskPageEnvelope = {
+    code: 0
+    msg: string
+    data: ApprovalTaskPage
+}
+
+export type HandoffPage = {
+    items: Array<HandoffSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type HandoffPageEnvelope = {
+    code: 0
+    msg: string
+    data: HandoffPage
+}
+
+export type AgentRunDetailEnvelope = {
+    code: 0
+    msg: string
+    data: AgentRunDetail
+}
+
+export type ActionProposalDetailEnvelope = {
+    code: 0
+    msg: string
+    data: ActionProposalDetail
+}
+
+export type ApprovalTaskDetailEnvelope = {
+    code: 0
+    msg: string
+    data: ApprovalTaskDetail
+}
+
+export type HandoffDetailEnvelope = {
+    code: 0
+    msg: string
+    data: HandoffDetail
+}
+
+export type ApprovalDecisionRequest = {
+    decision: "approve" | "reject"
+    comment?: string
+}
+
+export type AgentRunTakeoverRequest = {
+    reason: string
+    completed_summary?: string
+    missing_information?: Array<string>
+    evidence_digest: string
+}
+
+export type ConfigurationVersionStatus = "draft" | "simulated" | "published"
+
+export type WorkClass = "incident" | "request" | "problem" | "change" | "complaint" | "consultation"
+
+export type IntakeRequestTypeVersion = {
+    id: string
+    version: number
+    status: ConfigurationVersionStatus
+    key: string
+    name: string
+    description: string
+    work_class: WorkClass
+    json_schema: unknown
+    ui_schema: unknown
+    published_at?: string
+}
+
+export type IntakeWorkflowVersion = {
+    id: string
+    version: number
+    status: ConfigurationVersionStatus
+    key: string
+    name: string
+    description: string
+    states: unknown
+    transitions: unknown
+    published_at?: string
+}
+
+export type ProjectIntakeConfiguration = {
+    release_id: string
+    release_version: number
+    request_types: Array<IntakeRequestTypeVersion>
+    workflows: Array<IntakeWorkflowVersion>
+}
+
+export type ProjectIntakeConfigurationEnvelope = {
+    code: 0
+    msg: string
+    data: ProjectIntakeConfiguration
+}
+
+export type SLAConfig = {
+    id: number
+    created_at: string
+    updated_at: string
+    name: string
+    description: string
+    is_active: boolean
+    is_default: boolean
+    ticket_type?: string
+    priority?: string
+    category?: string
+    assigned_user_id?: number
+    response_time: number
+    resolution_time: number
+    exclude_weekends: boolean
+    exclude_holidays: boolean
+    applied_count: number
+    violation_count: number
+    compliance_rate: number
+}
+
+export type TimeRange = {
+    start: string
+    end: string
+}
+
+export type WorkingHours = {
+    monday: TimeRange
+    tuesday: TimeRange
+    wednesday: TimeRange
+    thursday: TimeRange
+    friday: TimeRange
+    saturday: TimeRange
+    sunday: TimeRange
+    timezone?: string
+    holidays?: Array<string>
+}
+
+export type EscalationRule = {
+    trigger_minutes: number
+    action: string
+    target_user_id?: number
+    notify_users?: Array<number>
+}
+
+export type SLAConfigRequest = {
+    name: string
+    description?: string
+    is_active?: boolean
+    is_default?: boolean
+    ticket_type?: string
+    priority?: string
+    category?: string
+    assigned_user_id?: number
+    response_time: number
+    resolution_time: number
+    working_hours?: WorkingHours
+    exclude_weekends?: boolean
+    exclude_holidays?: boolean
+    escalation_rules?: Array<EscalationRule>
+}
+
+export type SLAConfigPage = {
+    items: Array<SLAConfig>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type SLAConfigEnvelope = {
+    success: true
+    message: string
+    data: SLAConfig
+}
+
+export type SLAConfigPageEnvelope = {
+    success: true
+    message: string
+    data: SLAConfigPage
+}
+
+export type TicketTemplate = {
+    id: number
+    created_at: string
+    updated_at: string
+    name: string
+    description: string
+    category: string
+    is_active: boolean
+    title_template: string
+    content_template: string
+    default_type: string
+    default_priority: string
+    default_status: string
+    assign_to_user_id?: number
+    usage_count: number
+}
+
+export type CustomField = {
+    name: string
+    type: "text" | "textarea" | "select" | "checkbox" | "date"
+    label: string
+    required: boolean
+    default_value?: unknown
+    options?: Array<string>
+}
+
+export type TicketTemplateRequest = {
+    name: string
+    description?: string
+    category: string
+    is_active?: boolean
+    title_template?: string
+    content_template?: string
+    default_type?: string
+    default_priority?: string
+    default_status?: string
+    assign_to_user_id?: number
+    custom_fields?: Array<CustomField>
+}
+
+export type TicketTemplatePage = {
+    items: Array<TicketTemplate>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type TicketTemplateEnvelope = {
+    success: true
+    message: string
+    data: TicketTemplate
+}
+
+export type TicketTemplatePageEnvelope = {
+    success: true
+    message: string
+    data: TicketTemplatePage
+}
+
+export type QuickReply = {
+    id: number
+    created_at: string
+    updated_at: string
+    name: string
+    category: string
+    content: string
+    tags: string
+    is_public: boolean
+    usage_count: number
+}
+
+export type QuickReplyRequest = {
+    name: string
+    category?: string
+    content: string
+    tags?: string
+    is_public?: boolean
+}
+
+export type QuickReplyPage = {
+    items: Array<QuickReply>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type QuickReplyEnvelope = {
+    success: true
+    message: string
+    data: QuickReply
+}
+
+export type QuickReplyPageEnvelope = {
+    success: true
+    message: string
+    data: QuickReplyPage
+}
+
+export type KnowledgeArticleStatus = "active" | "archived"
+
+export type KnowledgeVersionStatus = "draft" | "published" | "superseded" | "quarantined"
+
+export type VirusScanStatus = "pending" | "clean" | "infected" | "error"
+
+export type KnowledgeIngestionStatus = "queued" | "parsing" | "indexing" | "completed" | "quarantined" | "failed"
+
+export type KnowledgeArticle = {
+    id: string
+    key: string
+    title: string
+    summary: string
+    status: KnowledgeArticleStatus
+    current_version_id?: string
+    revision: number
+    created_at: string
+    updated_at: string
+    has_unpublished_draft?: boolean
+    latest_draft_at?: string
+    latest_draft_version?: number
+}
+
+export type KnowledgeVersion = {
+    id: string
+    article_id: string
+    version: number
+    status: KnowledgeVersionStatus
+    created_by_type: ActorType
+    title: string
+    original_file_name: string
+    mime_type: string
+    size_bytes: number
+    content_hash: string
+    virus_scan: VirusScanStatus
+    scanned_at?: string | null
+    page_count: number
+    published_at?: string | null
+    created_at: string
+    updated_at: string
+}
+
+export type KnowledgeIngestion = {
+    id: string
+    article_id: string
+    version_id: string
+    attempt: number
+    status: KnowledgeIngestionStatus
+    parser_key: string
+    started_at?: string | null
+    completed_at?: string | null
+    created_at: string
+    updated_at: string
+}
+
+export type KnowledgeArticlePage = {
+    items: Array<KnowledgeArticle>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type KnowledgeArticlePageEnvelope = {
+    code: 0
+    msg: string
+    data: KnowledgeArticlePage
+}
+
+export type KnowledgeVersionPage = {
+    items: Array<KnowledgeVersion>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type KnowledgeVersionPageEnvelope = {
+    code: 0
+    msg: string
+    data: KnowledgeVersionPage
+}
+
+export type KnowledgeIngestionPage = {
+    items: Array<KnowledgeIngestion>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type KnowledgeIngestionPageEnvelope = {
+    code: 0
+    msg: string
+    data: KnowledgeIngestionPage
+}
+
+export type CreateKnowledgeArticleRequest = {
+    key: string
+    title: string
+    summary?: string
+    markdown: string
+    source_ticket_id?: number
+    source_attachment_ids?: Array<number>
+}
+
+export type CreateKnowledgeDraftRequest = {
+    title: string
+    markdown: string
+    source_ticket_id?: number
+    source_attachment_ids?: Array<number>
+}
+
+export type KnowledgeSource = {
+    ordinal: number
+    kind: "ticket" | "attachment"
+    visibility: "full" | "restricted" | "unavailable"
+    reference_label: string
+    source_ticket_id?: number
+    source_attachment_id?: number
+    ticket_number?: string
+    ticket_title?: string
+    attachment_name?: string
+    attachment_hash?: string
+}
+
+export type KnowledgeAuthoredResult = {
+    article: KnowledgeArticle
+    version: KnowledgeVersion
+    sources: Array<KnowledgeSource>
+    receipt: Receipt
+}
+
+export type KnowledgeAuthoredEnvelope = {
+    code: 0
+    msg: string
+    data: KnowledgeAuthoredResult
+}
+
+export type KnowledgeDocumentSection = {
+    ordinal: number
+    heading: string
+    level: number
+    section_path?: string
+    markdown: string
+    content_hash: string
+}
+
+export type KnowledgeDocument = {
+    article: KnowledgeArticle
+    version: KnowledgeVersion
+    markdown: string
+    sections: Array<KnowledgeDocumentSection>
+    sources: Array<KnowledgeSource>
+}
+
+export type KnowledgeDocumentEnvelope = {
+    code: 0
+    msg: string
+    data: KnowledgeDocument
+}
+
+export type KnowledgeVersionEnvelope = {
+    code: 0
+    msg: string
+    data: KnowledgeVersion
+}
+
+export type KnowledgeSearchRequest = {
+    query: string
+    limit?: number
+}
+
+export type KnowledgeCitation = {
+    id: string
+    search_id: string
+    article_id: string
+    article_key: string
+    article_title: string
+    version_id: string
+    document_version: number
+    chunk_id: string
+    page_number?: number
+    section_path: string
+    snippet: string
+    content_hash: string
+    rank: number
+    score: number
+}
+
+export type KnowledgeSearchResult = {
+    search_id: string
+    items: Array<KnowledgeCitation>
+}
+
+export type KnowledgeSearchEnvelope = {
+    code: 0
+    msg: string
+    data: KnowledgeSearchResult
+}
+
+export type KnowledgeIndexStatus = "rebuild_requested" | "building" | "ready" | "failed"
+
+export type KnowledgeIndexState = {
+    id: string
+    index_name: string
+    generation: number
+    desired_generation: number
+    status: KnowledgeIndexStatus
+    source_digest?: string
+    document_count: number
+    started_at?: string | null
+    completed_at?: string | null
+    updated_at: string
+}
+
+export type KnowledgeIndexStateEnvelope = {
+    code: 0
+    msg: string
+    data: KnowledgeIndexState
+}
+
+export type IntegrationResourceID = string
+
+export type IntegrationConnectorDirection = "inbound" | "outbound" | "bidirectional"
+
+export type IntegrationConnectorDefinitionStatus = "active" | "disabled" | "archived"
+
+export type IntegrationConnectionStatus = "active" | "inactive" | "error" | "archived"
+
+export type IntegrationMappingVersionStatus = "draft" | "published" | "retired"
+
+export type IntegrationInboxMessageStatus = "processing" | "completed" | "conflict" | "dead_letter"
+
+export type IntegrationInboxReceiptStatus = "applied" | "noop"
+
+export type IntegrationSyncDirection = "inbound" | "outbound"
+
+export type IntegrationSyncRunStatus = "pending" | "running" | "succeeded" | "failed" | "conflict" | "cancelled"
+
+export type IntegrationConflictType = "message_identity_reuse" | "external_link_mismatch" | "internal_link_collision"
+
+export type IntegrationConflictStatus = "open" | "resolved" | "ignored"
+
+export type IntegrationConflictResolution = "resolved" | "ignored"
+
+export type IntegrationDeadLetterStatus = "open" | "requeued" | "resolved"
+
+export type IntegrationOutboxDeliveryStatus = "pending" | "processing" | "succeeded" | "failed" | "dead"
+
+export type IntegrationConnectorDefinitionSummary = {
+    id: IntegrationResourceID
+    key: string
+    name: string
+    description: string
+    kind: string
+    direction: IntegrationConnectorDirection
+    status: IntegrationConnectorDefinitionStatus
+    signature_scheme: string
+    default_replay_window_seconds: number
+    has_configuration_schema: boolean
+    has_mapping_schema: boolean
+    created_at: string
+    updated_at: string
+}
+
+export type IntegrationConnectorDefinition = {
+    id: IntegrationResourceID
+    key: string
+    name: string
+    description: string
+    kind: string
+    direction: IntegrationConnectorDirection
+    status: IntegrationConnectorDefinitionStatus
+    signature_scheme: string
+    default_replay_window_seconds: number
+    configuration_schema: unknown
+    mapping_schema: unknown
+    created_at: string
+    updated_at: string
+}
+
+export type IntegrationConnectionSummary = {
+    id: IntegrationResourceID
+    key: string
+    name: string
+    description: string
+    status: IntegrationConnectionStatus
+    replay_window_seconds: number
+    has_configuration: boolean
+    has_verification_key: boolean
+    last_verified_at?: string
+    last_error_at?: string
+    last_error_code?: string
+    created_at: string
+    updated_at: string
+}
+
+export type IntegrationMappingSummary = {
+    id: IntegrationResourceID
+    key: string
+    version: number
+    status: IntegrationMappingVersionStatus
+    target_command: string
+    definition_digest: string
+    published_at?: string
+    published_by?: string
+    created_at: string
+    updated_at: string
+}
+
+export type IntegrationMapping = {
+    id: IntegrationResourceID
+    connection_id: number
+    key: string
+    version: number
+    status: IntegrationMappingVersionStatus
+    source_schema: unknown
+    target_command: string
+    definition: unknown
+    definition_digest: string
+    published_at?: string
+    published_by?: string
+    created_at: string
+    updated_at: string
+}
+
+export type IntegrationInboxMessageSummary = {
+    id: IntegrationResourceID
+    connection_id: number
+    external_message_id: string
+    external_resource_type: string
+    external_resource_id: string
+    signed_at: string
+    received_at: string
+    content_type: string
+    payload_digest: string
+    status: IntegrationInboxMessageStatus
+    processed_at?: string
+    created_at: string
+    updated_at: string
+}
+
+export type IntegrationInboxReceiptSummary = {
+    id: IntegrationResourceID
+    status: IntegrationInboxReceiptStatus
+    resource_type: string
+    resource_id: string
+    resource_version: number
+    event_id?: string
+    operation_id?: string
+    actor_type: ActorType
+    actor_id: string
+    processed_at: string
+    created_at: string
+}
+
+export type IntegrationSyncRunSummary = {
+    id: IntegrationResourceID
+    connection_id: number
+    run_key: string
+    direction: IntegrationSyncDirection
+    status: IntegrationSyncRunStatus
+    started_at?: string
+    finished_at?: string
+    processed_count: number
+    succeeded_count: number
+    failed_count: number
+    conflict_count: number
+    error_code?: string
+}
+
+export type IntegrationConflictSummary = {
+    id: IntegrationResourceID
+    connection_id: number
+    type: IntegrationConflictType
+    status: IntegrationConflictStatus
+    external_resource_type: string
+    external_resource_id: string
+    existing_internal_resource_id?: string
+    incoming_internal_resource_id?: string
+    resolved_at?: string
+    created_at: string
+    updated_at: string
+}
+
+export type IntegrationDeadLetterSummary = {
+    id: IntegrationResourceID
+    connection_id: number
+    status: IntegrationDeadLetterStatus
+    reason_code: string
+    attempt_count: number
+    next_attempt_at?: string
+    resolved_at?: string
+    created_at: string
+    updated_at: string
+}
+
+export type IntegrationDomainEventSummary = {
+    id: IntegrationResourceID
+    created_at: string
+    type: string
+    subject: string
+    actor_type: ActorType
+    actor_id: string
+    resource_version: number
+    time: string
+}
+
+export type IntegrationOutboxSummary = {
+    id: IntegrationResourceID
+    event_id: IntegrationResourceID
+    destination_type: string
+    destination_label: string
+    status: IntegrationOutboxDeliveryStatus
+    attempts: number
+    max_attempts: number
+    next_attempt_at: string
+    last_error?: string
+    delivered_at?: string
+    created_at: string
+    updated_at: string
+}
+
+export type IntegrationConnectionHealth = {
+    id: IntegrationResourceID
+    key: string
+    name: string
+    status: IntegrationConnectionStatus
+    last_verified_at?: string
+    last_error_at?: string
+    last_error_code?: string
+    last_run?: IntegrationSyncRunSummary
+}
+
+export type IntegrationOverview = {
+    connector_definitions: number
+    connections: number
+    active_connections: number
+    error_connections: number
+    open_conflicts: number
+    open_dead_letters: number
+    running_sync_runs: number
+    recent_runs: Array<IntegrationSyncRunSummary>
+    recent_runs_limit: number
+    recent_runs_truncated: boolean
+    connection_health: Array<IntegrationConnectionHealth>
+    connection_health_limit: number
+    connection_health_truncated: boolean
+}
+
+export type IntegrationConnectorDefinitionPage = {
+    items: Array<IntegrationConnectorDefinitionSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type IntegrationConnectionPage = {
+    items: Array<IntegrationConnectionSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type IntegrationMappingPage = {
+    items: Array<IntegrationMappingSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type IntegrationInboxMessagePage = {
+    items: Array<IntegrationInboxMessageSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type IntegrationInboxReceiptPage = {
+    items: Array<IntegrationInboxReceiptSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type IntegrationSyncRunPage = {
+    items: Array<IntegrationSyncRunSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type IntegrationConflictPage = {
+    items: Array<IntegrationConflictSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type IntegrationDeadLetterPage = {
+    items: Array<IntegrationDeadLetterSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type IntegrationOutboxPage = {
+    items: Array<IntegrationOutboxSummary>
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+export type IntegrationDomainEventCursorPage = {
+    items: Array<IntegrationDomainEventSummary>
+    next_cursor: string
+    has_more: boolean
+}
+
+export type IntegrationConnectorDefinitionPageEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationConnectorDefinitionPage
+}
+
+export type IntegrationConnectorDefinitionEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationConnectorDefinition
+}
+
+export type IntegrationConnectionPageEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationConnectionPage
+}
+
+export type IntegrationConnectionEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationConnectionSummary
+}
+
+export type IntegrationMappingPageEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationMappingPage
+}
+
+export type IntegrationMappingEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationMapping
+}
+
+export type IntegrationInboxMessagePageEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationInboxMessagePage
+}
+
+export type IntegrationInboxReceiptPageEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationInboxReceiptPage
+}
+
+export type IntegrationSyncRunPageEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationSyncRunPage
+}
+
+export type IntegrationConflictPageEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationConflictPage
+}
+
+export type IntegrationConflictEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationConflictSummary
+}
+
+export type IntegrationDeadLetterPageEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationDeadLetterPage
+}
+
+export type IntegrationDomainEventCursorEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationDomainEventCursorPage
+}
+
+export type IntegrationOutboxPageEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationOutboxPage
+}
+
+export type IntegrationOverviewEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationOverview
+}
+
+export type CreateIntegrationConnectorDefinitionRequest = {
+    key: string
+    name: string
+    description?: string
+    kind: string
+    direction: IntegrationConnectorDirection
+    status?: IntegrationConnectorDefinitionStatus
+    signature_scheme: string
+    default_replay_window_seconds?: number
+    configuration_schema?: unknown
+    mapping_schema?: unknown
+}
+
+export type UpdateIntegrationConnectorDefinitionRequest = {
+    name: string
+    description: string
+    status: IntegrationConnectorDefinitionStatus
+    signature_scheme: string
+    default_replay_window_seconds: number
+    configuration_schema: unknown
+    mapping_schema: unknown
+    expected_updated_at: string
+}
+
+export type CreateIntegrationConnectionRequest = {
+    connector_definition_id: IntegrationResourceID
+    key: string
+    name: string
+    description?: string
+    status?: IntegrationConnectionStatus
+    configuration?: unknown
+    verification_key_ref?: string
+    replay_window_seconds?: number
+}
+
+export type UpdateIntegrationConnectionRequest = {
+    name: string
+    description: string
+    status: IntegrationConnectionStatus
+    configuration: unknown
+    verification_key_ref: string
+    replay_window_seconds: number
+    expected_updated_at: string
+}
+
+export type CreateIntegrationMappingRequest = {
+    key: string
+    source_schema?: unknown
+    target_command: string
+    definition: unknown
+}
+
+export type UpdateIntegrationMappingRequest = {
+    source_schema?: unknown
+    target_command: string
+    definition: unknown
+    expected_definition_digest: string
+    expected_updated_at: string
+}
+
+export type PublishIntegrationMappingRequest = {
+    expected_definition_digest: string
+    expected_updated_at: string
+}
+
+export type DryRunIntegrationMappingRequest = {
+    payload: unknown
+}
+
+export type IntegrationMappingDryRunResult = {
+    mapping_version_id: number
+    payload_digest: string
+    target_command: string
+    preview: unknown
+    warnings?: Array<string>
+}
+
+export type IntegrationMappingDryRunEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationMappingDryRunResult
+}
+
+export type ResolveIntegrationConflictRequest = {
+    resolution: IntegrationConflictResolution
+    expected_updated_at: string
+}
+
+export type ReplayIntegrationDeadLetterRequest = {
+    expected_updated_at: string
+}
+
+export type IntegrationReplayReceipt = {
+    id: IntegrationResourceID
+    status: IntegrationInboxReceiptStatus
+    resource_type: string
+    resource_id: string
+    resource_version: number
+    event_id: string
+    operation_id: string
+}
+
+export type IntegrationInboundReplayResult = {
+    message_id?: IntegrationResourceID
+    status?: IntegrationInboxMessageStatus
+    receipt?: IntegrationReplayReceipt
+    conflict?: IntegrationConflictSummary
+    dead_letter?: IntegrationDeadLetterSummary
+    replayed: boolean
+}
+
+export type IntegrationInboundReplayEnvelope = {
+    code: 0
+    msg: string
+    data: IntegrationInboundReplayResult
+}
+
 export type CreateHumanSessionOperationPathParameters = Record<string, never>
 export type CreateHumanSessionOperationQuery = Record<string, never>
 export type CreateHumanSessionOperationRequest = LoginRequest
@@ -1788,12 +3365,33 @@ export type UpdateHumanProfileOperationQuery = Record<string, never>
 export type UpdateHumanProfileOperationRequest = UpdateHumanProfileRequest
 export type UpdateHumanProfileOperationResponse = AuthMessageSuccessEnvelope
 
-export type ListAuthorizedHumanProjectsOperationPathParameters = Record<string, never>
-export type ListAuthorizedHumanProjectsOperationQuery = Record<string, never>
-export type ListAuthorizedHumanProjectsOperationRequest = never
-export type ListAuthorizedHumanProjectsOperationResponse = SuccessEnvelope & {
-    data?: Array<AuthorizedProjectAccess>
+export type ListTrustedDevicesOperationPathParameters = Record<string, never>
+export type ListTrustedDevicesOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at" | "updated_at" | "last_used_at" | "expires_at" | "revoked" | "device_name"
+    sort_order?: "asc" | "desc"
 }
+export type ListTrustedDevicesOperationRequest = never
+export type ListTrustedDevicesOperationResponse = TrustedDevicePageEnvelope
+
+export type RevokeTrustedDeviceOperationPathParameters = {
+    deviceID: number
+}
+export type RevokeTrustedDeviceOperationQuery = Record<string, never>
+export type RevokeTrustedDeviceOperationRequest = never
+export type RevokeTrustedDeviceOperationResponse = EmptySuccessEnvelope
+
+export type ListAuthorizedHumanProjectsOperationPathParameters = Record<string, never>
+export type ListAuthorizedHumanProjectsOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "name" | "key" | "created_at"
+    sort_order?: "asc" | "desc"
+    search?: string
+}
+export type ListAuthorizedHumanProjectsOperationRequest = never
+export type ListAuthorizedHumanProjectsOperationResponse = AuthorizedProjectPageEnvelope
 
 export type GetAuthorizedProjectContextOperationPathParameters = {
     projectKey: string
@@ -1804,14 +3402,29 @@ export type GetAuthorizedProjectContextOperationResponse = SuccessEnvelope & {
     data: AuthorizedProjectAccess
 }
 
+export type ListProjectQueuesOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectQueuesOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at" | "updated_at" | "name" | "key" | "is_default"
+    sort_order?: "asc" | "desc"
+}
+export type ListProjectQueuesOperationRequest = never
+export type ListProjectQueuesOperationResponse = ProjectQueuePageEnvelope
+
 export type ListProjectMembershipsOperationPathParameters = {
     projectKey: string
 }
-export type ListProjectMembershipsOperationQuery = Record<string, never>
-export type ListProjectMembershipsOperationRequest = never
-export type ListProjectMembershipsOperationResponse = SuccessEnvelope & {
-    data?: Array<ProjectMembership>
+export type ListProjectMembershipsOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at" | "updated_at" | "role" | "is_active" | "user_id"
+    sort_order?: "asc" | "desc"
 }
+export type ListProjectMembershipsOperationRequest = never
+export type ListProjectMembershipsOperationResponse = ProjectMembershipPageEnvelope
 
 export type UpsertProjectMembershipOperationPathParameters = {
     projectKey: string
@@ -1835,7 +3448,9 @@ export type DeactivateProjectMembershipOperationPathParameters = {
     projectKey: string
     userID: number
 }
-export type DeactivateProjectMembershipOperationQuery = Record<string, never>
+export type DeactivateProjectMembershipOperationQuery = {
+    expected_version: number
+}
 export type DeactivateProjectMembershipOperationRequest = never
 export type DeactivateProjectMembershipOperationResponse = ProjectMembershipEnvelope
 
@@ -1953,7 +3568,6 @@ export type ListPlatformAuditLogsOperationQuery = {
     time_preset?: "1h" | "24h" | "7d" | "30d"
     start_time?: string
     end_time?: string
-    page?: number
     limit?: number
     cursor?: string
 }
@@ -1966,6 +3580,48 @@ export type GetPlatformAuditLogDetailOperationPathParameters = {
 export type GetPlatformAuditLogDetailOperationQuery = Record<string, never>
 export type GetPlatformAuditLogDetailOperationRequest = never
 export type GetPlatformAuditLogDetailOperationResponse = AdminAuditLogDetailEnvelope
+
+export type CreatePlatformAuditExportOperationPathParameters = Record<string, never>
+export type CreatePlatformAuditExportOperationQuery = {
+    user_id?: number
+    actor?: string
+    platform_role?: PlatformRole
+    action?: string
+    method?: "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"
+    path?: string
+    path_prefix?: string
+    status?: number
+    keyword?: string
+    result?: "pending" | "success" | "error"
+    start_time: string
+    end_time: string
+}
+export type CreatePlatformAuditExportOperationRequest = never
+export type CreatePlatformAuditExportOperationResponse = AdminAuditExportEnvelope
+
+export type GetPlatformAuditExportOperationPathParameters = {
+    auditExportPublicID: string
+}
+export type GetPlatformAuditExportOperationQuery = Record<string, never>
+export type GetPlatformAuditExportOperationRequest = never
+export type GetPlatformAuditExportOperationResponse = AdminAuditExportEnvelope
+
+export type DownloadPlatformAuditExportOperationPathParameters = {
+    auditExportPublicID: string
+}
+export type DownloadPlatformAuditExportOperationQuery = Record<string, never>
+export type DownloadPlatformAuditExportOperationRequest = never
+export type DownloadPlatformAuditExportOperationResponse = string
+
+export type GetPlatformEmergencyControlsOperationPathParameters = Record<string, never>
+export type GetPlatformEmergencyControlsOperationQuery = Record<string, never>
+export type GetPlatformEmergencyControlsOperationRequest = never
+export type GetPlatformEmergencyControlsOperationResponse = EmergencyControlEnvelope
+
+export type UpdatePlatformEmergencyControlsOperationPathParameters = Record<string, never>
+export type UpdatePlatformEmergencyControlsOperationQuery = Record<string, never>
+export type UpdatePlatformEmergencyControlsOperationRequest = UpdateEmergencyControlsRequest
+export type UpdatePlatformEmergencyControlsOperationResponse = EmergencyControlEnvelope
 
 export type GetWorkbenchDashboardOperationPathParameters = Record<string, never>
 export type GetWorkbenchDashboardOperationQuery = {
@@ -1997,7 +3653,7 @@ export type ListProjectTicketsOperationQuery = {
     assigned_to?: number
     created_by?: number
     search?: string
-    sort_by?: string
+    sort_by?: "id" | "ticket_number" | "title" | "status" | "priority" | "due_date" | "created_at" | "updated_at"
     sort_order?: "asc" | "desc"
     sla_breached?: boolean
     is_overdue?: boolean
@@ -2224,12 +3880,13 @@ export type ListProjectAutomationRulesOperationPathParameters = {
     projectKey: string
 }
 export type ListProjectAutomationRulesOperationQuery = {
-    rule_type?: string
+    rule_type?: "assignment" | "classification" | "escalation" | "sla"
     trigger_event?: string
     is_active?: boolean
     search?: string
     page?: number
     page_size?: number
+    sort?: "[\"priority\",\"ASC\"]"
 }
 export type ListProjectAutomationRulesOperationRequest = never
 export type ListProjectAutomationRulesOperationResponse = AutomationRulePageEnvelope
@@ -2272,8 +3929,8 @@ export type ListProjectAutomationLogsOperationQuery = {
     rule_id?: number
     ticket_id?: number
     success?: boolean
-    page?: number
-    page_size?: number
+    cursor?: string
+    limit?: number
 }
 export type ListProjectAutomationLogsOperationRequest = never
 export type ListProjectAutomationLogsOperationResponse = AutomationLogPageEnvelope
@@ -2293,8 +3950,23 @@ export type TestPlatformEmailConfigOperationQuery = Record<string, never>
 export type TestPlatformEmailConfigOperationRequest = TestEmailRequest
 export type TestPlatformEmailConfigOperationResponse = EmptySuccessEnvelope
 
+export type ListPlatformCleanupLogsOperationPathParameters = Record<string, never>
+export type ListPlatformCleanupLogsOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at" | "start_time" | "end_time" | "status" | "task_type" | "records_deleted"
+    sort_order?: "asc" | "desc"
+    task_type?: string
+}
+export type ListPlatformCleanupLogsOperationRequest = never
+export type ListPlatformCleanupLogsOperationResponse = CleanupLogPageEnvelope
+
 export type ListPlatformConfigsOperationPathParameters = Record<string, never>
 export type ListPlatformConfigsOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at" | "updated_at" | "key" | "category" | "group"
+    sort_order?: "asc" | "desc"
     category?: string
 }
 export type ListPlatformConfigsOperationRequest = never
@@ -2363,30 +4035,13 @@ export type ListProjectWebhookLogsOperationPathParameters = {
     webhookID: number
 }
 export type ListProjectWebhookLogsOperationQuery = {
-    page?: number
-    page_size?: number
-    status?: string
+    cursor?: string
+    limit?: number
+    status?: "pending" | "success" | "failed"
+    event_type?: WebhookEventType
 }
 export type ListProjectWebhookLogsOperationRequest = never
-export type ListProjectWebhookLogsOperationResponse = {
-    code: 0
-    msg: string
-    data: {
-        items: Array<{
-            id: number
-            created_at: string
-            config_id: number
-            event_type: string
-            status: string
-            response_status?: number
-            response_time?: number
-            error_message?: string
-        }>
-        total: number
-        page: number
-        size: number
-    }
-}
+export type ListProjectWebhookLogsOperationResponse = WebhookLogPageEnvelope
 
 export type GetProjectWebhookStatsOperationPathParameters = {
     projectKey: string
@@ -2576,6 +4231,644 @@ export type ListAgentPolicyDecisionsOperationQuery = {
 export type ListAgentPolicyDecisionsOperationRequest = never
 export type ListAgentPolicyDecisionsOperationResponse = AdminPolicyDecisionCursorEnvelope
 
+export type ListLoginHistoryOperationPathParameters = Record<string, never>
+export type ListLoginHistoryOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "id" | "login_time" | "created_at" | "updated_at" | "ip_address" | "device_type" | "login_method" | "login_status" | "is_active"
+    sort_order?: "asc" | "desc"
+    status?: LoginStatus
+    start_date?: string
+    end_date?: string
+    ip_address?: string
+    device_type?: string
+    login_method?: LoginMethod
+    session_id?: string
+    is_active?: boolean
+}
+export type ListLoginHistoryOperationRequest = never
+export type ListLoginHistoryOperationResponse = LoginHistoryPageEnvelope
+
+export type DeleteLoginHistorySessionOperationPathParameters = {
+    loginHistoryID: number
+}
+export type DeleteLoginHistorySessionOperationQuery = Record<string, never>
+export type DeleteLoginHistorySessionOperationRequest = never
+export type DeleteLoginHistorySessionOperationResponse = EmptySuccessEnvelope
+
+export type ListProjectCategoriesOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectCategoriesOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "id" | "name" | "slug" | "sort_order" | "status" | "type"
+    sort_order?: "asc" | "desc"
+    filter?: string
+    search?: string
+    sort?: string
+    status?: CategoryStatus
+}
+export type ListProjectCategoriesOperationRequest = never
+export type ListProjectCategoriesOperationResponse = ProjectCategoryPageEnvelope
+
+export type GetProjectCategoryOperationPathParameters = {
+    projectKey: string
+    categoryID: number
+}
+export type GetProjectCategoryOperationQuery = Record<string, never>
+export type GetProjectCategoryOperationRequest = never
+export type GetProjectCategoryOperationResponse = ProjectCategoryEnvelope
+
+export type ListProjectAssigneesOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectAssigneesOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "id" | "username" | "first_name" | "last_name" | "display_name" | "role"
+    sort_order?: "asc" | "desc"
+    filter?: string
+    search?: string
+    sort?: string
+}
+export type ListProjectAssigneesOperationRequest = never
+export type ListProjectAssigneesOperationResponse = ProjectAssigneePageEnvelope
+
+export type GetProjectAssigneeOperationPathParameters = {
+    projectKey: string
+    assigneeID: number
+}
+export type GetProjectAssigneeOperationQuery = Record<string, never>
+export type GetProjectAssigneeOperationRequest = never
+export type GetProjectAssigneeOperationResponse = ProjectAssigneeEnvelope
+
+export type ListProjectTicketEntityLinksOperationPathParameters = {
+    projectKey: string
+    ticketID: number
+}
+export type ListProjectTicketEntityLinksOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at"
+    sort_order?: "asc" | "desc"
+}
+export type ListProjectTicketEntityLinksOperationRequest = never
+export type ListProjectTicketEntityLinksOperationResponse = TicketEntityLinkPageEnvelope
+
+export type CreateProjectTicketEntityLinkOperationPathParameters = {
+    projectKey: string
+    ticketID: number
+}
+export type CreateProjectTicketEntityLinkOperationQuery = Record<string, never>
+export type CreateProjectTicketEntityLinkOperationRequest = AddTicketEntityLinkRequest
+export type CreateProjectTicketEntityLinkOperationResponse = AddTicketEntityLinkEnvelope
+
+export type ListProjectTicketRelationsOperationPathParameters = {
+    projectKey: string
+    ticketID: number
+}
+export type ListProjectTicketRelationsOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at"
+    sort_order?: "asc" | "desc"
+}
+export type ListProjectTicketRelationsOperationRequest = never
+export type ListProjectTicketRelationsOperationResponse = TicketRelationPageEnvelope
+
+export type CreateProjectTicketRelationOperationPathParameters = {
+    projectKey: string
+    ticketID: number
+}
+export type CreateProjectTicketRelationOperationQuery = Record<string, never>
+export type CreateProjectTicketRelationOperationRequest = AddTicketRelationRequest
+export type CreateProjectTicketRelationOperationResponse = AddTicketRelationEnvelope
+
+export type ListProjectAgentRunsOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectAgentRunsOperationQuery = {
+    page?: number
+    page_size?: number
+}
+export type ListProjectAgentRunsOperationRequest = never
+export type ListProjectAgentRunsOperationResponse = AgentRunPageEnvelope
+
+export type GetProjectAgentRunOperationPathParameters = {
+    projectKey: string
+    runID: string
+}
+export type GetProjectAgentRunOperationQuery = Record<string, never>
+export type GetProjectAgentRunOperationRequest = never
+export type GetProjectAgentRunOperationResponse = AgentRunDetailEnvelope
+
+export type ListProjectActionProposalsOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectActionProposalsOperationQuery = {
+    page?: number
+    page_size?: number
+}
+export type ListProjectActionProposalsOperationRequest = never
+export type ListProjectActionProposalsOperationResponse = ActionProposalPageEnvelope
+
+export type GetProjectActionProposalOperationPathParameters = {
+    projectKey: string
+    proposalID: string
+}
+export type GetProjectActionProposalOperationQuery = Record<string, never>
+export type GetProjectActionProposalOperationRequest = never
+export type GetProjectActionProposalOperationResponse = ActionProposalDetailEnvelope
+
+export type ListProjectApprovalTasksOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectApprovalTasksOperationQuery = {
+    page?: number
+    page_size?: number
+}
+export type ListProjectApprovalTasksOperationRequest = never
+export type ListProjectApprovalTasksOperationResponse = ApprovalTaskPageEnvelope
+
+export type GetProjectApprovalTaskOperationPathParameters = {
+    projectKey: string
+    approvalID: string
+}
+export type GetProjectApprovalTaskOperationQuery = Record<string, never>
+export type GetProjectApprovalTaskOperationRequest = never
+export type GetProjectApprovalTaskOperationResponse = ApprovalTaskDetailEnvelope
+
+export type ListProjectHandoffsOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectHandoffsOperationQuery = {
+    page?: number
+    page_size?: number
+}
+export type ListProjectHandoffsOperationRequest = never
+export type ListProjectHandoffsOperationResponse = HandoffPageEnvelope
+
+export type GetProjectHandoffOperationPathParameters = {
+    projectKey: string
+    handoffID: string
+}
+export type GetProjectHandoffOperationQuery = Record<string, never>
+export type GetProjectHandoffOperationRequest = never
+export type GetProjectHandoffOperationResponse = HandoffDetailEnvelope
+
+export type DecideProjectAgentApprovalOperationPathParameters = {
+    projectKey: string
+    approvalID: string
+}
+export type DecideProjectAgentApprovalOperationQuery = Record<string, never>
+export type DecideProjectAgentApprovalOperationRequest = ApprovalDecisionRequest
+export type DecideProjectAgentApprovalOperationResponse = ApprovalTaskDetailEnvelope
+
+export type TakeOverProjectAgentRunOperationPathParameters = {
+    projectKey: string
+    runID: string
+}
+export type TakeOverProjectAgentRunOperationQuery = Record<string, never>
+export type TakeOverProjectAgentRunOperationRequest = AgentRunTakeoverRequest
+export type TakeOverProjectAgentRunOperationResponse = HandoffDetailEnvelope
+
+export type GetProjectIntakeConfigurationOperationPathParameters = {
+    projectKey: string
+}
+export type GetProjectIntakeConfigurationOperationQuery = Record<string, never>
+export type GetProjectIntakeConfigurationOperationRequest = never
+export type GetProjectIntakeConfigurationOperationResponse = ProjectIntakeConfigurationEnvelope
+
+export type ListProjectSLAConfigsOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectSLAConfigsOperationQuery = {
+    page?: number
+    page_size?: number
+    is_active?: boolean
+}
+export type ListProjectSLAConfigsOperationRequest = never
+export type ListProjectSLAConfigsOperationResponse = SLAConfigPageEnvelope
+
+export type CreateProjectSLAConfigOperationPathParameters = {
+    projectKey: string
+}
+export type CreateProjectSLAConfigOperationQuery = Record<string, never>
+export type CreateProjectSLAConfigOperationRequest = SLAConfigRequest
+export type CreateProjectSLAConfigOperationResponse = SLAConfigEnvelope
+
+export type ListProjectTicketTemplatesOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectTicketTemplatesOperationQuery = {
+    page?: number
+    page_size?: number
+    category?: string
+    is_active?: boolean
+}
+export type ListProjectTicketTemplatesOperationRequest = never
+export type ListProjectTicketTemplatesOperationResponse = TicketTemplatePageEnvelope
+
+export type CreateProjectTicketTemplateOperationPathParameters = {
+    projectKey: string
+}
+export type CreateProjectTicketTemplateOperationQuery = Record<string, never>
+export type CreateProjectTicketTemplateOperationRequest = TicketTemplateRequest
+export type CreateProjectTicketTemplateOperationResponse = TicketTemplateEnvelope
+
+export type GetProjectTicketTemplateOperationPathParameters = {
+    projectKey: string
+    automationConfigID: number
+}
+export type GetProjectTicketTemplateOperationQuery = Record<string, never>
+export type GetProjectTicketTemplateOperationRequest = never
+export type GetProjectTicketTemplateOperationResponse = TicketTemplateEnvelope
+
+export type ListProjectQuickRepliesOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectQuickRepliesOperationQuery = {
+    page?: number
+    page_size?: number
+    category?: string
+    keyword?: string
+    is_public?: boolean
+}
+export type ListProjectQuickRepliesOperationRequest = never
+export type ListProjectQuickRepliesOperationResponse = QuickReplyPageEnvelope
+
+export type CreateProjectQuickReplyOperationPathParameters = {
+    projectKey: string
+}
+export type CreateProjectQuickReplyOperationQuery = Record<string, never>
+export type CreateProjectQuickReplyOperationRequest = QuickReplyRequest
+export type CreateProjectQuickReplyOperationResponse = QuickReplyEnvelope
+
+export type UseProjectQuickReplyOperationPathParameters = {
+    projectKey: string
+    automationConfigID: number
+}
+export type UseProjectQuickReplyOperationQuery = Record<string, never>
+export type UseProjectQuickReplyOperationRequest = never
+export type UseProjectQuickReplyOperationResponse = LegacyMessageSuccessEnvelope
+
+export type ListProjectKnowledgeArticlesOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectKnowledgeArticlesOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at" | "updated_at" | "key" | "title" | "status"
+    sort_order?: "asc" | "desc"
+    status?: KnowledgeArticleStatus
+    q?: string
+    view?: "manage" | "mine"
+}
+export type ListProjectKnowledgeArticlesOperationRequest = never
+export type ListProjectKnowledgeArticlesOperationResponse = KnowledgeArticlePageEnvelope
+
+export type CreateProjectKnowledgeArticleOperationPathParameters = {
+    projectKey: string
+}
+export type CreateProjectKnowledgeArticleOperationQuery = Record<string, never>
+export type CreateProjectKnowledgeArticleOperationRequest = CreateKnowledgeArticleRequest
+export type CreateProjectKnowledgeArticleOperationResponse = KnowledgeAuthoredEnvelope
+
+export type CreateProjectKnowledgeArticleDraftOperationPathParameters = {
+    projectKey: string
+    articleID: string
+}
+export type CreateProjectKnowledgeArticleDraftOperationQuery = Record<string, never>
+export type CreateProjectKnowledgeArticleDraftOperationRequest = CreateKnowledgeDraftRequest
+export type CreateProjectKnowledgeArticleDraftOperationResponse = KnowledgeAuthoredEnvelope
+
+export type GetProjectKnowledgeArticleDocumentOperationPathParameters = {
+    projectKey: string
+    articleID: string
+}
+export type GetProjectKnowledgeArticleDocumentOperationQuery = {
+    version_id?: string
+    prefer_latest_draft?: boolean
+}
+export type GetProjectKnowledgeArticleDocumentOperationRequest = never
+export type GetProjectKnowledgeArticleDocumentOperationResponse = KnowledgeDocumentEnvelope
+
+export type ListProjectKnowledgeVersionsOperationPathParameters = {
+    projectKey: string
+    articleID: string
+}
+export type ListProjectKnowledgeVersionsOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at" | "updated_at" | "version" | "status"
+    sort_order?: "asc" | "desc"
+    status?: KnowledgeVersionStatus
+    virus_scan?: VirusScanStatus
+}
+export type ListProjectKnowledgeVersionsOperationRequest = never
+export type ListProjectKnowledgeVersionsOperationResponse = KnowledgeVersionPageEnvelope
+
+export type PublishProjectKnowledgeVersionOperationPathParameters = {
+    projectKey: string
+    versionID: string
+}
+export type PublishProjectKnowledgeVersionOperationQuery = Record<string, never>
+export type PublishProjectKnowledgeVersionOperationRequest = never
+export type PublishProjectKnowledgeVersionOperationResponse = KnowledgeVersionEnvelope
+
+export type SearchProjectKnowledgeOperationPathParameters = {
+    projectKey: string
+}
+export type SearchProjectKnowledgeOperationQuery = Record<string, never>
+export type SearchProjectKnowledgeOperationRequest = KnowledgeSearchRequest
+export type SearchProjectKnowledgeOperationResponse = KnowledgeSearchEnvelope
+
+export type ListProjectKnowledgeIngestionsOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectKnowledgeIngestionsOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at" | "updated_at" | "attempt" | "status"
+    sort_order?: "asc" | "desc"
+    status?: KnowledgeIngestionStatus
+    version_id?: string
+}
+export type ListProjectKnowledgeIngestionsOperationRequest = never
+export type ListProjectKnowledgeIngestionsOperationResponse = KnowledgeIngestionPageEnvelope
+
+export type GetProjectKnowledgeIndexStateOperationPathParameters = {
+    projectKey: string
+}
+export type GetProjectKnowledgeIndexStateOperationQuery = Record<string, never>
+export type GetProjectKnowledgeIndexStateOperationRequest = never
+export type GetProjectKnowledgeIndexStateOperationResponse = KnowledgeIndexStateEnvelope
+
+export type RebuildProjectKnowledgeIndexOperationPathParameters = {
+    projectKey: string
+}
+export type RebuildProjectKnowledgeIndexOperationQuery = Record<string, never>
+export type RebuildProjectKnowledgeIndexOperationRequest = never
+export type RebuildProjectKnowledgeIndexOperationResponse = KnowledgeIndexStateEnvelope
+
+export type ListMyProjectTicketsOperationPathParameters = {
+    projectKey: string
+}
+export type ListMyProjectTicketsOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at"
+    sort_order?: "asc" | "desc"
+    status?: TicketStatus
+    priority?: TicketPriority
+}
+export type ListMyProjectTicketsOperationRequest = never
+export type ListMyProjectTicketsOperationResponse = TicketListPageEnvelope
+
+export type ListUnassignedProjectTicketsOperationPathParameters = {
+    projectKey: string
+}
+export type ListUnassignedProjectTicketsOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at"
+    sort_order?: "asc" | "desc"
+    priority?: TicketPriority
+    category_id?: number
+}
+export type ListUnassignedProjectTicketsOperationRequest = never
+export type ListUnassignedProjectTicketsOperationResponse = TicketListPageEnvelope
+
+export type ListProjectIntegrationConnectorDefinitionsOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectIntegrationConnectorDefinitionsOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at" | "updated_at" | "name" | "status" | "id"
+    sort_order?: "asc" | "desc"
+    search?: string
+    status?: IntegrationConnectorDefinitionStatus
+}
+export type ListProjectIntegrationConnectorDefinitionsOperationRequest = never
+export type ListProjectIntegrationConnectorDefinitionsOperationResponse = IntegrationConnectorDefinitionPageEnvelope
+
+export type CreateProjectIntegrationConnectorDefinitionOperationPathParameters = {
+    projectKey: string
+}
+export type CreateProjectIntegrationConnectorDefinitionOperationQuery = Record<string, never>
+export type CreateProjectIntegrationConnectorDefinitionOperationRequest = CreateIntegrationConnectorDefinitionRequest
+export type CreateProjectIntegrationConnectorDefinitionOperationResponse = IntegrationConnectorDefinitionEnvelope
+
+export type UpdateProjectIntegrationConnectorDefinitionOperationPathParameters = {
+    projectKey: string
+    definitionID: IntegrationResourceID
+}
+export type UpdateProjectIntegrationConnectorDefinitionOperationQuery = Record<string, never>
+export type UpdateProjectIntegrationConnectorDefinitionOperationRequest = UpdateIntegrationConnectorDefinitionRequest
+export type UpdateProjectIntegrationConnectorDefinitionOperationResponse = IntegrationConnectorDefinitionEnvelope
+
+export type ListProjectIntegrationConnectionsOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectIntegrationConnectionsOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at" | "updated_at" | "name" | "status" | "id"
+    sort_order?: "asc" | "desc"
+    search?: string
+    status?: IntegrationConnectionStatus
+}
+export type ListProjectIntegrationConnectionsOperationRequest = never
+export type ListProjectIntegrationConnectionsOperationResponse = IntegrationConnectionPageEnvelope
+
+export type CreateProjectIntegrationConnectionOperationPathParameters = {
+    projectKey: string
+}
+export type CreateProjectIntegrationConnectionOperationQuery = Record<string, never>
+export type CreateProjectIntegrationConnectionOperationRequest = CreateIntegrationConnectionRequest
+export type CreateProjectIntegrationConnectionOperationResponse = IntegrationConnectionEnvelope
+
+export type UpdateProjectIntegrationConnectionOperationPathParameters = {
+    projectKey: string
+    connectionID: IntegrationResourceID
+}
+export type UpdateProjectIntegrationConnectionOperationQuery = Record<string, never>
+export type UpdateProjectIntegrationConnectionOperationRequest = UpdateIntegrationConnectionRequest
+export type UpdateProjectIntegrationConnectionOperationResponse = IntegrationConnectionEnvelope
+
+export type ListProjectIntegrationMappingsOperationPathParameters = {
+    projectKey: string
+    connectionID: IntegrationResourceID
+}
+export type ListProjectIntegrationMappingsOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at" | "updated_at" | "key" | "version" | "status" | "id"
+    sort_order?: "asc" | "desc"
+    search?: string
+    status?: IntegrationMappingVersionStatus
+}
+export type ListProjectIntegrationMappingsOperationRequest = never
+export type ListProjectIntegrationMappingsOperationResponse = IntegrationMappingPageEnvelope
+
+export type CreateProjectIntegrationMappingOperationPathParameters = {
+    projectKey: string
+    connectionID: IntegrationResourceID
+}
+export type CreateProjectIntegrationMappingOperationQuery = Record<string, never>
+export type CreateProjectIntegrationMappingOperationRequest = CreateIntegrationMappingRequest
+export type CreateProjectIntegrationMappingOperationResponse = IntegrationMappingEnvelope
+
+export type UpdateProjectIntegrationMappingOperationPathParameters = {
+    projectKey: string
+    mappingID: IntegrationResourceID
+}
+export type UpdateProjectIntegrationMappingOperationQuery = Record<string, never>
+export type UpdateProjectIntegrationMappingOperationRequest = UpdateIntegrationMappingRequest
+export type UpdateProjectIntegrationMappingOperationResponse = IntegrationMappingEnvelope
+
+export type DryRunProjectIntegrationMappingOperationPathParameters = {
+    projectKey: string
+    mappingID: IntegrationResourceID
+}
+export type DryRunProjectIntegrationMappingOperationQuery = Record<string, never>
+export type DryRunProjectIntegrationMappingOperationRequest = DryRunIntegrationMappingRequest
+export type DryRunProjectIntegrationMappingOperationResponse = IntegrationMappingDryRunEnvelope
+
+export type PublishProjectIntegrationMappingOperationPathParameters = {
+    projectKey: string
+    mappingID: IntegrationResourceID
+}
+export type PublishProjectIntegrationMappingOperationQuery = Record<string, never>
+export type PublishProjectIntegrationMappingOperationRequest = PublishIntegrationMappingRequest
+export type PublishProjectIntegrationMappingOperationResponse = IntegrationMappingEnvelope
+
+export type GetProjectIntegrationOverviewOperationPathParameters = {
+    projectKey: string
+}
+export type GetProjectIntegrationOverviewOperationQuery = Record<string, never>
+export type GetProjectIntegrationOverviewOperationRequest = never
+export type GetProjectIntegrationOverviewOperationResponse = IntegrationOverviewEnvelope
+
+export type ListProjectIntegrationInboxMessagesOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectIntegrationInboxMessagesOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "received_at" | "processed_at" | "status" | "created_at" | "id"
+    sort_order?: "asc" | "desc"
+    search?: string
+    status?: IntegrationInboxMessageStatus
+    connection_id?: IntegrationResourceID
+}
+export type ListProjectIntegrationInboxMessagesOperationRequest = never
+export type ListProjectIntegrationInboxMessagesOperationResponse = IntegrationInboxMessagePageEnvelope
+
+export type ListProjectIntegrationInboxReceiptsOperationPathParameters = {
+    projectKey: string
+    messageID: IntegrationResourceID
+}
+export type ListProjectIntegrationInboxReceiptsOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at" | "processed_at" | "status" | "id"
+    sort_order?: "asc" | "desc"
+    status?: IntegrationInboxReceiptStatus
+}
+export type ListProjectIntegrationInboxReceiptsOperationRequest = never
+export type ListProjectIntegrationInboxReceiptsOperationResponse = IntegrationInboxReceiptPageEnvelope
+
+export type ListProjectIntegrationSyncRunsOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectIntegrationSyncRunsOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at" | "updated_at" | "started_at" | "finished_at" | "status" | "id"
+    sort_order?: "asc" | "desc"
+    search?: string
+    status?: IntegrationSyncRunStatus
+    direction?: IntegrationSyncDirection
+    connection_id?: IntegrationResourceID
+}
+export type ListProjectIntegrationSyncRunsOperationRequest = never
+export type ListProjectIntegrationSyncRunsOperationResponse = IntegrationSyncRunPageEnvelope
+
+export type ListProjectIntegrationConflictsOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectIntegrationConflictsOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at" | "updated_at" | "status" | "type" | "id"
+    sort_order?: "asc" | "desc"
+    search?: string
+    status?: IntegrationConflictStatus
+    type?: IntegrationConflictType
+}
+export type ListProjectIntegrationConflictsOperationRequest = never
+export type ListProjectIntegrationConflictsOperationResponse = IntegrationConflictPageEnvelope
+
+export type ResolveProjectIntegrationConflictOperationPathParameters = {
+    projectKey: string
+    conflictID: IntegrationResourceID
+}
+export type ResolveProjectIntegrationConflictOperationQuery = Record<string, never>
+export type ResolveProjectIntegrationConflictOperationRequest = ResolveIntegrationConflictRequest
+export type ResolveProjectIntegrationConflictOperationResponse = IntegrationConflictEnvelope
+
+export type ListProjectIntegrationDeadLettersOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectIntegrationDeadLettersOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at" | "updated_at" | "status" | "attempt_count" | "id"
+    sort_order?: "asc" | "desc"
+    search?: string
+    status?: IntegrationDeadLetterStatus
+}
+export type ListProjectIntegrationDeadLettersOperationRequest = never
+export type ListProjectIntegrationDeadLettersOperationResponse = IntegrationDeadLetterPageEnvelope
+
+export type ReplayProjectIntegrationDeadLetterOperationPathParameters = {
+    projectKey: string
+    deadLetterID: IntegrationResourceID
+}
+export type ReplayProjectIntegrationDeadLetterOperationQuery = Record<string, never>
+export type ReplayProjectIntegrationDeadLetterOperationRequest = ReplayIntegrationDeadLetterRequest
+export type ReplayProjectIntegrationDeadLetterOperationResponse = IntegrationInboundReplayEnvelope
+
+export type ListProjectIntegrationDomainEventsOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectIntegrationDomainEventsOperationQuery = {
+    cursor?: string
+    limit?: number
+    event_type?: string
+    search?: string
+}
+export type ListProjectIntegrationDomainEventsOperationRequest = never
+export type ListProjectIntegrationDomainEventsOperationResponse = IntegrationDomainEventCursorEnvelope
+
+export type ListProjectIntegrationOutboxDeliveriesOperationPathParameters = {
+    projectKey: string
+}
+export type ListProjectIntegrationOutboxDeliveriesOperationQuery = {
+    page?: number
+    page_size?: number
+    sort_by?: "created_at" | "updated_at" | "status" | "next_attempt_at" | "id"
+    sort_order?: "asc" | "desc"
+    search?: string
+    status?: IntegrationOutboxDeliveryStatus
+    destination_type?: string
+}
+export type ListProjectIntegrationOutboxDeliveriesOperationRequest = never
+export type ListProjectIntegrationOutboxDeliveriesOperationResponse = IntegrationOutboxPageEnvelope
+
 export const humanApiOperations = {
     createHumanSession: {
         method: "POST",
@@ -2633,26 +4926,47 @@ export const humanApiOperations = {
         requestBody: "required",
         listStrategy: null,
     },
+    listTrustedDevices: {
+        method: "GET",
+        path: "/user/trusted-devices",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    revokeTrustedDevice: {
+        method: "DELETE",
+        path: "/user/trusted-devices/{deviceID}",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: null,
+    },
     listAuthorizedHumanProjects: {
         method: "GET",
         path: "/projects",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     getAuthorizedProjectContext: {
         method: "GET",
         path: "/projects/{projectKey}/context",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "bounded",
+    },
+    listProjectQueues: {
+        method: "GET",
+        path: "/projects/{projectKey}/queues",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
     },
     listProjectMemberships: {
         method: "GET",
         path: "/projects/{projectKey}/memberships",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     upsertProjectMembership: {
         method: "POST",
@@ -2666,7 +4980,7 @@ export const humanApiOperations = {
         path: "/projects/{projectKey}/membership-candidates",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     deactivateProjectMembership: {
         method: "DELETE",
@@ -2680,7 +4994,7 @@ export const humanApiOperations = {
         path: "/platform/projects",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     createPlatformProject: {
         method: "POST",
@@ -2694,14 +5008,14 @@ export const humanApiOperations = {
         path: "/platform/project-creation-context",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     listPlatformProjectBusinessUnits: {
         method: "GET",
         path: "/platform/project-business-units",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     archivePlatformProject: {
         method: "POST",
@@ -2715,7 +5029,7 @@ export const humanApiOperations = {
         path: "/platform/users",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     createPlatformUser: {
         method: "POST",
@@ -2764,7 +5078,7 @@ export const humanApiOperations = {
         path: "/platform/audit-logs",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "cursor",
     },
     getPlatformAuditLogDetail: {
         method: "GET",
@@ -2773,61 +5087,96 @@ export const humanApiOperations = {
         requestBody: "none",
         listStrategy: null,
     },
+    createPlatformAuditExport: {
+        method: "POST",
+        path: "/platform/audit-exports",
+        successStatus: 202,
+        requestBody: "none",
+        listStrategy: null,
+    },
+    getPlatformAuditExport: {
+        method: "GET",
+        path: "/platform/audit-exports/{auditExportPublicID}",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: null,
+    },
+    downloadPlatformAuditExport: {
+        method: "GET",
+        path: "/platform/audit-exports/{auditExportPublicID}/download",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: null,
+    },
+    getPlatformEmergencyControls: {
+        method: "GET",
+        path: "/platform/emergency-controls",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: null,
+    },
+    updatePlatformEmergencyControls: {
+        method: "PUT",
+        path: "/platform/emergency-controls",
+        successStatus: 200,
+        requestBody: "required",
+        listStrategy: null,
+    },
     getWorkbenchDashboard: {
         method: "GET",
         path: "/workbench/dashboard",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     listCrossProjectWorkbenchTickets: {
         method: "GET",
         path: "/workbench/tickets",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     listProjectTickets: {
         method: "GET",
         path: "/projects/{projectKey}/tickets",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     createProjectTicket: {
         method: "POST",
         path: "/projects/{projectKey}/tickets",
         successStatus: 201,
         requestBody: "required",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     listProjectOverdueTickets: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/overdue",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     listProjectSLABreachedTickets: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/sla-breach",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     getProjectTicket: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/{ticketID}",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     updateProjectTicket: {
         method: "PUT",
         path: "/projects/{projectKey}/tickets/{ticketID}",
         successStatus: 200,
         requestBody: "required",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     deleteProjectTicket: {
         method: "DELETE",
@@ -2841,70 +5190,70 @@ export const humanApiOperations = {
         path: "/projects/{projectKey}/tickets/{ticketID}/assign",
         successStatus: 200,
         requestBody: "required",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     transferProjectTicket: {
         method: "POST",
         path: "/projects/{projectKey}/tickets/{ticketID}/transfer",
         successStatus: 200,
         requestBody: "required",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     escalateProjectTicket: {
         method: "POST",
         path: "/projects/{projectKey}/tickets/{ticketID}/escalate",
         successStatus: 200,
         requestBody: "required",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     updateProjectTicketStatus: {
         method: "POST",
         path: "/projects/{projectKey}/tickets/{ticketID}/status",
         successStatus: 200,
         requestBody: "required",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     listProjectTicketHistory: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/{ticketID}/history",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     listProjectTicketComments: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/{ticketID}/comments",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     createProjectTicketComment: {
         method: "POST",
         path: "/projects/{projectKey}/tickets/{ticketID}/comments",
         successStatus: 201,
         requestBody: "required",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     listProjectTicketCommentReplies: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/{ticketID}/comments/{commentID}/replies",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     listProjectTicketAttachments: {
         method: "GET",
         path: "/projects/{projectKey}/tickets/{ticketID}/attachments",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     uploadProjectTicketAttachment: {
         method: "POST",
         path: "/projects/{projectKey}/tickets/{ticketID}/attachments",
         successStatus: 202,
         requestBody: "required",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     downloadProjectTicketAttachment: {
         method: "GET",
@@ -2918,14 +5267,14 @@ export const humanApiOperations = {
         path: "/projects/{projectKey}/notifications",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     createProjectNotification: {
         method: "POST",
         path: "/projects/{projectKey}/notifications",
         successStatus: 201,
         requestBody: "required",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     deleteProjectNotification: {
         method: "DELETE",
@@ -2960,7 +5309,7 @@ export const humanApiOperations = {
         path: "/notification-preferences",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     updateHumanNotificationPreferences: {
         method: "PUT",
@@ -2974,7 +5323,7 @@ export const humanApiOperations = {
         path: "/projects/{projectKey}/admin/automation/rules",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     createProjectAutomationRule: {
         method: "POST",
@@ -3009,7 +5358,7 @@ export const humanApiOperations = {
         path: "/projects/{projectKey}/admin/automation/logs",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "cursor",
     },
     getPlatformEmailConfig: {
         method: "GET",
@@ -3032,12 +5381,19 @@ export const humanApiOperations = {
         requestBody: "required",
         listStrategy: null,
     },
+    listPlatformCleanupLogs: {
+        method: "GET",
+        path: "/platform/system/cleanup/logs",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
     listPlatformConfigs: {
         method: "GET",
         path: "/platform/configs",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     updatePlatformConfig: {
         method: "PUT",
@@ -3051,28 +5407,28 @@ export const humanApiOperations = {
         path: "/projects/{projectKey}/webhooks",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "page",
     },
     createProjectWebhook: {
         method: "POST",
         path: "/projects/{projectKey}/webhooks",
         successStatus: 200,
         requestBody: "required",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     getProjectWebhook: {
         method: "GET",
         path: "/projects/{projectKey}/webhooks/{webhookID}",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     updateProjectWebhook: {
         method: "PUT",
         path: "/projects/{projectKey}/webhooks/{webhookID}",
         successStatus: 200,
         requestBody: "required",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     deleteProjectWebhook: {
         method: "DELETE",
@@ -3093,21 +5449,21 @@ export const humanApiOperations = {
         path: "/projects/{projectKey}/webhooks/{webhookID}/logs",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "cursor",
     },
     getProjectWebhookStats: {
         method: "GET",
         path: "/projects/{projectKey}/webhooks/{webhookID}/stats",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     getAgentControlOverviewV2: {
         method: "GET",
         path: "/projects/{projectKey}/admin/agents/agent-control/overview",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     listAgentServicePrincipals: {
         method: "GET",
@@ -3121,28 +5477,28 @@ export const humanApiOperations = {
         path: "/projects/{projectKey}/admin/agents/service-principals",
         successStatus: 201,
         requestBody: "required",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     setServicePrincipalStatusV2: {
         method: "PUT",
         path: "/projects/{projectKey}/admin/agents/service-principals/{principalId}/status",
         successStatus: 200,
         requestBody: "required",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     rotateServicePrincipalCredentialV2: {
         method: "POST",
         path: "/projects/{projectKey}/admin/agents/service-principals/{principalId}/credentials/rotate",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     revokeServicePrincipalCredentialV2: {
         method: "DELETE",
         path: "/projects/{projectKey}/admin/agents/service-principals/{principalId}/credentials/{credentialId}",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     listServicePrincipalPoliciesV2: {
         method: "GET",
@@ -3156,14 +5512,14 @@ export const humanApiOperations = {
         path: "/projects/{projectKey}/admin/agents/service-principals/{principalId}/policies",
         successStatus: 201,
         requestBody: "required",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     disableServicePrincipalPolicyV2: {
         method: "DELETE",
         path: "/projects/{projectKey}/admin/agents/service-principals/{principalId}/policies/{policyId}",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     listAgentTicketLeases: {
         method: "GET",
@@ -3177,7 +5533,7 @@ export const humanApiOperations = {
         path: "/projects/{projectKey}/admin/agents/leases/{leaseId}/force-release",
         successStatus: 200,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     listAgentAttachmentScans: {
         method: "GET",
@@ -3191,7 +5547,7 @@ export const humanApiOperations = {
         path: "/projects/{projectKey}/admin/agents/attachments/{attachmentId}/scan",
         successStatus: 200,
         requestBody: "required",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     listAgentOutboxDeliveries: {
         method: "GET",
@@ -3205,7 +5561,7 @@ export const humanApiOperations = {
         path: "/projects/{projectKey}/admin/agents/outbox/{deliveryId}/replay",
         successStatus: 202,
         requestBody: "none",
-        listStrategy: null,
+        listStrategy: "bounded",
     },
     listAgentDomainEvents: {
         method: "GET",
@@ -3220,6 +5576,440 @@ export const humanApiOperations = {
         successStatus: 200,
         requestBody: "none",
         listStrategy: "cursor",
+    },
+    listLoginHistory: {
+        method: "GET",
+        path: "/user/login-history",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    deleteLoginHistorySession: {
+        method: "DELETE",
+        path: "/user/login-history/{loginHistoryID}",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: null,
+    },
+    listProjectCategories: {
+        method: "GET",
+        path: "/projects/{projectKey}/categories",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    getProjectCategory: {
+        method: "GET",
+        path: "/projects/{projectKey}/categories/{categoryID}",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: null,
+    },
+    listProjectAssignees: {
+        method: "GET",
+        path: "/projects/{projectKey}/assignees",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    getProjectAssignee: {
+        method: "GET",
+        path: "/projects/{projectKey}/assignees/{assigneeID}",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: null,
+    },
+    listProjectTicketEntityLinks: {
+        method: "GET",
+        path: "/projects/{projectKey}/tickets/{ticketID}/entity-links",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    createProjectTicketEntityLink: {
+        method: "POST",
+        path: "/projects/{projectKey}/tickets/{ticketID}/entity-links",
+        successStatus: 201,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    listProjectTicketRelations: {
+        method: "GET",
+        path: "/projects/{projectKey}/tickets/{ticketID}/relations",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    createProjectTicketRelation: {
+        method: "POST",
+        path: "/projects/{projectKey}/tickets/{ticketID}/relations",
+        successStatus: 201,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    listProjectAgentRuns: {
+        method: "GET",
+        path: "/projects/{projectKey}/agent-collaboration/runs",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    getProjectAgentRun: {
+        method: "GET",
+        path: "/projects/{projectKey}/agent-collaboration/runs/{runID}",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: null,
+    },
+    listProjectActionProposals: {
+        method: "GET",
+        path: "/projects/{projectKey}/agent-collaboration/proposals",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    getProjectActionProposal: {
+        method: "GET",
+        path: "/projects/{projectKey}/agent-collaboration/proposals/{proposalID}",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: null,
+    },
+    listProjectApprovalTasks: {
+        method: "GET",
+        path: "/projects/{projectKey}/agent-collaboration/approvals",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    getProjectApprovalTask: {
+        method: "GET",
+        path: "/projects/{projectKey}/agent-collaboration/approvals/{approvalID}",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: null,
+    },
+    listProjectHandoffs: {
+        method: "GET",
+        path: "/projects/{projectKey}/agent-collaboration/handoffs",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    getProjectHandoff: {
+        method: "GET",
+        path: "/projects/{projectKey}/agent-collaboration/handoffs/{handoffID}",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "bounded",
+    },
+    decideProjectAgentApproval: {
+        method: "POST",
+        path: "/projects/{projectKey}/agent-collaboration/approvals/{approvalID}/decisions",
+        successStatus: 200,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    takeOverProjectAgentRun: {
+        method: "POST",
+        path: "/projects/{projectKey}/agent-collaboration/runs/{runID}/takeover",
+        successStatus: 200,
+        requestBody: "required",
+        listStrategy: "bounded",
+    },
+    getProjectIntakeConfiguration: {
+        method: "GET",
+        path: "/projects/{projectKey}/configuration/intake",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "bounded",
+    },
+    listProjectSLAConfigs: {
+        method: "GET",
+        path: "/projects/{projectKey}/admin/automation/sla",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    createProjectSLAConfig: {
+        method: "POST",
+        path: "/projects/{projectKey}/admin/automation/sla",
+        successStatus: 201,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    listProjectTicketTemplates: {
+        method: "GET",
+        path: "/projects/{projectKey}/admin/automation/templates",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    createProjectTicketTemplate: {
+        method: "POST",
+        path: "/projects/{projectKey}/admin/automation/templates",
+        successStatus: 201,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    getProjectTicketTemplate: {
+        method: "GET",
+        path: "/projects/{projectKey}/admin/automation/templates/{automationConfigID}",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: null,
+    },
+    listProjectQuickReplies: {
+        method: "GET",
+        path: "/projects/{projectKey}/admin/automation/quick-replies",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    createProjectQuickReply: {
+        method: "POST",
+        path: "/projects/{projectKey}/admin/automation/quick-replies",
+        successStatus: 201,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    useProjectQuickReply: {
+        method: "POST",
+        path: "/projects/{projectKey}/admin/automation/quick-replies/{automationConfigID}/use",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: null,
+    },
+    listProjectKnowledgeArticles: {
+        method: "GET",
+        path: "/projects/{projectKey}/knowledge/articles",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    createProjectKnowledgeArticle: {
+        method: "POST",
+        path: "/projects/{projectKey}/knowledge/articles",
+        successStatus: 201,
+        requestBody: "required",
+        listStrategy: "bounded",
+    },
+    createProjectKnowledgeArticleDraft: {
+        method: "POST",
+        path: "/projects/{projectKey}/knowledge/articles/{articleID}/drafts",
+        successStatus: 201,
+        requestBody: "required",
+        listStrategy: "bounded",
+    },
+    getProjectKnowledgeArticleDocument: {
+        method: "GET",
+        path: "/projects/{projectKey}/knowledge/articles/{articleID}/document",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "bounded",
+    },
+    listProjectKnowledgeVersions: {
+        method: "GET",
+        path: "/projects/{projectKey}/knowledge/articles/{articleID}/versions",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    publishProjectKnowledgeVersion: {
+        method: "POST",
+        path: "/projects/{projectKey}/knowledge/versions/{versionID}/publication",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: null,
+    },
+    searchProjectKnowledge: {
+        method: "POST",
+        path: "/projects/{projectKey}/knowledge/searches",
+        successStatus: 200,
+        requestBody: "required",
+        listStrategy: "bounded",
+    },
+    listProjectKnowledgeIngestions: {
+        method: "GET",
+        path: "/projects/{projectKey}/knowledge/ingestions",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    getProjectKnowledgeIndexState: {
+        method: "GET",
+        path: "/projects/{projectKey}/knowledge/index-rebuilds/current",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: null,
+    },
+    rebuildProjectKnowledgeIndex: {
+        method: "POST",
+        path: "/projects/{projectKey}/knowledge/index-rebuilds",
+        successStatus: 202,
+        requestBody: "none",
+        listStrategy: null,
+    },
+    listMyProjectTickets: {
+        method: "GET",
+        path: "/projects/{projectKey}/tickets/my-tickets",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    listUnassignedProjectTickets: {
+        method: "GET",
+        path: "/projects/{projectKey}/tickets/unassigned",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    listProjectIntegrationConnectorDefinitions: {
+        method: "GET",
+        path: "/projects/{projectKey}/integrations/connector-definitions",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    createProjectIntegrationConnectorDefinition: {
+        method: "POST",
+        path: "/projects/{projectKey}/integrations/connector-definitions",
+        successStatus: 201,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    updateProjectIntegrationConnectorDefinition: {
+        method: "PUT",
+        path: "/projects/{projectKey}/integrations/connector-definitions/{definitionID}",
+        successStatus: 200,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    listProjectIntegrationConnections: {
+        method: "GET",
+        path: "/projects/{projectKey}/integrations/connections",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    createProjectIntegrationConnection: {
+        method: "POST",
+        path: "/projects/{projectKey}/integrations/connections",
+        successStatus: 201,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    updateProjectIntegrationConnection: {
+        method: "PUT",
+        path: "/projects/{projectKey}/integrations/connections/{connectionID}",
+        successStatus: 200,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    listProjectIntegrationMappings: {
+        method: "GET",
+        path: "/projects/{projectKey}/integrations/connections/{connectionID}/mappings",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    createProjectIntegrationMapping: {
+        method: "POST",
+        path: "/projects/{projectKey}/integrations/connections/{connectionID}/mappings",
+        successStatus: 201,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    updateProjectIntegrationMapping: {
+        method: "PUT",
+        path: "/projects/{projectKey}/integrations/mappings/{mappingID}",
+        successStatus: 200,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    dryRunProjectIntegrationMapping: {
+        method: "POST",
+        path: "/projects/{projectKey}/integrations/mappings/{mappingID}/dry-runs",
+        successStatus: 200,
+        requestBody: "required",
+        listStrategy: "bounded",
+    },
+    publishProjectIntegrationMapping: {
+        method: "POST",
+        path: "/projects/{projectKey}/integrations/mappings/{mappingID}/publication",
+        successStatus: 200,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    getProjectIntegrationOverview: {
+        method: "GET",
+        path: "/projects/{projectKey}/integrations/overview",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "bounded",
+    },
+    listProjectIntegrationInboxMessages: {
+        method: "GET",
+        path: "/projects/{projectKey}/integrations/inbox",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    listProjectIntegrationInboxReceipts: {
+        method: "GET",
+        path: "/projects/{projectKey}/integrations/inbox/{messageID}/receipts",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    listProjectIntegrationSyncRuns: {
+        method: "GET",
+        path: "/projects/{projectKey}/integrations/sync-runs",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    listProjectIntegrationConflicts: {
+        method: "GET",
+        path: "/projects/{projectKey}/integrations/conflicts",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    resolveProjectIntegrationConflict: {
+        method: "POST",
+        path: "/projects/{projectKey}/integrations/conflicts/{conflictID}/resolution",
+        successStatus: 200,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    listProjectIntegrationDeadLetters: {
+        method: "GET",
+        path: "/projects/{projectKey}/integrations/dead-letters",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
+    },
+    replayProjectIntegrationDeadLetter: {
+        method: "POST",
+        path: "/projects/{projectKey}/integrations/dead-letters/{deadLetterID}/replays",
+        successStatus: 200,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    listProjectIntegrationDomainEvents: {
+        method: "GET",
+        path: "/projects/{projectKey}/integrations/domain-events",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "cursor",
+    },
+    listProjectIntegrationOutboxDeliveries: {
+        method: "GET",
+        path: "/projects/{projectKey}/integrations/outbox",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "page",
     },
 } as const
 
@@ -3272,6 +6062,18 @@ export interface HumanApiOperationTypes {
         request: UpdateHumanProfileOperationRequest
         response: UpdateHumanProfileOperationResponse
     }
+    listTrustedDevices: {
+        pathParameters: ListTrustedDevicesOperationPathParameters
+        query: ListTrustedDevicesOperationQuery
+        request: ListTrustedDevicesOperationRequest
+        response: ListTrustedDevicesOperationResponse
+    }
+    revokeTrustedDevice: {
+        pathParameters: RevokeTrustedDeviceOperationPathParameters
+        query: RevokeTrustedDeviceOperationQuery
+        request: RevokeTrustedDeviceOperationRequest
+        response: RevokeTrustedDeviceOperationResponse
+    }
     listAuthorizedHumanProjects: {
         pathParameters: ListAuthorizedHumanProjectsOperationPathParameters
         query: ListAuthorizedHumanProjectsOperationQuery
@@ -3283,6 +6085,12 @@ export interface HumanApiOperationTypes {
         query: GetAuthorizedProjectContextOperationQuery
         request: GetAuthorizedProjectContextOperationRequest
         response: GetAuthorizedProjectContextOperationResponse
+    }
+    listProjectQueues: {
+        pathParameters: ListProjectQueuesOperationPathParameters
+        query: ListProjectQueuesOperationQuery
+        request: ListProjectQueuesOperationRequest
+        response: ListProjectQueuesOperationResponse
     }
     listProjectMemberships: {
         pathParameters: ListProjectMembershipsOperationPathParameters
@@ -3391,6 +6199,36 @@ export interface HumanApiOperationTypes {
         query: GetPlatformAuditLogDetailOperationQuery
         request: GetPlatformAuditLogDetailOperationRequest
         response: GetPlatformAuditLogDetailOperationResponse
+    }
+    createPlatformAuditExport: {
+        pathParameters: CreatePlatformAuditExportOperationPathParameters
+        query: CreatePlatformAuditExportOperationQuery
+        request: CreatePlatformAuditExportOperationRequest
+        response: CreatePlatformAuditExportOperationResponse
+    }
+    getPlatformAuditExport: {
+        pathParameters: GetPlatformAuditExportOperationPathParameters
+        query: GetPlatformAuditExportOperationQuery
+        request: GetPlatformAuditExportOperationRequest
+        response: GetPlatformAuditExportOperationResponse
+    }
+    downloadPlatformAuditExport: {
+        pathParameters: DownloadPlatformAuditExportOperationPathParameters
+        query: DownloadPlatformAuditExportOperationQuery
+        request: DownloadPlatformAuditExportOperationRequest
+        response: DownloadPlatformAuditExportOperationResponse
+    }
+    getPlatformEmergencyControls: {
+        pathParameters: GetPlatformEmergencyControlsOperationPathParameters
+        query: GetPlatformEmergencyControlsOperationQuery
+        request: GetPlatformEmergencyControlsOperationRequest
+        response: GetPlatformEmergencyControlsOperationResponse
+    }
+    updatePlatformEmergencyControls: {
+        pathParameters: UpdatePlatformEmergencyControlsOperationPathParameters
+        query: UpdatePlatformEmergencyControlsOperationQuery
+        request: UpdatePlatformEmergencyControlsOperationRequest
+        response: UpdatePlatformEmergencyControlsOperationResponse
     }
     getWorkbenchDashboard: {
         pathParameters: GetWorkbenchDashboardOperationPathParameters
@@ -3614,6 +6452,12 @@ export interface HumanApiOperationTypes {
         request: TestPlatformEmailConfigOperationRequest
         response: TestPlatformEmailConfigOperationResponse
     }
+    listPlatformCleanupLogs: {
+        pathParameters: ListPlatformCleanupLogsOperationPathParameters
+        query: ListPlatformCleanupLogsOperationQuery
+        request: ListPlatformCleanupLogsOperationRequest
+        response: ListPlatformCleanupLogsOperationResponse
+    }
     listPlatformConfigs: {
         pathParameters: ListPlatformConfigsOperationPathParameters
         query: ListPlatformConfigsOperationQuery
@@ -3776,6 +6620,378 @@ export interface HumanApiOperationTypes {
         request: ListAgentPolicyDecisionsOperationRequest
         response: ListAgentPolicyDecisionsOperationResponse
     }
+    listLoginHistory: {
+        pathParameters: ListLoginHistoryOperationPathParameters
+        query: ListLoginHistoryOperationQuery
+        request: ListLoginHistoryOperationRequest
+        response: ListLoginHistoryOperationResponse
+    }
+    deleteLoginHistorySession: {
+        pathParameters: DeleteLoginHistorySessionOperationPathParameters
+        query: DeleteLoginHistorySessionOperationQuery
+        request: DeleteLoginHistorySessionOperationRequest
+        response: DeleteLoginHistorySessionOperationResponse
+    }
+    listProjectCategories: {
+        pathParameters: ListProjectCategoriesOperationPathParameters
+        query: ListProjectCategoriesOperationQuery
+        request: ListProjectCategoriesOperationRequest
+        response: ListProjectCategoriesOperationResponse
+    }
+    getProjectCategory: {
+        pathParameters: GetProjectCategoryOperationPathParameters
+        query: GetProjectCategoryOperationQuery
+        request: GetProjectCategoryOperationRequest
+        response: GetProjectCategoryOperationResponse
+    }
+    listProjectAssignees: {
+        pathParameters: ListProjectAssigneesOperationPathParameters
+        query: ListProjectAssigneesOperationQuery
+        request: ListProjectAssigneesOperationRequest
+        response: ListProjectAssigneesOperationResponse
+    }
+    getProjectAssignee: {
+        pathParameters: GetProjectAssigneeOperationPathParameters
+        query: GetProjectAssigneeOperationQuery
+        request: GetProjectAssigneeOperationRequest
+        response: GetProjectAssigneeOperationResponse
+    }
+    listProjectTicketEntityLinks: {
+        pathParameters: ListProjectTicketEntityLinksOperationPathParameters
+        query: ListProjectTicketEntityLinksOperationQuery
+        request: ListProjectTicketEntityLinksOperationRequest
+        response: ListProjectTicketEntityLinksOperationResponse
+    }
+    createProjectTicketEntityLink: {
+        pathParameters: CreateProjectTicketEntityLinkOperationPathParameters
+        query: CreateProjectTicketEntityLinkOperationQuery
+        request: CreateProjectTicketEntityLinkOperationRequest
+        response: CreateProjectTicketEntityLinkOperationResponse
+    }
+    listProjectTicketRelations: {
+        pathParameters: ListProjectTicketRelationsOperationPathParameters
+        query: ListProjectTicketRelationsOperationQuery
+        request: ListProjectTicketRelationsOperationRequest
+        response: ListProjectTicketRelationsOperationResponse
+    }
+    createProjectTicketRelation: {
+        pathParameters: CreateProjectTicketRelationOperationPathParameters
+        query: CreateProjectTicketRelationOperationQuery
+        request: CreateProjectTicketRelationOperationRequest
+        response: CreateProjectTicketRelationOperationResponse
+    }
+    listProjectAgentRuns: {
+        pathParameters: ListProjectAgentRunsOperationPathParameters
+        query: ListProjectAgentRunsOperationQuery
+        request: ListProjectAgentRunsOperationRequest
+        response: ListProjectAgentRunsOperationResponse
+    }
+    getProjectAgentRun: {
+        pathParameters: GetProjectAgentRunOperationPathParameters
+        query: GetProjectAgentRunOperationQuery
+        request: GetProjectAgentRunOperationRequest
+        response: GetProjectAgentRunOperationResponse
+    }
+    listProjectActionProposals: {
+        pathParameters: ListProjectActionProposalsOperationPathParameters
+        query: ListProjectActionProposalsOperationQuery
+        request: ListProjectActionProposalsOperationRequest
+        response: ListProjectActionProposalsOperationResponse
+    }
+    getProjectActionProposal: {
+        pathParameters: GetProjectActionProposalOperationPathParameters
+        query: GetProjectActionProposalOperationQuery
+        request: GetProjectActionProposalOperationRequest
+        response: GetProjectActionProposalOperationResponse
+    }
+    listProjectApprovalTasks: {
+        pathParameters: ListProjectApprovalTasksOperationPathParameters
+        query: ListProjectApprovalTasksOperationQuery
+        request: ListProjectApprovalTasksOperationRequest
+        response: ListProjectApprovalTasksOperationResponse
+    }
+    getProjectApprovalTask: {
+        pathParameters: GetProjectApprovalTaskOperationPathParameters
+        query: GetProjectApprovalTaskOperationQuery
+        request: GetProjectApprovalTaskOperationRequest
+        response: GetProjectApprovalTaskOperationResponse
+    }
+    listProjectHandoffs: {
+        pathParameters: ListProjectHandoffsOperationPathParameters
+        query: ListProjectHandoffsOperationQuery
+        request: ListProjectHandoffsOperationRequest
+        response: ListProjectHandoffsOperationResponse
+    }
+    getProjectHandoff: {
+        pathParameters: GetProjectHandoffOperationPathParameters
+        query: GetProjectHandoffOperationQuery
+        request: GetProjectHandoffOperationRequest
+        response: GetProjectHandoffOperationResponse
+    }
+    decideProjectAgentApproval: {
+        pathParameters: DecideProjectAgentApprovalOperationPathParameters
+        query: DecideProjectAgentApprovalOperationQuery
+        request: DecideProjectAgentApprovalOperationRequest
+        response: DecideProjectAgentApprovalOperationResponse
+    }
+    takeOverProjectAgentRun: {
+        pathParameters: TakeOverProjectAgentRunOperationPathParameters
+        query: TakeOverProjectAgentRunOperationQuery
+        request: TakeOverProjectAgentRunOperationRequest
+        response: TakeOverProjectAgentRunOperationResponse
+    }
+    getProjectIntakeConfiguration: {
+        pathParameters: GetProjectIntakeConfigurationOperationPathParameters
+        query: GetProjectIntakeConfigurationOperationQuery
+        request: GetProjectIntakeConfigurationOperationRequest
+        response: GetProjectIntakeConfigurationOperationResponse
+    }
+    listProjectSLAConfigs: {
+        pathParameters: ListProjectSLAConfigsOperationPathParameters
+        query: ListProjectSLAConfigsOperationQuery
+        request: ListProjectSLAConfigsOperationRequest
+        response: ListProjectSLAConfigsOperationResponse
+    }
+    createProjectSLAConfig: {
+        pathParameters: CreateProjectSLAConfigOperationPathParameters
+        query: CreateProjectSLAConfigOperationQuery
+        request: CreateProjectSLAConfigOperationRequest
+        response: CreateProjectSLAConfigOperationResponse
+    }
+    listProjectTicketTemplates: {
+        pathParameters: ListProjectTicketTemplatesOperationPathParameters
+        query: ListProjectTicketTemplatesOperationQuery
+        request: ListProjectTicketTemplatesOperationRequest
+        response: ListProjectTicketTemplatesOperationResponse
+    }
+    createProjectTicketTemplate: {
+        pathParameters: CreateProjectTicketTemplateOperationPathParameters
+        query: CreateProjectTicketTemplateOperationQuery
+        request: CreateProjectTicketTemplateOperationRequest
+        response: CreateProjectTicketTemplateOperationResponse
+    }
+    getProjectTicketTemplate: {
+        pathParameters: GetProjectTicketTemplateOperationPathParameters
+        query: GetProjectTicketTemplateOperationQuery
+        request: GetProjectTicketTemplateOperationRequest
+        response: GetProjectTicketTemplateOperationResponse
+    }
+    listProjectQuickReplies: {
+        pathParameters: ListProjectQuickRepliesOperationPathParameters
+        query: ListProjectQuickRepliesOperationQuery
+        request: ListProjectQuickRepliesOperationRequest
+        response: ListProjectQuickRepliesOperationResponse
+    }
+    createProjectQuickReply: {
+        pathParameters: CreateProjectQuickReplyOperationPathParameters
+        query: CreateProjectQuickReplyOperationQuery
+        request: CreateProjectQuickReplyOperationRequest
+        response: CreateProjectQuickReplyOperationResponse
+    }
+    useProjectQuickReply: {
+        pathParameters: UseProjectQuickReplyOperationPathParameters
+        query: UseProjectQuickReplyOperationQuery
+        request: UseProjectQuickReplyOperationRequest
+        response: UseProjectQuickReplyOperationResponse
+    }
+    listProjectKnowledgeArticles: {
+        pathParameters: ListProjectKnowledgeArticlesOperationPathParameters
+        query: ListProjectKnowledgeArticlesOperationQuery
+        request: ListProjectKnowledgeArticlesOperationRequest
+        response: ListProjectKnowledgeArticlesOperationResponse
+    }
+    createProjectKnowledgeArticle: {
+        pathParameters: CreateProjectKnowledgeArticleOperationPathParameters
+        query: CreateProjectKnowledgeArticleOperationQuery
+        request: CreateProjectKnowledgeArticleOperationRequest
+        response: CreateProjectKnowledgeArticleOperationResponse
+    }
+    createProjectKnowledgeArticleDraft: {
+        pathParameters: CreateProjectKnowledgeArticleDraftOperationPathParameters
+        query: CreateProjectKnowledgeArticleDraftOperationQuery
+        request: CreateProjectKnowledgeArticleDraftOperationRequest
+        response: CreateProjectKnowledgeArticleDraftOperationResponse
+    }
+    getProjectKnowledgeArticleDocument: {
+        pathParameters: GetProjectKnowledgeArticleDocumentOperationPathParameters
+        query: GetProjectKnowledgeArticleDocumentOperationQuery
+        request: GetProjectKnowledgeArticleDocumentOperationRequest
+        response: GetProjectKnowledgeArticleDocumentOperationResponse
+    }
+    listProjectKnowledgeVersions: {
+        pathParameters: ListProjectKnowledgeVersionsOperationPathParameters
+        query: ListProjectKnowledgeVersionsOperationQuery
+        request: ListProjectKnowledgeVersionsOperationRequest
+        response: ListProjectKnowledgeVersionsOperationResponse
+    }
+    publishProjectKnowledgeVersion: {
+        pathParameters: PublishProjectKnowledgeVersionOperationPathParameters
+        query: PublishProjectKnowledgeVersionOperationQuery
+        request: PublishProjectKnowledgeVersionOperationRequest
+        response: PublishProjectKnowledgeVersionOperationResponse
+    }
+    searchProjectKnowledge: {
+        pathParameters: SearchProjectKnowledgeOperationPathParameters
+        query: SearchProjectKnowledgeOperationQuery
+        request: SearchProjectKnowledgeOperationRequest
+        response: SearchProjectKnowledgeOperationResponse
+    }
+    listProjectKnowledgeIngestions: {
+        pathParameters: ListProjectKnowledgeIngestionsOperationPathParameters
+        query: ListProjectKnowledgeIngestionsOperationQuery
+        request: ListProjectKnowledgeIngestionsOperationRequest
+        response: ListProjectKnowledgeIngestionsOperationResponse
+    }
+    getProjectKnowledgeIndexState: {
+        pathParameters: GetProjectKnowledgeIndexStateOperationPathParameters
+        query: GetProjectKnowledgeIndexStateOperationQuery
+        request: GetProjectKnowledgeIndexStateOperationRequest
+        response: GetProjectKnowledgeIndexStateOperationResponse
+    }
+    rebuildProjectKnowledgeIndex: {
+        pathParameters: RebuildProjectKnowledgeIndexOperationPathParameters
+        query: RebuildProjectKnowledgeIndexOperationQuery
+        request: RebuildProjectKnowledgeIndexOperationRequest
+        response: RebuildProjectKnowledgeIndexOperationResponse
+    }
+    listMyProjectTickets: {
+        pathParameters: ListMyProjectTicketsOperationPathParameters
+        query: ListMyProjectTicketsOperationQuery
+        request: ListMyProjectTicketsOperationRequest
+        response: ListMyProjectTicketsOperationResponse
+    }
+    listUnassignedProjectTickets: {
+        pathParameters: ListUnassignedProjectTicketsOperationPathParameters
+        query: ListUnassignedProjectTicketsOperationQuery
+        request: ListUnassignedProjectTicketsOperationRequest
+        response: ListUnassignedProjectTicketsOperationResponse
+    }
+    listProjectIntegrationConnectorDefinitions: {
+        pathParameters: ListProjectIntegrationConnectorDefinitionsOperationPathParameters
+        query: ListProjectIntegrationConnectorDefinitionsOperationQuery
+        request: ListProjectIntegrationConnectorDefinitionsOperationRequest
+        response: ListProjectIntegrationConnectorDefinitionsOperationResponse
+    }
+    createProjectIntegrationConnectorDefinition: {
+        pathParameters: CreateProjectIntegrationConnectorDefinitionOperationPathParameters
+        query: CreateProjectIntegrationConnectorDefinitionOperationQuery
+        request: CreateProjectIntegrationConnectorDefinitionOperationRequest
+        response: CreateProjectIntegrationConnectorDefinitionOperationResponse
+    }
+    updateProjectIntegrationConnectorDefinition: {
+        pathParameters: UpdateProjectIntegrationConnectorDefinitionOperationPathParameters
+        query: UpdateProjectIntegrationConnectorDefinitionOperationQuery
+        request: UpdateProjectIntegrationConnectorDefinitionOperationRequest
+        response: UpdateProjectIntegrationConnectorDefinitionOperationResponse
+    }
+    listProjectIntegrationConnections: {
+        pathParameters: ListProjectIntegrationConnectionsOperationPathParameters
+        query: ListProjectIntegrationConnectionsOperationQuery
+        request: ListProjectIntegrationConnectionsOperationRequest
+        response: ListProjectIntegrationConnectionsOperationResponse
+    }
+    createProjectIntegrationConnection: {
+        pathParameters: CreateProjectIntegrationConnectionOperationPathParameters
+        query: CreateProjectIntegrationConnectionOperationQuery
+        request: CreateProjectIntegrationConnectionOperationRequest
+        response: CreateProjectIntegrationConnectionOperationResponse
+    }
+    updateProjectIntegrationConnection: {
+        pathParameters: UpdateProjectIntegrationConnectionOperationPathParameters
+        query: UpdateProjectIntegrationConnectionOperationQuery
+        request: UpdateProjectIntegrationConnectionOperationRequest
+        response: UpdateProjectIntegrationConnectionOperationResponse
+    }
+    listProjectIntegrationMappings: {
+        pathParameters: ListProjectIntegrationMappingsOperationPathParameters
+        query: ListProjectIntegrationMappingsOperationQuery
+        request: ListProjectIntegrationMappingsOperationRequest
+        response: ListProjectIntegrationMappingsOperationResponse
+    }
+    createProjectIntegrationMapping: {
+        pathParameters: CreateProjectIntegrationMappingOperationPathParameters
+        query: CreateProjectIntegrationMappingOperationQuery
+        request: CreateProjectIntegrationMappingOperationRequest
+        response: CreateProjectIntegrationMappingOperationResponse
+    }
+    updateProjectIntegrationMapping: {
+        pathParameters: UpdateProjectIntegrationMappingOperationPathParameters
+        query: UpdateProjectIntegrationMappingOperationQuery
+        request: UpdateProjectIntegrationMappingOperationRequest
+        response: UpdateProjectIntegrationMappingOperationResponse
+    }
+    dryRunProjectIntegrationMapping: {
+        pathParameters: DryRunProjectIntegrationMappingOperationPathParameters
+        query: DryRunProjectIntegrationMappingOperationQuery
+        request: DryRunProjectIntegrationMappingOperationRequest
+        response: DryRunProjectIntegrationMappingOperationResponse
+    }
+    publishProjectIntegrationMapping: {
+        pathParameters: PublishProjectIntegrationMappingOperationPathParameters
+        query: PublishProjectIntegrationMappingOperationQuery
+        request: PublishProjectIntegrationMappingOperationRequest
+        response: PublishProjectIntegrationMappingOperationResponse
+    }
+    getProjectIntegrationOverview: {
+        pathParameters: GetProjectIntegrationOverviewOperationPathParameters
+        query: GetProjectIntegrationOverviewOperationQuery
+        request: GetProjectIntegrationOverviewOperationRequest
+        response: GetProjectIntegrationOverviewOperationResponse
+    }
+    listProjectIntegrationInboxMessages: {
+        pathParameters: ListProjectIntegrationInboxMessagesOperationPathParameters
+        query: ListProjectIntegrationInboxMessagesOperationQuery
+        request: ListProjectIntegrationInboxMessagesOperationRequest
+        response: ListProjectIntegrationInboxMessagesOperationResponse
+    }
+    listProjectIntegrationInboxReceipts: {
+        pathParameters: ListProjectIntegrationInboxReceiptsOperationPathParameters
+        query: ListProjectIntegrationInboxReceiptsOperationQuery
+        request: ListProjectIntegrationInboxReceiptsOperationRequest
+        response: ListProjectIntegrationInboxReceiptsOperationResponse
+    }
+    listProjectIntegrationSyncRuns: {
+        pathParameters: ListProjectIntegrationSyncRunsOperationPathParameters
+        query: ListProjectIntegrationSyncRunsOperationQuery
+        request: ListProjectIntegrationSyncRunsOperationRequest
+        response: ListProjectIntegrationSyncRunsOperationResponse
+    }
+    listProjectIntegrationConflicts: {
+        pathParameters: ListProjectIntegrationConflictsOperationPathParameters
+        query: ListProjectIntegrationConflictsOperationQuery
+        request: ListProjectIntegrationConflictsOperationRequest
+        response: ListProjectIntegrationConflictsOperationResponse
+    }
+    resolveProjectIntegrationConflict: {
+        pathParameters: ResolveProjectIntegrationConflictOperationPathParameters
+        query: ResolveProjectIntegrationConflictOperationQuery
+        request: ResolveProjectIntegrationConflictOperationRequest
+        response: ResolveProjectIntegrationConflictOperationResponse
+    }
+    listProjectIntegrationDeadLetters: {
+        pathParameters: ListProjectIntegrationDeadLettersOperationPathParameters
+        query: ListProjectIntegrationDeadLettersOperationQuery
+        request: ListProjectIntegrationDeadLettersOperationRequest
+        response: ListProjectIntegrationDeadLettersOperationResponse
+    }
+    replayProjectIntegrationDeadLetter: {
+        pathParameters: ReplayProjectIntegrationDeadLetterOperationPathParameters
+        query: ReplayProjectIntegrationDeadLetterOperationQuery
+        request: ReplayProjectIntegrationDeadLetterOperationRequest
+        response: ReplayProjectIntegrationDeadLetterOperationResponse
+    }
+    listProjectIntegrationDomainEvents: {
+        pathParameters: ListProjectIntegrationDomainEventsOperationPathParameters
+        query: ListProjectIntegrationDomainEventsOperationQuery
+        request: ListProjectIntegrationDomainEventsOperationRequest
+        response: ListProjectIntegrationDomainEventsOperationResponse
+    }
+    listProjectIntegrationOutboxDeliveries: {
+        pathParameters: ListProjectIntegrationOutboxDeliveriesOperationPathParameters
+        query: ListProjectIntegrationOutboxDeliveriesOperationQuery
+        request: ListProjectIntegrationOutboxDeliveriesOperationRequest
+        response: ListProjectIntegrationOutboxDeliveriesOperationResponse
+    }
 }
 
 export type HumanApiOperationId = keyof HumanApiOperationTypes
@@ -3869,17 +7085,23 @@ export const humanApiRoutes = {
         humanApiRoute("getHumanSessionUser", {}, query),
     updateHumanProfile: (query: UpdateHumanProfileOperationQuery = {}) =>
         humanApiRoute("updateHumanProfile", {}, query),
+    listTrustedDevices: (query: ListTrustedDevicesOperationQuery = {}) =>
+        humanApiRoute("listTrustedDevices", {}, query),
+    revokeTrustedDevice: (pathParameters: RevokeTrustedDeviceOperationPathParameters, query: RevokeTrustedDeviceOperationQuery = {}) =>
+        humanApiRoute("revokeTrustedDevice", pathParameters, query),
     listAuthorizedHumanProjects: (query: ListAuthorizedHumanProjectsOperationQuery = {}) =>
         humanApiRoute("listAuthorizedHumanProjects", {}, query),
     getAuthorizedProjectContext: (pathParameters: GetAuthorizedProjectContextOperationPathParameters, query: GetAuthorizedProjectContextOperationQuery = {}) =>
         humanApiRoute("getAuthorizedProjectContext", pathParameters, query),
+    listProjectQueues: (pathParameters: ListProjectQueuesOperationPathParameters, query: ListProjectQueuesOperationQuery = {}) =>
+        humanApiRoute("listProjectQueues", pathParameters, query),
     listProjectMemberships: (pathParameters: ListProjectMembershipsOperationPathParameters, query: ListProjectMembershipsOperationQuery = {}) =>
         humanApiRoute("listProjectMemberships", pathParameters, query),
     upsertProjectMembership: (pathParameters: UpsertProjectMembershipOperationPathParameters, query: UpsertProjectMembershipOperationQuery = {}) =>
         humanApiRoute("upsertProjectMembership", pathParameters, query),
     searchProjectMembershipCandidates: (pathParameters: SearchProjectMembershipCandidatesOperationPathParameters, query: SearchProjectMembershipCandidatesOperationQuery = {}) =>
         humanApiRoute("searchProjectMembershipCandidates", pathParameters, query),
-    deactivateProjectMembership: (pathParameters: DeactivateProjectMembershipOperationPathParameters, query: DeactivateProjectMembershipOperationQuery = {}) =>
+    deactivateProjectMembership: (pathParameters: DeactivateProjectMembershipOperationPathParameters, query: DeactivateProjectMembershipOperationQuery) =>
         humanApiRoute("deactivateProjectMembership", pathParameters, query),
     listPlatformProjects: (query: ListPlatformProjectsOperationQuery = {}) =>
         humanApiRoute("listPlatformProjects", {}, query),
@@ -3909,6 +7131,16 @@ export const humanApiRoutes = {
         humanApiRoute("listPlatformAuditLogs", {}, query),
     getPlatformAuditLogDetail: (pathParameters: GetPlatformAuditLogDetailOperationPathParameters, query: GetPlatformAuditLogDetailOperationQuery = {}) =>
         humanApiRoute("getPlatformAuditLogDetail", pathParameters, query),
+    createPlatformAuditExport: (query: CreatePlatformAuditExportOperationQuery) =>
+        humanApiRoute("createPlatformAuditExport", {}, query),
+    getPlatformAuditExport: (pathParameters: GetPlatformAuditExportOperationPathParameters, query: GetPlatformAuditExportOperationQuery = {}) =>
+        humanApiRoute("getPlatformAuditExport", pathParameters, query),
+    downloadPlatformAuditExport: (pathParameters: DownloadPlatformAuditExportOperationPathParameters, query: DownloadPlatformAuditExportOperationQuery = {}) =>
+        humanApiRoute("downloadPlatformAuditExport", pathParameters, query),
+    getPlatformEmergencyControls: (query: GetPlatformEmergencyControlsOperationQuery = {}) =>
+        humanApiRoute("getPlatformEmergencyControls", {}, query),
+    updatePlatformEmergencyControls: (query: UpdatePlatformEmergencyControlsOperationQuery = {}) =>
+        humanApiRoute("updatePlatformEmergencyControls", {}, query),
     getWorkbenchDashboard: (query: GetWorkbenchDashboardOperationQuery = {}) =>
         humanApiRoute("getWorkbenchDashboard", {}, query),
     listCrossProjectWorkbenchTickets: (query: ListCrossProjectWorkbenchTicketsOperationQuery = {}) =>
@@ -3983,6 +7215,8 @@ export const humanApiRoutes = {
         humanApiRoute("updatePlatformEmailConfig", {}, query),
     testPlatformEmailConfig: (query: TestPlatformEmailConfigOperationQuery = {}) =>
         humanApiRoute("testPlatformEmailConfig", {}, query),
+    listPlatformCleanupLogs: (query: ListPlatformCleanupLogsOperationQuery = {}) =>
+        humanApiRoute("listPlatformCleanupLogs", {}, query),
     listPlatformConfigs: (query: ListPlatformConfigsOperationQuery = {}) =>
         humanApiRoute("listPlatformConfigs", {}, query),
     updatePlatformConfig: (pathParameters: UpdatePlatformConfigOperationPathParameters, query: UpdatePlatformConfigOperationQuery = {}) =>
@@ -4037,4 +7271,128 @@ export const humanApiRoutes = {
         humanApiRoute("listAgentDomainEvents", pathParameters, query),
     listAgentPolicyDecisions: (pathParameters: ListAgentPolicyDecisionsOperationPathParameters, query: ListAgentPolicyDecisionsOperationQuery = {}) =>
         humanApiRoute("listAgentPolicyDecisions", pathParameters, query),
+    listLoginHistory: (query: ListLoginHistoryOperationQuery = {}) =>
+        humanApiRoute("listLoginHistory", {}, query),
+    deleteLoginHistorySession: (pathParameters: DeleteLoginHistorySessionOperationPathParameters, query: DeleteLoginHistorySessionOperationQuery = {}) =>
+        humanApiRoute("deleteLoginHistorySession", pathParameters, query),
+    listProjectCategories: (pathParameters: ListProjectCategoriesOperationPathParameters, query: ListProjectCategoriesOperationQuery = {}) =>
+        humanApiRoute("listProjectCategories", pathParameters, query),
+    getProjectCategory: (pathParameters: GetProjectCategoryOperationPathParameters, query: GetProjectCategoryOperationQuery = {}) =>
+        humanApiRoute("getProjectCategory", pathParameters, query),
+    listProjectAssignees: (pathParameters: ListProjectAssigneesOperationPathParameters, query: ListProjectAssigneesOperationQuery = {}) =>
+        humanApiRoute("listProjectAssignees", pathParameters, query),
+    getProjectAssignee: (pathParameters: GetProjectAssigneeOperationPathParameters, query: GetProjectAssigneeOperationQuery = {}) =>
+        humanApiRoute("getProjectAssignee", pathParameters, query),
+    listProjectTicketEntityLinks: (pathParameters: ListProjectTicketEntityLinksOperationPathParameters, query: ListProjectTicketEntityLinksOperationQuery = {}) =>
+        humanApiRoute("listProjectTicketEntityLinks", pathParameters, query),
+    createProjectTicketEntityLink: (pathParameters: CreateProjectTicketEntityLinkOperationPathParameters, query: CreateProjectTicketEntityLinkOperationQuery = {}) =>
+        humanApiRoute("createProjectTicketEntityLink", pathParameters, query),
+    listProjectTicketRelations: (pathParameters: ListProjectTicketRelationsOperationPathParameters, query: ListProjectTicketRelationsOperationQuery = {}) =>
+        humanApiRoute("listProjectTicketRelations", pathParameters, query),
+    createProjectTicketRelation: (pathParameters: CreateProjectTicketRelationOperationPathParameters, query: CreateProjectTicketRelationOperationQuery = {}) =>
+        humanApiRoute("createProjectTicketRelation", pathParameters, query),
+    listProjectAgentRuns: (pathParameters: ListProjectAgentRunsOperationPathParameters, query: ListProjectAgentRunsOperationQuery = {}) =>
+        humanApiRoute("listProjectAgentRuns", pathParameters, query),
+    getProjectAgentRun: (pathParameters: GetProjectAgentRunOperationPathParameters, query: GetProjectAgentRunOperationQuery = {}) =>
+        humanApiRoute("getProjectAgentRun", pathParameters, query),
+    listProjectActionProposals: (pathParameters: ListProjectActionProposalsOperationPathParameters, query: ListProjectActionProposalsOperationQuery = {}) =>
+        humanApiRoute("listProjectActionProposals", pathParameters, query),
+    getProjectActionProposal: (pathParameters: GetProjectActionProposalOperationPathParameters, query: GetProjectActionProposalOperationQuery = {}) =>
+        humanApiRoute("getProjectActionProposal", pathParameters, query),
+    listProjectApprovalTasks: (pathParameters: ListProjectApprovalTasksOperationPathParameters, query: ListProjectApprovalTasksOperationQuery = {}) =>
+        humanApiRoute("listProjectApprovalTasks", pathParameters, query),
+    getProjectApprovalTask: (pathParameters: GetProjectApprovalTaskOperationPathParameters, query: GetProjectApprovalTaskOperationQuery = {}) =>
+        humanApiRoute("getProjectApprovalTask", pathParameters, query),
+    listProjectHandoffs: (pathParameters: ListProjectHandoffsOperationPathParameters, query: ListProjectHandoffsOperationQuery = {}) =>
+        humanApiRoute("listProjectHandoffs", pathParameters, query),
+    getProjectHandoff: (pathParameters: GetProjectHandoffOperationPathParameters, query: GetProjectHandoffOperationQuery = {}) =>
+        humanApiRoute("getProjectHandoff", pathParameters, query),
+    decideProjectAgentApproval: (pathParameters: DecideProjectAgentApprovalOperationPathParameters, query: DecideProjectAgentApprovalOperationQuery = {}) =>
+        humanApiRoute("decideProjectAgentApproval", pathParameters, query),
+    takeOverProjectAgentRun: (pathParameters: TakeOverProjectAgentRunOperationPathParameters, query: TakeOverProjectAgentRunOperationQuery = {}) =>
+        humanApiRoute("takeOverProjectAgentRun", pathParameters, query),
+    getProjectIntakeConfiguration: (pathParameters: GetProjectIntakeConfigurationOperationPathParameters, query: GetProjectIntakeConfigurationOperationQuery = {}) =>
+        humanApiRoute("getProjectIntakeConfiguration", pathParameters, query),
+    listProjectSLAConfigs: (pathParameters: ListProjectSLAConfigsOperationPathParameters, query: ListProjectSLAConfigsOperationQuery = {}) =>
+        humanApiRoute("listProjectSLAConfigs", pathParameters, query),
+    createProjectSLAConfig: (pathParameters: CreateProjectSLAConfigOperationPathParameters, query: CreateProjectSLAConfigOperationQuery = {}) =>
+        humanApiRoute("createProjectSLAConfig", pathParameters, query),
+    listProjectTicketTemplates: (pathParameters: ListProjectTicketTemplatesOperationPathParameters, query: ListProjectTicketTemplatesOperationQuery = {}) =>
+        humanApiRoute("listProjectTicketTemplates", pathParameters, query),
+    createProjectTicketTemplate: (pathParameters: CreateProjectTicketTemplateOperationPathParameters, query: CreateProjectTicketTemplateOperationQuery = {}) =>
+        humanApiRoute("createProjectTicketTemplate", pathParameters, query),
+    getProjectTicketTemplate: (pathParameters: GetProjectTicketTemplateOperationPathParameters, query: GetProjectTicketTemplateOperationQuery = {}) =>
+        humanApiRoute("getProjectTicketTemplate", pathParameters, query),
+    listProjectQuickReplies: (pathParameters: ListProjectQuickRepliesOperationPathParameters, query: ListProjectQuickRepliesOperationQuery = {}) =>
+        humanApiRoute("listProjectQuickReplies", pathParameters, query),
+    createProjectQuickReply: (pathParameters: CreateProjectQuickReplyOperationPathParameters, query: CreateProjectQuickReplyOperationQuery = {}) =>
+        humanApiRoute("createProjectQuickReply", pathParameters, query),
+    useProjectQuickReply: (pathParameters: UseProjectQuickReplyOperationPathParameters, query: UseProjectQuickReplyOperationQuery = {}) =>
+        humanApiRoute("useProjectQuickReply", pathParameters, query),
+    listProjectKnowledgeArticles: (pathParameters: ListProjectKnowledgeArticlesOperationPathParameters, query: ListProjectKnowledgeArticlesOperationQuery = {}) =>
+        humanApiRoute("listProjectKnowledgeArticles", pathParameters, query),
+    createProjectKnowledgeArticle: (pathParameters: CreateProjectKnowledgeArticleOperationPathParameters, query: CreateProjectKnowledgeArticleOperationQuery = {}) =>
+        humanApiRoute("createProjectKnowledgeArticle", pathParameters, query),
+    createProjectKnowledgeArticleDraft: (pathParameters: CreateProjectKnowledgeArticleDraftOperationPathParameters, query: CreateProjectKnowledgeArticleDraftOperationQuery = {}) =>
+        humanApiRoute("createProjectKnowledgeArticleDraft", pathParameters, query),
+    getProjectKnowledgeArticleDocument: (pathParameters: GetProjectKnowledgeArticleDocumentOperationPathParameters, query: GetProjectKnowledgeArticleDocumentOperationQuery = {}) =>
+        humanApiRoute("getProjectKnowledgeArticleDocument", pathParameters, query),
+    listProjectKnowledgeVersions: (pathParameters: ListProjectKnowledgeVersionsOperationPathParameters, query: ListProjectKnowledgeVersionsOperationQuery = {}) =>
+        humanApiRoute("listProjectKnowledgeVersions", pathParameters, query),
+    publishProjectKnowledgeVersion: (pathParameters: PublishProjectKnowledgeVersionOperationPathParameters, query: PublishProjectKnowledgeVersionOperationQuery = {}) =>
+        humanApiRoute("publishProjectKnowledgeVersion", pathParameters, query),
+    searchProjectKnowledge: (pathParameters: SearchProjectKnowledgeOperationPathParameters, query: SearchProjectKnowledgeOperationQuery = {}) =>
+        humanApiRoute("searchProjectKnowledge", pathParameters, query),
+    listProjectKnowledgeIngestions: (pathParameters: ListProjectKnowledgeIngestionsOperationPathParameters, query: ListProjectKnowledgeIngestionsOperationQuery = {}) =>
+        humanApiRoute("listProjectKnowledgeIngestions", pathParameters, query),
+    getProjectKnowledgeIndexState: (pathParameters: GetProjectKnowledgeIndexStateOperationPathParameters, query: GetProjectKnowledgeIndexStateOperationQuery = {}) =>
+        humanApiRoute("getProjectKnowledgeIndexState", pathParameters, query),
+    rebuildProjectKnowledgeIndex: (pathParameters: RebuildProjectKnowledgeIndexOperationPathParameters, query: RebuildProjectKnowledgeIndexOperationQuery = {}) =>
+        humanApiRoute("rebuildProjectKnowledgeIndex", pathParameters, query),
+    listMyProjectTickets: (pathParameters: ListMyProjectTicketsOperationPathParameters, query: ListMyProjectTicketsOperationQuery = {}) =>
+        humanApiRoute("listMyProjectTickets", pathParameters, query),
+    listUnassignedProjectTickets: (pathParameters: ListUnassignedProjectTicketsOperationPathParameters, query: ListUnassignedProjectTicketsOperationQuery = {}) =>
+        humanApiRoute("listUnassignedProjectTickets", pathParameters, query),
+    listProjectIntegrationConnectorDefinitions: (pathParameters: ListProjectIntegrationConnectorDefinitionsOperationPathParameters, query: ListProjectIntegrationConnectorDefinitionsOperationQuery = {}) =>
+        humanApiRoute("listProjectIntegrationConnectorDefinitions", pathParameters, query),
+    createProjectIntegrationConnectorDefinition: (pathParameters: CreateProjectIntegrationConnectorDefinitionOperationPathParameters, query: CreateProjectIntegrationConnectorDefinitionOperationQuery = {}) =>
+        humanApiRoute("createProjectIntegrationConnectorDefinition", pathParameters, query),
+    updateProjectIntegrationConnectorDefinition: (pathParameters: UpdateProjectIntegrationConnectorDefinitionOperationPathParameters, query: UpdateProjectIntegrationConnectorDefinitionOperationQuery = {}) =>
+        humanApiRoute("updateProjectIntegrationConnectorDefinition", pathParameters, query),
+    listProjectIntegrationConnections: (pathParameters: ListProjectIntegrationConnectionsOperationPathParameters, query: ListProjectIntegrationConnectionsOperationQuery = {}) =>
+        humanApiRoute("listProjectIntegrationConnections", pathParameters, query),
+    createProjectIntegrationConnection: (pathParameters: CreateProjectIntegrationConnectionOperationPathParameters, query: CreateProjectIntegrationConnectionOperationQuery = {}) =>
+        humanApiRoute("createProjectIntegrationConnection", pathParameters, query),
+    updateProjectIntegrationConnection: (pathParameters: UpdateProjectIntegrationConnectionOperationPathParameters, query: UpdateProjectIntegrationConnectionOperationQuery = {}) =>
+        humanApiRoute("updateProjectIntegrationConnection", pathParameters, query),
+    listProjectIntegrationMappings: (pathParameters: ListProjectIntegrationMappingsOperationPathParameters, query: ListProjectIntegrationMappingsOperationQuery = {}) =>
+        humanApiRoute("listProjectIntegrationMappings", pathParameters, query),
+    createProjectIntegrationMapping: (pathParameters: CreateProjectIntegrationMappingOperationPathParameters, query: CreateProjectIntegrationMappingOperationQuery = {}) =>
+        humanApiRoute("createProjectIntegrationMapping", pathParameters, query),
+    updateProjectIntegrationMapping: (pathParameters: UpdateProjectIntegrationMappingOperationPathParameters, query: UpdateProjectIntegrationMappingOperationQuery = {}) =>
+        humanApiRoute("updateProjectIntegrationMapping", pathParameters, query),
+    dryRunProjectIntegrationMapping: (pathParameters: DryRunProjectIntegrationMappingOperationPathParameters, query: DryRunProjectIntegrationMappingOperationQuery = {}) =>
+        humanApiRoute("dryRunProjectIntegrationMapping", pathParameters, query),
+    publishProjectIntegrationMapping: (pathParameters: PublishProjectIntegrationMappingOperationPathParameters, query: PublishProjectIntegrationMappingOperationQuery = {}) =>
+        humanApiRoute("publishProjectIntegrationMapping", pathParameters, query),
+    getProjectIntegrationOverview: (pathParameters: GetProjectIntegrationOverviewOperationPathParameters, query: GetProjectIntegrationOverviewOperationQuery = {}) =>
+        humanApiRoute("getProjectIntegrationOverview", pathParameters, query),
+    listProjectIntegrationInboxMessages: (pathParameters: ListProjectIntegrationInboxMessagesOperationPathParameters, query: ListProjectIntegrationInboxMessagesOperationQuery = {}) =>
+        humanApiRoute("listProjectIntegrationInboxMessages", pathParameters, query),
+    listProjectIntegrationInboxReceipts: (pathParameters: ListProjectIntegrationInboxReceiptsOperationPathParameters, query: ListProjectIntegrationInboxReceiptsOperationQuery = {}) =>
+        humanApiRoute("listProjectIntegrationInboxReceipts", pathParameters, query),
+    listProjectIntegrationSyncRuns: (pathParameters: ListProjectIntegrationSyncRunsOperationPathParameters, query: ListProjectIntegrationSyncRunsOperationQuery = {}) =>
+        humanApiRoute("listProjectIntegrationSyncRuns", pathParameters, query),
+    listProjectIntegrationConflicts: (pathParameters: ListProjectIntegrationConflictsOperationPathParameters, query: ListProjectIntegrationConflictsOperationQuery = {}) =>
+        humanApiRoute("listProjectIntegrationConflicts", pathParameters, query),
+    resolveProjectIntegrationConflict: (pathParameters: ResolveProjectIntegrationConflictOperationPathParameters, query: ResolveProjectIntegrationConflictOperationQuery = {}) =>
+        humanApiRoute("resolveProjectIntegrationConflict", pathParameters, query),
+    listProjectIntegrationDeadLetters: (pathParameters: ListProjectIntegrationDeadLettersOperationPathParameters, query: ListProjectIntegrationDeadLettersOperationQuery = {}) =>
+        humanApiRoute("listProjectIntegrationDeadLetters", pathParameters, query),
+    replayProjectIntegrationDeadLetter: (pathParameters: ReplayProjectIntegrationDeadLetterOperationPathParameters, query: ReplayProjectIntegrationDeadLetterOperationQuery = {}) =>
+        humanApiRoute("replayProjectIntegrationDeadLetter", pathParameters, query),
+    listProjectIntegrationDomainEvents: (pathParameters: ListProjectIntegrationDomainEventsOperationPathParameters, query: ListProjectIntegrationDomainEventsOperationQuery = {}) =>
+        humanApiRoute("listProjectIntegrationDomainEvents", pathParameters, query),
+    listProjectIntegrationOutboxDeliveries: (pathParameters: ListProjectIntegrationOutboxDeliveriesOperationPathParameters, query: ListProjectIntegrationOutboxDeliveriesOperationQuery = {}) =>
+        humanApiRoute("listProjectIntegrationOutboxDeliveries", pathParameters, query),
 } as const

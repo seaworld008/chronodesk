@@ -435,6 +435,8 @@ export const authProvider: AuthProvider = {
                 platform_role: user.platform_role,
                 project_role: projectRole,
                 project_key: access.project.key,
+                can_create_knowledge_drafts:
+                    access.can_create_knowledge_drafts,
             }
         } catch {
             if (readStoredUser() === null) {
@@ -444,6 +446,7 @@ export const authProvider: AuthProvider = {
                 platform_role: user.platform_role,
                 project_role: null,
                 project_key: null,
+                can_create_knowledge_drafts: false,
             }
         }
     },

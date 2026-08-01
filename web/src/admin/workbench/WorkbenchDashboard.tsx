@@ -504,7 +504,7 @@ const WorkbenchDashboard: React.FC = () => {
           >
             <CircularProgress size={34} />
           </Box>
-        ) : dashboard && dashboard.selected_projects.length === 0 ? (
+        ) : dashboard && dashboard.selected_project_count === 0 ? (
           <Alert severity="info">
             当前账号没有有效项目成员关系，运营大屏暂无可汇总数据。
           </Alert>
@@ -604,7 +604,9 @@ const WorkbenchDashboard: React.FC = () => {
               <Box sx={{ p: 2 }}>
                 <Typography variant="h6">项目贡献</Typography>
                 <Typography variant="body2" color="text.secondary">
-                  按工单量从高到低排列
+                  {dashboard.project_breakdown_truncated
+                    ? `按工单量从高到低展示前 ${dashboard.project_breakdown.length} 个项目，共汇总 ${dashboard.selected_project_count} 个项目`
+                    : '按工单量从高到低排列'}
                 </Typography>
               </Box>
               <TableContainer sx={{ overflowX: 'auto' }}>

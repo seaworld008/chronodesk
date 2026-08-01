@@ -44,6 +44,7 @@ import {
     parseProjectRole,
 } from '@/lib/projectScope';
 import { transformTicketUpdate } from './ticketTransforms';
+import { EnterpriseReferenceAutocompleteInput } from '@/components/inputs/EnterpriseFilterInputs';
 
 // 状态选项
 const statusChoices = [
@@ -275,11 +276,12 @@ const TicketEdit: React.FC = () => {
                                                     reference="assignees"
                                                     label="分配给"
                                                 >
-                                                    <AutocompleteInput
+                                                    <EnterpriseReferenceAutocompleteInput
                                                         label="分配给"
                                                         optionText="username"
                                                         optionValue="id"
-                                                        helperText="选择负责处理此工单的用户"
+                                                        fullWidth
+                                                        helperText="输入姓名或用户名远程搜索负责处理此工单的用户"
                                                     />
                                                 </ReferenceInput>
                                             </Box>

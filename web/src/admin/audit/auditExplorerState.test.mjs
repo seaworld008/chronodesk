@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
     auditFiltersFromSearchParams,
+    auditFiltersToExportQuery,
     auditFiltersToQuery,
     auditFiltersToSearchParams,
 } from './auditExplorerState.ts'
@@ -59,6 +60,7 @@ test('invalid URL filters are explicit and cannot expand into an unfiltered quer
         'method=CONNECT',
         'result=maybe',
         'time_preset=forever',
+        'limit=10',
         'limit=101',
         'limit=not-a-number',
     ]) {
@@ -91,4 +93,39 @@ test('unknown duplicate and mutually exclusive URL parameters are rejected', () 
         assert.match(filters.urlError, /参数|不能同时使用/u)
         assert.throws(() => auditFiltersToQuery(filters))
     }
+})
+
+test('audit export snapshots filters with an explicit bounded range only', () => {
+    const filters = auditFiltersFromSearchParams(
+        new URLSearchParams(
+            'actor=alice&platform_role=security_auditor&method=GET' +
+                '&path_prefix=%2Fapi%2Fplatform&time_preset=30d' +
+                '&cursor=opaque&limit=100',
+        ),
+    )
+    const query = auditFiltersToExportQuery(
+        filters,
+        '2026-07-01T00:00:00Z',
+        '2026-07-31T00:00:00Z',
+    )
+    assert.deepEqual(query, {
+        actor: 'alice',
+        platform_role: 'security_auditor',
+        method: 'GET',
+        path_prefix: '/api/platform',
+        start_time: '2026-07-01T00:00:00.000Z',
+        end_time: '2026-07-31T00:00:00.000Z',
+    })
+    assert.equal(Object.hasOwn(query, 'cursor'), false)
+    assert.equal(Object.hasOwn(query, 'limit'), false)
+    assert.equal(Object.hasOwn(query, 'time_preset'), false)
+    assert.throws(
+        () =>
+            auditFiltersToExportQuery(
+                filters,
+                '2026-06-30T23:59:59.999Z',
+                '2026-07-31T00:00:00Z',
+            ),
+        /不超过 30 天/u,
+    )
 })

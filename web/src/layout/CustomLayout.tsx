@@ -140,6 +140,8 @@ export const CustomLayout: React.FC<LayoutProps> = (props) => (
             overflowY: 'auto',
             overscrollBehavior: 'contain',
             scrollbarGutter: 'stable',
+            scrollPaddingBlock: theme.spacing(1),
+            paddingBottom: theme.spacing(1),
             backgroundColor: theme.palette.background.paper,
           },
           '.RaSidebar-paper, .RaSidebar-root .MuiDrawer-paper': {
@@ -149,6 +151,8 @@ export const CustomLayout: React.FC<LayoutProps> = (props) => (
             overflowY: 'auto',
             overscrollBehavior: 'contain',
             scrollbarGutter: 'stable',
+            scrollPaddingBlock: theme.spacing(1),
+            paddingBottom: theme.spacing(1),
           },
           '.RaLayout-content': {
             position: 'relative',

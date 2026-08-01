@@ -231,6 +231,10 @@ const TrustedDevices = () => {
                                                     <Button
                                                         variant="outlined"
                                                         color="error"
+                                                        disabled={
+                                                            Boolean(error) ||
+                                                            revoking
+                                                        }
                                                         onClick={() => setRevokeTarget(device)}
                                                     >
                                                         撤销该设备
@@ -250,8 +254,17 @@ const TrustedDevices = () => {
                     page={page}
                     rowsPerPage={pageSize}
                     rowsPerPageOptions={[25, 50, 100]}
-                    onPageChange={(_, nextPage) => setPage(nextPage)}
+                    disabled={loading || revoking}
+                    onPageChange={(_, nextPage) => {
+                        setLoading(true)
+                        setDevices([])
+                        setRevokeTarget(null)
+                        setPage(nextPage)
+                    }}
                     onRowsPerPageChange={(event) => {
+                        setLoading(true)
+                        setDevices([])
+                        setRevokeTarget(null)
                         setPageSize(Number(event.target.value))
                         setPage(0)
                     }}

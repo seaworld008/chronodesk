@@ -9,9 +9,10 @@ const automationSections = [
 const AutomationTabs = () => {
     const location = useLocation()
     const navigate = useNavigate()
-    const activePath = location.pathname.startsWith('/automation-logs')
-        ? '/automation-logs'
-        : '/automation-rules'
+    const activePath =
+        automationSections.find((section) =>
+            location.pathname.startsWith(section.path),
+        )?.path ?? '/automation-rules'
 
     return (
         <Paper variant="outlined" sx={{ mb: 2 }}>

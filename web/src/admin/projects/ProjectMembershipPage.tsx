@@ -1,5 +1,6 @@
 import React from 'react'
 import {
+    HttpError,
     Title,
     useNotify,
     usePermissions,
@@ -10,6 +11,8 @@ import {
     Avatar,
     Box,
     Button,
+    Checkbox,
+    Chip,
     CircularProgress,
     Dialog,
     DialogActions,
@@ -17,6 +20,7 @@ import {
     DialogContentText,
     DialogTitle,
     FormControl,
+    FormControlLabel,
     InputLabel,
     MenuItem,
     Paper,
@@ -59,6 +63,12 @@ import {
 const projectMembershipColumns: ResizableColumn[] = [
     { key: 'user', defaultWidth: 320, minWidth: 240, maxWidth: 520 },
     { key: 'role', defaultWidth: 160, minWidth: 128, maxWidth: 240 },
+    {
+        key: 'knowledge_contributor',
+        defaultWidth: 180,
+        minWidth: 152,
+        maxWidth: 280,
+    },
     { key: 'status', defaultWidth: 112, minWidth: 96, maxWidth: 160 },
     {
         key: 'actions',
@@ -101,6 +111,7 @@ const parseMembershipPage = (
             typeof item.user_id !== 'number' ||
             parseProjectRole(item.role) === null ||
             typeof item.is_active !== 'boolean' ||
+            typeof item.knowledge_contributor !== 'boolean' ||
             typeof item.version !== 'number' ||
             typeof item.created_at !== 'string' ||
             typeof item.updated_at !== 'string'
@@ -152,11 +163,15 @@ const ProjectMembershipPage = () => {
     const [listError, setListError] = React.useState('')
     const [selectedUser, setSelectedUser] =
         React.useState<ProjectUserOption | null>(null)
+    const [selectedMembershipVersion, setSelectedMembershipVersion] =
+        React.useState(0)
     const [candidateOptions, setCandidateOptions] =
         React.useState<ProjectUserOption[]>([])
     const [candidateSearch, setCandidateSearch] = React.useState('')
     const [candidateLoading, setCandidateLoading] = React.useState(false)
     const [role, setRole] = React.useState<ProjectRole>('requester')
+    const [knowledgeContributor, setKnowledgeContributor] =
+        React.useState(false)
     const [membershipToRevoke, setMembershipToRevoke] =
         React.useState<ProjectMembership | null>(null)
     const listAbortController = React.useRef<AbortController | null>(null)
@@ -291,6 +306,11 @@ const ProjectMembershipPage = () => {
         const payload: UpsertProjectMembershipRequest = {
             user_id: selectedUser.id,
             role,
+            knowledge_contributor:
+                role === 'project_admin' || role === 'manager'
+                    ? false
+                    : knowledgeContributor,
+            expected_version: selectedMembershipVersion,
         }
         setSaving(true)
         setError('')
@@ -304,10 +324,23 @@ const ProjectMembershipPage = () => {
             })
             notify('项目成员关系已保存', { type: 'success' })
             setSelectedUser(null)
+            setSelectedMembershipVersion(0)
             setCandidateSearch('')
             setRole('requester')
+            setKnowledgeContributor(false)
             await loadMemberships()
         } catch (requestError) {
+            if (
+                requestError instanceof HttpError &&
+                requestError.status === 409
+            ) {
+                setSelectedUser(null)
+                setSelectedMembershipVersion(0)
+                setCandidateSearch('')
+                setRole('requester')
+                setKnowledgeContributor(false)
+                await loadMemberships()
+            }
             setError(
                 localizedUnknownErrorMessage(
                     requestError,
@@ -327,12 +360,21 @@ const ProjectMembershipPage = () => {
             const path = humanApiRoutes.deactivateProjectMembership({
                 projectKey: await resolveActiveProjectKey(),
                 userID: membershipToRevoke.user_id,
+            }, {
+                expected_version: membershipToRevoke.version,
             })
             await apiFetch(path, { method: 'DELETE' })
             notify('项目职责已撤销', { type: 'success' })
             setMembershipToRevoke(null)
             await loadMemberships()
         } catch (requestError) {
+            if (
+                requestError instanceof HttpError &&
+                requestError.status === 409
+            ) {
+                setMembershipToRevoke(null)
+                await loadMemberships()
+            }
             setError(
                 localizedUnknownErrorMessage(
                     requestError,
@@ -430,6 +472,22 @@ const ProjectMembershipPage = () => {
                             }
                             onChange={(_, value) => {
                                 setSelectedUser(value)
+                                const existingMembership = value
+                                    ? memberships.find(
+                                        (membership) =>
+                                            membership.user_id === value.id,
+                                    )
+                                    : undefined
+                                setSelectedMembershipVersion(
+                                    existingMembership?.version ?? 0,
+                                )
+                                setRole(
+                                    existingMembership?.role ?? 'requester',
+                                )
+                                setKnowledgeContributor(
+                                    existingMembership
+                                        ?.knowledge_contributor ?? false,
+                                )
                                 setCandidateSearch(
                                     value
                                         ? value.display_name || value.username
@@ -498,7 +556,17 @@ const ProjectMembershipPage = () => {
                                 label="项目职责"
                                 value={role}
                                 onChange={(event) =>
-                                    setRole(event.target.value as ProjectRole)
+                                    {
+                                        const nextRole =
+                                            event.target.value as ProjectRole
+                                        setRole(nextRole)
+                                        if (
+                                            nextRole === 'project_admin' ||
+                                            nextRole === 'manager'
+                                        ) {
+                                            setKnowledgeContributor(false)
+                                        }
+                                    }
                                 }
                             >
                                 {roleChoices.map((choice) => (
@@ -508,6 +576,46 @@ const ProjectMembershipPage = () => {
                                 ))}
                             </Select>
                         </FormControl>
+                        <Stack spacing={0}>
+                            <FormControlLabel
+                                control={(
+                                    <Checkbox
+                                        checked={
+                                            role === 'project_admin' ||
+                                            role === 'manager' ||
+                                            knowledgeContributor
+                                        }
+                                        disabled={
+                                            role === 'project_admin' ||
+                                            role === 'manager'
+                                        }
+                                        onChange={(event) =>
+                                            setKnowledgeContributor(
+                                                event.target.checked,
+                                            )}
+                                        slotProps={{
+                                            input: {
+                                                'aria-label':
+                                                    '允许创建知识草稿',
+                                            },
+                                        }}
+                                    />
+                                )}
+                                label={
+                                    role === 'project_admin' ||
+                                    role === 'manager'
+                                        ? '职责已包含知识管理'
+                                        : '知识贡献者（仅草稿）'
+                                }
+                            />
+                            <Typography
+                                variant="caption"
+                                color="text.secondary"
+                                sx={{ pl: 4 }}
+                            >
+                                可创建和修订自己的草稿，不能发布或调整知识权限
+                            </Typography>
+                        </Stack>
                         <Button
                             type="submit"
                             variant="contained"
@@ -530,6 +638,7 @@ const ProjectMembershipPage = () => {
                         <TableRow>
                             <TableCell>用户</TableCell>
                             <TableCell>项目职责</TableCell>
+                            <TableCell>知识贡献</TableCell>
                             <TableCell>状态</TableCell>
                             <TableCell align="right">操作</TableCell>
                         </TableRow>
@@ -537,7 +646,7 @@ const ProjectMembershipPage = () => {
                     <TableBody>
                         {loading ? (
                             <TableRow>
-                                <TableCell colSpan={4} align="center">
+                                <TableCell colSpan={5} align="center">
                                     <CircularProgress
                                         size={24}
                                         aria-label="正在加载项目成员"
@@ -546,7 +655,7 @@ const ProjectMembershipPage = () => {
                             </TableRow>
                         ) : memberships.length === 0 ? (
                             <TableRow>
-                                <TableCell colSpan={4} align="center">
+                                <TableCell colSpan={5} align="center">
                                     暂无项目成员
                                 </TableCell>
                             </TableRow>
@@ -575,6 +684,42 @@ const ProjectMembershipPage = () => {
                                             )}
                                         </TableCell>
                                         <TableCell>
+                                            {!membership.is_active ? (
+                                                <Chip
+                                                    size="small"
+                                                    color="default"
+                                                    variant="outlined"
+                                                    label="随职责撤销"
+                                                />
+                                            ) : membership.role ===
+                                                'project_admin' ||
+                                            membership.role === 'manager' ? (
+                                                <Chip
+                                                    size="small"
+                                                    color="primary"
+                                                    variant="outlined"
+                                                    label="职责自带"
+                                                />
+                                            ) : (
+                                                <Chip
+                                                    size="small"
+                                                    color={
+                                                        membership
+                                                            .knowledge_contributor
+                                                            ? 'success'
+                                                            : 'default'
+                                                    }
+                                                    variant="outlined"
+                                                    label={
+                                                        membership
+                                                            .knowledge_contributor
+                                                            ? '可创建草稿'
+                                                            : '未授权'
+                                                    }
+                                                />
+                                            )}
+                                        </TableCell>
+                                        <TableCell>
                                             {membership.is_active
                                                 ? '有效'
                                                 : '已撤销'}
@@ -593,7 +738,8 @@ const ProjectMembershipPage = () => {
                                                         size="small"
                                                         disabled={
                                                             !membership.is_active ||
-                                                            !membership.user
+                                                            !membership.user ||
+                                                            Boolean(listError)
                                                         }
                                                         onClick={() => {
                                                             const option =
@@ -601,6 +747,9 @@ const ProjectMembershipPage = () => {
                                                                     membership,
                                                                 )
                                                             setSelectedUser(option)
+                                                            setSelectedMembershipVersion(
+                                                                membership.version,
+                                                            )
                                                             setCandidateSearch(
                                                                 option
                                                                     ? option.display_name ||
@@ -609,6 +758,10 @@ const ProjectMembershipPage = () => {
                                                             )
                                                             setRole(
                                                                 membership.role,
+                                                            )
+                                                            setKnowledgeContributor(
+                                                                membership
+                                                                    .knowledge_contributor,
                                                             )
                                                         }}
                                                     >
@@ -619,7 +772,8 @@ const ProjectMembershipPage = () => {
                                                         color="error"
                                                         disabled={
                                                             !membership.is_active ||
-                                                            saving
+                                                            saving ||
+                                                            Boolean(listError)
                                                         }
                                                         onClick={() =>
                                                             setMembershipToRevoke(
@@ -652,8 +806,27 @@ const ProjectMembershipPage = () => {
                     page={page}
                     rowsPerPage={pageSize}
                     rowsPerPageOptions={[25, 50, 100]}
-                    onPageChange={(_, nextPage) => setPage(nextPage)}
+                    disabled={loading || saving}
+                    onPageChange={(_, nextPage) => {
+                        setLoading(true)
+                        setMemberships([])
+                        setMembershipToRevoke(null)
+                        setSelectedUser(null)
+                        setSelectedMembershipVersion(0)
+                        setCandidateSearch('')
+                        setRole('requester')
+                        setKnowledgeContributor(false)
+                        setPage(nextPage)
+                    }}
                     onRowsPerPageChange={(event) => {
+                        setLoading(true)
+                        setMemberships([])
+                        setMembershipToRevoke(null)
+                        setSelectedUser(null)
+                        setSelectedMembershipVersion(0)
+                        setCandidateSearch('')
+                        setRole('requester')
+                        setKnowledgeContributor(false)
                         setPageSize(Number(event.target.value))
                         setPage(0)
                     }}

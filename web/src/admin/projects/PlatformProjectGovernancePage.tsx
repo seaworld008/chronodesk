@@ -64,6 +64,8 @@ import {
     activeProjectKey,
     clearProjectScopeCache,
     refreshAuthorizedProjectInventory,
+    setActiveProjectKey,
+    type AuthorizedProject,
 } from '@/lib/projectScope'
 import {
     apiFetch,
@@ -755,6 +757,10 @@ const PlatformProjectGovernancePage = () => {
         React.useState<PlatformProjectSummary | null>(null)
     const [projectToInspect, setProjectToInspect] =
         React.useState<PlatformProjectSummary | null>(null)
+    const [createdProjectEntry, setCreatedProjectEntry] = React.useState<{
+        project: PlatformProjectSummary
+        inventory: AuthorizedProject[]
+    } | null>(null)
     const createWizardOpen = searchParams.get('create') === '1'
     const projectToArchiveIsActive =
         projectToArchive !== null &&
@@ -911,29 +917,48 @@ const PlatformProjectGovernancePage = () => {
 
     const refreshAuthorizedProjects = async (
         clearSelection: boolean,
-    ): Promise<boolean> => {
+    ): Promise<AuthorizedProject[] | null> => {
         if (clearSelection) {
             clearProjectScopeCache()
-            return true
+            return []
         }
         try {
-            await refreshAuthorizedProjectInventory()
-            return true
+            return await refreshAuthorizedProjectInventory()
         } catch {
-            return false
+            return null
         }
     }
 
     const handleCreated = async (created: PlatformProjectSummary) => {
-        const inventoryRefreshed = await refreshAuthorizedProjects(false)
+        const inventory = await refreshAuthorizedProjects(false)
         closeCreationWizard()
         setRefreshVersion((current) => current + 1)
         notify(`项目“${created.name}”创建成功`, { type: 'success' })
-        if (!inventoryRefreshed) {
+        if (inventory === null) {
+            setCreatedProjectEntry(null)
             notify('项目已创建，但授权项目清单刷新失败，请稍后手动刷新', {
                 type: 'warning',
             })
+            return
         }
+        if (inventory.some(({ project }) => project.key === created.key)) {
+            setCreatedProjectEntry({ project: created, inventory })
+        } else {
+            setCreatedProjectEntry(null)
+            notify('项目已创建，但当前账号未被加入该项目', {
+                type: 'info',
+            })
+        }
+    }
+
+    const enterCreatedProject = () => {
+        if (!createdProjectEntry) return
+        setActiveProjectKey(
+            createdProjectEntry.project.key,
+            createdProjectEntry.inventory,
+        )
+        setCreatedProjectEntry(null)
+        navigate('/tickets')
     }
 
     const archiveProject = async () => {
@@ -1074,6 +1099,23 @@ const PlatformProjectGovernancePage = () => {
             <Alert severity="warning" sx={{ my: 2 }}>
                 项目归档会立即撤销业务访问，当前版本不支持恢复。
             </Alert>
+            {createdProjectEntry && (
+                <Alert
+                    severity="success"
+                    sx={{ mb: 2 }}
+                    action={
+                        <Button
+                            color="inherit"
+                            onClick={enterCreatedProject}
+                            data-testid="enter-created-project"
+                        >
+                            进入项目
+                        </Button>
+                    }
+                >
+                    项目“{createdProjectEntry.project.name}”已创建，且当前账号已获得项目成员身份。
+                </Alert>
+            )}
             {error && (
                 <Alert severity="error" sx={{ mb: 2 }}>
                     {error}

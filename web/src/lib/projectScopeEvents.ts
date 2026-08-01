@@ -1,5 +1,7 @@
 export const projectAccessInvalidatedEvent =
     'chronodesk:project-access-invalidated'
+export const projectAccessRefreshRequestedEvent =
+    'chronodesk:project-access-refresh-requested'
 export const projectInventoryChangedEvent =
     'chronodesk:project-inventory-changed'
 export const projectScopeChangedEvent = 'chronodesk:project-scope-changed'
@@ -57,6 +59,24 @@ const storedActiveProjectKey = (): string | null => {
 export const isProjectScopedApiPath = (path: string): boolean =>
     projectKeyFromProjectScopedApiPath(path) !== null
 
+const projectResourceFromProjectScopedApiPath = (
+    path: string,
+): string | null => {
+    let pathname: string
+    try {
+        pathname = new URL(path, 'http://chronodesk.local').pathname
+    } catch {
+        return null
+    }
+
+    const segments = pathname.split('/').filter(Boolean)
+    const projectsIndex = segments.findIndex(
+        (segment, index) =>
+            segment === 'projects' && segments[index - 1] !== 'platform',
+    )
+    return projectsIndex < 0 ? null : segments[projectsIndex + 2] ?? null
+}
+
 const isProjectAccessRevokedPayload = (value: unknown): boolean =>
     typeof value === 'object' &&
     value !== null &&
@@ -77,9 +97,28 @@ export const shouldInvalidateActiveProjectAccess = (
     )
 }
 
+export const shouldRefreshActiveProjectAccessAfterForbidden = (
+    path: string,
+): boolean => {
+    const requestedProjectKey = projectKeyFromProjectScopedApiPath(path)
+    const activeProjectKey = storedActiveProjectKey()
+    return (
+        requestedProjectKey !== null &&
+        activeProjectKey !== null &&
+        requestedProjectKey === activeProjectKey &&
+        projectResourceFromProjectScopedApiPath(path) === 'knowledge'
+    )
+}
+
 export const signalProjectAccessInvalidated = (): void => {
     if (typeof window !== 'undefined') {
         window.dispatchEvent(new Event(projectAccessInvalidatedEvent))
+    }
+}
+
+export const signalProjectAccessRefreshRequested = (): void => {
+    if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event(projectAccessRefreshRequestedEvent))
     }
 }
 

@@ -224,18 +224,6 @@ const ticketPreconditions = (
     })
 
 const parseListResponse = (resource: string, json: unknown, headers: Headers) => {
-    if (isRecord(json) && resource === 'automation-logs' && isRecord(json.data) && Array.isArray(json.data.logs)) {
-        const data = json.data.logs
-        const total = (json.data.total as number | undefined) ?? data.length
-        return { data, total }
-    }
-
-    if (isRecord(json) && resource === 'automation-rules' && isRecord(json.data) && Array.isArray(json.data.rules)) {
-        const data = json.data.rules
-        const total = (json.data.total as number | undefined) ?? data.length
-        return { data, total }
-    }
-
     const payload = extractResponseData(json)
 
     if (isRecord(payload) && Array.isArray(payload.items)) {
@@ -419,6 +407,11 @@ export const dataProvider: DataProvider = {
                 if (searchValue) {
                     filter.q = searchValue;
                 }
+                // 通知列表的服务端语义固定为“当前登录用户的通知中心”。
+                // 丢弃旧书签或持久化列表状态中的跨用户筛选，避免向
+                // 当前用户接口发送看似可用、实际会被拒绝的身份条件。
+                delete filter.recipient_id;
+                delete filter.sender_id;
             }
 
             const cleanedFilter = Object.fromEntries(
@@ -531,8 +524,25 @@ export const dataProvider: DataProvider = {
     // 获取引用资源
     getManyReference: async (resource, params) => {
         const { page, perPage } = params.pagination || { page: 1, perPage: 10 };
+
+        if (params.target === 'ticket_id' && resource === 'ticket_history') {
+            const route = humanApiRoutes.listProjectTicketHistory(
+                {
+                    projectKey: await resolveActiveProjectKey(),
+                    ticketID: Number(params.id),
+                },
+                {
+                    page,
+                    page_size: perPage,
+                },
+            )
+            const { json, headers } = await httpClient(
+                joinApiUrl(apiUrl, route),
+            )
+            return parseListResponse(resource, json, headers)
+        }
+
         const { field, order } = params.sort || { field: 'id', order: 'ASC' };
-        
         const query: Record<string, unknown> = {
             page,
             page_size: perPage,
@@ -549,14 +559,12 @@ export const dataProvider: DataProvider = {
         };
         query.filter = convertFilterToGoFormat(filter);
 
-        if (params.target === 'ticket_id' && (resource === 'comments' || resource === 'ticket_history')) {
+        if (params.target === 'ticket_id' && resource === 'comments') {
             const pathParameters = {
                 projectKey: await resolveActiveProjectKey(),
                 ticketID: Number(params.id),
             }
-            const route = resource === 'comments'
-                ? humanApiRoutes.listProjectTicketComments(pathParameters)
-                : humanApiRoutes.listProjectTicketHistory(pathParameters)
+            const route = humanApiRoutes.listProjectTicketComments(pathParameters)
             const url = `${joinApiUrl(apiUrl, route)}?${queryString.stringify(query)}`
             const { json, headers } = await httpClient(url)
             return parseListResponse(resource, json, headers)

@@ -1,7 +1,9 @@
 import { HttpError } from 'react-admin'
 import {
+  shouldRefreshActiveProjectAccessAfterForbidden,
   shouldInvalidateActiveProjectAccess,
   signalProjectAccessInvalidated,
+  signalProjectAccessRefreshRequested,
   signalSessionInvalidated,
 } from './projectScopeEvents'
 import { joinApiUrl } from './apiUrl'
@@ -30,6 +32,8 @@ export const sessionAwareFetch = async (
     const payload = await response.clone().json().catch(() => null)
     if (shouldInvalidateActiveProjectAccess(path, payload)) {
       signalProjectAccessInvalidated()
+    } else if (shouldRefreshActiveProjectAccessAfterForbidden(path)) {
+      signalProjectAccessRefreshRequested()
     }
   }
   return response

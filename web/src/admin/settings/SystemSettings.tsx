@@ -36,7 +36,9 @@ import { useBlocker, useNotify } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
 import {
   humanApiRoutes,
-  type SystemConfig as HumanSystemConfig,
+  type ListPlatformConfigsOperationQuery,
+  type SystemConfig,
+  type SystemConfigPage,
   type UpdateSystemConfigRequest,
 } from '@/lib/generated/human-api'
 import {
@@ -47,7 +49,6 @@ import {
 import PageHeader from '@/components/layout/PageHeader'
 import PageShell from '@/components/layout/PageShell'
 import BackButton from '../common/BackButton'
-import SettingsTabs from './SettingsTabs'
 
 const systemConfigColumns: ResizableColumn[] = [
   { key: 'config', defaultWidth: 260, minWidth: 180, maxWidth: 460 },
@@ -63,20 +64,10 @@ const systemConfigColumns: ResizableColumn[] = [
   },
 ]
 
-type SystemConfig = HumanSystemConfig
-
 interface EditableConfig extends SystemConfig {
   boolValue?: boolean
   intValue?: number
   jsonValue?: string
-}
-
-interface SystemConfigPage {
-  items: SystemConfig[]
-  total: number
-  page: number
-  page_size: number
-  total_pages: number
 }
 
 interface CategoryPagination {
@@ -108,18 +99,6 @@ const pageCacheKey = (
   category: string,
   pagination: CategoryPagination,
 ) => `${category}:${pagination.page}:${pagination.pageSize}`
-
-const isSystemConfigPage = (value: unknown): value is SystemConfigPage => {
-  if (!value || typeof value !== 'object') return false
-  const page = value as Partial<SystemConfigPage>
-  return (
-    Array.isArray(page.items) &&
-    typeof page.total === 'number' &&
-    typeof page.page === 'number' &&
-    typeof page.page_size === 'number' &&
-    typeof page.total_pages === 'number'
-  )
-}
 
 const parseInitialValue = (config: SystemConfig): EditableConfig => {
   const editable: EditableConfig = { ...config }
@@ -204,21 +183,18 @@ const SystemSettings = () => {
       setLoading(true)
       setListError('')
       try {
-        const query = new URLSearchParams({
+        const query: ListPlatformConfigsOperationQuery = {
           category,
-          page: String(pagination.page + 1),
-          page_size: String(pagination.pageSize),
+          page: pagination.page + 1,
+          page_size: pagination.pageSize,
           sort_by: 'group',
           sort_order: 'asc',
-        })
-        const result = await apiFetch<unknown>(
-          `${humanApiRoutes.listPlatformConfigs()}?${query.toString()}`,
+        }
+        const result = await apiFetch<SystemConfigPage>(
+          humanApiRoutes.listPlatformConfigs(query),
           { signal: controller.signal },
         )
         if (controller.signal.aborted) return
-        if (!isSystemConfigPage(result)) {
-          throw new Error('系统配置响应格式无效')
-        }
         if (
           result.total_pages > 0 &&
           pagination.page + 1 > result.total_pages
@@ -513,9 +489,6 @@ const SystemSettings = () => {
           </Stack>
         }
       />
-      <Box sx={{ mt: 2 }}>
-        <SettingsTabs />
-      </Box>
       <Paper sx={{ mb: 2 }}>
         <Tabs
           value={activeTab}

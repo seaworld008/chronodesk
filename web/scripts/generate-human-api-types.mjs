@@ -394,9 +394,15 @@ function generatedOperationRuntime(operations) {
     )
     const routeEntries = operations.map((operation) => {
         const hasPathParameters = operation.pathParameters.length > 0
-        const argumentsList = hasPathParameters
-            ? `pathParameters: ${operation.typeName}PathParameters, query: ${operation.typeName}Query = {}`
+        const hasRequiredQueryParameters = operation.queryParameters.some(
+            (parameter) => parameter.required === true,
+        )
+        const queryArgument = hasRequiredQueryParameters
+            ? `query: ${operation.typeName}Query`
             : `query: ${operation.typeName}Query = {}`
+        const argumentsList = hasPathParameters
+            ? `pathParameters: ${operation.typeName}PathParameters, ${queryArgument}`
+            : queryArgument
         const pathArguments = hasPathParameters ? 'pathParameters' : '{}'
         return [
             `    ${propertyName(operation.operationId)}: (${argumentsList}) =>`,

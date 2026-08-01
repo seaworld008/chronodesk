@@ -22,38 +22,16 @@ import {
   type ResizableColumn,
 } from '@/components/tables/EnterpriseTable'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
-import { humanApiRoutes } from '@/lib/generated/human-api'
+import {
+  humanApiRoutes,
+  type AutomationLog,
+  type AutomationLogPage,
+  type ListProjectAutomationLogsOperationQuery,
+} from '@/lib/generated/human-api'
 import { resolveActiveProjectKey } from '@/lib/projectScope'
+import { projectScopeChangedEvent } from '@/lib/projectScopeEvents'
 import AutomationTabs from './AutomationTabs'
 import { automationTriggerEventLabel } from './triggerEvents'
-
-type AutomationLogItem = {
-  id: number
-  created_at: string
-  rule_id: number
-  rule?: {
-    id: number
-    name: string
-  }
-  ticket_id: number
-  ticket?: {
-    id: number
-    ticket_number: string
-    title: string
-    status: string
-  }
-  trigger_event: string
-  executed_at: string
-  success: boolean
-  error_message?: string
-  execution_time: number
-}
-
-type AutomationLogCursorPage = {
-  items: AutomationLogItem[]
-  next_cursor: string
-  has_more: boolean
-}
 
 type AutomationLogFilters = {
   ruleID: string
@@ -66,6 +44,8 @@ const emptyFilters: AutomationLogFilters = {
   ticketID: '',
   success: '',
 }
+
+const maxAutomationCursorPages = 100
 
 const automationLogColumns: ResizableColumn[] = [
   { key: 'id', defaultWidth: 88, minWidth: 72, maxWidth: 136 },
@@ -80,55 +60,145 @@ const automationLogColumns: ResizableColumn[] = [
 ]
 
 const positiveID = (value: string) => value === '' || /^[1-9]\d*$/.test(value)
+const isAbortedRequest = (error: unknown, signal: AbortSignal) =>
+  signal.aborted
+  || (error instanceof DOMException && error.name === 'AbortError')
 
 const AutomationLogList: React.FC = () => {
-  const [items, setItems] = useState<AutomationLogItem[]>([])
+  const [items, setItems] = useState<AutomationLog[]>([])
   const [filters, setFilters] = useState<AutomationLogFilters>(emptyFilters)
   const [appliedFilters, setAppliedFilters] = useState<AutomationLogFilters>(emptyFilters)
-  const [cursor, setCursor] = useState('')
+  const [nextCursor, setNextCursor] = useState('')
   const [hasMore, setHasMore] = useState(false)
+  const [pageIndex, setPageIndex] = useState(0)
+  const [cursorHistory, setCursorHistory] = useState<string[]>([''])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [filterError, setFilterError] = useState('')
-  const [selected, setSelected] = useState<AutomationLogItem | null>(null)
-  const lastAutomaticQuery = useRef('')
+  const [selected, setSelected] = useState<AutomationLog | null>(null)
+  const [scopeVersion, setScopeVersion] = useState(0)
+  const requestController = useRef<AbortController | null>(null)
+  const requestSequence = useRef(0)
+  const retryTarget = useRef({ cursor: '', pageIndex: 0 })
 
-  const fetchLogs = useCallback(async (nextCursor = '', append = false) => {
+  const fetchLogs = useCallback(async (
+    targetCursor = '',
+    targetPageIndex = 0,
+  ) => {
+    if (
+      targetPageIndex < 0
+      || targetPageIndex >= maxAutomationCursorPages
+    ) {
+      setError('本次浏览已达到 100 页上限，请缩小筛选范围后继续')
+      return
+    }
+    requestController.current?.abort()
+    const controller = new AbortController()
+    const sequence = requestSequence.current + 1
+    requestSequence.current = sequence
+    requestController.current = controller
+    retryTarget.current = {
+      cursor: targetCursor,
+      pageIndex: targetPageIndex,
+    }
     try {
       setLoading(true)
       setError('')
       const projectKey = await resolveActiveProjectKey()
-      const parameters = new URLSearchParams({ limit: '25' })
-      if (nextCursor) parameters.set('cursor', nextCursor)
-      if (appliedFilters.ruleID) parameters.set('rule_id', appliedFilters.ruleID)
-      if (appliedFilters.ticketID) parameters.set('ticket_id', appliedFilters.ticketID)
-      if (appliedFilters.success) parameters.set('success', appliedFilters.success)
-      const basePath = humanApiRoutes.listProjectAutomationLogs({ projectKey }, {})
-      const data = await apiFetch<AutomationLogCursorPage>(
-        `${basePath}?${parameters.toString()}`,
+      if (
+        controller.signal.aborted
+        || requestSequence.current !== sequence
+      ) return
+      const query: ListProjectAutomationLogsOperationQuery = {
+        limit: 25,
+        ...(targetCursor ? { cursor: targetCursor } : {}),
+        ...(appliedFilters.ruleID
+          ? { rule_id: Number(appliedFilters.ruleID) }
+          : {}),
+        ...(appliedFilters.ticketID
+          ? { ticket_id: Number(appliedFilters.ticketID) }
+          : {}),
+        ...(appliedFilters.success
+          ? { success: appliedFilters.success === 'true' }
+          : {}),
+      }
+      const path = humanApiRoutes.listProjectAutomationLogs(
+        { projectKey },
+        query,
       )
-      setItems((previous) => append
-        ? [...previous, ...(data.items ?? [])]
-        : (data.items ?? []))
-      setCursor(data.next_cursor ?? '')
+      const data = await apiFetch<AutomationLogPage>(
+        path,
+        { signal: controller.signal },
+      )
+      if (
+        controller.signal.aborted
+        || requestSequence.current !== sequence
+      ) return
+      const continuation = data.next_cursor ?? ''
+      setItems(data.items ?? [])
+      setNextCursor(continuation)
       setHasMore(Boolean(data.has_more))
-      if (!append) setSelected(null)
+      setPageIndex(targetPageIndex)
+      setCursorHistory((previous) => {
+        const history = targetPageIndex === 0
+          ? ['']
+          : previous.slice(0, targetPageIndex + 1)
+        if (
+          data.has_more
+          && continuation
+          && targetPageIndex + 1 < maxAutomationCursorPages
+        ) {
+          history[targetPageIndex + 1] = continuation
+        }
+        return history.slice(0, maxAutomationCursorPages)
+      })
+      setSelected(null)
     } catch (fetchError: unknown) {
+      if (
+        isAbortedRequest(fetchError, controller.signal)
+        || requestSequence.current !== sequence
+      ) return
       setError(localizedUnknownErrorMessage(
         fetchError,
         '加载自动化执行日志失败',
       ))
     } finally {
-      setLoading(false)
+      if (
+        !controller.signal.aborted
+        && requestSequence.current === sequence
+      ) {
+        setLoading(false)
+      }
     }
   }, [appliedFilters])
 
   useEffect(() => {
-    const queryKey = JSON.stringify(appliedFilters)
-    if (lastAutomaticQuery.current === queryKey) return
-    lastAutomaticQuery.current = queryKey
-    void fetchLogs()
-  }, [appliedFilters, fetchLogs])
+    setItems([])
+    setNextCursor('')
+    setHasMore(false)
+    setPageIndex(0)
+    setCursorHistory([''])
+    setSelected(null)
+    void fetchLogs('', 0)
+    return () => requestController.current?.abort()
+  }, [appliedFilters, fetchLogs, scopeVersion])
+
+  useEffect(() => {
+    const handleProjectScopeChanged = () => {
+      requestController.current?.abort()
+      requestSequence.current += 1
+      setScopeVersion((version) => version + 1)
+    }
+    window.addEventListener(projectScopeChangedEvent, handleProjectScopeChanged)
+    return () => {
+      requestController.current?.abort()
+      requestSequence.current += 1
+      window.removeEventListener(
+        projectScopeChangedEvent,
+        handleProjectScopeChanged,
+      )
+    }
+  }, [])
 
   const applyFilters = (event: React.FormEvent) => {
     event.preventDefault()
@@ -137,13 +207,13 @@ const AutomationLogList: React.FC = () => {
       return
     }
     setFilterError('')
-    setAppliedFilters(filters)
+    setAppliedFilters({ ...filters })
   }
 
   const clearFilters = () => {
     setFilters(emptyFilters)
     setFilterError('')
-    setAppliedFilters(emptyFilters)
+    setAppliedFilters({ ...emptyFilters })
   }
 
   return (
@@ -206,7 +276,15 @@ const AutomationLogList: React.FC = () => {
           severity="error"
           sx={{ mb: 2 }}
           action={(
-            <Button color="inherit" size="small" onClick={() => void fetchLogs()}>
+            <Button
+              color="inherit"
+              size="small"
+              disabled={loading}
+              onClick={() => void fetchLogs(
+                retryTarget.current.cursor,
+                retryTarget.current.pageIndex,
+              )}
+            >
               重试
             </Button>
           )}
@@ -297,16 +375,43 @@ const AutomationLogList: React.FC = () => {
         </ResizableMuiTable>
       </TableContainer>
 
-      {hasMore && (
-        <Stack sx={{ mt: 2, alignItems: 'center' }}>
+      {(pageIndex > 0 || hasMore) && (
+        <Stack
+          direction="row"
+          spacing={1}
+          sx={{ mt: 2, alignItems: 'center', justifyContent: 'center' }}
+        >
           <Button
             variant="outlined"
-            disabled={loading}
-            onClick={() => void fetchLogs(cursor, true)}
+            disabled={loading || pageIndex === 0}
+            onClick={() => void fetchLogs(
+              cursorHistory[pageIndex - 1] ?? '',
+              pageIndex - 1,
+            )}
           >
-            {loading ? '加载中…' : '加载更多'}
+            上一页
+          </Button>
+          <Typography variant="body2" color="text.secondary">
+            第 {pageIndex + 1} 页
+          </Typography>
+          <Button
+            variant="outlined"
+            disabled={
+              loading
+              || !hasMore
+              || !nextCursor
+              || pageIndex >= maxAutomationCursorPages - 1
+            }
+            onClick={() => void fetchLogs(nextCursor, pageIndex + 1)}
+          >
+            {loading ? '加载中…' : '下一页'}
           </Button>
         </Stack>
+      )}
+      {hasMore && pageIndex >= maxAutomationCursorPages - 1 && (
+        <Alert severity="info" sx={{ mt: 2 }}>
+          本次浏览已达到 100 页上限，请使用规则、工单或执行结果筛选缩小范围。
+        </Alert>
       )}
 
       {selected && (

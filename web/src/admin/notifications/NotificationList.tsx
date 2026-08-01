@@ -6,7 +6,6 @@ import {
     FilterButton,
     ExportButton,
     CreateButton,
-    ReferenceInput,
     TopToolbar,
     useRecordContext,
     WrapperField,
@@ -58,7 +57,6 @@ import { EnterpriseSearchInput } from '@/components/inputs/EnterpriseSearchInput
 import {
     EnterpriseBooleanFilterInput,
     EnterpriseDateFilterInput,
-    EnterpriseReferenceAutocompleteInput,
     EnterpriseSelectFilterInput,
 } from '@/components/inputs/EnterpriseFilterInputs';
 import {
@@ -369,7 +367,7 @@ type NotificationRecord = {
     retry_count?: number
 }
 
-const buildNotificationFilters = (canManageNotifications: boolean) => [
+const buildNotificationFilters = () => [
     <EnterpriseSearchInput key="q" source="q" placeholder="搜索通知" alwaysOn />,
     <EnterpriseSelectFilterInput
         key="type"
@@ -391,26 +389,6 @@ const buildNotificationFilters = (canManageNotifications: boolean) => [
     />,
     <EnterpriseBooleanFilterInput key="is_read" source="is_read" label="已读" />,
     <EnterpriseBooleanFilterInput key="is_sent" source="is_sent" label="已发送" />,
-    ...(canManageNotifications
-        ? [
-            <ReferenceInput
-                key="recipient_id"
-                source="recipient_id"
-                reference="assignees"
-                label="接收者"
-            >
-                <EnterpriseReferenceAutocompleteInput label="接收者" optionText="username" />
-            </ReferenceInput>,
-            <ReferenceInput
-                key="sender_id"
-                source="sender_id"
-                reference="assignees"
-                label="发送者"
-            >
-                <EnterpriseReferenceAutocompleteInput label="发送者" optionText="username" />
-            </ReferenceInput>,
-        ]
-        : []),
     <EnterpriseDateFilterInput
         key="created_at_gte"
         source="created_at_gte"
@@ -479,10 +457,7 @@ const NotificationList: React.FC = () => {
         permissions?.project_role,
         'manage_notifications',
     );
-    const filters = useMemo(
-        () => buildNotificationFilters(canManageNotifications),
-        [canManageNotifications],
-    );
+    const filters = useMemo(() => buildNotificationFilters(), []);
 
     return (
         <List
