@@ -35,7 +35,7 @@ flowchart LR
         PG["PostgreSQL\nbusiness state + audit + events"]
         Redis["Redis\nlimits + leases + runtime control"]
         Search["OpenSearch\nrebuildable ACL-filtered index"]
-        Objects["Object storage\nsource files + attachments"]
+        Objects["Private object storage\nlocal filesystem or S3-compatible"]
         Outbox["Outbox delivery workers"]
     end
 
@@ -155,8 +155,17 @@ portion of these rules.
   that boundary without becoming an Agent machine contract.
 - Project membership/grant checks and PostgreSQL RLS independently prevent
   cross-project reads and writes.
-- Attachment content is size-limited, hashed, scan-state gated, and authorized
-  on download.
+- Attachment and authored-knowledge objects use one private storage Interface:
+  local filesystem is the default and S3-compatible storage is an operator
+  choice. Logical keys, hashes, MIME metadata, scan state, and Project scope
+  stay authoritative in PostgreSQL; callers never receive bucket credentials
+  or durable public object URLs.
+- Attachment content is size-limited, content-sniffed, hashed, scan-state
+  gated, and authorized on download. Browser preview is explicit, bounded, and
+  fail-closed by type; parsing or conversion belongs in an isolated Worker.
+- Knowledge publication is Human-gated. Service Principals can search
+  authorized published sections and submit attributable drafts, but no machine
+  Adapter exposes a publication command.
 - User-controlled content is data, never instructions.
 - Runtime controls include global and per-principal read-only/emergency stops,
   rate/concurrency limits, and loop detection.

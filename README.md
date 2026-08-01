@@ -19,8 +19,10 @@ and external Connections.
 The project is a single-organization, self-hosted modular monolith. It does not
 ship an in-process model runtime, prompt-authoring platform, or autonomous
 planner. It does include project-scoped knowledge lifecycle, ACL-filtered
-hybrid retrieval, citations, feedback, and model-policy foundations that connect
-to deployment-owned search and model gateways.
+hybrid retrieval, ticket/attachment provenance, Human-gated publication,
+citations, feedback, and model-policy foundations that connect to
+deployment-owned search and model gateways. Private objects use the local
+filesystem by default and can be routed to an S3-compatible store.
 
 ## Why ChronoDesk
 
@@ -104,8 +106,9 @@ Email / alert / human / external Agent creates a Ticket
 - ChronoDesk can coordinate exceptions produced by real-time control, clinical,
   trading, or other specialist systems, but it does not replace those systems
   or their professional decisions.
-- Multi-tenancy, billing, embedded model execution, production ingestion/object
-  storage/scanning workers, and outbound delegation are later phases.
+- Multi-tenancy, billing, embedded model execution, production
+  ingestion/scanning and document-conversion workers, and outbound delegation
+  are later phases.
 
 ### Organization, Project, and access boundaries
 
@@ -118,6 +121,10 @@ Project never inherits another Project's data or authority.
   `emergency_operator`, and `member`. They govern platform operations only.
 - Project roles are exactly `project_admin`, `manager`, `agent`, `requester`,
   and `observer`, and exist only on an active `ProjectMembership`.
+- A Project administrator may independently grant an ordinary Membership the
+  draft-only knowledge-contributor capability. It lets that Human create and
+  revise personally managed drafts, but never publish, change ACLs, model
+  policy, or indexes; administrators and managers retain those review gates.
 - These two closed role sets are independent and unordered: a platform role
   never grants a Project role or project access.
 - A Human JWT contains only its platform-role assertion. Every authenticated
