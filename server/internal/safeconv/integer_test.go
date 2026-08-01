@@ -59,16 +59,27 @@ func TestPositiveUintRejectsZeroAndOverflow(t *testing.T) {
 }
 
 func TestIntUsesNativeWidth(t *testing.T) {
-	got, err := Int(int64(math.MaxInt))
-	if err != nil {
-		t.Fatalf("Int(MaxInt) error = %v", err)
-	}
-	if got != math.MaxInt {
-		t.Fatalf("Int(MaxInt) = %d, want %d", got, int(math.MaxInt))
+	for _, boundary := range []int{math.MinInt, math.MaxInt} {
+		got, err := Int(int64(boundary))
+		if err != nil {
+			t.Fatalf("Int(%d) error = %v", boundary, err)
+		}
+		if got != boundary {
+			t.Fatalf("Int(%d) = %d", boundary, got)
+		}
 	}
 	if strconv.IntSize == 32 {
-		if _, err := Int(int64(math.MaxInt32) + 1); !errors.Is(err, ErrIntegerOutOfRange) {
-			t.Fatalf("Int(overflow) error = %v, want ErrIntegerOutOfRange", err)
+		for _, overflow := range []int64{
+			int64(math.MinInt32) - 1,
+			int64(math.MaxInt32) + 1,
+		} {
+			if _, err := Int(overflow); !errors.Is(err, ErrIntegerOutOfRange) {
+				t.Fatalf(
+					"Int(%d) error = %v, want ErrIntegerOutOfRange",
+					overflow,
+					err,
+				)
+			}
 		}
 	}
 }
