@@ -102,6 +102,7 @@ const KnowledgeManagementPage = () => {
     const canCreateDraft =
         canManage || permissions?.can_create_knowledge_drafts === true
     const [searchParams, setSearchParams] = useSearchParams()
+    const pendingSearchParams = useRef(searchParams)
     const desiredTab = requestedTab(searchParams.get('tab'))
     const tab: KnowledgeTab =
         (desiredTab === 'manage' && !canManage)
@@ -126,6 +127,10 @@ const KnowledgeManagementPage = () => {
     const [error, setError] = useState('')
     const directoryController = useRef<AbortController | null>(null)
     const directorySequence = useRef(0)
+
+    useEffect(() => {
+        pendingSearchParams.current = searchParams
+    }, [searchParams])
 
     const [searchResult, setSearchResult] =
         useState<KnowledgeSearchResult | null>(null)
@@ -153,7 +158,7 @@ const KnowledgeManagementPage = () => {
             query: string
         }>,
     ) => {
-        const next = new URLSearchParams(searchParams)
+        const next = new URLSearchParams(pendingSearchParams.current)
         if (updates.tab) next.set('tab', updates.tab)
         if (updates.page) next.set('page', String(updates.page))
         if (updates.pageSize) {
@@ -167,17 +172,19 @@ const KnowledgeManagementPage = () => {
             if (updates.query) next.set('q', updates.query)
             else next.delete('q')
         }
+        pendingSearchParams.current = next
         setSearchParams(next, { replace: true })
-    }, [searchParams, setSearchParams])
+    }, [setSearchParams])
 
     const closeCreate = useCallback(() => {
         setCreateOpen(false)
         setDraftArticle(undefined)
-        const next = new URLSearchParams(searchParams)
+        const next = new URLSearchParams(pendingSearchParams.current)
         next.delete('create')
         next.delete('source_ticket_id')
+        pendingSearchParams.current = next
         setSearchParams(next, { replace: true })
-    }, [searchParams, setSearchParams])
+    }, [setSearchParams])
 
     useEffect(() => {
         setQueryInput(query)

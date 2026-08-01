@@ -361,6 +361,7 @@ const AgentCollaborationWorkspace = () => {
     const { permissions } = usePermissions<AccessPermissions>()
     const notify = useNotify()
     const [searchParams, setSearchParams] = useSearchParams()
+    const pendingSearchParams = useRef(searchParams)
     const tab = validTab(searchParams.get('tab'))
         ? searchParams.get('tab') as CollaborationTab
         : 'runs'
@@ -395,6 +396,10 @@ const AgentCollaborationWorkspace = () => {
     const canTakeover =
         role === 'project_admin' || role === 'manager' || role === 'agent'
 
+    useEffect(() => {
+        pendingSearchParams.current = searchParams
+    }, [searchParams])
+
     const updateQuery = useCallback((
         updates: Partial<{
             tab: CollaborationTab
@@ -402,14 +407,17 @@ const AgentCollaborationWorkspace = () => {
             pageSize: number
         }>,
     ) => {
-        const next = new URLSearchParams(searchParams)
+        // React Router 的函数式 updater 仍读取渲染时的快照；先同步记录
+        // 待导航值，保证连续操作基于前一次尚未渲染的更新继续合并。
+        const next = new URLSearchParams(pendingSearchParams.current)
         if (updates.tab) next.set('tab', updates.tab)
         if (updates.page) next.set('page', String(updates.page))
         if (updates.pageSize) {
             next.set('page_size', String(updates.pageSize))
         }
+        pendingSearchParams.current = next
         setSearchParams(next, { replace: true })
-    }, [searchParams, setSearchParams])
+    }, [setSearchParams])
 
     const load = useCallback(async () => {
         requestController.current?.abort()
