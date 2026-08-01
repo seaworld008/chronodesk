@@ -27,6 +27,19 @@ export default tseslint.config(
         'error',
         { argsIgnorePattern: '^_', caughtErrors: 'none' },
       ],
+      'no-restricted-imports': [
+        'error',
+        {
+          paths: [
+            {
+              name: 'react-admin',
+              importNames: ['AutocompleteInput'],
+              message:
+                'MUI 9 下请统一使用 EnterpriseReferenceAutocompleteInput，确保远程搜索、原生 input ref、键盘和无障碍契约。',
+            },
+          ],
+        },
+      ],
       'no-useless-assignment': 'off',
       'preserve-caught-error': 'off',
     },
