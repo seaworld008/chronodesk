@@ -1,4 +1,5 @@
 import { test, expect, type Locator } from '@playwright/test';
+import { monitorBrowserHealth } from './helpers/browserAudit';
 import {
     authenticatePage,
     cleanupE2EData,
@@ -60,6 +61,7 @@ test.describe('Ticket Workflow', () => {
         page,
         request,
     }) => {
+        const browserHealth = monitorBrowserHealth(page);
         test.setTimeout(60_000);
         const title = `${E2E_MARKER}生命周期工单`;
         const description = `${E2E_MARKER}工单描述-用于E2E验证完整流程`;
@@ -71,6 +73,13 @@ test.describe('Ticket Workflow', () => {
             ticketListMain()
                 .getByRole('row')
                 .filter({ hasText: title });
+        const waitForFilteredTicketListResponse = () =>
+            page.waitForResponse((response) => {
+                const url = new URL(response.url());
+                return response.request().method() === 'GET'
+                    && url.pathname === ticketsPath
+                    && url.searchParams.get('search') === title;
+            });
         const waitForTicketList = async () => {
             await expect(page).toHaveURL(/#\/tickets(?:\?.*)?$/, {
                 timeout: 15_000,
@@ -80,11 +89,37 @@ test.describe('Ticket Workflow', () => {
             await expect(searchInput).toBeVisible({ timeout: 15_000 });
             return searchInput;
         };
+        const waitForTicketListSurface = async () => {
+            await expect(page).toHaveURL(/#\/tickets(?:\?.*)?$/, {
+                timeout: 15_000,
+            });
+            // React Admin 在无筛选且 total=0 时会用 empty 组件替换列表工具栏。
+            // 搜索框和“暂无工单”因此是互斥但同样完整的列表加载结果。
+            const loadedSurface = ticketListMain()
+                .getByPlaceholder('搜索工单')
+                .or(
+                    ticketListMain().getByRole('heading', {
+                        name: '暂无工单',
+                        exact: true,
+                    }),
+                );
+            await expect(loadedSurface).toBeVisible({ timeout: 15_000 });
+        };
         const openTicketFromList = async () => {
             await page.goto('/#/tickets');
             const searchInput = await waitForTicketList();
-            await searchInput.fill(title);
-            await searchInput.press('Enter');
+            if ((await searchInput.inputValue()) !== title) {
+                const filteredListResponse =
+                    waitForFilteredTicketListResponse();
+                await searchInput.fill(title);
+                await searchInput.press('Enter');
+                const response = await filteredListResponse;
+                expect(
+                    response.status(),
+                    `工单筛选请求失败：${await response.text()}`,
+                ).toBe(200);
+            }
+            await expect(searchInput).toHaveValue(title);
             await expect(ticketRow()).toBeVisible({ timeout: 10_000 });
         };
         const openTicketDetailFromList = async () => {
@@ -161,6 +196,18 @@ test.describe('Ticket Workflow', () => {
             .getByRole('option', { name: roleAccounts.agent.optionLabel })
             .click();
 
+        await page
+            .getByRole('tab', { name: '分类与类型', exact: true })
+            .click();
+        const categoryInput = page.getByRole('combobox', {
+            name: '工单类别',
+            exact: true,
+        });
+        await categoryInput.click();
+        await page
+            .getByRole('option', { name: '技术支持', exact: true })
+            .click();
+
         const create = page.waitForResponse(
             (response) =>
                 response.request().method() === 'POST' &&
@@ -173,6 +220,7 @@ test.describe('Ticket Workflow', () => {
             await createResponse.json(),
         );
         expect(typeof createdTicket.id).toBe('number');
+        expect(typeof createdTicket.category_id).toBe('number');
         trackE2EResource('tickets', createdTicket.id as number);
         await page.waitForURL(/#\/tickets\/\d+\/show/, { timeout: 15000 });
 
@@ -231,13 +279,25 @@ test.describe('Ticket Workflow', () => {
         ).toBe(200);
         untrackE2EResource('tickets', createdTicket.id as number);
 
-        // 删除后的 SPA 重定向与列表首次加载分别验证，避免把 React 懒加载
-        // 挂载时序误当成删除失败，同时仍要求规范列表路由可独立完整加载。
+        // 删除后的 SPA 重定向与规范列表路由独立加载分别验证。重新加载时先
+        // 等待真实目录请求，再接受有数据表或零数据空状态两种合法完成态。
         await expect(page).toHaveURL(/#\/tickets(?:\?.*)?$/, {
             timeout: 15_000,
         });
-        await page.goto('/#/tickets');
-        await waitForTicketList();
+        const canonicalListResponse = page.waitForResponse(
+            (response) =>
+                response.request().method() === 'GET' &&
+                new URL(response.url()).pathname === ticketsPath,
+        );
+        await page.reload();
+        const reloadedList = await canonicalListResponse;
+        expect(
+            reloadedList.status(),
+            `工单目录重新加载失败：${await reloadedList.text()}`,
+        ).toBe(200);
+        await waitForTicketListSurface();
+        await expect(ticketRow()).toHaveCount(0);
+        browserHealth.assertClean();
     });
 
     test('requester 通知筛选不加载平台用户管理接口', async ({ page, request }) => {
