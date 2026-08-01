@@ -70,7 +70,7 @@ def _validate_symbol(
             _fail(errors, f"{case_id}: Pytest 测试符号不存在：{path}::{symbol}")
     elif kind == "playwright":
         pattern = re.compile(
-            rf"\btest\s*\(\s*(['\"]){re.escape(symbol)}\1",
+            rf"\btest\s*\(\s*(['\"`]){re.escape(symbol)}\1",
             re.MULTILINE,
         )
         if not pattern.search(text):

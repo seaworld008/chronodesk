@@ -188,10 +188,10 @@ A2A-016	automated	go@server/internal/agentplatform/assignment_adapter_test.go::T
 UI-001	hybrid	playwright@web/e2e/tickets.spec.ts::should allow user to login;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-001	not_recorded
 UI-002	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-002	not_recorded
 UI-003	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-003	not_recorded
-UI-004	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-004 UI-006 UI-028：全部 15 张现存企业表用真实数据验证实际单行布局，平台用户详情不投影项目工单;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-004	not_recorded
-UI-005	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-005 UI-026：全部 15 张现存表的键盘列宽可持久化且双击复位也持久化;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-005	not_recorded
-UI-006	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-004 UI-006 UI-028：全部 15 张现存企业表用真实数据验证实际单行布局，平台用户详情不投影项目工单;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-006	not_recorded
-UI-007	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-007 UI-029：窄视口横向滚动后 sticky 右操作列仍贴边、命中且按钮有名称;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-007	not_recorded
+UI-004	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-004 UI-006：${target.name}使用真实数据验证实际单行布局;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-004	not_recorded
+UI-005	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-005 UI-026：${target.name}键盘列宽可持久化且双击复位也持久化;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-005	not_recorded
+UI-006	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-004 UI-006：${target.name}使用真实数据验证实际单行布局;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-006	not_recorded
+UI-007	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-007 UI-029：${target.name}窄视口 sticky 右操作列仍贴边、命中且按钮有名称;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-007	not_recorded
 UI-008	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-008	not_recorded
 UI-009	hybrid	playwright@web/e2e/tickets.spec.ts::should view ticket details;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-009	not_recorded
 UI-010	hybrid	playwright@web/e2e/ticket-workflow.spec.ts::should create assign resolve close and delete ticket;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-010	not_recorded
@@ -210,9 +210,9 @@ UI-022	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-022
 UI-023	hybrid	playwright@web/e2e/trusted-devices.spec.ts::AUTH-019 AUTH-022 UI-023：可信设备仅使用 HttpOnly Cookie 并可撤销;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-023	not_recorded
 UI-024	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-024	not_recorded
 UI-025	hybrid	playwright@web/e2e/00-site-health.spec.ts::UI-025 UI-030 UI-031：页面健康、中文反馈与无障碍门禁;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-025	not_recorded
-UI-026	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-005 UI-026：全部 15 张现存表的键盘列宽可持久化且双击复位也持久化;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-026	not_recorded
+UI-026	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-005 UI-026：${target.name}键盘列宽可持久化且双击复位也持久化;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-026	not_recorded
 UI-027	release_manual	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-027	not_recorded
-UI-028	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-004 UI-006 UI-028：全部 15 张现存企业表用真实数据验证实际单行布局，平台用户详情不投影项目工单;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-028	not_recorded
+UI-028	hybrid	playwright@web/e2e/01-enterprise-tables.spec.ts::UI-028：平台用户详情不投影项目工单;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-028	not_recorded
 UI-029	fault_injection	chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-029	not_recorded
 UI-030	hybrid	playwright@web/e2e/00-site-health.spec.ts::UI-025 UI-030 UI-031：页面健康、中文反馈与无障碍门禁;chrome@docs/testing/RELEASE_EVIDENCE_PROCEDURES.md::UI-030	not_recorded
 UI-031	automated	playwright@web/e2e/00-site-health.spec.ts::UI-025 UI-030 UI-031：页面健康、中文反馈与无障碍门禁	not_recorded
