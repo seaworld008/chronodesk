@@ -2,12 +2,16 @@ package middleware
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/seaworld008/chronodesk/server/internal/models"
@@ -42,6 +46,44 @@ func GetCurrentUserID(c *gin.Context) (uint, bool) {
 	return id, true
 }
 
+const adminAuditRecordIDContextKey = "admin_audit_record_id"
+const adminAuditOutcomeContextKey = "admin_audit_operation_outcome"
+
+type adminAuditOperationOutcome struct {
+	result string
+	notes  string
+}
+
+// GetCurrentAdminAuditRecordID returns the durable pre-write anchor created by
+// LogAdminOperation for the current request. Export creation uses this exact
+// row as an exclusive upper bound, so the export cannot recursively include
+// its own creation/status/download audit records.
+func GetCurrentAdminAuditRecordID(c *gin.Context) (uint, bool) {
+	value, exists := c.Get(adminAuditRecordIDContextKey)
+	if !exists {
+		return 0, false
+	}
+	id, ok := value.(uint)
+	return id, ok && id > 0
+}
+
+// SetAdminAuditOperationOutcome lets a streaming handler report completion
+// after headers have already been written. Values are a closed internal
+// vocabulary; raw transport/storage errors must never be supplied as notes.
+func SetAdminAuditOperationOutcome(
+	c *gin.Context,
+	result string,
+	notes string,
+) {
+	if c == nil || (result != "success" && result != "error") {
+		return
+	}
+	c.Set(adminAuditOutcomeContextKey, adminAuditOperationOutcome{
+		result: result,
+		notes:  notes,
+	})
+}
+
 // LogAdminOperation 记录管理员操作日志的中间件
 func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -49,6 +91,29 @@ func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.Han
 		path := c.Request.URL.Path
 		if !isImportantAdminOperation(method, path) {
 			c.Next()
+			return
+		}
+		metadata, ok, metadataErr := adminAuditMetadataForRoute(
+			strings.ToUpper(method),
+			c.FullPath(),
+			c.Params,
+		)
+		if errors.Is(
+			metadataErr,
+			services.ErrInvalidSystemConfigKey,
+		) {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"message": services.ErrInvalidSystemConfigKey.Error(),
+				"error":   "invalid_config_key",
+			})
+			return
+		}
+		if metadataErr != nil || !ok {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"code": 1,
+				"msg":  "管理员审计操作映射不可用",
+			})
 			return
 		}
 		if auditService == nil {
@@ -74,17 +139,24 @@ func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.Han
 
 		action := fmt.Sprintf("%s %s", strings.ToUpper(method), path)
 		record := &services.AdminAuditRecord{
-			UserID:       userIDPtr,
-			PlatformRole: platformRole,
-			Action:       action,
-			Method:       method,
-			Path:         path,
-			StatusCode:   0,
-			ClientIP:     clientIP,
-			UserAgent:    userAgent,
-			Query:        query,
-			Result:       "pending",
-			Notes:        "管理员写操作已进入执行阶段",
+			Actor:            models.HumanActor(userID),
+			UserID:           userIDPtr,
+			PlatformRole:     platformRole,
+			Action:           action,
+			ActionCode:       metadata.ActionCode,
+			ResourceType:     metadata.ResourceType,
+			ResourcePublicID: metadata.ResourcePublicID,
+			Method:           method,
+			Path:             path,
+			RequestID:        c.GetString("request_id"),
+			TraceID:          TraceID(c),
+			CorrelationID:    CorrelationID(c),
+			StatusCode:       0,
+			ClientIP:         clientIP,
+			UserAgent:        userAgent,
+			Query:            query,
+			Result:           "pending",
+			Notes:            "管理员写操作已进入执行阶段",
 		}
 
 		if err := auditService.Record(c.Request.Context(), record); err != nil {
@@ -94,6 +166,7 @@ func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.Han
 			})
 			return
 		}
+		c.Set(adminAuditRecordIDContextKey, record.ID)
 
 		completed := false
 		defer func() {
@@ -107,6 +180,12 @@ func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.Han
 				record.Notes = "管理员写操作异常终止"
 			} else if record.StatusCode >= http.StatusBadRequest {
 				record.Result = "error"
+			}
+			if value, exists := c.Get(adminAuditOutcomeContextKey); exists {
+				if outcome, ok := value.(adminAuditOperationOutcome); ok {
+					record.Result = outcome.result
+					record.Notes = outcome.notes
+				}
 			}
 
 			finalizeContext, cancel := context.WithTimeout(
@@ -125,10 +204,182 @@ func LogAdminOperation(auditService services.AdminAuditServiceInterface) gin.Han
 	}
 }
 
+type adminAuditMetadata struct {
+	ActionCode       string
+	ResourceType     string
+	ResourcePublicID string
+}
+
+type adminAuditRouteMetadata struct {
+	actionCode    string
+	resourceType  string
+	publicIDParam string
+	fixedPublicID string
+}
+
+var adminAuditRouteMetadataByOperation = map[string]adminAuditRouteMetadata{
+	"PUT /api/platform/emergency-controls": {
+		"platform.emergency_controls.update",
+		"emergency_controls",
+		"",
+		"global",
+	},
+	"POST /api/platform/audit-exports": {
+		"platform.audit_export.create", "audit_export", "", "new",
+	},
+	"GET /api/platform/audit-exports/:publicID": {
+		"platform.audit_export.status", "audit_export", "publicID", "",
+	},
+	"GET /api/platform/audit-exports/:publicID/download": {
+		"platform.audit_export.download", "audit_export", "publicID", "",
+	},
+	"POST /api/platform/projects": {
+		"platform.project.create", "project", "", "new",
+	},
+	"POST /api/platform/projects/:projectPublicID/archive": {
+		"platform.project.archive", "project", "projectPublicID", "",
+	},
+	"PUT /api/platform/email-config": {
+		"platform.email_config.update", "email_config", "", "global",
+	},
+	"POST /api/platform/email-config/test": {
+		"platform.email_config.test", "email_config", "", "global",
+	},
+	"POST /api/platform/users": {
+		"platform.user.create", "user", "", "new",
+	},
+	"PUT /api/platform/users/:id": {
+		"platform.user.update", "user", "id", "",
+	},
+	"DELETE /api/platform/users/:id": {
+		"platform.user.delete", "user", "id", "",
+	},
+	"POST /api/platform/users/:id/reset-password": {
+		"platform.user.reset_password", "user", "id", "",
+	},
+	"PUT /api/platform/system/cleanup/config": {
+		"platform.cleanup_config.update", "cleanup_config", "", "global",
+	},
+	"POST /api/platform/system/cleanup/execute": {
+		"platform.cleanup.execute", "cleanup_job", "", "requested",
+	},
+	"POST /api/platform/system/cleanup/execute-all": {
+		"platform.cleanup.execute_all", "cleanup_job", "", "all",
+	},
+	"POST /api/platform/configs": {
+		"platform.config.create", "system_config", "", "new",
+	},
+	"PUT /api/platform/configs/:key": {
+		"platform.config.update", "system_config", "key", "",
+	},
+	"DELETE /api/platform/configs/:key": {
+		"platform.config.delete", "system_config", "key", "",
+	},
+	"PUT /api/platform/configs/batch": {
+		"platform.config.batch_update", "system_config", "", "batch",
+	},
+	"POST /api/platform/configs/import": {
+		"platform.config.import", "system_config", "", "import",
+	},
+	"POST /api/platform/configs/init": {
+		"platform.config.initialize", "system_config", "", "defaults",
+	},
+	"POST /api/projects/:projectKey/admin/agents/service-principals": {
+		"project.agent.service_principal.create",
+		"service_principal",
+		"",
+		"new",
+	},
+	"PUT /api/projects/:projectKey/admin/agents/service-principals/:id/status": {
+		"project.agent.service_principal.update_status",
+		"service_principal",
+		"id",
+		"",
+	},
+	"POST /api/projects/:projectKey/admin/agents/service-principals/:id/credentials/rotate": {
+		"project.agent.credential.rotate", "service_principal", "id", "",
+	},
+	"DELETE /api/projects/:projectKey/admin/agents/service-principals/:id/credentials/:credential_id": {
+		"project.agent.credential.revoke", "agent_credential", "credential_id", "",
+	},
+	"POST /api/projects/:projectKey/admin/agents/service-principals/:id/policies": {
+		"project.agent.policy.create", "service_principal", "id", "",
+	},
+	"DELETE /api/projects/:projectKey/admin/agents/service-principals/:id/policies/:policy_id": {
+		"project.agent.policy.disable", "agent_policy", "policy_id", "",
+	},
+	"POST /api/projects/:projectKey/admin/agents/leases/:id/force-release": {
+		"project.agent.lease.force_release", "ticket_lease", "id", "",
+	},
+	"POST /api/projects/:projectKey/admin/agents/attachments/:id/scan": {
+		"project.agent.attachment.scan", "ticket_attachment", "id", "",
+	},
+	"POST /api/projects/:projectKey/admin/agents/outbox/:id/replay": {
+		"project.agent.outbox.replay", "outbox_delivery", "id", "",
+	},
+}
+
+func adminAuditMetadataForRoute(
+	method string,
+	routeTemplate string,
+	params gin.Params,
+) (adminAuditMetadata, bool, error) {
+	operation := strings.TrimSpace(method) + " " +
+		strings.TrimSpace(routeTemplate)
+	config, ok := adminAuditRouteMetadataByOperation[operation]
+	if !ok {
+		return adminAuditMetadata{}, false, nil
+	}
+	publicID := config.fixedPublicID
+	if config.publicIDParam != "" {
+		rawPublicID := params.ByName(config.publicIDParam)
+		if config.resourceType == "system_config" &&
+			config.publicIDParam == "key" {
+			if err := services.ValidateSystemConfigKey(rawPublicID); err != nil {
+				return adminAuditMetadata{}, true, err
+			}
+			publicID = rawPublicID
+		} else {
+			publicID = boundedAdminAuditResourceID(rawPublicID)
+		}
+		if publicID == "" {
+			return adminAuditMetadata{}, false, nil
+		}
+	}
+	return adminAuditMetadata{
+		ActionCode:       config.actionCode,
+		ResourceType:     config.resourceType,
+		ResourcePublicID: publicID,
+	}, true, nil
+}
+
+func boundedAdminAuditResourceID(value string) string {
+	if value == "" || strings.TrimSpace(value) == "" {
+		return ""
+	}
+	if len(value) > 512 || !utf8.ValidString(value) ||
+		utf8.RuneCountInString(value) > 128 {
+		return digestAdminAuditResourceID(value)
+	}
+	for _, char := range value {
+		if unicode.IsControl(char) {
+			return digestAdminAuditResourceID(value)
+		}
+	}
+	return value
+}
+
+func digestAdminAuditResourceID(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("sha256:%x", digest)
+}
+
 // isImportantAdminOperation 判断是否为重要的管理操作
 func isImportantAdminOperation(method, path string) bool {
 	switch strings.ToUpper(strings.TrimSpace(method)) {
-	case http.MethodGet, http.MethodHead, http.MethodOptions:
+	case http.MethodGet:
+		return isPathWithin(path, "/api/platform/audit-exports")
+	case http.MethodHead, http.MethodOptions:
 		return false
 	}
 

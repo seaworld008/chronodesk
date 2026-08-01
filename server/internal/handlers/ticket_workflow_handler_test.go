@@ -93,6 +93,7 @@ func setupWorkflowHandlerTest(
 	db := openHandlerTestDB(t)
 	if err := db.AutoMigrate(
 		&models.User{},
+		&models.Category{},
 		&models.Ticket{},
 		&models.TicketComment{},
 		&models.TicketHistory{},
@@ -480,6 +481,11 @@ func TestCustomerHistoryUsesVisibleNarrowDTO(t *testing.T) {
 	if err := db.Model(&models.TicketHistory{}).
 		Where("ticket_id = ? AND description = ?", ticket.ID, hidden.Description).
 		UpdateColumn("is_visible", false).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.TicketHistory{}).
+		Where("id = ?", visible.ID).
+		UpdateColumn("field_name", nil).Error; err != nil {
 		t.Fatal(err)
 	}
 

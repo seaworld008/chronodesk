@@ -5,8 +5,8 @@ import "testing"
 func TestSupportedScopesAreUniqueAndDescribed(t *testing.T) {
 	scopes := SupportedScopes()
 	descriptions := ScopeDescriptions()
-	if len(scopes) != 10 {
-		t.Fatalf("supported scopes = %d, want 10", len(scopes))
+	if len(scopes) != 12 {
+		t.Fatalf("supported scopes = %d, want 12", len(scopes))
 	}
 	seen := make(map[string]struct{}, len(scopes))
 	for _, scope := range scopes {
@@ -20,6 +20,11 @@ func TestSupportedScopesAreUniqueAndDescribed(t *testing.T) {
 	}
 	if len(descriptions) != len(scopes) {
 		t.Errorf("scope descriptions = %d, want %d", len(descriptions), len(scopes))
+	}
+	for _, scope := range []string{ScopeKnowledgeRead, ScopeKnowledgeWrite} {
+		if _, ok := seen[scope]; !ok {
+			t.Errorf("knowledge scope %q is not discoverable", scope)
+		}
 	}
 }
 

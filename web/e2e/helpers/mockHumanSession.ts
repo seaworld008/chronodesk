@@ -74,9 +74,12 @@ export const defaultMockIdentity: MockSessionIdentity = {
 export const authorizedProjectAccess = (
     project: AuthorizedProject,
     projectRole: ProjectRole,
+    canCreateKnowledgeDrafts =
+        projectRole === 'project_admin' || projectRole === 'manager',
 ): AuthorizedProjectAccess => ({
     project,
     project_role: projectRole,
+    can_create_knowledge_drafts: canCreateKnowledgeDrafts,
     scope: {
         organization_id: project.organization_id,
         project_id: project.id,

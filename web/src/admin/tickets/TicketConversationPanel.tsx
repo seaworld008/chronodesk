@@ -1,4 +1,12 @@
-import { FormEvent, useCallback, useEffect, useState } from 'react'
+import {
+    FormEvent,
+    lazy,
+    Suspense,
+    useCallback,
+    useEffect,
+    useRef,
+    useState,
+} from 'react'
 import {
     Alert,
     Box,
@@ -14,6 +22,8 @@ import {
     ListItem,
     ListItemText,
     MenuItem,
+    Pagination,
+    Paper,
     Select,
     Stack,
     TextField,
@@ -23,6 +33,7 @@ import {
     AttachFile as AttachFileIcon,
     CloudDownload as DownloadIcon,
     Send as SendIcon,
+    Visibility as PreviewIcon,
 } from '@mui/icons-material'
 import {
     useGetIdentity,
@@ -49,8 +60,19 @@ import {
     canWritePublicTicketContent,
     type TicketRolePermissions,
 } from './ticketAccess'
+import {
+    LatestRequestGate,
+    lastPageAfterAppend,
+} from './pagedRequestGate'
+import { getAttachmentPreviewDecision } from './attachmentPreviewPolicy'
 
 const apiBase = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
+
+const AttachmentPreviewDialog = lazy(() =>
+    import('./AttachmentPreviewDialog').then((module) => ({
+        default: module.AttachmentPreviewDialog,
+    })),
+)
 
 const authHeaders = (contentType?: string) => {
     const headers = new Headers({ Accept: 'application/json' })
@@ -82,6 +104,26 @@ const listPayload = <T,>(payload: unknown): T[] => {
     }
     return []
 }
+
+const pagePayload = <T,>(payload: unknown) => {
+    const items = listPayload<T>(payload)
+    if (!payload || typeof payload !== 'object') {
+        return { items, total: items.length, totalPages: items.length > 0 ? 1 : 0 }
+    }
+    const total = 'total' in payload && typeof payload.total === 'number'
+        ? payload.total
+        : items.length
+    const totalPages = 'total_pages' in payload && typeof payload.total_pages === 'number'
+        ? payload.total_pages
+        : total > 0 ? 1 : 0
+    return { items, total, totalPages }
+}
+
+const pagedURL = (path: string, page: number, pageSize = 25) =>
+    `${joinApiUrl(apiBase, path)}?${new URLSearchParams({
+        page: String(page),
+        page_size: String(pageSize),
+    })}`
 
 const operationResourceVersion = (
     response: Response,
@@ -137,6 +179,30 @@ const scanLabel = {
     error: '扫描失败',
 }
 
+type ReplyPageState = {
+    items: TicketComment[]
+    page: number
+    total: number
+    totalPages: number
+    loading: boolean
+    error: string
+}
+
+const visibilityAdjustedPageMeta = (
+    rawItemCount: number,
+    visibleItemCount: number,
+    total: number,
+    totalPages: number,
+) => {
+    if (rawItemCount === visibleItemCount) {
+        return { total, totalPages }
+    }
+    return {
+        total: visibleItemCount,
+        totalPages: visibleItemCount > 0 ? 1 : 0,
+    }
+}
+
 export const TicketConversationPanel = () => {
     const ticket = useRecordContext<Ticket>()
     const notify = useNotify()
@@ -144,71 +210,224 @@ export const TicketConversationPanel = () => {
     const { identity } = useGetIdentity()
     const [comments, setComments] = useState<TicketComment[]>([])
     const [attachments, setAttachments] = useState<TicketAttachment[]>([])
-    const [loading, setLoading] = useState(true)
-    const [error, setError] = useState('')
+    const [commentsPage, setCommentsPage] = useState(1)
+    const [commentsTotal, setCommentsTotal] = useState(0)
+    const [commentsTotalPages, setCommentsTotalPages] = useState(0)
+    const [attachmentsPage, setAttachmentsPage] = useState(1)
+    const [attachmentsTotal, setAttachmentsTotal] = useState(0)
+    const [attachmentsTotalPages, setAttachmentsTotalPages] = useState(0)
+    const [replyPages, setReplyPages] = useState<Record<number, ReplyPageState>>({})
+    const [commentsLoading, setCommentsLoading] = useState(true)
+    const [commentsError, setCommentsError] = useState('')
+    const [attachmentsLoading, setAttachmentsLoading] = useState(true)
+    const [attachmentsError, setAttachmentsError] = useState('')
     const [comment, setComment] = useState('')
     const [commentType, setCommentType] = useState<'public' | 'internal'>('public')
     const [commentSubmitting, setCommentSubmitting] = useState(false)
     const [file, setFile] = useState<File>()
     const [attachmentPublic, setAttachmentPublic] = useState(false)
     const [attachmentSubmitting, setAttachmentSubmitting] = useState(false)
+    const [previewAttachment, setPreviewAttachment] =
+        useState<TicketAttachment | null>(null)
     const [resourceVersion, setResourceVersion] = useState(ticket?.version ?? 0)
+    const commentsGate = useRef(new LatestRequestGate())
+    const attachmentsGate = useRef(new LatestRequestGate())
+    const replyGates = useRef(new Map<number, LatestRequestGate>())
 
     useEffect(() => {
         setResourceVersion(ticket?.version ?? 0)
     }, [ticket?.id, ticket?.version])
 
-    const loadConversation = useCallback(async () => {
+    const loadComments = useCallback(async () => {
         if (!ticket?.id) return
-        setLoading(true)
-        setError('')
+        const request = commentsGate.current.start()
+        setCommentsLoading(true)
+        setCommentsError('')
         try {
-            const pathParameters = {
+            const response = await sessionAwareFetch(
+                pagedURL(
+                    humanApiRoutes.listProjectTicketComments({
+                        projectKey: await resolveActiveProjectKey(),
+                        ticketID: Number(ticket.id),
+                    }),
+                    commentsPage,
+                ),
+                { headers: authHeaders(), signal: request.signal },
+            )
+            if (!response.ok) {
+                throw new Error(
+                    await responseMessage(response, '加载评论失败'),
+                )
+            }
+            const page = pagePayload<TicketComment>(await response.json())
+            if (!commentsGate.current.isCurrent(request.token)) return
+            setComments(page.items)
+            setCommentsTotal(page.total)
+            setCommentsTotalPages(page.totalPages)
+        } catch (loadError) {
+            if (!commentsGate.current.isCurrent(request.token)) return
+            setCommentsError(
+                localizedUnknownErrorMessage(loadError, '加载评论失败'),
+            )
+        } finally {
+            if (commentsGate.current.isCurrent(request.token)) {
+                setCommentsLoading(false)
+            }
+        }
+    }, [commentsPage, ticket?.id])
+
+    const loadAttachments = useCallback(async () => {
+        if (!ticket?.id) return
+        const request = attachmentsGate.current.start()
+        setAttachmentsLoading(true)
+        setAttachmentsError('')
+        try {
+            const response = await sessionAwareFetch(
+                pagedURL(
+                    humanApiRoutes.listProjectTicketAttachments({
+                        projectKey: await resolveActiveProjectKey(),
+                        ticketID: Number(ticket.id),
+                    }),
+                    attachmentsPage,
+                ),
+                { headers: authHeaders(), signal: request.signal },
+            )
+            if (!response.ok) {
+                throw new Error(
+                    await responseMessage(response, '加载附件失败'),
+                )
+            }
+            const page = pagePayload<TicketAttachment>(await response.json())
+            if (!attachmentsGate.current.isCurrent(request.token)) return
+            setAttachments(page.items)
+            setAttachmentsTotal(page.total)
+            setAttachmentsTotalPages(page.totalPages)
+        } catch (loadError) {
+            if (!attachmentsGate.current.isCurrent(request.token)) return
+            setAttachmentsError(
+                localizedUnknownErrorMessage(loadError, '加载附件失败'),
+            )
+        } finally {
+            if (attachmentsGate.current.isCurrent(request.token)) {
+                setAttachmentsLoading(false)
+            }
+        }
+    }, [attachmentsPage, ticket?.id])
+
+    useEffect(() => {
+        void loadComments()
+    }, [loadComments])
+
+    useEffect(() => {
+        void loadAttachments()
+    }, [loadAttachments])
+
+    useEffect(() => {
+        setCommentsPage(1)
+        setAttachmentsPage(1)
+        setReplyPages({})
+        setPreviewAttachment(null)
+    }, [ticket?.id])
+
+    useEffect(() => () => {
+        commentsGate.current.abort()
+        attachmentsGate.current.abort()
+        for (const gate of replyGates.current.values()) {
+            gate.abort()
+        }
+        replyGates.current.clear()
+    }, [])
+
+    useEffect(() => {
+        for (const gate of replyGates.current.values()) {
+            gate.abort()
+        }
+        replyGates.current.clear()
+        setReplyPages({})
+    }, [commentsPage, ticket?.id])
+
+    const loadReplies = useCallback(async (commentID: number, page: number) => {
+        if (!ticket?.id) return
+        let gate = replyGates.current.get(commentID)
+        if (!gate) {
+            gate = new LatestRequestGate()
+            replyGates.current.set(commentID, gate)
+        }
+        const request = gate.start()
+        setReplyPages((current) => ({
+            ...current,
+            [commentID]: {
+                items: current[commentID]?.items ?? [],
+                page,
+                total: current[commentID]?.total ?? 0,
+                totalPages: current[commentID]?.totalPages ?? 0,
+                loading: true,
+                error: '',
+            },
+        }))
+        try {
+            const path = humanApiRoutes.listProjectTicketCommentReplies({
                 projectKey: await resolveActiveProjectKey(),
                 ticketID: Number(ticket.id),
+                commentID,
+            })
+            const response = await sessionAwareFetch(pagedURL(path, page), {
+                headers: authHeaders(),
+                signal: request.signal,
+            })
+            if (!response.ok) {
+                throw new Error(await responseMessage(response, '加载回复失败'))
             }
-            const [commentsResponse, attachmentsResponse] = await Promise.all([
-                sessionAwareFetch(
-                    joinApiUrl(
-                        apiBase,
-                        humanApiRoutes.listProjectTicketComments(pathParameters),
-                    ),
-                    { headers: authHeaders() },
-                ),
-                sessionAwareFetch(
-                    joinApiUrl(
-                        apiBase,
-                        humanApiRoutes.listProjectTicketAttachments(pathParameters),
-                    ),
-                    { headers: authHeaders() },
-                ),
-            ])
-            if (!commentsResponse.ok) {
-                throw new Error(
-                    await responseMessage(commentsResponse, '加载评论失败'),
-                )
-            }
-            if (!attachmentsResponse.ok) {
-                throw new Error(
-                    await responseMessage(attachmentsResponse, '加载附件失败'),
-                )
-            }
-            const [commentsPayload, attachmentsPayload] = await Promise.all([
-                commentsResponse.json(),
-                attachmentsResponse.json(),
-            ])
-            setComments(listPayload<TicketComment>(commentsPayload))
-            setAttachments(listPayload<TicketAttachment>(attachmentsPayload))
-        } catch (loadError) {
-            setError(localizedUnknownErrorMessage(loadError, '加载工单会话失败'))
-        } finally {
-            setLoading(false)
+            const payload = pagePayload<TicketComment>(await response.json())
+            if (!gate.isCurrent(request.token)) return
+            setReplyPages((current) => ({
+                ...current,
+                [commentID]: {
+                    items: payload.items,
+                    page,
+                    total: payload.total,
+                    totalPages: payload.totalPages,
+                    loading: false,
+                    error: '',
+                },
+            }))
+        } catch (replyError) {
+            if (!gate.isCurrent(request.token)) return
+            setReplyPages((current) => ({
+                ...current,
+                [commentID]: {
+                    items: current[commentID]?.items ?? [],
+                    page,
+                    total: current[commentID]?.total ?? 0,
+                    totalPages: current[commentID]?.totalPages ?? 0,
+                    loading: false,
+                    error: localizedUnknownErrorMessage(replyError, '加载回复失败'),
+                },
+            }))
         }
     }, [ticket?.id])
 
-    useEffect(() => {
-        void loadConversation()
-    }, [loadConversation])
+    const fetchAttachmentContent = useCallback(
+        async (attachment: TicketAttachment, signal: AbortSignal) => {
+            if (!ticket?.id) {
+                throw new Error('当前工单不可用，无法预览附件')
+            }
+            const attachmentPath =
+                humanApiRoutes.downloadProjectTicketAttachment({
+                    projectKey: await resolveActiveProjectKey(),
+                    ticketID: Number(ticket.id),
+                    attachmentID: attachment.id,
+                })
+            return sessionAwareFetch(
+                joinApiUrl(apiBase, attachmentPath),
+                {
+                    headers: authHeaders(),
+                    signal,
+                },
+            )
+        },
+        [ticket?.id],
+    )
 
     if (!ticket) {
         return null
@@ -229,7 +448,40 @@ export const TicketConversationPanel = () => {
     const visibleAttachments = canWriteInternal
         ? attachments
         : attachments.filter((attachment) => attachment.is_public)
-
+    const visibleCommentMeta = visibilityAdjustedPageMeta(
+        comments.length,
+        visibleComments.length,
+        commentsTotal,
+        commentsTotalPages,
+    )
+    const visibleAttachmentMeta = visibilityAdjustedPageMeta(
+        attachments.length,
+        visibleAttachments.length,
+        attachmentsTotal,
+        attachmentsTotalPages,
+    )
+    const visibleReplyPages = Object.fromEntries(
+        Object.entries(replyPages).map(([commentID, state]) => {
+            const items = canWriteInternal
+                ? state.items
+                : state.items.filter((reply) => reply.type !== 'internal')
+            const meta = visibilityAdjustedPageMeta(
+                state.items.length,
+                items.length,
+                state.total,
+                state.totalPages,
+            )
+            return [
+                commentID,
+                {
+                    ...state,
+                    items,
+                    total: meta.total,
+                    totalPages: meta.totalPages,
+                },
+            ]
+        }),
+    ) as Record<number, ReplyPageState>
     const submitComment = async (event: FormEvent) => {
         event.preventDefault()
         const content = comment.trim()
@@ -267,7 +519,12 @@ export const TicketConversationPanel = () => {
             }
             setComment('')
             notify('评论已添加', { type: 'success' })
-            await loadConversation()
+            const lastPage = lastPageAfterAppend(commentsTotal)
+            if (commentsPage === lastPage) {
+                await loadComments()
+            } else {
+                setCommentsPage(lastPage)
+            }
         } catch (submitError) {
             notify(
                 localizedUnknownErrorMessage(submitError, '添加评论失败'),
@@ -314,7 +571,11 @@ export const TicketConversationPanel = () => {
             }
             setFile(undefined)
             notify('附件已上传，等待安全扫描', { type: 'success' })
-            await loadConversation()
+            if (attachmentsPage === 1) {
+                await loadAttachments()
+            } else {
+                setAttachmentsPage(1)
+            }
         } catch (uploadError) {
             notify(
                 localizedUnknownErrorMessage(uploadError, '上传附件失败'),
@@ -416,15 +677,35 @@ export const TicketConversationPanel = () => {
                 <Alert severity="info">当前工单为只读，不能添加评论或上传附件。</Alert>
             )}
 
-            {error && <Alert severity="error">{error}</Alert>}
-            {loading ? (
+            {commentsError && (
+                <Alert
+                    severity="error"
+                    action={
+                        <Button
+                            color="inherit"
+                            size="small"
+                            onClick={() => void loadComments()}
+                        >
+                            重试
+                        </Button>
+                    }
+                >
+                    {commentsError}
+                </Alert>
+            )}
+            {commentsLoading ? (
                 <Box sx={{ display: 'flex', justifyContent: 'center', py: 3 }}>
-                    <CircularProgress size={28} />
+                    <CircularProgress
+                        size={28}
+                        aria-label="正在加载工单评论"
+                    />
                 </Box>
             ) : (
                 <Card variant="outlined" role="region" aria-label="工单评论记录">
                     <CardContent>
-                        <Typography variant="h6">评论记录</Typography>
+                        <Typography variant="h6">
+                            评论记录（{visibleCommentMeta.total}）
+                        </Typography>
                         {visibleComments.length === 0 ? (
                             <Typography color="text.secondary" sx={{ mt: 2 }}>
                                 暂无评论
@@ -476,13 +757,110 @@ export const TicketConversationPanel = () => {
                                                             {item.content}
                                                         </Box>
                                                         {new Date(item.created_at).toLocaleString('zh-CN')}
+                                                        {item.reply_count > 0 && (
+                                                            <Box component="span" sx={{ display: 'block', mt: 1 }}>
+                                                                <Button
+                                                                    size="small"
+                                                                    onClick={() => {
+                                                                        if (replyPages[item.id]) {
+                                                                            replyGates.current.get(item.id)?.abort()
+                                                                            replyGates.current.delete(item.id)
+                                                                            setReplyPages((current) => {
+                                                                                const next = { ...current }
+                                                                                delete next[item.id]
+                                                                                return next
+                                                                            })
+                                                                        } else {
+                                                                            void loadReplies(item.id, 1)
+                                                                        }
+                                                                    }}
+                                                                >
+                                                                    {replyPages[item.id]
+                                                                        ? '收起回复'
+                                                                        : canWriteInternal
+                                                                          ? `查看 ${item.reply_count} 条回复`
+                                                                          : '查看回复'}
+                                                                </Button>
+                                                            </Box>
+                                                        )}
                                                     </>
                                                 }
                                             />
                                         </ListItem>
+                                        {visibleReplyPages[item.id] && (
+                                            <Box sx={{ pl: { xs: 2, sm: 6 }, pb: 2 }}>
+                                                {visibleReplyPages[item.id].error ? (
+                                                    <Alert
+                                                        severity="error"
+                                                        action={
+                                                            <Button
+                                                                color="inherit"
+                                                                size="small"
+                                                                onClick={() =>
+                                                                    void loadReplies(
+                                                                        item.id,
+                                                                        visibleReplyPages[item.id].page,
+                                                                    )
+                                                                }
+                                                            >
+                                                                重试
+                                                            </Button>
+                                                        }
+                                                    >
+                                                        {visibleReplyPages[item.id].error}
+                                                    </Alert>
+                                                ) : visibleReplyPages[item.id].loading ? (
+                                                    <CircularProgress size={20} aria-label="正在加载回复" />
+                                                ) : visibleReplyPages[item.id].items.length === 0 ? (
+                                                    <Typography color="text.secondary">
+                                                        暂无可见回复
+                                                    </Typography>
+                                                ) : (
+                                                    <Stack spacing={1}>
+                                                        {visibleReplyPages[item.id].items.map((reply) => (
+                                                            <Paper
+                                                                key={reply.id}
+                                                                variant="outlined"
+                                                                sx={{ p: 1.5 }}
+                                                            >
+                                                                <Typography sx={{ fontWeight: 600 }}>
+                                                                    {actorName(reply)}
+                                                                </Typography>
+                                                                <Typography sx={{ whiteSpace: 'pre-wrap' }}>
+                                                                    {reply.content}
+                                                                </Typography>
+                                                                <Typography variant="caption" color="text.secondary">
+                                                                    {new Date(reply.created_at).toLocaleString('zh-CN')}
+                                                                </Typography>
+                                                            </Paper>
+                                                        ))}
+                                                        {visibleReplyPages[item.id].totalPages > 1 && (
+                                                            <Pagination
+                                                                page={visibleReplyPages[item.id].page}
+                                                                count={visibleReplyPages[item.id].totalPages}
+                                                                onChange={(_event, nextPage) =>
+                                                                    void loadReplies(item.id, nextPage)
+                                                                }
+                                                                size="small"
+                                                                aria-label={`评论 ${item.id} 的回复分页`}
+                                                            />
+                                                        )}
+                                                    </Stack>
+                                                )}
+                                            </Box>
+                                        )}
                                     </Box>
                                 ))}
                             </List>
+                        )}
+                        {visibleCommentMeta.totalPages > 1 && (
+                            <Pagination
+                                page={commentsPage}
+                                count={visibleCommentMeta.totalPages}
+                                onChange={(_event, page) => setCommentsPage(page)}
+                                sx={{ mt: 2 }}
+                                aria-label="评论分页"
+                            />
                         )}
                     </CardContent>
                 </Card>
@@ -491,7 +869,7 @@ export const TicketConversationPanel = () => {
             <Card variant="outlined" role="region" aria-label="工单附件">
                 <CardContent>
                     <Typography variant="h6" gutterBottom>
-                        附件
+                        附件（{visibleAttachmentMeta.total}）
                     </Typography>
                     <Stack spacing={2}>
                         {canWritePublic && <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
@@ -537,15 +915,83 @@ export const TicketConversationPanel = () => {
                             </Button>
                         </Stack>}
 
-                        {visibleAttachments.length === 0 ? (
+                        {attachmentsError && (
+                            <Alert
+                                severity="error"
+                                action={
+                                    <Button
+                                        color="inherit"
+                                        size="small"
+                                        onClick={() => void loadAttachments()}
+                                    >
+                                        重试
+                                    </Button>
+                                }
+                            >
+                                {attachmentsError}
+                            </Alert>
+                        )}
+                        {attachmentsLoading ? (
+                            <Box
+                                role="status"
+                                aria-label="正在加载工单附件"
+                                sx={{
+                                    display: 'flex',
+                                    justifyContent: 'center',
+                                    py: 3,
+                                }}
+                            >
+                                <CircularProgress size={24} />
+                            </Box>
+                        ) : attachmentsError ? null : visibleAttachments.length === 0 ? (
                             <Typography color="text.secondary">暂无附件</Typography>
                         ) : (
                             <List disablePadding>
-                                {visibleAttachments.map((attachment, index) => (
-                                    <Box key={attachment.id}>
+                                {visibleAttachments.map((attachment, index) => {
+                                    const previewDecision =
+                                        getAttachmentPreviewDecision(attachment)
+                                    return <Box key={attachment.id}>
                                         {index > 0 && <Divider />}
                                         <ListItem
-                                            secondaryAction={
+                                            sx={{
+                                                gap: 1,
+                                                alignItems: 'center',
+                                                flexWrap: { xs: 'wrap', sm: 'nowrap' },
+                                            }}
+                                        >
+                                            <ListItemText
+                                                sx={{
+                                                    minWidth: 0,
+                                                    flexBasis: { xs: '100%', sm: 'auto' },
+                                                }}
+                                                primary={attachment.original_name}
+                                                secondary={`${formatBytes(attachment.file_size)} · ${
+                                                    scanLabel[attachment.virus_scan]
+                                                } · ${attachment.is_public ? '公开' : '内部'}${
+                                                    attachment.hash
+                                                        ? ` · SHA-256 ${attachment.hash.slice(0, 12)}…`
+                                                        : ''
+                                                }${
+                                                    !previewDecision.eligible
+                                                        ? ` · ${previewDecision.reason}`
+                                                        : ''
+                                                }`}
+                                            />
+                                            <Stack
+                                                direction="row"
+                                                spacing={1}
+                                                sx={{ flexShrink: 0, ml: { sm: 'auto' } }}
+                                            >
+                                                <Button
+                                                    size="small"
+                                                    startIcon={<PreviewIcon />}
+                                                    disabled={!previewDecision.eligible}
+                                                    onClick={() =>
+                                                        setPreviewAttachment(attachment)
+                                                    }
+                                                >
+                                                    预览
+                                                </Button>
                                                 <Button
                                                     size="small"
                                                     startIcon={<DownloadIcon />}
@@ -554,26 +1000,42 @@ export const TicketConversationPanel = () => {
                                                 >
                                                     下载
                                                 </Button>
-                                            }
-                                        >
-                                            <ListItemText
-                                                primary={attachment.original_name}
-                                                secondary={`${formatBytes(attachment.file_size)} · ${
-                                                    scanLabel[attachment.virus_scan]
-                                                } · ${attachment.is_public ? '公开' : '内部'}${
-                                                    attachment.hash
-                                                        ? ` · SHA-256 ${attachment.hash.slice(0, 12)}…`
-                                                        : ''
-                                                }`}
-                                            />
+                                            </Stack>
                                         </ListItem>
                                     </Box>
-                                ))}
+                                })}
                             </List>
+                        )}
+                        {!attachmentsLoading &&
+                            !attachmentsError &&
+                            visibleAttachmentMeta.totalPages > 1 && (
+                            <Pagination
+                                page={attachmentsPage}
+                                count={visibleAttachmentMeta.totalPages}
+                                onChange={(_event, page) => setAttachmentsPage(page)}
+                                aria-label="附件分页"
+                            />
                         )}
                     </Stack>
                 </CardContent>
             </Card>
+            {previewAttachment && (
+                <Suspense
+                    fallback={
+                        <CircularProgress
+                            size={24}
+                            aria-label="正在打开附件预览"
+                        />
+                    }
+                >
+                    <AttachmentPreviewDialog
+                        open
+                        attachment={previewAttachment}
+                        fetchContent={fetchAttachmentContent}
+                        onClose={() => setPreviewAttachment(null)}
+                    />
+                </Suspense>
+            )}
         </Stack>
     )
 }

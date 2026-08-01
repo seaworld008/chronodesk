@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -38,25 +40,67 @@ type assigneeFilter struct {
 	Search string `json:"search"`
 }
 
+var assigneeListQuerySpec = directoryListQuerySpec{
+	DefaultSortBy:    "username",
+	DefaultSortOrder: "asc",
+	SortFields: map[string]struct{}{
+		"id":           {},
+		"username":     {},
+		"first_name":   {},
+		"last_name":    {},
+		"display_name": {},
+		"role":         {},
+	},
+	FilterFields: map[string]struct{}{
+		"filter": {},
+		"search": {},
+		"sort":   {},
+	},
+}
+
 func NewAssigneeHandler(db *gorm.DB) *AssigneeHandler {
 	return &AssigneeHandler{db: db}
 }
 
 func (h *AssigneeHandler) List(c *gin.Context) {
+	listQuery, err := parseDirectoryListQuery(
+		c.Request.URL.RawQuery,
+		assigneeListQuerySpec,
+	)
+	if err != nil {
+		writeInvalidAssigneeListQuery(c)
+		return
+	}
+	sortBy, sortOrder, err := assigneeListSort(listQuery)
+	if err != nil {
+		writeInvalidAssigneeListQuery(c)
+		return
+	}
+
 	if !canAssignTickets(normalizedProjectRole(c)) {
 		c.JSON(http.StatusOK, gin.H{
 			"code": 0,
-			"data": gin.H{"items": []assigneeResponse{}, "total": 0},
+			"data": gin.H{
+				"items":       []assigneeResponse{},
+				"total":       0,
+				"page":        listQuery.Page,
+				"page_size":   listQuery.PageSize,
+				"total_pages": 0,
+			},
 		})
 		return
 	}
 
 	var filter assigneeFilter
-	if rawFilter := strings.TrimSpace(c.Query("filter")); rawFilter != "" {
-		if err := json.Unmarshal([]byte(rawFilter), &filter); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"code": 1, "msg": "处理人筛选条件无效"})
+	if rawFilter, ok := listQuery.value("filter"); ok {
+		if err := decodeAssigneeListFilter(rawFilter, &filter); err != nil {
+			writeInvalidAssigneeListQuery(c)
 			return
 		}
+	}
+	if err := validateAssigneeListFilter(filter); err != nil {
+		writeInvalidAssigneeListQuery(c)
+		return
 	}
 
 	query, ok := h.assignableQuery(c)
@@ -68,14 +112,20 @@ func (h *AssigneeHandler) List(c *gin.Context) {
 		return
 	}
 	if len(filter.IDs) > 0 {
-		query = query.Where("id IN ?", filter.IDs)
+		query = query.Where("users.id IN ?", filter.IDs)
 	}
-	search := strings.TrimSpace(c.Query("search"))
-	if search == "" {
-		search = strings.TrimSpace(filter.Search)
+	search, directSearch := listQuery.value("search")
+	filterSearch, err := assigneeFilterSearch(filter)
+	if err != nil || directSearch && filterSearch != "" {
+		writeInvalidAssigneeListQuery(c)
+		return
 	}
-	if search == "" {
-		search = strings.TrimSpace(filter.Q)
+	if !directSearch {
+		search = filterSearch
+	}
+	if err := validateDirectorySearch(search); err != nil {
+		writeInvalidAssigneeListQuery(c)
+		return
 	}
 	if search != "" {
 		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(search)
@@ -96,13 +146,11 @@ func (h *AssigneeHandler) List(c *gin.Context) {
 		return
 	}
 
-	page := parsePositiveInt(c.Query("page"), 1, 1_000_000)
-	pageSize := parsePositiveInt(c.Query("page_size"), 25, 100)
 	var users []assignableUser
 	if err := query.
-		Order("username ASC, id ASC").
-		Limit(pageSize).
-		Offset((page - 1) * pageSize).
+		Order(assigneeOrderClause(sortBy, sortOrder)).
+		Limit(listQuery.PageSize).
+		Offset((listQuery.Page - 1) * listQuery.PageSize).
 		Find(&users).Error; err != nil {
 		logHandlerFailure(c, "assignee.list", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 1, "msg": "获取处理人列表失败"})
@@ -116,7 +164,13 @@ func (h *AssigneeHandler) List(c *gin.Context) {
 	c.Header("X-Total-Count", strconv.FormatInt(total, 10))
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
-		"data": gin.H{"items": items, "total": total},
+		"data": gin.H{
+			"items":       items,
+			"total":       total,
+			"page":        listQuery.Page,
+			"page_size":   listQuery.PageSize,
+			"total_pages": directoryTotalPages(total, listQuery.PageSize),
+		},
 	})
 }
 
@@ -192,4 +246,110 @@ func canAssignTickets(role string) bool {
 	default:
 		return false
 	}
+}
+
+func writeInvalidAssigneeListQuery(c *gin.Context) {
+	c.JSON(
+		http.StatusBadRequest,
+		gin.H{"code": 1, "msg": "处理人筛选条件无效"},
+	)
+}
+
+func decodeAssigneeListFilter(
+	raw string,
+	filter *assigneeFilter,
+) error {
+	if len(raw) > 8_192 || raw == "" || raw[0] != '{' {
+		return errInvalidDirectoryListQuery
+	}
+	decoder := json.NewDecoder(bytes.NewBufferString(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(filter); err != nil {
+		return errInvalidDirectoryListQuery
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errInvalidDirectoryListQuery
+	}
+	return nil
+}
+
+func validateAssigneeListFilter(filter assigneeFilter) error {
+	if len(filter.IDs) > 100 {
+		return errInvalidDirectoryListQuery
+	}
+	seen := make(map[uint]struct{}, len(filter.IDs))
+	for _, id := range filter.IDs {
+		if id == 0 {
+			return errInvalidDirectoryListQuery
+		}
+		if _, exists := seen[id]; exists {
+			return errInvalidDirectoryListQuery
+		}
+		seen[id] = struct{}{}
+	}
+	_, err := assigneeFilterSearch(filter)
+	return err
+}
+
+func assigneeFilterSearch(filter assigneeFilter) (string, error) {
+	if filter.Q != "" && filter.Search != "" {
+		return "", errInvalidDirectoryListQuery
+	}
+	search := filter.Search
+	if search == "" {
+		search = filter.Q
+	}
+	if err := validateDirectorySearch(search); err != nil {
+		return "", err
+	}
+	return search, nil
+}
+
+func assigneeListSort(
+	query directoryListQuery,
+) (string, string, error) {
+	legacySort, legacy := query.value("sort")
+	_, hasSortBy := query.value("sort_by")
+	_, hasSortOrder := query.value("sort_order")
+	if !legacy {
+		return query.SortBy, query.SortOrder, nil
+	}
+	if hasSortBy || hasSortOrder {
+		return "", "", errInvalidDirectoryListQuery
+	}
+	var values []string
+	decoder := json.NewDecoder(bytes.NewBufferString(legacySort))
+	if err := decoder.Decode(&values); err != nil || len(values) != 2 {
+		return "", "", errInvalidDirectoryListQuery
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return "", "", errInvalidDirectoryListQuery
+	}
+	if _, ok := assigneeListQuerySpec.SortFields[values[0]]; !ok {
+		return "", "", errInvalidDirectoryListQuery
+	}
+	order := strings.ToLower(values[1])
+	if order != "asc" && order != "desc" {
+		return "", "", errInvalidDirectoryListQuery
+	}
+	return values[0], order, nil
+}
+
+func assigneeOrderClause(sortBy, sortOrder string) string {
+	columns := map[string]string{
+		"id":           "users.id",
+		"username":     "users.username",
+		"first_name":   "users.first_name",
+		"last_name":    "users.last_name",
+		"display_name": "users.display_name",
+		"role":         "project_memberships.role",
+	}
+	order := "ASC"
+	if sortOrder == "desc" {
+		order = "DESC"
+	}
+	if sortBy == "id" {
+		return columns[sortBy] + " " + order
+	}
+	return columns[sortBy] + " " + order + ", users.id " + order
 }

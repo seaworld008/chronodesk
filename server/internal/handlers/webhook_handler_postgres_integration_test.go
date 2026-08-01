@@ -113,7 +113,7 @@ func TestPostgresWebhookStatsDateAndProjectIsolation(t *testing.T) {
 	})
 	request := httptest.NewRequest(
 		http.MethodGet,
-		"/webhooks/"+strconv.FormatUint(uint64(config.ID), 10)+"/stats?days=365",
+		"/webhooks/"+strconv.FormatUint(uint64(config.ID), 10)+"/stats?days=90",
 		nil,
 	)
 	recorder := httptest.NewRecorder()

@@ -1,6 +1,17 @@
 import * as React from 'react'
-import { Layout as RaLayout, LayoutProps } from 'react-admin'
-import { GlobalStyles, type Theme } from '@mui/material'
+import {
+  Layout as RaLayout,
+  Sidebar as RaSidebar,
+  useSidebarState,
+  type LayoutProps,
+  type SidebarProps,
+} from 'react-admin'
+import {
+  Drawer,
+  GlobalStyles,
+  useMediaQuery,
+  type Theme,
+} from '@mui/material'
 
 const resolveToolbarMinHeight = (theme: Theme): number => {
   const toolbar = theme.mixins.toolbar
@@ -18,6 +29,70 @@ const resolveToolbarMinHeight = (theme: Theme): number => {
   return 64
 }
 
+const ResponsiveSidebar: React.FC<SidebarProps> = ({
+  appBarAlwaysOn: _appBarAlwaysOn,
+  children,
+  closedSize: _closedSize,
+  size: _size,
+  ...props
+}) => {
+  const useTemporaryDrawer = useMediaQuery<Theme>((theme) =>
+    theme.breakpoints.down('md'),
+  )
+  const [open, setOpen] = useSidebarState()
+  const temporaryModeNormalized = React.useRef(false)
+
+  React.useEffect(() => {
+    if (useTemporaryDrawer && !temporaryModeNormalized.current) {
+      temporaryModeNormalized.current = true
+      setOpen(false)
+    } else if (!useTemporaryDrawer) {
+      temporaryModeNormalized.current = false
+    }
+  }, [setOpen, useTemporaryDrawer])
+  const temporaryOpen = temporaryModeNormalized.current ? open : false
+
+  if (!useTemporaryDrawer) {
+    return (
+      <RaSidebar
+        {...props}
+        appBarAlwaysOn={_appBarAlwaysOn}
+        closedSize={_closedSize}
+        size={_size}
+      >
+        {children}
+      </RaSidebar>
+    )
+  }
+
+  return (
+    <Drawer
+      {...props}
+      className={[
+        'ChronoDeskSidebar-temporary',
+        props.className,
+      ].filter(Boolean).join(' ')}
+      variant="temporary"
+      open={temporaryOpen}
+      onClose={() => setOpen(false)}
+      classes={{
+        root: 'RaSidebar-root',
+        paper: 'RaSidebar-paper',
+        modal: 'RaSidebar-modal',
+      }}
+      sx={{
+        '& .MuiDrawer-paper': {
+          bgcolor: 'background.paper',
+          boxSizing: 'border-box',
+          width: 240,
+        },
+      }}
+    >
+      {children}
+    </Drawer>
+  )
+}
+
 export const CustomLayout: React.FC<LayoutProps> = (props) => (
   <>
     <GlobalStyles
@@ -25,9 +100,20 @@ export const CustomLayout: React.FC<LayoutProps> = (props) => (
         const minHeightValue = resolveToolbarMinHeight(theme)
 
         return {
+          '.RaLayout-root': {
+            minWidth: 0,
+            maxWidth: '100%',
+            overflowX: 'clip',
+          },
+          '.RaLayout-appFrame': {
+            minWidth: 0,
+            maxWidth: '100%',
+            width: '100%',
+          },
           '.RaLayout-content, .RaLayout-contentWithSidebar': {
             maxWidth: 'none',
             minWidth: 0,
+            width: '100%',
           },
           '.RaLayout-contentWithSidebar': {
             position: 'relative',
@@ -40,6 +126,10 @@ export const CustomLayout: React.FC<LayoutProps> = (props) => (
             zIndex: theme.zIndex.drawer,
             flexShrink: 0,
           },
+          '.RaSidebar-root.ChronoDeskSidebar-temporary': {
+            position: 'fixed',
+            inset: 0,
+          },
           '.RaSidebar-fixed': {
             zIndex: theme.zIndex.drawer,
             width: 'inherit',
@@ -50,6 +140,8 @@ export const CustomLayout: React.FC<LayoutProps> = (props) => (
             overflowY: 'auto',
             overscrollBehavior: 'contain',
             scrollbarGutter: 'stable',
+            scrollPaddingBlock: theme.spacing(1),
+            paddingBottom: theme.spacing(1),
             backgroundColor: theme.palette.background.paper,
           },
           '.RaSidebar-paper, .RaSidebar-root .MuiDrawer-paper': {
@@ -59,6 +151,8 @@ export const CustomLayout: React.FC<LayoutProps> = (props) => (
             overflowY: 'auto',
             overscrollBehavior: 'contain',
             scrollbarGutter: 'stable',
+            scrollPaddingBlock: theme.spacing(1),
+            paddingBottom: theme.spacing(1),
           },
           '.RaLayout-content': {
             position: 'relative',
@@ -67,12 +161,13 @@ export const CustomLayout: React.FC<LayoutProps> = (props) => (
             display: 'flex',
             flexDirection: 'column',
             overflowX: 'hidden',
-            padding: theme.spacing(0),
+            padding: `${theme.spacing(0)} !important`,
+            boxSizing: 'border-box',
             backgroundColor: 'transparent',
           },
         }
       }}
     />
-    <RaLayout {...props} />
+    <RaLayout {...props} sidebar={ResponsiveSidebar} />
   </>
 )

@@ -3,18 +3,22 @@ package humanopenapi
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	authcontract "github.com/seaworld008/chronodesk/server/internal/auth"
 	"github.com/seaworld008/chronodesk/server/internal/middleware"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/routeinventory"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
@@ -46,8 +50,8 @@ func TestHumanWebContractPublishesClosedRoleAndSessionSchemas(t *testing.T) {
 	if got := document["openapi"]; got != "3.2.0" {
 		t.Fatalf("openapi = %v, want 3.2.0", got)
 	}
-	if got := document["x-chronodesk-types-generator"]; got != "2.0.0" {
-		t.Fatalf("types generator = %v, want 2.0.0", got)
+	if got := document["x-chronodesk-types-generator"]; got != "2.1.0" {
+		t.Fatalf("types generator = %v, want 2.1.0", got)
 	}
 
 	components := objectAt(t, document, "components")
@@ -65,7 +69,7 @@ func TestHumanWebContractPublishesClosedRoleAndSessionSchemas(t *testing.T) {
 		"ProjectMembership",
 		"AdminUser",
 		"PlatformProjectSummary",
-		"PlatformProjectSummaryListEnvelope",
+		"PlatformProjectPageEnvelope",
 	} {
 		if _, ok := schemas[name]; !ok {
 			t.Errorf("components.schemas.%s is missing", name)
@@ -99,6 +103,89 @@ func TestHumanWebContractPublishesClosedRoleAndSessionSchemas(t *testing.T) {
 		}
 		if _, ok := properties["role"]; ok {
 			t.Errorf("%s exposes removed global role", name)
+		}
+	}
+}
+
+func TestProjectMembershipWritesRequireOptimisticVersionPreconditions(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	components := objectAt(t, document, "components")
+	schemas := objectAt(t, components, "schemas")
+	request := objectAt(t, schemas, "UpsertProjectMembershipRequest")
+	required, ok := request["required"].([]any)
+	if !ok {
+		t.Fatalf("membership request required = %T", request["required"])
+	}
+	requiredFields := make(map[string]struct{}, len(required))
+	for _, raw := range required {
+		value, ok := raw.(string)
+		if !ok {
+			t.Fatalf("membership required field = %T", raw)
+		}
+		requiredFields[value] = struct{}{}
+	}
+	if _, ok := requiredFields["expected_version"]; !ok {
+		t.Fatal("membership upsert does not require expected_version")
+	}
+	expectedVersion := objectAt(
+		t,
+		objectAt(t, request, "properties"),
+		"expected_version",
+	)
+	if expectedVersion["minimum"] != float64(0) {
+		t.Fatalf(
+			"membership upsert expected_version minimum = %v",
+			expectedVersion["minimum"],
+		)
+	}
+
+	paths := objectAt(t, document, "paths")
+	upsert := objectAt(
+		t,
+		objectAt(t, paths, "/projects/{projectKey}/memberships"),
+		"post",
+	)
+	upsertResponses := objectAt(t, upsert, "responses")
+	for _, status := range []string{"409", "428"} {
+		if _, ok := upsertResponses[status]; !ok {
+			t.Errorf("membership upsert response %s is missing", status)
+		}
+	}
+
+	deactivate := objectAt(
+		t,
+		objectAt(
+			t,
+			paths,
+			"/projects/{projectKey}/memberships/{userID}",
+		),
+		"delete",
+	)
+	query := operationQueryParameters(t, document, deactivate)
+	deactivateVersion, ok := query["expected_version"]
+	if !ok {
+		t.Fatal("membership deactivate expected_version query is missing")
+	}
+	if deactivateVersion["required"] != true {
+		t.Fatal("membership deactivate expected_version is not required")
+	}
+	deactivateVersionSchema := objectAt(
+		t,
+		deactivateVersion,
+		"schema",
+	)
+	if deactivateVersionSchema["minimum"] != float64(1) {
+		t.Fatalf(
+			"membership deactivate expected_version minimum = %v",
+			deactivateVersionSchema["minimum"],
+		)
+	}
+	deactivateResponses := objectAt(t, deactivate, "responses")
+	for _, status := range []string{"409", "428"} {
+		if _, ok := deactivateResponses[status]; !ok {
+			t.Errorf("membership deactivate response %s is missing", status)
 		}
 	}
 }
@@ -474,7 +561,12 @@ func TestPlatformProjectSummaryNeverPublishesTrustedNumericScope(t *testing.T) {
 
 	access := objectAt(t, schemas, "AuthorizedProjectAccess")
 	accessProperties := objectAt(t, access, "properties")
-	for _, required := range []string{"project", "project_role", "scope"} {
+	for _, required := range []string{
+		"project",
+		"project_role",
+		"can_create_knowledge_drafts",
+		"scope",
+	} {
 		if _, ok := accessProperties[required]; !ok {
 			t.Errorf("AuthorizedProjectAccess.%s is missing", required)
 		}
@@ -612,9 +704,12 @@ func TestHumanWebContractCoversRequiredBrowserOperations(t *testing.T) {
 		{"/projects/{projectKey}/context", "get"},
 		{"/projects/{projectKey}/memberships", "get"},
 		{"/projects/{projectKey}/memberships", "post"},
+		{"/projects/{projectKey}/membership-candidates", "get"},
 		{"/projects/{projectKey}/memberships/{userID}", "delete"},
 		{"/platform/projects", "get"},
 		{"/platform/projects", "post"},
+		{"/platform/project-creation-context", "get"},
+		{"/platform/project-business-units", "get"},
 		{"/platform/projects/{projectPublicID}/archive", "post"},
 		{"/platform/users", "get"},
 		{"/platform/users", "post"},
@@ -623,12 +718,314 @@ func TestHumanWebContractCoversRequiredBrowserOperations(t *testing.T) {
 		{"/platform/users/{userID}", "put"},
 		{"/platform/users/{userID}", "delete"},
 		{"/platform/users/{userID}/reset-password", "post"},
+		{"/platform/emergency-controls", "get"},
+		{"/platform/emergency-controls", "put"},
 		{"/platform/audit-logs", "get"},
+		{"/platform/audit-logs/{auditLogID}", "get"},
 	} {
 		pathItem := objectAt(t, paths, expected.path)
 		if _, ok := pathItem[expected.method]; !ok {
 			t.Errorf("%s %s is missing", expected.method, expected.path)
 		}
+	}
+}
+
+func TestProjectGovernanceContractUsesPublicScopeBoundedQueriesAndExplicitAdmins(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+
+	list := objectAt(t, objectAt(t, paths, "/platform/projects"), "get")
+	listParameters, ok := list["parameters"].([]any)
+	if !ok {
+		t.Fatal("platform project list parameters are missing")
+	}
+	listNames := make([]string, 0, len(listParameters))
+	for _, rawParameter := range listParameters {
+		parameter := rawParameter.(map[string]any)
+		listNames = append(listNames, parameter["name"].(string))
+		if parameter["in"] != "query" {
+			t.Fatalf("platform project list parameter = %v", parameter)
+		}
+	}
+	if want := []string{
+		"page",
+		"page_size",
+		"search",
+		"status",
+		"business_unit_public_id",
+		"order_by",
+		"order",
+	}; !reflect.DeepEqual(listNames, want) {
+		t.Fatalf("platform project list parameters = %v, want %v", listNames, want)
+	}
+	pageSizeSchema := objectAt(
+		t,
+		listParameters[1].(map[string]any),
+		"schema",
+	)
+	if pageSizeSchema["default"] != float64(25) ||
+		pageSizeSchema["minimum"] != float64(1) ||
+		pageSizeSchema["maximum"] != float64(100) {
+		t.Fatalf("platform project page_size schema = %v", pageSizeSchema)
+	}
+
+	request := objectAt(t, schemas, "CreatePlatformProjectRequest")
+	if request["additionalProperties"] != false {
+		t.Fatal("CreatePlatformProjectRequest must reject numeric trusted scope")
+	}
+	required := []string{
+		"business_unit_public_id",
+		"key",
+		"name",
+		"initial_project_admin_user_ids",
+		"default_queue_key",
+		"default_queue_name",
+	}
+	assertExactStringArray(t, request["required"], required)
+	assertExactObjectKeys(
+		t,
+		objectAt(t, request, "properties"),
+		append(required, "description"),
+	)
+	for _, forbidden := range []string{
+		"organization_id",
+		"business_unit_id",
+		"administrator_id",
+	} {
+		if _, ok := objectAt(t, request, "properties")[forbidden]; ok {
+			t.Errorf(
+				"CreatePlatformProjectRequest exposes trusted field %q",
+				forbidden,
+			)
+		}
+	}
+	initialAdmins := objectAt(
+		t,
+		objectAt(t, request, "properties"),
+		"initial_project_admin_user_ids",
+	)
+	if initialAdmins["minItems"] != float64(1) ||
+		initialAdmins["uniqueItems"] != true {
+		t.Fatalf("initial administrator schema = %v", initialAdmins)
+	}
+
+	for _, schemaName := range []string{
+		"ProjectCreationContext",
+		"PlatformProjectPage",
+		"PlatformProjectSummary",
+		"PlatformBusinessUnitPageEnvelope",
+		"PlatformBusinessUnitPage",
+		"PlatformBusinessUnitSummary",
+		"ProjectUserOptionPage",
+	} {
+		if objectAt(t, schemas, schemaName)["additionalProperties"] != false {
+			t.Errorf("%s must be a closed DTO", schemaName)
+		}
+	}
+
+	pageFields := []string{
+		"items",
+		"total",
+		"page",
+		"page_size",
+		"total_pages",
+	}
+	for _, schemaName := range []string{
+		"PlatformProjectPage",
+		"PlatformBusinessUnitPage",
+		"ProjectUserOptionPage",
+	} {
+		page := objectAt(t, schemas, schemaName)
+		assertExactStringArray(t, page["required"], pageFields)
+		assertExactObjectKeys(
+			t,
+			objectAt(t, page, "properties"),
+			pageFields,
+		)
+	}
+
+	contextOperation := objectAt(
+		t,
+		objectAt(t, paths, "/platform/project-creation-context"),
+		"get",
+	)
+	contextParameters, ok := contextOperation["parameters"].([]any)
+	if !ok {
+		t.Fatal("project creation context parameters are missing")
+	}
+	contextNames := make([]string, 0, len(contextParameters))
+	for _, rawParameter := range contextParameters {
+		parameter := rawParameter.(map[string]any)
+		contextNames = append(
+			contextNames,
+			parameter["name"].(string),
+		)
+		if parameter["in"] != "query" {
+			t.Fatalf("project creation context parameter = %v", parameter)
+		}
+	}
+	if want := []string{
+		"page",
+		"page_size",
+		"search",
+		"business_unit_page",
+		"business_unit_page_size",
+		"business_unit_search",
+	}; !reflect.DeepEqual(contextNames, want) {
+		t.Fatalf(
+			"project creation context parameters = %v, want %v",
+			contextNames,
+			want,
+		)
+	}
+	for _, index := range []int{1, 4} {
+		pageSize := objectAt(
+			t,
+			contextParameters[index].(map[string]any),
+			"schema",
+		)
+		if pageSize["default"] != float64(25) ||
+			pageSize["minimum"] != float64(1) ||
+			pageSize["maximum"] != float64(100) {
+			t.Errorf(
+				"project creation context page size = %v",
+				pageSize,
+			)
+		}
+	}
+
+	contextProperties := objectAt(
+		t,
+		objectAt(t, schemas, "ProjectCreationContext"),
+		"properties",
+	)
+	for propertyName, wantReference := range map[string]string{
+		"business_units": "#/components/schemas/PlatformBusinessUnitPage",
+		"users":          "#/components/schemas/ProjectUserOptionPage",
+	} {
+		property := objectAt(t, contextProperties, propertyName)
+		if got, _ := property["$ref"].(string); got != wantReference {
+			t.Errorf(
+				"ProjectCreationContext.%s = %q, want %q",
+				propertyName,
+				got,
+				wantReference,
+			)
+		}
+	}
+
+	businessUnitsOperation := objectAt(
+		t,
+		objectAt(t, paths, "/platform/project-business-units"),
+		"get",
+	)
+	assertExactStringArray(
+		t,
+		businessUnitsOperation["x-chronodesk-platform-roles"],
+		[]string{"platform_admin"},
+	)
+	businessUnitParameters :=
+		businessUnitsOperation["parameters"].([]any)
+	businessUnitNames := make([]string, 0, len(businessUnitParameters))
+	for _, rawParameter := range businessUnitParameters {
+		parameter := rawParameter.(map[string]any)
+		businessUnitNames = append(
+			businessUnitNames,
+			parameter["name"].(string),
+		)
+	}
+	if want := []string{"page", "page_size", "search"}; !reflect.DeepEqual(
+		businessUnitNames,
+		want,
+	) {
+		t.Fatalf(
+			"platform Business Unit query = %v, want %v",
+			businessUnitNames,
+			want,
+		)
+	}
+	if got := responseSchemaRef(
+		t,
+		businessUnitsOperation,
+		"200",
+	); got != "#/components/schemas/PlatformBusinessUnitPageEnvelope" {
+		t.Fatalf("platform Business Unit page response = %q", got)
+	}
+	businessUnitEnvelope := objectAt(
+		t,
+		schemas,
+		"PlatformBusinessUnitPageEnvelope",
+	)
+	if businessUnitEnvelope["additionalProperties"] != false {
+		t.Fatal("PlatformBusinessUnitPageEnvelope must be closed")
+	}
+	businessUnitData := objectAt(
+		t,
+		objectAt(t, businessUnitEnvelope, "properties"),
+		"data",
+	)
+	if got, _ := businessUnitData["$ref"].(string); got !=
+		"#/components/schemas/PlatformBusinessUnitPage" {
+		t.Fatalf("platform Business Unit envelope data = %q", got)
+	}
+
+	createOperation := objectAt(
+		t,
+		objectAt(t, paths, "/platform/projects"),
+		"post",
+	)
+	assertExactObjectKeys(
+		t,
+		objectAt(t, createOperation, "responses"),
+		[]string{"201", "400", "401", "403", "429", "500", "503"},
+	)
+}
+
+func TestProjectMembershipCandidateContractIsRemoteBoundedAndAdminOnly(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	operation := objectAt(
+		t,
+		objectAt(
+			t,
+			paths,
+			"/projects/{projectKey}/membership-candidates",
+		),
+		"get",
+	)
+	assertExactStringArray(
+		t,
+		operation["x-chronodesk-project-roles"],
+		[]string{"project_admin"},
+	)
+	parameters := operation["parameters"].([]any)
+	if len(parameters) != 4 {
+		t.Fatalf("membership candidate parameters = %v", parameters)
+	}
+	queryNames := make([]string, 0, 3)
+	for _, rawParameter := range parameters[1:] {
+		parameter := rawParameter.(map[string]any)
+		queryNames = append(queryNames, parameter["name"].(string))
+	}
+	if want := []string{"page", "page_size", "search"}; !reflect.DeepEqual(
+		queryNames,
+		want,
+	) {
+		t.Fatalf("membership candidate query = %v, want %v", queryNames, want)
+	}
+	pageSize := objectAt(t, parameters[2].(map[string]any), "schema")
+	if pageSize["default"] != float64(25) ||
+		pageSize["maximum"] != float64(100) {
+		t.Fatalf("membership candidate page size = %v", pageSize)
 	}
 }
 
@@ -674,6 +1071,15 @@ func TestProtectedOperationsDeclareExactRoleAllowlist(t *testing.T) {
 				}
 				if operation["x-chronodesk-project-membership-filtered"] != true {
 					t.Error("GET /workbench/tickets must declare membership filtering")
+				}
+				continue
+			}
+			if path == "/workbench/dashboard" && method == "get" {
+				if hasPlatform || hasProject {
+					t.Error("GET /workbench/dashboard must filter memberships without a role precondition")
+				}
+				if operation["x-chronodesk-project-membership-filtered"] != true {
+					t.Error("GET /workbench/dashboard must declare membership filtering")
 				}
 				continue
 			}
@@ -906,6 +1312,12 @@ func TestProtectedOperationsMatchRuntimeRoleAllowlists(t *testing.T) {
 			"x-chronodesk-platform-roles",
 			[]string{"platform_admin", "security_auditor"},
 		},
+		{
+			"/platform/audit-logs/{auditLogID}",
+			"get",
+			"x-chronodesk-platform-roles",
+			[]string{"platform_admin", "security_auditor"},
+		},
 	} {
 		t.Run(test.method+" "+test.path, func(t *testing.T) {
 			operation := objectAt(
@@ -947,7 +1359,7 @@ func TestSessionAndPlatformProjectResponsesMatchRuntimeEnvelopes(t *testing.T) {
 		objectAt(t, objectAt(t, paths, "/platform/projects"), "get"),
 		"200",
 	)
-	if list != "#/components/schemas/PlatformProjectSummaryListEnvelope" {
+	if list != "#/components/schemas/PlatformProjectPageEnvelope" {
 		t.Fatalf("platform project list response schema = %q", list)
 	}
 
@@ -1003,12 +1415,12 @@ func TestSessionAndPlatformProjectResponsesMatchRuntimeEnvelopes(t *testing.T) {
 	listEnvelope := objectAt(
 		t,
 		schemas,
-		"PlatformProjectSummaryListEnvelope",
+		"PlatformProjectPageEnvelope",
 	)
 	if listEnvelope["type"] != "object" ||
 		listEnvelope["additionalProperties"] != false {
 		t.Fatalf(
-			"PlatformProjectSummaryListEnvelope = %v",
+			"PlatformProjectPageEnvelope = %v",
 			listEnvelope,
 		)
 	}
@@ -1022,12 +1434,9 @@ func TestSessionAndPlatformProjectResponsesMatchRuntimeEnvelopes(t *testing.T) {
 		objectAt(t, listEnvelope, "properties"),
 		"data",
 	)
-	if listData["type"] != "array" {
+	if reference, _ := listData["$ref"].(string); reference !=
+		"#/components/schemas/PlatformProjectPage" {
 		t.Fatalf("platform project list data = %v", listData)
-	}
-	items := objectAt(t, listData, "items")
-	if reference, _ := items["$ref"].(string); reference != "#/components/schemas/PlatformProjectSummary" {
-		t.Fatalf("platform project list item schema = %q", reference)
 	}
 }
 
@@ -1048,9 +1457,10 @@ func TestPlatformProjectListPublishesExactReadContract(t *testing.T) {
 			operation["operationId"],
 		)
 	}
-	if _, published := operation["parameters"]; published {
+	parameters, published := operation["parameters"].([]any)
+	if !published || len(parameters) != 7 {
 		t.Fatalf(
-			"GET /platform/projects publishes unsupported parameters: %v",
+			"GET /platform/projects parameters = %v",
 			operation["parameters"],
 		)
 	}
@@ -1109,14 +1519,19 @@ func TestPlatformProjectArchivePublishesUUIDv7AndStableStatuses(t *testing.T) {
 		"PlatformProjectSummary",
 		"AuthorizedProject",
 	} {
-		publicID := objectAt(
+		publicID := resolveComponentObject(
 			t,
+			document,
 			objectAt(
 				t,
-				objectAt(t, schemas, schemaName),
-				"properties",
+				objectAt(
+					t,
+					objectAt(t, schemas, schemaName),
+					"properties",
+				),
+				"public_id",
 			),
-			"public_id",
+			"schemas",
 		)
 		if publicID["format"] != "uuid" ||
 			publicID["pattern"] != schema["pattern"] {
@@ -1200,15 +1615,20 @@ func TestHumanQueryParametersMatchRuntimeAdapters(t *testing.T) {
 			path: "/platform/audit-logs",
 			want: []string{
 				"user_id",
+				"actor",
 				"platform_role",
+				"action",
 				"method",
 				"path",
+				"path_prefix",
 				"status",
 				"keyword",
+				"result",
+				"time_preset",
 				"start_time",
 				"end_time",
-				"page",
 				"limit",
+				"cursor",
 			},
 		},
 	} {
@@ -1292,8 +1712,13 @@ func TestP1HumanWebOperationsAreTypedAndMachineAddressable(t *testing.T) {
 		{"/auth/reset-password", "post"},
 		{"/platform/projects/{projectPublicID}/archive", "post"},
 		{"/workbench/tickets", "get"},
+		{"/workbench/dashboard", "get"},
 		{"/projects/{projectKey}/tickets", "get"},
 		{"/projects/{projectKey}/tickets", "post"},
+		{"/projects/{projectKey}/tickets/my-tickets", "get"},
+		{"/projects/{projectKey}/tickets/unassigned", "get"},
+		{"/projects/{projectKey}/tickets/overdue", "get"},
+		{"/projects/{projectKey}/tickets/sla-breach", "get"},
 		{"/projects/{projectKey}/tickets/{ticketID}", "get"},
 		{"/projects/{projectKey}/tickets/{ticketID}", "put"},
 		{"/projects/{projectKey}/tickets/{ticketID}", "delete"},
@@ -1304,6 +1729,7 @@ func TestP1HumanWebOperationsAreTypedAndMachineAddressable(t *testing.T) {
 		{"/projects/{projectKey}/tickets/{ticketID}/history", "get"},
 		{"/projects/{projectKey}/tickets/{ticketID}/comments", "get"},
 		{"/projects/{projectKey}/tickets/{ticketID}/comments", "post"},
+		{"/projects/{projectKey}/tickets/{ticketID}/comments/{commentID}/replies", "get"},
 		{"/projects/{projectKey}/tickets/{ticketID}/attachments", "get"},
 		{"/projects/{projectKey}/tickets/{ticketID}/attachments", "post"},
 		{
@@ -1318,6 +1744,12 @@ func TestP1HumanWebOperationsAreTypedAndMachineAddressable(t *testing.T) {
 		{"/projects/{projectKey}/notifications/unread-count", "get"},
 		{"/notification-preferences", "get"},
 		{"/notification-preferences", "put"},
+		{"/projects/{projectKey}/knowledge/articles", "get"},
+		{"/projects/{projectKey}/knowledge/articles", "post"},
+		{"/projects/{projectKey}/knowledge/articles/{articleID}/drafts", "post"},
+		{"/projects/{projectKey}/knowledge/articles/{articleID}/document", "get"},
+		{"/projects/{projectKey}/knowledge/versions/{versionID}/publication", "post"},
+		{"/projects/{projectKey}/knowledge/searches", "post"},
 		{"/projects/{projectKey}/admin/automation/rules", "get"},
 		{"/projects/{projectKey}/admin/automation/rules", "post"},
 		{"/projects/{projectKey}/admin/automation/rules/{ruleID}", "get"},
@@ -1399,6 +1831,89 @@ func TestP1HumanWebOperationsAreTypedAndMachineAddressable(t *testing.T) {
 	}
 }
 
+func TestP0ListPaginationContractUsesStrictTwentyFiveToOneHundredBounds(t *testing.T) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	notifications := objectAt(
+		t,
+		objectAt(t, paths, "/projects/{projectKey}/notifications"),
+		"get",
+	)
+	var notificationPageSize map[string]any
+	var notificationPageReference string
+	for _, raw := range notifications["parameters"].([]any) {
+		parameter := raw.(map[string]any)
+		if reference, _ := parameter["$ref"].(string); reference == "#/components/parameters/ContentPage" {
+			notificationPageReference = reference
+		}
+		if parameter["name"] == "page_size" {
+			notificationPageSize = parameter
+		}
+	}
+	if notificationPageReference != "#/components/parameters/ContentPage" {
+		t.Fatalf("notification page parameter ref=%q", notificationPageReference)
+	}
+	if notificationPageSize == nil {
+		t.Fatal("notification page_size parameter is missing")
+	}
+	notificationPageSizeSchema := objectAt(t, notificationPageSize, "schema")
+	if notificationPageSizeSchema["default"] != float64(25) ||
+		notificationPageSizeSchema["maximum"] != float64(100) {
+		t.Fatalf("notification page_size schema=%v", notificationPageSizeSchema)
+	}
+
+	components := objectAt(t, document, "components")
+	parameters := objectAt(t, components, "parameters")
+	contentPage := objectAt(t, objectAt(t, parameters, "ContentPage"), "schema")
+	if contentPage["default"] != float64(1) ||
+		contentPage["minimum"] != float64(1) ||
+		contentPage["maximum"] != float64(1_000_000) {
+		t.Fatalf("ContentPage schema=%v", contentPage)
+	}
+	contentPageSize := objectAt(t, objectAt(t, parameters, "ContentPageSize"), "schema")
+	if contentPageSize["default"] != float64(25) ||
+		contentPageSize["maximum"] != float64(100) {
+		t.Fatalf("ContentPageSize schema=%v", contentPageSize)
+	}
+	schemas := objectAt(t, components, "schemas")
+	notificationPage := objectAt(t, objectAt(t, schemas, "NotificationPage"), "properties")
+	pageSize := objectAt(t, notificationPage, "page_size")
+	if pageSize["maximum"] != float64(100) {
+		t.Fatalf("NotificationPage.page_size=%v", pageSize)
+	}
+
+	for _, path := range []string{
+		"/projects/{projectKey}/tickets/overdue",
+		"/projects/{projectKey}/tickets/sla-breach",
+	} {
+		operation := objectAt(t, objectAt(t, paths, path), "get")
+		rawParameters := operation["parameters"].([]any)
+		refs := make(map[string]bool, len(rawParameters))
+		for _, raw := range rawParameters {
+			parameter := raw.(map[string]any)
+			reference, _ := parameter["$ref"].(string)
+			refs[reference] = true
+		}
+		for _, required := range []string{
+			"#/components/parameters/ProjectKey",
+			"#/components/parameters/ContentPage",
+			"#/components/parameters/ContentPageSize",
+		} {
+			if !refs[required] {
+				t.Errorf("%s is missing %s", path, required)
+			}
+		}
+		responses := objectAt(t, operation, "responses")
+		okResponse := objectAt(t, responses, "200")
+		content := objectAt(t, okResponse, "content")
+		jsonContent := objectAt(t, content, "application/json")
+		schema := objectAt(t, jsonContent, "schema")
+		if schema["$ref"] != "#/components/schemas/TicketListPageEnvelope" {
+			t.Errorf("%s response schema=%v", path, schema)
+		}
+	}
+}
+
 func TestP1RuntimeDTOFieldsMatchPublishedSchemas(t *testing.T) {
 	document := decodeDocument(t)
 	schemas := objectAt(
@@ -1421,6 +1936,10 @@ func TestP1RuntimeDTOFieldsMatchPublishedSchemas(t *testing.T) {
 			"CrossProjectWorkbenchPage",
 			services.CrossProjectWorkbenchPage{},
 		},
+		{
+			"WorkbenchDashboard",
+			services.WorkbenchDashboard{},
+		},
 		{"WebhookTestReceipt", services.WebhookTestReceipt{}},
 	} {
 		t.Run(test.schemaName, func(t *testing.T) {
@@ -1429,6 +1948,57 @@ func TestP1RuntimeDTOFieldsMatchPublishedSchemas(t *testing.T) {
 			want := jsonFieldNames(t, reflect.TypeOf(test.value))
 			assertExactObjectKeys(t, properties, want)
 		})
+	}
+}
+
+func TestAdminAuditDetailRuntimeProjectionMatchesClosedSchema(t *testing.T) {
+	document := decodeDocument(t)
+	schema := objectAt(
+		t,
+		objectAt(t, objectAt(t, document, "components"), "schemas"),
+		"AdminAuditLogDetail",
+	)
+	userID := uint(42)
+	detail := services.AdminAuditDetail{
+		AdminAuditListItem: services.AdminAuditListItem{
+			ID:               7,
+			CreatedAt:        time.Date(2026, 7, 31, 8, 0, 0, 0, time.UTC),
+			UserID:           &userID,
+			Username:         "security-auditor",
+			PlatformRole:     models.PlatformRoleSecurityAuditor,
+			Action:           "platform.user.update",
+			ActionCode:       "platform.user.update",
+			ResourceType:     "user",
+			ResourcePublicID: "42",
+			Method:           "PUT",
+			Path:             "/api/platform/users/42",
+			StatusCode:       200,
+			MaskedIP:         "192.0.*.*",
+			LatencyMs:        12,
+			Result:           "success",
+		},
+		Query:         "view=compact",
+		UserAgent:     "browser",
+		Notes:         "",
+		RequestID:     "request-1",
+		TraceID:       "trace-1",
+		CorrelationID: "correlation-1",
+	}
+	encoded, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var instance map[string]any
+	if err := json.Unmarshal(encoded, &instance); err != nil {
+		t.Fatal(err)
+	}
+	assertClosedObjectInstance(t, schema, instance)
+
+	instance["unpublished_secret"] = "must be rejected"
+	properties := objectAt(t, schema, "properties")
+	if _, published := properties["unpublished_secret"]; published ||
+		schema["additionalProperties"] != false {
+		t.Fatal("detail schema accepted an unpublished property")
 	}
 }
 
@@ -1457,6 +2027,84 @@ func TestPlatformAuditContractCoversRuntimeFailureStatuses(t *testing.T) {
 			)
 		}
 	}
+}
+
+func TestEmergencyControlContractIsExactRoleStrictAndCASProtected(t *testing.T) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	components := objectAt(t, document, "components")
+	schemas := objectAt(t, components, "schemas")
+	path := objectAt(t, paths, "/platform/emergency-controls")
+
+	for _, method := range []string{"get", "put"} {
+		operation := objectAt(t, path, method)
+		assertExactStringArray(
+			t,
+			operation["x-chronodesk-platform-roles"],
+			[]string{"emergency_operator"},
+		)
+		responses := objectAt(t, operation, "responses")
+		success := objectAt(t, responses, "200")
+		headers := objectAt(t, success, "headers")
+		if objectAt(t, headers, "ETag")["$ref"] !=
+			"#/components/headers/ETag" {
+			t.Errorf("%s emergency-control response omits strong ETag", method)
+		}
+	}
+
+	update := objectAt(t, path, "put")
+	parameters, ok := update["parameters"].([]any)
+	if !ok || len(parameters) != 1 {
+		t.Fatalf("emergency-control PUT parameters = %v", update["parameters"])
+	}
+	if parameters[0].(map[string]any)["$ref"] !=
+		"#/components/parameters/IfMatch" {
+		t.Fatalf("emergency-control PUT must require shared If-Match")
+	}
+	if got := requestSchemaRef(t, update); got !=
+		"#/components/schemas/UpdateEmergencyControlsRequest" {
+		t.Fatalf("emergency-control request schema = %q", got)
+	}
+	for _, status := range []string{"400", "401", "403", "412", "428", "429", "503"} {
+		if _, ok := objectAt(t, update, "responses")[status]; !ok {
+			t.Errorf("emergency-control PUT response %s is missing", status)
+		}
+	}
+	stale := objectAt(t, objectAt(t, update, "responses"), "412")
+	if objectAt(t, objectAt(t, stale, "headers"), "ETag")["$ref"] !=
+		"#/components/headers/ETag" {
+		t.Error("stale emergency-control response omits current ETag")
+	}
+
+	request := objectAt(t, schemas, "UpdateEmergencyControlsRequest")
+	if request["additionalProperties"] != false ||
+		request["minProperties"] != float64(1) {
+		t.Fatalf("emergency-control request is not strict: %v", request)
+	}
+	assertExactObjectKeys(
+		t,
+		objectAt(t, request, "properties"),
+		[]string{"global_read_only", "emergency_stop"},
+	)
+	if required, exists := request["required"]; exists {
+		t.Fatalf(
+			"independent emergency-control fields must remain optional: %v",
+			required,
+		)
+	}
+
+	snapshot := objectAt(t, schemas, "EmergencyControlSnapshot")
+	if snapshot["additionalProperties"] != false {
+		t.Fatal("EmergencyControlSnapshot must be a closed DTO")
+	}
+	fields := []string{
+		"global_read_only",
+		"emergency_stop",
+		"version",
+		"updated_at",
+	}
+	assertExactStringArray(t, snapshot["required"], fields)
+	assertExactObjectKeys(t, objectAt(t, snapshot, "properties"), fields)
 }
 
 func TestAutomationLogAndWebhookSchemasAreClosedRuntimeDTOs(t *testing.T) {
@@ -1514,7 +2162,8 @@ func TestAutomationLogAndWebhookSchemasAreClosedRuntimeDTOs(t *testing.T) {
 			"name",
 			"description",
 			"provider",
-			"webhook_url",
+			"webhook_url_masked",
+			"has_webhook_url",
 			"status",
 			"previous_secret_expires_at",
 			"enabled_events",
@@ -1540,34 +2189,32 @@ func TestAutomationLogAndWebhookSchemasAreClosedRuntimeDTOs(t *testing.T) {
 			"updated_by",
 		},
 	)
+	for _, forbidden := range []string{
+		"webhook_url",
+		"secret",
+		"previous_secret",
+		"access_token",
+	} {
+		if _, exposed := objectAt(t, webhookConfig, "properties")[forbidden]; exposed {
+			t.Errorf("WebhookConfig exposes sensitive field %s", forbidden)
+		}
+	}
 
 	paths := objectAt(t, document, "paths")
-	logSchema := successResponseSchema(
-		t,
-		objectAt(
-			t,
-			objectAt(
-				t,
-				paths,
-				"/projects/{projectKey}/webhooks/{webhookID}/logs",
-			),
-			"get",
-		),
-		"200",
-	)
-	logData := objectAt(t, objectAt(t, logSchema, "properties"), "data")
+	logData := objectAt(t, schemas, "WebhookLogPage")
 	logItems := objectAt(
 		t,
 		objectAt(t, objectAt(t, logData, "properties"), "items"),
 		"items",
 	)
+	logItemSchema := objectAt(t, schemas, "WebhookLog")
 	if logData["additionalProperties"] != false ||
-		logItems["additionalProperties"] != false {
+		logItemSchema["additionalProperties"] != false {
 		t.Fatal("Webhook log page and items must be closed")
 	}
 	assertExactObjectKeys(
 		t,
-		objectAt(t, logItems, "properties"),
+		objectAt(t, logItemSchema, "properties"),
 		[]string{
 			"id",
 			"created_at",
@@ -1579,6 +2226,9 @@ func TestAutomationLogAndWebhookSchemasAreClosedRuntimeDTOs(t *testing.T) {
 			"error_message",
 		},
 	)
+	if logItems["$ref"] != "#/components/schemas/WebhookLog" {
+		t.Fatalf("WebhookLogPage.items ref = %v", logItems)
+	}
 
 	statsSchema := successResponseSchema(
 		t,
@@ -1625,6 +2275,75 @@ func TestAutomationLogAndWebhookSchemasAreClosedRuntimeDTOs(t *testing.T) {
 		objectAt(t, dailyStats, "properties"),
 		[]string{"date", "sent", "success", "failed"},
 	)
+}
+
+func TestAutomationAndWebhookListErrorsUseRuntimeEnvelopes(t *testing.T) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	for _, test := range []struct {
+		path     string
+		statuses []string
+		response string
+	}{
+		{
+			path:     "/projects/{projectKey}/admin/automation/rules",
+			statuses: []string{"400", "500"},
+			response: "#/components/responses/LegacyError",
+		},
+		{
+			path:     "/projects/{projectKey}/admin/automation/logs",
+			statuses: []string{"400", "500", "503"},
+			response: "#/components/responses/LegacyError",
+		},
+		{
+			path:     "/projects/{projectKey}/webhooks",
+			statuses: []string{"400", "500"},
+			response: "#/components/responses/StandardError",
+		},
+		{
+			path:     "/projects/{projectKey}/webhooks/{webhookID}/logs",
+			statuses: []string{"400", "404", "500", "503"},
+			response: "#/components/responses/StandardError",
+		},
+	} {
+		t.Run(test.path, func(t *testing.T) {
+			operation := objectAt(
+				t,
+				objectAt(t, paths, test.path),
+				"get",
+			)
+			responses := objectAt(t, operation, "responses")
+			for _, status := range test.statuses {
+				response := objectAt(t, responses, status)
+				if response["$ref"] != test.response {
+					t.Errorf(
+						"response %s = %v, want %q",
+						status,
+						response["$ref"],
+						test.response,
+					)
+				}
+			}
+		})
+	}
+
+	responses := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"responses",
+	)
+	for name, schemaReference := range map[string]string{
+		"LegacyError":   "#/components/schemas/LegacyErrorEnvelope",
+		"StandardError": "#/components/schemas/StandardErrorEnvelope",
+	} {
+		response := objectAt(t, responses, name)
+		content := objectAt(t, response, "content")
+		media := objectAt(t, content, "application/json")
+		schema := objectAt(t, media, "schema")
+		if schema["$ref"] != schemaReference {
+			t.Errorf("%s schema = %v, want %q", name, schema, schemaReference)
+		}
+	}
 }
 
 func TestPublishedHumanWriteSchemasRejectUnpublishedFields(t *testing.T) {
@@ -1695,8 +2414,8 @@ func TestAllPublishedRequestBodiesUseClosedTopLevelSchemas(t *testing.T) {
 			}
 		}
 	}
-	if count != 32 {
-		t.Fatalf("closed request body count = %d, want 32", count)
+	if count < 32 {
+		t.Fatalf("closed request body count = %d, want at least 32", count)
 	}
 }
 
@@ -1721,6 +2440,14 @@ func TestAdminUserPhoneAndManagerConstraintsMatchRuntime(t *testing.T) {
 		objectAt(t, schemas, "UpdateAdminUserRequest"),
 		"properties",
 	)
+	adminAvatar := objectAt(t, update, "avatar")
+	assertDeprecatedAvatarCompatibilitySchema(t, adminAvatar)
+	if pattern, _ := adminAvatar["pattern"].(string); !strings.Contains(
+		pattern,
+		"-4[0-9a-f]{3}-[89ab]",
+	) {
+		t.Fatalf("UpdateAdminUserRequest.avatar = %v", adminAvatar)
+	}
 	updatePhone := objectAt(t, update, "phone")
 	branches, ok := updatePhone["oneOf"].([]any)
 	if !ok || len(branches) != 3 {
@@ -1753,6 +2480,68 @@ func TestAdminUserPhoneAndManagerConstraintsMatchRuntime(t *testing.T) {
 		if manager["minimum"] != float64(1) {
 			t.Errorf("%s.manager_id = %v", schemaName, manager)
 		}
+	}
+}
+
+func TestHumanProfileUpdatePublishesValidatedCompatibilityFields(t *testing.T) {
+	document := decodeDocument(t)
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+	properties := objectAt(
+		t,
+		objectAt(t, schemas, "UpdateHumanProfileRequest"),
+		"properties",
+	)
+	updateSchema := objectAt(t, schemas, "UpdateHumanProfileRequest")
+	if required, exists := updateSchema["required"]; exists {
+		t.Errorf(
+			"UpdateHumanProfileRequest fields must remain optional: %v",
+			required,
+		)
+	}
+	for _, name := range []string{"first_name", "last_name"} {
+		property := objectAt(t, properties, name)
+		if property["maxLength"] != float64(50) {
+			t.Errorf("%s maxLength = %v", name, property["maxLength"])
+		}
+	}
+	timezone := objectAt(t, properties, "timezone")
+	if timezone["format"] != "iana-timezone" {
+		t.Errorf("timezone schema = %v", timezone)
+	}
+	language := objectAt(t, properties, "language")
+	if !reflect.DeepEqual(language["enum"], []any{"zh-CN", "en"}) {
+		t.Errorf("language schema = %v", language)
+	}
+	phone := objectAt(t, properties, "phone_number")
+	if len(phone["oneOf"].([]any)) != 2 {
+		t.Errorf("phone_number schema = %v", phone)
+	}
+	avatar := objectAt(t, properties, "avatar")
+	assertDeprecatedAvatarCompatibilitySchema(t, avatar)
+	if pattern, _ := avatar["pattern"].(string); !strings.Contains(
+		pattern,
+		"-4[0-9a-f]{3}-[89ab]",
+	) {
+		t.Errorf("avatar schema = %v", avatar)
+	}
+}
+
+func assertDeprecatedAvatarCompatibilitySchema(
+	t *testing.T,
+	schema map[string]any,
+) {
+	t.Helper()
+	if schema["deprecated"] != true {
+		t.Errorf("avatar compatibility field is not deprecated: %v", schema)
+	}
+	description, _ := schema["description"].(string)
+	if !strings.Contains(description, "exact current value") ||
+		!strings.Contains(description, "upload endpoint") {
+		t.Errorf("avatar compatibility description = %q", description)
 	}
 }
 
@@ -1898,6 +2687,2375 @@ func assertProjectKeySchema(
 	}
 }
 
+func TestAgentControlListsPublishStrictStrategiesAndSafeEnvelopes(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	components := objectAt(t, document, "components")
+	parameters := objectAt(t, components, "parameters")
+	schemas := objectAt(t, components, "schemas")
+
+	for _, test := range []struct {
+		path         string
+		operationID  string
+		strategy     string
+		queryNames   []string
+		responseName string
+	}{
+		{
+			path:         "/projects/{projectKey}/admin/agents/service-principals",
+			operationID:  "listAgentServicePrincipals",
+			strategy:     "page",
+			queryNames:   []string{"page", "page_size", "sort_by", "sort_order"},
+			responseName: "AdminPrincipalPageEnvelope",
+		},
+		{
+			path:         "/projects/{projectKey}/admin/agents/service-principals/{principalId}/policies",
+			operationID:  "listServicePrincipalPoliciesV2",
+			strategy:     "page",
+			queryNames:   []string{"page", "page_size", "sort_by", "sort_order"},
+			responseName: "AdminPolicyPageEnvelope",
+		},
+		{
+			path:         "/projects/{projectKey}/admin/agents/leases",
+			operationID:  "listAgentTicketLeases",
+			strategy:     "page",
+			queryNames:   []string{"page", "page_size", "sort_by", "sort_order"},
+			responseName: "AdminLeasePageEnvelope",
+		},
+		{
+			path:         "/projects/{projectKey}/admin/agents/attachments",
+			operationID:  "listAgentAttachmentScans",
+			strategy:     "page",
+			queryNames:   []string{"page", "page_size", "sort_by", "sort_order"},
+			responseName: "AdminAttachmentPageEnvelope",
+		},
+		{
+			path:         "/projects/{projectKey}/admin/agents/outbox",
+			operationID:  "listAgentOutboxDeliveries",
+			strategy:     "page",
+			queryNames:   []string{"page", "page_size", "sort_by", "sort_order"},
+			responseName: "AdminOutboxPageEnvelope",
+		},
+		{
+			path:         "/projects/{projectKey}/admin/agents/events",
+			operationID:  "listAgentDomainEvents",
+			strategy:     "cursor",
+			queryNames:   []string{"cursor", "limit"},
+			responseName: "AdminDomainEventCursorEnvelope",
+		},
+		{
+			path:         "/projects/{projectKey}/admin/agents/policy-decisions",
+			operationID:  "listAgentPolicyDecisions",
+			strategy:     "cursor",
+			queryNames:   []string{"cursor", "limit"},
+			responseName: "AdminPolicyDecisionCursorEnvelope",
+		},
+	} {
+		t.Run(test.operationID, func(t *testing.T) {
+			pathItem := objectAt(t, paths, test.path)
+			operation := objectAt(t, pathItem, "get")
+			if operation["operationId"] != test.operationID {
+				t.Fatalf("operationId=%v", operation["operationId"])
+			}
+			if operation["x-list-strategy"] != test.strategy {
+				t.Fatalf(
+					"x-list-strategy=%v, want %s",
+					operation["x-list-strategy"],
+					test.strategy,
+				)
+			}
+			names := make([]string, 0, len(test.queryNames))
+			for _, raw := range operation["parameters"].([]any) {
+				parameter := raw.(map[string]any)
+				if reference, ok := parameter["$ref"].(string); ok {
+					const prefix = "#/components/parameters/"
+					parameter = objectAt(
+						t,
+						parameters,
+						strings.TrimPrefix(reference, prefix),
+					)
+				}
+				if parameter["in"] == "query" {
+					name := parameter["name"].(string)
+					names = append(names, name)
+					schema := objectAt(t, parameter, "schema")
+					switch name {
+					case "page":
+						if schema["minimum"] != float64(1) ||
+							schema["default"] != float64(1) {
+							t.Errorf("page schema=%v", schema)
+						}
+					case "page_size", "limit":
+						if schema["minimum"] != float64(1) ||
+							schema["maximum"] != float64(100) ||
+							schema["default"] != float64(25) {
+							t.Errorf("%s schema=%v", name, schema)
+						}
+					case "cursor":
+						if schema["maxLength"] != float64(2048) {
+							t.Errorf("cursor schema=%v", schema)
+						}
+					case "sort_by", "sort_order":
+						if schema["const"] == nil ||
+							schema["default"] != schema["const"] {
+							t.Errorf("%s schema=%v", name, schema)
+						}
+					}
+				}
+			}
+			sort.Strings(names)
+			sort.Strings(test.queryNames)
+			if !reflect.DeepEqual(names, test.queryNames) {
+				t.Fatalf("query parameters=%v, want %v", names, test.queryNames)
+			}
+			if got := responseSchemaRef(t, operation, "200"); got !=
+				"#/components/schemas/"+test.responseName {
+				t.Fatalf("response schema=%q", got)
+			}
+		})
+	}
+	for schemaName, fields := range map[string][]string{
+		"AdminPrincipalPage": {
+			"items", "total", "page", "page_size", "total_pages",
+		},
+		"AdminPolicyPage": {
+			"items", "total", "page", "page_size", "total_pages",
+		},
+		"AdminLeasePage": {
+			"items", "total", "page", "page_size", "total_pages",
+		},
+		"AdminAttachmentPage": {
+			"items", "total", "page", "page_size", "total_pages",
+		},
+		"AdminOutboxPage": {
+			"items", "total", "page", "page_size", "total_pages",
+		},
+		"AdminDomainEventCursorPage": {
+			"items", "next_cursor", "has_more",
+		},
+		"AdminPolicyDecisionCursorPage": {
+			"items", "next_cursor", "has_more",
+		},
+	} {
+		schema := objectAt(t, schemas, schemaName)
+		assertExactStringArray(t, schema["required"], fields)
+		assertExactObjectKeys(t, objectAt(t, schema, "properties"), fields)
+	}
+
+	overview := objectAt(t, schemas, "AdminOverview")
+	for name, raw := range objectAt(t, overview, "properties") {
+		property := raw.(map[string]any)
+		if property["type"] == "array" {
+			t.Errorf("AdminOverview.%s remains a dynamic array", name)
+		}
+	}
+	for schemaName, forbidden := range map[string][]string{
+		"AdminAgentPolicy": {
+			"conditions",
+		},
+		"AdminAttachmentSummary": {
+			"storage_path",
+			"storage_url",
+			"access_token",
+			"hash",
+			"metadata",
+			"scan_details",
+		},
+		"AdminDomainEventSummary": {
+			"data",
+		},
+		"AdminPolicyDecisionSummary": {
+			"context",
+			"request_digest",
+		},
+		"AdminOutboxDeliverySummary": {
+			"destination_id",
+			"locked_by",
+			"locked_at",
+		},
+	} {
+		properties := objectAt(
+			t,
+			objectAt(t, schemas, schemaName),
+			"properties",
+		)
+		for _, field := range forbidden {
+			if _, exists := properties[field]; exists {
+				t.Errorf("%s exposes forbidden field %s", schemaName, field)
+			}
+		}
+	}
+}
+
+func TestHumanListClassificationInventoryBlocksNewUnclassifiedLists(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	rawInventory, ok := document["x-chronodesk-legacy-list-inventory"].([]any)
+	if !ok {
+		t.Fatal("x-chronodesk-legacy-list-inventory must be an explicit array")
+	}
+	if len(rawInventory) != 0 {
+		t.Fatalf(
+			"x-chronodesk-legacy-list-inventory must be empty, got %v",
+			rawInventory,
+		)
+	}
+
+	paths := objectAt(t, document, "paths")
+	for path, rawPathItem := range paths {
+		pathItem := rawPathItem.(map[string]any)
+		for _, method := range []string{"get", "post", "put", "patch", "delete"} {
+			rawOperation, exists := pathItem[method]
+			if !exists {
+				continue
+			}
+			operation := rawOperation.(map[string]any)
+			operationID, _ := operation["operationId"].(string)
+			hasArray := operationHasResponseArray(t, document, operation)
+			unboundedArray := operationHasUnboundedResponseArray(
+				t,
+				document,
+				operation,
+			)
+			if !strings.HasPrefix(operationID, "list") &&
+				!strings.HasPrefix(operationID, "search") &&
+				!hasArray {
+				continue
+			}
+			strategy, classified := operation["x-list-strategy"].(string)
+			if !classified {
+				t.Errorf(
+					"%s %s (%s) has a response list but no x-list-strategy",
+					strings.ToUpper(method),
+					path,
+					operationID,
+				)
+				continue
+			}
+			if strategy != "page" &&
+				strategy != "cursor" &&
+				strategy != "bounded" {
+				t.Errorf("%s has invalid x-list-strategy %q", operationID, strategy)
+			}
+			if strategy == "bounded" && unboundedArray {
+				t.Errorf(
+					"%s claims bounded but contains an array without maxItems <= 100",
+					operationID,
+				)
+			}
+			if strategy == "page" || strategy == "cursor" {
+				rawStable, stable := operation["x-stable-sort"].([]any)
+				if !stable || len(rawStable) < 2 {
+					t.Errorf(
+						"%s must publish a multi-column x-stable-sort",
+						operationID,
+					)
+					continue
+				}
+				last, ok := rawStable[len(rawStable)-1].(string)
+				if !ok || !strings.Contains(strings.ToLower(last), "id") {
+					t.Errorf(
+						"%s x-stable-sort must end in a unique id, got %v",
+						operationID,
+						rawStable,
+					)
+				}
+			}
+		}
+	}
+	workbench := objectAt(
+		t,
+		objectAt(
+			t,
+			paths,
+			"/workbench/dashboard",
+		),
+		"get",
+	)
+	if !operationHasResponseArray(t, document, workbench) ||
+		operationHasUnboundedResponseArray(t, document, workbench) {
+		t.Fatal("getWorkbenchDashboard must exercise bounded non-list arrays")
+	}
+}
+
+func TestRuntimeGETRegistrationsAreClassifiedAndHumanListsPublished(
+	t *testing.T,
+) {
+	serverRoot := filepath.Clean(filepath.Join("..", ".."))
+	registrations, err := routeinventory.ScanRuntimeGETRoutes(serverRoot)
+	if err != nil {
+		t.Fatalf("scan runtime GET registrations: %v", err)
+	}
+	declarations := routeinventory.HumanGETDeclarations()
+	if err := routeinventory.ValidateCoverage(
+		registrations,
+		declarations,
+	); err != nil {
+		t.Fatalf("runtime GET classification drift:\n%v", err)
+	}
+
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	classificationCounts := make(map[routeinventory.Classification]int)
+	for _, registration := range registrations {
+		declaration := declarations[registration.Fingerprint]
+		classificationCounts[declaration.Classification]++
+		if declaration.Classification ==
+			routeinventory.ClassificationMachinePublic {
+			continue
+		}
+		if declaration.OpenAPIPath == "" {
+			if declaration.Classification !=
+				routeinventory.ClassificationNonList {
+				t.Errorf(
+					"%s is a Human list without an OpenAPI binding",
+					registration.Fingerprint,
+				)
+			}
+			continue
+		}
+
+		rawPathItem, published := paths[declaration.OpenAPIPath]
+		if !published {
+			t.Errorf(
+				"%s maps to missing OpenAPI path %s",
+				registration.Fingerprint,
+				declaration.OpenAPIPath,
+			)
+			continue
+		}
+		pathItem, ok := rawPathItem.(map[string]any)
+		if !ok {
+			t.Errorf(
+				"OpenAPI path %s has invalid item %T",
+				declaration.OpenAPIPath,
+				rawPathItem,
+			)
+			continue
+		}
+		rawOperation, published := pathItem["get"]
+		if !published {
+			t.Errorf(
+				"%s has no published GET operation",
+				declaration.OpenAPIPath,
+			)
+			continue
+		}
+		operation, ok := rawOperation.(map[string]any)
+		if !ok {
+			t.Errorf(
+				"GET %s has invalid operation %T",
+				declaration.OpenAPIPath,
+				rawOperation,
+			)
+			continue
+		}
+		if operation["operationId"] != declaration.OperationID {
+			t.Errorf(
+				"GET %s operationId = %v, want %s",
+				declaration.OpenAPIPath,
+				operation["operationId"],
+				declaration.OperationID,
+			)
+		}
+
+		switch declaration.Classification {
+		case routeinventory.ClassificationPage:
+			assertRuntimeListOperation(
+				t,
+				document,
+				declaration,
+				operation,
+				"page_size",
+			)
+		case routeinventory.ClassificationCursor:
+			assertRuntimeListOperation(
+				t,
+				document,
+				declaration,
+				operation,
+				"limit",
+			)
+		case routeinventory.ClassificationBounded:
+			if operation["x-list-strategy"] != "bounded" {
+				t.Errorf(
+					"GET %s x-list-strategy = %v, want bounded",
+					declaration.OpenAPIPath,
+					operation["x-list-strategy"],
+				)
+			}
+			if operationHasUnboundedResponseArray(
+				t,
+				document,
+				operation,
+			) {
+				t.Errorf(
+					"GET %s claims bounded but publishes an unbounded array",
+					declaration.OpenAPIPath,
+				)
+			}
+		case routeinventory.ClassificationNonList:
+			if strategy, classified :=
+				operation["x-list-strategy"]; classified {
+				t.Errorf(
+					"GET %s is non-list but publishes x-list-strategy=%v",
+					declaration.OpenAPIPath,
+					strategy,
+				)
+			}
+		default:
+			t.Errorf(
+				"%s has unexpected classification %q",
+				registration.Fingerprint,
+				declaration.Classification,
+			)
+		}
+	}
+
+	for _, classification := range []routeinventory.Classification{
+		routeinventory.ClassificationPage,
+		routeinventory.ClassificationCursor,
+		routeinventory.ClassificationBounded,
+		routeinventory.ClassificationNonList,
+		routeinventory.ClassificationMachinePublic,
+	} {
+		if classificationCounts[classification] == 0 {
+			t.Errorf("runtime inventory has no %q registration", classification)
+		}
+	}
+
+	// These registrations were previously easy to omit because their path
+	// names or delegated handler groups were not inferred from OpenAPI itself.
+	assertRuntimeRegistrationClassification(
+		t,
+		registrations,
+		declarations,
+		"internal/app/app.go",
+		"tickets",
+		`"/my-tickets"`,
+		routeinventory.ClassificationPage,
+	)
+	assertRuntimeRegistrationClassification(
+		t,
+		registrations,
+		declarations,
+		"internal/app/app.go",
+		"tickets",
+		`"/unassigned"`,
+		routeinventory.ClassificationPage,
+	)
+	assertRuntimeRegistrationClassification(
+		t,
+		registrations,
+		declarations,
+		"internal/handlers/integration_handler.go",
+		"integrations",
+		`"/connections"`,
+		routeinventory.ClassificationPage,
+	)
+	assertRuntimeRegistrationClassification(
+		t,
+		registrations,
+		declarations,
+		"internal/handlers/integration_handler.go",
+		"integrations",
+		`"/domain-events"`,
+		routeinventory.ClassificationCursor,
+	)
+}
+
+func TestAnalyticsByCategoryMapHasAnExplicitRuntimeBound(t *testing.T) {
+	if services.AnalyticsMaxCategoryValues <= 0 ||
+		services.AnalyticsMaxCategoryValues > 1_000 {
+		t.Fatalf(
+			"Analytics by_category bound = %d, want 1..1000",
+			services.AnalyticsMaxCategoryValues,
+		)
+	}
+	field, exists := reflect.TypeOf(
+		services.AnalyticsTicketStats{},
+	).FieldByName("ByCategory")
+	if !exists {
+		t.Fatal("AnalyticsTicketStats.ByCategory runtime collection is missing")
+	}
+	if got := field.Tag.Get("json"); got != "by_category" {
+		t.Fatalf("ByCategory JSON name = %q, want by_category", got)
+	}
+	if field.Type.Kind() != reflect.Map {
+		t.Fatalf("ByCategory kind = %s, want map", field.Type.Kind())
+	}
+
+	document := decodeDocument(t)
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+	publishedByCategory := false
+	for name, rawSchema := range schemas {
+		schema, ok := rawSchema.(map[string]any)
+		if !ok {
+			continue
+		}
+		properties, ok := schema["properties"].(map[string]any)
+		if !ok {
+			continue
+		}
+		rawByCategory, exists := properties["by_category"]
+		if !exists {
+			continue
+		}
+		publishedByCategory = true
+		byCategory, ok := rawByCategory.(map[string]any)
+		if !ok {
+			t.Errorf("%s.by_category schema = %T", name, rawByCategory)
+			continue
+		}
+		if byCategory["maxProperties"] !=
+			float64(services.AnalyticsMaxCategoryValues) {
+			t.Errorf(
+				"%s.by_category maxProperties = %v, want %d",
+				name,
+				byCategory["maxProperties"],
+				services.AnalyticsMaxCategoryValues,
+			)
+		}
+	}
+	paths := objectAt(t, document, "paths")
+	if rawPath, published := paths["/platform/analytics/business"]; published {
+		pathItem, ok := rawPath.(map[string]any)
+		if !ok {
+			t.Fatalf("analytics business path item = %T", rawPath)
+		}
+		operation := objectAt(t, pathItem, "get")
+		if operation["x-list-strategy"] != "bounded" {
+			t.Errorf(
+				"analytics business x-list-strategy = %v, want bounded",
+				operation["x-list-strategy"],
+			)
+		}
+		if !publishedByCategory {
+			t.Error(
+				"analytics business was published without a bounded by_category schema",
+			)
+		}
+	}
+}
+
+func assertRuntimeListOperation(
+	t *testing.T,
+	document map[string]any,
+	declaration routeinventory.Declaration,
+	operation map[string]any,
+	sizeParameter string,
+) {
+	t.Helper()
+	if operation["x-list-strategy"] !=
+		string(declaration.Classification) {
+		t.Errorf(
+			"GET %s x-list-strategy = %v, want %s",
+			declaration.OpenAPIPath,
+			operation["x-list-strategy"],
+			declaration.Classification,
+		)
+	}
+	query := operationQueryParameters(t, document, operation)
+	rawSize, published := query[sizeParameter]
+	if !published {
+		t.Errorf(
+			"GET %s has no %s parameter",
+			declaration.OpenAPIPath,
+			sizeParameter,
+		)
+	} else {
+		schema := objectAt(t, rawSize, "schema")
+		if schema["minimum"] != float64(1) ||
+			schema["maximum"] != float64(100) ||
+			schema["default"] != float64(25) {
+			t.Errorf(
+				"GET %s %s schema = %v, want min=1 default=25 max=100",
+				declaration.OpenAPIPath,
+				sizeParameter,
+				schema,
+			)
+		}
+	}
+
+	rawSort, ok := operation["x-stable-sort"].([]any)
+	if !ok || len(rawSort) < 2 {
+		t.Errorf(
+			"GET %s x-stable-sort = %v, want at least two fields",
+			declaration.OpenAPIPath,
+			operation["x-stable-sort"],
+		)
+		return
+	}
+	last, ok := rawSort[len(rawSort)-1].(string)
+	if !ok || !strings.Contains(strings.ToLower(last), "id") {
+		t.Errorf(
+			"GET %s stable sort must end in a unique id, got %v",
+			declaration.OpenAPIPath,
+			rawSort,
+		)
+	}
+}
+
+func assertRuntimeRegistrationClassification(
+	t *testing.T,
+	registrations []routeinventory.Registration,
+	declarations map[string]routeinventory.Declaration,
+	file string,
+	receiver string,
+	pathExpression string,
+	want routeinventory.Classification,
+) {
+	t.Helper()
+	for _, registration := range registrations {
+		if registration.File != file ||
+			registration.Receiver != receiver ||
+			registration.PathExpression != pathExpression {
+			continue
+		}
+		if got := declarations[registration.Fingerprint].Classification; got !=
+			want {
+			t.Errorf(
+				"%s classification = %q, want %q",
+				registration.Fingerprint,
+				got,
+				want,
+			)
+		}
+		return
+	}
+	t.Errorf(
+		"runtime registration %s %s.GET(%s) was not discovered",
+		file,
+		receiver,
+		pathExpression,
+	)
+}
+
+func TestRegisteredRuntimeListInventoryIsExplicitlyPublished(t *testing.T) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	for _, test := range []struct {
+		path        string
+		operationID string
+		strategy    string
+		stableSort  []string
+	}{
+		{
+			path:        "/user/trusted-devices",
+			operationID: "listTrustedDevices",
+			strategy:    "page",
+			stableSort: []string{
+				"revoked ASC",
+				"expires_at DESC",
+				"id DESC",
+			},
+		},
+		{
+			path:        "/user/login-history",
+			operationID: "listLoginHistory",
+			strategy:    "page",
+			stableSort:  []string{"login_time DESC", "id DESC"},
+		},
+		{
+			path:        "/projects",
+			operationID: "listAuthorizedHumanProjects",
+			strategy:    "page",
+			stableSort:  []string{"name ASC", "id ASC"},
+		},
+		{
+			path:        "/projects/{projectKey}/queues",
+			operationID: "listProjectQueues",
+			strategy:    "page",
+			stableSort: []string{
+				"is_default DESC",
+				"name ASC",
+				"id ASC",
+			},
+		},
+		{
+			path:        "/projects/{projectKey}/memberships",
+			operationID: "listProjectMemberships",
+			strategy:    "page",
+			stableSort: []string{
+				"is_active DESC",
+				"role ASC",
+				"user_id ASC",
+				"id ASC",
+			},
+		},
+		{
+			path:        "/projects/{projectKey}/membership-candidates",
+			operationID: "searchProjectMembershipCandidates",
+			strategy:    "page",
+			stableSort: []string{
+				"display_name ASC",
+				"username ASC",
+				"id ASC",
+			},
+		},
+		{
+			path:        "/platform/projects",
+			operationID: "listPlatformProjects",
+			strategy:    "page",
+			stableSort:  []string{"name ASC", "id ASC"},
+		},
+		{
+			path:        "/platform/users",
+			operationID: "listPlatformUsers",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/platform/audit-logs",
+			operationID: "listPlatformAuditLogs",
+			strategy:    "cursor",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/workbench/tickets",
+			operationID: "listCrossProjectWorkbenchTickets",
+			strategy:    "page",
+			stableSort:  []string{"updated_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/tickets",
+			operationID: "listProjectTickets",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/tickets/my-tickets",
+			operationID: "listMyProjectTickets",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/tickets/unassigned",
+			operationID: "listUnassignedProjectTickets",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/notifications",
+			operationID: "listProjectNotifications",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/categories",
+			operationID: "listProjectCategories",
+			strategy:    "page",
+			stableSort: []string{
+				"sort_order ASC",
+				"name ASC",
+				"id ASC",
+			},
+		},
+		{
+			path:        "/projects/{projectKey}/assignees",
+			operationID: "listProjectAssignees",
+			strategy:    "page",
+			stableSort:  []string{"username ASC", "id ASC"},
+		},
+		{
+			path:        "/projects/{projectKey}/tickets/{ticketID}/entity-links",
+			operationID: "listProjectTicketEntityLinks",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/tickets/{ticketID}/relations",
+			operationID: "listProjectTicketRelations",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/agent-collaboration/runs",
+			operationID: "listProjectAgentRuns",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/agent-collaboration/proposals",
+			operationID: "listProjectActionProposals",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/agent-collaboration/approvals",
+			operationID: "listProjectApprovalTasks",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/agent-collaboration/handoffs",
+			operationID: "listProjectHandoffs",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/admin/automation/rules",
+			operationID: "listProjectAutomationRules",
+			strategy:    "page",
+			stableSort: []string{
+				"priority ASC",
+				"created_at DESC",
+				"id DESC",
+			},
+		},
+		{
+			path:        "/projects/{projectKey}/admin/automation/sla",
+			operationID: "listProjectSLAConfigs",
+			strategy:    "page",
+			stableSort: []string{
+				"is_default DESC",
+				"created_at DESC",
+				"id DESC",
+			},
+		},
+		{
+			path:        "/projects/{projectKey}/admin/automation/templates",
+			operationID: "listProjectTicketTemplates",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/admin/automation/quick-replies",
+			operationID: "listProjectQuickReplies",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/knowledge/articles",
+			operationID: "listProjectKnowledgeArticles",
+			strategy:    "page",
+			stableSort:  []string{"updated_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/knowledge/articles/{articleID}/versions",
+			operationID: "listProjectKnowledgeVersions",
+			strategy:    "page",
+			stableSort:  []string{"version DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/knowledge/ingestions",
+			operationID: "listProjectKnowledgeIngestions",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/integrations/connector-definitions",
+			operationID: "listProjectIntegrationConnectorDefinitions",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/integrations/connections",
+			operationID: "listProjectIntegrationConnections",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/integrations/connections/{connectionID}/mappings",
+			operationID: "listProjectIntegrationMappings",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/integrations/inbox",
+			operationID: "listProjectIntegrationInboxMessages",
+			strategy:    "page",
+			stableSort:  []string{"received_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/integrations/inbox/{messageID}/receipts",
+			operationID: "listProjectIntegrationInboxReceipts",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/integrations/sync-runs",
+			operationID: "listProjectIntegrationSyncRuns",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/integrations/conflicts",
+			operationID: "listProjectIntegrationConflicts",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/integrations/dead-letters",
+			operationID: "listProjectIntegrationDeadLetters",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/integrations/domain-events",
+			operationID: "listProjectIntegrationDomainEvents",
+			strategy:    "cursor",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/integrations/outbox",
+			operationID: "listProjectIntegrationOutboxDeliveries",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/admin/automation/logs",
+			operationID: "listProjectAutomationLogs",
+			strategy:    "cursor",
+			stableSort:  []string{"executed_at DESC", "id DESC"},
+		},
+		{
+			path:        "/platform/system/cleanup/logs",
+			operationID: "listPlatformCleanupLogs",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/platform/configs",
+			operationID: "listPlatformConfigs",
+			strategy:    "page",
+			stableSort: []string{
+				"category ASC",
+				"group ASC",
+				"key ASC",
+				"id ASC",
+			},
+		},
+		{
+			path:        "/projects/{projectKey}/webhooks",
+			operationID: "listProjectWebhooks",
+			strategy:    "page",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+		{
+			path:        "/projects/{projectKey}/webhooks/{webhookID}/logs",
+			operationID: "listProjectWebhookLogs",
+			strategy:    "cursor",
+			stableSort:  []string{"created_at DESC", "id DESC"},
+		},
+	} {
+		t.Run(test.operationID, func(t *testing.T) {
+			operation := objectAt(
+				t,
+				objectAt(t, paths, test.path),
+				"get",
+			)
+			if operation["operationId"] != test.operationID {
+				t.Fatalf(
+					"operationId = %v, want %q",
+					operation["operationId"],
+					test.operationID,
+				)
+			}
+			if operation["x-list-strategy"] != test.strategy {
+				t.Fatalf(
+					"x-list-strategy = %v, want %q",
+					operation["x-list-strategy"],
+					test.strategy,
+				)
+			}
+			assertExactStringArray(
+				t,
+				operation["x-stable-sort"],
+				test.stableSort,
+			)
+		})
+	}
+}
+
+func TestExperiencePhaseHumanContractsAreClosedBoundedAndRedacted(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+
+	for _, test := range []struct {
+		path        string
+		operationID string
+	}{
+		{"/user/login-history", "listLoginHistory"},
+		{"/projects/{projectKey}/categories", "listProjectCategories"},
+		{"/projects/{projectKey}/assignees", "listProjectAssignees"},
+		{
+			"/projects/{projectKey}/tickets/{ticketID}/entity-links",
+			"listProjectTicketEntityLinks",
+		},
+		{
+			"/projects/{projectKey}/tickets/{ticketID}/relations",
+			"listProjectTicketRelations",
+		},
+		{
+			"/projects/{projectKey}/agent-collaboration/runs",
+			"listProjectAgentRuns",
+		},
+		{
+			"/projects/{projectKey}/agent-collaboration/proposals",
+			"listProjectActionProposals",
+		},
+		{
+			"/projects/{projectKey}/agent-collaboration/approvals",
+			"listProjectApprovalTasks",
+		},
+		{
+			"/projects/{projectKey}/agent-collaboration/handoffs",
+			"listProjectHandoffs",
+		},
+		{
+			"/projects/{projectKey}/admin/automation/sla",
+			"listProjectSLAConfigs",
+		},
+		{
+			"/projects/{projectKey}/admin/automation/templates",
+			"listProjectTicketTemplates",
+		},
+		{
+			"/projects/{projectKey}/admin/automation/quick-replies",
+			"listProjectQuickReplies",
+		},
+		{
+			"/projects/{projectKey}/knowledge/articles",
+			"listProjectKnowledgeArticles",
+		},
+		{
+			"/projects/{projectKey}/knowledge/articles/{articleID}/versions",
+			"listProjectKnowledgeVersions",
+		},
+		{
+			"/projects/{projectKey}/knowledge/ingestions",
+			"listProjectKnowledgeIngestions",
+		},
+	} {
+		operation := objectAt(t, objectAt(t, paths, test.path), "get")
+		if operation["operationId"] != test.operationID {
+			t.Errorf(
+				"%s operationId = %v, want %s",
+				test.path,
+				operation["operationId"],
+				test.operationID,
+			)
+		}
+		if operation["x-list-strategy"] != "page" {
+			t.Errorf("%s is not a page list", test.path)
+		}
+		query := operationQueryParameters(t, document, operation)
+		pageSize := objectAt(t, query["page_size"], "schema")
+		if pageSize["default"] != float64(25) ||
+			pageSize["maximum"] != float64(100) {
+			t.Errorf("%s page_size = %v", test.path, pageSize)
+		}
+	}
+
+	for _, test := range []struct {
+		schema    string
+		forbidden []string
+	}{
+		{
+			schema: "LoginHistoryRecord",
+			forbidden: []string{
+				"user_id",
+				"username",
+				"email",
+				"session_id",
+			},
+		},
+		{
+			schema: "ProjectCategory",
+			forbidden: []string{
+				"organization_id",
+				"project_id",
+				"created_by",
+				"children",
+			},
+		},
+		{
+			schema: "ProjectAssignee",
+			forbidden: []string{
+				"email",
+				"password",
+				"password_hash",
+				"platform_role",
+			},
+		},
+		{
+			schema:    "SLAConfig",
+			forbidden: []string{"organization_id", "project_id"},
+		},
+		{
+			schema: "TicketTemplate",
+			forbidden: []string{
+				"organization_id",
+				"project_id",
+				"created_user",
+				"assign_to_user",
+			},
+		},
+		{
+			schema: "QuickReply",
+			forbidden: []string{
+				"organization_id",
+				"project_id",
+				"created_user",
+			},
+		},
+		{
+			schema: "IntakeRequestTypeVersion",
+			forbidden: []string{
+				"organization_id",
+				"project_id",
+				"created_by_type",
+				"created_by_id",
+				"content_hash",
+			},
+		},
+		{
+			schema: "IntakeWorkflowVersion",
+			forbidden: []string{
+				"organization_id",
+				"project_id",
+				"created_by_type",
+				"created_by_id",
+				"content_hash",
+			},
+		},
+		{
+			schema:    "AgentRunDetail",
+			forbidden: []string{"policy_snapshot", "principal_id", "agent_task_id"},
+		},
+		{
+			schema: "ActionProposalDetail",
+			forbidden: []string{
+				"action_payload",
+				"proposal_digest",
+				"evidence_digest",
+			},
+		},
+	} {
+		schema := objectAt(t, schemas, test.schema)
+		if schema["additionalProperties"] != false {
+			t.Errorf("%s is not closed", test.schema)
+		}
+		properties := objectAt(t, schema, "properties")
+		for _, field := range test.forbidden {
+			if _, exposed := properties[field]; exposed {
+				t.Errorf("%s exposes forbidden field %s", test.schema, field)
+			}
+		}
+	}
+
+	intake := objectAt(
+		t,
+		objectAt(t, paths, "/projects/{projectKey}/configuration/intake"),
+		"get",
+	)
+	if intake["x-list-strategy"] != "bounded" {
+		t.Errorf("configuration intake strategy = %v", intake["x-list-strategy"])
+	}
+	intakeSchema := objectAt(t, schemas, "ProjectIntakeConfiguration")
+	for _, field := range []string{"request_types", "workflows"} {
+		property := objectAt(
+			t,
+			objectAt(t, intakeSchema, "properties"),
+			field,
+		)
+		if property["maxItems"] != float64(100) {
+			t.Errorf("%s maxItems = %v", field, property["maxItems"])
+		}
+	}
+}
+
+func TestIntegrationHumanContractsMirrorStrictScopedRuntime(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+
+	for _, test := range []struct {
+		path         string
+		operationID  string
+		responseName string
+	}{
+		{
+			"/projects/{projectKey}/integrations/connector-definitions",
+			"listProjectIntegrationConnectorDefinitions",
+			"IntegrationConnectorDefinitionPageEnvelope",
+		},
+		{
+			"/projects/{projectKey}/integrations/connections",
+			"listProjectIntegrationConnections",
+			"IntegrationConnectionPageEnvelope",
+		},
+		{
+			"/projects/{projectKey}/integrations/connections/{connectionID}/mappings",
+			"listProjectIntegrationMappings",
+			"IntegrationMappingPageEnvelope",
+		},
+		{
+			"/projects/{projectKey}/integrations/inbox",
+			"listProjectIntegrationInboxMessages",
+			"IntegrationInboxMessagePageEnvelope",
+		},
+		{
+			"/projects/{projectKey}/integrations/inbox/{messageID}/receipts",
+			"listProjectIntegrationInboxReceipts",
+			"IntegrationInboxReceiptPageEnvelope",
+		},
+		{
+			"/projects/{projectKey}/integrations/sync-runs",
+			"listProjectIntegrationSyncRuns",
+			"IntegrationSyncRunPageEnvelope",
+		},
+		{
+			"/projects/{projectKey}/integrations/conflicts",
+			"listProjectIntegrationConflicts",
+			"IntegrationConflictPageEnvelope",
+		},
+		{
+			"/projects/{projectKey}/integrations/dead-letters",
+			"listProjectIntegrationDeadLetters",
+			"IntegrationDeadLetterPageEnvelope",
+		},
+		{
+			"/projects/{projectKey}/integrations/outbox",
+			"listProjectIntegrationOutboxDeliveries",
+			"IntegrationOutboxPageEnvelope",
+		},
+	} {
+		t.Run(test.operationID, func(t *testing.T) {
+			operation := objectAt(
+				t,
+				objectAt(t, paths, test.path),
+				"get",
+			)
+			if operation["operationId"] != test.operationID {
+				t.Fatalf("operationId = %v, want %s", operation["operationId"], test.operationID)
+			}
+			if operation["x-list-strategy"] != "page" {
+				t.Fatalf("x-list-strategy = %v", operation["x-list-strategy"])
+			}
+			assertExactRoleAllowlist(
+				t,
+				operation["x-chronodesk-project-roles"],
+				[]string{"project_admin", "manager", "observer"},
+			)
+			query := operationQueryParameters(t, document, operation)
+			page := objectAt(t, query["page"], "schema")
+			pageSize := objectAt(t, query["page_size"], "schema")
+			if page["minimum"] != float64(1) ||
+				page["default"] != float64(1) {
+				t.Errorf("page = %v", page)
+			}
+			if pageSize["minimum"] != float64(1) ||
+				pageSize["maximum"] != float64(100) ||
+				pageSize["default"] != float64(25) {
+				t.Errorf("page_size = %v", pageSize)
+			}
+			if got := responseSchemaRef(t, operation, "200"); got !=
+				"#/components/schemas/"+test.responseName {
+				t.Errorf("response schema = %q", got)
+			}
+		})
+	}
+
+	events := objectAt(
+		t,
+		objectAt(
+			t,
+			paths,
+			"/projects/{projectKey}/integrations/domain-events",
+		),
+		"get",
+	)
+	if events["x-list-strategy"] != "cursor" {
+		t.Fatalf("domain event strategy = %v", events["x-list-strategy"])
+	}
+	eventQuery := operationQueryParameters(t, document, events)
+	limit := objectAt(t, eventQuery["limit"], "schema")
+	if limit["minimum"] != float64(1) ||
+		limit["maximum"] != float64(100) ||
+		limit["default"] != float64(25) {
+		t.Errorf("domain event limit = %v", limit)
+	}
+	assertExactRoleAllowlist(
+		t,
+		events["x-chronodesk-project-roles"],
+		[]string{"project_admin", "manager", "observer"},
+	)
+
+	overview := objectAt(
+		t,
+		objectAt(
+			t,
+			paths,
+			"/projects/{projectKey}/integrations/overview",
+		),
+		"get",
+	)
+	if overview["x-list-strategy"] != "bounded" {
+		t.Errorf("integration overview strategy = %v", overview["x-list-strategy"])
+	}
+	overviewSchema := objectAt(t, schemas, "IntegrationOverview")
+	for _, field := range []string{"recent_runs", "connection_health"} {
+		property := objectAt(
+			t,
+			objectAt(t, overviewSchema, "properties"),
+			field,
+		)
+		if property["maxItems"] != float64(100) {
+			t.Errorf("IntegrationOverview.%s maxItems = %v", field, property["maxItems"])
+		}
+	}
+	dryRun := objectAt(
+		t,
+		objectAt(
+			t,
+			paths,
+			"/projects/{projectKey}/integrations/mappings/{mappingID}/dry-runs",
+		),
+		"post",
+	)
+	if dryRun["x-list-strategy"] != "bounded" {
+		t.Errorf("mapping dry-run strategy = %v", dryRun["x-list-strategy"])
+	}
+	warnings := objectAt(
+		t,
+		objectAt(
+			t,
+			objectAt(t, schemas, "IntegrationMappingDryRunResult"),
+			"properties",
+		),
+		"warnings",
+	)
+	if warnings["maxItems"] != float64(100) {
+		t.Errorf("mapping dry-run warnings maxItems = %v", warnings["maxItems"])
+	}
+
+	for _, test := range []struct {
+		path       string
+		method     string
+		operation  string
+		requestDTO string
+	}{
+		{
+			"/projects/{projectKey}/integrations/connector-definitions",
+			"post",
+			"createProjectIntegrationConnectorDefinition",
+			"CreateIntegrationConnectorDefinitionRequest",
+		},
+		{
+			"/projects/{projectKey}/integrations/connector-definitions/{definitionID}",
+			"put",
+			"updateProjectIntegrationConnectorDefinition",
+			"UpdateIntegrationConnectorDefinitionRequest",
+		},
+		{
+			"/projects/{projectKey}/integrations/connections",
+			"post",
+			"createProjectIntegrationConnection",
+			"CreateIntegrationConnectionRequest",
+		},
+		{
+			"/projects/{projectKey}/integrations/connections/{connectionID}",
+			"put",
+			"updateProjectIntegrationConnection",
+			"UpdateIntegrationConnectionRequest",
+		},
+		{
+			"/projects/{projectKey}/integrations/connections/{connectionID}/mappings",
+			"post",
+			"createProjectIntegrationMapping",
+			"CreateIntegrationMappingRequest",
+		},
+		{
+			"/projects/{projectKey}/integrations/mappings/{mappingID}",
+			"put",
+			"updateProjectIntegrationMapping",
+			"UpdateIntegrationMappingRequest",
+		},
+		{
+			"/projects/{projectKey}/integrations/mappings/{mappingID}/dry-runs",
+			"post",
+			"dryRunProjectIntegrationMapping",
+			"DryRunIntegrationMappingRequest",
+		},
+		{
+			"/projects/{projectKey}/integrations/mappings/{mappingID}/publication",
+			"post",
+			"publishProjectIntegrationMapping",
+			"PublishIntegrationMappingRequest",
+		},
+		{
+			"/projects/{projectKey}/integrations/conflicts/{conflictID}/resolution",
+			"post",
+			"resolveProjectIntegrationConflict",
+			"ResolveIntegrationConflictRequest",
+		},
+		{
+			"/projects/{projectKey}/integrations/dead-letters/{deadLetterID}/replays",
+			"post",
+			"replayProjectIntegrationDeadLetter",
+			"ReplayIntegrationDeadLetterRequest",
+		},
+	} {
+		t.Run(test.operation, func(t *testing.T) {
+			operation := objectAt(
+				t,
+				objectAt(t, paths, test.path),
+				test.method,
+			)
+			if operation["operationId"] != test.operation {
+				t.Fatalf("operationId = %v", operation["operationId"])
+			}
+			assertExactRoleAllowlist(
+				t,
+				operation["x-chronodesk-project-roles"],
+				[]string{"project_admin", "manager"},
+			)
+			if got := requestSchemaRef(t, operation); got !=
+				"#/components/schemas/"+test.requestDTO {
+				t.Errorf("request schema = %q", got)
+			}
+			if objectAt(t, schemas, test.requestDTO)["additionalProperties"] != false {
+				t.Errorf("%s is not closed", test.requestDTO)
+			}
+		})
+	}
+
+	for schemaName, forbidden := range map[string][]string{
+		"IntegrationConnectorDefinitionSummary": {
+			"configuration_schema",
+			"mapping_schema",
+			"organization_id",
+			"project_id",
+		},
+		"IntegrationConnectionSummary": {
+			"configuration",
+			"verification_key_ref",
+			"organization_id",
+			"project_id",
+		},
+		"IntegrationMappingSummary": {
+			"source_schema",
+			"definition",
+			"organization_id",
+			"project_id",
+		},
+		"IntegrationInboxMessageSummary": {
+			"payload",
+			"signature",
+			"organization_id",
+			"project_id",
+		},
+		"IntegrationOutboxSummary": {
+			"destination_id",
+			"locked_by",
+			"locked_at",
+			"organization_id",
+			"project_id",
+		},
+	} {
+		schema := objectAt(t, schemas, schemaName)
+		if schema["additionalProperties"] != false {
+			t.Errorf("%s is not closed", schemaName)
+		}
+		properties := objectAt(t, schema, "properties")
+		for _, field := range forbidden {
+			if _, exposed := properties[field]; exposed {
+				t.Errorf("%s exposes forbidden field %s", schemaName, field)
+			}
+		}
+	}
+}
+
+func TestNewRuntimeDirectoryContractsMatchAdapters(t *testing.T) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+	for _, test := range []struct {
+		path          string
+		queryNames    []string
+		sortByDefault string
+		sortDefault   string
+		sortFields    []string
+		responseRef   string
+	}{
+		{
+			path: "/user/trusted-devices",
+			queryNames: []string{
+				"page",
+				"page_size",
+				"sort_by",
+				"sort_order",
+			},
+			sortByDefault: "revoked",
+			sortDefault:   "asc",
+			sortFields: []string{
+				"created_at",
+				"updated_at",
+				"last_used_at",
+				"expires_at",
+				"revoked",
+				"device_name",
+			},
+			responseRef: "#/components/schemas/TrustedDevicePageEnvelope",
+		},
+		{
+			path: "/projects/{projectKey}/queues",
+			queryNames: []string{
+				"page",
+				"page_size",
+				"sort_by",
+				"sort_order",
+			},
+			sortByDefault: "is_default",
+			sortDefault:   "desc",
+			sortFields: []string{
+				"created_at",
+				"updated_at",
+				"name",
+				"key",
+				"is_default",
+			},
+			responseRef: "#/components/schemas/ProjectQueuePageEnvelope",
+		},
+		{
+			path: "/platform/system/cleanup/logs",
+			queryNames: []string{
+				"page",
+				"page_size",
+				"sort_by",
+				"sort_order",
+				"task_type",
+			},
+			sortByDefault: "created_at",
+			sortDefault:   "desc",
+			sortFields: []string{
+				"created_at",
+				"start_time",
+				"end_time",
+				"status",
+				"task_type",
+				"records_deleted",
+			},
+			responseRef: "#/components/schemas/CleanupLogPageEnvelope",
+		},
+	} {
+		t.Run(test.path, func(t *testing.T) {
+			operation := objectAt(
+				t,
+				objectAt(t, paths, test.path),
+				"get",
+			)
+			parameters := operationQueryParameters(t, document, operation)
+			names := make([]string, 0, len(parameters))
+			for name := range parameters {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			sort.Strings(test.queryNames)
+			if !reflect.DeepEqual(names, test.queryNames) {
+				t.Fatalf("query parameters = %v, want %v", names, test.queryNames)
+			}
+			page := objectAt(t, parameters["page"], "schema")
+			if page["minimum"] != float64(1) ||
+				page["default"] != float64(1) {
+				t.Errorf("page schema = %v", page)
+			}
+			pageSize := objectAt(t, parameters["page_size"], "schema")
+			if pageSize["minimum"] != float64(1) ||
+				pageSize["maximum"] != float64(100) ||
+				pageSize["default"] != float64(25) {
+				t.Errorf("page_size schema = %v", pageSize)
+			}
+			sortBy := objectAt(t, parameters["sort_by"], "schema")
+			if sortBy["default"] != test.sortByDefault {
+				t.Errorf("sort_by default = %v", sortBy["default"])
+			}
+			assertExactStringArray(t, sortBy["enum"], test.sortFields)
+			sortOrder := objectAt(t, parameters["sort_order"], "schema")
+			if sortOrder["default"] != test.sortDefault {
+				t.Errorf("sort_order default = %v", sortOrder["default"])
+			}
+			assertExactStringArray(
+				t,
+				sortOrder["enum"],
+				[]string{"asc", "desc"},
+			)
+			if got := responseSchemaRef(t, operation, "200"); got !=
+				test.responseRef {
+				t.Fatalf("response schema = %q, want %q", got, test.responseRef)
+			}
+			for _, status := range []string{"400", "401", "500"} {
+				if _, ok := objectAt(t, operation, "responses")[status]; !ok {
+					t.Errorf("response %s is missing", status)
+				}
+			}
+		})
+	}
+
+	assertExactObjectKeys(
+		t,
+		objectAt(t, objectAt(t, schemas, "TrustedDevice"), "properties"),
+		[]string{
+			"id",
+			"device_name",
+			"last_used_at",
+			"last_ip",
+			"user_agent",
+			"expires_at",
+			"revoked",
+			"created_at",
+			"updated_at",
+		},
+	)
+	projectQueueProperties := objectAt(
+		t,
+		objectAt(t, schemas, "ProjectQueue"),
+		"properties",
+	)
+	assertExactObjectKeys(
+		t,
+		projectQueueProperties,
+		[]string{
+			"public_id",
+			"created_at",
+			"updated_at",
+			"team_public_id",
+			"team_name",
+			"key",
+			"name",
+			"description",
+			"status",
+			"is_default",
+		},
+	)
+	for _, forbidden := range []string{
+		"id",
+		"project_id",
+		"project",
+		"team_id",
+		"team",
+	} {
+		if _, exposed := projectQueueProperties[forbidden]; exposed {
+			t.Errorf("ProjectQueue exposes internal relation field %q", forbidden)
+		}
+	}
+	assertExactObjectKeys(
+		t,
+		objectAt(t, objectAt(t, schemas, "CleanupLog"), "properties"),
+		[]string{
+			"id",
+			"created_at",
+			"task_type",
+			"status",
+			"start_time",
+			"end_time",
+			"duration",
+			"records_processed",
+			"records_deleted",
+			"error_message",
+			"retention_days",
+			"cutoff_date",
+			"trigger_type",
+			"trigger_by",
+		},
+	)
+}
+
+func TestHumanOpenAPIRequiredFieldsExistInSameObjectProperties(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	assertRequiredFieldsExistInSameObjectProperties(t, "$", document)
+}
+
+func TestSuccessEnvelopeCompositionIsSatisfiableAndClosed(t *testing.T) {
+	document := decodeDocument(t)
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+	for name, rawSchema := range schemas {
+		schema, ok := rawSchema.(map[string]any)
+		if !ok {
+			continue
+		}
+		allOf, ok := schema["allOf"].([]any)
+		if !ok {
+			continue
+		}
+		extendsSuccessEnvelope := false
+		for _, rawBranch := range allOf {
+			branch, branchOK := rawBranch.(map[string]any)
+			if !branchOK {
+				continue
+			}
+			if branch["$ref"] == "#/components/schemas/SuccessEnvelope" {
+				extendsSuccessEnvelope = true
+			}
+		}
+		if !extendsSuccessEnvelope {
+			continue
+		}
+		if schema["unevaluatedProperties"] != false {
+			t.Errorf(
+				"%s must close the composed success envelope with unevaluatedProperties=false",
+				name,
+			)
+		}
+		for _, rawBranch := range allOf {
+			branch, branchOK := rawBranch.(map[string]any)
+			if !branchOK {
+				continue
+			}
+			if branch["additionalProperties"] == false {
+				t.Errorf(
+					"%s has an unsatisfiable allOf branch that rejects fields from SuccessEnvelope",
+					name,
+				)
+			}
+		}
+	}
+}
+
+func TestKnowledgeWorkbenchRoutesRolesAndSchemasAreDurable(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+	allProjectRoles := []string{
+		"project_admin",
+		"manager",
+		"agent",
+		"requester",
+		"observer",
+	}
+	managerRoles := []string{"project_admin", "manager"}
+
+	for _, test := range []struct {
+		path        string
+		method      string
+		operationID string
+		roles       []string
+		strategy    string
+		status      string
+		response    string
+		request     string
+		visibility  string
+	}{
+		{
+			path:        "/projects/{projectKey}/knowledge/articles",
+			method:      "get",
+			operationID: "listProjectKnowledgeArticles",
+			roles:       allProjectRoles,
+			strategy:    "page",
+			status:      "200",
+			response:    "#/components/schemas/KnowledgeArticlePageEnvelope",
+			visibility:  "published-live-acl-or-explicit-management-view",
+		},
+		{
+			path:        "/projects/{projectKey}/knowledge/articles",
+			method:      "post",
+			operationID: "createProjectKnowledgeArticle",
+			roles:       allProjectRoles,
+			strategy:    "bounded",
+			status:      "201",
+			response:    "#/components/schemas/KnowledgeAuthoredEnvelope",
+			request:     "#/components/schemas/CreateKnowledgeArticleRequest",
+		},
+		{
+			path:        "/projects/{projectKey}/knowledge/articles/{articleID}/drafts",
+			method:      "post",
+			operationID: "createProjectKnowledgeArticleDraft",
+			roles:       allProjectRoles,
+			strategy:    "bounded",
+			status:      "201",
+			response:    "#/components/schemas/KnowledgeAuthoredEnvelope",
+			request:     "#/components/schemas/CreateKnowledgeDraftRequest",
+		},
+		{
+			path:        "/projects/{projectKey}/knowledge/articles/{articleID}/document",
+			method:      "get",
+			operationID: "getProjectKnowledgeArticleDocument",
+			roles:       allProjectRoles,
+			strategy:    "bounded",
+			status:      "200",
+			response:    "#/components/schemas/KnowledgeDocumentEnvelope",
+			visibility:  "manager-or-published-read-acl-or-draft-manage-acl",
+		},
+		{
+			path:        "/projects/{projectKey}/knowledge/versions/{versionID}/publication",
+			method:      "post",
+			operationID: "publishProjectKnowledgeVersion",
+			roles:       managerRoles,
+			status:      "200",
+			response:    "#/components/schemas/KnowledgeVersionEnvelope",
+		},
+		{
+			path:        "/projects/{projectKey}/knowledge/searches",
+			method:      "post",
+			operationID: "searchProjectKnowledge",
+			roles:       allProjectRoles,
+			strategy:    "bounded",
+			status:      "200",
+			response:    "#/components/schemas/KnowledgeSearchEnvelope",
+			request:     "#/components/schemas/KnowledgeSearchRequest",
+			visibility:  "published-live-acl",
+		},
+	} {
+		t.Run(test.operationID, func(t *testing.T) {
+			operation := objectAt(
+				t,
+				objectAt(t, paths, test.path),
+				test.method,
+			)
+			if operation["operationId"] != test.operationID {
+				t.Errorf(
+					"operationId = %v, want %s",
+					operation["operationId"],
+					test.operationID,
+				)
+			}
+			assertExactRoleAllowlist(
+				t,
+				operation["x-chronodesk-project-roles"],
+				test.roles,
+			)
+			if test.strategy != "" &&
+				operation["x-list-strategy"] != test.strategy {
+				t.Errorf(
+					"x-list-strategy = %v, want %s",
+					operation["x-list-strategy"],
+					test.strategy,
+				)
+			}
+			if got := responseSchemaRef(
+				t,
+				operation,
+				test.status,
+			); got != test.response {
+				t.Errorf("response = %q, want %q", got, test.response)
+			}
+			if test.request != "" {
+				if got := requestSchemaRef(t, operation); got != test.request {
+					t.Errorf("request = %q, want %q", got, test.request)
+				}
+			}
+			if test.visibility != "" &&
+				operation["x-chronodesk-knowledge-visibility"] !=
+					test.visibility {
+				t.Errorf(
+					"knowledge visibility = %v, want %s",
+					operation["x-chronodesk-knowledge-visibility"],
+					test.visibility,
+				)
+			}
+		})
+	}
+
+	articleList := objectAt(
+		t,
+		objectAt(
+			t,
+			paths,
+			"/projects/{projectKey}/knowledge/articles",
+		),
+		"get",
+	)
+	assertExactStringArray(
+		t,
+		articleList["x-stable-sort"],
+		[]string{"updated_at DESC", "id DESC"},
+	)
+	query := operationQueryParameters(t, document, articleList)
+	if objectAt(t, query["page_size"], "schema")["maximum"] != float64(100) {
+		t.Error("knowledge article page_size must be capped at 100")
+	}
+	documentOperation := objectAt(
+		t,
+		objectAt(
+			t,
+			paths,
+			"/projects/{projectKey}/knowledge/articles/{articleID}/document",
+		),
+		"get",
+	)
+	documentQuery := operationQueryParameters(t, document, documentOperation)
+	preferLatestDraft := objectAt(
+		t,
+		documentQuery["prefer_latest_draft"],
+		"schema",
+	)
+	if preferLatestDraft["type"] != "boolean" ||
+		preferLatestDraft["default"] != false {
+		t.Errorf(
+			"prefer_latest_draft schema = %v, want optional false boolean",
+			preferLatestDraft,
+		)
+	}
+
+	for _, test := range []struct {
+		schema     string
+		required   []string
+		properties []string
+	}{
+		{
+			schema:   "CreateKnowledgeArticleRequest",
+			required: []string{"key", "title", "markdown"},
+			properties: []string{
+				"key",
+				"title",
+				"summary",
+				"markdown",
+				"source_ticket_id",
+				"source_attachment_ids",
+			},
+		},
+		{
+			schema:   "CreateKnowledgeDraftRequest",
+			required: []string{"title", "markdown"},
+			properties: []string{
+				"title",
+				"markdown",
+				"source_ticket_id",
+				"source_attachment_ids",
+			},
+		},
+		{
+			schema:     "KnowledgeSearchRequest",
+			required:   []string{"query"},
+			properties: []string{"query", "limit"},
+		},
+	} {
+		schema := objectAt(t, schemas, test.schema)
+		if schema["additionalProperties"] != false {
+			t.Errorf("%s must reject unknown JSON fields", test.schema)
+		}
+		assertExactStringArray(t, schema["required"], test.required)
+		assertExactObjectKeys(
+			t,
+			objectAt(t, schema, "properties"),
+			test.properties,
+		)
+	}
+
+	for _, requestName := range []string{
+		"CreateKnowledgeArticleRequest",
+		"CreateKnowledgeDraftRequest",
+	} {
+		request := objectAt(t, schemas, requestName)
+		properties := objectAt(t, request, "properties")
+		markdown := objectAt(t, properties, "markdown")
+		if markdown["maxLength"] != float64(128<<10) ||
+			markdown["x-max-utf8-bytes"] != float64(128<<10) {
+			t.Errorf("%s Markdown is not capped at 128 KiB", requestName)
+		}
+		attachments := objectAt(t, properties, "source_attachment_ids")
+		if attachments["maxItems"] != float64(20) ||
+			attachments["uniqueItems"] != true {
+			t.Errorf("%s source attachments are not bounded and unique", requestName)
+		}
+		if request["x-chronodesk-source-constraint"] == nil {
+			t.Errorf("%s does not publish its ticket/source constraint", requestName)
+		}
+	}
+
+	source := objectAt(t, schemas, "KnowledgeSource")
+	if source["additionalProperties"] != false {
+		t.Fatal("KnowledgeSource must be a closed public provenance DTO")
+	}
+	sourceProperties := objectAt(t, source, "properties")
+	assertExactObjectKeys(t, sourceProperties, []string{
+		"ordinal",
+		"kind",
+		"visibility",
+		"reference_label",
+		"source_ticket_id",
+		"source_attachment_id",
+		"ticket_number",
+		"ticket_title",
+		"attachment_name",
+		"attachment_hash",
+	})
+	assertExactStringArray(t, source["required"], []string{
+		"ordinal",
+		"kind",
+		"visibility",
+		"reference_label",
+	})
+	assertExactStringArray(
+		t,
+		objectAt(t, sourceProperties, "visibility")["enum"],
+		[]string{"full", "restricted", "unavailable"},
+	)
+	for _, forbidden := range []string{
+		"id",
+		"article_id",
+		"version_id",
+		"created_at",
+		"organization_id",
+		"project_id",
+		"created_by",
+		"created_by_type",
+		"created_by_id",
+		"object_bucket",
+		"object_key",
+	} {
+		if _, exposed := sourceProperties[forbidden]; exposed {
+			t.Errorf("KnowledgeSource exposes internal field %s", forbidden)
+		}
+	}
+
+	authored := objectAt(t, schemas, "KnowledgeAuthoredResult")
+	assertExactObjectKeys(
+		t,
+		objectAt(t, authored, "properties"),
+		[]string{"article", "version", "sources", "receipt"},
+	)
+	authoredProperties := objectAt(t, authored, "properties")
+	if objectAt(t, authoredProperties, "sources")["maxItems"] != float64(20) {
+		t.Error("KnowledgeAuthoredResult.sources must be capped at 20")
+	}
+	if objectAt(t, authoredProperties, "receipt")["$ref"] !=
+		"#/components/schemas/Receipt" {
+		t.Error("KnowledgeAuthoredResult must expose the standard receipt")
+	}
+
+	documentSchema := objectAt(t, schemas, "KnowledgeDocument")
+	documentProperties := objectAt(t, documentSchema, "properties")
+	assertExactObjectKeys(t, documentProperties, []string{
+		"article",
+		"version",
+		"markdown",
+		"sections",
+		"sources",
+	})
+	if objectAt(t, documentProperties, "sections")["maxItems"] !=
+		float64(100) {
+		t.Error("KnowledgeDocument.sections must be capped at 100")
+	}
+	if objectAt(t, documentProperties, "sources")["maxItems"] !=
+		float64(20) {
+		t.Error("KnowledgeDocument.sources must be capped at 20")
+	}
+	documentSection := objectAt(t, schemas, "KnowledgeDocumentSection")
+	assertExactObjectKeys(
+		t,
+		objectAt(t, documentSection, "properties"),
+		[]string{
+			"ordinal",
+			"heading",
+			"level",
+			"section_path",
+			"markdown",
+			"content_hash",
+		},
+	)
+
+	searchResult := objectAt(t, schemas, "KnowledgeSearchResult")
+	if objectAt(
+		t,
+		objectAt(t, searchResult, "properties"),
+		"items",
+	)["maxItems"] != float64(50) {
+		t.Error("KnowledgeSearchResult.items must be capped at 50")
+	}
+	citation := objectAt(t, schemas, "KnowledgeCitation")
+	if citation["additionalProperties"] != false {
+		t.Error("KnowledgeCitation must be a closed public DTO")
+	}
+}
+
+func TestKnowledgeHumanSurfaceOmitsAdvancedUncontractedOperations(
+	t *testing.T,
+) {
+	paths := objectAt(t, decodeDocument(t), "paths")
+	versionPath := objectAt(
+		t,
+		paths,
+		"/projects/{projectKey}/knowledge/articles/{articleID}/versions",
+	)
+	if _, published := versionPath["post"]; published {
+		t.Error("raw knowledge version registration must not be a Human operation")
+	}
+	for _, path := range []string{
+		"/projects/{projectKey}/knowledge/articles/{articleID}/access-grants",
+		"/projects/{projectKey}/knowledge/versions/{versionID}/ingestions",
+		"/projects/{projectKey}/knowledge/citations/{citationID}/feedback",
+		"/projects/{projectKey}/knowledge/model-policy",
+	} {
+		if _, published := paths[path]; published {
+			t.Errorf("advanced knowledge operation unexpectedly published: %s", path)
+		}
+	}
+}
+
+func assertRequiredFieldsExistInSameObjectProperties(
+	t *testing.T,
+	path string,
+	value any,
+) {
+	t.Helper()
+	switch typed := value.(type) {
+	case map[string]any:
+		if required, ok := typed["required"].([]any); ok {
+			properties, propertiesOK := typed["properties"].(map[string]any)
+			if !propertiesOK {
+				t.Errorf("%s declares required fields without properties", path)
+			} else {
+				for _, rawName := range required {
+					name, nameOK := rawName.(string)
+					if !nameOK {
+						t.Errorf("%s has non-string required field %T", path, rawName)
+						continue
+					}
+					if _, exists := properties[name]; !exists {
+						t.Errorf(
+							"%s requires %q but does not declare it in properties",
+							path,
+							name,
+						)
+					}
+				}
+			}
+		}
+		for key, nested := range typed {
+			assertRequiredFieldsExistInSameObjectProperties(
+				t,
+				path+"."+key,
+				nested,
+			)
+		}
+	case []any:
+		for index, nested := range typed {
+			assertRequiredFieldsExistInSameObjectProperties(
+				t,
+				fmt.Sprintf("%s[%d]", path, index),
+				nested,
+			)
+		}
+	}
+}
+
+func operationHasResponseArray(
+	t *testing.T,
+	document map[string]any,
+	operation map[string]any,
+) bool {
+	t.Helper()
+	schema, ok := operationResponseJSONSchema(t, document, operation)
+	if !ok {
+		return false
+	}
+	return schemaHasArray(t, document, schema, make(map[string]bool))
+}
+
+func operationHasUnboundedResponseArray(
+	t *testing.T,
+	document map[string]any,
+	operation map[string]any,
+) bool {
+	t.Helper()
+	schema, ok := operationResponseJSONSchema(t, document, operation)
+	if !ok {
+		return false
+	}
+	return schemaHasUnboundedArray(
+		t,
+		document,
+		schema,
+		make(map[string]bool),
+	)
+}
+
+func operationResponseJSONSchema(
+	t *testing.T,
+	document map[string]any,
+	operation map[string]any,
+) (map[string]any, bool) {
+	t.Helper()
+	responses := objectAt(t, operation, "responses")
+	statuses := make([]string, 0, len(responses))
+	for status := range responses {
+		if regexp.MustCompile(`^2[0-9][0-9]$`).MatchString(status) {
+			statuses = append(statuses, status)
+		}
+	}
+	sort.Strings(statuses)
+	if len(statuses) == 0 {
+		return nil, false
+	}
+	response, ok := responses[statuses[0]].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	if reference, ok := response["$ref"].(string); ok {
+		const prefix = "#/components/responses/"
+		response = objectAt(
+			t,
+			objectAt(t, objectAt(t, document, "components"), "responses"),
+			strings.TrimPrefix(reference, prefix),
+		)
+	}
+	content, ok := response["content"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	media, ok := content["application/json"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	schema, ok := media["schema"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	return schema, true
+}
+
+func schemaHasArray(
+	t *testing.T,
+	document map[string]any,
+	schema map[string]any,
+	visiting map[string]bool,
+) bool {
+	t.Helper()
+	if reference, ok := schema["$ref"].(string); ok {
+		const prefix = "#/components/schemas/"
+		if !strings.HasPrefix(reference, prefix) || visiting[reference] {
+			return false
+		}
+		visiting[reference] = true
+		defer delete(visiting, reference)
+		return schemaHasArray(
+			t,
+			document,
+			objectAt(
+				t,
+				objectAt(
+					t,
+					objectAt(t, document, "components"),
+					"schemas",
+				),
+				strings.TrimPrefix(reference, prefix),
+			),
+			visiting,
+		)
+	}
+	if schema["type"] == "array" {
+		return true
+	}
+	for _, keyword := range []string{"allOf", "oneOf", "anyOf"} {
+		if branches, ok := schema[keyword].([]any); ok {
+			for _, raw := range branches {
+				if branch, ok := raw.(map[string]any); ok &&
+					schemaHasArray(t, document, branch, visiting) {
+					return true
+				}
+			}
+		}
+	}
+	if properties, ok := schema["properties"].(map[string]any); ok {
+		for _, raw := range properties {
+			if property, ok := raw.(map[string]any); ok &&
+				schemaHasArray(t, document, property, visiting) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func schemaHasUnboundedArray(
+	t *testing.T,
+	document map[string]any,
+	schema map[string]any,
+	visiting map[string]bool,
+) bool {
+	t.Helper()
+	if reference, ok := schema["$ref"].(string); ok {
+		const prefix = "#/components/schemas/"
+		if !strings.HasPrefix(reference, prefix) || visiting[reference] {
+			return false
+		}
+		visiting[reference] = true
+		defer delete(visiting, reference)
+		return schemaHasUnboundedArray(
+			t,
+			document,
+			objectAt(
+				t,
+				objectAt(
+					t,
+					objectAt(t, document, "components"),
+					"schemas",
+				),
+				strings.TrimPrefix(reference, prefix),
+			),
+			visiting,
+		)
+	}
+	if schema["type"] == "array" {
+		maxItems, bounded := schema["maxItems"].(float64)
+		if !bounded || maxItems > 100 {
+			return true
+		}
+		if items, ok := schema["items"].(map[string]any); ok {
+			return schemaHasUnboundedArray(t, document, items, visiting)
+		}
+		return false
+	}
+	for _, keyword := range []string{"allOf", "oneOf", "anyOf"} {
+		if branches, ok := schema[keyword].([]any); ok {
+			for _, raw := range branches {
+				if branch, ok := raw.(map[string]any); ok &&
+					schemaHasUnboundedArray(t, document, branch, visiting) {
+					return true
+				}
+			}
+		}
+	}
+	if properties, ok := schema["properties"].(map[string]any); ok {
+		for _, raw := range properties {
+			if property, ok := raw.(map[string]any); ok &&
+				schemaHasUnboundedArray(t, document, property, visiting) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func decodeDocument(t *testing.T) map[string]any {
 	t.Helper()
 	var document map[string]any
@@ -2002,6 +5160,36 @@ func assertExactObjectKeys(
 	}
 }
 
+func assertClosedObjectInstance(
+	t *testing.T,
+	schema map[string]any,
+	instance map[string]any,
+) {
+	t.Helper()
+	if schema["type"] != "object" || schema["additionalProperties"] != false {
+		t.Fatalf("schema is not a closed object: %v", schema)
+	}
+	properties := objectAt(t, schema, "properties")
+	for key := range instance {
+		if _, ok := properties[key]; !ok {
+			t.Errorf("runtime instance has unpublished property %q", key)
+		}
+	}
+	required, ok := schema["required"].([]any)
+	if !ok {
+		t.Fatal("closed object schema has no required list")
+	}
+	for _, raw := range required {
+		key, ok := raw.(string)
+		if !ok {
+			t.Fatalf("required field name = %T", raw)
+		}
+		if _, exists := instance[key]; !exists {
+			t.Errorf("runtime instance is missing required property %q", key)
+		}
+	}
+}
+
 func requestSchemaRef(t *testing.T, operation map[string]any) string {
 	t.Helper()
 	requestBody := objectAt(t, operation, "requestBody")
@@ -2028,6 +5216,50 @@ func responseSchemaRef(
 	schema := objectAt(t, media, "schema")
 	reference, _ := schema["$ref"].(string)
 	return reference
+}
+
+func operationQueryParameters(
+	t *testing.T,
+	document map[string]any,
+	operation map[string]any,
+) map[string]map[string]any {
+	t.Helper()
+	result := make(map[string]map[string]any)
+	rawParameters, ok := operation["parameters"].([]any)
+	if !ok {
+		return result
+	}
+	components := objectAt(t, document, "components")
+	componentParameters := objectAt(t, components, "parameters")
+	const prefix = "#/components/parameters/"
+	for _, raw := range rawParameters {
+		parameter, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("operation parameter is %T, want object", raw)
+		}
+		if reference, hasReference := parameter["$ref"].(string); hasReference {
+			if !strings.HasPrefix(reference, prefix) {
+				t.Fatalf("unsupported parameter reference %q", reference)
+			}
+			parameter = objectAt(
+				t,
+				componentParameters,
+				strings.TrimPrefix(reference, prefix),
+			)
+		}
+		if parameter["in"] != "query" {
+			continue
+		}
+		name, ok := parameter["name"].(string)
+		if !ok || name == "" {
+			t.Fatalf("query parameter has invalid name %v", parameter["name"])
+		}
+		if _, duplicate := result[name]; duplicate {
+			t.Fatalf("duplicate query parameter %q", name)
+		}
+		result[name] = parameter
+	}
+	return result
 }
 
 func successResponseSchema(

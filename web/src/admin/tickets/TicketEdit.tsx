@@ -28,10 +28,10 @@ import {
 } from '@mui/material';
 import { minCharacters, maxCharacters } from '@/lib/validators';
 import {
-    formatTagsInputValue,
     formatCustomFieldsInputValue,
     validateCustomFieldsInput,
 } from './tagUtils';
+import TagChipInput from './TagChipInput';
 import BackButton from '../common/BackButton';
 import {
     canDeleteTicket,
@@ -44,6 +44,7 @@ import {
     parseProjectRole,
 } from '@/lib/projectScope';
 import { transformTicketUpdate } from './ticketTransforms';
+import { EnterpriseReferenceAutocompleteInput } from '@/components/inputs/EnterpriseFilterInputs';
 
 // 状态选项
 const statusChoices = [
@@ -275,11 +276,12 @@ const TicketEdit: React.FC = () => {
                                                     reference="assignees"
                                                     label="分配给"
                                                 >
-                                                    <AutocompleteInput
+                                                    <EnterpriseReferenceAutocompleteInput
                                                         label="分配给"
                                                         optionText="username"
                                                         optionValue="id"
-                                                        helperText="选择负责处理此工单的用户"
+                                                        fullWidth
+                                                        helperText="输入姓名或用户名远程搜索负责处理此工单的用户"
                                                     />
                                                 </ReferenceInput>
                                             </Box>
@@ -392,12 +394,11 @@ const TicketEdit: React.FC = () => {
                                 />
                                 <CardContent>
                                     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                                        <TextInput
+                                        <TagChipInput
                                             source="tags"
                                             label="标签"
                                             fullWidth
-                                            helperText="用逗号分隔多个标签"
-                                            format={formatTagsInputValue}
+                                            helperText="输入标签后按回车"
                                         />
 
                                         {!requester && (

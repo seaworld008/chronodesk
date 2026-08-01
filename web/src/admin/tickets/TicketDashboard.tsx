@@ -36,9 +36,11 @@ import {
 } from '@/lib/apiClient'
 import { joinApiUrl } from '@/lib/apiUrl'
 import type { AccessPermissions } from '@/lib/accessControl'
+import { humanApiRoutes } from '@/lib/generated/human-api'
 import {
   parseProjectRole,
   projectResourcePath,
+  resolveActiveProjectKey,
 } from '@/lib/projectScope'
 import {
   PieChart,
@@ -228,6 +230,19 @@ const TicketDashboard: React.FC = () => {
         }
         const ticketsPath = await projectResourcePath('tickets')
         const ticketsURL = joinApiUrl(API_BASE, ticketsPath)
+        const projectKey = await resolveActiveProjectKey()
+        const myTicketsURL = joinApiUrl(
+          API_BASE,
+          humanApiRoutes.listMyProjectTickets(
+            { projectKey },
+            {
+              page: 1,
+              page_size: 10,
+              sort_by: 'created_at',
+              sort_order: 'desc',
+            },
+          ),
+        )
         const [statsRes, urgentRes, recentRes, myRes] = await Promise.all([
           sessionAwareFetch(`${ticketsURL}/stats`, { headers, signal: controller.signal }),
           sessionAwareFetch(`${ticketsURL}?priority=urgent,critical&status=open,in_progress&page_size=10`, {
@@ -236,7 +251,7 @@ const TicketDashboard: React.FC = () => {
           }),
           sessionAwareFetch(`${ticketsURL}?page_size=10&sort_by=created_at&sort_order=desc`, { headers, signal: controller.signal }),
           isAgent
-            ? sessionAwareFetch(`${ticketsURL}/my-tickets?limit=10`, { headers, signal: controller.signal })
+            ? sessionAwareFetch(myTicketsURL, { headers, signal: controller.signal })
             : Promise.resolve(null),
         ])
 
@@ -532,7 +547,7 @@ const TicketDashboard: React.FC = () => {
           ))}
         </List>
       ) : (
-        <Box sx={{ py: 4, display: 'flex', justifyContent: 'center', opacity: 0.6 }}>
+        <Box sx={{ py: 4, display: 'flex', justifyContent: 'center' }}>
           <Typography variant="body2" sx={{
             color: "text.secondary"
           }}>
@@ -584,7 +599,11 @@ const TicketDashboard: React.FC = () => {
               alignItems: "center",
               justifyContent: "flex-end"
             }}>
-            <Button startIcon={<RefreshIcon />} onClick={handleRefresh}>
+            <Button
+              startIcon={<RefreshIcon />}
+              onClick={handleRefresh}
+              sx={{ color: 'primary.dark' }}
+            >
               刷新
             </Button>
           </Stack>
@@ -802,7 +821,12 @@ const TicketDashboard: React.FC = () => {
                   }}>
                     {stats.unassigned}
                   </Typography>
-                  <Button variant="contained" color="warning" onClick={() => handleNavigateToTickets({ unassigned: true })}>
+                  <Button
+                    variant="contained"
+                    color="warning"
+                    onClick={() => handleNavigateToTickets({ unassigned: true })}
+                    sx={{ color: 'rgba(0, 0, 0, 0.87)' }}
+                  >
                     快速分配
                   </Button>
                 </Stack>

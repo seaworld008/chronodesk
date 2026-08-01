@@ -66,6 +66,7 @@ var (
 	ErrInvalidAttachment         = errors.New("invalid attachment")
 	ErrInvalidAttachmentName     = errors.New("invalid attachment name")
 	ErrInvalidComment            = errors.New("invalid comment")
+	ErrNestedCommentReply        = errors.New("nested comment replies are not supported")
 	ErrInvalidAttachmentCleanup  = errors.New("invalid attachment cleanup destination")
 	ErrOutboxLockLost            = errors.New("outbox delivery lock lost")
 	ErrOutboxReplayConflict      = errors.New("outbox delivery is actively being processed")
@@ -102,6 +103,11 @@ const (
 // AgentNativeErrorCode turns exported sentinel errors into stable API codes.
 func AgentNativeErrorCode(err error) string {
 	switch {
+	case errors.Is(err, ErrInvalidTicketTags),
+		errors.Is(err, ErrInvalidAgentContext),
+		errors.Is(err, ErrTicketCategoryScope),
+		errors.Is(err, ErrInvalidTicketCategorySelection):
+		return "invalid_request"
 	case errors.Is(err, ErrInvalidAssignee):
 		return "invalid_assignee"
 	case errors.Is(err, ErrAssigneeNotFound):
@@ -160,6 +166,8 @@ func AgentNativeErrorCode(err error) string {
 		return "invalid_attachment"
 	case errors.Is(err, ErrInvalidAttachmentName):
 		return "invalid_attachment_name"
+	case errors.Is(err, ErrNestedCommentReply):
+		return "nested_comment_reply"
 	case errors.Is(err, ErrInvalidComment):
 		return "invalid_comment"
 	case errors.Is(err, ErrOutboxReplayConflict):
@@ -186,7 +194,10 @@ type OutboxTarget struct {
 type AttachmentCleanupObject struct {
 	AttachmentID uint   `json:"attachment_id"`
 	TicketID     uint   `json:"ticket_id"`
+	StorageType  string `json:"storage_type,omitempty"`
+	StoreID      string `json:"store_id,omitempty"`
 	StoragePath  string `json:"storage_path"`
+	VersionID    string `json:"version_id,omitempty"`
 }
 
 // NewAttachmentCleanupOutboxTarget binds a cleanup delivery to the exact
@@ -212,6 +223,33 @@ func NewAttachmentCleanupOutboxTarget(
 	}, nil
 }
 
+func NewAttachmentCleanupOutboxTargetForObject(
+	object AttachmentCleanupObject,
+) (OutboxTarget, error) {
+	if object.AttachmentID == 0 ||
+		strings.TrimSpace(object.StoragePath) == "" ||
+		!validAttachmentStoreID(object.StoreID) ||
+		strings.TrimSpace(object.StorageType) == "" {
+		return OutboxTarget{}, ErrInvalidAttachmentCleanup
+	}
+	sum := attachmentCleanupReferenceDigest(
+		object.StorageType,
+		object.StoreID,
+		object.StoragePath,
+		object.VersionID,
+	)
+	return OutboxTarget{
+		Type: AttachmentCleanupOutboxDestination,
+		ID: fmt.Sprintf(
+			"%s%d:%s",
+			attachmentCleanupPrefix,
+			object.AttachmentID,
+			hex.EncodeToString(sum[:]),
+		),
+		MaxAttempts: 8,
+	}, nil
+}
+
 // ValidateAttachmentCleanupDestination verifies that a delivery still refers
 // to the exact attachment ID and storage key captured by the deletion
 // transaction.
@@ -228,6 +266,48 @@ func ValidateAttachmentCleanupDestination(
 		return 0, ErrInvalidAttachmentCleanup
 	}
 	return attachmentID, nil
+}
+
+func validateAttachmentCleanupObjectDestination(
+	destinationID string,
+	object AttachmentCleanupObject,
+) (uint, error) {
+	attachmentID, expectedHash, err := parseAttachmentCleanupDestination(
+		destinationID,
+	)
+	if err != nil {
+		return 0, ErrInvalidAttachmentCleanup
+	}
+	if object.StoreID == "" && object.VersionID == "" {
+		return ValidateAttachmentCleanupDestination(
+			destinationID,
+			object.StoragePath,
+		)
+	}
+	sum := attachmentCleanupReferenceDigest(
+		object.StorageType,
+		object.StoreID,
+		object.StoragePath,
+		object.VersionID,
+	)
+	if expectedHash != hex.EncodeToString(sum[:]) {
+		return 0, ErrInvalidAttachmentCleanup
+	}
+	return attachmentID, nil
+}
+
+func attachmentCleanupReferenceDigest(
+	storageType string,
+	storeID string,
+	storagePath string,
+	versionID string,
+) [sha256.Size]byte {
+	return sha256.Sum256([]byte(
+		strings.ToLower(strings.TrimSpace(storageType)) + "\x00" +
+			normalizeAttachmentStoreID(storeID) + "\x00" +
+			storagePath + "\x00" +
+			versionID,
+	))
 }
 
 func parseAttachmentCleanupDestination(destinationID string) (uint, string, error) {
@@ -257,14 +337,20 @@ type AgentNativeOptions struct {
 	AttachmentStorage          AttachmentStorage
 	AttachmentStaging          AttachmentStagingStore
 	AttachmentMaxBytes         int64
-	OutboxLockTTL              time.Duration
-	OutboxDeliveryTimeout      time.Duration
-	OutboxDeliveryConcurrency  int
-	LoopThreshold              int
-	LoopWindow                 time.Duration
-	ExecutionGuard             AgentExecutionGuard
-	ExecutionLeaseTTL          time.Duration
-	AuditLedger                *AuditLedgerService
+	// AttachmentDownloadConcurrency bounds all attachment downloads handled
+	// by this process. A slot remains held until the returned reader is closed.
+	AttachmentDownloadConcurrency int
+	// AttachmentDownloadPerActorConcurrency prevents one Human, Agent, or
+	// system actor from consuming the complete process-wide download budget.
+	AttachmentDownloadPerActorConcurrency int
+	OutboxLockTTL                         time.Duration
+	OutboxDeliveryTimeout                 time.Duration
+	OutboxDeliveryConcurrency             int
+	LoopThreshold                         int
+	LoopWindow                            time.Duration
+	ExecutionGuard                        AgentExecutionGuard
+	ExecutionLeaseTTL                     time.Duration
+	AuditLedger                           *AuditLedgerService
 	// RequireDistributedExecutionGuard prevents a production deployment from
 	// silently falling back to process-local enforcement when Redis is absent.
 	RequireDistributedExecutionGuard bool
@@ -288,6 +374,10 @@ type AgentNativeService struct {
 	attachmentStorage          AttachmentStorage
 	attachmentStaging          AttachmentStagingStore
 	attachmentMaxBytes         int64
+	attachmentDownloadSlots    chan struct{}
+	attachmentDownloadPerActor int
+	attachmentDownloadActorsMu sync.Mutex
+	attachmentDownloadActors   map[string]*attachmentDownloadActorSlots
 	outboxLockTTL              time.Duration
 	outboxDeliveryTimeout      time.Duration
 	outboxDeliverySlots        chan struct{}
@@ -376,6 +466,34 @@ func NewAgentNativeService(db *gorm.DB, provided ...AgentNativeOptions) *AgentNa
 	if options.AttachmentMaxBytes <= 0 {
 		options.AttachmentMaxBytes = 25 << 20
 	}
+	if options.AttachmentStaging == nil {
+		if staging, ok := options.AttachmentStorage.(AttachmentStagingStore); ok {
+			options.AttachmentStaging = staging
+		}
+	}
+	if options.AttachmentDownloadConcurrency <= 0 {
+		options.AttachmentDownloadConcurrency =
+			defaultAttachmentDownloadConcurrency
+	}
+	if options.AttachmentDownloadConcurrency >
+		maxAttachmentDownloadConcurrency {
+		options.AttachmentDownloadConcurrency =
+			maxAttachmentDownloadConcurrency
+	}
+	if options.AttachmentDownloadPerActorConcurrency <= 0 {
+		options.AttachmentDownloadPerActorConcurrency =
+			defaultAttachmentDownloadPerActorConcurrency
+	}
+	if options.AttachmentDownloadPerActorConcurrency >
+		maxAttachmentDownloadPerActorConcurrency {
+		options.AttachmentDownloadPerActorConcurrency =
+			maxAttachmentDownloadPerActorConcurrency
+	}
+	if options.AttachmentDownloadPerActorConcurrency >
+		options.AttachmentDownloadConcurrency {
+		options.AttachmentDownloadPerActorConcurrency =
+			options.AttachmentDownloadConcurrency
+	}
 	if options.OutboxLockTTL <= 0 {
 		options.OutboxLockTTL = 2 * time.Minute
 	}
@@ -420,16 +538,24 @@ func NewAgentNativeService(db *gorm.DB, provided ...AgentNativeOptions) *AgentNa
 		attachmentStorage:          options.AttachmentStorage,
 		attachmentStaging:          options.AttachmentStaging,
 		attachmentMaxBytes:         options.AttachmentMaxBytes,
-		outboxLockTTL:              options.OutboxLockTTL,
-		outboxDeliveryTimeout:      options.OutboxDeliveryTimeout,
-		outboxDeliverySlots:        make(chan struct{}, options.OutboxDeliveryConcurrency),
-		loopThreshold:              options.LoopThreshold,
-		loopWindow:                 options.LoopWindow,
-		executionGuard:             options.ExecutionGuard,
-		executionLeaseTTL:          options.ExecutionLeaseTTL,
-		auditLedger:                options.AuditLedger,
-		requireDistributedGuard:    options.RequireDistributedExecutionGuard,
-		now:                        options.Now,
+		attachmentDownloadSlots: make(
+			chan struct{},
+			options.AttachmentDownloadConcurrency,
+		),
+		attachmentDownloadPerActor: options.AttachmentDownloadPerActorConcurrency,
+		attachmentDownloadActors: make(
+			map[string]*attachmentDownloadActorSlots,
+		),
+		outboxLockTTL:           options.OutboxLockTTL,
+		outboxDeliveryTimeout:   options.OutboxDeliveryTimeout,
+		outboxDeliverySlots:     make(chan struct{}, options.OutboxDeliveryConcurrency),
+		loopThreshold:           options.LoopThreshold,
+		loopWindow:              options.LoopWindow,
+		executionGuard:          options.ExecutionGuard,
+		executionLeaseTTL:       options.ExecutionLeaseTTL,
+		auditLedger:             options.AuditLedger,
+		requireDistributedGuard: options.RequireDistributedExecutionGuard,
+		now:                     options.Now,
 	}
 }
 
@@ -2448,9 +2574,34 @@ func AttachmentCleanupStoragePath(
 	event CloudEventEnvelope,
 	destinationID string,
 ) (string, error) {
-	attachmentID, _, err := parseAttachmentCleanupDestination(destinationID)
+	reference, err := AttachmentCleanupStorageReference(
+		event,
+		destinationID,
+	)
 	if err != nil {
 		return "", err
+	}
+	return reference.StoragePath, nil
+}
+
+type AttachmentCleanupReference struct {
+	StorageType string
+	StoreID     string
+	StoragePath string
+	VersionID   string
+}
+
+// AttachmentCleanupStorageReference resolves the private storage backend and
+// logical key captured by the deletion transaction. Older manifests omit the
+// backend; a TypedAttachmentStorage may then delete that immutable key from
+// every configured migration backend.
+func AttachmentCleanupStorageReference(
+	event CloudEventEnvelope,
+	destinationID string,
+) (AttachmentCleanupReference, error) {
+	attachmentID, _, err := parseAttachmentCleanupDestination(destinationID)
+	if err != nil {
+		return AttachmentCleanupReference{}, err
 	}
 	raw := event.InternalData
 	if len(raw) == 0 {
@@ -2461,7 +2612,7 @@ func AttachmentCleanupStoragePath(
 	}
 	if err := json.Unmarshal(event.Data, &publicData); err != nil ||
 		publicData.TicketID == 0 {
-		return "", ErrInvalidAttachmentCleanup
+		return AttachmentCleanupReference{}, ErrInvalidAttachmentCleanup
 	}
 	var data struct {
 		TicketID uint                      `json:"ticket_id"`
@@ -2470,9 +2621,9 @@ func AttachmentCleanupStoragePath(
 	if err := json.Unmarshal(raw, &data); err != nil ||
 		data.TicketID == 0 ||
 		data.TicketID != publicData.TicketID {
-		return "", ErrInvalidAttachmentCleanup
+		return AttachmentCleanupReference{}, ErrInvalidAttachmentCleanup
 	}
-	var storagePath string
+	var reference AttachmentCleanupReference
 	matches := 0
 	for _, object := range data.Objects {
 		if object.AttachmentID != attachmentID {
@@ -2480,17 +2631,32 @@ func AttachmentCleanupStoragePath(
 		}
 		matches++
 		if matches > 1 || object.TicketID != data.TicketID {
-			return "", ErrInvalidAttachmentCleanup
+			return AttachmentCleanupReference{}, ErrInvalidAttachmentCleanup
 		}
-		storagePath = object.StoragePath
+		reference = AttachmentCleanupReference{
+			StorageType: object.StorageType,
+			StoreID:     object.StoreID,
+			StoragePath: object.StoragePath,
+			VersionID:   object.VersionID,
+		}
 	}
-	if matches != 1 || storagePath == "" {
-		return "", ErrInvalidAttachmentCleanup
+	if matches != 1 || reference.StoragePath == "" {
+		return AttachmentCleanupReference{}, ErrInvalidAttachmentCleanup
 	}
-	if _, err := ValidateAttachmentCleanupDestination(destinationID, storagePath); err != nil {
-		return "", err
+	if _, err := validateAttachmentCleanupObjectDestination(
+		destinationID,
+		AttachmentCleanupObject{
+			AttachmentID: attachmentID,
+			TicketID:     data.TicketID,
+			StorageType:  reference.StorageType,
+			StoreID:      reference.StoreID,
+			StoragePath:  reference.StoragePath,
+			VersionID:    reference.VersionID,
+		},
+	); err != nil {
+		return AttachmentCleanupReference{}, err
 	}
-	return storagePath, nil
+	return reference, nil
 }
 
 func (s *AgentNativeService) AppendDomainEventTx(
@@ -4635,6 +4801,14 @@ func (s *AgentNativeService) CreateNativeTicket(
 	if !status.IsValid() {
 		return nil, fmt.Errorf("invalid ticket status %q", status)
 	}
+	normalizedTags, err := normalizeTicketTags(input.Request.Tags)
+	if err != nil {
+		return nil, err
+	}
+	input.Request.Tags = normalizedTags
+	if err := validateAgentContext(input.Request.AgentContext); err != nil {
+		return nil, err
+	}
 	if input.TrustLevel == "" {
 		input.TrustLevel = models.TicketTrustLevelUntrusted
 	} else if !validTrustLevel(input.TrustLevel) {
@@ -4796,6 +4970,15 @@ func (s *AgentNativeService) CreateNativeTicket(
 		)
 		if configurationErr != nil {
 			return configurationErr
+		}
+		if err := validateTicketCategorySelectionTx(
+			ctx,
+			tx,
+			operation.Scope,
+			ticket.CategoryID,
+			ticket.SubcategoryID,
+		); err != nil {
+			return err
 		}
 		initialStatus, configurationErr := configuration.InitialStatus()
 		if configurationErr != nil {
@@ -5495,8 +5678,9 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 			}
 		}
 		if input.ParentID != nil {
-			var count int64
-			if err := tx.Model(&models.TicketComment{}).
+			var parent models.TicketComment
+			if err := tx.
+				Select("id", "parent_id").
 				Where(
 					"id = ? AND ticket_id = ? AND organization_id = ? AND project_id = ? AND is_deleted = ?",
 					*input.ParentID,
@@ -5505,11 +5689,13 @@ func (s *AgentNativeService) CreateComment(ctx context.Context, input NativeComm
 					projectScope.ProjectID,
 					false,
 				).
-				Count(&count).Error; err != nil {
+				First(&parent).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("%w: parent comment not found", ErrInvalidComment)
+			} else if err != nil {
 				return err
 			}
-			if count != 1 {
-				return fmt.Errorf("%w: parent comment not found", ErrInvalidComment)
+			if parent.ParentID != nil {
+				return fmt.Errorf("%w: %w", ErrInvalidComment, ErrNestedCommentReply)
 			}
 		}
 		if err := tx.Create(comment).Error; err != nil {
@@ -5712,6 +5898,9 @@ type StoredAttachmentObject struct {
 	Size                int64
 	SHA256              string
 	DetectedContentType string
+	StorageType         string
+	StoreID             string
+	VersionID           string
 }
 
 type LocalAttachmentStorage struct {
@@ -6250,7 +6439,7 @@ func (s *AgentNativeService) StoreAttachment(
 		ServicePrincipalID: actorServicePrincipalID(input.Actor),
 		FileName:           storageName,
 		OriginalName:       safeName,
-		FileType:           input.FileType,
+		FileType:           models.AttachmentTypeOther,
 		Extension:          extension,
 		StoragePath:        stagingKey,
 		StorageType:        attachmentStagingIntentStorageType,
@@ -6295,19 +6484,13 @@ func (s *AgentNativeService) StoreAttachment(
 	if staged.Size == 0 {
 		return nil, ErrInvalidAttachment
 	}
-	contentType := strings.TrimSpace(input.ContentType)
-	if contentType == "" || contentType == "application/octet-stream" {
-		contentType = staged.DetectedContentType
+	contentType := "application/octet-stream"
+	if parsedType, _, parseErr := mime.ParseMediaType(
+		strings.TrimSpace(staged.DetectedContentType),
+	); parseErr == nil && parsedType != "" {
+		contentType = strings.ToLower(parsedType)
 	}
-	if parsedType, _, parseErr := mime.ParseMediaType(contentType); parseErr == nil {
-		contentType = parsedType
-	} else {
-		contentType = "application/octet-stream"
-	}
-	fileType := input.FileType
-	if fileType == "" {
-		fileType = attachmentTypeForMIME(contentType)
-	}
+	fileType := attachmentTypeForMIME(contentType)
 	attachment.FileSize = staged.Size
 	attachment.MimeType = contentType
 	attachment.FileType = fileType
@@ -6316,6 +6499,7 @@ func (s *AgentNativeService) StoreAttachment(
 	attachment.Hash = staged.SHA256
 	uploadMigration, err := newAttachmentUploadMigrationIntent(
 		*attachment,
+		s.attachmentStorage,
 	)
 	if err != nil {
 		return nil, err
@@ -6812,11 +6996,22 @@ func sanitizeTicketChanges(input map[string]any) (map[string]any, []string, erro
 		case "agent_context":
 			encoded, err := json.Marshal(value)
 			if err != nil {
-				return nil, nil, fmt.Errorf("encode agent_context: %w", err)
+				return nil, nil, fmt.Errorf(
+					"%w: encode agent_context: %v",
+					ErrInvalidAgentContext,
+					err,
+				)
 			}
 			var contextValue models.AgentContext
 			if err := json.Unmarshal(encoded, &contextValue); err != nil {
-				return nil, nil, fmt.Errorf("decode agent_context: %w", err)
+				return nil, nil, fmt.Errorf(
+					"%w: decode agent_context: %v",
+					ErrInvalidAgentContext,
+					err,
+				)
+			}
+			if err := validateAgentContext(&contextValue); err != nil {
+				return nil, nil, err
 			}
 			value = datatypes.NewJSONType(contextValue)
 		case "custom_fields":
@@ -6838,7 +7033,18 @@ func sanitizeTicketChanges(input map[string]any) (map[string]any, []string, erro
 			if err := json.Unmarshal(encoded, &tags); err != nil {
 				return nil, nil, fmt.Errorf("decode tags: %w", err)
 			}
-			value = datatypes.NewJSONSlice(tags)
+			normalizedTags, err := normalizeTicketTags(tags)
+			if err != nil {
+				return nil, nil, err
+			}
+			value = datatypes.NewJSONSlice([]string(normalizedTags))
+		case "category_id", "subcategory_id":
+			normalizedCategoryID, err :=
+				normalizeTicketCategoryChange(value)
+			if err != nil {
+				return nil, nil, err
+			}
+			value = normalizedCategoryID
 		}
 		changes[field] = value
 		fields = append(fields, field)
@@ -7020,6 +7226,43 @@ func validateTicketChangeSemantics(
 	changes map[string]any,
 	actor models.ActorRef,
 ) error {
+	categoryID := ticket.CategoryID
+	subcategoryID := ticket.SubcategoryID
+	if value, ok := changes["category_id"]; ok {
+		var err error
+		categoryID, err = optionalTicketCategoryID(value)
+		if err != nil {
+			return err
+		}
+	}
+	if value, ok := changes["subcategory_id"]; ok {
+		var err error
+		subcategoryID, err = optionalTicketCategoryID(value)
+		if err != nil {
+			return err
+		}
+	}
+	if _, categoryChanged := changes["category_id"]; categoryChanged {
+		if err := validateTicketCategorySelectionTx(
+			ctx,
+			tx,
+			scope,
+			categoryID,
+			subcategoryID,
+		); err != nil {
+			return err
+		}
+	} else if _, subcategoryChanged := changes["subcategory_id"]; subcategoryChanged {
+		if err := validateTicketCategorySelectionTx(
+			ctx,
+			tx,
+			scope,
+			categoryID,
+			subcategoryID,
+		); err != nil {
+			return err
+		}
+	}
 	if value, ok := changes["status"]; ok {
 		status := models.TicketStatus(fmt.Sprint(value))
 		if err := validateTicketWorkflowTransitionTx(

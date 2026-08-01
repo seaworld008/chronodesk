@@ -24,7 +24,10 @@
 ## 运维
 
 - [数据库迁移](operations/database-migrations.md)
+- [平台审计导出](operations/audit-exports.md)
 - [数据库静态加密](reference/DATA_AT_REST_ENCRYPTION.md)
+- [附件存储、安全预览与 Agent 读取](reference/attachment-storage-and-preview.md)
+- [项目知识库：工单驱动的解决方案沉淀](reference/knowledge-library.md)
 
 ## 协议与机器契约
 

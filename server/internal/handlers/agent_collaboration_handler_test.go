@@ -621,6 +621,68 @@ func TestAgentCollaborationHandlerLeastPrivilegeAndStrictJSON(
 	}
 }
 
+func TestAgentCollaborationHandlerUsesStrictBoundedPagination(t *testing.T) {
+	fixture := newCollaborationHandlerFixture(t)
+	router := fixture.router(models.ProjectRoleManager)
+	for _, resource := range []string{
+		"runs",
+		"proposals",
+		"approvals",
+		"handoffs",
+	} {
+		t.Run(resource+" defaults to 25", func(t *testing.T) {
+			response := performCollaborationRequest(
+				t,
+				router,
+				http.MethodGet,
+				"/api/projects/TEST/agent-collaboration/"+resource,
+				"",
+			)
+			if response.Code != http.StatusOK ||
+				!strings.Contains(response.Body.String(), `"page_size":25`) {
+				t.Fatalf(
+					"default pagination = %d %s",
+					response.Code,
+					response.Body.String(),
+				)
+			}
+		})
+		for _, query := range []string{
+			"page=0",
+			"page=-1",
+			"page_size=0",
+			"page_size=101",
+			"page_size=",
+			"page_size=25&page_size=50",
+			"page_size=%2025",
+			"unknown=value",
+			"page=999999999999999999999999999999",
+		} {
+			t.Run(resource+" rejects "+query, func(t *testing.T) {
+				response := performCollaborationRequest(
+					t,
+					router,
+					http.MethodGet,
+					"/api/projects/TEST/agent-collaboration/"+
+						resource+"?"+query,
+					"",
+				)
+				if response.Code != http.StatusBadRequest ||
+					!strings.Contains(
+						response.Body.String(),
+						`"code":"invalid_pagination"`,
+					) {
+					t.Fatalf(
+						"invalid pagination = %d %s",
+						response.Code,
+						response.Body.String(),
+					)
+				}
+			})
+		}
+	}
+}
+
 func TestAgentCollaborationHandlerRejectsUntrustedOperationContext(
 	t *testing.T,
 ) {

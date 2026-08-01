@@ -1,4 +1,8 @@
-import type { APIRequestContext, Page } from '@playwright/test';
+import type {
+    APIRequestContext,
+    APIResponse,
+    Page,
+} from '@playwright/test';
 import {
     projectRoleValues,
     type UpdatePlatformConfigOperationRequest,
@@ -227,10 +231,9 @@ export const resolveE2EProjectKey = (
         const response = await apiRequest<Record<string, unknown>>(
             request,
             token,
-            '/api/projects',
+            '/api/projects?page=1&page_size=100&sort_by=name&sort_order=asc',
         );
-        const accesses =
-            extractData<Array<Record<string, unknown>>>(response) ?? [];
+        const accesses = extractItems<Record<string, unknown>>(response);
         const selected = accesses
             .filter((access) =>
                 typeof access.project_role === 'string' &&
@@ -318,6 +321,35 @@ export const resolveE2ETicketCreateConfiguration = (
     return pending;
 };
 
+const waitForAuthenticatedShell = async (
+    page: Page,
+    expectedProjectKey: string,
+) => {
+    await page
+        .getByRole('banner')
+        .getByRole('button', { name: '账号', exact: true })
+        .waitFor({ timeout: 15_000 });
+    await page.getByRole('main').waitFor({ timeout: 15_000 });
+    await page
+        .getByTestId('project-switcher-loading')
+        .waitFor({ state: 'hidden', timeout: 15_000 });
+    await page
+        .getByTestId('active-project-switcher')
+        .waitFor({ state: 'visible', timeout: 15_000 });
+    await page.waitForFunction((projectKey) => {
+        const serialized = localStorage.getItem('chronodesk.activeProject');
+        if (!serialized) return false;
+        try {
+            const selection = JSON.parse(serialized) as {
+                project_key?: unknown;
+            };
+            return selection.project_key === projectKey;
+        } catch {
+            return false;
+        }
+    }, expectedProjectKey, { timeout: 15_000 });
+};
+
 export const authenticatePage = async (
     page: Page,
     credentials: Credentials = DEFAULT_ADMIN,
@@ -367,7 +399,7 @@ export const authenticatePage = async (
         sessionBinding: binding,
     });
     await page.goto('/#/');
-    await page.getByRole('menuitem', { name: '工单管理' }).waitFor({ timeout: 15000 });
+    await waitForAuthenticatedShell(page, projectKey);
 };
 
 export const selectDefaultProjectViaUI = async (page: Page) => {
@@ -378,9 +410,8 @@ export const selectDefaultProjectViaUI = async (page: Page) => {
     await projectSelection
         .getByTestId('select-project-DEFAULT')
         .click();
-    await page
-        .getByRole('menuitem', { name: '工单管理', exact: true })
-        .waitFor({ timeout: 15_000 });
+    await projectSelection.waitFor({ state: 'hidden', timeout: 15_000 });
+    await waitForAuthenticatedShell(page, 'DEFAULT');
 
     const selectedProjectKey = await page.evaluate(() => {
         const serialized = localStorage.getItem('chronodesk.activeProject');
@@ -459,12 +490,106 @@ type TemporaryRoleAccount = Credentials & {
     optionLabel: string;
 };
 
+type ProjectMembership = {
+    user_id?: unknown;
+    role?: unknown;
+    is_active?: unknown;
+    version?: unknown;
+};
+
 export type TemporaryRoleAccounts = {
     agent: TemporaryRoleAccount;
     requester: TemporaryRoleAccount;
 };
 
 let temporaryRoleAccounts: Promise<TemporaryRoleAccounts> | undefined;
+const trackedMembershipTargets = new Set<string>();
+const trackedMembershipVersions = new Map<string, number>();
+
+const membershipTrackingKey = (projectKey: string, userID: number) =>
+    `${projectKey}:${userID}`;
+
+const positiveVersion = (value: unknown): value is number =>
+    typeof value === 'number' &&
+    Number.isSafeInteger(value) &&
+    value > 0;
+
+const responsePayload = async (
+    response: APIResponse,
+): Promise<Record<string, unknown> | undefined> => {
+    const payload = await response.json().catch(() => undefined);
+    return isRecord(payload) ? payload : undefined;
+};
+
+const membershipVersion = (
+    membership: ProjectMembership | undefined,
+    userID: number,
+    expectedRole?: TemporaryRoleAccount['projectRole'],
+) => {
+    if (
+        membership?.user_id !== userID ||
+        membership.is_active !== true ||
+        (expectedRole !== undefined && membership.role !== expectedRole) ||
+        !positiveVersion(membership.version)
+    ) {
+        return undefined;
+    }
+    return membership.version;
+};
+
+const findProjectMembership = async (
+    request: APIRequestContext,
+    token: string,
+    projectKey: string,
+    userID: number,
+): Promise<ProjectMembership | undefined> => {
+    let page = 1;
+    while (true) {
+        const query = new URLSearchParams({
+            page: String(page),
+            page_size: '100',
+            sort_by: 'user_id',
+            sort_order: 'asc',
+        });
+        const response = await apiRequest<Record<string, unknown>>(
+            request,
+            token,
+            `${projectAPIPath(projectKey, 'memberships')}?${query.toString()}`,
+        );
+        const directory = extractData<Record<string, unknown>>(response);
+        const items = directory.items;
+        const totalPages = directory.total_pages;
+        if (
+            !Array.isArray(items) ||
+            typeof totalPages !== 'number' ||
+            !Number.isSafeInteger(totalPages) ||
+            totalPages < 0 ||
+            directory.page !== page
+        ) {
+            throw new Error('项目成员对账响应缺少严格分页数据');
+        }
+        const matches = items.filter(
+            (item): item is ProjectMembership =>
+                isRecord(item) && item.user_id === userID,
+        );
+        if (matches.length > 1) {
+            throw new Error(`项目成员对账发现重复用户：${userID}`);
+        }
+        if (matches.length === 1) {
+            return matches[0];
+        }
+        if (page >= totalPages) {
+            return undefined;
+        }
+        page += 1;
+    }
+};
+
+const clearTrackedMembership = (projectKey: string, userID: number) => {
+    const key = membershipTrackingKey(projectKey, userID);
+    trackedMembershipTargets.delete(key);
+    trackedMembershipVersions.delete(key);
+};
 
 const temporaryRoleAccountIdentity = (
     account: keyof TemporaryRoleAccounts,
@@ -477,28 +602,209 @@ const temporaryRoleAccountIdentity = (
     return { username, email };
 };
 
+const createProjectMembership = async (
+    request: APIRequestContext,
+    token: string,
+    projectKey: string,
+    userID: number,
+    role: TemporaryRoleAccount['projectRole'],
+) => {
+    if (!trackedResources.users.has(String(userID))) {
+        throw new Error(`拒绝为非本轮创建用户授权项目成员：${userID}`);
+    }
+    assertDestructiveE2EAllowed(
+        `POST project membership ${projectKey}/${userID}`,
+    );
+    const key = membershipTrackingKey(projectKey, userID);
+    trackedMembershipTargets.add(key);
+    const path = projectAPIPath(projectKey, 'memberships');
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        let response: APIResponse;
+        try {
+            response = await request.post(path, {
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    'Content-Type': 'application/json',
+                },
+                data: {
+                    user_id: userID,
+                    role,
+                    expected_version: 0,
+                },
+            });
+        } catch (error) {
+            const current = await findProjectMembership(
+                request,
+                token,
+                projectKey,
+                userID,
+            );
+            const currentVersion = membershipVersion(
+                current,
+                userID,
+                role,
+            );
+            if (currentVersion !== undefined) {
+                trackedMembershipVersions.set(key, currentVersion);
+                return;
+            }
+            if (current !== undefined || attempt === 1) {
+                throw new Error(
+                    `创建用户 ${userID} 的项目成员结果不确定，且对账未确认目标授权：${
+                        error instanceof Error ? error.message : String(error)
+                    }`,
+                );
+            }
+            continue;
+        }
+
+        const payload = await responsePayload(response);
+        if (response.status() === 200) {
+            const persisted = extractData<ProjectMembership>(payload ?? {});
+            let version = membershipVersion(persisted, userID, role);
+            if (version === undefined) {
+                version = membershipVersion(
+                    await findProjectMembership(
+                        request,
+                        token,
+                        projectKey,
+                        userID,
+                    ),
+                    userID,
+                    role,
+                );
+            }
+            if (version === undefined) {
+                throw new Error(
+                    `创建用户 ${userID} 的项目成员后缺少有效版本`,
+                );
+            }
+            trackedMembershipVersions.set(key, version);
+            return;
+        }
+
+        if (response.status() === 409) {
+            const current = await findProjectMembership(
+                request,
+                token,
+                projectKey,
+                userID,
+            );
+            const currentVersion = membershipVersion(
+                current,
+                userID,
+                role,
+            );
+            if (currentVersion !== undefined) {
+                trackedMembershipVersions.set(key, currentVersion);
+                return;
+            }
+            if (current === undefined && attempt === 0) {
+                continue;
+            }
+        }
+        throw new Error(
+            `创建用户 ${userID} 的项目成员失败：HTTP ${response.status()}`,
+        );
+    }
+};
+
 const deactivateProjectMembership = async (
     request: APIRequestContext,
     token: string,
     projectKey: string,
     userID: number,
 ) => {
+    if (!trackedResources.users.has(String(userID))) {
+        throw new Error(`拒绝清理非本轮创建用户的项目成员：${userID}`);
+    }
+    const key = membershipTrackingKey(projectKey, userID);
+    if (!trackedMembershipTargets.has(key)) {
+        return;
+    }
     assertDestructiveE2EAllowed(
         `DELETE project membership ${projectKey}/${userID}`,
     );
-    const response = await request.delete(
-        projectAPIPath(
-            projectKey,
-            `memberships/${encodeURIComponent(userID)}`,
-        ),
-        {
-            headers: {
-                Authorization: `Bearer ${token}`,
-                'Content-Type': 'application/json',
-            },
-        },
+    const path = projectAPIPath(
+        projectKey,
+        `memberships/${encodeURIComponent(userID)}`,
     );
-    if (![200, 204, 404].includes(response.status())) {
+    let version = trackedMembershipVersions.get(key);
+    if (!positiveVersion(version)) {
+        const current = await findProjectMembership(
+            request,
+            token,
+            projectKey,
+            userID,
+        );
+        if (current === undefined || current.is_active === false) {
+            clearTrackedMembership(projectKey, userID);
+            return;
+        }
+        version = membershipVersion(current, userID);
+        if (version === undefined) {
+            throw new Error(`用户 ${userID} 的项目成员清理版本无效`);
+        }
+        trackedMembershipVersions.set(key, version);
+    }
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        let response: APIResponse;
+        try {
+            response = await request.delete(path, {
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    'Content-Type': 'application/json',
+                },
+                params: { expected_version: version },
+            });
+        } catch (error) {
+            const current = await findProjectMembership(
+                request,
+                token,
+                projectKey,
+                userID,
+            );
+            if (current === undefined || current.is_active === false) {
+                clearTrackedMembership(projectKey, userID);
+                return;
+            }
+            const refreshedVersion = membershipVersion(current, userID);
+            if (refreshedVersion === undefined || attempt === 1) {
+                throw new Error(
+                    `撤销用户 ${userID} 的项目成员结果不确定，且对账仍为有效授权：${
+                        error instanceof Error ? error.message : String(error)
+                    }`,
+                );
+            }
+            version = refreshedVersion;
+            trackedMembershipVersions.set(key, version);
+            continue;
+        }
+
+        if ([200, 204, 404].includes(response.status())) {
+            clearTrackedMembership(projectKey, userID);
+            return;
+        }
+        if (response.status() === 409) {
+            const current = await findProjectMembership(
+                request,
+                token,
+                projectKey,
+                userID,
+            );
+            if (current === undefined || current.is_active === false) {
+                clearTrackedMembership(projectKey, userID);
+                return;
+            }
+            const refreshedVersion = membershipVersion(current, userID);
+            if (refreshedVersion !== undefined && attempt === 0) {
+                version = refreshedVersion;
+                trackedMembershipVersions.set(key, version);
+                continue;
+            }
+        }
         throw new Error(
             `撤销临时用户 ${userID} 的项目成员关系失败：HTTP ${response.status()}`,
         );
@@ -617,17 +923,12 @@ export const ensureRoleAccounts = async (
                 }
                 createdUserIDs.push(created.id);
                 trackE2EResource('users', created.id);
-                await apiRequest(
+                await createProjectMembership(
                     request,
                     token,
-                    projectAPIPath(projectKey, 'memberships'),
-                    {
-                        method: 'POST',
-                        data: {
-                            user_id: created.id,
-                            role: definition.projectRole,
-                        },
-                    },
+                    projectKey,
+                    created.id,
+                    definition.projectRole,
                 );
                 result[definition.key] = {
                     id: created.id,
@@ -903,13 +1204,21 @@ type AgentControlPrincipal = {
 type AgentControlSnapshot = {
     global_read_only: boolean;
     emergency_stop: boolean;
-    principals: AgentControlPrincipal[];
-    attachments?: Array<{
-        id: number;
-        original_name: string;
-        virus_scan: string;
-        resource_version: number;
-    }>;
+};
+
+type AgentControlPage<T> = {
+    items: T[];
+    total: number;
+    page: number;
+    page_size: number;
+    total_pages: number;
+};
+
+type AgentAttachmentScan = {
+    id: number;
+    original_name: string;
+    virus_scan: string;
+    resource_version: number;
 };
 
 const getAgentControlSnapshot = async (
@@ -924,6 +1233,34 @@ const getAgentControlSnapshot = async (
         projectAPIPath(projectKey, 'admin/agents/agent-control/overview'),
     );
     return extractData<AgentControlSnapshot>(response);
+};
+
+const getAllAgentListItems = async <T>(
+    request: APIRequestContext,
+    token: string,
+    path: string,
+    sortBy: string,
+    sortOrder: 'asc' | 'desc',
+): Promise<T[]> => {
+    const items: T[] = [];
+    let page = 1;
+    while (true) {
+        const query = new URLSearchParams({
+            page: String(page),
+            page_size: '100',
+            sort_by: sortBy,
+            sort_order: sortOrder,
+        });
+        const response = await apiRequest<Record<string, unknown>>(
+            request,
+            token,
+            `${path}?${query.toString()}`,
+        );
+        const result = extractData<AgentControlPage<T>>(response);
+        items.push(...(result.items ?? []));
+        if (page >= result.total_pages) return items;
+        page += 1;
+    }
 };
 
 export type AgentGlobalControlSnapshot = Pick<
@@ -969,10 +1306,10 @@ const disableTrackedAgentPrincipals = async (
             token,
             `${agentAdminPath}/service-principals/${principalID}/policies`,
         );
-        const policies = extractData<Array<Record<string, unknown>>>(
+        const policyPage = extractData<AgentControlPage<Record<string, unknown>>>(
             policyResponse,
-        ) ?? [];
-        for (const policy of policies) {
+        );
+        for (const policy of policyPage.items ?? []) {
             if (
                 policy.is_active !== true ||
                 typeof policy.id !== 'string' ||
@@ -991,8 +1328,14 @@ const disableTrackedAgentPrincipals = async (
             );
         }
 
-        const snapshot = await getAgentControlSnapshot(request, token);
-        const principal = snapshot.principals.find(
+        const principals = await getAllAgentListItems<AgentControlPrincipal>(
+            request,
+            token,
+            `${agentAdminPath}/service-principals`,
+            'created_at',
+            'desc',
+        );
+        const principal = principals.find(
             (candidate) => candidate.id === principalID,
         );
         if (!principal) {
@@ -1040,8 +1383,14 @@ export const markE2EAttachmentClean = async (
     const token = await getAdminToken(request);
     const projectKey = await resolveE2EProjectKey(request, token);
     const agentAdminPath = projectAPIPath(projectKey, 'admin/agents');
-    const snapshot = await getAgentControlSnapshot(request, token);
-    const attachment = (snapshot.attachments ?? []).find(
+    const attachments = await getAllAgentListItems<AgentAttachmentScan>(
+        request,
+        token,
+        `${agentAdminPath}/attachments`,
+        'created_at',
+        'desc',
+    );
+    const attachment = attachments.find(
         (candidate) => candidate.original_name === originalName,
     );
     if (!attachment) {
@@ -1090,9 +1439,12 @@ export const trackTrustedDeviceByName = async (
     const response = await apiRequest<Record<string, unknown>>(
         request,
         token,
-        '/api/user/trusted-devices',
+        '/api/user/trusted-devices?page=1&page_size=100&sort_by=revoked&sort_order=asc',
     );
-    const devices = extractData<Array<Record<string, unknown>>>(response) ?? [];
+    const devicePage = extractData<{
+        items: Array<Record<string, unknown>>;
+    }>(response);
+    const devices = devicePage?.items ?? [];
     const device = devices.find(
         (candidate) => candidate.device_name === deviceName,
     );
@@ -1252,18 +1604,27 @@ export const captureSystemConfig = async (
     key: string,
 ): Promise<SystemConfigSnapshot> => {
     const token = await getAdminToken(request);
-    const response = await apiRequest<Record<string, unknown>>(
-        request,
-        token,
-        `/api/platform/configs?category=${encodeURIComponent(category)}`,
-    );
-    const config = extractData<SystemConfigSnapshot[]>(response).find(
-        (candidate) => candidate.key === key,
-    );
-    if (!config) {
-        throw new Error(`未找到系统配置：${key}`);
+    for (let page = 1; page <= 100; page += 1) {
+        const response = await apiRequest<Record<string, unknown>>(
+            request,
+            token,
+            `/api/platform/configs?category=${encodeURIComponent(category)}&page=${page}&page_size=100&sort_by=group&sort_order=asc`,
+        );
+        const configPage = extractData<{
+            items: SystemConfigSnapshot[];
+            total_pages: number;
+        }>(response);
+        const config = configPage?.items.find(
+            (candidate) => candidate.key === key,
+        );
+        if (config) {
+            return config;
+        }
+        if (!configPage || page >= configPage.total_pages) {
+            break;
+        }
     }
-    return config;
+    throw new Error(`未找到系统配置：${key}`);
 };
 
 export const restoreSystemConfig = async (

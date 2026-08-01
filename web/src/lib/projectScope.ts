@@ -13,8 +13,10 @@ import {
 import { parsePlatformRole } from './accessControl'
 import {
     projectAccessInvalidatedEvent,
+    projectAccessRefreshRequestedEvent,
     projectScopeChangedEvent,
     signalProjectAccessInvalidated,
+    signalProjectInventoryChanged,
     signalProjectScopeChanged,
 } from './projectScopeEvents'
 import {
@@ -62,9 +64,12 @@ export type ProjectCapability =
     | 'write_internal_content'
     | 'manage_notifications'
     | 'manage_automation'
+    | 'view_integrations'
     | 'manage_integrations'
+    | 'view_memberships'
     | 'manage_memberships'
     | 'manage_agents'
+    | 'manage_knowledge'
 
 const projectCapabilities: Record<
     ProjectRole,
@@ -81,9 +86,12 @@ const projectCapabilities: Record<
         'write_internal_content',
         'manage_notifications',
         'manage_automation',
+        'view_integrations',
         'manage_integrations',
+        'view_memberships',
         'manage_memberships',
         'manage_agents',
+        'manage_knowledge',
     ]),
     manager: new Set([
         'view_project',
@@ -96,7 +104,10 @@ const projectCapabilities: Record<
         'write_internal_content',
         'manage_notifications',
         'manage_automation',
+        'view_integrations',
         'manage_integrations',
+        'view_memberships',
+        'manage_knowledge',
     ]),
     agent: new Set([
         'view_project',
@@ -113,7 +124,7 @@ const projectCapabilities: Record<
         'edit_ticket_safe_fields',
         'write_public_content',
     ]),
-    observer: new Set(['view_project']),
+    observer: new Set(['view_project', 'view_integrations']),
 }
 
 export const hasProjectCapability = (
@@ -149,15 +160,53 @@ let projectRequest:
     | Promise<AuthorizedProject[]>
     | undefined
 let projectRequestBinding: string | undefined
+let projectRequestCompletedAt: number | undefined
+let projectAccessRefreshRequest:
+    | Promise<AuthorizedProject[]>
+    | undefined
+const activeProjectSelectionListeners = new Set<() => void>()
+
+export const authorizedProjectAccessCacheTtlMs = 30_000
+
+export const subscribeActiveProjectSelection = (
+    listener: () => void,
+): (() => void) => {
+    activeProjectSelectionListeners.add(listener)
+    return () => activeProjectSelectionListeners.delete(listener)
+}
+
+const notifyActiveProjectSelectionChanged = (): void => {
+    for (const listener of activeProjectSelectionListeners) listener()
+}
+
+const resetAuthorizedProjectCache = (): void => {
+    projectRequest = undefined
+    projectRequestBinding = undefined
+    projectRequestCompletedAt = undefined
+}
 
 if (typeof window !== 'undefined') {
     window.addEventListener(projectAccessInvalidatedEvent, () => {
-        projectRequest = undefined
-        projectRequestBinding = undefined
+        resetAuthorizedProjectCache()
     })
     window.addEventListener(projectScopeChangedEvent, () => {
-        projectRequest = undefined
-        projectRequestBinding = undefined
+        resetAuthorizedProjectCache()
+    })
+    window.addEventListener(projectAccessRefreshRequestedEvent, () => {
+        if (projectAccessRefreshRequest) return
+        resetAuthorizedProjectCache()
+        const refreshRequest = loadAuthorizedProjects(true)
+        projectAccessRefreshRequest = refreshRequest
+        void refreshRequest
+            .then(() => {
+                signalProjectInventoryChanged()
+            })
+            .catch(() => undefined)
+            .finally(() => {
+                if (projectAccessRefreshRequest === refreshRequest) {
+                    projectAccessRefreshRequest = undefined
+                }
+            })
     })
 }
 
@@ -168,6 +217,11 @@ const positiveInteger = (value: unknown): value is number =>
     typeof value === 'number' &&
     Number.isSafeInteger(value) &&
     value > 0
+
+const nonNegativeInteger = (value: unknown): value is number =>
+    typeof value === 'number' &&
+    Number.isSafeInteger(value) &&
+    value >= 0
 
 const nonEmptyString = (value: unknown): value is string =>
     typeof value === 'string' && value.length > 0
@@ -270,7 +324,14 @@ const parseAuthorizedProject = (value: unknown): AuthorizedProject | null => {
     ) {
         return null
     }
-    return value as AuthorizedProject
+    const canCreateKnowledgeDrafts =
+        typeof value.can_create_knowledge_drafts === 'boolean'
+            ? value.can_create_knowledge_drafts
+            : projectRole === 'project_admin' || projectRole === 'manager'
+    return {
+        ...(value as AuthorizedProject),
+        can_create_knowledge_drafts: canCreateKnowledgeDrafts,
+    }
 }
 
 const responseData = (value: unknown): unknown => {
@@ -278,13 +339,86 @@ const responseData = (value: unknown): unknown => {
     return value
 }
 
+const authorizedProjectPageSize = 100
+const maxAuthorizedProjectInventory = 500
+
+type AuthorizedProjectPage = {
+    items: AuthorizedProject[]
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+const parseAuthorizedProjectItems = (
+    value: unknown,
+    body: unknown,
+): AuthorizedProject[] => {
+    if (!Array.isArray(value)) {
+        throw new HttpError('授权项目响应格式无效', 502, body)
+    }
+    const projects = value.map(parseAuthorizedProject)
+    if (projects.some((project) => project === null)) {
+        throw new HttpError('授权项目响应包含无效项目角色或范围', 502, body)
+    }
+    return projects as AuthorizedProject[]
+}
+
+const parseAuthorizedProjectPage = (
+    value: unknown,
+    expectedPage: number,
+    body: unknown,
+): AuthorizedProjectPage | AuthorizedProject[] => {
+    // Keep the prior array response readable for one protected release while
+    // every deployed server moves to the bounded page envelope.
+    if (Array.isArray(value)) {
+        if (expectedPage !== 1) {
+            throw new HttpError('授权项目分页响应格式发生变化', 502, body)
+        }
+        return parseAuthorizedProjectItems(value, body)
+    }
+    if (
+        !isRecord(value) ||
+        !Array.isArray(value.items) ||
+        !nonNegativeInteger(value.total) ||
+        !positiveInteger(value.page) ||
+        !positiveInteger(value.page_size) ||
+        !nonNegativeInteger(value.total_pages) ||
+        value.page !== expectedPage ||
+        value.page_size !== authorizedProjectPageSize ||
+        value.total_pages !== (
+            value.total === 0
+                ? 0
+                : Math.ceil(value.total / authorizedProjectPageSize)
+        )
+    ) {
+        throw new HttpError('授权项目分页响应格式无效', 502, body)
+    }
+    return {
+        items: parseAuthorizedProjectItems(value.items, body),
+        total: value.total,
+        page: value.page,
+        page_size: value.page_size,
+        total_pages: value.total_pages,
+    }
+}
+
+const authorizedProjectPagePath = (page: number): string => {
+    const parameters = new URLSearchParams({
+        page: String(page),
+        page_size: String(authorizedProjectPageSize),
+        sort_by: 'name',
+        sort_order: 'asc',
+    })
+    return `${humanApiRoutes.listAuthorizedHumanProjects()}?${parameters}`
+}
+
 export const loadAuthorizedProjects = async (
     force = false,
 ): Promise<AuthorizedProject[]> => {
     const binding = readHumanSessionBinding()
     if (!binding) {
-        projectRequest = undefined
-        projectRequestBinding = undefined
+        resetAuthorizedProjectCache()
         localStorage.removeItem(activeProjectStorageKey)
         localStorage.removeItem(legacyActiveProjectStorageKey)
         throw new HttpError('登录会话无效，请重新登录', 401, {
@@ -295,38 +429,90 @@ export const loadAuthorizedProjects = async (
     if (
         !force &&
         projectRequest &&
-        projectRequestBinding === currentBindingKey
+        projectRequestBinding === currentBindingKey &&
+        (
+            projectRequestCompletedAt === undefined ||
+            Date.now() - projectRequestCompletedAt <
+                authorizedProjectAccessCacheTtlMs
+        )
     ) {
         return projectRequest
     }
 
     projectRequestBinding = currentBindingKey
+    projectRequestCompletedAt = undefined
     const request = (async () => {
         const token = localStorage.getItem('token')
-        const response = await sessionAwareFetch(
-            joinApiUrl(apiBase, humanApiRoutes.listAuthorizedHumanProjects()),
-            {
-            headers: {
-                Accept: 'application/json',
-                Authorization: `Bearer ${token}`,
-            },
-            },
-        )
-        const body: unknown = await response.json().catch(() => ({}))
-        if (!response.ok) {
-            throw new HttpError(
-                localizedApiErrorMessage(body, response.status),
-                response.status,
+        const projects: AuthorizedProject[] = []
+        const seenPublicIDs = new Set<string>()
+        const seenKeys = new Set<string>()
+        let expectedTotal: number | null = null
+        let totalPages = 1
+        for (let page = 1; page <= totalPages; page += 1) {
+            const response = await sessionAwareFetch(
+                joinApiUrl(apiBase, authorizedProjectPagePath(page)),
+                {
+                    headers: {
+                        Accept: 'application/json',
+                        Authorization: `Bearer ${token}`,
+                    },
+                },
+            )
+            const body: unknown = await response.json().catch(() => ({}))
+            if (!response.ok) {
+                throw new HttpError(
+                    localizedApiErrorMessage(body, response.status),
+                    response.status,
+                    body,
+                )
+            }
+            const payload = parseAuthorizedProjectPage(
+                responseData(body),
+                page,
                 body,
             )
+            if (Array.isArray(payload)) return payload
+            if (page === 1) {
+                expectedTotal = payload.total
+                totalPages = payload.total_pages
+                if (expectedTotal > maxAuthorizedProjectInventory) {
+                    throw new HttpError(
+                        `授权项目超过 ${maxAuthorizedProjectInventory} 个，请联系平台管理员拆分职责范围`,
+                        409,
+                        { code: 'authorized_project_inventory_limit' },
+                    )
+                }
+            } else if (
+                payload.total !== expectedTotal ||
+                payload.total_pages !== totalPages
+            ) {
+                throw new HttpError(
+                    '授权项目在分页读取期间发生变化，请重试',
+                    409,
+                    { code: 'authorized_project_inventory_changed' },
+                )
+            }
+            for (const project of payload.items) {
+                const publicID = project.project.public_id
+                const key = project.project.key
+                if (seenPublicIDs.has(publicID) || seenKeys.has(key)) {
+                    throw new HttpError(
+                        '授权项目分页响应包含重复项目',
+                        502,
+                        body,
+                    )
+                }
+                seenPublicIDs.add(publicID)
+                seenKeys.add(key)
+                projects.push(project)
+            }
         }
-        const payload = responseData(body)
-        if (!Array.isArray(payload)) {
-            throw new HttpError('授权项目响应格式无效', 502, body)
-        }
-        const projects = payload.map(parseAuthorizedProject)
-        if (projects.some((project) => project === null)) {
-            throw new HttpError('授权项目响应包含无效项目角色或范围', 502, body)
+        if (projects.length !== expectedTotal) {
+            throw new HttpError(
+                '授权项目分页响应数量不一致，请重试',
+                409,
+                { code: 'authorized_project_inventory_changed' },
+            )
         }
         const latestBinding = readHumanSessionBinding()
         if (!latestBinding || !sameBinding(binding, latestBinding)) {
@@ -334,19 +520,30 @@ export const loadAuthorizedProjects = async (
                 code: 'project_cache_subject_mismatch',
             })
         }
-        return projects as AuthorizedProject[]
+        return projects
     })()
     projectRequest = request
 
     try {
-        return await request
+        const projects = await request
+        if (projectRequest === request) {
+            projectRequestCompletedAt = Date.now()
+        }
+        return projects
     } catch (error) {
         if (projectRequest === request) {
-            projectRequest = undefined
-            projectRequestBinding = undefined
+            resetAuthorizedProjectCache()
         }
         throw error
     }
+}
+
+export const refreshAuthorizedProjectInventory = async (): Promise<
+    AuthorizedProject[]
+> => {
+    const projects = await loadAuthorizedProjects(true)
+    signalProjectInventoryChanged()
+    return projects
 }
 
 export const activeProjectKey = (): string | undefined => {
@@ -379,7 +576,10 @@ export const resolveActiveProjectAccess = async (): Promise<AuthorizedProject> =
     }
     const selected = projects.find(({ project }) => project.key === stored)
     if (!selected) {
-        clearActiveProjectSelection()
+        // Keep this resolver side-effect free. A cached or in-flight inventory
+        // can become stale while the user switches projects; only explicit
+        // revocation and the latest AppBar inventory reconciliation may remove
+        // the stored selection.
         throw new HttpError('当前账号没有可访问的项目', 403, {
             code: 'active_project_access_lost',
         })
@@ -409,12 +609,14 @@ export const setActiveProjectKey = (
     const previousProjectKey = activeProjectKey()
     localStorage.setItem(activeProjectStorageKey, JSON.stringify(record))
     if (previousProjectKey !== projectKey) {
+        notifyActiveProjectSelectionChanged()
         signalProjectScopeChanged(projectKey)
     }
 }
 
 export const clearActiveProjectSelection = (): void => {
     clearStoredProjectSelection()
+    notifyActiveProjectSelectionChanged()
 }
 
 export const projectResourcePath = async (resourcePath: string): Promise<string> => {
@@ -423,9 +625,12 @@ export const projectResourcePath = async (resourcePath: string): Promise<string>
 }
 
 export const invalidateProjectAccessCache = (): void => {
-    projectRequest = undefined
-    projectRequestBinding = undefined
+    invalidateAuthorizedProjectCache()
     signalProjectAccessInvalidated()
+}
+
+export const invalidateAuthorizedProjectCache = (): void => {
+    resetAuthorizedProjectCache()
 }
 
 export const clearProjectScopeCache = (): void => {

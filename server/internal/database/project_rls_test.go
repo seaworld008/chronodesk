@@ -52,17 +52,20 @@ func TestProjectRLSTableInventoriesAreExplicitAndDefensive(t *testing.T) {
 		}
 	}
 	protected[0] = "users"
-	if got := ProjectRLSProtectedTables(); got[0] != "tickets" {
+	if got := ProjectRLSProtectedTables(); got[0] != "categories" {
 		t.Fatalf("caller mutated protected table inventory: %v", got)
 	}
 
 	for _, expected := range []string{
+		"categories",
 		"ticket_comments",
 		"policy_decisions",
 		"domain_events",
 		"agent_tasks",
 		"agent_runs",
 		"approval_decisions",
+		"knowledge_source_links",
+		"knowledge_object_write_intents",
 		"connector_definitions",
 		"integration_conflicts",
 		"notifications",
@@ -79,7 +82,7 @@ func TestProjectRLSTableInventoriesAreExplicitAndDefensive(t *testing.T) {
 		}
 	}
 	required[0] = "users"
-	if RequiredProjectOwnedTables()[0] != "tickets" {
+	if RequiredProjectOwnedTables()[0] != "categories" {
 		t.Fatal("caller mutated required project-owned table inventory")
 	}
 }

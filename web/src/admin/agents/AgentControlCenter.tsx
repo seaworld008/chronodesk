@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { Title, useNotify } from 'react-admin'
 import {
   Alert,
@@ -26,6 +26,7 @@ import {
   TableCell,
   TableContainer,
   TableHead,
+  TablePagination,
   TableRow,
   Tabs,
   TextField,
@@ -50,12 +51,22 @@ import {
   TruncatedText,
   type ResizableColumn,
 } from '../../components/tables/EnterpriseTable'
+import { activeProjectStorageKey } from '../../lib/humanSessionStorage'
 import { resolveActiveProjectKey } from '../../lib/projectScope'
+import { projectScopeChangedEvent } from '../../lib/projectScopeEvents'
 import {
   humanApiRoutes,
   type AdminAgentPolicy,
+  type AdminAttachmentPage,
+  type AdminAttachmentSummary,
+  type AdminDomainEventCursorPage,
+  type AdminLeasePage,
   type AdminOutboxDeliverySummary,
   type AdminOverview,
+  type AdminOutboxPage,
+  type AdminPolicyDecisionCursorPage,
+  type AdminPolicyPage,
+  type AdminPrincipalPage,
   type AdminServicePrincipalSummary,
   type AdminTicketLeaseSummary,
   type AgentPolicyCreate,
@@ -78,7 +89,7 @@ const AVAILABLE_SCOPES = [
 
 const principalColumns: ResizableColumn[] = [
   { key: 'agent', defaultWidth: 260, minWidth: 180, maxWidth: 420 },
-  { key: 'status', defaultWidth: 180, minWidth: 128, maxWidth: 280 },
+  { key: 'status', defaultWidth: 300, minWidth: 220, maxWidth: 420 },
   { key: 'scopes', defaultWidth: 420, minWidth: 220, maxWidth: 640 },
   { key: 'limits', defaultWidth: 120, minWidth: 96, maxWidth: 200 },
   { key: 'last-used', defaultWidth: 188, minWidth: 150, maxWidth: 260 },
@@ -112,6 +123,15 @@ const outboxColumns: ResizableColumn[] = [
   { key: 'actions', defaultWidth: 96, minWidth: 80, maxWidth: 136, sticky: 'right' },
 ]
 
+const attachmentColumns: ResizableColumn[] = [
+  { key: 'attachment', defaultWidth: 300, minWidth: 180, maxWidth: 500 },
+  { key: 'ticket', defaultWidth: 120, minWidth: 96, maxWidth: 180 },
+  { key: 'type', defaultWidth: 180, minWidth: 120, maxWidth: 280 },
+  { key: 'size', defaultWidth: 120, minWidth: 96, maxWidth: 180 },
+  { key: 'scan', defaultWidth: 160, minWidth: 120, maxWidth: 240 },
+  { key: 'updated', defaultWidth: 188, minWidth: 150, maxWidth: 260 },
+]
+
 const policyAuditColumns: ResizableColumn[] = [
   { key: 'time', defaultWidth: 188, minWidth: 150, maxWidth: 260 },
   { key: 'actor', defaultWidth: 280, minWidth: 180, maxWidth: 480 },
@@ -126,7 +146,7 @@ type ServicePrincipal = AdminServicePrincipalSummary
 type TicketLease = AdminTicketLeaseSummary
 type OutboxDelivery = AdminOutboxDeliverySummary
 type AgentPolicy = AdminAgentPolicy
-type AgentControlSnapshot = AdminOverview
+type AttachmentScan = AdminAttachmentSummary
 type CreatePrincipalForm = Required<
   Pick<
     ServicePrincipalCreate,
@@ -140,6 +160,68 @@ type PolicyForm = Required<
     'effect' | 'scope' | 'action' | 'resource_type' | 'resource_id'
   >
 >
+
+type ScopeSnapshot = {
+  projectKey: string
+  epoch: number
+}
+
+type ScopedWriteResult<T> =
+  | { current: true; data: T }
+  | { current: false }
+
+type CredentialProtection = {
+  projectKey: string
+  storedProjectSelection: string | null
+  sessionBinding: string
+  credential: CredentialResult | null
+}
+
+let protectedCredential: CredentialProtection | null = null
+const protectedCredentialListeners = new Set<(
+  value: CredentialProtection | null,
+) => void>()
+
+const publishProtectedCredential = (
+  value: CredentialProtection | null,
+) => {
+  protectedCredential = value
+  for (const listener of protectedCredentialListeners) listener(value)
+}
+
+const projectSelectionSessionBinding = (serialized: string | null) => {
+  if (!serialized) return ''
+  try {
+    const value: unknown = JSON.parse(serialized)
+    if (
+      typeof value !== 'object'
+      || value === null
+      || !('subject' in value)
+      || !('session_id' in value)
+      || typeof value.subject !== 'string'
+      || typeof value.session_id !== 'string'
+    ) return ''
+    return `${value.subject}\u0000${value.session_id}`
+  } catch {
+    return ''
+  }
+}
+
+const protectedCredentialForCurrentSession = () => {
+  if (!protectedCredential || typeof window === 'undefined') {
+    return protectedCredential
+  }
+  const currentBinding = projectSelectionSessionBinding(
+    window.localStorage.getItem(activeProjectStorageKey),
+  )
+  if (
+    !currentBinding
+    || currentBinding !== protectedCredential.sessionBinding
+  ) {
+    protectedCredential = null
+  }
+  return protectedCredential
+}
 
 interface ConfirmationRequest {
   title: string
@@ -169,6 +251,54 @@ const formatDate = (value?: string | null) => {
   if (!value) return '—'
   const parsed = new Date(value)
   return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString('zh-CN')
+}
+
+const principalGrantState = (
+  principal: ServicePrincipal,
+  now = Date.now(),
+): {
+  usable: boolean
+  label: string
+  color: 'success' | 'warning' | 'error'
+  detail: string
+} => {
+  const expiresAt = principal.grant.expires_at
+  const expiresAtMillis = expiresAt ? Date.parse(expiresAt) : Number.POSITIVE_INFINITY
+  const invalidExpiry = Boolean(expiresAt) && Number.isNaN(expiresAtMillis)
+  const expired = Number.isFinite(expiresAtMillis) && expiresAtMillis <= now
+  const detail = expiresAt
+    ? `项目授权到期时间：${formatDate(expiresAt)}`
+    : '项目授权长期有效'
+  if (!principal.grant.is_active) {
+    return {
+      usable: false,
+      label: '项目授权已停用',
+      color: 'warning',
+      detail,
+    }
+  }
+  if (invalidExpiry) {
+    return {
+      usable: false,
+      label: '项目授权时间异常',
+      color: 'error',
+      detail: '项目授权到期时间无效，已按不可用状态处理',
+    }
+  }
+  if (expired) {
+    return {
+      usable: false,
+      label: '项目授权已过期',
+      color: 'error',
+      detail,
+    }
+  }
+  return {
+    usable: true,
+    label: expiresAt ? `授权至 ${new Date(expiresAt).toLocaleDateString('zh-CN')}` : '项目授权有效',
+    color: 'success',
+    detail,
+  }
 }
 
 const formatETag = (version: number) => `"v${version}"`
@@ -320,25 +450,6 @@ const resourceTypeLabels: Record<string, string> = {
   system: '系统',
 }
 
-const destinationTypeLabels: Record<string, string> = {
-  webhook: 'Webhook 回调',
-  event_stream: '事件流',
-  automation: '自动化规则',
-  notification: '系统通知',
-  sla: 'SLA 升级',
-  sla_escalation: 'SLA 升级',
-  attachment_cleanup: '附件清理',
-  a2a_push: 'A2A 推送',
-}
-
-const notificationDestinationLabels: Record<string, string> = {
-  ticket_assigned: '工单分配通知',
-  ticket_status_changed: '工单状态变更通知',
-  ticket_comment_added: '工单评论通知',
-  sla_warning: 'SLA 预警通知',
-  sla_breach: 'SLA 违约通知',
-}
-
 const scopeLabel = (scope: string) => scopeLabels[scope] ?? '自定义权限范围'
 const reasonCodeLabel = (code: string) => reasonCodeLabels[code] ?? '其他策略原因'
 const eventTypeLabel = (type: string) => eventTypeLabels[type] ?? '自定义领域事件'
@@ -353,22 +464,6 @@ const resourceTypeLabel = (resourceType: string) => {
   return resourceTypeLabels[resourceType] ?? '其他资源'
 }
 const resourceIDLabel = (resourceID: string) => resourceID && resourceID !== '*' ? resourceID : '全部'
-const destinationLabel = (destination: string) => {
-  const [type, ...rest] = destination.split(':')
-  const [detail, identifier] = rest
-
-  if (type === 'event_stream' && detail === 'default') return '默认事件流'
-  if (type === 'automation' && detail === 'rules') return '自动化规则引擎'
-  if (type === 'webhook' && detail === 'configured') return '已配置 Webhook 回调'
-  if (type === 'sla_escalation' && detail === 'breach') return 'SLA 违约升级'
-  if (type === 'notification') {
-    const label = notificationDestinationLabels[detail] ?? '系统通知'
-    return identifier ? `${label}（接收者 #${identifier}）` : label
-  }
-
-  return destinationTypeLabels[type] ?? '其他投递目标'
-}
-
 const MetricCard = ({ label, value, helper }: { label: string; value: number; helper: string }) => (
   <Paper variant="outlined" sx={{ p: 2.5, height: '100%' }}>
     <Typography variant="body2" sx={{
@@ -395,65 +490,485 @@ const EmptyRow = ({ colSpan, message }: { colSpan: number; message: string }) =>
   </TableRow>
 )
 
-const AgentControlCenter: React.FC = () => {
+export type AgentControlSurface = 'agent' | 'integration'
+type AgentControlTab = 'principals' | 'leases' | 'attachments' | 'events' | 'outbox' | 'policy'
+
+const surfaceTabs: Record<
+  AgentControlSurface,
+  readonly { id: AgentControlTab; label: string }[]
+> = {
+  agent: [
+    { id: 'principals', label: '服务主体' },
+    { id: 'leases', label: '实时租约' },
+    { id: 'attachments', label: '附件扫描' },
+    { id: 'policy', label: '策略审计' },
+  ],
+  integration: [
+    { id: 'events', label: '领域事件' },
+    { id: 'outbox', label: '事件投递（Outbox）' },
+  ],
+}
+
+export const AgentControlCenter: React.FC<{
+  surface?: AgentControlSurface
+}> = ({ surface = 'agent' }) => {
   const notify = useNotify()
-  const [snapshot, setSnapshot] = useState<AgentControlSnapshot | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
-  const [tab, setTab] = useState(0)
+  const notifyRef = useRef(notify)
+  notifyRef.current = notify
+  type LoadKey = 'overview' | AgentControlTab | 'policies'
+  const [projectKey, setProjectKey] = useState('')
+  const [overview, setOverview] = useState<AdminOverview | null>(null)
+  const [principals, setPrincipals] = useState<AdminPrincipalPage | null>(null)
+  const [leases, setLeases] = useState<AdminLeasePage | null>(null)
+  const [attachments, setAttachments] = useState<AdminAttachmentPage | null>(null)
+  const [events, setEvents] = useState<AdminDomainEventCursorPage | null>(null)
+  const [outbox, setOutbox] = useState<AdminOutboxPage | null>(null)
+  const [decisions, setDecisions] = useState<AdminPolicyDecisionCursorPage | null>(null)
+  const [loadingByKey, setLoadingByKey] = useState<Partial<Record<LoadKey, boolean>>>({})
+  const [errorByKey, setErrorByKey] = useState<Partial<Record<LoadKey, string>>>({})
+  const [tab, setTab] = useState<AgentControlTab>(surfaceTabs[surface][0].id)
+  const [principalPage, setPrincipalPage] = useState(1)
+  const [leasePage, setLeasePage] = useState(1)
+  const [attachmentPage, setAttachmentPage] = useState(1)
+  const [outboxPage, setOutboxPage] = useState(1)
+  const [eventCursor, setEventCursor] = useState('')
+  const [eventCursorHistory, setEventCursorHistory] = useState<string[]>([])
+  const [decisionCursor, setDecisionCursor] = useState('')
+  const [decisionCursorHistory, setDecisionCursorHistory] = useState<string[]>([])
   const [createOpen, setCreateOpen] = useState(false)
   const [createForm, setCreateForm] = useState<CreatePrincipalForm>(initialCreateForm)
   const [submitting, setSubmitting] = useState(false)
-  const [credential, setCredential] = useState<CredentialResult | null>(null)
+  const [credentialProtectionState, setCredentialProtectionState] =
+    useState<CredentialProtection | null>(
+      protectedCredentialForCurrentSession,
+    )
   const [policyPrincipal, setPolicyPrincipal] = useState<ServicePrincipal | null>(null)
-  const [policies, setPolicies] = useState<AgentPolicy[]>([])
+  const [policies, setPolicies] = useState<AdminPolicyPage | null>(null)
+  const [policyPage, setPolicyPage] = useState(1)
   const [policyForm, setPolicyForm] = useState<PolicyForm>(initialPolicyForm)
   const [confirmation, setConfirmation] = useState<ConfirmationRequest | null>(null)
   const [confirming, setConfirming] = useState(false)
+  const [grantNow, setGrantNow] = useState(() => Date.now())
+  const requestControllers = useRef<Partial<Record<LoadKey, AbortController>>>({})
+  const writeControllers = useRef<Set<AbortController>>(new Set())
+  const scopeEpoch = useRef(0)
+  const activeProjectKey = useRef('')
+  const submittingToken = useRef<symbol | null>(null)
+  const confirmingToken = useRef<symbol | null>(null)
+  const credential = credentialProtectionState?.credential ?? null
+  const credentialProjectKey = credentialProtectionState?.projectKey ?? ''
+  const credentialProtectionActive = credentialProtectionState !== null
 
-  const loadSnapshot = useCallback(async () => {
-    setLoading(true)
-    setError('')
+  const beginSubmitting = useCallback(() => {
+    const token = Symbol('agent-control-submit')
+    submittingToken.current = token
+    setSubmitting(true)
+    return token
+  }, [])
+
+  const endSubmitting = useCallback((token: symbol) => {
+    if (submittingToken.current !== token) return
+    submittingToken.current = null
+    setSubmitting(false)
+  }, [])
+
+  const beginCredentialProtection = useCallback((scope: ScopeSnapshot) => {
+    const storedProjectSelection = window.localStorage.getItem(
+      activeProjectStorageKey,
+    )
+    publishProtectedCredential({
+      projectKey: scope.projectKey,
+      storedProjectSelection,
+      sessionBinding: projectSelectionSessionBinding(storedProjectSelection),
+      credential: null,
+    })
+  }, [])
+
+  const endCredentialProtection = useCallback(() => {
+    publishProtectedCredential(null)
+  }, [])
+
+  const abortScopedRequests = useCallback(() => {
+    for (const controller of Object.values(requestControllers.current)) controller?.abort()
+    for (const controller of writeControllers.current) controller.abort()
+    requestControllers.current = {}
+    writeControllers.current.clear()
+  }, [])
+
+  const isScopeCurrent = useCallback((scope: ScopeSnapshot): boolean => (
+    scopeEpoch.current === scope.epoch
+    && (!activeProjectKey.current || activeProjectKey.current === scope.projectKey)
+  ), [])
+
+  const resolveScopeSnapshot = useCallback(async (): Promise<ScopeSnapshot | null> => {
+    const epoch = scopeEpoch.current
+    const projectKey = activeProjectKey.current || await resolveActiveProjectKey()
+    const scope = { projectKey, epoch }
+    return isScopeCurrent(scope) ? scope : null
+  }, [isScopeCurrent])
+
+  const runScopedWrite = useCallback(async <T,>(
+    scope: ScopeSnapshot,
+    path: string,
+    options: RequestInit,
+    resourceVersion?: number,
+  ): Promise<ScopedWriteResult<T>> => {
+    if (!isScopeCurrent(scope)) return { current: false }
+    const controller = new AbortController()
+    writeControllers.current.add(controller)
     try {
-      const projectKey = await resolveActiveProjectKey()
-      const result = await apiFetch<AgentControlSnapshot>(
-        humanApiRoutes.getAgentControlOverviewV2({ projectKey }),
+      const data = await adminWrite<T>(
+        path,
+        { ...options, signal: controller.signal },
+        resourceVersion,
       )
-      const normalized: AgentControlSnapshot = {
-        ...result,
-        global_read_only: Boolean(result.global_read_only),
-        emergency_stop: Boolean(result.emergency_stop),
-        principals: result.principals ?? [],
-        leases: result.leases ?? [],
-        events: result.events ?? [],
-        outbox: result.outbox ?? [],
-        attachments: result.attachments ?? [],
-        policy_decisions: result.policy_decisions ?? [],
+      if (controller.signal.aborted || !isScopeCurrent(scope)) {
+        return { current: false }
       }
-      setSnapshot(normalized)
-      return normalized
+      return { current: true, data }
     } catch (requestError) {
-      setError(localizedUnknownErrorMessage(requestError, '智能体控制面加载失败'))
+      if (controller.signal.aborted || !isScopeCurrent(scope)) {
+        return { current: false }
+      }
+      throw requestError
+    } finally {
+      writeControllers.current.delete(controller)
+    }
+  }, [isScopeCurrent])
+
+  const runCredentialWrite = useCallback(async (
+    scope: ScopeSnapshot,
+    path: string,
+    options: RequestInit,
+    resourceVersion?: number,
+  ): Promise<CredentialResult | null> => {
+    if (!isScopeCurrent(scope)) return null
+    beginCredentialProtection(scope)
+    try {
+      // Credential creation and rotation may commit before the response
+      // reaches the browser. Do not attach these one-time-secret responses to
+      // the ordinary scope AbortController/epoch path: project switching is
+      // locked until the operator explicitly acknowledges the secret.
+      const result = await adminWrite<CredentialResult>(
+        path,
+        options,
+        resourceVersion,
+      )
+      const protection = protectedCredential
+      if (protection?.projectKey === scope.projectKey) {
+        publishProtectedCredential({ ...protection, credential: result })
+      }
+      return result
+    } catch (requestError) {
+      endCredentialProtection()
+      throw requestError
+    }
+  }, [beginCredentialProtection, endCredentialProtection, isScopeCurrent])
+
+  const runRequest = useCallback(async <T,>(
+    key: LoadKey,
+    projectKey: string,
+    path: string,
+    fallback: string,
+    setData: (data: T) => void,
+  ): Promise<T | null> => {
+    const scope = { projectKey, epoch: scopeEpoch.current }
+    if (!isScopeCurrent(scope)) return null
+    requestControllers.current[key]?.abort()
+    const controller = new AbortController()
+    requestControllers.current[key] = controller
+    setLoadingByKey((current) => ({ ...current, [key]: true }))
+    setErrorByKey((current) => ({ ...current, [key]: '' }))
+    try {
+      const result = await apiFetch<T>(
+        path,
+        { signal: controller.signal },
+      )
+      if (
+        controller.signal.aborted
+        || requestControllers.current[key] !== controller
+        || !isScopeCurrent(scope)
+      ) return null
+      setData(result)
+      return result
+    } catch (requestError) {
+      if (
+        controller.signal.aborted
+        || requestControllers.current[key] !== controller
+        || !isScopeCurrent(scope)
+      ) return null
+      setErrorByKey((current) => ({
+        ...current,
+        [key]: localizedUnknownErrorMessage(requestError, fallback),
+      }))
       return null
     } finally {
-      setLoading(false)
+      if (requestControllers.current[key] === controller) {
+        delete requestControllers.current[key]
+        setLoadingByKey((current) => ({ ...current, [key]: false }))
+      }
+    }
+  }, [isScopeCurrent])
+
+  const loadOverview = useCallback((key: string) => runRequest<AdminOverview>(
+    'overview',
+    key,
+    humanApiRoutes.getAgentControlOverviewV2({ projectKey: key }),
+    '智能体控制指标加载失败',
+    setOverview,
+  ), [runRequest])
+
+  const loadPrincipals = useCallback((key: string, page: number) => runRequest<AdminPrincipalPage>(
+    'principals',
+    key,
+    humanApiRoutes.listAgentServicePrincipals(
+      { projectKey: key },
+      { page, page_size: 25, sort_by: 'created_at', sort_order: 'desc' },
+    ),
+    '服务主体加载失败',
+    setPrincipals,
+  ), [runRequest])
+
+  const loadLeases = useCallback((key: string, page: number) => runRequest<AdminLeasePage>(
+    'leases',
+    key,
+    humanApiRoutes.listAgentTicketLeases(
+      { projectKey: key },
+      { page, page_size: 25, sort_by: 'expires_at', sort_order: 'asc' },
+    ),
+    '工单租约加载失败',
+    setLeases,
+  ), [runRequest])
+
+  const loadAttachments = useCallback((key: string, page: number) => runRequest<AdminAttachmentPage>(
+    'attachments',
+    key,
+    humanApiRoutes.listAgentAttachmentScans(
+      { projectKey: key },
+      { page, page_size: 25, sort_by: 'created_at', sort_order: 'desc' },
+    ),
+    '附件扫描状态加载失败',
+    setAttachments,
+  ), [runRequest])
+
+  const loadEvents = useCallback((key: string, cursor: string) => runRequest<AdminDomainEventCursorPage>(
+    'events',
+    key,
+    humanApiRoutes.listAgentDomainEvents(
+      { projectKey: key },
+      { cursor, limit: 25 },
+    ),
+    '领域事件加载失败',
+    setEvents,
+  ), [runRequest])
+
+  const loadOutbox = useCallback((key: string, page: number) => runRequest<AdminOutboxPage>(
+    'outbox',
+    key,
+    humanApiRoutes.listAgentOutboxDeliveries(
+      { projectKey: key },
+      { page, page_size: 25, sort_by: 'created_at', sort_order: 'desc' },
+    ),
+    '事件投递记录加载失败',
+    setOutbox,
+  ), [runRequest])
+
+  const loadDecisions = useCallback((key: string, cursor: string) => runRequest<AdminPolicyDecisionCursorPage>(
+    'policy',
+    key,
+    humanApiRoutes.listAgentPolicyDecisions(
+      { projectKey: key },
+      { cursor, limit: 25 },
+    ),
+    '策略决策加载失败',
+    setDecisions,
+  ), [runRequest])
+
+  const loadPolicies = useCallback((
+    key: string,
+    principalID: string,
+    page: number,
+  ) => runRequest<AdminPolicyPage>(
+    'policies',
+    key,
+    humanApiRoutes.listServicePrincipalPoliciesV2(
+      { projectKey: key, principalId: principalID },
+      { page, page_size: 25, sort_by: 'priority', sort_order: 'desc' },
+    ),
+    '策略加载失败',
+    setPolicies,
+  ), [runRequest])
+
+  const clearScopedState = useCallback(() => {
+    scopeEpoch.current += 1
+    activeProjectKey.current = ''
+    abortScopedRequests()
+    setProjectKey('')
+    setOverview(null)
+    setPrincipals(null)
+    setLeases(null)
+    setAttachments(null)
+    setEvents(null)
+    setOutbox(null)
+    setDecisions(null)
+    setPolicies(null)
+    setPolicyPrincipal(null)
+    setCreateOpen(false)
+    setCreateForm(initialCreateForm)
+    setPolicyForm(initialPolicyForm)
+    setConfirmation(null)
+    submittingToken.current = null
+    confirmingToken.current = null
+    setSubmitting(false)
+    setConfirming(false)
+    setLoadingByKey({})
+    setErrorByKey({})
+    setPrincipalPage(1)
+    setLeasePage(1)
+    setAttachmentPage(1)
+    setOutboxPage(1)
+    setEventCursor('')
+    setEventCursorHistory([])
+    setDecisionCursor('')
+    setDecisionCursorHistory([])
+    setPolicyPage(1)
+  }, [abortScopedRequests])
+
+  useEffect(() => {
+    const updateCredentialProtection = (
+      value: CredentialProtection | null,
+    ) => {
+      if (
+        value
+        && value.sessionBinding !== projectSelectionSessionBinding(
+          window.localStorage.getItem(activeProjectStorageKey),
+        )
+      ) {
+        protectedCredential = null
+        setCredentialProtectionState(null)
+        return
+      }
+      setCredentialProtectionState(value)
+    }
+    protectedCredentialListeners.add(updateCredentialProtection)
+    setCredentialProtectionState(protectedCredentialForCurrentSession())
+    return () => {
+      protectedCredentialListeners.delete(updateCredentialProtection)
     }
   }, [])
 
   useEffect(() => {
-    void loadSnapshot()
-  }, [loadSnapshot])
+    if (!credentialProtectionActive) return
 
-  const metrics = useMemo(() => {
-    const principals = snapshot?.principals ?? []
-    const outbox = snapshot?.outbox ?? []
-    return {
-      active: principals.filter((item) => item.status === 'active').length,
-      leases: snapshot?.leases.length ?? 0,
-      failedDeliveries: outbox.filter((item) => item.status === 'failed' || item.status === 'dead').length,
-      recentEvents: snapshot?.events.length ?? 0,
+    const switcher = document.querySelector<HTMLElement>(
+      '[data-testid="active-project-switcher"]',
+    )
+    const previousAriaDisabled = switcher?.getAttribute('aria-disabled')
+    switcher?.setAttribute('aria-disabled', 'true')
+
+    const blockProjectSwitcherInteraction = (event: Event) => {
+      const target = event.target
+      if (
+        target instanceof Element
+        && target.closest('[data-testid="work-project-control"]')
+      ) {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+      }
     }
-  }, [snapshot])
+    document.addEventListener('pointerdown', blockProjectSwitcherInteraction, true)
+    document.addEventListener('keydown', blockProjectSwitcherInteraction, true)
+    return () => {
+      document.removeEventListener('pointerdown', blockProjectSwitcherInteraction, true)
+      document.removeEventListener('keydown', blockProjectSwitcherInteraction, true)
+      if (previousAriaDisabled == null) {
+        switcher?.removeAttribute('aria-disabled')
+      } else {
+        switcher?.setAttribute('aria-disabled', previousAriaDisabled)
+      }
+    }
+  }, [credentialProtectionActive])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setGrantNow(Date.now()), 30_000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
+    let mounted = true
+    const initialEpoch = scopeEpoch.current
+    const activate = (nextProjectKey: string) => {
+      if (!mounted || !nextProjectKey.trim()) return
+      clearScopedState()
+      activeProjectKey.current = nextProjectKey
+      setProjectKey(nextProjectKey)
+    }
+    void resolveActiveProjectKey().then((nextProjectKey) => {
+      if (scopeEpoch.current === initialEpoch) activate(nextProjectKey)
+    }).catch((requestError) => {
+      if (!mounted) return
+      setErrorByKey({
+        overview: localizedUnknownErrorMessage(requestError, '当前项目加载失败'),
+      })
+    })
+    const handleScopeChange = (event: Event) => {
+      const nextProjectKey = (event as CustomEvent<{ project_key?: string }>).detail?.project_key
+      const protection = protectedCredential
+      if (nextProjectKey && protection) {
+        if (protection.storedProjectSelection === null) {
+          window.localStorage.removeItem(activeProjectStorageKey)
+        } else {
+          window.localStorage.setItem(
+            activeProjectStorageKey,
+            protection.storedProjectSelection,
+          )
+        }
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        notifyRef.current(
+          `项目 ${protection.projectKey} 的一次性凭据正在签发或尚未保存，请保存后再切换项目`,
+          { type: 'warning' },
+        )
+        return
+      }
+      if (nextProjectKey) activate(nextProjectKey)
+    }
+    window.addEventListener(projectScopeChangedEvent, handleScopeChange, true)
+    return () => {
+      mounted = false
+      window.removeEventListener(projectScopeChangedEvent, handleScopeChange, true)
+      scopeEpoch.current += 1
+      activeProjectKey.current = ''
+      abortScopedRequests()
+    }
+  }, [abortScopedRequests, clearScopedState])
+
+  useEffect(() => {
+    if (projectKey) void loadOverview(projectKey)
+  }, [loadOverview, projectKey])
+  useEffect(() => {
+    if (projectKey && tab === 'principals') void loadPrincipals(projectKey, principalPage)
+  }, [loadPrincipals, principalPage, projectKey, tab])
+  useEffect(() => {
+    if (projectKey && tab === 'leases') void loadLeases(projectKey, leasePage)
+  }, [leasePage, loadLeases, projectKey, tab])
+  useEffect(() => {
+    if (projectKey && tab === 'attachments') void loadAttachments(projectKey, attachmentPage)
+  }, [attachmentPage, loadAttachments, projectKey, tab])
+  useEffect(() => {
+    if (projectKey && tab === 'events') void loadEvents(projectKey, eventCursor)
+  }, [eventCursor, loadEvents, projectKey, tab])
+  useEffect(() => {
+    if (projectKey && tab === 'outbox') void loadOutbox(projectKey, outboxPage)
+  }, [loadOutbox, outboxPage, projectKey, tab])
+  useEffect(() => {
+    if (projectKey && tab === 'policy') void loadDecisions(projectKey, decisionCursor)
+  }, [decisionCursor, loadDecisions, projectKey, tab])
+  useEffect(() => {
+    if (projectKey && policyPrincipal) {
+      void loadPolicies(projectKey, policyPrincipal.id, policyPage)
+    }
+  }, [loadPolicies, policyPage, policyPrincipal, projectKey])
 
   const createPrincipal = async () => {
     if (!createForm.name.trim() || createForm.scopes.length === 0) {
@@ -461,151 +976,218 @@ const AgentControlCenter: React.FC = () => {
       return
     }
 
-    setSubmitting(true)
+    const submitting = beginSubmitting()
     try {
-      const projectKey = await resolveActiveProjectKey()
-      const result = await adminWrite<CredentialResult>(
-        humanApiRoutes.createServicePrincipalV2({ projectKey }),
+      const scope = await resolveScopeSnapshot()
+      if (!scope) return
+      const result = await runCredentialWrite(
+        scope,
+        humanApiRoutes.createServicePrincipalV2({ projectKey: scope.projectKey }),
         {
-        method: 'POST',
-        body: JSON.stringify({
-          ...createForm,
-          name: createForm.name.trim(),
-          description: createForm.description.trim(),
-        }),
+          method: 'POST',
+          body: JSON.stringify({
+            ...createForm,
+            name: createForm.name.trim(),
+            description: createForm.description.trim(),
+          }),
         },
       )
-      setCredential(result)
+      if (!result) return
       setCreateOpen(false)
       setCreateForm(initialCreateForm)
       notify('服务主体已创建，请立即保存一次性密钥', { type: 'success' })
-      await loadSnapshot()
+      setPrincipalPage(1)
+      await Promise.all([
+        loadPrincipals(scope.projectKey, 1),
+        loadOverview(scope.projectKey),
+      ])
     } catch (requestError) {
       notify(localizedUnknownErrorMessage(requestError, '创建失败'), { type: 'error' })
     } finally {
-      setSubmitting(false)
+      endSubmitting(submitting)
     }
   }
 
   const rotateCredential = async (principal: ServicePrincipal) => {
-    setSubmitting(true)
+    const grantState = principalGrantState(principal)
+    if (!grantState.usable) {
+      notify(`${grantState.label}，不能轮换凭据`, { type: 'warning' })
+      return
+    }
+    const submitting = beginSubmitting()
     try {
-      const projectKey = await resolveActiveProjectKey()
-      const result = await adminWrite<CredentialResult>(
+      const scope = await resolveScopeSnapshot()
+      if (!scope) return
+      const result = await runCredentialWrite(
+        scope,
         humanApiRoutes.rotateServicePrincipalCredentialV2({
-          projectKey,
+          projectKey: scope.projectKey,
           principalId: principal.id,
         }),
         { method: 'POST' },
         principal.resource_version,
       )
-      setCredential(result)
+      if (!result) return
       notify('凭据已轮换，旧凭据已撤销', { type: 'success' })
-      await loadSnapshot()
+      await Promise.all([
+        loadPrincipals(scope.projectKey, principalPage),
+        loadOverview(scope.projectKey),
+      ])
     } catch (requestError) {
       notify(localizedUnknownErrorMessage(requestError, '凭据轮换失败'), { type: 'error' })
     } finally {
-      setSubmitting(false)
+      endSubmitting(submitting)
     }
   }
 
   const togglePrincipal = async (principal: ServicePrincipal) => {
+    const grantState = principalGrantState(principal)
+    if (!grantState.usable) {
+      notify(`${grantState.label}，不能修改服务主体状态`, { type: 'warning' })
+      return
+    }
     const nextStatus: PrincipalStatus = principal.status === 'active' ? 'inactive' : 'active'
     try {
-      const projectKey = await resolveActiveProjectKey()
-      await adminWrite(humanApiRoutes.setServicePrincipalStatusV2({
-        projectKey,
-        principalId: principal.id,
-      }), {
-        method: 'PUT',
-        body: JSON.stringify({ status: nextStatus }),
-      }, principal.resource_version)
+      const scope = await resolveScopeSnapshot()
+      if (!scope) return
+      const write = await runScopedWrite(
+        scope,
+        humanApiRoutes.setServicePrincipalStatusV2({
+          projectKey: scope.projectKey,
+          principalId: principal.id,
+        }),
+        {
+          method: 'PUT',
+          body: JSON.stringify({ status: nextStatus }),
+        },
+        principal.resource_version,
+      )
+      if (!write.current) return
       notify(nextStatus === 'active' ? '智能体已启用' : '智能体已停用', { type: 'success' })
-      await loadSnapshot()
+      await Promise.all([
+        loadPrincipals(scope.projectKey, principalPage),
+        loadOverview(scope.projectKey),
+      ])
     } catch (requestError) {
       notify(localizedUnknownErrorMessage(requestError, '状态更新失败'), { type: 'error' })
     }
   }
 
   const togglePrincipalEmergency = async (principal: ServicePrincipal) => {
+    const grantState = principalGrantState(principal)
+    if (!grantState.usable) {
+      notify(`${grantState.label}，不能修改熔断状态`, { type: 'warning' })
+      return
+    }
     try {
-      const projectKey = await resolveActiveProjectKey()
-      await adminWrite(humanApiRoutes.setServicePrincipalStatusV2({
-        projectKey,
-        principalId: principal.id,
-      }), {
-        method: 'PUT',
-        body: JSON.stringify({ emergency_disabled: !principal.emergency_disabled }),
-      }, principal.resource_version)
+      const scope = await resolveScopeSnapshot()
+      if (!scope) return
+      const write = await runScopedWrite(
+        scope,
+        humanApiRoutes.setServicePrincipalStatusV2({
+          projectKey: scope.projectKey,
+          principalId: principal.id,
+        }),
+        {
+          method: 'PUT',
+          body: JSON.stringify({ emergency_disabled: !principal.emergency_disabled }),
+        },
+        principal.resource_version,
+      )
+      if (!write.current) return
       notify(principal.emergency_disabled ? '智能体熔断已解除' : '智能体已立即熔断', {
         type: principal.emergency_disabled ? 'success' : 'warning',
       })
-      await loadSnapshot()
+      await Promise.all([
+        loadPrincipals(scope.projectKey, principalPage),
+        loadOverview(scope.projectKey),
+      ])
     } catch (requestError) {
       notify(localizedUnknownErrorMessage(requestError, '智能体熔断更新失败'), { type: 'error' })
     }
   }
 
-  const openPolicies = async (principal: ServicePrincipal) => {
+  const openPolicies = (principal: ServicePrincipal) => {
+    const grantState = principalGrantState(principal)
+    if (!grantState.usable) {
+      notify(`${grantState.label}，不能管理策略`, { type: 'warning' })
+      return
+    }
     setPolicyPrincipal(principal)
     setPolicyForm(initialPolicyForm)
-    try {
-      const projectKey = await resolveActiveProjectKey()
-      const result = await apiFetch<AgentPolicy[]>(
-        humanApiRoutes.listServicePrincipalPoliciesV2({
-          projectKey,
-          principalId: principal.id,
-        }),
-      )
-      setPolicies(result ?? [])
-    } catch (requestError) {
-      notify(localizedUnknownErrorMessage(requestError, '策略加载失败'), { type: 'error' })
-    }
+    setPolicies(null)
+    setPolicyPage(1)
   }
 
   const createPolicy = async () => {
     if (!policyPrincipal) return
-    setSubmitting(true)
+    const grantState = principalGrantState(policyPrincipal)
+    if (!grantState.usable) {
+      notify(`${grantState.label}，不能新增策略`, { type: 'warning' })
+      return
+    }
+    const submitting = beginSubmitting()
     try {
-      const projectKey = await resolveActiveProjectKey()
-      await adminWrite(humanApiRoutes.createServicePrincipalPolicyV2({
-        projectKey,
-        principalId: policyPrincipal.id,
-      }), {
-        method: 'POST',
-        body: JSON.stringify(policyForm),
-      }, policyPrincipal.resource_version)
-      const result = await apiFetch<AgentPolicy[]>(
-        humanApiRoutes.listServicePrincipalPoliciesV2({
-          projectKey,
+      const scope = await resolveScopeSnapshot()
+      if (!scope) return
+      const write = await runScopedWrite(
+        scope,
+        humanApiRoutes.createServicePrincipalPolicyV2({
+          projectKey: scope.projectKey,
           principalId: policyPrincipal.id,
         }),
+        {
+          method: 'POST',
+          body: JSON.stringify(policyForm),
+        },
+        policyPrincipal.resource_version,
       )
-      setPolicies(result ?? [])
+      if (!write.current) return
+      await loadPolicies(scope.projectKey, policyPrincipal.id, policyPage)
+      if (!isScopeCurrent(scope)) return
       setPolicyForm(initialPolicyForm)
-      const refreshed = await loadSnapshot()
-      const refreshedPrincipal = refreshed?.principals.find((item) => item.id === policyPrincipal.id)
+      const refreshed = await loadPrincipals(scope.projectKey, principalPage)
+      await loadOverview(scope.projectKey)
+      if (!isScopeCurrent(scope)) return
+      const refreshedPrincipal = refreshed?.items.find((item) => item.id === policyPrincipal.id)
       if (refreshedPrincipal) setPolicyPrincipal(refreshedPrincipal)
       notify('策略已创建', { type: 'success' })
     } catch (requestError) {
       notify(localizedUnknownErrorMessage(requestError, '策略创建失败'), { type: 'error' })
     } finally {
-      setSubmitting(false)
+      endSubmitting(submitting)
     }
   }
 
   const disablePolicy = async (policy: AgentPolicy) => {
     if (!policyPrincipal) return
+    const grantState = principalGrantState(policyPrincipal)
+    if (!grantState.usable) {
+      notify(`${grantState.label}，不能停用策略`, { type: 'warning' })
+      return
+    }
     try {
-      const projectKey = await resolveActiveProjectKey()
-      await adminWrite(humanApiRoutes.disableServicePrincipalPolicyV2({
-        projectKey,
-        principalId: policyPrincipal.id,
-        policyId: policy.id,
-      }), {
-        method: 'DELETE',
-      }, policy.resource_version)
-      setPolicies(policies.map((item) => (item.id === policy.id ? { ...item, is_active: false } : item)))
+      const scope = await resolveScopeSnapshot()
+      if (!scope) return
+      const write = await runScopedWrite(
+        scope,
+        humanApiRoutes.disableServicePrincipalPolicyV2({
+          projectKey: scope.projectKey,
+          principalId: policyPrincipal.id,
+          policyId: policy.id,
+        }),
+        {
+          method: 'DELETE',
+        },
+        policy.resource_version,
+      )
+      if (!write.current) return
+      setPolicies((current) => current ? {
+        ...current,
+        items: current.items.map((item) => (
+          item.id === policy.id ? { ...item, is_active: false } : item
+        )),
+      } : current)
       notify('策略已停用', { type: 'success' })
     } catch (requestError) {
       notify(localizedUnknownErrorMessage(requestError, '策略停用失败'), { type: 'error' })
@@ -614,17 +1196,23 @@ const AgentControlCenter: React.FC = () => {
 
   const forceReleaseLease = async (lease: TicketLease) => {
     try {
-      const projectKey = await resolveActiveProjectKey()
-      await adminWrite(
+      const scope = await resolveScopeSnapshot()
+      if (!scope) return
+      const write = await runScopedWrite(
+        scope,
         humanApiRoutes.forceReleaseTicketLeaseV2({
-          projectKey,
+          projectKey: scope.projectKey,
           leaseId: lease.id,
         }),
         { method: 'POST' },
         lease.resource_version,
       )
+      if (!write.current) return
       notify('工单租约已强制释放', { type: 'success' })
-      await loadSnapshot()
+      await Promise.all([
+        loadLeases(scope.projectKey, leasePage),
+        loadOverview(scope.projectKey),
+      ])
     } catch (requestError) {
       notify(localizedUnknownErrorMessage(requestError, '租约释放失败'), { type: 'error' })
     }
@@ -632,17 +1220,23 @@ const AgentControlCenter: React.FC = () => {
 
   const replayDelivery = async (delivery: OutboxDelivery) => {
     try {
-      const projectKey = await resolveActiveProjectKey()
-      await adminWrite(
+      const scope = await resolveScopeSnapshot()
+      if (!scope) return
+      const write = await runScopedWrite(
+        scope,
         humanApiRoutes.replayOutboxDeliveryV2({
-          projectKey,
+          projectKey: scope.projectKey,
           deliveryId: delivery.id,
         }),
         { method: 'POST' },
         delivery.resource_version,
       )
+      if (!write.current) return
       notify('事件投递已重新排队', { type: 'success' })
-      await loadSnapshot()
+      await Promise.all([
+        loadOutbox(scope.projectKey, outboxPage),
+        loadOverview(scope.projectKey),
+      ])
     } catch (requestError) {
       notify(localizedUnknownErrorMessage(requestError, '事件投递回放失败'), { type: 'error' })
     }
@@ -655,12 +1249,22 @@ const AgentControlCenter: React.FC = () => {
   const runConfirmedAction = async () => {
     if (!confirmation) return
 
+    const requestedConfirmation = confirmation
+    const token = Symbol('agent-control-confirmation')
+    confirmingToken.current = token
     setConfirming(true)
     try {
-      await confirmation.action()
-      setConfirmation(null)
+      await requestedConfirmation.action()
+      if (confirmingToken.current === token) {
+        setConfirmation((current) => (
+          current === requestedConfirmation ? null : current
+        ))
+      }
     } finally {
-      setConfirming(false)
+      if (confirmingToken.current === token) {
+        confirmingToken.current = null
+        setConfirming(false)
+      }
     }
   }
 
@@ -748,9 +1352,46 @@ const AgentControlCenter: React.FC = () => {
     notify('密钥已复制', { type: 'info' })
   }
 
+  const loadActiveTab = () => {
+    if (!projectKey) return
+    switch (tab) {
+      case 'principals':
+        void loadPrincipals(projectKey, principalPage)
+        break
+      case 'leases':
+        void loadLeases(projectKey, leasePage)
+        break
+      case 'attachments':
+        void loadAttachments(projectKey, attachmentPage)
+        break
+      case 'events':
+        void loadEvents(projectKey, eventCursor)
+        break
+      case 'outbox':
+        void loadOutbox(projectKey, outboxPage)
+        break
+      case 'policy':
+        void loadDecisions(projectKey, decisionCursor)
+        break
+    }
+  }
+  const activeTabHasData = {
+    principals: principals !== null,
+    leases: leases !== null,
+    attachments: attachments !== null,
+    events: events !== null,
+    outbox: outbox !== null,
+    policy: decisions !== null,
+  }[tab]
+  const activeTabLoading = loadingByKey[tab] === true
+  const activeTabError = errorByKey[tab] ?? ''
+  const policyGrantState = policyPrincipal
+    ? principalGrantState(policyPrincipal, grantNow)
+    : null
+
   return (
     <>
-      <Title title="AI 智能体控制中心" />
+      <Title title={surface === 'agent' ? 'AI 智能体控制中心' : '集成运行监控'} />
       <Box sx={{ p: { xs: 2, md: 3 } }}>
         <Stack
           direction={{ xs: 'column', md: 'row' }}
@@ -765,122 +1406,154 @@ const AgentControlCenter: React.FC = () => {
               alignItems: "center"
             }}>
               <AgentIcon color="primary" />
-              <Typography variant="h4">AI 智能体控制中心</Typography>
+              <Typography variant="h4">
+                {surface === 'agent' ? 'AI 智能体控制中心' : '集成运行监控'}
+              </Typography>
             </Stack>
             <Typography
               sx={{
                 color: "text.secondary",
                 mt: 0.5
               }}>
-              管理服务主体、最小权限、实时租约与事件投递。
+              {surface === 'agent'
+                ? '管理服务主体、最小权限、实时租约与策略决策。'
+                : '查看项目领域事件与 Outbox 投递状态。'}
             </Typography>
           </Box>
           <Stack direction="row" spacing={1} sx={{
             alignItems: "center"
           }}>
-            <FormControlLabel
-              control={
-                <Switch
-                  checked={snapshot?.emergency_stop ?? false}
-                  color="error"
-                  disabled
-                  slotProps={{ input: { 'aria-label': '智能体全局紧急停止' } }}
+            {surface === 'agent' && (
+              <>
+                <FormControlLabel
+                  control={
+                    <Switch
+                      checked={overview?.emergency_stop ?? false}
+                      color="error"
+                      disabled
+                      slotProps={{ input: { 'aria-label': '智能体全局紧急停止' } }}
+                    />
+                  }
+                  label="紧急停止"
                 />
-              }
-              label="紧急停止"
-            />
-            <FormControlLabel
-              control={
-                <Switch
-                  checked={snapshot?.global_read_only ?? false}
-                  color="warning"
-                  disabled
-                  slotProps={{ input: { 'aria-label': '智能体全局只读模式' } }}
+                <FormControlLabel
+                  control={
+                    <Switch
+                      checked={overview?.global_read_only ?? false}
+                      color="warning"
+                      disabled
+                      slotProps={{ input: { 'aria-label': '智能体全局只读模式' } }}
+                    />
+                  }
+                  label="全局只读"
                 />
-              }
-              label="全局只读"
-            />
+              </>
+            )}
             <Tooltip title="刷新">
               <span>
-                <IconButton onClick={() => void loadSnapshot()} disabled={loading} aria-label="刷新控制面">
+                <IconButton
+                  onClick={() => {
+                    if (projectKey) void loadOverview(projectKey)
+                    loadActiveTab()
+                  }}
+                  disabled={loadingByKey.overview || activeTabLoading}
+                  aria-label="刷新控制面"
+                >
                   <RefreshIcon />
                 </IconButton>
               </span>
             </Tooltip>
-            <Button variant="contained" startIcon={<AddIcon />} onClick={() => setCreateOpen(true)}>
-              新建智能体
-            </Button>
+            {surface === 'agent' && (
+              <Button
+                variant="contained"
+                startIcon={<AddIcon />}
+                onClick={() => setCreateOpen(true)}
+                disabled={credentialProtectionActive}
+              >
+                新建智能体
+              </Button>
+            )}
           </Stack>
         </Stack>
 
-        <Alert severity="info" sx={{ mb: 3 }}>
-          全局只读和紧急停止属于平台级安全控制，本项目页面仅展示状态；变更入口已与项目业务操作隔离。
-        </Alert>
+        {surface === 'agent' && (
+          <Alert severity="info" sx={{ mb: 3 }}>
+            全局只读和紧急停止属于平台级安全控制，本项目页面仅展示状态；变更入口已与项目业务操作隔离。
+          </Alert>
+        )}
 
-        {snapshot?.global_read_only && (
+        {credentialProtectionActive && (
+          <Alert severity="warning" sx={{ mb: 3 }}>
+            一次性凭据正在签发或尚未保存，保存前已暂时锁定项目切换。
+          </Alert>
+        )}
+
+        {surface === 'agent' && overview?.global_read_only && (
           <Alert severity="warning" icon={<PausedIcon />} sx={{ mb: 3 }}>
             智能体全局只读模式已开启。MCP 与 A2A 查询仍可用，所有智能体写操作将被策略层拒绝。
           </Alert>
         )}
-        {snapshot?.emergency_stop && (
+        {surface === 'agent' && overview?.emergency_stop && (
           <Alert severity="error" icon={<StopIcon />} sx={{ mb: 3 }}>
             智能体全局紧急停止已启用。所有智能体请求都会被拒绝，管理员仍可检查审计并接管租约。
           </Alert>
         )}
-        {error && (
-          <Alert severity="error" action={<Button onClick={() => void loadSnapshot()}>重试</Button>} sx={{ mb: 3 }}>
-            {error}
+        {errorByKey.overview && (
+          <Alert
+            severity="error"
+            action={<Button onClick={() => projectKey && void loadOverview(projectKey)}>重试</Button>}
+            sx={{ mb: 3 }}
+          >
+            {errorByKey.overview}
           </Alert>
         )}
 
         <Grid container spacing={2} sx={{ mb: 3 }}>
-          <Grid
-            size={{
-              xs: 6,
-              lg: 3
-            }}>
-            <MetricCard label="活跃智能体" value={metrics.active} helper="可签发令牌的服务主体" />
-          </Grid>
-          <Grid
-            size={{
-              xs: 6,
-              lg: 3
-            }}>
-            <MetricCard label="实时租约" value={metrics.leases} helper="正在处理的工单" />
-          </Grid>
-          <Grid
-            size={{
-              xs: 6,
-              lg: 3
-            }}>
-            <MetricCard label="近期事件" value={metrics.recentEvents} helper="最近一页领域事件" />
-          </Grid>
-          <Grid
-            size={{
-              xs: 6,
-              lg: 3
-            }}>
-            <MetricCard label="投递失败" value={metrics.failedDeliveries} helper="需要关注的事件投递记录" />
-          </Grid>
+          {surface === 'agent' ? (
+            <>
+              <Grid size={{ xs: 12, sm: 6 }}>
+                <MetricCard label="活跃智能体" value={overview?.active_principal_count ?? 0} helper="服务端统计的有效项目授权" />
+              </Grid>
+              <Grid size={{ xs: 12, sm: 6 }}>
+                <MetricCard label="实时租约" value={overview?.active_lease_count ?? 0} helper="服务端统计的活跃租约" />
+              </Grid>
+            </>
+          ) : (
+            <>
+              <Grid size={{ xs: 12, sm: 6 }}>
+                <MetricCard label="近期事件" value={overview?.recent_event_count ?? 0} helper="最近 24 小时的项目事件" />
+              </Grid>
+              <Grid size={{ xs: 12, sm: 6 }}>
+                <MetricCard label="投递失败" value={overview?.failed_outbox_count ?? 0} helper="服务端统计的失败与终止投递" />
+              </Grid>
+            </>
+          )}
         </Grid>
 
         <Paper variant="outlined">
           <Tabs
             value={tab}
-            onChange={(_, nextTab: number) => setTab(nextTab)}
+            onChange={(_, nextTab: AgentControlTab) => setTab(nextTab)}
             variant="scrollable"
             scrollButtons="auto"
-            aria-label="AI 智能体控制面数据"
+            aria-label={surface === 'agent' ? 'AI 智能体控制面数据' : '集成运行监控数据'}
           >
-            <Tab label="服务主体" />
-            <Tab label="实时租约" />
-            <Tab label="领域事件" />
-            <Tab label="事件投递（Outbox）" />
-            <Tab label="策略审计" />
+            {surfaceTabs[surface].map((item) => (
+              <Tab key={item.id} value={item.id} label={item.label} />
+            ))}
           </Tabs>
           <Divider />
 
-          {loading && !snapshot ? (
+          {activeTabError && (
+            <Alert
+              severity="error"
+              action={<Button onClick={loadActiveTab}>重试</Button>}
+              sx={{ m: 2 }}
+            >
+              {activeTabError}
+            </Alert>
+          )}
+          {activeTabLoading && !activeTabHasData ? (
             <Stack
               aria-busy="true"
               sx={{
@@ -893,12 +1566,12 @@ const AgentControlCenter: React.FC = () => {
                   color: "text.secondary",
                   mt: 2
                 }}>
-                正在加载 AI 智能体控制面…
+                正在加载当前列表…
               </Typography>
             </Stack>
           ) : (
             <TableContainer>
-              {tab === 0 && (
+              {tab === 'principals' && (
                 <ResizableMuiTable tableId="agent-control.principals" columns={principalColumns} size="small" aria-label="服务主体列表">
                   <TableHead>
                     <TableRow>
@@ -911,7 +1584,9 @@ const AgentControlCenter: React.FC = () => {
                     </TableRow>
                   </TableHead>
                   <TableBody>
-                    {(snapshot?.principals ?? []).map((principal) => (
+                    {(principals?.items ?? []).map((principal) => {
+                      const grantState = principalGrantState(principal, grantNow)
+                      return (
                       <TableRow key={principal.id} hover>
                         <TableCell>
                           <InlineDetails
@@ -921,12 +1596,24 @@ const AgentControlCenter: React.FC = () => {
                           />
                         </TableCell>
                         <TableCell>
-                          <Stack direction="row" spacing={0.5}>
+                          <Stack
+                            direction="row"
+                            spacing={0.5}
+                            sx={{ alignItems: 'center', flexWrap: 'nowrap', overflow: 'hidden' }}
+                          >
                             <Tooltip title={`状态代码：${principal.status}`}>
                               <Chip
                                 size="small"
                                 label={statusLabel(principal.status)}
                                 color={statusColor(principal.status)}
+                                variant="outlined"
+                              />
+                            </Tooltip>
+                            <Tooltip title={grantState.detail}>
+                              <Chip
+                                size="small"
+                                label={grantState.label}
+                                color={grantState.color}
                                 variant="outlined"
                               />
                             </Tooltip>
@@ -959,56 +1646,83 @@ const AgentControlCenter: React.FC = () => {
                         </TableCell>
                         <TableCell>{formatDate(principal.last_used_at)}</TableCell>
                         <TableCell align="right">
-                          <Tooltip title="权限范围策略">
-                            <IconButton
-                              size="small"
-                              onClick={() => void openPolicies(principal)}
-                              aria-label={`管理 ${principal.name} 的策略`}
-                            >
-                              <PolicyIcon fontSize="small" />
-                            </IconButton>
+                          <Tooltip title={grantState.usable ? '权限范围策略' : `${grantState.label}，策略管理不可用`}>
+                            <span>
+                              <IconButton
+                                size="small"
+                                onClick={() => void openPolicies(principal)}
+                                disabled={!grantState.usable || submitting}
+                                aria-label={`管理 ${principal.name} 的策略`}
+                              >
+                                <PolicyIcon fontSize="small" />
+                              </IconButton>
+                            </span>
                           </Tooltip>
-                          <Tooltip title="轮换凭据">
+                          <Tooltip title={
+                            credentialProtectionActive
+                              ? '请先保存当前一次性凭据'
+                              : grantState.usable
+                                ? '轮换凭据'
+                                : `${grantState.label}，凭据轮换不可用`
+                          }>
                             <span>
                               <IconButton
                                 size="small"
                                 onClick={() => confirmRotateCredential(principal)}
-                                disabled={submitting}
+                                disabled={
+                                  !grantState.usable
+                                  || submitting
+                                  || credentialProtectionActive
+                                }
                                 aria-label={`轮换 ${principal.name} 的凭据`}
                               >
                                 <RotateIcon fontSize="small" />
                               </IconButton>
                             </span>
                           </Tooltip>
-                          <Tooltip title={principal.emergency_disabled ? '解除单个智能体熔断' : '立即熔断智能体'}>
-                            <IconButton
-                              size="small"
-                              color={principal.emergency_disabled ? 'success' : 'error'}
-                              onClick={() => confirmTogglePrincipalEmergency(principal)}
-                              aria-label={`${principal.emergency_disabled ? '解除' : '启用'} ${principal.name} 的熔断`}
-                            >
-                              <StopIcon fontSize="small" />
-                            </IconButton>
+                          <Tooltip title={
+                            grantState.usable
+                              ? principal.emergency_disabled ? '解除单个智能体熔断' : '立即熔断智能体'
+                              : `${grantState.label}，熔断操作不可用`
+                          }>
+                            <span>
+                              <IconButton
+                                size="small"
+                                color={principal.emergency_disabled ? 'success' : 'error'}
+                                onClick={() => confirmTogglePrincipalEmergency(principal)}
+                                disabled={!grantState.usable || submitting}
+                                aria-label={`${principal.emergency_disabled ? '解除' : '启用'} ${principal.name} 的熔断`}
+                              >
+                                <StopIcon fontSize="small" />
+                              </IconButton>
+                            </span>
                           </Tooltip>
-                          <Button
-                            size="small"
-                            color={principal.status === 'active' ? 'warning' : 'primary'}
-                            onClick={() => confirmTogglePrincipal(principal)}
-                            disabled={principal.status === 'revoked'}
-                          >
-                            {principal.status === 'revoked' ? '已撤销' : principal.status === 'active' ? '停用' : '启用'}
-                          </Button>
+                          <Tooltip title={
+                            grantState.usable ? '' : `${grantState.label}，状态操作不可用`
+                          }>
+                            <span>
+                              <Button
+                                size="small"
+                                color={principal.status === 'active' ? 'warning' : 'primary'}
+                                onClick={() => confirmTogglePrincipal(principal)}
+                                disabled={principal.status === 'revoked' || !grantState.usable || submitting}
+                              >
+                                {principal.status === 'revoked' ? '已撤销' : principal.status === 'active' ? '停用' : '启用'}
+                              </Button>
+                            </span>
+                          </Tooltip>
                         </TableCell>
                       </TableRow>
-                    ))}
-                    {(snapshot?.principals.length ?? 0) === 0 && (
+                      )
+                    })}
+                    {(principals?.items.length ?? 0) === 0 && (
                       <EmptyRow colSpan={6} message="还没有服务主体。创建后即可通过 OAuth 获取智能体访问令牌。" />
                     )}
                   </TableBody>
                 </ResizableMuiTable>
               )}
 
-              {tab === 1 && (
+              {tab === 'leases' && (
                 <ResizableMuiTable tableId="agent-control.leases" columns={leaseColumns} size="small" aria-label="工单租约列表">
                   <TableHead>
                     <TableRow>
@@ -1021,7 +1735,7 @@ const AgentControlCenter: React.FC = () => {
                     </TableRow>
                   </TableHead>
                   <TableBody>
-                    {(snapshot?.leases ?? []).map((lease) => (
+                    {(leases?.items ?? []).map((lease) => (
                       <TableRow key={lease.id} hover>
                         <TableCell>
                           <TruncatedText title={lease.ticket_number || `工单 #${lease.ticket_id}`}>
@@ -1029,7 +1743,12 @@ const AgentControlCenter: React.FC = () => {
                           </TruncatedText>
                         </TableCell>
                         <TableCell>
-                          <TruncatedText title={lease.principal_name}>{lease.principal_name}</TruncatedText>
+                          <InlineDetails
+                            primary={lease.holder_display_name}
+                            secondary={`${actorTypeLabel(lease.holder_actor_type)}：${lease.holder_actor_id}`}
+                            title={`${lease.holder_display_name} · ${lease.holder_actor_type}:${lease.holder_actor_id}`}
+                            primaryFontWeight={400}
+                          />
                         </TableCell>
                         <TableCell>v{lease.ticket_version}</TableCell>
                         <TableCell>{formatDate(lease.acquired_at)}</TableCell>
@@ -1041,12 +1760,68 @@ const AgentControlCenter: React.FC = () => {
                         </TableCell>
                       </TableRow>
                     ))}
-                    {(snapshot?.leases.length ?? 0) === 0 && <EmptyRow colSpan={6} message="当前没有活跃工单租约。" />}
+                    {(leases?.items.length ?? 0) === 0 && <EmptyRow colSpan={6} message="当前没有活跃工单租约。" />}
                   </TableBody>
                 </ResizableMuiTable>
               )}
 
-              {tab === 2 && (
+              {tab === 'attachments' && (
+                <ResizableMuiTable tableId="agent-control.attachments" columns={attachmentColumns} size="small" aria-label="附件扫描列表">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>附件</TableCell>
+                      <TableCell>工单</TableCell>
+                      <TableCell>类型</TableCell>
+                      <TableCell>大小</TableCell>
+                      <TableCell>扫描状态</TableCell>
+                      <TableCell>更新时间</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {(attachments?.items ?? []).map((attachment: AttachmentScan) => (
+                      <TableRow key={attachment.id} hover>
+                        <TableCell>
+                          <TruncatedText title={attachment.original_name}>
+                            {attachment.original_name}
+                          </TruncatedText>
+                        </TableCell>
+                        <TableCell>#{attachment.ticket_id}</TableCell>
+                        <TableCell>
+                          <TruncatedText title={attachment.mime_type || '—'}>
+                            {attachment.mime_type || '—'}
+                          </TruncatedText>
+                        </TableCell>
+                        <TableCell>{attachment.file_size.toLocaleString('zh-CN')} 字节</TableCell>
+                        <TableCell>
+                          <Chip
+                            size="small"
+                            label={{
+                              pending: '待扫描',
+                              clean: '安全',
+                              infected: '已感染',
+                              error: '扫描异常',
+                            }[attachment.virus_scan]}
+                            color={
+                              attachment.virus_scan === 'clean'
+                                ? 'success'
+                                : attachment.virus_scan === 'pending'
+                                  ? 'warning'
+                                  : 'error'
+                            }
+                            variant="outlined"
+                          />
+                        </TableCell>
+                        <TableCell>{formatDate(attachment.updated_at)}</TableCell>
+                      </TableRow>
+                    ))}
+                    {(attachments?.items.length ?? 0) === 0 && (
+                      <EmptyRow colSpan={6} message="暂无附件扫描记录。" />
+                    )}
+                  </TableBody>
+                </ResizableMuiTable>
+              )}
+
+              {tab === 'events' && (
                 <ResizableMuiTable tableId="agent-control.events" columns={eventColumns} size="small" aria-label="领域事件列表">
                   <TableHead>
                     <TableRow>
@@ -1058,7 +1833,7 @@ const AgentControlCenter: React.FC = () => {
                     </TableRow>
                   </TableHead>
                   <TableBody>
-                    {(snapshot?.events ?? []).map((event) => (
+                    {(events?.items ?? []).map((event) => (
                       <TableRow key={event.id} hover>
                         <TableCell>{formatDate(event.time)}</TableCell>
                         <TableCell>
@@ -1077,12 +1852,12 @@ const AgentControlCenter: React.FC = () => {
                         <TableCell>v{event.resource_version}</TableCell>
                       </TableRow>
                     ))}
-                    {(snapshot?.events.length ?? 0) === 0 && <EmptyRow colSpan={5} message="暂无领域事件。" />}
+                    {(events?.items.length ?? 0) === 0 && <EmptyRow colSpan={5} message="暂无领域事件。" />}
                   </TableBody>
                 </ResizableMuiTable>
               )}
 
-              {tab === 3 && (
+              {tab === 'outbox' && (
                 <ResizableMuiTable tableId="agent-control.outbox" columns={outboxColumns} size="small" aria-label="事件投递列表">
                   <TableHead>
                     <TableRow>
@@ -1096,14 +1871,14 @@ const AgentControlCenter: React.FC = () => {
                     </TableRow>
                   </TableHead>
                   <TableBody>
-                    {(snapshot?.outbox ?? []).map((delivery) => (
+                    {(outbox?.items ?? []).map((delivery) => (
                       <TableRow key={delivery.id} hover>
                         <TableCell>
                           <TruncatedText title={delivery.event_id}>{delivery.event_id}</TruncatedText>
                         </TableCell>
                         <TableCell>
-                          <TruncatedText title={`投递目标代码：${delivery.destination}`}>
-                            {destinationLabel(delivery.destination)}
+                          <TruncatedText title={`投递类型：${delivery.destination_type}`}>
+                            {delivery.destination_label}
                           </TruncatedText>
                         </TableCell>
                         <TableCell>
@@ -1133,12 +1908,12 @@ const AgentControlCenter: React.FC = () => {
                         </TableCell>
                       </TableRow>
                     ))}
-                    {(snapshot?.outbox.length ?? 0) === 0 && <EmptyRow colSpan={7} message="暂无事件投递记录。" />}
+                    {(outbox?.items.length ?? 0) === 0 && <EmptyRow colSpan={7} message="暂无事件投递记录。" />}
                   </TableBody>
                 </ResizableMuiTable>
               )}
 
-              {tab === 4 && (
+              {tab === 'policy' && (
                 <ResizableMuiTable tableId="agent-control.policy-audit" columns={policyAuditColumns} size="small" aria-label="智能体策略决策审计">
                   <TableHead>
                     <TableRow>
@@ -1151,7 +1926,7 @@ const AgentControlCenter: React.FC = () => {
                     </TableRow>
                   </TableHead>
                   <TableBody>
-                    {(snapshot?.policy_decisions ?? []).map((decision) => (
+                    {(decisions?.items ?? []).map((decision) => (
                       <TableRow key={decision.id} hover>
                         <TableCell>{formatDate(decision.created_at)}</TableCell>
                         <TableCell>
@@ -1204,11 +1979,101 @@ const AgentControlCenter: React.FC = () => {
                         </TableCell>
                       </TableRow>
                     ))}
-                    {(snapshot?.policy_decisions.length ?? 0) === 0 && (
+                    {(decisions?.items.length ?? 0) === 0 && (
                       <EmptyRow colSpan={6} message="暂无智能体策略决策记录。" />
                     )}
                   </TableBody>
                 </ResizableMuiTable>
+              )}
+              {tab === 'principals' && principals && (
+                <TablePagination
+                  component="div"
+                  count={principals.total}
+                  page={principals.page - 1}
+                  rowsPerPage={principals.page_size}
+                  rowsPerPageOptions={[25]}
+                  onPageChange={(_, nextPage) => setPrincipalPage(nextPage + 1)}
+                  labelRowsPerPage="每页"
+                />
+              )}
+              {tab === 'leases' && leases && (
+                <TablePagination
+                  component="div"
+                  count={leases.total}
+                  page={leases.page - 1}
+                  rowsPerPage={leases.page_size}
+                  rowsPerPageOptions={[25]}
+                  onPageChange={(_, nextPage) => setLeasePage(nextPage + 1)}
+                  labelRowsPerPage="每页"
+                />
+              )}
+              {tab === 'attachments' && attachments && (
+                <TablePagination
+                  component="div"
+                  count={attachments.total}
+                  page={attachments.page - 1}
+                  rowsPerPage={attachments.page_size}
+                  rowsPerPageOptions={[25]}
+                  onPageChange={(_, nextPage) => setAttachmentPage(nextPage + 1)}
+                  labelRowsPerPage="每页"
+                />
+              )}
+              {tab === 'outbox' && outbox && (
+                <TablePagination
+                  component="div"
+                  count={outbox.total}
+                  page={outbox.page - 1}
+                  rowsPerPage={outbox.page_size}
+                  rowsPerPageOptions={[25]}
+                  onPageChange={(_, nextPage) => setOutboxPage(nextPage + 1)}
+                  labelRowsPerPage="每页"
+                />
+              )}
+              {tab === 'events' && events && (
+                <Stack direction="row" spacing={1} sx={{ justifyContent: 'flex-end', p: 2 }}>
+                  <Button
+                    disabled={eventCursorHistory.length === 0 || activeTabLoading}
+                    onClick={() => {
+                      const history = [...eventCursorHistory]
+                      setEventCursor(history.pop() ?? '')
+                      setEventCursorHistory(history)
+                    }}
+                  >
+                    上一页
+                  </Button>
+                  <Button
+                    disabled={!events.has_more || !events.next_cursor || activeTabLoading}
+                    onClick={() => {
+                      setEventCursorHistory((history) => [...history, eventCursor])
+                      setEventCursor(events.next_cursor)
+                    }}
+                  >
+                    下一页
+                  </Button>
+                </Stack>
+              )}
+              {tab === 'policy' && decisions && (
+                <Stack direction="row" spacing={1} sx={{ justifyContent: 'flex-end', p: 2 }}>
+                  <Button
+                    disabled={decisionCursorHistory.length === 0 || activeTabLoading}
+                    onClick={() => {
+                      const history = [...decisionCursorHistory]
+                      setDecisionCursor(history.pop() ?? '')
+                      setDecisionCursorHistory(history)
+                    }}
+                  >
+                    上一页
+                  </Button>
+                  <Button
+                    disabled={!decisions.has_more || !decisions.next_cursor || activeTabLoading}
+                    onClick={() => {
+                      setDecisionCursorHistory((history) => [...history, decisionCursor])
+                      setDecisionCursor(decisions.next_cursor)
+                    }}
+                  >
+                    下一页
+                  </Button>
+                </Stack>
               )}
             </TableContainer>
           )}
@@ -1275,7 +2140,11 @@ const AgentControlCenter: React.FC = () => {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setCreateOpen(false)}>取消</Button>
-          <Button variant="contained" onClick={() => void createPrincipal()} disabled={submitting}>
+          <Button
+            variant="contained"
+            onClick={() => void createPrincipal()}
+            disabled={submitting || credentialProtectionActive}
+          >
             {submitting ? '创建中…' : '创建并签发凭据'}
           </Button>
         </DialogActions>
@@ -1288,6 +2157,11 @@ const AgentControlCenter: React.FC = () => {
       >
         <DialogTitle>{policyPrincipal?.name} · 权限范围策略</DialogTitle>
         <DialogContent>
+          {policyGrantState && !policyGrantState.usable && (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              {policyGrantState.label}，当前策略仅供查看，不能新增或停用。
+            </Alert>
+          )}
           <Alert severity="info" sx={{ mb: 2 }}>
             拒绝策略始终优先；分配、状态流转和升级等风险动作必须存在匹配的显式允许策略。
             智能体触发外部 Webhook 还必须具备“订阅事件”权限，并显式允许“发送外部通知”操作；
@@ -1381,14 +2255,36 @@ const AgentControlCenter: React.FC = () => {
                 void createPolicy()
               }
             }}
-            disabled={submitting}
+            disabled={submitting || !policyGrantState?.usable}
             sx={{ mt: 2 }}
           >
             新增策略
           </Button>
           <Divider sx={{ my: 2 }} />
+          {errorByKey.policies && (
+            <Alert
+              severity="error"
+              action={
+                <Button onClick={() => {
+                  if (projectKey && policyPrincipal) {
+                    void loadPolicies(projectKey, policyPrincipal.id, policyPage)
+                  }
+                }}>
+                  重试
+                </Button>
+              }
+              sx={{ mb: 2 }}
+            >
+              {errorByKey.policies}
+            </Alert>
+          )}
+          {loadingByKey.policies && !policies && (
+            <Stack aria-busy="true" sx={{ alignItems: 'center', py: 3 }}>
+              <CircularProgress size={24} />
+            </Stack>
+          )}
           <Stack spacing={1}>
-            {policies.map((policy) => (
+            {(policies?.items ?? []).map((policy) => (
               <Paper key={policy.id} variant="outlined" sx={{ p: 1.5 }}>
                 <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{
                   justifyContent: "space-between"
@@ -1421,14 +2317,25 @@ const AgentControlCenter: React.FC = () => {
                     {!policy.is_active && <Chip size="small" label="已停用" />}
                   </Stack>
                   {policy.is_active && (
-                    <Button size="small" color="warning" onClick={() => confirmDisablePolicy(policy)}>
-                      停用
-                    </Button>
+                    <Tooltip title={
+                      policyGrantState?.usable ? '' : `${policyGrantState?.label ?? '项目授权不可用'}，不能停用策略`
+                    }>
+                      <span>
+                        <Button
+                          size="small"
+                          color="warning"
+                          onClick={() => confirmDisablePolicy(policy)}
+                          disabled={!policyGrantState?.usable}
+                        >
+                          停用
+                        </Button>
+                      </span>
+                    </Tooltip>
                   )}
                 </Stack>
               </Paper>
             ))}
-            {policies.length === 0 && (
+            {(policies?.items.length ?? 0) === 0 && !loadingByKey.policies && (
               <Typography
                 align="center"
                 sx={{
@@ -1439,6 +2346,17 @@ const AgentControlCenter: React.FC = () => {
               </Typography>
             )}
           </Stack>
+          {policies && (
+            <TablePagination
+              component="div"
+              count={policies.total}
+              page={policies.page - 1}
+              rowsPerPage={policies.page_size}
+              rowsPerPageOptions={[25]}
+              onPageChange={(_, nextPage) => setPolicyPage(nextPage + 1)}
+              labelRowsPerPage="每页"
+            />
+          )}
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setPolicyPrincipal(null)}>关闭</Button>
@@ -1505,6 +2423,11 @@ const AgentControlCenter: React.FC = () => {
                 },
               }}
             />
+            {credentialProjectKey && (
+              <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                凭据签发项目：{credentialProjectKey}
+              </Typography>
+            )}
             {credential?.expires_at && (
               <Typography variant="body2" sx={{
                 color: "text.secondary"
@@ -1515,7 +2438,14 @@ const AgentControlCenter: React.FC = () => {
           </Stack>
         </DialogContent>
         <DialogActions>
-          <Button variant="contained" onClick={() => setCredential(null)}>我已安全保存</Button>
+          <Button
+            variant="contained"
+            onClick={() => {
+              endCredentialProtection()
+            }}
+          >
+            我已安全保存
+          </Button>
         </DialogActions>
       </Dialog>
     </>

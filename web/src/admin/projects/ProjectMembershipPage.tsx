@@ -1,13 +1,18 @@
 import React from 'react'
 import {
+    HttpError,
     Title,
     useNotify,
     usePermissions,
 } from 'react-admin'
 import {
     Alert,
+    Autocomplete,
+    Avatar,
     Box,
     Button,
+    Checkbox,
+    Chip,
     CircularProgress,
     Dialog,
     DialogActions,
@@ -15,6 +20,7 @@ import {
     DialogContentText,
     DialogTitle,
     FormControl,
+    FormControlLabel,
     InputLabel,
     MenuItem,
     Paper,
@@ -24,6 +30,7 @@ import {
     TableCell,
     TableContainer,
     TableHead,
+    TablePagination,
     TableRow,
     TextField,
     Typography,
@@ -32,6 +39,8 @@ import {
     humanApiRoutes,
     type ProjectMembership,
     type ProjectRole,
+    type ProjectUserOption,
+    type ProjectUserOptionPage,
     type UpsertProjectMembershipRequest,
 } from '@/lib/generated/human-api'
 import type { AccessPermissions } from '@/lib/accessControl'
@@ -52,8 +61,14 @@ import {
 } from '@/components/tables/EnterpriseTable'
 
 const projectMembershipColumns: ResizableColumn[] = [
-    { key: 'user', defaultWidth: 300, minWidth: 220, maxWidth: 520 },
+    { key: 'user', defaultWidth: 320, minWidth: 240, maxWidth: 520 },
     { key: 'role', defaultWidth: 160, minWidth: 128, maxWidth: 240 },
+    {
+        key: 'knowledge_contributor',
+        defaultWidth: 180,
+        minWidth: 152,
+        maxWidth: 280,
+    },
     { key: 'status', defaultWidth: 112, minWidth: 96, maxWidth: 160 },
     {
         key: 'actions',
@@ -67,11 +82,28 @@ const projectMembershipColumns: ResizableColumn[] = [
 const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === 'object' && value !== null
 
-const parseMemberships = (value: unknown): ProjectMembership[] => {
-    if (!Array.isArray(value)) {
+interface DirectoryPage<T> {
+    items: T[]
+    total: number
+    page: number
+    page_size: number
+    total_pages: number
+}
+
+const parseMembershipPage = (
+    value: unknown,
+): DirectoryPage<ProjectMembership> => {
+    if (
+        !isRecord(value) ||
+        !Array.isArray(value.items) ||
+        typeof value.total !== 'number' ||
+        typeof value.page !== 'number' ||
+        typeof value.page_size !== 'number' ||
+        typeof value.total_pages !== 'number'
+    ) {
         throw new Error('项目成员响应格式无效')
     }
-    return value.map((item) => {
+    const items = value.items.map((item) => {
         if (
             !isRecord(item) ||
             typeof item.id !== 'number' ||
@@ -79,6 +111,7 @@ const parseMemberships = (value: unknown): ProjectMembership[] => {
             typeof item.user_id !== 'number' ||
             parseProjectRole(item.role) === null ||
             typeof item.is_active !== 'boolean' ||
+            typeof item.knowledge_contributor !== 'boolean' ||
             typeof item.version !== 'number' ||
             typeof item.created_at !== 'string' ||
             typeof item.updated_at !== 'string'
@@ -87,6 +120,13 @@ const parseMemberships = (value: unknown): ProjectMembership[] => {
         }
         return item as ProjectMembership
     })
+    return {
+        items,
+        total: value.total,
+        page: value.page,
+        page_size: value.page_size,
+        total_pages: value.total_pages,
+    }
 }
 
 const roleChoices = projectRoleValues.map((role) => ({
@@ -94,61 +134,183 @@ const roleChoices = projectRoleValues.map((role) => ({
     name: getProjectRoleLabel(role),
 }))
 
+const userOptionFromMembership = (
+    membership: ProjectMembership,
+): ProjectUserOption | null => {
+    if (!membership.user) return null
+    return {
+        id: membership.user.id,
+        username: membership.user.username,
+        display_name: membership.user.display_name,
+        avatar: membership.user.avatar,
+    }
+}
+
 const ProjectMembershipPage = () => {
     const { permissions, isPending: permissionsPending } =
         usePermissions<AccessPermissions>()
     const notify = useNotify()
-    const isProjectAdmin =
-        parseProjectRole(permissions?.project_role) === 'project_admin'
+    const projectRole = parseProjectRole(permissions?.project_role)
+    const isProjectAdmin = projectRole === 'project_admin'
+    const canRead = isProjectAdmin || projectRole === 'manager'
     const [memberships, setMemberships] = React.useState<ProjectMembership[]>([])
+    const [page, setPage] = React.useState(0)
+    const [pageSize, setPageSize] = React.useState(25)
+    const [total, setTotal] = React.useState(0)
     const [loading, setLoading] = React.useState(true)
     const [saving, setSaving] = React.useState(false)
     const [error, setError] = React.useState('')
-    const [userID, setUserID] = React.useState('')
+    const [listError, setListError] = React.useState('')
+    const [selectedUser, setSelectedUser] =
+        React.useState<ProjectUserOption | null>(null)
+    const [selectedMembershipVersion, setSelectedMembershipVersion] =
+        React.useState(0)
+    const [candidateOptions, setCandidateOptions] =
+        React.useState<ProjectUserOption[]>([])
+    const [candidateSearch, setCandidateSearch] = React.useState('')
+    const [candidateLoading, setCandidateLoading] = React.useState(false)
     const [role, setRole] = React.useState<ProjectRole>('requester')
+    const [knowledgeContributor, setKnowledgeContributor] =
+        React.useState(false)
     const [membershipToRevoke, setMembershipToRevoke] =
         React.useState<ProjectMembership | null>(null)
+    const listAbortController = React.useRef<AbortController | null>(null)
 
     const loadMemberships = React.useCallback(async () => {
-        if (!isProjectAdmin) return
+        if (!canRead) return
+        listAbortController.current?.abort()
+        const controller = new AbortController()
+        listAbortController.current = controller
         setLoading(true)
-        setError('')
+        setListError('')
         try {
-            const path = humanApiRoutes.listProjectMemberships({
+            const basePath = humanApiRoutes.listProjectMemberships({
                 projectKey: await resolveActiveProjectKey(),
             })
-            const response = await apiFetch<unknown>(path)
-            setMemberships(parseMemberships(response))
+            if (controller.signal.aborted) return
+            const query = new URLSearchParams({
+                page: String(page + 1),
+                page_size: String(pageSize),
+                sort_by: 'is_active',
+                sort_order: 'desc',
+            })
+            const response = await apiFetch<unknown>(
+                `${basePath}?${query.toString()}`,
+                { signal: controller.signal },
+            )
+            if (controller.signal.aborted) return
+            const parsed = parseMembershipPage(response)
+            if (
+                parsed.total_pages > 0 &&
+                page + 1 > parsed.total_pages
+            ) {
+                setPage(parsed.total_pages - 1)
+                return
+            }
+            setMemberships(parsed.items)
+            setTotal(parsed.total)
         } catch (requestError) {
-            setError(
+            if (controller.signal.aborted) return
+            setListError(
                 localizedUnknownErrorMessage(
                     requestError,
                     '项目成员加载失败，请稍后重试',
                 ),
             )
         } finally {
-            setLoading(false)
+            if (
+                !controller.signal.aborted &&
+                listAbortController.current === controller
+            ) {
+                setLoading(false)
+            }
         }
-    }, [isProjectAdmin])
+    }, [canRead, page, pageSize])
 
     React.useEffect(() => {
-        if (!permissionsPending && isProjectAdmin) {
+        if (!permissionsPending && canRead) {
             void loadMemberships()
         } else if (!permissionsPending) {
             setLoading(false)
         }
-    }, [isProjectAdmin, loadMemberships, permissionsPending])
+        return () => {
+            listAbortController.current?.abort()
+        }
+    }, [canRead, loadMemberships, permissionsPending])
+
+    React.useEffect(() => {
+        if (!isProjectAdmin) return
+        const controller = new AbortController()
+        const timer = window.setTimeout(() => {
+            setCandidateLoading(true)
+            void resolveActiveProjectKey()
+                .then((projectKey) =>
+                    apiFetch<ProjectUserOptionPage>(
+                        humanApiRoutes.searchProjectMembershipCandidates(
+                            { projectKey },
+                            {
+                                page: 1,
+                                page_size: 25,
+                                ...(candidateSearch.trim()
+                                    ? { search: candidateSearch.trim() }
+                                    : {}),
+                            },
+                        ),
+                        {
+                            method: 'GET',
+                            signal: controller.signal,
+                        },
+                    ),
+                )
+                .then((page) => {
+                    if (!controller.signal.aborted) {
+                        const options = selectedUser
+                            ? [
+                                selectedUser,
+                                ...page.items.filter(
+                                    ({ id }) => id !== selectedUser.id,
+                                ),
+                            ]
+                            : page.items
+                        setCandidateOptions(options)
+                    }
+                })
+                .catch((requestError: unknown) => {
+                    if (!controller.signal.aborted) {
+                        setError(
+                            localizedUnknownErrorMessage(
+                                requestError,
+                                '用户候选搜索失败，请稍后重试',
+                            ),
+                        )
+                    }
+                })
+                .finally(() => {
+                    if (!controller.signal.aborted) {
+                        setCandidateLoading(false)
+                    }
+                })
+        }, 250)
+        return () => {
+            window.clearTimeout(timer)
+            controller.abort()
+        }
+    }, [candidateSearch, isProjectAdmin, selectedUser])
 
     const saveMembership = async (event: React.FormEvent) => {
         event.preventDefault()
-        const numericUserID = Number(userID)
-        if (!Number.isSafeInteger(numericUserID) || numericUserID <= 0) {
-            setError('请输入有效的用户 ID')
+        if (!selectedUser) {
+            setError('请通过远程搜索选择用户')
             return
         }
         const payload: UpsertProjectMembershipRequest = {
-            user_id: numericUserID,
+            user_id: selectedUser.id,
             role,
+            knowledge_contributor:
+                role === 'project_admin' || role === 'manager'
+                    ? false
+                    : knowledgeContributor,
+            expected_version: selectedMembershipVersion,
         }
         setSaving(true)
         setError('')
@@ -161,10 +323,24 @@ const ProjectMembershipPage = () => {
                 body: JSON.stringify(payload),
             })
             notify('项目成员关系已保存', { type: 'success' })
-            setUserID('')
+            setSelectedUser(null)
+            setSelectedMembershipVersion(0)
+            setCandidateSearch('')
             setRole('requester')
+            setKnowledgeContributor(false)
             await loadMemberships()
         } catch (requestError) {
+            if (
+                requestError instanceof HttpError &&
+                requestError.status === 409
+            ) {
+                setSelectedUser(null)
+                setSelectedMembershipVersion(0)
+                setCandidateSearch('')
+                setRole('requester')
+                setKnowledgeContributor(false)
+                await loadMemberships()
+            }
             setError(
                 localizedUnknownErrorMessage(
                     requestError,
@@ -184,12 +360,21 @@ const ProjectMembershipPage = () => {
             const path = humanApiRoutes.deactivateProjectMembership({
                 projectKey: await resolveActiveProjectKey(),
                 userID: membershipToRevoke.user_id,
+            }, {
+                expected_version: membershipToRevoke.version,
             })
             await apiFetch(path, { method: 'DELETE' })
             notify('项目职责已撤销', { type: 'success' })
             setMembershipToRevoke(null)
             await loadMemberships()
         } catch (requestError) {
+            if (
+                requestError instanceof HttpError &&
+                requestError.status === 409
+            ) {
+                setMembershipToRevoke(null)
+                await loadMemberships()
+            }
             setError(
                 localizedUnknownErrorMessage(
                     requestError,
@@ -209,10 +394,10 @@ const ProjectMembershipPage = () => {
         )
     }
 
-    if (!isProjectAdmin) {
+    if (!canRead) {
         return (
             <Alert severity="error" data-testid="project-membership-forbidden">
-                仅项目管理员可访问项目成员管理。
+                仅项目管理员或项目经理可查看项目成员。
             </Alert>
         )
     }
@@ -224,69 +409,236 @@ const ProjectMembershipPage = () => {
                 项目成员管理
             </Typography>
             <Typography color="text.secondary" sx={{ mb: 3 }}>
-                项目职责仅在当前项目内生效。平台职责不会自动授予任何项目访问权限。
+                项目经理可查看成员；只有项目管理员可授予、变更或撤销项目职责。
             </Typography>
 
-            {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
-
-            <Paper
-                component="form"
-                onSubmit={saveMembership}
-                variant="outlined"
-                sx={{ p: 3, mb: 3 }}
-            >
-                <Typography variant="h6" gutterBottom>
-                    授予项目职责
-                </Typography>
-                <Stack
-                    direction={{ xs: 'column', md: 'row' }}
-                    spacing={2}
-                    sx={{ alignItems: { md: 'center' } }}
-                >
-                    <TextField
-                        label="用户 ID"
-                        value={userID}
-                        onChange={(event) => setUserID(event.target.value)}
-                        inputMode="numeric"
-                        required
-                    />
-                    <FormControl sx={{ minWidth: 220 }}>
-                        <InputLabel id="project-role-label">项目职责</InputLabel>
-                        <Select
-                            labelId="project-role-label"
-                            label="项目职责"
-                            value={role}
-                            onChange={(event) =>
-                                setRole(event.target.value as ProjectRole)
-                            }
+            {error && (
+                <Alert severity="error" sx={{ mb: 2 }}>
+                    {error}
+                </Alert>
+            )}
+            {listError && (
+                <Alert
+                    severity="error"
+                    sx={{ mb: 2 }}
+                    action={
+                        <Button
+                            color="inherit"
+                            size="small"
+                            onClick={() => void loadMemberships()}
                         >
-                            {roleChoices.map((choice) => (
-                                <MenuItem key={choice.id} value={choice.id}>
-                                    {choice.name}
-                                </MenuItem>
-                            ))}
-                        </Select>
-                    </FormControl>
-                    <Button
-                        type="submit"
-                        variant="contained"
-                        disabled={saving}
-                    >
-                        {saving ? '保存中…' : '保存成员关系'}
-                    </Button>
-                </Stack>
-            </Paper>
-
-            <TableContainer component={Paper} variant="outlined">
-                <ResizableMuiTable
-                    tableId="projects.memberships"
-                    columns={projectMembershipColumns}
-                    aria-label="项目成员列表"
+                            重试
+                        </Button>
+                    }
                 >
+                    {listError}
+                </Alert>
+            )}
+            {!isProjectAdmin && (
+                <Alert
+                    severity="info"
+                    sx={{ mb: 2 }}
+                    data-testid="project-membership-read-only"
+                >
+                    当前为只读视图。请联系项目管理员变更成员职责。
+                </Alert>
+            )}
+
+            {isProjectAdmin && (
+                <Paper
+                    component="form"
+                    onSubmit={saveMembership}
+                    variant="outlined"
+                    sx={{ p: 3, mb: 3 }}
+                >
+                    <Typography variant="h6" gutterBottom>
+                        授予项目职责
+                    </Typography>
+                    <Stack
+                        direction={{ xs: 'column', md: 'row' }}
+                        spacing={2}
+                        sx={{ alignItems: { md: 'center' } }}
+                    >
+                        <Autocomplete
+                            options={candidateOptions}
+                            value={selectedUser}
+                            loading={candidateLoading}
+                            filterOptions={(options) => options}
+                            isOptionEqualToValue={(option, value) =>
+                                option.id === value.id
+                            }
+                            getOptionLabel={(option) =>
+                                option.display_name || option.username
+                            }
+                            onChange={(_, value) => {
+                                setSelectedUser(value)
+                                const existingMembership = value
+                                    ? memberships.find(
+                                        (membership) =>
+                                            membership.user_id === value.id,
+                                    )
+                                    : undefined
+                                setSelectedMembershipVersion(
+                                    existingMembership?.version ?? 0,
+                                )
+                                setRole(
+                                    existingMembership?.role ?? 'requester',
+                                )
+                                setKnowledgeContributor(
+                                    existingMembership
+                                        ?.knowledge_contributor ?? false,
+                                )
+                                setCandidateSearch(
+                                    value
+                                        ? value.display_name || value.username
+                                        : '',
+                                )
+                            }}
+                            inputValue={candidateSearch}
+                            onInputChange={(_, value, reason) => {
+                                if (reason !== 'reset') {
+                                    setCandidateSearch(value)
+                                }
+                            }}
+                            renderOption={(props, option) => {
+                                const {
+                                    key: optionKey,
+                                    ...optionProps
+                                } = props
+                                return (
+                                    <Box
+                                        component="li"
+                                        key={optionKey}
+                                        {...optionProps}
+                                    >
+                                        <Avatar
+                                            src={option.avatar || undefined}
+                                            sx={{
+                                                width: 28,
+                                                height: 28,
+                                                mr: 1,
+                                            }}
+                                        >
+                                            {(option.display_name ||
+                                                option.username).slice(0, 1)}
+                                        </Avatar>
+                                        <Box>
+                                            <Typography variant="body2">
+                                                {option.display_name ||
+                                                    option.username}
+                                            </Typography>
+                                            <Typography
+                                                variant="caption"
+                                                color="text.secondary"
+                                            >
+                                                @{option.username}
+                                            </Typography>
+                                        </Box>
+                                    </Box>
+                                )
+                            }}
+                            renderInput={(params) => (
+                                <TextField
+                                    {...params}
+                                    label="搜索用户"
+                                    placeholder="输入姓名、用户名或邮箱远程搜索"
+                                    required
+                                />
+                            )}
+                            sx={{ minWidth: { md: 320 }, flex: 1 }}
+                        />
+                        <FormControl sx={{ minWidth: 220 }}>
+                            <InputLabel id="project-role-label">
+                                项目职责
+                            </InputLabel>
+                            <Select
+                                labelId="project-role-label"
+                                label="项目职责"
+                                value={role}
+                                onChange={(event) =>
+                                    {
+                                        const nextRole =
+                                            event.target.value as ProjectRole
+                                        setRole(nextRole)
+                                        if (
+                                            nextRole === 'project_admin' ||
+                                            nextRole === 'manager'
+                                        ) {
+                                            setKnowledgeContributor(false)
+                                        }
+                                    }
+                                }
+                            >
+                                {roleChoices.map((choice) => (
+                                    <MenuItem key={choice.id} value={choice.id}>
+                                        {choice.name}
+                                    </MenuItem>
+                                ))}
+                            </Select>
+                        </FormControl>
+                        <Stack spacing={0}>
+                            <FormControlLabel
+                                control={(
+                                    <Checkbox
+                                        checked={
+                                            role === 'project_admin' ||
+                                            role === 'manager' ||
+                                            knowledgeContributor
+                                        }
+                                        disabled={
+                                            role === 'project_admin' ||
+                                            role === 'manager'
+                                        }
+                                        onChange={(event) =>
+                                            setKnowledgeContributor(
+                                                event.target.checked,
+                                            )}
+                                        slotProps={{
+                                            input: {
+                                                'aria-label':
+                                                    '允许创建知识草稿',
+                                            },
+                                        }}
+                                    />
+                                )}
+                                label={
+                                    role === 'project_admin' ||
+                                    role === 'manager'
+                                        ? '职责已包含知识管理'
+                                        : '知识贡献者（仅草稿）'
+                                }
+                            />
+                            <Typography
+                                variant="caption"
+                                color="text.secondary"
+                                sx={{ pl: 4 }}
+                            >
+                                可创建和修订自己的草稿，不能发布或调整知识权限
+                            </Typography>
+                        </Stack>
+                        <Button
+                            type="submit"
+                            variant="contained"
+                            disabled={saving || !selectedUser}
+                        >
+                            {saving ? '保存中…' : '保存成员关系'}
+                        </Button>
+                    </Stack>
+                </Paper>
+            )}
+
+            <Paper variant="outlined">
+                <TableContainer>
+                    <ResizableMuiTable
+                        tableId="projects.memberships"
+                        columns={projectMembershipColumns}
+                        aria-label="项目成员列表"
+                    >
                     <TableHead>
                         <TableRow>
                             <TableCell>用户</TableCell>
                             <TableCell>项目职责</TableCell>
+                            <TableCell>知识贡献</TableCell>
                             <TableCell>状态</TableCell>
                             <TableCell align="right">操作</TableCell>
                         </TableRow>
@@ -294,7 +646,7 @@ const ProjectMembershipPage = () => {
                     <TableBody>
                         {loading ? (
                             <TableRow>
-                                <TableCell colSpan={4} align="center">
+                                <TableCell colSpan={5} align="center">
                                     <CircularProgress
                                         size={24}
                                         aria-label="正在加载项目成员"
@@ -303,79 +655,194 @@ const ProjectMembershipPage = () => {
                             </TableRow>
                         ) : memberships.length === 0 ? (
                             <TableRow>
-                                <TableCell colSpan={4} align="center">
+                                <TableCell colSpan={5} align="center">
                                     暂无项目成员
                                 </TableCell>
                             </TableRow>
                         ) : (
-                            memberships.map((membership) => (
-                                <TableRow key={membership.id}>
-                                    <TableCell>
-                                        <InlineDetails
-                                            primary={
-                                                membership.user?.display_name ||
-                                                membership.user?.username ||
-                                                `用户 ${membership.user_id}`
-                                            }
-                                            secondary={`ID ${membership.user_id}`}
-                                            title={`${
-                                                membership.user?.display_name ||
-                                                membership.user?.username ||
-                                                `用户 ${membership.user_id}`
-                                            } · ID ${membership.user_id}`}
-                                        />
-                                    </TableCell>
-                                    <TableCell>
-                                        {getProjectRoleLabel(membership.role)}
-                                    </TableCell>
-                                    <TableCell>
-                                        {membership.is_active
-                                            ? '有效'
-                                            : '已撤销'}
-                                    </TableCell>
-                                    <TableCell align="right">
-                                        <Stack
-                                            direction="row"
-                                            spacing={1}
-                                            sx={{ justifyContent: 'flex-end' }}
-                                        >
-                                            <Button
-                                                size="small"
-                                                disabled={!membership.is_active}
-                                                onClick={() => {
-                                                    setUserID(
-                                                        String(
-                                                            membership.user_id,
-                                                        ),
-                                                    )
-                                                    setRole(membership.role)
-                                                }}
-                                            >
-                                                变更职责
-                                            </Button>
-                                            <Button
-                                                size="small"
-                                                color="error"
-                                                disabled={
-                                                    !membership.is_active ||
-                                                    saving
+                            memberships.map((membership) => {
+                                const displayName =
+                                    membership.user?.display_name ||
+                                    membership.user?.username ||
+                                    '用户信息不可用'
+                                return (
+                                    <TableRow key={membership.id}>
+                                        <TableCell>
+                                            <InlineDetails
+                                                primary={displayName}
+                                                secondary={
+                                                    membership.user
+                                                        ? `@${membership.user.username}`
+                                                        : '无法加载用户摘要'
                                                 }
-                                                onClick={() =>
-                                                    setMembershipToRevoke(
-                                                        membership,
-                                                    )
-                                                }
-                                            >
-                                                撤销项目职责
-                                            </Button>
-                                        </Stack>
-                                    </TableCell>
-                                </TableRow>
-                            ))
+                                                title={displayName}
+                                            />
+                                        </TableCell>
+                                        <TableCell>
+                                            {getProjectRoleLabel(
+                                                membership.role,
+                                            )}
+                                        </TableCell>
+                                        <TableCell>
+                                            {!membership.is_active ? (
+                                                <Chip
+                                                    size="small"
+                                                    color="default"
+                                                    variant="outlined"
+                                                    label="随职责撤销"
+                                                />
+                                            ) : membership.role ===
+                                                'project_admin' ||
+                                            membership.role === 'manager' ? (
+                                                <Chip
+                                                    size="small"
+                                                    color="primary"
+                                                    variant="outlined"
+                                                    label="职责自带"
+                                                />
+                                            ) : (
+                                                <Chip
+                                                    size="small"
+                                                    color={
+                                                        membership
+                                                            .knowledge_contributor
+                                                            ? 'success'
+                                                            : 'default'
+                                                    }
+                                                    variant="outlined"
+                                                    label={
+                                                        membership
+                                                            .knowledge_contributor
+                                                            ? '可创建草稿'
+                                                            : '未授权'
+                                                    }
+                                                />
+                                            )}
+                                        </TableCell>
+                                        <TableCell>
+                                            {membership.is_active
+                                                ? '有效'
+                                                : '已撤销'}
+                                        </TableCell>
+                                        <TableCell align="right">
+                                            {isProjectAdmin ? (
+                                                <Stack
+                                                    direction="row"
+                                                    spacing={1}
+                                                    sx={{
+                                                        justifyContent:
+                                                            'flex-end',
+                                                    }}
+                                                >
+                                                    <Button
+                                                        size="small"
+                                                        disabled={
+                                                            !membership.is_active ||
+                                                            !membership.user ||
+                                                            Boolean(listError)
+                                                        }
+                                                        onClick={() => {
+                                                            const option =
+                                                                userOptionFromMembership(
+                                                                    membership,
+                                                                )
+                                                            setSelectedUser(option)
+                                                            setSelectedMembershipVersion(
+                                                                membership.version,
+                                                            )
+                                                            setCandidateSearch(
+                                                                option
+                                                                    ? option.display_name ||
+                                                                        option.username
+                                                                    : '',
+                                                            )
+                                                            setRole(
+                                                                membership.role,
+                                                            )
+                                                            setKnowledgeContributor(
+                                                                membership
+                                                                    .knowledge_contributor,
+                                                            )
+                                                        }}
+                                                    >
+                                                        变更职责
+                                                    </Button>
+                                                    <Button
+                                                        size="small"
+                                                        color="error"
+                                                        disabled={
+                                                            !membership.is_active ||
+                                                            saving ||
+                                                            Boolean(listError)
+                                                        }
+                                                        onClick={() =>
+                                                            setMembershipToRevoke(
+                                                                membership,
+                                                            )
+                                                        }
+                                                    >
+                                                        撤销项目职责
+                                                    </Button>
+                                                </Stack>
+                                            ) : (
+                                                <Typography
+                                                    variant="body2"
+                                                    color="text.secondary"
+                                                >
+                                                    只读
+                                                </Typography>
+                                            )}
+                                        </TableCell>
+                                    </TableRow>
+                                )
+                            })
                         )}
                     </TableBody>
-                </ResizableMuiTable>
-            </TableContainer>
+                    </ResizableMuiTable>
+                </TableContainer>
+                <TablePagination
+                    component="div"
+                    count={total}
+                    page={page}
+                    rowsPerPage={pageSize}
+                    rowsPerPageOptions={[25, 50, 100]}
+                    disabled={loading || saving}
+                    onPageChange={(_, nextPage) => {
+                        setLoading(true)
+                        setMemberships([])
+                        setMembershipToRevoke(null)
+                        setSelectedUser(null)
+                        setSelectedMembershipVersion(0)
+                        setCandidateSearch('')
+                        setRole('requester')
+                        setKnowledgeContributor(false)
+                        setPage(nextPage)
+                    }}
+                    onRowsPerPageChange={(event) => {
+                        setLoading(true)
+                        setMemberships([])
+                        setMembershipToRevoke(null)
+                        setSelectedUser(null)
+                        setSelectedMembershipVersion(0)
+                        setCandidateSearch('')
+                        setRole('requester')
+                        setKnowledgeContributor(false)
+                        setPageSize(Number(event.target.value))
+                        setPage(0)
+                    }}
+                    labelRowsPerPage="每页行数"
+                    labelDisplayedRows={({ from, to, count }) =>
+                        `${from}–${to} / ${count}`
+                    }
+                    slotProps={{
+                        select: {
+                            inputProps: {
+                                'aria-label': '项目成员每页行数',
+                            },
+                        },
+                    }}
+                />
+            </Paper>
 
             <Dialog
                 open={membershipToRevoke !== null}
@@ -384,7 +851,8 @@ const ProjectMembershipPage = () => {
                 <DialogTitle>撤销项目职责</DialogTitle>
                 <DialogContent>
                     <DialogContentText>
-                        撤销后，该用户将立即失去当前项目的访问权限。此操作会保留不可变的成员关系历史。
+                        撤销后，该用户将立即失去当前项目的访问权限。
+                        此操作会保留不可变的成员关系历史。
                     </DialogContentText>
                 </DialogContent>
                 <DialogActions>

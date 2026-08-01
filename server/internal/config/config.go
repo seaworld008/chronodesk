@@ -31,6 +31,7 @@ type Config struct {
 	Knowledge     KnowledgeConfig     `json:"knowledge"`
 	Observability ObservabilityConfig `json:"observability"`
 	Integration   IntegrationConfig   `json:"integration"`
+	AuditExport   AuditExportConfig   `json:"audit_export"`
 }
 
 // ServerConfig 服务器配置
@@ -111,19 +112,56 @@ type RateLimitConfig struct {
 // AgentConfig controls machine identities and protocol endpoints separately
 // from human browser sessions.
 type AgentConfig struct {
-	JWTSecret          string        `json:"-"`
-	CredentialPepper   string        `json:"-"`
-	Issuer             string        `json:"issuer"`
-	MCPResourceURL     string        `json:"mcp_resource_url"`
-	APIResourceURL     string        `json:"api_resource_url"`
-	A2AResourceURL     string        `json:"a2a_resource_url"`
-	TokenTTL           time.Duration `json:"token_ttl"`
-	CredentialTTL      time.Duration `json:"credential_ttl"`
-	AttachmentDir      string        `json:"attachment_dir"`
-	MaxAttachmentBytes int64         `json:"max_attachment_bytes"`
-	LoopThreshold      int           `json:"loop_threshold"`
-	LoopWindow         time.Duration `json:"loop_window"`
-	GlobalReadOnly     bool          `json:"global_read_only"`
+	JWTSecret                     string                    `json:"-"`
+	CredentialPepper              string                    `json:"-"`
+	Issuer                        string                    `json:"issuer"`
+	MCPResourceURL                string                    `json:"mcp_resource_url"`
+	APIResourceURL                string                    `json:"api_resource_url"`
+	A2AResourceURL                string                    `json:"a2a_resource_url"`
+	TokenTTL                      time.Duration             `json:"token_ttl"`
+	CredentialTTL                 time.Duration             `json:"credential_ttl"`
+	AttachmentStorageBackend      string                    `json:"attachment_storage_backend"`
+	AttachmentLocalStoreID        string                    `json:"attachment_local_store_id"`
+	AttachmentDir                 string                    `json:"attachment_dir"`
+	AttachmentStagingDir          string                    `json:"attachment_staging_dir"`
+	AttachmentLocalDeploymentMode string                    `json:"attachment_local_deployment_mode"`
+	AttachmentS3Endpoint          string                    `json:"attachment_s3_endpoint"`
+	AttachmentS3StoreID           string                    `json:"attachment_s3_store_id"`
+	AttachmentS3Region            string                    `json:"attachment_s3_region"`
+	AttachmentS3Bucket            string                    `json:"attachment_s3_bucket"`
+	AttachmentS3Prefix            string                    `json:"attachment_s3_prefix"`
+	AttachmentS3UsePathStyle      bool                      `json:"attachment_s3_use_path_style"`
+	AttachmentS3AllowInsecure     bool                      `json:"attachment_s3_allow_insecure"`
+	AttachmentS3AccessKeyID       string                    `json:"-"`
+	AttachmentS3SecretAccessKey   string                    `json:"-"`
+	AttachmentS3SessionToken      string                    `json:"-"`
+	AttachmentS3SSE               string                    `json:"attachment_s3_sse"`
+	AttachmentS3KMSKeyID          string                    `json:"-"`
+	AttachmentS3VersioningMode    string                    `json:"attachment_s3_versioning_mode"`
+	AttachmentS3HistoricalStores  []AttachmentS3StoreConfig `json:"-"`
+	MaxAttachmentBytes            int64                     `json:"max_attachment_bytes"`
+	LoopThreshold                 int                       `json:"loop_threshold"`
+	LoopWindow                    time.Duration             `json:"loop_window"`
+	GlobalReadOnly                bool                      `json:"global_read_only"`
+}
+
+// AttachmentS3StoreConfig is one deployment-owned historical object-store
+// generation. It is never serialized because it may contain static
+// credentials. At most a small bounded registry is loaded at startup.
+type AttachmentS3StoreConfig struct {
+	StoreID               string `json:"store_id"`
+	Endpoint              string `json:"endpoint,omitempty"`
+	Region                string `json:"region"`
+	Bucket                string `json:"bucket"`
+	Prefix                string `json:"prefix"`
+	UsePathStyle          bool   `json:"use_path_style,omitempty"`
+	AllowInsecureEndpoint bool   `json:"allow_insecure_endpoint,omitempty"`
+	AccessKeyID           string `json:"access_key_id,omitempty"`
+	SecretAccessKey       string `json:"secret_access_key,omitempty"`
+	SessionToken          string `json:"session_token,omitempty"`
+	ServerSideEncryption  string `json:"server_side_encryption,omitempty"`
+	KMSKeyID              string `json:"kms_key_id,omitempty"`
+	VersioningMode        string `json:"versioning_mode,omitempty"`
 }
 
 // KnowledgeConfig controls only deployment-owned search infrastructure.
@@ -158,6 +196,20 @@ type IntegrationHMACKeyConfig struct {
 	Previous []byte
 }
 
+// AuditExportConfig describes the durable object-store topology used by the
+// asynchronous platform audit exporter. The current adapter is local
+// filesystem storage; multi-replica deployments must explicitly declare a
+// shared RWX/PVC root.
+type AuditExportConfig struct {
+	StorageBackend      string        `json:"storage_backend"`
+	StorageDir          string        `json:"storage_dir"`
+	LocalDeploymentMode string        `json:"local_deployment_mode"`
+	ReplicaCount        int           `json:"replica_count"`
+	WorkerID            string        `json:"worker_id"`
+	PollInterval        time.Duration `json:"poll_interval"`
+	CleanupInterval     time.Duration `json:"cleanup_interval"`
+}
+
 // Load 加载配置
 func Load() (*Config, error) {
 	// 使用与迁移和维护命令一致的 dotenv 解析器，正确处理引号、转义和
@@ -190,11 +242,33 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	historicalAttachmentStores, err :=
+		getEnvAsAttachmentS3Stores(
+			"AGENT_ATTACHMENT_S3_HISTORICAL_STORES_JSON",
+		)
+	if err != nil {
+		return nil, err
+	}
+	environment := getEnv("ENVIRONMENT", "development")
+	auditExportModeDefault := "single"
+	attachmentLocalModeDefault := "single"
+	if environment == "production" {
+		// Production must make the topology assertion explicitly.
+		auditExportModeDefault = ""
+		attachmentLocalModeDefault = ""
+	}
+	auditExportReplicaCount, err := getEnvAsStrictInt(
+		"CHRONODESK_REPLICA_COUNT",
+		1,
+	)
+	if err != nil {
+		return nil, err
+	}
 	config := &Config{
 		Server: ServerConfig{
 			Port:           getEnv("PORT", "8081"),
 			GinMode:        getEnv("GIN_MODE", "debug"),
-			Environment:    getEnv("ENVIRONMENT", "development"),
+			Environment:    environment,
 			TrustedProxies: getEnvAsSlice("TRUSTED_PROXIES", []string{}),
 		},
 		Database: DatabaseConfig{
@@ -276,16 +350,93 @@ func Load() (*Config, error) {
 			// RFC 8707 resource identifiers are derived from the canonical public
 			// origin. They are intentionally not independently configurable:
 			// MCP, REST, and A2A tokens must never share an audience.
-			MCPResourceURL:     appURL + "/mcp",
-			APIResourceURL:     appURL + "/api/v2",
-			A2AResourceURL:     appURL + "/a2a/v1",
-			TokenTTL:           getEnvAsDuration("AGENT_TOKEN_TTL", 15*time.Minute),
-			CredentialTTL:      getEnvAsDuration("AGENT_CREDENTIAL_TTL", 90*24*time.Hour),
-			AttachmentDir:      getEnv("AGENT_ATTACHMENT_DIR", "./data/agent-attachments"),
-			MaxAttachmentBytes: int64(getEnvAsInt("AGENT_MAX_ATTACHMENT_BYTES", 25<<20)),
-			LoopThreshold:      getEnvAsInt("AGENT_LOOP_THRESHOLD", 20),
-			LoopWindow:         getEnvAsDuration("AGENT_LOOP_WINDOW", time.Minute),
-			GlobalReadOnly:     getEnvAsBool("AGENT_GLOBAL_READ_ONLY", false),
+			MCPResourceURL: appURL + "/mcp",
+			APIResourceURL: appURL + "/api/v2",
+			A2AResourceURL: appURL + "/a2a/v1",
+			TokenTTL:       getEnvAsDuration("AGENT_TOKEN_TTL", 15*time.Minute),
+			CredentialTTL:  getEnvAsDuration("AGENT_CREDENTIAL_TTL", 90*24*time.Hour),
+			AttachmentStorageBackend: getEnv(
+				"AGENT_ATTACHMENT_STORAGE_BACKEND",
+				"local",
+			),
+			AttachmentLocalStoreID: getEnv(
+				"AGENT_ATTACHMENT_LOCAL_STORE_ID",
+				"local-default",
+			),
+			AttachmentDir: getEnv(
+				"AGENT_ATTACHMENT_DIR",
+				"./data/agent-attachments",
+			),
+			AttachmentStagingDir: getEnv(
+				"AGENT_ATTACHMENT_STAGING_DIR",
+				"./data/agent-attachment-staging",
+			),
+			AttachmentLocalDeploymentMode: getEnv(
+				"AGENT_ATTACHMENT_LOCAL_DEPLOYMENT_MODE",
+				attachmentLocalModeDefault,
+			),
+			AttachmentS3Endpoint: getEnv(
+				"AGENT_ATTACHMENT_S3_ENDPOINT",
+				"",
+			),
+			AttachmentS3StoreID: getEnv(
+				"AGENT_ATTACHMENT_S3_STORE_ID",
+				"s3-default",
+			),
+			AttachmentS3Region: getEnv(
+				"AGENT_ATTACHMENT_S3_REGION",
+				"us-east-1",
+			),
+			AttachmentS3Bucket: getEnv(
+				"AGENT_ATTACHMENT_S3_BUCKET",
+				"",
+			),
+			AttachmentS3Prefix: getEnv(
+				"AGENT_ATTACHMENT_S3_PREFIX",
+				"chronodesk/attachments",
+			),
+			AttachmentS3UsePathStyle: getEnvAsBool(
+				"AGENT_ATTACHMENT_S3_USE_PATH_STYLE",
+				false,
+			),
+			AttachmentS3AllowInsecure: getEnvAsBool(
+				"AGENT_ATTACHMENT_S3_ALLOW_INSECURE",
+				false,
+			),
+			AttachmentS3AccessKeyID: getEnv(
+				"AGENT_ATTACHMENT_S3_ACCESS_KEY_ID",
+				"",
+			),
+			AttachmentS3SecretAccessKey: getEnv(
+				"AGENT_ATTACHMENT_S3_SECRET_ACCESS_KEY",
+				"",
+			),
+			AttachmentS3SessionToken: getEnv(
+				"AGENT_ATTACHMENT_S3_SESSION_TOKEN",
+				"",
+			),
+			AttachmentS3SSE: getEnv(
+				"AGENT_ATTACHMENT_S3_SSE",
+				"bucket-default",
+			),
+			AttachmentS3KMSKeyID: getEnv(
+				"AGENT_ATTACHMENT_S3_KMS_KEY_ID",
+				"",
+			),
+			AttachmentS3VersioningMode: getEnv(
+				"AGENT_ATTACHMENT_S3_VERSIONING_MODE",
+				"auto",
+			),
+			AttachmentS3HistoricalStores: historicalAttachmentStores,
+			MaxAttachmentBytes: int64(
+				getEnvAsInt(
+					"AGENT_MAX_ATTACHMENT_BYTES",
+					25<<20,
+				),
+			),
+			LoopThreshold:  getEnvAsInt("AGENT_LOOP_THRESHOLD", 20),
+			LoopWindow:     getEnvAsDuration("AGENT_LOOP_WINDOW", time.Minute),
+			GlobalReadOnly: getEnvAsBool("AGENT_GLOBAL_READ_ONLY", false),
 		},
 		Knowledge: KnowledgeConfig{
 			OpenSearchURL:           getEnv("OPENSEARCH_URL", ""),
@@ -312,6 +463,33 @@ func Load() (*Config, error) {
 			),
 		},
 		Integration: IntegrationConfig{HMACKeys: integrationHMACKeys},
+		AuditExport: AuditExportConfig{
+			StorageBackend: getEnv(
+				"AUDIT_EXPORT_STORAGE_BACKEND",
+				"local",
+			),
+			StorageDir: getEnv(
+				"AUDIT_EXPORT_STORAGE_DIR",
+				"./data/audit-exports",
+			),
+			LocalDeploymentMode: getEnv(
+				"AUDIT_EXPORT_LOCAL_DEPLOYMENT_MODE",
+				auditExportModeDefault,
+			),
+			ReplicaCount: auditExportReplicaCount,
+			WorkerID: getEnv(
+				"AUDIT_EXPORT_WORKER_ID",
+				getEnv("HOSTNAME", "chronodesk-audit-export-1"),
+			),
+			PollInterval: getEnvAsDuration(
+				"AUDIT_EXPORT_POLL_INTERVAL",
+				5*time.Second,
+			),
+			CleanupInterval: getEnvAsDuration(
+				"AUDIT_EXPORT_CLEANUP_INTERVAL",
+				15*time.Minute,
+			),
+		},
 	}
 
 	// 验证配置
@@ -388,8 +566,14 @@ func (c *Config) Validate() error {
 	if c.Agent.CredentialTTL < time.Hour || c.Agent.CredentialTTL > 365*24*time.Hour {
 		return fmt.Errorf("agent credential TTL must be between 1 hour and 365 days")
 	}
-	if c.Agent.MaxAttachmentBytes <= 0 {
-		return fmt.Errorf("agent maximum attachment size must be positive")
+	if c.Agent.MaxAttachmentBytes <= 0 ||
+		c.Agent.MaxAttachmentBytes > 100<<20 {
+		return fmt.Errorf(
+			"agent maximum attachment size must be between 1 byte and 100 MiB",
+		)
+	}
+	if err := c.validateAttachmentStorageConfig(); err != nil {
+		return err
 	}
 	if c.Agent.LoopThreshold <= 0 || c.Agent.LoopWindow <= 0 {
 		return fmt.Errorf("agent loop threshold and window must be positive")
@@ -432,6 +616,63 @@ func (c *Config) Validate() error {
 		c.RateLimit.AnonymousWindow <= 0 {
 		return fmt.Errorf("authenticated and anonymous rate limit requests and windows must be positive")
 	}
+	if c.AuditExport.StorageBackend == "" {
+		// Keep directly-constructed development test configs compatible while
+		// treating the loaded runtime default as the canonical local adapter.
+		c.AuditExport.StorageBackend = "local"
+	}
+	if c.AuditExport.LocalDeploymentMode == "" &&
+		c.Server.Environment != "production" {
+		c.AuditExport.LocalDeploymentMode = "single"
+	}
+	if c.AuditExport.ReplicaCount == 0 {
+		c.AuditExport.ReplicaCount = 1
+	}
+	if c.AuditExport.PollInterval == 0 {
+		c.AuditExport.PollInterval = 5 * time.Second
+	}
+	if c.AuditExport.CleanupInterval == 0 {
+		c.AuditExport.CleanupInterval = 15 * time.Minute
+	}
+	if c.AuditExport.StorageBackend != "local" {
+		return fmt.Errorf(
+			"audit export storage backend %q is not supported",
+			c.AuditExport.StorageBackend,
+		)
+	}
+	if strings.TrimSpace(c.AuditExport.StorageDir) == "" {
+		if c.Server.Environment == "production" {
+			return fmt.Errorf("production audit export storage directory is required")
+		}
+		c.AuditExport.StorageDir = "./data/audit-exports"
+	}
+	if c.AuditExport.LocalDeploymentMode != "single" &&
+		c.AuditExport.LocalDeploymentMode != "shared-rwx" {
+		return fmt.Errorf(
+			"audit export local deployment mode must be single or shared-rwx",
+		)
+	}
+	if c.AuditExport.ReplicaCount < 1 {
+		return fmt.Errorf("audit export replica count must be positive")
+	}
+	if c.AuditExport.ReplicaCount > 1 &&
+		c.AuditExport.LocalDeploymentMode != "shared-rwx" {
+		return fmt.Errorf(
+			"multi-replica local audit export storage requires shared-rwx mode",
+		)
+	}
+	if strings.TrimSpace(c.AuditExport.WorkerID) == "" {
+		if c.Server.Environment == "production" {
+			return fmt.Errorf("production audit export worker id is required")
+		}
+		c.AuditExport.WorkerID = "chronodesk-audit-export-1"
+	}
+	if c.AuditExport.PollInterval < time.Second ||
+		c.AuditExport.PollInterval > time.Minute ||
+		c.AuditExport.CleanupInterval < time.Minute ||
+		c.AuditExport.CleanupInterval > 24*time.Hour {
+		return fmt.Errorf("audit export worker intervals are invalid")
+	}
 
 	if c.Database.Host == "" {
 		return fmt.Errorf("database host is required")
@@ -471,6 +712,373 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("redis host is required")
 	}
 
+	return nil
+}
+
+func (c *Config) validateAttachmentStorageConfig() error {
+	c.Agent.AttachmentStorageBackend = strings.ToLower(
+		strings.TrimSpace(c.Agent.AttachmentStorageBackend),
+	)
+	if c.Agent.AttachmentStorageBackend == "" {
+		c.Agent.AttachmentStorageBackend = "local"
+	}
+	if c.Agent.AttachmentStorageBackend != "local" &&
+		c.Agent.AttachmentStorageBackend != "s3" {
+		return fmt.Errorf(
+			"attachment storage backend must be local or s3",
+		)
+	}
+	c.Agent.AttachmentLocalStoreID = strings.ToLower(
+		strings.TrimSpace(c.Agent.AttachmentLocalStoreID),
+	)
+	if c.Agent.AttachmentLocalStoreID == "" {
+		c.Agent.AttachmentLocalStoreID = "local-default"
+	}
+	c.Agent.AttachmentS3StoreID = strings.ToLower(
+		strings.TrimSpace(c.Agent.AttachmentS3StoreID),
+	)
+	if c.Agent.AttachmentS3StoreID == "" {
+		c.Agent.AttachmentS3StoreID = "s3-default"
+	}
+	if !validAttachmentStoreID(c.Agent.AttachmentLocalStoreID) ||
+		!validAttachmentStoreID(c.Agent.AttachmentS3StoreID) ||
+		c.Agent.AttachmentLocalStoreID ==
+			c.Agent.AttachmentS3StoreID {
+		return fmt.Errorf(
+			"attachment store IDs must be distinct lowercase non-sensitive identifiers",
+		)
+	}
+	c.Agent.AttachmentS3VersioningMode = strings.ToLower(
+		strings.TrimSpace(c.Agent.AttachmentS3VersioningMode),
+	)
+	if c.Agent.AttachmentS3VersioningMode == "" {
+		c.Agent.AttachmentS3VersioningMode = "auto"
+	}
+	if !validAttachmentS3VersioningMode(
+		c.Agent.AttachmentS3VersioningMode,
+	) {
+		return fmt.Errorf(
+			"attachment S3 versioning mode must be auto, required, or disabled",
+		)
+	}
+	registeredStoreIDs := map[string]struct{}{
+		c.Agent.AttachmentLocalStoreID: {},
+		c.Agent.AttachmentS3StoreID:    {},
+	}
+	if len(c.Agent.AttachmentS3HistoricalStores) > 8 {
+		return fmt.Errorf(
+			"attachment S3 historical store registry supports at most 8 stores",
+		)
+	}
+	for index := range c.Agent.AttachmentS3HistoricalStores {
+		store := &c.Agent.AttachmentS3HistoricalStores[index]
+		if err := validateHistoricalAttachmentS3Store(
+			store,
+			c.Server.Environment,
+		); err != nil {
+			return fmt.Errorf(
+				"attachment historical S3 store %d: %w",
+				index,
+				err,
+			)
+		}
+		if _, exists := registeredStoreIDs[store.StoreID]; exists {
+			return fmt.Errorf(
+				"attachment store_id %q is duplicated",
+				store.StoreID,
+			)
+		}
+		registeredStoreIDs[store.StoreID] = struct{}{}
+	}
+	if strings.TrimSpace(c.Agent.AttachmentDir) == "" {
+		if c.Server.Environment == "production" {
+			return fmt.Errorf(
+				"production attachment fallback directory is required",
+			)
+		}
+		c.Agent.AttachmentDir = "./data/agent-attachments"
+	}
+	if strings.TrimSpace(c.Agent.AttachmentStagingDir) == "" {
+		if c.Server.Environment == "production" {
+			return fmt.Errorf(
+				"production attachment staging directory is required",
+			)
+		}
+		c.Agent.AttachmentStagingDir =
+			"./data/agent-attachment-staging"
+	}
+	c.Agent.AttachmentLocalDeploymentMode = strings.ToLower(
+		strings.TrimSpace(
+			c.Agent.AttachmentLocalDeploymentMode,
+		),
+	)
+	if c.Agent.AttachmentLocalDeploymentMode == "" {
+		if c.Server.Environment == "production" {
+			return fmt.Errorf(
+				"production attachment local deployment mode must be explicitly single or shared-rwx",
+			)
+		}
+		c.Agent.AttachmentLocalDeploymentMode = "single"
+	}
+	if c.Agent.AttachmentLocalDeploymentMode != "single" &&
+		c.Agent.AttachmentLocalDeploymentMode != "shared-rwx" {
+		return fmt.Errorf(
+			"attachment local deployment mode must be single or shared-rwx",
+		)
+	}
+	replicaCount := c.AuditExport.ReplicaCount
+	if replicaCount == 0 {
+		replicaCount = 1
+	}
+	// Inbound bytes are always staged outside the database transaction. A
+	// multi-replica deployment therefore needs a shared filesystem even when
+	// the final immutable object is stored in S3.
+	if replicaCount > 1 &&
+		c.Agent.AttachmentLocalDeploymentMode != "shared-rwx" {
+		return fmt.Errorf(
+			"multi-replica attachment staging requires shared-rwx mode",
+		)
+	}
+
+	s3Requested := c.Agent.AttachmentStorageBackend == "s3" ||
+		strings.TrimSpace(c.Agent.AttachmentS3Endpoint) != "" ||
+		strings.TrimSpace(c.Agent.AttachmentS3Bucket) != "" ||
+		strings.TrimSpace(c.Agent.AttachmentS3AccessKeyID) != "" ||
+		strings.TrimSpace(c.Agent.AttachmentS3SecretAccessKey) != "" ||
+		strings.TrimSpace(c.Agent.AttachmentS3SessionToken) != "" ||
+		strings.TrimSpace(c.Agent.AttachmentS3KMSKeyID) != ""
+	if !s3Requested {
+		return nil
+	}
+	if strings.TrimSpace(c.Agent.AttachmentS3Bucket) == "" ||
+		strings.ContainsAny(
+			c.Agent.AttachmentS3Bucket,
+			"/\\\r\n\t ",
+		) {
+		return fmt.Errorf(
+			"attachment S3 bucket must be a non-empty bucket name",
+		)
+	}
+	if strings.TrimSpace(c.Agent.AttachmentS3Region) == "" {
+		return fmt.Errorf("attachment S3 region is required")
+	}
+	if !validAttachmentObjectPrefix(
+		c.Agent.AttachmentS3Prefix,
+	) {
+		return fmt.Errorf(
+			"attachment S3 prefix must contain safe relative path segments",
+		)
+	}
+	accessKeyConfigured :=
+		strings.TrimSpace(c.Agent.AttachmentS3AccessKeyID) != ""
+	secretKeyConfigured :=
+		strings.TrimSpace(
+			c.Agent.AttachmentS3SecretAccessKey,
+		) != ""
+	if accessKeyConfigured != secretKeyConfigured {
+		return fmt.Errorf(
+			"attachment S3 access key id and secret access key must be configured together",
+		)
+	}
+	if strings.TrimSpace(c.Agent.AttachmentS3SessionToken) != "" &&
+		!accessKeyConfigured {
+		return fmt.Errorf(
+			"attachment S3 session token requires static access credentials",
+		)
+	}
+
+	c.Agent.AttachmentS3SSE = strings.ToLower(
+		strings.TrimSpace(c.Agent.AttachmentS3SSE),
+	)
+	if c.Agent.AttachmentS3SSE == "" {
+		c.Agent.AttachmentS3SSE = "bucket-default"
+	}
+	switch c.Agent.AttachmentS3SSE {
+	case "bucket-default", "aes256", "aws:kms":
+	default:
+		return fmt.Errorf(
+			"attachment S3 server-side encryption must be bucket-default, AES256, or aws:kms",
+		)
+	}
+	if strings.TrimSpace(c.Agent.AttachmentS3KMSKeyID) != "" &&
+		c.Agent.AttachmentS3SSE != "aws:kms" {
+		return fmt.Errorf(
+			"attachment S3 KMS key requires aws:kms encryption",
+		)
+	}
+
+	endpoint := strings.TrimSpace(c.Agent.AttachmentS3Endpoint)
+	if endpoint == "" {
+		if c.Agent.AttachmentS3AllowInsecure {
+			return fmt.Errorf(
+				"attachment S3 insecure mode requires an explicit development endpoint",
+			)
+		}
+		return nil
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil ||
+		(parsed.Scheme != "https" && parsed.Scheme != "http") ||
+		parsed.Host == "" ||
+		parsed.User != nil ||
+		(parsed.Path != "" && parsed.Path != "/") ||
+		parsed.RawQuery != "" ||
+		parsed.Fragment != "" {
+		return fmt.Errorf(
+			"attachment S3 endpoint must be an absolute HTTP(S) origin without credentials, path, query, or fragment",
+		)
+	}
+	if parsed.Scheme == "http" {
+		if c.Server.Environment == "production" {
+			return fmt.Errorf(
+				"production attachment S3 endpoint must use HTTPS",
+			)
+		}
+		if !c.Agent.AttachmentS3AllowInsecure {
+			return fmt.Errorf(
+				"HTTP attachment S3 endpoint requires AGENT_ATTACHMENT_S3_ALLOW_INSECURE=true",
+			)
+		}
+	} else if c.Agent.AttachmentS3AllowInsecure {
+		return fmt.Errorf(
+			"attachment S3 insecure mode is invalid for an HTTPS endpoint",
+		)
+	}
+	return nil
+}
+
+func validAttachmentObjectPrefix(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" ||
+		strings.HasPrefix(value, "/") ||
+		strings.HasSuffix(value, "/") ||
+		strings.ContainsAny(value, "\\\x00\r\n") {
+		return false
+	}
+	parts := strings.Split(value, "/")
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+func validAttachmentStoreID(value string) bool {
+	if len(value) == 0 || len(value) > 63 ||
+		value[0] < 'a' || value[0] > 'z' {
+		return false
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') ||
+			(character >= '0' && character <= '9') ||
+			character == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validAttachmentS3VersioningMode(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "auto", "required", "disabled":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateHistoricalAttachmentS3Store(
+	store *AttachmentS3StoreConfig,
+	environment string,
+) error {
+	if store == nil {
+		return fmt.Errorf("store is required")
+	}
+	store.StoreID = strings.ToLower(strings.TrimSpace(store.StoreID))
+	store.Region = strings.TrimSpace(store.Region)
+	store.Bucket = strings.TrimSpace(store.Bucket)
+	store.Prefix = strings.TrimSpace(store.Prefix)
+	store.Endpoint = strings.TrimSpace(store.Endpoint)
+	store.AccessKeyID = strings.TrimSpace(store.AccessKeyID)
+	store.ServerSideEncryption = strings.ToLower(
+		strings.TrimSpace(store.ServerSideEncryption),
+	)
+	store.VersioningMode = strings.ToLower(
+		strings.TrimSpace(store.VersioningMode),
+	)
+	if !validAttachmentStoreID(store.StoreID) {
+		return fmt.Errorf("store_id is invalid")
+	}
+	if store.Region == "" {
+		return fmt.Errorf("region is required")
+	}
+	if store.Bucket == "" ||
+		strings.ContainsAny(store.Bucket, "/\\\r\n\t ") {
+		return fmt.Errorf("bucket is invalid")
+	}
+	if !validAttachmentObjectPrefix(store.Prefix) {
+		return fmt.Errorf("prefix must contain safe relative path segments")
+	}
+	hasAccessKey := store.AccessKeyID != ""
+	hasSecretKey := strings.TrimSpace(store.SecretAccessKey) != ""
+	if hasAccessKey != hasSecretKey {
+		return fmt.Errorf(
+			"access key id and secret access key must be configured together",
+		)
+	}
+	if strings.TrimSpace(store.SessionToken) != "" && !hasAccessKey {
+		return fmt.Errorf(
+			"session token requires static access credentials",
+		)
+	}
+	if store.ServerSideEncryption == "" {
+		store.ServerSideEncryption = "bucket-default"
+	}
+	switch store.ServerSideEncryption {
+	case "bucket-default", "aes256":
+		if strings.TrimSpace(store.KMSKeyID) != "" {
+			return fmt.Errorf("KMS key requires aws:kms encryption")
+		}
+	case "aws:kms":
+	default:
+		return fmt.Errorf("server-side encryption is invalid")
+	}
+	if store.VersioningMode == "" {
+		store.VersioningMode = "auto"
+	}
+	if !validAttachmentS3VersioningMode(store.VersioningMode) {
+		return fmt.Errorf("versioning mode is invalid")
+	}
+	if store.Endpoint == "" {
+		if store.AllowInsecureEndpoint {
+			return fmt.Errorf(
+				"insecure mode requires an explicit development endpoint",
+			)
+		}
+		return nil
+	}
+	parsed, err := url.Parse(store.Endpoint)
+	if err != nil ||
+		(parsed.Scheme != "https" && parsed.Scheme != "http") ||
+		parsed.Host == "" ||
+		parsed.User != nil ||
+		(parsed.Path != "" && parsed.Path != "/") ||
+		parsed.RawQuery != "" ||
+		parsed.Fragment != "" {
+		return fmt.Errorf("endpoint must be an absolute HTTP(S) origin")
+	}
+	if parsed.Scheme == "http" {
+		if environment == "production" {
+			return fmt.Errorf("production endpoint must use HTTPS")
+		}
+		if !store.AllowInsecureEndpoint {
+			return fmt.Errorf("HTTP endpoint requires insecure opt-in")
+		}
+	} else if store.AllowInsecureEndpoint {
+		return fmt.Errorf("insecure mode is invalid for HTTPS")
+	}
 	return nil
 }
 
@@ -727,6 +1335,42 @@ func getEnvAsIntegrationHMACKeys(
 		}
 	}
 	return result, nil
+}
+
+func getEnvAsAttachmentS3Stores(
+	key string,
+) ([]AttachmentS3StoreConfig, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return nil, nil
+	}
+	if len(value) > 64<<10 {
+		return nil, fmt.Errorf("%s exceeds 64 KiB", key)
+	}
+	var stores []AttachmentS3StoreConfig
+	decoder := json.NewDecoder(bytes.NewReader([]byte(value)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&stores); err != nil {
+		return nil, fmt.Errorf(
+			"%s must be a strict JSON array: %w",
+			key,
+			err,
+		)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err == nil {
+		return nil, fmt.Errorf("%s must contain one JSON value", key)
+	} else if !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf(
+			"%s contains invalid trailing data: %w",
+			key,
+			err,
+		)
+	}
+	if len(stores) > 8 {
+		return nil, fmt.Errorf("%s supports at most 8 stores", key)
+	}
+	return stores, nil
 }
 
 func validIntegrationKeyReference(value string) bool {

@@ -18,7 +18,11 @@ command and query carries a server-resolved `ProjectScope`; request bodies,
 custom fields, and A2A metadata can name a public project key but can never
 construct the trusted numeric scope.
 
-`ProjectMembership` grants a human one project role.
+`ProjectMembership` grants a human one project role and may carry narrow,
+explicit capabilities that do not redefine that role. The first such
+capability is `knowledge_contributor`: an ordinary member may create and
+revise personally managed knowledge drafts, while publication, ACL, model
+policy, and index administration remain manager gates.
 `ProjectPrincipalGrant` grants a Service Principal a bounded role and scope
 set. Platform administrators may enter an explicit management overview, while
 ordinary cross-project work uses only active memberships.
@@ -170,6 +174,14 @@ old claim, approval, or version.
 or Artifact together with a content hash. Knowledge metadata is authoritative
 in PostgreSQL; source files live in object storage and a rebuildable
 OpenSearch index provides project- and ACL-filtered hybrid retrieval.
+
+`KnowledgeSourceLink` is the immutable provenance snapshot between one
+knowledge version and the Ticket or clean Attachment from which it was
+derived. Authored Markdown is stored as a private immutable object, split into
+stable sections for retrieval, and published only by an authorized Human
+manager. A Service Principal may read authorized published knowledge and
+submit a draft when it has the explicit knowledge scopes; it can never publish
+its own generated content.
 
 Filtering occurs before ranking. A citation identifies the document version,
 page or chunk, and content hash. Prompts, tools, and retrieval policies are

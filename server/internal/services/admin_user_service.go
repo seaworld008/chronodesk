@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +30,9 @@ var (
 	)
 	ErrAdminUserAccessEventWriter = errors.New(
 		"admin user access revocation event writer is unavailable",
+	)
+	ErrInvalidAdminUserAvatar = errors.New(
+		"admin user avatar must be an uploaded local avatar path",
 	)
 )
 
@@ -125,23 +129,44 @@ type UserListResponse struct {
 	Pages    int                    `json:"pages"`
 }
 
+var ErrInvalidAdminUserListQuery = errors.New(
+	"invalid admin user list query",
+)
+
 // GetUserList 获取用户列表
 func (s *AdminUserService) GetUserList(ctx context.Context, req *UserListRequest) (*UserListResponse, error) {
+	if s == nil || s.db == nil || req == nil {
+		return nil, ErrInvalidAdminUserListQuery
+	}
 	if req.PlatformRole != nil && !req.PlatformRole.IsValid() {
-		return nil, fmt.Errorf("invalid platform role")
+		return nil, ErrInvalidAdminUserListQuery
 	}
 	// 设置默认值
-	if req.Page <= 0 {
+	if req.Page == 0 {
 		req.Page = 1
 	}
-	if req.PageSize <= 0 {
-		req.PageSize = 20
+	if req.PageSize == 0 {
+		req.PageSize = 25
 	}
 	if req.OrderBy == "" {
 		req.OrderBy = "created_at"
 	}
 	if req.Order == "" {
 		req.Order = "desc"
+	}
+	if req.Page < 1 || req.PageSize < 1 || req.PageSize > 100 ||
+		req.Page > math.MaxInt/req.PageSize ||
+		len([]rune(req.Search)) > 100 {
+		return nil, ErrInvalidAdminUserListQuery
+	}
+	switch req.OrderBy {
+	case "id", "username", "email", "created_at", "updated_at",
+		"last_login_at":
+	default:
+		return nil, ErrInvalidAdminUserListQuery
+	}
+	if req.Order != "asc" && req.Order != "desc" {
+		return nil, ErrInvalidAdminUserListQuery
 	}
 
 	query := s.db.WithContext(ctx).Model(&models.User{})
@@ -187,12 +212,17 @@ func (s *AdminUserService) GetUserList(ctx context.Context, req *UserListRequest
 	case "created_at":
 		orderColumn.Name = "created_at"
 	}
-	query = query.Clauses(clause.OrderBy{
-		Columns: []clause.OrderByColumn{{
-			Column: orderColumn,
+	orderColumns := []clause.OrderByColumn{{
+		Column: orderColumn,
+		Desc:   !strings.EqualFold(req.Order, "asc"),
+	}}
+	if orderColumn.Name != "id" {
+		orderColumns = append(orderColumns, clause.OrderByColumn{
+			Column: clause.Column{Name: "id"},
 			Desc:   !strings.EqualFold(req.Order, "asc"),
-		}},
-	})
+		})
+	}
+	query = query.Clauses(clause.OrderBy{Columns: orderColumns})
 
 	// 分页
 	offset := (req.Page - 1) * req.PageSize
@@ -296,7 +326,12 @@ func (s *AdminUserService) CreateUser(ctx context.Context, req *models.UserCreat
 		Language:     "zh-CN",
 	}
 
-	if err := s.db.WithContext(ctx).Create(user).Error; err != nil {
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(user).Error; err != nil {
+			return err
+		}
+		return tx.Create(userProfileProjection(user)).Error
+	}); err != nil {
 		// 预检查不能替代数据库约束；并发创建时由唯一索引裁决，并映射为
 		// 稳定冲突而不是把数据库细节泄漏成 500。
 		if errors.Is(err, gorm.ErrDuplicatedKey) {
@@ -464,6 +499,22 @@ func (s *AdminUserService) updateUserOnDB(
 		}
 		return nil, fmt.Errorf("failed to find user: %w", err)
 	}
+	if req.Avatar != nil {
+		currentAvatar := user.Avatar
+		var authoritativeProfile models.UserProfile
+		profileErr := db.WithContext(ctx).
+			Select("id", "avatar").
+			Where("user_id = ?", userID).
+			First(&authoritativeProfile).Error
+		if profileErr == nil {
+			currentAvatar = authoritativeProfile.Avatar
+		} else if !errors.Is(profileErr, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("failed to load authoritative avatar: %w", profileErr)
+		}
+		if *req.Avatar != "" && *req.Avatar != currentAvatar {
+			return nil, ErrInvalidAdminUserAvatar
+		}
+	}
 
 	if user.PlatformRole == models.PlatformRolePlatformAdmin {
 		targetRole := user.PlatformRole
@@ -579,6 +630,34 @@ func (s *AdminUserService) updateUserOnDB(
 		}
 	}
 
+	if req.Avatar != nil || req.Phone != nil ||
+		req.Timezone != nil || req.Language != nil {
+		var profile models.UserProfile
+		err := db.WithContext(ctx).
+			Where("user_id = ?", user.ID).
+			First(&profile).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			profile = *userProfileProjection(user)
+		} else if err != nil {
+			return nil, fmt.Errorf("failed to load user profile: %w", err)
+		}
+		if req.Avatar != nil {
+			profile.Avatar = *req.Avatar
+		}
+		if req.Phone != nil {
+			profile.Phone = *req.Phone
+		}
+		if req.Timezone != nil {
+			profile.Timezone = *req.Timezone
+		}
+		if req.Language != nil {
+			profile.Language = *req.Language
+		}
+		if err := db.WithContext(ctx).Save(&profile).Error; err != nil {
+			return nil, fmt.Errorf("failed to update user profile: %w", err)
+		}
+	}
+
 	// 重新加载用户信息
 	err := db.WithContext(ctx).Preload("Manager").First(user, user.ID).Error
 	if err != nil {
@@ -586,6 +665,24 @@ func (s *AdminUserService) updateUserOnDB(
 	}
 
 	return user, nil
+}
+
+func userProfileProjection(user *models.User) *models.UserProfile {
+	timezone := user.Timezone
+	if timezone == "" {
+		timezone = "Asia/Shanghai"
+	}
+	language := user.Language
+	if language == "" {
+		language = "zh-CN"
+	}
+	return &models.UserProfile{
+		UserID:   user.ID,
+		Avatar:   user.Avatar,
+		Phone:    user.Phone,
+		Timezone: timezone,
+		Language: language,
+	}
 }
 
 // ResetUserPassword 重置用户密码

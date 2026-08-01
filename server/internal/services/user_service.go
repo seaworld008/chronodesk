@@ -9,14 +9,18 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"math"
 	"mime/multipart"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // UserService 用户服务
@@ -34,12 +38,16 @@ const (
 )
 
 var (
-	ErrAvatarStorageMissing = errors.New("avatar storage is not configured")
-	ErrInvalidAvatar        = errors.New("invalid avatar image")
-	ErrAvatarNotFound       = errors.New("avatar not found")
+	ErrAvatarStorageMissing     = errors.New("avatar storage is not configured")
+	ErrInvalidAvatar            = errors.New("invalid avatar image")
+	ErrAvatarNotFound           = errors.New("avatar not found")
+	ErrInvalidLoginHistoryQuery = errors.New(
+		"invalid login history query",
+	)
 )
 
 var loginHistorySortableColumns = map[string]string{
+	"id":           "id",
 	"login_time":   "login_time",
 	"created_at":   "created_at",
 	"updated_at":   "updated_at",
@@ -70,6 +78,12 @@ func (s *UserService) SetAvatarStorage(storage AttachmentStorage, maxBytes int64
 
 // GetLoginHistory 获取用户登录历史
 func (s *UserService) GetLoginHistory(ctx context.Context, userID uint, req *models.LoginHistoryRequest) ([]*models.LoginHistoryResponse, int64, error) {
+	if s == nil || s.db == nil || ctx == nil || userID == 0 || req == nil ||
+		req.Page < 1 || req.PageSize < 1 || req.PageSize > 100 ||
+		req.Page > math.MaxInt/req.PageSize ||
+		!validLoginHistoryRequest(req) {
+		return nil, 0, ErrInvalidLoginHistoryQuery
+	}
 	query := s.db.WithContext(ctx).Model(&models.LoginHistory{})
 
 	// 过滤条件
@@ -113,22 +127,21 @@ func (s *UserService) GetLoginHistory(ctx context.Context, userID uint, req *mod
 		return nil, 0, fmt.Errorf("failed to count login history: %w", err)
 	}
 
-	// 排序（白名单）
-	orderBy, order := sanitizeLoginHistoryOrder(req.OrderBy, req.Order)
-	query = query.Order(fmt.Sprintf("%s %s", orderBy, order))
-
-	// 分页
-	page := 1
-	pageSize := 20
-	if req.Page > 0 {
-		page = req.Page
+	orderBy := loginHistorySortableColumns[req.OrderBy]
+	descending := req.Order == "desc"
+	orders := []clause.OrderByColumn{{
+		Column: clause.Column{Name: orderBy},
+		Desc:   descending,
+	}}
+	if orderBy != "id" {
+		orders = append(orders, clause.OrderByColumn{
+			Column: clause.Column{Name: "id"},
+			Desc:   descending,
+		})
 	}
-	if req.PageSize > 0 {
-		pageSize = req.PageSize
-	}
-
-	offset := (page - 1) * pageSize
-	query = query.Offset(offset).Limit(pageSize)
+	query = query.Clauses(clause.OrderBy{Columns: orders}).
+		Offset((req.Page - 1) * req.PageSize).
+		Limit(req.PageSize)
 
 	// 查询数据
 	var histories []models.LoginHistory
@@ -143,6 +156,52 @@ func (s *UserService) GetLoginHistory(ctx context.Context, userID uint, req *mod
 	}
 
 	return responses, total, nil
+}
+
+func validLoginHistoryRequest(req *models.LoginHistoryRequest) bool {
+	if req.OrderBy == "" {
+		req.OrderBy = "login_time"
+	}
+	if req.Order == "" {
+		req.Order = "desc"
+	}
+	if _, ok := loginHistorySortableColumns[req.OrderBy]; !ok ||
+		(req.Order != "asc" && req.Order != "desc") {
+		return false
+	}
+	if req.Status != nil {
+		switch *req.Status {
+		case models.LoginStatusSuccess,
+			models.LoginStatusFailed,
+			models.LoginStatusBlocked,
+			models.LoginStatusSuspended,
+			models.LoginStatusExpired:
+		default:
+			return false
+		}
+	}
+	if req.StartDate != nil && req.EndDate != nil &&
+		req.StartDate.After(*req.EndDate) {
+		return false
+	}
+	if req.LoginMethod != "" && !req.LoginMethod.IsValid() {
+		return false
+	}
+	for _, value := range []struct {
+		text string
+		max  int
+	}{
+		{text: req.IPAddress, max: 45},
+		{text: req.DeviceType, max: 50},
+		{text: req.SessionID, max: 255},
+	} {
+		if strings.TrimSpace(value.text) != value.text ||
+			utf8.RuneCountInString(value.text) > value.max ||
+			strings.IndexFunc(value.text, unicode.IsControl) >= 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // DeleteLoginSession 删除指定用户的登录会话（用于踢设备下线）
@@ -330,11 +389,6 @@ func (s *UserService) UploadAvatar(ctx context.Context, userID uint, file multip
 		return "", ErrAttachmentTooLarge
 	}
 
-	var user models.User
-	if err := s.db.WithContext(ctx).Select("id", "avatar").First(&user, userID).Error; err != nil {
-		return "", fmt.Errorf("find avatar owner: %w", err)
-	}
-
 	filename := uuid.NewString() + extension
 	key := filepath.ToSlash(filepath.Join("avatars", fmt.Sprintf("%d", userID), filename))
 	stored, err := s.avatarStorage.Put(ctx, key, bytes.NewReader(sanitized.Bytes()), maxBytes)
@@ -343,14 +397,54 @@ func (s *UserService) UploadAvatar(ctx context.Context, userID uint, file multip
 	}
 	avatarURL := avatarURLPrefix + fmt.Sprintf("%d/%s", userID, filename)
 
-	if err := s.db.WithContext(ctx).Model(&models.User{}).
-		Where("id = ?", userID).
-		Update("avatar", avatarURL).Error; err != nil {
+	oldAvatarURL := ""
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var user models.User
+		if err := tx.
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id", "avatar", "phone", "timezone", "language").
+			Where("id = ?", userID).
+			First(&user).Error; err != nil {
+			return fmt.Errorf("find avatar owner: %w", err)
+		}
+
+		var profile models.UserProfile
+		err := tx.
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("user_id = ?", userID).
+			First(&profile).Error
+		profileExists := true
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// Locking users serializes the absent-profile case. Build the one
+			// compatibility row from the now-locked user without carrying that
+			// snapshot into any later update.
+			profile = *userProfileProjection(&user)
+			profileExists = false
+			oldAvatarURL = user.Avatar
+		} else if err != nil {
+			return fmt.Errorf("find avatar profile: %w", err)
+		} else {
+			oldAvatarURL = profile.Avatar
+		}
+
+		if err := tx.Model(&models.User{}).
+			Where("id = ?", userID).
+			Update("avatar", avatarURL).Error; err != nil {
+			return err
+		}
+		if !profileExists {
+			profile.Avatar = avatarURL
+			return tx.Create(&profile).Error
+		}
+		return tx.Model(&models.UserProfile{}).
+			Where("user_id = ?", userID).
+			Update("avatar", avatarURL).Error
+	}); err != nil {
 		_ = s.avatarStorage.Delete(context.Background(), stored.Key)
 		return "", fmt.Errorf("update avatar: %w", err)
 	}
 
-	if oldKey, ok := avatarStorageKey(user.Avatar); ok && oldKey != stored.Key {
+	if oldKey, ok := avatarStorageKey(oldAvatarURL); ok && oldKey != stored.Key {
 		_ = s.avatarStorage.Delete(context.Background(), oldKey)
 	}
 	return avatarURL, nil
@@ -447,23 +541,4 @@ func (s *UserService) calculateSecurityScore(user *models.User, stats *models.Us
 	}
 
 	return score
-}
-
-func sanitizeLoginHistoryOrder(orderBy, order string) (string, string) {
-	column := "login_time"
-	if requested := strings.ToLower(strings.TrimSpace(orderBy)); requested != "" {
-		if whitelisted, ok := loginHistorySortableColumns[requested]; ok {
-			column = whitelisted
-		}
-	}
-
-	direction := "DESC"
-	switch strings.ToLower(strings.TrimSpace(order)) {
-	case "asc":
-		direction = "ASC"
-	case "desc":
-		direction = "DESC"
-	}
-
-	return column, direction
 }

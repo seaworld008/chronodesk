@@ -15,12 +15,14 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
 	"github.com/seaworld008/chronodesk/server/internal/httpcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"github.com/gin-gonic/gin"
@@ -40,10 +42,71 @@ const (
 	adminMaximumRequestBytes   = 1 << 20
 )
 
+var (
+	ErrRuntimeControlPatchRequired = errors.New(
+		"at least one runtime safety control is required",
+	)
+	ErrRuntimeControlHumanActorRequired = errors.New(
+		"runtime safety controls require a human actor",
+	)
+)
+
+func runtimeControlHumanActorID(actor models.ActorRef) (uint, error) {
+	if err := actor.Validate(); err != nil ||
+		actor.Type != models.ActorTypeHuman {
+		return 0, ErrRuntimeControlHumanActorRequired
+	}
+	actorID, err := safeconv.ParsePositiveUint(actor.ID)
+	if err != nil {
+		return 0, ErrRuntimeControlHumanActorRequired
+	}
+	return actorID, nil
+}
+
+// RuntimeControlSnapshot is the authoritative platform-wide Agent safety
+// state. Version is shared by both switches so one strong ETag protects the
+// complete resource while each boolean can still be patched independently.
+type RuntimeControlSnapshot struct {
+	GlobalReadOnly bool      `json:"global_read_only"`
+	EmergencyStop  bool      `json:"emergency_stop"`
+	Version        uint64    `json:"version"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+// RuntimeControlPatch preserves omission separately from false. Transports
+// must reject a patch with neither field present.
+type RuntimeControlPatch struct {
+	GlobalReadOnly *bool
+	EmergencyStop  *bool
+}
+
+// RuntimeControlVersionConflict carries the current durable version so the
+// HTTP adapter can return a fresh ETag without disclosing persistence details.
+type RuntimeControlVersionConflict struct {
+	Expected uint64
+	Current  uint64
+}
+
+func (e *RuntimeControlVersionConflict) Error() string {
+	return fmt.Sprintf(
+		"runtime safety control version conflict: expected %d, current %d",
+		e.Expected,
+		e.Current,
+	)
+}
+
+func (e *RuntimeControlVersionConflict) CurrentVersion() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.Current
+}
+
 type RuntimeControl struct {
 	native           *services.AgentNativeService
 	db               *gorm.DB
 	fallbackReadOnly bool
+	mu               sync.Mutex
 	readOnly         atomic.Bool
 	emergency        atomic.Bool
 	healthy          atomic.Bool
@@ -69,14 +132,22 @@ func NewRuntimeControl(
 		db:               db,
 		fallbackReadOnly: readOnly,
 	}
-	control.SetReadOnly(readOnly)
+	control.setReadOnly(readOnly)
+	if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return control.ensureRuntimeControlRowsTx(ctx, tx, 0)
+	}); err != nil {
+		return nil, fmt.Errorf(
+			"bootstrap persisted Agent safety controls: %w",
+			err,
+		)
+	}
 	if err := control.Refresh(ctx); err != nil {
 		return nil, fmt.Errorf("load persisted Agent safety controls: %w", err)
 	}
 	return control, nil
 }
 
-func (c *RuntimeControl) SetReadOnly(enabled bool) {
+func (c *RuntimeControl) setReadOnly(enabled bool) {
 	c.readOnly.Store(enabled)
 	if c.native != nil {
 		c.native.SetGlobalReadOnly(enabled)
@@ -87,7 +158,7 @@ func (c *RuntimeControl) ReadOnly() bool {
 	return c != nil && c.readOnly.Load()
 }
 
-func (c *RuntimeControl) SetEmergencyStop(enabled bool) {
+func (c *RuntimeControl) setEmergencyStop(enabled bool) {
 	c.emergency.Store(enabled)
 	if c.native != nil {
 		c.native.SetGlobalEmergencyStop(enabled)
@@ -102,80 +173,367 @@ func (c *RuntimeControl) Healthy() bool {
 	return c != nil && c.healthy.Load()
 }
 
-func (c *RuntimeControl) persistTx(
+// Snapshot reads the durable platform resource. It never serves atomics as an
+// authoritative management response because another process may have already
+// committed a newer value that the refresh loop has not observed yet.
+func (c *RuntimeControl) Snapshot(
 	ctx context.Context,
-	tx *gorm.DB,
-	key string,
-	enabled bool,
-	updatedBy uint,
-) error {
-	return c.persistOnDB(ctx, tx, key, enabled, updatedBy)
+) (RuntimeControlSnapshot, error) {
+	if c == nil || c.db == nil {
+		return RuntimeControlSnapshot{},
+			errors.New("runtime control persistence is unavailable")
+	}
+	if ctx == nil {
+		return RuntimeControlSnapshot{},
+			errors.New("runtime control context is required")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var rows []models.SystemConfig
+	if err := c.db.WithContext(ctx).
+		Where(
+			"key IN ? AND is_active = ?",
+			[]string{agentReadOnlyConfigKey, agentEmergencyConfigKey},
+			true,
+		).
+		Find(&rows).Error; err != nil {
+		c.failClosed()
+		return RuntimeControlSnapshot{}, err
+	}
+	snapshot, err := c.snapshotFromRows(rows)
+	if err != nil {
+		c.failClosed()
+		return RuntimeControlSnapshot{}, err
+	}
+	return snapshot, nil
 }
 
-func (c *RuntimeControl) persistOnDB(
+// ReadPlatformControls exposes a cycle-free primitive contract to the Human
+// HTTP adapter while Snapshot remains the typed in-package API.
+func (c *RuntimeControl) ReadPlatformControls(
 	ctx context.Context,
-	db *gorm.DB,
-	key string,
-	enabled bool,
+) (bool, bool, uint64, time.Time, error) {
+	snapshot, err := c.Snapshot(ctx)
+	return snapshot.GlobalReadOnly,
+		snapshot.EmergencyStop,
+		snapshot.Version,
+		snapshot.UpdatedAt,
+		err
+}
+
+// UpdateCAS performs one platform-wide compare-and-swap. The emergency-stop
+// row is the aggregate version anchor and both protected rows are advanced to
+// the same version in one transaction. No generic SystemConfig path can write
+// either row.
+func (c *RuntimeControl) UpdateCAS(
+	ctx context.Context,
+	expectedVersion uint64,
+	patch RuntimeControlPatch,
+	actor models.ActorRef,
+) (RuntimeControlSnapshot, error) {
+	if c == nil || c.db == nil {
+		return RuntimeControlSnapshot{},
+			errors.New("runtime control persistence is unavailable")
+	}
+	if ctx == nil {
+		return RuntimeControlSnapshot{},
+			errors.New("runtime control context is required")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if expectedVersion == 0 {
+		return RuntimeControlSnapshot{},
+			&RuntimeControlVersionConflict{Expected: 0, Current: 1}
+	}
+	if patch.GlobalReadOnly == nil && patch.EmergencyStop == nil {
+		return RuntimeControlSnapshot{}, ErrRuntimeControlPatchRequired
+	}
+	updatedBy, err := runtimeControlHumanActorID(actor)
+	if err != nil {
+		return RuntimeControlSnapshot{},
+			ErrRuntimeControlHumanActorRequired
+	}
+
+	var snapshot RuntimeControlSnapshot
+	err = c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var emergencyRow models.SystemConfig
+		if err := tx.WithContext(ctx).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("key = ?", agentEmergencyConfigKey).
+			First(&emergencyRow).Error; err != nil {
+			return err
+		}
+		var readOnlyRow models.SystemConfig
+		if err := tx.WithContext(ctx).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("key = ?", agentReadOnlyConfigKey).
+			First(&readOnlyRow).Error; err != nil {
+			return err
+		}
+		current, err := c.snapshotFromRows(
+			[]models.SystemConfig{readOnlyRow, emergencyRow},
+		)
+		if err != nil {
+			return err
+		}
+		currentVersion := current.Version
+		if currentVersion != expectedVersion {
+			return &RuntimeControlVersionConflict{
+				Expected: expectedVersion,
+				Current:  currentVersion,
+			}
+		}
+
+		nextReadOnly := current.GlobalReadOnly
+		if patch.GlobalReadOnly != nil {
+			nextReadOnly = *patch.GlobalReadOnly
+		}
+		nextEmergency := current.EmergencyStop
+		if patch.EmergencyStop != nil {
+			nextEmergency = *patch.EmergencyStop
+		}
+		nextVersion := currentVersion + 1
+		now := time.Now().UTC()
+		anchor := tx.WithContext(ctx).
+			Model(&models.SystemConfig{}).
+			Where(
+				"id = ? AND version = ?",
+				emergencyRow.ID,
+				emergencyRow.Version,
+			).
+			Updates(map[string]any{
+				"value":      strconv.FormatBool(nextEmergency),
+				"value_type": "bool",
+				"is_active":  true,
+				"updated_by": updatedBy,
+				"version":    nextVersion,
+				"updated_at": now,
+			})
+		if anchor.Error != nil {
+			return anchor.Error
+		}
+		if anchor.RowsAffected != 1 {
+			var current models.SystemConfig
+			if err := tx.WithContext(ctx).
+				Where("key = ?", agentEmergencyConfigKey).
+				First(&current).Error; err != nil {
+				return err
+			}
+			return &RuntimeControlVersionConflict{
+				Expected: expectedVersion,
+				Current:  positiveRuntimeControlVersion(current.Version),
+			}
+		}
+		readOnlyUpdate := tx.WithContext(ctx).
+			Model(&models.SystemConfig{}).
+			Where("id = ?", readOnlyRow.ID).
+			Updates(map[string]any{
+				"value":      strconv.FormatBool(nextReadOnly),
+				"value_type": "bool",
+				"is_active":  true,
+				"updated_by": updatedBy,
+				"version":    nextVersion,
+				"updated_at": now,
+			})
+		if readOnlyUpdate.Error != nil {
+			return readOnlyUpdate.Error
+		}
+		if readOnlyUpdate.RowsAffected != 1 {
+			return errors.New("runtime read-only control was not updated")
+		}
+		snapshot = RuntimeControlSnapshot{
+			GlobalReadOnly: nextReadOnly,
+			EmergencyStop:  nextEmergency,
+			Version:        nextVersion,
+			UpdatedAt:      now,
+		}
+		return nil
+	})
+	if err != nil {
+		var conflict *RuntimeControlVersionConflict
+		if !errors.As(err, &conflict) &&
+			!errors.Is(err, ErrRuntimeControlPatchRequired) &&
+			!errors.Is(err, ErrRuntimeControlHumanActorRequired) {
+			c.failClosed()
+		}
+		return RuntimeControlSnapshot{}, err
+	}
+	c.setReadOnly(snapshot.GlobalReadOnly)
+	c.setEmergencyStop(snapshot.EmergencyStop)
+	c.healthy.Store(true)
+	return snapshot, nil
+}
+
+// CompareAndSwapPlatformControls exposes the dedicated platform adapter
+// contract without coupling the handlers package back to agentplatform types.
+func (c *RuntimeControl) CompareAndSwapPlatformControls(
+	ctx context.Context,
+	expectedVersion uint64,
+	globalReadOnly *bool,
+	emergencyStop *bool,
+	actor models.ActorRef,
+) (bool, bool, uint64, time.Time, error) {
+	snapshot, err := c.UpdateCAS(
+		ctx,
+		expectedVersion,
+		RuntimeControlPatch{
+			GlobalReadOnly: globalReadOnly,
+			EmergencyStop:  emergencyStop,
+		},
+		actor,
+	)
+	return snapshot.GlobalReadOnly,
+		snapshot.EmergencyStop,
+		snapshot.Version,
+		snapshot.UpdatedAt,
+		err
+}
+
+func (c *RuntimeControl) ensureRuntimeControlRowsTx(
+	ctx context.Context,
+	tx *gorm.DB,
 	updatedBy uint,
 ) error {
-	if c == nil || db == nil {
-		return nil
-	}
-	value := strconv.FormatBool(enabled)
 	var userID *uint
 	if updatedBy > 0 {
 		userID = &updatedBy
 	}
-	row := models.SystemConfig{
-		Key: key, Value: value, ValueType: "bool",
-		Description: "Agent-native runtime safety control",
-		Category:    "security", Group: "agent", IsActive: true,
-		DefaultValue: "false", UpdatedBy: userID, Version: 1,
+	rows := []models.SystemConfig{
+		{
+			Key: agentReadOnlyConfigKey, Value: strconv.FormatBool(c.fallbackReadOnly),
+			ValueType: "bool", Description: "Agent-native runtime safety control",
+			Category: "security", Group: "agent", IsActive: true,
+			DefaultValue: strconv.FormatBool(c.fallbackReadOnly),
+			UpdatedBy:    userID, Version: 1,
+		},
+		{
+			Key: agentEmergencyConfigKey, Value: "false",
+			ValueType: "bool", Description: "Agent-native runtime safety control",
+			Category: "security", Group: "agent", IsActive: true,
+			DefaultValue: "false", UpdatedBy: userID, Version: 1,
+		},
 	}
-	return db.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "key"}},
-		DoUpdates: clause.Assignments(map[string]any{
-			"value":       value,
-			"value_type":  "bool",
-			"is_active":   true,
-			"updated_by":  userID,
-			"version":     gorm.Expr("system_configs.version + 1"),
-			"updated_at":  time.Now().UTC(),
-			"description": row.Description,
-			"category":    row.Category,
-			"group":       row.Group,
-		}),
-	}).Create(&row).Error
+	for i := range rows {
+		if err := tx.WithContext(ctx).
+			Clauses(clause.OnConflict{DoNothing: true}).
+			Create(&rows[i]).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *RuntimeControl) snapshotFromRows(
+	rows []models.SystemConfig,
+) (RuntimeControlSnapshot, error) {
+	if len(rows) != 2 {
+		return RuntimeControlSnapshot{},
+			errors.New("runtime safety controls are incomplete")
+	}
+	snapshot := RuntimeControlSnapshot{}
+	seenReadOnly := false
+	seenEmergency := false
+	var readOnlyVersion uint64
+	var emergencyVersion uint64
+	for i := range rows {
+		row := rows[i]
+		if !row.IsActive || row.ValueType != "bool" {
+			return RuntimeControlSnapshot{},
+				errors.New("runtime safety control metadata is invalid")
+		}
+		if row.Version < 1 {
+			return RuntimeControlSnapshot{},
+				errors.New("runtime safety control version is invalid")
+		}
+		enabled, err := parseRuntimeControlBool(row.Value)
+		if err != nil {
+			return RuntimeControlSnapshot{}, err
+		}
+		switch row.Key {
+		case agentReadOnlyConfigKey:
+			if seenReadOnly {
+				return RuntimeControlSnapshot{},
+					errors.New("runtime read-only control is duplicated")
+			}
+			seenReadOnly = true
+			snapshot.GlobalReadOnly = enabled
+			readOnlyVersion = positiveRuntimeControlVersion(row.Version)
+			if row.UpdatedAt.After(snapshot.UpdatedAt) {
+				snapshot.UpdatedAt = row.UpdatedAt
+			}
+		case agentEmergencyConfigKey:
+			if seenEmergency {
+				return RuntimeControlSnapshot{},
+					errors.New("runtime emergency control is duplicated")
+			}
+			seenEmergency = true
+			snapshot.EmergencyStop = enabled
+			emergencyVersion = positiveRuntimeControlVersion(row.Version)
+			if row.UpdatedAt.After(snapshot.UpdatedAt) {
+				snapshot.UpdatedAt = row.UpdatedAt
+			}
+		default:
+			return RuntimeControlSnapshot{},
+				errors.New("unexpected runtime safety control key")
+		}
+	}
+	if !seenReadOnly || !seenEmergency {
+		return RuntimeControlSnapshot{},
+			errors.New("runtime safety controls are incomplete")
+	}
+	if readOnlyVersion != emergencyVersion {
+		return RuntimeControlSnapshot{},
+			errors.New("runtime safety control versions are inconsistent")
+	}
+	snapshot.Version = emergencyVersion
+	return snapshot, nil
+}
+
+func positiveRuntimeControlVersion(version int) uint64 {
+	if version < 1 {
+		return 1
+	}
+	return uint64(version)
+}
+
+func parseRuntimeControlBool(value string) (bool, error) {
+	switch value {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, errors.New("runtime safety control value is invalid")
+	}
+}
+
+func (c *RuntimeControl) failClosed() {
+	c.healthy.Store(false)
+	c.setEmergencyStop(true)
 }
 
 func (c *RuntimeControl) Refresh(ctx context.Context) error {
 	if c == nil || c.db == nil {
 		return errors.New("runtime control persistence is unavailable")
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	var rows []models.SystemConfig
 	if err := c.db.WithContext(ctx).
 		Where("key IN ? AND is_active = ?", []string{agentReadOnlyConfigKey, agentEmergencyConfigKey}, true).
 		Find(&rows).Error; err != nil {
 		// Persistence is authoritative for the emergency switch. A stale open
 		// value is unsafe, so any refresh failure immediately stops Agent writes.
-		c.healthy.Store(false)
-		c.SetEmergencyStop(true)
+		c.failClosed()
 		return err
 	}
-	nextReadOnly := c.fallbackReadOnly
-	nextEmergency := false
-	for i := range rows {
-		enabled := rows[i].GetBoolValue()
-		switch rows[i].Key {
-		case agentReadOnlyConfigKey:
-			nextReadOnly = enabled
-		case agentEmergencyConfigKey:
-			nextEmergency = enabled
-		}
+	snapshot, err := c.snapshotFromRows(rows)
+	if err != nil {
+		c.failClosed()
+		return err
 	}
-	c.SetReadOnly(nextReadOnly)
-	c.SetEmergencyStop(nextEmergency)
+	c.setReadOnly(snapshot.GlobalReadOnly)
+	c.setEmergencyStop(snapshot.EmergencyStop)
 	c.healthy.Store(true)
 	return nil
 }
@@ -299,6 +657,7 @@ type AdminHandler struct {
 	db            *gorm.DB
 	native        *services.AgentNativeService
 	control       *RuntimeControl
+	lists         *AdminListService
 	credentialTTL time.Duration
 	replayCipher  cipher.AEAD
 }
@@ -325,23 +684,40 @@ func NewAdminHandler(
 	return handler
 }
 
+func (h *AdminHandler) ConfigureListService(service *AdminListService) error {
+	if h == nil || service == nil || service.db == nil {
+		return errors.New("administrator list service is required")
+	}
+	if h.db != service.db {
+		return errors.New("administrator list service database does not match handler")
+	}
+	h.lists = service
+	return nil
+}
+
 func (h *AdminHandler) RegisterRoutes(group *gin.RouterGroup) {
 	group.Use(h.requireAdminCommandHeaders)
-	group.GET("/agent-control/overview", h.Overview)
+	group.GET("/agent-control/overview", h.OverviewMetrics)
 	// Global read-only and emergency-stop are platform resources persisted in
 	// SystemConfig. They are intentionally read-only from this project route:
 	// a project-scoped command must never emit an unscoped 0/0 DomainEvent or
 	// disguise a platform-wide mutation as project-local.
+	group.GET("/service-principals", h.ListPrincipalsPage)
 	group.POST("/service-principals", h.CreateServicePrincipal)
 	group.PUT("/service-principals/:id/status", h.SetServicePrincipalStatus)
 	group.POST("/service-principals/:id/credentials/rotate", h.RotateCredential)
 	group.DELETE("/service-principals/:id/credentials/:credential_id", h.RevokeCredential)
-	group.GET("/service-principals/:id/policies", h.ListPolicies)
+	group.GET("/service-principals/:id/policies", h.ListPoliciesPage)
 	group.POST("/service-principals/:id/policies", h.CreatePolicy)
 	group.DELETE("/service-principals/:id/policies/:policy_id", h.DisablePolicy)
+	group.GET("/leases", h.ListLeasesPage)
 	group.POST("/leases/:id/force-release", h.ForceReleaseLease)
+	group.GET("/attachments", h.ListAttachmentScansPage)
 	group.POST("/attachments/:id/scan", h.MarkAttachmentScan)
+	group.GET("/events", h.ListDomainEventsPage)
+	group.GET("/outbox", h.ListOutboxPage)
 	group.POST("/outbox/:id/replay", h.ReplayOutbox)
+	group.GET("/policy-decisions", h.ListPolicyDecisionsPage)
 }
 
 func (h *AdminHandler) requireProjectScope(
@@ -551,277 +927,7 @@ func bindAdminJSON(c *gin.Context, target any) error {
 }
 
 func (h *AdminHandler) Overview(c *gin.Context) {
-	scope, ok := h.requireProjectScope(c)
-	if !ok {
-		return
-	}
-	var principals []models.ServicePrincipal
-	if err := scopedAdminPrincipalQuery(
-		h.db.WithContext(c.Request.Context()),
-		scope,
-	).
-		Order("service_principals.created_at DESC").
-		Find(&principals).Error; err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load service principals", true)
-		return
-	}
-	var grants []models.ProjectPrincipalGrant
-	if err := h.db.WithContext(c.Request.Context()).
-		Where(
-			"project_id = ? AND is_active = ? AND (expires_at IS NULL OR expires_at > ?)",
-			scope.ProjectID,
-			true,
-			time.Now().UTC(),
-		).
-		Find(&grants).Error; err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load project principal grants", true)
-		return
-	}
-	projectScopes := make(map[string][]string, len(grants))
-	for i := range grants {
-		scopes, err := grants[i].ScopeList()
-		if err != nil {
-			WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to decode project principal grant", true)
-			return
-		}
-		projectScopes[grants[i].ServicePrincipalID] = scopes
-	}
-
-	now := time.Now().UTC()
-	var leases []models.TicketLease
-	if err := h.db.WithContext(c.Request.Context()).
-		Where(
-			"organization_id = ? AND project_id = ? AND released_at IS NULL AND expires_at > ?",
-			scope.OrganizationID,
-			scope.ProjectID,
-			now,
-		).
-		Order("expires_at ASC").
-		Limit(100).
-		Find(&leases).Error; err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load ticket leases", true)
-		return
-	}
-
-	var events []models.DomainEvent
-	if err := h.db.WithContext(c.Request.Context()).
-		Where(
-			"organization_id = ? AND project_id = ?",
-			scope.OrganizationID,
-			scope.ProjectID,
-		).
-		Order("created_at DESC").
-		Limit(100).
-		Find(&events).Error; err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load domain events", true)
-		return
-	}
-
-	var deliveries []models.OutboxDelivery
-	if err := h.db.WithContext(c.Request.Context()).
-		Where(
-			"organization_id = ? AND project_id = ?",
-			scope.OrganizationID,
-			scope.ProjectID,
-		).
-		Order("updated_at DESC").
-		Limit(100).
-		Find(&deliveries).Error; err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load Outbox deliveries", true)
-		return
-	}
-	var attachments []models.TicketAttachment
-	if err := h.db.WithContext(c.Request.Context()).
-		Where(
-			"organization_id = ? AND project_id = ?",
-			scope.OrganizationID,
-			scope.ProjectID,
-		).
-		Order("updated_at DESC").
-		Limit(100).
-		Find(&attachments).Error; err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load attachment scan state", true)
-		return
-	}
-	var decisions []models.PolicyDecision
-	if err := h.db.WithContext(c.Request.Context()).
-		Where(
-			"organization_id = ? AND project_id = ?",
-			scope.OrganizationID,
-			scope.ProjectID,
-		).
-		Order("created_at DESC").
-		Limit(100).
-		Find(&decisions).Error; err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load policy decisions", true)
-		return
-	}
-
-	versionSubjects := make([]string, 0, len(principals)+len(leases)+len(deliveries)+len(attachments))
-	for i := range principals {
-		versionSubjects = append(versionSubjects, "service-principal/"+principals[i].ID)
-	}
-	for i := range leases {
-		versionSubjects = append(versionSubjects, "lease/"+leases[i].ID)
-	}
-	for i := range deliveries {
-		versionSubjects = append(versionSubjects, "outbox/"+deliveries[i].ID)
-	}
-	for i := range attachments {
-		versionSubjects = append(
-			versionSubjects,
-			"attachment/"+strconv.FormatUint(uint64(attachments[i].ID), 10),
-		)
-	}
-	resourceVersions, err := h.adminResourceVersions(
-		c.Request.Context(),
-		h.db,
-		scope,
-		versionSubjects,
-	)
-	if err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load administrator resource versions", true)
-		return
-	}
-
-	principalRows := make([]gin.H, 0, len(principals))
-	for i := range principals {
-		principal := &principals[i]
-		principalRows = append(principalRows, gin.H{
-			"id":          principal.ID,
-			"client_id":   principal.ID,
-			"name":        principal.Name,
-			"description": principal.Description,
-			"status":      principal.Status,
-			"scopes": intersectAgentScopes(
-				principal.ScopeList(),
-				projectScopes[principal.ID],
-			),
-			"rate_limit":         principal.RateLimitPerMinute,
-			"concurrency_limit":  principal.ConcurrentLimit,
-			"last_used_at":       principal.LastUsedAt,
-			"expires_at":         principal.ExpiresAt,
-			"created_at":         principal.CreatedAt,
-			"read_only":          principal.ReadOnly,
-			"emergency_disabled": principal.EmergencyDisabled,
-			"resource_version":   resourceVersions["service-principal/"+principal.ID],
-		})
-	}
-
-	leaseRows := make([]gin.H, 0, len(leases))
-	for i := range leases {
-		lease := &leases[i]
-		var ticket models.Ticket
-		_ = h.db.WithContext(c.Request.Context()).
-			Select("id", "ticket_number").
-			Where(
-				"id = ? AND organization_id = ? AND project_id = ?",
-				lease.TicketID,
-				scope.OrganizationID,
-				scope.ProjectID,
-			).
-			First(&ticket).Error
-		principalName := lease.HolderActorID
-		if lease.HolderActorType == models.ActorTypeServicePrincipal {
-			principal, principalErr := requireScopedAdminPrincipal(
-				c.Request.Context(),
-				h.db,
-				scope,
-				lease.HolderActorID,
-			)
-			if principalErr == nil {
-				principalName = principal.Name
-			}
-		}
-		leaseRows = append(leaseRows, gin.H{
-			"id":               lease.ID,
-			"ticket_id":        lease.TicketID,
-			"ticket_number":    ticket.TicketNumber,
-			"principal_name":   principalName,
-			"acquired_at":      lease.CreatedAt,
-			"expires_at":       lease.ExpiresAt,
-			"ticket_version":   lease.TicketVersion,
-			"resource_version": resourceVersions["lease/"+lease.ID],
-		})
-	}
-
-	eventRows := make([]gin.H, 0, len(events))
-	for i := range events {
-		event := &events[i]
-		eventRows = append(eventRows, gin.H{
-			"id":               event.ID,
-			"type":             event.Type,
-			"subject":          event.Subject,
-			"actor_type":       event.ActorType,
-			"actor_id":         event.ActorID,
-			"resource_version": event.ResourceVersion,
-			"time":             event.Time,
-		})
-	}
-
-	outboxRows := make([]gin.H, 0, len(deliveries))
-	for i := range deliveries {
-		delivery := &deliveries[i]
-		outboxRows = append(outboxRows, gin.H{
-			"id":               delivery.ID,
-			"event_id":         delivery.EventID,
-			"destination":      delivery.DestinationType + ":" + delivery.DestinationID,
-			"status":           delivery.Status,
-			"attempts":         delivery.Attempts,
-			"next_attempt_at":  delivery.NextAttemptAt,
-			"last_error":       services.ScrubOutboxFailureText(delivery.LastError),
-			"updated_at":       delivery.UpdatedAt,
-			"resource_version": resourceVersions["outbox/"+delivery.ID],
-		})
-	}
-	attachmentRows := make([]gin.H, 0, len(attachments))
-	for i := range attachments {
-		attachment := &attachments[i]
-		subject := "attachment/" + strconv.FormatUint(uint64(attachment.ID), 10)
-		attachmentRows = append(attachmentRows, gin.H{
-			"id":               attachment.ID,
-			"ticket_id":        attachment.TicketID,
-			"original_name":    attachment.OriginalName,
-			"mime_type":        attachment.MimeType,
-			"file_size":        attachment.FileSize,
-			"virus_scan":       attachment.VirusScan,
-			"scan_details":     attachment.ScanDetails,
-			"scanned_at":       attachment.ScannedAt,
-			"updated_at":       attachment.UpdatedAt,
-			"resource_version": resourceVersions[subject],
-		})
-	}
-	decisionRows := make([]gin.H, 0, len(decisions))
-	for i := range decisions {
-		decision := &decisions[i]
-		decisionRows = append(decisionRows, gin.H{
-			"id":                decision.ID,
-			"created_at":        decision.CreatedAt,
-			"actor_type":        decision.ActorType,
-			"actor_id":          decision.ActorID,
-			"credential_id":     decision.CredentialID,
-			"scope":             decision.Scope,
-			"action":            decision.Action,
-			"resource_type":     decision.ResourceType,
-			"resource_id":       decision.ResourceID,
-			"allowed":           decision.Allowed,
-			"reason_code":       decision.ReasonCode,
-			"matched_policy_id": decision.MatchedPolicyID,
-			"source_protocol":   decision.SourceProtocol,
-			"request_digest":    decision.RequestDigest,
-		})
-	}
-
-	WriteData(c, http.StatusOK, gin.H{
-		"global_read_only": h.control != nil && h.control.ReadOnly(),
-		"emergency_stop":   h.control != nil && h.control.EmergencyStop(),
-		"principals":       principalRows,
-		"leases":           leaseRows,
-		"events":           eventRows,
-		"outbox":           outboxRows,
-		"attachments":      attachmentRows,
-		"policy_decisions": decisionRows,
-	}, Meta{})
+	h.OverviewMetrics(c)
 }
 
 func (h *AdminHandler) CreateServicePrincipal(c *gin.Context) {
@@ -1163,67 +1269,7 @@ func (h *AdminHandler) CreatePolicy(c *gin.Context) {
 }
 
 func (h *AdminHandler) ListPolicies(c *gin.Context) {
-	scope, ok := h.requireProjectScope(c)
-	if !ok {
-		return
-	}
-	if _, err := requireScopedAdminPrincipal(
-		c.Request.Context(),
-		h.db,
-		scope,
-		c.Param("id"),
-	); err != nil {
-		h.writeNativeError(c, err)
-		return
-	}
-	var policies []models.AgentPolicy
-	if err := h.db.WithContext(c.Request.Context()).
-		Where("service_principal_id = ?", c.Param("id")).
-		Order("priority DESC, created_at DESC").
-		Find(&policies).Error; err != nil {
-		h.writeNativeError(c, err)
-		return
-	}
-	subjects := make([]string, 0, len(policies))
-	for i := range policies {
-		subjects = append(
-			subjects,
-			"service-principal/"+policies[i].ServicePrincipalID+"/policy/"+policies[i].ID,
-		)
-	}
-	versions, err := h.adminResourceVersions(
-		c.Request.Context(),
-		h.db,
-		scope,
-		subjects,
-	)
-	if err != nil {
-		WriteProblem(c, http.StatusInternalServerError, ProblemInternal, "Failed to load policy versions", true)
-		return
-	}
-	rows := make([]gin.H, 0, len(policies))
-	for i := range policies {
-		policy := &policies[i]
-		subject := "service-principal/" + policy.ServicePrincipalID + "/policy/" + policy.ID
-		rows = append(rows, gin.H{
-			"id":                   policy.ID,
-			"created_at":           policy.CreatedAt,
-			"updated_at":           policy.UpdatedAt,
-			"service_principal_id": policy.ServicePrincipalID,
-			"name":                 policy.Name,
-			"effect":               policy.Effect,
-			"scope":                policy.Scope,
-			"action":               policy.Action,
-			"resource_type":        policy.ResourceType,
-			"resource_id":          policy.ResourceID,
-			"conditions":           policy.Conditions,
-			"priority":             policy.Priority,
-			"is_active":            policy.IsActive,
-			"expires_at":           policy.ExpiresAt,
-			"resource_version":     versions[subject],
-		})
-	}
-	WriteData(c, http.StatusOK, rows, Meta{})
+	h.ListPoliciesPage(c)
 }
 
 func (h *AdminHandler) DisablePolicy(c *gin.Context) {

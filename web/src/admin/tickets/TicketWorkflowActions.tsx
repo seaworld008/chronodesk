@@ -1,6 +1,8 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
+    Autocomplete,
     Button,
+    CircularProgress,
     Dialog,
     DialogTitle,
     DialogContent,
@@ -100,6 +102,16 @@ type AssigneeOption = {
     last_name?: string;
 };
 
+const assigneeOptionLabel = (option: AssigneeOption) => {
+    const displayName = [option.first_name, option.last_name]
+        .filter(Boolean)
+        .join(' ')
+        .trim();
+    return displayName
+        ? `${option.username}（${displayName}）`
+        : option.username;
+};
+
 /**
  * 工单工作流操作组件
  * 提供分配、转移、升级、状态变更等工单流转功能
@@ -113,7 +125,9 @@ const TicketWorkflowActions: React.FC = () => {
     
     const [dialogOpen, setDialogOpen] = useState(false);
     const [currentAction, setCurrentAction] = useState<WorkflowAction | null>(null);
-    const [assigneeId, setAssigneeId] = useState<number | null>(null);
+    const [assignee, setAssignee] = useState<AssigneeOption | null>(null);
+    const [assigneeSearch, setAssigneeSearch] = useState('');
+    const [debouncedAssigneeSearch, setDebouncedAssigneeSearch] = useState('');
     const [transferDepartment, setTransferDepartment] = useState('');
     const [escalationReason, setEscalationReason] = useState('');
     const [newStatus, setNewStatus] = useState<TicketStatus | ''>('');
@@ -121,9 +135,11 @@ const TicketWorkflowActions: React.FC = () => {
     const { data: assignees = [], isPending: assigneesPending } = useGetList<AssigneeOption>(
         'assignees',
         {
-            pagination: { page: 1, perPage: 100 },
+            pagination: { page: 1, perPage: 25 },
             sort: { field: 'username', order: 'ASC' },
-            filter: {},
+            filter: debouncedAssigneeSearch
+                ? { q: debouncedAssigneeSearch }
+                : {},
         },
         {
             enabled:
@@ -132,6 +148,24 @@ const TicketWorkflowActions: React.FC = () => {
                 ['assign', 'transfer', 'escalate'].includes(currentAction.type),
         },
     );
+    const assigneeOptions = useMemo(() => {
+        if (
+            assignee === null
+            || assignees.some((candidate) => candidate.id === assignee.id)
+        ) {
+            return assignees;
+        }
+        return [assignee, ...assignees];
+    }, [assignee, assignees]);
+    const assigneeId = assignee?.id ?? null;
+
+    useEffect(() => {
+        const timer = window.setTimeout(
+            () => setDebouncedAssigneeSearch(assigneeSearch.trim()),
+            250,
+        );
+        return () => window.clearTimeout(timer);
+    }, [assigneeSearch]);
 
     if (!record) return null;
 
@@ -292,7 +326,9 @@ const TicketWorkflowActions: React.FC = () => {
     };
 
     const resetForm = () => {
-        setAssigneeId(null);
+        setAssignee(null);
+        setAssigneeSearch('');
+        setDebouncedAssigneeSearch('');
         setTransferDepartment('');
         setEscalationReason('');
         setNewStatus('');
@@ -317,6 +353,61 @@ const TicketWorkflowActions: React.FC = () => {
     );
     const availableActions =
         canUseWorkflow || canAssign ? getAvailableActions() : [];
+    const renderAssigneeSelector = (label: string) => (
+        <Autocomplete
+            fullWidth
+            options={assigneeOptions}
+            value={assignee}
+            inputValue={assigneeSearch}
+            loading={assigneesPending}
+            filterOptions={(options) => options}
+            getOptionLabel={assigneeOptionLabel}
+            isOptionEqualToValue={(option, value) => option.id === value.id}
+            onChange={(_, value) => {
+                setAssignee(value);
+                setAssigneeSearch(value ? assigneeOptionLabel(value) : '');
+            }}
+            onInputChange={(_, value, reason) => {
+                if (reason === 'input' || reason === 'clear') {
+                    setAssigneeSearch(value);
+                }
+            }}
+            noOptionsText={
+                debouncedAssigneeSearch
+                    ? '未找到匹配的项目成员'
+                    : '暂无可分配成员'
+            }
+            renderInput={(params) => (
+                <TextField
+                    {...params}
+                    label={label}
+                    helperText="输入姓名或用户名搜索；每次最多显示 25 项"
+                    slotProps={{
+                        ...params.slotProps,
+                        htmlInput: {
+                            ...params.slotProps.htmlInput,
+                            'aria-label': label,
+                        },
+                        input: {
+                            ...params.slotProps.input,
+                            endAdornment: (
+                                <>
+                                    {assigneesPending && (
+                                        <CircularProgress
+                                            color="inherit"
+                                            size={18}
+                                            aria-label="正在搜索可分配成员"
+                                        />
+                                    )}
+                                    {params.slotProps.input.endAdornment}
+                                </>
+                            ),
+                        },
+                    }}
+                />
+            )}
+        />
+    );
 
     return (
         <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
@@ -374,25 +465,7 @@ const TicketWorkflowActions: React.FC = () => {
                             <Alert severity="info">
                                 选择要分配给的用户。分配后该用户将成为工单的负责人。
                             </Alert>
-                            <FormControl fullWidth>
-                                <InputLabel id="assign-user-label">分配给</InputLabel>
-                                <Select
-                                    labelId="assign-user-label"
-                                    label="分配给"
-                                    value={assigneeId ?? ''}
-                                    disabled={assigneesPending}
-                                    onChange={(event) => setAssigneeId(Number(event.target.value))}
-                                >
-                                    {assignees.map((user) => (
-                                        <MenuItem key={user.id} value={user.id}>
-                                            {user.username}
-                                            {user.first_name || user.last_name
-                                                ? ` (${user.first_name ?? ''} ${user.last_name ?? ''})`
-                                                : ''}
-                                        </MenuItem>
-                                    ))}
-                                </Select>
-                            </FormControl>
+                            {renderAssigneeSelector('分配给')}
                         </Box>
                     )}
 
@@ -413,22 +486,7 @@ const TicketWorkflowActions: React.FC = () => {
                                     <MenuItem value="management">管理层</MenuItem>
                                 </Select>
                             </FormControl>
-                            <FormControl fullWidth>
-                                <InputLabel id="transfer-user-label">转移给</InputLabel>
-                                <Select
-                                    labelId="transfer-user-label"
-                                    label="转移给"
-                                    value={assigneeId ?? ''}
-                                    disabled={assigneesPending}
-                                    onChange={(event) => setAssigneeId(Number(event.target.value))}
-                                >
-                                    {assignees.map((user) => (
-                                        <MenuItem key={user.id} value={user.id}>
-                                            {user.username}
-                                        </MenuItem>
-                                    ))}
-                                </Select>
-                            </FormControl>
+                            {renderAssigneeSelector('转移给')}
                         </Box>
                     )}
 
@@ -446,22 +504,7 @@ const TicketWorkflowActions: React.FC = () => {
                                 onChange={(e) => setEscalationReason(e.target.value)}
                                 required
                             />
-                            <FormControl fullWidth>
-                                <InputLabel id="escalate-user-label">升级给</InputLabel>
-                                <Select
-                                    labelId="escalate-user-label"
-                                    label="升级给"
-                                    value={assigneeId ?? ''}
-                                    disabled={assigneesPending}
-                                    onChange={(event) => setAssigneeId(Number(event.target.value))}
-                                >
-                                    {assignees.map((user) => (
-                                        <MenuItem key={user.id} value={user.id}>
-                                            {user.username}
-                                        </MenuItem>
-                                    ))}
-                                </Select>
-                            </FormControl>
+                            {renderAssigneeSelector('升级给')}
                             <Box>
                                 <Tooltip
                                     title={`优先级代码：${record.priority} → ${PRIORITY_ESCALATION[record.priority as keyof typeof PRIORITY_ESCALATION]}`}

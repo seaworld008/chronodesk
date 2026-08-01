@@ -355,17 +355,24 @@ func (h *TicketWorkflowHandler) GetTicketStats(c *gin.Context) {
 func (h *TicketWorkflowHandler) GetMyTickets(c *gin.Context) {
 	userID := c.GetUint("user_id")
 	role := normalizedProjectRole(c)
-
-	limit := 10
-	if l := c.Query("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil {
-			limit = parsed
-		}
+	query, ok := requireTicketPreviewListQuery(
+		c,
+		map[string]struct{}{
+			"status":   {},
+			"priority": {},
+		},
+	)
+	if !ok {
+		return
 	}
-	_, limit = normalizePagination(1, limit, 100)
-
-	status := c.Query("status")
-	priority := c.Query("priority")
+	status := query.values.Get("status")
+	priority := query.values.Get("priority")
+	page := services.DirectoryPageRequest{
+		Page:      query.Page,
+		PageSize:  query.PageSize,
+		SortBy:    query.SortBy,
+		SortOrder: query.SortOrder,
+	}
 
 	var (
 		tickets []*models.Ticket
@@ -374,13 +381,13 @@ func (h *TicketWorkflowHandler) GetMyTickets(c *gin.Context) {
 	)
 	if isRequesterRole(role) {
 		tickets, total, err = h.ticketService.GetTickets(c.Request.Context(), services.TicketFilters{
-			Page:      1,
-			Limit:     limit,
+			Page:      query.Page,
+			Limit:     query.PageSize,
 			Status:    status,
 			Priority:  priority,
 			CreatorID: &userID,
-			SortBy:    "created_at",
-			SortOrder: "desc",
+			SortBy:    query.SortBy,
+			SortOrder: query.SortOrder,
 		})
 	} else if isProjectAgentRole(role) || isProjectManagerRole(role) {
 		tickets, total, err = h.ticketService.GetUserTickets(
@@ -388,12 +395,20 @@ func (h *TicketWorkflowHandler) GetMyTickets(c *gin.Context) {
 			userID,
 			status,
 			priority,
-			limit,
+			page,
 		)
 	} else {
 		c.JSON(http.StatusForbidden, gin.H{
 			"success": false,
 			"message": "当前身份不能查询工单",
+		})
+		return
+	}
+	if errors.Is(err, services.ErrInvalidTicketListQuery) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "我的工单查询参数无效",
+			"error":   "invalid_query",
 		})
 		return
 	}
@@ -407,11 +422,13 @@ func (h *TicketWorkflowHandler) GetMyTickets(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    ticketListResponseForRole(tickets, role),
-		"total":   total,
-	})
+	writePageEnvelope(
+		c,
+		ticketListResponseForRole(tickets, role),
+		total,
+		query.Page,
+		query.PageSize,
+	)
 }
 
 func (h *TicketWorkflowHandler) GetUnassignedTickets(c *gin.Context) {
@@ -423,23 +440,38 @@ func (h *TicketWorkflowHandler) GetUnassignedTickets(c *gin.Context) {
 		})
 		return
 	}
-	limit := 20
-	if l := c.Query("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil {
-			limit = parsed
-		}
+	query, ok := requireTicketPreviewListQuery(
+		c,
+		map[string]struct{}{
+			"priority":    {},
+			"category_id": {},
+		},
+	)
+	if !ok {
+		return
 	}
-	_, limit = normalizePagination(1, limit, 100)
-
-	priority := c.Query("priority")
-	categoryID := c.Query("category_id")
+	priority := query.values.Get("priority")
+	categoryID := query.values.Get("category_id")
 
 	tickets, total, err := h.ticketService.GetUnassignedTickets(
 		c.Request.Context(),
 		priority,
 		categoryID,
-		limit,
+		services.DirectoryPageRequest{
+			Page:      query.Page,
+			PageSize:  query.PageSize,
+			SortBy:    query.SortBy,
+			SortOrder: query.SortOrder,
+		},
 	)
+	if errors.Is(err, services.ErrInvalidTicketListQuery) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "未分配工单查询参数无效",
+			"error":   "invalid_query",
+		})
+		return
+	}
 	if err != nil {
 		logHandlerFailure(c, "ticket_workflow.get_unassigned_tickets", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -450,21 +482,73 @@ func (h *TicketWorkflowHandler) GetUnassignedTickets(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    ticketListResponseForRole(tickets, role),
-		"total":   total,
+	writePageEnvelope(
+		c,
+		ticketListResponseForRole(tickets, role),
+		total,
+		query.Page,
+		query.PageSize,
+	)
+}
+
+func requireTicketPreviewListQuery(
+	c *gin.Context,
+	filterFields map[string]struct{},
+) (directoryListQuery, bool) {
+	query, err := parseDirectoryListQuery(
+		c.Request.URL.RawQuery,
+		directoryListQuerySpec{
+			DefaultSortBy:    "created_at",
+			DefaultSortOrder: "desc",
+			SortFields:       map[string]struct{}{"created_at": {}},
+			FilterFields:     filterFields,
+		},
+	)
+	if err != nil {
+		writeInvalidTicketPreviewListQuery(c)
+		return directoryListQuery{}, false
+	}
+	if status, ok := query.values["status"]; ok &&
+		!validTicketListValues(status[0], validTicketStatusFilter) {
+		writeInvalidTicketPreviewListQuery(c)
+		return directoryListQuery{}, false
+	}
+	if priority, ok := query.values["priority"]; ok &&
+		!validTicketListValues(priority[0], validTicketPriorityFilter) {
+		writeInvalidTicketPreviewListQuery(c)
+		return directoryListQuery{}, false
+	}
+	if categoryID, ok := query.values["category_id"]; ok {
+		parsed, parseErr := strconv.ParseUint(categoryID[0], 10, 32)
+		if parseErr != nil || parsed == 0 {
+			writeInvalidTicketPreviewListQuery(c)
+			return directoryListQuery{}, false
+		}
+	}
+	return query, true
+}
+
+func writeInvalidTicketPreviewListQuery(c *gin.Context) {
+	c.JSON(http.StatusBadRequest, gin.H{
+		"success": false,
+		"message": "工单预览查询参数无效",
+		"error":   "invalid_query",
 	})
 }
 
 func (h *TicketWorkflowHandler) GetOverdueTickets(c *gin.Context) {
 	userID := c.GetUint("user_id")
 	role := normalizedProjectRole(c)
+	page, pageSize, ok := parseStrictPagePagination(c, 25, 100)
+	if !ok {
+		return
+	}
 
 	tickets, total, err := h.ticketService.GetOverdueTickets(
 		c.Request.Context(),
 		userID,
 		role,
+		services.PageRequest{Page: page, PageSize: pageSize},
 	)
 	if err != nil {
 		logHandlerFailure(c, "ticket_workflow.get_overdue_tickets", err)
@@ -476,21 +560,22 @@ func (h *TicketWorkflowHandler) GetOverdueTickets(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    ticketListResponseForRole(tickets, role),
-		"total":   total,
-	})
+	writePageEnvelope(c, ticketListResponseForRole(tickets, role), total, page, pageSize)
 }
 
 func (h *TicketWorkflowHandler) GetSLABreachedTickets(c *gin.Context) {
 	userID := c.GetUint("user_id")
 	role := normalizedProjectRole(c)
+	page, pageSize, ok := parseStrictPagePagination(c, 25, 100)
+	if !ok {
+		return
+	}
 
 	tickets, total, err := h.ticketService.GetSLABreachedTickets(
 		c.Request.Context(),
 		userID,
 		role,
+		services.PageRequest{Page: page, PageSize: pageSize},
 	)
 	if err != nil {
 		logHandlerFailure(c, "ticket_workflow.get_sla_breached_tickets", err)
@@ -502,11 +587,7 @@ func (h *TicketWorkflowHandler) GetSLABreachedTickets(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    ticketListResponseForRole(tickets, role),
-		"total":   total,
-	})
+	writePageEnvelope(c, ticketListResponseForRole(tickets, role), total, page, pageSize)
 }
 
 func (h *TicketWorkflowHandler) GetTicketHistory(c *gin.Context) {
@@ -524,10 +605,19 @@ func (h *TicketWorkflowHandler) GetTicketHistory(c *gin.Context) {
 		}
 		return
 	}
+	page, pageSize, ok := parseStrictPagePagination(c, 25, 100)
+	if !ok {
+		return
+	}
 
-	history, _, err := h.ticketService.GetTicketHistory(
+	history, total, err := h.ticketService.GetTicketHistory(
 		c.Request.Context(),
 		uint(ticketID),
+		services.PageRequest{
+			Page:            page,
+			PageSize:        pageSize,
+			CustomerVisible: isRequesterRole(normalizedProjectRole(c)),
+		},
 	)
 	if err != nil {
 		logHandlerFailure(c, "ticket_workflow.get_history", err)
@@ -541,9 +631,5 @@ func (h *TicketWorkflowHandler) GetTicketHistory(c *gin.Context) {
 	customer := isRequesterRole(normalizedProjectRole(c))
 	responses := ticketHistoryResponses(history, customer)
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    responses,
-		"total":   len(responses),
-	})
+	writePageEnvelope(c, responses, total, page, pageSize)
 }

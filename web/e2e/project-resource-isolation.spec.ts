@@ -203,11 +203,44 @@ const mockProjectBackend = async (
                     data: {
                         global_read_only: false,
                         emergency_stop: false,
-                        principals: [],
-                        leases: [],
-                        events: [],
-                        outbox: [],
-                        policy_decisions: [],
+                        active_principal_count: 0,
+                        active_lease_count: 0,
+                        recent_event_count: 0,
+                        failed_outbox_count: 0,
+                    },
+                });
+                return;
+            }
+            if (
+                suffix === 'admin/agents/service-principals' ||
+                suffix === 'admin/agents/leases' ||
+                suffix === 'admin/agents/attachments' ||
+                suffix === 'admin/agents/outbox'
+            ) {
+                await fulfillJSON(route, {
+                    code: 0,
+                    data: {
+                        items: [],
+                        total: 0,
+                        page: Number(url.searchParams.get('page') ?? '1'),
+                        page_size: Number(
+                            url.searchParams.get('page_size') ?? '25',
+                        ),
+                        total_pages: 0,
+                    },
+                });
+                return;
+            }
+            if (
+                suffix === 'admin/agents/events' ||
+                suffix === 'admin/agents/policy-decisions'
+            ) {
+                await fulfillJSON(route, {
+                    code: 0,
+                    data: {
+                        items: [],
+                        next_cursor: '',
+                        has_more: false,
                     },
                 });
                 return;
@@ -266,6 +299,32 @@ const expectTicketCapabilities = async (
 };
 
 test.describe('项目资源缓存与会话失效隔离', () => {
+    test('工单历史只发送严格分页参数，不透传 React Admin 排序与筛选', async ({
+        page,
+    }) => {
+        await installMockSession(page, defaultMockIdentity, projectA);
+        await mockProjectBackend(page, [
+            authorizedProjectAccess(projectA, 'project_admin'),
+        ]);
+        const historyPath =
+            `/api/projects/${projectA.key}/tickets/${ticketID}/history`;
+        const historyRequest = page.waitForRequest((request) =>
+            request.method() === 'GET' &&
+            new URL(request.url()).pathname === historyPath,
+        );
+
+        await page.goto(`/#/tickets/${ticketID}/show`);
+        await page
+            .getByRole('main')
+            .getByRole('tab', { name: '历史记录', exact: true })
+            .click();
+
+        const historyURL = new URL((await historyRequest).url());
+        expect(`${historyURL.pathname}${historyURL.search}`).toBe(
+            `${historyPath}?page=1&page_size=25`,
+        );
+    });
+
     test('A/B 同 numeric ticket ID：撤销 A 后当前 URL fail closed，绝不触碰 B 同 ID 工单', async ({
         page,
     }) => {
@@ -348,10 +407,12 @@ test.describe('项目资源缓存与会话失效隔离', () => {
 
             await page.goto('/#/agent-control');
             await expect(
-                page.getByRole('heading', {
-                    name: 'AI 智能体控制中心',
-                    exact: true,
-                }),
+                page
+                    .getByRole('main')
+                    .getByRole('heading', {
+                        name: 'AI 智能体控制中心',
+                        exact: true,
+                    }),
             ).toBeVisible();
 
             backend.forbiddenCodes.set(overviewPath, forbiddenCode);

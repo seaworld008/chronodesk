@@ -105,7 +105,12 @@ func (s *SLAService) getConfigForTicketOnDB(
 		conditions = append(conditions, "assigned_user_id IS NULL")
 	}
 
-	category, err := slaTicketCategoryOnDB(ctx, db, ticket)
+	category, err := slaTicketCategoryOnDB(
+		ctx,
+		db,
+		scope,
+		ticket,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -176,18 +181,32 @@ func slaProjectScopeForTicket(
 func slaTicketCategoryOnDB(
 	ctx context.Context,
 	db *gorm.DB,
+	scope models.ProjectScope,
 	ticket *models.Ticket,
 ) (*models.Category, error) {
 	if ticket.CategoryID == nil {
 		return nil, nil
 	}
 	if ticket.Category != nil && ticket.Category.ID == *ticket.CategoryID {
+		if ticket.Category.OrganizationID != scope.OrganizationID ||
+			ticket.Category.ProjectID != scope.ProjectID {
+			return nil, ErrTicketCategoryScope
+		}
 		return ticket.Category, nil
 	}
 	var category models.Category
 	if err := db.WithContext(ctx).
-		Select("id", "name", "slug").
-		First(&category, *ticket.CategoryID).Error; err != nil {
+		Select("id", "organization_id", "project_id", "name", "slug").
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ? AND deleted_at IS NULL",
+			*ticket.CategoryID,
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		First(&category).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrTicketCategoryScope
+		}
 		return nil, fmt.Errorf("get ticket category for SLA: %w", err)
 	}
 	return &category, nil

@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from .api import APIClient
+from .api import APIClient, APIError
 from .intake import PublishedTicketIntake, load_published_ticket_intake
 from .safety import (
     register_secret,
@@ -31,6 +31,167 @@ PROJECT_ROLES = (
     "requester",
     "observer",
 )
+
+
+def find_project_membership(
+    api: APIClient,
+    user_id: int,
+) -> dict[str, Any] | None:
+    """Find one exact user in the bounded project-membership directory."""
+
+    assert isinstance(user_id, int) and user_id > 0, "成员对账用户 ID 无效"
+    page = 1
+    while True:
+        response = api.get_json(
+            api.project_path("memberships"),
+            params={
+                "page": page,
+                "page_size": 100,
+                "sort_by": "user_id",
+                "sort_order": "asc",
+            },
+        )
+        if response.status_code != 200:
+            raise AssertionError(
+                f"项目成员对账查询失败：{response_diagnostic(response)}"
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise AssertionError("项目成员对账返回非 JSON") from exc
+        directory = payload.get("data") if isinstance(payload, dict) else None
+        items = directory.get("items") if isinstance(directory, dict) else None
+        total_pages = (
+            directory.get("total_pages") if isinstance(directory, dict) else None
+        )
+        if (
+            not isinstance(items, list)
+            or not isinstance(total_pages, int)
+            or total_pages < 0
+            or directory.get("page") != page
+            or directory.get("page_size") != 100
+        ):
+            raise AssertionError(
+                f"项目成员对账缺少严格分页数据：{safe_diagnostic(payload)}"
+            )
+        matches = [
+            item
+            for item in items
+            if isinstance(item, dict) and item.get("user_id") == user_id
+        ]
+        if len(matches) > 1:
+            raise AssertionError(f"项目成员对账发现重复用户：{user_id}")
+        if matches:
+            return matches[0]
+        if page >= total_pages:
+            return None
+        page += 1
+
+
+def active_project_membership_version(
+    api: APIClient,
+    user_id: int,
+    expected_role: str,
+) -> int:
+    """Reconcile the current version for one known, newly generated user."""
+
+    membership = find_project_membership(api, user_id)
+    if (
+        not isinstance(membership, dict)
+        or membership.get("user_id") != user_id
+        or membership.get("role") != expected_role
+        or membership.get("is_active") is not True
+    ):
+        raise AssertionError(
+            f"项目成员对账未确认用户 {user_id} 的 {expected_role} 有效授权"
+        )
+    version = membership.get("version")
+    if not isinstance(version, int) or version <= 0:
+        raise AssertionError(f"项目成员对账缺少用户 {user_id} 的有效版本")
+    return version
+
+
+def cleanup_project_membership(
+    api: APIClient,
+    user_id: int,
+    expected_version: int | None,
+) -> str | None:
+    """Revoke one generated user's membership without blind write retries."""
+
+    assert isinstance(user_id, int) and user_id > 0, "成员清理用户 ID 无效"
+    version = expected_version
+    if not isinstance(version, int) or version <= 0:
+        try:
+            current = find_project_membership(api, user_id)
+        except AssertionError as exc:
+            return f"无法取得用户 {user_id} 的成员清理版本：{safe_diagnostic(exc)}"
+        if current is None or current.get("is_active") is False:
+            return None
+        if current.get("is_active") is not True:
+            return f"用户 {user_id} 的成员启用状态无效"
+        version = current.get("version")
+        if not isinstance(version, int) or version <= 0:
+            return f"用户 {user_id} 的成员清理版本无效"
+
+    try:
+        response = api.delete(
+            api.project_path(f"memberships/{user_id}"),
+            params={"expected_version": version},
+            retry=False,
+        )
+    except APIError:
+        try:
+            current = find_project_membership(api, user_id)
+        except AssertionError as exc:
+            return (
+                f"用户 {user_id} 的成员撤销结果不确定，且对账失败："
+                f"{safe_diagnostic(exc)}"
+            )
+        if current is None or current.get("is_active") is False:
+            return None
+        return f"用户 {user_id} 的成员撤销结果不确定，对账后仍处于启用状态"
+
+    if response.status_code in (200, 204, 404):
+        return None
+    if response.status_code != 409:
+        return f"撤销用户 {user_id} 的项目成员失败：{response_diagnostic(response)}"
+
+    try:
+        current = find_project_membership(api, user_id)
+    except AssertionError as exc:
+        return f"用户 {user_id} 的成员版本冲突，且刷新失败：{safe_diagnostic(exc)}"
+    if current is None or current.get("is_active") is False:
+        return None
+    refreshed_version = current.get("version")
+    if (
+        current.get("is_active") is not True
+        or not isinstance(refreshed_version, int)
+        or refreshed_version <= 0
+    ):
+        return f"用户 {user_id} 的成员版本冲突，刷新结果无效"
+
+    try:
+        retried = api.delete(
+            api.project_path(f"memberships/{user_id}"),
+            params={"expected_version": refreshed_version},
+            retry=False,
+        )
+    except APIError:
+        try:
+            current = find_project_membership(api, user_id)
+        except AssertionError as exc:
+            return (
+                f"用户 {user_id} 刷新版本后的成员撤销结果不确定，且对账失败："
+                f"{safe_diagnostic(exc)}"
+            )
+        if current is None or current.get("is_active") is False:
+            return None
+        return f"用户 {user_id} 刷新版本后的成员撤销结果不确定，对账后仍处于启用状态"
+    if retried.status_code in (200, 204, 404):
+        return None
+    return (
+        f"刷新版本后撤销用户 {user_id} 的项目成员失败：{response_diagnostic(retried)}"
+    )
 
 
 def assert_human_session_contract(
@@ -171,7 +332,7 @@ class E2EResourceManager:
         # per-identity label and a cryptographically random suffix.
         self._user_run_token = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:12]
         self._users: list[tuple[int, str]] = []
-        self._memberships: list[int] = []
+        self._memberships: dict[int, int] = {}
         self._tickets: list[tuple[int, str]] = []
         self._notifications: list[int] = []
         self._clients: list[APIClient] = []
@@ -298,19 +459,48 @@ class E2EResourceManager:
             platform_role,
             label=label or project_role,
         )
-        membership = self.admin_api.post_json(
-            self.project_path("memberships"),
-            {
-                "user_id": identity.id,
-                "role": project_role,
-            },
-        )
-        assert membership.status_code == 200, response_diagnostic(membership)
-        self._memberships.append(identity.id)
-        granted = membership.json().get("data")
-        assert isinstance(granted, dict), response_diagnostic(membership)
-        assert granted.get("user_id") == identity.id, safe_diagnostic(granted)
-        assert granted.get("role") == project_role, safe_diagnostic(granted)
+        try:
+            membership = self.admin_api.post_json(
+                self.project_path("memberships"),
+                {
+                    "user_id": identity.id,
+                    "role": project_role,
+                    "expected_version": 0,
+                },
+                retry=False,
+            )
+        except APIError as exc:
+            try:
+                granted_version = active_project_membership_version(
+                    self.admin_api,
+                    identity.id,
+                    project_role,
+                )
+            except AssertionError as reconcile_exc:
+                raise AssertionError(
+                    f"项目成员授权结果不确定，且未能确认用户 {identity.id} "
+                    f"的提交结果：{safe_diagnostic(reconcile_exc)}"
+                ) from exc
+        else:
+            assert membership.status_code == 200, response_diagnostic(membership)
+            try:
+                granted = membership.json().get("data")
+            except ValueError:
+                granted = None
+            granted_version = (
+                granted.get("version")
+                if isinstance(granted, dict)
+                and granted.get("user_id") == identity.id
+                and granted.get("role") == project_role
+                else None
+            )
+            if not isinstance(granted_version, int) or granted_version <= 0:
+                granted_version = active_project_membership_version(
+                    self.admin_api,
+                    identity.id,
+                    project_role,
+                )
+        self.track_membership_version(identity.id, granted_version)
 
         context = identity.api.get_json(identity.api.project_path("context"))
         assert context.status_code == 200, response_diagnostic(context)
@@ -322,6 +512,49 @@ class E2EResourceManager:
             identity,
             project_role=project_role,
         )
+
+    def membership_version(self, user_id: int) -> int:
+        """Return the latest tracked version from this run's membership writes."""
+
+        version = self._memberships.get(user_id)
+        assert isinstance(version, int) and version > 0, (
+            f"本次 E2E 运行未跟踪用户 {user_id} 的项目成员版本"
+        )
+        return version
+
+    def track_membership_version(self, user_id: int, version: int) -> None:
+        """Track a returned or reconciled token for one run-owned user."""
+
+        if not any(owned_id == user_id for owned_id, _ in self._users):
+            raise AssertionError(f"拒绝跟踪非本次 E2E 运行用户 {user_id} 的成员版本")
+        if not isinstance(version, int) or version <= 0:
+            raise AssertionError(f"用户 {user_id} 的项目成员版本无效")
+        self._memberships[user_id] = version
+
+    def refresh_membership_version(self, user_id: int) -> int:
+        """Refresh one run-owned user's active membership version."""
+
+        if not any(owned_id == user_id for owned_id, _ in self._users):
+            raise AssertionError(f"拒绝对账非本次 E2E 运行用户 {user_id} 的成员版本")
+        membership = find_project_membership(self.admin_api, user_id)
+        if not isinstance(membership, dict) or membership.get("is_active") is not True:
+            raise AssertionError(f"未找到用户 {user_id} 的有效项目成员授权")
+        version = membership.get("version")
+        self.track_membership_version(user_id, version)
+        return version
+
+    def revoke_project_membership(self, user_id: int):
+        """Revoke one tracked grant with its optimistic concurrency token."""
+
+        version = self.membership_version(user_id)
+        response = self.admin_api.delete(
+            self.project_path(f"memberships/{user_id}"),
+            params={"expected_version": version},
+            retry=False,
+        )
+        if response.status_code in (200, 204, 404):
+            self._memberships.pop(user_id, None)
+        return response
 
     def create_ticket(
         self,
@@ -461,15 +694,16 @@ class E2EResourceManager:
         for client in self._clients:
             client.close()
 
-        for user_id in reversed(self._memberships):
-            membership = self.admin_api.delete(
-                self.project_path(f"memberships/{user_id}")
+        for user_id, version in reversed(tuple(self._memberships.items())):
+            membership_error = cleanup_project_membership(
+                self.admin_api,
+                user_id,
+                version,
             )
-            if membership.status_code not in (200, 204, 404):
-                errors.append(
-                    f"revoke project membership for user {user_id}: "
-                    f"{response_diagnostic(membership)}"
-                )
+            if membership_error is not None:
+                errors.append(f"撤销用户 {user_id} 的项目成员失败：{membership_error}")
+            else:
+                self._memberships.pop(user_id, None)
 
         for user_id, expected_username in reversed(self._users):
             detail = self.admin_api.get_json(f"/platform/users/{user_id}")

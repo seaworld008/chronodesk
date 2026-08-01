@@ -47,11 +47,27 @@ func registerPlatformProjectRoutes(
 	handler *handlers.ProjectHandler,
 ) {
 	routes.GET("/projects", handler.ListPlatform)
+	routes.GET(
+		"/project-creation-context",
+		handler.CreationContext,
+	)
+	routes.GET(
+		"/project-business-units",
+		handler.ListPlatformBusinessUnits,
+	)
 	routes.POST("/projects", handler.Create)
 	routes.POST(
 		"/projects/:projectPublicID/archive",
 		handler.Archive,
 	)
+}
+
+func registerPlatformEmergencyControlRoutes(
+	routes *gin.RouterGroup,
+	handler *handlers.EmergencyControlHandler,
+) {
+	routes.GET("/emergency-controls", handler.Get)
+	routes.PUT("/emergency-controls", handler.Update)
 }
 
 func configureProjectAgentAdminMiddleware(
@@ -222,10 +238,17 @@ func Run() error {
 
 	// 初始化 Agent 原生领域、身份与协议适配器。REST、MCP、A2A 和人类
 	// 评论/附件接口共享同一个事务服务，避免协议间出现业务语义分叉。
-	attachmentStorage, err := services.NewLocalAttachmentStorage(cfg.Agent.AttachmentDir)
+	attachmentStorage, attachmentStaging, err := buildAttachmentStores(
+		appContext,
+		cfg.Agent,
+	)
 	if err != nil {
 		log.Fatal("Failed to initialize Agent attachment storage:", err)
 	}
+	cfg.Agent.AttachmentS3AccessKeyID = ""
+	cfg.Agent.AttachmentS3SecretAccessKey = ""
+	cfg.Agent.AttachmentS3SessionToken = ""
+	cfg.Agent.AttachmentS3KMSKeyID = ""
 	executionGuard, err := services.NewRedisAgentExecutionGuard(
 		db.Redis,
 		[]byte(cfg.Agent.CredentialPepper),
@@ -242,7 +265,7 @@ func Run() error {
 		EventSource:                      strings.TrimRight(cfg.Agent.Issuer, "/") + "/events",
 		DefaultCredentialTTL:             cfg.Agent.CredentialTTL,
 		AttachmentStorage:                attachmentStorage,
-		AttachmentStaging:                attachmentStorage,
+		AttachmentStaging:                attachmentStaging,
 		AttachmentMaxBytes:               cfg.Agent.MaxAttachmentBytes,
 		LoopThreshold:                    cfg.Agent.LoopThreshold,
 		LoopWindow:                       cfg.Agent.LoopWindow,
@@ -373,6 +396,9 @@ func Run() error {
 			ModelProviders:       knowledgeModelProviders,
 			ProjectAuthorization: projectService,
 			Events:               nativeService,
+			AttachmentStorage:    attachmentStorage,
+			StorageBucket:        knowledgeStorageBucket(cfg.Agent),
+			IdempotencyCompleter: nativeService,
 		},
 	)
 	if err != nil {
@@ -432,6 +458,11 @@ func Run() error {
 		)
 	if err != nil {
 		log.Fatal("Failed to initialize integration management service: ", err)
+	}
+	if err := integrationManagementService.ConfigureCursorSigningKey(
+		[]byte(cfg.JWT.Secret),
+	); err != nil {
+		log.Fatal("Failed to configure integration timeline cursors: ", err)
 	}
 	credentialStore := agentplatform.NewCredentialStore(
 		nativeService,
@@ -499,6 +530,30 @@ func Run() error {
 		defer agentWorkers.Done()
 		runtimeControl.Run(agentBackground, 2*time.Second)
 	}()
+	hostname, _ := os.Hostname()
+	knowledgeObjectCleanupWorker, err :=
+		services.NewKnowledgeObjectCleanupWorker(
+			db.DB,
+			attachmentStorage,
+			knowledgeObjectCleanupWorkerID(
+				hostname,
+				os.Getpid(),
+			),
+		)
+	if err != nil {
+		log.Fatal(
+			"Failed to initialize knowledge object cleanup worker: ",
+			err,
+		)
+	}
+	agentWorkers.Add(1)
+	go func() {
+		defer agentWorkers.Done()
+		runKnowledgeObjectCleanupWorker(
+			agentBackground,
+			knowledgeObjectCleanupWorker,
+		)
+	}()
 	a2aStore := a2a.NewGormStoreWithProtector(db.DB, secretProtector)
 	a2aBackend, err := agentplatform.NewA2ABackend(db.DB, nativeService)
 	if err != nil {
@@ -543,8 +598,51 @@ func Run() error {
 	if err != nil {
 		log.Fatal("Failed to initialize A2A server:", err)
 	}
-	adminAuditService := services.NewAdminAuditService(db.DB)
+	adminAuditService, err := services.NewAdminAuditServiceWithCursorKey(
+		db.DB,
+		[]byte(cfg.JWT.Secret),
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize admin audit service:", err)
+	}
+	auditExportStorage, err := services.NewLocalAttachmentStorage(
+		cfg.AuditExport.StorageDir,
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize platform audit export storage:", err)
+	}
+	adminAuditExportService, err := services.NewAdminAuditExportService(
+		db.DB,
+		auditExportStorage,
+		adminAuditService,
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize platform audit export service:", err)
+	}
+	adminAuditExportWorker, err := services.NewAdminAuditExportWorker(
+		adminAuditExportService,
+		cfg.AuditExport.WorkerID,
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize platform audit export worker:", err)
+	}
+	agentWorkers.Add(1)
+	go func() {
+		defer agentWorkers.Done()
+		runAdminAuditExportWorker(
+			agentBackground,
+			adminAuditExportWorker,
+			adminAuditExportService,
+			cfg.AuditExport.PollInterval,
+			cfg.AuditExport.CleanupInterval,
+		)
+	}()
 	automationService := services.NewAutomationServiceWithAgentNative(db.DB, nativeService)
+	if err := automationService.ConfigureListCursor(
+		[]byte(cfg.JWT.Secret),
+	); err != nil {
+		log.Fatal("Failed to initialize Automation list cursor:", err)
+	}
 	slaEscalationConsumer := services.NewEscalationService(db.DB)
 	slaEscalationConsumer.SetAgentNativeService(nativeService)
 
@@ -760,6 +858,12 @@ func Run() error {
 		cfg.Agent.MaxAttachmentBytes,
 		mcpPublisher,
 	)
+	if err := agentAPI.ConfigureTicketContentListCursor(
+		[]byte(cfg.JWT.Secret),
+	); err != nil {
+		log.Fatal("Failed to initialize Agent ticket content pagination:", err)
+	}
+	agentAPI.SetKnowledgeService(knowledgeService)
 	agentAPI.RegisterRoutes(agentProjectAPI)
 	agentAdmin := agentplatform.NewAdminHandler(
 		db.DB,
@@ -768,6 +872,16 @@ func Run() error {
 		cfg.Agent.CredentialTTL,
 		[]byte(cfg.Agent.CredentialPepper),
 	)
+	agentAdminLists, err := agentplatform.NewAdminListService(
+		db.DB,
+		[]byte(cfg.JWT.Secret),
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize Agent administrator lists:", err)
+	}
+	if err := agentAdmin.ConfigureListService(agentAdminLists); err != nil {
+		log.Fatal("Failed to configure Agent administrator lists:", err)
+	}
 
 	// API 路由组
 	api := r.Group("/api")
@@ -812,6 +926,12 @@ func Run() error {
 		workbench.Use(ginAdapter(authModule.Handler.RequireAuth))
 		workbench.Use(authenticatedRateLimit)
 		workbench.GET("/tickets", crossProjectWorkbenchHandler.ListTickets)
+		workbench.GET(
+			"/dashboard",
+			handlers.NewWorkbenchDashboardHandler(
+				crossProjectWorkbenchService,
+			).Get,
+		)
 
 		// 项目是所有工单、配置与集成资源的唯一运行边界。
 		projectHandler := handlers.NewProjectHandler(projectService)
@@ -840,6 +960,10 @@ func Run() error {
 		projectScoped.GET("/context", projectHandler.Current)
 		projectScoped.GET("/queues", projectHandler.ListQueues)
 		projectScoped.GET("/memberships", projectHandler.ListMemberships)
+		projectScoped.GET(
+			"/membership-candidates",
+			projectHandler.SearchMembershipCandidates,
+		)
 		projectCommands.POST(
 			"/memberships",
 			projectHandler.UpsertMembership,
@@ -968,6 +1092,7 @@ func Run() error {
 		trustedDeviceService := services.NewTrustedDeviceService(db.DB)
 		userHandler := handlers.NewUserHandler(userService, trustedDeviceService)
 		adminAuditHandler := handlers.NewAdminAuditHandler(adminAuditService)
+		adminAuditHandler.SetExportService(adminAuditExportService)
 		r.GET("/uploads/avatars/:userID/:filename", userHandler.GetAvatar)
 
 		user := api.Group("/user")
@@ -987,6 +1112,20 @@ func Run() error {
 		platform := api.Group("/platform")
 		platform.Use(ginAdapter(authModule.Handler.RequireAuth))
 		platform.Use(authenticatedRateLimit)
+
+		emergencyControls := platform.Group("")
+		emergencyControls.Use(
+			middleware.LogAdminOperation(adminAuditService),
+		)
+		emergencyControls.Use(ginAdapter(
+			authModule.Handler.RequirePlatformRoles(
+				auth.PlatformRoleEmergencyOperator,
+			),
+		))
+		registerPlatformEmergencyControlRoutes(
+			emergencyControls,
+			handlers.NewEmergencyControlHandler(runtimeControl),
+		)
 
 		platformAdmin := platform.Group("")
 		platformAdmin.Use(ginAdapter(authModule.Handler.RequirePlatformRoles(
@@ -1067,6 +1206,15 @@ func Run() error {
 			auth.PlatformRoleSecurityAuditor,
 		)))
 		platformAudit.GET("/audit-logs", adminAuditHandler.GetAuditLogs)
+		platformAudit.GET("/audit-logs/:id", adminAuditHandler.GetAuditLog)
+		auditExports := platformAudit.Group("/audit-exports")
+		auditExports.Use(middleware.LogAdminOperation(adminAuditService))
+		auditExports.POST("", adminAuditHandler.CreateAuditExport)
+		auditExports.GET("/:publicID", adminAuditHandler.GetAuditExport)
+		auditExports.GET(
+			"/:publicID/download",
+			adminAuditHandler.DownloadAuditExport,
+		)
 
 		// 通知系统服务和处理器
 		notificationService := services.NewNotificationServiceWithProtector(
@@ -1212,6 +1360,11 @@ func Run() error {
 			secretProtector,
 			notificationService,
 		)
+		if err := webhookHandler.ConfigureListCursor(
+			[]byte(cfg.JWT.Secret),
+		); err != nil {
+			log.Fatal("Failed to initialize Webhook list cursor:", err)
+		}
 		webhooks := projectScoped.Group("/webhooks")
 		webhooks.Use(middleware.LogAdminOperation(adminAuditService))
 		{
@@ -1342,6 +1495,42 @@ func trustedProtocolOrigins(origins []string) []string {
 	return trusted
 }
 
+func runAdminAuditExportWorker(
+	ctx context.Context,
+	worker *services.AdminAuditExportWorker,
+	exportService *services.AdminAuditExportService,
+	pollInterval time.Duration,
+	cleanupInterval time.Duration,
+) {
+	poll := time.NewTicker(pollInterval)
+	cleanup := time.NewTicker(cleanupInterval)
+	defer poll.Stop()
+	defer cleanup.Stop()
+	process := func() {
+		if _, err := worker.ProcessOne(ctx); err != nil &&
+			ctx.Err() == nil {
+			// Database and storage errors can contain sensitive values. Keep
+			// the operator signal fixed; the durable job exposes only a safe
+			// failure code.
+			log.Print("Platform audit export worker iteration failed")
+		}
+	}
+	process()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-poll.C:
+			process()
+		case <-cleanup.C:
+			if _, err := exportService.CleanupExpired(ctx, 100); err != nil &&
+				ctx.Err() == nil {
+				log.Print("Platform audit export cleanup iteration failed")
+			}
+		}
+	}
+}
+
 func runAgentOutboxWorker(
 	ctx context.Context,
 	native *services.AgentNativeService,
@@ -1365,4 +1554,64 @@ func runAgentOutboxWorker(
 		case <-ticker.C:
 		}
 	}
+}
+
+func runKnowledgeObjectCleanupWorker(
+	ctx context.Context,
+	worker *services.KnowledgeObjectCleanupWorker,
+) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	process := func() {
+		result, err := worker.ProcessBatch(ctx, 25)
+		if err != nil && ctx.Err() == nil {
+			// Storage/provider errors may include endpoints, bucket names or
+			// credential diagnostics. Durable rows contain only fixed failure
+			// codes and the operator log intentionally stays generic.
+			log.Print("Knowledge object cleanup iteration failed")
+		}
+		if result.Failed > 0 {
+			log.Printf(
+				"Knowledge object cleanup deferred %d intent(s)",
+				result.Failed,
+			)
+		}
+	}
+	process()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			process()
+		}
+	}
+}
+
+func knowledgeObjectCleanupWorkerID(
+	hostname string,
+	processID int,
+) string {
+	normalized := strings.Map(func(character rune) rune {
+		switch {
+		case character >= 'a' && character <= 'z',
+			character >= 'A' && character <= 'Z',
+			character >= '0' && character <= '9',
+			strings.ContainsRune("._:-", character):
+			return character
+		default:
+			return '-'
+		}
+	}, strings.TrimSpace(hostname))
+	if normalized == "" {
+		normalized = "chronodesk"
+	}
+	if len(normalized) > 40 {
+		normalized = normalized[:40]
+	}
+	return fmt.Sprintf(
+		"chronodesk-%s-%d-knowledge-objects",
+		normalized,
+		processID,
+	)
 }

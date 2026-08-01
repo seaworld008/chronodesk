@@ -2,6 +2,8 @@ package services
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -25,6 +27,14 @@ func (service *KnowledgeService) ExecuteIndexRebuildOutbox(
 	generation uint64,
 ) error {
 	if service == nil || service.db == nil || service.searchIndex == nil {
+		return ErrKnowledgeIndexUnavailable
+	}
+	batchIndex, supportsBatches :=
+		service.searchIndex.(HybridSearchIndexBatchReplacer)
+	if !supportsBatches {
+		// Never regress to collecting a whole project in memory merely because
+		// an alternate index implementation has not adopted the bounded
+		// rebuild contract.
 		return ErrKnowledgeIndexUnavailable
 	}
 	if err := requireExternalIOOutsideProjectTransaction(
@@ -79,10 +89,11 @@ func (service *KnowledgeService) ExecuteIndexRebuildOutbox(
 	}
 
 	var (
-		documents    []HybridIndexDocument
-		sourceDigest string
-		policy       models.ProjectModelPolicy
-		provider     ModelProvider
+		sourceDigest  string
+		documentCount int
+		policy        models.ProjectModelPolicy
+		provider      ModelProvider
+		embed         bool
 	)
 	err = scopeddb.WithProjectScopeContextTransaction(
 		ctx,
@@ -90,38 +101,31 @@ func (service *KnowledgeService) ExecuteIndexRebuildOutbox(
 		operation.Scope,
 		func(scopedContext context.Context) error {
 			var snapshotErr error
-			documents, sourceDigest, snapshotErr =
-				service.loadKnowledgeIndexDocuments(
-					scopedContext,
-					operation.Scope,
-				)
-			if snapshotErr != nil || len(documents) == 0 {
-				return snapshotErr
-			}
 			policy, provider, snapshotErr =
 				service.resolveKnowledgeModelPolicy(
 					scopedContext,
 					operation.Scope,
 				)
-			return snapshotErr
+			switch {
+			case snapshotErr == nil:
+				embed = true
+				return nil
+			case errors.Is(
+				snapshotErr,
+				ErrKnowledgeModelPolicyUnavailable,
+			):
+				// Lexical indexing is the safe baseline. A deployment may add
+				// an approved model policy later and rebuild the same
+				// PostgreSQL authority into a hybrid generation.
+				policy = models.ProjectModelPolicy{}
+				provider = nil
+				embed = false
+				return nil
+			default:
+				return snapshotErr
+			}
 		},
 	)
-	if err == nil && len(documents) > 0 {
-		if boundaryErr := requireExternalIOOutsideProjectTransaction(
-			ctx,
-			"knowledge index embedding",
-		); boundaryErr != nil {
-			err = boundaryErr
-		} else {
-			documents, err = embedKnowledgeIndexDocuments(
-				ctx,
-				operation.Scope,
-				documents,
-				policy,
-				provider,
-			)
-		}
-	}
 	if err == nil {
 		if boundaryErr := requireExternalIOOutsideProjectTransaction(
 			ctx,
@@ -129,16 +133,106 @@ func (service *KnowledgeService) ExecuteIndexRebuildOutbox(
 		); boundaryErr != nil {
 			err = boundaryErr
 		} else {
-			err = service.searchIndex.ReplaceProject(
+			cursor := ""
+			exhausted := false
+			digest := sha256.New()
+			firstDigestEntry := true
+			source := func(
+				sourceContext context.Context,
+			) ([]HybridIndexDocument, error) {
+				for {
+					if exhausted {
+						return nil, nil
+					}
+					var (
+						documents    []HybridIndexDocument
+						nextCursor   string
+						batchIsFinal bool
+					)
+					loadErr := scopeddb.
+						WithProjectScopeContextTransaction(
+							sourceContext,
+							service.db,
+							operation.Scope,
+							func(scopedContext context.Context) error {
+								var batchErr error
+								documents,
+									nextCursor,
+									batchIsFinal,
+									batchErr =
+									service.
+										loadKnowledgeIndexDocumentBatch(
+											scopedContext,
+											operation.Scope,
+											cursor,
+											service.indexBatchSize,
+										)
+								return batchErr
+							},
+						)
+					if loadErr != nil {
+						return nil, loadErr
+					}
+					if !batchIsFinal && nextCursor <= cursor {
+						return nil, errors.New(
+							"knowledge index keyset cursor did not advance",
+						)
+					}
+					cursor = nextCursor
+					exhausted = batchIsFinal
+					if len(documents) == 0 {
+						if exhausted {
+							return nil, nil
+						}
+						continue
+					}
+					if embed {
+						if boundaryErr :=
+							requireExternalIOOutsideProjectTransaction(
+								sourceContext,
+								"knowledge index embedding",
+							); boundaryErr != nil {
+							return nil, boundaryErr
+						}
+						documents, loadErr =
+							embedKnowledgeIndexDocuments(
+								sourceContext,
+								operation.Scope,
+								documents,
+								policy,
+								provider,
+							)
+						if loadErr != nil {
+							return nil, loadErr
+						}
+					}
+					for _, document := range documents {
+						if !firstDigestEntry {
+							_, _ = digest.Write([]byte{'\n'})
+						}
+						firstDigestEntry = false
+						_, _ = digest.Write([]byte(
+							document.ChunkID + ":" +
+								document.ContentHash + ":" +
+								knowledgeSubjectsDigest(
+									document.ACLSubjects,
+								),
+						))
+					}
+					documentCount += len(documents)
+					return documents, nil
+				}
+			}
+			err = batchIndex.ReplaceProjectBatches(
 				ctx,
 				HybridIndexReplacement{
 					OrganizationID: operation.Scope.OrganizationID,
 					ProjectID:      operation.Scope.ProjectID,
 					Generation:     generation,
-					SourceDigest:   sourceDigest,
-					Documents:      documents,
 				},
+				source,
 			)
+			sourceDigest = hex.EncodeToString(digest.Sum(nil))
 		}
 	}
 	if err != nil {
@@ -180,7 +274,7 @@ func (service *KnowledgeService) ExecuteIndexRebuildOutbox(
 			now := service.now().UTC()
 			state.Generation = generation
 			state.SourceDigest = sourceDigest
-			state.DocumentCount = len(documents)
+			state.DocumentCount = documentCount
 			state.FailureDetail = ""
 			state.CompletedAt = &now
 			if state.DesiredGeneration > generation {

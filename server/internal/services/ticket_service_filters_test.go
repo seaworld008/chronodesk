@@ -1,6 +1,8 @@
 package services
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -197,11 +199,11 @@ func TestGetTicketsFilters_Source(t *testing.T) {
 	}
 }
 
-func TestGetTickets_SortFieldInjectionFallsBackToCreatedAt(t *testing.T) {
+func TestGetTicketsRejectsInvalidSortField(t *testing.T) {
 	db := setupFilterTestDB(t)
 	creator := seedUser(t, db, "sort-creator")
 
-	older := seedTicket(t, db, models.Ticket{
+	seedTicket(t, db, models.Ticket{
 		TicketNumber: "S-001",
 		Title:        "Older ticket",
 		Description:  "desc",
@@ -212,7 +214,7 @@ func TestGetTickets_SortFieldInjectionFallsBackToCreatedAt(t *testing.T) {
 		CreatedByID:  &creator.ID,
 	})
 	time.Sleep(10 * time.Millisecond)
-	newer := seedTicket(t, db, models.Ticket{
+	seedTicket(t, db, models.Ticket{
 		TicketNumber: "S-002",
 		Title:        "Newer ticket",
 		Description:  "desc",
@@ -226,20 +228,126 @@ func TestGetTickets_SortFieldInjectionFallsBackToCreatedAt(t *testing.T) {
 	svc := newTicketServiceForTest(t, db)
 	ctx := testProjectOperationContext(t, db, models.HumanActor(creator.ID))
 
-	tickets, _, err := svc.GetTickets(ctx, TicketFilters{
+	_, _, err := svc.GetTickets(ctx, TicketFilters{
 		SortBy:    "bad_column",
 		SortOrder: "DESC",
 	})
-	if err != nil {
-		t.Fatalf("expected injected sort field to be sanitized, got error: %v", err)
+	if !errors.Is(err, ErrInvalidTicketListQuery) {
+		t.Fatalf("injected sort error = %v", err)
 	}
-	if len(tickets) < 2 {
-		t.Fatalf("expected at least 2 tickets, got %d", len(tickets))
-	}
+}
 
-	// Invalid sort field should fall back to created_at DESC.
-	if tickets[0].ID != newer.ID {
-		t.Fatalf("expected newest ticket first after fallback sort, got first id=%d want=%d (older id=%d)", tickets[0].ID, newer.ID, older.ID)
+func TestTicketPreviewServicesAreBoundedAndStable(t *testing.T) {
+	db := setupFilterTestDB(t)
+	creator := seedUser(t, db, "preview-creator")
+	assignee := seedUser(t, db, "preview-assignee")
+	ctx := testProjectOperationContext(t, db, models.HumanActor(creator.ID))
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Now().UTC().Truncate(time.Second)
+	items := make([]models.Ticket, 0, 150)
+	for index := 0; index < 150; index++ {
+		items = append(items, models.Ticket{
+			CreatedAt:           createdAt,
+			OrganizationID:      operation.Scope.OrganizationID,
+			ProjectID:           operation.Scope.ProjectID,
+			TicketNumber:        fmt.Sprintf("PREVIEW-%03d", index),
+			Title:               fmt.Sprintf("Preview %03d", index),
+			Description:         "preview list",
+			Status:              models.TicketStatusOpen,
+			Priority:            models.TicketPriorityNormal,
+			Type:                models.TicketTypeRequest,
+			Source:              models.TicketSourceWeb,
+			CreatedByID:         &creator.ID,
+			AssignedToID:        &assignee.ID,
+			CreatedByActorType:  models.ActorTypeHuman,
+			CreatedByActorID:    fmt.Sprint(creator.ID),
+			AssignedToActorType: models.ActorTypeHuman,
+			AssignedToActorID:   fmt.Sprint(assignee.ID),
+		})
+	}
+	if err := db.Create(&items).Error; err != nil {
+		t.Fatal(err)
+	}
+	service := newTicketServiceForTest(t, db)
+	tickets, total, err := service.GetUserTickets(
+		ctx,
+		assignee.ID,
+		"",
+		"",
+		DirectoryPageRequest{
+			Page:      1,
+			PageSize:  100,
+			SortBy:    "created_at",
+			SortOrder: "desc",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 150 || len(tickets) != 100 {
+		t.Fatalf("preview page total=%d len=%d", total, len(tickets))
+	}
+	for index := 1; index < len(tickets); index++ {
+		if tickets[index-1].ID <= tickets[index].ID {
+			t.Fatalf(
+				"preview order is not stable descending: %d then %d",
+				tickets[index-1].ID,
+				tickets[index].ID,
+			)
+		}
+	}
+	secondPage, secondTotal, err := service.GetUserTickets(
+		ctx,
+		assignee.ID,
+		"",
+		"",
+		DirectoryPageRequest{
+			Page:      2,
+			PageSize:  100,
+			SortBy:    "created_at",
+			SortOrder: "desc",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondTotal != 150 || len(secondPage) != 50 {
+		t.Fatalf(
+			"preview second page total=%d len=%d",
+			secondTotal,
+			len(secondPage),
+		)
+	}
+	if tickets[len(tickets)-1].ID == secondPage[0].ID {
+		t.Fatalf("preview pages repeated ticket id %d", secondPage[0].ID)
+	}
+	for _, page := range []DirectoryPageRequest{
+		{Page: 0, PageSize: 25, SortBy: "created_at", SortOrder: "desc"},
+		{Page: -1, PageSize: 25, SortBy: "created_at", SortOrder: "desc"},
+		{Page: 1, PageSize: 101, SortBy: "created_at", SortOrder: "desc"},
+		{Page: 1, PageSize: 25, SortBy: "id", SortOrder: "desc"},
+		{Page: 1, PageSize: 25, SortBy: "created_at", SortOrder: "sideways"},
+	} {
+		if _, _, listErr := service.GetUserTickets(
+			ctx,
+			assignee.ID,
+			"",
+			"",
+			page,
+		); !errors.Is(listErr, ErrInvalidTicketListQuery) {
+			t.Fatalf("user preview page %+v error=%v", page, listErr)
+		}
+		if _, _, listErr := service.GetUnassignedTickets(
+			ctx,
+			"",
+			"",
+			page,
+		); !errors.Is(listErr, ErrInvalidTicketListQuery) {
+			t.Fatalf("unassigned preview page %+v error=%v", page, listErr)
+		}
 	}
 }
 

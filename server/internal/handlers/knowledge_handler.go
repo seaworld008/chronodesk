@@ -14,7 +14,11 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
-const knowledgeRequestBodyLimit = 8 << 20
+const (
+	knowledgeRequestBodyLimit         = 8 << 20
+	knowledgeAuthoredRequestBodyLimit = services.MaxAuthoredMarkdownBytes +
+		(64 << 10)
+)
 
 type KnowledgeHandler struct {
 	service  *services.KnowledgeService
@@ -32,19 +36,12 @@ func NewKnowledgeHandler(service *services.KnowledgeService) *KnowledgeHandler {
 // group must already use ProjectScopeMiddleware.
 func (handler *KnowledgeHandler) RegisterRoutes(projectGroup *gin.RouterGroup) {
 	knowledge := projectGroup.Group("/knowledge")
-	knowledge.POST("/articles", handler.CreateArticle)
-	knowledge.POST(
+	knowledge.GET("/articles", handler.ListArticles)
+	knowledge.GET(
 		"/articles/:articleID/versions",
-		handler.RegisterVersion,
+		handler.ListArticleVersions,
 	)
-	knowledge.POST(
-		"/articles/:articleID/access-grants",
-		handler.GrantArticleAccess,
-	)
-	knowledge.POST(
-		"/versions/:versionID/ingestions",
-		handler.QueueIngestion,
-	)
+	knowledge.GET("/ingestions", handler.ListIngestions)
 	// Virus scan, parsing, chunk persistence, and ingestion completion are
 	// worker-only commands. Exposing them on the human project API would let a
 	// browser caller forge a clean scan or inject trusted index content.
@@ -52,13 +49,7 @@ func (handler *KnowledgeHandler) RegisterRoutes(projectGroup *gin.RouterGroup) {
 		"/versions/:versionID/publication",
 		handler.PublishVersion,
 	)
-	knowledge.POST(
-		"/citations/:citationID/feedback",
-		handler.RecordFeedback,
-	)
 	knowledge.GET("/index-rebuilds/current", handler.GetIndexState)
-	knowledge.GET("/model-policy", handler.GetModelPolicy)
-	knowledge.PUT("/model-policy", handler.UpdateModelPolicy)
 }
 
 // RegisterExternalRoutes mounts knowledge operations that cross a model or
@@ -69,32 +60,149 @@ func (handler *KnowledgeHandler) RegisterExternalRoutes(
 	projectGroup *gin.RouterGroup,
 ) {
 	knowledge := projectGroup.Group("/knowledge")
+	knowledge.POST("/articles", handler.CreateArticle)
+	knowledge.GET(
+		"/articles/:articleID/document",
+		handler.GetArticleDocument,
+	)
+	knowledge.POST(
+		"/articles/:articleID/drafts",
+		handler.CreateArticleDraft,
+	)
 	knowledge.POST("/index-rebuilds", handler.RebuildIndex)
 	knowledge.POST("/searches", handler.Search)
 }
 
 type createKnowledgeArticleRequest struct {
-	Key                string `json:"key"`
-	Title              string `json:"title"`
-	Summary            string `json:"summary"`
-	GrantProjectAccess bool   `json:"grant_project_access"`
+	Key                 string `json:"key"`
+	Title               string `json:"title"`
+	Summary             string `json:"summary"`
+	Markdown            string `json:"markdown"`
+	SourceTicketID      uint   `json:"source_ticket_id"`
+	SourceAttachmentIDs []uint `json:"source_attachment_ids"`
+}
+
+func (handler *KnowledgeHandler) ListArticles(c *gin.Context) {
+	if !handler.requireProjectAccess(c, false) {
+		return
+	}
+	query, err := parseDirectoryListQuery(
+		c.Request.URL.RawQuery,
+		directoryListQuerySpec{
+			DefaultSortBy:    "updated_at",
+			DefaultSortOrder: "desc",
+			SortFields: map[string]struct{}{
+				"created_at": {},
+				"updated_at": {},
+				"key":        {},
+				"title":      {},
+				"status":     {},
+			},
+			FilterFields: map[string]struct{}{
+				"status": {},
+				"q":      {},
+				"view":   {},
+			},
+		},
+	)
+	if err != nil {
+		handler.response.BadRequest(c, "知识文章查询参数无效")
+		return
+	}
+	status, _ := query.value("status")
+	keyword, _ := query.value("q")
+	view, _ := query.value("view")
+	if keyword != "" && len([]rune(keyword)) > 200 {
+		handler.response.BadRequest(c, "知识文章查询参数无效")
+		return
+	}
+	access, ok := ProjectAccessFromGin(c)
+	if !ok {
+		handler.response.Forbidden(c, "未解析可信项目范围")
+		return
+	}
+	manageAll := view == "manage"
+	managedByActor := view == "mine"
+	if view != "" && !manageAll && !managedByActor {
+		handler.response.BadRequest(c, "知识文章查询参数无效")
+		return
+	}
+	if (manageAll &&
+		access.Role != models.ProjectRoleAdmin &&
+		access.Role != models.ProjectRoleManager) ||
+		(managedByActor && !access.CanCreateKnowledgeDrafts) {
+		handler.response.Forbidden(c, "当前成员无权使用该知识视图")
+		return
+	}
+	page, err := handler.service.ListArticles(
+		c.Request.Context(),
+		services.KnowledgeArticleListFilter{
+			Status:         models.KnowledgeArticleStatus(status),
+			Query:          keyword,
+			ManageAll:      manageAll,
+			ManagedByActor: managedByActor,
+		},
+		services.DirectoryPageRequest{
+			Page:      query.Page,
+			PageSize:  query.PageSize,
+			SortBy:    query.SortBy,
+			SortOrder: query.SortOrder,
+		},
+	)
+	if errors.Is(err, services.ErrDirectoryListQuery) {
+		handler.response.BadRequest(c, "知识文章查询参数无效")
+		return
+	}
+	if err != nil {
+		handler.writeError(c, err)
+		return
+	}
+	items := make([]knowledgeArticleResponse, 0, len(page.Items))
+	for index := range page.Items {
+		items = append(
+			items,
+			newKnowledgeArticleDirectoryResponse(
+				page.Items[index],
+				manageAll || managedByActor,
+			),
+		)
+	}
+	handler.response.List(
+		c,
+		items,
+		page.Total,
+		page.Page,
+		page.PageSize,
+		"获取知识文章成功",
+	)
 }
 
 func (handler *KnowledgeHandler) CreateArticle(c *gin.Context) {
-	if !handler.requireProjectAccess(c, true) {
+	if !handler.requireProjectDraftCreationAccess(c) {
 		return
 	}
 	var request createKnowledgeArticleRequest
-	if !handler.bindJSON(c, &request) {
+	if !handler.bindAuthoredJSON(c, &request) ||
+		!handler.validateAuthoredInput(
+			c,
+			request.Markdown,
+			request.SourceTicketID,
+			request.SourceAttachmentIDs,
+		) {
 		return
 	}
-	article, err := handler.service.CreateArticle(
+	result, err := handler.service.CreateAuthoredArticle(
 		c.Request.Context(),
-		services.CreateKnowledgeArticleInput{
-			Key:                strings.TrimSpace(request.Key),
-			Title:              strings.TrimSpace(request.Title),
-			Summary:            strings.TrimSpace(request.Summary),
-			GrantProjectAccess: request.GrantProjectAccess,
+		services.CreateAuthoredArticleInput{
+			Key:            strings.TrimSpace(request.Key),
+			Title:          strings.TrimSpace(request.Title),
+			Summary:        strings.TrimSpace(request.Summary),
+			Markdown:       request.Markdown,
+			SourceTicketID: request.SourceTicketID,
+			SourceAttachmentIDs: append(
+				[]uint(nil),
+				request.SourceAttachmentIDs...,
+			),
 		},
 	)
 	if err != nil {
@@ -103,8 +211,140 @@ func (handler *KnowledgeHandler) CreateArticle(c *gin.Context) {
 	}
 	handler.response.Created(
 		c,
-		newKnowledgeArticleResponse(*article),
-		"知识文章创建成功",
+		newKnowledgeAuthoredResponse(*result),
+		"知识文章草稿创建成功",
+	)
+}
+
+func (handler *KnowledgeHandler) requireProjectDraftCreationAccess(
+	c *gin.Context,
+) bool {
+	if !handler.requireProjectAccess(c, false) {
+		return false
+	}
+	access, ok := ProjectAccessFromGin(c)
+	if !ok ||
+		(!access.CanCreateKnowledgeDrafts &&
+			access.Role != models.ProjectRoleAdmin &&
+			access.Role != models.ProjectRoleManager) {
+		handler.response.Forbidden(
+			c,
+			"当前成员未获知识草稿贡献授权",
+		)
+		return false
+	}
+	return true
+}
+
+type createKnowledgeArticleDraftRequest struct {
+	Title               string `json:"title"`
+	Markdown            string `json:"markdown"`
+	SourceTicketID      uint   `json:"source_ticket_id"`
+	SourceAttachmentIDs []uint `json:"source_attachment_ids"`
+}
+
+func (handler *KnowledgeHandler) CreateArticleDraft(c *gin.Context) {
+	if !handler.requireProjectDraftCreationAccess(c) {
+		return
+	}
+	articleID, ok := handler.requiredPathID(
+		c,
+		"articleID",
+		"知识文章标识无效",
+	)
+	if !ok {
+		return
+	}
+	var request createKnowledgeArticleDraftRequest
+	if !handler.bindAuthoredJSON(c, &request) ||
+		!handler.validateAuthoredInput(
+			c,
+			request.Markdown,
+			request.SourceTicketID,
+			request.SourceAttachmentIDs,
+		) {
+		return
+	}
+	result, err := handler.service.CreateAuthoredVersion(
+		c.Request.Context(),
+		articleID,
+		services.CreateAuthoredVersionInput{
+			Title:          strings.TrimSpace(request.Title),
+			Markdown:       request.Markdown,
+			SourceTicketID: request.SourceTicketID,
+			SourceAttachmentIDs: append(
+				[]uint(nil),
+				request.SourceAttachmentIDs...,
+			),
+		},
+	)
+	if err != nil {
+		handler.writeError(c, err)
+		return
+	}
+	handler.response.Created(
+		c,
+		newKnowledgeAuthoredResponse(*result),
+		"知识文章新草稿创建成功",
+	)
+}
+
+func (handler *KnowledgeHandler) GetArticleDocument(c *gin.Context) {
+	if !handler.requireProjectAccess(c, false) {
+		return
+	}
+	articleID, ok := handler.requiredPathID(
+		c,
+		"articleID",
+		"知识文章标识无效",
+	)
+	if !ok {
+		return
+	}
+	query := c.Request.URL.Query()
+	for key, values := range query {
+		if (key != "version_id" && key != "prefer_latest_draft") ||
+			len(values) != 1 {
+			handler.response.BadRequest(c, "知识正文查询参数无效")
+			return
+		}
+	}
+	versionID := strings.TrimSpace(query.Get("version_id"))
+	if _, present := query["version_id"]; present && versionID == "" {
+		handler.response.BadRequest(c, "知识正文查询参数无效")
+		return
+	}
+	preferLatestDraft := false
+	if values, present := query["prefer_latest_draft"]; present {
+		switch strings.TrimSpace(values[0]) {
+		case "true":
+			preferLatestDraft = true
+		case "false":
+		default:
+			handler.response.BadRequest(c, "知识正文查询参数无效")
+			return
+		}
+	}
+	if versionID != "" && preferLatestDraft {
+		handler.response.BadRequest(c, "知识正文查询参数无效")
+		return
+	}
+	document, err := handler.service.GetArticleDocument(
+		c.Request.Context(),
+		articleID,
+		services.GetArticleDocumentInput{
+			VersionID:         versionID,
+			PreferLatestDraft: preferLatestDraft,
+		},
+	)
+	if err != nil {
+		handler.writeError(c, err)
+		return
+	}
+	handler.response.Success(
+		c,
+		newKnowledgeDocumentResponse(*document),
+		"获取知识正文成功",
 	)
 }
 
@@ -118,6 +358,77 @@ type registerKnowledgeVersionRequest struct {
 	MimeType        string `json:"mime_type"`
 	SizeBytes       int64  `json:"size_bytes"`
 	ContentHash     string `json:"content_hash"`
+}
+
+func (handler *KnowledgeHandler) ListArticleVersions(c *gin.Context) {
+	if !handler.requireProjectAccess(c, true) {
+		return
+	}
+	articleID, ok := handler.requiredPathID(
+		c,
+		"articleID",
+		"知识文章标识无效",
+	)
+	if !ok {
+		return
+	}
+	query, err := parseDirectoryListQuery(
+		c.Request.URL.RawQuery,
+		directoryListQuerySpec{
+			DefaultSortBy:    "version",
+			DefaultSortOrder: "desc",
+			SortFields: map[string]struct{}{
+				"created_at": {},
+				"updated_at": {},
+				"version":    {},
+				"status":     {},
+			},
+			FilterFields: map[string]struct{}{
+				"status":     {},
+				"virus_scan": {},
+			},
+		},
+	)
+	if err != nil {
+		handler.response.BadRequest(c, "知识版本查询参数无效")
+		return
+	}
+	status, _ := query.value("status")
+	virusScan, _ := query.value("virus_scan")
+	page, err := handler.service.ListArticleVersions(
+		c.Request.Context(),
+		articleID,
+		services.KnowledgeVersionListFilter{
+			Status:    models.KnowledgeVersionStatus(status),
+			VirusScan: models.VirusScanStatus(virusScan),
+		},
+		services.DirectoryPageRequest{
+			Page:      query.Page,
+			PageSize:  query.PageSize,
+			SortBy:    query.SortBy,
+			SortOrder: query.SortOrder,
+		},
+	)
+	if errors.Is(err, services.ErrDirectoryListQuery) {
+		handler.response.BadRequest(c, "知识版本查询参数无效")
+		return
+	}
+	if err != nil {
+		handler.writeError(c, err)
+		return
+	}
+	items := make([]knowledgeVersionResponse, 0, len(page.Items))
+	for index := range page.Items {
+		items = append(items, newKnowledgeVersionResponse(page.Items[index]))
+	}
+	handler.response.List(
+		c,
+		items,
+		page.Total,
+		page.Page,
+		page.PageSize,
+		"获取知识版本成功",
+	)
 }
 
 func (handler *KnowledgeHandler) RegisterVersion(c *gin.Context) {
@@ -248,6 +559,68 @@ func (handler *KnowledgeHandler) QueueIngestion(c *gin.Context) {
 		c,
 		newKnowledgeIngestionResponse(*task),
 		"知识摄取任务创建成功",
+	)
+}
+
+func (handler *KnowledgeHandler) ListIngestions(c *gin.Context) {
+	if !handler.requireProjectAccess(c, true) {
+		return
+	}
+	query, err := parseDirectoryListQuery(
+		c.Request.URL.RawQuery,
+		directoryListQuerySpec{
+			DefaultSortBy:    "created_at",
+			DefaultSortOrder: "desc",
+			SortFields: map[string]struct{}{
+				"created_at": {},
+				"updated_at": {},
+				"attempt":    {},
+				"status":     {},
+			},
+			FilterFields: map[string]struct{}{
+				"status":     {},
+				"version_id": {},
+			},
+		},
+	)
+	if err != nil {
+		handler.response.BadRequest(c, "知识摄取查询参数无效")
+		return
+	}
+	status, _ := query.value("status")
+	versionID, _ := query.value("version_id")
+	page, err := handler.service.ListIngestions(
+		c.Request.Context(),
+		services.KnowledgeIngestionListFilter{
+			Status:    models.KnowledgeIngestionStatus(status),
+			VersionID: versionID,
+		},
+		services.DirectoryPageRequest{
+			Page:      query.Page,
+			PageSize:  query.PageSize,
+			SortBy:    query.SortBy,
+			SortOrder: query.SortOrder,
+		},
+	)
+	if errors.Is(err, services.ErrDirectoryListQuery) {
+		handler.response.BadRequest(c, "知识摄取查询参数无效")
+		return
+	}
+	if err != nil {
+		handler.writeError(c, err)
+		return
+	}
+	items := make([]knowledgeIngestionResponse, 0, len(page.Items))
+	for index := range page.Items {
+		items = append(items, newKnowledgeIngestionResponse(page.Items[index]))
+	}
+	handler.response.List(
+		c,
+		items,
+		page.Total,
+		page.Page,
+		page.PageSize,
+		"获取知识摄取任务成功",
 	)
 }
 
@@ -643,10 +1016,33 @@ func (handler *KnowledgeHandler) bindJSON(
 	c *gin.Context,
 	destination any,
 ) bool {
+	return handler.bindJSONWithLimit(
+		c,
+		destination,
+		knowledgeRequestBodyLimit,
+	)
+}
+
+func (handler *KnowledgeHandler) bindAuthoredJSON(
+	c *gin.Context,
+	destination any,
+) bool {
+	return handler.bindJSONWithLimit(
+		c,
+		destination,
+		knowledgeAuthoredRequestBodyLimit,
+	)
+}
+
+func (handler *KnowledgeHandler) bindJSONWithLimit(
+	c *gin.Context,
+	destination any,
+	limit int64,
+) bool {
 	c.Request.Body = http.MaxBytesReader(
 		c.Writer,
 		c.Request.Body,
-		knowledgeRequestBodyLimit,
+		limit,
 	)
 	decoder := json.NewDecoder(c.Request.Body)
 	decoder.DisallowUnknownFields()
@@ -657,6 +1053,41 @@ func (handler *KnowledgeHandler) bindJSON(
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		handler.response.BadRequest(c, "知识请求只能包含一个 JSON 对象")
 		return false
+	}
+	return true
+}
+
+func (handler *KnowledgeHandler) validateAuthoredInput(
+	c *gin.Context,
+	markdown string,
+	sourceTicketID uint,
+	sourceAttachmentIDs []uint,
+) bool {
+	markdownBytes := len([]byte(markdown))
+	if strings.TrimSpace(markdown) == "" ||
+		markdownBytes > services.MaxAuthoredMarkdownBytes {
+		handler.response.BadRequest(c, "知识正文必须为 1 到 128 KiB 的 Markdown")
+		return false
+	}
+	if len(sourceAttachmentIDs) > services.MaxAuthoredSourceLinks {
+		handler.response.BadRequest(c, "知识来源附件最多 20 个")
+		return false
+	}
+	if len(sourceAttachmentIDs) > 0 && sourceTicketID == 0 {
+		handler.response.BadRequest(c, "关联附件时必须同时指定来源工单")
+		return false
+	}
+	seen := make(map[uint]struct{}, len(sourceAttachmentIDs))
+	for _, attachmentID := range sourceAttachmentIDs {
+		if attachmentID == 0 {
+			handler.response.BadRequest(c, "知识来源附件标识无效")
+			return false
+		}
+		if _, duplicate := seen[attachmentID]; duplicate {
+			handler.response.BadRequest(c, "知识来源附件不能重复")
+			return false
+		}
+		seen[attachmentID] = struct{}{}
 	}
 	return true
 }
@@ -678,13 +1109,21 @@ func (handler *KnowledgeHandler) writeError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, services.ErrKnowledgeNotFound):
 		handler.response.NotFound(c, "知识资源不存在")
+	case errors.Is(err, services.ErrProjectKnowledgeAccessDenied),
+		errors.Is(err, services.ErrProjectAccessDenied),
+		errors.Is(err, services.ErrPolicyDenied):
+		handler.response.Forbidden(c, "无权访问或管理该知识资源")
 	case errors.Is(err, services.ErrKnowledgeVirusScanRequired):
 		handler.response.Error(c, http.StatusConflict, "文档未通过病毒扫描，不能解析")
 	case errors.Is(err, services.ErrKnowledgeIngestionState),
-		errors.Is(err, models.ErrPublishedKnowledgeVersionImmutable):
+		errors.Is(err, models.ErrPublishedKnowledgeVersionImmutable),
+		errors.Is(err, services.ErrAttachmentNotClean),
+		errors.Is(err, services.ErrIdempotencyConflict):
 		handler.response.Error(c, http.StatusConflict, "知识资源状态冲突")
 	case errors.Is(err, services.ErrKnowledgeIndexUnavailable):
 		handler.response.Error(c, http.StatusServiceUnavailable, "知识索引服务不可用")
+	case errors.Is(err, services.ErrAttachmentStorageMissing):
+		handler.response.Error(c, http.StatusServiceUnavailable, "知识对象存储不可用")
 	case errors.Is(err, services.ErrKnowledgeIndexBoundaryViolation):
 		handler.response.Error(c, http.StatusBadGateway, "知识索引边界校验失败")
 	case errors.Is(err, services.ErrKnowledgeModelPolicyDenied):
@@ -712,15 +1151,18 @@ func trimKnowledgeStrings(values []string) []string {
 }
 
 type knowledgeArticleResponse struct {
-	ID               string                        `json:"id"`
-	Key              string                        `json:"key"`
-	Title            string                        `json:"title"`
-	Summary          string                        `json:"summary"`
-	Status           models.KnowledgeArticleStatus `json:"status"`
-	CurrentVersionID *string                       `json:"current_version_id,omitempty"`
-	Revision         uint64                        `json:"revision"`
-	CreatedAt        time.Time                     `json:"created_at"`
-	UpdatedAt        time.Time                     `json:"updated_at"`
+	ID                  string                        `json:"id"`
+	Key                 string                        `json:"key"`
+	Title               string                        `json:"title"`
+	Summary             string                        `json:"summary"`
+	Status              models.KnowledgeArticleStatus `json:"status"`
+	CurrentVersionID    *string                       `json:"current_version_id,omitempty"`
+	Revision            uint64                        `json:"revision"`
+	CreatedAt           time.Time                     `json:"created_at"`
+	UpdatedAt           time.Time                     `json:"updated_at"`
+	HasUnpublishedDraft *bool                         `json:"has_unpublished_draft,omitempty"`
+	LatestDraftAt       *time.Time                    `json:"latest_draft_at,omitempty"`
+	LatestDraftVersion  *uint64                       `json:"latest_draft_version,omitempty"`
 }
 
 func newKnowledgeArticleResponse(
@@ -739,11 +1181,27 @@ func newKnowledgeArticleResponse(
 	}
 }
 
+func newKnowledgeArticleDirectoryResponse(
+	article models.KnowledgeArticle,
+	includeDraftActivity bool,
+) knowledgeArticleResponse {
+	response := newKnowledgeArticleResponse(article)
+	if !includeDraftActivity {
+		return response
+	}
+	hasDraft := article.HasUnpublishedDraft
+	response.HasUnpublishedDraft = &hasDraft
+	response.LatestDraftAt = article.LatestDraftAt
+	response.LatestDraftVersion = article.LatestDraftVersion
+	return response
+}
+
 type knowledgeVersionResponse struct {
 	ID               string                        `json:"id"`
 	ArticleID        string                        `json:"article_id"`
 	Version          uint64                        `json:"version"`
 	Status           models.KnowledgeVersionStatus `json:"status"`
+	CreatedByType    models.ActorType              `json:"created_by_type"`
 	Title            string                        `json:"title"`
 	OriginalFileName string                        `json:"original_file_name"`
 	MimeType         string                        `json:"mime_type"`
@@ -765,6 +1223,7 @@ func newKnowledgeVersionResponse(
 		ArticleID:        version.ArticleID,
 		Version:          version.Version,
 		Status:           version.Status,
+		CreatedByType:    version.CreatedByType,
 		Title:            version.Title,
 		OriginalFileName: version.OriginalFileName,
 		MimeType:         version.MimeType,
@@ -776,6 +1235,108 @@ func newKnowledgeVersionResponse(
 		PublishedAt:      version.PublishedAt,
 		CreatedAt:        version.CreatedAt,
 		UpdatedAt:        version.UpdatedAt,
+	}
+}
+
+type knowledgeSourceResponse struct {
+	Ordinal            uint                               `json:"ordinal"`
+	Kind               services.KnowledgeSourceKind       `json:"kind"`
+	Visibility         services.KnowledgeSourceVisibility `json:"visibility"`
+	ReferenceLabel     string                             `json:"reference_label"`
+	SourceTicketID     *uint                              `json:"source_ticket_id,omitempty"`
+	TicketNumber       string                             `json:"ticket_number,omitempty"`
+	TicketTitle        string                             `json:"ticket_title,omitempty"`
+	SourceAttachmentID *uint                              `json:"source_attachment_id,omitempty"`
+	AttachmentName     string                             `json:"attachment_name,omitempty"`
+	AttachmentHash     string                             `json:"attachment_hash,omitempty"`
+}
+
+func newKnowledgeSourceResponse(
+	source services.KnowledgeSourceView,
+) knowledgeSourceResponse {
+	return knowledgeSourceResponse{
+		Ordinal:            source.Ordinal,
+		Kind:               source.Kind,
+		Visibility:         source.Visibility,
+		ReferenceLabel:     source.ReferenceLabel,
+		SourceTicketID:     source.SourceTicketID,
+		SourceAttachmentID: source.SourceAttachmentID,
+		TicketNumber:       source.TicketNumber,
+		TicketTitle:        source.TicketTitle,
+		AttachmentName:     source.AttachmentName,
+		AttachmentHash:     source.AttachmentHash,
+	}
+}
+
+func newKnowledgeSourceResponses(
+	sources []services.KnowledgeSourceView,
+) []knowledgeSourceResponse {
+	result := make([]knowledgeSourceResponse, 0, len(sources))
+	for _, source := range sources {
+		result = append(result, newKnowledgeSourceResponse(source))
+	}
+	return result
+}
+
+type knowledgeAuthoredResponse struct {
+	Article knowledgeArticleResponse  `json:"article"`
+	Version knowledgeVersionResponse  `json:"version"`
+	Sources []knowledgeSourceResponse `json:"sources"`
+	Receipt services.OperationReceipt `json:"receipt"`
+}
+
+func newKnowledgeAuthoredResponse(
+	result services.AuthoredKnowledgeResult,
+) knowledgeAuthoredResponse {
+	return knowledgeAuthoredResponse{
+		Article: newKnowledgeArticleResponse(result.Article),
+		Version: newKnowledgeVersionResponse(result.Version),
+		Sources: newKnowledgeSourceResponses(result.Sources),
+		Receipt: result.Receipt,
+	}
+}
+
+type knowledgeDocumentSectionResponse struct {
+	Ordinal     uint   `json:"ordinal"`
+	Heading     string `json:"heading"`
+	Level       int    `json:"level"`
+	SectionPath string `json:"section_path,omitempty"`
+	Markdown    string `json:"markdown"`
+	ContentHash string `json:"content_hash"`
+}
+
+type knowledgeDocumentResponse struct {
+	Article  knowledgeArticleResponse           `json:"article"`
+	Version  knowledgeVersionResponse           `json:"version"`
+	Markdown string                             `json:"markdown"`
+	Sections []knowledgeDocumentSectionResponse `json:"sections"`
+	Sources  []knowledgeSourceResponse          `json:"sources"`
+}
+
+func newKnowledgeDocumentResponse(
+	document services.KnowledgeArticleDocument,
+) knowledgeDocumentResponse {
+	sections := make(
+		[]knowledgeDocumentSectionResponse,
+		0,
+		len(document.Sections),
+	)
+	for _, section := range document.Sections {
+		sections = append(sections, knowledgeDocumentSectionResponse{
+			Ordinal:     section.Ordinal,
+			Heading:     section.Heading,
+			Level:       section.HeadingLevel,
+			SectionPath: section.SectionPath,
+			Markdown:    section.Markdown,
+			ContentHash: section.ContentHash,
+		})
+	}
+	return knowledgeDocumentResponse{
+		Article:  newKnowledgeArticleResponse(document.Article),
+		Version:  newKnowledgeVersionResponse(document.Version),
+		Markdown: document.Markdown,
+		Sections: sections,
+		Sources:  newKnowledgeSourceResponses(document.Sources),
 	}
 }
 
@@ -880,10 +1441,13 @@ type knowledgeCitationResponse struct {
 	ID              string  `json:"id"`
 	SearchID        string  `json:"search_id"`
 	ArticleID       string  `json:"article_id"`
+	ArticleKey      string  `json:"article_key"`
+	ArticleTitle    string  `json:"article_title"`
 	VersionID       string  `json:"version_id"`
 	DocumentVersion uint64  `json:"document_version"`
 	ChunkID         string  `json:"chunk_id"`
 	PageNumber      *int    `json:"page_number,omitempty"`
+	SectionPath     string  `json:"section_path"`
 	Snippet         string  `json:"snippet"`
 	ContentHash     string  `json:"content_hash"`
 	Rank            int     `json:"rank"`
@@ -897,10 +1461,13 @@ func newKnowledgeCitationResponse(
 		ID:              citation.ID,
 		SearchID:        citation.SearchID,
 		ArticleID:       citation.ArticleID,
+		ArticleKey:      citation.ArticleKey,
+		ArticleTitle:    citation.ArticleTitle,
 		VersionID:       citation.VersionID,
 		DocumentVersion: citation.DocumentVersion,
 		ChunkID:         citation.ChunkID,
 		PageNumber:      citation.PageNumber,
+		SectionPath:     citation.SectionPath,
 		Snippet:         citation.Snippet,
 		ContentHash:     citation.ContentHash,
 		Rank:            citation.Rank,

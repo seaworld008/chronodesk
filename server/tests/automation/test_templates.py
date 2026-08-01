@@ -61,12 +61,28 @@ class TestTemplates:
 
             list_resp = admin_api.get_json(
                 admin_api.project_path("admin/automation/templates"),
-                params={"page_size": 50},
+                params={"page": 1, "page_size": 50},
             )
             assert list_resp.status_code == 200, list_resp.text
             list_body = list_resp.json()
             assert list_body.get("success") is True, list_body
-            templates = list_body.get("data", {}).get("templates", [])
+            assert set(list_body) == {"success", "message", "data"}, list_body
+            list_data = list_body["data"]
+            assert isinstance(list_data, dict), list_body
+            assert set(list_data) == {
+                "items",
+                "total",
+                "page",
+                "page_size",
+                "total_pages",
+            }, list_data
+            assert list_data["page"] == 1, list_data
+            assert list_data["page_size"] == 50, list_data
+            assert isinstance(list_data["total"], int), list_data
+            assert isinstance(list_data["total_pages"], int), list_data
+            templates = list_data["items"]
+            assert isinstance(templates, list), list_data
+            assert len(templates) <= 50, list_data
             assert any(tpl.get("id") == created_id for tpl in templates)
 
             detail_resp = admin_api.get_json(

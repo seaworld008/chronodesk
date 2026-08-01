@@ -146,12 +146,12 @@ func ensureWebhookJSONEOF(decoder *json.Decoder) error {
 
 // WebhookConfig Webhook配置模型
 type WebhookConfig struct {
-	ID             uint           `json:"id" gorm:"primaryKey;autoIncrement"`
-	CreatedAt      time.Time      `json:"created_at" gorm:"autoCreateTime"`
+	ID             uint           `json:"id" gorm:"primaryKey;autoIncrement;index:idx_webhook_configs_directory,priority:5,sort:desc"`
+	CreatedAt      time.Time      `json:"created_at" gorm:"autoCreateTime;index:idx_webhook_configs_directory,priority:4,sort:desc"`
 	UpdatedAt      time.Time      `json:"updated_at" gorm:"autoUpdateTime"`
-	DeletedAt      gorm.DeletedAt `json:"-" gorm:"index"`
-	OrganizationID uint           `json:"organization_id" gorm:"not null;index"`
-	ProjectID      uint           `json:"project_id" gorm:"not null;index"`
+	DeletedAt      gorm.DeletedAt `json:"-" gorm:"index;index:idx_webhook_configs_directory,priority:3"`
+	OrganizationID uint           `json:"organization_id" gorm:"not null;index;index:idx_webhook_configs_directory,priority:1"`
+	ProjectID      uint           `json:"project_id" gorm:"not null;index;index:idx_webhook_configs_directory,priority:2"`
 
 	// 基本配置
 	Name        string          `json:"name" gorm:"size:100;not null" validate:"required,max=100"`
@@ -480,20 +480,20 @@ func (w *WebhookConfig) MatchesEvent(
 
 // WebhookLog 通知日志模型
 type WebhookLog struct {
-	ID             uint      `json:"id" gorm:"primaryKey;autoIncrement"`
-	CreatedAt      time.Time `json:"created_at" gorm:"autoCreateTime"`
-	OrganizationID uint      `json:"organization_id" gorm:"not null;index"`
-	ProjectID      uint      `json:"project_id" gorm:"not null;index"`
+	ID             uint      `json:"id" gorm:"primaryKey;autoIncrement;index:idx_webhook_logs_timeline,priority:5,sort:desc;index:idx_webhook_logs_status_timeline,priority:6,sort:desc;index:idx_webhook_logs_event_timeline,priority:6,sort:desc"`
+	CreatedAt      time.Time `json:"created_at" gorm:"autoCreateTime;index:idx_webhook_logs_timeline,priority:4,sort:desc;index:idx_webhook_logs_status_timeline,priority:5,sort:desc;index:idx_webhook_logs_event_timeline,priority:5,sort:desc"`
+	OrganizationID uint      `json:"organization_id" gorm:"not null;index;index:idx_webhook_logs_timeline,priority:1;index:idx_webhook_logs_status_timeline,priority:1;index:idx_webhook_logs_event_timeline,priority:1"`
+	ProjectID      uint      `json:"project_id" gorm:"not null;index;index:idx_webhook_logs_timeline,priority:2;index:idx_webhook_logs_status_timeline,priority:2;index:idx_webhook_logs_event_timeline,priority:2"`
 
 	// 关联配置
-	ConfigID uint           `json:"config_id" gorm:"not null;index"`
+	ConfigID uint           `json:"config_id" gorm:"not null;index;index:idx_webhook_logs_timeline,priority:3;index:idx_webhook_logs_status_timeline,priority:3;index:idx_webhook_logs_event_timeline,priority:3"`
 	Config   *WebhookConfig `json:"config,omitempty" gorm:"foreignKey:ConfigID"`
 
 	// 事件信息
-	EventType    WebhookEventType `json:"event_type" gorm:"size:50;not null;index"` // canonical CloudEvent type
-	EventData    string           `json:"event_data" gorm:"type:text"`              // JSON格式的事件数据
-	ResourceID   uint             `json:"resource_id" gorm:"index"`                 // 相关资源ID(如工单ID)
-	ResourceType string           `json:"resource_type" gorm:"size:50;index"`       // 资源类型
+	EventType    WebhookEventType `json:"event_type" gorm:"size:50;not null;index;index:idx_webhook_logs_event_timeline,priority:4"` // canonical CloudEvent type
+	EventData    string           `json:"event_data" gorm:"type:text"`                                                               // JSON格式的事件数据
+	ResourceID   uint             `json:"resource_id" gorm:"index"`                                                                  // 相关资源ID(如工单ID)
+	ResourceType string           `json:"resource_type" gorm:"size:50;index"`                                                        // 资源类型
 
 	// 请求信息
 	RequestURL     string `json:"request_url" gorm:"size:500"`
@@ -509,7 +509,7 @@ type WebhookLog struct {
 
 	// 执行状态。WebhookLog 只记录单次 Outbox 尝试；跨尝试重试状态由
 	// outbox_deliveries 持久化管理。
-	Status       string     `json:"status" gorm:"size:20;not null;index"` // pending, success, failed
+	Status       string     `json:"status" gorm:"size:20;not null;index;index:idx_webhook_logs_status_timeline,priority:4"` // pending, success, failed
 	ErrorMessage string     `json:"error_message" gorm:"type:text"`
 	RetryCount   int        `json:"retry_count" gorm:"default:0"`
 	MaxRetries   int        `json:"max_retries" gorm:"default:0"`

@@ -2075,6 +2075,25 @@ func (b *A2ABackend) reportDomainError(ctx context.Context, reporter a2a.Reporte
 		return reportA2AState(ctx, reporter, a2a.TaskStateInputRequired, services.AgentNativeErrorCode(err), []string{"valid lease_id"})
 	case errors.Is(err, services.ErrInvalidTicketTransition):
 		return reportA2AState(ctx, reporter, a2a.TaskStateInputRequired, "invalid_ticket_transition", []string{"valid status transition"})
+	case errors.Is(err, services.ErrInvalidTicketTags):
+		return reportA2AState(ctx, reporter, a2a.TaskStateInputRequired, "invalid_request", []string{"at most 20 unique tags of at most 50 characters"})
+	case errors.Is(err, services.ErrInvalidAgentContext):
+		return reportA2AState(
+			ctx,
+			reporter,
+			a2a.TaskStateInputRequired,
+			"invalid_request",
+			[]string{"agent_context within documented limits"},
+		)
+	case errors.Is(err, services.ErrTicketCategoryScope),
+		errors.Is(err, services.ErrInvalidTicketCategorySelection):
+		return reportA2AState(
+			ctx,
+			reporter,
+			a2a.TaskStateInputRequired,
+			"invalid_request",
+			[]string{"category and direct subcategory from the authorized project"},
+		)
 	case errors.Is(err, services.ErrRateLimited),
 		errors.Is(err, services.ErrConcurrencyLimit),
 		errors.Is(err, services.ErrAutomationLoop):

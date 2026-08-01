@@ -27,6 +27,11 @@ import {
   Typography,
 } from '@mui/material'
 import type { TableProps } from '@mui/material'
+import {
+  currentPageSelectionState,
+  updateCurrentPageSelection,
+} from './currentPageSelection'
+import { readHumanSessionBinding } from '@/lib/projectScope'
 
 export interface ResizableColumn {
   key: string
@@ -56,12 +61,19 @@ const normalizeColumns = (columns: ResizableColumn[]): NormalizedColumn[] =>
 const clampWidth = (width: number, column: NormalizedColumn) =>
   Math.min(column.maxWidth, Math.max(column.minWidth, Math.round(width)))
 
-const loadStoredWidths = (tableId: string, columns: NormalizedColumn[]) => {
+const columnWidthStorageKey = (tableId: string) => {
+  const subject = typeof window === 'undefined'
+    ? null
+    : readHumanSessionBinding()?.subject
+  return `${STORAGE_PREFIX}.${encodeURIComponent(subject ?? 'anonymous')}.${tableId}`
+}
+
+const loadStoredWidths = (storageKey: string, columns: NormalizedColumn[]) => {
   const defaults = Object.fromEntries(columns.map((column) => [column.key, column.defaultWidth]))
   if (typeof window === 'undefined') return defaults
 
   try {
-    const stored = window.localStorage.getItem(`${STORAGE_PREFIX}.${tableId}`)
+    const stored = window.localStorage.getItem(storageKey)
     if (!stored) return defaults
 
     const parsed = JSON.parse(stored) as Record<string, unknown>
@@ -80,19 +92,14 @@ const loadStoredWidths = (tableId: string, columns: NormalizedColumn[]) => {
 
 const usePersistentColumnWidths = (tableId: string, rawColumns: ResizableColumn[]) => {
   const columns = useMemo(() => normalizeColumns(rawColumns), [rawColumns])
-  const [widths, setWidths] = useState<Record<string, number>>(() => loadStoredWidths(tableId, columns))
+  const storageKey = columnWidthStorageKey(tableId)
+  const [widths, setWidths] = useState<Record<string, number>>(() => loadStoredWidths(storageKey, columns))
   const [resizingKey, setResizingKey] = useState<string | null>(null)
   const resizeCleanupRef = useRef<(() => void) | null>(null)
 
   useEffect(() => {
-    setWidths((current) => {
-      const next: Record<string, number> = {}
-      for (const column of columns) {
-        next[column.key] = clampWidth(current[column.key] ?? column.defaultWidth, column)
-      }
-      return next
-    })
-  }, [columns])
+    setWidths(loadStoredWidths(storageKey, columns))
+  }, [columns, storageKey])
 
   useLayoutEffect(() => {
     try {
@@ -100,11 +107,11 @@ const usePersistentColumnWidths = (tableId: string, rawColumns: ResizableColumn[
       // navigates or reloads. A deferred timer is cancelled during unmount and
       // can silently discard a keyboard or pointer resize that is already
       // visible on screen.
-      window.localStorage.setItem(`${STORAGE_PREFIX}.${tableId}`, JSON.stringify(widths))
+      window.localStorage.setItem(storageKey, JSON.stringify(widths))
     } catch {
       // Persisting preferences is a progressive enhancement.
     }
-  }, [tableId, widths])
+  }, [storageKey, widths])
 
   useEffect(() => () => resizeCleanupRef.current?.(), [])
 
@@ -186,6 +193,19 @@ interface ColumnHeaderContentProps {
   onKeyDown: (key: string, event: React.KeyboardEvent<HTMLElement>) => void
 }
 
+const columnHeaderText = (node: React.ReactNode): string => {
+  if (typeof node === 'string' || typeof node === 'number') {
+    return String(node).trim()
+  }
+  if (Array.isArray(node)) {
+    return node.map(columnHeaderText).filter(Boolean).join(' ').trim()
+  }
+  if (isValidElement<{ children?: React.ReactNode }>(node)) {
+    return columnHeaderText(node.props.children)
+  }
+  return ''
+}
+
 const ColumnHeaderContent = ({
   column,
   label,
@@ -195,33 +215,39 @@ const ColumnHeaderContent = ({
   onResizeStart,
   onReset,
   onKeyDown,
-}: ColumnHeaderContentProps) => (
-  <span className="cd-resizable-header-content">
-    <Tooltip title={accessibleLabel ?? (typeof label === 'string' ? label : '')} enterDelay={600}>
-      <span className="cd-resizable-header-label">{label}</span>
-    </Tooltip>
-    <span
-      className="cd-column-resize-handle"
-      data-resizing={resizing || undefined}
-      role="separator"
-      aria-label={`调整${accessibleLabel || (typeof label === 'string' ? `“${label}”` : '')}列宽，当前 ${width} 像素`}
-      aria-orientation="vertical"
-      aria-valuemin={column.minWidth}
-      aria-valuemax={column.maxWidth}
-      aria-valuenow={width}
-      tabIndex={0}
-      onPointerDown={(event) => onResizeStart(column.key, event)}
-      onDoubleClick={(event) => {
-        event.preventDefault()
-        event.stopPropagation()
-        onReset(column.key)
-      }}
-      onClick={(event) => event.stopPropagation()}
-      onKeyDown={(event) => onKeyDown(column.key, event)}
-      title="拖动调整列宽，双击恢复默认；聚焦后可用方向键调整"
-    />
-  </span>
-)
+}: ColumnHeaderContentProps) => {
+  const visibleLabel = columnHeaderText(label)
+  const resizeLabel = accessibleLabel
+    || `“${visibleLabel || column.key}”`
+
+  return (
+    <span className="cd-resizable-header-content">
+      <Tooltip title={visibleLabel || column.key} enterDelay={600}>
+        <span className="cd-resizable-header-label">{label}</span>
+      </Tooltip>
+      <span
+        className="cd-column-resize-handle"
+        data-resizing={resizing || undefined}
+        role="separator"
+        aria-label={`调整${resizeLabel}列宽，当前 ${width} 像素`}
+        aria-orientation="vertical"
+        aria-valuemin={column.minWidth}
+        aria-valuemax={column.maxWidth}
+        aria-valuenow={width}
+        tabIndex={0}
+        onPointerDown={(event) => onResizeStart(column.key, event)}
+        onDoubleClick={(event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          onReset(column.key)
+        }}
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => onKeyDown(column.key, event)}
+        title="拖动调整列宽，双击恢复默认；聚焦后可用方向键调整"
+      />
+    </span>
+  )
+}
 
 type DatagridHeaderProps = React.ComponentProps<typeof DatagridHeader>
 interface DatagridFieldProps {
@@ -234,6 +260,7 @@ interface DatagridFieldProps {
 type DatagridField = React.ReactElement<DatagridFieldProps>
 
 interface ResizableDatagridHeaderProps extends DatagridHeaderProps {
+  tableId: string
   columns: NormalizedColumn[]
   widths: Record<string, number>
   resizingKey: string | null
@@ -249,6 +276,7 @@ const ResizableDatagridHeader = ({
   hasExpand = false,
   hasBulkActions = false,
   isRowSelectable,
+  tableId,
   columns,
   widths,
   resizingKey,
@@ -261,26 +289,27 @@ const ResizableDatagridHeader = ({
   const tableHeadRef = useRef<HTMLTableSectionElement>(null)
   const { sort, data, onSelect, selectedIds, setSort } = useListContextWithProps(listContextProps)
 
-  const selectableIds = Array.isArray(data)
-    ? data
-      .filter((record) => !isRowSelectable || isRowSelectable(record))
-      .map((record) => record.id)
-    : []
+  const selectableIds = useMemo(
+    () => Array.isArray(data)
+      ? data
+        .filter((record) => !isRowSelectable || isRowSelectable(record))
+        .map((record) => record.id)
+      : [],
+    [data, isRowSelectable],
+  )
+  const currentPageSelection = currentPageSelectionState(
+    selectableIds,
+    selectedIds ?? [],
+  )
 
   const handleSelectAll = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
-    if (!onSelect || !selectedIds || !data) return
-    onSelect(
-      event.target.checked
-        ? selectedIds.concat(
-          data
-            .filter((record) =>
-              !selectedIds.includes(record.id) &&
-              (!isRowSelectable || isRowSelectable(record)))
-            .map((record) => record.id),
-        )
-        : selectedIds.filter((id) => !data.some((record) => record.id === id)),
-    )
-  }, [data, isRowSelectable, onSelect, selectedIds])
+    if (!onSelect || !selectedIds) return
+    onSelect(updateCurrentPageSelection(
+      selectedIds,
+      selectableIds,
+      event.target.checked,
+    ))
+  }, [onSelect, selectableIds, selectedIds])
 
   const fields = Children.toArray(children).filter(isValidElement) as DatagridField[]
   const totalWidth = columns.reduce(
@@ -311,18 +340,31 @@ const ResizableDatagridHeader = ({
             padding="checkbox"
             className="RaDatagrid-headerCell cd-table-selection-column"
           >
-            <Checkbox
-              slotProps={{ input: { 'aria-label': '选择当前页全部记录' } }}
-              className="select-all"
-              color="primary"
-              checked={
-                selectedIds.length > 0 &&
-                selectableIds.length > 0 &&
-                selectableIds.every((id) => selectedIds.includes(id))
-              }
-              onChange={handleSelectAll}
-              onClick={(event) => event.stopPropagation()}
-            />
+            <Tooltip title="仅选择当前页可选记录，不会选择其他分页中的记录">
+              <span>
+                <Checkbox
+                  slotProps={{
+                    input: {
+                      'aria-label': '选择当前页全部可选记录',
+                      'aria-describedby': `${tableId}-current-page-selection-help`,
+                    },
+                  }}
+                  className="select-all"
+                  color="primary"
+                  checked={currentPageSelection.allSelected}
+                  indeterminate={currentPageSelection.indeterminate}
+                  disabled={selectableIds.length === 0}
+                  onChange={handleSelectAll}
+                  onClick={(event) => event.stopPropagation()}
+                />
+                <span
+                  id={`${tableId}-current-page-selection-help`}
+                  hidden
+                >
+                  批量选择仅应用于当前页，不会选择全部匹配结果
+                </span>
+              </span>
+            </Tooltip>
           </TableCell>
         )}
         {fields.map((field, index) => {
@@ -433,6 +475,7 @@ export const PersistentResizableDatagridHeader = ({
   return (
     <ResizableDatagridHeader
       {...props}
+      tableId={tableId}
       children={children}
       columns={columns}
       widths={widths}
@@ -488,6 +531,7 @@ export const EnterpriseDatagrid = React.forwardRef<HTMLTableElement, EnterpriseD
     // and dropping keyboard focus after every width update.
     const header = (
       <ResizableDatagridHeader
+        tableId={tableId}
         columns={columns}
         widths={widths}
         resizingKey={resizingKey}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -140,6 +141,210 @@ func TestAutomationHandlerUsesOnlyProjectScopedAdminRoutes(t *testing.T) {
 	)
 	if forbidden.Code != http.StatusForbidden {
 		t.Fatalf("project agent automation status=%d body=%s", forbidden.Code, forbidden.Body)
+	}
+
+	publicReply := models.QuickReply{
+		OrganizationID: environment.operations.OrganizationID,
+		ProjectID:      environment.operations.ID,
+		Name:           "公共回复",
+		Content:        "public",
+		IsPublic:       true,
+		CreatedBy:      environment.manager.ID,
+	}
+	agentReply := models.QuickReply{
+		OrganizationID: environment.operations.OrganizationID,
+		ProjectID:      environment.operations.ID,
+		Name:           "处理人私有回复",
+		Content:        "private",
+		CreatedBy:      environment.agent.ID,
+	}
+	managerReply := models.QuickReply{
+		OrganizationID: environment.operations.OrganizationID,
+		ProjectID:      environment.operations.ID,
+		Name:           "经理私有回复",
+		Content:        "private",
+		CreatedBy:      environment.manager.ID,
+	}
+	if err := environment.db.Create(
+		&[]*models.QuickReply{
+			&publicReply,
+			&agentReply,
+			&managerReply,
+		},
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name       string
+		replyID    uint
+		wantStatus int
+	}{
+		{
+			name:       "public",
+			replyID:    publicReply.ID,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "own private",
+			replyID:    agentReply.ID,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "other private",
+			replyID:    managerReply.ID,
+			wantStatus: http.StatusNotFound,
+		},
+	} {
+		t.Run("agent quick reply "+test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			agentRouter.ServeHTTP(
+				response,
+				httptest.NewRequest(
+					http.MethodPost,
+					fmt.Sprintf(
+						"/api/projects/OPS/admin/automation/quick-replies/%d/use",
+						test.replyID,
+					),
+					nil,
+				),
+			)
+			if response.Code != test.wantStatus {
+				t.Fatalf(
+					"status=%d body=%s want=%d",
+					response.Code,
+					response.Body,
+					test.wantStatus,
+				)
+			}
+		})
+	}
+}
+
+func TestAutomationConfigurationListsUseUniformBoundedPageEnvelope(
+	t *testing.T,
+) {
+	environment := newProjectConfigurationHandlerEnvironment(t)
+	if err := environment.db.AutoMigrate(
+		&models.AutomationRule{},
+		&models.AutomationLog{},
+		&models.SLAConfig{},
+		&models.TicketTemplate{},
+		&models.QuickReply{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	automationService := services.NewAutomationService(environment.db)
+	schedulerService, err := services.NewSchedulerService(
+		environment.db,
+		automationHandlerSchedulerRedis{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewAutomationHandler(
+		automationService,
+		schedulerService,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := automationHandlerProjectRouter(
+		environment,
+		environment.manager,
+		handler,
+	)
+	scope := environment.operations.Scope()
+	if err := environment.db.Create(&models.SLAConfig{
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		Name:           "SLA",
+		ResponseTime:   30,
+		ResolutionTime: 60,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := environment.db.Create(&models.TicketTemplate{
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		Name:           "模板",
+		Category:       "incident",
+		CreatedBy:      environment.manager.ID,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := environment.db.Create(&models.QuickReply{
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		Name:           "回复",
+		Content:        "内容",
+		CreatedBy:      environment.manager.ID,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{
+		"/api/projects/OPS/admin/automation/sla",
+		"/api/projects/OPS/admin/automation/templates",
+		"/api/projects/OPS/admin/automation/quick-replies",
+	} {
+		t.Run(path, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			router.ServeHTTP(
+				response,
+				httptest.NewRequest(http.MethodGet, path, nil),
+			)
+			if response.Code != http.StatusOK {
+				t.Fatalf(
+					"status=%d body=%s",
+					response.Code,
+					response.Body,
+				)
+			}
+			var payload struct {
+				Data map[string]json.RawMessage `json:"data"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			for _, required := range []string{
+				"items",
+				"total",
+				"page",
+				"page_size",
+				"total_pages",
+			} {
+				if _, exists := payload.Data[required]; !exists {
+					t.Fatalf(
+						"response omits %s: %s",
+						required,
+						response.Body,
+					)
+				}
+			}
+			for _, legacy := range []string{
+				"configs",
+				"templates",
+				"replies",
+			} {
+				if _, exists := payload.Data[legacy]; exists {
+					t.Fatalf(
+						"response retains legacy %s: %s",
+						legacy,
+						response.Body,
+					)
+				}
+			}
+			var pageSize int
+			if err := json.Unmarshal(
+				payload.Data["page_size"],
+				&pageSize,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if pageSize != services.DefaultAutomationListSize {
+				t.Fatalf("page_size=%d", pageSize)
+			}
+		})
 	}
 }
 

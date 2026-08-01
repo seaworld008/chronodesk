@@ -10,11 +10,14 @@ import (
 const maxOutboxFailureRunes = 4000
 
 var (
-	outboxAbsoluteURLPattern = regexp.MustCompile(`(?i)\bhttps?://[^\s"'<>]+`)
-	outboxQueryPattern       = regexp.MustCompile(`([[:alnum:]_./:@-]+)\?[^\s"'<>]*`)
-	outboxBearerPattern      = regexp.MustCompile(`(?i)\bbearer\s+[^\s,;]+`)
+	outboxAbsoluteURLPattern   = regexp.MustCompile(`(?i)\bhttps?://[^\s"'<>]+`)
+	outboxQueryPattern         = regexp.MustCompile(`([[:alnum:]_./:@-]+)\?[^\s"'<>]*`)
+	outboxAuthSchemePattern    = regexp.MustCompile(`(?i)\b(bearer|basic)\s+[^\s,;}\]]+`)
+	outboxAuthorizationPattern = regexp.MustCompile(
+		`(?i)\bauthorization"?\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n,;]+)`,
+	)
 	outboxSensitiveKVPattern = regexp.MustCompile(
-		`(?i)\b(authorization|access[_-]?token|refresh[_-]?token|token|secret|credential|password|api[_-]?key)(\s*[:=]\s*)[^\s&,;]+`,
+		`(?i)\b(access[_-]?token|refresh[_-]?token|token|secret|credential|password|api[_-]?key)"?(\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s&,;}\]]+)`,
 	)
 )
 
@@ -33,7 +36,11 @@ func scrubOutboxFailure(deliveryErr error) string {
 	message := strings.TrimSpace(deliveryErr.Error())
 	message = outboxAbsoluteURLPattern.ReplaceAllString(message, "[URL 已隐藏]")
 	message = outboxQueryPattern.ReplaceAllString(message, "${1}?[查询参数已隐藏]")
-	message = outboxBearerPattern.ReplaceAllString(message, "Bearer [凭据已隐藏]")
+	message = outboxAuthorizationPattern.ReplaceAllString(
+		message,
+		"Authorization: [凭据已隐藏]",
+	)
+	message = outboxAuthSchemePattern.ReplaceAllString(message, "$1 [凭据已隐藏]")
 	message = outboxSensitiveKVPattern.ReplaceAllString(message, "$1$2[凭据已隐藏]")
 	runes := []rune(message)
 	if len(runes) > maxOutboxFailureRunes {

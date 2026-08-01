@@ -78,6 +78,9 @@ func TestKnowledgeVersionStoresOnlyObjectReferenceForOriginalFile(
 			t.Errorf("serialized version is missing %q", required)
 		}
 	}
+	if _, exists := fields["object_store_id"]; exists {
+		t.Fatal("serialized version exposed private object_store_id")
+	}
 }
 
 func TestKnowledgeVersionRequiresCleanScanBeforeParsingAndIsImmutable(
@@ -192,6 +195,7 @@ func validKnowledgeVersion() KnowledgeArticleVersion {
 		ObjectProvider:   "s3",
 		ObjectBucket:     "knowledge",
 		ObjectKey:        "projects/2/database-recovery.pdf",
+		ObjectStoreID:    "s3-2025",
 		ObjectVersionID:  "object-version-1",
 		OriginalFileName: "database-recovery.pdf",
 		MimeType:         "application/pdf",

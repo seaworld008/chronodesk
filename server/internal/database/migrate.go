@@ -30,6 +30,27 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 		if err := validatePostgresRuntimeSchema(db, requirements); err != nil {
 			return err
 		}
+		if err := ValidateAutomationWebhookPaginationIndexes(db); err != nil {
+			return err
+		}
+		if err := ValidatePolicyDecisionEpochContract(db); err != nil {
+			return err
+		}
+		if err := ValidateAdminAuditExportContract(db); err != nil {
+			return err
+		}
+		if err := ValidateAttachmentStorageIdentityContract(db); err != nil {
+			return err
+		}
+		if err := ValidateKnowledgeObjectIdentityContract(db); err != nil {
+			return err
+		}
+		if err := ValidateKnowledgeObjectWriteIntentContract(db); err != nil {
+			return err
+		}
+		if err := ValidateKnowledgePublishedVersionContract(db); err != nil {
+			return err
+		}
 		if err := validatePostgresLoginHistoryMethodContract(db); err != nil {
 			return err
 		}
@@ -43,6 +64,9 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 			return err
 		}
 		if err := ValidatePlatformRoleCutover(db); err != nil {
+			return err
+		}
+		if err := ValidateCategoryScopeContract(db); err != nil {
 			return err
 		}
 		return ValidateProjectRLSReadiness(db)
@@ -66,6 +90,24 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 			strings.Join(missing, ", "),
 		)
 	}
+	if err := ValidateAutomationWebhookPaginationIndexes(db); err != nil {
+		return err
+	}
+	if err := ValidatePolicyDecisionEpochContract(db); err != nil {
+		return err
+	}
+	if err := ValidateAttachmentStorageIdentityContract(db); err != nil {
+		return err
+	}
+	if err := ValidateKnowledgeObjectIdentityContract(db); err != nil {
+		return err
+	}
+	if err := ValidateKnowledgeObjectWriteIntentContract(db); err != nil {
+		return err
+	}
+	if err := ValidateKnowledgePublishedVersionContract(db); err != nil {
+		return err
+	}
 	if err := ValidateIdempotencyScopeIndex(db); err != nil {
 		return err
 	}
@@ -73,6 +115,9 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 		return err
 	}
 	if err := ValidatePlatformRoleCutover(db); err != nil {
+		return err
+	}
+	if err := ValidateCategoryScopeContract(db); err != nil {
 		return err
 	}
 	return ValidateProjectRLSReadiness(db)
@@ -161,7 +206,18 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 			"welcome_email_delivered_at",
 		}},
 		{&models.AdminAuditLog{}, "admin_audit_logs", []string{
-			"id", "user_id", "platform_role", "action", "status_code",
+			"id", "actor_type", "actor_id", "user_id", "platform_role",
+			"action", "status_code",
+			"action_code", "resource_type", "resource_public_id", "request_id",
+			"trace_id", "correlation_id",
+		}},
+		{&models.AdminAuditExportJob{}, "admin_audit_export_jobs", []string{
+			"id", "public_id", "requester_user_id", "requester_role",
+			"filter_snapshot", "filter_hash", "start_time", "end_time",
+			"anchor_created_at", "anchor_id", "state", "requested_at",
+			"lease_owner", "lease_expires_at", "fencing_token", "attempt",
+			"row_count", "truncated", "object_key", "sha256", "size_bytes",
+			"failure_code", "expires_at",
 		}},
 		{&models.UserProfile{}, "user_profiles", []string{"user_id"}},
 		{&models.EmailConfig{}, "email_configs", []string{
@@ -191,6 +247,13 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 			"operation", "key", "request_hash", "state",
 			"resource_snapshot", "expires_at", "completion_ttl_nanoseconds", "completed_at",
 		}},
+		{&models.Category{}, "categories", []string{
+			"id", "organization_id", "project_id", "slug", "parent_id",
+		}},
+		{&models.ProjectMembership{}, "project_memberships", []string{
+			"id", "project_id", "user_id", "role", "is_active",
+			"knowledge_contributor", "version",
+		}},
 		{&models.Ticket{}, "tickets", []string{
 			"id", "public_id", "organization_id", "project_id", "queue_id",
 			"request_type_version_id", "workflow_version_id",
@@ -200,7 +263,20 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 		{&models.TicketComment{}, "ticket_comments", []string{"ticket_id", "actor_type", "actor_id", "service_principal_id", "type"}},
 		{&models.TicketAttachment{}, "ticket_attachments", []string{
 			"ticket_id", "actor_type", "actor_id", "service_principal_id",
-			"storage_path", "hash", "virus_scan",
+			"storage_path", "storage_store_id", "storage_version_id",
+			"hash", "virus_scan",
+		}},
+		{&models.KnowledgeArticleVersion{}, "knowledge_article_versions", []string{
+			"id", "organization_id", "project_id", "article_id",
+			"object_provider", "object_key", "object_store_id",
+			"object_version_id", "content_hash",
+		}},
+		{&models.KnowledgeObjectWriteIntent{}, "knowledge_object_write_intents", []string{
+			"id", "organization_id", "project_id", "article_id", "version_id",
+			"object_provider", "object_store_id", "object_key",
+			"object_version_id", "size_bytes", "content_hash",
+			"receipt_recorded", "next_attempt_at", "lease_owner",
+			"lease_expires_at", "fencing_token", "attempts", "failure_code",
 		}},
 		{&models.TicketHistory{}, "ticket_histories", []string{
 			"ticket_id", "actor_type", "actor_id", "service_principal_id",
@@ -472,6 +548,9 @@ func schemaMigrationModels() []any {
 		// New models append here to preserve every existing one-based resume
 		// position used by controlled production migrations.
 		&models.A2APushDeliverySnapshot{},
+		&models.AdminAuditExportJob{},
+		&models.KnowledgeSourceLink{},
+		&models.KnowledgeObjectWriteIntent{},
 	}
 }
 
@@ -489,10 +568,11 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_users_last_login_at ON users(last_login_at);",
 
 		// 分类表索引
-		"CREATE INDEX IF NOT EXISTS idx_categories_parent_id ON categories(parent_id);",
-		"CREATE INDEX IF NOT EXISTS idx_categories_slug ON categories(slug);",
-		"CREATE INDEX IF NOT EXISTS idx_categories_status ON categories(status);",
-		"CREATE INDEX IF NOT EXISTS idx_categories_type ON categories(type);",
+		"CREATE INDEX IF NOT EXISTS idx_categories_scope_parent ON categories(organization_id, project_id, parent_id);",
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_categories_project_slug ON categories(organization_id, project_id, slug);",
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_categories_scope_id ON categories(organization_id, project_id, id);",
+		"CREATE INDEX IF NOT EXISTS idx_categories_scope_status_sort ON categories(organization_id, project_id, status, sort_order, id);",
+		"CREATE INDEX IF NOT EXISTS idx_categories_scope_type ON categories(organization_id, project_id, type, id);",
 
 		// 工单表索引
 		"CREATE INDEX IF NOT EXISTS idx_tickets_ticket_number ON tickets(ticket_number);",
@@ -508,6 +588,10 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_tickets_closed_at ON tickets(closed_at);",
 		"CREATE INDEX IF NOT EXISTS idx_tickets_status_priority ON tickets(status, priority);",
 		"CREATE INDEX IF NOT EXISTS idx_tickets_created_at ON tickets(created_at);",
+		"CREATE INDEX IF NOT EXISTS idx_tickets_scope_due_id ON tickets(organization_id, project_id, due_date, id);",
+		"DROP INDEX IF EXISTS idx_tickets_scope_sla_status_created_id;",
+		"DROP INDEX IF EXISTS idx_tickets_scope_active_sla_created_id;",
+		"CREATE INDEX IF NOT EXISTS idx_tickets_scope_sla_created_id ON tickets(organization_id, project_id, sla_breached, created_at, id);",
 		"CREATE INDEX IF NOT EXISTS idx_tickets_version ON tickets(id, version);",
 		"CREATE INDEX IF NOT EXISTS idx_tickets_creator_actor ON tickets(created_by_actor_type, created_by_actor_id);",
 		"CREATE INDEX IF NOT EXISTS idx_tickets_assignee_actor ON tickets(assigned_to_actor_type, assigned_to_actor_id);",
@@ -518,12 +602,17 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_ticket_comments_type ON ticket_comments(type);",
 		"CREATE INDEX IF NOT EXISTS idx_ticket_comments_parent_id ON ticket_comments(parent_id);",
 		"CREATE INDEX IF NOT EXISTS idx_ticket_comments_created_at ON ticket_comments(created_at);",
+		"CREATE INDEX IF NOT EXISTS idx_ticket_comments_scope_ticket_parent_created ON ticket_comments(organization_id, project_id, ticket_id, parent_id, created_at, id);",
+		"CREATE INDEX IF NOT EXISTS idx_ticket_comments_scope_ticket_timeline ON ticket_comments(organization_id, project_id, ticket_id, created_at DESC, id DESC) WHERE is_deleted = false;",
 
 		// 工单历史表索引
 		"CREATE INDEX IF NOT EXISTS idx_ticket_histories_ticket_id ON ticket_histories(ticket_id);",
 		"CREATE INDEX IF NOT EXISTS idx_ticket_histories_user_id ON ticket_histories(user_id);",
 		"CREATE INDEX IF NOT EXISTS idx_ticket_histories_action ON ticket_histories(action);",
 		"CREATE INDEX IF NOT EXISTS idx_ticket_histories_created_at ON ticket_histories(created_at);",
+		"CREATE INDEX IF NOT EXISTS idx_ticket_histories_scope_ticket_created ON ticket_histories(organization_id, project_id, ticket_id, created_at, id);",
+		"CREATE INDEX IF NOT EXISTS idx_ticket_attachments_scope_ticket_created ON ticket_attachments(organization_id, project_id, ticket_id, created_at, id);",
+		"CREATE INDEX IF NOT EXISTS idx_notifications_scope_recipient_created ON notifications(organization_id, project_id, recipient_id, created_at, id);",
 
 		// Agent-native identity, policy, event and lease indexes
 		"CREATE INDEX IF NOT EXISTS idx_service_principals_controls ON service_principals(status, emergency_disabled, expires_at);",
@@ -537,19 +626,25 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_entity_links_project_ticket ON entity_links(organization_id, project_id, ticket_id, created_at);",
 		"CREATE INDEX IF NOT EXISTS idx_ticket_relations_project_source ON ticket_relations(organization_id, project_id, source_ticket_id, created_at);",
 		"CREATE INDEX IF NOT EXISTS idx_ticket_relations_project_target ON ticket_relations(organization_id, project_id, target_ticket_id, created_at);",
+		"CREATE INDEX IF NOT EXISTS idx_entity_links_scope_ticket_timeline ON entity_links(organization_id, project_id, ticket_id, created_at DESC, id DESC);",
+		"CREATE INDEX IF NOT EXISTS idx_ticket_relations_scope_source_timeline ON ticket_relations(organization_id, project_id, source_ticket_id, created_at DESC, id DESC);",
+		"CREATE INDEX IF NOT EXISTS idx_ticket_relations_scope_target_timeline ON ticket_relations(organization_id, project_id, target_ticket_id, created_at DESC, id DESC);",
 		"CREATE INDEX IF NOT EXISTS idx_agent_tasks_context_state ON agent_tasks(context_id, state, updated_at DESC);",
 		"CREATE INDEX IF NOT EXISTS idx_agent_task_events_context_cursor ON agent_task_events(context_id, id);",
 		"CREATE INDEX IF NOT EXISTS idx_agent_push_task ON agent_push_notification_configs(task_id);",
 
 		// Project scope, membership and routing indexes
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_scope_id ON projects(organization_id, id);",
 		"CREATE INDEX IF NOT EXISTS idx_business_units_organization_status ON business_units(organization_id, status);",
 		"CREATE INDEX IF NOT EXISTS idx_projects_organization_status ON projects(organization_id, status);",
 		"CREATE INDEX IF NOT EXISTS idx_projects_business_unit_status ON projects(business_unit_id, status);",
 		"CREATE INDEX IF NOT EXISTS idx_project_memberships_user_active ON project_memberships(user_id, is_active);",
 		"CREATE INDEX IF NOT EXISTS idx_project_memberships_project_role_active ON project_memberships(project_id, role, is_active);",
+		"CREATE INDEX IF NOT EXISTS idx_project_memberships_directory ON project_memberships(project_id, is_active DESC, role, user_id, id);",
 		"CREATE INDEX IF NOT EXISTS idx_teams_project_status ON teams(project_id, status);",
 		"CREATE INDEX IF NOT EXISTS idx_team_memberships_user_active ON team_memberships(user_id, is_active);",
 		"CREATE INDEX IF NOT EXISTS idx_queues_project_status ON queues(project_id, status);",
+		"CREATE INDEX IF NOT EXISTS idx_queues_directory ON queues(project_id, status, is_default DESC, name, id);",
 		"CREATE INDEX IF NOT EXISTS idx_queues_team_status ON queues(team_id, status);",
 		"CREATE INDEX IF NOT EXISTS idx_project_principal_grants_principal_active ON project_principal_grants(service_principal_id, is_active);",
 		"CREATE INDEX IF NOT EXISTS idx_project_principal_grants_project_active ON project_principal_grants(project_id, is_active);",
@@ -559,6 +654,7 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_otp_codes_code ON otp_codes(code);",
 		"CREATE INDEX IF NOT EXISTS idx_otp_codes_expires_at ON otp_codes(expires_at);",
 		"CREATE INDEX IF NOT EXISTS idx_otp_codes_type ON otp_codes(type);",
+		"CREATE INDEX IF NOT EXISTS idx_otp_trusted_devices_directory ON otp_trusted_devices(user_id, revoked, expires_at DESC, id DESC);",
 
 		// 刷新令牌表索引
 		"CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id);",
@@ -607,6 +703,7 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_system_configs_group ON system_configs(\"group\");",
 		"CREATE INDEX IF NOT EXISTS idx_system_configs_is_active ON system_configs(is_active);",
 		"CREATE INDEX IF NOT EXISTS idx_system_configs_category_group ON system_configs(category, \"group\");",
+		"CREATE INDEX IF NOT EXISTS idx_system_configs_directory ON system_configs(category, \"group\", key, id);",
 
 		// 清理日志表索引
 		"CREATE INDEX IF NOT EXISTS idx_cleanup_logs_task_type ON cleanup_logs(task_type);",
@@ -615,6 +712,8 @@ func CreateIndexes(db *gorm.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_cleanup_logs_trigger_type ON cleanup_logs(trigger_type);",
 		"CREATE INDEX IF NOT EXISTS idx_cleanup_logs_trigger_by ON cleanup_logs(trigger_by);",
 		"CREATE INDEX IF NOT EXISTS idx_cleanup_logs_task_status ON cleanup_logs(task_type, status);",
+		"CREATE INDEX IF NOT EXISTS idx_cleanup_logs_directory ON cleanup_logs(created_at DESC, id DESC);",
+		"CREATE INDEX IF NOT EXISTS idx_cleanup_logs_task_directory ON cleanup_logs(task_type, created_at DESC, id DESC);",
 	}
 
 	var indexErrors []error
@@ -622,6 +721,12 @@ func CreateIndexes(db *gorm.DB) error {
 		if err := db.Exec(indexSQL).Error; err != nil {
 			indexErrors = append(indexErrors, fmt.Errorf("%s: %w", indexSQL, err))
 		}
+	}
+	if err := MigrateAutomationWebhookPaginationIndexes(db); err != nil {
+		indexErrors = append(
+			indexErrors,
+			fmt.Errorf("automation and webhook pagination indexes: %w", err),
+		)
 	}
 	if err := errors.Join(indexErrors...); err != nil {
 		return fmt.Errorf("create required indexes: %w", err)
@@ -800,10 +905,23 @@ func seedInitialData(db *gorm.DB, options SeedOptions) error {
 	); err != nil {
 		return err
 	}
+	categoryScope, err := defaultPlatformRoleCutoverScope(db)
+	if err != nil {
+		return fmt.Errorf(
+			"resolve trusted default project for category seed: %w",
+			err,
+		)
+	}
 
 	// 检查是否已有默认分类
 	var categoryCount int64
-	if err := db.Model(&models.Category{}).Count(&categoryCount).Error; err != nil {
+	if err := db.Model(&models.Category{}).
+		Where(
+			"organization_id = ? AND project_id = ?",
+			categoryScope.OrganizationID,
+			categoryScope.ProjectID,
+		).
+		Count(&categoryCount).Error; err != nil {
 		return fmt.Errorf("failed to check default categories: %w", err)
 	}
 
@@ -811,44 +929,52 @@ func seedInitialData(db *gorm.DB, options SeedOptions) error {
 		// 创建默认分类，使用管理员用户ID作为创建者
 		defaultCategories := []*models.Category{
 			{
-				Name:        "技术支持",
-				Slug:        "technical-support",
-				Description: "技术相关问题和支持请求",
-				Type:        models.CategoryTypeSupport,
-				Status:      models.CategoryStatusActive,
-				IsPublic:    true,
-				SortOrder:   1,
-				CreatedBy:   adminUser.ID,
+				OrganizationID: categoryScope.OrganizationID,
+				ProjectID:      categoryScope.ProjectID,
+				Name:           "技术支持",
+				Slug:           "technical-support",
+				Description:    "技术相关问题和支持请求",
+				Type:           models.CategoryTypeSupport,
+				Status:         models.CategoryStatusActive,
+				IsPublic:       true,
+				SortOrder:      1,
+				CreatedBy:      adminUser.ID,
 			},
 			{
-				Name:        "账户问题",
-				Slug:        "account-issues",
-				Description: "账户相关问题和请求",
-				Type:        models.CategoryTypeSupport,
-				Status:      models.CategoryStatusActive,
-				IsPublic:    true,
-				SortOrder:   2,
-				CreatedBy:   adminUser.ID,
+				OrganizationID: categoryScope.OrganizationID,
+				ProjectID:      categoryScope.ProjectID,
+				Name:           "账户问题",
+				Slug:           "account-issues",
+				Description:    "账户相关问题和请求",
+				Type:           models.CategoryTypeSupport,
+				Status:         models.CategoryStatusActive,
+				IsPublic:       true,
+				SortOrder:      2,
+				CreatedBy:      adminUser.ID,
 			},
 			{
-				Name:        "功能请求",
-				Slug:        "feature-requests",
-				Description: "新功能请求和改进建议",
-				Type:        models.CategoryTypeRequest,
-				Status:      models.CategoryStatusActive,
-				IsPublic:    true,
-				SortOrder:   3,
-				CreatedBy:   adminUser.ID,
+				OrganizationID: categoryScope.OrganizationID,
+				ProjectID:      categoryScope.ProjectID,
+				Name:           "功能请求",
+				Slug:           "feature-requests",
+				Description:    "新功能请求和改进建议",
+				Type:           models.CategoryTypeRequest,
+				Status:         models.CategoryStatusActive,
+				IsPublic:       true,
+				SortOrder:      3,
+				CreatedBy:      adminUser.ID,
 			},
 			{
-				Name:        "Bug报告",
-				Slug:        "bug-reports",
-				Description: "系统错误和Bug报告",
-				Type:        models.CategoryTypeIncident,
-				Status:      models.CategoryStatusActive,
-				IsPublic:    true,
-				SortOrder:   4,
-				CreatedBy:   adminUser.ID,
+				OrganizationID: categoryScope.OrganizationID,
+				ProjectID:      categoryScope.ProjectID,
+				Name:           "Bug报告",
+				Slug:           "bug-reports",
+				Description:    "系统错误和Bug报告",
+				Type:           models.CategoryTypeIncident,
+				Status:         models.CategoryStatusActive,
+				IsPublic:       true,
+				SortOrder:      4,
+				CreatedBy:      adminUser.ID,
 			},
 		}
 
@@ -1066,36 +1192,120 @@ func runMigrationsFromModelLocked(
 		return fmt.Errorf("login history method migration failed: %w", err)
 	}
 
-	// 3. Checkpoints are outside the resumable model window: a retry that
+	// 3. Existing audit rows need a deterministic human ActorRef before the
+	// canonical model makes the new columns non-null.
+	if err := PrepareAdminAuditActorColumns(db); err != nil {
+		return fmt.Errorf("admin audit actor preparation failed: %w", err)
+	}
+
+	// 4. Checkpoints are outside the resumable model window: a retry that
 	// starts after this model must still be able to prove whether destructive
 	// data cutovers committed.
 	if err := db.AutoMigrate(&models.SchemaMigrationCheckpoint{}); err != nil {
 		return fmt.Errorf("schema migration checkpoint setup failed: %w", err)
 	}
 
-	// 4. Existing pre-project PostgreSQL tables need a non-null zero sentinel
+	// 5. Category scope has a dedicated evidence-driven cutover. Stage only a
+	// retryable zero sentinel before the canonical NOT NULL model is parsed.
+	if err := PrepareCategoryScopeColumns(db); err != nil {
+		return fmt.Errorf("legacy category scope preparation failed: %w", err)
+	}
+
+	// 6. Existing pre-project PostgreSQL tables need a non-null zero sentinel
 	// before canonical model tags are applied. No live scoped value is inferred
 	// or rewritten here.
 	if err := PrepareLegacyProjectScopeColumns(db); err != nil {
 		return fmt.Errorf("legacy project scope preparation failed: %w", err)
 	}
 
-	// 5. 自动迁移模型
+	// Existing decisions predate the serialized policy-set epoch. Add the
+	// column as nullable and backfill a deterministic non-zero baseline before
+	// GORM applies the canonical NOT NULL model contract.
+	if err := PreparePolicyDecisionEpochColumn(db); err != nil {
+		return fmt.Errorf("policy decision epoch preparation failed: %w", err)
+	}
+
+	// Membership draft contribution is an additive authorization fact. It
+	// must be present even when an operator resumes after the membership model.
+	if err := PrepareKnowledgeContributorColumn(db); err != nil {
+		return fmt.Errorf("knowledge contributor preparation failed: %w", err)
+	}
+	if err := PrepareAttachmentStorageIdentityColumns(db); err != nil {
+		return fmt.Errorf(
+			"attachment storage identity preparation failed: %w",
+			err,
+		)
+	}
+	if err := PrepareKnowledgeObjectIdentityColumns(db); err != nil {
+		return fmt.Errorf(
+			"knowledge object identity preparation failed: %w",
+			err,
+		)
+	}
+	if err := PrepareKnowledgePublishedVersionContract(db); err != nil {
+		return fmt.Errorf(
+			"knowledge published-version preparation failed: %w",
+			err,
+		)
+	}
+
+	// 7. 自动迁移模型
 	if err := autoMigrateFromModel(db, firstModel); err != nil {
 		return fmt.Errorf("auto migration failed: %w", err)
 	}
+	if err := MigrateAttachmentStorageIdentityContract(db); err != nil {
+		return fmt.Errorf(
+			"attachment storage identity migration failed: %w",
+			err,
+		)
+	}
+	if err := MigrateKnowledgeObjectIdentityContract(db); err != nil {
+		return fmt.Errorf(
+			"knowledge object identity migration failed: %w",
+			err,
+		)
+	}
+	if err := MigrateKnowledgeObjectWriteIntentContract(db); err != nil {
+		return fmt.Errorf(
+			"knowledge object write intent migration failed: %w",
+			err,
+		)
+	}
+	if err := MigrateKnowledgePublishedVersionContract(db); err != nil {
+		return fmt.Errorf(
+			"knowledge published-version migration failed: %w",
+			err,
+		)
+	}
 
-	// 6. 将单组织存量数据映射到显式默认项目，并回填人类与服务主体授权。
+	// Remove any interrupted migration default and verify the durable epoch
+	// contract after the canonical model migration.
+	if err := MigratePolicyDecisionEpochContract(db); err != nil {
+		return fmt.Errorf("policy decision epoch migration failed: %w", err)
+	}
+
+	// 7. Install nullable platform-role/ActorRef constraints and the durable
+	// audit-export job/lease/index contract.
+	if err := MigrateAdminAuditExportContract(db); err != nil {
+		return fmt.Errorf("admin audit export migration failed: %w", err)
+	}
+
+	// 9. 将单组织存量数据映射到显式默认项目，并回填人类与服务主体授权。
 	if err := MigrateProjectScope(db, membershipWriters...); err != nil {
 		return fmt.Errorf("project scope migration failed: %w", err)
 	}
 
-	// 7. 原子替换旧四列幂等索引，使六列项目作用域 ON CONFLICT 契约可用。
+	// 10. 依据 Ticket 的可信 ProjectScope 克隆存量分类树并原子重写引用。
+	if err := MigrateCategoryProjectScope(db); err != nil {
+		return fmt.Errorf("category project scope migration failed: %w", err)
+	}
+
+	// 11. 原子替换旧四列幂等索引，使六列项目作用域 ON CONFLICT 契约可用。
 	if err := MigrateIdempotencyScopeIndex(db); err != nil {
 		return fmt.Errorf("idempotency scope index migration failed: %w", err)
 	}
 
-	// 8. 显式扩展外部 A2A 标识符；GORM 不会可靠修改已有 VARCHAR 长度。
+	// 10. 显式扩展外部 A2A 标识符；GORM 不会可靠修改已有 VARCHAR 长度。
 	if err := MigrateA2AIdentifierContract(db); err != nil {
 		return fmt.Errorf("A2A identifier migration failed: %w", err)
 	}
@@ -1125,28 +1335,33 @@ func runMigrationsFromModelLocked(
 		return fmt.Errorf("ticket history event-link migration failed: %w", err)
 	}
 
-	// 14. 收口删除语义明确的外键策略
+	// 14. 将旧的多层回复链扁平化到顶层评论，确保分页端点仍可读取。
+	if err := MigrateNestedCommentReplies(db); err != nil {
+		return fmt.Errorf("nested comment reply migration failed: %w", err)
+	}
+
+	// 15. 收口删除语义明确的外键策略
 	if err := EnsureForeignKeyPolicies(db); err != nil {
 		return fmt.Errorf("foreign-key policy migration failed: %w", err)
 	}
 
-	// 15. 创建额外索引
+	// 16. 创建额外索引
 	if err := CreateIndexes(db); err != nil {
 		return fmt.Errorf("index creation failed: %w", err)
 	}
 
-	// 16. 为项目审计账本安装数据库级追加写与链连续性约束。
+	// 17. 为项目审计账本安装数据库级追加写与链连续性约束。
 	if err := InstallAuditLedgerConstraints(db); err != nil {
 		return fmt.Errorf("audit ledger constraint migration failed: %w", err)
 	}
 
-	// 17. 为 scope-ready 的项目业务表安装 PostgreSQL RLS policy。
+	// 18. 为 scope-ready 的项目业务表安装 PostgreSQL RLS policy。
 	// ENABLE/FORCE 是所有写路径切换到 scoped transaction 后的显式部署步骤。
 	if err := MigrateProjectRLS(db); err != nil {
 		return fmt.Errorf("project RLS migration failed: %w", err)
 	}
 
-	// 18. 所有其他持久迁移成功后，最后切换平台角色、删除旧 role
+	// 19. 所有其他持久迁移成功后，最后切换平台角色、删除旧 role
 	// 列并写入 checkpoint。随后的 runtime gate 只读，因此 checkpoint 是
 	// 该外层事务的最后一笔 durable write。
 	if err := MigratePlatformRoles(db, membershipWriters...); err != nil {

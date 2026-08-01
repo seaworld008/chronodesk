@@ -8,9 +8,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/services"
@@ -19,26 +21,44 @@ import (
 
 // 错误定义
 var (
-	ErrInvalidCredentials  = errors.New("invalid credentials")
-	ErrUserNotFound        = errors.New("user not found")
-	ErrUserExists          = errors.New("user already exists")
-	ErrInvalidToken        = errors.New("invalid token")
-	ErrTokenExpired        = errors.New("token expired")
-	ErrInvalidOTP          = errors.New("invalid OTP")
-	ErrOTPExpired          = errors.New("OTP expired")
-	ErrEmailNotVerified    = errors.New("email not verified")
-	ErrAccountLocked       = errors.New("account locked")
-	ErrAccountInactive     = errors.New("account is inactive")
-	ErrAccountSuspended    = errors.New("account is suspended")
-	ErrAccountDeleted      = errors.New("account is deleted")
-	ErrInvalidAccountState = errors.New("invalid account state")
-	ErrPasswordTooWeak     = errors.New("password too weak")
+	ErrInvalidCredentials   = errors.New("invalid credentials")
+	ErrUserNotFound         = errors.New("user not found")
+	ErrUserExists           = errors.New("user already exists")
+	ErrInvalidToken         = errors.New("invalid token")
+	ErrTokenExpired         = errors.New("token expired")
+	ErrInvalidOTP           = errors.New("invalid OTP")
+	ErrOTPExpired           = errors.New("OTP expired")
+	ErrEmailNotVerified     = errors.New("email not verified")
+	ErrAccountLocked        = errors.New("account locked")
+	ErrAccountInactive      = errors.New("account is inactive")
+	ErrAccountSuspended     = errors.New("account is suspended")
+	ErrAccountDeleted       = errors.New("account is deleted")
+	ErrInvalidAccountState  = errors.New("invalid account state")
+	ErrPasswordTooWeak      = errors.New("password too weak")
+	ErrInvalidProfileName   = errors.New("profile name is invalid")
+	ErrInvalidProfileZone   = errors.New("profile timezone is invalid")
+	ErrInvalidProfileLocale = errors.New(
+		"profile language is not supported",
+	)
+	ErrInvalidProfilePhone  = errors.New("profile phone is invalid")
+	ErrInvalidProfileAvatar = errors.New("profile avatar is invalid")
 )
 
 var (
 	defaultTrustedDeviceTTL        = 30 * 24 * time.Hour
 	defaultTrustedDeviceMaxPerUser = 5
+	profilePhonePattern            = regexp.MustCompile(`^\+[1-9][0-9]{1,14}$`)
 )
+
+const (
+	DefaultProfileLanguage = "zh-CN"
+	EnglishProfileLanguage = "en"
+)
+
+func isSupportedProfileLanguage(language string) bool {
+	return language == DefaultProfileLanguage ||
+		language == EnglishProfileLanguage
+}
 
 // PlatformRole 与领域用户模型共享同一组平台职责，避免认证与治理授权漂移。
 type PlatformRole = models.PlatformRole
@@ -241,6 +261,18 @@ type UpdateProfileRequest struct {
 	Language    *string `json:"language,omitempty"`
 }
 
+// ProfilePatch preserves the JSON field-presence contract through the
+// persistence boundary. A nil pointer means "not requested"; a non-nil empty
+// string is an explicit clear where that field permits it.
+type ProfilePatch struct {
+	FirstName *string
+	LastName  *string
+	Phone     *string
+	Avatar    *string
+	Timezone  *string
+	Language  *string
+}
+
 // VerifyEmailRequest 验证邮箱请求
 type VerifyEmailRequest struct {
 	Token string `json:"token" binding:"required"`
@@ -314,7 +346,7 @@ type UserRepository interface {
 type ProfileRepository interface {
 	Create(ctx context.Context, profile *UserProfile) error
 	GetByUserID(ctx context.Context, userID uint) (*UserProfile, error)
-	Update(ctx context.Context, profile *UserProfile) error
+	Patch(ctx context.Context, userID uint, patch ProfilePatch) error
 	Delete(ctx context.Context, userID uint) error
 }
 
@@ -626,7 +658,7 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 		Department:  req.Department,
 		Position:    req.Position,
 		Timezone:    "UTC",
-		Language:    "en",
+		Language:    DefaultProfileLanguage,
 	}
 	var verification *EmailVerification
 	if emailVerificationEnabled {
@@ -1326,42 +1358,63 @@ func (s *AuthService) ResendVerification(ctx context.Context, email string) erro
 
 // UpdateProfile 更新用户资料
 func (s *AuthService) UpdateProfile(ctx context.Context, userID uint, req *UpdateProfileRequest) error {
-	// 获取用户资料
-	profile, err := s.profileRepo.GetByUserID(ctx, userID)
-	if err != nil {
-		return fmt.Errorf("failed to get profile: %w", err)
+	if req == nil {
+		return ErrInvalidProfileName
 	}
-
-	// 更新字段
-	if req.FirstName != nil {
-		profile.FirstName = *req.FirstName
+	if err := validateUpdateProfileRequest(req); err != nil {
+		return err
 	}
-	if req.LastName != nil {
-		profile.LastName = *req.LastName
-	}
-	if req.PhoneNumber != nil {
-		profile.Phone = *req.PhoneNumber
-	}
-	if req.Avatar != nil {
-		profile.Avatar = *req.Avatar
-	}
-	if req.Timezone != nil {
-		profile.Timezone = *req.Timezone
-	}
-	if req.Language != nil {
-		profile.Language = *req.Language
-	}
-
-	// 更新显示名称
-	if profile.FirstName != "" || profile.LastName != "" {
-		profile.DisplayName = strings.TrimSpace(profile.FirstName + " " + profile.LastName)
-	}
-
-	err = s.profileRepo.Update(ctx, profile)
-	if err != nil {
+	if err := s.profileRepo.Patch(ctx, userID, ProfilePatch{
+		FirstName: req.FirstName,
+		LastName:  req.LastName,
+		Phone:     req.PhoneNumber,
+		Avatar:    req.Avatar,
+		Timezone:  req.Timezone,
+		Language:  req.Language,
+	}); err != nil {
 		return fmt.Errorf("failed to update profile: %w", err)
 	}
 
+	return nil
+}
+
+func validateUpdateProfileRequest(req *UpdateProfileRequest) error {
+	for _, name := range []*string{req.FirstName, req.LastName} {
+		if name == nil {
+			continue
+		}
+		*name = strings.TrimSpace(*name)
+		if utf8.RuneCountInString(*name) > 50 {
+			return ErrInvalidProfileName
+		}
+	}
+	if req.Timezone != nil {
+		*req.Timezone = strings.TrimSpace(*req.Timezone)
+		if *req.Timezone == "" || *req.Timezone == "Local" {
+			return ErrInvalidProfileZone
+		}
+		if _, err := time.LoadLocation(*req.Timezone); err != nil {
+			return ErrInvalidProfileZone
+		}
+	}
+	if req.Language != nil {
+		*req.Language = strings.TrimSpace(*req.Language)
+		if !isSupportedProfileLanguage(*req.Language) {
+			return ErrInvalidProfileLocale
+		}
+	}
+	if req.PhoneNumber != nil {
+		*req.PhoneNumber = strings.TrimSpace(*req.PhoneNumber)
+		if *req.PhoneNumber != "" &&
+			!profilePhonePattern.MatchString(*req.PhoneNumber) {
+			return ErrInvalidProfilePhone
+		}
+	}
+	if req.Avatar != nil {
+		// Compatibility only: new avatar bytes must flow through UploadAvatar.
+		// The legacy request field may preserve the exact current value or clear it.
+		// Do not normalize it before the equality check.
+	}
 	return nil
 }
 

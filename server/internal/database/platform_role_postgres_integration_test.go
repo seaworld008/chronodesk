@@ -261,12 +261,12 @@ func TestPostgresPlatformRoleAuditContractRejectsCatalogDrift(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := ValidatePlatformRoleCutover(db); err == nil ||
-		!strings.Contains(err.Error(), "member default") {
+		!strings.Contains(err.Error(), "nullable without a default") {
 		t.Fatalf("wrong audit platform role default validation error = %v", err)
 	}
 	if err := db.Exec(`
 		ALTER TABLE admin_audit_logs
-		ALTER COLUMN platform_role SET DEFAULT 'member'
+		ALTER COLUMN platform_role DROP DEFAULT
 	`).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -297,19 +297,19 @@ func TestPostgresPlatformRoleAuditContractRejectsCatalogDrift(t *testing.T) {
 			DROP CONSTRAINT chk_admin_audit_logs_platform_role;
 		ALTER TABLE admin_audit_logs
 			ADD CONSTRAINT chk_admin_audit_logs_platform_role
-			CHECK (platform_role IN (
+			CHECK (platform_role IS NULL OR platform_role IN (
 				'platform_admin',
 				'security_auditor',
 				'emergency_operator',
 				'member'
 			));
 		ALTER TABLE admin_audit_logs
-			ALTER COLUMN platform_role DROP NOT NULL
+			ALTER COLUMN platform_role SET NOT NULL
 	`).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := ValidatePlatformRoleCutover(db); err == nil ||
-		!strings.Contains(err.Error(), "NOT NULL") {
+		!strings.Contains(err.Error(), "nullable without a default") {
 		t.Fatalf("nullable audit platform role validation error = %v", err)
 	}
 }
@@ -346,9 +346,12 @@ func TestPostgresPlatformRoleCutoverRejectsUnprovenRetainedState(
 			wantState: "admin_audit_logs=1",
 			insert: func(t *testing.T, db *gorm.DB) {
 				t.Helper()
+				role := models.PlatformRoleMember
 				if err := db.Create(&models.AdminAuditLog{
 					Username:     "unproven-audit",
-					PlatformRole: models.PlatformRoleMember,
+					ActorType:    models.ActorTypeHuman,
+					ActorID:      "human:unproven-audit",
+					PlatformRole: &role,
 					Action:       "legacy_action",
 				}).Error; err != nil {
 					t.Fatal(err)
@@ -399,9 +402,12 @@ func TestPostgresPlatformRoleCutoverRejectsUnprovenRetainedState(
 				`).Error; err != nil {
 					t.Fatal(err)
 				}
+				role := models.PlatformRoleMember
 				if err := db.Create(&models.AdminAuditLog{
 					Username:     "asymmetric-audit",
-					PlatformRole: models.PlatformRoleMember,
+					ActorType:    models.ActorTypeHuman,
+					ActorID:      "human:asymmetric-audit",
+					PlatformRole: &role,
 					Action:       "legacy_admin_action",
 				}).Error; err != nil {
 					t.Fatal(err)
@@ -485,6 +491,7 @@ func TestPostgresPlatformRoleFinalCheckpointFailureRollsBackEveryArtifact(
 		);
 		CREATE TABLE admin_audit_logs (
 			id BIGSERIAL PRIMARY KEY,
+			user_id BIGINT,
 			role VARCHAR(50)
 		)
 	`).Error; err != nil {

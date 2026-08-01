@@ -1,0 +1,379 @@
+diff --git a/node_modules/ra-ui-materialui/dist/input/AutocompleteInput.cjs b/node_modules/ra-ui-materialui/dist/input/AutocompleteInput.cjs
+index 7c76b61..de61205 100644
+--- a/node_modules/ra-ui-materialui/dist/input/AutocompleteInput.cjs
++++ b/node_modules/ra-ui-materialui/dist/input/AutocompleteInput.cjs
+@@ -487,7 +487,7 @@ If you provided a React element for the optionText prop, you must also provide t
+                     ...TextFieldProps?.InputProps,
+                 };
+                 // @ts-expect-error slotProps do not yet exist in MUI v5
+-                const mergedSlotProps = TextFieldProps?.slotProps
++                const mergedSlotProps = material_1.major >= 6
+                     ? {
+                         slotProps: {
+                             // @ts-expect-error slotProps do not yet exist in MUI v5
+@@ -501,11 +501,11 @@ If you provided a React element for the optionText prop, you must also provide t
+                         },
+                     }
+                     : undefined;
+-                return (React.createElement(material_1.TextField, { name: field.name, label: label !== '' && label !== false ? (React.createElement(ra_core_1.FieldTitle, { label: label, source: source, resource: resourceProp, isRequired: isRequired })) : null, error: !!fetchError || invalid, helperText: renderHelperText ? (React.createElement(InputHelperText_1.InputHelperText, { error: error?.message ||
+-                            fetchError?.message, helperText: helperText })) : null, margin: margin, variant: variant, className: (0, clsx_1.default)({
++                    return (React.createElement(material_1.TextField, { name: field.name, label: label !== '' && label !== false ? (React.createElement(ra_core_1.FieldTitle, { label: label, source: source, resource: resourceProp, isRequired: isRequired })) : null, error: !!fetchError || invalid, helperText: renderHelperText ? (React.createElement(InputHelperText_1.InputHelperText, { error: error?.message ||
++                                fetchError?.message, helperText: helperText })) : null, margin: margin, variant: variant, className: (0, clsx_1.default)({
+                         [exports.AutocompleteInputClasses.textField]: true,
+                         [exports.AutocompleteInputClasses.emptyLabel]: label === false || label === '',
+-                    }), ...params, ...TextFieldProps, InputProps: mergedTextFieldProps, ...mergedSlotProps, size: size, inputRef: handleInputRef }));
++                    }), ...params, ...TextFieldProps, ...(material_1.major < 9 ? { InputProps: mergedTextFieldProps } : {}), ...mergedSlotProps, size: size, inputRef: handleInputRef }));
+             }, multiple: multiple, ...(material_1.major >= 7
+                 ? // In MUI v7, renderValue replaces renderTags, but it is also
+                     // called in single-selection mode with a non-array value.
+diff --git a/node_modules/ra-ui-materialui/dist/input/AutocompleteInput.js b/node_modules/ra-ui-materialui/dist/input/AutocompleteInput.js
+index a08783e..b39fff2 100644
+--- a/node_modules/ra-ui-materialui/dist/input/AutocompleteInput.js
++++ b/node_modules/ra-ui-materialui/dist/input/AutocompleteInput.js
+@@ -448,7 +448,7 @@ If you provided a React element for the optionText prop, you must also provide t
+                     ...TextFieldProps?.InputProps,
+                 };
+                 // @ts-expect-error slotProps do not yet exist in MUI v5
+-                const mergedSlotProps = TextFieldProps?.slotProps
++                const mergedSlotProps = muiMajor >= 6
+                     ? {
+                         slotProps: {
+                             // @ts-expect-error slotProps do not yet exist in MUI v5
+@@ -462,11 +462,11 @@ If you provided a React element for the optionText prop, you must also provide t
+                         },
+                     }
+                     : undefined;
+-                return (React.createElement(TextField, { name: field.name, label: label !== '' && label !== false ? (React.createElement(FieldTitle, { label: label, source: source, resource: resourceProp, isRequired: isRequired })) : null, error: !!fetchError || invalid, helperText: renderHelperText ? (React.createElement(InputHelperText, { error: error?.message ||
+-                            fetchError?.message, helperText: helperText })) : null, margin: margin, variant: variant, className: clsx({
++                    return (React.createElement(TextField, { name: field.name, label: label !== '' && label !== false ? (React.createElement(FieldTitle, { label: label, source: source, resource: resourceProp, isRequired: isRequired })) : null, error: !!fetchError || invalid, helperText: renderHelperText ? (React.createElement(InputHelperText, { error: error?.message ||
++                                fetchError?.message, helperText: helperText })) : null, margin: margin, variant: variant, className: clsx({
+                         [AutocompleteInputClasses.textField]: true,
+                         [AutocompleteInputClasses.emptyLabel]: label === false || label === '',
+-                    }), ...params, ...TextFieldProps, InputProps: mergedTextFieldProps, ...mergedSlotProps, size: size, inputRef: handleInputRef }));
++                    }), ...params, ...TextFieldProps, ...(muiMajor < 9 ? { InputProps: mergedTextFieldProps } : {}), ...mergedSlotProps, size: size, inputRef: handleInputRef }));
+             }, multiple: multiple, ...(muiMajor >= 7
+                 ? // In MUI v7, renderValue replaces renderTags, but it is also
+                     // called in single-selection mode with a non-array value.
+diff --git a/node_modules/ra-ui-materialui/dist/input/DateInput.cjs b/node_modules/ra-ui-materialui/dist/input/DateInput.cjs
+index 263a703..b3f15dc 100644
+--- a/node_modules/ra-ui-materialui/dist/input/DateInput.cjs
++++ b/node_modules/ra-ui-materialui/dist/input/DateInput.cjs
+@@ -189,7 +189,7 @@ const DateInput = (props) => {
+             ...rest.slotProps?.inputLabel,
+         },
+     };
+-    return (React.createElement(StyledTextField, { id: id, name: name, inputRef: inputRef, defaultValue: format(initialDefaultValueRef.current), key: inputKey, type: "date", onChange: handleChange, onFocus: handleFocus, onBlur: handleBlur, className: (0, clsx_1.default)('ra-input', `ra-input-${source}`, className), size: "small", variant: variant, margin: margin, error: invalid, disabled: disabled || readOnly, readOnly: readOnly, helperText: renderHelperText ? (React.createElement(InputHelperText_1.InputHelperText, { error: error?.message, helperText: helperText })) : null, label: label !== '' && label !== false ? (React.createElement(ra_core_1.FieldTitle, { label: label, source: source, resource: resource, isRequired: isRequired })) : null, InputLabelProps: defaultInputLabelProps, ...(0, sanitizeInputRestProps_1.sanitizeInputRestProps)(rest), ...(material_1.major >= 6 ? { slotProps: mergedSlotProps } : {}) }));
++    return (React.createElement(StyledTextField, { id: id, name: name, inputRef: inputRef, defaultValue: format(initialDefaultValueRef.current), key: inputKey, type: "date", onChange: handleChange, onFocus: handleFocus, onBlur: handleBlur, className: (0, clsx_1.default)('ra-input', `ra-input-${source}`, className), size: "small", variant: variant, margin: margin, error: invalid, disabled: disabled || readOnly, readOnly: readOnly, helperText: renderHelperText ? (React.createElement(InputHelperText_1.InputHelperText, { error: error?.message, helperText: helperText })) : null, label: label !== '' && label !== false ? (React.createElement(ra_core_1.FieldTitle, { label: label, source: source, resource: resource, isRequired: isRequired })) : null, ...(material_1.major < 9 ? { InputLabelProps: defaultInputLabelProps } : {}), ...(0, sanitizeInputRestProps_1.sanitizeInputRestProps)(rest), ...(material_1.major >= 6 ? { slotProps: mergedSlotProps } : {}) }));
+ };
+ exports.DateInput = DateInput;
+ /**
+diff --git a/node_modules/ra-ui-materialui/dist/input/DateInput.js b/node_modules/ra-ui-materialui/dist/input/DateInput.js
+index 48f9cf7..91c18a7 100644
+--- a/node_modules/ra-ui-materialui/dist/input/DateInput.js
++++ b/node_modules/ra-ui-materialui/dist/input/DateInput.js
+@@ -150,7 +150,7 @@ export const DateInput = (props) => {
+             ...rest.slotProps?.inputLabel,
+         },
+     };
+-    return (React.createElement(StyledTextField, { id: id, name: name, inputRef: inputRef, defaultValue: format(initialDefaultValueRef.current), key: inputKey, type: "date", onChange: handleChange, onFocus: handleFocus, onBlur: handleBlur, className: clsx('ra-input', `ra-input-${source}`, className), size: "small", variant: variant, margin: margin, error: invalid, disabled: disabled || readOnly, readOnly: readOnly, helperText: renderHelperText ? (React.createElement(InputHelperText, { error: error?.message, helperText: helperText })) : null, label: label !== '' && label !== false ? (React.createElement(FieldTitle, { label: label, source: source, resource: resource, isRequired: isRequired })) : null, InputLabelProps: defaultInputLabelProps, ...sanitizeInputRestProps(rest), ...(muiMajor >= 6 ? { slotProps: mergedSlotProps } : {}) }));
++    return (React.createElement(StyledTextField, { id: id, name: name, inputRef: inputRef, defaultValue: format(initialDefaultValueRef.current), key: inputKey, type: "date", onChange: handleChange, onFocus: handleFocus, onBlur: handleBlur, className: clsx('ra-input', `ra-input-${source}`, className), size: "small", variant: variant, margin: margin, error: invalid, disabled: disabled || readOnly, readOnly: readOnly, helperText: renderHelperText ? (React.createElement(InputHelperText, { error: error?.message, helperText: helperText })) : null, label: label !== '' && label !== false ? (React.createElement(FieldTitle, { label: label, source: source, resource: resource, isRequired: isRequired })) : null, ...(muiMajor < 9 ? { InputLabelProps: defaultInputLabelProps } : {}), ...sanitizeInputRestProps(rest), ...(muiMajor >= 6 ? { slotProps: mergedSlotProps } : {}) }));
+ };
+ /**
+  * Convert Date object to String, using the local timezone
+diff --git a/node_modules/ra-ui-materialui/dist/input/DateTimeInput.cjs b/node_modules/ra-ui-materialui/dist/input/DateTimeInput.cjs
+index 8ef34a5..8c63368 100644
+--- a/node_modules/ra-ui-materialui/dist/input/DateTimeInput.cjs
++++ b/node_modules/ra-ui-materialui/dist/input/DateTimeInput.cjs
+@@ -151,7 +151,7 @@ const DateTimeInput = (props) => {
+             ...rest.slotProps?.inputLabel,
+         },
+     };
+-    return (React.createElement(StyledTextField, { id: id, inputRef: inputRef, name: name, defaultValue: format(initialDefaultValueRef.current), key: inputKey, type: "datetime-local", onChange: handleChange, onFocus: handleFocus, onBlur: handleBlur, className: (0, clsx_1.default)('ra-input', `ra-input-${source}`, className), size: "small", variant: variant, margin: margin, error: invalid, disabled: disabled || readOnly, readOnly: readOnly, helperText: renderHelperText ? (React.createElement(InputHelperText_1.InputHelperText, { error: error?.message, helperText: helperText })) : null, label: label !== '' && label !== false ? (React.createElement(ra_core_1.FieldTitle, { label: label, source: source, resource: resource, isRequired: isRequired })) : null, InputLabelProps: defaultInputLabelProps, ...(0, sanitizeInputRestProps_1.sanitizeInputRestProps)(rest), ...(material_1.major >= 6 ? { slotProps: mergedSlotProps } : {}) }));
++    return (React.createElement(StyledTextField, { id: id, inputRef: inputRef, name: name, defaultValue: format(initialDefaultValueRef.current), key: inputKey, type: "datetime-local", onChange: handleChange, onFocus: handleFocus, onBlur: handleBlur, className: (0, clsx_1.default)('ra-input', `ra-input-${source}`, className), size: "small", variant: variant, margin: margin, error: invalid, disabled: disabled || readOnly, readOnly: readOnly, helperText: renderHelperText ? (React.createElement(InputHelperText_1.InputHelperText, { error: error?.message, helperText: helperText })) : null, label: label !== '' && label !== false ? (React.createElement(ra_core_1.FieldTitle, { label: label, source: source, resource: resource, isRequired: isRequired })) : null, ...(material_1.major < 9 ? { InputLabelProps: defaultInputLabelProps } : {}), ...(0, sanitizeInputRestProps_1.sanitizeInputRestProps)(rest), ...(material_1.major >= 6 ? { slotProps: mergedSlotProps } : {}) }));
+ };
+ exports.DateTimeInput = DateTimeInput;
+ const leftPad = (nb = 2) => value => ('0'.repeat(nb) + value).slice(-nb);
+diff --git a/node_modules/ra-ui-materialui/dist/input/DateTimeInput.js b/node_modules/ra-ui-materialui/dist/input/DateTimeInput.js
+index adf2d2f..9a7759e 100644
+--- a/node_modules/ra-ui-materialui/dist/input/DateTimeInput.js
++++ b/node_modules/ra-ui-materialui/dist/input/DateTimeInput.js
+@@ -112,7 +112,7 @@ export const DateTimeInput = (props) => {
+             ...rest.slotProps?.inputLabel,
+         },
+     };
+-    return (React.createElement(StyledTextField, { id: id, inputRef: inputRef, name: name, defaultValue: format(initialDefaultValueRef.current), key: inputKey, type: "datetime-local", onChange: handleChange, onFocus: handleFocus, onBlur: handleBlur, className: clsx('ra-input', `ra-input-${source}`, className), size: "small", variant: variant, margin: margin, error: invalid, disabled: disabled || readOnly, readOnly: readOnly, helperText: renderHelperText ? (React.createElement(InputHelperText, { error: error?.message, helperText: helperText })) : null, label: label !== '' && label !== false ? (React.createElement(FieldTitle, { label: label, source: source, resource: resource, isRequired: isRequired })) : null, InputLabelProps: defaultInputLabelProps, ...sanitizeInputRestProps(rest), ...(muiMajor >= 6 ? { slotProps: mergedSlotProps } : {}) }));
++    return (React.createElement(StyledTextField, { id: id, inputRef: inputRef, name: name, defaultValue: format(initialDefaultValueRef.current), key: inputKey, type: "datetime-local", onChange: handleChange, onFocus: handleFocus, onBlur: handleBlur, className: clsx('ra-input', `ra-input-${source}`, className), size: "small", variant: variant, margin: margin, error: invalid, disabled: disabled || readOnly, readOnly: readOnly, helperText: renderHelperText ? (React.createElement(InputHelperText, { error: error?.message, helperText: helperText })) : null, label: label !== '' && label !== false ? (React.createElement(FieldTitle, { label: label, source: source, resource: resource, isRequired: isRequired })) : null, ...(muiMajor < 9 ? { InputLabelProps: defaultInputLabelProps } : {}), ...sanitizeInputRestProps(rest), ...(muiMajor >= 6 ? { slotProps: mergedSlotProps } : {}) }));
+ };
+ const leftPad = (nb = 2) => value => ('0'.repeat(nb) + value).slice(-nb);
+ const leftPad4 = leftPad(4);
+diff --git a/node_modules/ra-ui-materialui/dist/input/ResettableTextField.cjs b/node_modules/ra-ui-materialui/dist/input/ResettableTextField.cjs
+index bd7f4c3..7d700c0 100644
+--- a/node_modules/ra-ui-materialui/dist/input/ResettableTextField.cjs
++++ b/node_modules/ra-ui-materialui/dist/input/ResettableTextField.cjs
+@@ -114,7 +114,7 @@ exports.ResettableTextField = (0, react_1.forwardRef)((inProps, ref) => {
+         // @ts-expect-error slotProps do not yet exist in MUI v5
+         input: { ...inputProps, ...rest.slotProps?.input },
+     };
+-    return (React.createElement(StyledTextField, { value: value, InputProps: inputProps, disabled: disabled || readOnly, variant: variant, margin: margin, className: className, ...rest, ...(material_1.major >= 6 ? { slotProps: mergedSlotProps } : {}), inputRef: ref }));
++    return (React.createElement(StyledTextField, { value: value, ...(material_1.major < 9 ? { InputProps: inputProps } : {}), disabled: disabled || readOnly, variant: variant, margin: margin, className: className, ...rest, ...(material_1.major >= 6 ? { slotProps: mergedSlotProps } : {}), inputRef: ref }));
+ });
+ exports.ResettableTextField.displayName = 'ResettableTextField';
+ const handleMouseDownClearButton = event => {
+diff --git a/node_modules/ra-ui-materialui/dist/input/ResettableTextField.js b/node_modules/ra-ui-materialui/dist/input/ResettableTextField.js
+index 1ee7a8a..2d3feca 100644
+--- a/node_modules/ra-ui-materialui/dist/input/ResettableTextField.js
++++ b/node_modules/ra-ui-materialui/dist/input/ResettableTextField.js
+@@ -75,7 +75,7 @@ export const ResettableTextField = forwardRef((inProps, ref) => {
+         // @ts-expect-error slotProps do not yet exist in MUI v5
+         input: { ...inputProps, ...rest.slotProps?.input },
+     };
+-    return (React.createElement(StyledTextField, { value: value, InputProps: inputProps, disabled: disabled || readOnly, variant: variant, margin: margin, className: className, ...rest, ...(muiMajor >= 6 ? { slotProps: mergedSlotProps } : {}), inputRef: ref }));
++    return (React.createElement(StyledTextField, { value: value, ...(muiMajor < 9 ? { InputProps: inputProps } : {}), disabled: disabled || readOnly, variant: variant, margin: margin, className: className, ...rest, ...(muiMajor >= 6 ? { slotProps: mergedSlotProps } : {}), inputRef: ref }));
+ });
+ ResettableTextField.displayName = 'ResettableTextField';
+ const handleMouseDownClearButton = event => {
+diff --git a/node_modules/ra-ui-materialui/dist/list/datagrid/DatagridRow.cjs b/node_modules/ra-ui-materialui/dist/list/datagrid/DatagridRow.cjs
+index 5e2e5b6..b8a893f 100644
+--- a/node_modules/ra-ui-materialui/dist/list/datagrid/DatagridRow.cjs
++++ b/node_modules/ra-ui-materialui/dist/list/datagrid/DatagridRow.cjs
+@@ -93,6 +93,11 @@ const DatagridRow = react_1.default.forwardRef((props, ref) => {
+         onToggleItem(id, event);
+         event.stopPropagation();
+     }, [id, onToggleItem, selectable]);
++    const selectRowInputProps = {
++        'aria-label': translate('ra.action.select_row', {
++            _: 'Select this row',
++        }),
++    };
+     const getPathForRecord = (0, ra_core_1.useGetPathForRecordCallback)();
+     const handleClick = (0, react_1.useCallback)(async (event) => {
+         event.persist();
+@@ -140,9 +145,7 @@ const DatagridRow = react_1.default.forwardRef((props, ref) => {
+                     [useDatagridStyles_1.DatagridClasses.expanded]: expanded,
+                 }), expanded: expanded, onClick: handleToggleExpand, expandContentId: `${id}-expand` })))),
+             hasBulkActions && (react_1.default.createElement(material_1.TableCell, { padding: "checkbox" },
+-                react_1.default.createElement(material_1.Checkbox, { "aria-label": translate('ra.action.select_row', {
+-                        _: 'Select this row',
+-                    }), color: "primary", className: `select-item ${useDatagridStyles_1.DatagridClasses.checkbox}`, checked: selectable && selected, onClick: handleToggleSelection, disabled: !selectable }))),
++                react_1.default.createElement(material_1.Checkbox, { slotProps: { input: selectRowInputProps }, color: "primary", className: `select-item ${useDatagridStyles_1.DatagridClasses.checkbox}`, checked: selectable && selected, onClick: handleToggleSelection, disabled: !selectable }))),
+             react_1.default.Children.map(children, (field, index) => (0, react_1.isValidElement)(field) ? (react_1.default.createElement(DatagridCell_1.default, { key: `${id}-${field.props.source || index}`, className: (0, clsx_1.default)(`column-${field.props.source}`, useDatagridStyles_1.DatagridClasses.rowCell), record: record, field: field,
+                 resource })) : null)),
+         expandable && expanded && (react_1.default.createElement(material_1.TableRow, { key: `${id}-expand`, id: `${id}-expand`, className: useDatagridStyles_1.DatagridClasses.expandedPanel },
+@@ -159,4 +162,4 @@ exports.PureDatagridRow = (0, react_1.memo)(DatagridRow, areEqual);
+ exports.PureDatagridRow.displayName = 'PureDatagridRow';
+ const isPromise = (value) => value && typeof value.then === 'function';
+ exports.default = DatagridRow;
+-//# sourceMappingURL=DatagridRow.js.map
+\ No newline at end of file
++//# sourceMappingURL=DatagridRow.js.map
+diff --git a/node_modules/ra-ui-materialui/dist/list/datagrid/DatagridRow.js b/node_modules/ra-ui-materialui/dist/list/datagrid/DatagridRow.js
+index f3c23ca..6313b8b 100644
+--- a/node_modules/ra-ui-materialui/dist/list/datagrid/DatagridRow.js
++++ b/node_modules/ra-ui-materialui/dist/list/datagrid/DatagridRow.js
+@@ -54,6 +54,11 @@ const DatagridRow = React.forwardRef((props, ref) => {
+         onToggleItem(id, event);
+         event.stopPropagation();
+     }, [id, onToggleItem, selectable]);
++    const selectRowInputProps = {
++        'aria-label': translate('ra.action.select_row', {
++            _: 'Select this row',
++        }),
++    };
+     const getPathForRecord = useGetPathForRecordCallback();
+     const handleClick = useCallback(async (event) => {
+         event.persist();
+@@ -101,9 +106,7 @@ const DatagridRow = React.forwardRef((props, ref) => {
+                     [DatagridClasses.expanded]: expanded,
+                 }), expanded: expanded, onClick: handleToggleExpand, expandContentId: `${id}-expand` })))),
+             hasBulkActions && (React.createElement(TableCell, { padding: "checkbox" },
+-                React.createElement(Checkbox, { "aria-label": translate('ra.action.select_row', {
+-                        _: 'Select this row',
+-                    }), color: "primary", className: `select-item ${DatagridClasses.checkbox}`, checked: selectable && selected, onClick: handleToggleSelection, disabled: !selectable }))),
++                React.createElement(Checkbox, { slotProps: { input: selectRowInputProps }, color: "primary", className: `select-item ${DatagridClasses.checkbox}`, checked: selectable && selected, onClick: handleToggleSelection, disabled: !selectable }))),
+             React.Children.map(children, (field, index) => isValidElement(field) ? (React.createElement(DatagridCell, { key: `${id}-${field.props.source || index}`, className: clsx(`column-${field.props.source}`, DatagridClasses.rowCell), record: record, field: field,
+                 resource })) : null)),
+         expandable && expanded && (React.createElement(TableRow, { key: `${id}-expand`, id: `${id}-expand`, className: DatagridClasses.expandedPanel },
+@@ -120,4 +123,4 @@ export const PureDatagridRow = memo(DatagridRow, areEqual);
+ PureDatagridRow.displayName = 'PureDatagridRow';
+ const isPromise = (value) => value && typeof value.then === 'function';
+ export default DatagridRow;
+-//# sourceMappingURL=DatagridRow.js.map
+\ No newline at end of file
++//# sourceMappingURL=DatagridRow.js.map
+diff --git a/node_modules/ra-ui-materialui/dist/list/datatable/SelectRowCheckbox.cjs b/node_modules/ra-ui-materialui/dist/list/datatable/SelectRowCheckbox.cjs
+index 390bc7f..55c8d4c 100644
+--- a/node_modules/ra-ui-materialui/dist/list/datatable/SelectRowCheckbox.cjs
++++ b/node_modules/ra-ui-materialui/dist/list/datatable/SelectRowCheckbox.cjs
+@@ -48,15 +48,18 @@ exports.SelectRowCheckbox = (0, react_1.memo)(() => {
+     }
+     const selectable = !isRowSelectable || isRowSelectable(record);
+     const selected = selectedIds?.includes(record.id);
++    const selectRowInputProps = {
++        'aria-label': translate('ra.action.select_row', {
++            _: 'Select this row',
++        }),
++    };
+     const handleToggleSelection = (0, react_1.useCallback)(event => {
+         if (!selectable || !handleToggleItem)
+             return;
+         handleToggleItem(record.id, event);
+         event.stopPropagation();
+     }, [record.id, handleToggleItem, selectable]);
+-    return (react_1.default.createElement(material_1.Checkbox, { "aria-label": translate('ra.action.select_row', {
+-            _: 'Select this row',
+-        }), color: "primary", className: `select-item ${DataTableRoot_1.DataTableClasses.checkbox}`, checked: selectable && selected, onClick: handleToggleSelection, disabled: !selectable }));
++    return (react_1.default.createElement(material_1.Checkbox, { slotProps: { input: selectRowInputProps }, color: "primary", className: `select-item ${DataTableRoot_1.DataTableClasses.checkbox}`, checked: selectable && selected, onClick: handleToggleSelection, disabled: !selectable }));
+ });
+ exports.SelectRowCheckbox.displayName = 'SelectRowTableCell';
+-//# sourceMappingURL=SelectRowCheckbox.js.map
+\ No newline at end of file
++//# sourceMappingURL=SelectRowCheckbox.js.map
+diff --git a/node_modules/ra-ui-materialui/dist/list/datatable/SelectRowCheckbox.js b/node_modules/ra-ui-materialui/dist/list/datatable/SelectRowCheckbox.js
+index b57ec32..3df58dc 100644
+--- a/node_modules/ra-ui-materialui/dist/list/datatable/SelectRowCheckbox.js
++++ b/node_modules/ra-ui-materialui/dist/list/datatable/SelectRowCheckbox.js
+@@ -12,15 +12,18 @@ export const SelectRowCheckbox = memo(() => {
+     }
+     const selectable = !isRowSelectable || isRowSelectable(record);
+     const selected = selectedIds?.includes(record.id);
++    const selectRowInputProps = {
++        'aria-label': translate('ra.action.select_row', {
++            _: 'Select this row',
++        }),
++    };
+     const handleToggleSelection = useCallback(event => {
+         if (!selectable || !handleToggleItem)
+             return;
+         handleToggleItem(record.id, event);
+         event.stopPropagation();
+     }, [record.id, handleToggleItem, selectable]);
+-    return (React.createElement(Checkbox, { "aria-label": translate('ra.action.select_row', {
+-            _: 'Select this row',
+-        }), color: "primary", className: `select-item ${DataTableClasses.checkbox}`, checked: selectable && selected, onClick: handleToggleSelection, disabled: !selectable }));
++    return (React.createElement(Checkbox, { slotProps: { input: selectRowInputProps }, color: "primary", className: `select-item ${DataTableClasses.checkbox}`, checked: selectable && selected, onClick: handleToggleSelection, disabled: !selectable }));
+ });
+ SelectRowCheckbox.displayName = 'SelectRowTableCell';
+-//# sourceMappingURL=SelectRowCheckbox.js.map
+\ No newline at end of file
++//# sourceMappingURL=SelectRowCheckbox.js.map
+diff --git a/node_modules/ra-ui-materialui/src/input/AutocompleteInput.tsx b/node_modules/ra-ui-materialui/src/input/AutocompleteInput.tsx
+index d5e8eb9..0ff87bc 100644
+--- a/node_modules/ra-ui-materialui/src/input/AutocompleteInput.tsx
++++ b/node_modules/ra-ui-materialui/src/input/AutocompleteInput.tsx
+@@ -726,7 +726,7 @@ If you provided a React element for the optionText prop, you must also provide t
+                         ...TextFieldProps?.InputProps,
+                     };
+                     // @ts-expect-error slotProps do not yet exist in MUI v5
+-                    const mergedSlotProps = TextFieldProps?.slotProps
++                    const mergedSlotProps = muiMajor >= 6
+                         ? {
+                               slotProps: {
+                                   // @ts-expect-error slotProps do not yet exist in MUI v5
+@@ -774,7 +774,9 @@ If you provided a React element for the optionText prop, you must also provide t
+                             })}
+                             {...params}
+                             {...TextFieldProps}
+-                            InputProps={mergedTextFieldProps}
++                            {...(muiMajor < 9
++                                ? { InputProps: mergedTextFieldProps }
++                                : {})}
+                             {...mergedSlotProps}
+                             size={size}
+                             inputRef={handleInputRef}
+diff --git a/node_modules/ra-ui-materialui/src/input/DateInput.tsx b/node_modules/ra-ui-materialui/src/input/DateInput.tsx
+index ab4e663..ad5028c 100644
+--- a/node_modules/ra-ui-materialui/src/input/DateInput.tsx
++++ b/node_modules/ra-ui-materialui/src/input/DateInput.tsx
+@@ -234,7 +234,9 @@ export const DateInput = (props: DateInputProps) => {
+                     />
+                 ) : null
+             }
+-            InputLabelProps={defaultInputLabelProps}
++            {...(muiMajor < 9
++                ? { InputLabelProps: defaultInputLabelProps }
++                : {})}
+             {...sanitizeInputRestProps(rest)}
+             {...(muiMajor >= 6 ? { slotProps: mergedSlotProps } : {})}
+         />
+diff --git a/node_modules/ra-ui-materialui/src/input/DateTimeInput.tsx b/node_modules/ra-ui-materialui/src/input/DateTimeInput.tsx
+index 6c742b4..d4e283b 100644
+--- a/node_modules/ra-ui-materialui/src/input/DateTimeInput.tsx
++++ b/node_modules/ra-ui-materialui/src/input/DateTimeInput.tsx
+@@ -193,7 +193,9 @@ export const DateTimeInput = (props: DateTimeInputProps) => {
+                     />
+                 ) : null
+             }
+-            InputLabelProps={defaultInputLabelProps}
++            {...(muiMajor < 9
++                ? { InputLabelProps: defaultInputLabelProps }
++                : {})}
+             {...sanitizeInputRestProps(rest)}
+             {...(muiMajor >= 6 ? { slotProps: mergedSlotProps } : {})}
+         />
+diff --git a/node_modules/ra-ui-materialui/src/input/ResettableTextField.tsx b/node_modules/ra-ui-materialui/src/input/ResettableTextField.tsx
+index ab61e04..ee2cc71 100644
+--- a/node_modules/ra-ui-materialui/src/input/ResettableTextField.tsx
++++ b/node_modules/ra-ui-materialui/src/input/ResettableTextField.tsx
+@@ -169,7 +169,7 @@ export const ResettableTextField = forwardRef(
+         return (
+             <StyledTextField
+                 value={value}
+-                InputProps={inputProps}
++                {...(muiMajor < 9 ? { InputProps: inputProps } : {})}
+                 disabled={disabled || readOnly}
+                 variant={variant}
+                 margin={margin}
+diff --git a/node_modules/ra-ui-materialui/src/list/datagrid/DatagridRow.tsx b/node_modules/ra-ui-materialui/src/list/datagrid/DatagridRow.tsx
+index bc3e05f..5604c3f 100644
+--- a/node_modules/ra-ui-materialui/src/list/datagrid/DatagridRow.tsx
++++ b/node_modules/ra-ui-materialui/src/list/datagrid/DatagridRow.tsx
+@@ -120,6 +120,11 @@ const DatagridRow: React.ForwardRefExoticComponent<
+         },
+         [id, onToggleItem, selectable]
+     );
++    const selectRowInputProps = {
++        'aria-label': translate('ra.action.select_row', {
++            _: 'Select this row',
++        }),
++    };
+ 
+     const getPathForRecord = useGetPathForRecordCallback();
+ 
+@@ -201,9 +206,7 @@ const DatagridRow: React.ForwardRefExoticComponent<
+                 {hasBulkActions && (
+                     <TableCell padding="checkbox">
+                         <Checkbox
+-                            aria-label={translate('ra.action.select_row', {
+-                                _: 'Select this row',
+-                            })}
++                            slotProps={{ input: selectRowInputProps }}
+                             color="primary"
+                             className={`select-item ${DatagridClasses.checkbox}`}
+                             checked={selectable && selected}
+diff --git a/node_modules/ra-ui-materialui/src/list/datatable/SelectRowCheckbox.tsx b/node_modules/ra-ui-materialui/src/list/datatable/SelectRowCheckbox.tsx
+index 28e0bf6..4275ea4 100644
+--- a/node_modules/ra-ui-materialui/src/list/datatable/SelectRowCheckbox.tsx
++++ b/node_modules/ra-ui-materialui/src/list/datatable/SelectRowCheckbox.tsx
+@@ -23,6 +23,11 @@ export const SelectRowCheckbox = memo(() => {
+ 
+     const selectable = !isRowSelectable || isRowSelectable(record);
+     const selected = selectedIds?.includes(record.id);
++    const selectRowInputProps = {
++        'aria-label': translate('ra.action.select_row', {
++            _: 'Select this row',
++        }),
++    };
+ 
+     const handleToggleSelection = useCallback(
+         event => {
+@@ -35,9 +40,7 @@ export const SelectRowCheckbox = memo(() => {
+ 
+     return (
+         <Checkbox
+-            aria-label={translate('ra.action.select_row', {
+-                _: 'Select this row',
+-            })}
++            slotProps={{ input: selectRowInputProps }}
+             color="primary"
+             className={`select-item ${DataTableClasses.checkbox}`}
+             checked={selectable && selected}

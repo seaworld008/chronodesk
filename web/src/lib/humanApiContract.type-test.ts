@@ -51,10 +51,18 @@ buildHumanApiRequest('listPlatformProjects', {
 
 const platformProjectSummary: PlatformProjectSummary = {
   public_id: '019fb344-fa16-7e13-9c5b-08eb95478098',
+  created_at: '2026-07-31T00:00:00Z',
+  updated_at: '2026-07-31T00:00:00Z',
   key: 'DEMO',
   name: '演示项目',
   description: '演示项目',
   status: 'active',
+  business_unit: {
+    public_id: '019fb344-fa16-7e13-9c5b-08eb95478099',
+    key: 'OPS',
+    name: '运营',
+    description: '',
+  },
 }
 
 const createdPlatformProject: CreatePlatformProjectOperationResponse = {
@@ -67,9 +75,15 @@ void createdPlatformProject.data.public_id
 const listedPlatformProjects: ListPlatformProjectsOperationResponse = {
   code: 0,
   msg: '获取成功',
-  data: [platformProjectSummary],
+  data: {
+    items: [platformProjectSummary],
+    total: 1,
+    page: 1,
+    page_size: 25,
+    total_pages: 1,
+  },
 }
-void listedPlatformProjects.data[0]?.public_id
+void listedPlatformProjects.data.items[0]?.public_id
 
 const archivedPlatformProject: ArchivePlatformProjectOperationResponse = {
   code: 0,

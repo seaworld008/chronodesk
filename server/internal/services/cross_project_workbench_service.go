@@ -99,7 +99,8 @@ type authorizedWorkbenchProject struct {
 }
 
 type CrossProjectWorkbenchService struct {
-	db *gorm.DB
+	db  *gorm.DB
+	now func() time.Time
 }
 
 func NewCrossProjectWorkbenchService(

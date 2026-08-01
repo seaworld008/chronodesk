@@ -122,9 +122,39 @@ func TestWebhookHandlerEncryptsCredentialsAtRest(t *testing.T) {
 	if strings.Contains(rotationResponse.Body.String(), "signature-secret") {
 		t.Fatal("webhook rotation response leaked a signing secret")
 	}
+	if strings.Contains(
+		rotationResponse.Body.String(),
+		"https://hooks.example.test/events",
+	) || strings.Contains(rotationResponse.Body.String(), `"webhook_url"`) {
+		t.Fatalf(
+			"webhook rotation response leaked raw URL: %s",
+			rotationResponse.Body.String(),
+		)
+	}
+	var rotationPayload struct {
+		Data WebhookConfigResponse `json:"data"`
+	}
+	if err := json.Unmarshal(rotationResponse.Body.Bytes(), &rotationPayload); err != nil {
+		t.Fatal(err)
+	}
+	if !rotationPayload.Data.HasWebhookURL ||
+		rotationPayload.Data.WebhookURLMasked !=
+			"https://hooks.example.test/…" {
+		t.Fatalf(
+			"masked URL response = %+v",
+			rotationPayload.Data,
+		)
+	}
 	var rotated models.WebhookConfig
 	if err := db.First(&rotated, stored.ID).Error; err != nil {
 		t.Fatal(err)
+	}
+	if rotated.WebhookURL != stored.WebhookURL {
+		t.Fatalf(
+			"omitted edit URL changed from %q to %q",
+			stored.WebhookURL,
+			rotated.WebhookURL,
+		)
 	}
 	if !security.IsEnvelope(rotated.Secret) ||
 		!security.IsEnvelope(rotated.PreviousSecret) ||

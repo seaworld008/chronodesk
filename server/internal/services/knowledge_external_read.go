@@ -14,6 +14,7 @@ import (
 )
 
 type knowledgeAuthorizationEpoch struct {
+	ActorType            models.ActorType
 	ProjectID            uint
 	ProjectUpdatedAtNano int64
 	UserID               uint
@@ -22,6 +23,15 @@ type knowledgeAuthorizationEpoch struct {
 	MembershipVersion    uint64
 	MembershipUpdatedAt  int64
 	Role                 models.ProjectRole
+	PrincipalID          string
+	PrincipalUpdatedAt   int64
+	PrincipalPolicyEpoch uint64
+	GrantID              uint
+	GrantUpdatedAt       int64
+	GrantRole            models.ProjectRole
+	GrantScopesDigest    [sha256.Size]byte
+	CredentialID         string
+	CredentialUpdatedAt  int64
 	SubjectsDigest       [sha256.Size]byte
 	PolicyDigest         [sha256.Size]byte
 }
@@ -33,9 +43,45 @@ type knowledgeSearchSnapshot struct {
 	provider ModelProvider
 }
 
+func (service *KnowledgeService) resolveKnowledgeSearchModelSnapshot(
+	ctx context.Context,
+	scope models.ProjectScope,
+) (
+	models.ProjectModelPolicy,
+	ModelProvider,
+	[]byte,
+	error,
+) {
+	policy, provider, err := service.resolveKnowledgeModelPolicy(ctx, scope)
+	if errors.Is(err, ErrKnowledgeModelPolicyUnavailable) {
+		// OpenSearch lexical retrieval is the safe, useful baseline. No
+		// document content leaves the deployment when a model policy/provider
+		// is absent or not currently approved.
+		return models.ProjectModelPolicy{},
+			nil,
+			[]byte(`{"mode":"lexical"}`),
+			nil
+	}
+	if err != nil {
+		return models.ProjectModelPolicy{}, nil, nil, err
+	}
+	payload, err := json.Marshal(policy)
+	if err != nil {
+		return models.ProjectModelPolicy{},
+			nil,
+			nil,
+			fmt.Errorf(
+				"encode knowledge authorization model policy: %w",
+				err,
+			)
+	}
+	return policy, provider, payload, nil
+}
+
 func (service *KnowledgeService) captureKnowledgeSearchSnapshot(
 	ctx context.Context,
 	operation OperationContext,
+	policyDecisionID string,
 ) (knowledgeSearchSnapshot, error) {
 	var snapshot knowledgeSearchSnapshot
 	if service == nil || service.db == nil || service.projects == nil {
@@ -43,14 +89,6 @@ func (service *KnowledgeService) captureKnowledgeSearchSnapshot(
 			"knowledge authorization snapshot is unavailable",
 		)
 	}
-	if operation.Actor.Type != models.ActorTypeHuman {
-		return snapshot, ErrProjectKnowledgeAccessDenied
-	}
-	userID, err := parseKnowledgeHumanID(operation.Actor.ID)
-	if err != nil {
-		return snapshot, ErrProjectKnowledgeAccessDenied
-	}
-
 	reusable, err := scopeddb.CanReuseProjectScopeTransaction(
 		ctx,
 		operation.Scope,
@@ -64,7 +102,7 @@ func (service *KnowledgeService) captureKnowledgeSearchSnapshot(
 			service.captureKnowledgeSearchSnapshotInTransaction(
 				scopedContext,
 				operation,
-				userID,
+				policyDecisionID,
 			)
 		return captureErr
 	}
@@ -82,6 +120,33 @@ func (service *KnowledgeService) captureKnowledgeSearchSnapshot(
 }
 
 func (service *KnowledgeService) captureKnowledgeSearchSnapshotInTransaction(
+	ctx context.Context,
+	operation OperationContext,
+	policyDecisionID string,
+) (knowledgeSearchSnapshot, error) {
+	switch operation.Actor.Type {
+	case models.ActorTypeHuman:
+		userID, err := parseKnowledgeHumanID(operation.Actor.ID)
+		if err != nil {
+			return knowledgeSearchSnapshot{}, ErrProjectKnowledgeAccessDenied
+		}
+		return service.captureHumanKnowledgeSearchSnapshot(
+			ctx,
+			operation,
+			userID,
+		)
+	case models.ActorTypeServicePrincipal:
+		return service.capturePrincipalKnowledgeSearchSnapshot(
+			ctx,
+			operation,
+			policyDecisionID,
+		)
+	default:
+		return knowledgeSearchSnapshot{}, ErrProjectKnowledgeAccessDenied
+	}
+}
+
+func (service *KnowledgeService) captureHumanKnowledgeSearchSnapshot(
 	ctx context.Context,
 	operation OperationContext,
 	userID uint,
@@ -127,10 +192,11 @@ func (service *KnowledgeService) captureKnowledgeSearchSnapshotInTransaction(
 	if err != nil {
 		return knowledgeSearchSnapshot{}, err
 	}
-	policy, provider, err := service.resolveKnowledgeModelPolicy(
-		ctx,
-		operation.Scope,
-	)
+	policy, provider, policyPayload, err :=
+		service.resolveKnowledgeSearchModelSnapshot(
+			ctx,
+			operation.Scope,
+		)
 	if err != nil {
 		return knowledgeSearchSnapshot{}, err
 	}
@@ -141,15 +207,9 @@ func (service *KnowledgeService) captureKnowledgeSearchSnapshotInTransaction(
 			err,
 		)
 	}
-	policyPayload, err := json.Marshal(policy)
-	if err != nil {
-		return knowledgeSearchSnapshot{}, fmt.Errorf(
-			"encode knowledge authorization model policy: %w",
-			err,
-		)
-	}
 	return knowledgeSearchSnapshot{
 		epoch: knowledgeAuthorizationEpoch{
+			ActorType:            models.ActorTypeHuman,
 			ProjectID:            access.Project.ID,
 			ProjectUpdatedAtNano: access.Project.UpdatedAt.UTC().UnixNano(),
 			UserID:               identity.ID,
@@ -170,10 +230,128 @@ func (service *KnowledgeService) captureKnowledgeSearchSnapshotInTransaction(
 	}, nil
 }
 
+func (service *KnowledgeService) capturePrincipalKnowledgeSearchSnapshot(
+	ctx context.Context,
+	operation OperationContext,
+	policyDecisionID string,
+) (knowledgeSearchSnapshot, error) {
+	if strings.TrimSpace(operation.CredentialID) == "" {
+		return knowledgeSearchSnapshot{}, ErrProjectKnowledgeAccessDenied
+	}
+	access, err := service.projects.RevalidatePrincipalProjectAccess(
+		ctx,
+		operation.Scope,
+		operation.Actor.ID,
+		knowledgeReadScope,
+	)
+	if err != nil {
+		return knowledgeSearchSnapshot{}, err
+	}
+	if err := service.validateAuthoredPolicyDecisionTx(
+		ctx,
+		operation,
+		policyDecisionID,
+		knowledgeReadScope,
+		"knowledge.search",
+		"knowledge",
+		"*",
+		false,
+	); err != nil {
+		return knowledgeSearchSnapshot{}, err
+	}
+	var principal models.ServicePrincipal
+	if err := service.db.WithContext(ctx).
+		Select("id", "updated_at", "policy_epoch").
+		Where("id = ?", operation.Actor.ID).
+		Take(&principal).Error; err != nil {
+		return knowledgeSearchSnapshot{}, fmt.Errorf(
+			"load knowledge principal epoch: %w",
+			err,
+		)
+	}
+	var credential models.AgentCredential
+	if err := service.db.WithContext(ctx).
+		Select(
+			"id",
+			"updated_at",
+			"status",
+			"expires_at",
+			"revoked_at",
+		).
+		Where(
+			"id = ? AND service_principal_id = ?",
+			operation.CredentialID,
+			operation.Actor.ID,
+		).
+		Take(&credential).Error; err != nil {
+		return knowledgeSearchSnapshot{}, fmt.Errorf(
+			"load knowledge credential epoch: %w",
+			err,
+		)
+	}
+	if credential.Status != models.AgentCredentialStatusActive ||
+		credential.RevokedAt != nil ||
+		!credential.ExpiresAt.After(service.now().UTC()) {
+		return knowledgeSearchSnapshot{}, ErrProjectKnowledgeAccessDenied
+	}
+	subjects, err := service.resolveKnowledgeSubjects(ctx, operation)
+	if err != nil {
+		return knowledgeSearchSnapshot{}, err
+	}
+	policy, provider, policyPayload, err :=
+		service.resolveKnowledgeSearchModelSnapshot(
+			ctx,
+			operation.Scope,
+		)
+	if err != nil {
+		return knowledgeSearchSnapshot{}, err
+	}
+	subjectPayload, err := json.Marshal(subjects)
+	if err != nil {
+		return knowledgeSearchSnapshot{}, fmt.Errorf(
+			"encode knowledge principal subjects: %w",
+			err,
+		)
+	}
+	grantScopesPayload, err := json.Marshal(access.Scopes)
+	if err != nil {
+		return knowledgeSearchSnapshot{}, fmt.Errorf(
+			"encode knowledge principal grant scopes: %w",
+			err,
+		)
+	}
+	authorization := access.AuthorizationSnapshot
+	return knowledgeSearchSnapshot{
+		epoch: knowledgeAuthorizationEpoch{
+			ActorType:            models.ActorTypeServicePrincipal,
+			ProjectID:            access.Project.ID,
+			ProjectUpdatedAtNano: access.Project.UpdatedAt.UTC().UnixNano(),
+			PrincipalID:          principal.ID,
+			PrincipalUpdatedAt:   principal.UpdatedAt.UTC().UnixNano(),
+			PrincipalPolicyEpoch: principal.PolicyEpoch,
+			GrantID:              authorization.GrantID,
+			GrantUpdatedAt:       authorization.GrantUpdatedAt.UTC().UnixNano(),
+			GrantRole:            authorization.GrantRole,
+			GrantScopesDigest:    sha256.Sum256(grantScopesPayload),
+			CredentialID:         credential.ID,
+			CredentialUpdatedAt:  credential.UpdatedAt.UTC().UnixNano(),
+			SubjectsDigest:       sha256.Sum256(subjectPayload),
+			PolicyDigest:         sha256.Sum256(policyPayload),
+		},
+		subjects: append(
+			[]models.KnowledgeACLSubject(nil),
+			subjects...,
+		),
+		policy:   policy,
+		provider: provider,
+	}, nil
+}
+
 func (service *KnowledgeService) finalizeKnowledgeSearch(
 	ctx context.Context,
 	operation OperationContext,
 	expected knowledgeAuthorizationEpoch,
+	policyDecisionID string,
 	hits []HybridSearchHit,
 	citations []models.KnowledgeCitation,
 ) error {
@@ -188,7 +366,7 @@ func (service *KnowledgeService) finalizeKnowledgeSearch(
 				service.captureKnowledgeSearchSnapshotInTransaction(
 					scopedContext,
 					operation,
-					expected.UserID,
+					policyDecisionID,
 				)
 			if snapshotErr != nil {
 				return snapshotErr
@@ -199,16 +377,34 @@ func (service *KnowledgeService) finalizeKnowledgeSearch(
 			if len(hits) == 0 {
 				return nil
 			}
-			if err := service.validateKnowledgeSearchHits(
-				scopedContext,
-				operation.Scope,
-				finalSnapshot.subjects,
-				hits,
-			); err != nil {
+			authoritativeHits, displayByChunk, err :=
+				service.validateKnowledgeSearchHits(
+					scopedContext,
+					operation.Scope,
+					finalSnapshot.subjects,
+					hits,
+				)
+			if err != nil {
 				return err
 			}
 			if len(citations) == 0 {
 				return nil
+			}
+			for index := range citations {
+				display, ok := displayByChunk[citations[index].ChunkID]
+				if !ok {
+					return ErrProjectKnowledgeAccessDenied
+				}
+				authoritative, ok := authoritativeHits[citations[index].ChunkID]
+				if !ok {
+					return ErrProjectKnowledgeAccessDenied
+				}
+				citations[index].ArticleKey = display.ArticleKey
+				citations[index].ArticleTitle = display.ArticleTitle
+				citations[index].SectionPath = display.SectionPath
+				citations[index].PageNumber = authoritative.PageNumber
+				citations[index].Snippet = authoritative.Snippet
+				citations[index].ContentHash = authoritative.ContentHash
 			}
 			if err := service.db.WithContext(scopedContext).
 				Create(&citations).Error; err != nil {
@@ -222,12 +418,71 @@ func (service *KnowledgeService) finalizeKnowledgeSearch(
 	)
 }
 
+// prevalidateKnowledgeSearchHits converts an OpenSearch projection back into
+// PostgreSQL-authoritative snippets before any result text is sent to a model
+// provider. The final write transaction repeats the authorization and
+// document checks to close the subsequent TOCTOU window.
+func (service *KnowledgeService) prevalidateKnowledgeSearchHits(
+	ctx context.Context,
+	operation OperationContext,
+	expected knowledgeAuthorizationEpoch,
+	policyDecisionID string,
+	hits []HybridSearchHit,
+) ([]HybridSearchHit, error) {
+	validated := make([]HybridSearchHit, 0, len(hits))
+	err := scopeddb.WithProjectScopeContextTransaction(
+		ctx,
+		service.db,
+		operation.Scope,
+		func(scopedContext context.Context) error {
+			snapshot, err :=
+				service.captureKnowledgeSearchSnapshotInTransaction(
+					scopedContext,
+					operation,
+					policyDecisionID,
+				)
+			if err != nil {
+				return err
+			}
+			if snapshot.epoch != expected {
+				return ErrProjectAccessDenied
+			}
+			authoritativeByChunk, _, err :=
+				service.validateKnowledgeSearchHits(
+					scopedContext,
+					operation.Scope,
+					snapshot.subjects,
+					hits,
+				)
+			if err != nil {
+				return err
+			}
+			for _, hit := range hits {
+				authoritative, ok := authoritativeByChunk[hit.ChunkID]
+				if !ok {
+					return ErrProjectKnowledgeAccessDenied
+				}
+				validated = append(validated, authoritative)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return validated, nil
+}
+
 func (service *KnowledgeService) validateKnowledgeSearchHits(
 	ctx context.Context,
 	scope models.ProjectScope,
 	subjects []models.KnowledgeACLSubject,
 	hits []HybridSearchHit,
-) error {
+) (
+	map[string]HybridSearchHit,
+	map[string]knowledgeCitationDisplay,
+	error,
+) {
 	chunkIDs := make([]string, 0, len(hits))
 	articleIDs := make([]string, 0, len(hits))
 	for _, hit := range hits {
@@ -237,15 +492,21 @@ func (service *KnowledgeService) validateKnowledgeSearchHits(
 	type liveChunk struct {
 		ID              string
 		ArticleID       string
+		ArticleKey      string
+		ArticleTitle    string
 		VersionID       string
 		DocumentVersion uint64
+		PageNumber      *int
+		SectionPath     string
+		Snippet         string
 		ContentHash     string
+		TokenCount      int
 	}
 	var rows []liveChunk
 	if err := service.db.WithContext(ctx).
 		Table("knowledge_chunks AS chunks").
 		Select(
-			"chunks.id, chunks.article_id, chunks.version_id, versions.version AS document_version, chunks.content_hash",
+			"chunks.id, chunks.article_id, articles.key AS article_key, articles.title AS article_title, chunks.version_id, versions.version AS document_version, chunks.page_number, chunks.section_path, chunks.snippet, chunks.content_hash, chunks.token_count",
 		).
 		Joins(
 			"JOIN knowledge_article_versions AS versions ON versions.id = chunks.version_id AND versions.article_id = chunks.article_id",
@@ -273,7 +534,10 @@ func (service *KnowledgeService) validateKnowledgeSearchHits(
 			models.KnowledgeArticleActive,
 		).
 		Find(&rows).Error; err != nil {
-		return fmt.Errorf("revalidate knowledge search documents: %w", err)
+		return nil, nil, fmt.Errorf(
+			"revalidate knowledge search documents: %w",
+			err,
+		)
 	}
 	liveByID := make(map[string]liveChunk, len(rows))
 	for _, row := range rows {
@@ -286,7 +550,7 @@ func (service *KnowledgeService) validateKnowledgeSearchHits(
 			row.VersionID != hit.VersionID ||
 			row.DocumentVersion != hit.DocumentVersion ||
 			row.ContentHash != hit.ContentHash {
-			return ErrProjectKnowledgeAccessDenied
+			return nil, nil, ErrProjectKnowledgeAccessDenied
 		}
 	}
 
@@ -324,7 +588,10 @@ func (service *KnowledgeService) validateKnowledgeSearchHits(
 			subjectArguments...,
 		).
 		Find(&aclRows).Error; err != nil {
-		return fmt.Errorf("revalidate knowledge search ACL: %w", err)
+		return nil, nil, fmt.Errorf(
+			"revalidate knowledge search ACL: %w",
+			err,
+		)
 	}
 	allowed := make(map[string]struct{}, len(aclRows))
 	for _, row := range aclRows {
@@ -332,8 +599,32 @@ func (service *KnowledgeService) validateKnowledgeSearchHits(
 	}
 	for _, hit := range hits {
 		if _, ok := allowed[hit.ArticleID]; !ok {
-			return ErrProjectKnowledgeAccessDenied
+			return nil, nil, ErrProjectKnowledgeAccessDenied
 		}
 	}
-	return nil
+	authoritativeHits := make(map[string]HybridSearchHit, len(hits))
+	displayByChunk := make(
+		map[string]knowledgeCitationDisplay,
+		len(liveByID),
+	)
+	for _, hit := range hits {
+		row := liveByID[hit.ChunkID]
+		hit.PageNumber = row.PageNumber
+		hit.Snippet = row.Snippet
+		hit.ContentHash = row.ContentHash
+		hit.TokenCount = row.TokenCount
+		authoritativeHits[hit.ChunkID] = hit
+		displayByChunk[hit.ChunkID] = knowledgeCitationDisplay{
+			ArticleKey:   row.ArticleKey,
+			ArticleTitle: row.ArticleTitle,
+			SectionPath:  row.SectionPath,
+		}
+	}
+	return authoritativeHits, displayByChunk, nil
+}
+
+type knowledgeCitationDisplay struct {
+	ArticleKey   string
+	ArticleTitle string
+	SectionPath  string
 }

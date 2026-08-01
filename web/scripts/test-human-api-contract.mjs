@@ -40,9 +40,11 @@ const [
     ticketTypes,
     workbenchTypes,
     adminApp,
+    auditExplorer,
     workbenchPage,
     emailSettings,
     systemSettings,
+    automationLogs,
     webhookSettings,
     agentControl,
     notificationCreate,
@@ -51,13 +53,30 @@ const [
     ticketConversation,
     ticketWorkflowActions,
     authProvider,
+    loginHistory,
+    ticketRelationships,
+    agentCollaboration,
+    automationSLA,
+    automationTemplates,
+    automationQuickReplies,
+    automationDirectory,
+    knowledgeManagement,
+    knowledgeApi,
+    knowledgeTypes,
+    ticketCreate,
+    ticketEdit,
+    integrationRuntime,
+    integrationData,
+    integrationTypes,
 ] = await Promise.all([
     readWebSource('types', 'index.ts'),
     readWebSource('lib', 'types', 'crossProjectWorkbench.ts'),
     readWebSource('AdminApp.tsx'),
+    readWebSource('admin', 'audit', 'PlatformAuditExplorer.tsx'),
     readWebSource('admin', 'workbench', 'CrossProjectWorkbench.tsx'),
     readWebSource('admin', 'settings', 'EmailSettings.tsx'),
     readWebSource('admin', 'settings', 'SystemSettings.tsx'),
+    readWebSource('admin', 'automation', 'AutomationLogList.tsx'),
     readWebSource('admin', 'settings', 'WebhookSettings.tsx'),
     readWebSource('admin', 'agents', 'AgentControlCenter.tsx'),
     readWebSource('admin', 'notifications', 'NotificationCreate.tsx'),
@@ -66,10 +85,30 @@ const [
     readWebSource('admin', 'tickets', 'TicketConversationPanel.tsx'),
     readWebSource('admin', 'tickets', 'TicketWorkflowActions.tsx'),
     readWebSource('lib', 'authProvider.ts'),
+    readWebSource('admin', 'security', 'LoginHistory.tsx'),
+    readWebSource('admin', 'tickets', 'TicketRelationshipsPanel.tsx'),
+    readWebSource('admin', 'agents', 'AgentCollaborationWorkspace.tsx'),
+    readWebSource('admin', 'automation', 'AutomationSLAList.tsx'),
+    readWebSource('admin', 'automation', 'AutomationTemplateList.tsx'),
+    readWebSource('admin', 'automation', 'AutomationQuickReplyList.tsx'),
+    readWebSource('admin', 'automation', 'useAutomationDirectory.ts'),
+    readWebSource('admin', 'knowledge', 'KnowledgeManagementPage.tsx'),
+    readWebSource('admin', 'knowledge', 'knowledgeApi.ts'),
+    readWebSource('admin', 'knowledge', 'types.ts'),
+    readWebSource('admin', 'tickets', 'TicketCreate.tsx'),
+    readWebSource('admin', 'tickets', 'TicketEdit.tsx'),
+    readWebSource('admin', 'integrations', 'IntegrationRuntime.tsx'),
+    readWebSource('admin', 'integrations', 'useIntegrationData.ts'),
+    readWebSource('admin', 'integrations', 'integrationTypes.ts'),
 ])
+const knowledgeClient = [
+    knowledgeManagement,
+    knowledgeApi,
+    knowledgeTypes,
+].join('\n')
 
 assert.equal(contract.openapi, '3.2.0')
-assert.equal(contract['x-chronodesk-types-generator'], '2.0.0')
+assert.equal(contract['x-chronodesk-types-generator'], '2.1.0')
 assert.deepEqual(contract.components.schemas.PlatformRole.enum, [
     'platform_admin',
     'security_auditor',
@@ -91,6 +130,26 @@ assert.equal(
     contract.components.schemas.ProjectRole['x-chronodesk-runtime-values'],
     'projectRoleValues',
 )
+for (const [name, schema] of Object.entries(contract.components.schemas)) {
+    if (!Array.isArray(schema.allOf)) continue
+    const extendsSuccessEnvelope = schema.allOf.some(
+        (branch) =>
+            branch.$ref === '#/components/schemas/SuccessEnvelope',
+    )
+    if (!extendsSuccessEnvelope) continue
+    assert.equal(
+        schema.unevaluatedProperties,
+        false,
+        `${name} must close composed success fields`,
+    )
+    assert.equal(
+        schema.allOf.some(
+            (branch) => branch.additionalProperties === false,
+        ),
+        false,
+        `${name} contains an unsatisfiable allOf branch`,
+    )
+}
 
 for (const name of [
     'PlatformRole',
@@ -106,17 +165,92 @@ for (const name of [
     'AuthorizedProjectAccess',
     'ProjectMembership',
     'ProjectMembershipEnvelope',
+    'TrustedDevice',
+    'TrustedDevicePage',
+    'TrustedDevicePageEnvelope',
+    'QueueStatus',
+    'ProjectQueue',
+    'ProjectQueuePage',
+    'ProjectQueuePageEnvelope',
+    'CleanupLog',
+    'CleanupLogPage',
+    'CleanupLogPageEnvelope',
     'AdminUser',
     'AdminUserStats',
     'AdminAuditLog',
     'AdminAuditLogPage',
     'PlatformProjectSummary',
     'PlatformProjectSummaryEnvelope',
-    'PlatformProjectSummaryListEnvelope',
+    'PlatformProjectPage',
+    'PlatformProjectPageEnvelope',
+    'ProjectCreationContext',
+    'PlatformBusinessUnitPage',
+    'ProjectUserOptionPage',
     'StandardErrorEnvelope',
     'AuthErrorEnvelope',
     'CodedErrorEnvelope',
     'ErrorEnvelope',
+    'LoginHistoryRecord',
+    'LoginHistoryPage',
+    'ProjectCategory',
+    'ProjectCategoryPage',
+    'ProjectAssignee',
+    'ProjectAssigneePage',
+    'TicketEntityLink',
+    'TicketEntityLinkPage',
+    'TicketRelation',
+    'TicketRelationPage',
+    'AgentRunSummary',
+    'AgentRunDetail',
+    'ActionProposalSummary',
+    'ApprovalTaskSummary',
+    'HandoffSummary',
+    'ProjectIntakeConfiguration',
+    'SLAConfig',
+    'SLAConfigPage',
+    'TicketTemplate',
+    'TicketTemplatePage',
+    'QuickReply',
+    'QuickReplyPage',
+    'KnowledgeArticle',
+    'KnowledgeArticlePage',
+    'KnowledgeVersion',
+    'KnowledgeVersionPage',
+    'KnowledgeIngestion',
+    'KnowledgeIngestionPage',
+    'CreateKnowledgeArticleRequest',
+    'CreateKnowledgeDraftRequest',
+    'KnowledgeSource',
+    'KnowledgeAuthoredResult',
+    'KnowledgeDocumentSection',
+    'KnowledgeDocument',
+    'KnowledgeSearchRequest',
+    'KnowledgeCitation',
+    'KnowledgeSearchResult',
+    'KnowledgeIndexState',
+    'IntegrationConnectorDefinitionSummary',
+    'IntegrationConnectorDefinitionPage',
+    'IntegrationConnectionSummary',
+    'IntegrationConnectionPage',
+    'IntegrationMappingSummary',
+    'IntegrationMappingPage',
+    'IntegrationInboxMessageSummary',
+    'IntegrationInboxMessagePage',
+    'IntegrationInboxReceiptSummary',
+    'IntegrationInboxReceiptPage',
+    'IntegrationSyncRunSummary',
+    'IntegrationSyncRunPage',
+    'IntegrationConflictSummary',
+    'IntegrationConflictPage',
+    'IntegrationDeadLetterSummary',
+    'IntegrationDeadLetterPage',
+    'IntegrationDomainEventSummary',
+    'IntegrationDomainEventCursorPage',
+    'IntegrationOutboxSummary',
+    'IntegrationOutboxPage',
+    'IntegrationOverview',
+    'IntegrationMappingDryRunResult',
+    'IntegrationInboundReplayResult',
 ]) {
     assert.match(generated, new RegExp(`export type ${name} =`))
 }
@@ -140,7 +274,14 @@ const requiredOperations = [
     ['/auth/logout-all', 'post'],
     ['/auth/me', 'get'],
     ['/auth/profile', 'put'],
+    ['/user/trusted-devices', 'get'],
+    ['/user/trusted-devices/{deviceID}', 'delete'],
+    ['/user/login-history', 'get'],
+    ['/user/login-history/{loginHistoryID}', 'delete'],
     ['/projects/{projectKey}/context', 'get'],
+    ['/projects/{projectKey}/queues', 'get'],
+    ['/projects/{projectKey}/categories', 'get'],
+    ['/projects/{projectKey}/assignees', 'get'],
     ['/projects/{projectKey}/memberships', 'get'],
     ['/projects/{projectKey}/memberships', 'post'],
     ['/projects/{projectKey}/memberships/{userID}', 'delete'],
@@ -155,12 +296,568 @@ const requiredOperations = [
     ['/platform/users/{userID}', 'delete'],
     ['/platform/users/{userID}/reset-password', 'post'],
     ['/platform/audit-logs', 'get'],
+    ['/platform/audit-logs/{auditLogID}', 'get'],
+    ['/platform/system/cleanup/logs', 'get'],
+    ['/projects/{projectKey}/tickets/{ticketID}/entity-links', 'get'],
+    ['/projects/{projectKey}/tickets/{ticketID}/entity-links', 'post'],
+    ['/projects/{projectKey}/tickets/{ticketID}/relations', 'get'],
+    ['/projects/{projectKey}/tickets/{ticketID}/relations', 'post'],
+    ['/projects/{projectKey}/tickets/my-tickets', 'get'],
+    ['/projects/{projectKey}/tickets/unassigned', 'get'],
+    ['/projects/{projectKey}/agent-collaboration/runs', 'get'],
+    ['/projects/{projectKey}/agent-collaboration/proposals', 'get'],
+    ['/projects/{projectKey}/agent-collaboration/approvals', 'get'],
+    ['/projects/{projectKey}/agent-collaboration/handoffs', 'get'],
+    ['/projects/{projectKey}/configuration/intake', 'get'],
+    ['/projects/{projectKey}/admin/automation/sla', 'get'],
+    ['/projects/{projectKey}/admin/automation/templates', 'get'],
+    ['/projects/{projectKey}/admin/automation/quick-replies', 'get'],
+    ['/projects/{projectKey}/knowledge/articles', 'get'],
+    ['/projects/{projectKey}/knowledge/articles', 'post'],
+    [
+        '/projects/{projectKey}/knowledge/articles/{articleID}/drafts',
+        'post',
+    ],
+    [
+        '/projects/{projectKey}/knowledge/articles/{articleID}/document',
+        'get',
+    ],
+    ['/projects/{projectKey}/knowledge/articles/{articleID}/versions', 'get'],
+    [
+        '/projects/{projectKey}/knowledge/versions/{versionID}/publication',
+        'post',
+    ],
+    ['/projects/{projectKey}/knowledge/searches', 'post'],
+    ['/projects/{projectKey}/knowledge/ingestions', 'get'],
+    ['/projects/{projectKey}/knowledge/index-rebuilds/current', 'get'],
+    ['/projects/{projectKey}/knowledge/index-rebuilds', 'post'],
+    ['/projects/{projectKey}/integrations/connector-definitions', 'get'],
+    ['/projects/{projectKey}/integrations/connector-definitions', 'post'],
+    [
+        '/projects/{projectKey}/integrations/connector-definitions/{definitionID}',
+        'put',
+    ],
+    ['/projects/{projectKey}/integrations/connections', 'get'],
+    ['/projects/{projectKey}/integrations/connections', 'post'],
+    [
+        '/projects/{projectKey}/integrations/connections/{connectionID}',
+        'put',
+    ],
+    [
+        '/projects/{projectKey}/integrations/connections/{connectionID}/mappings',
+        'get',
+    ],
+    [
+        '/projects/{projectKey}/integrations/connections/{connectionID}/mappings',
+        'post',
+    ],
+    ['/projects/{projectKey}/integrations/mappings/{mappingID}', 'put'],
+    [
+        '/projects/{projectKey}/integrations/mappings/{mappingID}/dry-runs',
+        'post',
+    ],
+    [
+        '/projects/{projectKey}/integrations/mappings/{mappingID}/publication',
+        'post',
+    ],
+    ['/projects/{projectKey}/integrations/overview', 'get'],
+    ['/projects/{projectKey}/integrations/inbox', 'get'],
+    [
+        '/projects/{projectKey}/integrations/inbox/{messageID}/receipts',
+        'get',
+    ],
+    ['/projects/{projectKey}/integrations/sync-runs', 'get'],
+    ['/projects/{projectKey}/integrations/conflicts', 'get'],
+    [
+        '/projects/{projectKey}/integrations/conflicts/{conflictID}/resolution',
+        'post',
+    ],
+    ['/projects/{projectKey}/integrations/dead-letters', 'get'],
+    [
+        '/projects/{projectKey}/integrations/dead-letters/{deadLetterID}/replays',
+        'post',
+    ],
+    ['/projects/{projectKey}/integrations/domain-events', 'get'],
+    ['/projects/{projectKey}/integrations/outbox', 'get'],
 ]
 for (const [operationPath, method] of requiredOperations) {
     assert.ok(
         contract.paths[operationPath]?.[method],
         `${method.toUpperCase()} ${operationPath} is missing`,
     )
+}
+
+const registeredRuntimeListInventory = [
+    [
+        '/user/trusted-devices',
+        'listTrustedDevices',
+        'page',
+        ['revoked ASC', 'expires_at DESC', 'id DESC'],
+    ],
+    [
+        '/user/login-history',
+        'listLoginHistory',
+        'page',
+        ['login_time DESC', 'id DESC'],
+    ],
+    [
+        '/projects',
+        'listAuthorizedHumanProjects',
+        'page',
+        ['name ASC', 'id ASC'],
+    ],
+    [
+        '/projects/{projectKey}/queues',
+        'listProjectQueues',
+        'page',
+        ['is_default DESC', 'name ASC', 'id ASC'],
+    ],
+    [
+        '/projects/{projectKey}/memberships',
+        'listProjectMemberships',
+        'page',
+        ['is_active DESC', 'role ASC', 'user_id ASC', 'id ASC'],
+    ],
+    [
+        '/projects/{projectKey}/membership-candidates',
+        'searchProjectMembershipCandidates',
+        'page',
+        ['display_name ASC', 'username ASC', 'id ASC'],
+    ],
+    [
+        '/platform/projects',
+        'listPlatformProjects',
+        'page',
+        ['name ASC', 'id ASC'],
+    ],
+    [
+        '/platform/users',
+        'listPlatformUsers',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/platform/audit-logs',
+        'listPlatformAuditLogs',
+        'cursor',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/workbench/tickets',
+        'listCrossProjectWorkbenchTickets',
+        'page',
+        ['updated_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/tickets',
+        'listProjectTickets',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/tickets/my-tickets',
+        'listMyProjectTickets',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/tickets/unassigned',
+        'listUnassignedProjectTickets',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/notifications',
+        'listProjectNotifications',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/categories',
+        'listProjectCategories',
+        'page',
+        ['sort_order ASC', 'name ASC', 'id ASC'],
+    ],
+    [
+        '/projects/{projectKey}/assignees',
+        'listProjectAssignees',
+        'page',
+        ['username ASC', 'id ASC'],
+    ],
+    [
+        '/projects/{projectKey}/tickets/{ticketID}/entity-links',
+        'listProjectTicketEntityLinks',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/tickets/{ticketID}/relations',
+        'listProjectTicketRelations',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/agent-collaboration/runs',
+        'listProjectAgentRuns',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/agent-collaboration/proposals',
+        'listProjectActionProposals',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/agent-collaboration/approvals',
+        'listProjectApprovalTasks',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/agent-collaboration/handoffs',
+        'listProjectHandoffs',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/admin/automation/rules',
+        'listProjectAutomationRules',
+        'page',
+        ['priority ASC', 'created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/admin/automation/logs',
+        'listProjectAutomationLogs',
+        'cursor',
+        ['executed_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/admin/automation/sla',
+        'listProjectSLAConfigs',
+        'page',
+        ['is_default DESC', 'created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/admin/automation/templates',
+        'listProjectTicketTemplates',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/admin/automation/quick-replies',
+        'listProjectQuickReplies',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/knowledge/articles',
+        'listProjectKnowledgeArticles',
+        'page',
+        ['updated_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/knowledge/articles/{articleID}/versions',
+        'listProjectKnowledgeVersions',
+        'page',
+        ['version DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/knowledge/ingestions',
+        'listProjectKnowledgeIngestions',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/integrations/connector-definitions',
+        'listProjectIntegrationConnectorDefinitions',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/integrations/connections',
+        'listProjectIntegrationConnections',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/integrations/connections/{connectionID}/mappings',
+        'listProjectIntegrationMappings',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/integrations/inbox',
+        'listProjectIntegrationInboxMessages',
+        'page',
+        ['received_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/integrations/inbox/{messageID}/receipts',
+        'listProjectIntegrationInboxReceipts',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/integrations/sync-runs',
+        'listProjectIntegrationSyncRuns',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/integrations/conflicts',
+        'listProjectIntegrationConflicts',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/integrations/dead-letters',
+        'listProjectIntegrationDeadLetters',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/integrations/domain-events',
+        'listProjectIntegrationDomainEvents',
+        'cursor',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/integrations/outbox',
+        'listProjectIntegrationOutboxDeliveries',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/platform/system/cleanup/logs',
+        'listPlatformCleanupLogs',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/platform/configs',
+        'listPlatformConfigs',
+        'page',
+        ['category ASC', 'group ASC', 'key ASC', 'id ASC'],
+    ],
+    [
+        '/projects/{projectKey}/webhooks',
+        'listProjectWebhooks',
+        'page',
+        ['created_at DESC', 'id DESC'],
+    ],
+    [
+        '/projects/{projectKey}/webhooks/{webhookID}/logs',
+        'listProjectWebhookLogs',
+        'cursor',
+        ['created_at DESC', 'id DESC'],
+    ],
+]
+for (const [operationPath, operationId, strategy, stableSort] of
+    registeredRuntimeListInventory) {
+    const operation = contract.paths[operationPath]?.get
+    assert.ok(operation, `GET ${operationPath} is absent from Human OpenAPI`)
+    assert.equal(operation.operationId, operationId)
+    assert.equal(operation['x-list-strategy'], strategy)
+    assert.deepEqual(operation['x-stable-sort'], stableSort)
+}
+
+for (const [source, helperNames, forbiddenPath] of [
+    [
+        loginHistory,
+        ['listLoginHistory'],
+        /\/user\/login-history\?/,
+    ],
+    [
+        ticketRelationships,
+        [
+            'listProjectTicketEntityLinks',
+            'listProjectTicketRelations',
+            'createProjectTicketEntityLink',
+            'createProjectTicketRelation',
+        ],
+        /\/tickets\/\$\{[^}]+\}\/(?:entity-links|relations)/,
+    ],
+    [
+        agentCollaboration,
+        [
+            'listProjectAgentRuns',
+            'listProjectActionProposals',
+            'listProjectApprovalTasks',
+            'listProjectHandoffs',
+            'decideProjectAgentApproval',
+            'takeOverProjectAgentRun',
+        ],
+        /\/agent-collaboration\//,
+    ],
+    [
+        automationDirectory,
+        [
+            'listProjectSLAConfigs',
+            'listProjectTicketTemplates',
+            'listProjectQuickReplies',
+            'createProjectSLAConfig',
+            'createProjectTicketTemplate',
+            'createProjectQuickReply',
+            'useProjectQuickReply',
+        ],
+        /\/admin\/automation\//,
+    ],
+    [
+        knowledgeClient,
+        [
+            'listProjectKnowledgeArticles',
+            'listProjectKnowledgeVersions',
+            'createProjectKnowledgeArticle',
+            'createProjectKnowledgeArticleDraft',
+            'getProjectKnowledgeArticleDocument',
+            'publishProjectKnowledgeVersion',
+            'searchProjectKnowledge',
+        ],
+        /\/knowledge\//,
+    ],
+    [
+        integrationData,
+        [
+            'listProjectIntegrationConnectorDefinitions',
+            'listProjectIntegrationConnections',
+            'listProjectIntegrationMappings',
+            'listProjectIntegrationInboxMessages',
+            'listProjectIntegrationInboxReceipts',
+            'listProjectIntegrationSyncRuns',
+            'listProjectIntegrationConflicts',
+            'listProjectIntegrationDeadLetters',
+            'listProjectIntegrationDomainEvents',
+            'listProjectIntegrationOutboxDeliveries',
+            'getProjectIntegrationOverview',
+        ],
+        /\/projects\/\$\{[^}]+\}\/integrations\//,
+    ],
+    [
+        integrationRuntime,
+        [
+            'resolveProjectIntegrationConflict',
+            'replayProjectIntegrationDeadLetter',
+        ],
+        /\/projects\/\$\{[^}]+\}\/integrations\//,
+    ],
+    [
+        ticketCreate,
+        ['getProjectIntakeConfiguration'],
+        /configuration\/intake/,
+    ],
+]) {
+    for (const helperName of helperNames) {
+        assert.match(
+            source,
+            new RegExp(`humanApiRoutes\\.${helperName}\\b`),
+            `${helperName} generated route helper is not consumed`,
+        )
+    }
+    assert.doesNotMatch(
+        source,
+        forbiddenPath,
+        'Human API path must come from the generated route registry',
+    )
+}
+for (const [source, typeNames] of [
+    [loginHistory, ['LoginHistoryPage', 'LoginHistoryRecord']],
+    [
+        ticketRelationships,
+        [
+            'TicketEntityLinkPage',
+            'TicketRelationPage',
+            'AddTicketEntityLinkResult',
+            'AddTicketRelationResult',
+        ],
+    ],
+    [
+        agentCollaboration,
+        [
+            'AgentRunSummary',
+            'ActionProposalSummary',
+            'ApprovalTaskSummary',
+            'HandoffSummary',
+        ],
+    ],
+    [automationSLA, ['SLAConfig']],
+    [automationTemplates, ['TicketTemplate']],
+    [automationQuickReplies, ['QuickReply']],
+    [
+        knowledgeClient,
+        [
+            'KnowledgeArticlePage',
+            'KnowledgeVersionPage',
+            'KnowledgeAuthoredResult',
+            'KnowledgeDocument',
+            'KnowledgeSearchResult',
+        ],
+    ],
+    [
+        integrationTypes,
+        [
+            'IntegrationConnectorDefinitionSummary',
+            'IntegrationConnectionSummary',
+            'IntegrationMappingSummary',
+            'IntegrationInboxMessageSummary',
+            'IntegrationInboxReceiptSummary',
+            'IntegrationSyncRunSummary',
+            'IntegrationConflictSummary',
+            'IntegrationDeadLetterSummary',
+            'IntegrationDomainEventSummary',
+            'IntegrationOutboxSummary',
+            'IntegrationOverview',
+        ],
+    ],
+    [
+        integrationRuntime,
+        [
+            'ReplayIntegrationDeadLetterRequest',
+            'ResolveIntegrationConflictRequest',
+        ],
+    ],
+    [ticketCreate, ['ProjectIntakeConfiguration']],
+]) {
+    for (const typeName of typeNames) {
+        assert.match(
+            source,
+            new RegExp(`\\b${typeName}\\b`),
+            `${typeName} generated type is not consumed`,
+        )
+    }
+}
+for (const [schemaName, forbidden] of [
+    [
+        'LoginHistoryRecord',
+        ['user_id', 'username', 'email', 'session_id'],
+    ],
+    [
+        'TicketTemplate',
+        ['organization_id', 'project_id', 'created_user', 'assign_to_user'],
+    ],
+    [
+        'QuickReply',
+        ['organization_id', 'project_id', 'created_user', 'created_by'],
+    ],
+    [
+        'IntakeRequestTypeVersion',
+        [
+            'organization_id',
+            'project_id',
+            'created_by_type',
+            'created_by_id',
+            'content_hash',
+        ],
+    ],
+]) {
+    const properties = contract.components.schemas[schemaName].properties
+    for (const field of forbidden) {
+        assert.equal(
+            Object.hasOwn(properties, field),
+            false,
+            `${schemaName} exposes forbidden field ${field}`,
+        )
+    }
 }
 
 const allPlatformRoles = [
@@ -185,6 +882,18 @@ const exactRoleAllowlists = [
     ],
     ['/auth/me', 'get', 'x-chronodesk-platform-roles', allPlatformRoles],
     ['/auth/profile', 'put', 'x-chronodesk-platform-roles', allPlatformRoles],
+    [
+        '/user/trusted-devices',
+        'get',
+        'x-chronodesk-platform-roles',
+        allPlatformRoles,
+    ],
+    [
+        '/user/trusted-devices/{deviceID}',
+        'delete',
+        'x-chronodesk-platform-roles',
+        allPlatformRoles,
+    ],
     [
         '/projects/{projectKey}/context',
         'get',
@@ -222,6 +931,12 @@ const exactRoleAllowlists = [
         ['project_admin', 'manager'],
     ],
     [
+        '/projects/{projectKey}/queues',
+        'get',
+        'x-chronodesk-project-roles',
+        allProjectRoles,
+    ],
+    [
         '/projects/{projectKey}/memberships',
         'post',
         'x-chronodesk-project-roles',
@@ -232,6 +947,42 @@ const exactRoleAllowlists = [
         'delete',
         'x-chronodesk-project-roles',
         ['project_admin'],
+    ],
+    [
+        '/projects/{projectKey}/knowledge/articles',
+        'get',
+        'x-chronodesk-project-roles',
+        allProjectRoles,
+    ],
+    [
+        '/projects/{projectKey}/knowledge/articles',
+        'post',
+        'x-chronodesk-project-roles',
+        allProjectRoles,
+    ],
+    [
+        '/projects/{projectKey}/knowledge/articles/{articleID}/drafts',
+        'post',
+        'x-chronodesk-project-roles',
+        allProjectRoles,
+    ],
+    [
+        '/projects/{projectKey}/knowledge/articles/{articleID}/document',
+        'get',
+        'x-chronodesk-project-roles',
+        allProjectRoles,
+    ],
+    [
+        '/projects/{projectKey}/knowledge/versions/{versionID}/publication',
+        'post',
+        'x-chronodesk-project-roles',
+        ['project_admin', 'manager'],
+    ],
+    [
+        '/projects/{projectKey}/knowledge/searches',
+        'post',
+        'x-chronodesk-project-roles',
+        allProjectRoles,
     ],
     [
         '/projects/{projectKey}/webhooks',
@@ -347,6 +1098,18 @@ const exactRoleAllowlists = [
         'x-chronodesk-platform-roles',
         ['platform_admin', 'security_auditor'],
     ],
+    [
+        '/platform/audit-logs/{auditLogID}',
+        'get',
+        'x-chronodesk-platform-roles',
+        ['platform_admin', 'security_auditor'],
+    ],
+    [
+        '/platform/system/cleanup/logs',
+        'get',
+        'x-chronodesk-platform-roles',
+        ['platform_admin'],
+    ],
 ]
 for (const [operationPath, method, extension, expected] of exactRoleAllowlists) {
     const operation = contract.paths[operationPath][method]
@@ -371,6 +1134,431 @@ assert.equal(
 assert.equal(
     Object.hasOwn(contract.paths['/projects'].get, 'x-chronodesk-project-roles'),
     false,
+)
+
+for (const [
+    operationPath,
+    method,
+    operationId,
+    strategy,
+    successStatus,
+    responseRef,
+    requestRef,
+    visibility,
+] of [
+    [
+        '/projects/{projectKey}/knowledge/articles',
+        'get',
+        'listProjectKnowledgeArticles',
+        'page',
+        '200',
+        '#/components/schemas/KnowledgeArticlePageEnvelope',
+        undefined,
+        'published-live-acl-or-explicit-management-view',
+    ],
+    [
+        '/projects/{projectKey}/knowledge/articles',
+        'post',
+        'createProjectKnowledgeArticle',
+        'bounded',
+        '201',
+        '#/components/schemas/KnowledgeAuthoredEnvelope',
+        '#/components/schemas/CreateKnowledgeArticleRequest',
+        undefined,
+    ],
+    [
+        '/projects/{projectKey}/knowledge/articles/{articleID}/drafts',
+        'post',
+        'createProjectKnowledgeArticleDraft',
+        'bounded',
+        '201',
+        '#/components/schemas/KnowledgeAuthoredEnvelope',
+        '#/components/schemas/CreateKnowledgeDraftRequest',
+        undefined,
+    ],
+    [
+        '/projects/{projectKey}/knowledge/articles/{articleID}/document',
+        'get',
+        'getProjectKnowledgeArticleDocument',
+        'bounded',
+        '200',
+        '#/components/schemas/KnowledgeDocumentEnvelope',
+        undefined,
+        'manager-or-published-read-acl-or-draft-manage-acl',
+    ],
+    [
+        '/projects/{projectKey}/knowledge/versions/{versionID}/publication',
+        'post',
+        'publishProjectKnowledgeVersion',
+        undefined,
+        '200',
+        '#/components/schemas/KnowledgeVersionEnvelope',
+        undefined,
+        undefined,
+    ],
+    [
+        '/projects/{projectKey}/knowledge/searches',
+        'post',
+        'searchProjectKnowledge',
+        'bounded',
+        '200',
+        '#/components/schemas/KnowledgeSearchEnvelope',
+        '#/components/schemas/KnowledgeSearchRequest',
+        'published-live-acl',
+    ],
+]) {
+    const operation = contract.paths[operationPath][method]
+    assert.equal(operation.operationId, operationId)
+    if (strategy !== undefined) {
+        assert.equal(operation['x-list-strategy'], strategy)
+    }
+    assert.equal(
+        operation.responses[successStatus].content['application/json'].schema.$ref,
+        responseRef,
+    )
+    if (requestRef !== undefined) {
+        assert.equal(
+            operation.requestBody.content['application/json'].schema.$ref,
+            requestRef,
+        )
+    }
+    if (visibility !== undefined) {
+        assert.equal(
+            operation['x-chronodesk-knowledge-visibility'],
+            visibility,
+        )
+    }
+}
+assert.deepEqual(
+    contract.paths['/projects/{projectKey}/knowledge/articles'].get[
+        'x-stable-sort'
+    ],
+    ['updated_at DESC', 'id DESC'],
+)
+
+for (const [schemaName, required, propertyNames] of [
+    [
+        'CreateKnowledgeArticleRequest',
+        ['key', 'title', 'markdown'],
+        [
+            'key',
+            'title',
+            'summary',
+            'markdown',
+            'source_ticket_id',
+            'source_attachment_ids',
+        ],
+    ],
+    [
+        'CreateKnowledgeDraftRequest',
+        ['title', 'markdown'],
+        [
+            'title',
+            'markdown',
+            'source_ticket_id',
+            'source_attachment_ids',
+        ],
+    ],
+    ['KnowledgeSearchRequest', ['query'], ['query', 'limit']],
+]) {
+    const schema = contract.components.schemas[schemaName]
+    assert.equal(schema.additionalProperties, false)
+    assert.deepEqual(schema.required, required)
+    assert.deepEqual(Object.keys(schema.properties), propertyNames)
+}
+for (const schemaName of [
+    'CreateKnowledgeArticleRequest',
+    'CreateKnowledgeDraftRequest',
+]) {
+    const schema = contract.components.schemas[schemaName]
+    assert.equal(schema.properties.markdown.maxLength, 128 * 1024)
+    assert.equal(
+        schema.properties.markdown['x-max-utf8-bytes'],
+        128 * 1024,
+    )
+    assert.equal(schema.properties.source_attachment_ids.maxItems, 20)
+    assert.equal(schema.properties.source_attachment_ids.uniqueItems, true)
+    assert.equal(
+        typeof schema['x-chronodesk-source-constraint'],
+        'string',
+    )
+}
+const knowledgeSourceProperties =
+    contract.components.schemas.KnowledgeSource.properties
+assert.deepEqual(Object.keys(knowledgeSourceProperties), [
+    'ordinal',
+    'kind',
+    'visibility',
+    'reference_label',
+    'source_ticket_id',
+    'source_attachment_id',
+    'ticket_number',
+    'ticket_title',
+    'attachment_name',
+    'attachment_hash',
+])
+assert.deepEqual(
+    contract.components.schemas.KnowledgeSource.required,
+    ['ordinal', 'kind', 'visibility', 'reference_label'],
+)
+assert.deepEqual(
+    knowledgeSourceProperties.visibility.enum,
+    ['full', 'restricted', 'unavailable'],
+)
+for (const forbidden of [
+    'id',
+    'article_id',
+    'version_id',
+    'created_at',
+    'organization_id',
+    'project_id',
+    'created_by',
+    'created_by_type',
+    'created_by_id',
+    'object_bucket',
+    'object_key',
+]) {
+    assert.equal(Object.hasOwn(knowledgeSourceProperties, forbidden), false)
+}
+assert.equal(
+    contract.components.schemas.KnowledgeAuthoredResult.properties.sources
+        .maxItems,
+    20,
+)
+assert.equal(
+    contract.components.schemas.KnowledgeAuthoredResult.properties.receipt.$ref,
+    '#/components/schemas/Receipt',
+)
+assert.equal(
+    contract.components.schemas.KnowledgeDocument.properties.sections.maxItems,
+    100,
+)
+assert.equal(
+    contract.components.schemas.KnowledgeDocument.properties.sources.maxItems,
+    20,
+)
+assert.equal(
+    contract.components.schemas.KnowledgeSearchResult.properties.items.maxItems,
+    50,
+)
+
+const inlineQueryParameters = (operationPath) =>
+    Object.fromEntries(
+        contract.paths[operationPath].get.parameters
+            .map((parameter) => {
+                if (!parameter.$ref) return parameter
+                const prefix = '#/components/parameters/'
+                assert.ok(parameter.$ref.startsWith(prefix))
+                return contract.components.parameters[
+                    parameter.$ref.slice(prefix.length)
+                ]
+            })
+            .filter((parameter) => parameter.in === 'query')
+            .map((parameter) => [parameter.name, parameter]),
+    )
+for (const [
+    operationPath,
+    names,
+    sortByDefault,
+    sortOrderDefault,
+    sortFields,
+    responseRef,
+] of [
+    [
+        '/user/trusted-devices',
+        ['page', 'page_size', 'sort_by', 'sort_order'],
+        'revoked',
+        'asc',
+        [
+            'created_at',
+            'updated_at',
+            'last_used_at',
+            'expires_at',
+            'revoked',
+            'device_name',
+        ],
+        '#/components/schemas/TrustedDevicePageEnvelope',
+    ],
+    [
+        '/projects/{projectKey}/queues',
+        ['page', 'page_size', 'sort_by', 'sort_order'],
+        'is_default',
+        'desc',
+        ['created_at', 'updated_at', 'name', 'key', 'is_default'],
+        '#/components/schemas/ProjectQueuePageEnvelope',
+    ],
+    [
+        '/platform/system/cleanup/logs',
+        ['page', 'page_size', 'sort_by', 'sort_order', 'task_type'],
+        'created_at',
+        'desc',
+        [
+            'created_at',
+            'start_time',
+            'end_time',
+            'status',
+            'task_type',
+            'records_deleted',
+        ],
+        '#/components/schemas/CleanupLogPageEnvelope',
+    ],
+]) {
+    const query = inlineQueryParameters(operationPath)
+    assert.deepEqual(Object.keys(query).sort(), [...names].sort())
+    assert.deepEqual(
+        [query.page.schema.minimum, query.page.schema.default],
+        [1, 1],
+    )
+    assert.deepEqual(
+        [
+            query.page_size.schema.minimum,
+            query.page_size.schema.maximum,
+            query.page_size.schema.default,
+        ],
+        [1, 100, 25],
+    )
+    assert.equal(query.sort_by.schema.default, sortByDefault)
+    assert.deepEqual(query.sort_by.schema.enum, sortFields)
+    assert.equal(query.sort_order.schema.default, sortOrderDefault)
+    assert.deepEqual(query.sort_order.schema.enum, ['asc', 'desc'])
+    assert.equal(
+        contract.paths[operationPath].get.responses['200'].content[
+            'application/json'
+        ].schema.$ref,
+        responseRef,
+    )
+    for (const status of ['400', '401', '500']) {
+        assert.ok(contract.paths[operationPath].get.responses[status])
+    }
+}
+assert.equal(
+    inlineQueryParameters('/projects/{projectKey}/memberships').sort_by.schema
+        .default,
+    'is_active',
+)
+assert.equal(
+    inlineQueryParameters('/projects/{projectKey}/memberships').sort_order.schema
+        .default,
+    'desc',
+)
+assert.deepEqual(
+    contract.paths['/projects/{projectKey}/memberships'].get['x-stable-sort'],
+    ['is_active DESC', 'role ASC', 'user_id ASC', 'id ASC'],
+)
+const membershipUpsert =
+    contract.paths['/projects/{projectKey}/memberships'].post
+const membershipUpsertSchema =
+    contract.components.schemas.UpsertProjectMembershipRequest
+assert.ok(membershipUpsertSchema.required.includes('expected_version'))
+assert.equal(
+    membershipUpsertSchema.properties.expected_version.minimum,
+    0,
+)
+for (const status of ['409', '428']) {
+    assert.ok(membershipUpsert.responses[status])
+}
+const membershipDeactivate =
+    contract.paths['/projects/{projectKey}/memberships/{userID}'].delete
+const membershipDeactivateExpectedVersion =
+    membershipDeactivate.parameters.find(
+        (parameter) =>
+            parameter.in === 'query' &&
+            parameter.name === 'expected_version',
+    )
+assert.ok(membershipDeactivateExpectedVersion)
+assert.equal(membershipDeactivateExpectedVersion.required, true)
+assert.equal(membershipDeactivateExpectedVersion.schema.minimum, 1)
+for (const status of ['409', '428']) {
+    assert.ok(membershipDeactivate.responses[status])
+}
+assert.deepEqual(
+    Object.keys(contract.components.schemas.TrustedDevice.properties).sort(),
+    [
+        'id',
+        'device_name',
+        'last_used_at',
+        'last_ip',
+        'user_agent',
+        'expires_at',
+        'revoked',
+        'created_at',
+        'updated_at',
+    ].sort(),
+)
+const projectQueueProperties =
+    contract.components.schemas.ProjectQueue.properties
+assert.deepEqual(Object.keys(projectQueueProperties).sort(), [
+    'created_at',
+    'description',
+    'is_default',
+    'key',
+    'name',
+    'public_id',
+    'status',
+    'team_name',
+    'team_public_id',
+    'updated_at',
+])
+for (const forbidden of ['id', 'project_id', 'project', 'team_id', 'team']) {
+    assert.equal(Object.hasOwn(projectQueueProperties, forbidden), false)
+}
+assert.deepEqual(
+    Object.keys(contract.components.schemas.CleanupLog.properties).sort(),
+    [
+        'id',
+        'created_at',
+        'task_type',
+        'status',
+        'start_time',
+        'end_time',
+        'duration',
+        'records_processed',
+        'records_deleted',
+        'error_message',
+        'retention_days',
+        'cutoff_date',
+        'trigger_type',
+        'trigger_by',
+    ].sort(),
+)
+for (const [operationPath, statuses, response] of [
+    [
+        '/projects/{projectKey}/admin/automation/rules',
+        ['400', '500'],
+        '#/components/responses/LegacyError',
+    ],
+    [
+        '/projects/{projectKey}/admin/automation/logs',
+        ['400', '500', '503'],
+        '#/components/responses/LegacyError',
+    ],
+    [
+        '/projects/{projectKey}/webhooks',
+        ['400', '500'],
+        '#/components/responses/StandardError',
+    ],
+    [
+        '/projects/{projectKey}/webhooks/{webhookID}/logs',
+        ['400', '404', '500', '503'],
+        '#/components/responses/StandardError',
+    ],
+]) {
+    for (const status of statuses) {
+        assert.equal(
+            contract.paths[operationPath].get.responses[status].$ref,
+            response,
+        )
+    }
+}
+assert.equal(
+    contract.components.responses.LegacyError.content['application/json'].schema
+        .$ref,
+    '#/components/schemas/LegacyErrorEnvelope',
+)
+assert.equal(
+    contract.components.responses.StandardError.content['application/json']
+        .schema.$ref,
+    '#/components/schemas/StandardErrorEnvelope',
 )
 
 assert.equal(
@@ -461,7 +1649,7 @@ assert.equal(
     contract.paths['/platform/projects'].get.responses['200'].content[
         'application/json'
     ].schema.$ref,
-    '#/components/schemas/PlatformProjectSummaryListEnvelope',
+    '#/components/schemas/PlatformProjectPageEnvelope',
 )
 assert.equal(
     contract.paths['/platform/projects'].post.responses['201'].content[
@@ -492,27 +1680,32 @@ assert.equal(
     '#/components/schemas/PlatformProjectSummary',
 )
 assert.equal(
-    contract.components.schemas.PlatformProjectSummaryListEnvelope
+    contract.components.schemas.PlatformProjectPageEnvelope
         .additionalProperties,
     false,
 )
 assert.deepEqual(
-    contract.components.schemas.PlatformProjectSummaryListEnvelope.required,
+    contract.components.schemas.PlatformProjectPageEnvelope.required,
     ['code', 'msg', 'data'],
 )
 assert.equal(
-    contract.components.schemas.PlatformProjectSummaryListEnvelope.properties
-        .data.type,
-    'array',
+    contract.components.schemas.PlatformProjectPageEnvelope.properties
+        .data.$ref,
+    '#/components/schemas/PlatformProjectPage',
 )
-assert.equal(
-    contract.components.schemas.PlatformProjectSummaryListEnvelope.properties
-        .data.items.$ref,
-    '#/components/schemas/PlatformProjectSummary',
-)
-assert.equal(
-    Object.hasOwn(contract.paths['/platform/projects'].get, 'parameters'),
-    false,
+assert.deepEqual(
+    contract.paths['/platform/projects'].get.parameters.map(
+        (parameter) => parameter.name,
+    ),
+    [
+        'page',
+        'page_size',
+        'search',
+        'status',
+        'business_unit_public_id',
+        'order_by',
+        'order',
+    ],
 )
 assert.deepEqual(
     Object.keys(contract.paths['/platform/projects'].get.responses),
@@ -637,15 +1830,20 @@ assert.deepEqual(
     ),
     [
         'user_id',
+        'actor',
         'platform_role',
+        'action',
         'method',
         'path',
+        'path_prefix',
         'status',
         'keyword',
+        'result',
+        'time_preset',
         'start_time',
         'end_time',
-        'page',
         'limit',
+        'cursor',
     ],
 )
 
@@ -670,7 +1868,7 @@ assert.equal(
     projectPublicIDPattern,
 )
 for (const schema of [
-    contract.components.schemas.PlatformProjectSummary.properties.public_id,
+    contract.components.schemas.PublicUUIDv7,
     contract.components.schemas.AuthorizedProject.properties.public_id,
 ]) {
     assert.equal(schema.format, 'uuid')
@@ -733,6 +1931,8 @@ const p1Operations = [
     ['/projects/{projectKey}/tickets/{ticketID}', 'get'],
     ['/projects/{projectKey}/tickets/{ticketID}', 'put'],
     ['/projects/{projectKey}/tickets/{ticketID}', 'delete'],
+    ['/projects/{projectKey}/tickets/overdue', 'get'],
+    ['/projects/{projectKey}/tickets/sla-breach', 'get'],
     ['/projects/{projectKey}/notifications', 'get'],
     ['/projects/{projectKey}/notifications', 'post'],
     ['/projects/{projectKey}/notifications/{notificationID}', 'delete'],
@@ -805,6 +2005,10 @@ const p1Operations = [
     ['/projects/{projectKey}/tickets/{ticketID}/history', 'get'],
     ['/projects/{projectKey}/tickets/{ticketID}/comments', 'get'],
     ['/projects/{projectKey}/tickets/{ticketID}/comments', 'post'],
+    [
+        '/projects/{projectKey}/tickets/{ticketID}/comments/{commentID}/replies',
+        'get',
+    ],
     ['/projects/{projectKey}/tickets/{ticketID}/attachments', 'get'],
     ['/projects/{projectKey}/tickets/{ticketID}/attachments', 'post'],
     [
@@ -816,6 +2020,32 @@ for (const [operationPath, method] of p1Operations) {
     assert.ok(
         contract.paths[operationPath]?.[method],
         `${method.toUpperCase()} ${operationPath} is missing from the P1 contract`,
+    )
+}
+const notificationListParameters =
+    contract.paths['/projects/{projectKey}/notifications'].get.parameters
+const notificationPageSize = notificationListParameters.find(
+    (parameter) => parameter.name === 'page_size',
+)
+assert.ok(
+    notificationListParameters.some(
+        (parameter) =>
+            parameter.$ref === '#/components/parameters/ContentPage',
+    ),
+)
+assert.equal(notificationPageSize.schema.default, 25)
+assert.equal(notificationPageSize.schema.maximum, 100)
+assert.equal(contract.components.parameters.ContentPage.schema.minimum, 1)
+assert.equal(contract.components.parameters.ContentPage.schema.maximum, 1_000_000)
+assert.equal(contract.components.parameters.ContentPage.schema.default, 1)
+for (const path of [
+    '/projects/{projectKey}/tickets/overdue',
+    '/projects/{projectKey}/tickets/sla-breach',
+]) {
+    const operation = contract.paths[path].get
+    assert.equal(
+        operation.responses['200'].content['application/json'].schema.$ref,
+        '#/components/schemas/TicketListPageEnvelope',
     )
 }
 
@@ -909,8 +2139,28 @@ for (const [operationPath, pathItem] of Object.entries(contract.paths)) {
     }
 }
 assert.ok(operationCount >= 77, `only ${operationCount} Human operations generated`)
-assert.equal(requestBodyCount, 32)
+assert.ok(
+    requestBodyCount >= 32,
+    `only ${requestBodyCount} closed Human request bodies generated`,
+)
 assert.match(generated, /export const humanApiOperations = \{/)
+for (const [operationId, strategy] of [
+    ['listAgentServicePrincipals', 'page'],
+    ['listServicePrincipalPoliciesV2', 'page'],
+    ['listAgentTicketLeases', 'page'],
+    ['listAgentAttachmentScans', 'page'],
+    ['listAgentOutboxDeliveries', 'page'],
+    ['listAgentDomainEvents', 'cursor'],
+    ['listAgentPolicyDecisions', 'cursor'],
+]) {
+    assert.match(
+        generated,
+        new RegExp(
+            `${operationId}: \\{[\\s\\S]*?listStrategy: "${strategy}"`,
+        ),
+        `${operationId} list strategy was not retained`,
+    )
+}
 assert.match(generated, /export interface HumanApiOperationTypes \{/)
 assert.match(generated, /export const buildHumanApiRequest =/)
 assert.match(generated, /export const humanApiRoutes = \{/)
@@ -937,6 +2187,14 @@ assert.match(
 assert.doesNotMatch(
     generated,
     /Record<string, PolicyConditionValue>/,
+)
+assert.match(
+    generated,
+    /createPlatformAuditExport: \(query: CreatePlatformAuditExportOperationQuery\) =>/,
+)
+assert.doesNotMatch(
+    generated,
+    /createPlatformAuditExport: \(query: CreatePlatformAuditExportOperationQuery = \{\}\) =>/,
 )
 
 assert.equal(
@@ -969,7 +2227,9 @@ assert.doesNotMatch(ticketTypes, /export interface CreateTicketRequest\b/)
 assert.doesNotMatch(ticketTypes, /export interface UpdateTicketRequest\b/)
 assert.match(workbenchTypes, /CrossProjectWorkbenchTicket/)
 assert.doesNotMatch(workbenchTypes, /export interface CrossProjectWorkbench/)
-assert.match(adminApp, /humanApiRoutes\.listPlatformAuditLogs/)
+assert.match(adminApp, /admin\/audit\/PlatformAuditExplorer/)
+assert.match(auditExplorer, /humanApiRoutes\.listPlatformAuditLogs/)
+assert.match(auditExplorer, /humanApiRoutes\.getPlatformAuditLogDetail/)
 assert.doesNotMatch(adminApp, /type PlatformAuditItem\b/)
 assert.match(workbenchPage, /humanApiRoutes\.listCrossProjectWorkbenchTickets/)
 assert.doesNotMatch(workbenchPage, /["'`]\/workbench\/tickets/)
@@ -978,14 +2238,39 @@ assert.match(emailSettings, /humanApiRoutes\.updatePlatformEmailConfig/)
 assert.doesNotMatch(emailSettings, /interface EmailConfigResponse\b/)
 assert.match(systemSettings, /humanApiRoutes\.listPlatformConfigs/)
 assert.match(systemSettings, /humanApiRoutes\.updatePlatformConfig/)
+assert.match(systemSettings, /type SystemConfigPage,/)
+assert.doesNotMatch(systemSettings, /interface SystemConfigPage\b/)
+assert.doesNotMatch(systemSettings, /new URLSearchParams/)
+assert.match(automationLogs, /type AutomationLogPage,/)
+assert.doesNotMatch(automationLogs, /type AutomationLogItem\b/)
+assert.doesNotMatch(automationLogs, /new URLSearchParams/)
 assert.match(webhookSettings, /type WebhookConfig,/)
+assert.match(webhookSettings, /type WebhookLogPage,/)
 assert.match(webhookSettings, /humanApiRoutes\.queueProjectWebhookTest/)
 assert.doesNotMatch(webhookSettings, /interface WebhookConfig\b/)
+assert.doesNotMatch(webhookSettings, /type WebhookDefinition\b/)
+assert.doesNotMatch(webhookSettings, /type WebhookDelivery\b/)
+assert.doesNotMatch(webhookSettings, /new URLSearchParams/)
 assert.doesNotMatch(webhookSettings, /projectResourcePath/)
-assert.match(agentControl, /type AgentControlSnapshot = AdminOverview/)
 assert.match(agentControl, /humanApiRoutes\.getAgentControlOverviewV2/)
+for (const routeHelper of [
+    'listAgentServicePrincipals',
+    'listServicePrincipalPoliciesV2',
+    'listAgentTicketLeases',
+    'listAgentAttachmentScans',
+    'listAgentOutboxDeliveries',
+    'listAgentDomainEvents',
+    'listAgentPolicyDecisions',
+]) {
+    assert.match(agentControl, new RegExp(`humanApiRoutes\\.${routeHelper}`))
+}
 assert.match(agentControl, /humanApiRoutes\.createServicePrincipalV2/)
-assert.doesNotMatch(agentControl, /interface AgentControlSnapshot\b/)
+assert.match(agentControl, /projectScopeChangedEvent/)
+assert.match(agentControl, /AbortController/)
+assert.match(agentControl, /loadingByKey/)
+assert.match(agentControl, /errorByKey/)
+assert.doesNotMatch(agentControl, /AgentControlSnapshot/)
+assert.doesNotMatch(agentControl, /snapshot\?/)
 assert.doesNotMatch(agentControl, /resolveAgentAdminPath/)
 assert.match(
     notificationCreate,
@@ -1018,6 +2303,7 @@ for (const routeHelper of [
 }
 for (const routeHelper of [
     'listProjectTicketComments',
+    'listProjectTicketCommentReplies',
     'createProjectTicketComment',
     'listProjectTicketAttachments',
     'uploadProjectTicketAttachment',
@@ -1031,6 +2317,24 @@ for (const routeHelper of [
 assert.doesNotMatch(ticketConversation, /type TicketComment\s*=/)
 assert.doesNotMatch(ticketConversation, /type TicketAttachment\s*=/)
 assert.doesNotMatch(ticketConversation, /projectResourcePath/)
+assert.match(ticketConversation, /<Pagination/)
+assert.match(ticketConversation, /aria-label="评论分页"/)
+assert.match(ticketConversation, /aria-label="附件分页"/)
+assert.match(ticketConversation, /LatestRequestGate/)
+assert.match(ticketConversation, /signal: request\.signal/)
+assert.match(ticketConversation, /lastPageAfterAppend\(commentsTotal\)/)
+assert.match(ticketConversation, />\s*重试\s*</)
+assert.match(
+    ticketConversation,
+    /comments\.filter\(\(item\) => item\.type !== 'internal'\)/,
+)
+assert.match(
+    ticketConversation,
+    /attachments\.filter\(\(attachment\) => attachment\.is_public\)/,
+)
+assert.match(ticketConversation, /visibilityAdjustedPageMeta/)
+assert.match(ticketConversation, /visibleReplyPages/)
+assert.match(dataProvider, /queryString\.stringify\(query\)/)
 for (const routeHelper of [
     'assignProjectTicket',
     'transferProjectTicket',
@@ -1043,6 +2347,16 @@ for (const routeHelper of [
     )
 }
 assert.doesNotMatch(ticketWorkflowActions, /projectResourcePath/)
+assert.match(ticketWorkflowActions, /<Autocomplete/)
+assert.match(ticketWorkflowActions, /perPage: 25/)
+assert.match(ticketWorkflowActions, /q: debouncedAssigneeSearch/)
+assert.doesNotMatch(ticketWorkflowActions, /perPage: 100/)
+for (const source of [ticketCreate, ticketEdit]) {
+    assert.match(
+        source,
+        /<ReferenceInput[\s\S]*?source="assigned_to_id"[\s\S]*?<EnterpriseReferenceAutocompleteInput/,
+    )
+}
 for (const routeHelper of [
     'createHumanSession',
     'refreshHumanSession',
@@ -1205,7 +2519,8 @@ assert.deepEqual(
         'name',
         'description',
         'provider',
-        'webhook_url',
+        'webhook_url_masked',
+        'has_webhook_url',
         'status',
         'previous_secret_expires_at',
         'enabled_events',
@@ -1231,14 +2546,35 @@ assert.deepEqual(
         'updated_by',
     ].sort(),
 )
+for (const forbidden of [
+    'webhook_url',
+    'secret',
+    'previous_secret',
+    'access_token',
+]) {
+    assert.equal(
+        Object.hasOwn(
+            contract.components.schemas.WebhookConfig.properties,
+            forbidden,
+        ),
+        false,
+    )
+}
 const webhookLogResponse =
     contract.paths['/projects/{projectKey}/webhooks/{webhookID}/logs'].get
         .responses['200'].content['application/json'].schema
-const webhookLogData = webhookLogResponse.properties.data
-const webhookLogItem = webhookLogData.properties.items.items
-assert.equal(webhookLogResponse.additionalProperties, false)
+assert.equal(
+    webhookLogResponse.$ref,
+    '#/components/schemas/WebhookLogPageEnvelope',
+)
+const webhookLogData = contract.components.schemas.WebhookLogPage
+const webhookLogItem = contract.components.schemas.WebhookLog
 assert.equal(webhookLogData.additionalProperties, false)
 assert.equal(webhookLogItem.additionalProperties, false)
+assert.equal(
+    webhookLogData.properties.items.items.$ref,
+    '#/components/schemas/WebhookLog',
+)
 assert.deepEqual(Object.keys(webhookLogItem.properties).sort(), [
     'config_id',
     'created_at',

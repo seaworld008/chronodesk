@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
@@ -77,8 +80,8 @@ func NewAdminUserHandler(adminUserService *services.AdminUserService) *AdminUser
 // @Failure 500 {object} ApiResponse
 // @Router /api/platform/users [get]
 func (h *AdminUserHandler) GetUserList(c *gin.Context) {
-	var req services.UserListRequest
-	if err := c.ShouldBindQuery(&req); err != nil {
+	req, err := parseAdminUserListRequest(c.Request.URL.RawQuery)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, ApiResponse{
 			Code: 1,
 			Msg:  "查询参数错误",
@@ -87,8 +90,16 @@ func (h *AdminUserHandler) GetUserList(c *gin.Context) {
 		return
 	}
 
-	response, err := h.adminUserService.GetUserList(c.Request.Context(), &req)
+	response, err := h.adminUserService.GetUserList(c.Request.Context(), req)
 	if err != nil {
+		if errors.Is(err, services.ErrInvalidAdminUserListQuery) {
+			c.JSON(http.StatusBadRequest, ApiResponse{
+				Code: 1,
+				Msg:  "查询参数错误",
+				Data: nil,
+			})
+			return
+		}
 		logHandlerFailure(c, "admin_user.list", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
 			Code: 1,
@@ -103,6 +114,99 @@ func (h *AdminUserHandler) GetUserList(c *gin.Context) {
 		Msg:  "获取用户列表成功",
 		Data: response,
 	})
+}
+
+func parseAdminUserListRequest(
+	rawQuery string,
+) (*services.UserListRequest, error) {
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return nil, services.ErrInvalidAdminUserListQuery
+	}
+	allowed := map[string]struct{}{
+		"page":          {},
+		"page_size":     {},
+		"platform_role": {},
+		"status":        {},
+		"search":        {},
+		"order_by":      {},
+		"order":         {},
+	}
+	for key, entries := range values {
+		if _, ok := allowed[key]; !ok || len(entries) != 1 ||
+			!utf8.ValidString(key) || !utf8.ValidString(entries[0]) ||
+			containsDirectoryQueryControl(key) ||
+			containsDirectoryQueryControl(entries[0]) ||
+			strings.TrimSpace(entries[0]) == "" ||
+			strings.TrimSpace(entries[0]) != entries[0] {
+			return nil, services.ErrInvalidAdminUserListQuery
+		}
+	}
+	page, err := parseDirectoryPositiveInt(
+		values,
+		"page",
+		1,
+		math.MaxInt/defaultDirectoryPageSize,
+	)
+	if err != nil {
+		return nil, services.ErrInvalidAdminUserListQuery
+	}
+	pageSize, err := parseDirectoryPositiveInt(
+		values,
+		"page_size",
+		defaultDirectoryPageSize,
+		maxDirectoryPageSize,
+	)
+	if err != nil || page > math.MaxInt/pageSize {
+		return nil, services.ErrInvalidAdminUserListQuery
+	}
+	request := &services.UserListRequest{
+		Page:     page,
+		PageSize: pageSize,
+		OrderBy:  "created_at",
+		Order:    "desc",
+	}
+	if raw, ok := values["platform_role"]; ok {
+		role := models.PlatformRole(raw[0])
+		if !role.IsValid() {
+			return nil, services.ErrInvalidAdminUserListQuery
+		}
+		request.PlatformRole = &role
+	}
+	if raw, ok := values["status"]; ok {
+		status := models.UserStatus(raw[0])
+		switch status {
+		case models.UserStatusActive,
+			models.UserStatusInactive,
+			models.UserStatusSuspended,
+			models.UserStatusDeleted:
+			request.Status = &status
+		default:
+			return nil, services.ErrInvalidAdminUserListQuery
+		}
+	}
+	if raw, ok := values["search"]; ok {
+		if len([]rune(raw[0])) > 100 {
+			return nil, services.ErrInvalidAdminUserListQuery
+		}
+		request.Search = raw[0]
+	}
+	if raw, ok := values["order_by"]; ok {
+		switch raw[0] {
+		case "id", "username", "email", "created_at", "updated_at",
+			"last_login_at":
+			request.OrderBy = raw[0]
+		default:
+			return nil, services.ErrInvalidAdminUserListQuery
+		}
+	}
+	if raw, ok := values["order"]; ok {
+		if raw[0] != "asc" && raw[0] != "desc" {
+			return nil, services.ErrInvalidAdminUserListQuery
+		}
+		request.Order = raw[0]
+	}
+	return request, nil
 }
 
 // GetUser 获取用户详细信息
@@ -325,6 +429,14 @@ func (h *AdminUserHandler) UpdateUser(c *gin.Context) {
 			c.JSON(http.StatusConflict, ApiResponse{
 				Code: 1,
 				Msg:  "用户名或邮箱已被使用（包括已删除账号）",
+				Data: nil,
+			})
+			return
+		}
+		if errors.Is(err, services.ErrInvalidAdminUserAvatar) {
+			c.JSON(http.StatusBadRequest, ApiResponse{
+				Code: 1,
+				Msg:  "头像字段只能省略、清空或保持当前值；更换头像必须使用专用上传接口",
 				Data: nil,
 			})
 			return

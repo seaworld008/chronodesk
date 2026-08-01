@@ -16,6 +16,7 @@ import {
 const ticketID = 9001;
 const internalNote = 'REQUESTER-MUST-NEVER-SEE-INTERNAL-NOTE';
 const internalComment = 'REQUESTER-MUST-NEVER-SEE-INTERNAL-COMMENT';
+const internalReply = 'REQUESTER-MUST-NEVER-SEE-INTERNAL-REPLY';
 const internalAttachment = 'requester-must-never-see-internal.txt';
 
 const ticket = {
@@ -77,7 +78,17 @@ const installTicketBackend = async (
         });
 
         if (url.pathname === '/api/projects') {
-            await fulfillJSON(route, { code: 0, data: [access] });
+            await fulfillJSON(route, {
+                code: 0,
+                msg: '',
+                data: {
+                    items: [access],
+                    page: 1,
+                    page_size: 100,
+                    total: 1,
+                    total_pages: 1,
+                },
+            });
             return;
         }
 
@@ -96,6 +107,7 @@ const installTicketBackend = async (
             const body = requestBody(request);
             await fulfillJSON(route, {
                 code: 0,
+                msg: '',
                 data: {
                     ...ticket,
                     ...(body && typeof body === 'object' ? body : {}),
@@ -111,14 +123,20 @@ const installTicketBackend = async (
         ) {
             await fulfillJSON(route, {
                 code: 0,
-                data: [
-                    {
-                        id: 88,
-                        username: 'target-agent',
-                        first_name: 'Target',
-                        last_name: 'Agent',
-                    },
-                ],
+                data: {
+                    items: [
+                        {
+                            id: 88,
+                            username: 'target-agent',
+                            first_name: 'Target',
+                            last_name: 'Agent',
+                        },
+                    ],
+                    page: 1,
+                    page_size: 25,
+                    total: 1,
+                    total_pages: 1,
+                },
             });
             return;
         }
@@ -128,7 +146,7 @@ const installTicketBackend = async (
             request.method() === 'GET'
         ) {
             await fulfillJSON(route, {
-                code: 0,
+                success: true,
                 data: [
                     {
                         id: 1,
@@ -136,6 +154,7 @@ const installTicketBackend = async (
                         type: 'public',
                         created_at: '2026-07-30T08:30:00Z',
                         actor: { type: 'human', id: '42' },
+                        reply_count: 40,
                     },
                     {
                         id: 2,
@@ -145,6 +164,40 @@ const installTicketBackend = async (
                         actor: { type: 'human', id: '7' },
                     },
                 ],
+                page: 1,
+                page_size: 25,
+                total: 40,
+                total_pages: 2,
+            });
+            return;
+        }
+
+        if (
+            url.pathname === `${ticketPath}/comments/1/replies` &&
+            request.method() === 'GET'
+        ) {
+            await fulfillJSON(route, {
+                success: true,
+                data: [
+                    {
+                        id: 101,
+                        content: '公开回复仍然可见',
+                        type: 'public',
+                        created_at: '2026-07-30T08:31:00Z',
+                        actor: { type: 'human', id: '42' },
+                    },
+                    {
+                        id: 102,
+                        content: internalReply,
+                        type: 'internal',
+                        created_at: '2026-07-30T08:32:00Z',
+                        actor: { type: 'human', id: '7' },
+                    },
+                ],
+                page: 1,
+                page_size: 25,
+                total: 40,
+                total_pages: 2,
             });
             return;
         }
@@ -171,7 +224,7 @@ const installTicketBackend = async (
             request.method() === 'GET'
         ) {
             await fulfillJSON(route, {
-                code: 0,
+                success: true,
                 data: [
                     {
                         id: 11,
@@ -192,6 +245,10 @@ const installTicketBackend = async (
                         created_at: '2026-07-30T08:45:00Z',
                     },
                 ],
+                page: 1,
+                page_size: 25,
+                total: 40,
+                total_pages: 2,
             });
             return;
         }
@@ -257,6 +314,35 @@ const installTicketBackend = async (
     return state;
 };
 
+const selectTargetAssignee = async (page: Page, label: string) => {
+    const input = page
+        .getByRole('dialog')
+        .getByRole('combobox', { name: label });
+    await input.click();
+    const remoteSearch = page.waitForRequest((request) => {
+        const url = new URL(request.url());
+        if (
+            request.method() !== 'GET' ||
+            url.pathname !== `/api/projects/${projectA.key}/assignees`
+        ) {
+            return false;
+        }
+        const rawFilter = url.searchParams.get('filter');
+        if (!rawFilter) return false;
+        try {
+            const filter = JSON.parse(rawFilter) as Record<string, unknown>;
+            return filter.q === 'target-agent';
+        } catch {
+            return false;
+        }
+    });
+    await input.fill('target-agent');
+    await remoteSearch;
+    await page
+        .getByRole('option', { name: /^target-agent/u })
+        .click();
+};
+
 const workflowCases = [
     {
         name: 'assign',
@@ -264,13 +350,7 @@ const workflowCases = [
         confirm: '确认重新分配',
         suffix: 'assign',
         prepare: async (page: Page) => {
-            const dialog = page.getByRole('dialog');
-            await dialog
-                .getByRole('combobox', { name: '分配给' })
-                .click();
-            await page
-                .getByRole('option', { name: /target-agent/u })
-                .click();
+            await selectTargetAssignee(page, '分配给');
         },
     },
     {
@@ -284,12 +364,7 @@ const workflowCases = [
             await page
                 .getByRole('option', { name: '技术支持', exact: true })
                 .click();
-            await dialog
-                .getByRole('combobox', { name: '转移给' })
-                .click();
-            await page
-                .getByRole('option', { name: 'target-agent', exact: true })
-                .click();
+            await selectTargetAssignee(page, '转移给');
         },
     },
     {
@@ -302,12 +377,7 @@ const workflowCases = [
             await dialog
                 .getByRole('textbox', { name: '升级原因' })
                 .fill('需要项目管理员协同');
-            await dialog
-                .getByRole('combobox', { name: '升级给' })
-                .click();
-            await page
-                .getByRole('option', { name: 'target-agent', exact: true })
-                .click();
+            await selectTargetAssignee(page, '升级给');
         },
     },
     {
@@ -463,6 +533,27 @@ test.describe('工单 Human UI 项目作用域与 requester 最小权限', () =>
         await expect(
             page.getByText(internalAttachment, { exact: true }),
         ).toHaveCount(0);
+        await expect(
+            page.getByRole('heading', { name: '评论记录（1）' }),
+        ).toBeVisible();
+        await expect(
+            page.getByRole('heading', { name: '附件（1）' }),
+        ).toBeVisible();
+        await expect(page.getByLabel('评论分页')).toHaveCount(0);
+        await expect(page.getByLabel('附件分页')).toHaveCount(0);
+        await expect(
+            page.getByRole('button', { name: '查看回复', exact: true }),
+        ).toBeVisible();
+        await page
+            .getByRole('button', { name: '查看回复', exact: true })
+            .click();
+        await expect(
+            page.getByText('公开回复仍然可见', { exact: true }),
+        ).toBeVisible();
+        await expect(
+            page.getByText(internalReply, { exact: true }),
+        ).toHaveCount(0);
+        await expect(page.getByLabel('评论 1 的回复分页')).toHaveCount(0);
         await expect(
             page.getByRole('combobox', { name: '可见性' }),
         ).toHaveCount(0);

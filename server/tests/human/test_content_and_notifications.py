@@ -20,36 +20,77 @@ from tests.utils import (
 pytestmark = [pytest.mark.api, pytest.mark.integration]
 
 
+def _assert_notification_page(
+    payload: object,
+    *,
+    expected_page_size: int,
+) -> list[dict[str, object]]:
+    assert isinstance(payload, dict), safe_diagnostic(payload)
+    assert set(payload) == {"code", "msg", "data"}, safe_diagnostic(payload)
+    assert payload.get("code") == 0, safe_diagnostic(payload)
+    page = payload.get("data")
+    assert isinstance(page, dict), safe_diagnostic(payload)
+    assert set(page) == {
+        "items",
+        "page",
+        "page_size",
+        "total",
+        "total_pages",
+    }, safe_diagnostic(payload)
+    assert page.get("page") == 1, safe_diagnostic(payload)
+    assert page.get("page_size") == expected_page_size, safe_diagnostic(payload)
+    assert isinstance(page.get("total"), int), safe_diagnostic(payload)
+    assert isinstance(page.get("total_pages"), int), safe_diagnostic(payload)
+    items = page.get("items")
+    assert isinstance(items, list), safe_diagnostic(payload)
+    assert len(items) <= expected_page_size, safe_diagnostic(payload)
+    assert all(isinstance(item, dict) for item in items), safe_diagnostic(payload)
+    return items
+
+
 def _wait_for_attachment_upload_worker(
     e2e_manager: E2EResourceManager,
     admin: HumanIdentity,
     attachment_id: int,
+    upload_event_id: str,
 ) -> int:
     """Wait for durable staging migration and return the scan-command version."""
 
-    overview_path = e2e_manager.project_path("admin/agents/agent-control/overview")
-    destination = f"attachment_upload:{attachment_id}"
+    attachments_path = e2e_manager.project_path("admin/agents/attachments")
+    outbox_path = e2e_manager.project_path("admin/agents/outbox")
     deadline = time.monotonic() + 10
     last_state: dict[str, object] = {}
 
     while time.monotonic() < deadline:
-        response = admin.api.get_json(overview_path)
+        response = admin.api.get_json(
+            attachments_path,
+            params={
+                "page": 1,
+                "page_size": 100,
+                "sort_by": "created_at",
+                "sort_order": "desc",
+            },
+        )
         assert response.status_code == 200, response_diagnostic(response)
         data = response.json().get("data", {})
         assert isinstance(data, dict), safe_diagnostic(data)
-        outbox = data.get("outbox", [])
-        attachments = data.get("attachments", [])
-        assert isinstance(outbox, list), safe_diagnostic(outbox)
+        attachments = data.get("items", [])
         assert isinstance(attachments, list), safe_diagnostic(attachments)
-
-        delivery = next(
-            (
-                row
-                for row in outbox
-                if isinstance(row, dict) and row.get("destination") == destination
-            ),
-            None,
+        outbox_response = admin.api.get_json(
+            outbox_path,
+            params={
+                "page": 1,
+                "page_size": 100,
+                "sort_by": "created_at",
+                "sort_order": "desc",
+            },
         )
+        assert outbox_response.status_code == 200, response_diagnostic(outbox_response)
+        outbox_data = outbox_response.json().get("data", {})
+        assert isinstance(outbox_data, dict), safe_diagnostic(outbox_data)
+        outbox = outbox_data.get("items", [])
+        assert isinstance(outbox, list), safe_diagnostic(outbox)
+
         attachment = next(
             (
                 row
@@ -58,10 +99,17 @@ def _wait_for_attachment_upload_worker(
             ),
             None,
         )
-        last_state = {
-            "delivery": delivery,
-            "attachment": attachment,
-        }
+        delivery = next(
+            (
+                row
+                for row in outbox
+                if isinstance(row, dict)
+                and row.get("event_id") == upload_event_id
+                and row.get("destination_type") == "attachment_upload"
+            ),
+            None,
+        )
+        last_state = {"attachment": attachment, "delivery": delivery}
         if isinstance(delivery, dict) and delivery.get("status") == "succeeded":
             assert isinstance(attachment, dict), safe_diagnostic(last_state)
             resource_version = attachment.get("resource_version")
@@ -249,6 +297,8 @@ def test_attachment_rejection_name_safety_and_download_authorization(
     attachment = uploaded.json().get("data", {})
     attachment_id = attachment.get("id")
     assert isinstance(attachment_id, int) and attachment_id > 0, attachment
+    upload_event_id = uploaded.json().get("receipt", {}).get("event_id")
+    assert isinstance(upload_event_id, str) and upload_event_id, uploaded.text
     original_name = attachment.get("original_name")
     assert isinstance(original_name, str) and original_name.endswith(".txt")
     assert "/" not in original_name
@@ -275,6 +325,7 @@ def test_attachment_rejection_name_safety_and_download_authorization(
         e2e_manager,
         admin,
         attachment_id,
+        upload_event_id,
     )
     scan = admin.api.post_json(
         e2e_manager.project_path(f"admin/agents/attachments/{attachment_id}/scan"),
@@ -352,8 +403,21 @@ def test_notifications_are_strictly_recipient_scoped(
             ),
         },
     )
-    assert forged_filter.status_code == 200, forged_filter.text
-    a_items = forged_filter.json().get("data", {}).get("items", [])
+    assert_error_contract(forged_filter, 400)
+
+    a_list = customer_a.api.get_json(
+        customer_a.api.project_path("notifications"),
+        params={
+            "page": 1,
+            "page_size": 100,
+            "filter": json.dumps({"q": e2e_manager.prefix}, ensure_ascii=False),
+        },
+    )
+    assert a_list.status_code == 200, a_list.text
+    a_items = _assert_notification_page(
+        a_list.json(),
+        expected_page_size=100,
+    )
     a_ids = {item.get("id") for item in a_items}
     assert notification_a["id"] in a_ids
     assert notification_b["id"] not in a_ids
@@ -368,7 +432,10 @@ def test_notifications_are_strictly_recipient_scoped(
         },
     )
     assert b_list.status_code == 200, b_list.text
-    b_items = b_list.json().get("data", {}).get("items", [])
+    b_items = _assert_notification_page(
+        b_list.json(),
+        expected_page_size=100,
+    )
     b_ids = {item.get("id") for item in b_items}
     assert notification_b["id"] in b_ids
     assert notification_a["id"] not in b_ids
@@ -389,7 +456,9 @@ def test_notifications_are_strictly_recipient_scoped(
         },
     )
     assert still_unread.status_code == 200, still_unread.text
-    unread_ids = {
-        item.get("id") for item in still_unread.json().get("data", {}).get("items", [])
-    }
+    unread_items = _assert_notification_page(
+        still_unread.json(),
+        expected_page_size=25,
+    )
+    unread_ids = {item.get("id") for item in unread_items}
     assert notification_b["id"] in unread_ids

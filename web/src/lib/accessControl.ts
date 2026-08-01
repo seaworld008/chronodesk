@@ -69,4 +69,5 @@ export type AccessPermissions = {
     platform_role: PlatformRole
     project_role: ProjectRole | null
     project_key: string | null
+    can_create_knowledge_drafts: boolean
 }

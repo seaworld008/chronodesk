@@ -31,6 +31,33 @@ type TrustedDeviceResponse struct {
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
+type loginHistoryPageResponse struct {
+	Items      []loginHistoryResponse `json:"items"`
+	Total      int64                  `json:"total"`
+	Page       int                    `json:"page"`
+	PageSize   int                    `json:"page_size"`
+	TotalPages int                    `json:"total_pages"`
+}
+
+// loginHistoryResponse is the closed self-service projection. Session IDs and
+// duplicated account identity fields are intentionally excluded because the
+// account page does not need them and a browser must never receive reusable
+// session identifiers through a history endpoint.
+type loginHistoryResponse struct {
+	ID               uint               `json:"id"`
+	IPAddress        string             `json:"ip_address"`
+	LoginTime        time.Time          `json:"login_time"`
+	LogoutTime       *time.Time         `json:"logout_time"`
+	LoginStatus      models.LoginStatus `json:"login_status"`
+	LoginMethod      models.LoginMethod `json:"login_method"`
+	FailureReason    string             `json:"failure_reason,omitempty"`
+	Location         string             `json:"location"`
+	DeviceInfo       string             `json:"device_info"`
+	SessionDuration  string             `json:"session_duration"`
+	IsCurrentSession bool               `json:"is_current_session"`
+	IsActive         bool               `json:"is_active"`
+}
+
 // NewUserHandler 创建用户处理器
 func NewUserHandler(userService *services.UserService, trustedDeviceService *services.TrustedDeviceService) *UserHandler {
 	return &UserHandler{
@@ -60,7 +87,40 @@ func (h *UserHandler) GetTrustedDevices(c *gin.Context) {
 		return
 	}
 
-	devices, err := h.trustedDeviceService.ListTrustedDevices(c.Request.Context(), userID)
+	query, err := parseDirectoryListQuery(
+		c.Request.URL.RawQuery,
+		directoryListQuerySpec{
+			DefaultSortBy:    "revoked",
+			DefaultSortOrder: "asc",
+			SortFields: map[string]struct{}{
+				"created_at":   {},
+				"updated_at":   {},
+				"last_used_at": {},
+				"expires_at":   {},
+				"revoked":      {},
+				"device_name":  {},
+			},
+		},
+	)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, ApiResponse{
+			Code: 1,
+			Msg:  "可信设备查询参数无效",
+			Data: nil,
+		})
+		return
+	}
+
+	devices, err := h.trustedDeviceService.ListTrustedDevicePage(
+		c.Request.Context(),
+		userID,
+		services.DirectoryPageRequest{
+			Page:      query.Page,
+			PageSize:  query.PageSize,
+			SortBy:    query.SortBy,
+			SortOrder: query.SortOrder,
+		},
+	)
 	if err != nil {
 		logHandlerFailure(c, "user.list_trusted_devices", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
@@ -71,8 +131,8 @@ func (h *UserHandler) GetTrustedDevices(c *gin.Context) {
 		return
 	}
 
-	responses := make([]TrustedDeviceResponse, len(devices))
-	for i, device := range devices {
+	responses := make([]TrustedDeviceResponse, len(devices.Items))
+	for i, device := range devices.Items {
 		responses[i] = TrustedDeviceResponse{
 			ID:         device.ID,
 			DeviceName: device.DeviceName,
@@ -89,7 +149,13 @@ func (h *UserHandler) GetTrustedDevices(c *gin.Context) {
 	c.JSON(http.StatusOK, ApiResponse{
 		Code: 0,
 		Msg:  "获取可信设备成功",
-		Data: responses,
+		Data: services.DirectoryPage[TrustedDeviceResponse]{
+			Items:      responses,
+			Total:      devices.Total,
+			Page:       devices.Page,
+			PageSize:   devices.PageSize,
+			TotalPages: devices.TotalPages,
+		},
 	})
 }
 
@@ -159,7 +225,7 @@ func (h *UserHandler) RevokeTrustedDevice(c *gin.Context) {
 // @Produce json
 // @Security ApiKeyAuth
 // @Param page query int false "页码" default(1)
-// @Param page_size query int false "每页数量" default(20)
+// @Param page_size query int false "每页数量" default(25)
 // @Param status query string false "登录状态" Enums(success, failed, blocked, suspended)
 // @Param start_date query string false "开始日期" format(date-time)
 // @Param end_date query string false "结束日期" format(date-time)
@@ -184,29 +250,29 @@ func (h *UserHandler) GetLoginHistory(c *gin.Context) {
 		return
 	}
 
-	// 解析查询参数
-	var req models.LoginHistoryRequest
-	if err := c.ShouldBindQuery(&req); err != nil {
+	req, err := parseLoginHistoryListQuery(c.Request.URL.RawQuery)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, ApiResponse{
 			Code: 1,
-			Msg:  "查询参数错误",
+			Msg:  "登录历史查询参数无效",
 			Data: nil,
 		})
 		return
 	}
 
-	// 设置默认值
-	if req.Page <= 0 {
-		req.Page = 1
+	histories, total, err := h.userService.GetLoginHistory(
+		c.Request.Context(),
+		userID,
+		req,
+	)
+	if errors.Is(err, services.ErrInvalidLoginHistoryQuery) {
+		c.JSON(http.StatusBadRequest, ApiResponse{
+			Code: 1,
+			Msg:  "登录历史查询参数无效",
+			Data: nil,
+		})
+		return
 	}
-	if req.PageSize <= 0 {
-		req.PageSize = 20
-	}
-	if req.PageSize > 100 {
-		req.PageSize = 100
-	}
-
-	histories, total, err := h.userService.GetLoginHistory(c.Request.Context(), userID, &req)
 	if err != nil {
 		logHandlerFailure(c, "user.get_login_history", err)
 		c.JSON(http.StatusInternalServerError, ApiResponse{
@@ -217,11 +283,24 @@ func (h *UserHandler) GetLoginHistory(c *gin.Context) {
 		return
 	}
 
-	response := PaginatedResponse{
-		Items:    histories,
-		Total:    total,
-		Page:     int64(req.Page),
-		PageSize: int64(req.PageSize),
+	totalPages := 0
+	if total > 0 {
+		totalPages = int((total + int64(req.PageSize) - 1) /
+			int64(req.PageSize))
+	}
+	items := make([]loginHistoryResponse, 0, len(histories))
+	for _, history := range histories {
+		if history == nil {
+			continue
+		}
+		items = append(items, loginHistoryDTO(history))
+	}
+	response := loginHistoryPageResponse{
+		Items:      items,
+		Total:      total,
+		Page:       req.Page,
+		PageSize:   req.PageSize,
+		TotalPages: totalPages,
 	}
 
 	c.JSON(http.StatusOK, ApiResponse{
@@ -229,6 +308,125 @@ func (h *UserHandler) GetLoginHistory(c *gin.Context) {
 		Msg:  "获取登录历史成功",
 		Data: response,
 	})
+}
+
+func loginHistoryDTO(history *models.LoginHistoryResponse) loginHistoryResponse {
+	if history == nil {
+		return loginHistoryResponse{}
+	}
+	return loginHistoryResponse{
+		ID:               history.ID,
+		IPAddress:        history.IPAddress,
+		LoginTime:        history.LoginTime,
+		LogoutTime:       history.LogoutTime,
+		LoginStatus:      history.LoginStatus,
+		LoginMethod:      history.LoginMethod,
+		FailureReason:    history.FailureReason,
+		Location:         history.Location,
+		DeviceInfo:       history.DeviceInfo,
+		SessionDuration:  history.SessionDuration,
+		IsCurrentSession: history.IsCurrentSession,
+		IsActive:         history.IsActive,
+	}
+}
+
+func parseLoginHistoryListQuery(
+	rawQuery string,
+) (*models.LoginHistoryRequest, error) {
+	query, err := parseDirectoryListQuery(
+		rawQuery,
+		directoryListQuerySpec{
+			DefaultSortBy:    "login_time",
+			DefaultSortOrder: "desc",
+			SortFields: map[string]struct{}{
+				"id":           {},
+				"login_time":   {},
+				"created_at":   {},
+				"updated_at":   {},
+				"ip_address":   {},
+				"device_type":  {},
+				"login_method": {},
+				"login_status": {},
+				"is_active":    {},
+			},
+			FilterFields: map[string]struct{}{
+				"status":       {},
+				"start_date":   {},
+				"end_date":     {},
+				"ip_address":   {},
+				"device_type":  {},
+				"login_method": {},
+				"session_id":   {},
+				"is_active":    {},
+			},
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	request := &models.LoginHistoryRequest{
+		Page:     query.Page,
+		PageSize: query.PageSize,
+		OrderBy:  query.SortBy,
+		Order:    query.SortOrder,
+	}
+	if raw, ok := query.value("status"); ok {
+		status := models.LoginStatus(raw)
+		switch status {
+		case models.LoginStatusSuccess,
+			models.LoginStatusFailed,
+			models.LoginStatusBlocked,
+			models.LoginStatusSuspended,
+			models.LoginStatusExpired:
+			request.Status = &status
+		default:
+			return nil, errInvalidDirectoryListQuery
+		}
+	}
+	for key, destination := range map[string]**time.Time{
+		"start_date": &request.StartDate,
+		"end_date":   &request.EndDate,
+	} {
+		if raw, ok := query.value(key); ok {
+			parsed, parseErr := time.Parse(time.RFC3339, raw)
+			if parseErr != nil {
+				return nil, errInvalidDirectoryListQuery
+			}
+			*destination = &parsed
+		}
+	}
+	if request.StartDate != nil && request.EndDate != nil &&
+		request.StartDate.After(*request.EndDate) {
+		return nil, errInvalidDirectoryListQuery
+	}
+	if raw, ok := query.value("ip_address"); ok {
+		request.IPAddress = raw
+	}
+	if raw, ok := query.value("device_type"); ok {
+		request.DeviceType = raw
+	}
+	if raw, ok := query.value("login_method"); ok {
+		request.LoginMethod = models.LoginMethod(raw)
+		if !request.LoginMethod.IsValid() {
+			return nil, errInvalidDirectoryListQuery
+		}
+	}
+	if raw, ok := query.value("session_id"); ok {
+		request.SessionID = raw
+	}
+	if raw, ok := query.value("is_active"); ok {
+		switch raw {
+		case "true":
+			value := true
+			request.IsActive = &value
+		case "false":
+			value := false
+			request.IsActive = &value
+		default:
+			return nil, errInvalidDirectoryListQuery
+		}
+	}
+	return request, nil
 }
 
 // GetStats 获取用户统计信息

@@ -147,7 +147,7 @@ func TestWebhookConfigResponseUsesExactFieldAllowlist(t *testing.T) {
 		Name:                    "alerts",
 		Description:             "operator alerts",
 		Provider:                models.WebhookProviderCustom,
-		WebhookURL:              "https://example.invalid/webhook",
+		WebhookURL:              "https://example.invalid/webhook?access_token=secret-value",
 		Status:                  models.WebhookStatusActive,
 		PreviousSecretExpiresAt: &now,
 		EnabledEvents:           `["io.chronodesk.system.alert.v1"]`,
@@ -198,7 +198,8 @@ func TestWebhookConfigResponseUsesExactFieldAllowlist(t *testing.T) {
 		"name",
 		"description",
 		"provider",
-		"webhook_url",
+		"webhook_url_masked",
+		"has_webhook_url",
 		"status",
 		"previous_secret_expires_at",
 		"enabled_events",
@@ -223,6 +224,23 @@ func TestWebhookConfigResponseUsesExactFieldAllowlist(t *testing.T) {
 		"created_by",
 		"updated_by",
 	})
+	payload, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{
+		"/webhook",
+		"access_token",
+		"secret-value",
+	} {
+		if strings.Contains(string(payload), forbidden) {
+			t.Fatalf("Webhook response leaked URL credential material %q: %s", forbidden, payload)
+		}
+	}
+	if response.WebhookURLMasked != "https://example.invalid/…" ||
+		!response.HasWebhookURL {
+		t.Fatalf("unexpected masked Webhook URL: %+v", response)
+	}
 }
 
 func TestWebhookLogResponseUsesExactFieldAllowlist(t *testing.T) {

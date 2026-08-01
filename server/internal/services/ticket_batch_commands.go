@@ -93,6 +93,8 @@ func (s *AgentNativeService) DeleteTicket(
 				"ticket_id",
 				"storage_path",
 				"storage_type",
+				"storage_store_id",
+				"storage_version_id",
 			).
 			Where(
 				"ticket_id = ? AND organization_id = ? AND project_id = ?",
@@ -112,10 +114,27 @@ func (s *AgentNativeService) DeleteTicket(
 				attachments[i].StoragePath == "" {
 				continue
 			}
-			target, err := NewAttachmentCleanupOutboxTarget(
-				attachments[i].ID,
-				attachments[i].StoragePath,
-			)
+			cleanupObject := AttachmentCleanupObject{
+				AttachmentID: attachments[i].ID,
+				TicketID:     ticket.ID,
+				StorageType:  attachments[i].StorageType,
+				StoreID:      attachments[i].StorageStoreID,
+				StoragePath:  attachments[i].StoragePath,
+				VersionID:    attachments[i].StorageVersionID,
+			}
+			var target OutboxTarget
+			var err error
+			if cleanupObject.StoreID == "" {
+				target, err = NewAttachmentCleanupOutboxTarget(
+					attachments[i].ID,
+					attachments[i].StoragePath,
+				)
+			} else {
+				target, err =
+					NewAttachmentCleanupOutboxTargetForObject(
+						cleanupObject,
+					)
+			}
 			if err != nil {
 				return fmt.Errorf(
 					"prepare attachment %d cleanup: %w",
@@ -124,11 +143,7 @@ func (s *AgentNativeService) DeleteTicket(
 				)
 			}
 			cleanupTargets = append(cleanupTargets, target)
-			cleanupObjects = append(cleanupObjects, AttachmentCleanupObject{
-				AttachmentID: attachments[i].ID,
-				TicketID:     ticket.ID,
-				StoragePath:  attachments[i].StoragePath,
-			})
+			cleanupObjects = append(cleanupObjects, cleanupObject)
 		}
 		if err := tx.Where(
 			"related_ticket_id = ? AND organization_id = ? AND project_id = ?",

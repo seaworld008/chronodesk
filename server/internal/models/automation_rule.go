@@ -9,20 +9,20 @@ import (
 
 // AutomationRule 自动化规则模型
 type AutomationRule struct {
-	ID        uint           `json:"id" gorm:"primaryKey;autoIncrement"`
-	CreatedAt time.Time      `json:"created_at" gorm:"autoCreateTime"`
+	ID        uint           `json:"id" gorm:"primaryKey;autoIncrement;index:idx_automation_rules_directory,priority:6,sort:desc"`
+	CreatedAt time.Time      `json:"created_at" gorm:"autoCreateTime;index:idx_automation_rules_directory,priority:5,sort:desc"`
 	UpdatedAt time.Time      `json:"updated_at" gorm:"autoUpdateTime"`
-	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
+	DeletedAt gorm.DeletedAt `json:"-" gorm:"index;index:idx_automation_rules_directory,priority:3"`
 
-	OrganizationID uint `json:"organization_id" gorm:"not null;index"`
-	ProjectID      uint `json:"project_id" gorm:"not null;index"`
+	OrganizationID uint `json:"organization_id" gorm:"not null;index;index:idx_automation_rules_directory,priority:1"`
+	ProjectID      uint `json:"project_id" gorm:"not null;index;index:idx_automation_rules_directory,priority:2"`
 
 	// 基本信息
 	Name        string `json:"name" gorm:"size:100;not null"`
 	Description string `json:"description" gorm:"type:text"`
 	RuleType    string `json:"rule_type" gorm:"size:50;not null;index"` // assignment, classification, escalation, sla
 	IsActive    bool   `json:"is_active" gorm:"default:false;index"`
-	Priority    int    `json:"priority" gorm:"default:1;index"` // 规则优先级，数字越小优先级越高
+	Priority    int    `json:"priority" gorm:"default:1;index;index:idx_automation_rules_directory,priority:4"` // 规则优先级，数字越小优先级越高
 
 	// 触发条件
 	TriggerEvent string `json:"trigger_event" gorm:"size:50;not null"` // exact current CloudEvent type
@@ -322,22 +322,22 @@ func (tt *TicketTemplate) GetCustomFields() ([]CustomField, error) {
 
 // AutomationLog 自动化执行日志
 type AutomationLog struct {
-	ID        uint      `json:"id" gorm:"primaryKey;autoIncrement"`
+	ID        uint      `json:"id" gorm:"primaryKey;autoIncrement;index:idx_automation_logs_timeline,priority:4,sort:desc;index:idx_automation_logs_rule_timeline,priority:5,sort:desc;index:idx_automation_logs_ticket_timeline,priority:5,sort:desc;index:idx_automation_logs_success_timeline,priority:5,sort:desc"`
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 
-	OrganizationID uint `json:"organization_id" gorm:"not null;index"`
-	ProjectID      uint `json:"project_id" gorm:"not null;index"`
+	OrganizationID uint `json:"organization_id" gorm:"not null;index;index:idx_automation_logs_timeline,priority:1;index:idx_automation_logs_rule_timeline,priority:1;index:idx_automation_logs_ticket_timeline,priority:1;index:idx_automation_logs_success_timeline,priority:1"`
+	ProjectID      uint `json:"project_id" gorm:"not null;index;index:idx_automation_logs_timeline,priority:2;index:idx_automation_logs_rule_timeline,priority:2;index:idx_automation_logs_ticket_timeline,priority:2;index:idx_automation_logs_success_timeline,priority:2"`
 
 	// 关联信息
-	RuleID   uint            `json:"rule_id" gorm:"index"`
+	RuleID   uint            `json:"rule_id" gorm:"index;index:idx_automation_logs_rule_timeline,priority:3"`
 	Rule     *AutomationRule `json:"rule,omitempty" gorm:"foreignKey:RuleID"`
-	TicketID uint            `json:"ticket_id" gorm:"index"`
+	TicketID uint            `json:"ticket_id" gorm:"index;index:idx_automation_logs_ticket_timeline,priority:3"`
 	Ticket   *Ticket         `json:"ticket,omitempty" gorm:"foreignKey:TicketID"`
 
 	// 执行信息
 	TriggerEvent  string    `json:"trigger_event" gorm:"size:50"` // exact CloudEvent type at execution
-	ExecutedAt    time.Time `json:"executed_at" gorm:"not null"`
-	Success       bool      `json:"success" gorm:"index"`
+	ExecutedAt    time.Time `json:"executed_at" gorm:"not null;index:idx_automation_logs_timeline,priority:3,sort:desc;index:idx_automation_logs_rule_timeline,priority:4,sort:desc;index:idx_automation_logs_ticket_timeline,priority:4,sort:desc;index:idx_automation_logs_success_timeline,priority:4,sort:desc"`
+	Success       bool      `json:"success" gorm:"index;index:idx_automation_logs_success_timeline,priority:3"`
 	ErrorMessage  string    `json:"error_message,omitempty" gorm:"type:text"`
 	ExecutionTime int64     `json:"execution_time"` // 毫秒
 

@@ -19,6 +19,7 @@ import {
     FunctionField,
     useGetIdentity,
     usePermissions,
+    Pagination as RaPagination,
 } from 'react-admin';
 import {
     Box,
@@ -29,6 +30,7 @@ import {
     CardHeader,
     Stack,
     Alert,
+    Button,
     type ChipProps,
 } from '@mui/material';
 import {
@@ -39,12 +41,15 @@ import {
     Phone as PhoneIcon,
     Warning as WarningIcon,
     Schedule as ScheduleIcon,
+    MenuBook as KnowledgeIcon,
 } from '@mui/icons-material';
+import { useNavigate } from 'react-router-dom';
 import { parseTagsToArray } from './tagUtils';
 import BackButton from '../common/BackButton';
 import { Ticket } from '@/types';
 import TicketWorkflowActions from './TicketWorkflowActions';
 import { TicketConversationPanel } from './TicketConversationPanel';
+import { TicketRelationshipsPanel } from './TicketRelationshipsPanel';
 import {
     canDeleteTicket,
     canEditTicket,
@@ -580,16 +585,34 @@ const TicketShowActions = () => {
     const record = useRecordContext<Ticket>();
     const { permissions } = usePermissions<TicketRolePermissions>();
     const { identity } = useGetIdentity();
+    const navigate = useNavigate();
     const canEdit = canEditTicket(
         record,
         permissions?.project_role,
         identity?.id,
     );
+    const canCreateKnowledgeDraft =
+        hasProjectCapability(
+            permissions?.project_role,
+            'manage_knowledge',
+        ) || permissions?.can_create_knowledge_drafts === true;
 
     return (
         <TopToolbar>
             <ListButton label="返回列表" />
             {canEdit && <EditButton label="编辑" />}
+            {record && canCreateKnowledgeDraft && (
+                <Button
+                    startIcon={<KnowledgeIcon />}
+                    onClick={() => navigate(
+                        `/knowledge?source_ticket_id=${encodeURIComponent(
+                            String(record.id),
+                        )}&create=1`,
+                    )}
+                >
+                    沉淀为知识
+                </Button>
+            )}
             {canDeleteTicket(permissions?.project_role) && (
                 <FocusSafeDeleteButton label="删除" mutationMode="pessimistic" />
             )}
@@ -714,15 +737,21 @@ const TicketShow: React.FC = () => {
                         <TicketConversationPanel />
                     </Tab>
 
+                    {/* 实体与工单关系 */}
+                    <Tab label="关联关系">
+                        <TicketRelationshipsPanel />
+                    </Tab>
+
                     {/* 历史记录 */}
                     <Tab label="历史记录">
                         <ReferenceManyField
                             reference="ticket_history"
                             target="ticket_id"
                             label="历史记录"
-                            perPage={20}
+                            perPage={25}
                             sort={{ field: 'created_at', order: 'DESC' }}
                         >
+                            <>
                             <EnterpriseDatagrid
                                 tableId="tickets.show.history"
                                 columns={ticketHistoryColumns}
@@ -811,6 +840,8 @@ const TicketShow: React.FC = () => {
                                     locales="zh-CN"
                                 />
                             </EnterpriseDatagrid>
+                            <RaPagination rowsPerPageOptions={[25, 50, 100]} />
+                            </>
                         </ReferenceManyField>
                     </Tab>
 

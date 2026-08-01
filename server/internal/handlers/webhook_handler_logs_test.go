@@ -31,7 +31,7 @@ func (roundTrip webhookTestRoundTripFunc) RoundTrip(
 	return roundTrip(request)
 }
 
-func TestWebhookHandlerGetWebhookLogsReturnsCountedRows(t *testing.T) {
+func TestWebhookHandlerGetWebhookLogsReturnsScopedCursorRows(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db, err := gorm.Open(
 		sqlite.Open(filepath.Join(t.TempDir(), "webhook.db")),
@@ -103,6 +103,11 @@ func TestWebhookHandlerGetWebhookLogsReturnsCountedRows(t *testing.T) {
 	}
 
 	handler := NewWebhookHandlerWithProtector(db, nil)
+	if err := handler.ConfigureListCursor(
+		[]byte("webhook-handler-log-cursor-test-key"),
+	); err != nil {
+		t.Fatal(err)
+	}
 	router := gin.New()
 	router.GET("/webhooks/:id/logs", func(c *gin.Context) {
 		bindWebhookProjectTestContext(t, c)
@@ -110,7 +115,6 @@ func TestWebhookHandlerGetWebhookLogsReturnsCountedRows(t *testing.T) {
 	})
 	configPath := "/webhooks/" + strconv.FormatUint(uint64(config.ID), 10)
 
-	var countStatement *gorm.Statement
 	var listStatement *gorm.Statement
 	const captureCallback = "test:capture_webhook_log_query_statements"
 	if err := db.Callback().Query().Before("gorm:query").Register(
@@ -120,8 +124,6 @@ func TestWebhookHandlerGetWebhookLogsReturnsCountedRows(t *testing.T) {
 				return
 			}
 			switch tx.Statement.Dest.(type) {
-			case *int64:
-				countStatement = tx.Statement
 			case *[]models.WebhookLog:
 				listStatement = tx.Statement
 			}
@@ -137,7 +139,7 @@ func TestWebhookHandlerGetWebhookLogsReturnsCountedRows(t *testing.T) {
 
 	request := httptest.NewRequest(
 		http.MethodGet,
-		configPath+"/logs?status=failed&page=1&page_size=10",
+		configPath+"/logs?status=failed&limit=10",
 		nil,
 	)
 	response := httptest.NewRecorder()
@@ -149,10 +151,9 @@ func TestWebhookHandlerGetWebhookLogsReturnsCountedRows(t *testing.T) {
 	var payload struct {
 		Code int `json:"code"`
 		Data struct {
-			Items []models.WebhookLog `json:"items"`
-			Total int64               `json:"total"`
-			Page  int                 `json:"page"`
-			Size  int                 `json:"size"`
+			Items      []models.WebhookLog `json:"items"`
+			NextCursor string              `json:"next_cursor"`
+			HasMore    bool                `json:"has_more"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
@@ -160,9 +161,6 @@ func TestWebhookHandlerGetWebhookLogsReturnsCountedRows(t *testing.T) {
 	}
 	if payload.Code != 0 {
 		t.Fatalf("code=%d body=%s", payload.Code, response.Body.String())
-	}
-	if payload.Data.Total != 1 {
-		t.Fatalf("total=%d, want 1; body=%s", payload.Data.Total, response.Body.String())
 	}
 	if len(payload.Data.Items) != 1 {
 		t.Fatalf(
@@ -179,15 +177,11 @@ func TestWebhookHandlerGetWebhookLogsReturnsCountedRows(t *testing.T) {
 			response.Body.String(),
 		)
 	}
-	if countStatement == nil || listStatement == nil {
-		t.Fatalf(
-			"did not capture count and list statements: count=%p list=%p",
-			countStatement,
-			listStatement,
-		)
+	if listStatement == nil {
+		t.Fatal("did not capture scoped webhook log list statement")
 	}
-	if countStatement == listStatement {
-		t.Fatal("webhook log count and list reused one mutable GORM statement")
+	if payload.Data.HasMore || payload.Data.NextCursor != "" {
+		t.Fatalf("unexpected continuation: %+v", payload.Data)
 	}
 }
 

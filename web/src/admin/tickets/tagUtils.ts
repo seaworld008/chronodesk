@@ -1,112 +1,61 @@
-export const formatTagsInputValue = (value: unknown): string => {
-    if (value == null) {
-        return '';
+export const MAX_TICKET_TAGS = 20
+export const MAX_TICKET_TAG_LENGTH = 50
+
+const rawTags = (value: unknown): string[] => {
+    if (value == null) return []
+    if (Array.isArray(value)) return value.map(String)
+    if (typeof value !== 'string') return []
+    const trimmed = value.trim()
+    if (!trimmed) return []
+    try {
+        const parsed: unknown = JSON.parse(trimmed)
+        if (Array.isArray(parsed)) return parsed.map(String)
+    } catch {
+        // One-release compatibility for records written by the old comma input.
     }
+    return trimmed.split(',')
+}
 
-    if (Array.isArray(value)) {
-        return value
-            .map((item) => String(item).trim())
-            .filter(Boolean)
-            .join(', ');
+export const normalizeTagList = (value: unknown): string[] => {
+    const seen = new Set<string>()
+    const normalized: string[] = []
+    for (const rawTag of rawTags(value)) {
+        const tag = rawTag.trim()
+        if (!tag) continue
+        const key = tag.toLocaleLowerCase()
+        if (seen.has(key)) continue
+        seen.add(key)
+        normalized.push(tag)
     }
+    return normalized
+}
 
-    if (typeof value === 'string') {
-        const trimmed = value.trim();
-        if (!trimmed) {
-            return '';
-        }
-
-        try {
-            const parsed = JSON.parse(trimmed);
-            if (Array.isArray(parsed)) {
-                return parsed
-                    .map((item) => String(item).trim())
-                    .filter(Boolean)
-                    .join(', ');
-            }
-        } catch (error) {
-            // value is not JSON, fall back to raw string
-        }
-
-        return trimmed;
+export const validateTagsInput = (value: unknown): string | undefined => {
+    const tags = normalizeTagList(value)
+    if (tags.length > MAX_TICKET_TAGS) {
+        return `标签最多 ${MAX_TICKET_TAGS} 个`
     }
-
-    return '';
-};
+    const tooLong = tags.find(
+        (tag) => Array.from(tag).length > MAX_TICKET_TAG_LENGTH,
+    )
+    if (tooLong) {
+        return `每个标签不能超过 ${MAX_TICKET_TAG_LENGTH} 个字符`
+    }
+    return undefined
+}
 
 export const normalizeTagsForSubmit = (value: unknown): string[] | undefined => {
     if (value == null) {
-        return undefined;
+        return undefined
     }
-
-    if (Array.isArray(value)) {
-        return value
-            .map((item) => String(item).trim())
-            .filter(Boolean);
-    }
-
-    if (typeof value === 'string') {
-        const trimmed = value.trim();
-        if (!trimmed) {
-            return [];
-        }
-
-        try {
-            const parsed = JSON.parse(trimmed);
-            if (Array.isArray(parsed)) {
-                return parsed
-                    .map((item) => String(item).trim())
-                    .filter(Boolean);
-            }
-        } catch (error) {
-            // ignore JSON parse error and fall back to comma split
-        }
-
-        return trimmed
-            .split(',')
-            .map((item) => item.trim())
-            .filter(Boolean);
-    }
-
-    return [];
-};
+    const error = validateTagsInput(value)
+    if (error) throw new Error(error)
+    return normalizeTagList(value)
+}
 
 export const parseTagsToArray = (value: unknown): string[] => {
-    if (value == null) {
-        return [];
-    }
-
-    if (Array.isArray(value)) {
-        return value
-            .map((item) => String(item).trim())
-            .filter(Boolean);
-    }
-
-    if (typeof value === 'string') {
-        const trimmed = value.trim();
-        if (!trimmed) {
-            return [];
-        }
-
-        try {
-            const parsed = JSON.parse(trimmed);
-            if (Array.isArray(parsed)) {
-                return parsed
-                    .map((item) => String(item).trim())
-                    .filter(Boolean);
-            }
-        } catch (error) {
-            // ignore and fallback to comma split
-        }
-
-        return trimmed
-            .split(',')
-            .map((item) => item.trim())
-            .filter(Boolean);
-    }
-
-    return [];
-};
+    return normalizeTagList(value)
+}
 
 export const normalizeCustomFieldsForSubmit = (value: unknown): Record<string, unknown> | undefined => {
     if (value == null) {

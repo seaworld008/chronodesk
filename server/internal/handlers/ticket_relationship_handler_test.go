@@ -21,10 +21,18 @@ import (
 )
 
 type ticketRelationshipOperationsStub struct {
-	addEntityLink       func(context.Context, services.AddEntityLinkInput) (*services.AddEntityLinkResult, error)
-	addTicketRelation   func(context.Context, services.AddTicketRelationInput) (*services.AddTicketRelationResult, error)
-	listEntityLinks     func(context.Context, uint) ([]models.EntityLink, error)
-	listTicketRelations func(context.Context, uint) ([]models.TicketRelation, error)
+	addEntityLink     func(context.Context, services.AddEntityLinkInput) (*services.AddEntityLinkResult, error)
+	addTicketRelation func(context.Context, services.AddTicketRelationInput) (*services.AddTicketRelationResult, error)
+	listEntityLinks   func(
+		context.Context,
+		uint,
+		services.DirectoryPageRequest,
+	) (*services.DirectoryPage[models.EntityLink], error)
+	listTicketRelations func(
+		context.Context,
+		uint,
+		services.DirectoryPageRequest,
+	) (*services.DirectoryPage[services.TicketRelationDirectoryItem], error)
 }
 
 func (stub *ticketRelationshipOperationsStub) AddEntityLink(
@@ -50,21 +58,23 @@ func (stub *ticketRelationshipOperationsStub) AddTicketRelation(
 func (stub *ticketRelationshipOperationsStub) ListEntityLinks(
 	ctx context.Context,
 	ticketID uint,
-) ([]models.EntityLink, error) {
+	request services.DirectoryPageRequest,
+) (*services.DirectoryPage[models.EntityLink], error) {
 	if stub.listEntityLinks == nil {
 		return nil, errors.New("unexpected ListEntityLinks call")
 	}
-	return stub.listEntityLinks(ctx, ticketID)
+	return stub.listEntityLinks(ctx, ticketID, request)
 }
 
 func (stub *ticketRelationshipOperationsStub) ListTicketRelations(
 	ctx context.Context,
 	ticketID uint,
-) ([]models.TicketRelation, error) {
+	request services.DirectoryPageRequest,
+) (*services.DirectoryPage[services.TicketRelationDirectoryItem], error) {
 	if stub.listTicketRelations == nil {
 		return nil, errors.New("unexpected ListTicketRelations call")
 	}
-	return stub.listTicketRelations(ctx, ticketID)
+	return stub.listTicketRelations(ctx, ticketID, request)
 }
 
 type ticketRelationshipTicketServiceStub struct {
@@ -142,7 +152,8 @@ func TestTicketRelationshipHandlerRequiresMatchingOperationContext(
 			listEntityLinks: func(
 				context.Context,
 				uint,
-			) ([]models.EntityLink, error) {
+				services.DirectoryPageRequest,
+			) (*services.DirectoryPage[models.EntityLink], error) {
 				relationshipCalls++
 				return nil, nil
 			},
@@ -441,39 +452,63 @@ func TestTicketRelationshipHandlerListsSafeProjectScopedViews(
 			listEntityLinks: func(
 				ctx context.Context,
 				ticketID uint,
-			) ([]models.EntityLink, error) {
+				request services.DirectoryPageRequest,
+			) (*services.DirectoryPage[models.EntityLink], error) {
 				assertTicketRelationshipOperation(t, ctx, operation)
 				entityCalls++
-				return []models.EntityLink{{
-					ID:             "019891f1-e935-72db-8719-36e0cbb29688",
-					OrganizationID: scope.OrganizationID,
-					ProjectID:      scope.ProjectID,
-					TicketID:       ticketID,
-					Kind:           models.EntityKindDevice,
-					ReferenceID:    "device:edge-1",
-					DisplayName:    "边缘网关",
-					Metadata:       datatypes.JSON([]byte(`{"rack":"A01"}`)),
-					CreatedByType:  models.ActorTypeHuman,
-					CreatedByID:    "PRIVATE-LIST-ACTOR",
-				}}, nil
+				if request.Page != 1 || request.PageSize != 25 ||
+					request.SortBy != "created_at" ||
+					request.SortOrder != "desc" {
+					t.Fatalf("entity link page request = %+v", request)
+				}
+				return &services.DirectoryPage[models.EntityLink]{
+					Items: []models.EntityLink{{
+						ID:             "019891f1-e935-72db-8719-36e0cbb29688",
+						OrganizationID: scope.OrganizationID,
+						ProjectID:      scope.ProjectID,
+						TicketID:       ticketID,
+						Kind:           models.EntityKindDevice,
+						ReferenceID:    "device:edge-1",
+						DisplayName:    "边缘网关",
+						Metadata:       datatypes.JSON([]byte(`{"rack":"A01"}`)),
+						CreatedByType:  models.ActorTypeHuman,
+						CreatedByID:    "PRIVATE-LIST-ACTOR",
+					}},
+					Total: 1, Page: 1, PageSize: 25, TotalPages: 1,
+				}, nil
 			},
 			listTicketRelations: func(
 				ctx context.Context,
 				ticketID uint,
-			) ([]models.TicketRelation, error) {
+				request services.DirectoryPageRequest,
+			) (*services.DirectoryPage[services.TicketRelationDirectoryItem], error) {
 				assertTicketRelationshipOperation(t, ctx, operation)
 				relationCalls++
-				return []models.TicketRelation{{
-					ID:             "019891f2-6228-7ebc-ad60-82f11121c6a4",
-					OrganizationID: scope.OrganizationID,
-					ProjectID:      scope.ProjectID,
-					SourceTicketID: ticketID,
-					TargetTicketID: 42,
-					Relation:       models.TicketRelationCollaboratesWith,
-					Reason:         "联合处理",
-					CreatedByType:  models.ActorTypeHuman,
-					CreatedByID:    "PRIVATE-LIST-ACTOR",
-				}}, nil
+				if request.Page != 1 || request.PageSize != 25 ||
+					request.SortBy != "created_at" ||
+					request.SortOrder != "desc" {
+					t.Fatalf("ticket relation page request = %+v", request)
+				}
+				return &services.DirectoryPage[services.TicketRelationDirectoryItem]{
+					Items: []services.TicketRelationDirectoryItem{{
+						Relation: models.TicketRelation{
+							ID:             "019891f2-6228-7ebc-ad60-82f11121c6a4",
+							OrganizationID: scope.OrganizationID,
+							ProjectID:      scope.ProjectID,
+							SourceTicketID: ticketID,
+							TargetTicketID: 42,
+							Relation:       models.TicketRelationCollaboratesWith,
+							Reason:         "联合处理",
+							CreatedByType:  models.ActorTypeHuman,
+							CreatedByID:    "PRIVATE-LIST-ACTOR",
+						},
+						Direction:           services.TicketRelationDirectionOutgoing,
+						RelatedTicketID:     42,
+						RelatedTicketNumber: "OPS-42",
+						RelatedTicketTitle:  "数据库协作工单",
+					}},
+					Total: 1, Page: 1, PageSize: 25, TotalPages: 1,
+				}, nil
 			},
 		},
 		ticketRelationshipTicketServiceStub{
@@ -512,14 +547,21 @@ func TestTicketRelationshipHandlerListsSafeProjectScopedViews(
 		}
 		assertTicketRelationshipResponseIsSafe(t, response.Body.String())
 		var body struct {
-			Total         int              `json:"total"`
-			TicketVersion uint64           `json:"ticket_version"`
-			Data          []map[string]any `json:"data"`
+			Data struct {
+				Items         []map[string]any `json:"items"`
+				Total         int              `json:"total"`
+				Page          int              `json:"page"`
+				PageSize      int              `json:"page_size"`
+				TotalPages    int              `json:"total_pages"`
+				TicketVersion uint64           `json:"ticket_version"`
+			} `json:"data"`
 		}
 		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 			t.Fatal(err)
 		}
-		if body.Total != 1 || body.TicketVersion != 10 || len(body.Data) != 1 {
+		if body.Data.Total != 1 || body.Data.TicketVersion != 10 ||
+			body.Data.Page != 1 || body.Data.PageSize != 25 ||
+			body.Data.TotalPages != 1 || len(body.Data.Items) != 1 {
 			t.Fatalf("%s list response = %+v", resource, body)
 		}
 	}
@@ -529,6 +571,82 @@ func TestTicketRelationshipHandlerListsSafeProjectScopedViews(
 			entityCalls,
 			relationCalls,
 		)
+	}
+}
+
+func TestTicketRelationshipListsRejectInvalidPagination(t *testing.T) {
+	scope := models.ProjectScope{OrganizationID: 19, ProjectID: 190}
+	operation := services.OperationContext{
+		Scope:  scope,
+		Actor:  models.HumanActor(19),
+		Source: services.SourceProtocolHumanREST,
+	}
+	access := ticketRelationshipTestAccess(
+		scope,
+		"OPS",
+		models.ProjectRoleObserver,
+	)
+	var listCalls int
+	handler := newTicketRelationshipHandler(
+		&ticketRelationshipOperationsStub{
+			listEntityLinks: func(
+				context.Context,
+				uint,
+				services.DirectoryPageRequest,
+			) (*services.DirectoryPage[models.EntityLink], error) {
+				listCalls++
+				return nil, errors.New("unexpected list call")
+			},
+		},
+		ticketRelationshipTicketServiceStub{
+			getTicket: func(
+				context.Context,
+				uint,
+			) (*models.Ticket, error) {
+				return &models.Ticket{ID: 41, Version: 1}, nil
+			},
+		},
+	)
+	for _, query := range []string{
+		"page=0",
+		"page=-1",
+		"page_size=101",
+		"page=",
+		"page=1&page=2",
+		"sort_by=id",
+		"sort_order=DESC",
+		"unknown=value",
+		"page=%ZZ",
+	} {
+		t.Run(query, func(t *testing.T) {
+			router := ticketRelationshipTestRouter(
+				t,
+				handler,
+				access,
+				19,
+				&operation,
+			)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(
+				response,
+				httptest.NewRequest(
+					http.MethodGet,
+					"/api/projects/OPS/tickets/41/entity-links?"+query,
+					nil,
+				),
+			)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf(
+					"query=%q status=%d body=%s",
+					query,
+					response.Code,
+					response.Body,
+				)
+			}
+		})
+	}
+	if listCalls != 0 {
+		t.Fatalf("invalid pagination reached relationship service %d times", listCalls)
 	}
 }
 

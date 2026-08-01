@@ -40,12 +40,13 @@ func (appender *adminUserActorEventAppender) AppendDomainEventTx(
 func TestAdminUserUpdateAllowsClearingPhoneAndEmailVerification(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := openHandlerTestDB(t)
-	if err := db.AutoMigrate(&models.User{}); err != nil {
+	if err := db.AutoMigrate(&models.User{}, &models.UserProfile{}); err != nil {
 		t.Fatalf("migrate users: %v", err)
 	}
 	user := models.User{
 		Username: "update-user", Email: "update-user@example.com",
 		Phone: "+8613800138000", PasswordHash: "hashed",
+		Avatar:       "https://legacy.example.test/avatar.png",
 		PlatformRole: models.PlatformRoleMember, Status: models.UserStatusActive,
 	}
 	if err := db.Create(&user).Error; err != nil {
@@ -145,6 +146,43 @@ func TestAdminUserUpdateAllowsClearingPhoneAndEmailVerification(t *testing.T) {
 			"invalid manager_id status = %d, want %d",
 			invalidManagerResponse.Code,
 			http.StatusBadRequest,
+		)
+	}
+
+	avatarRequest := httptest.NewRequest(
+		http.MethodPut,
+		fmt.Sprintf("/users/%d", user.ID),
+		bytes.NewBufferString(`{"avatar":"https://legacy.example.test/avatar.png"}`),
+	)
+	avatarRequest.Header.Set("Content-Type", "application/json")
+	avatarResponse := httptest.NewRecorder()
+	router.ServeHTTP(avatarResponse, avatarRequest)
+	if avatarResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"legacy avatar no-op status = %d, want %d; body=%s",
+			avatarResponse.Code,
+			http.StatusOK,
+			avatarResponse.Body.String(),
+		)
+	}
+
+	forgedAvatar := fmt.Sprintf(
+		"/uploads/avatars/%d/00000000-0000-4000-8000-000000000001.png",
+		user.ID,
+	)
+	forgedAvatarRequest := httptest.NewRequest(
+		http.MethodPut,
+		fmt.Sprintf("/users/%d", user.ID),
+		bytes.NewBufferString(fmt.Sprintf(`{"avatar":%q}`, forgedAvatar)),
+	)
+	forgedAvatarRequest.Header.Set("Content-Type", "application/json")
+	forgedAvatarResponse := httptest.NewRecorder()
+	router.ServeHTTP(forgedAvatarResponse, forgedAvatarRequest)
+	if forgedAvatarResponse.Code != http.StatusBadRequest {
+		t.Fatalf(
+			"forged avatar status = %d, body=%s",
+			forgedAvatarResponse.Code,
+			forgedAvatarResponse.Body.String(),
 		)
 	}
 
@@ -443,5 +481,47 @@ func TestAdminUserHandlerAcceptsAllPublishedListQueryParameters(t *testing.T) {
 		if !strings.Contains(response.Body.String(), expected) {
 			t.Errorf("response is missing %s: %s", expected, response.Body.String())
 		}
+	}
+}
+
+func TestAdminUserHandlerRejectsUnpublishedAndInvalidListQueries(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(&models.User{}); err != nil {
+		t.Fatalf("migrate users: %v", err)
+	}
+	handler := NewAdminUserHandler(services.NewAdminUserService(db))
+	for _, query := range []string{
+		"page=0",
+		"page_size=101",
+		"page=1&page=2",
+		"search=%20alice",
+		"order_by=role",
+		"order=ASC",
+		"unknown=value",
+		"search=%ZZ",
+	} {
+		t.Run(query, func(t *testing.T) {
+			router := gin.New()
+			router.GET("/users", handler.GetUserList)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(
+				response,
+				httptest.NewRequest(
+					http.MethodGet,
+					"/users?"+query,
+					nil,
+				),
+			)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf(
+					"status = %d, want 400; body=%s",
+					response.Code,
+					response.Body,
+				)
+			}
+		})
 	}
 }

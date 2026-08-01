@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -42,6 +43,34 @@ func TestAnalyticsBusinessStatsFailClosedWithoutAuthorizedProjects(t *testing.T)
 	}
 	if stats.TicketStats.ByCategory == nil {
 		t.Fatal("empty authorized set must return a stable empty category map")
+	}
+}
+
+func TestAnalyticsAuthorizedProjectSetIsBoundedAndCanonical(t *testing.T) {
+	projects := make([]uint, AnalyticsMaxProjects+1)
+	for index := range projects {
+		projects[index] = uint(index + 1)
+	}
+	if _, err := NewHumanAnalyticsAuthorizedProjectSet(
+		1,
+		1,
+		projects,
+	); !errors.Is(err, ErrAnalyticsProjectLimit) {
+		t.Fatalf("project overflow error = %v", err)
+	}
+	for name, projectIDs := range map[string][]uint{
+		"zero":      {1, 0},
+		"duplicate": {1, 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NewHumanAnalyticsAuthorizedProjectSet(
+				1,
+				1,
+				projectIDs,
+			); !errors.Is(err, ErrAnalyticsAuthorizedProjectSetRequired) {
+				t.Fatalf("invalid project set error = %v", err)
+			}
+		})
 	}
 }
 
@@ -123,6 +152,219 @@ func TestAnalyticsTimeRangeStatsUsesAuthorizedProjectTransaction(t *testing.T) {
 		countDailyValues(stats.CommentTrend) != 1 ||
 		countDailyValues(stats.UserActivityTrend) != 1 {
 		t.Fatalf("project trend scope leaked or omitted rows: %+v", stats)
+	}
+}
+
+func TestAnalyticsTimeRangeIsInclusiveBoundedForDirectCallers(t *testing.T) {
+	start := time.Date(2030, time.January, 1, 0, 0, 0, 0, time.UTC)
+	ninetyDayEnd := start.AddDate(0, 0, 90).Add(-time.Nanosecond)
+	if err := ValidateAnalyticsTimeRange(start, ninetyDayEnd); err != nil {
+		t.Fatalf("90 inclusive days rejected: %v", err)
+	}
+	ninetyOneDayEnd := start.AddDate(0, 0, 91).Add(-time.Nanosecond)
+	if err := ValidateAnalyticsTimeRange(
+		start,
+		ninetyOneDayEnd,
+	); !errors.Is(err, ErrAnalyticsInvalidTimeRange) {
+		t.Fatalf("91 inclusive days error = %v", err)
+	}
+
+	service := NewAnalyticsService(openTestDB(t))
+	authorized := mustHumanAnalyticsAuthorizedProjectSet(
+		t,
+		1,
+		10,
+		[]uint{1},
+	)
+	if _, err := service.GetTimeRangeStats(
+		context.Background(),
+		authorized,
+		start,
+		ninetyOneDayEnd,
+	); !errors.Is(err, ErrAnalyticsInvalidTimeRange) {
+		t.Fatalf("direct time-range call error = %v", err)
+	}
+	oneHundredOneDayEnd := start.AddDate(0, 0, 101).
+		Add(-time.Nanosecond)
+	if _, err := service.ExportStats(
+		context.Background(),
+		authorized,
+		"json",
+		&start,
+		&oneHundredOneDayEnd,
+	); !errors.Is(err, ErrAnalyticsInvalidTimeRange) {
+		t.Fatalf("101-day direct export call error = %v", err)
+	}
+}
+
+func TestAnalyticsTimeRangeReturnsAtMostNinetyDailyValues(t *testing.T) {
+	db := openAnalyticsScopeTestDB(t)
+	seedAnalyticsScopeFixtures(t, db)
+	start := time.Date(2030, time.January, 1, 0, 0, 0, 0, time.UTC)
+	for day := 0; day < AnalyticsMaxTimeRangeDays; day++ {
+		at := start.AddDate(0, 0, day).Add(12 * time.Hour)
+		if err := db.Exec(
+			`INSERT INTO tickets (
+				id, organization_id, project_id, category_id, status, priority,
+				created_at, updated_at
+			) VALUES (?, 10, 1, 1, 'open', 'high', ?, ?)`,
+			1000+day,
+			at,
+			at,
+		).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Exec(
+			`INSERT INTO ticket_comments (
+				id, organization_id, project_id, created_at
+			) VALUES (?, 10, 1, ?)`,
+			1000+day,
+			at,
+		).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Exec(
+			`INSERT INTO login_histories (id, user_id, login_time)
+			 VALUES (?, 1, ?)`,
+			1000+day,
+			at,
+		).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	end := start.AddDate(0, 0, AnalyticsMaxTimeRangeDays).
+		Add(-time.Nanosecond)
+	stats, err := NewAnalyticsService(db).GetTimeRangeStats(
+		context.Background(),
+		mustHumanAnalyticsAuthorizedProjectSet(t, 1, 10, []uint{1}),
+		start,
+		end,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, values := range map[string][]DailyCount{
+		"tickets":  stats.TicketTrend,
+		"users":    stats.UserActivityTrend,
+		"comments": stats.CommentTrend,
+	} {
+		if len(values) != AnalyticsMaxTimeRangeDays {
+			t.Fatalf("%s daily values = %d, want %d", name, len(values), AnalyticsMaxTimeRangeDays)
+		}
+	}
+}
+
+func TestAnalyticsOversizedSeriesAndExportFailInsteadOfTruncating(t *testing.T) {
+	rows := make([]struct {
+		Date  string `gorm:"column:date"`
+		Count int64
+	}, AnalyticsMaxTimeRangeDays+1)
+	for index := range rows {
+		rows[index].Date = time.Date(
+			2030,
+			time.January,
+			1,
+			0,
+			0,
+			0,
+			0,
+			time.UTC,
+		).AddDate(0, 0, index).Format("2006-01-02")
+	}
+	if _, err := parseDailyCounts(rows); !errors.Is(
+		err,
+		ErrAnalyticsResultTooLarge,
+	) {
+		t.Fatalf("oversized series error = %v", err)
+	}
+	if _, err := marshalAnalyticsExport(map[string]any{
+		"oversized": strings.Repeat("x", AnalyticsMaxExportBytes),
+	}); !errors.Is(err, ErrAnalyticsExportTooLarge) {
+		t.Fatalf("oversized export error = %v", err)
+	}
+}
+
+func TestAnalyticsCategoryDimensionFailsClosedAtBound(t *testing.T) {
+	db := openAnalyticsScopeTestDB(t)
+	seedAnalyticsScopeFixtures(t, db)
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		for index := 0; index < AnalyticsMaxCategoryValues-1; index++ {
+			categoryID := 1000 + index
+			if err := tx.Exec(
+				`INSERT INTO categories (
+					id, organization_id, project_id, name
+				) VALUES (?, 10, 1, ?)`,
+				categoryID,
+				fmt.Sprintf("Category-%04d", index),
+			).Error; err != nil {
+				return err
+			}
+			if err := tx.Exec(
+				`INSERT INTO tickets (
+					id, organization_id, project_id, category_id,
+					status, priority, created_at, updated_at
+				) VALUES (?, 10, 1, ?, 'open', 'normal', ?, ?)`,
+				2000+index,
+				categoryID,
+				analyticsFixtureNow(),
+				analyticsFixtureNow(),
+			).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := NewAnalyticsService(db)
+	authorized := mustHumanAnalyticsAuthorizedProjectSet(
+		t,
+		1,
+		10,
+		[]uint{1},
+	)
+	stats, err := service.GetBusinessStats(
+		context.Background(),
+		authorized,
+	)
+	if err != nil {
+		t.Fatalf("exact category limit rejected: %v", err)
+	}
+	if len(stats.TicketStats.ByCategory) != AnalyticsMaxCategoryValues {
+		t.Fatalf(
+			"category values = %d, want %d",
+			len(stats.TicketStats.ByCategory),
+			AnalyticsMaxCategoryValues,
+		)
+	}
+
+	overflowID := 1000 + AnalyticsMaxCategoryValues - 1
+	if err := db.Exec(
+		`INSERT INTO categories (
+			id, organization_id, project_id, name
+		) VALUES (?, 10, 1, 'Category-overflow')`,
+		overflowID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(
+		`INSERT INTO tickets (
+			id, organization_id, project_id, category_id,
+			status, priority, created_at, updated_at
+		) VALUES (?, 10, 1, ?, 'open', 'normal', ?, ?)`,
+		2000+AnalyticsMaxCategoryValues-1,
+		overflowID,
+		analyticsFixtureNow(),
+		analyticsFixtureNow(),
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.GetBusinessStats(
+		context.Background(),
+		authorized,
+	); !errors.Is(err, ErrAnalyticsResultTooLarge) {
+		t.Fatalf("category overflow error = %v", err)
 	}
 }
 
@@ -275,6 +517,8 @@ func openAnalyticsScopeTestDB(t *testing.T) *gorm.DB {
 		)`,
 		`CREATE TABLE categories (
 			id INTEGER PRIMARY KEY,
+			organization_id INTEGER NOT NULL,
+			project_id INTEGER NOT NULL,
 			name TEXT NOT NULL
 		)`,
 		`CREATE TABLE users (
@@ -320,8 +564,12 @@ func seedAnalyticsScopeFixtures(t *testing.T, db *gorm.DB) {
 				(1, 10, 'active'), (2, 10, 'active'), (3, 20, 'active')`,
 		},
 		{
-			query: `INSERT INTO categories (id, name) VALUES
-				(1, 'Incident'), (2, 'Request'), (3, 'Foreign')`,
+			query: `INSERT INTO categories (
+				id, organization_id, project_id, name
+			) VALUES
+				(1, 10, 1, 'Incident'),
+				(2, 10, 2, 'Request'),
+				(3, 20, 3, 'Foreign')`,
 		},
 		{
 			query: `INSERT INTO tickets (

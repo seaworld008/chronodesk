@@ -56,7 +56,10 @@ func PositiveUint(value uint64) (uint, error) {
 
 // Int converts an int64 only after proving that it fits the platform int.
 func Int(value int64) (int, error) {
-	if strconv.IntSize == 32 && (value < math.MinInt32 || value > math.MaxInt32) {
+	// math.MinInt and math.MaxInt are architecture-aware integer constants.
+	// Compare against both bounds before conversion so callers never rely on
+	// a cast-derived or control-flow-derived proof of the destination width.
+	if value < math.MinInt || value > math.MaxInt {
 		return 0, ErrIntegerOutOfRange
 	}
 	return int(value), nil

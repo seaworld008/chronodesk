@@ -36,8 +36,16 @@ type ticketRelationshipOperations interface {
 		context.Context,
 		services.AddTicketRelationInput,
 	) (*services.AddTicketRelationResult, error)
-	ListEntityLinks(context.Context, uint) ([]models.EntityLink, error)
-	ListTicketRelations(context.Context, uint) ([]models.TicketRelation, error)
+	ListEntityLinks(
+		context.Context,
+		uint,
+		services.DirectoryPageRequest,
+	) (*services.DirectoryPage[models.EntityLink], error)
+	ListTicketRelations(
+		context.Context,
+		uint,
+		services.DirectoryPageRequest,
+	) (*services.DirectoryPage[services.TicketRelationDirectoryItem], error)
 }
 
 // TicketRelationshipHandler exposes project-scoped human APIs for immutable
@@ -106,12 +114,16 @@ type entityLinkResponse struct {
 }
 
 type ticketRelationResponse struct {
-	ID             string                    `json:"id"`
-	CreatedAt      time.Time                 `json:"created_at"`
-	SourceTicketID uint                      `json:"source_ticket_id"`
-	TargetTicketID uint                      `json:"target_ticket_id"`
-	Relation       models.TicketRelationType `json:"relation"`
-	Reason         string                    `json:"reason"`
+	ID                  string                           `json:"id"`
+	CreatedAt           time.Time                        `json:"created_at"`
+	SourceTicketID      uint                             `json:"source_ticket_id"`
+	TargetTicketID      uint                             `json:"target_ticket_id"`
+	Direction           services.TicketRelationDirection `json:"direction,omitempty"`
+	RelatedTicketID     uint                             `json:"related_ticket_id,omitempty"`
+	RelatedTicketNumber string                           `json:"related_ticket_number,omitempty"`
+	RelatedTicketTitle  string                           `json:"related_ticket_title,omitempty"`
+	Relation            models.TicketRelationType        `json:"relation"`
+	Reason              string                           `json:"reason"`
 }
 
 type addEntityLinkResponse struct {
@@ -126,22 +138,45 @@ type addTicketRelationResponse struct {
 	EventID       string                 `json:"event_id"`
 }
 
+type entityLinkPageResponse struct {
+	Items         []entityLinkResponse `json:"items"`
+	Total         int64                `json:"total"`
+	Page          int                  `json:"page"`
+	PageSize      int                  `json:"page_size"`
+	TotalPages    int                  `json:"total_pages"`
+	TicketVersion uint64               `json:"ticket_version"`
+}
+
+type ticketRelationPageResponse struct {
+	Items         []ticketRelationResponse `json:"items"`
+	Total         int64                    `json:"total"`
+	Page          int                      `json:"page"`
+	PageSize      int                      `json:"page_size"`
+	TotalPages    int                      `json:"total_pages"`
+	TicketVersion uint64                   `json:"ticket_version"`
+}
+
 func (handler *TicketRelationshipHandler) ListEntityLinks(c *gin.Context) {
 	ticket, ok := handler.authorizedTicket(c, ticketAccessRead)
 	if !ok {
 		return
 	}
-	links, err := handler.relationships.ListEntityLinks(
+	request, ok := requireTicketRelationshipListQuery(c)
+	if !ok {
+		return
+	}
+	page, err := handler.relationships.ListEntityLinks(
 		c.Request.Context(),
 		ticket.ID,
+		request,
 	)
 	if err != nil {
 		handler.writeError(c, err)
 		return
 	}
-	items := make([]entityLinkResponse, 0, len(links))
-	for index := range links {
-		item, err := entityLinkView(links[index])
+	items := make([]entityLinkResponse, 0, len(page.Items))
+	for index := range page.Items {
+		item, err := entityLinkView(page.Items[index])
 		if err != nil {
 			handler.writeError(c, err)
 			return
@@ -150,10 +185,15 @@ func (handler *TicketRelationshipHandler) ListEntityLinks(c *gin.Context) {
 	}
 	setTicketETag(c, ticket.Version)
 	c.JSON(http.StatusOK, gin.H{
-		"success":        true,
-		"data":           items,
-		"total":          len(items),
-		"ticket_version": ticket.Version,
+		"success": true,
+		"data": entityLinkPageResponse{
+			Items:         items,
+			Total:         page.Total,
+			Page:          page.Page,
+			PageSize:      page.PageSize,
+			TotalPages:    page.TotalPages,
+			TicketVersion: ticket.Version,
+		},
 	})
 }
 
@@ -247,25 +287,70 @@ func (handler *TicketRelationshipHandler) ListTicketRelations(
 	if !ok {
 		return
 	}
-	relations, err := handler.relationships.ListTicketRelations(
+	request, ok := requireTicketRelationshipListQuery(c)
+	if !ok {
+		return
+	}
+	page, err := handler.relationships.ListTicketRelations(
 		c.Request.Context(),
 		ticket.ID,
+		request,
 	)
 	if err != nil {
 		handler.writeError(c, err)
 		return
 	}
-	items := make([]ticketRelationResponse, 0, len(relations))
-	for index := range relations {
-		items = append(items, ticketRelationView(relations[index]))
+	items := make([]ticketRelationResponse, 0, len(page.Items))
+	for index := range page.Items {
+		item := ticketRelationView(page.Items[index].Relation)
+		item.Direction = page.Items[index].Direction
+		item.RelatedTicketID = page.Items[index].RelatedTicketID
+		item.RelatedTicketNumber = page.Items[index].RelatedTicketNumber
+		item.RelatedTicketTitle = page.Items[index].RelatedTicketTitle
+		items = append(items, item)
 	}
 	setTicketETag(c, ticket.Version)
 	c.JSON(http.StatusOK, gin.H{
-		"success":        true,
-		"data":           items,
-		"total":          len(items),
-		"ticket_version": ticket.Version,
+		"success": true,
+		"data": ticketRelationPageResponse{
+			Items:         items,
+			Total:         page.Total,
+			Page:          page.Page,
+			PageSize:      page.PageSize,
+			TotalPages:    page.TotalPages,
+			TicketVersion: ticket.Version,
+		},
 	})
+}
+
+func requireTicketRelationshipListQuery(
+	c *gin.Context,
+) (services.DirectoryPageRequest, bool) {
+	query, err := parseDirectoryListQuery(
+		c.Request.URL.RawQuery,
+		directoryListQuerySpec{
+			DefaultSortBy:    "created_at",
+			DefaultSortOrder: "desc",
+			SortFields: map[string]struct{}{
+				"created_at": {},
+			},
+		},
+	)
+	if err != nil {
+		handlerError := gin.H{
+			"success": false,
+			"code":    "invalid_pagination",
+			"message": "关联列表查询参数无效",
+		}
+		c.JSON(http.StatusBadRequest, handlerError)
+		return services.DirectoryPageRequest{}, false
+	}
+	return services.DirectoryPageRequest{
+		Page:      query.Page,
+		PageSize:  query.PageSize,
+		SortBy:    query.SortBy,
+		SortOrder: query.SortOrder,
+	}, true
 }
 
 func (handler *TicketRelationshipHandler) AddTicketRelation(

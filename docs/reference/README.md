@@ -10,6 +10,8 @@
 - [CloudEvents 1.0](CLOUDEVENTS_1_0.md)：领域事件信封、合法扩展属性、Outbox 消费和去重约束。
 - [OpenAPI 3.2](OPENAPI_3_2.md)：Agent 单版本机器契约、Redocly/Spectral 严格门禁与管理员并发契约；Human Web P1 契约由 `/human-openapi.json` 独立发布。
 - [数据库敏感字段静态加密](DATA_AT_REST_ENCRYPTION.md)：AES-256-GCM keyring、显式迁移、轮换与投递日志安全。
+- [附件存储、安全预览与 Agent 读取](attachment-storage-and-preview.md)：默认本地目录、S3/MinIO 兼容、安全预览白名单、迁移与派生内容边界。
+- [项目知识库](knowledge-library.md)：从工单沉淀结构化方案、不可变版本、来源证据、OpenSearch 投影和 Agent 草稿边界。
 - [集成 SDK](INTEGRATION_SDKS.md)：Go、TypeScript、Python SDK 的生成、校验与发布边界。
 - [集成工具](INTEGRATION_TOOLING.md)：`chronodeskctl`、Connection 测试和 Webhook 回放的运维入口。
 - [AI 原生多项目升级开发检查点](AI_NATIVE_UPGRADE_PROGRESS.md)：当前实现、未闭环能力、验证状态和下一次恢复入口。

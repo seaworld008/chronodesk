@@ -73,9 +73,11 @@ class APIClient:
         data: Mapping[str, Any] | None = None,
         files: Mapping[str, Any] | None = None,
         expected_status: int | None = None,
+        retry: bool = True,
     ) -> requests.Response:
         url = self._build_url(path)
         attempt = 0
+        max_attempts = self.max_retries if retry else 1
         last_exc: Exception | None = None
         register_headers(self.session.headers)
         register_headers(headers)
@@ -83,7 +85,7 @@ class APIClient:
         register_sensitive_values(data)
         register_sensitive_values(params)
 
-        while attempt < self.max_retries:
+        while attempt < max_attempts:
             try:
                 response = self.session.request(
                     method=method,
@@ -114,7 +116,7 @@ class APIClient:
                     method,
                     url,
                     attempt,
-                    self.max_retries,
+                    max_attempts,
                     exc,
                 )
                 time.sleep(self.retry_delay)
@@ -132,8 +134,15 @@ class APIClient:
         payload: dict[str, Any],
         *,
         headers: dict[str, str] | None = None,
+        retry: bool = True,
     ) -> requests.Response:
-        return self.request("POST", path, json=payload, headers=headers)
+        return self.request(
+            "POST",
+            path,
+            json=payload,
+            headers=headers,
+            retry=retry,
+        )
 
     def get_json(
         self,
@@ -141,8 +150,15 @@ class APIClient:
         *,
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
+        retry: bool = True,
     ) -> requests.Response:
-        return self.request("GET", path, headers=headers, params=params)
+        return self.request(
+            "GET",
+            path,
+            headers=headers,
+            params=params,
+            retry=retry,
+        )
 
     def put_json(
         self,
@@ -150,18 +166,32 @@ class APIClient:
         payload: dict[str, Any],
         *,
         headers: dict[str, str] | None = None,
+        retry: bool = True,
     ) -> requests.Response:
-        return self.request("PUT", path, json=payload, headers=headers)
+        return self.request(
+            "PUT",
+            path,
+            json=payload,
+            headers=headers,
+            retry=retry,
+        )
 
     def delete(
         self,
         path: str,
         *,
         headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
         expected_status: int | None = None,
+        retry: bool = True,
     ) -> requests.Response:
         return self.request(
-            "DELETE", path, headers=headers, expected_status=expected_status
+            "DELETE",
+            path,
+            headers=headers,
+            params=params,
+            expected_status=expected_status,
+            retry=retry,
         )
 
     def post_multipart(
@@ -171,6 +201,7 @@ class APIClient:
         headers: Mapping[str, str] | None = None,
         fields: Mapping[str, Any] | None = None,
         files: Mapping[str, Any] | None = None,
+        retry: bool = True,
     ) -> requests.Response:
         # A request-level None removes the JSON Content-Type inherited from the
         # session so requests can generate the multipart boundary safely.
@@ -182,6 +213,7 @@ class APIClient:
             headers=request_headers,
             data=fields,
             files=files,
+            retry=retry,
         )
 
     def bind_project(self, project_key: str) -> None:

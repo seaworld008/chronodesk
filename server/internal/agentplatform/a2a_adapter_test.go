@@ -1337,6 +1337,81 @@ func TestA2ABackendRequiresStructuredInputAndNeverInfersText(t *testing.T) {
 	}
 }
 
+func TestA2AInvalidAgentContextUsesClosedInputError(t *testing.T) {
+	reporter := &recordingA2AReporter{}
+	err := (&A2ABackend{}).reportDomainError(
+		context.Background(),
+		reporter,
+		fmt.Errorf(
+			"%w: constraints must contain at most 20 items",
+			services.ErrInvalidAgentContext,
+		),
+	)
+	if err != nil {
+		t.Fatalf("report invalid Agent context: %v", err)
+	}
+	if reporter.lastState() != a2a.TaskStateInputRequired {
+		t.Fatalf(
+			"state = %s, want INPUT_REQUIRED",
+			reporter.lastState(),
+		)
+	}
+	message := reporter.lastStatusMessage()
+	if message == nil || len(message.Parts) != 1 {
+		t.Fatalf("missing structured Agent context error: %#v", message)
+	}
+	var payload struct {
+		Code           string   `json:"code"`
+		RequiredFields []string `json:"requiredFields"`
+	}
+	if err := json.Unmarshal(message.Parts[0].Data, &payload); err != nil {
+		t.Fatalf("decode Agent context error: %v", err)
+	}
+	if payload.Code != "invalid_request" ||
+		len(payload.RequiredFields) != 1 ||
+		payload.RequiredFields[0] != "agent_context within documented limits" {
+		t.Fatalf("unexpected Agent context error payload: %+v", payload)
+	}
+}
+
+func TestA2AInvalidTicketCategoryUsesClosedInputError(t *testing.T) {
+	reporter := &recordingA2AReporter{}
+	err := (&A2ABackend{}).reportDomainError(
+		context.Background(),
+		reporter,
+		fmt.Errorf(
+			"%w: category is outside the authorized project",
+			services.ErrTicketCategoryScope,
+		),
+	)
+	if err != nil {
+		t.Fatalf("report invalid Ticket category: %v", err)
+	}
+	if reporter.lastState() != a2a.TaskStateInputRequired {
+		t.Fatalf(
+			"state = %s, want INPUT_REQUIRED",
+			reporter.lastState(),
+		)
+	}
+	message := reporter.lastStatusMessage()
+	if message == nil || len(message.Parts) != 1 {
+		t.Fatalf("missing structured category error: %#v", message)
+	}
+	var payload struct {
+		Code           string   `json:"code"`
+		RequiredFields []string `json:"requiredFields"`
+	}
+	if err := json.Unmarshal(message.Parts[0].Data, &payload); err != nil {
+		t.Fatalf("decode category error: %v", err)
+	}
+	if payload.Code != "invalid_request" ||
+		len(payload.RequiredFields) != 1 ||
+		payload.RequiredFields[0] !=
+			"category and direct subcategory from the authorized project" {
+		t.Fatalf("unexpected category error payload: %+v", payload)
+	}
+}
+
 func TestA2ABackendAttenuatesFullPrincipalToOAuthTokenScopes(t *testing.T) {
 	fixture := newA2AAdapterFixture(t)
 	ticket := seedA2AQueryTicket(t, fixture, "TEST-TOKEN-SCOPE-1")

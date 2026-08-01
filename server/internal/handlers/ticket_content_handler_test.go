@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -18,10 +20,388 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/datatypes"
+	"gorm.io/gorm"
 )
 
 func intPtr(value int) *int {
 	return &value
+}
+
+func TestDownloadAttachmentReturnsContentWithSafeHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	scope := ensureHandlerTestProject(t, db)
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.ProjectMembership{},
+		&models.Ticket{},
+		&models.TicketAttachment{},
+	); err != nil {
+		t.Fatalf("migrate attachment download schemas: %v", err)
+	}
+	var queue models.Queue
+	if err := db.Where(
+		"project_id = ? AND is_default = ?",
+		scope.ProjectID,
+		true,
+	).First(&queue).Error; err != nil {
+		t.Fatalf("load default queue: %v", err)
+	}
+	user := models.User{
+		Username:     "attachment-download-admin",
+		Email:        "attachment-download-admin@example.com",
+		PasswordHash: "hashed",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("seed attachment download user: %v", err)
+	}
+	if err := db.Create(&models.ProjectMembership{
+		ProjectID: scope.ProjectID,
+		UserID:    user.ID,
+		Role:      models.ProjectRoleAdmin,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
+		t.Fatalf("seed attachment download membership: %v", err)
+	}
+	ticket := models.Ticket{
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		QueueID:        queue.ID,
+		TicketNumber:   "ATTACHMENT-DOWNLOAD",
+		Title:          "attachment download",
+		Description:    "attachment download",
+		Type:           models.TicketTypeRequest,
+		Priority:       models.TicketPriorityNormal,
+		Status:         models.TicketStatusOpen,
+		Source:         models.TicketSourceWeb,
+		CreatedByID:    &user.ID,
+		Version:        1,
+	}
+	if err := db.Create(&ticket).Error; err != nil {
+		t.Fatalf("seed attachment download ticket: %v", err)
+	}
+	storage, err := services.NewLocalAttachmentStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("create attachment download storage: %v", err)
+	}
+	content := []byte("human attachment content")
+	stored, err := storage.Put(
+		context.Background(),
+		"tickets/human-download.txt",
+		bytes.NewReader(content),
+		1024,
+	)
+	if err != nil {
+		t.Fatalf("store attachment download content: %v", err)
+	}
+	originalName := `财务报告 "Q4".txt`
+	attachment := models.TicketAttachment{
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		TicketID:       ticket.ID,
+		UploadedBy:     &user.ID,
+		ActorType:      models.ActorTypeHuman,
+		ActorID:        models.HumanActor(user.ID).ID,
+		FileName:       "human-download.txt",
+		OriginalName:   originalName,
+		FileSize:       stored.Size,
+		MimeType:       "text/plain",
+		FileType:       models.AttachmentTypeDocument,
+		Extension:      ".txt",
+		StoragePath:    stored.Key,
+		StorageType:    storage.AttachmentStorageType(),
+		Hash:           stored.SHA256,
+		VirusScan:      models.VirusScanClean,
+	}
+	if err := db.Create(&attachment).Error; err != nil {
+		t.Fatalf("seed clean attachment: %v", err)
+	}
+	native := services.NewAgentNativeService(
+		db,
+		services.AgentNativeOptions{
+			AttachmentStorage: storage,
+		},
+	)
+	handler := NewTicketContentHandler(db, nil, native, 1024)
+	router := gin.New()
+	router.GET(
+		"/tickets/:id/attachments/:attachment_id/content",
+		func(c *gin.Context) {
+			ctx, contextErr := services.WithOperationContext(
+				c.Request.Context(),
+				services.OperationContext{
+					Scope:  scope,
+					Actor:  models.HumanActor(user.ID),
+					Source: services.SourceProtocolHumanREST,
+				},
+			)
+			if contextErr != nil {
+				t.Fatalf("build human attachment context: %v", contextErr)
+			}
+			c.Request = c.Request.WithContext(ctx)
+			handler.DownloadAttachment(c)
+		},
+	)
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/tickets/"+strconv.FormatUint(uint64(ticket.ID), 10)+
+			"/attachments/"+
+			strconv.FormatUint(uint64(attachment.ID), 10)+
+			"/content",
+		nil,
+	)
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"download status = %d, body = %s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	if response.Body.String() != string(content) {
+		t.Fatalf(
+			"download content = %q, want %q",
+			response.Body.String(),
+			content,
+		)
+	}
+	for name, want := range map[string]string{
+		"Cache-Control":           "private, no-store",
+		"Pragma":                  "no-cache",
+		"X-Content-Type-Options":  "nosniff",
+		"Content-Security-Policy": "default-src 'none'; sandbox",
+		"Content-Type":            "text/plain",
+	} {
+		if got := response.Header().Get(name); got != want {
+			t.Fatalf("%s = %q, want %q", name, got, want)
+		}
+	}
+	if got := response.Header().Get("Accept-Ranges"); got != "" {
+		t.Fatalf("Accept-Ranges = %q, want absent", got)
+	}
+	disposition, parameters, err := mime.ParseMediaType(
+		response.Header().Get("Content-Disposition"),
+	)
+	if err != nil {
+		t.Fatalf("parse Content-Disposition: %v", err)
+	}
+	if disposition != "attachment" ||
+		parameters["filename"] != originalName {
+		t.Fatalf(
+			"Content-Disposition = %q params=%v",
+			disposition,
+			parameters,
+		)
+	}
+}
+
+func TestTicketContentPaginationIsBoundedStableAndSeparatesReplies(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.ServicePrincipal{},
+		&models.Ticket{},
+		&models.TicketComment{},
+		&models.TicketAttachment{},
+	); err != nil {
+		t.Fatalf("migrate paginated content schemas: %v", err)
+	}
+	admin := models.User{
+		Username:     "content-pagination-admin",
+		Email:        "content-pagination@example.com",
+		PasswordHash: "hashed",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&admin).Error; err != nil {
+		t.Fatal(err)
+	}
+	ticket := models.Ticket{
+		TicketNumber: "CONTENT-PAGE",
+		Title:        "content pagination",
+		Description:  "content pagination",
+		Type:         models.TicketTypeRequest,
+		Priority:     models.TicketPriorityNormal,
+		Status:       models.TicketStatusOpen,
+		Source:       models.TicketSourceWeb,
+		CreatedByID:  &admin.ID,
+		Version:      1,
+	}
+	if err := db.Create(&ticket).Error; err != nil {
+		t.Fatal(err)
+	}
+	sameCreatedAt := time.Now().UTC().Truncate(time.Second)
+	comments := make([]models.TicketComment, 150)
+	for index := range comments {
+		comments[index] = models.TicketComment{
+			CreatedAt:   sameCreatedAt,
+			TicketID:    ticket.ID,
+			UserID:      &admin.ID,
+			ActorType:   models.ActorTypeHuman,
+			ActorID:     strconv.FormatUint(uint64(admin.ID), 10),
+			Content:     "top-level-" + strconv.Itoa(index+1),
+			ContentType: "text",
+			Type:        models.CommentTypePublic,
+		}
+	}
+	if err := db.Create(&comments).Error; err != nil {
+		t.Fatalf("seed 150 top-level comments: %v", err)
+	}
+	replies := make([]models.TicketComment, 3)
+	for index := range replies {
+		replies[index] = models.TicketComment{
+			CreatedAt:   sameCreatedAt,
+			TicketID:    ticket.ID,
+			UserID:      &admin.ID,
+			ActorType:   models.ActorTypeHuman,
+			ActorID:     strconv.FormatUint(uint64(admin.ID), 10),
+			Content:     "reply-" + strconv.Itoa(index+1),
+			ContentType: "text",
+			Type:        models.CommentTypePublic,
+			ParentID:    &comments[0].ID,
+		}
+	}
+	if err := db.Create(&replies).Error; err != nil {
+		t.Fatalf("seed replies: %v", err)
+	}
+
+	ticketService := newHandlerTicketService(t, db)
+	scope := ensureHandlerTestProject(t, db)
+	foreignComment := models.TicketComment{
+		OrganizationID: scope.OrganizationID + 100,
+		ProjectID:      scope.ProjectID + 100,
+		TicketID:       ticket.ID,
+		UserID:         &admin.ID,
+		ActorType:      models.ActorTypeHuman,
+		ActorID:        strconv.FormatUint(uint64(admin.ID), 10),
+		Content:        "foreign-project-comment",
+		ContentType:    "text",
+		Type:           models.CommentTypePublic,
+	}
+	if err := db.Session(&gorm.Session{SkipHooks: true}).Create(&foreignComment).Error; err != nil {
+		t.Fatalf("seed foreign-project comment: %v", err)
+	}
+	foreignReply := foreignComment
+	foreignReply.ID = 0
+	foreignReply.Content = "foreign-project-reply"
+	foreignReply.ParentID = &comments[0].ID
+	if err := db.Session(&gorm.Session{SkipHooks: true}).Create(&foreignReply).Error; err != nil {
+		t.Fatalf("seed foreign-project reply: %v", err)
+	}
+
+	handler := NewTicketContentHandler(db, ticketService, nil, 0)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", admin.ID)
+		c.Set(projectRoleContextKey, string(models.ProjectRoleAdmin))
+		c.Next()
+	})
+	router.Use(handlerTestProjectMiddleware(t, db))
+	router.GET("/tickets/:id/comments", handler.ListComments)
+	router.GET("/tickets/:id/comments/:comment_id/replies", handler.ListCommentReplies)
+	router.GET("/tickets/:id/attachments", handler.ListAttachments)
+
+	path := "/tickets/" + strconv.FormatUint(uint64(ticket.ID), 10)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(
+		response,
+		httptest.NewRequest(http.MethodGet, path+"/comments?page=2&page_size=25", nil),
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("comments page status=%d body=%s", response.Code, response.Body.String())
+	}
+	var page struct {
+		Data       []models.TicketCommentResponse `json:"data"`
+		Total      int64                          `json:"total"`
+		Page       int                            `json:"page"`
+		PageSize   int                            `json:"page_size"`
+		TotalPages int64                          `json:"total_pages"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Data) != 25 || page.Total != 150 || page.Page != 2 ||
+		page.PageSize != 25 || page.TotalPages != 6 {
+		t.Fatalf("unexpected comments page: %+v", page)
+	}
+	for index := range page.Data {
+		if page.Data[index].ID != comments[index+25].ID ||
+			page.Data[index].ParentID != nil {
+			t.Fatalf("unstable or nested comment at %d: %+v", index, page.Data[index])
+		}
+	}
+
+	firstPageResponse := httptest.NewRecorder()
+	router.ServeHTTP(
+		firstPageResponse,
+		httptest.NewRequest(http.MethodGet, path+"/comments?page=1&page_size=25", nil),
+	)
+	if firstPageResponse.Code != http.StatusOK {
+		t.Fatalf("first comments page status=%d body=%s", firstPageResponse.Code, firstPageResponse.Body.String())
+	}
+	if err := json.Unmarshal(firstPageResponse.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Data[0].ReplyCount != 3 || len(page.Data[0].Replies) != 0 {
+		t.Fatalf("top-level reply projection=%+v", page.Data[0])
+	}
+
+	replyResponse := httptest.NewRecorder()
+	router.ServeHTTP(
+		replyResponse,
+		httptest.NewRequest(
+			http.MethodGet,
+			path+"/comments/"+strconv.FormatUint(uint64(comments[0].ID), 10)+"/replies?page=2&page_size=2",
+			nil,
+		),
+	)
+	if replyResponse.Code != http.StatusOK {
+		t.Fatalf("reply page status=%d body=%s", replyResponse.Code, replyResponse.Body.String())
+	}
+	if err := json.Unmarshal(replyResponse.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Data) != 1 || page.Total != 3 || page.TotalPages != 2 ||
+		page.Data[0].ID != replies[2].ID {
+		t.Fatalf("unexpected reply page: %+v", page)
+	}
+
+	for _, suffix := range []string{
+		"/comments?page=0",
+		"/comments?page=-1",
+		"/comments?page_size=0",
+		"/comments?page_size=-1",
+		"/comments?page_size=101",
+		"/comments?page_size=abc",
+		"/comments?page=",
+		"/comments?page=1&page=2",
+		"/comments?page=%ZZ",
+		"/comments?page=%201",
+		"/comments?unknown=value",
+		"/attachments?page_size=101",
+	} {
+		invalidResponse := httptest.NewRecorder()
+		router.ServeHTTP(
+			invalidResponse,
+			httptest.NewRequest(http.MethodGet, path+suffix, nil),
+		)
+		if invalidResponse.Code != http.StatusBadRequest ||
+			!strings.Contains(invalidResponse.Body.String(), `"code":"invalid_pagination"`) {
+			t.Fatalf(
+				"%s status=%d body=%s",
+				suffix,
+				invalidResponse.Code,
+				invalidResponse.Body.String(),
+			)
+		}
+	}
 }
 
 func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
@@ -139,7 +519,11 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 	router.Use(func(c *gin.Context) {
 		userID, _ := strconv.ParseUint(c.GetHeader("X-Test-User"), 10, 32)
 		c.Set("user_id", uint(userID))
-		c.Set(projectRoleContextKey, string(models.ProjectRoleRequester))
+		role := c.GetHeader("X-Test-Role")
+		if role == "" {
+			role = string(models.ProjectRoleRequester)
+		}
+		c.Set(projectRoleContextKey, role)
 		c.Next()
 	})
 	router.Use(handlerTestProjectMiddleware(t, db))
@@ -158,16 +542,44 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 		t.Fatalf("owner response = %d: %s", ownerResponse.Code, ownerResponse.Body.String())
 	}
 	var body struct {
-		Data []models.TicketCommentResponse `json:"data"`
+		Data  []models.TicketCommentResponse `json:"data"`
+		Total int64                          `json:"total"`
 	}
 	if err := json.Unmarshal(ownerResponse.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body.Data) != 3 ||
+	if body.Total != 3 || len(body.Data) != 3 ||
 		body.Data[0].Content != "public" ||
 		body.Data[1].Content != "support public" ||
 		body.Data[2].Content != "service public" {
 		t.Fatalf("customer saw non-public comments: %#v", body.Data)
+	}
+	for _, role := range []models.ProjectRole{
+		models.ProjectRoleAgent,
+		models.ProjectRoleObserver,
+	} {
+		roleRequest := httptest.NewRequest(
+			http.MethodGet,
+			"/tickets/"+strconv.FormatUint(uint64(ticket.ID), 10)+"/comments",
+			nil,
+		)
+		roleRequest.Header.Set("X-Test-User", strconv.FormatUint(uint64(owner.ID), 10))
+		roleRequest.Header.Set("X-Test-Role", string(role))
+		roleResponse := httptest.NewRecorder()
+		router.ServeHTTP(roleResponse, roleRequest)
+		if roleResponse.Code != http.StatusOK {
+			t.Fatalf("%s comments status=%d body=%s", role, roleResponse.Code, roleResponse.Body.String())
+		}
+		var roleBody struct {
+			Data  []models.TicketCommentResponse `json:"data"`
+			Total int64                          `json:"total"`
+		}
+		if err := json.Unmarshal(roleResponse.Body.Bytes(), &roleBody); err != nil {
+			t.Fatal(err)
+		}
+		if roleBody.Total != 4 || len(roleBody.Data) != 4 {
+			t.Fatalf("%s comment page=%+v", role, roleBody)
+		}
 	}
 	rawBody := ownerResponse.Body.String()
 	for _, forbidden := range []string{
@@ -201,15 +613,43 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 		)
 	}
 	var attachmentBody struct {
-		Data []customerAttachmentResponse `json:"data"`
+		Data  []customerAttachmentResponse `json:"data"`
+		Total int64                        `json:"total"`
 	}
 	if err := json.Unmarshal(attachmentResponse.Body.Bytes(), &attachmentBody); err != nil {
 		t.Fatal(err)
 	}
-	if len(attachmentBody.Data) != 1 ||
+	if attachmentBody.Total != 1 || len(attachmentBody.Data) != 1 ||
 		attachmentBody.Data[0].OriginalName != "customer-visible.txt" ||
 		attachmentBody.Data[0].VirusScan != models.VirusScanClean {
 		t.Fatalf("customer attachment data=%+v", attachmentBody.Data)
+	}
+	for _, role := range []models.ProjectRole{
+		models.ProjectRoleAgent,
+		models.ProjectRoleObserver,
+	} {
+		roleRequest := httptest.NewRequest(
+			http.MethodGet,
+			"/tickets/"+strconv.FormatUint(uint64(ticket.ID), 10)+"/attachments",
+			nil,
+		)
+		roleRequest.Header.Set("X-Test-User", strconv.FormatUint(uint64(owner.ID), 10))
+		roleRequest.Header.Set("X-Test-Role", string(role))
+		roleResponse := httptest.NewRecorder()
+		router.ServeHTTP(roleResponse, roleRequest)
+		if roleResponse.Code != http.StatusOK {
+			t.Fatalf("%s attachments status=%d body=%s", role, roleResponse.Code, roleResponse.Body.String())
+		}
+		var roleBody struct {
+			Data  []models.TicketAttachmentResponse `json:"data"`
+			Total int64                             `json:"total"`
+		}
+		if err := json.Unmarshal(roleResponse.Body.Bytes(), &roleBody); err != nil {
+			t.Fatal(err)
+		}
+		if roleBody.Total != 2 || len(roleBody.Data) != 2 {
+			t.Fatalf("%s attachment page=%+v", role, roleBody)
+		}
 	}
 	rawAttachmentBody := attachmentResponse.Body.String()
 	for _, forbidden := range []string{
@@ -381,6 +821,36 @@ func TestCustomerCannotReferenceInternalDeletedOrCrossTicketComment(t *testing.T
 	}
 	if err := db.Create(&publicComment).Error; err != nil {
 		t.Fatal(err)
+	}
+	nestedParent := models.TicketComment{
+		TicketID: tickets[0].ID, UserID: &customer.ID,
+		ActorType: models.ActorTypeHuman,
+		ActorID:   strconv.FormatUint(uint64(customer.ID), 10),
+		Content:   "existing reply", ContentType: "text",
+		Type: models.CommentTypePublic, ParentID: &publicComment.ID,
+	}
+	if err := db.Create(&nestedParent).Error; err != nil {
+		t.Fatal(err)
+	}
+	nestedRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/tickets/"+jsonNumber(tickets[0].ID)+"/comments",
+		bytes.NewBufferString(
+			`{"content":"nested reply","parent_id":`+
+				jsonNumber(nestedParent.ID)+`}`,
+		),
+	)
+	nestedRequest.Header.Set("Content-Type", "application/json")
+	nestedRequest.Header.Set("If-Match", httpcontract.FormatETag(tickets[0].Version))
+	nestedResponse := httptest.NewRecorder()
+	router.ServeHTTP(nestedResponse, nestedRequest)
+	if nestedResponse.Code != http.StatusBadRequest ||
+		!strings.Contains(nestedResponse.Body.String(), `"code":"nested_comment_reply"`) {
+		t.Fatalf(
+			"nested requester reply status=%d body=%s",
+			nestedResponse.Code,
+			nestedResponse.Body.String(),
+		)
 	}
 	var payload bytes.Buffer
 	writer := multipart.NewWriter(&payload)

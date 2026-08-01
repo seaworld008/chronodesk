@@ -7,6 +7,7 @@ import {
   FunctionField,
   List,
   NumberField,
+  Pagination,
   ShowButton,
   TopToolbar,
   CreateButton,
@@ -27,6 +28,7 @@ import {
   automationTriggerEventChoices,
   automationTriggerEventLabel,
 } from './triggerEvents'
+import AutomationTabs from './AutomationTabs'
 
 const ruleTypeChoices = [
   { id: 'assignment', name: '自动分配' },
@@ -55,27 +57,30 @@ const ListActions = () => (
 )
 
 const AutomationRuleList: React.FC = () => (
-  <List
-    perPage={25}
-    sort={{ field: 'priority', order: 'ASC' }}
-    actions={<ListActions />}
-    filters={[
-      <EnterpriseSelectFilterInput
-        key="rule_type"
-        source="rule_type"
-        label="规则类型"
-        choices={ruleTypeChoices}
-        alwaysOn
-      />,
-      <EnterpriseSelectFilterInput
-        key="trigger_event"
-        source="trigger_event"
-        label="触发事件"
-        choices={automationTriggerEventChoices}
-      />,
-      <EnterpriseBooleanFilterInput key="active" source="is_active" label="启用" />,
-    ]}
-  >
+  <>
+    <AutomationTabs />
+    <List
+      perPage={25}
+      pagination={<Pagination rowsPerPageOptions={[25, 50, 100]} />}
+      sort={{ field: 'priority', order: 'ASC' }}
+      actions={<ListActions />}
+      filters={[
+        <EnterpriseSelectFilterInput
+          key="rule_type"
+          source="rule_type"
+          label="规则类型"
+          choices={ruleTypeChoices}
+          alwaysOn
+        />,
+        <EnterpriseSelectFilterInput
+          key="trigger_event"
+          source="trigger_event"
+          label="触发事件"
+          choices={automationTriggerEventChoices}
+        />,
+        <EnterpriseBooleanFilterInput key="active" source="is_active" label="启用" />,
+      ]}
+    >
     <EnterpriseDatagrid
       tableId="automation.rules"
       columns={automationRuleColumns}
@@ -84,14 +89,14 @@ const AutomationRuleList: React.FC = () => (
     >
       <FunctionField
         label="规则名称"
-        sortBy="name"
+        sortable={false}
         render={(record) => (
           <TruncatedText title={record?.name}>{record?.name || '—'}</TruncatedText>
         )}
       />
       <FunctionField
         label="类型"
-        sortBy="rule_type"
+        sortable={false}
         render={(record) => (
           <TruncatedText title={`规则类型代码：${record?.rule_type || '—'}`}>
             {ruleTypeChoices.find((choice) => choice.id === record?.rule_type)?.name ?? '未知类型'}
@@ -100,24 +105,25 @@ const AutomationRuleList: React.FC = () => (
       />
       <FunctionField
         label="触发事件"
-        sortBy="trigger_event"
+        sortable={false}
         render={(record) => (
           <TruncatedText title={`触发事件代码：${record?.trigger_event || '—'}`}>
             {automationTriggerEventLabel(record?.trigger_event)}
           </TruncatedText>
         )}
       />
-      <NumberField source="priority" label="优先级" />
-      <BooleanField source="is_active" label="启用" />
+      <NumberField source="priority" label="优先级" sortable={false} />
+      <BooleanField source="is_active" label="启用" sortable={false} />
       <FunctionField
         label="执行统计"
+        sortable={false}
         render={(record) => (
           <Box component="span">
             成功 {record.success_count ?? 0} 次 / 失败 {record.failure_count ?? 0} 次
           </Box>
         )}
       />
-      <DateField source="updated_at" label="更新时间" showTime />
+      <DateField source="updated_at" label="更新时间" showTime sortable={false} />
       <WrapperField
         label="操作"
         cellClassName="cd-table-sticky-right"
@@ -129,7 +135,8 @@ const AutomationRuleList: React.FC = () => (
         </Stack>
       </WrapperField>
     </EnterpriseDatagrid>
-  </List>
+    </List>
+  </>
 )
 
 export default AutomationRuleList

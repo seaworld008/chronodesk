@@ -24,6 +24,8 @@ import {
   type EmailConfig,
   type TestEmailRequest,
 } from '@/lib/generated/human-api'
+import PageHeader from '@/components/layout/PageHeader'
+import PageShell from '@/components/layout/PageShell'
 import BackButton from '../common/BackButton'
 
 interface EmailForm extends EmailConfig {
@@ -37,6 +39,14 @@ const defaultTestForm: TestForm = {
   subject: '测试邮件',
   content: '这是一封来自 ChronoDesk 的测试邮件，如果您收到此邮件说明配置已生效。',
 }
+
+const EmailSettingsHeader = () => (
+  <PageHeader
+    title="平台邮件设置"
+    description="配置平台级 SMTP 服务器与邮件模板，不修改项目配置快照。"
+    leading={<BackButton fallbackPath="/system-settings" />}
+  />
+)
 
 const EmailSettings: React.FC = () => {
   const notify = useNotify()
@@ -158,45 +168,37 @@ const EmailSettings: React.FC = () => {
 
   if (loading) {
     return (
-      <Box sx={{ display: 'flex', justifyContent: 'center', mt: 6 }}>
-        <CircularProgress />
-      </Box>
+      <PageShell title="平台邮件设置" testId="email-settings-page-shell">
+        <EmailSettingsHeader />
+        <Box
+          role="status"
+          aria-label="正在加载平台邮件设置"
+          sx={{ display: 'flex', justifyContent: 'center', pb: 6, pt: 9 }}
+        >
+          <CircularProgress aria-label="正在加载平台邮件设置" />
+        </Box>
+      </PageShell>
     )
   }
 
   if (!config) {
     return (
-      <Alert severity="error" action={<Button onClick={loadConfig}>重试</Button>}>
-        无法加载邮件配置
-      </Alert>
+      <PageShell title="平台邮件设置" testId="email-settings-page-shell">
+        <EmailSettingsHeader />
+        <Alert
+          severity="error"
+          action={<Button onClick={loadConfig}>重试</Button>}
+          sx={{ mt: 2 }}
+        >
+          无法加载邮件配置
+        </Alert>
+      </PageShell>
     )
   }
 
   return (
-    <Box sx={{ p: 3 }}>
-      <Stack
-        direction="row"
-        sx={{
-          alignItems: "center",
-          justifyContent: "space-between",
-          mb: 2
-        }}>
-        <Stack direction="row" spacing={2} sx={{
-          alignItems: "center"
-        }}>
-          <BackButton fallbackPath="/system-settings" />
-          <Box>
-            <Typography variant="h4" gutterBottom>
-              邮件通知配置
-            </Typography>
-            <Typography sx={{
-              color: "text.secondary"
-            }}>
-              配置 SMTP 服务器与模板，用于系统通知邮件发送。
-            </Typography>
-          </Box>
-        </Stack>
-      </Stack>
+    <PageShell title="平台邮件设置" testId="email-settings-page-shell">
+      <EmailSettingsHeader />
       <Paper sx={{ p: 3, mb: 3 }}>
         <Stack
           direction="row"
@@ -369,7 +371,12 @@ const EmailSettings: React.FC = () => {
           </Grid>
         </Grid>
       </Paper>
-      <Stack direction="row" spacing={2}>
+      <Stack
+        direction="row"
+        spacing={2}
+        useFlexGap
+        sx={{ flexWrap: 'wrap' }}
+      >
         <Button
           variant="contained"
           onClick={handleSave}
@@ -429,7 +436,7 @@ const EmailSettings: React.FC = () => {
           </Button>
         </DialogActions>
       </Dialog>
-    </Box>
+    </PageShell>
   );
 }
 

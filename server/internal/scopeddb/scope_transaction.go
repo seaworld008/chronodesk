@@ -70,6 +70,106 @@ func ConfigureProjectScopeTransaction(
 	return nil
 }
 
+// ConfigureAuthorizedProjectScopeTransaction installs a bounded cross-project
+// scope on an already-open top-level transaction. Callers must resolve and
+// revalidate the project IDs from authoritative memberships or principal
+// grants in this same transaction before calling this function.
+func ConfigureAuthorizedProjectScopeTransaction(
+	tx *gorm.DB,
+	organizationID uint,
+	projectIDs []uint,
+) error {
+	if err := requireDatabase(tx); err != nil {
+		return err
+	}
+	if organizationID == 0 ||
+		uint64(organizationID) > postgresScopeMaxID {
+		return errors.New(
+			"authorized project set organization must fit PostgreSQL BIGINT",
+		)
+	}
+	if _, inTransaction := tx.Statement.ConnPool.(gorm.TxCommitter); !inTransaction {
+		return errors.New(
+			"authorized project scope configuration requires an active database transaction",
+		)
+	}
+	authorizedIDs, err := normalizeAuthorizedProjectIDs(projectIDs)
+	if err != nil {
+		return err
+	}
+	if len(authorizedIDs) > 0 {
+		var matchingProjects int64
+		if err := tx.Table("projects").
+			Where(
+				"organization_id = ? AND id IN ?",
+				organizationID,
+				authorizedIDs,
+			).
+			Count(&matchingProjects).Error; err != nil {
+			return fmt.Errorf(
+				"validate authorized project ownership: %w",
+				err,
+			)
+		}
+		if matchingProjects != int64(len(authorizedIDs)) {
+			return errors.New(
+				"authorized project set contains a missing or cross-organization project",
+			)
+		}
+	}
+	if tx.Dialector.Name() != "postgres" {
+		return nil
+	}
+
+	organizationValue := strconv.FormatUint(uint64(organizationID), 10)
+	projectValues := make([]string, 0, len(authorizedIDs))
+	for _, projectID := range authorizedIDs {
+		projectValues = append(
+			projectValues,
+			strconv.FormatUint(uint64(projectID), 10),
+		)
+	}
+	projectSetValue := strings.Join(projectValues, ",")
+	configured := struct {
+		OrganizationID string `gorm:"column:organization_id"`
+		ProjectID      string `gorm:"column:project_id"`
+		ProjectIDs     string `gorm:"column:project_ids"`
+	}{}
+	if err := tx.Raw(
+		`SELECT
+			set_config(
+				'chronodesk.organization_id',
+				?,
+				true
+			) AS organization_id,
+			set_config(
+				'chronodesk.project_id',
+				'',
+				true
+			) AS project_id,
+			set_config(
+				'chronodesk.project_ids',
+				?,
+				true
+			) AS project_ids`,
+		organizationValue,
+		projectSetValue,
+	).Scan(&configured).Error; err != nil {
+		return fmt.Errorf(
+			"set local authorized project scope: %w",
+			err,
+		)
+	}
+	if configured.OrganizationID != organizationValue ||
+		configured.ProjectID != "" ||
+		configured.ProjectIDs != projectSetValue {
+		return errors.New(
+			"PostgreSQL did not retain the authorized project set",
+		)
+	}
+	return nil
+}
+
 // WithProjectScopeTransaction is the low-level worker/repository boundary. It
 // sets PostgreSQL scope with transaction-local settings and passes the actual
 // GORM transaction to fn. Workers should keep claim and finalize operations in
@@ -214,102 +314,21 @@ func WithAuthorizedProjectScopeTransaction(
 			"nested authorized project set transactions are forbidden",
 		)
 	}
-	authorizedIDs := append([]uint(nil), projectIDs...)
-	seen := make(map[uint]struct{}, len(authorizedIDs))
-	for _, projectID := range authorizedIDs {
-		if projectID == 0 ||
-			uint64(projectID) > postgresScopeMaxID {
-			return errors.New(
-				"authorized project IDs must fit PostgreSQL BIGINT",
-			)
-		}
-		if _, exists := seen[projectID]; exists {
-			return fmt.Errorf(
-				"authorized project set contains duplicate project ID %d",
-				projectID,
-			)
-		}
-		seen[projectID] = struct{}{}
+	authorizedIDs, err := normalizeAuthorizedProjectIDs(projectIDs)
+	if err != nil {
+		return err
 	}
-	sort.Slice(authorizedIDs, func(left, right int) bool {
-		return authorizedIDs[left] < authorizedIDs[right]
-	})
 	if err := Install(db); err != nil {
 		return err
 	}
 
 	return db.WithContext(ctx).Transaction(func(scoped *gorm.DB) error {
-		if len(authorizedIDs) > 0 {
-			var matchingProjects int64
-			if err := scoped.Table("projects").
-				Where(
-					"organization_id = ? AND id IN ?",
-					organizationID,
-					authorizedIDs,
-				).
-				Count(&matchingProjects).Error; err != nil {
-				return fmt.Errorf(
-					"validate authorized project ownership: %w",
-					err,
-				)
-			}
-			if matchingProjects != int64(len(authorizedIDs)) {
-				return errors.New(
-					"authorized project set contains a missing or cross-organization project",
-				)
-			}
-		}
-
-		organizationValue := strconv.FormatUint(
-			uint64(organizationID),
-			10,
-		)
-		projectValues := make([]string, 0, len(authorizedIDs))
-		for _, projectID := range authorizedIDs {
-			projectValues = append(
-				projectValues,
-				strconv.FormatUint(uint64(projectID), 10),
-			)
-		}
-		projectSetValue := strings.Join(projectValues, ",")
-		if scoped.Dialector.Name() == "postgres" {
-			configured := struct {
-				OrganizationID string `gorm:"column:organization_id"`
-				ProjectID      string `gorm:"column:project_id"`
-				ProjectIDs     string `gorm:"column:project_ids"`
-			}{}
-			if err := scoped.Raw(
-				`SELECT
-					set_config(
-						'chronodesk.organization_id',
-						?,
-						true
-					) AS organization_id,
-					set_config(
-						'chronodesk.project_id',
-						'',
-						true
-					) AS project_id,
-					set_config(
-						'chronodesk.project_ids',
-						?,
-						true
-					) AS project_ids`,
-				organizationValue,
-				projectSetValue,
-			).Scan(&configured).Error; err != nil {
-				return fmt.Errorf(
-					"set local authorized project scope: %w",
-					err,
-				)
-			}
-			if configured.OrganizationID != organizationValue ||
-				configured.ProjectID != "" ||
-				configured.ProjectIDs != projectSetValue {
-				return errors.New(
-					"PostgreSQL did not retain the authorized project set",
-				)
-			}
+		if err := ConfigureAuthorizedProjectScopeTransaction(
+			scoped,
+			organizationID,
+			authorizedIDs,
+		); err != nil {
+			return err
 		}
 		return WithAuthorizedTransactionBinding(
 			ctx,
@@ -320,4 +339,28 @@ func WithAuthorizedProjectScopeTransaction(
 			fn,
 		)
 	})
+}
+
+func normalizeAuthorizedProjectIDs(projectIDs []uint) ([]uint, error) {
+	authorizedIDs := append([]uint(nil), projectIDs...)
+	seen := make(map[uint]struct{}, len(authorizedIDs))
+	for _, projectID := range authorizedIDs {
+		if projectID == 0 ||
+			uint64(projectID) > postgresScopeMaxID {
+			return nil, errors.New(
+				"authorized project IDs must fit PostgreSQL BIGINT",
+			)
+		}
+		if _, exists := seen[projectID]; exists {
+			return nil, fmt.Errorf(
+				"authorized project set contains duplicate project ID %d",
+				projectID,
+			)
+		}
+		seen[projectID] = struct{}{}
+	}
+	sort.Slice(authorizedIDs, func(left, right int) bool {
+		return authorizedIDs[left] < authorizedIDs[right]
+	})
+	return authorizedIDs, nil
 }

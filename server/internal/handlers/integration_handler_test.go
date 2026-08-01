@@ -8,10 +8,12 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/services"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -203,6 +205,288 @@ func TestIntegrationHandlerRestrictsMutationsAndAllowsObserverLists(t *testing.T
 	}
 }
 
+func TestIntegrationHandlerUsesStrictBoundedListContract(t *testing.T) {
+	environment := newIntegrationHandlerEnvironment(t)
+	router := integrationHandlerRouter(
+		t,
+		environment,
+		models.ProjectRoleObserver,
+	)
+	for _, query := range []string{
+		"?page=0",
+		"?page=-1",
+		"?page_size=0",
+		"?page_size=101",
+		"?pageSize=25",
+		"?page=1&page=2",
+		"?sort_by=configuration_schema",
+		"?sort_order=DESC",
+		"?search=%20leading",
+		"?unknown=value",
+	} {
+		response := performIntegrationHandlerRequest(
+			t,
+			router,
+			http.MethodGet,
+			"/api/projects/INT/integrations/connector-definitions"+query,
+			nil,
+		)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf(
+				"query %s status=%d body=%s",
+				query,
+				response.Code,
+				response.Body.String(),
+			)
+		}
+	}
+
+	definitions := make([]models.ConnectorDefinition, 0, 26)
+	for index := 0; index < 26; index++ {
+		definitions = append(definitions, models.ConnectorDefinition{
+			OrganizationID:             environment.project.OrganizationID,
+			ProjectID:                  environment.project.ID,
+			Key:                        "strict-" + strconv.Itoa(index),
+			Name:                       "Strict " + strconv.Itoa(index),
+			Kind:                       "webhook",
+			Direction:                  models.ConnectorDirectionInbound,
+			Status:                     models.ConnectorDefinitionStatusActive,
+			SignatureScheme:            "hmac-sha256",
+			DefaultReplayWindowSeconds: 300,
+			ConfigurationSchema: datatypes.JSON(
+				[]byte(`{"private_schema_hint":"must-not-list"}`),
+			),
+			MappingSchema: datatypes.JSON(
+				[]byte(`{"private_mapping_hint":"must-not-list"}`),
+			),
+		})
+	}
+	if err := environment.db.CreateInBatches(definitions, 20).Error; err != nil {
+		t.Fatal(err)
+	}
+	response := performIntegrationHandlerRequest(
+		t,
+		router,
+		http.MethodGet,
+		"/api/projects/INT/integrations/connector-definitions",
+		nil,
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("default list status=%d body=%s", response.Code, response.Body.String())
+	}
+	var envelope struct {
+		Data struct {
+			Items      []connectorDefinitionSummaryView `json:"items"`
+			Total      int64                            `json:"total"`
+			Page       int                              `json:"page"`
+			PageSize   int                              `json:"page_size"`
+			TotalPages int                              `json:"total_pages"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Data.Total != 26 ||
+		len(envelope.Data.Items) != 25 ||
+		envelope.Data.Page != 1 ||
+		envelope.Data.PageSize != 25 ||
+		envelope.Data.TotalPages != 2 {
+		t.Fatalf("unexpected default page: %+v", envelope.Data)
+	}
+	body := response.Body.String()
+	for _, forbidden := range []string{
+		"private_schema_hint",
+		"private_mapping_hint",
+		`"configuration_schema":`,
+		`"mapping_schema":`,
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("bounded connector list leaked %q: %s", forbidden, body)
+		}
+	}
+}
+
+func TestIntegrationInboxAndReceiptResponsesAreRedacted(t *testing.T) {
+	environment := newIntegrationHandlerEnvironment(t)
+	router := integrationHandlerRouter(
+		t,
+		environment,
+		models.ProjectRoleManager,
+	)
+	definition := models.ConnectorDefinition{
+		OrganizationID:             environment.project.OrganizationID,
+		ProjectID:                  environment.project.ID,
+		Key:                        "inbox-redaction",
+		Name:                       "Inbox Redaction",
+		Kind:                       "webhook",
+		Direction:                  models.ConnectorDirectionInbound,
+		Status:                     models.ConnectorDefinitionStatusActive,
+		SignatureScheme:            "hmac-sha256",
+		DefaultReplayWindowSeconds: 300,
+		ConfigurationSchema:        datatypes.JSON([]byte(`{"type":"object"}`)),
+		MappingSchema:              datatypes.JSON([]byte(`{"type":"object"}`)),
+	}
+	if err := environment.db.Create(&definition).Error; err != nil {
+		t.Fatal(err)
+	}
+	connection := models.Connection{
+		OrganizationID:        environment.project.OrganizationID,
+		ProjectID:             environment.project.ID,
+		ConnectorDefinitionID: definition.ID,
+		Key:                   "redacted-primary",
+		Name:                  "Redacted Primary",
+		Status:                models.ConnectionStatusActive,
+		ReplayWindowSeconds:   300,
+		ActorType:             models.ActorTypeSystem,
+		ActorID:               "connector:redacted",
+	}
+	if err := environment.db.Create(&connection).Error; err != nil {
+		t.Fatal(err)
+	}
+	mapping := models.MappingVersion{
+		OrganizationID: environment.project.OrganizationID,
+		ProjectID:      environment.project.ID,
+		ConnectionID:   connection.ID,
+		Key:            "redacted-map",
+		Version:        1,
+		Status:         models.MappingVersionStatusDraft,
+		TargetCommand:  "ticket.create",
+		Definition:     datatypes.JSON([]byte(`{"password":"mapping-secret"}`)),
+	}
+	if err := environment.db.Create(&mapping).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 1, 8, 0, 0, 0, time.UTC)
+	message := models.InboxMessage{
+		OrganizationID:       environment.project.OrganizationID,
+		ProjectID:            environment.project.ID,
+		ConnectionID:         connection.ID,
+		MappingVersionID:     mapping.ID,
+		ExternalMessageID:    "message-redacted",
+		ExternalResourceType: "ticket",
+		ExternalResourceID:   "EXT-100",
+		SignedAt:             now,
+		ReceivedAt:           now,
+		ContentType:          "application/json",
+		Payload:              []byte(`{"access_token":"payload-secret"}`),
+		PayloadDigest:        strings.Repeat("a", 64),
+		SignatureDigest:      "signature-secret",
+		Status:               models.InboxMessageStatusCompleted,
+		ProcessedAt:          &now,
+	}
+	if err := environment.db.Create(&message).Error; err != nil {
+		t.Fatal(err)
+	}
+	receipt := models.InboxReceipt{
+		OrganizationID:  environment.project.OrganizationID,
+		ProjectID:       environment.project.ID,
+		ConnectionID:    connection.ID,
+		InboxMessageID:  message.ID,
+		Status:          models.InboxReceiptStatusApplied,
+		ResourceType:    "ticket",
+		ResourceID:      "INT-100",
+		ResourceVersion: 1,
+		Result:          datatypes.JSON([]byte(`{"secret":"receipt-secret"}`)),
+		ActorType:       models.ActorTypeSystem,
+		ActorID:         "connector:redacted",
+		ProcessedAt:     now,
+	}
+	if err := environment.db.Create(&receipt).Error; err != nil {
+		t.Fatal(err)
+	}
+	event := models.DomainEvent{
+		ID:              "00000000-0000-7000-8000-000000000501",
+		OrganizationID:  environment.project.OrganizationID,
+		ProjectID:       environment.project.ID,
+		SpecVersion:     "1.0",
+		Source:          "urn:chronodesk:test",
+		Type:            "io.chronodesk.integration.redaction.v1",
+		Subject:         "ticket/INT-100",
+		Time:            now,
+		DataContentType: "application/json",
+		Data: datatypes.JSON(
+			[]byte(`{"access_token":"domain-event-secret"}`),
+		),
+		TraceID:         "trace-secret",
+		CorrelationID:   "correlation-secret",
+		ActorType:       models.ActorTypeSystem,
+		ActorID:         "integration-redaction",
+		ResourceVersion: 1,
+	}
+	if err := environment.db.Create(&event).Error; err != nil {
+		t.Fatal(err)
+	}
+	outbox := models.OutboxDelivery{
+		ID:              "00000000-0000-7000-8000-000000000502",
+		OrganizationID:  environment.project.OrganizationID,
+		ProjectID:       environment.project.ID,
+		EventID:         event.ID,
+		DestinationType: "webhook",
+		DestinationID:   "vault://outbox-destination-secret",
+		Status:          models.OutboxDeliveryFailed,
+		Attempts:        1,
+		MaxAttempts:     8,
+		NextAttemptAt:   now,
+		LockedBy:        "private-worker",
+		LastError:       "Authorization: Bearer outbox-access-token",
+	}
+	if err := environment.db.Create(&outbox).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{
+		"/api/projects/INT/integrations/inbox",
+		"/api/projects/INT/integrations/inbox/" + message.PublicID +
+			"/receipts",
+		"/api/projects/INT/integrations/connections/" +
+			connection.PublicID + "/mappings",
+		"/api/projects/INT/integrations/domain-events",
+		"/api/projects/INT/integrations/outbox",
+	} {
+		response := performIntegrationHandlerRequest(
+			t,
+			router,
+			http.MethodGet,
+			path,
+			nil,
+		)
+		if response.Code != http.StatusOK {
+			t.Fatalf(
+				"path %s status=%d body=%s",
+				path,
+				response.Code,
+				response.Body.String(),
+			)
+		}
+		body := response.Body.String()
+		for _, forbidden := range []string{
+			"payload-secret",
+			"signature-secret",
+			"receipt-secret",
+			"mapping-secret",
+			`"payload"`,
+			`"signature_digest"`,
+			`"result"`,
+			`"definition"`,
+			`"source_schema"`,
+			"domain-event-secret",
+			"trace-secret",
+			"correlation-secret",
+			"outbox-destination-secret",
+			"outbox-access-token",
+			"private-worker",
+			`"trace_id"`,
+			`"correlation_id"`,
+			`"destination_id"`,
+			`"locked_by"`,
+		} {
+			if strings.Contains(body, forbidden) {
+				t.Fatalf("path %s leaked %q: %s", path, forbidden, body)
+			}
+		}
+	}
+}
+
 func newIntegrationHandlerEnvironment(t *testing.T) integrationHandlerEnvironment {
 	t.Helper()
 	db := openHandlerTestDB(t)
@@ -221,6 +505,8 @@ func newIntegrationHandlerEnvironment(t *testing.T) integrationHandlerEnvironmen
 		&models.SyncRun{},
 		&models.IntegrationConflict{},
 		&models.DeadLetter{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -263,6 +549,11 @@ func newIntegrationHandlerEnvironment(t *testing.T) integrationHandlerEnvironmen
 	}
 	service, err := services.NewIntegrationManagementService(db, nil)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ConfigureCursorSigningKey(
+		[]byte("integration-handler-test-cursor"),
+	); err != nil {
 		t.Fatal(err)
 	}
 	return integrationHandlerEnvironment{

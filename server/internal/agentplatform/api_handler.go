@@ -4,17 +4,20 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
 	"github.com/seaworld008/chronodesk/server/internal/httpcontract"
 	"github.com/seaworld008/chronodesk/server/internal/mcp"
@@ -44,10 +47,12 @@ type apiPublicationBufferContextKey struct{}
 type APIHandler struct {
 	db                 *gorm.DB
 	native             *services.AgentNativeService
+	knowledge          *services.KnowledgeService
 	projects           *services.ProjectService
 	tokens             *agentauth.Manager
 	maxAttachmentBytes int64
 	publisher          ResourcePublisher
+	ticketContentLists *agentTicketContentListCursors
 }
 
 func NewAPIHandler(
@@ -71,8 +76,21 @@ func NewAPIHandler(
 	}
 }
 
+func (h *APIHandler) SetKnowledgeService(
+	knowledge *services.KnowledgeService,
+) {
+	if h != nil {
+		h.knowledge = knowledge
+	}
+}
+
 func (h *APIHandler) RegisterRoutes(api *gin.RouterGroup) {
 	api.GET("/capabilities", h.tokens.Middleware(models.ScopeTicketsRead), h.bindProjectContext(), h.Capabilities)
+	api.GET("/knowledge/articles", h.tokens.Middleware(models.ScopeKnowledgeRead), h.executionLimit(), h.bindExternalProjectContext(), h.ListKnowledgeArticles)
+	api.POST("/knowledge/articles", h.tokens.Middleware(models.ScopeKnowledgeWrite), h.executionLimit(), h.bindExternalProjectContext(), h.CreateKnowledgeArticleDraft)
+	api.GET("/knowledge/articles/:knowledgeArticleID/document", h.tokens.Middleware(models.ScopeKnowledgeRead), h.executionLimit(), h.bindExternalProjectContext(), h.GetKnowledgeArticleDocument)
+	api.POST("/knowledge/articles/:knowledgeArticleID/drafts", h.tokens.Middleware(models.ScopeKnowledgeWrite), h.executionLimit(), h.bindExternalProjectContext(), h.CreateKnowledgeVersionDraft)
+	api.POST("/knowledge/searches", h.tokens.Middleware(models.ScopeKnowledgeRead), h.executionLimit(), h.bindExternalProjectContext(), h.SearchKnowledge)
 	api.GET("/tickets", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.bindProjectContext(), h.ListTickets)
 	api.POST("/tickets", h.tokens.Middleware(models.ScopeTicketsCreate), h.executionLimit(), h.bindMachineWriteProjectContext(), h.CreateTicket)
 	api.GET("/tickets/:id", h.tokens.Middleware(models.ScopeTicketsRead), h.executionLimit(), h.bindProjectContext(), h.GetTicket)
@@ -370,6 +388,484 @@ func (h *APIHandler) Capabilities(c *gin.Context) {
 			"ticket_leases":      true,
 			"idempotency_keys":   true,
 		},
+	}, Meta{})
+}
+
+func (h *APIHandler) ListKnowledgeArticles(c *gin.Context) {
+	principal, ok := h.principal(c)
+	if !ok {
+		return
+	}
+	decision, ok := h.checkAgentKnowledgeAction(
+		c,
+		principal,
+		models.ScopeKnowledgeRead,
+		"knowledge.article.list",
+		"knowledge_article",
+		"*",
+		false,
+		"",
+	)
+	if !ok {
+		return
+	}
+	page, pageSize, ok := parseAgentKnowledgePage(c)
+	if !ok {
+		return
+	}
+	result, err := h.knowledge.ListArticles(
+		c.Request.Context(),
+		services.KnowledgeArticleListFilter{
+			PolicyDecisionID: decision.ID,
+		},
+		services.DirectoryPageRequest{
+			Page:      page,
+			PageSize:  pageSize,
+			SortBy:    "updated_at",
+			SortOrder: "desc",
+		},
+	)
+	if errors.Is(err, services.ErrDirectoryListQuery) {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			"Knowledge article pagination is invalid",
+			false,
+		)
+		return
+	}
+	if err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
+	items := make(
+		[]agentKnowledgeArticleResponse,
+		0,
+		len(result.Items),
+	)
+	for _, article := range result.Items {
+		items = append(items, newAgentKnowledgeArticleResponse(article))
+	}
+	WriteData(c, http.StatusOK, agentKnowledgeArticlePage{
+		Items:      items,
+		Total:      result.Total,
+		Page:       result.Page,
+		PageSize:   result.PageSize,
+		TotalPages: result.TotalPages,
+	}, Meta{HasMore: result.Page < result.TotalPages})
+}
+
+func (h *APIHandler) GetKnowledgeArticleDocument(c *gin.Context) {
+	principal, ok := h.principal(c)
+	if !ok {
+		return
+	}
+	articleID, ok := parseKnowledgeArticleID(c, "knowledgeArticleID")
+	if !ok {
+		return
+	}
+	versionID, ok := parseOptionalKnowledgeVersionID(c)
+	if !ok {
+		return
+	}
+	decision, ok := h.checkAgentKnowledgeAction(
+		c,
+		principal,
+		models.ScopeKnowledgeRead,
+		"knowledge.article.read",
+		"knowledge_article",
+		articleID,
+		false,
+		"",
+	)
+	if !ok {
+		return
+	}
+	documentInput := services.GetArticleDocumentInput{
+		VersionID:        versionID,
+		PolicyDecisionID: decision.ID,
+		Authorization: services.
+			KnowledgeDocumentRead,
+	}
+	document, err := h.knowledge.GetArticleDocument(
+		c.Request.Context(),
+		articleID,
+		documentInput,
+	)
+	if err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
+	document, ok = h.expandAgentKnowledgeDocumentSources(
+		c,
+		principal,
+		articleID,
+		documentInput,
+		document,
+	)
+	if !ok {
+		return
+	}
+	WriteData(
+		c,
+		http.StatusOK,
+		newAgentKnowledgeDocumentResponse(document),
+		Meta{},
+	)
+}
+
+func (h *APIHandler) CreateKnowledgeArticleDraft(c *gin.Context) {
+	principal, ok := h.principal(c)
+	if !ok {
+		return
+	}
+	key, ok := RequireIdempotencyKey(c)
+	if !ok {
+		return
+	}
+	body, ok := readJSONBody(c, maxAgentKnowledgeRequestBytes)
+	if !ok {
+		return
+	}
+	var request agentKnowledgeArticleDraftRequest
+	if err := decodeStrictJSON(body, &request); err != nil {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			"Knowledge article draft request is invalid",
+			false,
+		)
+		return
+	}
+	if err := validateAgentKnowledgeArticleDraft(request); err != nil {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			err.Error(),
+			false,
+		)
+		return
+	}
+	fingerprint := commandFingerprint(
+		http.MethodPost,
+		agentRESTProjectPath(c, "/knowledge/articles"),
+		0,
+		"",
+		body,
+	)
+	requestDigest := digestBytes(fingerprint)
+	decision, ok := h.checkAgentKnowledgeAction(
+		c,
+		principal,
+		models.ScopeKnowledgeWrite,
+		"knowledge.article.draft.create",
+		"knowledge_article",
+		"*",
+		true,
+		requestDigest,
+	)
+	if !ok {
+		return
+	}
+	sourceAuthorization, ok := h.authorizeAgentKnowledgeSources(
+		c,
+		principal,
+		request.SourceTicketID,
+		request.SourceAttachmentIDs,
+		requestDigest,
+	)
+	if !ok {
+		return
+	}
+	reservation, err := h.native.ReserveIdempotency(
+		c.Request.Context(),
+		models.ServicePrincipalActor(principal.ID),
+		"knowledge.article.create",
+		key,
+		fingerprint,
+		24*time.Hour,
+	)
+	if err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
+	if reservation.Replayed {
+		h.writeReplayedKnowledgeDocument(
+			c,
+			reservation.Record,
+			"",
+			decision.ID,
+			services.KnowledgeDocumentAuthoredArticleReplay,
+		)
+		return
+	}
+	result, err := h.knowledge.CreateAuthoredArticle(
+		c.Request.Context(),
+		services.CreateAuthoredArticleInput{
+			Key:                              request.Key,
+			Title:                            request.Title,
+			Summary:                          request.Summary,
+			Markdown:                         request.Markdown,
+			SourceTicketID:                   request.SourceTicketID,
+			SourceAttachmentIDs:              append([]uint(nil), request.SourceAttachmentIDs...),
+			PolicyDecisionID:                 decision.ID,
+			SourceTicketPolicyDecisionID:     sourceAuthorization.TicketPolicyDecisionID,
+			SourceAttachmentPolicyDecisionID: sourceAuthorization.AttachmentPolicyDecisionID,
+			IdempotencyRecordID:              reservation.Record.ID,
+			IdempotencyCompletionTTL:         24 * time.Hour,
+		},
+	)
+	if err != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(err),
+		)
+		h.writeNativeError(c, err)
+		return
+	}
+	h.writeAuthoredKnowledgeResult(c, result)
+}
+
+func (h *APIHandler) CreateKnowledgeVersionDraft(c *gin.Context) {
+	principal, ok := h.principal(c)
+	if !ok {
+		return
+	}
+	articleID, ok := parseKnowledgeArticleID(c, "knowledgeArticleID")
+	if !ok {
+		return
+	}
+	key, ok := RequireIdempotencyKey(c)
+	if !ok {
+		return
+	}
+	body, ok := readJSONBody(c, maxAgentKnowledgeRequestBytes)
+	if !ok {
+		return
+	}
+	var request agentKnowledgeVersionDraftRequest
+	if err := decodeStrictJSON(body, &request); err != nil {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			"Knowledge version draft request is invalid",
+			false,
+		)
+		return
+	}
+	if err := validateAgentKnowledgeVersionDraft(request); err != nil {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			err.Error(),
+			false,
+		)
+		return
+	}
+	fingerprint := commandFingerprint(
+		http.MethodPost,
+		agentRESTProjectPath(
+			c,
+			"/knowledge/articles/"+articleID+"/drafts",
+		),
+		0,
+		"",
+		body,
+	)
+	requestDigest := digestBytes(fingerprint)
+	decision, ok := h.checkAgentKnowledgeAction(
+		c,
+		principal,
+		models.ScopeKnowledgeWrite,
+		"knowledge.article.draft.create",
+		"knowledge_article",
+		articleID,
+		true,
+		requestDigest,
+	)
+	if !ok {
+		return
+	}
+	sourceAuthorization, ok := h.authorizeAgentKnowledgeSources(
+		c,
+		principal,
+		request.SourceTicketID,
+		request.SourceAttachmentIDs,
+		requestDigest,
+	)
+	if !ok {
+		return
+	}
+	reservation, err := h.native.ReserveIdempotency(
+		c.Request.Context(),
+		models.ServicePrincipalActor(principal.ID),
+		"knowledge.article.draft.create",
+		key,
+		fingerprint,
+		24*time.Hour,
+	)
+	if err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
+	if reservation.Replayed {
+		h.writeReplayedKnowledgeDocument(
+			c,
+			reservation.Record,
+			articleID,
+			decision.ID,
+			services.KnowledgeDocumentAuthoredVersionReplay,
+		)
+		return
+	}
+	result, err := h.knowledge.CreateAuthoredVersion(
+		c.Request.Context(),
+		articleID,
+		services.CreateAuthoredVersionInput{
+			Title:                            request.Title,
+			Markdown:                         request.Markdown,
+			SourceTicketID:                   request.SourceTicketID,
+			SourceAttachmentIDs:              append([]uint(nil), request.SourceAttachmentIDs...),
+			PolicyDecisionID:                 decision.ID,
+			SourceTicketPolicyDecisionID:     sourceAuthorization.TicketPolicyDecisionID,
+			SourceAttachmentPolicyDecisionID: sourceAuthorization.AttachmentPolicyDecisionID,
+			IdempotencyRecordID:              reservation.Record.ID,
+			IdempotencyCompletionTTL:         24 * time.Hour,
+		},
+	)
+	if err != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(err),
+		)
+		h.writeNativeError(c, err)
+		return
+	}
+	h.writeAuthoredKnowledgeResult(c, result)
+}
+
+type agentKnowledgeCitationResponse struct {
+	ID              string  `json:"id"`
+	ArticleID       string  `json:"article_id"`
+	ArticleKey      string  `json:"article_key"`
+	ArticleTitle    string  `json:"article_title"`
+	VersionID       string  `json:"version_id"`
+	DocumentVersion uint64  `json:"document_version"`
+	ChunkID         string  `json:"chunk_id"`
+	PageNumber      *int    `json:"page_number,omitempty"`
+	SectionPath     string  `json:"section_path"`
+	Snippet         string  `json:"snippet"`
+	ContentHash     string  `json:"content_hash"`
+	Rank            int     `json:"rank"`
+	Score           float64 `json:"score"`
+}
+
+type agentKnowledgeSearchResponse struct {
+	SearchID string                           `json:"search_id"`
+	Items    []agentKnowledgeCitationResponse `json:"items"`
+}
+
+func (h *APIHandler) SearchKnowledge(c *gin.Context) {
+	principal, ok := h.principal(c)
+	if !ok {
+		return
+	}
+	body, ok := readJSONBody(c, 16<<10)
+	if !ok {
+		return
+	}
+	var request agentKnowledgeSearchRequest
+	if err := decodeStrictJSON(body, &request); err != nil {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			"Knowledge search request is invalid",
+			false,
+		)
+		return
+	}
+	request.Query = strings.TrimSpace(request.Query)
+	if request.Query == "" || utf8.RuneCountInString(request.Query) > 2000 {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			"Knowledge search query must contain between 1 and 2000 characters",
+			false,
+		)
+		return
+	}
+	if request.Limit == 0 {
+		request.Limit = 10
+	}
+	if request.Limit < 1 || request.Limit > 50 {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			"Knowledge search limit must be between 1 and 50",
+			false,
+		)
+		return
+	}
+	decision, ok := h.checkAgentKnowledgeAction(
+		c,
+		principal,
+		models.ScopeKnowledgeRead,
+		"knowledge.search",
+		"knowledge",
+		"*",
+		false,
+		digestBytes(body),
+	)
+	if !ok {
+		return
+	}
+	result, err := h.knowledge.Search(
+		c.Request.Context(),
+		services.KnowledgeSearchInput{
+			Query:            request.Query,
+			Limit:            request.Limit,
+			PolicyDecisionID: decision.ID,
+		},
+	)
+	if err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
+	items := make(
+		[]agentKnowledgeCitationResponse,
+		0,
+		len(result.Items),
+	)
+	for _, citation := range result.Items {
+		items = append(items, agentKnowledgeCitationResponse{
+			ID:              citation.ID,
+			ArticleID:       citation.ArticleID,
+			ArticleKey:      citation.ArticleKey,
+			ArticleTitle:    citation.ArticleTitle,
+			VersionID:       citation.VersionID,
+			DocumentVersion: citation.DocumentVersion,
+			ChunkID:         citation.ChunkID,
+			PageNumber:      citation.PageNumber,
+			SectionPath:     citation.SectionPath,
+			Snippet:         citation.Snippet,
+			ContentHash:     citation.ContentHash,
+			Rank:            citation.Rank,
+			Score:           citation.Score,
+		})
+	}
+	WriteData(c, http.StatusOK, agentKnowledgeSearchResponse{
+		SearchID: result.SearchID,
+		Items:    items,
 	}, Meta{})
 }
 
@@ -1853,27 +2349,68 @@ func (h *APIHandler) ListComments(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
-	var comments []models.TicketComment
-	if err := h.db.WithContext(c.Request.Context()).
-		Preload("User").
-		Preload("ServicePrincipal").
+	query, ok := h.requireTicketContentListQuery(
+		c,
+		agentTicketCommentsList,
+		projectScope,
+		ticketID,
+	)
+	if !ok {
+		return
+	}
+	dbQuery := h.db.WithContext(c.Request.Context()).
 		Where(
 			"organization_id = ? AND project_id = ? AND ticket_id = ? AND is_deleted = ?",
 			projectScope.OrganizationID,
 			projectScope.ProjectID,
 			ticketID,
 			false,
-		).
-		Order("created_at ASC").
+		)
+	if query.After != nil {
+		dbQuery = dbQuery.Where(
+			"created_at < ? OR (created_at = ? AND id < ?)",
+			query.After.CreatedAt,
+			query.After.CreatedAt,
+			query.After.ID,
+		)
+	}
+	var comments []models.TicketComment
+	if err := dbQuery.
+		Preload("User").
+		Preload("ServicePrincipal").
+		Order("created_at DESC").
+		Order("id DESC").
+		Limit(query.Limit + 1).
 		Find(&comments).Error; err != nil {
 		h.writeNativeError(c, err)
 		return
+	}
+	hasMore := len(comments) > query.Limit
+	if hasMore {
+		comments = comments[:query.Limit]
 	}
 	result := make([]*models.TicketCommentResponse, 0, len(comments))
 	for i := range comments {
 		result = append(result, comments[i].ToResponse())
 	}
-	WriteData(c, http.StatusOK, result, Meta{})
+	nextCursor, ok := nextTicketContentListCursor(
+		h,
+		c,
+		agentTicketCommentsList,
+		projectScope,
+		ticketID,
+		query.Limit,
+		hasMore,
+		comments,
+	)
+	if !ok {
+		return
+	}
+	WriteData(c, http.StatusOK, agentTicketCommentPage{
+		Items:      result,
+		NextCursor: nextCursor,
+		HasMore:    hasMore,
+	}, Meta{})
 }
 
 func (h *APIHandler) ListAttachments(c *gin.Context) {
@@ -1890,24 +2427,65 @@ func (h *APIHandler) ListAttachments(c *gin.Context) {
 		h.writeNativeError(c, err)
 		return
 	}
-	var attachments []models.TicketAttachment
-	if err := h.db.WithContext(c.Request.Context()).
+	query, ok := h.requireTicketContentListQuery(
+		c,
+		agentTicketAttachmentsList,
+		projectScope,
+		ticketID,
+	)
+	if !ok {
+		return
+	}
+	dbQuery := h.db.WithContext(c.Request.Context()).
 		Where(
 			"organization_id = ? AND project_id = ? AND ticket_id = ?",
 			projectScope.OrganizationID,
 			projectScope.ProjectID,
 			ticketID,
-		).
+		)
+	if query.After != nil {
+		dbQuery = dbQuery.Where(
+			"created_at < ? OR (created_at = ? AND id < ?)",
+			query.After.CreatedAt,
+			query.After.CreatedAt,
+			query.After.ID,
+		)
+	}
+	var attachments []models.TicketAttachment
+	if err := dbQuery.
 		Order("created_at DESC").
+		Order("id DESC").
+		Limit(query.Limit + 1).
 		Find(&attachments).Error; err != nil {
 		h.writeNativeError(c, err)
 		return
+	}
+	hasMore := len(attachments) > query.Limit
+	if hasMore {
+		attachments = attachments[:query.Limit]
 	}
 	result := make([]*models.TicketAttachmentResponse, 0, len(attachments))
 	for i := range attachments {
 		result = append(result, attachments[i].ToResponse())
 	}
-	WriteData(c, http.StatusOK, result, Meta{})
+	nextCursor, ok := nextTicketContentListCursor(
+		h,
+		c,
+		agentTicketAttachmentsList,
+		projectScope,
+		ticketID,
+		query.Limit,
+		hasMore,
+		attachments,
+	)
+	if !ok {
+		return
+	}
+	WriteData(c, http.StatusOK, agentTicketAttachmentPage{
+		Items:      result,
+		NextCursor: nextCursor,
+		HasMore:    hasMore,
+	}, Meta{})
 }
 
 func (h *APIHandler) DownloadAttachment(c *gin.Context) {
@@ -1921,8 +2499,29 @@ func (h *APIHandler) DownloadAttachment(c *gin.Context) {
 		return
 	}
 	defer reader.Close()
-	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, attachment.OriginalName))
+	setAgentAttachmentDownloadHeaders(c, attachment.OriginalName)
 	c.DataFromReader(http.StatusOK, attachment.FileSize, attachment.MimeType, reader, nil)
+}
+
+func setAgentAttachmentDownloadHeaders(
+	c *gin.Context,
+	originalName string,
+) {
+	disposition := mime.FormatMediaType(
+		"attachment",
+		map[string]string{"filename": originalName},
+	)
+	if disposition == "" {
+		disposition = "attachment"
+	}
+	c.Header("Cache-Control", "private, no-store")
+	c.Header("Pragma", "no-cache")
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.Header(
+		"Content-Security-Policy",
+		"default-src 'none'; sandbox",
+	)
+	c.Header("Content-Disposition", disposition)
 }
 
 func (h *APIHandler) GetHistory(c *gin.Context) {
@@ -2108,6 +2707,697 @@ func ticketResourceIDFromEvent(event *models.DomainEvent) (string, bool) {
 type authenticatedPrincipal struct {
 	ID           string
 	CredentialID string
+}
+
+const maxAgentKnowledgeRequestBytes int64 = 128 << 10
+
+type agentKnowledgeArticleDraftRequest struct {
+	Key                 string `json:"key"`
+	Title               string `json:"title"`
+	Summary             string `json:"summary"`
+	Markdown            string `json:"markdown"`
+	SourceTicketID      uint   `json:"source_ticket_id"`
+	SourceAttachmentIDs []uint `json:"source_attachment_ids"`
+}
+
+type agentKnowledgeVersionDraftRequest struct {
+	Title               string `json:"title"`
+	Markdown            string `json:"markdown"`
+	SourceTicketID      uint   `json:"source_ticket_id"`
+	SourceAttachmentIDs []uint `json:"source_attachment_ids"`
+}
+
+type agentKnowledgeSearchRequest struct {
+	Query string `json:"query"`
+	Limit int    `json:"limit"`
+}
+
+type agentKnowledgeArticleResponse struct {
+	ID               string                        `json:"id"`
+	CreatedAt        time.Time                     `json:"created_at"`
+	UpdatedAt        time.Time                     `json:"updated_at"`
+	Key              string                        `json:"key"`
+	Title            string                        `json:"title"`
+	Summary          string                        `json:"summary"`
+	Status           models.KnowledgeArticleStatus `json:"status"`
+	CurrentVersionID *string                       `json:"current_version_id,omitempty"`
+	Revision         uint64                        `json:"revision"`
+}
+
+func newAgentKnowledgeArticleResponse(
+	article models.KnowledgeArticle,
+) agentKnowledgeArticleResponse {
+	return agentKnowledgeArticleResponse{
+		ID:               article.ID,
+		CreatedAt:        article.CreatedAt,
+		UpdatedAt:        article.UpdatedAt,
+		Key:              article.Key,
+		Title:            article.Title,
+		Summary:          article.Summary,
+		Status:           article.Status,
+		CurrentVersionID: article.CurrentVersion,
+		Revision:         article.Revision,
+	}
+}
+
+type agentKnowledgeVersionResponse struct {
+	ID          string                        `json:"id"`
+	CreatedAt   time.Time                     `json:"created_at"`
+	UpdatedAt   time.Time                     `json:"updated_at"`
+	ArticleID   string                        `json:"article_id"`
+	Version     uint64                        `json:"version"`
+	Status      models.KnowledgeVersionStatus `json:"status"`
+	Title       string                        `json:"title"`
+	MimeType    string                        `json:"mime_type"`
+	SizeBytes   int64                         `json:"size_bytes"`
+	ContentHash string                        `json:"content_hash"`
+	VirusScan   models.VirusScanStatus        `json:"virus_scan"`
+	PageCount   int                           `json:"page_count"`
+	PublishedAt *time.Time                    `json:"published_at,omitempty"`
+}
+
+func newAgentKnowledgeVersionResponse(
+	version models.KnowledgeArticleVersion,
+) agentKnowledgeVersionResponse {
+	return agentKnowledgeVersionResponse{
+		ID:          version.ID,
+		CreatedAt:   version.CreatedAt,
+		UpdatedAt:   version.UpdatedAt,
+		ArticleID:   version.ArticleID,
+		Version:     version.Version,
+		Status:      version.Status,
+		Title:       version.Title,
+		MimeType:    version.MimeType,
+		SizeBytes:   version.SizeBytes,
+		ContentHash: version.ContentHash,
+		VirusScan:   version.VirusScan,
+		PageCount:   version.PageCount,
+		PublishedAt: version.PublishedAt,
+	}
+}
+
+type agentKnowledgeSourceResponse struct {
+	Ordinal            uint                               `json:"ordinal"`
+	Kind               services.KnowledgeSourceKind       `json:"kind"`
+	Visibility         services.KnowledgeSourceVisibility `json:"visibility"`
+	ReferenceLabel     string                             `json:"reference_label"`
+	SourceTicketID     *uint                              `json:"source_ticket_id,omitempty"`
+	TicketNumber       string                             `json:"ticket_number,omitempty"`
+	TicketTitle        string                             `json:"ticket_title,omitempty"`
+	SourceAttachmentID *uint                              `json:"source_attachment_id,omitempty"`
+	AttachmentName     string                             `json:"attachment_name,omitempty"`
+	AttachmentHash     string                             `json:"attachment_hash,omitempty"`
+}
+
+func newAgentKnowledgeSourceResponse(
+	source services.KnowledgeSourceView,
+) agentKnowledgeSourceResponse {
+	return agentKnowledgeSourceResponse{
+		Ordinal:            source.Ordinal,
+		Kind:               source.Kind,
+		Visibility:         source.Visibility,
+		ReferenceLabel:     source.ReferenceLabel,
+		SourceTicketID:     source.SourceTicketID,
+		SourceAttachmentID: source.SourceAttachmentID,
+		TicketNumber:       source.TicketNumber,
+		TicketTitle:        source.TicketTitle,
+		AttachmentName:     source.AttachmentName,
+		AttachmentHash:     source.AttachmentHash,
+	}
+}
+
+type agentKnowledgeDocumentSectionResponse struct {
+	Ordinal      uint   `json:"ordinal"`
+	Heading      string `json:"heading,omitempty"`
+	HeadingLevel int    `json:"heading_level"`
+	SectionPath  string `json:"section_path,omitempty"`
+	Markdown     string `json:"markdown"`
+	ContentHash  string `json:"content_hash"`
+}
+
+type agentKnowledgeDocumentResponse struct {
+	Article  agentKnowledgeArticleResponse           `json:"article"`
+	Version  agentKnowledgeVersionResponse           `json:"version"`
+	Markdown string                                  `json:"markdown"`
+	Sections []agentKnowledgeDocumentSectionResponse `json:"sections"`
+	Sources  []agentKnowledgeSourceResponse          `json:"sources"`
+}
+
+func newAgentKnowledgeDocumentResponse(
+	document *services.KnowledgeArticleDocument,
+) agentKnowledgeDocumentResponse {
+	response := agentKnowledgeDocumentResponse{
+		Sections: make(
+			[]agentKnowledgeDocumentSectionResponse,
+			0,
+		),
+		Sources: make([]agentKnowledgeSourceResponse, 0),
+	}
+	if document == nil {
+		return response
+	}
+	response.Article = newAgentKnowledgeArticleResponse(
+		document.Article,
+	)
+	response.Version = newAgentKnowledgeVersionResponse(
+		document.Version,
+	)
+	response.Markdown = document.Markdown
+	response.Sections = make(
+		[]agentKnowledgeDocumentSectionResponse,
+		0,
+		len(document.Sections),
+	)
+	for _, section := range document.Sections {
+		response.Sections = append(
+			response.Sections,
+			agentKnowledgeDocumentSectionResponse{
+				Ordinal:      section.Ordinal,
+				Heading:      section.Heading,
+				HeadingLevel: section.HeadingLevel,
+				SectionPath:  section.SectionPath,
+				Markdown:     section.Markdown,
+				ContentHash:  section.ContentHash,
+			},
+		)
+	}
+	response.Sources = make(
+		[]agentKnowledgeSourceResponse,
+		0,
+		len(document.Sources),
+	)
+	for _, source := range document.Sources {
+		response.Sources = append(
+			response.Sources,
+			newAgentKnowledgeSourceResponse(source),
+		)
+	}
+	return response
+}
+
+type agentKnowledgeArticlePage struct {
+	Items      []agentKnowledgeArticleResponse `json:"items"`
+	Total      int64                           `json:"total"`
+	Page       int                             `json:"page"`
+	PageSize   int                             `json:"page_size"`
+	TotalPages int                             `json:"total_pages"`
+}
+
+func (h *APIHandler) checkAgentKnowledgeAction(
+	c *gin.Context,
+	principal authenticatedPrincipal,
+	scope string,
+	action string,
+	resourceType string,
+	resourceID string,
+	isWrite bool,
+	requestDigest string,
+) (*models.PolicyDecision, bool) {
+	if h == nil || h.native == nil || h.knowledge == nil {
+		WriteProblem(
+			c,
+			http.StatusServiceUnavailable,
+			ProblemServiceUnavailable,
+			"Knowledge service is unavailable",
+			true,
+		)
+		return nil, false
+	}
+	decision, err := h.native.CheckActionInShortProjectTransactions(
+		c.Request.Context(),
+		services.PolicyCheckInput{
+			ServicePrincipalID: principal.ID,
+			CredentialID:       principal.CredentialID,
+			Scope:              scope,
+			Action:             action,
+			ResourceType:       resourceType,
+			ResourceID:         resourceID,
+			IsWrite:            isWrite,
+			RequestDigest:      requestDigest,
+			SourceProtocol: string(
+				services.SourceProtocolAgentREST,
+			),
+		},
+	)
+	if err != nil {
+		h.writeNativeError(c, err)
+		return decision, false
+	}
+	if decision == nil || strings.TrimSpace(decision.ID) == "" {
+		WriteProblem(
+			c,
+			http.StatusInternalServerError,
+			ProblemInternal,
+			"Knowledge policy decision is unavailable",
+			true,
+		)
+		return nil, false
+	}
+	return decision, true
+}
+
+type agentKnowledgeSourceAuthorization struct {
+	TicketPolicyDecisionID     string
+	AttachmentPolicyDecisionID string
+}
+
+func (h *APIHandler) expandAgentKnowledgeDocumentSources(
+	c *gin.Context,
+	principal authenticatedPrincipal,
+	articleID string,
+	input services.GetArticleDocumentInput,
+	document *services.KnowledgeArticleDocument,
+) (*services.KnowledgeArticleDocument, bool) {
+	if document == nil || h == nil || h.native == nil ||
+		h.knowledge == nil {
+		return document, true
+	}
+	targets := document.SourceAuthorizationTargets()
+	if len(targets) == 0 ||
+		!agentauth.HasScopes(c, models.ScopeTicketsRead) {
+		return document, true
+	}
+	authorizations := make(
+		[]services.KnowledgeSourceAuthorization,
+		0,
+		len(targets),
+	)
+	for _, target := range targets {
+		resourceID := strconv.FormatUint(
+			uint64(target.SourceTicketID),
+			10,
+		)
+		ticketDecision, err :=
+			h.native.CheckActionInShortProjectTransactions(
+				c.Request.Context(),
+				services.PolicyCheckInput{
+					ServicePrincipalID: principal.ID,
+					CredentialID:       principal.CredentialID,
+					Scope:              models.ScopeTicketsRead,
+					Action:             "ticket.read",
+					ResourceType:       "ticket",
+					ResourceID:         resourceID,
+					SourceProtocol: string(
+						services.SourceProtocolAgentREST,
+					),
+				},
+			)
+		if err != nil || ticketDecision == nil ||
+			strings.TrimSpace(ticketDecision.ID) == "" {
+			continue
+		}
+		authorization := services.KnowledgeSourceAuthorization{
+			SourceTicketID:         target.SourceTicketID,
+			TicketPolicyDecisionID: ticketDecision.ID,
+		}
+		if target.HasAttachment &&
+			agentauth.HasScopes(
+				c,
+				models.ScopeAttachmentsRead,
+			) {
+			attachmentDecision, decisionErr :=
+				h.native.CheckActionInShortProjectTransactions(
+					c.Request.Context(),
+					services.PolicyCheckInput{
+						ServicePrincipalID: principal.ID,
+						CredentialID:       principal.CredentialID,
+						Scope:              models.ScopeAttachmentsRead,
+						Action:             "ticket.attachment.read",
+						ResourceType:       "ticket",
+						ResourceID:         resourceID,
+						SourceProtocol: string(
+							services.SourceProtocolAgentREST,
+						),
+					},
+				)
+			if decisionErr == nil &&
+				attachmentDecision != nil {
+				authorization.AttachmentPolicyDecisionID =
+					attachmentDecision.ID
+			}
+		}
+		authorizations = append(authorizations, authorization)
+	}
+	if len(authorizations) == 0 {
+		return document, true
+	}
+	input.SourceAuthorizations = authorizations
+	expanded, err := h.knowledge.GetArticleDocument(
+		c.Request.Context(),
+		articleID,
+		input,
+	)
+	if err != nil {
+		h.writeNativeError(c, err)
+		return nil, false
+	}
+	return expanded, true
+}
+
+func (h *APIHandler) authorizeAgentKnowledgeSources(
+	c *gin.Context,
+	principal authenticatedPrincipal,
+	sourceTicketID uint,
+	sourceAttachmentIDs []uint,
+	requestDigest string,
+) (agentKnowledgeSourceAuthorization, bool) {
+	result := agentKnowledgeSourceAuthorization{}
+	if len(sourceAttachmentIDs) > 0 && sourceTicketID == 0 {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			"source_ticket_id is required when source_attachment_ids are present",
+			false,
+		)
+		return result, false
+	}
+	if sourceTicketID == 0 {
+		return result, true
+	}
+	resourceID := strconv.FormatUint(uint64(sourceTicketID), 10)
+	if !agentauth.HasScopes(c, models.ScopeTicketsRead) {
+		h.writeNativeError(c, services.ErrInvalidScope)
+		return result, false
+	}
+	ticketDecision, ok := h.checkAgentKnowledgeAction(
+		c,
+		principal,
+		models.ScopeTicketsRead,
+		"ticket.read",
+		"ticket",
+		resourceID,
+		false,
+		requestDigest,
+	)
+	if !ok {
+		return result, false
+	}
+	result.TicketPolicyDecisionID = ticketDecision.ID
+	if len(sourceAttachmentIDs) == 0 {
+		return result, true
+	}
+	if !agentauth.HasScopes(c, models.ScopeAttachmentsRead) {
+		h.writeNativeError(c, services.ErrInvalidScope)
+		return result, false
+	}
+	attachmentDecision, ok := h.checkAgentKnowledgeAction(
+		c,
+		principal,
+		models.ScopeAttachmentsRead,
+		"ticket.attachment.read",
+		"ticket",
+		resourceID,
+		false,
+		requestDigest,
+	)
+	if !ok {
+		return result, false
+	}
+	result.AttachmentPolicyDecisionID = attachmentDecision.ID
+	return result, true
+}
+
+func (h *APIHandler) writeAuthoredKnowledgeResult(
+	c *gin.Context,
+	result *services.AuthoredKnowledgeResult,
+) {
+	if result == nil ||
+		strings.TrimSpace(result.Article.ID) == "" ||
+		strings.TrimSpace(result.Version.ID) == "" ||
+		result.Document == nil {
+		WriteProblem(
+			c,
+			http.StatusInternalServerError,
+			ProblemInternal,
+			"Knowledge draft result is unavailable",
+			true,
+		)
+		return
+	}
+	WriteReceipt(
+		c,
+		http.StatusCreated,
+		newAgentKnowledgeDocumentResponse(result.Document),
+		receiptFromService(result.Receipt),
+	)
+}
+
+func (h *APIHandler) writeReplayedKnowledgeDocument(
+	c *gin.Context,
+	record *models.IdempotencyRecord,
+	requestedArticleID string,
+	policyDecisionID string,
+	authorization services.KnowledgeDocumentAuthorizationMode,
+) {
+	if !idempotencyRecordMatchesProject(c, record) {
+		WriteProblem(
+			c,
+			http.StatusConflict,
+			ProblemIdempotencyConflict,
+			"Idempotency record belongs to another project",
+			false,
+		)
+		return
+	}
+	resourceID := strings.TrimSpace(record.ResourceID)
+	parsedResourceID, err := uuid.Parse(resourceID)
+	if err != nil || parsedResourceID.String() != resourceID {
+		WriteProblem(
+			c,
+			http.StatusInternalServerError,
+			ProblemInternal,
+			"Completed knowledge operation has no valid resource",
+			true,
+		)
+		return
+	}
+	var storedCompletion services.AuthoredKnowledgeIdempotencyReceipt
+	if err := json.Unmarshal(
+		record.ResponseBody,
+		&storedCompletion,
+	); err != nil ||
+		strings.TrimSpace(storedCompletion.OperationID) == "" ||
+		storedCompletion.ResourceID != resourceID {
+		WriteProblem(
+			c,
+			http.StatusInternalServerError,
+			ProblemInternal,
+			"Completed knowledge operation receipt is invalid",
+			true,
+		)
+		return
+	}
+	storedReceipt := storedCompletion.OperationReceipt
+	articleID := requestedArticleID
+	versionID := resourceID
+	hasBoundReference := storedCompletion.ArticleID != "" ||
+		storedCompletion.VersionID != "" ||
+		storedCompletion.ContentHash != ""
+	if hasBoundReference {
+		parsedArticleID, articleErr := uuid.Parse(
+			storedCompletion.ArticleID,
+		)
+		parsedVersionID, versionErr := uuid.Parse(
+			storedCompletion.VersionID,
+		)
+		contentHashBytes, hashErr := hex.DecodeString(
+			storedCompletion.ContentHash,
+		)
+		expectedResourceID := storedCompletion.VersionID
+		if requestedArticleID == "" {
+			expectedResourceID = storedCompletion.ArticleID
+		}
+		if articleErr != nil ||
+			parsedArticleID.String() != storedCompletion.ArticleID ||
+			versionErr != nil ||
+			parsedVersionID.String() != storedCompletion.VersionID ||
+			hashErr != nil ||
+			len(contentHashBytes) != sha256.Size ||
+			strings.ToLower(storedCompletion.ContentHash) !=
+				storedCompletion.ContentHash ||
+			expectedResourceID != resourceID ||
+			(requestedArticleID != "" &&
+				storedCompletion.ArticleID != requestedArticleID) {
+			WriteProblem(
+				c,
+				http.StatusInternalServerError,
+				ProblemInternal,
+				"Completed knowledge operation reference is invalid",
+				true,
+			)
+			return
+		}
+		articleID = storedCompletion.ArticleID
+		versionID = storedCompletion.VersionID
+	} else if articleID == "" {
+		// Compatibility for records completed before exact authored document
+		// references were persisted.
+		articleID = resourceID
+		versionID = ""
+	}
+	document, err := h.knowledge.GetArticleDocument(
+		c.Request.Context(),
+		articleID,
+		services.GetArticleDocumentInput{
+			VersionID:        versionID,
+			PolicyDecisionID: policyDecisionID,
+			Authorization:    authorization,
+		},
+	)
+	if err != nil {
+		h.writeNativeError(c, err)
+		return
+	}
+	if hasBoundReference &&
+		(document.Article.ID != storedCompletion.ArticleID ||
+			document.Version.ID != storedCompletion.VersionID ||
+			document.Version.ContentHash != storedCompletion.ContentHash) {
+		WriteProblem(
+			c,
+			http.StatusInternalServerError,
+			ProblemInternal,
+			"Completed knowledge operation document changed",
+			true,
+		)
+		return
+	}
+	principal, ok := h.principal(c)
+	if !ok {
+		return
+	}
+	document, ok = h.expandAgentKnowledgeDocumentSources(
+		c,
+		principal,
+		articleID,
+		services.GetArticleDocumentInput{
+			VersionID:        versionID,
+			PolicyDecisionID: policyDecisionID,
+			Authorization:    authorization,
+		},
+		document,
+	)
+	if !ok {
+		return
+	}
+	WriteReceipt(
+		c,
+		record.ResponseCode,
+		newAgentKnowledgeDocumentResponse(document),
+		receiptFromService(storedReceipt),
+	)
+}
+
+func validateAgentKnowledgeArticleDraft(
+	request agentKnowledgeArticleDraftRequest,
+) error {
+	if !validAgentKnowledgeKey(request.Key) {
+		return errors.New(
+			"key must match ^[a-z][a-z0-9._-]{0,63}$",
+		)
+	}
+	if err := validateAgentKnowledgeTitle(request.Title); err != nil {
+		return err
+	}
+	if utf8.RuneCountInString(request.Summary) > 1000 {
+		return errors.New(
+			"summary cannot exceed 1000 characters",
+		)
+	}
+	if err := validateAgentKnowledgeMarkdown(request.Markdown); err != nil {
+		return err
+	}
+	return validateAgentKnowledgeSources(
+		request.SourceTicketID,
+		request.SourceAttachmentIDs,
+	)
+}
+
+func validateAgentKnowledgeVersionDraft(
+	request agentKnowledgeVersionDraftRequest,
+) error {
+	if err := validateAgentKnowledgeTitle(request.Title); err != nil {
+		return err
+	}
+	if err := validateAgentKnowledgeMarkdown(request.Markdown); err != nil {
+		return err
+	}
+	return validateAgentKnowledgeSources(
+		request.SourceTicketID,
+		request.SourceAttachmentIDs,
+	)
+}
+
+func validAgentKnowledgeKey(value string) bool {
+	if len(value) < 1 || len(value) > 64 ||
+		value[0] < 'a' || value[0] > 'z' {
+		return false
+	}
+	for index := 1; index < len(value); index++ {
+		character := value[index]
+		if (character >= 'a' && character <= 'z') ||
+			(character >= '0' && character <= '9') ||
+			character == '.' ||
+			character == '_' ||
+			character == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validateAgentKnowledgeTitle(value string) error {
+	length := utf8.RuneCountInString(strings.TrimSpace(value))
+	if length < 1 || length > 240 {
+		return errors.New(
+			"title must contain between 1 and 240 characters",
+		)
+	}
+	return nil
+}
+
+func validateAgentKnowledgeMarkdown(value string) error {
+	if !utf8.ValidString(value) ||
+		len(value) > services.MaxAuthoredMarkdownBytes ||
+		strings.TrimSpace(value) == "" {
+		return errors.New(
+			"markdown must be non-blank UTF-8 within 128 KiB",
+		)
+	}
+	return nil
+}
+
+func validateAgentKnowledgeSources(
+	sourceTicketID uint,
+	sourceAttachmentIDs []uint,
+) error {
+	if len(sourceAttachmentIDs) > services.MaxAuthoredSourceLinks {
+		return fmt.Errorf(
+			"source_attachment_ids cannot contain more than %d items",
+			services.MaxAuthoredSourceLinks,
+		)
+	}
+	if len(sourceAttachmentIDs) > 0 && sourceTicketID == 0 {
+		return errors.New(
+			"source_ticket_id is required when source_attachment_ids are present",
+		)
+	}
+	seen := make(map[uint]struct{}, len(sourceAttachmentIDs))
+	for _, attachmentID := range sourceAttachmentIDs {
+		if attachmentID == 0 {
+			return errors.New(
+				"source_attachment_ids must contain positive IDs",
+			)
+		}
+		if _, duplicate := seen[attachmentID]; duplicate {
+			return errors.New(
+				"source_attachment_ids cannot contain duplicate IDs",
+			)
+		}
+		seen[attachmentID] = struct{}{}
+	}
+	return nil
 }
 
 func (h *APIHandler) executionLimit() gin.HandlerFunc {
@@ -2697,7 +3987,8 @@ func writeNativeProblem(c *gin.Context, err error) {
 	retryable := false
 	detail := err.Error()
 	switch {
-	case errors.Is(err, gorm.ErrRecordNotFound):
+	case errors.Is(err, gorm.ErrRecordNotFound),
+		errors.Is(err, services.ErrKnowledgeNotFound):
 		status, code = http.StatusNotFound, ProblemNotFound
 	case errors.Is(err, services.ErrInvalidCredential),
 		errors.Is(err, services.ErrCredentialExpired),
@@ -2709,7 +4000,9 @@ func writeNativeProblem(c *gin.Context, err error) {
 		errors.Is(err, services.ErrGlobalEmergencyStop):
 		status = http.StatusForbidden
 	case errors.Is(err, services.ErrPolicyDenied),
-		errors.Is(err, services.ErrProjectAccessDenied):
+		errors.Is(err, services.ErrProjectAccessDenied),
+		errors.Is(err, services.ErrProjectKnowledgeAccessDenied),
+		errors.Is(err, services.ErrKnowledgeModelPolicyDenied):
 		status, code = http.StatusForbidden, ProblemPolicyDenied
 	case errors.Is(err, services.ErrInvalidScope):
 		status, code = http.StatusForbidden, ProblemInsufficientScope
@@ -2721,6 +4014,9 @@ func writeNativeProblem(c *gin.Context, err error) {
 	case errors.Is(err, services.ErrExecutionGuardUnavailable):
 		status, code, retryable = http.StatusServiceUnavailable, ProblemServiceUnavailable, true
 		detail = "Agent execution protection is temporarily unavailable"
+	case errors.Is(err, services.ErrKnowledgeIndexUnavailable):
+		status, code, retryable = http.StatusServiceUnavailable, ProblemServiceUnavailable, true
+		detail = "Knowledge search is temporarily unavailable"
 	case errors.Is(err, services.ErrVersionConflict):
 		status, code = http.StatusConflict, ProblemVersionConflict
 	case errors.Is(err, services.ErrLeaseConflict), errors.Is(err, services.ErrLeaseExpired), errors.Is(err, services.ErrLeaseNotOwned):
@@ -2817,6 +4113,82 @@ func parsePathUint(c *gin.Context, name string) (uint, bool) {
 		return 0, false
 	}
 	return uint(value), true
+}
+
+func parseKnowledgeArticleID(
+	c *gin.Context,
+	name string,
+) (string, bool) {
+	value := strings.TrimSpace(c.Param(name))
+	parsed, err := uuid.Parse(value)
+	if err != nil || parsed.String() != value {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			"Invalid knowledge article ID",
+			false,
+		)
+		return "", false
+	}
+	return value, true
+}
+
+func parseOptionalKnowledgeVersionID(
+	c *gin.Context,
+) (string, bool) {
+	value := strings.TrimSpace(c.Query("version_id"))
+	if value == "" {
+		return "", true
+	}
+	parsed, err := uuid.Parse(value)
+	if err != nil || parsed.String() != value {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			"Invalid knowledge version ID",
+			false,
+		)
+		return "", false
+	}
+	return value, true
+}
+
+func parseAgentKnowledgePage(c *gin.Context) (int, int, bool) {
+	page, ok := parsePositiveQueryInteger(c, "page", 1, 0)
+	if !ok {
+		return 0, 0, false
+	}
+	pageSize, ok := parsePositiveQueryInteger(c, "page_size", 20, 100)
+	if !ok {
+		return 0, 0, false
+	}
+	return page, pageSize, true
+}
+
+func parsePositiveQueryInteger(
+	c *gin.Context,
+	name string,
+	fallback int,
+	maximum int,
+) (int, bool) {
+	value := strings.TrimSpace(c.Query(name))
+	if value == "" {
+		return fallback, true
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 1 || (maximum > 0 && parsed > maximum) {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			name+" must be a positive integer within its allowed range",
+			false,
+		)
+		return 0, false
+	}
+	return parsed, true
 }
 
 func requireTicketLeaseHeader(c *gin.Context) (string, bool) {

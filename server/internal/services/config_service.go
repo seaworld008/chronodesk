@@ -1,11 +1,16 @@
 package services
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -15,6 +20,45 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/observability"
 	"github.com/seaworld008/chronodesk/server/internal/version"
 )
+
+var (
+	// ErrInvalidSystemConfigKey is stable so every transport can map the shared
+	// key invariant without depending on a persistence error.
+	ErrInvalidSystemConfigKey = errors.New("配置键无效")
+	// ErrProtectedSystemConfigKey prevents the generic configuration surface
+	// from bypassing the Agent platform's audited runtime-control workflow. It
+	// wraps ErrInvalidSystemConfigKey so existing transports fail closed as a
+	// bad generic-config request while callers can still match this sentinel.
+	ErrProtectedSystemConfigKey = fmt.Errorf(
+		"%w: Agent 全局安全控制必须通过专用接口修改",
+		ErrInvalidSystemConfigKey,
+	)
+	ErrConfigExportTooLarge = errors.New("系统配置导出超过大小限制")
+)
+
+const (
+	MaxConfigExportRecords = 10_000
+	MaxConfigExportBytes   = 10 << 20
+)
+
+// ValidateSystemConfigKey enforces the persisted SystemConfig key contract.
+// Keys are Unicode data: they are not normalized or restricted to ASCII.
+func ValidateSystemConfigKey(key string) error {
+	if !utf8.ValidString(key) {
+		return ErrInvalidSystemConfigKey
+	}
+	codePoints := utf8.RuneCountInString(key)
+	if codePoints < 1 || codePoints > 100 ||
+		strings.TrimSpace(key) != key {
+		return ErrInvalidSystemConfigKey
+	}
+	for _, char := range key {
+		if unicode.IsControl(char) {
+			return ErrInvalidSystemConfigKey
+		}
+	}
+	return nil
+}
 
 // ConfigService 系统配置服务
 type ConfigService struct {
@@ -71,6 +115,11 @@ const (
 	KeyNotifyEmailEnabled     = "notify.email_enabled"
 	KeyNotifyWebSocketEnabled = "notify.websocket_enabled"
 	KeyNotifyInAppEnabled     = "notify.inapp_enabled"
+
+	// Agent 全局安全控制由 agentplatform.RuntimeControl 独占修改。它们仍存放
+	// 在 system_configs 中以支持持久化恢复，但不是通用系统配置。
+	KeyAgentGlobalReadOnly = "agent.global_read_only"
+	KeyAgentEmergencyStop  = "agent.emergency_stop"
 )
 
 // NewConfigService 创建配置服务
@@ -85,9 +134,13 @@ func NewConfigService(db *gorm.DB) *ConfigService {
 func (s *ConfigService) InitDefaultConfigs() error {
 	log.Println("🔧 初始化系统默认配置...")
 
+	defaults := models.DefaultSystemConfigs(version.Version)
+	if err := validateSystemConfigKeys(defaults); err != nil {
+		return err
+	}
 	created := make([]models.SystemConfig, 0)
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
-		for _, config := range models.DefaultSystemConfigs(version.Version) {
+		for _, config := range defaults {
 			result := tx.Clauses(clause.OnConflict{
 				Columns:   []clause.Column{{Name: "key"}},
 				DoNothing: true,
@@ -157,6 +210,9 @@ func (s *ConfigService) GetConfigBool(key string) (bool, error) {
 
 // SetConfig 设置配置值
 func (s *ConfigService) SetConfig(key, value, valueType, description, category, group string) error {
+	if err := validateMutableSystemConfigKey(key); err != nil {
+		return err
+	}
 	var existingConfig models.SystemConfig
 	err := s.db.Where("key = ?", key).First(&existingConfig).Error
 
@@ -202,6 +258,9 @@ func (s *ConfigService) SetConfig(key, value, valueType, description, category, 
 
 // DeleteConfig 删除配置
 func (s *ConfigService) DeleteConfig(key string) error {
+	if err := validateMutableSystemConfigKey(key); err != nil {
+		return err
+	}
 	if err := s.db.Where("key = ?", key).Delete(&models.SystemConfig{}).Error; err != nil {
 		return err
 	}
@@ -212,28 +271,94 @@ func (s *ConfigService) DeleteConfig(key string) error {
 	return nil
 }
 
-// GetConfigsByCategory 按分类获取配置
-func (s *ConfigService) GetConfigsByCategory(category string) ([]models.SystemConfig, error) {
-	var configs []models.SystemConfig
-	if err := s.db.Where("category = ?", category).Order("\"group\", key").Find(&configs).Error; err != nil {
+// ListConfigPage returns one bounded page of platform configuration. Values
+// remain editable control data, so the platform authorization middleware must
+// run before this service is reached.
+func (s *ConfigService) ListConfigPage(
+	ctx context.Context,
+	category string,
+	request DirectoryPageRequest,
+) (*DirectoryPage[models.SystemConfig], error) {
+	sortFields := map[string]struct{}{
+		"created_at": {},
+		"updated_at": {},
+		"key":        {},
+		"category":   {},
+		"group":      {},
+	}
+	if err := validateDirectoryPageRequest(request, sortFields); err != nil {
 		return nil, err
 	}
-
-	return configs, nil
+	if category != "" && !validSystemConfigCategory(category) {
+		return nil, ErrDirectoryListQuery
+	}
+	query := editableSystemConfigs(
+		s.db.WithContext(ctx).Model(&models.SystemConfig{}),
+	)
+	if category != "" {
+		query = query.Where("category = ?", category)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, fmt.Errorf("count system configs: %w", err)
+	}
+	configs := make([]models.SystemConfig, 0, request.PageSize)
+	if err := query.
+		Order(systemConfigDirectoryOrder(request)).
+		Offset(directoryPageOffset(request)).
+		Limit(request.PageSize).
+		Find(&configs).Error; err != nil {
+		return nil, fmt.Errorf("list system configs: %w", err)
+	}
+	return &DirectoryPage[models.SystemConfig]{
+		Items:      configs,
+		Total:      total,
+		Page:       request.Page,
+		PageSize:   request.PageSize,
+		TotalPages: directoryTotalPages(total, request.PageSize),
+	}, nil
 }
 
-// GetAllConfigs 获取所有配置
-func (s *ConfigService) GetAllConfigs() ([]models.SystemConfig, error) {
-	var configs []models.SystemConfig
-	if err := s.db.Order("category, \"group\", key").Find(&configs).Error; err != nil {
-		return nil, err
+func validSystemConfigCategory(category string) bool {
+	switch category {
+	case CategorySystem,
+		CategorySecurity,
+		CategoryEmail,
+		CategoryTicket,
+		CategoryNotify,
+		CategoryUI:
+		return true
+	default:
+		return false
 	}
+}
 
-	return configs, nil
+func systemConfigDirectoryOrder(request DirectoryPageRequest) string {
+	if request.SortBy == "category" && request.SortOrder == "asc" {
+		return "category ASC, \"group\" ASC, key ASC, id ASC"
+	}
+	if request.SortBy == "group" && request.SortOrder == "asc" {
+		return "\"group\" ASC, key ASC, id ASC"
+	}
+	direction := "ASC"
+	if request.SortOrder == "desc" {
+		direction = "DESC"
+	}
+	column := map[string]string{
+		"created_at": "created_at",
+		"updated_at": "updated_at",
+		"key":        "key",
+		"category":   "category",
+		"group":      "\"group\"",
+	}[request.SortBy]
+	return column + " " + direction + ", id " + direction
 }
 
 // BatchUpdateConfigs 批量更新配置
 func (s *ConfigService) BatchUpdateConfigs(configs []models.SystemConfig) error {
+	if err := validateMutableSystemConfigKeys(configs); err != nil {
+		return err
+	}
 	changes := make([]configAuditChange, 0, len(configs))
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
 		for _, config := range configs {
@@ -309,9 +434,11 @@ func (s *ConfigService) logConfigChange(key, value, operation string) {
 
 // ExportConfigs 导出配置到JSON
 func (s *ConfigService) ExportConfigs(category string) ([]byte, error) {
-	var configs []models.SystemConfig
+	configs := make([]models.SystemConfig, 0, MaxConfigExportRecords+1)
 
-	query := s.db.Order("category, \"group\", key")
+	query := editableSystemConfigs(s.db).
+		Order("category ASC, \"group\" ASC, key ASC, id ASC").
+		Limit(MaxConfigExportRecords + 1)
 	if category != "" {
 		query = query.Where("category = ?", category)
 	}
@@ -319,8 +446,26 @@ func (s *ConfigService) ExportConfigs(category string) ([]byte, error) {
 	if err := query.Find(&configs).Error; err != nil {
 		return nil, err
 	}
+	if len(configs) > MaxConfigExportRecords {
+		return nil, fmt.Errorf(
+			"%w: record limit is %d",
+			ErrConfigExportTooLarge,
+			MaxConfigExportRecords,
+		)
+	}
 
-	return json.MarshalIndent(configs, "", "  ")
+	data, err := json.MarshalIndent(configs, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > MaxConfigExportBytes {
+		return nil, fmt.Errorf(
+			"%w: byte limit is %d",
+			ErrConfigExportTooLarge,
+			MaxConfigExportBytes,
+		)
+	}
+	return data, nil
 }
 
 // ImportConfigs 从JSON导入配置
@@ -328,6 +473,9 @@ func (s *ConfigService) ImportConfigs(data []byte) error {
 	var configs []models.SystemConfig
 	if err := json.Unmarshal(data, &configs); err != nil {
 		return fmt.Errorf("JSON格式错误: %v", err)
+	}
+	if err := validateMutableSystemConfigKeys(configs); err != nil {
+		return err
 	}
 
 	changes := make([]configAuditChange, 0, len(configs))
@@ -354,6 +502,9 @@ func (s *ConfigService) ImportConfigs(data []byte) error {
 
 // ValidateConfig 验证配置值
 func (s *ConfigService) ValidateConfig(key, value, valueType string) error {
+	if err := validateMutableSystemConfigKey(key); err != nil {
+		return err
+	}
 	switch valueType {
 	case "int":
 		var intValue int
@@ -377,6 +528,50 @@ func (s *ConfigService) ValidateConfig(key, value, valueType string) error {
 	}
 
 	return nil
+}
+
+func validateSystemConfigKeys(configs []models.SystemConfig) error {
+	for _, config := range configs {
+		if err := ValidateSystemConfigKey(config.Key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateMutableSystemConfigKey(key string) error {
+	if err := ValidateSystemConfigKey(key); err != nil {
+		return err
+	}
+	if isProtectedSystemConfigKey(key) {
+		return ErrProtectedSystemConfigKey
+	}
+	return nil
+}
+
+func validateMutableSystemConfigKeys(configs []models.SystemConfig) error {
+	for _, config := range configs {
+		if err := validateMutableSystemConfigKey(config.Key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isProtectedSystemConfigKey(key string) bool {
+	switch key {
+	case KeyAgentGlobalReadOnly, KeyAgentEmergencyStop:
+		return true
+	default:
+		return false
+	}
+}
+
+func editableSystemConfigs(query *gorm.DB) *gorm.DB {
+	return query.Where(
+		"key NOT IN ?",
+		[]string{KeyAgentGlobalReadOnly, KeyAgentEmergencyStop},
+	)
 }
 
 // GetSecurityPolicy 获取安全策略配置

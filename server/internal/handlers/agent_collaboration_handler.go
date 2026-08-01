@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -569,41 +568,14 @@ func (handler *AgentCollaborationHandler) requireWriteAccess(
 func (handler *AgentCollaborationHandler) pagination(
 	c *gin.Context,
 ) (services.CollaborationPagination, bool) {
-	page, ok := parseCollaborationPositiveInt(c, "page", 1)
+	page, pageSize, ok := parseStrictPagePagination(c, 25, 100)
 	if !ok {
 		return services.CollaborationPagination{}, false
-	}
-	pageSize, ok := parseCollaborationPositiveInt(c, "page_size", 20)
-	if !ok {
-		return services.CollaborationPagination{}, false
-	}
-	if pageSize > 100 {
-		pageSize = 100
 	}
 	return services.CollaborationPagination{
 		Page:     page,
 		PageSize: pageSize,
 	}, true
-}
-
-func parseCollaborationPositiveInt(
-	c *gin.Context,
-	name string,
-	defaultValue int,
-) (int, bool) {
-	raw := strings.TrimSpace(c.Query(name))
-	if raw == "" {
-		return defaultValue, true
-	}
-	value, err := strconv.Atoi(raw)
-	if err != nil || value < 1 {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"code": "invalid_pagination",
-			"msg":  "分页参数必须是正整数",
-		})
-		return 0, false
-	}
-	return value, true
 }
 
 func (handler *AgentCollaborationHandler) collaborationID(

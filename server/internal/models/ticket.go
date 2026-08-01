@@ -189,9 +189,9 @@ type Ticket struct {
 
 	// 分类和标签
 	CategoryID    *uint                       `json:"category_id,omitempty" gorm:"index"`
-	Category      *Category                   `json:"category,omitempty" gorm:"foreignKey:CategoryID"`
+	Category      *Category                   `json:"category,omitempty" gorm:"foreignKey:OrganizationID,ProjectID,CategoryID;references:OrganizationID,ProjectID,ID;-:migration"`
 	SubcategoryID *uint                       `json:"subcategory_id,omitempty" gorm:"index"`
-	Subcategory   *Category                   `json:"subcategory,omitempty" gorm:"foreignKey:SubcategoryID"`
+	Subcategory   *Category                   `json:"subcategory,omitempty" gorm:"foreignKey:OrganizationID,ProjectID,SubcategoryID;references:OrganizationID,ProjectID,ID;-:migration"`
 	Tags          datatypes.JSONSlice[string] `json:"tags" gorm:"type:jsonb"` // JSONB格式存储标签列表
 
 	// 时间跟踪

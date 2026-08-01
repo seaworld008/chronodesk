@@ -29,13 +29,19 @@ import {
 import { minCharacters, maxCharacters } from '@/lib/validators';
 import {
     normalizeTagsForSubmit,
-    formatTagsInputValue,
     normalizeCustomFieldsForSubmit,
 } from './tagUtils';
+import TagChipInput from './TagChipInput';
 import BackButton from '../common/BackButton';
 import { CreateTicketRequest } from '@/types';
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient';
-import { projectResourcePath } from '@/lib/projectScope';
+import {
+    humanApiRoutes,
+    type IntakeRequestTypeVersion,
+    type ProjectIntakeConfiguration,
+} from '@/lib/generated/human-api';
+import { resolveActiveProjectKey } from '@/lib/projectScope';
+import { EnterpriseReferenceAutocompleteInput } from '@/components/inputs/EnterpriseFilterInputs';
 
 type JSONSchemaProperty = {
     type?: string | string[];
@@ -45,30 +51,6 @@ type JSONSchemaProperty = {
     minimum?: number;
     maximum?: number;
     maxLength?: number;
-};
-
-type RequestTypeVersion = {
-    id: string;
-    key: string;
-    name: string;
-    description?: string;
-    work_class: CreateTicketRequest['type'];
-    json_schema: unknown;
-    ui_schema: unknown;
-};
-
-type WorkflowVersion = {
-    id: string;
-    key: string;
-    name: string;
-    description?: string;
-};
-
-type IntakeConfiguration = {
-    release_id: string;
-    release_version: number;
-    request_types: RequestTypeVersion[];
-    workflows: WorkflowVersion[];
 };
 
 const priorityChoices = [
@@ -109,7 +91,7 @@ type TicketCreateFormValues = CreateTicketRequest & {
 
 const transformTicketCreate = (
     data: TicketCreateFormValues,
-    intake: IntakeConfiguration,
+    intake: ProjectIntakeConfiguration,
 ): Record<string, unknown> => {
     const selectedRequestType = intake.request_types.find(
         ({ id }) => id === data.request_type_version_id,
@@ -212,7 +194,7 @@ const schemaFieldOrder = (
 const RequestTypeCustomFields = ({
     requestType,
 }: {
-    requestType?: RequestTypeVersion;
+    requestType?: IntakeRequestTypeVersion;
 }) => {
     if (!requestType) {
         return <Alert severity="warning">请选择请求类型后填写扩展字段。</Alert>;
@@ -343,13 +325,16 @@ const TicketCreateActions = () => (
  * 创建工单页面
  */
 const TicketCreate: React.FC = () => {
-    const [intake, setIntake] = React.useState<IntakeConfiguration>();
+    const [intake, setIntake] =
+        React.useState<ProjectIntakeConfiguration>();
     const [configurationError, setConfigurationError] = React.useState('');
 
     React.useEffect(() => {
         let active = true;
-        void projectResourcePath('configuration/intake')
-            .then((path) => apiFetch<IntakeConfiguration>(path))
+        void resolveActiveProjectKey()
+            .then((projectKey) => apiFetch<ProjectIntakeConfiguration>(
+                humanApiRoutes.getProjectIntakeConfiguration({ projectKey }),
+            ))
             .then((configuration) => {
                 if (!active) return;
                 if (
@@ -498,20 +483,19 @@ const TicketCreate: React.FC = () => {
                                     </Box>
 
                                     <ReferenceInput source="assigned_to_id" reference="assignees" label="分配给">
-                                        <AutocompleteInput
+                                        <EnterpriseReferenceAutocompleteInput
                                             label="分配给"
                                             optionText={(choice) => `${choice.username} (${choice.first_name} ${choice.last_name})`}
                                             fullWidth
-                                            helperText="选择负责处理此工单的人员"
+                                            helperText="输入姓名或用户名远程搜索负责处理此工单的人员"
                                         />
                                     </ReferenceInput>
 
-                                    <TextInput
+                                    <TagChipInput
                                         source="tags"
                                         label="标签"
                                         fullWidth
-                                        helperText="用逗号分隔多个标签，便于分类和搜索"
-                                        format={formatTagsInputValue}
+                                        helperText="输入标签后按回车，便于分类和搜索"
                                     />
                                 </Box>
                             </CardContent>

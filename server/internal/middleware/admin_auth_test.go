@@ -2,9 +2,12 @@ package middleware
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
@@ -108,6 +111,9 @@ func TestLogAdminOperationRecordsProjectAgentManagementWrite(t *testing.T) {
 	record := audit.records[0]
 	if record.Path != "/api/projects/OPS/admin/agents/service-principals" ||
 		record.Method != http.MethodPost ||
+		record.ActionCode != "project.agent.service_principal.create" ||
+		record.ResourceType != "service_principal" ||
+		record.ResourcePublicID != "new" ||
 		record.StatusCode != http.StatusCreated ||
 		record.UserID == nil ||
 		*record.UserID != 7 {
@@ -115,6 +121,238 @@ func TestLogAdminOperationRecordsProjectAgentManagementWrite(t *testing.T) {
 	}
 	if record.Query != "client_secret=%5BREDACTED%5D&view=compact" {
 		t.Fatalf("audit query was not safely redacted: %q", record.Query)
+	}
+}
+
+func TestLogAdminOperationUsesTrustedRouteTemplateForResourceMetadata(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	audit := &recordingAdminAuditService{}
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", uint(7))
+		c.Set("platform_role", models.PlatformRolePlatformAdmin)
+		c.Next()
+	})
+	router.Use(LogAdminOperation(audit))
+	router.PUT("/api/platform/users/:id", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPut,
+		"/api/platform/users/42",
+		nil,
+	)
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || len(audit.records) != 1 {
+		t.Fatalf(
+			"status=%d records=%d",
+			recorder.Code,
+			len(audit.records),
+		)
+	}
+	record := audit.records[0]
+	if record.ActionCode != "platform.user.update" ||
+		record.ResourceType != "user" ||
+		record.ResourcePublicID != "42" {
+		t.Fatalf("structured audit metadata = %+v", record)
+	}
+}
+
+func TestLogAdminOperationAuditsEmergencyControlActorAndResource(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	audit := &recordingAdminAuditService{}
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", uint(17))
+		c.Set("platform_role", models.PlatformRoleEmergencyOperator)
+		c.Next()
+	})
+	router.Use(LogAdminOperation(audit))
+	router.PUT("/api/platform/emergency-controls", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(
+		recorder,
+		httptest.NewRequest(
+			http.MethodPut,
+			"/api/platform/emergency-controls",
+			nil,
+		),
+	)
+	if recorder.Code != http.StatusOK || len(audit.records) != 1 {
+		t.Fatalf(
+			"status=%d records=%d",
+			recorder.Code,
+			len(audit.records),
+		)
+	}
+	record := audit.records[0]
+	if record.Actor != models.HumanActor(17) ||
+		record.PlatformRole != models.PlatformRoleEmergencyOperator ||
+		record.ActionCode != "platform.emergency_controls.update" ||
+		record.ResourceType != "emergency_controls" ||
+		record.ResourcePublicID != "global" {
+		t.Fatalf("emergency control audit metadata = %+v", record)
+	}
+}
+
+func TestLogAdminOperationAcceptsUnicodeConfigResourceKeys(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, test := range []struct {
+		method     string
+		actionCode string
+	}{
+		{method: http.MethodPut, actionCode: "platform.config.update"},
+		{method: http.MethodDelete, actionCode: "platform.config.delete"},
+	} {
+		t.Run(test.method, func(t *testing.T) {
+			audit := &recordingAdminAuditService{}
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				c.Set("user_id", uint(7))
+				c.Set("platform_role", models.PlatformRolePlatformAdmin)
+				c.Next()
+			})
+			router.Use(LogAdminOperation(audit))
+			router.Handle(
+				test.method,
+				"/api/platform/configs/:key",
+				func(c *gin.Context) { c.Status(http.StatusOK) },
+			)
+			configKey := strings.Repeat("配", 100)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(
+				recorder,
+				httptest.NewRequest(
+					test.method,
+					"/api/platform/configs/"+url.PathEscape(configKey),
+					nil,
+				),
+			)
+			if recorder.Code != http.StatusOK || len(audit.records) != 1 {
+				t.Fatalf(
+					"status=%d records=%d",
+					recorder.Code,
+					len(audit.records),
+				)
+			}
+			record := audit.records[0]
+			if record.ActionCode != test.actionCode ||
+				record.ResourceType != "system_config" ||
+				record.ResourcePublicID != configKey {
+				t.Fatalf("unicode config audit metadata = %+v", record)
+			}
+		})
+	}
+}
+
+func TestLogAdminOperationRejectsInvalidConfigKeysBeforeHandler(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	for _, test := range []struct {
+		name      string
+		configKey string
+	}{
+		{
+			name:      "control character",
+			configKey: "配置\u0001键",
+		},
+		{
+			name:      "more than one hundred characters",
+			configKey: strings.Repeat("配", 101),
+		},
+		{
+			name:      "leading whitespace",
+			configKey: " 配置",
+		},
+		{
+			name:      "trailing whitespace",
+			configKey: "配置\u3000",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handlerCalled := false
+			router := gin.New()
+			router.Use(LogAdminOperation(nil))
+			router.PUT(
+				"/api/platform/configs/:key",
+				func(c *gin.Context) {
+					handlerCalled = true
+					c.Status(http.StatusOK)
+				},
+			)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(
+				recorder,
+				httptest.NewRequest(
+					http.MethodPut,
+					"/api/platform/configs/"+
+						url.PathEscape(test.configKey),
+					nil,
+				),
+			)
+			if recorder.Code != http.StatusBadRequest || handlerCalled {
+				t.Fatalf(
+					"status=%d handler=%t body=%s",
+					recorder.Code,
+					handlerCalled,
+					recorder.Body.String(),
+				)
+			}
+			var payload struct {
+				Success bool   `json:"success"`
+				Message string `json:"message"`
+				Error   string `json:"error"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if payload.Success ||
+				payload.Message != "配置键无效" ||
+				payload.Error != "invalid_config_key" {
+				t.Fatalf("unstable invalid-key response: %+v", payload)
+			}
+		})
+	}
+}
+
+func TestLogAdminOperationFailsClosedWithoutTrustedOperationMapping(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	audit := &recordingAdminAuditService{}
+	handlerCalled := false
+	router := gin.New()
+	router.Use(LogAdminOperation(audit))
+	router.POST("/api/platform/unmapped", func(c *gin.Context) {
+		handlerCalled = true
+		c.Status(http.StatusCreated)
+	})
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(
+		recorder,
+		httptest.NewRequest(
+			http.MethodPost,
+			"/api/platform/unmapped",
+			nil,
+		),
+	)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503", recorder.Code)
+	}
+	if handlerCalled || len(audit.records) != 0 {
+		t.Fatalf(
+			"unmapped handler=%t audit records=%d",
+			handlerCalled,
+			len(audit.records),
+		)
 	}
 }
 

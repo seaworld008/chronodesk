@@ -1,18 +1,28 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import {
+  Alert,
   Box,
   Button,
+  Checkbox,
   Chip,
   CircularProgress,
   Dialog,
   DialogActions,
   DialogContent,
   DialogTitle,
+  Drawer,
   FormControl,
   FormControlLabel,
   Grid,
   IconButton,
   InputLabel,
+  ListItemText,
   MenuItem,
   Paper,
   Select,
@@ -23,6 +33,7 @@ import {
   TableCell,
   TableContainer,
   TableHead,
+  TablePagination,
   TableRow,
   TextField,
   Tooltip,
@@ -34,15 +45,21 @@ import {
   Edit as EditIcon,
   Science as TestIcon,
   Refresh as RefreshIcon,
+  ReceiptLong as DeliveryIcon,
 } from '@mui/icons-material'
 import { useNotify } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
 import { resolveActiveProjectKey } from '@/lib/projectScope'
+import { projectScopeChangedEvent } from '@/lib/projectScopeEvents'
 import {
   humanApiRoutes,
   type WebhookConfig,
+  type WebhookEventType,
+  type WebhookLog,
+  type WebhookLogPage,
   type WebhookPage,
   type WebhookTestReceipt,
+  type ListProjectWebhookLogsOperationQuery,
 } from '@/lib/generated/human-api'
 import BackButton from '../common/BackButton'
 import {
@@ -51,6 +68,8 @@ import {
   TruncatedText,
   type ResizableColumn,
 } from '@/components/tables/EnterpriseTable'
+import PageHeader from '@/components/layout/PageHeader'
+import PageShell from '@/components/layout/PageShell'
 
 const webhookColumns: ResizableColumn[] = [
   { key: 'name', defaultWidth: 280, minWidth: 180, maxWidth: 480 },
@@ -59,7 +78,7 @@ const webhookColumns: ResizableColumn[] = [
   { key: 'events', defaultWidth: 360, minWidth: 200, maxWidth: 640 },
   { key: 'delivery', defaultWidth: 180, minWidth: 140, maxWidth: 280 },
   { key: 'last-success', defaultWidth: 188, minWidth: 150, maxWidth: 280 },
-  { key: 'actions', defaultWidth: 152, minWidth: 136, maxWidth: 220, sticky: 'right' },
+  { key: 'actions', defaultWidth: 200, minWidth: 184, maxWidth: 280, sticky: 'right' },
 ]
 
 const isQueuedWebhookTestReceipt = (
@@ -150,7 +169,40 @@ const transitionStatusOptions = [
 const transitionStatusLabel = (status: string) =>
   transitionStatusOptions.find((item) => item.value === status)?.label ?? '未知状态'
 
-const webhookEventSummary = (webhook: WebhookConfig) => {
+const renderSelectedValues = (
+  selected: readonly string[],
+  label: (value: string) => string,
+  emptyLabel = '未选择',
+) => {
+  if (selected.length === 0) {
+    return <Typography color="text.secondary">{emptyLabel}</Typography>
+  }
+  const visible = selected.slice(0, 3)
+  return (
+    <Stack
+      component="span"
+      direction="row"
+      spacing={0.5}
+      sx={{ alignItems: 'center', minWidth: 0, overflow: 'hidden' }}
+    >
+      {visible.map((value) => (
+        <Chip
+          key={value}
+          size="small"
+          label={label(value)}
+          sx={{ maxWidth: 180 }}
+        />
+      ))}
+      {selected.length > visible.length && (
+        <Chip size="small" label={`+${selected.length - visible.length}`} />
+      )}
+    </Stack>
+  )
+}
+
+const webhookEventSummary = (
+  webhook: Pick<WebhookConfig, 'enabled_events_list' | 'filter_rules_obj'>,
+) => {
   const statuses = webhook.filter_rules_obj?.transition_statuses ?? []
   return (webhook.enabled_events_list ?? [])
     .map((event) => {
@@ -209,10 +261,20 @@ type PendingWebhookAction = {
   name: string
 }
 
+const maxWebhookDeliveryCursorPages = 100
+
+const isAbortedRequest = (error: unknown, signal: AbortSignal) =>
+  signal.aborted
+  || (error instanceof DOMException && error.name === 'AbortError')
+
 const WebhookSettings: React.FC = () => {
   const notify = useNotify()
   const [loading, setLoading] = useState(false)
   const [items, setItems] = useState<WebhookConfig[]>([])
+  const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(0)
+  const [pageSize, setPageSize] = useState(25)
+  const [listError, setListError] = useState('')
   const [formOpen, setFormOpen] = useState(false)
   const [currentId, setCurrentId] = useState<number | null>(null)
   const [form, setForm] = useState<WebhookForm>(defaultForm)
@@ -220,31 +282,237 @@ const WebhookSettings: React.FC = () => {
   const [testId, setTestId] = useState<number | null>(null)
   const [saving, setSaving] = useState(false)
   const [pendingAction, setPendingAction] = useState<PendingWebhookAction | null>(null)
+  const [deliveryWebhook, setDeliveryWebhook] = useState<WebhookConfig | null>(null)
+  const [deliveries, setDeliveries] = useState<WebhookLog[]>([])
+  const [deliveryLoading, setDeliveryLoading] = useState(false)
+  const [deliveryError, setDeliveryError] = useState('')
+  const [deliveryStatus, setDeliveryStatus] = useState('')
+  const [deliveryEventType, setDeliveryEventType] = useState('')
+  const [deliveryCursor, setDeliveryCursor] = useState('')
+  const [deliveryHasMore, setDeliveryHasMore] = useState(false)
+  const [deliveryPageIndex, setDeliveryPageIndex] = useState(0)
+  const [deliveryCursorHistory, setDeliveryCursorHistory] = useState<string[]>([''])
+  const [selectedDelivery, setSelectedDelivery] = useState<WebhookLog | null>(null)
+  const [scopeVersion, setScopeVersion] = useState(0)
+  const definitionController = useRef<AbortController | null>(null)
+  const definitionSequence = useRef(0)
+  const deliveryController = useRef<AbortController | null>(null)
+  const deliverySequence = useRef(0)
+  const deliveryRetryTarget = useRef({
+    cursor: '',
+    pageIndex: 0,
+  })
 
   const extractErrorMessage = useCallback((error: unknown, fallback: string) => {
     return localizedUnknownErrorMessage(error, fallback)
   }, [])
 
   const fetchWebhooks = useCallback(async () => {
+    definitionController.current?.abort()
+    const controller = new AbortController()
+    const sequence = definitionSequence.current + 1
+    definitionSequence.current = sequence
+    definitionController.current = controller
     try {
       setLoading(true)
+      setListError('')
       const projectKey = await resolveActiveProjectKey()
+      if (
+        controller.signal.aborted
+        || definitionSequence.current !== sequence
+      ) return
       const path = humanApiRoutes.listProjectWebhooks(
         { projectKey },
-        { page: 1, page_size: 100 },
+        { page: page + 1, page_size: pageSize },
       )
-      const data = await apiFetch<WebhookPage>(path)
+      const data = await apiFetch<WebhookPage>(
+        path,
+        { signal: controller.signal },
+      )
+      if (
+        controller.signal.aborted
+        || definitionSequence.current !== sequence
+      ) return
       setItems(data.items ?? [])
+      setTotal(data.total ?? 0)
     } catch (error: unknown) {
-      notify(extractErrorMessage(error, '加载 Webhook 列表失败'), { type: 'error' })
+      if (
+        isAbortedRequest(error, controller.signal)
+        || definitionSequence.current !== sequence
+      ) return
+      setListError(extractErrorMessage(error, '加载 Webhook 列表失败'))
     } finally {
-      setLoading(false)
+      if (
+        !controller.signal.aborted
+        && definitionSequence.current === sequence
+      ) {
+        setLoading(false)
+      }
     }
-  }, [notify, extractErrorMessage])
+  }, [extractErrorMessage, page, pageSize])
 
   useEffect(() => {
-    fetchWebhooks()
-  }, [fetchWebhooks])
+    void fetchWebhooks()
+    return () => definitionController.current?.abort()
+  }, [fetchWebhooks, page, pageSize, scopeVersion])
+
+  const fetchDeliveries = useCallback(async (
+    webhook: WebhookConfig,
+    targetCursor = '',
+    targetPageIndex = 0,
+  ) => {
+    if (
+      targetPageIndex < 0
+      || targetPageIndex >= maxWebhookDeliveryCursorPages
+    ) {
+      setDeliveryError('本次浏览已达到 100 页上限，请缩小筛选范围后继续')
+      return
+    }
+    deliveryController.current?.abort()
+    const controller = new AbortController()
+    const sequence = deliverySequence.current + 1
+    deliverySequence.current = sequence
+    deliveryController.current = controller
+    deliveryRetryTarget.current = {
+      cursor: targetCursor,
+      pageIndex: targetPageIndex,
+    }
+    try {
+      setDeliveryLoading(true)
+      setDeliveryError('')
+      const projectKey = await resolveActiveProjectKey()
+      if (
+        controller.signal.aborted
+        || deliverySequence.current !== sequence
+      ) return
+      const query: ListProjectWebhookLogsOperationQuery = {
+        limit: 25,
+        ...(targetCursor ? { cursor: targetCursor } : {}),
+        ...(deliveryStatus
+          ? { status: deliveryStatus as WebhookLog['status'] }
+          : {}),
+        ...(deliveryEventType
+          ? { event_type: deliveryEventType as WebhookEventType }
+          : {}),
+      }
+      const path = humanApiRoutes.listProjectWebhookLogs(
+        { projectKey, webhookID: webhook.id },
+        query,
+      )
+      const data = await apiFetch<WebhookLogPage>(
+        path,
+        { signal: controller.signal },
+      )
+      if (
+        controller.signal.aborted
+        || deliverySequence.current !== sequence
+      ) return
+      const continuation = data.next_cursor ?? ''
+      setDeliveries(data.items ?? [])
+      setDeliveryCursor(continuation)
+      setDeliveryHasMore(Boolean(data.has_more))
+      setDeliveryPageIndex(targetPageIndex)
+      setDeliveryCursorHistory((previous) => {
+        const history = targetPageIndex === 0
+          ? ['']
+          : previous.slice(0, targetPageIndex + 1)
+        if (
+          data.has_more
+          && continuation
+          && targetPageIndex + 1 < maxWebhookDeliveryCursorPages
+        ) {
+          history[targetPageIndex + 1] = continuation
+        }
+        return history.slice(0, maxWebhookDeliveryCursorPages)
+      })
+      setSelectedDelivery(null)
+    } catch (error: unknown) {
+      if (
+        isAbortedRequest(error, controller.signal)
+        || deliverySequence.current !== sequence
+      ) return
+      setDeliveryError(extractErrorMessage(error, '加载 Webhook 投递记录失败'))
+    } finally {
+      if (
+        !controller.signal.aborted
+        && deliverySequence.current === sequence
+      ) {
+        setDeliveryLoading(false)
+      }
+    }
+  }, [deliveryEventType, deliveryStatus, extractErrorMessage])
+
+  useEffect(() => {
+    if (!deliveryWebhook) return
+    setDeliveries([])
+    setDeliveryCursor('')
+    setDeliveryHasMore(false)
+    setDeliveryPageIndex(0)
+    setDeliveryCursorHistory([''])
+    setSelectedDelivery(null)
+    void fetchDeliveries(deliveryWebhook, '', 0)
+    return () => deliveryController.current?.abort()
+  }, [
+    deliveryEventType,
+    deliveryStatus,
+    deliveryWebhook,
+    fetchDeliveries,
+    scopeVersion,
+  ])
+
+  const closeDeliveries = useCallback(() => {
+    deliveryController.current?.abort()
+    deliverySequence.current += 1
+    setDeliveryWebhook(null)
+    setDeliveries([])
+    setDeliveryError('')
+    setDeliveryStatus('')
+    setDeliveryEventType('')
+    setDeliveryCursor('')
+    setDeliveryHasMore(false)
+    setDeliveryPageIndex(0)
+    setDeliveryCursorHistory([''])
+    setSelectedDelivery(null)
+    setDeliveryLoading(false)
+  }, [])
+
+  const openDeliveries = useCallback((webhook: WebhookConfig) => {
+    deliveryController.current?.abort()
+    deliverySequence.current += 1
+    setDeliveries([])
+    setDeliveryError('')
+    setDeliveryStatus('')
+    setDeliveryEventType('')
+    setDeliveryCursor('')
+    setDeliveryHasMore(false)
+    setDeliveryPageIndex(0)
+    setDeliveryCursorHistory([''])
+    setSelectedDelivery(null)
+    setDeliveryWebhook(webhook)
+  }, [])
+
+  useEffect(() => {
+    const handleProjectScopeChanged = () => {
+      definitionController.current?.abort()
+      definitionSequence.current += 1
+      closeDeliveries()
+      setItems([])
+      setTotal(0)
+      setPage(0)
+      setScopeVersion((version) => version + 1)
+    }
+    window.addEventListener(projectScopeChangedEvent, handleProjectScopeChanged)
+    return () => {
+      definitionController.current?.abort()
+      definitionSequence.current += 1
+      deliveryController.current?.abort()
+      deliverySequence.current += 1
+      window.removeEventListener(
+        projectScopeChangedEvent,
+        handleProjectScopeChanged,
+      )
+    }
+  }, [closeDeliveries])
 
   const openCreate = () => {
     setCurrentId(null)
@@ -259,7 +527,7 @@ const WebhookSettings: React.FC = () => {
       name: webhook.name,
       description: webhook.description || '',
       provider: webhook.provider,
-      webhook_url: webhook.webhook_url,
+      webhook_url: '',
       secret: '',
       access_token: '',
       enabled_events: webhook.enabled_events_list ?? [],
@@ -289,8 +557,7 @@ const WebhookSettings: React.FC = () => {
     setErrors((prev) => ({ ...prev, [key]: '' }))
   }
 
-  const handleEventsChange = (event: SelectChangeEvent<string[]>) => {
-    const value = typeof event.target.value === 'string' ? event.target.value.split(',') : event.target.value
+  const applyEnabledEvents = (value: string[]) => {
     setForm((previous) => ({
       ...previous,
       enabled_events: value,
@@ -299,6 +566,11 @@ const WebhookSettings: React.FC = () => {
         : [],
     }))
     setErrors((previous) => ({ ...previous, enabled_events: '' }))
+  }
+
+  const handleEventsChange = (event: SelectChangeEvent<string[]>) => {
+    const value = typeof event.target.value === 'string' ? event.target.value.split(',') : event.target.value
+    applyEnabledEvents(value)
   }
 
   const handleTransitionStatusesChange = (event: SelectChangeEvent<string[]>) => {
@@ -311,9 +583,12 @@ const WebhookSettings: React.FC = () => {
     if (!form.name.trim()) {
       next.name = '请输入名称'
     }
-    if (!form.webhook_url.trim()) {
+    if (currentId === null && !form.webhook_url.trim()) {
       next.webhook_url = '请输入Webhook URL'
-    } else if (!/^https:\/\//i.test(form.webhook_url)) {
+    } else if (
+      form.webhook_url.trim()
+      && !/^https:\/\//i.test(form.webhook_url)
+    ) {
       next.webhook_url = 'Webhook 地址必须使用公网 HTTPS'
     }
     if (form.enabled_events.length === 0) {
@@ -343,7 +618,6 @@ const WebhookSettings: React.FC = () => {
       name: form.name.trim(),
       description: form.description.trim(),
       provider: form.provider,
-      webhook_url: form.webhook_url.trim(),
       enabled_events: form.enabled_events,
       filter_rules: {
         transition_statuses: form.enabled_events.includes(ticketTransitionedEvent)
@@ -357,6 +631,9 @@ const WebhookSettings: React.FC = () => {
       is_async: form.is_async,
       rate_limit: Number(form.rate_limit || 0),
       rate_limit_window: Number(form.rate_limit_window || 0),
+    }
+    if (currentId === null || form.webhook_url.trim()) {
+      payload.webhook_url = form.webhook_url.trim()
     }
     if (includeStatus) payload.status = form.status
 
@@ -432,6 +709,12 @@ const WebhookSettings: React.FC = () => {
         throw new Error('Webhook 测试入队响应无效，请稍后重试')
       }
       notify('Webhook 测试已入队，请等待投递结果', { type: 'info' })
+      if (deliveryWebhook?.id === id) {
+        setDeliveries([])
+        setDeliveryPageIndex(0)
+        setDeliveryCursorHistory([''])
+        void fetchDeliveries(deliveryWebhook, '', 0)
+      }
     } catch (error: unknown) {
       notify(extractErrorMessage(error, 'Webhook 测试入队失败'), { type: 'error' })
     } finally {
@@ -456,40 +739,41 @@ const WebhookSettings: React.FC = () => {
   }, [form.provider])
 
   return (
-    <Box sx={{ p: 3 }}>
-      <Stack
-        direction="row"
-        sx={{
-          justifyContent: "space-between",
-          alignItems: "center",
-          mb: 3
-        }}>
-        <Stack direction="row" spacing={1.5} sx={{
-          alignItems: "center"
-        }}>
-          <BackButton fallbackPath="/" />
-          <Box>
-            <Typography variant="h4" sx={{ fontWeight: 600 }}>
-              Webhook 集成
-            </Typography>
-            <Typography variant="body2" sx={{
-              color: "text.secondary"
-            }}>
-              管理企业微信、钉钉、飞书等即时通讯渠道的自动通知。
-            </Typography>
-          </Box>
-        </Stack>
-        <Stack direction="row" spacing={1} sx={{
-          alignItems: "center"
-        }}>
-          <Button variant="outlined" startIcon={<RefreshIcon />} onClick={fetchWebhooks}>
-            刷新
-          </Button>
-          <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
-            新增 Webhook
-          </Button>
-        </Stack>
-      </Stack>
+    <PageShell title="Webhook 集成" testId="webhook-settings-page-shell">
+      <PageHeader
+        title="Webhook 集成"
+        description="管理企业微信、钉钉、飞书等即时通讯渠道的自动通知。"
+        leading={<BackButton fallbackPath="/" />}
+        action={(
+          <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
+            <Button
+              variant="outlined"
+              startIcon={<RefreshIcon />}
+              onClick={() => void fetchWebhooks()}
+              disabled={loading}
+            >
+              刷新
+            </Button>
+            <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
+              新增 Webhook
+            </Button>
+          </Stack>
+        )}
+      />
+      <Box sx={{ mt: 3 }}>
+      {listError && (
+        <Alert
+          severity="error"
+          sx={{ mb: 2 }}
+          action={(
+            <Button color="inherit" size="small" onClick={() => void fetchWebhooks()}>
+              重试
+            </Button>
+          )}
+        >
+          {listError}
+        </Alert>
+      )}
       <TableContainer component={Paper}>
         <ResizableMuiTable
           tableId="settings.webhooks"
@@ -564,6 +848,14 @@ const WebhookSettings: React.FC = () => {
                   }}>
                     <IconButton
                       size="small"
+                      aria-label={`查看投递记录：${item.name}`}
+                      title="查看投递记录"
+                      onClick={() => openDeliveries(item)}
+                    >
+                      <DeliveryIcon fontSize="small" />
+                    </IconButton>
+                    <IconButton
+                      size="small"
                       aria-label={`测试 Webhook：${item.name}`}
                       title="将测试请求加入投递队列"
                       onClick={() => setPendingAction({
@@ -601,7 +893,211 @@ const WebhookSettings: React.FC = () => {
             ))}
           </TableBody>
         </ResizableMuiTable>
+        <TablePagination
+          component="div"
+          count={total}
+          page={page}
+          rowsPerPage={pageSize}
+          rowsPerPageOptions={[25, 50, 100]}
+          labelRowsPerPage="每页行数"
+          labelDisplayedRows={({ from, to, count }) => `${from}–${to} / ${count}`}
+          onPageChange={(_, nextPage) => setPage(nextPage)}
+          onRowsPerPageChange={(event) => {
+            setPage(0)
+            setPageSize(Number(event.target.value))
+          }}
+        />
       </TableContainer>
+      </Box>
+      <Drawer
+        anchor="right"
+        open={Boolean(deliveryWebhook)}
+        onClose={closeDeliveries}
+        sx={{ '& .MuiDrawer-paper': { width: { xs: '100%', md: 720 }, p: 3 } }}
+      >
+        <Stack spacing={2} sx={{ minHeight: '100%' }}>
+          <Stack
+            direction="row"
+            sx={{ justifyContent: 'space-between', alignItems: 'center' }}
+          >
+            <Box>
+              <Typography variant="h6">投递记录</Typography>
+              <Typography variant="body2" color="text.secondary">
+                {deliveryWebhook?.name || 'Webhook'}
+              </Typography>
+            </Box>
+            <Button onClick={closeDeliveries}>关闭</Button>
+          </Stack>
+          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+            <TextField
+              select
+              fullWidth
+              size="small"
+              label="投递状态"
+              value={deliveryStatus}
+              onChange={(event) => setDeliveryStatus(event.target.value)}
+            >
+              <MenuItem value="">全部状态</MenuItem>
+              <MenuItem value="pending">等待中</MenuItem>
+              <MenuItem value="success">成功</MenuItem>
+              <MenuItem value="failed">失败</MenuItem>
+            </TextField>
+            <TextField
+              select
+              fullWidth
+              size="small"
+              label="事件类型"
+              value={deliveryEventType}
+              onChange={(event) => setDeliveryEventType(event.target.value)}
+            >
+              <MenuItem value="">全部事件</MenuItem>
+              {eventOptions.map((eventType) => (
+                <MenuItem key={eventType} value={eventType}>
+                  {eventLabel(eventType)}
+                </MenuItem>
+              ))}
+            </TextField>
+          </Stack>
+          {deliveryError && (
+            <Alert
+              severity="error"
+              action={(
+                <Button
+                  color="inherit"
+                  size="small"
+                  disabled={deliveryLoading}
+                  onClick={() => deliveryWebhook
+                    && void fetchDeliveries(
+                      deliveryWebhook,
+                      deliveryRetryTarget.current.cursor,
+                      deliveryRetryTarget.current.pageIndex,
+                    )}
+                >
+                  重试
+                </Button>
+              )}
+            >
+              {deliveryError}
+            </Alert>
+          )}
+          <Paper variant="outlined" sx={{ overflow: 'hidden' }}>
+            {deliveries.map((delivery) => (
+              <Button
+                key={delivery.id}
+                fullWidth
+                color="inherit"
+                onClick={() => setSelectedDelivery(delivery)}
+                sx={{
+                  display: 'grid',
+                  gridTemplateColumns: { xs: '1fr', sm: '160px 1fr 88px' },
+                  gap: 1,
+                  justifyItems: 'start',
+                  px: 2,
+                  py: 1.5,
+                  borderRadius: 0,
+                  borderBottom: '1px solid',
+                  borderColor: 'divider',
+                  textAlign: 'left',
+                  textTransform: 'none',
+                }}
+              >
+                <Typography variant="body2">
+                  {new Date(delivery.created_at).toLocaleString('zh-CN')}
+                </Typography>
+                <TruncatedText title={delivery.event_type}>
+                  {eventLabel(delivery.event_type)}
+                </TruncatedText>
+                <Chip
+                  size="small"
+                  label={delivery.status === 'success'
+                    ? '成功'
+                    : delivery.status === 'failed' ? '失败' : '等待中'}
+                  color={delivery.status === 'success'
+                    ? 'success'
+                    : delivery.status === 'failed' ? 'error' : 'default'}
+                />
+              </Button>
+            ))}
+            {!deliveryLoading && deliveries.length === 0 && !deliveryError && (
+              <Typography sx={{ p: 4, textAlign: 'center' }} color="text.secondary">
+                暂无投递记录
+              </Typography>
+            )}
+            {deliveryLoading && deliveries.length === 0 && (
+              <Stack sx={{ p: 4, alignItems: 'center' }}>
+                <CircularProgress size={24} aria-label="正在加载投递记录" />
+              </Stack>
+            )}
+          </Paper>
+          {(deliveryPageIndex > 0 || deliveryHasMore) && (
+            <Stack
+              direction="row"
+              spacing={1}
+              sx={{ alignItems: 'center', justifyContent: 'center' }}
+            >
+              <Button
+                variant="outlined"
+                disabled={deliveryLoading || deliveryPageIndex === 0}
+                onClick={() => deliveryWebhook
+                  && void fetchDeliveries(
+                    deliveryWebhook,
+                    deliveryCursorHistory[deliveryPageIndex - 1] ?? '',
+                    deliveryPageIndex - 1,
+                  )}
+              >
+                上一页
+              </Button>
+              <Typography variant="body2" color="text.secondary">
+                第 {deliveryPageIndex + 1} 页
+              </Typography>
+              <Button
+                variant="outlined"
+                disabled={
+                  deliveryLoading
+                  || !deliveryHasMore
+                  || !deliveryCursor
+                  || deliveryPageIndex >= maxWebhookDeliveryCursorPages - 1
+                }
+                onClick={() => deliveryWebhook
+                  && void fetchDeliveries(
+                    deliveryWebhook,
+                    deliveryCursor,
+                    deliveryPageIndex + 1,
+                  )}
+              >
+                {deliveryLoading ? '加载中…' : '下一页'}
+              </Button>
+            </Stack>
+          )}
+          {deliveryHasMore
+            && deliveryPageIndex >= maxWebhookDeliveryCursorPages - 1 && (
+              <Alert severity="info">
+                本次浏览已达到 100 页上限，请按投递状态或事件类型缩小范围。
+              </Alert>
+            )}
+          {selectedDelivery && (
+            <Paper variant="outlined" sx={{ p: 2 }} aria-live="polite">
+              <Typography component="h3" variant="subtitle1" gutterBottom>
+                投递详情 #{selectedDelivery.id}
+              </Typography>
+              <Stack spacing={0.5}>
+                <Typography variant="body2">
+                  事件：{selectedDelivery.event_type}
+                </Typography>
+                <Typography variant="body2">
+                  HTTP 状态：{selectedDelivery.response_status || '—'}
+                </Typography>
+                <Typography variant="body2">
+                  耗时：{selectedDelivery.response_time ?? '—'} 毫秒
+                </Typography>
+                <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+                  诊断：{selectedDelivery.error_message || '无'}
+                </Typography>
+              </Stack>
+            </Paper>
+          )}
+        </Stack>
+      </Drawer>
       <Dialog open={formOpen} onClose={closeForm} maxWidth="md" fullWidth>
         <DialogTitle>{currentId ? '编辑 Webhook' : '新增 Webhook'}</DialogTitle>
         <DialogContent dividers>
@@ -693,7 +1189,11 @@ const WebhookSettings: React.FC = () => {
                 value={form.webhook_url}
                 onChange={(e) => handleFormChange('webhook_url', e.target.value)}
                 error={Boolean(errors.webhook_url)}
-                helperText={errors.webhook_url || '复制自各渠道机器人配置界面'}
+                helperText={errors.webhook_url || (
+                  currentId === null
+                    ? '复制自各渠道机器人配置界面；保存后仅显示脱敏地址'
+                    : `留空保留当前地址（${items.find((item) => item.id === currentId)?.webhook_url_masked || '已配置'}）；填写新地址才会替换`
+                )}
               />
             </Grid>
             <Grid
@@ -731,17 +1231,47 @@ const WebhookSettings: React.FC = () => {
                   multiple
                   value={form.enabled_events}
                   onChange={handleEventsChange}
-                  renderValue={(selected) => selected.map(eventLabel).join('、')}
+                  renderValue={(selected) =>
+                    renderSelectedValues(selected, eventLabel)
+                  }
+                  inputProps={{
+                    'aria-describedby': `${webhookFormFieldIDs.enabledEvents}-help`,
+                  }}
                 >
                   {eventOptions.map((evt) => (
                     <MenuItem key={evt} value={evt}>
-                      {eventLabel(evt)}（{evt}）
+                      <Checkbox
+                        checked={form.enabled_events.includes(evt)}
+                        tabIndex={-1}
+                        disableRipple
+                      />
+                      <ListItemText
+                        primary={eventLabel(evt)}
+                        secondary={evt}
+                      />
                     </MenuItem>
                   ))}
                 </Select>
-                <Typography variant="caption" color={errors.enabled_events ? 'error' : 'text.secondary'}>
-                  {errors.enabled_events || '仅支持当前完整 CloudEvent 类型；事件标识会原样写入投递日志和请求体。'}
-                </Typography>
+                <Stack
+                  id={`${webhookFormFieldIDs.enabledEvents}-help`}
+                  direction={{ xs: 'column', sm: 'row' }}
+                  spacing={1}
+                  sx={{ alignItems: { sm: 'center' }, justifyContent: 'space-between', mt: 0.5 }}
+                >
+                  <Typography variant="caption" color={errors.enabled_events ? 'error' : 'text.secondary'}>
+                    {errors.enabled_events
+                      || `已选择 ${form.enabled_events.length} 个；仅支持当前完整 CloudEvent 类型。`}
+                  </Typography>
+                  {form.enabled_events.length > 0 && (
+                    <Button
+                      size="small"
+                      onClick={() => applyEnabledEvents([])}
+                      aria-label="清空已选订阅事件"
+                    >
+                      清空
+                    </Button>
+                  )}
+                </Stack>
               </FormControl>
             </Grid>
             {form.enabled_events.includes(ticketTransitionedEvent) && (
@@ -758,23 +1288,49 @@ const WebhookSettings: React.FC = () => {
                     value={form.transition_statuses}
                     onChange={handleTransitionStatusesChange}
                     renderValue={(selected) =>
-                      selected.length > 0
-                        ? selected.map(transitionStatusLabel).join('、')
-                        : '全部状态'
+                      renderSelectedValues(
+                        selected,
+                        transitionStatusLabel,
+                        '全部状态',
+                      )
                     }
+                    inputProps={{
+                      'aria-describedby': `${webhookFormFieldIDs.transitionStatuses}-help`,
+                    }}
                   >
                     {transitionStatusOptions.map((status) => (
                       <MenuItem key={status.value} value={status.value}>
-                        {status.label}（{status.value}）
+                        <Checkbox
+                          checked={form.transition_statuses.includes(status.value)}
+                          tabIndex={-1}
+                          disableRipple
+                        />
+                        <ListItemText
+                          primary={status.label}
+                          secondary={status.value}
+                        />
                       </MenuItem>
                     ))}
                   </Select>
-                  <Typography variant="caption" color="text.secondary">
-                    留空表示订阅全部状态流转。若只关心已解决或已关闭，请在此明确选择，事件类型仍为
-                    {' '}
-                    {ticketTransitionedEvent}
-                    。
-                  </Typography>
+                  <Stack
+                    id={`${webhookFormFieldIDs.transitionStatuses}-help`}
+                    direction={{ xs: 'column', sm: 'row' }}
+                    spacing={1}
+                    sx={{ alignItems: { sm: 'center' }, justifyContent: 'space-between', mt: 0.5 }}
+                  >
+                    <Typography variant="caption" color="text.secondary">
+                      已选择 {form.transition_statuses.length} 个；留空表示订阅全部状态流转。
+                    </Typography>
+                    {form.transition_statuses.length > 0 && (
+                      <Button
+                        size="small"
+                        onClick={() => handleFormChange('transition_statuses', [])}
+                        aria-label="清空已选状态流转筛选"
+                      >
+                        清空
+                      </Button>
+                    )}
+                  </Stack>
                 </FormControl>
               </Grid>
             )}
@@ -916,7 +1472,7 @@ const WebhookSettings: React.FC = () => {
           </Button>
         </DialogActions>
       </Dialog>
-    </Box>
+    </PageShell>
   );
 }
 

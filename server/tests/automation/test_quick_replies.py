@@ -43,12 +43,28 @@ class TestQuickReplies:
 
             list_resp = admin_api.get_json(
                 admin_api.project_path("admin/automation/quick-replies"),
-                params={"page_size": 50, "is_public": True},
+                params={"page": 1, "page_size": 50, "is_public": "true"},
             )
             assert list_resp.status_code == 200, list_resp.text
             list_body = list_resp.json()
             assert list_body.get("success") is True, list_body
-            replies = list_body.get("data", {}).get("replies", [])
+            assert set(list_body) == {"success", "message", "data"}, list_body
+            list_data = list_body["data"]
+            assert isinstance(list_data, dict), list_body
+            assert set(list_data) == {
+                "items",
+                "total",
+                "page",
+                "page_size",
+                "total_pages",
+            }, list_data
+            assert list_data["page"] == 1, list_data
+            assert list_data["page_size"] == 50, list_data
+            assert isinstance(list_data["total"], int), list_data
+            assert isinstance(list_data["total_pages"], int), list_data
+            replies = list_data["items"]
+            assert isinstance(replies, list), list_data
+            assert len(replies) <= 50, list_data
             assert any(reply.get("id") == created_id for reply in replies)
 
             use_resp = admin_api.post_json(

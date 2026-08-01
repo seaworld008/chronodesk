@@ -189,6 +189,7 @@ func dropChronoDeskTables(db *gorm.DB) error {
 		"email_verifications",
 		"system_configs",
 		"email_configs",
+		"category_scope_migration_mappings",
 		"categories",
 		"users",
 	}

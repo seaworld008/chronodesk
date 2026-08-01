@@ -21,6 +21,10 @@ from .utils import (
     assert_human_session_contract,
 )
 from .utils.api import validate_project_key
+from .utils.human import (
+    active_project_membership_version,
+    cleanup_project_membership,
+)
 from .utils.safety import (
     TestSafetyError,
     TestTarget,
@@ -241,9 +245,17 @@ def project_key(
             pytest.fail(f"项目发现返回非 JSON：{redact_text(exc)}")
     finally:
         discovery_client.close()
-    rows = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(rows, list):
-        pytest.fail(f"项目发现缺少 data：{safe_diagnostic(payload)}")
+    directory = payload.get("data") if isinstance(payload, dict) else None
+    if (
+        not isinstance(directory, dict)
+        or not isinstance(directory.get("items"), list)
+        or directory.get("page") != 1
+        or directory.get("page_size") != 25
+        or not isinstance(directory.get("total"), int)
+        or not isinstance(directory.get("total_pages"), int)
+    ):
+        pytest.fail(f"项目发现缺少严格分页 data：{safe_diagnostic(payload)}")
+    rows = directory["items"]
     active_accesses = [
         row
         for row in rows
@@ -471,23 +483,70 @@ def registered_user(
             "注册 Auth/JWT 必须只使用 platform_role=member："
             f"{safe_diagnostic(registered_identity)}"
         )
+    membership_version: int | None = None
     try:
-        membership = admin_api.post_json(
-            admin_api.project_path("memberships"),
-            {"user_id": registered_id, "role": "requester"},
-        )
-        if membership.status_code != 200:
-            pytest.fail(f"注册用户项目授权失败：{response_diagnostic(membership)}")
+        try:
+            membership = admin_api.post_json(
+                admin_api.project_path("memberships"),
+                {
+                    "user_id": registered_id,
+                    "role": "requester",
+                    "expected_version": 0,
+                },
+                retry=False,
+            )
+        except APIError:
+            try:
+                membership_version = active_project_membership_version(
+                    admin_api,
+                    registered_id,
+                    "requester",
+                )
+            except AssertionError as reconcile_exc:
+                pytest.fail(
+                    "注册用户项目授权结果不确定，且未能确认提交结果："
+                    f"{safe_diagnostic(reconcile_exc)}",
+                    pytrace=False,
+                )
+        else:
+            if membership.status_code != 200:
+                pytest.fail(f"注册用户项目授权失败：{response_diagnostic(membership)}")
+            try:
+                membership_data = membership.json().get("data")
+            except ValueError:
+                membership_data = None
+            membership_version = (
+                membership_data.get("version")
+                if isinstance(membership_data, dict)
+                and membership_data.get("user_id") == registered_id
+                and membership_data.get("role") == "requester"
+                else None
+            )
+            if not isinstance(membership_version, int) or membership_version <= 0:
+                try:
+                    membership_version = active_project_membership_version(
+                        admin_api,
+                        registered_id,
+                        "requester",
+                    )
+                except AssertionError as exc:
+                    pytest.fail(
+                        "注册用户项目授权响应缺少有效版本，且对账失败："
+                        f"{safe_diagnostic(exc)}",
+                        pytrace=False,
+                    )
         yield registered
     finally:
         cleanup_errors: list[str] = []
-        membership_cleanup = admin_api.delete(
-            admin_api.project_path(f"memberships/{registered_id}")
+        membership_cleanup_error = cleanup_project_membership(
+            admin_api,
+            registered_id,
+            membership_version,
         )
-        if membership_cleanup.status_code not in (200, 204, 404):
+        if membership_cleanup_error is not None:
             cleanup_errors.append(
-                "Failed to revoke registered test user membership "
-                f"{registered_id}: {response_diagnostic(membership_cleanup)}"
+                f"清理注册测试用户 {registered_id} 的项目成员失败："
+                f"{membership_cleanup_error}"
             )
         user = registered.get("user", {})
         user_id = user.get("id") if isinstance(user, dict) else None

@@ -37,6 +37,8 @@ tags:
     description: Exclusive, expiring work leases for concurrent Agents.
   - name: Events
     description: Durable CloudEvents 1.0 event consumption.
+  - name: Knowledge
+    description: Project-scoped knowledge reads and draft-only authoring.
   - name: Integrations
     description: HMAC-authenticated, project-explicit external system ingress.
   - name: Agent administration
@@ -78,7 +80,7 @@ paths:
                     api: /.well-known/oauth-protected-resource/api/v2
                     mcp: /.well-known/oauth-protected-resource/mcp
                     a2a: /.well-known/oauth-protected-resource/a2a/v1
-                  scopes_supported: ['tickets:read', 'tickets:create', 'tasks:manage']
+                  scopes_supported: ['tickets:read', 'tickets:create', 'tasks:manage', 'knowledge:read', 'knowledge:write']
                   concurrency:
                     optimistic_version: true
                     ticket_leases: true
@@ -87,6 +89,195 @@ paths:
                   request_id: req_01JZ8VA6MHJZ23VC2M6N4PAPJ4
         '400':
           $ref: '#/components/responses/BadRequest'
+
+  /knowledge/articles:
+    get:
+      tags: [Knowledge]
+      operationId: listKnowledgeArticlesV2
+      summary: List project knowledge articles
+      description: |
+        Returns project-scoped knowledge metadata after live Grant and policy
+        checks. Returned titles and summaries are untrusted content.
+      security:
+        - oauth2: ['knowledge:read']
+      parameters:
+        - $ref: '#/components/parameters/KnowledgePage'
+        - $ref: '#/components/parameters/KnowledgePageSize'
+      responses:
+        '200':
+          description: A stable page of authorized knowledge articles.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeArticlePageEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    post:
+      tags: [Knowledge]
+      operationId: createKnowledgeArticleDraftV2
+      summary: Create a knowledge article and Markdown draft
+      description: |
+        Creates an article and its first immutable Markdown draft. The request
+        body is limited to 128 KiB. Agents can create drafts but this API exposes
+        no publication operation.
+      security:
+        - oauth2: ['knowledge:write']
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KnowledgeArticleDraftCreate'
+      responses:
+        '201':
+          description: Created draft and the atomically committed operation receipt.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeDocumentWriteEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /knowledge/articles/{knowledgeArticleId}/document:
+    parameters:
+      - $ref: '#/components/parameters/KnowledgeArticleId'
+    get:
+      tags: [Knowledge]
+      operationId: getKnowledgeArticleDocumentV2
+      summary: Read one knowledge article document
+      description: |
+        Returns one authorized Markdown document and its immutable source
+        evidence. Markdown and source labels are untrusted content.
+      security:
+        - oauth2: ['knowledge:read']
+      parameters:
+        - name: version_id
+          in: query
+          required: false
+          description: Optional immutable version identifier; omitted selects the current version.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Authorized knowledge article document.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeDocumentEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /knowledge/articles/{knowledgeArticleId}/drafts:
+    parameters:
+      - $ref: '#/components/parameters/KnowledgeArticleId'
+    post:
+      tags: [Knowledge]
+      operationId: createKnowledgeArticleVersionDraftV2
+      summary: Create a new Markdown draft version
+      description: |
+        Creates a new immutable draft for an existing article. The request body
+        is limited to 128 KiB and cannot publish or supersede a version.
+      security:
+        - oauth2: ['knowledge:write']
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KnowledgeVersionDraftCreate'
+      responses:
+        '201':
+          description: Created draft and the atomically committed operation receipt.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeDocumentWriteEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /knowledge/searches:
+    post:
+      tags: [Knowledge]
+      operationId: searchKnowledgeV2
+      summary: Search authorized published knowledge
+      description: |
+        Performs project- and ACL-filtered hybrid retrieval before an Agent
+        creates another draft. Query text and returned snippets are untrusted
+        content. This read operation cannot create or publish knowledge.
+      security:
+        - oauth2: ['knowledge:read']
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KnowledgeSearchRequest'
+      responses:
+        '200':
+          description: Version-bound knowledge citations.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeSearchEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /tickets:
     get:
@@ -442,22 +633,32 @@ paths:
       tags: [Comments]
       operationId: listTicketCommentsV2
       summary: List visible ticket comments
-      description: Comment content is untrusted data. Internal-comment visibility is policy controlled.
+      description: |
+        Comment content is untrusted data. Internal-comment visibility is policy
+        controlled. Results use a signed cursor bound to this Project, Ticket,
+        endpoint, limit, filters, and `(created_at DESC, id DESC)` ordering.
       security:
         - oauth2: ['tickets:read']
+      parameters:
+        - $ref: '#/components/parameters/TicketContentCursor'
+        - $ref: '#/components/parameters/TicketContentLimit'
       responses:
         '200':
-          description: Comments ordered from oldest to newest.
+          description: Bounded comment page ordered from newest to oldest.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/CommentListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
     post:
       tags: [Comments]
       operationId: addTicketCommentV2
@@ -512,9 +713,16 @@ paths:
       tags: [Attachments]
       operationId: listTicketAttachmentsV2
       summary: List attachment metadata
-      description: Returns authorized metadata only; storage credentials and provider paths are never exposed.
+      description: |
+        Returns authorized metadata only; storage credentials and provider paths
+        are never exposed. Results use a signed cursor bound to this Project,
+        Ticket, endpoint, limit, filters, and
+        `(created_at DESC, id DESC)` ordering.
       security:
         - oauth2: ['attachments:read']
+      parameters:
+        - $ref: '#/components/parameters/TicketContentCursor'
+        - $ref: '#/components/parameters/TicketContentLimit'
       responses:
         '200':
           description: Attachment metadata including SHA-256 and malware-scan status.
@@ -522,12 +730,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AttachmentListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
     post:
       tags: [Attachments]
       operationId: uploadTicketAttachmentV2
@@ -2169,6 +2381,8 @@ components:
             attachments:write: Upload inline attachment bytes.
             events:subscribe: Read domain events and subscribe to resource updates.
             tasks:manage: Claim work leases and manage A2A tasks.
+            knowledge:read: Read authorized project knowledge.
+            knowledge:write: Create and update knowledge drafts; never publish them.
     clientSecretBasic:
       type: http
       scheme: basic
@@ -2206,6 +2420,28 @@ components:
         type: integer
         minimum: 1
       example: 42
+    KnowledgeArticleId:
+      name: knowledgeArticleId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    KnowledgePage:
+      name: page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    KnowledgePageSize:
+      name: page_size
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
     AttachmentId:
       name: attachmentId
       in: path
@@ -2267,6 +2503,25 @@ components:
         minimum: 1
         maximum: 100
         default: 20
+    TicketContentCursor:
+      name: cursor
+      in: query
+      description: |
+        Opaque signed continuation cursor copied unchanged from
+        `data.next_cursor`. It is bound to the Project, Ticket, endpoint, limit,
+        filters, and stable sort order and cannot be reused across them.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 2048
+    TicketContentLimit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
     HistoryLimit:
       name: limit
       in: query
@@ -3358,6 +3613,417 @@ components:
             actor:
               $ref: '#/components/schemas/ActorRef'
           additionalProperties: true
+    KnowledgeArticleDraftCreate:
+      type: object
+      additionalProperties: false
+      required: [key, title, markdown]
+      properties:
+        key:
+          type: string
+          pattern: '^[a-z][a-z0-9._-]{0,63}$'
+          minLength: 1
+          maxLength: 64
+        title:
+          type: string
+          minLength: 1
+          maxLength: 240
+          description: Untrusted article title.
+        summary:
+          type: string
+          maxLength: 1000
+          description: Untrusted article summary.
+        markdown:
+          type: string
+          minLength: 1
+          maxLength: 131072
+          description: |
+            Untrusted UTF-8 Markdown. The complete JSON request body is limited
+            to 128 KiB and the Markdown value cannot be blank.
+        source_ticket_id:
+          type: integer
+          minimum: 1
+          description: |
+            Optional visible source ticket. Requires effective tickets:read
+            scope and a live ticket.read policy decision.
+        source_attachment_ids:
+          type: array
+          uniqueItems: true
+          maxItems: 20
+          description: |
+            Optional clean attachments from source_ticket_id. Requires
+            effective attachments:read scope and a live
+            ticket.attachment.read policy decision.
+          items:
+            type: integer
+            minimum: 1
+    KnowledgeVersionDraftCreate:
+      type: object
+      additionalProperties: false
+      required: [title, markdown]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 240
+          description: Untrusted version title.
+        markdown:
+          type: string
+          minLength: 1
+          maxLength: 131072
+          description: |
+            Untrusted UTF-8 Markdown. The complete JSON request body is limited
+            to 128 KiB and the Markdown value cannot be blank.
+        source_ticket_id:
+          type: integer
+          minimum: 1
+          description: |
+            Optional visible source ticket. Requires effective tickets:read
+            scope and a live ticket.read policy decision.
+        source_attachment_ids:
+          type: array
+          uniqueItems: true
+          maxItems: 20
+          description: |
+            Optional clean attachments from source_ticket_id. Requires
+            effective attachments:read scope and a live
+            ticket.attachment.read policy decision.
+          items:
+            type: integer
+            minimum: 1
+    KnowledgeSearchRequest:
+      type: object
+      additionalProperties: false
+      required: [query]
+      properties:
+        query:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: Untrusted search text.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 10
+    KnowledgeArticle:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - created_at
+        - updated_at
+        - key
+        - title
+        - summary
+        - status
+        - revision
+      properties:
+        id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        key:
+          type: string
+          pattern: '^[a-z][a-z0-9._-]{0,63}$'
+        title:
+          type: string
+          description: Untrusted article title.
+        summary:
+          type: string
+          description: Untrusted article summary.
+        status:
+          type: string
+          enum: [active, archived]
+        current_version_id:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          minimum: 1
+    KnowledgeVersion:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - created_at
+        - updated_at
+        - article_id
+        - version
+        - status
+        - title
+        - mime_type
+        - size_bytes
+        - content_hash
+        - virus_scan
+        - page_count
+      properties:
+        id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        article_id:
+          type: string
+          format: uuid
+        version:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+          enum: [draft, published, superseded, quarantined]
+        title:
+          type: string
+          description: Untrusted version title.
+        mime_type:
+          type: string
+          const: 'text/plain; charset=utf-8'
+        size_bytes:
+          type: integer
+          minimum: 1
+          maximum: 131072
+        content_hash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+          description: SHA-256 digest of the immutable Markdown object.
+        virus_scan:
+          type: string
+          enum: [pending, clean, infected, error]
+        page_count:
+          type: integer
+          minimum: 0
+        published_at:
+          type: string
+          format: date-time
+    KnowledgeSource:
+      type: object
+      additionalProperties: false
+      required:
+        - ordinal
+        - kind
+        - visibility
+        - reference_label
+      properties:
+        ordinal:
+          type: integer
+          minimum: 0
+        kind:
+          type: string
+          enum: [ticket, attachment]
+        visibility:
+          type: string
+          enum: [full, restricted, unavailable]
+          description: >
+            Live source projection. Protected Ticket and Attachment fields are
+            present only for full; restricted and unavailable keep a safe
+            reference without weakening knowledge document availability.
+        reference_label:
+          type: string
+          minLength: 1
+          maxLength: 320
+          description: Safe display label for the current visibility.
+        source_ticket_id:
+          type: integer
+          minimum: 1
+          description: Present only after live source Ticket authorization.
+        source_attachment_id:
+          type: integer
+          minimum: 1
+          description: Present only after live source Attachment authorization.
+        ticket_number:
+          type: string
+          maxLength: 64
+          description: Authorized untrusted snapshot of the source ticket number.
+        ticket_title:
+          type: string
+          maxLength: 255
+          description: Authorized untrusted snapshot of the source ticket title.
+        attachment_name:
+          type: string
+          maxLength: 255
+          description: Authorized untrusted snapshot of the source attachment name.
+        attachment_hash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+          description: Authorized SHA-256 snapshot of the source attachment.
+    KnowledgeDocumentSection:
+      type: object
+      additionalProperties: false
+      required:
+        - ordinal
+        - heading_level
+        - markdown
+        - content_hash
+      properties:
+        ordinal:
+          type: integer
+          minimum: 0
+        heading:
+          type: string
+          description: Untrusted Markdown heading.
+        heading_level:
+          type: integer
+          minimum: 0
+          maximum: 6
+        section_path:
+          type: string
+          description: Untrusted normalized heading path.
+        markdown:
+          type: string
+          description: Untrusted Markdown section content.
+        content_hash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+    KnowledgeDocument:
+      type: object
+      additionalProperties: false
+      required: [article, version, markdown, sections, sources]
+      properties:
+        article:
+          $ref: '#/components/schemas/KnowledgeArticle'
+        version:
+          $ref: '#/components/schemas/KnowledgeVersion'
+        markdown:
+          type: string
+          description: Untrusted UTF-8 Markdown.
+        sections:
+          type: array
+          items:
+            $ref: '#/components/schemas/KnowledgeDocumentSection'
+        sources:
+          type: array
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/KnowledgeSource'
+    KnowledgeArticlePage:
+      type: object
+      additionalProperties: false
+      required: [items, total, page, page_size, total_pages]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/KnowledgeArticle'
+        total:
+          type: integer
+          minimum: 0
+        page:
+          type: integer
+          minimum: 1
+        page_size:
+          type: integer
+          minimum: 1
+          maximum: 100
+        total_pages:
+          type: integer
+          minimum: 0
+    KnowledgeCitation:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - article_id
+        - article_key
+        - article_title
+        - version_id
+        - document_version
+        - chunk_id
+        - section_path
+        - snippet
+        - content_hash
+        - rank
+        - score
+      properties:
+        id:
+          type: string
+        article_id:
+          type: string
+          format: uuid
+        article_key:
+          type: string
+          minLength: 1
+          maxLength: 64
+        article_title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        version_id:
+          type: string
+          format: uuid
+        document_version:
+          type: integer
+          minimum: 1
+        chunk_id:
+          type: string
+        page_number:
+          type: integer
+          minimum: 1
+        section_path:
+          type: string
+          maxLength: 500
+        snippet:
+          type: string
+          description: Untrusted result excerpt.
+        content_hash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        rank:
+          type: integer
+          minimum: 1
+        score:
+          type: number
+          format: double
+    KnowledgeSearchResult:
+      type: object
+      additionalProperties: false
+      required: [search_id, items]
+      properties:
+        search_id:
+          type: string
+          minLength: 1
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/KnowledgeCitation'
+    KnowledgeArticlePageEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/KnowledgeArticlePage'
+    KnowledgeDocumentEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/KnowledgeDocument'
+    KnowledgeDocumentWriteEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [receipt]
+          properties:
+            data:
+              $ref: '#/components/schemas/KnowledgeDocument'
+            receipt:
+              $ref: '#/components/schemas/Receipt'
+    KnowledgeSearchEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/KnowledgeSearchResult'
     CapabilitiesEnvelope:
       allOf:
         - $ref: '#/components/schemas/Envelope'
@@ -3459,15 +4125,28 @@ components:
               $ref: '#/components/schemas/Ticket'
             receipt:
               $ref: '#/components/schemas/Receipt'
+    CommentCursorPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/Comment'
+        next_cursor:
+          type: string
+          description: Empty when the current page exhausts the result set.
+        has_more:
+          type: boolean
     CommentListEnvelope:
       allOf:
         - $ref: '#/components/schemas/Envelope'
         - type: object
           properties:
             data:
-              type: array
-              items:
-                $ref: '#/components/schemas/Comment'
+              $ref: '#/components/schemas/CommentCursorPage'
     CommentWriteEnvelope:
       allOf:
         - $ref: '#/components/schemas/Envelope'
@@ -3478,15 +4157,28 @@ components:
               $ref: '#/components/schemas/Comment'
             receipt:
               $ref: '#/components/schemas/Receipt'
+    AttachmentCursorPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/Attachment'
+        next_cursor:
+          type: string
+          description: Empty when the current page exhausts the result set.
+        has_more:
+          type: boolean
     AttachmentListEnvelope:
       allOf:
         - $ref: '#/components/schemas/Envelope'
         - type: object
           properties:
             data:
-              type: array
-              items:
-                $ref: '#/components/schemas/Attachment'
+              $ref: '#/components/schemas/AttachmentCursorPage'
     AttachmentWriteEnvelope:
       allOf:
         - $ref: '#/components/schemas/Envelope'
@@ -3574,6 +4266,8 @@ components:
         - attachments:write
         - events:subscribe
         - tasks:manage
+        - knowledge:read
+        - knowledge:write
     ServicePrincipalControl:
       type: object
       additionalProperties: false

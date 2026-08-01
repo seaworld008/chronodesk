@@ -14,30 +14,28 @@ import (
 
 type captureAdminAuditService struct {
 	filter services.AdminAuditFilter
+	detail *services.AdminAuditDetail
 }
 
-func (*captureAdminAuditService) Record(
-	context.Context,
-	*services.AdminAuditRecord,
-) error {
-	return nil
-}
-
-func (*captureAdminAuditService) Finalize(
-	context.Context,
-	*services.AdminAuditRecord,
-) error {
-	return nil
-}
-
-func (service *captureAdminAuditService) List(
+func (service *captureAdminAuditService) Explore(
 	_ context.Context,
 	filter *services.AdminAuditFilter,
-) ([]*models.AdminAuditLog, int64, error) {
+) (*services.AdminAuditPage, error) {
 	if filter != nil {
 		service.filter = *filter
 	}
-	return []*models.AdminAuditLog{}, 0, nil
+	return &services.AdminAuditPage{
+		Items:      []*services.AdminAuditListItem{},
+		NextCursor: "",
+		HasMore:    false,
+	}, nil
+}
+
+func (service *captureAdminAuditService) GetDetail(
+	_ context.Context,
+	_ uint,
+) (*services.AdminAuditDetail, error) {
+	return service.detail, nil
 }
 
 func TestAdminAuditHandlerBindsAllPublishedQueryParameters(t *testing.T) {
@@ -51,13 +49,15 @@ func TestAdminAuditHandlerBindsAllPublishedQueryParameters(t *testing.T) {
 		http.MethodGet,
 		"/audit-logs?user_id=42"+
 			"&platform_role=security_auditor"+
+			"&actor=audit-admin"+
+			"&action=platform.user.update"+
 			"&method=post"+
-			"&path=%2Fapi%2Fplatform"+
+			"&path_prefix=%2Fapi%2Fplatform"+
 			"&status=403"+
+			"&result=error"+
 			"&keyword=denied"+
 			"&start_time=2026-07-01"+
 			"&end_time=2026-07-30T12%3A30%3A00Z"+
-			"&page=2"+
 			"&limit=50",
 		nil,
 	)
@@ -74,7 +74,12 @@ func TestAdminAuditHandlerBindsAllPublishedQueryParameters(t *testing.T) {
 	if filter.PlatformRole != models.PlatformRoleSecurityAuditor {
 		t.Errorf("platform_role = %q", filter.PlatformRole)
 	}
-	if filter.Method != "post" ||
+	if filter.Actor != "audit-admin" ||
+		filter.Action != "platform.user.update" ||
+		filter.Result != "error" {
+		t.Errorf("structured filters = %+v", filter)
+	}
+	if filter.Method != "POST" ||
 		filter.Path != "/api/platform" ||
 		filter.Keyword != "denied" {
 		t.Errorf("text filters = %+v", filter)
@@ -90,8 +95,60 @@ func TestAdminAuditHandlerBindsAllPublishedQueryParameters(t *testing.T) {
 	if filter.EndTime == nil || !filter.EndTime.Equal(wantEnd) {
 		t.Errorf("end_time = %v", filter.EndTime)
 	}
-	if filter.Page != 2 || filter.Limit != 50 {
-		t.Errorf("pagination = page %d limit %d", filter.Page, filter.Limit)
+	if filter.Limit != 50 {
+		t.Errorf("pagination limit = %d", filter.Limit)
+	}
+}
+
+func TestAdminAuditHandlerUsesStrictPaginationDefaultsAndValidation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, test := range []struct {
+		name  string
+		query string
+		want  int
+	}{
+		{name: "defaults", query: "", want: http.StatusOK},
+		{name: "numbered page removed", query: "?page=1", want: http.StatusBadRequest},
+		{name: "oversized limit", query: "?limit=101", want: http.StatusBadRequest},
+		{name: "empty limit", query: "?limit=", want: http.StatusBadRequest},
+		{name: "empty cursor", query: "?cursor=", want: http.StatusBadRequest},
+		{name: "empty actor", query: "?actor=", want: http.StatusBadRequest},
+		{name: "empty status", query: "?status=", want: http.StatusBadRequest},
+		{name: "padded actor", query: "?actor=%20admin", want: http.StatusBadRequest},
+		{name: "bad status", query: "?status=ok", want: http.StatusBadRequest},
+		{name: "bad date", query: "?start_time=yesterday", want: http.StatusBadRequest},
+		{name: "unknown filter", query: "?role=admin", want: http.StatusBadRequest},
+		{name: "invalid encoding", query: "?action=%ZZ", want: http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := &captureAdminAuditService{}
+			router := gin.New()
+			router.GET(
+				"/audit-logs",
+				NewAdminAuditHandler(service).GetAuditLogs,
+			)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(
+				response,
+				httptest.NewRequest(
+					http.MethodGet,
+					"/audit-logs"+test.query,
+					nil,
+				),
+			)
+			if response.Code != test.want {
+				t.Fatalf(
+					"status = %d, want %d; body=%s",
+					response.Code,
+					test.want,
+					response.Body.String(),
+				)
+			}
+			if test.name == "defaults" &&
+				service.filter.Limit != services.DefaultAdminAuditLimit {
+				t.Fatalf("defaults = %+v", service.filter)
+			}
+		})
 	}
 }
 

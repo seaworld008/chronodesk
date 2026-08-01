@@ -25,6 +25,7 @@ var projectRLSIdentifierPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 // an indirect foreign-key join as an authorization boundary.
 var requiredProjectOwnedTableNames = []string{
 	// Ticket business state and its transactional audit/outbox records.
+	"categories",
 	"tickets",
 	"ticket_comments",
 	"ticket_attachments",
@@ -67,7 +68,9 @@ var requiredProjectOwnedTableNames = []string{
 	// a rebuildable projection that receives the same project and ACL filters.
 	"knowledge_articles",
 	"knowledge_article_versions",
+	"knowledge_object_write_intents",
 	"knowledge_article_acl",
+	"knowledge_source_links",
 	"knowledge_ingestion_tasks",
 	"knowledge_chunks",
 	"knowledge_citations",

@@ -38,12 +38,14 @@ var (
 )
 
 type attachmentUploadMigrationIntent struct {
-	AttachmentID uint   `json:"attachment_id"`
-	TicketID     uint   `json:"ticket_id"`
-	StagingKey   string `json:"staging_key"`
-	FinalKey     string `json:"final_key"`
-	FileSize     int64  `json:"file_size"`
-	SHA256       string `json:"sha256"`
+	AttachmentID      uint   `json:"attachment_id"`
+	TicketID          uint   `json:"ticket_id"`
+	StagingKey        string `json:"staging_key"`
+	FinalKey          string `json:"final_key"`
+	TargetStoreID     string `json:"target_store_id"`
+	TargetStorageType string `json:"target_storage_type"`
+	FileSize          int64  `json:"file_size"`
+	SHA256            string `json:"sha256"`
 }
 
 // ExecuteAttachmentUploadOutbox copies one committed staging object into the
@@ -193,6 +195,7 @@ func (s *AgentNativeService) ExecuteAttachmentUploadOutbox(
 		return s.cleanupObsoleteAttachmentUpload(
 			ctx,
 			migrationIntent,
+			nil,
 		)
 	}
 
@@ -205,8 +208,10 @@ func (s *AgentNativeService) ExecuteAttachmentUploadOutbox(
 	if err != nil {
 		return err
 	}
-	stored, putErr := s.attachmentStorage.Put(
+	stored, putErr := putAttachmentInStore(
 		ctx,
+		s.attachmentStorage,
+		migrationIntent.TargetStoreID,
 		finalKey,
 		reader,
 		s.attachmentMaxBytes,
@@ -224,7 +229,9 @@ func (s *AgentNativeService) ExecuteAttachmentUploadOutbox(
 		!strings.EqualFold(
 			stored.SHA256,
 			migrationIntent.SHA256,
-		) {
+		) ||
+		stored.StoreID != migrationIntent.TargetStoreID ||
+		stored.StorageType != migrationIntent.TargetStorageType {
 		return ErrInvalidAttachment
 	}
 
@@ -251,6 +258,7 @@ func (s *AgentNativeService) ExecuteAttachmentUploadOutbox(
 						attachment,
 						stagingKey,
 						finalKey,
+						stored,
 					)
 				},
 			)
@@ -261,6 +269,7 @@ func (s *AgentNativeService) ExecuteAttachmentUploadOutbox(
 			return s.cleanupObsoleteAttachmentUpload(
 				ctx,
 				migrationIntent,
+				stored,
 			)
 		}
 		return err
@@ -276,8 +285,9 @@ func (s *AgentNativeService) finalizeAttachmentUploadTx(
 	expected models.TicketAttachment,
 	stagingKey string,
 	finalKey string,
+	stored *StoredAttachmentObject,
 ) error {
-	if tx == nil {
+	if tx == nil || stored == nil {
 		return ErrInvalidAttachment
 	}
 	var current models.TicketAttachment
@@ -297,7 +307,9 @@ func (s *AgentNativeService) finalizeAttachmentUploadTx(
 		return queryErr
 	}
 	if current.StorageType != "staging" {
-		if current.StoragePath == finalKey {
+		if current.StoragePath == finalKey &&
+			current.StorageStoreID == stored.StoreID &&
+			current.StorageVersionID == stored.VersionID {
 			return nil
 		}
 		return ErrInvalidAttachment
@@ -320,11 +332,11 @@ func (s *AgentNativeService) finalizeAttachmentUploadTx(
 			stagingKey,
 		).
 		Updates(map[string]any{
-			"storage_path": finalKey,
-			"storage_type": attachmentStorageType(
-				s.attachmentStorage,
-			),
-			"updated_at": now,
+			"storage_path":       finalKey,
+			"storage_type":       stored.StorageType,
+			"storage_store_id":   stored.StoreID,
+			"storage_version_id": stored.VersionID,
+			"updated_at":         now,
 		})
 	if update.Error != nil {
 		return update.Error
@@ -513,6 +525,7 @@ func (s *AgentNativeService) cancelArchivedAttachmentUploadTx(
 
 func newAttachmentUploadMigrationIntent(
 	attachment models.TicketAttachment,
+	storage AttachmentStorage,
 ) (attachmentUploadMigrationIntent, error) {
 	finalKey, err := attachmentFinalStorageKey(
 		attachment.TicketID,
@@ -522,12 +535,14 @@ func newAttachmentUploadMigrationIntent(
 		return attachmentUploadMigrationIntent{}, err
 	}
 	intent := attachmentUploadMigrationIntent{
-		AttachmentID: attachment.ID,
-		TicketID:     attachment.TicketID,
-		StagingKey:   attachmentStagingKey(attachment.FileName),
-		FinalKey:     finalKey,
-		FileSize:     attachment.FileSize,
-		SHA256:       strings.ToLower(strings.TrimSpace(attachment.Hash)),
+		AttachmentID:      attachment.ID,
+		TicketID:          attachment.TicketID,
+		StagingKey:        attachmentStagingKey(attachment.FileName),
+		FinalKey:          finalKey,
+		TargetStoreID:     attachmentStorageStoreID(storage),
+		TargetStorageType: attachmentStorageType(storage),
+		FileSize:          attachment.FileSize,
+		SHA256:            strings.ToLower(strings.TrimSpace(attachment.Hash)),
 	}
 	if err := validateAttachmentUploadMigrationIntent(
 		intent,
@@ -559,7 +574,10 @@ func validateAttachmentUploadMigrationIntent(
 		intent.TicketID == 0 ||
 		intent.FileSize <= 0 ||
 		!validAttachmentStagingKey(intent.StagingKey) ||
-		len(intent.SHA256) != 64 {
+		len(intent.SHA256) != 64 ||
+		!validAttachmentStoreID(intent.TargetStoreID) ||
+		intent.TargetStorageType == "" ||
+		intent.TargetStorageType == "managed" {
 		return ErrInvalidAttachment
 	}
 	if _, err := hex.DecodeString(intent.SHA256); err != nil {
@@ -595,7 +613,9 @@ func validateAttachmentUploadMigrationMatches(
 		return ErrInvalidAttachment
 	}
 	if alreadyStored {
-		if attachment.StoragePath != intent.FinalKey {
+		if attachment.StoragePath != intent.FinalKey ||
+			attachment.StorageStoreID != intent.TargetStoreID ||
+			attachment.StorageType != intent.TargetStorageType {
 			return ErrInvalidAttachment
 		}
 		return nil
@@ -677,6 +697,7 @@ func (s *AgentNativeService) loadAttachmentUploadMigrationIntentTx(
 func (s *AgentNativeService) cleanupObsoleteAttachmentUpload(
 	ctx context.Context,
 	intent attachmentUploadMigrationIntent,
+	stored *StoredAttachmentObject,
 ) error {
 	if err := validateAttachmentUploadMigrationIntent(
 		intent,
@@ -760,9 +781,23 @@ func (s *AgentNativeService) cleanupObsoleteAttachmentUpload(
 		return errAttachmentUploadStillReferenced
 	}
 	var cleanupErrors []error
-	if err := s.attachmentStorage.Delete(
+	reference := AttachmentStoredReference{
+		StorageType: intent.TargetStorageType,
+		StoreID:     intent.TargetStoreID,
+		Key:         intent.FinalKey,
+	}
+	if stored != nil {
+		if stored.StoreID != intent.TargetStoreID ||
+			stored.StorageType != intent.TargetStorageType ||
+			stored.Key != intent.FinalKey {
+			return ErrInvalidAttachment
+		}
+		reference.VersionID = stored.VersionID
+	}
+	if err := deleteAttachmentStoredObject(
 		cleanupContext,
-		intent.FinalKey,
+		s.attachmentStorage,
+		reference,
 	); err != nil {
 		cleanupErrors = append(
 			cleanupErrors,

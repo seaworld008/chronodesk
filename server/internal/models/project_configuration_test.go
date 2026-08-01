@@ -79,6 +79,29 @@ func TestTypedExpressionsAndActionsRejectExecutableEscapeHatches(t *testing.T) {
 	}
 }
 
+func TestConfigurationSnapshotBoundsPublishedIntakeArrays(t *testing.T) {
+	validID := "019fb344-fa16-7e13-9c5b-08eb95478098"
+	oversized := make([]string, MaxConfigurationSnapshotVersions+1)
+	for index := range oversized {
+		oversized[index] = validID
+	}
+	for _, snapshot := range []ConfigurationSnapshot{
+		{
+			RequestTypeVersionIDs: oversized,
+			WorkflowVersionIDs:    []string{validID},
+		},
+		{
+			RequestTypeVersionIDs: []string{validID},
+			WorkflowVersionIDs:    oversized,
+		},
+	} {
+		if err := snapshot.Validate(); err == nil ||
+			!strings.Contains(err.Error(), "maximum published version count") {
+			t.Fatalf("oversized configuration snapshot error = %v", err)
+		}
+	}
+}
+
 func TestIndustrySolutionPackageEd25519DetectsTamperingAndExports(t *testing.T) {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

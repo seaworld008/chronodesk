@@ -29,7 +29,7 @@ test.describe('我的跨项目工作台', () => {
     // are registered afterwards so Playwright evaluates these narrower routes
     // before that broad safety route.
     await authenticatePage(page)
-    await page.route('**/api/projects', async (route) => {
+    await page.route('**/api/projects?*', async (route) => {
       if (route.request().method() !== 'GET') {
         await route.fallback()
         return
@@ -91,8 +91,20 @@ test.describe('我的跨项目工作台', () => {
       })
     })
 
-    await page.getByRole('menuitem', {
-      name: '我的跨项目工作台',
+    const menu = page.getByRole('menu', { name: '主导航', exact: true })
+    const workbenchToggle = menu.getByRole('menuitem', {
+      name: '工作台',
+      exact: true,
+    })
+    if ((await workbenchToggle.getAttribute('aria-expanded')) !== 'true') {
+      await workbenchToggle.click()
+    }
+    await expect(workbenchToggle).toHaveAttribute('aria-expanded', 'true')
+    await menu.getByRole('group', {
+      name: '工作台导航',
+      exact: true,
+    }).getByRole('menuitem', {
+      name: '跨项目工作台',
       exact: true,
     }).click()
 

@@ -491,7 +491,7 @@ func validatePlatformRoleSchema(db *gorm.DB) error {
 		var invalidAuditRoles []string
 		if err := db.Table("admin_audit_logs").
 			Distinct("platform_role").
-			Where("platform_role IS NULL OR platform_role NOT IN ?", []string{
+			Where("platform_role IS NOT NULL AND platform_role NOT IN ?", []string{
 				string(models.PlatformRolePlatformAdmin),
 				string(models.PlatformRoleSecurityAuditor),
 				string(models.PlatformRoleEmergencyOperator),
@@ -508,7 +508,7 @@ func validatePlatformRoleSchema(db *gorm.DB) error {
 			)
 		}
 		if db.Dialector.Name() == "postgres" {
-			if err := validatePostgresPlatformRoleContract(
+			if err := validatePostgresAdminAuditRoleContract(
 				db,
 				"admin_audit_logs",
 				"chk_admin_audit_logs_platform_role",
@@ -516,6 +516,103 @@ func validatePlatformRoleSchema(db *gorm.DB) error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+func validatePostgresAdminAuditRoleContract(
+	db *gorm.DB,
+	tableName, constraintName string,
+) error {
+	type platformRoleColumnContract struct {
+		IsNullable    string
+		ColumnDefault *string
+	}
+	var column platformRoleColumnContract
+	if err := db.Raw(`
+		SELECT is_nullable, column_default
+		FROM information_schema.columns
+		WHERE table_schema = CURRENT_SCHEMA()
+		  AND table_name = ?
+		  AND column_name = 'platform_role'
+	`, tableName).Scan(&column).Error; err != nil {
+		return fmt.Errorf(
+			"read %s nullable platform_role contract: %w",
+			tableName,
+			err,
+		)
+	}
+	if column.IsNullable != "YES" || column.ColumnDefault != nil {
+		return fmt.Errorf(
+			"%s.platform_role must be nullable without a default",
+			tableName,
+		)
+	}
+	var checkContract struct {
+		Definition string
+		Validated  bool
+		NoInherit  bool
+	}
+	if err := db.Raw(`
+		SELECT
+			pg_get_constraintdef(c.oid) AS definition,
+			c.convalidated AS validated,
+			c.connoinherit AS no_inherit
+		FROM pg_constraint c
+		JOIN pg_class t ON t.oid = c.conrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		JOIN pg_attribute a
+		  ON a.attrelid = t.oid
+		 AND a.attname = 'platform_role'
+		WHERE n.nspname = CURRENT_SCHEMA()
+		  AND t.relname = ?
+		  AND c.conname = ?
+		  AND c.contype = 'c'
+		  AND c.conkey = ARRAY[a.attnum]::smallint[]
+	`, tableName, constraintName).Scan(&checkContract).Error; err != nil {
+		return fmt.Errorf(
+			"read %s nullable platform role check: %w",
+			tableName,
+			err,
+		)
+	}
+	if !checkContract.Validated ||
+		checkContract.NoInherit ||
+		!isExactNullableAuditPlatformRoleCheckDefinition(
+			checkContract.Definition,
+		) {
+		return fmt.Errorf(
+			"%s nullable platform role check has unexpected semantics",
+			tableName,
+		)
+	}
+	var indexCount int64
+	if err := db.Raw(`
+		SELECT COUNT(*)
+		FROM pg_index i
+		JOIN pg_class t ON t.oid = i.indrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		JOIN pg_attribute a
+		  ON a.attrelid = t.oid
+		 AND a.attnum = i.indkey[0]
+		WHERE n.nspname = CURRENT_SCHEMA()
+		  AND t.relname = ?
+		  AND i.indnatts = 1
+		  AND i.indnkeyatts = 1
+		  AND i.indisvalid
+		  AND i.indisready
+		  AND i.indpred IS NULL
+		  AND i.indexprs IS NULL
+		  AND a.attname = 'platform_role'
+	`, tableName).Scan(&indexCount).Error; err != nil {
+		return fmt.Errorf(
+			"read %s nullable platform role index: %w",
+			tableName,
+			err,
+		)
+	}
+	if indexCount == 0 {
+		return fmt.Errorf("%s.platform_role index is missing", tableName)
 	}
 	return nil
 }
@@ -656,6 +753,57 @@ func isExactPlatformRoleCheckDefinition(definition string) bool {
 		structure == "checkplatform_role=anyarray?,?,?,?"
 }
 
+func isExactNullableAuditPlatformRoleCheckDefinition(
+	definition string,
+) bool {
+	withoutCasts := postgresTextCastPattern.ReplaceAllString(
+		definition,
+		"",
+	)
+	canonical := strings.ToLower(withoutCasts)
+	canonical = strings.Map(func(character rune) rune {
+		switch character {
+		case ' ', '\t', '\r', '\n', '(', ')', '[', ']', '"':
+			return -1
+		default:
+			return character
+		}
+	}, canonical)
+	var values []string
+	literalPattern := regexp.MustCompile(`'([^']*)'`)
+	for _, match := range literalPattern.FindAllStringSubmatch(
+		canonical,
+		-1,
+	) {
+		values = append(values, match[1])
+	}
+	if len(values) != 4 {
+		return false
+	}
+	expected := map[string]struct{}{
+		string(models.PlatformRolePlatformAdmin):     {},
+		string(models.PlatformRoleSecurityAuditor):   {},
+		string(models.PlatformRoleEmergencyOperator): {},
+		string(models.PlatformRoleMember):            {},
+	}
+	for _, value := range values {
+		if _, ok := expected[value]; !ok {
+			return false
+		}
+		delete(expected, value)
+	}
+	if len(expected) != 0 {
+		return false
+	}
+	return strings.Contains(
+		canonical,
+		"platform_roleisnullorplatform_rolein",
+	) || strings.Contains(
+		canonical,
+		"platform_roleisnullorplatform_role=anyarray",
+	)
+}
+
 func isExactMemberPlatformRoleDefault(defaultValue string) bool {
 	normalized := strings.TrimSpace(defaultValue)
 	for strings.HasPrefix(normalized, "(") && strings.HasSuffix(normalized, ")") {
@@ -681,6 +829,51 @@ func migrateLegacyAdminAuditRoles(tx *gorm.DB) error {
 	if err != nil || !hasLegacyRole {
 		return err
 	}
+	if err := backfillLegacyAdminAuditPlatformRoles(tx); err != nil {
+		return err
+	}
+	if err := tx.Exec(
+		"ALTER TABLE admin_audit_logs DROP COLUMN role",
+	).Error; err != nil {
+		return fmt.Errorf("drop legacy admin_audit_logs.role: %w", err)
+	}
+	return nil
+}
+
+// backfillLegacyAdminAuditPlatformRoles projects the authoritative legacy
+// human role into the closed platform-role vocabulary without removing the
+// source column. Keeping projection and destruction separate allows the
+// ActorRef constraint to be installed before the final checkpointed cutover,
+// while the outer transaction still rolls every artifact back together.
+func backfillLegacyAdminAuditPlatformRoles(tx *gorm.DB) error {
+	if tx == nil {
+		return errors.New("database is required")
+	}
+	if !tx.Migrator().HasTable(&models.AdminAuditLog{}) {
+		return nil
+	}
+	hasLegacyRole, err := hasExactDatabaseColumn(
+		tx,
+		"admin_audit_logs",
+		"role",
+	)
+	if err != nil || !hasLegacyRole {
+		return err
+	}
+	hasPlatformRole, err := hasExactDatabaseColumn(
+		tx,
+		"admin_audit_logs",
+		"platform_role",
+	)
+	if err != nil {
+		return err
+	}
+	if !hasPlatformRole {
+		return errors.New(
+			"legacy admin audit platform-role backfill requires admin_audit_logs.platform_role",
+		)
+	}
+
 	var unsupported []string
 	if err := tx.Table("admin_audit_logs").
 		Distinct("role").
@@ -702,23 +895,65 @@ func migrateLegacyAdminAuditRoles(tx *gorm.DB) error {
 			strings.Join(unsupported, ", "),
 		)
 	}
+
+	humanPredicate := "1 = 1"
+	hasActorType, err := hasExactDatabaseColumn(
+		tx,
+		"admin_audit_logs",
+		"actor_type",
+	)
+	if err != nil {
+		return err
+	}
+	if hasActorType {
+		var invalidNonHumanRoles int64
+		if err := tx.Table("admin_audit_logs").
+			Where(
+				"actor_type IN ? AND role IS NOT NULL AND role <> ''",
+				[]string{
+					string(models.ActorTypeServicePrincipal),
+					string(models.ActorTypeSystem),
+				},
+			).
+			Count(&invalidNonHumanRoles).Error; err != nil {
+			return fmt.Errorf(
+				"inspect non-human legacy admin audit roles: %w",
+				err,
+			)
+		}
+		if invalidNonHumanRoles > 0 {
+			return fmt.Errorf(
+				"non-human admin audit actors retain %d legacy role value(s)",
+				invalidNonHumanRoles,
+			)
+		}
+		humanPredicate = "actor_type = 'human'"
+		if err := tx.Table("admin_audit_logs").
+			Where("actor_type IN ?", []string{
+				string(models.ActorTypeServicePrincipal),
+				string(models.ActorTypeSystem),
+			}).
+			Update("platform_role", nil).Error; err != nil {
+			return fmt.Errorf(
+				"clear non-human admin audit platform roles: %w",
+				err,
+			)
+		}
+	}
 	if err := tx.Table("admin_audit_logs").
+		Where(humanPredicate).
 		Where("role IN ?", []string{"admin", "superuser"}).
 		Update("platform_role", models.PlatformRolePlatformAdmin).Error; err != nil {
 		return fmt.Errorf("migrate administrator audit roles: %w", err)
 	}
 	if err := tx.Table("admin_audit_logs").
+		Where(humanPredicate).
 		Where(
 			"role IS NULL OR role = '' OR role IN ?",
 			[]string{"supervisor", "agent", "customer", "user"},
 		).
 		Update("platform_role", models.PlatformRoleMember).Error; err != nil {
 		return fmt.Errorf("migrate member audit roles: %w", err)
-	}
-	if err := tx.Exec(
-		"ALTER TABLE admin_audit_logs DROP COLUMN role",
-	).Error; err != nil {
-		return fmt.Errorf("drop legacy admin_audit_logs.role: %w", err)
 	}
 	return nil
 }

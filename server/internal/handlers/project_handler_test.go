@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -61,6 +63,161 @@ func TestPlatformProjectSummaryNeverExposesTrustedScopeOrProjectRole(
 	} {
 		if _, ok := fields[forbidden]; ok {
 			t.Errorf("platform project summary exposes %q: %s", forbidden, payload)
+		}
+	}
+}
+
+func TestProjectQueueResponseNeverExposesPersistenceRelations(t *testing.T) {
+	teamPublicID := "019fb344-fa16-7e13-9c5b-08eb95478099"
+	teamName := "一线支持"
+	payload, err := json.Marshal(projectQueueResponse{
+		PublicID:     "019fb344-fa16-7e13-9c5b-08eb95478098",
+		TeamPublicID: &teamPublicID,
+		TeamName:     &teamName,
+		Key:          models.QueueKey("support"),
+		Name:         "技术支持",
+		Description:  "默认支持队列",
+		Status:       models.QueueStatusActive,
+		IsDefault:    true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"public_id",
+		"created_at",
+		"updated_at",
+		"team_public_id",
+		"team_name",
+		"key",
+		"name",
+		"description",
+		"status",
+		"is_default",
+	} {
+		if _, ok := fields[required]; !ok {
+			t.Errorf("project queue response is missing %q: %s", required, payload)
+		}
+	}
+	for _, forbidden := range []string{
+		"id",
+		"project",
+		"project_id",
+		"team",
+		"team_id",
+	} {
+		if _, ok := fields[forbidden]; ok {
+			t.Errorf("project queue response exposes %q: %s", forbidden, payload)
+		}
+	}
+}
+
+func TestProjectDirectoryAuthorizationPrecedesQueryValidation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewProjectHandler(nil)
+	router := gin.New()
+	router.GET("/memberships", func(c *gin.Context) {
+		c.Set(projectAccessContextKey, services.ProjectAccess{
+			Role: models.ProjectRoleObserver,
+		})
+		handler.ListMemberships(c)
+	})
+	router.GET("/queues", handler.ListQueues)
+
+	memberships := httptest.NewRecorder()
+	router.ServeHTTP(
+		memberships,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/memberships?page_size=101",
+			nil,
+		),
+	)
+	if memberships.Code != http.StatusForbidden {
+		t.Fatalf(
+			"membership status = %d, body=%s",
+			memberships.Code,
+			memberships.Body.String(),
+		)
+	}
+	queues := httptest.NewRecorder()
+	router.ServeHTTP(
+		queues,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/queues?page_size=101",
+			nil,
+		),
+	)
+	if queues.Code != http.StatusForbidden {
+		t.Fatalf(
+			"queue status = %d, body=%s",
+			queues.Code,
+			queues.Body.String(),
+		)
+	}
+}
+
+func TestAuthorizedProjectListUsesStrictBoundedDirectoryContract(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service, project, user, _ := projectHandlerTestService(t)
+	handler := NewProjectHandler(service)
+	router := gin.New()
+	router.GET("/projects", func(c *gin.Context) {
+		c.Set("user_id", user.ID)
+		handler.List(c)
+	})
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(
+		response,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/projects?page=1&page_size=25&sort_by=name&sort_order=asc&search=Oper",
+			nil,
+		),
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Data services.DirectoryPage[services.ProjectAccess] `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Data.Total != 1 || body.Data.TotalPages != 1 ||
+		len(body.Data.Items) != 1 ||
+		body.Data.Items[0].Project.PublicID != project.PublicID {
+		t.Fatalf("unexpected authorized project page: %+v", body.Data)
+	}
+
+	for _, query := range []string{
+		"?page=0",
+		"?page_size=101",
+		"?sort_by=id",
+		"?sort_order=sideways",
+		"?unknown=true",
+		"?search=first&search=second",
+		"?page=%ZZ",
+		"?search=%FF",
+	} {
+		invalid := httptest.NewRecorder()
+		router.ServeHTTP(
+			invalid,
+			httptest.NewRequest(http.MethodGet, "/projects"+query, nil),
+		)
+		if invalid.Code != http.StatusBadRequest {
+			t.Fatalf(
+				"query %q status = %d, want 400; body=%s",
+				query,
+				invalid.Code,
+				invalid.Body.String(),
+			)
 		}
 	}
 }
@@ -470,6 +627,125 @@ func TestProjectWriteHandlersRejectUnknownAndTrailingJSON(t *testing.T) {
 	}
 }
 
+func TestProjectMembershipHandlersRequireStrictExpectedVersion(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewProjectHandler(nil)
+
+	for _, testCase := range []struct {
+		name       string
+		payload    string
+		wantStatus int
+	}{
+		{
+			name:       "missing",
+			payload:    `{"user_id":42,"role":"requester"}`,
+			wantStatus: http.StatusPreconditionRequired,
+		},
+		{
+			name:       "null",
+			payload:    `{"user_id":42,"role":"requester","expected_version":null}`,
+			wantStatus: http.StatusPreconditionRequired,
+		},
+		{
+			name:       "negative",
+			payload:    `{"user_id":42,"role":"requester","expected_version":-1}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "fractional",
+			payload:    `{"user_id":42,"role":"requester","expected_version":1.5}`,
+			wantStatus: http.StatusBadRequest,
+		},
+	} {
+		t.Run("upsert_"+testCase.name, func(t *testing.T) {
+			router := gin.New()
+			router.POST(
+				"/memberships",
+				projectAdminAccessForStrictJSON,
+				handler.UpsertMembership,
+			)
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/memberships",
+				bytes.NewBufferString(testCase.payload),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(response, request)
+			if response.Code != testCase.wantStatus {
+				t.Fatalf(
+					"status = %d, want %d; body=%s",
+					response.Code,
+					testCase.wantStatus,
+					response.Body.String(),
+				)
+			}
+		})
+	}
+
+	for _, testCase := range []struct {
+		name       string
+		query      string
+		wantStatus int
+	}{
+		{
+			name:       "missing",
+			wantStatus: http.StatusPreconditionRequired,
+		},
+		{
+			name:       "empty",
+			query:      "?expected_version=",
+			wantStatus: http.StatusPreconditionRequired,
+		},
+		{
+			name:       "negative",
+			query:      "?expected_version=-1",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "non_numeric",
+			query:      "?expected_version=latest",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "duplicate",
+			query:      "?expected_version=1&expected_version=2",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "unknown",
+			query:      "?expected_version=1&force=true",
+			wantStatus: http.StatusBadRequest,
+		},
+	} {
+		t.Run("deactivate_"+testCase.name, func(t *testing.T) {
+			router := gin.New()
+			router.DELETE(
+				"/memberships/:userID",
+				projectAdminAccessForStrictJSON,
+				handler.DeactivateMembership,
+			)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(
+				response,
+				httptest.NewRequest(
+					http.MethodDelete,
+					"/memberships/42"+testCase.query,
+					nil,
+				),
+			)
+			if response.Code != testCase.wantStatus {
+				t.Fatalf(
+					"status = %d, want %d; body=%s",
+					response.Code,
+					testCase.wantStatus,
+					response.Body.String(),
+				)
+			}
+		})
+	}
+}
+
 func TestProjectListReturnsEmptySuccessWithoutMembership(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	service, _, _, db := projectHandlerTestService(t)
@@ -496,14 +772,19 @@ func TestProjectListReturnsEmptySuccessWithoutMembership(t *testing.T) {
 		t.Fatalf("status = %d; body=%s", response.Code, response.Body.String())
 	}
 	var body struct {
-		Code int               `json:"code"`
-		Msg  string            `json:"msg"`
-		Data []json.RawMessage `json:"data"`
+		Code int                                     `json:"code"`
+		Msg  string                                  `json:"msg"`
+		Data services.DirectoryPage[json.RawMessage] `json:"data"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Code != 0 || body.Msg == "" || len(body.Data) != 0 {
+	if body.Code != 0 || body.Msg == "" ||
+		body.Data.Page != 1 ||
+		body.Data.PageSize != defaultDirectoryPageSize ||
+		body.Data.Total != 0 ||
+		body.Data.TotalPages != 0 ||
+		len(body.Data.Items) != 0 {
 		t.Fatalf("project list response = %+v", body)
 	}
 }
@@ -543,17 +824,29 @@ func TestPlatformProjectListReturnsClosedInventoryWithoutMembership(
 		)
 	}
 	var body struct {
-		Code int                          `json:"code"`
-		Msg  string                       `json:"msg"`
-		Data []map[string]json.RawMessage `json:"data"`
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			Items      []map[string]json.RawMessage `json:"items"`
+			Total      int64                        `json:"total"`
+			Page       int                          `json:"page"`
+			PageSize   int                          `json:"page_size"`
+			TotalPages int                          `json:"total_pages"`
+		} `json:"data"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Code != 0 || body.Msg == "" || len(body.Data) != 2 {
+	if body.Code != 0 ||
+		body.Msg == "" ||
+		len(body.Data.Items) != 2 ||
+		body.Data.Total != 2 ||
+		body.Data.Page != 1 ||
+		body.Data.PageSize != 25 ||
+		body.Data.TotalPages != 1 {
 		t.Fatalf("platform project list response = %+v", body)
 	}
-	for _, item := range body.Data {
+	for _, item := range body.Data.Items {
 		for _, required := range []string{
 			"public_id",
 			"key",
@@ -683,7 +976,7 @@ func TestPlatformProjectListRejectsUndocumentedQueryParameters(t *testing.T) {
 		response,
 		httptest.NewRequest(
 			http.MethodGet,
-			"/platform/projects?page=1",
+			"/platform/projects?unknown=1",
 			nil,
 		),
 	)
@@ -693,6 +986,19 @@ func TestPlatformProjectListRejectsUndocumentedQueryParameters(t *testing.T) {
 			response.Code,
 			response.Body.String(),
 		)
+	}
+}
+
+func TestProjectGovernanceParsersRejectOffsetOverflow(t *testing.T) {
+	query := url.Values{
+		"page":      {strconv.Itoa(math.MaxInt)},
+		"page_size": {"100"},
+	}
+	if _, err := parsePlatformProjectListQuery(query); err == nil {
+		t.Fatal("platform project parser accepted an overflowing page offset")
+	}
+	if _, err := parseProjectUserSearchQuery(query); err == nil {
+		t.Fatal("project user parser accepted an overflowing page offset")
 	}
 }
 
@@ -1260,13 +1566,33 @@ func TestProjectMembershipHandlerCreatesExplicitGrant(t *testing.T) {
 		bytes.NewBufferString(
 			`{"user_id":`+
 				strconv.FormatUint(uint64(target.ID), 10)+
-				`,"role":"requester"}`,
+				`,"role":"requester","knowledge_contributor":true,"expected_version":0}`,
 		),
 	)
 	request.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	staleResponse := httptest.NewRecorder()
+	staleRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/api/projects/OPS/memberships",
+		bytes.NewBufferString(
+			`{"user_id":`+
+				strconv.FormatUint(uint64(target.ID), 10)+
+				`,"role":"observer","knowledge_contributor":false,"expected_version":0}`,
+		),
+	)
+	staleRequest.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(staleResponse, staleRequest)
+	if staleResponse.Code != http.StatusConflict ||
+		!strings.Contains(staleResponse.Body.String(), "刷新成员列表后重试") {
+		t.Fatalf(
+			"stale status = %d, body = %s",
+			staleResponse.Code,
+			staleResponse.Body.String(),
+		)
 	}
 	var membership models.ProjectMembership
 	if err := db.Where(
@@ -1278,6 +1604,7 @@ func TestProjectMembershipHandlerCreatesExplicitGrant(t *testing.T) {
 	}
 	if !membership.IsActive ||
 		membership.Role != models.ProjectRoleRequester ||
+		!membership.KnowledgeContributor ||
 		membership.Version != 1 {
 		t.Fatalf("unexpected project membership: %+v", membership)
 	}
@@ -1329,11 +1656,30 @@ func TestProjectMembershipDeactivateRouteUsesCommandOwnedTransaction(
 		handler.DeactivateMembership,
 	)
 
+	staleResponse := httptest.NewRecorder()
+	staleRequest := httptest.NewRequest(
+		http.MethodDelete,
+		"/api/projects/OPS/memberships/"+
+			strconv.FormatUint(uint64(target.ID), 10)+
+			"?expected_version=2",
+		nil,
+	)
+	router.ServeHTTP(staleResponse, staleRequest)
+	if staleResponse.Code != http.StatusConflict ||
+		!strings.Contains(staleResponse.Body.String(), "刷新成员列表后重试") {
+		t.Fatalf(
+			"stale status = %d, body = %s",
+			staleResponse.Code,
+			staleResponse.Body.String(),
+		)
+	}
+
 	response := httptest.NewRecorder()
 	request := httptest.NewRequest(
 		http.MethodDelete,
 		"/api/projects/OPS/memberships/"+
-			strconv.FormatUint(uint64(target.ID), 10),
+			strconv.FormatUint(uint64(target.ID), 10)+
+			"?expected_version=1",
 		nil,
 	)
 	router.ServeHTTP(response, request)

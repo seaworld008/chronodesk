@@ -736,7 +736,15 @@ type ConfigurationSnapshot struct {
 	RiskPolicies          []RiskPolicyDefinition     `json:"risk_policies,omitempty"`
 }
 
+const MaxConfigurationSnapshotVersions = 100
+
 func (snapshot ConfigurationSnapshot) Validate() error {
+	if len(snapshot.RequestTypeVersionIDs) > MaxConfigurationSnapshotVersions ||
+		len(snapshot.WorkflowVersionIDs) > MaxConfigurationSnapshotVersions {
+		return errors.New(
+			"configuration snapshot exceeds the maximum published version count",
+		)
+	}
 	if err := validateUUIDReferences(snapshot.RequestTypeVersionIDs, "request type"); err != nil {
 		return err
 	}

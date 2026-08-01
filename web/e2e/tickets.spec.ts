@@ -51,7 +51,7 @@ test.describe('Ticket Management', () => {
             exact: true,
         });
         const ticketInfoHeader = table.getByRole('columnheader', {
-            name: /^“工单信息”/u,
+            name: /^工单信息/u,
         });
         await expect(ticketInfoHeader).toBeVisible({ timeout: 10000 });
         const search = page.getByPlaceholder('搜索工单');
@@ -110,14 +110,22 @@ test.describe('Navigation', () => {
     });
 
     test('should navigate to users page', async ({ page }) => {
+        const governance = page.getByRole('menuitem', { name: /^治理中心/ });
+        if ((await governance.getAttribute('aria-expanded')) !== 'true') {
+            await governance.click();
+        }
         await page
-            .getByRole('menuitem', { name: '平台用户管理' })
+            .getByRole('menuitem', { name: '平台身份与访问' })
             .click();
         await expect(page).toHaveURL(/#\/users/);
     });
 
     test('should navigate to system settings', async ({ page }) => {
-        await page.getByRole('menuitem', { name: '系统设置' }).click();
-        await expect(page).toHaveURL(/#\/system-settings/);
+        const settings = page.getByRole('menuitem', { name: /^系统设置/ });
+        if ((await settings.getAttribute('aria-expanded')) !== 'true') {
+            await settings.click();
+        }
+        await page.getByRole('menuitem', { name: '邮件外发' }).click();
+        await expect(page).toHaveURL(/#\/system-settings\/email/);
     });
 });

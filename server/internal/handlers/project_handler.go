@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
@@ -33,6 +37,19 @@ type ProjectHandler struct {
 	response *middleware.ResponseHelper
 }
 
+type projectQueueResponse struct {
+	PublicID     string             `json:"public_id"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+	TeamPublicID *string            `json:"team_public_id,omitempty"`
+	TeamName     *string            `json:"team_name,omitempty"`
+	Key          models.QueueKey    `json:"key"`
+	Name         string             `json:"name"`
+	Description  string             `json:"description"`
+	Status       models.QueueStatus `json:"status"`
+	IsDefault    bool               `json:"is_default"`
+}
+
 func NewProjectHandler(service *services.ProjectService) *ProjectHandler {
 	return &ProjectHandler{
 		service:  service,
@@ -46,9 +63,34 @@ func (handler *ProjectHandler) List(c *gin.Context) {
 		return
 	}
 	userID := c.GetUint("user_id")
-	projects, err := handler.service.ListHumanProjects(
+	query, err := parseDirectoryListQuery(
+		c.Request.URL.RawQuery,
+		directoryListQuerySpec{
+			DefaultSortBy:    "name",
+			DefaultSortOrder: "asc",
+			SortFields: map[string]struct{}{
+				"name":       {},
+				"key":        {},
+				"created_at": {},
+			},
+			FilterFields: map[string]struct{}{"search": {}},
+		},
+	)
+	if err != nil {
+		handler.response.BadRequest(c, "授权项目查询参数无效")
+		return
+	}
+	search, _ := query.value("search")
+	projects, err := handler.service.ListHumanProjectPage(
 		c.Request.Context(),
 		userID,
+		services.HumanProjectListRequest{
+			Page:      query.Page,
+			PageSize:  query.PageSize,
+			Search:    search,
+			SortBy:    query.SortBy,
+			SortOrder: query.SortOrder,
+		},
 	)
 	if err != nil {
 		writeProjectError(c, handler.response, err)
@@ -72,12 +114,72 @@ func (handler *ProjectHandler) ListQueues(c *gin.Context) {
 		handler.response.Forbidden(c, "未解析可信项目范围")
 		return
 	}
-	queues, err := handler.service.ListQueues(c.Request.Context(), access.Scope)
+	query, err := parseDirectoryListQuery(
+		c.Request.URL.RawQuery,
+		directoryListQuerySpec{
+			DefaultSortBy:    "is_default",
+			DefaultSortOrder: "desc",
+			SortFields: map[string]struct{}{
+				"created_at": {},
+				"updated_at": {},
+				"name":       {},
+				"key":        {},
+				"is_default": {},
+			},
+		},
+	)
+	if err != nil {
+		handler.response.BadRequest(c, "项目队列查询参数无效")
+		return
+	}
+	queues, err := handler.service.ListQueuePage(
+		c.Request.Context(),
+		access.Scope,
+		services.DirectoryPageRequest{
+			Page:      query.Page,
+			PageSize:  query.PageSize,
+			SortBy:    query.SortBy,
+			SortOrder: query.SortOrder,
+		},
+	)
 	if err != nil {
 		writeProjectError(c, handler.response, err)
 		return
 	}
-	handler.response.Success(c, queues, "获取项目队列成功")
+	items := make([]projectQueueResponse, 0, len(queues.Items))
+	for _, queue := range queues.Items {
+		var teamPublicID *string
+		var teamName *string
+		if queue.Team != nil && queue.Team.PublicID != "" {
+			publicID := queue.Team.PublicID
+			name := queue.Team.Name
+			teamPublicID = &publicID
+			teamName = &name
+		}
+		items = append(items, projectQueueResponse{
+			PublicID:     queue.PublicID,
+			CreatedAt:    queue.CreatedAt,
+			UpdatedAt:    queue.UpdatedAt,
+			TeamPublicID: teamPublicID,
+			TeamName:     teamName,
+			Key:          queue.Key,
+			Name:         queue.Name,
+			Description:  queue.Description,
+			Status:       queue.Status,
+			IsDefault:    queue.IsDefault,
+		})
+	}
+	handler.response.Success(
+		c,
+		services.DirectoryPage[projectQueueResponse]{
+			Items:      items,
+			Total:      queues.Total,
+			Page:       queues.Page,
+			PageSize:   queues.PageSize,
+			TotalPages: queues.TotalPages,
+		},
+		"获取项目队列成功",
+	)
 }
 
 func (handler *ProjectHandler) ListMemberships(c *gin.Context) {
@@ -91,9 +193,33 @@ func (handler *ProjectHandler) ListMemberships(c *gin.Context) {
 		handler.response.Forbidden(c, "仅项目管理员或经理可查看项目成员")
 		return
 	}
-	memberships, err := handler.service.ListHumanMemberships(
+	query, err := parseDirectoryListQuery(
+		c.Request.URL.RawQuery,
+		directoryListQuerySpec{
+			DefaultSortBy:    "is_active",
+			DefaultSortOrder: "desc",
+			SortFields: map[string]struct{}{
+				"created_at": {},
+				"updated_at": {},
+				"role":       {},
+				"is_active":  {},
+				"user_id":    {},
+			},
+		},
+	)
+	if err != nil {
+		handler.response.BadRequest(c, "项目成员查询参数无效")
+		return
+	}
+	memberships, err := handler.service.ListHumanMembershipPage(
 		c.Request.Context(),
 		access.Scope,
+		services.DirectoryPageRequest{
+			Page:      query.Page,
+			PageSize:  query.PageSize,
+			SortBy:    query.SortBy,
+			SortOrder: query.SortOrder,
+		},
 	)
 	if err != nil {
 		writeProjectError(c, handler.response, err)
@@ -102,9 +228,38 @@ func (handler *ProjectHandler) ListMemberships(c *gin.Context) {
 	handler.response.Success(c, memberships, "获取项目成员成功")
 }
 
+func (handler *ProjectHandler) SearchMembershipCandidates(c *gin.Context) {
+	access, ok := ProjectAccessFromGin(c)
+	if !ok {
+		handler.response.Forbidden(c, "未解析可信项目范围")
+		return
+	}
+	if access.Role != models.ProjectRoleAdmin {
+		handler.response.Forbidden(c, "仅项目管理员可搜索成员候选人")
+		return
+	}
+	request, err := parseProjectUserSearchQuery(c.Request.URL.Query())
+	if err != nil {
+		handler.response.BadRequest(c, "项目成员候选查询参数无效")
+		return
+	}
+	users, err := handler.service.SearchHumanMembershipCandidates(
+		c.Request.Context(),
+		access.Scope,
+		request,
+	)
+	if err != nil {
+		writeProjectError(c, handler.response, err)
+		return
+	}
+	handler.response.Success(c, users, "获取项目成员候选人成功")
+}
+
 type upsertProjectMembershipRequest struct {
-	UserID uint               `json:"user_id" binding:"required"`
-	Role   models.ProjectRole `json:"role" binding:"required"`
+	UserID               uint               `json:"user_id" binding:"required"`
+	Role                 models.ProjectRole `json:"role" binding:"required"`
+	KnowledgeContributor *bool              `json:"knowledge_contributor"`
+	ExpectedVersion      *uint64            `json:"expected_version"`
 }
 
 func (handler *ProjectHandler) UpsertMembership(c *gin.Context) {
@@ -123,12 +278,22 @@ func (handler *ProjectHandler) UpsertMembership(c *gin.Context) {
 		handler.response.BadRequest(c, "项目成员参数无效")
 		return
 	}
+	if request.ExpectedVersion == nil {
+		handler.response.Error(
+			c,
+			http.StatusPreconditionRequired,
+			"缺少成员版本，请刷新成员列表后重试",
+		)
+		return
+	}
 	membership, err := handler.service.UpsertHumanMembership(
 		c.Request.Context(),
 		access.Scope,
 		services.UpsertProjectMembershipInput{
-			UserID: request.UserID,
-			Role:   request.Role,
+			UserID:               request.UserID,
+			Role:                 request.Role,
+			KnowledgeContributor: request.KnowledgeContributor,
+			ExpectedVersion:      *request.ExpectedVersion,
 		},
 	)
 	if err != nil {
@@ -153,10 +318,39 @@ func (handler *ProjectHandler) DeactivateMembership(c *gin.Context) {
 		handler.response.BadRequest(c, "用户 ID 无效")
 		return
 	}
+	query := c.Request.URL.Query()
+	if err := requireExactProjectQueryKeys(
+		query,
+		"expected_version",
+	); err != nil {
+		handler.response.BadRequest(c, "成员版本参数无效")
+		return
+	}
+	expectedVersionValues, exists := query["expected_version"]
+	if !exists ||
+		len(expectedVersionValues) != 1 ||
+		strings.TrimSpace(expectedVersionValues[0]) == "" {
+		handler.response.Error(
+			c,
+			http.StatusPreconditionRequired,
+			"缺少成员版本，请刷新成员列表后重试",
+		)
+		return
+	}
+	expectedVersion, err := strconv.ParseUint(
+		expectedVersionValues[0],
+		10,
+		64,
+	)
+	if err != nil {
+		handler.response.BadRequest(c, "成员版本参数无效")
+		return
+	}
 	membership, err := handler.service.DeactivateHumanMembership(
 		c.Request.Context(),
 		access.Scope,
 		uint(userID),
+		expectedVersion,
 	)
 	if err != nil {
 		writeProjectError(c, handler.response, err)
@@ -166,13 +360,13 @@ func (handler *ProjectHandler) DeactivateMembership(c *gin.Context) {
 }
 
 type createProjectRequest struct {
-	OrganizationID   uint   `json:"organization_id" binding:"required"`
-	BusinessUnitID   uint   `json:"business_unit_id" binding:"required"`
-	Key              string `json:"key" binding:"required"`
-	Name             string `json:"name" binding:"required,max=120"`
-	Description      string `json:"description" binding:"max=500"`
-	DefaultQueueKey  string `json:"default_queue_key"`
-	DefaultQueueName string `json:"default_queue_name"`
+	BusinessUnitPublicID    string `json:"business_unit_public_id" binding:"required"`
+	Key                     string `json:"key" binding:"required"`
+	Name                    string `json:"name" binding:"required,max=120"`
+	Description             string `json:"description" binding:"max=500"`
+	InitialAdministratorIDs []uint `json:"initial_project_admin_user_ids" binding:"required,min=1,max=100,dive,gt=0"`
+	DefaultQueueKey         string `json:"default_queue_key" binding:"required"`
+	DefaultQueueName        string `json:"default_queue_name" binding:"required,max=120"`
 }
 
 // platformProjectSummary keeps the existing command-handler helper private
@@ -184,25 +378,35 @@ func newPlatformProjectSummary(
 ) platformProjectSummary {
 	return platformProjectSummary{
 		PublicID:    project.PublicID,
+		CreatedAt:   project.CreatedAt,
+		UpdatedAt:   project.UpdatedAt,
 		Key:         project.Key,
 		Name:        project.Name,
 		Description: project.Description,
 		Status:      project.Status,
+		BusinessUnit: services.PlatformBusinessUnitSummary{
+			PublicID:    project.BusinessUnit.PublicID,
+			Key:         project.BusinessUnit.Key,
+			Name:        project.BusinessUnit.Name,
+			Description: project.BusinessUnit.Description,
+		},
 	}
 }
 
 func (handler *ProjectHandler) ListPlatform(c *gin.Context) {
+	request, err := parsePlatformProjectListQuery(c.Request.URL.Query())
+	if err != nil {
+		handler.response.BadRequest(c, "平台项目查询参数无效")
+		return
+	}
 	if handler.service == nil {
 		handler.response.InternalServerError(c, "项目服务不可用")
 		return
 	}
-	if len(c.Request.URL.Query()) != 0 {
-		handler.response.BadRequest(c, "平台项目查询参数无效")
-		return
-	}
-	projects, err := handler.service.ListPlatformProjects(
+	projects, err := handler.service.ListPlatformProjectPage(
 		c.Request.Context(),
 		c.GetUint("user_id"),
+		request,
 	)
 	if err != nil {
 		writeProjectError(c, handler.response, err)
@@ -211,23 +415,81 @@ func (handler *ProjectHandler) ListPlatform(c *gin.Context) {
 	handler.response.Success(c, projects, "获取平台项目成功")
 }
 
+func (handler *ProjectHandler) CreationContext(c *gin.Context) {
+	request, err := parseProjectCreationContextQuery(c.Request.URL.Query())
+	if err != nil {
+		handler.response.BadRequest(c, "项目创建上下文查询参数无效")
+		return
+	}
+	if handler.service == nil {
+		handler.response.InternalServerError(c, "项目服务不可用")
+		return
+	}
+	options, err := handler.service.GetProjectCreationContext(
+		c.Request.Context(),
+		c.GetUint("user_id"),
+		request,
+	)
+	if err != nil {
+		writeProjectError(c, handler.response, err)
+		return
+	}
+	handler.response.Success(c, options, "获取项目创建上下文成功")
+}
+
+func (handler *ProjectHandler) ListPlatformBusinessUnits(c *gin.Context) {
+	request, err := parsePlatformBusinessUnitSearchQuery(
+		c.Request.URL.Query(),
+	)
+	if err != nil {
+		handler.response.BadRequest(c, "平台业务单元查询参数无效")
+		return
+	}
+	if handler.service == nil {
+		handler.response.InternalServerError(c, "项目服务不可用")
+		return
+	}
+	units, err := handler.service.ListPlatformProjectBusinessUnits(
+		c.Request.Context(),
+		c.GetUint("user_id"),
+		request,
+	)
+	if err != nil {
+		writeProjectError(c, handler.response, err)
+		return
+	}
+	handler.response.Success(c, units, "获取平台业务单元成功")
+}
+
 func (handler *ProjectHandler) Create(c *gin.Context) {
 	var request createProjectRequest
 	if err := decodeStrictProjectJSON(c, &request); err != nil ||
-		models.ValidateProjectKey(request.Key) != nil {
+		models.ValidateProjectKey(request.Key) != nil ||
+		!canonicalProjectPublicID(request.BusinessUnitPublicID) ||
+		!uniquePositiveUserIDs(request.InitialAdministratorIDs) ||
+		models.ValidateQueueKey(
+			strings.TrimSpace(request.DefaultQueueKey),
+		) != nil ||
+		strings.TrimSpace(request.DefaultQueueName) == "" {
 		handler.response.BadRequest(c, "项目参数无效")
+		return
+	}
+	if handler.service == nil {
+		handler.response.InternalServerError(c, "项目服务不可用")
 		return
 	}
 	project, err := handler.service.CreateProject(
 		c.Request.Context(),
 		services.CreateProjectInput{
-			OrganizationID:   request.OrganizationID,
-			BusinessUnitID:   request.BusinessUnitID,
-			Key:              request.Key,
-			Name:             request.Name,
-			Description:      request.Description,
-			AdministratorID:  c.GetUint("user_id"),
-			DefaultQueueKey:  strings.TrimSpace(request.DefaultQueueKey),
+			ActorUserID:             c.GetUint("user_id"),
+			BusinessUnitPublicID:    request.BusinessUnitPublicID,
+			Key:                     request.Key,
+			Name:                    request.Name,
+			Description:             request.Description,
+			InitialAdministratorIDs: request.InitialAdministratorIDs,
+			DefaultQueueKey: strings.TrimSpace(
+				request.DefaultQueueKey,
+			),
 			DefaultQueueName: request.DefaultQueueName,
 		},
 	)
@@ -237,7 +499,7 @@ func (handler *ProjectHandler) Create(c *gin.Context) {
 	}
 	handler.response.Created(
 		c,
-		newPlatformProjectSummary(project.Project),
+		newPlatformProjectSummary(*project),
 		"项目创建成功",
 	)
 }
@@ -293,6 +555,295 @@ func decodeStrictProjectJSON(c *gin.Context, target interface{}) error {
 		return err
 	}
 	return binding.Validator.ValidateStruct(target)
+}
+
+func parsePlatformProjectListQuery(
+	query url.Values,
+) (services.PlatformProjectListRequest, error) {
+	if err := requireExactProjectQueryKeys(
+		query,
+		"page",
+		"page_size",
+		"search",
+		"status",
+		"business_unit_public_id",
+		"order_by",
+		"order",
+	); err != nil {
+		return services.PlatformProjectListRequest{}, err
+	}
+	page, err := positiveProjectQueryInteger(query, "page", 1, 0)
+	if err != nil {
+		return services.PlatformProjectListRequest{}, err
+	}
+	pageSize, err := positiveProjectQueryInteger(
+		query,
+		"page_size",
+		25,
+		100,
+	)
+	if err != nil {
+		return services.PlatformProjectListRequest{}, err
+	}
+	if page > math.MaxInt/pageSize {
+		return services.PlatformProjectListRequest{}, errors.New(
+			"project page offset overflows",
+		)
+	}
+	search, err := singleProjectQueryValue(query, "search", "")
+	if err != nil || utf8.RuneCountInString(strings.TrimSpace(search)) > 100 {
+		return services.PlatformProjectListRequest{}, errors.New(
+			"invalid project search",
+		)
+	}
+	statusValue, err := singleProjectQueryValue(query, "status", "")
+	if err != nil {
+		return services.PlatformProjectListRequest{}, err
+	}
+	var status *models.ProjectStatus
+	if statusValue != "" {
+		parsed := models.ProjectStatus(statusValue)
+		if parsed != models.ProjectStatusActive &&
+			parsed != models.ProjectStatusArchived {
+			return services.PlatformProjectListRequest{}, errors.New(
+				"invalid project status",
+			)
+		}
+		status = &parsed
+	}
+	businessUnitPublicID, err := singleProjectQueryValue(
+		query,
+		"business_unit_public_id",
+		"",
+	)
+	if err != nil ||
+		(businessUnitPublicID != "" &&
+			!canonicalProjectPublicID(businessUnitPublicID)) {
+		return services.PlatformProjectListRequest{}, errors.New(
+			"invalid business unit public id",
+		)
+	}
+	orderBy, err := singleProjectQueryValue(query, "order_by", "name")
+	if err != nil {
+		return services.PlatformProjectListRequest{}, err
+	}
+	switch orderBy {
+	case "name", "key", "status", "business_unit", "created_at", "updated_at":
+	default:
+		return services.PlatformProjectListRequest{}, errors.New(
+			"invalid project order field",
+		)
+	}
+	order, err := singleProjectQueryValue(query, "order", "asc")
+	if err != nil || (order != "asc" && order != "desc") {
+		return services.PlatformProjectListRequest{}, errors.New(
+			"invalid project order",
+		)
+	}
+	return services.PlatformProjectListRequest{
+		Page:                 page,
+		PageSize:             pageSize,
+		Search:               strings.TrimSpace(search),
+		Status:               status,
+		BusinessUnitPublicID: businessUnitPublicID,
+		OrderBy:              orderBy,
+		Order:                order,
+	}, nil
+}
+
+func parseProjectUserSearchQuery(
+	query url.Values,
+) (services.ProjectUserSearchRequest, error) {
+	if err := requireExactProjectQueryKeys(
+		query,
+		"page",
+		"page_size",
+		"search",
+	); err != nil {
+		return services.ProjectUserSearchRequest{}, err
+	}
+	page, err := positiveProjectQueryInteger(query, "page", 1, 0)
+	if err != nil {
+		return services.ProjectUserSearchRequest{}, err
+	}
+	pageSize, err := positiveProjectQueryInteger(
+		query,
+		"page_size",
+		25,
+		100,
+	)
+	if err != nil {
+		return services.ProjectUserSearchRequest{}, err
+	}
+	if page > math.MaxInt/pageSize {
+		return services.ProjectUserSearchRequest{}, errors.New(
+			"project user page offset overflows",
+		)
+	}
+	search, err := singleProjectQueryValue(query, "search", "")
+	if err != nil || utf8.RuneCountInString(strings.TrimSpace(search)) > 100 {
+		return services.ProjectUserSearchRequest{}, errors.New(
+			"invalid user search",
+		)
+	}
+	return services.ProjectUserSearchRequest{
+		Page:     page,
+		PageSize: pageSize,
+		Search:   strings.TrimSpace(search),
+	}, nil
+}
+
+func parsePlatformBusinessUnitSearchQuery(
+	query url.Values,
+) (services.PlatformBusinessUnitSearchRequest, error) {
+	users, err := parseProjectUserSearchQuery(query)
+	if err != nil {
+		return services.PlatformBusinessUnitSearchRequest{}, err
+	}
+	return services.PlatformBusinessUnitSearchRequest{
+		Page:     users.Page,
+		PageSize: users.PageSize,
+		Search:   users.Search,
+	}, nil
+}
+
+func parseProjectCreationContextQuery(
+	query url.Values,
+) (services.ProjectCreationContextRequest, error) {
+	if err := requireExactProjectQueryKeys(
+		query,
+		"page",
+		"page_size",
+		"search",
+		"business_unit_page",
+		"business_unit_page_size",
+		"business_unit_search",
+	); err != nil {
+		return services.ProjectCreationContextRequest{}, err
+	}
+	usersQuery := make(url.Values)
+	for _, key := range []string{"page", "page_size", "search"} {
+		if values, ok := query[key]; ok {
+			usersQuery[key] = values
+		}
+	}
+	users, err := parseProjectUserSearchQuery(usersQuery)
+	if err != nil {
+		return services.ProjectCreationContextRequest{}, err
+	}
+	businessUnitPage, err := positiveProjectQueryInteger(
+		query,
+		"business_unit_page",
+		1,
+		0,
+	)
+	if err != nil {
+		return services.ProjectCreationContextRequest{}, err
+	}
+	businessUnitPageSize, err := positiveProjectQueryInteger(
+		query,
+		"business_unit_page_size",
+		25,
+		100,
+	)
+	if err != nil {
+		return services.ProjectCreationContextRequest{}, err
+	}
+	businessUnitSearch, err := singleProjectQueryValue(
+		query,
+		"business_unit_search",
+		"",
+	)
+	if err != nil ||
+		utf8.RuneCountInString(strings.TrimSpace(businessUnitSearch)) > 100 {
+		return services.ProjectCreationContextRequest{}, errors.New(
+			"invalid business unit search",
+		)
+	}
+	return services.ProjectCreationContextRequest{
+		Users: users,
+		BusinessUnits: services.PlatformBusinessUnitSearchRequest{
+			Page:     businessUnitPage,
+			PageSize: businessUnitPageSize,
+			Search:   strings.TrimSpace(businessUnitSearch),
+		},
+	}, nil
+}
+
+func requireExactProjectQueryKeys(
+	query url.Values,
+	allowed ...string,
+) error {
+	allowlist := make(map[string]struct{}, len(allowed))
+	for _, key := range allowed {
+		allowlist[key] = struct{}{}
+	}
+	for key, values := range query {
+		if _, ok := allowlist[key]; !ok || len(values) != 1 {
+			return errors.New("invalid project query parameter")
+		}
+	}
+	return nil
+}
+
+func positiveProjectQueryInteger(
+	query url.Values,
+	name string,
+	defaultValue int,
+	maximum int,
+) (int, error) {
+	raw, exists := query[name]
+	if !exists {
+		return defaultValue, nil
+	}
+	if len(raw) != 1 || raw[0] == "" {
+		return 0, errors.New("invalid project pagination")
+	}
+	value, err := strconv.Atoi(raw[0])
+	if err != nil || value < 1 || (maximum > 0 && value > maximum) {
+		return 0, errors.New("invalid project pagination")
+	}
+	return value, nil
+}
+
+func singleProjectQueryValue(
+	query url.Values,
+	name string,
+	defaultValue string,
+) (string, error) {
+	raw, exists := query[name]
+	if !exists {
+		return defaultValue, nil
+	}
+	if len(raw) != 1 {
+		return "", errors.New("duplicate project query parameter")
+	}
+	return raw[0], nil
+}
+
+func canonicalProjectPublicID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil &&
+		parsed.Version() == 7 &&
+		parsed.Variant() == uuid.RFC4122 &&
+		parsed.String() == value
+}
+
+func uniquePositiveUserIDs(userIDs []uint) bool {
+	if len(userIDs) == 0 || len(userIDs) > 100 {
+		return false
+	}
+	seen := make(map[uint]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID == 0 {
+			return false
+		}
+		if _, duplicate := seen[userID]; duplicate {
+			return false
+		}
+		seen[userID] = struct{}{}
+	}
+	return true
 }
 
 func ProjectScopeMiddleware(
@@ -511,6 +1062,11 @@ func writeProjectError(
 	err error,
 ) {
 	switch {
+	case errors.Is(err, services.ErrProjectGovernanceQuery),
+		errors.Is(err, services.ErrDirectoryListQuery),
+		errors.Is(err, services.ErrBusinessUnitPublicID),
+		errors.Is(err, services.ErrInitialProjectAdministrator):
+		response.BadRequest(c, "项目治理参数无效")
 	case errors.Is(err, services.ErrProjectAccessDenied):
 		response.Forbidden(c, "无权访问该项目")
 	case errors.Is(err, services.ErrProjectNotFound),
@@ -522,6 +1078,12 @@ func writeProjectError(
 		response.Forbidden(c, "项目已停用")
 	case errors.Is(err, services.ErrLastProjectAdministrator):
 		response.Error(c, http.StatusConflict, "项目必须保留至少一名有效管理员")
+	case errors.Is(err, services.ErrProjectMembershipVersionConflict):
+		response.Error(
+			c,
+			http.StatusConflict,
+			"成员关系已被其他操作更新，请刷新成员列表后重试",
+		)
 	default:
 		response.InternalServerError(c, "项目操作失败")
 	}

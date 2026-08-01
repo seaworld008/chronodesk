@@ -8,12 +8,22 @@ import {
     type LayoutProps,
     usePermissions,
 } from 'react-admin'
-import { Navigate, Route, useNavigate } from 'react-router-dom'
+import {
+    Navigate,
+    Route,
+    useLocation,
+    useNavigate,
+} from 'react-router-dom'
 import {
     Alert,
     Box,
     Button,
     CircularProgress,
+    Collapse,
+    List,
+    ListItemButton,
+    ListItemIcon,
+    ListItemText,
     Paper,
     Stack,
     Typography,
@@ -28,7 +38,6 @@ import {
     hasPlatformCapability,
     parsePlatformRole,
     type AccessPermissions,
-    type PlatformCapability,
 } from './lib/accessControl'
 import {
     getProjectRoleLabel,
@@ -40,20 +49,17 @@ import {
     projectRoleValues,
     clearActiveProjectSelection,
     resolveActiveProjectAccess,
+    readHumanSessionBinding,
     setActiveProjectKey,
     type AuthorizedProject,
     type ProjectCapability,
     type ProjectRole,
 } from './lib/projectScope'
 import {
+    projectInventoryChangedEvent,
     projectScopeChangedEvent,
     sessionInvalidatedEvent,
 } from './lib/projectScopeEvents'
-import { apiFetch, localizedUnknownErrorMessage } from './lib/apiClient'
-import {
-    humanApiRoutes,
-    type AdminAuditLog,
-} from './lib/generated/human-api'
 
 import {
     AdminPanelSettings as AdminIcon,
@@ -62,10 +68,16 @@ import {
     DashboardCustomize as WorkbenchIcon,
     FactCheck as AuditIcon,
     GroupAdd as MembershipIcon,
+    Handshake as CollaborationIcon,
     History as HistoryIcon,
+    MenuBook as KnowledgeIcon,
     Notifications as NotificationIcon,
     People as UsersIcon,
     AccountTree as PlatformProjectsIcon,
+    ExpandLess,
+    ExpandMore,
+    Home as HomeIcon,
+    Hub as IntegrationRuntimeIcon,
     Security as SecurityIcon,
     SmartToy as AgentIcon,
     Webhook as WebhookIcon,
@@ -76,6 +88,28 @@ import { CustomAppBar } from './layout/CustomAppBar'
 import LoginPage from './components/auth/LoginPage'
 import { AppNotification } from './components/layout/AppNotification'
 import { i18nProvider, muiZhCN } from './i18n'
+import {
+    navigationRegistry,
+    resourceViewNavigationNode,
+    visibleNavigationNodes,
+    type AdminResourceName,
+    type AdminResourceView,
+    type CustomNavigationComponent,
+    type NavigationIcon,
+    type NavigationLeafNode,
+} from './navigation/navigationRegistry'
+import {
+    expandActiveNavigationGroup,
+    findActiveNavigationGroupID,
+    isNavigationItemActive,
+    isNavigationToggleKey,
+    loadNavigationGroupState,
+    navigationStateStorageKey,
+    saveNavigationGroupState,
+    toggleNavigationGroup,
+    validNavigationGroupIDs,
+    type NavigationGroupState,
+} from './navigation/navigationTreeState'
 
 const PageLoading = () => (
     <Box
@@ -130,24 +164,63 @@ const AutomationRuleEdit = lazyPage(
 const AutomationLogList = lazyPage(
     () => import('./admin/automation/AutomationLogList'),
 )
-const SimpleWorkingSystemSettings = lazyPage(
-    () => import('./admin/settings/SimpleWorkingSystemSettings'),
+const AutomationSLAList = lazyPage(
+    () => import('./admin/automation/AutomationSLAList'),
+)
+const AutomationTemplateList = lazyPage(
+    () => import('./admin/automation/AutomationTemplateList'),
+)
+const AutomationQuickReplyList = lazyPage(
+    () => import('./admin/automation/AutomationQuickReplyList'),
 )
 const EmailSettings = lazyPage(() => import('./admin/settings/EmailSettings'))
 const WebhookSettings = lazyPage(() => import('./admin/settings/WebhookSettings'))
 const SystemSettings = lazyPage(() => import('./admin/settings/SystemSettings'))
 const TrustedDevices = lazyPage(() => import('./admin/security/TrustedDevices'))
+const LoginHistory = lazyPage(() => import('./admin/security/LoginHistory'))
+const AccountProfile = lazyPage(() => import('./admin/security/AccountProfile'))
+const AccountSecurity = lazyPage(() => import('./admin/security/AccountSecurity'))
+const EmergencyControls = lazyPage(
+    () => import('./admin/security/EmergencyControls'),
+)
 const AgentControlCenter = lazyPage(
     () => import('./admin/agents/AgentControlCenter'),
+)
+const AgentCollaborationWorkspace = lazyPage(
+    () => import('./admin/agents/AgentCollaborationWorkspace'),
+)
+const KnowledgeManagementPage = lazyPage(
+    () => import('./admin/knowledge/KnowledgeManagementPage'),
+)
+const IntegrationRuntime = lazyPage(
+    () => import('./admin/integrations/IntegrationRuntime'),
 )
 const CrossProjectWorkbench = lazyPage(
     () => import('./admin/workbench/CrossProjectWorkbench'),
 )
+const WorkbenchDashboard = lazyPage(
+    () => import('./admin/workbench/WorkbenchDashboard'),
+)
 const ProjectMembershipPage = lazyPage(
     () => import('./admin/projects/ProjectMembershipPage'),
 )
+const ProjectBasicSettingsPage = lazyPage(
+    () => import('./admin/projects/ProjectBasicSettingsPage'),
+)
+const ProjectIntakeSettingsPage = lazyPage(
+    () => import('./admin/projects/ProjectIntakeSettingsPage'),
+)
+const ProjectQueueSettingsPage = lazyPage(
+    () => import('./admin/projects/ProjectQueueSettingsPage'),
+)
+const ProjectNotificationChannelsPage = lazyPage(
+    () => import('./admin/projects/ProjectNotificationChannelsPage'),
+)
 const PlatformProjectGovernancePage = lazyPage(
     () => import('./admin/projects/PlatformProjectGovernancePage'),
+)
+const PlatformAuditPage = lazyPage(
+    () => import('./admin/audit/PlatformAuditExplorer'),
 )
 
 const theme = createTheme(
@@ -155,7 +228,7 @@ const theme = createTheme(
         palette: {
             mode: 'light',
             primary: {
-                main: '#3b82f6',
+                main: '#2563eb',
                 light: '#60a5fa',
                 dark: '#1d4ed8',
                 contrastText: '#ffffff',
@@ -165,6 +238,12 @@ const theme = createTheme(
                 light: '#94a3b8',
                 dark: '#475569',
                 contrastText: '#ffffff',
+            },
+            warning: {
+                main: '#ed6c02',
+                light: '#ff9800',
+                dark: '#e65100',
+                contrastText: 'rgba(0, 0, 0, 0.87)',
             },
             background: {
                 default: '#f8fafc',
@@ -184,6 +263,17 @@ const theme = createTheme(
             ].join(','),
         },
         shape: { borderRadius: 12 },
+        components: {
+            RaEmpty: {
+                styleOverrides: {
+                    root: {
+                        '& .RaEmpty-message': {
+                            color: 'rgba(0, 0, 0, 0.6)',
+                        },
+                    },
+                },
+            },
+        },
     },
     muiZhCN,
 )
@@ -217,16 +307,19 @@ const useActiveProjectAccess = (): ActiveProjectAccessState => {
         errorCode: null,
         isPending: true,
     })
+    const loadSequence = React.useRef(0)
 
     React.useEffect(() => {
         let active = true
         const loadAccess = async () => {
+            const sequence = ++loadSequence.current
             setState((current) => ({ ...current, isPending: true }))
             try {
                 const projects = await loadAuthorizedProjects()
+                if (!active || sequence !== loadSequence.current) return
                 try {
                     const access = await resolveActiveProjectAccess()
-                    if (active) {
+                    if (active && sequence === loadSequence.current) {
                         setState({
                             access,
                             projects,
@@ -235,7 +328,7 @@ const useActiveProjectAccess = (): ActiveProjectAccessState => {
                         })
                     }
                 } catch (requestError) {
-                    if (active) {
+                    if (active && sequence === loadSequence.current) {
                         setState({
                             access: null,
                             projects,
@@ -245,7 +338,7 @@ const useActiveProjectAccess = (): ActiveProjectAccessState => {
                     }
                 }
             } catch (requestError) {
-                if (active) {
+                if (active && sequence === loadSequence.current) {
                     setState({
                         access: null,
                         projects: [],
@@ -258,11 +351,17 @@ const useActiveProjectAccess = (): ActiveProjectAccessState => {
         void loadAccess()
         const reloadAccess = () => void loadAccess()
         window.addEventListener(projectAccessInvalidatedEvent, reloadAccess)
+        window.addEventListener(projectInventoryChangedEvent, reloadAccess)
         window.addEventListener(projectScopeChangedEvent, reloadAccess)
         return () => {
             active = false
+            loadSequence.current += 1
             window.removeEventListener(
                 projectAccessInvalidatedEvent,
+                reloadAccess,
+            )
+            window.removeEventListener(
+                projectInventoryChangedEvent,
                 reloadAccess,
             )
             window.removeEventListener(projectScopeChangedEvent, reloadAccess)
@@ -270,40 +369,6 @@ const useActiveProjectAccess = (): ActiveProjectAccessState => {
     }, [])
 
     return state
-}
-
-export const PlatformCapabilityRoute = ({
-    capability,
-    children,
-}: React.PropsWithChildren<{ capability: PlatformCapability }>) => {
-    const { permissions, isPending } = usePermissions<AccessPermissions>()
-    if (isPending) return <PageLoading />
-    if (
-        !hasPlatformCapability(permissions?.platform_role, capability)
-    ) {
-        return <Navigate to="/" replace />
-    }
-    return <>{children}</>
-}
-
-const PlatformAdminRoute = ({ children }: React.PropsWithChildren) => {
-    const { permissions, isPending } = usePermissions<AccessPermissions>()
-    if (isPending) return <PageLoading />
-    if (parsePlatformRole(permissions?.platform_role) !== 'platform_admin') {
-        return <Navigate to="/" replace />
-    }
-    return <>{children}</>
-}
-
-export const ProjectRequiredRoute = ({
-    children,
-}: React.PropsWithChildren) => {
-    const { access, isPending } = useActiveProjectAccess()
-    if (isPending) return <PageLoading />
-    if (!access || parseProjectRole(access.project_role) === null) {
-        return <Navigate to="/" replace />
-    }
-    return <>{children}</>
 }
 
 export const ExactProjectRoleRoute = ({
@@ -328,99 +393,120 @@ export const ExactProjectRoleRoute = ({
     return <>{children}</>
 }
 
-const withPlatformCapability = <P extends object>(
+const PlatformNavigationRoute = ({
+    node,
+    children,
+}: React.PropsWithChildren<{ node: NavigationLeafNode }>) => {
+    const { permissions, isPending } = usePermissions<AccessPermissions>()
+    if (isPending) return <PageLoading />
+    const role = parsePlatformRole(permissions?.platform_role)
+    const allowedRoles = node.roles?.kind === 'platform'
+        ? node.roles.values
+        : null
+    const capability = node.capability?.kind === 'platform'
+        ? node.capability.value
+        : null
+    if (
+        role === null ||
+        (allowedRoles && !allowedRoles.includes(role)) ||
+        (capability && !hasPlatformCapability(role, capability))
+    ) {
+        return <Navigate to="/" replace />
+    }
+    return <>{children}</>
+}
+
+const NavigationContractGuard = ({
+    node,
+    children,
+}: React.PropsWithChildren<{ node: NavigationLeafNode }>) => {
+    if (node.scope === 'project') {
+        return (
+            <ExactProjectRoleRoute
+                roles={
+                    node.roles?.kind === 'project'
+                        ? node.roles.values
+                        : projectRoleValues
+                }
+                capability={
+                    node.capability?.kind === 'project'
+                        ? node.capability.value
+                        : undefined
+                }
+            >
+                {children}
+            </ExactProjectRoleRoute>
+        )
+    }
+    if (node.scope === 'platform') {
+        return (
+            <PlatformNavigationRoute node={node}>
+                {children}
+            </PlatformNavigationRoute>
+        )
+    }
+    return <>{children}</>
+}
+
+const withResourceViewContract = <P extends object>(
     Component: React.ComponentType<P>,
-    capability: PlatformCapability,
+    resource: AdminResourceName,
+    view: AdminResourceView,
 ) => {
+    const node = resourceViewNavigationNode(resource, view)
     const GuardedView = (props: P) => (
-        <PlatformCapabilityRoute capability={capability}>
+        <NavigationContractGuard node={node}>
             <Component {...props} />
-        </PlatformCapabilityRoute>
+        </NavigationContractGuard>
     )
-    GuardedView.displayName = `PlatformCapability${
+    GuardedView.displayName = `ResourceContract${
         Component.displayName || Component.name || 'View'
     }`
     return GuardedView
 }
 
-const withProjectRequired = <P extends object>(
-    Component: React.ComponentType<P>,
-) => {
-    const GuardedView = (props: P) => (
-        <ProjectRequiredRoute>
-            <Component {...props} />
-        </ProjectRequiredRoute>
-    )
-    GuardedView.displayName = `ProjectRequired${
-        Component.displayName || Component.name || 'View'
-    }`
-    return GuardedView
-}
-
-const withProjectCapability = <P extends object>(
-    Component: React.ComponentType<P>,
-    capability: ProjectCapability,
-    roles: readonly ProjectRole[] = projectRoleValues,
-) => {
-    const GuardedView = (props: P) => (
-        <ExactProjectRoleRoute roles={roles} capability={capability}>
-            <Component {...props} />
-        </ExactProjectRoleRoute>
-    )
-    GuardedView.displayName = `ProjectCapability${
-        Component.displayName || Component.name || 'View'
-    }`
-    return GuardedView
-}
-
-const PlatformUserList = withPlatformCapability(
-    UserList,
-    'manage_platform_users',
+const PlatformUserList = withResourceViewContract(UserList, 'users', 'list')
+const PlatformUserShow = withResourceViewContract(UserShow, 'users', 'show')
+const PlatformUserEdit = withResourceViewContract(UserEdit, 'users', 'edit')
+const PlatformUserCreate = withResourceViewContract(UserCreate, 'users', 'create')
+const ProjectTicketList = withResourceViewContract(TicketList, 'tickets', 'list')
+const ProjectTicketShow = withResourceViewContract(TicketShow, 'tickets', 'show')
+const ProjectTicketEdit = withResourceViewContract(TicketEdit, 'tickets', 'edit')
+const ProjectTicketCreate = withResourceViewContract(TicketCreate, 'tickets', 'create')
+const ProjectNotificationList = withResourceViewContract(
+    NotificationList,
+    'notifications',
+    'list',
 )
-const PlatformUserShow = withPlatformCapability(
-    UserShow,
-    'manage_platform_users',
-)
-const PlatformUserEdit = withPlatformCapability(
-    UserEdit,
-    'manage_platform_users',
-)
-const PlatformUserCreate = withPlatformCapability(
-    UserCreate,
-    'manage_platform_users',
-)
-const ProjectTicketList = withProjectRequired(TicketList)
-const ProjectTicketShow = withProjectRequired(TicketShow)
-const ProjectTicketEdit = withProjectCapability(
-    TicketEdit,
-    'edit_ticket_safe_fields',
-)
-const ProjectTicketCreate = withProjectCapability(TicketCreate, 'create_ticket')
-const ProjectNotificationList = withProjectRequired(NotificationList)
-const ProjectNotificationCreate = withProjectCapability(
+const ProjectNotificationCreate = withResourceViewContract(
     NotificationCreate,
-    'manage_notifications',
-    ['project_admin', 'manager'],
+    'notifications',
+    'create',
 )
-const ProjectAutomationRuleList = withProjectCapability(
+const ProjectAutomationRuleList = withResourceViewContract(
     AutomationRuleList,
-    'manage_automation',
+    'automation-rules',
+    'list',
 )
-const ProjectAutomationRuleShow = withProjectCapability(
+const ProjectAutomationRuleShow = withResourceViewContract(
     AutomationRuleShow,
-    'manage_automation',
+    'automation-rules',
+    'show',
 )
-const ProjectAutomationRuleEdit = withProjectCapability(
+const ProjectAutomationRuleEdit = withResourceViewContract(
     AutomationRuleEdit,
-    'manage_automation',
+    'automation-rules',
+    'edit',
 )
-const ProjectAutomationRuleCreate = withProjectCapability(
+const ProjectAutomationRuleCreate = withResourceViewContract(
     AutomationRuleCreate,
-    'manage_automation',
+    'automation-rules',
+    'create',
 )
-const ProjectAutomationLogList = withProjectCapability(
+const ProjectAutomationLogList = withResourceViewContract(
     AutomationLogList,
-    'manage_automation',
+    'automation-logs',
+    'list',
 )
 
 const NoAuthorizedProjects = () => (
@@ -501,12 +587,9 @@ const PlatformHome = ({ permissions }: { permissions: AccessPermissions }) => {
             path: '/platform/projects',
         },
         {
-            visible: hasPlatformCapability(
-                platformRole,
-                'manage_platform_settings',
-            ),
-            label: '系统设置',
-            path: '/system-settings',
+            visible: platformRole === 'platform_admin',
+            label: '创建项目',
+            path: '/platform/projects?create=1',
         },
         {
             visible: hasPlatformCapability(
@@ -516,14 +599,22 @@ const PlatformHome = ({ permissions }: { permissions: AccessPermissions }) => {
             label: '平台审计',
             path: '/platform/audit',
         },
+        {
+            visible: hasPlatformCapability(
+                platformRole,
+                'operate_emergency_controls',
+            ),
+            label: '安全与应急',
+            path: '/platform/emergency-controls',
+        },
     ].filter(({ visible }) => visible)
 
     return (
         <Box data-testid="platform-home" sx={{ p: 4 }}>
-            <Title title="平台治理中心" />
+            <Title title="平台工作台" />
             <Paper sx={{ p: 4 }}>
                 <Typography variant="h4" gutterBottom>
-                    平台治理中心
+                    平台工作台
                 </Typography>
                 <Typography color="text.secondary">
                     当前平台职责：
@@ -559,6 +650,16 @@ const PlatformHome = ({ permissions }: { permissions: AccessPermissions }) => {
     )
 }
 
+const PlatformHomeRoute = () => {
+    const { permissions, isPending } = usePermissions<AccessPermissions>()
+    if (isPending) return <PageLoading />
+    const role = parsePlatformRole(permissions?.platform_role)
+    if (role === null || role === 'member' || !permissions) {
+        return <Navigate to="/" replace />
+    }
+    return <PlatformHome permissions={permissions} />
+}
+
 const HomeDashboard = () => {
     const { permissions, isPending: permissionsPending } =
         usePermissions<AccessPermissions>()
@@ -588,114 +689,165 @@ const HomeDashboard = () => {
     }
     const platformRole = parsePlatformRole(permissions?.platform_role)
     if (permissions && platformRole !== null && platformRole !== 'member') {
-        return <PlatformHome permissions={permissions} />
+        return <Navigate to="/platform/home" replace />
     }
     return <NoAuthorizedProjects />
 }
 
-const parsePlatformAuditItems = (value: unknown): AdminAuditLog[] => {
-    if (
-        typeof value !== 'object' ||
-        value === null ||
-        !('items' in value) ||
-        !Array.isArray(value.items)
-    ) {
-        throw new Error('平台审计响应格式无效')
-    }
-    return value.items.map((item) => {
-        if (
-            typeof item !== 'object' ||
-            item === null ||
-            typeof item.id !== 'number' ||
-            typeof item.created_at !== 'string' ||
-            typeof item.username !== 'string' ||
-            parsePlatformRole(item.platform_role) === null ||
-            typeof item.method !== 'string' ||
-            typeof item.path !== 'string' ||
-            typeof item.status_code !== 'number'
-        ) {
-            throw new Error('平台审计响应包含无效字段')
-        }
-        return item as AdminAuditLog
-    })
+const navigationIcons: Record<NavigationIcon, React.ReactElement> = {
+    home: <HomeIcon />,
+    workbench: <WorkbenchIcon />,
+    tickets: <TicketIcon />,
+    notifications: <NotificationIcon />,
+    automation: <AutomationIcon />,
+    agents: <AgentIcon />,
+    collaboration: <CollaborationIcon />,
+    knowledge: <KnowledgeIcon />,
+    webhook: <WebhookIcon />,
+    integrationRuntime: <IntegrationRuntimeIcon />,
+    memberships: <MembershipIcon />,
+    users: <UsersIcon />,
+    projects: <PlatformProjectsIcon />,
+    settings: <AdminIcon />,
+    audit: <AuditIcon />,
+    security: <SecurityIcon />,
+    loginHistory: <HistoryIcon />,
 }
 
-const PlatformAuditPage = () => {
-    const [items, setItems] = React.useState<AdminAuditLog[]>([])
-    const [loading, setLoading] = React.useState(true)
-    const [error, setError] = React.useState('')
+const customNavigationComponents: Record<
+    CustomNavigationComponent,
+    React.ComponentType
+> = {
+    workbench: CrossProjectWorkbench,
+    workbenchDashboard: WorkbenchDashboard,
+    automationIndex: () => <Navigate to="/automation-rules" replace />,
+    automationSLA: AutomationSLAList,
+    automationTemplates: AutomationTemplateList,
+    automationQuickReplies: AutomationQuickReplyList,
+    agentControl: AgentControlCenter,
+    agentCollaboration: AgentCollaborationWorkspace,
+    knowledgeManagement: KnowledgeManagementPage,
+    webhookSettings: WebhookSettings,
+    integrationRuntime: IntegrationRuntime,
+    projectBasicSettings: ProjectBasicSettingsPage,
+    projectMemberships: ProjectMembershipPage,
+    projectIntakeSettings: ProjectIntakeSettingsPage,
+    projectQueueSettings: ProjectQueueSettingsPage,
+    projectNotificationChannels: ProjectNotificationChannelsPage,
+    platformHome: PlatformHomeRoute,
+    platformProjects: PlatformProjectGovernancePage,
+    platformAudit: PlatformAuditPage,
+    emergencyControls: EmergencyControls,
+    platformConfig: SystemSettings,
+    platformEmail: EmailSettings,
+    accountProfile: AccountProfile,
+    accountSecurity: AccountSecurity,
+    trustedDevices: TrustedDevices,
+    loginHistory: LoginHistory,
+}
+
+const customNavigationLeaves = navigationRegistry.flatMap((node) =>
+    node.kind === 'leaf'
+        ? node.route.kind === 'custom' ? [node] : []
+        : node.children.filter((child) => child.route.kind === 'custom'),
+)
+
+const navigationRouteElement = (
+    node: NavigationLeafNode,
+    legacy = false,
+    component?: CustomNavigationComponent,
+) => {
+    if (node.route.kind !== 'custom') return null
+    const Component = customNavigationComponents[
+        component ?? node.route.component
+    ]
+    return (
+        <NavigationContractGuard node={node}>
+            {legacy ? <Navigate to={node.path} replace /> : <Component />}
+        </NavigationContractGuard>
+    )
+}
+
+const persistedNavigationGroupIDs = validNavigationGroupIDs(
+    navigationRegistry.filter((node) => node.placement === 'sidebar'),
+)
+
+const useNavigationTreeState = (
+    nodes: ReturnType<typeof visibleNavigationNodes>,
+) => {
+    const { pathname } = useLocation()
+    const session = readHumanSessionBinding()
+    const sessionSubject = session?.subject ?? ''
+    const sessionID = session?.session_id ?? ''
+    const binding = React.useMemo(
+        () => sessionSubject && sessionID
+            ? { subject: sessionSubject, session_id: sessionID }
+            : null,
+        [sessionID, sessionSubject],
+    )
+    const bindingKey = binding ? navigationStateStorageKey(binding) : ''
+    const activeGroupID = React.useMemo(
+        () => findActiveNavigationGroupID(nodes, pathname),
+        [nodes, pathname],
+    )
+    const loadState = React.useCallback(() => {
+        const stored = binding
+            ? loadNavigationGroupState(
+                localStorage,
+                binding,
+                persistedNavigationGroupIDs,
+            )
+            : {}
+        return expandActiveNavigationGroup(stored, activeGroupID)
+    }, [activeGroupID, binding])
+    const [expanded, setExpanded] =
+        React.useState<NavigationGroupState>(loadState)
+    const loadedBindingKey = React.useRef(bindingKey)
 
     React.useEffect(() => {
-        const controller = new AbortController()
-        void apiFetch<unknown>(
-            humanApiRoutes.listPlatformAuditLogs({ page: 1, limit: 50 }),
-            { signal: controller.signal },
-        )
-            .then((value) => setItems(parsePlatformAuditItems(value)))
-            .catch((requestError: unknown) => {
-                if (
-                    controller.signal.aborted ||
-                    (requestError instanceof DOMException &&
-                        requestError.name === 'AbortError')
-                ) {
-                    return
-                }
-                setError(
-                    localizedUnknownErrorMessage(
-                        requestError,
-                        '平台审计记录加载失败',
-                    ),
-                )
-            })
-            .finally(() => {
-                if (!controller.signal.aborted) setLoading(false)
-            })
-        return () => controller.abort()
-    }, [])
+        if (loadedBindingKey.current === bindingKey) return
+        loadedBindingKey.current = bindingKey
+        setExpanded(loadState())
+    }, [bindingKey, loadState])
 
-    return (
-        <Box data-testid="platform-audit-page" sx={{ p: 3 }}>
-            <Title title="平台审计" />
-            <Typography variant="h4" gutterBottom>
-                平台审计
-            </Typography>
-            <Typography color="text.secondary" sx={{ mb: 2 }}>
-                只读查看平台治理操作，不提供任何修改入口。
-            </Typography>
-            {loading && <PageLoading />}
-            {error && <Alert severity="error">{error}</Alert>}
-            {!loading && !error && (
-                <Stack spacing={1.5}>
-                    {items.length === 0 && (
-                        <Alert severity="info">暂无平台审计记录</Alert>
-                    )}
-                    {items.map((item) => (
-                        <Paper key={item.id} variant="outlined" sx={{ p: 2 }}>
-                            <Stack
-                                direction={{ xs: 'column', md: 'row' }}
-                                spacing={1}
-                                sx={{ justifyContent: 'space-between' }}
-                            >
-                                <Typography sx={{ fontWeight: 600 }}>
-                                    {item.method} {item.path}
-                                </Typography>
-                                <Typography color="text.secondary">
-                                    {new Date(item.created_at).toLocaleString(
-                                        'zh-CN',
-                                    )}
-                                </Typography>
-                            </Stack>
-                            <Typography variant="body2" color="text.secondary">
-                                {item.username} ·{' '}
-                                {getPlatformRoleLabel(item.platform_role)} · HTTP{' '}
-                                {item.status_code}
-                            </Typography>
-                        </Paper>
-                    ))}
-                </Stack>
-            )}
-        </Box>
-    )
+    React.useEffect(() => {
+        setExpanded((current) => {
+            const next = expandActiveNavigationGroup(
+                current,
+                activeGroupID,
+            )
+            if (next !== current && binding) {
+                saveNavigationGroupState(
+                    localStorage,
+                    binding,
+                    next,
+                    persistedNavigationGroupIDs,
+                )
+            }
+            return next
+        })
+    }, [activeGroupID, binding])
+
+    const toggleGroup = React.useCallback((groupID: string) => {
+        setExpanded((current) => {
+            const next = toggleNavigationGroup(
+                current,
+                groupID,
+                activeGroupID,
+            )
+            if (binding) {
+                saveNavigationGroupState(
+                    localStorage,
+                    binding,
+                    next,
+                    persistedNavigationGroupIDs,
+                )
+            }
+            return next
+        })
+    }, [activeGroupID, binding])
+
+    return { activeGroupID, expanded, pathname, toggleGroup }
 }
 
 const CustomMenu: React.FC = () => {
@@ -703,109 +855,147 @@ const CustomMenu: React.FC = () => {
     const { access, isPending } = useActiveProjectAccess()
     const projectRole = parseProjectRole(access?.project_role)
     const hasProject = !isPending && projectRole !== null
+    const platformRole = parsePlatformRole(permissions?.platform_role)
+    const nodes = React.useMemo(
+        () => visibleNavigationNodes('sidebar', {
+            platformRole,
+            projectRole,
+            hasProject,
+        }),
+        [hasProject, platformRole, projectRole],
+    )
+    const {
+        activeGroupID,
+        expanded,
+        pathname,
+        toggleGroup,
+    } = useNavigationTreeState(nodes)
 
     return (
         <Menu aria-label="主导航">
-            <Menu.DashboardItem
-                primaryText={hasProject ? '项目仪表盘' : '首页'}
-            />
-            {hasProject && (
-                <>
-                    <Menu.Item
-                        to="/workbench"
-                        primaryText="我的跨项目工作台"
-                        leftIcon={<WorkbenchIcon />}
-                    />
-                    <Menu.Item
-                        to="/tickets"
-                        primaryText="工单管理"
-                        leftIcon={<TicketIcon />}
-                    />
-                    <Menu.Item
-                        to="/notifications"
-                        primaryText="通知中心"
-                        leftIcon={<NotificationIcon />}
-                    />
-                </>
-            )}
-            {hasProjectCapability(projectRole, 'manage_automation') && (
-                <>
-                    <Menu.Item
-                        to="/automation-rules"
-                        primaryText="自动化规则"
-                        leftIcon={<AutomationIcon />}
-                    />
-                    <Menu.Item
-                        to="/automation-logs"
-                        primaryText="自动化日志"
-                        leftIcon={<HistoryIcon />}
-                    />
-                </>
-            )}
-            {hasProjectCapability(projectRole, 'manage_integrations') && (
-                <Menu.Item
-                    to="/webhook-settings"
-                    primaryText="Webhook 集成"
-                    leftIcon={<WebhookIcon />}
-                />
-            )}
-            {projectRole === 'project_admin' && (
-                <Menu.Item
-                    to="/project-memberships"
-                    primaryText="项目成员管理"
-                    leftIcon={<MembershipIcon />}
-                />
-            )}
-            {projectRole === 'project_admin' && (
-                <Menu.Item
-                    to="/agent-control"
-                    primaryText="AI 智能体控制"
-                    leftIcon={<AgentIcon />}
-                />
-            )}
-            {hasPlatformCapability(
-                permissions?.platform_role,
-                'manage_platform_users',
-            ) && (
-                <Menu.Item
-                    to="/users"
-                    primaryText="平台用户管理"
-                    leftIcon={<UsersIcon />}
-                />
-            )}
-            {parsePlatformRole(permissions?.platform_role) ===
-                'platform_admin' && (
-                <Menu.Item
-                    to="/platform/projects"
-                    primaryText="平台项目治理"
-                    leftIcon={<PlatformProjectsIcon />}
-                />
-            )}
-            {hasPlatformCapability(
-                permissions?.platform_role,
-                'manage_platform_settings',
-            ) && (
-                <Menu.Item
-                    to="/system-settings"
-                    primaryText="系统设置"
-                    leftIcon={<AdminIcon />}
-                />
-            )}
-            {hasPlatformCapability(
-                permissions?.platform_role,
-                'view_platform_audit',
-            ) && (
-                <Menu.Item
-                    to="/platform/audit"
-                    primaryText="平台审计"
-                    leftIcon={<AuditIcon />}
-                />
-            )}
-            <Menu.Item
-                to="/account/trusted-devices"
-                primaryText="账号安全"
-                leftIcon={<SecurityIcon />}
-            />
+            {nodes.map((node, nodeIndex) => {
+                if (node.kind === 'leaf') {
+                    const active = isNavigationItemActive(node, pathname)
+                    return (
+                        <Menu.Item
+                            key={node.id}
+                            to={node.path}
+                            primaryText={node.label}
+                            leftIcon={navigationIcons[node.icon]}
+                            aria-current={active ? 'page' : undefined}
+                            sx={{
+                                py: 0.75,
+                                bgcolor: active
+                                    ? 'action.selected'
+                                    : undefined,
+                            }}
+                        />
+                    )
+                }
+                if (node.children.length === 1) {
+                    const child = node.children[0]
+                    const active = isNavigationItemActive(child, pathname)
+                    return (
+                        <Menu.Item
+                            key={node.id}
+                            to={child.path}
+                            primaryText={node.label}
+                            leftIcon={navigationIcons[node.icon]}
+                            aria-current={active ? 'page' : undefined}
+                            sx={{
+                                py: 0.75,
+                                bgcolor: active
+                                    ? 'action.selected'
+                                    : undefined,
+                            }}
+                        />
+                    )
+                }
+                const contentID = `navigation-group-${node.id}-children`
+                const isExpanded = expanded[node.id] === true
+                const isActive = activeGroupID === node.id
+                return (
+                    <Box component="div" key={node.id}>
+                        <ListItemButton
+                            component="button"
+                            type="button"
+                            role="menuitem"
+                            aria-expanded={isExpanded}
+                            aria-controls={contentID}
+                            data-testid={`navigation-group-${nodeIndex}-toggle`}
+                            onClick={() => toggleGroup(node.id)}
+                            onKeyDown={(event) => {
+                                if (!isNavigationToggleKey(event.key)) return
+                                event.preventDefault()
+                                toggleGroup(node.id)
+                            }}
+                            sx={{
+                                width: '100%',
+                                color: isActive
+                                    ? 'primary.dark'
+                                    : 'text.secondary',
+                                bgcolor: isActive
+                                    ? 'action.selected'
+                                    : undefined,
+                                py: 0.75,
+                            }}
+                        >
+                            <ListItemIcon sx={{ minWidth: 36 }}>
+                                {navigationIcons[node.icon]}
+                            </ListItemIcon>
+                            <ListItemText
+                                primary={node.label}
+                                slotProps={{
+                                    primary: {
+                                        variant: 'body2',
+                                        sx: {
+                                            fontWeight: isActive ? 700 : 600,
+                                        },
+                                    },
+                                }}
+                            />
+                            {isExpanded ? <ExpandLess /> : <ExpandMore />}
+                        </ListItemButton>
+                        <Collapse
+                            in={isExpanded}
+                            timeout="auto"
+                            unmountOnExit
+                            id={contentID}
+                        >
+                            <List
+                                component="div"
+                                role="group"
+                                aria-label={`${node.label}导航`}
+                                disablePadding
+                            >
+                                {node.children.map((item) => {
+                                    const active = isNavigationItemActive(
+                                        item,
+                                        pathname,
+                                    )
+                                    return (
+                                        <Menu.Item
+                                            key={item.id}
+                                            to={item.path}
+                                            primaryText={item.label}
+                                            leftIcon={navigationIcons[item.icon]}
+                                            aria-current={
+                                                active ? 'page' : undefined
+                                            }
+                                            sx={{
+                                                pl: 4,
+                                                bgcolor: active
+                                                    ? 'action.selected'
+                                                    : undefined,
+                                            }}
+                                        />
+                                    )
+                                })}
+                            </List>
+                        </Collapse>
+                    </Box>
+                )
+            })}
         </Menu>
     )
 }
@@ -822,6 +1012,12 @@ const AppRuntimeCoordinator = () => {
         }
         const handleProjectScopeChanged = () => {
             clearRuntimeCaches()
+        }
+        const handleProjectInventoryChanged = () => {
+            void queryClient.refetchQueries({
+                queryKey: ['auth', 'getPermissions'],
+                type: 'active',
+            })
         }
         const handleProjectAccessInvalidated = () => {
             if (
@@ -848,6 +1044,10 @@ const AppRuntimeCoordinator = () => {
         }
 
         window.addEventListener(
+            projectInventoryChangedEvent,
+            handleProjectInventoryChanged,
+        )
+        window.addEventListener(
             projectScopeChangedEvent,
             handleProjectScopeChanged,
         )
@@ -860,6 +1060,10 @@ const AppRuntimeCoordinator = () => {
             handleSessionInvalidated,
         )
         return () => {
+            window.removeEventListener(
+                projectInventoryChangedEvent,
+                handleProjectInventoryChanged,
+            )
             window.removeEventListener(
                 projectScopeChangedEvent,
                 handleProjectScopeChanged,
@@ -945,91 +1149,34 @@ const AdminApp: React.FC = () => (
         />
 
         <CustomRoutes>
-            <Route
-                path="/workbench"
-                element={
-                    <ProjectRequiredRoute>
-                        <CrossProjectWorkbench />
-                    </ProjectRequiredRoute>
-                }
-            />
-            <Route
-                path="/system-settings"
-                element={
-                    <PlatformCapabilityRoute capability="manage_platform_settings">
-                        <SimpleWorkingSystemSettings />
-                    </PlatformCapabilityRoute>
-                }
-            />
-            <Route
-                path="/email-settings"
-                element={
-                    <PlatformCapabilityRoute capability="manage_email_settings">
-                        <EmailSettings />
-                    </PlatformCapabilityRoute>
-                }
-            />
-            <Route
-                path="/system-settings/overview"
-                element={
-                    <PlatformCapabilityRoute capability="manage_platform_settings">
-                        <SystemSettings />
-                    </PlatformCapabilityRoute>
-                }
-            />
-            <Route
-                path="/platform/audit"
-                element={
-                    <PlatformCapabilityRoute capability="view_platform_audit">
-                        <PlatformAuditPage />
-                    </PlatformCapabilityRoute>
-                }
-            />
-            <Route
-                path="/platform/projects"
-                element={
-                    <PlatformAdminRoute>
-                        <PlatformProjectGovernancePage />
-                    </PlatformAdminRoute>
-                }
-            />
-            <Route
-                path="/webhook-settings"
-                element={
-                    <ExactProjectRoleRoute
-                        roles={projectRoleValues}
-                        capability="manage_integrations"
-                    >
-                        <WebhookSettings />
-                    </ExactProjectRoleRoute>
-                }
-            />
-            <Route
-                path="/project-memberships"
-                element={
-                    <ExactProjectRoleRoute
-                        roles={['project_admin']}
-                        capability="manage_memberships"
-                    >
-                        <ProjectMembershipPage />
-                    </ExactProjectRoleRoute>
-                }
-            />
-            <Route
-                path="/agent-control"
-                element={
-                    <ExactProjectRoleRoute
-                        roles={['project_admin']}
-                        capability="manage_agents"
-                    >
-                        <AgentControlCenter />
-                    </ExactProjectRoleRoute>
-                }
-            />
-            <Route
-                path="/account/trusted-devices"
-                element={<TrustedDevices />}
-            />
+            {customNavigationLeaves.flatMap((node) => {
+                if (node.route.kind !== 'custom') return []
+                return [
+                    <Route
+                        key={node.path}
+                        path={node.path}
+                        element={navigationRouteElement(node)}
+                    />,
+                    ...(node.route.legacyPaths ?? []).map((legacyPath) => (
+                        <Route
+                            key={legacyPath}
+                            path={legacyPath}
+                            element={navigationRouteElement(node, true)}
+                        />
+                    )),
+                    ...(node.route.subroutes ?? []).map((subroute) => (
+                        <Route
+                            key={subroute.path}
+                            path={subroute.path}
+                            element={navigationRouteElement(
+                                node,
+                                false,
+                                subroute.component,
+                            )}
+                        />
+                    )),
+                ]
+            })}
         </CustomRoutes>
     </Admin>
 )

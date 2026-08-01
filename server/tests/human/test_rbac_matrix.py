@@ -22,6 +22,41 @@ from tests.utils import (
 pytestmark = [pytest.mark.api, pytest.mark.integration]
 
 
+def _assert_strict_page_envelope(
+    payload: object,
+    *,
+    expected_page: int = 1,
+    expected_page_size: int = 25,
+) -> list[dict[str, object]]:
+    assert isinstance(payload, dict), payload
+    assert set(payload) == {"code", "msg", "data"}, payload
+    assert payload.get("code") == 0, payload
+    assert isinstance(payload.get("msg"), str) and payload["msg"], payload
+
+    page = payload.get("data")
+    assert isinstance(page, dict), payload
+    assert set(page) == {
+        "items",
+        "total",
+        "page",
+        "page_size",
+        "total_pages",
+    }, payload
+    assert page.get("page") == expected_page, payload
+    assert page.get("page_size") == expected_page_size, payload
+    total = page.get("total")
+    total_pages = page.get("total_pages")
+    items = page.get("items")
+    assert isinstance(total, int) and total >= 0, payload
+    assert isinstance(total_pages, int) and total_pages >= 0, payload
+    assert total_pages == ((total + expected_page_size - 1) // expected_page_size), (
+        payload
+    )
+    assert isinstance(items, list) and len(items) <= expected_page_size, payload
+    assert all(isinstance(item, dict) for item in items), payload
+    return items
+
+
 def test_platform_role_change_audit_identifies_actor_target_result_and_redacts_query(
     e2e_manager: E2EResourceManager,
     platform_admin_identity: HumanIdentity,
@@ -52,14 +87,22 @@ def test_platform_role_change_audit_identifies_actor_target_result_and_redacts_q
             "/platform/audit-logs",
             params={
                 "method": "PUT",
-                "path": target_path,
+                "path_prefix": target_path,
                 "status": 200,
-                "page": 1,
                 "limit": 20,
             },
         )
         assert response.status_code == 200, response.text
-        items = response.json().get("data", {}).get("items", [])
+        body = response.json()
+        assert set(body) == {"code", "msg", "data"}, body
+        assert body.get("code") == 0, body
+        cursor_page = body.get("data")
+        assert isinstance(cursor_page, dict), body
+        assert set(cursor_page) == {"items", "next_cursor", "has_more"}, body
+        items = cursor_page.get("items")
+        assert isinstance(items, list) and len(items) <= 20, body
+        assert isinstance(cursor_page.get("next_cursor"), str), body
+        assert isinstance(cursor_page.get("has_more"), bool), body
         audit_item = next(
             (
                 item
@@ -80,19 +123,36 @@ def test_platform_role_change_audit_identifies_actor_target_result_and_redacts_q
     assert audit_item.get("platform_role") == "platform_admin"
     assert "role" not in audit_item
     assert audit_item.get("path") == target_path
-    assert str(target.id) in audit_item.get("action", "")
+    assert audit_item.get("action") == "platform.user.update"
+    assert audit_item.get("action_code") == "platform.user.update"
+    assert audit_item.get("resource_type") == "user"
+    assert audit_item.get("resource_public_id") == str(target.id)
     assert audit_item.get("method") == "PUT"
     assert audit_item.get("status_code") == 200
     assert audit_item.get("result") == "success"
     assert isinstance(audit_item.get("created_at"), str) and audit_item["created_at"]
-    assert isinstance(audit_item.get("client_ip"), str) and audit_item["client_ip"]
-    assert isinstance(audit_item.get("user_agent"), str) and audit_item["user_agent"]
+    assert isinstance(audit_item.get("masked_ip"), str) and audit_item["masked_ip"]
+    assert isinstance(audit_item.get("latency_ms"), int)
+    assert {"client_ip", "query", "user_agent", "notes"}.isdisjoint(audit_item)
 
-    query = parse_qs(audit_item.get("query", ""), keep_blank_values=True)
-    assert query.get("password") == ["[REDACTED]"]
-    assert query.get("token") == ["[REDACTED]"]
+    detail_response = admin.api.get_json(f"/platform/audit-logs/{audit_item['id']}")
+    assert detail_response.status_code == 200, detail_response.text
+    detail_body = detail_response.json()
+    assert set(detail_body) == {"code", "msg", "data"}, detail_body
+    assert detail_body.get("code") == 0, detail_body
+    detail = detail_body.get("data")
+    assert isinstance(detail, dict), detail_body
+    assert detail.get("id") == audit_item["id"], detail
+    assert detail.get("masked_ip") == audit_item["masked_ip"], detail
+    assert "client_ip" not in detail
+    assert isinstance(detail.get("user_agent"), str) and detail["user_agent"]
+    assert isinstance(detail.get("notes"), str), detail
+
+    query = parse_qs(detail.get("query", ""), keep_blank_values=True)
+    assert query.get("password") == ["[已隐藏]"]
+    assert query.get("token") == ["[已隐藏]"]
     assert query.get("visible") == ["evidence"]
-    assert "must-not-persist" not in audit_item.get("query", "")
+    assert "must-not-persist" not in detail.get("query", "")
 
 
 def test_platform_permission_matrix_never_grants_implicit_project_access(
@@ -105,22 +165,22 @@ def test_platform_permission_matrix_never_grants_implicit_project_access(
         "platform_admin": {
             "/platform/users?page=1&page_size=1": 200,
             "/platform/configs?page=1": 200,
-            "/platform/audit-logs?page=1&limit=1": 200,
+            "/platform/audit-logs?limit=1": 200,
         },
         "security_auditor": {
             "/platform/users?page=1&page_size=1": 403,
             "/platform/configs?page=1": 403,
-            "/platform/audit-logs?page=1&limit=1": 200,
+            "/platform/audit-logs?limit=1": 200,
         },
         "emergency_operator": {
             "/platform/users?page=1&page_size=1": 403,
             "/platform/configs?page=1": 403,
-            "/platform/audit-logs?page=1&limit=1": 403,
+            "/platform/audit-logs?limit=1": 403,
         },
         "member": {
             "/platform/users?page=1&page_size=1": 403,
             "/platform/configs?page=1": 403,
-            "/platform/audit-logs?page=1&limit=1": 403,
+            "/platform/audit-logs?limit=1": 403,
         },
     }
 
@@ -130,7 +190,7 @@ def test_platform_permission_matrix_never_grants_implicit_project_access(
 
         projects = identity.api.get_json("/projects")
         assert projects.status_code == 200, projects.text
-        assert projects.json().get("data") == [], projects.text
+        assert _assert_strict_page_envelope(projects.json()) == [], projects.text
 
         context = identity.api.get_json(identity.api.project_path("context"))
         assert_error_contract(
@@ -174,22 +234,25 @@ def test_platform_project_inventory_requires_active_platform_admin_not_membershi
 
     membership_projects = administrator.api.get_json("/projects")
     assert membership_projects.status_code == 200, membership_projects.text
-    assert membership_projects.json().get("data") == [], membership_projects.text
+    assert _assert_strict_page_envelope(membership_projects.json()) == [], (
+        membership_projects.text
+    )
 
     response = administrator.api.get_json("/platform/projects")
     assert response.status_code == 200, response.text
     payload = response.json()
-    assert set(payload) == {"code", "msg", "data"}, payload
-    assert payload.get("code") == 0, payload
-    projects = payload.get("data")
-    assert isinstance(projects, list) and projects, payload
+    projects = _assert_strict_page_envelope(payload)
+    assert projects, payload
 
     expected_fields = {
         "public_id",
+        "created_at",
+        "updated_at",
         "key",
         "name",
         "description",
         "status",
+        "business_unit",
     }
     for project in projects:
         assert isinstance(project, dict), project
@@ -203,6 +266,17 @@ def test_platform_project_inventory_requires_active_platform_admin_not_membershi
         assert isinstance(project.get("name"), str), project
         assert isinstance(project.get("description"), str), project
         assert project.get("status") in {"active", "archived"}, project
+        business_unit = project.get("business_unit")
+        assert isinstance(business_unit, dict), project
+        assert set(business_unit) == {
+            "public_id",
+            "key",
+            "name",
+            "description",
+        }, project
+        business_unit_public_id = business_unit.get("public_id")
+        assert isinstance(business_unit_public_id, str), project
+        assert UUID(business_unit_public_id).version == 7, project
 
     assert any(project.get("key") == e2e_manager.project_key for project in projects), (
         projects
@@ -256,8 +330,8 @@ def test_project_permission_matrix_uses_only_active_membership(
 
         projects = identity.api.get_json("/projects")
         assert projects.status_code == 200, projects.text
-        accesses = projects.json().get("data")
-        assert isinstance(accesses, list) and len(accesses) == 1, projects.text
+        accesses = _assert_strict_page_envelope(projects.json())
+        assert len(accesses) == 1, projects.text
         assert accesses[0].get("project_role") == expected_project_role
         assert "role" not in accesses[0]
 
@@ -337,17 +411,56 @@ def test_unknown_roles_fail_closed(
         {
             "user_id": human_identities["agent_a"].id,
             "role": "unknown",
+            "expected_version": e2e_manager.membership_version(
+                human_identities["agent_a"].id
+            ),
         },
+        retry=False,
     )
     if invalid_membership.status_code == 200:
+        unexpected_membership = invalid_membership.json().get("data")
+        unexpected_version = (
+            unexpected_membership.get("version")
+            if isinstance(unexpected_membership, dict)
+            and unexpected_membership.get("user_id") == human_identities["agent_a"].id
+            else None
+        )
+        if not isinstance(unexpected_version, int) or unexpected_version <= 0:
+            unexpected_version = e2e_manager.refresh_membership_version(
+                human_identities["agent_a"].id
+            )
+        else:
+            e2e_manager.track_membership_version(
+                human_identities["agent_a"].id,
+                unexpected_version,
+            )
         restored = admin_api.post_json(
             admin_api.project_path("memberships"),
             {
                 "user_id": human_identities["agent_a"].id,
                 "role": "agent",
+                "expected_version": unexpected_version,
             },
+            retry=False,
         )
-        assert restored.status_code == 200, restored.text
+        assert restored.status_code == 200, "非法项目角色意外写入后的恢复失败"
+        restored_membership = restored.json().get("data")
+        restored_version = (
+            restored_membership.get("version")
+            if isinstance(restored_membership, dict)
+            and restored_membership.get("user_id") == human_identities["agent_a"].id
+            and restored_membership.get("role") == "agent"
+            else None
+        )
+        if not isinstance(restored_version, int) or restored_version <= 0:
+            restored_version = e2e_manager.refresh_membership_version(
+                human_identities["agent_a"].id
+            )
+        else:
+            e2e_manager.track_membership_version(
+                human_identities["agent_a"].id,
+                restored_version,
+            )
     assert_error_contract(invalid_membership, 400)
 
     unchanged_context = human_identities["agent_a"].api.get_json(
@@ -367,14 +480,12 @@ def test_revoked_membership_immediately_removes_project_access(
         "observer",
         label="revoked-membership",
     )
-    revoked = admin_api.delete(
-        admin_api.project_path(f"memberships/{identity.id}"),
-    )
+    revoked = e2e_manager.revoke_project_membership(identity.id)
     assert revoked.status_code in (200, 204), revoked.text
 
     projects = identity.api.get_json("/projects")
     assert projects.status_code == 200, projects.text
-    assert projects.json().get("data") == []
+    assert _assert_strict_page_envelope(projects.json()) == []
 
     context = identity.api.get_json(identity.api.project_path("context"))
     assert_error_contract(
@@ -579,7 +690,29 @@ def test_ticket_object_permission_matrix(
     assert own_agent_read.status_code == 200, own_agent_read.text
     unassigned = agent_a.api.get_json(
         e2e_manager.project_path("tickets/unassigned"),
-        params={"limit": 100},
+        params={
+            "page": 1,
+            "page_size": 100,
+            "sort_by": "created_at",
+            "sort_order": "desc",
+        },
     )
     assert unassigned.status_code == 200, unassigned.text
-    assert ticket_b_id in {item.get("id") for item in unassigned.json().get("data", [])}
+    unassigned_body = unassigned.json()
+    assert set(unassigned_body) == {
+        "success",
+        "data",
+        "total",
+        "page",
+        "page_size",
+        "total_pages",
+    }, unassigned_body
+    assert unassigned_body.get("success") is True, unassigned_body
+    assert unassigned_body.get("page") == 1, unassigned_body
+    assert unassigned_body.get("page_size") == 100, unassigned_body
+    assert isinstance(unassigned_body.get("total"), int), unassigned_body
+    assert isinstance(unassigned_body.get("total_pages"), int), unassigned_body
+    unassigned_items = unassigned_body.get("data")
+    assert isinstance(unassigned_items, list), unassigned_body
+    assert len(unassigned_items) <= 100, unassigned_body
+    assert ticket_b_id in {item.get("id") for item in unassigned_items}
