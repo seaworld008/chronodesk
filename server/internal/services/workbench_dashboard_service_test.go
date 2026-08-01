@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -370,6 +371,11 @@ func TestWorkbenchDashboardFailsClosedAndNeverUsesPlatformRole(t *testing.T) {
 		{
 			name:  "invalid days",
 			query: WorkbenchDashboardQuery{UserID: 7, Days: 365},
+			want:  ErrCrossProjectWorkbenchQuery,
+		},
+		{
+			name:  "overflow-sized days",
+			query: WorkbenchDashboardQuery{UserID: 7, Days: math.MaxInt},
 			want:  ErrCrossProjectWorkbenchQuery,
 		},
 	} {

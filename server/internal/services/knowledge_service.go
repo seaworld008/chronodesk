@@ -367,7 +367,7 @@ func (service *KnowledgeService) ListArticles(
 		return nil, ErrDirectoryListQuery
 	}
 	page := &DirectoryPage[models.KnowledgeArticle]{
-		Items:    make([]models.KnowledgeArticle, 0, request.PageSize),
+		Items:    make([]models.KnowledgeArticle, 0),
 		Page:     request.Page,
 		PageSize: request.PageSize,
 	}

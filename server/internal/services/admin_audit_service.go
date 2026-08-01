@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"gorm.io/gorm"
 )
 
@@ -254,13 +255,12 @@ func (s *AdminAuditService) normalizeAdminAuditActor(
 	platformRole := record.PlatformRole
 	switch actor.Type {
 	case models.ActorTypeHuman:
-		parsed, err := strconv.ParseUint(actor.ID, 10, 64)
-		if err != nil || parsed == 0 || uint64(uint(parsed)) != parsed {
+		humanID, err := safeconv.ParsePositiveUint(actor.ID)
+		if err != nil {
 			return models.ActorRef{}, nil, "", "", errors.New(
 				"human audit actor id is invalid",
 			)
 		}
-		humanID := uint(parsed)
 		if record.UserID != nil && *record.UserID != humanID {
 			return models.ActorRef{}, nil, "", "", errors.New(
 				"human audit actor does not match user id",

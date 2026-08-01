@@ -369,7 +369,7 @@ func (service *CrossProjectWorkbenchService) Dashboard(
 		}
 		result.Summary = workbenchDashboardSummary(aggregate)
 
-		dailyRows := make([]dashboardDailyRow, 0, input.Days)
+		dailyRows := make([]dashboardDailyRow, 0)
 		dateExpression := "DATE(tickets.created_at)"
 		if tx.Dialector.Name() == "postgres" {
 			dateExpression = "TO_CHAR(tickets.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')"

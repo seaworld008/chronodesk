@@ -8,6 +8,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 )
 
 const (
@@ -141,11 +143,15 @@ func parseDirectoryPositiveInt(
 			return 0, errInvalidDirectoryListQuery
 		}
 	}
-	parsed, err := strconv.ParseUint(value, 10, 0)
-	if err != nil || parsed == 0 || parsed > uint64(maximum) {
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
 		return 0, errInvalidDirectoryListQuery
 	}
-	return int(parsed), nil
+	converted, err := safeconv.Int(parsed)
+	if err != nil || converted <= 0 || converted > maximum {
+		return 0, errInvalidDirectoryListQuery
+	}
+	return converted, nil
 }
 
 func (query directoryListQuery) value(key string) (string, bool) {

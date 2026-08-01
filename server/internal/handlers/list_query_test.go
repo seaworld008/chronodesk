@@ -1,6 +1,10 @@
 package handlers
 
 import (
+	"errors"
+	"math"
+	"net/url"
+	"strconv"
 	"testing"
 )
 
@@ -89,5 +93,44 @@ func TestParseDirectoryListQueryRejectsInvalidInput(t *testing.T) {
 				t.Fatalf("query %q unexpectedly accepted", rawQuery)
 			}
 		})
+	}
+}
+
+func TestParseDirectoryPositiveIntUsesNativeIntWidth(t *testing.T) {
+	maximum := strconv.Itoa(math.MaxInt)
+	got, err := parseDirectoryPositiveInt(
+		url.Values{"page": []string{maximum}},
+		"page",
+		1,
+		math.MaxInt,
+	)
+	if err != nil {
+		t.Fatalf("parseDirectoryPositiveInt(%q) error = %v", maximum, err)
+	}
+	if got != math.MaxInt {
+		t.Fatalf(
+			"parseDirectoryPositiveInt(%q) = %d, want %d",
+			maximum,
+			got,
+			math.MaxInt,
+		)
+	}
+
+	overflow := "9223372036854775808"
+	if strconv.IntSize == 32 {
+		overflow = strconv.FormatInt(int64(math.MaxInt32)+1, 10)
+	}
+	if _, err := parseDirectoryPositiveInt(
+		url.Values{"page": []string{overflow}},
+		"page",
+		1,
+		math.MaxInt,
+	); !errors.Is(err, errInvalidDirectoryListQuery) {
+		t.Fatalf(
+			"parseDirectoryPositiveInt(%q) error = %v, want %v",
+			overflow,
+			err,
+			errInvalidDirectoryListQuery,
+		)
 	}
 }

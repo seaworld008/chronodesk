@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -758,6 +759,7 @@ func TestKnowledgeDirectoriesAreScopedBoundedAndStable(t *testing.T) {
 	for _, invalid := range []DirectoryPageRequest{
 		{Page: 0, PageSize: 25, SortBy: "updated_at", SortOrder: "desc"},
 		{Page: 1, PageSize: 101, SortBy: "updated_at", SortOrder: "desc"},
+		{Page: 1, PageSize: math.MaxInt, SortBy: "updated_at", SortOrder: "desc"},
 		{Page: 1, PageSize: 25, SortBy: "project_id", SortOrder: "desc"},
 	} {
 		if _, listErr := service.ListArticles(

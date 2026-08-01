@@ -16,6 +16,7 @@ import (
 
 	"github.com/seaworld008/chronodesk/server/internal/listcursor"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
@@ -1250,11 +1251,15 @@ func parsePositiveAdminInteger(raw string, maximum int) (int, error) {
 	if strings.TrimSpace(raw) != raw {
 		return 0, ErrInvalidAdminListQuery
 	}
-	value, err := strconv.ParseUint(raw, 10, 63)
-	if err != nil || value == 0 || value > uint64(maximum) {
+	parsed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
 		return 0, ErrInvalidAdminListQuery
 	}
-	return int(value), nil
+	value, err := safeconv.Int(parsed)
+	if err != nil || value <= 0 || value > maximum {
+		return 0, ErrInvalidAdminListQuery
+	}
+	return value, nil
 }
 
 func validateAdminListScope(

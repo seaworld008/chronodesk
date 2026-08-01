@@ -9,6 +9,7 @@ import (
 	"strconv"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"gorm.io/gorm"
 )
 
@@ -180,12 +181,13 @@ func optionalTicketCategoryID(value any) (*uint, error) {
 	default:
 		return nil, invalidTicketCategoryID()
 	}
-	if raw == 0 ||
-		raw > maxDatabaseID ||
-		uint64(uint(raw)) != raw {
+	if raw == 0 || raw > maxDatabaseID {
 		return nil, invalidTicketCategoryID()
 	}
-	id := uint(raw)
+	id, err := safeconv.PositiveUint(raw)
+	if err != nil {
+		return nil, invalidTicketCategoryID()
+	}
 	return &id, nil
 }
 

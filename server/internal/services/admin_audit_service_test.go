@@ -102,6 +102,29 @@ func TestAdminAuditLifecyclePersistsAnchorBeforeFinalization(t *testing.T) {
 	}
 }
 
+func TestAdminAuditRejectsOverflowingHumanActorID(t *testing.T) {
+	db, err := gorm.Open(
+		sqlite.Open("file:admin_audit_actor_overflow?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newAdminAuditExplorerForTest(t, db)
+	record := &AdminAuditRecord{
+		Actor: models.ActorRef{
+			Type: models.ActorTypeHuman,
+			ID:   overflowingUint,
+		},
+		Action: "GET /api/platform/audit",
+		Method: "GET",
+		Path:   "/api/platform/audit",
+	}
+	if err := service.Record(context.Background(), record); err == nil {
+		t.Fatal("Record() accepted an overflowing human actor ID")
+	}
+}
+
 func TestAdminAuditExploreUsesStableCursorAndListProjection(t *testing.T) {
 	db, err := gorm.Open(
 		sqlite.Open("file:admin_audit_explore?mode=memory&cache=shared"),

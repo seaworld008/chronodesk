@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -205,6 +206,41 @@ func TestRuntimeSafetyControlCASRejectsMissingPatchAndNonHumanActor(
 		models.ServicePrincipalActor("agent-7"),
 	); !errors.Is(err, ErrRuntimeControlHumanActorRequired) {
 		t.Fatalf("service-principal actor error = %v", err)
+	}
+}
+
+func TestRuntimeControlHumanActorIDUsesNativeUintWidth(t *testing.T) {
+	maximum := strconv.FormatUint(uint64(math.MaxUint), 10)
+	got, err := runtimeControlHumanActorID(models.ActorRef{
+		Type: models.ActorTypeHuman,
+		ID:   maximum,
+	})
+	if err != nil {
+		t.Fatalf("runtimeControlHumanActorID(%q) error = %v", maximum, err)
+	}
+	if got != math.MaxUint {
+		t.Fatalf(
+			"runtimeControlHumanActorID(%q) = %d, want %d",
+			maximum,
+			got,
+			uint(math.MaxUint),
+		)
+	}
+
+	overflow := "18446744073709551616"
+	if strconv.IntSize == 32 {
+		overflow = strconv.FormatUint(uint64(math.MaxUint32)+1, 10)
+	}
+	if _, err := runtimeControlHumanActorID(models.ActorRef{
+		Type: models.ActorTypeHuman,
+		ID:   overflow,
+	}); !errors.Is(err, ErrRuntimeControlHumanActorRequired) {
+		t.Fatalf(
+			"runtimeControlHumanActorID(%q) error = %v, want %v",
+			overflow,
+			err,
+			ErrRuntimeControlHumanActorRequired,
+		)
 	}
 }
 

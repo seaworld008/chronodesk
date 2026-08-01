@@ -22,6 +22,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
 	"github.com/seaworld008/chronodesk/server/internal/httpcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"github.com/gin-gonic/gin"
@@ -49,6 +50,18 @@ var (
 		"runtime safety controls require a human actor",
 	)
 )
+
+func runtimeControlHumanActorID(actor models.ActorRef) (uint, error) {
+	if err := actor.Validate(); err != nil ||
+		actor.Type != models.ActorTypeHuman {
+		return 0, ErrRuntimeControlHumanActorRequired
+	}
+	actorID, err := safeconv.ParsePositiveUint(actor.ID)
+	if err != nil {
+		return 0, ErrRuntimeControlHumanActorRequired
+	}
+	return actorID, nil
+}
 
 // RuntimeControlSnapshot is the authoritative platform-wide Agent safety
 // state. Version is shared by both switches so one strong ETag protects the
@@ -235,17 +248,11 @@ func (c *RuntimeControl) UpdateCAS(
 	if patch.GlobalReadOnly == nil && patch.EmergencyStop == nil {
 		return RuntimeControlSnapshot{}, ErrRuntimeControlPatchRequired
 	}
-	if err := actor.Validate(); err != nil ||
-		actor.Type != models.ActorTypeHuman {
+	updatedBy, err := runtimeControlHumanActorID(actor)
+	if err != nil {
 		return RuntimeControlSnapshot{},
 			ErrRuntimeControlHumanActorRequired
 	}
-	actorID, err := strconv.ParseUint(actor.ID, 10, 64)
-	if err != nil || actorID == 0 || actorID > uint64(^uint(0)) {
-		return RuntimeControlSnapshot{},
-			ErrRuntimeControlHumanActorRequired
-	}
-	updatedBy := uint(actorID)
 
 	var snapshot RuntimeControlSnapshot
 	err = c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
