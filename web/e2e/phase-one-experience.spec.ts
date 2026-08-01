@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { expect, test, type Page } from '@playwright/test';
 import { monitorBrowserHealth } from './helpers/browserAudit';
 import {
@@ -215,7 +216,7 @@ const installPhaseOneBackend = async (
         page,
         {
             ...defaultMockIdentity,
-            sessionID: `phase-one-${Date.now()}-${Math.random()}`,
+            sessionID: `phase-one-${Date.now()}-${randomUUID()}`,
         },
         projectA,
     );

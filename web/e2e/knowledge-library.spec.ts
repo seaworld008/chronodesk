@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { expect, test, type Page } from '@playwright/test';
 import { monitorBrowserHealth } from './helpers/browserAudit';
 import {
@@ -65,7 +66,7 @@ const installKnowledgeBackend = async (
 ): Promise<KnowledgeMockState> => {
     const identity = {
         ...defaultMockIdentity,
-        sessionID: `knowledge-${projectRole}-${Date.now()}-${Math.random()}`,
+        sessionID: `knowledge-${projectRole}-${Date.now()}-${randomUUID()}`,
     };
     await installMockSession(page, identity, projectA);
     const access = authorizedProjectAccess(
