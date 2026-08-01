@@ -231,6 +231,12 @@ test.describe('Ticket Workflow', () => {
         ).toBe(200);
         untrackE2EResource('tickets', createdTicket.id as number);
 
+        // 删除后的 SPA 重定向与列表首次加载分别验证，避免把 React 懒加载
+        // 挂载时序误当成删除失败，同时仍要求规范列表路由可独立完整加载。
+        await expect(page).toHaveURL(/#\/tickets(?:\?.*)?$/, {
+            timeout: 15_000,
+        });
+        await page.goto('/#/tickets');
         await waitForTicketList();
     });
 
