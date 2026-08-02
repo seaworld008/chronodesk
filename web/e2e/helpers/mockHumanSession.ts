@@ -94,13 +94,14 @@ const encodeBase64URL = (value: unknown): string =>
 
 export const mockSessionToken = (
     identity: MockSessionIdentity,
+    expiresAtSeconds = Math.floor(Date.now() / 1000) + 3600,
 ): string => [
     encodeBase64URL({ alg: 'none', typ: 'JWT' }),
     encodeBase64URL({
         sub: String(identity.id),
         sid: identity.sessionID,
         platform_role: identity.platformRole,
-        exp: Math.floor(Date.now() / 1000) + 3600,
+        exp: expiresAtSeconds,
     }),
     'e2e-signature',
 ].join('.');
@@ -109,10 +110,17 @@ export const installMockSession = async (
     page: Page,
     identity: MockSessionIdentity,
     activeProject?: AuthorizedProject,
+    expiresAtSeconds = Math.floor(Date.now() / 1000) + 3600,
 ) => {
-    const token = mockSessionToken(identity);
+    const token = mockSessionToken(identity, expiresAtSeconds);
     await page.addInitScript(
-        ({ authToken, user, selectedProject, initializationKey }) => {
+        ({
+            authToken,
+            user,
+            selectedProject,
+            initializationKey,
+            tokenExpiresAt,
+        }) => {
             if (sessionStorage.getItem(initializationKey) === 'installed') {
                 return;
             }
@@ -134,7 +142,7 @@ export const installMockSession = async (
             );
             localStorage.setItem(
                 'tokenExpiresAt',
-                String(Date.now() + 3_600_000),
+                String(tokenExpiresAt),
             );
             if (selectedProject) {
                 localStorage.setItem(
@@ -152,6 +160,7 @@ export const installMockSession = async (
             user: identity,
             selectedProject: activeProject,
             initializationKey: `chronodesk.e2e.session.${identity.sessionID}`,
+            tokenExpiresAt: expiresAtSeconds * 1000,
         },
     );
     return token;

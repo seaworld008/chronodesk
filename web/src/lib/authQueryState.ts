@@ -6,7 +6,7 @@ export const humanAuthCheckQueryKey = [
     {},
 ] as const
 
-export const humanSessionStorageCommitKey = 'tokenExpiresAt'
+export const humanSessionStorageCommitKey = 'token'
 
 export const markHumanAuthQueryAuthenticated = (
     queryClient: QueryClient,

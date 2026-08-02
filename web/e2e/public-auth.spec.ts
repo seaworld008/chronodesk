@@ -378,8 +378,13 @@ test('受保护标签在跨账号登录和退出后重载身份且不提交旧�
         sessionID: 'e2e-protected-tab-user-b',
         email: 'protected-user-b@example.test',
     }
+    const sharedExpiresAtSeconds =
+        Math.floor(Date.now() / 1000) + 3600
     let tokenA = ''
-    const tokenB = mockSessionToken(identityB)
+    const tokenB = mockSessionToken(
+        identityB,
+        sharedExpiresAtSeconds,
+    )
     const accessA = authorizedProjectAccess(projectA, 'requester')
     const accessB = authorizedProjectAccess(projectB, 'observer')
     let logoutRequests = 0
@@ -476,7 +481,12 @@ test('受保护标签在跨账号登录和退出后重载身份且不提交旧�
     ).toBeVisible()
 
     const protectedPage = await context.newPage()
-    tokenA = await installMockSession(protectedPage, identityA)
+    tokenA = await installMockSession(
+        protectedPage,
+        identityA,
+        undefined,
+        sharedExpiresAtSeconds,
+    )
     await protectedPage.goto('/#/')
     await expect
         .poll(() =>
