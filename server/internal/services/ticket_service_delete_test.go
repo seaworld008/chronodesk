@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"gorm.io/gorm"
 )
 
 func TestDeleteTicketExpectedVersionRejectsStaleSnapshot(t *testing.T) {
@@ -400,5 +401,290 @@ func TestDeleteTicketCommitsAttachmentCleanupWithDefaultOutboxTargets(t *testing
 				delivery,
 			)
 		}
+	}
+}
+
+func TestDeleteTicketRoutesOnlyFinalizedAttachmentsToGenericCleanup(
+	t *testing.T,
+) {
+	db := openAgentNativeTestDB(t)
+	if err := db.AutoMigrate(&models.Notification{}); err != nil {
+		t.Fatalf("migrate ticket deletion dependencies: %v", err)
+	}
+	user := seedActorUser(t, db, "delete-cleanup-routing")
+	actor := models.HumanActor(user.ID)
+	ctx := testProjectOperationContext(t, db, actor)
+	ticket := seedNativeTicket(
+		t,
+		db,
+		user.ID,
+		"DELETE-CLEANUP-ROUTING-001",
+	)
+
+	attachments := []models.TicketAttachment{
+		{
+			TicketID: ticket.ID, UploadedBy: &user.ID,
+			ActorType: actor.Type, ActorID: actor.ID,
+			FileName: "local.txt", OriginalName: "local.txt", FileSize: 5,
+			StorageType: "local", StorageStoreID: "local-primary",
+			StoragePath: "tickets/final/local.txt",
+		},
+		{
+			TicketID: ticket.ID, UploadedBy: &user.ID,
+			ActorType: actor.Type, ActorID: actor.ID,
+			FileName: "s3.txt", OriginalName: "s3.txt", FileSize: 4,
+			StorageType: "s3", StorageStoreID: "s3-archive",
+			StorageVersionID: "version-1",
+			StoragePath:      "tickets/final/s3.txt",
+		},
+		{
+			TicketID: ticket.ID, UploadedBy: &user.ID,
+			ActorType: actor.Type, ActorID: actor.ID,
+			FileName: "intent.txt", OriginalName: "intent.txt",
+			StorageType: attachmentStagingIntentStorageType,
+			StoragePath: ".staging/intent.txt",
+		},
+		{
+			TicketID: ticket.ID, UploadedBy: &user.ID,
+			ActorType: actor.Type, ActorID: actor.ID,
+			FileName: "cleanup.txt", OriginalName: "cleanup.txt",
+			StorageType: attachmentStagingCleanupStorageType,
+			StoragePath: ".staging/cleanup.txt",
+		},
+		{
+			TicketID: ticket.ID, UploadedBy: &user.ID,
+			ActorType: actor.Type, ActorID: actor.ID,
+			FileName: "uploading.txt", OriginalName: "uploading.txt",
+			StorageType: "staging",
+			StoragePath: ".staging/uploading.txt",
+		},
+		{
+			TicketID: ticket.ID, UploadedBy: &user.ID,
+			ActorType: actor.Type, ActorID: actor.ID,
+			FileName: "cancelled.txt", OriginalName: "cancelled.txt",
+			StorageType: attachmentUploadCancelledStorageType,
+			StoragePath: "",
+		},
+	}
+	for index := range attachments {
+		if err := db.Create(&attachments[index]).Error; err != nil {
+			t.Fatalf(
+				"create attachment %q: %v",
+				attachments[index].StorageType,
+				err,
+			)
+		}
+	}
+
+	native := NewAgentNativeService(db, AgentNativeOptions{
+		DefaultOutboxTargets: []OutboxTarget{{
+			Type: "event_stream", ID: "default", MaxAttempts: 8,
+		}},
+	})
+	receipt, err := native.DeleteTicket(ctx, DeleteTicketCommand{
+		TicketID:        ticket.ID,
+		ExpectedVersion: ticket.Version,
+		Actor:           actor,
+		SourceProtocol:  "test",
+	})
+	if err != nil {
+		t.Fatalf("delete ticket with mixed attachment states: %v", err)
+	}
+
+	var event models.DomainEvent
+	if err := db.Where("id = ?", receipt.EventID).
+		Take(&event).Error; err != nil {
+		t.Fatalf("load ticket deletion event: %v", err)
+	}
+	var data struct {
+		CleanupCount int                       `json:"attachment_cleanup_count"`
+		Objects      []AttachmentCleanupObject `json:"_attachment_cleanup_objects"`
+	}
+	if err := json.Unmarshal(event.Data, &data); err != nil {
+		t.Fatalf("decode ticket deletion cleanup manifest: %v", err)
+	}
+	if data.CleanupCount != 2 || len(data.Objects) != 2 {
+		t.Fatalf(
+			"generic cleanup manifest = count %d objects %+v, want only local and S3",
+			data.CleanupCount,
+			data.Objects,
+		)
+	}
+
+	wantFinal := map[uint]string{
+		attachments[0].ID: "local",
+		attachments[1].ID: "s3",
+	}
+	for _, object := range data.Objects {
+		wantType, ok := wantFinal[object.AttachmentID]
+		if !ok || object.StorageType != wantType {
+			t.Fatalf(
+				"generic cleanup captured non-final attachment: %+v",
+				object,
+			)
+		}
+		delete(wantFinal, object.AttachmentID)
+	}
+	if len(wantFinal) != 0 {
+		t.Fatalf("generic cleanup lost finalized attachments: %#v", wantFinal)
+	}
+
+	var deliveries []models.OutboxDelivery
+	if err := db.Where("event_id = ?", event.ID).
+		Find(&deliveries).Error; err != nil {
+		t.Fatalf("load ticket deletion deliveries: %v", err)
+	}
+	genericCleanupCount := 0
+	envelope := CloudEventFromModel(&event)
+	for _, delivery := range deliveries {
+		if delivery.DestinationType !=
+			AttachmentCleanupOutboxDestination {
+			continue
+		}
+		genericCleanupCount++
+		reference, err := AttachmentCleanupStorageReference(
+			envelope,
+			delivery.DestinationID,
+		)
+		if err != nil {
+			t.Fatalf("resolve finalized cleanup target: %v", err)
+		}
+		if reference.StorageType != "local" &&
+			reference.StorageType != "s3" {
+			t.Fatalf(
+				"generic cleanup routed transitional storage %q",
+				reference.StorageType,
+			)
+		}
+	}
+	if genericCleanupCount != 2 {
+		t.Fatalf(
+			"generic attachment cleanup deliveries = %d, want 2",
+			genericCleanupCount,
+		)
+	}
+
+	var remaining []models.TicketAttachment
+	if err := db.Where("ticket_id = ?", ticket.ID).
+		Order("id ASC").
+		Find(&remaining).Error; err != nil {
+		t.Fatalf("load staging placeholders after ticket deletion: %v", err)
+	}
+	if len(remaining) != 2 ||
+		remaining[0].ID != attachments[2].ID ||
+		remaining[0].StorageType !=
+			attachmentStagingIntentStorageType ||
+		remaining[1].ID != attachments[3].ID ||
+		remaining[1].StorageType !=
+			attachmentStagingCleanupStorageType {
+		t.Fatalf(
+			"ticket deletion retained unexpected attachment rows: %+v",
+			remaining,
+		)
+	}
+}
+
+func TestDeleteTicketRejectsCancelledAttachmentWithResidualPath(t *testing.T) {
+	db := openAgentNativeTestDB(t)
+	if err := db.AutoMigrate(&models.Notification{}); err != nil {
+		t.Fatalf("migrate ticket deletion dependencies: %v", err)
+	}
+	user := seedActorUser(t, db, "delete-cancelled-residual")
+	actor := models.HumanActor(user.ID)
+	ctx := testProjectOperationContext(t, db, actor)
+	ticket := seedNativeTicket(
+		t,
+		db,
+		user.ID,
+		"DELETE-CANCELLED-RESIDUAL-001",
+	)
+	attachment := models.TicketAttachment{
+		TicketID: ticket.ID, UploadedBy: &user.ID,
+		ActorType: actor.Type, ActorID: actor.ID,
+		FileName: "cancelled.txt", OriginalName: "cancelled.txt",
+		StorageType: attachmentUploadCancelledStorageType,
+		StoragePath: ".staging/residual-cancelled.txt",
+	}
+	if err := db.Create(&attachment).Error; err != nil {
+		t.Fatalf("create invalid cancelled attachment: %v", err)
+	}
+
+	native := NewAgentNativeService(db, AgentNativeOptions{})
+	_, err := native.DeleteTicket(ctx, DeleteTicketCommand{
+		TicketID:        ticket.ID,
+		ExpectedVersion: ticket.Version,
+		Actor:           actor,
+		SourceProtocol:  "test",
+	})
+	if !errors.Is(err, ErrInvalidAttachmentCleanup) {
+		t.Fatalf(
+			"cancelled attachment residual path error = %v, want ErrInvalidAttachmentCleanup",
+			err,
+		)
+	}
+
+	var persistedTicket models.Ticket
+	if err := db.First(&persistedTicket, ticket.ID).Error; err != nil {
+		t.Fatalf("failed deletion removed ticket: %v", err)
+	}
+	if persistedTicket.Version != ticket.Version {
+		t.Fatalf(
+			"failed deletion changed ticket version to %d",
+			persistedTicket.Version,
+		)
+	}
+	var persistedAttachment models.TicketAttachment
+	if err := db.First(&persistedAttachment, attachment.ID).Error; err != nil {
+		t.Fatalf("failed deletion removed attachment: %v", err)
+	}
+}
+
+func TestDeleteTicketDoesNotRetainLegacyNullStorageTypeRow(t *testing.T) {
+	db := openAgentNativeTestDB(t)
+	if err := db.AutoMigrate(&models.Notification{}); err != nil {
+		t.Fatalf("migrate ticket deletion dependencies: %v", err)
+	}
+	user := seedActorUser(t, db, "delete-null-storage-type")
+	actor := models.HumanActor(user.ID)
+	ctx := testProjectOperationContext(t, db, actor)
+	ticket := seedNativeTicket(
+		t,
+		db,
+		user.ID,
+		"DELETE-NULL-STORAGE-TYPE-001",
+	)
+	attachment := models.TicketAttachment{
+		TicketID: ticket.ID, UploadedBy: &user.ID,
+		ActorType: actor.Type, ActorID: actor.ID,
+		FileName: "legacy.txt", OriginalName: "legacy.txt",
+		StorageType: "local",
+		StoragePath: "tickets/legacy/legacy.txt",
+	}
+	if err := db.Create(&attachment).Error; err != nil {
+		t.Fatalf("create legacy attachment: %v", err)
+	}
+	if err := db.Exec(
+		"UPDATE ticket_attachments SET storage_type = NULL WHERE id = ?",
+		attachment.ID,
+	).Error; err != nil {
+		t.Fatalf("seed legacy NULL storage type: %v", err)
+	}
+
+	native := NewAgentNativeService(db, AgentNativeOptions{})
+	if _, err := native.DeleteTicket(ctx, DeleteTicketCommand{
+		TicketID:        ticket.ID,
+		ExpectedVersion: ticket.Version,
+		Actor:           actor,
+		SourceProtocol:  "test",
+	}); err != nil {
+		t.Fatalf("delete ticket with legacy NULL storage type: %v", err)
+	}
+
+	var persisted models.TicketAttachment
+	if err := db.First(&persisted, attachment.ID).Error; !errors.Is(
+		err,
+		gorm.ErrRecordNotFound,
+	) {
+		t.Fatalf("legacy NULL storage type row survived deletion: %v", err)
 	}
 }

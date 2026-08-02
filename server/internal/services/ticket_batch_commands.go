@@ -114,6 +114,22 @@ func (s *AgentNativeService) DeleteTicket(
 				attachments[i].StoragePath == "" {
 				continue
 			}
+			switch attachments[i].StorageType {
+			case attachmentStagingIntentStorageType,
+				attachmentStagingCleanupStorageType,
+				"staging":
+				// Transitional objects remain owned by their durable staging
+				// or upload-recovery delivery. Routing them through the final
+				// attachment store either races that worker or dead-letters
+				// because these internal storage states are not store IDs.
+				continue
+			case attachmentUploadCancelledStorageType:
+				return fmt.Errorf(
+					"prepare attachment %d cleanup: %w",
+					attachments[i].ID,
+					ErrInvalidAttachmentCleanup,
+				)
+			}
 			cleanupObject := AttachmentCleanupObject{
 				AttachmentID: attachments[i].ID,
 				TicketID:     ticket.ID,
@@ -163,12 +179,22 @@ func (s *AgentNativeService) DeleteTicket(
 			Delete(&models.TicketHistory{}).Error; err != nil {
 			return fmt.Errorf("delete ticket histories: %w", err)
 		}
+		// The delayed staging cleanup delivery resolves its immutable key from
+		// this private placeholder. Keep only those fenced rows until that
+		// worker deletes the staged object and then removes the row.
 		if err := tx.Where(
 			"ticket_id = ? AND organization_id = ? AND project_id = ?",
 			ticket.ID,
 			projectScope.OrganizationID,
 			projectScope.ProjectID,
 		).
+			Where(
+				"storage_type IS NULL OR storage_type NOT IN ?",
+				[]string{
+					attachmentStagingIntentStorageType,
+					attachmentStagingCleanupStorageType,
+				},
+			).
 			Delete(&models.TicketAttachment{}).Error; err != nil {
 			return fmt.Errorf("delete ticket attachments: %w", err)
 		}

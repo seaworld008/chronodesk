@@ -1,8 +1,8 @@
 diff --git a/node_modules/ra-ui-materialui/dist/input/AutocompleteInput.cjs b/node_modules/ra-ui-materialui/dist/input/AutocompleteInput.cjs
-index 7c76b61..de61205 100644
+index 7c76b61..f90a546 100644
 --- a/node_modules/ra-ui-materialui/dist/input/AutocompleteInput.cjs
 +++ b/node_modules/ra-ui-materialui/dist/input/AutocompleteInput.cjs
-@@ -487,7 +487,7 @@ If you provided a React element for the optionText prop, you must also provide t
+@@ -487,9 +487,10 @@ If you provided a React element for the optionText prop, you must also provide t
                      ...TextFieldProps?.InputProps,
                  };
                  // @ts-expect-error slotProps do not yet exist in MUI v5
@@ -10,8 +10,26 @@ index 7c76b61..de61205 100644
 +                const mergedSlotProps = material_1.major >= 6
                      ? {
                          slotProps: {
++                            ...params.slotProps,
                              // @ts-expect-error slotProps do not yet exist in MUI v5
-@@ -501,11 +501,11 @@ If you provided a React element for the optionText prop, you must also provide t
+                             ...TextFieldProps?.slotProps,
+                             input: {
+@@ -497,15 +498,26 @@ If you provided a React element for the optionText prop, you must also provide t
+                                 ...params.InputProps,
+                                 // @ts-expect-error slotProps do not yet exist in MUI v5
+                                 ...TextFieldProps?.slotProps?.input,
++                                ...params.slotProps?.input,
++                            },
++                            inputLabel: {
++                                // @ts-expect-error slotProps do not yet exist in MUI v5
++                                ...TextFieldProps?.slotProps?.inputLabel,
++                                ...params.slotProps?.inputLabel,
++                            },
++                            htmlInput: {
++                                // @ts-expect-error slotProps do not yet exist in MUI v5
++                                ...TextFieldProps?.slotProps?.htmlInput,
++                                ...params.slotProps?.htmlInput,
+                             },
                          },
                      }
                      : undefined;
@@ -27,10 +45,10 @@ index 7c76b61..de61205 100644
                  ? // In MUI v7, renderValue replaces renderTags, but it is also
                      // called in single-selection mode with a non-array value.
 diff --git a/node_modules/ra-ui-materialui/dist/input/AutocompleteInput.js b/node_modules/ra-ui-materialui/dist/input/AutocompleteInput.js
-index a08783e..b39fff2 100644
+index a08783e..a360f12 100644
 --- a/node_modules/ra-ui-materialui/dist/input/AutocompleteInput.js
 +++ b/node_modules/ra-ui-materialui/dist/input/AutocompleteInput.js
-@@ -448,7 +448,7 @@ If you provided a React element for the optionText prop, you must also provide t
+@@ -448,9 +448,10 @@ If you provided a React element for the optionText prop, you must also provide t
                      ...TextFieldProps?.InputProps,
                  };
                  // @ts-expect-error slotProps do not yet exist in MUI v5
@@ -38,8 +56,26 @@ index a08783e..b39fff2 100644
 +                const mergedSlotProps = muiMajor >= 6
                      ? {
                          slotProps: {
++                            ...params.slotProps,
                              // @ts-expect-error slotProps do not yet exist in MUI v5
-@@ -462,11 +462,11 @@ If you provided a React element for the optionText prop, you must also provide t
+                             ...TextFieldProps?.slotProps,
+                             input: {
+@@ -458,15 +459,26 @@ If you provided a React element for the optionText prop, you must also provide t
+                                 ...params.InputProps,
+                                 // @ts-expect-error slotProps do not yet exist in MUI v5
+                                 ...TextFieldProps?.slotProps?.input,
++                                ...params.slotProps?.input,
++                            },
++                            inputLabel: {
++                                // @ts-expect-error slotProps do not yet exist in MUI v5
++                                ...TextFieldProps?.slotProps?.inputLabel,
++                                ...params.slotProps?.inputLabel,
++                            },
++                            htmlInput: {
++                                // @ts-expect-error slotProps do not yet exist in MUI v5
++                                ...TextFieldProps?.slotProps?.htmlInput,
++                                ...params.slotProps?.htmlInput,
+                             },
                          },
                      }
                      : undefined;
@@ -133,7 +169,7 @@ index 1ee7a8a..2d3feca 100644
  ResettableTextField.displayName = 'ResettableTextField';
  const handleMouseDownClearButton = event => {
 diff --git a/node_modules/ra-ui-materialui/dist/list/datagrid/DatagridRow.cjs b/node_modules/ra-ui-materialui/dist/list/datagrid/DatagridRow.cjs
-index 5e2e5b6..b8a893f 100644
+index 5e2e5b6..0ce2477 100644
 --- a/node_modules/ra-ui-materialui/dist/list/datagrid/DatagridRow.cjs
 +++ b/node_modules/ra-ui-materialui/dist/list/datagrid/DatagridRow.cjs
 @@ -93,6 +93,11 @@ const DatagridRow = react_1.default.forwardRef((props, ref) => {
@@ -159,15 +195,8 @@ index 5e2e5b6..b8a893f 100644
              react_1.default.Children.map(children, (field, index) => (0, react_1.isValidElement)(field) ? (react_1.default.createElement(DatagridCell_1.default, { key: `${id}-${field.props.source || index}`, className: (0, clsx_1.default)(`column-${field.props.source}`, useDatagridStyles_1.DatagridClasses.rowCell), record: record, field: field,
                  resource })) : null)),
          expandable && expanded && (react_1.default.createElement(material_1.TableRow, { key: `${id}-expand`, id: `${id}-expand`, className: useDatagridStyles_1.DatagridClasses.expandedPanel },
-@@ -159,4 +162,4 @@ exports.PureDatagridRow = (0, react_1.memo)(DatagridRow, areEqual);
- exports.PureDatagridRow.displayName = 'PureDatagridRow';
- const isPromise = (value) => value && typeof value.then === 'function';
- exports.default = DatagridRow;
--//# sourceMappingURL=DatagridRow.js.map
-\ No newline at end of file
-+//# sourceMappingURL=DatagridRow.js.map
 diff --git a/node_modules/ra-ui-materialui/dist/list/datagrid/DatagridRow.js b/node_modules/ra-ui-materialui/dist/list/datagrid/DatagridRow.js
-index f3c23ca..6313b8b 100644
+index f3c23ca..a701942 100644
 --- a/node_modules/ra-ui-materialui/dist/list/datagrid/DatagridRow.js
 +++ b/node_modules/ra-ui-materialui/dist/list/datagrid/DatagridRow.js
 @@ -54,6 +54,11 @@ const DatagridRow = React.forwardRef((props, ref) => {
@@ -193,15 +222,8 @@ index f3c23ca..6313b8b 100644
              React.Children.map(children, (field, index) => isValidElement(field) ? (React.createElement(DatagridCell, { key: `${id}-${field.props.source || index}`, className: clsx(`column-${field.props.source}`, DatagridClasses.rowCell), record: record, field: field,
                  resource })) : null)),
          expandable && expanded && (React.createElement(TableRow, { key: `${id}-expand`, id: `${id}-expand`, className: DatagridClasses.expandedPanel },
-@@ -120,4 +123,4 @@ export const PureDatagridRow = memo(DatagridRow, areEqual);
- PureDatagridRow.displayName = 'PureDatagridRow';
- const isPromise = (value) => value && typeof value.then === 'function';
- export default DatagridRow;
--//# sourceMappingURL=DatagridRow.js.map
-\ No newline at end of file
-+//# sourceMappingURL=DatagridRow.js.map
 diff --git a/node_modules/ra-ui-materialui/dist/list/datatable/SelectRowCheckbox.cjs b/node_modules/ra-ui-materialui/dist/list/datatable/SelectRowCheckbox.cjs
-index 390bc7f..55c8d4c 100644
+index 390bc7f..c251195 100644
 --- a/node_modules/ra-ui-materialui/dist/list/datatable/SelectRowCheckbox.cjs
 +++ b/node_modules/ra-ui-materialui/dist/list/datatable/SelectRowCheckbox.cjs
 @@ -48,15 +48,18 @@ exports.SelectRowCheckbox = (0, react_1.memo)(() => {
@@ -225,11 +247,10 @@ index 390bc7f..55c8d4c 100644
 +    return (react_1.default.createElement(material_1.Checkbox, { slotProps: { input: selectRowInputProps }, color: "primary", className: `select-item ${DataTableRoot_1.DataTableClasses.checkbox}`, checked: selectable && selected, onClick: handleToggleSelection, disabled: !selectable }));
  });
  exports.SelectRowCheckbox.displayName = 'SelectRowTableCell';
--//# sourceMappingURL=SelectRowCheckbox.js.map
+ //# sourceMappingURL=SelectRowCheckbox.js.map
 \ No newline at end of file
-+//# sourceMappingURL=SelectRowCheckbox.js.map
 diff --git a/node_modules/ra-ui-materialui/dist/list/datatable/SelectRowCheckbox.js b/node_modules/ra-ui-materialui/dist/list/datatable/SelectRowCheckbox.js
-index b57ec32..3df58dc 100644
+index b57ec32..44b9d84 100644
 --- a/node_modules/ra-ui-materialui/dist/list/datatable/SelectRowCheckbox.js
 +++ b/node_modules/ra-ui-materialui/dist/list/datatable/SelectRowCheckbox.js
 @@ -12,15 +12,18 @@ export const SelectRowCheckbox = memo(() => {
@@ -253,14 +274,13 @@ index b57ec32..3df58dc 100644
 +    return (React.createElement(Checkbox, { slotProps: { input: selectRowInputProps }, color: "primary", className: `select-item ${DataTableClasses.checkbox}`, checked: selectable && selected, onClick: handleToggleSelection, disabled: !selectable }));
  });
  SelectRowCheckbox.displayName = 'SelectRowTableCell';
--//# sourceMappingURL=SelectRowCheckbox.js.map
+ //# sourceMappingURL=SelectRowCheckbox.js.map
 \ No newline at end of file
-+//# sourceMappingURL=SelectRowCheckbox.js.map
 diff --git a/node_modules/ra-ui-materialui/src/input/AutocompleteInput.tsx b/node_modules/ra-ui-materialui/src/input/AutocompleteInput.tsx
-index d5e8eb9..0ff87bc 100644
+index d5e8eb9..8c3e0f3 100644
 --- a/node_modules/ra-ui-materialui/src/input/AutocompleteInput.tsx
 +++ b/node_modules/ra-ui-materialui/src/input/AutocompleteInput.tsx
-@@ -726,7 +726,7 @@ If you provided a React element for the optionText prop, you must also provide t
+@@ -726,9 +726,10 @@ If you provided a React element for the optionText prop, you must also provide t
                          ...TextFieldProps?.InputProps,
                      };
                      // @ts-expect-error slotProps do not yet exist in MUI v5
@@ -268,8 +288,29 @@ index d5e8eb9..0ff87bc 100644
 +                    const mergedSlotProps = muiMajor >= 6
                          ? {
                                slotProps: {
++                                  ...params.slotProps,
                                    // @ts-expect-error slotProps do not yet exist in MUI v5
-@@ -774,7 +774,9 @@ If you provided a React element for the optionText prop, you must also provide t
+                                   ...TextFieldProps?.slotProps,
+                                   input: {
+@@ -736,6 +737,17 @@ If you provided a React element for the optionText prop, you must also provide t
+                                       ...params.InputProps,
+                                       // @ts-expect-error slotProps do not yet exist in MUI v5
+                                       ...TextFieldProps?.slotProps?.input,
++                                      ...params.slotProps?.input,
++                                  },
++                                  inputLabel: {
++                                      // @ts-expect-error slotProps do not yet exist in MUI v5
++                                      ...TextFieldProps?.slotProps?.inputLabel,
++                                      ...params.slotProps?.inputLabel,
++                                  },
++                                  htmlInput: {
++                                      // @ts-expect-error slotProps do not yet exist in MUI v5
++                                      ...TextFieldProps?.slotProps?.htmlInput,
++                                      ...params.slotProps?.htmlInput,
+                                   },
+                               },
+                           }
+@@ -774,7 +786,9 @@ If you provided a React element for the optionText prop, you must also provide t
                              })}
                              {...params}
                              {...TextFieldProps}

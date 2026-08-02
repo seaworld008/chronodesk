@@ -182,7 +182,9 @@ npm run build
 
 依赖审计只保留一个有时限的 React Router RSC 专用例外，复核截止日期为
 `2026-09-30`。ChronoDesk 当前不使用 RSC；安全脚本在检测到 RSC 使用或例外到期时
-必须失败。该例外不能被描述为“零例外”或“漏洞已修复”。
+必须失败。该例外不能被描述为“零例外”或“漏洞已修复”。该段是 2026-07-30
+时点记录；上游随后确认 `7.18.2` 已包含 v7 回移修复，当前结论见
+[React Router Advisory 处置决策](REACT_ROUTER_ADVISORY_DECISION_2026-08-02.md)。
 
 ## 4. Chrome 插件真实页面验收
 

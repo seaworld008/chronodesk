@@ -2240,7 +2240,8 @@ func (ns *NotificationService) DeliverTicketNotificationOutbox(
 	switch notificationType {
 	case models.NotificationTypeTicketAssigned:
 		if event.Type != eventcontract.TicketAssignedEventType &&
-			event.Type != eventcontract.TicketUpdatedEventType {
+			event.Type != eventcontract.TicketUpdatedEventType &&
+			event.Type != eventcontract.TicketEscalatedEventType {
 			return nil, false, fmt.Errorf(
 				"ticket assignment notification does not support event %q",
 				event.Type,
@@ -2249,15 +2250,27 @@ func (ns *NotificationService) DeliverTicketNotificationOutbox(
 		if data.AssignedToID == 0 || data.AssignedToID != recipientID {
 			return nil, false, errors.New("assignment notification recipient does not match event data")
 		}
-		notification.Title = truncateNotificationTitle(
-			"新工单已分配 - "+data.TicketTitle,
-			255,
-		)
-		notification.Content = fmt.Sprintf(
-			"工单 #%s 已分配给您，请及时处理",
-			data.TicketNumber,
-		)
-		notification.Priority = models.NotificationPriorityHigh
+		if event.Type == eventcontract.TicketEscalatedEventType {
+			notification.Title = truncateNotificationTitle(
+				"工单已升级 - "+data.TicketTitle,
+				255,
+			)
+			notification.Content = fmt.Sprintf(
+				"工单 #%s 已升级并分配给您，请优先处理",
+				data.TicketNumber,
+			)
+			notification.Priority = models.NotificationPriorityUrgent
+		} else {
+			notification.Title = truncateNotificationTitle(
+				"新工单已分配 - "+data.TicketTitle,
+				255,
+			)
+			notification.Content = fmt.Sprintf(
+				"工单 #%s 已分配给您，请及时处理",
+				data.TicketNumber,
+			)
+			notification.Priority = models.NotificationPriorityHigh
+		}
 		metadata["priority"] = string(data.TicketPriority)
 	case models.NotificationTypeTicketStatusChanged:
 		if event.Type != eventcontract.TicketTransitionedEventType &&
