@@ -864,6 +864,9 @@ func (s *AgentNativeService) ExecuteAttachmentStagingCleanupOutbox(
 				return revalidateErr
 			}
 			var attachment models.TicketAttachment
+			// Ticket deletion preserves this private upload placeholder until
+			// the delayed cleanup becomes due. The exact scope, ID, state and
+			// key fences below keep the worker away from finalized attachments.
 			queryErr := s.db.WithContext(scopedContext).
 				Clauses(clause.Locking{Strength: "UPDATE"}).
 				Where(
@@ -885,9 +888,12 @@ func (s *AgentNativeService) ExecuteAttachmentStagingCleanupOutbox(
 				result := s.db.WithContext(scopedContext).
 					Model(&models.TicketAttachment{}).
 					Where(
-						"id = ? AND storage_type = ?",
+						"id = ? AND organization_id = ? AND project_id = ? AND storage_type = ? AND storage_path = ?",
 						attachment.ID,
+						operation.Scope.OrganizationID,
+						operation.Scope.ProjectID,
 						attachmentStagingIntentStorageType,
+						stagingKey,
 					).
 					Updates(map[string]any{
 						"storage_type": attachmentStagingCleanupStorageType,
@@ -934,6 +940,9 @@ func (s *AgentNativeService) ExecuteAttachmentStagingCleanupOutbox(
 				); revalidateErr != nil {
 				return revalidateErr
 			}
+			// Once the staged object is gone, physically remove only the
+			// still-fenced placeholder so a completed intent cannot be
+			// rediscovered or retain a stale storage key.
 			result := s.db.WithContext(scopedContext).
 				Where(
 					"id = ? AND organization_id = ? AND project_id = ? AND storage_type = ? AND storage_path = ?",
