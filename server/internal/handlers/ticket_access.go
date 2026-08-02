@@ -57,6 +57,10 @@ func isProjectObserverRole(role string) bool {
 	return role == string(models.ProjectRoleObserver)
 }
 
+func isPublicTicketContentOnlyRole(role string) bool {
+	return isRequesterRole(role) || isProjectObserverRole(role)
+}
+
 func authorizeTicket(
 	ctx context.Context,
 	c *gin.Context,
@@ -241,10 +245,10 @@ type ticketHistoryResponse struct {
 	IsImportant     bool                           `json:"is_important"`
 }
 
-func ticketHistoryResponses(histories []*models.TicketHistory, customer bool) []*ticketHistoryResponse {
+func ticketHistoryResponses(histories []*models.TicketHistory, publicOnly bool) []*ticketHistoryResponse {
 	result := make([]*ticketHistoryResponse, 0, len(histories))
 	for _, history := range histories {
-		if history == nil || (customer && !customerCanSeeTicketHistory(history)) {
+		if history == nil || (publicOnly && !customerCanSeeTicketHistory(history)) {
 			continue
 		}
 		response := &ticketHistoryResponse{
@@ -266,7 +270,7 @@ func ticketHistoryResponses(histories []*models.TicketHistory, customer bool) []
 			IsAutomated:  history.IsAutomated,
 			IsImportant:  history.IsImportant,
 		}
-		if !customer {
+		if !publicOnly {
 			actor := history.Actor()
 			response.Actor = &actor
 			response.EventID = history.EventID

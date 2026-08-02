@@ -53,6 +53,9 @@ const [
     ticketConversation,
     ticketWorkflowActions,
     authProvider,
+    publicAuthApi,
+    loginPage,
+    customAppBar,
     loginHistory,
     ticketRelationships,
     agentCollaboration,
@@ -85,6 +88,9 @@ const [
     readWebSource('admin', 'tickets', 'TicketConversationPanel.tsx'),
     readWebSource('admin', 'tickets', 'TicketWorkflowActions.tsx'),
     readWebSource('lib', 'authProvider.ts'),
+    readWebSource('components', 'auth', 'publicAuthApi.ts'),
+    readWebSource('components', 'auth', 'LoginPage.tsx'),
+    readWebSource('layout', 'CustomAppBar.tsx'),
     readWebSource('admin', 'security', 'LoginHistory.tsx'),
     readWebSource('admin', 'tickets', 'TicketRelationshipsPanel.tsx'),
     readWebSource('admin', 'agents', 'AgentCollaborationWorkspace.tsx'),
@@ -736,6 +742,8 @@ for (const [source, helperNames, forbiddenPath] of [
     [
         integrationRuntime,
         [
+            'listAgentOutboxDeliveries',
+            'replayOutboxDeliveryV2',
             'resolveProjectIntegrationConflict',
             'replayProjectIntegrationDeadLetter',
         ],
@@ -812,6 +820,7 @@ for (const [source, typeNames] of [
     [
         integrationRuntime,
         [
+            'AdminOutboxPage',
             'ReplayIntegrationDeadLetterRequest',
             'ResolveIntegrationConflictRequest',
         ],
@@ -826,6 +835,26 @@ for (const [source, typeNames] of [
         )
     }
 }
+assert.match(
+    integrationRuntime,
+    /role === 'project_admin'\s*&&\s*hasProjectCapability\(role,\s*'manage_agents'\)/u,
+    'Integration Outbox replay must require project_admin manage_agents',
+)
+assert.match(
+    integrationRuntime,
+    /confirmation\.kind === 'outbox-replay'\s*&&\s*!canReplayOutbox/u,
+    'Integration Outbox replay execution must fail closed without manage_agents',
+)
+assert.match(
+    integrationRuntime,
+    /row\.status === 'failed'\s*\|\|\s*row\.status === 'dead'/u,
+    'Integration Outbox replay must be limited to failed or dead deliveries',
+)
+assert.match(
+    integrationRuntime,
+    /'Idempotency-Key': newIdempotencyKey\(\)[\s\S]*'If-Match': formatResourceVersion\(delivery\.resource_version\)/u,
+    'Integration Outbox replay must preserve idempotency and version preconditions',
+)
 for (const [schemaName, forbidden] of [
     [
         'LoginHistoryRecord',
@@ -1594,6 +1623,19 @@ assert.equal(
     ),
     false,
 )
+for (const [schemaName, propertyName] of [
+    ['RegisterHumanRequest', 'email'],
+    ['LoginRequest', 'email'],
+    ['LoginRequest', 'device_name'],
+    ['ForgotPasswordRequest', 'email'],
+    ['ResendHumanEmailVerificationRequest', 'email'],
+]) {
+    assert.equal(
+        contract.components.schemas[schemaName].properties[propertyName]
+            .maxLength,
+        100,
+    )
+}
 assert.equal(
     contract.paths['/auth/refresh'].post.responses['200'].content[
         'application/json'
@@ -1635,9 +1677,17 @@ assert.deepEqual(
     ['refresh_token'],
 )
 for (const [operationPath, expectedStatuses] of [
-    ['/auth/login', ['200', '400', '401', '403', '429', '503']],
-    ['/auth/refresh', ['200', '400', '401', '408', '429', '503']],
-    ['/auth/logout', ['200', '400', '429', '503']],
+    ['/auth/register', ['201', '400', '409', '413', '429', '500', '503']],
+    ['/auth/forgot-password', ['200', '400', '413', '429', '503']],
+    [
+        '/auth/reset-password',
+        ['200', '400', '413', '429', '500', '503'],
+    ],
+    ['/auth/verify-email', ['200', '400', '413', '429', '500', '503']],
+    ['/auth/resend-verification', ['200', '400', '413', '429', '503']],
+    ['/auth/login', ['200', '400', '401', '403', '413', '429', '503']],
+    ['/auth/refresh', ['200', '400', '401', '408', '413', '429', '503']],
+    ['/auth/logout', ['200', '400', '413', '429', '503']],
     ['/auth/logout-all', ['200', '401', '429', '500', '503']],
 ]) {
     assert.deepEqual(
@@ -1645,6 +1695,10 @@ for (const [operationPath, expectedStatuses] of [
         expectedStatuses,
     )
 }
+assert.deepEqual(
+    Object.keys(contract.paths['/auth/profile'].put.responses),
+    ['200', '400', '401', '413'],
+)
 assert.equal(
     contract.paths['/platform/projects'].get.responses['200'].content[
         'application/json'
@@ -2002,6 +2056,7 @@ const p1Operations = [
     ['/projects/{projectKey}/tickets/{ticketID}/transfer', 'post'],
     ['/projects/{projectKey}/tickets/{ticketID}/escalate', 'post'],
     ['/projects/{projectKey}/tickets/{ticketID}/status', 'post'],
+    ['/projects/{projectKey}/tickets/{ticketID}/transitions', 'get'],
     ['/projects/{projectKey}/tickets/{ticketID}/history', 'get'],
     ['/projects/{projectKey}/tickets/{ticketID}/comments', 'get'],
     ['/projects/{projectKey}/tickets/{ticketID}/comments', 'post'],
@@ -2339,6 +2394,7 @@ for (const routeHelper of [
     'assignProjectTicket',
     'transferProjectTicket',
     'escalateProjectTicket',
+    'getProjectTicketAllowedTransitions',
     'updateProjectTicketStatus',
 ]) {
     assert.match(
@@ -2370,6 +2426,35 @@ for (const routeHelper of [
 }
 assert.doesNotMatch(authProvider, /buildUrl\(\s*['"`]\/auth\//)
 
+for (const routeHelper of [
+    'registerHuman',
+    'requestHumanPasswordReset',
+    'resetHumanPassword',
+    'verifyHumanEmail',
+    'resendHumanEmailVerification',
+]) {
+    assert.match(
+        publicAuthApi,
+        new RegExp(`humanApiRoutes\\.${routeHelper}`),
+    )
+}
+assert.doesNotMatch(publicAuthApi, /['"`]\/auth\//)
+for (const publicRoute of [
+    '/register',
+    '/forgot-password',
+    '/reset-password',
+    '/verify-email',
+    '/resend-verification',
+]) {
+    assert.match(adminApp, new RegExp(`path=["']${publicRoute}["']`))
+}
+assert.match(adminApp, /<CustomRoutes noLayout>/)
+assert.match(loginPage, /to=["']\/register["']/)
+assert.match(loginPage, /to=["']\/forgot-password["']/)
+assert.match(loginPage, /to=["']\/resend-verification["']/)
+assert.match(customAppBar, /replace\(publicLoginHashTarget\)/)
+assert.doesNotMatch(customAppBar, /location\.(?:assign|replace)\(['"]\/login/)
+
 for (const requestSchema of [
     'CreateTicketRequest',
     'UpdateTicketRequest',
@@ -2380,6 +2465,9 @@ for (const requestSchema of [
     'UpdateSystemConfigRequest',
     'ForgotPasswordRequest',
     'ResetHumanPasswordRequest',
+    'RegisterHumanRequest',
+    'VerifyHumanEmailRequest',
+    'ResendHumanEmailVerificationRequest',
     'AssignTicketRequest',
     'TransferTicketRequest',
     'EscalateTicketRequest',

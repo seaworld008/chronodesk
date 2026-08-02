@@ -12,6 +12,8 @@ import (
 
 var emailConfigValidator = validator.New()
 
+const invalidSMTPHostMessage = "SMTP 主机必须是合法的主机名、IPv4 或未加方括号的 IPv6 地址，且不能包含协议、端口或路径"
+
 // EmailConfigHandler 邮箱配置处理器
 type EmailConfigHandler struct {
 	emailConfigService services.EmailConfigServiceInterface
@@ -83,14 +85,24 @@ func (h *EmailConfigHandler) UpdateEmailConfig(c *gin.Context) {
 		return
 	}
 	if req.SMTPHost != nil && *req.SMTPHost != "" {
-		if err := emailConfigValidator.Var(*req.SMTPHost, "hostname"); err != nil {
-			h.response.Error(c, http.StatusBadRequest, "invalid_request", "SMTP 主机名格式无效")
+		if err := emailConfigValidator.Var(*req.SMTPHost, "hostname_rfc1123|ip"); err != nil {
+			h.response.Error(
+				c,
+				http.StatusBadRequest,
+				"invalid_smtp_host",
+				invalidSMTPHostMessage,
+			)
 			return
 		}
 	}
 	if req.FromEmail != nil && *req.FromEmail != "" {
 		if err := emailConfigValidator.Var(*req.FromEmail, "email"); err != nil {
-			h.response.Error(c, http.StatusBadRequest, "invalid_request", "发件人邮箱格式无效")
+			h.response.Error(
+				c,
+				http.StatusBadRequest,
+				"invalid_from_email",
+				"发件人邮箱格式无效",
+			)
 			return
 		}
 	}

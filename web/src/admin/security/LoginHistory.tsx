@@ -1,11 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Refresh as RefreshIcon } from '@mui/icons-material'
+import {
+    Logout as LogoutIcon,
+    Refresh as RefreshIcon,
+} from '@mui/icons-material'
 import {
     Alert,
     Box,
     Button,
     Chip,
     CircularProgress,
+    Dialog,
+    DialogActions,
+    DialogContent,
+    DialogContentText,
+    DialogTitle,
     IconButton,
     Paper,
     Stack,
@@ -16,6 +24,7 @@ import {
     TableRow,
     Tooltip,
 } from '@mui/material'
+import { useNotify } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
 import {
     humanApiRoutes,
@@ -37,6 +46,7 @@ const columns: ResizableColumn[] = [
     { key: 'ip', defaultWidth: 160, minWidth: 120, maxWidth: 240 },
     { key: 'location', defaultWidth: 220, minWidth: 140, maxWidth: 360 },
     { key: 'duration', defaultWidth: 150, minWidth: 120, maxWidth: 220 },
+    { key: 'actions', defaultWidth: 120, minWidth: 104, maxWidth: 180 },
 ]
 
 const dateTime = (value: string) => {
@@ -53,11 +63,15 @@ const statusLabel = (record: LoginHistoryRecord) => {
 }
 
 const LoginHistory = () => {
+    const notify = useNotify()
     const [page, setPage] = useState<LoginHistoryPage | null>(null)
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState('')
     const [pageIndex, setPageIndex] = useState(0)
     const [pageSize, setPageSize] = useState(25)
+    const [revokeTarget, setRevokeTarget] =
+        useState<LoginHistoryRecord | null>(null)
+    const [revoking, setRevoking] = useState(false)
     const requestController = useRef<AbortController | null>(null)
     const requestSequence = useRef(0)
 
@@ -109,6 +123,30 @@ const LoginHistory = () => {
         requestController.current?.abort()
         requestSequence.current += 1
     }, [])
+
+    const revokeSession = async () => {
+        if (!revokeTarget) return
+        setRevoking(true)
+        setError('')
+        try {
+            await apiFetch(
+                humanApiRoutes.deleteLoginHistorySession({
+                    loginHistoryID: revokeTarget.id,
+                }),
+                { method: 'DELETE' },
+            )
+            notify('指定设备会话已撤销', { type: 'success' })
+            setRevokeTarget(null)
+            await load()
+        } catch (requestError) {
+            setError(localizedUnknownErrorMessage(
+                requestError,
+                '撤销设备会话失败',
+            ))
+        } finally {
+            setRevoking(false)
+        }
+    }
 
     return (
         <PageShell
@@ -163,6 +201,7 @@ const LoginHistory = () => {
                                     <TableCell>IP 地址</TableCell>
                                     <TableCell>位置</TableCell>
                                     <TableCell>会话时长</TableCell>
+                                    <TableCell align="right">操作</TableCell>
                                 </TableRow>
                             </TableHead>
                             <TableBody>
@@ -202,11 +241,29 @@ const LoginHistory = () => {
                                             </TruncatedText>
                                         </TableCell>
                                         <TableCell>{record.session_duration || '—'}</TableCell>
+                                        <TableCell align="right">
+                                            {record.is_active
+                                                && !record.is_current_session ? (
+                                                <Tooltip title="撤销此设备会话">
+                                                    <span>
+                                                        <IconButton
+                                                            aria-label={`撤销会话：${record.device_info || record.ip_address || record.id}`}
+                                                            color="warning"
+                                                            onClick={() =>
+                                                                setRevokeTarget(record)
+                                                            }
+                                                        >
+                                                            <LogoutIcon />
+                                                        </IconButton>
+                                                    </span>
+                                                </Tooltip>
+                                            ) : '—'}
+                                        </TableCell>
                                     </TableRow>
                                 ))}
                                 {(page?.items.length ?? 0) === 0 && (
                                     <TableRow>
-                                        <TableCell colSpan={6} align="center" sx={{ py: 6 }}>
+                                        <TableCell colSpan={7} align="center" sx={{ py: 6 }}>
                                             暂无登录历史。
                                         </TableCell>
                                     </TableRow>
@@ -234,6 +291,35 @@ const LoginHistory = () => {
                     </Box>
                 )}
             </Paper>
+            <Dialog
+                open={revokeTarget !== null}
+                onClose={() => {
+                    if (!revoking) setRevokeTarget(null)
+                }}
+            >
+                <DialogTitle>撤销设备会话</DialogTitle>
+                <DialogContent>
+                    <DialogContentText>
+                        撤销后，该设备的刷新令牌会立即失效，需要重新登录。
+                    </DialogContentText>
+                </DialogContent>
+                <DialogActions>
+                    <Button
+                        disabled={revoking}
+                        onClick={() => setRevokeTarget(null)}
+                    >
+                        取消
+                    </Button>
+                    <Button
+                        color="warning"
+                        variant="contained"
+                        disabled={revoking}
+                        onClick={() => void revokeSession()}
+                    >
+                        确认撤销
+                    </Button>
+                </DialogActions>
+            </Dialog>
         </PageShell>
     )
 }

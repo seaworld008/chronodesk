@@ -42,6 +42,7 @@ import {
 import { logoutAllSessions } from '@/lib/authProvider'
 import { visibleNavigationItems } from '@/navigation/navigationRegistry'
 import { resolveRoutePageScope } from './routePageScope'
+import { publicLoginHashTarget } from './logoutNavigation'
 
 const LogoutAllMenuItem: React.FC = () => {
   const notify = useNotify()
@@ -50,10 +51,10 @@ const LogoutAllMenuItem: React.FC = () => {
     onClose?.()
     try {
       await logoutAllSessions()
-      window.location.assign('/login')
+      window.location.replace(publicLoginHashTarget)
     } catch {
       notify('已清理本地登录状态，请重新登录', { type: 'warning' })
-      window.location.assign('/login')
+      window.location.replace(publicLoginHashTarget)
     }
   }
   return (

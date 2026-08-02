@@ -262,6 +262,16 @@ func TestDomainEventAutomationUsesNativeCommandsAndIsIdempotent(t *testing.T) {
 		First(&originalDelivery).Error; err != nil {
 		t.Fatalf("load original delivery: %v", err)
 	}
+	if err := automation.db.Model(&models.OutboxDelivery{}).
+		Where("id = ?", originalDelivery.ID).
+		Updates(map[string]any{
+			"status":          models.OutboxDeliveryFailed,
+			"next_attempt_at": time.Now(),
+			"last_error":      "simulate a replayable delivery failure",
+			"delivered_at":    nil,
+		}).Error; err != nil {
+		t.Fatalf("make original delivery replayable: %v", err)
+	}
 	if err := native.ReplayOutbox(
 		automationWorkerTestContext(t, automation),
 		originalDelivery.ID,

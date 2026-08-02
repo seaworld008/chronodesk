@@ -13,6 +13,7 @@ import {
   CardContent,
   Chip,
   List,
+  ListItem,
   ListItemButton,
   ListItemText,
   Skeleton,
@@ -453,96 +454,100 @@ const TicketDashboard: React.FC = () => {
         <List disablePadding sx={{ width: '100%', bgcolor: 'background.paper' }}>
           {items.slice(0, 5).map((ticket, index) => (
             <React.Fragment key={ticket.id}>
-              <ListItemButton
-                alignItems="flex-start"
-                onClick={() => handleNavigateToTicketDetail(ticket.id)}
-                sx={{
-                  borderRadius: 2,
-                  px: 1,
-                  py: 1.5,
-                  mb: 0.5,
-                  '&:hover': { bgcolor: alpha(theme.palette.primary.main, 0.04) }
-                }}
-              >
-                <ListItemAvatar sx={{ minWidth: 48, mt: 0 }}>
-                  <Avatar sx={{
-                    width: 36, height: 36,
-                    bgcolor: ticket.is_overdue || ticket.sla_breached
-                      ? alpha(theme.palette.error.main, 0.1)
-                      : alpha(theme.palette.primary.main, 0.1),
-                    color: ticket.is_overdue || ticket.sla_breached
-                      ? 'error.main'
-                      : 'primary.main'
-                  }}>
-                    {ticket.is_overdue ? <Warning fontSize="small" /> :
-                      ticket.sla_breached ? <Timer fontSize="small" /> :
-                        <Assignment fontSize="small" />}
-                  </Avatar>
-                </ListItemAvatar>
-                <ListItemText
-                  primary={
-                    <Stack
-                      direction="row"
-                      spacing={1}
-                      sx={{
-                        justifyContent: "space-between",
-                        alignItems: "center"
-                      }}>
-                      <Typography
-                        variant="subtitle2"
-                        noWrap
+              <ListItem disablePadding sx={{ display: 'block' }}>
+                <ListItemButton
+                  alignItems="flex-start"
+                  onClick={() => handleNavigateToTicketDetail(ticket.id)}
+                  sx={{
+                    borderRadius: 2,
+                    px: 1,
+                    py: 1.5,
+                    mb: 0.5,
+                    '&:hover': { bgcolor: alpha(theme.palette.primary.main, 0.04) }
+                  }}
+                >
+                  <ListItemAvatar sx={{ minWidth: 48, mt: 0 }}>
+                    <Avatar sx={{
+                      width: 36, height: 36,
+                      bgcolor: ticket.is_overdue || ticket.sla_breached
+                        ? alpha(theme.palette.error.main, 0.1)
+                        : alpha(theme.palette.primary.main, 0.1),
+                      color: ticket.is_overdue || ticket.sla_breached
+                        ? 'error.main'
+                        : 'primary.main'
+                    }}>
+                      {ticket.is_overdue ? <Warning fontSize="small" /> :
+                        ticket.sla_breached ? <Timer fontSize="small" /> :
+                          <Assignment fontSize="small" />}
+                    </Avatar>
+                  </ListItemAvatar>
+                  <ListItemText
+                    primary={
+                      <Stack
+                        direction="row"
+                        spacing={1}
                         sx={{
-                          fontWeight: 600,
-                          maxWidth: '70%'
+                          justifyContent: "space-between",
+                          alignItems: "center"
                         }}>
-                        {ticket.title}
-                      </Typography>
-                      <Chip
-                        size="small"
-                        label={ticketStatusLabels[ticket.status] ?? '未知状态'}
-                        color={getStatusColor(ticket.status)}
-                        sx={{ height: 20, fontSize: '0.7rem', fontWeight: 500 }}
-                      />
-                    </Stack>
-                  }
-                  secondary={
-                    <Stack
-                      direction="row"
-                      spacing={1}
-                      component="span"
-                      sx={{
-                        alignItems: "center",
-                        mt: 0.5
-                      }}>
-                      <Typography
-                        variant="caption"
+                        <Typography
+                          variant="subtitle2"
+                          noWrap
+                          sx={{
+                            fontWeight: 600,
+                            maxWidth: '70%'
+                          }}>
+                          {ticket.title}
+                        </Typography>
+                        <Chip
+                          size="small"
+                          label={ticketStatusLabels[ticket.status] ?? '未知状态'}
+                          color={getStatusColor(ticket.status)}
+                          sx={{ height: 20, fontSize: '0.7rem', fontWeight: 500 }}
+                        />
+                      </Stack>
+                    }
+                    secondary={
+                      <Stack
+                        direction="row"
+                        spacing={1}
+                        component="span"
                         sx={{
-                          color: "text.secondary",
-                          fontFamily: 'monospace'
+                          alignItems: "center",
+                          mt: 0.5
                         }}>
-                        #{ticket.ticket_number}
-                      </Typography>
-                      <Typography variant="caption" sx={{
-                        color: "text.disabled"
-                      }}>•</Typography>
-                      <Typography variant="caption" sx={{
-                        color: "text.secondary"
-                      }}>
-                        {ticket.customer_name || '匿名'}
-                      </Typography>
-                      <Typography variant="caption" sx={{
-                        color: "text.disabled"
-                      }}>•</Typography>
-                      <Typography variant="caption" sx={{
-                        color: "text.secondary"
-                      }}>
-                        {ticketPriorityLabels[ticket.priority] ?? '未知优先级'}
-                      </Typography>
-                    </Stack>
-                  }
-                />
-              </ListItemButton>
-              {index < items.slice(0, 5).length - 1 && <Divider variant="inset" component="li" sx={{ ml: 7 }} />}
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            color: "text.secondary",
+                            fontFamily: 'monospace'
+                          }}>
+                          #{ticket.ticket_number}
+                        </Typography>
+                        <Typography variant="caption" sx={{
+                          color: "text.disabled"
+                        }}>•</Typography>
+                        <Typography variant="caption" sx={{
+                          color: "text.secondary"
+                        }}>
+                          {ticket.customer_name || '匿名'}
+                        </Typography>
+                        <Typography variant="caption" sx={{
+                          color: "text.disabled"
+                        }}>•</Typography>
+                        <Typography variant="caption" sx={{
+                          color: "text.secondary"
+                        }}>
+                          {ticketPriorityLabels[ticket.priority] ?? '未知优先级'}
+                        </Typography>
+                      </Stack>
+                    }
+                  />
+                </ListItemButton>
+                {index < items.slice(0, 5).length - 1 && (
+                  <Divider variant="inset" sx={{ ml: 7 }} />
+                )}
+              </ListItem>
             </React.Fragment>
           ))}
         </List>

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -48,8 +49,37 @@ func setupSessionRevocationTest(t *testing.T) (*GormTokenRepository, *SimpleJWTM
 	if err != nil {
 		t.Fatalf("open session database: %v", err)
 	}
-	if err := db.AutoMigrate(&models.User{}, &models.LoginHistory{}, &RefreshToken{}); err != nil {
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.LoginHistory{},
+		&models.OTPTrustedDevice{},
+		&RefreshToken{},
+	); err != nil {
 		t.Fatalf("migrate refresh token session table: %v", err)
+	}
+	for _, user := range []models.User{
+		{
+			ID:            42,
+			Username:      "session-admin",
+			Email:         "session-admin@example.test",
+			PasswordHash:  "not-used",
+			PlatformRole:  models.PlatformRolePlatformAdmin,
+			Status:        models.UserStatusActive,
+			EmailVerified: true,
+		},
+		{
+			ID:            84,
+			Username:      "session-member",
+			Email:         "session-member@example.test",
+			PasswordHash:  "not-used",
+			PlatformRole:  models.PlatformRoleMember,
+			Status:        models.UserStatusActive,
+			EmailVerified: true,
+		},
+	} {
+		if err := db.Create(&user).Error; err != nil {
+			t.Fatalf("seed session user: %v", err)
+		}
 	}
 	repository := &GormTokenRepository{db: db}
 	manager := mustTestJWTManager(t, time.Hour, 24*time.Hour)
@@ -176,6 +206,49 @@ func TestLogoutRevokesAccessTokenSessionImmediately(t *testing.T) {
 	}
 }
 
+func TestLogoutKeepsTrustedDeviceCredentialForTheNextLogin(t *testing.T) {
+	repository, manager, handler := setupSessionRevocationTest(t)
+	_, refreshToken := issueSessionTokens(
+		t,
+		repository,
+		manager,
+		42,
+		PlatformRolePlatformAdmin,
+		"session-with-trusted-device",
+	)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/api/auth/logout", func(c *gin.Context) {
+		handler.Logout(NewGinHTTPContext(c))
+	})
+	body, err := json.Marshal(LogoutRequest{RefreshToken: refreshToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/auth/logout",
+		bytes.NewReader(body),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("logout status = %d; body=%s", response.Code, response.Body)
+	}
+	for _, cookie := range response.Result().Cookies() {
+		if cookie.Name == trustedDeviceCookieName {
+			t.Fatalf(
+				"普通退出错误清除了可信设备凭据: MaxAge=%d Expires=%s",
+				cookie.MaxAge,
+				cookie.Expires,
+			)
+		}
+	}
+}
+
 func TestLogoutAllRevokesEveryUserSessionOnly(t *testing.T) {
 	repository, manager, handler := setupSessionRevocationTest(t)
 	firstAccess, _ := issueSessionTokens(
@@ -187,6 +260,33 @@ func TestLogoutAllRevokesEveryUserSessionOnly(t *testing.T) {
 	otherAccess, _ := issueSessionTokens(
 		t, repository, manager, 84, PlatformRoleMember, "session-other-user",
 	)
+	for _, device := range []models.OTPTrustedDevice{
+		{
+			UserID:          42,
+			DeviceTokenHash: hashTrustedDeviceToken("admin-device-one"),
+			DeviceName:      "Admin device one",
+			LastUsedAt:      time.Now(),
+			ExpiresAt:       time.Now().Add(time.Hour),
+		},
+		{
+			UserID:          42,
+			DeviceTokenHash: hashTrustedDeviceToken("admin-device-two"),
+			DeviceName:      "Admin device two",
+			LastUsedAt:      time.Now(),
+			ExpiresAt:       time.Now().Add(time.Hour),
+		},
+		{
+			UserID:          84,
+			DeviceTokenHash: hashTrustedDeviceToken("other-user-device"),
+			DeviceName:      "Other user device",
+			LastUsedAt:      time.Now(),
+			ExpiresAt:       time.Now().Add(time.Hour),
+		},
+	} {
+		if err := repository.db.Create(&device).Error; err != nil {
+			t.Fatalf("persist trusted device: %v", err)
+		}
+	}
 
 	if err := handler.authService.LogoutAll(context.Background(), 42); err != nil {
 		t.Fatalf("logout all: %v", err)
@@ -204,6 +304,24 @@ func TestLogoutAllRevokesEveryUserSessionOnly(t *testing.T) {
 	}
 	if status, problem := protectedRequest(t, handler, otherAccess); status != http.StatusOK {
 		t.Fatalf("other user's session status = %d, problem=%+v", status, problem)
+	}
+	var targetActive, otherActive int64
+	if err := repository.db.Model(&models.OTPTrustedDevice{}).
+		Where("user_id = ? AND revoked = ?", 42, false).
+		Count(&targetActive).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.db.Model(&models.OTPTrustedDevice{}).
+		Where("user_id = ? AND revoked = ?", 84, false).
+		Count(&otherActive).Error; err != nil {
+		t.Fatal(err)
+	}
+	if targetActive != 0 || otherActive != 1 {
+		t.Fatalf(
+			"active trusted devices after logout-all = target:%d other:%d, want 0/1",
+			targetActive,
+			otherActive,
+		)
 	}
 }
 

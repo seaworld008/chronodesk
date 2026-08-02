@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/security"
@@ -25,7 +26,10 @@ func newOTPSecretStorageTest(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&models.User{}); err != nil {
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.OTPTrustedDevice{},
+	); err != nil {
 		t.Fatal(err)
 	}
 	sqlDB, err := db.DB()
@@ -53,6 +57,94 @@ func newOTPSecretStorageTest(
 		t.Fatal(err)
 	}
 	return db, repository, ring, user
+}
+
+func TestConfigureOTPRevokesTrustedDevicesInTheSameTransaction(t *testing.T) {
+	db, repository, _, user := newOTPSecretStorageTest(t)
+	now := time.Now()
+	for _, token := range []string{"pre-mfa-one", "pre-mfa-two"} {
+		if err := db.Create(&models.OTPTrustedDevice{
+			UserID:          user.ID,
+			DeviceTokenHash: hashTrustedDeviceToken(token),
+			DeviceName:      token,
+			LastUsedAt:      now,
+			ExpiresAt:       now.Add(time.Hour),
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	hashes, err := hashBackupCodes([]string{"ABCDEF12"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ConfigureOTP(
+		context.Background(),
+		user.ID,
+		"JBSWY3DPEHPK3PXP",
+		hashes,
+		true,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var activeDevices int64
+	if err := db.Model(&models.OTPTrustedDevice{}).
+		Where(
+			"user_id = ? AND revoked = ? AND expires_at > ?",
+			user.ID,
+			false,
+			time.Now(),
+		).
+		Count(&activeDevices).Error; err != nil {
+		t.Fatal(err)
+	}
+	if activeDevices != 0 {
+		t.Fatalf("active pre-MFA trusted devices = %d", activeDevices)
+	}
+}
+
+func TestConfigureOTPRollsBackWhenTrustedDeviceRevocationFails(t *testing.T) {
+	db, repository, _, user := newOTPSecretStorageTest(t)
+	now := time.Now()
+	if err := db.Create(&models.OTPTrustedDevice{
+		UserID:          user.ID,
+		DeviceTokenHash: hashTrustedDeviceToken("rollback-pre-mfa"),
+		DeviceName:      "rollback-pre-mfa",
+		LastUsedAt:      now,
+		ExpiresAt:       now.Add(time.Hour),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(`
+		CREATE TRIGGER reject_mfa_trusted_device_revoke
+		BEFORE UPDATE ON otp_trusted_devices
+		BEGIN
+			SELECT RAISE(FAIL, 'injected trusted device failure');
+		END
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	hashes, err := hashBackupCodes([]string{"ABCDEF12"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ConfigureOTP(
+		context.Background(),
+		user.ID,
+		"JBSWY3DPEHPK3PXP",
+		hashes,
+		true,
+	); err == nil {
+		t.Fatal("ConfigureOTP unexpectedly committed after revoke failure")
+	}
+	var stored models.User
+	if err := db.First(&stored, user.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.TwoFactorEnabled ||
+		stored.TwoFactorSecret != "" ||
+		stored.BackupCodes != "" {
+		t.Fatalf("MFA state escaped rollback: %+v", stored)
+	}
 }
 
 func TestOTPSecretAndBackupCodesAreProtectedAtRest(t *testing.T) {

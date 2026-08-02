@@ -195,7 +195,7 @@ func TestAutomationRuleTypeIsClosedAtServiceBoundary(t *testing.T) {
 	); !errors.Is(err, ErrInvalidAutomationRuleType) {
 		t.Fatalf("CreateRule unsupported type error = %v", err)
 	}
-	if err := service.UpdateRule(
+	if _, err := service.UpdateRule(
 		ctx,
 		1,
 		&models.AutomationRuleRequest{

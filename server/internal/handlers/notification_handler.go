@@ -727,15 +727,54 @@ func (h *NotificationHandler) CreateNotification(c *gin.Context) {
 
 	notification, err := h.notificationService.CreateNotification(c.Request.Context(), &req)
 	if err != nil {
+		if errors.Is(err, services.ErrUnsupportedNotificationChannel) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "通知渠道仅支持应用内或邮件",
+			})
+			return
+		}
 		logHandlerFailure(c, "notification.create", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建通知失败"})
 		return
 	}
 
-	// 触发WebSocket实时推送
-	websocketPkg.NotificationCreatedHook(c.Request.Context(), notification)
+	// A preference-suppressed row is a durable idempotency/audit receipt, not
+	// a user-visible notification. It must never escape through the live push
+	// optimization.
+	if notification.DeliveryStatus !=
+		services.NotificationDeliveryStatusSuppressedByPreference {
+		if err := queueProjectAfterCommit(c, func() {
+			websocketPkg.NotificationCreatedHook(
+				c.Request.Context(),
+				notification,
+			)
+		}); err != nil {
+			logHandlerFailure(
+				c,
+				"notification.create_after_commit",
+				err,
+			)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "创建通知失败",
+			})
+			return
+		}
+	}
 
-	c.JSON(http.StatusCreated, gin.H{"data": notification.ToResponse()})
+	response := notification.ToResponse()
+	if notification.DeliveryStatus ==
+		services.NotificationDeliveryStatusSuppressedByPreference {
+		// Managers may create a notification for another member, but they may
+		// not probe that member's private channel, quiet-time, or frequency
+		// choices. Keep the accepted response indistinguishable from a visible
+		// create while retaining the internal suppression receipt.
+		response.IsRead = false
+		response.ReadAt = nil
+		response.ExpiresAt = req.ExpiresAt
+		response.DeliveryStatus = ""
+		response.Metadata = req.Metadata
+	}
+	c.JSON(http.StatusCreated, gin.H{"data": response})
 }
 
 // DeleteNotification 删除通知 (管理员接口)
@@ -786,7 +825,11 @@ func (h *NotificationHandler) GetNotificationPreferences(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": preferences})
+	c.JSON(http.StatusOK, gin.H{
+		"code": 0,
+		"msg":  "获取通知偏好成功",
+		"data": preferences,
+	})
 }
 
 // UpdateNotificationPreferences 更新用户通知偏好设置

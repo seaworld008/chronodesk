@@ -75,6 +75,8 @@ const priorityChoices = [
     { id: 'critical', name: '严重' },
 ];
 
+const accessibleWarningColor = '#b54708';
+
 const typeChoices = [
     { id: 'incident', name: '事件' },
     { id: 'request', name: '请求' },
@@ -124,9 +126,9 @@ const EnhancedPriorityField: React.FC = () => {
                     icon: <Warning sx={{ color: '#ffffff !important' }} />
                 };
             case 'urgent':
-                // 深橙背景，白字
+                // 深橙背景与白字保持 WCAG AA 对比度。
                 return {
-                    bgColor: '#ed6c02',
+                    bgColor: accessibleWarningColor,
                     color: '#ffffff',
                     icon: <PriorityHigh sx={{ color: '#ffffff !important' }} />
                 };
@@ -293,9 +295,12 @@ const AssignmentField: React.FC = () => {
         return (
             <Chip
                 label="未分配"
-                color="warning"
                 size="small"
                 variant="outlined"
+                sx={{
+                    color: accessibleWarningColor,
+                    borderColor: accessibleWarningColor,
+                }}
             />
         );
     }

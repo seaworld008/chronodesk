@@ -31,10 +31,14 @@ import {
 } from '@/lib/apiClient'
 import {
   humanApiRoutes,
+  type AdminOutboxPage,
   type ReplayIntegrationDeadLetterRequest,
   type ResolveIntegrationConflictRequest,
 } from '@/lib/generated/human-api'
-import { parseProjectRole } from '@/lib/projectScope'
+import {
+  hasProjectCapability,
+  parseProjectRole,
+} from '@/lib/projectScope'
 import {
   conflictColumns,
   connectionColumns,
@@ -91,6 +95,7 @@ type Confirmation =
   | { kind: 'resolve'; row: ConflictSummary }
   | { kind: 'ignore'; row: ConflictSummary }
   | { kind: 'replay'; row: DeadLetterSummary }
+  | { kind: 'outbox-replay'; row: OutboxSummary }
 
 const runtimeTabs: { value: RuntimeTab; label: string }[] = [
   { value: 'connections', label: '连接' },
@@ -148,11 +153,53 @@ const emptyPage = <T,>(items: T[]): DirectoryPage<T> => ({
   total_pages: items.length > 0 ? 1 : 0,
 })
 
+const formatResourceVersion = (version: number) => `"v${version}"`
+
+const newIdempotencyKey = () => {
+  if (
+    typeof crypto !== 'undefined'
+    && typeof crypto.randomUUID === 'function'
+  ) return crypto.randomUUID()
+  return `integration-outbox-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+const findAdminOutboxDelivery = async (
+  projectKey: string,
+  deliveryID: string,
+  signal: AbortSignal,
+) => {
+  let page = 1
+  while (true) {
+    const result = await apiFetch<AdminOutboxPage>(
+      humanApiRoutes.listAgentOutboxDeliveries(
+        { projectKey },
+        {
+          page,
+          page_size: 100,
+          sort_by: 'created_at',
+          sort_order: 'desc',
+        },
+      ),
+      { signal },
+    )
+    const delivery = result.items.find((item) => item.id === deliveryID)
+    if (delivery) return delivery
+    if (
+      result.items.length === 0
+      || !Number.isSafeInteger(result.total_pages)
+      || page >= result.total_pages
+    ) return null
+    page += 1
+  }
+}
+
 const IntegrationRuntime = () => {
   const notify = useNotify()
   const { permissions } = usePermissions<AccessPermissions>()
   const role = parseProjectRole(permissions?.project_role)
   const canManage = role === 'project_admin' || role === 'manager'
+  const canReplayOutbox = role === 'project_admin'
+    && hasProjectCapability(role, 'manage_agents')
   const { projectKey, projectError } = useIntegrationProjectKey()
   const overview = useIntegrationOverview(projectKey)
   const [tab, setTab] = React.useState<RuntimeTab>('connections')
@@ -315,14 +362,49 @@ const IntegrationRuntime = () => {
   )
 
   const performConfirmedAction = async () => {
-    if (!confirmation || !projectKey || !canManage) return
+    if (
+      !confirmation
+      || !projectKey
+      || !canManage
+      || (confirmation.kind === 'outbox-replay' && !canReplayOutbox)
+    ) return
     mutationController.current?.abort()
     const controller = new AbortController()
     mutationController.current = controller
     const capturedProjectKey = projectKey
     setSubmitting(true)
     try {
-      if (confirmation.kind === 'replay') {
+      if (confirmation.kind === 'outbox-replay') {
+        const delivery = await findAdminOutboxDelivery(
+          capturedProjectKey,
+          confirmation.row.id,
+          controller.signal,
+        )
+        if (!delivery) {
+          throw new Error('无法获取投递的最新版本，请刷新列表后重试')
+        }
+        if (delivery.status !== 'failed' && delivery.status !== 'dead') {
+          throw new Error('该投递状态已发生变化，请刷新列表后重试')
+        }
+        await apiFetch(
+          humanApiRoutes.replayOutboxDeliveryV2({
+            projectKey: capturedProjectKey,
+            deliveryId: delivery.id,
+          }),
+          {
+            method: 'POST',
+            headers: {
+              'Idempotency-Key': newIdempotencyKey(),
+              'If-Match': formatResourceVersion(delivery.resource_version),
+            },
+            signal: controller.signal,
+          },
+        )
+        if (projectKeyRef.current === capturedProjectKey) {
+          notify('事件投递已重新排队', { type: 'success' })
+          outbox.refresh()
+        }
+      } else if (confirmation.kind === 'replay') {
         const body: ReplayIntegrationDeadLetterRequest = {
           expected_updated_at: confirmation.row.updated_at,
         }
@@ -783,6 +865,22 @@ const IntegrationRuntime = () => {
                 onPageSizeChange={outbox.setPageSize}
                 onRetry={outbox.refresh}
                 onOpenDetails={(row) => openDetails('Outbox 投递详情', row)}
+                renderActions={canReplayOutbox ? (row) => (
+                  row.status === 'failed' || row.status === 'dead'
+                ) && (
+                  <Tooltip title="重新投递">
+                    <IconButton
+                      size="small"
+                      aria-label={`重新投递 ${row.id}`}
+                      onClick={() => setConfirmation({
+                        kind: 'outbox-replay',
+                        row,
+                      })}
+                    >
+                      <ReplayIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                ) : undefined}
               />
             )}
           </Box>
@@ -839,17 +937,22 @@ const IntegrationRuntime = () => {
           if (!submitting) setConfirmation(null)
         }}
         aria-labelledby="integration-confirmation-title"
+        aria-describedby="integration-confirmation-description"
       >
         <DialogTitle id="integration-confirmation-title">
-          {confirmation?.kind === 'replay'
+          {confirmation?.kind === 'outbox-replay'
+            ? '确认重新投递'
+            : confirmation?.kind === 'replay'
             ? '确认重新处理死信'
             : confirmation?.kind === 'ignore'
               ? '确认忽略冲突'
               : '确认解决冲突'}
         </DialogTitle>
         <DialogContent>
-          <Typography>
-            此操作会写入当前项目的集成运行状态，并保留审计记录。请确认当前筛选和资源标识无误。
+          <Typography id="integration-confirmation-description">
+            {confirmation?.kind === 'outbox-replay'
+              ? '该事件投递将重新进入队列。接收端必须按事件 ID 去重，以免产生重复副作用。操作会保留审计记录。'
+              : '此操作会写入当前项目的集成运行状态，并保留审计记录。请确认当前筛选和资源标识无误。'}
           </Typography>
         </DialogContent>
         <DialogActions>
@@ -861,7 +964,11 @@ const IntegrationRuntime = () => {
             disabled={submitting}
             onClick={() => void performConfirmedAction()}
           >
-            {submitting ? '正在提交…' : '确认'}
+            {submitting
+              ? '正在提交…'
+              : confirmation?.kind === 'outbox-replay'
+                ? '确认重新投递'
+                : '确认'}
           </Button>
         </DialogActions>
       </Dialog>

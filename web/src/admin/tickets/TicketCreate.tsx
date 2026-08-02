@@ -41,6 +41,7 @@ import {
 } from '@/lib/generated/human-api';
 import { resolveActiveProjectKey } from '@/lib/projectScope';
 import { EnterpriseReferenceAutocompleteInput } from '@/components/inputs/EnterpriseFilterInputs';
+import { normalizeTicketDateTimeForSubmit } from './ticketDateTime';
 
 type JSONSchemaProperty = {
     type?: string | string[];
@@ -120,7 +121,9 @@ const transformTicketCreate = (
         'customer_phone',
     ] as const) {
         if (typeof data[field] !== 'undefined') {
-            payload[field] = data[field];
+            payload[field] = field === 'due_date'
+                ? normalizeTicketDateTimeForSubmit(data[field])
+                : data[field];
         }
     }
     payload.type = selectedRequestType.work_class;

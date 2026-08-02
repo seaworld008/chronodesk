@@ -29,6 +29,7 @@ func TestNotificationOutboxRecoversAfterSideEffectBeforeAcknowledgement(t *testi
 		&models.User{},
 		&models.Ticket{},
 		&models.Notification{},
+		&models.NotificationPreference{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
 	); err != nil {

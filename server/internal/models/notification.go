@@ -192,7 +192,7 @@ type NotificationCreateRequest struct {
 	Title           string                 `json:"title" binding:"required,max=255"`
 	Content         string                 `json:"content" binding:"required"`
 	Priority        NotificationPriority   `json:"priority" binding:"omitempty,oneof=low normal high urgent"`
-	Channel         NotificationChannel    `json:"channel" binding:"omitempty,oneof=in_app email webhook websocket"`
+	Channel         NotificationChannel    `json:"channel" binding:"omitempty,oneof=in_app email"`
 	RecipientID     uint                   `json:"recipient_id" binding:"required"`
 	SenderID        *uint                  `json:"sender_id"`
 	RelatedType     string                 `json:"related_type"`
@@ -318,6 +318,21 @@ type NotificationPreference struct {
 	MaxDailyCount int  `json:"max_daily_count" gorm:"default:50"`
 	BatchDelivery bool `json:"batch_delivery" gorm:"default:false"`
 	BatchInterval int  `json:"batch_interval" gorm:"default:60"` // 分钟
+}
+
+// NotificationPreferenceView is the stable user-facing projection. Storage
+// identifiers and timestamps are deliberately omitted because missing rows
+// use the same canonical defaults without turning a safe GET into a write.
+type NotificationPreferenceView struct {
+	NotificationType  NotificationType `json:"notification_type"`
+	EmailEnabled      bool             `json:"email_enabled"`
+	InAppEnabled      bool             `json:"in_app_enabled"`
+	WebhookEnabled    bool             `json:"webhook_enabled"`
+	DoNotDisturbStart *time.Time       `json:"do_not_disturb_start"`
+	DoNotDisturbEnd   *time.Time       `json:"do_not_disturb_end"`
+	MaxDailyCount     int              `json:"max_daily_count"`
+	BatchDelivery     bool             `json:"batch_delivery"`
+	BatchInterval     int              `json:"batch_interval"`
 }
 
 // TableName 指定表名

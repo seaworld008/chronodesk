@@ -5,8 +5,10 @@ import {
   signalProjectAccessInvalidated,
   signalProjectAccessRefreshRequested,
   signalSessionInvalidated,
+  signalSessionReplaced,
 } from './projectScopeEvents'
 import { joinApiUrl } from './apiUrl'
+import { humanTabSessionMatches } from './humanTabSession'
 
 export type ApiOptions = RequestInit & { rawResponse?: boolean }
 
@@ -24,6 +26,18 @@ export const sessionAwareFetch = async (
   input: RequestInfo | URL,
   init?: RequestInit,
 ): Promise<Response> => {
+  const requestHeaders = new Headers(
+    init?.headers ??
+      (input instanceof Request ? input.headers : undefined),
+  )
+  const authorization = requestHeaders.get('Authorization')
+  if (authorization?.startsWith('Bearer ')) {
+    const accessToken = authorization.slice('Bearer '.length)
+    if (!humanTabSessionMatches(accessToken)) {
+      signalSessionReplaced()
+      throw new Error('登录账号已在其他标签页发生变化，请刷新后继续')
+    }
+  }
   const response = await fetch(input, init)
   const path = requestPath(input)
   if (response.status === 401) {

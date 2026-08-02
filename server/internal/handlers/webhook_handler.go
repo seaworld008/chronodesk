@@ -99,7 +99,7 @@ type UpdateWebhookRequest struct {
 	IsAsync              *bool                      `json:"is_async"`
 	RateLimit            *int                       `json:"rate_limit"`
 	RateLimitWindow      *int                       `json:"rate_limit_window"`
-	Status               *models.WebhookStatus      `json:"status"`
+	Status               *models.WebhookStatus      `json:"status" binding:"omitempty,oneof=active inactive disabled error"`
 }
 
 // WebhookConfigResponse is the closed Human Web projection of a persisted
@@ -378,8 +378,10 @@ func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
 		IsAsync:         req.IsAsync,
 		RateLimit:       req.RateLimit,
 		RateLimitWindow: req.RateLimitWindow,
-		Status:          models.WebhookStatusActive,
-		CreatedBy:       userID,
+		// A newly saved endpoint has not yet been proven reachable or reviewed
+		// by an operator. Keep it inert until an explicit update activates it.
+		Status:    models.WebhookStatusInactive,
+		CreatedBy: userID,
 	}
 	if err := webhook.SetSubscriptions(req.EnabledEvents, req.FilterRules, true); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{

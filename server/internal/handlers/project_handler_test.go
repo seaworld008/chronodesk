@@ -1482,6 +1482,7 @@ func TestProjectScopeMiddlewareNeverEmitsSuccessWhenCommitFails(
 		t.Fatal(err)
 	}
 
+	callbackCalled := false
 	router := gin.New()
 	group := router.Group("/api/projects/:projectKey")
 	group.Use(func(c *gin.Context) {
@@ -1491,6 +1492,12 @@ func TestProjectScopeMiddlewareNeverEmitsSuccessWhenCommitFails(
 	})
 	group.Use(ProjectScopeMiddleware(service, db))
 	group.POST("/commit-failure", func(c *gin.Context) {
+		if err := queueProjectAfterCommit(c, func() {
+			callbackCalled = true
+		}); err != nil {
+			c.String(http.StatusInternalServerError, err.Error())
+			return
+		}
 		result := db.WithContext(c.Request.Context()).Exec(`
 			INSERT INTO project_commit_children (id, parent_id)
 			VALUES (1, 999)
@@ -1522,12 +1529,65 @@ func TestProjectScopeMiddlewareNeverEmitsSuccessWhenCommitFails(
 			response.Body.String(),
 		)
 	}
+	if callbackCalled {
+		t.Fatal("commit failure executed a project after-commit callback")
+	}
 	var count int64
 	if err := db.Table("project_commit_children").Count(&count).Error; err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {
 		t.Fatalf("failed commit persisted %d child rows", count)
+	}
+}
+
+func TestProjectScopeMiddlewareRunsCallbacksOnlyAfterCommit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service, _, user, db := projectHandlerTestService(t)
+	callbackCalled := false
+	callbackHadTransaction := true
+
+	router := gin.New()
+	group := router.Group("/api/projects/:projectKey")
+	group.Use(func(c *gin.Context) {
+		c.Set("user_id", user.ID)
+		c.Set("platform_role", models.PlatformRoleMember)
+		c.Next()
+	})
+	group.Use(ProjectScopeMiddleware(service, db))
+	group.POST("/after-commit", func(c *gin.Context) {
+		if err := queueProjectAfterCommit(c, func() {
+			callbackCalled = true
+			callbackHadTransaction = scopeddb.HasTransaction(
+				c.Request.Context(),
+			)
+		}); err != nil {
+			c.String(http.StatusInternalServerError, err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true})
+	})
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/projects/OPS/after-commit",
+		nil,
+	)
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"status = %d, body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	if !callbackCalled || callbackHadTransaction {
+		t.Fatalf(
+			"after-commit callback state = called:%v transaction:%v",
+			callbackCalled,
+			callbackHadTransaction,
+		)
 	}
 }
 

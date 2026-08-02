@@ -1126,6 +1126,8 @@ func (handler *KnowledgeHandler) writeError(c *gin.Context, err error) {
 		handler.response.Error(c, http.StatusServiceUnavailable, "知识对象存储不可用")
 	case errors.Is(err, services.ErrKnowledgeIndexBoundaryViolation):
 		handler.response.Error(c, http.StatusBadGateway, "知识索引边界校验失败")
+	case errors.Is(err, services.ErrKnowledgeIndexResponseInvalid):
+		handler.response.Error(c, http.StatusBadGateway, "知识索引响应无效")
 	case errors.Is(err, services.ErrKnowledgeModelPolicyDenied):
 		handler.response.Forbidden(c, "知识模型策略拒绝本次操作")
 	case errors.Is(err, services.ErrKnowledgeModelResponseInvalid):

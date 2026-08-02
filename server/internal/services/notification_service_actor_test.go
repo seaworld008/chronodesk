@@ -38,6 +38,7 @@ func TestTicketNotificationOutboxSupportsEveryAuthoritativeActorType(t *testing.
 				&models.User{},
 				&models.Ticket{},
 				&models.Notification{},
+				&models.NotificationPreference{},
 			); err != nil {
 				t.Fatalf("migrate notification actor fixture: %v", err)
 			}

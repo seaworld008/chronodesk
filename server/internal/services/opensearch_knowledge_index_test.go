@@ -117,6 +117,229 @@ func TestOpenSearchKnowledgeSearchPushesScopeAndACLIntoHybridFilter(
 	}
 }
 
+func TestOpenSearchKnowledgeSearchClassifiesDownstreamFailures(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status int
+		body   string
+		want   error
+	}{
+		{
+			name:   "alias not ready",
+			status: http.StatusNotFound,
+			body:   `{"error":"alias missing"}`,
+			want:   ErrKnowledgeIndexUnavailable,
+		},
+		{
+			name:   "service unavailable",
+			status: http.StatusServiceUnavailable,
+			body:   `{"error":"unavailable"}`,
+			want:   ErrKnowledgeIndexUnavailable,
+		},
+		{
+			name:   "request timeout",
+			status: http.StatusRequestTimeout,
+			body:   `{"error":"timeout"}`,
+			want:   ErrKnowledgeIndexUnavailable,
+		},
+		{
+			name:   "rate limited",
+			status: http.StatusTooManyRequests,
+			body:   `{"error":"rate limited"}`,
+			want:   ErrKnowledgeIndexUnavailable,
+		},
+		{
+			name:   "malformed success response",
+			status: http.StatusOK,
+			body:   `{"hits":`,
+			want:   ErrKnowledgeIndexResponseInvalid,
+		},
+		{
+			name:   "missing outer hits",
+			status: http.StatusOK,
+			body:   `{}`,
+			want:   ErrKnowledgeIndexResponseInvalid,
+		},
+		{
+			name:   "null outer hits",
+			status: http.StatusOK,
+			body:   `{"hits":null}`,
+			want:   ErrKnowledgeIndexResponseInvalid,
+		},
+		{
+			name:   "missing inner hits",
+			status: http.StatusOK,
+			body:   `{"hits":{}}`,
+			want:   ErrKnowledgeIndexResponseInvalid,
+		},
+		{
+			name:   "null inner hits",
+			status: http.StatusOK,
+			body:   `{"hits":{"hits":null}}`,
+			want:   ErrKnowledgeIndexResponseInvalid,
+		},
+		{
+			name:   "hit missing source",
+			status: http.StatusOK,
+			body:   `{"hits":{"hits":[{"_score":0.5}]}}`,
+			want:   ErrKnowledgeIndexResponseInvalid,
+		},
+		{
+			name:   "hit missing score",
+			status: http.StatusOK,
+			body:   `{"hits":{"hits":[{"_source":{}}]}}`,
+			want:   ErrKnowledgeIndexResponseInvalid,
+		},
+		{
+			name:   "unexpected downstream rejection",
+			status: http.StatusBadRequest,
+			body:   `{"error":"bad downstream request"}`,
+			want:   ErrKnowledgeIndexResponseInvalid,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(
+				writer http.ResponseWriter,
+				_ *http.Request,
+			) {
+				writer.WriteHeader(test.status)
+				_, _ = writer.Write([]byte(test.body))
+			}))
+			defer server.Close()
+			index := newOpenSearchKnowledgeTestIndex(
+				t,
+				server.URL,
+				server.Client(),
+			)
+
+			_, err := index.Search(
+				context.Background(),
+				openSearchKnowledgeTestSearchRequest(),
+			)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Search() error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+type openSearchKnowledgeRoundTripFunc func(
+	*http.Request,
+) (*http.Response, error)
+
+func (function openSearchKnowledgeRoundTripFunc) RoundTrip(
+	request *http.Request,
+) (*http.Response, error) {
+	return function(request)
+}
+
+type openSearchKnowledgeReadErrorBody struct{}
+
+func (openSearchKnowledgeReadErrorBody) Read([]byte) (int, error) {
+	return 0, errors.New("injected OpenSearch body read failure")
+}
+
+func (openSearchKnowledgeReadErrorBody) Close() error {
+	return nil
+}
+
+func TestOpenSearchUnavailableStatusWinsOverInvalidErrorBody(t *testing.T) {
+	t.Run("oversized unavailable body", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(
+			writer http.ResponseWriter,
+			_ *http.Request,
+		) {
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = writer.Write([]byte(strings.Repeat(
+				"x",
+				openSearchKnowledgeMaxResponseBytes+1,
+			)))
+		}))
+		defer server.Close()
+		index := newOpenSearchKnowledgeTestIndex(
+			t,
+			server.URL,
+			server.Client(),
+		)
+		_, err := index.Search(
+			context.Background(),
+			openSearchKnowledgeTestSearchRequest(),
+		)
+		if !errors.Is(err, ErrKnowledgeIndexUnavailable) {
+			t.Fatalf("oversized 503 error = %v", err)
+		}
+	})
+
+	t.Run("unreadable unavailable body", func(t *testing.T) {
+		client := &http.Client{
+			Transport: openSearchKnowledgeRoundTripFunc(func(
+				*http.Request,
+			) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Header:     make(http.Header),
+					Body:       openSearchKnowledgeReadErrorBody{},
+				}, nil
+			}),
+		}
+		index := newOpenSearchKnowledgeTestIndex(
+			t,
+			"https://opensearch.example.test",
+			client,
+		)
+		_, err := index.Search(
+			context.Background(),
+			openSearchKnowledgeTestSearchRequest(),
+		)
+		if !errors.Is(err, ErrKnowledgeIndexUnavailable) {
+			t.Fatalf("unreadable 429 error = %v", err)
+		}
+	})
+}
+
+func TestOpenSearchKnowledgeSearchClassifiesConnectionFailureAsUnavailable(
+	t *testing.T,
+) {
+	server := httptest.NewServer(http.HandlerFunc(func(
+		http.ResponseWriter,
+		*http.Request,
+	) {
+	}))
+	endpoint := server.URL
+	client := server.Client()
+	server.Close()
+	index := newOpenSearchKnowledgeTestIndex(t, endpoint, client)
+
+	_, err := index.Search(
+		context.Background(),
+		openSearchKnowledgeTestSearchRequest(),
+	)
+	if !errors.Is(err, ErrKnowledgeIndexUnavailable) {
+		t.Fatalf(
+			"Search() connection error = %v, want %v",
+			err,
+			ErrKnowledgeIndexUnavailable,
+		)
+	}
+}
+
+func openSearchKnowledgeTestSearchRequest() HybridSearchRequest {
+	return HybridSearchRequest{
+		Query: "database timeout",
+		Limit: 5,
+		Filter: HybridSearchFilter{
+			OrganizationID: 7,
+			ProjectID:      11,
+			ACLSubjects: []models.KnowledgeACLSubject{{
+				Type: models.KnowledgeACLAllProject,
+				ID:   "*",
+			}},
+			PublishedOnly: true,
+			VirusScan:     models.VirusScanClean,
+		},
+	}
+}
+
 func TestOpenSearchKnowledgeReplacementBuildsImmutableGenerationAndMovesAlias(
 	t *testing.T,
 ) {

@@ -69,7 +69,7 @@ var (
 	ErrNestedCommentReply        = errors.New("nested comment replies are not supported")
 	ErrInvalidAttachmentCleanup  = errors.New("invalid attachment cleanup destination")
 	ErrOutboxLockLost            = errors.New("outbox delivery lock lost")
-	ErrOutboxReplayConflict      = errors.New("outbox delivery is actively being processed")
+	ErrOutboxReplayConflict      = errors.New("outbox delivery is not replayable")
 )
 
 const (
@@ -3350,17 +3350,20 @@ func (s *AgentNativeService) ReplayOutbox(ctx context.Context, deliveryID string
 		).First(&delivery).Error; err != nil {
 			return err
 		}
-		if delivery.Status == models.OutboxDeliveryProcessing &&
-			delivery.LockedAt != nil &&
-			delivery.LockedAt.After(now.Add(-2*time.Minute)) {
+		if delivery.Status != models.OutboxDeliveryFailed &&
+			delivery.Status != models.OutboxDeliveryDead {
 			return ErrOutboxReplayConflict
 		}
 		result := tx.Model(&models.OutboxDelivery{}).
 			Where(
-				"id = ? AND organization_id = ? AND project_id = ?",
+				"id = ? AND organization_id = ? AND project_id = ? AND status IN ?",
 				deliveryID,
 				projectScope.OrganizationID,
 				projectScope.ProjectID,
+				[]models.OutboxDeliveryStatus{
+					models.OutboxDeliveryFailed,
+					models.OutboxDeliveryDead,
+				},
 			).
 			Updates(map[string]any{
 				"status":          models.OutboxDeliveryPending,
@@ -3376,7 +3379,10 @@ func (s *AgentNativeService) ReplayOutbox(ctx context.Context, deliveryID string
 			return fmt.Errorf("replay outbox delivery: %w", result.Error)
 		}
 		if result.RowsAffected == 0 {
-			return gorm.ErrRecordNotFound
+			// A worker may claim a failed delivery after the read above. The
+			// status predicate is the linearization point: never clear a lock
+			// or requeue a delivery after another actor won that race.
+			return ErrOutboxReplayConflict
 		}
 		if err := tx.Model(&models.DomainEvent{}).
 			Where(

@@ -532,7 +532,7 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
             await createResponse.json(),
         );
         expect(typeof createdWebhook.id).toBe('number');
-        expect(createdWebhook.status).toBe('active');
+        expect(createdWebhook.status).toBe('inactive');
         trackE2EResource('webhooks', createdWebhook.id as number);
         const row = page.getByRole('row', { name: new RegExp(webhookName) });
         await expect(row).toBeVisible({ timeout: 15_000 });
@@ -687,5 +687,23 @@ test.describe('Webhook canonical CloudEvent 管理', () => {
         );
         expect(finalLog?.status).toBe('failed');
         expect(JSON.stringify(logs)).not.toContain(markerSecret);
+
+        await row
+            .getByRole('button', { name: `编辑 Webhook：${webhookName}` })
+            .click();
+        const activationForm = page.getByRole('dialog', {
+            name: '编辑 Webhook',
+        });
+        await activationForm.getByLabel('状态', { exact: true }).click();
+        await page.getByRole('option', { name: '启用', exact: true }).click();
+        const activation = page.waitForResponse(
+            (response) =>
+                response.request().method() === 'PUT' &&
+                new URL(response.url()).pathname ===
+                    `${webhooksPath}/${webhook!.id}`,
+        );
+        await activationForm.getByRole('button', { name: '保存' }).click();
+        expect((await activation).status()).toBe(200);
+        await expect(row).toContainText('启用');
     });
 });

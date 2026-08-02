@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/seaworld008/chronodesk/server/internal/models"
@@ -17,6 +18,169 @@ import (
 type capturingNotificationListService struct {
 	services.NotificationServiceInterface
 	filter *models.NotificationFilter
+}
+
+type suppressedNotificationCreateService struct {
+	services.NotificationServiceInterface
+}
+
+func (*suppressedNotificationCreateService) CreateNotification(
+	_ context.Context,
+	request *models.NotificationCreateRequest,
+) (*models.Notification, error) {
+	now := time.Now().UTC()
+	return &models.Notification{
+		ID:             41,
+		Type:           request.Type,
+		Title:          request.Title,
+		Content:        request.Content,
+		Priority:       models.NotificationPriorityNormal,
+		Channel:        models.NotificationChannelInApp,
+		RecipientID:    request.RecipientID,
+		IsRead:         true,
+		ReadAt:         &now,
+		ExpiresAt:      &now,
+		Metadata:       `{"preference_suppression":"do_not_disturb"}`,
+		DeliveryStatus: services.NotificationDeliveryStatusSuppressedByPreference,
+	}, nil
+}
+
+func TestNotificationPreferencesGetMatchesHumanOpenAPIEnvelope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.NotificationPreference{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	const userID = uint(7)
+	if err := db.Create(&models.User{
+		ID:            userID,
+		Username:      "preference-owner",
+		Email:         "preference-owner@example.test",
+		PasswordHash:  "test-only",
+		PlatformRole:  models.PlatformRoleMember,
+		Status:        models.UserStatusActive,
+		EmailVerified: true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	preference := models.NotificationPreference{
+		UserID:           userID,
+		NotificationType: models.NotificationTypeTicketAssigned,
+		EmailEnabled:     true,
+		InAppEnabled:     true,
+		WebhookEnabled:   false,
+		MaxDailyCount:    50,
+		BatchInterval:    60,
+	}
+	if err := db.Create(&preference).Error; err != nil {
+		t.Fatal(err)
+	}
+	handler := NewNotificationHandler(
+		services.NewNotificationServiceWithProtector(db, nil),
+	)
+	router := gin.New()
+	router.GET("/preferences", func(c *gin.Context) {
+		c.Set("user_id", userID)
+		handler.GetNotificationPreferences(c)
+	})
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(
+		response,
+		httptest.NewRequest(http.MethodGet, "/preferences", nil),
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	var envelope struct {
+		Code int                                 `json:"code"`
+		Msg  string                              `json:"msg"`
+		Data []models.NotificationPreferenceView `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Code != 0 ||
+		envelope.Msg == "" ||
+		len(envelope.Data) != len(models.NotificationTypes()) {
+		t.Fatalf("notification preferences envelope=%+v", envelope)
+	}
+	var assigned *models.NotificationPreferenceView
+	for index := range envelope.Data {
+		if envelope.Data[index].NotificationType ==
+			models.NotificationTypeTicketAssigned {
+			assigned = &envelope.Data[index]
+			break
+		}
+	}
+	if assigned == nil ||
+		!assigned.InAppEnabled ||
+		assigned.MaxDailyCount != 50 {
+		t.Fatalf("assigned preference=%+v", assigned)
+	}
+}
+
+func TestManualNotificationResponseDoesNotRevealRecipientPreferences(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	handler := NewNotificationHandler(
+		&suppressedNotificationCreateService{},
+	)
+	router := gin.New()
+	router.POST("/notifications", func(c *gin.Context) {
+		c.Set(projectAccessContextKey, services.ProjectAccess{
+			Role: models.ProjectRoleManager,
+		})
+		handler.CreateNotification(c)
+	})
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(
+		response,
+		httptest.NewRequest(
+			http.MethodPost,
+			"/notifications",
+			bytes.NewBufferString(
+				`{"type":"system_alert","title":"安全提醒","content":"测试","channel":"in_app","recipient_id":42}`,
+			),
+		),
+	)
+	if response.Code != http.StatusCreated {
+		t.Fatalf(
+			"status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	var envelope struct {
+		Data models.NotificationResponse `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Data.IsRead ||
+		envelope.Data.ReadAt != nil ||
+		envelope.Data.ExpiresAt != nil ||
+		envelope.Data.DeliveryStatus != "" {
+		t.Fatalf(
+			"suppression state leaked in response: %+v",
+			envelope.Data,
+		)
+	}
+	if _, leaked := envelope.Data.Metadata["preference_suppression"]; leaked {
+		t.Fatalf(
+			"suppression reason leaked in response: %#v",
+			envelope.Data.Metadata,
+		)
+	}
 }
 
 func (service *capturingNotificationListService) GetNotifications(
@@ -117,10 +281,24 @@ func TestNotificationPreferenceUpdateRejectsUntrustedPersistenceFields(
 ) {
 	gin.SetMode(gin.TestMode)
 	db := openHandlerTestDB(t)
-	if err := db.AutoMigrate(&models.NotificationPreference{}); err != nil {
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.NotificationPreference{},
+	); err != nil {
 		t.Fatal(err)
 	}
 	const userID = uint(7)
+	if err := db.Create(&models.User{
+		ID:            userID,
+		Username:      "preference-owner",
+		Email:         "preference-owner@example.test",
+		PasswordHash:  "test-only",
+		PlatformRole:  models.PlatformRoleMember,
+		Status:        models.UserStatusActive,
+		EmailVerified: true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 	existing := models.NotificationPreference{
 		UserID:           userID,
 		NotificationType: models.NotificationTypeTicketAssigned,
@@ -144,7 +322,7 @@ func TestNotificationPreferenceUpdateRejectsUntrustedPersistenceFields(
 		handler.UpdateNotificationPreferences(c)
 	})
 
-	validItem := `"notification_type":"ticket_assigned","email_enabled":false,"in_app_enabled":true,"webhook_enabled":false,"max_daily_count":25,"batch_delivery":false,"batch_interval":30`
+	validItem := `"notification_type":"ticket_assigned","email_enabled":false,"in_app_enabled":true,"webhook_enabled":false,"max_daily_count":25,"batch_delivery":false,"batch_interval":60`
 	tests := []struct {
 		name string
 		body string
@@ -160,6 +338,18 @@ func TestNotificationPreferenceUpdateRejectsUntrustedPersistenceFields(
 		{
 			name: "identity smuggle",
 			body: `{"preferences":[{` + validItem + `,"id":99,"user_id":42}]}`,
+		},
+		{
+			name: "unsupported webhook",
+			body: `{"preferences":[{"notification_type":"ticket_assigned","email_enabled":false,"in_app_enabled":true,"webhook_enabled":true,"max_daily_count":25,"batch_delivery":false,"batch_interval":60}]}`,
+		},
+		{
+			name: "unsupported batch",
+			body: `{"preferences":[{"notification_type":"ticket_assigned","email_enabled":false,"in_app_enabled":true,"webhook_enabled":false,"max_daily_count":25,"batch_delivery":true,"batch_interval":60}]}`,
+		},
+		{
+			name: "reserved batch interval",
+			body: `{"preferences":[{"notification_type":"ticket_assigned","email_enabled":false,"in_app_enabled":true,"webhook_enabled":false,"max_daily_count":25,"batch_delivery":false,"batch_interval":30}]}`,
 		},
 	}
 	for _, test := range tests {
@@ -199,7 +389,7 @@ func TestNotificationPreferenceUpdateRejectsUntrustedPersistenceFields(
 				`{"notification_type":"ticket_status_changed",`+
 				`"email_enabled":false,"in_app_enabled":false,`+
 				`"webhook_enabled":false,"max_daily_count":0,`+
-				`"batch_delivery":false,"batch_interval":1}]}`,
+				`"batch_delivery":false,"batch_interval":60}]}`,
 		),
 	)
 	request.Header.Set("Content-Type", "application/json")
@@ -233,7 +423,7 @@ func TestNotificationPreferenceUpdateRejectsUntrustedPersistenceFields(
 		allDisabled.InAppEnabled ||
 		allDisabled.WebhookEnabled ||
 		allDisabled.MaxDailyCount != 0 ||
-		allDisabled.BatchInterval != 1 {
+		allDisabled.BatchInterval != 60 {
 		t.Fatalf("all-disabled persisted preference = %+v", allDisabled)
 	}
 }

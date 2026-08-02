@@ -40,6 +40,7 @@ import {
     humanApiRoutes,
     type AssignTicketRequest,
     type EscalateTicketRequest,
+    type TicketAllowedTransitions,
     type TransferTicketRequest,
     type UpdateTicketStatusRequest,
 } from '@/lib/generated/human-api';
@@ -49,16 +50,6 @@ import {
     canUseTicketWorkflow,
     type TicketRolePermissions,
 } from './ticketAccess';
-
-// 工单状态流转定义
-const TICKET_WORKFLOWS: Record<TicketStatus, TicketStatus[]> = {
-    open: ['in_progress', 'pending', 'resolved', 'cancelled'],
-    in_progress: ['pending', 'resolved', 'cancelled'],
-    pending: ['in_progress', 'resolved', 'cancelled'], 
-    resolved: ['closed', 'open'],
-    closed: [],
-    cancelled: ['open']
-};
 
 // 状态中文映射
 const STATUS_LABELS = {
@@ -132,6 +123,14 @@ const TicketWorkflowActions: React.FC = () => {
     const [escalationReason, setEscalationReason] = useState('');
     const [newStatus, setNewStatus] = useState<TicketStatus | ''>('');
     const [comment, setComment] = useState('');
+    const [allowedStatuses, setAllowedStatuses] =
+        useState<TicketStatus[]>([]);
+    const [workflowError, setWorkflowError] = useState('');
+    const workflowAllowed = canUseTicketWorkflow(
+        record ?? undefined,
+        permissions?.project_role,
+        identity?.id,
+    );
     const { data: assignees = [], isPending: assigneesPending } = useGetList<AssigneeOption>(
         'assignees',
         {
@@ -166,6 +165,42 @@ const TicketWorkflowActions: React.FC = () => {
         );
         return () => window.clearTimeout(timer);
     }, [assigneeSearch]);
+
+    useEffect(() => {
+        let active = true;
+        setAllowedStatuses([]);
+        setWorkflowError('');
+        if (!record?.id || !workflowAllowed) {
+            return () => {
+                active = false;
+            };
+        }
+        void resolveActiveProjectKey()
+            .then((projectKey) => apiFetch<TicketAllowedTransitions>(
+                humanApiRoutes.getProjectTicketAllowedTransitions({
+                    projectKey,
+                    ticketID: Number(record.id),
+                }),
+            ))
+            .then((result) => {
+                if (active) {
+                    if (!Array.isArray(result.allowed_next_statuses)) {
+                        throw new Error('服务端未返回合法工单状态');
+                    }
+                    setAllowedStatuses(result.allowed_next_statuses);
+                }
+            })
+            .catch((error: unknown) => {
+                if (!active) return;
+                setWorkflowError(localizedUnknownErrorMessage(
+                    error,
+                    '加载工单绑定工作流失败',
+                ));
+            });
+        return () => {
+            active = false;
+        };
+    }, [record?.id, record?.version, workflowAllowed]);
 
     if (!record) return null;
 
@@ -217,8 +252,7 @@ const TicketWorkflowActions: React.FC = () => {
         }
 
         // 状态变更
-        const availableStatuses = TICKET_WORKFLOWS[record.status as keyof typeof TICKET_WORKFLOWS];
-        if (canUseWorkflow && availableStatuses.length > 0) {
+        if (canUseWorkflow && allowedStatuses.length > 0) {
             actions.push({
                 type: 'status_change',
                 label: '状态变更',
@@ -341,11 +375,7 @@ const TicketWorkflowActions: React.FC = () => {
         setDialogOpen(true);
     };
 
-    const canUseWorkflow = canUseTicketWorkflow(
-        record,
-        permissions?.project_role,
-        identity?.id,
-    );
+    const canUseWorkflow = workflowAllowed;
     const canAssign = canAssignTicket(
         record,
         permissions?.project_role,
@@ -433,6 +463,14 @@ const TicketWorkflowActions: React.FC = () => {
                         variant="outlined"
                     />
                 )}
+                {canUseWorkflow && workflowError && (
+                    <Chip
+                        label="工作流加载失败"
+                        color="error"
+                        size="small"
+                        variant="outlined"
+                    />
+                )}
             </Box>
 
             {/* 操作按钮 */}
@@ -475,8 +513,12 @@ const TicketWorkflowActions: React.FC = () => {
                                 将工单转移到其他部门或用户。转移历史将被记录。
                             </Alert>
                             <FormControl fullWidth>
-                                <InputLabel>目标部门</InputLabel>
+                                <InputLabel id="ticket-transfer-department-label">
+                                    目标部门
+                                </InputLabel>
                                 <Select
+                                    labelId="ticket-transfer-department-label"
+                                    label="目标部门"
                                     value={transferDepartment}
                                     onChange={(e) => setTransferDepartment(e.target.value)}
                                 >
@@ -525,12 +567,16 @@ const TicketWorkflowActions: React.FC = () => {
                                 更改工单状态。状态变更将触发相应的自动化流程。
                             </Alert>
                             <FormControl fullWidth>
-                                <InputLabel>新状态</InputLabel>
+                                <InputLabel id="ticket-status-change-label">
+                                    新状态
+                                </InputLabel>
                                 <Select
+                                    labelId="ticket-status-change-label"
+                                    label="新状态"
                                     value={newStatus}
                                     onChange={(e) => setNewStatus(e.target.value)}
                                 >
-                                    {TICKET_WORKFLOWS[record.status].map(status => (
+                                    {allowedStatuses.map(status => (
                                         <MenuItem key={status} value={status}>
                                             {STATUS_LABELS[status as keyof typeof STATUS_LABELS]}
                                         </MenuItem>

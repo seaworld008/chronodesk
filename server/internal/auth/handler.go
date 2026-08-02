@@ -115,6 +115,8 @@ func authLogReason(err error) string {
 		return "otp_expired"
 	case errors.Is(err, ErrEmailNotVerified):
 		return "email_not_verified"
+	case errors.Is(err, ErrEmailVerificationPolicyUnavailable):
+		return "email_verification_policy_unavailable"
 	case errors.Is(err, ErrAccountLocked):
 		return "account_locked"
 	case errors.Is(err, ErrPasswordTooWeak):
@@ -172,6 +174,22 @@ func (h *AuthHandler) abortTerminatedReadRequest(c HTTPContext, err error) bool 
 func authResponseWritten(c HTTPContext) bool {
 	ginContext, ok := c.(*GinHTTPContext)
 	return ok && ginContext.ginCtx.Writer.Written()
+}
+
+func rejectOversizedAuthenticationRequest(
+	c HTTPContext,
+	err error,
+) bool {
+	if !errors.Is(err, ErrAuthenticationRequestBodyTooLarge) {
+		return false
+	}
+	c.JSON(http.StatusRequestEntityTooLarge, ErrorResponse{
+		Error:   "request_too_large",
+		Message: "认证请求体超过允许的大小",
+		Code:    "request_too_large",
+	})
+	c.Abort()
+	return true
 }
 
 func (h *AuthHandler) boundedRequestContext(
@@ -252,6 +270,9 @@ type SuccessResponse struct {
 func (h *AuthHandler) Register(c HTTPContext) {
 	var req RegisterRequest
 	if err := c.Bind(&req); err != nil {
+		if rejectOversizedAuthenticationRequest(c, err) {
+			return
+		}
 		h.logger.Error(
 			"Failed to bind register request",
 			"request_id", authLogRequestID(c),
@@ -295,13 +316,16 @@ func (h *AuthHandler) Register(c HTTPContext) {
 		message := "注册失败"
 		status := http.StatusInternalServerError
 
-		switch err {
-		case ErrUserExists:
+		switch {
+		case errors.Is(err, ErrUserExists):
 			message = "该用户已存在"
 			status = http.StatusConflict
-		case ErrPasswordTooWeak:
+		case errors.Is(err, ErrPasswordTooWeak):
 			message = "密码强度不符合要求"
 			status = http.StatusBadRequest
+		case errors.Is(err, ErrEmailVerificationPolicyUnavailable):
+			message = "注册服务暂时不可用"
+			status = http.StatusServiceUnavailable
 		default:
 			if strings.Contains(err.Error(), "password") {
 				message = "密码强度不符合要求"
@@ -335,6 +359,9 @@ func (h *AuthHandler) Register(c HTTPContext) {
 func (h *AuthHandler) Login(c HTTPContext) {
 	var req LoginRequest
 	if err := c.Bind(&req); err != nil {
+		if rejectOversizedAuthenticationRequest(c, err) {
+			return
+		}
 		h.logger.Error(
 			"Failed to bind login request",
 			"request_id", authLogRequestID(c),
@@ -424,6 +451,9 @@ func (h *AuthHandler) Login(c HTTPContext) {
 func (h *AuthHandler) RefreshToken(c HTTPContext) {
 	var req RefreshTokenRequest
 	if err := c.Bind(&req); err != nil {
+		if rejectOversizedAuthenticationRequest(c, err) {
+			return
+		}
 		h.logger.Error(
 			"Failed to bind refresh token request",
 			"request_id", authLogRequestID(c),
@@ -495,6 +525,8 @@ func loginFailureHTTPResponse(err error) (int, string) {
 		return http.StatusForbidden, "账号已锁定"
 	case errors.Is(err, ErrEmailNotVerified):
 		return http.StatusForbidden, "邮箱尚未验证"
+	case errors.Is(err, ErrEmailVerificationPolicyUnavailable):
+		return http.StatusServiceUnavailable, "认证策略暂时不可用"
 	case errors.Is(err, ErrInvalidOTP):
 		return http.StatusUnauthorized, "OTP 验证码错误"
 	case err != nil && strings.Contains(err.Error(), "OTP"):
@@ -523,8 +555,8 @@ func refreshFailureHTTPResponse(err error) (int, string, string) {
 
 // Logout 用户登出
 func (h *AuthHandler) Logout(c HTTPContext) {
-	h.clearTrustedDeviceCookie(c)
-
+	// 普通退出只结束当前登录会话。用户显式选择的可信设备凭据继续保留，
+	// 直到其在设备管理中撤销、过期，或执行全设备退出。
 	// 从头部获取刷新令牌
 	refreshToken := c.GetHeader("X-Refresh-Token")
 	var req LogoutRequest
@@ -532,6 +564,8 @@ func (h *AuthHandler) Logout(c HTTPContext) {
 		if refreshToken == "" {
 			refreshToken = req.RefreshToken
 		}
+	} else if rejectOversizedAuthenticationRequest(c, err) {
+		return
 	} else if !errors.Is(err, io.EOF) {
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "invalid_request",
@@ -720,6 +754,9 @@ func (h *AuthHandler) GetProfile(c HTTPContext) {
 func (h *AuthHandler) ForgotPassword(c HTTPContext) {
 	var req ForgotPasswordRequest
 	if err := c.Bind(&req); err != nil {
+		if rejectOversizedAuthenticationRequest(c, err) {
+			return
+		}
 		h.logger.Error(
 			"Failed to bind forgot password request",
 			"request_id", authLogRequestID(c),
@@ -739,18 +776,18 @@ func (h *AuthHandler) ForgotPassword(c HTTPContext) {
 	defer cancel()
 	err := h.authService.ForgotPassword(ctx, req.Email)
 	if err != nil {
+		if h.abortTerminatedPublicEmailRequest(c, err) {
+			return
+		}
 		h.logger.Error(
 			"Failed to process forgot password",
 			"request_id", authLogRequestID(c),
 			"reason", authLogReason(err),
 		)
-		c.JSON(http.StatusInternalServerError, ErrorResponse{
-			Error:   "forgot_password_failed",
-			Message: "处理密码重置请求失败",
-		})
-		return
 	}
 
+	// Never reveal account existence or dependency health on a public recovery
+	// endpoint. Operators receive the bounded internal log above.
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
 		Message: "密码重置邮件已发送",
@@ -761,6 +798,9 @@ func (h *AuthHandler) ForgotPassword(c HTTPContext) {
 func (h *AuthHandler) ResetPassword(c HTTPContext) {
 	var req ResetPasswordRequest
 	if err := c.Bind(&req); err != nil {
+		if rejectOversizedAuthenticationRequest(c, err) {
+			return
+		}
 		h.logger.Error(
 			"Failed to bind reset password request",
 			"request_id", authLogRequestID(c),
@@ -807,11 +847,19 @@ func (h *AuthHandler) ResetPassword(c HTTPContext) {
 
 // VerifyEmail 验证邮箱
 func (h *AuthHandler) VerifyEmail(c HTTPContext) {
-	token := c.GetQuery("token")
-	if token == "" {
+	var req VerifyEmailRequest
+	if err := c.Bind(&req); err != nil {
+		if rejectOversizedAuthenticationRequest(c, err) {
+			return
+		}
+		h.logger.Error(
+			"Failed to bind verify email request",
+			"request_id", authLogRequestID(c),
+			"reason", "invalid_request_body",
+		)
 		c.JSON(http.StatusBadRequest, ErrorResponse{
-			Error:   "missing_token",
-			Message: "缺少邮箱验证令牌",
+			Error:   "invalid_request",
+			Message: "请求格式无效",
 		})
 		return
 	}
@@ -821,7 +869,7 @@ func (h *AuthHandler) VerifyEmail(c HTTPContext) {
 		return
 	}
 	defer cancel()
-	err := h.authService.VerifyEmail(ctx, token)
+	err := h.authService.VerifyEmail(ctx, req.Token)
 	if err != nil {
 		h.logger.Error(
 			"Failed to verify email",
@@ -852,6 +900,9 @@ func (h *AuthHandler) VerifyEmail(c HTTPContext) {
 func (h *AuthHandler) ResendVerification(c HTTPContext) {
 	var req ResendVerificationRequest
 	if err := c.Bind(&req); err != nil {
+		if rejectOversizedAuthenticationRequest(c, err) {
+			return
+		}
 		h.logger.Error(
 			"Failed to bind resend verification request",
 			"request_id", authLogRequestID(c),
@@ -871,22 +922,63 @@ func (h *AuthHandler) ResendVerification(c HTTPContext) {
 	defer cancel()
 	err := h.authService.ResendVerification(ctx, req.Email)
 	if err != nil {
+		if h.abortTerminatedPublicEmailRequest(c, err) {
+			return
+		}
 		h.logger.Error(
 			"Failed to resend verification",
 			"request_id", authLogRequestID(c),
 			"reason", authLogReason(err),
 		)
-		c.JSON(http.StatusInternalServerError, ErrorResponse{
-			Error:   "resend_failed",
-			Message: "重新发送验证邮件失败",
-		})
-		return
 	}
 
+	// Keep the public response indistinguishable for unknown, already verified,
+	// accepted, and internally failed requests.
 	c.JSON(http.StatusOK, SuccessResponse{
 		Success: true,
 		Message: "验证邮件已发送",
 	})
+}
+
+// abortTerminatedPublicEmailRequest avoids writing the enumeration-safe success
+// envelope after the original client request has already ended. The service
+// error must match the parent request's termination cause: a timeout derived by
+// boundedRequestContext, or an unrelated dependency failure that races with
+// parent cancellation, must still publish the same opaque 200 response.
+func (h *AuthHandler) abortTerminatedPublicEmailRequest(
+	c HTTPContext,
+	err error,
+) bool {
+	if c == nil || err == nil || c.Request() == nil {
+		return false
+	}
+
+	parentErr := c.Request().Context().Err()
+	status := 0
+	reason := ""
+	switch {
+	case errors.Is(parentErr, context.Canceled) &&
+		errors.Is(err, context.Canceled):
+		status = statusClientClosedRequest
+		reason = "request_canceled"
+	case errors.Is(parentErr, context.DeadlineExceeded) &&
+		errors.Is(err, context.DeadlineExceeded):
+		status = http.StatusRequestTimeout
+		reason = "request_deadline_exceeded"
+	default:
+		return false
+	}
+
+	h.logger.Debug(
+		"Public authentication email request ended before processing completed",
+		"request_id", authLogRequestID(c),
+		"reason", reason,
+	)
+	if !authResponseWritten(c) {
+		c.Status(status)
+	}
+	c.Abort()
+	return true
 }
 
 // UpdateProfile 更新用户资料
@@ -907,6 +999,9 @@ func (h *AuthHandler) UpdateProfile(c HTTPContext) {
 
 	var req UpdateProfileRequest
 	if err := c.Bind(&req); err != nil {
+		if rejectOversizedAuthenticationRequest(c, err) {
+			return
+		}
 		h.logger.Error(
 			"Failed to bind update profile request",
 			"request_id", authLogRequestID(c),
@@ -989,6 +1084,9 @@ func (h *AuthHandler) ChangePassword(c HTTPContext) {
 
 	var req ChangePasswordRequest
 	if err := c.Bind(&req); err != nil {
+		if rejectOversizedAuthenticationRequest(c, err) {
+			return
+		}
 		h.logger.Error(
 			"Failed to bind change password request",
 			"request_id", authLogRequestID(c),
@@ -1048,6 +1146,9 @@ func (h *AuthHandler) EnableOTP(c HTTPContext) {
 
 	var req EnableOTPRequest
 	if err := c.Bind(&req); err != nil {
+		if rejectOversizedAuthenticationRequest(c, err) {
+			return
+		}
 		h.logger.Error(
 			"Failed to bind enable OTP request",
 			"request_id", authLogRequestID(c),
@@ -1118,6 +1219,9 @@ func (h *AuthHandler) DisableOTP(c HTTPContext) {
 		Password string `json:"password" binding:"required"`
 	}
 	if err := c.Bind(&req); err != nil {
+		if rejectOversizedAuthenticationRequest(c, err) {
+			return
+		}
 		h.logger.Error(
 			"Failed to bind disable OTP request",
 			"request_id", authLogRequestID(c),
@@ -1178,6 +1282,9 @@ func (h *AuthHandler) VerifyOTP(c HTTPContext) {
 
 	var req VerifyOTPRequest
 	if err := c.Bind(&req); err != nil {
+		if rejectOversizedAuthenticationRequest(c, err) {
+			return
+		}
 		h.logger.Error(
 			"Failed to bind verify OTP request",
 			"request_id", authLogRequestID(c),
@@ -1204,16 +1311,7 @@ func (h *AuthHandler) VerifyOTP(c HTTPContext) {
 			"user_id", authLogUserID(userInfo.ID),
 			"reason", authLogReason(err),
 		)
-		status := http.StatusUnauthorized
-		message := "OTP 验证码错误"
-
-		if errors.Is(err, ErrOTPExpired) {
-			status = http.StatusBadRequest
-			message = "OTP 验证码已过期"
-		} else if !errors.Is(err, ErrInvalidOTP) {
-			status = http.StatusInternalServerError
-			message = "验证 OTP 失败"
-		}
+		status, message := verifyOTPFailureHTTPResponse(err)
 
 		c.JSON(status, ErrorResponse{
 			Error:   "invalid_otp",
@@ -1226,6 +1324,17 @@ func (h *AuthHandler) VerifyOTP(c HTTPContext) {
 		Success: true,
 		Message: "OTP 验证成功",
 	})
+}
+
+func verifyOTPFailureHTTPResponse(err error) (int, string) {
+	switch {
+	case errors.Is(err, ErrInvalidOTP):
+		return http.StatusBadRequest, "OTP 验证码错误"
+	case errors.Is(err, ErrOTPExpired):
+		return http.StatusBadRequest, "OTP 验证码已过期"
+	default:
+		return http.StatusInternalServerError, "验证 OTP 失败"
+	}
 }
 
 // GenerateBackupCodes 生成备用代码

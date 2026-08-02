@@ -786,20 +786,31 @@ func (s *TicketService) AllowedTicketTransitions(
 			if candidate == ticket.Status {
 				continue
 			}
-			if err := validateTicketWorkflowTransitionTx(
+			candidateErr := validateTicketWorkflowTransitionTx(
 				ctx,
 				tx,
 				operation.Scope,
 				&ticket,
 				candidate,
 				operation.Actor,
-			); err == nil {
+			)
+			if candidateErr == nil {
 				allowed = append(allowed, candidate)
+				continue
+			}
+			if !errors.Is(
+				candidateErr,
+				errTicketWorkflowCandidateNotAllowed,
+			) {
+				return candidateErr
 			}
 		}
 		return nil
 	})
-	return allowed, err
+	if err != nil {
+		return nil, err
+	}
+	return allowed, nil
 }
 
 // GetTicketStatistics returns enhanced statistics for one authorized project.

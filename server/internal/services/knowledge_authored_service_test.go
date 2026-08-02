@@ -1055,7 +1055,7 @@ func TestKnowledgeSourceViewsRevalidateHumanTicketAndAttachmentVisibility(
 			name:       "observer",
 			userID:     104,
 			role:       models.ProjectRoleObserver,
-			visibility: KnowledgeSourceFull,
+			visibility: KnowledgeSourceRestricted,
 		},
 		{
 			name:       "unrelated requester",
@@ -2547,6 +2547,91 @@ func TestKnowledgeManageListAndPublishReuseBoundProjectTransaction(
 	)
 	if err != nil {
 		t.Fatalf("reuse scoped transaction: %v", err)
+	}
+}
+
+func TestKnowledgeEventWritesUseActualAuditLedgerTransaction(t *testing.T) {
+	fixture := newAuthoredKnowledgeFixture(t)
+	ledger, err := NewAuditLedgerService(fixture.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	native := NewAgentNativeService(
+		fixture.db,
+		AgentNativeOptions{AuditLedger: ledger},
+	)
+	fixture.service.events = native
+	fixture.service.idempotency = native
+	fixture.service.searchIndex = &knowledgeServiceTestIndex{}
+	fixture.service.modelProviders = map[string]ModelProvider{
+		"approved-local": &knowledgeServiceTestProvider{
+			descriptor: ModelProviderDescriptor{
+				Key:        "approved-local",
+				IsExternal: false,
+			},
+		},
+	}
+
+	created, err := fixture.service.CreateAuthoredArticle(
+		fixture.ctx,
+		CreateAuthoredArticleInput{
+			Key:      "audited-knowledge-write",
+			Title:    "审计事务知识写入",
+			Markdown: "# 初始版本\n",
+		},
+	)
+	if err != nil {
+		t.Fatalf("create audited authored article: %v", err)
+	}
+	revised, err := fixture.service.CreateAuthoredVersion(
+		fixture.ctx,
+		created.Article.ID,
+		CreateAuthoredVersionInput{
+			Title:    "审计事务知识写入第二版",
+			Markdown: "# 第二版本\n",
+		},
+	)
+	if err != nil {
+		t.Fatalf("create audited authored version: %v", err)
+	}
+	if _, err := fixture.service.PublishVersion(
+		fixture.ctx,
+		revised.Version.ID,
+	); err != nil {
+		t.Fatalf("publish audited authored version: %v", err)
+	}
+	if _, err := fixture.service.SetProjectModelPolicy(
+		fixture.ctx,
+		ProjectModelPolicyInput{
+			PolicyKey:         "knowledge",
+			ProviderKey:       "approved-local",
+			GenerateModel:     "generate-v1",
+			EmbeddingModel:    "embed-v1",
+			RerankModel:       "rerank-v1",
+			DataEgress:        models.ModelDataEgressDenied,
+			ProviderAllowlist: []string{"approved-local"},
+			ModelAllowlist: []string{
+				"generate-v1",
+				"embed-v1",
+				"rerank-v1",
+			},
+		},
+	); err != nil {
+		t.Fatalf("set audited model policy: %v", err)
+	}
+	if _, err := fixture.service.RebuildIndex(fixture.ctx); err != nil {
+		t.Fatalf("request audited index rebuild: %v", err)
+	}
+
+	verification, err := ledger.Verify(fixture.ctx)
+	if err != nil {
+		t.Fatalf("verify knowledge audit ledger: %v", err)
+	}
+	if !verification.Valid || verification.HeadSequence != 6 {
+		t.Fatalf(
+			"knowledge audit ledger verification = %+v, want six valid entries",
+			verification,
+		)
 	}
 }
 

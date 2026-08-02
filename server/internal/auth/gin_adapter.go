@@ -11,6 +11,12 @@ import (
 	"github.com/gin-gonic/gin/binding"
 )
 
+const maxAuthenticationJSONBodyBytes int64 = 64 << 10
+
+var ErrAuthenticationRequestBodyTooLarge = errors.New(
+	"authentication request body is too large",
+)
+
 // GinHTTPContext Gin框架的HTTPContext适配器
 type GinHTTPContext struct {
 	ginCtx *gin.Context
@@ -46,7 +52,21 @@ func (g *GinHTTPContext) Bind(obj interface{}) error {
 	if g == nil || g.ginCtx == nil || g.ginCtx.Request == nil {
 		return errors.New("HTTP request is required")
 	}
-	return decodeStrictJSON(g.ginCtx.Request.Body, obj)
+	request := g.ginCtx.Request
+	if request.ContentLength > maxAuthenticationJSONBodyBytes {
+		return ErrAuthenticationRequestBodyTooLarge
+	}
+	request.Body = http.MaxBytesReader(
+		g.ginCtx.Writer,
+		request.Body,
+		maxAuthenticationJSONBodyBytes,
+	)
+	err := decodeStrictJSON(request.Body, obj)
+	var maxBytesError *http.MaxBytesError
+	if errors.As(err, &maxBytesError) {
+		return ErrAuthenticationRequestBodyTooLarge
+	}
+	return err
 }
 
 // JSON 返回JSON响应

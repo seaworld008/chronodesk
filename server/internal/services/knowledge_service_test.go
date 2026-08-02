@@ -991,6 +991,58 @@ func TestKnowledgeSearchUsesLexicalFallbackWithoutModelPolicy(
 	}
 }
 
+func TestKnowledgeSearchClassifiesIndexFailuresAfterLexicalFallback(
+	t *testing.T,
+) {
+	for _, test := range []struct {
+		name      string
+		searchErr error
+		want      error
+	}{
+		{
+			name:      "unavailable",
+			searchErr: ErrKnowledgeIndexUnavailable,
+			want:      ErrKnowledgeIndexUnavailable,
+		},
+		{
+			name:      "invalid response",
+			searchErr: errors.New("malformed OpenSearch response"),
+			want:      ErrKnowledgeIndexResponseInvalid,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := newKnowledgeServiceTestDB(t)
+			scope := models.ProjectScope{
+				OrganizationID: 28,
+				ProjectID:      280,
+			}
+			seedKnowledgeSearchAuthorization(t, db, scope)
+			ctx := knowledgeServiceTestContext(t, scope)
+			index := &knowledgeServiceTestIndex{
+				searchErr: test.searchErr,
+			}
+			service := newKnowledgeServiceForTest(t, db, index, nil, nil)
+
+			_, err := service.Search(ctx, KnowledgeSearchInput{
+				Query: "无模型策略时的词法检索",
+				Limit: 5,
+			})
+			if !errors.Is(err, test.want) {
+				t.Fatalf("search error = %v, want %v", err, test.want)
+			}
+			if index.searchCalls != 1 ||
+				index.searchRequest.Query != "无模型策略时的词法检索" ||
+				len(index.searchRequest.QueryEmbedding) != 0 {
+				t.Fatalf(
+					"lexical search request = %+v, calls = %d",
+					index.searchRequest,
+					index.searchCalls,
+				)
+			}
+		})
+	}
+}
+
 func TestKnowledgeSearchUsesLexicalFallbackWhenProviderIsUnavailable(
 	t *testing.T,
 ) {
@@ -1157,6 +1209,58 @@ func TestKnowledgeSearchFailsClosedOnIndexBoundaryViolationBeforeRerank(
 		index.searchRequest.Filter.ProjectID != scope.ProjectID ||
 		len(index.searchRequest.Filter.ACLSubjects) == 0 {
 		t.Fatalf("backend search did not receive mandatory filters: %+v", index.searchRequest)
+	}
+}
+
+func TestKnowledgeSearchClassifiesMalformedIndexHitBeforeRerank(
+	t *testing.T,
+) {
+	db := newKnowledgeServiceTestDB(t)
+	scope := models.ProjectScope{OrganizationID: 17, ProjectID: 170}
+	seedKnowledgeSearchAuthorization(t, db, scope)
+	ctx := knowledgeServiceTestContext(t, scope)
+	index := &knowledgeServiceTestIndex{
+		hits: []HybridSearchHit{{
+			OrganizationID:  scope.OrganizationID,
+			ProjectID:       scope.ProjectID,
+			DocumentVersion: 1,
+			ChunkID:         uuid.Must(uuid.NewV7()).String(),
+			Snippet:         "缺少文章和版本标识的畸形索引命中",
+			ContentHash:     strings.Repeat("e", 64),
+			TokenCount:      2,
+		}},
+	}
+	provider := &knowledgeServiceTestProvider{
+		descriptor: ModelProviderDescriptor{
+			Key:        "approved-external",
+			IsExternal: true,
+		},
+	}
+	service := newKnowledgeServiceForTest(
+		t,
+		db,
+		index,
+		nil,
+		map[string]ModelProvider{
+			"approved-external": provider,
+		},
+	)
+	setKnowledgeServiceTestPolicy(
+		t,
+		service,
+		ctx,
+		models.ModelDataEgressAllowed,
+	)
+
+	_, err := service.Search(ctx, KnowledgeSearchInput{
+		Query: "畸形索引命中",
+		Limit: 1,
+	})
+	if !errors.Is(err, ErrKnowledgeIndexResponseInvalid) {
+		t.Fatalf("malformed index hit error = %v", err)
+	}
+	if provider.rerankCalls != 0 {
+		t.Fatalf("rerank called after malformed index hit = %d", provider.rerankCalls)
 	}
 }
 
@@ -1462,6 +1566,7 @@ type knowledgeServiceTestIndex struct {
 	afterSearch        func(context.Context)
 	searchRequest      HybridSearchRequest
 	searchCalls        int
+	searchErr          error
 	replacement        HybridIndexReplacement
 	replacementBatches []int
 	replaceErr         error
@@ -1481,6 +1586,9 @@ func (index *knowledgeServiceTestIndex) Search(
 	}
 	if index.afterSearch != nil {
 		index.afterSearch(ctx)
+	}
+	if index.searchErr != nil {
+		return nil, index.searchErr
 	}
 	return append([]HybridSearchHit(nil), index.hits...), nil
 }

@@ -188,7 +188,6 @@
   min-width: 0 !important;
 }
 
-.RaDatagrid-root > div,
 .RaDatagrid-tableWrapper,
 .MuiTableContainer-root {
   contain: inline-size;

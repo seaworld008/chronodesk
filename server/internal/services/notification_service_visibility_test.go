@@ -195,6 +195,7 @@ func TestDeliverTicketNotificationOutboxKeepsSnapshotAfterTicketDeletion(t *test
 		&models.User{},
 		&models.Ticket{},
 		&models.Notification{},
+		&models.NotificationPreference{},
 	); err != nil {
 		t.Fatal(err)
 	}

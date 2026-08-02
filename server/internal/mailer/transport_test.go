@@ -40,6 +40,18 @@ func TestSMTPTransportRejectsUnsafeModes(t *testing.T) {
 			},
 		},
 		{
+			name: "remote IPv4 plaintext is rejected",
+			config: SMTPTransportConfig{
+				Host: "192.0.2.25", Port: 25,
+			},
+		},
+		{
+			name: "remote IPv6 plaintext is rejected",
+			config: SMTPTransportConfig{
+				Host: "2001:db8::25", Port: 25,
+			},
+		},
+		{
 			name: "partial credentials are rejected",
 			config: SMTPTransportConfig{
 				Host: "localhost", Port: 2525, Username: "user",
@@ -51,6 +63,30 @@ func TestSMTPTransportRejectsUnsafeModes(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := NewSMTPTransport(test.config); err == nil {
 				t.Fatal("不安全的SMTP配置未被拒绝")
+			}
+		})
+	}
+}
+
+func TestSMTPTransportAcceptsHostnameAndIPLiteral(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		host     string
+		startTLS bool
+	}{
+		{name: "hostname", host: "smtp.example.com", startTLS: true},
+		{name: "remote IPv4 with TLS", host: "192.0.2.25", startTLS: true},
+		{name: "remote IPv6 with TLS", host: "2001:db8::25", startTLS: true},
+		{name: "loopback IPv4 plaintext", host: "127.0.0.1"},
+		{name: "loopback IPv6 plaintext", host: "::1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := NewSMTPTransport(SMTPTransportConfig{
+				Host:        test.host,
+				Port:        2525,
+				UseSTARTTLS: test.startTLS,
+			}); err != nil {
+				t.Fatalf("SMTP host %q was rejected: %v", test.host, err)
 			}
 		})
 	}

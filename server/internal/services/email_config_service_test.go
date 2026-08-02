@@ -82,6 +82,49 @@ func TestUpdateEmailConfigCanSkipSMTPTest(t *testing.T) {
 	}
 }
 
+func TestUpdateEmailConfigAcceptsIPv6Literal(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.EmailConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	protector, err := security.NewKeyring("test-email-ipv6", map[string][]byte{
+		"test-email-ipv6": bytes.Repeat([]byte{0x48}, 32),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewEmailConfigServiceWithProtector(db, protector)
+	enabled := true
+	host := "::1"
+	port := 2525
+	username := "chronodesk"
+	password := "test-password"
+	from := "chronodesk@example.test"
+	skip := true
+
+	updated, err := service.UpdateEmailConfig(
+		context.Background(),
+		&models.EmailConfigUpdateRequest{
+			EmailVerificationEnabled: &enabled,
+			SMTPHost:                 &host,
+			SMTPPort:                 &port,
+			SMTPUsername:             &username,
+			SMTPPassword:             &password,
+			SMTPUseTLS:               boolPtr(false),
+			SMTPUseSSL:               boolPtr(false),
+			FromEmail:                &from,
+			SkipSMTPTest:             &skip,
+		},
+		1,
+	)
+	if err != nil {
+		t.Fatalf("IPv6 SMTP literal should be accepted: %v", err)
+	}
+	if updated.SMTPHost != host {
+		t.Fatalf("SMTP host = %q, want %q", updated.SMTPHost, host)
+	}
+}
+
 func TestGetEmailConfigReturnsDefaultWithoutWriting(t *testing.T) {
 	db := openTestDB(t)
 	if err := db.AutoMigrate(&models.EmailConfig{}); err != nil {

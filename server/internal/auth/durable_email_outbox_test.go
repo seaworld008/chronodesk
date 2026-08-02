@@ -35,6 +35,7 @@ func newAuthEmailOutboxTestRepository(
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.UserProfile{},
+		&models.EmailConfig{},
 		&EmailVerification{},
 		&PasswordReset{},
 		&models.Organization{},
@@ -115,6 +116,20 @@ func seedAuthEmailOutboxUser(t *testing.T, db *gorm.DB) models.User {
 		t.Fatal(err)
 	}
 	return user
+}
+
+func seedAuthEmailVerificationPolicy(
+	t *testing.T,
+	db *gorm.DB,
+	enabled bool,
+) {
+	t.Helper()
+	if err := db.Create(&models.EmailConfig{
+		EmailVerificationEnabled: enabled,
+		IsActive:                 true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestParseEmailDestinationIDRejectsNativeUintNarrowing(t *testing.T) {
@@ -474,6 +489,7 @@ func TestRegistrationRollsBackUserProfileCredentialEventAndOutbox(t *testing.T) 
 				Timezone:  "UTC",
 				Language:  "zh-CN",
 			}
+			seedAuthEmailVerificationPolicy(t, db, true)
 			err := repository.Register(
 				context.Background(),
 				user,
@@ -483,6 +499,7 @@ func TestRegistrationRollsBackUserProfileCredentialEventAndOutbox(t *testing.T) 
 					Token:     "registration-verification-secret",
 					ExpiresAt: time.Now().Add(time.Hour),
 				},
+				&EmailVerificationPolicySnapshot{Enabled: true},
 			)
 			if err == nil {
 				t.Fatal("expected injected registration failure")
@@ -511,6 +528,55 @@ func TestRegistrationRollsBackUserProfileCredentialEventAndOutbox(t *testing.T) 
 				)
 			}
 		})
+	}
+}
+
+func TestRegistrationRejectsEmailPolicyChangedBeforeFinalTransaction(
+	t *testing.T,
+) {
+	db, repository, _ := newAuthEmailOutboxTestRepository(t)
+	seedAuthEmailVerificationPolicy(t, db, true)
+	now := time.Now()
+	user := &User{
+		Username:          "stale-registration-policy",
+		Email:             "stale-registration-policy@example.test",
+		PasswordHash:      "test-password-hash",
+		PlatformRole:      PlatformRoleMember,
+		Status:            StatusActive,
+		EmailVerified:     true,
+		EmailVerifiedAt:   &now,
+		PasswordChangedAt: &now,
+	}
+	profile := &UserProfile{
+		FirstName: "策略",
+		LastName:  "竞态",
+		Timezone:  "UTC",
+		Language:  "zh-CN",
+	}
+	err := repository.Register(
+		context.Background(),
+		user,
+		profile,
+		nil,
+		&EmailVerificationPolicySnapshot{Enabled: false},
+	)
+	if !errors.Is(err, ErrEmailVerificationPolicyChanged) {
+		t.Fatalf("stale registration policy error = %v", err)
+	}
+	for table, model := range map[string]any{
+		"users":               &models.User{},
+		"user_profiles":       &models.UserProfile{},
+		"email_verifications": &EmailVerification{},
+		"domain_events":       &models.DomainEvent{},
+		"outbox_deliveries":   &models.OutboxDelivery{},
+	} {
+		var count int64
+		if err := db.Model(model).Count(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("%s count after stale policy = %d, want 0", table, count)
+		}
 	}
 }
 
@@ -564,11 +630,15 @@ func TestRegistrationCommitsUserProfileAndEmailIntentTogether(t *testing.T) {
 					ExpiresAt: time.Now().Add(time.Hour),
 				}
 			}
+			seedAuthEmailVerificationPolicy(t, db, test.requireVerify)
 			if err := repository.Register(
 				context.Background(),
 				user,
 				profile,
 				verification,
+				&EmailVerificationPolicySnapshot{
+					Enabled: test.requireVerify,
+				},
 			); err != nil {
 				t.Fatal(err)
 			}

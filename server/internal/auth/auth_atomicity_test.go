@@ -347,8 +347,10 @@ func (r *loginFailureUserRepository) UpdateLastLogin(
 
 type loginFailureAttemptRepository struct {
 	LoginAttemptRepository
+	TokenRepository
 	createErr   error
 	createCalls int
+	commitCalls int
 }
 
 func (r *loginFailureAttemptRepository) GetRecentFailedAttempts(
@@ -364,6 +366,14 @@ func (r *loginFailureAttemptRepository) Create(
 	*LoginAttempt,
 ) error {
 	r.createCalls++
+	return r.createErr
+}
+
+func (r *loginFailureAttemptRepository) CommitLoginSession(
+	context.Context,
+	*LoginSessionCommit,
+) error {
+	r.commitCalls++
 	return r.createErr
 }
 
@@ -402,13 +412,18 @@ func newLoginFailureService(
 	return &AuthService{
 		userRepo:           userRepository,
 		profileRepo:        &loginFailureProfileRepository{},
+		tokenRepo:          attemptRepository,
 		loginAttemptRepo:   attemptRepository,
 		loginHistoryRepo:   &noopLoginHistoryRepository{},
 		emailConfigService: sessionTestEmailConfig{},
+		otpService:         trustedLoginOTPService{},
 		passwordService:    passwordService,
+		jwtManager:         mustTestJWTManager(t, time.Hour, 24*time.Hour),
 		config: &AuthConfig{
 			MaxFailedLogins:          5,
 			RequireEmailVerification: false,
+			AccessTokenExpire:        time.Hour,
+			RefreshTokenExpire:       24 * time.Hour,
 		},
 	}, userRepository, attemptRepository
 }
@@ -498,14 +513,16 @@ func TestSuccessfulCredentialCheckCannotIssueTokenWhenAuditFails(t *testing.T) {
 	if !errors.Is(err, injected) {
 		t.Fatalf("login error = %v, want injected success-audit failure", err)
 	}
-	if users.resetCalls != 1 ||
-		users.updateLastLoginCalls != 1 ||
-		attempts.createCalls != 1 {
+	if users.resetCalls != 0 ||
+		users.updateLastLoginCalls != 0 ||
+		attempts.createCalls != 0 ||
+		attempts.commitCalls != 1 {
 		t.Fatalf(
-			"reset=%d update=%d audit=%d, want 1/1/1",
+			"reset=%d update=%d standaloneAudit=%d atomicCommit=%d, want 0/0/0/1",
 			users.resetCalls,
 			users.updateLastLoginCalls,
 			attempts.createCalls,
+			attempts.commitCalls,
 		)
 	}
 }

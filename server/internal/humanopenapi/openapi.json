@@ -91,6 +91,57 @@
     }
   ],
   "paths": {
+    "/auth/register": {
+      "post": {
+        "operationId": "registerHuman",
+        "summary": "Register a human account",
+        "description": "Creates a member identity. When email verification is enabled, no usable browser session is issued until the one-time verification token is consumed.",
+        "tags": [
+          "Human sessions"
+        ],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterHumanRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Human account registered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HumanRegistrationEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
     "/auth/login": {
       "post": {
         "operationId": "createHumanSession",
@@ -129,6 +180,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
@@ -178,6 +232,9 @@
           "408": {
             "$ref": "#/components/responses/RequestTimeout"
           },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
           },
@@ -191,7 +248,7 @@
       "post": {
         "operationId": "requestHumanPasswordReset",
         "summary": "Request a human password reset",
-        "description": "Accepts an email address without revealing whether an account exists and queues the durable password-reset email workflow.",
+        "description": "Accepts an email address without revealing whether an account exists. When applicable, the server attempts to queue the durable password-reset workflow; account lookup and workflow dependency outcomes do not change the public success envelope.",
         "tags": [
           "Human sessions"
         ],
@@ -220,11 +277,11 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
-          },
-          "500": {
-            "$ref": "#/components/responses/InternalServerError"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -265,6 +322,9 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
           },
@@ -277,11 +337,104 @@
         }
       }
     },
+    "/auth/verify-email": {
+      "post": {
+        "operationId": "verifyHumanEmail",
+        "summary": "Verify a human email address",
+        "description": "Consumes a one-time email-verification token from the JSON request body. Tokens are never accepted from the HTTP query string.",
+        "tags": [
+          "Human sessions"
+        ],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyHumanEmailRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Email verified",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthMessageSuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/auth/resend-verification": {
+      "post": {
+        "operationId": "resendHumanEmailVerification",
+        "summary": "Request another human email-verification message",
+        "description": "Accepts an email address without revealing whether an unverified account exists. When applicable, the server attempts to queue a fresh one-time verification workflow; account lookup and workflow dependency outcomes do not change the public success envelope.",
+        "tags": [
+          "Human sessions"
+        ],
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResendHumanEmailVerificationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Verification request accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthMessageSuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
     "/auth/logout": {
       "post": {
         "operationId": "deleteHumanSession",
         "summary": "End one human browser session",
-        "description": "Idempotently revokes the refresh-token session supplied by X-Refresh-Token or the optional JSON body and clears the trusted-device cookie.",
+        "description": "Idempotently revokes the refresh-token session supplied by X-Refresh-Token or the optional JSON body. The explicit trusted-device credential remains on this browser until it expires, is individually revoked, or the human ends all sessions.",
         "tags": [
           "Human sessions"
         ],
@@ -321,6 +474,9 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
           },
@@ -334,7 +490,7 @@
       "post": {
         "operationId": "deleteAllHumanSessions",
         "summary": "End all sessions for the current human",
-        "description": "Revokes every persisted session for the authenticated human and clears the trusted-device cookie.",
+        "description": "Revokes every persisted session and every persisted trusted-device credential for the authenticated human, then clears this browser's trusted-device cookie.",
         "tags": [
           "Human sessions"
         ],
@@ -456,6 +612,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
           }
         }
       }
@@ -3585,6 +3744,62 @@
         ]
       }
     },
+    "/projects/{projectKey}/tickets/{ticketID}/transitions": {
+      "get": {
+        "operationId": "getProjectTicketAllowedTransitions",
+        "x-list-strategy": "bounded",
+        "summary": "Get allowed transitions for one Ticket",
+        "description": "Projects the exact immutable workflow version bound to the authorized Ticket into the lifecycle statuses the current human actor may select.",
+        "tags": [
+          "Tickets"
+        ],
+        "security": [
+          {
+            "humanBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ProjectKey"
+          },
+          {
+            "$ref": "#/components/parameters/TicketID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Allowed Ticket transitions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketAllowedTransitionsEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "x-chronodesk-project-roles": [
+          "project_admin",
+          "manager",
+          "agent"
+        ]
+      }
+    },
     "/projects/{projectKey}/tickets/{ticketID}/history": {
       "get": {
         "operationId": "listProjectTicketHistory",
@@ -4814,7 +5029,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/LegacyMessageSuccessEnvelope"
+                  "$ref": "#/components/schemas/AutomationRuleEnvelope"
                 }
               }
             }
@@ -5523,7 +5738,7 @@
         "operationId": "createProjectWebhook",
         "x-list-strategy": "bounded",
         "summary": "Create a Webhook configuration in one Project",
-        "description": "Creates a validated Webhook configuration in an authorized Project; lifecycle status is server-controlled during creation.",
+        "description": "Creates a validated Webhook configuration in an authorized Project with server-controlled inactive status. An administrator or manager may enqueue an explicit test while inactive, but ordinary event delivery begins only after an explicit update to active.",
         "tags": [
           "Webhooks"
         ],
@@ -12688,6 +12903,16 @@
           }
         }
       },
+      "PayloadTooLarge": {
+        "description": "The authentication JSON request body exceeds the 64 KiB limit",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            }
+          }
+        }
+      },
       "Unauthorized": {
         "description": "Authentication required or invalid",
         "content": {
@@ -13703,6 +13928,52 @@
         "format": "uuid",
         "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
       },
+      "RegisterHumanRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "username",
+          "email",
+          "password",
+          "confirm_password"
+        ],
+        "properties": {
+          "username": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 50
+          },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "maxLength": 100
+          },
+          "password": {
+            "type": "string",
+            "minLength": 8
+          },
+          "confirm_password": {
+            "type": "string",
+            "minLength": 1
+          },
+          "first_name": {
+            "type": "string",
+            "maxLength": 50
+          },
+          "last_name": {
+            "type": "string",
+            "maxLength": 50
+          },
+          "department": {
+            "type": "string",
+            "maxLength": 100
+          },
+          "position": {
+            "type": "string",
+            "maxLength": 100
+          }
+        }
+      },
       "LoginRequest": {
         "type": "object",
         "additionalProperties": false,
@@ -13713,7 +13984,8 @@
         "properties": {
           "email": {
             "type": "string",
-            "format": "email"
+            "format": "email",
+            "maxLength": 100
           },
           "password": {
             "type": "string",
@@ -13726,7 +13998,8 @@
             "type": "boolean"
           },
           "device_name": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 100
           }
         }
       },
@@ -13752,7 +14025,8 @@
         "properties": {
           "email": {
             "type": "string",
-            "format": "email"
+            "format": "email",
+            "maxLength": 100
           }
         }
       },
@@ -13771,6 +14045,33 @@
           "new_password": {
             "type": "string",
             "minLength": 8
+          }
+        }
+      },
+      "VerifyHumanEmailRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "ResendHumanEmailVerificationRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "email"
+        ],
+        "properties": {
+          "email": {
+            "type": "string",
+            "format": "email",
+            "maxLength": 100
           }
         }
       },
@@ -14208,6 +14509,40 @@
           "token_type": {
             "type": "string",
             "const": "Bearer"
+          }
+        }
+      },
+      "HumanRegistrationResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "user",
+          "access_token",
+          "refresh_token",
+          "expires_in",
+          "token_type"
+        ],
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/HumanSessionUser"
+          },
+          "access_token": {
+            "type": "string"
+          },
+          "refresh_token": {
+            "type": "string"
+          },
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "token_type": {
+            "type": "string",
+            "enum": [
+              "",
+              "Bearer"
+            ]
           }
         }
       },
@@ -15769,6 +16104,28 @@
           }
         ]
       },
+      "HumanRegistrationEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "msg",
+          "data"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer",
+            "const": 0
+          },
+          "msg": {
+            "type": "string",
+            "const": "注册成功"
+          },
+          "data": {
+            "$ref": "#/components/schemas/HumanRegistrationResult"
+          }
+        }
+      },
       "AuthSessionSuccessEnvelope": {
         "type": "object",
         "additionalProperties": false,
@@ -16414,6 +16771,40 @@
           "resolution_notes": {
             "type": "string",
             "maxLength": 10000
+          }
+        }
+      },
+      "TicketAllowedTransitions": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "allowed_next_statuses"
+        ],
+        "properties": {
+          "allowed_next_statuses": {
+            "type": "array",
+            "maxItems": 6,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/TicketStatus"
+            }
+          }
+        }
+      },
+      "TicketAllowedTransitionsEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "data"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "const": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/TicketAllowedTransitions"
           }
         }
       },
@@ -18014,7 +18405,12 @@
             "$ref": "#/components/schemas/NotificationPriority"
           },
           "channel": {
-            "$ref": "#/components/schemas/NotificationChannel"
+            "type": "string",
+            "enum": [
+              "in_app",
+              "email"
+            ],
+            "description": "Manual notification creation supports only application and durable email delivery."
           },
           "recipient_id": {
             "type": "integer",
@@ -18237,10 +18633,6 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "id",
-          "created_at",
-          "updated_at",
-          "user_id",
           "notification_type",
           "email_enabled",
           "in_app_enabled",
@@ -18252,22 +18644,6 @@
           "batch_interval"
         ],
         "properties": {
-          "id": {
-            "type": "integer",
-            "minimum": 1
-          },
-          "created_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "updated_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "user_id": {
-            "type": "integer",
-            "minimum": 1
-          },
           "notification_type": {
             "$ref": "#/components/schemas/NotificationType"
           },
@@ -18278,32 +18654,41 @@
             "type": "boolean"
           },
           "webhook_enabled": {
-            "type": "boolean"
+            "type": "boolean",
+            "const": false,
+            "description": "Reserved compatibility field. Notification Webhook delivery is not available in this release and the value is always false."
           },
           "do_not_disturb_start": {
             "type": [
               "string",
               "null"
             ],
-            "format": "date-time"
+            "format": "date-time",
+            "description": "Optional absolute start of the application-notification quiet interval."
           },
           "do_not_disturb_end": {
             "type": [
               "string",
               "null"
             ],
-            "format": "date-time"
+            "format": "date-time",
+            "description": "Optional absolute end of the application-notification quiet interval; both bounds must be supplied and end must be later than start."
           },
           "max_daily_count": {
             "type": "integer",
-            "minimum": 0
+            "minimum": 0,
+            "maximum": 10000,
+            "description": "Per-Project UTC-day limit for visible application notifications of this type. The same value applies independently in every Project; zero means unlimited."
           },
           "batch_delivery": {
-            "type": "boolean"
+            "type": "boolean",
+            "const": false,
+            "description": "Reserved compatibility field. Batch notification delivery is not available in this release and the value is always false."
           },
           "batch_interval": {
             "type": "integer",
-            "minimum": 1
+            "const": 60,
+            "description": "Reserved compatibility value for the unavailable batch-delivery feature."
           }
         }
       },
@@ -18330,34 +18715,41 @@
             "type": "boolean"
           },
           "webhook_enabled": {
-            "type": "boolean"
+            "type": "boolean",
+            "const": false,
+            "description": "Reserved compatibility field; must be false because notification Webhook delivery is unavailable."
           },
           "do_not_disturb_start": {
             "type": [
               "string",
               "null"
             ],
-            "format": "date-time"
+            "format": "date-time",
+            "description": "Optional absolute start of the application-notification quiet interval."
           },
           "do_not_disturb_end": {
             "type": [
               "string",
               "null"
             ],
-            "format": "date-time"
+            "format": "date-time",
+            "description": "Optional absolute end of the application-notification quiet interval; both bounds must be supplied and end must be later than start."
           },
           "max_daily_count": {
             "type": "integer",
             "minimum": 0,
-            "maximum": 10000
+            "maximum": 10000,
+            "description": "Per-Project UTC-day limit for visible application notifications of this type. The same value applies independently in every Project; zero means unlimited."
           },
           "batch_delivery": {
-            "type": "boolean"
+            "type": "boolean",
+            "const": false,
+            "description": "Reserved compatibility field; must be false because batch notification delivery is unavailable."
           },
           "batch_interval": {
             "type": "integer",
-            "minimum": 1,
-            "maximum": 1440
+            "const": 60,
+            "description": "Reserved compatibility value for the unavailable batch-delivery feature."
           }
         }
       },
@@ -18371,7 +18763,7 @@
           "preferences": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 50,
+            "maxItems": 10,
             "items": {
               "$ref": "#/components/schemas/NotificationPreferenceUpdate"
             }

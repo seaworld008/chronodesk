@@ -24,13 +24,56 @@ import (
 )
 
 const (
-	projectAccessContextKey = "project_access"
-	projectRoleContextKey   = "project_role"
+	projectAccessContextKey      = "project_access"
+	projectRoleContextKey        = "project_role"
+	projectAfterCommitContextKey = "project_after_commit"
 )
 
 var errProjectRequestRollback = errors.New(
 	"project request returned an unsuccessful response",
 )
+
+type projectAfterCommitQueue struct {
+	callbacks []func()
+}
+
+func queueProjectAfterCommit(c *gin.Context, callback func()) error {
+	if c == nil || callback == nil {
+		return errors.New("project after-commit callback is invalid")
+	}
+	value, exists := c.Get(projectAfterCommitContextKey)
+	queue, ok := value.(*projectAfterCommitQueue)
+	if !exists || !ok || queue == nil {
+		return errors.New("project after-commit queue is unavailable")
+	}
+	queue.callbacks = append(queue.callbacks, callback)
+	return nil
+}
+
+func runProjectAfterCommit(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	value, exists := c.Get(projectAfterCommitContextKey)
+	queue, ok := value.(*projectAfterCommitQueue)
+	if !exists || !ok || queue == nil {
+		return
+	}
+	callbacks := append([]func(){}, queue.callbacks...)
+	queue.callbacks = nil
+	for _, callback := range callbacks {
+		func() {
+			defer func() {
+				if recover() != nil {
+					_ = c.Error(errors.New(
+						"project after-commit callback panicked",
+					))
+				}
+			}()
+			callback()
+		}()
+	}
+}
 
 type ProjectHandler struct {
 	service  *services.ProjectService
@@ -888,6 +931,10 @@ func ProjectScopeMiddleware(
 			})
 			return
 		}
+		c.Set(
+			projectAfterCommitContextKey,
+			&projectAfterCommitQueue{},
+		)
 		originalWriter := c.Writer
 		defer func() {
 			c.Writer = originalWriter
@@ -979,6 +1026,7 @@ func ProjectScopeMiddleware(
 			}
 			return
 		}
+		runProjectAfterCommit(c)
 		if err := bufferedWriter.Commit(); err != nil {
 			_ = c.Error(err)
 			if !c.Writer.Written() {

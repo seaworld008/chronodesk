@@ -22,6 +22,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // AutomationService 自动化服务
@@ -254,14 +255,27 @@ func (s *AutomationService) GetRuleByID(ctx context.Context, ruleID uint) (*mode
 	if err != nil {
 		return nil, err
 	}
+	return getAutomationRuleByIDOnDB(ctx, s.db, scope, ruleID, false)
+}
+
+func getAutomationRuleByIDOnDB(
+	ctx context.Context,
+	db *gorm.DB,
+	scope models.ProjectScope,
+	ruleID uint,
+	lock bool,
+) (*models.AutomationRule, error) {
 	var rule models.AutomationRule
-	if err := scopedAutomationQuery(
-		s.db.WithContext(ctx),
+	query := scopedAutomationQuery(
+		db.WithContext(ctx),
 		scope,
 	).Preload("CreatedUser").
 		Preload("UpdatedUser").
-		Where("id = ?", ruleID).
-		First(&rule).Error; err != nil {
+		Where("id = ?", ruleID)
+	if lock {
+		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	if err := query.First(&rule).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, fmt.Errorf("rule not found")
 		}
@@ -271,60 +285,81 @@ func (s *AutomationService) GetRuleByID(ctx context.Context, ruleID uint) (*mode
 }
 
 // UpdateRule 更新规则
-func (s *AutomationService) UpdateRule(ctx context.Context, ruleID uint, req *models.AutomationRuleRequest, userID uint) error {
+func (s *AutomationService) UpdateRule(
+	ctx context.Context,
+	ruleID uint,
+	req *models.AutomationRuleRequest,
+	userID uint,
+) (*models.AutomationRule, error) {
 	if req == nil || !validAutomationRuleType(req.RuleType) {
-		return ErrInvalidAutomationRuleType
-	}
-	rule, err := s.GetRuleByID(ctx, ruleID)
-	if err != nil {
-		return err
+		return nil, ErrInvalidAutomationRuleType
 	}
 	triggerEvent, err := normalizeAutomationRuleTriggerEvent(req.TriggerEvent)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	updates := map[string]interface{}{
-		"name":          req.Name,
-		"description":   req.Description,
-		"rule_type":     req.RuleType,
-		"trigger_event": triggerEvent,
-		"updated_by":    userID,
-	}
-
-	if req.IsActive != nil {
-		updates["is_active"] = *req.IsActive
-	}
-	if req.Priority != nil {
-		updates["priority"] = *req.Priority
-	}
-
-	// 更新条件和动作
-	if err := rule.SetConditions(req.Conditions); err != nil {
-		return fmt.Errorf("invalid conditions: %w", err)
-	}
-	if err := rule.SetActions(req.Actions); err != nil {
-		return fmt.Errorf("invalid actions: %w", err)
-	}
-
-	updates["conditions"] = rule.Conditions
-	updates["actions"] = rule.Actions
 
 	scope, err := automationProjectScope(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	result := scopedAutomationQuery(
-		s.db.WithContext(ctx).Model(&models.AutomationRule{}),
-		scope,
-	).Where("id = ?", rule.ID).Updates(updates)
-	if result.Error != nil {
-		return result.Error
+	var updated *models.AutomationRule
+	err = transactionForContext(ctx, s.db, func(tx *gorm.DB) error {
+		rule, lockErr := getAutomationRuleByIDOnDB(
+			ctx,
+			tx,
+			scope,
+			ruleID,
+			true,
+		)
+		if lockErr != nil {
+			return lockErr
+		}
+		updates := map[string]interface{}{
+			"name":          req.Name,
+			"description":   req.Description,
+			"rule_type":     req.RuleType,
+			"trigger_event": triggerEvent,
+			"updated_by":    userID,
+		}
+		if req.IsActive != nil {
+			updates["is_active"] = *req.IsActive
+		}
+		if req.Priority != nil {
+			updates["priority"] = *req.Priority
+		}
+		if setErr := rule.SetConditions(req.Conditions); setErr != nil {
+			return fmt.Errorf("invalid conditions: %w", setErr)
+		}
+		if setErr := rule.SetActions(req.Actions); setErr != nil {
+			return fmt.Errorf("invalid actions: %w", setErr)
+		}
+		updates["conditions"] = rule.Conditions
+		updates["actions"] = rule.Actions
+
+		result := scopedAutomationQuery(
+			tx.WithContext(ctx).Model(&models.AutomationRule{}),
+			scope,
+		).Where("id = ?", rule.ID).Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errors.New("rule not found")
+		}
+		updated, lockErr = getAutomationRuleByIDOnDB(
+			ctx,
+			tx,
+			scope,
+			rule.ID,
+			false,
+		)
+		return lockErr
+	})
+	if err != nil {
+		return nil, err
 	}
-	if result.RowsAffected != 1 {
-		return errors.New("rule not found")
-	}
-	return nil
+	return updated, nil
 }
 
 func validAutomationRuleType(ruleType string) bool {
@@ -2409,6 +2444,7 @@ func (s *AutomationService) CreateSLAConfig(ctx context.Context, req *models.SLA
 		AssignedUserID:  req.AssignedUserID,
 		ResponseTime:    req.ResponseTime,
 		ResolutionTime:  req.ResolutionTime,
+		EscalationRules: "[]",
 		ExcludeWeekends: true,
 		ExcludeHolidays: true,
 	}
@@ -2426,17 +2462,29 @@ func (s *AutomationService) CreateSLAConfig(ctx context.Context, req *models.SLA
 		config.ExcludeHolidays = *req.ExcludeHolidays
 	}
 
-	// 设置工作时间
-	if req.WorkingHours != nil {
-		if _, err := prepareWorkingSchedule(req.WorkingHours, config.ExcludeWeekends, config.ExcludeHolidays, time.UTC); err != nil {
-			return nil, err
-		}
-		workingHoursJSON, err := json.Marshal(req.WorkingHours)
+	// PostgreSQL json/jsonb columns reject the Go string zero value. Persist the
+	// same default schedule that GetWorkingHours exposes when the request omits
+	// an explicit schedule so storage and domain semantics remain aligned.
+	workingHours := req.WorkingHours
+	if workingHours == nil {
+		workingHours, err = config.GetWorkingHours()
 		if err != nil {
-			return nil, fmt.Errorf("invalid working hours: %w", err)
+			return nil, fmt.Errorf("load default working hours: %w", err)
 		}
-		config.WorkingHours = string(workingHoursJSON)
 	}
+	if _, err := prepareWorkingSchedule(
+		workingHours,
+		config.ExcludeWeekends,
+		config.ExcludeHolidays,
+		time.UTC,
+	); err != nil {
+		return nil, err
+	}
+	workingHoursJSON, err := json.Marshal(workingHours)
+	if err != nil {
+		return nil, fmt.Errorf("invalid working hours: %w", err)
+	}
+	config.WorkingHours = string(workingHoursJSON)
 
 	// 设置升级规则
 	if len(req.EscalationRules) > 0 {
@@ -2651,6 +2699,7 @@ func (s *AutomationService) CreateTemplate(ctx context.Context, req *models.Tick
 		DefaultPriority: req.DefaultPriority,
 		DefaultStatus:   req.DefaultStatus,
 		AssignToUserID:  req.AssignToUserID,
+		CustomFields:    "[]",
 		CreatedBy:       userID,
 	}
 

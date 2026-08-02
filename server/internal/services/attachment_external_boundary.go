@@ -802,14 +802,6 @@ func (s *AgentNativeService) loadAndAuthorizeAttachmentDownload(
 		destination.TicketID != expectedTicketID {
 		return gorm.ErrRecordNotFound
 	}
-	if destination.StorageType == "staging" ||
-		destination.VirusScan != models.VirusScanClean {
-		return fmt.Errorf(
-			"%w: %s",
-			ErrAttachmentNotClean,
-			destination.VirusScan,
-		)
-	}
 	var ticket models.Ticket
 	if err := s.db.WithContext(ctx).
 		Select(
@@ -862,6 +854,17 @@ func (s *AgentNativeService) loadAndAuthorizeAttachmentDownload(
 	case models.ActorTypeSystem:
 	default:
 		return ErrInvalidActor
+	}
+	// Visibility and ticket authorization must be evaluated before scan or
+	// storage state. Otherwise an unauthorized caller can distinguish pending,
+	// infected, or staged private attachments from resources they may not read.
+	if destination.StorageType == "staging" ||
+		destination.VirusScan != models.VirusScanClean {
+		return fmt.Errorf(
+			"%w: %s",
+			ErrAttachmentNotClean,
+			destination.VirusScan,
+		)
 	}
 	return nil
 }
@@ -979,7 +982,7 @@ func authorizeHumanAttachmentTicket(
 	case models.ProjectRoleAdmin, models.ProjectRoleManager:
 		return nil
 	case models.ProjectRoleObserver:
-		if !write {
+		if !write && isPublic {
 			return nil
 		}
 	case models.ProjectRoleAgent:

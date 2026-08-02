@@ -16,6 +16,7 @@ func TestDeliverTicketNotificationOutboxRendersEscalationAndPreservesAssignmentE
 		&models.User{},
 		&models.Ticket{},
 		&models.Notification{},
+		&models.NotificationPreference{},
 	); err != nil {
 		t.Fatalf("migrate ticket notification fixture: %v", err)
 	}

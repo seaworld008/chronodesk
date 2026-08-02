@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -311,6 +312,84 @@ func TestKnowledgeHandlerContractedAuthoredPublishAndSearchFlow(
 		},
 		http.StatusForbidden,
 	)
+}
+
+func TestKnowledgeHandlerClassifiesSearchFailuresWithoutModelPolicy(
+	t *testing.T,
+) {
+	for _, test := range []struct {
+		name        string
+		query       string
+		searchErr   error
+		wantStatus  int
+		wantMessage string
+		wantCalls   int
+	}{
+		{
+			name:        "index unavailable",
+			query:       "服务恢复",
+			searchErr:   services.ErrKnowledgeIndexUnavailable,
+			wantStatus:  http.StatusServiceUnavailable,
+			wantMessage: "知识索引服务不可用",
+			wantCalls:   1,
+		},
+		{
+			name:        "invalid index response",
+			query:       "服务恢复",
+			searchErr:   errors.New("malformed OpenSearch response"),
+			wantStatus:  http.StatusBadGateway,
+			wantMessage: "知识索引响应无效",
+			wantCalls:   1,
+		},
+		{
+			name:        "invalid human query",
+			query:       " ",
+			wantStatus:  http.StatusBadRequest,
+			wantMessage: "知识参数或引用无效",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			environment := newKnowledgeHandlerTestEnvironment(t)
+			environment.index.searchErr = test.searchErr
+			router := knowledgeHandlerTestRouter(
+				environment,
+				environment.agent,
+			)
+
+			response, _ := performKnowledgeHandlerRequest[json.RawMessage](
+				t,
+				router,
+				http.MethodPost,
+				"/api/projects/OPS/knowledge/searches",
+				knowledgeSearchRequest{
+					Query: test.query,
+					Limit: 5,
+				},
+				test.wantStatus,
+			)
+			if response.Msg != test.wantMessage {
+				t.Fatalf(
+					"search message = %q, want %q",
+					response.Msg,
+					test.wantMessage,
+				)
+			}
+			if environment.index.searchCalls != test.wantCalls {
+				t.Fatalf(
+					"search calls = %d, want %d",
+					environment.index.searchCalls,
+					test.wantCalls,
+				)
+			}
+			if test.wantCalls == 1 &&
+				len(environment.index.lastSearch.QueryEmbedding) != 0 {
+				t.Fatalf(
+					"missing model policy did not use lexical search: %+v",
+					environment.index.lastSearch,
+				)
+			}
+		})
+	}
 }
 
 func TestKnowledgeHandlerDoesNotExposeAdvancedKnowledgeMutationRoutes(
@@ -657,8 +736,10 @@ func TestKnowledgeHandlerRejectsScopeAndActorFields(
 }
 
 type knowledgeHandlerTestIndex struct {
-	documents  []services.HybridIndexDocument
-	lastSearch services.HybridSearchRequest
+	documents   []services.HybridIndexDocument
+	lastSearch  services.HybridSearchRequest
+	searchCalls int
+	searchErr   error
 }
 
 func (index *knowledgeHandlerTestIndex) Search(
@@ -668,7 +749,11 @@ func (index *knowledgeHandlerTestIndex) Search(
 	if err := request.Filter.Validate(); err != nil {
 		return nil, err
 	}
+	index.searchCalls++
 	index.lastSearch = request
+	if index.searchErr != nil {
+		return nil, index.searchErr
+	}
 	hits := make([]services.HybridSearchHit, 0)
 	for _, document := range index.documents {
 		if document.OrganizationID != request.Filter.OrganizationID ||

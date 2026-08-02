@@ -279,8 +279,27 @@ func NewWebhookDeliverySnapshot(
 	config WebhookConfig,
 	eventID string,
 ) (*WebhookDeliverySnapshot, error) {
+	return newWebhookDeliverySnapshot(config, eventID, false)
+}
+
+// NewWebhookTestDeliverySnapshot freezes an explicit operator test for an
+// active or inactive configuration. Disabled/error configurations remain
+// unavailable, and ordinary event delivery still requires active status.
+func NewWebhookTestDeliverySnapshot(
+	config WebhookConfig,
+	eventID string,
+) (*WebhookDeliverySnapshot, error) {
+	return newWebhookDeliverySnapshot(config, eventID, true)
+}
+
+func newWebhookDeliverySnapshot(
+	config WebhookConfig,
+	eventID string,
+	allowInactive bool,
+) (*WebhookDeliverySnapshot, error) {
 	if config.ID == 0 || config.OrganizationID == 0 || config.ProjectID == 0 ||
-		config.Status != WebhookStatusActive {
+		(config.Status != WebhookStatusActive &&
+			(!allowInactive || config.Status != WebhookStatusInactive)) {
 		return nil, errors.New("active project webhook configuration is required")
 	}
 	if err := config.ValidateSubscriptions(true); err != nil {

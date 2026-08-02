@@ -73,4 +73,19 @@ func TestUpdateWebhookRequestAcceptsPublishedStatusOnly(t *testing.T) {
 	if request.Status == nil || string(*request.Status) != "inactive" {
 		t.Fatalf("status = %v, want inactive", request.Status)
 	}
+
+	invalidRecorder := httptest.NewRecorder()
+	invalidContext, _ := gin.CreateTestContext(invalidRecorder)
+	invalidContext.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/projects/TEST/webhooks/1",
+		strings.NewReader(`{"status":"running"}`),
+	)
+	var invalidRequest UpdateWebhookRequest
+	if err := decodeStrictWebhookJSON(
+		invalidContext,
+		&invalidRequest,
+	); err == nil {
+		t.Fatal("decodeStrictWebhookJSON accepted an unknown webhook status")
+	}
 }

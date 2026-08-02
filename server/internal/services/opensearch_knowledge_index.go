@@ -223,23 +223,24 @@ func (index *OpenSearchKnowledgeIndex) Search(
 		searchPath += "?search_pipeline=" +
 			url.QueryEscape(index.searchPipeline)
 	}
+	type searchHit struct {
+		Score  *float64 `json:"_score"`
+		Source *struct {
+			OrganizationID  uint   `json:"organization_id"`
+			ProjectID       uint   `json:"project_id"`
+			ArticleID       string `json:"article_id"`
+			VersionID       string `json:"version_id"`
+			DocumentVersion uint64 `json:"document_version"`
+			ChunkID         string `json:"chunk_id"`
+			PageNumber      *int   `json:"page_number"`
+			Snippet         string `json:"snippet"`
+			ContentHash     string `json:"content_hash"`
+			TokenCount      int    `json:"token_count"`
+		} `json:"_source"`
+	}
 	response := struct {
-		Hits struct {
-			Hits []struct {
-				Score  float64 `json:"_score"`
-				Source struct {
-					OrganizationID  uint   `json:"organization_id"`
-					ProjectID       uint   `json:"project_id"`
-					ArticleID       string `json:"article_id"`
-					VersionID       string `json:"version_id"`
-					DocumentVersion uint64 `json:"document_version"`
-					ChunkID         string `json:"chunk_id"`
-					PageNumber      *int   `json:"page_number"`
-					Snippet         string `json:"snippet"`
-					ContentHash     string `json:"content_hash"`
-					TokenCount      int    `json:"token_count"`
-				} `json:"_source"`
-			} `json:"hits"`
+		Hits *struct {
+			Hits *[]searchHit `json:"hits"`
 		} `json:"hits"`
 	}{}
 	if err := index.doJSON(
@@ -252,9 +253,22 @@ func (index *OpenSearchKnowledgeIndex) Search(
 	); err != nil {
 		return nil, err
 	}
-	results := make([]HybridSearchHit, 0, len(response.Hits.Hits))
-	for _, hit := range response.Hits.Hits {
-		source := hit.Source
+	if response.Hits == nil || response.Hits.Hits == nil {
+		return nil, fmt.Errorf(
+			"%w: OpenSearch search response is missing hits.hits",
+			ErrKnowledgeIndexResponseInvalid,
+		)
+	}
+	rawHits := *response.Hits.Hits
+	results := make([]HybridSearchHit, 0, len(rawHits))
+	for _, hit := range rawHits {
+		if hit.Source == nil || hit.Score == nil {
+			return nil, fmt.Errorf(
+				"%w: OpenSearch search hit is missing _source or _score",
+				ErrKnowledgeIndexResponseInvalid,
+			)
+		}
+		source := *hit.Source
 		results = append(results, HybridSearchHit{
 			OrganizationID:  source.OrganizationID,
 			ProjectID:       source.ProjectID,
@@ -265,7 +279,7 @@ func (index *OpenSearchKnowledgeIndex) Search(
 			PageNumber:      source.PageNumber,
 			Snippet:         source.Snippet,
 			ContentHash:     source.ContentHash,
-			Score:           hit.Score,
+			Score:           *hit.Score,
 			TokenCount:      source.TokenCount,
 		})
 	}
@@ -774,7 +788,18 @@ func (index *OpenSearchKnowledgeIndex) doRequest(
 			return nil
 		}
 	}
-	return fmt.Errorf("OpenSearch returned unexpected status %d", status)
+	if openSearchKnowledgeStatusUnavailable(status) {
+		return fmt.Errorf(
+			"%w: OpenSearch returned unexpected status %d",
+			ErrKnowledgeIndexUnavailable,
+			status,
+		)
+	}
+	return fmt.Errorf(
+		"%w: OpenSearch returned unexpected status %d",
+		ErrKnowledgeIndexResponseInvalid,
+		status,
+	)
 }
 
 func (index *OpenSearchKnowledgeIndex) doRequestStatus(
@@ -797,7 +822,11 @@ func (index *OpenSearchKnowledgeIndex) doRequestStatus(
 	requestURL := strings.TrimRight(index.endpoint.String(), "/") + path
 	request, err := http.NewRequestWithContext(ctx, method, requestURL, body)
 	if err != nil {
-		return 0, fmt.Errorf("create OpenSearch request: %w", err)
+		return 0, fmt.Errorf(
+			"%w: create OpenSearch request: %v",
+			ErrKnowledgeIndexResponseInvalid,
+			err,
+		)
 	}
 	request.Header.Set("Accept", "application/json")
 	if body != nil {
@@ -805,34 +834,78 @@ func (index *OpenSearchKnowledgeIndex) doRequestStatus(
 	}
 	if index.authorizer != nil {
 		if err := index.authorizer.Authorize(request); err != nil {
-			return 0, fmt.Errorf("authorize OpenSearch request: %w", err)
+			return 0, fmt.Errorf(
+				"%w: authorize OpenSearch request: %v",
+				ErrKnowledgeIndexUnavailable,
+				err,
+			)
 		}
 	}
 	httpResponse, err := index.client.Do(request)
 	if err != nil {
-		return 0, fmt.Errorf("execute OpenSearch request: %w", err)
+		return 0, fmt.Errorf(
+			"%w: execute OpenSearch request: %v",
+			ErrKnowledgeIndexUnavailable,
+			err,
+		)
 	}
 	defer httpResponse.Body.Close()
+	unavailableStatus := openSearchKnowledgeStatusUnavailable(
+		httpResponse.StatusCode,
+	)
 	limited := io.LimitReader(
 		httpResponse.Body,
 		openSearchKnowledgeMaxResponseBytes+1,
 	)
 	payload, err := io.ReadAll(limited)
 	if err != nil {
-		return 0, fmt.Errorf("read OpenSearch response: %w", err)
+		classification := ErrKnowledgeIndexResponseInvalid
+		if unavailableStatus {
+			classification = ErrKnowledgeIndexUnavailable
+		}
+		return 0, fmt.Errorf(
+			"%w: read OpenSearch response for status %d: %v",
+			classification,
+			httpResponse.StatusCode,
+			err,
+		)
 	}
 	if len(payload) > openSearchKnowledgeMaxResponseBytes {
-		return 0, errors.New("OpenSearch response exceeds the configured limit")
+		classification := ErrKnowledgeIndexResponseInvalid
+		if unavailableStatus {
+			classification = ErrKnowledgeIndexUnavailable
+		}
+		return 0, fmt.Errorf(
+			"%w: OpenSearch response for status %d exceeds the configured limit",
+			classification,
+			httpResponse.StatusCode,
+		)
 	}
 	if response != nil &&
-		len(bytes.TrimSpace(payload)) > 0 &&
 		httpResponse.StatusCode >= 200 &&
 		httpResponse.StatusCode < 300 {
+		if len(bytes.TrimSpace(payload)) == 0 {
+			return 0, fmt.Errorf(
+				"%w: OpenSearch returned an empty response",
+				ErrKnowledgeIndexResponseInvalid,
+			)
+		}
 		if err := json.Unmarshal(payload, response); err != nil {
-			return 0, fmt.Errorf("decode OpenSearch response: %w", err)
+			return 0, fmt.Errorf(
+				"%w: decode OpenSearch response: %v",
+				ErrKnowledgeIndexResponseInvalid,
+				err,
+			)
 		}
 	}
 	return httpResponse.StatusCode, nil
+}
+
+func openSearchKnowledgeStatusUnavailable(status int) bool {
+	return status == http.StatusNotFound ||
+		status == http.StatusRequestTimeout ||
+		status == http.StatusTooManyRequests ||
+		status >= http.StatusInternalServerError
 }
 
 func (index *OpenSearchKnowledgeIndex) projectAlias(

@@ -30,6 +30,7 @@ import {
 import {
     authenticationStorageKeys,
 } from './humanSessionStorage'
+import { bindHumanTabSession } from './humanTabSession'
 import { joinApiUrl } from './apiUrl'
 
 const apiBase = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
@@ -134,10 +135,14 @@ const readStoredUser = (): HumanSessionUser | null => {
     }
 }
 
+export const hasCompleteAuthenticationState = (): boolean =>
+    readStoredUser() !== null
+
 export const clearAuthenticationState = (): void => {
     for (const key of authenticationStorageKeys) {
         localStorage.removeItem(key)
     }
+    bindHumanTabSession(null)
     clearProjectScopeCache()
 }
 
@@ -159,6 +164,7 @@ const storeAuthSession = (
     localStorage.setItem('refreshToken', session.refresh_token)
     localStorage.setItem('user', JSON.stringify(session.user))
     localStorage.setItem('tokenExpiresAt', String(binding.expires_at))
+    bindHumanTabSession(session.access_token)
 }
 
 const refreshStoredSession = async (): Promise<void> => {

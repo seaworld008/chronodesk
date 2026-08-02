@@ -117,6 +117,52 @@ func TestWebhookTestCommandCommitsSnapshotEventAndOutboxWithoutHTTP(
 	}
 }
 
+func TestWebhookTestCommandAllowsInactiveWithoutEnablingOrdinaryDelivery(
+	t *testing.T,
+) {
+	fixture := newNotificationWebhookTestCommandFixture(
+		t,
+		models.ProjectRoleManager,
+	)
+	if err := fixture.db.Model(&models.WebhookConfig{}).
+		Where("id = ?", fixture.config.ID).
+		Update("status", models.WebhookStatusInactive).Error; err != nil {
+		t.Fatal(err)
+	}
+	fixture.config.Status = models.WebhookStatusInactive
+
+	targets, err := fixture.service.ListWebhookOutboxTargets(
+		fixture.ctx,
+		fixture.scope,
+		models.WebhookEventSystemAlert,
+		"",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 0 {
+		t.Fatalf("inactive webhook became ordinary delivery target: %+v", targets)
+	}
+	if _, err := models.NewWebhookDeliverySnapshot(
+		fixture.config,
+		"ordinary-event",
+	); err == nil {
+		t.Fatal("ordinary snapshot accepted inactive webhook")
+	}
+
+	receipt, err := fixture.service.TestWebhook(
+		fixture.ctx,
+		fixture.scope,
+		fixture.config.ID,
+	)
+	if err != nil {
+		t.Fatalf("queue inactive webhook test delivery: %v", err)
+	}
+	if receipt == nil || !receipt.Queued || receipt.ConfigID != fixture.config.ID {
+		t.Fatalf("inactive webhook test receipt=%+v", receipt)
+	}
+}
+
 func TestWebhookTestCommandRollsBackSnapshotWhenEventAppendFails(t *testing.T) {
 	fixture := newNotificationWebhookTestCommandFixture(
 		t,

@@ -271,6 +271,21 @@ const installTicketBackend = async (
         }
 
         if (
+            url.pathname === `${ticketPath}/transitions` &&
+            request.method() === 'GET'
+        ) {
+            await fulfillJSON(route, {
+                success: true,
+                data: {
+                    // The Ticket is bound to a published workflow whose
+                    // open state permits only these exact lifecycle edges.
+                    allowed_next_statuses: ['in_progress', 'cancelled'],
+                },
+            });
+            return;
+        }
+
+        if (
             url.pathname.startsWith(`${ticketPath}/`) &&
             request.method() === 'POST'
         ) {

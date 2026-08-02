@@ -670,7 +670,9 @@ const WebhookSettings: React.FC = () => {
           method: 'POST',
           body: JSON.stringify(payload),
         })
-        notify('Webhook 创建成功', { type: 'success' })
+        notify('Webhook 已创建为停用状态，请验证后再启用', {
+          type: 'success',
+        })
       }
       closeForm()
       fetchWebhooks()

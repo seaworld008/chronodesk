@@ -1646,6 +1646,7 @@ func validateWorkflowDefinitions(
 		return errors.New("workflow must contain between 1 and 64 states")
 	}
 	stateKeys := make(map[string]WorkflowStateDefinition, len(states))
+	categoryStates := make(map[LifecycleCategory]string, len(states))
 	initialCount := 0
 	for _, state := range states {
 		if err := validateConfigurationKey(state.Key, "workflow state"); err != nil {
@@ -1665,6 +1666,15 @@ func validateWorkflowDefinitions(
 			return fmt.Errorf("duplicate workflow state %q", state.Key)
 		}
 		stateKeys[state.Key] = state
+		if existingState, exists := categoryStates[state.LifecycleCategory]; exists {
+			return fmt.Errorf(
+				"duplicate workflow lifecycle category %q in states %q and %q",
+				state.LifecycleCategory,
+				existingState,
+				state.Key,
+			)
+		}
+		categoryStates[state.LifecycleCategory] = state.Key
 		if state.IsInitial {
 			initialCount++
 		}

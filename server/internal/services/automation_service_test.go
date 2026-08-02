@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -66,6 +67,91 @@ func setupAutomationServiceTestDB(t *testing.T) *gorm.DB {
 	}
 
 	return db
+}
+
+func TestAutomationConfigCreationStoresValidJSONDefaults(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.SLAConfig{},
+		&models.TicketTemplate{},
+	); err != nil {
+		t.Fatalf("migrate automation configuration schemas: %v", err)
+	}
+	user := models.User{
+		Username:     "automation-json-author",
+		Email:        "automation-json-author@example.com",
+		PasswordHash: "hashed",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("create automation JSON author: %v", err)
+	}
+	ctx := testProjectOperationContext(t, db, models.HumanActor(user.ID))
+	service := NewAutomationService(db)
+
+	sla, err := service.CreateSLAConfig(
+		ctx,
+		&models.SLAConfigRequest{
+			Name:           "valid JSON defaults",
+			ResponseTime:   30,
+			ResolutionTime: 120,
+		},
+	)
+	if err != nil {
+		t.Fatalf("create SLA with omitted JSON fields: %v", err)
+	}
+	if !json.Valid([]byte(sla.WorkingHours)) ||
+		!json.Valid([]byte(sla.EscalationRules)) {
+		t.Fatalf(
+			"SLA JSON defaults are invalid: working_hours=%q escalation_rules=%q",
+			sla.WorkingHours,
+			sla.EscalationRules,
+		)
+	}
+	hours, err := sla.GetWorkingHours()
+	if err != nil {
+		t.Fatalf("decode default working hours: %v", err)
+	}
+	if hours.Monday.Start != "09:00" ||
+		hours.Monday.End != "18:00" ||
+		hours.Saturday.Start != "" ||
+		hours.Saturday.End != "" {
+		t.Fatalf("unexpected default working hours: %+v", hours)
+	}
+	rules, err := sla.GetEscalationRules()
+	if err != nil {
+		t.Fatalf("decode default escalation rules: %v", err)
+	}
+	if len(rules) != 0 {
+		t.Fatalf("default escalation rules = %+v, want empty", rules)
+	}
+
+	template, err := service.CreateTemplate(
+		ctx,
+		&models.TicketTemplateRequest{
+			Name:     "valid JSON defaults",
+			Category: "request",
+		},
+		user.ID,
+	)
+	if err != nil {
+		t.Fatalf("create template with omitted custom fields: %v", err)
+	}
+	if !json.Valid([]byte(template.CustomFields)) {
+		t.Fatalf(
+			"template custom_fields default is invalid: %q",
+			template.CustomFields,
+		)
+	}
+	fields, err := template.GetCustomFields()
+	if err != nil {
+		t.Fatalf("decode default custom fields: %v", err)
+	}
+	if len(fields) != 0 {
+		t.Fatalf("default custom fields = %+v, want empty", fields)
+	}
 }
 
 func TestCreateAutomationRuleDefaultsToInactive(t *testing.T) {
@@ -226,7 +312,7 @@ func TestAutomationRuleWritesRequireCurrentCloudEventTypes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.UpdateRule(
+	if _, err := service.UpdateRule(
 		ctx,
 		rule.ID,
 		&models.AutomationRuleRequest{
@@ -238,7 +324,7 @@ func TestAutomationRuleWritesRequireCurrentCloudEventTypes(t *testing.T) {
 	); !errors.Is(err, ErrInvalidAutomationTriggerType) {
 		t.Fatalf("legacy update error = %v, want invalid trigger type", err)
 	}
-	if err := service.UpdateRule(
+	updated, err := service.UpdateRule(
 		ctx,
 		rule.ID,
 		&models.AutomationRuleRequest{
@@ -247,8 +333,89 @@ func TestAutomationRuleWritesRequireCurrentCloudEventTypes(t *testing.T) {
 			TriggerEvent: eventcontract.TicketUpdatedEventType,
 		},
 		user.ID,
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatalf("current update failed: %v", err)
+	}
+	if updated == nil ||
+		updated.TriggerEvent != eventcontract.TicketUpdatedEventType ||
+		!json.Valid([]byte(updated.Conditions)) ||
+		!json.Valid([]byte(updated.Actions)) {
+		t.Fatalf("canonical updated automation rule = %+v", updated)
+	}
+}
+
+func TestAutomationRuleUpdateRollsBackWhenCanonicalReloadFails(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.AutomationRule{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	user := models.User{
+		Username:     "automation-atomic-author",
+		Email:        "automation-atomic-author@example.com",
+		PasswordHash: "hashed",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	service := NewAutomationService(db)
+	ctx := testProjectOperationContext(t, db, models.HumanActor(user.ID))
+	rule, err := service.CreateRule(
+		ctx,
+		&models.AutomationRuleRequest{
+			Name:         "atomic original",
+			RuleType:     "assignment",
+			TriggerEvent: eventcontract.TicketCreatedEventType,
+		},
+		user.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const callbackName = "test:delete_automation_before_reload"
+	if err := db.Callback().Update().
+		After("gorm:update").
+		Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table != "automation_rules" {
+				return
+			}
+			tx.Exec(
+				"DELETE FROM automation_rules WHERE id = ?",
+				rule.ID,
+			)
+		}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = db.Callback().Update().Remove(callbackName)
+	})
+
+	if _, err := service.UpdateRule(
+		ctx,
+		rule.ID,
+		&models.AutomationRuleRequest{
+			Name:         "must roll back",
+			RuleType:     "assignment",
+			TriggerEvent: eventcontract.TicketUpdatedEventType,
+		},
+		user.ID,
+	); err == nil {
+		t.Fatal("update succeeded after canonical reload row disappeared")
+	}
+
+	var persisted models.AutomationRule
+	if err := db.Where("id = ?", rule.ID).First(&persisted).Error; err != nil {
+		t.Fatalf("atomic update did not restore original row: %v", err)
+	}
+	if persisted.Name != "atomic original" ||
+		persisted.TriggerEvent != eventcontract.TicketCreatedEventType {
+		t.Fatalf("failed canonical reload committed partial update: %+v", persisted)
 	}
 }
 

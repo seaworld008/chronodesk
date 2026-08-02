@@ -109,6 +109,39 @@ test.describe('Ticket Management', () => {
         ).toBeVisible();
     });
 
+    test('selected tickets expose a visible and usable bulk toolbar', async ({
+        page,
+    }) => {
+        const health = monitorBrowserHealth(page);
+        await page.goto('/#/tickets');
+        const search = page.getByPlaceholder('搜索工单');
+        await search.fill(ticketTitle);
+        await search.press('Enter');
+        const createdRow = page.getByRole('row', {
+            name: new RegExp(ticketTitle),
+        });
+        await expect(createdRow).toBeVisible({ timeout: 10_000 });
+        await createdRow.getByRole('checkbox').check();
+
+        const bulkUpdate = page.getByRole('button', {
+            name: '批量更新',
+            exact: true,
+        });
+        await expect(bulkUpdate).toBeVisible();
+        await expect(bulkUpdate).toBeInViewport();
+        await bulkUpdate.click();
+
+        const dialog = page.getByRole('dialog', {
+            name: '批量更新工单',
+            exact: true,
+        });
+        await expect(dialog).toBeVisible();
+        await expect(dialog.getByText('已选择 1 条工单记录')).toBeVisible();
+        await dialog.getByRole('button', { name: '取消', exact: true }).click();
+        await expect(dialog).toBeHidden();
+        health.assertClean();
+    });
+
     test('should open create ticket form', async ({ page }) => {
         await page.goto('/#/tickets');
         await page.getByRole('link', { name: '创建工单' }).click();

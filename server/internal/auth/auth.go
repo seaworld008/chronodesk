@@ -21,13 +21,23 @@ import (
 
 // 错误定义
 var (
-	ErrInvalidCredentials   = errors.New("invalid credentials")
-	ErrUserNotFound         = errors.New("user not found")
-	ErrUserExists           = errors.New("user already exists")
-	ErrInvalidToken         = errors.New("invalid token")
-	ErrTokenExpired         = errors.New("token expired")
-	ErrInvalidOTP           = errors.New("invalid OTP")
-	ErrOTPExpired           = errors.New("OTP expired")
+	ErrInvalidCredentials            = errors.New("invalid credentials")
+	ErrUserNotFound                  = errors.New("user not found")
+	ErrUserExists                    = errors.New("user already exists")
+	ErrInvalidToken                  = errors.New("invalid token")
+	ErrTokenExpired                  = errors.New("token expired")
+	ErrInvalidOTP                    = errors.New("invalid OTP")
+	ErrOTPExpired                    = errors.New("OTP expired")
+	ErrTrustedDeviceInvalid          = errors.New("trusted device is no longer active")
+	ErrAtomicLoginSessionUnavailable = errors.New(
+		"atomic login session repository is unavailable",
+	)
+	ErrEmailVerificationPolicyUnavailable = errors.New(
+		"email verification policy is unavailable",
+	)
+	ErrEmailVerificationPolicyChanged = errors.New(
+		"email verification policy changed during authentication",
+	)
 	ErrEmailNotVerified     = errors.New("email not verified")
 	ErrAccountLocked        = errors.New("account locked")
 	ErrAccountInactive      = errors.New("account is inactive")
@@ -96,6 +106,7 @@ type User struct {
 	LockedUntil       *time.Time     `json:"locked_until"`
 	OTPEnabled        bool           `json:"otp_enabled" gorm:"default:false"`
 	OTPSecret         string         `json:"-"`
+	OTPStorageHash    string         `json:"-" gorm:"-"`
 	BackupCodes       string         `json:"-"`
 	PasswordChangedAt *time.Time     `json:"password_changed_at"`
 	CreatedAt         time.Time      `json:"created_at"`
@@ -199,7 +210,7 @@ type OTPCode struct {
 // RegisterRequest 注册请求
 type RegisterRequest struct {
 	Username        string `json:"username" binding:"required,min=3,max=50"`
-	Email           string `json:"email" binding:"required,email"`
+	Email           string `json:"email" binding:"required,email,max=100"`
 	Password        string `json:"password" binding:"required,min=8"`
 	ConfirmPassword string `json:"confirm_password" binding:"required"`
 	FirstName       string `json:"first_name" binding:"max=50"`
@@ -210,12 +221,12 @@ type RegisterRequest struct {
 
 // LoginRequest 登录请求
 type LoginRequest struct {
-	Email          string `json:"email" binding:"required,email"`
+	Email          string `json:"email" binding:"required,email,max=100"`
 	Password       string `json:"password" binding:"required"`
 	OTPCode        string `json:"otp_code,omitempty"`
 	DeviceToken    string `json:"-"`
 	RememberDevice bool   `json:"remember_device,omitempty"`
-	DeviceName     string `json:"device_name,omitempty"`
+	DeviceName     string `json:"device_name,omitempty" binding:"omitempty,max=100"`
 }
 
 // RefreshTokenRequest 刷新令牌请求
@@ -237,7 +248,7 @@ type ChangePasswordRequest struct {
 
 // ForgotPasswordRequest 忘记密码请求
 type ForgotPasswordRequest struct {
-	Email string `json:"email" binding:"required,email"`
+	Email string `json:"email" binding:"required,email,max=100"`
 }
 
 // ResetPasswordRequest 重置密码请求
@@ -248,7 +259,7 @@ type ResetPasswordRequest struct {
 
 // ResendVerificationRequest 重发验证邮件请求
 type ResendVerificationRequest struct {
-	Email string `json:"email" binding:"required,email"`
+	Email string `json:"email" binding:"required,email,max=100"`
 }
 
 // UpdateProfileRequest 更新用户资料请求
@@ -297,6 +308,54 @@ type AuthResponse struct {
 	TokenType              string    `json:"token_type"`
 	TrustedDeviceToken     string    `json:"-"`
 	TrustedDeviceExpiresAt time.Time `json:"-"`
+}
+
+// LoginSessionCommit is the complete persistence unit for one successful human
+// login. Refresh-token authority, the active login-history row, and any trusted
+// device mutation must be committed under the same locked user row.
+type LoginSessionCommit struct {
+	UserID                 uint
+	CommittedAt            time.Time
+	ExpectedPrincipal      *LoginPrincipalSnapshot
+	ExpectedEmailPolicy    *EmailVerificationPolicySnapshot
+	BackupCode             string
+	RefreshToken           *RefreshToken
+	LoginHistory           *models.LoginHistory
+	SuccessfulAttempt      *LoginAttempt
+	TrustedDeviceTokenHash string
+	TrustedDeviceName      string
+	TrustedDeviceIP        string
+	TrustedDeviceUserAgent string
+	TrustedDeviceExpiresAt *time.Time
+	NewTrustedDevice       *models.OTPTrustedDevice
+}
+
+// LoginPrincipalSnapshot binds the final session commit to the exact
+// authentication state that was verified before tokens were minted. The OTP
+// storage hash is an opaque digest of the encrypted-at-rest value, never the
+// TOTP secret itself.
+type LoginPrincipalSnapshot struct {
+	Email          string
+	PasswordHash   string
+	PlatformRole   PlatformRole
+	Status         UserStatus
+	EmailVerified  bool
+	OTPEnabled     bool
+	OTPStorageHash string
+}
+
+// EmailVerificationPolicySnapshot binds authentication decisions to the
+// policy value observed before password or registration work began. The final
+// persistence transaction locks the policy table and must match this value.
+type EmailVerificationPolicySnapshot struct {
+	Enabled bool
+}
+
+// AtomicLoginSessionRepository is an optional TokenRepository capability. A
+// successful login must fail closed when it is absent; falling back to separate
+// writes would reopen logout-all and trusted-device TOCTOU windows.
+type AtomicLoginSessionRepository interface {
+	CommitLoginSession(context.Context, *LoginSessionCommit) error
 }
 
 // UserInfo 用户信息
@@ -622,10 +681,9 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 	}
 
 	// 检查邮箱验证是否启用
-	emailVerificationEnabled, err := s.emailConfigService.IsEmailVerificationEnabled(ctx)
+	emailVerificationEnabled, err := s.emailVerificationEnabled(ctx)
 	if err != nil {
-		// 如果无法获取配置，使用默认配置
-		emailVerificationEnabled = s.config.RequireEmailVerification
+		return nil, err
 	}
 
 	// 哈希密码
@@ -675,7 +733,15 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 	if s.emailOutboxRepo == nil {
 		return nil, errors.New("durable authentication email Outbox is unavailable")
 	}
-	if err := s.emailOutboxRepo.Register(ctx, user, profile, verification); err != nil {
+	if err := s.emailOutboxRepo.Register(
+		ctx,
+		user,
+		profile,
+		verification,
+		&EmailVerificationPolicySnapshot{
+			Enabled: emailVerificationEnabled,
+		},
+	); err != nil {
 		return nil, fmt.Errorf("failed to register user: %w", err)
 	}
 
@@ -783,20 +849,20 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 				if device.UserID == user.ID && !device.Revoked && device.ExpiresAt.After(time.Now()) {
 					trustedDevice = device
 					deviceTrusted = true
-				} else if device.UserID == user.ID && device.ExpiresAt.Before(time.Now()) && !device.Revoked {
-					device.Revoked = true
-					if updateErr := s.trustedDeviceRepo.Update(ctx, device); updateErr != nil {
-						fmt.Printf("Warning: failed to revoke expired trusted device: %v\n", updateErr)
-					}
 				}
 			}
 		}
 	}
 
 	otpValidated := deviceTrusted
+	backupCodeForCommit := ""
 
-	// 检查账户状态
-	if statusErr := s.checkUserStatus(ctx, user); statusErr != nil {
+	// 检查账户状态，并保留最终事务必须重新匹配的邮箱验证策略。
+	emailVerificationEnabled, statusErr := s.checkUserStatusWithEmailPolicy(
+		ctx,
+		user,
+	)
+	if statusErr != nil {
 		method := determineLoginMethod(user, req, deviceTrusted, otpValidated)
 		if err := s.recordLoginAttempt(
 			ctx,
@@ -884,12 +950,14 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 		}
 
 		if !s.otpService.VerifyCode(user.OTPSecret, req.OTPCode) {
-			// 检查是否是备用码
-			consumed, consumeErr := s.userRepo.ConsumeBackupCode(ctx, user.ID, req.OTPCode)
-			if consumeErr != nil {
-				return nil, fmt.Errorf("failed to consume backup code: %w", consumeErr)
+			// 这里只验证事务外读取的备用码快照，不提前删除。最终
+			// CommitLoginSession 会在锁定用户行后重新匹配并删除它，
+			// 从而确保提交失败不会消耗备用码。
+			hashes, backupErr := parseBackupCodeHashes(user.BackupCodes)
+			if backupErr != nil {
+				return nil, fmt.Errorf("failed to validate backup code storage: %w", backupErr)
 			}
-			if !consumed {
+			if matchBackupCode(hashes, req.OTPCode) < 0 {
 				method := determineLoginMethod(user, req, deviceTrusted, false)
 				if err := s.recordLoginAttempt(
 					ctx,
@@ -915,6 +983,7 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 				}
 				return nil, ErrInvalidOTP
 			}
+			backupCodeForCommit = req.OTPCode
 			otpValidated = true
 		}
 		otpValidated = true
@@ -923,31 +992,9 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 	// 获取用户资料
 	profile, _ := s.profileRepo.GetByUserID(ctx, user.ID)
 
-	// 重置失败登录计数
-	if err := s.userRepo.ResetFailedLogin(ctx, user.ID); err != nil {
-		return nil, fmt.Errorf("failed to reset failed-login counter: %w", err)
-	}
-
-	// 更新最后登录时间
 	now := time.Now()
 	trustedDeviceTTL := s.getTrustedDeviceTTL()
 	maxTrustedDevices := s.getTrustedDeviceLimit()
-	if err := s.userRepo.UpdateLastLogin(ctx, user.ID, now); err != nil {
-		return nil, fmt.Errorf("failed to update last login: %w", err)
-	}
-
-	// 记录成功登录
-	if err := s.recordLoginAttempt(
-		ctx,
-		&user.ID,
-		req.Email,
-		ipAddress,
-		userAgent,
-		true,
-		"",
-	); err != nil {
-		return nil, fmt.Errorf("failed to persist successful login audit: %w", err)
-	}
 
 	sessionID, err := GenerateSecureToken(16)
 	if err != nil {
@@ -962,40 +1009,30 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 		return nil, fmt.Errorf("failed to generate tokens: %w", err)
 	}
 
-	// 保存刷新令牌
-	if err := s.saveRefreshToken(ctx, user.ID, refreshToken, sessionID, ipAddress, userAgent); err != nil {
-		return nil, fmt.Errorf("failed to save refresh token: %w", err)
-	}
-
 	loginMethod := determineLoginMethod(user, req, deviceTrusted, otpValidated)
-	if err := s.recordLoginHistorySuccess(
-		ctx,
-		user,
+	refreshRecord, err := s.newRefreshTokenRecordAt(
+		user.ID,
+		refreshToken,
+		sessionID,
 		ipAddress,
 		userAgent,
-		sessionID,
 		now,
-		loginMethod,
-	); err != nil {
-		_ = s.tokenRepo.RevokeSession(ctx, user.ID, sessionID)
-		return nil, fmt.Errorf("failed to persist login session: %w", err)
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	var trustedDeviceToken string
+	var trustedDeviceHash string
+	var trustedDeviceExpiresAt *time.Time
+	var newTrustedDevice *models.OTPTrustedDevice
 	if s.trustedDeviceRepo != nil {
 		if deviceTrusted && trustedDevice != nil {
-			trustedDevice.LastUsedAt = now
-			trustedDevice.LastIP = ipAddress
-			trustedDevice.UserAgent = userAgent
+			trustedDeviceHash = hashTrustedDeviceToken(req.DeviceToken)
 			if req.RememberDevice {
-				trustedDevice.ExpiresAt = now.Add(trustedDeviceTTL)
+				expiresAt := now.Add(trustedDeviceTTL)
+				trustedDeviceExpiresAt = &expiresAt
 				trustedDeviceToken = req.DeviceToken
-				if req.DeviceName != "" {
-					trustedDevice.DeviceName = req.DeviceName
-				}
-			}
-			if err := s.trustedDeviceRepo.Update(ctx, trustedDevice); err != nil {
-				fmt.Printf("Warning: failed to update trusted device: %v\n", err)
 			}
 		} else if req.RememberDevice && (otpValidated || !user.OTPEnabled) {
 			deviceToken, tokenErr := GenerateSecureToken(32)
@@ -1003,7 +1040,7 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 				fmt.Printf("Warning: failed to generate trusted device token: %v\n", tokenErr)
 			} else {
 				hash := hashTrustedDeviceToken(deviceToken)
-				device := &models.OTPTrustedDevice{
+				newTrustedDevice = &models.OTPTrustedDevice{
 					UserID:          user.ID,
 					DeviceTokenHash: hash,
 					DeviceName:      resolveTrustedDeviceName(req.DeviceName, userAgent),
@@ -1012,17 +1049,58 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 					UserAgent:       userAgent,
 					ExpiresAt:       now.Add(trustedDeviceTTL),
 				}
-				if err := s.trustedDeviceRepo.Create(ctx, device); err != nil {
-					fmt.Printf("Warning: failed to persist trusted device: %v\n", err)
-				} else {
-					trustedDeviceToken = deviceToken
-				}
+				trustedDeviceToken = deviceToken
 			}
 		}
+	}
 
-		if maxTrustedDevices > 0 {
-			s.enforceTrustedDeviceQuota(ctx, user.ID, maxTrustedDevices, now)
+	sessionRepository, ok := s.tokenRepo.(AtomicLoginSessionRepository)
+	if !ok || sessionRepository == nil {
+		return nil, ErrAtomicLoginSessionUnavailable
+	}
+	commit := &LoginSessionCommit{
+		UserID:            user.ID,
+		CommittedAt:       now,
+		ExpectedPrincipal: loginPrincipalSnapshot(user),
+		ExpectedEmailPolicy: &EmailVerificationPolicySnapshot{
+			Enabled: emailVerificationEnabled,
+		},
+		BackupCode:   backupCodeForCommit,
+		RefreshToken: refreshRecord,
+		LoginHistory: newLoginHistorySuccess(
+			user,
+			ipAddress,
+			userAgent,
+			sessionID,
+			now,
+			loginMethod,
+		),
+		SuccessfulAttempt: &LoginAttempt{
+			UserID:    &user.ID,
+			Email:     req.Email,
+			IPAddress: ipAddress,
+			UserAgent: userAgent,
+			Success:   true,
+			CreatedAt: now,
+		},
+		TrustedDeviceTokenHash: trustedDeviceHash,
+		TrustedDeviceIP:        ipAddress,
+		TrustedDeviceUserAgent: userAgent,
+		TrustedDeviceExpiresAt: trustedDeviceExpiresAt,
+		NewTrustedDevice:       newTrustedDevice,
+	}
+	if req.RememberDevice && req.DeviceName != "" {
+		commit.TrustedDeviceName = req.DeviceName
+	}
+	if err := sessionRepository.CommitLoginSession(ctx, commit); err != nil {
+		if errors.Is(err, ErrTrustedDeviceInvalid) {
+			return nil, errors.New("OTP code required")
 		}
+		return nil, fmt.Errorf("failed to persist login session: %w", err)
+	}
+	user.LastLoginAt = &now
+	if maxTrustedDevices > 0 && s.trustedDeviceRepo != nil {
+		s.enforceTrustedDeviceQuota(ctx, user.ID, maxTrustedDevices, now)
 	}
 
 	return &AuthResponse{
@@ -1034,6 +1112,21 @@ func (s *AuthService) Login(ctx context.Context, req *LoginRequest, ipAddress, u
 		TrustedDeviceToken:     trustedDeviceToken,
 		TrustedDeviceExpiresAt: now.Add(trustedDeviceTTL),
 	}, nil
+}
+
+func loginPrincipalSnapshot(user *User) *LoginPrincipalSnapshot {
+	if user == nil {
+		return nil
+	}
+	return &LoginPrincipalSnapshot{
+		Email:          user.Email,
+		PasswordHash:   user.PasswordHash,
+		PlatformRole:   user.PlatformRole,
+		Status:         user.Status,
+		EmailVerified:  user.EmailVerified,
+		OTPEnabled:     user.OTPEnabled,
+		OTPStorageHash: user.OTPStorageHash,
+	}
 }
 
 // RefreshToken 刷新令牌
@@ -1236,8 +1329,13 @@ func (s *AuthService) ForgotPassword(ctx context.Context, email string) error {
 	// 查找用户
 	user, err := s.userRepo.GetByEmail(ctx, email)
 	if err != nil {
-		// 为了安全，即使用户不存在也返回成功
-		return nil
+		if errors.Is(err, ErrUserNotFound) {
+			// 为了安全，即使用户不存在也返回成功。
+			return nil
+		}
+		// The HTTP adapter records this bounded internal failure while still
+		// publishing the same enumeration-safe success response.
+		return fmt.Errorf("failed to load password reset account: %w", err)
 	}
 
 	// 生成重置令牌
@@ -1327,8 +1425,11 @@ func (s *AuthService) ResendVerification(ctx context.Context, email string) erro
 	// 查找用户
 	user, err := s.userRepo.GetByEmail(ctx, email)
 	if err != nil {
-		// 防止通过响应差异枚举已注册邮箱。
-		return nil
+		if errors.Is(err, ErrUserNotFound) {
+			// 防止通过响应差异枚举已注册邮箱。
+			return nil
+		}
+		return fmt.Errorf("failed to load verification account: %w", err)
 	}
 
 	// 检查是否已验证
@@ -1622,22 +1723,46 @@ func (s *AuthService) checkLoginAttempts(ctx context.Context, email string) erro
 }
 
 func (s *AuthService) checkUserStatus(ctx context.Context, user *User) error {
+	_, err := s.checkUserStatusWithEmailPolicy(ctx, user)
+	return err
+}
+
+func (s *AuthService) checkUserStatusWithEmailPolicy(
+	ctx context.Context,
+	user *User,
+) (bool, error) {
 	if err := validateUserAccessState(user, time.Now()); err != nil {
-		return err
+		return false, err
 	}
 
 	// 动态获取邮箱验证配置
-	emailVerificationEnabled, err := s.emailConfigService.IsEmailVerificationEnabled(ctx)
+	emailVerificationEnabled, err := s.emailVerificationEnabled(ctx)
 	if err != nil {
-		// 如果无法获取配置，使用默认配置
-		emailVerificationEnabled = s.config.RequireEmailVerification
+		return false, err
 	}
 
 	if emailVerificationEnabled && !user.EmailVerified {
-		return ErrEmailNotVerified
+		return emailVerificationEnabled, ErrEmailNotVerified
 	}
 
-	return nil
+	return emailVerificationEnabled, nil
+}
+
+func (s *AuthService) emailVerificationEnabled(
+	ctx context.Context,
+) (bool, error) {
+	if s == nil || s.emailConfigService == nil {
+		return false, ErrEmailVerificationPolicyUnavailable
+	}
+	enabled, err := s.emailConfigService.IsEmailVerificationEnabled(ctx)
+	if err != nil {
+		return false, fmt.Errorf(
+			"%w: %v",
+			ErrEmailVerificationPolicyUnavailable,
+			err,
+		)
+	}
+	return enabled, nil
 }
 
 func validateUserAccessState(user *User, now time.Time) error {
@@ -1742,10 +1867,30 @@ func (s *AuthService) recordLoginHistorySuccess(
 	if s.loginHistoryRepo == nil || user == nil {
 		return errors.New("login session repository is unavailable")
 	}
+	return s.loginHistoryRepo.Create(
+		ctx,
+		newLoginHistorySuccess(
+			user,
+			ipAddress,
+			userAgent,
+			sessionID,
+			loginTime,
+			method,
+		),
+	)
+}
 
+func newLoginHistorySuccess(
+	user *User,
+	ipAddress, userAgent, sessionID string,
+	loginTime time.Time,
+	method models.LoginMethod,
+) *models.LoginHistory {
+	if user == nil {
+		return nil
+	}
 	deviceType, operatingSystem, browser := extractDeviceContext(userAgent)
-
-	history := &models.LoginHistory{
+	return &models.LoginHistory{
 		UserID:          user.ID,
 		Username:        user.Username,
 		Email:           user.Email,
@@ -1761,8 +1906,6 @@ func (s *AuthService) recordLoginHistorySuccess(
 		Browser:         browser,
 		IsActive:        true,
 	}
-
-	return s.loginHistoryRepo.Create(ctx, history)
 }
 
 func (s *AuthService) recordLoginHistoryFailure(

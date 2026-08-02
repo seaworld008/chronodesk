@@ -101,7 +101,7 @@ func (ec *EmailConfig) CanSendEmail() bool {
 // EmailConfigCreateRequest 创建邮箱配置请求
 type EmailConfigCreateRequest struct {
 	EmailVerificationEnabled bool   `json:"email_verification_enabled"`
-	SMTPHost                 string `json:"smtp_host" binding:"required_if=EmailVerificationEnabled true,omitempty,hostname"`
+	SMTPHost                 string `json:"smtp_host" binding:"required_if=EmailVerificationEnabled true,omitempty,hostname_rfc1123|ip"`
 	SMTPPort                 int    `json:"smtp_port" binding:"required_if=EmailVerificationEnabled true,omitempty,min=1,max=65535"`
 	SMTPUsername             string `json:"smtp_username" binding:"required_if=EmailVerificationEnabled true"`
 	SMTPPassword             string `json:"smtp_password" binding:"required_if=EmailVerificationEnabled true"`

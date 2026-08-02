@@ -1059,9 +1059,13 @@ func Run() error {
 			tickets.DELETE("/:id", ticketHandler.DeleteTicket)              // 删除工单
 
 			// 工作流相关路由
-			tickets.POST("/:id/assign", workflowHandler.AssignTicket)       // 分配工单
-			tickets.POST("/:id/transfer", workflowHandler.TransferTicket)   // 转移工单
-			tickets.POST("/:id/escalate", workflowHandler.EscalateTicket)   // 升级工单
+			tickets.POST("/:id/assign", workflowHandler.AssignTicket)     // 分配工单
+			tickets.POST("/:id/transfer", workflowHandler.TransferTicket) // 转移工单
+			tickets.POST("/:id/escalate", workflowHandler.EscalateTicket) // 升级工单
+			tickets.GET(
+				"/:id/transitions",
+				workflowHandler.GetAllowedTicketTransitions,
+			) // 获取绑定工作流允许的状态边
 			tickets.POST("/:id/status", workflowHandler.UpdateTicketStatus) // 更新状态
 			tickets.GET("/:id/history", workflowHandler.GetTicketHistory)   // 获取工单历史
 			contentHandler.RegisterRoutes(tickets)                          // 评论与附件

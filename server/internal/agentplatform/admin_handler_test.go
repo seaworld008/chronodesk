@@ -978,6 +978,14 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 	).Order("created_at ASC").First(&replayDelivery).Error; err != nil {
 		t.Fatal(err)
 	}
+	if err := db.Model(&models.OutboxDelivery{}).
+		Where("id = ?", replayDelivery.ID).
+		Updates(map[string]any{
+			"status":     models.OutboxDeliveryFailed,
+			"last_error": "temporary delivery failure",
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
 	t.Run("outbox replay", func(t *testing.T) {
 		doWrite(
 			t,

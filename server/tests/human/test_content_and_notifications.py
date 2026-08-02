@@ -254,6 +254,7 @@ def test_attachment_rejection_name_safety_and_download_authorization(
     admin = human_identities["admin"]
     owner = human_identities["customer_a"]
     other_customer = human_identities["customer_b"]
+    observer = human_identities["observer"]
     ticket = e2e_manager.create_ticket(owner, "attachment-security")
     ticket_id = ticket["id"]
 
@@ -320,6 +321,25 @@ def test_attachment_rejection_name_safety_and_download_authorization(
         409,
         machine_codes={"attachment_not_clean"},
     )
+    observer_pending = observer.api.get_json(
+        e2e_manager.project_path(
+            f"tickets/{ticket_id}/attachments/{attachment_id}/content"
+        )
+    )
+    assert_error_contract(
+        observer_pending,
+        403,
+        machine_codes={"attachment_visibility_denied"},
+    )
+    for forbidden_scan_detail in (
+        "attachment_not_clean",
+        "virus_scan",
+        "scan_details",
+        "storage_type",
+        "pending",
+        "staging",
+    ):
+        assert forbidden_scan_detail not in observer_pending.text.lower()
 
     attachment_resource_version = _wait_for_attachment_upload_worker(
         e2e_manager,
@@ -357,6 +377,16 @@ def test_attachment_rejection_name_safety_and_download_authorization(
         owner_download,
         403,
         machine_codes={"ticket_access_denied"},
+    )
+    observer_clean = observer.api.get_json(
+        e2e_manager.project_path(
+            f"tickets/{ticket_id}/attachments/{attachment_id}/content"
+        )
+    )
+    assert_error_contract(
+        observer_clean,
+        403,
+        machine_codes={"attachment_visibility_denied"},
     )
     cross_download = other_customer.api.get_json(
         e2e_manager.project_path(

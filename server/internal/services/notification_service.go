@@ -39,7 +39,7 @@ type NotificationServiceInterface interface {
 	GetUnreadCount(ctx context.Context, userID uint) (int64, error)
 
 	// 通知偏好设置
-	GetNotificationPreferences(ctx context.Context, userID uint) ([]*models.NotificationPreference, error)
+	GetNotificationPreferences(ctx context.Context, userID uint) ([]*models.NotificationPreferenceView, error)
 	UpdateNotificationPreferences(ctx context.Context, userID uint, preferences []models.NotificationPreference) error
 
 	// 邮件通知相关方法
@@ -52,6 +52,11 @@ var ErrInvalidNotificationPreferences = errors.New(
 var ErrInvalidNotificationListQuery = errors.New(
 	"invalid notification list query",
 )
+var ErrUnsupportedNotificationChannel = errors.New(
+	"unsupported manual notification channel",
+)
+
+const NotificationDeliveryStatusSuppressedByPreference = "suppressed_by_preference"
 
 // NotificationService 通知服务
 type NotificationService struct {
@@ -1359,11 +1364,14 @@ func (ns *NotificationService) TestWebhook(
 					queryErr := tx.WithContext(scopedContext).
 						Clauses(clause.Locking{Strength: "UPDATE"}).
 						Where(
-							"id = ? AND organization_id = ? AND project_id = ? AND status = ?",
+							"id = ? AND organization_id = ? AND project_id = ? AND status IN ?",
 							configID,
 							scope.OrganizationID,
 							scope.ProjectID,
-							models.WebhookStatusActive,
+							[]models.WebhookStatus{
+								models.WebhookStatusActive,
+								models.WebhookStatusInactive,
+							},
 						).
 						Take(&config).Error
 					if errors.Is(queryErr, gorm.ErrRecordNotFound) {
@@ -1386,7 +1394,7 @@ func (ns *NotificationService) TestWebhook(
 					configurationVersion :=
 						webhookTestConfigurationVersion(config)
 					snapshot, snapshotErr :=
-						models.NewWebhookDeliverySnapshot(
+						models.NewWebhookTestDeliverySnapshot(
 							config,
 							eventID,
 						)
@@ -1594,10 +1602,18 @@ func (ns *NotificationService) CreateNotification(ctx context.Context, req *mode
 	if notification.Channel == "" {
 		notification.Channel = models.NotificationChannelInApp
 	}
+	if notification.Channel != models.NotificationChannelInApp &&
+		notification.Channel != models.NotificationChannelEmail {
+		return nil, ErrUnsupportedNotificationChannel
+	}
 
+	notificationMetadata := make(map[string]any, len(req.Metadata)+1)
+	for key, value := range req.Metadata {
+		notificationMetadata[key] = value
+	}
 	// 处理metadata
-	if req.Metadata != nil {
-		metadataBytes, err := json.Marshal(req.Metadata)
+	if len(notificationMetadata) > 0 {
+		metadataBytes, err := json.Marshal(notificationMetadata)
 		if err != nil {
 			return nil, fmt.Errorf("通知元数据无效: %w", err)
 		}
@@ -1643,6 +1659,33 @@ func (ns *NotificationService) CreateNotification(ctx context.Context, req *mode
 				"/tickets/%d",
 				*notification.RelatedTicketID,
 			)
+		}
+		if notification.Channel == models.NotificationChannelInApp {
+			now := time.Now().UTC()
+			allowed, reason, err := inAppNotificationAllowedByPreference(
+				tx,
+				notification,
+				now,
+			)
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				notification.DeliveryStatus =
+					NotificationDeliveryStatusSuppressedByPreference
+				notification.IsRead = true
+				notification.ReadAt = &now
+				notification.ExpiresAt = &now
+				notificationMetadata["preference_suppression"] = reason
+				metadataBytes, err := json.Marshal(notificationMetadata)
+				if err != nil {
+					return fmt.Errorf("通知元数据无效: %w", err)
+				}
+				if len(metadataBytes) > 16*1024 {
+					return errors.New("通知元数据超过 16 KiB 限制")
+				}
+				notification.Metadata = string(metadataBytes)
+			}
 		}
 		if err := tx.Create(notification).Error; err != nil {
 			return err
@@ -1771,6 +1814,10 @@ func (ns *NotificationService) GetNotifications(ctx context.Context, filter *mod
 			"organization_id = ? AND project_id = ?",
 			scope.OrganizationID,
 			scope.ProjectID,
+		).
+		Where(
+			"(delivery_status IS NULL OR delivery_status <> ?)",
+			NotificationDeliveryStatusSuppressedByPreference,
 		)
 
 	// 应用过滤条件
@@ -2079,20 +2126,51 @@ func (ns *NotificationService) GetUnreadCount(ctx context.Context, userID uint) 
 }
 
 // GetNotificationPreferences 获取用户通知偏好设置
-func (ns *NotificationService) GetNotificationPreferences(ctx context.Context, userID uint) ([]*models.NotificationPreference, error) {
+func (ns *NotificationService) GetNotificationPreferences(
+	ctx context.Context,
+	userID uint,
+) ([]*models.NotificationPreferenceView, error) {
 	if ns == nil || ns.db == nil || userID == 0 {
 		return nil, ErrInvalidNotificationPreferences
 	}
-	var preferences []*models.NotificationPreference
 	allowed := models.NotificationTypes()
+	var persisted []models.NotificationPreference
 	if err := ns.db.WithContext(ctx).
 		Where("user_id = ? AND notification_type IN ?", userID, allowed).
 		Order("notification_type ASC").
 		Limit(len(allowed)).
-		Find(&preferences).Error; err != nil {
+		Find(&persisted).Error; err != nil {
 		return nil, fmt.Errorf("获取通知偏好设置失败: %w", err)
 	}
-	return preferences, nil
+	byType := make(
+		map[models.NotificationType]models.NotificationPreference,
+		len(persisted),
+	)
+	for _, preference := range persisted {
+		byType[preference.NotificationType] = preference
+	}
+	result := make([]*models.NotificationPreferenceView, 0, len(allowed))
+	for _, notificationType := range allowed {
+		preference, exists := byType[notificationType]
+		if !exists {
+			preference = defaultNotificationPreference(
+				userID,
+				notificationType,
+			)
+		}
+		result = append(result, &models.NotificationPreferenceView{
+			NotificationType:  notificationType,
+			EmailEnabled:      preference.EmailEnabled,
+			InAppEnabled:      preference.InAppEnabled,
+			WebhookEnabled:    false,
+			DoNotDisturbStart: preference.DoNotDisturbStart,
+			DoNotDisturbEnd:   preference.DoNotDisturbEnd,
+			MaxDailyCount:     preference.MaxDailyCount,
+			BatchDelivery:     false,
+			BatchInterval:     60,
+		})
+	}
+	return result, nil
 }
 
 // UpdateNotificationPreferences 更新用户通知偏好设置
@@ -2103,7 +2181,18 @@ func (ns *NotificationService) UpdateNotificationPreferences(ctx context.Context
 	}
 	seen := make(map[models.NotificationType]struct{}, len(preferences))
 	for _, preference := range preferences {
-		if !preference.NotificationType.IsValid() {
+		if !preference.NotificationType.IsValid() ||
+			preference.MaxDailyCount < 0 ||
+			preference.MaxDailyCount > 10_000 ||
+			preference.BatchInterval != 60 ||
+			preference.WebhookEnabled ||
+			preference.BatchDelivery ||
+			(preference.DoNotDisturbStart == nil) !=
+				(preference.DoNotDisturbEnd == nil) {
+			return ErrInvalidNotificationPreferences
+		}
+		if preference.DoNotDisturbStart != nil &&
+			!preference.DoNotDisturbEnd.After(*preference.DoNotDisturbStart) {
 			return ErrInvalidNotificationPreferences
 		}
 		if _, duplicate := seen[preference.NotificationType]; duplicate {
@@ -2112,6 +2201,9 @@ func (ns *NotificationService) UpdateNotificationPreferences(ctx context.Context
 		seen[preference.NotificationType] = struct{}{}
 	}
 	return ns.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockNotificationPreferenceUser(tx, userID); err != nil {
+			return err
+		}
 		// 删除现有设置
 		if err := tx.Where("user_id = ?", userID).Delete(&models.NotificationPreference{}).Error; err != nil {
 			return err
@@ -2309,35 +2401,271 @@ func (ns *NotificationService) DeliverTicketNotificationOutbox(
 		return nil, false, errors.New("notification source event key is too long")
 	}
 	notification.SourceEventKey = &sourceEventKey
-	metadataBytes, err := json.Marshal(metadata)
+	return ns.persistTicketNotificationWithPreference(
+		ctx,
+		notification,
+		metadata,
+	)
+}
+
+func (ns *NotificationService) persistTicketNotificationWithPreference(
+	ctx context.Context,
+	notification *models.Notification,
+	metadata map[string]any,
+) (*models.Notification, bool, error) {
+	if notification == nil ||
+		notification.SourceEventKey == nil ||
+		strings.TrimSpace(*notification.SourceEventKey) == "" {
+		return nil, false, errors.New("notification source event key is required")
+	}
+
+	var (
+		persisted *models.Notification
+		created   bool
+	)
+	err := transactionForContext(ctx, ns.db, func(tx *gorm.DB) error {
+		sourceEventKey := *notification.SourceEventKey
+		var existing models.Notification
+		existingErr := tx.
+			Where("source_event_key = ?", sourceEventKey).
+			First(&existing).Error
+		switch {
+		case existingErr == nil:
+			if err := validateIdempotentTicketNotification(
+				&existing,
+				notification,
+			); err != nil {
+				return err
+			}
+			persisted = &existing
+			return nil
+		case !errors.Is(existingErr, gorm.ErrRecordNotFound):
+			return fmt.Errorf(
+				"load idempotent Outbox notification: %w",
+				existingErr,
+			)
+		}
+
+		now := time.Now().UTC()
+		allowed, reason, err := inAppNotificationAllowedByPreference(
+			tx,
+			notification,
+			now,
+		)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			notification.DeliveryStatus =
+				NotificationDeliveryStatusSuppressedByPreference
+			notification.IsRead = true
+			notification.ReadAt = &now
+			notification.ExpiresAt = &now
+			metadata["preference_suppression"] = reason
+		}
+		metadataBytes, err := json.Marshal(metadata)
+		if err != nil {
+			return fmt.Errorf("encode notification metadata: %w", err)
+		}
+		notification.Metadata = string(metadataBytes)
+
+		result := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "source_event_key"}},
+			DoNothing: true,
+		}).Create(notification)
+		if result.Error != nil {
+			return fmt.Errorf(
+				"persist Outbox notification: %w",
+				result.Error,
+			)
+		}
+		if result.RowsAffected == 1 {
+			persisted = notification
+			created = allowed
+			return nil
+		}
+		if err := tx.
+			Where("source_event_key = ?", sourceEventKey).
+			First(&existing).Error; err != nil {
+			return fmt.Errorf(
+				"load concurrent idempotent Outbox notification: %w",
+				err,
+			)
+		}
+		if err := validateIdempotentTicketNotification(
+			&existing,
+			notification,
+		); err != nil {
+			return err
+		}
+		persisted = &existing
+		return nil
+	})
 	if err != nil {
-		return nil, false, fmt.Errorf("encode notification metadata: %w", err)
+		return nil, false, err
 	}
-	notification.Metadata = string(metadataBytes)
+	return persisted, created, nil
+}
 
-	result := ns.db.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "source_event_key"}},
-		DoNothing: true,
-	}).Create(notification)
-	if result.Error != nil {
-		return nil, false, fmt.Errorf("persist Outbox notification: %w", result.Error)
+func validateIdempotentTicketNotification(
+	existing *models.Notification,
+	candidate *models.Notification,
+) error {
+	if existing == nil ||
+		candidate == nil ||
+		existing.Type != candidate.Type ||
+		existing.RecipientID != candidate.RecipientID ||
+		!sameOptionalTicketReference(
+			existing.RelatedTicketID,
+			candidate.RelatedTicketID,
+		) {
+		return errors.New("notification source event key collision")
 	}
-	if result.RowsAffected == 1 {
-		return notification, true, nil
-	}
+	return nil
+}
 
-	var existing models.Notification
-	if err := ns.db.WithContext(ctx).
-		Where("source_event_key = ?", sourceEventKey).
-		First(&existing).Error; err != nil {
-		return nil, false, fmt.Errorf("load idempotent Outbox notification: %w", err)
+func inAppNotificationAllowedByPreference(
+	tx *gorm.DB,
+	notification *models.Notification,
+	now time.Time,
+) (bool, string, error) {
+	if tx == nil ||
+		notification == nil ||
+		notification.RecipientID == 0 ||
+		!notification.Type.IsValid() ||
+		notification.Channel != models.NotificationChannelInApp ||
+		now.IsZero() {
+		return false, "", errors.New("notification preference decision is invalid")
 	}
-	if existing.Type != notification.Type ||
-		existing.RecipientID != notification.RecipientID ||
-		!sameOptionalTicketReference(existing.RelatedTicketID, notification.RelatedTicketID) {
-		return nil, false, errors.New("notification source event key collision")
+	if err := lockNotificationPreferenceUser(
+		tx,
+		notification.RecipientID,
+	); err != nil {
+		return false, "", err
 	}
-	return &existing, false, nil
+	var preference models.NotificationPreference
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"user_id = ? AND notification_type = ?",
+			notification.RecipientID,
+			notification.Type,
+		).
+		First(&preference).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		preference = defaultNotificationPreference(
+			notification.RecipientID,
+			notification.Type,
+		)
+		err = nil
+	}
+	if err != nil {
+		return false, "", fmt.Errorf(
+			"load notification preference: %w",
+			err,
+		)
+	}
+	if preference.MaxDailyCount < 0 ||
+		preference.MaxDailyCount > 10_000 ||
+		preference.BatchInterval < 1 ||
+		preference.BatchInterval > 1_440 ||
+		(preference.DoNotDisturbStart == nil) !=
+			(preference.DoNotDisturbEnd == nil) {
+		return false, "invalid_preference", nil
+	}
+	if !preference.InAppEnabled {
+		return false, "in_app_disabled", nil
+	}
+	if preference.DoNotDisturbStart != nil {
+		if !preference.DoNotDisturbEnd.After(
+			*preference.DoNotDisturbStart,
+		) {
+			return false, "invalid_preference", nil
+		}
+		if !now.Before(*preference.DoNotDisturbStart) &&
+			now.Before(*preference.DoNotDisturbEnd) {
+			return false, "do_not_disturb", nil
+		}
+	}
+	if preference.MaxDailyCount == 0 {
+		return true, "", nil
+	}
+	dayStart := time.Date(
+		now.Year(),
+		now.Month(),
+		now.Day(),
+		0,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	nextDay := dayStart.AddDate(0, 0, 1)
+	var deliveredToday int64
+	if err := tx.Model(&models.Notification{}).
+		Where(
+			"organization_id = ? AND project_id = ? AND recipient_id = ? AND type = ? AND channel = ? AND created_at >= ? AND created_at < ?",
+			notification.OrganizationID,
+			notification.ProjectID,
+			notification.RecipientID,
+			notification.Type,
+			models.NotificationChannelInApp,
+			dayStart,
+			nextDay,
+		).
+		Where(
+			"(delivery_status IS NULL OR delivery_status <> ?)",
+			NotificationDeliveryStatusSuppressedByPreference,
+		).
+		Count(&deliveredToday).Error; err != nil {
+		return false, "", fmt.Errorf(
+			"count daily notifications: %w",
+			err,
+		)
+	}
+	if deliveredToday >= int64(preference.MaxDailyCount) {
+		return false, "daily_limit", nil
+	}
+	return true, "", nil
+}
+
+func defaultNotificationPreference(
+	userID uint,
+	notificationType models.NotificationType,
+) models.NotificationPreference {
+	return models.NotificationPreference{
+		UserID:           userID,
+		NotificationType: notificationType,
+		EmailEnabled:     true,
+		InAppEnabled:     true,
+		WebhookEnabled:   false,
+		MaxDailyCount:    50,
+		BatchDelivery:    false,
+		BatchInterval:    60,
+	}
+}
+
+func notificationPreferenceUserLockQuery(
+	tx *gorm.DB,
+	userID uint,
+) *gorm.DB {
+	return tx.Model(&models.User{}).
+		Select("id").
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ?", userID)
+}
+
+func lockNotificationPreferenceUser(tx *gorm.DB, userID uint) error {
+	if tx == nil || userID == 0 {
+		return ErrInvalidNotificationPreferences
+	}
+	var user struct {
+		ID uint
+	}
+	if err := notificationPreferenceUserLockQuery(tx, userID).
+		Take(&user).Error; err != nil {
+		return fmt.Errorf("lock notification preference owner: %w", err)
+	}
+	return nil
 }
 
 func sameOptionalTicketReference(left, right *uint) bool {

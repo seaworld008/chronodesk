@@ -90,6 +90,9 @@ func TestWebhookHandlerEncryptsCredentialsAtRest(t *testing.T) {
 		strings.Contains(stored.AccessToken, "external-access-token") {
 		t.Fatalf("webhook credentials were not encrypted: secret=%q token=%q", stored.Secret, stored.AccessToken)
 	}
+	if stored.Status != models.WebhookStatusInactive {
+		t.Fatalf("new webhook status=%q, want inactive until explicit activation", stored.Status)
+	}
 	service := services.NewNotificationServiceWithProtector(db, ring)
 	targets, err := service.ListWebhookOutboxTargets(
 		request.Context(),
@@ -97,8 +100,8 @@ func TestWebhookHandlerEncryptsCredentialsAtRest(t *testing.T) {
 		models.WebhookEventTicketCreated,
 		"",
 	)
-	if err != nil || len(targets) != 1 {
-		t.Fatalf("encrypted webhook reload targets=%+v err=%v", targets, err)
+	if err != nil || len(targets) != 0 {
+		t.Fatalf("inactive webhook unexpectedly became delivery target=%+v err=%v", targets, err)
 	}
 
 	rotationRequest := httptest.NewRequest(
@@ -106,7 +109,8 @@ func TestWebhookHandlerEncryptsCredentialsAtRest(t *testing.T) {
 		"/webhooks/"+strconv.FormatUint(uint64(stored.ID), 10),
 		strings.NewReader(`{
 			"secret":"rotated-signature-secret",
-			"secret_overlap_seconds":3600
+			"secret_overlap_seconds":3600,
+			"status":"active"
 		}`),
 	)
 	rotationRequest.Header.Set("Content-Type", "application/json")
@@ -161,6 +165,9 @@ func TestWebhookHandlerEncryptsCredentialsAtRest(t *testing.T) {
 		rotated.PreviousSecretExpiresAt == nil ||
 		!rotated.PreviousSecretExpiresAt.After(time.Now().UTC()) {
 		t.Fatalf("webhook dual-key rotation was not persisted: %+v", rotated)
+	}
+	if rotated.Status != models.WebhookStatusActive {
+		t.Fatalf("explicit webhook activation status=%q, want active", rotated.Status)
 	}
 	current, err := ring.Open(
 		rotated.Secret,

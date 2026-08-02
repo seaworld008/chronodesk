@@ -101,6 +101,7 @@ func NewAuthModule(
 	emailService, err := NewConfiguredSMTPEmailService(
 		emailConfigService,
 		cfg.App.WebURL,
+		cfg.Server.Environment,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("initialize authentication email sender: %w", err)
