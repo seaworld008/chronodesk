@@ -40,19 +40,19 @@
     "remark-gfm": "4.0.1"
   },
   "devDependencies": {
-    "@axe-core/playwright": "^4.11.0",
-    "@playwright/test": "^1.62.0",
+    "@axe-core/playwright": "^4.12.1",
+    "@playwright/test": "^1.62.1",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^6.0.4",
+    "@vitejs/plugin-react": "^6.0.5",
     "eslint": "^10.8.0",
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.3",
     "globals": "^17.8.0",
     "patch-package": "^8.0.1",
-    "typescript": "^6.0.3",
+    "typescript": "^7.0.2",
     "typescript-eslint": "^8.65.0",
-    "vite": "^8.1.5"
+    "vite": "^8.2.0"
   },
   "allowScripts": {
     "fsevents@2.3.3": true,
