@@ -126,7 +126,6 @@ export const installMockSession = async (
             }
             sessionStorage.setItem(initializationKey, 'installed');
             localStorage.clear();
-            localStorage.setItem('token', authToken);
             localStorage.setItem('refreshToken', `${user.sessionID}-refresh`);
             localStorage.setItem(
                 'user',
@@ -144,6 +143,8 @@ export const installMockSession = async (
                 'tokenExpiresAt',
                 String(tokenExpiresAt),
             );
+            // Match authProvider: token is the cross-tab commit marker.
+            localStorage.setItem('token', authToken);
             if (selectedProject) {
                 localStorage.setItem(
                     'chronodesk.activeProject',

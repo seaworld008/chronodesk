@@ -291,6 +291,31 @@ test('公共认证标签不会用旧 checkAuth 状态注销新密码会话', asy
 
     const verifyPage = await context.newPage()
     const loginPage = await context.newPage()
+    await loginPage.addInitScript(() => {
+        const tracedWindow = window as Window & {
+            __chronodeskAuthenticationWrites?: string[]
+        }
+        tracedWindow.__chronodeskAuthenticationWrites = []
+        const originalSetItem = Storage.prototype.setItem
+        Storage.prototype.setItem = function (
+            key: string,
+            value: string,
+        ): void {
+            if (
+                [
+                    'refreshToken',
+                    'user',
+                    'tokenExpiresAt',
+                    'token',
+                ].includes(key)
+            ) {
+                tracedWindow.__chronodeskAuthenticationWrites?.push(
+                    key,
+                )
+            }
+            originalSetItem.call(this, key, value)
+        }
+    })
 
     await resetPage.goto('/#/reset-password?token=cross-tab-reset')
     await resetPage
@@ -320,8 +345,16 @@ test('公共认证标签不会用旧 checkAuth 状态注销新密码会话', asy
     await loginPage
         .getByRole('button', { name: '登录系统', exact: true })
         .click()
-    await expect(loginPage.getByText('邮箱或密码错误')).toBeVisible()
+    await expect(loginPage.getByRole('alert')).toContainText(
+        '邮箱或密码错误',
+    )
 
+    await loginPage.evaluate(() => {
+        const tracedWindow = window as Window & {
+            __chronodeskAuthenticationWrites?: string[]
+        }
+        tracedWindow.__chronodeskAuthenticationWrites?.splice(0)
+    })
     await loginPage.getByLabel('密码').fill(newPassword)
     await loginPage
         .getByRole('button', { name: '登录系统', exact: true })
@@ -332,6 +365,21 @@ test('公共认证标签不会用旧 checkAuth 状态注销新密码会话', asy
             loginPage.evaluate(() => localStorage.getItem('token')),
         )
         .toBe(accessToken)
+    await expect
+        .poll(() =>
+            loginPage.evaluate(() => {
+                const tracedWindow = window as Window & {
+                    __chronodeskAuthenticationWrites?: string[]
+                }
+                return tracedWindow.__chronodeskAuthenticationWrites
+            }),
+        )
+        .toEqual([
+            'refreshToken',
+            'user',
+            'tokenExpiresAt',
+            'token',
+        ])
 
     for (const publicPage of [resetPage, verifyPage]) {
         await publicPage.evaluate(

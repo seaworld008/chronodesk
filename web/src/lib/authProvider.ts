@@ -160,10 +160,12 @@ const storeAuthSession = (
     for (const key of authenticationStorageKeys) {
         localStorage.removeItem(key)
     }
-    localStorage.setItem('token', session.access_token)
     localStorage.setItem('refreshToken', session.refresh_token)
     localStorage.setItem('user', JSON.stringify(session.user))
     localStorage.setItem('tokenExpiresAt', String(binding.expires_at))
+    // Cross-tab listeners treat token as the session commit marker. Keep it
+    // last so they never observe a partially written authentication state.
+    localStorage.setItem('token', session.access_token)
     bindHumanTabSession(session.access_token)
 }
 
