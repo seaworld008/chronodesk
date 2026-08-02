@@ -24,7 +24,7 @@ GO_LDFLAGS := -s -w \
 	help doctor install-deps install-server-deps install-web-deps install-test-deps install-sdk-deps \
 	dev server-dev web-dev docker-up docker-down docker-logs \
 	build build-server build-web build-sdk clean \
-	fmt fmt-check test test-server test-race test-redis-integration test-web test-sdk test-python-static test-python-toolchain python-toolchain security verify \
+	fmt fmt-check test test-server test-race test-postgres-cloud test-redis-integration test-web test-sdk test-python-static test-python-toolchain python-toolchain security verify \
 	openapi-lint human-openapi-generate human-openapi-check asyncapi-lint smoke e2e db-migrate db-migrate-seed db-migrate-sample \
 	credential-validate credential-rotate credential-quarantine
 
@@ -44,6 +44,7 @@ help:
 	@echo "  test-python-toolchain 验证仓库 Python 虚拟环境与依赖刷新"
 	@echo "  test            执行 Go、Web、OpenAPI 与 AsyncAPI 标准门禁"
 	@echo "  test-race       执行 Go 竞态检测"
+	@echo "  test-postgres-cloud 真实云 PostgreSQL Ping、读取与临时写入回滚"
 	@echo "  test-redis-integration 使用显式 Redis 配置验证 Agent execution guard"
 	@echo "  test-sdk        编译并测试 Go、Python、TypeScript 项目绑定 SDK"
 	@echo "  human-openapi-check 验证 Human Web OpenAPI 与生成类型一致"
@@ -159,6 +160,9 @@ test-server:
 
 test-race:
 	cd server && go test -race ./... -count=1
+
+test-postgres-cloud:
+	cd server && go run ./cmd/postgres-test
 
 test-redis-integration:
 	@test "$(CHRONODESK_REDIS_INTEGRATION)" = "1" || \
