@@ -80,7 +80,9 @@ OpenSearch 和 Server 均恢复健康。
   再由部署负责人显式执行；本轮没有把本地验证等同于云端已迁移。
 - Web 生产依赖策略保留 React Router
   `GHSA-qwww-vcr4-c8h2` 例外。仓库未启用受影响的 unstable RSC API，复核期限为
-  2026-09-30；这不是“没有安全公告”的声明。
+  2026-09-30；这不是“没有安全公告”的声明。该段是 2026-07-31 时点记录；上游随后
+  确认 `7.18.2` 已包含 v7 回移修复，当前结论见
+  [React Router Advisory 处置决策](REACT_ROUTER_ADVISORY_DECISION_2026-08-02.md)。
 - 本地干净容器结果不替代 GitHub PR 最终 head 的 Secret Scan、Dependency
   Security、CodeQL 和 Smoke/E2E Checks。只有这些 Checks 全部成功后才允许合并。
 

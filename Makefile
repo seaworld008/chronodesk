@@ -176,6 +176,7 @@ test-redis-integration:
 test-web:
 	cd web && npm run check:human-api
 	cd web && npm run test:human-api
+	cd web && node --test ./scripts/audit-security.test.mjs
 	cd web && npm run typecheck
 	cd web && npm run lint
 	cd web && npm run audit:security
