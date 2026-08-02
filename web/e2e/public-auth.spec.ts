@@ -436,6 +436,14 @@ test('受保护标签在跨账号登录和退出后重载身份且不提交旧�
     const accessA = authorizedProjectAccess(projectA, 'requester')
     const accessB = authorizedProjectAccess(projectB, 'observer')
     let logoutRequests = 0
+    let markLoginRequestStarted: (() => void) | undefined
+    const loginRequestStarted = new Promise<void>((resolve) => {
+        markLoginRequestStarted = resolve
+    })
+    let releaseLoginResponse: (() => void) | undefined
+    const loginResponseReleased = new Promise<void>((resolve) => {
+        releaseLoginResponse = resolve
+    })
 
     await context.route('**/api/**', async (route) => {
         const request = route.request()
@@ -474,6 +482,19 @@ test('受保护标签在跨账号登录和退出后重载身份且不提交旧�
             pathname === '/api/auth/login' &&
             request.method() === 'POST'
         ) {
+            const body = request.postDataJSON() as {
+                password?: unknown
+            }
+            if (body.password === 'WrongPassword123!') {
+                await fulfillJSON(
+                    route,
+                    { code: 1, msg: '邮箱或密码错误' },
+                    401,
+                )
+                return
+            }
+            markLoginRequestStarted?.()
+            await loginResponseReleased
             await fulfillJSON(route, {
                 code: 0,
                 data: {
@@ -546,10 +567,42 @@ test('受保护标签在跨账号登录和退出后重载身份且不提交旧�
     ).toContainText(`e2e-${identityA.id}`)
 
     await loginPage.getByLabel('邮箱').fill(identityB.email)
-    await loginPage.getByLabel('密码').fill('CorrectPassword123!')
+    await loginPage.getByLabel('密码').fill('WrongPassword123!')
     await loginPage
         .getByRole('button', { name: '登录系统', exact: true })
         .click()
+    await expect(loginPage.getByRole('alert')).toContainText(
+        '邮箱或密码错误',
+    )
+    await expect
+        .poll(() =>
+            protectedPage.evaluate(() =>
+                localStorage.getItem('token'),
+            ),
+        )
+        .toBe(tokenA)
+    await expect(
+        protectedPage.getByTestId('account-menu'),
+    ).toContainText(`e2e-${identityA.id}`)
+
+    await loginPage.getByLabel('邮箱').fill(identityB.email)
+    await loginPage.getByLabel('密码').fill('CorrectPassword123!')
+    const loginSubmission = loginPage
+        .getByRole('button', { name: '登录系统', exact: true })
+        .click()
+    await loginRequestStarted
+    await expect
+        .poll(() =>
+            protectedPage.evaluate(() =>
+                localStorage.getItem('token'),
+            ),
+        )
+        .toBe(tokenA)
+    await expect(
+        protectedPage.getByTestId('account-menu'),
+    ).toContainText(`e2e-${identityA.id}`)
+    releaseLoginResponse?.()
+    await loginSubmission
     await expect(loginPage).toHaveURL(/\/#\/$/u)
     await expect(
         loginPage.getByTestId('account-menu'),

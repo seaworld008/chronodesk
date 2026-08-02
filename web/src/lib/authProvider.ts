@@ -318,7 +318,9 @@ export const authProvider: AuthProvider = {
             deviceName,
         } = params as LoginParams
 
-        clearAuthenticationState()
+        // Preserve the shared session until a replacement is fully validated.
+        // Clearing it before the network round trip can log out other tabs and
+        // leave them without a listener for the eventual replacement commit.
         const payload: LoginRequest = {
             email: username,
             password,
@@ -365,7 +367,6 @@ export const authProvider: AuthProvider = {
 
         const session = parseAuthSession(responseData(body))
         if (session === null) {
-            clearAuthenticationState()
             throw new Error('登录响应包含无效的平台角色或会话信息')
         }
         storeAuthSession(session, false)
