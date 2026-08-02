@@ -27,6 +27,47 @@ test.describe('Authentication', () => {
     });
 });
 
+test.describe('Ticket Creation Form', () => {
+    test.beforeEach(async ({ page }) => {
+        await authenticatePage(page, TEST_USER);
+    });
+
+    test('should open category autocomplete without browser warnings', async ({
+        page,
+    }) => {
+        const health = monitorBrowserHealth(page);
+        await page.goto('/#/tickets/create');
+
+        const categoryTab = page.getByRole('tab', {
+            name: '分类与类型',
+            exact: true,
+        });
+        await expect(categoryTab).toBeVisible({ timeout: 15_000 });
+        await expect(
+            page.getByText('正在加载当前项目的已发布建单配置…', {
+                exact: true,
+            }),
+        ).toBeHidden();
+        await categoryTab.click();
+
+        const categoryInput = page.getByRole('combobox', {
+            name: '工单类别',
+            exact: true,
+        });
+        await expect(categoryInput).toBeVisible();
+        await expect(categoryInput).toBeEnabled();
+        await categoryInput.click();
+        await expect(page.getByRole('listbox')).toBeVisible();
+        await expect(
+            page.getByRole('option', {
+                name: '技术支持',
+                exact: true,
+            }),
+        ).toBeVisible();
+        health.assertClean();
+    });
+});
+
 test.describe('Ticket Management', () => {
     let ticketId: number;
     const ticketTitle = `${E2E_MARKER}基础工单`;
