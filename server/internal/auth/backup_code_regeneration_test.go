@@ -12,8 +12,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
+	httpmiddleware "github.com/seaworld008/chronodesk/server/internal/middleware"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
 )
@@ -96,6 +98,7 @@ type backupCodeMemoryRepository struct {
 	user        User
 	audits      []AuthenticationSecurityAuditEvent
 	rotationErr error
+	panicValue  interface{}
 	getArrived  *sync.WaitGroup
 	getRelease  <-chan struct{}
 }
@@ -130,6 +133,9 @@ func (repository *backupCodeMemoryRepository) RotateBackupCodesWithAudit(
 ) error {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
+	if repository.panicValue != nil {
+		panic(repository.panicValue)
+	}
 	if repository.rotationErr != nil {
 		return repository.rotationErr
 	}
@@ -721,6 +727,16 @@ func TestGormBackupCodeRegenerationCASAllowsExactlyOneWinner(t *testing.T) {
 	if auditCount != 1 {
 		t.Fatalf("success audit count = %d, want 1", auditCount)
 	}
+	var securityAudit AuthenticationSecurityAuditEvent
+	if err := db.Where("user_id = ?", user.ID).
+		First(&securityAudit).Error; err != nil {
+		t.Fatal(err)
+	}
+	if securityAudit.RequestID != "concurrent-request" ||
+		securityAudit.TraceID != "4bf92f3577b34da6a3ce929d0e0e4736" ||
+		securityAudit.CorrelationID != "correlation-concurrent" {
+		t.Fatalf("valid security audit metadata was not retained: %+v", securityAudit)
+	}
 	consumed, err := baseRepository.ConsumeBackupCode(
 		context.Background(),
 		user.ID,
@@ -976,5 +992,178 @@ func TestBackupCodeRegenerationStorageFailureReturnsNoCodes(t *testing.T) {
 	if stored.BackupCodes != oldHashes || len(audits) != 0 ||
 		otpService.callCount() != 1 {
 		t.Fatal("storage failure changed hashes or wrote success audit")
+	}
+}
+
+func newProductionMiddlewareBackupCodeTest(
+	t *testing.T,
+	repository *backupCodeMemoryRepository,
+) (
+	*gin.Engine,
+	*bytes.Buffer,
+	*bytes.Buffer,
+	*backupCodeTestLogger,
+) {
+	t.Helper()
+	otpService := &backupCodeTestOTPService{}
+	service := &AuthService{
+		userRepo:        repository,
+		otpService:      otpService,
+		passwordService: backupCodeTestPasswordService{},
+	}
+	authLogger := &backupCodeTestLogger{}
+	handler := NewAuthHandler(service, authLogger)
+
+	var accessLogs bytes.Buffer
+	var recoveryLogs bytes.Buffer
+	config := httpmiddleware.ProductionMiddlewareConfig()
+	config.Logger.Logger = httpmiddleware.NewSimpleLogger(
+		&accessLogs,
+		httpmiddleware.LogLevelInfo,
+	)
+	config.Recovery.Logger = httpmiddleware.NewSimpleLogger(
+		&recoveryLogs,
+		httpmiddleware.LogLevelError,
+	)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(
+		httpmiddleware.WrapGinMiddlewares(
+			httpmiddleware.SetupMiddlewares(config),
+		)...,
+	)
+	router.POST("/api/auth/otp/backup-codes", func(c *gin.Context) {
+		c.Set("user_id", repository.user.ID)
+		c.Set("platform_role", PlatformRoleMember)
+		handler.GenerateBackupCodes(NewGinHTTPContext(c))
+	})
+	return router, &accessLogs, &recoveryLogs, authLogger
+}
+
+func TestProductionMiddlewareDoesNotLogBackupCodeRouteSecrets(t *testing.T) {
+	oldHashes, err := hashBackupCodes([]string{"OLD-CODE-01"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name       string
+		configure  func(*backupCodeMemoryRepository)
+		wantStatus int
+	}{
+		{
+			name: "handler storage failure",
+			configure: func(repository *backupCodeMemoryRepository) {
+				repository.rotationErr = errors.New(
+					"storage failure SET01-CODE01",
+				)
+			},
+			wantStatus: http.StatusServiceUnavailable,
+		},
+		{
+			name: "recovery panic",
+			configure: func(repository *backupCodeMemoryRepository) {
+				repository.panicValue = "SET01-CODE01"
+			},
+			wantStatus: http.StatusInternalServerError,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repository := &backupCodeMemoryRepository{
+				user: User{
+					ID:           42,
+					PasswordHash: backupCodeTestHash,
+					OTPEnabled:   true,
+					BackupCodes:  oldHashes,
+				},
+			}
+			test.configure(repository)
+			router, accessLogs, recoveryLogs, authLogger :=
+				newProductionMiddlewareBackupCodeTest(t, repository)
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/api/auth/otp/backup-codes?view=SET01-CODE01",
+				strings.NewReader(
+					`{"current_password":"CurrentPassword123!"}`,
+				),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("X-Request-ID", backupCodeTestPassword)
+			request.Header.Set("User-Agent", "SET01-CODE01")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != test.wantStatus {
+				t.Fatalf(
+					"status = %d, want %d; body=%s",
+					response.Code,
+					test.wantStatus,
+					response.Body.String(),
+				)
+			}
+
+			logs := accessLogs.String() +
+				recoveryLogs.String() +
+				authLogger.serialized()
+			for _, secret := range []string{
+				backupCodeTestPassword,
+				"SET01-CODE01",
+				oldHashes,
+			} {
+				if strings.Contains(logs, secret) {
+					t.Fatalf(
+						"production request/recovery/handler logs contain %q:\n%s",
+						secret,
+						logs,
+					)
+				}
+			}
+		})
+	}
+}
+
+func TestBackupCodeRegenerationBoundsLongAuditRequestID(t *testing.T) {
+	db, repository, user, _ := setupGormBackupCodeRotationTest(t)
+	otpService := &backupCodeTestOTPService{}
+	service := &AuthService{
+		userRepo:        repository,
+		otpService:      otpService,
+		passwordService: backupCodeTestPasswordService{},
+	}
+	handler := NewAuthHandler(service, nil)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/api/auth/otp/backup-codes", func(c *gin.Context) {
+		c.Set("user_id", user.ID)
+		c.Set("platform_role", PlatformRoleMember)
+		handler.GenerateBackupCodes(NewGinHTTPContext(c))
+	})
+
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/auth/otp/backup-codes",
+		strings.NewReader(`{"current_password":"CurrentPassword123!"}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Request-ID", strings.Repeat("界", 257))
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"257-rune request ID status = %d, want 200; body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	var audit AuthenticationSecurityAuditEvent
+	if err := db.Where("user_id = ?", user.ID).First(&audit).Error; err != nil {
+		t.Fatal(err)
+	}
+	if audit.RequestID == "" ||
+		utf8.RuneCountInString(audit.RequestID) > 256 {
+		t.Fatalf(
+			"persisted audit request ID has %d runes: %q",
+			utf8.RuneCountInString(audit.RequestID),
+			audit.RequestID,
+		)
 	}
 }

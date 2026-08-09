@@ -1854,7 +1854,9 @@ func sanitizeAuthenticationSecurityAuditContext(
 	secrets []string,
 ) AuthenticationSecurityAuditContext {
 	requestID := observability.SafeLogValue(auditContext.RequestID)
-	if requestID == "" || auditMetadataContainsSecret(requestID, secrets) {
+	if requestID == "" ||
+		utf8.RuneCountInString(requestID) > 256 ||
+		auditMetadataContainsSecret(requestID, secrets) {
 		requestID = "request-redacted"
 	}
 
