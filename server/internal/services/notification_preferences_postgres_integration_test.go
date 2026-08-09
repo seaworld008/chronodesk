@@ -262,7 +262,7 @@ func TestPostgresEmailNotificationPreferenceCreateFollowsUpdateOrder(
 		)
 		return createResult{notification: notification, err: err}
 	}
-	countIntents := func() (int64, int64) {
+	countIntents := func(t *testing.T) (int64, int64) {
 		t.Helper()
 		var events, deliveries int64
 		if err := db.Model(&models.DomainEvent{}).Count(&events).Error; err != nil {
@@ -273,7 +273,7 @@ func TestPostgresEmailNotificationPreferenceCreateFollowsUpdateOrder(
 		}
 		return events, deliveries
 	}
-	holdPreferenceUserLock := func() *gorm.DB {
+	holdPreferenceUserLock := func(t *testing.T) *gorm.DB {
 		t.Helper()
 		tx := db.Begin()
 		if tx.Error != nil {
@@ -285,8 +285,11 @@ func TestPostgresEmailNotificationPreferenceCreateFollowsUpdateOrder(
 		}
 		return tx
 	}
-	waitForQueuedPreferenceLock := func() {
+	waitForQueuedPreferenceLock := func(t *testing.T, wantWaiters int64) {
 		t.Helper()
+		if wantWaiters < 1 {
+			t.Fatalf("queued preference lock waiters = %d, want at least 1", wantWaiters)
+		}
 		deadline := time.Now().Add(5 * time.Second)
 		for {
 			var blocked int64
@@ -296,16 +299,20 @@ func TestPostgresEmailNotificationPreferenceCreateFollowsUpdateOrder(
 			).Scan(&blocked).Error; err != nil {
 				t.Fatal(err)
 			}
-			if blocked > 0 {
+			if blocked >= wantWaiters {
 				return
 			}
 			if time.Now().After(deadline) {
-				t.Fatal("timed out waiting for a queued notification preference lock")
+				t.Fatalf(
+					"timed out waiting for queued notification preference locks: got %d, want at least %d",
+					blocked,
+					wantWaiters,
+				)
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	waitUpdate := func(result <-chan error) {
+	waitUpdate := func(t *testing.T, result <-chan error) {
 		t.Helper()
 		select {
 		case err := <-result:
@@ -316,7 +323,10 @@ func TestPostgresEmailNotificationPreferenceCreateFollowsUpdateOrder(
 			t.Fatal("timed out waiting for notification preference update")
 		}
 	}
-	waitCreate := func(result <-chan createResult) *models.Notification {
+	waitCreate := func(
+		t *testing.T,
+		result <-chan createResult,
+	) *models.Notification {
 		t.Helper()
 		select {
 		case outcome := <-result:
@@ -334,24 +344,25 @@ func TestPostgresEmailNotificationPreferenceCreateFollowsUpdateOrder(
 		if err := updateEmailPreference(true); err != nil {
 			t.Fatal(err)
 		}
-		hold := holdPreferenceUserLock()
+		hold := holdPreferenceUserLock(t)
 		updateDone := make(chan error, 1)
 		go func() { updateDone <- updateEmailPreference(false) }()
-		waitForQueuedPreferenceLock()
+		waitForQueuedPreferenceLock(t, 1)
 		createDone := make(chan createResult, 1)
 		go func() { createDone <- createEmail("update-first") }()
+		waitForQueuedPreferenceLock(t, 2)
 		if err := hold.Commit().Error; err != nil {
 			t.Fatal(err)
 		}
-		waitUpdate(updateDone)
-		notification := waitCreate(createDone)
+		waitUpdate(t, updateDone)
+		notification := waitCreate(t, createDone)
 		if notification.DeliveryStatus !=
 			NotificationDeliveryStatusSuppressedByPreference ||
 			!notification.IsRead || notification.ReadAt == nil ||
 			notification.ExpiresAt == nil {
 			t.Fatalf("update-first notification = %+v", notification)
 		}
-		events, deliveries := countIntents()
+		events, deliveries := countIntents(t)
 		if events != 0 || deliveries != 0 {
 			t.Fatalf(
 				"update-first intents = events:%d deliveries:%d, want 0/0",
@@ -365,22 +376,23 @@ func TestPostgresEmailNotificationPreferenceCreateFollowsUpdateOrder(
 		if err := updateEmailPreference(true); err != nil {
 			t.Fatal(err)
 		}
-		hold := holdPreferenceUserLock()
+		hold := holdPreferenceUserLock(t)
 		createDone := make(chan createResult, 1)
 		go func() { createDone <- createEmail("create-first") }()
-		waitForQueuedPreferenceLock()
+		waitForQueuedPreferenceLock(t, 1)
 		updateDone := make(chan error, 1)
 		go func() { updateDone <- updateEmailPreference(false) }()
+		waitForQueuedPreferenceLock(t, 2)
 		if err := hold.Commit().Error; err != nil {
 			t.Fatal(err)
 		}
-		notification := waitCreate(createDone)
+		notification := waitCreate(t, createDone)
 		if notification.DeliveryStatus != "" || notification.IsRead ||
 			notification.ReadAt != nil || notification.ExpiresAt != nil {
 			t.Fatalf("create-first notification = %+v", notification)
 		}
-		waitUpdate(updateDone)
-		events, deliveries := countIntents()
+		waitUpdate(t, updateDone)
+		events, deliveries := countIntents(t)
 		if events != 1 || deliveries != 1 {
 			t.Fatalf(
 				"create-first intents = events:%d deliveries:%d, want 1/1",
