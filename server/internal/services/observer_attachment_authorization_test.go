@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"gorm.io/datatypes"
+	"gorm.io/gorm"
 )
 
 func TestObserverAttachmentAuthorizationRequiresPublicRead(t *testing.T) {
@@ -438,5 +441,133 @@ func TestObserverAttachmentCrossProjectScopeRemainsNotFound(
 			"cross-project attachment error = %v, want attachment unavailable",
 			err,
 		)
+	}
+}
+
+func TestServicePrincipalObserverGrantPreservesAttachmentNotFoundSemantics(
+	t *testing.T,
+) {
+	db := openAgentNativeTestDB(t)
+	principal := models.ServicePrincipal{
+		ID:     "00000000-0000-7000-8000-000000000601",
+		Name:   "observer-grant-attachment-machine",
+		Status: models.ServicePrincipalStatusActive,
+		Scopes: datatypes.JSON(`["attachments:read"]`),
+	}
+	if err := db.Create(&principal).Error; err != nil {
+		t.Fatal(err)
+	}
+	operationContext := testProjectOperationContext(
+		t,
+		db,
+		models.ServicePrincipalActor(principal.ID),
+	)
+	operation, err := OperationContextFromContext(operationContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.ProjectPrincipalGrant{
+		ProjectID:          operation.Scope.ProjectID,
+		ServicePrincipalID: principal.ID,
+		Role:               models.ProjectRoleObserver,
+		Scopes:             datatypes.JSON(`["attachments:read"]`),
+		IsActive:           true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.AgentCredential{
+		ID:                 operation.CredentialID,
+		ServicePrincipalID: principal.ID,
+		Name:               "observer-grant-attachment-machine",
+		SecretHash:         "test-only-observer-grant-secret-hash",
+		Status:             models.AgentCredentialStatusActive,
+		ExpiresAt:          time.Now().UTC().Add(time.Hour),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	user := seedActorUser(t, db, "observer-grant-attachment-owner")
+	readableTicket := seedNativeTicket(
+		t,
+		db,
+		user.ID,
+		"OBSERVER-GRANT-ATTACHMENT-READABLE",
+	)
+	otherTicket := seedNativeTicket(
+		t,
+		db,
+		user.ID,
+		"OBSERVER-GRANT-ATTACHMENT-OTHER",
+	)
+	otherAttachment := models.TicketAttachment{
+		OrganizationID: operation.Scope.OrganizationID,
+		ProjectID:      operation.Scope.ProjectID,
+		TicketID:       otherTicket.ID,
+		ActorType:      models.ActorTypeHuman,
+		ActorID:        models.HumanActor(user.ID).ID,
+		FileName:       "machine-other-ticket.txt",
+		OriginalName:   "machine-other-ticket.txt",
+		FileSize:       7,
+		MimeType:       "text/plain",
+		FileType:       models.AttachmentTypeDocument,
+		StoragePath:    "machine-other-ticket.txt",
+		StorageType:    "local",
+		Hash:           "machine-other-ticket-hash",
+		IsPublic:       true,
+		VirusScan:      models.VirusScanClean,
+	}
+	if err := db.Create(&otherAttachment).Error; err != nil {
+		t.Fatal(err)
+	}
+	storage, err := NewLocalAttachmentStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewAgentNativeService(
+		db,
+		AgentNativeOptions{AttachmentStorage: storage},
+	)
+	targets := []struct {
+		name         string
+		attachmentID uint
+	}{
+		{
+			name:         "random nonexistent attachment",
+			attachmentID: otherAttachment.ID + 1000000,
+		},
+		{
+			name:         "same project attachment on another ticket",
+			attachmentID: otherAttachment.ID,
+		},
+	}
+	for _, target := range targets {
+		t.Run(target.name, func(t *testing.T) {
+			attachment, reader, err := service.OpenTicketAttachment(
+				operationContext,
+				readableTicket.ID,
+				target.attachmentID,
+			)
+			if attachment != nil || reader != nil {
+				if reader != nil {
+					_ = reader.Close()
+				}
+				t.Fatalf(
+					"machine not-found target returned attachment=%+v reader=%T",
+					attachment,
+					reader,
+				)
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				t.Fatalf(
+					"machine not-found target error = %v, want record not found",
+					err,
+				)
+			}
+			if errors.Is(err, ErrAttachmentUnavailable) {
+				t.Fatalf(
+					"machine not-found target was normalized as Human observer: %v",
+					err,
+				)
+			}
+		})
 	}
 }

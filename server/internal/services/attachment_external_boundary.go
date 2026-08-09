@@ -796,12 +796,17 @@ func (s *AgentNativeService) loadAndAuthorizeAttachmentDownload(
 			operation.Scope.ProjectID,
 		).
 		Take(destination).Error; err != nil {
-		return observerAttachmentDownloadError(access, err)
+		return observerAttachmentDownloadError(
+			access,
+			operation,
+			err,
+		)
 	}
 	if expectedTicketID != 0 &&
 		destination.TicketID != expectedTicketID {
 		return observerAttachmentDownloadError(
 			access,
+			operation,
 			gorm.ErrRecordNotFound,
 		)
 	}
@@ -821,7 +826,11 @@ func (s *AgentNativeService) loadAndAuthorizeAttachmentDownload(
 			operation.Scope.ProjectID,
 		).
 		Take(&ticket).Error; err != nil {
-		return observerAttachmentDownloadError(access, err)
+		return observerAttachmentDownloadError(
+			access,
+			operation,
+			err,
+		)
 	}
 	switch operation.Actor.Type {
 	case models.ActorTypeHuman:
@@ -832,7 +841,11 @@ func (s *AgentNativeService) loadAndAuthorizeAttachmentDownload(
 			false,
 			destination.IsPublic,
 		); err != nil {
-			return observerAttachmentDownloadError(access, err)
+			return observerAttachmentDownloadError(
+				access,
+				operation,
+				err,
+			)
 		}
 		if access.Role == models.ProjectRoleRequester &&
 			!destination.IsPublic {
@@ -874,10 +887,12 @@ func (s *AgentNativeService) loadAndAuthorizeAttachmentDownload(
 
 func observerAttachmentDownloadError(
 	access *ProjectAccess,
+	operation OperationContext,
 	err error,
 ) error {
 	if err == nil ||
 		access == nil ||
+		operation.Actor.Type != models.ActorTypeHuman ||
 		access.Role != models.ProjectRoleObserver {
 		return err
 	}

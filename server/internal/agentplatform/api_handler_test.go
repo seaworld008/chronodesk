@@ -179,6 +179,104 @@ func TestAgentDownloadAttachmentReturnsContentWithSafeHeaders(t *testing.T) {
 	}
 }
 
+func TestAgentObserverGrantMissingAttachmentRemainsNotFound(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dsn := fmt.Sprintf(
+		"file:%s?mode=memory&cache=shared",
+		strings.ReplaceAll(t.Name(), "/", "_"),
+	)
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open Agent observer attachment database: %v", err)
+	}
+	project := ensureAPIHandlerTestProject(t, db)
+	if err := db.AutoMigrate(
+		&models.ServicePrincipal{},
+		&models.AgentCredential{},
+		&models.TicketAttachment{},
+	); err != nil {
+		t.Fatalf("migrate Agent observer attachment schemas: %v", err)
+	}
+	principal := models.ServicePrincipal{
+		ID:     "00000000-0000-7000-8000-000000000602",
+		Name:   "agent-observer-attachment",
+		Status: models.ServicePrincipalStatusActive,
+		Scopes: datatypes.JSON(`["attachments:read"]`),
+	}
+	if err := db.Create(&principal).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.ProjectPrincipalGrant{
+		ProjectID:          project.project.ID,
+		ServicePrincipalID: principal.ID,
+		Role:               models.ProjectRoleObserver,
+		Scopes:             datatypes.JSON(`["attachments:read"]`),
+		IsActive:           true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	credential := models.AgentCredential{
+		ID:                 "00000000-0000-7000-8000-000000000603",
+		ServicePrincipalID: principal.ID,
+		Name:               "agent-observer-attachment",
+		SecretHash:         "test-only-agent-observer-attachment-hash",
+		Status:             models.AgentCredentialStatusActive,
+		ExpiresAt:          time.Now().UTC().Add(time.Hour),
+	}
+	if err := db.Create(&credential).Error; err != nil {
+		t.Fatal(err)
+	}
+	storage, err := services.NewLocalAttachmentStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	native := services.NewAgentNativeService(
+		db,
+		services.AgentNativeOptions{AttachmentStorage: storage},
+	)
+	handler := NewAPIHandler(db, native, nil, 1024, nil)
+	router := gin.New()
+	router.GET("/attachments/:id/content", func(c *gin.Context) {
+		ctx := apiHandlerTestOperationContext(
+			t,
+			db,
+			principal.ID,
+			credential.ID,
+		)
+		c.Request = c.Request.WithContext(ctx)
+		handler.DownloadAttachment(c)
+	})
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(
+		response,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/attachments/1000001/content",
+			nil,
+		),
+	)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf(
+			"Agent observer missing attachment status=%d body=%s, want 404",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	var problem Problem
+	if err := json.Unmarshal(response.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("decode Agent observer attachment problem: %v", err)
+	}
+	if problem.Status != http.StatusNotFound ||
+		problem.Code != ProblemNotFound ||
+		problem.Retryable {
+		t.Fatalf(
+			"Agent observer missing attachment problem=%+v",
+			problem,
+		)
+	}
+}
+
 func ensureAPIHandlerTestProject(
 	t *testing.T,
 	db *gorm.DB,
