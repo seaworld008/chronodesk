@@ -66,11 +66,17 @@ func webhookCredentialColumnContracts() []webhookCredentialColumnContract {
 }
 
 func validateWebhookCredentialColumnContract(db *gorm.DB) error {
-	return validateWebhookCredentialColumnContractState(db, false)
+	if err := validateWebhookCredentialColumnContractState(db, false); err != nil {
+		return err
+	}
+	return validateWebhookCredentialStatusColumnContract(db)
 }
 
 func validatePreparedWebhookCredentialColumnContract(db *gorm.DB) error {
-	return validateWebhookCredentialColumnContractState(db, true)
+	if err := validateWebhookCredentialColumnContractState(db, true); err != nil {
+		return err
+	}
+	return validateWebhookCredentialStatusColumnContract(db)
 }
 
 func validateWebhookCredentialColumnContractState(
@@ -246,4 +252,115 @@ func equalOptionalInt64(left, right *int64) bool {
 		return left == nil && right == nil
 	}
 	return *left == *right
+}
+
+func validateWebhookCredentialStatusColumnContract(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("webhook credential status column database is required")
+	}
+	switch db.Dialector.Name() {
+	case "postgres":
+		var state struct {
+			DataType        string  `gorm:"column:data_type"`
+			UDTName         string  `gorm:"column:udt_name"`
+			IsNullable      string  `gorm:"column:is_nullable"`
+			ColumnDefault   *string `gorm:"column:column_default"`
+			CharacterLength *int64  `gorm:"column:character_maximum_length"`
+			IsGenerated     string  `gorm:"column:is_generated"`
+			IsIdentity      string  `gorm:"column:is_identity"`
+		}
+		result := db.Raw(`
+			SELECT
+				data_type,
+				udt_name,
+				is_nullable,
+				column_default,
+				character_maximum_length,
+				is_generated,
+				is_identity
+			FROM information_schema.columns
+			WHERE table_schema = CURRENT_SCHEMA()
+			  AND table_name = 'outbox_deliveries'
+			  AND column_name = 'status'
+		`).Scan(&state)
+		if result.Error != nil {
+			return fmt.Errorf(
+				"read PostgreSQL outbox_deliveries.status contract: %w",
+				result.Error,
+			)
+		}
+		if result.RowsAffected != 1 ||
+			state.DataType != "character varying" ||
+			state.UDTName != "varchar" ||
+			state.IsNullable != "NO" ||
+			state.CharacterLength == nil ||
+			*state.CharacterLength != 20 ||
+			state.ColumnDefault == nil ||
+			normalizeWebhookStatusDefault(*state.ColumnDefault) != "pending" ||
+			state.IsGenerated != "NEVER" ||
+			state.IsIdentity != "NO" {
+			return errors.New(
+				"outbox_deliveries.status has incompatible PostgreSQL type/not null/default/length contract",
+			)
+		}
+		return nil
+	case "sqlite":
+		var rows []struct {
+			Name       string  `gorm:"column:name"`
+			Type       string  `gorm:"column:type"`
+			NotNull    int     `gorm:"column:notnull"`
+			Default    *string `gorm:"column:dflt_value"`
+			HiddenFlag int     `gorm:"column:hidden"`
+		}
+		if err := db.Raw(
+			"PRAGMA table_xinfo(`outbox_deliveries`)",
+		).Scan(&rows).Error; err != nil {
+			return fmt.Errorf(
+				"read SQLite outbox_deliveries.status contract: %w",
+				err,
+			)
+		}
+		for _, state := range rows {
+			if state.Name != "status" {
+				continue
+			}
+			statusType := strings.ToUpper(strings.TrimSpace(state.Type))
+			if (statusType != "TEXT" && statusType != "VARCHAR(20)") ||
+				state.NotNull != 1 ||
+				state.Default == nil ||
+				normalizeWebhookStatusDefault(*state.Default) != "pending" ||
+				state.HiddenFlag != 0 {
+				return errors.New(
+					"outbox_deliveries.status has incompatible SQLite type/not null/default/length contract",
+				)
+			}
+			return nil
+		}
+		return errors.New("outbox_deliveries.status is missing")
+	default:
+		return fmt.Errorf(
+			"webhook credential status column contract is unsupported for database dialect %q",
+			db.Dialector.Name(),
+		)
+	}
+}
+
+func normalizeWebhookStatusDefault(value string) string {
+	value = strings.TrimSpace(value)
+	for strings.HasPrefix(value, "(") {
+		close, ok := matchingSQLParenthesis(value, 0)
+		if !ok || close != len(value)-1 {
+			break
+		}
+		value = strings.TrimSpace(value[1:close])
+	}
+	switch value {
+	case "'pending'",
+		`"pending"`,
+		"'pending'::text",
+		"'pending'::character varying":
+		return "pending"
+	default:
+		return value
+	}
 }

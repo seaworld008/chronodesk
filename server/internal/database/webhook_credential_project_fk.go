@@ -214,22 +214,35 @@ func rebuildSQLiteTableWithProjectScopeFK(
 			err,
 		)
 	}
-	if countSQLiteNamedConstraint(
+	named, namedErr := sqliteNamedProjectScopeForeignKey(
 		tableState.SQL,
 		definition.name,
-	) == 1 {
+	)
+	if namedErr == nil && named.isCanonicalProjectScopeFK() {
 		return nil
 	}
-	if countSQLiteNamedConstraint(
-		tableState.SQL,
-		definition.name,
-	) != 0 {
+	if namedErr != nil &&
+		!errors.Is(namedErr, errSQLiteNamedConstraintMissing) {
 		return fmt.Errorf(
-			"SQLite Project-scope foreign key %s is duplicated",
+			"SQLite Project-scope foreign key %s is malformed: %w",
+			definition.name,
+			namedErr,
+		)
+	}
+	if namedErr == nil {
+		return fmt.Errorf(
+			"SQLite Project-scope foreign key %s has an incompatible definition",
 			definition.name,
 		)
 	}
-	open := strings.Index(tableState.SQL, "(")
+	open, openErr := findSQLiteTableBodyOpen(tableState.SQL)
+	if openErr != nil {
+		return fmt.Errorf(
+			"parse SQLite table %s opening DDL: %w",
+			definition.table,
+			openErr,
+		)
+	}
 	close, ok := matchingSQLParenthesis(tableState.SQL, open)
 	if !ok {
 		return fmt.Errorf(
@@ -316,13 +329,28 @@ func validateWebhookProjectDirectoryReferences(db *gorm.DB) error {
 }
 
 type postgresWebhookProjectScopeFKCatalogRow struct {
-	Table      string `gorm:"column:table_name"`
-	Name       string `gorm:"column:constraint_name"`
-	Type       string `gorm:"column:constraint_type"`
-	Validated  bool   `gorm:"column:validated"`
-	Deferrable bool   `gorm:"column:deferrable"`
-	Deferred   bool   `gorm:"column:deferred"`
-	Definition string `gorm:"column:definition"`
+	ChildRelationOID    uint32 `gorm:"column:child_relation_oid"`
+	ExpectedChildOID    uint32 `gorm:"column:expected_child_oid"`
+	ParentRelationOID   uint32 `gorm:"column:parent_relation_oid"`
+	ExpectedParentOID   uint32 `gorm:"column:expected_parent_oid"`
+	ChildSchema         string `gorm:"column:child_schema"`
+	ChildTable          string `gorm:"column:child_table"`
+	ParentSchema        string `gorm:"column:parent_schema"`
+	ParentTable         string `gorm:"column:parent_table"`
+	Name                string `gorm:"column:constraint_name"`
+	Type                string `gorm:"column:constraint_type"`
+	Ordinality          int    `gorm:"column:ordinality"`
+	ChildAttnum         int    `gorm:"column:child_attnum"`
+	ParentAttnum        int    `gorm:"column:parent_attnum"`
+	ChildColumn         string `gorm:"column:child_column"`
+	ParentColumn        string `gorm:"column:parent_column"`
+	UpdateAction        string `gorm:"column:update_action"`
+	DeleteAction        string `gorm:"column:delete_action"`
+	MatchType           string `gorm:"column:match_type"`
+	Validated           bool   `gorm:"column:validated"`
+	Deferrable          bool   `gorm:"column:deferrable"`
+	Deferred            bool   `gorm:"column:deferred"`
+	ParentConstraintOID uint32 `gorm:"column:parent_constraint_oid"`
 }
 
 func postgresWebhookProjectScopeFKState(
@@ -332,22 +360,63 @@ func postgresWebhookProjectScopeFKState(
 	var rows []postgresWebhookProjectScopeFKCatalogRow
 	if err := db.Raw(`
 		SELECT
-			table_state.relname AS table_name,
+			constraint_state.conrelid::oid AS child_relation_oid,
+			to_regclass(
+				format('%I.%I', CURRENT_SCHEMA(), CAST(? AS text))
+			)::oid AS expected_child_oid,
+			constraint_state.confrelid::oid AS parent_relation_oid,
+			to_regclass(
+				format('%I.%I', CURRENT_SCHEMA(), 'projects')
+			)::oid AS expected_parent_oid,
+			child_namespace.nspname AS child_schema,
+			child_table.relname AS child_table,
+			parent_namespace.nspname AS parent_schema,
+			parent_table.relname AS parent_table,
 			constraint_state.conname AS constraint_name,
 			constraint_state.contype::text AS constraint_type,
+			key.ordinality::integer AS ordinality,
+			key.child_attnum::integer AS child_attnum,
+			key.parent_attnum::integer AS parent_attnum,
+			child_attribute.attname AS child_column,
+			parent_attribute.attname AS parent_column,
+			constraint_state.confupdtype::text AS update_action,
+			constraint_state.confdeltype::text AS delete_action,
+			constraint_state.confmatchtype::text AS match_type,
 			constraint_state.convalidated AS validated,
 			constraint_state.condeferrable AS deferrable,
 			constraint_state.condeferred AS deferred,
-			pg_get_constraintdef(constraint_state.oid, true) AS definition
+			constraint_state.conparentid::oid AS parent_constraint_oid
 		FROM pg_constraint AS constraint_state
-		JOIN pg_class AS table_state
-		  ON table_state.oid = constraint_state.conrelid
-		JOIN pg_namespace AS namespace
-		  ON namespace.oid = table_state.relnamespace
-		WHERE namespace.nspname = CURRENT_SCHEMA()
-		  AND table_state.relname = ?
+		JOIN pg_class AS child_table
+		  ON child_table.oid = constraint_state.conrelid
+		JOIN pg_namespace AS child_namespace
+		  ON child_namespace.oid = child_table.relnamespace
+		JOIN pg_class AS parent_table
+		  ON parent_table.oid = constraint_state.confrelid
+		JOIN pg_namespace AS parent_namespace
+		  ON parent_namespace.oid = parent_table.relnamespace
+		JOIN LATERAL unnest(
+			constraint_state.conkey,
+			constraint_state.confkey
+		) WITH ORDINALITY AS key(
+			child_attnum,
+			parent_attnum,
+			ordinality
+		) ON TRUE
+		JOIN pg_attribute AS child_attribute
+		  ON child_attribute.attrelid = constraint_state.conrelid
+		 AND child_attribute.attnum = key.child_attnum
+		 AND NOT child_attribute.attisdropped
+		JOIN pg_attribute AS parent_attribute
+		  ON parent_attribute.attrelid = constraint_state.confrelid
+		 AND parent_attribute.attnum = key.parent_attnum
+		 AND NOT parent_attribute.attisdropped
+		WHERE child_namespace.oid =
+			to_regnamespace(CURRENT_SCHEMA())::oid
+		  AND child_table.relname = ?
 		  AND constraint_state.conname = ?
-	`, expected.table, expected.name).Scan(&rows).Error; err != nil {
+		ORDER BY key.ordinality
+	`, expected.table, expected.table, expected.name).Scan(&rows).Error; err != nil {
 		return false, false, fmt.Errorf(
 			"read PostgreSQL Project-scope foreign key %s: %w",
 			expected.name,
@@ -357,29 +426,39 @@ func postgresWebhookProjectScopeFKState(
 	if len(rows) == 0 {
 		return false, false, nil
 	}
-	if len(rows) != 1 {
+	if len(rows) != 2 {
 		return false, true, nil
 	}
-	row := rows[0]
-	want := "foreign key (organization_id, project_id) " +
-		"references projects(organization_id, id) " +
-		"on update restrict on delete restrict"
-	return row.Table == expected.table &&
-			row.Name == expected.name &&
-			row.Type == "f" &&
-			row.Validated &&
-			!row.Deferrable &&
-			!row.Deferred &&
-			canonicalForeignKeyDefinition(row.Definition) ==
-				canonicalForeignKeyDefinition(want),
-		true,
-		nil
-}
-
-func canonicalForeignKeyDefinition(value string) string {
-	value = strings.ToLower(value)
-	value = strings.ReplaceAll(value, `"`, "")
-	return strings.Join(strings.Fields(value), " ")
+	expectedChildColumns := []string{"organization_id", "project_id"}
+	expectedParentColumns := []string{"organization_id", "id"}
+	for index, row := range rows {
+		if row.ChildRelationOID == 0 ||
+			row.ParentRelationOID == 0 ||
+			row.ChildRelationOID != row.ExpectedChildOID ||
+			row.ParentRelationOID != row.ExpectedParentOID ||
+			row.ChildRelationOID == row.ParentRelationOID ||
+			row.ChildSchema != row.ParentSchema ||
+			row.ChildSchema == "" ||
+			row.ChildTable != expected.table ||
+			row.ParentTable != "projects" ||
+			row.Name != expected.name ||
+			row.Type != "f" ||
+			row.Ordinality != index+1 ||
+			row.ChildAttnum <= 0 ||
+			row.ParentAttnum <= 0 ||
+			row.ChildColumn != expectedChildColumns[index] ||
+			row.ParentColumn != expectedParentColumns[index] ||
+			row.UpdateAction != "r" ||
+			row.DeleteAction != "r" ||
+			row.MatchType != "s" ||
+			!row.Validated ||
+			row.Deferrable ||
+			row.Deferred ||
+			row.ParentConstraintOID != 0 {
+			return false, true, nil
+		}
+	}
+	return true, true, nil
 }
 
 func validateWebhookProjectScopeForeignKeyCatalog(db *gorm.DB) error {
@@ -503,12 +582,21 @@ func validateSQLiteWebhookProjectScopeFK(
 			err,
 		)
 	}
-	if countSQLiteNamedConstraint(
+	named, err := sqliteNamedProjectScopeForeignKey(
 		tableState.SQL,
 		expected.name,
-	) != 1 {
+	)
+	if err != nil {
 		return fmt.Errorf(
-			"SQLite Project-scope foreign key %s is missing or duplicated on %s",
+			"SQLite Project-scope foreign key %s is missing, duplicated, or malformed on %s: %w",
+			expected.name,
+			expected.table,
+			err,
+		)
+	}
+	if !named.isCanonicalProjectScopeFK() {
+		return fmt.Errorf(
+			"SQLite Project-scope foreign key %s is not the canonical FK group on %s",
 			expected.name,
 			expected.table,
 		)
@@ -516,25 +604,61 @@ func validateSQLiteWebhookProjectScopeFK(
 	return nil
 }
 
-func countSQLiteNamedConstraint(tableSQL, name string) int {
-	lower := strings.ToLower(tableSQL)
-	needle := strings.ToLower(name)
-	count := 0
-	for offset := 0; offset < len(lower); {
-		index := strings.Index(lower[offset:], needle)
-		if index < 0 {
-			break
-		}
-		index += offset
-		before := strings.LastIndex(lower[:index], "constraint")
-		if before >= 0 &&
-			strings.Trim(
-				lower[before+len("constraint"):index],
-				" \t\n\r`\"",
-			) == "" {
-			count++
-		}
-		offset = index + len(needle)
+func sqliteNamedProjectScopeForeignKey(
+	tableSQL string,
+	name string,
+) (sqliteParsedTableConstraint, error) {
+	constraints, err := sqliteNamedTableConstraints(tableSQL, name)
+	if err != nil {
+		return sqliteParsedTableConstraint{}, err
 	}
-	return count
+	if len(constraints) == 0 {
+		return sqliteParsedTableConstraint{}, fmt.Errorf(
+			"%w: %s",
+			errSQLiteNamedConstraintMissing,
+			name,
+		)
+	}
+	if len(constraints) != 1 {
+		return sqliteParsedTableConstraint{}, fmt.Errorf(
+			"SQLite named constraint %s is duplicated",
+			name,
+		)
+	}
+	if constraints[0].kind != sqliteTableConstraintForeignKey {
+		return sqliteParsedTableConstraint{}, fmt.Errorf(
+			"SQLite named constraint %s is not a FOREIGN KEY",
+			name,
+		)
+	}
+	return constraints[0], nil
+}
+
+func (constraint sqliteParsedTableConstraint) isCanonicalProjectScopeFK() bool {
+	return constraint.kind == sqliteTableConstraintForeignKey &&
+		equalFoldedIdentifiers(
+			constraint.childColumns,
+			[]string{"organization_id", "project_id"},
+		) &&
+		strings.EqualFold(constraint.parentTable, "projects") &&
+		equalFoldedIdentifiers(
+			constraint.parentColumns,
+			[]string{"organization_id", "id"},
+		) &&
+		constraint.onUpdate == "RESTRICT" &&
+		constraint.onDelete == "RESTRICT" &&
+		!constraint.deferrable &&
+		!constraint.initiallyDeferred
+}
+
+func equalFoldedIdentifiers(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if !strings.EqualFold(left[index], right[index]) {
+			return false
+		}
+	}
+	return true
 }

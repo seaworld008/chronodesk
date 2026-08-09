@@ -34,8 +34,9 @@ const (
 )
 
 type webhookCheckToken struct {
-	kind webhookCheckTokenKind
-	text string
+	kind   webhookCheckTokenKind
+	text   string
+	quoted bool
 }
 
 type webhookCheckNodeKind uint8
@@ -58,8 +59,9 @@ const (
 )
 
 type webhookCheckValue struct {
-	kind webhookCheckValueKind
-	text string
+	kind   webhookCheckValueKind
+	text   string
+	quoted bool
 }
 
 type webhookCheckNode struct {
@@ -221,8 +223,9 @@ func lexWebhookCheckExpression(
 				return nil, err
 			}
 			tokens = append(tokens, webhookCheckToken{
-				kind: webhookCheckTokenIdentifier,
-				text: strings.ToLower(value),
+				kind:   webhookCheckTokenIdentifier,
+				text:   value,
+				quoted: true,
 			})
 			index = next
 		default:
@@ -311,8 +314,7 @@ func isWebhookCheckIdentifierStart(value byte) bool {
 
 func isWebhookCheckIdentifierPart(value byte) bool {
 	return isWebhookCheckIdentifierStart(value) ||
-		value >= '0' && value <= '9' ||
-		value == '.'
+		value >= '0' && value <= '9'
 }
 
 func (parser *webhookCheckParser) parseOr() (*webhookCheckNode, error) {
@@ -469,8 +471,9 @@ func (parser *webhookCheckParser) parseValue() (webhookCheckValue, error) {
 		switch token.kind {
 		case webhookCheckTokenIdentifier:
 			value = webhookCheckValue{
-				kind: webhookCheckIdentifier,
-				text: token.text,
+				kind:   webhookCheckIdentifier,
+				text:   token.text,
+				quoted: token.quoted,
 			}
 		case webhookCheckTokenString:
 			value = webhookCheckValue{
@@ -681,6 +684,9 @@ func serializeWebhookCheckChildren(
 func serializeWebhookCheckValue(value webhookCheckValue) string {
 	switch value.kind {
 	case webhookCheckIdentifier:
+		if value.quoted && value.text != strings.ToLower(value.text) {
+			return "quoted-id:" + strconv.Quote(value.text)
+		}
 		return "id:" + value.text
 	case webhookCheckString:
 		return "str:" + strconv.Quote(value.text)
@@ -697,6 +703,25 @@ func matchingSQLParenthesis(value string, open int) (int, bool) {
 	}
 	depth := 0
 	for index := open; index < len(value); index++ {
+		if value[index] == '-' &&
+			index+1 < len(value) &&
+			value[index+1] == '-' {
+			index += 2
+			for index < len(value) && value[index] != '\n' {
+				index++
+			}
+			continue
+		}
+		if value[index] == '/' &&
+			index+1 < len(value) &&
+			value[index+1] == '*' {
+			close := strings.Index(value[index+2:], "*/")
+			if close < 0 {
+				return 0, false
+			}
+			index += close + 3
+			continue
+		}
 		switch value[index] {
 		case '\'':
 			next, ok := skipBalancedSQLQuote(value, index, '\'')

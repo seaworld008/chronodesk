@@ -33,17 +33,36 @@ func validateWebhookCredentialRuntimeSnapshot(
 		return errors.New("webhook credential lifetime database is required")
 	}
 	if db.Dialector.Name() == "sqlite" {
-		enabled, err := sqliteForeignKeysEnabled(db)
-		if err != nil {
-			return err
-		}
-		if !enabled {
-			return errors.New(
-				"SQLite foreign_keys runtime contract is disabled",
-			)
-		}
+		return withPinnedGORMConnection(
+			ctx,
+			db,
+			func(pinned *gorm.DB) error {
+				return validateWebhookCredentialRuntimeSnapshotPinned(
+					ctx,
+					pinned,
+				)
+			},
+		)
 	}
+	return validateWebhookCredentialRuntimeSnapshotPinned(ctx, db)
+}
+
+func validateWebhookCredentialRuntimeSnapshotPinned(
+	ctx context.Context,
+	db *gorm.DB,
+) error {
 	run := func(tx *gorm.DB) error {
+		if tx.Dialector.Name() == "sqlite" {
+			enabled, err := sqliteForeignKeysEnabled(tx)
+			if err != nil {
+				return err
+			}
+			if !enabled {
+				return errors.New(
+					"SQLite foreign_keys runtime contract is disabled",
+				)
+			}
+		}
 		var lastOrganizationID uint
 		var lastProjectID uint
 		for {
@@ -236,8 +255,11 @@ func validateWebhookCredentialSet(
 				CAST(event_id AS TEXT) AS related_id
 			FROM scoped_snapshots
 			WHERE NOT (%s)
+			   OR id IS NULL
 			   OR organization_id = 0
+			   OR organization_id IS NULL
 			   OR project_id = 0
+			   OR project_id IS NULL
 			   OR event_id IS NULL
 			   OR event_id = ''
 			   OR NOT (%s)
@@ -268,11 +290,17 @@ func validateWebhookCredentialSet(
 				CAST(event_id AS TEXT)
 			FROM %s
 			WHERE NOT (%s)
+			   OR id IS NULL
 			   OR organization_id = 0
+			   OR organization_id IS NULL
 			   OR project_id = 0
+			   OR project_id IS NULL
 			   OR event_id IS NULL
 			   OR event_id = ''
 			   OR NOT (%s)
+			   OR destination_type IS NULL
+			   OR destination_id IS NULL
+			   OR status IS NULL
 			   OR status NOT IN (%s)
 			   OR ((status = 'expired') <> (expired_at IS NOT NULL))
 			   OR (
@@ -425,11 +453,15 @@ func webhookCredentialUUIDShapeSQL(
 	}
 	return "length(" + column + ") = 36" +
 		" AND lower(" + column + ") = " + column +
+		" AND substr(" + column + ", 1, 8) NOT GLOB '*[^0-9a-f]*'" +
 		" AND substr(" + column + ", 9, 1) = '-'" +
+		" AND substr(" + column + ", 10, 4) NOT GLOB '*[^0-9a-f]*'" +
 		" AND substr(" + column + ", 14, 1) = '-'" +
+		" AND substr(" + column + ", 15, 4) NOT GLOB '*[^0-9a-f]*'" +
 		" AND substr(" + column + ", 19, 1) = '-'" +
+		" AND substr(" + column + ", 20, 4) NOT GLOB '*[^0-9a-f]*'" +
 		" AND substr(" + column + ", 24, 1) = '-'" +
-		" AND " + column + " NOT GLOB '*[^0-9a-f-]*'" +
+		" AND substr(" + column + ", 25, 12) NOT GLOB '*[^0-9a-f]*'" +
 		" AND " + version
 }
 

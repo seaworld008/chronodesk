@@ -315,7 +315,7 @@ type OutboxDelivery struct {
 	Event           *DomainEvent         `json:"event,omitempty" gorm:"foreignKey:EventID"`
 	DestinationType string               `json:"destination_type" gorm:"size:50;not null;uniqueIndex:idx_event_destination,priority:2;index"`
 	DestinationID   string               `json:"destination_id" gorm:"size:128;not null;uniqueIndex:idx_event_destination,priority:3;index"`
-	Status          OutboxDeliveryStatus `json:"status" gorm:"size:20;not null;default:'pending';index;check:chk_outbox_delivery_status,status = 'pending' OR status = 'processing' OR status = 'succeeded' OR status = 'failed' OR status = 'dead' OR status = 'expired'"`
+	Status          OutboxDeliveryStatus `json:"status" gorm:"size:20;not null;default:'pending';index;check:chk_outbox_delivery_status,status IS NOT NULL AND (status = 'pending' OR status = 'processing' OR status = 'succeeded' OR status = 'failed' OR status = 'dead' OR status = 'expired')"`
 	Attempts        int                  `json:"attempts" gorm:"not null;default:0"`
 	MaxAttempts     int                  `json:"max_attempts" gorm:"not null;default:8"`
 	NextAttemptAt   time.Time            `json:"next_attempt_at" gorm:"not null;index"`

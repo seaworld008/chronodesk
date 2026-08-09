@@ -5,10 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -58,7 +56,7 @@ var webhookCredentialConstraintDefinitions = map[string]struct {
 	},
 	"chk_outbox_delivery_status": {
 		table: "outbox_deliveries",
-		expression: closedVocabularyConstraintExpression(
+		expression: requiredClosedVocabularyConstraintExpression(
 			"status",
 			models.OutboxDeliveryStatusValues(),
 		),
@@ -112,43 +110,6 @@ var webhookCredentialIndexDefinitions = []automationWebhookIndexDefinition{
 			{name: "expires_at"},
 		},
 	},
-}
-
-type webhookCredentialSnapshotRow struct {
-	ID                    string     `gorm:"column:id"`
-	CreatedAt             time.Time  `gorm:"column:created_at"`
-	OrganizationID        uint       `gorm:"column:organization_id"`
-	ProjectID             uint       `gorm:"column:project_id"`
-	EventID               string     `gorm:"column:event_id"`
-	Secret                string     `gorm:"column:secret"`
-	PreviousSecret        string     `gorm:"column:previous_secret"`
-	AccessToken           string     `gorm:"column:access_token"`
-	CredentialExpiresAt   *time.Time `gorm:"column:credential_expires_at"`
-	CredentialShreddedAt  *time.Time `gorm:"column:credential_shredded_at"`
-	CredentialShredReason *string    `gorm:"column:credential_shred_reason"`
-}
-
-type webhookCredentialDeliveryRow struct {
-	ID              string                      `gorm:"column:id"`
-	OrganizationID  uint                        `gorm:"column:organization_id"`
-	ProjectID       uint                        `gorm:"column:project_id"`
-	EventID         string                      `gorm:"column:event_id"`
-	DestinationType string                      `gorm:"column:destination_type"`
-	DestinationID   string                      `gorm:"column:destination_id"`
-	Status          models.OutboxDeliveryStatus `gorm:"column:status"`
-	ExpiresAt       *time.Time                  `gorm:"column:expires_at"`
-	ExpiredAt       *time.Time                  `gorm:"column:expired_at"`
-}
-
-type webhookCredentialEventRow struct {
-	ID             string `gorm:"column:id"`
-	OrganizationID uint   `gorm:"column:organization_id"`
-	ProjectID      uint   `gorm:"column:project_id"`
-}
-
-type webhookCredentialPair struct {
-	snapshot webhookCredentialSnapshotRow
-	delivery webhookCredentialDeliveryRow
 }
 
 // PrepareWebhookSnapshotCredentialLifetimeContract is retained for callers
@@ -575,6 +536,26 @@ func migrateWebhookSnapshotCredentialLifetimeContractAt(
 			"SQLite webhook credential cutover requires a top-level database handle",
 		)
 	}
+	ctx := db.Statement.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return withPinnedGORMConnection(
+		ctx,
+		db,
+		func(pinned *gorm.DB) error {
+			return migrateSQLiteWebhookSnapshotCredentialLifetimeContractAt(
+				pinned,
+				cutoverAt,
+			)
+		},
+	)
+}
+
+func migrateSQLiteWebhookSnapshotCredentialLifetimeContractAt(
+	db *gorm.DB,
+	cutoverAt time.Time,
+) error {
 	enabled, err := sqliteForeignKeysEnabled(db)
 	if err != nil {
 		return err
@@ -584,20 +565,55 @@ func migrateWebhookSnapshotCredentialLifetimeContractAt(
 			"SQLite foreign_keys must be enabled before webhook credential cutover",
 		)
 	}
-	if err := db.Exec("PRAGMA foreign_keys = OFF").Error; err != nil {
-		return fmt.Errorf(
-			"disable SQLite foreign keys for webhook credential cutover: %w",
-			err,
-		)
-	}
-	cutoverErr := db.Transaction(func(tx *gorm.DB) error {
-		return runWebhookSnapshotCredentialLifetimeCutover(tx, cutoverAt)
+	cutoverErr := func() error {
+		if err := db.Exec("PRAGMA foreign_keys = OFF").Error; err != nil {
+			return fmt.Errorf(
+				"disable SQLite foreign keys for webhook credential cutover: %w",
+				err,
+			)
+		}
+		disabled, err := sqliteForeignKeysEnabled(db)
+		if err != nil {
+			return err
+		}
+		if disabled {
+			return errors.New(
+				"SQLite foreign_keys remained enabled for webhook credential cutover",
+			)
+		}
+		return db.Transaction(func(tx *gorm.DB) error {
+			return runWebhookSnapshotCredentialLifetimeCutover(
+				tx,
+				cutoverAt,
+			)
+		})
+	}()
+	cleanupCtx, cancel := context.WithTimeout(
+		context.Background(),
+		chronodeskMigrationCleanupTimeout,
+	)
+	defer cancel()
+	cleanupDB := db.Session(&gorm.Session{
+		NewDB:   true,
+		Context: cleanupCtx,
 	})
-	restoreErr := db.Exec("PRAGMA foreign_keys = ON").Error
+	restoreErr := cleanupDB.Exec("PRAGMA foreign_keys = ON").Error
+	if restoreErr == nil {
+		var restored bool
+		restored, restoreErr = sqliteForeignKeysEnabled(cleanupDB)
+		if restoreErr == nil && !restored {
+			restoreErr = errors.New(
+				"SQLite foreign_keys remained disabled after webhook credential cutover",
+			)
+		}
+	}
 	if restoreErr != nil {
-		restoreErr = fmt.Errorf(
-			"restore SQLite foreign keys after webhook credential cutover: %w",
-			restoreErr,
+		restoreErr = errors.Join(
+			fmt.Errorf(
+				"restore SQLite foreign keys after webhook credential cutover: %w",
+				restoreErr,
+			),
+			discardPinnedGORMConnection(db),
 		)
 	}
 	if err := errors.Join(cutoverErr, restoreErr); err != nil {
@@ -607,7 +623,7 @@ func migrateWebhookSnapshotCredentialLifetimeContractAt(
 		Table string `gorm:"column:table"`
 		RowID int64  `gorm:"column:rowid"`
 	}
-	if err := db.Raw("PRAGMA foreign_key_check").
+	if err := cleanupDB.Raw("PRAGMA foreign_key_check").
 		Scan(&violations).Error; err != nil {
 		return fmt.Errorf("run SQLite foreign key check: %w", err)
 	}
@@ -617,7 +633,7 @@ func migrateWebhookSnapshotCredentialLifetimeContractAt(
 			len(violations),
 		)
 	}
-	return validateWebhookCredentialLifetimeCatalog(db)
+	return validateWebhookCredentialLifetimeCatalog(cleanupDB)
 }
 
 func createWebhookCredentialIndexes(db *gorm.DB) error {
@@ -675,7 +691,7 @@ func installPostgresWebhookCredentialConstraints(db *gorm.DB) error {
 			if err := db.Exec(
 				"ALTER TABLE " + definition.table +
 					" ADD CONSTRAINT " + name +
-					" CHECK (" + definition.expression + ")",
+					" CHECK (" + definition.expression + ") NOT VALID",
 			).Error; err != nil {
 				return fmt.Errorf(
 					"install PostgreSQL webhook credential constraint %s: %w",
@@ -683,6 +699,16 @@ func installPostgresWebhookCredentialConstraints(db *gorm.DB) error {
 					err,
 				)
 			}
+		}
+		if err := db.Exec(
+			"ALTER TABLE " + definition.table +
+				" VALIDATE CONSTRAINT " + name,
+		).Error; err != nil {
+			return fmt.Errorf(
+				"validate PostgreSQL webhook credential constraint %s: %w",
+				name,
+				err,
+			)
 		}
 	}
 	return nil
@@ -896,15 +922,16 @@ func validateSQLiteWebhookCredentialCatalog(db *gorm.DB) error {
 		tableSQL[row.Name] = row.SQL
 	}
 	for name, expected := range webhookCredentialConstraintDefinitions {
-		rawExpression, exists := sqliteWebhookConstraintExpression(
+		rawExpression, err := sqliteNamedCheckConstraintExpression(
 			tableSQL[expected.table],
 			name,
 		)
-		if !exists {
+		if err != nil {
 			return fmt.Errorf(
-				"SQLite webhook credential constraint %s is missing or duplicated in %q",
+				"SQLite webhook credential constraint %s is invalid in %q: %w",
 				name,
 				tableSQL[expected.table],
+				err,
 			)
 		}
 		actualExpression, err := canonicalWebhookConstraintDefinition(
@@ -937,51 +964,6 @@ func validateSQLiteWebhookCredentialCatalog(db *gorm.DB) error {
 		}
 	}
 	return nil
-}
-
-func sqliteWebhookConstraintExpression(
-	tableSQL string,
-	name string,
-) (string, bool) {
-	lowerSQL := strings.ToLower(tableSQL)
-	start := strings.Index(lowerSQL, strings.ToLower(name))
-	if start < 0 {
-		return "", false
-	}
-	constraintOffset := strings.LastIndex(
-		lowerSQL[:start],
-		"constraint",
-	)
-	if constraintOffset < 0 {
-		return "", false
-	}
-	if strings.Trim(
-		lowerSQL[constraintOffset+len("constraint"):start],
-		" \t\n\r`\"",
-	) != "" {
-		return "", false
-	}
-	valueStart := start + len(name)
-	checkOffset := strings.Index(
-		lowerSQL[valueStart:],
-		"check",
-	)
-	if checkOffset < 0 {
-		return "", false
-	}
-	openOffset := strings.Index(
-		lowerSQL[valueStart+checkOffset+len("check"):],
-		"(",
-	)
-	if openOffset < 0 {
-		return "", false
-	}
-	open := valueStart + checkOffset + len("check") + openOffset
-	close, ok := matchingSQLParenthesis(tableSQL, open)
-	if !ok {
-		return "", false
-	}
-	return tableSQL[open+1 : close], true
 }
 
 func webhookCredentialConstraintNames() []string {
@@ -1017,322 +999,4 @@ func ValidateWebhookSnapshotCredentialLifetimeRuntimeData(
 	db *gorm.DB,
 ) error {
 	return validateWebhookCredentialRuntimeSnapshot(ctx, db)
-}
-
-func loadAndValidateWebhookCredentialPairs(
-	db *gorm.DB,
-	requireDeadlines bool,
-	expectedScope *models.ProjectScope,
-) ([]webhookCredentialPair, error) {
-	snapshotQuery := db.Table("webhook_delivery_snapshots").
-		Select(
-			"id, created_at, organization_id, project_id, event_id, " +
-				"secret, previous_secret, access_token, " +
-				"credential_expires_at, credential_shredded_at, " +
-				"credential_shred_reason",
-		)
-	deliveryQuery := db.Table("outbox_deliveries").
-		Select(
-			"id, organization_id, project_id, event_id, destination_type, " +
-				"destination_id, status, expires_at, expired_at",
-		)
-	if expectedScope != nil {
-		snapshotQuery = snapshotQuery.Where(
-			"organization_id = ? AND project_id = ?",
-			expectedScope.OrganizationID,
-			expectedScope.ProjectID,
-		)
-		deliveryQuery = deliveryQuery.Where(
-			"organization_id = ? AND project_id = ?",
-			expectedScope.OrganizationID,
-			expectedScope.ProjectID,
-		)
-	}
-	var snapshots []webhookCredentialSnapshotRow
-	if err := snapshotQuery.Order("id ASC").Scan(&snapshots).Error; err != nil {
-		return nil, fmt.Errorf(
-			"load webhook credential snapshots: %w",
-			err,
-		)
-	}
-	var deliveries []webhookCredentialDeliveryRow
-	if err := deliveryQuery.Order("id ASC").Scan(&deliveries).Error; err != nil {
-		return nil, fmt.Errorf(
-			"load webhook credential Outbox deliveries: %w",
-			err,
-		)
-	}
-
-	eventIDs := make([]string, 0, len(snapshots)+len(deliveries))
-	seenEventIDs := make(map[string]struct{}, cap(eventIDs))
-	addEventID := func(eventID string) {
-		if _, exists := seenEventIDs[eventID]; exists {
-			return
-		}
-		seenEventIDs[eventID] = struct{}{}
-		eventIDs = append(eventIDs, eventID)
-	}
-	for _, snapshot := range snapshots {
-		addEventID(snapshot.EventID)
-	}
-	for _, delivery := range deliveries {
-		if delivery.DestinationType == "webhook" {
-			addEventID(delivery.EventID)
-		}
-	}
-	var events []webhookCredentialEventRow
-	if len(eventIDs) > 0 {
-		eventQuery := db.Table("domain_events").
-			Select("id, organization_id, project_id").
-			Where("id IN ?", eventIDs)
-		if expectedScope != nil {
-			eventQuery = eventQuery.Where(
-				"organization_id = ? AND project_id = ?",
-				expectedScope.OrganizationID,
-				expectedScope.ProjectID,
-			)
-		}
-		if err := eventQuery.Order("id ASC").Scan(&events).Error; err != nil {
-			return nil, fmt.Errorf(
-				"load webhook credential DomainEvents: %w",
-				err,
-			)
-		}
-	}
-	eventByID := make(map[string]webhookCredentialEventRow, len(events))
-	for _, event := range events {
-		if _, err := parseCanonicalUUID(event.ID, "DomainEvent"); err != nil {
-			return nil, err
-		}
-		eventByID[event.ID] = event
-	}
-
-	snapshotByID := make(
-		map[string]webhookCredentialSnapshotRow,
-		len(snapshots),
-	)
-	for _, snapshot := range snapshots {
-		if _, err := models.ParseWebhookDeliverySnapshotID(
-			snapshot.ID,
-		); err != nil {
-			return nil, err
-		}
-		if snapshot.OrganizationID == 0 ||
-			snapshot.ProjectID == 0 ||
-			strings.TrimSpace(snapshot.EventID) == "" {
-			return nil, fmt.Errorf(
-				"webhook snapshot %s has invalid project scope or event",
-				snapshot.ID,
-			)
-		}
-		event, exists := eventByID[snapshot.EventID]
-		if !exists {
-			return nil, fmt.Errorf(
-				"webhook snapshot %s is missing DomainEvent %s",
-				snapshot.ID,
-				snapshot.EventID,
-			)
-		}
-		if event.OrganizationID != snapshot.OrganizationID ||
-			event.ProjectID != snapshot.ProjectID {
-			return nil, fmt.Errorf(
-				"webhook snapshot %s scope does not match DomainEvent %s",
-				snapshot.ID,
-				snapshot.EventID,
-			)
-		}
-		if requireDeadlines && snapshot.CredentialExpiresAt == nil {
-			return nil, fmt.Errorf(
-				"webhook snapshot %s credential deadline is missing",
-				snapshot.ID,
-			)
-		}
-		if err := validateWebhookCredentialShredRow(snapshot); err != nil {
-			return nil, err
-		}
-		if _, exists := snapshotByID[snapshot.ID]; exists {
-			return nil, fmt.Errorf(
-				"duplicate webhook snapshot %s",
-				snapshot.ID,
-			)
-		}
-		snapshotByID[snapshot.ID] = snapshot
-	}
-
-	deliveryBySnapshot := make(map[string]webhookCredentialDeliveryRow)
-	for _, delivery := range deliveries {
-		if _, err := parseCanonicalUUID(delivery.ID, "Outbox delivery"); err != nil {
-			return nil, err
-		}
-		if !delivery.Status.IsValid() {
-			return nil, fmt.Errorf(
-				"Outbox delivery %s has invalid status %q",
-				delivery.ID,
-				delivery.Status,
-			)
-		}
-		isExpired := delivery.Status == models.OutboxDeliveryExpired
-		if isExpired != (delivery.ExpiredAt != nil) {
-			return nil, fmt.Errorf(
-				"Outbox delivery %s expired status and timestamp disagree",
-				delivery.ID,
-			)
-		}
-		if delivery.DestinationType != "webhook" {
-			if isExpired {
-				return nil, fmt.Errorf(
-					"non-webhook Outbox delivery %s has expired status",
-					delivery.ID,
-				)
-			}
-			continue
-		}
-		if delivery.OrganizationID == 0 ||
-			delivery.ProjectID == 0 ||
-			strings.TrimSpace(delivery.EventID) == "" {
-			return nil, fmt.Errorf(
-				"webhook Outbox delivery %s has invalid project scope or event",
-				delivery.ID,
-			)
-		}
-		event, exists := eventByID[delivery.EventID]
-		if !exists {
-			return nil, fmt.Errorf(
-				"webhook Outbox delivery %s is missing DomainEvent %s",
-				delivery.ID,
-				delivery.EventID,
-			)
-		}
-		if event.OrganizationID != delivery.OrganizationID ||
-			event.ProjectID != delivery.ProjectID {
-			return nil, fmt.Errorf(
-				"webhook Outbox delivery %s scope does not match DomainEvent %s",
-				delivery.ID,
-				delivery.EventID,
-			)
-		}
-		snapshotID, err :=
-			models.ParseWebhookDeliverySnapshotDestinationID(
-				delivery.DestinationID,
-			)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"malformed webhook delivery %s destination: %w",
-				delivery.ID,
-				err,
-			)
-		}
-		snapshot, exists := snapshotByID[snapshotID]
-		if !exists {
-			return nil, fmt.Errorf(
-				"webhook delivery %s is missing snapshot %s",
-				delivery.ID,
-				snapshotID,
-			)
-		}
-		if _, duplicate := deliveryBySnapshot[snapshotID]; duplicate {
-			return nil, fmt.Errorf(
-				"duplicate webhook delivery for snapshot %s",
-				snapshotID,
-			)
-		}
-		if delivery.EventID != snapshot.EventID {
-			return nil, fmt.Errorf(
-				"webhook delivery %s event does not match snapshot %s",
-				delivery.ID,
-				snapshotID,
-			)
-		}
-		if delivery.OrganizationID != snapshot.OrganizationID ||
-			delivery.ProjectID != snapshot.ProjectID {
-			return nil, fmt.Errorf(
-				"webhook delivery %s scope does not match snapshot %s",
-				delivery.ID,
-				snapshotID,
-			)
-		}
-		if requireDeadlines {
-			if delivery.ExpiresAt == nil ||
-				snapshot.CredentialExpiresAt == nil {
-				return nil, fmt.Errorf(
-					"webhook delivery %s deadline is missing",
-					delivery.ID,
-				)
-			}
-			if !delivery.ExpiresAt.Equal(
-				*snapshot.CredentialExpiresAt,
-			) {
-				return nil, fmt.Errorf(
-					"webhook delivery %s deadline does not match snapshot %s",
-					delivery.ID,
-					snapshotID,
-				)
-			}
-		}
-		deliveryBySnapshot[snapshotID] = delivery
-	}
-
-	pairs := make([]webhookCredentialPair, 0, len(snapshots))
-	for _, snapshot := range snapshots {
-		delivery, exists := deliveryBySnapshot[snapshot.ID]
-		if !exists {
-			return nil, fmt.Errorf(
-				"webhook snapshot %s is missing its delivery",
-				snapshot.ID,
-			)
-		}
-		pairs = append(pairs, webhookCredentialPair{
-			snapshot: snapshot,
-			delivery: delivery,
-		})
-	}
-	return pairs, nil
-}
-
-func validateWebhookCredentialShredRow(
-	snapshot webhookCredentialSnapshotRow,
-) error {
-	hasTimestamp := snapshot.CredentialShreddedAt != nil
-	hasReason := snapshot.CredentialShredReason != nil
-	if hasTimestamp != hasReason {
-		return fmt.Errorf(
-			"webhook snapshot %s shred timestamp and reason disagree",
-			snapshot.ID,
-		)
-	}
-	if !hasReason {
-		return nil
-	}
-	reason := models.WebhookCredentialShredReason(
-		*snapshot.CredentialShredReason,
-	)
-	if !reason.IsValid() {
-		return fmt.Errorf(
-			"webhook snapshot %s has invalid shred reason %q",
-			snapshot.ID,
-			reason,
-		)
-	}
-	if snapshot.Secret != "" ||
-		snapshot.PreviousSecret != "" ||
-		snapshot.AccessToken != "" {
-		return fmt.Errorf(
-			"webhook snapshot %s retains a credential envelope after shredding",
-			snapshot.ID,
-		)
-	}
-	return nil
-}
-
-func parseCanonicalUUID(value, label string) (string, error) {
-	parsed, err := uuid.Parse(value)
-	if err != nil ||
-		parsed.String() != value {
-		return "", fmt.Errorf(
-			"%s id %q must be a canonical lowercase UUID",
-			label,
-			value,
-		)
-	}
-	return value, nil
 }

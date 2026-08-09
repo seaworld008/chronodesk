@@ -2764,6 +2764,41 @@ func (s *AgentNativeService) appendDomainEventTxAt(
 	if event.ResourceVersion == 0 {
 		event.ResourceVersion = 1
 	}
+	if len(targets) == 0 {
+		targets = s.defaultOutboxTargets
+	}
+	normalizedTargets := make([]OutboxTarget, len(targets))
+	for index, target := range targets {
+		if strings.TrimSpace(target.Type) == "" ||
+			strings.TrimSpace(target.ID) == "" {
+			return nil, fmt.Errorf("outbox target type and id are required")
+		}
+		if target.MaxAttempts <= 0 {
+			target.MaxAttempts = 8
+		}
+		normalizedTargets[index] = target
+	}
+	targets = normalizedTargets
+	if input.Actor.Type == models.ActorTypeServicePrincipal &&
+		!input.AllowExternalNotifications {
+		filtered := make([]OutboxTarget, 0, len(targets))
+		for _, target := range targets {
+			if target.Type != "webhook" {
+				filtered = append(filtered, target)
+			}
+		}
+		targets = filtered
+	}
+	targets, err = s.freezeWebhookOutboxTargetsTx(
+		ctx,
+		tx,
+		event,
+		targets,
+		txNow,
+	)
+	if err != nil {
+		return nil, err
+	}
 	if err := tx.WithContext(ctx).Create(event).Error; err != nil {
 		return nil, fmt.Errorf("create domain event: %w", err)
 	}
@@ -2798,39 +2833,6 @@ func (s *AgentNativeService) appendDomainEventTxAt(
 				err,
 			)
 		}
-	}
-	if len(targets) == 0 {
-		targets = s.defaultOutboxTargets
-	}
-	normalizedTargets := make([]OutboxTarget, len(targets))
-	for index, target := range targets {
-		if strings.TrimSpace(target.Type) == "" || strings.TrimSpace(target.ID) == "" {
-			return nil, fmt.Errorf("outbox target type and id are required")
-		}
-		if target.MaxAttempts <= 0 {
-			target.MaxAttempts = 8
-		}
-		normalizedTargets[index] = target
-	}
-	targets = normalizedTargets
-	if input.Actor.Type == models.ActorTypeServicePrincipal && !input.AllowExternalNotifications {
-		filtered := make([]OutboxTarget, 0, len(targets))
-		for _, target := range targets {
-			if target.Type != "webhook" {
-				filtered = append(filtered, target)
-			}
-		}
-		targets = filtered
-	}
-	targets, err = s.freezeWebhookOutboxTargetsTx(
-		ctx,
-		tx,
-		event,
-		targets,
-		txNow,
-	)
-	if err != nil {
-		return nil, err
 	}
 	snapshots := make([]*models.WebhookDeliverySnapshot, 0)
 	for _, target := range targets {

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -165,6 +166,7 @@ func TestWebhookTestCommandUnderNonOwnerPostgresForceRLS(t *testing.T) {
 		Secret:         "sealed-force-rls-envelope",
 		EnabledEventsObj: []models.WebhookEventType{
 			models.WebhookEventSystemAlert,
+			models.WebhookEventTicketCreated,
 		},
 		RetryCount: 2,
 		CreatedBy:  user.ID,
@@ -272,6 +274,9 @@ func TestWebhookTestCommandUnderNonOwnerPostgresForceRLS(t *testing.T) {
 
 	runtimeURL := adminScopedURL
 	runtimeURL.User = url.UserPassword(roleName, rolePassword)
+	runtimeQuery := runtimeURL.Query()
+	runtimeQuery.Set("application_name", "chronodesk_task9a_human")
+	runtimeURL.RawQuery = runtimeQuery.Encode()
 	runtimeDB, err := gorm.Open(
 		postgres.Open(runtimeURL.String()),
 		silentConfig,
@@ -284,6 +289,9 @@ func TestWebhookTestCommandUnderNonOwnerPostgresForceRLS(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtimeSQL = runtimeDBSQL
+	runtimeDBSQL.SetMaxOpenConns(1)
+	runtimeDBSQL.SetMaxIdleConns(1)
+	scopeddb.Install(runtimeDB)
 	assertWebhookPostgresRuntimeRole(t, runtimeDB, roleName)
 
 	var unscopedConfigs int64
@@ -365,6 +373,280 @@ func TestWebhookTestCommandUnderNonOwnerPostgresForceRLS(t *testing.T) {
 		config,
 	)
 
+	humanConfigLocked := make(chan struct{})
+	releaseHumanConfig := make(chan struct{})
+	var humanBarrierOnce sync.Once
+	const lockOrderCallback = "test:webhook_human_config_audit_lock_order"
+	if err := runtimeDB.Callback().Query().After("gorm:query").Register(
+		lockOrderCallback,
+		func(tx *gorm.DB) {
+			if tx.Statement == nil ||
+				tx.Statement.Table != "webhook_configs" {
+				return
+			}
+			operation, operationErr := OperationContextFromContext(
+				tx.Statement.Context,
+			)
+			if operationErr != nil ||
+				operation.Source != SourceProtocolHumanREST {
+				return
+			}
+			humanBarrierOnce.Do(func() {
+				close(humanConfigLocked)
+				<-releaseHumanConfig
+			})
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = runtimeDB.Callback().Query().Remove(lockOrderCallback)
+	})
+
+	humanDone := make(chan error, 1)
+	go func() {
+		_, humanErr := notificationService.TestWebhook(
+			commandContext,
+			project.Scope(),
+			config.ID,
+		)
+		humanDone <- humanErr
+	}()
+	select {
+	case <-humanConfigLocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Human Webhook test did not acquire its config UPDATE lock")
+	}
+
+	ordinaryURL := runtimeURL
+	ordinaryQuery := ordinaryURL.Query()
+	ordinaryQuery.Set(
+		"application_name",
+		"chronodesk_task9a_ordinary",
+	)
+	ordinaryURL.RawQuery = ordinaryQuery.Encode()
+	ordinaryDB, err := gorm.Open(
+		postgres.Open(ordinaryURL.String()),
+		silentConfig,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinarySQL, err := ordinaryDB.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinarySQL.SetMaxOpenConns(1)
+	ordinarySQL.SetMaxIdleConns(1)
+	t.Cleanup(func() { _ = ordinarySQL.Close() })
+	scopeddb.Install(ordinaryDB)
+	ordinaryAudit, err := NewAuditLedgerService(ordinaryDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinaryNative := NewAgentNativeService(
+		ordinaryDB,
+		AgentNativeOptions{
+			AuditLedger: ordinaryAudit,
+			DefaultOutboxTargets: []OutboxTarget{{
+				Type: "webhook",
+				ID:   webhookConfiguredDestinationID,
+			}},
+		},
+	)
+	ordinaryActor := models.SystemActor("webhook-lock-order")
+	ordinaryContext, err := WithOperationContext(
+		context.Background(),
+		OperationContext{
+			Scope:  project.Scope(),
+			Actor:  ordinaryActor,
+			Source: SourceProtocolWorker,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinaryDone := make(chan error, 1)
+	var ordinaryEventCreated atomic.Bool
+	var ordinaryAuditHeadLocked atomic.Bool
+	const ordinaryEventCreateCallback = "test:webhook_ordinary_event_create_order"
+	if err := ordinaryDB.Callback().Create().Before("gorm:create").Register(
+		ordinaryEventCreateCallback,
+		func(tx *gorm.DB) {
+			if tx.Statement != nil &&
+				tx.Statement.Table == "domain_events" {
+				ordinaryEventCreated.Store(true)
+			}
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	const ordinaryAuditQueryCallback = "test:webhook_ordinary_audit_query_order"
+	if err := ordinaryDB.Callback().Query().Before("gorm:query").Register(
+		ordinaryAuditQueryCallback,
+		func(tx *gorm.DB) {
+			if tx.Statement != nil &&
+				tx.Statement.Table == "audit_chain_heads" {
+				ordinaryAuditHeadLocked.Store(true)
+			}
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = ordinaryDB.Callback().Create().Remove(
+			ordinaryEventCreateCallback,
+		)
+		_ = ordinaryDB.Callback().Query().Remove(
+			ordinaryAuditQueryCallback,
+		)
+	})
+	go func() {
+		ordinaryErr := scopeddb.WithProjectScopeContextTransaction(
+			ordinaryContext,
+			ordinaryDB,
+			project.Scope(),
+			func(scopedContext context.Context) error {
+				return transactionForContext(
+					scopedContext,
+					ordinaryDB,
+					func(tx *gorm.DB) error {
+						_, appendErr := ordinaryNative.AppendDomainEventTx(
+							scopedContext,
+							tx,
+							DomainEventInput{
+								Type:            "io.chronodesk.ticket.created.v1",
+								Subject:         "ticket/lock-order",
+								Actor:           ordinaryActor,
+								ResourceVersion: 1,
+								Data:            map[string]any{"ticket_id": 909},
+								Scope:           project.Scope(),
+							},
+							nil,
+						)
+						return appendErr
+					},
+				)
+			},
+		)
+		ordinaryDone <- ordinaryErr
+	}()
+	waitDeadline := time.Now().Add(3 * time.Second)
+	waitingOnConfig := false
+	for time.Now().Before(waitDeadline) {
+		var waitCount int64
+		if err := admin.Raw(`
+			SELECT COUNT(*)
+			FROM pg_stat_activity
+			WHERE application_name = 'chronodesk_task9a_ordinary'
+			  AND wait_event_type = 'Lock'
+			  AND query LIKE '%webhook_configs%'
+		`).Scan(&waitCount).Error; err != nil {
+			t.Fatal(err)
+		}
+		if waitCount == 1 {
+			waitingOnConfig = true
+			break
+		}
+		select {
+		case ordinaryErr := <-ordinaryDone:
+			t.Fatalf(
+				"ordinary configured fan-out ended before config wait: %v",
+				ordinaryErr,
+			)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !waitingOnConfig {
+		t.Fatal(
+			"ordinary configured fan-out was not observed waiting on webhook_configs",
+		)
+	}
+	if ordinaryEventCreated.Load() || ordinaryAuditHeadLocked.Load() {
+		t.Fatalf(
+			"ordinary fan-out wrote DomainEvent=%v or reached audit head=%v before config lock",
+			ordinaryEventCreated.Load(),
+			ordinaryAuditHeadLocked.Load(),
+		)
+	}
+	close(releaseHumanConfig)
+
+	var humanErr, ordinaryErr error
+	select {
+	case humanErr = <-humanDone:
+	case <-time.After(5 * time.Second):
+		humanErr = errors.New(
+			"Human Webhook test did not finish; possible database deadlock",
+		)
+	}
+	select {
+	case ordinaryErr = <-ordinaryDone:
+	case <-time.After(5 * time.Second):
+		ordinaryErr = errors.New(
+			"ordinary configured event did not finish; possible database deadlock",
+		)
+	}
+	if humanErr != nil || ordinaryErr != nil {
+		t.Fatalf(
+			"lock-order barrier Human error=%v ordinary error=%v",
+			humanErr,
+			ordinaryErr,
+		)
+	}
+
+	var durableCounts struct {
+		Events     int64
+		Ledger     int64
+		Deliveries int64
+		Snapshots  int64
+		Sequence   uint64
+	}
+	if err := scopeddb.WithProjectScopeContextTransaction(
+		commandContext,
+		runtimeDB,
+		project.Scope(),
+		func(scopedContext context.Context) error {
+			scoped := runtimeDB.WithContext(scopedContext)
+			if err := scoped.Model(&models.DomainEvent{}).
+				Count(&durableCounts.Events).Error; err != nil {
+				return err
+			}
+			if err := scoped.Model(&models.AuditLedgerEntry{}).
+				Count(&durableCounts.Ledger).Error; err != nil {
+				return err
+			}
+			if err := scoped.Model(&models.OutboxDelivery{}).
+				Count(&durableCounts.Deliveries).Error; err != nil {
+				return err
+			}
+			if err := scoped.Model(&models.WebhookDeliverySnapshot{}).
+				Count(&durableCounts.Snapshots).Error; err != nil {
+				return err
+			}
+			return scoped.Model(&models.AuditChainHead{}).
+				Select("last_sequence").
+				Where(
+					"organization_id = ? AND project_id = ?",
+					project.OrganizationID,
+					project.ID,
+				).
+				Scan(&durableCounts.Sequence).Error
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if durableCounts.Events != 3 ||
+		durableCounts.Ledger != 3 ||
+		durableCounts.Deliveries != 3 ||
+		durableCounts.Snapshots != 3 ||
+		durableCounts.Sequence != 3 {
+		t.Fatalf(
+			"lock-order durable counts = %+v, want three complete intents",
+			durableCounts,
+		)
+	}
+
 	if err := adminScoped.Model(&models.ProjectMembership{}).
 		Where("id = ?", membership.ID).
 		Update("is_active", false).Error; err != nil {
@@ -399,7 +681,7 @@ func TestWebhookTestCommandUnderNonOwnerPostgresForceRLS(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if deliveryCount != 1 {
+	if deliveryCount != 3 {
 		t.Fatalf(
 			"revoked PostgreSQL Human changed durable delivery count to %d",
 			deliveryCount,

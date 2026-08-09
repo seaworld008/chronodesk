@@ -529,7 +529,7 @@ func TestValidateWebhookCredentialLifetimeContractFailsClosedOnBadData(
 					legacyWebhookDeliveryID,
 				)
 			},
-			wantErr: "status",
+			wantErr: "delivery malformed",
 		},
 		{
 			name: "invalid shred reason",
@@ -545,7 +545,7 @@ func TestValidateWebhookCredentialLifetimeContractFailsClosedOnBadData(
 					legacyWebhookSnapshotID,
 				)
 			},
-			wantErr: "shred reason",
+			wantErr: "snapshot shape",
 		},
 		{
 			name: "shredded secret remains",
@@ -563,7 +563,7 @@ func TestValidateWebhookCredentialLifetimeContractFailsClosedOnBadData(
 					legacyWebhookSnapshotID,
 				)
 			},
-			wantErr: "credential envelope",
+			wantErr: "snapshot shape",
 		},
 		{
 			name: "deadline mismatch",
@@ -661,11 +661,7 @@ func TestValidateWebhookCredentialLifetimeContractFailsClosedOnBadData(
 				deadline,
 			)
 			test.mutate(t, db)
-			_, err := loadAndValidateWebhookCredentialPairs(
-				db,
-				true,
-				nil,
-			)
+			err := validateWebhookCredentialOwnerSet(db, true)
 			if err == nil ||
 				!strings.Contains(
 					strings.ToLower(err.Error()),
@@ -917,7 +913,7 @@ func TestWebhookCredentialColumnContractRejectsWrongExistingSQLiteColumns(
 func TestWebhookCredentialClosedVocabularyMatchesCanonicalModelValues(
 	t *testing.T,
 ) {
-	statusExpression := closedVocabularyConstraintExpression(
+	statusExpression := requiredClosedVocabularyConstraintExpression(
 		"status",
 		models.OutboxDeliveryStatusValues(),
 	)
@@ -1063,6 +1059,11 @@ func TestSQLiteWebhookCredentialConstraintsRejectInvalidDirectSQL(
 			args:  []any{delivery.ID},
 		},
 		{
+			name:  "null outbox status",
+			query: "UPDATE outbox_deliveries SET status = NULL WHERE id = ?",
+			args:  []any{delivery.ID},
+		},
+		{
 			name:  "expired status without timestamp",
 			query: "UPDATE outbox_deliveries SET status = 'expired' WHERE id = ?",
 			args:  []any{delivery.ID},
@@ -1179,7 +1180,7 @@ func openLegacyWebhookCredentialMigrationDB(
 ) *gorm.DB {
 	t.Helper()
 	dsn := fmt.Sprintf(
-		"file:%s-%s?mode=memory&cache=shared",
+		"file:%s-%s?mode=memory&cache=shared&_foreign_keys=1",
 		strings.ReplaceAll(t.Name(), "/", "-"),
 		strings.ReplaceAll(suffix, " ", "-"),
 	)
@@ -1228,7 +1229,7 @@ func openLegacyWebhookCredentialMigrationDB(
 			event_id TEXT NOT NULL,
 			destination_type TEXT NOT NULL,
 			destination_id TEXT NOT NULL,
-			status TEXT NOT NULL
+			status VARCHAR(20) NOT NULL DEFAULT 'pending'
 		)`,
 	}
 	for _, statement := range statements {

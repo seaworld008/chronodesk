@@ -58,7 +58,7 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 	quotedOwner := quotePostgresRLSTestIdentifier(ownerRole)
 	quotedRuntime := quotePostgresRLSTestIdentifier(runtimeRole)
 	silentConfig := &gorm.Config{
-		TranslateError: true,
+		TranslateError: false,
 		Logger:         logger.Default.LogMode(logger.Silent),
 	}
 	admin, err := gorm.Open(postgres.Open(rawDSN), silentConfig)
@@ -175,7 +175,7 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 			event_id VARCHAR(36) NOT NULL,
 			destination_type VARCHAR(50) NOT NULL,
 			destination_id VARCHAR(128) NOT NULL,
-			status VARCHAR(20) NOT NULL
+			status VARCHAR(20) NOT NULL DEFAULT 'pending'
 		)`,
 	}
 	for _, statement := range legacyStatements {
@@ -197,7 +197,24 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 		t.Fatal(err)
 	}
 	seedLegacyWebhookCredentialPair(t, owner)
-	seedPostgresWebhookCredentialScaleFixture(t, owner, firstCutoverPlaceholder())
+	projectCount := 100
+	pairCount := 10_000
+	nonWebhookCount := 100_000
+	capacityQualification :=
+		os.Getenv("CHRONODESK_TASK9A_CAPACITY_QUALIFICATION") == "1"
+	if capacityQualification {
+		projectCount = 1_000
+		pairCount = 100_000
+		nonWebhookCount = 1_000_000
+	}
+	seedPostgresWebhookCredentialScaleFixture(
+		t,
+		owner,
+		firstCutoverPlaceholder(),
+		projectCount,
+		pairCount,
+		nonWebhookCount,
+	)
 	for _, table := range []string{
 		"domain_events",
 		"outbox_deliveries",
@@ -339,8 +356,11 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 		t.Fatalf("migrate FORCE-RLS legacy webhook credentials: %v", err)
 	}
 	t.Logf(
-		"representative cutover: 100 Projects, 10000 webhook pairs, "+
-			"100000 non-webhook deliveries in %s",
+		"representative cutover: %d Projects, %d webhook pairs, "+
+			"%d non-webhook deliveries in %s",
+		projectCount,
+		pairCount,
+		nonWebhookCount,
 		time.Since(scaleCutoverStarted),
 	)
 	assertPostgresWebhookCredentialForceRLS(t, owner)
@@ -422,10 +442,70 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 	}
 	cancelRuntimeValidation()
 	t.Logf(
-		"representative runtime gate: 100 Projects, 10000 webhook pairs, "+
-			"100000 non-webhook deliveries in %s",
+		"representative runtime gate: %d Projects, %d webhook pairs, "+
+			"%d non-webhook deliveries in %s",
+		projectCount,
+		pairCount,
+		nonWebhookCount,
 		time.Since(runtimeValidationStarted),
 	)
+	if capacityQualification {
+		var postgresVersion string
+		if err := owner.Raw(
+			"SHOW server_version",
+		).Scan(&postgresVersion).Error; err != nil {
+			t.Fatal(err)
+		}
+		var planRows []struct {
+			Plan string `gorm:"column:QUERY PLAN"`
+		}
+		if err := WithProjectScopeTransaction(
+			context.Background(),
+			owner,
+			models.ProjectScope{
+				OrganizationID: 11,
+				ProjectID:      100,
+			},
+			func(tx *gorm.DB) error {
+				return tx.Raw(`
+					EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+					SELECT delivery.id
+					FROM outbox_deliveries AS delivery
+					JOIN webhook_delivery_snapshots AS snapshot
+					  ON delivery.destination_id =
+						 'snapshot:' || snapshot.id
+					 AND delivery.organization_id =
+						 snapshot.organization_id
+					 AND delivery.project_id = snapshot.project_id
+					 AND delivery.event_id = snapshot.event_id
+					WHERE delivery.organization_id = 11
+					  AND delivery.project_id = 100
+					  AND delivery.destination_type = 'webhook'
+					LIMIT 1
+				`).Scan(&planRows).Error
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		var waitingLocks int64
+		if err := owner.Raw(`
+			SELECT COUNT(*)
+			FROM pg_locks
+			WHERE NOT granted
+		`).Scan(&waitingLocks).Error; err != nil {
+			t.Fatal(err)
+		}
+		plan := make([]string, 0, len(planRows))
+		for _, row := range planRows {
+			plan = append(plan, row.Plan)
+		}
+		t.Logf(
+			"capacity qualification PostgreSQL=%s waiting_locks=%d plan=%s",
+			postgresVersion,
+			waitingLocks,
+			strings.Join(plan, " | "),
+		)
+	}
 	const runtimeBarrierCallback = "test:task9a_runtime_repeatable_read_barrier"
 	inventoryRead := make(chan struct{})
 	writerCommitted := make(chan struct{})
@@ -594,6 +674,47 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 		firstCutover,
 	)
 	if err := owner.Exec(`
+		ALTER TABLE outbox_deliveries
+		ALTER COLUMN status DROP NOT NULL
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	err = validateWebhookCredentialLifetimeCatalog(owner)
+	if err == nil ||
+		!strings.Contains(err.Error(), "outbox_deliveries.status") {
+		t.Fatalf("PostgreSQL nullable status catalog error = %v", err)
+	}
+	var fullLegacyProject models.Project
+	if err := owner.Where("id = ?", 1001).
+		Take(&fullLegacyProject).Error; err != nil {
+		t.Fatal(err)
+	}
+	nullStatusErr := WithProjectScopeTransaction(
+		context.Background(),
+		owner,
+		fullLegacyProject.Scope(),
+		func(tx *gorm.DB) error {
+			return tx.Exec(`
+				UPDATE outbox_deliveries
+				SET status = NULL
+				WHERE id = '00000000-0000-7000-8000-000000000923'
+			`).Error
+		},
+	)
+	if nullStatusErr == nil ||
+		!strings.Contains(nullStatusErr.Error(), "SQLSTATE 23514") {
+		t.Fatalf(
+			"PostgreSQL status CHECK accepted raw NULL after nullability drift: %v",
+			nullStatusErr,
+		)
+	}
+	if err := owner.Exec(`
+		ALTER TABLE outbox_deliveries
+		ALTER COLUMN status SET NOT NULL
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Exec(`
 		ALTER TABLE webhook_delivery_snapshots
 		ALTER COLUMN credential_shred_reason TYPE VARCHAR(21)
 	`).Error; err != nil {
@@ -744,6 +865,162 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 			"weakened same-name PostgreSQL constraint error = %v",
 			err,
 		)
+	}
+	if err := owner.Exec(`
+		ALTER TABLE outbox_deliveries
+		DROP CONSTRAINT chk_outbox_delivery_status
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Exec(
+		"ALTER TABLE outbox_deliveries ADD CONSTRAINT " +
+			"chk_outbox_delivery_status CHECK (" +
+			webhookCredentialConstraintDefinitions["chk_outbox_delivery_status"].expression +
+			")",
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := owner.Exec(`
+		ALTER TABLE outbox_deliveries
+		ADD COLUMN "Status" VARCHAR(20) NOT NULL DEFAULT 'pending',
+		DROP CONSTRAINT chk_outbox_delivery_status,
+		ADD CONSTRAINT chk_outbox_delivery_status CHECK (
+			"Status" IS NOT NULL AND (
+				"Status" = 'pending' OR
+				"Status" = 'processing' OR
+				"Status" = 'succeeded' OR
+				"Status" = 'failed' OR
+				"Status" = 'dead' OR
+				"Status" = 'expired'
+			)
+		)
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	err = validateWebhookCredentialLifetimeCatalog(owner)
+	if err == nil ||
+		!strings.Contains(err.Error(), "chk_outbox_delivery_status") {
+		t.Fatalf(`quoted "Status" CHECK catalog error = %v`, err)
+	}
+	if err := owner.Exec(`
+		ALTER TABLE outbox_deliveries
+		DROP CONSTRAINT chk_outbox_delivery_status,
+		DROP COLUMN "Status"
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Exec(
+		"ALTER TABLE outbox_deliveries ADD CONSTRAINT " +
+			"chk_outbox_delivery_status CHECK (" +
+			webhookCredentialConstraintDefinitions["chk_outbox_delivery_status"].expression +
+			")",
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := withWebhookCredentialOwnerAccess(
+		owner,
+		func(tx *gorm.DB) error {
+			if err := tx.Exec(`
+				ALTER TABLE domain_events
+				DROP CONSTRAINT fk_domain_events_project_scope,
+				ADD COLUMN "Project_ID" BIGINT
+			`).Error; err != nil {
+				return err
+			}
+			if err := tx.Exec(`
+				UPDATE domain_events SET "Project_ID" = project_id
+			`).Error; err != nil {
+				return err
+			}
+			return tx.Exec(`
+				ALTER TABLE domain_events
+				ALTER COLUMN "Project_ID" SET NOT NULL,
+				ADD CONSTRAINT fk_domain_events_project_scope
+					FOREIGN KEY (organization_id, "Project_ID")
+					REFERENCES projects(organization_id, id)
+					ON UPDATE RESTRICT ON DELETE RESTRICT
+			`).Error
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	valid, exists, stateErr := postgresWebhookProjectScopeFKState(
+		owner,
+		webhookProjectScopeFKDefinitions()[0],
+	)
+	if stateErr != nil {
+		t.Fatal(stateErr)
+	}
+	if !exists || valid {
+		t.Fatalf(
+			`quoted "Project_ID" FK state = valid:%v exists:%v, want incompatible`,
+			valid,
+			exists,
+		)
+	}
+	if err := owner.Exec(`
+		ALTER TABLE domain_events
+		DROP CONSTRAINT fk_domain_events_project_scope,
+		DROP COLUMN "Project_ID",
+		ADD CONSTRAINT fk_domain_events_project_scope
+			FOREIGN KEY (organization_id, project_id)
+			REFERENCES projects(organization_id, id)
+			ON UPDATE RESTRICT ON DELETE RESTRICT
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := owner.Exec(`
+		CREATE TABLE "Projects" (
+			id BIGINT PRIMARY KEY,
+			organization_id BIGINT NOT NULL,
+			UNIQUE (organization_id, id)
+		)
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Exec(`
+		INSERT INTO "Projects" (id, organization_id)
+		SELECT id, organization_id FROM projects
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Exec(`
+		ALTER TABLE domain_events
+		DROP CONSTRAINT fk_domain_events_project_scope,
+		ADD CONSTRAINT fk_domain_events_project_scope
+			FOREIGN KEY (organization_id, project_id)
+			REFERENCES "Projects"(organization_id, id)
+			ON UPDATE RESTRICT ON DELETE RESTRICT
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	valid, exists, stateErr = postgresWebhookProjectScopeFKState(
+		owner,
+		webhookProjectScopeFKDefinitions()[0],
+	)
+	if stateErr != nil {
+		t.Fatal(stateErr)
+	}
+	if !exists || valid {
+		t.Fatalf(
+			`quoted "Projects" FK state = valid:%v exists:%v, want incompatible`,
+			valid,
+			exists,
+		)
+	}
+	if err := owner.Exec(`
+		ALTER TABLE domain_events
+		DROP CONSTRAINT fk_domain_events_project_scope,
+		ADD CONSTRAINT fk_domain_events_project_scope
+			FOREIGN KEY (organization_id, project_id)
+			REFERENCES projects(organization_id, id)
+			ON UPDATE RESTRICT ON DELETE RESTRICT;
+		DROP TABLE "Projects"
+	`).Error; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -932,7 +1209,8 @@ func exerciseFullLegacyRunMigrationsPostgres(
 	}
 	err := RunMigrations(owner)
 	if err == nil ||
-		!strings.Contains(err.Error(), "injected task9a SQL backfill failure") {
+		!strings.Contains(err.Error(), "injected task9a SQL backfill failure") ||
+		!strings.Contains(err.Error(), "SQLSTATE P0001") {
 		t.Fatalf("real PostgreSQL backfill SQL error = %v", err)
 	}
 	assertPostgresWebhookCredentialForceRLS(t, owner)
@@ -960,6 +1238,145 @@ func exerciseFullLegacyRunMigrationsPostgres(
 		t.Fatal(err)
 	}
 	if err := owner.Exec("DROP FUNCTION fail_task9a_backfill_fn()").Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := owner.Exec(`
+		CREATE FUNCTION fail_task9a_snapshot_backfill_fn()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			RAISE EXCEPTION 'injected task9a snapshot SQL backfill failure';
+		END;
+		$$
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Exec(`
+		CREATE TRIGGER fail_task9a_snapshot_backfill
+		BEFORE UPDATE ON webhook_delivery_snapshots
+		FOR EACH ROW EXECUTE FUNCTION fail_task9a_snapshot_backfill_fn()
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	err = RunMigrations(owner)
+	if err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"injected task9a snapshot SQL backfill failure",
+		) ||
+		!strings.Contains(err.Error(), "SQLSTATE P0001") {
+		t.Fatalf("second PostgreSQL backfill SQL error = %v", err)
+	}
+	assertPostgresWebhookCredentialCutoverRolledBack(t, owner)
+	if err := owner.Exec(
+		"DROP TRIGGER fail_task9a_snapshot_backfill " +
+			"ON webhook_delivery_snapshots",
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Exec(
+		"DROP FUNCTION fail_task9a_snapshot_backfill_fn()",
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := owner.Exec(`
+		ALTER TABLE outbox_deliveries
+		DROP CONSTRAINT IF EXISTS chk_outbox_delivery_status
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := WithProjectScopeTransaction(
+		context.Background(),
+		owner,
+		scope,
+		func(tx *gorm.DB) error {
+			return tx.Exec(`
+				INSERT INTO outbox_deliveries (
+					id, organization_id, project_id, event_id,
+					destination_type, destination_id, status,
+					next_attempt_at
+				) VALUES (
+					'00000000-0000-7000-8000-000000000924',
+					?, ?, ?, 'test_delivery', 'constraint-abort', 'mystery', ?
+				)
+			`,
+				scope.OrganizationID,
+				scope.ProjectID,
+				eventID,
+				now,
+			).Error
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	err = RunMigrations(owner)
+	if err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"validate PostgreSQL webhook credential constraint chk_outbox_delivery_status",
+		) ||
+		!strings.Contains(err.Error(), "SQLSTATE 23514") {
+		t.Fatalf("PostgreSQL constraint validation SQL error = %v", err)
+	}
+	assertPostgresWebhookCredentialCutoverRolledBack(t, owner)
+	if err := WithProjectScopeTransaction(
+		context.Background(),
+		owner,
+		scope,
+		func(tx *gorm.DB) error {
+			return tx.Exec(`
+				DELETE FROM outbox_deliveries
+				WHERE id = '00000000-0000-7000-8000-000000000924'
+			`).Error
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := owner.Exec(`
+		CREATE FUNCTION fail_task9a_checkpoint_insert_fn()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF NEW.key = '20260810_webhook_snapshot_credential_lifetime_v1' THEN
+				RAISE EXCEPTION 'injected task9a checkpoint SQL insert failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Exec(`
+		CREATE TRIGGER fail_task9a_checkpoint_insert
+		BEFORE INSERT ON schema_migration_checkpoints
+		FOR EACH ROW EXECUTE FUNCTION fail_task9a_checkpoint_insert_fn()
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	err = RunMigrations(owner)
+	if err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"injected task9a checkpoint SQL insert failure",
+		) ||
+		!strings.Contains(err.Error(), "SQLSTATE P0001") {
+		t.Fatalf("PostgreSQL checkpoint INSERT SQL error = %v", err)
+	}
+	assertPostgresWebhookCredentialCutoverRolledBack(t, owner)
+	if err := owner.Exec(`
+		DROP TRIGGER fail_task9a_checkpoint_insert
+		ON schema_migration_checkpoints
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Exec(
+		"DROP FUNCTION fail_task9a_checkpoint_insert_fn()",
+	).Error; err != nil {
 		t.Fatal(err)
 	}
 
@@ -1073,6 +1490,9 @@ func seedPostgresWebhookCredentialScaleFixture(
 	t *testing.T,
 	db *gorm.DB,
 	createdAt time.Time,
+	projectCount int,
+	pairCount int,
+	nonWebhookCount int,
 ) {
 	t.Helper()
 	statements := []struct {
@@ -1083,8 +1503,9 @@ func seedPostgresWebhookCredentialScaleFixture(
 			sql: `
 				INSERT INTO projects (id, organization_id, status)
 				SELECT value, 11, 'active'
-				FROM generate_series(100, 199) AS value
+				FROM generate_series(100, ?) AS value
 			`,
+			args: []any{99 + projectCount},
 		},
 		{
 			sql: `
@@ -1095,9 +1516,10 @@ func seedPostgresWebhookCredentialScaleFixture(
 					'00000000-0000-7000-8000-' ||
 						lpad((100000 + value)::text, 12, '0'),
 					11,
-					100 + ((value - 1) % 100)
-				FROM generate_series(1, 10000) AS value
+					100 + ((value - 1) % ?)
+				FROM generate_series(1, ?) AS value
 			`,
+			args: []any{projectCount, pairCount},
 		},
 		{
 			sql: `
@@ -1110,16 +1532,20 @@ func seedPostgresWebhookCredentialScaleFixture(
 						lpad((200000 + value)::text, 12, '0'),
 					?,
 					11,
-					100 + ((value - 1) % 100),
+					100 + ((value - 1) % ?),
 					1000 + value,
 					'00000000-0000-7000-8000-' ||
 						lpad((100000 + value)::text, 12, '0'),
 					'sealed',
 					'',
 					''
-				FROM generate_series(1, 10000) AS value
+				FROM generate_series(1, ?) AS value
 			`,
-			args: []any{createdAt},
+			args: []any{
+				createdAt,
+				projectCount,
+				pairCount,
+			},
 		},
 		{
 			sql: `
@@ -1131,15 +1557,16 @@ func seedPostgresWebhookCredentialScaleFixture(
 					'00000000-0000-7000-8000-' ||
 						lpad((300000 + value)::text, 12, '0'),
 					11,
-					100 + ((value - 1) % 100),
+					100 + ((value - 1) % ?),
 					'00000000-0000-7000-8000-' ||
 						lpad((100000 + value)::text, 12, '0'),
 					'webhook',
 					'snapshot:00000000-0000-7000-8000-' ||
 						lpad((200000 + value)::text, 12, '0'),
 					'pending'
-				FROM generate_series(1, 10000) AS value
+				FROM generate_series(1, ?) AS value
 			`,
+			args: []any{projectCount, pairCount},
 		},
 		{
 			sql: `
@@ -1151,18 +1578,23 @@ func seedPostgresWebhookCredentialScaleFixture(
 					'00000000-0000-7000-8000-' ||
 						lpad((400000 + value)::text, 12, '0'),
 					11,
-					100 + ((value - 1) % 100),
+					100 + ((value - 1) % ?),
 					'00000000-0000-7000-8000-' ||
 						lpad(
-							(100000 + (((value - 1) % 100) + 1))::text,
+							(100000 + (((value - 1) % ?) + 1))::text,
 							12,
 							'0'
 						),
 					'test_delivery',
 					'scale:' || value::text,
 					'pending'
-				FROM generate_series(1, 100000) AS value
+				FROM generate_series(1, ?) AS value
 			`,
+			args: []any{
+				projectCount,
+				projectCount,
+				nonWebhookCount,
+			},
 		},
 	}
 	for _, statement := range statements {
@@ -1201,6 +1633,52 @@ func dropPostgresProjectScopeForeignKeys(t *testing.T, db *gorm.DB) {
 				quotePostgresRLSTestIdentifier(row.Name),
 		).Error; err != nil {
 			t.Fatal(err)
+		}
+	}
+}
+
+func assertPostgresWebhookCredentialCutoverRolledBack(
+	t *testing.T,
+	db *gorm.DB,
+) {
+	t.Helper()
+	assertPostgresWebhookCredentialForceRLS(t, db)
+	var checkpointCount int64
+	if err := db.Model(&models.SchemaMigrationCheckpoint{}).
+		Where("key = ?", webhookSnapshotCredentialLifetimeCheckpointKey).
+		Count(&checkpointCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if checkpointCount != 0 {
+		t.Fatalf(
+			"SQL-aborted cutover retained %d foundation checkpoints",
+			checkpointCount,
+		)
+	}
+	for _, column := range []string{
+		"credential_expires_at",
+		"credential_shredded_at",
+		"credential_shred_reason",
+	} {
+		if db.Migrator().HasColumn(
+			&models.WebhookDeliverySnapshot{},
+			column,
+		) {
+			t.Fatalf(
+				"SQL-aborted cutover retained webhook snapshot column %s",
+				column,
+			)
+		}
+	}
+	for _, column := range []string{"expires_at", "expired_at"} {
+		if db.Migrator().HasColumn(
+			&models.OutboxDelivery{},
+			column,
+		) {
+			t.Fatalf(
+				"SQL-aborted cutover retained Outbox column %s",
+				column,
+			)
 		}
 	}
 }

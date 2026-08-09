@@ -19,6 +19,17 @@ func closedVocabularyConstraintExpression[T ~string](
 	return strings.Join(parts, " OR ")
 }
 
+func requiredClosedVocabularyConstraintExpression[T ~string](
+	column string,
+	values []T,
+) string {
+	expression := closedVocabularyConstraintExpression(column, values)
+	if expression == "" {
+		return column + " IS NOT NULL AND FALSE"
+	}
+	return column + " IS NOT NULL AND (" + expression + ")"
+}
+
 func nullableClosedVocabularyConstraintExpression[T ~string](
 	column string,
 	values []T,
