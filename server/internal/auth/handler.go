@@ -88,6 +88,14 @@ func authLogUserID(userID uint) string {
 	return observability.SafeLogValue(strconv.FormatUint(uint64(userID), 10))
 }
 
+func backupCodeSecurityLogRequestID(HTTPContext) string {
+	// Request IDs may be client supplied. This endpoint handles a password and
+	// newly generated recovery credentials, so it never writes that open value
+	// to operational logs. The durable security audit retains separately
+	// sanitized request/correlation metadata.
+	return "security-sensitive-request"
+}
+
 // authLogReason intentionally returns only a bounded, predefined category.
 // Authentication service errors may include password-policy input, OTP/token
 // state, or database values and must never be written verbatim.
@@ -113,6 +121,14 @@ func authLogReason(err error) string {
 		return "invalid_otp"
 	case errors.Is(err, ErrOTPExpired):
 		return "otp_expired"
+	case errors.Is(err, ErrInvalidPassword):
+		return "invalid_password"
+	case errors.Is(err, ErrOTPNotEnabled):
+		return "otp_not_enabled"
+	case errors.Is(err, ErrBackupCodesChanged):
+		return "backup_codes_changed"
+	case errors.Is(err, ErrAtomicBackupCodeRotationUnavailable):
+		return "atomic_backup_code_rotation_unavailable"
 	case errors.Is(err, ErrEmailNotVerified):
 		return "email_not_verified"
 	case errors.Is(err, ErrEmailVerificationPolicyUnavailable):
@@ -1348,23 +1364,67 @@ func (h *AuthHandler) GenerateBackupCodes(c HTTPContext) {
 		return
 	}
 
+	var req GenerateBackupCodesRequest
+	if err := c.Bind(&req); err != nil {
+		if rejectOversizedAuthenticationRequest(c, err) {
+			return
+		}
+		h.logger.Warn(
+			"Invalid backup-code regeneration request",
+			"request_id", backupCodeSecurityLogRequestID(c),
+			"user_id", authLogUserID(userInfo.ID),
+			"reason", "invalid_request_body",
+		)
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error:   "invalid_request",
+			Message: "请求体格式无效",
+		})
+		return
+	}
+
 	ctx, cancel, ok := h.boundedRequestContext(c)
 	if !ok {
 		return
 	}
 	defer cancel()
 
-	codes, err := h.authService.GenerateBackupCodes(ctx, userInfo.ID)
+	codes, err := h.authService.GenerateBackupCodes(
+		ctx,
+		userInfo.ID,
+		req.CurrentPassword,
+		AuthenticationSecurityAuditContext{
+			RequestID:     authLogRequestID(c),
+			TraceID:       observability.TraceIDFromContext(ctx),
+			CorrelationID: observability.CorrelationIDFromContext(ctx),
+		},
+	)
 	if err != nil {
 		h.logger.Error(
 			"Failed to generate backup codes",
-			"request_id", authLogRequestID(c),
+			"request_id", backupCodeSecurityLogRequestID(c),
 			"user_id", authLogUserID(userInfo.ID),
 			"reason", authLogReason(err),
 		)
-		c.JSON(http.StatusInternalServerError, ErrorResponse{
-			Error:   "generate_backup_codes_failed",
-			Message: "生成备用验证码失败",
+		status := http.StatusServiceUnavailable
+		errorCode := "backup_code_regeneration_unavailable"
+		message := "备用验证码服务暂时不可用"
+		switch {
+		case errors.Is(err, ErrInvalidPassword):
+			status = http.StatusUnauthorized
+			errorCode = "invalid_password"
+			message = "当前密码错误"
+		case errors.Is(err, ErrOTPNotEnabled):
+			status = http.StatusConflict
+			errorCode = "otp_not_enabled"
+			message = "尚未启用 OTP"
+		case errors.Is(err, ErrBackupCodesChanged):
+			status = http.StatusConflict
+			errorCode = "backup_codes_changed"
+			message = "认证状态已变更，请重试"
+		}
+		c.JSON(status, ErrorResponse{
+			Error:   errorCode,
+			Message: message,
 		})
 		return
 	}

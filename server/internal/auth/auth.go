@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/observability"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 	"gorm.io/gorm"
 )
@@ -52,6 +53,14 @@ var (
 	)
 	ErrInvalidProfilePhone  = errors.New("profile phone is invalid")
 	ErrInvalidProfileAvatar = errors.New("profile avatar is invalid")
+	ErrInvalidPassword      = errors.New("current password is invalid")
+	ErrOTPNotEnabled        = errors.New("OTP is not enabled")
+	ErrBackupCodesChanged   = errors.New(
+		"backup codes or authentication state changed",
+	)
+	ErrAtomicBackupCodeRotationUnavailable = errors.New(
+		"atomic backup-code rotation repository is unavailable",
+	)
 )
 
 var (
@@ -205,6 +214,72 @@ type OTPCode struct {
 	UsedAt    *time.Time  `json:"used_at"`
 	CreatedAt time.Time   `json:"created_at"`
 	User      models.User `json:"user" gorm:"foreignKey:UserID"`
+}
+
+type AuthenticationSecurityEventType string
+
+const (
+	AuthenticationSecurityEventBackupCodesRegenerated AuthenticationSecurityEventType = "backup_codes_regenerated"
+)
+
+type AuthenticationSecurityAuditSource string
+
+const (
+	AuthenticationSecurityAuditSourceHumanREST AuthenticationSecurityAuditSource = "human-rest"
+)
+
+// AuthenticationSecurityAuditEvent is the purpose-built, closed-vocabulary
+// audit record for security-sensitive authentication changes. It deliberately
+// has no free-form metadata or credential fields.
+type AuthenticationSecurityAuditEvent struct {
+	ID            uint                              `json:"id" gorm:"primaryKey"`
+	UserID        uint                              `json:"user_id" gorm:"not null;index"`
+	EventType     AuthenticationSecurityEventType   `json:"event_type" gorm:"type:varchar(64);not null;index;check:chk_authentication_security_event_type,event_type = 'backup_codes_regenerated'"`
+	Source        AuthenticationSecurityAuditSource `json:"source" gorm:"type:varchar(32);not null;check:chk_authentication_security_audit_source,source = 'human-rest'"`
+	RequestID     string                            `json:"request_id" gorm:"size:256;not null"`
+	TraceID       string                            `json:"trace_id,omitempty" gorm:"size:32"`
+	CorrelationID string                            `json:"correlation_id,omitempty" gorm:"size:128"`
+	CreatedAt     time.Time                         `json:"created_at" gorm:"not null;index"`
+}
+
+func (event *AuthenticationSecurityAuditEvent) BeforeCreate(*gorm.DB) error {
+	if event == nil ||
+		event.UserID == 0 ||
+		event.EventType != AuthenticationSecurityEventBackupCodesRegenerated ||
+		event.Source != AuthenticationSecurityAuditSourceHumanREST ||
+		event.CreatedAt.IsZero() ||
+		event.RequestID == "" ||
+		utf8.RuneCountInString(event.RequestID) > 256 ||
+		len(event.TraceID) > 32 ||
+		len(event.CorrelationID) > 128 {
+		return errors.New("invalid authentication security audit event")
+	}
+	return nil
+}
+
+type AuthenticationSecurityAuditContext struct {
+	RequestID     string
+	TraceID       string
+	CorrelationID string
+}
+
+type BackupCodeRotationSnapshot struct {
+	UserID       uint
+	OTPEnabled   bool
+	PasswordHash string
+	BackupCodes  string
+}
+
+// AtomicBackupCodeRotationRepository is required for regeneration. There is no
+// fallback to a standalone user update because the CAS and success audit must
+// commit in one transaction.
+type AtomicBackupCodeRotationRepository interface {
+	RotateBackupCodesWithAudit(
+		context.Context,
+		BackupCodeRotationSnapshot,
+		string,
+		AuthenticationSecurityAuditEvent,
+	) error
 }
 
 // RegisterRequest 注册请求
@@ -378,6 +453,10 @@ type OTPSetupResponse struct {
 	BackupCodes []string `json:"backup_codes"`
 }
 
+type GenerateBackupCodesRequest struct {
+	CurrentPassword string `json:"current_password" binding:"required"`
+}
+
 // UserRepository 用户仓库接口
 type UserRepository interface {
 	Create(ctx context.Context, user *User) error
@@ -397,7 +476,6 @@ type UserRepository interface {
 		changedAt time.Time,
 	) error
 	ConfigureOTP(ctx context.Context, userID uint, secret, backupCodeHashes string, enabled bool) error
-	ReplaceBackupCodes(ctx context.Context, userID uint, backupCodeHashes string) error
 	ConsumeBackupCode(ctx context.Context, userID uint, code string) (bool, error)
 }
 
@@ -546,7 +624,12 @@ type AuthServiceInterface interface {
 	// 验证OTP
 	VerifyOTP(ctx context.Context, userID uint, code string) error
 	// 生成备用代码
-	GenerateBackupCodes(ctx context.Context, userID uint) ([]string, error)
+	GenerateBackupCodes(
+		ctx context.Context,
+		userID uint,
+		currentPassword string,
+		auditContext AuthenticationSecurityAuditContext,
+	) ([]string, error)
 }
 
 // AuthService 认证服务
@@ -1673,7 +1756,15 @@ func (s *AuthService) VerifyOTP(ctx context.Context, userID uint, code string) e
 }
 
 // GenerateBackupCodes 生成备用代码
-func (s *AuthService) GenerateBackupCodes(ctx context.Context, userID uint) ([]string, error) {
+func (s *AuthService) GenerateBackupCodes(
+	ctx context.Context,
+	userID uint,
+	currentPassword string,
+	auditContext AuthenticationSecurityAuditContext,
+) ([]string, error) {
+	if s.userRepo == nil {
+		return nil, ErrAtomicBackupCodeRotationUnavailable
+	}
 	// 获取用户
 	user, err := s.userRepo.GetByID(ctx, userID)
 	if err != nil {
@@ -1682,7 +1773,25 @@ func (s *AuthService) GenerateBackupCodes(ctx context.Context, userID uint) ([]s
 
 	// 检查是否启用OTP
 	if !user.OTPEnabled {
-		return nil, errors.New("OTP not enabled")
+		return nil, ErrOTPNotEnabled
+	}
+
+	if currentPassword == "" || s.passwordService == nil {
+		return nil, ErrInvalidPassword
+	}
+	if err := s.passwordService.VerifyPassword(
+		user.PasswordHash,
+		currentPassword,
+	); err != nil {
+		return nil, ErrInvalidPassword
+	}
+
+	atomicRepository, ok := s.userRepo.(AtomicBackupCodeRotationRepository)
+	if !ok {
+		return nil, ErrAtomicBackupCodeRotationUnavailable
+	}
+	if s.otpService == nil {
+		return nil, ErrAtomicBackupCodeRotationUnavailable
 	}
 
 	// 生成新的备用码
@@ -1690,17 +1799,99 @@ func (s *AuthService) GenerateBackupCodes(ctx context.Context, userID uint) ([]s
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate backup codes: %w", err)
 	}
+	if len(backupCodes) != 10 {
+		return nil, ErrInvalidBackupCodeStorage
+	}
 	backupCodeHashes, err := hashBackupCodes(backupCodes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to protect backup codes: %w", err)
 	}
 
-	// 更新用户备用码
-	if err := s.userRepo.ReplaceBackupCodes(ctx, user.ID, backupCodeHashes); err != nil {
-		return nil, fmt.Errorf("failed to update user: %w", err)
+	safeAuditContext := sanitizeAuthenticationSecurityAuditContext(
+		auditContext,
+		append(
+			[]string{
+				currentPassword,
+				user.OTPSecret,
+				user.PasswordHash,
+				user.BackupCodes,
+				backupCodeHashes,
+			},
+			backupCodes...,
+		),
+	)
+	audit := AuthenticationSecurityAuditEvent{
+		UserID:        user.ID,
+		EventType:     AuthenticationSecurityEventBackupCodesRegenerated,
+		Source:        AuthenticationSecurityAuditSourceHumanREST,
+		RequestID:     safeAuditContext.RequestID,
+		TraceID:       safeAuditContext.TraceID,
+		CorrelationID: safeAuditContext.CorrelationID,
+		CreatedAt:     time.Now().UTC(),
+	}
+	if err := atomicRepository.RotateBackupCodesWithAudit(
+		ctx,
+		BackupCodeRotationSnapshot{
+			UserID:       user.ID,
+			OTPEnabled:   user.OTPEnabled,
+			PasswordHash: user.PasswordHash,
+			BackupCodes:  user.BackupCodes,
+		},
+		backupCodeHashes,
+		audit,
+	); err != nil {
+		if errors.Is(err, ErrBackupCodesChanged) {
+			return nil, ErrBackupCodesChanged
+		}
+		return nil, fmt.Errorf("rotate backup codes atomically: %w", err)
 	}
 
 	return backupCodes, nil
+}
+
+func sanitizeAuthenticationSecurityAuditContext(
+	auditContext AuthenticationSecurityAuditContext,
+	secrets []string,
+) AuthenticationSecurityAuditContext {
+	requestID := observability.SafeLogValue(auditContext.RequestID)
+	if requestID == "" || auditMetadataContainsSecret(requestID, secrets) {
+		requestID = "request-redacted"
+	}
+
+	traceID := strings.TrimSpace(auditContext.TraceID)
+	decodedTraceID, traceErr := hex.DecodeString(traceID)
+	if traceErr != nil ||
+		len(decodedTraceID) != 16 ||
+		auditMetadataContainsSecret(traceID, secrets) {
+		traceID = ""
+	}
+
+	correlationID := strings.TrimSpace(auditContext.CorrelationID)
+	if !observability.IsValidCorrelationID(correlationID) ||
+		auditMetadataContainsSecret(correlationID, secrets) {
+		correlationID = ""
+	}
+	return AuthenticationSecurityAuditContext{
+		RequestID:     requestID,
+		TraceID:       strings.ToLower(traceID),
+		CorrelationID: correlationID,
+	}
+}
+
+func auditMetadataContainsSecret(value string, secrets []string) bool {
+	if value == "" {
+		return false
+	}
+	for _, secret := range secrets {
+		if secret == "" {
+			continue
+		}
+		if strings.Contains(value, secret) ||
+			(len(value) >= 4 && strings.Contains(secret, value)) {
+			return true
+		}
+	}
+	return false
 }
 
 // 辅助方法

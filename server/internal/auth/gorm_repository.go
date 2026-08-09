@@ -353,24 +353,45 @@ func (r *GormUserRepository) configureOTPWithDB(
 	return nil
 }
 
-func (r *GormUserRepository) ReplaceBackupCodes(
+func (r *GormUserRepository) RotateBackupCodesWithAudit(
 	ctx context.Context,
-	userID uint,
-	backupCodeHashes string,
+	expected BackupCodeRotationSnapshot,
+	replacementHashes string,
+	audit AuthenticationSecurityAuditEvent,
 ) error {
-	if _, err := parseBackupCodeHashes(backupCodeHashes); err != nil {
+	if expected.UserID == 0 ||
+		!expected.OTPEnabled ||
+		expected.PasswordHash == "" ||
+		audit.UserID != expected.UserID {
+		return ErrBackupCodesChanged
+	}
+	if _, err := parseBackupCodeHashes(expected.BackupCodes); err != nil {
 		return err
 	}
-	result := r.db.WithContext(ctx).Model(&models.User{}).
-		Where("id = ? AND two_factor_enabled = ?", userID, true).
-		Update("backup_codes", backupCodeHashes)
-	if result.Error != nil {
-		return result.Error
+	if _, err := parseBackupCodeHashes(replacementHashes); err != nil {
+		return err
 	}
-	if result.RowsAffected != 1 {
-		return ErrInvalidOTP
-	}
-	return nil
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&models.User{}).
+			Where(
+				"id = ? AND two_factor_enabled = ? AND password_hash = ? AND backup_codes = ?",
+				expected.UserID,
+				expected.OTPEnabled,
+				expected.PasswordHash,
+				expected.BackupCodes,
+			).
+			Update("backup_codes", replacementHashes)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrBackupCodesChanged
+		}
+		if err := tx.Create(&audit).Error; err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func (r *GormUserRepository) ConsumeBackupCode(

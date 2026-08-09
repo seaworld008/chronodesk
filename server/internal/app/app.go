@@ -42,6 +42,54 @@ func ginAdapter(handler func(auth.HTTPContext)) gin.HandlerFunc {
 	}
 }
 
+const backupCodeRegenerationRateLimitNamespace = "backup-code-regeneration"
+
+func backupCodeRegenerationRateLimitKey(rawKey string) string {
+	if strings.TrimSpace(rawKey) == "" {
+		return ""
+	}
+	return backupCodeRegenerationRateLimitNamespace + "|" + rawKey
+}
+
+func backupCodeRegenerationUserRouteKey(
+	context middleware.HTTPContext,
+) string {
+	userID, exists := context.Get("user_id")
+	typedUserID, valid := userID.(uint)
+	if !exists || !valid || typedUserID == 0 {
+		return ""
+	}
+	return backupCodeRegenerationRateLimitKey(
+		middleware.AuthenticatedUserRouteKeyFunc(context),
+	)
+}
+
+func newBackupCodeRegenerationRateLimit(
+	client middleware.RedisRateLimitScriptExecutor,
+	keyPepper []byte,
+	rateLimitConfig config.RateLimitConfig,
+) (gin.HandlerFunc, error) {
+	limiter, err := middleware.NewRedisSlidingWindow(
+		client,
+		keyPepper,
+		rateLimitConfig.BackupCodeRequests,
+		rateLimitConfig.BackupCodeWindow,
+		2*time.Second,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return middleware.WrapGinMiddleware(middleware.RateLimit(
+		&middleware.RateLimitConfig{
+			Limiter: limiter,
+			KeyFunc: func(context middleware.HTTPContext) string {
+				return backupCodeRegenerationUserRouteKey(context)
+			},
+			Headers: true,
+		},
+	)), nil
+}
+
 func registerPlatformProjectRoutes(
 	routes *gin.RouterGroup,
 	handler *handlers.ProjectHandler,
@@ -750,6 +798,14 @@ func Run() error {
 		KeyFunc: middleware.AuthenticatedUserRouteKeyFunc,
 		Headers: true,
 	}))
+	backupCodeRegenerationRateLimit, err := newBackupCodeRegenerationRateLimit(
+		db.Redis,
+		[]byte(cfg.Agent.CredentialPepper),
+		cfg.RateLimit,
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize backup-code regeneration Redis rate limiter: ", err)
+	}
 	a2aRateLimitError := func(ctx middleware.HTTPContext) {
 		ginContext, ok := ctx.(*middleware.GinHTTPContext)
 		if !ok {
@@ -912,7 +968,11 @@ func Run() error {
 				authenticated.POST("/enable-otp", ginAdapter(authModule.Handler.EnableOTP))
 				authenticated.POST("/disable-otp", ginAdapter(authModule.Handler.DisableOTP))
 				authenticated.POST("/verify-otp", ginAdapter(authModule.Handler.VerifyOTP))
-				authenticated.POST("/otp/backup-codes", ginAdapter(authModule.Handler.GenerateBackupCodes))
+				authenticated.POST(
+					"/otp/backup-codes",
+					backupCodeRegenerationRateLimit,
+					ginAdapter(authModule.Handler.GenerateBackupCodes),
+				)
 			}
 		}
 

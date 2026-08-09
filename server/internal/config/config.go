@@ -107,6 +107,8 @@ type RateLimitConfig struct {
 	AnonymousIdentityRequests int           `json:"anonymous_identity_requests"`
 	AnonymousIPRequests       int           `json:"anonymous_ip_requests"`
 	AnonymousWindow           time.Duration `json:"anonymous_window"`
+	BackupCodeRequests        int           `json:"backup_code_requests"`
+	BackupCodeWindow          time.Duration `json:"backup_code_window"`
 }
 
 // AgentConfig controls machine identities and protocol endpoints separately
@@ -342,6 +344,8 @@ func Load() (*Config, error) {
 			AnonymousIdentityRequests: getEnvAsInt("AUTH_IDENTITY_RATE_LIMIT_REQUESTS", 20),
 			AnonymousIPRequests:       getEnvAsInt("AUTH_IP_RATE_LIMIT_REQUESTS", 200),
 			AnonymousWindow:           getEnvAsDuration("AUTH_RATE_LIMIT_WINDOW", time.Minute),
+			BackupCodeRequests:        getEnvAsInt("OTP_BACKUP_CODE_RATE_LIMIT_REQUESTS", 5),
+			BackupCodeWindow:          getEnvAsDuration("OTP_BACKUP_CODE_RATE_LIMIT_WINDOW", 15*time.Minute),
 		},
 		Agent: AgentConfig{
 			JWTSecret:        getEnv("AGENT_JWT_SECRET", getEnv("JWT_SECRET", "your-super-secret-jwt-key-change-in-production")),
@@ -613,7 +617,9 @@ func (c *Config) Validate() error {
 		c.RateLimit.Window <= 0 ||
 		c.RateLimit.AnonymousIdentityRequests <= 0 ||
 		c.RateLimit.AnonymousIPRequests <= 0 ||
-		c.RateLimit.AnonymousWindow <= 0 {
+		c.RateLimit.AnonymousWindow <= 0 ||
+		c.RateLimit.BackupCodeRequests <= 0 ||
+		c.RateLimit.BackupCodeWindow <= 0 {
 		return fmt.Errorf("authenticated and anonymous rate limit requests and windows must be positive")
 	}
 	if c.AuditExport.StorageBackend == "" {

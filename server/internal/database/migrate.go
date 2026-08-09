@@ -237,6 +237,10 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 			"used", "expires_at", "used_at",
 		}},
 		{&auth.OTPCode{}, "otp_codes", []string{"user_id", "code", "type", "expires_at", "used", "used_at"}},
+		{&auth.AuthenticationSecurityAuditEvent{}, "authentication_security_audit_events", []string{
+			"id", "user_id", "event_type", "source", "request_id",
+			"trace_id", "correlation_id", "created_at",
+		}},
 		{&models.LoginHistory{}, "login_histories", []string{"user_id", "session_id", "is_active"}},
 		{&models.ServicePrincipal{}, "service_principals", []string{"id", "status", "scopes", "read_only", "emergency_disabled", "expires_at", "policy_epoch"}},
 		{&models.AgentCredential{}, "agent_credentials", []string{"service_principal_id", "secret_hash", "status", "expires_at", "revoked_at"}},
@@ -551,6 +555,7 @@ func schemaMigrationModels() []any {
 		&models.AdminAuditExportJob{},
 		&models.KnowledgeSourceLink{},
 		&models.KnowledgeObjectWriteIntent{},
+		&auth.AuthenticationSecurityAuditEvent{},
 	}
 }
 
