@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.1.0.
- * Contract SHA-256: 0c2b7ce6a2ee492345dd4151c45a12cfe9387a0b65ad151a6351ee101d5eb800.
+ * Contract SHA-256: 7073b291e7f744edf14a808d5eda53f6038885802a421d4507ace3a3f5ed3023.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -466,6 +466,18 @@ export type AdminAuditExport = {
 
 export type AdminAuditExportEnvelope = SuccessEnvelope & {
     data: AdminAuditExport
+}
+
+export type RegenerateOTPBackupCodesRequest = {
+    current_password: string
+}
+
+export type OTPBackupCodeRegenerationEnvelope = {
+    success: true
+    message: string
+    data: {
+        backup_codes: Array<string>
+    }
 }
 
 export type SuccessEnvelope = {
@@ -3418,6 +3430,11 @@ export type UpdateHumanProfileOperationQuery = Record<string, never>
 export type UpdateHumanProfileOperationRequest = UpdateHumanProfileRequest
 export type UpdateHumanProfileOperationResponse = AuthMessageSuccessEnvelope
 
+export type RegenerateOTPBackupCodesOperationPathParameters = Record<string, never>
+export type RegenerateOTPBackupCodesOperationQuery = Record<string, never>
+export type RegenerateOTPBackupCodesOperationRequest = RegenerateOTPBackupCodesRequest
+export type RegenerateOTPBackupCodesOperationResponse = OTPBackupCodeRegenerationEnvelope
+
 export type ListTrustedDevicesOperationPathParameters = Record<string, never>
 export type ListTrustedDevicesOperationQuery = {
     page?: number
@@ -5008,6 +5025,13 @@ export const humanApiOperations = {
         requestBody: "required",
         listStrategy: null,
     },
+    regenerateOTPBackupCodes: {
+        method: "POST",
+        path: "/auth/otp/backup-codes",
+        successStatus: 200,
+        requestBody: "required",
+        listStrategy: "bounded",
+    },
     listTrustedDevices: {
         method: "GET",
         path: "/user/trusted-devices",
@@ -6169,6 +6193,12 @@ export interface HumanApiOperationTypes {
         request: UpdateHumanProfileOperationRequest
         response: UpdateHumanProfileOperationResponse
     }
+    regenerateOTPBackupCodes: {
+        pathParameters: RegenerateOTPBackupCodesOperationPathParameters
+        query: RegenerateOTPBackupCodesOperationQuery
+        request: RegenerateOTPBackupCodesOperationRequest
+        response: RegenerateOTPBackupCodesOperationResponse
+    }
     listTrustedDevices: {
         pathParameters: ListTrustedDevicesOperationPathParameters
         query: ListTrustedDevicesOperationQuery
@@ -7204,6 +7234,8 @@ export const humanApiRoutes = {
         humanApiRoute("getHumanSessionUser", {}, query),
     updateHumanProfile: (query: UpdateHumanProfileOperationQuery = {}) =>
         humanApiRoute("updateHumanProfile", {}, query),
+    regenerateOTPBackupCodes: (query: RegenerateOTPBackupCodesOperationQuery = {}) =>
+        humanApiRoute("regenerateOTPBackupCodes", {}, query),
     listTrustedDevices: (query: ListTrustedDevicesOperationQuery = {}) =>
         humanApiRoute("listTrustedDevices", {}, query),
     revokeTrustedDevice: (pathParameters: RevokeTrustedDeviceOperationPathParameters, query: RevokeTrustedDeviceOperationQuery = {}) =>

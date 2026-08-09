@@ -163,6 +163,8 @@ for (const name of [
     'LoginRequest',
     'RefreshTokenRequest',
     'LogoutRequest',
+    'RegenerateOTPBackupCodesRequest',
+    'OTPBackupCodeRegenerationEnvelope',
     'HumanSessionUser',
     'AuthSession',
     'AuthSessionEnvelope',
@@ -278,6 +280,7 @@ const requiredOperations = [
     ['/auth/reset-password', 'post'],
     ['/auth/logout', 'post'],
     ['/auth/logout-all', 'post'],
+    ['/auth/otp/backup-codes', 'post'],
     ['/auth/me', 'get'],
     ['/auth/profile', 'put'],
     ['/user/trusted-devices', 'get'],
@@ -2219,6 +2222,14 @@ for (const [operationId, strategy] of [
 assert.match(generated, /export interface HumanApiOperationTypes \{/)
 assert.match(generated, /export const buildHumanApiRequest =/)
 assert.match(generated, /export const humanApiRoutes = \{/)
+assert.match(
+    generated,
+    /regenerateOTPBackupCodes: \(query: RegenerateOTPBackupCodesOperationQuery = \{\}\) =>[\s\S]*?humanApiRoute\("regenerateOTPBackupCodes", \{\}, query\)/,
+)
+assert.match(
+    humanApiTypeTest,
+    /buildHumanApiRequest\('regenerateOTPBackupCodes'/,
+)
 
 const exportedNames = [
     ...generated.matchAll(

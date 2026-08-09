@@ -619,6 +619,101 @@
         }
       }
     },
+    "/auth/otp/backup-codes": {
+      "post": {
+        "operationId": "regenerateOTPBackupCodes",
+        "summary": "Regenerate the current human's OTP backup codes",
+        "description": "Requires a current-password step-up and active OTP. The authenticated user's previous password hash, OTP state, and backup-code hashes are compared atomically; a concurrent authentication change returns `backup_codes_changed` without codes. A winning change and the secret-free `backup_codes_regenerated` authentication security audit commit in one transaction. This route has a dedicated authenticated-user-and-route Redis limit of at most 5 requests per 15 minutes in addition to the shared authenticated limiter.",
+        "tags": [
+          "Account security"
+        ],
+        "security": [
+          {
+            "humanBearer": []
+          }
+        ],
+        "x-chronodesk-platform-roles": [
+          "platform_admin",
+          "security_auditor",
+          "emergency_operator",
+          "member"
+        ],
+        "x-rate-limit": {
+          "limit": 5,
+          "window": "PT15M",
+          "key": "authenticated-user-and-route"
+        },
+        "x-list-strategy": "bounded",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegenerateOTPBackupCodesRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Exactly ten new single-use plaintext backup codes. Only this winning response receives the codes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OTPBackupCodeRegenerationEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Strict JSON is missing current_password, is empty, malformed, or contains unknown fields (`invalid_request`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The bearer is invalid or current_password is wrong (`invalid_password`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "OTP is disabled (`otp_not_enabled`) or the password, OTP state, or backup codes changed concurrently (`backup_codes_changed`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "description": "Atomic rotation, audit persistence, PostgreSQL, or Redis is unavailable and the operation fails closed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/user/trusted-devices": {
       "get": {
         "operationId": "listTrustedDevices",
@@ -15857,6 +15952,57 @@
             }
           }
         ]
+      },
+      "RegenerateOTPBackupCodesRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "current_password"
+        ],
+        "properties": {
+          "current_password": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "writeOnly": true
+          }
+        }
+      },
+      "OTPBackupCodeRegenerationEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "message",
+          "data"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "const": true
+          },
+          "message": {
+            "type": "string"
+          },
+          "data": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "backup_codes"
+            ],
+            "properties": {
+              "backup_codes": {
+                "type": "array",
+                "minItems": 10,
+                "maxItems": 10,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        }
       },
       "SuccessEnvelope": {
         "type": "object",

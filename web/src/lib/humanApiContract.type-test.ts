@@ -45,6 +45,23 @@ buildHumanApiRequest('resendHumanEmailVerification', {
   body: { email: 'human@example.com' },
 })
 
+buildHumanApiRequest('regenerateOTPBackupCodes', {
+  pathParameters: {},
+  body: { current_password: 'not-a-real-secret' },
+})
+
+// @ts-expect-error Backup-code regeneration requires current-password step-up.
+buildHumanApiRequest('regenerateOTPBackupCodes', { pathParameters: {} })
+
+buildHumanApiRequest('regenerateOTPBackupCodes', {
+  pathParameters: {},
+  body: {
+    current_password: 'not-a-real-secret',
+    // @ts-expect-error Strict request schema rejects unknown fields.
+    unexpected: true,
+  },
+})
+
 buildHumanApiRequest('getProjectTicketAllowedTransitions', {
   pathParameters: {
     projectKey: 'OPS',

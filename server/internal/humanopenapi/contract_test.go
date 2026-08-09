@@ -42,6 +42,102 @@ func TestRegisterRoutesPublishesEmbeddedHumanContract(t *testing.T) {
 	}
 }
 
+func TestBackupCodeRegenerationContractMatchesRuntimeSecurityBoundary(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	pathItem := objectAt(t, paths, "/auth/otp/backup-codes")
+	operation := objectAt(t, pathItem, "post")
+	if operation["operationId"] != "regenerateOTPBackupCodes" {
+		t.Fatalf("operationId = %v", operation["operationId"])
+	}
+	security, ok := operation["security"].([]any)
+	if !ok || len(security) != 1 {
+		t.Fatalf("security = %v, want human bearer", operation["security"])
+	}
+	securityRequirement, ok := security[0].(map[string]any)
+	if !ok {
+		t.Fatalf("security requirement = %T", security[0])
+	}
+	if _, ok := securityRequirement["humanBearer"]; !ok {
+		t.Fatalf("security = %v, want humanBearer", securityRequirement)
+	}
+
+	requestBody := objectAt(t, operation, "requestBody")
+	if requestBody["required"] != true {
+		t.Fatal("current-password request body is not required")
+	}
+	content := objectAt(t, requestBody, "content")
+	media := objectAt(t, content, "application/json")
+	requestSchema := objectAt(t, media, "schema")
+	if requestSchema["$ref"] !=
+		"#/components/schemas/RegenerateOTPBackupCodesRequest" {
+		t.Fatalf("request schema = %v", requestSchema)
+	}
+
+	schemas := objectAt(t, objectAt(t, document, "components"), "schemas")
+	request := objectAt(t, schemas, "RegenerateOTPBackupCodesRequest")
+	if request["additionalProperties"] != false {
+		t.Fatal("backup-code regeneration request accepts unknown fields")
+	}
+	required, ok := request["required"].([]any)
+	if !ok || len(required) != 1 || required[0] != "current_password" {
+		t.Fatalf("required fields = %v", request["required"])
+	}
+	currentPassword := objectAt(
+		t,
+		objectAt(t, request, "properties"),
+		"current_password",
+	)
+	if currentPassword["type"] != "string" ||
+		currentPassword["minLength"] != float64(1) ||
+		currentPassword["writeOnly"] != true {
+		t.Fatalf("current_password schema = %v", currentPassword)
+	}
+
+	responseSchema := objectAt(t, schemas, "OTPBackupCodeRegenerationEnvelope")
+	responseData := objectAt(
+		t,
+		objectAt(t, responseSchema, "properties"),
+		"data",
+	)
+	backupCodes := objectAt(
+		t,
+		objectAt(t, responseData, "properties"),
+		"backup_codes",
+	)
+	if backupCodes["type"] != "array" ||
+		backupCodes["minItems"] != float64(10) ||
+		backupCodes["maxItems"] != float64(10) {
+		t.Fatalf("backup_codes schema = %v", backupCodes)
+	}
+
+	responses := objectAt(t, operation, "responses")
+	for _, status := range []string{"200", "400", "401", "409", "413", "429", "503"} {
+		if _, ok := responses[status]; !ok {
+			t.Errorf("POST /auth/otp/backup-codes response %s is missing", status)
+		}
+	}
+	description, _ := operation["description"].(string)
+	if !strings.Contains(description, "5 requests per 15 minutes") {
+		t.Fatalf("dedicated rate limit is undocumented: %q", description)
+	}
+
+	serverRoot := filepath.Clean(filepath.Join("..", ".."))
+	count, err := routeinventory.CountRuntimeMethodPathRegistrations(
+		serverRoot,
+		http.MethodPost,
+		"/otp/backup-codes",
+	)
+	if err != nil {
+		t.Fatalf("scan runtime backup-code route: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("runtime POST /otp/backup-codes registrations = %d, want 1", count)
+	}
+}
+
 func TestHumanWebContractPublishesClosedRoleAndSessionSchemas(t *testing.T) {
 	var document map[string]any
 	if err := json.Unmarshal(Document(), &document); err != nil {
