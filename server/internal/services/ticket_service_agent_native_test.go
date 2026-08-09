@@ -3,6 +3,7 @@ package services
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -175,6 +176,52 @@ func TestHumanTicketDueDateOmittedLeavesValueAndVersionUnchanged(t *testing.T) {
 	assertHumanTicketDueDateAuditCount(t, fixture, 0, false)
 }
 
+func TestHumanTicketDueDateExplicitNullOnEmptyValueIsCompleteNoOp(t *testing.T) {
+	fixture := newHumanTicketWithoutDueDateFixture(t)
+	var before models.Ticket
+	if err := fixture.db.First(&before, fixture.ticket.ID).Error; err != nil {
+		t.Fatalf("load ticket before update: %v", err)
+	}
+	request := &models.TicketUpdateRequest{
+		DueDate: models.NewOptionalTime(nil),
+	}
+	changes, histories, _, err := NewAgentNativeService(fixture.db).buildHumanTicketUpdate(
+		fixture.ctx,
+		&before,
+		request,
+	)
+	if err != nil {
+		t.Fatalf("build empty due date update: %v", err)
+	}
+	if len(changes) != 0 || len(histories) != 0 {
+		t.Fatalf("explicit null for an empty due date produced changes=%#v histories=%#v", changes, histories)
+	}
+
+	updated, err := fixture.service.UpdateTicketExpectedVersion(
+		fixture.ctx,
+		fixture.ticket.ID,
+		request,
+		fixture.actor.ID,
+		fixture.ticket.Version,
+	)
+	if err != nil {
+		t.Fatalf("clear empty due date: %v", err)
+	}
+	assertTicketDueDate(t, updated, nil)
+	if updated.Version != fixture.ticket.Version {
+		t.Fatalf("version = %d, want unchanged %d", updated.Version, fixture.ticket.Version)
+	}
+
+	var after models.Ticket
+	if err := fixture.db.First(&after, fixture.ticket.ID).Error; err != nil {
+		t.Fatalf("load ticket after update: %v", err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("ticket changed after clearing an empty due date: before=%#v after=%#v", before, after)
+	}
+	assertHumanTicketDueDateAuditCount(t, fixture, 0, false)
+}
+
 func TestHumanTicketDueDateValueUpdatesWithAuditEventAndVersion(t *testing.T) {
 	fixture, _ := newHumanTicketDueDateFixture(t)
 	replacement := time.Date(2026, time.August, 5, 15, 45, 0, 0, time.UTC)
@@ -241,6 +288,11 @@ func newHumanTicketDueDateFixture(t *testing.T) (durableNotificationFixture, tim
 	}
 	fixture.ticket.DueDate = &initial
 	return fixture, initial
+}
+
+func newHumanTicketWithoutDueDateFixture(t *testing.T) durableNotificationFixture {
+	t.Helper()
+	return newDurableNotificationFixture(t, false)
 }
 
 func assertTicketDueDate(t *testing.T, ticket *models.Ticket, want *time.Time) {

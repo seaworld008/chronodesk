@@ -245,11 +245,13 @@ func (s *AgentNativeService) buildHumanTicketUpdate(
 		add("tags", []string(current.Tags), []string(normalizedTags), models.HistoryActionUpdate, "标签已更新", false)
 	}
 	if dueDate, present := request.DueDate.Value(); present {
-		var updatedDueDate any
-		if dueDate != nil {
-			updatedDueDate = dueDate
+		if !equalOptionalTime(current.DueDate, dueDate) {
+			var updatedDueDate any
+			if dueDate != nil {
+				updatedDueDate = dueDate
+			}
+			add("due_date", current.DueDate, updatedDueDate, models.HistoryActionUpdate, "截止时间已更新", true)
 		}
-		add("due_date", current.DueDate, updatedDueDate, models.HistoryActionUpdate, "截止时间已更新", true)
 	}
 	if request.CustomerEmail != nil {
 		add("customer_email", current.CustomerEmail, *request.CustomerEmail, models.HistoryActionUpdate, "客户邮箱已更新", false)
