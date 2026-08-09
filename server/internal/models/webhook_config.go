@@ -47,15 +47,26 @@ const (
 	WebhookCredentialShredReasonRevoked   WebhookCredentialShredReason = "revoked"
 )
 
+var webhookCredentialShredReasonValues = []WebhookCredentialShredReason{
+	WebhookCredentialShredReasonSucceeded,
+	WebhookCredentialShredReasonExpired,
+	WebhookCredentialShredReasonRevoked,
+}
+
+func WebhookCredentialShredReasonValues() []WebhookCredentialShredReason {
+	return append(
+		[]WebhookCredentialShredReason(nil),
+		webhookCredentialShredReasonValues...,
+	)
+}
+
 func (reason WebhookCredentialShredReason) IsValid() bool {
-	switch reason {
-	case WebhookCredentialShredReasonSucceeded,
-		WebhookCredentialShredReasonExpired,
-		WebhookCredentialShredReasonRevoked:
-		return true
-	default:
-		return false
+	for _, candidate := range webhookCredentialShredReasonValues {
+		if reason == candidate {
+			return true
+		}
 	}
+	return false
 }
 
 func WebhookDeliverySnapshotDestinationID(
@@ -287,6 +298,7 @@ type WebhookDeliverySnapshot struct {
 
 	OrganizationID  uint      `json:"organization_id" gorm:"not null;index;<-:create"`
 	ProjectID       uint      `json:"project_id" gorm:"not null;index;<-:create;check:chk_webhook_snapshot_scope,organization_id > 0 AND project_id > 0 AND event_id <> ''"`
+	ProjectScope    Project   `json:"-" gorm:"-:migration;foreignKey:OrganizationID,ProjectID;references:OrganizationID,ID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
 	ConfigID        uint      `json:"config_id" gorm:"not null;index;uniqueIndex:idx_webhook_snapshot_event_config,priority:2;<-:create"`
 	EventID         string    `json:"event_id" gorm:"size:64;not null;index;uniqueIndex:idx_webhook_snapshot_event_config,priority:1;<-:create"`
 	ConfigUpdatedAt time.Time `json:"config_updated_at" gorm:"not null;<-:create"`
@@ -299,8 +311,8 @@ type WebhookDeliverySnapshot struct {
 	PreviousSecretExpiresAt *time.Time                    `json:"-" gorm:"<-:create"`
 	AccessToken             string                        `json:"-" gorm:"size:2048;<-:create"`
 	CredentialExpiresAt     time.Time                     `json:"credential_expires_at" gorm:"not null;index;<-:create"`
-	CredentialShreddedAt    *time.Time                    `json:"credential_shredded_at,omitempty" gorm:"index;<-:create;check:chk_webhook_snapshot_shred_state,(credential_shredded_at IS NULL AND credential_shred_reason IS NULL) OR (credential_shredded_at IS NOT NULL AND credential_shred_reason IS NOT NULL AND secret = '' AND previous_secret = '' AND access_token = '')"`
-	CredentialShredReason   *WebhookCredentialShredReason `json:"credential_shred_reason,omitempty" gorm:"size:20;<-:create;check:chk_webhook_snapshot_shred_reason,credential_shred_reason IS NULL OR credential_shred_reason = 'succeeded' OR credential_shred_reason = 'expired' OR credential_shred_reason = 'revoked'"`
+	CredentialShreddedAt    *time.Time                    `json:"credential_shredded_at,omitempty" gorm:"index;<-:create;check:chk_webhook_snapshot_shred_state,(credential_shredded_at IS NULL AND credential_shred_reason IS NULL) OR (credential_shredded_at IS NOT NULL AND credential_shred_reason IS NOT NULL AND secret IS NOT NULL AND secret = '' AND previous_secret IS NOT NULL AND previous_secret = '' AND access_token IS NOT NULL AND access_token = '')"`
+	CredentialShredReason   *WebhookCredentialShredReason `json:"credential_shred_reason,omitempty" gorm:"type:varchar(20);<-:create;check:chk_webhook_snapshot_shred_reason,credential_shred_reason IS NULL OR credential_shred_reason = 'succeeded' OR credential_shred_reason = 'expired' OR credential_shred_reason = 'revoked'"`
 
 	EnabledEvents   string `json:"-" gorm:"type:text;not null;<-:create"`
 	MessageTemplate string `json:"-" gorm:"type:text;<-:create"`

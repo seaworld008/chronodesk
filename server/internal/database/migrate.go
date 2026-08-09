@@ -21,6 +21,13 @@ import (
 // but the process must fail fast instead of starting schedulers that repeatedly
 // fail against an older schema.
 func ValidateRuntimeSchema(db *gorm.DB) error {
+	return validateRuntimeSchema(db, true)
+}
+
+func validateRuntimeSchema(
+	db *gorm.DB,
+	requireWebhookCredentialFoundation bool,
+) error {
 	if db == nil {
 		return fmt.Errorf("database is required")
 	}
@@ -69,8 +76,10 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 		if err := ValidateCategoryScopeContract(db); err != nil {
 			return err
 		}
-		if err := validateWebhookCredentialLifetimeCatalog(db); err != nil {
-			return err
+		if requireWebhookCredentialFoundation {
+			if err := validateWebhookCredentialLifetimeCatalog(db); err != nil {
+				return err
+			}
 		}
 		return ValidateProjectRLSReadiness(db)
 	}
@@ -123,8 +132,10 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 	if err := ValidateCategoryScopeContract(db); err != nil {
 		return err
 	}
-	if err := validateWebhookCredentialLifetimeCatalog(db); err != nil {
-		return err
+	if requireWebhookCredentialFoundation {
+		if err := validateWebhookCredentialLifetimeCatalog(db); err != nil {
+			return err
+		}
 	}
 	return ValidateProjectRLSReadiness(db)
 }
@@ -1160,21 +1171,31 @@ func RunMigrationsFromModel(
 	if db.Config == nil || db.Statement == nil {
 		return errors.New("migration database is not initialized")
 	}
+	if err := validateMigrationResumePoint(
+		firstModel,
+		len(schemaMigrationModels()),
+	); err != nil {
+		return err
+	}
 	db = db.WithContext(ctx)
-	return db.Transaction(func(tx *gorm.DB) error {
-		if err := lockLegacyPlatformRoleTables(tx); err != nil {
-			return err
-		}
-		if err := preflightLegacyPlatformRoleValues(tx); err != nil {
-			return err
-		}
-		return runMigrationsFromModelLocked(
-			ctx,
-			tx,
-			firstModel,
-			membershipWriters...,
-		)
-	})
+	return runBoundedMigrationOrchestration(
+		ctx,
+		db,
+		func(tx *gorm.DB) error {
+			if err := lockLegacyPlatformRoleTables(tx); err != nil {
+				return err
+			}
+			if err := preflightLegacyPlatformRoleValues(tx); err != nil {
+				return err
+			}
+			return runMigrationsFromModelLocked(
+				ctx,
+				tx,
+				firstModel,
+				membershipWriters...,
+			)
+		},
+	)
 }
 
 func runMigrationsFromModelLocked(
@@ -1215,18 +1236,10 @@ func runMigrationsFromModelLocked(
 		return fmt.Errorf("admin audit actor preparation failed: %w", err)
 	}
 
-	// 4. Checkpoints are outside the resumable model window: a retry that
-	// starts after this model must still be able to prove whether destructive
-	// data cutovers committed.
-	if err := db.AutoMigrate(&models.SchemaMigrationCheckpoint{}); err != nil {
-		return fmt.Errorf("schema migration checkpoint setup failed: %w", err)
-	}
-	if err := PrepareWebhookSnapshotCredentialLifetimeContract(db); err != nil {
-		return fmt.Errorf(
-			"webhook credential lifetime preparation failed: %w",
-			err,
-		)
-	}
+	// 4. The foundation checkpoint and complete legacy webhook credential
+	// cutover ran in a dedicated top-level transaction before this main
+	// migration transaction. This keeps ACCESS EXCLUSIVE off the rest of the
+	// model scan while the session advisory lock still serializes migrations.
 
 	// 5. Category scope has a dedicated evidence-driven cutover. Stage only a
 	// retryable zero sentinel before the canonical NOT NULL model is parsed.
@@ -1383,13 +1396,6 @@ func runMigrationsFromModelLocked(
 	if err := MigrateProjectRLS(db); err != nil {
 		return fmt.Errorf("project RLS migration failed: %w", err)
 	}
-	if err := MigrateWebhookSnapshotCredentialLifetimeContract(db); err != nil {
-		return fmt.Errorf(
-			"webhook credential lifetime migration failed: %w",
-			err,
-		)
-	}
-
 	// 19. 所有其他持久迁移成功后，最后切换平台角色、删除旧 role
 	// 列并写入 checkpoint。随后的 runtime gate 只读，因此 checkpoint 是
 	// 该外层事务的最后一笔 durable write。
@@ -1398,7 +1404,7 @@ func runMigrationsFromModelLocked(
 	}
 
 	// 19. 验证运行时所需的关键表、列、索引与 RLS policy readiness。
-	if err := ValidateRuntimeSchema(db); err != nil {
+	if err := validateRuntimeSchema(db, false); err != nil {
 		return fmt.Errorf("runtime schema validation failed: %w", err)
 	}
 

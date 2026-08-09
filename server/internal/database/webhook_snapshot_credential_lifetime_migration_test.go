@@ -1,8 +1,10 @@
 package database
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -310,6 +312,81 @@ func TestWebhookCredentialLifetimeMigrationRollsBackBackfillWithCheckpoint(
 	)
 }
 
+func TestRunMigrationsRecoversFromFreshSQLitePostCutoverFailure(
+	t *testing.T,
+) {
+	db, err := gorm.Open(
+		sqlite.Open(
+			"file:"+strings.ReplaceAll(t.Name(), "/", "-")+
+				"?mode=memory&cache=shared",
+		),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const callbackName = "test:fail_fresh_sqlite_post_cutover"
+	if err := db.Callback().Create().Before("gorm:create").Register(
+		callbackName,
+		func(tx *gorm.DB) {
+			checkpoint, ok := tx.Statement.Dest.(*models.SchemaMigrationCheckpoint)
+			if ok &&
+				checkpoint.Key ==
+					webhookSnapshotCredentialLifetimeCheckpointKey {
+				_ = tx.AddError(
+					errors.New("injected fresh SQLite post-cutover failure"),
+				)
+			}
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	err = RunMigrations(db)
+	if err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"injected fresh SQLite post-cutover failure",
+		) {
+		t.Fatalf("fresh SQLite post-cutover error = %v", err)
+	}
+	if err := ValidateRuntimeSchema(db); err == nil {
+		t.Fatalf(
+			"runtime schema accepted failed fresh post-cutover: %v",
+			err,
+		)
+	}
+	if err := db.Callback().Create().Remove(callbackName); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("recover fresh SQLite post-cutover: %v", err)
+	}
+	var checkpoint models.SchemaMigrationCheckpoint
+	if err := db.Where(
+		"key = ?",
+		webhookSnapshotCredentialLifetimeCheckpointKey,
+	).Take(&checkpoint).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("rerun recovered fresh SQLite migration: %v", err)
+	}
+	var rerun models.SchemaMigrationCheckpoint
+	if err := db.Where(
+		"key = ?",
+		webhookSnapshotCredentialLifetimeCheckpointKey,
+	).Take(&rerun).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !rerun.CompletedAt.Equal(checkpoint.CompletedAt) {
+		t.Fatalf(
+			"fresh SQLite rerun changed checkpoint from %s to %s",
+			checkpoint.CompletedAt,
+			rerun.CompletedAt,
+		)
+	}
+}
+
 func TestWebhookCredentialLifetimeMigrationRejectsExistingDeadlineMismatch(
 	t *testing.T,
 ) {
@@ -558,12 +635,31 @@ func TestValidateWebhookCredentialLifetimeContractFailsClosedOnBadData(
 		t.Run(test.name, func(t *testing.T) {
 			db := openLegacyWebhookCredentialMigrationDB(t, "validate-"+test.name)
 			seedLegacyWebhookCredentialPair(t, db)
-			if err := migrateWebhookSnapshotCredentialLifetimeContractAt(
-				db,
-				time.Date(2026, 8, 10, 1, 2, 3, 0, time.UTC),
-			); err != nil {
-				t.Fatalf("migrate valid fixture: %v", err)
+			if err := prepareWebhookSnapshotCredentialLifetimeColumns(db); err != nil {
+				t.Fatalf("prepare validator fixture: %v", err)
 			}
+			deadline := time.Date(
+				2026,
+				8,
+				17,
+				1,
+				2,
+				3,
+				0,
+				time.UTC,
+			)
+			mustExecWebhookCredentialTest(
+				t,
+				db,
+				"UPDATE webhook_delivery_snapshots SET credential_expires_at = ?",
+				deadline,
+			)
+			mustExecWebhookCredentialTest(
+				t,
+				db,
+				"UPDATE outbox_deliveries SET expires_at = ?",
+				deadline,
+			)
 			test.mutate(t, db)
 			_, err := loadAndValidateWebhookCredentialPairs(
 				db,
@@ -600,6 +696,274 @@ func TestValidateWebhookCredentialLifetimeContractRejectsMissingSchema(
 	}
 }
 
+func TestRuntimeWebhookCredentialValidationRejectsUnknownProjectStatus(
+	t *testing.T,
+) {
+	db := openLegacyWebhookCredentialMigrationDB(t, "runtime-status")
+	seedLegacyWebhookCredentialPair(t, db)
+	if err := migrateWebhookSnapshotCredentialLifetimeContractAt(
+		db,
+		time.Date(2026, 8, 10, 1, 2, 3, 0, time.UTC),
+	); err != nil {
+		t.Fatal(err)
+	}
+	mustExecWebhookCredentialTest(
+		t,
+		db,
+		"PRAGMA ignore_check_constraints = ON",
+	)
+	mustExecWebhookCredentialTest(
+		t,
+		db,
+		"UPDATE projects SET status = 'mystery' WHERE id = 22",
+	)
+	mustExecWebhookCredentialTest(
+		t,
+		db,
+		"PRAGMA ignore_check_constraints = OFF",
+	)
+	err := ValidateWebhookSnapshotCredentialLifetimeRuntimeData(
+		context.Background(),
+		db,
+	)
+	if err == nil ||
+		!strings.Contains(strings.ToLower(err.Error()), "status") {
+		t.Fatalf(
+			"runtime validation error = %v, want unknown Project status",
+			err,
+		)
+	}
+}
+
+func TestWebhookCredentialProjectScopeForeignKeysRejectDirectoryOrphans(
+	t *testing.T,
+) {
+	db := openLegacyWebhookCredentialMigrationDB(t, "project-scope-fk")
+	seedLegacyWebhookCredentialPair(t, db)
+	if err := migrateWebhookSnapshotCredentialLifetimeContractAt(
+		db,
+		time.Date(2026, 8, 10, 1, 2, 3, 0, time.UTC),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec("DELETE FROM projects WHERE id = 22").Error; err == nil {
+		t.Fatal("Project hard delete bypassed child scope foreign keys")
+	}
+}
+
+func TestRuntimeWebhookCredentialValidationDoesNotScanNonWebhookHistory(
+	t *testing.T,
+) {
+	db := openLegacyWebhookCredentialMigrationDB(t, "runtime-bounded")
+	seedLegacyWebhookCredentialPair(t, db)
+	if err := migrateWebhookSnapshotCredentialLifetimeContractAt(
+		db,
+		time.Date(2026, 8, 10, 1, 2, 3, 0, time.UTC),
+	); err != nil {
+		t.Fatal(err)
+	}
+	mustExecWebhookCredentialTest(
+		t,
+		db,
+		`INSERT INTO outbox_deliveries (
+			id, organization_id, project_id, event_id,
+			destination_type, destination_id, status
+		 ) VALUES (
+			'legacy-non-webhook-id', 11, 22, ?,
+			'test_delivery', 'large-history', 'pending'
+		 )`,
+		legacyWebhookEventID,
+	)
+	if err := ValidateWebhookSnapshotCredentialLifetimeRuntimeData(
+		context.Background(),
+		db,
+	); err != nil {
+		t.Fatalf(
+			"runtime validator scanned non-webhook history: %v",
+			err,
+		)
+	}
+}
+
+func TestCanonicalWebhookConstraintDefinitionPreservesLogicalGrouping(
+	t *testing.T,
+) {
+	leftGrouped, err := canonicalWebhookConstraintDefinition(
+		`CHECK ((a = 'x' AND b = 'y') OR (c = 'z' AND d = 'w'))`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightGrouped, err := canonicalWebhookConstraintDefinition(
+		`CHECK (a = 'x' AND (b = 'y' OR c = 'z') AND d = 'w')`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leftGrouped == rightGrouped {
+		t.Fatalf(
+			"logically different CHECK groupings collapsed to %q",
+			leftGrouped,
+		)
+	}
+}
+
+func TestWebhookCredentialColumnContractRejectsWrongExistingSQLiteColumns(
+	t *testing.T,
+) {
+	tests := []struct {
+		name        string
+		snapshotDDL string
+		outboxDDL   string
+		wantColumn  string
+	}{
+		{
+			name: "snapshot deadline text",
+			snapshotDDL: `CREATE TABLE webhook_delivery_snapshots (
+				credential_expires_at TEXT NOT NULL,
+				credential_shredded_at DATETIME,
+				credential_shred_reason VARCHAR(20)
+			)`,
+			outboxDDL: `CREATE TABLE outbox_deliveries (
+				expires_at DATETIME,
+				expired_at DATETIME
+			)`,
+			wantColumn: "credential_expires_at",
+		},
+		{
+			name: "snapshot shredded timestamp not null",
+			snapshotDDL: `CREATE TABLE webhook_delivery_snapshots (
+				credential_expires_at DATETIME NOT NULL,
+				credential_shredded_at DATETIME NOT NULL,
+				credential_shred_reason VARCHAR(20)
+			)`,
+			outboxDDL: `CREATE TABLE outbox_deliveries (
+				expires_at DATETIME,
+				expired_at DATETIME
+			)`,
+			wantColumn: "credential_shredded_at",
+		},
+		{
+			name: "shred reason length",
+			snapshotDDL: `CREATE TABLE webhook_delivery_snapshots (
+				credential_expires_at DATETIME NOT NULL,
+				credential_shredded_at DATETIME,
+				credential_shred_reason VARCHAR(21)
+			)`,
+			outboxDDL: `CREATE TABLE outbox_deliveries (
+				expires_at DATETIME,
+				expired_at DATETIME
+			)`,
+			wantColumn: "credential_shred_reason",
+		},
+		{
+			name: "outbox expiry not null with default",
+			snapshotDDL: `CREATE TABLE webhook_delivery_snapshots (
+				credential_expires_at DATETIME NOT NULL,
+				credential_shredded_at DATETIME,
+				credential_shred_reason VARCHAR(20)
+			)`,
+			outboxDDL: `CREATE TABLE outbox_deliveries (
+				expires_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				expired_at DATETIME
+			)`,
+			wantColumn: "expires_at",
+		},
+		{
+			name: "outbox expired timestamp text default",
+			snapshotDDL: `CREATE TABLE webhook_delivery_snapshots (
+				credential_expires_at DATETIME NOT NULL,
+				credential_shredded_at DATETIME,
+				credential_shred_reason VARCHAR(20)
+			)`,
+			outboxDDL: `CREATE TABLE outbox_deliveries (
+				expires_at DATETIME,
+				expired_at TEXT DEFAULT 'never'
+			)`,
+			wantColumn: "expired_at",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, err := gorm.Open(
+				sqlite.Open(
+					"file:"+strings.ReplaceAll(t.Name(), "/", "-")+
+						"?mode=memory&cache=shared",
+				),
+				&gorm.Config{},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Exec(test.snapshotDDL).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Exec(test.outboxDDL).Error; err != nil {
+				t.Fatal(err)
+			}
+			err = validateWebhookCredentialColumnContract(db)
+			if err == nil ||
+				!strings.Contains(err.Error(), test.wantColumn) {
+				t.Fatalf(
+					"column contract error = %v, want %s rejection",
+					err,
+					test.wantColumn,
+				)
+			}
+		})
+	}
+}
+
+func TestWebhookCredentialClosedVocabularyMatchesCanonicalModelValues(
+	t *testing.T,
+) {
+	statusExpression := closedVocabularyConstraintExpression(
+		"status",
+		models.OutboxDeliveryStatusValues(),
+	)
+	if got := webhookCredentialConstraintDefinitions["chk_outbox_delivery_status"].expression; got != statusExpression {
+		t.Fatalf(
+			"Outbox status CHECK = %q, want canonical %q",
+			got,
+			statusExpression,
+		)
+	}
+	reasonExpression := nullableClosedVocabularyConstraintExpression(
+		"credential_shred_reason",
+		models.WebhookCredentialShredReasonValues(),
+	)
+	if got := webhookCredentialConstraintDefinitions["chk_webhook_snapshot_shred_reason"].expression; got != reasonExpression {
+		t.Fatalf(
+			"shred reason CHECK = %q, want canonical %q",
+			got,
+			reasonExpression,
+		)
+	}
+
+	statusField, ok := reflect.TypeOf(models.OutboxDelivery{}).
+		FieldByName("Status")
+	if !ok {
+		t.Fatal("OutboxDelivery.Status field is missing")
+	}
+	assertGORMCheckUsesCanonicalExpression(
+		t,
+		statusField.Tag.Get("gorm"),
+		"chk_outbox_delivery_status",
+		statusExpression,
+	)
+	reasonField, ok := reflect.TypeOf(models.WebhookDeliverySnapshot{}).
+		FieldByName("CredentialShredReason")
+	if !ok {
+		t.Fatal("WebhookDeliverySnapshot.CredentialShredReason field is missing")
+	}
+	assertGORMCheckUsesCanonicalExpression(
+		t,
+		reasonField.Tag.Get("gorm"),
+		"chk_webhook_snapshot_shred_reason",
+		reasonExpression,
+	)
+}
+
 func TestSQLiteWebhookCredentialConstraintsRejectInvalidDirectSQL(
 	t *testing.T,
 ) {
@@ -614,6 +978,7 @@ func TestSQLiteWebhookCredentialConstraintsRejectInvalidDirectSQL(
 		t.Fatal(err)
 	}
 	if err := db.AutoMigrate(
+		&models.Project{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
 		&models.WebhookDeliverySnapshot{},
@@ -725,6 +1090,39 @@ func TestSQLiteWebhookCredentialConstraintsRejectInvalidDirectSQL(
 			args: []any{now, snapshot.ID},
 		},
 		{
+			name: "shredded secret null",
+			query: `UPDATE webhook_delivery_snapshots
+				SET credential_shredded_at = ?,
+				    credential_shred_reason = 'succeeded',
+				    secret = NULL,
+				    previous_secret = '',
+				    access_token = ''
+				WHERE id = ?`,
+			args: []any{now, snapshot.ID},
+		},
+		{
+			name: "shredded previous secret null",
+			query: `UPDATE webhook_delivery_snapshots
+				SET credential_shredded_at = ?,
+				    credential_shred_reason = 'succeeded',
+				    secret = '',
+				    previous_secret = NULL,
+				    access_token = ''
+				WHERE id = ?`,
+			args: []any{now, snapshot.ID},
+		},
+		{
+			name: "shredded access token null",
+			query: `UPDATE webhook_delivery_snapshots
+				SET credential_shredded_at = ?,
+				    credential_shred_reason = 'succeeded',
+				    secret = '',
+				    previous_secret = '',
+				    access_token = NULL
+				WHERE id = ?`,
+			args: []any{now, snapshot.ID},
+		},
+		{
 			name:  "snapshot deadline removed",
 			query: "UPDATE webhook_delivery_snapshots SET credential_expires_at = NULL WHERE id = ?",
 			args:  []any{snapshot.ID},
@@ -736,6 +1134,42 @@ func TestSQLiteWebhookCredentialConstraintsRejectInvalidDirectSQL(
 				t.Fatalf("invalid direct SQL passed constraint: %s", test.query)
 			}
 		})
+	}
+}
+
+func assertGORMCheckUsesCanonicalExpression(
+	t *testing.T,
+	tag string,
+	name string,
+	wantExpression string,
+) {
+	t.Helper()
+	marker := "check:" + name + ","
+	start := strings.Index(tag, marker)
+	if start < 0 {
+		t.Fatalf("GORM tag %q is missing %s", tag, name)
+	}
+	got := tag[start+len(marker):]
+	if separator := strings.Index(got, ";"); separator >= 0 {
+		got = got[:separator]
+	}
+	gotCanonical, err := canonicalWebhookConstraintDefinition(got)
+	if err != nil {
+		t.Fatalf("parse GORM CHECK %s: %v", name, err)
+	}
+	wantCanonical, err := canonicalWebhookConstraintDefinition(
+		wantExpression,
+	)
+	if err != nil {
+		t.Fatalf("parse canonical CHECK %s: %v", name, err)
+	}
+	if gotCanonical != wantCanonical {
+		t.Fatalf(
+			"GORM CHECK %s = %q, want %q",
+			name,
+			got,
+			wantExpression,
+		)
 	}
 }
 
@@ -753,10 +1187,24 @@ func openLegacyWebhookCredentialMigrationDB(
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := db.Exec("PRAGMA foreign_keys = ON").Error; err != nil {
+		t.Fatal(err)
+	}
 	if err := db.AutoMigrate(&models.SchemaMigrationCheckpoint{}); err != nil {
 		t.Fatal(err)
 	}
 	statements := []string{
+		`CREATE TABLE projects (
+			id INTEGER NOT NULL,
+			organization_id INTEGER NOT NULL,
+			status VARCHAR(20) NOT NULL,
+			PRIMARY KEY (id),
+			CONSTRAINT chk_projects_status CHECK (
+				status IN ('active', 'archived')
+			)
+		)`,
+		`CREATE UNIQUE INDEX idx_projects_scope_id
+		 ON projects(organization_id, id)`,
 		`CREATE TABLE domain_events (
 			id TEXT PRIMARY KEY,
 			organization_id INTEGER NOT NULL,
@@ -794,6 +1242,20 @@ func openLegacyWebhookCredentialMigrationDB(
 func seedLegacyWebhookCredentialPair(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	createdAt := time.Date(2026, 8, 1, 1, 2, 3, 0, time.UTC)
+	projectInsert := `INSERT OR IGNORE INTO projects (
+		id, organization_id, status
+	 ) VALUES
+		(22, 11, 'active'),
+		(23, 11, 'archived')`
+	if db.Dialector.Name() == "postgres" {
+		projectInsert = `INSERT INTO projects (
+			id, organization_id, status
+		 ) VALUES
+			(22, 11, 'active'),
+			(23, 11, 'archived')
+		 ON CONFLICT (id) DO NOTHING`
+	}
+	mustExecWebhookCredentialTest(t, db, projectInsert)
 	mustExecWebhookCredentialTest(
 		t,
 		db,

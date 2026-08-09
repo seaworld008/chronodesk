@@ -884,7 +884,6 @@ func installCategoryScopeContract(tx *gorm.DB) error {
 		categoryScopeListIndex,
 		categoryScopeParentIndex,
 		categoryScopeTypeIndex,
-		projectScopeIDIndex,
 	} {
 		if err := tx.Exec(
 			"DROP INDEX IF EXISTS " +
@@ -908,8 +907,6 @@ func installCategoryScopeContract(tx *gorm.DB) error {
 			" ON categories(organization_id, project_id, parent_id)",
 		"CREATE INDEX " + categoryScopeTypeIndex +
 			" ON categories(organization_id, project_id, type, id)",
-		"CREATE UNIQUE INDEX " + projectScopeIDIndex +
-			" ON projects(organization_id, id)",
 	} {
 		if err := tx.Exec(statement).Error; err != nil {
 			return fmt.Errorf(
@@ -954,6 +951,16 @@ func installCategoryScopeContract(tx *gorm.DB) error {
 				err,
 			)
 		}
+	}
+	if err := tx.Exec(
+		"CREATE UNIQUE INDEX IF NOT EXISTS " + projectScopeIDIndex +
+			" ON projects(organization_id, id)",
+	).Error; err != nil {
+		return fmt.Errorf(
+			"ensure Project scope identity index %s: %w",
+			projectScopeIDIndex,
+			err,
+		)
 	}
 	return nil
 }

@@ -116,6 +116,24 @@ const (
 	ProjectStatusArchived ProjectStatus = "archived"
 )
 
+var projectStatusValues = []ProjectStatus{
+	ProjectStatusActive,
+	ProjectStatusArchived,
+}
+
+func ProjectStatusValues() []ProjectStatus {
+	return append([]ProjectStatus(nil), projectStatusValues...)
+}
+
+func (status ProjectStatus) IsValid() bool {
+	for _, candidate := range projectStatusValues {
+		if status == candidate {
+			return true
+		}
+	}
+	return false
+}
+
 type TeamStatus string
 
 const (
@@ -231,12 +249,12 @@ func (unit *BusinessUnit) BeforeCreate(_ *gorm.DB) error {
 }
 
 type Project struct {
-	ID        uint      `json:"id" gorm:"primaryKey;autoIncrement"`
+	ID        uint      `json:"id" gorm:"primaryKey;autoIncrement;uniqueIndex:idx_projects_scope_id,priority:2"`
 	PublicID  string    `json:"public_id" gorm:"size:36;not null;uniqueIndex;<-:create"`
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"autoUpdateTime"`
 
-	OrganizationID uint          `json:"organization_id" gorm:"not null;index;uniqueIndex:idx_projects_organization_key,priority:1"`
+	OrganizationID uint          `json:"organization_id" gorm:"not null;index;uniqueIndex:idx_projects_organization_key,priority:1;uniqueIndex:idx_projects_scope_id,priority:1"`
 	Organization   Organization  `json:"organization,omitempty" gorm:"constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
 	BusinessUnitID uint          `json:"business_unit_id" gorm:"not null;index"`
 	BusinessUnit   BusinessUnit  `json:"business_unit,omitempty" gorm:"constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`

@@ -17,6 +17,7 @@ type automationWebhookIndexColumn struct {
 type automationWebhookIndexDefinition struct {
 	name    string
 	table   string
+	unique  bool
 	columns []automationWebhookIndexColumn
 }
 
@@ -370,7 +371,11 @@ func postgresAutomationWebhookIndexDDL(
 	schema string,
 	definition automationWebhookIndexDefinition,
 ) string {
-	return "CREATE INDEX " +
+	unique := ""
+	if definition.unique {
+		unique = "UNIQUE "
+	}
+	return "CREATE " + unique + "INDEX " +
 		quoteAutomationWebhookPostgresIdentifier(definition.name) +
 		" ON " +
 		quoteAutomationWebhookPostgresIdentifier(schema) + "." +
@@ -426,7 +431,11 @@ func migrateSQLiteAutomationWebhookPaginationIndexes(db *gorm.DB) error {
 func sqliteAutomationWebhookIndexDDL(
 	definition automationWebhookIndexDefinition,
 ) string {
-	return "CREATE INDEX " +
+	unique := ""
+	if definition.unique {
+		unique = "UNIQUE "
+	}
+	return "CREATE " + unique + "INDEX " +
 		quoteAutomationWebhookSQLiteIdentifier(definition.name) +
 		" ON " +
 		quoteAutomationWebhookSQLiteIdentifier(definition.table) +
@@ -483,9 +492,10 @@ func ValidateAutomationWebhookPaginationIndexes(db *gorm.DB) error {
 		}
 		if !valid {
 			return fmt.Errorf(
-				"pagination index %s on %s must be a valid, ready, non-unique, non-partial, non-expression btree index on (%s) in exact order; run `go run ./cmd/migrate`",
+				"pagination index %s on %s must be a valid, ready, unique=%t, non-partial, non-expression btree index on (%s) in exact order; run `go run ./cmd/migrate`",
 				definition.name,
 				definition.table,
+				definition.unique,
 				automationWebhookIndexContractDescription(definition),
 			)
 		}
@@ -582,7 +592,7 @@ func postgresAutomationWebhookIndexIsValid(
 			row.KeyColumnCount != len(definition.columns) ||
 			row.AttributeCount != len(definition.columns) ||
 			row.AccessMethod != "btree" ||
-			row.IsUnique ||
+			row.IsUnique != definition.unique ||
 			!row.IsValid ||
 			!row.IsReady ||
 			!row.IsLive ||
@@ -649,7 +659,8 @@ func sqliteAutomationWebhookIndexIsValid(
 			continue
 		}
 		found = true
-		if index.Unique != 0 || index.Partial != 0 {
+		if (index.Unique != 0) != definition.unique ||
+			index.Partial != 0 {
 			return false, nil
 		}
 		break

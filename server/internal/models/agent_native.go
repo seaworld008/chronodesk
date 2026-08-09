@@ -243,6 +243,7 @@ type DomainEvent struct {
 	CreatedAt            time.Time      `json:"created_at" gorm:"autoCreateTime;index"`
 	OrganizationID       uint           `json:"organizationid" gorm:"not null;index"`
 	ProjectID            uint           `json:"projectid" gorm:"not null;index"`
+	ProjectScope         Project        `json:"-" gorm:"-:migration;foreignKey:OrganizationID,ProjectID;references:OrganizationID,ID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
 	ConfigurationVersion string         `json:"configurationversion,omitempty" gorm:"size:100;index"`
 	PolicyDecisionID     string         `json:"policydecisionid,omitempty" gorm:"size:36;index"`
 	SpecVersion          string         `json:"specversion" gorm:"size:10;not null;default:'1.0'"`
@@ -280,18 +281,26 @@ const (
 	OutboxDeliveryExpired    OutboxDeliveryStatus = "expired"
 )
 
+var outboxDeliveryStatusValues = []OutboxDeliveryStatus{
+	OutboxDeliveryPending,
+	OutboxDeliveryProcessing,
+	OutboxDeliverySucceeded,
+	OutboxDeliveryFailed,
+	OutboxDeliveryDead,
+	OutboxDeliveryExpired,
+}
+
+func OutboxDeliveryStatusValues() []OutboxDeliveryStatus {
+	return append([]OutboxDeliveryStatus(nil), outboxDeliveryStatusValues...)
+}
+
 func (status OutboxDeliveryStatus) IsValid() bool {
-	switch status {
-	case OutboxDeliveryPending,
-		OutboxDeliveryProcessing,
-		OutboxDeliverySucceeded,
-		OutboxDeliveryFailed,
-		OutboxDeliveryDead,
-		OutboxDeliveryExpired:
-		return true
-	default:
-		return false
+	for _, candidate := range outboxDeliveryStatusValues {
+		if status == candidate {
+			return true
+		}
 	}
+	return false
 }
 
 // OutboxDelivery tracks independent delivery state for each event target.
@@ -301,6 +310,7 @@ type OutboxDelivery struct {
 	UpdatedAt       time.Time            `json:"updated_at" gorm:"autoUpdateTime"`
 	OrganizationID  uint                 `json:"organization_id" gorm:"not null;index"`
 	ProjectID       uint                 `json:"project_id" gorm:"not null;index"`
+	ProjectScope    Project              `json:"-" gorm:"-:migration;foreignKey:OrganizationID,ProjectID;references:OrganizationID,ID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
 	EventID         string               `json:"event_id" gorm:"size:36;not null;uniqueIndex:idx_event_destination,priority:1"`
 	Event           *DomainEvent         `json:"event,omitempty" gorm:"foreignKey:EventID"`
 	DestinationType string               `json:"destination_type" gorm:"size:50;not null;uniqueIndex:idx_event_destination,priority:2;index"`

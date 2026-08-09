@@ -1432,6 +1432,24 @@ func TestConfiguredWebhookAppendFailuresRollBackWholeIntent(t *testing.T) {
 			if err := db.Create(&config).Error; err != nil {
 				t.Fatal(err)
 			}
+			ledger, err := NewAuditLedgerService(db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var auditWritten atomic.Bool
+			auditCallbackName := "test:observe_audit_before_" + failedTable
+			if err := db.Callback().Create().After("gorm:create").Register(
+				auditCallbackName,
+				func(tx *gorm.DB) {
+					if tx.Statement != nil &&
+						tx.Statement.Table == "audit_ledger_entries" &&
+						tx.Error == nil {
+						auditWritten.Store(true)
+					}
+				},
+			); err != nil {
+				t.Fatal(err)
+			}
 			callbackName := "test:fail_" + failedTable
 			if err := db.Callback().Create().Before("gorm:create").Register(
 				callbackName,
@@ -1446,8 +1464,10 @@ func TestConfiguredWebhookAppendFailuresRollBackWholeIntent(t *testing.T) {
 			}
 			t.Cleanup(func() {
 				_ = db.Callback().Create().Remove(callbackName)
+				_ = db.Callback().Create().Remove(auditCallbackName)
 			})
 			service := NewAgentNativeService(db, AgentNativeOptions{
+				AuditLedger: ledger,
 				DefaultOutboxTargets: []OutboxTarget{{
 					Type: "webhook",
 					ID:   "configured",
@@ -1473,10 +1493,18 @@ func TestConfiguredWebhookAppendFailuresRollBackWholeIntent(t *testing.T) {
 					err,
 				)
 			}
+			if !auditWritten.Load() {
+				t.Fatalf(
+					"injected %s failure occurred before the audit ledger write",
+					failedTable,
+				)
+			}
 			for name, model := range map[string]any{
-				"events":     &models.DomainEvent{},
-				"deliveries": &models.OutboxDelivery{},
-				"snapshots":  &models.WebhookDeliverySnapshot{},
+				"events":      &models.DomainEvent{},
+				"deliveries":  &models.OutboxDelivery{},
+				"snapshots":   &models.WebhookDeliverySnapshot{},
+				"audit heads": &models.AuditChainHead{},
+				"audit rows":  &models.AuditLedgerEntry{},
 			} {
 				var count int64
 				if err := db.Model(model).Count(&count).Error; err != nil {

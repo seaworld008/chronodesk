@@ -151,7 +151,7 @@ func TestReplayOutboxCASDoesNotClearConcurrentWorkerClaimPostgres(
 		OrganizationID:  scope.OrganizationID,
 		ProjectID:       scope.ProjectID,
 		EventID:         event.ID,
-		DestinationType: "webhook",
+		DestinationType: "test_delivery",
 		DestinationID:   "outbox-replay-race",
 		Status:          models.OutboxDeliveryFailed,
 		Attempts:        3,
