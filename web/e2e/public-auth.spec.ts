@@ -762,6 +762,413 @@ test('公共认证标签不会用旧 checkAuth 状态注销新密码会话', asy
         .toBe(accessToken)
 })
 
+test('同一 Human session 刷新轮换不会重载受保护标签且下一请求使用新 bearer', async ({
+    context,
+    page: protectedPage,
+}) => {
+    const identity = {
+        ...defaultMockIdentity,
+        sessionID: 'e2e-same-session-refresh-rotation',
+        email: 'same-session-refresh@example.test',
+    }
+    const access = authorizedProjectAccess(projectA, 'requester')
+    const oldToken = await installMockSession(
+        protectedPage,
+        identity,
+        projectA,
+    )
+    const rotatedToken = mockSessionToken(
+        identity,
+        Math.floor(Date.now() / 1000) + 12 * 60 * 60,
+    )
+    const user = {
+        id: identity.id,
+        username: `e2e-${identity.id}`,
+        email: identity.email,
+        platform_role: identity.platformRole,
+        status: 'active',
+        email_verified: true,
+        otp_enabled: false,
+        last_login_at: null,
+        profile: {
+            first_name: '服务端名字',
+            last_name: '已加载查询态',
+            timezone: 'Asia/Shanghai',
+            language: 'zh-CN',
+        },
+    }
+    let refreshRequests = 0
+    let logoutRequests = 0
+    let profileGetRequests = 0
+    let profileUpdateBearer = ''
+    let markRefreshRequestStarted: (() => void) | undefined
+    const refreshRequestStarted = new Promise<void>((resolve) => {
+        markRefreshRequestStarted = resolve
+    })
+    let releaseRefreshResponse: (() => void) | undefined
+    const refreshResponseReleased = new Promise<void>((resolve) => {
+        releaseRefreshResponse = resolve
+    })
+
+    await protectedPage.addInitScript(() => {
+        const key = 'chronodesk.e2e.protected-load-count'
+        const next = Number(sessionStorage.getItem(key) ?? '0') + 1
+        sessionStorage.setItem(key, String(next))
+    })
+    await context.route('**/api/**', async (route) => {
+        const request = route.request()
+        const pathname = new URL(request.url()).pathname
+        const authorization = request.headers().authorization ?? ''
+        if (
+            pathname === '/api/auth/refresh' &&
+            request.method() === 'POST'
+        ) {
+            refreshRequests += 1
+            markRefreshRequestStarted?.()
+            await refreshResponseReleased
+            await fulfillJSON(route, {
+                code: 0,
+                data: {
+                    user,
+                    access_token: rotatedToken,
+                    refresh_token: `${identity.sessionID}-refresh-rotated`,
+                    expires_in: 12 * 60 * 60,
+                    token_type: 'Bearer',
+                },
+            })
+            return
+        }
+        if (
+            pathname === '/api/auth/logout' &&
+            request.method() === 'POST'
+        ) {
+            logoutRequests += 1
+            await fulfillJSON(route, {
+                success: true,
+                message: '已退出当前会话',
+            })
+            return
+        }
+        if (
+            pathname === '/api/auth/profile' &&
+            request.method() === 'PUT'
+        ) {
+            profileUpdateBearer = authorization
+            await fulfillJSON(route, { code: 0, data: user })
+            return
+        }
+        if (pathname === '/api/auth/me') {
+            profileGetRequests += 1
+            await fulfillJSON(route, { code: 0, data: user })
+            return
+        }
+        if (pathname === '/api/projects') {
+            await fulfillJSON(route, { code: 0, data: [access] })
+            return
+        }
+        if (pathname === `/api/projects/${projectA.key}/context`) {
+            await fulfillJSON(route, { code: 0, data: access })
+            return
+        }
+        await fulfillJSON(route, { code: 0, data: [] })
+    })
+
+    await protectedPage.goto('/#/account/profile')
+    await expect(protectedPage.getByTestId('account-profile-page')).toBeVisible()
+    await expect(protectedPage.getByLabel('姓氏')).toHaveValue('已加载查询态')
+    await protectedPage.getByLabel('名字').fill('受保护标签未提交表单')
+    const profileGetRequestsBeforeRotation = profileGetRequests
+    expect(profileGetRequestsBeforeRotation).toBeGreaterThan(0)
+    expect(
+        await protectedPage.evaluate(() =>
+            sessionStorage.getItem(
+                'chronodesk.e2e.protected-load-count',
+            ),
+        ),
+    ).toBe('1')
+
+    const refreshPage = await context.newPage()
+    await refreshPage.clock.install({
+        time: Date.now() + 3 * 60 * 60 * 1000,
+    })
+    const refreshNavigation = refreshPage.goto('/#/')
+    await refreshRequestStarted
+
+    await expect
+        .poll(() =>
+            protectedPage.evaluate(() => localStorage.getItem('token')),
+        )
+        .toBe(oldToken)
+    await expect(protectedPage.getByLabel('名字')).toHaveValue(
+        '受保护标签未提交表单',
+    )
+
+    releaseRefreshResponse?.()
+    await refreshNavigation
+    await expect
+        .poll(() =>
+            protectedPage.evaluate(() => localStorage.getItem('token')),
+        )
+        .toBe(rotatedToken)
+    await protectedPage.waitForTimeout(100)
+
+    expect(refreshRequests).toBeGreaterThan(0)
+    expect(logoutRequests).toBe(0)
+    expect(profileGetRequests).toBe(profileGetRequestsBeforeRotation)
+    await expect(protectedPage).toHaveURL(/\/#\/account\/profile$/u)
+    await expect(protectedPage.getByLabel('名字')).toHaveValue(
+        '受保护标签未提交表单',
+    )
+    await expect(protectedPage.getByLabel('姓氏')).toHaveValue('已加载查询态')
+    expect(
+        await protectedPage.evaluate(() =>
+            sessionStorage.getItem(
+                'chronodesk.e2e.protected-load-count',
+            ),
+        ),
+    ).toBe('1')
+
+    await protectedPage
+        .getByRole('button', { name: '保存个人资料' })
+        .click()
+    await expect
+        .poll(() => profileUpdateBearer)
+        .toBe(`Bearer ${rotatedToken}`)
+    expect(logoutRequests).toBe(0)
+    expect(
+        await protectedPage.evaluate(() =>
+            sessionStorage.getItem(
+                'chronodesk.e2e.protected-load-count',
+            ),
+        ),
+    ).toBe('1')
+})
+
+for (const replacement of [
+    {
+        name: 'subject 变化',
+        identity: {
+            ...defaultMockIdentity,
+            id: defaultMockIdentity.id + 1,
+            email: 'different-subject@example.test',
+        },
+    },
+    {
+        name: 'session ID 变化',
+        identity: {
+            ...defaultMockIdentity,
+            sessionID: 'e2e-different-session-id',
+        },
+    },
+]) {
+    test(`受保护标签在${replacement.name}时仍按账号或会话替换重载`, async ({
+        context,
+        page: protectedPage,
+    }) => {
+        const initialIdentity = {
+            ...defaultMockIdentity,
+            sessionID: 'e2e-replacement-initial-session',
+        }
+        const initialToken = await installMockSession(
+            protectedPage,
+            initialIdentity,
+            projectA,
+        )
+        const replacementToken = mockSessionToken(replacement.identity)
+        const access = authorizedProjectAccess(projectA, 'requester')
+        await protectedPage.addInitScript(() => {
+            const key = 'chronodesk.e2e.replacement-load-count'
+            const next = Number(sessionStorage.getItem(key) ?? '0') + 1
+            sessionStorage.setItem(key, String(next))
+        })
+        await context.route('**/api/**', async (route) => {
+            const authorization =
+                route.request().headers().authorization ?? ''
+            const usingReplacement =
+                authorization === `Bearer ${replacementToken}`
+            const identity = usingReplacement
+                ? replacement.identity
+                : initialIdentity
+            const pathname = new URL(route.request().url()).pathname
+            const user = {
+                id: identity.id,
+                username: `e2e-${identity.id}`,
+                email: identity.email,
+                platform_role: identity.platformRole,
+                status: 'active',
+                email_verified: true,
+                otp_enabled: false,
+                last_login_at: null,
+            }
+            if (pathname === '/api/auth/me') {
+                await fulfillJSON(route, { code: 0, data: user })
+                return
+            }
+            if (pathname === '/api/projects') {
+                await fulfillJSON(route, { code: 0, data: [access] })
+                return
+            }
+            if (pathname === `/api/projects/${projectA.key}/context`) {
+                await fulfillJSON(route, { code: 0, data: access })
+                return
+            }
+            await fulfillJSON(route, { code: 0, data: [] })
+        })
+
+        await protectedPage.goto('/#/')
+        await expect(protectedPage.getByTestId('account-menu')).toBeVisible()
+        expect(
+            await protectedPage.evaluate(() =>
+                sessionStorage.getItem(
+                    'chronodesk.e2e.replacement-load-count',
+                ),
+            ),
+        ).toBe('1')
+        await expect
+            .poll(() =>
+                protectedPage.evaluate(() => localStorage.getItem('token')),
+            )
+            .toBe(initialToken)
+
+        const committingPage = await context.newPage()
+        await committingPage.goto('/#/login')
+        await committingPage.evaluate(
+            ({ identity, token }) => {
+                for (const key of [
+                    'token',
+                    'refreshToken',
+                    'user',
+                    'tokenExpiresAt',
+                ]) {
+                    localStorage.removeItem(key)
+                }
+                const payload = JSON.parse(
+                    atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')),
+                ) as { exp: number }
+                localStorage.setItem(
+                    'refreshToken',
+                    `${identity.sessionID}-refresh`,
+                )
+                localStorage.setItem(
+                    'user',
+                    JSON.stringify({
+                        id: identity.id,
+                        username: `e2e-${identity.id}`,
+                        email: identity.email,
+                        platform_role: identity.platformRole,
+                        status: 'active',
+                        email_verified: true,
+                        otp_enabled: false,
+                    }),
+                )
+                localStorage.setItem(
+                    'tokenExpiresAt',
+                    String(payload.exp * 1000),
+                )
+                localStorage.setItem('token', token)
+            },
+            {
+                identity: replacement.identity,
+                token: replacementToken,
+            },
+        )
+
+        await expect
+            .poll(() =>
+                protectedPage.evaluate(() =>
+                    Number(
+                        sessionStorage.getItem(
+                            'chronodesk.e2e.replacement-load-count',
+                        ) ?? '0',
+                    ),
+                ),
+            )
+            .toBeGreaterThan(1)
+        await expect
+            .poll(() =>
+                protectedPage.evaluate(() => localStorage.getItem('token')),
+            )
+            .toBe(replacementToken)
+    })
+}
+
+for (const commitCase of [
+    { name: '残缺', kind: 'incomplete' as const },
+    { name: '畸形', kind: 'malformed' as const },
+]) {
+    test(`${commitCase.name} token-last 提交 fail closed 且不发送旧 bearer`, async ({
+        page,
+    }) => {
+        const identity = {
+            ...defaultMockIdentity,
+            sessionID: `e2e-${commitCase.kind}-session-commit`,
+        }
+        const token = await installMockSession(page, identity, projectA)
+        const access = authorizedProjectAccess(projectA, 'requester')
+        const user = {
+            id: identity.id,
+            username: `e2e-${identity.id}`,
+            email: identity.email,
+            platform_role: identity.platformRole,
+            status: 'active',
+            email_verified: true,
+            otp_enabled: false,
+            last_login_at: null,
+            profile: {
+                first_name: '完整状态',
+                last_name: '测试用户',
+                timezone: 'Asia/Shanghai',
+                language: 'zh-CN',
+            },
+        }
+        let protectedUpdates = 0
+        await page.route('**/api/**', async (route) => {
+            const request = route.request()
+            const pathname = new URL(request.url()).pathname
+            if (
+                pathname === '/api/auth/profile' &&
+                request.method() === 'PUT'
+            ) {
+                protectedUpdates += 1
+                await fulfillJSON(route, { code: 0, data: user })
+                return
+            }
+            if (pathname === '/api/auth/me') {
+                await fulfillJSON(route, { code: 0, data: user })
+                return
+            }
+            if (pathname === '/api/projects') {
+                await fulfillJSON(route, { code: 0, data: [access] })
+                return
+            }
+            if (pathname === `/api/projects/${projectA.key}/context`) {
+                await fulfillJSON(route, { code: 0, data: access })
+                return
+            }
+            await fulfillJSON(route, { code: 0, data: [] })
+        })
+
+        await page.goto('/#/account/profile')
+        await expect(page.getByTestId('account-profile-page')).toBeVisible()
+        await page.evaluate(
+            ({ committedToken, kind }) => {
+                if (kind === 'incomplete') {
+                    localStorage.removeItem('refreshToken')
+                    localStorage.setItem('token', committedToken)
+                    return
+                }
+                localStorage.setItem('token', 'not-a-jwt')
+            },
+            { committedToken: token, kind: commitCase.kind },
+        )
+        await page.getByLabel('名字').fill(`不得提交${commitCase.name}状态`)
+        await page.getByRole('button', { name: '保存个人资料' }).click()
+
+        await expect(page).toHaveURL(/\/#\/login$/u)
+        expect(protectedUpdates).toBe(0)
+    })
+}
+
 test('受保护标签在跨账号登录和退出后重载身份且不提交旧缓存', async ({
     context,
     page: loginPage,

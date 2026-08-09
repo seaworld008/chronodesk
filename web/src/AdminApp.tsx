@@ -34,7 +34,10 @@ import { useQueryClient } from '@tanstack/react-query'
 import { dataProvider } from './lib/dataProvider'
 import { authProvider } from './lib/authProvider'
 import { humanSessionStorageCommitKey } from './lib/authQueryState'
-import { humanTabSessionMatches } from './lib/humanTabSession'
+import {
+    adoptHumanTabSessionRotation,
+    readCommittedHumanTabSessionToken,
+} from './lib/humanTabSession'
 import {
     getPlatformRoleLabel,
     hasPlatformCapability,
@@ -1087,10 +1090,11 @@ const AppRuntimeCoordinator = () => {
             }
             storageRevalidationTimer.current = window.setTimeout(() => {
                 storageRevalidationTimer.current = null
+                const committedAccessToken =
+                    readCommittedHumanTabSessionToken()
                 if (
-                    !humanTabSessionMatches(
-                        localStorage.getItem('token'),
-                    )
+                    committedAccessToken === null ||
+                    !adoptHumanTabSessionRotation(committedAccessToken)
                 ) {
                     signalSessionReplaced()
                 }

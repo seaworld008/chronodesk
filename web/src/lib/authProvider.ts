@@ -30,7 +30,10 @@ import {
 import {
     authenticationStorageKeys,
 } from './humanSessionStorage'
-import { bindHumanTabSession } from './humanTabSession'
+import {
+    bindHumanTabSession,
+    readCommittedHumanTabSessionToken,
+} from './humanTabSession'
 import { joinApiUrl } from './apiUrl'
 
 const apiBase = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
@@ -136,6 +139,7 @@ const readStoredUser = (): HumanSessionUser | null => {
 }
 
 export const hasCompleteAuthenticationState = (): boolean =>
+    readCommittedHumanTabSessionToken() !== null &&
     readStoredUser() !== null
 
 export const clearAuthenticationState = (): void => {
@@ -435,16 +439,18 @@ export const authProvider: AuthProvider = {
     },
 
     checkAuth: async () => {
-        let binding = readHumanSessionBinding()
-        if (!binding || readStoredUser() === null) {
+        let committedToken = readCommittedHumanTabSessionToken()
+        let binding = readHumanSessionBinding(committedToken)
+        if (!committedToken || !binding || readStoredUser() === null) {
             clearAuthenticationState()
             throw new Error('登录会话无效，请重新登录')
         }
         if (Date.now() >= binding.expires_at) {
             await refreshStoredSession()
-            binding = readHumanSessionBinding()
+            committedToken = readCommittedHumanTabSessionToken()
+            binding = readHumanSessionBinding(committedToken)
         }
-        if (!binding || readStoredUser() === null) {
+        if (!committedToken || !binding || readStoredUser() === null) {
             clearAuthenticationState()
             throw new Error('登录状态已过期，请重新登录')
         }

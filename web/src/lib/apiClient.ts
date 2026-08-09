@@ -8,7 +8,11 @@ import {
   signalSessionReplaced,
 } from './projectScopeEvents'
 import { joinApiUrl } from './apiUrl'
-import { humanTabSessionMatches } from './humanTabSession'
+import {
+  adoptHumanTabSessionRotation,
+  humanTabSessionMatches,
+  readCommittedHumanTabSessionToken,
+} from './humanTabSession'
 
 export type ApiOptions = RequestInit & { rawResponse?: boolean }
 
@@ -33,7 +37,14 @@ export const sessionAwareFetch = async (
   const authorization = requestHeaders.get('Authorization')
   if (authorization?.startsWith('Bearer ')) {
     const accessToken = authorization.slice('Bearer '.length)
-    if (!humanTabSessionMatches(accessToken)) {
+    const committedAccessToken = readCommittedHumanTabSessionToken()
+    if (
+      committedAccessToken !== accessToken ||
+      (
+        !humanTabSessionMatches(accessToken) &&
+        !adoptHumanTabSessionRotation(accessToken)
+      )
+    ) {
       signalSessionReplaced()
       throw new Error('登录账号已在其他标签页发生变化，请刷新后继续')
     }
