@@ -17,6 +17,9 @@ import (
 	"github.com/gin-gonic/gin"
 	httpmiddleware "github.com/seaworld008/chronodesk/server/internal/middleware"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/observability"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"gorm.io/gorm"
 )
 
@@ -25,14 +28,25 @@ const (
 	backupCodeTestHash     = "current-password-hash"
 )
 
-type backupCodeTestPasswordService struct{}
+type backupCodeTestPasswordService struct {
+	expectedHash     string
+	expectedPassword string
+}
 
 func (backupCodeTestPasswordService) HashPassword(password string) (string, error) {
 	return "hash:" + password, nil
 }
 
-func (backupCodeTestPasswordService) VerifyPassword(hash, password string) error {
-	if hash != backupCodeTestHash || password != backupCodeTestPassword {
+func (service backupCodeTestPasswordService) VerifyPassword(hash, password string) error {
+	expectedHash := service.expectedHash
+	if expectedHash == "" {
+		expectedHash = backupCodeTestHash
+	}
+	expectedPassword := service.expectedPassword
+	if expectedPassword == "" {
+		expectedPassword = backupCodeTestPassword
+	}
+	if hash != expectedHash || password != expectedPassword {
 		return errors.New("password verification failed")
 	}
 	return nil
@@ -1004,12 +1018,29 @@ func newProductionMiddlewareBackupCodeTest(
 	*bytes.Buffer,
 	*backupCodeTestLogger,
 ) {
+	return newProductionMiddlewareBackupCodeTestWithPassword(
+		t,
+		repository,
+		backupCodeTestPasswordService{},
+	)
+}
+
+func newProductionMiddlewareBackupCodeTestWithPassword(
+	t *testing.T,
+	repository *backupCodeMemoryRepository,
+	passwordService PasswordService,
+) (
+	*gin.Engine,
+	*bytes.Buffer,
+	*bytes.Buffer,
+	*backupCodeTestLogger,
+) {
 	t.Helper()
 	otpService := &backupCodeTestOTPService{}
 	service := &AuthService{
 		userRepo:        repository,
 		otpService:      otpService,
-		passwordService: backupCodeTestPasswordService{},
+		passwordService: passwordService,
 	}
 	authLogger := &backupCodeTestLogger{}
 	handler := NewAuthHandler(service, authLogger)
@@ -1028,6 +1059,23 @@ func newProductionMiddlewareBackupCodeTest(
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+	t.Cleanup(func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Errorf("shutdown tracing provider: %v", err)
+		}
+	})
+	router.Use(httpmiddleware.TracingMiddleware(
+		httpmiddleware.TelemetryConfig{
+			TracerProvider: provider,
+			Propagator: propagation.NewCompositeTextMapPropagator(
+				propagation.TraceContext{},
+				propagation.Baggage{},
+			),
+		},
+	))
 	router.Use(
 		httpmiddleware.WrapGinMiddlewares(
 			httpmiddleware.SetupMiddlewares(config),
@@ -1165,5 +1213,94 @@ func TestBackupCodeRegenerationBoundsLongAuditRequestID(t *testing.T) {
 			utf8.RuneCountInString(audit.RequestID),
 			audit.RequestID,
 		)
+	}
+}
+
+func TestFullProductionStackUsesServerTelemetryForBackupCodeAudit(t *testing.T) {
+	const (
+		currentPassword = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		passwordHash    = "sensitive-route-password-hash"
+		oldCode         = "OLD-CODE-01"
+		totpSecret      = "TOTPSECRETBASE32"
+		otpStorageHash  = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	oldHashes, err := hashBackupCodes([]string{oldCode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &backupCodeMemoryRepository{
+		user: User{
+			ID:             42,
+			PasswordHash:   passwordHash,
+			OTPEnabled:     true,
+			OTPSecret:      totpSecret,
+			OTPStorageHash: otpStorageHash,
+			BackupCodes:    oldHashes,
+		},
+	}
+	router, accessLogs, recoveryLogs, authLogger :=
+		newProductionMiddlewareBackupCodeTestWithPassword(
+			t,
+			repository,
+			backupCodeTestPasswordService{
+				expectedHash:     passwordHash,
+				expectedPassword: currentPassword,
+			},
+		)
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/auth/otp/backup-codes",
+		strings.NewReader(
+			`{"current_password":"`+currentPassword+`"}`,
+		),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(
+		"traceparent",
+		"00-"+currentPassword+"-00f067aa0ba902b7-01",
+	)
+	request.Header.Set("tracestate", "vendor="+totpSecret)
+	request.Header.Set("baggage", "otp_storage_hash="+otpStorageHash)
+	request.Header.Set(observability.CorrelationIDHeader, oldCode)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", response.Code, response.Body.String())
+	}
+
+	_, audits := repository.snapshot()
+	if len(audits) != 1 {
+		t.Fatalf("success audit count = %d", len(audits))
+	}
+	auditJSON, err := json.Marshal(audits[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := accessLogs.String() +
+		recoveryLogs.String() +
+		authLogger.serialized()
+	for _, secret := range []string{
+		currentPassword,
+		oldCode,
+		totpSecret,
+		otpStorageHash,
+		oldHashes,
+	} {
+		for name, values := range response.Header() {
+			if strings.Contains(strings.Join(values, ","), secret) {
+				t.Fatalf("response header %s exposed %q", name, secret)
+			}
+		}
+		if bytes.Contains(auditJSON, []byte(secret)) {
+			t.Fatalf("success audit exposed %q: %s", secret, auditJSON)
+		}
+		if strings.Contains(logs, secret) {
+			t.Fatalf("production logs exposed %q:\n%s", secret, logs)
+		}
+	}
+	if audits[0].TraceID == "" ||
+		audits[0].CorrelationID == "" ||
+		!observability.IsValidCorrelationID(audits[0].CorrelationID) {
+		t.Fatalf("server telemetry was not retained in audit: %+v", audits[0])
 	}
 }
