@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/seaworld008/chronodesk/server/internal/middleware"
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 )
 
@@ -31,6 +32,29 @@ func NewCrossProjectWorkbenchHandler(
 		service:  service,
 		response: middleware.NewResponseHelper(),
 	}
+}
+
+func projectWorkbenchPageForHuman(
+	page *services.CrossProjectWorkbenchPage,
+) *services.CrossProjectWorkbenchPage {
+	if page == nil {
+		return nil
+	}
+	response := *page
+	response.Items = make(
+		[]services.CrossProjectWorkbenchTicket,
+		len(page.Items),
+	)
+	copy(response.Items, page.Items)
+	for index := range response.Items {
+		if response.Items[index].ProjectRole != models.ProjectRoleObserver {
+			continue
+		}
+		response.Items[index].CreatedByID = nil
+		response.Items[index].AssignedToID = nil
+		response.Items[index].AssignedToName = ""
+	}
+	return &response
 }
 
 // ListTickets exposes the ordinary human workbench. It intentionally does not
@@ -72,7 +96,11 @@ func (handler *CrossProjectWorkbenchHandler) ListTickets(c *gin.Context) {
 		writeCrossProjectWorkbenchError(c, handler.response, err)
 		return
 	}
-	handler.response.Success(c, result, "获取我的跨项目工作台成功")
+	handler.response.Success(
+		c,
+		projectWorkbenchPageForHuman(result),
+		"获取我的跨项目工作台成功",
+	)
 }
 
 func parseOptionalPositiveInt(value string, fallback int) (int, error) {

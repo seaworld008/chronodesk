@@ -70,7 +70,6 @@ func (s *NotificationWebSocketService) PushNotification(ctx context.Context, not
 		"is_read":        notificationData.IsRead,
 		"action_url":     notificationData.ActionURL,
 		"sender":         notificationData.Sender,
-		"related_ticket": notificationData.RelatedTicket,
 	}); err != nil {
 		return err
 	}

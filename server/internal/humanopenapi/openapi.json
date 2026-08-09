@@ -17719,18 +17719,13 @@
           "sla_due_date",
           "response_time",
           "resolution_time",
-          "customer_email",
-          "customer_phone",
-          "customer_name",
           "custom_fields",
           "view_count",
           "comment_count",
           "rating",
           "rating_comment",
           "version",
-          "agent_context",
           "trust_level",
-          "created_by_actor",
           "is_overdue",
           "is_escalated"
         ],
@@ -18609,6 +18604,27 @@
           }
         }
       },
+      "NotificationTicketSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "ticket_number",
+          "title"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "ticket_number": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
       "Notification": {
         "type": "object",
         "additionalProperties": false,
@@ -18623,6 +18639,7 @@
           "channel",
           "related_type",
           "related_id",
+          "related_ticket",
           "is_read",
           "read_at",
           "is_sent",
@@ -18680,7 +18697,14 @@
             "minimum": 1
           },
           "related_ticket": {
-            "$ref": "#/components/schemas/Ticket"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NotificationTicketSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "is_read": {
             "type": "boolean"

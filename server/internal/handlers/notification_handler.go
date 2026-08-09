@@ -46,6 +46,26 @@ func NewNotificationHandler(notificationService services.NotificationServiceInte
 	}
 }
 
+func notificationResponseForRole(
+	notification *models.Notification,
+	role string,
+	currentUserID uint,
+) *models.NotificationResponse {
+	if notification == nil {
+		return nil
+	}
+	response := notification.ToResponse()
+	if !isRequesterRole(role) {
+		return response
+	}
+	if notification.RelatedTicket == nil ||
+		notification.RelatedTicket.CreatedByID == nil ||
+		*notification.RelatedTicket.CreatedByID != currentUserID {
+		response.RelatedTicket = nil
+	}
+	return response
+}
+
 // GetNotifications 获取用户通知列表
 func (h *NotificationHandler) GetNotifications(c *gin.Context) {
 	userIDValue, exists := c.Get("user_id")
@@ -168,7 +188,14 @@ func (h *NotificationHandler) GetNotifications(c *gin.Context) {
 
 	responses := make([]*models.NotificationResponse, 0, len(notifications))
 	for _, notification := range notifications {
-		responses = append(responses, notification.ToResponse())
+		responses = append(
+			responses,
+			notificationResponseForRole(
+				notification,
+				normalizedProjectRole(c),
+				userID,
+			),
+		)
 	}
 
 	totalPages := int64(0)
@@ -761,7 +788,11 @@ func (h *NotificationHandler) CreateNotification(c *gin.Context) {
 		}
 	}
 
-	response := notification.ToResponse()
+	response := notificationResponseForRole(
+		notification,
+		string(access.Role),
+		c.GetUint("user_id"),
+	)
 	if notification.DeliveryStatus ==
 		services.NotificationDeliveryStatusSuppressedByPreference {
 		// Managers may create a notification for another member, but they may

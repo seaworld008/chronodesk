@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"gorm.io/datatypes"
+	"gorm.io/gorm"
 )
 
 func TestGetNotificationsPreservesRecipientAndReadFilters(t *testing.T) {
@@ -114,6 +117,176 @@ func TestGetNotificationsPreservesRecipientAndReadFilters(t *testing.T) {
 	}
 	if total != 2 || len(items) != 1 || items[0].ID != notifications[0].ID {
 		t.Fatalf("pagination changed filters: len=%d total=%d first=%v", len(items), total, items)
+	}
+}
+
+func TestGetNotificationsBatchPreloadsOnlyScopedTicketSummaryAndOwnership(
+	t *testing.T,
+) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.Ticket{},
+		&models.Notification{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	recipient := models.User{
+		Username:     "summary-recipient",
+		Email:        "summary-recipient@example.test",
+		PasswordHash: "hash",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&recipient).Error; err != nil {
+		t.Fatal(err)
+	}
+	ownerID := recipient.ID
+	otherOwnerID := ownerID + 1
+	tickets := []models.Ticket{
+		{
+			OrganizationID: 1,
+			ProjectID:      1,
+			TicketNumber:   "SUM-1",
+			Title:          "first summary",
+			Description:    "description-sentinel-1",
+			CustomerEmail:  "pii-sentinel-1@example.test",
+			CustomerPhone:  "phone-sentinel-1",
+			CustomerName:   "name-sentinel-1",
+			CreatedByID:    &ownerID,
+			AgentContext: datatypes.NewJSONType(models.AgentContext{
+				Goal: "agent-context-sentinel-1",
+			}),
+		},
+		{
+			OrganizationID: 1,
+			ProjectID:      1,
+			TicketNumber:   "SUM-2",
+			Title:          "second summary",
+			Description:    "description-sentinel-2",
+			CustomerEmail:  "pii-sentinel-2@example.test",
+			CreatedByID:    &otherOwnerID,
+		},
+		{
+			OrganizationID: 1,
+			ProjectID:      2,
+			TicketNumber:   "OTHER-1",
+			Title:          "cross-project sentinel",
+			Description:    "cross-project-description-sentinel",
+			CustomerEmail:  "cross-project-pii@example.test",
+			CreatedByID:    &ownerID,
+		},
+	}
+	for index := range tickets {
+		if err := db.Create(&tickets[index]).Error; err != nil {
+			t.Fatalf("create ticket %d: %v", index, err)
+		}
+	}
+	notifications := []models.Notification{
+		{
+			OrganizationID:  1,
+			ProjectID:       1,
+			RecipientID:     recipient.ID,
+			Type:            models.NotificationTypeTicketCreated,
+			Title:           "first",
+			Content:         "first",
+			RelatedTicketID: &tickets[0].ID,
+		},
+		{
+			OrganizationID:  1,
+			ProjectID:       1,
+			RecipientID:     recipient.ID,
+			Type:            models.NotificationTypeTicketCreated,
+			Title:           "second",
+			Content:         "second",
+			RelatedTicketID: &tickets[1].ID,
+		},
+		{
+			OrganizationID:  1,
+			ProjectID:       1,
+			RecipientID:     recipient.ID,
+			Type:            models.NotificationTypeTicketCreated,
+			Title:           "cross project",
+			Content:         "cross project",
+			RelatedTicketID: &tickets[2].ID,
+		},
+	}
+	for index := range notifications {
+		if err := db.Create(&notifications[index]).Error; err != nil {
+			t.Fatalf("create notification %d: %v", index, err)
+		}
+	}
+
+	var ticketQueries atomic.Int64
+	const callbackName = "test:count-notification-ticket-summary-preload"
+	if err := db.Callback().Query().Before("gorm:query").Register(
+		callbackName,
+		func(query *gorm.DB) {
+			if query.Statement.Table == (models.Ticket{}).TableName() {
+				ticketQueries.Add(1)
+			}
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = db.Callback().Query().Remove(callbackName)
+	})
+
+	service := NewNotificationServiceWithProtector(db, nil)
+	ctx := notificationTestOperationContext(
+		t,
+		models.ProjectScope{OrganizationID: 1, ProjectID: 1},
+		models.HumanActor(recipient.ID),
+	)
+	items, total, err := service.GetNotifications(
+		ctx,
+		&models.NotificationFilter{
+			RecipientID: &recipient.ID,
+			Limit:       10,
+			OrderBy:     "id",
+			OrderDir:    "asc",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 || len(items) != 3 {
+		t.Fatalf("notifications len=%d total=%d, want 3/3", len(items), total)
+	}
+	if ticketQueries.Load() != 1 {
+		t.Fatalf(
+			"related ticket preload queries=%d, want one batched query",
+			ticketQueries.Load(),
+		)
+	}
+	for index := 0; index < 2; index++ {
+		ticket := items[index].RelatedTicket
+		if ticket == nil {
+			t.Fatalf("items[%d] missing related ticket summary", index)
+		}
+		if ticket.ID != tickets[index].ID ||
+			ticket.TicketNumber != tickets[index].TicketNumber ||
+			ticket.Title != tickets[index].Title ||
+			ticket.CreatedByID == nil ||
+			*ticket.CreatedByID != *tickets[index].CreatedByID {
+			t.Fatalf("items[%d] summary/ownership=%+v", index, ticket)
+		}
+		if ticket.OrganizationID != 0 ||
+			ticket.ProjectID != 0 ||
+			ticket.Description != "" ||
+			ticket.CustomerEmail != "" ||
+			ticket.CustomerPhone != "" ||
+			ticket.CustomerName != "" ||
+			ticket.AgentContext.Data().Goal != "" {
+			t.Errorf("items[%d] preloaded full ticket fields: %+v", index, ticket)
+		}
+	}
+	if items[2].RelatedTicket != nil {
+		t.Fatalf(
+			"cross-project related ticket was preloaded: %+v",
+			items[2].RelatedTicket,
+		)
 	}
 }
 

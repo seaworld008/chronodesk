@@ -80,6 +80,7 @@ type CrossProjectWorkbenchTicket struct {
 	Version        uint64                `json:"version"`
 	CreatedAt      time.Time             `json:"created_at"`
 	UpdatedAt      time.Time             `json:"updated_at"`
+	ProjectRole    models.ProjectRole    `json:"-" gorm:"-"`
 }
 
 type CrossProjectWorkbenchPage struct {
@@ -92,10 +93,11 @@ type CrossProjectWorkbenchPage struct {
 }
 
 type authorizedWorkbenchProject struct {
-	ID             uint              `gorm:"column:id"`
-	OrganizationID uint              `gorm:"column:organization_id"`
-	Key            models.ProjectKey `gorm:"column:key"`
-	Name           string            `gorm:"column:name"`
+	ID             uint               `gorm:"column:id"`
+	OrganizationID uint               `gorm:"column:organization_id"`
+	Key            models.ProjectKey  `gorm:"column:key"`
+	Name           string             `gorm:"column:name"`
+	Role           models.ProjectRole `gorm:"column:role"`
 }
 
 type CrossProjectWorkbenchService struct {
@@ -139,15 +141,19 @@ func (service *CrossProjectWorkbenchService) ListTickets(
 	}
 
 	projectIDs := make([]uint, 0, len(projects))
+	projectRoles := make(map[uint]models.ProjectRole, len(projects))
 	organizationID := projects[0].OrganizationID
 	if organizationID == 0 {
 		return nil, ErrCrossProjectWorkbenchAccessDenied
 	}
 	for _, project := range projects {
-		if project.ID == 0 || project.OrganizationID != organizationID {
+		if project.ID == 0 ||
+			project.OrganizationID != organizationID ||
+			!project.Role.IsValid() {
 			return nil, ErrCrossProjectWorkbenchAccessDenied
 		}
 		projectIDs = append(projectIDs, project.ID)
+		projectRoles[project.ID] = project.Role
 	}
 	actorID := strconv.FormatUint(uint64(normalized.UserID), 10)
 	var total int64
@@ -231,6 +237,13 @@ func (service *CrossProjectWorkbenchService) ListTickets(
 	); err != nil {
 		return nil, err
 	}
+	for index := range items {
+		role, ok := projectRoles[items[index].ProjectID]
+		if !ok {
+			return nil, ErrCrossProjectWorkbenchAccessDenied
+		}
+		items[index].ProjectRole = role
+	}
 
 	return &CrossProjectWorkbenchPage{
 		Items:      items,
@@ -250,7 +263,7 @@ func (service *CrossProjectWorkbenchService) authorizedProjects(
 	if err := service.db.WithContext(ctx).
 		Table("projects AS projects").
 		Select(
-			"projects.id, projects.organization_id, projects.key, projects.name",
+			"projects.id, projects.organization_id, projects.key, projects.name, memberships.role AS role",
 		).
 		Joins(
 			"JOIN project_memberships AS memberships ON memberships.project_id = projects.id",

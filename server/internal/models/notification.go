@@ -204,32 +204,41 @@ type NotificationCreateRequest struct {
 	Metadata        map[string]interface{} `json:"metadata"`
 }
 
+// NotificationTicketSummary is the complete role-independent Ticket shape
+// that a Notification may serialize. Ownership is intentionally retained only
+// on Notification.RelatedTicket for the Human HTTP boundary to authorize.
+type NotificationTicketSummary struct {
+	ID           uint   `json:"id"`
+	TicketNumber string `json:"ticket_number"`
+	Title        string `json:"title"`
+}
+
 // NotificationResponse 通知响应
 type NotificationResponse struct {
-	ID             uint                   `json:"id"`
-	CreatedAt      time.Time              `json:"created_at"`
-	UpdatedAt      time.Time              `json:"updated_at"`
-	Type           NotificationType       `json:"type"`
-	Title          string                 `json:"title"`
-	Content        string                 `json:"content"`
-	Priority       NotificationPriority   `json:"priority"`
-	Channel        NotificationChannel    `json:"channel"`
-	Recipient      *UserSummary           `json:"recipient,omitempty"`
-	Sender         *UserSummary           `json:"sender,omitempty"`
-	RelatedType    string                 `json:"related_type"`
-	RelatedID      *uint                  `json:"related_id"`
-	RelatedTicket  *TicketResponse        `json:"related_ticket,omitempty"`
-	IsRead         bool                   `json:"is_read"`
-	ReadAt         *time.Time             `json:"read_at"`
-	IsSent         bool                   `json:"is_sent"`
-	SentAt         *time.Time             `json:"sent_at"`
-	IsDelivered    bool                   `json:"is_delivered"`
-	DeliveredAt    *time.Time             `json:"delivered_at"`
-	ActionURL      string                 `json:"action_url"`
-	ScheduledAt    *time.Time             `json:"scheduled_at"`
-	ExpiresAt      *time.Time             `json:"expires_at"`
-	Metadata       map[string]interface{} `json:"metadata"`
-	DeliveryStatus string                 `json:"delivery_status"`
+	ID             uint                       `json:"id"`
+	CreatedAt      time.Time                  `json:"created_at"`
+	UpdatedAt      time.Time                  `json:"updated_at"`
+	Type           NotificationType           `json:"type"`
+	Title          string                     `json:"title"`
+	Content        string                     `json:"content"`
+	Priority       NotificationPriority       `json:"priority"`
+	Channel        NotificationChannel        `json:"channel"`
+	Recipient      *UserSummary               `json:"recipient,omitempty"`
+	Sender         *UserSummary               `json:"sender,omitempty"`
+	RelatedType    string                     `json:"related_type"`
+	RelatedID      *uint                      `json:"related_id"`
+	RelatedTicket  *NotificationTicketSummary `json:"related_ticket"`
+	IsRead         bool                       `json:"is_read"`
+	ReadAt         *time.Time                 `json:"read_at"`
+	IsSent         bool                       `json:"is_sent"`
+	SentAt         *time.Time                 `json:"sent_at"`
+	IsDelivered    bool                       `json:"is_delivered"`
+	DeliveredAt    *time.Time                 `json:"delivered_at"`
+	ActionURL      string                     `json:"action_url"`
+	ScheduledAt    *time.Time                 `json:"scheduled_at"`
+	ExpiresAt      *time.Time                 `json:"expires_at"`
+	Metadata       map[string]interface{}     `json:"metadata"`
+	DeliveryStatus string                     `json:"delivery_status"`
 }
 
 // ToResponse 转换为响应格式
@@ -265,7 +274,11 @@ func (n *Notification) ToResponse() *NotificationResponse {
 		response.Sender = n.Sender.ToSummary()
 	}
 	if n.RelatedTicket != nil {
-		response.RelatedTicket = n.RelatedTicket.ToResponse()
+		response.RelatedTicket = &NotificationTicketSummary{
+			ID:           n.RelatedTicket.ID,
+			TicketNumber: n.RelatedTicket.TicketNumber,
+			Title:        n.RelatedTicket.Title,
+		}
 	}
 
 	response.Metadata = decodeJSONMap(n.Metadata)

@@ -1955,8 +1955,20 @@ func (ns *NotificationService) GetNotifications(ctx context.Context, filter *mod
 		dataQuery = dataQuery.Offset(filter.Offset)
 	}
 
-	// 预加载关联数据
-	dataQuery = dataQuery.Preload("Recipient").Preload("Sender").Preload("RelatedTicket")
+	// The Human list needs only a closed Ticket summary plus creator ownership
+	// for requester projection. GORM keeps this as one batched IN query.
+	dataQuery = dataQuery.
+		Preload("Recipient").
+		Preload("Sender").
+		Preload("RelatedTicket", func(query *gorm.DB) *gorm.DB {
+			return query.
+				Select("id", "ticket_number", "title", "created_by_id").
+				Where(
+					"organization_id = ? AND project_id = ?",
+					scope.OrganizationID,
+					scope.ProjectID,
+				)
+		})
 
 	var notifications []*models.Notification
 	if err := dataQuery.Find(&notifications).Error; err != nil {

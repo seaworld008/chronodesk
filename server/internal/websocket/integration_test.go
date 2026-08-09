@@ -160,6 +160,60 @@ func TestNotificationPushesOnlyToSameProjectAndUser(t *testing.T) {
 	}
 }
 
+func TestNotificationPushOmitsRelatedTicketUntilProjectedRESTFetch(t *testing.T) {
+	hub := newAuthorizedWebSocketTestHub()
+	client := newWebSocketTestClient(hub, 101, websocketTestScopeA, 1)
+	hub.clients[client] = true
+	service := NewNotificationWebSocketService(hub)
+	ownerID := uint(999)
+
+	if err := service.PushNotification(
+		context.Background(),
+		&models.Notification{
+			ID:             56,
+			OrganizationID: websocketTestScopeA.OrganizationID,
+			ProjectID:      websocketTestScopeA.ProjectID,
+			RecipientID:    101,
+			Type:           models.NotificationTypeTicketAssigned,
+			Title:          "REST projection required",
+			Content:        "live payload must stay narrow",
+			Priority:       models.NotificationPriorityNormal,
+			Channel:        models.NotificationChannelWebSocket,
+			RelatedTicket: &models.Ticket{
+				ID:            91,
+				TicketNumber:  "WS-91",
+				Title:         "related ticket sentinel",
+				Description:   "full-ticket-sentinel",
+				CustomerEmail: "pii-sentinel@example.test",
+				CreatedByID:   &ownerID,
+			},
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case message := <-client.send:
+		var envelope map[string]json.RawMessage
+		if err := json.Unmarshal(message.payload, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		var data map[string]json.RawMessage
+		if err := json.Unmarshal(envelope["data"], &data); err != nil {
+			t.Fatal(err)
+		}
+		if related, present := data["related_ticket"]; present {
+			t.Fatalf(
+				"live notification exposed related_ticket=%s; payload=%s",
+				related,
+				message.payload,
+			)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected notification message")
+	}
+}
+
 func TestHubRunClosesClientsAndReturnsOnContextCancellation(t *testing.T) {
 	hub := newAuthorizedWebSocketTestHub()
 	client := newWebSocketTestClient(hub, 100, websocketTestScopeA, 1)

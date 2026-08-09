@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -191,13 +192,50 @@ func setTicketETag(c *gin.Context, version uint64) {
 	c.Header("ETag", httpcontract.FormatETag(version))
 }
 
-// ticketResponseForRole prevents customer-facing collection and detail endpoints from disclosing
-// another user's contact, authentication, role, or login metadata.
-func ticketResponseForRole(ticket *models.Ticket, role string) *models.TicketResponse {
+var observerTicketForbiddenFields = [...]string{
+	"customer_email",
+	"customer_phone",
+	"customer_name",
+	"created_by_id",
+	"created_by",
+	"created_by_actor",
+	"assigned_to_id",
+	"assigned_to",
+	"assigned_to_actor",
+	"agent_context",
+}
+
+// observerTicketResponse keeps the Human observer projection at the HTTP
+// boundary. TicketResponse remains the unchanged shared machine-contract DTO.
+type observerTicketResponse struct {
+	response *models.TicketResponse
+}
+
+func (response observerTicketResponse) MarshalJSON() ([]byte, error) {
+	raw, err := json.Marshal(response.response)
+	if err != nil {
+		return nil, err
+	}
+	fields := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	for _, field := range observerTicketForbiddenFields {
+		delete(fields, field)
+	}
+	return json.Marshal(fields)
+}
+
+// ticketResponseForRole prevents Human collection and detail endpoints from
+// disclosing identity and private collaboration fields to public observers.
+func ticketResponseForRole(ticket *models.Ticket, role string) any {
 	if ticket == nil {
 		return nil
 	}
 	response := ticket.ToResponse()
+	if isProjectObserverRole(role) {
+		return observerTicketResponse{response: response}
+	}
 	if isRequesterRole(role) {
 		response.CreatedBy = nil
 		response.AssignedToID = nil
@@ -208,8 +246,8 @@ func ticketResponseForRole(ticket *models.Ticket, role string) *models.TicketRes
 	return response
 }
 
-func ticketListResponseForRole(tickets []*models.Ticket, role string) []*models.TicketResponse {
-	result := make([]*models.TicketResponse, 0, len(tickets))
+func ticketListResponseForRole(tickets []*models.Ticket, role string) []any {
+	result := make([]any, 0, len(tickets))
 	for _, ticket := range tickets {
 		if ticket != nil {
 			result = append(result, ticketResponseForRole(ticket, role))

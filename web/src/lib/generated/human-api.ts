@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.1.0.
- * Contract SHA-256: 7073b291e7f744edf14a808d5eda53f6038885802a421d4507ace3a3f5ed3023.
+ * Contract SHA-256: a96c2516e343dbeed57820c75958ec88a659937a82357263add01aba211dd52b.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -911,18 +911,18 @@ export type Ticket = {
     sla_due_date: string | null
     response_time: number | null
     resolution_time: number | null
-    customer_email: string
-    customer_phone: string
-    customer_name: string
+    customer_email?: string
+    customer_phone?: string
+    customer_name?: string
     custom_fields: unknown
     view_count: number
     comment_count: number
     rating: number | null
     rating_comment: string
     version: number
-    agent_context: AgentContext
+    agent_context?: AgentContext
     trust_level: TicketTrustLevel
-    created_by_actor: ActorRef
+    created_by_actor?: ActorRef
     assigned_to_actor?: ActorRef
     is_overdue: boolean
     is_escalated: boolean
@@ -1084,6 +1084,12 @@ export type CreateNotificationRequest = {
     metadata?: unknown
 }
 
+export type NotificationTicketSummary = {
+    id: number
+    ticket_number: string
+    title: string
+}
+
 export type Notification = {
     id: number
     created_at: string
@@ -1097,7 +1103,7 @@ export type Notification = {
     sender?: HumanUserSummary
     related_type: string
     related_id: number | null
-    related_ticket?: Ticket
+    related_ticket: NotificationTicketSummary | null
     is_read: boolean
     read_at: string | null
     is_sent: boolean

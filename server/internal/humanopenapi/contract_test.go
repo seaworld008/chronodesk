@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -2161,6 +2162,11 @@ func TestP1RuntimeDTOFieldsMatchPublishedSchemas(t *testing.T) {
 		{"CreateTicketRequest", models.TicketCreateRequest{}},
 		{"UpdateTicketRequest", models.TicketUpdateRequest{}},
 		{"Ticket", models.TicketResponse{}},
+		{"Notification", models.NotificationResponse{}},
+		{
+			"NotificationTicketSummary",
+			models.NotificationTicketSummary{},
+		},
 		{
 			"CrossProjectWorkbenchTicket",
 			services.CrossProjectWorkbenchTicket{},
@@ -2181,6 +2187,75 @@ func TestP1RuntimeDTOFieldsMatchPublishedSchemas(t *testing.T) {
 			want := jsonFieldNames(t, reflect.TypeOf(test.value))
 			assertExactObjectKeys(t, properties, want)
 		})
+	}
+}
+
+func TestNotificationTicketProjectionContractIsClosedAndRoleSafe(t *testing.T) {
+	document := decodeDocument(t)
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+	summary := objectAt(t, schemas, "NotificationTicketSummary")
+	if summary["type"] != "object" || summary["additionalProperties"] != false {
+		t.Fatalf("NotificationTicketSummary must be a closed object: %v", summary)
+	}
+	assertExactObjectKeys(
+		t,
+		objectAt(t, summary, "properties"),
+		[]string{"id", "ticket_number", "title"},
+	)
+	required, ok := summary["required"].([]any)
+	if !ok {
+		t.Fatalf("NotificationTicketSummary.required=%T, want array", summary["required"])
+	}
+	if !reflect.DeepEqual(
+		required,
+		[]any{"id", "ticket_number", "title"},
+	) {
+		t.Fatalf("NotificationTicketSummary.required=%v", required)
+	}
+
+	notification := objectAt(t, schemas, "Notification")
+	notificationRequired := notification["required"].([]any)
+	if !slices.Contains(notificationRequired, any("related_ticket")) {
+		t.Fatalf("Notification.required=%v, missing related_ticket", notificationRequired)
+	}
+	relatedTicket := objectAt(
+		t,
+		objectAt(t, notification, "properties"),
+		"related_ticket",
+	)
+	anyOf, ok := relatedTicket["anyOf"].([]any)
+	if !ok || len(anyOf) != 2 {
+		t.Fatalf("Notification.related_ticket=%v, want nullable anyOf", relatedTicket)
+	}
+	if anyOf[0].(map[string]any)["$ref"] !=
+		"#/components/schemas/NotificationTicketSummary" ||
+		anyOf[1].(map[string]any)["type"] != "null" {
+		t.Fatalf("Notification.related_ticket.anyOf=%v", anyOf)
+	}
+
+	ticketRequired := objectAt(t, schemas, "Ticket")["required"].([]any)
+	for _, observerOptional := range []any{
+		"customer_email",
+		"customer_phone",
+		"customer_name",
+		"created_by_id",
+		"created_by",
+		"created_by_actor",
+		"assigned_to_id",
+		"assigned_to",
+		"assigned_to_actor",
+		"agent_context",
+	} {
+		if slices.Contains(ticketRequired, observerOptional) {
+			t.Errorf(
+				"Ticket.required still requires observer-omitted field %q",
+				observerOptional,
+			)
+		}
 	}
 }
 

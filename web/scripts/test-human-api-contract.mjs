@@ -2293,6 +2293,57 @@ assert.doesNotMatch(ticketTypes, /export interface CreateTicketRequest\b/)
 assert.doesNotMatch(ticketTypes, /export interface UpdateTicketRequest\b/)
 assert.match(workbenchTypes, /CrossProjectWorkbenchTicket/)
 assert.doesNotMatch(workbenchTypes, /export interface CrossProjectWorkbench/)
+const notificationTicketSummary =
+    contract.components.schemas.NotificationTicketSummary
+assert.equal(notificationTicketSummary.type, 'object')
+assert.equal(notificationTicketSummary.additionalProperties, false)
+assert.deepEqual(notificationTicketSummary.required, [
+    'id',
+    'ticket_number',
+    'title',
+])
+assert.deepEqual(
+    Object.keys(notificationTicketSummary.properties).sort(),
+    ['id', 'ticket_number', 'title'],
+)
+assert.ok(
+    contract.components.schemas.Notification.required.includes(
+        'related_ticket',
+    ),
+)
+assert.deepEqual(
+    contract.components.schemas.Notification.properties.related_ticket.anyOf,
+    [
+        {
+            $ref: '#/components/schemas/NotificationTicketSummary',
+        },
+        { type: 'null' },
+    ],
+)
+for (const observerOptional of [
+    'customer_email',
+    'customer_phone',
+    'customer_name',
+    'created_by_id',
+    'created_by',
+    'created_by_actor',
+    'assigned_to_id',
+    'assigned_to',
+    'assigned_to_actor',
+    'agent_context',
+]) {
+    assert.equal(
+        contract.components.schemas.Ticket.required.includes(observerOptional),
+        false,
+        `Ticket.required must not include observer-omitted ${observerOptional}`,
+    )
+}
+assert.match(generated, /export type NotificationTicketSummary = \{/)
+assert.match(
+    generated,
+    /related_ticket: NotificationTicketSummary \| null/,
+)
+assert.doesNotMatch(generated, /related_ticket\?: Ticket/)
 assert.match(adminApp, /admin\/audit\/PlatformAuditExplorer/)
 assert.match(auditExplorer, /humanApiRoutes\.listPlatformAuditLogs/)
 assert.match(auditExplorer, /humanApiRoutes\.getPlatformAuditLogDetail/)
