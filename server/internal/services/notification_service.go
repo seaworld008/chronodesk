@@ -1611,6 +1611,9 @@ func (ns *NotificationService) CreateNotification(ctx context.Context, req *mode
 	for key, value := range req.Metadata {
 		notificationMetadata[key] = value
 	}
+	// preference_suppression is a service-owned audit reason. Callers cannot
+	// predeclare a suppression state while still requesting an enabled delivery.
+	delete(notificationMetadata, "preference_suppression")
 	// 处理metadata
 	if len(notificationMetadata) > 0 {
 		metadataBytes, err := json.Marshal(notificationMetadata)

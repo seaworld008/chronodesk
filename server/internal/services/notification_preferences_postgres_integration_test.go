@@ -210,3 +210,271 @@ func TestPostgresNotificationDailyLimitSerializesConcurrentDelivery(
 		)
 	}
 }
+
+func TestPostgresEmailNotificationPreferenceCreateFollowsUpdateOrder(
+	t *testing.T,
+) {
+	db, applicationName := openNotificationEmailPreferenceIntegrationDB(t)
+	user := models.User{
+		Username:     "postgres-email-preference-recipient",
+		Email:        "postgres-email-preference-recipient@example.test",
+		PasswordHash: "test-only",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	scope := seedNotificationProjectMembership(t, db, user.ID)
+	service := NewNotificationServiceWithProtector(db, nil)
+	ctx := notificationTestOperationContext(
+		t,
+		scope,
+		models.SystemActor("postgres-email-preference-test"),
+	)
+	updateEmailPreference := func(emailEnabled bool) error {
+		return service.UpdateNotificationPreferences(
+			context.Background(),
+			user.ID,
+			[]models.NotificationPreference{{
+				NotificationType: models.NotificationTypeSystemAlert,
+				EmailEnabled:     emailEnabled,
+				InAppEnabled:     true,
+				MaxDailyCount:    50,
+				BatchInterval:    60,
+			}},
+		)
+	}
+	type createResult struct {
+		notification *models.Notification
+		err          error
+	}
+	createEmail := func(title string) createResult {
+		notification, err := service.CreateNotification(
+			ctx,
+			&models.NotificationCreateRequest{
+				Type:        models.NotificationTypeSystemAlert,
+				Title:       title,
+				Content:     "PostgreSQL preference ordering evidence",
+				Channel:     models.NotificationChannelEmail,
+				RecipientID: user.ID,
+			},
+		)
+		return createResult{notification: notification, err: err}
+	}
+	countIntents := func() (int64, int64) {
+		t.Helper()
+		var events, deliveries int64
+		if err := db.Model(&models.DomainEvent{}).Count(&events).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Model(&models.OutboxDelivery{}).Count(&deliveries).Error; err != nil {
+			t.Fatal(err)
+		}
+		return events, deliveries
+	}
+	holdPreferenceUserLock := func() *gorm.DB {
+		t.Helper()
+		tx := db.Begin()
+		if tx.Error != nil {
+			t.Fatal(tx.Error)
+		}
+		if err := lockNotificationPreferenceUser(tx, user.ID); err != nil {
+			_ = tx.Rollback().Error
+			t.Fatal(err)
+		}
+		return tx
+	}
+	waitForQueuedPreferenceLock := func() {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			var blocked int64
+			if err := db.Raw(
+				"SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = ? AND wait_event_type = 'Lock'",
+				applicationName,
+			).Scan(&blocked).Error; err != nil {
+				t.Fatal(err)
+			}
+			if blocked > 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for a queued notification preference lock")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	waitUpdate := func(result <-chan error) {
+		t.Helper()
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for notification preference update")
+		}
+	}
+	waitCreate := func(result <-chan createResult) *models.Notification {
+		t.Helper()
+		select {
+		case outcome := <-result:
+			if outcome.err != nil {
+				t.Fatal(outcome.err)
+			}
+			return outcome.notification
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for email notification creation")
+			return nil
+		}
+	}
+
+	t.Run("update first suppresses create without Outbox", func(t *testing.T) {
+		if err := updateEmailPreference(true); err != nil {
+			t.Fatal(err)
+		}
+		hold := holdPreferenceUserLock()
+		updateDone := make(chan error, 1)
+		go func() { updateDone <- updateEmailPreference(false) }()
+		waitForQueuedPreferenceLock()
+		createDone := make(chan createResult, 1)
+		go func() { createDone <- createEmail("update-first") }()
+		if err := hold.Commit().Error; err != nil {
+			t.Fatal(err)
+		}
+		waitUpdate(updateDone)
+		notification := waitCreate(createDone)
+		if notification.DeliveryStatus !=
+			NotificationDeliveryStatusSuppressedByPreference ||
+			!notification.IsRead || notification.ReadAt == nil ||
+			notification.ExpiresAt == nil {
+			t.Fatalf("update-first notification = %+v", notification)
+		}
+		events, deliveries := countIntents()
+		if events != 0 || deliveries != 0 {
+			t.Fatalf(
+				"update-first intents = events:%d deliveries:%d, want 0/0",
+				events,
+				deliveries,
+			)
+		}
+	})
+
+	t.Run("create first queues one Outbox before update", func(t *testing.T) {
+		if err := updateEmailPreference(true); err != nil {
+			t.Fatal(err)
+		}
+		hold := holdPreferenceUserLock()
+		createDone := make(chan createResult, 1)
+		go func() { createDone <- createEmail("create-first") }()
+		waitForQueuedPreferenceLock()
+		updateDone := make(chan error, 1)
+		go func() { updateDone <- updateEmailPreference(false) }()
+		if err := hold.Commit().Error; err != nil {
+			t.Fatal(err)
+		}
+		notification := waitCreate(createDone)
+		if notification.DeliveryStatus != "" || notification.IsRead ||
+			notification.ReadAt != nil || notification.ExpiresAt != nil {
+			t.Fatalf("create-first notification = %+v", notification)
+		}
+		waitUpdate(updateDone)
+		events, deliveries := countIntents()
+		if events != 1 || deliveries != 1 {
+			t.Fatalf(
+				"create-first intents = events:%d deliveries:%d, want 1/1",
+				events,
+				deliveries,
+			)
+		}
+	})
+}
+
+func openNotificationEmailPreferenceIntegrationDB(
+	t *testing.T,
+) (*gorm.DB, string) {
+	t.Helper()
+	if os.Getenv("CHRONODESK_POSTGRES_INTEGRATION") != "1" {
+		t.Skip(
+			"set CHRONODESK_POSTGRES_INTEGRATION=1 for PostgreSQL notification preference evidence",
+		)
+	}
+	rawDSN := strings.TrimSpace(
+		os.Getenv("CHRONODESK_POSTGRES_INTEGRATION_DSN"),
+	)
+	if rawDSN == "" {
+		t.Fatal("CHRONODESK_POSTGRES_INTEGRATION_DSN is required")
+	}
+	parsed, err := url.Parse(rawDSN)
+	if err != nil {
+		t.Fatalf("parse PostgreSQL integration DSN: %v", err)
+	}
+	host := parsed.Hostname()
+	if host != "localhost" {
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			t.Fatal(
+				"notification preference integration test requires a loopback PostgreSQL target",
+			)
+		}
+	}
+	admin, err := gorm.Open(postgres.Open(rawDSN), &gorm.Config{
+		TranslateError: true,
+		Logger:         logger.Default.LogMode(logger.Silent),
+	})
+	if err != nil {
+		t.Fatalf("open PostgreSQL notification administrator: %v", err)
+	}
+	adminSQL, err := admin.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adminSQL.Close() })
+
+	schemaName := fmt.Sprintf(
+		"chronodesk_email_preference_%d",
+		time.Now().UnixNano(),
+	)
+	quotedSchema := `"` + schemaName + `"`
+	if err := admin.Exec("CREATE SCHEMA " + quotedSchema).Error; err != nil {
+		t.Fatalf("create email preference schema: %v", err)
+	}
+	t.Cleanup(func() {
+		if cleanupErr := admin.Exec(
+			"DROP SCHEMA IF EXISTS " + quotedSchema + " CASCADE",
+		).Error; cleanupErr != nil {
+			t.Errorf("drop email preference schema: %v", cleanupErr)
+		}
+	})
+
+	scopedURL := *parsed
+	query := scopedURL.Query()
+	query.Set("search_path", schemaName)
+	query.Set("application_name", schemaName)
+	scopedURL.RawQuery = query.Encode()
+	db, err := gorm.Open(postgres.Open(scopedURL.String()), &gorm.Config{
+		TranslateError: true,
+		Logger:         logger.Default.LogMode(logger.Silent),
+	})
+	if err != nil {
+		t.Fatalf("open schema-scoped email preference database: %v", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB.SetMaxOpenConns(4)
+	sqlDB.SetMaxIdleConns(4)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.Notification{},
+		&models.NotificationPreference{},
+		&models.DomainEvent{},
+		&models.OutboxDelivery{},
+	); err != nil {
+		t.Fatalf("migrate email preference fixture: %v", err)
+	}
+	return db, schemaName
+}
