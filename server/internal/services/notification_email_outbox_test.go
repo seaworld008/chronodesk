@@ -2,11 +2,13 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/driver/sqlite"
@@ -58,6 +60,7 @@ func newNotificationEmailOutboxTestService(
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.Notification{},
+		&models.NotificationPreference{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
 	); err != nil {
@@ -122,6 +125,203 @@ func TestCreateEmailNotificationCommitsOnlyDurableOutboxIntent(t *testing.T) {
 		strings.Contains(string(event.Data), user.Email) {
 		t.Fatal("email notification event copied recipient or message content")
 	}
+}
+
+func TestCreateEmailNotificationHonorsTypeSpecificPreferenceBeforeQueuing(
+	t *testing.T,
+) {
+	tests := []struct {
+		name           string
+		preference     *bool
+		scheduledAt    *time.Time
+		wantSuppressed bool
+	}{
+		{
+			name:           "disabled is suppressed without delivery intent",
+			preference:     notificationBoolPointer(false),
+			wantSuppressed: true,
+		},
+		{
+			name:       "missing preference queues one delivery intent",
+			preference: nil,
+		},
+		{
+			name:       "enabled preference queues one delivery intent",
+			preference: notificationBoolPointer(true),
+		},
+		{
+			name:        "enabled scheduled preference preserves availability",
+			preference:  notificationBoolPointer(true),
+			scheduledAt: notificationTimePointer(time.Now().UTC().Add(time.Hour)),
+		},
+		{
+			name:           "disabled scheduled preference is immediately suppressed",
+			preference:     notificationBoolPointer(false),
+			scheduledAt:    notificationTimePointer(time.Now().UTC().Add(time.Hour)),
+			wantSuppressed: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, service, attempt, user, ctx :=
+				newNotificationEmailOutboxTestService(t)
+			if test.preference != nil {
+				if err := service.UpdateNotificationPreferences(
+					context.Background(),
+					user.ID,
+					[]models.NotificationPreference{{
+						NotificationType: models.NotificationTypeSystemAlert,
+						EmailEnabled:     *test.preference,
+						InAppEnabled:     true,
+						MaxDailyCount:    50,
+						BatchInterval:    60,
+					}},
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			notification, err := service.CreateNotification(
+				ctx,
+				&models.NotificationCreateRequest{
+					Type:        models.NotificationTypeSystemAlert,
+					Title:       "邮件偏好裁决",
+					Content:     "必须先于 Outbox 写入生效",
+					Channel:     models.NotificationChannelEmail,
+					RecipientID: user.ID,
+					ScheduledAt: test.scheduledAt,
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if attempt.callCount() != 0 {
+				t.Fatal("notification creation performed an SMTP attempt")
+			}
+
+			var notificationCount, eventCount, deliveryCount int64
+			for name, model := range map[string]any{
+				"notifications":     &models.Notification{},
+				"domain_events":     &models.DomainEvent{},
+				"outbox_deliveries": &models.OutboxDelivery{},
+			} {
+				var count int64
+				if err := db.Model(model).Count(&count).Error; err != nil {
+					t.Fatal(err)
+				}
+				switch name {
+				case "notifications":
+					notificationCount = count
+				case "domain_events":
+					eventCount = count
+				case "outbox_deliveries":
+					deliveryCount = count
+				}
+			}
+			if notificationCount != 1 {
+				t.Fatalf("notification count = %d, want 1", notificationCount)
+			}
+			if test.wantSuppressed {
+				if notification.DeliveryStatus !=
+					NotificationDeliveryStatusSuppressedByPreference ||
+					!notification.IsRead ||
+					notification.ReadAt == nil ||
+					notification.ExpiresAt == nil {
+					t.Fatalf("suppressed email notification = %+v", notification)
+				}
+				var metadata map[string]any
+				if err := json.Unmarshal([]byte(notification.Metadata), &metadata); err != nil {
+					t.Fatal(err)
+				}
+				if metadata["preference_suppression"] != "email_disabled" {
+					t.Fatalf("suppression metadata = %#v", metadata)
+				}
+				if eventCount != 0 || deliveryCount != 0 {
+					t.Fatalf(
+						"suppressed delivery intents = events:%d outbox:%d, want 0/0",
+						eventCount,
+						deliveryCount,
+					)
+				}
+				return
+			}
+			if notification.DeliveryStatus != "" || notification.IsRead {
+				t.Fatalf("enabled email notification was suppressed: %+v", notification)
+			}
+			if eventCount != 1 || deliveryCount != 1 {
+				t.Fatalf(
+					"email delivery intents = events:%d outbox:%d, want 1/1",
+					eventCount,
+					deliveryCount,
+				)
+			}
+			if test.scheduledAt != nil {
+				var delivery models.OutboxDelivery
+				if err := db.First(&delivery).Error; err != nil {
+					t.Fatal(err)
+				}
+				if !delivery.NextAttemptAt.Equal(*test.scheduledAt) {
+					t.Fatalf(
+						"scheduled Outbox availability = %s, want %s",
+						delivery.NextAttemptAt,
+						*test.scheduledAt,
+					)
+				}
+			}
+		})
+	}
+}
+
+func TestDisabledEmailPreferenceDoesNotSuppressInAppNotification(t *testing.T) {
+	db, service, _, user, ctx := newNotificationEmailOutboxTestService(t)
+	if err := service.UpdateNotificationPreferences(
+		context.Background(),
+		user.ID,
+		[]models.NotificationPreference{{
+			NotificationType: models.NotificationTypeSystemAlert,
+			EmailEnabled:     false,
+			InAppEnabled:     true,
+			MaxDailyCount:    50,
+			BatchInterval:    60,
+		}},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	notification, err := service.CreateNotification(
+		ctx,
+		&models.NotificationCreateRequest{
+			Type:        models.NotificationTypeSystemAlert,
+			Title:       "应用内投递独立",
+			Content:     "邮件禁用不能压制应用内通知",
+			Channel:     models.NotificationChannelInApp,
+			RecipientID: user.ID,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notification.DeliveryStatus != "" || notification.IsRead ||
+		notification.ReadAt != nil || notification.ExpiresAt != nil {
+		t.Fatalf("in-app notification was suppressed: %+v", notification)
+	}
+	for name, model := range map[string]any{
+		"domain_events":     &models.DomainEvent{},
+		"outbox_deliveries": &models.OutboxDelivery{},
+	} {
+		var count int64
+		if err := db.Model(model).Count(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("%s count = %d, want 0", name, count)
+		}
+	}
+}
+
+func notificationBoolPointer(value bool) *bool {
+	return &value
 }
 
 func TestCreateEmailNotificationRollsBackWhenOutboxInsertFails(t *testing.T) {

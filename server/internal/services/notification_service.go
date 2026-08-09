@@ -1687,10 +1687,41 @@ func (ns *NotificationService) CreateNotification(ctx context.Context, req *mode
 				notification.Metadata = string(metadataBytes)
 			}
 		}
+		if notification.Channel == models.NotificationChannelEmail {
+			now := time.Now().UTC()
+			allowed, err := emailNotificationAllowedByPreference(
+				tx,
+				notification,
+			)
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				notification.DeliveryStatus =
+					NotificationDeliveryStatusSuppressedByPreference
+				notification.IsRead = true
+				notification.ReadAt = &now
+				notification.ExpiresAt = &now
+				notificationMetadata["preference_suppression"] =
+					"email_disabled"
+				metadataBytes, err := json.Marshal(notificationMetadata)
+				if err != nil {
+					return fmt.Errorf("通知元数据无效: %w", err)
+				}
+				if len(metadataBytes) > 16*1024 {
+					return errors.New("通知元数据超过 16 KiB 限制")
+				}
+				notification.Metadata = string(metadataBytes)
+			}
+		}
 		if err := tx.Create(notification).Error; err != nil {
 			return err
 		}
 		if notification.Channel != models.NotificationChannelEmail {
+			return nil
+		}
+		if notification.DeliveryStatus ==
+			NotificationDeliveryStatusSuppressedByPreference {
 			return nil
 		}
 		availableAt := time.Time{}
@@ -2537,27 +2568,11 @@ func inAppNotificationAllowedByPreference(
 		now.IsZero() {
 		return false, "", errors.New("notification preference decision is invalid")
 	}
-	if err := lockNotificationPreferenceUser(
+	preference, err := notificationPreferenceForUpdate(
 		tx,
 		notification.RecipientID,
-	); err != nil {
-		return false, "", err
-	}
-	var preference models.NotificationPreference
-	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where(
-			"user_id = ? AND notification_type = ?",
-			notification.RecipientID,
-			notification.Type,
-		).
-		First(&preference).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		preference = defaultNotificationPreference(
-			notification.RecipientID,
-			notification.Type,
-		)
-		err = nil
-	}
+		notification.Type,
+	)
 	if err != nil {
 		return false, "", fmt.Errorf(
 			"load notification preference: %w",
@@ -2626,6 +2641,57 @@ func inAppNotificationAllowedByPreference(
 		return false, "daily_limit", nil
 	}
 	return true, "", nil
+}
+
+func emailNotificationAllowedByPreference(
+	tx *gorm.DB,
+	notification *models.Notification,
+) (bool, error) {
+	if tx == nil ||
+		notification == nil ||
+		notification.RecipientID == 0 ||
+		!notification.Type.IsValid() ||
+		notification.Channel != models.NotificationChannelEmail {
+		return false, errors.New("notification email preference decision is invalid")
+	}
+	preference, err := notificationPreferenceForUpdate(
+		tx,
+		notification.RecipientID,
+		notification.Type,
+	)
+	if err != nil {
+		return false, fmt.Errorf("load notification preference: %w", err)
+	}
+	return preference.EmailEnabled, nil
+}
+
+func notificationPreferenceForUpdate(
+	tx *gorm.DB,
+	userID uint,
+	notificationType models.NotificationType,
+) (models.NotificationPreference, error) {
+	if tx == nil || userID == 0 || !notificationType.IsValid() {
+		return models.NotificationPreference{},
+			errors.New("notification preference decision is invalid")
+	}
+	if err := lockNotificationPreferenceUser(tx, userID); err != nil {
+		return models.NotificationPreference{}, err
+	}
+	var preference models.NotificationPreference
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"user_id = ? AND notification_type = ?",
+			userID,
+			notificationType,
+		).
+		First(&preference).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return defaultNotificationPreference(userID, notificationType), nil
+	}
+	if err != nil {
+		return models.NotificationPreference{}, err
+	}
+	return preference, nil
 }
 
 func defaultNotificationPreference(
