@@ -625,6 +625,7 @@ func validatePostgresAutomationWebhookIndex(
 type sqliteAutomationWebhookIndexListRow struct {
 	Name    string `gorm:"column:name"`
 	Unique  int    `gorm:"column:unique"`
+	Origin  string `gorm:"column:origin"`
 	Partial int    `gorm:"column:partial"`
 }
 
@@ -643,7 +644,7 @@ func sqliteAutomationWebhookIndexIsValid(
 ) (bool, error) {
 	var indexes []sqliteAutomationWebhookIndexListRow
 	if err := db.Raw(
-		"PRAGMA index_list(" +
+		"PRAGMA main.index_list(" +
 			quoteAutomationWebhookSQLiteIdentifier(definition.table) +
 			")",
 	).Scan(&indexes).Error; err != nil {
@@ -672,7 +673,7 @@ func sqliteAutomationWebhookIndexIsValid(
 
 	var indexRows []sqliteAutomationWebhookIndexColumn
 	if err := db.Raw(
-		"PRAGMA index_xinfo(" +
+		"PRAGMA main.index_xinfo(" +
 			quoteAutomationWebhookSQLiteIdentifier(definition.name) +
 			")",
 	).Scan(&indexRows).Error; err != nil {

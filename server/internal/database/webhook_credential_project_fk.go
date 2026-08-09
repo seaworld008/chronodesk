@@ -165,21 +165,18 @@ func installWebhookProjectScopeForeignKeys(db *gorm.DB) error {
 			}
 		}
 		if enabled {
-			var violations []struct {
-				Table string `gorm:"column:table"`
-				RowID int64  `gorm:"column:rowid"`
-			}
-			if err := db.Raw("PRAGMA foreign_key_check").
-				Scan(&violations).Error; err != nil {
+			violation, found, err :=
+				firstSQLiteForeignKeyViolation(db)
+			if err != nil {
 				return fmt.Errorf(
 					"run SQLite foreign key check: %w",
 					err,
 				)
 			}
-			if len(violations) != 0 {
+			if found {
 				return fmt.Errorf(
-					"SQLite foreign key check found %d violations",
-					len(violations),
+					"SQLite foreign key check found a violation in %s",
+					violation.Table,
 				)
 			}
 		}
@@ -205,7 +202,7 @@ func rebuildSQLiteTableWithProjectScopeFK(
 	var tableState sqliteSchemaObject
 	if err := db.Raw(`
 		SELECT type, name, sql
-		FROM sqlite_master
+		FROM main.sqlite_schema
 		WHERE type = 'table' AND name = ?
 	`, definition.table).Take(&tableState).Error; err != nil {
 		return fmt.Errorf(
@@ -255,7 +252,7 @@ func rebuildSQLiteTableWithProjectScopeFK(
 	suffix := tableState.SQL[close+1:]
 	createSQL := "CREATE TABLE " +
 		quoteAutomationWebhookSQLiteIdentifier(tempTable) +
-		" (" + body + ", CONSTRAINT " +
+		" (" + body + "\n, CONSTRAINT " +
 		quoteAutomationWebhookSQLiteIdentifier(definition.name) +
 		" FOREIGN KEY (" +
 		quoteAutomationWebhookSQLiteIdentifier("organization_id") + ", " +
@@ -526,7 +523,7 @@ func validateSQLiteWebhookProjectScopeFK(
 ) error {
 	var rows []sqliteWebhookForeignKeyRow
 	if err := db.Raw(
-		"PRAGMA foreign_key_list(`" + expected.table + "`)",
+		"PRAGMA main.foreign_key_list(`" + expected.table + "`)",
 	).Scan(&rows).Error; err != nil {
 		return fmt.Errorf(
 			"read SQLite Project-scope foreign keys for %s: %w",
@@ -573,7 +570,7 @@ func validateSQLiteWebhookProjectScopeFK(
 	}
 	if err := db.Raw(`
 		SELECT sql
-		FROM sqlite_master
+		FROM main.sqlite_schema
 		WHERE type = 'table' AND name = ?
 	`, expected.table).Scan(&tableState).Error; err != nil {
 		return fmt.Errorf(

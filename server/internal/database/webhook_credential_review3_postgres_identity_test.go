@@ -373,6 +373,52 @@ func exercisePostgresIdentityColumnContractMatrix(
 		if err := validateWebhookCredentialIdentityColumnContract(pinned); err != nil {
 			return fmt.Errorf("exact PostgreSQL identity fixture: %w", err)
 		}
+		const identityID = "00000000-0000-4000-8000-000000000001"
+		if err := pinned.Exec(
+			"INSERT INTO domain_events (id, organization_id, project_id) "+
+				"VALUES (?, 1, 1)",
+			identityID,
+		).Error; err != nil {
+			return err
+		}
+		for _, behavior := range []struct {
+			name  string
+			query string
+			args  []any
+		}{
+			{
+				name: "duplicate primary key",
+				query: "INSERT INTO domain_events " +
+					"(id, organization_id, project_id) VALUES (?, 2, 2)",
+				args: []any{identityID},
+			},
+			{
+				name: "NULL primary key",
+				query: "INSERT INTO domain_events " +
+					"(id, organization_id, project_id) VALUES (NULL, 2, 2)",
+			},
+		} {
+			behaviorErr := pinned.Session(&gorm.Session{NewDB: true}).
+				Transaction(func(tx *gorm.DB) error {
+					if err := tx.Exec(
+						behavior.query,
+						behavior.args...,
+					).Error; err == nil {
+						return fmt.Errorf(
+							"PostgreSQL identity accepted %s",
+							behavior.name,
+						)
+					}
+					return rollback
+				})
+			if !errors.Is(behaviorErr, rollback) {
+				return fmt.Errorf(
+					"PostgreSQL %s behavior: %w",
+					behavior.name,
+					behaviorErr,
+				)
+			}
+		}
 		tests := []struct {
 			name     string
 			mutation string
@@ -414,6 +460,21 @@ func exercisePostgresIdentityColumnContractMatrix(
 					"DROP CONSTRAINT domain_events_pkey; " +
 					"ALTER TABLE domain_events ADD PRIMARY KEY " +
 					"(id, organization_id)",
+			},
+			{
+				name: "deferred primary key",
+				mutation: "ALTER TABLE domain_events " +
+					"DROP CONSTRAINT domain_events_pkey; " +
+					"ALTER TABLE domain_events ADD PRIMARY KEY (id) " +
+					"DEFERRABLE INITIALLY DEFERRED",
+			},
+			{
+				name: "column collation",
+				mutation: "ALTER TABLE domain_events " +
+					"DROP CONSTRAINT domain_events_pkey; " +
+					"ALTER TABLE domain_events " +
+					"ALTER COLUMN id TYPE VARCHAR(64) COLLATE \"C\"; " +
+					"ALTER TABLE domain_events ADD PRIMARY KEY (id)",
 			},
 		}
 		for _, test := range tests {
@@ -610,10 +671,11 @@ func exercisePostgresProjectScopeFKCatalogMatrix(
 	t.Helper()
 	_ = schemaName
 	tests := []struct {
-		name       string
-		setup      []string
-		cleanup    []string
-		wantExists bool
+		name                 string
+		setup                []string
+		cleanup              []string
+		wantExists           bool
+		wantParentConstraint bool
 	}{
 		{
 			name: "reversed two columns",
@@ -675,6 +737,37 @@ func exercisePostgresProjectScopeFKCatalogMatrix(
 			wantExists: true,
 		},
 		{
+			name: "wrong update action",
+			setup: []string{
+				"ALTER TABLE domain_events " +
+					"ADD CONSTRAINT fk_domain_events_project_scope " +
+					"FOREIGN KEY (organization_id, project_id) " +
+					"REFERENCES projects(organization_id, id) " +
+					"ON UPDATE CASCADE ON DELETE RESTRICT",
+			},
+			cleanup: []string{
+				"ALTER TABLE domain_events DROP CONSTRAINT " +
+					"fk_domain_events_project_scope",
+			},
+			wantExists: true,
+		},
+		{
+			name: "match full",
+			setup: []string{
+				"ALTER TABLE domain_events " +
+					"ADD CONSTRAINT fk_domain_events_project_scope " +
+					"FOREIGN KEY (organization_id, project_id) " +
+					"REFERENCES projects(organization_id, id) " +
+					"MATCH FULL " +
+					"ON UPDATE RESTRICT ON DELETE RESTRICT",
+			},
+			cleanup: []string{
+				"ALTER TABLE domain_events DROP CONSTRAINT " +
+					"fk_domain_events_project_scope",
+			},
+			wantExists: true,
+		},
+		{
 			name: "not valid",
 			setup: []string{
 				"ALTER TABLE domain_events " +
@@ -704,6 +797,33 @@ func exercisePostgresProjectScopeFKCatalogMatrix(
 					"fk_domain_events_project_scope",
 			},
 			wantExists: true,
+		},
+		{
+			name: "partition child constraint",
+			setup: []string{
+				"ALTER TABLE domain_events RENAME TO " +
+					"task9a_domain_events_original",
+				"CREATE TABLE task9a_domain_events_parent (" +
+					"id VARCHAR(36) NOT NULL, " +
+					"organization_id BIGINT NOT NULL, " +
+					"project_id BIGINT NOT NULL, " +
+					"PRIMARY KEY (id, project_id)) " +
+					"PARTITION BY LIST (project_id)",
+				"CREATE TABLE domain_events PARTITION OF " +
+					"task9a_domain_events_parent FOR VALUES IN (22)",
+				"ALTER TABLE task9a_domain_events_parent " +
+					"ADD CONSTRAINT fk_domain_events_project_scope " +
+					"FOREIGN KEY (organization_id, project_id) " +
+					"REFERENCES projects(organization_id, id) " +
+					"ON UPDATE RESTRICT ON DELETE RESTRICT",
+			},
+			cleanup: []string{
+				"DROP TABLE task9a_domain_events_parent CASCADE",
+				"ALTER TABLE task9a_domain_events_original " +
+					"RENAME TO domain_events",
+			},
+			wantExists:           true,
+			wantParentConstraint: true,
 		},
 		{
 			name: "wrong schema child",
@@ -759,6 +879,28 @@ func exercisePostgresProjectScopeFKCatalogMatrix(
 							exists,
 							test.wantExists,
 						)
+					}
+					if test.wantParentConstraint {
+						var inherited bool
+						if err := tx.Raw(`
+							SELECT constraint_state.conparentid <> 0
+							FROM pg_constraint AS constraint_state
+							JOIN pg_class AS child
+							  ON child.oid = constraint_state.conrelid
+							JOIN pg_namespace AS namespace
+							  ON namespace.oid = child.relnamespace
+							WHERE namespace.nspname = CURRENT_SCHEMA()
+							  AND child.relname = 'domain_events'
+							  AND constraint_state.conname =
+								'fk_domain_events_project_scope'
+						`).Scan(&inherited).Error; err != nil {
+							return err
+						}
+						if !inherited {
+							return errors.New(
+								"partition-child FK did not produce conparentid",
+							)
+						}
 					}
 					for _, statement := range test.cleanup {
 						if err := tx.Exec(statement).Error; err != nil {

@@ -14,18 +14,41 @@ import (
 )
 
 const (
-	task9aQualificationProjectCeiling        = 1_000
-	task9aQualificationWebhookPairCeiling    = 100_000
-	task9aQualificationNonWebhookCeiling     = 1_000_000
-	task9aQualificationAEXAcquireBudget      = 5 * time.Second
-	task9aQualificationAEXHoldBudget         = 15 * time.Second
-	task9aQualificationCutoverBudget         = 20 * time.Second
-	task9aQualificationRuntimeBudget         = 10 * time.Second
-	task9aQualificationStatementBudget       = 8 * time.Second
-	task9aQualificationStatementTotalBudget  = 12 * time.Second
-	task9aQualificationPeakRSSBudgetInBytes  = uint64(1 << 30)
-	task9aQualificationLockObservationBudget = 5 * time.Second
+	task9aQualificationProjectCeiling                 = 1_000
+	task9aQualificationWebhookPairCeiling             = 100_000
+	task9aQualificationNonWebhookCeiling              = 1_000_000
+	task9aQualificationAEXAcquireBudget               = 5 * time.Second
+	task9aQualificationAEXHoldBudget                  = 15 * time.Second
+	task9aQualificationCutoverBudget                  = 20 * time.Second
+	task9aQualificationRuntimeBudget                  = 10 * time.Second
+	task9aQualificationStatementBudget                = 8 * time.Second
+	task9aQualificationStatementTotalBudget           = 12 * time.Second
+	task9aQualificationPeakRSSBudgetInBytes           = uint64(1 << 30)
+	task9aQualificationLockObservationBudget          = 5 * time.Second
+	task9aQualificationRuntimeBarrierWatchdogBudget   = task9aQualificationRuntimeBudget + 5*time.Second
+	task9aQualificationRuntimeValidationContextBudget = 30 * time.Second
 )
+
+func TestTask9aQualificationRuntimeBarrierBudgetsIncludeSchedulerMargin(
+	t *testing.T,
+) {
+	if task9aQualificationRuntimeBarrierWatchdogBudget <=
+		task9aQualificationRuntimeBudget {
+		t.Fatalf(
+			"runtime barrier watchdog %s must exceed runtime budget %s",
+			task9aQualificationRuntimeBarrierWatchdogBudget,
+			task9aQualificationRuntimeBudget,
+		)
+	}
+	if task9aQualificationRuntimeValidationContextBudget <=
+		task9aQualificationRuntimeBarrierWatchdogBudget {
+		t.Fatalf(
+			"runtime validation context %s must exceed watchdog %s",
+			task9aQualificationRuntimeValidationContextBudget,
+			task9aQualificationRuntimeBarrierWatchdogBudget,
+		)
+	}
+}
 
 func qualifyPostgresWebhookProductionStatements(
 	t *testing.T,

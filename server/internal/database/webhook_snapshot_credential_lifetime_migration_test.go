@@ -1198,7 +1198,7 @@ func openLegacyWebhookCredentialMigrationDB(
 		`CREATE TABLE projects (
 			id INTEGER NOT NULL,
 			organization_id INTEGER NOT NULL,
-			status VARCHAR(20) NOT NULL,
+			status VARCHAR(20) NOT NULL DEFAULT 'active',
 			PRIMARY KEY (id),
 			CONSTRAINT chk_projects_status CHECK (
 				status IN ('active', 'archived')

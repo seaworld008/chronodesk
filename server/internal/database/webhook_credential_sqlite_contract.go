@@ -1,13 +1,90 @@
 package database
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
+	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
 )
+
+type sqliteForeignKeyViolation struct {
+	Table  string        `gorm:"column:table"`
+	RowID  sql.NullInt64 `gorm:"column:rowid"`
+	Parent string        `gorm:"column:parent"`
+	FKID   int           `gorm:"column:fkid"`
+}
+
+var sqliteWebhookCredentialProtectedTables = []string{
+	"projects",
+	"domain_events",
+	"webhook_delivery_snapshots",
+	"outbox_deliveries",
+	"schema_migration_checkpoints",
+}
+
+func requireSQLiteNoTempSchemaShadows(
+	db *gorm.DB,
+	names ...string,
+) error {
+	if db == nil {
+		return errors.New("SQLite TEMP shadow database is required")
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(names))
+	args := make([]any, len(names))
+	for index, name := range names {
+		placeholders[index] = "?"
+		args[index] = name
+	}
+	var collision struct {
+		Type string `gorm:"column:type"`
+		Name string `gorm:"column:name"`
+	}
+	result := db.Raw(
+		`SELECT type, name
+		 FROM temp.sqlite_schema
+		 WHERE name COLLATE NOCASE IN (`+
+			strings.Join(placeholders, ", ")+`)
+		 ORDER BY type, name
+		 LIMIT 1`,
+		args...,
+	).Scan(&collision)
+	if result.Error != nil {
+		return fmt.Errorf(
+			"inspect SQLite TEMP schema shadows: %w",
+			result.Error,
+		)
+	}
+	if result.RowsAffected != 0 {
+		return fmt.Errorf(
+			"SQLite TEMP schema shadow %s %s is not permitted",
+			collision.Type,
+			collision.Name,
+		)
+	}
+	return nil
+}
+
+func firstSQLiteForeignKeyViolation(
+	db *gorm.DB,
+) (sqliteForeignKeyViolation, bool, error) {
+	var violation sqliteForeignKeyViolation
+	result := db.Raw(`
+		SELECT "table", rowid, parent, fkid
+		FROM pragma_foreign_key_check
+		LIMIT 1
+	`).Scan(&violation)
+	if result.Error != nil {
+		return sqliteForeignKeyViolation{}, false, result.Error
+	}
+	return violation, result.RowsAffected != 0, nil
+}
 
 func installSQLiteWebhookCredentialConstraints(db *gorm.DB) error {
 	if db == nil || db.Dialector.Name() != "sqlite" {
@@ -45,7 +122,7 @@ func rebuildSQLiteWebhookCredentialConstraintTable(
 	var tableState sqliteSchemaObject
 	if err := db.Raw(`
 		SELECT type, name, sql
-		FROM sqlite_master
+		FROM main.sqlite_schema
 		WHERE type = 'table' AND name = ?
 	`, table).Take(&tableState).Error; err != nil {
 		return fmt.Errorf(
@@ -80,7 +157,10 @@ func rebuildSQLiteWebhookCredentialConstraintTable(
 			foundDeadline = true
 			lowerPart := strings.ToLower(strings.Join(strings.Fields(part), " "))
 			if !strings.Contains(lowerPart, " not null") {
-				bodyParts[index] = strings.TrimSpace(part) + " NOT NULL"
+				bodyParts[index] = appendSQLiteColumnConstraint(
+					part,
+					"NOT NULL",
+				)
 				changed = true
 			}
 		}
@@ -116,8 +196,7 @@ func rebuildSQLiteWebhookCredentialConstraintTable(
 				)
 			}
 			if got != want {
-				if name == "chk_webhook_snapshot_scope" &&
-					isLegacyWebhookSnapshotScopeConstraint(got) {
+				if isLegacyWebhookCredentialConstraint(name, got) {
 					replaced := false
 					for index, part := range bodyParts {
 						constraint, named, parseErr :=
@@ -172,7 +251,7 @@ func rebuildSQLiteWebhookCredentialConstraintTable(
 	tempTable := table + "__webhook_credential_contract"
 	createSQL := "CREATE TABLE " +
 		quoteAutomationWebhookSQLiteIdentifier(tempTable) +
-		" (" + strings.Join(bodyParts, ", ") + ")" +
+		" (" + joinSQLiteTableBody(bodyParts) + ")" +
 		tableState.SQL[close+1:]
 	return rebuildSQLiteTableFromDDL(
 		db,
@@ -188,6 +267,26 @@ func isLegacyWebhookSnapshotScopeConstraint(canonical string) bool {
 		"organization_id > 0 AND project_id > 0 AND event_id <> ''",
 	)
 	return err == nil && canonical == legacy
+}
+
+func isLegacyWebhookCredentialConstraint(
+	name string,
+	canonical string,
+) bool {
+	switch name {
+	case "chk_webhook_snapshot_scope":
+		return isLegacyWebhookSnapshotScopeConstraint(canonical)
+	case "chk_projects_status":
+		legacy, err := canonicalWebhookConstraintDefinition(
+			closedVocabularyINConstraintExpression(
+				"status",
+				models.ProjectStatusValues(),
+			),
+		)
+		return err == nil && canonical == legacy
+	default:
+		return false
+	}
 }
 
 var errSQLiteNamedConstraintMissing = errors.New(
@@ -768,30 +867,304 @@ func splitSQLiteTableBody(body string) ([]string, error) {
 }
 
 func sqliteDDLLeadingIdentifier(part string) string {
-	part = strings.TrimSpace(part)
-	if part == "" {
+	identifier, _, _, ok := scanSQLiteDDLIdentifier(part, 0)
+	if !ok {
 		return ""
 	}
-	switch part[0] {
-	case '"', '`':
-		close := strings.IndexByte(part[1:], part[0])
-		if close < 0 {
-			return ""
-		}
-		return strings.ToLower(part[1 : close+1])
-	case '[':
-		close := strings.IndexByte(part[1:], ']')
-		if close < 0 {
-			return ""
-		}
-		return strings.ToLower(part[1 : close+1])
-	default:
-		end := strings.IndexAny(part, " \t\r\n")
-		if end < 0 {
-			end = len(part)
-		}
-		return strings.ToLower(part[:end])
+	return strings.ToLower(identifier)
+}
+
+func appendSQLiteColumnConstraint(part string, constraint string) string {
+	return strings.TrimRight(part, " \t\r\n") + "\n" + constraint
+}
+
+func joinSQLiteTableBody(parts []string) string {
+	return strings.Join(parts, "\n,\n")
+}
+
+func validateSQLiteProtectedColumnConstraintSemantics(
+	db *gorm.DB,
+	table string,
+	protectedColumns []string,
+	validatePrimaryKey bool,
+) error {
+	var tableSQL string
+	result := db.Raw(`
+		SELECT sql
+		FROM main.sqlite_schema
+		WHERE type = 'table' AND name = ?
+	`, table).Scan(&tableSQL)
+	if result.Error != nil {
+		return fmt.Errorf(
+			"read SQLite %s DDL for protected constraints: %w",
+			table,
+			result.Error,
+		)
 	}
+	if result.RowsAffected != 1 || strings.TrimSpace(tableSQL) == "" {
+		return fmt.Errorf("SQLite table %s is missing", table)
+	}
+	open, err := findSQLiteTableBodyOpen(tableSQL)
+	if err != nil {
+		return err
+	}
+	close, ok := matchingSQLParenthesis(tableSQL, open)
+	if !ok {
+		return fmt.Errorf("SQLite table %s has malformed DDL", table)
+	}
+	parts, err := splitSQLiteTableBody(tableSQL[open+1 : close])
+	if err != nil {
+		return err
+	}
+	protected := make(map[string]bool, len(protectedColumns))
+	for _, column := range protectedColumns {
+		protected[strings.ToLower(column)] = false
+	}
+	tablePrimaryKeys := 0
+	for _, part := range parts {
+		leading := sqliteDDLLeadingIdentifier(part)
+		if _, wanted := protected[leading]; wanted {
+			protected[leading] = true
+			if err := validateSQLiteDefaultConflictAlgorithms(part); err != nil {
+				return fmt.Errorf(
+					"SQLite %s.%s has incompatible constraint semantics: %w",
+					table,
+					leading,
+					err,
+				)
+			}
+		}
+		tokens, err := sqliteDDLTopLevelKeywords(part)
+		if err != nil {
+			return fmt.Errorf(
+				"parse SQLite %s table constraints: %w",
+				table,
+				err,
+			)
+		}
+		if containsSQLiteKeywordSequence(tokens, "primary", "key") &&
+			leading != "id" {
+			tablePrimaryKeys++
+			if err := validateSQLiteDefaultConflictAlgorithms(
+				part,
+			); err != nil {
+				return fmt.Errorf(
+					"SQLite %s primary key has incompatible constraint semantics: %w",
+					table,
+					err,
+				)
+			}
+		}
+	}
+	for column, found := range protected {
+		if !found {
+			return fmt.Errorf(
+				"SQLite protected column %s.%s is missing",
+				table,
+				column,
+			)
+		}
+	}
+	if validatePrimaryKey {
+		if tablePrimaryKeys > 1 {
+			return fmt.Errorf(
+				"SQLite table %s has duplicated table primary keys",
+				table,
+			)
+		}
+		if err := validateSQLitePrimaryKeyBackingIndex(db, table); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateSQLiteDefaultConflictAlgorithms(value string) error {
+	tokens, err := sqliteDDLTopLevelKeywords(value)
+	if err != nil {
+		return err
+	}
+	for index := 0; index < len(tokens); index++ {
+		if tokens[index] != "on" ||
+			index+1 >= len(tokens) ||
+			tokens[index+1] != "conflict" {
+			continue
+		}
+		if index+2 >= len(tokens) {
+			return errors.New("ON CONFLICT is missing its algorithm")
+		}
+		if tokens[index+2] != "abort" {
+			return fmt.Errorf(
+				"ON CONFLICT %s is not canonical ABORT behavior",
+				strings.ToUpper(tokens[index+2]),
+			)
+		}
+		index += 2
+	}
+	return nil
+}
+
+func sqliteDDLTopLevelKeywords(value string) ([]string, error) {
+	keywords := make([]string, 0, 12)
+	depth := 0
+	for index := 0; index < len(value); {
+		next, ok := skipSQLiteDDLTrivia(value, index)
+		if !ok {
+			return nil, errors.New("unterminated SQLite DDL comment")
+		}
+		index = next
+		if index >= len(value) {
+			break
+		}
+		switch value[index] {
+		case '\'':
+			after, ok := skipSQLiteDDLStringLiteral(value, index)
+			if !ok {
+				return nil, errors.New(
+					"unterminated SQLite DDL string literal",
+				)
+			}
+			index = after
+		case '(':
+			depth++
+			index++
+		case ')':
+			depth--
+			if depth < 0 {
+				return nil, errors.New(
+					"unbalanced SQLite DDL parenthesis",
+				)
+			}
+			index++
+		default:
+			identifier, quoted, after, present :=
+				scanSQLiteDDLIdentifier(value, index)
+			if present {
+				if depth == 0 && !quoted {
+					keywords = append(
+						keywords,
+						strings.ToLower(identifier),
+					)
+				}
+				index = after
+				continue
+			}
+			index++
+		}
+	}
+	if depth != 0 {
+		return nil, errors.New("unbalanced SQLite DDL parenthesis")
+	}
+	return keywords, nil
+}
+
+func skipSQLiteDDLStringLiteral(value string, index int) (int, bool) {
+	if index >= len(value) || value[index] != '\'' {
+		return index, false
+	}
+	for index++; index < len(value); index++ {
+		if value[index] != '\'' {
+			continue
+		}
+		if index+1 < len(value) && value[index+1] == '\'' {
+			index++
+			continue
+		}
+		return index + 1, true
+	}
+	return index, false
+}
+
+func containsSQLiteKeywordSequence(tokens []string, expected ...string) bool {
+	if len(expected) == 0 || len(tokens) < len(expected) {
+		return false
+	}
+	for start := 0; start <= len(tokens)-len(expected); start++ {
+		matches := true
+		for index := range expected {
+			if tokens[start+index] != expected[index] {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return true
+		}
+	}
+	return false
+}
+
+func validateSQLitePrimaryKeyBackingIndex(
+	db *gorm.DB,
+	table string,
+) error {
+	var indexes []sqliteAutomationWebhookIndexListRow
+	if err := db.Raw(
+		"PRAGMA main.index_list(" +
+			quoteAutomationWebhookSQLiteIdentifier(table) + ")",
+	).Scan(&indexes).Error; err != nil {
+		return fmt.Errorf(
+			"read SQLite %s primary-key indexes: %w",
+			table,
+			err,
+		)
+	}
+	primaryIndexes := make([]sqliteAutomationWebhookIndexListRow, 0, 1)
+	for _, index := range indexes {
+		if strings.EqualFold(index.Origin, "pk") {
+			primaryIndexes = append(primaryIndexes, index)
+		}
+	}
+	if len(primaryIndexes) != 1 {
+		return fmt.Errorf(
+			"SQLite table %s has %d primary-key backing indexes, want 1",
+			table,
+			len(primaryIndexes),
+		)
+	}
+	index := primaryIndexes[0]
+	if index.Unique != 1 ||
+		index.Partial != 0 ||
+		!strings.HasPrefix(
+			strings.ToLower(index.Name),
+			"sqlite_autoindex_"+strings.ToLower(table)+"_",
+		) {
+		return fmt.Errorf(
+			"SQLite table %s has incompatible primary-key backing index",
+			table,
+		)
+	}
+	var rows []sqliteAutomationWebhookIndexColumn
+	if err := db.Raw(
+		"PRAGMA main.index_xinfo(" +
+			quoteAutomationWebhookSQLiteIdentifier(index.Name) + ")",
+	).Scan(&rows).Error; err != nil {
+		return fmt.Errorf(
+			"read SQLite %s primary-key index columns: %w",
+			table,
+			err,
+		)
+	}
+	keys := make([]sqliteAutomationWebhookIndexColumn, 0, 1)
+	for _, row := range rows {
+		if row.Key == 1 {
+			keys = append(keys, row)
+		}
+	}
+	if len(keys) != 1 ||
+		keys[0].Sequence != 0 ||
+		keys[0].ColumnID < 0 ||
+		!keys[0].ColumnName.Valid ||
+		keys[0].ColumnName.String != "id" ||
+		keys[0].Descending != 0 ||
+		!keys[0].Collation.Valid ||
+		!strings.EqualFold(keys[0].Collation.String, "BINARY") {
+		return fmt.Errorf(
+			"SQLite table %s has incompatible primary-key key semantics",
+			table,
+		)
+	}
+	return nil
 }
 
 func sqliteColumnUsesDefaultBinaryCollation(
@@ -802,7 +1175,7 @@ func sqliteColumnUsesDefaultBinaryCollation(
 	var tableSQL string
 	if err := db.Raw(`
 		SELECT sql
-		FROM sqlite_master
+		FROM main.sqlite_schema
 		WHERE type = 'table' AND name = ?
 	`, table).Scan(&tableSQL).Error; err != nil {
 		return false, fmt.Errorf(
@@ -909,13 +1282,40 @@ func rebuildSQLiteTableFromDDL(
 	createSQL string,
 	purpose string,
 ) error {
+	if db == nil {
+		return errors.New("SQLite rebuild database is required")
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		return rebuildSQLiteTableFromDDLInTransaction(
+			tx,
+			table,
+			tempTable,
+			createSQL,
+			purpose,
+		)
+	})
+}
+
+func rebuildSQLiteTableFromDDLInTransaction(
+	db *gorm.DB,
+	table string,
+	tempTable string,
+	createSQL string,
+	purpose string,
+) error {
+	if err := requireSQLiteNoTempSchemaShadows(db, table); err != nil {
+		return err
+	}
+	if err := requireSQLiteRebuildNameAvailable(db, tempTable); err != nil {
+		return err
+	}
 	type columnState struct {
 		Name   string `gorm:"column:name"`
 		Hidden int    `gorm:"column:hidden"`
 	}
 	var columnRows []columnState
 	if err := db.Raw(
-		"PRAGMA table_xinfo(" +
+		"PRAGMA main.table_xinfo(" +
 			quoteAutomationWebhookSQLiteIdentifier(table) + ")",
 	).Scan(&columnRows).Error; err != nil {
 		return fmt.Errorf("read SQLite %s columns: %w", table, err)
@@ -935,7 +1335,7 @@ func rebuildSQLiteTableFromDDL(
 	var schemaObjects []sqliteSchemaObject
 	if err := db.Raw(`
 		SELECT type, name, sql
-		FROM sqlite_master
+		FROM main.sqlite_schema
 		WHERE tbl_name = ?
 		  AND type IN ('index', 'trigger')
 		  AND sql IS NOT NULL
@@ -946,7 +1346,7 @@ func rebuildSQLiteTableFromDDL(
 	var externalTriggers []sqliteSchemaObject
 	if err := db.Raw(`
 		SELECT type, name, sql
-		FROM sqlite_master
+		FROM main.sqlite_schema
 		WHERE type = 'trigger'
 		  AND tbl_name <> ?
 		  AND sql IS NOT NULL
@@ -956,6 +1356,14 @@ func rebuildSQLiteTableFromDDL(
 		return fmt.Errorf(
 			"read SQLite triggers that reference %s: %w",
 			table,
+			err,
+		)
+	}
+	if err := db.Exec(createSQL).Error; err != nil {
+		return fmt.Errorf(
+			"create SQLite rebuild table %s for %s: %w",
+			tempTable,
+			purpose,
 			err,
 		)
 	}
@@ -973,9 +1381,6 @@ func rebuildSQLiteTableFromDDL(
 		}
 	}
 	statements := []string{
-		"DROP TABLE IF EXISTS " +
-			quoteAutomationWebhookSQLiteIdentifier(tempTable),
-		createSQL,
 		"INSERT INTO " +
 			quoteAutomationWebhookSQLiteIdentifier(tempTable) +
 			" (" + strings.Join(columns, ", ") + ") SELECT " +
@@ -1012,6 +1417,54 @@ func rebuildSQLiteTableFromDDL(
 				err,
 			)
 		}
+	}
+	return nil
+}
+
+func requireSQLiteRebuildNameAvailable(
+	db *gorm.DB,
+	name string,
+) error {
+	var collision struct {
+		SchemaName string `gorm:"column:schema_name"`
+		Type       string `gorm:"column:type"`
+		Name       string `gorm:"column:name"`
+	}
+	result := db.Raw(`
+		SELECT schema_name, type, name
+		FROM (
+			SELECT
+				'main' AS schema_name,
+				type,
+				name
+			FROM main.sqlite_schema
+			WHERE name = ? COLLATE NOCASE
+			UNION ALL
+			SELECT
+				'temp' AS schema_name,
+				type,
+				name
+			FROM temp.sqlite_schema
+			WHERE name = ? COLLATE NOCASE
+		) AS collisions
+		ORDER BY schema_name, type, name
+		LIMIT 1
+	`, name, name).Scan(&collision)
+	if result.Error != nil {
+		return fmt.Errorf(
+			"inspect SQLite reserved rebuild name %s: %w",
+			name,
+			result.Error,
+		)
+	}
+	if result.RowsAffected != 0 {
+		return fmt.Errorf(
+			"SQLite reserved rebuild name %s collides with %s %s.%s",
+			name,
+			collision.Type,
+			collision.SchemaName,
+			collision.Name,
+		)
 	}
 	return nil
 }

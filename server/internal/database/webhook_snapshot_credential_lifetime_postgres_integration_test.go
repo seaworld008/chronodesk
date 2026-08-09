@@ -194,7 +194,7 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 		`CREATE TABLE projects (
 			id BIGINT PRIMARY KEY,
 			organization_id BIGINT NOT NULL,
-			status VARCHAR(20) NOT NULL
+			status VARCHAR(20) NOT NULL DEFAULT 'active'
 		)`,
 		`CREATE TABLE domain_events (
 			id VARCHAR(36) PRIMARY KEY,
@@ -554,6 +554,7 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 		runtime,
 	)
 	exercisePostgresIdentityColumnContractMatrix(t, owner)
+	exercisePostgresProjectStatusColumnContractMatrix(t, owner)
 	exercisePostgresWebhookTextCollations(
 		t,
 		owner,
@@ -576,87 +577,48 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 			firstCutover,
 		)
 	}
-	const runtimeBarrierCallback = "test:task9a_runtime_repeatable_read_barrier"
-	inventoryRead := make(chan struct{})
-	writerCommitted := make(chan struct{})
-	var inventoryOnce sync.Once
-	if err := runtime.Callback().Query().After("gorm:query").Register(
-		runtimeBarrierCallback,
-		func(tx *gorm.DB) {
-			if tx.Statement == nil || tx.Statement.Table != "projects" {
-				return
-			}
-			inventoryOnce.Do(func() {
-				close(inventoryRead)
-				<-writerCommitted
-			})
-		},
-	); err != nil {
-		t.Fatal(err)
-	}
-	validationResult := make(chan error, 1)
-	go func() {
-		validationResult <- ValidateWebhookSnapshotCredentialLifetimeRuntimeData(
-			context.Background(),
-			runtime,
-		)
-	}()
-	select {
-	case <-inventoryRead:
-	case <-time.After(5 * time.Second):
-		t.Fatal("runtime validator did not establish its Project inventory snapshot")
-	}
 	barrierScope := models.ProjectScope{
 		OrganizationID: 11,
 		ProjectID:      199,
 	}
-	var barrierSnapshot struct {
-		ID       string    `gorm:"column:id"`
-		Deadline time.Time `gorm:"column:credential_expires_at"`
-	}
-	if err := WithProjectScopeTransaction(
-		context.Background(),
+	repeatableReadBarrier := runPostgresRuntimeIsolationBarrier(
+		t,
 		owner,
-		barrierScope,
-		func(tx *gorm.DB) error {
-			if err := tx.Table("webhook_delivery_snapshots").
-				Select("id", "credential_expires_at").
-				Order("id ASC").
-				Take(&barrierSnapshot).Error; err != nil {
-				return err
-			}
-			return tx.Exec(
-				`UPDATE webhook_delivery_snapshots
-				 SET credential_expires_at = ?
-				 WHERE id = ?`,
-				barrierSnapshot.Deadline.Add(2*time.Hour),
-				barrierSnapshot.ID,
-			).Error
-		},
-	); err != nil {
-		t.Fatal(err)
-	}
-	close(writerCommitted)
-	select {
-	case err := <-validationResult:
-		if err != nil {
-			t.Fatalf(
-				"repeatable-read runtime gate mixed a concurrent atomic pair: %v",
-				err,
-			)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("repeatable-read runtime gate did not complete")
-	}
-	if err := runtime.Callback().Query().Remove(
-		runtimeBarrierCallback,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if err := ValidateWebhookSnapshotCredentialLifetimeRuntimeData(
-		context.Background(),
 		runtime,
-	); err == nil ||
+		barrierScope,
+		sql.LevelRepeatableRead,
+		"test:task9a_runtime_repeatable_read_barrier",
+	)
+	if repeatableReadBarrier.Validation != nil {
+		t.Fatalf(
+			"repeatable-read runtime gate mixed a concurrent atomic pair: %v",
+			repeatableReadBarrier.Validation,
+		)
+	}
+	t.Logf(
+		"repeatable-read runtime barrier wall=%s budget=%s watchdog=%s",
+		repeatableReadBarrier.WallDuration,
+		task9aQualificationRuntimeBudget,
+		task9aQualificationRuntimeBarrierWatchdogBudget,
+	)
+	if repeatableReadBarrier.WallDuration >
+		task9aQualificationRuntimeBudget {
+		t.Fatalf(
+			"repeatable-read runtime barrier %s exceeded frozen budget %s",
+			repeatableReadBarrier.WallDuration,
+			task9aQualificationRuntimeBudget,
+		)
+	}
+	postBarrierContext, cancelPostBarrier := context.WithTimeout(
+		context.Background(),
+		task9aQualificationRuntimeValidationContextBudget,
+	)
+	err = ValidateWebhookSnapshotCredentialLifetimeRuntimeData(
+		postBarrierContext,
+		runtime,
+	)
+	cancelPostBarrier()
+	if err == nil ||
 		!strings.Contains(strings.ToLower(err.Error()), "deadline") ||
 		!strings.Contains(err.Error(), "199") {
 		t.Fatalf(
@@ -664,28 +626,63 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 			err,
 		)
 	}
-	if err := WithProjectScopeTransaction(
-		context.Background(),
+	restorePostgresRuntimeIsolationBarrierSnapshot(
+		t,
 		owner,
 		barrierScope,
-		func(tx *gorm.DB) error {
-			return tx.Exec(
-				`UPDATE webhook_delivery_snapshots
-				 SET credential_expires_at = ?
-				 WHERE id = ?`,
-				barrierSnapshot.Deadline,
-				barrierSnapshot.ID,
-			).Error
-		},
-	); err != nil {
-		t.Fatal(err)
+		repeatableReadBarrier,
+	)
+
+	readCommittedBarrier := runPostgresRuntimeIsolationBarrier(
+		t,
+		owner,
+		runtime,
+		barrierScope,
+		sql.LevelReadCommitted,
+		"test:task9a_runtime_read_committed_barrier",
+	)
+	if readCommittedBarrier.Validation == nil ||
+		!strings.Contains(
+			strings.ToLower(readCommittedBarrier.Validation.Error()),
+			"deadline",
+		) ||
+		!strings.Contains(readCommittedBarrier.Validation.Error(), "199") {
+		t.Fatalf(
+			"READ COMMITTED runtime mutation did not produce the expected "+
+				"mixed-snapshot RED: %v",
+			readCommittedBarrier.Validation,
+		)
 	}
-	if err := ValidateWebhookSnapshotCredentialLifetimeRuntimeData(
+	t.Logf(
+		"READ COMMITTED mutation RED wall=%s",
+		readCommittedBarrier.WallDuration,
+	)
+	if readCommittedBarrier.WallDuration >
+		task9aQualificationRuntimeBudget {
+		t.Fatalf(
+			"READ COMMITTED control barrier %s exceeded frozen budget %s",
+			readCommittedBarrier.WallDuration,
+			task9aQualificationRuntimeBudget,
+		)
+	}
+	restorePostgresRuntimeIsolationBarrierSnapshot(
+		t,
+		owner,
+		barrierScope,
+		readCommittedBarrier,
+	)
+	restoredContext, cancelRestored := context.WithTimeout(
 		context.Background(),
+		task9aQualificationRuntimeValidationContextBudget,
+	)
+	if err := ValidateWebhookSnapshotCredentialLifetimeRuntimeData(
+		restoredContext,
 		runtime,
 	); err != nil {
+		cancelRestored()
 		t.Fatalf("runtime gate rejected restored unread pair: %v", err)
 	}
+	cancelRestored()
 
 	secondEventID := "00000000-0000-4000-8000-000000000911"
 	secondSnapshotID := "00000000-0000-7000-8000-000000000912"

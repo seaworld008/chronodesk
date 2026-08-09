@@ -261,7 +261,7 @@ type Project struct {
 	Key            ProjectKey    `json:"key" gorm:"size:32;not null;uniqueIndex:idx_projects_organization_key,priority:2;<-:create"`
 	Name           string        `json:"name" gorm:"size:120;not null"`
 	Description    string        `json:"description" gorm:"size:500"`
-	Status         ProjectStatus `json:"status" gorm:"size:20;not null;default:'active';index;check:chk_projects_status,status IN ('active','archived')"`
+	Status         ProjectStatus `json:"status" gorm:"size:20;not null;default:'active';index;check:chk_projects_status,status IS NOT NULL AND (status = 'active' OR status = 'archived')"`
 	TicketSequence uint64        `json:"ticket_sequence" gorm:"not null;default:0"`
 }
 

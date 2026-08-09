@@ -251,32 +251,107 @@ func validatePostgresWebhookCredentialIdentityColumnContract(
 	return validatePostgresWebhookCredentialPrimaryKeys(db)
 }
 
+type postgresWebhookCredentialPrimaryKeyRow struct {
+	TableName              string `gorm:"column:table_name"`
+	TableOID               uint32 `gorm:"column:table_oid"`
+	ExpectedTableOID       uint32 `gorm:"column:expected_table_oid"`
+	ConstraintOID          uint32 `gorm:"column:constraint_oid"`
+	ConstraintType         string `gorm:"column:constraint_type"`
+	ColumnName             string `gorm:"column:column_name"`
+	ConstraintAttnum       int    `gorm:"column:constraint_attnum"`
+	ConstraintOrdinality   int    `gorm:"column:constraint_ordinality"`
+	ConstraintIndexOID     uint32 `gorm:"column:constraint_index_oid"`
+	ConstraintValidated    bool   `gorm:"column:constraint_validated"`
+	ConstraintDeferrable   bool   `gorm:"column:constraint_deferrable"`
+	ConstraintDeferred     bool   `gorm:"column:constraint_deferred"`
+	ParentConstraintOID    uint32 `gorm:"column:parent_constraint_oid"`
+	IndexOID               uint32 `gorm:"column:index_oid"`
+	IndexTableOID          uint32 `gorm:"column:index_table_oid"`
+	IndexAttnum            int    `gorm:"column:index_attnum"`
+	IndexOrdinality        int    `gorm:"column:index_ordinality"`
+	ColumnCollationOID     uint32 `gorm:"column:column_collation_oid"`
+	IndexCollationOID      uint32 `gorm:"column:index_collation_oid"`
+	IndexOptionBits        int    `gorm:"column:index_option_bits"`
+	IndexAttributeCount    int    `gorm:"column:index_attribute_count"`
+	IndexKeyAttributeCount int    `gorm:"column:index_key_attribute_count"`
+	IndexUnique            bool   `gorm:"column:index_unique"`
+	IndexPrimary           bool   `gorm:"column:index_primary"`
+	IndexValid             bool   `gorm:"column:index_valid"`
+	IndexReady             bool   `gorm:"column:index_ready"`
+	IndexLive              bool   `gorm:"column:index_live"`
+	IndexImmediate         bool   `gorm:"column:index_immediate"`
+	IndexHasPredicate      bool   `gorm:"column:index_has_predicate"`
+	IndexHasExpressions    bool   `gorm:"column:index_has_expressions"`
+	IndexAccessMethod      string `gorm:"column:index_access_method"`
+}
+
 func validatePostgresWebhookCredentialPrimaryKeys(db *gorm.DB) error {
-	type primaryKeyRow struct {
-		TableName      string `gorm:"column:table_name"`
-		ConstraintOID  uint32 `gorm:"column:constraint_oid"`
-		ColumnName     string `gorm:"column:column_name"`
-		Ordinality     int    `gorm:"column:ordinality"`
-		ConstraintType string `gorm:"column:constraint_type"`
-	}
-	var rows []primaryKeyRow
+	var rows []postgresWebhookCredentialPrimaryKeyRow
 	if err := db.Raw(`
 		SELECT
 			table_state.relname AS table_name,
+			table_state.oid::oid AS table_oid,
+			to_regclass(
+				format(
+					'%I.%I',
+					CURRENT_SCHEMA(),
+					table_state.relname
+				)
+			)::oid AS expected_table_oid,
 			constraint_state.oid::oid AS constraint_oid,
+			constraint_state.contype::text AS constraint_type,
 			attribute.attname AS column_name,
-			key.ordinality::integer AS ordinality,
-			constraint_state.contype::text AS constraint_type
+			constraint_key.attnum::integer AS constraint_attnum,
+			constraint_key.ordinality::integer AS constraint_ordinality,
+			constraint_state.conindid::oid AS constraint_index_oid,
+			constraint_state.convalidated AS constraint_validated,
+			constraint_state.condeferrable AS constraint_deferrable,
+			constraint_state.condeferred AS constraint_deferred,
+			constraint_state.conparentid::oid AS parent_constraint_oid,
+			index_state.indexrelid::oid AS index_oid,
+			index_state.indrelid::oid AS index_table_oid,
+			index_key.attnum::integer AS index_attnum,
+			index_key.ordinality::integer AS index_ordinality,
+			attribute.attcollation::oid AS column_collation_oid,
+			index_collation.collation_oid::oid AS index_collation_oid,
+			index_option.option_bits::integer AS index_option_bits,
+			index_state.indnatts::integer AS index_attribute_count,
+			index_state.indnkeyatts::integer AS index_key_attribute_count,
+			index_state.indisunique AS index_unique,
+			index_state.indisprimary AS index_primary,
+			index_state.indisvalid AS index_valid,
+			index_state.indisready AS index_ready,
+			index_state.indislive AS index_live,
+			index_state.indimmediate AS index_immediate,
+			(index_state.indpred IS NOT NULL) AS index_has_predicate,
+			(index_state.indexprs IS NOT NULL) AS index_has_expressions,
+			access_method.amname AS index_access_method
 		FROM pg_constraint AS constraint_state
 		JOIN pg_class AS table_state
 		  ON table_state.oid = constraint_state.conrelid
 		JOIN pg_namespace AS namespace
 		  ON namespace.oid = table_state.relnamespace
+		JOIN pg_index AS index_state
+		  ON index_state.indexrelid = constraint_state.conindid
+		 AND index_state.indrelid = constraint_state.conrelid
+		JOIN pg_class AS index_relation
+		  ON index_relation.oid = index_state.indexrelid
+		JOIN pg_am AS access_method
+		  ON access_method.oid = index_relation.relam
 		JOIN LATERAL unnest(constraint_state.conkey)
-		  WITH ORDINALITY AS key(attnum, ordinality) ON TRUE
+		  WITH ORDINALITY AS constraint_key(attnum, ordinality) ON TRUE
+		JOIN LATERAL unnest(index_state.indkey::smallint[])
+		  WITH ORDINALITY AS index_key(attnum, ordinality)
+		  ON index_key.ordinality = constraint_key.ordinality
+		JOIN LATERAL unnest(index_state.indcollation::oid[])
+		  WITH ORDINALITY AS index_collation(collation_oid, ordinality)
+		  ON index_collation.ordinality = constraint_key.ordinality
+		JOIN LATERAL unnest(index_state.indoption::smallint[])
+		  WITH ORDINALITY AS index_option(option_bits, ordinality)
+		  ON index_option.ordinality = constraint_key.ordinality
 		JOIN pg_attribute AS attribute
 		  ON attribute.attrelid = constraint_state.conrelid
-		 AND attribute.attnum = key.attnum
+		 AND attribute.attnum = constraint_key.attnum
 		 AND NOT attribute.attisdropped
 		WHERE namespace.nspname = CURRENT_SCHEMA()
 		  AND table_state.relname IN (
@@ -285,14 +360,20 @@ func validatePostgresWebhookCredentialPrimaryKeys(db *gorm.DB) error {
 			'outbox_deliveries'
 		  )
 		  AND constraint_state.contype = 'p'
-		ORDER BY table_state.relname, constraint_state.oid, key.ordinality
+		ORDER BY
+			table_state.relname,
+			constraint_state.oid,
+			constraint_key.ordinality
 	`).Scan(&rows).Error; err != nil {
 		return fmt.Errorf(
 			"read PostgreSQL webhook credential primary keys: %w",
 			err,
 		)
 	}
-	byTable := make(map[string][]primaryKeyRow, 3)
+	byTable := make(
+		map[string][]postgresWebhookCredentialPrimaryKeyRow,
+		3,
+	)
 	for _, row := range rows {
 		byTable[row.TableName] = append(byTable[row.TableName], row)
 	}
@@ -302,11 +383,7 @@ func validatePostgresWebhookCredentialPrimaryKeys(db *gorm.DB) error {
 		"outbox_deliveries",
 	} {
 		keys := byTable[table]
-		if len(keys) != 1 ||
-			keys[0].ConstraintOID == 0 ||
-			keys[0].ConstraintType != "p" ||
-			keys[0].ColumnName != "id" ||
-			keys[0].Ordinality != 1 {
+		if !postgresWebhookCredentialPrimaryKeyRowsAreCanonical(keys) {
 			return fmt.Errorf(
 				"%s has incompatible PostgreSQL primary key semantics",
 				table,
@@ -314,6 +391,46 @@ func validatePostgresWebhookCredentialPrimaryKeys(db *gorm.DB) error {
 		}
 	}
 	return nil
+}
+
+func postgresWebhookCredentialPrimaryKeyRowsAreCanonical(
+	rows []postgresWebhookCredentialPrimaryKeyRow,
+) bool {
+	if len(rows) != 1 {
+		return false
+	}
+	row := rows[0]
+	return row.TableName != "" &&
+		row.TableOID != 0 &&
+		row.TableOID == row.ExpectedTableOID &&
+		row.ConstraintOID != 0 &&
+		row.ConstraintType == "p" &&
+		row.ColumnName == "id" &&
+		row.ConstraintAttnum > 0 &&
+		row.ConstraintOrdinality == 1 &&
+		row.ConstraintIndexOID != 0 &&
+		row.ConstraintIndexOID == row.IndexOID &&
+		row.ConstraintValidated &&
+		!row.ConstraintDeferrable &&
+		!row.ConstraintDeferred &&
+		row.ParentConstraintOID == 0 &&
+		row.IndexOID != 0 &&
+		row.IndexTableOID == row.TableOID &&
+		row.IndexAttnum == row.ConstraintAttnum &&
+		row.IndexOrdinality == 1 &&
+		row.IndexCollationOID == row.ColumnCollationOID &&
+		row.IndexOptionBits == 0 &&
+		row.IndexAttributeCount == 1 &&
+		row.IndexKeyAttributeCount == 1 &&
+		row.IndexUnique &&
+		row.IndexPrimary &&
+		row.IndexValid &&
+		row.IndexReady &&
+		row.IndexLive &&
+		row.IndexImmediate &&
+		!row.IndexHasPredicate &&
+		!row.IndexHasExpressions &&
+		row.IndexAccessMethod == "btree"
 }
 
 func validateSQLiteWebhookCredentialIdentityColumnContract(
@@ -336,7 +453,7 @@ func validateSQLiteWebhookCredentialIdentityColumnContract(
 	} {
 		var rows []columnState
 		if err := db.Raw(
-			"PRAGMA table_xinfo(" +
+			"PRAGMA main.table_xinfo(" +
 				quoteAutomationWebhookSQLiteIdentifier(table) + ")",
 		).Scan(&rows).Error; err != nil {
 			return fmt.Errorf(
@@ -398,6 +515,27 @@ func validateSQLiteWebhookCredentialIdentityColumnContract(
 					key,
 				)
 			}
+		}
+	}
+	protectedByTable := make(map[string][]string, 3)
+	for _, contract := range webhookCredentialIdentityColumnContracts() {
+		protectedByTable[contract.table] = append(
+			protectedByTable[contract.table],
+			contract.column,
+		)
+	}
+	for _, table := range []string{
+		"domain_events",
+		"webhook_delivery_snapshots",
+		"outbox_deliveries",
+	} {
+		if err := validateSQLiteProtectedColumnConstraintSemantics(
+			db,
+			table,
+			protectedByTable[table],
+			true,
+		); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -540,7 +678,7 @@ func rebuildSQLiteWebhookCredentialIdentityTables(db *gorm.DB) error {
 		var tableState sqliteSchemaObject
 		if err := db.Raw(`
 			SELECT type, name, sql
-			FROM sqlite_master
+			FROM main.sqlite_schema
 			WHERE type = 'table' AND name = ?
 		`, table).Take(&tableState).Error; err != nil {
 			return fmt.Errorf(
@@ -566,7 +704,7 @@ func rebuildSQLiteWebhookCredentialIdentityTables(db *gorm.DB) error {
 			NotNull int    `gorm:"column:notnull"`
 		}
 		if err := db.Raw(
-			"PRAGMA table_xinfo(" +
+			"PRAGMA main.table_xinfo(" +
 				quoteAutomationWebhookSQLiteIdentifier(table) + ")",
 		).Scan(&columnStates).Error; err != nil {
 			return err
@@ -587,7 +725,10 @@ func rebuildSQLiteWebhookCredentialIdentityTables(db *gorm.DB) error {
 			}
 			delete(required, column)
 			if !notNullByColumn[column] {
-				parts[index] = strings.TrimSpace(part) + " NOT NULL"
+				parts[index] = appendSQLiteColumnConstraint(
+					part,
+					"NOT NULL",
+				)
 				changed = true
 			}
 		}
@@ -609,7 +750,7 @@ func rebuildSQLiteWebhookCredentialIdentityTables(db *gorm.DB) error {
 		tempTable := table + "__identity_contract"
 		createSQL := "CREATE TABLE " +
 			quoteAutomationWebhookSQLiteIdentifier(tempTable) +
-			" (" + strings.Join(parts, ", ") + ")" +
+			" (" + joinSQLiteTableBody(parts) + ")" +
 			tableState.SQL[close+1:]
 		if err := rebuildSQLiteTableFromDDL(
 			db,

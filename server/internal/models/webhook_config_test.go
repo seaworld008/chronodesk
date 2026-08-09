@@ -91,6 +91,7 @@ func TestParseWebhookDeliverySnapshotIDRequiresRFC4122Variant(t *testing.T) {
 		"00000000-0000-7000-1000-000000000001",
 		"00000000-0000-7000-c000-000000000001",
 		"00000000-0000-7000-f000-000000000001",
+		"00000000-0000-7000-8000-000000000001\x00",
 	} {
 		if _, err := ParseWebhookDeliverySnapshotID(snapshotID); err == nil {
 			t.Fatalf(

@@ -39,8 +39,36 @@ func validateWebhookCredentialRuntimeSnapshotInReadTransaction(
 	ctx context.Context,
 	db *gorm.DB,
 ) error {
+	if db.Dialector.Name() == "postgres" {
+		return validateWebhookCredentialRuntimeSnapshotWithOptions(
+			ctx,
+			db,
+			&sql.TxOptions{
+				Isolation: sql.LevelRepeatableRead,
+				ReadOnly:  true,
+			},
+		)
+	}
+	return validateWebhookCredentialRuntimeSnapshotWithOptions(
+		ctx,
+		db,
+		nil,
+	)
+}
+
+func validateWebhookCredentialRuntimeSnapshotWithOptions(
+	ctx context.Context,
+	db *gorm.DB,
+	options *sql.TxOptions,
+) error {
 	run := func(tx *gorm.DB) error {
 		if tx.Dialector.Name() == "sqlite" {
+			if err := requireSQLiteNoTempSchemaShadows(
+				tx,
+				sqliteWebhookCredentialProtectedTables...,
+			); err != nil {
+				return err
+			}
 			enabled, err := sqliteForeignKeysEnabled(tx)
 			if err != nil {
 				return err
@@ -50,22 +78,15 @@ func validateWebhookCredentialRuntimeSnapshotInReadTransaction(
 					"SQLite foreign_keys runtime contract is disabled",
 				)
 			}
-			var violation struct {
-				Table string        `gorm:"column:table"`
-				RowID sql.NullInt64 `gorm:"column:rowid"`
-			}
-			result := tx.Raw(`
-				SELECT "table", rowid
-				FROM pragma_foreign_key_check
-				LIMIT 1
-			`).Scan(&violation)
-			if result.Error != nil {
+			violation, found, err :=
+				firstSQLiteForeignKeyViolation(tx)
+			if err != nil {
 				return fmt.Errorf(
 					"run SQLite runtime foreign key check: %w",
-					result.Error,
+					err,
 				)
 			}
-			if result.RowsAffected != 0 {
+			if found {
 				return fmt.Errorf(
 					"SQLite runtime foreign key check found a violation in %s",
 					violation.Table,
@@ -139,14 +160,8 @@ func validateWebhookCredentialRuntimeSnapshotInReadTransaction(
 			lastProjectID = last.ID
 		}
 	}
-	if db.Dialector.Name() == "postgres" {
-		return db.WithContext(ctx).Transaction(
-			run,
-			&sql.TxOptions{
-				Isolation: sql.LevelRepeatableRead,
-				ReadOnly:  true,
-			},
-		)
+	if options != nil {
+		return db.WithContext(ctx).Transaction(run, options)
 	}
 	return db.WithContext(ctx).Transaction(run)
 }
@@ -481,7 +496,10 @@ func webhookCredentialUUIDShapeSQL(
 	if requireV7 {
 		version = "substr(" + column + ", 15, 1) = '7'"
 	}
-	return "length(" + column + ") = 36" +
+	return "typeof(" + column + ") = 'text'" +
+		" AND length(CAST(" + column + " AS BLOB)) = 36" +
+		" AND instr(CAST(" + column + " AS BLOB), x'00') = 0" +
+		" AND length(" + column + ") = 36" +
 		" AND lower(" + column + ") = " + column +
 		" AND substr(" + column + ", 1, 8) NOT GLOB '*[^0-9a-f]*'" +
 		" AND substr(" + column + ", 9, 1) = '-'" +

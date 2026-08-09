@@ -27,7 +27,7 @@ var webhookCredentialConstraintDefinitions = map[string]struct {
 }{
 	"chk_projects_status": {
 		table: "projects",
-		expression: closedVocabularyINConstraintExpression(
+		expression: requiredClosedVocabularyConstraintExpression(
 			"status",
 			models.ProjectStatusValues(),
 		),
@@ -597,6 +597,12 @@ func migrateSQLiteWebhookSnapshotCredentialLifetimeContractAt(
 	db *gorm.DB,
 	cutoverAt time.Time,
 ) error {
+	if err := requireSQLiteNoTempSchemaShadows(
+		db,
+		sqliteWebhookCredentialProtectedTables...,
+	); err != nil {
+		return err
+	}
 	enabled, err := sqliteForeignKeysEnabled(db)
 	if err != nil {
 		return err
@@ -660,18 +666,14 @@ func migrateSQLiteWebhookSnapshotCredentialLifetimeContractAt(
 	if err := errors.Join(cutoverErr, restoreErr); err != nil {
 		return err
 	}
-	var violations []struct {
-		Table string `gorm:"column:table"`
-		RowID int64  `gorm:"column:rowid"`
-	}
-	if err := cleanupDB.Raw("PRAGMA foreign_key_check").
-		Scan(&violations).Error; err != nil {
+	violation, found, err := firstSQLiteForeignKeyViolation(cleanupDB)
+	if err != nil {
 		return fmt.Errorf("run SQLite foreign key check: %w", err)
 	}
-	if len(violations) != 0 {
+	if found {
 		return fmt.Errorf(
-			"SQLite foreign key check found %d violations",
-			len(violations),
+			"SQLite foreign key check found a violation in %s",
+			violation.Table,
 		)
 	}
 	if err := validateWebhookCredentialLifetimeCatalog(cleanupDB); err != nil {
@@ -764,9 +766,8 @@ func installPostgresWebhookCredentialConstraints(db *gorm.DB) error {
 				return err
 			}
 			if states[0].Type != "c" || got != want {
-				if name != "chk_webhook_snapshot_scope" ||
-					states[0].Type != "c" ||
-					!isLegacyWebhookSnapshotScopeConstraint(got) {
+				if states[0].Type != "c" ||
+					!isLegacyWebhookCredentialConstraint(name, got) {
 					return fmt.Errorf(
 						"PostgreSQL webhook credential constraint %s has an incompatible definition",
 						name,
@@ -846,18 +847,33 @@ func validateWebhookCredentialLifetimeCatalog(db *gorm.DB) error {
 		return err
 	}
 	var checkpoint models.SchemaMigrationCheckpoint
-	if err := db.Where(
-		"key = ?",
-		webhookSnapshotCredentialLifetimeCheckpointKey,
-	).Take(&checkpoint).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+	var checkpointErr error
+	if db.Dialector.Name() == "sqlite" {
+		result := db.Raw(`
+			SELECT key, version, checksum, completed_at
+			FROM main.schema_migration_checkpoints
+			WHERE key = ?
+			LIMIT 1
+		`, webhookSnapshotCredentialLifetimeCheckpointKey).Scan(&checkpoint)
+		checkpointErr = result.Error
+		if checkpointErr == nil && result.RowsAffected == 0 {
+			checkpointErr = gorm.ErrRecordNotFound
+		}
+	} else {
+		checkpointErr = db.Where(
+			"key = ?",
+			webhookSnapshotCredentialLifetimeCheckpointKey,
+		).Take(&checkpoint).Error
+	}
+	if checkpointErr != nil {
+		if errors.Is(checkpointErr, gorm.ErrRecordNotFound) {
 			return errors.New(
 				"webhook credential lifetime checkpoint is missing; run `go run ./cmd/migrate`",
 			)
 		}
 		return fmt.Errorf(
 			"read webhook credential lifetime checkpoint: %w",
-			err,
+			checkpointErr,
 		)
 	}
 	if checkpoint.Version !=
@@ -1001,7 +1017,7 @@ func validateSQLiteWebhookCredentialCatalog(db *gorm.DB) error {
 	}
 	if err := db.Raw(`
 		SELECT name, sql
-		FROM sqlite_master
+		FROM main.sqlite_schema
 		WHERE type = 'table'
 		  AND name IN (
 			'projects',

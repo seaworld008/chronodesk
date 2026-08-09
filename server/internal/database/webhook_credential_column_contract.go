@@ -72,7 +72,7 @@ func validateWebhookCredentialColumnContract(db *gorm.DB) error {
 	if err := validateWebhookCredentialStatusColumnContract(db); err != nil {
 		return err
 	}
-	if err := validateWebhookProjectStatusCollationContract(db); err != nil {
+	if err := validateWebhookProjectStatusColumnContract(db); err != nil {
 		return err
 	}
 	return validateWebhookCredentialIdentityColumnContract(db)
@@ -85,7 +85,7 @@ func validatePreparedWebhookCredentialColumnContract(db *gorm.DB) error {
 	if err := validateWebhookCredentialStatusColumnContract(db); err != nil {
 		return err
 	}
-	if err := validateWebhookProjectStatusCollationContract(db); err != nil {
+	if err := validateWebhookProjectStatusColumnContract(db); err != nil {
 		return err
 	}
 	return validateWebhookCredentialIdentityColumnContract(db)
@@ -219,7 +219,7 @@ func validateSQLiteWebhookCredentialColumnContract(
 	for _, contract := range webhookCredentialColumnContracts() {
 		var rows []columnState
 		if err := db.Raw(
-			"PRAGMA table_xinfo(`" + contract.table + "`)",
+			"PRAGMA main.table_xinfo(`" + contract.table + "`)",
 		).Scan(&rows).Error; err != nil {
 			return fmt.Errorf(
 				"read SQLite %s columns: %w",
@@ -348,7 +348,7 @@ func validateWebhookCredentialStatusColumnContract(db *gorm.DB) error {
 			HiddenFlag int     `gorm:"column:hidden"`
 		}
 		if err := db.Raw(
-			"PRAGMA table_xinfo(`outbox_deliveries`)",
+			"PRAGMA main.table_xinfo(`outbox_deliveries`)",
 		).Scan(&rows).Error; err != nil {
 			return fmt.Errorf(
 				"read SQLite outbox_deliveries.status contract: %w",
@@ -382,6 +382,14 @@ func validateWebhookCredentialStatusColumnContract(db *gorm.DB) error {
 					"outbox_deliveries.status has incompatible SQLite collation contract",
 				)
 			}
+			if err := validateSQLiteProtectedColumnConstraintSemantics(
+				db,
+				"outbox_deliveries",
+				[]string{"status"},
+				false,
+			); err != nil {
+				return err
+			}
 			return nil
 		}
 		return errors.New("outbox_deliveries.status is missing")
@@ -394,36 +402,35 @@ func validateWebhookCredentialStatusColumnContract(db *gorm.DB) error {
 }
 
 func normalizeWebhookStatusDefault(value string) string {
-	value = strings.TrimSpace(value)
-	for strings.HasPrefix(value, "(") {
-		close, ok := matchingSQLParenthesis(value, 0)
-		if !ok || close != len(value)-1 {
-			break
-		}
-		value = strings.TrimSpace(value[1:close])
-	}
-	switch value {
-	case "'pending'",
-		`"pending"`,
-		"'pending'::text",
-		"'pending'::character varying":
-		return "pending"
-	default:
-		return value
-	}
+	return normalizeClosedVocabularyDefault(value, "pending")
 }
 
-func validateWebhookProjectStatusCollationContract(db *gorm.DB) error {
+func validateWebhookProjectStatusColumnContract(db *gorm.DB) error {
 	if db == nil {
-		return errors.New("Project status collation database is required")
+		return errors.New("Project status column database is required")
 	}
 	switch db.Dialector.Name() {
 	case "postgres":
 		var state struct {
-			CollationName *string `gorm:"column:collation_name"`
+			DataType        string  `gorm:"column:data_type"`
+			UDTName         string  `gorm:"column:udt_name"`
+			IsNullable      string  `gorm:"column:is_nullable"`
+			ColumnDefault   *string `gorm:"column:column_default"`
+			CharacterLength *int64  `gorm:"column:character_maximum_length"`
+			CollationName   *string `gorm:"column:collation_name"`
+			IsGenerated     string  `gorm:"column:is_generated"`
+			IsIdentity      string  `gorm:"column:is_identity"`
 		}
 		result := db.Raw(`
-			SELECT collation_name
+			SELECT
+				data_type,
+				udt_name,
+				is_nullable,
+				column_default,
+				character_maximum_length,
+				collation_name,
+				is_generated,
+				is_identity
 			FROM information_schema.columns
 			WHERE table_schema = CURRENT_SCHEMA()
 			  AND table_name = 'projects'
@@ -435,13 +442,64 @@ func validateWebhookProjectStatusCollationContract(db *gorm.DB) error {
 				result.Error,
 			)
 		}
-		if result.RowsAffected != 1 || state.CollationName != nil {
+		if result.RowsAffected != 1 ||
+			state.DataType != "character varying" ||
+			state.UDTName != "varchar" ||
+			state.IsNullable != "NO" ||
+			state.CharacterLength == nil ||
+			*state.CharacterLength != 20 ||
+			state.ColumnDefault == nil ||
+			normalizeClosedVocabularyDefault(
+				*state.ColumnDefault,
+				"active",
+			) != "active" ||
+			state.CollationName != nil ||
+			state.IsGenerated != "NEVER" ||
+			state.IsIdentity != "NO" {
 			return errors.New(
-				"projects.status has incompatible PostgreSQL collation contract",
+				"projects.status has incompatible PostgreSQL type/not null/default/length/collation contract",
 			)
 		}
 		return nil
 	case "sqlite":
+		var rows []struct {
+			Name       string  `gorm:"column:name"`
+			Type       string  `gorm:"column:type"`
+			NotNull    int     `gorm:"column:notnull"`
+			Default    *string `gorm:"column:dflt_value"`
+			HiddenFlag int     `gorm:"column:hidden"`
+		}
+		if err := db.Raw("PRAGMA main.table_xinfo(`projects`)").
+			Scan(&rows).Error; err != nil {
+			return fmt.Errorf(
+				"read SQLite projects.status contract: %w",
+				err,
+			)
+		}
+		var found bool
+		for _, state := range rows {
+			if state.Name != "status" {
+				continue
+			}
+			found = true
+			statusType := strings.ToUpper(strings.TrimSpace(state.Type))
+			if (statusType != "TEXT" && statusType != "VARCHAR(20)") ||
+				state.NotNull != 1 ||
+				state.Default == nil ||
+				normalizeClosedVocabularyDefault(
+					*state.Default,
+					"active",
+				) != "active" ||
+				state.HiddenFlag != 0 {
+				return errors.New(
+					"projects.status has incompatible SQLite type/not null/default/length contract",
+				)
+			}
+			break
+		}
+		if !found {
+			return errors.New("projects.status is missing")
+		}
 		binary, err := sqliteColumnUsesDefaultBinaryCollation(
 			db,
 			"projects",
@@ -455,11 +513,39 @@ func validateWebhookProjectStatusCollationContract(db *gorm.DB) error {
 				"projects.status has incompatible SQLite collation contract",
 			)
 		}
+		if err := validateSQLiteProtectedColumnConstraintSemantics(
+			db,
+			"projects",
+			[]string{"status"},
+			false,
+		); err != nil {
+			return err
+		}
 		return nil
 	default:
 		return fmt.Errorf(
-			"Project status collation contract is unsupported for database dialect %q",
+			"Project status column contract is unsupported for database dialect %q",
 			db.Dialector.Name(),
 		)
+	}
+}
+
+func normalizeClosedVocabularyDefault(value string, expected string) string {
+	value = strings.TrimSpace(value)
+	for strings.HasPrefix(value, "(") {
+		close, ok := matchingSQLParenthesis(value, 0)
+		if !ok || close != len(value)-1 {
+			break
+		}
+		value = strings.TrimSpace(value[1:close])
+	}
+	switch value {
+	case "'" + expected + "'",
+		`"` + expected + `"`,
+		"'" + expected + "'::text",
+		"'" + expected + "'::character varying":
+		return expected
+	default:
+		return value
 	}
 }

@@ -265,7 +265,7 @@ func TestSQLiteRuntimeReadTransactionPinsForeignKeyPrecheckAndProjectScan(
 			rotated,
 		)
 	}
-	const boundedForeignKeyCheck = `select "table", rowid from pragma_foreign_key_check limit 1`
+	const boundedForeignKeyCheck = `select "table", rowid, parent, fkid from pragma_foreign_key_check limit 1`
 	foundBoundedForeignKeyCheck := false
 	for _, operation := range operations {
 		if operation.statement == boundedForeignKeyCheck {
@@ -304,7 +304,7 @@ func openRecordedLegacySQLiteReview3Database(
 		`CREATE TABLE projects (
 			id INTEGER NOT NULL,
 			organization_id INTEGER NOT NULL,
-			status VARCHAR(20) NOT NULL,
+			status VARCHAR(20) NOT NULL DEFAULT 'active',
 			PRIMARY KEY (id),
 			CONSTRAINT chk_projects_status CHECK (
 				status IN ('active', 'archived')
