@@ -633,6 +633,7 @@ type sqliteAutomationWebhookIndexColumn struct {
 	ColumnID   int            `gorm:"column:cid"`
 	ColumnName sql.NullString `gorm:"column:name"`
 	Descending int            `gorm:"column:desc"`
+	Collation  sql.NullString `gorm:"column:coll"`
 	Key        int            `gorm:"column:key"`
 }
 
@@ -696,6 +697,8 @@ func sqliteAutomationWebhookIndexIsValid(
 			row.ColumnID < 0 ||
 			!row.ColumnName.Valid ||
 			row.ColumnName.String != expected.name ||
+			!row.Collation.Valid ||
+			!strings.EqualFold(row.Collation.String, "BINARY") ||
 			(row.Descending == 1) != expected.descending {
 			return false, nil
 		}

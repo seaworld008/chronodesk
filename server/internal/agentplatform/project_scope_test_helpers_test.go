@@ -11,6 +11,19 @@ import (
 
 const agentplatformTestOutboxWorkerActorID = "outbox-delivery-worker"
 
+func closeAgentplatformTestDB(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("resolve agentplatform test database pool: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := sqlDB.Close(); err != nil {
+			t.Errorf("close agentplatform test database pool: %v", err)
+		}
+	})
+}
+
 func installAgentplatformTestProjectScope(
 	t *testing.T,
 	db *gorm.DB,

@@ -32,22 +32,10 @@ func validateWebhookCredentialRuntimeSnapshot(
 	if db == nil {
 		return errors.New("webhook credential lifetime database is required")
 	}
-	if db.Dialector.Name() == "sqlite" {
-		return withPinnedGORMConnection(
-			ctx,
-			db,
-			func(pinned *gorm.DB) error {
-				return validateWebhookCredentialRuntimeSnapshotPinned(
-					ctx,
-					pinned,
-				)
-			},
-		)
-	}
-	return validateWebhookCredentialRuntimeSnapshotPinned(ctx, db)
+	return validateWebhookCredentialRuntimeSnapshotInReadTransaction(ctx, db)
 }
 
-func validateWebhookCredentialRuntimeSnapshotPinned(
+func validateWebhookCredentialRuntimeSnapshotInReadTransaction(
 	ctx context.Context,
 	db *gorm.DB,
 ) error {
@@ -60,6 +48,27 @@ func validateWebhookCredentialRuntimeSnapshotPinned(
 			if !enabled {
 				return errors.New(
 					"SQLite foreign_keys runtime contract is disabled",
+				)
+			}
+			var violation struct {
+				Table string        `gorm:"column:table"`
+				RowID sql.NullInt64 `gorm:"column:rowid"`
+			}
+			result := tx.Raw(`
+				SELECT "table", rowid
+				FROM pragma_foreign_key_check
+				LIMIT 1
+			`).Scan(&violation)
+			if result.Error != nil {
+				return fmt.Errorf(
+					"run SQLite runtime foreign key check: %w",
+					result.Error,
+				)
+			}
+			if result.RowsAffected != 0 {
+				return fmt.Errorf(
+					"SQLite runtime foreign key check found a violation in %s",
+					violation.Table,
 				)
 			}
 		}
@@ -179,6 +188,37 @@ func validateWebhookCredentialSet(
 	if db == nil {
 		return errors.New("webhook credential validation database is required")
 	}
+	statement := buildWebhookCredentialViolationStatement(
+		db.Dialector.Name(),
+		scope,
+		requireDeadlines,
+		includeAllOutboxShapes,
+	)
+	var violation webhookCredentialViolation
+	if err := db.Raw(statement.query, statement.args...).
+		Scan(&violation).Error; err != nil {
+		return fmt.Errorf(
+			"run set-based webhook credential validation: %w",
+			err,
+		)
+	}
+	if violation.Code != "" {
+		return webhookCredentialViolationError(violation)
+	}
+	return nil
+}
+
+type webhookCredentialSQLStatement struct {
+	query string
+	args  []any
+}
+
+func buildWebhookCredentialViolationStatement(
+	dialect string,
+	scope *models.ProjectScope,
+	requireDeadlines bool,
+	includeAllOutboxShapes bool,
+) webhookCredentialSQLStatement {
 	snapshotScope := "1 = 1"
 	deliveryScope := "1 = 1"
 	eventScope := "1 = 1"
@@ -195,17 +235,17 @@ func validateWebhookCredentialSet(
 		)
 	}
 	snapshotIDValid := webhookCredentialUUIDShapeSQL(
-		db.Dialector.Name(),
+		dialect,
 		"id",
 		true,
 	)
 	deliveryIDValid := webhookCredentialUUIDShapeSQL(
-		db.Dialector.Name(),
+		dialect,
 		"id",
 		false,
 	)
 	eventIDValid := webhookCredentialUUIDShapeSQL(
-		db.Dialector.Name(),
+		dialect,
 		"event_id",
 		false,
 	)
@@ -390,17 +430,7 @@ func validateWebhookCredentialSet(
 		requireDeliveryDeadline,
 		sqlBooleanLiteral(requireDeadlines),
 	)
-	var violation webhookCredentialViolation
-	if err := db.Raw(query, args...).Scan(&violation).Error; err != nil {
-		return fmt.Errorf(
-			"run set-based webhook credential validation: %w",
-			err,
-		)
-	}
-	if violation.Code != "" {
-		return webhookCredentialViolationError(violation)
-	}
-	return nil
+	return webhookCredentialSQLStatement{query: query, args: args}
 }
 
 func webhookCredentialViolationError(
@@ -445,7 +475,7 @@ func webhookCredentialUUIDShapeSQL(
 		}
 		return column + " ~ '^[0-9a-f]{8}-[0-9a-f]{4}-" +
 			version +
-			"[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$'"
+			"[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'"
 	}
 	version := "substr(" + column + ", 15, 1) BETWEEN '0' AND 'f'"
 	if requireV7 {
@@ -462,7 +492,8 @@ func webhookCredentialUUIDShapeSQL(
 		" AND substr(" + column + ", 20, 4) NOT GLOB '*[^0-9a-f]*'" +
 		" AND substr(" + column + ", 24, 1) = '-'" +
 		" AND substr(" + column + ", 25, 12) NOT GLOB '*[^0-9a-f]*'" +
-		" AND " + version
+		" AND " + version +
+		" AND substr(" + column + ", 20, 1) IN ('8', '9', 'a', 'b')"
 }
 
 func closedVocabularySQLList[T ~string](values []T) string {

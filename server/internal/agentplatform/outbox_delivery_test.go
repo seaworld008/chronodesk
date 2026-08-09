@@ -236,6 +236,7 @@ func TestProjectArchiveOutboxWorkerRevokesWebSocketProjectAccess(
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAgentplatformTestDB(t, db)
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.Organization{},

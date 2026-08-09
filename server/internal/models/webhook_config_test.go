@@ -85,6 +85,34 @@ func TestValidateWebhookSubscriptionsRequiresCanonicalTypes(t *testing.T) {
 	}
 }
 
+func TestParseWebhookDeliverySnapshotIDRequiresRFC4122Variant(t *testing.T) {
+	for _, snapshotID := range []string{
+		"00000000-0000-7000-0000-000000000001",
+		"00000000-0000-7000-1000-000000000001",
+		"00000000-0000-7000-c000-000000000001",
+		"00000000-0000-7000-f000-000000000001",
+	} {
+		if _, err := ParseWebhookDeliverySnapshotID(snapshotID); err == nil {
+			t.Fatalf(
+				"ParseWebhookDeliverySnapshotID(%q) accepted a non-RFC4122 variant",
+				snapshotID,
+			)
+		}
+	}
+	for _, snapshotID := range []string{
+		"00000000-0000-7000-8000-000000000001",
+		"00000000-0000-7000-b000-000000000001",
+	} {
+		if _, err := ParseWebhookDeliverySnapshotID(snapshotID); err != nil {
+			t.Fatalf(
+				"ParseWebhookDeliverySnapshotID(%q) rejected RFC4122 variant: %v",
+				snapshotID,
+				err,
+			)
+		}
+	}
+}
+
 func TestWebhookConfigMatchesTransitionPredicate(t *testing.T) {
 	config := WebhookConfig{
 		EnabledEventsObj: []WebhookEventType{

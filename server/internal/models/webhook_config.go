@@ -103,7 +103,8 @@ func ParseWebhookDeliverySnapshotID(snapshotID string) (string, error) {
 	parsed, err := uuid.Parse(snapshotID)
 	if err != nil ||
 		parsed.String() != snapshotID ||
-		parsed.Version() != 7 {
+		parsed.Version() != 7 ||
+		parsed.Variant() != uuid.RFC4122 {
 		return "", fmt.Errorf(
 			"invalid webhook delivery snapshot id %q",
 			snapshotID,
@@ -293,11 +294,11 @@ type WebhookConfig struct {
 // They are revealed only for one bounded delivery attempt using the original
 // ConfigID as encryption AAD.
 type WebhookDeliverySnapshot struct {
-	ID        string    `json:"id" gorm:"primaryKey;size:36;<-:create"`
+	ID        string    `json:"id" gorm:"primaryKey;size:36;not null;<-:create"`
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime;<-:create"`
 
 	OrganizationID  uint      `json:"organization_id" gorm:"not null;index;<-:create"`
-	ProjectID       uint      `json:"project_id" gorm:"not null;index;<-:create;check:chk_webhook_snapshot_scope,organization_id > 0 AND project_id > 0 AND event_id <> ''"`
+	ProjectID       uint      `json:"project_id" gorm:"not null;index;<-:create;check:chk_webhook_snapshot_scope,organization_id IS NOT NULL AND project_id IS NOT NULL AND event_id IS NOT NULL AND organization_id > 0 AND project_id > 0 AND event_id <> ''"`
 	ProjectScope    Project   `json:"-" gorm:"-:migration;foreignKey:OrganizationID,ProjectID;references:OrganizationID,ID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
 	ConfigID        uint      `json:"config_id" gorm:"not null;index;uniqueIndex:idx_webhook_snapshot_event_config,priority:2;<-:create"`
 	EventID         string    `json:"event_id" gorm:"size:64;not null;index;uniqueIndex:idx_webhook_snapshot_event_config,priority:1;<-:create"`

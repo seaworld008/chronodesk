@@ -34,7 +34,9 @@ var webhookCredentialConstraintDefinitions = map[string]struct {
 	},
 	"chk_webhook_snapshot_scope": {
 		table: "webhook_delivery_snapshots",
-		expression: "organization_id > 0 AND project_id > 0 " +
+		expression: "organization_id IS NOT NULL " +
+			"AND project_id IS NOT NULL AND event_id IS NOT NULL " +
+			"AND organization_id > 0 AND project_id > 0 " +
 			"AND event_id <> ''",
 	},
 	"chk_webhook_snapshot_shred_reason": {
@@ -159,6 +161,9 @@ func runWebhookSnapshotCredentialLifetimeCutover(
 		if err := prepareWebhookSnapshotCredentialLifetimeColumns(tx); err != nil {
 			return err
 		}
+		if err := installWebhookCredentialIdentityNotNull(tx); err != nil {
+			return err
+		}
 		if err := validatePreparedWebhookCredentialColumnContract(tx); err != nil {
 			return err
 		}
@@ -173,6 +178,12 @@ func runWebhookSnapshotCredentialLifetimeCutover(
 			); err != nil {
 				return fmt.Errorf(
 					"validate completed webhook credential lifetime migration: %w",
+					err,
+				)
+			}
+			if err := finalizeWebhookCredentialLifetimeSchema(tx); err != nil {
+				return fmt.Errorf(
+					"upgrade completed webhook credential lifetime schema: %w",
 					err,
 				)
 			}
@@ -224,25 +235,13 @@ func runWebhookSnapshotCredentialLifetimeCutover(
 				err,
 			)
 		}
-		deliveryResult := tx.Exec(`
-			UPDATE outbox_deliveries
-			SET expires_at = ?
-			WHERE destination_type = 'webhook'
-			  AND expires_at IS NULL
-			  AND expired_at IS NULL
-			  AND EXISTS (
-				SELECT 1
-				FROM webhook_delivery_snapshots AS snapshot
-				WHERE outbox_deliveries.destination_id =
-					'snapshot:' || snapshot.id
-				  AND outbox_deliveries.organization_id =
-					snapshot.organization_id
-				  AND outbox_deliveries.project_id =
-					snapshot.project_id
-				  AND outbox_deliveries.event_id =
-					snapshot.event_id
-			  )
-		`, deadline)
+		deliveryBackfill := buildWebhookDeliveryDeadlineBackfillStatement(
+			deadline,
+		)
+		deliveryResult := tx.Exec(
+			deliveryBackfill.query,
+			deliveryBackfill.args...,
+		)
 		if deliveryResult.Error != nil {
 			return fmt.Errorf(
 				"set-based backfill webhook delivery deadlines: %w",
@@ -256,27 +255,13 @@ func runWebhookSnapshotCredentialLifetimeCutover(
 				auditedPairCount,
 			)
 		}
-		snapshotResult := tx.Exec(`
-			UPDATE webhook_delivery_snapshots
-			SET credential_expires_at = ?
-			WHERE credential_expires_at IS NULL
-			  AND credential_shredded_at IS NULL
-			  AND credential_shred_reason IS NULL
-			  AND EXISTS (
-				SELECT 1
-				FROM outbox_deliveries AS delivery
-				WHERE delivery.destination_type = 'webhook'
-				  AND delivery.destination_id =
-					'snapshot:' || webhook_delivery_snapshots.id
-				  AND delivery.organization_id =
-					webhook_delivery_snapshots.organization_id
-				  AND delivery.project_id =
-					webhook_delivery_snapshots.project_id
-				  AND delivery.event_id =
-					webhook_delivery_snapshots.event_id
-				  AND delivery.expires_at = ?
-			  )
-		`, deadline, deadline)
+		snapshotBackfill := buildWebhookSnapshotDeadlineBackfillStatement(
+			deadline,
+		)
+		snapshotResult := tx.Exec(
+			snapshotBackfill.query,
+			snapshotBackfill.args...,
+		)
 		if snapshotResult.Error != nil {
 			return fmt.Errorf(
 				"set-based backfill webhook snapshot deadlines: %w",
@@ -316,6 +301,62 @@ func runWebhookSnapshotCredentialLifetimeCutover(
 		}
 		return validateWebhookCredentialOwnerSet(tx, true)
 	})
+}
+
+func buildWebhookDeliveryDeadlineBackfillStatement(
+	deadline time.Time,
+) webhookCredentialSQLStatement {
+	return webhookCredentialSQLStatement{
+		query: `
+			UPDATE outbox_deliveries
+			SET expires_at = ?
+			WHERE destination_type = 'webhook'
+			  AND expires_at IS NULL
+			  AND expired_at IS NULL
+			  AND EXISTS (
+				SELECT 1
+				FROM webhook_delivery_snapshots AS snapshot
+				WHERE outbox_deliveries.destination_id =
+					'snapshot:' || snapshot.id
+				  AND outbox_deliveries.organization_id =
+					snapshot.organization_id
+				  AND outbox_deliveries.project_id =
+					snapshot.project_id
+				  AND outbox_deliveries.event_id =
+					snapshot.event_id
+			  )
+		`,
+		args: []any{deadline},
+	}
+}
+
+func buildWebhookSnapshotDeadlineBackfillStatement(
+	deadline time.Time,
+) webhookCredentialSQLStatement {
+	return webhookCredentialSQLStatement{
+		query: `
+			UPDATE webhook_delivery_snapshots
+			SET credential_expires_at = ?
+			WHERE credential_expires_at IS NULL
+			  AND credential_shredded_at IS NULL
+			  AND credential_shred_reason IS NULL
+			  AND EXISTS (
+				SELECT 1
+				FROM outbox_deliveries AS delivery
+				WHERE delivery.destination_type = 'webhook'
+				  AND delivery.destination_id =
+					'snapshot:' || webhook_delivery_snapshots.id
+				  AND delivery.organization_id =
+					webhook_delivery_snapshots.organization_id
+				  AND delivery.project_id =
+					webhook_delivery_snapshots.project_id
+				  AND delivery.event_id =
+					webhook_delivery_snapshots.event_id
+				  AND delivery.expires_at = ?
+			  )
+		`,
+		args: []any{deadline, deadline},
+	}
 }
 
 func prepareWebhookSnapshotCredentialLifetimeColumns(db *gorm.DB) error {
@@ -633,7 +674,10 @@ func migrateSQLiteWebhookSnapshotCredentialLifetimeContractAt(
 			len(violations),
 		)
 	}
-	return validateWebhookCredentialLifetimeCatalog(cleanupDB)
+	if err := validateWebhookCredentialLifetimeCatalog(cleanupDB); err != nil {
+		return err
+	}
+	return nil
 }
 
 func createWebhookCredentialIndexes(db *gorm.DB) error {
@@ -669,9 +713,18 @@ func installPostgresWebhookCredentialConstraints(db *gorm.DB) error {
 	sort.Strings(names)
 	for _, name := range names {
 		definition := webhookCredentialConstraintDefinitions[name]
-		var count int64
+		var states []struct {
+			Type       string `gorm:"column:constraint_type"`
+			Expression string `gorm:"column:expression"`
+		}
 		if err := db.Raw(`
-			SELECT COUNT(*)
+			SELECT
+				constraint_state.contype::text AS constraint_type,
+				pg_get_expr(
+					constraint_state.conbin,
+					constraint_state.conrelid,
+					false
+				) AS expression
 			FROM pg_constraint AS constraint_state
 			JOIN pg_class AS table_state
 			  ON table_state.oid = constraint_state.conrelid
@@ -680,14 +733,59 @@ func installPostgresWebhookCredentialConstraints(db *gorm.DB) error {
 			WHERE namespace.nspname = CURRENT_SCHEMA()
 			  AND table_state.relname = ?
 			  AND constraint_state.conname = ?
-		`, definition.table, name).Scan(&count).Error; err != nil {
+		`, definition.table, name).Scan(&states).Error; err != nil {
 			return fmt.Errorf(
 				"inspect PostgreSQL webhook credential constraint %s: %w",
 				name,
 				err,
 			)
 		}
-		if count == 0 {
+		if len(states) > 1 {
+			return fmt.Errorf(
+				"PostgreSQL webhook credential constraint %s is duplicated",
+				name,
+			)
+		}
+		if len(states) == 1 {
+			got, err := canonicalWebhookConstraintDefinition(
+				states[0].Expression,
+			)
+			if err != nil {
+				return fmt.Errorf(
+					"parse PostgreSQL webhook credential constraint %s: %w",
+					name,
+					err,
+				)
+			}
+			want, err := canonicalWebhookConstraintDefinition(
+				definition.expression,
+			)
+			if err != nil {
+				return err
+			}
+			if states[0].Type != "c" || got != want {
+				if name != "chk_webhook_snapshot_scope" ||
+					states[0].Type != "c" ||
+					!isLegacyWebhookSnapshotScopeConstraint(got) {
+					return fmt.Errorf(
+						"PostgreSQL webhook credential constraint %s has an incompatible definition",
+						name,
+					)
+				}
+				if err := db.Exec(
+					"ALTER TABLE " + definition.table +
+						" DROP CONSTRAINT " + name,
+				).Error; err != nil {
+					return fmt.Errorf(
+						"drop legacy PostgreSQL webhook credential constraint %s: %w",
+						name,
+						err,
+					)
+				}
+				states = nil
+			}
+		}
+		if len(states) == 0 {
 			if err := db.Exec(
 				"ALTER TABLE " + definition.table +
 					" ADD CONSTRAINT " + name +

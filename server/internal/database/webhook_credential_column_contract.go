@@ -69,14 +69,26 @@ func validateWebhookCredentialColumnContract(db *gorm.DB) error {
 	if err := validateWebhookCredentialColumnContractState(db, false); err != nil {
 		return err
 	}
-	return validateWebhookCredentialStatusColumnContract(db)
+	if err := validateWebhookCredentialStatusColumnContract(db); err != nil {
+		return err
+	}
+	if err := validateWebhookProjectStatusCollationContract(db); err != nil {
+		return err
+	}
+	return validateWebhookCredentialIdentityColumnContract(db)
 }
 
 func validatePreparedWebhookCredentialColumnContract(db *gorm.DB) error {
 	if err := validateWebhookCredentialColumnContractState(db, true); err != nil {
 		return err
 	}
-	return validateWebhookCredentialStatusColumnContract(db)
+	if err := validateWebhookCredentialStatusColumnContract(db); err != nil {
+		return err
+	}
+	if err := validateWebhookProjectStatusCollationContract(db); err != nil {
+		return err
+	}
+	return validateWebhookCredentialIdentityColumnContract(db)
 }
 
 func validateWebhookCredentialColumnContractState(
@@ -117,6 +129,7 @@ func validatePostgresWebhookCredentialColumnContract(
 		IsNullable      string  `gorm:"column:is_nullable"`
 		ColumnDefault   *string `gorm:"column:column_default"`
 		CharacterLength *int64  `gorm:"column:character_maximum_length"`
+		CollationName   *string `gorm:"column:collation_name"`
 		IsGenerated     string  `gorm:"column:is_generated"`
 		IsIdentity      string  `gorm:"column:is_identity"`
 	}
@@ -130,6 +143,7 @@ func validatePostgresWebhookCredentialColumnContract(
 			is_nullable,
 			column_default,
 			character_maximum_length,
+			collation_name,
 			is_generated,
 			is_identity
 		FROM information_schema.columns
@@ -174,6 +188,8 @@ func validatePostgresWebhookCredentialColumnContract(
 			row.UDTName != contract.postgresUDT ||
 			!nullableMatches ||
 			row.ColumnDefault != nil ||
+			(contract.column == "credential_shred_reason" &&
+				row.CollationName != nil) ||
 			row.IsGenerated != "NEVER" ||
 			row.IsIdentity != "NO" ||
 			!equalOptionalInt64(
@@ -181,7 +197,7 @@ func validatePostgresWebhookCredentialColumnContract(
 				contract.characterLength,
 			) {
 			return fmt.Errorf(
-				"%s has incompatible PostgreSQL type/null/default/length contract",
+				"%s has incompatible PostgreSQL type/null/default/length/collation contract",
 				key,
 			)
 		}
@@ -243,6 +259,22 @@ func validateSQLiteWebhookCredentialColumnContract(
 				key,
 			)
 		}
+		if contract.column == "credential_shred_reason" {
+			binary, err := sqliteColumnUsesDefaultBinaryCollation(
+				db,
+				contract.table,
+				contract.column,
+			)
+			if err != nil {
+				return err
+			}
+			if !binary {
+				return fmt.Errorf(
+					"%s has incompatible SQLite collation contract",
+					key,
+				)
+			}
+		}
 	}
 	return nil
 }
@@ -266,6 +298,7 @@ func validateWebhookCredentialStatusColumnContract(db *gorm.DB) error {
 			IsNullable      string  `gorm:"column:is_nullable"`
 			ColumnDefault   *string `gorm:"column:column_default"`
 			CharacterLength *int64  `gorm:"column:character_maximum_length"`
+			CollationName   *string `gorm:"column:collation_name"`
 			IsGenerated     string  `gorm:"column:is_generated"`
 			IsIdentity      string  `gorm:"column:is_identity"`
 		}
@@ -276,6 +309,7 @@ func validateWebhookCredentialStatusColumnContract(db *gorm.DB) error {
 				is_nullable,
 				column_default,
 				character_maximum_length,
+				collation_name,
 				is_generated,
 				is_identity
 			FROM information_schema.columns
@@ -295,12 +329,13 @@ func validateWebhookCredentialStatusColumnContract(db *gorm.DB) error {
 			state.IsNullable != "NO" ||
 			state.CharacterLength == nil ||
 			*state.CharacterLength != 20 ||
+			state.CollationName != nil ||
 			state.ColumnDefault == nil ||
 			normalizeWebhookStatusDefault(*state.ColumnDefault) != "pending" ||
 			state.IsGenerated != "NEVER" ||
 			state.IsIdentity != "NO" {
 			return errors.New(
-				"outbox_deliveries.status has incompatible PostgreSQL type/not null/default/length contract",
+				"outbox_deliveries.status has incompatible PostgreSQL type/not null/default/length/collation contract",
 			)
 		}
 		return nil
@@ -334,6 +369,19 @@ func validateWebhookCredentialStatusColumnContract(db *gorm.DB) error {
 					"outbox_deliveries.status has incompatible SQLite type/not null/default/length contract",
 				)
 			}
+			binary, err := sqliteColumnUsesDefaultBinaryCollation(
+				db,
+				"outbox_deliveries",
+				"status",
+			)
+			if err != nil {
+				return err
+			}
+			if !binary {
+				return errors.New(
+					"outbox_deliveries.status has incompatible SQLite collation contract",
+				)
+			}
 			return nil
 		}
 		return errors.New("outbox_deliveries.status is missing")
@@ -362,5 +410,56 @@ func normalizeWebhookStatusDefault(value string) string {
 		return "pending"
 	default:
 		return value
+	}
+}
+
+func validateWebhookProjectStatusCollationContract(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("Project status collation database is required")
+	}
+	switch db.Dialector.Name() {
+	case "postgres":
+		var state struct {
+			CollationName *string `gorm:"column:collation_name"`
+		}
+		result := db.Raw(`
+			SELECT collation_name
+			FROM information_schema.columns
+			WHERE table_schema = CURRENT_SCHEMA()
+			  AND table_name = 'projects'
+			  AND column_name = 'status'
+		`).Scan(&state)
+		if result.Error != nil {
+			return fmt.Errorf(
+				"read PostgreSQL projects.status collation: %w",
+				result.Error,
+			)
+		}
+		if result.RowsAffected != 1 || state.CollationName != nil {
+			return errors.New(
+				"projects.status has incompatible PostgreSQL collation contract",
+			)
+		}
+		return nil
+	case "sqlite":
+		binary, err := sqliteColumnUsesDefaultBinaryCollation(
+			db,
+			"projects",
+			"status",
+		)
+		if err != nil {
+			return err
+		}
+		if !binary {
+			return errors.New(
+				"projects.status has incompatible SQLite collation contract",
+			)
+		}
+		return nil
+	default:
+		return fmt.Errorf(
+			"Project status collation contract is unsupported for database dialect %q",
+			db.Dialector.Name(),
+		)
 	}
 }

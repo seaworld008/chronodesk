@@ -239,7 +239,7 @@ func (PolicyDecision) TableName() string {
 // DomainEvent is both the durable event log and the persisted CloudEvents 1.0
 // envelope. Data contains JSON and is never interpreted as instructions.
 type DomainEvent struct {
-	ID                   string         `json:"id" gorm:"primaryKey;size:36"`
+	ID                   string         `json:"id" gorm:"primaryKey;size:36;not null"`
 	CreatedAt            time.Time      `json:"created_at" gorm:"autoCreateTime;index"`
 	OrganizationID       uint           `json:"organizationid" gorm:"not null;index"`
 	ProjectID            uint           `json:"projectid" gorm:"not null;index"`
@@ -305,7 +305,7 @@ func (status OutboxDeliveryStatus) IsValid() bool {
 
 // OutboxDelivery tracks independent delivery state for each event target.
 type OutboxDelivery struct {
-	ID              string               `json:"id" gorm:"primaryKey;size:36"`
+	ID              string               `json:"id" gorm:"primaryKey;size:36;not null"`
 	CreatedAt       time.Time            `json:"created_at" gorm:"autoCreateTime;index"`
 	UpdatedAt       time.Time            `json:"updated_at" gorm:"autoUpdateTime"`
 	OrganizationID  uint                 `json:"organization_id" gorm:"not null;index"`

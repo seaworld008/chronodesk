@@ -69,29 +69,70 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 	if err != nil {
 		t.Fatal(err)
 	}
-	var ownerSQL, runtimeSQL *sql.DB
+	var ownerSQL, ownerPeerSQL, runtimeSQL *sql.DB
 	schemaCreated := false
 	ownerCreated := false
 	runtimeCreated := false
 	t.Cleanup(func() {
 		if runtimeSQL != nil {
-			_ = runtimeSQL.Close()
+			if err := runtimeSQL.Close(); err != nil {
+				t.Errorf("close PostgreSQL runtime pool: %v", err)
+			}
+		}
+		if ownerPeerSQL != nil {
+			if err := ownerPeerSQL.Close(); err != nil {
+				t.Errorf("close PostgreSQL owner peer pool: %v", err)
+			}
 		}
 		if ownerSQL != nil {
-			_ = ownerSQL.Close()
+			if err := ownerSQL.Close(); err != nil {
+				t.Errorf("close PostgreSQL owner pool: %v", err)
+			}
+		}
+		if ownerCreated || runtimeCreated {
+			waitForPostgresTestRoleSessionsToExit(
+				t,
+				admin,
+				[]string{ownerRole, runtimeRole},
+			)
 		}
 		if schemaCreated {
-			_ = admin.Exec(
+			if err := admin.Exec(
 				"DROP SCHEMA IF EXISTS " + quotedSchema + " CASCADE",
-			).Error
+			).Error; err != nil {
+				t.Errorf("drop PostgreSQL Review-3 schema: %v", err)
+			}
 		}
 		if runtimeCreated {
-			_ = admin.Exec("DROP ROLE IF EXISTS " + quotedRuntime).Error
+			if err := admin.Exec(
+				"DROP ROLE IF EXISTS " + quotedRuntime,
+			).Error; err != nil {
+				t.Errorf("drop PostgreSQL runtime role: %v", err)
+			}
 		}
 		if ownerCreated {
-			_ = admin.Exec("DROP ROLE IF EXISTS " + quotedOwner).Error
+			if err := admin.Exec(
+				"DROP ROLE IF EXISTS " + quotedOwner,
+			).Error; err != nil {
+				t.Errorf("drop PostgreSQL owner role: %v", err)
+			}
 		}
-		_ = adminSQL.Close()
+		var leftovers int64
+		if err := admin.Raw(`
+			SELECT
+				(SELECT COUNT(*) FROM pg_namespace WHERE nspname = ?) +
+				(SELECT COUNT(*) FROM pg_roles WHERE rolname IN (?, ?))
+		`, schemaName, ownerRole, runtimeRole).Scan(&leftovers).Error; err != nil {
+			t.Errorf("inspect PostgreSQL Review-3 cleanup: %v", err)
+		} else if leftovers != 0 {
+			t.Errorf(
+				"PostgreSQL Review-3 cleanup retained %d exact schema/role objects",
+				leftovers,
+			)
+		}
+		if err := adminSQL.Close(); err != nil {
+			t.Errorf("close PostgreSQL administrator pool: %v", err)
+		}
 	})
 	if err := admin.Exec(
 		"CREATE ROLE " + quotedOwner +
@@ -120,6 +161,7 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 	ownerURL.User = url.UserPassword(ownerRole, ownerPassword)
 	ownerQuery := ownerURL.Query()
 	ownerQuery.Set("search_path", schemaName)
+	ownerQuery.Set("application_name", "task9a_migration_owner_"+suffix)
 	ownerURL.RawQuery = ownerQuery.Encode()
 	owner, err := gorm.Open(
 		postgres.Open(ownerURL.String()),
@@ -132,20 +174,22 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 	if err != nil {
 		t.Fatal(err)
 	}
+	ownerPeerApplicationName := "task9a_migration_peer_" + suffix
+	ownerPeerURL := ownerURL
+	ownerPeerQuery := ownerPeerURL.Query()
+	ownerPeerQuery.Set("application_name", ownerPeerApplicationName)
+	ownerPeerURL.RawQuery = ownerPeerQuery.Encode()
 	ownerPeer, err := gorm.Open(
-		postgres.Open(ownerURL.String()),
+		postgres.Open(ownerPeerURL.String()),
 		silentConfig,
 	)
 	if err != nil {
 		t.Fatalf("open peer PostgreSQL migration owner: %v", err)
 	}
-	ownerPeerSQL, err := ownerPeer.DB()
+	ownerPeerSQL, err = ownerPeer.DB()
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_ = ownerPeerSQL.Close()
-	})
 	legacyStatements := []string{
 		`CREATE TABLE projects (
 			id BIGINT PRIMARY KEY,
@@ -163,7 +207,7 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 			organization_id BIGINT NOT NULL,
 			project_id BIGINT NOT NULL,
 			config_id BIGINT NOT NULL,
-			event_id VARCHAR(36) NOT NULL,
+			event_id VARCHAR(64) NOT NULL,
 			secret VARCHAR(2048) NOT NULL DEFAULT '',
 			previous_secret VARCHAR(2048) NOT NULL DEFAULT '',
 			access_token VARCHAR(2048) NOT NULL DEFAULT ''
@@ -203,9 +247,9 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 	capacityQualification :=
 		os.Getenv("CHRONODESK_TASK9A_CAPACITY_QUALIFICATION") == "1"
 	if capacityQualification {
-		projectCount = 1_000
-		pairCount = 100_000
-		nonWebhookCount = 1_000_000
+		projectCount = task9aQualificationProjectCeiling
+		pairCount = task9aQualificationWebhookPairCeiling
+		nonWebhookCount = task9aQualificationNonWebhookCeiling
 	}
 	seedPostgresWebhookCredentialScaleFixture(
 		t,
@@ -349,20 +393,38 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 	}
 
 	scaleCutoverStarted := time.Now()
-	if err := migrateWebhookSnapshotCredentialLifetimeContractAt(
+	if capacityQualification {
+		runPostgresCapacityCutoverWithBlockedWriter(
+			t,
+			owner,
+			ownerPeer,
+			ownerPeerApplicationName,
+			firstCutover,
+			scaleCutoverStarted,
+		)
+	} else if err := migrateWebhookSnapshotCredentialLifetimeContractAt(
 		owner,
 		firstCutover,
 	); err != nil {
 		t.Fatalf("migrate FORCE-RLS legacy webhook credentials: %v", err)
 	}
+	cutoverDuration := time.Since(scaleCutoverStarted)
 	t.Logf(
 		"representative cutover: %d Projects, %d webhook pairs, "+
 			"%d non-webhook deliveries in %s",
 		projectCount,
 		pairCount,
 		nonWebhookCount,
-		time.Since(scaleCutoverStarted),
+		cutoverDuration,
 	)
+	if capacityQualification &&
+		cutoverDuration > task9aQualificationCutoverBudget {
+		t.Fatalf(
+			"qualified cutover %s exceeded frozen budget %s",
+			cutoverDuration,
+			task9aQualificationCutoverBudget,
+		)
+	}
 	assertPostgresWebhookCredentialForceRLS(t, owner)
 	var checkpoint models.SchemaMigrationCheckpoint
 	if err := owner.Where(
@@ -392,6 +454,26 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 		models.ProjectScope{OrganizationID: 11, ProjectID: 22},
 		persistedDeadline,
 	)
+	if err := owner.Exec(`
+		ALTER TABLE webhook_delivery_snapshots
+		DROP CONSTRAINT chk_webhook_snapshot_scope,
+		ADD CONSTRAINT chk_webhook_snapshot_scope CHECK (
+			organization_id > 0
+			AND project_id > 0
+			AND event_id <> ''
+		)
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateWebhookSnapshotCredentialLifetimeContractAt(
+		owner,
+		firstCutover.Add(60*24*time.Hour),
+	); err != nil {
+		t.Fatalf(
+			"upgrade PostgreSQL legacy nullable snapshot scope CHECK: %v",
+			err,
+		)
+	}
 	if err := MigrateWebhookSnapshotCredentialLifetimeContract(owner); err != nil {
 		t.Fatalf("finalize PostgreSQL webhook credential contract: %v", err)
 	}
@@ -441,69 +523,57 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 		t.Fatalf("validate scoped runtime webhook credential data: %v", err)
 	}
 	cancelRuntimeValidation()
+	runtimeValidationDuration := time.Since(runtimeValidationStarted)
 	t.Logf(
 		"representative runtime gate: %d Projects, %d webhook pairs, "+
 			"%d non-webhook deliveries in %s",
 		projectCount,
 		pairCount,
 		nonWebhookCount,
-		time.Since(runtimeValidationStarted),
+		runtimeValidationDuration,
+	)
+	if capacityQualification &&
+		runtimeValidationDuration > task9aQualificationRuntimeBudget {
+		t.Fatalf(
+			"qualified runtime gate %s exceeded frozen budget %s",
+			runtimeValidationDuration,
+			task9aQualificationRuntimeBudget,
+		)
+	}
+	exercisePostgresWebhookIdentityNullCatalog(
+		t,
+		admin,
+		owner,
+		runtime,
+		quotedSchema,
+		persistedDeadline,
+	)
+	exercisePostgresWebhookUUIDVariants(
+		t,
+		owner,
+		runtime,
+	)
+	exercisePostgresIdentityColumnContractMatrix(t, owner)
+	exercisePostgresWebhookTextCollations(
+		t,
+		owner,
+		runtime,
+		schemaName,
+	)
+	exercisePostgresProjectScopeFKCatalogMatrix(
+		t,
+		owner,
+		schemaName,
 	)
 	if capacityQualification {
-		var postgresVersion string
-		if err := owner.Raw(
-			"SHOW server_version",
-		).Scan(&postgresVersion).Error; err != nil {
-			t.Fatal(err)
-		}
-		var planRows []struct {
-			Plan string `gorm:"column:QUERY PLAN"`
-		}
-		if err := WithProjectScopeTransaction(
-			context.Background(),
+		qualifyPostgresWebhookProductionStatements(
+			t,
 			owner,
 			models.ProjectScope{
 				OrganizationID: 11,
 				ProjectID:      100,
 			},
-			func(tx *gorm.DB) error {
-				return tx.Raw(`
-					EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
-					SELECT delivery.id
-					FROM outbox_deliveries AS delivery
-					JOIN webhook_delivery_snapshots AS snapshot
-					  ON delivery.destination_id =
-						 'snapshot:' || snapshot.id
-					 AND delivery.organization_id =
-						 snapshot.organization_id
-					 AND delivery.project_id = snapshot.project_id
-					 AND delivery.event_id = snapshot.event_id
-					WHERE delivery.organization_id = 11
-					  AND delivery.project_id = 100
-					  AND delivery.destination_type = 'webhook'
-					LIMIT 1
-				`).Scan(&planRows).Error
-			},
-		); err != nil {
-			t.Fatal(err)
-		}
-		var waitingLocks int64
-		if err := owner.Raw(`
-			SELECT COUNT(*)
-			FROM pg_locks
-			WHERE NOT granted
-		`).Scan(&waitingLocks).Error; err != nil {
-			t.Fatal(err)
-		}
-		plan := make([]string, 0, len(planRows))
-		for _, row := range planRows {
-			plan = append(plan, row.Plan)
-		}
-		t.Logf(
-			"capacity qualification PostgreSQL=%s waiting_locks=%d plan=%s",
-			postgresVersion,
-			waitingLocks,
-			strings.Join(plan, " | "),
+			firstCutover,
 		)
 	}
 	const runtimeBarrierCallback = "test:task9a_runtime_repeatable_read_barrier"
@@ -536,50 +606,31 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 	case <-time.After(5 * time.Second):
 		t.Fatal("runtime validator did not establish its Project inventory snapshot")
 	}
-	barrierEventID := "00000000-0000-7000-8000-000000000931"
-	barrierSnapshotID := "00000000-0000-7000-8000-000000000932"
-	barrierDeliveryID := "00000000-0000-7000-8000-000000000933"
-	if err := owner.Exec(`
-		INSERT INTO projects (id, organization_id, status)
-		VALUES (24, 11, 'active')
-	`).Error; err != nil {
-		t.Fatal(err)
+	barrierScope := models.ProjectScope{
+		OrganizationID: 11,
+		ProjectID:      199,
 	}
-	barrierDeadline := persistedDeadline.Add(2 * time.Hour)
+	var barrierSnapshot struct {
+		ID       string    `gorm:"column:id"`
+		Deadline time.Time `gorm:"column:credential_expires_at"`
+	}
 	if err := WithProjectScopeTransaction(
 		context.Background(),
 		owner,
-		models.ProjectScope{OrganizationID: 11, ProjectID: 24},
+		barrierScope,
 		func(tx *gorm.DB) error {
-			if err := tx.Exec(`
-				INSERT INTO domain_events (id, organization_id, project_id)
-				VALUES (?, 11, 24)
-			`, barrierEventID).Error; err != nil {
+			if err := tx.Table("webhook_delivery_snapshots").
+				Select("id", "credential_expires_at").
+				Order("id ASC").
+				Take(&barrierSnapshot).Error; err != nil {
 				return err
 			}
-			if err := tx.Exec(`
-				INSERT INTO webhook_delivery_snapshots (
-					id, created_at, organization_id, project_id, config_id,
-					event_id, credential_expires_at
-				) VALUES (?, ?, 11, 24, 79, ?, ?)
-			`,
-				barrierSnapshotID,
-				firstCutover,
-				barrierEventID,
-				barrierDeadline,
-			).Error; err != nil {
-				return err
-			}
-			return tx.Exec(`
-				INSERT INTO outbox_deliveries (
-					id, organization_id, project_id, event_id,
-					destination_type, destination_id, status, expires_at
-				) VALUES (?, 11, 24, ?, 'webhook', ?, 'pending', ?)
-			`,
-				barrierDeliveryID,
-				barrierEventID,
-				"snapshot:"+barrierSnapshotID,
-				barrierDeadline,
+			return tx.Exec(
+				`UPDATE webhook_delivery_snapshots
+				 SET credential_expires_at = ?
+				 WHERE id = ?`,
+				barrierSnapshot.Deadline.Add(2*time.Hour),
+				barrierSnapshot.ID,
 			).Error
 		},
 	); err != nil {
@@ -605,11 +656,35 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 	if err := ValidateWebhookSnapshotCredentialLifetimeRuntimeData(
 		context.Background(),
 		runtime,
-	); err != nil {
+	); err == nil ||
+		!strings.Contains(strings.ToLower(err.Error()), "deadline") ||
+		!strings.Contains(err.Error(), "199") {
 		t.Fatalf(
-			"runtime gate rejected the committed concurrent Project/pair: %v",
+			"runtime gate did not observe the committed unread-pair mutation: %v",
 			err,
 		)
+	}
+	if err := WithProjectScopeTransaction(
+		context.Background(),
+		owner,
+		barrierScope,
+		func(tx *gorm.DB) error {
+			return tx.Exec(
+				`UPDATE webhook_delivery_snapshots
+				 SET credential_expires_at = ?
+				 WHERE id = ?`,
+				barrierSnapshot.Deadline,
+				barrierSnapshot.ID,
+			).Error
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateWebhookSnapshotCredentialLifetimeRuntimeData(
+		context.Background(),
+		runtime,
+	); err != nil {
+		t.Fatalf("runtime gate rejected restored unread pair: %v", err)
 	}
 
 	secondEventID := "00000000-0000-4000-8000-000000000911"
@@ -671,6 +746,7 @@ func TestWebhookCredentialLifetimeMigrationUnderForceRLSPostgres(
 		t,
 		owner,
 		ownerPeer,
+		ownerPeerApplicationName,
 		firstCutover,
 	)
 	if err := owner.Exec(`
@@ -1028,6 +1104,7 @@ func exerciseFullLegacyRunMigrationsPostgres(
 	t *testing.T,
 	owner *gorm.DB,
 	ownerPeer *gorm.DB,
+	ownerPeerApplicationName string,
 	now time.Time,
 ) {
 	t.Helper()
@@ -1414,14 +1491,13 @@ func exerciseFullLegacyRunMigrationsPostgres(
 	go func() {
 		secondResult <- RunMigrations(ownerPeer)
 	}()
-	select {
-	case err := <-secondResult:
-		t.Fatalf(
-			"peer migration bypassed the session advisory lock: %v",
-			err,
-		)
-	case <-time.After(150 * time.Millisecond):
-	}
+	waitForPostgresAdvisoryLockWait(
+		t,
+		owner,
+		ownerPeerApplicationName,
+		chronodeskMigrationAdvisoryLockKey,
+		secondResult,
+	)
 	close(releaseCheckpoint)
 	if err := <-firstResult; err != nil {
 		t.Fatalf("first concurrent PostgreSQL migration: %v", err)

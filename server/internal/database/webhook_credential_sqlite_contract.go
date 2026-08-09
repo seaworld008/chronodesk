@@ -116,6 +116,34 @@ func rebuildSQLiteWebhookCredentialConstraintTable(
 				)
 			}
 			if got != want {
+				if name == "chk_webhook_snapshot_scope" &&
+					isLegacyWebhookSnapshotScopeConstraint(got) {
+					replaced := false
+					for index, part := range bodyParts {
+						constraint, named, parseErr :=
+							parseSQLiteTableConstraint(part)
+						if parseErr != nil {
+							return parseErr
+						}
+						if !named ||
+							!strings.EqualFold(constraint.name, name) {
+							continue
+						}
+						bodyParts[index] = "CONSTRAINT " +
+							quoteAutomationWebhookSQLiteIdentifier(name) +
+							" CHECK (" + definition.expression + ")"
+						replaced = true
+						changed = true
+						break
+					}
+					if !replaced {
+						return fmt.Errorf(
+							"SQLite webhook credential constraint %s could not be upgraded",
+							name,
+						)
+					}
+					continue
+				}
 				return fmt.Errorf(
 					"SQLite webhook credential constraint %s has an incompatible definition",
 					name,
@@ -153,6 +181,13 @@ func rebuildSQLiteWebhookCredentialConstraintTable(
 		createSQL,
 		"webhook credential constraints",
 	)
+}
+
+func isLegacyWebhookSnapshotScopeConstraint(canonical string) bool {
+	legacy, err := canonicalWebhookConstraintDefinition(
+		"organization_id > 0 AND project_id > 0 AND event_id <> ''",
+	)
+	return err == nil && canonical == legacy
 }
 
 var errSQLiteNamedConstraintMissing = errors.New(
@@ -757,6 +792,114 @@ func sqliteDDLLeadingIdentifier(part string) string {
 		}
 		return strings.ToLower(part[:end])
 	}
+}
+
+func sqliteColumnUsesDefaultBinaryCollation(
+	db *gorm.DB,
+	table string,
+	column string,
+) (bool, error) {
+	var tableSQL string
+	if err := db.Raw(`
+		SELECT sql
+		FROM sqlite_master
+		WHERE type = 'table' AND name = ?
+	`, table).Scan(&tableSQL).Error; err != nil {
+		return false, fmt.Errorf(
+			"read SQLite %s DDL for collation contract: %w",
+			table,
+			err,
+		)
+	}
+	if strings.TrimSpace(tableSQL) == "" {
+		return false, fmt.Errorf("SQLite table %s is missing", table)
+	}
+	open, err := findSQLiteTableBodyOpen(tableSQL)
+	if err != nil {
+		return false, err
+	}
+	close, ok := matchingSQLParenthesis(tableSQL, open)
+	if !ok {
+		return false, fmt.Errorf("SQLite table %s has malformed DDL", table)
+	}
+	parts, err := splitSQLiteTableBody(tableSQL[open+1 : close])
+	if err != nil {
+		return false, err
+	}
+	for _, part := range parts {
+		if sqliteDDLLeadingIdentifier(part) != strings.ToLower(column) {
+			continue
+		}
+		collations, err := sqliteDDLDeclaredCollations(part)
+		if err != nil {
+			return false, fmt.Errorf(
+				"parse SQLite %s.%s collation: %w",
+				table,
+				column,
+				err,
+			)
+		}
+		return len(collations) == 0 ||
+			len(collations) == 1 &&
+				strings.EqualFold(collations[0], "BINARY"), nil
+	}
+	return false, fmt.Errorf("SQLite %s.%s is missing", table, column)
+}
+
+func sqliteDDLDeclaredCollations(value string) ([]string, error) {
+	collations := make([]string, 0, 1)
+	for index := 0; index < len(value); {
+		next, ok := skipSQLiteDDLTrivia(value, index)
+		if !ok {
+			return nil, errors.New("unterminated SQLite DDL comment")
+		}
+		index = next
+		if index >= len(value) {
+			return collations, nil
+		}
+		if value[index] == '\'' {
+			index++
+			for index < len(value) {
+				if value[index] != '\'' {
+					index++
+					continue
+				}
+				if index+1 < len(value) && value[index+1] == '\'' {
+					index += 2
+					continue
+				}
+				index++
+				break
+			}
+			if index > len(value) ||
+				index == len(value) && value[len(value)-1] != '\'' {
+				return nil, errors.New(
+					"unterminated SQLite DDL string literal",
+				)
+			}
+			continue
+		}
+		identifier, quoted, after, present :=
+			scanSQLiteDDLIdentifier(value, index)
+		if present {
+			if !quoted && strings.EqualFold(identifier, "collate") {
+				collation, _, afterCollation, ok :=
+					scanSQLiteDDLIdentifier(value, after)
+				if !ok {
+					return nil, errors.New(
+						"SQLite COLLATE clause is missing its name",
+					)
+				}
+				collations = append(collations, collation)
+				index = afterCollation
+				continue
+			}
+			index = after
+			continue
+		}
+		index++
+	}
+	return collations, nil
 }
 
 func rebuildSQLiteTableFromDDL(

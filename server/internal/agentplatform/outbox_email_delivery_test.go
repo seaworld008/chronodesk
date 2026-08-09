@@ -137,6 +137,7 @@ func newAuthEmailOutboxFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAgentplatformTestDB(t, db)
 	if err := db.AutoMigrate(
 		&models.User{},
 		&auth.PasswordReset{},
@@ -369,6 +370,7 @@ func TestNotificationEmailOutboxRetriesFailedAttemptAndSkipsReplay(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAgentplatformTestDB(t, db)
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.Notification{},
