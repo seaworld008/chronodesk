@@ -200,7 +200,12 @@ const TicketWorkflowActions: React.FC = () => {
         return () => {
             active = false;
         };
-    }, [record?.id, record?.version, workflowAllowed]);
+    }, [
+        record?.id,
+        record?.version,
+        workflowAllowed,
+        permissions?.project_role,
+    ]);
 
     if (!record) return null;
 
