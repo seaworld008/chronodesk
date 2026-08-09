@@ -773,15 +773,6 @@ func (h *TicketContentHandler) DownloadAttachment(c *gin.Context) {
 		uint(attachmentID),
 	)
 	if err != nil {
-		if isProjectObserverRole(normalizedProjectRole(c)) &&
-			errors.Is(err, services.ErrProjectAccessDenied) {
-			c.JSON(http.StatusForbidden, gin.H{
-				"success": false,
-				"code":    "attachment_visibility_denied",
-				"message": "当前身份不能访问私有附件",
-			})
-			return
-		}
 		h.writeError(c, err)
 		return
 	}
@@ -832,7 +823,9 @@ func (h *TicketContentHandler) authorizedTicket(
 
 func (h *TicketContentHandler) writeError(c *gin.Context, err error) {
 	switch {
-	case errors.Is(err, gorm.ErrRecordNotFound), err.Error() == "ticket not found":
+	case errors.Is(err, gorm.ErrRecordNotFound),
+		errors.Is(err, services.ErrAttachmentUnavailable),
+		err.Error() == "ticket not found":
 		c.JSON(http.StatusNotFound, gin.H{"success": false, "code": "not_found", "message": "资源不存在"})
 	case errors.Is(err, services.ErrVersionConflict):
 		writeTicketVersionConflict(c)

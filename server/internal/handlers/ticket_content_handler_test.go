@@ -209,7 +209,9 @@ func TestDownloadAttachmentReturnsContentWithSafeHeaders(t *testing.T) {
 	}
 }
 
-func TestObserverCannotDownloadPrivateAttachmentOrUploadDirectly(t *testing.T) {
+func TestObserverAttachmentDownloadDoesNotRevealPrivateAttachmentExistence(
+	t *testing.T,
+) {
 	gin.SetMode(gin.TestMode)
 	db := openHandlerTestDB(t)
 	scope := ensureHandlerTestProject(t, db)
@@ -264,6 +266,14 @@ func TestObserverCannotDownloadPrivateAttachmentOrUploadDirectly(t *testing.T) {
 	if err := db.Create(&ticket).Error; err != nil {
 		t.Fatal(err)
 	}
+	otherTicket := ticket
+	otherTicket.ID = 0
+	otherTicket.PublicID = ""
+	otherTicket.TicketNumber = "OBSERVER-OTHER-ATTACHMENT"
+	otherTicket.Title = "observer other ticket attachment"
+	if err := db.Create(&otherTicket).Error; err != nil {
+		t.Fatal(err)
+	}
 	privateAttachments := []models.TicketAttachment{
 		{
 			OrganizationID: scope.OrganizationID,
@@ -294,7 +304,7 @@ func TestObserverCannotDownloadPrivateAttachmentOrUploadDirectly(t *testing.T) {
 			MimeType:       "text/plain",
 			FileType:       models.AttachmentTypeDocument,
 			StoragePath:    "private-pending.txt",
-			StorageType:    "staging",
+			StorageType:    "local",
 			Hash:           "private-pending-hash",
 			IsPublic:       false,
 			VirusScan:      models.VirusScanPending,
@@ -333,6 +343,40 @@ func TestObserverCannotDownloadPrivateAttachmentOrUploadDirectly(t *testing.T) {
 			IsPublic:       false,
 			VirusScan:      models.VirusScanError,
 		},
+		{
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			TicketID:       ticket.ID,
+			ActorType:      models.ActorTypeHuman,
+			ActorID:        models.HumanActor(observer.ID).ID,
+			FileName:       "private-staging.txt",
+			OriginalName:   "private-staging.txt",
+			FileSize:       7,
+			MimeType:       "text/plain",
+			FileType:       models.AttachmentTypeDocument,
+			StoragePath:    "private-staging.txt",
+			StorageType:    "staging",
+			Hash:           "private-staging-hash",
+			IsPublic:       false,
+			VirusScan:      models.VirusScanClean,
+		},
+		{
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			TicketID:       otherTicket.ID,
+			ActorType:      models.ActorTypeHuman,
+			ActorID:        models.HumanActor(observer.ID).ID,
+			FileName:       "other-ticket-public.txt",
+			OriginalName:   "other-ticket-public.txt",
+			FileSize:       7,
+			MimeType:       "text/plain",
+			FileType:       models.AttachmentTypeDocument,
+			StoragePath:    "other-ticket-public.txt",
+			StorageType:    "local",
+			Hash:           "other-ticket-public-hash",
+			IsPublic:       true,
+			VirusScan:      models.VirusScanClean,
+		},
 	}
 	if err := db.Create(&privateAttachments).Error; err != nil {
 		t.Fatal(err)
@@ -340,6 +384,91 @@ func TestObserverCannotDownloadPrivateAttachmentOrUploadDirectly(t *testing.T) {
 
 	storage, err := services.NewLocalAttachmentStorage(t.TempDir())
 	if err != nil {
+		t.Fatal(err)
+	}
+	publicContent := []byte("observer public attachment")
+	publicStored, err := storage.Put(
+		context.Background(),
+		"tickets/observer-public.txt",
+		bytes.NewReader(publicContent),
+		int64(len(publicContent)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicAttachment := models.TicketAttachment{
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		TicketID:       ticket.ID,
+		ActorType:      models.ActorTypeHuman,
+		ActorID:        models.HumanActor(observer.ID).ID,
+		FileName:       "observer-public.txt",
+		OriginalName:   "observer-public.txt",
+		FileSize:       publicStored.Size,
+		MimeType:       "text/plain",
+		FileType:       models.AttachmentTypeDocument,
+		StoragePath:    publicStored.Key,
+		StorageType:    storage.AttachmentStorageType(),
+		Hash:           publicStored.SHA256,
+		IsPublic:       true,
+		VirusScan:      models.VirusScanClean,
+	}
+	if err := db.Create(&publicAttachment).Error; err != nil {
+		t.Fatal(err)
+	}
+	var project models.Project
+	if err := db.First(&project, scope.ProjectID).Error; err != nil {
+		t.Fatal(err)
+	}
+	crossProject := models.Project{
+		OrganizationID: project.OrganizationID,
+		BusinessUnitID: project.BusinessUnitID,
+		Key:            "ATTACHMENT-CROSS",
+		Name:           "Attachment Cross Project",
+		Status:         models.ProjectStatusActive,
+	}
+	if err := db.Create(&crossProject).Error; err != nil {
+		t.Fatal(err)
+	}
+	crossQueue := models.Queue{
+		ProjectID: crossProject.ID,
+		Key:       "default",
+		Name:      "Default",
+		Status:    models.QueueStatusActive,
+		IsDefault: true,
+	}
+	if err := db.Create(&crossQueue).Error; err != nil {
+		t.Fatal(err)
+	}
+	crossTicket := ticket
+	crossTicket.ID = 0
+	crossTicket.PublicID = ""
+	crossTicket.OrganizationID = crossProject.OrganizationID
+	crossTicket.ProjectID = crossProject.ID
+	crossTicket.QueueID = crossQueue.ID
+	crossTicket.TicketNumber = "OBSERVER-CROSS-PROJECT"
+	crossTicket.Title = "observer cross project attachment"
+	if err := db.Create(&crossTicket).Error; err != nil {
+		t.Fatal(err)
+	}
+	crossAttachment := models.TicketAttachment{
+		OrganizationID: crossProject.OrganizationID,
+		ProjectID:      crossProject.ID,
+		TicketID:       crossTicket.ID,
+		ActorType:      models.ActorTypeHuman,
+		ActorID:        models.HumanActor(observer.ID).ID,
+		FileName:       "cross-project-public.txt",
+		OriginalName:   "cross-project-public.txt",
+		FileSize:       7,
+		MimeType:       "text/plain",
+		FileType:       models.AttachmentTypeDocument,
+		StoragePath:    "cross-project-public.txt",
+		StorageType:    "local",
+		Hash:           "cross-project-public-hash",
+		IsPublic:       true,
+		VirusScan:      models.VirusScanClean,
+	}
+	if err := db.Create(&crossAttachment).Error; err != nil {
 		t.Fatal(err)
 	}
 	native := services.NewAgentNativeService(
@@ -365,7 +494,90 @@ func TestObserverCannotDownloadPrivateAttachmentOrUploadDirectly(t *testing.T) {
 	)
 	router.POST("/tickets/:id/attachments", handler.StoreAttachment)
 
-	for _, privateAttachment := range privateAttachments {
+	wantNotFoundBody := `{"code":"not_found","message":"资源不存在","success":false}`
+	randomAttachmentID := crossAttachment.ID + 1000000
+	indistinguishableTargets := []struct {
+		name         string
+		ticketID     uint
+		attachmentID uint
+	}{
+		{
+			name:         "existing private attachment on readable ticket",
+			ticketID:     ticket.ID,
+			attachmentID: privateAttachments[0].ID,
+		},
+		{
+			name:         "random nonexistent attachment",
+			ticketID:     ticket.ID,
+			attachmentID: randomAttachmentID,
+		},
+		{
+			name:         "same project attachment on another ticket",
+			ticketID:     ticket.ID,
+			attachmentID: privateAttachments[len(privateAttachments)-1].ID,
+		},
+	}
+	var firstNotFoundBody string
+	for _, target := range indistinguishableTargets {
+		downloadResponse := httptest.NewRecorder()
+		router.ServeHTTP(
+			downloadResponse,
+			httptest.NewRequest(
+				http.MethodGet,
+				"/tickets/"+jsonNumber(target.ticketID)+
+					"/attachments/"+jsonNumber(target.attachmentID)+
+					"/content",
+				nil,
+			),
+		)
+		body := downloadResponse.Body.String()
+		if downloadResponse.Code != http.StatusNotFound ||
+			body != wantNotFoundBody {
+			t.Fatalf(
+				"observer %s download status=%d body=%q, want status=%d body=%q",
+				target.name,
+				downloadResponse.Code,
+				body,
+				http.StatusNotFound,
+				wantNotFoundBody,
+			)
+		}
+		if firstNotFoundBody == "" {
+			firstNotFoundBody = body
+		} else if body != firstNotFoundBody {
+			t.Fatalf(
+				"observer %s body=%q differs from first target body=%q",
+				target.name,
+				body,
+				firstNotFoundBody,
+			)
+		}
+		for _, leaked := range []string{
+			"attachment_visibility_denied",
+			"private-clean.txt",
+			"other-ticket-public.txt",
+			"attachment_not_clean",
+			`"is_public"`,
+			`"virus_scan"`,
+			`"scan_details"`,
+			`"storage_type"`,
+			`"pending"`,
+			`"infected"`,
+			`"error"`,
+			`"staging"`,
+		} {
+			if strings.Contains(body, leaked) {
+				t.Fatalf(
+					"observer %s response leaked %q: %s",
+					target.name,
+					leaked,
+					body,
+				)
+			}
+		}
+	}
+
+	for index, privateAttachment := range privateAttachments[:len(privateAttachments)-1] {
 		downloadResponse := httptest.NewRecorder()
 		router.ServeHTTP(
 			downloadResponse,
@@ -377,37 +589,57 @@ func TestObserverCannotDownloadPrivateAttachmentOrUploadDirectly(t *testing.T) {
 				nil,
 			),
 		)
-		body := downloadResponse.Body.String()
-		if downloadResponse.Code != http.StatusForbidden ||
-			!strings.Contains(
-				body,
-				`"code":"attachment_visibility_denied"`,
-			) {
+		if downloadResponse.Code != http.StatusNotFound ||
+			downloadResponse.Body.String() != wantNotFoundBody {
 			t.Fatalf(
-				"observer private %s download status=%d body=%s",
+				"observer private state %d scan=%s storage=%s status=%d body=%q",
+				index,
 				privateAttachment.VirusScan,
+				privateAttachment.StorageType,
 				downloadResponse.Code,
-				body,
+				downloadResponse.Body.String(),
 			)
 		}
-		for _, leaked := range []string{
-			"attachment_not_clean",
-			`"virus_scan"`,
-			`"scan_details"`,
-			`"storage_type"`,
-			`"pending"`,
-			`"infected"`,
-			`"staging"`,
-		} {
-			if strings.Contains(body, leaked) {
-				t.Fatalf(
-					"observer private %s response leaked %q: %s",
-					privateAttachment.VirusScan,
-					leaked,
-					body,
-				)
-			}
-		}
+	}
+
+	crossProjectResponse := httptest.NewRecorder()
+	router.ServeHTTP(
+		crossProjectResponse,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/tickets/"+jsonNumber(crossTicket.ID)+
+				"/attachments/"+jsonNumber(crossAttachment.ID)+
+				"/content",
+			nil,
+		),
+	)
+	if crossProjectResponse.Code != http.StatusNotFound ||
+		crossProjectResponse.Body.String() != wantNotFoundBody {
+		t.Fatalf(
+			"observer cross-project download status=%d body=%q",
+			crossProjectResponse.Code,
+			crossProjectResponse.Body.String(),
+		)
+	}
+
+	publicResponse := httptest.NewRecorder()
+	router.ServeHTTP(
+		publicResponse,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/tickets/"+jsonNumber(ticket.ID)+
+				"/attachments/"+jsonNumber(publicAttachment.ID)+
+				"/content",
+			nil,
+		),
+	)
+	if publicResponse.Code != http.StatusOK ||
+		!bytes.Equal(publicResponse.Body.Bytes(), publicContent) {
+		t.Fatalf(
+			"observer public clean download status=%d body=%q",
+			publicResponse.Code,
+			publicResponse.Body.String(),
+		)
 	}
 
 	uploadResponse := httptest.NewRecorder()

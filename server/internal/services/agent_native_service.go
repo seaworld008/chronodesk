@@ -63,6 +63,7 @@ var (
 	ErrAttachmentStorageMissing  = errors.New("attachment storage is not configured")
 	ErrAttachmentTooLarge        = errors.New("attachment exceeds size limit")
 	ErrAttachmentNotClean        = errors.New("attachment is not cleared for download")
+	ErrAttachmentUnavailable     = errors.New("attachment is unavailable")
 	ErrInvalidAttachment         = errors.New("invalid attachment")
 	ErrInvalidAttachmentName     = errors.New("invalid attachment name")
 	ErrInvalidComment            = errors.New("invalid comment")
