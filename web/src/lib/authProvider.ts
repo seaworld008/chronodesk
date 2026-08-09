@@ -169,6 +169,41 @@ const storeAuthSession = (
     bindHumanTabSession(session.access_token)
 }
 
+export type RegistrationSessionOutcome =
+    | 'authenticated'
+    | 'verification_required'
+
+export const consumeRegistrationResult = (
+    value: unknown,
+): RegistrationSessionOutcome => {
+    if (!isRecord(value)) {
+        throw new Error('注册响应包含无效的用户或会话信息')
+    }
+    const user = parseHumanSessionUser(value.user)
+    if (user === null) {
+        throw new Error('注册响应包含无效的用户或会话信息')
+    }
+
+    if (!user.email_verified) {
+        if (
+            value.access_token === '' &&
+            value.refresh_token === '' &&
+            value.token_type === '' &&
+            value.expires_in === 0
+        ) {
+            return 'verification_required'
+        }
+        throw new Error('注册响应包含无效的用户或会话信息')
+    }
+
+    const session = parseAuthSession(value)
+    if (session === null) {
+        throw new Error('注册响应包含无效的用户或会话信息')
+    }
+    storeAuthSession(session, false)
+    return 'authenticated'
+}
+
 const refreshStoredSession = async (): Promise<void> => {
     const refreshToken = localStorage.getItem('refreshToken')
     const previousBinding = readHumanSessionBinding()

@@ -28,6 +28,11 @@ test('公开注册页无需会话并提交严格 Human API DTO', async ({ page }
         }
     })
     let submitted: Record<string, unknown> | null = null
+    let projectListRequests = 0
+    await page.route('**/api/projects**', async (route) => {
+        projectListRequests += 1
+        await fulfillJSON(route, { code: 0, data: [] })
+    })
     await page.route('**/api/auth/register', async (route) => {
         submitted = route.request().postDataJSON() as Record<string, unknown>
         await route.fulfill({
@@ -70,7 +75,218 @@ test('公开注册页无需会话并提交严格 Human API DTO', async ({ page }
         password: 'ExamplePassword123!',
         confirm_password: 'ExamplePassword123!',
     })
+    expect(projectListRequests).toBe(0)
     expect(consoleErrors).toEqual([])
+})
+
+test('已验证注册会话按登录路径写入并进入根路由', async ({ page }) => {
+    const identity = {
+        id: 78,
+        sessionID: 'e2e-registration-complete-session',
+        email: 'e2e-registration-complete@example.test',
+        platformRole: 'member' as const,
+    }
+    const accessToken = mockSessionToken(identity)
+    const user = {
+        id: identity.id,
+        username: 'e2e-registration-complete',
+        email: identity.email,
+        platform_role: identity.platformRole,
+        status: 'active',
+        email_verified: true,
+        otp_enabled: false,
+        last_login_at: null,
+    }
+    let projectListRequests = 0
+
+    await page.addInitScript(() => {
+        const tracedWindow = window as Window & {
+            __chronodeskAuthenticationWrites?: string[]
+        }
+        tracedWindow.__chronodeskAuthenticationWrites = []
+        const originalSetItem = Storage.prototype.setItem
+        Storage.prototype.setItem = function (
+            key: string,
+            value: string,
+        ): void {
+            if (
+                [
+                    'refreshToken',
+                    'user',
+                    'tokenExpiresAt',
+                    'token',
+                ].includes(key)
+            ) {
+                tracedWindow.__chronodeskAuthenticationWrites?.push(key)
+            }
+            originalSetItem.call(this, key, value)
+        }
+    })
+    await page.route('**/api/**', async (route) => {
+        const pathname = new URL(route.request().url()).pathname
+        if (pathname === '/api/auth/register') {
+            await fulfillJSON(
+                route,
+                {
+                    code: 0,
+                    msg: '注册成功',
+                    data: {
+                        user,
+                        access_token: accessToken,
+                        refresh_token: `${identity.sessionID}-refresh`,
+                        expires_in: 3600,
+                        token_type: 'Bearer',
+                    },
+                },
+                201,
+            )
+            return
+        }
+        if (pathname === '/api/projects') {
+            projectListRequests += 1
+            await fulfillJSON(route, { code: 0, data: [] })
+            return
+        }
+        await fulfillJSON(route, { code: 0, data: [] })
+    })
+
+    await page.goto('/#/register')
+    await page.getByLabel('用户名').fill(user.username)
+    await page.getByLabel('邮箱').fill(user.email)
+    await page
+        .getByRole('textbox', { name: '密码', exact: true })
+        .fill('ExamplePassword123!')
+    await page
+        .getByRole('textbox', { name: '确认密码', exact: true })
+        .fill('ExamplePassword123!')
+    await page.getByRole('button', { name: '创建账号' }).click()
+
+    await expect(page).toHaveURL(/\/#\/$/u)
+    await expect(page.getByTestId('no-authorized-projects')).toBeVisible()
+    expect(projectListRequests).toBeGreaterThan(0)
+    await expect
+        .poll(() => page.evaluate(() => localStorage.getItem('token')))
+        .toBe(accessToken)
+    expect(
+        await page.evaluate(() => {
+            const tracedWindow = window as Window & {
+                __chronodeskAuthenticationWrites?: string[]
+            }
+            return tracedWindow.__chronodeskAuthenticationWrites
+        }),
+    ).toEqual(['refreshToken', 'user', 'tokenExpiresAt', 'token'])
+})
+
+test('已验证注册的残缺成功响应不写入部分会话', async ({ page }) => {
+    const identity = {
+        id: 79,
+        sessionID: 'e2e-registration-incomplete-session',
+        email: 'e2e-registration-incomplete@example.test',
+        platformRole: 'member' as const,
+    }
+    await page.route('**/api/auth/register', async (route) => {
+        await fulfillJSON(
+            route,
+            {
+                code: 0,
+                msg: '注册成功',
+                data: {
+                    user: {
+                        id: identity.id,
+                        username: 'e2e-registration-incomplete',
+                        email: identity.email,
+                        platform_role: identity.platformRole,
+                        status: 'active',
+                        email_verified: true,
+                        otp_enabled: false,
+                        last_login_at: null,
+                    },
+                    access_token: mockSessionToken(identity),
+                    refresh_token: '',
+                    expires_in: 3600,
+                    token_type: 'Bearer',
+                },
+            },
+            201,
+        )
+    })
+
+    await page.goto('/#/register')
+    await page.getByLabel('用户名').fill('e2e-registration-incomplete')
+    await page.getByLabel('邮箱').fill(identity.email)
+    await page
+        .getByRole('textbox', { name: '密码', exact: true })
+        .fill('ExamplePassword123!')
+    await page
+        .getByRole('textbox', { name: '确认密码', exact: true })
+        .fill('ExamplePassword123!')
+    await page.getByRole('button', { name: '创建账号' }).click()
+
+    await expect(page.getByRole('alert')).toContainText(
+        '注册响应包含无效的用户或会话信息',
+    )
+    await expect(page).toHaveURL(/\/#\/register$/u)
+    await expect(
+        page.getByText('注册成功，现在可以登录。'),
+    ).toHaveCount(0)
+    expect(
+        await page.evaluate(() => ({
+            token: localStorage.getItem('token'),
+            refreshToken: localStorage.getItem('refreshToken'),
+            user: localStorage.getItem('user'),
+            tokenExpiresAt: localStorage.getItem('tokenExpiresAt'),
+        })),
+    ).toEqual({
+        token: null,
+        refreshToken: null,
+        user: null,
+        tokenExpiresAt: null,
+    })
+})
+
+test('未验证注册拒绝混合会话而不请求项目列表', async ({ page }) => {
+    let projectListRequests = 0
+    await page.route('**/api/projects**', async (route) => {
+        projectListRequests += 1
+        await fulfillJSON(route, { code: 0, data: [] })
+    })
+    await page.route('**/api/auth/register', async (route) => {
+        await fulfillJSON(
+            route,
+            {
+                code: 0,
+                msg: '注册成功',
+                data: {
+                    user: publicUser,
+                    access_token: '',
+                    refresh_token: 'unexpected-refresh-token',
+                    expires_in: 0,
+                    token_type: '',
+                },
+            },
+            201,
+        )
+    })
+
+    await page.goto('/#/register')
+    await page.getByLabel('用户名').fill('e2e-public-human')
+    await page.getByLabel('邮箱').fill('e2e-public-human@example.test')
+    await page
+        .getByRole('textbox', { name: '密码', exact: true })
+        .fill('ExamplePassword123!')
+    await page
+        .getByRole('textbox', { name: '确认密码', exact: true })
+        .fill('ExamplePassword123!')
+    await page.getByRole('button', { name: '创建账号' }).click()
+
+    await expect(page.getByRole('alert')).toContainText(
+        '注册响应包含无效的用户或会话信息',
+    )
+    await expect(page).toHaveURL(/\/#\/register$/u)
+    expect(projectListRequests).toBe(0)
+    await expect(
+        page.getByText('注册请求已完成，请查收验证邮件后再登录。'),
+    ).toHaveCount(0)
 })
 
 test('找回密码与重发验证保持防枚举反馈', async ({ page }) => {

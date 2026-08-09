@@ -6,8 +6,11 @@ import {
     Stack,
     TextField,
 } from '@mui/material'
-import { Link as RouterLink } from 'react-router-dom'
+import { useQueryClient } from '@tanstack/react-query'
+import { Link as RouterLink, useNavigate } from 'react-router-dom'
 import { localizedUnknownErrorMessage } from '@/lib/apiClient'
+import { consumeRegistrationResult } from '@/lib/authProvider'
+import { markHumanAuthQueryAuthenticated } from '@/lib/authQueryState'
 import PublicAuthShell from './PublicAuthShell'
 import { registerHumanAccount } from './publicAuthApi'
 
@@ -30,6 +33,8 @@ const initialForm: RegistrationForm = {
 }
 
 const RegisterPage = () => {
+    const queryClient = useQueryClient()
+    const navigate = useNavigate()
     const [form, setForm] = useState(initialForm)
     const [submitting, setSubmitting] = useState(false)
     const [registered, setRegistered] = useState(false)
@@ -64,8 +69,16 @@ const RegisterPage = () => {
                     ? { last_name: form.lastName.trim() }
                     : {}),
             })
-            setRequiresVerification(!result.user.email_verified)
-            setRegistered(true)
+            if (consumeRegistrationResult(result) === 'authenticated') {
+                markHumanAuthQueryAuthenticated(queryClient)
+                void queryClient.invalidateQueries({
+                    queryKey: ['auth', 'getPermissions'],
+                })
+                navigate('/', { replace: true })
+            } else {
+                setRequiresVerification(true)
+                setRegistered(true)
+            }
         } catch (requestError) {
             setError(
                 localizedUnknownErrorMessage(
