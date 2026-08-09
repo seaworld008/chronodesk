@@ -345,6 +345,7 @@ func TestPostgresEmailNotificationPreferenceCreateFollowsUpdateOrder(
 			t.Fatal(err)
 		}
 		hold := holdPreferenceUserLock(t)
+		defer func() { _ = hold.Rollback().Error }()
 		updateDone := make(chan error, 1)
 		go func() { updateDone <- updateEmailPreference(false) }()
 		waitForQueuedPreferenceLock(t, 1)
@@ -377,6 +378,7 @@ func TestPostgresEmailNotificationPreferenceCreateFollowsUpdateOrder(
 			t.Fatal(err)
 		}
 		hold := holdPreferenceUserLock(t)
+		defer func() { _ = hold.Rollback().Error }()
 		createDone := make(chan createResult, 1)
 		go func() { createDone <- createEmail("create-first") }()
 		waitForQueuedPreferenceLock(t, 1)
