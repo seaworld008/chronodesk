@@ -372,6 +372,7 @@ func TestNotificationEmailOutboxRetriesFailedAttemptAndSkipsReplay(t *testing.T)
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.Notification{},
+		&models.NotificationPreference{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
 	); err != nil {
