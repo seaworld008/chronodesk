@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
 import {
     authorizedProjectAccess,
     defaultMockIdentity,
@@ -19,6 +19,52 @@ const publicUser = {
     otp_enabled: false,
     last_login_at: null,
 }
+
+const registrationPassword = 'ExamplePassword123!'
+
+const submitRegistration = async (
+    page: Page,
+    username: string,
+    email: string,
+): Promise<void> => {
+    await page.getByLabel('用户名').fill(username)
+    await page.getByLabel('邮箱').fill(email)
+    await page
+        .getByRole('textbox', { name: '密码', exact: true })
+        .fill(registrationPassword)
+    await page
+        .getByRole('textbox', { name: '确认密码', exact: true })
+        .fill(registrationPassword)
+    await page.getByRole('button', { name: '创建账号' }).click()
+}
+
+const readAuthenticationStorage = (page: Page) =>
+    page.evaluate(() => ({
+        token: localStorage.getItem('token'),
+        refreshToken: localStorage.getItem('refreshToken'),
+        user: localStorage.getItem('user'),
+        tokenExpiresAt: localStorage.getItem('tokenExpiresAt'),
+    }))
+
+const emptyAuthenticationStorage = {
+    token: null,
+    refreshToken: null,
+    user: null,
+    tokenExpiresAt: null,
+}
+
+const encodeJwtSegment = (value: unknown): string =>
+    btoa(JSON.stringify(value))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/u, '')
+
+const registrationTokenWithPayload = (payload: Record<string, unknown>) =>
+    [
+        encodeJwtSegment({ alg: 'none', typ: 'JWT' }),
+        encodeJwtSegment(payload),
+        'e2e-signature',
+    ].join('.')
 
 test('公开注册页无需会话并提交严格 Human API DTO', async ({ page }) => {
     const consoleErrors: string[] = []
@@ -56,15 +102,7 @@ test('公开注册页无需会话并提交严格 Human API DTO', async ({ page }
     await expect(
         page.getByRole('heading', { name: '注册 ChronoDesk' }),
     ).toBeVisible()
-    await page.getByLabel('用户名').fill('e2e-public-human')
-    await page.getByLabel('邮箱').fill('e2e-public-human@example.test')
-    await page
-        .getByRole('textbox', { name: '密码', exact: true })
-        .fill('ExamplePassword123!')
-    await page
-        .getByRole('textbox', { name: '确认密码', exact: true })
-        .fill('ExamplePassword123!')
-    await page.getByRole('button', { name: '创建账号' }).click()
+    await submitRegistration(page, publicUser.username, publicUser.email)
 
     await expect(
         page.getByText('注册请求已完成，请查收验证邮件后再登录。'),
@@ -76,6 +114,9 @@ test('公开注册页无需会话并提交严格 Human API DTO', async ({ page }
         confirm_password: 'ExamplePassword123!',
     })
     expect(projectListRequests).toBe(0)
+    expect(await readAuthenticationStorage(page)).toEqual(
+        emptyAuthenticationStorage,
+    )
     expect(consoleErrors).toEqual([])
 })
 
@@ -151,15 +192,7 @@ test('已验证注册会话按登录路径写入并进入根路由', async ({ pa
     })
 
     await page.goto('/#/register')
-    await page.getByLabel('用户名').fill(user.username)
-    await page.getByLabel('邮箱').fill(user.email)
-    await page
-        .getByRole('textbox', { name: '密码', exact: true })
-        .fill('ExamplePassword123!')
-    await page
-        .getByRole('textbox', { name: '确认密码', exact: true })
-        .fill('ExamplePassword123!')
-    await page.getByRole('button', { name: '创建账号' }).click()
+    await submitRegistration(page, user.username, user.email)
 
     await expect(page).toHaveURL(/\/#\/$/u)
     await expect(page.getByTestId('no-authorized-projects')).toBeVisible()
@@ -212,15 +245,11 @@ test('已验证注册的残缺成功响应不写入部分会话', async ({ page 
     })
 
     await page.goto('/#/register')
-    await page.getByLabel('用户名').fill('e2e-registration-incomplete')
-    await page.getByLabel('邮箱').fill(identity.email)
-    await page
-        .getByRole('textbox', { name: '密码', exact: true })
-        .fill('ExamplePassword123!')
-    await page
-        .getByRole('textbox', { name: '确认密码', exact: true })
-        .fill('ExamplePassword123!')
-    await page.getByRole('button', { name: '创建账号' }).click()
+    await submitRegistration(
+        page,
+        'e2e-registration-incomplete',
+        identity.email,
+    )
 
     await expect(page.getByRole('alert')).toContainText(
         '注册响应包含无效的用户或会话信息',
@@ -229,19 +258,9 @@ test('已验证注册的残缺成功响应不写入部分会话', async ({ page 
     await expect(
         page.getByText('注册成功，现在可以登录。'),
     ).toHaveCount(0)
-    expect(
-        await page.evaluate(() => ({
-            token: localStorage.getItem('token'),
-            refreshToken: localStorage.getItem('refreshToken'),
-            user: localStorage.getItem('user'),
-            tokenExpiresAt: localStorage.getItem('tokenExpiresAt'),
-        })),
-    ).toEqual({
-        token: null,
-        refreshToken: null,
-        user: null,
-        tokenExpiresAt: null,
-    })
+    expect(await readAuthenticationStorage(page)).toEqual(
+        emptyAuthenticationStorage,
+    )
 })
 
 test('未验证注册拒绝混合会话而不请求项目列表', async ({ page }) => {
@@ -269,15 +288,7 @@ test('未验证注册拒绝混合会话而不请求项目列表', async ({ page 
     })
 
     await page.goto('/#/register')
-    await page.getByLabel('用户名').fill('e2e-public-human')
-    await page.getByLabel('邮箱').fill('e2e-public-human@example.test')
-    await page
-        .getByRole('textbox', { name: '密码', exact: true })
-        .fill('ExamplePassword123!')
-    await page
-        .getByRole('textbox', { name: '确认密码', exact: true })
-        .fill('ExamplePassword123!')
-    await page.getByRole('button', { name: '创建账号' }).click()
+    await submitRegistration(page, publicUser.username, publicUser.email)
 
     await expect(page.getByRole('alert')).toContainText(
         '注册响应包含无效的用户或会话信息',
@@ -288,6 +299,130 @@ test('未验证注册拒绝混合会话而不请求项目列表', async ({ page 
         page.getByText('注册请求已完成，请查收验证邮件后再登录。'),
     ).toHaveCount(0)
 })
+
+const invalidRegistrationIdentity = {
+    id: 80,
+    sessionID: 'e2e-registration-validation-session',
+    email: 'e2e-registration-validation@example.test',
+    platformRole: 'member' as const,
+}
+
+const validVerifiedRegistrationResult = () => ({
+    user: {
+        id: invalidRegistrationIdentity.id,
+        username: 'e2e-registration-validation',
+        email: invalidRegistrationIdentity.email,
+        platform_role: invalidRegistrationIdentity.platformRole,
+        status: 'active',
+        email_verified: true,
+        otp_enabled: false,
+        last_login_at: null,
+    },
+    access_token: mockSessionToken(invalidRegistrationIdentity),
+    refresh_token: `${invalidRegistrationIdentity.sessionID}-refresh`,
+    expires_in: 3600,
+    token_type: 'Bearer',
+})
+
+const malformedRegistrationCases: Array<{
+    name: string
+    result: () => Record<string, unknown>
+}> = [
+    {
+        name: '格式错误的 JWT',
+        result: () => ({
+            ...validVerifiedRegistrationResult(),
+            access_token: 'not-a-jwt',
+        }),
+    },
+    {
+        name: 'JWT subject 与用户不匹配',
+        result: () => ({
+            ...validVerifiedRegistrationResult(),
+            access_token: mockSessionToken({
+                ...invalidRegistrationIdentity,
+                id: invalidRegistrationIdentity.id + 1,
+            }),
+        }),
+    },
+    {
+        name: 'JWT platform role 与用户不匹配',
+        result: () => ({
+            ...validVerifiedRegistrationResult(),
+            user: {
+                ...validVerifiedRegistrationResult().user,
+                platform_role: 'platform_admin',
+            },
+        }),
+    },
+    {
+        name: 'JWT session ID 为空',
+        result: () => ({
+            ...validVerifiedRegistrationResult(),
+            access_token: registrationTokenWithPayload({
+                sub: String(invalidRegistrationIdentity.id),
+                sid: '',
+                platform_role: invalidRegistrationIdentity.platformRole,
+                exp: Math.floor(Date.now() / 1000) + 3600,
+            }),
+        }),
+    },
+    {
+        name: 'JWT 缺少 session ID',
+        result: () => ({
+            ...validVerifiedRegistrationResult(),
+            access_token: registrationTokenWithPayload({
+                sub: String(invalidRegistrationIdentity.id),
+                platform_role: invalidRegistrationIdentity.platformRole,
+                exp: Math.floor(Date.now() / 1000) + 3600,
+            }),
+        }),
+    },
+    {
+        name: '会话字段类型错误',
+        result: () => ({
+            ...validVerifiedRegistrationResult(),
+            expires_in: '3600',
+        }),
+    },
+]
+
+for (const { name, result } of malformedRegistrationCases) {
+    test(`已验证注册拒绝${name}且不写入认证状态`, async ({ page }) => {
+        let projectListRequests = 0
+        await page.route('**/api/projects**', async (route) => {
+            projectListRequests += 1
+            await fulfillJSON(route, { code: 0, data: [] })
+        })
+        await page.route('**/api/auth/register', async (route) => {
+            await fulfillJSON(
+                route,
+                {
+                    code: 0,
+                    msg: '注册成功',
+                    data: result(),
+                },
+                201,
+            )
+        })
+
+        await page.goto('/#/register')
+        await submitRegistration(
+            page,
+            'e2e-registration-validation',
+            invalidRegistrationIdentity.email,
+        )
+
+        await expect(page.getByRole('alert')).toContainText(
+            '注册响应包含无效的用户或会话信息',
+        )
+        await expect(page).toHaveURL(/\/#\/register$/u)
+        expect(await readAuthenticationStorage(page)).toEqual(
+            emptyAuthenticationStorage,
+        )
+        expect(projectListRequests).toBe(0)
+    })
+}
 
 test('找回密码与重发验证保持防枚举反馈', async ({ page }) => {
     const requests: Array<{ path: string; body: unknown }> = []
