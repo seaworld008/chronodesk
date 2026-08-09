@@ -109,6 +109,13 @@ export const humanTabSessionMatches = (
     accessToken: string | null,
 ): boolean => boundAccessToken === accessToken
 
+const sameStableBinding = (
+    left: HumanSessionBinding,
+    right: HumanSessionBinding,
+): boolean =>
+    left.subject === right.subject &&
+    left.session_id === right.session_id
+
 export const adoptHumanTabSessionRotation = (
     accessToken: string,
 ): boolean => {
@@ -117,11 +124,33 @@ export const adoptHumanTabSessionRotation = (
     if (
         boundBinding === null ||
         nextBinding === null ||
-        boundBinding.subject !== nextBinding.subject ||
-        boundBinding.session_id !== nextBinding.session_id
+        !sameStableBinding(boundBinding, nextBinding)
     ) {
         return false
     }
     boundAccessToken = accessToken
     return true
+}
+
+export const resolveHumanBearerForRequest = (
+    capturedAccessToken: string,
+): string | null => {
+    const committedAccessToken = readCommittedHumanTabSessionToken()
+    const capturedBinding = readHumanSessionBinding(capturedAccessToken)
+    const committedBinding = readHumanSessionBinding(committedAccessToken)
+    if (
+        committedAccessToken === null ||
+        capturedBinding === null ||
+        committedBinding === null ||
+        !sameStableBinding(capturedBinding, committedBinding)
+    ) {
+        return null
+    }
+    if (
+        !humanTabSessionMatches(committedAccessToken) &&
+        !adoptHumanTabSessionRotation(committedAccessToken)
+    ) {
+        return null
+    }
+    return committedAccessToken
 }

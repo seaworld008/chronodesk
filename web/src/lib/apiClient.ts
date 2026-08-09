@@ -9,9 +9,7 @@ import {
 } from './projectScopeEvents'
 import { joinApiUrl } from './apiUrl'
 import {
-  adoptHumanTabSessionRotation,
-  humanTabSessionMatches,
-  readCommittedHumanTabSessionToken,
+  resolveHumanBearerForRequest,
 } from './humanTabSession'
 
 export type ApiOptions = RequestInit & { rawResponse?: boolean }
@@ -36,20 +34,9 @@ export const sessionAwareFetch = async (
   )
   const authorization = requestHeaders.get('Authorization')
   if (authorization?.startsWith('Bearer ')) {
-    const accessToken = authorization.slice('Bearer '.length)
-    const committedAccessToken = readCommittedHumanTabSessionToken()
-    if (
-      committedAccessToken !== accessToken ||
-      (
-        !humanTabSessionMatches(accessToken) &&
-        !adoptHumanTabSessionRotation(accessToken)
-      )
-    ) {
-      signalSessionReplaced()
-      throw new Error('登录账号已在其他标签页发生变化，请刷新后继续')
-    }
+    requireCommittedHumanBearerHeaders(requestHeaders)
   }
-  const response = await fetch(input, init)
+  const response = await fetch(input, { ...init, headers: requestHeaders })
   const path = requestPath(input)
   if (response.status === 401) {
     signalSessionInvalidated()
@@ -62,6 +49,23 @@ export const sessionAwareFetch = async (
     }
   }
   return response
+}
+
+export const requireCommittedHumanBearerHeaders = (
+  headers: Headers,
+): Headers => {
+  const authorization = headers.get('Authorization')
+  const capturedAccessToken = authorization?.startsWith('Bearer ')
+    ? authorization.slice('Bearer '.length)
+    : ''
+  const committedAccessToken =
+    resolveHumanBearerForRequest(capturedAccessToken)
+  if (committedAccessToken === null) {
+    signalSessionReplaced()
+    throw new Error('登录账号已在其他标签页发生变化，请刷新后继续')
+  }
+  headers.set('Authorization', `Bearer ${committedAccessToken}`)
+  return headers
 }
 
 type JsonRecord = Record<string, unknown>

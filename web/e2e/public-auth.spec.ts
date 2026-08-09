@@ -801,6 +801,7 @@ test('同一 Human session 刷新轮换不会重载受保护标签且下一请�
     let logoutRequests = 0
     let profileGetRequests = 0
     let profileUpdateBearer = ''
+    let capturedRequestBearer = ''
     let markRefreshRequestStarted: (() => void) | undefined
     const refreshRequestStarted = new Promise<void>((resolve) => {
         markRefreshRequestStarted = resolve
@@ -857,6 +858,11 @@ test('同一 Human session 刷新轮换不会重载受保护标签且下一请�
             await fulfillJSON(route, { code: 0, data: user })
             return
         }
+        if (pathname === '/api/e2e/captured-rotation') {
+            capturedRequestBearer = authorization
+            await fulfillJSON(route, { code: 0, data: [] })
+            return
+        }
         if (pathname === '/api/auth/me') {
             profileGetRequests += 1
             await fulfillJSON(route, { code: 0, data: user })
@@ -903,6 +909,53 @@ test('同一 Human session 刷新轮换不会重载受保护标签且下一请�
         '受保护标签未提交表单',
     )
 
+    const capturedRequest = protectedPage.evaluate(
+        async ({ accessToken, requestPath, modulePath }) => {
+            const requestHeaders = new Headers({
+                Authorization: `Bearer ${accessToken}`,
+            })
+            const tracedWindow = window as Window & {
+                __chronodeskCapturedRequestReady?: boolean
+            }
+            tracedWindow.__chronodeskCapturedRequestReady = true
+            await new Promise<void>((resolve) => {
+                window.addEventListener(
+                    'chronodesk-release-captured-request',
+                    () => resolve(),
+                    { once: true },
+                )
+            })
+            const apiClient = await import(
+                /* @vite-ignore */ modulePath
+            ) as {
+                sessionAwareFetch: (
+                    input: RequestInfo | URL,
+                    init?: RequestInit,
+                ) => Promise<Response>
+            }
+            const response = await apiClient.sessionAwareFetch(
+                requestPath,
+                { headers: requestHeaders },
+            )
+            return response.status
+        },
+        {
+            accessToken: oldToken,
+            requestPath: '/api/e2e/captured-rotation',
+            modulePath: '/src/lib/apiClient.ts',
+        },
+    )
+    await expect
+        .poll(() =>
+            protectedPage.evaluate(() => {
+                const tracedWindow = window as Window & {
+                    __chronodeskCapturedRequestReady?: boolean
+                }
+                return tracedWindow.__chronodeskCapturedRequestReady
+            }),
+        )
+        .toBe(true)
+
     releaseRefreshResponse?.()
     await refreshNavigation
     await expect
@@ -911,9 +964,16 @@ test('同一 Human session 刷新轮换不会重载受保护标签且下一请�
         )
         .toBe(rotatedToken)
     await protectedPage.waitForTimeout(100)
+    await protectedPage.evaluate(() => {
+        window.dispatchEvent(
+            new Event('chronodesk-release-captured-request'),
+        )
+    })
+    expect(await capturedRequest).toBe(200)
 
     expect(refreshRequests).toBeGreaterThan(0)
     expect(logoutRequests).toBe(0)
+    expect(capturedRequestBearer).toBe(`Bearer ${rotatedToken}`)
     expect(profileGetRequests).toBe(profileGetRequestsBeforeRotation)
     await expect(protectedPage).toHaveURL(/\/#\/account\/profile$/u)
     await expect(protectedPage.getByLabel('名字')).toHaveValue(
@@ -950,6 +1010,7 @@ for (const replacement of [
         identity: {
             ...defaultMockIdentity,
             id: defaultMockIdentity.id + 1,
+            sessionID: 'e2e-replacement-initial-session',
             email: 'different-subject@example.test',
         },
     },
@@ -1096,7 +1157,7 @@ for (const commitCase of [
     { name: '残缺', kind: 'incomplete' as const },
     { name: '畸形', kind: 'malformed' as const },
 ]) {
-    test(`${commitCase.name} token-last 提交 fail closed 且不发送旧 bearer`, async ({
+    test(`${commitCase.name} token-last 提交使 dataProvider Create 零目标网络`, async ({
         page,
     }) => {
         const identity = {
@@ -1121,15 +1182,15 @@ for (const commitCase of [
                 language: 'zh-CN',
             },
         }
-        let protectedUpdates = 0
+        let dataProviderCreateRequests = 0
         await page.route('**/api/**', async (route) => {
             const request = route.request()
             const pathname = new URL(request.url()).pathname
             if (
-                pathname === '/api/auth/profile' &&
-                request.method() === 'PUT'
+                pathname === '/api/platform/users' &&
+                request.method() === 'POST'
             ) {
-                protectedUpdates += 1
+                dataProviderCreateRequests += 1
                 await fulfillJSON(route, { code: 0, data: user })
                 return
             }
@@ -1161,11 +1222,39 @@ for (const commitCase of [
             },
             { committedToken: token, kind: commitCase.kind },
         )
-        await page.getByLabel('名字').fill(`不得提交${commitCase.name}状态`)
-        await page.getByRole('button', { name: '保存个人资料' }).click()
+        const providerCall = page.evaluate(
+            async ({ modulePath, email }) => {
+                const providerModule = await import(
+                    /* @vite-ignore */ modulePath
+                ) as {
+                    dataProvider: {
+                        create: (
+                            resource: string,
+                            params: { data: Record<string, unknown> },
+                        ) => Promise<unknown>
+                    }
+                }
+                try {
+                    await providerModule.dataProvider.create('users', {
+                        data: {
+                            username: 'blocked-data-provider-create',
+                            email,
+                        },
+                    })
+                    return 'resolved'
+                } catch {
+                    return 'rejected'
+                }
+            },
+            {
+                modulePath: '/src/lib/dataProvider.ts',
+                email: `blocked-${commitCase.kind}@example.test`,
+            },
+        ).catch(() => 'navigation-destroyed')
 
+        await providerCall
+        expect(dataProviderCreateRequests).toBe(0)
         await expect(page).toHaveURL(/\/#\/login$/u)
-        expect(protectedUpdates).toBe(0)
     })
 }
 
