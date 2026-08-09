@@ -277,7 +277,22 @@ const (
 	OutboxDeliverySucceeded  OutboxDeliveryStatus = "succeeded"
 	OutboxDeliveryFailed     OutboxDeliveryStatus = "failed"
 	OutboxDeliveryDead       OutboxDeliveryStatus = "dead"
+	OutboxDeliveryExpired    OutboxDeliveryStatus = "expired"
 )
+
+func (status OutboxDeliveryStatus) IsValid() bool {
+	switch status {
+	case OutboxDeliveryPending,
+		OutboxDeliveryProcessing,
+		OutboxDeliverySucceeded,
+		OutboxDeliveryFailed,
+		OutboxDeliveryDead,
+		OutboxDeliveryExpired:
+		return true
+	default:
+		return false
+	}
+}
 
 // OutboxDelivery tracks independent delivery state for each event target.
 type OutboxDelivery struct {
@@ -290,14 +305,16 @@ type OutboxDelivery struct {
 	Event           *DomainEvent         `json:"event,omitempty" gorm:"foreignKey:EventID"`
 	DestinationType string               `json:"destination_type" gorm:"size:50;not null;uniqueIndex:idx_event_destination,priority:2;index"`
 	DestinationID   string               `json:"destination_id" gorm:"size:128;not null;uniqueIndex:idx_event_destination,priority:3;index"`
-	Status          OutboxDeliveryStatus `json:"status" gorm:"size:20;not null;default:'pending';index"`
+	Status          OutboxDeliveryStatus `json:"status" gorm:"size:20;not null;default:'pending';index;check:chk_outbox_delivery_status,status = 'pending' OR status = 'processing' OR status = 'succeeded' OR status = 'failed' OR status = 'dead' OR status = 'expired'"`
 	Attempts        int                  `json:"attempts" gorm:"not null;default:0"`
 	MaxAttempts     int                  `json:"max_attempts" gorm:"not null;default:8"`
 	NextAttemptAt   time.Time            `json:"next_attempt_at" gorm:"not null;index"`
 	LockedAt        *time.Time           `json:"locked_at,omitempty" gorm:"index"`
 	LockedBy        string               `json:"locked_by,omitempty" gorm:"size:100;index"`
 	LastError       string               `json:"last_error,omitempty" gorm:"type:text"`
-	DeliveredAt     *time.Time           `json:"delivered_at,omitempty" gorm:"index"`
+	DeliveredAt     *time.Time           `json:"delivered_at,omitempty" gorm:"index;check:chk_outbox_expired_at,(status = 'expired' AND expired_at IS NOT NULL) OR (status <> 'expired' AND expired_at IS NULL)"`
+	ExpiresAt       *time.Time           `json:"expires_at,omitempty" gorm:"index;check:chk_outbox_webhook_expires_at,destination_type <> 'webhook' OR (destination_type = 'webhook' AND expires_at IS NOT NULL)"`
+	ExpiredAt       *time.Time           `json:"expired_at,omitempty" gorm:"index;check:chk_outbox_expired_webhook,status <> 'expired' OR (status = 'expired' AND destination_type = 'webhook')"`
 }
 
 func (OutboxDelivery) TableName() string {

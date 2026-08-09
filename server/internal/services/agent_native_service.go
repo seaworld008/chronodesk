@@ -98,7 +98,7 @@ const (
 	defaultIdempotencyProcessingLease = 2 * time.Minute
 	idempotencyFailureCleanupTimeout  = 5 * time.Second
 	webhookConfiguredDestinationID    = "configured"
-	webhookSnapshotDestinationPrefix  = "snapshot:"
+	webhookSnapshotDestinationPrefix  = models.WebhookDeliverySnapshotDestinationPrefix
 )
 
 // AgentNativeErrorCode turns exported sentinel errors into stable API codes.
@@ -190,6 +190,11 @@ type OutboxTarget struct {
 	Type        string
 	ID          string
 	MaxAttempts int
+
+	// webhookSnapshot is set only by the two trusted freeze paths in this
+	// package. A caller-provided webhook target is either the configured
+	// placeholder or invalid; it can never manufacture an unbounded delivery.
+	webhookSnapshot *models.WebhookDeliverySnapshot
 }
 
 type AttachmentCleanupObject struct {
@@ -2666,9 +2671,29 @@ func (s *AgentNativeService) AppendDomainEventTx(
 	input DomainEventInput,
 	targets []OutboxTarget,
 ) (*models.DomainEvent, error) {
+	return s.appendDomainEventTxAt(
+		ctx,
+		tx,
+		input,
+		targets,
+		s.now().UTC(),
+	)
+}
+
+func (s *AgentNativeService) appendDomainEventTxAt(
+	ctx context.Context,
+	tx *gorm.DB,
+	input DomainEventInput,
+	targets []OutboxTarget,
+	txNow time.Time,
+) (*models.DomainEvent, error) {
 	if tx == nil {
 		return nil, fmt.Errorf("transaction is required")
 	}
+	if txNow.IsZero() {
+		return nil, errors.New("domain event transaction time is required")
+	}
+	txNow = txNow.UTC()
 	if strings.TrimSpace(input.Type) == "" {
 		return nil, fmt.Errorf("domain event type is required")
 	}
@@ -2711,7 +2736,7 @@ func (s *AgentNativeService) AppendDomainEventTx(
 		input.DataSchema = "urn:chronodesk:schema:domain-event-data:v1"
 	}
 	if input.Time.IsZero() {
-		input.Time = s.now().UTC()
+		input.Time = txNow
 	} else {
 		input.Time = input.Time.UTC()
 	}
@@ -2802,11 +2827,12 @@ func (s *AgentNativeService) AppendDomainEventTx(
 		tx,
 		event,
 		targets,
+		txNow,
 	)
 	if err != nil {
 		return nil, err
 	}
-	now := s.now()
+	snapshots := make([]*models.WebhookDeliverySnapshot, 0)
 	for _, target := range targets {
 		delivery := &models.OutboxDelivery{
 			ID:              newNativeID(),
@@ -2817,12 +2843,47 @@ func (s *AgentNativeService) AppendDomainEventTx(
 			DestinationID:   target.ID,
 			Status:          models.OutboxDeliveryPending,
 			MaxAttempts:     target.MaxAttempts,
-			NextAttemptAt:   now,
+			NextAttemptAt:   txNow,
+		}
+		if target.Type == "webhook" {
+			snapshot := target.webhookSnapshot
+			if snapshot == nil {
+				return nil, errors.New(
+					"webhook Outbox target requires a transaction-owned delivery snapshot",
+				)
+			}
+			snapshotDestinationID, snapshotDestinationErr :=
+				models.WebhookDeliverySnapshotDestinationID(snapshot.ID)
+			if snapshotDestinationErr != nil ||
+				target.ID != snapshotDestinationID ||
+				snapshot.EventID != event.ID ||
+				snapshot.OrganizationID != event.OrganizationID ||
+				snapshot.ProjectID != event.ProjectID ||
+				snapshot.CredentialExpiresAt.IsZero() {
+				return nil, errors.New(
+					"webhook Outbox target requires a transaction-owned delivery snapshot",
+				)
+			}
+			expiresAt := snapshot.CredentialExpiresAt.UTC()
+			delivery.ExpiresAt = &expiresAt
+			snapshots = append(snapshots, snapshot)
+		} else if target.webhookSnapshot != nil {
+			return nil, errors.New(
+				"non-webhook Outbox target cannot carry a webhook snapshot",
+			)
 		}
 		if err := tx.WithContext(ctx).Create(delivery).Error; err != nil {
 			return nil, fmt.Errorf("create outbox delivery: %w", err)
 		}
 		event.Deliveries = append(event.Deliveries, *delivery)
+	}
+	for _, snapshot := range snapshots {
+		if err := tx.WithContext(ctx).Create(snapshot).Error; err != nil {
+			return nil, fmt.Errorf(
+				"create webhook delivery snapshot: %w",
+				err,
+			)
+		}
 	}
 	return event, nil
 }
@@ -2836,6 +2897,7 @@ func (s *AgentNativeService) freezeWebhookOutboxTargetsTx(
 	tx *gorm.DB,
 	event *models.DomainEvent,
 	targets []OutboxTarget,
+	now time.Time,
 ) ([]OutboxTarget, error) {
 	if tx == nil || event == nil {
 		return nil, errors.New("webhook snapshot transaction and event are required")
@@ -2871,6 +2933,7 @@ func (s *AgentNativeService) freezeWebhookOutboxTargetsTx(
 	var configs []models.WebhookConfig
 	if eventcontract.IsWebhookDeliveryEventType(event.Type) {
 		if err := tx.WithContext(ctx).
+			Clauses(clause.Locking{Strength: "SHARE"}).
 			Where(
 				"organization_id = ? AND project_id = ? AND status = ?",
 				event.OrganizationID,
@@ -2900,17 +2963,12 @@ func (s *AgentNativeService) freezeWebhookOutboxTargetsTx(
 			snapshot, err := models.NewWebhookDeliverySnapshot(
 				config,
 				event.ID,
+				now.Add(models.WebhookDeliveryCredentialLifetime),
 			)
 			if err != nil {
 				return nil, fmt.Errorf(
 					"freeze webhook configuration %d: %w",
 					config.ID,
-					err,
-				)
-			}
-			if err := tx.WithContext(ctx).Create(snapshot).Error; err != nil {
-				return nil, fmt.Errorf(
-					"create webhook delivery snapshot: %w",
 					err,
 				)
 			}
@@ -2921,10 +2979,16 @@ func (s *AgentNativeService) freezeWebhookOutboxTargetsTx(
 			if maxAttempts > 11 {
 				maxAttempts = 11
 			}
+			destinationID, destinationErr :=
+				models.WebhookDeliverySnapshotDestinationID(snapshot.ID)
+			if destinationErr != nil {
+				return nil, destinationErr
+			}
 			frozen = append(frozen, OutboxTarget{
-				Type:        "webhook",
-				ID:          webhookSnapshotDestinationPrefix + snapshot.ID,
-				MaxAttempts: maxAttempts,
+				Type:            "webhook",
+				ID:              destinationID,
+				MaxAttempts:     maxAttempts,
+				webhookSnapshot: snapshot,
 			})
 		}
 	}

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1227,6 +1228,273 @@ func TestAgentNativeEventOutboxRollbackRetryAndRecovery(t *testing.T) {
 	}
 }
 
+func TestAppendDomainEventRejectsRawWebhookTargetWithoutSnapshot(t *testing.T) {
+	db := openAgentNativeTestDB(t)
+	service := NewAgentNativeService(db)
+	ctx := testProjectOperationContext(
+		t,
+		db,
+		models.SystemActor("raw-webhook-target-test"),
+	)
+	event, err := service.createDomainEvent(
+		t,
+		ctx,
+		DomainEventInput{
+			Type:            "io.chronodesk.ticket.test.v1",
+			Subject:         "ticket/1",
+			Actor:           models.SystemActor("raw-webhook-target-test"),
+			ResourceVersion: 1,
+			Data:            map[string]any{"ticket_id": 1},
+		},
+		[]OutboxTarget{{
+			Type:        "webhook",
+			ID:          "raw-destination",
+			MaxAttempts: 2,
+		}},
+	)
+	if err == nil || event != nil ||
+		!strings.Contains(err.Error(), "snapshot") {
+		t.Fatalf(
+			"raw webhook target returned event=%+v err=%v, want snapshot rejection",
+			event,
+			err,
+		)
+	}
+	var events, deliveries, snapshots int64
+	if err := db.Model(&models.DomainEvent{}).Count(&events).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.OutboxDelivery{}).
+		Count(&deliveries).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.WebhookDeliverySnapshot{}).
+		Count(&snapshots).Error; err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 || deliveries != 0 || snapshots != 0 {
+		t.Fatalf(
+			"raw webhook target partially committed events=%d deliveries=%d snapshots=%d",
+			events,
+			deliveries,
+			snapshots,
+		)
+	}
+}
+
+func TestConfiguredWebhookFanoutUsesOneTransactionClock(t *testing.T) {
+	db := openAgentNativeTestDB(t)
+	user := seedActorUser(t, db, "fanout-clock")
+	actor := models.SystemActor("fanout-clock")
+	ctx := testProjectOperationContext(t, db, actor)
+	scope, err := RequireProjectScope(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := models.WebhookConfig{
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		Name:           "fanout-clock",
+		Provider:       models.WebhookProviderCustom,
+		WebhookURL:     "https://fanout-clock.example.test/events",
+		Status:         models.WebhookStatusActive,
+		EnabledEventsObj: []models.WebhookEventType{
+			models.WebhookEventTicketCreated,
+		},
+		CreatedBy: user.ID,
+	}
+	if err := db.Create(&config).Error; err != nil {
+		t.Fatal(err)
+	}
+	txNow := time.Date(
+		2026,
+		8,
+		10,
+		12,
+		34,
+		56,
+		987654321,
+		time.UTC,
+	)
+	var clockCalls atomic.Int32
+	service := NewAgentNativeService(db, AgentNativeOptions{
+		DefaultOutboxTargets: []OutboxTarget{{
+			Type: "webhook",
+			ID:   "configured",
+		}},
+		Now: func() time.Time {
+			clockCalls.Add(1)
+			return txNow
+		},
+	})
+	event, err := service.createDomainEvent(
+		t,
+		ctx,
+		DomainEventInput{
+			Type:            "io.chronodesk.ticket.created.v1",
+			Subject:         "ticket/1",
+			Actor:           actor,
+			ResourceVersion: 1,
+			Data:            map[string]any{"ticket_id": 1},
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("append configured webhook event: %v", err)
+	}
+	if clockCalls.Load() != 1 {
+		t.Fatalf("transaction clock called %d times, want 1", clockCalls.Load())
+	}
+	var snapshot models.WebhookDeliverySnapshot
+	if err := db.Where("event_id = ?", event.ID).Take(&snapshot).Error; err != nil {
+		t.Fatal(err)
+	}
+	var delivery models.OutboxDelivery
+	if err := db.Where(
+		"event_id = ? AND destination_type = ?",
+		event.ID,
+		"webhook",
+	).Take(&delivery).Error; err != nil {
+		t.Fatal(err)
+	}
+	wantDeadline := txNow.Add(models.WebhookDeliveryCredentialLifetime)
+	if !event.Time.Equal(txNow) ||
+		!delivery.NextAttemptAt.Equal(txNow) ||
+		delivery.ExpiresAt == nil ||
+		!delivery.ExpiresAt.Equal(wantDeadline) ||
+		!delivery.ExpiresAt.Equal(snapshot.CredentialExpiresAt) {
+		t.Fatalf(
+			"transaction clock drifted event=%s next=%s snapshot=%s delivery=%v",
+			event.Time,
+			delivery.NextAttemptAt,
+			snapshot.CredentialExpiresAt,
+			delivery.ExpiresAt,
+		)
+	}
+}
+
+func TestNonWebhookOutboxDeliveryKeepsNullableDeadline(t *testing.T) {
+	db := openAgentNativeTestDB(t)
+	service := NewAgentNativeService(db)
+	event, err := service.createDomainEvent(
+		t,
+		context.Background(),
+		DomainEventInput{
+			Type:            "io.chronodesk.ticket.test.v1",
+			Subject:         "ticket/1",
+			Actor:           models.SystemActor("nullable-deadline"),
+			ResourceVersion: 1,
+			Data:            map[string]any{"ticket_id": 1},
+		},
+		[]OutboxTarget{{
+			Type: "test_delivery",
+			ID:   "nullable-deadline",
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var delivery models.OutboxDelivery
+	if err := db.Where("event_id = ?", event.ID).Take(&delivery).Error; err != nil {
+		t.Fatal(err)
+	}
+	if delivery.ExpiresAt != nil || delivery.ExpiredAt != nil {
+		t.Fatalf("non-webhook delivery acquired a deadline: %+v", delivery)
+	}
+}
+
+func TestConfiguredWebhookAppendFailuresRollBackWholeIntent(t *testing.T) {
+	for _, failedTable := range []string{
+		"outbox_deliveries",
+		"webhook_delivery_snapshots",
+	} {
+		t.Run(failedTable, func(t *testing.T) {
+			db := openAgentNativeTestDB(t)
+			user := seedActorUser(t, db, "append-"+failedTable)
+			actor := models.SystemActor("append-" + failedTable)
+			ctx := testProjectOperationContext(t, db, actor)
+			scope, err := RequireProjectScope(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			config := models.WebhookConfig{
+				OrganizationID: scope.OrganizationID,
+				ProjectID:      scope.ProjectID,
+				Name:           "append failure",
+				Provider:       models.WebhookProviderCustom,
+				WebhookURL:     "https://append-failure.example.test/events",
+				Status:         models.WebhookStatusActive,
+				EnabledEventsObj: []models.WebhookEventType{
+					models.WebhookEventTicketCreated,
+				},
+				CreatedBy: user.ID,
+			}
+			if err := db.Create(&config).Error; err != nil {
+				t.Fatal(err)
+			}
+			callbackName := "test:fail_" + failedTable
+			if err := db.Callback().Create().Before("gorm:create").Register(
+				callbackName,
+				func(tx *gorm.DB) {
+					if tx.Statement != nil &&
+						tx.Statement.Table == failedTable {
+						_ = tx.AddError(errors.New("injected append failure"))
+					}
+				},
+			); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_ = db.Callback().Create().Remove(callbackName)
+			})
+			service := NewAgentNativeService(db, AgentNativeOptions{
+				DefaultOutboxTargets: []OutboxTarget{{
+					Type: "webhook",
+					ID:   "configured",
+				}},
+			})
+			event, err := service.createDomainEvent(
+				t,
+				ctx,
+				DomainEventInput{
+					Type:            "io.chronodesk.ticket.created.v1",
+					Subject:         "ticket/1",
+					Actor:           actor,
+					ResourceVersion: 1,
+					Data:            map[string]any{"ticket_id": 1},
+				},
+				nil,
+			)
+			if err == nil || event != nil {
+				t.Fatalf(
+					"injected %s failure returned event=%+v err=%v",
+					failedTable,
+					event,
+					err,
+				)
+			}
+			for name, model := range map[string]any{
+				"events":     &models.DomainEvent{},
+				"deliveries": &models.OutboxDelivery{},
+				"snapshots":  &models.WebhookDeliverySnapshot{},
+			} {
+				var count int64
+				if err := db.Model(model).Count(&count).Error; err != nil {
+					t.Fatalf("count %s: %v", name, err)
+				}
+				if count != 0 {
+					t.Fatalf(
+						"injected %s failure committed %d %s",
+						failedTable,
+						count,
+						name,
+					)
+				}
+			}
+		})
+	}
+}
+
 func TestAppendDomainEventPersistsAuditLedgerInSameTransaction(t *testing.T) {
 	db := openAgentNativeTestDB(t)
 	ledger, err := NewAuditLedgerService(db)
@@ -1297,11 +1565,13 @@ func TestAppendDomainEventPersistsAuditLedgerInSameTransaction(t *testing.T) {
 func TestServicePrincipalWebhookFanoutRequiresSeparateExplicitPolicy(t *testing.T) {
 	db := openAgentNativeTestDB(t)
 	user := seedActorUser(t, db, "external-notification")
+	now := time.Date(2026, 8, 10, 10, 0, 0, 0, time.UTC)
 	service := NewAgentNativeService(db, AgentNativeOptions{
 		DefaultOutboxTargets: []OutboxTarget{
 			{Type: "event_stream", ID: "default"},
 			{Type: "webhook", ID: "configured"},
 		},
+		Now: func() time.Time { return now },
 	})
 	principal := createNativePrincipal(
 		t,
@@ -1410,6 +1680,17 @@ func TestServicePrincipalWebhookFanoutRequiresSeparateExplicitPolicy(t *testing.
 		delivery.MaxAttempts != config.RetryCount+1 {
 		t.Fatalf("webhook delivery did not bind immutable snapshot: %+v", delivery)
 	}
+	wantDeadline := now.Add(models.WebhookDeliveryCredentialLifetime)
+	if delivery.ExpiresAt == nil ||
+		!delivery.ExpiresAt.Equal(snapshot.CredentialExpiresAt) ||
+		!snapshot.CredentialExpiresAt.Equal(wantDeadline) {
+		t.Fatalf(
+			"configured fan-out deadline mismatch: snapshot=%s delivery=%v want=%s",
+			snapshot.CredentialExpiresAt,
+			delivery.ExpiresAt,
+			wantDeadline,
+		)
+	}
 }
 
 func TestCloudEventWireUsesCompliantScalarExtensions(t *testing.T) {
@@ -1491,8 +1772,8 @@ func TestProcessOutboxBatchStartsIndependentDeliveriesConcurrently(t *testing.T)
 		ResourceVersion: 1,
 		Data:            map[string]any{"ticket_id": 1},
 	}, []OutboxTarget{
-		{Type: "webhook", ID: "slow", MaxAttempts: 2},
-		{Type: "webhook", ID: "fast", MaxAttempts: 2},
+		{Type: "test_delivery", ID: "slow", MaxAttempts: 2},
+		{Type: "test_delivery", ID: "fast", MaxAttempts: 2},
 	})
 	if err != nil {
 		t.Fatalf("create event: %v", err)

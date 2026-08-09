@@ -146,7 +146,21 @@ func migrationDSNFromEnvironment() string {
 func dropChronoDeskTables(db *gorm.DB) error {
 	// 仅包含 ChronoDesk 自有表，避免误删同一 schema 中的其他应用数据。
 	// CASCADE 负责外键顺序，表名是编译期常量而非用户输入。
-	tables := []string{
+	tables := dropChronoDeskTableNames()
+	return db.Transaction(func(tx *gorm.DB) error {
+		for _, table := range tables {
+			if err := tx.Exec(
+				fmt.Sprintf(`DROP TABLE IF EXISTS "%s" CASCADE`, table),
+			).Error; err != nil {
+				return fmt.Errorf("drop %s: %w", table, err)
+			}
+		}
+		return nil
+	})
+}
+
+func dropChronoDeskTableNames() []string {
+	return []string{
 		"agent_push_notification_configs",
 		"agent_task_events",
 		"agent_task_status_history",
@@ -154,6 +168,7 @@ func dropChronoDeskTables(db *gorm.DB) error {
 		"agent_messages",
 		"agent_tasks",
 		"agent_admin_resource_versions",
+		"webhook_delivery_snapshots",
 		"outbox_deliveries",
 		"domain_events",
 		"ticket_leases",
@@ -193,14 +208,4 @@ func dropChronoDeskTables(db *gorm.DB) error {
 		"categories",
 		"users",
 	}
-	return db.Transaction(func(tx *gorm.DB) error {
-		for _, table := range tables {
-			if err := tx.Exec(
-				fmt.Sprintf(`DROP TABLE IF EXISTS "%s" CASCADE`, table),
-			).Error; err != nil {
-				return fmt.Errorf("drop %s: %w", table, err)
-			}
-		}
-		return nil
-	})
 }

@@ -35,6 +35,72 @@ const (
 	WebhookStatusError    WebhookStatus = "error"    // 错误状态
 )
 
+const WebhookDeliveryCredentialLifetime = 7 * 24 * time.Hour
+
+const WebhookDeliverySnapshotDestinationPrefix = "snapshot:"
+
+type WebhookCredentialShredReason string
+
+const (
+	WebhookCredentialShredReasonSucceeded WebhookCredentialShredReason = "succeeded"
+	WebhookCredentialShredReasonExpired   WebhookCredentialShredReason = "expired"
+	WebhookCredentialShredReasonRevoked   WebhookCredentialShredReason = "revoked"
+)
+
+func (reason WebhookCredentialShredReason) IsValid() bool {
+	switch reason {
+	case WebhookCredentialShredReasonSucceeded,
+		WebhookCredentialShredReasonExpired,
+		WebhookCredentialShredReasonRevoked:
+		return true
+	default:
+		return false
+	}
+}
+
+func WebhookDeliverySnapshotDestinationID(
+	snapshotID string,
+) (string, error) {
+	canonicalID, err := ParseWebhookDeliverySnapshotID(snapshotID)
+	if err != nil {
+		return "", err
+	}
+	return WebhookDeliverySnapshotDestinationPrefix + canonicalID, nil
+}
+
+func ParseWebhookDeliverySnapshotDestinationID(
+	destinationID string,
+) (string, error) {
+	if !strings.HasPrefix(
+		destinationID,
+		WebhookDeliverySnapshotDestinationPrefix,
+	) {
+		return "", fmt.Errorf(
+			"unsupported webhook Outbox destination %q",
+			destinationID,
+		)
+	}
+	return ParseWebhookDeliverySnapshotID(
+		strings.TrimPrefix(
+			destinationID,
+			WebhookDeliverySnapshotDestinationPrefix,
+		),
+	)
+}
+
+func ParseWebhookDeliverySnapshotID(snapshotID string) (string, error) {
+	parsed, err := uuid.Parse(snapshotID)
+	if err != nil ||
+		parsed.String() != snapshotID ||
+		parsed.Version() != 7 {
+		return "", fmt.Errorf(
+			"invalid webhook delivery snapshot id %q",
+			snapshotID,
+		)
+	}
+	return snapshotID, nil
+}
+
 // WebhookEventType 事件类型枚举
 type WebhookEventType string
 
@@ -220,7 +286,7 @@ type WebhookDeliverySnapshot struct {
 	CreatedAt time.Time `json:"created_at" gorm:"autoCreateTime;<-:create"`
 
 	OrganizationID  uint      `json:"organization_id" gorm:"not null;index;<-:create"`
-	ProjectID       uint      `json:"project_id" gorm:"not null;index;<-:create"`
+	ProjectID       uint      `json:"project_id" gorm:"not null;index;<-:create;check:chk_webhook_snapshot_scope,organization_id > 0 AND project_id > 0 AND event_id <> ''"`
 	ConfigID        uint      `json:"config_id" gorm:"not null;index;uniqueIndex:idx_webhook_snapshot_event_config,priority:2;<-:create"`
 	EventID         string    `json:"event_id" gorm:"size:64;not null;index;uniqueIndex:idx_webhook_snapshot_event_config,priority:1;<-:create"`
 	ConfigUpdatedAt time.Time `json:"config_updated_at" gorm:"not null;<-:create"`
@@ -228,10 +294,13 @@ type WebhookDeliverySnapshot struct {
 	Provider   WebhookProvider `json:"provider" gorm:"size:20;not null;<-:create"`
 	WebhookURL string          `json:"webhook_url" gorm:"size:500;not null;<-:create"`
 
-	Secret                  string     `json:"-" gorm:"size:2048;<-:create"`
-	PreviousSecret          string     `json:"-" gorm:"size:2048;<-:create"`
-	PreviousSecretExpiresAt *time.Time `json:"-" gorm:"<-:create"`
-	AccessToken             string     `json:"-" gorm:"size:2048;<-:create"`
+	Secret                  string                        `json:"-" gorm:"size:2048;<-:create"`
+	PreviousSecret          string                        `json:"-" gorm:"size:2048;<-:create"`
+	PreviousSecretExpiresAt *time.Time                    `json:"-" gorm:"<-:create"`
+	AccessToken             string                        `json:"-" gorm:"size:2048;<-:create"`
+	CredentialExpiresAt     time.Time                     `json:"credential_expires_at" gorm:"not null;index;<-:create"`
+	CredentialShreddedAt    *time.Time                    `json:"credential_shredded_at,omitempty" gorm:"index;<-:create;check:chk_webhook_snapshot_shred_state,(credential_shredded_at IS NULL AND credential_shred_reason IS NULL) OR (credential_shredded_at IS NOT NULL AND credential_shred_reason IS NOT NULL AND secret = '' AND previous_secret = '' AND access_token = '')"`
+	CredentialShredReason   *WebhookCredentialShredReason `json:"credential_shred_reason,omitempty" gorm:"size:20;<-:create;check:chk_webhook_snapshot_shred_reason,credential_shred_reason IS NULL OR credential_shred_reason = 'succeeded' OR credential_shred_reason = 'expired' OR credential_shred_reason = 'revoked'"`
 
 	EnabledEvents   string `json:"-" gorm:"type:text;not null;<-:create"`
 	MessageTemplate string `json:"-" gorm:"type:text;<-:create"`
@@ -254,17 +323,62 @@ func (snapshot *WebhookDeliverySnapshot) BeforeCreate(_ *gorm.DB) error {
 		snapshot.ConfigID == 0 || strings.TrimSpace(snapshot.EventID) == "" {
 		return errors.New("webhook delivery snapshot scope and source are required")
 	}
-	if strings.TrimSpace(snapshot.ID) == "" {
-		generated, err := uuid.NewV7()
-		if err != nil {
-			return fmt.Errorf("generate webhook delivery snapshot id: %w", err)
-		}
-		snapshot.ID = generated.String()
+	if err := snapshot.ValidateCredentialState(); err != nil {
+		return err
 	}
-	if err := uuid.Validate(snapshot.ID); err != nil {
-		return fmt.Errorf("invalid webhook delivery snapshot id: %w", err)
+	if strings.TrimSpace(snapshot.ID) == "" {
+		generated, err := newWebhookDeliverySnapshotID()
+		if err != nil {
+			return err
+		}
+		snapshot.ID = generated
+	}
+	if _, err := ParseWebhookDeliverySnapshotID(snapshot.ID); err != nil {
+		return err
 	}
 	return nil
+}
+
+func (snapshot WebhookDeliverySnapshot) ValidateCredentialState() error {
+	if snapshot.CredentialExpiresAt.IsZero() {
+		return errors.New(
+			"webhook delivery snapshot credential deadline is required",
+		)
+	}
+	hasShreddedAt := snapshot.CredentialShreddedAt != nil
+	hasShredReason := snapshot.CredentialShredReason != nil
+	if hasShreddedAt != hasShredReason {
+		return errors.New(
+			"webhook delivery snapshot shred timestamp and reason must be set together",
+		)
+	}
+	if !hasShredReason {
+		return nil
+	}
+	if !snapshot.CredentialShredReason.IsValid() {
+		return errors.New(
+			"webhook delivery snapshot credential shred reason is invalid",
+		)
+	}
+	if snapshot.Secret != "" ||
+		snapshot.PreviousSecret != "" ||
+		snapshot.AccessToken != "" {
+		return errors.New(
+			"shredded webhook delivery snapshot retains a credential envelope",
+		)
+	}
+	return nil
+}
+
+func newWebhookDeliverySnapshotID() (string, error) {
+	generated, err := uuid.NewV7()
+	if err != nil {
+		return "", fmt.Errorf(
+			"generate webhook delivery snapshot id: %w",
+			err,
+		)
+	}
+	return generated.String(), nil
 }
 
 func (*WebhookDeliverySnapshot) BeforeUpdate(_ *gorm.DB) error {
@@ -278,8 +392,14 @@ func (*WebhookDeliverySnapshot) BeforeDelete(_ *gorm.DB) error {
 func NewWebhookDeliverySnapshot(
 	config WebhookConfig,
 	eventID string,
+	credentialExpiresAt time.Time,
 ) (*WebhookDeliverySnapshot, error) {
-	return newWebhookDeliverySnapshot(config, eventID, false)
+	return newWebhookDeliverySnapshot(
+		config,
+		eventID,
+		credentialExpiresAt,
+		false,
+	)
 }
 
 // NewWebhookTestDeliverySnapshot freezes an explicit operator test for an
@@ -288,13 +408,20 @@ func NewWebhookDeliverySnapshot(
 func NewWebhookTestDeliverySnapshot(
 	config WebhookConfig,
 	eventID string,
+	credentialExpiresAt time.Time,
 ) (*WebhookDeliverySnapshot, error) {
-	return newWebhookDeliverySnapshot(config, eventID, true)
+	return newWebhookDeliverySnapshot(
+		config,
+		eventID,
+		credentialExpiresAt,
+		true,
+	)
 }
 
 func newWebhookDeliverySnapshot(
 	config WebhookConfig,
 	eventID string,
+	credentialExpiresAt time.Time,
 	allowInactive bool,
 ) (*WebhookDeliverySnapshot, error) {
 	if config.ID == 0 || config.OrganizationID == 0 || config.ProjectID == 0 ||
@@ -305,7 +432,17 @@ func newWebhookDeliverySnapshot(
 	if err := config.ValidateSubscriptions(true); err != nil {
 		return nil, err
 	}
+	if credentialExpiresAt.IsZero() {
+		return nil, errors.New(
+			"webhook delivery snapshot credential deadline is required",
+		)
+	}
+	snapshotID, err := newWebhookDeliverySnapshotID()
+	if err != nil {
+		return nil, err
+	}
 	return &WebhookDeliverySnapshot{
+		ID:                      snapshotID,
 		OrganizationID:          config.OrganizationID,
 		ProjectID:               config.ProjectID,
 		ConfigID:                config.ID,
@@ -317,6 +454,7 @@ func newWebhookDeliverySnapshot(
 		PreviousSecret:          config.PreviousSecret,
 		PreviousSecretExpiresAt: config.PreviousSecretExpiresAt,
 		AccessToken:             config.AccessToken,
+		CredentialExpiresAt:     credentialExpiresAt.UTC(),
 		EnabledEvents:           config.EnabledEvents,
 		MessageTemplate:         config.MessageTemplate,
 		MessageFormat:           config.MessageFormat,

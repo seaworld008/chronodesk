@@ -1307,9 +1307,18 @@ func TestCommittedWebhookDeliveriesUseImmutableSnapshots(t *testing.T) {
 		snapshot, exists := snapshotByID[snapshotID]
 		if !exists ||
 			delivery.MaxAttempts != snapshot.RetryCount+1 ||
-			delivery.Status != models.OutboxDeliveryPending {
+			delivery.Status != models.OutboxDeliveryPending ||
+			delivery.ExpiresAt == nil ||
+			!delivery.ExpiresAt.Equal(snapshot.CredentialExpiresAt) ||
+			!snapshot.CredentialExpiresAt.Equal(
+				now.Add(models.WebhookDeliveryCredentialLifetime),
+			) {
 			t.Fatalf("invalid snapshot delivery: %+v", delivery)
 		}
+	}
+	originalDeadlines := make(map[string]time.Time, len(snapshots))
+	for _, snapshot := range snapshots {
+		originalDeadlines[snapshot.ID] = snapshot.CredentialExpiresAt
 	}
 
 	protector := newAgentplatformWebhookTestProtector(t)
@@ -1335,6 +1344,9 @@ func TestCommittedWebhookDeliveriesUseImmutableSnapshots(t *testing.T) {
 			"filter_rules":   `{"transition_statuses":["closed"]}`,
 			"status":         models.WebhookStatusDisabled,
 		}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Delete(&configs[1]).Error; err != nil {
 		t.Fatal(err)
 	}
 	newConfig := models.WebhookConfig{
@@ -1433,8 +1445,28 @@ func TestCommittedWebhookDeliveriesUseImmutableSnapshots(t *testing.T) {
 	}
 	if retained.WebhookURL != firstEndpoint.URL ||
 		retained.EnabledEvents !=
-			`["io.chronodesk.ticket.created.v1"]` {
+			`["io.chronodesk.ticket.created.v1"]` ||
+		!retained.CredentialExpiresAt.Equal(
+			originalDeadlines[retained.ID],
+		) {
 		t.Fatalf("committed snapshot changed after config edit: %+v", retained)
+	}
+	var deletedConfigSnapshot models.WebhookDeliverySnapshot
+	if err := db.First(
+		&deletedConfigSnapshot,
+		"event_id = ? AND config_id = ?",
+		event.ID,
+		configs[1].ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !deletedConfigSnapshot.CredentialExpiresAt.Equal(
+		originalDeadlines[deletedConfigSnapshot.ID],
+	) {
+		t.Fatalf(
+			"committed snapshot deadline changed after config delete: %+v",
+			deletedConfigSnapshot,
+		)
 	}
 	otherProject := models.Project{
 		OrganizationID: scope.OrganizationID,

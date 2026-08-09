@@ -224,6 +224,7 @@ func TestWebhookOutboxAttemptHasHardTimeoutAndNoLegacyRetry(t *testing.T) {
 	snapshot, err := models.NewWebhookDeliverySnapshot(
 		config,
 		event.Metadata["event_id"],
+		time.Now().UTC().Add(models.WebhookDeliveryCredentialLifetime),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -440,6 +441,7 @@ func TestCustomWebhookWithoutSecretFailsClosed(t *testing.T) {
 	snapshot, err := models.NewWebhookDeliverySnapshot(
 		config,
 		event.Metadata["event_id"],
+		time.Now().UTC().Add(models.WebhookDeliveryCredentialLifetime),
 	)
 	if err != nil {
 		t.Fatal(err)

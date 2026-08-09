@@ -115,6 +115,31 @@ func TestWebhookTestCommandCommitsSnapshotEventAndOutboxWithoutHTTP(
 		delivery.MaxAttempts != fixture.config.RetryCount+1 {
 		t.Fatalf("unexpected webhook Outbox delivery: %+v", delivery)
 	}
+	if delivery.ExpiresAt == nil ||
+		!delivery.ExpiresAt.Equal(snapshot.CredentialExpiresAt) ||
+		!snapshot.CredentialExpiresAt.Equal(
+			event.Time.Add(models.WebhookDeliveryCredentialLifetime),
+		) {
+		t.Fatalf(
+			"Human webhook test deadline mismatch: event=%s snapshot=%s delivery=%v",
+			event.Time,
+			snapshot.CredentialExpiresAt,
+			delivery.ExpiresAt,
+		)
+	}
+	if fixture.clockCalls.Load() != 1 {
+		t.Fatalf(
+			"Human webhook test transaction clock called %d times, want 1",
+			fixture.clockCalls.Load(),
+		)
+	}
+	if !event.Time.Equal(fixture.txNow) {
+		t.Fatalf(
+			"Human webhook test event time=%s, want %s",
+			event.Time,
+			fixture.txNow,
+		)
+	}
 }
 
 func TestWebhookTestCommandAllowsInactiveWithoutEnablingOrdinaryDelivery(
@@ -146,6 +171,7 @@ func TestWebhookTestCommandAllowsInactiveWithoutEnablingOrdinaryDelivery(
 	if _, err := models.NewWebhookDeliverySnapshot(
 		fixture.config,
 		"ordinary-event",
+		time.Now().UTC().Add(models.WebhookDeliveryCredentialLifetime),
 	); err == nil {
 		t.Fatal("ordinary snapshot accepted inactive webhook")
 	}
@@ -264,6 +290,8 @@ type notificationWebhookTestCommandFixture struct {
 	config       models.WebhookConfig
 	ctx          context.Context
 	httpAttempts *atomic.Int32
+	clockCalls   *atomic.Int32
+	txNow        time.Time
 }
 
 func newNotificationWebhookTestCommandFixture(
@@ -289,10 +317,24 @@ func newNotificationWebhookTestCommandFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	native := NewAgentNativeService(
-		db,
-		AgentNativeOptions{AuditLedger: auditLedger},
+	txNow := time.Date(
+		2026,
+		8,
+		10,
+		14,
+		15,
+		16,
+		987654321,
+		time.UTC,
 	)
+	clockCalls := &atomic.Int32{}
+	native := NewAgentNativeService(db, AgentNativeOptions{
+		AuditLedger: auditLedger,
+		Now: func() time.Time {
+			clockCalls.Add(1)
+			return txNow
+		},
+	})
 	httpAttempts := &atomic.Int32{}
 	service := NewNotificationServiceWithClientFactory(
 		db,
@@ -337,5 +379,7 @@ func newNotificationWebhookTestCommandFixture(
 			models.HumanActor(user.ID),
 		),
 		httpAttempts: httpAttempts,
+		clockCalls:   clockCalls,
+		txNow:        txNow,
 	}
 }

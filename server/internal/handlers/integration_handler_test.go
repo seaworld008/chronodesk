@@ -421,7 +421,7 @@ func TestIntegrationInboxAndReceiptResponsesAreRedacted(t *testing.T) {
 		OrganizationID:  environment.project.OrganizationID,
 		ProjectID:       environment.project.ID,
 		EventID:         event.ID,
-		DestinationType: "webhook",
+		DestinationType: "connector_test",
 		DestinationID:   "vault://outbox-destination-secret",
 		Status:          models.OutboxDeliveryFailed,
 		Attempts:        1,

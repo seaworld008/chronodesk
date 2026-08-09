@@ -247,7 +247,12 @@ func TestWebhookDeliverySnapshotIsAppendOnly(t *testing.T) {
 	if err := db.Create(&config).Error; err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := NewWebhookDeliverySnapshot(config, "event-append-only")
+	deadline := time.Date(2026, 8, 17, 9, 30, 0, 0, time.UTC)
+	snapshot, err := NewWebhookDeliverySnapshot(
+		config,
+		"event-append-only",
+		deadline,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +279,166 @@ func TestWebhookDeliverySnapshotIsAppendOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if retained.WebhookURL != config.WebhookURL ||
-		retained.EventID != "event-append-only" {
+		retained.EventID != "event-append-only" ||
+		!retained.CredentialExpiresAt.Equal(deadline) {
 		t.Fatalf("immutable snapshot changed: %+v", retained)
+	}
+}
+
+func TestWebhookDeliverySnapshotRequiresFixedCredentialDeadline(t *testing.T) {
+	config := WebhookConfig{
+		ID:             7,
+		OrganizationID: 11,
+		ProjectID:      22,
+		UpdatedAt:      time.Date(2026, 8, 10, 9, 0, 0, 0, time.UTC),
+		Provider:       WebhookProviderCustom,
+		WebhookURL:     "https://webhook.example.test/events",
+		Status:         WebhookStatusActive,
+		EnabledEventsObj: []WebhookEventType{
+			WebhookEventTicketCreated,
+		},
+	}
+	deadline := time.Date(2026, 8, 17, 9, 0, 0, 0, time.UTC)
+	snapshot, err := NewWebhookDeliverySnapshot(
+		config,
+		"00000000-0000-7000-8000-000000000001",
+		deadline,
+	)
+	if err != nil {
+		t.Fatalf("create snapshot: %v", err)
+	}
+	if !snapshot.CredentialExpiresAt.Equal(deadline) {
+		t.Fatalf(
+			"credential deadline = %s, want %s",
+			snapshot.CredentialExpiresAt,
+			deadline,
+		)
+	}
+	if _, err := NewWebhookDeliverySnapshot(
+		config,
+		"00000000-0000-7000-8000-000000000002",
+		time.Time{},
+	); err == nil {
+		t.Fatal("snapshot constructor accepted an empty credential deadline")
+	}
+}
+
+func TestWebhookDeliverySnapshotRejectsInvalidShredState(t *testing.T) {
+	db, err := gorm.Open(
+		sqlite.Open(fmt.Sprintf(
+			"file:%s?mode=memory&cache=shared",
+			t.Name(),
+		)),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&WebhookDeliverySnapshot{}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Date(2026, 8, 17, 9, 0, 0, 0, time.UTC)
+	shreddedAt := time.Date(2026, 8, 11, 9, 0, 0, 0, time.UTC)
+	base := WebhookDeliverySnapshot{
+		OrganizationID:      11,
+		ProjectID:           22,
+		ConfigID:            7,
+		EventID:             "00000000-0000-7000-8000-000000000010",
+		ConfigUpdatedAt:     time.Date(2026, 8, 10, 9, 0, 0, 0, time.UTC),
+		Provider:            WebhookProviderCustom,
+		WebhookURL:          "https://webhook.example.test/events",
+		EnabledEvents:       `["io.chronodesk.ticket.created.v1"]`,
+		CredentialExpiresAt: deadline,
+	}
+	tests := []struct {
+		name   string
+		mutate func(*WebhookDeliverySnapshot)
+	}{
+		{
+			name: "unknown reason",
+			mutate: func(snapshot *WebhookDeliverySnapshot) {
+				reason := WebhookCredentialShredReason("unknown")
+				snapshot.CredentialShreddedAt = &shreddedAt
+				snapshot.CredentialShredReason = &reason
+			},
+		},
+		{
+			name: "timestamp without reason",
+			mutate: func(snapshot *WebhookDeliverySnapshot) {
+				snapshot.CredentialShreddedAt = &shreddedAt
+			},
+		},
+		{
+			name: "reason without timestamp",
+			mutate: func(snapshot *WebhookDeliverySnapshot) {
+				reason :=
+					WebhookCredentialShredReasonSucceeded
+				snapshot.CredentialShredReason = &reason
+			},
+		},
+		{
+			name: "shredded secret envelope",
+			mutate: func(snapshot *WebhookDeliverySnapshot) {
+				reason := WebhookCredentialShredReasonExpired
+				snapshot.CredentialShreddedAt = &shreddedAt
+				snapshot.CredentialShredReason = &reason
+				snapshot.Secret = "sealed-secret"
+			},
+		},
+		{
+			name: "shredded previous secret envelope",
+			mutate: func(snapshot *WebhookDeliverySnapshot) {
+				reason := WebhookCredentialShredReasonRevoked
+				snapshot.CredentialShreddedAt = &shreddedAt
+				snapshot.CredentialShredReason = &reason
+				snapshot.PreviousSecret = "sealed-previous-secret"
+			},
+		},
+		{
+			name: "shredded access token envelope",
+			mutate: func(snapshot *WebhookDeliverySnapshot) {
+				reason := WebhookCredentialShredReasonSucceeded
+				snapshot.CredentialShreddedAt = &shreddedAt
+				snapshot.CredentialShredReason = &reason
+				snapshot.AccessToken = "sealed-access-token"
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := base
+			snapshot.ID = ""
+			test.mutate(&snapshot)
+			if err := db.Create(&snapshot).Error; err == nil {
+				t.Fatalf("invalid shredded snapshot committed: %+v", snapshot)
+			}
+		})
+	}
+
+	valid := base
+	valid.EventID = "00000000-0000-7000-8000-000000000011"
+	validReason := WebhookCredentialShredReasonSucceeded
+	valid.CredentialShreddedAt = &shreddedAt
+	valid.CredentialShredReason = &validReason
+	if err := db.Create(&valid).Error; err != nil {
+		t.Fatalf("valid shredded snapshot rejected: %v", err)
+	}
+	updateErr := db.Model(&valid).
+		UpdateColumn("secret", "sealed-revived-secret").Error
+	if updateErr != nil && !strings.Contains(updateErr.Error(), "immutable") {
+		t.Fatalf(
+			"shredded snapshot credential revival error = %v",
+			updateErr,
+		)
+	}
+	var stillShredded WebhookDeliverySnapshot
+	if err := db.Where("id = ?", valid.ID).Take(&stillShredded).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stillShredded.Secret != "" {
+		t.Fatalf(
+			"ordinary ORM revived shredded snapshot secret: %+v",
+			stillShredded,
+		)
 	}
 }

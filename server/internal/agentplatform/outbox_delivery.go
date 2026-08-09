@@ -618,7 +618,7 @@ func queueNamesFromCloudEvent(event services.CloudEventEnvelope) []string {
 	return result
 }
 
-const webhookSnapshotPrefix = "snapshot:"
+const webhookSnapshotPrefix = models.WebhookDeliverySnapshotDestinationPrefix
 
 func (d *NativeOutboxDeliverer) deliverWebhook(
 	ctx context.Context,
@@ -706,21 +706,7 @@ func notificationEventFromCloudEvent(
 func parseWebhookSnapshotDestinationID(
 	destinationID string,
 ) (string, error) {
-	if !strings.HasPrefix(destinationID, webhookSnapshotPrefix) {
-		return "", fmt.Errorf(
-			"unsupported webhook Outbox destination %q",
-			destinationID,
-		)
-	}
-	value := strings.TrimPrefix(destinationID, webhookSnapshotPrefix)
-	parsed, err := uuid.Parse(value)
-	if err != nil || parsed.String() != value || parsed.Version() != 7 {
-		return "", fmt.Errorf(
-			"invalid webhook Outbox snapshot destination %q",
-			destinationID,
-		)
-	}
-	return value, nil
+	return models.ParseWebhookDeliverySnapshotDestinationID(destinationID)
 }
 
 func (d *NativeOutboxDeliverer) deliverA2APush(

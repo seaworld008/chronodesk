@@ -1388,7 +1388,10 @@ func (ns *NotificationService) TestWebhook(
 						)
 					}
 
-					now := time.Now().UTC()
+					now := ns.webhookTestEvents.now().UTC()
+					deadline := now.Add(
+						models.WebhookDeliveryCredentialLifetime,
+					)
 					operationID := newNativeID()
 					eventID := newNativeID()
 					configurationVersion :=
@@ -1397,6 +1400,7 @@ func (ns *NotificationService) TestWebhook(
 						models.NewWebhookTestDeliverySnapshot(
 							config,
 							eventID,
+							deadline,
 						)
 					if snapshotErr != nil {
 						return fmt.Errorf(
@@ -1404,14 +1408,6 @@ func (ns *NotificationService) TestWebhook(
 							snapshotErr,
 						)
 					}
-					if createErr := tx.WithContext(scopedContext).
-						Create(snapshot).Error; createErr != nil {
-						return fmt.Errorf(
-							"create webhook test delivery snapshot: %w",
-							createErr,
-						)
-					}
-
 					maxAttempts := config.RetryCount + 1
 					if maxAttempts < 1 {
 						maxAttempts = 1
@@ -1420,7 +1416,7 @@ func (ns *NotificationService) TestWebhook(
 						maxAttempts = 11
 					}
 					event, appendErr :=
-						ns.webhookTestEvents.AppendDomainEventTx(
+						ns.webhookTestEvents.appendDomainEventTxAt(
 							scopedContext,
 							tx,
 							DomainEventInput{
@@ -1444,11 +1440,12 @@ func (ns *NotificationService) TestWebhook(
 								ConfigurationVersion: configurationVersion,
 							},
 							[]OutboxTarget{{
-								Type: "webhook",
-								ID: webhookSnapshotDestinationPrefix +
-									snapshot.ID,
-								MaxAttempts: maxAttempts,
+								Type:            "webhook",
+								ID:              webhookSnapshotDestinationPrefix + snapshot.ID,
+								MaxAttempts:     maxAttempts,
+								webhookSnapshot: snapshot,
 							}},
+							now,
 						)
 					if appendErr != nil {
 						return fmt.Errorf(
@@ -1460,7 +1457,11 @@ func (ns *NotificationService) TestWebhook(
 						len(event.Deliveries) != 1 ||
 						event.Deliveries[0].DestinationType != "webhook" ||
 						event.Deliveries[0].DestinationID !=
-							webhookSnapshotDestinationPrefix+snapshot.ID {
+							webhookSnapshotDestinationPrefix+snapshot.ID ||
+						event.Deliveries[0].ExpiresAt == nil ||
+						!event.Deliveries[0].ExpiresAt.Equal(
+							snapshot.CredentialExpiresAt,
+						) {
 						return errors.New(
 							"webhook test delivery intent did not create one snapshot Outbox delivery",
 						)

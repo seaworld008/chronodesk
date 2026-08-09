@@ -69,6 +69,9 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 		if err := ValidateCategoryScopeContract(db); err != nil {
 			return err
 		}
+		if err := validateWebhookCredentialLifetimeCatalog(db); err != nil {
+			return err
+		}
 		return ValidateProjectRLSReadiness(db)
 	}
 
@@ -118,6 +121,9 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 		return err
 	}
 	if err := ValidateCategoryScopeContract(db); err != nil {
+		return err
+	}
+	if err := validateWebhookCredentialLifetimeCatalog(db); err != nil {
 		return err
 	}
 	return ValidateProjectRLSReadiness(db)
@@ -302,6 +308,12 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 		{&models.OutboxDelivery{}, "outbox_deliveries", []string{
 			"event_id", "destination_type", "destination_id", "status",
 			"attempts", "next_attempt_at", "locked_at", "locked_by",
+			"expires_at", "expired_at",
+		}},
+		{&models.WebhookDeliverySnapshot{}, "webhook_delivery_snapshots", []string{
+			"id", "organization_id", "project_id", "config_id", "event_id",
+			"credential_expires_at", "credential_shredded_at",
+			"credential_shred_reason",
 		}},
 		{&models.AuditChainHead{}, "audit_chain_heads", []string{
 			"organization_id", "project_id", "last_sequence", "last_hash",
@@ -1209,6 +1221,12 @@ func runMigrationsFromModelLocked(
 	if err := db.AutoMigrate(&models.SchemaMigrationCheckpoint{}); err != nil {
 		return fmt.Errorf("schema migration checkpoint setup failed: %w", err)
 	}
+	if err := PrepareWebhookSnapshotCredentialLifetimeContract(db); err != nil {
+		return fmt.Errorf(
+			"webhook credential lifetime preparation failed: %w",
+			err,
+		)
+	}
 
 	// 5. Category scope has a dedicated evidence-driven cutover. Stage only a
 	// retryable zero sentinel before the canonical NOT NULL model is parsed.
@@ -1364,6 +1382,12 @@ func runMigrationsFromModelLocked(
 	// ENABLE/FORCE 是所有写路径切换到 scoped transaction 后的显式部署步骤。
 	if err := MigrateProjectRLS(db); err != nil {
 		return fmt.Errorf("project RLS migration failed: %w", err)
+	}
+	if err := MigrateWebhookSnapshotCredentialLifetimeContract(db); err != nil {
+		return fmt.Errorf(
+			"webhook credential lifetime migration failed: %w",
+			err,
+		)
 	}
 
 	// 19. 所有其他持久迁移成功后，最后切换平台角色、删除旧 role

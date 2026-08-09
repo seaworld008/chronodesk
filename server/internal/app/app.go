@@ -258,6 +258,19 @@ func Run() error {
 	if err := database.ValidateRuntimeSchema(db.DB); err != nil {
 		log.Fatal("Database schema validation failed: ", err)
 	}
+	webhookCredentialValidationContext, cancelWebhookCredentialValidation :=
+		context.WithTimeout(context.Background(), 30*time.Second)
+	if err := database.ValidateWebhookSnapshotCredentialLifetimeRuntimeData(
+		webhookCredentialValidationContext,
+		db.DB,
+	); err != nil {
+		cancelWebhookCredentialValidation()
+		log.Fatal(
+			"Webhook delivery credential data validation failed: ",
+			err,
+		)
+	}
+	cancelWebhookCredentialValidation()
 	secretProtector, err := security.LoadDeploymentKeyring(
 		[]byte(cfg.Agent.CredentialPepper),
 	)

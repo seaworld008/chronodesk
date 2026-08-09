@@ -18,6 +18,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/handlers"
 	"github.com/seaworld008/chronodesk/server/internal/httpcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"github.com/gin-gonic/gin"
@@ -1190,6 +1191,9 @@ func newAdminContractFixture(t *testing.T) *adminContractFixture {
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := scopeddb.Install(db); err != nil {
+		t.Fatalf("install project scope transaction routing: %v", err)
 	}
 	sqlDB, err := db.DB()
 	if err != nil {

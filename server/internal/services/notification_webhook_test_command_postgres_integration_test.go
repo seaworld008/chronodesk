@@ -471,7 +471,16 @@ func assertWebhookPostgresCommittedIntent(
 				delivery.DestinationType != "webhook" ||
 				delivery.DestinationID !=
 					webhookSnapshotDestinationPrefix+snapshot.ID ||
-				delivery.Status != models.OutboxDeliveryPending {
+				delivery.Status != models.OutboxDeliveryPending ||
+				delivery.ExpiresAt == nil ||
+				!delivery.ExpiresAt.Equal(
+					snapshot.CredentialExpiresAt,
+				) ||
+				!snapshot.CredentialExpiresAt.Equal(
+					event.Time.Add(
+						models.WebhookDeliveryCredentialLifetime,
+					),
+				) {
 				return fmt.Errorf("invalid Webhook Outbox delivery: %+v", delivery)
 			}
 			return nil
