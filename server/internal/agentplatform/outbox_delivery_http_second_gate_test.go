@@ -78,7 +78,10 @@ func TestWebhookOutboxSecondGateRejectsShreddedSnapshotBeforeHTTP(
 
 	result := fixture.deliverAttempt(t, deliverer, time.Now().Add(time.Minute))
 	if result.Kind != services.OutboxAttemptKnownFailure ||
-		result.Err == nil {
+		!errors.Is(
+			result.Err,
+			services.ErrWebhookOutboxAttemptRejected,
+		) {
 		t.Fatalf("shredded result = %+v", result)
 	}
 	if clientCreations.Load() != 1 {
@@ -120,7 +123,10 @@ func TestWebhookOutboxFirstGateRejectsMismatchedPairBeforeClientCreation(
 
 	attempt := fixture.deliverAttempt(t, deliverer, time.Now().Add(time.Minute))
 	if attempt.Kind != services.OutboxAttemptKnownFailure ||
-		attempt.Err == nil {
+		!errors.Is(
+			attempt.Err,
+			services.ErrWebhookOutboxAttemptRejected,
+		) {
 		t.Fatalf("mismatched pair result = %+v", attempt)
 	}
 	if clientCreations.Load() != 0 || httpAttempts.Load() != 0 {
@@ -250,14 +256,9 @@ func TestWebhookOutboxRequestAndClientAreBoundedByCredentialDeadline(
 		requestDeadline time.Time
 		httpAttempts    atomic.Int32
 	)
-	deliverer := fixture.deliverer(t, func(
-		_ context.Context,
-		_ *url.URL,
-		timeout time.Duration,
-	) (*http.Client, error) {
-		clientCreatedAt = time.Now()
-		clientTimeout = timeout
-		return &http.Client{Transport: httpSecondGateRoundTripper(
+	sharedClient := &http.Client{
+		Timeout: time.Minute,
+		Transport: httpSecondGateRoundTripper(
 			func(request *http.Request) (*http.Response, error) {
 				httpAttempts.Add(1)
 				var ok bool
@@ -267,7 +268,16 @@ func TestWebhookOutboxRequestAndClientAreBoundedByCredentialDeadline(
 				}
 				return httpSecondGateNoContentResponse(), nil
 			},
-		)}, nil
+		),
+	}
+	deliverer := fixture.deliverer(t, func(
+		_ context.Context,
+		_ *url.URL,
+		timeout time.Duration,
+	) (*http.Client, error) {
+		clientCreatedAt = time.Now()
+		clientTimeout = timeout
+		return sharedClient, nil
 	})
 
 	result := fixture.deliverAttempt(t, deliverer, time.Now().Add(time.Minute))
@@ -276,6 +286,12 @@ func TestWebhookOutboxRequestAndClientAreBoundedByCredentialDeadline(
 	}
 	if httpAttempts.Load() != 1 {
 		t.Fatalf("HTTP attempts = %d, want 1", httpAttempts.Load())
+	}
+	if sharedClient.Timeout != time.Minute {
+		t.Fatalf(
+			"factory shared client timeout mutated to %s",
+			sharedClient.Timeout,
+		)
 	}
 	if requestDeadline.After(fixture.snapshot.CredentialExpiresAt) {
 		t.Fatalf(
@@ -327,7 +343,10 @@ func TestWebhookOutboxDeadlineElapsedAfterClientCreationSkipsHTTP(
 		time.Now().Add(50*time.Millisecond),
 	)
 	if result.Kind != services.OutboxAttemptKnownFailure ||
-		result.Err == nil {
+		!errors.Is(
+			result.Err,
+			services.ErrWebhookOutboxAttemptRejected,
+		) {
 		t.Fatalf("elapsed deadline result = %+v", result)
 	}
 	if clientCreations.Load() != 1 {
@@ -368,12 +387,409 @@ func TestWebhookOutboxSecondGateRejectsNewClaimGeneration(
 
 	result := fixture.deliverAttempt(t, deliverer, time.Now().Add(time.Minute))
 	if result.Kind != services.OutboxAttemptKnownFailure ||
-		result.Err == nil {
+		!errors.Is(
+			result.Err,
+			services.ErrWebhookOutboxAttemptRejected,
+		) {
 		t.Fatalf("stale claim result = %+v", result)
 	}
 	if httpAttempts.Load() != 0 {
 		t.Fatalf("stale claim performed %d HTTP attempts", httpAttempts.Load())
 	}
+}
+
+func TestWebhookOutboxRejectsCallerForgedUnsupportedEventBeforeFinalize(
+	t *testing.T,
+) {
+	fixture := newHTTPSecondGateFixture(t, time.Now().Add(time.Minute))
+	var httpAttempts atomic.Int32
+	deliverer := fixture.deliverer(t, func(
+		context.Context,
+		*url.URL,
+		time.Duration,
+	) (*http.Client, error) {
+		return &http.Client{Transport: httpSecondGateRoundTripper(
+			func(*http.Request) (*http.Response, error) {
+				httpAttempts.Add(1)
+				return httpSecondGateNoContentResponse(), nil
+			},
+		)}, nil
+	})
+	forged := fixture.event
+	forged.Type = "io.chronodesk.unsupported.v1"
+	deadline := time.Now().Add(time.Minute)
+	ctx, cancel := context.WithDeadline(
+		agentplatformTestOutboxWorkerContext(t, fixture.scope),
+		deadline,
+	)
+	result := deliverer.DeliverAttempt(
+		ctx,
+		&fixture.delivery,
+		forged,
+	)
+	cancel()
+	claim, err := services.OutboxClaimRefFromDelivery(&fixture.delivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim.EffectiveDeadline = deadline
+	finalized, finalizeErr := services.NewAgentNativeService(
+		fixture.db,
+	).FinalizeOutboxAttempt(
+		agentplatformTestOutboxWorkerContext(t, fixture.scope),
+		claim,
+		result,
+	)
+	if finalizeErr != nil {
+		t.Fatalf("finalize forged event result: %v", finalizeErr)
+	}
+	if result.Kind != services.OutboxAttemptKnownFailure ||
+		!errors.Is(
+			result.Err,
+			services.ErrWebhookOutboxAttemptRejected,
+		) {
+		t.Fatalf("forged event result = %+v", result)
+	}
+	if finalized.Status == models.OutboxDeliverySucceeded {
+		t.Fatalf("forged event finalized as %q", finalized.Status)
+	}
+	var snapshot models.WebhookDeliverySnapshot
+	if err := fixture.db.Take(
+		&snapshot,
+		"id = ?",
+		fixture.snapshot.ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.CredentialShreddedAt != nil {
+		t.Fatalf("forged event shredded snapshot: %+v", snapshot)
+	}
+	if httpAttempts.Load() != 0 {
+		t.Fatalf("forged event performed %d HTTP attempts", httpAttempts.Load())
+	}
+}
+
+func TestWebhookOutboxConfiguredDeadlineRejectsLateCleanEOF(
+	t *testing.T,
+) {
+	fixture := newHTTPSecondGateFixture(t, time.Now().Add(time.Minute))
+	if err := fixture.db.Table(
+		(models.WebhookDeliverySnapshot{}).TableName(),
+	).Where("id = ?", fixture.snapshot.ID).
+		Update("timeout_seconds", 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	var (
+		httpAttempts    atomic.Int32
+		requestDeadline = make(chan time.Time, 1)
+	)
+	deliverer := fixture.deliverer(t, func(
+		context.Context,
+		*url.URL,
+		time.Duration,
+	) (*http.Client, error) {
+		return &http.Client{Transport: httpSecondGateRoundTripper(
+			func(request *http.Request) (*http.Response, error) {
+				httpAttempts.Add(1)
+				deadline, ok := request.Context().Deadline()
+				if !ok {
+					return nil, errors.New("request deadline missing")
+				}
+				requestDeadline <- deadline
+				return &http.Response{
+					StatusCode: http.StatusNoContent,
+					Header:     make(http.Header),
+					Body: &httpSecondGateLateEOFBody{
+						context: request.Context(),
+					},
+				}, nil
+			},
+		)}, nil
+	})
+	deadline := time.Now().Add(time.Minute)
+	result := fixture.deliverAttempt(t, deliverer, deadline)
+	claim, err := services.OutboxClaimRefFromDelivery(&fixture.delivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim.EffectiveDeadline = deadline
+	finalized, finalizeErr := services.NewAgentNativeService(
+		fixture.db,
+	).FinalizeOutboxAttempt(
+		agentplatformTestOutboxWorkerContext(t, fixture.scope),
+		claim,
+		result,
+	)
+	if finalizeErr != nil {
+		t.Fatalf("finalize late EOF: %v", finalizeErr)
+	}
+	attemptDeadline := <-requestDeadline
+	if result.Kind == services.OutboxAttemptKnownSuccess {
+		t.Fatalf(
+			"late EOF at %s returned known success: %+v",
+			time.Now(),
+			result,
+		)
+	}
+	if result.CompletedAt.IsZero() ||
+		!result.CompletedAt.After(attemptDeadline) {
+		t.Fatalf(
+			"late EOF completion=%s deadline=%s",
+			result.CompletedAt,
+			attemptDeadline,
+		)
+	}
+	if finalized.Status == models.OutboxDeliverySucceeded {
+		t.Fatalf("late EOF finalized as %q", finalized.Status)
+	}
+	if httpAttempts.Load() != 1 {
+		t.Fatalf("late EOF HTTP attempts = %d, want 1", httpAttempts.Load())
+	}
+}
+
+func TestWebhookOutboxTimelyEOFSucceedsAfterLateFinalize(
+	t *testing.T,
+) {
+	fixture := newHTTPSecondGateFixture(t, time.Now().Add(time.Minute))
+	if err := fixture.db.Table(
+		(models.WebhookDeliverySnapshot{}).TableName(),
+	).Where("id = ?", fixture.snapshot.ID).
+		Update("timeout_seconds", 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	requestDeadline := make(chan time.Time, 1)
+	deliverer := fixture.deliverer(t, func(
+		context.Context,
+		*url.URL,
+		time.Duration,
+	) (*http.Client, error) {
+		return &http.Client{Transport: httpSecondGateRoundTripper(
+			func(request *http.Request) (*http.Response, error) {
+				deadline, ok := request.Context().Deadline()
+				if !ok {
+					return nil, errors.New("request deadline missing")
+				}
+				requestDeadline <- deadline
+				return httpSecondGateNoContentResponse(), nil
+			},
+		)}, nil
+	})
+	workerDeadline := time.Now().Add(time.Minute)
+	result := fixture.deliverAttempt(t, deliverer, workerDeadline)
+	attemptDeadline := <-requestDeadline
+	if result.Kind != services.OutboxAttemptKnownSuccess ||
+		result.CompletedAt.IsZero() ||
+		result.CompletedAt.After(attemptDeadline) {
+		t.Fatalf("timely EOF result = %+v", result)
+	}
+	timer := time.NewTimer(time.Until(attemptDeadline) + 20*time.Millisecond)
+	<-timer.C
+	claim, err := services.OutboxClaimRefFromDelivery(&fixture.delivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim.EffectiveDeadline = workerDeadline
+	finalized, finalizeErr := services.NewAgentNativeService(
+		fixture.db,
+	).FinalizeOutboxAttempt(
+		agentplatformTestOutboxWorkerContext(t, fixture.scope),
+		claim,
+		result,
+	)
+	if finalizeErr != nil {
+		t.Fatalf("late finalize timely EOF: %v", finalizeErr)
+	}
+	if finalized.Status != models.OutboxDeliverySucceeded {
+		t.Fatalf("timely EOF finalized as %q", finalized.Status)
+	}
+}
+
+func TestWebhookOutboxMalformedBoundariesUseFixedRejection(
+	t *testing.T,
+) {
+	tests := []struct {
+		name   string
+		invoke func(
+			*testing.T,
+			httpSecondGateFixture,
+			*NativeOutboxDeliverer,
+		) services.OutboxAttemptResult
+	}{
+		{
+			name: "destination",
+			invoke: func(
+				t *testing.T,
+				fixture httpSecondGateFixture,
+				deliverer *NativeOutboxDeliverer,
+			) services.OutboxAttemptResult {
+				t.Helper()
+				delivery := fixture.delivery
+				delivery.DestinationID = "snapshot:not-a-uuid"
+				return fixture.deliverAttemptFor(
+					t,
+					deliverer,
+					&delivery,
+					fixture.event,
+					time.Now().Add(time.Minute),
+				)
+			},
+		},
+		{
+			name: "scope",
+			invoke: func(
+				t *testing.T,
+				fixture httpSecondGateFixture,
+				deliverer *NativeOutboxDeliverer,
+			) services.OutboxAttemptResult {
+				t.Helper()
+				delivery := fixture.delivery
+				delivery.ProjectID++
+				event := fixture.event
+				event.ProjectID = delivery.ProjectID
+				return fixture.deliverAttemptFor(
+					t,
+					deliverer,
+					&delivery,
+					event,
+					time.Now().Add(time.Minute),
+				)
+			},
+		},
+		{
+			name: "event",
+			invoke: func(
+				t *testing.T,
+				fixture httpSecondGateFixture,
+				deliverer *NativeOutboxDeliverer,
+			) services.OutboxAttemptResult {
+				t.Helper()
+				event := fixture.event
+				event.ID = "forged-event"
+				return fixture.deliverAttemptFor(
+					t,
+					deliverer,
+					&fixture.delivery,
+					event,
+					time.Now().Add(time.Minute),
+				)
+			},
+		},
+		{
+			name: "nil notification event",
+			invoke: func(
+				t *testing.T,
+				fixture httpSecondGateFixture,
+				deliverer *NativeOutboxDeliverer,
+			) services.OutboxAttemptResult {
+				t.Helper()
+				deadline := time.Now().Add(time.Minute)
+				ctx, cancel := context.WithDeadline(
+					agentplatformTestOutboxWorkerContext(
+						t,
+						fixture.scope,
+					),
+					deadline,
+				)
+				defer cancel()
+				return deliverer.notifications.
+					SendWebhookSnapshotOutboxAttemptResult(
+						ctx,
+						fixture.claim(t, deadline),
+						nil,
+					)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newHTTPSecondGateFixture(
+				t,
+				time.Now().Add(time.Minute),
+			)
+			var httpAttempts atomic.Int32
+			deliverer := fixture.deliverer(t, func(
+				context.Context,
+				*url.URL,
+				time.Duration,
+			) (*http.Client, error) {
+				return &http.Client{
+					Transport: httpSecondGateRoundTripper(
+						func(*http.Request) (*http.Response, error) {
+							httpAttempts.Add(1)
+							return httpSecondGateNoContentResponse(),
+								nil
+						},
+					),
+				}, nil
+			})
+			result := test.invoke(t, fixture, deliverer)
+			if result.Kind != services.OutboxAttemptKnownFailure ||
+				!errors.Is(
+					result.Err,
+					services.ErrWebhookOutboxAttemptRejected,
+				) {
+				t.Fatalf("malformed boundary result = %+v", result)
+			}
+			if httpAttempts.Load() != 0 {
+				t.Fatalf(
+					"malformed boundary performed %d HTTP attempts",
+					httpAttempts.Load(),
+				)
+			}
+		})
+	}
+}
+
+func TestWebhookOutboxDirectDeliverUsesFixedMalformedScopeRejection(
+	t *testing.T,
+) {
+	fixture := newHTTPSecondGateFixture(t, time.Now().Add(time.Minute))
+	var httpAttempts atomic.Int32
+	deliverer := fixture.deliverer(t, func(
+		context.Context,
+		*url.URL,
+		time.Duration,
+	) (*http.Client, error) {
+		return &http.Client{Transport: httpSecondGateRoundTripper(
+			func(*http.Request) (*http.Response, error) {
+				httpAttempts.Add(1)
+				return httpSecondGateNoContentResponse(), nil
+			},
+		)}, nil
+	})
+	delivery := fixture.delivery
+	delivery.ProjectID++
+	event := fixture.event
+	event.ProjectID = delivery.ProjectID
+	ctx, cancel := context.WithDeadline(
+		agentplatformTestOutboxWorkerContext(t, fixture.scope),
+		time.Now().Add(time.Minute),
+	)
+	err := deliverer.Deliver(ctx, &delivery, event)
+	cancel()
+	if !errors.Is(err, services.ErrWebhookOutboxAttemptRejected) {
+		t.Fatalf("direct malformed scope error = %v", err)
+	}
+	if httpAttempts.Load() != 0 {
+		t.Fatalf(
+			"direct malformed scope performed %d HTTP attempts",
+			httpAttempts.Load(),
+		)
+	}
+}
+
+type httpSecondGateLateEOFBody struct {
+	context context.Context
+	once    sync.Once
+}
+
+func (body *httpSecondGateLateEOFBody) Read([]byte) (int, error) {
+	body.once.Do(func() { <-body.context.Done() })
+	return 0, io.EOF
+}
+
+func (*httpSecondGateLateEOFBody) Close() error {
+	return nil
 }
 
 func TestWebhookOutboxValidClaimCompletesAtBodyEOFWithoutAuditWait(
@@ -682,10 +1098,50 @@ func (fixture httpSecondGateFixture) deliverAttempt(
 	effectiveDeadline time.Time,
 ) services.OutboxAttemptResult {
 	t.Helper()
+	return fixture.deliverAttemptFor(
+		t,
+		deliverer,
+		&fixture.delivery,
+		fixture.event,
+		effectiveDeadline,
+	)
+}
+
+func (fixture httpSecondGateFixture) deliverAttemptFor(
+	t *testing.T,
+	deliverer *NativeOutboxDeliverer,
+	delivery *models.OutboxDelivery,
+	event services.CloudEventEnvelope,
+	effectiveDeadline time.Time,
+) services.OutboxAttemptResult {
+	t.Helper()
 	ctx, cancel := context.WithDeadline(
 		agentplatformTestOutboxWorkerContext(t, fixture.scope),
 		effectiveDeadline,
 	)
 	defer cancel()
-	return deliverer.DeliverAttempt(ctx, &fixture.delivery, fixture.event)
+	return deliverer.DeliverAttempt(ctx, delivery, event)
+}
+
+func (fixture httpSecondGateFixture) claim(
+	t *testing.T,
+	effectiveDeadline time.Time,
+) services.WebhookOutboxAttemptClaim {
+	t.Helper()
+	claim, err := services.OutboxClaimRefFromDelivery(&fixture.delivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return services.WebhookOutboxAttemptClaim{
+		DeliveryID:          fixture.delivery.ID,
+		EventID:             fixture.event.ID,
+		Scope:               fixture.scope,
+		WorkerID:            claim.WorkerID,
+		LockToken:           claim.LockToken,
+		LockedAt:            claim.LockedAt,
+		AttemptGeneration:   claim.Attempts,
+		SnapshotDestination: fixture.delivery.DestinationID,
+		EffectiveDeadline:   effectiveDeadline,
+		CredentialExpiresAt: fixture.snapshot.CredentialExpiresAt,
+	}
 }

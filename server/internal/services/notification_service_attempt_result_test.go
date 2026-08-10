@@ -43,6 +43,85 @@ type webhookAttemptEOFBody struct {
 	once      sync.Once
 }
 
+func TestBoundWebhookClientTimeoutUsesShallowCopyAndRemainingWindow(
+	t *testing.T,
+) {
+	tests := []struct {
+		name      string
+		timeout   time.Duration
+		remaining time.Duration
+		want      time.Duration
+		wantErr   bool
+	}{
+		{
+			name:      "zero client timeout",
+			timeout:   0,
+			remaining: 250 * time.Millisecond,
+			want:      250 * time.Millisecond,
+		},
+		{
+			name:      "oversized client timeout",
+			timeout:   time.Minute,
+			remaining: 250 * time.Millisecond,
+			want:      250 * time.Millisecond,
+		},
+		{
+			name:      "shorter existing timeout",
+			timeout:   50 * time.Millisecond,
+			remaining: 250 * time.Millisecond,
+			want:      50 * time.Millisecond,
+		},
+		{
+			name:      "elapsed remaining window",
+			timeout:   time.Minute,
+			remaining: 0,
+			wantErr:   true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			shared := &http.Client{
+				Transport: http.DefaultTransport,
+				Timeout:   test.timeout,
+			}
+			bounded, err := boundWebhookClientTimeout(
+				shared,
+				test.remaining,
+			)
+			if test.wantErr {
+				if !errors.Is(err, ErrWebhookOutboxAttemptRejected) ||
+					bounded != nil {
+					t.Fatalf("bounded client = %#v, error = %v", bounded, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bounded == shared {
+				t.Fatal("bounded client reused shared factory client pointer")
+			}
+			if bounded.Timeout != test.want {
+				t.Fatalf(
+					"bounded timeout = %s, want %s",
+					bounded.Timeout,
+					test.want,
+				)
+			}
+			if shared.Timeout != test.timeout {
+				t.Fatalf(
+					"shared timeout mutated from %s to %s",
+					test.timeout,
+					shared.Timeout,
+				)
+			}
+			if bounded.Transport != shared.Transport {
+				t.Fatal("shallow copy changed client transport")
+			}
+		})
+	}
+}
+
 func (body *webhookAttemptEOFBody) Read(buffer []byte) (int, error) {
 	count, err := body.reader.Read(buffer)
 	if err == io.EOF {

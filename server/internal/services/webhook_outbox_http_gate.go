@@ -31,6 +31,11 @@ type WebhookOutboxAttemptClaim struct {
 	CredentialExpiresAt time.Time
 }
 
+type webhookOutboxGateState struct {
+	snapshot models.WebhookDeliverySnapshot
+	event    models.DomainEvent
+}
+
 func (claim WebhookOutboxAttemptClaim) validate() error {
 	if strings.TrimSpace(claim.DeliveryID) == "" ||
 		strings.TrimSpace(claim.EventID) == "" ||
@@ -70,30 +75,30 @@ func (claim WebhookOutboxAttemptClaim) outboxClaimRef() OutboxClaimRef {
 func (ns *NotificationService) validateWebhookOutboxAttemptGate(
 	ctx context.Context,
 	claim WebhookOutboxAttemptClaim,
-) (models.WebhookDeliverySnapshot, error) {
+) (webhookOutboxGateState, error) {
 	if ns == nil || ns.db == nil || ctx == nil {
-		return models.WebhookDeliverySnapshot{},
+		return webhookOutboxGateState{},
 			ErrWebhookOutboxAttemptRejected
 	}
 	if err := claim.validate(); err != nil || ctx.Err() != nil {
-		return models.WebhookDeliverySnapshot{},
+		return webhookOutboxGateState{},
 			ErrWebhookOutboxAttemptRejected
 	}
 	now := time.Now().UTC()
 	if !now.Before(claim.EffectiveDeadline.UTC()) ||
 		!now.Before(claim.CredentialExpiresAt.UTC()) {
-		return models.WebhookDeliverySnapshot{},
+		return webhookOutboxGateState{},
 			ErrWebhookOutboxAttemptRejected
 	}
-	snapshot, err := withNotificationProjectOperation(
+	state, err := withNotificationProjectOperation(
 		ns,
 		ctx,
 		claim.Scope,
 		func(scopedContext context.Context) (
-			models.WebhookDeliverySnapshot,
+			webhookOutboxGateState,
 			error,
 		) {
-			var validated models.WebhookDeliverySnapshot
+			var validated webhookOutboxGateState
 			err := transactionForContext(
 				scopedContext,
 				ns.db,
@@ -122,16 +127,14 @@ func (ns *NotificationService) validateWebhookOutboxAttemptGate(
 						) {
 						return ErrWebhookOutboxLifecycleInvariant
 					}
-					var event models.DomainEvent
 					if err := tx.
-						Select("id", "organization_id", "project_id").
 						Where(
 							"id = ? AND organization_id = ? AND project_id = ?",
 							claim.EventID,
 							claim.Scope.OrganizationID,
 							claim.Scope.ProjectID,
 						).
-						Take(&event).Error; err != nil {
+						Take(&validated.event).Error; err != nil {
 						return ErrWebhookOutboxLifecycleInvariant
 					}
 					snapshot, err := lockWebhookSnapshotForDelivery(
@@ -152,7 +155,7 @@ func (ns *NotificationService) validateWebhookOutboxAttemptGate(
 						) {
 						return ErrWebhookOutboxLifecycleInvariant
 					}
-					validated = *snapshot
+					validated.snapshot = *snapshot
 					return nil
 				},
 			)
@@ -160,8 +163,8 @@ func (ns *NotificationService) validateWebhookOutboxAttemptGate(
 		},
 	)
 	if err != nil {
-		return models.WebhookDeliverySnapshot{},
+		return webhookOutboxGateState{},
 			ErrWebhookOutboxAttemptRejected
 	}
-	return snapshot, nil
+	return state, nil
 }

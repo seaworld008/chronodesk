@@ -140,6 +140,23 @@ func (f WebhookClientFactoryFunc) ClientFor(
 	return f(ctx, target, timeout)
 }
 
+func boundWebhookClientTimeout(
+	client *http.Client,
+	remaining time.Duration,
+) (*http.Client, error) {
+	if client == nil || remaining <= 0 {
+		return nil, ErrWebhookOutboxAttemptRejected
+	}
+	bounded := *client
+	if bounded.Timeout <= 0 || bounded.Timeout > remaining {
+		bounded.Timeout = remaining
+	}
+	if bounded.Timeout <= 0 {
+		return nil, ErrWebhookOutboxAttemptRejected
+	}
+	return &bounded, nil
+}
+
 type publicWebhookClientFactory struct {
 	resolver *net.Resolver
 }
@@ -529,7 +546,7 @@ func (ns *NotificationService) SendWebhookOutboxAttempt(
 func (ns *NotificationService) SendWebhookSnapshotOutboxAttempt(
 	ctx context.Context,
 	claim WebhookOutboxAttemptClaim,
-	event *NotificationEvent,
+	event *CloudEventEnvelope,
 ) error {
 	return ns.SendWebhookSnapshotOutboxAttemptResult(
 		ctx,
@@ -541,39 +558,39 @@ func (ns *NotificationService) SendWebhookSnapshotOutboxAttempt(
 func (ns *NotificationService) SendWebhookSnapshotOutboxAttemptResult(
 	ctx context.Context,
 	claim WebhookOutboxAttemptClaim,
-	event *NotificationEvent,
+	callerEvent *CloudEventEnvelope,
 ) OutboxAttemptResult {
-	if event == nil {
-		return OutboxKnownFailure(errors.New("webhook event is required"))
+	if callerEvent == nil {
+		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
 	}
 	if err := claim.validate(); err != nil {
 		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
 	}
-	eventID := strings.TrimSpace(event.Metadata["event_id"])
-	if eventID == "" || eventID != claim.EventID {
-		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
-	}
-	deliveryID := strings.TrimSpace(event.Metadata["delivery_id"])
-	if deliveryID == "" || deliveryID != claim.DeliveryID {
-		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
-	}
-	snapshot, err := ns.validateWebhookOutboxAttemptGate(
+	state, err := ns.validateWebhookOutboxAttemptGate(
 		ctx,
 		claim,
 	)
 	if err != nil {
 		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
 	}
-	config, err := snapshot.WebhookConfig()
+	persistedEvent := CloudEventFromModel(&state.event)
+	if !eventcontract.IsWebhookDeliveryEventType(
+		strings.TrimSpace(persistedEvent.Type),
+	) ||
+		!webhookCallerEventMatchesPersisted(
+			callerEvent,
+			&persistedEvent,
+		) {
+		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
+	}
+	event := notificationEventFromPersistedCloudEvent(persistedEvent)
+	event.Metadata["delivery_id"] = claim.DeliveryID
+	config, err := state.snapshot.WebhookConfig()
 	if err != nil {
-		return OutboxKnownFailure(
-			fmt.Errorf("hydrate webhook delivery snapshot: %w", err),
-		)
+		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
 	}
 	if err := ns.revealWebhookSecrets(&config); err != nil {
-		return OutboxKnownFailure(
-			fmt.Errorf("无法读取webhook快照凭据: %w", err),
-		)
+		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
 	}
 	timeout := ns.outboxWebhookTimeout
 	if timeout <= 0 || timeout > defaultOutboxWebhookAttemptTimeout {
@@ -605,7 +622,7 @@ func (ns *NotificationService) SendWebhookSnapshotOutboxAttemptResult(
 	attemptClaim.EffectiveDeadline = attemptDeadline
 	attemptCtx, cancel := context.WithDeadline(ctx, attemptDeadline)
 	defer cancel()
-	return ns.sendWebhookAttemptResultWithAudit(
+	result := ns.sendWebhookAttemptResultWithAudit(
 		attemptCtx,
 		&config,
 		event,
@@ -618,6 +635,97 @@ func (ns *NotificationService) SendWebhookSnapshotOutboxAttemptResult(
 			return err
 		},
 	)
+	return result.withEffectiveDeadline(attemptDeadline)
+}
+
+func webhookCallerEventMatchesPersisted(
+	caller *CloudEventEnvelope,
+	persisted *CloudEventEnvelope,
+) bool {
+	if caller == nil || persisted == nil {
+		return false
+	}
+	callerJSON, callerErr := json.Marshal(caller)
+	persistedJSON, persistedErr := json.Marshal(persisted)
+	return callerErr == nil &&
+		persistedErr == nil &&
+		bytes.Equal(callerJSON, persistedJSON)
+}
+
+func notificationEventFromPersistedCloudEvent(
+	event CloudEventEnvelope,
+) *NotificationEvent {
+	var payload map[string]any
+	if len(event.Data) > 0 {
+		_ = json.Unmarshal(event.Data, &payload)
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payload["event_id"] = event.ID
+	payload["cloud_event"] = event
+	var ticket struct {
+		TicketID uint `json:"ticket_id"`
+	}
+	_ = json.Unmarshal(event.Data, &ticket)
+	if ticket.TicketID == 0 &&
+		strings.HasPrefix(event.Subject, "ticket/") {
+		ticket.TicketID, _ = safeconv.ParsePositiveUint(
+			strings.TrimPrefix(event.Subject, "ticket/"),
+		)
+	}
+	transitionStatus := models.TicketStatus("")
+	if event.Type == eventcontract.TicketTransitionedEventType {
+		var transition struct {
+			Status    models.TicketStatus `json:"status"`
+			NewStatus models.TicketStatus `json:"new_status"`
+		}
+		if json.Unmarshal(event.Data, &transition) == nil {
+			transitionStatus = transition.NewStatus
+			if transitionStatus == "" {
+				transitionStatus = transition.Status
+			}
+		}
+	}
+	title := "ChronoDesk ticket event"
+	description := event.Type
+	if event.Type ==
+		eventcontract.AutomationNotificationRequestedEventType {
+		var requested struct {
+			Notification struct {
+				Title   string `json:"title"`
+				Content string `json:"content"`
+			} `json:"notification"`
+		}
+		if json.Unmarshal(event.Data, &requested) == nil {
+			if value := strings.TrimSpace(
+				requested.Notification.Title,
+			); value != "" {
+				title = value
+			}
+			if value := strings.TrimSpace(
+				requested.Notification.Content,
+			); value != "" {
+				description = value
+			}
+		}
+	}
+	return &NotificationEvent{
+		Type:             models.WebhookEventType(event.Type),
+		TransitionStatus: transitionStatus,
+		ResourceID:       ticket.TicketID,
+		ResourceType:     "ticket",
+		Title:            title,
+		Description:      description,
+		Data:             payload,
+		Metadata: map[string]string{
+			"event_id":       event.ID,
+			"trace_id":       event.TraceID,
+			"correlation_id": event.CorrelationID,
+			"specversion":    event.SpecVersion,
+		},
+		Timestamp: event.Time,
+	}
 }
 
 func (ns *NotificationService) sendWebhookAttempt(
@@ -871,6 +979,39 @@ func (ns *NotificationService) sendWebhookAttemptResultWithAudit(
 				waitForAudit,
 			)
 		}
+		deadline, ok := req.Context().Deadline()
+		if !ok {
+			log.Status = "failed"
+			log.ErrorMessage = "webhook投递门禁拒绝"
+			return ns.finishWebhookAttempt(
+				ctx,
+				config,
+				log,
+				OutboxKnownFailure(ErrWebhookOutboxAttemptRejected),
+				false,
+				false,
+				nil,
+				waitForAudit,
+			)
+		}
+		client, err = boundWebhookClientTimeout(
+			client,
+			time.Until(deadline),
+		)
+		if err != nil {
+			log.Status = "failed"
+			log.ErrorMessage = "webhook投递门禁拒绝"
+			return ns.finishWebhookAttempt(
+				ctx,
+				config,
+				log,
+				OutboxKnownFailure(ErrWebhookOutboxAttemptRejected),
+				false,
+				false,
+				nil,
+				waitForAudit,
+			)
+		}
 	}
 	if ctx.Err() != nil {
 		log.Status = "failed"
@@ -951,6 +1092,26 @@ func (ns *NotificationService) sendWebhookAttemptResultWithAudit(
 		)
 	}
 	completedAt := time.Now().UTC()
+	if completedDeadline, ok := ctx.Deadline(); ok &&
+		completedAt.After(completedDeadline.UTC()) {
+		log.Status = "failed"
+		log.ErrorMessage = "webhook响应在投递截止时间后完成"
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			outboxLateCompletion(
+				completedAt,
+				errors.New(
+					"webhook response completed after attempt deadline",
+				),
+			),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
+	}
 	log.ResponseStatus = resp.StatusCode
 	// 回调响应由外部系统控制，可能回显 Authorization、签名或 Cookie。
 	// 响应正文不进入持久日志。

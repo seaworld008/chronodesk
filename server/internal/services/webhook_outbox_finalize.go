@@ -71,10 +71,11 @@ const (
 )
 
 type OutboxAttemptResult struct {
-	Kind        OutboxAttemptResultKind
-	CompletedAt time.Time
-	Err         error
-	notStarted  bool
+	Kind              OutboxAttemptResultKind
+	CompletedAt       time.Time
+	Err               error
+	notStarted        bool
+	effectiveDeadline time.Time
 }
 
 type outboxTimeoutError interface {
@@ -100,6 +101,24 @@ func OutboxUncertain(err error) OutboxAttemptResult {
 		Kind: OutboxAttemptUncertain,
 		Err:  err,
 	}
+}
+
+func outboxLateCompletion(
+	completedAt time.Time,
+	err error,
+) OutboxAttemptResult {
+	return OutboxAttemptResult{
+		Kind:        OutboxAttemptUncertain,
+		CompletedAt: completedAt.UTC(),
+		Err:         err,
+	}
+}
+
+func (result OutboxAttemptResult) withEffectiveDeadline(
+	deadline time.Time,
+) OutboxAttemptResult {
+	result.effectiveDeadline = deadline.UTC()
+	return result
 }
 
 func outboxAttemptNotStarted(err error) OutboxAttemptResult {
@@ -416,12 +435,18 @@ func finalizeWebhookOutboxAttempt(
 	now time.Time,
 ) (models.OutboxDeliveryStatus, error) {
 	expiresAt := delivery.ExpiresAt.UTC()
+	effectiveDeadline := claim.EffectiveDeadline.UTC()
+	if !attempt.effectiveDeadline.IsZero() &&
+		(effectiveDeadline.IsZero() ||
+			attempt.effectiveDeadline.Before(effectiveDeadline)) {
+		effectiveDeadline = attempt.effectiveDeadline.UTC()
+	}
 	if attempt.Kind == OutboxAttemptKnownSuccess &&
 		!attempt.CompletedAt.IsZero() &&
 		!attempt.CompletedAt.UTC().Before(claim.LockedAt.UTC()) &&
-		!claim.EffectiveDeadline.IsZero() &&
+		!effectiveDeadline.IsZero() &&
 		!attempt.CompletedAt.UTC().After(
-			claim.EffectiveDeadline.UTC(),
+			effectiveDeadline,
 		) &&
 		!attempt.CompletedAt.UTC().After(expiresAt) &&
 		snapshot.CredentialShreddedAt == nil {
