@@ -241,12 +241,24 @@ func TestWebhookOutboxAttemptHasHardTimeoutAndNoLegacyRetry(t *testing.T) {
 	if err := db.Create(snapshot).Error; err != nil {
 		t.Fatal(err)
 	}
-	err = service.SendWebhookSnapshotOutboxAttempt(
+	snapshotConfig, err := snapshot.WebhookConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.revealWebhookSecrets(&snapshotConfig); err != nil {
+		t.Fatal(err)
+	}
+	attemptCtx, cancelAttempt := context.WithTimeout(
 		context.Background(),
-		models.ProjectScope{OrganizationID: 1, ProjectID: 10},
-		snapshot.ID,
+		service.outboxWebhookTimeout,
+	)
+	attemptResult := service.sendWebhookAttemptResult(
+		attemptCtx,
+		&snapshotConfig,
 		event,
 	)
+	err = attemptResult.Err
+	cancelAttempt()
 	elapsed := time.Since(started)
 	close(releaseHandler)
 	if err == nil {
@@ -459,12 +471,16 @@ func TestCustomWebhookWithoutSecretFailsClosed(t *testing.T) {
 	if err := db.Create(snapshot).Error; err != nil {
 		t.Fatal(err)
 	}
-	err = service.SendWebhookSnapshotOutboxAttempt(
+	snapshotConfig, err := snapshot.WebhookConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptCtx, cancelAttempt := context.WithDeadline(
 		context.Background(),
-		models.ProjectScope{OrganizationID: 1, ProjectID: 20},
-		snapshot.ID,
-		event,
+		snapshot.CredentialExpiresAt,
 	)
+	err = service.sendWebhookAttempt(attemptCtx, &snapshotConfig, event)
+	cancelAttempt()
 	if err == nil || !strings.Contains(err.Error(), "缺少签名密钥") {
 		t.Fatalf("unsigned custom Webhook error = %v", err)
 	}

@@ -1130,13 +1130,19 @@ func TestOutboxWebhookDeliveryUsesOneBoundedAttemptWithoutLocalRetry(t *testing.
 	if !strings.HasPrefix(delivery.DestinationID, webhookSnapshotPrefix) {
 		t.Fatalf("webhook delivery is not snapshot-bound: %+v", delivery)
 	}
+	claimWebhookDeliveryForAdapterTest(t, db, &delivery)
 
 	started := time.Now()
-	err = deliverer.Deliver(
+	attemptContext, cancelAttempt := context.WithDeadline(
 		agentplatformTestOutboxWorkerContext(t, projectScope),
+		delivery.ExpiresAt.UTC(),
+	)
+	err = deliverer.Deliver(
+		attemptContext,
 		&delivery,
 		event,
 	)
+	cancelAttempt()
 	elapsed := time.Since(started)
 	if err == nil {
 		t.Fatal("non-2xx webhook attempt must fail for Outbox backoff")
@@ -1574,7 +1580,7 @@ func TestCommittedWebhookDeliveriesUseImmutableSnapshots(t *testing.T) {
 		&foreignDelivery,
 		foreignEvent,
 	); err == nil ||
-		!strings.Contains(err.Error(), "load webhook delivery snapshot") {
+		!errors.Is(err, services.ErrWebhookOutboxAttemptRejected) {
 		t.Fatalf("cross-project snapshot error = %v", err)
 	}
 	if firstAttempts.Load() != 1 ||
@@ -1637,6 +1643,34 @@ func newWebhookTestNotificationService(
 			return http.DefaultClient, nil
 		}),
 	)
+}
+
+func claimWebhookDeliveryForAdapterTest(
+	t testing.TB,
+	db *gorm.DB,
+	delivery *models.OutboxDelivery,
+) {
+	t.Helper()
+	if db == nil || delivery == nil || delivery.ExpiresAt == nil {
+		t.Fatal("webhook delivery claim fixture is incomplete")
+	}
+	lockedAt := time.Now().UTC()
+	lockToken := "019feb4d-0000-7000-8000-000000000001"
+	result := db.Model(&models.OutboxDelivery{}).
+		Where("id = ?", delivery.ID).
+		Updates(map[string]any{
+			"status":     models.OutboxDeliveryProcessing,
+			"attempts":   1,
+			"locked_at":  lockedAt,
+			"locked_by":  "adapter-webhook-test-worker",
+			"lock_token": lockToken,
+		})
+	if result.Error != nil || result.RowsAffected != 1 {
+		t.Fatalf("claim adapter webhook delivery: %v", result.Error)
+	}
+	if err := db.Take(delivery, "id = ?", delivery.ID).Error; err != nil {
+		t.Fatalf("reload adapter webhook delivery claim: %v", err)
+	}
 }
 
 func newAgentplatformWebhookTestProtector(

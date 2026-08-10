@@ -674,21 +674,47 @@ func (d *NativeOutboxDeliverer) deliverWebhookAttempt(
 	if !eventcontract.IsWebhookDeliveryEventType(strings.TrimSpace(event.Type)) {
 		return services.OutboxKnownSuccess(time.Now().UTC())
 	}
-	snapshotID, err := parseWebhookSnapshotDestinationID(
+	_, err := parseWebhookSnapshotDestinationID(
 		delivery.DestinationID,
 	)
 	if err != nil {
 		return services.OutboxKnownFailure(err)
 	}
+	claimRef, err := services.OutboxClaimRefFromDelivery(delivery)
+	if err != nil || delivery.ExpiresAt == nil {
+		return services.OutboxKnownFailure(
+			services.ErrWebhookOutboxAttemptRejected,
+		)
+	}
+	effectiveDeadline, ok := ctx.Deadline()
+	if !ok {
+		return services.OutboxKnownFailure(
+			services.ErrWebhookOutboxAttemptRejected,
+		)
+	}
+	credentialExpiresAt := delivery.ExpiresAt.UTC()
+	if credentialExpiresAt.Before(effectiveDeadline) {
+		effectiveDeadline = credentialExpiresAt
+	}
 	notification := notificationEventFromCloudEvent(event)
 	notification.Metadata["delivery_id"] = delivery.ID
 	return d.notifications.SendWebhookSnapshotOutboxAttemptResult(
 		ctx,
-		models.ProjectScope{
-			OrganizationID: event.OrganizationID,
-			ProjectID:      event.ProjectID,
+		services.WebhookOutboxAttemptClaim{
+			DeliveryID: delivery.ID,
+			EventID:    event.ID,
+			Scope: models.ProjectScope{
+				OrganizationID: event.OrganizationID,
+				ProjectID:      event.ProjectID,
+			},
+			WorkerID:            claimRef.WorkerID,
+			LockToken:           claimRef.LockToken,
+			LockedAt:            claimRef.LockedAt,
+			AttemptGeneration:   claimRef.Attempts,
+			SnapshotDestination: delivery.DestinationID,
+			EffectiveDeadline:   effectiveDeadline.UTC(),
+			CredentialExpiresAt: credentialExpiresAt,
 		},
-		snapshotID,
 		notification,
 	)
 }

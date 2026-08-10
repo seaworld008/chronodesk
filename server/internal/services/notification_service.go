@@ -528,68 +528,41 @@ func (ns *NotificationService) SendWebhookOutboxAttempt(
 // retry behavior.
 func (ns *NotificationService) SendWebhookSnapshotOutboxAttempt(
 	ctx context.Context,
-	scope models.ProjectScope,
-	snapshotID string,
+	claim WebhookOutboxAttemptClaim,
 	event *NotificationEvent,
 ) error {
 	return ns.SendWebhookSnapshotOutboxAttemptResult(
 		ctx,
-		scope,
-		snapshotID,
+		claim,
 		event,
 	).Err
 }
 
 func (ns *NotificationService) SendWebhookSnapshotOutboxAttemptResult(
 	ctx context.Context,
-	scope models.ProjectScope,
-	snapshotID string,
+	claim WebhookOutboxAttemptClaim,
 	event *NotificationEvent,
 ) OutboxAttemptResult {
 	if event == nil {
 		return OutboxKnownFailure(errors.New("webhook event is required"))
 	}
-	if err := scope.Validate(); err != nil {
-		return OutboxKnownFailure(
-			fmt.Errorf("invalid webhook project scope: %w", err),
-		)
+	if err := claim.validate(); err != nil {
+		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
 	}
-	snapshotID = strings.TrimSpace(snapshotID)
-	if snapshotID == "" {
-		return OutboxKnownFailure(
-			errors.New("webhook delivery snapshot is required"),
-		)
+	eventID := strings.TrimSpace(event.Metadata["event_id"])
+	if eventID == "" || eventID != claim.EventID {
+		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
 	}
-	snapshot, err := withNotificationProjectOperation(
-		ns,
+	deliveryID := strings.TrimSpace(event.Metadata["delivery_id"])
+	if deliveryID == "" || deliveryID != claim.DeliveryID {
+		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
+	}
+	snapshot, err := ns.validateWebhookOutboxAttemptGate(
 		ctx,
-		scope,
-		func(scopedContext context.Context) (
-			models.WebhookDeliverySnapshot,
-			error,
-		) {
-			var snapshot models.WebhookDeliverySnapshot
-			err := ns.db.WithContext(scopedContext).
-				Where(
-					"id = ? AND organization_id = ? AND project_id = ?",
-					snapshotID,
-					scope.OrganizationID,
-					scope.ProjectID,
-				).
-				First(&snapshot).Error
-			return snapshot, err
-		},
+		claim,
 	)
 	if err != nil {
-		return OutboxKnownFailure(
-			fmt.Errorf("load webhook delivery snapshot: %w", err),
-		)
-	}
-	if eventID := strings.TrimSpace(event.Metadata["event_id"]); eventID == "" ||
-		eventID != snapshot.EventID {
-		return OutboxKnownFailure(
-			errors.New("webhook delivery snapshot event mismatch"),
-		)
+		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
 	}
 	config, err := snapshot.WebhookConfig()
 	if err != nil {
@@ -612,13 +585,39 @@ func (ns *NotificationService) SendWebhookSnapshotOutboxAttemptResult(
 			timeout = configured
 		}
 	}
-	attemptDeadline := time.Now().Add(timeout)
-	if snapshot.CredentialExpiresAt.Before(attemptDeadline) {
-		attemptDeadline = snapshot.CredentialExpiresAt
+	now := time.Now().UTC()
+	attemptDeadline := claim.EffectiveDeadline.UTC()
+	if parentDeadline, ok := ctx.Deadline(); ok &&
+		parentDeadline.Before(attemptDeadline) {
+		attemptDeadline = parentDeadline.UTC()
 	}
+	configuredDeadline := now.Add(timeout)
+	if configuredDeadline.Before(attemptDeadline) {
+		attemptDeadline = configuredDeadline
+	}
+	if claim.CredentialExpiresAt.Before(attemptDeadline) {
+		attemptDeadline = claim.CredentialExpiresAt.UTC()
+	}
+	if !now.Before(attemptDeadline) {
+		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
+	}
+	attemptClaim := claim
+	attemptClaim.EffectiveDeadline = attemptDeadline
 	attemptCtx, cancel := context.WithDeadline(ctx, attemptDeadline)
 	defer cancel()
-	return ns.sendWebhookAttemptResult(attemptCtx, &config, event)
+	return ns.sendWebhookAttemptResultWithAudit(
+		attemptCtx,
+		&config,
+		event,
+		false,
+		func(gateContext context.Context) error {
+			_, err := ns.validateWebhookOutboxAttemptGate(
+				gateContext,
+				attemptClaim,
+			)
+			return err
+		},
+	)
 }
 
 func (ns *NotificationService) sendWebhookAttempt(
@@ -631,6 +630,7 @@ func (ns *NotificationService) sendWebhookAttempt(
 		config,
 		event,
 		true,
+		nil,
 	).Err
 }
 
@@ -644,6 +644,7 @@ func (ns *NotificationService) sendWebhookAttemptResult(
 		config,
 		event,
 		false,
+		nil,
 	)
 }
 
@@ -652,6 +653,7 @@ func (ns *NotificationService) sendWebhookAttemptResultWithAudit(
 	config *models.WebhookConfig,
 	event *NotificationEvent,
 	waitForAudit bool,
+	beforeDo func(context.Context) error,
 ) OutboxAttemptResult {
 	if config == nil {
 		return OutboxKnownFailure(errors.New("webhook配置不能为空"))
@@ -813,10 +815,28 @@ func (ns *NotificationService) sendWebhookAttemptResultWithAudit(
 	// 以及所有未知扩展头永不落盘。
 	log.RequestHeaders = headersForAuditLog(req.Header, requestHeaderAuditAllowlist)
 
+	clientTimeout := ns.outboxWebhookTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		clientTimeout = time.Until(deadline)
+	}
+	if clientTimeout <= 0 {
+		log.Status = "failed"
+		log.ErrorMessage = "webhook投递门禁拒绝"
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxKnownFailure(ErrWebhookOutboxAttemptRejected),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
+	}
 	client, err := ns.webhookClients.ClientFor(
 		ctx,
 		req.URL,
-		ns.outboxWebhookTimeout,
+		clientTimeout,
 	)
 	if err != nil || client == nil {
 		log.Status = "failed"
@@ -835,6 +855,37 @@ func (ns *NotificationService) sendWebhookAttemptResultWithAudit(
 		)
 	}
 	defer client.CloseIdleConnections()
+
+	if beforeDo != nil {
+		if err := beforeDo(ctx); err != nil {
+			log.Status = "failed"
+			log.ErrorMessage = "webhook投递门禁拒绝"
+			return ns.finishWebhookAttempt(
+				ctx,
+				config,
+				log,
+				OutboxKnownFailure(ErrWebhookOutboxAttemptRejected),
+				false,
+				false,
+				nil,
+				waitForAudit,
+			)
+		}
+	}
+	if ctx.Err() != nil {
+		log.Status = "failed"
+		log.ErrorMessage = "webhook投递门禁拒绝"
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxKnownFailure(ErrWebhookOutboxAttemptRejected),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
+	}
 
 	// 发送请求
 	resp, err := client.Do(req)
