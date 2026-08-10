@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.1.0.
- * Contract SHA-256: a96c2516e343dbeed57820c75958ec88a659937a82357263add01aba211dd52b.
+ * Contract SHA-256: e4a7221b5659169c01f9dc661ed4b0f3af56c7cc1c6ce4e2d8a0957db81375b7.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -1788,10 +1788,12 @@ export type AdminOutboxDeliverySummary = {
     event_id: string
     destination_type: "webhook" | "event_stream" | "automation" | "notification" | "sla" | "sla_escalation" | "attachment_upload" | "attachment_cleanup" | "attachment_staging_cleanup" | "a2a_push" | "email" | "other"
     destination_label: string
-    status: "pending" | "processing" | "succeeded" | "failed" | "dead"
+    status: "pending" | "processing" | "succeeded" | "failed" | "dead" | "expired"
     attempts: number
     next_attempt_at: string
     last_error: string
+    expires_at?: string | null
+    expired_at?: string | null
     updated_at: string
     resource_version: ResourceVersion
 }
@@ -1830,7 +1832,7 @@ export type Problem = {
     title: string
     status: number
     detail?: string
-    code: "invalid_request" | "precondition_required" | "unauthorized" | "invalid_actor" | "invalid_scope" | "principal_not_found" | "principal_disabled" | "principal_expired" | "invalid_credential" | "credential_expired" | "insufficient_scope" | "policy_denied" | "agent_emergency_stop" | "read_only" | "automation_loop" | "not_found" | "version_conflict" | "lease_conflict" | "lease_expired" | "lease_not_owned" | "idempotency_conflict" | "idempotency_in_progress" | "command_scope_mismatch" | "outbox_replay_conflict" | "rate_limited" | "concurrency_limit" | "attachment_rejected" | "attachment_too_large" | "attachment_not_clean" | "invalid_attachment_name" | "service_unavailable" | "internal_error"
+    code: "invalid_request" | "precondition_required" | "unauthorized" | "invalid_actor" | "invalid_scope" | "principal_not_found" | "principal_disabled" | "principal_expired" | "invalid_credential" | "credential_expired" | "insufficient_scope" | "policy_denied" | "agent_emergency_stop" | "read_only" | "automation_loop" | "not_found" | "version_conflict" | "lease_conflict" | "lease_expired" | "lease_not_owned" | "idempotency_conflict" | "idempotency_in_progress" | "command_scope_mismatch" | "outbox_replay_conflict" | "outbox_replay_expired" | "rate_limited" | "concurrency_limit" | "attachment_rejected" | "attachment_too_large" | "attachment_not_clean" | "invalid_attachment_name" | "service_unavailable" | "internal_error"
     request_id: string
     retryable: boolean
 }
@@ -2893,7 +2895,7 @@ export type IntegrationConflictResolution = "resolved" | "ignored"
 
 export type IntegrationDeadLetterStatus = "open" | "requeued" | "resolved"
 
-export type IntegrationOutboxDeliveryStatus = "pending" | "processing" | "succeeded" | "failed" | "dead"
+export type IntegrationOutboxDeliveryStatus = "pending" | "processing" | "succeeded" | "failed" | "dead" | "expired"
 
 export type IntegrationConnectorDefinitionSummary = {
     id: IntegrationResourceID
@@ -3065,6 +3067,8 @@ export type IntegrationOutboxSummary = {
     next_attempt_at: string
     last_error?: string
     delivered_at?: string
+    expires_at?: string | null
+    expired_at?: string | null
     created_at: string
     updated_at: string
 }

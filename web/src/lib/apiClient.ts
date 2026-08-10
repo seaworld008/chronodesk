@@ -110,6 +110,7 @@ const problemMessages: Record<string, string> = {
   service_unavailable: '安全执行保护暂时不可用，请稍后重试',
   automation_loop: '检测到异常自动化循环，操作已停止',
   outbox_replay_conflict: '该投递当前无法回放，请刷新状态后重试',
+  outbox_replay_expired: '该投递已过期或凭据已撤销，无法回放',
   attachment_rejected: '附件未通过安全校验，无法继续处理',
   ticket_configuration_unavailable: '当前项目没有完整的已发布建单配置',
   request_type_version_required: '请选择当前项目已发布的请求类型',

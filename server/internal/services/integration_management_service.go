@@ -1562,6 +1562,7 @@ func (service *IntegrationManagementService) ListOutboxDeliveries(
 			string(models.OutboxDeliverySucceeded),
 			string(models.OutboxDeliveryFailed),
 			string(models.OutboxDeliveryDead),
+			string(models.OutboxDeliveryExpired),
 		),
 	}
 	options, err = normalizeIntegrationListOptions(options, spec)
@@ -1592,7 +1593,7 @@ func (service *IntegrationManagementService) ListOutboxDeliveries(
 	}
 	var items []models.OutboxDelivery
 	listQuery := query.Select(
-		"id, created_at, updated_at, organization_id, project_id, event_id, destination_type, status, attempts, max_attempts, next_attempt_at, last_error, delivered_at",
+		"id, created_at, updated_at, organization_id, project_id, event_id, destination_type, status, attempts, max_attempts, next_attempt_at, last_error, delivered_at, expires_at, expired_at",
 	)
 	if err := applyIntegrationOrder(listQuery, options, spec).
 		Offset(integrationPageOffset(options)).

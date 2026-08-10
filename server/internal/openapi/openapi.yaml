@@ -2934,6 +2934,7 @@ components:
             - idempotency_in_progress
             - command_scope_mismatch
             - outbox_replay_conflict
+            - outbox_replay_expired
             - rate_limited
             - concurrency_limit
             - attachment_rejected
@@ -4771,7 +4772,7 @@ components:
           maxLength: 179
         status:
           type: string
-          enum: [pending, processing, succeeded, failed, dead]
+          enum: [pending, processing, succeeded, failed, dead, expired]
         attempts:
           type: integer
           minimum: 0
@@ -4780,6 +4781,12 @@ components:
           format: date-time
         last_error:
           type: string
+        expires_at:
+          type: [string, 'null']
+          format: date-time
+        expired_at:
+          type: [string, 'null']
+          format: date-time
         updated_at:
           type: string
           format: date-time

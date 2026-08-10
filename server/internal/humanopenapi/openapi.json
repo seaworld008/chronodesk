@@ -21639,7 +21639,8 @@
               "processing",
               "succeeded",
               "failed",
-              "dead"
+              "dead",
+              "expired"
             ]
           },
           "attempts": {
@@ -21653,6 +21654,20 @@
           "last_error": {
             "type": "string",
             "maxLength": 500
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "expired_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
           },
           "updated_at": {
             "type": "string",
@@ -21860,6 +21875,7 @@
               "idempotency_in_progress",
               "command_scope_mismatch",
               "outbox_replay_conflict",
+              "outbox_replay_expired",
               "rate_limited",
               "concurrency_limit",
               "attachment_rejected",
@@ -26474,7 +26490,8 @@
           "processing",
           "succeeded",
           "failed",
-          "dead"
+          "dead",
+          "expired"
         ]
       },
       "IntegrationConnectorDefinitionSummary": {
@@ -27203,6 +27220,20 @@
           },
           "delivered_at": {
             "type": "string",
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "expired_at": {
+            "type": [
+              "string",
+              "null"
+            ],
             "format": "date-time"
           },
           "created_at": {

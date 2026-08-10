@@ -511,8 +511,8 @@ func TestWebhookOutboxLifecyclePostgresConcurrencyMatrix(t *testing.T) {
 		replayErr := receivePostgresError(t, replayDone)
 		cleanup := receivePostgresCleanupResult(t, cleanupDone)
 		race.join()
-		if !errors.Is(replayErr, ErrOutboxReplayConflict) {
-			t.Fatalf("replay race error = %v, want conflict", replayErr)
+		if !errors.Is(replayErr, ErrOutboxReplayExpired) {
+			t.Fatalf("replay race error = %v, want expired", replayErr)
 		}
 		if cleanup.err != nil {
 			t.Fatal(cleanup.err)

@@ -1344,8 +1344,21 @@ func (h *AdminHandler) ReplayOutbox(c *gin.Context) {
 				First(&delivery).Error; err != nil {
 				return adminMutationResult{}, err
 			}
-			if err := h.native.ReplayOutbox(txCtx, delivery.ID); err != nil {
+			replay, err := h.native.ReplayOutboxCommand(
+				txCtx,
+				delivery.ID,
+			)
+			if err != nil {
 				return adminMutationResult{}, err
+			}
+			if replay.Disposition == services.OutboxReplayExpired {
+				if replay.Materialized {
+					return adminMutationResult{
+						AfterCommitError: services.ErrOutboxReplayExpired,
+					}, nil
+				}
+				return adminMutationResult{},
+					services.ErrOutboxReplayExpired
 			}
 			return adminMutationResult{
 				Data:          gin.H{"replayed": true},
@@ -1500,14 +1513,15 @@ func setOneTimeSecretResponseHeaders(c *gin.Context) {
 var errAdminEventPersistence = errors.New("persist administrator event")
 
 type adminMutationResult struct {
-	Data          any
-	EventName     string
-	Subject       string
-	ResourceID    string
-	Scope         models.ProjectScope
-	ChangedFields []string
-	PublicValues  map[string]any
-	AfterCommit   func()
+	Data             any
+	EventName        string
+	Subject          string
+	ResourceID       string
+	Scope            models.ProjectScope
+	ChangedFields    []string
+	PublicValues     map[string]any
+	AfterCommit      func()
+	AfterCommitError error
 }
 
 type adminMutationOptions struct {
@@ -1678,6 +1692,9 @@ func (h *AdminHandler) executeAdminMutation(
 			if err != nil {
 				return err
 			}
+			if result.AfterCommitError != nil {
+				return nil
+			}
 			if strings.TrimSpace(result.Subject) == "" || strings.TrimSpace(result.ResourceID) == "" {
 				return fmt.Errorf("%w: administrator mutation returned no resource identity", errAdminEventPersistence)
 			}
@@ -1765,6 +1782,15 @@ func (h *AdminHandler) executeAdminMutation(
 			c.Header("ETag", httpcontract.FormatETag(expectedVersion))
 		}
 		h.writeNativeError(c, err)
+		return
+	}
+	if result.AfterCommitError != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(result.AfterCommitError),
+		)
+		h.writeNativeError(c, result.AfterCommitError)
 		return
 	}
 	if result.AfterCommit != nil {
@@ -2243,6 +2269,8 @@ func (h *AdminHandler) writeNativeError(c *gin.Context, err error) {
 		status, code = http.StatusConflict, ProblemLeaseConflict
 	case errors.Is(err, services.ErrOutboxReplayConflict):
 		status, code = http.StatusConflict, ProblemOutboxConflict
+	case errors.Is(err, services.ErrOutboxReplayExpired):
+		status, code = http.StatusConflict, ProblemOutboxExpired
 	case errors.Is(err, services.ErrIdempotencyConflict), errors.Is(err, services.ErrIdempotencyInProgress):
 		status, code = http.StatusConflict, ProblemIdempotencyConflict
 	}

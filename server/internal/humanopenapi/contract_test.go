@@ -43,6 +43,91 @@ func TestRegisterRoutesPublishesEmbeddedHumanContract(t *testing.T) {
 	}
 }
 
+func TestHumanOutboxContractsPublishOnlySafeFiniteReplayState(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+	contains := func(raw any, want string) bool {
+		values, ok := raw.([]any)
+		if !ok {
+			return false
+		}
+		for _, value := range values {
+			if value == want {
+				return true
+			}
+		}
+		return false
+	}
+	problem := objectAt(t, schemas, "Problem")
+	code := objectAt(t, objectAt(t, problem, "properties"), "code")
+	if !contains(code["enum"], "outbox_replay_expired") {
+		t.Fatal("Human Problem.code omits outbox_replay_expired")
+	}
+
+	for _, schemaName := range []string{
+		"AdminOutboxDeliverySummary",
+		"IntegrationOutboxSummary",
+	} {
+		schema := objectAt(t, schemas, schemaName)
+		if schema["additionalProperties"] != false {
+			t.Fatalf("%s is not closed", schemaName)
+		}
+		properties := objectAt(t, schema, "properties")
+		status := objectAt(t, properties, "status")
+		if reference, ok := status["$ref"].(string); ok {
+			status = objectAt(
+				t,
+				schemas,
+				strings.TrimPrefix(
+					reference,
+					"#/components/schemas/",
+				),
+			)
+		}
+		if !contains(status["enum"], "expired") {
+			t.Errorf("%s status omits expired", schemaName)
+		}
+		for _, field := range []string{"expires_at", "expired_at"} {
+			property := objectAt(t, properties, field)
+			if !contains(property["type"], "string") ||
+				!contains(property["type"], "null") ||
+				property["format"] != "date-time" {
+				t.Errorf(
+					"%s.%s is not a nullable date-time: %v",
+					schemaName,
+					field,
+					property,
+				)
+			}
+		}
+		for _, forbidden := range []string{
+			"destination_id",
+			"snapshot_id",
+			"locked_at",
+			"locked_by",
+			"lock_token",
+			"generation",
+			"credential",
+			"url",
+			"headers",
+		} {
+			if _, exposed := properties[forbidden]; exposed {
+				t.Errorf(
+					"%s exposes forbidden field %s",
+					schemaName,
+					forbidden,
+				)
+			}
+		}
+	}
+}
+
 func TestBackupCodeRegenerationContractMatchesRuntimeSecurityBoundary(
 	t *testing.T,
 ) {

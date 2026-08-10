@@ -22,6 +22,7 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/datatypes"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -1200,6 +1201,7 @@ func newAdminContractFixture(t *testing.T) *adminContractFixture {
 		t.Fatal(err)
 	}
 	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = sqlDB.Close() })
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.SystemConfig{},
@@ -1210,6 +1212,8 @@ func newAdminContractFixture(t *testing.T) *adminContractFixture {
 		&models.Ticket{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
+		&models.WebhookConfig{},
+		&models.WebhookDeliverySnapshot{},
 		&models.IdempotencyRecord{},
 		&models.TicketLease{},
 		&models.TicketAttachment{},
@@ -1255,6 +1259,148 @@ func newAdminContractFixture(t *testing.T) *adminContractFixture {
 		admin:   admin,
 		scope:   projectFixture.project.Scope(),
 		project: projectFixture.project,
+	}
+}
+
+func TestAdminReplayDueWebhookCommitsExpiryThenReturnsStableConflict(
+	t *testing.T,
+) {
+	fixture := newAdminContractFixture(t)
+	now := time.Now().UTC()
+	deadline := now.Add(-time.Minute)
+	event := models.DomainEvent{
+		ID:              "00000000-0000-7000-8000-000000009101",
+		OrganizationID:  fixture.scope.OrganizationID,
+		ProjectID:       fixture.scope.ProjectID,
+		SpecVersion:     "1.0",
+		Source:          "urn:chronodesk:test:admin-replay-expired",
+		Type:            "io.chronodesk.test.admin-replay-expired.v1",
+		Subject:         "outbox-replay/expired",
+		Time:            now.Add(-time.Hour),
+		DataContentType: "application/json",
+		Data:            datatypes.JSON(`{"safe":true}`),
+		ActorType:       models.ActorTypeSystem,
+		ActorID:         "admin-replay-expired-test",
+		ResourceVersion: 1,
+	}
+	if err := fixture.db.Create(&event).Error; err != nil {
+		t.Fatal(err)
+	}
+	snapshot := models.WebhookDeliverySnapshot{
+		ID:                  "00000000-0000-7000-8000-000000009102",
+		OrganizationID:      fixture.scope.OrganizationID,
+		ProjectID:           fixture.scope.ProjectID,
+		ConfigID:            1,
+		EventID:             event.ID,
+		ConfigUpdatedAt:     now.Add(-time.Hour),
+		Provider:            models.WebhookProviderCustom,
+		WebhookURL:          "https://expired.invalid.example/events",
+		Secret:              "sealed-secret",
+		AccessToken:         "sealed-token",
+		CredentialExpiresAt: deadline,
+		EnabledEvents:       "ticket.created",
+		RetryCount:          8,
+		RetryInterval:       60,
+		TimeoutSeconds:      10,
+		RateLimit:           10,
+		RateLimitWindow:     60,
+	}
+	if err := fixture.db.Create(&snapshot).Error; err != nil {
+		t.Fatal(err)
+	}
+	destinationID, err :=
+		models.WebhookDeliverySnapshotDestinationID(snapshot.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery := models.OutboxDelivery{
+		ID:              "00000000-0000-7000-8000-000000009103",
+		OrganizationID:  fixture.scope.OrganizationID,
+		ProjectID:       fixture.scope.ProjectID,
+		EventID:         event.ID,
+		DestinationType: "webhook",
+		DestinationID:   destinationID,
+		Status:          models.OutboxDeliveryFailed,
+		Attempts:        3,
+		MaxAttempts:     8,
+		NextAttemptAt:   deadline,
+		LastError:       "bounded failure",
+		ExpiresAt:       &deadline,
+	}
+	if err := fixture.db.Create(&delivery).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	response := performAdminContractRequest(
+		fixture.router,
+		http.MethodPost,
+		"/api/projects/TEST/admin/agents/outbox/"+delivery.ID+"/replay",
+		"",
+		"expired-replay",
+		httpcontract.FormatETag(1),
+		"expired-replay",
+	)
+	if response.Code != http.StatusConflict ||
+		!strings.Contains(
+			response.Body.String(),
+			ProblemOutboxExpired,
+		) {
+		t.Fatalf(
+			"expired replay status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	var currentDelivery models.OutboxDelivery
+	if err := fixture.db.First(
+		&currentDelivery,
+		"id = ?",
+		delivery.ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if currentDelivery.Status != models.OutboxDeliveryExpired ||
+		currentDelivery.ExpiredAt == nil {
+		t.Fatalf(
+			"expired replay terminal state rolled back: %+v",
+			currentDelivery,
+		)
+	}
+	var currentSnapshot models.WebhookDeliverySnapshot
+	if err := fixture.db.First(
+		&currentSnapshot,
+		"id = ?",
+		snapshot.ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if currentSnapshot.CredentialShreddedAt == nil ||
+		currentSnapshot.CredentialShredReason == nil ||
+		*currentSnapshot.CredentialShredReason !=
+			models.WebhookCredentialShredReasonExpired ||
+		currentSnapshot.Secret != "" ||
+		currentSnapshot.AccessToken != "" {
+		t.Fatalf(
+			"expired replay retained credential material: %+v",
+			currentSnapshot,
+		)
+	}
+}
+
+func TestNativeProblemMapsReplayExpiryAcrossSharedAdapters(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Set("request_id", "outbox-replay-expired")
+
+	writeNativeProblem(context, services.ErrOutboxReplayExpired)
+
+	if recorder.Code != http.StatusConflict ||
+		!strings.Contains(recorder.Body.String(), ProblemOutboxExpired) {
+		t.Fatalf(
+			"shared native problem status=%d body=%s",
+			recorder.Code,
+			recorder.Body.String(),
+		)
 	}
 }
 

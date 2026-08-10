@@ -26,6 +26,7 @@ const (
 	ProblemServiceUnavailable  = "service_unavailable"
 	ProblemAutomationLoop      = "automation_loop"
 	ProblemOutboxConflict      = "outbox_replay_conflict"
+	ProblemOutboxExpired       = "outbox_replay_expired"
 	ProblemAttachmentRejected  = "attachment_rejected"
 	ProblemInternal            = "internal_error"
 )

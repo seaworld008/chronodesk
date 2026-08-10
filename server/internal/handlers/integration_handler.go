@@ -1418,6 +1418,8 @@ type integrationOutboxView struct {
 	NextAttemptAt    time.Time                   `json:"next_attempt_at"`
 	LastError        string                      `json:"last_error,omitempty"`
 	DeliveredAt      *time.Time                  `json:"delivered_at,omitempty"`
+	ExpiresAt        *time.Time                  `json:"expires_at"`
+	ExpiredAt        *time.Time                  `json:"expired_at"`
 	CreatedAt        time.Time                   `json:"created_at"`
 	UpdatedAt        time.Time                   `json:"updated_at"`
 }
@@ -1436,6 +1438,8 @@ func integrationOutboxViewOf(
 		NextAttemptAt:    model.NextAttemptAt,
 		LastError:        services.ScrubOutboxFailureText(model.LastError),
 		DeliveredAt:      model.DeliveredAt,
+		ExpiresAt:        model.ExpiresAt,
+		ExpiredAt:        model.ExpiredAt,
 		CreatedAt:        model.CreatedAt,
 		UpdatedAt:        model.UpdatedAt,
 	}

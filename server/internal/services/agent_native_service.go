@@ -71,6 +71,7 @@ var (
 	ErrInvalidAttachmentCleanup  = errors.New("invalid attachment cleanup destination")
 	ErrOutboxLockLost            = errors.New("outbox delivery lock lost")
 	ErrOutboxReplayConflict      = errors.New("outbox delivery is not replayable")
+	ErrOutboxReplayExpired       = errors.New("outbox delivery replay deadline expired")
 )
 
 const (
@@ -175,6 +176,8 @@ func AgentNativeErrorCode(err error) string {
 		return "invalid_comment"
 	case errors.Is(err, ErrOutboxReplayConflict):
 		return "outbox_replay_conflict"
+	case errors.Is(err, ErrOutboxReplayExpired):
+		return "outbox_replay_expired"
 	case errors.Is(err, ErrTicketConfigurationUnavailable):
 		return "ticket_configuration_unavailable"
 	case errors.Is(err, ErrTicketRequestTypeAmbiguous):
@@ -3717,15 +3720,51 @@ func (s *AgentNativeService) MarkOutboxFailed(
 	return err
 }
 
-func (s *AgentNativeService) ReplayOutbox(ctx context.Context, deliveryID string) error {
-	projectScope, err := commandProjectScope(ctx)
+type OutboxReplayDisposition uint8
+
+const (
+	OutboxReplayQueued OutboxReplayDisposition = iota + 1
+	OutboxReplayExpired
+)
+
+type OutboxReplayResult struct {
+	Disposition  OutboxReplayDisposition
+	Materialized bool
+}
+
+func (s *AgentNativeService) ReplayOutbox(
+	ctx context.Context,
+	deliveryID string,
+) error {
+	result, err := s.ReplayOutboxCommand(ctx, deliveryID)
 	if err != nil {
 		return err
 	}
-	now := s.now()
-	return s.InTransaction(ctx, func(txCtx context.Context, tx *gorm.DB) error {
+	if result.Disposition == OutboxReplayExpired {
+		return ErrOutboxReplayExpired
+	}
+	return nil
+}
+
+// ReplayOutboxCommand returns an expired disposition without a transaction
+// error so a newly materialized terminal state can commit. Adapters translate
+// that disposition only after their transaction succeeds.
+func (s *AgentNativeService) ReplayOutboxCommand(
+	ctx context.Context,
+	deliveryID string,
+) (OutboxReplayResult, error) {
+	commandResult := OutboxReplayResult{}
+	projectScope, err := commandProjectScope(ctx)
+	if err != nil {
+		return commandResult, err
+	}
+	now := s.now().UTC()
+	err = s.InTransaction(ctx, func(txCtx context.Context, tx *gorm.DB) error {
+		if err := lockWebhookLifecycleProject(tx, projectScope); err != nil {
+			return err
+		}
 		var delivery models.OutboxDelivery
-		if err := tx.Where(
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
 			"id = ? AND organization_id = ? AND project_id = ?",
 			deliveryID,
 			projectScope.OrganizationID,
@@ -3733,21 +3772,24 @@ func (s *AgentNativeService) ReplayOutbox(ctx context.Context, deliveryID string
 		).First(&delivery).Error; err != nil {
 			return err
 		}
+		if delivery.DestinationType == "webhook" {
+			result, replayErr := replayWebhookOutboxTx(
+				tx,
+				projectScope,
+				&delivery,
+				now,
+			)
+			commandResult = result
+			return replayErr
+		}
 		if delivery.Status != models.OutboxDeliveryFailed &&
 			delivery.Status != models.OutboxDeliveryDead {
 			return ErrOutboxReplayConflict
 		}
-		result := tx.Model(&models.OutboxDelivery{}).
-			Where(
-				"id = ? AND organization_id = ? AND project_id = ? AND status IN ?",
-				deliveryID,
-				projectScope.OrganizationID,
-				projectScope.ProjectID,
-				[]models.OutboxDeliveryStatus{
-					models.OutboxDeliveryFailed,
-					models.OutboxDeliveryDead,
-				},
-			).
+		result := exactOutboxReplayGeneration(
+			tx.Model(&models.OutboxDelivery{}),
+			&delivery,
+		).
 			Updates(map[string]any{
 				"status":          models.OutboxDeliveryPending,
 				"attempts":        0,
@@ -3767,18 +3809,217 @@ func (s *AgentNativeService) ReplayOutbox(ctx context.Context, deliveryID string
 			// or requeue a delivery after another actor won that race.
 			return ErrOutboxReplayConflict
 		}
-		if err := tx.Model(&models.DomainEvent{}).
-			Where(
-				"id = ? AND organization_id = ? AND project_id = ?",
-				delivery.EventID,
-				projectScope.OrganizationID,
-				projectScope.ProjectID,
-			).
-			Update("published_at", nil).Error; err != nil {
-			return fmt.Errorf("reset replayed event publication state: %w", err)
+		if err := clearOutboxEventPublication(
+			tx,
+			projectScope,
+			delivery.EventID,
+		); err != nil {
+			return fmt.Errorf(
+				"reset replayed event publication state: %w",
+				err,
+			)
 		}
+		commandResult.Disposition = OutboxReplayQueued
 		return nil
 	})
+	if err != nil {
+		return OutboxReplayResult{}, err
+	}
+	return commandResult, nil
+}
+
+func replayWebhookOutboxTx(
+	tx *gorm.DB,
+	scope models.ProjectScope,
+	delivery *models.OutboxDelivery,
+	now time.Time,
+) (OutboxReplayResult, error) {
+	expired := OutboxReplayResult{
+		Disposition: OutboxReplayExpired,
+	}
+	if delivery == nil ||
+		delivery.DestinationType != "webhook" {
+		return OutboxReplayResult{}, ErrWebhookOutboxLifecycleInvariant
+	}
+	if delivery.Status == models.OutboxDeliveryExpired {
+		return expired, nil
+	}
+	if delivery.Status != models.OutboxDeliveryFailed &&
+		delivery.Status != models.OutboxDeliveryDead {
+		return OutboxReplayResult{}, ErrOutboxReplayConflict
+	}
+	if delivery.ExpiresAt == nil {
+		return expired, nil
+	}
+	snapshot, err := lockWebhookSnapshotForDelivery(tx, delivery)
+	if err != nil {
+		if errors.Is(err, ErrWebhookOutboxLifecycleInvariant) {
+			return expired, nil
+		}
+		return OutboxReplayResult{}, err
+	}
+	if snapshot.CredentialShreddedAt != nil {
+		return expired, nil
+	}
+	if err := lockOutboxLifecycleEvent(
+		tx,
+		scope,
+		delivery.EventID,
+	); err != nil {
+		if errors.Is(err, ErrWebhookOutboxLifecycleInvariant) {
+			return expired, nil
+		}
+		return OutboxReplayResult{}, err
+	}
+	if !delivery.ExpiresAt.UTC().After(now) {
+		result := exactOutboxReplayGeneration(
+			tx.Model(&models.OutboxDelivery{}),
+			delivery,
+		).Where("expires_at <= ?", now).
+			Updates(map[string]any{
+				"status":       models.OutboxDeliveryExpired,
+				"expired_at":   now,
+				"delivered_at": nil,
+				"locked_at":    nil,
+				"locked_by":    "",
+				"lock_token":   nil,
+				"last_error": "webhook delivery credential deadline " +
+					"expired",
+				"updated_at": now,
+			})
+		if result.Error != nil {
+			return OutboxReplayResult{}, fmt.Errorf(
+				"expire replayed webhook delivery: %w",
+				result.Error,
+			)
+		}
+		if result.RowsAffected != 1 {
+			return OutboxReplayResult{}, ErrOutboxReplayConflict
+		}
+		if err := shredWebhookSnapshot(
+			tx,
+			snapshot,
+			models.WebhookCredentialShredReasonExpired,
+			now,
+		); err != nil {
+			return OutboxReplayResult{}, err
+		}
+		if err := clearOutboxEventPublication(
+			tx,
+			scope,
+			delivery.EventID,
+		); err != nil {
+			return OutboxReplayResult{}, err
+		}
+		expired.Materialized = true
+		return expired, nil
+	}
+	result := exactOutboxReplayGeneration(
+		tx.Model(&models.OutboxDelivery{}),
+		delivery,
+	).Where("expires_at > ?", now).
+		Updates(map[string]any{
+			"status":          models.OutboxDeliveryPending,
+			"attempts":        0,
+			"next_attempt_at": now,
+			"locked_at":       nil,
+			"locked_by":       "",
+			"lock_token":      nil,
+			"last_error":      "",
+			"delivered_at":    nil,
+			"expired_at":      nil,
+			"updated_at":      now,
+		})
+	if result.Error != nil {
+		return OutboxReplayResult{}, fmt.Errorf(
+			"replay webhook outbox delivery: %w",
+			result.Error,
+		)
+	}
+	if result.RowsAffected != 1 {
+		return OutboxReplayResult{}, ErrOutboxReplayConflict
+	}
+	if err := clearOutboxEventPublication(
+		tx,
+		scope,
+		delivery.EventID,
+	); err != nil {
+		return OutboxReplayResult{}, err
+	}
+	return OutboxReplayResult{Disposition: OutboxReplayQueued}, nil
+}
+
+func exactOutboxReplayGeneration(
+	query *gorm.DB,
+	delivery *models.OutboxDelivery,
+) *gorm.DB {
+	query = query.Where(
+		"id = ? AND organization_id = ? AND project_id = ? "+
+			"AND event_id = ? AND destination_type = ? "+
+			"AND destination_id = ? AND status = ? "+
+			"AND attempts = ? AND max_attempts = ? "+
+			"AND next_attempt_at = ? AND locked_by = ? "+
+			"AND last_error = ? AND updated_at = ?",
+		delivery.ID,
+		delivery.OrganizationID,
+		delivery.ProjectID,
+		delivery.EventID,
+		delivery.DestinationType,
+		delivery.DestinationID,
+		delivery.Status,
+		delivery.Attempts,
+		delivery.MaxAttempts,
+		delivery.NextAttemptAt,
+		delivery.LockedBy,
+		delivery.LastError,
+		delivery.UpdatedAt,
+	)
+	query = whereNullableReplayGeneration(
+		query,
+		"locked_at",
+		delivery.LockedAt,
+	)
+	query = whereNullableReplayGeneration(
+		query,
+		"lock_token",
+		delivery.LockToken,
+	)
+	query = whereNullableReplayGeneration(
+		query,
+		"delivered_at",
+		delivery.DeliveredAt,
+	)
+	query = whereNullableReplayGeneration(
+		query,
+		"expires_at",
+		delivery.ExpiresAt,
+	)
+	return whereNullableReplayGeneration(
+		query,
+		"expired_at",
+		delivery.ExpiredAt,
+	)
+}
+
+func whereNullableReplayGeneration(
+	query *gorm.DB,
+	column string,
+	value any,
+) *gorm.DB {
+	switch current := value.(type) {
+	case *time.Time:
+		if current == nil {
+			return query.Where(column + " IS NULL")
+		}
+		return query.Where(column+" = ?", current.UTC())
+	case *string:
+		if current == nil {
+			return query.Where(column + " IS NULL")
+		}
+		return query.Where(column+" = ?", *current)
+	default:
+		return query.Where(column+" = ?", value)
+	}
 }
 
 type OutboxDeliverer interface {

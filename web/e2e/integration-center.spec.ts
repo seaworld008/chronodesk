@@ -39,7 +39,11 @@ const directory = <T,>(items: T[], page = 1, total = items.length) => ({
 const installIntegrationBackend = async (
   page: Page,
   role: ProjectRole,
-  options: { holdOpsSecondPage?: boolean } = {},
+  options: {
+    holdOpsSecondPage?: boolean
+    outboxStatus?: 'failed' | 'expired'
+    replayExpired?: boolean
+  } = {},
 ) => {
   const sessionID = `integration-${role}-${Date.now()}`
   await installMockSession(
@@ -61,6 +65,7 @@ const installIntegrationBackend = async (
     ifMatch: string | null
   }[] = []
   let outboxReplayed = false
+  let outboxExpired = options.outboxStatus === 'expired'
   let integrationOutboxLoads = 0
   let releaseOpsSecondPage: (() => void) | undefined
   const opsSecondPageGate = new Promise<void>((resolve) => {
@@ -120,10 +125,12 @@ const installIntegrationBackend = async (
             event_id: '00000000-0000-7000-8000-000000000109',
             destination_type: 'webhook',
             destination_label: 'Webhook',
-            status: 'failed',
+            status: outboxExpired ? 'expired' : 'failed',
             attempts: 2,
             next_attempt_at: timestamp,
             last_error: '管理端错误详情不得显示在集成页面',
+            expires_at: timestamp,
+            expired_at: outboxExpired ? timestamp : null,
             updated_at: timestamp,
             resource_version: 7,
           }] : [{
@@ -155,6 +162,19 @@ const installIntegrationBackend = async (
         idempotencyKey: request.headers()['idempotency-key'] ?? null,
         ifMatch: request.headers()['if-match'] ?? null,
       })
+      if (options.replayExpired) {
+        outboxExpired = true
+        await fulfillJSON(route, {
+          type: 'about:blank',
+          title: 'Conflict',
+          status: 409,
+          detail: 'outbox delivery replay deadline expired',
+          code: 'outbox_replay_expired',
+          request_id: 'integration-replay-expired',
+          retryable: false,
+        }, 409)
+        return
+      }
       outboxReplayed = true
       await fulfillJSON(route, {
         code: 0,
@@ -380,11 +400,21 @@ const installIntegrationBackend = async (
           event_id: '00000000-0000-7000-8000-000000000109',
           destination_type: 'webhook',
           destination_label: 'Webhook',
-          status: outboxReplayed ? 'pending' : 'failed',
+          status: outboxExpired
+            ? 'expired'
+            : outboxReplayed
+              ? 'pending'
+              : 'failed',
           attempts: outboxReplayed ? 0 : 2,
           max_attempts: 8,
           next_attempt_at: timestamp,
-          last_error: outboxReplayed ? '' : '上游暂不可用',
+          last_error: outboxExpired
+            ? '投递截止时间已到'
+            : outboxReplayed
+              ? ''
+              : '上游暂不可用',
+          expires_at: timestamp,
+          expired_at: outboxExpired ? timestamp : null,
           created_at: timestamp,
           updated_at: timestamp,
         }]),
@@ -645,5 +675,97 @@ test.describe('企业集成中心', () => {
     expect(backend.replayRequests).toHaveLength(1)
     expect(backend.replayRequests[0].ifMatch).toBe('"v7"')
     expect(backend.replayRequests[0].idempotencyKey).toBeTruthy()
+  })
+
+  test('INT-006：已过期投递显示中文终态且永不发起回放', async ({
+    page,
+  }) => {
+    const backend = await installIntegrationBackend(
+      page,
+      'project_admin',
+      { outboxStatus: 'expired' },
+    )
+    await page.goto('/#/integration-runtime')
+    const main = page.getByRole('main')
+    const outboxResponse = page.waitForResponse((response) =>
+      response.request().method() === 'GET'
+      && new URL(response.url()).pathname.endsWith(
+        '/integrations/outbox',
+      ))
+    await main.getByRole('tab', { name: 'Outbox', exact: true }).click()
+    const projection = await (await outboxResponse).json() as {
+      data: { items: Array<Record<string, unknown>> }
+    }
+    const projectedRow = projection.data.items[0]
+    expect(projectedRow.status).toBe('expired')
+    expect(projectedRow.expires_at).toBe(timestamp)
+    expect(projectedRow.expired_at).toBe(timestamp)
+    for (const forbidden of [
+      'destination_id',
+      'snapshot_id',
+      'locked_at',
+      'locked_by',
+      'lock_token',
+      'generation',
+      'credential',
+      'url',
+      'headers',
+    ]) {
+      expect(projectedRow).not.toHaveProperty(forbidden)
+    }
+
+    await expect(
+      main.getByText('已过期', { exact: true }),
+    ).toBeVisible()
+    await expect(
+      main.getByRole('button', {
+        name: `重新投递 ${outboxDeliveryID}`,
+        exact: true,
+      }),
+    ).toHaveCount(0)
+    expect(backend.replayRequests).toHaveLength(0)
+  })
+
+  test('INT-007：回放与到期竞态显示稳定消息并安全刷新终态', async ({
+    page,
+  }) => {
+    const backend = await installIntegrationBackend(
+      page,
+      'project_admin',
+      { replayExpired: true },
+    )
+    await page.goto('/#/integration-runtime')
+    const main = page.getByRole('main')
+    await main.getByRole('tab', { name: 'Outbox', exact: true }).click()
+    await main.getByRole('button', {
+      name: `重新投递 ${outboxDeliveryID}`,
+      exact: true,
+    }).click()
+    await page.getByRole('dialog', {
+      name: '确认重新投递',
+    }).getByRole('button', {
+      name: '确认重新投递',
+      exact: true,
+    }).click()
+
+    await expect(
+      page.getByText(
+        '该投递已过期或凭据已撤销，无法回放',
+        { exact: true },
+      ),
+    ).toBeVisible()
+    await expect.poll(
+      () => backend.integrationOutboxLoads(),
+    ).toBeGreaterThan(1)
+    await expect(
+      main.getByText('已过期', { exact: true }),
+    ).toBeVisible()
+    await expect(
+      main.getByRole('button', {
+        name: `重新投递 ${outboxDeliveryID}`,
+        exact: true,
+      }),
+    ).toHaveCount(0)
+    expect(backend.replayRequests).toHaveLength(1)
   })
 })

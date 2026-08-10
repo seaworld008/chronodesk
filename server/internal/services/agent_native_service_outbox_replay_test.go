@@ -8,12 +8,12 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"gorm.io/datatypes"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -101,6 +101,319 @@ func TestReplayOutboxKeepsNotFoundContract(t *testing.T) {
 	}
 }
 
+func TestReplayWebhookOutboxRequiresLiveMatchingFiniteSnapshot(t *testing.T) {
+	now := time.Date(2026, time.August, 10, 9, 0, 0, 0, time.UTC)
+
+	t.Run("eligible replay preserves absolute deadline", func(t *testing.T) {
+		fixture := newWebhookOutboxLifecycleFixture(t, now)
+		setWebhookReplayCandidate(t, fixture, models.OutboxDeliveryFailed)
+		before := fixture.delivery.ExpiresAt.UTC()
+
+		if err := fixture.service.ReplayOutbox(
+			contextWithProjectScope(
+				t,
+				fixture.scope,
+				models.HumanActor(1),
+			),
+			fixture.delivery.ID,
+		); err != nil {
+			t.Fatalf("ReplayOutbox() error = %v", err)
+		}
+
+		delivery, snapshot := loadWebhookLifecycleRows(
+			t,
+			fixture,
+			fixture.delivery.ID,
+			fixture.snapshot.ID,
+		)
+		if delivery.Status != models.OutboxDeliveryPending ||
+			delivery.ExpiresAt == nil ||
+			!delivery.ExpiresAt.UTC().Equal(before) {
+			t.Fatalf(
+				"replay changed finite delivery generation: %+v",
+				delivery,
+			)
+		}
+		if snapshot.CredentialShreddedAt != nil ||
+			!snapshot.CredentialExpiresAt.UTC().Equal(before) {
+			t.Fatalf(
+				"replay changed finite snapshot generation: %+v",
+				snapshot,
+			)
+		}
+	})
+
+	t.Run("due replay commits expiry before stable error", func(t *testing.T) {
+		fixture := newWebhookOutboxLifecycleFixture(t, now)
+		setWebhookReplayCandidate(t, fixture, models.OutboxDeliveryDead)
+		absoluteDeadline := fixture.snapshot.CredentialExpiresAt.UTC()
+		fixture.setNow(fixture.snapshot.CredentialExpiresAt)
+
+		err := fixture.service.ReplayOutbox(
+			contextWithProjectScope(
+				t,
+				fixture.scope,
+				models.HumanActor(1),
+			),
+			fixture.delivery.ID,
+		)
+		if !errors.Is(err, ErrOutboxReplayExpired) {
+			t.Fatalf(
+				"ReplayOutbox() error = %v, want %v",
+				err,
+				ErrOutboxReplayExpired,
+			)
+		}
+
+		delivery, snapshot := loadWebhookLifecycleRows(
+			t,
+			fixture,
+			fixture.delivery.ID,
+			fixture.snapshot.ID,
+		)
+		if delivery.Status != models.OutboxDeliveryExpired ||
+			delivery.ExpiredAt == nil ||
+			delivery.DeliveredAt != nil ||
+			delivery.ExpiresAt == nil ||
+			!delivery.ExpiresAt.UTC().Equal(absoluteDeadline) ||
+			!snapshot.CredentialExpiresAt.UTC().Equal(
+				absoluteDeadline,
+			) {
+			t.Fatalf(
+				"due replay did not commit terminal delivery: %+v",
+				delivery,
+			)
+		}
+		assertSnapshotShredded(
+			t,
+			snapshot,
+			models.WebhookCredentialShredReasonExpired,
+		)
+		var event models.DomainEvent
+		if err := fixture.db.First(
+			&event,
+			"id = ?",
+			fixture.event.ID,
+		).Error; err != nil {
+			t.Fatal(err)
+		}
+		if event.PublishedAt != nil {
+			t.Fatalf(
+				"expired replay published domain event at %v",
+				event.PublishedAt,
+			)
+		}
+	})
+
+	t.Run("already expired uses stable error", func(t *testing.T) {
+		fixture := newWebhookOutboxLifecycleFixture(t, now)
+		setWebhookReplayCandidate(t, fixture, models.OutboxDeliveryFailed)
+		expiredAt := now.Add(-time.Minute)
+		if err := fixture.db.Model(&models.OutboxDelivery{}).
+			Where("id = ?", fixture.delivery.ID).
+			Updates(map[string]any{
+				"status":     models.OutboxDeliveryExpired,
+				"expired_at": expiredAt,
+			}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := shredWebhookSnapshot(
+			fixture.db,
+			&fixture.snapshot,
+			models.WebhookCredentialShredReasonExpired,
+			expiredAt,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		err := fixture.service.ReplayOutbox(
+			contextWithProjectScope(
+				t,
+				fixture.scope,
+				models.HumanActor(1),
+			),
+			fixture.delivery.ID,
+		)
+		if !errors.Is(err, ErrOutboxReplayExpired) {
+			t.Fatalf(
+				"ReplayOutbox() error = %v, want %v",
+				err,
+				ErrOutboxReplayExpired,
+			)
+		}
+	})
+
+	t.Run("shredded failed candidate uses stable error", func(t *testing.T) {
+		fixture := newWebhookOutboxLifecycleFixture(t, now)
+		setWebhookReplayCandidate(t, fixture, models.OutboxDeliveryFailed)
+		if err := shredWebhookSnapshot(
+			fixture.db,
+			&fixture.snapshot,
+			models.WebhookCredentialShredReasonRevoked,
+			now,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		err := fixture.service.ReplayOutbox(
+			contextWithProjectScope(
+				t,
+				fixture.scope,
+				models.HumanActor(1),
+			),
+			fixture.delivery.ID,
+		)
+		if !errors.Is(err, ErrOutboxReplayExpired) {
+			t.Fatalf(
+				"ReplayOutbox() error = %v, want %v",
+				err,
+				ErrOutboxReplayExpired,
+			)
+		}
+	})
+
+	t.Run("deadline mismatch uses stable error", func(t *testing.T) {
+		fixture := newWebhookOutboxLifecycleFixture(t, now)
+		setWebhookReplayCandidate(t, fixture, models.OutboxDeliveryDead)
+		mismatch := fixture.snapshot.CredentialExpiresAt.Add(-time.Second)
+		if err := fixture.db.Model(&models.OutboxDelivery{}).
+			Where("id = ?", fixture.delivery.ID).
+			Update("expires_at", mismatch).Error; err != nil {
+			t.Fatal(err)
+		}
+
+		err := fixture.service.ReplayOutbox(
+			contextWithProjectScope(
+				t,
+				fixture.scope,
+				models.HumanActor(1),
+			),
+			fixture.delivery.ID,
+		)
+		if !errors.Is(err, ErrOutboxReplayExpired) {
+			t.Fatalf(
+				"ReplayOutbox() error = %v, want %v",
+				err,
+				ErrOutboxReplayExpired,
+			)
+		}
+	})
+
+	t.Run("missing snapshot pair uses stable error", func(t *testing.T) {
+		fixture := newWebhookOutboxLifecycleFixture(t, now)
+		setWebhookReplayCandidate(t, fixture, models.OutboxDeliveryFailed)
+		if err := fixture.db.Exec(
+			"DELETE FROM webhook_delivery_snapshots WHERE id = ?",
+			fixture.snapshot.ID,
+		).Error; err != nil {
+			t.Fatal(err)
+		}
+
+		err := fixture.service.ReplayOutbox(
+			contextWithProjectScope(
+				t,
+				fixture.scope,
+				models.HumanActor(1),
+			),
+			fixture.delivery.ID,
+		)
+		if !errors.Is(err, ErrOutboxReplayExpired) {
+			t.Fatalf(
+				"ReplayOutbox() error = %v, want %v",
+				err,
+				ErrOutboxReplayExpired,
+			)
+		}
+	})
+}
+
+func TestReplayWebhookOutboxExactGenerationCASRejectsSameStatusABA(
+	t *testing.T,
+) {
+	now := time.Date(2026, time.August, 10, 10, 0, 0, 0, time.UTC)
+	fixture := newWebhookOutboxLifecycleFixture(t, now)
+	setWebhookReplayCandidate(t, fixture, models.OutboxDeliveryFailed)
+
+	const callbackName = "test:outbox_replay_same_status_aba"
+	changedAt := now.Add(time.Second)
+	var injected bool
+	if err := fixture.db.Callback().Update().
+		Before("gorm:update").
+		Register(callbackName, func(tx *gorm.DB) {
+			if injected ||
+				tx.Statement == nil ||
+				tx.Statement.Table !=
+					(models.OutboxDelivery{}).TableName() {
+				return
+			}
+			injected = true
+			if _, err := tx.Statement.ConnPool.ExecContext(
+				tx.Statement.Context,
+				"UPDATE outbox_deliveries "+
+					"SET attempts = attempts + 1, updated_at = ? "+
+					"WHERE id = ? AND status = ?",
+				changedAt,
+				fixture.delivery.ID,
+				models.OutboxDeliveryFailed,
+			); err != nil {
+				tx.AddError(err)
+			}
+		}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = fixture.db.Callback().Update().Remove(callbackName)
+	})
+
+	err := fixture.service.ReplayOutbox(
+		contextWithProjectScope(
+			t,
+			fixture.scope,
+			models.HumanActor(1),
+		),
+		fixture.delivery.ID,
+	)
+	if !errors.Is(err, ErrOutboxReplayConflict) {
+		t.Fatalf(
+			"ReplayOutbox() same-status ABA error = %v, want %v",
+			err,
+			ErrOutboxReplayConflict,
+		)
+	}
+}
+
+func setWebhookReplayCandidate(
+	t *testing.T,
+	fixture *webhookOutboxLifecycleFixture,
+	status models.OutboxDeliveryStatus,
+) {
+	t.Helper()
+	if err := fixture.db.Model(&models.OutboxDelivery{}).
+		Where("id = ?", fixture.delivery.ID).
+		Updates(map[string]any{
+			"status":   status,
+			"attempts": 3,
+			"next_attempt_at": fixture.snapshot.CredentialExpiresAt.Add(
+				-time.Hour,
+			),
+			"locked_at":    nil,
+			"locked_by":    "",
+			"lock_token":   nil,
+			"last_error":   "bounded test failure",
+			"delivered_at": nil,
+			"expired_at":   nil,
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.db.First(
+		&fixture.delivery,
+		"id = ?",
+		fixture.delivery.ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReplayOutboxCASDoesNotClearConcurrentWorkerClaimPostgres(
 	t *testing.T,
 ) {
@@ -110,6 +423,15 @@ func TestReplayOutboxCASDoesNotClearConcurrentWorkerClaimPostgres(
 		&models.OutboxDelivery{},
 	); err != nil {
 		t.Fatalf("migrate isolated Outbox replay tables: %v", err)
+	}
+	if err := db.Exec(`
+		CREATE TABLE projects (
+			id BIGINT PRIMARY KEY,
+			organization_id BIGINT NOT NULL,
+			status TEXT NOT NULL
+		)
+	`).Error; err != nil {
+		t.Fatalf("create isolated Project lifecycle table: %v", err)
 	}
 	if err := db.Exec(`
 		ALTER TABLE outbox_deliveries
@@ -132,6 +454,14 @@ func TestReplayOutboxCASDoesNotClearConcurrentWorkerClaimPostgres(
 	scope := models.ProjectScope{
 		OrganizationID: 11,
 		ProjectID:      22,
+	}
+	if err := db.Exec(
+		"INSERT INTO projects (id, organization_id, status) VALUES (?, ?, ?)",
+		scope.ProjectID,
+		scope.OrganizationID,
+		models.ProjectStatusActive,
+	).Error; err != nil {
+		t.Fatalf("seed isolated Project lifecycle row: %v", err)
 	}
 	ctx, err := WithOperationContext(
 		context.Background(),
@@ -222,29 +552,13 @@ func TestReplayOutboxCASDoesNotClearConcurrentWorkerClaimPostgres(
 		t.Fatalf("worker claim failed delivery: %v", err)
 	}
 
-	replayRead := make(chan struct{})
-	var signalOnce sync.Once
-	const callbackName = "test:observe_outbox_replay_stale_read"
-	if err := db.Callback().Query().
-		After("gorm:query").
-		Register(callbackName, func(tx *gorm.DB) {
-			if tx.Statement != nil &&
-				tx.Statement.Table == (models.OutboxDelivery{}).TableName() {
-				signalOnce.Do(func() { close(replayRead) })
-			}
-		}); err != nil {
-		t.Fatalf("register replay read observer: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = db.Callback().Query().Remove(callbackName)
-	})
-
 	service := NewAgentNativeService(db, AgentNativeOptions{
 		Now: func() time.Time { return now.Add(2 * time.Second) },
 	})
 	replayCtx, cancelReplay := context.WithCancel(ctx)
 	replayResult := make(chan error, 1)
 	replayDone := make(chan struct{})
+	replayStarted := make(chan struct{})
 	t.Cleanup(func() {
 		cancelReplay()
 		if !workerCommitted {
@@ -258,6 +572,7 @@ func TestReplayOutboxCASDoesNotClearConcurrentWorkerClaimPostgres(
 	})
 	go func() {
 		defer close(replayDone)
+		close(replayStarted)
 		replayResult <- service.ReplayOutbox(
 			replayCtx,
 			delivery.ID,
@@ -265,9 +580,9 @@ func TestReplayOutboxCASDoesNotClearConcurrentWorkerClaimPostgres(
 	}()
 
 	select {
-	case <-replayRead:
+	case <-replayStarted:
 	case <-time.After(5 * time.Second):
-		t.Fatal("ReplayOutbox did not read the pre-claim snapshot")
+		t.Fatal("ReplayOutbox goroutine did not start")
 	}
 	if err := workerTx.Commit().Error; err != nil {
 		t.Fatalf("commit worker claim: %v", err)
@@ -311,6 +626,216 @@ func TestReplayOutboxCASDoesNotClearConcurrentWorkerClaimPostgres(
 		t.Fatalf(
 			"rejected race reset event publication: %v",
 			currentEvent.PublishedAt,
+		)
+	}
+}
+
+func TestReplayWebhookOutboxExactGenerationCASPostgres(t *testing.T) {
+	fixture := newWebhookOutboxLifecyclePostgresFixture(t)
+	fixture.clearRows(t)
+	deadline := fixture.now.Add(time.Hour)
+	pair := fixture.seedPair(
+		t,
+		fixture.projectA,
+		models.OutboxDeliveryFailed,
+		deadline,
+		"",
+		nil,
+		2,
+	)
+	service := fixture.service(fixture.runtimeA, fixture.now)
+	const callbackName = "test:postgres_outbox_replay_same_status_aba"
+	changedAt := fixture.now.Add(time.Second)
+	var injected bool
+	if err := fixture.runtimeA.Callback().Update().
+		Before("gorm:update").
+		Register(callbackName, func(tx *gorm.DB) {
+			if injected ||
+				tx.Statement == nil ||
+				tx.Statement.Table !=
+					(models.OutboxDelivery{}).TableName() {
+				return
+			}
+			injected = true
+			if _, err := tx.Statement.ConnPool.ExecContext(
+				tx.Statement.Context,
+				"UPDATE outbox_deliveries "+
+					"SET attempts = attempts + 1, updated_at = $1 "+
+					"WHERE id = $2 AND status = $3",
+				changedAt,
+				pair.delivery.ID,
+				models.OutboxDeliveryFailed,
+			); err != nil {
+				tx.AddError(err)
+			}
+		}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = fixture.runtimeA.Callback().Update().Remove(callbackName)
+	})
+	replayContext := fixture.workerContext(
+		t,
+		context.Background(),
+		fixture.projectA,
+	)
+	err := scopeddb.WithProjectScopeContextTransaction(
+		replayContext,
+		fixture.runtimeA,
+		fixture.projectA.Scope(),
+		func(scopedCtx context.Context) error {
+			return service.ReplayOutbox(scopedCtx, pair.delivery.ID)
+		},
+	)
+	if !injected {
+		t.Fatal("same-status PostgreSQL ABA mutation was not injected")
+	}
+	if !errors.Is(err, ErrOutboxReplayConflict) {
+		t.Fatalf(
+			"ReplayOutbox() PostgreSQL ABA error = %v, want %v",
+			err,
+			ErrOutboxReplayConflict,
+		)
+	}
+	current := fixture.loadDelivery(t, pair.delivery.ID)
+	if current.Status != models.OutboxDeliveryFailed ||
+		current.Attempts != pair.delivery.Attempts ||
+		!current.ExpiresAt.Equal(*pair.delivery.ExpiresAt) {
+		t.Fatalf(
+			"stale replay overwrote PostgreSQL generation: %+v",
+			current,
+		)
+	}
+}
+
+func TestReplayWebhookOutboxLosesToConcurrentWorkerClaimPostgres(
+	t *testing.T,
+) {
+	fixture := newWebhookOutboxLifecyclePostgresFixture(t)
+	fixture.clearRows(t)
+	deadline := fixture.now.Add(time.Hour)
+	pair := fixture.seedPair(
+		t,
+		fixture.projectA,
+		models.OutboxDeliveryFailed,
+		deadline,
+		"",
+		nil,
+		2,
+	)
+	workerContext := fixture.workerContext(
+		t,
+		context.Background(),
+		fixture.projectA,
+	)
+	replayContext := fixture.workerContext(
+		t,
+		context.Background(),
+		fixture.projectA,
+	)
+	workerClaimed := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	workerDone := make(chan error, 1)
+	replayDone := make(chan error, 1)
+	claimAt := fixture.now.Add(time.Second)
+	token, err := uuid.NewV7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimToken := token.String()
+	go func() {
+		workerDone <- scopeddb.WithProjectScopeContextTransaction(
+			workerContext,
+			fixture.runtimeB,
+			fixture.projectA.Scope(),
+			func(scopedCtx context.Context) error {
+				db := fixture.runtimeB.WithContext(scopedCtx)
+				if err := lockWebhookLifecycleProject(
+					db,
+					fixture.projectA.Scope(),
+				); err != nil {
+					return err
+				}
+				var delivery models.OutboxDelivery
+				if err := db.Clauses(
+					clause.Locking{Strength: "UPDATE"},
+				).Where(
+					"id = ? AND organization_id = ? AND project_id = ?",
+					pair.delivery.ID,
+					fixture.projectA.OrganizationID,
+					fixture.projectA.ID,
+				).Take(&delivery).Error; err != nil {
+					return err
+				}
+				result := db.Model(&models.OutboxDelivery{}).
+					Where(
+						"id = ? AND status = ? AND attempts = ?",
+						delivery.ID,
+						models.OutboxDeliveryFailed,
+						delivery.Attempts,
+					).
+					Updates(map[string]any{
+						"status":     models.OutboxDeliveryProcessing,
+						"attempts":   gorm.Expr("attempts + 1"),
+						"locked_at":  claimAt,
+						"locked_by":  "postgres-worker-claim-winner",
+						"lock_token": claimToken,
+						"updated_at": claimAt,
+					})
+				if result.Error != nil {
+					return result.Error
+				}
+				if result.RowsAffected != 1 {
+					return errors.New("worker claim lost exact generation CAS")
+				}
+				close(workerClaimed)
+				<-releaseWorker
+				return nil
+			},
+		)
+	}()
+	select {
+	case <-workerClaimed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("PostgreSQL worker claim did not reach commit gate")
+	}
+	service := fixture.service(fixture.runtimeA, fixture.now.Add(2*time.Second))
+	go func() {
+		replayDone <- scopeddb.WithProjectScopeContextTransaction(
+			replayContext,
+			fixture.runtimeA,
+			fixture.projectA.Scope(),
+			func(scopedCtx context.Context) error {
+				return service.ReplayOutbox(scopedCtx, pair.delivery.ID)
+			},
+		)
+	}()
+	fixture.waitForRuntimeBlockedBy(
+		t,
+		fixture.runtimeAPID,
+		fixture.runtimeBPID,
+	)
+	close(releaseWorker)
+	if workerErr := receivePostgresError(t, workerDone); workerErr != nil {
+		t.Fatal(workerErr)
+	}
+	replayErr := receivePostgresError(t, replayDone)
+	if !errors.Is(replayErr, ErrOutboxReplayConflict) {
+		t.Fatalf(
+			"replay/claim error = %v, want %v",
+			replayErr,
+			ErrOutboxReplayConflict,
+		)
+	}
+	current := fixture.loadDelivery(t, pair.delivery.ID)
+	if current.Status != models.OutboxDeliveryProcessing ||
+		current.Attempts != pair.delivery.Attempts+1 ||
+		current.LockedBy != "postgres-worker-claim-winner" ||
+		current.LockToken == nil ||
+		*current.LockToken != claimToken {
+		t.Fatalf(
+			"replay overwrote worker claim generation: %+v",
+			current,
 		)
 	}
 }

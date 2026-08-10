@@ -142,6 +142,7 @@ const statusOptions: Record<RuntimeTab, { value: string; label: string }[]> = {
     { value: 'succeeded', label: '成功' },
     { value: 'failed', label: '失败' },
     { value: 'dead', label: '终止' },
+    { value: 'expired', label: '已过期' },
   ],
 }
 
@@ -452,6 +453,13 @@ const IntegrationRuntime = () => {
       if (projectKeyRef.current === capturedProjectKey) setConfirmation(null)
     } catch (requestError) {
       if (!controller.signal.aborted) {
+        if (
+          confirmation?.kind === 'outbox-replay'
+          && projectKeyRef.current === capturedProjectKey
+        ) {
+          setConfirmation(null)
+          outbox.refresh()
+        }
         notify(localizedUnknownErrorMessage(
           requestError,
           '集成恢复操作失败，请刷新后重试',
