@@ -882,6 +882,60 @@ func joinSQLiteTableBody(parts []string) string {
 	return strings.Join(parts, "\n,\n")
 }
 
+type sqliteDDLTopLevelToken struct {
+	value  string
+	quoted bool
+}
+
+type sqliteUniqueConstraintKey struct {
+	column     string
+	collation  string
+	descending bool
+}
+
+type sqliteParsedUniqueConstraint struct {
+	name      string
+	keys      []sqliteUniqueConstraintKey
+	algorithm string
+}
+
+var sqliteWebhookCredentialUniqueProtectedColumns = map[string][]string{
+	"projects": {
+		"id",
+		"organization_id",
+		"status",
+	},
+	"domain_events": {
+		"id",
+		"organization_id",
+		"project_id",
+	},
+	"webhook_delivery_snapshots": {
+		"id",
+		"organization_id",
+		"project_id",
+		"event_id",
+		"config_id",
+		"secret",
+		"previous_secret",
+		"access_token",
+		"credential_expires_at",
+		"credential_shredded_at",
+		"credential_shred_reason",
+	},
+	"outbox_deliveries": {
+		"id",
+		"organization_id",
+		"project_id",
+		"event_id",
+		"destination_type",
+		"destination_id",
+		"status",
+		"expires_at",
+		"expired_at",
+	},
+}
+
 func validateSQLiteProtectedColumnConstraintSemantics(
 	db *gorm.DB,
 	table string,
@@ -965,6 +1019,14 @@ func validateSQLiteProtectedColumnConstraintSemantics(
 			)
 		}
 	}
+	if err := validateSQLiteUniqueConstraintSemantics(
+		db,
+		table,
+		parts,
+		protected,
+	); err != nil {
+		return err
+	}
 	if validatePrimaryKey {
 		if tablePrimaryKeys > 1 {
 			return fmt.Errorf(
@@ -977,6 +1039,666 @@ func validateSQLiteProtectedColumnConstraintSemantics(
 		}
 	}
 	return nil
+}
+
+func validateSQLiteUniqueConstraintSemantics(
+	db *gorm.DB,
+	table string,
+	parts []string,
+	protected map[string]bool,
+) error {
+	for _, column := range sqliteWebhookCredentialUniqueProtectedColumns[table] {
+		protected[strings.ToLower(column)] = true
+	}
+	constraints, err := parseSQLiteUniqueConstraints(parts)
+	if err != nil {
+		return fmt.Errorf(
+			"parse SQLite %s UNIQUE constraints: %w",
+			table,
+			err,
+		)
+	}
+	for _, constraint := range constraints {
+		if constraint.algorithm != "ABORT" {
+			return fmt.Errorf(
+				"SQLite %s UNIQUE constraint %q uses noncanonical "+
+					"ON CONFLICT %s",
+				table,
+				constraint.name,
+				constraint.algorithm,
+			)
+		}
+		for _, key := range constraint.keys {
+			if _, unsafe := protected[key.column]; unsafe {
+				return fmt.Errorf(
+					"SQLite %s has a redundant UNIQUE constraint "+
+						"on protected column %s",
+					table,
+					key.column,
+				)
+			}
+		}
+	}
+	return validateSQLiteUniqueConstraintIndexes(db, table, constraints)
+}
+
+func parseSQLiteUniqueConstraints(
+	parts []string,
+) ([]sqliteParsedUniqueConstraint, error) {
+	columnCollations := make(map[string]string)
+	for _, part := range parts {
+		column, collation, isColumn, err :=
+			sqliteColumnDefinitionIdentity(part)
+		if err != nil {
+			return nil, err
+		}
+		if isColumn {
+			columnCollations[column] = collation
+		}
+	}
+	constraints := make([]sqliteParsedUniqueConstraint, 0)
+	for _, part := range parts {
+		tableConstraint, found, err :=
+			parseSQLiteTableUniqueConstraint(part, columnCollations)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			constraints = append(constraints, tableConstraint)
+			continue
+		}
+		column, collation, isColumn, err :=
+			sqliteColumnDefinitionIdentity(part)
+		if err != nil {
+			return nil, err
+		}
+		if !isColumn {
+			continue
+		}
+		columnConstraints, err := parseSQLiteColumnUniqueConstraints(
+			part,
+			column,
+			collation,
+		)
+		if err != nil {
+			return nil, err
+		}
+		constraints = append(constraints, columnConstraints...)
+	}
+	return constraints, nil
+}
+
+func sqliteColumnDefinitionIdentity(
+	part string,
+) (string, string, bool, error) {
+	name, quoted, _, ok := scanSQLiteDDLIdentifier(part, 0)
+	if !ok {
+		return "", "", false, errors.New(
+			"SQLite table body item is missing its leading identifier",
+		)
+	}
+	if !quoted {
+		switch strings.ToLower(name) {
+		case "constraint", "primary", "unique", "check", "foreign":
+			return "", "", false, nil
+		}
+	}
+	tokens, err := sqliteDDLTopLevelTokens(part)
+	if err != nil {
+		return "", "", false, err
+	}
+	collation := "BINARY"
+	collationCount := 0
+	for index := 1; index < len(tokens); index++ {
+		switch {
+		case sqliteDDLTokenIsKeyword(tokens[index], "constraint"),
+			sqliteDDLTokenIsKeyword(tokens[index], "references"):
+			if index+1 >= len(tokens) {
+				return "", "", false, fmt.Errorf(
+					"SQLite column %s has an incomplete %s clause",
+					name,
+					strings.ToUpper(tokens[index].value),
+				)
+			}
+			index++
+			continue
+		case !sqliteDDLTokenIsKeyword(tokens[index], "collate"):
+			continue
+		}
+		if index+1 >= len(tokens) {
+			return "", "", false, fmt.Errorf(
+				"SQLite column %s COLLATE clause is missing its name",
+				name,
+			)
+		}
+		collationCount++
+		collation = strings.ToUpper(tokens[index+1].value)
+		index++
+	}
+	if collationCount > 1 {
+		return "", "", false, fmt.Errorf(
+			"SQLite column %s has duplicated COLLATE clauses",
+			name,
+		)
+	}
+	return strings.ToLower(name), collation, true, nil
+}
+
+func parseSQLiteColumnUniqueConstraints(
+	part string,
+	column string,
+	collation string,
+) ([]sqliteParsedUniqueConstraint, error) {
+	tokens, err := sqliteDDLTopLevelTokens(part)
+	if err != nil {
+		return nil, err
+	}
+	constraints := make([]sqliteParsedUniqueConstraint, 0, 1)
+	for index := 1; index < len(tokens); index++ {
+		switch {
+		case sqliteDDLTokenIsKeyword(tokens[index], "constraint"),
+			sqliteDDLTokenIsKeyword(tokens[index], "collate"),
+			sqliteDDLTokenIsKeyword(tokens[index], "references"):
+			if index+1 >= len(tokens) {
+				return nil, fmt.Errorf(
+					"SQLite column %s has an incomplete %s clause",
+					column,
+					strings.ToUpper(tokens[index].value),
+				)
+			}
+			index++
+			continue
+		case !sqliteDDLTokenIsKeyword(tokens[index], "unique"):
+			continue
+		}
+		algorithm, err := sqliteUniqueConflictAlgorithm(
+			tokens,
+			index,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"SQLite column %s UNIQUE constraint: %w",
+				column,
+				err,
+			)
+		}
+		constraints = append(constraints, sqliteParsedUniqueConstraint{
+			name:      column + " inline UNIQUE",
+			algorithm: algorithm,
+			keys: []sqliteUniqueConstraintKey{{
+				column:    column,
+				collation: collation,
+			}},
+		})
+	}
+	return constraints, nil
+}
+
+func parseSQLiteTableUniqueConstraint(
+	part string,
+	columnCollations map[string]string,
+) (sqliteParsedUniqueConstraint, bool, error) {
+	var constraint sqliteParsedUniqueConstraint
+	kind, quoted, index, ok := scanSQLiteDDLIdentifier(part, 0)
+	if !ok {
+		return constraint, false, errors.New(
+			"SQLite table body item is missing its type",
+		)
+	}
+	if !quoted && strings.EqualFold(kind, "constraint") {
+		name, _, afterName, present := scanSQLiteDDLIdentifier(part, index)
+		if !present {
+			return constraint, false, errors.New(
+				"SQLite table CONSTRAINT is missing its name",
+			)
+		}
+		constraint.name = name
+		kind, quoted, index, ok =
+			scanSQLiteDDLIdentifier(part, afterName)
+		if !ok {
+			return constraint, false, fmt.Errorf(
+				"SQLite table constraint %s is missing its type",
+				name,
+			)
+		}
+	}
+	if quoted || !strings.EqualFold(kind, "unique") {
+		return constraint, false, nil
+	}
+	if constraint.name == "" {
+		constraint.name = "anonymous UNIQUE"
+	}
+	var err error
+	constraint.keys, index, err = parseSQLiteUniqueKeyList(
+		part,
+		index,
+		columnCollations,
+	)
+	if err != nil {
+		return constraint, true, err
+	}
+	constraint.algorithm, err = parseSQLiteTableUniqueConflictClause(
+		part,
+		index,
+	)
+	if err != nil {
+		return constraint, true, err
+	}
+	return constraint, true, nil
+}
+
+func parseSQLiteUniqueKeyList(
+	value string,
+	index int,
+	columnCollations map[string]string,
+) ([]sqliteUniqueConstraintKey, int, error) {
+	var triviaOK bool
+	index, triviaOK = skipSQLiteDDLTrivia(value, index)
+	if !triviaOK {
+		return nil, index, errors.New(
+			"SQLite UNIQUE key list has an unterminated comment",
+		)
+	}
+	if index >= len(value) || value[index] != '(' {
+		return nil, index, errors.New(
+			"SQLite table UNIQUE constraint is missing its key list",
+		)
+	}
+	close, ok := matchingSQLParenthesis(value, index)
+	if !ok {
+		return nil, index, errors.New(
+			"SQLite table UNIQUE key list is malformed",
+		)
+	}
+	parts, err := splitSQLiteTableBody(value[index+1 : close])
+	if err != nil {
+		return nil, index, fmt.Errorf(
+			"parse SQLite UNIQUE key list: %w",
+			err,
+		)
+	}
+	keys := make([]sqliteUniqueConstraintKey, 0, len(parts))
+	for _, part := range parts {
+		key, err := parseSQLiteUniqueKey(part, columnCollations)
+		if err != nil {
+			return nil, index, err
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return nil, index, errors.New(
+			"SQLite table UNIQUE constraint has no keys",
+		)
+	}
+	return keys, close + 1, nil
+}
+
+func parseSQLiteUniqueKey(
+	value string,
+	columnCollations map[string]string,
+) (sqliteUniqueConstraintKey, error) {
+	var key sqliteUniqueConstraintKey
+	column, _, index, ok := scanSQLiteDDLIdentifier(value, 0)
+	if !ok {
+		return key, errors.New(
+			"SQLite table UNIQUE expression keys are not permitted",
+		)
+	}
+	key.column = strings.ToLower(column)
+	key.collation = columnCollations[key.column]
+	if key.collation == "" {
+		return key, fmt.Errorf(
+			"SQLite table UNIQUE references unknown column %s",
+			column,
+		)
+	}
+	collationSet := false
+	orderSet := false
+	for {
+		next, triviaOK := skipSQLiteDDLTrivia(value, index)
+		if !triviaOK {
+			return key, errors.New(
+				"SQLite table UNIQUE key has an unterminated comment",
+			)
+		}
+		if next == len(value) {
+			return key, nil
+		}
+		keyword, quoted, afterKeyword, present :=
+			scanSQLiteDDLIdentifier(value, next)
+		if !present || quoted {
+			return key, errors.New(
+				"SQLite table UNIQUE expression keys are not permitted",
+			)
+		}
+		switch strings.ToLower(keyword) {
+		case "collate":
+			if collationSet {
+				return key, errors.New(
+					"SQLite table UNIQUE key duplicates COLLATE",
+				)
+			}
+			collation, _, afterCollation, ok :=
+				scanSQLiteDDLIdentifier(value, afterKeyword)
+			if !ok {
+				return key, errors.New(
+					"SQLite table UNIQUE COLLATE is missing its name",
+				)
+			}
+			key.collation = strings.ToUpper(collation)
+			collationSet = true
+			index = afterCollation
+		case "asc", "desc":
+			if orderSet {
+				return key, errors.New(
+					"SQLite table UNIQUE key duplicates sort order",
+				)
+			}
+			key.descending = strings.EqualFold(keyword, "desc")
+			orderSet = true
+			index = afterKeyword
+		default:
+			return key, fmt.Errorf(
+				"SQLite table UNIQUE key has unsupported clause %q",
+				keyword,
+			)
+		}
+	}
+}
+
+func parseSQLiteTableUniqueConflictClause(
+	value string,
+	index int,
+) (string, error) {
+	next, ok := skipSQLiteDDLTrivia(value, index)
+	if !ok {
+		return "", errors.New(
+			"SQLite table UNIQUE has an unterminated comment",
+		)
+	}
+	if next == len(value) {
+		return "ABORT", nil
+	}
+	on, quoted, afterOn, present := scanSQLiteDDLIdentifier(value, next)
+	if !present || quoted || !strings.EqualFold(on, "on") {
+		return "", errors.New(
+			"SQLite table UNIQUE has malformed trailing SQL",
+		)
+	}
+	conflict, quoted, afterConflict, present :=
+		scanSQLiteDDLIdentifier(value, afterOn)
+	if !present || quoted || !strings.EqualFold(conflict, "conflict") {
+		return "", errors.New(
+			"SQLite table UNIQUE is missing CONFLICT after ON",
+		)
+	}
+	algorithm, quoted, afterAlgorithm, present :=
+		scanSQLiteDDLIdentifier(value, afterConflict)
+	if !present || quoted {
+		return "", errors.New(
+			"SQLite table UNIQUE ON CONFLICT is missing its algorithm",
+		)
+	}
+	algorithm = strings.ToUpper(algorithm)
+	if !sqliteConflictAlgorithmIsValid(algorithm) {
+		return "", fmt.Errorf(
+			"SQLite table UNIQUE has unknown conflict algorithm %q",
+			algorithm,
+		)
+	}
+	trailing, triviaOK := skipSQLiteDDLTrivia(value, afterAlgorithm)
+	if !triviaOK || trailing != len(value) {
+		return "", errors.New(
+			"SQLite table UNIQUE has malformed trailing SQL",
+		)
+	}
+	return algorithm, nil
+}
+
+func sqliteUniqueConflictAlgorithm(
+	tokens []sqliteDDLTopLevelToken,
+	uniqueIndex int,
+) (string, error) {
+	if uniqueIndex+1 >= len(tokens) ||
+		!sqliteDDLTokenIsKeyword(tokens[uniqueIndex+1], "on") {
+		return "ABORT", nil
+	}
+	if uniqueIndex+3 >= len(tokens) ||
+		!sqliteDDLTokenIsKeyword(tokens[uniqueIndex+2], "conflict") ||
+		tokens[uniqueIndex+3].quoted {
+		return "", errors.New(
+			"ON CONFLICT is missing its algorithm",
+		)
+	}
+	algorithm := strings.ToUpper(tokens[uniqueIndex+3].value)
+	if !sqliteConflictAlgorithmIsValid(algorithm) {
+		return "", fmt.Errorf(
+			"unknown conflict algorithm %q",
+			algorithm,
+		)
+	}
+	return algorithm, nil
+}
+
+func sqliteConflictAlgorithmIsValid(algorithm string) bool {
+	switch strings.ToUpper(algorithm) {
+	case "ROLLBACK", "ABORT", "FAIL", "IGNORE", "REPLACE":
+		return true
+	default:
+		return false
+	}
+}
+
+func sqliteDDLTopLevelTokens(
+	value string,
+) ([]sqliteDDLTopLevelToken, error) {
+	tokens := make([]sqliteDDLTopLevelToken, 0, 16)
+	depth := 0
+	for index := 0; index < len(value); {
+		next, ok := skipSQLiteDDLTrivia(value, index)
+		if !ok {
+			return nil, errors.New("unterminated SQLite DDL comment")
+		}
+		index = next
+		if index >= len(value) {
+			break
+		}
+		switch value[index] {
+		case '\'':
+			after, ok := skipSQLiteDDLStringLiteral(value, index)
+			if !ok {
+				return nil, errors.New(
+					"unterminated SQLite DDL string literal",
+				)
+			}
+			index = after
+		case '(':
+			depth++
+			index++
+		case ')':
+			depth--
+			if depth < 0 {
+				return nil, errors.New(
+					"unbalanced SQLite DDL parenthesis",
+				)
+			}
+			index++
+		default:
+			identifier, quoted, after, present :=
+				scanSQLiteDDLIdentifier(value, index)
+			if present {
+				if depth == 0 {
+					tokens = append(tokens, sqliteDDLTopLevelToken{
+						value:  identifier,
+						quoted: quoted,
+					})
+				}
+				index = after
+				continue
+			}
+			index++
+		}
+	}
+	if depth != 0 {
+		return nil, errors.New("unbalanced SQLite DDL parenthesis")
+	}
+	return tokens, nil
+}
+
+func sqliteDDLTokenIsKeyword(
+	token sqliteDDLTopLevelToken,
+	keyword string,
+) bool {
+	return !token.quoted && strings.EqualFold(token.value, keyword)
+}
+
+func validateSQLiteUniqueConstraintIndexes(
+	db *gorm.DB,
+	table string,
+	constraints []sqliteParsedUniqueConstraint,
+) error {
+	var indexes []sqliteAutomationWebhookIndexListRow
+	if err := db.Raw(
+		"PRAGMA main.index_list(" +
+			quoteAutomationWebhookSQLiteIdentifier(table) + ")",
+	).Scan(&indexes).Error; err != nil {
+		return fmt.Errorf(
+			"read SQLite %s UNIQUE indexes: %w",
+			table,
+			err,
+		)
+	}
+	actual := make([][]sqliteUniqueConstraintKey, 0)
+	for _, index := range indexes {
+		if !strings.EqualFold(index.Origin, "u") {
+			continue
+		}
+		if index.Unique != 1 || index.Partial != 0 {
+			return fmt.Errorf(
+				"SQLite table %s has incompatible origin=u index %s",
+				table,
+				index.Name,
+			)
+		}
+		keys, err := sqliteUniqueIndexKeys(db, table, index.Name)
+		if err != nil {
+			return err
+		}
+		if !sqliteUniqueKeysMatchAnyConstraint(keys, constraints) {
+			return fmt.Errorf(
+				"SQLite table %s has unexplained origin=u index %s",
+				table,
+				index.Name,
+			)
+		}
+		actual = append(actual, keys)
+	}
+	for _, constraint := range constraints {
+		found := false
+		for _, keys := range actual {
+			if sqliteUniqueKeysEqual(keys, constraint.keys) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf(
+				"SQLite table %s UNIQUE constraint %q has no "+
+					"matching origin=u index",
+				table,
+				constraint.name,
+			)
+		}
+	}
+	return nil
+}
+
+func sqliteUniqueIndexKeys(
+	db *gorm.DB,
+	table string,
+	index string,
+) ([]sqliteUniqueConstraintKey, error) {
+	var rows []sqliteAutomationWebhookIndexColumn
+	if err := db.Raw(
+		"PRAGMA main.index_xinfo(" +
+			quoteAutomationWebhookSQLiteIdentifier(index) + ")",
+	).Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf(
+			"read SQLite %s UNIQUE index %s: %w",
+			table,
+			index,
+			err,
+		)
+	}
+	keys := make([]sqliteAutomationWebhookIndexColumn, 0, len(rows))
+	for _, row := range rows {
+		if row.Key == 1 {
+			keys = append(keys, row)
+		}
+	}
+	sort.Slice(keys, func(left, right int) bool {
+		return keys[left].Sequence < keys[right].Sequence
+	})
+	result := make([]sqliteUniqueConstraintKey, 0, len(keys))
+	for position, key := range keys {
+		if key.Sequence != position ||
+			key.ColumnID < 0 ||
+			!key.ColumnName.Valid ||
+			!key.Collation.Valid ||
+			(key.Descending != 0 && key.Descending != 1) {
+			return nil, fmt.Errorf(
+				"SQLite table %s origin=u index %s has "+
+					"non-column, expression, or malformed key semantics",
+				table,
+				index,
+			)
+		}
+		result = append(result, sqliteUniqueConstraintKey{
+			column:     strings.ToLower(key.ColumnName.String),
+			collation:  strings.ToUpper(key.Collation.String),
+			descending: key.Descending == 1,
+		})
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf(
+			"SQLite table %s origin=u index %s has no keys",
+			table,
+			index,
+		)
+	}
+	return result, nil
+}
+
+func sqliteUniqueKeysMatchAnyConstraint(
+	keys []sqliteUniqueConstraintKey,
+	constraints []sqliteParsedUniqueConstraint,
+) bool {
+	for _, constraint := range constraints {
+		if sqliteUniqueKeysEqual(keys, constraint.keys) {
+			return true
+		}
+	}
+	return false
+}
+
+func sqliteUniqueKeysEqual(
+	left []sqliteUniqueConstraintKey,
+	right []sqliteUniqueConstraintKey,
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index].column != right[index].column ||
+			!strings.EqualFold(
+				left[index].collation,
+				right[index].collation,
+			) ||
+			left[index].descending != right[index].descending {
+			return false
+		}
+	}
+	return true
 }
 
 func validateSQLiteDefaultConflictAlgorithms(value string) error {
