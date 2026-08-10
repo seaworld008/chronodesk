@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -31,13 +33,11 @@ type SecretRotationReport struct {
 // Runtime startup must use ValidateRuntimeDatabaseSecrets so FORCE RLS cannot
 // turn a project-owned table scan into a misleading empty result.
 func ValidateDatabaseSecrets(ctx context.Context, db *gorm.DB, protector Protector) error {
+	maintenanceNow := time.Now().UTC()
 	if err := validateDatabaseSecretInputs(db, protector); err != nil {
 		return err
 	}
-	if err := validateProjectDatabaseSecrets(ctx, db, protector); err != nil {
-		return err
-	}
-	return validateGlobalDatabaseSecrets(ctx, db, protector)
+	return validateDatabaseSecretsAt(ctx, db, protector, maintenanceNow)
 }
 
 // ValidateRuntimeDatabaseSecrets is the least-privilege startup gate. It
@@ -49,19 +49,26 @@ func ValidateRuntimeDatabaseSecrets(
 	db *gorm.DB,
 	protector Protector,
 ) error {
+	maintenanceNow := time.Now().UTC()
 	if err := validateDatabaseSecretInputs(db, protector); err != nil {
 		return err
 	}
+	return validateDatabaseSecretsAt(ctx, db, protector, maintenanceNow)
+}
+
+func validateDatabaseSecretsAt(
+	ctx context.Context,
+	db *gorm.DB,
+	protector Protector,
+	maintenanceNow time.Time,
+) error {
 	if err := validateGlobalDatabaseSecrets(ctx, db, protector); err != nil {
 		return err
 	}
 
-	var projects []models.Project
-	if err := db.WithContext(ctx).
-		Select("id", "organization_id").
-		Order("organization_id ASC, id ASC").
-		Find(&projects).Error; err != nil {
-		return fmt.Errorf("list projects for secret validation: %w", err)
+	projects, err := listSecretMaintenanceProjects(ctx, db)
+	if err != nil {
+		return err
 	}
 	for _, project := range projects {
 		scope := project.Scope()
@@ -70,7 +77,13 @@ func ValidateRuntimeDatabaseSecrets(
 			db,
 			scope,
 			func(tx *gorm.DB) error {
-				return validateProjectDatabaseSecrets(ctx, tx, protector)
+				return validateProjectDatabaseSecretsAt(
+					ctx,
+					tx,
+					protector,
+					scope,
+					maintenanceNow,
+				)
 			},
 		); err != nil {
 			return fmt.Errorf(
@@ -83,6 +96,20 @@ func ValidateRuntimeDatabaseSecrets(
 	return nil
 }
 
+func listSecretMaintenanceProjects(
+	ctx context.Context,
+	db *gorm.DB,
+) ([]models.Project, error) {
+	var projects []models.Project
+	if err := db.WithContext(ctx).
+		Select("id", "organization_id").
+		Order("organization_id ASC, id ASC").
+		Find(&projects).Error; err != nil {
+		return nil, fmt.Errorf("list projects for secret maintenance: %w", err)
+	}
+	return projects, nil
+}
+
 func validateDatabaseSecretInputs(db *gorm.DB, protector Protector) error {
 	if db == nil {
 		return errors.New("secret validation database is required")
@@ -93,14 +120,22 @@ func validateDatabaseSecretInputs(db *gorm.DB, protector Protector) error {
 	return nil
 }
 
-func validateProjectDatabaseSecrets(
+func validateProjectDatabaseSecretsAt(
 	ctx context.Context,
 	db *gorm.DB,
 	protector Protector,
+	scope models.ProjectScope,
+	maintenanceNow time.Time,
 ) error {
 	var webhooks []models.WebhookConfig
 	if err := db.WithContext(ctx).Unscoped().
 		Select("id", "secret", "previous_secret", "access_token").
+		Where(
+			"organization_id = ? AND project_id = ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		Order("id ASC").
 		Find(&webhooks).Error; err != nil {
 		return fmt.Errorf("validate webhook secrets: %w", err)
 	}
@@ -121,9 +156,77 @@ func validateProjectDatabaseSecrets(
 		}
 	}
 
+	var snapshots []models.WebhookDeliverySnapshot
+	if err := db.WithContext(ctx).
+		Select(
+			"id",
+			"config_id",
+			"secret",
+			"previous_secret",
+			"access_token",
+			"credential_expires_at",
+			"credential_shredded_at",
+			"credential_shred_reason",
+		).
+		Where(
+			"organization_id = ? AND project_id = ? AND credential_shredded_at IS NULL",
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		Order("id ASC").
+		Find(&snapshots).Error; err != nil {
+		return fmt.Errorf("validate webhook snapshot secrets: %w", err)
+	}
+	for _, row := range snapshots {
+		if row.CredentialExpiresAt.IsZero() {
+			return errors.New(
+				"validate webhook snapshot secrets: unshredded credential lifetime is missing",
+			)
+		}
+		if !row.CredentialExpiresAt.After(maintenanceNow) {
+			continue
+		}
+		rowID := strconv.FormatUint(uint64(row.ConfigID), 10)
+		if err := validateEnvelope(
+			protector,
+			row.Secret,
+			FieldAAD(webhookSecretsTable, rowID, "secret"),
+		); err != nil {
+			return fmt.Errorf("webhook snapshot %q secret: %w", row.ID, err)
+		}
+		if err := validateEnvelope(
+			protector,
+			row.PreviousSecret,
+			FieldAAD(webhookSecretsTable, rowID, "previous_secret"),
+		); err != nil {
+			return fmt.Errorf(
+				"webhook snapshot %q previous secret: %w",
+				row.ID,
+				err,
+			)
+		}
+		if err := validateEnvelope(
+			protector,
+			row.AccessToken,
+			FieldAAD(webhookSecretsTable, rowID, "access_token"),
+		); err != nil {
+			return fmt.Errorf(
+				"webhook snapshot %q access token: %w",
+				row.ID,
+				err,
+			)
+		}
+	}
+
 	var pushes []models.AgentPushNotificationConfig
 	if err := db.WithContext(ctx).
 		Select("id", "token", "authentication").
+		Where(
+			"organization_id = ? AND project_id = ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		Order("id ASC").
 		Find(&pushes).Error; err != nil {
 		return fmt.Errorf("validate A2A push secrets: %w", err)
 	}
@@ -150,6 +253,7 @@ func validateGlobalDatabaseSecrets(
 	var emails []models.EmailConfig
 	if err := db.WithContext(ctx).
 		Select("id", "smtp_password").
+		Order("id ASC").
 		Find(&emails).Error; err != nil {
 		return fmt.Errorf("validate SMTP secrets: %w", err)
 	}
@@ -178,131 +282,517 @@ func RotateDatabaseSecrets(
 	db *gorm.DB,
 	protector Protector,
 ) (SecretRotationReport, error) {
-	var report SecretRotationReport
+	maintenanceNow := time.Now().UTC()
 	if db == nil {
-		return report, errors.New("secret rotation database is required")
+		return SecretRotationReport{}, errors.New("secret rotation database is required")
 	}
 	if protector == nil {
-		return report, ErrKeyringUnavailable
+		return SecretRotationReport{}, ErrKeyringUnavailable
 	}
+	return rotateDatabaseSecretsAt(ctx, db, protector, maintenanceNow)
+}
+
+func rotateDatabaseSecretsAt(
+	ctx context.Context,
+	db *gorm.DB,
+	protector Protector,
+	maintenanceNow time.Time,
+) (SecretRotationReport, error) {
+	var report SecretRotationReport
 	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var webhooks []models.WebhookConfig
-		if err := tx.Unscoped().
-			Select("id", "secret", "previous_secret", "access_token").
-			Find(&webhooks).Error; err != nil {
+		projects, err := listSecretMaintenanceProjects(ctx, tx)
+		if err != nil {
 			return err
 		}
-		for _, row := range webhooks {
-			rowID := strconv.FormatUint(uint64(row.ID), 10)
-			updates := map[string]any{}
-			if value, changed, err := rotateValue(protector, row.Secret, FieldAAD(webhookSecretsTable, rowID, "secret")); err != nil {
-				return fmt.Errorf("rotate webhook %d secret: %w", row.ID, err)
-			} else if changed {
-				updates["secret"] = value
-				report.Rotated++
-			} else if row.Secret != "" {
-				report.Verified++
+		for _, project := range projects {
+			if err := lockSecretMaintenanceProject(tx, project.Scope()); err != nil {
+				return err
 			}
-			if value, changed, err := rotateValue(
-				protector,
-				row.PreviousSecret,
-				FieldAAD(webhookSecretsTable, rowID, "previous_secret"),
+			if err := scopeddb.ConfigureProjectScopeTransaction(
+				tx,
+				project.Scope(),
 			); err != nil {
 				return fmt.Errorf(
-					"rotate webhook %d previous secret: %w",
-					row.ID,
+					"configure project %d secret rotation scope: %w",
+					project.ID,
 					err,
 				)
-			} else if changed {
-				updates["previous_secret"] = value
-				report.Rotated++
-			} else if row.PreviousSecret != "" {
-				report.Verified++
 			}
-			if value, changed, err := rotateValue(protector, row.AccessToken, FieldAAD(webhookSecretsTable, rowID, "access_token")); err != nil {
-				return fmt.Errorf("rotate webhook %d access token: %w", row.ID, err)
-			} else if changed {
-				updates["access_token"] = value
-				report.Rotated++
-			} else if row.AccessToken != "" {
-				report.Verified++
-			}
-			if len(updates) > 0 {
-				if err := tx.Unscoped().Model(&models.WebhookConfig{}).Where("id = ?", row.ID).Updates(updates).Error; err != nil {
-					return err
-				}
-			}
-		}
-
-		var emails []models.EmailConfig
-		if err := tx.Select("id", "smtp_password").Find(&emails).Error; err != nil {
-			return err
-		}
-		for _, row := range emails {
-			rowID := strconv.FormatUint(uint64(row.ID), 10)
-			value, changed, err := rotateValue(protector, row.SMTPPassword, FieldAAD(emailSecretsTable, rowID, "smtp_password"))
-			if err != nil {
-				return fmt.Errorf("rotate email config %d SMTP password: %w", row.ID, err)
-			}
-			if changed {
-				if err := tx.Model(&models.EmailConfig{}).Where("id = ?", row.ID).
-					UpdateColumn("smtp_password", value).Error; err != nil {
-					return err
-				}
-				report.Rotated++
-			} else if row.SMTPPassword != "" {
-				report.Verified++
-			}
-		}
-
-		var pushes []models.AgentPushNotificationConfig
-		if err := tx.Select("id", "token", "authentication").Find(&pushes).Error; err != nil {
-			return err
-		}
-		for _, row := range pushes {
-			updates := map[string]any{}
-			if value, changed, err := rotateValue(protector, row.Token, FieldAAD(a2aPushSecretsTable, row.ID, "token")); err != nil {
-				return fmt.Errorf("rotate A2A push config %q token: %w", row.ID, err)
-			} else if changed {
-				updates["token"] = value
-				report.Rotated++
-			} else if row.Token != "" {
-				report.Verified++
-			}
-
-			storedAuthentication, err := storedJSONEnvelope(row.Authentication)
-			if err != nil {
-				return fmt.Errorf("rotate A2A push config %q authentication: %w", row.ID, err)
-			}
-			authenticationEnvelope, authenticationChanged, err := rotateValue(
+			projectReport, err := rotateProjectDatabaseSecretsAt(
+				tx,
 				protector,
-				storedAuthentication,
-				FieldAAD(a2aPushSecretsTable, row.ID, "authentication"),
+				project.Scope(),
+				maintenanceNow,
 			)
 			if err != nil {
-				return fmt.Errorf("rotate A2A push config %q authentication: %w", row.ID, err)
+				return fmt.Errorf(
+					"rotate project %d database secrets: %w",
+					project.ID,
+					err,
+				)
 			}
-			if authenticationChanged {
-				encoded, err := json.Marshal(authenticationEnvelope)
-				if err != nil {
-					return err
-				}
-				updates["authentication"] = datatypes.JSON(encoded)
-				report.Rotated++
-			} else if storedAuthentication != "" {
-				report.Verified++
-			}
-			if len(updates) > 0 {
-				if err := tx.Model(&models.AgentPushNotificationConfig{}).
-					Where("id = ?", row.ID).Updates(updates).Error; err != nil {
-					return err
-				}
-			}
+			report.add(projectReport)
 		}
+
+		globalReport, err := rotateGlobalDatabaseSecrets(tx, protector)
+		if err != nil {
+			return err
+		}
+		report.add(globalReport)
 		return nil
 	})
 	if err != nil {
 		return SecretRotationReport{}, err
+	}
+	return report, nil
+}
+
+func (report *SecretRotationReport) add(delta SecretRotationReport) {
+	report.Rotated += delta.Rotated
+	report.Verified += delta.Verified
+}
+
+func lockSecretMaintenanceProject(
+	tx *gorm.DB,
+	scope models.ProjectScope,
+) error {
+	var project models.Project
+	query := tx.Select("id", "organization_id").
+		Where("id = ? AND organization_id = ?", scope.ProjectID, scope.OrganizationID)
+	query = withSecretMaintenanceLock(query, "SHARE")
+	if err := query.First(&project).Error; err != nil {
+		return fmt.Errorf("lock project for secret rotation: %w", err)
+	}
+	return nil
+}
+
+func withSecretMaintenanceLock(db *gorm.DB, strength string) *gorm.DB {
+	if db.Dialector.Name() != "postgres" {
+		return db
+	}
+	return db.Clauses(clause.Locking{Strength: strength})
+}
+
+func rotateProjectDatabaseSecretsAt(
+	tx *gorm.DB,
+	protector Protector,
+	scope models.ProjectScope,
+	maintenanceNow time.Time,
+) (SecretRotationReport, error) {
+	var report SecretRotationReport
+	var webhooks []models.WebhookConfig
+	webhookQuery := tx.Unscoped().
+		Select(
+			"id",
+			"organization_id",
+			"project_id",
+			"secret",
+			"previous_secret",
+			"access_token",
+		).
+		Where(
+			"organization_id = ? AND project_id = ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		Order("id ASC")
+	if err := withSecretMaintenanceLock(
+		webhookQuery,
+		"UPDATE",
+	).Find(&webhooks).Error; err != nil {
+		return report, fmt.Errorf("lock webhook configs: %w", err)
+	}
+	for _, row := range webhooks {
+		delta, err := rotateWebhookConfigRow(tx, protector, row)
+		if err != nil {
+			return SecretRotationReport{}, err
+		}
+		report.add(delta)
+	}
+
+	var snapshots []models.WebhookDeliverySnapshot
+	snapshotQuery := tx.
+		Select(
+			"id",
+			"organization_id",
+			"project_id",
+			"config_id",
+			"secret",
+			"previous_secret",
+			"access_token",
+			"credential_expires_at",
+			"credential_shredded_at",
+			"credential_shred_reason",
+		).
+		Where(
+			"organization_id = ? AND project_id = ? AND credential_shredded_at IS NULL",
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		Order("id ASC")
+	if err := withSecretMaintenanceLock(
+		snapshotQuery,
+		"UPDATE",
+	).Find(&snapshots).Error; err != nil {
+		return SecretRotationReport{}, fmt.Errorf(
+			"lock webhook delivery snapshots: %w",
+			err,
+		)
+	}
+	for _, row := range snapshots {
+		if row.CredentialExpiresAt.IsZero() {
+			return SecretRotationReport{}, errors.New(
+				"rotate webhook snapshot secrets: unshredded credential lifetime is missing",
+			)
+		}
+		if !row.CredentialExpiresAt.After(maintenanceNow) {
+			continue
+		}
+		delta, _, err := rewrapWebhookSnapshotRow(
+			tx,
+			protector,
+			row,
+			maintenanceNow,
+		)
+		if err != nil {
+			return SecretRotationReport{}, err
+		}
+		report.add(delta)
+	}
+
+	var pushes []models.AgentPushNotificationConfig
+	pushQuery := tx.Select(
+		"id",
+		"organization_id",
+		"project_id",
+		"token",
+		"authentication",
+	).Where(
+		"organization_id = ? AND project_id = ?",
+		scope.OrganizationID,
+		scope.ProjectID,
+	).Order("id ASC")
+	if err := withSecretMaintenanceLock(
+		pushQuery,
+		"UPDATE",
+	).Find(&pushes).Error; err != nil {
+		return SecretRotationReport{}, fmt.Errorf(
+			"lock A2A push configs: %w",
+			err,
+		)
+	}
+	for _, row := range pushes {
+		delta, err := rotateA2APushRow(tx, protector, row)
+		if err != nil {
+			return SecretRotationReport{}, err
+		}
+		report.add(delta)
+	}
+	return report, nil
+}
+
+func rotateWebhookConfigRow(
+	tx *gorm.DB,
+	protector Protector,
+	row models.WebhookConfig,
+) (SecretRotationReport, error) {
+	rowID := strconv.FormatUint(uint64(row.ID), 10)
+	updates := map[string]any{}
+	var delta SecretRotationReport
+	for _, field := range []struct {
+		column string
+		value  string
+	}{
+		{column: "secret", value: row.Secret},
+		{column: "previous_secret", value: row.PreviousSecret},
+		{column: "access_token", value: row.AccessToken},
+	} {
+		value, changed, err := rotateValue(
+			protector,
+			field.value,
+			FieldAAD(webhookSecretsTable, rowID, field.column),
+		)
+		if err != nil {
+			return SecretRotationReport{}, fmt.Errorf(
+				"rotate webhook %d %s: %w",
+				row.ID,
+				field.column,
+				err,
+			)
+		}
+		if changed {
+			updates[field.column] = value
+			delta.Rotated++
+		} else if field.value != "" {
+			delta.Verified++
+		}
+	}
+	if len(updates) == 0 {
+		return delta, nil
+	}
+	result := tx.Unscoped().Model(&models.WebhookConfig{}).
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ? AND secret = ? AND previous_secret = ? AND access_token = ?",
+			row.ID,
+			row.OrganizationID,
+			row.ProjectID,
+			row.Secret,
+			row.PreviousSecret,
+			row.AccessToken,
+		).
+		Updates(updates)
+	if result.Error != nil {
+		return SecretRotationReport{}, result.Error
+	}
+	if result.RowsAffected != 1 {
+		return SecretRotationReport{}, errors.New(
+			"webhook config changed during secret rotation",
+		)
+	}
+	return delta, nil
+}
+
+func rewrapWebhookSnapshotRow(
+	tx *gorm.DB,
+	protector Protector,
+	row models.WebhookDeliverySnapshot,
+	maintenanceNow time.Time,
+) (SecretRotationReport, bool, error) {
+	if row.CredentialExpiresAt.IsZero() {
+		return SecretRotationReport{}, false, errors.New(
+			"rotate webhook snapshot secrets: unshredded credential lifetime is missing",
+		)
+	}
+	if row.CredentialShreddedAt != nil ||
+		!row.CredentialExpiresAt.After(maintenanceNow) {
+		return SecretRotationReport{}, true, nil
+	}
+
+	rowID := strconv.FormatUint(uint64(row.ConfigID), 10)
+	updates := map[string]any{}
+	var delta SecretRotationReport
+	for _, field := range []struct {
+		column string
+		value  string
+	}{
+		{column: "secret", value: row.Secret},
+		{column: "previous_secret", value: row.PreviousSecret},
+		{column: "access_token", value: row.AccessToken},
+	} {
+		value, changed, err := rotateValue(
+			protector,
+			field.value,
+			FieldAAD(webhookSecretsTable, rowID, field.column),
+		)
+		if err != nil {
+			return SecretRotationReport{}, false, fmt.Errorf(
+				"rotate webhook snapshot %q %s: %w",
+				row.ID,
+				field.column,
+				err,
+			)
+		}
+		if changed {
+			updates[field.column] = value
+			delta.Rotated++
+		} else if field.value != "" {
+			delta.Verified++
+		}
+	}
+	if len(updates) == 0 {
+		return delta, false, nil
+	}
+
+	result := tx.Table("webhook_delivery_snapshots").
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ? AND config_id = ?",
+			row.ID,
+			row.OrganizationID,
+			row.ProjectID,
+			row.ConfigID,
+		).
+		Where(
+			"secret = ? AND previous_secret = ? AND access_token = ?",
+			row.Secret,
+			row.PreviousSecret,
+			row.AccessToken,
+		).
+		Where(
+			"credential_shredded_at IS NULL AND credential_expires_at > ?",
+			maintenanceNow,
+		).
+		Updates(updates)
+	if result.Error != nil {
+		return SecretRotationReport{}, false, result.Error
+	}
+	if result.RowsAffected == 1 {
+		return delta, false, nil
+	}
+
+	var current models.WebhookDeliverySnapshot
+	if err := tx.Table("webhook_delivery_snapshots").
+		Select(
+			"id",
+			"organization_id",
+			"project_id",
+			"config_id",
+			"secret",
+			"previous_secret",
+			"access_token",
+			"credential_expires_at",
+			"credential_shredded_at",
+			"credential_shred_reason",
+		).
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ? AND config_id = ?",
+			row.ID,
+			row.OrganizationID,
+			row.ProjectID,
+			row.ConfigID,
+		).
+		Take(&current).Error; err != nil {
+		return SecretRotationReport{}, false, fmt.Errorf(
+			"re-read webhook snapshot after rotation conflict: %w",
+			err,
+		)
+	}
+	if current.CredentialExpiresAt.IsZero() {
+		return SecretRotationReport{}, false, errors.New(
+			"rotate webhook snapshot secrets: unshredded credential lifetime is missing",
+		)
+	}
+	if current.CredentialShreddedAt != nil ||
+		!current.CredentialExpiresAt.After(maintenanceNow) {
+		return SecretRotationReport{}, true, nil
+	}
+	return SecretRotationReport{}, false, errors.New(
+		"live webhook snapshot changed during secret rotation",
+	)
+}
+
+func rotateA2APushRow(
+	tx *gorm.DB,
+	protector Protector,
+	row models.AgentPushNotificationConfig,
+) (SecretRotationReport, error) {
+	updates := map[string]any{}
+	var delta SecretRotationReport
+	if value, changed, err := rotateValue(
+		protector,
+		row.Token,
+		FieldAAD(a2aPushSecretsTable, row.ID, "token"),
+	); err != nil {
+		return SecretRotationReport{}, fmt.Errorf(
+			"rotate A2A push config %q token: %w",
+			row.ID,
+			err,
+		)
+	} else if changed {
+		updates["token"] = value
+		delta.Rotated++
+	} else if row.Token != "" {
+		delta.Verified++
+	}
+
+	storedAuthentication, err := storedJSONEnvelope(row.Authentication)
+	if err != nil {
+		return SecretRotationReport{}, fmt.Errorf(
+			"rotate A2A push config %q authentication: %w",
+			row.ID,
+			err,
+		)
+	}
+	authenticationEnvelope, authenticationChanged, err := rotateValue(
+		protector,
+		storedAuthentication,
+		FieldAAD(a2aPushSecretsTable, row.ID, "authentication"),
+	)
+	if err != nil {
+		return SecretRotationReport{}, fmt.Errorf(
+			"rotate A2A push config %q authentication: %w",
+			row.ID,
+			err,
+		)
+	}
+	if authenticationChanged {
+		encoded, err := json.Marshal(authenticationEnvelope)
+		if err != nil {
+			return SecretRotationReport{}, err
+		}
+		updates["authentication"] = datatypes.JSON(encoded)
+		delta.Rotated++
+	} else if storedAuthentication != "" {
+		delta.Verified++
+	}
+	if len(updates) == 0 {
+		return delta, nil
+	}
+	result := tx.Model(&models.AgentPushNotificationConfig{}).
+		Where(
+			"id = ? AND organization_id = ? AND project_id = ? AND token = ? AND authentication = ?",
+			row.ID,
+			row.OrganizationID,
+			row.ProjectID,
+			row.Token,
+			row.Authentication,
+		).
+		Updates(updates)
+	if result.Error != nil {
+		return SecretRotationReport{}, result.Error
+	}
+	if result.RowsAffected != 1 {
+		return SecretRotationReport{}, errors.New(
+			"A2A push config changed during secret rotation",
+		)
+	}
+	return delta, nil
+}
+
+func rotateGlobalDatabaseSecrets(
+	tx *gorm.DB,
+	protector Protector,
+) (SecretRotationReport, error) {
+	var report SecretRotationReport
+	var emails []models.EmailConfig
+	emailQuery := tx.Select("id", "smtp_password").Order("id ASC")
+	if err := withSecretMaintenanceLock(
+		emailQuery,
+		"UPDATE",
+	).Find(&emails).Error; err != nil {
+		return report, fmt.Errorf("lock email configs: %w", err)
+	}
+	for _, row := range emails {
+		rowID := strconv.FormatUint(uint64(row.ID), 10)
+		value, changed, err := rotateValue(
+			protector,
+			row.SMTPPassword,
+			FieldAAD(emailSecretsTable, rowID, "smtp_password"),
+		)
+		if err != nil {
+			return SecretRotationReport{}, fmt.Errorf(
+				"rotate email config %d SMTP password: %w",
+				row.ID,
+				err,
+			)
+		}
+		if !changed {
+			if row.SMTPPassword != "" {
+				report.Verified++
+			}
+			continue
+		}
+		result := tx.Model(&models.EmailConfig{}).
+			Where("id = ? AND smtp_password = ?", row.ID, row.SMTPPassword).
+			UpdateColumn("smtp_password", value)
+		if result.Error != nil {
+			return SecretRotationReport{}, result.Error
+		}
+		if result.RowsAffected != 1 {
+			return SecretRotationReport{}, errors.New(
+				"email config changed during secret rotation",
+			)
+		}
+		report.Rotated++
 	}
 	return report, nil
 }
