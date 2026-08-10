@@ -74,6 +74,8 @@ var (
 )
 
 const (
+	outboxAttemptResultHandoffTimeout = 100 * time.Millisecond
+
 	// AttachmentCleanupOutboxDestination routes a committed ticket deletion to
 	// the configured AttachmentStorage. The destination identifier contains an
 	// attachment ID and a hash of its storage key, never a path or URL.
@@ -388,6 +390,13 @@ type AgentNativeService struct {
 	outboxDeliveryTimeout      time.Duration
 	outboxDeliverySlots        chan struct{}
 	outboxProjectCursor        atomic.Uint64
+	outboxProjectCursorMu      sync.Mutex
+	outboxClaimCursorMu        sync.Mutex
+	outboxClaimClassCursors    map[string]uint8
+	outboxClaimScanCursors     map[string]outboxClaimScanCursor
+	outboxCleanupProjectCursor atomic.Uint64
+	outboxCleanupCursorMu      sync.Mutex
+	outboxCleanupCursors       map[string]webhookOutboxCleanupProjectCursor
 	loopThreshold              int
 	loopWindow                 time.Duration
 	executionGuard             AgentExecutionGuard
@@ -3032,14 +3041,36 @@ func (s *AgentNativeService) ClaimPendingOutbox(
 	limit int,
 	lockTTL time.Duration,
 ) ([]*models.OutboxDelivery, error) {
-	return s.claimPendingOutbox(
+	claimed, _, _, err := s.claimPendingOutbox(
 		ctx,
 		workerID,
 		limit,
 		lockTTL,
+		outboxBatchPersistenceCutoff(s.db),
 		archivedProjectOutboxDestinations(),
 		archivedProjectOutboxEventTypes(),
 	)
+	return claimed, err
+}
+
+func outboxBatchPersistenceCutoff(db *gorm.DB) time.Time {
+	if db == nil || db.Config == nil || db.NowFunc == nil {
+		return time.Time{}
+	}
+	now := db.NowFunc()
+	if db.Dialector != nil && db.Dialector.Name() == "sqlite" {
+		return time.Date(
+			now.Year(),
+			now.Month(),
+			now.Day(),
+			now.Hour(),
+			now.Minute(),
+			now.Second(),
+			now.Nanosecond(),
+			time.UTC,
+		)
+	}
+	return now.UTC()
 }
 
 func (s *AgentNativeService) claimPendingOutbox(
@@ -3047,11 +3078,12 @@ func (s *AgentNativeService) claimPendingOutbox(
 	workerID string,
 	limit int,
 	lockTTL time.Duration,
+	batchCreatedBefore time.Time,
 	archivedAllowedDestinations []string,
 	archivedAllowedEventTypes []string,
-) ([]*models.OutboxDelivery, error) {
+) ([]*models.OutboxDelivery, int, int, error) {
 	if strings.TrimSpace(workerID) == "" {
-		return nil, fmt.Errorf("worker id is required")
+		return nil, 0, 0, fmt.Errorf("worker id is required")
 	}
 	if limit <= 0 {
 		limit = 50
@@ -3062,12 +3094,19 @@ func (s *AgentNativeService) claimPendingOutbox(
 	if lockTTL <= 0 {
 		lockTTL = 2 * time.Minute
 	}
-	now := s.now()
-	lockCutoff := now.Add(-lockTTL)
+	if batchCreatedBefore.IsZero() {
+		return nil, 0, 0, errors.New(
+			"outbox batch creation cutoff is required",
+		)
+	}
+	batchCreatedBefore = batchCreatedBefore.UTC()
 	var claimed []*models.OutboxDelivery
+	backstoppedDead := 0
+	scannedCandidates := 0
+	var scanCursorMutations []outboxClaimScanCursorMutation
 	operation, err := requireOutboxWorkerOperation(ctx)
 	if err != nil {
-		return nil, err
+		return nil, 0, 0, err
 	}
 	applyAllowlist := func(query *gorm.DB) *gorm.DB {
 		if len(archivedAllowedDestinations) == 0 &&
@@ -3138,6 +3177,8 @@ func (s *AgentNativeService) claimPendingOutbox(
 						project.Status != models.ProjectStatusArchived {
 						return ErrProjectInactive
 					}
+					selectionNow := s.now().UTC()
+					selectionLockCutoff := selectionNow.Add(-lockTTL)
 					applyCurrentProjectPolicy := func(
 						query *gorm.DB,
 					) *gorm.DB {
@@ -3147,43 +3188,336 @@ func (s *AgentNativeService) claimPendingOutbox(
 						}
 						return applyAllowlist(query)
 					}
-					var candidates []models.OutboxDelivery
-					candidateQuery := tx.Where(
-						"organization_id = ? AND project_id = ? AND ((status IN ? AND next_attempt_at <= ?) OR (status = ? AND locked_at < ?))",
-						operation.Scope.OrganizationID,
-						operation.Scope.ProjectID,
-						[]models.OutboxDeliveryStatus{
-							models.OutboxDeliveryPending,
-							models.OutboxDeliveryFailed,
-						},
-						now,
-						models.OutboxDeliveryProcessing,
-						lockCutoff,
+					claimClasses := make(
+						[][]models.OutboxDelivery,
+						5,
 					)
-					candidateQuery =
-						applyCurrentProjectPolicy(candidateQuery)
-					if err := candidateQuery.
-						Order("next_attempt_at ASC, created_at ASC").
-						Limit(limit).
-						Find(&candidates).Error; err != nil {
-						return err
+					classStart := s.nextOutboxClaimClassStart(
+						operation.Scope,
+						len(claimClasses),
+					)
+					loadClaimClass := func(
+						classIndex int,
+						class string,
+						pageLimit int,
+						buildRaw func(
+							outboxClaimScanCursor,
+							int,
+						) *gorm.DB,
+						sortAt func(
+							models.OutboxDelivery,
+						) time.Time,
+						filterEligible func(
+							[]string,
+							int,
+						) *gorm.DB,
+					) (int, error) {
+						if pageLimit <= 0 {
+							return 0, nil
+						}
+						expected :=
+							s.currentOutboxClaimScanCursor(
+								operation.Scope,
+								class,
+							)
+						cursor := expected
+						var raw []models.OutboxDelivery
+						loadRaw := func() error {
+							raw = nil
+							query := buildRaw(cursor, pageLimit)
+							return query.Find(&raw).Error
+						}
+						if err := loadRaw(); err != nil {
+							return 0, err
+						}
+						if len(raw) == 0 && !cursor.isZero() {
+							cursor = outboxClaimScanCursor{}
+							if err := loadRaw(); err != nil {
+								return 0, err
+							}
+						}
+						next := outboxClaimScanCursor{}
+						if len(raw) > 0 {
+							last := raw[len(raw)-1]
+							next = outboxClaimScanCursor{
+								sortAt:    sortAt(last),
+								createdAt: last.CreatedAt,
+								stableID:  last.ID,
+							}
+						}
+						if expected != next {
+							scanCursorMutations = append(
+								scanCursorMutations,
+								outboxClaimScanCursorMutation{
+									class:    class,
+									expected: expected,
+									next:     next,
+								},
+							)
+						}
+						if len(raw) == 0 {
+							return 0, nil
+						}
+						if filterEligible == nil {
+							claimClasses[classIndex] = raw
+							return len(raw), nil
+						}
+						ids := make([]string, 0, len(raw))
+						for index := range raw {
+							ids = append(ids, raw[index].ID)
+						}
+						query := applyCurrentProjectPolicy(
+							filterEligible(ids, len(raw)),
+						)
+						var eligible []models.OutboxDelivery
+						if err := query.Find(&eligible).Error; err != nil {
+							return len(raw), err
+						}
+						eligibleByID := make(
+							map[string]models.OutboxDelivery,
+							len(eligible),
+						)
+						for index := range eligible {
+							eligibleByID[eligible[index].ID] =
+								eligible[index]
+						}
+						for index := range raw {
+							if candidate, ok :=
+								eligibleByID[raw[index].ID]; ok {
+								claimClasses[classIndex] = append(
+									claimClasses[classIndex],
+									candidate,
+								)
+							}
+						}
+						return len(raw), nil
 					}
+					classLoaders := make(
+						[]func(int) (int, error),
+						len(claimClasses),
+					)
+					for classIndex, status := range []models.OutboxDeliveryStatus{
+						models.OutboxDeliveryPending,
+						models.OutboxDeliveryFailed,
+					} {
+						classIndex := classIndex
+						claimStatus := status
+						classLoaders[classIndex] = func(
+							pageLimit int,
+						) (int, error) {
+							return loadClaimClass(
+								classIndex,
+								"webhook:"+string(claimStatus),
+								pageLimit,
+								func(
+									cursor outboxClaimScanCursor,
+									pageLimit int,
+								) *gorm.DB {
+									return buildOutboxWebhookRetryClaimCandidateQuery(
+										tx.Model(&models.OutboxDelivery{}),
+										operation.Scope,
+										claimStatus,
+										selectionNow,
+										batchCreatedBefore,
+										cursor,
+										pageLimit,
+									)
+								},
+								func(
+									delivery models.OutboxDelivery,
+								) time.Time {
+									return delivery.NextAttemptAt
+								},
+								func(
+									ids []string,
+									_ int,
+								) *gorm.DB {
+									return buildOutboxWebhookRetryEligiblePageQuery(
+										tx.Model(&models.OutboxDelivery{}),
+										operation.Scope,
+										claimStatus,
+										selectionNow,
+										batchCreatedBefore,
+										ids,
+									)
+								},
+							)
+						}
+					}
+					classLoaders[2] = func(
+						pageLimit int,
+					) (int, error) {
+						return loadClaimClass(
+							2,
+							"webhook:stale",
+							pageLimit,
+							func(
+								cursor outboxClaimScanCursor,
+								pageLimit int,
+							) *gorm.DB {
+								return buildOutboxWebhookStaleClaimCandidateQuery(
+									tx.Model(&models.OutboxDelivery{}),
+									operation.Scope,
+									selectionLockCutoff,
+									batchCreatedBefore,
+									cursor,
+									pageLimit,
+								)
+							},
+							func(delivery models.OutboxDelivery) time.Time {
+								if delivery.LockedAt == nil {
+									return time.Time{}
+								}
+								return delivery.LockedAt.UTC()
+							},
+							func(ids []string, _ int) *gorm.DB {
+								return buildOutboxWebhookStaleEligiblePageQuery(
+									tx.Model(&models.OutboxDelivery{}),
+									operation.Scope,
+									selectionNow,
+									selectionLockCutoff,
+									batchCreatedBefore,
+									ids,
+								)
+							},
+						)
+					}
+					classLoaders[3] = func(
+						pageLimit int,
+					) (int, error) {
+						return loadClaimClass(
+							3,
+							"non-webhook:retry",
+							pageLimit,
+							func(
+								cursor outboxClaimScanCursor,
+								pageLimit int,
+							) *gorm.DB {
+								return buildOutboxNonWebhookRetryClaimCandidateQuery(
+									tx.Model(&models.OutboxDelivery{}),
+									operation.Scope,
+									selectionNow,
+									batchCreatedBefore,
+									cursor,
+									pageLimit,
+								)
+							},
+							func(delivery models.OutboxDelivery) time.Time {
+								return delivery.NextAttemptAt
+							},
+							func(ids []string, _ int) *gorm.DB {
+								return buildOutboxNonWebhookRetryEligiblePageQuery(
+									tx.Model(&models.OutboxDelivery{}),
+									operation.Scope,
+									selectionNow,
+									batchCreatedBefore,
+									ids,
+								)
+							},
+						)
+					}
+					classLoaders[4] = func(
+						pageLimit int,
+					) (int, error) {
+						return loadClaimClass(
+							4,
+							"non-webhook:stale",
+							pageLimit,
+							func(
+								cursor outboxClaimScanCursor,
+								pageLimit int,
+							) *gorm.DB {
+								return buildOutboxNonWebhookStaleClaimCandidateQuery(
+									tx.Model(&models.OutboxDelivery{}),
+									operation.Scope,
+									selectionLockCutoff,
+									batchCreatedBefore,
+									cursor,
+									pageLimit,
+								)
+							},
+							func(delivery models.OutboxDelivery) time.Time {
+								if delivery.LockedAt == nil {
+									return time.Time{}
+								}
+								return delivery.LockedAt.UTC()
+							},
+							func(ids []string, _ int) *gorm.DB {
+								return buildOutboxNonWebhookStaleEligiblePageQuery(
+									tx.Model(&models.OutboxDelivery{}),
+									operation.Scope,
+									selectionLockCutoff,
+									batchCreatedBefore,
+									ids,
+								)
+							},
+						)
+					}
+					remainingScan := limit
+					for offset := 0; offset < len(classLoaders) &&
+						remainingScan > 0; offset++ {
+						classIndex :=
+							(classStart + offset) % len(classLoaders)
+						scanned, loadErr :=
+							classLoaders[classIndex](remainingScan)
+						if loadErr != nil {
+							return loadErr
+						}
+						remainingScan -= scanned
+					}
+					scannedCandidates += limit - remainingScan
+					candidates := mergeOutboxClaimCandidateClasses(
+						claimClasses,
+						classStart,
+						limit,
+					)
 					for index := range candidates {
 						candidate := &candidates[index]
+						claimNow := s.now().UTC()
+						if candidate.DestinationType == "webhook" &&
+							candidate.Status ==
+								models.OutboxDeliveryProcessing &&
+							candidate.Attempts >=
+								candidate.MaxAttempts {
+							if transitioned, transitionErr :=
+								transitionExhaustedStaleWebhookCandidate(
+									tx,
+									operation.Scope,
+									candidate,
+									claimNow,
+									claimNow.Add(-lockTTL),
+									batchCreatedBefore,
+								); transitionErr != nil {
+								return transitionErr
+							} else if transitioned {
+								backstoppedDead++
+							}
+							continue
+						}
+						lockToken, tokenErr := newOutboxLockToken()
+						if tokenErr != nil {
+							return tokenErr
+						}
 						updateQuery := tx.Model(
 							&models.OutboxDelivery{},
 						).Where(
-							"id = ? AND organization_id = ? AND project_id = ? AND ((status IN ? AND next_attempt_at <= ?) OR (status = ? AND locked_at < ?))",
+							"id = ? AND organization_id = ? AND project_id = ?",
 							candidate.ID,
 							operation.Scope.OrganizationID,
 							operation.Scope.ProjectID,
-							[]models.OutboxDeliveryStatus{
-								models.OutboxDeliveryPending,
-								models.OutboxDeliveryFailed,
-							},
-							now,
-							models.OutboxDeliveryProcessing,
-							lockCutoff,
+						)
+						updateQuery = applyExactOutboxCandidate(
+							updateQuery,
+							candidate,
+						)
+						updateQuery = applyOutboxBatchCreatedBefore(
+							updateQuery,
+							batchCreatedBefore,
+						)
+						updateQuery = applyOutboxClaimEligibility(
+							updateQuery,
+							claimNow,
+							claimNow.Add(-lockTTL),
 						)
 						updateQuery =
 							applyCurrentProjectPolicy(updateQuery)
@@ -3191,9 +3525,10 @@ func (s *AgentNativeService) claimPendingOutbox(
 							Updates(map[string]any{
 								"status":     models.OutboxDeliveryProcessing,
 								"attempts":   gorm.Expr("attempts + 1"),
-								"locked_at":  now,
+								"locked_at":  claimNow,
 								"locked_by":  workerID,
-								"updated_at": now,
+								"lock_token": lockToken,
+								"updated_at": claimNow,
 							})
 						if result.Error != nil {
 							return result.Error
@@ -3219,6 +3554,11 @@ func (s *AgentNativeService) claimPendingOutbox(
 								"outbox delivery event project scope mismatch",
 							)
 						}
+						if _, err := OutboxClaimRefFromDelivery(
+							&delivery,
+						); err != nil {
+							return err
+						}
 						claimed = append(claimed, &delivery)
 					}
 					return nil
@@ -3227,178 +3567,154 @@ func (s *AgentNativeService) claimPendingOutbox(
 		},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("claim outbox deliveries: %w", err)
+		return nil, 0, 0, fmt.Errorf("claim outbox deliveries: %w", err)
 	}
-	return claimed, nil
+	for _, mutation := range scanCursorMutations {
+		s.compareAndSetOutboxClaimScanCursor(
+			operation.Scope,
+			mutation.class,
+			mutation.expected,
+			mutation.next,
+		)
+	}
+	return claimed, backstoppedDead, scannedCandidates, nil
 }
 
-func (s *AgentNativeService) MarkOutboxDelivered(ctx context.Context, deliveryID, workerID string) error {
-	operation, err := requireOutboxWorkerOperation(ctx)
-	if err != nil {
-		return err
+func (s *AgentNativeService) nextOutboxClaimClassStart(
+	scope models.ProjectScope,
+	classCount int,
+) int {
+	if classCount <= 0 {
+		return 0
 	}
-	now := s.now()
-	return runSystemProjectOperation(
-		ctx,
-		s.db,
-		operation.Scope,
-		operation.Actor,
-		operation.TraceID,
-		operation.CorrelationID,
-		func(projectCtx context.Context) error {
-			return transactionForContext(
-				projectCtx,
-				s.db,
-				func(tx *gorm.DB) error {
-					result := tx.Model(&models.OutboxDelivery{}).
-						Where(
-							"id = ? AND organization_id = ? AND project_id = ? AND status = ? AND locked_by = ?",
-							deliveryID,
-							operation.Scope.OrganizationID,
-							operation.Scope.ProjectID,
-							models.OutboxDeliveryProcessing,
-							workerID,
-						).
-						Updates(map[string]any{
-							"status":       models.OutboxDeliverySucceeded,
-							"delivered_at": now,
-							"locked_at":    nil,
-							"locked_by":    "",
-							"last_error":   "",
-							"updated_at":   now,
-						})
-					if result.Error != nil {
-						return fmt.Errorf(
-							"mark outbox delivered: %w",
-							result.Error,
-						)
-					}
-					if result.RowsAffected == 0 {
-						return ErrOutboxLockLost
-					}
-					var delivery models.OutboxDelivery
-					if err := tx.Where(
-						"id = ? AND organization_id = ? AND project_id = ?",
-						deliveryID,
-						operation.Scope.OrganizationID,
-						operation.Scope.ProjectID,
-					).First(&delivery).Error; err != nil {
-						return err
-					}
-					var remaining int64
-					if err := tx.Model(&models.OutboxDelivery{}).
-						Where(
-							"event_id = ? AND organization_id = ? AND project_id = ? AND status <> ?",
-							delivery.EventID,
-							operation.Scope.OrganizationID,
-							operation.Scope.ProjectID,
-							models.OutboxDeliverySucceeded,
-						).
-						Count(&remaining).Error; err != nil {
-						return err
-					}
-					if remaining == 0 {
-						if err := tx.Model(&models.DomainEvent{}).
-							Where(
-								"id = ? AND organization_id = ? AND project_id = ?",
-								delivery.EventID,
-								operation.Scope.OrganizationID,
-								operation.Scope.ProjectID,
-							).
-							Update("published_at", now).Error; err != nil {
-							return err
-						}
-					}
-					return nil
-				},
-			)
-		},
+	key := fmt.Sprintf("%d/%d", scope.OrganizationID, scope.ProjectID)
+	s.outboxClaimCursorMu.Lock()
+	defer s.outboxClaimCursorMu.Unlock()
+	if s.outboxClaimClassCursors == nil {
+		s.outboxClaimClassCursors = make(map[string]uint8, 1)
+	}
+	start := int(s.outboxClaimClassCursors[key]) % classCount
+	s.outboxClaimClassCursors[key] = uint8((start + 1) % classCount)
+	return start
+}
+
+func outboxClaimScanCursorKey(
+	scope models.ProjectScope,
+	class string,
+) string {
+	return fmt.Sprintf(
+		"%d:%d:%s",
+		scope.OrganizationID,
+		scope.ProjectID,
+		class,
 	)
 }
 
-func (s *AgentNativeService) MarkOutboxFailed(ctx context.Context, deliveryID, workerID string, deliveryErr error) error {
-	operation, err := requireOutboxWorkerOperation(ctx)
-	if err != nil {
-		return err
+func (s *AgentNativeService) currentOutboxClaimScanCursor(
+	scope models.ProjectScope,
+	class string,
+) outboxClaimScanCursor {
+	if s == nil {
+		return outboxClaimScanCursor{}
 	}
-	message := ""
-	if deliveryErr != nil {
-		message = scrubOutboxFailure(deliveryErr)
+	key := outboxClaimScanCursorKey(scope, class)
+	s.outboxClaimCursorMu.Lock()
+	defer s.outboxClaimCursorMu.Unlock()
+	if s.outboxClaimScanCursors == nil {
+		return outboxClaimScanCursor{}
 	}
-	return runSystemProjectOperation(
-		ctx,
-		s.db,
-		operation.Scope,
-		operation.Actor,
-		operation.TraceID,
-		operation.CorrelationID,
-		func(projectCtx context.Context) error {
-			return transactionForContext(
-				projectCtx,
-				s.db,
-				func(tx *gorm.DB) error {
-					var delivery models.OutboxDelivery
-					load := tx.Clauses(
-						clause.Locking{Strength: "UPDATE"},
-					).Where(
-						"id = ? AND organization_id = ? AND project_id = ? AND status = ? AND locked_by = ?",
-						deliveryID,
-						operation.Scope.OrganizationID,
-						operation.Scope.ProjectID,
-						models.OutboxDeliveryProcessing,
-						workerID,
-					).First(&delivery)
-					if errors.Is(load.Error, gorm.ErrRecordNotFound) {
-						return ErrOutboxLockLost
-					}
-					if load.Error != nil {
-						return fmt.Errorf(
-							"lock failed outbox delivery: %w",
-							load.Error,
-						)
-					}
-					status := models.OutboxDeliveryFailed
-					if delivery.Attempts >= delivery.MaxAttempts {
-						status = models.OutboxDeliveryDead
-					}
-					backoff := time.Second * time.Duration(
-						1<<minInt(delivery.Attempts, 10),
-					)
-					if backoff > time.Hour {
-						backoff = time.Hour
-					}
-					now := s.now()
-					result := tx.Model(&models.OutboxDelivery{}).
-						Where(
-							"id = ? AND organization_id = ? AND project_id = ? AND status = ? AND locked_by = ?",
-							deliveryID,
-							operation.Scope.OrganizationID,
-							operation.Scope.ProjectID,
-							models.OutboxDeliveryProcessing,
-							workerID,
-						).
-						Updates(map[string]any{
-							"status":          status,
-							"next_attempt_at": now.Add(backoff),
-							"locked_at":       nil,
-							"locked_by":       "",
-							"last_error":      message,
-							"updated_at":      now,
-						})
-					if result.Error != nil {
-						return fmt.Errorf(
-							"mark outbox failed: %w",
-							result.Error,
-						)
-					}
-					if result.RowsAffected == 0 {
-						return ErrOutboxLockLost
-					}
-					return nil
-				},
+	return s.outboxClaimScanCursors[key]
+}
+
+func (s *AgentNativeService) compareAndSetOutboxClaimScanCursor(
+	scope models.ProjectScope,
+	class string,
+	expected outboxClaimScanCursor,
+	next outboxClaimScanCursor,
+) {
+	if s == nil {
+		return
+	}
+	key := outboxClaimScanCursorKey(scope, class)
+	s.outboxClaimCursorMu.Lock()
+	defer s.outboxClaimCursorMu.Unlock()
+	if s.outboxClaimScanCursors == nil {
+		s.outboxClaimScanCursors = make(
+			map[string]outboxClaimScanCursor,
+			1,
+		)
+	}
+	current := s.outboxClaimScanCursors[key]
+	if current != expected {
+		return
+	}
+	if next.isZero() {
+		delete(s.outboxClaimScanCursors, key)
+		return
+	}
+	s.outboxClaimScanCursors[key] = next
+}
+
+func mergeOutboxClaimCandidateClasses(
+	classes [][]models.OutboxDelivery,
+	start int,
+	limit int,
+) []models.OutboxDelivery {
+	if len(classes) == 0 || limit <= 0 {
+		return nil
+	}
+	if start < 0 {
+		start = 0
+	}
+	start %= len(classes)
+	result := make([]models.OutboxDelivery, 0, limit)
+	positions := make([]int, len(classes))
+	for len(result) < limit {
+		progressed := false
+		for offset := 0; offset < len(classes) &&
+			len(result) < limit; offset++ {
+			classIndex := (start + offset) % len(classes)
+			if positions[classIndex] >= len(classes[classIndex]) {
+				continue
+			}
+			result = append(
+				result,
+				classes[classIndex][positions[classIndex]],
 			)
-		},
+			positions[classIndex]++
+			progressed = true
+		}
+		if !progressed {
+			break
+		}
+	}
+	return result
+}
+
+func (s *AgentNativeService) MarkOutboxDelivered(
+	ctx context.Context,
+	claim OutboxClaimRef,
+	completedAt time.Time,
+) error {
+	_, err := s.FinalizeOutboxAttempt(
+		ctx,
+		claim,
+		OutboxKnownSuccess(completedAt),
 	)
+	return err
+}
+
+func (s *AgentNativeService) MarkOutboxFailed(
+	ctx context.Context,
+	claim OutboxClaimRef,
+	deliveryErr error,
+) error {
+	attempt := OutboxKnownFailure(deliveryErr)
+	if outboxAttemptErrorIsUncertain(deliveryErr) {
+		attempt = OutboxUncertain(deliveryErr)
+	}
+	_, err := s.FinalizeOutboxAttempt(ctx, claim, attempt)
+	return err
 }
 
 func (s *AgentNativeService) ReplayOutbox(ctx context.Context, deliveryID string) error {
@@ -3472,6 +3788,18 @@ type OutboxDeliverer interface {
 	Deliver(ctx context.Context, delivery *models.OutboxDelivery, event CloudEventEnvelope) error
 }
 
+// OutboxAttemptDeliverer is an optional richer result seam. Implementations
+// that can distinguish a known rejection from an uncertain external side
+// effect may implement it in addition to OutboxDeliverer. Existing deliverers
+// remain source-compatible through the error-only interface above.
+type OutboxAttemptDeliverer interface {
+	DeliverAttempt(
+		ctx context.Context,
+		delivery *models.OutboxDelivery,
+		event CloudEventEnvelope,
+	) OutboxAttemptResult
+}
+
 type OutboxDeliverFunc func(ctx context.Context, delivery *models.OutboxDelivery, event CloudEventEnvelope) error
 
 func (f OutboxDeliverFunc) Deliver(ctx context.Context, delivery *models.OutboxDelivery, event CloudEventEnvelope) error {
@@ -3483,6 +3811,8 @@ type OutboxBatchResult struct {
 	Delivered int
 	Failed    int
 	Dead      int
+	Expired   int
+	consumed  int
 }
 
 type outboxWorkerProject struct {
@@ -3578,67 +3908,134 @@ func (s *AgentNativeService) ProcessOutboxBatch(
 	if limit > 200 {
 		limit = 200
 	}
+	auditBatch := newOutboxAttemptAuditBatch(limit)
+	ctx = context.WithValue(
+		ctx,
+		outboxAttemptAuditBatchContextKey{},
+		auditBatch,
+	)
+	defer auditBatch.finalize()
+	batchCreatedBefore := outboxBatchPersistenceCutoff(s.db)
 	actor := models.SystemActor(outboxSystemActorID)
 	projects, err := outboxWorkerProjects(ctx, s.db, actor)
 	if err != nil {
 		return result, err
 	}
-	deliveries := make([]*models.OutboxDelivery, 0, limit)
-	if len(projects) > 0 {
-		start := int(
-			(s.outboxProjectCursor.Add(1) - 1) % uint64(len(projects)),
+	var batchErrors []error
+	consumed := 0
+	for consumed < limit {
+		wave, err := s.processOutboxWave(
+			ctx,
+			workerID,
+			limit-consumed,
+			deliverer,
+			projects,
+			batchCreatedBefore,
 		)
-		for offset := 0; offset < len(projects) &&
-			len(deliveries) < limit; offset++ {
-			project := projects[(start+offset)%len(projects)]
-			traceID := fmt.Sprintf(
-				"outbox:%s:%d:%d",
-				workerID,
-				project.Scope.ProjectID,
-				s.now().UnixNano(),
-			)
-			projectCtx, contextErr := EnsureSystemProjectOperationContext(
-				ctx,
-				project.Scope,
-				actor,
-				traceID,
-				traceID,
-			)
-			if contextErr != nil {
-				return result, contextErr
-			}
-			var claimed []*models.OutboxDelivery
-			claimed, claimErr := s.claimPendingOutbox(
-				projectCtx,
-				workerID,
-				limit-len(deliveries),
-				s.outboxLockTTL,
-				archivedProjectOutboxDestinations(),
-				archivedProjectOutboxEventTypes(),
-			)
-			if claimErr != nil {
-				return result, fmt.Errorf(
-					"claim project %s outbox: %w",
-					project.Key,
-					claimErr,
-				)
-			}
-			deliveries = append(deliveries, claimed...)
+		result.Claimed += wave.Claimed
+		result.Delivered += wave.Delivered
+		result.Failed += wave.Failed
+		result.Dead += wave.Dead
+		result.Expired += wave.Expired
+		result.consumed += wave.consumed
+		consumed += wave.consumed
+		if err != nil {
+			batchErrors = append(batchErrors, err)
+			break
+		}
+		if wave.consumed == 0 {
+			break
 		}
 	}
+	return result, errors.Join(batchErrors...)
+}
+
+func (s *AgentNativeService) processOutboxWave(
+	ctx context.Context,
+	workerID string,
+	limit int,
+	deliverer OutboxDeliverer,
+	projects []outboxWorkerProject,
+	batchCreatedBefore time.Time,
+) (OutboxBatchResult, error) {
+	result := OutboxBatchResult{}
+	if deliverer == nil {
+		return result, fmt.Errorf("outbox deliverer is required")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	reserved := 0
+	for reserved < limit {
+		select {
+		case s.outboxDeliverySlots <- struct{}{}:
+			reserved++
+		default:
+			limit = reserved
+		}
+		if reserved == limit {
+			break
+		}
+	}
+	if reserved == 0 {
+		return result, nil
+	}
+	reservationsHandedOff := false
+	defer func() {
+		if reservationsHandedOff {
+			return
+		}
+		for reserved > 0 {
+			<-s.outboxDeliverySlots
+			reserved--
+		}
+	}()
+	actor := models.SystemActor(outboxSystemActorID)
+	deliveries, backstoppedDead, scannedCandidates, err :=
+		s.claimOutboxWaveProjects(
+			ctx,
+			actor,
+			workerID,
+			limit,
+			projects,
+			batchCreatedBefore,
+		)
+	claimErr := err
+	result.Dead = backstoppedDead
+	result.Failed = backstoppedDead
+	result.consumed = scannedCandidates
 	result.Claimed = len(deliveries)
 	if len(deliveries) == 0 {
-		return result, nil
+		return result, claimErr
+	}
+	for reserved > len(deliveries) {
+		<-s.outboxDeliverySlots
+		reserved--
 	}
 
 	var batchErrors []error
+	if claimErr != nil {
+		batchErrors = append(batchErrors, claimErr)
+	}
 	type deliveryAttempt struct {
-		delivery *models.OutboxDelivery
-		err      error
+		delivery         *models.OutboxDelivery
+		finalizeDelivery *models.OutboxDelivery
+		scope            models.ProjectScope
+		claim            OutboxClaimRef
+		result           OutboxAttemptResult
 	}
 	type deliveryJob struct {
-		delivery *models.OutboxDelivery
-		deadline time.Time
+		delivery         *models.OutboxDelivery
+		finalizeDelivery *models.OutboxDelivery
+		scope            models.ProjectScope
+		claim            OutboxClaimRef
+		deadline         time.Time
 	}
 
 	workerCount := cap(s.outboxDeliverySlots)
@@ -3651,15 +4048,54 @@ func (s *AgentNativeService) ProcessOutboxBatch(
 	jobs := make(chan deliveryJob, len(deliveries))
 	attempts := make(chan deliveryAttempt, len(deliveries))
 	for _, delivery := range deliveries {
+		requestWindow := s.outboxDeliveryTimeout
+		if parentDeadline, ok := ctx.Deadline(); ok {
+			if parentWindow := time.Until(parentDeadline); parentWindow <
+				requestWindow {
+				requestWindow = parentWindow
+			}
+		}
+		businessNow := s.now().UTC()
+		effectiveDeadline := businessNow.Add(requestWindow)
+		if delivery.DestinationType == "webhook" &&
+			delivery.ExpiresAt != nil &&
+			delivery.ExpiresAt.Before(effectiveDeadline) {
+			effectiveDeadline = delivery.ExpiresAt.UTC()
+			requestWindow = effectiveDeadline.Sub(businessNow)
+		}
+		if requestWindow < 0 {
+			requestWindow = 0
+		}
+		attemptDeadline := time.Now().Add(requestWindow)
+		claim, claimErr := OutboxClaimRefFromDelivery(delivery)
+		if claimErr != nil {
+			return result, claimErr
+		}
+		if delivery.DestinationType == "webhook" {
+			claim.EffectiveDeadline = effectiveDeadline
+		}
+		scope := models.ProjectScope{
+			OrganizationID: delivery.OrganizationID,
+			ProjectID:      delivery.ProjectID,
+		}
+		finalizeDelivery := *delivery
+		if delivery.Event != nil {
+			event := *delivery.Event
+			finalizeDelivery.Event = &event
+		}
 		jobs <- deliveryJob{
-			delivery: delivery,
+			delivery:         delivery,
+			finalizeDelivery: &finalizeDelivery,
+			scope:            scope,
+			claim:            claim,
 			// Every claimed delivery receives the same full bounded window.
 			// A non-cooperative black-hole attempt therefore cannot make queued
 			// work extend the batch by another timeout per item.
-			deadline: time.Now().Add(s.outboxDeliveryTimeout),
+			deadline: attemptDeadline,
 		}
 	}
 	close(jobs)
+	reservationsHandedOff = true
 
 	for range workerCount {
 		go func() {
@@ -3667,15 +4103,26 @@ func (s *AgentNativeService) ProcessOutboxBatch(
 				deliveryCtx, contextErr :=
 					outboxDeliveryOperationContext(ctx, job.delivery)
 				if contextErr != nil {
+					<-s.outboxDeliverySlots
 					attempts <- deliveryAttempt{
-						delivery: job.delivery,
-						err:      contextErr,
+						delivery:         job.delivery,
+						finalizeDelivery: job.finalizeDelivery,
+						scope:            job.scope,
+						claim:            job.claim,
+						result: outboxAttemptNotStarted(
+							errors.New(
+								"outbox delivery operation context is unavailable",
+							),
+						),
 					}
 					continue
 				}
 				attempts <- deliveryAttempt{
-					delivery: job.delivery,
-					err: s.performOutboxDeliveryAttempt(
+					delivery:         job.delivery,
+					finalizeDelivery: job.finalizeDelivery,
+					scope:            job.scope,
+					claim:            job.claim,
+					result: s.performOutboxDeliveryAttempt(
 						deliveryCtx,
 						job.deadline,
 						deliverer,
@@ -3690,11 +4137,8 @@ func (s *AgentNativeService) ProcessOutboxBatch(
 		attempt := <-attempts
 		finalizeBase, contextErr := outboxWorkerOperationContext(
 			context.WithoutCancel(ctx),
-			models.ProjectScope{
-				OrganizationID: attempt.delivery.OrganizationID,
-				ProjectID:      attempt.delivery.ProjectID,
-			},
-			attempt.delivery,
+			attempt.scope,
+			attempt.finalizeDelivery,
 		)
 		if contextErr != nil {
 			batchErrors = append(batchErrors, contextErr)
@@ -3704,37 +4148,115 @@ func (s *AgentNativeService) ProcessOutboxBatch(
 			finalizeBase,
 			5*time.Second,
 		)
-		if attempt.err == nil {
-			markErr := s.MarkOutboxDelivered(
-				finalizeCtx,
-				attempt.delivery.ID,
-				workerID,
-			)
-			cancelFinalize()
-			if markErr != nil {
-				batchErrors = append(batchErrors, markErr)
-				continue
-			}
-			result.Delivered++
-			continue
-		}
-		markErr := s.MarkOutboxFailed(
+		finalized, finalizeErr := s.FinalizeOutboxAttempt(
 			finalizeCtx,
-			attempt.delivery.ID,
-			workerID,
-			attempt.err,
+			attempt.claim,
+			attempt.result,
 		)
 		cancelFinalize()
-		if markErr != nil {
-			batchErrors = append(batchErrors, markErr)
+		if finalizeErr != nil {
+			batchErrors = append(batchErrors, finalizeErr)
 			continue
 		}
-		result.Failed++
-		if attempt.delivery.Attempts >= attempt.delivery.MaxAttempts {
+		switch finalized.Status {
+		case models.OutboxDeliverySucceeded:
+			result.Delivered++
+		case models.OutboxDeliveryFailed:
+			result.Failed++
+		case models.OutboxDeliveryDead:
+			result.Failed++
 			result.Dead++
+		case models.OutboxDeliveryExpired:
+			result.Expired++
+		default:
+			batchErrors = append(
+				batchErrors,
+				ErrWebhookOutboxLifecycleInvariant,
+			)
 		}
 	}
 	return result, errors.Join(batchErrors...)
+}
+
+func (s *AgentNativeService) claimOutboxWaveProjects(
+	ctx context.Context,
+	actor models.ActorRef,
+	workerID string,
+	limit int,
+	projects []outboxWorkerProject,
+	batchCreatedBefore time.Time,
+) ([]*models.OutboxDelivery, int, int, error) {
+	if len(projects) == 0 || limit <= 0 {
+		return nil, 0, 0, nil
+	}
+	projectBudget := minInt(len(projects), limit)
+	s.outboxProjectCursorMu.Lock()
+	defer s.outboxProjectCursorMu.Unlock()
+	start := int(s.outboxProjectCursor.Load() % uint64(len(projects)))
+	visited := 0
+	defer func() {
+		if visited == 0 {
+			visited = 1
+		}
+		s.outboxProjectCursor.Add(uint64(visited))
+	}()
+	deliveries := make([]*models.OutboxDelivery, 0, limit)
+	backstoppedDead := 0
+	scannedCandidates := 0
+	var projectErrors []error
+	for offset := 0; offset < projectBudget &&
+		scannedCandidates < limit; offset++ {
+		project := projects[(start+offset)%len(projects)]
+		visited++
+		traceID := fmt.Sprintf(
+			"outbox:%s:%d:%d",
+			workerID,
+			project.Scope.ProjectID,
+			s.now().UnixNano(),
+		)
+		projectCtx, err := EnsureSystemProjectOperationContext(
+			ctx,
+			project.Scope,
+			actor,
+			traceID,
+			traceID,
+		)
+		if err != nil {
+			projectErrors = append(projectErrors, err)
+			if contextErr := ctx.Err(); contextErr != nil {
+				projectErrors = append(projectErrors, contextErr)
+				break
+			}
+			continue
+		}
+		claimed, projectDead, projectScanned, err :=
+			s.claimPendingOutbox(
+				projectCtx,
+				workerID,
+				limit-scannedCandidates,
+				s.outboxLockTTL,
+				batchCreatedBefore,
+				archivedProjectOutboxDestinations(),
+				archivedProjectOutboxEventTypes(),
+			)
+		if err != nil {
+			projectErrors = append(projectErrors, fmt.Errorf(
+				"claim project %s outbox: %w",
+				project.Key,
+				err,
+			))
+			if contextErr := ctx.Err(); contextErr != nil {
+				projectErrors = append(projectErrors, contextErr)
+				break
+			}
+			continue
+		}
+		backstoppedDead += projectDead
+		scannedCandidates += projectScanned
+		deliveries = append(deliveries, claimed...)
+	}
+	return deliveries, backstoppedDead, scannedCandidates,
+		errors.Join(projectErrors...)
 }
 
 func requireOutboxWorkerOperation(
@@ -3833,50 +4355,109 @@ func (s *AgentNativeService) performOutboxDeliveryAttempt(
 	deadline time.Time,
 	deliverer OutboxDeliverer,
 	delivery *models.OutboxDelivery,
-) error {
+) OutboxAttemptResult {
+	releaseReservation := true
+	defer func() {
+		if releaseReservation {
+			<-s.outboxDeliverySlots
+		}
+	}()
 	if delivery == nil {
-		return errors.New("outbox delivery is missing")
+		return OutboxUncertain(errors.New("outbox delivery is missing"))
 	}
 	if delivery.Event == nil {
-		return fmt.Errorf("domain event %s is missing", delivery.EventID)
+		return OutboxUncertain(
+			fmt.Errorf("domain event %s is missing", delivery.EventID),
+		)
 	}
 	attemptCtx, cancel := context.WithDeadline(parent, deadline)
 	defer cancel()
 	if err := attemptCtx.Err(); err != nil {
-		return err
+		return outboxAttemptNotStarted(
+			errors.New("outbox delivery attempt did not start"),
+		)
 	}
 
-	select {
-	case s.outboxDeliverySlots <- struct{}{}:
-	case <-attemptCtx.Done():
-		return fmt.Errorf("outbox delivery slot unavailable: %w", attemptCtx.Err())
-	}
-
-	outcome := make(chan error, 1)
+	outcome := make(chan OutboxAttemptResult, 1)
 	go func() {
-		defer func() {
+		reservationReleased := false
+		release := func() {
+			if reservationReleased {
+				return
+			}
 			<-s.outboxDeliverySlots
+			reservationReleased = true
+		}
+		send := func(result OutboxAttemptResult) {
+			release()
+			outcome <- result
+		}
+		defer func() {
 			if recover() != nil {
 				// Panic payloads can contain sensitive adapter state and must
 				// not be persisted in Outbox error details.
-				outcome <- errors.New("outbox deliverer panicked")
+				send(OutboxUncertain(
+					errors.New("outbox deliverer panicked"),
+				))
+				return
 			}
+			release()
 		}()
-		outcome <- deliverer.Deliver(
-			attemptCtx,
-			delivery,
-			CloudEventFromModel(delivery.Event),
-		)
+		event := CloudEventFromModel(delivery.Event)
+		if richer, ok := deliverer.(OutboxAttemptDeliverer); ok {
+			result := richer.DeliverAttempt(
+				attemptCtx,
+				delivery,
+				event,
+			)
+			if err := result.validate(); err != nil {
+				send(OutboxUncertain(
+					errors.New("outbox deliverer returned an invalid result"),
+				))
+				return
+			}
+			send(result)
+			return
+		}
+		err := deliverer.Deliver(attemptCtx, delivery, event)
+		if attemptCtx.Err() != nil {
+			send(OutboxUncertain(attemptCtx.Err()))
+			return
+		}
+		if err == nil {
+			send(OutboxKnownSuccess(s.now().UTC()))
+			return
+		}
+		if outboxAttemptErrorIsUncertain(err) {
+			send(OutboxUncertain(err))
+			return
+		}
+		send(OutboxKnownFailure(err))
 	}()
+	releaseReservation = false
 
 	select {
-	case err := <-outcome:
-		return err
+	case result := <-outcome:
+		return result
 	case <-attemptCtx.Done():
-		// The downstream outcome is unknown near a timeout. SMTP/webhook
-		// protocols do not provide exactly-once semantics; the bounded slot is
-		// released only if the adapter eventually returns.
-		return fmt.Errorf("outbox delivery attempt timed out: %w", attemptCtx.Err())
+		// Cancellation stops external I/O at the effective deadline. A rich
+		// adapter may already have completed a bounded response body and be
+		// handing its immutable result to this goroutine at the same instant.
+		// Give only that in-process handoff a small bound; a non-cooperative
+		// adapter remains uncertain and cannot hold the worker indefinitely.
+		handoff := time.NewTimer(outboxAttemptResultHandoffTimeout)
+		defer handoff.Stop()
+		select {
+		case result := <-outcome:
+			return result
+		case <-handoff.C:
+			return OutboxUncertain(
+				fmt.Errorf(
+					"outbox delivery attempt timed out: %w",
+					attemptCtx.Err(),
+				),
+			)
+		}
 	}
 }
 

@@ -22,6 +22,7 @@ const (
 	webhookCheckTokenEqual
 	webhookCheckTokenNotEqual
 	webhookCheckTokenGreater
+	webhookCheckTokenRegexMatch
 	webhookCheckTokenAnd
 	webhookCheckTokenOr
 	webhookCheckTokenIs
@@ -171,6 +172,12 @@ func lexWebhookCheckExpression(
 			tokens = append(tokens, webhookCheckToken{
 				kind: webhookCheckTokenGreater,
 				text: ">",
+			})
+			index++
+		case '~':
+			tokens = append(tokens, webhookCheckToken{
+				kind: webhookCheckTokenRegexMatch,
+				text: "~",
 			})
 			index++
 		case '<':
@@ -425,6 +432,8 @@ func (parser *webhookCheckParser) parsePredicate() (*webhookCheckNode, error) {
 		operator = "<>"
 	case parser.match(webhookCheckTokenGreater):
 		operator = ">"
+	case parser.match(webhookCheckTokenRegexMatch):
+		operator = "~"
 	default:
 		return nil, parser.unexpected("comparison operator")
 	}

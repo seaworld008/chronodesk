@@ -81,6 +81,12 @@ func validateRuntimeSchema(
 				return err
 			}
 		}
+		if err := ValidateWebhookOutboxLifecycleFence(db); err != nil {
+			return err
+		}
+		if err := ValidateWebhookOutboxLifecycleIndexes(db); err != nil {
+			return err
+		}
 		return ValidateProjectRLSReadiness(db)
 	}
 
@@ -136,6 +142,12 @@ func validateRuntimeSchema(
 		if err := validateWebhookCredentialLifetimeCatalog(db); err != nil {
 			return err
 		}
+	}
+	if err := ValidateWebhookOutboxLifecycleFence(db); err != nil {
+		return err
+	}
+	if err := ValidateWebhookOutboxLifecycleIndexes(db); err != nil {
+		return err
 	}
 	return ValidateProjectRLSReadiness(db)
 }
@@ -319,7 +331,7 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 		{&models.OutboxDelivery{}, "outbox_deliveries", []string{
 			"event_id", "destination_type", "destination_id", "status",
 			"attempts", "next_attempt_at", "locked_at", "locked_by",
-			"expires_at", "expired_at",
+			"lock_token", "expires_at", "expired_at",
 		}},
 		{&models.WebhookDeliverySnapshot{}, "webhook_delivery_snapshots", []string{
 			"id", "organization_id", "project_id", "config_id", "event_id",
@@ -754,6 +766,18 @@ func CreateIndexes(db *gorm.DB) error {
 		indexErrors = append(
 			indexErrors,
 			fmt.Errorf("automation and webhook pagination indexes: %w", err),
+		)
+	}
+	if err := MigrateWebhookOutboxLifecycleFence(db); err != nil {
+		indexErrors = append(
+			indexErrors,
+			fmt.Errorf("webhook Outbox lifecycle fence: %w", err),
+		)
+	}
+	if err := MigrateWebhookOutboxLifecycleIndexes(db); err != nil {
+		indexErrors = append(
+			indexErrors,
+			fmt.Errorf("webhook Outbox lifecycle indexes: %w", err),
 		)
 	}
 	if err := errors.Join(indexErrors...); err != nil {

@@ -582,9 +582,13 @@ func Run() error {
 
 	agentBackground, stopAgentBackground := context.WithCancel(appContext)
 	var agentWorkers sync.WaitGroup
+	var closeWebhookAttemptAudits func()
 	defer func() {
 		stopAgentBackground()
 		agentWorkers.Wait()
+		if closeWebhookAttemptAudits != nil {
+			closeWebhookAttemptAudits()
+		}
 	}()
 	agentWorkers.Add(1)
 	go func() {
@@ -1298,6 +1302,8 @@ func Run() error {
 			db.DB,
 			secretProtector,
 		)
+		closeWebhookAttemptAudits =
+			notificationService.CloseWebhookAttemptAuditsAndWait
 		notificationService.ConfigureWebhookTestCommands(
 			projectService,
 			nativeService,
@@ -1613,24 +1619,114 @@ func runAgentOutboxWorker(
 	native *services.AgentNativeService,
 	deliverer services.OutboxDeliverer,
 ) {
+	runAgentOutboxWorkerLoops(
+		ctx,
+		native,
+		deliverer,
+		time.Second,
+		time.Second,
+	)
+}
+
+type agentOutboxLifecycleRuntime interface {
+	ExpireWebhookDeliveriesBatch(
+		context.Context,
+		int,
+	) (services.WebhookOutboxCleanupResult, error)
+	ProcessOutboxBatch(
+		context.Context,
+		string,
+		int,
+		services.OutboxDeliverer,
+	) (services.OutboxBatchResult, error)
+}
+
+func runAgentOutboxWorkerLoops(
+	ctx context.Context,
+	native agentOutboxLifecycleRuntime,
+	deliverer services.OutboxDeliverer,
+	deliveryInterval time.Duration,
+	cleanupInterval time.Duration,
+) {
+	if native == nil || deliverer == nil {
+		return
+	}
+	if deliveryInterval <= 0 {
+		deliveryInterval = time.Second
+	}
+	if cleanupInterval <= 0 {
+		cleanupInterval = time.Second
+	}
 	hostname, _ := os.Hostname()
 	workerID := fmt.Sprintf("%s-%d", hostname, os.Getpid())
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		result, err := native.ProcessOutboxBatch(ctx, workerID, 50, deliverer)
-		if err != nil && ctx.Err() == nil {
-			log.Printf("Agent Outbox batch failed: %v", err)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		ticker := time.NewTicker(deliveryInterval)
+		defer ticker.Stop()
+		for {
+			result, err := native.ProcessOutboxBatch(
+				ctx,
+				workerID,
+				50,
+				deliverer,
+			)
+			if err != nil && ctx.Err() == nil {
+				log.Printf("Agent Outbox batch failed: %v", err)
+			}
+			if result.Dead > 0 {
+				log.Printf(
+					"Agent Outbox moved %d deliveries to dead state",
+					result.Dead,
+				)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 		}
-		if result.Dead > 0 {
-			log.Printf("Agent Outbox moved %d deliveries to dead state", result.Dead)
+	}()
+	go func() {
+		defer workers.Done()
+		ticker := time.NewTicker(cleanupInterval)
+		defer ticker.Stop()
+		for {
+			result, err := native.ExpireWebhookDeliveriesBatch(ctx, 50)
+			if result.Attempted > 0 {
+				log.Print(agentOutboxCleanupMetricText(result))
+			}
+			if err != nil && ctx.Err() == nil {
+				// Candidate errors may involve malformed historical rows. Keep
+				// the operator signal fixed and secret-free.
+				log.Print(
+					"Agent Outbox lifecycle cleanup iteration failed",
+				)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
+	}()
+	workers.Wait()
+}
+
+func agentOutboxCleanupMetricText(
+	result services.WebhookOutboxCleanupResult,
+) string {
+	return fmt.Sprintf(
+		"Agent Outbox lifecycle cleanup: attempted=%d expired=%d "+
+			"malformed=%d overlap_cleared=%d "+
+			"legacy_succeeded_shredded=%d",
+		result.Attempted,
+		result.Expired,
+		result.Malformed,
+		result.OverlapCleared,
+		result.LegacySucceededShredded,
+	)
 }
 
 func runKnowledgeObjectCleanupWorker(

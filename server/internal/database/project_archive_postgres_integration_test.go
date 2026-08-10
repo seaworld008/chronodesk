@@ -388,10 +388,16 @@ func TestPostgresOutboxClaimWaitsForArchiveAndAppliesArchivedAllowlist(
 			claimed.deliveries,
 		)
 	}
+	claimRef, err := services.OutboxClaimRefFromDelivery(
+		claimed.deliveries[0],
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := claimService.MarkOutboxDelivered(
 		claimContext,
-		claimed.deliveries[0].ID,
-		workerID,
+		claimRef,
+		time.Now().UTC(),
 	); err != nil {
 		t.Fatalf("finalize allowed archived Outbox delivery: %v", err)
 	}

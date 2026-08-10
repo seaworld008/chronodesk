@@ -321,6 +321,7 @@ type OutboxDelivery struct {
 	NextAttemptAt   time.Time            `json:"next_attempt_at" gorm:"not null;index"`
 	LockedAt        *time.Time           `json:"locked_at,omitempty" gorm:"index"`
 	LockedBy        string               `json:"locked_by,omitempty" gorm:"size:100;index"`
+	LockToken       *string              `json:"-" gorm:"size:36"`
 	LastError       string               `json:"last_error,omitempty" gorm:"type:text"`
 	DeliveredAt     *time.Time           `json:"delivered_at,omitempty" gorm:"index;check:chk_outbox_expired_at,(status = 'expired' AND expired_at IS NOT NULL) OR (status <> 'expired' AND expired_at IS NULL)"`
 	ExpiresAt       *time.Time           `json:"expires_at,omitempty" gorm:"index;check:chk_outbox_webhook_expires_at,destination_type <> 'webhook' OR (destination_type = 'webhook' AND expires_at IS NOT NULL)"`

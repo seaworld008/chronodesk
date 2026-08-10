@@ -439,6 +439,7 @@ func TestSLABreachOutboxRecoversFromSnapshotAfterStateAndConfigChange(t *testing
 		&models.TicketHistory{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
+		&models.WebhookDeliverySnapshot{},
 		&models.IdempotencyRecord{},
 	); err != nil {
 		t.Fatal(err)

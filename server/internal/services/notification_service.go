@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	stdlog "log"
 	"math"
 	"net"
 	"net/http"
@@ -17,6 +18,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
@@ -60,14 +63,21 @@ const NotificationDeliveryStatusSuppressedByPreference = "suppressed_by_preferen
 
 // NotificationService 通知服务
 type NotificationService struct {
-	db                       *gorm.DB
-	emailNotificationService EmailNotificationServiceInterface
-	outboxWebhookTimeout     time.Duration
-	environment              string
-	secretStore              security.Protector
-	webhookClients           WebhookClientFactory
-	webhookTestProjects      *ProjectService
-	webhookTestEvents        *AgentNativeService
+	db                         *gorm.DB
+	emailNotificationService   EmailNotificationServiceInterface
+	outboxWebhookTimeout       time.Duration
+	environment                string
+	secretStore                security.Protector
+	webhookClients             WebhookClientFactory
+	webhookTestProjects        *ProjectService
+	webhookTestEvents          *AgentNativeService
+	webhookAttemptAudits       sync.WaitGroup
+	webhookAttemptAuditMu      sync.Mutex
+	webhookAttemptAuditClosed  bool
+	webhookAttemptAuditRoot    context.Context
+	webhookAttemptAuditCancel  context.CancelFunc
+	webhookAttemptAuditWriters chan struct{}
+	webhookAttemptAuditDrops   atomic.Uint64
 }
 
 func withNotificationProjectOperation[T any](
@@ -144,6 +154,7 @@ func (f publicWebhookClientFactory) ClientFor(
 
 const (
 	defaultOutboxWebhookAttemptTimeout = 20 * time.Second
+	webhookAttemptAuditConcurrency     = 8
 
 	// NotificationOutboxDestination is the durable in-app notification
 	// consumer. It is deliberately distinct from "webhook": database-backed
@@ -251,12 +262,19 @@ func NewNotificationServiceWithClientFactory(
 	if factory == nil {
 		factory = publicWebhookClientFactory{resolver: net.DefaultResolver}
 	}
+	auditRoot, cancelAudit := context.WithCancel(context.Background())
 	return &NotificationService{
-		db:                   db,
-		outboxWebhookTimeout: defaultOutboxWebhookAttemptTimeout,
-		environment:          getRuntimeEnvironment(),
-		secretStore:          protector,
-		webhookClients:       factory,
+		db:                        db,
+		outboxWebhookTimeout:      defaultOutboxWebhookAttemptTimeout,
+		environment:               getRuntimeEnvironment(),
+		secretStore:               protector,
+		webhookClients:            factory,
+		webhookAttemptAuditRoot:   auditRoot,
+		webhookAttemptAuditCancel: cancelAudit,
+		webhookAttemptAuditWriters: make(
+			chan struct{},
+			1,
+		),
 	}
 }
 
@@ -514,15 +532,33 @@ func (ns *NotificationService) SendWebhookSnapshotOutboxAttempt(
 	snapshotID string,
 	event *NotificationEvent,
 ) error {
+	return ns.SendWebhookSnapshotOutboxAttemptResult(
+		ctx,
+		scope,
+		snapshotID,
+		event,
+	).Err
+}
+
+func (ns *NotificationService) SendWebhookSnapshotOutboxAttemptResult(
+	ctx context.Context,
+	scope models.ProjectScope,
+	snapshotID string,
+	event *NotificationEvent,
+) OutboxAttemptResult {
 	if event == nil {
-		return errors.New("webhook event is required")
+		return OutboxKnownFailure(errors.New("webhook event is required"))
 	}
 	if err := scope.Validate(); err != nil {
-		return fmt.Errorf("invalid webhook project scope: %w", err)
+		return OutboxKnownFailure(
+			fmt.Errorf("invalid webhook project scope: %w", err),
+		)
 	}
 	snapshotID = strings.TrimSpace(snapshotID)
 	if snapshotID == "" {
-		return errors.New("webhook delivery snapshot is required")
+		return OutboxKnownFailure(
+			errors.New("webhook delivery snapshot is required"),
+		)
 	}
 	snapshot, err := withNotificationProjectOperation(
 		ns,
@@ -545,18 +581,26 @@ func (ns *NotificationService) SendWebhookSnapshotOutboxAttempt(
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("load webhook delivery snapshot: %w", err)
+		return OutboxKnownFailure(
+			fmt.Errorf("load webhook delivery snapshot: %w", err),
+		)
 	}
 	if eventID := strings.TrimSpace(event.Metadata["event_id"]); eventID == "" ||
 		eventID != snapshot.EventID {
-		return errors.New("webhook delivery snapshot event mismatch")
+		return OutboxKnownFailure(
+			errors.New("webhook delivery snapshot event mismatch"),
+		)
 	}
 	config, err := snapshot.WebhookConfig()
 	if err != nil {
-		return fmt.Errorf("hydrate webhook delivery snapshot: %w", err)
+		return OutboxKnownFailure(
+			fmt.Errorf("hydrate webhook delivery snapshot: %w", err),
+		)
 	}
 	if err := ns.revealWebhookSecrets(&config); err != nil {
-		return fmt.Errorf("无法读取webhook快照凭据: %w", err)
+		return OutboxKnownFailure(
+			fmt.Errorf("无法读取webhook快照凭据: %w", err),
+		)
 	}
 	timeout := ns.outboxWebhookTimeout
 	if timeout <= 0 || timeout > defaultOutboxWebhookAttemptTimeout {
@@ -568,9 +612,13 @@ func (ns *NotificationService) SendWebhookSnapshotOutboxAttempt(
 			timeout = configured
 		}
 	}
-	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	attemptDeadline := time.Now().Add(timeout)
+	if snapshot.CredentialExpiresAt.Before(attemptDeadline) {
+		attemptDeadline = snapshot.CredentialExpiresAt
+	}
+	attemptCtx, cancel := context.WithDeadline(ctx, attemptDeadline)
 	defer cancel()
-	return ns.sendWebhookAttempt(attemptCtx, &config, event)
+	return ns.sendWebhookAttemptResult(attemptCtx, &config, event)
 }
 
 func (ns *NotificationService) sendWebhookAttempt(
@@ -578,17 +626,44 @@ func (ns *NotificationService) sendWebhookAttempt(
 	config *models.WebhookConfig,
 	event *NotificationEvent,
 ) error {
+	return ns.sendWebhookAttemptResultWithAudit(
+		ctx,
+		config,
+		event,
+		true,
+	).Err
+}
+
+func (ns *NotificationService) sendWebhookAttemptResult(
+	ctx context.Context,
+	config *models.WebhookConfig,
+	event *NotificationEvent,
+) OutboxAttemptResult {
+	return ns.sendWebhookAttemptResultWithAudit(
+		ctx,
+		config,
+		event,
+		false,
+	)
+}
+
+func (ns *NotificationService) sendWebhookAttemptResultWithAudit(
+	ctx context.Context,
+	config *models.WebhookConfig,
+	event *NotificationEvent,
+	waitForAudit bool,
+) OutboxAttemptResult {
 	if config == nil {
-		return errors.New("webhook配置不能为空")
+		return OutboxKnownFailure(errors.New("webhook配置不能为空"))
 	}
 	if event == nil {
-		return errors.New("webhook事件不能为空")
+		return OutboxKnownFailure(errors.New("webhook事件不能为空"))
 	}
 	if err := requireExternalIOOutsideProjectTransaction(
 		ctx,
 		"webhook HTTP delivery",
 	); err != nil {
-		return err
+		return OutboxKnownFailure(err)
 	}
 	startTime := time.Now()
 
@@ -616,8 +691,18 @@ func (ns *NotificationService) sendWebhookAttempt(
 		strings.TrimSpace(config.Secret) == "" {
 		log.Status = "failed"
 		log.ErrorMessage = "自定义webhook缺少签名密钥"
-		ns.saveLog(ctx, log, config)
-		return errors.New("自定义webhook缺少签名密钥")
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxKnownFailure(
+				errors.New("自定义webhook缺少签名密钥"),
+			),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
 	}
 
 	// 生成消息内容
@@ -625,8 +710,16 @@ func (ns *NotificationService) sendWebhookAttempt(
 	if err != nil {
 		log.Status = "failed"
 		log.ErrorMessage = fmt.Sprintf("生成消息失败: %v", err)
-		ns.saveLog(ctx, log, config)
-		return err
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxKnownFailure(err),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
 	}
 
 	// 构建请求
@@ -634,8 +727,16 @@ func (ns *NotificationService) sendWebhookAttempt(
 	if err != nil {
 		log.Status = "failed"
 		log.ErrorMessage = fmt.Sprintf("构建请求失败: %v", err)
-		ns.saveLog(ctx, log, config)
-		return err
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxKnownFailure(err),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
 	}
 	eventID := strings.TrimSpace(event.Metadata["event_id"])
 	if config.Provider == models.WebhookProviderCustom {
@@ -643,14 +744,34 @@ func (ns *NotificationService) sendWebhookAttempt(
 		if err := json.Unmarshal(requestBody, &structuredEvent); err != nil {
 			log.Status = "failed"
 			log.ErrorMessage = "读取自定义webhook CloudEvent标识失败"
-			ns.saveLog(ctx, log, config)
-			return errors.New("读取自定义webhook CloudEvent标识失败")
+			return ns.finishWebhookAttempt(
+				ctx,
+				config,
+				log,
+				OutboxKnownFailure(
+					errors.New("读取自定义webhook CloudEvent标识失败"),
+				),
+				false,
+				false,
+				nil,
+				waitForAudit,
+			)
 		}
 		if eventID != "" && eventID != structuredEvent.ID {
 			log.Status = "failed"
 			log.ErrorMessage = "自定义webhook CloudEvent标识不一致"
-			ns.saveLog(ctx, log, config)
-			return errors.New("自定义webhook CloudEvent标识不一致")
+			return ns.finishWebhookAttempt(
+				ctx,
+				config,
+				log,
+				OutboxKnownFailure(
+					errors.New("自定义webhook CloudEvent标识不一致"),
+				),
+				false,
+				false,
+				nil,
+				waitForAudit,
+			)
 		}
 		eventID = structuredEvent.ID
 	}
@@ -664,8 +785,16 @@ func (ns *NotificationService) sendWebhookAttempt(
 	if err != nil {
 		log.Status = "failed"
 		log.ErrorMessage = "创建webhook请求失败"
-		ns.saveLog(ctx, log, config)
-		return errors.New("webhook请求地址无效")
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxKnownFailure(errors.New("webhook请求地址无效")),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
 	}
 
 	// 设置请求头
@@ -692,8 +821,18 @@ func (ns *NotificationService) sendWebhookAttempt(
 	if err != nil || client == nil {
 		log.Status = "failed"
 		log.ErrorMessage = "webhook目标地址未通过安全校验"
-		ns.saveLog(ctx, log, config)
-		return errors.New("webhook目标地址未通过安全校验")
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxKnownFailure(
+				errors.New("webhook目标地址未通过安全校验"),
+			),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
 	}
 	defer client.CloseIdleConnections()
 
@@ -704,13 +843,63 @@ func (ns *NotificationService) sendWebhookAttempt(
 	if err != nil {
 		log.Status = "failed"
 		log.ErrorMessage = "webhook请求发送失败"
-		ns.saveLog(ctx, log, config)
-		return errors.New("webhook请求发送失败")
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxUncertain(
+				errors.New("webhook请求发送结果不确定"),
+			),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
 	}
 	defer resp.Body.Close()
 
-	// 读取响应
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	// A result is known only after the bounded response body reaches EOF. A
+	// transport/body failure after client.Do starts cannot prove whether the
+	// receiver committed its side effect.
+	const maxWebhookResponseBodyBytes = int64(1 << 20)
+	bodyBytes, bodyErr := io.CopyN(
+		io.Discard,
+		resp.Body,
+		maxWebhookResponseBodyBytes+1,
+	)
+	if bodyErr != nil && !errors.Is(bodyErr, io.EOF) {
+		log.Status = "failed"
+		log.ErrorMessage = "读取webhook响应失败"
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxUncertain(
+				errors.New("webhook响应读取结果不确定"),
+			),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
+	}
+	if bodyErr == nil || bodyBytes > maxWebhookResponseBodyBytes {
+		log.Status = "failed"
+		log.ErrorMessage = "webhook响应超过读取上限"
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxUncertain(
+				errors.New("webhook响应读取结果不确定"),
+			),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
+	}
+	completedAt := time.Now().UTC()
 	log.ResponseStatus = resp.StatusCode
 	// 回调响应由外部系统控制，可能回显 Authorization、签名或 Cookie。
 	// 响应正文不进入持久日志。
@@ -723,35 +912,126 @@ func (ns *NotificationService) sendWebhookAttempt(
 	// 判断请求是否成功
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		log.Status = "success"
-
-		// 更新配置统计
-		ns.updateConfigStats(ctx, config, true, nil)
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxKnownSuccess(completedAt),
+			true,
+			true,
+			nil,
+			waitForAudit,
+		)
 	} else {
 		log.Status = "failed"
 		log.ErrorMessage = fmt.Sprintf("HTTP错误: %d", resp.StatusCode)
-
-		// 更新配置统计
-		ns.updateConfigStats(
-			ctx,
-			config,
-			false,
-			fmt.Errorf("HTTP %d", resp.StatusCode),
-		)
-
 	}
-
-	// 保存日志
-	ns.saveLog(ctx, log, config)
 
 	// Any non-2xx response must remain an error. The durable Agent Outbox is
 	// the recovery owner for domain-event delivery; returning nil for a
 	// locally marked "retrying" log would permanently acknowledge a failed
 	// external side effect.
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("webhook发送失败: HTTP %d", resp.StatusCode)
+	return ns.finishWebhookAttempt(
+		ctx,
+		config,
+		log,
+		OutboxKnownFailure(
+			fmt.Errorf("webhook发送失败: HTTP %d", resp.StatusCode),
+		),
+		true,
+		false,
+		fmt.Errorf("HTTP %d", resp.StatusCode),
+		waitForAudit,
+	)
+}
+
+func (ns *NotificationService) finishWebhookAttempt(
+	ctx context.Context,
+	config *models.WebhookConfig,
+	log *models.WebhookLog,
+	result OutboxAttemptResult,
+	updateStats bool,
+	success bool,
+	statsErr error,
+	waitForAudit bool,
+) OutboxAttemptResult {
+	if ns == nil || config == nil || log == nil {
+		return result
+	}
+	attemptedAt := time.Now().UTC()
+	if !result.CompletedAt.IsZero() {
+		attemptedAt = result.CompletedAt.UTC()
+	}
+	log.CreatedAt = attemptedAt
+	persist := func(
+		auditContext context.Context,
+		auditConfig *models.WebhookConfig,
+		auditLog *models.WebhookLog,
+	) {
+		if updateStats {
+			ns.updateConfigStats(
+				auditContext,
+				auditConfig,
+				success,
+				statsErr,
+				attemptedAt,
+			)
+		}
+		ns.saveLog(auditContext, auditLog, auditConfig)
+	}
+	if waitForAudit {
+		persist(ctx, config, log)
+		return result
 	}
 
-	return nil
+	configCopy := *config
+	logCopy := *log
+	ns.submitWebhookAttemptAudit(webhookAttemptAuditWork{
+		source: ctx,
+		persist: func(auditContext context.Context) {
+			persist(auditContext, &configCopy, &logCopy)
+		},
+	})
+	return result
+}
+
+func (ns *NotificationService) waitForWebhookAttemptAudits() {
+	ns.WaitForWebhookAttemptAudits()
+}
+
+// WaitForWebhookAttemptAudits joins post-response bookkeeping after callers
+// have stopped admitting new webhook attempts.
+func (ns *NotificationService) WaitForWebhookAttemptAudits() {
+	if ns == nil {
+		return
+	}
+	if !ns.waitForWebhookAttemptAuditsWithin(webhookAttemptAuditWaitTimeout) {
+		stdlog.Print("webhook post-response audit wait budget exhausted")
+	}
+}
+
+// CloseWebhookAttemptAuditsAndWait atomically closes async audit admission,
+// then joins every audit admitted before the close. Late external attempts are
+// dropped without touching a database that may already be shutting down.
+func (ns *NotificationService) CloseWebhookAttemptAuditsAndWait() {
+	if ns == nil {
+		return
+	}
+	ns.webhookAttemptAuditMu.Lock()
+	ns.webhookAttemptAuditClosed = true
+	ns.webhookAttemptAuditMu.Unlock()
+	grace := webhookAttemptAuditShutdownTimeout / 2
+	if ns.waitForWebhookAttemptAuditsWithin(grace) {
+		return
+	}
+	if ns.webhookAttemptAuditCancel != nil {
+		ns.webhookAttemptAuditCancel()
+	}
+	if !ns.waitForWebhookAttemptAuditsWithin(
+		webhookAttemptAuditShutdownTimeout - grace,
+	) {
+		stdlog.Print("webhook post-response audit shutdown budget exhausted")
+	}
 }
 
 // generateMessage 生成消息内容
@@ -1191,6 +1471,7 @@ func (ns *NotificationService) updateConfigStats(
 	config *models.WebhookConfig,
 	success bool,
 	err error,
+	attemptedAt time.Time,
 ) {
 	if config == nil ||
 		config.ID == 0 ||
@@ -1199,25 +1480,51 @@ func (ns *NotificationService) updateConfigStats(
 		return
 	}
 	finalizeContext, cancelFinalize := context.WithTimeout(
-		context.WithoutCancel(ctx),
+		ctx,
 		5*time.Second,
 	)
 	defer cancelFinalize()
+	attemptedAt = attemptedAt.UTC()
+	lastError := ""
+	if err != nil {
+		lastError = err.Error()
+	}
 	updates := map[string]interface{}{
-		"last_triggered_at": time.Now(),
-		"total_sent":        gorm.Expr("total_sent + 1"),
+		"last_triggered_at": gorm.Expr(
+			"CASE WHEN last_triggered_at IS NULL OR "+
+				"last_triggered_at < ? THEN ? "+
+				"ELSE last_triggered_at END",
+			attemptedAt,
+			attemptedAt,
+		),
+		"last_error": gorm.Expr(
+			"CASE WHEN last_triggered_at IS NULL OR "+
+				"last_triggered_at < ? THEN ? "+
+				"ELSE last_error END",
+			attemptedAt,
+			lastError,
+		),
+		"total_sent": gorm.Expr("total_sent + 1"),
 	}
 
 	if success {
-		updates["last_success_at"] = time.Now()
+		updates["last_success_at"] = gorm.Expr(
+			"CASE WHEN last_success_at IS NULL OR "+
+				"last_success_at < ? THEN ? "+
+				"ELSE last_success_at END",
+			attemptedAt,
+			attemptedAt,
+		)
 		updates["total_success"] = gorm.Expr("total_success + 1")
-		updates["last_error"] = "" // 清除错误信息
 	} else {
-		updates["last_error_at"] = time.Now()
+		updates["last_error_at"] = gorm.Expr(
+			"CASE WHEN last_error_at IS NULL OR "+
+				"last_error_at < ? THEN ? "+
+				"ELSE last_error_at END",
+			attemptedAt,
+			attemptedAt,
+		)
 		updates["total_failed"] = gorm.Expr("total_failed + 1")
-		if err != nil {
-			updates["last_error"] = err.Error()
-		}
 	}
 
 	_, _ = withNotificationProjectOperation(
@@ -1253,7 +1560,7 @@ func (ns *NotificationService) saveLog(
 		return
 	}
 	finalizeContext, cancelFinalize := context.WithTimeout(
-		context.WithoutCancel(ctx),
+		ctx,
 		5*time.Second,
 	)
 	defer cancelFinalize()

@@ -173,6 +173,10 @@ func TestMarkOutboxFailedLocksAndUpdatesInOneAtomicTransaction(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim delivery: count=%d err=%v", len(claimed), err)
 	}
+	claim, err := OutboxClaimRefFromDelivery(claimed[0])
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	type atomicMarker struct{}
 	markedCtx := context.WithValue(workerCtx, atomicMarker{}, true)
@@ -228,8 +232,7 @@ func TestMarkOutboxFailedLocksAndUpdatesInOneAtomicTransaction(t *testing.T) {
 
 	err = service.MarkOutboxFailed(
 		markedCtx,
-		claimed[0].ID,
-		"atomic-worker",
+		claim,
 		errors.New("destination failed"),
 	)
 	if !errors.Is(err, injected) {

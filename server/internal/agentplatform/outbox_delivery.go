@@ -346,6 +346,39 @@ func (d *NativeOutboxDeliverer) Deliver(
 	}
 }
 
+func (d *NativeOutboxDeliverer) DeliverAttempt(
+	ctx context.Context,
+	delivery *models.OutboxDelivery,
+	event services.CloudEventEnvelope,
+) services.OutboxAttemptResult {
+	if err := validateOutboxDeliveryOperation(
+		ctx,
+		delivery,
+		event,
+	); err != nil {
+		return services.OutboxKnownFailure(err)
+	}
+	if delivery.DestinationType == "webhook" {
+		return d.deliverWebhookAttempt(ctx, delivery, event)
+	}
+	err := d.Deliver(ctx, delivery, event)
+	if contextErr := ctx.Err(); contextErr != nil {
+		return services.OutboxUncertain(contextErr)
+	}
+	if err == nil {
+		return services.OutboxKnownSuccess(time.Now().UTC())
+	}
+	if errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return services.OutboxUncertain(err)
+	}
+	var timeout net.Error
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		return services.OutboxUncertain(err)
+	}
+	return services.OutboxKnownFailure(err)
+}
+
 func (d *NativeOutboxDeliverer) deliverWebSocketAccessRevocation(
 	event services.CloudEventEnvelope,
 ) (bool, error) {
@@ -625,21 +658,31 @@ func (d *NativeOutboxDeliverer) deliverWebhook(
 	delivery *models.OutboxDelivery,
 	event services.CloudEventEnvelope,
 ) error {
+	return d.deliverWebhookAttempt(ctx, delivery, event).Err
+}
+
+func (d *NativeOutboxDeliverer) deliverWebhookAttempt(
+	ctx context.Context,
+	delivery *models.OutboxDelivery,
+	event services.CloudEventEnvelope,
+) services.OutboxAttemptResult {
 	if d.notifications == nil {
-		return errors.New("webhook notification service is unavailable")
+		return services.OutboxKnownFailure(
+			errors.New("webhook notification service is unavailable"),
+		)
 	}
 	if !eventcontract.IsWebhookDeliveryEventType(strings.TrimSpace(event.Type)) {
-		return nil
+		return services.OutboxKnownSuccess(time.Now().UTC())
 	}
 	snapshotID, err := parseWebhookSnapshotDestinationID(
 		delivery.DestinationID,
 	)
 	if err != nil {
-		return err
+		return services.OutboxKnownFailure(err)
 	}
 	notification := notificationEventFromCloudEvent(event)
 	notification.Metadata["delivery_id"] = delivery.ID
-	return d.notifications.SendWebhookSnapshotOutboxAttempt(
+	return d.notifications.SendWebhookSnapshotOutboxAttemptResult(
 		ctx,
 		models.ProjectScope{
 			OrganizationID: event.OrganizationID,

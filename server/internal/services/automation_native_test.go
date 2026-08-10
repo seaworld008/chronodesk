@@ -455,7 +455,7 @@ func TestAutomationRetryContinuesActionsAfterConditionWasChanged(t *testing.T) {
 		Where("event_id = ? AND destination_type = ?", created.Event.ID, "automation").
 		Updates(map[string]any{
 			"status":          models.OutboxDeliveryFailed,
-			"next_attempt_at": time.Now().Add(-time.Second),
+			"next_attempt_at": time.Now().UTC().Add(-time.Second),
 		}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -679,7 +679,9 @@ func TestAutomationConcurrentSiblingDeliveriesHaveOneRuleOwnerAndOneStatistic(t 
 				"automation",
 				models.OutboxDeliveryFailed,
 			).
-			Updates(map[string]any{"next_attempt_at": time.Now().Add(-time.Second)}).Error; err != nil {
+			Updates(map[string]any{
+				"next_attempt_at": time.Now().UTC().Add(-time.Second),
+			}).Error; err != nil {
 			t.Fatal(err)
 		}
 		if _, err := native.ProcessOutboxBatch(
@@ -1028,7 +1030,7 @@ func TestAutomationRetryUsesFrozenRuleAfterModificationAndDisable(t *testing.T) 
 		Where("event_id = ? AND destination_type = ?", created.Event.ID, "automation").
 		Updates(map[string]any{
 			"status":          models.OutboxDeliveryFailed,
-			"next_attempt_at": time.Now().Add(-time.Second),
+			"next_attempt_at": time.Now().UTC().Add(-time.Second),
 		}).Error; err != nil {
 		t.Fatal(err)
 	}

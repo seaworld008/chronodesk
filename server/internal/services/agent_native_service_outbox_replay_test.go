@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/datatypes"
 	"gorm.io/driver/postgres"
@@ -110,6 +111,24 @@ func TestReplayOutboxCASDoesNotClearConcurrentWorkerClaimPostgres(
 	); err != nil {
 		t.Fatalf("migrate isolated Outbox replay tables: %v", err)
 	}
+	if err := db.Exec(`
+		ALTER TABLE outbox_deliveries
+		ADD CONSTRAINT chk_outbox_lifecycle_lock_token
+		CHECK (
+			(
+				status = 'processing'
+				AND lock_token IS NOT NULL
+				AND lock_token ~
+					'^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+			)
+			OR (
+				status <> 'processing'
+				AND lock_token IS NULL
+			)
+		)
+	`).Error; err != nil {
+		t.Fatalf("install isolated Outbox lifecycle fence: %v", err)
+	}
 	scope := models.ProjectScope{
 		OrganizationID: 11,
 		ProjectID:      22,
@@ -181,6 +200,11 @@ func TestReplayOutboxCASDoesNotClearConcurrentWorkerClaimPostgres(
 		t.Fatalf("worker lock failed delivery: %v", err)
 	}
 	workerLockAt := now.Add(time.Second)
+	generatedWorkerToken, err := uuid.NewV7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerToken := generatedWorkerToken.String()
 	if err := workerTx.Model(&models.OutboxDelivery{}).
 		Where(
 			"id = ? AND status = ?",
@@ -192,6 +216,7 @@ func TestReplayOutboxCASDoesNotClearConcurrentWorkerClaimPostgres(
 			"attempts":   gorm.Expr("attempts + 1"),
 			"locked_at":  workerLockAt,
 			"locked_by":  "worker-won-race",
+			"lock_token": workerToken,
 			"updated_at": workerLockAt,
 		}).Error; err != nil {
 		t.Fatalf("worker claim failed delivery: %v", err)
@@ -217,9 +242,26 @@ func TestReplayOutboxCASDoesNotClearConcurrentWorkerClaimPostgres(
 	service := NewAgentNativeService(db, AgentNativeOptions{
 		Now: func() time.Time { return now.Add(2 * time.Second) },
 	})
+	replayCtx, cancelReplay := context.WithCancel(ctx)
 	replayResult := make(chan error, 1)
+	replayDone := make(chan struct{})
+	t.Cleanup(func() {
+		cancelReplay()
+		if !workerCommitted {
+			_ = workerTx.Rollback().Error
+		}
+		select {
+		case <-replayDone:
+		case <-time.After(5 * time.Second):
+			t.Error("ReplayOutbox goroutine did not join")
+		}
+	})
 	go func() {
-		replayResult <- service.ReplayOutbox(ctx, delivery.ID)
+		defer close(replayDone)
+		replayResult <- service.ReplayOutbox(
+			replayCtx,
+			delivery.ID,
+		)
 	}()
 
 	select {
@@ -244,6 +286,7 @@ func TestReplayOutboxCASDoesNotClearConcurrentWorkerClaimPostgres(
 	case <-time.After(5 * time.Second):
 		t.Fatal("ReplayOutbox did not finish after worker commit")
 	}
+	<-replayDone
 
 	var current models.OutboxDelivery
 	if err := db.First(&current, "id = ?", delivery.ID).Error; err != nil {
@@ -254,6 +297,8 @@ func TestReplayOutboxCASDoesNotClearConcurrentWorkerClaimPostgres(
 		current.LockedAt == nil ||
 		!current.LockedAt.Equal(workerLockAt) ||
 		current.LockedBy != "worker-won-race" ||
+		current.LockToken == nil ||
+		*current.LockToken != workerToken ||
 		current.LastError != delivery.LastError {
 		t.Fatalf("replay cleared the winning worker claim: %+v", current)
 	}
@@ -285,7 +330,7 @@ func openOutboxReplayPostgresIntegrationDB(t *testing.T) *gorm.DB {
 	}
 	parsed, err := url.Parse(rawDSN)
 	if err != nil {
-		t.Fatalf("parse PostgreSQL integration DSN: %v", err)
+		t.Fatal("parse PostgreSQL integration DSN")
 	}
 	host := parsed.Hostname()
 	if host != "localhost" {
@@ -301,11 +346,11 @@ func openOutboxReplayPostgresIntegrationDB(t *testing.T) *gorm.DB {
 		Logger:         logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
-		t.Fatalf("open PostgreSQL Outbox replay administrator: %v", err)
+		t.Fatal("open PostgreSQL Outbox replay administrator")
 	}
 	adminSQL, err := admin.DB()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("get PostgreSQL Outbox replay administrator pool")
 	}
 	t.Cleanup(func() { _ = adminSQL.Close() })
 
@@ -334,11 +379,11 @@ func openOutboxReplayPostgresIntegrationDB(t *testing.T) *gorm.DB {
 		Logger:         logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
-		t.Fatalf("open isolated Outbox replay schema: %v", err)
+		t.Fatal("open isolated Outbox replay schema")
 	}
 	sqlDB, err := db.DB()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("get isolated Outbox replay pool")
 	}
 	sqlDB.SetMaxOpenConns(4)
 	t.Cleanup(func() { _ = sqlDB.Close() })
@@ -357,6 +402,11 @@ func newOutboxReplayTestFixture(
 ) {
 	t.Helper()
 	db := openAgentNativeTestDB(t)
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal("get Outbox replay SQLite pool")
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
 	ctx := testProjectOperationContext(
 		t,
 		db,

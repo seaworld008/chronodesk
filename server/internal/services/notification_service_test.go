@@ -175,6 +175,15 @@ func TestWebhookOutboxAttemptHasHardTimeoutAndNoLegacyRetry(t *testing.T) {
 	defer endpoint.Close()
 
 	db := openTestDB(t)
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sqlDB.Close(); err != nil {
+			t.Errorf("close webhook timeout test database: %v", err)
+		}
+	})
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.WebhookConfig{},
@@ -249,6 +258,7 @@ func TestWebhookOutboxAttemptHasHardTimeoutAndNoLegacyRetry(t *testing.T) {
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("Outbox webhook made %d attempts, want 1", got)
 	}
+	service.waitForWebhookAttemptAudits()
 	var log models.WebhookLog
 	if err := db.Order("id DESC").First(&log).Error; err != nil {
 		t.Fatal(err)
@@ -461,6 +471,7 @@ func TestCustomWebhookWithoutSecretFailsClosed(t *testing.T) {
 	if attempts.Load() != 0 {
 		t.Fatalf("unsigned custom Webhook made %d HTTP attempts", attempts.Load())
 	}
+	service.waitForWebhookAttemptAudits()
 	var log models.WebhookLog
 	if err := db.Order("id DESC").First(&log).Error; err != nil {
 		t.Fatal(err)

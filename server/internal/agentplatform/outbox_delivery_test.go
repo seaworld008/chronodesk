@@ -30,11 +30,30 @@ import (
 	"gorm.io/gorm"
 )
 
+var _ services.OutboxAttemptDeliverer = (*NativeOutboxDeliverer)(nil)
+
 const agentplatformCustomWebhookTestSecret = "agentplatform-custom-webhook-test-secret"
 
 type recordingSLAEscalationConsumer struct {
 	calls int
 	event services.CloudEventEnvelope
+}
+
+type deadlineThenNilAttachmentUploadConsumer struct{}
+
+func (deadlineThenNilAttachmentUploadConsumer) ExecuteAttachmentUploadOutbox(
+	ctx context.Context,
+	_ uint,
+) error {
+	<-ctx.Done()
+	return nil
+}
+
+func (deadlineThenNilAttachmentUploadConsumer) ExecuteAttachmentStagingCleanupOutbox(
+	context.Context,
+	uint,
+) error {
+	return nil
 }
 
 type recordingWebSocketAccessRevoker struct {
@@ -244,6 +263,7 @@ func TestProjectArchiveOutboxWorkerRevokesWebSocketProjectAccess(
 		&models.Project{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
+		&models.WebhookDeliverySnapshot{},
 		&models.AuditChainHead{},
 		&models.AuditLedgerEntry{},
 	); err != nil {
@@ -407,6 +427,11 @@ func TestNativeOutboxDelivererRequiresTrustedMatchingWorkerBoundary(
 	if err != nil {
 		t.Fatal(err)
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal("get trusted boundary SQLite pool")
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
 	deliverer, err := NewNativeOutboxDeliverer(
 		NativeOutboxDelivererOptions{DB: db},
 	)
@@ -535,6 +560,61 @@ func TestSLAEscalationOutboxDeliveryUsesInjectedConsumer(t *testing.T) {
 	}
 }
 
+func TestNativeOutboxDelivererDoesNotAcknowledgeLateNilNonWebhookResult(
+	t *testing.T,
+) {
+	db, err := gorm.Open(
+		sqlite.Open("file:late_nil_non_webhook_attempt?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal("get late nil non-webhook SQLite pool")
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	deliverer, err := NewNativeOutboxDeliverer(
+		NativeOutboxDelivererOptions{
+			DB:                db,
+			AttachmentUploads: deadlineThenNilAttachmentUploadConsumer{},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := models.ProjectScope{OrganizationID: 1, ProjectID: 1}
+	delivery := &models.OutboxDelivery{
+		ID:              "late-nil-non-webhook",
+		OrganizationID:  scope.OrganizationID,
+		ProjectID:       scope.ProjectID,
+		EventID:         "late-nil-event",
+		DestinationType: services.AttachmentUploadOutboxDestination,
+		DestinationID:   "1",
+	}
+	event := services.CloudEventEnvelope{
+		ID:             delivery.EventID,
+		Type:           "io.chronodesk.attachment.upload.requested.v1",
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+	}
+	workerCtx, cancel := context.WithTimeout(
+		agentplatformTestOutboxWorkerContext(t, scope),
+		10*time.Millisecond,
+	)
+	defer cancel()
+
+	result := deliverer.DeliverAttempt(workerCtx, delivery, event)
+	if result.Kind != services.OutboxAttemptUncertain {
+		t.Fatalf(
+			"late nil result kind = %q error = %v, want uncertain",
+			result.Kind,
+			result.Err,
+		)
+	}
+}
+
 func TestAttachmentCleanupOutboxRetriesAfterCommitAndIsIdempotent(t *testing.T) {
 	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
@@ -556,6 +636,7 @@ func TestAttachmentCleanupOutboxRetriesAfterCommitAndIsIdempotent(t *testing.T) 
 		&models.TicketAttachment{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
+		&models.WebhookDeliverySnapshot{},
 	); err != nil {
 		t.Fatalf("migrate attachment cleanup schema: %v", err)
 	}
@@ -1118,6 +1199,7 @@ func TestOutboxWebhookDeliveryUsesOneBoundedAttemptWithoutLocalRetry(t *testing.
 	if requestData["ticket_id"] != float64(42) {
 		t.Fatalf("structured CloudEvent data missing ticket identity: %#v", requestData)
 	}
+	notifications.WaitForWebhookAttemptAudits()
 	var logs []models.WebhookLog
 	if err := db.Order("id ASC").Find(&logs).Error; err != nil {
 		t.Fatalf("load webhook logs: %v", err)
