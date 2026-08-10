@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
@@ -550,7 +551,7 @@ func TestSQLiteOriginUUniqueIndexesRequireStructuredDDLMatch(
 func TestSQLiteFoundationMigrationPreservesSafeUserUniqueConstraint(
 	t *testing.T,
 ) {
-	db := openLegacyWebhookCredentialMigrationDB(t, "review5-safe-unique")
+	db := openLegacySQLiteReview5Database(t, "safe-unique")
 	seedLegacyWebhookCredentialPair(t, db)
 	rebuildSQLiteReview3Table(
 		t,
@@ -658,7 +659,7 @@ func TestRunMigrationsRejectsPopulatedSQLiteUnsafeUniqueWithoutMutation(
 
 func openPopulatedLegacySQLiteReview5Database(t *testing.T) *gorm.DB {
 	t.Helper()
-	db := openFreshSQLiteReview3Database(t, "review5-populated")
+	db := openFreshSQLiteReview5Database(t, "populated")
 	now := time.Date(2026, 8, 10, 1, 2, 3, 0, time.UTC)
 	organization := models.Organization{
 		Slug:   "task9a-review5-legacy",
@@ -745,6 +746,119 @@ func openPopulatedLegacySQLiteReview5Database(t *testing.T) *gorm.DB {
 		t.Fatal(err)
 	}
 	downgradeSQLiteWebhookCredentialFoundation(t, db)
+	return db
+}
+
+func openLegacySQLiteReview5Database(
+	t *testing.T,
+	suffix string,
+) *gorm.DB {
+	t.Helper()
+	db := openSQLiteReview5Database(t, suffix)
+	if err := db.Exec("PRAGMA foreign_keys = ON").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&models.SchemaMigrationCheckpoint{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE projects (
+			id INTEGER NOT NULL,
+			organization_id INTEGER NOT NULL,
+			status VARCHAR(20) NOT NULL DEFAULT 'active',
+			PRIMARY KEY (id),
+			CONSTRAINT chk_projects_status CHECK (
+				status IN ('active', 'archived')
+			)
+		)`,
+		`CREATE UNIQUE INDEX idx_projects_scope_id
+		 ON projects(organization_id, id)`,
+		`CREATE TABLE domain_events (
+			id TEXT PRIMARY KEY,
+			organization_id INTEGER NOT NULL,
+			project_id INTEGER NOT NULL
+		)`,
+		`CREATE TABLE webhook_delivery_snapshots (
+			id TEXT PRIMARY KEY,
+			created_at DATETIME NOT NULL,
+			organization_id INTEGER NOT NULL,
+			project_id INTEGER NOT NULL,
+			config_id INTEGER NOT NULL,
+			event_id TEXT NOT NULL,
+			secret TEXT NOT NULL DEFAULT '',
+			previous_secret TEXT NOT NULL DEFAULT '',
+			access_token TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE outbox_deliveries (
+			id TEXT PRIMARY KEY,
+			organization_id INTEGER NOT NULL,
+			project_id INTEGER NOT NULL,
+			event_id TEXT NOT NULL,
+			destination_type TEXT NOT NULL,
+			destination_id TEXT NOT NULL,
+			status VARCHAR(20) NOT NULL DEFAULT 'pending'
+		)`,
+	} {
+		if err := db.Exec(statement).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	return db
+}
+
+func openFreshSQLiteReview5Database(
+	t *testing.T,
+	suffix string,
+) *gorm.DB {
+	t.Helper()
+	db := openSQLiteReview5Database(t, suffix)
+	if err := RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func openSQLiteReview5Database(
+	t *testing.T,
+	suffix string,
+) *gorm.DB {
+	t.Helper()
+	dsn := fmt.Sprintf(
+		"file:%s-review5-%s?mode=memory&cache=shared&_foreign_keys=1",
+		strings.ReplaceAll(t.Name(), "/", "-"),
+		strings.ReplaceAll(suffix, " ", "-"),
+	)
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return registerSQLiteReview5DatabaseCleanup(t, db)
+}
+
+func registerSQLiteReview5DatabaseCleanup(
+	t *testing.T,
+	db *gorm.DB,
+) *gorm.DB {
+	t.Helper()
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sqlDB.Close(); err != nil {
+			t.Errorf("close Review-5 SQLite database: %v", err)
+			return
+		}
+		if open := sqlDB.Stats().OpenConnections; open != 0 {
+			t.Errorf(
+				"Review-5 SQLite database retained %d open connections",
+				open,
+			)
+		}
+		if err := sqlDB.Ping(); err == nil {
+			t.Error("closed Review-5 SQLite database still accepted Ping")
+		}
+	})
 	return db
 }
 
