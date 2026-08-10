@@ -9,7 +9,6 @@ import {
 import { EnterpriseReferenceAutocompleteInput } from '@/components/inputs/EnterpriseFilterInputs'
 import type {
     CreateNotificationRequest,
-    NotificationChannel,
     NotificationPriority,
     NotificationType,
 } from '@/lib/generated/human-api'
@@ -37,8 +36,6 @@ const priorityChoices = [
 const channelChoices = [
     { id: 'in_app', name: '应用内' },
     { id: 'email', name: '邮件' },
-    { id: 'webhook', name: 'Webhook' },
-    { id: 'websocket', name: 'WebSocket' },
 ] as const
 
 const choiceIDs = <T extends string>(
@@ -87,7 +84,9 @@ const transformCreateNotification = (
             notificationPriorities,
             '优先级',
         ),
-        channel: exactChoice<NotificationChannel>(
+        channel: exactChoice<
+            NonNullable<CreateNotificationRequest['channel']>
+        >(
             value.channel,
             notificationChannels,
             '渠道',

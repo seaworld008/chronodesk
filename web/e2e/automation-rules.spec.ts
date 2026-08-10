@@ -314,5 +314,30 @@ test.describe('Automation Rules', () => {
         await page.getByRole('link', { name: '返回列表' }).click();
         await expect(page).toHaveURL(/#\/automation-rules$/);
         await expect(page.getByText(ruleName)).toBeVisible({ timeout: 10000 });
+
+        const row = page.getByRole('row', { name: new RegExp(ruleName) });
+        await row.getByRole('link', { name: '编辑', exact: true }).click();
+        await page
+            .getByRole('textbox', { name: '描述', exact: true })
+            .fill('Playwright E2E 更新自动化规则');
+        const update = page.waitForResponse(
+            (response) =>
+                response.request().method() === 'PUT' &&
+                new URL(response.url()).pathname ===
+                    `${automationRulesPath}/${created.id}`,
+        );
+        await page.getByRole('button', { name: '保存' }).click();
+        const updateResponse = await update;
+        expect(updateResponse.status()).toBe(200);
+        const updated = extractData<Record<string, unknown>>(
+            await updateResponse.json(),
+        );
+        expect(updated.id).toBe(created.id);
+        expect(typeof updated.conditions).toBe('string');
+        expect(typeof updated.actions).toBe('string');
+        expect(JSON.parse(updated.conditions as string)).toEqual([]);
+        expect(JSON.parse(updated.actions as string)).toEqual([
+            { type: 'assign', params: { user_id: 1 } },
+        ]);
     });
 });

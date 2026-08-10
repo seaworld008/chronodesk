@@ -6,6 +6,7 @@ export const projectInventoryChangedEvent =
     'chronodesk:project-inventory-changed'
 export const projectScopeChangedEvent = 'chronodesk:project-scope-changed'
 export const sessionInvalidatedEvent = 'chronodesk:session-invalidated'
+export const sessionReplacedEvent = 'chronodesk:session-replaced'
 export const projectAccessRevokedCode = 'project_access_revoked'
 
 const activeProjectStorageKey = 'chronodesk.activeProject'
@@ -141,5 +142,11 @@ export const signalProjectScopeChanged = (projectKey: string): void => {
 export const signalSessionInvalidated = (): void => {
     if (typeof window !== 'undefined') {
         window.dispatchEvent(new Event(sessionInvalidatedEvent))
+    }
+}
+
+export const signalSessionReplaced = (): void => {
+    if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event(sessionReplacedEvent))
     }
 }

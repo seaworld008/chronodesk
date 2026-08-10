@@ -226,23 +226,27 @@ func LoggingMiddleware(config *LoggerConfig) func(HTTPContext) {
 
 		// 记录请求开始
 		startTime := time.Now()
+		sensitiveAuthenticationRoute :=
+			isSensitiveAuthenticationLoggingRoute(c)
 		requestInfo := &RequestInfo{
 			Method:    getMethod(c),
 			Path:      getPath(c),
-			Query:     getQuery(c),
 			IP:        getClientIP(c),
 			StartTime: startTime,
 		}
+		if !sensitiveAuthenticationRoute {
+			requestInfo.Query = getQuery(c)
+		}
 
 		// 获取可选信息
-		if config.LogUserAgent {
+		if config.LogUserAgent && !sensitiveAuthenticationRoute {
 			requestInfo.UserAgent = c.GetHeader("User-Agent")
 		}
-		if config.LogReferer {
+		if config.LogReferer && !sensitiveAuthenticationRoute {
 			requestInfo.Referer = c.GetHeader("Referer")
 		}
 		if config.LogRequestID {
-			requestInfo.RequestID = getRequestID(c)
+			requestInfo.RequestID = requestIDForLogs(c)
 		}
 
 		// 获取用户信息
@@ -273,8 +277,12 @@ func LoggingMiddleware(config *LoggerConfig) func(HTTPContext) {
 
 		// 获取错误信息
 		if err := getError(c); err != nil {
-			requestInfo.Error = err.Error()
 			requestInfo.Err = err
+			if sensitiveAuthenticationRoute {
+				requestInfo.Error = "sensitive_authentication_route_error"
+			} else {
+				requestInfo.Error = err.Error()
+			}
 		}
 
 		// 记录请求完成日志
@@ -478,6 +486,23 @@ func getRequestID(c HTTPContext) string {
 	return ""
 }
 
+const (
+	backupCodeRegenerationLoggingPath = "/api/auth/otp/backup-codes"
+	sensitiveAuthenticationLogMarker  = "security-sensitive-request"
+)
+
+func isSensitiveAuthenticationLoggingRoute(c HTTPContext) bool {
+	return getMethod(c) == "POST" &&
+		getPath(c) == backupCodeRegenerationLoggingPath
+}
+
+func requestIDForLogs(c HTTPContext) string {
+	if isSensitiveAuthenticationLoggingRoute(c) {
+		return sensitiveAuthenticationLogMarker
+	}
+	return getRequestID(c)
+}
+
 // getStatusCode 获取响应状态码
 func getStatusCode(c HTTPContext) int {
 	if ginCtx, ok := c.(*GinHTTPContext); ok {
@@ -530,11 +555,21 @@ func getError(c HTTPContext) error {
 // RequestIDMiddleware 请求ID中间件
 func RequestIDMiddleware() func(HTTPContext) {
 	return func(c HTTPContext) {
-		requestID := c.GetHeader("X-Request-ID")
+		requestID := ""
+		if !isSensitiveAuthenticationLoggingRoute(c) {
+			requestID = c.GetHeader("X-Request-ID")
+		}
 		if requestID == "" {
 			// 生成新的请求ID
 			requestID = generateRequestID()
 			setHeader(c, "X-Request-ID", requestID)
+		}
+		if ginContext, ok := c.(*GinHTTPContext); ok &&
+			ginContext.Context.Request != nil {
+			ginContext.Context.Request.Header.Set(
+				"X-Request-ID",
+				requestID,
+			)
 		}
 
 		// 存储到上下文

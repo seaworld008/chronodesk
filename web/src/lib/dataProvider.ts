@@ -1,6 +1,10 @@
 import { DataProvider, fetchUtils, HttpError } from 'react-admin'
 import queryString from 'query-string'
-import { containsChineseText, localizedApiErrorMessage } from './apiClient'
+import {
+    containsChineseText,
+    localizedApiErrorMessage,
+    requireCommittedHumanBearerHeaders,
+} from './apiClient'
 import {
     projectResourcePath,
     resolveActiveProjectKey,
@@ -65,6 +69,7 @@ const httpClient = async (url: string, options: HttpClientOptions = {}) => {
     }
 
     try {
+        requireCommittedHumanBearerHeaders(headers)
         return await fetchUtils.fetchJson(url, { ...options, headers })
     } catch (error: unknown) {
         return handleHttpError(error, url)

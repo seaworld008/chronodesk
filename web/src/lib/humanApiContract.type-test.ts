@@ -25,6 +25,88 @@ buildHumanApiRequest('createHumanSession', {
   },
 })
 
+buildHumanApiRequest('registerHuman', {
+  pathParameters: {},
+  body: {
+    username: 'human',
+    email: 'human@example.com',
+    password: 'not-a-real-secret',
+    confirm_password: 'not-a-real-secret',
+  },
+})
+
+buildHumanApiRequest('verifyHumanEmail', {
+  pathParameters: {},
+  body: { token: 'one-time-verification-token' },
+})
+
+buildHumanApiRequest('resendHumanEmailVerification', {
+  pathParameters: {},
+  body: { email: 'human@example.com' },
+})
+
+buildHumanApiRequest('regenerateOTPBackupCodes', {
+  pathParameters: {},
+  body: { current_password: 'not-a-real-secret' },
+})
+
+// @ts-expect-error Backup-code regeneration requires current-password step-up.
+buildHumanApiRequest('regenerateOTPBackupCodes', { pathParameters: {} })
+
+buildHumanApiRequest('regenerateOTPBackupCodes', {
+  pathParameters: {},
+  body: {
+    current_password: 'not-a-real-secret',
+    // @ts-expect-error Strict request schema rejects unknown fields.
+    unexpected: true,
+  },
+})
+
+buildHumanApiRequest('getProjectTicketAllowedTransitions', {
+  pathParameters: {
+    projectKey: 'OPS',
+    ticketID: 42,
+  },
+})
+
+buildHumanApiRequest('updateProjectTicket', {
+  pathParameters: {
+    projectKey: 'OPS',
+    ticketID: 42,
+  },
+  body: {},
+})
+
+buildHumanApiRequest('updateProjectTicket', {
+  pathParameters: {
+    projectKey: 'OPS',
+    ticketID: 42,
+  },
+  body: { due_date: null },
+})
+
+buildHumanApiRequest('updateProjectTicket', {
+  pathParameters: {
+    projectKey: 'OPS',
+    ticketID: 42,
+  },
+  body: { due_date: '2026-08-03T09:30:00Z' },
+})
+
+buildHumanApiRequest('updateProjectTicket', {
+  pathParameters: {
+    projectKey: 'OPS',
+    ticketID: 42,
+  },
+  body: {
+    // @ts-expect-error due_date only accepts an RFC 3339 string or null.
+    due_date: 42,
+  },
+})
+
+// @ts-expect-error Email verification consumes a required JSON body token.
+buildHumanApiRequest('verifyHumanEmail', { pathParameters: {} })
+
 // @ts-expect-error Login has requestBody.required=true, so body is mandatory.
 buildHumanApiRequest('createHumanSession', { pathParameters: {} })
 

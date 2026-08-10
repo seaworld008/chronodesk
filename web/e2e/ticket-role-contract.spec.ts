@@ -50,6 +50,7 @@ type RecordedRequest = {
 
 type TicketMockState = {
     requests: RecordedRequest[];
+    setProjectRole: (projectRole: ProjectRole) => void;
 };
 
 const requestBody = (request: Request): unknown => {
@@ -64,8 +65,13 @@ const installTicketBackend = async (
     page: Page,
     projectRole: ProjectRole,
 ): Promise<TicketMockState> => {
-    const state: TicketMockState = { requests: [] };
-    const access = authorizedProjectAccess(projectA, projectRole);
+    let activeProjectRole = projectRole;
+    const state: TicketMockState = {
+        requests: [],
+        setProjectRole: (nextProjectRole) => {
+            activeProjectRole = nextProjectRole;
+        },
+    };
 
     await page.route('**/api/**', async (route) => {
         const request = route.request();
@@ -82,7 +88,9 @@ const installTicketBackend = async (
                 code: 0,
                 msg: '',
                 data: {
-                    items: [access],
+                    items: [
+                        authorizedProjectAccess(projectA, activeProjectRole),
+                    ],
                     page: 1,
                     page_size: 100,
                     total: 1,
@@ -267,6 +275,24 @@ const installTicketBackend = async (
                 201,
                 { ETag: '"v7"' },
             );
+            return;
+        }
+
+        if (
+            url.pathname === `${ticketPath}/transitions` &&
+            request.method() === 'GET'
+        ) {
+            await fulfillJSON(route, {
+                success: true,
+                data: {
+                    // The Ticket is bound to a published workflow whose
+                    // open state permits only these exact lifecycle edges.
+                    allowed_next_statuses:
+                        activeProjectRole === 'manager'
+                            ? ['resolved']
+                            : ['in_progress', 'cancelled'],
+                },
+            });
             return;
         }
 
@@ -611,5 +637,67 @@ test.describe('工单 Human UI 项目作用域与 requester 最小权限', () =>
                     /^\/api\/tickets(?:\/|$)/u.test(request.pathname),
             ),
         ).toEqual([]);
+    });
+
+    test('项目角色变化且工单版本不变时，重新获取服务端工作流状态', async ({
+        page,
+    }) => {
+        await installMockSession(
+            page,
+            {
+                ...defaultMockIdentity,
+                sessionID: 'e2e-workflow-role-refetch',
+            },
+            projectA,
+        );
+        const state = await installTicketBackend(page, 'project_admin');
+        const transitionsPath =
+            `/api/projects/${projectA.key}/tickets/${ticketID}/transitions`;
+        await page.goto(`/#/tickets/${ticketID}/show`);
+
+        const statusAction = page
+            .getByRole('main')
+            .getByRole('button', { name: '状态变更', exact: true });
+        await expect(statusAction).toBeVisible();
+        await statusAction.click();
+        const dialog = page.getByRole('dialog', {
+            name: '状态变更',
+            exact: true,
+        });
+        await dialog.getByRole('combobox', { name: '新状态' }).click();
+        await expect(
+            page.getByRole('option', { name: '处理中', exact: true }),
+        ).toBeVisible();
+        await page.keyboard.press('Escape');
+        await page.getByRole('button', { name: '取消', exact: true }).click();
+
+        const refetchedTransitions = page.waitForRequest((request) =>
+            request.method() === 'GET' &&
+            new URL(request.url()).pathname === transitionsPath,
+        );
+        state.setProjectRole('manager');
+        await page.evaluate(() => {
+            window.dispatchEvent(
+                new Event('chronodesk:project-access-refresh-requested'),
+            );
+        });
+        await refetchedTransitions;
+
+        await statusAction.click();
+        await dialog.getByRole('combobox', { name: '新状态' }).click();
+        await expect(
+            page.getByRole('option', { name: '已解决', exact: true }),
+        ).toBeVisible();
+        await expect(
+            page.getByRole('option', { name: '处理中', exact: true }),
+        ).toHaveCount(0);
+        expect(ticket.version).toBe(5);
+        expect(
+            state.requests.filter(
+                (request) =>
+                    request.method === 'GET' &&
+                    request.pathname === transitionsPath,
+            ),
+        ).toHaveLength(2);
     });
 });

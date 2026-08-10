@@ -283,13 +283,32 @@ func (r *GormUserRepository) ConfigureOTP(
 	secret, backupCodeHashes string,
 	enabled bool,
 ) error {
-	return r.configureOTPWithDB(
-		r.db.WithContext(ctx),
-		userID,
-		secret,
-		backupCodeHashes,
-		enabled,
-	)
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := r.configureOTPWithDB(
+			tx,
+			userID,
+			secret,
+			backupCodeHashes,
+			enabled,
+		); err != nil {
+			return err
+		}
+		// Any remembered device belongs to the previous MFA state. Revoke it
+		// in the same transaction so enabling cannot trust a device created
+		// without MFA and disabling cannot leave stale step-up credentials.
+		now := time.Now()
+		result := tx.Model(&models.OTPTrustedDevice{}).
+			Where("user_id = ? AND revoked = ?", userID, false).
+			Updates(map[string]interface{}{
+				"revoked":    true,
+				"expires_at": now,
+				"updated_at": now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		return nil
+	})
 }
 
 func (r *GormUserRepository) configureOTPWithDB(
@@ -334,24 +353,45 @@ func (r *GormUserRepository) configureOTPWithDB(
 	return nil
 }
 
-func (r *GormUserRepository) ReplaceBackupCodes(
+func (r *GormUserRepository) RotateBackupCodesWithAudit(
 	ctx context.Context,
-	userID uint,
-	backupCodeHashes string,
+	expected BackupCodeRotationSnapshot,
+	replacementHashes string,
+	audit AuthenticationSecurityAuditEvent,
 ) error {
-	if _, err := parseBackupCodeHashes(backupCodeHashes); err != nil {
+	if expected.UserID == 0 ||
+		!expected.OTPEnabled ||
+		expected.PasswordHash == "" ||
+		audit.UserID != expected.UserID {
+		return ErrBackupCodesChanged
+	}
+	if _, err := parseBackupCodeHashes(expected.BackupCodes); err != nil {
 		return err
 	}
-	result := r.db.WithContext(ctx).Model(&models.User{}).
-		Where("id = ? AND two_factor_enabled = ?", userID, true).
-		Update("backup_codes", backupCodeHashes)
-	if result.Error != nil {
-		return result.Error
+	if _, err := parseBackupCodeHashes(replacementHashes); err != nil {
+		return err
 	}
-	if result.RowsAffected != 1 {
-		return ErrInvalidOTP
-	}
-	return nil
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&models.User{}).
+			Where(
+				"id = ? AND two_factor_enabled = ? AND password_hash = ? AND backup_codes = ?",
+				expected.UserID,
+				expected.OTPEnabled,
+				expected.PasswordHash,
+				expected.BackupCodes,
+			).
+			Update("backup_codes", replacementHashes)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrBackupCodesChanged
+		}
+		if err := tx.Create(&audit).Error; err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func (r *GormUserRepository) ConsumeBackupCode(
@@ -444,6 +484,7 @@ func (r *GormUserRepository) convertToAuthUser(modelUser *models.User) (*User, e
 		LockedUntil:       modelUser.LockedUntil,
 		OTPEnabled:        modelUser.TwoFactorEnabled,
 		OTPSecret:         otpSecret,
+		OTPStorageHash:    loginOTPStorageHash(modelUser.TwoFactorSecret),
 		BackupCodes:       modelUser.BackupCodes,
 		PasswordChangedAt: modelUser.PasswordResetAt,
 		CreatedAt:         modelUser.CreatedAt,
@@ -466,6 +507,13 @@ func bearerTokenDigest(purpose, token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func loginOTPStorageHash(storedSecret string) string {
+	if storedSecret == "" {
+		return ""
+	}
+	return bearerTokenDigest("login-otp-storage", storedSecret)
+}
+
 // CreateRefreshToken 创建刷新令牌
 func (r *GormTokenRepository) CreateRefreshToken(ctx context.Context, token *RefreshToken) error {
 	if token == nil || strings.TrimSpace(token.Token) == "" {
@@ -477,6 +525,308 @@ func (r *GormTokenRepository) CreateRefreshToken(ctx context.Context, token *Ref
 		token.Token = plaintext
 	}()
 	return r.db.WithContext(ctx).Create(token).Error
+}
+
+// CommitLoginSession is the sole successful-login persistence path. The user
+// row is the linearization point shared with logout-all. Trusted-device
+// revalidation or creation, refresh authority, and login-history activation
+// therefore either commit together or leave no session behind.
+func (r *GormTokenRepository) CommitLoginSession(
+	ctx context.Context,
+	command *LoginSessionCommit,
+) error {
+	if err := validateLoginSessionCommit(command); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	storedRefresh := *command.RefreshToken
+	storedRefresh.ID = 0
+	storedRefresh.Token = bearerTokenDigest(
+		"refresh-token",
+		command.RefreshToken.Token,
+	)
+	storedHistory := *command.LoginHistory
+	storedHistory.ID = 0
+	storedAttempt := *command.SuccessfulAttempt
+	storedAttempt.ID = 0
+	storedAttempt.User = nil
+	var storedNewDevice *models.OTPTrustedDevice
+	if command.NewTrustedDevice != nil {
+		copied := *command.NewTrustedDevice
+		copied.ID = 0
+		storedNewDevice = &copied
+	}
+
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		lockedUser, err := lockAuthUserForUpdate(tx, command.UserID)
+		if err != nil {
+			return err
+		}
+		if !loginPrincipalStillMatches(
+			lockedUser,
+			command.ExpectedPrincipal,
+			command.CommittedAt,
+		) {
+			return ErrInvalidCredentials
+		}
+		if err := lockAndMatchEmailVerificationPolicyTx(
+			tx,
+			command.ExpectedEmailPolicy,
+		); err != nil {
+			return err
+		}
+		if err := consumeLoginBackupCodeTx(
+			tx,
+			lockedUser,
+			command.BackupCode,
+		); err != nil {
+			return err
+		}
+		userUpdate := tx.Model(&models.User{}).
+			Where("id = ?", command.UserID).
+			Updates(map[string]interface{}{
+				"login_attempts": 0,
+				"locked_until":   nil,
+				"last_login_at":  command.CommittedAt,
+			})
+		if userUpdate.Error != nil {
+			return userUpdate.Error
+		}
+		if userUpdate.RowsAffected != 1 {
+			return ErrUserNotFound
+		}
+		if command.TrustedDeviceTokenHash != "" {
+			if err := revalidateAndTouchTrustedDeviceTx(
+				tx,
+				command,
+			); err != nil {
+				return err
+			}
+		} else if storedNewDevice != nil {
+			if err := tx.Create(storedNewDevice).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Create(&storedRefresh).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(&storedHistory).Error; err != nil {
+			return err
+		}
+		return tx.Create(&storedAttempt).Error
+	})
+	if err != nil {
+		return err
+	}
+	command.RefreshToken.ID = storedRefresh.ID
+	command.LoginHistory.ID = storedHistory.ID
+	command.SuccessfulAttempt.ID = storedAttempt.ID
+	if command.NewTrustedDevice != nil && storedNewDevice != nil {
+		command.NewTrustedDevice.ID = storedNewDevice.ID
+	}
+	return nil
+}
+
+func validateLoginSessionCommit(command *LoginSessionCommit) error {
+	if command == nil ||
+		command.UserID == 0 ||
+		command.CommittedAt.IsZero() ||
+		command.RefreshToken == nil ||
+		command.LoginHistory == nil ||
+		command.SuccessfulAttempt == nil ||
+		command.ExpectedPrincipal == nil ||
+		command.ExpectedEmailPolicy == nil ||
+		command.RefreshToken.UserID != command.UserID ||
+		command.LoginHistory.UserID != command.UserID ||
+		strings.TrimSpace(command.RefreshToken.Token) == "" ||
+		strings.TrimSpace(command.RefreshToken.SessionID) == "" ||
+		command.RefreshToken.SessionID != command.LoginHistory.SessionID ||
+		!command.RefreshToken.ExpiresAt.After(command.CommittedAt) ||
+		!command.LoginHistory.IsActive ||
+		command.LoginHistory.LoginStatus != models.LoginStatusSuccess ||
+		!command.LoginHistory.LoginMethod.IsValid() {
+		return ErrInvalidToken
+	}
+	if command.SuccessfulAttempt.UserID == nil ||
+		*command.SuccessfulAttempt.UserID != command.UserID ||
+		strings.TrimSpace(command.SuccessfulAttempt.Email) == "" ||
+		!command.SuccessfulAttempt.Success ||
+		strings.TrimSpace(command.SuccessfulAttempt.FailReason) != "" {
+		return ErrInvalidToken
+	}
+	principal := command.ExpectedPrincipal
+	if strings.TrimSpace(principal.Email) == "" ||
+		strings.TrimSpace(principal.PasswordHash) == "" ||
+		!principal.PlatformRole.IsValid() ||
+		principal.Status != StatusActive ||
+		(principal.OTPEnabled && principal.OTPStorageHash == "") ||
+		(!principal.OTPEnabled && principal.OTPStorageHash != "") {
+		return ErrInvalidToken
+	}
+	if strings.TrimSpace(command.BackupCode) != "" &&
+		!principal.OTPEnabled {
+		return ErrInvalidToken
+	}
+	if command.TrustedDeviceTokenHash != "" &&
+		command.NewTrustedDevice != nil {
+		return ErrTrustedDeviceInvalid
+	}
+	if command.TrustedDeviceExpiresAt != nil &&
+		(command.TrustedDeviceTokenHash == "" ||
+			!command.TrustedDeviceExpiresAt.After(command.CommittedAt)) {
+		return ErrTrustedDeviceInvalid
+	}
+	if device := command.NewTrustedDevice; device != nil &&
+		(device.UserID != command.UserID ||
+			strings.TrimSpace(device.DeviceTokenHash) == "" ||
+			!device.ExpiresAt.After(command.CommittedAt) ||
+			device.Revoked) {
+		return ErrTrustedDeviceInvalid
+	}
+	return nil
+}
+
+// lockAndMatchEmailVerificationPolicyTx closes the interval between reading
+// the dynamic policy and committing authentication state. PostgreSQL's table
+// lock covers the no-row/default-policy case as well as updates to an existing
+// row; SQLite's transaction-level locking provides the equivalent test and
+// development behavior.
+func lockAndMatchEmailVerificationPolicyTx(
+	tx *gorm.DB,
+	expected *EmailVerificationPolicySnapshot,
+) error {
+	if tx == nil || expected == nil {
+		return ErrEmailVerificationPolicyUnavailable
+	}
+	if tx.Dialector.Name() == "postgres" {
+		if err := tx.Exec(
+			`LOCK TABLE "email_configs" IN SHARE MODE`,
+		).Error; err != nil {
+			return fmt.Errorf(
+				"%w: lock policy: %v",
+				ErrEmailVerificationPolicyUnavailable,
+				err,
+			)
+		}
+	}
+
+	var config models.EmailConfig
+	err := emailVerificationPolicyLockQuery(tx).
+		Take(&config).Error
+	enabled := false
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf(
+			"%w: load policy: %v",
+			ErrEmailVerificationPolicyUnavailable,
+			err,
+		)
+	}
+	if err == nil {
+		enabled = config.EmailVerificationEnabled
+	}
+	if enabled != expected.Enabled {
+		return ErrEmailVerificationPolicyChanged
+	}
+	return nil
+}
+
+func emailVerificationPolicyLockQuery(tx *gorm.DB) *gorm.DB {
+	return tx.Model(&models.EmailConfig{}).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("is_active = ?", true).
+		Order("created_at DESC").
+		Order("id DESC")
+}
+
+func consumeLoginBackupCodeTx(
+	tx *gorm.DB,
+	user *lockedAuthUser,
+	code string,
+) error {
+	if strings.TrimSpace(code) == "" {
+		return nil
+	}
+	if tx == nil || user == nil || user.ID == 0 || !user.TwoFactorEnabled {
+		return ErrInvalidOTP
+	}
+	hashes, err := parseBackupCodeHashes(user.BackupCodes)
+	if err != nil {
+		return err
+	}
+	index := matchBackupCode(hashes, code)
+	if index < 0 {
+		return ErrInvalidOTP
+	}
+	remaining := append(append([]string{}, hashes[:index]...), hashes[index+1:]...)
+	result := tx.Model(&models.User{}).
+		Where(
+			"id = ? AND two_factor_enabled = ? AND backup_codes = ?",
+			user.ID,
+			true,
+			user.BackupCodes,
+		).
+		Update("backup_codes", strings.Join(remaining, ","))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrInvalidOTP
+	}
+	user.BackupCodes = strings.Join(remaining, ",")
+	return nil
+}
+
+func revalidateAndTouchTrustedDeviceTx(
+	tx *gorm.DB,
+	command *LoginSessionCommit,
+) error {
+	var device models.OTPTrustedDevice
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"user_id = ? AND device_token_hash = ? AND revoked = ? AND expires_at > ?",
+			command.UserID,
+			command.TrustedDeviceTokenHash,
+			false,
+			command.CommittedAt,
+		).
+		Take(&device).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrTrustedDeviceInvalid
+		}
+		return err
+	}
+	updates := map[string]interface{}{
+		"last_used_at": command.CommittedAt,
+		"last_ip":      command.TrustedDeviceIP,
+		"user_agent":   command.TrustedDeviceUserAgent,
+	}
+	if command.TrustedDeviceName != "" {
+		updates["device_name"] = command.TrustedDeviceName
+	}
+	if command.TrustedDeviceExpiresAt != nil {
+		updates["expires_at"] = *command.TrustedDeviceExpiresAt
+	}
+	result := tx.Model(&models.OTPTrustedDevice{}).
+		Where(
+			"id = ? AND user_id = ? AND device_token_hash = ? AND revoked = ? AND expires_at > ?",
+			device.ID,
+			command.UserID,
+			command.TrustedDeviceTokenHash,
+			false,
+			command.CommittedAt,
+		).
+		Updates(updates)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrTrustedDeviceInvalid
+	}
+	return nil
 }
 
 // GetRefreshToken 获取刷新令牌
@@ -608,10 +958,14 @@ func (r *GormTokenRepository) RotateRefreshToken(
 	return nil
 }
 
-// RevokeAllUserTokens 撤销用户所有令牌
+// RevokeAllUserTokens atomically revokes every persisted authentication state
+// that can keep a human signed in or bypass OTP on a remembered device.
 func (r *GormTokenRepository) RevokeAllUserTokens(ctx context.Context, userID uint) error {
 	now := time.Now()
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := lockAuthUserForUpdate(tx, userID); err != nil {
+			return err
+		}
 		if err := tx.Model(&RefreshToken{}).
 			Where("user_id = ? AND revoked = false", userID).
 			Updates(map[string]interface{}{
@@ -620,7 +974,7 @@ func (r *GormTokenRepository) RevokeAllUserTokens(ctx context.Context, userID ui
 			}).Error; err != nil {
 			return err
 		}
-		return tx.Model(&models.LoginHistory{}).
+		if err := tx.Model(&models.LoginHistory{}).
 			Where("user_id = ? AND is_active = ?", userID, true).
 			Updates(map[string]interface{}{
 				"is_active":        false,
@@ -628,6 +982,14 @@ func (r *GormTokenRepository) RevokeAllUserTokens(ctx context.Context, userID ui
 				"last_activity_at": now,
 				"login_status":     models.LoginStatusExpired,
 				"failure_reason":   "logout_all",
+			}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&models.OTPTrustedDevice{}).
+			Where("user_id = ? AND revoked = ?", userID, false).
+			Updates(map[string]interface{}{
+				"revoked":    true,
+				"expires_at": now,
 			}).Error
 	})
 }
@@ -702,7 +1064,10 @@ func (r *GormTokenRepository) CleanupExpiredTokens(ctx context.Context) error {
 
 // CreateEmailVerification 创建邮箱验证
 func (r *GormTokenRepository) CreateEmailVerification(ctx context.Context, verification *EmailVerification) error {
-	if verification == nil || strings.TrimSpace(verification.Token) == "" {
+	if verification == nil ||
+		verification.UserID == 0 ||
+		strings.TrimSpace(verification.Email) == "" ||
+		strings.TrimSpace(verification.Token) == "" {
 		return ErrInvalidToken
 	}
 	plaintext := verification.Token
@@ -710,7 +1075,16 @@ func (r *GormTokenRepository) CreateEmailVerification(ctx context.Context, verif
 	defer func() {
 		verification.Token = plaintext
 	}()
-	return r.db.WithContext(ctx).Create(verification).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockAuthCredentialUserEmail(
+			tx,
+			verification.UserID,
+			verification.Email,
+		); err != nil {
+			return err
+		}
+		return tx.Create(verification).Error
+	})
 }
 
 // GetEmailVerification 获取邮箱验证
@@ -776,6 +1150,28 @@ func (r *GormTokenRepository) VerifyEmailWithToken(
 			}
 			return err
 		}
+		if err := lockAuthCredentialUserEmail(
+			tx,
+			verification.UserID,
+			verification.Email,
+		); err != nil {
+			return err
+		}
+		// The account row is the serialization point for credential
+		// consumption. Re-read after acquiring it so a concurrent consumer
+		// cannot continue from a stale pre-lock snapshot.
+		if err := tx.Where(
+			"id = ? AND token = ? AND used = ? AND expires_at > ?",
+			verification.ID,
+			digest,
+			false,
+			verifiedAt,
+		).Take(&verification).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrInvalidToken
+			}
+			return err
+		}
 		result := tx.Model(&EmailVerification{}).
 			Where(
 				"id = ? AND used = ? AND expires_at > ?",
@@ -795,7 +1191,11 @@ func (r *GormTokenRepository) VerifyEmailWithToken(
 			return ErrInvalidToken
 		}
 		result = tx.Model(&models.User{}).
-			Where("id = ?", verification.UserID).
+			Where(
+				"id = ? AND email = ?",
+				verification.UserID,
+				verification.Email,
+			).
 			Updates(map[string]interface{}{
 				"email_verified":    true,
 				"email_verified_at": &verifiedAt,
@@ -814,7 +1214,10 @@ func (r *GormTokenRepository) VerifyEmailWithToken(
 
 // CreatePasswordReset 创建密码重置
 func (r *GormTokenRepository) CreatePasswordReset(ctx context.Context, reset *PasswordReset) error {
-	if reset == nil || strings.TrimSpace(reset.Token) == "" {
+	if reset == nil ||
+		reset.UserID == 0 ||
+		strings.TrimSpace(reset.Email) == "" ||
+		strings.TrimSpace(reset.Token) == "" {
 		return ErrInvalidToken
 	}
 	plaintext := reset.Token
@@ -822,7 +1225,16 @@ func (r *GormTokenRepository) CreatePasswordReset(ctx context.Context, reset *Pa
 	defer func() {
 		reset.Token = plaintext
 	}()
-	return r.db.WithContext(ctx).Create(reset).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockAuthCredentialUserEmail(
+			tx,
+			reset.UserID,
+			reset.Email,
+		); err != nil {
+			return err
+		}
+		return tx.Create(reset).Error
+	})
 }
 
 // GetPasswordReset 获取密码重置
@@ -891,12 +1303,33 @@ func (r *GormTokenRepository) ResetPasswordWithToken(
 			}
 			return err
 		}
+		if err := lockAuthCredentialUserEmail(
+			tx,
+			reset.UserID,
+			reset.Email,
+		); err != nil {
+			return err
+		}
+		// Different reset links for one account lock the same user row. The
+		// presented token is revalidated after that lock, making the account
+		// single-winner even when two valid links race.
+		if err := tx.Where(
+			"id = ? AND token = ? AND used = ? AND expires_at > ?",
+			reset.ID,
+			digest,
+			false,
+			changedAt,
+		).Take(&reset).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrInvalidToken
+			}
+			return err
+		}
 		result := tx.Model(&PasswordReset{}).
 			Where(
-				"id = ? AND used = ? AND expires_at > ?",
-				reset.ID,
+				"user_id = ? AND used = ?",
+				reset.UserID,
 				false,
-				changedAt,
 			).
 			Updates(map[string]interface{}{
 				"used":            true,
@@ -906,11 +1339,11 @@ func (r *GormTokenRepository) ResetPasswordWithToken(
 		if result.Error != nil {
 			return result.Error
 		}
-		if result.RowsAffected != 1 {
+		if result.RowsAffected < 1 {
 			return ErrInvalidToken
 		}
 		result = tx.Model(&models.User{}).
-			Where("id = ?", reset.UserID).
+			Where("id = ? AND email = ?", reset.UserID, reset.Email).
 			Updates(map[string]interface{}{
 				"password_hash":     passwordHash,
 				"password_reset_at": &changedAt,
@@ -946,6 +1379,101 @@ func (r *GormTokenRepository) ResetPasswordWithToken(
 		return nil
 	})
 	return userID, err
+}
+
+// lockAuthCredentialUserEmail binds a one-time credential to the mailbox that
+// received it and locks the account as the serialization point for concurrent
+// credential consumption. Changing an account email therefore invalidates all
+// previously issued verification and password-reset links without consuming
+// them or applying partial side effects.
+func lockAuthCredentialUserEmail(
+	tx *gorm.DB,
+	userID uint,
+	credentialEmail string,
+) error {
+	if tx == nil || userID == 0 || strings.TrimSpace(credentialEmail) == "" {
+		return ErrInvalidToken
+	}
+	user, err := lockAuthUserForUpdate(tx, userID)
+	if err != nil {
+		return err
+	}
+	if user.Email != credentialEmail {
+		return ErrInvalidToken
+	}
+	return nil
+}
+
+type lockedAuthUser struct {
+	ID               uint
+	Email            string
+	PasswordHash     string
+	PlatformRole     models.PlatformRole
+	Status           models.UserStatus
+	EmailVerified    bool
+	TwoFactorEnabled bool
+	TwoFactorSecret  string
+	BackupCodes      string
+	LockedUntil      *time.Time
+}
+
+// authUserLockQuery is shared by every authentication state transition that
+// must linearize against logout-all. Keeping the clause in one builder also
+// makes its PostgreSQL SELECT ... FOR UPDATE contract directly testable.
+func authUserLockQuery(tx *gorm.DB, userID uint) *gorm.DB {
+	return tx.Model(&models.User{}).
+		Select(
+			"id",
+			"email",
+			"password_hash",
+			"platform_role",
+			"status",
+			"email_verified",
+			"two_factor_enabled",
+			"two_factor_secret",
+			"backup_codes",
+			"locked_until",
+		).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ?", userID)
+}
+
+func lockAuthUserForUpdate(
+	tx *gorm.DB,
+	userID uint,
+) (*lockedAuthUser, error) {
+	if tx == nil || userID == 0 {
+		return nil, ErrUserNotFound
+	}
+	var user lockedAuthUser
+	if err := authUserLockQuery(tx, userID).Take(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+	return &user, nil
+}
+
+func loginPrincipalStillMatches(
+	user *lockedAuthUser,
+	expected *LoginPrincipalSnapshot,
+	at time.Time,
+) bool {
+	if user == nil || expected == nil || at.IsZero() {
+		return false
+	}
+	if user.LockedUntil != nil && user.LockedUntil.After(at) {
+		return false
+	}
+	return user.Email == expected.Email &&
+		user.PasswordHash == expected.PasswordHash &&
+		PlatformRole(user.PlatformRole) == expected.PlatformRole &&
+		user.Status == expected.Status &&
+		user.Status == StatusActive &&
+		user.EmailVerified == expected.EmailVerified &&
+		user.TwoFactorEnabled == expected.OTPEnabled &&
+		loginOTPStorageHash(user.TwoFactorSecret) == expected.OTPStorageHash
 }
 
 // CreateOTPCode 创建OTP验证码
@@ -1499,17 +2027,74 @@ func (r *GormTrustedDeviceRepository) Create(ctx context.Context, device *models
 	return r.db.WithContext(ctx).Create(device).Error
 }
 
-// Update 更新设备记录
+// Update applies only mutable fields to the exact still-active owner row.
+// Save is intentionally forbidden: a stale in-memory Revoked=false value must
+// never resurrect a device that logout-all revoked concurrently.
 func (r *GormTrustedDeviceRepository) Update(ctx context.Context, device *models.OTPTrustedDevice) error {
-	return r.db.WithContext(ctx).Save(device).Error
+	if device == nil ||
+		device.ID == 0 ||
+		device.UserID == 0 ||
+		strings.TrimSpace(device.DeviceTokenHash) == "" ||
+		device.ExpiresAt.IsZero() {
+		return ErrTrustedDeviceInvalid
+	}
+	now := time.Now()
+	updates := map[string]interface{}{
+		"device_name":  device.DeviceName,
+		"last_used_at": device.LastUsedAt,
+		"last_ip":      device.LastIP,
+		"user_agent":   device.UserAgent,
+		"expires_at":   device.ExpiresAt,
+	}
+	if device.Revoked {
+		updates["revoked"] = true
+	}
+	result := r.db.WithContext(ctx).
+		Model(&models.OTPTrustedDevice{}).
+		Where(
+			"id = ? AND user_id = ? AND device_token_hash = ? AND revoked = ? AND expires_at > ?",
+			device.ID,
+			device.UserID,
+			device.DeviceTokenHash,
+			false,
+			now,
+		).
+		Updates(updates)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrTrustedDeviceInvalid
+	}
+	return nil
 }
 
-// ListActiveDevices 返回用户当前未撤销的可信设备，按最近使用时间排序
+// ListActiveDevices revokes expired records before returning the user's
+// currently usable devices. Expired rows therefore never consume the quota or
+// cause a still-valid remembered device to be evicted.
 func (r *GormTrustedDeviceRepository) ListActiveDevices(ctx context.Context, userID uint) ([]*models.OTPTrustedDevice, error) {
 	var devices []*models.OTPTrustedDevice
-	err := r.db.WithContext(ctx).
-		Where("user_id = ? AND revoked = ?", userID, false).
-		Order("COALESCE(last_used_at, created_at) DESC").
-		Find(&devices).Error
+	now := time.Now()
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&models.OTPTrustedDevice{}).
+			Where(
+				"user_id = ? AND revoked = ? AND expires_at <= ?",
+				userID,
+				false,
+				now,
+			).
+			Update("revoked", true).Error; err != nil {
+			return err
+		}
+		return tx.
+			Where(
+				"user_id = ? AND revoked = ? AND expires_at > ?",
+				userID,
+				false,
+				now,
+			).
+			Order("COALESCE(last_used_at, created_at) DESC").
+			Find(&devices).Error
+	})
 	return devices, err
 }

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	stdlog "log"
 	"math"
 	"net"
 	"net/http"
@@ -17,6 +18,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
@@ -39,7 +42,7 @@ type NotificationServiceInterface interface {
 	GetUnreadCount(ctx context.Context, userID uint) (int64, error)
 
 	// 通知偏好设置
-	GetNotificationPreferences(ctx context.Context, userID uint) ([]*models.NotificationPreference, error)
+	GetNotificationPreferences(ctx context.Context, userID uint) ([]*models.NotificationPreferenceView, error)
 	UpdateNotificationPreferences(ctx context.Context, userID uint, preferences []models.NotificationPreference) error
 
 	// 邮件通知相关方法
@@ -52,17 +55,29 @@ var ErrInvalidNotificationPreferences = errors.New(
 var ErrInvalidNotificationListQuery = errors.New(
 	"invalid notification list query",
 )
+var ErrUnsupportedNotificationChannel = errors.New(
+	"unsupported manual notification channel",
+)
+
+const NotificationDeliveryStatusSuppressedByPreference = "suppressed_by_preference"
 
 // NotificationService 通知服务
 type NotificationService struct {
-	db                       *gorm.DB
-	emailNotificationService EmailNotificationServiceInterface
-	outboxWebhookTimeout     time.Duration
-	environment              string
-	secretStore              security.Protector
-	webhookClients           WebhookClientFactory
-	webhookTestProjects      *ProjectService
-	webhookTestEvents        *AgentNativeService
+	db                         *gorm.DB
+	emailNotificationService   EmailNotificationServiceInterface
+	outboxWebhookTimeout       time.Duration
+	environment                string
+	secretStore                security.Protector
+	webhookClients             WebhookClientFactory
+	webhookTestProjects        *ProjectService
+	webhookTestEvents          *AgentNativeService
+	webhookAttemptAudits       sync.WaitGroup
+	webhookAttemptAuditMu      sync.Mutex
+	webhookAttemptAuditClosed  bool
+	webhookAttemptAuditRoot    context.Context
+	webhookAttemptAuditCancel  context.CancelFunc
+	webhookAttemptAuditWriters chan struct{}
+	webhookAttemptAuditDrops   atomic.Uint64
 }
 
 func withNotificationProjectOperation[T any](
@@ -125,6 +140,23 @@ func (f WebhookClientFactoryFunc) ClientFor(
 	return f(ctx, target, timeout)
 }
 
+func boundWebhookClientTimeout(
+	client *http.Client,
+	remaining time.Duration,
+) (*http.Client, error) {
+	if client == nil || remaining <= 0 {
+		return nil, ErrWebhookOutboxAttemptRejected
+	}
+	bounded := *client
+	if bounded.Timeout <= 0 || bounded.Timeout > remaining {
+		bounded.Timeout = remaining
+	}
+	if bounded.Timeout <= 0 {
+		return nil, ErrWebhookOutboxAttemptRejected
+	}
+	return &bounded, nil
+}
+
 type publicWebhookClientFactory struct {
 	resolver *net.Resolver
 }
@@ -139,6 +171,7 @@ func (f publicWebhookClientFactory) ClientFor(
 
 const (
 	defaultOutboxWebhookAttemptTimeout = 20 * time.Second
+	webhookAttemptAuditConcurrency     = 8
 
 	// NotificationOutboxDestination is the durable in-app notification
 	// consumer. It is deliberately distinct from "webhook": database-backed
@@ -246,12 +279,19 @@ func NewNotificationServiceWithClientFactory(
 	if factory == nil {
 		factory = publicWebhookClientFactory{resolver: net.DefaultResolver}
 	}
+	auditRoot, cancelAudit := context.WithCancel(context.Background())
 	return &NotificationService{
-		db:                   db,
-		outboxWebhookTimeout: defaultOutboxWebhookAttemptTimeout,
-		environment:          getRuntimeEnvironment(),
-		secretStore:          protector,
-		webhookClients:       factory,
+		db:                        db,
+		outboxWebhookTimeout:      defaultOutboxWebhookAttemptTimeout,
+		environment:               getRuntimeEnvironment(),
+		secretStore:               protector,
+		webhookClients:            factory,
+		webhookAttemptAuditRoot:   auditRoot,
+		webhookAttemptAuditCancel: cancelAudit,
+		webhookAttemptAuditWriters: make(
+			chan struct{},
+			1,
+		),
 	}
 }
 
@@ -505,53 +545,52 @@ func (ns *NotificationService) SendWebhookOutboxAttempt(
 // retry behavior.
 func (ns *NotificationService) SendWebhookSnapshotOutboxAttempt(
 	ctx context.Context,
-	scope models.ProjectScope,
-	snapshotID string,
-	event *NotificationEvent,
+	claim WebhookOutboxAttemptClaim,
+	event *CloudEventEnvelope,
 ) error {
-	if event == nil {
-		return errors.New("webhook event is required")
-	}
-	if err := scope.Validate(); err != nil {
-		return fmt.Errorf("invalid webhook project scope: %w", err)
-	}
-	snapshotID = strings.TrimSpace(snapshotID)
-	if snapshotID == "" {
-		return errors.New("webhook delivery snapshot is required")
-	}
-	snapshot, err := withNotificationProjectOperation(
-		ns,
+	return ns.SendWebhookSnapshotOutboxAttemptResult(
 		ctx,
-		scope,
-		func(scopedContext context.Context) (
-			models.WebhookDeliverySnapshot,
-			error,
-		) {
-			var snapshot models.WebhookDeliverySnapshot
-			err := ns.db.WithContext(scopedContext).
-				Where(
-					"id = ? AND organization_id = ? AND project_id = ?",
-					snapshotID,
-					scope.OrganizationID,
-					scope.ProjectID,
-				).
-				First(&snapshot).Error
-			return snapshot, err
-		},
+		claim,
+		event,
+	).Err
+}
+
+func (ns *NotificationService) SendWebhookSnapshotOutboxAttemptResult(
+	ctx context.Context,
+	claim WebhookOutboxAttemptClaim,
+	callerEvent *CloudEventEnvelope,
+) OutboxAttemptResult {
+	if callerEvent == nil {
+		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
+	}
+	if err := claim.validate(); err != nil {
+		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
+	}
+	state, err := ns.validateWebhookOutboxAttemptGate(
+		ctx,
+		claim,
 	)
 	if err != nil {
-		return fmt.Errorf("load webhook delivery snapshot: %w", err)
+		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
 	}
-	if eventID := strings.TrimSpace(event.Metadata["event_id"]); eventID == "" ||
-		eventID != snapshot.EventID {
-		return errors.New("webhook delivery snapshot event mismatch")
+	persistedEvent := CloudEventFromModel(&state.event)
+	if !eventcontract.IsWebhookDeliveryEventType(
+		strings.TrimSpace(persistedEvent.Type),
+	) ||
+		!webhookCallerEventMatchesPersisted(
+			callerEvent,
+			&persistedEvent,
+		) {
+		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
 	}
-	config, err := snapshot.WebhookConfig()
+	event := notificationEventFromPersistedCloudEvent(persistedEvent)
+	event.Metadata["delivery_id"] = claim.DeliveryID
+	config, err := state.snapshot.WebhookConfig()
 	if err != nil {
-		return fmt.Errorf("hydrate webhook delivery snapshot: %w", err)
+		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
 	}
 	if err := ns.revealWebhookSecrets(&config); err != nil {
-		return fmt.Errorf("无法读取webhook快照凭据: %w", err)
+		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
 	}
 	timeout := ns.outboxWebhookTimeout
 	if timeout <= 0 || timeout > defaultOutboxWebhookAttemptTimeout {
@@ -563,9 +602,130 @@ func (ns *NotificationService) SendWebhookSnapshotOutboxAttempt(
 			timeout = configured
 		}
 	}
-	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	now := time.Now().UTC()
+	attemptDeadline := claim.EffectiveDeadline.UTC()
+	if parentDeadline, ok := ctx.Deadline(); ok &&
+		parentDeadline.Before(attemptDeadline) {
+		attemptDeadline = parentDeadline.UTC()
+	}
+	configuredDeadline := now.Add(timeout)
+	if configuredDeadline.Before(attemptDeadline) {
+		attemptDeadline = configuredDeadline
+	}
+	if claim.CredentialExpiresAt.Before(attemptDeadline) {
+		attemptDeadline = claim.CredentialExpiresAt.UTC()
+	}
+	if !now.Before(attemptDeadline) {
+		return OutboxKnownFailure(ErrWebhookOutboxAttemptRejected)
+	}
+	attemptClaim := claim
+	attemptClaim.EffectiveDeadline = attemptDeadline
+	attemptCtx, cancel := context.WithDeadline(ctx, attemptDeadline)
 	defer cancel()
-	return ns.sendWebhookAttempt(attemptCtx, &config, event)
+	result := ns.sendWebhookAttemptResultWithAudit(
+		attemptCtx,
+		&config,
+		event,
+		false,
+		func(gateContext context.Context) error {
+			_, err := ns.validateWebhookOutboxAttemptGate(
+				gateContext,
+				attemptClaim,
+			)
+			return err
+		},
+	)
+	return result.withEffectiveDeadline(attemptDeadline)
+}
+
+func webhookCallerEventMatchesPersisted(
+	caller *CloudEventEnvelope,
+	persisted *CloudEventEnvelope,
+) bool {
+	if caller == nil || persisted == nil {
+		return false
+	}
+	callerJSON, callerErr := json.Marshal(caller)
+	persistedJSON, persistedErr := json.Marshal(persisted)
+	return callerErr == nil &&
+		persistedErr == nil &&
+		bytes.Equal(callerJSON, persistedJSON)
+}
+
+func notificationEventFromPersistedCloudEvent(
+	event CloudEventEnvelope,
+) *NotificationEvent {
+	var payload map[string]any
+	if len(event.Data) > 0 {
+		_ = json.Unmarshal(event.Data, &payload)
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payload["event_id"] = event.ID
+	payload["cloud_event"] = event
+	var ticket struct {
+		TicketID uint `json:"ticket_id"`
+	}
+	_ = json.Unmarshal(event.Data, &ticket)
+	if ticket.TicketID == 0 &&
+		strings.HasPrefix(event.Subject, "ticket/") {
+		ticket.TicketID, _ = safeconv.ParsePositiveUint(
+			strings.TrimPrefix(event.Subject, "ticket/"),
+		)
+	}
+	transitionStatus := models.TicketStatus("")
+	if event.Type == eventcontract.TicketTransitionedEventType {
+		var transition struct {
+			Status    models.TicketStatus `json:"status"`
+			NewStatus models.TicketStatus `json:"new_status"`
+		}
+		if json.Unmarshal(event.Data, &transition) == nil {
+			transitionStatus = transition.NewStatus
+			if transitionStatus == "" {
+				transitionStatus = transition.Status
+			}
+		}
+	}
+	title := "ChronoDesk ticket event"
+	description := event.Type
+	if event.Type ==
+		eventcontract.AutomationNotificationRequestedEventType {
+		var requested struct {
+			Notification struct {
+				Title   string `json:"title"`
+				Content string `json:"content"`
+			} `json:"notification"`
+		}
+		if json.Unmarshal(event.Data, &requested) == nil {
+			if value := strings.TrimSpace(
+				requested.Notification.Title,
+			); value != "" {
+				title = value
+			}
+			if value := strings.TrimSpace(
+				requested.Notification.Content,
+			); value != "" {
+				description = value
+			}
+		}
+	}
+	return &NotificationEvent{
+		Type:             models.WebhookEventType(event.Type),
+		TransitionStatus: transitionStatus,
+		ResourceID:       ticket.TicketID,
+		ResourceType:     "ticket",
+		Title:            title,
+		Description:      description,
+		Data:             payload,
+		Metadata: map[string]string{
+			"event_id":       event.ID,
+			"trace_id":       event.TraceID,
+			"correlation_id": event.CorrelationID,
+			"specversion":    event.SpecVersion,
+		},
+		Timestamp: event.Time,
+	}
 }
 
 func (ns *NotificationService) sendWebhookAttempt(
@@ -573,17 +733,47 @@ func (ns *NotificationService) sendWebhookAttempt(
 	config *models.WebhookConfig,
 	event *NotificationEvent,
 ) error {
+	return ns.sendWebhookAttemptResultWithAudit(
+		ctx,
+		config,
+		event,
+		true,
+		nil,
+	).Err
+}
+
+func (ns *NotificationService) sendWebhookAttemptResult(
+	ctx context.Context,
+	config *models.WebhookConfig,
+	event *NotificationEvent,
+) OutboxAttemptResult {
+	return ns.sendWebhookAttemptResultWithAudit(
+		ctx,
+		config,
+		event,
+		false,
+		nil,
+	)
+}
+
+func (ns *NotificationService) sendWebhookAttemptResultWithAudit(
+	ctx context.Context,
+	config *models.WebhookConfig,
+	event *NotificationEvent,
+	waitForAudit bool,
+	beforeDo func(context.Context) error,
+) OutboxAttemptResult {
 	if config == nil {
-		return errors.New("webhook配置不能为空")
+		return OutboxKnownFailure(errors.New("webhook配置不能为空"))
 	}
 	if event == nil {
-		return errors.New("webhook事件不能为空")
+		return OutboxKnownFailure(errors.New("webhook事件不能为空"))
 	}
 	if err := requireExternalIOOutsideProjectTransaction(
 		ctx,
 		"webhook HTTP delivery",
 	); err != nil {
-		return err
+		return OutboxKnownFailure(err)
 	}
 	startTime := time.Now()
 
@@ -611,8 +801,18 @@ func (ns *NotificationService) sendWebhookAttempt(
 		strings.TrimSpace(config.Secret) == "" {
 		log.Status = "failed"
 		log.ErrorMessage = "自定义webhook缺少签名密钥"
-		ns.saveLog(ctx, log, config)
-		return errors.New("自定义webhook缺少签名密钥")
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxKnownFailure(
+				errors.New("自定义webhook缺少签名密钥"),
+			),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
 	}
 
 	// 生成消息内容
@@ -620,8 +820,16 @@ func (ns *NotificationService) sendWebhookAttempt(
 	if err != nil {
 		log.Status = "failed"
 		log.ErrorMessage = fmt.Sprintf("生成消息失败: %v", err)
-		ns.saveLog(ctx, log, config)
-		return err
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxKnownFailure(err),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
 	}
 
 	// 构建请求
@@ -629,8 +837,16 @@ func (ns *NotificationService) sendWebhookAttempt(
 	if err != nil {
 		log.Status = "failed"
 		log.ErrorMessage = fmt.Sprintf("构建请求失败: %v", err)
-		ns.saveLog(ctx, log, config)
-		return err
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxKnownFailure(err),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
 	}
 	eventID := strings.TrimSpace(event.Metadata["event_id"])
 	if config.Provider == models.WebhookProviderCustom {
@@ -638,14 +854,34 @@ func (ns *NotificationService) sendWebhookAttempt(
 		if err := json.Unmarshal(requestBody, &structuredEvent); err != nil {
 			log.Status = "failed"
 			log.ErrorMessage = "读取自定义webhook CloudEvent标识失败"
-			ns.saveLog(ctx, log, config)
-			return errors.New("读取自定义webhook CloudEvent标识失败")
+			return ns.finishWebhookAttempt(
+				ctx,
+				config,
+				log,
+				OutboxKnownFailure(
+					errors.New("读取自定义webhook CloudEvent标识失败"),
+				),
+				false,
+				false,
+				nil,
+				waitForAudit,
+			)
 		}
 		if eventID != "" && eventID != structuredEvent.ID {
 			log.Status = "failed"
 			log.ErrorMessage = "自定义webhook CloudEvent标识不一致"
-			ns.saveLog(ctx, log, config)
-			return errors.New("自定义webhook CloudEvent标识不一致")
+			return ns.finishWebhookAttempt(
+				ctx,
+				config,
+				log,
+				OutboxKnownFailure(
+					errors.New("自定义webhook CloudEvent标识不一致"),
+				),
+				false,
+				false,
+				nil,
+				waitForAudit,
+			)
 		}
 		eventID = structuredEvent.ID
 	}
@@ -659,8 +895,16 @@ func (ns *NotificationService) sendWebhookAttempt(
 	if err != nil {
 		log.Status = "failed"
 		log.ErrorMessage = "创建webhook请求失败"
-		ns.saveLog(ctx, log, config)
-		return errors.New("webhook请求地址无效")
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxKnownFailure(errors.New("webhook请求地址无效")),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
 	}
 
 	// 设置请求头
@@ -679,18 +923,110 @@ func (ns *NotificationService) sendWebhookAttempt(
 	// 以及所有未知扩展头永不落盘。
 	log.RequestHeaders = headersForAuditLog(req.Header, requestHeaderAuditAllowlist)
 
+	clientTimeout := ns.outboxWebhookTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		clientTimeout = time.Until(deadline)
+	}
+	if clientTimeout <= 0 {
+		log.Status = "failed"
+		log.ErrorMessage = "webhook投递门禁拒绝"
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxKnownFailure(ErrWebhookOutboxAttemptRejected),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
+	}
 	client, err := ns.webhookClients.ClientFor(
 		ctx,
 		req.URL,
-		ns.outboxWebhookTimeout,
+		clientTimeout,
 	)
 	if err != nil || client == nil {
 		log.Status = "failed"
 		log.ErrorMessage = "webhook目标地址未通过安全校验"
-		ns.saveLog(ctx, log, config)
-		return errors.New("webhook目标地址未通过安全校验")
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxKnownFailure(
+				errors.New("webhook目标地址未通过安全校验"),
+			),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
 	}
 	defer client.CloseIdleConnections()
+
+	if beforeDo != nil {
+		if err := beforeDo(ctx); err != nil {
+			log.Status = "failed"
+			log.ErrorMessage = "webhook投递门禁拒绝"
+			return ns.finishWebhookAttempt(
+				ctx,
+				config,
+				log,
+				OutboxKnownFailure(ErrWebhookOutboxAttemptRejected),
+				false,
+				false,
+				nil,
+				waitForAudit,
+			)
+		}
+		deadline, ok := req.Context().Deadline()
+		if !ok {
+			log.Status = "failed"
+			log.ErrorMessage = "webhook投递门禁拒绝"
+			return ns.finishWebhookAttempt(
+				ctx,
+				config,
+				log,
+				OutboxKnownFailure(ErrWebhookOutboxAttemptRejected),
+				false,
+				false,
+				nil,
+				waitForAudit,
+			)
+		}
+		client, err = boundWebhookClientTimeout(
+			client,
+			time.Until(deadline),
+		)
+		if err != nil {
+			log.Status = "failed"
+			log.ErrorMessage = "webhook投递门禁拒绝"
+			return ns.finishWebhookAttempt(
+				ctx,
+				config,
+				log,
+				OutboxKnownFailure(ErrWebhookOutboxAttemptRejected),
+				false,
+				false,
+				nil,
+				waitForAudit,
+			)
+		}
+	}
+	if ctx.Err() != nil {
+		log.Status = "failed"
+		log.ErrorMessage = "webhook投递门禁拒绝"
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxKnownFailure(ErrWebhookOutboxAttemptRejected),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
+	}
 
 	// 发送请求
 	resp, err := client.Do(req)
@@ -699,13 +1035,83 @@ func (ns *NotificationService) sendWebhookAttempt(
 	if err != nil {
 		log.Status = "failed"
 		log.ErrorMessage = "webhook请求发送失败"
-		ns.saveLog(ctx, log, config)
-		return errors.New("webhook请求发送失败")
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxUncertain(
+				errors.New("webhook请求发送结果不确定"),
+			),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
 	}
 	defer resp.Body.Close()
 
-	// 读取响应
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	// A result is known only after the bounded response body reaches EOF. A
+	// transport/body failure after client.Do starts cannot prove whether the
+	// receiver committed its side effect.
+	const maxWebhookResponseBodyBytes = int64(1 << 20)
+	bodyBytes, bodyErr := io.CopyN(
+		io.Discard,
+		resp.Body,
+		maxWebhookResponseBodyBytes+1,
+	)
+	if bodyErr != nil && !errors.Is(bodyErr, io.EOF) {
+		log.Status = "failed"
+		log.ErrorMessage = "读取webhook响应失败"
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxUncertain(
+				errors.New("webhook响应读取结果不确定"),
+			),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
+	}
+	if bodyErr == nil || bodyBytes > maxWebhookResponseBodyBytes {
+		log.Status = "failed"
+		log.ErrorMessage = "webhook响应超过读取上限"
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxUncertain(
+				errors.New("webhook响应读取结果不确定"),
+			),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
+	}
+	completedAt := time.Now().UTC()
+	if completedDeadline, ok := ctx.Deadline(); ok &&
+		completedAt.After(completedDeadline.UTC()) {
+		log.Status = "failed"
+		log.ErrorMessage = "webhook响应在投递截止时间后完成"
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			outboxLateCompletion(
+				completedAt,
+				errors.New(
+					"webhook response completed after attempt deadline",
+				),
+			),
+			false,
+			false,
+			nil,
+			waitForAudit,
+		)
+	}
 	log.ResponseStatus = resp.StatusCode
 	// 回调响应由外部系统控制，可能回显 Authorization、签名或 Cookie。
 	// 响应正文不进入持久日志。
@@ -718,35 +1124,126 @@ func (ns *NotificationService) sendWebhookAttempt(
 	// 判断请求是否成功
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		log.Status = "success"
-
-		// 更新配置统计
-		ns.updateConfigStats(ctx, config, true, nil)
+		return ns.finishWebhookAttempt(
+			ctx,
+			config,
+			log,
+			OutboxKnownSuccess(completedAt),
+			true,
+			true,
+			nil,
+			waitForAudit,
+		)
 	} else {
 		log.Status = "failed"
 		log.ErrorMessage = fmt.Sprintf("HTTP错误: %d", resp.StatusCode)
-
-		// 更新配置统计
-		ns.updateConfigStats(
-			ctx,
-			config,
-			false,
-			fmt.Errorf("HTTP %d", resp.StatusCode),
-		)
-
 	}
-
-	// 保存日志
-	ns.saveLog(ctx, log, config)
 
 	// Any non-2xx response must remain an error. The durable Agent Outbox is
 	// the recovery owner for domain-event delivery; returning nil for a
 	// locally marked "retrying" log would permanently acknowledge a failed
 	// external side effect.
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("webhook发送失败: HTTP %d", resp.StatusCode)
+	return ns.finishWebhookAttempt(
+		ctx,
+		config,
+		log,
+		OutboxKnownFailure(
+			fmt.Errorf("webhook发送失败: HTTP %d", resp.StatusCode),
+		),
+		true,
+		false,
+		fmt.Errorf("HTTP %d", resp.StatusCode),
+		waitForAudit,
+	)
+}
+
+func (ns *NotificationService) finishWebhookAttempt(
+	ctx context.Context,
+	config *models.WebhookConfig,
+	log *models.WebhookLog,
+	result OutboxAttemptResult,
+	updateStats bool,
+	success bool,
+	statsErr error,
+	waitForAudit bool,
+) OutboxAttemptResult {
+	if ns == nil || config == nil || log == nil {
+		return result
+	}
+	attemptedAt := time.Now().UTC()
+	if !result.CompletedAt.IsZero() {
+		attemptedAt = result.CompletedAt.UTC()
+	}
+	log.CreatedAt = attemptedAt
+	persist := func(
+		auditContext context.Context,
+		auditConfig *models.WebhookConfig,
+		auditLog *models.WebhookLog,
+	) {
+		if updateStats {
+			ns.updateConfigStats(
+				auditContext,
+				auditConfig,
+				success,
+				statsErr,
+				attemptedAt,
+			)
+		}
+		ns.saveLog(auditContext, auditLog, auditConfig)
+	}
+	if waitForAudit {
+		persist(ctx, config, log)
+		return result
 	}
 
-	return nil
+	configCopy := *config
+	logCopy := *log
+	ns.submitWebhookAttemptAudit(webhookAttemptAuditWork{
+		source: ctx,
+		persist: func(auditContext context.Context) {
+			persist(auditContext, &configCopy, &logCopy)
+		},
+	})
+	return result
+}
+
+func (ns *NotificationService) waitForWebhookAttemptAudits() {
+	ns.WaitForWebhookAttemptAudits()
+}
+
+// WaitForWebhookAttemptAudits joins post-response bookkeeping after callers
+// have stopped admitting new webhook attempts.
+func (ns *NotificationService) WaitForWebhookAttemptAudits() {
+	if ns == nil {
+		return
+	}
+	if !ns.waitForWebhookAttemptAuditsWithin(webhookAttemptAuditWaitTimeout) {
+		stdlog.Print("webhook post-response audit wait budget exhausted")
+	}
+}
+
+// CloseWebhookAttemptAuditsAndWait atomically closes async audit admission,
+// then joins every audit admitted before the close. Late external attempts are
+// dropped without touching a database that may already be shutting down.
+func (ns *NotificationService) CloseWebhookAttemptAuditsAndWait() {
+	if ns == nil {
+		return
+	}
+	ns.webhookAttemptAuditMu.Lock()
+	ns.webhookAttemptAuditClosed = true
+	ns.webhookAttemptAuditMu.Unlock()
+	grace := webhookAttemptAuditShutdownTimeout / 2
+	if ns.waitForWebhookAttemptAuditsWithin(grace) {
+		return
+	}
+	if ns.webhookAttemptAuditCancel != nil {
+		ns.webhookAttemptAuditCancel()
+	}
+	if !ns.waitForWebhookAttemptAuditsWithin(
+		webhookAttemptAuditShutdownTimeout - grace,
+	) {
+		stdlog.Print("webhook post-response audit shutdown budget exhausted")
+	}
 }
 
 // generateMessage 生成消息内容
@@ -1186,6 +1683,7 @@ func (ns *NotificationService) updateConfigStats(
 	config *models.WebhookConfig,
 	success bool,
 	err error,
+	attemptedAt time.Time,
 ) {
 	if config == nil ||
 		config.ID == 0 ||
@@ -1194,25 +1692,51 @@ func (ns *NotificationService) updateConfigStats(
 		return
 	}
 	finalizeContext, cancelFinalize := context.WithTimeout(
-		context.WithoutCancel(ctx),
+		ctx,
 		5*time.Second,
 	)
 	defer cancelFinalize()
+	attemptedAt = attemptedAt.UTC()
+	lastError := ""
+	if err != nil {
+		lastError = err.Error()
+	}
 	updates := map[string]interface{}{
-		"last_triggered_at": time.Now(),
-		"total_sent":        gorm.Expr("total_sent + 1"),
+		"last_triggered_at": gorm.Expr(
+			"CASE WHEN last_triggered_at IS NULL OR "+
+				"last_triggered_at < ? THEN ? "+
+				"ELSE last_triggered_at END",
+			attemptedAt,
+			attemptedAt,
+		),
+		"last_error": gorm.Expr(
+			"CASE WHEN last_triggered_at IS NULL OR "+
+				"last_triggered_at < ? THEN ? "+
+				"ELSE last_error END",
+			attemptedAt,
+			lastError,
+		),
+		"total_sent": gorm.Expr("total_sent + 1"),
 	}
 
 	if success {
-		updates["last_success_at"] = time.Now()
+		updates["last_success_at"] = gorm.Expr(
+			"CASE WHEN last_success_at IS NULL OR "+
+				"last_success_at < ? THEN ? "+
+				"ELSE last_success_at END",
+			attemptedAt,
+			attemptedAt,
+		)
 		updates["total_success"] = gorm.Expr("total_success + 1")
-		updates["last_error"] = "" // 清除错误信息
 	} else {
-		updates["last_error_at"] = time.Now()
+		updates["last_error_at"] = gorm.Expr(
+			"CASE WHEN last_error_at IS NULL OR "+
+				"last_error_at < ? THEN ? "+
+				"ELSE last_error_at END",
+			attemptedAt,
+			attemptedAt,
+		)
 		updates["total_failed"] = gorm.Expr("total_failed + 1")
-		if err != nil {
-			updates["last_error"] = err.Error()
-		}
 	}
 
 	_, _ = withNotificationProjectOperation(
@@ -1248,7 +1772,7 @@ func (ns *NotificationService) saveLog(
 		return
 	}
 	finalizeContext, cancelFinalize := context.WithTimeout(
-		context.WithoutCancel(ctx),
+		ctx,
 		5*time.Second,
 	)
 	defer cancelFinalize()
@@ -1359,11 +1883,14 @@ func (ns *NotificationService) TestWebhook(
 					queryErr := tx.WithContext(scopedContext).
 						Clauses(clause.Locking{Strength: "UPDATE"}).
 						Where(
-							"id = ? AND organization_id = ? AND project_id = ? AND status = ?",
+							"id = ? AND organization_id = ? AND project_id = ? AND status IN ?",
 							configID,
 							scope.OrganizationID,
 							scope.ProjectID,
-							models.WebhookStatusActive,
+							[]models.WebhookStatus{
+								models.WebhookStatusActive,
+								models.WebhookStatusInactive,
+							},
 						).
 						Take(&config).Error
 					if errors.Is(queryErr, gorm.ErrRecordNotFound) {
@@ -1380,15 +1907,19 @@ func (ns *NotificationService) TestWebhook(
 						)
 					}
 
-					now := time.Now().UTC()
+					now := ns.webhookTestEvents.now().UTC()
+					deadline := now.Add(
+						models.WebhookDeliveryCredentialLifetime,
+					)
 					operationID := newNativeID()
 					eventID := newNativeID()
 					configurationVersion :=
 						webhookTestConfigurationVersion(config)
 					snapshot, snapshotErr :=
-						models.NewWebhookDeliverySnapshot(
+						models.NewWebhookTestDeliverySnapshot(
 							config,
 							eventID,
+							deadline,
 						)
 					if snapshotErr != nil {
 						return fmt.Errorf(
@@ -1396,14 +1927,6 @@ func (ns *NotificationService) TestWebhook(
 							snapshotErr,
 						)
 					}
-					if createErr := tx.WithContext(scopedContext).
-						Create(snapshot).Error; createErr != nil {
-						return fmt.Errorf(
-							"create webhook test delivery snapshot: %w",
-							createErr,
-						)
-					}
-
 					maxAttempts := config.RetryCount + 1
 					if maxAttempts < 1 {
 						maxAttempts = 1
@@ -1412,7 +1935,7 @@ func (ns *NotificationService) TestWebhook(
 						maxAttempts = 11
 					}
 					event, appendErr :=
-						ns.webhookTestEvents.AppendDomainEventTx(
+						ns.webhookTestEvents.appendDomainEventTxAt(
 							scopedContext,
 							tx,
 							DomainEventInput{
@@ -1436,11 +1959,12 @@ func (ns *NotificationService) TestWebhook(
 								ConfigurationVersion: configurationVersion,
 							},
 							[]OutboxTarget{{
-								Type: "webhook",
-								ID: webhookSnapshotDestinationPrefix +
-									snapshot.ID,
-								MaxAttempts: maxAttempts,
+								Type:            "webhook",
+								ID:              webhookSnapshotDestinationPrefix + snapshot.ID,
+								MaxAttempts:     maxAttempts,
+								webhookSnapshot: snapshot,
 							}},
+							now,
 						)
 					if appendErr != nil {
 						return fmt.Errorf(
@@ -1452,7 +1976,11 @@ func (ns *NotificationService) TestWebhook(
 						len(event.Deliveries) != 1 ||
 						event.Deliveries[0].DestinationType != "webhook" ||
 						event.Deliveries[0].DestinationID !=
-							webhookSnapshotDestinationPrefix+snapshot.ID {
+							webhookSnapshotDestinationPrefix+snapshot.ID ||
+						event.Deliveries[0].ExpiresAt == nil ||
+						!event.Deliveries[0].ExpiresAt.Equal(
+							snapshot.CredentialExpiresAt,
+						) {
 						return errors.New(
 							"webhook test delivery intent did not create one snapshot Outbox delivery",
 						)
@@ -1594,10 +2122,21 @@ func (ns *NotificationService) CreateNotification(ctx context.Context, req *mode
 	if notification.Channel == "" {
 		notification.Channel = models.NotificationChannelInApp
 	}
+	if notification.Channel != models.NotificationChannelInApp &&
+		notification.Channel != models.NotificationChannelEmail {
+		return nil, ErrUnsupportedNotificationChannel
+	}
 
+	notificationMetadata := make(map[string]any, len(req.Metadata)+1)
+	for key, value := range req.Metadata {
+		notificationMetadata[key] = value
+	}
+	// preference_suppression is a service-owned audit reason. Callers cannot
+	// predeclare a suppression state while still requesting an enabled delivery.
+	delete(notificationMetadata, "preference_suppression")
 	// 处理metadata
-	if req.Metadata != nil {
-		metadataBytes, err := json.Marshal(req.Metadata)
+	if len(notificationMetadata) > 0 {
+		metadataBytes, err := json.Marshal(notificationMetadata)
 		if err != nil {
 			return nil, fmt.Errorf("通知元数据无效: %w", err)
 		}
@@ -1644,10 +2183,68 @@ func (ns *NotificationService) CreateNotification(ctx context.Context, req *mode
 				*notification.RelatedTicketID,
 			)
 		}
+		if notification.Channel == models.NotificationChannelInApp {
+			now := time.Now().UTC()
+			allowed, reason, err := inAppNotificationAllowedByPreference(
+				tx,
+				notification,
+				now,
+			)
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				notification.DeliveryStatus =
+					NotificationDeliveryStatusSuppressedByPreference
+				notification.IsRead = true
+				notification.ReadAt = &now
+				notification.ExpiresAt = &now
+				notificationMetadata["preference_suppression"] = reason
+				metadataBytes, err := json.Marshal(notificationMetadata)
+				if err != nil {
+					return fmt.Errorf("通知元数据无效: %w", err)
+				}
+				if len(metadataBytes) > 16*1024 {
+					return errors.New("通知元数据超过 16 KiB 限制")
+				}
+				notification.Metadata = string(metadataBytes)
+			}
+		}
+		if notification.Channel == models.NotificationChannelEmail {
+			now := time.Now().UTC()
+			allowed, err := emailNotificationAllowedByPreference(
+				tx,
+				notification,
+			)
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				notification.DeliveryStatus =
+					NotificationDeliveryStatusSuppressedByPreference
+				notification.IsRead = true
+				notification.ReadAt = &now
+				notification.ExpiresAt = &now
+				notificationMetadata["preference_suppression"] =
+					"email_disabled"
+				metadataBytes, err := json.Marshal(notificationMetadata)
+				if err != nil {
+					return fmt.Errorf("通知元数据无效: %w", err)
+				}
+				if len(metadataBytes) > 16*1024 {
+					return errors.New("通知元数据超过 16 KiB 限制")
+				}
+				notification.Metadata = string(metadataBytes)
+			}
+		}
 		if err := tx.Create(notification).Error; err != nil {
 			return err
 		}
 		if notification.Channel != models.NotificationChannelEmail {
+			return nil
+		}
+		if notification.DeliveryStatus ==
+			NotificationDeliveryStatusSuppressedByPreference {
 			return nil
 		}
 		availableAt := time.Time{}
@@ -1771,6 +2368,10 @@ func (ns *NotificationService) GetNotifications(ctx context.Context, filter *mod
 			"organization_id = ? AND project_id = ?",
 			scope.OrganizationID,
 			scope.ProjectID,
+		).
+		Where(
+			"(delivery_status IS NULL OR delivery_status <> ?)",
+			NotificationDeliveryStatusSuppressedByPreference,
 		)
 
 	// 应用过滤条件
@@ -1874,8 +2475,20 @@ func (ns *NotificationService) GetNotifications(ctx context.Context, filter *mod
 		dataQuery = dataQuery.Offset(filter.Offset)
 	}
 
-	// 预加载关联数据
-	dataQuery = dataQuery.Preload("Recipient").Preload("Sender").Preload("RelatedTicket")
+	// The Human list needs only a closed Ticket summary plus creator ownership
+	// for requester projection. GORM keeps this as one batched IN query.
+	dataQuery = dataQuery.
+		Preload("Recipient").
+		Preload("Sender").
+		Preload("RelatedTicket", func(query *gorm.DB) *gorm.DB {
+			return query.
+				Select("id", "ticket_number", "title", "created_by_id").
+				Where(
+					"organization_id = ? AND project_id = ?",
+					scope.OrganizationID,
+					scope.ProjectID,
+				)
+		})
 
 	var notifications []*models.Notification
 	if err := dataQuery.Find(&notifications).Error; err != nil {
@@ -2079,20 +2692,51 @@ func (ns *NotificationService) GetUnreadCount(ctx context.Context, userID uint) 
 }
 
 // GetNotificationPreferences 获取用户通知偏好设置
-func (ns *NotificationService) GetNotificationPreferences(ctx context.Context, userID uint) ([]*models.NotificationPreference, error) {
+func (ns *NotificationService) GetNotificationPreferences(
+	ctx context.Context,
+	userID uint,
+) ([]*models.NotificationPreferenceView, error) {
 	if ns == nil || ns.db == nil || userID == 0 {
 		return nil, ErrInvalidNotificationPreferences
 	}
-	var preferences []*models.NotificationPreference
 	allowed := models.NotificationTypes()
+	var persisted []models.NotificationPreference
 	if err := ns.db.WithContext(ctx).
 		Where("user_id = ? AND notification_type IN ?", userID, allowed).
 		Order("notification_type ASC").
 		Limit(len(allowed)).
-		Find(&preferences).Error; err != nil {
+		Find(&persisted).Error; err != nil {
 		return nil, fmt.Errorf("获取通知偏好设置失败: %w", err)
 	}
-	return preferences, nil
+	byType := make(
+		map[models.NotificationType]models.NotificationPreference,
+		len(persisted),
+	)
+	for _, preference := range persisted {
+		byType[preference.NotificationType] = preference
+	}
+	result := make([]*models.NotificationPreferenceView, 0, len(allowed))
+	for _, notificationType := range allowed {
+		preference, exists := byType[notificationType]
+		if !exists {
+			preference = defaultNotificationPreference(
+				userID,
+				notificationType,
+			)
+		}
+		result = append(result, &models.NotificationPreferenceView{
+			NotificationType:  notificationType,
+			EmailEnabled:      preference.EmailEnabled,
+			InAppEnabled:      preference.InAppEnabled,
+			WebhookEnabled:    false,
+			DoNotDisturbStart: preference.DoNotDisturbStart,
+			DoNotDisturbEnd:   preference.DoNotDisturbEnd,
+			MaxDailyCount:     preference.MaxDailyCount,
+			BatchDelivery:     false,
+			BatchInterval:     60,
+		})
+	}
+	return result, nil
 }
 
 // UpdateNotificationPreferences 更新用户通知偏好设置
@@ -2103,7 +2747,18 @@ func (ns *NotificationService) UpdateNotificationPreferences(ctx context.Context
 	}
 	seen := make(map[models.NotificationType]struct{}, len(preferences))
 	for _, preference := range preferences {
-		if !preference.NotificationType.IsValid() {
+		if !preference.NotificationType.IsValid() ||
+			preference.MaxDailyCount < 0 ||
+			preference.MaxDailyCount > 10_000 ||
+			preference.BatchInterval != 60 ||
+			preference.WebhookEnabled ||
+			preference.BatchDelivery ||
+			(preference.DoNotDisturbStart == nil) !=
+				(preference.DoNotDisturbEnd == nil) {
+			return ErrInvalidNotificationPreferences
+		}
+		if preference.DoNotDisturbStart != nil &&
+			!preference.DoNotDisturbEnd.After(*preference.DoNotDisturbStart) {
 			return ErrInvalidNotificationPreferences
 		}
 		if _, duplicate := seen[preference.NotificationType]; duplicate {
@@ -2112,6 +2767,9 @@ func (ns *NotificationService) UpdateNotificationPreferences(ctx context.Context
 		seen[preference.NotificationType] = struct{}{}
 	}
 	return ns.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockNotificationPreferenceUser(tx, userID); err != nil {
+			return err
+		}
 		// 删除现有设置
 		if err := tx.Where("user_id = ?", userID).Delete(&models.NotificationPreference{}).Error; err != nil {
 			return err
@@ -2309,35 +2967,306 @@ func (ns *NotificationService) DeliverTicketNotificationOutbox(
 		return nil, false, errors.New("notification source event key is too long")
 	}
 	notification.SourceEventKey = &sourceEventKey
-	metadataBytes, err := json.Marshal(metadata)
+	return ns.persistTicketNotificationWithPreference(
+		ctx,
+		notification,
+		metadata,
+	)
+}
+
+func (ns *NotificationService) persistTicketNotificationWithPreference(
+	ctx context.Context,
+	notification *models.Notification,
+	metadata map[string]any,
+) (*models.Notification, bool, error) {
+	if notification == nil ||
+		notification.SourceEventKey == nil ||
+		strings.TrimSpace(*notification.SourceEventKey) == "" {
+		return nil, false, errors.New("notification source event key is required")
+	}
+
+	var (
+		persisted *models.Notification
+		created   bool
+	)
+	err := transactionForContext(ctx, ns.db, func(tx *gorm.DB) error {
+		sourceEventKey := *notification.SourceEventKey
+		var existing models.Notification
+		existingErr := tx.
+			Where("source_event_key = ?", sourceEventKey).
+			First(&existing).Error
+		switch {
+		case existingErr == nil:
+			if err := validateIdempotentTicketNotification(
+				&existing,
+				notification,
+			); err != nil {
+				return err
+			}
+			persisted = &existing
+			return nil
+		case !errors.Is(existingErr, gorm.ErrRecordNotFound):
+			return fmt.Errorf(
+				"load idempotent Outbox notification: %w",
+				existingErr,
+			)
+		}
+
+		now := time.Now().UTC()
+		allowed, reason, err := inAppNotificationAllowedByPreference(
+			tx,
+			notification,
+			now,
+		)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			notification.DeliveryStatus =
+				NotificationDeliveryStatusSuppressedByPreference
+			notification.IsRead = true
+			notification.ReadAt = &now
+			notification.ExpiresAt = &now
+			metadata["preference_suppression"] = reason
+		}
+		metadataBytes, err := json.Marshal(metadata)
+		if err != nil {
+			return fmt.Errorf("encode notification metadata: %w", err)
+		}
+		notification.Metadata = string(metadataBytes)
+
+		result := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "source_event_key"}},
+			DoNothing: true,
+		}).Create(notification)
+		if result.Error != nil {
+			return fmt.Errorf(
+				"persist Outbox notification: %w",
+				result.Error,
+			)
+		}
+		if result.RowsAffected == 1 {
+			persisted = notification
+			created = allowed
+			return nil
+		}
+		if err := tx.
+			Where("source_event_key = ?", sourceEventKey).
+			First(&existing).Error; err != nil {
+			return fmt.Errorf(
+				"load concurrent idempotent Outbox notification: %w",
+				err,
+			)
+		}
+		if err := validateIdempotentTicketNotification(
+			&existing,
+			notification,
+		); err != nil {
+			return err
+		}
+		persisted = &existing
+		return nil
+	})
 	if err != nil {
-		return nil, false, fmt.Errorf("encode notification metadata: %w", err)
+		return nil, false, err
 	}
-	notification.Metadata = string(metadataBytes)
+	return persisted, created, nil
+}
 
-	result := ns.db.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "source_event_key"}},
-		DoNothing: true,
-	}).Create(notification)
-	if result.Error != nil {
-		return nil, false, fmt.Errorf("persist Outbox notification: %w", result.Error)
+func validateIdempotentTicketNotification(
+	existing *models.Notification,
+	candidate *models.Notification,
+) error {
+	if existing == nil ||
+		candidate == nil ||
+		existing.Type != candidate.Type ||
+		existing.RecipientID != candidate.RecipientID ||
+		!sameOptionalTicketReference(
+			existing.RelatedTicketID,
+			candidate.RelatedTicketID,
+		) {
+		return errors.New("notification source event key collision")
 	}
-	if result.RowsAffected == 1 {
-		return notification, true, nil
-	}
+	return nil
+}
 
-	var existing models.Notification
-	if err := ns.db.WithContext(ctx).
-		Where("source_event_key = ?", sourceEventKey).
-		First(&existing).Error; err != nil {
-		return nil, false, fmt.Errorf("load idempotent Outbox notification: %w", err)
+func inAppNotificationAllowedByPreference(
+	tx *gorm.DB,
+	notification *models.Notification,
+	now time.Time,
+) (bool, string, error) {
+	if tx == nil ||
+		notification == nil ||
+		notification.RecipientID == 0 ||
+		!notification.Type.IsValid() ||
+		notification.Channel != models.NotificationChannelInApp ||
+		now.IsZero() {
+		return false, "", errors.New("notification preference decision is invalid")
 	}
-	if existing.Type != notification.Type ||
-		existing.RecipientID != notification.RecipientID ||
-		!sameOptionalTicketReference(existing.RelatedTicketID, notification.RelatedTicketID) {
-		return nil, false, errors.New("notification source event key collision")
+	preference, err := notificationPreferenceForUpdate(
+		tx,
+		notification.RecipientID,
+		notification.Type,
+	)
+	if err != nil {
+		return false, "", fmt.Errorf(
+			"load notification preference: %w",
+			err,
+		)
 	}
-	return &existing, false, nil
+	if preference.MaxDailyCount < 0 ||
+		preference.MaxDailyCount > 10_000 ||
+		preference.BatchInterval < 1 ||
+		preference.BatchInterval > 1_440 ||
+		(preference.DoNotDisturbStart == nil) !=
+			(preference.DoNotDisturbEnd == nil) {
+		return false, "invalid_preference", nil
+	}
+	if !preference.InAppEnabled {
+		return false, "in_app_disabled", nil
+	}
+	if preference.DoNotDisturbStart != nil {
+		if !preference.DoNotDisturbEnd.After(
+			*preference.DoNotDisturbStart,
+		) {
+			return false, "invalid_preference", nil
+		}
+		if !now.Before(*preference.DoNotDisturbStart) &&
+			now.Before(*preference.DoNotDisturbEnd) {
+			return false, "do_not_disturb", nil
+		}
+	}
+	if preference.MaxDailyCount == 0 {
+		return true, "", nil
+	}
+	dayStart := time.Date(
+		now.Year(),
+		now.Month(),
+		now.Day(),
+		0,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	nextDay := dayStart.AddDate(0, 0, 1)
+	var deliveredToday int64
+	if err := tx.Model(&models.Notification{}).
+		Where(
+			"organization_id = ? AND project_id = ? AND recipient_id = ? AND type = ? AND channel = ? AND created_at >= ? AND created_at < ?",
+			notification.OrganizationID,
+			notification.ProjectID,
+			notification.RecipientID,
+			notification.Type,
+			models.NotificationChannelInApp,
+			dayStart,
+			nextDay,
+		).
+		Where(
+			"(delivery_status IS NULL OR delivery_status <> ?)",
+			NotificationDeliveryStatusSuppressedByPreference,
+		).
+		Count(&deliveredToday).Error; err != nil {
+		return false, "", fmt.Errorf(
+			"count daily notifications: %w",
+			err,
+		)
+	}
+	if deliveredToday >= int64(preference.MaxDailyCount) {
+		return false, "daily_limit", nil
+	}
+	return true, "", nil
+}
+
+func emailNotificationAllowedByPreference(
+	tx *gorm.DB,
+	notification *models.Notification,
+) (bool, error) {
+	if tx == nil ||
+		notification == nil ||
+		notification.RecipientID == 0 ||
+		!notification.Type.IsValid() ||
+		notification.Channel != models.NotificationChannelEmail {
+		return false, errors.New("notification email preference decision is invalid")
+	}
+	preference, err := notificationPreferenceForUpdate(
+		tx,
+		notification.RecipientID,
+		notification.Type,
+	)
+	if err != nil {
+		return false, fmt.Errorf("load notification preference: %w", err)
+	}
+	return preference.EmailEnabled, nil
+}
+
+func notificationPreferenceForUpdate(
+	tx *gorm.DB,
+	userID uint,
+	notificationType models.NotificationType,
+) (models.NotificationPreference, error) {
+	if tx == nil || userID == 0 || !notificationType.IsValid() {
+		return models.NotificationPreference{},
+			errors.New("notification preference decision is invalid")
+	}
+	if err := lockNotificationPreferenceUser(tx, userID); err != nil {
+		return models.NotificationPreference{}, err
+	}
+	var preference models.NotificationPreference
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"user_id = ? AND notification_type = ?",
+			userID,
+			notificationType,
+		).
+		First(&preference).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return defaultNotificationPreference(userID, notificationType), nil
+	}
+	if err != nil {
+		return models.NotificationPreference{}, err
+	}
+	return preference, nil
+}
+
+func defaultNotificationPreference(
+	userID uint,
+	notificationType models.NotificationType,
+) models.NotificationPreference {
+	return models.NotificationPreference{
+		UserID:           userID,
+		NotificationType: notificationType,
+		EmailEnabled:     true,
+		InAppEnabled:     true,
+		WebhookEnabled:   false,
+		MaxDailyCount:    50,
+		BatchDelivery:    false,
+		BatchInterval:    60,
+	}
+}
+
+func notificationPreferenceUserLockQuery(
+	tx *gorm.DB,
+	userID uint,
+) *gorm.DB {
+	return tx.Model(&models.User{}).
+		Select("id").
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ?", userID)
+}
+
+func lockNotificationPreferenceUser(tx *gorm.DB, userID uint) error {
+	if tx == nil || userID == 0 {
+		return ErrInvalidNotificationPreferences
+	}
+	var user struct {
+		ID uint
+	}
+	if err := notificationPreferenceUserLockQuery(tx, userID).
+		Take(&user).Error; err != nil {
+		return fmt.Errorf("lock notification preference owner: %w", err)
+	}
+	return nil
 }
 
 func sameOptionalTicketReference(left, right *uint) bool {

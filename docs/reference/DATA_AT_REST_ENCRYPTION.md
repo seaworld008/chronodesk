@@ -4,7 +4,8 @@ ChronoDesk 对以下长期凭据使用版本化 AES-256-GCM 信封加密：
 
 - A2A Push Notification 的 token 与 authentication；
 - SMTP 密码；
-- Webhook 签名 secret 与 access token；
+- Webhook Config 以及未粉碎、未过期 delivery snapshot 的签名 secret、
+  previous secret 与 access token；
 - 人类账号的 TOTP seed。
 
 密文使用 `cdsec:v1:<key-id>:<payload>` 格式。随机 nonce 防止相同明文产生相同密文，AAD 将密文绑定到表、记录 ID 和字段，复制到其他记录或字段后将无法解密。
@@ -47,6 +48,17 @@ go run ./cmd/credential-maintain -validate-only
 明文、不支持的密码哈希、密文篡改、错误 AAD、缺失 key ID 或错误密钥时立即
 失败。部署前必须从可信备份恢复当前格式，或撤销并重新签发相关凭据。
 
+Webhook delivery snapshot 的 live 定义为
+`credential_shredded_at IS NULL AND credential_expires_at > maintenanceNow`。
+未粉碎但缺失有效 deadline 的行会 fail closed；已经过期或已经粉碎的行不会被
+解密或 rewrap。snapshot 中复制的 envelope 继续使用原 Config ID 的历史 AAD：
+`webhook_configs/<config-id>/<field>`，不能改成 snapshot UUID。
+
+runtime 验证按可信 Project inventory 在短 RLS transaction 内逐项目执行；
+maintenance rotation 使用一个顶层 transaction，按稳定 Project、Webhook Config、
+live snapshot、A2A Push、global email 顺序加锁。任一坏 envelope 或 CAS 冲突会使
+整次 rotation 回滚，并返回零成功报告。
+
 不支持的密码哈希不可安全反推，可由管理员显式执行：
 
 ```bash
@@ -62,8 +74,10 @@ go run ./cmd/credential-maintain -quarantine
 2. 将新的 key ID 设为 primary，旧 key 暂时保留；
 3. 执行 `go run ./cmd/credential-maintain -rotate`，将已认证的当前格式密文
    重新封装为新 key；
-4. 执行 `go run ./cmd/credential-maintain -validate-only` 并重启所有实例；
-5. 确认所有实例均已加载新配置后再移除旧 key。
+4. 使用 old+new keyring 执行
+   `go run ./cmd/credential-maintain -validate-only`；
+5. 使用只包含新 key 的隔离维护配置再次执行 `-validate-only`；
+6. 确认所有实例均已加载 new-only 配置后再移除旧 key。
 
 轮换事务遇到明文或畸形信封会完整回滚。维护日志只包含轮换和验证数量，不输出
 任何凭据或密文。

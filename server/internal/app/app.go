@@ -42,6 +42,54 @@ func ginAdapter(handler func(auth.HTTPContext)) gin.HandlerFunc {
 	}
 }
 
+const backupCodeRegenerationRateLimitNamespace = "backup-code-regeneration"
+
+func backupCodeRegenerationRateLimitKey(rawKey string) string {
+	if strings.TrimSpace(rawKey) == "" {
+		return ""
+	}
+	return backupCodeRegenerationRateLimitNamespace + "|" + rawKey
+}
+
+func backupCodeRegenerationUserRouteKey(
+	context middleware.HTTPContext,
+) string {
+	userID, exists := context.Get("user_id")
+	typedUserID, valid := userID.(uint)
+	if !exists || !valid || typedUserID == 0 {
+		return ""
+	}
+	return backupCodeRegenerationRateLimitKey(
+		middleware.AuthenticatedUserRouteKeyFunc(context),
+	)
+}
+
+func newBackupCodeRegenerationRateLimit(
+	client middleware.RedisRateLimitScriptExecutor,
+	keyPepper []byte,
+	rateLimitConfig config.RateLimitConfig,
+) (gin.HandlerFunc, error) {
+	limiter, err := middleware.NewRedisSlidingWindow(
+		client,
+		keyPepper,
+		rateLimitConfig.BackupCodeRequests,
+		rateLimitConfig.BackupCodeWindow,
+		2*time.Second,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return middleware.WrapGinMiddleware(middleware.RateLimit(
+		&middleware.RateLimitConfig{
+			Limiter: limiter,
+			KeyFunc: func(context middleware.HTTPContext) string {
+				return backupCodeRegenerationUserRouteKey(context)
+			},
+			Headers: true,
+		},
+	)), nil
+}
+
 func registerPlatformProjectRoutes(
 	routes *gin.RouterGroup,
 	handler *handlers.ProjectHandler,
@@ -210,6 +258,19 @@ func Run() error {
 	if err := database.ValidateRuntimeSchema(db.DB); err != nil {
 		log.Fatal("Database schema validation failed: ", err)
 	}
+	webhookCredentialValidationContext, cancelWebhookCredentialValidation :=
+		context.WithTimeout(context.Background(), 30*time.Second)
+	if err := database.ValidateWebhookSnapshotCredentialLifetimeRuntimeData(
+		webhookCredentialValidationContext,
+		db.DB,
+	); err != nil {
+		cancelWebhookCredentialValidation()
+		log.Fatal(
+			"Webhook delivery credential data validation failed: ",
+			err,
+		)
+	}
+	cancelWebhookCredentialValidation()
 	secretProtector, err := security.LoadDeploymentKeyring(
 		[]byte(cfg.Agent.CredentialPepper),
 	)
@@ -521,9 +582,13 @@ func Run() error {
 
 	agentBackground, stopAgentBackground := context.WithCancel(appContext)
 	var agentWorkers sync.WaitGroup
+	var closeWebhookAttemptAudits func()
 	defer func() {
 		stopAgentBackground()
 		agentWorkers.Wait()
+		if closeWebhookAttemptAudits != nil {
+			closeWebhookAttemptAudits()
+		}
 	}()
 	agentWorkers.Add(1)
 	go func() {
@@ -750,6 +815,14 @@ func Run() error {
 		KeyFunc: middleware.AuthenticatedUserRouteKeyFunc,
 		Headers: true,
 	}))
+	backupCodeRegenerationRateLimit, err := newBackupCodeRegenerationRateLimit(
+		db.Redis,
+		[]byte(cfg.Agent.CredentialPepper),
+		cfg.RateLimit,
+	)
+	if err != nil {
+		log.Fatal("Failed to initialize backup-code regeneration Redis rate limiter: ", err)
+	}
 	a2aRateLimitError := func(ctx middleware.HTTPContext) {
 		ginContext, ok := ctx.(*middleware.GinHTTPContext)
 		if !ok {
@@ -912,7 +985,11 @@ func Run() error {
 				authenticated.POST("/enable-otp", ginAdapter(authModule.Handler.EnableOTP))
 				authenticated.POST("/disable-otp", ginAdapter(authModule.Handler.DisableOTP))
 				authenticated.POST("/verify-otp", ginAdapter(authModule.Handler.VerifyOTP))
-				authenticated.POST("/otp/backup-codes", ginAdapter(authModule.Handler.GenerateBackupCodes))
+				authenticated.POST(
+					"/otp/backup-codes",
+					backupCodeRegenerationRateLimit,
+					ginAdapter(authModule.Handler.GenerateBackupCodes),
+				)
 			}
 		}
 
@@ -1059,9 +1136,13 @@ func Run() error {
 			tickets.DELETE("/:id", ticketHandler.DeleteTicket)              // 删除工单
 
 			// 工作流相关路由
-			tickets.POST("/:id/assign", workflowHandler.AssignTicket)       // 分配工单
-			tickets.POST("/:id/transfer", workflowHandler.TransferTicket)   // 转移工单
-			tickets.POST("/:id/escalate", workflowHandler.EscalateTicket)   // 升级工单
+			tickets.POST("/:id/assign", workflowHandler.AssignTicket)     // 分配工单
+			tickets.POST("/:id/transfer", workflowHandler.TransferTicket) // 转移工单
+			tickets.POST("/:id/escalate", workflowHandler.EscalateTicket) // 升级工单
+			tickets.GET(
+				"/:id/transitions",
+				workflowHandler.GetAllowedTicketTransitions,
+			) // 获取绑定工作流允许的状态边
 			tickets.POST("/:id/status", workflowHandler.UpdateTicketStatus) // 更新状态
 			tickets.GET("/:id/history", workflowHandler.GetTicketHistory)   // 获取工单历史
 			contentHandler.RegisterRoutes(tickets)                          // 评论与附件
@@ -1221,6 +1302,8 @@ func Run() error {
 			db.DB,
 			secretProtector,
 		)
+		closeWebhookAttemptAudits =
+			notificationService.CloseWebhookAttemptAuditsAndWait
 		notificationService.ConfigureWebhookTestCommands(
 			projectService,
 			nativeService,
@@ -1536,24 +1619,114 @@ func runAgentOutboxWorker(
 	native *services.AgentNativeService,
 	deliverer services.OutboxDeliverer,
 ) {
+	runAgentOutboxWorkerLoops(
+		ctx,
+		native,
+		deliverer,
+		time.Second,
+		time.Second,
+	)
+}
+
+type agentOutboxLifecycleRuntime interface {
+	ExpireWebhookDeliveriesBatch(
+		context.Context,
+		int,
+	) (services.WebhookOutboxCleanupResult, error)
+	ProcessOutboxBatch(
+		context.Context,
+		string,
+		int,
+		services.OutboxDeliverer,
+	) (services.OutboxBatchResult, error)
+}
+
+func runAgentOutboxWorkerLoops(
+	ctx context.Context,
+	native agentOutboxLifecycleRuntime,
+	deliverer services.OutboxDeliverer,
+	deliveryInterval time.Duration,
+	cleanupInterval time.Duration,
+) {
+	if native == nil || deliverer == nil {
+		return
+	}
+	if deliveryInterval <= 0 {
+		deliveryInterval = time.Second
+	}
+	if cleanupInterval <= 0 {
+		cleanupInterval = time.Second
+	}
 	hostname, _ := os.Hostname()
 	workerID := fmt.Sprintf("%s-%d", hostname, os.Getpid())
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		result, err := native.ProcessOutboxBatch(ctx, workerID, 50, deliverer)
-		if err != nil && ctx.Err() == nil {
-			log.Printf("Agent Outbox batch failed: %v", err)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		ticker := time.NewTicker(deliveryInterval)
+		defer ticker.Stop()
+		for {
+			result, err := native.ProcessOutboxBatch(
+				ctx,
+				workerID,
+				50,
+				deliverer,
+			)
+			if err != nil && ctx.Err() == nil {
+				log.Printf("Agent Outbox batch failed: %v", err)
+			}
+			if result.Dead > 0 {
+				log.Printf(
+					"Agent Outbox moved %d deliveries to dead state",
+					result.Dead,
+				)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 		}
-		if result.Dead > 0 {
-			log.Printf("Agent Outbox moved %d deliveries to dead state", result.Dead)
+	}()
+	go func() {
+		defer workers.Done()
+		ticker := time.NewTicker(cleanupInterval)
+		defer ticker.Stop()
+		for {
+			result, err := native.ExpireWebhookDeliveriesBatch(ctx, 50)
+			if result.Attempted > 0 {
+				log.Print(agentOutboxCleanupMetricText(result))
+			}
+			if err != nil && ctx.Err() == nil {
+				// Candidate errors may involve malformed historical rows. Keep
+				// the operator signal fixed and secret-free.
+				log.Print(
+					"Agent Outbox lifecycle cleanup iteration failed",
+				)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
+	}()
+	workers.Wait()
+}
+
+func agentOutboxCleanupMetricText(
+	result services.WebhookOutboxCleanupResult,
+) string {
+	return fmt.Sprintf(
+		"Agent Outbox lifecycle cleanup: attempted=%d expired=%d "+
+			"malformed=%d overlap_cleared=%d "+
+			"legacy_succeeded_shredded=%d",
+		result.Attempted,
+		result.Expired,
+		result.Malformed,
+		result.OverlapCleared,
+		result.LegacySucceededShredded,
+	)
 }
 
 func runKnowledgeObjectCleanupWorker(

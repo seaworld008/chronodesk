@@ -1,6 +1,6 @@
 # ChronoDesk AI 原生多项目状态
 
-> 更新时间：2026-07-31
+> 更新时间：2026-08-10
 > 状态口径：本页描述当前仓库实现和必须继续验证的边界；不依赖特定开发分支，也不预写未经当次发布门禁证明的远端结论。
 
 ## 已接受的运行模型
@@ -48,11 +48,83 @@ OpenAPI `3.2.0` 和 CloudEvents `1.0`。不保留旧版兼容分支。
 | Human Web | `/human-openapi.json`、类型化 P1 操作与工作台边界 | 未列入 P1 的遗留路由不可据此宣称稳定公共契约 |
 | Agent 与协议 | Agent REST、MCP、A2A 的共享领域入口和版本门禁 | Proposal 执行 Adapter、关系 API 对外契约、SDK 同步与主动 A2A 委派 |
 | 集成 | Connection、Mapping、Inbox、Receipt、ExternalLink、Outbox 基础模型 | 邮件双向同步、CSV、Kafka/AMQP、内网 Relay 与额外语言 SDK 的生产化 |
+| Webhook / Outbox | 七天绝对凭据期限、终态粉碎、过期 cleanup、双 HTTP gate、有限 replay、安全管理投影、live snapshot DEK validate/rewrap | 紧急撤销命令与 UI、运维 ADR/runbook、备份/PITR 演练 |
 | 知识与检索 | 项目知识版本、ACL、摄取状态、OpenSearch 混合检索、引用反馈与模型策略 | 生产对象存储、扫描/解析/摄取 Worker、模型网关运行基线与完整 Copilot 闭环 |
 | AI 协作 | Run、Proposal、Approval、Handoff、Lease 与审计模型 | 内置 Copilot、完整执行工作台、对象存储/扫描/解析 Worker 的生产闭环 |
 | 运行可靠性 | RLS、审计哈希链、凭据维护、迁移 checkpoint | WORM、保留归档、备份恢复自动化、容量基准与故障演练 |
 
 “已有基础”仅表示存在实现与相应契约/测试位置，不能代替本次提交的实际测试、真实依赖健康检查或远端 CI 结果。
+
+## 2026-08-10 代码存档检查点与继续开发顺序
+
+本检查点按代码存档合并，不作为生产发布证明。最终整分支发布门禁、远端 CI
+等待、真实依赖健康检查和合并后回归由需求方明确延后；恢复开发时必须先验证
+当前 `origin/main`，不能把历史开发过程中的局部 GREEN 当作当前环境结论。
+
+### 本检查点包含
+
+- DOMPurify 安全版本、项目角色变化后的 workflow transition 刷新、空 due date
+  no-op、注册会话消费、通知 email preference、OTP backup code step-up、
+  observer attachment 404 等价、同 session refresh 跨 tab 同步，以及通知内嵌
+  Ticket 的角色投影。
+- Webhook snapshot 与 Outbox 共享不可延长的七天绝对 deadline；成功、过期和
+  cleanup 路径单调清空 credential envelopes，并保留审计 metadata。
+- claim、HTTP client 创建、`Do` 前第二 gate、finalize、cleanup 和 replay
+  均复核 scope、event、snapshot、deadline 与 claim generation。
+- `expired` 投递的 Agent/Human 安全投影、稳定
+  `outbox_replay_expired` 409、两处管理 UI 的中文终态与 replay 隐藏。
+- database-secret startup/maintenance 对每个 live snapshot 的三类 envelope
+  执行 Project-scoped 验证和 rewrap；历史 AAD 继续绑定原 Webhook Config ID。
+
+### 明确未完成
+
+1. **Webhook emergency revoke**
+   - 仍缺 exact `project_admin` 的 preflight `resource_version` 读取、强制
+     `If-Match`/Idempotency-Key 的 revoke 命令、配置禁用、未终态 snapshot
+     粉碎、pending/failed/dead 过期、in-flight 计数、secret-free event/audit、
+     Webhook Settings UI 和 PostgreSQL race。
+   - 普通 Webhook edit/disable/delete 仍保留 deadline 前已经提交的 immutable
+     delivery；它们不是 emergency revoke。
+2. **注册后端原子性**
+   - 前端已消费 verification-disabled 的完整 session，但后端仍应把
+     User、Profile、refresh digest、LoginHistory、successful LoginAttempt、
+     DomainEvent 与 welcome Outbox 收敛到一个
+     `AtomicRegistrationRepository` transaction。
+3. **Workflow 重复 lifecycle category 兼容**
+   - 后续应允许不同 state key 投影到相同 canonical category，同时继续拒绝
+     duplicate state/transition key、未知端点、非法/重复 role；运行时权限语义是
+     同一 canonical `(from, to)` 的 edge union。
+4. **运维文档与演练**
+   - 仍需 ADR-0009、Webhook credential runbook、迁移发布/回滚、backup/WAL/PITR
+     边界和真实恢复演练；应用层 shred 不等于物理介质即时擦除。
+
+### 恢复开发的强制起点
+
+1. 从最新 `origin/main` 创建新的 `codex/` 分支或隔离 worktree，先阅读
+   [`CONTEXT.md`](../../CONTEXT.md)、[`ARCHITECTURE.md`](../../ARCHITECTURE.md)
+   和仓库 `AGENTS.md`。
+2. 在修改代码前先建立基线：
+
+   ```bash
+   make doctor
+   make verify
+   make test-race
+   make credential-validate
+   make smoke
+   make e2e
+   ```
+
+   同时运行 loopback-only PostgreSQL lifecycle/DEK integration tests、
+   Human API generation check、Web typecheck/lint/build；任何未配置或未执行的
+   外部依赖门禁必须如实记录为未验证。
+3. 优先完成 emergency revoke，再完成注册原子性和 workflow 兼容。每一项先写
+   mutation-sensitive RED，使用现有共享 domain interface，分别做独立 code
+   review 后再进入下一项。
+4. Webhook 测试只允许 injectable client、mock route 或 loopback server；不得
+   在开发/CI 中联系真实第三方 endpoint，也不得在命令、日志或报告中输出
+   DSN、DEK、credential envelope 或 Webhook URL。
+5. 最终交付必须重新执行完整本地门禁、最新远端 CI、review thread closure、
+   clean merged-main 回归；本存档检查点不能替代这些证据。
 
 ## 验证与维护入口
 

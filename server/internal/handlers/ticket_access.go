@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -55,6 +56,10 @@ func isProjectAgentRole(role string) bool {
 
 func isProjectObserverRole(role string) bool {
 	return role == string(models.ProjectRoleObserver)
+}
+
+func isPublicTicketContentOnlyRole(role string) bool {
+	return isRequesterRole(role) || isProjectObserverRole(role)
 }
 
 func authorizeTicket(
@@ -187,13 +192,50 @@ func setTicketETag(c *gin.Context, version uint64) {
 	c.Header("ETag", httpcontract.FormatETag(version))
 }
 
-// ticketResponseForRole prevents customer-facing collection and detail endpoints from disclosing
-// another user's contact, authentication, role, or login metadata.
-func ticketResponseForRole(ticket *models.Ticket, role string) *models.TicketResponse {
+var observerTicketForbiddenFields = [...]string{
+	"customer_email",
+	"customer_phone",
+	"customer_name",
+	"created_by_id",
+	"created_by",
+	"created_by_actor",
+	"assigned_to_id",
+	"assigned_to",
+	"assigned_to_actor",
+	"agent_context",
+}
+
+// observerTicketResponse keeps the Human observer projection at the HTTP
+// boundary. TicketResponse remains the unchanged shared machine-contract DTO.
+type observerTicketResponse struct {
+	response *models.TicketResponse
+}
+
+func (response observerTicketResponse) MarshalJSON() ([]byte, error) {
+	raw, err := json.Marshal(response.response)
+	if err != nil {
+		return nil, err
+	}
+	fields := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	for _, field := range observerTicketForbiddenFields {
+		delete(fields, field)
+	}
+	return json.Marshal(fields)
+}
+
+// ticketResponseForRole prevents Human collection and detail endpoints from
+// disclosing identity and private collaboration fields to public observers.
+func ticketResponseForRole(ticket *models.Ticket, role string) any {
 	if ticket == nil {
 		return nil
 	}
 	response := ticket.ToResponse()
+	if isProjectObserverRole(role) {
+		return observerTicketResponse{response: response}
+	}
 	if isRequesterRole(role) {
 		response.CreatedBy = nil
 		response.AssignedToID = nil
@@ -204,8 +246,8 @@ func ticketResponseForRole(ticket *models.Ticket, role string) *models.TicketRes
 	return response
 }
 
-func ticketListResponseForRole(tickets []*models.Ticket, role string) []*models.TicketResponse {
-	result := make([]*models.TicketResponse, 0, len(tickets))
+func ticketListResponseForRole(tickets []*models.Ticket, role string) []any {
+	result := make([]any, 0, len(tickets))
 	for _, ticket := range tickets {
 		if ticket != nil {
 			result = append(result, ticketResponseForRole(ticket, role))
@@ -241,10 +283,10 @@ type ticketHistoryResponse struct {
 	IsImportant     bool                           `json:"is_important"`
 }
 
-func ticketHistoryResponses(histories []*models.TicketHistory, customer bool) []*ticketHistoryResponse {
+func ticketHistoryResponses(histories []*models.TicketHistory, publicOnly bool) []*ticketHistoryResponse {
 	result := make([]*ticketHistoryResponse, 0, len(histories))
 	for _, history := range histories {
-		if history == nil || (customer && !customerCanSeeTicketHistory(history)) {
+		if history == nil || (publicOnly && !customerCanSeeTicketHistory(history)) {
 			continue
 		}
 		response := &ticketHistoryResponse{
@@ -266,7 +308,7 @@ func ticketHistoryResponses(histories []*models.TicketHistory, customer bool) []
 			IsAutomated:  history.IsAutomated,
 			IsImportant:  history.IsImportant,
 		}
-		if !customer {
+		if !publicOnly {
 			actor := history.Actor()
 			response.Actor = &actor
 			response.EventID = history.EventID

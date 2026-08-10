@@ -154,7 +154,8 @@ func (h *TicketContentHandler) ListComments(c *gin.Context) {
 	if !ok {
 		return
 	}
-	customer := isRequesterRole(normalizedProjectRole(c))
+	role := normalizedProjectRole(c)
+	publicOnly := isPublicTicketContentOnlyRole(role)
 	query := h.db.WithContext(c.Request.Context()).
 		Model(&models.TicketComment{}).
 		Where(
@@ -164,7 +165,7 @@ func (h *TicketContentHandler) ListComments(c *gin.Context) {
 			ticket.ProjectID,
 			false,
 		)
-	if customer {
+	if publicOnly {
 		query = query.Where("ticket_comments.type = ?", models.CommentTypePublic)
 	} else {
 		query = query.Preload("User").Preload("ServicePrincipal")
@@ -181,7 +182,7 @@ func (h *TicketContentHandler) ListComments(c *gin.Context) {
 		ticket.ProjectID,
 		false,
 	}
-	if customer {
+	if publicOnly {
 		replyVisibility = " AND replies.type = ?"
 		replyArguments = append(replyArguments, models.CommentTypePublic)
 	}
@@ -201,7 +202,7 @@ func (h *TicketContentHandler) ListComments(c *gin.Context) {
 		h.writeError(c, err)
 		return
 	}
-	if customer {
+	if publicOnly {
 		writePageEnvelope(c, customerCommentResponses(comments), total, page, pageSize)
 		return
 	}
@@ -226,7 +227,8 @@ func (h *TicketContentHandler) ListCommentReplies(c *gin.Context) {
 	if !ok {
 		return
 	}
-	customer := isRequesterRole(normalizedProjectRole(c))
+	role := normalizedProjectRole(c)
+	publicOnly := isPublicTicketContentOnlyRole(role)
 	parentQuery := h.db.WithContext(c.Request.Context()).
 		Model(&models.TicketComment{}).
 		Where(
@@ -237,7 +239,7 @@ func (h *TicketContentHandler) ListCommentReplies(c *gin.Context) {
 			ticket.ProjectID,
 			false,
 		)
-	if customer {
+	if publicOnly {
 		parentQuery = parentQuery.Where("type = ?", models.CommentTypePublic)
 	}
 	var parentCount int64
@@ -264,7 +266,7 @@ func (h *TicketContentHandler) ListCommentReplies(c *gin.Context) {
 			uint(commentID),
 			false,
 		)
-	if customer {
+	if publicOnly {
 		query = query.Where("type = ?", models.CommentTypePublic)
 	} else {
 		query = query.Preload("User").Preload("ServicePrincipal")
@@ -283,7 +285,7 @@ func (h *TicketContentHandler) ListCommentReplies(c *gin.Context) {
 		h.writeError(c, err)
 		return
 	}
-	if customer {
+	if publicOnly {
 		writePageEnvelope(c, customerCommentResponses(replies), total, page, pageSize)
 		return
 	}
@@ -483,7 +485,8 @@ func (h *TicketContentHandler) ListAttachments(c *gin.Context) {
 			ticket.OrganizationID,
 			ticket.ProjectID,
 		)
-	if isRequesterRole(normalizedProjectRole(c)) {
+	role := normalizedProjectRole(c)
+	if isPublicTicketContentOnlyRole(role) {
 		query = query.Where("is_public = ?", true)
 	}
 	var total int64
@@ -500,7 +503,7 @@ func (h *TicketContentHandler) ListAttachments(c *gin.Context) {
 		h.writeError(c, err)
 		return
 	}
-	if isRequesterRole(normalizedProjectRole(c)) {
+	if isPublicTicketContentOnlyRole(role) {
 		result := make([]*customerAttachmentResponse, 0, len(attachments))
 		for i := range attachments {
 			result = append(result, customerAttachmentFromModel(&attachments[i]))
@@ -607,6 +610,19 @@ func (h *TicketContentHandler) StoreAttachment(c *gin.Context) {
 			"success": false,
 			"code":    "invalid_request",
 			"message": "工单 ID 无效",
+		})
+		return
+	}
+	// The native attachment command performs the authoritative ticket-row
+	// authorization inside the project transaction before staging external
+	// bytes. Reject observers at the adapter boundary as well so the UI-facing
+	// contract remains an immediate, stable denial without a FORCE RLS
+	// pre-query outside that transaction.
+	if isProjectObserverRole(normalizedProjectRole(c)) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"success": false,
+			"code":    "ticket_access_denied",
+			"message": "无权访问或修改该工单",
 		})
 		return
 	}
@@ -739,7 +755,11 @@ func (h *TicketContentHandler) customerCanReferenceComment(c *gin.Context, ticke
 func (h *TicketContentHandler) DownloadAttachment(c *gin.Context) {
 	ticketID, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil || ticketID == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "code": "invalid_request", "message": "工单 ID 无效"})
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"code":    "invalid_request",
+			"message": "工单 ID 无效",
+		})
 		return
 	}
 	attachmentID, err := strconv.ParseUint(c.Param("attachment_id"), 10, 32)
@@ -803,7 +823,9 @@ func (h *TicketContentHandler) authorizedTicket(
 
 func (h *TicketContentHandler) writeError(c *gin.Context, err error) {
 	switch {
-	case errors.Is(err, gorm.ErrRecordNotFound), err.Error() == "ticket not found":
+	case errors.Is(err, gorm.ErrRecordNotFound),
+		errors.Is(err, services.ErrAttachmentUnavailable),
+		err.Error() == "ticket not found":
 		c.JSON(http.StatusNotFound, gin.H{"success": false, "code": "not_found", "message": "资源不存在"})
 	case errors.Is(err, services.ErrVersionConflict):
 		writeTicketVersionConflict(c)

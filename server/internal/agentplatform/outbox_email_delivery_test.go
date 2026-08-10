@@ -137,12 +137,14 @@ func newAuthEmailOutboxFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAgentplatformTestDB(t, db)
 	if err := db.AutoMigrate(
 		&models.User{},
 		&auth.PasswordReset{},
 		&auth.EmailVerification{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
+		&models.WebhookDeliverySnapshot{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +254,10 @@ func TestAuthenticationEmailOutboxRetriesAndRecoversIdempotently(t *testing.T) {
 				}
 				if err := fixture.db.Model(&models.OutboxDelivery{}).
 					Where("id = ?", fixture.deliveryID).
-					Update("next_attempt_at", time.Now().Add(-time.Minute)).
+					Update(
+						"next_attempt_at",
+						time.Now().UTC().Add(-time.Minute),
+					).
 					Error; err != nil {
 					t.Fatal(err)
 				}
@@ -308,7 +313,10 @@ func TestAuthenticationEmailOutboxRetriesAndRecoversIdempotently(t *testing.T) {
 				// after the side effect and its durable receipt.
 				if err := fixture.db.Model(&models.OutboxDelivery{}).
 					Where("id = ?", fixture.deliveryID).
-					Update("locked_at", time.Now().Add(-3*time.Minute)).
+					Update(
+						"locked_at",
+						time.Now().UTC().Add(-3*time.Minute),
+					).
 					Error; err != nil {
 					t.Fatal(err)
 				}
@@ -369,11 +377,14 @@ func TestNotificationEmailOutboxRetriesFailedAttemptAndSkipsReplay(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAgentplatformTestDB(t, db)
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.Notification{},
+		&models.NotificationPreference{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
+		&models.WebhookDeliverySnapshot{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -450,7 +461,10 @@ func TestNotificationEmailOutboxRetriesFailedAttemptAndSkipsReplay(t *testing.T)
 	}
 	if err := db.Model(&models.OutboxDelivery{}).
 		Where("destination_type = ?", services.EmailOutboxDestination).
-		Update("next_attempt_at", time.Now().Add(-time.Minute)).
+		Update(
+			"next_attempt_at",
+			time.Now().UTC().Add(-time.Minute),
+		).
 		Error; err != nil {
 		t.Fatal(err)
 	}

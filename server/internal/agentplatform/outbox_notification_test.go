@@ -29,8 +29,10 @@ func TestNotificationOutboxRecoversAfterSideEffectBeforeAcknowledgement(t *testi
 		&models.User{},
 		&models.Ticket{},
 		&models.Notification{},
+		&models.NotificationPreference{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
+		&models.WebhookDeliverySnapshot{},
 	); err != nil {
 		t.Fatalf("migrate notification Outbox schema: %v", err)
 	}

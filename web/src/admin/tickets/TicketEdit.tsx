@@ -45,15 +45,6 @@ import {
 import { transformTicketUpdate } from './ticketTransforms';
 import { EnterpriseReferenceAutocompleteInput } from '@/components/inputs/EnterpriseFilterInputs';
 
-// 状态选项
-const statusChoices = [
-    { id: 'open', name: '待处理' },
-    { id: 'in_progress', name: '处理中' },
-    { id: 'pending', name: '等待中' },
-    { id: 'resolved', name: '已解决' },
-    { id: 'closed', name: '已关闭' },
-];
-
 const priorityChoices = [
     { id: 'low', name: '低' },
     { id: 'normal', name: '普通' },
@@ -210,17 +201,6 @@ const TicketEdit: React.FC = () => {
                                         />
 
                                         <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
-                                            {!requester && (
-                                                <Box sx={{ flex: 1, minWidth: '200px' }}>
-                                                    <SelectInput
-                                                        source="status"
-                                                        label="状态"
-                                                        choices={statusChoices}
-                                                        required
-                                                    />
-                                                </Box>
-                                            )}
-
                                             <Box sx={{ flex: 1, minWidth: '200px' }}>
                                                 <SelectInput
                                                     source="priority"
@@ -248,6 +228,11 @@ const TicketEdit: React.FC = () => {
                                                 />
                                             </Box>
                                         </Box>
+                                        {!requester && (
+                                            <Alert severity="info">
+                                                工单状态只能在详情页通过绑定的已发布工作流变更。
+                                            </Alert>
+                                        )}
                                     </Box>
                                 </CardContent>
                             </Card>

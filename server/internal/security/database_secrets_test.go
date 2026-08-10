@@ -21,8 +21,11 @@ func TestDatabaseSecretRotationRejectsPlaintextAndRollsBack(t *testing.T) {
 	db := openSecretTestDB(t)
 	ctx := context.Background()
 	oldRing := testDatabaseKeyring(t, "dek-old", 0x51)
+	scope := defaultSecretTestScope(t, db)
 	webhook := models.WebhookConfig{
-		Name: "rotate-before-plaintext", Provider: models.WebhookProviderCustom,
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		Name:           "rotate-before-plaintext", Provider: models.WebhookProviderCustom,
 		WebhookURL: "https://hooks.example.test", Status: models.WebhookStatusActive,
 		CreatedBy: 1,
 	}
@@ -83,8 +86,11 @@ func TestDatabaseSecretValidationDetectsTamperAndWrongKey(t *testing.T) {
 	db := openSecretTestDB(t)
 	ctx := context.Background()
 	ring := testDatabaseKeyring(t, "dek-one", 0x61)
+	scope := defaultSecretTestScope(t, db)
 	webhook := models.WebhookConfig{
-		Name: "encrypted", Provider: models.WebhookProviderCustom,
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		Name:           "encrypted", Provider: models.WebhookProviderCustom,
 		WebhookURL: "https://hooks.example.test", Status: models.WebhookStatusActive,
 		CreatedBy: 1,
 	}
@@ -218,6 +224,7 @@ func TestRuntimeDatabaseSecretValidationUsesOneScopedTransactionPerProject(
 				tableName = query.Statement.Schema.Table
 			}
 			if tableName != webhookSecretsTable &&
+				tableName != "webhook_delivery_snapshots" &&
 				tableName != a2aPushSecretsTable {
 				return
 			}
@@ -240,11 +247,13 @@ func TestRuntimeDatabaseSecretValidationUsesOneScopedTransactionPerProject(
 	); err != nil {
 		t.Fatal(err)
 	}
-	if protectedQueries != len(projects)*2 {
+	const projectOwnedSecretQueryCount = 3
+	totalProjects := len(projects) + 1
+	if protectedQueries != totalProjects*projectOwnedSecretQueryCount {
 		t.Fatalf(
 			"project-owned secret queries = %d, want %d",
 			protectedQueries,
-			len(projects)*2,
+			totalProjects*projectOwnedSecretQueryCount,
 		)
 	}
 	if unscopedProtectedQueries != 0 {
@@ -257,8 +266,11 @@ func TestRuntimeDatabaseSecretValidationUsesOneScopedTransactionPerProject(
 
 func TestDatabaseSecretRotationRejectsObjectAuthentication(t *testing.T) {
 	db := openSecretTestDB(t)
+	scope := defaultSecretTestScope(t, db)
 	push := models.AgentPushNotificationConfig{
 		ID:             "push-object-auth",
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
 		TaskID:         "task-object-auth",
 		URL:            "https://push.example.test",
 		Authentication: datatypes.JSON(`{"scheme":"Bearer","credentials":"unsupported"}`),
@@ -284,8 +296,11 @@ func TestDatabaseSecretRotationRotatesKeyID(t *testing.T) {
 	db := openSecretTestDB(t)
 	ctx := context.Background()
 	oldRing := testDatabaseKeyring(t, "dek-old", 0x31)
+	scope := defaultSecretTestScope(t, db)
 	webhook := models.WebhookConfig{
-		Name: "rotate", Provider: models.WebhookProviderCustom,
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		Name:           "rotate", Provider: models.WebhookProviderCustom,
 		WebhookURL: "https://hooks.example.test", Status: models.WebhookStatusActive,
 		CreatedBy: 1,
 	}
@@ -349,7 +364,11 @@ func openSecretTestDB(t *testing.T) *gorm.DB {
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	if err := db.AutoMigrate(
 		&models.User{},
+		&models.Organization{},
+		&models.BusinessUnit{},
+		&models.Project{},
 		&models.WebhookConfig{},
+		&models.WebhookDeliverySnapshot{},
 		&models.EmailConfig{},
 		&models.AgentPushNotificationConfig{},
 	); err != nil {
@@ -359,7 +378,43 @@ func openSecretTestDB(t *testing.T) *gorm.DB {
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
 	}
+	organization := models.Organization{
+		Slug:   "database-secret-tests",
+		Name:   "Database Secret Tests",
+		Status: models.OrganizationStatusActive,
+	}
+	if err := db.Create(&organization).Error; err != nil {
+		t.Fatal(err)
+	}
+	unit := models.BusinessUnit{
+		OrganizationID: organization.ID,
+		Key:            "security",
+		Name:           "Security",
+		Status:         models.BusinessUnitStatusActive,
+	}
+	if err := db.Create(&unit).Error; err != nil {
+		t.Fatal(err)
+	}
+	project := models.Project{
+		OrganizationID: organization.ID,
+		BusinessUnitID: unit.ID,
+		Key:            models.ProjectKey("DEFAULT"),
+		Name:           "Default",
+		Status:         models.ProjectStatusActive,
+	}
+	if err := db.Create(&project).Error; err != nil {
+		t.Fatal(err)
+	}
 	return db
+}
+
+func defaultSecretTestScope(t *testing.T, db *gorm.DB) models.ProjectScope {
+	t.Helper()
+	var project models.Project
+	if err := db.Order("id ASC").First(&project).Error; err != nil {
+		t.Fatal(err)
+	}
+	return project.Scope()
 }
 
 func testDatabaseKeyring(t *testing.T, keyID string, value byte) *Keyring {

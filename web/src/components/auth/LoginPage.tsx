@@ -7,12 +7,20 @@ import {
     Checkbox,
     CircularProgress,
     FormControlLabel,
+    Link,
     Stack,
     TextField,
     Typography,
 } from '@mui/material'
-import { useLogin, useNotify } from 'react-admin'
+import { useAuthProvider, useNotify } from 'react-admin'
+import { useQueryClient } from '@tanstack/react-query'
+import {
+    Link as RouterLink,
+    useLocation,
+    useNavigate,
+} from 'react-router-dom'
 import { localizedUnknownErrorMessage } from '@/lib/apiClient'
+import { markHumanAuthQueryAuthenticated } from '@/lib/authQueryState'
 
 type NavigatorWithUAData = Navigator & {
     userAgentData?: {
@@ -41,9 +49,32 @@ const storedPreference = () => {
     return localStorage.getItem('rememberDevicePreference') === 'true'
 }
 
+const afterLoginPath = (state: unknown): string => {
+    if (typeof state !== 'object' || state === null) {
+        return '/'
+    }
+    const nextPathname =
+        'nextPathname' in state && typeof state.nextPathname === 'string'
+            ? state.nextPathname
+            : ''
+    if (!nextPathname.startsWith('/') || nextPathname.startsWith('//')) {
+        return '/'
+    }
+    const nextSearch =
+        'nextSearch' in state &&
+        typeof state.nextSearch === 'string' &&
+        state.nextSearch.startsWith('?')
+            ? state.nextSearch
+            : ''
+    return `${nextPathname}${nextSearch}`
+}
+
 const LoginPage = () => {
-    const login = useLogin()
+    const authProvider = useAuthProvider()
     const notify = useNotify()
+    const queryClient = useQueryClient()
+    const location = useLocation()
+    const navigate = useNavigate()
 
     const [email, setEmail] = useState('')
     const [password, setPassword] = useState('')
@@ -59,7 +90,10 @@ const LoginPage = () => {
         setError(null)
 
         try {
-            await login({
+            if (!authProvider) {
+                throw new Error('认证服务尚未就绪，请稍后重试')
+            }
+            await authProvider.login({
                 username: email,
                 password,
                 remember: rememberDevice,
@@ -67,6 +101,11 @@ const LoginPage = () => {
                 otpCode: otpCode || undefined,
                 deviceName: rememberDevice ? deviceName : undefined,
             })
+            markHumanAuthQueryAuthenticated(queryClient)
+            void queryClient.invalidateQueries({
+                queryKey: ['auth', 'getPermissions'],
+            })
+            navigate(afterLoginPath(location.state), { replace: true })
             notify('登录成功', { type: 'info' })
         } catch (err) {
             const message = localizedUnknownErrorMessage(err, '登录失败')
@@ -237,6 +276,28 @@ const LoginPage = () => {
                                     />
                                 )}
                             </Box>
+
+                            <Stack
+                                direction={{ xs: 'column', sm: 'row' }}
+                                spacing={1}
+                                sx={{ justifyContent: 'space-between' }}
+                            >
+                                <Link
+                                    component={RouterLink}
+                                    to="/forgot-password"
+                                >
+                                    忘记密码
+                                </Link>
+                                <Link
+                                    component={RouterLink}
+                                    to="/resend-verification"
+                                >
+                                    重发验证邮件
+                                </Link>
+                                <Link component={RouterLink} to="/register">
+                                    注册账号
+                                </Link>
+                            </Stack>
 
                             {error && (
                                 <Box sx={{

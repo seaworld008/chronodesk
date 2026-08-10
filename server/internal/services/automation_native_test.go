@@ -262,6 +262,16 @@ func TestDomainEventAutomationUsesNativeCommandsAndIsIdempotent(t *testing.T) {
 		First(&originalDelivery).Error; err != nil {
 		t.Fatalf("load original delivery: %v", err)
 	}
+	if err := automation.db.Model(&models.OutboxDelivery{}).
+		Where("id = ?", originalDelivery.ID).
+		Updates(map[string]any{
+			"status":          models.OutboxDeliveryFailed,
+			"next_attempt_at": time.Now(),
+			"last_error":      "simulate a replayable delivery failure",
+			"delivered_at":    nil,
+		}).Error; err != nil {
+		t.Fatalf("make original delivery replayable: %v", err)
+	}
 	if err := native.ReplayOutbox(
 		automationWorkerTestContext(t, automation),
 		originalDelivery.ID,
@@ -445,7 +455,7 @@ func TestAutomationRetryContinuesActionsAfterConditionWasChanged(t *testing.T) {
 		Where("event_id = ? AND destination_type = ?", created.Event.ID, "automation").
 		Updates(map[string]any{
 			"status":          models.OutboxDeliveryFailed,
-			"next_attempt_at": time.Now().Add(-time.Second),
+			"next_attempt_at": time.Now().UTC().Add(-time.Second),
 		}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -669,7 +679,9 @@ func TestAutomationConcurrentSiblingDeliveriesHaveOneRuleOwnerAndOneStatistic(t 
 				"automation",
 				models.OutboxDeliveryFailed,
 			).
-			Updates(map[string]any{"next_attempt_at": time.Now().Add(-time.Second)}).Error; err != nil {
+			Updates(map[string]any{
+				"next_attempt_at": time.Now().UTC().Add(-time.Second),
+			}).Error; err != nil {
 			t.Fatal(err)
 		}
 		if _, err := native.ProcessOutboxBatch(
@@ -1018,7 +1030,7 @@ func TestAutomationRetryUsesFrozenRuleAfterModificationAndDisable(t *testing.T) 
 		Where("event_id = ? AND destination_type = ?", created.Event.ID, "automation").
 		Updates(map[string]any{
 			"status":          models.OutboxDeliveryFailed,
-			"next_attempt_at": time.Now().Add(-time.Second),
+			"next_attempt_at": time.Now().UTC().Add(-time.Second),
 		}).Error; err != nil {
 		t.Fatal(err)
 	}

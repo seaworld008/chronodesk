@@ -30,6 +30,10 @@ import {
 import {
     authenticationStorageKeys,
 } from './humanSessionStorage'
+import {
+    bindHumanTabSession,
+    readCommittedHumanTabSessionToken,
+} from './humanTabSession'
 import { joinApiUrl } from './apiUrl'
 
 const apiBase = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
@@ -134,10 +138,15 @@ const readStoredUser = (): HumanSessionUser | null => {
     }
 }
 
+export const hasCompleteAuthenticationState = (): boolean =>
+    readCommittedHumanTabSessionToken() !== null &&
+    readStoredUser() !== null
+
 export const clearAuthenticationState = (): void => {
     for (const key of authenticationStorageKeys) {
         localStorage.removeItem(key)
     }
+    bindHumanTabSession(null)
     clearProjectScopeCache()
 }
 
@@ -155,10 +164,48 @@ const storeAuthSession = (
     for (const key of authenticationStorageKeys) {
         localStorage.removeItem(key)
     }
-    localStorage.setItem('token', session.access_token)
     localStorage.setItem('refreshToken', session.refresh_token)
     localStorage.setItem('user', JSON.stringify(session.user))
     localStorage.setItem('tokenExpiresAt', String(binding.expires_at))
+    // Cross-tab listeners treat token as the session commit marker. Keep it
+    // last so they never observe a partially written authentication state.
+    localStorage.setItem('token', session.access_token)
+    bindHumanTabSession(session.access_token)
+}
+
+export type RegistrationSessionOutcome =
+    | 'authenticated'
+    | 'verification_required'
+
+export const consumeRegistrationResult = (
+    value: unknown,
+): RegistrationSessionOutcome => {
+    if (!isRecord(value)) {
+        throw new Error('注册响应包含无效的用户或会话信息')
+    }
+    const user = parseHumanSessionUser(value.user)
+    if (user === null) {
+        throw new Error('注册响应包含无效的用户或会话信息')
+    }
+
+    if (!user.email_verified) {
+        if (
+            value.access_token === '' &&
+            value.refresh_token === '' &&
+            value.token_type === '' &&
+            value.expires_in === 0
+        ) {
+            return 'verification_required'
+        }
+        throw new Error('注册响应包含无效的用户或会话信息')
+    }
+
+    const session = parseAuthSession(value)
+    if (session === null) {
+        throw new Error('注册响应包含无效的用户或会话信息')
+    }
+    storeAuthSession(session, false)
+    return 'authenticated'
 }
 
 const refreshStoredSession = async (): Promise<void> => {
@@ -310,7 +357,9 @@ export const authProvider: AuthProvider = {
             deviceName,
         } = params as LoginParams
 
-        clearAuthenticationState()
+        // Preserve the shared session until a replacement is fully validated.
+        // Clearing it before the network round trip can log out other tabs and
+        // leave them without a listener for the eventual replacement commit.
         const payload: LoginRequest = {
             email: username,
             password,
@@ -357,7 +406,6 @@ export const authProvider: AuthProvider = {
 
         const session = parseAuthSession(responseData(body))
         if (session === null) {
-            clearAuthenticationState()
             throw new Error('登录响应包含无效的平台角色或会话信息')
         }
         storeAuthSession(session, false)
@@ -391,16 +439,18 @@ export const authProvider: AuthProvider = {
     },
 
     checkAuth: async () => {
-        let binding = readHumanSessionBinding()
-        if (!binding || readStoredUser() === null) {
+        let committedToken = readCommittedHumanTabSessionToken()
+        let binding = readHumanSessionBinding(committedToken)
+        if (!committedToken || !binding || readStoredUser() === null) {
             clearAuthenticationState()
             throw new Error('登录会话无效，请重新登录')
         }
         if (Date.now() >= binding.expires_at) {
             await refreshStoredSession()
-            binding = readHumanSessionBinding()
+            committedToken = readCommittedHumanTabSessionToken()
+            binding = readHumanSessionBinding(committedToken)
         }
-        if (!binding || readStoredUser() === null) {
+        if (!committedToken || !binding || readStoredUser() === null) {
             clearAuthenticationState()
             throw new Error('登录状态已过期，请重新登录')
         }

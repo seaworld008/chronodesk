@@ -1069,6 +1069,15 @@ func projectHandlerTestService(
 	if err != nil {
 		t.Fatal(err)
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if closeErr := sqlDB.Close(); closeErr != nil {
+			t.Errorf("close project handler test database: %v", closeErr)
+		}
+	})
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.Organization{},
@@ -1449,6 +1458,174 @@ func TestProjectScopeMiddlewareRollsBackUnsuccessfulRequest(t *testing.T) {
 	}
 }
 
+func TestProjectScopeMiddlewareCommitsTypedConflictAfterTransaction(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	service, project, user, db := projectHandlerTestService(t)
+	target := models.User{
+		Username:     "after-commit-conflict-target",
+		Email:        "after-commit-conflict-target@example.test",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&target).Error; err != nil {
+		t.Fatal(err)
+	}
+	callbackCalled := false
+	callbackHadTransaction := true
+
+	router := gin.New()
+	group := router.Group("/api/projects/:projectKey")
+	group.Use(func(c *gin.Context) {
+		c.Set("user_id", user.ID)
+		c.Set("platform_role", models.PlatformRoleMember)
+		c.Next()
+	})
+	group.Use(ProjectScopeMiddleware(service, db))
+	group.POST("/after-commit-conflict", func(c *gin.Context) {
+		if err := db.WithContext(c.Request.Context()).
+			Create(&models.ProjectMembership{
+				ProjectID: project.ID,
+				UserID:    target.ID,
+				Role:      models.ProjectRoleRequester,
+				IsActive:  true,
+			}).Error; err != nil {
+			c.String(http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := queueProjectAfterCommit(c, func() {
+			callbackCalled = true
+			callbackHadTransaction = scopeddb.HasTransaction(
+				c.Request.Context(),
+			)
+		}); err != nil {
+			c.String(http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := middleware.QueueProjectAfterCommitResponse(
+			c,
+			middleware.ProjectAfterCommitResponse{
+				Status:      http.StatusConflict,
+				ContentType: "application/problem+json",
+				Header:      http.Header{"ETag": {`"v2"`}},
+				Body:        []byte(`{"code":"stable_conflict"}`),
+			},
+		); err != nil {
+			c.String(http.StatusInternalServerError, err.Error())
+		}
+	})
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/projects/OPS/after-commit-conflict",
+		nil,
+	)
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict ||
+		!strings.Contains(response.Body.String(), `"stable_conflict"`) ||
+		response.Header().Get("ETag") != `"v2"` {
+		t.Fatalf(
+			"typed after-commit response = status:%d headers:%v body:%s",
+			response.Code,
+			response.Header(),
+			response.Body.String(),
+		)
+	}
+	if !callbackCalled || callbackHadTransaction {
+		t.Fatalf(
+			"after-commit callback state = called:%v transaction:%v",
+			callbackCalled,
+			callbackHadTransaction,
+		)
+	}
+	var count int64
+	if err := db.Model(&models.ProjectMembership{}).
+		Where("project_id = ? AND user_id = ?", project.ID, target.ID).
+		Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("typed conflict committed %d memberships, want 1", count)
+	}
+}
+
+func TestProjectScopeMiddlewareRejectsTypedResponseConflict(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	service, project, user, db := projectHandlerTestService(t)
+	target := models.User{
+		Username:     "response-conflict-target",
+		Email:        "response-conflict-target@example.test",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&target).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	router := gin.New()
+	group := router.Group("/api/projects/:projectKey")
+	group.Use(func(c *gin.Context) {
+		c.Set("user_id", user.ID)
+		c.Set("platform_role", models.PlatformRoleMember)
+		c.Next()
+	})
+	group.Use(ProjectScopeMiddleware(service, db))
+	group.POST("/response-conflict", func(c *gin.Context) {
+		if err := db.WithContext(c.Request.Context()).
+			Create(&models.ProjectMembership{
+				ProjectID: project.ID,
+				UserID:    target.ID,
+				Role:      models.ProjectRoleRequester,
+				IsActive:  true,
+			}).Error; err != nil {
+			c.String(http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := middleware.QueueProjectAfterCommitResponse(
+			c,
+			middleware.ProjectAfterCommitResponse{
+				Status:      http.StatusConflict,
+				ContentType: "application/problem+json",
+				Body:        []byte(`{"code":"must_not_escape"}`),
+			},
+		); err != nil {
+			c.String(http.StatusInternalServerError, err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true})
+	})
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/projects/OPS/response-conflict",
+		nil,
+	)
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusInternalServerError ||
+		strings.Contains(response.Body.String(), "must_not_escape") ||
+		strings.Contains(response.Body.String(), `"success":true`) {
+		t.Fatalf(
+			"conflicting response did not fail closed: status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	var count int64
+	if err := db.Model(&models.ProjectMembership{}).
+		Where("project_id = ? AND user_id = ?", project.ID, target.ID).
+		Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("response conflict committed %d memberships", count)
+	}
+}
+
 func TestProjectScopeMiddlewareNeverEmitsSuccessWhenCommitFails(
 	t *testing.T,
 ) {
@@ -1482,6 +1659,7 @@ func TestProjectScopeMiddlewareNeverEmitsSuccessWhenCommitFails(
 		t.Fatal(err)
 	}
 
+	callbackCalled := false
 	router := gin.New()
 	group := router.Group("/api/projects/:projectKey")
 	group.Use(func(c *gin.Context) {
@@ -1491,6 +1669,12 @@ func TestProjectScopeMiddlewareNeverEmitsSuccessWhenCommitFails(
 	})
 	group.Use(ProjectScopeMiddleware(service, db))
 	group.POST("/commit-failure", func(c *gin.Context) {
+		if err := queueProjectAfterCommit(c, func() {
+			callbackCalled = true
+		}); err != nil {
+			c.String(http.StatusInternalServerError, err.Error())
+			return
+		}
 		result := db.WithContext(c.Request.Context()).Exec(`
 			INSERT INTO project_commit_children (id, parent_id)
 			VALUES (1, 999)
@@ -1522,12 +1706,246 @@ func TestProjectScopeMiddlewareNeverEmitsSuccessWhenCommitFails(
 			response.Body.String(),
 		)
 	}
+	if callbackCalled {
+		t.Fatal("commit failure executed a project after-commit callback")
+	}
 	var count int64
 	if err := db.Table("project_commit_children").Count(&count).Error; err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {
 		t.Fatalf("failed commit persisted %d child rows", count)
+	}
+}
+
+func TestProjectScopeMiddlewareNeverEmitsTypedConflictWhenCommitFails(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	service, _, user, db := projectHandlerTestService(t)
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	if err := db.Exec("PRAGMA foreign_keys = ON").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(`
+		CREATE TABLE project_conflict_commit_parents (
+			id INTEGER PRIMARY KEY
+		)
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(`
+		CREATE TABLE project_conflict_commit_children (
+			id INTEGER PRIMARY KEY,
+			parent_id INTEGER NOT NULL,
+			CONSTRAINT project_conflict_commit_parent_fk
+				FOREIGN KEY (parent_id)
+				REFERENCES project_conflict_commit_parents(id)
+				DEFERRABLE INITIALLY DEFERRED
+		)
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	callbackCalled := false
+	router := gin.New()
+	group := router.Group("/api/projects/:projectKey")
+	group.Use(func(c *gin.Context) {
+		c.Set("user_id", user.ID)
+		c.Set("platform_role", models.PlatformRoleMember)
+		c.Next()
+	})
+	group.Use(ProjectScopeMiddleware(service, db))
+	group.POST("/queued-commit-failure", func(c *gin.Context) {
+		if err := queueProjectAfterCommit(c, func() {
+			callbackCalled = true
+		}); err != nil {
+			c.String(http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := middleware.QueueProjectAfterCommitResponse(
+			c,
+			middleware.ProjectAfterCommitResponse{
+				Status:      http.StatusConflict,
+				ContentType: "application/problem+json",
+				Body:        []byte(`{"code":"must_not_escape"}`),
+			},
+		); err != nil {
+			c.String(http.StatusInternalServerError, err.Error())
+			return
+		}
+		result := db.WithContext(c.Request.Context()).Exec(`
+			INSERT INTO project_conflict_commit_children (id, parent_id)
+			VALUES (1, 999)
+		`)
+		if result.Error != nil {
+			c.String(http.StatusInternalServerError, result.Error.Error())
+		}
+	})
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/projects/OPS/queued-commit-failure",
+		nil,
+	)
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusInternalServerError ||
+		strings.Contains(response.Body.String(), "must_not_escape") {
+		t.Fatalf(
+			"commit failure emitted queued conflict: status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	if callbackCalled {
+		t.Fatal("commit failure executed a project after-commit callback")
+	}
+}
+
+func TestProjectScopeMiddlewarePreservesCommittedResponsesWhenCallbackPanics(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	service, _, user, db := projectHandlerTestService(t)
+	recordedErrors := 0
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Next()
+		recordedErrors = len(c.Errors)
+	})
+	group := router.Group("/api/projects/:projectKey")
+	group.Use(func(c *gin.Context) {
+		c.Set("user_id", user.ID)
+		c.Set("platform_role", models.PlatformRoleMember)
+		c.Next()
+	})
+	group.Use(ProjectScopeMiddleware(service, db))
+	group.POST("/callback-panic", func(c *gin.Context) {
+		if err := queueProjectAfterCommit(c, func() {
+			panic("callback failure")
+		}); err != nil {
+			c.String(http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := middleware.QueueProjectAfterCommitResponse(
+			c,
+			middleware.ProjectAfterCommitResponse{
+				Status:      http.StatusConflict,
+				ContentType: "application/problem+json",
+				Body:        []byte(`{"code":"must_not_escape"}`),
+			},
+		); err != nil {
+			c.String(http.StatusInternalServerError, err.Error())
+		}
+	})
+	group.POST("/callback-panic-success", func(c *gin.Context) {
+		if err := queueProjectAfterCommit(c, func() {
+			panic("notification callback failure")
+		}); err != nil {
+			c.String(http.StatusInternalServerError, err.Error())
+			return
+		}
+		c.JSON(http.StatusCreated, gin.H{"created": true})
+	})
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/projects/OPS/callback-panic",
+		nil,
+	)
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict ||
+		!strings.Contains(response.Body.String(), "must_not_escape") {
+		t.Fatalf(
+			"callback panic lost committed conflict: status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	if recordedErrors != 1 {
+		t.Fatalf(
+			"callback panic recorded %d errors, want 1",
+			recordedErrors,
+		)
+	}
+
+	recordedErrors = 0
+	response = httptest.NewRecorder()
+	request = httptest.NewRequest(
+		http.MethodPost,
+		"/api/projects/OPS/callback-panic-success",
+		nil,
+	)
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated ||
+		!strings.Contains(response.Body.String(), `"created":true`) {
+		t.Fatalf(
+			"notification callback panic lost committed success: status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	if recordedErrors != 1 {
+		t.Fatalf(
+			"notification callback panic recorded %d errors, want 1",
+			recordedErrors,
+		)
+	}
+}
+
+func TestProjectScopeMiddlewareRunsCallbacksOnlyAfterCommit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service, _, user, db := projectHandlerTestService(t)
+	callbackCalled := false
+	callbackHadTransaction := true
+
+	router := gin.New()
+	group := router.Group("/api/projects/:projectKey")
+	group.Use(func(c *gin.Context) {
+		c.Set("user_id", user.ID)
+		c.Set("platform_role", models.PlatformRoleMember)
+		c.Next()
+	})
+	group.Use(ProjectScopeMiddleware(service, db))
+	group.POST("/after-commit", func(c *gin.Context) {
+		if err := queueProjectAfterCommit(c, func() {
+			callbackCalled = true
+			callbackHadTransaction = scopeddb.HasTransaction(
+				c.Request.Context(),
+			)
+		}); err != nil {
+			c.String(http.StatusInternalServerError, err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true})
+	})
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/projects/OPS/after-commit",
+		nil,
+	)
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"status = %d, body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	if !callbackCalled || callbackHadTransaction {
+		t.Fatalf(
+			"after-commit callback state = called:%v transaction:%v",
+			callbackCalled,
+			callbackHadTransaction,
+		)
 	}
 }
 

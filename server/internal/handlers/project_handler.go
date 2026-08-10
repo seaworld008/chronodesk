@@ -32,6 +32,16 @@ var errProjectRequestRollback = errors.New(
 	"project request returned an unsuccessful response",
 )
 
+func queueProjectAfterCommit(c *gin.Context, callback func()) error {
+	return middleware.QueueProjectAfterCommit(c, callback)
+}
+
+func runProjectAfterCommit(c *gin.Context) {
+	if err := middleware.RunProjectAfterCommitCallbacks(c); err != nil {
+		_ = c.Error(err)
+	}
+}
+
 type ProjectHandler struct {
 	service  *services.ProjectService
 	response *middleware.ResponseHelper
@@ -888,6 +898,13 @@ func ProjectScopeMiddleware(
 			})
 			return
 		}
+		if err := middleware.InstallProjectAfterCommitQueue(c); err != nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+				"code": "project_after_commit_unavailable",
+				"msg":  "项目提交后处理不可用",
+			})
+			return
+		}
 		originalWriter := c.Writer
 		defer func() {
 			c.Writer = originalWriter
@@ -936,6 +953,13 @@ func ProjectScopeMiddleware(
 					bufferedWriter.Status() >= http.StatusBadRequest {
 					return errProjectRequestRollback
 				}
+				if middleware.HasProjectAfterCommitResponse(c) &&
+					bufferedWriter.Written() {
+					return errors.New(
+						"project after-commit response conflicts " +
+							"with buffered response",
+					)
+				}
 				return nil
 			},
 		)
@@ -977,6 +1001,25 @@ func ProjectScopeMiddleware(
 			} else {
 				c.Abort()
 			}
+			return
+		}
+		runProjectAfterCommit(c)
+		emitted, emitErr :=
+			middleware.EmitProjectAfterCommitResponse(c)
+		if emitErr != nil {
+			_ = c.Error(emitErr)
+			if !c.Writer.Written() {
+				c.AbortWithStatusJSON(
+					http.StatusInternalServerError,
+					gin.H{
+						"code": "project_response_failed",
+						"msg":  "项目响应失败",
+					},
+				)
+			}
+			return
+		}
+		if emitted {
 			return
 		}
 		if err := bufferedWriter.Commit(); err != nil {

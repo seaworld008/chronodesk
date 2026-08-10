@@ -280,7 +280,7 @@ func randInt(max int) int {
 
 // IsValidEmail 验证邮箱格式
 func IsValidEmail(email string) bool {
-	if len(email) < 3 || len(email) > 254 {
+	if len(email) < 3 || len(email) > 100 {
 		return false
 	}
 

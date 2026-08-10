@@ -11,6 +11,11 @@ import (
 	"gorm.io/gorm"
 )
 
+var errTicketWorkflowCandidateNotAllowed = fmt.Errorf(
+	"%w: ticket workflow candidate transition is not allowed",
+	ErrInvalidTicketTransition,
+)
+
 // validateTicketWorkflowTransitionTx makes the immutable workflow version
 // stored on the Ticket authoritative for lifecycle transitions. The shared
 // canonical TicketStatus remains a reporting projection; projects may name
@@ -53,7 +58,14 @@ func validateTicketWorkflowTransitionTx(
 		).
 		First(&workflow).Error; err != nil {
 		return fmt.Errorf(
-			"%w: load ticket workflow: %v",
+			"%w: load ticket workflow: %w",
+			ErrInvalidTicketTransition,
+			err,
+		)
+	}
+	if err := workflow.Validate(); err != nil {
+		return fmt.Errorf(
+			"%w: invalid ticket workflow configuration: %v",
 			ErrInvalidTicketTransition,
 			err,
 		)
@@ -111,7 +123,7 @@ func validateTicketWorkflowTransitionTx(
 	}
 	return fmt.Errorf(
 		"%w: workflow %s does not allow %s to %s",
-		ErrInvalidTicketTransition,
+		errTicketWorkflowCandidateNotAllowed,
 		workflow.ID,
 		ticket.Status,
 		next,
@@ -164,8 +176,9 @@ func workflowActorProjectRoleTx(
 			).
 			First(&membership).Error; err != nil {
 			return "", fmt.Errorf(
-				"%w: workflow actor has no active project membership",
+				"%w: workflow actor has no active project membership: %w",
 				ErrInvalidTicketTransition,
+				err,
 			)
 		}
 		return membership.Role, nil
@@ -181,8 +194,9 @@ func workflowActorProjectRoleTx(
 			).
 			First(&grant).Error; err != nil {
 			return "", fmt.Errorf(
-				"%w: workflow actor has no active project grant",
+				"%w: workflow actor has no active project grant: %w",
 				ErrInvalidTicketTransition,
+				err,
 			)
 		}
 		if grant.ExpiresAt != nil && !grant.ExpiresAt.After(time.Now().UTC()) {

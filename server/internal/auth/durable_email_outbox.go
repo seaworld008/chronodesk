@@ -24,6 +24,7 @@ type AuthEmailOutboxRepository interface {
 		*User,
 		*UserProfile,
 		*EmailVerification,
+		*EmailVerificationPolicySnapshot,
 	) error
 	QueueEmailVerification(context.Context, *EmailVerification, string) error
 	QueuePasswordReset(context.Context, *PasswordReset) error
@@ -131,9 +132,15 @@ func (r *GormAuthEmailOutboxRepository) Register(
 	user *User,
 	profile *UserProfile,
 	verification *EmailVerification,
+	emailPolicy *EmailVerificationPolicySnapshot,
 ) error {
 	if user == nil || profile == nil {
 		return errors.New("user and profile are required")
+	}
+	if emailPolicy == nil ||
+		user.EmailVerified == emailPolicy.Enabled ||
+		(verification != nil) != emailPolicy.Enabled {
+		return ErrEmailVerificationPolicyChanged
 	}
 	if !user.PlatformRole.IsValid() || !isValidUserStatus(user.Status) {
 		return ErrInvalidAccountState
@@ -149,6 +156,12 @@ func (r *GormAuthEmailOutboxRepository) Register(
 		ctx,
 		models.SystemActor("auth-registration"),
 		func(txCtx context.Context, tx *gorm.DB) error {
+			if err := lockAndMatchEmailVerificationPolicyTx(
+				tx,
+				emailPolicy,
+			); err != nil {
+				return err
+			}
 			if err := tx.Create(&modelUser).Error; err != nil {
 				return err
 			}
@@ -331,17 +344,11 @@ func validateAuthEmailRecipientTx(
 	userID uint,
 	email string,
 ) error {
-	var user models.User
-	if err := tx.Select("id", "email").First(&user, userID).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return ErrUserNotFound
-		}
-		return err
-	}
-	if strings.TrimSpace(email) == "" || email != user.Email {
-		return errors.New("authentication email recipient does not match user")
-	}
-	return nil
+	// Issuance and consumption lock the same account row. A reset or
+	// verification request therefore linearizes wholly before or after a
+	// successful one-time credential consumption; it cannot insert an
+	// unaccounted credential in the middle of account-wide invalidation.
+	return lockAuthCredentialUserEmail(tx, userID, email)
 }
 
 func (r *GormAuthEmailOutboxRepository) VerifyEmailAndQueueWelcome(
@@ -358,6 +365,25 @@ func (r *GormAuthEmailOutboxRepository) VerifyEmailAndQueueWelcome(
 			var verification EmailVerification
 			if err := tx.Where(
 				"token = ? AND used = ? AND expires_at > ?",
+				digest,
+				false,
+				verifiedAt,
+			).Take(&verification).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return ErrInvalidToken
+				}
+				return err
+			}
+			if err := lockAuthCredentialUserEmail(
+				tx,
+				verification.UserID,
+				verification.Email,
+			); err != nil {
+				return err
+			}
+			if err := tx.Where(
+				"id = ? AND token = ? AND used = ? AND expires_at > ?",
+				verification.ID,
 				digest,
 				false,
 				verifiedAt,
@@ -387,7 +413,11 @@ func (r *GormAuthEmailOutboxRepository) VerifyEmailAndQueueWelcome(
 			}
 
 			result = tx.Model(&models.User{}).
-				Where("id = ?", verification.UserID).
+				Where(
+					"id = ? AND email = ?",
+					verification.UserID,
+					verification.Email,
+				).
 				Updates(map[string]any{
 					"email_verified":    true,
 					"email_verified_at": &verifiedAt,

@@ -332,8 +332,9 @@ export const StatusChip = ({ value }: { value: string }) => {
     ? 'success'
     : warning.includes(value)
       ? 'warning'
-      : ['error', 'failed', 'dead', 'dead_letter', 'conflict'].includes(value)
+      : ['error', 'failed', 'dead', 'expired', 'dead_letter', 'conflict'].includes(value)
         ? 'error'
         : 'default'
-  return <Chip size="small" label={value} color={color} variant="outlined" />
+  const label = value === 'expired' ? '已过期' : value
+  return <Chip size="small" label={label} color={color} variant="outlined" />
 }

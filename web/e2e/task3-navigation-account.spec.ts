@@ -181,6 +181,7 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         await installSession(page)
         const profileWrites: Array<Record<string, unknown>> = []
         const loginPages: number[] = []
+        const revokedLoginSessions: number[] = []
         const passwordWrites: Array<Record<string, unknown>> = []
         const otpVerifications: string[] = []
         const uploadedAvatarURL =
@@ -255,6 +256,14 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
                     page: requestedPage,
                     page_size: 20,
                 }
+            } else if (
+                /^\/api\/user\/login-history\/\d+$/u.test(url.pathname)
+                && request.method() === 'DELETE'
+            ) {
+                revokedLoginSessions.push(
+                    Number(url.pathname.split('/').at(-1)),
+                )
+                data = null
             } else if (
                 url.pathname === '/api/auth/enable-otp' &&
                 request.method() === 'POST'
@@ -477,8 +486,25 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             name: '登录历史',
             level: 1,
         })).toBeVisible()
+        await expect(
+            page.getByRole('button', { name: /^撤销会话：/u }),
+        ).toHaveCount(0)
         await page.getByRole('button', { name: /下一页|next page/i }).click()
         await expect.poll(() => loginPages).toContain(2)
+        await page.getByRole('button', {
+            name: '撤销会话：Chromium',
+            exact: true,
+        }).click()
+        const revokeDialog = page.getByRole('dialog', {
+            name: '撤销设备会话',
+            exact: true,
+        })
+        await expect(revokeDialog).toBeVisible()
+        await revokeDialog.getByRole('button', {
+            name: '确认撤销',
+            exact: true,
+        }).click()
+        await expect.poll(() => revokedLoginSessions).toEqual([2])
 
         await page.goto('/#/webhook-settings')
         await expect(page.getByRole('heading', {

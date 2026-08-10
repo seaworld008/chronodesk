@@ -1535,11 +1535,32 @@ func TestA2AMissingTokenEventScopeSoftDeniesExternalDelivery(t *testing.T) {
 		services.AgentNativeOptions{
 			DefaultOutboxTargets: []services.OutboxTarget{{
 				Type:        "webhook",
-				ID:          "token-scope-test",
+				ID:          "configured",
 				MaxAttempts: 3,
 			}},
 		},
 	)
+	if err := fixture.db.AutoMigrate(
+		&models.WebhookConfig{},
+		&models.WebhookDeliverySnapshot{},
+	); err != nil {
+		t.Fatalf("migrate token-scope webhook snapshot tables: %v", err)
+	}
+	webhookConfig := models.WebhookConfig{
+		OrganizationID: fixture.organization.ID,
+		ProjectID:      fixture.project.ID,
+		Name:           "token-scope-test",
+		Provider:       models.WebhookProviderCustom,
+		WebhookURL:     "https://token-scope.example.test/events",
+		Status:         models.WebhookStatusActive,
+		EnabledEventsObj: []models.WebhookEventType{
+			models.WebhookEventTicketCreated,
+		},
+		CreatedBy: fixture.user.ID,
+	}
+	if err := fixture.db.Create(&webhookConfig).Error; err != nil {
+		t.Fatalf("create token-scope webhook config: %v", err)
+	}
 	if _, err := fixture.native.CreateAgentPolicy(
 		context.Background(),
 		services.CreateAgentPolicyInput{

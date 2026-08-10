@@ -34,3 +34,35 @@ func TestMigrationDSNFromEnvironmentRejectsMissingConfiguration(t *testing.T) {
 		t.Fatalf("migration DSN = %q, want empty value", got)
 	}
 }
+
+func TestDestructiveDropIncludesWebhookDeliverySnapshotsBeforeConfigs(
+	t *testing.T,
+) {
+	tables := dropChronoDeskTableNames()
+	positions := make(map[string]int, len(tables))
+	for index, table := range tables {
+		positions[table] = index
+	}
+	snapshot, hasSnapshot := positions["webhook_delivery_snapshots"]
+	outbox, hasOutbox := positions["outbox_deliveries"]
+	event, hasEvent := positions["domain_events"]
+	config, hasConfig := positions["webhook_configs"]
+	if !hasSnapshot {
+		t.Fatal("destructive drop inventory omits webhook_delivery_snapshots")
+	}
+	if !hasConfig {
+		t.Fatal("destructive drop inventory omits webhook_configs")
+	}
+	if !hasOutbox || !hasEvent {
+		t.Fatal("destructive drop inventory omits Outbox or DomainEvent tables")
+	}
+	if snapshot >= outbox || outbox >= event || snapshot >= config {
+		t.Fatalf(
+			"drop order snapshot=%d outbox=%d event=%d config=%d is unsafe",
+			snapshot,
+			outbox,
+			event,
+			config,
+		)
+	}
+}

@@ -162,6 +162,8 @@ type AdminOutboxDeliveryListItem struct {
 	Attempts         int                         `json:"attempts"`
 	NextAttemptAt    time.Time                   `json:"next_attempt_at"`
 	LastError        string                      `json:"last_error"`
+	ExpiresAt        *time.Time                  `json:"expires_at"`
+	ExpiredAt        *time.Time                  `json:"expired_at"`
 	ResourceVersion  uint64                      `json:"resource_version"`
 }
 
@@ -721,6 +723,8 @@ func (s *AdminListService) ListOutbox(
 				services.ScrubOutboxFailureText(delivery.LastError),
 				500,
 			),
+			ExpiresAt:       delivery.ExpiresAt,
+			ExpiredAt:       delivery.ExpiredAt,
 			ResourceVersion: versions["outbox/"+delivery.ID],
 		})
 	}

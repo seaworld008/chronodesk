@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"net"
 	"net/url"
-	"path"
 	"strings"
 
 	"github.com/seaworld008/chronodesk/server/internal/mailer"
@@ -30,11 +30,12 @@ type SMTPEmailService struct {
 func NewConfiguredSMTPEmailService(
 	provider SMTPConfigProvider,
 	webURL string,
+	environments ...string,
 ) (*SMTPEmailService, error) {
 	if provider == nil {
 		return nil, errors.New("SMTP配置提供器不能为空")
 	}
-	baseURL, err := parseApplicationWebURL(webURL)
+	baseURL, err := parseApplicationWebURL(webURL, environments...)
 	if err != nil {
 		return nil, err
 	}
@@ -170,16 +171,22 @@ func (s *SMTPEmailService) applicationURL(
 	parameters map[string]string,
 ) string {
 	target := *s.webURL
-	target.Path = path.Join(strings.TrimSuffix(target.Path, "/"), route)
-	query := target.Query()
+	target.Path = strings.TrimRight(target.Path, "/") + "/"
+	query := make(url.Values, len(parameters))
 	for key, value := range parameters {
 		query.Set(key, value)
 	}
-	target.RawQuery = query.Encode()
-	return target.String()
+	fragment := "/" + strings.TrimLeft(route, "/")
+	if encoded := query.Encode(); encoded != "" {
+		fragment += "?" + encoded
+	}
+	return target.String() + "#" + fragment
 }
 
-func parseApplicationWebURL(raw string) (*url.URL, error) {
+func parseApplicationWebURL(
+	raw string,
+	environments ...string,
+) (*url.URL, error) {
 	raw = strings.TrimSpace(raw)
 	parsed, err := url.Parse(raw)
 	if err != nil {
@@ -192,5 +199,22 @@ func parseApplicationWebURL(raw string) (*url.URL, error) {
 		parsed.Fragment != "" {
 		return nil, errors.New("WEB_URL必须是无凭据、查询参数和片段的绝对HTTP(S)地址")
 	}
+	if parsed.Scheme == "http" &&
+		!applicationWebURLLoopback(parsed.Hostname()) {
+		return nil, errors.New("WEB_URL必须使用HTTPS；仅本机开发允许HTTP")
+	}
+	if len(environments) > 0 &&
+		strings.EqualFold(strings.TrimSpace(environments[0]), "production") &&
+		parsed.Scheme != "https" {
+		return nil, errors.New("生产环境WEB_URL必须使用HTTPS")
+	}
 	return parsed, nil
+}
+
+func applicationWebURLLoopback(hostname string) bool {
+	if strings.EqualFold(strings.TrimSpace(hostname), "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.TrimSpace(hostname))
+	return ip != nil && ip.IsLoopback()
 }

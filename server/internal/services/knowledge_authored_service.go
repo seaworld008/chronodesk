@@ -358,87 +358,106 @@ func (service *KnowledgeService) CreateAuthoredArticle(
 		service.db,
 		operation.Scope,
 		func(scopedContext context.Context) error {
-			tx := service.db.WithContext(scopedContext)
-			access, err := service.revalidateAuthoredWrite(
+			return transactionForContext(
 				scopedContext,
-				operation,
-				options,
-			)
-			if err != nil {
-				return err
-			}
-			if err := tx.Create(&article).Error; err != nil {
-				return fmt.Errorf("create authored knowledge article: %w", err)
-			}
-			if err := tx.Create(&version).Error; err != nil {
-				return fmt.Errorf("create authored knowledge version: %w", err)
-			}
-			sources, err := service.createAuthoredSourcesTx(
-				scopedContext,
-				tx,
-				operation,
-				options,
-				access,
-			)
-			if err != nil {
-				return err
-			}
-			if err := tx.Create(&task).Error; err != nil {
-				return fmt.Errorf("create authored knowledge ingestion: %w", err)
-			}
-			if err := tx.Create(&chunks).Error; err != nil {
-				return fmt.Errorf("create authored knowledge chunks: %w", err)
-			}
-			if err := service.grantAuthoredArticleAccessTx(
-				tx,
-				operation,
-				article.ID,
-				input.GrantProjectAccess,
-			); err != nil {
-				return err
-			}
-			event, receipt, err := service.appendAuthoredDraftEventTx(
-				scopedContext,
-				tx,
-				operation,
-				article,
-				version,
-				len(sources),
-				options,
-				true,
-			)
-			if err != nil {
-				return err
-			}
-			if err := takeAuthoredObjectWriteIntentTx(
-				tx,
-				operation,
-				intent.ID,
-				stored,
-				now,
-			); err != nil {
-				return err
-			}
-			sourceViews := fullKnowledgeSourceViews(sources)
-			result = &AuthoredKnowledgeResult{
-				Article: article,
-				Version: version,
-				Sources: sourceViews,
-				Document: &KnowledgeArticleDocument{
-					Article:  article,
-					Version:  version,
-					Markdown: options.markdown,
-					Sections: parseAuthoredMarkdownSections(options.markdown),
-					Sources:  sourceViews,
-					sourceLinks: append(
-						[]models.KnowledgeSourceLink(nil),
-						sources...,
-					),
+				service.db,
+				func(tx *gorm.DB) error {
+					access, err := service.revalidateAuthoredWrite(
+						scopedContext,
+						operation,
+						options,
+					)
+					if err != nil {
+						return err
+					}
+					if err := tx.Create(&article).Error; err != nil {
+						return fmt.Errorf(
+							"create authored knowledge article: %w",
+							err,
+						)
+					}
+					if err := tx.Create(&version).Error; err != nil {
+						return fmt.Errorf(
+							"create authored knowledge version: %w",
+							err,
+						)
+					}
+					sources, err := service.createAuthoredSourcesTx(
+						scopedContext,
+						tx,
+						operation,
+						options,
+						access,
+					)
+					if err != nil {
+						return err
+					}
+					if err := tx.Create(&task).Error; err != nil {
+						return fmt.Errorf(
+							"create authored knowledge ingestion: %w",
+							err,
+						)
+					}
+					if err := tx.Create(&chunks).Error; err != nil {
+						return fmt.Errorf(
+							"create authored knowledge chunks: %w",
+							err,
+						)
+					}
+					if err := service.grantAuthoredArticleAccessTx(
+						tx,
+						operation,
+						article.ID,
+						input.GrantProjectAccess,
+					); err != nil {
+						return err
+					}
+					event, receipt, err := service.appendAuthoredDraftEventTx(
+						scopedContext,
+						tx,
+						operation,
+						article,
+						version,
+						len(sources),
+						options,
+						true,
+					)
+					if err != nil {
+						return err
+					}
+					if err := takeAuthoredObjectWriteIntentTx(
+						tx,
+						operation,
+						intent.ID,
+						stored,
+						now,
+					); err != nil {
+						return err
+					}
+					sourceViews := fullKnowledgeSourceViews(sources)
+					result = &AuthoredKnowledgeResult{
+						Article: article,
+						Version: version,
+						Sources: sourceViews,
+						Document: &KnowledgeArticleDocument{
+							Article:  article,
+							Version:  version,
+							Markdown: options.markdown,
+							Sections: parseAuthoredMarkdownSections(
+								options.markdown,
+							),
+							Sources: sourceViews,
+							sourceLinks: append(
+								[]models.KnowledgeSourceLink(nil),
+								sources...,
+							),
+						},
+						Event:   event,
+						Receipt: receipt,
+					}
+					return nil
 				},
-				Event:   event,
-				Receipt: receipt,
-			}
-			return nil
+			)
 		},
 	)
 	if transactionErr != nil {
@@ -566,108 +585,127 @@ func (service *KnowledgeService) CreateAuthoredVersion(
 		service.db,
 		operation.Scope,
 		func(scopedContext context.Context) error {
-			tx := service.db.WithContext(scopedContext)
-			access, err := service.revalidateAuthoredWrite(
+			return transactionForContext(
 				scopedContext,
-				operation,
-				options,
-			)
-			if err != nil {
-				return err
-			}
-			var article models.KnowledgeArticle
-			if err := knowledgeScopedQuery(tx, operation.Scope).
-				Clauses(clause.Locking{Strength: "UPDATE"}).
-				Where(
-					"id = ? AND status = ?",
-					articleID,
-					models.KnowledgeArticleActive,
-				).
-				First(&article).Error; err != nil {
-				return knowledgeLookupError(err)
-			}
-			var maximum struct{ Version uint64 }
-			if err := knowledgeScopedQuery(
-				tx.Model(&models.KnowledgeArticleVersion{}),
-				operation.Scope,
-			).Select("COALESCE(MAX(version), 0) AS version").
-				Where("article_id = ?", article.ID).
-				Scan(&maximum).Error; err != nil {
-				return fmt.Errorf("select authored knowledge version: %w", err)
-			}
-			version, task, chunks, err :=
-				service.prepareAuthoredVersionRecords(
-					operation,
-					options,
-					maximum.Version+1,
-					stored,
-					objectKey,
-					now,
-				)
-			if err != nil {
-				return err
-			}
-			if err := tx.Create(&version).Error; err != nil {
-				return fmt.Errorf("create authored knowledge version: %w", err)
-			}
-			sources, err := service.createAuthoredSourcesTx(
-				scopedContext,
-				tx,
-				operation,
-				options,
-				access,
-			)
-			if err != nil {
-				return err
-			}
-			if err := tx.Create(&task).Error; err != nil {
-				return fmt.Errorf("create authored knowledge ingestion: %w", err)
-			}
-			if err := tx.Create(&chunks).Error; err != nil {
-				return fmt.Errorf("create authored knowledge chunks: %w", err)
-			}
-			event, receipt, err := service.appendAuthoredDraftEventTx(
-				scopedContext,
-				tx,
-				operation,
-				article,
-				version,
-				len(sources),
-				options,
-				false,
-			)
-			if err != nil {
-				return err
-			}
-			if err := takeAuthoredObjectWriteIntentTx(
-				tx,
-				operation,
-				intent.ID,
-				stored,
-				now,
-			); err != nil {
-				return err
-			}
-			sourceViews := fullKnowledgeSourceViews(sources)
-			result = &AuthoredKnowledgeResult{
-				Article: article,
-				Version: version,
-				Sources: sourceViews,
-				Document: &KnowledgeArticleDocument{
-					Article:  article,
-					Version:  version,
-					Markdown: options.markdown,
-					Sections: parseAuthoredMarkdownSections(options.markdown),
-					Sources:  sourceViews,
-					sourceLinks: append(
-						[]models.KnowledgeSourceLink(nil),
-						sources...,
-					),
+				service.db,
+				func(tx *gorm.DB) error {
+					access, err := service.revalidateAuthoredWrite(
+						scopedContext,
+						operation,
+						options,
+					)
+					if err != nil {
+						return err
+					}
+					var article models.KnowledgeArticle
+					if err := knowledgeScopedQuery(tx, operation.Scope).
+						Clauses(clause.Locking{Strength: "UPDATE"}).
+						Where(
+							"id = ? AND status = ?",
+							articleID,
+							models.KnowledgeArticleActive,
+						).
+						First(&article).Error; err != nil {
+						return knowledgeLookupError(err)
+					}
+					var maximum struct{ Version uint64 }
+					if err := knowledgeScopedQuery(
+						tx.Model(&models.KnowledgeArticleVersion{}),
+						operation.Scope,
+					).Select("COALESCE(MAX(version), 0) AS version").
+						Where("article_id = ?", article.ID).
+						Scan(&maximum).Error; err != nil {
+						return fmt.Errorf(
+							"select authored knowledge version: %w",
+							err,
+						)
+					}
+					version, task, chunks, err :=
+						service.prepareAuthoredVersionRecords(
+							operation,
+							options,
+							maximum.Version+1,
+							stored,
+							objectKey,
+							now,
+						)
+					if err != nil {
+						return err
+					}
+					if err := tx.Create(&version).Error; err != nil {
+						return fmt.Errorf(
+							"create authored knowledge version: %w",
+							err,
+						)
+					}
+					sources, err := service.createAuthoredSourcesTx(
+						scopedContext,
+						tx,
+						operation,
+						options,
+						access,
+					)
+					if err != nil {
+						return err
+					}
+					if err := tx.Create(&task).Error; err != nil {
+						return fmt.Errorf(
+							"create authored knowledge ingestion: %w",
+							err,
+						)
+					}
+					if err := tx.Create(&chunks).Error; err != nil {
+						return fmt.Errorf(
+							"create authored knowledge chunks: %w",
+							err,
+						)
+					}
+					event, receipt, err := service.appendAuthoredDraftEventTx(
+						scopedContext,
+						tx,
+						operation,
+						article,
+						version,
+						len(sources),
+						options,
+						false,
+					)
+					if err != nil {
+						return err
+					}
+					if err := takeAuthoredObjectWriteIntentTx(
+						tx,
+						operation,
+						intent.ID,
+						stored,
+						now,
+					); err != nil {
+						return err
+					}
+					sourceViews := fullKnowledgeSourceViews(sources)
+					result = &AuthoredKnowledgeResult{
+						Article: article,
+						Version: version,
+						Sources: sourceViews,
+						Document: &KnowledgeArticleDocument{
+							Article:  article,
+							Version:  version,
+							Markdown: options.markdown,
+							Sections: parseAuthoredMarkdownSections(
+								options.markdown,
+							),
+							Sources: sourceViews,
+							sourceLinks: append(
+								[]models.KnowledgeSourceLink(nil),
+								sources...,
+							),
+						},
+						Event:   event,
+						Receipt: receipt,
+					}
+					return nil
 				},
-				Event:   event,
-				Receipt: receipt,
-			}
-			return nil
+			)
 		},
 	)
 	if transactionErr != nil {

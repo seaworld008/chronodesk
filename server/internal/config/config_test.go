@@ -26,6 +26,30 @@ func TestCORSConfigFromEnv(t *testing.T) {
 	}
 }
 
+func TestBackupCodeRegenerationRateLimitDefaultsAndOverrides(t *testing.T) {
+	t.Setenv("OTP_BACKUP_CODE_RATE_LIMIT_REQUESTS", "")
+	t.Setenv("OTP_BACKUP_CODE_RATE_LIMIT_WINDOW", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RateLimit.BackupCodeRequests != 5 ||
+		cfg.RateLimit.BackupCodeWindow != 15*time.Minute {
+		t.Fatalf("backup-code limiter defaults = %+v", cfg.RateLimit)
+	}
+
+	t.Setenv("OTP_BACKUP_CODE_RATE_LIMIT_REQUESTS", "3")
+	t.Setenv("OTP_BACKUP_CODE_RATE_LIMIT_WINDOW", "20m")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RateLimit.BackupCodeRequests != 3 ||
+		cfg.RateLimit.BackupCodeWindow != 20*time.Minute {
+		t.Fatalf("backup-code limiter overrides = %+v", cfg.RateLimit)
+	}
+}
+
 func TestTrustedProxiesRequireExplicitConfiguration(t *testing.T) {
 	t.Setenv("TRUSTED_PROXIES", "")
 	cfg, err := Load()
@@ -115,6 +139,8 @@ func TestValidateProductionRequiresStrongIndependentSecrets(t *testing.T) {
 			AnonymousIdentityRequests: 20,
 			AnonymousIPRequests:       200,
 			AnonymousWindow:           time.Minute,
+			BackupCodeRequests:        5,
+			BackupCodeWindow:          15 * time.Minute,
 		},
 		AuditExport: AuditExportConfig{
 			StorageBackend:      "local",
@@ -219,6 +245,8 @@ func TestValidateAuditExportLocalDeploymentTopology(t *testing.T) {
 			AnonymousIdentityRequests: 20,
 			AnonymousIPRequests:       200,
 			AnonymousWindow:           time.Minute,
+			BackupCodeRequests:        5,
+			BackupCodeWindow:          15 * time.Minute,
 		},
 		AuditExport: AuditExportConfig{
 			StorageBackend:      "local",
@@ -785,6 +813,8 @@ func TestValidate_AgentEndpointContract(t *testing.T) {
 			AnonymousIdentityRequests: 20,
 			AnonymousIPRequests:       200,
 			AnonymousWindow:           time.Minute,
+			BackupCodeRequests:        5,
+			BackupCodeWindow:          15 * time.Minute,
 		},
 	}
 	if err := valid.Validate(); err != nil {
@@ -878,6 +908,20 @@ func TestValidate_AgentEndpointContract(t *testing.T) {
 			name: "anonymous rate limit window is not positive",
 			mutate: func(cfg *Config) {
 				cfg.RateLimit.AnonymousWindow = 0
+			},
+			wantErr: "rate limit requests and windows must be positive",
+		},
+		{
+			name: "backup-code rate limit count is not positive",
+			mutate: func(cfg *Config) {
+				cfg.RateLimit.BackupCodeRequests = 0
+			},
+			wantErr: "rate limit requests and windows must be positive",
+		},
+		{
+			name: "backup-code rate limit window is not positive",
+			mutate: func(cfg *Config) {
+				cfg.RateLimit.BackupCodeWindow = 0
 			},
 			wantErr: "rate limit requests and windows must be positive",
 		},

@@ -12,6 +12,7 @@ import { monitorBrowserHealth } from './helpers/browserAudit'
 type ProjectRole = 'project_admin' | 'manager' | 'observer'
 
 const timestamp = '2026-08-01T08:00:00Z'
+const outboxDeliveryID = '00000000-0000-7000-8000-000000000110'
 
 const connection = {
   id: '00000000-0000-7000-8000-000000000101',
@@ -38,7 +39,11 @@ const directory = <T,>(items: T[], page = 1, total = items.length) => ({
 const installIntegrationBackend = async (
   page: Page,
   role: ProjectRole,
-  options: { holdOpsSecondPage?: boolean } = {},
+  options: {
+    holdOpsSecondPage?: boolean
+    outboxStatus?: 'failed' | 'expired'
+    replayExpired?: boolean
+  } = {},
 ) => {
   const sessionID = `integration-${role}-${Date.now()}`
   await installMockSession(
@@ -54,6 +59,14 @@ const installIntegrationBackend = async (
     authorizedProjectAccess(projectB, role),
   ]
   const requests: URL[] = []
+  const adminOutboxRequests: URL[] = []
+  const replayRequests: {
+    idempotencyKey: string | null
+    ifMatch: string | null
+  }[] = []
+  let outboxReplayed = false
+  let outboxExpired = options.outboxStatus === 'expired'
+  let integrationOutboxLoads = 0
   let releaseOpsSecondPage: (() => void) | undefined
   const opsSecondPageGate = new Promise<void>((resolve) => {
     releaseOpsSecondPage = resolve
@@ -95,6 +108,80 @@ const installIntegrationBackend = async (
       candidate.project.key === projectKey)
     if (resource === 'context') {
       await fulfillJSON(route, { code: 0, data: access })
+      return
+    }
+    if (
+      resource === 'admin/agents/outbox'
+      && request.method() === 'GET'
+    ) {
+      adminOutboxRequests.push(url)
+      const requestedPage = Number(url.searchParams.get('page') ?? 1)
+      await fulfillJSON(route, {
+        code: 0,
+        data: {
+          items: requestedPage === 2 ? [{
+            id: outboxDeliveryID,
+            created_at: timestamp,
+            event_id: '00000000-0000-7000-8000-000000000109',
+            destination_type: 'webhook',
+            destination_label: 'Webhook',
+            status: outboxExpired ? 'expired' : 'failed',
+            attempts: 2,
+            next_attempt_at: timestamp,
+            last_error: '管理端错误详情不得显示在集成页面',
+            expires_at: timestamp,
+            expired_at: outboxExpired ? timestamp : null,
+            updated_at: timestamp,
+            resource_version: 7,
+          }] : [{
+            id: '00000000-0000-7000-8000-000000000999',
+            created_at: timestamp,
+            event_id: '00000000-0000-7000-8000-000000000998',
+            destination_type: 'notification',
+            destination_label: '项目通知',
+            status: 'succeeded',
+            attempts: 1,
+            next_attempt_at: timestamp,
+            last_error: '',
+            updated_at: timestamp,
+            resource_version: 2,
+          }],
+          total: 2,
+          page: requestedPage,
+          page_size: 100,
+          total_pages: 2,
+        },
+      })
+      return
+    }
+    if (
+      resource === `admin/agents/outbox/${outboxDeliveryID}/replay`
+      && request.method() === 'POST'
+    ) {
+      replayRequests.push({
+        idempotencyKey: request.headers()['idempotency-key'] ?? null,
+        ifMatch: request.headers()['if-match'] ?? null,
+      })
+      if (options.replayExpired) {
+        outboxExpired = true
+        await fulfillJSON(route, {
+          type: 'about:blank',
+          title: 'Conflict',
+          status: 409,
+          detail: 'outbox delivery replay deadline expired',
+          code: 'outbox_replay_expired',
+          request_id: 'integration-replay-expired',
+          retryable: false,
+        }, 409)
+        return
+      }
+      outboxReplayed = true
+      await fulfillJSON(route, {
+        code: 0,
+        data: {
+          replayed: true,
+        },
+      }, 202)
       return
     }
     if (!resource.startsWith('integrations')) {
@@ -305,18 +392,29 @@ const installIntegrationBackend = async (
       return
     }
     if (resource === 'integrations/outbox') {
+      integrationOutboxLoads += 1
       await fulfillJSON(route, {
         code: 0,
         data: directory([{
-          id: '00000000-0000-7000-8000-000000000110',
+          id: outboxDeliveryID,
           event_id: '00000000-0000-7000-8000-000000000109',
           destination_type: 'webhook',
           destination_label: 'Webhook',
-          status: 'failed',
-          attempts: 2,
+          status: outboxExpired
+            ? 'expired'
+            : outboxReplayed
+              ? 'pending'
+              : 'failed',
+          attempts: outboxReplayed ? 0 : 2,
           max_attempts: 8,
           next_attempt_at: timestamp,
-          last_error: '上游暂不可用',
+          last_error: outboxExpired
+            ? '投递截止时间已到'
+            : outboxReplayed
+              ? ''
+              : '上游暂不可用',
+          expires_at: timestamp,
+          expired_at: outboxExpired ? timestamp : null,
           created_at: timestamp,
           updated_at: timestamp,
         }]),
@@ -331,6 +429,9 @@ const installIntegrationBackend = async (
   })
 
   return {
+    adminOutboxRequests,
+    integrationOutboxLoads: () => integrationOutboxLoads,
+    replayRequests,
     requests,
     sessionID,
     releaseOpsSecondPage: () => releaseOpsSecondPage?.(),
@@ -385,6 +486,9 @@ test.describe('企业集成中心', () => {
         main.getByRole('table', { name: table, exact: true }),
       ).toBeVisible()
     }
+    await expect(
+      main.getByRole('button', { name: /重新投递/u }),
+    ).toHaveCount(0)
 
     await main.getByRole('tab', { name: 'Inbox 与同步', exact: true }).click()
     await main.getByRole('button', { name: '同步运行', exact: true }).click()
@@ -454,6 +558,10 @@ test.describe('企业集成中心', () => {
     await expect(
       main.getByRole('button', { name: /重新处理死信/u }),
     ).toHaveCount(0)
+    await main.getByRole('tab', { name: 'Outbox', exact: true }).click()
+    await expect(
+      main.getByRole('button', { name: /重新投递/u }),
+    ).toHaveCount(0)
   })
 
   test('INT-003：翻页发起服务端请求，项目切换取消旧页并清除陈旧数据', async ({
@@ -518,5 +626,146 @@ test.describe('企业集成中心', () => {
     const bodyWidth = await page.evaluate(() => document.body.scrollWidth)
     const viewportWidth = await page.evaluate(() => window.innerWidth)
     expect(bodyWidth).toBeLessThanOrEqual(viewportWidth)
+  })
+
+  test('INT-005：仅项目管理员可确认并按最新版本重新投递失败的 Outbox', async ({
+    page,
+  }) => {
+    const backend = await installIntegrationBackend(page, 'project_admin')
+    await page.goto('/#/integration-runtime')
+    const main = page.getByRole('main')
+    await main.getByRole('tab', { name: 'Outbox', exact: true }).click()
+    const replayButton = main.getByRole('button', {
+      name: `重新投递 ${outboxDeliveryID}`,
+      exact: true,
+    })
+    await expect(replayButton).toBeVisible()
+    await expect(main.getByText('上游暂不可用', { exact: true })).toBeVisible()
+    await expect(
+      main.getByText('管理端错误详情不得显示在集成页面', { exact: true }),
+    ).toHaveCount(0)
+
+    await replayButton.focus()
+    await page.keyboard.press('Enter')
+    const dialog = page.getByRole('dialog', { name: '确认重新投递' })
+    await expect(dialog).toBeVisible()
+    await expect(dialog.getByText(/按事件 ID 去重/u)).toBeVisible()
+    expect(backend.replayRequests).toHaveLength(0)
+
+    await dialog.getByRole('button', {
+      name: '确认重新投递',
+      exact: true,
+    }).click()
+    await expect(
+      page.getByText('事件投递已重新排队', { exact: true }),
+    ).toBeVisible()
+    await expect.poll(() => backend.integrationOutboxLoads()).toBeGreaterThan(1)
+    await expect(replayButton).toHaveCount(0)
+
+    expect(backend.adminOutboxRequests).toHaveLength(2)
+    expect(
+      backend.adminOutboxRequests.map((url) =>
+        url.searchParams.get('page')),
+    ).toEqual(['1', '2'])
+    for (const url of backend.adminOutboxRequests) {
+      expect(url.searchParams.get('page_size')).toBe('100')
+      expect(url.searchParams.get('sort_by')).toBe('created_at')
+      expect(url.searchParams.get('sort_order')).toBe('desc')
+    }
+    expect(backend.replayRequests).toHaveLength(1)
+    expect(backend.replayRequests[0].ifMatch).toBe('"v7"')
+    expect(backend.replayRequests[0].idempotencyKey).toBeTruthy()
+  })
+
+  test('INT-006：已过期投递显示中文终态且永不发起回放', async ({
+    page,
+  }) => {
+    const backend = await installIntegrationBackend(
+      page,
+      'project_admin',
+      { outboxStatus: 'expired' },
+    )
+    await page.goto('/#/integration-runtime')
+    const main = page.getByRole('main')
+    const outboxResponse = page.waitForResponse((response) =>
+      response.request().method() === 'GET'
+      && new URL(response.url()).pathname.endsWith(
+        '/integrations/outbox',
+      ))
+    await main.getByRole('tab', { name: 'Outbox', exact: true }).click()
+    const projection = await (await outboxResponse).json() as {
+      data: { items: Array<Record<string, unknown>> }
+    }
+    const projectedRow = projection.data.items[0]
+    expect(projectedRow.status).toBe('expired')
+    expect(projectedRow.expires_at).toBe(timestamp)
+    expect(projectedRow.expired_at).toBe(timestamp)
+    for (const forbidden of [
+      'destination_id',
+      'snapshot_id',
+      'locked_at',
+      'locked_by',
+      'lock_token',
+      'generation',
+      'credential',
+      'url',
+      'headers',
+    ]) {
+      expect(projectedRow).not.toHaveProperty(forbidden)
+    }
+
+    await expect(
+      main.getByText('已过期', { exact: true }),
+    ).toBeVisible()
+    await expect(
+      main.getByRole('button', {
+        name: `重新投递 ${outboxDeliveryID}`,
+        exact: true,
+      }),
+    ).toHaveCount(0)
+    expect(backend.replayRequests).toHaveLength(0)
+  })
+
+  test('INT-007：回放与到期竞态显示稳定消息并安全刷新终态', async ({
+    page,
+  }) => {
+    const backend = await installIntegrationBackend(
+      page,
+      'project_admin',
+      { replayExpired: true },
+    )
+    await page.goto('/#/integration-runtime')
+    const main = page.getByRole('main')
+    await main.getByRole('tab', { name: 'Outbox', exact: true }).click()
+    await main.getByRole('button', {
+      name: `重新投递 ${outboxDeliveryID}`,
+      exact: true,
+    }).click()
+    await page.getByRole('dialog', {
+      name: '确认重新投递',
+    }).getByRole('button', {
+      name: '确认重新投递',
+      exact: true,
+    }).click()
+
+    await expect(
+      page.getByText(
+        '该投递已过期或凭据已撤销，无法回放',
+        { exact: true },
+      ),
+    ).toBeVisible()
+    await expect.poll(
+      () => backend.integrationOutboxLoads(),
+    ).toBeGreaterThan(1)
+    await expect(
+      main.getByText('已过期', { exact: true }),
+    ).toBeVisible()
+    await expect(
+      main.getByRole('button', {
+        name: `重新投递 ${outboxDeliveryID}`,
+        exact: true,
+      }),
+    ).toHaveCount(0)
+    expect(backend.replayRequests).toHaveLength(1)
   })
 })

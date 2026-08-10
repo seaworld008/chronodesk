@@ -5,8 +5,12 @@ import {
   signalProjectAccessInvalidated,
   signalProjectAccessRefreshRequested,
   signalSessionInvalidated,
+  signalSessionReplaced,
 } from './projectScopeEvents'
 import { joinApiUrl } from './apiUrl'
+import {
+  resolveHumanBearerForRequest,
+} from './humanTabSession'
 
 export type ApiOptions = RequestInit & { rawResponse?: boolean }
 
@@ -24,7 +28,15 @@ export const sessionAwareFetch = async (
   input: RequestInfo | URL,
   init?: RequestInit,
 ): Promise<Response> => {
-  const response = await fetch(input, init)
+  const requestHeaders = new Headers(
+    init?.headers ??
+      (input instanceof Request ? input.headers : undefined),
+  )
+  const authorization = requestHeaders.get('Authorization')
+  if (authorization?.startsWith('Bearer ')) {
+    requireCommittedHumanBearerHeaders(requestHeaders)
+  }
+  const response = await fetch(input, { ...init, headers: requestHeaders })
   const path = requestPath(input)
   if (response.status === 401) {
     signalSessionInvalidated()
@@ -37,6 +49,23 @@ export const sessionAwareFetch = async (
     }
   }
   return response
+}
+
+export const requireCommittedHumanBearerHeaders = (
+  headers: Headers,
+): Headers => {
+  const authorization = headers.get('Authorization')
+  const capturedAccessToken = authorization?.startsWith('Bearer ')
+    ? authorization.slice('Bearer '.length)
+    : ''
+  const committedAccessToken =
+    resolveHumanBearerForRequest(capturedAccessToken)
+  if (committedAccessToken === null) {
+    signalSessionReplaced()
+    throw new Error('登录账号已在其他标签页发生变化，请刷新后继续')
+  }
+  headers.set('Authorization', `Bearer ${committedAccessToken}`)
+  return headers
 }
 
 type JsonRecord = Record<string, unknown>
@@ -81,6 +110,7 @@ const problemMessages: Record<string, string> = {
   service_unavailable: '安全执行保护暂时不可用，请稍后重试',
   automation_loop: '检测到异常自动化循环，操作已停止',
   outbox_replay_conflict: '该投递当前无法回放，请刷新状态后重试',
+  outbox_replay_expired: '该投递已过期或凭据已撤销，无法回放',
   attachment_rejected: '附件未通过安全校验，无法继续处理',
   ticket_configuration_unavailable: '当前项目没有完整的已发布建单配置',
   request_type_version_required: '请选择当前项目已发布的请求类型',

@@ -62,7 +62,15 @@ import {
 import {
     type AccessPermissions,
 } from '@/lib/accessControl';
-import { hasProjectCapability } from '@/lib/projectScope';
+import {
+    hasExactProjectRole,
+    hasProjectCapability,
+} from '@/lib/projectScope';
+import {
+    MarkAllNotificationsReadButton,
+    NotificationRowActions,
+} from './NotificationActions';
+import { NotificationPreferencesButton } from './NotificationPreferencesDialog';
 
 // 通知类型选项
 const notificationTypeChoices = [
@@ -106,6 +114,13 @@ const notificationColumns: ResizableColumn[] = [
     { key: 'created_at', defaultWidth: 184, minWidth: 144, maxWidth: 280 },
     { key: 'read_at', defaultWidth: 184, minWidth: 144, maxWidth: 280 },
     { key: 'column-11', defaultWidth: 132, minWidth: 104, maxWidth: 200 },
+    {
+        key: 'column-12',
+        defaultWidth: 112,
+        minWidth: 88,
+        maxWidth: 160,
+        sticky: 'right',
+    },
 ];
 
 /**
@@ -411,6 +426,8 @@ const NotificationListActions = ({
 }) => (
     <TopToolbar>
         {canCreate && <CreateButton label="创建通知" />}
+        <MarkAllNotificationsReadButton />
+        <NotificationPreferencesButton />
         <FilterButton />
         <ExportButton label="导出" />
     </TopToolbar>
@@ -436,13 +453,19 @@ const NotificationEmpty = ({
                 }}>
                     当前没有任何通知记录。当系统产生通知时，它们会出现在这里。
                 </Typography>
-                {canCreate && (
-                    <CreateButton
-                        label="创建通知"
-                        variant="contained"
-                        sx={{ mt: 3 }}
-                    />
-                )}
+                <Stack
+                    direction={{ xs: 'column', sm: 'row' }}
+                    spacing={1}
+                    sx={{ justifyContent: 'center', mt: 3 }}
+                >
+                    {canCreate && (
+                        <CreateButton
+                            label="创建通知"
+                            variant="contained"
+                        />
+                    )}
+                    <NotificationPreferencesButton />
+                </Stack>
             </CardContent>
         </Card>
     </Box>
@@ -456,6 +479,10 @@ const NotificationList: React.FC = () => {
     const canManageNotifications = hasProjectCapability(
         permissions?.project_role,
         'manage_notifications',
+    );
+    const canDeleteNotifications = hasExactProjectRole(
+        permissions?.project_role,
+        ['project_admin'],
     );
     const filters = useMemo(() => buildNotificationFilters(), []);
 
@@ -623,6 +650,12 @@ const NotificationList: React.FC = () => {
                         );
                     }}
                 />
+
+                <WrapperField label="操作">
+                    <NotificationRowActions
+                        canDelete={canDeleteNotifications}
+                    />
+                </WrapperField>
             </EnterpriseDatagrid>
         </List>
     );

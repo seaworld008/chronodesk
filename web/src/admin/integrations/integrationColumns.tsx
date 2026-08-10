@@ -557,6 +557,22 @@ export const outboxColumns: IntegrationColumn<OutboxSummary>[] = [
     maxWidth: 600,
     render: (row) => text(row.last_error ?? ''),
   },
+  {
+    key: 'expires',
+    label: '截止时间',
+    defaultWidth: 188,
+    minWidth: 160,
+    maxWidth: 260,
+    render: (row) => formatDate(row.expires_at ?? undefined),
+  },
+  {
+    key: 'expired',
+    label: '过期时间',
+    defaultWidth: 188,
+    minWidth: 160,
+    maxWidth: 260,
+    render: (row) => formatDate(row.expired_at ?? undefined),
+  },
 ]
 
 export { formatDate }

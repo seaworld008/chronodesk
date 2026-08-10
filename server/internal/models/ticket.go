@@ -1,6 +1,8 @@
 package models
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -333,6 +335,52 @@ type TicketCreateRequest struct {
 	AgentContext         *AgentContext  `json:"agent_context"`
 }
 
+// OptionalTime preserves the distinction between an omitted JSON property,
+// an explicit null, and a concrete timestamp.
+type OptionalTime struct {
+	value *time.Time
+	set   bool
+}
+
+// NewOptionalTime constructs an explicitly present nullable timestamp.
+func NewOptionalTime(value *time.Time) OptionalTime {
+	return OptionalTime{value: value, set: true}
+}
+
+// Value returns the nullable timestamp and whether the property was present.
+func (value OptionalTime) Value() (*time.Time, bool) {
+	return value.value, value.set
+}
+
+// IsZero lets encoding/json omit an OptionalTime that was not provided.
+func (value OptionalTime) IsZero() bool {
+	return !value.set
+}
+
+// UnmarshalJSON records property presence while retaining JSON null.
+func (value *OptionalTime) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		value.value = nil
+		value.set = true
+		return nil
+	}
+	var parsed time.Time
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return err
+	}
+	value.value = &parsed
+	value.set = true
+	return nil
+}
+
+// MarshalJSON emits either the concrete timestamp or JSON null.
+func (value OptionalTime) MarshalJSON() ([]byte, error) {
+	if value.value == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(value.value)
+}
+
 // TicketUpdateRequest 工单更新请求
 type TicketUpdateRequest struct {
 	Title         *string         `json:"title" binding:"omitempty,min=1,max=255"`
@@ -345,7 +393,7 @@ type TicketUpdateRequest struct {
 	CategoryID    *uint           `json:"category_id"`
 	SubcategoryID *uint           `json:"subcategory_id"`
 	Tags          StringList      `json:"tags"`
-	DueDate       *time.Time      `json:"due_date"`
+	DueDate       OptionalTime    `json:"due_date,omitzero"`
 	CustomerEmail *string         `json:"customer_email"`
 	CustomerPhone *string         `json:"customer_phone"`
 	CustomerName  *string         `json:"customer_name"`

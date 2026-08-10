@@ -34,6 +34,16 @@ interface EmailForm extends EmailConfig {
 
 type TestForm = TestEmailRequest
 
+type EmailConfigFieldErrors = {
+  smtp_host?: string
+  from_email?: string
+}
+
+type EmailConfigFailure = {
+  message: string
+  field?: keyof EmailConfigFieldErrors
+}
+
 const defaultTestForm: TestForm = {
   to_email: '',
   subject: '测试邮件',
@@ -48,6 +58,28 @@ const EmailSettingsHeader = () => (
   />
 )
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null
+
+const emailConfigFailure = (
+  error: unknown,
+  fallback: string,
+): EmailConfigFailure => {
+  const errorRecord = isRecord(error) ? error : null
+  const body = isRecord(errorRecord?.body) ? errorRecord.body : null
+  const code = typeof body?.msg === 'string' ? body.msg : ''
+  const detail = typeof body?.data === 'string' ? body.data : ''
+  const message = detail || localizedUnknownErrorMessage(error, fallback)
+
+  if (code === 'invalid_smtp_host') {
+    return { message, field: 'smtp_host' }
+  }
+  if (code === 'invalid_from_email') {
+    return { message, field: 'from_email' }
+  }
+  return { message }
+}
+
 const EmailSettings: React.FC = () => {
   const notify = useNotify()
   const [loading, setLoading] = useState(true)
@@ -57,6 +89,9 @@ const EmailSettings: React.FC = () => {
   const [config, setConfig] = useState<EmailForm | null>(null)
   const [originalConfig, setOriginalConfig] = useState<EmailForm | null>(null)
   const [testForm, setTestForm] = useState<TestForm>(defaultTestForm)
+  const [saveError, setSaveError] = useState('')
+  const [fieldErrors, setFieldErrors] = useState<EmailConfigFieldErrors>({})
+  const [testError, setTestError] = useState('')
   const shouldSkipSMTPTest = import.meta.env.DEV || import.meta.env.VITE_DEV_MODE === 'true'
 
   const extractErrorMessage = useCallback((error: unknown, fallback: string) => {
@@ -66,6 +101,8 @@ const EmailSettings: React.FC = () => {
   const loadConfig = useCallback(async () => {
     try {
       setLoading(true)
+      setSaveError('')
+      setFieldErrors({})
       const data = await apiFetch<EmailConfig>(
         humanApiRoutes.getPlatformEmailConfig(),
       )
@@ -88,11 +125,17 @@ const EmailSettings: React.FC = () => {
   const handleChange = <K extends keyof EmailForm>(key: K, value: EmailForm[K]) => {
     if (!config) return
     setConfig({ ...config, [key]: value })
+    setSaveError('')
+    if (key === 'smtp_host' || key === 'from_email') {
+      setFieldErrors((previous) => ({ ...previous, [key]: '' }))
+    }
   }
 
   const handleSave = async () => {
     if (!config) return
     setSaving(true)
+    setSaveError('')
+    setFieldErrors({})
     try {
       const payload: Record<string, unknown> = {
         email_verification_enabled: config.email_verification_enabled,
@@ -120,12 +163,19 @@ const EmailSettings: React.FC = () => {
       })
 
       notify('邮件配置保存成功', { type: 'success' })
+      setSaveError('')
+      setFieldErrors({})
       setOriginalConfig({ ...config })
       if (config.smtp_password) {
         setConfig({ ...config, smtp_password: '' })
       }
     } catch (error: unknown) {
-      notify(extractErrorMessage(error, '保存邮件配置失败'), { type: 'error' })
+      const failure = emailConfigFailure(error, '保存邮件配置失败')
+      setSaveError(failure.message)
+      if (failure.field) {
+        setFieldErrors({ [failure.field]: failure.message })
+      }
+      notify(failure.message, { type: 'error' })
     } finally {
       setSaving(false)
     }
@@ -133,15 +183,22 @@ const EmailSettings: React.FC = () => {
 
   const handleTest = async () => {
     setTesting(true)
+    setTestError('')
     try {
       await apiFetch(humanApiRoutes.testPlatformEmailConfig(), {
         method: 'POST',
         body: JSON.stringify(testForm),
       })
       notify('测试邮件发送成功，请检查收件箱', { type: 'success' })
+      setTestError('')
       setTestDialogOpen(false)
     } catch (error: unknown) {
-      notify(extractErrorMessage(error, '测试邮件发送失败'), { type: 'error' })
+      const message = emailConfigFailure(
+        error,
+        '测试邮件发送失败',
+      ).message
+      setTestError(message)
+      notify(message, { type: 'error' })
     } finally {
       setTesting(false)
     }
@@ -199,6 +256,15 @@ const EmailSettings: React.FC = () => {
   return (
     <PageShell title="平台邮件设置" testId="email-settings-page-shell">
       <EmailSettingsHeader />
+      {saveError && (
+        <Alert
+          severity="error"
+          data-testid="email-config-save-error"
+          sx={{ mb: 2 }}
+        >
+          {saveError}
+        </Alert>
+      )}
       <Paper sx={{ p: 3, mb: 3 }}>
         <Stack
           direction="row"
@@ -207,10 +273,19 @@ const EmailSettings: React.FC = () => {
             alignItems: "center",
             mb: 2
           }}>
-          <FormControlLabel
-            control={<Switch checked={config.email_verification_enabled} onChange={(e) => handleChange('email_verification_enabled', e.target.checked)} />}
-            label="启用邮件功能"
-          />
+          <Box>
+            <FormControlLabel
+              control={<Switch checked={config.email_verification_enabled} onChange={(e) => handleChange('email_verification_enabled', e.target.checked)} />}
+              label="新注册用户必须验证邮箱"
+            />
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              sx={{ display: 'block' }}
+            >
+              此开关仅控制注册验证与未验证账号登录；邮件发送能力由 SMTP 配置完整性和状态决定。
+            </Typography>
+          </Box>
           {config.is_configured ? (
             <Chip label="配置完整" color="success" size="small" />
           ) : (
@@ -234,6 +309,11 @@ const EmailSettings: React.FC = () => {
               label="SMTP 主机"
               value={config.smtp_host}
               onChange={(e) => handleChange('smtp_host', e.target.value)}
+              error={Boolean(fieldErrors.smtp_host)}
+              helperText={
+                fieldErrors.smtp_host
+                || '支持主机名、IPv4 和未加方括号的 IPv6 地址'
+              }
             />
           </Grid>
           <Grid
@@ -304,6 +384,8 @@ const EmailSettings: React.FC = () => {
               label="发件人邮箱"
               value={config.from_email}
               onChange={(e) => handleChange('from_email', e.target.value)}
+              error={Boolean(fieldErrors.from_email)}
+              helperText={fieldErrors.from_email || undefined}
             />
           </Grid>
           <Grid
@@ -389,6 +471,8 @@ const EmailSettings: React.FC = () => {
           onClick={() => {
             if (originalConfig) {
               setConfig({ ...originalConfig, smtp_password: '' })
+              setSaveError('')
+              setFieldErrors({})
             }
           }}
           disabled={!hasChanges}
@@ -397,7 +481,10 @@ const EmailSettings: React.FC = () => {
         </Button>
         <Button
           variant="outlined"
-          onClick={() => setTestDialogOpen(true)}
+          onClick={() => {
+            setTestError('')
+            setTestDialogOpen(true)
+          }}
           disabled={!config.can_send_email}
         >
           发送测试邮件
@@ -406,10 +493,23 @@ const EmailSettings: React.FC = () => {
           刷新
         </Button>
       </Stack>
-      <Dialog open={testDialogOpen} onClose={() => setTestDialogOpen(false)} maxWidth="sm" fullWidth>
+      <Dialog
+        open={testDialogOpen}
+        onClose={() => {
+          setTestError('')
+          setTestDialogOpen(false)
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
         <DialogTitle>发送测试邮件</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={2}>
+            {testError && (
+              <Alert severity="error" data-testid="email-test-error">
+                {testError}
+              </Alert>
+            )}
             <TextField
               label="收件人邮箱"
               value={testForm.to_email}
@@ -430,7 +530,14 @@ const EmailSettings: React.FC = () => {
           </Stack>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setTestDialogOpen(false)}>取消</Button>
+          <Button
+            onClick={() => {
+              setTestError('')
+              setTestDialogOpen(false)
+            }}
+          >
+            取消
+          </Button>
           <Button onClick={handleTest} variant="contained" disabled={testing}>
             {testing ? '发送中…' : '发送'}
           </Button>

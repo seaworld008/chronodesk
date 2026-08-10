@@ -123,6 +123,40 @@ func TestAuthFailureMappingsPublishContractedRuntimeStatuses(t *testing.T) {
 		name       string
 		err        error
 		wantStatus int
+	}{
+		{
+			name:       "invalid MFA step-up preserves the authenticated session",
+			err:        ErrInvalidOTP,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "expired MFA step-up preserves the authenticated session",
+			err:        ErrOTPExpired,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "MFA dependency failure",
+			err:        errors.New("OTP store unavailable"),
+			wantStatus: http.StatusInternalServerError,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status, message := verifyOTPFailureHTTPResponse(test.err)
+			if status != test.wantStatus || message == "" {
+				t.Fatalf(
+					"verify OTP failure = (%d, %q), want status %d",
+					status,
+					message,
+					test.wantStatus,
+				)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name       string
+		err        error
+		wantStatus int
 		wantCode   string
 	}{
 		{
@@ -176,7 +210,9 @@ func TestAuthFailureMappingsPublishContractedRuntimeStatuses(t *testing.T) {
 	}
 }
 
-func TestLogoutHandlersPublishClosedSuccessEnvelopesAndClearCookie(t *testing.T) {
+func TestLogoutHandlersPublishClosedSuccessEnvelopesAndPreserveTrustSemantics(
+	t *testing.T,
+) {
 	_, _, handler := setupSessionRevocationTest(t)
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
@@ -191,9 +227,18 @@ func TestLogoutHandlersPublishClosedSuccessEnvelopesAndClearCookie(t *testing.T)
 	for _, test := range []struct {
 		path        string
 		wantMessage string
+		clearsTrust bool
 	}{
-		{path: "/logout", wantMessage: "退出登录成功"},
-		{path: "/logout-all", wantMessage: "已从所有设备退出登录"},
+		{
+			path:        "/logout",
+			wantMessage: "退出登录成功",
+			clearsTrust: false,
+		},
+		{
+			path:        "/logout-all",
+			wantMessage: "已从所有设备退出登录",
+			clearsTrust: true,
+		},
 	} {
 		t.Run(test.path, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, test.path, nil)
@@ -213,10 +258,15 @@ func TestLogoutHandlersPublishClosedSuccessEnvelopesAndClearCookie(t *testing.T)
 				t.Fatalf("logout response = %v", body)
 			}
 			cookie := response.Header().Get("Set-Cookie")
-			if !strings.Contains(cookie, trustedDeviceCookieName+"=") ||
-				!strings.Contains(cookie, "Path="+trustedDeviceCookiePath) ||
-				!strings.Contains(cookie, "HttpOnly") ||
-				!strings.Contains(cookie, "SameSite=Strict") {
+			hasClearingCookie :=
+				strings.Contains(cookie, trustedDeviceCookieName+"=") &&
+					strings.Contains(
+						cookie,
+						"Path="+trustedDeviceCookiePath,
+					) &&
+					strings.Contains(cookie, "HttpOnly") &&
+					strings.Contains(cookie, "SameSite=Strict")
+			if hasClearingCookie != test.clearsTrust {
 				t.Fatalf("trusted-device clearing cookie = %q", cookie)
 			}
 		})
@@ -243,6 +293,19 @@ func TestHumanAuthHandlersRejectUnknownAndTrailingJSON(t *testing.T) {
 			payload: `{"email":"user@example.test","password":"secret"} {}`,
 		},
 		{
+			name:   "login rejects email beyond persistence limit",
+			handle: handler.Login,
+			payload: `{"email":"` +
+				strings.Repeat("a", 88) +
+				`@example.test","password":"secret"}`,
+		},
+		{
+			name:   "login rejects device name beyond persistence limit",
+			handle: handler.Login,
+			payload: `{"email":"user@example.test","password":"secret",` +
+				`"device_name":"` + strings.Repeat("设", 101) + `"}`,
+		},
+		{
 			name:    "refresh rejects permissions",
 			handle:  handler.RefreshToken,
 			payload: `{"refresh_token":"token","permissions":["admin"]}`,
@@ -251,6 +314,16 @@ func TestHumanAuthHandlersRejectUnknownAndTrailingJSON(t *testing.T) {
 			name:    "refresh rejects trailing JSON",
 			handle:  handler.RefreshToken,
 			payload: `{"refresh_token":"token"} {}`,
+		},
+		{
+			name:    "verify email rejects query-shaped compatibility fields",
+			handle:  handler.VerifyEmail,
+			payload: `{"token":"token","token_query":"legacy"}`,
+		},
+		{
+			name:    "verify email rejects trailing JSON",
+			handle:  handler.VerifyEmail,
+			payload: `{"token":"token"} {}`,
 		},
 		{
 			name:   "profile rejects historical role",
@@ -315,6 +388,101 @@ func TestHumanAuthHandlersRejectUnknownAndTrailingJSON(t *testing.T) {
 				)
 			}
 			assertClosedRuntimeAuthError(t, response.Body.Bytes(), "invalid_request")
+		})
+	}
+}
+
+func TestVerifyEmailRejectsLegacyHTTPQueryToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewAuthHandler(nil, nil)
+	router := gin.New()
+	router.POST("/verify-email", func(c *gin.Context) {
+		handler.VerifyEmail(NewGinHTTPContext(c))
+	})
+
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/verify-email?token=must-not-enter-http-query",
+		nil,
+	)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf(
+			"query-only verification status = %d; body=%s",
+			response.Code,
+			response.Body,
+		)
+	}
+	assertClosedRuntimeAuthError(
+		t,
+		response.Body.Bytes(),
+		"invalid_request",
+	)
+}
+
+func TestAuthenticationJSONBodyLimitRejectsKnownChunkedAndUnderstatedBodies(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	payload := `{"token":"` +
+		strings.Repeat("x", int(maxAuthenticationJSONBodyBytes)) +
+		`"}`
+	for _, testCase := range []struct {
+		name             string
+		configureRequest func(*http.Request)
+	}{
+		{
+			name: "known content length",
+		},
+		{
+			name: "chunked body",
+			configureRequest: func(request *http.Request) {
+				request.ContentLength = -1
+				request.TransferEncoding = []string{"chunked"}
+			},
+		},
+		{
+			name: "understated content length",
+			configureRequest: func(request *http.Request) {
+				request.ContentLength = 16
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			handler := NewAuthHandler(nil, nil)
+			router := gin.New()
+			router.POST("/", func(c *gin.Context) {
+				handler.VerifyEmail(NewGinHTTPContext(c))
+			})
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/",
+				strings.NewReader(payload),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			if testCase.configureRequest != nil {
+				testCase.configureRequest(request)
+			}
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			if response.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf(
+					"status = %d, want 413; body=%s",
+					response.Code,
+					response.Body.String(),
+				)
+			}
+			var body ErrorResponse
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Code != "request_too_large" ||
+				body.Error != "request_too_large" {
+				t.Fatalf("oversized body response = %+v", body)
+			}
 		})
 	}
 }

@@ -21,6 +21,7 @@ import (
 
 	"github.com/seaworld008/chronodesk/server/internal/agentauth"
 	"github.com/seaworld008/chronodesk/server/internal/httpcontract"
+	"github.com/seaworld008/chronodesk/server/internal/middleware"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/safeconv"
 	"github.com/seaworld008/chronodesk/server/internal/services"
@@ -1344,8 +1345,21 @@ func (h *AdminHandler) ReplayOutbox(c *gin.Context) {
 				First(&delivery).Error; err != nil {
 				return adminMutationResult{}, err
 			}
-			if err := h.native.ReplayOutbox(txCtx, delivery.ID); err != nil {
+			replay, err := h.native.ReplayOutboxCommand(
+				txCtx,
+				delivery.ID,
+			)
+			if err != nil {
 				return adminMutationResult{}, err
+			}
+			if replay.Disposition == services.OutboxReplayExpired {
+				if replay.Materialized {
+					return adminMutationResult{
+						AfterCommitError: services.ErrOutboxReplayExpired,
+					}, nil
+				}
+				return adminMutationResult{},
+					services.ErrOutboxReplayExpired
 			}
 			return adminMutationResult{
 				Data:          gin.H{"replayed": true},
@@ -1500,14 +1514,15 @@ func setOneTimeSecretResponseHeaders(c *gin.Context) {
 var errAdminEventPersistence = errors.New("persist administrator event")
 
 type adminMutationResult struct {
-	Data          any
-	EventName     string
-	Subject       string
-	ResourceID    string
-	Scope         models.ProjectScope
-	ChangedFields []string
-	PublicValues  map[string]any
-	AfterCommit   func()
+	Data             any
+	EventName        string
+	Subject          string
+	ResourceID       string
+	Scope            models.ProjectScope
+	ChangedFields    []string
+	PublicValues     map[string]any
+	AfterCommit      func()
+	AfterCommitError error
 }
 
 type adminMutationOptions struct {
@@ -1678,6 +1693,9 @@ func (h *AdminHandler) executeAdminMutation(
 			if err != nil {
 				return err
 			}
+			if result.AfterCommitError != nil {
+				return nil
+			}
 			if strings.TrimSpace(result.Subject) == "" || strings.TrimSpace(result.ResourceID) == "" {
 				return fmt.Errorf("%w: administrator mutation returned no resource identity", errAdminEventPersistence)
 			}
@@ -1765,6 +1783,32 @@ func (h *AdminHandler) executeAdminMutation(
 			c.Header("ETag", httpcontract.FormatETag(expectedVersion))
 		}
 		h.writeNativeError(c, err)
+		return
+	}
+	if result.AfterCommitError != nil {
+		_ = h.native.FailIdempotency(
+			c.Request.Context(),
+			reservation.Record.ID,
+			services.AgentNativeErrorCode(result.AfterCommitError),
+		)
+		if err := queueAdminNativeErrorAfterProjectCommit(
+			c,
+			result.AfterCommitError,
+			httpcontract.FormatETag(parentVersion),
+		); err == nil {
+			return
+		}
+		if middleware.ProjectAfterCommitQueueInstalled(c) {
+			WriteProblem(
+				c,
+				http.StatusInternalServerError,
+				ProblemInternal,
+				"Failed to queue committed administrator outcome",
+				true,
+			)
+			return
+		}
+		h.writeNativeError(c, result.AfterCommitError)
 		return
 	}
 	if result.AfterCommit != nil {
@@ -2213,6 +2257,13 @@ func safeAdminEventValues(values map[string]any) map[string]any {
 }
 
 func (h *AdminHandler) writeNativeError(c *gin.Context, err error) {
+	status, code, detail, retryable := adminNativeProblem(err)
+	WriteProblem(c, status, code, detail, retryable)
+}
+
+func adminNativeProblem(
+	err error,
+) (int, string, string, bool) {
 	code := services.AgentNativeErrorCode(err)
 	status := http.StatusBadRequest
 	retryable := false
@@ -2243,8 +2294,43 @@ func (h *AdminHandler) writeNativeError(c *gin.Context, err error) {
 		status, code = http.StatusConflict, ProblemLeaseConflict
 	case errors.Is(err, services.ErrOutboxReplayConflict):
 		status, code = http.StatusConflict, ProblemOutboxConflict
+	case errors.Is(err, services.ErrOutboxReplayExpired):
+		status, code = http.StatusConflict, ProblemOutboxExpired
 	case errors.Is(err, services.ErrIdempotencyConflict), errors.Is(err, services.ErrIdempotencyInProgress):
 		status, code = http.StatusConflict, ProblemIdempotencyConflict
 	}
-	WriteProblem(c, status, code, err.Error(), retryable)
+	return status, code, err.Error(), retryable
+}
+
+func queueAdminNativeErrorAfterProjectCommit(
+	c *gin.Context,
+	err error,
+	etag string,
+) error {
+	status, code, detail, retryable := adminNativeProblem(err)
+	body, marshalErr := json.Marshal(Problem{
+		Type:      "https://chronodesk.local/problems/" + code,
+		Title:     strings.ReplaceAll(code, "_", " "),
+		Status:    status,
+		Detail:    detail,
+		Code:      code,
+		RequestID: RequestID(c),
+		Retryable: retryable,
+	})
+	if marshalErr != nil {
+		return marshalErr
+	}
+	header := make(http.Header)
+	if strings.TrimSpace(etag) != "" {
+		header.Set("ETag", etag)
+	}
+	return middleware.QueueProjectAfterCommitResponse(
+		c,
+		middleware.ProjectAfterCommitResponse{
+			Status:      status,
+			ContentType: "application/problem+json",
+			Header:      header,
+			Body:        body,
+		},
+	)
 }

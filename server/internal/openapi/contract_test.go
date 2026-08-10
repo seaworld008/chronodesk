@@ -736,6 +736,77 @@ func TestSpecificationIsStableAgentContract(t *testing.T) {
 	assertMCPResourceBoundTokenContract(t, paths, schemas)
 }
 
+func TestOutboxReplayPublishesFiniteSafeExpiredContract(t *testing.T) {
+	var document map[string]any
+	if err := yaml.Unmarshal(Specification(), &document); err != nil {
+		t.Fatal(err)
+	}
+	components := contractMap(t, document["components"], "components")
+	schemas := contractMap(t, components["schemas"], "components.schemas")
+	problem := contractMap(t, schemas["Problem"], "Problem")
+	problemProperties := contractMap(
+		t,
+		problem["properties"],
+		"Problem.properties",
+	)
+	code := contractMap(t, problemProperties["code"], "Problem.code")
+	if !contractSliceContains(code["enum"], "outbox_replay_expired") {
+		t.Fatal("Problem.code omits outbox_replay_expired")
+	}
+
+	outbox := contractMap(
+		t,
+		schemas["AdminOutboxDeliverySummary"],
+		"AdminOutboxDeliverySummary",
+	)
+	if outbox["additionalProperties"] != false {
+		t.Fatal("AdminOutboxDeliverySummary is not closed")
+	}
+	for _, field := range []string{"expires_at", "expired_at"} {
+		if !contractSliceContains(outbox["required"], field) {
+			t.Errorf(
+				"AdminOutboxDeliverySummary.required omits %s",
+				field,
+			)
+		}
+	}
+	properties := contractMap(
+		t,
+		outbox["properties"],
+		"AdminOutboxDeliverySummary.properties",
+	)
+	status := contractMap(t, properties["status"], "outbox.status")
+	if !contractSliceContains(status["enum"], "expired") {
+		t.Fatal("Admin Outbox status omits expired")
+	}
+	for _, field := range []string{"expires_at", "expired_at"} {
+		property := contractMap(t, properties[field], "outbox."+field)
+		if !contractSliceContains(property["type"], "string") ||
+			!contractSliceContains(property["type"], "null") ||
+			property["format"] != "date-time" {
+			t.Errorf("%s is not a nullable date-time: %v", field, property)
+		}
+	}
+	for _, forbidden := range []string{
+		"destination_id",
+		"snapshot_id",
+		"locked_at",
+		"locked_by",
+		"lock_token",
+		"generation",
+		"credential",
+		"url",
+		"headers",
+	} {
+		if _, exposed := properties[forbidden]; exposed {
+			t.Errorf(
+				"Admin Outbox exposes forbidden field %s",
+				forbidden,
+			)
+		}
+	}
+}
+
 func TestSpecificationHasNoDuplicateKeysOrSemanticArrays(t *testing.T) {
 	decoder := yaml.NewDecoder(bytes.NewReader(Specification()))
 	var root yaml.Node

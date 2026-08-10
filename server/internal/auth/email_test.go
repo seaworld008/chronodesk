@@ -95,7 +95,7 @@ func TestAuthenticationEmailUsesConfiguredWebURLAndChineseCopy(t *testing.T) {
 	body := string(decodedBody)
 	if strings.Contains(body, "localhost:3000") ||
 		!strings.Contains(body, "验证您的邮箱") ||
-		!strings.Contains(body, "support.example.test/chronodesk/verify-email") {
+		!strings.Contains(body, "support.example.test/chronodesk/#/verify-email") {
 		t.Fatalf("验证邮件内容或链接不正确: %s", body)
 	}
 	start := strings.Index(body, "https://support.example.test")
@@ -111,9 +111,73 @@ func TestAuthenticationEmailUsesConfiguredWebURLAndChineseCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsedLink.Query().Get("token") != token {
-		t.Fatalf("验证令牌没有安全保真: %q", parsedLink.Query().Get("token"))
+	if parsedLink.RawQuery != "" {
+		t.Fatalf("验证令牌不得进入服务端可见的 HTTP query: %q", parsedLink.RawQuery)
 	}
+	if parsedLink.Path != "/chronodesk/" {
+		t.Fatalf("HashRouter 链接的服务端路径 = %q", parsedLink.Path)
+	}
+	_, rawFragment, found := strings.Cut(link, "#")
+	if !found {
+		t.Fatalf("未找到 HashRouter 片段: %q", link)
+	}
+	fragment, err := url.Parse(rawFragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fragment.Path != "/verify-email" {
+		t.Fatalf("验证页面片段路径 = %q", fragment.Path)
+	}
+	if fragment.Query().Get("token") != token {
+		t.Fatalf("验证令牌没有安全保真: %q", fragment.Query().Get("token"))
+	}
+}
+
+func TestApplicationURLKeepsSensitiveTokensInsideHashRouterFragment(t *testing.T) {
+	service := &SMTPEmailService{
+		webURL: mustParseApplicationWebURLForTest(
+			t,
+			"https://support.example.test/chronodesk",
+		),
+	}
+	token := "one-time&token=含 空格"
+
+	link := service.applicationURL(
+		"/reset-password",
+		map[string]string{"token": token},
+	)
+	parsed, err := url.Parse(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Path != "/chronodesk/" || parsed.RawQuery != "" {
+		t.Fatalf(
+			"服务端可见地址不安全: path=%q query=%q",
+			parsed.Path,
+			parsed.RawQuery,
+		)
+	}
+	_, rawFragment, found := strings.Cut(link, "#")
+	if !found {
+		t.Fatalf("未找到 HashRouter 片段: %q", link)
+	}
+	fragment, err := url.Parse(rawFragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fragment.Path != "/reset-password" ||
+		fragment.Query().Get("token") != token {
+		t.Fatalf("HashRouter 片段没有保真: %q", rawFragment)
+	}
+}
+
+func mustParseApplicationWebURLForTest(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	parsed, err := parseApplicationWebURL(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
 }
 
 func TestConfiguredSMTPEmailServiceRejectsInvalidWebURL(t *testing.T) {
@@ -123,12 +187,27 @@ func TestConfiguredSMTPEmailServiceRejectsInvalidWebURL(t *testing.T) {
 		"",
 		"/relative",
 		"ftp://example.test",
+		"http://example.test",
 		"https://user:password@example.test",
 		"https://example.test?redirect=unsafe",
 	} {
 		if _, err := NewConfiguredSMTPEmailService(provider, raw); err == nil {
 			t.Fatalf("无效WEB_URL未被拒绝: %q", raw)
 		}
+	}
+	if _, err := NewConfiguredSMTPEmailService(
+		provider,
+		"http://127.0.0.1:3000",
+		"development",
+	); err != nil {
+		t.Fatalf("本机开发WEB_URL被拒绝: %v", err)
+	}
+	if _, err := NewConfiguredSMTPEmailService(
+		provider,
+		"http://localhost:3000",
+		"production",
+	); err == nil {
+		t.Fatal("生产环境本机HTTP WEB_URL未被拒绝")
 	}
 }
 

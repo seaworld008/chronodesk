@@ -12,7 +12,7 @@
     "generate:human-api": "node ./scripts/generate-human-api-types.mjs",
     "check:human-api": "node ./scripts/generate-human-api-types.mjs --check",
     "test:human-api": "node ./scripts/test-human-api-contract.mjs",
-    "test:ticket-pagination": "node --test ./src/admin/tickets/pagedRequestGate.test.mjs",
+    "test:ticket-pagination": "node --test ./src/admin/tickets/pagedRequestGate.test.mjs ./src/admin/tickets/ticketDateTime.test.mjs",
     "test:attachment-preview": "node --test ./src/admin/tickets/attachmentPreviewPolicy.test.mjs",
     "test:audit-explorer": "node --test ./src/admin/audit/*.test.mjs",
     "test:layout": "node --test ./src/layout/*.test.mjs",

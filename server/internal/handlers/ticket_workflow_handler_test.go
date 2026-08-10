@@ -85,6 +85,21 @@ func (s *authorizationRaceTicketService) UpdateTicketStatusExpectedVersion(
 	return s.versioned.UpdateTicketStatusExpectedVersion(ctx, ticketID, status, userID, comment, resolutionNotes, version)
 }
 
+type allowedTransitionsTicketService struct {
+	services.TicketServiceInterface
+	allowed []models.TicketStatus
+	calls   int
+}
+
+func (service *allowedTransitionsTicketService) AllowedTicketTransitions(
+	_ context.Context,
+	_ uint,
+	_ uint,
+) ([]models.TicketStatus, error) {
+	service.calls++
+	return append([]models.TicketStatus(nil), service.allowed...), nil
+}
+
 func setupWorkflowHandlerTest(
 	t *testing.T,
 ) (*TicketWorkflowHandler, *gorm.DB, models.User, models.User, models.Ticket, models.Ticket) {
@@ -238,6 +253,67 @@ func TestUpdateTicketStatusRejectsUnknownStatus(t *testing.T) {
 
 	if resp.Code != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d, body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestGetAllowedTicketTransitionsUsesVersionedWorkflowProjection(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	handler, db, agent, _, ticket, _ := setupWorkflowHandlerTest(t)
+	service := &allowedTransitionsTicketService{
+		TicketServiceInterface: handler.ticketService,
+		allowed: []models.TicketStatus{
+			models.TicketStatusInProgress,
+			models.TicketStatusCancelled,
+		},
+	}
+	handler = NewTicketWorkflowHandler(service)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", agent.ID)
+		c.Set(projectRoleContextKey, string(models.ProjectRoleAgent))
+		c.Next()
+	})
+	router.Use(handlerTestProjectMiddleware(t, db))
+	router.GET(
+		"/tickets/:id/transitions",
+		handler.GetAllowedTicketTransitions,
+	)
+
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/tickets/"+jsonNumber(ticket.ID)+"/transitions",
+		nil,
+	)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"allowed transitions status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	if service.calls != 1 {
+		t.Fatalf("AllowedTicketTransitions calls=%d, want 1", service.calls)
+	}
+	var body struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Allowed []string `json:"allowed_next_statuses"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.Success ||
+		len(body.Data.Allowed) != 2 ||
+		body.Data.Allowed[0] != "in_progress" ||
+		body.Data.Allowed[1] != "cancelled" {
+		t.Fatalf("allowed transitions response=%+v", body)
 	}
 }
 
@@ -445,7 +521,7 @@ func TestCustomerSpecialListsUseSafeTicketDTO(t *testing.T) {
 	}
 }
 
-func TestCustomerHistoryUsesVisibleNarrowDTO(t *testing.T) {
+func TestRequesterAndObserverHistoryUsesVisibleNarrowDTO(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	handler, db, _, _, _, _ := setupWorkflowHandlerTest(t)
 	customer := models.User{
@@ -475,7 +551,20 @@ func TestCustomerHistoryUsesVisibleNarrowDTO(t *testing.T) {
 		Action: models.HistoryActionSystem, Description: "HIDDEN-HISTORY-MUST-NOT-LEAK",
 		IsVisible: false,
 	}
-	if err := db.Create(&[]models.TicketHistory{visible, hidden}).Error; err != nil {
+	internalNotes := models.TicketHistory{
+		TicketID: ticket.ID, UserID: &customer.ID,
+		Action:      models.HistoryActionUpdate,
+		Description: "INTERNAL-NOTES-HISTORY-MUST-NOT-LEAK",
+		FieldName:   "internal_notes",
+		OldValue:    "OLD-INTERNAL-NOTES",
+		NewValue:    "NEW-INTERNAL-NOTES",
+		IsVisible:   true,
+	}
+	if err := db.Create(&[]models.TicketHistory{
+		visible,
+		hidden,
+		internalNotes,
+	}).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Model(&models.TicketHistory{}).
@@ -489,34 +578,52 @@ func TestCustomerHistoryUsesVisibleNarrowDTO(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	router := gin.New()
-	router.Use(func(c *gin.Context) {
-		c.Set("user_id", customer.ID)
-		c.Set(projectRoleContextKey, string(models.ProjectRoleRequester))
-		c.Next()
-	})
-	router.Use(handlerTestProjectMiddleware(t, db))
-	router.GET("/tickets/:id/history", handler.GetTicketHistory)
-	response := httptest.NewRecorder()
-	router.ServeHTTP(
-		response,
-		httptest.NewRequest(http.MethodGet, "/tickets/"+jsonNumber(ticket.ID)+"/history", nil),
-	)
-	if response.Code != http.StatusOK {
-		t.Fatalf("history status=%d body=%s", response.Code, response.Body.String())
-	}
-	body := response.Body.String()
-	if !strings.Contains(body, "visible history") {
-		t.Fatalf("visible history missing: %s", body)
-	}
-	for _, forbidden := range []string{
-		`"source_ip"`, `"user_agent"`, `"details"`, `"metadata"`, `"user"`,
-		"192.0.2.10", "SECRET-USER-AGENT", "RAW-DETAIL", "RAW-METADATA",
-		"HIDDEN-HISTORY-MUST-NOT-LEAK", "history-private@example.com",
+	for _, role := range []models.ProjectRole{
+		models.ProjectRoleRequester,
+		models.ProjectRoleObserver,
 	} {
-		if strings.Contains(body, forbidden) {
-			t.Fatalf("history leaked %q: %s", forbidden, body)
-		}
+		t.Run(string(role), func(t *testing.T) {
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				c.Set("user_id", customer.ID)
+				c.Set(projectRoleContextKey, string(role))
+				c.Next()
+			})
+			router.Use(handlerTestProjectMiddleware(t, db))
+			router.GET("/tickets/:id/history", handler.GetTicketHistory)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(
+				response,
+				httptest.NewRequest(
+					http.MethodGet,
+					"/tickets/"+jsonNumber(ticket.ID)+"/history",
+					nil,
+				),
+			)
+			if response.Code != http.StatusOK {
+				t.Fatalf(
+					"history status=%d body=%s",
+					response.Code,
+					response.Body.String(),
+				)
+			}
+			body := response.Body.String()
+			if !strings.Contains(body, "visible history") {
+				t.Fatalf("visible history missing: %s", body)
+			}
+			for _, forbidden := range []string{
+				`"source_ip"`, `"user_agent"`, `"details"`, `"metadata"`, `"user"`,
+				"192.0.2.10", "SECRET-USER-AGENT", "RAW-DETAIL", "RAW-METADATA",
+				"HIDDEN-HISTORY-MUST-NOT-LEAK",
+				"INTERNAL-NOTES-HISTORY-MUST-NOT-LEAK",
+				"OLD-INTERNAL-NOTES", "NEW-INTERNAL-NOTES",
+				"history-private@example.com",
+			} {
+				if strings.Contains(body, forbidden) {
+					t.Fatalf("history leaked %q: %s", forbidden, body)
+				}
+			}
+		})
 	}
 }
 

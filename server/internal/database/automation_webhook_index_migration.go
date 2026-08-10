@@ -15,9 +15,12 @@ type automationWebhookIndexColumn struct {
 }
 
 type automationWebhookIndexDefinition struct {
-	name    string
-	table   string
-	columns []automationWebhookIndexColumn
+	name              string
+	table             string
+	unique            bool
+	columns           []automationWebhookIndexColumn
+	where             string
+	postgresPredicate string
 }
 
 var automationWebhookPaginationIndexes = []automationWebhookIndexDefinition{
@@ -370,7 +373,11 @@ func postgresAutomationWebhookIndexDDL(
 	schema string,
 	definition automationWebhookIndexDefinition,
 ) string {
-	return "CREATE INDEX " +
+	unique := ""
+	if definition.unique {
+		unique = "UNIQUE "
+	}
+	statement := "CREATE " + unique + "INDEX " +
 		quoteAutomationWebhookPostgresIdentifier(definition.name) +
 		" ON " +
 		quoteAutomationWebhookPostgresIdentifier(schema) + "." +
@@ -379,6 +386,10 @@ func postgresAutomationWebhookIndexDDL(
 		definition,
 		quoteAutomationWebhookPostgresIdentifier,
 	) + ")"
+	if definition.where != "" {
+		statement += " WHERE " + definition.where
+	}
+	return statement
 }
 
 func quoteAutomationWebhookPostgresIdentifier(identifier string) string {
@@ -426,7 +437,11 @@ func migrateSQLiteAutomationWebhookPaginationIndexes(db *gorm.DB) error {
 func sqliteAutomationWebhookIndexDDL(
 	definition automationWebhookIndexDefinition,
 ) string {
-	return "CREATE INDEX " +
+	unique := ""
+	if definition.unique {
+		unique = "UNIQUE "
+	}
+	statement := "CREATE " + unique + "INDEX " +
 		quoteAutomationWebhookSQLiteIdentifier(definition.name) +
 		" ON " +
 		quoteAutomationWebhookSQLiteIdentifier(definition.table) +
@@ -434,6 +449,10 @@ func sqliteAutomationWebhookIndexDDL(
 		definition,
 		quoteAutomationWebhookSQLiteIdentifier,
 	) + ")"
+	if definition.where != "" {
+		statement += " WHERE " + definition.where
+	}
+	return statement
 }
 
 func quoteAutomationWebhookSQLiteIdentifier(identifier string) string {
@@ -483,9 +502,10 @@ func ValidateAutomationWebhookPaginationIndexes(db *gorm.DB) error {
 		}
 		if !valid {
 			return fmt.Errorf(
-				"pagination index %s on %s must be a valid, ready, non-unique, non-partial, non-expression btree index on (%s) in exact order; run `go run ./cmd/migrate`",
+				"pagination index %s on %s must be a valid, ready, unique=%t, non-partial, non-expression btree index on (%s) in exact order; run `go run ./cmd/migrate`",
 				definition.name,
 				definition.table,
+				definition.unique,
 				automationWebhookIndexContractDescription(definition),
 			)
 		}
@@ -508,18 +528,22 @@ func automationWebhookIndexContractDescription(
 }
 
 type postgresAutomationWebhookIndexColumn struct {
-	ColumnName     string `gorm:"column:column_name"`
-	Ordinal        int    `gorm:"column:ordinal"`
-	KeyColumnCount int    `gorm:"column:key_column_count"`
-	AttributeCount int    `gorm:"column:attribute_count"`
-	AccessMethod   string `gorm:"column:access_method"`
-	IsUnique       bool   `gorm:"column:is_unique"`
-	IsValid        bool   `gorm:"column:is_valid"`
-	IsReady        bool   `gorm:"column:is_ready"`
-	IsLive         bool   `gorm:"column:is_live"`
-	HasPredicate   bool   `gorm:"column:has_predicate"`
-	HasExpressions bool   `gorm:"column:has_expressions"`
-	IsDescending   bool   `gorm:"column:is_descending"`
+	ColumnName      string `gorm:"column:column_name"`
+	Ordinal         int    `gorm:"column:ordinal"`
+	KeyColumnCount  int    `gorm:"column:key_column_count"`
+	AttributeCount  int    `gorm:"column:attribute_count"`
+	AccessMethod    string `gorm:"column:access_method"`
+	IsUnique        bool   `gorm:"column:is_unique"`
+	IsValid         bool   `gorm:"column:is_valid"`
+	IsReady         bool   `gorm:"column:is_ready"`
+	IsLive          bool   `gorm:"column:is_live"`
+	HasPredicate    bool   `gorm:"column:has_predicate"`
+	HasExpressions  bool   `gorm:"column:has_expressions"`
+	IsDescending    bool   `gorm:"column:is_descending"`
+	IsNullsFirst    bool   `gorm:"column:is_nulls_first"`
+	DefaultOpclass  bool   `gorm:"column:default_opclass"`
+	ColumnCollation bool   `gorm:"column:column_collation"`
+	Predicate       string `gorm:"column:predicate"`
 }
 
 func postgresAutomationWebhookIndexIsValid(
@@ -540,7 +564,16 @@ func postgresAutomationWebhookIndexIsValid(
 			index_row.indislive AS is_live,
 			(index_row.indpred IS NOT NULL) AS has_predicate,
 			(index_row.indexprs IS NOT NULL) AS has_expressions,
-			((index_key.option_bits::integer & 1) = 1) AS is_descending
+			COALESCE(
+				pg_get_expr(index_row.indpred, index_row.indrelid),
+				''
+			) AS predicate,
+			((index_key.option_bits::integer & 1) = 1) AS is_descending,
+			((index_key.option_bits::integer & 2) = 2) AS is_nulls_first,
+			opclass_row.opcdefault AS default_opclass,
+			(
+				index_key.collation_oid = attribute.attcollation
+			) AS column_collation
 		FROM pg_class AS table_row
 		JOIN pg_namespace AS namespace_row
 		  ON namespace_row.oid = table_row.relnamespace
@@ -552,15 +585,21 @@ func postgresAutomationWebhookIndexIsValid(
 		  ON access_method.oid = index_class.relam
 		CROSS JOIN LATERAL unnest(
 			index_row.indkey::smallint[],
-			index_row.indoption::smallint[]
+			index_row.indoption::smallint[],
+			index_row.indclass::oid[],
+			index_row.indcollation::oid[]
 		) WITH ORDINALITY AS index_key(
 			attribute_number,
 			option_bits,
+			opclass_oid,
+			collation_oid,
 			ordinality
 		)
 		LEFT JOIN pg_attribute AS attribute
 		  ON attribute.attrelid = table_row.oid
 		 AND attribute.attnum = index_key.attribute_number
+		LEFT JOIN pg_opclass AS opclass_row
+		  ON opclass_row.oid = index_key.opclass_oid
 		WHERE namespace_row.nspname = CURRENT_SCHEMA()
 		  AND table_row.relname = ?
 		  AND index_class.relname = ?
@@ -582,13 +621,17 @@ func postgresAutomationWebhookIndexIsValid(
 			row.KeyColumnCount != len(definition.columns) ||
 			row.AttributeCount != len(definition.columns) ||
 			row.AccessMethod != "btree" ||
-			row.IsUnique ||
+			row.IsUnique != definition.unique ||
 			!row.IsValid ||
 			!row.IsReady ||
 			!row.IsLive ||
-			row.HasPredicate ||
+			row.HasPredicate != (definition.where != "") ||
 			row.HasExpressions ||
-			row.IsDescending != expected.descending {
+			row.IsDescending != expected.descending ||
+			row.IsNullsFirst != expected.descending ||
+			!row.DefaultOpclass ||
+			!row.ColumnCollation ||
+			row.Predicate != definition.postgresPredicate {
 			return false, nil
 		}
 	}
@@ -615,6 +658,7 @@ func validatePostgresAutomationWebhookIndex(
 type sqliteAutomationWebhookIndexListRow struct {
 	Name    string `gorm:"column:name"`
 	Unique  int    `gorm:"column:unique"`
+	Origin  string `gorm:"column:origin"`
 	Partial int    `gorm:"column:partial"`
 }
 
@@ -623,6 +667,7 @@ type sqliteAutomationWebhookIndexColumn struct {
 	ColumnID   int            `gorm:"column:cid"`
 	ColumnName sql.NullString `gorm:"column:name"`
 	Descending int            `gorm:"column:desc"`
+	Collation  sql.NullString `gorm:"column:coll"`
 	Key        int            `gorm:"column:key"`
 }
 
@@ -632,7 +677,7 @@ func sqliteAutomationWebhookIndexIsValid(
 ) (bool, error) {
 	var indexes []sqliteAutomationWebhookIndexListRow
 	if err := db.Raw(
-		"PRAGMA index_list(" +
+		"PRAGMA main.index_list(" +
 			quoteAutomationWebhookSQLiteIdentifier(definition.table) +
 			")",
 	).Scan(&indexes).Error; err != nil {
@@ -649,7 +694,8 @@ func sqliteAutomationWebhookIndexIsValid(
 			continue
 		}
 		found = true
-		if index.Unique != 0 || index.Partial != 0 {
+		if (index.Unique != 0) != definition.unique ||
+			(index.Partial != 0) != (definition.where != "") {
 			return false, nil
 		}
 		break
@@ -657,10 +703,36 @@ func sqliteAutomationWebhookIndexIsValid(
 	if !found {
 		return false, nil
 	}
+	if definition.where != "" {
+		var storedSQL sql.NullString
+		if err := db.Raw(
+			`SELECT sql
+			 FROM main.sqlite_schema
+			 WHERE type = 'index' AND name = ?`,
+			definition.name,
+		).Scan(&storedSQL).Error; err != nil {
+			return false, fmt.Errorf(
+				"inspect SQLite pagination index SQL %s: %w",
+				definition.name,
+				err,
+			)
+		}
+		if !storedSQL.Valid {
+			return false, nil
+		}
+		upperSQL := strings.ToUpper(storedSQL.String)
+		whereAt := strings.LastIndex(upperSQL, " WHERE ")
+		if whereAt < 0 ||
+			canonicalSQLiteLifecycleFenceSQL(
+				storedSQL.String[whereAt+len(" WHERE "):],
+			) != canonicalSQLiteLifecycleFenceSQL(definition.where) {
+			return false, nil
+		}
+	}
 
 	var indexRows []sqliteAutomationWebhookIndexColumn
 	if err := db.Raw(
-		"PRAGMA index_xinfo(" +
+		"PRAGMA main.index_xinfo(" +
 			quoteAutomationWebhookSQLiteIdentifier(definition.name) +
 			")",
 	).Scan(&indexRows).Error; err != nil {
@@ -685,6 +757,8 @@ func sqliteAutomationWebhookIndexIsValid(
 			row.ColumnID < 0 ||
 			!row.ColumnName.Valid ||
 			row.ColumnName.String != expected.name ||
+			!row.Collation.Valid ||
+			!strings.EqualFold(row.Collation.String, "BINARY") ||
 			(row.Descending == 1) != expected.descending {
 			return false, nil
 		}

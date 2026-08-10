@@ -200,6 +200,10 @@ func (d *NativeOutboxDeliverer) Deliver(
 	event services.CloudEventEnvelope,
 ) error {
 	if err := validateOutboxDeliveryOperation(ctx, delivery, event); err != nil {
+		if delivery != nil &&
+			delivery.DestinationType == "webhook" {
+			return services.ErrWebhookOutboxAttemptRejected
+		}
 		return err
 	}
 	switch delivery.DestinationType {
@@ -344,6 +348,45 @@ func (d *NativeOutboxDeliverer) Deliver(
 	default:
 		return fmt.Errorf("unsupported outbox destination type %q", delivery.DestinationType)
 	}
+}
+
+func (d *NativeOutboxDeliverer) DeliverAttempt(
+	ctx context.Context,
+	delivery *models.OutboxDelivery,
+	event services.CloudEventEnvelope,
+) services.OutboxAttemptResult {
+	if err := validateOutboxDeliveryOperation(
+		ctx,
+		delivery,
+		event,
+	); err != nil {
+		if delivery != nil &&
+			delivery.DestinationType == "webhook" {
+			return services.OutboxKnownFailure(
+				services.ErrWebhookOutboxAttemptRejected,
+			)
+		}
+		return services.OutboxKnownFailure(err)
+	}
+	if delivery.DestinationType == "webhook" {
+		return d.deliverWebhookAttempt(ctx, delivery, event)
+	}
+	err := d.Deliver(ctx, delivery, event)
+	if contextErr := ctx.Err(); contextErr != nil {
+		return services.OutboxUncertain(contextErr)
+	}
+	if err == nil {
+		return services.OutboxKnownSuccess(time.Now().UTC())
+	}
+	if errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return services.OutboxUncertain(err)
+	}
+	var timeout net.Error
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		return services.OutboxUncertain(err)
+	}
+	return services.OutboxKnownFailure(err)
 }
 
 func (d *NativeOutboxDeliverer) deliverWebSocketAccessRevocation(
@@ -618,35 +661,68 @@ func queueNamesFromCloudEvent(event services.CloudEventEnvelope) []string {
 	return result
 }
 
-const webhookSnapshotPrefix = "snapshot:"
+const webhookSnapshotPrefix = models.WebhookDeliverySnapshotDestinationPrefix
 
 func (d *NativeOutboxDeliverer) deliverWebhook(
 	ctx context.Context,
 	delivery *models.OutboxDelivery,
 	event services.CloudEventEnvelope,
 ) error {
+	return d.deliverWebhookAttempt(ctx, delivery, event).Err
+}
+
+func (d *NativeOutboxDeliverer) deliverWebhookAttempt(
+	ctx context.Context,
+	delivery *models.OutboxDelivery,
+	event services.CloudEventEnvelope,
+) services.OutboxAttemptResult {
 	if d.notifications == nil {
-		return errors.New("webhook notification service is unavailable")
+		return services.OutboxKnownFailure(
+			errors.New("webhook notification service is unavailable"),
+		)
 	}
-	if !eventcontract.IsWebhookDeliveryEventType(strings.TrimSpace(event.Type)) {
-		return nil
-	}
-	snapshotID, err := parseWebhookSnapshotDestinationID(
+	_, err := parseWebhookSnapshotDestinationID(
 		delivery.DestinationID,
 	)
 	if err != nil {
-		return err
+		return services.OutboxKnownFailure(
+			services.ErrWebhookOutboxAttemptRejected,
+		)
 	}
-	notification := notificationEventFromCloudEvent(event)
-	notification.Metadata["delivery_id"] = delivery.ID
-	return d.notifications.SendWebhookSnapshotOutboxAttempt(
+	claimRef, err := services.OutboxClaimRefFromDelivery(delivery)
+	if err != nil || delivery.ExpiresAt == nil {
+		return services.OutboxKnownFailure(
+			services.ErrWebhookOutboxAttemptRejected,
+		)
+	}
+	effectiveDeadline, ok := ctx.Deadline()
+	if !ok {
+		return services.OutboxKnownFailure(
+			services.ErrWebhookOutboxAttemptRejected,
+		)
+	}
+	credentialExpiresAt := delivery.ExpiresAt.UTC()
+	if credentialExpiresAt.Before(effectiveDeadline) {
+		effectiveDeadline = credentialExpiresAt
+	}
+	return d.notifications.SendWebhookSnapshotOutboxAttemptResult(
 		ctx,
-		models.ProjectScope{
-			OrganizationID: event.OrganizationID,
-			ProjectID:      event.ProjectID,
+		services.WebhookOutboxAttemptClaim{
+			DeliveryID: delivery.ID,
+			EventID:    event.ID,
+			Scope: models.ProjectScope{
+				OrganizationID: event.OrganizationID,
+				ProjectID:      event.ProjectID,
+			},
+			WorkerID:            claimRef.WorkerID,
+			LockToken:           claimRef.LockToken,
+			LockedAt:            claimRef.LockedAt,
+			AttemptGeneration:   claimRef.Attempts,
+			SnapshotDestination: delivery.DestinationID,
+			EffectiveDeadline:   effectiveDeadline.UTC(),
+			CredentialExpiresAt: credentialExpiresAt,
 		},
-		snapshotID,
-		notification,
+		&event,
 	)
 }
 
@@ -706,21 +782,7 @@ func notificationEventFromCloudEvent(
 func parseWebhookSnapshotDestinationID(
 	destinationID string,
 ) (string, error) {
-	if !strings.HasPrefix(destinationID, webhookSnapshotPrefix) {
-		return "", fmt.Errorf(
-			"unsupported webhook Outbox destination %q",
-			destinationID,
-		)
-	}
-	value := strings.TrimPrefix(destinationID, webhookSnapshotPrefix)
-	parsed, err := uuid.Parse(value)
-	if err != nil || parsed.String() != value || parsed.Version() != 7 {
-		return "", fmt.Errorf(
-			"invalid webhook Outbox snapshot destination %q",
-			destinationID,
-		)
-	}
-	return value, nil
+	return models.ParseWebhookDeliverySnapshotDestinationID(destinationID)
 }
 
 func (d *NativeOutboxDeliverer) deliverA2APush(

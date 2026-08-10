@@ -18,9 +18,11 @@ import (
 	"github.com/seaworld008/chronodesk/server/internal/handlers"
 	"github.com/seaworld008/chronodesk/server/internal/httpcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/datatypes"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -978,6 +980,14 @@ func TestAdminWriteEndpointsReturnReceiptsAndSafeDomainEvents(t *testing.T) {
 	).Order("created_at ASC").First(&replayDelivery).Error; err != nil {
 		t.Fatal(err)
 	}
+	if err := db.Model(&models.OutboxDelivery{}).
+		Where("id = ?", replayDelivery.ID).
+		Updates(map[string]any{
+			"status":     models.OutboxDeliveryFailed,
+			"last_error": "temporary delivery failure",
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
 	t.Run("outbox replay", func(t *testing.T) {
 		doWrite(
 			t,
@@ -1183,11 +1193,15 @@ func newAdminContractFixture(t *testing.T) *adminContractFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := scopeddb.Install(db); err != nil {
+		t.Fatalf("install project scope transaction routing: %v", err)
+	}
 	sqlDB, err := db.DB()
 	if err != nil {
 		t.Fatal(err)
 	}
 	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = sqlDB.Close() })
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.SystemConfig{},
@@ -1198,6 +1212,8 @@ func newAdminContractFixture(t *testing.T) *adminContractFixture {
 		&models.Ticket{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
+		&models.WebhookConfig{},
+		&models.WebhookDeliverySnapshot{},
 		&models.IdempotencyRecord{},
 		&models.TicketLease{},
 		&models.TicketAttachment{},
@@ -1243,6 +1259,398 @@ func newAdminContractFixture(t *testing.T) *adminContractFixture {
 		admin:   admin,
 		scope:   projectFixture.project.Scope(),
 		project: projectFixture.project,
+	}
+}
+
+func TestAdminReplayDueWebhookCommitsExpiryThenReturnsStableConflict(
+	t *testing.T,
+) {
+	fixture := newAdminContractFixture(t)
+	due := seedAdminDueWebhookReplay(t, fixture)
+
+	response := performAdminContractRequest(
+		fixture.router,
+		http.MethodPost,
+		"/api/projects/TEST/admin/agents/outbox/"+
+			due.delivery.ID+"/replay",
+		"",
+		"expired-replay",
+		httpcontract.FormatETag(1),
+		"expired-replay",
+	)
+	assertAdminDueReplayCommitted(t, fixture, due, response)
+}
+
+func TestAdminReplayDueWebhookCommitsThroughProjectScopeMiddleware(
+	t *testing.T,
+) {
+	fixture := newAdminContractFixture(t)
+	due := seedAdminDueWebhookReplay(t, fixture)
+	projectService, err := services.NewProjectService(fixture.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewAdminHandler(
+		fixture.db,
+		fixture.native,
+		newTestRuntimeControl(t, fixture.db, fixture.native, false),
+		time.Hour,
+		[]byte("project-middleware-expired-replay-key"),
+	)
+	adminLists, err := NewAdminListService(
+		fixture.db,
+		[]byte("project-middleware-expired-list-cursor-key"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.ConfigureListService(adminLists); err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", fixture.admin.ID)
+		c.Set("platform_role", models.PlatformRolePlatformAdmin)
+		c.Set("request_id", "project-middleware-expired-replay")
+		c.Next()
+	})
+	group := router.Group("/api/projects/:projectKey/admin/agents")
+	group.Use(handlers.ProjectScopeMiddleware(
+		projectService,
+		fixture.db,
+	))
+	group.Use(handlers.RequireProjectRoles(models.ProjectRoleAdmin))
+	handler.RegisterRoutes(group)
+
+	response := performAdminContractRequest(
+		router,
+		http.MethodPost,
+		"/api/projects/TEST/admin/agents/outbox/"+
+			due.delivery.ID+"/replay",
+		"",
+		"project-middleware-expired-replay",
+		httpcontract.FormatETag(1),
+		"project-middleware-expired-replay",
+	)
+	assertAdminDueReplayCommitted(t, fixture, due, response)
+	if response.Header().Get("ETag") != httpcontract.FormatETag(2) {
+		t.Fatalf(
+			"after-commit ETag = %q, want %q",
+			response.Header().Get("ETag"),
+			httpcontract.FormatETag(2),
+		)
+	}
+	assertAdminOutboxHTTPProjectionSafe(
+		t,
+		router,
+		due,
+	)
+
+	var idempotency models.IdempotencyRecord
+	if err := fixture.db.Where(
+		"key = ?",
+		"project-middleware-expired-replay",
+	).Take(&idempotency).Error; err != nil {
+		t.Fatal(err)
+	}
+	if idempotency.State != models.IdempotencyStateFailed ||
+		idempotency.LastErrorCode != "outbox_replay_expired" {
+		t.Fatalf(
+			"expired replay idempotency outcome = %+v",
+			idempotency,
+		)
+	}
+	var version models.SystemConfig
+	if err := fixture.db.Where(
+		"key = ?",
+		adminResourceVersionKey(
+			fixture.scope,
+			"outbox/"+due.delivery.ID,
+		),
+	).Take(&version).Error; err != nil {
+		t.Fatal(err)
+	}
+	if version.Version != 2 {
+		t.Fatalf(
+			"expired replay resource version = %d, want 2",
+			version.Version,
+		)
+	}
+}
+
+func assertAdminOutboxHTTPProjectionSafe(
+	t *testing.T,
+	router http.Handler,
+	due adminDueWebhookReplayFixture,
+) {
+	t.Helper()
+	response := performAdminContractRequest(
+		router,
+		http.MethodGet,
+		"/api/projects/TEST/admin/agents/outbox"+
+			"?page=1&page_size=25&sort_by=created_at&sort_order=desc",
+		"",
+		"",
+		"",
+		"project-middleware-expired-list",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"safe Outbox list status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	var envelope struct {
+		Data struct {
+			Items []map[string]json.RawMessage `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	var projected map[string]json.RawMessage
+	for _, item := range envelope.Data.Items {
+		var id string
+		if err := json.Unmarshal(item["id"], &id); err != nil {
+			t.Fatal(err)
+		}
+		if id == due.delivery.ID {
+			projected = item
+			break
+		}
+	}
+	if projected == nil {
+		t.Fatalf(
+			"safe Outbox list omitted delivery %s: %s",
+			due.delivery.ID,
+			response.Body.String(),
+		)
+	}
+	for _, required := range []string{
+		"status",
+		"expires_at",
+		"expired_at",
+		"destination_type",
+		"destination_label",
+	} {
+		if _, exists := projected[required]; !exists {
+			t.Errorf("safe Outbox projection omitted %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"destination_id",
+		"snapshot_id",
+		"config_id",
+		"locked_at",
+		"locked_by",
+		"lock_token",
+		"generation",
+		"credential",
+		"credential_envelope",
+		"webhook_url",
+		"access_token",
+		"secret",
+		"previous_secret",
+		"url",
+		"headers",
+	} {
+		if _, exposed := projected[forbidden]; exposed {
+			t.Errorf(
+				"safe Outbox HTTP projection exposes %q: %s",
+				forbidden,
+				response.Body.String(),
+			)
+		}
+	}
+	for _, secret := range []string{
+		due.snapshot.ID,
+		due.snapshot.WebhookURL,
+		due.snapshot.Secret,
+		due.snapshot.PreviousSecret,
+		due.snapshot.AccessToken,
+	} {
+		if secret != "" &&
+			strings.Contains(response.Body.String(), secret) {
+			t.Errorf(
+				"safe Outbox HTTP projection leaked seeded value",
+			)
+		}
+	}
+}
+
+type adminDueWebhookReplayFixture struct {
+	event    models.DomainEvent
+	snapshot models.WebhookDeliverySnapshot
+	delivery models.OutboxDelivery
+	deadline time.Time
+}
+
+func seedAdminDueWebhookReplay(
+	t *testing.T,
+	fixture *adminContractFixture,
+) adminDueWebhookReplayFixture {
+	t.Helper()
+	now := time.Now().UTC()
+	deadline := now.Add(-time.Minute)
+	publishedAt := now.Add(-30 * time.Second)
+	event := models.DomainEvent{
+		ID:              "00000000-0000-7000-8000-000000009101",
+		OrganizationID:  fixture.scope.OrganizationID,
+		ProjectID:       fixture.scope.ProjectID,
+		SpecVersion:     "1.0",
+		Source:          "urn:chronodesk:test:admin-replay-expired",
+		Type:            "io.chronodesk.test.admin-replay-expired.v1",
+		Subject:         "outbox-replay/expired",
+		Time:            now.Add(-time.Hour),
+		DataContentType: "application/json",
+		Data:            datatypes.JSON(`{"safe":true}`),
+		ActorType:       models.ActorTypeSystem,
+		ActorID:         "admin-replay-expired-test",
+		ResourceVersion: 1,
+		PublishedAt:     &publishedAt,
+	}
+	if err := fixture.db.Create(&event).Error; err != nil {
+		t.Fatal(err)
+	}
+	snapshot := models.WebhookDeliverySnapshot{
+		ID:                  "00000000-0000-7000-8000-000000009102",
+		OrganizationID:      fixture.scope.OrganizationID,
+		ProjectID:           fixture.scope.ProjectID,
+		ConfigID:            1,
+		EventID:             event.ID,
+		ConfigUpdatedAt:     now.Add(-time.Hour),
+		Provider:            models.WebhookProviderCustom,
+		WebhookURL:          "https://expired.invalid.example/events",
+		Secret:              "sealed-secret",
+		PreviousSecret:      "sealed-previous-secret",
+		AccessToken:         "sealed-token",
+		CredentialExpiresAt: deadline,
+		EnabledEvents:       "ticket.created",
+		RetryCount:          8,
+		RetryInterval:       60,
+		TimeoutSeconds:      10,
+		RateLimit:           10,
+		RateLimitWindow:     60,
+	}
+	if err := fixture.db.Create(&snapshot).Error; err != nil {
+		t.Fatal(err)
+	}
+	destinationID, err :=
+		models.WebhookDeliverySnapshotDestinationID(snapshot.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery := models.OutboxDelivery{
+		ID:              "00000000-0000-7000-8000-000000009103",
+		OrganizationID:  fixture.scope.OrganizationID,
+		ProjectID:       fixture.scope.ProjectID,
+		EventID:         event.ID,
+		DestinationType: "webhook",
+		DestinationID:   destinationID,
+		Status:          models.OutboxDeliveryFailed,
+		Attempts:        3,
+		MaxAttempts:     8,
+		NextAttemptAt:   deadline,
+		LastError:       "bounded failure",
+		ExpiresAt:       &deadline,
+	}
+	if err := fixture.db.Create(&delivery).Error; err != nil {
+		t.Fatal(err)
+	}
+	return adminDueWebhookReplayFixture{
+		event:    event,
+		snapshot: snapshot,
+		delivery: delivery,
+		deadline: deadline,
+	}
+}
+
+func assertAdminDueReplayCommitted(
+	t *testing.T,
+	fixture *adminContractFixture,
+	due adminDueWebhookReplayFixture,
+	response *httptest.ResponseRecorder,
+) {
+	t.Helper()
+	if response.Code != http.StatusConflict ||
+		!strings.Contains(
+			response.Body.String(),
+			ProblemOutboxExpired,
+		) {
+		t.Fatalf(
+			"expired replay status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	var currentDelivery models.OutboxDelivery
+	if err := fixture.db.First(
+		&currentDelivery,
+		"id = ?",
+		due.delivery.ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if currentDelivery.Status != models.OutboxDeliveryExpired ||
+		currentDelivery.ExpiredAt == nil ||
+		currentDelivery.ExpiresAt == nil ||
+		!currentDelivery.ExpiresAt.Equal(due.deadline) {
+		t.Fatalf(
+			"expired replay terminal state rolled back: %+v",
+			currentDelivery,
+		)
+	}
+	var currentSnapshot models.WebhookDeliverySnapshot
+	if err := fixture.db.First(
+		&currentSnapshot,
+		"id = ?",
+		due.snapshot.ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if currentSnapshot.CredentialShreddedAt == nil ||
+		currentSnapshot.CredentialShredReason == nil ||
+		*currentSnapshot.CredentialShredReason !=
+			models.WebhookCredentialShredReasonExpired ||
+		currentSnapshot.Secret != "" ||
+		currentSnapshot.PreviousSecret != "" ||
+		currentSnapshot.AccessToken != "" {
+		t.Fatalf(
+			"expired replay retained credential material: %+v",
+			currentSnapshot,
+		)
+	}
+	var currentEvent models.DomainEvent
+	if err := fixture.db.First(
+		&currentEvent,
+		"id = ?",
+		due.event.ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if currentEvent.PublishedAt != nil {
+		t.Fatalf(
+			"expired replay retained PublishedAt=%v",
+			currentEvent.PublishedAt,
+		)
+	}
+}
+
+func TestNativeProblemMapsReplayExpiryAcrossSharedAdapters(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Set("request_id", "outbox-replay-expired")
+
+	writeNativeProblem(context, services.ErrOutboxReplayExpired)
+
+	if recorder.Code != http.StatusConflict ||
+		!strings.Contains(recorder.Body.String(), ProblemOutboxExpired) {
+		t.Fatalf(
+			"shared native problem status=%d body=%s",
+			recorder.Code,
+			recorder.Body.String(),
+		)
 	}
 }
 

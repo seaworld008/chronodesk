@@ -239,10 +239,11 @@ func (PolicyDecision) TableName() string {
 // DomainEvent is both the durable event log and the persisted CloudEvents 1.0
 // envelope. Data contains JSON and is never interpreted as instructions.
 type DomainEvent struct {
-	ID                   string         `json:"id" gorm:"primaryKey;size:36"`
+	ID                   string         `json:"id" gorm:"primaryKey;size:36;not null"`
 	CreatedAt            time.Time      `json:"created_at" gorm:"autoCreateTime;index"`
 	OrganizationID       uint           `json:"organizationid" gorm:"not null;index"`
 	ProjectID            uint           `json:"projectid" gorm:"not null;index"`
+	ProjectScope         Project        `json:"-" gorm:"-:migration;foreignKey:OrganizationID,ProjectID;references:OrganizationID,ID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
 	ConfigurationVersion string         `json:"configurationversion,omitempty" gorm:"size:100;index"`
 	PolicyDecisionID     string         `json:"policydecisionid,omitempty" gorm:"size:36;index"`
 	SpecVersion          string         `json:"specversion" gorm:"size:10;not null;default:'1.0'"`
@@ -277,27 +278,54 @@ const (
 	OutboxDeliverySucceeded  OutboxDeliveryStatus = "succeeded"
 	OutboxDeliveryFailed     OutboxDeliveryStatus = "failed"
 	OutboxDeliveryDead       OutboxDeliveryStatus = "dead"
+	OutboxDeliveryExpired    OutboxDeliveryStatus = "expired"
 )
+
+var outboxDeliveryStatusValues = []OutboxDeliveryStatus{
+	OutboxDeliveryPending,
+	OutboxDeliveryProcessing,
+	OutboxDeliverySucceeded,
+	OutboxDeliveryFailed,
+	OutboxDeliveryDead,
+	OutboxDeliveryExpired,
+}
+
+func OutboxDeliveryStatusValues() []OutboxDeliveryStatus {
+	return append([]OutboxDeliveryStatus(nil), outboxDeliveryStatusValues...)
+}
+
+func (status OutboxDeliveryStatus) IsValid() bool {
+	for _, candidate := range outboxDeliveryStatusValues {
+		if status == candidate {
+			return true
+		}
+	}
+	return false
+}
 
 // OutboxDelivery tracks independent delivery state for each event target.
 type OutboxDelivery struct {
-	ID              string               `json:"id" gorm:"primaryKey;size:36"`
+	ID              string               `json:"id" gorm:"primaryKey;size:36;not null"`
 	CreatedAt       time.Time            `json:"created_at" gorm:"autoCreateTime;index"`
 	UpdatedAt       time.Time            `json:"updated_at" gorm:"autoUpdateTime"`
 	OrganizationID  uint                 `json:"organization_id" gorm:"not null;index"`
 	ProjectID       uint                 `json:"project_id" gorm:"not null;index"`
+	ProjectScope    Project              `json:"-" gorm:"-:migration;foreignKey:OrganizationID,ProjectID;references:OrganizationID,ID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
 	EventID         string               `json:"event_id" gorm:"size:36;not null;uniqueIndex:idx_event_destination,priority:1"`
 	Event           *DomainEvent         `json:"event,omitempty" gorm:"foreignKey:EventID"`
 	DestinationType string               `json:"destination_type" gorm:"size:50;not null;uniqueIndex:idx_event_destination,priority:2;index"`
 	DestinationID   string               `json:"destination_id" gorm:"size:128;not null;uniqueIndex:idx_event_destination,priority:3;index"`
-	Status          OutboxDeliveryStatus `json:"status" gorm:"size:20;not null;default:'pending';index"`
+	Status          OutboxDeliveryStatus `json:"status" gorm:"size:20;not null;default:'pending';index;check:chk_outbox_delivery_status,status IS NOT NULL AND (status = 'pending' OR status = 'processing' OR status = 'succeeded' OR status = 'failed' OR status = 'dead' OR status = 'expired')"`
 	Attempts        int                  `json:"attempts" gorm:"not null;default:0"`
 	MaxAttempts     int                  `json:"max_attempts" gorm:"not null;default:8"`
 	NextAttemptAt   time.Time            `json:"next_attempt_at" gorm:"not null;index"`
 	LockedAt        *time.Time           `json:"locked_at,omitempty" gorm:"index"`
 	LockedBy        string               `json:"locked_by,omitempty" gorm:"size:100;index"`
+	LockToken       *string              `json:"-" gorm:"size:36"`
 	LastError       string               `json:"last_error,omitempty" gorm:"type:text"`
-	DeliveredAt     *time.Time           `json:"delivered_at,omitempty" gorm:"index"`
+	DeliveredAt     *time.Time           `json:"delivered_at,omitempty" gorm:"index;check:chk_outbox_expired_at,(status = 'expired' AND expired_at IS NOT NULL) OR (status <> 'expired' AND expired_at IS NULL)"`
+	ExpiresAt       *time.Time           `json:"expires_at,omitempty" gorm:"index;check:chk_outbox_webhook_expires_at,destination_type <> 'webhook' OR (destination_type = 'webhook' AND expires_at IS NOT NULL)"`
+	ExpiredAt       *time.Time           `json:"expired_at,omitempty" gorm:"index;check:chk_outbox_expired_webhook,status <> 'expired' OR (status = 'expired' AND destination_type = 'webhook')"`
 }
 
 func (OutboxDelivery) TableName() string {

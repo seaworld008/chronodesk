@@ -2,6 +2,7 @@ package agentplatform
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -32,6 +33,11 @@ func newAdminListTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
 	tableOnly := db.Session(&gorm.Session{NewDB: true})
 	tableOnly.Config.IgnoreRelationshipsWhenMigrating = true
 	if err := tableOnly.AutoMigrate(
@@ -256,6 +262,97 @@ func TestAdminOverviewUsesScopedServerAggregates(t *testing.T) {
 	}
 	if metrics.PrincipalCount != 3 || metrics.ActivePrincipalCount != 1 {
 		t.Fatalf("unexpected scoped principal metrics: %+v", metrics)
+	}
+}
+
+func TestAdminOutboxProjectsExpiredTimestampsWithoutInternals(t *testing.T) {
+	db := newAdminListTestDB(t)
+	project := adminListTestProject(t, db, 145, 14, "OUTBOXSAFE")
+	now := time.Date(2026, 8, 10, 11, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(-time.Minute)
+	expiredAt := now
+	event := models.DomainEvent{
+		ID:              "00000000-0000-7000-8000-000000001451",
+		OrganizationID:  project.OrganizationID,
+		ProjectID:       project.ID,
+		SpecVersion:     "1.0",
+		Source:          "urn:chronodesk:test:admin-outbox-safe",
+		Type:            "io.chronodesk.test.admin-outbox-safe.v1",
+		Subject:         "outbox/safe",
+		Time:            now.Add(-time.Hour),
+		DataContentType: "application/json",
+		Data:            datatypes.JSON(`{"safe":true}`),
+		ActorType:       models.ActorTypeSystem,
+		ActorID:         "admin-outbox-safe",
+		ResourceVersion: 1,
+	}
+	if err := db.Create(&event).Error; err != nil {
+		t.Fatal(err)
+	}
+	delivery := models.OutboxDelivery{
+		ID:              "00000000-0000-7000-8000-000000001452",
+		CreatedAt:       now.Add(-time.Hour),
+		UpdatedAt:       now,
+		OrganizationID:  project.OrganizationID,
+		ProjectID:       project.ID,
+		EventID:         event.ID,
+		DestinationType: "webhook",
+		DestinationID:   "snapshot:00000000-0000-7000-8000-000000001453",
+		Status:          models.OutboxDeliveryExpired,
+		Attempts:        2,
+		MaxAttempts:     8,
+		NextAttemptAt:   expiresAt,
+		LockedBy:        "private-worker-generation",
+		LastError:       "Authorization: Bearer private-credential",
+		ExpiresAt:       &expiresAt,
+		ExpiredAt:       &expiredAt,
+	}
+	if err := db.Create(&delivery).Error; err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewAdminListService(db, adminListTestCursorKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := service.ListOutbox(
+		adminListTestContext(t, project.Scope()),
+		project.Scope(),
+		AdminPageQuery{Page: 1, PageSize: 25},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("outbox items=%d, want 1", len(page.Items))
+	}
+	item := page.Items[0]
+	if item.Status != models.OutboxDeliveryExpired ||
+		item.ExpiresAt == nil ||
+		!item.ExpiresAt.Equal(expiresAt) ||
+		item.ExpiredAt == nil ||
+		!item.ExpiredAt.Equal(expiredAt) {
+		t.Fatalf("expired projection is incomplete: %+v", item)
+	}
+	encoded, err := json.Marshal(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{
+		"destination_id",
+		"snapshot:",
+		"locked_by",
+		"lock_token",
+		"private-worker-generation",
+		"private-credential",
+		"credential",
+	} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf(
+				"safe Outbox projection leaked %q: %s",
+				forbidden,
+				encoded,
+			)
+		}
 	}
 }
 

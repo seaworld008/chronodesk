@@ -1,4 +1,4 @@
-import { test, expect, type Locator } from '@playwright/test';
+import { test, expect } from '@playwright/test';
 import { monitorBrowserHealth } from './helpers/browserAudit';
 import {
     authenticatePage,
@@ -65,6 +65,12 @@ test.describe('Ticket Workflow', () => {
         test.setTimeout(60_000);
         const title = `${E2E_MARKER}生命周期工单`;
         const description = `${E2E_MARKER}工单描述-用于E2E验证完整流程`;
+        const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000);
+        const dueDateLocal = [
+            tomorrow.getFullYear(),
+            String(tomorrow.getMonth() + 1).padStart(2, '0'),
+            String(tomorrow.getDate()).padStart(2, '0'),
+        ].join('-') + 'T17:00';
         const token = await getAdminToken(request);
         const projectKey = await resolveE2EProjectKey(request, token);
         const ticketsPath = projectAPIPath(projectKey, 'tickets');
@@ -129,42 +135,42 @@ test.describe('Ticket Workflow', () => {
                 .click();
             await expect(page).toHaveURL(/#\/tickets\/\d+\/show/);
         };
-        const openTicketEditFromDetail = async () => {
-            await page
-                .getByRole('main')
-                .getByRole('link', { name: '编辑', exact: true })
-                .click();
-            await expect(page).toHaveURL(/#\/tickets\/\d+$/, {
-                timeout: 15_000,
-            });
-            const editForm = page.getByRole('main').locator('form');
-            await expect(editForm).toBeVisible({ timeout: 15_000 });
-            return editForm;
-        };
         const updateTicketStatus = async (
-            editForm: Locator,
             ticketID: number,
             statusLabel: '处理中' | '已解决' | '已关闭',
         ) => {
-            const statusInput = editForm.getByRole('combobox', {
-                name: '状态',
+            const statusAction = page.getByRole('button', {
+                name: '状态变更',
                 exact: true,
             });
-            await expect(statusInput).toBeVisible({ timeout: 15_000 });
+            await expect(statusAction).toBeVisible({ timeout: 15_000 });
+            await statusAction.click();
+            const dialog = page.getByRole('dialog', {
+                name: '状态变更',
+                exact: true,
+            });
+            await expect(dialog).toBeVisible();
+            const statusInput = dialog.getByRole('combobox', {
+                name: '新状态',
+                exact: true,
+            });
             await statusInput.click();
             await page
                 .getByRole('option', { name: statusLabel, exact: true })
                 .click();
             const update = page.waitForResponse(
                 (response) =>
-                    response.request().method() === 'PUT' &&
+                    response.request().method() === 'POST' &&
                     new URL(response.url()).pathname ===
                         `${ticketsPath}/${encodeURIComponent(
                             String(ticketID),
-                        )}`,
+                        )}/status`,
             );
-            await editForm
-                .getByRole('button', { name: '保存更改', exact: true })
+            await dialog
+                .getByRole('button', {
+                    name: '确认状态变更',
+                    exact: true,
+                })
                 .click();
             const updated = await update;
             expect(
@@ -208,6 +214,11 @@ test.describe('Ticket Workflow', () => {
             .getByRole('option', { name: '技术支持', exact: true })
             .click();
 
+        await page
+            .getByRole('tab', { name: '时间管理', exact: true })
+            .click();
+        await page.getByLabel('预期完成时间').fill(dueDateLocal);
+
         const create = page.waitForResponse(
             (response) =>
                 response.request().method() === 'POST' &&
@@ -219,15 +230,20 @@ test.describe('Ticket Workflow', () => {
         const createdTicket = extractData<Record<string, unknown>>(
             await createResponse.json(),
         );
+        const submittedCreate = createResponse.request().postDataJSON() as {
+            due_date?: unknown;
+        };
+        expect(typeof submittedCreate.due_date).toBe('string');
+        expect(submittedCreate.due_date).toMatch(
+            /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u,
+        );
         expect(typeof createdTicket.id).toBe('number');
         expect(typeof createdTicket.category_id).toBe('number');
         trackE2EResource('tickets', createdTicket.id as number);
         await page.waitForURL(/#\/tickets\/\d+\/show/, { timeout: 15000 });
 
         const createdTicketID = createdTicket.id as number;
-        const firstEditForm = await openTicketEditFromDetail();
         await updateTicketStatus(
-            firstEditForm,
             createdTicketID,
             '处理中',
         );
@@ -235,9 +251,7 @@ test.describe('Ticket Workflow', () => {
         await expectStatusInList('处理中');
 
         await openTicketDetailFromList();
-        const resolveEditForm = await openTicketEditFromDetail();
         await updateTicketStatus(
-            resolveEditForm,
             createdTicketID,
             '已解决',
         );
@@ -245,9 +259,7 @@ test.describe('Ticket Workflow', () => {
         await expectStatusInList('已解决');
 
         await openTicketDetailFromList();
-        const closeEditForm = await openTicketEditFromDetail();
         await updateTicketStatus(
-            closeEditForm,
             createdTicketID,
             '已关闭',
         );

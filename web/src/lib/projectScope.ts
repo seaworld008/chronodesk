@@ -2,7 +2,6 @@ import { HttpError } from 'react-admin'
 import {
     humanApiRoutes,
     type AuthorizedProjectAccess,
-    type PlatformRole,
     type ProjectRole,
 } from '@/lib/generated/human-api'
 import { projectRoleValues } from '@/lib/generated/human-api'
@@ -10,7 +9,6 @@ import {
     localizedApiErrorMessage,
     sessionAwareFetch,
 } from './apiClient'
-import { parsePlatformRole } from './accessControl'
 import {
     projectAccessInvalidatedEvent,
     projectAccessRefreshRequestedEvent,
@@ -24,6 +22,10 @@ import {
     clearStoredProjectSelection,
     legacyActiveProjectStorageKey,
 } from './humanSessionStorage'
+import {
+    readHumanSessionBinding,
+    type HumanSessionBinding,
+} from './humanTabSession'
 import { joinApiUrl } from './apiUrl'
 
 const apiBase = (import.meta.env.VITE_API_URL ?? '/api').toString().replace(/\/$/, '')
@@ -143,12 +145,10 @@ export const hasExactProjectRole = (
     return parsed !== null && allowed.includes(parsed)
 }
 
-export type HumanSessionBinding = {
-    subject: string
-    session_id: string
-    platform_role: PlatformRole
-    expires_at: number
-}
+export {
+    readHumanSessionBinding,
+    type HumanSessionBinding,
+} from './humanTabSession'
 
 type ActiveProjectRecord = {
     subject: string
@@ -225,44 +225,6 @@ const nonNegativeInteger = (value: unknown): value is number =>
 
 const nonEmptyString = (value: unknown): value is string =>
     typeof value === 'string' && value.length > 0
-
-const decodeBase64Url = (value: string): string => {
-    const normalized = value.replace(/-/g, '+').replace(/_/g, '/')
-    const padded = normalized.padEnd(
-        normalized.length + ((4 - (normalized.length % 4)) % 4),
-        '=',
-    )
-    return atob(padded)
-}
-
-export const readHumanSessionBinding = (
-    token = localStorage.getItem('token'),
-): HumanSessionBinding | null => {
-    if (!token) return null
-    const parts = token.split('.')
-    if (parts.length !== 3) return null
-    try {
-        const payload: unknown = JSON.parse(decodeBase64Url(parts[1]))
-        if (!isRecord(payload)) return null
-        const platformRole = parsePlatformRole(payload.platform_role)
-        if (
-            !nonEmptyString(payload.sub) ||
-            !nonEmptyString(payload.sid) ||
-            platformRole === null ||
-            !positiveInteger(payload.exp)
-        ) {
-            return null
-        }
-        return {
-            subject: payload.sub,
-            session_id: payload.sid,
-            platform_role: platformRole,
-            expires_at: payload.exp * 1000,
-        }
-    } catch {
-        return null
-    }
-}
 
 const bindingKey = (binding: HumanSessionBinding): string =>
     `${binding.subject}\u0000${binding.session_id}`

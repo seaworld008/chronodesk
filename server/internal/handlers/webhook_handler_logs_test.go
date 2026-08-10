@@ -185,7 +185,7 @@ func TestWebhookHandlerGetWebhookLogsReturnsScopedCursorRows(t *testing.T) {
 	}
 }
 
-func TestWebhookHandlerQueuesThenWorkerCommitsFailedDeliveryLog(
+func TestWebhookHandlerQueuesThenWorkerExpiresUncertainDelivery(
 	t *testing.T,
 ) {
 	gin.SetMode(gin.TestMode)
@@ -375,7 +375,8 @@ func TestWebhookHandlerQueuesThenWorkerCommitsFailedDeliveryLog(
 	}
 	if result.Claimed != 1 ||
 		result.Delivered != 0 ||
-		result.Failed != 1 ||
+		result.Failed != 0 ||
+		result.Expired != 1 ||
 		httpAttempts.Load() != 1 {
 		t.Fatalf(
 			"worker result=%+v HTTP attempts=%d",
@@ -383,6 +384,7 @@ func TestWebhookHandlerQueuesThenWorkerCommitsFailedDeliveryLog(
 			httpAttempts.Load(),
 		)
 	}
+	notificationService.WaitForWebhookAttemptAudits()
 	select {
 	case target := <-deliveredTargets:
 		if target != config.WebhookURL || target == changedURL {
@@ -415,10 +417,34 @@ func TestWebhookHandlerQueuesThenWorkerCommitsFailedDeliveryLog(
 		Take(&delivery).Error; err != nil {
 		t.Fatal(err)
 	}
-	if delivery.Status != models.OutboxDeliveryFailed ||
+	if delivery.Status != models.OutboxDeliveryExpired ||
 		delivery.DeliveredAt != nil ||
+		delivery.ExpiredAt == nil ||
 		delivery.Attempts != 1 {
 		t.Fatalf("worker did not finalize Outbox delivery: %+v", delivery)
+	}
+	var snapshot models.WebhookDeliverySnapshot
+	if err := db.Where("id = ?", payload.Data.SnapshotID).
+		Take(&snapshot).Error; err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Secret != "" ||
+		snapshot.PreviousSecret != "" ||
+		snapshot.PreviousSecretExpiresAt != nil ||
+		snapshot.AccessToken != "" ||
+		snapshot.CredentialShreddedAt == nil ||
+		snapshot.CredentialShredReason == nil ||
+		*snapshot.CredentialShredReason !=
+			models.WebhookCredentialShredReasonExpired {
+		t.Fatalf("uncertain delivery snapshot was not shredded: %+v", snapshot)
+	}
+	var event models.DomainEvent
+	if err := db.Where("id = ?", payload.Data.EventID).
+		Take(&event).Error; err != nil {
+		t.Fatal(err)
+	}
+	if event.PublishedAt != nil {
+		t.Fatalf("expired delivery event was published at %v", event.PublishedAt)
 	}
 }
 

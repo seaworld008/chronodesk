@@ -796,18 +796,18 @@ func (s *AgentNativeService) loadAndAuthorizeAttachmentDownload(
 			operation.Scope.ProjectID,
 		).
 		Take(destination).Error; err != nil {
-		return err
+		return observerAttachmentDownloadError(
+			access,
+			operation,
+			err,
+		)
 	}
 	if expectedTicketID != 0 &&
 		destination.TicketID != expectedTicketID {
-		return gorm.ErrRecordNotFound
-	}
-	if destination.StorageType == "staging" ||
-		destination.VirusScan != models.VirusScanClean {
-		return fmt.Errorf(
-			"%w: %s",
-			ErrAttachmentNotClean,
-			destination.VirusScan,
+		return observerAttachmentDownloadError(
+			access,
+			operation,
+			gorm.ErrRecordNotFound,
 		)
 	}
 	var ticket models.Ticket
@@ -826,7 +826,11 @@ func (s *AgentNativeService) loadAndAuthorizeAttachmentDownload(
 			operation.Scope.ProjectID,
 		).
 		Take(&ticket).Error; err != nil {
-		return err
+		return observerAttachmentDownloadError(
+			access,
+			operation,
+			err,
+		)
 	}
 	switch operation.Actor.Type {
 	case models.ActorTypeHuman:
@@ -837,7 +841,11 @@ func (s *AgentNativeService) loadAndAuthorizeAttachmentDownload(
 			false,
 			destination.IsPublic,
 		); err != nil {
-			return err
+			return observerAttachmentDownloadError(
+				access,
+				operation,
+				err,
+			)
 		}
 		if access.Role == models.ProjectRoleRequester &&
 			!destination.IsPublic {
@@ -863,7 +871,36 @@ func (s *AgentNativeService) loadAndAuthorizeAttachmentDownload(
 	default:
 		return ErrInvalidActor
 	}
+	// Visibility and ticket authorization must be evaluated before scan or
+	// storage state. Otherwise an unauthorized caller can distinguish pending,
+	// infected, or staged private attachments from resources they may not read.
+	if destination.StorageType == "staging" ||
+		destination.VirusScan != models.VirusScanClean {
+		return fmt.Errorf(
+			"%w: %s",
+			ErrAttachmentNotClean,
+			destination.VirusScan,
+		)
+	}
 	return nil
+}
+
+func observerAttachmentDownloadError(
+	access *ProjectAccess,
+	operation OperationContext,
+	err error,
+) error {
+	if err == nil ||
+		access == nil ||
+		operation.Actor.Type != models.ActorTypeHuman ||
+		access.Role != models.ProjectRoleObserver {
+		return err
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) ||
+		errors.Is(err, ErrProjectAccessDenied) {
+		return ErrAttachmentUnavailable
+	}
+	return err
 }
 
 func (s *AgentNativeService) captureAttachmentAuthorization(
@@ -979,7 +1016,7 @@ func authorizeHumanAttachmentTicket(
 	case models.ProjectRoleAdmin, models.ProjectRoleManager:
 		return nil
 	case models.ProjectRoleObserver:
-		if !write {
+		if !write && isPublic {
 			return nil
 		}
 	case models.ProjectRoleAgent:

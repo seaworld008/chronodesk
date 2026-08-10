@@ -29,6 +29,10 @@ func TestMarkOutboxFailedNeverPersistsCallbackURLQueryOrCredential(t *testing.T)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim delivery: count=%d err=%v", len(claimed), err)
 	}
+	claim, err := OutboxClaimRefFromDelivery(claimed[0])
+	if err != nil {
+		t.Fatal(err)
+	}
 	const (
 		queryToken = "query-token-must-not-persist"
 		bearer     = "bearer-credential-must-not-persist"
@@ -40,8 +44,7 @@ func TestMarkOutboxFailedNeverPersistsCallbackURLQueryOrCredential(t *testing.T)
 	)
 	if err := service.MarkOutboxFailed(
 		workerCtx,
-		claimed[0].ID,
-		"scrub-worker",
+		claim,
 		deliveryErr,
 	); err != nil {
 		t.Fatal(err)

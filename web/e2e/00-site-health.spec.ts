@@ -5,7 +5,13 @@ import {
     monitorBrowserHealth,
     waitForPrimaryPage,
 } from './helpers/browserAudit';
-import { authenticatePage } from './helpers/testData';
+import {
+    authenticatePage,
+    createTicket,
+    deleteTicket,
+    E2E_MARKER,
+} from './helpers/testData';
+import { assertDestructiveE2EAllowed } from './helpers/safety';
 
 type PrimaryPageCase = {
     caseID: string;
@@ -547,6 +553,12 @@ const assertNoSeriousOrCriticalAccessibilityIssues = async (
             targets: violation.nodes
                 .flatMap((node) => node.target)
                 .slice(0, 10),
+            html: violation.nodes
+                .map((node) => node.html)
+                .slice(0, 3),
+            failureSummaries: violation.nodes
+                .map((node) => node.failureSummary)
+                .slice(0, 3),
         }));
 
     expect(
@@ -556,6 +568,40 @@ const assertNoSeriousOrCriticalAccessibilityIssues = async (
 };
 
 test.describe('全站一级页面健康巡航', () => {
+    let dashboardTicketID = 0;
+
+    test.beforeAll(async ({ request }) => {
+        assertDestructiveE2EAllowed('全站页面健康仪表盘有数据分支');
+        dashboardTicketID = await createTicket(
+            request,
+            `${E2E_MARKER}仪表盘列表语义回归`,
+        );
+    });
+
+    test.afterAll(async ({ request }) => {
+        if (dashboardTicketID > 0) {
+            await deleteTicket(request, dashboardTicketID);
+        }
+    });
+
+    test('UI-025：键盘跳过导航后焦点停留在主要内容', async ({
+        page,
+    }) => {
+        await authenticatePage(page);
+        await page.goto('/#/');
+        await waitForPrimaryPage(page);
+
+        await page.keyboard.press('Tab');
+        const skipNavigation = page.getByRole('button', {
+            name: '跳到主要内容',
+            exact: true,
+        });
+        await expect(skipNavigation).toHaveCount(1);
+        await expect(skipNavigation).toBeFocused();
+        await page.keyboard.press('Enter');
+        await expect(page.locator('#main-content')).toBeFocused();
+    });
+
     test('UI-002：左侧导航在多视口与 200% 等效重排下无遮挡且全部可达', async ({
         page,
     }) => {

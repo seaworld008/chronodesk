@@ -33,6 +33,11 @@ import { useQueryClient } from '@tanstack/react-query'
 
 import { dataProvider } from './lib/dataProvider'
 import { authProvider } from './lib/authProvider'
+import { humanSessionStorageCommitKey } from './lib/authQueryState'
+import {
+    adoptHumanTabSessionRotation,
+    readCommittedHumanTabSessionToken,
+} from './lib/humanTabSession'
 import {
     getPlatformRoleLabel,
     hasPlatformCapability,
@@ -59,6 +64,8 @@ import {
     projectInventoryChangedEvent,
     projectScopeChangedEvent,
     sessionInvalidatedEvent,
+    sessionReplacedEvent,
+    signalSessionReplaced,
 } from './lib/projectScopeEvents'
 
 import {
@@ -85,6 +92,7 @@ import {
 
 import { CustomLayout as Layout } from './layout/CustomLayout'
 import { CustomAppBar } from './layout/CustomAppBar'
+import { focusMainContent } from './layout/skipNavigation'
 import LoginPage from './components/auth/LoginPage'
 import { AppNotification } from './components/layout/AppNotification'
 import { i18nProvider, muiZhCN } from './i18n'
@@ -134,6 +142,21 @@ const lazyPage = <P extends object>(
     return LazyPage
 }
 
+const RegisterPage = lazyPage(
+    () => import('./components/auth/RegisterPage'),
+)
+const ForgotPasswordPage = lazyPage(
+    () => import('./components/auth/ForgotPasswordPage'),
+)
+const ResetPasswordPage = lazyPage(
+    () => import('./components/auth/ResetPasswordPage'),
+)
+const VerifyEmailPage = lazyPage(
+    () => import('./components/auth/VerifyEmailPage'),
+)
+const ResendVerificationPage = lazyPage(
+    () => import('./components/auth/ResendVerificationPage'),
+)
 const TicketDashboard = lazyPage(() => import('./admin/tickets/TicketDashboard'))
 const TicketList = lazyPage(() => import('./admin/tickets/TicketListEnhanced'))
 const TicketShow = lazyPage(() => import('./admin/tickets/TicketShow'))
@@ -264,6 +287,11 @@ const theme = createTheme(
         },
         shape: { borderRadius: 12 },
         components: {
+            RaSkipNavigationButton: {
+                defaultProps: {
+                    onClick: focusMainContent,
+                },
+            },
             RaEmpty: {
                 styleOverrides: {
                     root: {
@@ -1004,6 +1032,7 @@ const AppRuntimeCoordinator = () => {
     const queryClient = useQueryClient()
     const navigate = useNavigate()
     const handlingSessionInvalidation = React.useRef(false)
+    const storageRevalidationTimer = React.useRef<number | null>(null)
 
     React.useEffect(() => {
         const clearRuntimeCaches = () => {
@@ -1042,6 +1071,35 @@ const AppRuntimeCoordinator = () => {
                     handlingSessionInvalidation.current = false
                 })
         }
+        const handleSessionReplaced = () => {
+            if (handlingSessionInvalidation.current) return
+            handlingSessionInvalidation.current = true
+            clearActiveProjectSelection()
+            clearRuntimeCaches()
+            if (localStorage.getItem('token')) {
+                window.location.reload()
+                return
+            }
+            navigate('/login', { replace: true })
+            handlingSessionInvalidation.current = false
+        }
+        const handleAuthenticationStorage = (event: StorageEvent) => {
+            if (event.key !== humanSessionStorageCommitKey) return
+            if (storageRevalidationTimer.current !== null) {
+                window.clearTimeout(storageRevalidationTimer.current)
+            }
+            storageRevalidationTimer.current = window.setTimeout(() => {
+                storageRevalidationTimer.current = null
+                const committedAccessToken =
+                    readCommittedHumanTabSessionToken()
+                if (
+                    committedAccessToken === null ||
+                    !adoptHumanTabSessionRotation(committedAccessToken)
+                ) {
+                    signalSessionReplaced()
+                }
+            }, 25)
+        }
 
         window.addEventListener(
             projectInventoryChangedEvent,
@@ -1059,7 +1117,16 @@ const AppRuntimeCoordinator = () => {
             sessionInvalidatedEvent,
             handleSessionInvalidated,
         )
+        window.addEventListener(
+            sessionReplacedEvent,
+            handleSessionReplaced,
+        )
+        window.addEventListener('storage', handleAuthenticationStorage)
         return () => {
+            if (storageRevalidationTimer.current !== null) {
+                window.clearTimeout(storageRevalidationTimer.current)
+                storageRevalidationTimer.current = null
+            }
             window.removeEventListener(
                 projectInventoryChangedEvent,
                 handleProjectInventoryChanged,
@@ -1075,6 +1142,14 @@ const AppRuntimeCoordinator = () => {
             window.removeEventListener(
                 sessionInvalidatedEvent,
                 handleSessionInvalidated,
+            )
+            window.removeEventListener(
+                sessionReplacedEvent,
+                handleSessionReplaced,
+            )
+            window.removeEventListener(
+                'storage',
+                handleAuthenticationStorage,
             )
         }
     }, [navigate, queryClient])
@@ -1102,6 +1177,22 @@ const AdminApp: React.FC = () => (
         notification={AppNotification}
         requireAuth
     >
+        <CustomRoutes noLayout>
+            <Route path="/register" element={<RegisterPage />} />
+            <Route
+                path="/forgot-password"
+                element={<ForgotPasswordPage />}
+            />
+            <Route
+                path="/reset-password"
+                element={<ResetPasswordPage />}
+            />
+            <Route path="/verify-email" element={<VerifyEmailPage />} />
+            <Route
+                path="/resend-verification"
+                element={<ResendVerificationPage />}
+            />
+        </CustomRoutes>
         <Resource
             name="tickets"
             list={ProjectTicketList}

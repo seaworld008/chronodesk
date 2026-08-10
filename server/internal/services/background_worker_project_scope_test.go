@@ -173,6 +173,10 @@ func TestMarkOutboxFailedLocksAndUpdatesInOneAtomicTransaction(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim delivery: count=%d err=%v", len(claimed), err)
 	}
+	claim, err := OutboxClaimRefFromDelivery(claimed[0])
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	type atomicMarker struct{}
 	markedCtx := context.WithValue(workerCtx, atomicMarker{}, true)
@@ -228,8 +232,7 @@ func TestMarkOutboxFailedLocksAndUpdatesInOneAtomicTransaction(t *testing.T) {
 
 	err = service.MarkOutboxFailed(
 		markedCtx,
-		claimed[0].ID,
-		"atomic-worker",
+		claim,
 		errors.New("destination failed"),
 	)
 	if !errors.Is(err, injected) {
@@ -406,7 +409,10 @@ func TestSLASchedulerScansEveryActiveProject(t *testing.T) {
 	if err := db.Model(&models.Ticket{}).
 		Where("id IN ?", []uint{ticketA.ID, ticketB.ID}).
 		Updates(map[string]any{
-			"created_at":   time.Now().Add(-48 * time.Hour),
+			// Keep this fixture overdue on every weekday and weekend. The
+			// default SLA excludes weekends, so a 48-hour offset is not
+			// sufficient when the test runs on Sunday.
+			"created_at":   time.Now().Add(-14 * 24 * time.Hour),
 			"sla_due_date": nil,
 			"sla_breached": false,
 		}).Error; err != nil {

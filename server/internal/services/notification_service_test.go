@@ -175,6 +175,15 @@ func TestWebhookOutboxAttemptHasHardTimeoutAndNoLegacyRetry(t *testing.T) {
 	defer endpoint.Close()
 
 	db := openTestDB(t)
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sqlDB.Close(); err != nil {
+			t.Errorf("close webhook timeout test database: %v", err)
+		}
+	})
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.WebhookConfig{},
@@ -224,6 +233,7 @@ func TestWebhookOutboxAttemptHasHardTimeoutAndNoLegacyRetry(t *testing.T) {
 	snapshot, err := models.NewWebhookDeliverySnapshot(
 		config,
 		event.Metadata["event_id"],
+		time.Now().UTC().Add(models.WebhookDeliveryCredentialLifetime),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -231,12 +241,24 @@ func TestWebhookOutboxAttemptHasHardTimeoutAndNoLegacyRetry(t *testing.T) {
 	if err := db.Create(snapshot).Error; err != nil {
 		t.Fatal(err)
 	}
-	err = service.SendWebhookSnapshotOutboxAttempt(
+	snapshotConfig, err := snapshot.WebhookConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.revealWebhookSecrets(&snapshotConfig); err != nil {
+		t.Fatal(err)
+	}
+	attemptCtx, cancelAttempt := context.WithTimeout(
 		context.Background(),
-		models.ProjectScope{OrganizationID: 1, ProjectID: 10},
-		snapshot.ID,
+		service.outboxWebhookTimeout,
+	)
+	attemptResult := service.sendWebhookAttemptResult(
+		attemptCtx,
+		&snapshotConfig,
 		event,
 	)
+	err = attemptResult.Err
+	cancelAttempt()
 	elapsed := time.Since(started)
 	close(releaseHandler)
 	if err == nil {
@@ -248,6 +270,7 @@ func TestWebhookOutboxAttemptHasHardTimeoutAndNoLegacyRetry(t *testing.T) {
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("Outbox webhook made %d attempts, want 1", got)
 	}
+	service.waitForWebhookAttemptAudits()
 	var log models.WebhookLog
 	if err := db.Order("id DESC").First(&log).Error; err != nil {
 		t.Fatal(err)
@@ -440,6 +463,7 @@ func TestCustomWebhookWithoutSecretFailsClosed(t *testing.T) {
 	snapshot, err := models.NewWebhookDeliverySnapshot(
 		config,
 		event.Metadata["event_id"],
+		time.Now().UTC().Add(models.WebhookDeliveryCredentialLifetime),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -447,18 +471,23 @@ func TestCustomWebhookWithoutSecretFailsClosed(t *testing.T) {
 	if err := db.Create(snapshot).Error; err != nil {
 		t.Fatal(err)
 	}
-	err = service.SendWebhookSnapshotOutboxAttempt(
+	snapshotConfig, err := snapshot.WebhookConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptCtx, cancelAttempt := context.WithDeadline(
 		context.Background(),
-		models.ProjectScope{OrganizationID: 1, ProjectID: 20},
-		snapshot.ID,
-		event,
+		snapshot.CredentialExpiresAt,
 	)
+	err = service.sendWebhookAttempt(attemptCtx, &snapshotConfig, event)
+	cancelAttempt()
 	if err == nil || !strings.Contains(err.Error(), "缺少签名密钥") {
 		t.Fatalf("unsigned custom Webhook error = %v", err)
 	}
 	if attempts.Load() != 0 {
 		t.Fatalf("unsigned custom Webhook made %d HTTP attempts", attempts.Load())
 	}
+	service.waitForWebhookAttemptAudits()
 	var log models.WebhookLog
 	if err := db.Order("id DESC").First(&log).Error; err != nil {
 		t.Fatal(err)

@@ -423,12 +423,14 @@ func TestIntegrationInboxAndReceiptResponsesAreRedacted(t *testing.T) {
 		EventID:         event.ID,
 		DestinationType: "webhook",
 		DestinationID:   "vault://outbox-destination-secret",
-		Status:          models.OutboxDeliveryFailed,
+		Status:          models.OutboxDeliveryExpired,
 		Attempts:        1,
 		MaxAttempts:     8,
 		NextAttemptAt:   now,
 		LockedBy:        "private-worker",
 		LastError:       "Authorization: Bearer outbox-access-token",
+		ExpiresAt:       &now,
+		ExpiredAt:       &now,
 	}
 	if err := environment.db.Create(&outbox).Error; err != nil {
 		t.Fatal(err)
@@ -459,6 +461,22 @@ func TestIntegrationInboxAndReceiptResponsesAreRedacted(t *testing.T) {
 			)
 		}
 		body := response.Body.String()
+		if strings.HasSuffix(path, "/integrations/outbox") {
+			for _, required := range []string{
+				`"status":"expired"`,
+				`"expires_at":"`,
+				`"expired_at":"`,
+			} {
+				if !strings.Contains(body, required) {
+					t.Fatalf(
+						"path %s omitted safe field %q: %s",
+						path,
+						required,
+						body,
+					)
+				}
+			}
+		}
 		for _, forbidden := range []string{
 			"payload-secret",
 			"signature-secret",
@@ -490,6 +508,11 @@ func TestIntegrationInboxAndReceiptResponsesAreRedacted(t *testing.T) {
 func newIntegrationHandlerEnvironment(t *testing.T) integrationHandlerEnvironment {
 	t.Helper()
 	db := openHandlerTestDB(t)
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
 	if err := db.AutoMigrate(
 		&models.Organization{},
 		&models.BusinessUnit{},

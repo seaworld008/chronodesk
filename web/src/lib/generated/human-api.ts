@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.1.0.
- * Contract SHA-256: 3851c27205f5db8e02d18396de3c930ada3da06391c448a02ba21a1700b0ee4f.
+ * Contract SHA-256: 340d0cf947642aec27b46eaf826f2af3ecd3aeb3de4ccb2bf1bbb5d888d645a4.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -16,6 +16,17 @@ export type UserStatus = "active" | "inactive" | "suspended" | "deleted"
 export type ProjectStatus = "active" | "archived"
 
 export type PublicUUIDv7 = string
+
+export type RegisterHumanRequest = {
+    username: string
+    email: string
+    password: string
+    confirm_password: string
+    first_name?: string
+    last_name?: string
+    department?: string
+    position?: string
+}
 
 export type LoginRequest = {
     email: string
@@ -36,6 +47,14 @@ export type ForgotPasswordRequest = {
 export type ResetHumanPasswordRequest = {
     token: string
     new_password: string
+}
+
+export type VerifyHumanEmailRequest = {
+    token: string
+}
+
+export type ResendHumanEmailVerificationRequest = {
+    email: string
 }
 
 export type LogoutRequest = {
@@ -137,6 +156,14 @@ export type AuthSession = {
     refresh_token: string
     expires_in: number
     token_type: "Bearer"
+}
+
+export type HumanRegistrationResult = {
+    user: HumanSessionUser
+    access_token: string
+    refresh_token: string
+    expires_in: number
+    token_type: "" | "Bearer"
 }
 
 export type PlatformProjectSummary = {
@@ -441,6 +468,18 @@ export type AdminAuditExportEnvelope = SuccessEnvelope & {
     data: AdminAuditExport
 }
 
+export type RegenerateOTPBackupCodesRequest = {
+    current_password: string
+}
+
+export type OTPBackupCodeRegenerationEnvelope = {
+    success: true
+    message: string
+    data: {
+        backup_codes: Array<string>
+    }
+}
+
 export type SuccessEnvelope = {
     code: 0
     msg: string
@@ -506,6 +545,12 @@ export type ErrorEnvelope = StandardErrorEnvelope | AuthErrorEnvelope | CodedErr
 
 export type AuthSessionEnvelope = SuccessEnvelope & {
     data: AuthSession
+}
+
+export type HumanRegistrationEnvelope = {
+    code: 0
+    msg: "注册成功"
+    data: HumanRegistrationResult
 }
 
 export type AuthSessionSuccessEnvelope = {
@@ -656,6 +701,15 @@ export type UpdateTicketStatusRequest = {
     status: TicketStatus
     comment?: string
     resolution_notes?: string
+}
+
+export type TicketAllowedTransitions = {
+    allowed_next_statuses: Array<TicketStatus>
+}
+
+export type TicketAllowedTransitionsEnvelope = {
+    success: true
+    data: TicketAllowedTransitions
 }
 
 export type TicketWorkflowEnvelope = {
@@ -857,18 +911,18 @@ export type Ticket = {
     sla_due_date: string | null
     response_time: number | null
     resolution_time: number | null
-    customer_email: string
-    customer_phone: string
-    customer_name: string
+    customer_email?: string
+    customer_phone?: string
+    customer_name?: string
     custom_fields: unknown
     view_count: number
     comment_count: number
     rating: number | null
     rating_comment: string
     version: number
-    agent_context: AgentContext
+    agent_context?: AgentContext
     trust_level: TicketTrustLevel
-    created_by_actor: ActorRef
+    created_by_actor?: ActorRef
     assigned_to_actor?: ActorRef
     is_overdue: boolean
     is_escalated: boolean
@@ -1018,7 +1072,7 @@ export type CreateNotificationRequest = {
     title: string
     content: string
     priority?: NotificationPriority
-    channel?: NotificationChannel
+    channel?: "in_app" | "email"
     recipient_id: number
     sender_id?: number | null
     related_type?: string
@@ -1028,6 +1082,12 @@ export type CreateNotificationRequest = {
     scheduled_at?: string | null
     expires_at?: string | null
     metadata?: unknown
+}
+
+export type NotificationTicketSummary = {
+    id: number
+    ticket_number: string
+    title: string
 }
 
 export type Notification = {
@@ -1043,7 +1103,7 @@ export type Notification = {
     sender?: HumanUserSummary
     related_type: string
     related_id: number | null
-    related_ticket?: Ticket
+    related_ticket: NotificationTicketSummary | null
     is_read: boolean
     read_at: string | null
     is_sent: boolean
@@ -1066,31 +1126,27 @@ export type NotificationPage = {
 }
 
 export type NotificationPreference = {
-    id: number
-    created_at: string
-    updated_at: string
-    user_id: number
     notification_type: NotificationType
     email_enabled: boolean
     in_app_enabled: boolean
-    webhook_enabled: boolean
+    webhook_enabled: false
     do_not_disturb_start: string | null
     do_not_disturb_end: string | null
     max_daily_count: number
-    batch_delivery: boolean
-    batch_interval: number
+    batch_delivery: false
+    batch_interval: 60
 }
 
 export type NotificationPreferenceUpdate = {
     notification_type: NotificationType
     email_enabled: boolean
     in_app_enabled: boolean
-    webhook_enabled: boolean
+    webhook_enabled: false
     do_not_disturb_start?: string | null
     do_not_disturb_end?: string | null
     max_daily_count: number
-    batch_delivery: boolean
-    batch_interval: number
+    batch_delivery: false
+    batch_interval: 60
 }
 
 export type UpdateNotificationPreferencesRequest = {
@@ -1732,10 +1788,12 @@ export type AdminOutboxDeliverySummary = {
     event_id: string
     destination_type: "webhook" | "event_stream" | "automation" | "notification" | "sla" | "sla_escalation" | "attachment_upload" | "attachment_cleanup" | "attachment_staging_cleanup" | "a2a_push" | "email" | "other"
     destination_label: string
-    status: "pending" | "processing" | "succeeded" | "failed" | "dead"
+    status: "pending" | "processing" | "succeeded" | "failed" | "dead" | "expired"
     attempts: number
     next_attempt_at: string
     last_error: string
+    expires_at: string | null
+    expired_at: string | null
     updated_at: string
     resource_version: ResourceVersion
 }
@@ -1774,7 +1832,7 @@ export type Problem = {
     title: string
     status: number
     detail?: string
-    code: "invalid_request" | "precondition_required" | "unauthorized" | "invalid_actor" | "invalid_scope" | "principal_not_found" | "principal_disabled" | "principal_expired" | "invalid_credential" | "credential_expired" | "insufficient_scope" | "policy_denied" | "agent_emergency_stop" | "read_only" | "automation_loop" | "not_found" | "version_conflict" | "lease_conflict" | "lease_expired" | "lease_not_owned" | "idempotency_conflict" | "idempotency_in_progress" | "command_scope_mismatch" | "outbox_replay_conflict" | "rate_limited" | "concurrency_limit" | "attachment_rejected" | "attachment_too_large" | "attachment_not_clean" | "invalid_attachment_name" | "service_unavailable" | "internal_error"
+    code: "invalid_request" | "precondition_required" | "unauthorized" | "invalid_actor" | "invalid_scope" | "principal_not_found" | "principal_disabled" | "principal_expired" | "invalid_credential" | "credential_expired" | "insufficient_scope" | "policy_denied" | "agent_emergency_stop" | "read_only" | "automation_loop" | "not_found" | "version_conflict" | "lease_conflict" | "lease_expired" | "lease_not_owned" | "idempotency_conflict" | "idempotency_in_progress" | "command_scope_mismatch" | "outbox_replay_conflict" | "outbox_replay_expired" | "rate_limited" | "concurrency_limit" | "attachment_rejected" | "attachment_too_large" | "attachment_not_clean" | "invalid_attachment_name" | "service_unavailable" | "internal_error"
     request_id: string
     retryable: boolean
 }
@@ -2837,7 +2895,7 @@ export type IntegrationConflictResolution = "resolved" | "ignored"
 
 export type IntegrationDeadLetterStatus = "open" | "requeued" | "resolved"
 
-export type IntegrationOutboxDeliveryStatus = "pending" | "processing" | "succeeded" | "failed" | "dead"
+export type IntegrationOutboxDeliveryStatus = "pending" | "processing" | "succeeded" | "failed" | "dead" | "expired"
 
 export type IntegrationConnectorDefinitionSummary = {
     id: IntegrationResourceID
@@ -3009,6 +3067,8 @@ export type IntegrationOutboxSummary = {
     next_attempt_at: string
     last_error?: string
     delivered_at?: string
+    expires_at: string | null
+    expired_at: string | null
     created_at: string
     updated_at: string
 }
@@ -3325,6 +3385,11 @@ export type IntegrationInboundReplayEnvelope = {
     data: IntegrationInboundReplayResult
 }
 
+export type RegisterHumanOperationPathParameters = Record<string, never>
+export type RegisterHumanOperationQuery = Record<string, never>
+export type RegisterHumanOperationRequest = RegisterHumanRequest
+export type RegisterHumanOperationResponse = HumanRegistrationEnvelope
+
 export type CreateHumanSessionOperationPathParameters = Record<string, never>
 export type CreateHumanSessionOperationQuery = Record<string, never>
 export type CreateHumanSessionOperationRequest = LoginRequest
@@ -3345,6 +3410,16 @@ export type ResetHumanPasswordOperationQuery = Record<string, never>
 export type ResetHumanPasswordOperationRequest = ResetHumanPasswordRequest
 export type ResetHumanPasswordOperationResponse = AuthMessageSuccessEnvelope
 
+export type VerifyHumanEmailOperationPathParameters = Record<string, never>
+export type VerifyHumanEmailOperationQuery = Record<string, never>
+export type VerifyHumanEmailOperationRequest = VerifyHumanEmailRequest
+export type VerifyHumanEmailOperationResponse = AuthMessageSuccessEnvelope
+
+export type ResendHumanEmailVerificationOperationPathParameters = Record<string, never>
+export type ResendHumanEmailVerificationOperationQuery = Record<string, never>
+export type ResendHumanEmailVerificationOperationRequest = ResendHumanEmailVerificationRequest
+export type ResendHumanEmailVerificationOperationResponse = AuthMessageSuccessEnvelope
+
 export type DeleteHumanSessionOperationPathParameters = Record<string, never>
 export type DeleteHumanSessionOperationQuery = Record<string, never>
 export type DeleteHumanSessionOperationRequest = LogoutRequest
@@ -3364,6 +3439,11 @@ export type UpdateHumanProfileOperationPathParameters = Record<string, never>
 export type UpdateHumanProfileOperationQuery = Record<string, never>
 export type UpdateHumanProfileOperationRequest = UpdateHumanProfileRequest
 export type UpdateHumanProfileOperationResponse = AuthMessageSuccessEnvelope
+
+export type RegenerateOTPBackupCodesOperationPathParameters = Record<string, never>
+export type RegenerateOTPBackupCodesOperationQuery = Record<string, never>
+export type RegenerateOTPBackupCodesOperationRequest = RegenerateOTPBackupCodesRequest
+export type RegenerateOTPBackupCodesOperationResponse = OTPBackupCodeRegenerationEnvelope
 
 export type ListTrustedDevicesOperationPathParameters = Record<string, never>
 export type ListTrustedDevicesOperationQuery = {
@@ -3747,6 +3827,14 @@ export type UpdateProjectTicketStatusOperationQuery = Record<string, never>
 export type UpdateProjectTicketStatusOperationRequest = UpdateTicketStatusRequest
 export type UpdateProjectTicketStatusOperationResponse = TicketWorkflowEnvelope
 
+export type GetProjectTicketAllowedTransitionsOperationPathParameters = {
+    projectKey: string
+    ticketID: number
+}
+export type GetProjectTicketAllowedTransitionsOperationQuery = Record<string, never>
+export type GetProjectTicketAllowedTransitionsOperationRequest = never
+export type GetProjectTicketAllowedTransitionsOperationResponse = TicketAllowedTransitionsEnvelope
+
 export type ListProjectTicketHistoryOperationPathParameters = {
     projectKey: string
     ticketID: number
@@ -3912,7 +4000,7 @@ export type UpdateProjectAutomationRuleOperationPathParameters = {
 }
 export type UpdateProjectAutomationRuleOperationQuery = Record<string, never>
 export type UpdateProjectAutomationRuleOperationRequest = AutomationRuleRequest
-export type UpdateProjectAutomationRuleOperationResponse = LegacyMessageSuccessEnvelope
+export type UpdateProjectAutomationRuleOperationResponse = AutomationRuleEnvelope
 
 export type DeleteProjectAutomationRuleOperationPathParameters = {
     projectKey: string
@@ -4870,6 +4958,13 @@ export type ListProjectIntegrationOutboxDeliveriesOperationRequest = never
 export type ListProjectIntegrationOutboxDeliveriesOperationResponse = IntegrationOutboxPageEnvelope
 
 export const humanApiOperations = {
+    registerHuman: {
+        method: "POST",
+        path: "/auth/register",
+        successStatus: 201,
+        requestBody: "required",
+        listStrategy: null,
+    },
     createHumanSession: {
         method: "POST",
         path: "/auth/login",
@@ -4894,6 +4989,20 @@ export const humanApiOperations = {
     resetHumanPassword: {
         method: "POST",
         path: "/auth/reset-password",
+        successStatus: 200,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    verifyHumanEmail: {
+        method: "POST",
+        path: "/auth/verify-email",
+        successStatus: 200,
+        requestBody: "required",
+        listStrategy: null,
+    },
+    resendHumanEmailVerification: {
+        method: "POST",
+        path: "/auth/resend-verification",
         successStatus: 200,
         requestBody: "required",
         listStrategy: null,
@@ -4925,6 +5034,13 @@ export const humanApiOperations = {
         successStatus: 200,
         requestBody: "required",
         listStrategy: null,
+    },
+    regenerateOTPBackupCodes: {
+        method: "POST",
+        path: "/auth/otp/backup-codes",
+        successStatus: 200,
+        requestBody: "required",
+        listStrategy: "bounded",
     },
     listTrustedDevices: {
         method: "GET",
@@ -5211,6 +5327,13 @@ export const humanApiOperations = {
         path: "/projects/{projectKey}/tickets/{ticketID}/status",
         successStatus: 200,
         requestBody: "required",
+        listStrategy: "bounded",
+    },
+    getProjectTicketAllowedTransitions: {
+        method: "GET",
+        path: "/projects/{projectKey}/tickets/{ticketID}/transitions",
+        successStatus: 200,
+        requestBody: "none",
         listStrategy: "bounded",
     },
     listProjectTicketHistory: {
@@ -6014,6 +6137,12 @@ export const humanApiOperations = {
 } as const
 
 export interface HumanApiOperationTypes {
+    registerHuman: {
+        pathParameters: RegisterHumanOperationPathParameters
+        query: RegisterHumanOperationQuery
+        request: RegisterHumanOperationRequest
+        response: RegisterHumanOperationResponse
+    }
     createHumanSession: {
         pathParameters: CreateHumanSessionOperationPathParameters
         query: CreateHumanSessionOperationQuery
@@ -6038,6 +6167,18 @@ export interface HumanApiOperationTypes {
         request: ResetHumanPasswordOperationRequest
         response: ResetHumanPasswordOperationResponse
     }
+    verifyHumanEmail: {
+        pathParameters: VerifyHumanEmailOperationPathParameters
+        query: VerifyHumanEmailOperationQuery
+        request: VerifyHumanEmailOperationRequest
+        response: VerifyHumanEmailOperationResponse
+    }
+    resendHumanEmailVerification: {
+        pathParameters: ResendHumanEmailVerificationOperationPathParameters
+        query: ResendHumanEmailVerificationOperationQuery
+        request: ResendHumanEmailVerificationOperationRequest
+        response: ResendHumanEmailVerificationOperationResponse
+    }
     deleteHumanSession: {
         pathParameters: DeleteHumanSessionOperationPathParameters
         query: DeleteHumanSessionOperationQuery
@@ -6061,6 +6202,12 @@ export interface HumanApiOperationTypes {
         query: UpdateHumanProfileOperationQuery
         request: UpdateHumanProfileOperationRequest
         response: UpdateHumanProfileOperationResponse
+    }
+    regenerateOTPBackupCodes: {
+        pathParameters: RegenerateOTPBackupCodesOperationPathParameters
+        query: RegenerateOTPBackupCodesOperationQuery
+        request: RegenerateOTPBackupCodesOperationRequest
+        response: RegenerateOTPBackupCodesOperationResponse
     }
     listTrustedDevices: {
         pathParameters: ListTrustedDevicesOperationPathParameters
@@ -6307,6 +6454,12 @@ export interface HumanApiOperationTypes {
         query: UpdateProjectTicketStatusOperationQuery
         request: UpdateProjectTicketStatusOperationRequest
         response: UpdateProjectTicketStatusOperationResponse
+    }
+    getProjectTicketAllowedTransitions: {
+        pathParameters: GetProjectTicketAllowedTransitionsOperationPathParameters
+        query: GetProjectTicketAllowedTransitionsOperationQuery
+        request: GetProjectTicketAllowedTransitionsOperationRequest
+        response: GetProjectTicketAllowedTransitionsOperationResponse
     }
     listProjectTicketHistory: {
         pathParameters: ListProjectTicketHistoryOperationPathParameters
@@ -7069,6 +7222,8 @@ export const buildHumanApiRequest = <Operation extends HumanApiOperationId>(
 }
 
 export const humanApiRoutes = {
+    registerHuman: (query: RegisterHumanOperationQuery = {}) =>
+        humanApiRoute("registerHuman", {}, query),
     createHumanSession: (query: CreateHumanSessionOperationQuery = {}) =>
         humanApiRoute("createHumanSession", {}, query),
     refreshHumanSession: (query: RefreshHumanSessionOperationQuery = {}) =>
@@ -7077,6 +7232,10 @@ export const humanApiRoutes = {
         humanApiRoute("requestHumanPasswordReset", {}, query),
     resetHumanPassword: (query: ResetHumanPasswordOperationQuery = {}) =>
         humanApiRoute("resetHumanPassword", {}, query),
+    verifyHumanEmail: (query: VerifyHumanEmailOperationQuery = {}) =>
+        humanApiRoute("verifyHumanEmail", {}, query),
+    resendHumanEmailVerification: (query: ResendHumanEmailVerificationOperationQuery = {}) =>
+        humanApiRoute("resendHumanEmailVerification", {}, query),
     deleteHumanSession: (query: DeleteHumanSessionOperationQuery = {}) =>
         humanApiRoute("deleteHumanSession", {}, query),
     deleteAllHumanSessions: (query: DeleteAllHumanSessionsOperationQuery = {}) =>
@@ -7085,6 +7244,8 @@ export const humanApiRoutes = {
         humanApiRoute("getHumanSessionUser", {}, query),
     updateHumanProfile: (query: UpdateHumanProfileOperationQuery = {}) =>
         humanApiRoute("updateHumanProfile", {}, query),
+    regenerateOTPBackupCodes: (query: RegenerateOTPBackupCodesOperationQuery = {}) =>
+        humanApiRoute("regenerateOTPBackupCodes", {}, query),
     listTrustedDevices: (query: ListTrustedDevicesOperationQuery = {}) =>
         humanApiRoute("listTrustedDevices", {}, query),
     revokeTrustedDevice: (pathParameters: RevokeTrustedDeviceOperationPathParameters, query: RevokeTrustedDeviceOperationQuery = {}) =>
@@ -7167,6 +7328,8 @@ export const humanApiRoutes = {
         humanApiRoute("escalateProjectTicket", pathParameters, query),
     updateProjectTicketStatus: (pathParameters: UpdateProjectTicketStatusOperationPathParameters, query: UpdateProjectTicketStatusOperationQuery = {}) =>
         humanApiRoute("updateProjectTicketStatus", pathParameters, query),
+    getProjectTicketAllowedTransitions: (pathParameters: GetProjectTicketAllowedTransitionsOperationPathParameters, query: GetProjectTicketAllowedTransitionsOperationQuery = {}) =>
+        humanApiRoute("getProjectTicketAllowedTransitions", pathParameters, query),
     listProjectTicketHistory: (pathParameters: ListProjectTicketHistoryOperationPathParameters, query: ListProjectTicketHistoryOperationQuery = {}) =>
         humanApiRoute("listProjectTicketHistory", pathParameters, query),
     listProjectTicketComments: (pathParameters: ListProjectTicketCommentsOperationPathParameters, query: ListProjectTicketCommentsOperationQuery = {}) =>

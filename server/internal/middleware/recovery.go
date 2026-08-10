@@ -85,12 +85,22 @@ func getStack(stackSize int, disableStackAll bool) []byte {
 
 // logPanic 记录panic日志
 func logPanic(logger Logger, err interface{}, stack []byte, c HTTPContext, config *RecoveryConfig) {
+	sensitiveAuthenticationRoute :=
+		isSensitiveAuthenticationLoggingRoute(c)
+	errorValue := fmt.Sprintf("%v", err)
+	userAgent := c.GetHeader("User-Agent")
+	if sensitiveAuthenticationRoute {
+		errorValue = "sensitive_authentication_route_panic"
+		userAgent = ""
+	}
 	fields := []Field{
-		{"error", fmt.Sprintf("%v", err)},
+		{"error", errorValue},
 		{"method", getMethod(c)},
 		{"path", getPath(c)},
 		{"ip", getClientIP(c)},
-		{"user_agent", c.GetHeader("User-Agent")},
+	}
+	if !sensitiveAuthenticationRoute {
+		fields = append(fields, Field{"user_agent", userAgent})
 	}
 
 	// 添加用户信息
@@ -99,12 +109,14 @@ func logPanic(logger Logger, err interface{}, stack []byte, c HTTPContext, confi
 	}
 
 	// 添加请求ID
-	if requestID := getRequestID(c); requestID != "" {
+	if requestID := requestIDForLogs(c); requestID != "" {
 		fields = append(fields, Field{"request_id", requestID})
 	}
 
 	// 添加堆栈信息
-	if len(stack) > 0 && !config.DisablePrintStack {
+	if len(stack) > 0 &&
+		!config.DisablePrintStack &&
+		!sensitiveAuthenticationRoute {
 		fields = append(fields, Field{"stack", string(stack)})
 	}
 
@@ -119,7 +131,7 @@ func defaultErrorResponse(c HTTPContext, _ interface{}) {
 		c.Abort()
 		return
 	}
-	requestID := getRequestID(c)
+	requestID := requestIDForLogs(c)
 	errorBody := map[string]interface{}{
 		"code":    "internal_error",
 		"message": "服务器内部错误，请稍后重试",

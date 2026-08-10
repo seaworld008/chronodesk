@@ -21,6 +21,18 @@ const principalRowName = new RegExp(
 );
 const credentialGuardTestTitle =
     'AGT-014：一次性凭据写入期间锁定项目切换且保存后自动解锁';
+const expiredOutboxTestTitle =
+    'AGT-016：已过期投递显示中文终态、安全投影且零回放请求';
+const replayExpiryRaceTestTitle =
+    'AGT-017：回放到期竞态显示稳定中文并安全刷新终态';
+const mockOnlyAgentTestTitles = new Set([
+    credentialGuardTestTitle,
+    expiredOutboxTestTitle,
+    replayExpiryRaceTestTitle,
+]);
+const agentOutboxDeliveryID =
+    '00000000-0000-7000-8000-000000000116';
+const agentOutboxTimestamp = '2026-08-10T08:00:00Z';
 
 const installAgentControlMockSession = async (
     page: import('@playwright/test').Page,
@@ -115,21 +127,185 @@ const installAgentControlMockSession = async (
     });
 };
 
+const installAgentOutboxMockBackend = async (
+    page: import('@playwright/test').Page,
+    mode: 'expired' | 'race',
+) => {
+    await installAgentControlMockSession(page);
+    let expired = mode === 'expired';
+    let agentOutboxLoads = 0;
+    let replayPosts = 0;
+    const directory = <T,>(items: T[], pageSize = 25) => ({
+        items,
+        total: items.length,
+        page: 1,
+        page_size: pageSize,
+        total_pages: items.length > 0 ? 1 : 0,
+    });
+    const adminRow = () => ({
+        id: agentOutboxDeliveryID,
+        created_at: agentOutboxTimestamp,
+        event_id: '00000000-0000-7000-8000-000000000115',
+        destination_type: 'webhook',
+        destination_label: '客户通知 Webhook',
+        status: expired ? 'expired' : 'failed',
+        attempts: 2,
+        next_attempt_at: agentOutboxTimestamp,
+        last_error: expired ? '投递截止时间已到' : '上游暂不可用',
+        expires_at: agentOutboxTimestamp,
+        expired_at: expired ? agentOutboxTimestamp : null,
+        updated_at: agentOutboxTimestamp,
+        resource_version: expired ? 8 : 7,
+    });
+
+    await page.route('**/api/**', async (route) => {
+        const request = route.request();
+        const url = new URL(request.url());
+        if (
+            url.pathname === '/api/auth/me'
+            || url.pathname === '/api/projects'
+        ) {
+            await route.fallback();
+            return;
+        }
+        const projectResource = url.pathname.match(
+            /^\/api\/projects\/WRITE-ORIGINAL\/(.+)$/u,
+        )?.[1];
+        if (projectResource === 'context') {
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({
+                    code: 0,
+                    msg: 'ok',
+                    data: {
+                        project: {
+                            id: 71,
+                            public_id:
+                                '00000000-0000-7000-8000-000000000071',
+                            created_at: agentOutboxTimestamp,
+                            updated_at: agentOutboxTimestamp,
+                            organization_id: 1,
+                            business_unit_id: 1,
+                            key: 'WRITE-ORIGINAL',
+                            name: '原凭据项目',
+                            description: '',
+                            status: 'active',
+                        },
+                        project_role: 'project_admin',
+                        scope: {
+                            organization_id: 1,
+                            project_id: 71,
+                        },
+                    },
+                }),
+            });
+            return;
+        }
+        if (
+            projectResource ===
+            'admin/agents/agent-control/overview'
+        ) {
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({
+                    data: {
+                        global_read_only: false,
+                        emergency_stop: false,
+                        principal_count: 0,
+                        active_principal_count: 0,
+                        active_lease_count: 0,
+                        failed_outbox_count: expired ? 0 : 1,
+                        recent_event_count: 1,
+                        pending_attachment_scan_count: 0,
+                    },
+                    meta: { request_id: 'agent-outbox-overview' },
+                }),
+            });
+            return;
+        }
+        if (
+            projectResource === 'admin/agents/service-principals'
+            && request.method() === 'GET'
+        ) {
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({
+                    data: directory([]),
+                    meta: { request_id: 'agent-outbox-principals' },
+                }),
+            });
+            return;
+        }
+        if (
+            projectResource === 'admin/agents/outbox'
+            && request.method() === 'GET'
+        ) {
+            agentOutboxLoads += 1;
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({
+                    data: directory([adminRow()], 100),
+                    meta: { request_id: 'agent-outbox-admin-lookup' },
+                }),
+            });
+            return;
+        }
+        if (
+            projectResource ===
+                `admin/agents/outbox/${agentOutboxDeliveryID}/replay`
+            && request.method() === 'POST'
+        ) {
+            replayPosts += 1;
+            expired = true;
+            await route.fulfill({
+                status: 409,
+                contentType: 'application/problem+json',
+                body: JSON.stringify({
+                    type: 'https://chronodesk.local/problems/outbox_replay_expired',
+                    title: 'outbox replay expired',
+                    status: 409,
+                    detail: 'outbox delivery replay deadline expired',
+                    code: 'outbox_replay_expired',
+                    request_id: 'agent-outbox-replay-expired',
+                    retryable: false,
+                }),
+            });
+            return;
+        }
+        await route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({
+                code: 0,
+                data: directory([]),
+            }),
+        });
+    });
+    return {
+        agentOutboxLoads: () => agentOutboxLoads,
+        replayPosts: () => replayPosts,
+    };
+};
+
 test.describe('AI 智能体控制中心', () => {
     test.describe.configure({ mode: 'serial' });
     let globalControlsBeforeTest: AgentGlobalControlSnapshot | undefined;
     let usedRealBackend = false;
 
     test.beforeEach(async ({ request }, testInfo) => {
+        if (mockOnlyAgentTestTitles.has(testInfo.title)) return;
         assertDestructiveE2EAllowed('Agent 控制中心写操作 E2E');
-        if (testInfo.title === credentialGuardTestTitle) return;
         usedRealBackend = true;
         globalControlsBeforeTest = await captureAgentGlobalControls(request);
     });
 
     test.afterEach(async ({ request }, testInfo) => {
         if (
-            testInfo.title === credentialGuardTestTitle
+            mockOnlyAgentTestTitles.has(testInfo.title)
             || !globalControlsBeforeTest
         ) return;
         await restoreAgentGlobalControls(request, globalControlsBeforeTest);
@@ -334,6 +510,142 @@ test.describe('AI 智能体控制中心', () => {
             ),
         ).toBe(false);
         expect(new URL(page.url()).hash).toBe('#/integration-runtime');
+    });
+
+    test(expiredOutboxTestTitle, async ({ page }) => {
+        const backend = await installAgentOutboxMockBackend(
+            page,
+            'expired',
+        );
+        const replayRequests: string[] = [];
+        page.on('request', (request) => {
+            if (
+                request.method() === 'POST'
+                && /\/outbox\/[^/]+\/replay$/u.test(
+                    new URL(request.url()).pathname,
+                )
+            ) {
+                replayRequests.push(request.url());
+            }
+        });
+        await page.goto('/#/agent-control');
+        const main = page.getByRole('main');
+        const outboxResponse = page.waitForResponse((response) =>
+            response.request().method() === 'GET'
+            && new URL(response.url()).pathname.endsWith(
+                '/admin/agents/outbox',
+            ));
+        await main.getByRole('tab', {
+            name: '事件投递（Outbox）',
+            exact: true,
+        }).click();
+        const projection = await (await outboxResponse).json() as {
+            data: { items: Array<Record<string, unknown>> };
+        };
+        const projectedRow = projection.data.items[0];
+        expect(projectedRow.status).toBe('expired');
+        expect(projectedRow.expires_at).toBe(agentOutboxTimestamp);
+        expect(projectedRow.expired_at).toBe(agentOutboxTimestamp);
+        for (const forbidden of [
+            'destination_id',
+            'snapshot_id',
+            'config_id',
+            'locked_at',
+            'locked_by',
+            'lock_token',
+            'generation',
+            'credential',
+            'credential_envelope',
+            'webhook_url',
+            'access_token',
+            'secret',
+            'previous_secret',
+            'url',
+            'headers',
+        ]) {
+            expect(projectedRow).not.toHaveProperty(forbidden);
+        }
+        await expect(
+            main.getByText('已过期', { exact: true }),
+        ).toBeVisible();
+        await expect(
+            main.getByRole('button', {
+                name: `重新投递 ${agentOutboxDeliveryID}`,
+                exact: true,
+            }),
+        ).toHaveCount(0);
+        expect(backend.replayPosts()).toBe(0);
+        expect(replayRequests).toHaveLength(0);
+    });
+
+    test(replayExpiryRaceTestTitle, async ({ page }) => {
+        const backend = await installAgentOutboxMockBackend(page, 'race');
+        await page.goto('/#/agent-control');
+        const main = page.getByRole('main');
+        await main.getByRole('tab', {
+            name: '事件投递（Outbox）',
+            exact: true,
+        }).click();
+        await main.getByRole('button', {
+            name: `重新投递 ${agentOutboxDeliveryID}`,
+            exact: true,
+        }).click();
+        const refreshedOutbox = page.waitForResponse((response) =>
+            response.request().method() === 'GET'
+            && new URL(response.url()).pathname.endsWith(
+                '/admin/agents/outbox',
+            ));
+        await page.getByRole('dialog', {
+            name: '确认回放事件投递',
+        }).getByRole('button', {
+            name: '确认重新投递',
+            exact: true,
+        }).click();
+        await expect(
+            page.getByText(
+                '该投递已过期或凭据已撤销，无法回放',
+                { exact: true },
+            ),
+        ).toBeVisible();
+        const projection = await (await refreshedOutbox).json() as {
+            data: { items: Array<Record<string, unknown>> };
+        };
+        const projectedRow = projection.data.items[0];
+        expect(projectedRow.status).toBe('expired');
+        expect(projectedRow.expires_at).toBe(agentOutboxTimestamp);
+        expect(projectedRow.expired_at).toBe(agentOutboxTimestamp);
+        for (const forbidden of [
+            'destination_id',
+            'snapshot_id',
+            'config_id',
+            'locked_at',
+            'locked_by',
+            'lock_token',
+            'generation',
+            'credential',
+            'credential_envelope',
+            'webhook_url',
+            'access_token',
+            'secret',
+            'previous_secret',
+            'url',
+            'headers',
+        ]) {
+            expect(projectedRow).not.toHaveProperty(forbidden);
+        }
+        await expect.poll(
+            () => backend.agentOutboxLoads(),
+        ).toBeGreaterThan(1);
+        await expect(
+            main.getByText('已过期', { exact: true }),
+        ).toBeVisible();
+        await expect(
+            main.getByRole('button', {
+                name: `重新投递 ${agentOutboxDeliveryID}`,
+                exact: true,
+            }),
+        ).toHaveCount(0);
+        expect(backend.replayPosts()).toBe(1);
     });
 
     test('AGT-011：标签错误局部展示且可独立重试', async ({ page }) => {

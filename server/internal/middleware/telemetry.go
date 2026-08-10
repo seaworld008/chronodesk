@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"context"
+	cryptorand "crypto/rand"
 	"errors"
 	"net/http"
 	"strings"
@@ -8,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/seaworld008/chronodesk/server/internal/observability"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
@@ -60,16 +63,41 @@ func TracingMiddleware(config TelemetryConfig) gin.HandlerFunc {
 
 		method := boundedHTTPMethod(c.Request.Method)
 		initialRoute := matchedRouteTemplate(c)
-		parentContext := propagator.Extract(
-			c.Request.Context(),
-			propagation.HeaderCarrier(c.Request.Header),
-		)
+		sensitiveAuthenticationRoute :=
+			isSensitiveAuthenticationLoggingRoute(NewGinHTTPContext(c))
+		parentContext := c.Request.Context()
+		if sensitiveAuthenticationRoute {
+			parentContext = removeExternalTelemetryPropagation(
+				parentContext,
+				c.Request,
+				propagator,
+			)
+		} else {
+			parentContext = propagator.Extract(
+				parentContext,
+				propagation.HeaderCarrier(c.Request.Header),
+			)
+		}
 		requestContext, span := tracer.Start(
 			parentContext,
 			method+" "+initialRoute,
 			trace.WithSpanKind(trace.SpanKindServer),
 			trace.WithAttributes(attribute.String("http.request.method", method)),
 		)
+		if sensitiveAuthenticationRoute {
+			var identityErr error
+			requestContext, identityErr =
+				ensureServerControlledTraceIdentity(requestContext)
+			if identityErr != nil {
+				span.SetStatus(codes.Error, "telemetry identity unavailable")
+				span.End()
+				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+					"code": http.StatusServiceUnavailable,
+					"msg":  "请求标识生成失败",
+				})
+				return
+			}
+		}
 
 		traceID := observability.TraceIDFromContext(requestContext)
 		correlationID, err := trustedCorrelationID(c, traceID)
@@ -125,6 +153,58 @@ func TracingMiddleware(config TelemetryConfig) gin.HandlerFunc {
 		}()
 		c.Next()
 	}
+}
+
+func removeExternalTelemetryPropagation(
+	parent context.Context,
+	request *http.Request,
+	propagator propagation.TextMapPropagator,
+) context.Context {
+	if parent == nil {
+		parent = context.Background()
+	}
+	parent = trace.ContextWithSpanContext(parent, trace.SpanContext{})
+	parent = baggage.ContextWithoutBaggage(parent)
+	if request == nil {
+		return parent
+	}
+	for _, header := range append(
+		[]string{
+			observability.CorrelationIDHeader,
+			"traceparent",
+			"tracestate",
+			"baggage",
+		},
+		propagator.Fields()...,
+	) {
+		request.Header.Del(header)
+	}
+	return parent
+}
+
+func ensureServerControlledTraceIdentity(
+	ctx context.Context,
+) (context.Context, error) {
+	if observability.TraceIDFromContext(ctx) != "" {
+		return ctx, nil
+	}
+	var traceID trace.TraceID
+	var spanID trace.SpanID
+	if _, err := cryptorand.Read(traceID[:]); err != nil {
+		return nil, err
+	}
+	if _, err := cryptorand.Read(spanID[:]); err != nil {
+		return nil, err
+	}
+	spanContext := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID: traceID,
+		SpanID:  spanID,
+		Remote:  false,
+	})
+	if !spanContext.IsValid() {
+		return nil, errors.New("generated telemetry identity is invalid")
+	}
+	return trace.ContextWithSpanContext(ctx, spanContext), nil
 }
 
 // TraceID returns the OpenTelemetry trace ID exposed by TracingMiddleware.

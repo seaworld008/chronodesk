@@ -4,6 +4,7 @@ import {
     normalizeCustomFieldsForSubmit,
     normalizeTagsForSubmit,
 } from './tagUtils'
+import { normalizeTicketDateTimeForSubmit } from './ticketDateTime'
 
 type TicketEditFormValues = UpdateTicketRequest & {
     tags?: unknown
@@ -22,7 +23,6 @@ export const transformTicketUpdate = (
         'description',
         'type',
         'priority',
-        'status',
         'source',
         'assigned_to_id',
         'category_id',
@@ -38,7 +38,6 @@ export const transformTicketUpdate = (
         if (
             requester &&
             (
-                field === 'status' ||
                 field === 'assigned_to_id' ||
                 field === 'internal_notes'
             )
@@ -46,7 +45,9 @@ export const transformTicketUpdate = (
             continue
         }
         if (typeof data[field] !== 'undefined') {
-            payload[field] = data[field]
+            payload[field] = field === 'due_date'
+                ? normalizeTicketDateTimeForSubmit(data[field])
+                : data[field]
         }
     }
 

@@ -1247,6 +1247,7 @@ test.describe('第一阶段关键体验（mock）', () => {
 
     test('项目设置旧路径受保护重定向且 agent 无入口也不发设置请求', async ({
         page,
+        browser,
     }) => {
         const managerState = await installPhaseOneBackend(page, {
             projectRole: 'manager',
@@ -1296,7 +1297,12 @@ test.describe('第一阶段关键体验（mock）', () => {
             ).toBe(true);
         }
 
-        const agentPage = await page.context().newPage();
+        // A browser context represents one employee browser session. Installing
+        // another identity in a sibling tab must now trigger the cross-tab
+        // session-replacement guard, so the independent agent persona belongs
+        // in its own context.
+        const agentContext = await browser.newContext();
+        const agentPage = await agentContext.newPage();
         const agentState = await installPhaseOneBackend(agentPage, {
             projectRole: 'agent',
         });
@@ -1343,6 +1349,6 @@ test.describe('第一阶段关键体验（mock）', () => {
             agentPage.getByTestId('knowledge-library-page'),
         ).toBeVisible();
         expect(agentState.projectSettingsRequests).toEqual([]);
-        await agentPage.close();
+        await agentContext.close();
     });
 });

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -42,6 +43,192 @@ func TestRegisterRoutesPublishesEmbeddedHumanContract(t *testing.T) {
 	}
 }
 
+func TestHumanOutboxContractsPublishOnlySafeFiniteReplayState(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+	contains := func(raw any, want string) bool {
+		values, ok := raw.([]any)
+		if !ok {
+			return false
+		}
+		for _, value := range values {
+			if value == want {
+				return true
+			}
+		}
+		return false
+	}
+	problem := objectAt(t, schemas, "Problem")
+	code := objectAt(t, objectAt(t, problem, "properties"), "code")
+	if !contains(code["enum"], "outbox_replay_expired") {
+		t.Fatal("Human Problem.code omits outbox_replay_expired")
+	}
+
+	for _, schemaName := range []string{
+		"AdminOutboxDeliverySummary",
+		"IntegrationOutboxSummary",
+	} {
+		schema := objectAt(t, schemas, schemaName)
+		if schema["additionalProperties"] != false {
+			t.Fatalf("%s is not closed", schemaName)
+		}
+		for _, field := range []string{"expires_at", "expired_at"} {
+			if !contains(schema["required"], field) {
+				t.Errorf("%s.required omits %s", schemaName, field)
+			}
+		}
+		properties := objectAt(t, schema, "properties")
+		status := objectAt(t, properties, "status")
+		if reference, ok := status["$ref"].(string); ok {
+			status = objectAt(
+				t,
+				schemas,
+				strings.TrimPrefix(
+					reference,
+					"#/components/schemas/",
+				),
+			)
+		}
+		if !contains(status["enum"], "expired") {
+			t.Errorf("%s status omits expired", schemaName)
+		}
+		for _, field := range []string{"expires_at", "expired_at"} {
+			property := objectAt(t, properties, field)
+			if !contains(property["type"], "string") ||
+				!contains(property["type"], "null") ||
+				property["format"] != "date-time" {
+				t.Errorf(
+					"%s.%s is not a nullable date-time: %v",
+					schemaName,
+					field,
+					property,
+				)
+			}
+		}
+		for _, forbidden := range []string{
+			"destination_id",
+			"snapshot_id",
+			"locked_at",
+			"locked_by",
+			"lock_token",
+			"generation",
+			"credential",
+			"url",
+			"headers",
+		} {
+			if _, exposed := properties[forbidden]; exposed {
+				t.Errorf(
+					"%s exposes forbidden field %s",
+					schemaName,
+					forbidden,
+				)
+			}
+		}
+	}
+}
+
+func TestBackupCodeRegenerationContractMatchesRuntimeSecurityBoundary(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	pathItem := objectAt(t, paths, "/auth/otp/backup-codes")
+	operation := objectAt(t, pathItem, "post")
+	if operation["operationId"] != "regenerateOTPBackupCodes" {
+		t.Fatalf("operationId = %v", operation["operationId"])
+	}
+	security, ok := operation["security"].([]any)
+	if !ok || len(security) != 1 {
+		t.Fatalf("security = %v, want human bearer", operation["security"])
+	}
+	securityRequirement, ok := security[0].(map[string]any)
+	if !ok {
+		t.Fatalf("security requirement = %T", security[0])
+	}
+	if _, ok := securityRequirement["humanBearer"]; !ok {
+		t.Fatalf("security = %v, want humanBearer", securityRequirement)
+	}
+
+	requestBody := objectAt(t, operation, "requestBody")
+	if requestBody["required"] != true {
+		t.Fatal("current-password request body is not required")
+	}
+	content := objectAt(t, requestBody, "content")
+	media := objectAt(t, content, "application/json")
+	requestSchema := objectAt(t, media, "schema")
+	if requestSchema["$ref"] !=
+		"#/components/schemas/RegenerateOTPBackupCodesRequest" {
+		t.Fatalf("request schema = %v", requestSchema)
+	}
+
+	schemas := objectAt(t, objectAt(t, document, "components"), "schemas")
+	request := objectAt(t, schemas, "RegenerateOTPBackupCodesRequest")
+	if request["additionalProperties"] != false {
+		t.Fatal("backup-code regeneration request accepts unknown fields")
+	}
+	required, ok := request["required"].([]any)
+	if !ok || len(required) != 1 || required[0] != "current_password" {
+		t.Fatalf("required fields = %v", request["required"])
+	}
+	currentPassword := objectAt(
+		t,
+		objectAt(t, request, "properties"),
+		"current_password",
+	)
+	if currentPassword["type"] != "string" ||
+		currentPassword["minLength"] != float64(1) ||
+		currentPassword["writeOnly"] != true {
+		t.Fatalf("current_password schema = %v", currentPassword)
+	}
+
+	responseSchema := objectAt(t, schemas, "OTPBackupCodeRegenerationEnvelope")
+	responseData := objectAt(
+		t,
+		objectAt(t, responseSchema, "properties"),
+		"data",
+	)
+	backupCodes := objectAt(
+		t,
+		objectAt(t, responseData, "properties"),
+		"backup_codes",
+	)
+	if backupCodes["type"] != "array" ||
+		backupCodes["minItems"] != float64(10) ||
+		backupCodes["maxItems"] != float64(10) {
+		t.Fatalf("backup_codes schema = %v", backupCodes)
+	}
+
+	responses := objectAt(t, operation, "responses")
+	for _, status := range []string{"200", "400", "401", "409", "413", "429", "503"} {
+		if _, ok := responses[status]; !ok {
+			t.Errorf("POST /auth/otp/backup-codes response %s is missing", status)
+		}
+	}
+	description, _ := operation["description"].(string)
+	if !strings.Contains(description, "5 requests per 15 minutes") {
+		t.Fatalf("dedicated rate limit is undocumented: %q", description)
+	}
+
+	serverRoot := filepath.Clean(filepath.Join("..", ".."))
+	count, err := routeinventory.CountRuntimeMethodPathRegistrations(
+		serverRoot,
+		http.MethodPost,
+		"/otp/backup-codes",
+	)
+	if err != nil {
+		t.Fatalf("scan runtime backup-code route: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("runtime POST /otp/backup-codes registrations = %d, want 1", count)
+	}
+}
+
 func TestHumanWebContractPublishesClosedRoleAndSessionSchemas(t *testing.T) {
 	var document map[string]any
 	if err := json.Unmarshal(Document(), &document); err != nil {
@@ -59,11 +246,18 @@ func TestHumanWebContractPublishesClosedRoleAndSessionSchemas(t *testing.T) {
 	for _, name := range []string{
 		"PlatformRole",
 		"ProjectRole",
+		"RegisterHumanRequest",
 		"LoginRequest",
 		"RefreshTokenRequest",
 		"LogoutRequest",
+		"ForgotPasswordRequest",
+		"ResetHumanPasswordRequest",
+		"VerifyHumanEmailRequest",
+		"ResendHumanEmailVerificationRequest",
 		"HumanSessionUser",
 		"AuthSession",
+		"HumanRegistrationResult",
+		"HumanRegistrationEnvelope",
 		"AuthorizedProject",
 		"AuthorizedProjectAccess",
 		"ProjectMembership",
@@ -205,6 +399,26 @@ func TestHumanSessionRequestsMatchStrictRuntimeDTOs(t *testing.T) {
 		properties []string
 	}{
 		{
+			path:       "/auth/register",
+			schemaName: "RegisterHumanRequest",
+			required: []string{
+				"username",
+				"email",
+				"password",
+				"confirm_password",
+			},
+			properties: []string{
+				"username",
+				"email",
+				"password",
+				"confirm_password",
+				"first_name",
+				"last_name",
+				"department",
+				"position",
+			},
+		},
+		{
 			path:       "/auth/login",
 			schemaName: "LoginRequest",
 			required:   []string{"email", "password"},
@@ -234,6 +448,18 @@ func TestHumanSessionRequestsMatchStrictRuntimeDTOs(t *testing.T) {
 			required:   []string{"token", "new_password"},
 			properties: []string{"token", "new_password"},
 		},
+		{
+			path:       "/auth/verify-email",
+			schemaName: "VerifyHumanEmailRequest",
+			required:   []string{"token"},
+			properties: []string{"token"},
+		},
+		{
+			path:       "/auth/resend-verification",
+			schemaName: "ResendHumanEmailVerificationRequest",
+			required:   []string{"email"},
+			properties: []string{"email"},
+		},
 	} {
 		t.Run(test.schemaName, func(t *testing.T) {
 			operation := objectAt(
@@ -262,6 +488,30 @@ func TestHumanSessionRequestsMatchStrictRuntimeDTOs(t *testing.T) {
 		"properties",
 	)["device_token"]; exposed {
 		t.Fatal("LoginRequest exposes server-managed device_token")
+	}
+	for _, field := range []struct {
+		schema string
+		name   string
+	}{
+		{schema: "RegisterHumanRequest", name: "email"},
+		{schema: "LoginRequest", name: "email"},
+		{schema: "LoginRequest", name: "device_name"},
+		{schema: "ForgotPasswordRequest", name: "email"},
+		{schema: "ResendHumanEmailVerificationRequest", name: "email"},
+	} {
+		property := objectAt(
+			t,
+			objectAt(t, objectAt(t, schemas, field.schema), "properties"),
+			field.name,
+		)
+		if property["maxLength"] != float64(100) {
+			t.Errorf(
+				"%s.%s maxLength = %v, want 100",
+				field.schema,
+				field.name,
+				property["maxLength"],
+			)
+		}
 	}
 	logout := objectAt(t, objectAt(t, paths, "/auth/logout"), "post")
 	requestBody := objectAt(t, logout, "requestBody")
@@ -697,6 +947,9 @@ func TestHumanWebContractCoversRequiredBrowserOperations(t *testing.T) {
 		path   string
 		method string
 	}{
+		{"/auth/register", "post"},
+		{"/auth/verify-email", "post"},
+		{"/auth/resend-verification", "post"},
 		{"/auth/logout", "post"},
 		{"/auth/logout-all", "post"},
 		{"/auth/me", "get"},
@@ -1548,35 +1801,55 @@ func TestAuthOperationsPublishEveryRuntimeStatus(t *testing.T) {
 		want []string
 	}{
 		{
+			path: "/auth/register",
+			want: []string{"201", "400", "409", "413", "429", "500", "503"},
+		},
+		{
 			path: "/auth/forgot-password",
-			want: []string{"200", "400", "429", "500", "503"},
+			want: []string{"200", "400", "413", "429", "503"},
 		},
 		{
 			path: "/auth/reset-password",
-			want: []string{"200", "400", "429", "500", "503"},
+			want: []string{"200", "400", "413", "429", "500", "503"},
+		},
+		{
+			path: "/auth/verify-email",
+			want: []string{"200", "400", "413", "429", "500", "503"},
+		},
+		{
+			path: "/auth/resend-verification",
+			want: []string{"200", "400", "413", "429", "503"},
 		},
 		{
 			path: "/auth/login",
-			want: []string{"200", "400", "401", "403", "429", "503"},
+			want: []string{"200", "400", "401", "403", "413", "429", "503"},
 		},
 		{
 			path: "/auth/refresh",
-			want: []string{"200", "400", "401", "408", "429", "503"},
+			want: []string{"200", "400", "401", "408", "413", "429", "503"},
 		},
 		{
 			path: "/auth/logout",
-			want: []string{"200", "400", "429", "503"},
+			want: []string{"200", "400", "413", "429", "503"},
 		},
 		{
 			path: "/auth/logout-all",
 			want: []string{"200", "401", "429", "500", "503"},
 		},
+		{
+			path: "/auth/profile",
+			want: []string{"200", "400", "401", "413"},
+		},
 	} {
 		t.Run(test.path, func(t *testing.T) {
+			method := "post"
+			if test.path == "/auth/profile" {
+				method = "put"
+			}
 			operation := objectAt(
 				t,
 				objectAt(t, paths, test.path),
-				"post",
+				method,
 			)
 			assertExactObjectKeys(
 				t,
@@ -1708,8 +1981,11 @@ func TestP1HumanWebOperationsAreTypedAndMachineAddressable(t *testing.T) {
 		path   string
 		method string
 	}{
+		{"/auth/register", "post"},
 		{"/auth/forgot-password", "post"},
 		{"/auth/reset-password", "post"},
+		{"/auth/verify-email", "post"},
+		{"/auth/resend-verification", "post"},
 		{"/platform/projects/{projectPublicID}/archive", "post"},
 		{"/workbench/tickets", "get"},
 		{"/workbench/dashboard", "get"},
@@ -1726,6 +2002,7 @@ func TestP1HumanWebOperationsAreTypedAndMachineAddressable(t *testing.T) {
 		{"/projects/{projectKey}/tickets/{ticketID}/transfer", "post"},
 		{"/projects/{projectKey}/tickets/{ticketID}/escalate", "post"},
 		{"/projects/{projectKey}/tickets/{ticketID}/status", "post"},
+		{"/projects/{projectKey}/tickets/{ticketID}/transitions", "get"},
 		{"/projects/{projectKey}/tickets/{ticketID}/history", "get"},
 		{"/projects/{projectKey}/tickets/{ticketID}/comments", "get"},
 		{"/projects/{projectKey}/tickets/{ticketID}/comments", "post"},
@@ -1914,6 +2191,53 @@ func TestP0ListPaginationContractUsesStrictTwentyFiveToOneHundredBounds(t *testi
 	}
 }
 
+func TestNotificationPreferenceArrayBoundMatchesRuntimeTypes(t *testing.T) {
+	document := decodeDocument(t)
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+	request := objectAt(t, schemas, "UpdateNotificationPreferencesRequest")
+	properties := objectAt(t, request, "properties")
+	preferences := objectAt(t, properties, "preferences")
+	if preferences["minItems"] != float64(1) ||
+		preferences["maxItems"] != float64(len(models.NotificationTypes())) {
+		t.Fatalf(
+			"notification preference bounds=%v, runtime types=%d",
+			preferences,
+			len(models.NotificationTypes()),
+		)
+	}
+}
+
+func TestTicketUpdateDueDateIsOptionalAndNullable(t *testing.T) {
+	document := decodeDocument(t)
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+	request := objectAt(t, schemas, "UpdateTicketRequest")
+	required, ok := request["required"].([]any)
+	if !ok {
+		t.Fatalf("UpdateTicketRequest.required = %T, want array", request["required"])
+	}
+	for _, field := range required {
+		if field == "due_date" {
+			t.Fatal("UpdateTicketRequest.due_date must remain optional")
+		}
+	}
+
+	dueDate := objectAt(t, objectAt(t, request, "properties"), "due_date")
+	if got, want := dueDate["type"], []any{"string", "null"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("UpdateTicketRequest.due_date.type = %v, want %v", got, want)
+	}
+	if dueDate["format"] != "date-time" {
+		t.Fatalf("UpdateTicketRequest.due_date.format = %v, want date-time", dueDate["format"])
+	}
+}
+
 func TestP1RuntimeDTOFieldsMatchPublishedSchemas(t *testing.T) {
 	document := decodeDocument(t)
 	schemas := objectAt(
@@ -1928,6 +2252,11 @@ func TestP1RuntimeDTOFieldsMatchPublishedSchemas(t *testing.T) {
 		{"CreateTicketRequest", models.TicketCreateRequest{}},
 		{"UpdateTicketRequest", models.TicketUpdateRequest{}},
 		{"Ticket", models.TicketResponse{}},
+		{"Notification", models.NotificationResponse{}},
+		{
+			"NotificationTicketSummary",
+			models.NotificationTicketSummary{},
+		},
 		{
 			"CrossProjectWorkbenchTicket",
 			services.CrossProjectWorkbenchTicket{},
@@ -1948,6 +2277,75 @@ func TestP1RuntimeDTOFieldsMatchPublishedSchemas(t *testing.T) {
 			want := jsonFieldNames(t, reflect.TypeOf(test.value))
 			assertExactObjectKeys(t, properties, want)
 		})
+	}
+}
+
+func TestNotificationTicketProjectionContractIsClosedAndRoleSafe(t *testing.T) {
+	document := decodeDocument(t)
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+	summary := objectAt(t, schemas, "NotificationTicketSummary")
+	if summary["type"] != "object" || summary["additionalProperties"] != false {
+		t.Fatalf("NotificationTicketSummary must be a closed object: %v", summary)
+	}
+	assertExactObjectKeys(
+		t,
+		objectAt(t, summary, "properties"),
+		[]string{"id", "ticket_number", "title"},
+	)
+	required, ok := summary["required"].([]any)
+	if !ok {
+		t.Fatalf("NotificationTicketSummary.required=%T, want array", summary["required"])
+	}
+	if !reflect.DeepEqual(
+		required,
+		[]any{"id", "ticket_number", "title"},
+	) {
+		t.Fatalf("NotificationTicketSummary.required=%v", required)
+	}
+
+	notification := objectAt(t, schemas, "Notification")
+	notificationRequired := notification["required"].([]any)
+	if !slices.Contains(notificationRequired, any("related_ticket")) {
+		t.Fatalf("Notification.required=%v, missing related_ticket", notificationRequired)
+	}
+	relatedTicket := objectAt(
+		t,
+		objectAt(t, notification, "properties"),
+		"related_ticket",
+	)
+	anyOf, ok := relatedTicket["anyOf"].([]any)
+	if !ok || len(anyOf) != 2 {
+		t.Fatalf("Notification.related_ticket=%v, want nullable anyOf", relatedTicket)
+	}
+	if anyOf[0].(map[string]any)["$ref"] !=
+		"#/components/schemas/NotificationTicketSummary" ||
+		anyOf[1].(map[string]any)["type"] != "null" {
+		t.Fatalf("Notification.related_ticket.anyOf=%v", anyOf)
+	}
+
+	ticketRequired := objectAt(t, schemas, "Ticket")["required"].([]any)
+	for _, observerOptional := range []any{
+		"customer_email",
+		"customer_phone",
+		"customer_name",
+		"created_by_id",
+		"created_by",
+		"created_by_actor",
+		"assigned_to_id",
+		"assigned_to",
+		"assigned_to_actor",
+		"agent_context",
+	} {
+		if slices.Contains(ticketRequired, observerOptional) {
+			t.Errorf(
+				"Ticket.required still requires observer-omitted field %q",
+				observerOptional,
+			)
+		}
 	}
 }
 

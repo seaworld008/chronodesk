@@ -14,6 +14,15 @@ import (
 
 func TestProcessOutboxBatchTimesOutBlackHoleAndCanRetry(t *testing.T) {
 	db := openAgentNativeTestDB(t)
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sqlDB.Close(); err != nil {
+			t.Errorf("close black-hole Outbox test database: %v", err)
+		}
+	})
 	service := NewAgentNativeService(db, AgentNativeOptions{
 		OutboxLockTTL:             time.Second,
 		OutboxDeliveryTimeout:     60 * time.Millisecond,
@@ -64,15 +73,19 @@ func TestProcessOutboxBatchTimesOutBlackHoleAndCanRetry(t *testing.T) {
 
 	close(release)
 	deadline := time.Now().Add(time.Second)
-	for !returned.Load() && time.Now().Before(deadline) {
+	for (!returned.Load() || len(service.outboxDeliverySlots) != 0) &&
+		time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if !returned.Load() {
-		t.Fatal("释放后投递适配器没有返回")
+	if !returned.Load() || len(service.outboxDeliverySlots) != 0 {
+		t.Fatal("释放后投递适配器没有返回并释放并发槽")
 	}
 	if err := db.Model(&models.OutboxDelivery{}).
 		Where("id = ?", delivery.ID).
-		Update("next_attempt_at", time.Now().Add(-time.Second)).Error; err != nil {
+		Update(
+			"next_attempt_at",
+			time.Now().UTC().Add(-time.Second),
+		).Error; err != nil {
 		t.Fatal(err)
 	}
 	retried, err := service.ProcessOutboxBatch(

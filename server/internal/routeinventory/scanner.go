@@ -96,6 +96,83 @@ func ScanRuntimeGETRoutes(serverRoot string) ([]Registration, error) {
 	return registrations, nil
 }
 
+// CountRuntimeMethodPathRegistrations provides a focused inventory for
+// security-sensitive non-GET routes without weakening the exhaustive GET
+// classification manifest. It counts exact literal method/path registrations
+// across production internal source.
+func CountRuntimeMethodPathRegistrations(
+	serverRoot string,
+	method string,
+	routePath string,
+) (int, error) {
+	if strings.TrimSpace(serverRoot) == "" {
+		return 0, errors.New("server root is required")
+	}
+	method = strings.ToUpper(strings.TrimSpace(method))
+	switch method {
+	case "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT":
+	default:
+		return 0, fmt.Errorf("unsupported HTTP method %q", method)
+	}
+	if !strings.HasPrefix(routePath, "/") {
+		return 0, errors.New("route path must be an absolute literal")
+	}
+
+	internalRoot := filepath.Join(serverRoot, "internal")
+	count := 0
+	err := filepath.WalkDir(
+		internalRoot,
+		func(path string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.IsDir() ||
+				!strings.HasSuffix(entry.Name(), ".go") ||
+				strings.HasSuffix(entry.Name(), "_test.go") {
+				return nil
+			}
+			source, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			fileSet := token.NewFileSet()
+			file, err := parser.ParseFile(
+				fileSet,
+				path,
+				source,
+				parser.SkipObjectResolution,
+			)
+			if err != nil {
+				return err
+			}
+			ast.Inspect(file, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok || len(call.Args) < 2 {
+					return true
+				}
+				selector, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || selector.Sel.Name != method {
+					return true
+				}
+				literal, ok := call.Args[0].(*ast.BasicLit)
+				if !ok || literal.Kind != token.STRING {
+					return true
+				}
+				value, err := strconv.Unquote(literal.Value)
+				if err == nil && value == routePath {
+					count++
+				}
+				return true
+			})
+			return nil
+		},
+	)
+	if err != nil {
+		return 0, fmt.Errorf("inventory %s %s: %w", method, routePath, err)
+	}
+	return count, nil
+}
+
 func scanSource(
 	filename string,
 	source []byte,

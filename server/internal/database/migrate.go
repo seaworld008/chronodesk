@@ -21,6 +21,13 @@ import (
 // but the process must fail fast instead of starting schedulers that repeatedly
 // fail against an older schema.
 func ValidateRuntimeSchema(db *gorm.DB) error {
+	return validateRuntimeSchema(db, true)
+}
+
+func validateRuntimeSchema(
+	db *gorm.DB,
+	requireWebhookCredentialFoundation bool,
+) error {
 	if db == nil {
 		return fmt.Errorf("database is required")
 	}
@@ -67,6 +74,17 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 			return err
 		}
 		if err := ValidateCategoryScopeContract(db); err != nil {
+			return err
+		}
+		if requireWebhookCredentialFoundation {
+			if err := validateWebhookCredentialLifetimeCatalog(db); err != nil {
+				return err
+			}
+		}
+		if err := ValidateWebhookOutboxLifecycleFence(db); err != nil {
+			return err
+		}
+		if err := ValidateWebhookOutboxLifecycleIndexes(db); err != nil {
 			return err
 		}
 		return ValidateProjectRLSReadiness(db)
@@ -118,6 +136,17 @@ func ValidateRuntimeSchema(db *gorm.DB) error {
 		return err
 	}
 	if err := ValidateCategoryScopeContract(db); err != nil {
+		return err
+	}
+	if requireWebhookCredentialFoundation {
+		if err := validateWebhookCredentialLifetimeCatalog(db); err != nil {
+			return err
+		}
+	}
+	if err := ValidateWebhookOutboxLifecycleFence(db); err != nil {
+		return err
+	}
+	if err := ValidateWebhookOutboxLifecycleIndexes(db); err != nil {
 		return err
 	}
 	return ValidateProjectRLSReadiness(db)
@@ -237,6 +266,10 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 			"used", "expires_at", "used_at",
 		}},
 		{&auth.OTPCode{}, "otp_codes", []string{"user_id", "code", "type", "expires_at", "used", "used_at"}},
+		{&auth.AuthenticationSecurityAuditEvent{}, "authentication_security_audit_events", []string{
+			"id", "user_id", "event_type", "source", "request_id",
+			"trace_id", "correlation_id", "created_at",
+		}},
 		{&models.LoginHistory{}, "login_histories", []string{"user_id", "session_id", "is_active"}},
 		{&models.ServicePrincipal{}, "service_principals", []string{"id", "status", "scopes", "read_only", "emergency_disabled", "expires_at", "policy_epoch"}},
 		{&models.AgentCredential{}, "agent_credentials", []string{"service_principal_id", "secret_hash", "status", "expires_at", "revoked_at"}},
@@ -298,6 +331,12 @@ func runtimeSchemaRequirements() []runtimeSchemaRequirement {
 		{&models.OutboxDelivery{}, "outbox_deliveries", []string{
 			"event_id", "destination_type", "destination_id", "status",
 			"attempts", "next_attempt_at", "locked_at", "locked_by",
+			"lock_token", "expires_at", "expired_at",
+		}},
+		{&models.WebhookDeliverySnapshot{}, "webhook_delivery_snapshots", []string{
+			"id", "organization_id", "project_id", "config_id", "event_id",
+			"credential_expires_at", "credential_shredded_at",
+			"credential_shred_reason",
 		}},
 		{&models.AuditChainHead{}, "audit_chain_heads", []string{
 			"organization_id", "project_id", "last_sequence", "last_hash",
@@ -551,6 +590,7 @@ func schemaMigrationModels() []any {
 		&models.AdminAuditExportJob{},
 		&models.KnowledgeSourceLink{},
 		&models.KnowledgeObjectWriteIntent{},
+		&auth.AuthenticationSecurityAuditEvent{},
 	}
 }
 
@@ -726,6 +766,18 @@ func CreateIndexes(db *gorm.DB) error {
 		indexErrors = append(
 			indexErrors,
 			fmt.Errorf("automation and webhook pagination indexes: %w", err),
+		)
+	}
+	if err := MigrateWebhookOutboxLifecycleFence(db); err != nil {
+		indexErrors = append(
+			indexErrors,
+			fmt.Errorf("webhook Outbox lifecycle fence: %w", err),
+		)
+	}
+	if err := MigrateWebhookOutboxLifecycleIndexes(db); err != nil {
+		indexErrors = append(
+			indexErrors,
+			fmt.Errorf("webhook Outbox lifecycle indexes: %w", err),
 		)
 	}
 	if err := errors.Join(indexErrors...); err != nil {
@@ -1143,21 +1195,31 @@ func RunMigrationsFromModel(
 	if db.Config == nil || db.Statement == nil {
 		return errors.New("migration database is not initialized")
 	}
+	if err := validateMigrationResumePoint(
+		firstModel,
+		len(schemaMigrationModels()),
+	); err != nil {
+		return err
+	}
 	db = db.WithContext(ctx)
-	return db.Transaction(func(tx *gorm.DB) error {
-		if err := lockLegacyPlatformRoleTables(tx); err != nil {
-			return err
-		}
-		if err := preflightLegacyPlatformRoleValues(tx); err != nil {
-			return err
-		}
-		return runMigrationsFromModelLocked(
-			ctx,
-			tx,
-			firstModel,
-			membershipWriters...,
-		)
-	})
+	return runBoundedMigrationOrchestration(
+		ctx,
+		db,
+		func(tx *gorm.DB) error {
+			if err := lockLegacyPlatformRoleTables(tx); err != nil {
+				return err
+			}
+			if err := preflightLegacyPlatformRoleValues(tx); err != nil {
+				return err
+			}
+			return runMigrationsFromModelLocked(
+				ctx,
+				tx,
+				firstModel,
+				membershipWriters...,
+			)
+		},
+	)
 }
 
 func runMigrationsFromModelLocked(
@@ -1198,12 +1260,10 @@ func runMigrationsFromModelLocked(
 		return fmt.Errorf("admin audit actor preparation failed: %w", err)
 	}
 
-	// 4. Checkpoints are outside the resumable model window: a retry that
-	// starts after this model must still be able to prove whether destructive
-	// data cutovers committed.
-	if err := db.AutoMigrate(&models.SchemaMigrationCheckpoint{}); err != nil {
-		return fmt.Errorf("schema migration checkpoint setup failed: %w", err)
-	}
+	// 4. The foundation checkpoint and complete legacy webhook credential
+	// cutover ran in a dedicated top-level transaction before this main
+	// migration transaction. This keeps ACCESS EXCLUSIVE off the rest of the
+	// model scan while the session advisory lock still serializes migrations.
 
 	// 5. Category scope has a dedicated evidence-driven cutover. Stage only a
 	// retryable zero sentinel before the canonical NOT NULL model is parsed.
@@ -1360,7 +1420,6 @@ func runMigrationsFromModelLocked(
 	if err := MigrateProjectRLS(db); err != nil {
 		return fmt.Errorf("project RLS migration failed: %w", err)
 	}
-
 	// 19. 所有其他持久迁移成功后，最后切换平台角色、删除旧 role
 	// 列并写入 checkpoint。随后的 runtime gate 只读，因此 checkpoint 是
 	// 该外层事务的最后一笔 durable write。
@@ -1369,7 +1428,7 @@ func runMigrationsFromModelLocked(
 	}
 
 	// 19. 验证运行时所需的关键表、列、索引与 RLS policy readiness。
-	if err := ValidateRuntimeSchema(db); err != nil {
+	if err := validateRuntimeSchema(db, false); err != nil {
 		return fmt.Errorf("runtime schema validation failed: %w", err)
 	}
 

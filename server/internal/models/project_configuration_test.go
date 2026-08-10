@@ -47,6 +47,101 @@ func TestWorkflowVersionRequiresLockedLifecycleCategories(t *testing.T) {
 	}
 }
 
+func TestWorkflowVersionRejectsDuplicateLifecycleCategories(t *testing.T) {
+	states := defaultConfigurationTestStates()
+	states = append(states, WorkflowStateDefinition{
+		Key:               "triage",
+		Name:              "Triage",
+		LifecycleCategory: LifecycleCategoryNew,
+	})
+	workflow := WorkflowVersion{
+		OrganizationID: 1,
+		ProjectID:      2,
+		Key:            "duplicate-category",
+		Version:        1,
+		Status:         ConfigurationStatusDraft,
+		Name:           "Duplicate category",
+		CreatedByType:  ActorTypeHuman,
+		CreatedByID:    HumanActor(1).ID,
+	}
+	encodedStates, err := json.Marshal(states)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedTransitions, err := json.Marshal(defaultConfigurationTestTransitions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow.States = encodedStates
+	workflow.Transitions = encodedTransitions
+
+	err = workflow.Validate()
+	const want = `duplicate workflow lifecycle category "new" in states "open" and "triage"`
+	if err == nil || err.Error() != want {
+		t.Fatalf("WorkflowVersion.Validate() error = %v, want %q", err, want)
+	}
+	if err := workflow.SetDefinitions(
+		states,
+		defaultConfigurationTestTransitions(),
+	); err == nil || err.Error() != want {
+		t.Fatalf("WorkflowVersion.SetDefinitions() error = %v, want %q", err, want)
+	}
+}
+
+func TestWorkflowVersionAcceptsDefaultSixLifecycleCategories(t *testing.T) {
+	states := []WorkflowStateDefinition{
+		{
+			Key: "open", Name: "Open",
+			LifecycleCategory: LifecycleCategoryNew,
+			IsInitial:         true,
+		},
+		{
+			Key: "in_progress", Name: "In progress",
+			LifecycleCategory: LifecycleCategoryActive,
+		},
+		{
+			Key: "pending", Name: "Pending",
+			LifecycleCategory: LifecycleCategoryWaiting,
+		},
+		{
+			Key: "resolved", Name: "Resolved",
+			LifecycleCategory: LifecycleCategoryResolved,
+			IsTerminal:        true,
+		},
+		{
+			Key: "closed", Name: "Closed",
+			LifecycleCategory: LifecycleCategoryClosed,
+			IsTerminal:        true,
+		},
+		{
+			Key: "cancelled", Name: "Cancelled",
+			LifecycleCategory: LifecycleCategoryCancelled,
+			IsTerminal:        true,
+		},
+	}
+	transitions := []WorkflowTransitionDefinition{
+		{Key: "start", Name: "Start", From: "open", To: "in_progress"},
+		{Key: "wait", Name: "Wait", From: "in_progress", To: "pending"},
+		{Key: "resume", Name: "Resume", From: "pending", To: "in_progress"},
+		{Key: "resolve", Name: "Resolve", From: "in_progress", To: "resolved"},
+		{Key: "close", Name: "Close", From: "resolved", To: "closed"},
+		{Key: "cancel", Name: "Cancel", From: "open", To: "cancelled"},
+	}
+	workflow := WorkflowVersion{
+		OrganizationID: 1,
+		ProjectID:      2,
+		Key:            "default-six",
+		Version:        1,
+		Status:         ConfigurationStatusDraft,
+		Name:           "Default six",
+		CreatedByType:  ActorTypeHuman,
+		CreatedByID:    HumanActor(1).ID,
+	}
+	if err := workflow.SetDefinitions(states, transitions); err != nil {
+		t.Fatalf("default six-state workflow rejected: %v", err)
+	}
+}
+
 func TestTypedExpressionsAndActionsRejectExecutableEscapeHatches(t *testing.T) {
 	valid := TypedExpression{
 		Field:     "ticket.priority",

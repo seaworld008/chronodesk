@@ -30,11 +30,30 @@ import (
 	"gorm.io/gorm"
 )
 
+var _ services.OutboxAttemptDeliverer = (*NativeOutboxDeliverer)(nil)
+
 const agentplatformCustomWebhookTestSecret = "agentplatform-custom-webhook-test-secret"
 
 type recordingSLAEscalationConsumer struct {
 	calls int
 	event services.CloudEventEnvelope
+}
+
+type deadlineThenNilAttachmentUploadConsumer struct{}
+
+func (deadlineThenNilAttachmentUploadConsumer) ExecuteAttachmentUploadOutbox(
+	ctx context.Context,
+	_ uint,
+) error {
+	<-ctx.Done()
+	return nil
+}
+
+func (deadlineThenNilAttachmentUploadConsumer) ExecuteAttachmentStagingCleanupOutbox(
+	context.Context,
+	uint,
+) error {
+	return nil
 }
 
 type recordingWebSocketAccessRevoker struct {
@@ -236,6 +255,7 @@ func TestProjectArchiveOutboxWorkerRevokesWebSocketProjectAccess(
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeAgentplatformTestDB(t, db)
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.Organization{},
@@ -243,6 +263,7 @@ func TestProjectArchiveOutboxWorkerRevokesWebSocketProjectAccess(
 		&models.Project{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
+		&models.WebhookDeliverySnapshot{},
 		&models.AuditChainHead{},
 		&models.AuditLedgerEntry{},
 	); err != nil {
@@ -406,6 +427,11 @@ func TestNativeOutboxDelivererRequiresTrustedMatchingWorkerBoundary(
 	if err != nil {
 		t.Fatal(err)
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal("get trusted boundary SQLite pool")
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
 	deliverer, err := NewNativeOutboxDeliverer(
 		NativeOutboxDelivererOptions{DB: db},
 	)
@@ -534,6 +560,61 @@ func TestSLAEscalationOutboxDeliveryUsesInjectedConsumer(t *testing.T) {
 	}
 }
 
+func TestNativeOutboxDelivererDoesNotAcknowledgeLateNilNonWebhookResult(
+	t *testing.T,
+) {
+	db, err := gorm.Open(
+		sqlite.Open("file:late_nil_non_webhook_attempt?mode=memory&cache=shared"),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal("get late nil non-webhook SQLite pool")
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	deliverer, err := NewNativeOutboxDeliverer(
+		NativeOutboxDelivererOptions{
+			DB:                db,
+			AttachmentUploads: deadlineThenNilAttachmentUploadConsumer{},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := models.ProjectScope{OrganizationID: 1, ProjectID: 1}
+	delivery := &models.OutboxDelivery{
+		ID:              "late-nil-non-webhook",
+		OrganizationID:  scope.OrganizationID,
+		ProjectID:       scope.ProjectID,
+		EventID:         "late-nil-event",
+		DestinationType: services.AttachmentUploadOutboxDestination,
+		DestinationID:   "1",
+	}
+	event := services.CloudEventEnvelope{
+		ID:             delivery.EventID,
+		Type:           "io.chronodesk.attachment.upload.requested.v1",
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+	}
+	workerCtx, cancel := context.WithTimeout(
+		agentplatformTestOutboxWorkerContext(t, scope),
+		10*time.Millisecond,
+	)
+	defer cancel()
+
+	result := deliverer.DeliverAttempt(workerCtx, delivery, event)
+	if result.Kind != services.OutboxAttemptUncertain {
+		t.Fatalf(
+			"late nil result kind = %q error = %v, want uncertain",
+			result.Kind,
+			result.Err,
+		)
+	}
+}
+
 func TestAttachmentCleanupOutboxRetriesAfterCommitAndIsIdempotent(t *testing.T) {
 	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
@@ -555,6 +636,7 @@ func TestAttachmentCleanupOutboxRetriesAfterCommitAndIsIdempotent(t *testing.T) 
 		&models.TicketAttachment{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
+		&models.WebhookDeliverySnapshot{},
 	); err != nil {
 		t.Fatalf("migrate attachment cleanup schema: %v", err)
 	}
@@ -1048,13 +1130,19 @@ func TestOutboxWebhookDeliveryUsesOneBoundedAttemptWithoutLocalRetry(t *testing.
 	if !strings.HasPrefix(delivery.DestinationID, webhookSnapshotPrefix) {
 		t.Fatalf("webhook delivery is not snapshot-bound: %+v", delivery)
 	}
+	claimWebhookDeliveryForAdapterTest(t, db, &delivery)
 
 	started := time.Now()
-	err = deliverer.Deliver(
+	attemptContext, cancelAttempt := context.WithDeadline(
 		agentplatformTestOutboxWorkerContext(t, projectScope),
+		delivery.ExpiresAt.UTC(),
+	)
+	err = deliverer.Deliver(
+		attemptContext,
 		&delivery,
 		event,
 	)
+	cancelAttempt()
 	elapsed := time.Since(started)
 	if err == nil {
 		t.Fatal("non-2xx webhook attempt must fail for Outbox backoff")
@@ -1117,6 +1205,7 @@ func TestOutboxWebhookDeliveryUsesOneBoundedAttemptWithoutLocalRetry(t *testing.
 	if requestData["ticket_id"] != float64(42) {
 		t.Fatalf("structured CloudEvent data missing ticket identity: %#v", requestData)
 	}
+	notifications.WaitForWebhookAttemptAudits()
 	var logs []models.WebhookLog
 	if err := db.Order("id ASC").Find(&logs).Error; err != nil {
 		t.Fatalf("load webhook logs: %v", err)
@@ -1307,9 +1396,18 @@ func TestCommittedWebhookDeliveriesUseImmutableSnapshots(t *testing.T) {
 		snapshot, exists := snapshotByID[snapshotID]
 		if !exists ||
 			delivery.MaxAttempts != snapshot.RetryCount+1 ||
-			delivery.Status != models.OutboxDeliveryPending {
+			delivery.Status != models.OutboxDeliveryPending ||
+			delivery.ExpiresAt == nil ||
+			!delivery.ExpiresAt.Equal(snapshot.CredentialExpiresAt) ||
+			!snapshot.CredentialExpiresAt.Equal(
+				now.Add(models.WebhookDeliveryCredentialLifetime),
+			) {
 			t.Fatalf("invalid snapshot delivery: %+v", delivery)
 		}
+	}
+	originalDeadlines := make(map[string]time.Time, len(snapshots))
+	for _, snapshot := range snapshots {
+		originalDeadlines[snapshot.ID] = snapshot.CredentialExpiresAt
 	}
 
 	protector := newAgentplatformWebhookTestProtector(t)
@@ -1335,6 +1433,9 @@ func TestCommittedWebhookDeliveriesUseImmutableSnapshots(t *testing.T) {
 			"filter_rules":   `{"transition_statuses":["closed"]}`,
 			"status":         models.WebhookStatusDisabled,
 		}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Delete(&configs[1]).Error; err != nil {
 		t.Fatal(err)
 	}
 	newConfig := models.WebhookConfig{
@@ -1433,8 +1534,28 @@ func TestCommittedWebhookDeliveriesUseImmutableSnapshots(t *testing.T) {
 	}
 	if retained.WebhookURL != firstEndpoint.URL ||
 		retained.EnabledEvents !=
-			`["io.chronodesk.ticket.created.v1"]` {
+			`["io.chronodesk.ticket.created.v1"]` ||
+		!retained.CredentialExpiresAt.Equal(
+			originalDeadlines[retained.ID],
+		) {
 		t.Fatalf("committed snapshot changed after config edit: %+v", retained)
+	}
+	var deletedConfigSnapshot models.WebhookDeliverySnapshot
+	if err := db.First(
+		&deletedConfigSnapshot,
+		"event_id = ? AND config_id = ?",
+		event.ID,
+		configs[1].ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !deletedConfigSnapshot.CredentialExpiresAt.Equal(
+		originalDeadlines[deletedConfigSnapshot.ID],
+	) {
+		t.Fatalf(
+			"committed snapshot deadline changed after config delete: %+v",
+			deletedConfigSnapshot,
+		)
 	}
 	otherProject := models.Project{
 		OrganizationID: scope.OrganizationID,
@@ -1459,7 +1580,7 @@ func TestCommittedWebhookDeliveriesUseImmutableSnapshots(t *testing.T) {
 		&foreignDelivery,
 		foreignEvent,
 	); err == nil ||
-		!strings.Contains(err.Error(), "load webhook delivery snapshot") {
+		!errors.Is(err, services.ErrWebhookOutboxAttemptRejected) {
 		t.Fatalf("cross-project snapshot error = %v", err)
 	}
 	if firstAttempts.Load() != 1 ||
@@ -1522,6 +1643,34 @@ func newWebhookTestNotificationService(
 			return http.DefaultClient, nil
 		}),
 	)
+}
+
+func claimWebhookDeliveryForAdapterTest(
+	t testing.TB,
+	db *gorm.DB,
+	delivery *models.OutboxDelivery,
+) {
+	t.Helper()
+	if db == nil || delivery == nil || delivery.ExpiresAt == nil {
+		t.Fatal("webhook delivery claim fixture is incomplete")
+	}
+	lockedAt := time.Now().UTC()
+	lockToken := "019feb4d-0000-7000-8000-000000000001"
+	result := db.Model(&models.OutboxDelivery{}).
+		Where("id = ?", delivery.ID).
+		Updates(map[string]any{
+			"status":     models.OutboxDeliveryProcessing,
+			"attempts":   1,
+			"locked_at":  lockedAt,
+			"locked_by":  "adapter-webhook-test-worker",
+			"lock_token": lockToken,
+		})
+	if result.Error != nil || result.RowsAffected != 1 {
+		t.Fatalf("claim adapter webhook delivery: %v", result.Error)
+	}
+	if err := db.Take(delivery, "id = ?", delivery.ID).Error; err != nil {
+		t.Fatalf("reload adapter webhook delivery claim: %v", err)
+	}
 }
 
 func newAgentplatformWebhookTestProtector(

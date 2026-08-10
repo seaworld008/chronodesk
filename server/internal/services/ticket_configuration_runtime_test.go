@@ -1,12 +1,16 @@
 package services
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/datatypes"
+	"gorm.io/gorm"
 )
 
 func TestValidateTicketRequestFormUsesPublishedSchemaAndRejectsReservedFields(
@@ -132,6 +136,92 @@ func TestTicketTransitionUsesStoredWorkflowVersionInsteadOfHardcodedLifecycle(
 		t.Fatal(err)
 	}
 
+	operation, err := OperationContextFromContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	replacement := models.WorkflowVersion{
+		OrganizationID: operation.Scope.OrganizationID,
+		ProjectID:      operation.Scope.ProjectID,
+		Key:            "default",
+		Version:        2,
+		Status:         models.ConfigurationStatusPublished,
+		Name:           "Replacement workflow",
+		CreatedByType:  models.ActorTypeHuman,
+		CreatedByID:    models.HumanActor(user.ID).ID,
+		PublishedAt:    &now,
+	}
+	if err := replacement.SetDefinitions(
+		[]models.WorkflowStateDefinition{
+			{
+				Key: "new", Name: "New",
+				LifecycleCategory: models.LifecycleCategoryNew,
+				IsInitial:         true,
+			},
+			{
+				Key: "done", Name: "Done",
+				LifecycleCategory: models.LifecycleCategoryResolved,
+				IsTerminal:        true,
+			},
+		},
+		[]models.WorkflowTransitionDefinition{
+			{
+				Key: "resolve_directly", Name: "Resolve directly",
+				From: "new", To: "done",
+			},
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&replacement).Error; err != nil {
+		t.Fatal(err)
+	}
+	var requestType models.RequestTypeVersion
+	if err := db.First(
+		&requestType,
+		"id = ?",
+		ticket.RequestTypeVersionID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	release := models.ConfigurationRelease{
+		OrganizationID: operation.Scope.OrganizationID,
+		ProjectID:      operation.Scope.ProjectID,
+		Version:        2,
+		Status:         models.ConfigurationStatusPublished,
+		CreatedByType:  models.ActorTypeHuman,
+		CreatedByID:    models.HumanActor(user.ID).ID,
+		ApprovedByType: models.ActorTypeHuman,
+		ApprovedByID:   models.HumanActor(user.ID).ID,
+		PublishedAt:    &now,
+	}
+	if err := release.SetConfigurationSnapshot(models.ConfigurationSnapshot{
+		RequestTypeVersionIDs: []string{requestType.ID},
+		WorkflowVersionIDs:    []string{replacement.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&release).Error; err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := ticketService.AllowedTicketTransitions(
+		ctx,
+		ticket.ID,
+		user.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(allowed) != 2 ||
+		allowed[0] != models.TicketStatusInProgress ||
+		allowed[1] != models.TicketStatusCancelled {
+		t.Fatalf(
+			"bound V1 transitions after V2 publication = %v",
+			allowed,
+		)
+	}
+
 	// The former hardcoded lifecycle allowed open -> resolved, while the
 	// published bootstrap workflow intentionally requires start -> resolve.
 	if _, err := ticketService.UpdateTicketStatusExpectedVersion(
@@ -161,6 +251,286 @@ func TestTicketTransitionUsesStoredWorkflowVersionInsteadOfHardcodedLifecycle(
 	if started.Status != models.TicketStatusInProgress ||
 		started.WorkflowVersionID != ticket.WorkflowVersionID {
 		t.Fatalf("unexpected workflow transition result: %+v", started)
+	}
+}
+
+func TestTicketWorkflowRuntimeRejectsHistoricalDuplicateCategoryEdges(
+	t *testing.T,
+) {
+	db, ticketService, ctx, user, ticket := newWorkflowRuntimeTicket(
+		t,
+		models.ProjectRoleAgent,
+	)
+	forceHistoricalWorkflowDefinitions(
+		t,
+		db,
+		ticket.WorkflowVersionID,
+		[]models.WorkflowStateDefinition{
+			{
+				Key: "primary_new", Name: "Primary new",
+				LifecycleCategory: models.LifecycleCategoryNew,
+				IsInitial:         true,
+			},
+			{
+				Key: "shadow_new", Name: "Shadow new",
+				LifecycleCategory: models.LifecycleCategoryNew,
+			},
+			{
+				Key: "active", Name: "Active",
+				LifecycleCategory: models.LifecycleCategoryActive,
+			},
+			{
+				Key: "resolved", Name: "Resolved",
+				LifecycleCategory: models.LifecycleCategoryResolved,
+				IsTerminal:        true,
+			},
+		},
+		[]models.WorkflowTransitionDefinition{
+			{
+				Key: "start", Name: "Start",
+				From: "primary_new", To: "active",
+			},
+			{
+				Key: "shadow_resolve", Name: "Shadow resolve",
+				From: "shadow_new", To: "resolved",
+			},
+		},
+	)
+
+	_, err := ticketService.UpdateTicketStatusExpectedVersion(
+		ctx,
+		ticket.ID,
+		string(models.TicketStatusResolved),
+		user.ID,
+		"",
+		"",
+		ticket.Version,
+	)
+	assertDuplicateWorkflowCategoryRuntimeError(t, err)
+
+	allowed, err := ticketService.AllowedTicketTransitions(
+		ctx,
+		ticket.ID,
+		user.ID,
+	)
+	assertDuplicateWorkflowCategoryRuntimeError(t, err)
+	if allowed != nil {
+		t.Fatalf("AllowedTicketTransitions() = %v, want nil on corrupt workflow", allowed)
+	}
+}
+
+func TestTicketWorkflowRuntimeRejectsHistoricalDuplicateCategoryRoles(
+	t *testing.T,
+) {
+	db, ticketService, ctx, user, ticket := newWorkflowRuntimeTicket(
+		t,
+		models.ProjectRoleRequester,
+	)
+	forceHistoricalWorkflowDefinitions(
+		t,
+		db,
+		ticket.WorkflowVersionID,
+		[]models.WorkflowStateDefinition{
+			{
+				Key: "primary_new", Name: "Primary new",
+				LifecycleCategory: models.LifecycleCategoryNew,
+				IsInitial:         true,
+			},
+			{
+				Key: "shadow_new", Name: "Shadow new",
+				LifecycleCategory: models.LifecycleCategoryNew,
+			},
+			{
+				Key: "active", Name: "Active",
+				LifecycleCategory: models.LifecycleCategoryActive,
+			},
+		},
+		[]models.WorkflowTransitionDefinition{
+			{
+				Key: "agent_start", Name: "Agent start",
+				From:  "primary_new",
+				To:    "active",
+				Roles: []models.ProjectRole{models.ProjectRoleAgent},
+			},
+			{
+				Key: "requester_shadow_start", Name: "Requester shadow start",
+				From:  "shadow_new",
+				To:    "active",
+				Roles: []models.ProjectRole{models.ProjectRoleRequester},
+			},
+		},
+	)
+
+	_, err := ticketService.UpdateTicketStatusExpectedVersion(
+		ctx,
+		ticket.ID,
+		string(models.TicketStatusInProgress),
+		user.ID,
+		"",
+		"",
+		ticket.Version,
+	)
+	assertDuplicateWorkflowCategoryRuntimeError(t, err)
+}
+
+func TestAllowedTicketTransitionsPropagatesWorkflowLookupErrors(t *testing.T) {
+	db, ticketService, ctx, user, ticket := newWorkflowRuntimeTicket(
+		t,
+		models.ProjectRoleAgent,
+	)
+	if err := db.Migrator().DropTable(&models.WorkflowVersion{}); err != nil {
+		t.Fatal(err)
+	}
+
+	allowed, err := ticketService.AllowedTicketTransitions(
+		ctx,
+		ticket.ID,
+		user.ID,
+	)
+	if err == nil ||
+		!errors.Is(err, ErrInvalidTicketTransition) ||
+		!strings.Contains(err.Error(), "load ticket workflow") {
+		t.Fatalf("AllowedTicketTransitions() error = %v, want workflow lookup error", err)
+	}
+	if allowed != nil {
+		t.Fatalf("AllowedTicketTransitions() = %v, want nil on lookup error", allowed)
+	}
+}
+
+func TestAllowedTicketTransitionsPropagatesAuthorizationQueryErrors(
+	t *testing.T,
+) {
+	db, ticketService, ctx, user, ticket := newWorkflowRuntimeTicket(
+		t,
+		models.ProjectRoleAgent,
+	)
+	forceHistoricalWorkflowDefinitions(
+		t,
+		db,
+		ticket.WorkflowVersionID,
+		[]models.WorkflowStateDefinition{
+			{
+				Key: "open", Name: "Open",
+				LifecycleCategory: models.LifecycleCategoryNew,
+				IsInitial:         true,
+			},
+			{
+				Key: "active", Name: "Active",
+				LifecycleCategory: models.LifecycleCategoryActive,
+			},
+		},
+		[]models.WorkflowTransitionDefinition{
+			{
+				Key: "start", Name: "Start",
+				From:  "open",
+				To:    "active",
+				Roles: []models.ProjectRole{models.ProjectRoleAgent},
+			},
+		},
+	)
+	if err := db.Migrator().DropTable(&models.ProjectMembership{}); err != nil {
+		t.Fatal(err)
+	}
+
+	allowed, err := ticketService.AllowedTicketTransitions(
+		ctx,
+		ticket.ID,
+		user.ID,
+	)
+	if err == nil ||
+		!errors.Is(err, ErrInvalidTicketTransition) ||
+		!strings.Contains(
+			err.Error(),
+			"workflow actor has no active project membership",
+		) {
+		t.Fatalf("AllowedTicketTransitions() error = %v, want authorization query error", err)
+	}
+	if allowed != nil {
+		t.Fatalf("AllowedTicketTransitions() = %v, want nil on authorization error", allowed)
+	}
+}
+
+func newWorkflowRuntimeTicket(
+	t *testing.T,
+	role models.ProjectRole,
+) (
+	*gorm.DB,
+	*TicketService,
+	context.Context,
+	models.User,
+	*models.Ticket,
+) {
+	t.Helper()
+	db := openAgentNativeTestDB(t)
+	user := seedActorUser(t, db, strings.ReplaceAll(t.Name(), "/", "-"))
+	native := NewAgentNativeService(db)
+	ticketService, err := NewTicketService(
+		db,
+		native,
+		nil,
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := testProjectOperationContext(t, db, models.HumanActor(user.ID))
+	grantHumanTicketCreateMembership(t, db, ctx, user.ID, role)
+	ticket, err := ticketService.CreateTicket(
+		ctx,
+		&models.TicketCreateRequest{
+			Title:       "验证历史工作流",
+			Description: "历史发布配置损坏时必须拒绝合并生命周期边。",
+			Type:        models.TicketTypeRequest,
+			Priority:    models.TicketPriorityNormal,
+			Source:      models.TicketSourceWeb,
+		},
+		user.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db, ticketService, ctx, user, ticket
+}
+
+func forceHistoricalWorkflowDefinitions(
+	t *testing.T,
+	db *gorm.DB,
+	workflowID string,
+	states []models.WorkflowStateDefinition,
+	transitions []models.WorkflowTransitionDefinition,
+) {
+	t.Helper()
+	encodedStates, err := json.Marshal(states)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedTransitions, err := json.Marshal(transitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := db.Exec(
+		"UPDATE workflow_versions SET states = ?, transitions = ? WHERE id = ?",
+		string(encodedStates),
+		string(encodedTransitions),
+		workflowID,
+	)
+	if result.Error != nil {
+		t.Fatal(result.Error)
+	}
+	if result.RowsAffected != 1 {
+		t.Fatalf("updated historical workflows = %d, want 1", result.RowsAffected)
+	}
+}
+
+func assertDuplicateWorkflowCategoryRuntimeError(t *testing.T, err error) {
+	t.Helper()
+	if err == nil ||
+		!errors.Is(err, ErrInvalidTicketTransition) ||
+		!strings.Contains(
+			err.Error(),
+			`duplicate workflow lifecycle category "new"`,
+		) {
+		t.Fatalf("workflow runtime error = %v, want duplicate category rejection", err)
 	}
 }
 

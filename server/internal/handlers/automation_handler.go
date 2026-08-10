@@ -499,7 +499,12 @@ func (h *AutomationHandler) UpdateRule(c *gin.Context) {
 	}
 
 	userID, _ := c.Get("user_id")
-	err = h.automationService.UpdateRule(c.Request.Context(), uint(ruleID), &req, userID.(uint))
+	rule, err := h.automationService.UpdateRule(
+		c.Request.Context(),
+		uint(ruleID),
+		&req,
+		userID.(uint),
+	)
 	if err != nil {
 		status := http.StatusInternalServerError
 		message := "更新规则失败"
@@ -530,6 +535,7 @@ func (h *AutomationHandler) UpdateRule(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "更新规则成功",
+		"data":    rule,
 	})
 }
 

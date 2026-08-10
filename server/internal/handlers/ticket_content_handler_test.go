@@ -114,6 +114,7 @@ func TestDownloadAttachmentReturnsContentWithSafeHeaders(t *testing.T) {
 		StoragePath:    stored.Key,
 		StorageType:    storage.AttachmentStorageType(),
 		Hash:           stored.SHA256,
+		IsPublic:       true,
 		VirusScan:      models.VirusScanClean,
 	}
 	if err := db.Create(&attachment).Error; err != nil {
@@ -125,11 +126,18 @@ func TestDownloadAttachmentReturnsContentWithSafeHeaders(t *testing.T) {
 			AttachmentStorage: storage,
 		},
 	)
-	handler := NewTicketContentHandler(db, nil, native, 1024)
+	handler := NewTicketContentHandler(
+		db,
+		newHandlerTicketService(t, db),
+		native,
+		1024,
+	)
 	router := gin.New()
 	router.GET(
 		"/tickets/:id/attachments/:attachment_id/content",
 		func(c *gin.Context) {
+			c.Set("user_id", user.ID)
+			c.Set(projectRoleContextKey, string(models.ProjectRoleAdmin))
 			ctx, contextErr := services.WithOperationContext(
 				c.Request.Context(),
 				services.OperationContext{
@@ -197,6 +205,461 @@ func TestDownloadAttachmentReturnsContentWithSafeHeaders(t *testing.T) {
 			"Content-Disposition = %q params=%v",
 			disposition,
 			parameters,
+		)
+	}
+}
+
+func TestObserverAttachmentDownloadDoesNotRevealPrivateAttachmentExistence(
+	t *testing.T,
+) {
+	gin.SetMode(gin.TestMode)
+	db := openHandlerTestDB(t)
+	scope := ensureHandlerTestProject(t, db)
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.ProjectMembership{},
+		&models.Ticket{},
+		&models.TicketAttachment{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	var queue models.Queue
+	if err := db.Where(
+		"project_id = ? AND is_default = ?",
+		scope.ProjectID,
+		true,
+	).First(&queue).Error; err != nil {
+		t.Fatal(err)
+	}
+	observer := models.User{
+		Username:     "private-attachment-observer",
+		Email:        "private-attachment-observer@example.test",
+		PasswordHash: "hashed",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := db.Create(&observer).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.ProjectMembership{
+		ProjectID: scope.ProjectID,
+		UserID:    observer.ID,
+		Role:      models.ProjectRoleObserver,
+		IsActive:  true,
+		Version:   1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	ticket := models.Ticket{
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		QueueID:        queue.ID,
+		TicketNumber:   "OBSERVER-PRIVATE-ATTACHMENT",
+		Title:          "observer private attachment",
+		Description:    "observer private attachment",
+		Type:           models.TicketTypeRequest,
+		Priority:       models.TicketPriorityNormal,
+		Status:         models.TicketStatusOpen,
+		Source:         models.TicketSourceWeb,
+		Version:        1,
+	}
+	if err := db.Create(&ticket).Error; err != nil {
+		t.Fatal(err)
+	}
+	otherTicket := ticket
+	otherTicket.ID = 0
+	otherTicket.PublicID = ""
+	otherTicket.TicketNumber = "OBSERVER-OTHER-ATTACHMENT"
+	otherTicket.Title = "observer other ticket attachment"
+	if err := db.Create(&otherTicket).Error; err != nil {
+		t.Fatal(err)
+	}
+	privateAttachments := []models.TicketAttachment{
+		{
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			TicketID:       ticket.ID,
+			ActorType:      models.ActorTypeHuman,
+			ActorID:        models.HumanActor(observer.ID).ID,
+			FileName:       "private-clean.txt",
+			OriginalName:   "private-clean.txt",
+			FileSize:       7,
+			MimeType:       "text/plain",
+			FileType:       models.AttachmentTypeDocument,
+			StoragePath:    "private-clean.txt",
+			StorageType:    "local",
+			Hash:           "private-clean-hash",
+			IsPublic:       false,
+			VirusScan:      models.VirusScanClean,
+		},
+		{
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			TicketID:       ticket.ID,
+			ActorType:      models.ActorTypeHuman,
+			ActorID:        models.HumanActor(observer.ID).ID,
+			FileName:       "private-pending.txt",
+			OriginalName:   "private-pending.txt",
+			FileSize:       7,
+			MimeType:       "text/plain",
+			FileType:       models.AttachmentTypeDocument,
+			StoragePath:    "private-pending.txt",
+			StorageType:    "local",
+			Hash:           "private-pending-hash",
+			IsPublic:       false,
+			VirusScan:      models.VirusScanPending,
+		},
+		{
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			TicketID:       ticket.ID,
+			ActorType:      models.ActorTypeHuman,
+			ActorID:        models.HumanActor(observer.ID).ID,
+			FileName:       "private-infected.txt",
+			OriginalName:   "private-infected.txt",
+			FileSize:       7,
+			MimeType:       "text/plain",
+			FileType:       models.AttachmentTypeDocument,
+			StoragePath:    "private-infected.txt",
+			StorageType:    "local",
+			Hash:           "private-infected-hash",
+			IsPublic:       false,
+			VirusScan:      models.VirusScanInfected,
+		},
+		{
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			TicketID:       ticket.ID,
+			ActorType:      models.ActorTypeHuman,
+			ActorID:        models.HumanActor(observer.ID).ID,
+			FileName:       "private-error.txt",
+			OriginalName:   "private-error.txt",
+			FileSize:       7,
+			MimeType:       "text/plain",
+			FileType:       models.AttachmentTypeDocument,
+			StoragePath:    "private-error.txt",
+			StorageType:    "local",
+			Hash:           "private-error-hash",
+			IsPublic:       false,
+			VirusScan:      models.VirusScanError,
+		},
+		{
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			TicketID:       ticket.ID,
+			ActorType:      models.ActorTypeHuman,
+			ActorID:        models.HumanActor(observer.ID).ID,
+			FileName:       "private-staging.txt",
+			OriginalName:   "private-staging.txt",
+			FileSize:       7,
+			MimeType:       "text/plain",
+			FileType:       models.AttachmentTypeDocument,
+			StoragePath:    "private-staging.txt",
+			StorageType:    "staging",
+			Hash:           "private-staging-hash",
+			IsPublic:       false,
+			VirusScan:      models.VirusScanClean,
+		},
+		{
+			OrganizationID: scope.OrganizationID,
+			ProjectID:      scope.ProjectID,
+			TicketID:       otherTicket.ID,
+			ActorType:      models.ActorTypeHuman,
+			ActorID:        models.HumanActor(observer.ID).ID,
+			FileName:       "other-ticket-public.txt",
+			OriginalName:   "other-ticket-public.txt",
+			FileSize:       7,
+			MimeType:       "text/plain",
+			FileType:       models.AttachmentTypeDocument,
+			StoragePath:    "other-ticket-public.txt",
+			StorageType:    "local",
+			Hash:           "other-ticket-public-hash",
+			IsPublic:       true,
+			VirusScan:      models.VirusScanClean,
+		},
+	}
+	if err := db.Create(&privateAttachments).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	storage, err := services.NewLocalAttachmentStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicContent := []byte("observer public attachment")
+	publicStored, err := storage.Put(
+		context.Background(),
+		"tickets/observer-public.txt",
+		bytes.NewReader(publicContent),
+		int64(len(publicContent)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicAttachment := models.TicketAttachment{
+		OrganizationID: scope.OrganizationID,
+		ProjectID:      scope.ProjectID,
+		TicketID:       ticket.ID,
+		ActorType:      models.ActorTypeHuman,
+		ActorID:        models.HumanActor(observer.ID).ID,
+		FileName:       "observer-public.txt",
+		OriginalName:   "observer-public.txt",
+		FileSize:       publicStored.Size,
+		MimeType:       "text/plain",
+		FileType:       models.AttachmentTypeDocument,
+		StoragePath:    publicStored.Key,
+		StorageType:    storage.AttachmentStorageType(),
+		Hash:           publicStored.SHA256,
+		IsPublic:       true,
+		VirusScan:      models.VirusScanClean,
+	}
+	if err := db.Create(&publicAttachment).Error; err != nil {
+		t.Fatal(err)
+	}
+	var project models.Project
+	if err := db.First(&project, scope.ProjectID).Error; err != nil {
+		t.Fatal(err)
+	}
+	crossProject := models.Project{
+		OrganizationID: project.OrganizationID,
+		BusinessUnitID: project.BusinessUnitID,
+		Key:            "ATTACHMENT-CROSS",
+		Name:           "Attachment Cross Project",
+		Status:         models.ProjectStatusActive,
+	}
+	if err := db.Create(&crossProject).Error; err != nil {
+		t.Fatal(err)
+	}
+	crossQueue := models.Queue{
+		ProjectID: crossProject.ID,
+		Key:       "default",
+		Name:      "Default",
+		Status:    models.QueueStatusActive,
+		IsDefault: true,
+	}
+	if err := db.Create(&crossQueue).Error; err != nil {
+		t.Fatal(err)
+	}
+	crossTicket := ticket
+	crossTicket.ID = 0
+	crossTicket.PublicID = ""
+	crossTicket.OrganizationID = crossProject.OrganizationID
+	crossTicket.ProjectID = crossProject.ID
+	crossTicket.QueueID = crossQueue.ID
+	crossTicket.TicketNumber = "OBSERVER-CROSS-PROJECT"
+	crossTicket.Title = "observer cross project attachment"
+	if err := db.Create(&crossTicket).Error; err != nil {
+		t.Fatal(err)
+	}
+	crossAttachment := models.TicketAttachment{
+		OrganizationID: crossProject.OrganizationID,
+		ProjectID:      crossProject.ID,
+		TicketID:       crossTicket.ID,
+		ActorType:      models.ActorTypeHuman,
+		ActorID:        models.HumanActor(observer.ID).ID,
+		FileName:       "cross-project-public.txt",
+		OriginalName:   "cross-project-public.txt",
+		FileSize:       7,
+		MimeType:       "text/plain",
+		FileType:       models.AttachmentTypeDocument,
+		StoragePath:    "cross-project-public.txt",
+		StorageType:    "local",
+		Hash:           "cross-project-public-hash",
+		IsPublic:       true,
+		VirusScan:      models.VirusScanClean,
+	}
+	if err := db.Create(&crossAttachment).Error; err != nil {
+		t.Fatal(err)
+	}
+	native := services.NewAgentNativeService(
+		db,
+		services.AgentNativeOptions{AttachmentStorage: storage},
+	)
+	handler := NewTicketContentHandler(
+		db,
+		newHandlerTicketService(t, db),
+		native,
+		1024,
+	)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", observer.ID)
+		c.Set(projectRoleContextKey, string(models.ProjectRoleObserver))
+		c.Next()
+	})
+	router.Use(handlerTestProjectMiddleware(t, db))
+	router.GET(
+		"/tickets/:id/attachments/:attachment_id/content",
+		handler.DownloadAttachment,
+	)
+	router.POST("/tickets/:id/attachments", handler.StoreAttachment)
+
+	wantNotFoundBody := `{"code":"not_found","message":"资源不存在","success":false}`
+	randomAttachmentID := crossAttachment.ID + 1000000
+	indistinguishableTargets := []struct {
+		name         string
+		ticketID     uint
+		attachmentID uint
+	}{
+		{
+			name:         "existing private attachment on readable ticket",
+			ticketID:     ticket.ID,
+			attachmentID: privateAttachments[0].ID,
+		},
+		{
+			name:         "random nonexistent attachment",
+			ticketID:     ticket.ID,
+			attachmentID: randomAttachmentID,
+		},
+		{
+			name:         "same project attachment on another ticket",
+			ticketID:     ticket.ID,
+			attachmentID: privateAttachments[len(privateAttachments)-1].ID,
+		},
+	}
+	var firstNotFoundBody string
+	for _, target := range indistinguishableTargets {
+		downloadResponse := httptest.NewRecorder()
+		router.ServeHTTP(
+			downloadResponse,
+			httptest.NewRequest(
+				http.MethodGet,
+				"/tickets/"+jsonNumber(target.ticketID)+
+					"/attachments/"+jsonNumber(target.attachmentID)+
+					"/content",
+				nil,
+			),
+		)
+		body := downloadResponse.Body.String()
+		if downloadResponse.Code != http.StatusNotFound ||
+			body != wantNotFoundBody {
+			t.Fatalf(
+				"observer %s download status=%d body=%q, want status=%d body=%q",
+				target.name,
+				downloadResponse.Code,
+				body,
+				http.StatusNotFound,
+				wantNotFoundBody,
+			)
+		}
+		if firstNotFoundBody == "" {
+			firstNotFoundBody = body
+		} else if body != firstNotFoundBody {
+			t.Fatalf(
+				"observer %s body=%q differs from first target body=%q",
+				target.name,
+				body,
+				firstNotFoundBody,
+			)
+		}
+		for _, leaked := range []string{
+			"attachment_visibility_denied",
+			"private-clean.txt",
+			"other-ticket-public.txt",
+			"attachment_not_clean",
+			`"is_public"`,
+			`"virus_scan"`,
+			`"scan_details"`,
+			`"storage_type"`,
+			`"pending"`,
+			`"infected"`,
+			`"error"`,
+			`"staging"`,
+		} {
+			if strings.Contains(body, leaked) {
+				t.Fatalf(
+					"observer %s response leaked %q: %s",
+					target.name,
+					leaked,
+					body,
+				)
+			}
+		}
+	}
+
+	for index, privateAttachment := range privateAttachments[:len(privateAttachments)-1] {
+		downloadResponse := httptest.NewRecorder()
+		router.ServeHTTP(
+			downloadResponse,
+			httptest.NewRequest(
+				http.MethodGet,
+				"/tickets/"+jsonNumber(ticket.ID)+
+					"/attachments/"+jsonNumber(privateAttachment.ID)+
+					"/content",
+				nil,
+			),
+		)
+		if downloadResponse.Code != http.StatusNotFound ||
+			downloadResponse.Body.String() != wantNotFoundBody {
+			t.Fatalf(
+				"observer private state %d scan=%s storage=%s status=%d body=%q",
+				index,
+				privateAttachment.VirusScan,
+				privateAttachment.StorageType,
+				downloadResponse.Code,
+				downloadResponse.Body.String(),
+			)
+		}
+	}
+
+	crossProjectResponse := httptest.NewRecorder()
+	router.ServeHTTP(
+		crossProjectResponse,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/tickets/"+jsonNumber(crossTicket.ID)+
+				"/attachments/"+jsonNumber(crossAttachment.ID)+
+				"/content",
+			nil,
+		),
+	)
+	if crossProjectResponse.Code != http.StatusNotFound ||
+		crossProjectResponse.Body.String() != wantNotFoundBody {
+		t.Fatalf(
+			"observer cross-project download status=%d body=%q",
+			crossProjectResponse.Code,
+			crossProjectResponse.Body.String(),
+		)
+	}
+
+	publicResponse := httptest.NewRecorder()
+	router.ServeHTTP(
+		publicResponse,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/tickets/"+jsonNumber(ticket.ID)+
+				"/attachments/"+jsonNumber(publicAttachment.ID)+
+				"/content",
+			nil,
+		),
+	)
+	if publicResponse.Code != http.StatusOK ||
+		!bytes.Equal(publicResponse.Body.Bytes(), publicContent) {
+		t.Fatalf(
+			"observer public clean download status=%d body=%q",
+			publicResponse.Code,
+			publicResponse.Body.String(),
+		)
+	}
+
+	uploadResponse := httptest.NewRecorder()
+	router.ServeHTTP(
+		uploadResponse,
+		httptest.NewRequest(
+			http.MethodPost,
+			"/tickets/"+jsonNumber(ticket.ID)+"/attachments",
+			nil,
+		),
+	)
+	if uploadResponse.Code != http.StatusForbidden ||
+		!strings.Contains(
+			uploadResponse.Body.String(),
+			`"code":"ticket_access_denied"`,
+		) {
+		t.Fatalf(
+			"observer direct upload status=%d body=%s",
+			uploadResponse.Code,
+			uploadResponse.Body.String(),
 		)
 	}
 }
@@ -489,6 +952,25 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 	if err := db.Create(&comments).Error; err != nil {
 		t.Fatal(err)
 	}
+	replies := []models.TicketComment{
+		{
+			TicketID: ticket.ID, UserID: &owner.ID,
+			ActorType: models.ActorTypeHuman,
+			ActorID:   strconv.FormatUint(uint64(owner.ID), 10),
+			Content:   "public reply", ContentType: "text",
+			Type: models.CommentTypePublic, ParentID: &comments[0].ID,
+		},
+		{
+			TicketID: ticket.ID, UserID: &agent.ID,
+			ActorType: models.ActorTypeHuman,
+			ActorID:   strconv.FormatUint(uint64(agent.ID), 10),
+			Content:   "internal reply secret", ContentType: "text",
+			Type: models.CommentTypeInternal, ParentID: &comments[0].ID,
+		},
+	}
+	if err := db.Create(&replies).Error; err != nil {
+		t.Fatal(err)
+	}
 	scannedAt := time.Now().Add(-time.Minute)
 	attachments := []models.TicketAttachment{
 		{
@@ -528,6 +1010,10 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 	})
 	router.Use(handlerTestProjectMiddleware(t, db))
 	router.GET("/tickets/:id/comments", handler.ListComments)
+	router.GET(
+		"/tickets/:id/comments/:comment_id/replies",
+		handler.ListCommentReplies,
+	)
 	router.GET("/tickets/:id/attachments", handler.ListAttachments)
 
 	ownerRequest := httptest.NewRequest(
@@ -554,9 +1040,12 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 		body.Data[2].Content != "service public" {
 		t.Fatalf("customer saw non-public comments: %#v", body.Data)
 	}
-	for _, role := range []models.ProjectRole{
-		models.ProjectRoleAgent,
-		models.ProjectRoleObserver,
+	for _, roleCase := range []struct {
+		role          models.ProjectRole
+		expectedTotal int64
+	}{
+		{role: models.ProjectRoleAgent, expectedTotal: 4},
+		{role: models.ProjectRoleObserver, expectedTotal: 3},
 	} {
 		roleRequest := httptest.NewRequest(
 			http.MethodGet,
@@ -564,11 +1053,11 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 			nil,
 		)
 		roleRequest.Header.Set("X-Test-User", strconv.FormatUint(uint64(owner.ID), 10))
-		roleRequest.Header.Set("X-Test-Role", string(role))
+		roleRequest.Header.Set("X-Test-Role", string(roleCase.role))
 		roleResponse := httptest.NewRecorder()
 		router.ServeHTTP(roleResponse, roleRequest)
 		if roleResponse.Code != http.StatusOK {
-			t.Fatalf("%s comments status=%d body=%s", role, roleResponse.Code, roleResponse.Body.String())
+			t.Fatalf("%s comments status=%d body=%s", roleCase.role, roleResponse.Code, roleResponse.Body.String())
 		}
 		var roleBody struct {
 			Data  []models.TicketCommentResponse `json:"data"`
@@ -577,8 +1066,91 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 		if err := json.Unmarshal(roleResponse.Body.Bytes(), &roleBody); err != nil {
 			t.Fatal(err)
 		}
-		if roleBody.Total != 4 || len(roleBody.Data) != 4 {
-			t.Fatalf("%s comment page=%+v", role, roleBody)
+		if roleBody.Total != roleCase.expectedTotal ||
+			int64(len(roleBody.Data)) != roleCase.expectedTotal {
+			t.Fatalf("%s comment page=%+v", roleCase.role, roleBody)
+		}
+		if roleCase.role == models.ProjectRoleObserver {
+			for _, comment := range roleBody.Data {
+				if comment.Type != models.CommentTypePublic ||
+					comment.Content == "private" {
+					t.Fatalf("observer saw private comment: %+v", comment)
+				}
+			}
+			for _, forbidden := range []string{
+				`"user"`, `"service_principal"`, `"actor"`,
+				`"time_spent"`, `"billable_time"`, `"work_type"`,
+				`"notification_sent"`, `"metadata"`,
+			} {
+				if strings.Contains(roleResponse.Body.String(), forbidden) {
+					t.Fatalf(
+						"observer comment response leaked %q: %s",
+						forbidden,
+						roleResponse.Body.String(),
+					)
+				}
+			}
+		}
+	}
+	for _, roleCase := range []struct {
+		role          models.ProjectRole
+		expectedTotal int64
+	}{
+		{role: models.ProjectRoleAgent, expectedTotal: 2},
+		{role: models.ProjectRoleObserver, expectedTotal: 1},
+	} {
+		replyRequest := httptest.NewRequest(
+			http.MethodGet,
+			"/tickets/"+strconv.FormatUint(uint64(ticket.ID), 10)+
+				"/comments/"+strconv.FormatUint(uint64(comments[0].ID), 10)+
+				"/replies",
+			nil,
+		)
+		replyRequest.Header.Set(
+			"X-Test-User",
+			strconv.FormatUint(uint64(owner.ID), 10),
+		)
+		replyRequest.Header.Set("X-Test-Role", string(roleCase.role))
+		replyResponse := httptest.NewRecorder()
+		router.ServeHTTP(replyResponse, replyRequest)
+		if replyResponse.Code != http.StatusOK {
+			t.Fatalf(
+				"%s replies status=%d body=%s",
+				roleCase.role,
+				replyResponse.Code,
+				replyResponse.Body.String(),
+			)
+		}
+		var replyBody struct {
+			Data  []models.TicketCommentResponse `json:"data"`
+			Total int64                          `json:"total"`
+		}
+		if err := json.Unmarshal(replyResponse.Body.Bytes(), &replyBody); err != nil {
+			t.Fatal(err)
+		}
+		if replyBody.Total != roleCase.expectedTotal ||
+			int64(len(replyBody.Data)) != roleCase.expectedTotal {
+			t.Fatalf("%s reply page=%+v", roleCase.role, replyBody)
+		}
+		if roleCase.role == models.ProjectRoleObserver &&
+			(replyBody.Data[0].Type != models.CommentTypePublic ||
+				replyBody.Data[0].Content != "public reply") {
+			t.Fatalf("observer saw private reply: %+v", replyBody.Data)
+		}
+		if roleCase.role == models.ProjectRoleObserver {
+			for _, forbidden := range []string{
+				`"user"`, `"service_principal"`, `"actor"`,
+				`"time_spent"`, `"billable_time"`, `"work_type"`,
+				`"notification_sent"`, `"metadata"`,
+			} {
+				if strings.Contains(replyResponse.Body.String(), forbidden) {
+					t.Fatalf(
+						"observer reply response leaked %q: %s",
+						forbidden,
+						replyResponse.Body.String(),
+					)
+				}
+			}
 		}
 	}
 	rawBody := ownerResponse.Body.String()
@@ -624,9 +1196,12 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 		attachmentBody.Data[0].VirusScan != models.VirusScanClean {
 		t.Fatalf("customer attachment data=%+v", attachmentBody.Data)
 	}
-	for _, role := range []models.ProjectRole{
-		models.ProjectRoleAgent,
-		models.ProjectRoleObserver,
+	for _, roleCase := range []struct {
+		role          models.ProjectRole
+		expectedTotal int64
+	}{
+		{role: models.ProjectRoleAgent, expectedTotal: 2},
+		{role: models.ProjectRoleObserver, expectedTotal: 1},
 	} {
 		roleRequest := httptest.NewRequest(
 			http.MethodGet,
@@ -634,11 +1209,11 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 			nil,
 		)
 		roleRequest.Header.Set("X-Test-User", strconv.FormatUint(uint64(owner.ID), 10))
-		roleRequest.Header.Set("X-Test-Role", string(role))
+		roleRequest.Header.Set("X-Test-Role", string(roleCase.role))
 		roleResponse := httptest.NewRecorder()
 		router.ServeHTTP(roleResponse, roleRequest)
 		if roleResponse.Code != http.StatusOK {
-			t.Fatalf("%s attachments status=%d body=%s", role, roleResponse.Code, roleResponse.Body.String())
+			t.Fatalf("%s attachments status=%d body=%s", roleCase.role, roleResponse.Code, roleResponse.Body.String())
 		}
 		var roleBody struct {
 			Data  []models.TicketAttachmentResponse `json:"data"`
@@ -647,8 +1222,30 @@ func TestTicketContentCustomerVisibilityAndObjectAuthorization(t *testing.T) {
 		if err := json.Unmarshal(roleResponse.Body.Bytes(), &roleBody); err != nil {
 			t.Fatal(err)
 		}
-		if roleBody.Total != 2 || len(roleBody.Data) != 2 {
-			t.Fatalf("%s attachment page=%+v", role, roleBody)
+		if roleBody.Total != roleCase.expectedTotal ||
+			int64(len(roleBody.Data)) != roleCase.expectedTotal {
+			t.Fatalf("%s attachment page=%+v", roleCase.role, roleBody)
+		}
+		if roleCase.role == models.ProjectRoleObserver {
+			for _, attachment := range roleBody.Data {
+				if !attachment.IsPublic ||
+					attachment.OriginalName == "private.txt" {
+					t.Fatalf("observer saw private attachment: %+v", attachment)
+				}
+			}
+			for _, forbidden := range []string{
+				`"uploaded_by"`, `"actor_type"`, `"actor_id"`,
+				`"service_principal_id"`, `"file_name"`,
+				`"download_count"`, `"hash"`, `"scan_details"`,
+			} {
+				if strings.Contains(roleResponse.Body.String(), forbidden) {
+					t.Fatalf(
+						"observer attachment response leaked %q: %s",
+						forbidden,
+						roleResponse.Body.String(),
+					)
+				}
+			}
 		}
 	}
 	rawAttachmentBody := attachmentResponse.Body.String()

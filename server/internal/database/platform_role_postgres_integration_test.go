@@ -617,8 +617,23 @@ func TestPostgresPlatformRoleFinalCheckpointFailureRollsBackEveryArtifact(
 	if auditRole != "admin" {
 		t.Fatalf("failed migration changed legacy audit role to %q", auditRole)
 	}
+	if !db.Migrator().HasTable(&models.SchemaMigrationCheckpoint{}) {
+		t.Fatal(
+			"migration orchestration did not retain its pre-main checkpoint table",
+		)
+	}
+	var checkpointCount int64
+	if err := db.Model(&models.SchemaMigrationCheckpoint{}).
+		Count(&checkpointCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if checkpointCount != 0 {
+		t.Fatalf(
+			"failed main migration retained %d cutover checkpoints",
+			checkpointCount,
+		)
+	}
 	for _, model := range []any{
-		&models.SchemaMigrationCheckpoint{},
 		&models.ProjectMembership{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},

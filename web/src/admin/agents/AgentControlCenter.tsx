@@ -119,6 +119,8 @@ const outboxColumns: ResizableColumn[] = [
   { key: 'status', defaultWidth: 120, minWidth: 96, maxWidth: 180 },
   { key: 'attempts', defaultWidth: 88, minWidth: 72, maxWidth: 136 },
   { key: 'retry-at', defaultWidth: 188, minWidth: 150, maxWidth: 260 },
+  { key: 'expires-at', defaultWidth: 188, minWidth: 150, maxWidth: 260 },
+  { key: 'expired-at', defaultWidth: 188, minWidth: 150, maxWidth: 260 },
   { key: 'error', defaultWidth: 360, minWidth: 200, maxWidth: 640 },
   { key: 'actions', defaultWidth: 96, minWidth: 80, maxWidth: 136, sticky: 'right' },
 ]
@@ -326,7 +328,7 @@ const adminWrite = <T,>(
 const statusColor = (status: string): 'success' | 'warning' | 'error' | 'default' => {
   if (status === 'active' || status === 'delivered' || status === 'succeeded' || status === 'completed') return 'success'
   if (status === 'pending' || status === 'retrying') return 'warning'
-  if (status === 'failed' || status === 'dead' || status === 'suspended') return 'error'
+  if (status === 'failed' || status === 'dead' || status === 'expired' || status === 'suspended') return 'error'
   return 'default'
 }
 
@@ -341,6 +343,7 @@ const statusLabel = (status: string) => ({
   retrying: '重试中',
   failed: '失败',
   dead: '终止',
+  expired: '已过期',
   suspended: '已暂停',
   processing: '处理中',
 } as Record<string, string>)[status] ?? '未知状态'
@@ -501,6 +504,7 @@ const surfaceTabs: Record<
     { id: 'principals', label: '服务主体' },
     { id: 'leases', label: '实时租约' },
     { id: 'attachments', label: '附件扫描' },
+    { id: 'outbox', label: '事件投递（Outbox）' },
     { id: 'policy', label: '策略审计' },
   ],
   integration: [
@@ -1238,6 +1242,12 @@ export const AgentControlCenter: React.FC<{
         loadOverview(scope.projectKey),
       ])
     } catch (requestError) {
+      if (
+        projectKey
+        && activeProjectKey.current === projectKey
+      ) {
+        await loadOutbox(projectKey, outboxPage)
+      }
       notify(localizedUnknownErrorMessage(requestError, '事件投递回放失败'), { type: 'error' })
     }
   }
@@ -1866,6 +1876,8 @@ export const AgentControlCenter: React.FC<{
                       <TableCell>状态</TableCell>
                       <TableCell>尝试</TableCell>
                       <TableCell>下次重试</TableCell>
+                      <TableCell>截止时间</TableCell>
+                      <TableCell>过期时间</TableCell>
                       <TableCell>错误</TableCell>
                       <TableCell align="right">操作</TableCell>
                     </TableRow>
@@ -1888,6 +1900,8 @@ export const AgentControlCenter: React.FC<{
                         </TableCell>
                         <TableCell>{delivery.attempts}</TableCell>
                         <TableCell>{formatDate(delivery.next_attempt_at)}</TableCell>
+                        <TableCell>{formatDate(delivery.expires_at)}</TableCell>
+                        <TableCell>{formatDate(delivery.expired_at)}</TableCell>
                         <TableCell sx={{ maxWidth: 320 }}>
                           <TruncatedText title={delivery.last_error || '—'}>
                             {delivery.last_error || '—'}
@@ -1908,7 +1922,7 @@ export const AgentControlCenter: React.FC<{
                         </TableCell>
                       </TableRow>
                     ))}
-                    {(outbox?.items.length ?? 0) === 0 && <EmptyRow colSpan={7} message="暂无事件投递记录。" />}
+                    {(outbox?.items.length ?? 0) === 0 && <EmptyRow colSpan={9} message="暂无事件投递记录。" />}
                   </TableBody>
                 </ResizableMuiTable>
               )}

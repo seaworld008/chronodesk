@@ -4025,6 +4025,8 @@ func writeNativeProblem(c *gin.Context, err error) {
 		status, code = http.StatusConflict, ProblemIdempotencyConflict
 	case errors.Is(err, services.ErrOutboxReplayConflict):
 		status, code = http.StatusConflict, ProblemOutboxConflict
+	case errors.Is(err, services.ErrOutboxReplayExpired):
+		status, code = http.StatusConflict, ProblemOutboxExpired
 	case errors.Is(err, services.ErrTicketConfigurationUnavailable):
 		status, code = http.StatusConflict, "ticket_configuration_unavailable"
 	case errors.Is(err, services.ErrTicketRequestTypeAmbiguous):

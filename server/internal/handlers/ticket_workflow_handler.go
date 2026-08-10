@@ -53,6 +53,65 @@ type StatusUpdateRequest struct {
 	ResolutionNotes string `json:"resolution_notes" binding:"max=10000"`
 }
 
+// GetAllowedTicketTransitions returns the lifecycle projections allowed by
+// the immutable workflow version bound to this exact Ticket.
+func (h *TicketWorkflowHandler) GetAllowedTicketTransitions(c *gin.Context) {
+	ticketID, err := strconv.ParseUint(c.Param("id"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "无效的工单ID",
+		})
+		return
+	}
+	if _, err := authorizeTicket(
+		c.Request.Context(),
+		c,
+		h.ticketService,
+		uint(ticketID),
+		ticketAccessWorkflow,
+	); err != nil {
+		if !writeTicketAuthorizationError(c, err) {
+			c.JSON(http.StatusNotFound, gin.H{
+				"success": false,
+				"message": "工单不存在",
+			})
+		}
+		return
+	}
+	reader, ok := h.ticketService.(ticketWorkflowTransitionReader)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "工单工作流能力不可用",
+		})
+		return
+	}
+	allowed, err := reader.AllowedTicketTransitions(
+		c.Request.Context(),
+		uint(ticketID),
+		c.GetUint("user_id"),
+	)
+	if err != nil {
+		logHandlerFailure(c, "ticket_workflow.allowed_transitions", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "获取合法工单状态失败",
+		})
+		return
+	}
+	values := make([]string, len(allowed))
+	for index, status := range allowed {
+		values[index] = string(status)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"allowed_next_statuses": values,
+		},
+	})
+}
+
 func (h *TicketWorkflowHandler) AssignTicket(c *gin.Context) {
 	ticketID, err := strconv.ParseUint(c.Param("id"), 10, 32)
 	if err != nil {
@@ -614,9 +673,11 @@ func (h *TicketWorkflowHandler) GetTicketHistory(c *gin.Context) {
 		c.Request.Context(),
 		uint(ticketID),
 		services.PageRequest{
-			Page:            page,
-			PageSize:        pageSize,
-			CustomerVisible: isRequesterRole(normalizedProjectRole(c)),
+			Page:     page,
+			PageSize: pageSize,
+			CustomerVisible: isPublicTicketContentOnlyRole(
+				normalizedProjectRole(c),
+			),
 		},
 	)
 	if err != nil {
@@ -628,8 +689,8 @@ func (h *TicketWorkflowHandler) GetTicketHistory(c *gin.Context) {
 		})
 		return
 	}
-	customer := isRequesterRole(normalizedProjectRole(c))
-	responses := ticketHistoryResponses(history, customer)
+	publicOnly := isPublicTicketContentOnlyRole(normalizedProjectRole(c))
+	responses := ticketHistoryResponses(history, publicOnly)
 
 	writePageEnvelope(c, responses, total, page, pageSize)
 }
