@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.1.0.
- * Contract SHA-256: e4a7221b5659169c01f9dc661ed4b0f3af56c7cc1c6ce4e2d8a0957db81375b7.
+ * Contract SHA-256: 340d0cf947642aec27b46eaf826f2af3ecd3aeb3de4ccb2bf1bbb5d888d645a4.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -1792,8 +1792,8 @@ export type AdminOutboxDeliverySummary = {
     attempts: number
     next_attempt_at: string
     last_error: string
-    expires_at?: string | null
-    expired_at?: string | null
+    expires_at: string | null
+    expired_at: string | null
     updated_at: string
     resource_version: ResourceVersion
 }
@@ -3067,8 +3067,8 @@ export type IntegrationOutboxSummary = {
     next_attempt_at: string
     last_error?: string
     delivered_at?: string
-    expires_at?: string | null
-    expired_at?: string | null
+    expires_at: string | null
+    expired_at: string | null
     created_at: string
     updated_at: string
 }

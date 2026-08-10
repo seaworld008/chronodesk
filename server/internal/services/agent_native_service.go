@@ -3758,7 +3758,6 @@ func (s *AgentNativeService) ReplayOutboxCommand(
 	if err != nil {
 		return commandResult, err
 	}
-	now := s.now().UTC()
 	err = s.InTransaction(ctx, func(txCtx context.Context, tx *gorm.DB) error {
 		if err := lockWebhookLifecycleProject(tx, projectScope); err != nil {
 			return err
@@ -3777,7 +3776,7 @@ func (s *AgentNativeService) ReplayOutboxCommand(
 				tx,
 				projectScope,
 				&delivery,
-				now,
+				s.now,
 			)
 			commandResult = result
 			return replayErr
@@ -3786,6 +3785,7 @@ func (s *AgentNativeService) ReplayOutboxCommand(
 			delivery.Status != models.OutboxDeliveryDead {
 			return ErrOutboxReplayConflict
 		}
+		transactionNow := s.now().UTC()
 		result := exactOutboxReplayGeneration(
 			tx.Model(&models.OutboxDelivery{}),
 			&delivery,
@@ -3793,12 +3793,12 @@ func (s *AgentNativeService) ReplayOutboxCommand(
 			Updates(map[string]any{
 				"status":          models.OutboxDeliveryPending,
 				"attempts":        0,
-				"next_attempt_at": now,
+				"next_attempt_at": transactionNow,
 				"locked_at":       nil,
 				"locked_by":       "",
 				"last_error":      "",
 				"delivered_at":    nil,
-				"updated_at":      now,
+				"updated_at":      transactionNow,
 			})
 		if result.Error != nil {
 			return fmt.Errorf("replay outbox delivery: %w", result.Error)
@@ -3832,7 +3832,7 @@ func replayWebhookOutboxTx(
 	tx *gorm.DB,
 	scope models.ProjectScope,
 	delivery *models.OutboxDelivery,
-	now time.Time,
+	now func() time.Time,
 ) (OutboxReplayResult, error) {
 	expired := OutboxReplayResult{
 		Disposition: OutboxReplayExpired,
@@ -3871,21 +3871,22 @@ func replayWebhookOutboxTx(
 		}
 		return OutboxReplayResult{}, err
 	}
-	if !delivery.ExpiresAt.UTC().After(now) {
+	transactionNow := now().UTC()
+	if !delivery.ExpiresAt.UTC().After(transactionNow) {
 		result := exactOutboxReplayGeneration(
 			tx.Model(&models.OutboxDelivery{}),
 			delivery,
-		).Where("expires_at <= ?", now).
+		).Where("expires_at <= ?", transactionNow).
 			Updates(map[string]any{
 				"status":       models.OutboxDeliveryExpired,
-				"expired_at":   now,
+				"expired_at":   transactionNow,
 				"delivered_at": nil,
 				"locked_at":    nil,
 				"locked_by":    "",
 				"lock_token":   nil,
 				"last_error": "webhook delivery credential deadline " +
 					"expired",
-				"updated_at": now,
+				"updated_at": transactionNow,
 			})
 		if result.Error != nil {
 			return OutboxReplayResult{}, fmt.Errorf(
@@ -3900,7 +3901,7 @@ func replayWebhookOutboxTx(
 			tx,
 			snapshot,
 			models.WebhookCredentialShredReasonExpired,
-			now,
+			transactionNow,
 		); err != nil {
 			return OutboxReplayResult{}, err
 		}
@@ -3917,18 +3918,18 @@ func replayWebhookOutboxTx(
 	result := exactOutboxReplayGeneration(
 		tx.Model(&models.OutboxDelivery{}),
 		delivery,
-	).Where("expires_at > ?", now).
+	).Where("expires_at > ?", transactionNow).
 		Updates(map[string]any{
 			"status":          models.OutboxDeliveryPending,
 			"attempts":        0,
-			"next_attempt_at": now,
+			"next_attempt_at": transactionNow,
 			"locked_at":       nil,
 			"locked_by":       "",
 			"lock_token":      nil,
 			"last_error":      "",
 			"delivered_at":    nil,
 			"expired_at":      nil,
-			"updated_at":      now,
+			"updated_at":      transactionNow,
 		})
 	if result.Error != nil {
 		return OutboxReplayResult{}, fmt.Errorf(

@@ -4757,6 +4757,8 @@ components:
         - attempts
         - next_attempt_at
         - last_error
+        - expires_at
+        - expired_at
         - updated_at
         - resource_version
       properties:

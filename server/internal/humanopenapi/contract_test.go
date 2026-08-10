@@ -78,6 +78,11 @@ func TestHumanOutboxContractsPublishOnlySafeFiniteReplayState(
 		if schema["additionalProperties"] != false {
 			t.Fatalf("%s is not closed", schemaName)
 		}
+		for _, field := range []string{"expires_at", "expired_at"} {
+			if !contains(schema["required"], field) {
+				t.Errorf("%s.required omits %s", schemaName, field)
+			}
+		}
 		properties := objectAt(t, schema, "properties")
 		status := objectAt(t, properties, "status")
 		if reference, ok := status["$ref"].(string); ok {

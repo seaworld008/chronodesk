@@ -21595,6 +21595,8 @@
           "attempts",
           "next_attempt_at",
           "last_error",
+          "expires_at",
+          "expired_at",
           "updated_at",
           "resource_version"
         ],
@@ -27181,6 +27183,8 @@
           "attempts",
           "max_attempts",
           "next_attempt_at",
+          "expires_at",
+          "expired_at",
           "created_at",
           "updated_at"
         ],

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -704,6 +705,153 @@ func TestReplayWebhookOutboxExactGenerationCASPostgres(t *testing.T) {
 		t.Fatalf(
 			"stale replay overwrote PostgreSQL generation: %+v",
 			current,
+		)
+	}
+}
+
+func TestReplayWebhookOutboxResamplesClockAfterLifecycleLocksPostgres(
+	t *testing.T,
+) {
+	fixture := newWebhookOutboxLifecyclePostgresFixture(t)
+	fixture.clearRows(t)
+	deadline := fixture.now.Add(time.Hour)
+	pair := fixture.seedPair(
+		t,
+		fixture.projectA,
+		models.OutboxDeliveryFailed,
+		deadline,
+		"",
+		nil,
+		2,
+	)
+	blockerContext := fixture.workerContext(
+		t,
+		context.Background(),
+		fixture.projectA,
+	)
+	deliveryLocked := make(chan struct{})
+	releaseDelivery := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() {
+			close(releaseDelivery)
+		})
+	})
+	blockerDone := make(chan error, 1)
+	go func() {
+		blockerDone <- scopeddb.WithProjectScopeContextTransaction(
+			blockerContext,
+			fixture.runtimeB,
+			fixture.projectA.Scope(),
+			func(scopedCtx context.Context) error {
+				db := fixture.runtimeB.WithContext(scopedCtx)
+				if err := lockWebhookLifecycleProject(
+					db,
+					fixture.projectA.Scope(),
+				); err != nil {
+					return err
+				}
+				var delivery models.OutboxDelivery
+				if err := db.Clauses(
+					clause.Locking{Strength: "UPDATE"},
+				).Where(
+					"id = ? AND organization_id = ? AND project_id = ?",
+					pair.delivery.ID,
+					fixture.projectA.OrganizationID,
+					fixture.projectA.ID,
+				).Take(&delivery).Error; err != nil {
+					return err
+				}
+				close(deliveryLocked)
+				<-releaseDelivery
+				return nil
+			},
+		)
+	}()
+	select {
+	case <-deliveryLocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("PostgreSQL delivery blocker did not acquire its lock")
+	}
+	var clockMu sync.RWMutex
+	transactionNow := deadline.Add(-time.Nanosecond)
+	service := NewAgentNativeService(
+		fixture.runtimeA,
+		AgentNativeOptions{
+			OutboxLockTTL: time.Minute,
+			Now: func() time.Time {
+				clockMu.RLock()
+				defer clockMu.RUnlock()
+				return transactionNow
+			},
+		},
+	)
+	replayContext := fixture.workerContext(
+		t,
+		context.Background(),
+		fixture.projectA,
+	)
+	type replayResult struct {
+		command OutboxReplayResult
+		err     error
+	}
+	replayDone := make(chan replayResult, 1)
+	go func() {
+		var command OutboxReplayResult
+		err := scopeddb.WithProjectScopeContextTransaction(
+			replayContext,
+			fixture.runtimeA,
+			fixture.projectA.Scope(),
+			func(scopedCtx context.Context) error {
+				var commandErr error
+				command, commandErr = service.ReplayOutboxCommand(
+					scopedCtx,
+					pair.delivery.ID,
+				)
+				return commandErr
+			},
+		)
+		if err == nil &&
+			command.Disposition == OutboxReplayExpired {
+			err = ErrOutboxReplayExpired
+		}
+		replayDone <- replayResult{command: command, err: err}
+	}()
+	fixture.waitForRuntimeBlockedBy(
+		t,
+		fixture.runtimeAPID,
+		fixture.runtimeBPID,
+	)
+	clockMu.Lock()
+	transactionNow = deadline
+	clockMu.Unlock()
+	releaseOnce.Do(func() {
+		close(releaseDelivery)
+	})
+	if err := receivePostgresError(t, blockerDone); err != nil {
+		t.Fatal(err)
+	}
+	replay := <-replayDone
+	if !errors.Is(replay.err, ErrOutboxReplayExpired) ||
+		replay.command.Disposition != OutboxReplayExpired ||
+		!replay.command.Materialized {
+		t.Fatalf(
+			"clock-crossing replay = result:%+v error:%v, want materialized expired",
+			replay.command,
+			replay.err,
+		)
+	}
+	fixture.assertExpiredEnvelope(t, pair)
+	current := fixture.loadDelivery(t, pair.delivery.ID)
+	if current.ExpiredAt == nil ||
+		!current.ExpiredAt.Equal(deadline) ||
+		current.ExpiresAt == nil ||
+		!current.ExpiresAt.Equal(deadline) {
+		t.Fatalf(
+			"deadline equality expires_at=%v expired_at=%v, want %v",
+			current.ExpiresAt,
+			current.ExpiredAt,
+			deadline,
 		)
 	}
 }

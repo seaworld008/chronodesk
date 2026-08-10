@@ -24,54 +24,21 @@ import (
 )
 
 const (
-	projectAccessContextKey      = "project_access"
-	projectRoleContextKey        = "project_role"
-	projectAfterCommitContextKey = "project_after_commit"
+	projectAccessContextKey = "project_access"
+	projectRoleContextKey   = "project_role"
 )
 
 var errProjectRequestRollback = errors.New(
 	"project request returned an unsuccessful response",
 )
 
-type projectAfterCommitQueue struct {
-	callbacks []func()
-}
-
 func queueProjectAfterCommit(c *gin.Context, callback func()) error {
-	if c == nil || callback == nil {
-		return errors.New("project after-commit callback is invalid")
-	}
-	value, exists := c.Get(projectAfterCommitContextKey)
-	queue, ok := value.(*projectAfterCommitQueue)
-	if !exists || !ok || queue == nil {
-		return errors.New("project after-commit queue is unavailable")
-	}
-	queue.callbacks = append(queue.callbacks, callback)
-	return nil
+	return middleware.QueueProjectAfterCommit(c, callback)
 }
 
 func runProjectAfterCommit(c *gin.Context) {
-	if c == nil {
-		return
-	}
-	value, exists := c.Get(projectAfterCommitContextKey)
-	queue, ok := value.(*projectAfterCommitQueue)
-	if !exists || !ok || queue == nil {
-		return
-	}
-	callbacks := append([]func(){}, queue.callbacks...)
-	queue.callbacks = nil
-	for _, callback := range callbacks {
-		func() {
-			defer func() {
-				if recover() != nil {
-					_ = c.Error(errors.New(
-						"project after-commit callback panicked",
-					))
-				}
-			}()
-			callback()
-		}()
+	if err := middleware.RunProjectAfterCommitCallbacks(c); err != nil {
+		_ = c.Error(err)
 	}
 }
 
@@ -931,10 +898,13 @@ func ProjectScopeMiddleware(
 			})
 			return
 		}
-		c.Set(
-			projectAfterCommitContextKey,
-			&projectAfterCommitQueue{},
-		)
+		if err := middleware.InstallProjectAfterCommitQueue(c); err != nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+				"code": "project_after_commit_unavailable",
+				"msg":  "项目提交后处理不可用",
+			})
+			return
+		}
 		originalWriter := c.Writer
 		defer func() {
 			c.Writer = originalWriter
@@ -983,6 +953,13 @@ func ProjectScopeMiddleware(
 					bufferedWriter.Status() >= http.StatusBadRequest {
 					return errProjectRequestRollback
 				}
+				if middleware.HasProjectAfterCommitResponse(c) &&
+					bufferedWriter.Written() {
+					return errors.New(
+						"project after-commit response conflicts " +
+							"with buffered response",
+					)
+				}
 				return nil
 			},
 		)
@@ -1027,6 +1004,24 @@ func ProjectScopeMiddleware(
 			return
 		}
 		runProjectAfterCommit(c)
+		emitted, emitErr :=
+			middleware.EmitProjectAfterCommitResponse(c)
+		if emitErr != nil {
+			_ = c.Error(emitErr)
+			if !c.Writer.Written() {
+				c.AbortWithStatusJSON(
+					http.StatusInternalServerError,
+					gin.H{
+						"code": "project_response_failed",
+						"msg":  "项目响应失败",
+					},
+				)
+			}
+			return
+		}
+		if emitted {
+			return
+		}
 		if err := bufferedWriter.Commit(); err != nil {
 			_ = c.Error(err)
 			if !c.Writer.Written() {

@@ -504,6 +504,7 @@ const surfaceTabs: Record<
     { id: 'principals', label: '服务主体' },
     { id: 'leases', label: '实时租约' },
     { id: 'attachments', label: '附件扫描' },
+    { id: 'outbox', label: '事件投递（Outbox）' },
     { id: 'policy', label: '策略审计' },
   ],
   integration: [

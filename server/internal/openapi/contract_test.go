@@ -762,6 +762,14 @@ func TestOutboxReplayPublishesFiniteSafeExpiredContract(t *testing.T) {
 	if outbox["additionalProperties"] != false {
 		t.Fatal("AdminOutboxDeliverySummary is not closed")
 	}
+	for _, field := range []string{"expires_at", "expired_at"} {
+		if !contractSliceContains(outbox["required"], field) {
+			t.Errorf(
+				"AdminOutboxDeliverySummary.required omits %s",
+				field,
+			)
+		}
+	}
 	properties := contractMap(
 		t,
 		outbox["properties"],
