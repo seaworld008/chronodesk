@@ -142,20 +142,27 @@ func validateProjectDatabaseSecretsAt(
 	for _, row := range webhooks {
 		rowID := strconv.FormatUint(uint64(row.ID), 10)
 		if err := validateEnvelope(protector, row.Secret, FieldAAD(webhookSecretsTable, rowID, "secret")); err != nil {
-			return fmt.Errorf("webhook %d secret: %w", row.ID, err)
+			return fmt.Errorf("webhook secret: %w", err)
 		}
 		if err := validateEnvelope(
 			protector,
 			row.PreviousSecret,
 			FieldAAD(webhookSecretsTable, rowID, "previous_secret"),
 		); err != nil {
-			return fmt.Errorf("webhook %d previous secret: %w", row.ID, err)
+			return fmt.Errorf("webhook previous secret: %w", err)
 		}
 		if err := validateEnvelope(protector, row.AccessToken, FieldAAD(webhookSecretsTable, rowID, "access_token")); err != nil {
-			return fmt.Errorf("webhook %d access token: %w", row.ID, err)
+			return fmt.Errorf("webhook access token: %w", err)
 		}
 	}
 
+	if err := validateWebhookSnapshotCredentialLifetimes(
+		ctx,
+		db,
+		scope,
+	); err != nil {
+		return err
+	}
 	var snapshots []models.WebhookDeliverySnapshot
 	if err := db.WithContext(ctx).
 		Select(
@@ -169,9 +176,10 @@ func validateProjectDatabaseSecretsAt(
 			"credential_shred_reason",
 		).
 		Where(
-			"organization_id = ? AND project_id = ? AND credential_shredded_at IS NULL",
+			"organization_id = ? AND project_id = ? AND credential_shredded_at IS NULL AND credential_expires_at > ?",
 			scope.OrganizationID,
 			scope.ProjectID,
+			maintenanceNow,
 		).
 		Order("id ASC").
 		Find(&snapshots).Error; err != nil {
@@ -192,7 +200,7 @@ func validateProjectDatabaseSecretsAt(
 			row.Secret,
 			FieldAAD(webhookSecretsTable, rowID, "secret"),
 		); err != nil {
-			return fmt.Errorf("webhook snapshot %q secret: %w", row.ID, err)
+			return fmt.Errorf("webhook snapshot secret: %w", err)
 		}
 		if err := validateEnvelope(
 			protector,
@@ -200,8 +208,7 @@ func validateProjectDatabaseSecretsAt(
 			FieldAAD(webhookSecretsTable, rowID, "previous_secret"),
 		); err != nil {
 			return fmt.Errorf(
-				"webhook snapshot %q previous secret: %w",
-				row.ID,
+				"webhook snapshot previous secret: %w",
 				err,
 			)
 		}
@@ -211,8 +218,7 @@ func validateProjectDatabaseSecretsAt(
 			FieldAAD(webhookSecretsTable, rowID, "access_token"),
 		); err != nil {
 			return fmt.Errorf(
-				"webhook snapshot %q access token: %w",
-				row.ID,
+				"webhook snapshot access token: %w",
 				err,
 			)
 		}
@@ -232,15 +238,50 @@ func validateProjectDatabaseSecretsAt(
 	}
 	for _, row := range pushes {
 		if err := validateEnvelope(protector, row.Token, FieldAAD(a2aPushSecretsTable, row.ID, "token")); err != nil {
-			return fmt.Errorf("A2A push config %q token: %w", row.ID, err)
+			return fmt.Errorf("A2A push token: %w", err)
 		}
 		authentication, err := storedJSONEnvelope(row.Authentication)
 		if err != nil {
-			return fmt.Errorf("A2A push config %q authentication: %w", row.ID, err)
+			return fmt.Errorf("A2A push authentication: %w", err)
 		}
 		if err := validateEnvelope(protector, authentication, FieldAAD(a2aPushSecretsTable, row.ID, "authentication")); err != nil {
-			return fmt.Errorf("A2A push config %q authentication: %w", row.ID, err)
+			return fmt.Errorf("A2A push authentication: %w", err)
 		}
+	}
+	return nil
+}
+
+func validateWebhookSnapshotCredentialLifetimes(
+	ctx context.Context,
+	db *gorm.DB,
+	scope models.ProjectScope,
+) error {
+	var corrupt struct {
+		Found int
+	}
+	if err := db.WithContext(ctx).
+		Table("webhook_delivery_snapshots").
+		Select("1 AS found").
+		Where(
+			"organization_id = ? AND project_id = ? AND credential_shredded_at IS NULL",
+			scope.OrganizationID,
+			scope.ProjectID,
+		).
+		Where(
+			"credential_expires_at IS NULL OR credential_expires_at <= ?",
+			time.Time{},
+		).
+		Limit(1).
+		Scan(&corrupt).Error; err != nil {
+		return fmt.Errorf(
+			"validate webhook snapshot credential lifetimes: %w",
+			err,
+		)
+	}
+	if corrupt.Found != 0 {
+		return errors.New(
+			"validate webhook snapshot credential lifetimes: unshredded credential lifetime is missing",
+		)
 	}
 	return nil
 }
@@ -265,8 +306,7 @@ func validateGlobalDatabaseSecrets(
 			FieldAAD(emailSecretsTable, rowID, "smtp_password"),
 		); err != nil {
 			return fmt.Errorf(
-				"email config %d SMTP password: %w",
-				row.ID,
+				"email SMTP password: %w",
 				err,
 			)
 		}
@@ -410,6 +450,13 @@ func rotateProjectDatabaseSecretsAt(
 		report.add(delta)
 	}
 
+	if err := validateWebhookSnapshotCredentialLifetimes(
+		tx.Statement.Context,
+		tx,
+		scope,
+	); err != nil {
+		return SecretRotationReport{}, err
+	}
 	var snapshots []models.WebhookDeliverySnapshot
 	snapshotQuery := tx.
 		Select(
@@ -425,9 +472,10 @@ func rotateProjectDatabaseSecretsAt(
 			"credential_shred_reason",
 		).
 		Where(
-			"organization_id = ? AND project_id = ? AND credential_shredded_at IS NULL",
+			"organization_id = ? AND project_id = ? AND credential_shredded_at IS NULL AND credential_expires_at > ?",
 			scope.OrganizationID,
 			scope.ProjectID,
+			maintenanceNow,
 		).
 		Order("id ASC")
 	if err := withSecretMaintenanceLock(
@@ -467,6 +515,7 @@ func rotateProjectDatabaseSecretsAt(
 		"project_id",
 		"token",
 		"authentication",
+		"updated_at",
 	).Where(
 		"organization_id = ? AND project_id = ?",
 		scope.OrganizationID,
@@ -729,12 +778,12 @@ func rotateA2APushRow(
 	}
 	result := tx.Model(&models.AgentPushNotificationConfig{}).
 		Where(
-			"id = ? AND organization_id = ? AND project_id = ? AND token = ? AND authentication = ?",
+			"id = ? AND organization_id = ? AND project_id = ? AND token = ? AND updated_at = ?",
 			row.ID,
 			row.OrganizationID,
 			row.ProjectID,
 			row.Token,
-			row.Authentication,
+			row.UpdatedAt,
 		).
 		Updates(updates)
 	if result.Error != nil {
@@ -803,7 +852,7 @@ func validateEnvelope(protector Protector, value string, aad []byte) error {
 	}
 	plaintext, err := protector.Open(value, aad)
 	clear(plaintext)
-	return err
+	return redactDatabaseSecretProtectorError(err)
 }
 
 func rotateValue(protector Protector, value string, aad []byte) (string, bool, error) {
@@ -818,7 +867,7 @@ func rotateValue(protector Protector, value string, aad []byte) (string, bool, e
 	}
 	plaintext, err := protector.Open(value, aad)
 	if err != nil {
-		return "", false, err
+		return "", false, redactDatabaseSecretProtectorError(err)
 	}
 	defer clear(plaintext)
 	keyID, err := EnvelopeKeyID(value)
@@ -829,7 +878,26 @@ func rotateValue(protector Protector, value string, aad []byte) (string, bool, e
 		return value, false, nil
 	}
 	envelope, err := protector.Seal(plaintext, aad)
-	return envelope, err == nil, err
+	return envelope, err == nil, redactDatabaseSecretProtectorError(err)
+}
+
+type redactedDatabaseSecretProtectorError struct {
+	cause error
+}
+
+func (redactedDatabaseSecretProtectorError) Error() string {
+	return "encrypted-secret operation failed"
+}
+
+func (err redactedDatabaseSecretProtectorError) Unwrap() error {
+	return err.cause
+}
+
+func redactDatabaseSecretProtectorError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return redactedDatabaseSecretProtectorError{cause: err}
 }
 
 func storedJSONEnvelope(raw datatypes.JSON) (string, error) {

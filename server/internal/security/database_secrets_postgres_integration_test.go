@@ -2,6 +2,8 @@ package security
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -112,11 +115,38 @@ func TestDatabaseSecretMaintenancePostgresForceRLSAndConcurrentShred(
 	if err := owner.Exec(
 		`INSERT INTO agent_push_notification_configs
 			(id, organization_id, project_id, token, authentication)
-		 VALUES (?, ?, ?, ?, 'null'::jsonb)`,
+		 VALUES (?, ?, ?, ?, NULL)`,
 		pushID,
 		1,
 		activeProjectID,
 		pushEnvelope,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	authenticationPushID := "force-rls-authentication-push"
+	authenticationEnvelope, err := oldRing.Seal(
+		[]byte("push-authentication"),
+		FieldAAD(
+			a2aPushSecretsTable,
+			authenticationPushID,
+			"authentication",
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedAuthentication, err := json.Marshal(authenticationEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Exec(
+		`INSERT INTO agent_push_notification_configs
+			(id, organization_id, project_id, token, authentication)
+		 VALUES (?, ?, ?, '', CAST(? AS json))`,
+		authenticationPushID,
+		1,
+		activeProjectID,
+		string(encodedAuthentication),
 	).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -205,6 +235,12 @@ func TestDatabaseSecretMaintenancePostgresForceRLSAndConcurrentShred(
 		"token",
 		pushEnvelope,
 	)
+	assertSecretPostgresJSONValue(
+		t,
+		owner,
+		authenticationPushID,
+		encodedAuthentication,
+	)
 
 	archivedEnvelope := sealSnapshotField(
 		t,
@@ -259,6 +295,12 @@ func TestDatabaseSecretMaintenancePostgresForceRLSAndConcurrentShred(
 		"token",
 		pushEnvelope,
 	)
+	assertSecretPostgresJSONValue(
+		t,
+		owner,
+		authenticationPushID,
+		encodedAuthentication,
+	)
 
 	if err := owner.Table("email_configs").
 		Where("id = ?", emailID).
@@ -282,8 +324,8 @@ func TestDatabaseSecretMaintenancePostgresForceRLSAndConcurrentShred(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Rotated != 5 {
-		t.Fatalf("complete PostgreSQL rotation report = %+v, want rotated=5", report)
+	if report.Rotated != 6 {
+		t.Fatalf("complete PostgreSQL rotation report = %+v, want rotated=6", report)
 	}
 	if err := validateDatabaseSecretsAt(
 		context.Background(),
@@ -293,6 +335,17 @@ func TestDatabaseSecretMaintenancePostgresForceRLSAndConcurrentShred(
 	); err != nil {
 		t.Fatalf("new-only post-rotation validation failed: %v", err)
 	}
+	assertPostgresA2APushGenerationCAS(
+		t,
+		owner,
+		runtime,
+		rotating,
+		models.ProjectScope{
+			OrganizationID: 1,
+			ProjectID:      activeProjectID,
+		},
+		oldRing,
+	)
 
 	concurrentEnvelope := sealSnapshotField(
 		t,
@@ -324,6 +377,65 @@ func TestDatabaseSecretMaintenancePostgresForceRLSAndConcurrentShred(
 	if err := admin.Exec("SELECT 1").Error; err != nil {
 		t.Fatalf("PostgreSQL cleanup handle is unavailable: %v", err)
 	}
+}
+
+func TestDatabaseSecretMaintenancePostgresLocksOnlyLiveSnapshots(t *testing.T) {
+	admin, owner, runtime, cleanup := openDatabaseSecretPostgresFixture(t)
+	defer cleanup()
+
+	maintenanceNow := time.Date(2026, 8, 10, 17, 0, 0, 0, time.UTC)
+	projectID := insertSecretPostgresProject(
+		t,
+		owner,
+		1,
+		models.ProjectStatusActive,
+	)
+	configID := insertSecretPostgresWebhook(t, owner, 1, projectID)
+	expiredID := "00000000-0000-7000-8000-000000000201"
+	equalityID := "00000000-0000-7000-8000-000000000202"
+	liveID := "00000000-0000-7000-8000-000000000203"
+	insertSecretPostgresSnapshot(
+		t,
+		owner,
+		expiredID,
+		1,
+		projectID,
+		configID,
+		"",
+		maintenanceNow.Add(-time.Nanosecond),
+	)
+	insertSecretPostgresSnapshot(
+		t,
+		owner,
+		equalityID,
+		1,
+		projectID,
+		configID,
+		"",
+		maintenanceNow,
+	)
+	insertSecretPostgresSnapshot(
+		t,
+		owner,
+		liveID,
+		1,
+		projectID,
+		configID,
+		"",
+		maintenanceNow.Add(time.Microsecond),
+	)
+
+	assertPostgresMaintenanceSnapshotLockBoundary(
+		t,
+		admin,
+		owner,
+		runtime,
+		testDatabaseKeyring(t, "dek-lock-boundary", 0x37),
+		maintenanceNow,
+		expiredID,
+		equalityID,
+		liveID,
+	)
 }
 
 func openDatabaseSecretPostgresFixture(
@@ -416,6 +528,7 @@ func openDatabaseSecretPostgresFixture(
 	ownerURL.RawQuery = ownerQuery.Encode()
 	owner = open(ownerURL.String())
 	createDatabaseSecretPostgresTables(t, owner)
+	assertDatabaseSecretPostgresCatalog(t, owner)
 	installDatabaseSecretPostgresRLS(t, owner)
 	if err := admin.Exec(
 		"GRANT USAGE ON SCHEMA " + quotedSchema + " TO " + quotedRole,
@@ -423,24 +536,38 @@ func openDatabaseSecretPostgresFixture(
 		t.Fatal(err)
 	}
 	if err := admin.Exec(
-		"GRANT SELECT, UPDATE ON " + quotedSchema +
-			".projects TO " + quotedRole,
+		"GRANT SELECT ON ALL TABLES IN SCHEMA " + quotedSchema +
+			" TO " + quotedRole,
 	).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := admin.Exec(
-		"GRANT SELECT, UPDATE ON " + quotedSchema +
-			".webhook_configs, " + quotedSchema +
-			".webhook_delivery_snapshots, " + quotedSchema +
-			".agent_push_notification_configs, " + quotedSchema +
+	columnGrants := []string{
+		"GRANT UPDATE (updated_at) ON " + quotedSchema +
+			".projects TO " + quotedRole,
+		"GRANT UPDATE (secret, previous_secret, access_token, updated_at) ON " +
+			quotedSchema + ".webhook_configs TO " + quotedRole,
+		"GRANT UPDATE (secret, previous_secret, access_token) ON " +
+			quotedSchema + ".webhook_delivery_snapshots TO " + quotedRole,
+		"GRANT UPDATE (token, authentication, updated_at) ON " +
+			quotedSchema + ".agent_push_notification_configs TO " + quotedRole,
+		"GRANT UPDATE (smtp_password) ON " + quotedSchema +
 			".email_configs TO " + quotedRole,
-	).Error; err != nil {
-		t.Fatal(err)
+	}
+	for _, grant := range columnGrants {
+		if err := admin.Exec(grant).Error; err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	runtimeURL := ownerURL
 	runtimeURL.User = url.User(roleName)
 	runtime = open(runtimeURL.String())
+	assertDatabaseSecretPostgresRoleAndColumnPermissions(
+		t,
+		admin,
+		runtime,
+		roleName,
+	)
 	return admin, owner, runtime, cleanup
 }
 
@@ -450,7 +577,8 @@ func createDatabaseSecretPostgresTables(t *testing.T, db *gorm.DB) {
 		`CREATE TABLE projects (
 			id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
 			organization_id bigint NOT NULL,
-			status text NOT NULL
+			status text NOT NULL,
+			updated_at timestamptz NOT NULL DEFAULT now()
 		)`,
 		`CREATE TABLE webhook_configs (
 			id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -459,6 +587,7 @@ func createDatabaseSecretPostgresTables(t *testing.T, db *gorm.DB) {
 			secret text NOT NULL DEFAULT '',
 			previous_secret text NOT NULL DEFAULT '',
 			access_token text NOT NULL DEFAULT '',
+			webhook_url text NOT NULL DEFAULT 'https://fixture.example.test/webhook',
 			updated_at timestamptz NOT NULL DEFAULT now(),
 			deleted_at timestamptz
 		)`,
@@ -470,6 +599,7 @@ func createDatabaseSecretPostgresTables(t *testing.T, db *gorm.DB) {
 			secret text NOT NULL DEFAULT '',
 			previous_secret text NOT NULL DEFAULT '',
 			access_token text NOT NULL DEFAULT '',
+			webhook_url text NOT NULL DEFAULT 'https://fixture.example.test/snapshot',
 			credential_expires_at timestamptz NOT NULL,
 			credential_shredded_at timestamptz,
 			credential_shred_reason text,
@@ -486,17 +616,89 @@ func createDatabaseSecretPostgresTables(t *testing.T, db *gorm.DB) {
 			organization_id bigint NOT NULL,
 			project_id bigint NOT NULL,
 			token text NOT NULL DEFAULT '',
-			authentication jsonb,
+			authentication json,
+			url text NOT NULL DEFAULT 'https://fixture.example.test/a2a',
 			updated_at timestamptz NOT NULL DEFAULT now()
 		)`,
 		`CREATE TABLE email_configs (
 			id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-			smtp_password text NOT NULL DEFAULT ''
+			smtp_password text NOT NULL DEFAULT '',
+			smtp_host text NOT NULL DEFAULT 'fixture.smtp.example.test'
 		)`,
 	}
 	for _, statement := range statements {
 		if err := db.Exec(statement).Error; err != nil {
 			t.Fatal(err)
+		}
+	}
+}
+
+func assertDatabaseSecretPostgresCatalog(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	var dataType string
+	if err := db.Raw(
+		`SELECT data_type
+		   FROM information_schema.columns
+		  WHERE table_schema = current_schema()
+		    AND table_name = 'agent_push_notification_configs'
+		    AND column_name = 'authentication'`,
+	).Scan(&dataType).Error; err != nil {
+		t.Fatal(err)
+	}
+	if dataType != "json" {
+		t.Fatalf(
+			"A2A authentication catalog data_type = %q, want production json",
+			dataType,
+		)
+	}
+}
+
+func assertDatabaseSecretPostgresRoleAndColumnPermissions(
+	t *testing.T,
+	admin *gorm.DB,
+	runtime *gorm.DB,
+	roleName string,
+) {
+	t.Helper()
+	role := struct {
+		Superuser bool `gorm:"column:rolsuper"`
+		BypassRLS bool `gorm:"column:rolbypassrls"`
+	}{}
+	if err := admin.Raw(
+		`SELECT rolsuper, rolbypassrls
+		   FROM pg_roles
+		  WHERE rolname = ?`,
+		roleName,
+	).Scan(&role).Error; err != nil {
+		t.Fatal(err)
+	}
+	if role.Superuser || role.BypassRLS {
+		t.Fatalf("runtime role privileges = %+v, want NOSUPERUSER NOBYPASSRLS", role)
+	}
+
+	allowed := []string{
+		"UPDATE projects SET updated_at = updated_at WHERE false",
+		"UPDATE webhook_configs SET secret = secret WHERE false",
+		"UPDATE webhook_delivery_snapshots SET secret = secret WHERE false",
+		"UPDATE agent_push_notification_configs SET token = token WHERE false",
+		"UPDATE email_configs SET smtp_password = smtp_password WHERE false",
+	}
+	for _, statement := range allowed {
+		if err := runtime.Exec(statement).Error; err != nil {
+			t.Fatalf("required column-level UPDATE was denied: %v", err)
+		}
+	}
+
+	denied := []string{
+		"UPDATE projects SET status = status WHERE false",
+		"UPDATE webhook_configs SET webhook_url = webhook_url WHERE false",
+		"UPDATE webhook_delivery_snapshots SET webhook_url = webhook_url WHERE false",
+		"UPDATE agent_push_notification_configs SET url = url WHERE false",
+		"UPDATE email_configs SET smtp_host = smtp_host WHERE false",
+	}
+	for _, statement := range denied {
+		if err := runtime.Exec(statement).Error; err == nil {
+			t.Fatalf("business-column UPDATE unexpectedly allowed: %s", statement)
 		}
 	}
 }
@@ -619,6 +821,140 @@ func assertSecretPostgresValue(
 	}
 }
 
+func assertSecretPostgresJSONValue(
+	t *testing.T,
+	db *gorm.DB,
+	id string,
+	want []byte,
+) {
+	t.Helper()
+	var got string
+	if err := db.Raw(
+		`SELECT authentication::text
+		   FROM agent_push_notification_configs
+		  WHERE id = ?`,
+		id,
+	).Scan(&got).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got != string(want) {
+		t.Fatal("A2A authentication generation changed unexpectedly")
+	}
+}
+
+func assertPostgresA2APushGenerationCAS(
+	t *testing.T,
+	owner *gorm.DB,
+	runtime *gorm.DB,
+	rotating Protector,
+	scope models.ProjectScope,
+	oldRing Protector,
+) {
+	t.Helper()
+	const rowID = "force-rls-concurrent-generation"
+	oldToken, err := oldRing.Seal(
+		[]byte("stale-postgres-token"),
+		FieldAAD(a2aPushSecretsTable, rowID, "token"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAuthentication, err := oldRing.Seal(
+		[]byte("stale-postgres-authentication"),
+		FieldAAD(a2aPushSecretsTable, rowID, "authentication"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedOldAuthentication, err := json.Marshal(oldAuthentication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Exec(
+		`INSERT INTO agent_push_notification_configs
+			(id, organization_id, project_id, token, authentication)
+		 VALUES (?, ?, ?, ?, CAST(? AS json))`,
+		rowID,
+		scope.OrganizationID,
+		scope.ProjectID,
+		oldToken,
+		string(encodedOldAuthentication),
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	var stale models.AgentPushNotificationConfig
+	if err := owner.First(&stale, "id = ?", rowID).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	currentToken, err := oldRing.Seal(
+		[]byte("current-postgres-token"),
+		FieldAAD(a2aPushSecretsTable, rowID, "token"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentAuthentication, err := oldRing.Seal(
+		[]byte("current-postgres-authentication"),
+		FieldAAD(a2aPushSecretsTable, rowID, "authentication"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedCurrentAuthentication, err := json.Marshal(currentAuthentication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentUpdatedAt := stale.UpdatedAt.Add(time.Second)
+	if err := owner.Exec(
+		`UPDATE agent_push_notification_configs
+		    SET token = ?,
+		        authentication = CAST(? AS json),
+		        updated_at = ?
+		  WHERE id = ?`,
+		currentToken,
+		string(encodedCurrentAuthentication),
+		currentUpdatedAt,
+		rowID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	var report SecretRotationReport
+	rotationErr := runtime.WithContext(context.Background()).
+		Transaction(func(tx *gorm.DB) error {
+			if err := scopeddb.ConfigureProjectScopeTransaction(
+				tx,
+				scope,
+			); err != nil {
+				return err
+			}
+			var err error
+			report, err = rotateA2APushRow(tx, rotating, stale)
+			return err
+		})
+	if rotationErr == nil {
+		t.Fatal("stale PostgreSQL A2A generation unexpectedly succeeded")
+	}
+	if report != (SecretRotationReport{}) {
+		t.Fatalf("stale PostgreSQL A2A report = %+v, want zero", report)
+	}
+	assertSecretPostgresValue(
+		t,
+		owner,
+		a2aPushSecretsTable,
+		rowID,
+		"token",
+		currentToken,
+	)
+	assertSecretPostgresJSONValue(
+		t,
+		owner,
+		rowID,
+		encodedCurrentAuthentication,
+	)
+}
+
 func assertConcurrentSecretPostgresShredWins(
 	t *testing.T,
 	owner *gorm.DB,
@@ -630,7 +966,12 @@ func assertConcurrentSecretPostgresShredWins(
 	t.Helper()
 	readReached := make(chan struct{})
 	releaseRead := make(chan struct{})
-	var once sync.Once
+	var pauseOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseRead) })
+	}
+	defer release()
 	callbackName := "task9b_pause_after_snapshot_lock"
 	if err := runtime.Callback().Query().After("gorm:query").Register(
 		callbackName,
@@ -642,7 +983,7 @@ func assertConcurrentSecretPostgresShredWins(
 			if tableName != "webhook_delivery_snapshots" {
 				return
 			}
-			once.Do(func() {
+			pauseOnce.Do(func() {
 				close(readReached)
 				<-releaseRead
 			})
@@ -689,7 +1030,7 @@ func assertConcurrentSecretPostgresShredWins(
 		t.Fatalf("concurrent shred bypassed snapshot row lock: %v", err)
 	case <-time.After(150 * time.Millisecond):
 	}
-	close(releaseRead)
+	release()
 	select {
 	case err := <-rotationDone:
 		if err != nil {
@@ -722,5 +1063,214 @@ func assertConcurrentSecretPostgresShredWins(
 		stored.CredentialShreddedAt == nil ||
 		stored.CredentialShredReason == nil {
 		t.Fatal("concurrent shred did not remain the final monotonic state")
+	}
+}
+
+func assertPostgresMaintenanceSnapshotLockBoundary(
+	t *testing.T,
+	admin *gorm.DB,
+	owner *gorm.DB,
+	runtime *gorm.DB,
+	protector Protector,
+	maintenanceNow time.Time,
+	expiredID string,
+	equalityID string,
+	liveID string,
+) {
+	t.Helper()
+	readReached := make(chan struct{})
+	releaseRead := make(chan struct{})
+	var pauseOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseRead) })
+	}
+	defer release()
+	callbackName := "task9b_pause_live_snapshot_lock_query"
+	if err := runtime.Callback().Query().After("gorm:query").Register(
+		callbackName,
+		func(query *gorm.DB) {
+			tableName := query.Statement.Table
+			if query.Statement.Schema != nil {
+				tableName = query.Statement.Schema.Table
+			}
+			if tableName != "webhook_delivery_snapshots" ||
+				!strings.Contains(
+					strings.ToUpper(query.Statement.SQL.String()),
+					"FOR UPDATE",
+				) {
+				return
+			}
+			pauseOnce.Do(func() {
+				close(readReached)
+				<-releaseRead
+			})
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Callback().Query().Remove(callbackName)
+
+	rotationDone := make(chan error, 1)
+	go func() {
+		_, err := rotateDatabaseSecretsAt(
+			context.Background(),
+			runtime,
+			protector,
+			maintenanceNow,
+		)
+		rotationDone <- err
+	}()
+	select {
+	case <-readReached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rotation did not reach the live snapshot FOR UPDATE query")
+	}
+
+	assertNotLocked := func(id string) {
+		t.Helper()
+		pid, done, closeConnection := startPostgresSnapshotShred(
+			t,
+			owner,
+			id,
+			maintenanceNow,
+		)
+		defer closeConnection()
+		state, err := waitForPostgresStatementState(admin, pid, done)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state != postgresStatementCompleted {
+			release()
+			waitPostgresOperation(t, rotationDone, "rotation")
+			waitPostgresOperation(t, done, "non-live shred")
+			t.Fatalf(
+				"non-live snapshot %s waited on %s; maintenance must not lock it",
+				id,
+				state,
+			)
+		}
+	}
+	assertNotLocked(expiredID)
+	assertNotLocked(equalityID)
+
+	livePID, liveDone, closeLiveConnection := startPostgresSnapshotShred(
+		t,
+		owner,
+		liveID,
+		maintenanceNow,
+	)
+	defer closeLiveConnection()
+	liveState, err := waitForPostgresStatementState(admin, livePID, liveDone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if liveState != postgresStatementWaitingOnLock {
+		release()
+		waitPostgresOperation(t, rotationDone, "rotation")
+		if liveState != postgresStatementCompleted {
+			waitPostgresOperation(t, liveDone, "live shred")
+		}
+		t.Fatalf("live snapshot state = %s, want row-lock wait", liveState)
+	}
+	release()
+	waitPostgresOperation(t, rotationDone, "rotation")
+	waitPostgresOperation(t, liveDone, "live shred")
+}
+
+type postgresStatementState string
+
+const (
+	postgresStatementCompleted     postgresStatementState = "completed"
+	postgresStatementWaitingOnLock postgresStatementState = "waiting_on_lock"
+)
+
+func startPostgresSnapshotShred(
+	t *testing.T,
+	db *gorm.DB,
+	id string,
+	shreddedAt time.Time,
+) (int, <-chan error, func()) {
+	t.Helper()
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := sqlDB.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pid int
+	if err := connection.QueryRowContext(
+		context.Background(),
+		"SELECT pg_backend_pid()",
+	).Scan(&pid); err != nil {
+		_ = connection.Close()
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func(conn *sql.Conn) {
+		_, err := conn.ExecContext(
+			context.Background(),
+			`UPDATE webhook_delivery_snapshots
+			    SET secret = '',
+			        previous_secret = '',
+			        access_token = '',
+			        credential_shredded_at = $1,
+			        credential_shred_reason = 'expired'
+			  WHERE id = $2`,
+			shreddedAt,
+			id,
+		)
+		done <- err
+	}(connection)
+	return pid, done, func() { _ = connection.Close() }
+}
+
+func waitForPostgresStatementState(
+	admin *gorm.DB,
+	pid int,
+	done <-chan error,
+) (postgresStatementState, error) {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-done:
+			if err != nil {
+				return "", err
+			}
+			return postgresStatementCompleted, nil
+		default:
+		}
+		var waitEventType string
+		if err := admin.Raw(
+			`SELECT COALESCE(wait_event_type, '')
+			   FROM pg_stat_activity
+			  WHERE pid = ?`,
+			pid,
+		).Scan(&waitEventType).Error; err != nil {
+			return "", err
+		}
+		if waitEventType == "Lock" {
+			return postgresStatementWaitingOnLock, nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return "", errors.New("PostgreSQL statement state was not observable")
+}
+
+func waitPostgresOperation(
+	t *testing.T,
+	done <-chan error,
+	operation string,
+) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("%s failed: %v", operation, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s did not complete", operation)
 	}
 }
