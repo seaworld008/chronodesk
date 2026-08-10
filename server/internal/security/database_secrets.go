@@ -87,8 +87,7 @@ func validateDatabaseSecretsAt(
 			},
 		); err != nil {
 			return fmt.Errorf(
-				"validate project %d database secrets: %w",
-				project.ID,
+				"validate project database secrets: %w",
 				err,
 			)
 		}
@@ -366,8 +365,7 @@ func rotateDatabaseSecretsAt(
 			)
 			if err != nil {
 				return fmt.Errorf(
-					"rotate project %d database secrets: %w",
-					project.ID,
+					"rotate project database secrets: %w",
 					err,
 				)
 			}
@@ -563,8 +561,7 @@ func rotateWebhookConfigRow(
 		)
 		if err != nil {
 			return SecretRotationReport{}, fmt.Errorf(
-				"rotate webhook %d %s: %w",
-				row.ID,
+				"rotate webhook %s: %w",
 				field.column,
 				err,
 			)
@@ -635,8 +632,7 @@ func rewrapWebhookSnapshotRow(
 		)
 		if err != nil {
 			return SecretRotationReport{}, false, fmt.Errorf(
-				"rotate webhook snapshot %q %s: %w",
-				row.ID,
+				"rotate webhook snapshot %s: %w",
 				field.column,
 				err,
 			)
@@ -732,8 +728,7 @@ func rotateA2APushRow(
 		FieldAAD(a2aPushSecretsTable, row.ID, "token"),
 	); err != nil {
 		return SecretRotationReport{}, fmt.Errorf(
-			"rotate A2A push config %q token: %w",
-			row.ID,
+			"rotate A2A push token: %w",
 			err,
 		)
 	} else if changed {
@@ -746,8 +741,7 @@ func rotateA2APushRow(
 	storedAuthentication, err := storedJSONEnvelope(row.Authentication)
 	if err != nil {
 		return SecretRotationReport{}, fmt.Errorf(
-			"rotate A2A push config %q authentication: %w",
-			row.ID,
+			"rotate A2A push authentication: %w",
 			err,
 		)
 	}
@@ -758,8 +752,7 @@ func rotateA2APushRow(
 	)
 	if err != nil {
 		return SecretRotationReport{}, fmt.Errorf(
-			"rotate A2A push config %q authentication: %w",
-			row.ID,
+			"rotate A2A push authentication: %w",
 			err,
 		)
 	}
@@ -819,8 +812,7 @@ func rotateGlobalDatabaseSecrets(
 		)
 		if err != nil {
 			return SecretRotationReport{}, fmt.Errorf(
-				"rotate email config %d SMTP password: %w",
-				row.ID,
+				"rotate email SMTP password: %w",
 				err,
 			)
 		}
@@ -882,22 +874,35 @@ func rotateValue(protector Protector, value string, aad []byte) (string, bool, e
 }
 
 type redactedDatabaseSecretProtectorError struct {
-	cause error
+	sentinel error
 }
 
 func (redactedDatabaseSecretProtectorError) Error() string {
 	return "encrypted-secret operation failed"
 }
 
-func (err redactedDatabaseSecretProtectorError) Unwrap() error {
-	return err.cause
+func (err redactedDatabaseSecretProtectorError) Is(target error) bool {
+	return err.sentinel != nil && target == err.sentinel
 }
 
 func redactDatabaseSecretProtectorError(err error) error {
 	if err == nil {
 		return nil
 	}
-	return redactedDatabaseSecretProtectorError{cause: err}
+	for _, sentinel := range []error{
+		ErrKeyringUnavailable,
+		ErrInvalidEnvelope,
+		ErrPlaintextSecret,
+		ErrUnknownKey,
+		ErrAuthentication,
+	} {
+		if errors.Is(err, sentinel) {
+			return redactedDatabaseSecretProtectorError{
+				sentinel: sentinel,
+			}
+		}
+	}
+	return redactedDatabaseSecretProtectorError{}
 }
 
 func storedJSONEnvelope(raw datatypes.JSON) (string, error) {

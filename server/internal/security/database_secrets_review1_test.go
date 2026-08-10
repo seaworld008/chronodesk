@@ -299,18 +299,97 @@ func TestDatabaseSecretErrorsDoNotAssociateRecordAndKeyMetadata(t *testing.T) {
 			if !errors.Is(err, ErrUnknownKey) {
 				t.Fatalf("validation error = %v, want ErrUnknownKey", err)
 			}
-			errorText := err.Error()
-			for _, value := range forbidden {
-				if value != "" && strings.Contains(errorText, value) {
+			for _, chainErr := range accessibleDatabaseSecretErrorChain(err) {
+				errorText := chainErr.Error()
+				for _, value := range forbidden {
+					if value != "" && strings.Contains(errorText, value) {
+						t.Fatalf(
+							"validation error chain contains forbidden metadata %q: %s",
+							value,
+							errorText,
+						)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestDatabaseSecretProtectorErrorsExposeOnlySafeIsSemantics(t *testing.T) {
+	tests := []struct {
+		name      string
+		raw       error
+		wantIs    error
+		forbidden string
+	}{
+		{
+			name:      "unknown_key",
+			raw:       fmt.Errorf("%w: key ID %q", ErrUnknownKey, "dek-chain-old"),
+			wantIs:    ErrUnknownKey,
+			forbidden: "dek-chain-old",
+		},
+		{
+			name:      "authentication",
+			raw:       fmt.Errorf("%w: credential payload detail", ErrAuthentication),
+			wantIs:    ErrAuthentication,
+			forbidden: "credential payload detail",
+		},
+		{
+			name:      "invalid_envelope",
+			raw:       fmt.Errorf("%w: ciphertext detail", ErrInvalidEnvelope),
+			wantIs:    ErrInvalidEnvelope,
+			forbidden: "ciphertext detail",
+		},
+		{
+			name:      "keyring_unavailable",
+			raw:       fmt.Errorf("%w: deployment key metadata", ErrKeyringUnavailable),
+			wantIs:    ErrKeyringUnavailable,
+			forbidden: "deployment key metadata",
+		},
+		{
+			name:      "unknown_protector_error",
+			raw:       errors.New("unknown raw protector credential detail"),
+			forbidden: "unknown raw protector credential detail",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := redactDatabaseSecretProtectorError(test.raw)
+			if test.wantIs != nil && !errors.Is(err, test.wantIs) {
+				t.Fatalf("errors.Is(%v) = false", test.wantIs)
+			}
+			for _, chainErr := range accessibleDatabaseSecretErrorChain(err) {
+				if strings.Contains(chainErr.Error(), test.forbidden) {
 					t.Fatalf(
-						"validation error contains forbidden metadata %q: %s",
-						value,
-						errorText,
+						"sanitized error chain exposes raw protector detail: %s",
+						chainErr,
 					)
 				}
 			}
 		})
 	}
+}
+
+func accessibleDatabaseSecretErrorChain(root error) []error {
+	if root == nil {
+		return nil
+	}
+	pending := []error{root}
+	chain := make([]error, 0, 8)
+	for len(pending) > 0 && len(chain) < 32 {
+		err := pending[0]
+		pending = pending[1:]
+		chain = append(chain, err)
+		switch wrapped := err.(type) {
+		case interface{ Unwrap() []error }:
+			pending = append(pending, wrapped.Unwrap()...)
+		case interface{ Unwrap() error }:
+			if next := wrapped.Unwrap(); next != nil {
+				pending = append(pending, next)
+			}
+		}
+	}
+	return chain
 }
 
 func TestWebhookSnapshotMaintenanceQueriesFilterLiveRowsAtSQLBoundary(
