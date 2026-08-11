@@ -3190,8 +3190,11 @@
           "409": {
             "$ref": "#/components/responses/Conflict"
           },
+          "413": {
+            "$ref": "#/components/responses/TicketPayloadTooLarge"
+          },
           "422": {
-            "$ref": "#/components/responses/BadRequest"
+            "$ref": "#/components/responses/TicketUnprocessableEntity"
           },
           "500": {
             "$ref": "#/components/responses/InternalServerError"
@@ -3451,6 +3454,12 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/TicketPayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/TicketUnprocessableEntity"
           },
           "428": {
             "$ref": "#/components/responses/PreconditionRequired"
@@ -13300,6 +13309,26 @@
           }
         }
       },
+      "TicketUnprocessableEntity": {
+        "description": "The Ticket write is structurally valid but violates a published workflow, trusted-source, form, tag, Agent-context, or category rule.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "TicketPayloadTooLarge": {
+        "description": "The Human Ticket JSON request body exceeds the 1 MiB limit.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            }
+          }
+        }
+      },
       "PayloadTooLarge": {
         "description": "The authentication JSON request body exceeds the 64 KiB limit",
         "content": {
@@ -16806,6 +16835,18 @@
         ],
         "x-chronodesk-runtime-values": "ticketSourceValues"
       },
+      "HumanTicketSource": {
+        "type": "string",
+        "description": "Human-authored ticket sources. The trusted agent source is assigned only by the machine intake boundary.",
+        "enum": [
+          "web",
+          "email",
+          "phone",
+          "chat",
+          "api",
+          "mobile"
+        ]
+      },
       "TicketTrustLevel": {
         "type": "string",
         "enum": [
@@ -16959,11 +17000,8 @@
           "priority": {
             "$ref": "#/components/schemas/TicketPriority"
           },
-          "status": {
-            "$ref": "#/components/schemas/TicketStatus"
-          },
           "source": {
-            "$ref": "#/components/schemas/TicketSource"
+            "$ref": "#/components/schemas/HumanTicketSource"
           },
           "request_type_version_id": {
             "type": "string",
@@ -17055,11 +17093,8 @@
           "priority": {
             "$ref": "#/components/schemas/TicketPriority"
           },
-          "status": {
-            "$ref": "#/components/schemas/TicketStatus"
-          },
           "source": {
-            "$ref": "#/components/schemas/TicketSource"
+            "$ref": "#/components/schemas/HumanTicketSource"
           },
           "assigned_to_id": {
             "type": [
@@ -22327,6 +22362,9 @@
             "enum": [
               "invalid_request",
               "invalid_status_transition",
+              "ticket_form_validation_failed",
+              "workflow_transition_required",
+              "trusted_source_not_human_writable",
               "precondition_required",
               "unauthorized",
               "invalid_actor",

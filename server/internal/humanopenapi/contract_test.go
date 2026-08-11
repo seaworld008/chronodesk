@@ -2683,8 +2683,128 @@ func TestP1RuntimeDTOFieldsMatchPublishedSchemas(t *testing.T) {
 			schema := objectAt(t, schemas, test.schemaName)
 			properties := objectAt(t, schema, "properties")
 			want := jsonFieldNames(t, reflect.TypeOf(test.value))
+			if test.schemaName == "CreateTicketRequest" ||
+				test.schemaName == "UpdateTicketRequest" {
+				want = slices.DeleteFunc(
+					want,
+					func(name string) bool {
+						return name == "status"
+					},
+				)
+			}
 			assertExactObjectKeys(t, properties, want)
 		})
+	}
+}
+
+func TestHumanTicketWritesUseWorkflowStateAndHumanSources(t *testing.T) {
+	document := decodeDocument(t)
+	components := objectAt(t, document, "components")
+	schemas := objectAt(t, components, "schemas")
+	humanSource := objectAt(t, schemas, "HumanTicketSource")
+	assertExactStringArray(
+		t,
+		humanSource["enum"],
+		[]string{"web", "email", "phone", "chat", "api", "mobile"},
+	)
+
+	for _, name := range []string{
+		"CreateTicketRequest",
+		"UpdateTicketRequest",
+	} {
+		properties := objectAt(t, objectAt(t, schemas, name), "properties")
+		if _, published := properties["status"]; published {
+			t.Errorf("%s must use the dedicated workflow status operation", name)
+		}
+		source := objectAt(t, properties, "source")
+		if source["$ref"] != "#/components/schemas/HumanTicketSource" {
+			t.Errorf("%s.source = %v", name, source)
+		}
+	}
+
+	paths := objectAt(t, document, "paths")
+	ticketPath := objectAt(
+		t,
+		paths,
+		"/projects/{projectKey}/tickets/{ticketID}",
+	)
+	create := objectAt(
+		t,
+		objectAt(t, paths, "/projects/{projectKey}/tickets"),
+		"post",
+	)
+	update := objectAt(t, ticketPath, "put")
+	for operationID, operation := range map[string]map[string]any{
+		"createProjectTicket": create,
+		"updateProjectTicket": update,
+	} {
+		responses := objectAt(t, operation, "responses")
+		payloadTooLarge := objectAt(t, responses, "413")
+		if payloadTooLarge["$ref"] !=
+			"#/components/responses/TicketPayloadTooLarge" {
+			t.Errorf("%s 413 response = %v", operationID, payloadTooLarge)
+		}
+		unprocessable := objectAt(
+			t,
+			responses,
+			"422",
+		)
+		if unprocessable["$ref"] !=
+			"#/components/responses/TicketUnprocessableEntity" {
+			t.Errorf("%s 422 response = %v", operationID, unprocessable)
+		}
+	}
+
+	ticketPayloadTooLarge := objectAt(
+		t,
+		objectAt(t, components, "responses"),
+		"TicketPayloadTooLarge",
+	)
+	payloadContent := objectAt(t, ticketPayloadTooLarge, "content")
+	payloadMedia := objectAt(t, payloadContent, "application/json")
+	if objectAt(t, payloadMedia, "schema")["$ref"] !=
+		"#/components/schemas/ErrorEnvelope" {
+		t.Fatalf(
+			"TicketPayloadTooLarge media type/schema = %v",
+			ticketPayloadTooLarge,
+		)
+	}
+
+	ticketUnprocessable := objectAt(
+		t,
+		objectAt(t, components, "responses"),
+		"TicketUnprocessableEntity",
+	)
+	content := objectAt(t, ticketUnprocessable, "content")
+	problemMedia := objectAt(t, content, "application/problem+json")
+	if objectAt(t, problemMedia, "schema")["$ref"] !=
+		"#/components/schemas/Problem" {
+		t.Fatalf(
+			"TicketUnprocessableEntity media type/schema = %v",
+			ticketUnprocessable,
+		)
+	}
+
+	problem := objectAt(t, schemas, "Problem")
+	code := objectAt(t, objectAt(t, problem, "properties"), "code")
+	rawCodes, ok := code["enum"].([]any)
+	if !ok {
+		t.Fatalf("Problem.code enum = %T", code["enum"])
+	}
+	availableCodes := make(map[string]bool, len(rawCodes))
+	for _, rawCode := range rawCodes {
+		value, ok := rawCode.(string)
+		if ok {
+			availableCodes[value] = true
+		}
+	}
+	for _, required := range []string{
+		"workflow_transition_required",
+		"trusted_source_not_human_writable",
+	} {
+		if !availableCodes[required] {
+			t.Errorf("Problem.code enum lacks %q", required)
+		}
 	}
 }
 

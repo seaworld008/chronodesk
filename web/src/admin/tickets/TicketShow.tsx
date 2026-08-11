@@ -178,6 +178,7 @@ const sourceChoices = [
     { id: 'chat', name: '聊天' },
     { id: 'api', name: 'API' },
     { id: 'mobile', name: '移动端' },
+    { id: 'agent', name: '智能体' },
 ];
 
 /**

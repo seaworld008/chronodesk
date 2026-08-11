@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -20,6 +21,7 @@ type recordingVersionedTicketService struct {
 	services.TicketServiceInterface
 	currentVersion uint64
 	calls          int
+	request        *models.TicketUpdateRequest
 }
 
 func (s *recordingVersionedTicketService) result(
@@ -45,10 +47,14 @@ func (s *recordingVersionedTicketService) result(
 func (s *recordingVersionedTicketService) UpdateTicketExpectedVersion(
 	_ context.Context,
 	ticketID uint,
-	_ *models.TicketUpdateRequest,
+	request *models.TicketUpdateRequest,
 	_ uint,
 	expectedVersion uint64,
 ) (*models.Ticket, error) {
+	if request != nil {
+		copy := *request
+		s.request = &copy
+	}
 	return s.result(ticketID, expectedVersion)
 }
 
@@ -189,6 +195,228 @@ func TestHumanTicketPutEnforcesIfMatch(t *testing.T) {
 				ticket.Version+1,
 			)
 		})
+	}
+}
+
+func TestHumanTicketUpdateRequiresWorkflowAndPreservesTrustedSource(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		body          string
+		currentSource models.TicketSource
+		wantCode      string
+	}{
+		{
+			name:          "status uses workflow endpoint",
+			body:          `{"status":"cancelled"}`,
+			currentSource: models.TicketSourceWeb,
+			wantCode:      "workflow_transition_required",
+		},
+		{
+			name:          "null status still uses workflow endpoint",
+			body:          `{"status":null}`,
+			currentSource: models.TicketSourceWeb,
+			wantCode:      "workflow_transition_required",
+		},
+		{
+			name:          "human cannot claim agent source",
+			body:          `{"source":"agent"}`,
+			currentSource: models.TicketSourceWeb,
+			wantCode:      "trusted_source_not_human_writable",
+		},
+		{
+			name:          "human cannot rewrite existing agent source",
+			body:          `{"source":"web"}`,
+			currentSource: models.TicketSourceAgent,
+			wantCode:      "trusted_source_not_human_writable",
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			workflow, db, agent, _, ticket, _ := setupWorkflowHandlerTest(t)
+			if err := db.Model(&models.Ticket{}).
+				Where("id = ?", ticket.ID).
+				Update("source", test.currentSource).Error; err != nil {
+				t.Fatalf("set current source: %v", err)
+			}
+			service := &recordingVersionedTicketService{
+				TicketServiceInterface: workflow.ticketService,
+				currentVersion:         ticket.Version,
+			}
+			handler := NewTicketHandler(service)
+			router := humanTicketTestRouter(
+				agent,
+				models.ProjectRoleAgent,
+				func(router *gin.Engine) {
+					router.PUT("/tickets/:id", handler.UpdateTicket)
+				},
+			)
+			request := httptest.NewRequest(
+				http.MethodPut,
+				"/tickets/"+strconv.FormatUint(uint64(ticket.ID), 10),
+				bytes.NewBufferString(test.body),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("If-Match", httpcontract.FormatETag(ticket.Version))
+			response := httptest.NewRecorder()
+
+			router.ServeHTTP(response, request)
+
+			assertHumanProblem(
+				t,
+				response,
+				http.StatusUnprocessableEntity,
+				test.wantCode,
+			)
+			if service.calls != 0 {
+				t.Fatalf("forbidden generic update reached service %d time(s)", service.calls)
+			}
+		})
+	}
+}
+
+func TestHumanTicketUpdateRejectsNullSource(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	workflow, _, agent, _, ticket, _ := setupWorkflowHandlerTest(t)
+	service := &recordingVersionedTicketService{
+		TicketServiceInterface: workflow.ticketService,
+		currentVersion:         ticket.Version,
+	}
+	handler := NewTicketHandler(service)
+	router := humanTicketTestRouter(
+		agent,
+		models.ProjectRoleAgent,
+		func(router *gin.Engine) {
+			router.PUT("/tickets/:id", handler.UpdateTicket)
+		},
+	)
+	request := httptest.NewRequest(
+		http.MethodPut,
+		"/tickets/"+strconv.FormatUint(uint64(ticket.ID), 10),
+		bytes.NewBufferString(`{"source":null}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("If-Match", httpcontract.FormatETag(ticket.Version))
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf(
+			"null source status=%d, want %d; body=%s",
+			response.Code,
+			http.StatusBadRequest,
+			response.Body.String(),
+		)
+	}
+	if service.calls != 0 {
+		t.Fatalf("null source reached service %d time(s)", service.calls)
+	}
+}
+
+func TestHumanTicketUpdateRejectsNonCanonicalFieldNames(t *testing.T) {
+	for _, body := range []string{
+		`{"Status":"cancelled"}`,
+		`{"SOURCE":"web"}`,
+	} {
+		body := body
+		t.Run(body, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			workflow, _, agent, _, ticket, _ := setupWorkflowHandlerTest(t)
+			service := &recordingVersionedTicketService{
+				TicketServiceInterface: workflow.ticketService,
+				currentVersion:         ticket.Version,
+			}
+			handler := NewTicketHandler(service)
+			router := humanTicketTestRouter(
+				agent,
+				models.ProjectRoleAgent,
+				func(router *gin.Engine) {
+					router.PUT("/tickets/:id", handler.UpdateTicket)
+				},
+			)
+			request := httptest.NewRequest(
+				http.MethodPut,
+				"/tickets/"+strconv.FormatUint(uint64(ticket.ID), 10),
+				bytes.NewBufferString(body),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("If-Match", httpcontract.FormatETag(ticket.Version))
+			response := httptest.NewRecorder()
+
+			router.ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf(
+					"non-canonical field status=%d, want %d; body=%s",
+					response.Code,
+					http.StatusBadRequest,
+					response.Body.String(),
+				)
+			}
+			if service.calls != 0 {
+				t.Fatalf(
+					"non-canonical field reached service %d time(s)",
+					service.calls,
+				)
+			}
+		})
+	}
+}
+
+func TestHumanTicketUpdateAllowsOtherFieldsForTrustedAgentSource(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	workflow, db, agent, _, ticket, _ := setupWorkflowHandlerTest(t)
+	if err := db.Model(&models.Ticket{}).
+		Where("id = ?", ticket.ID).
+		Update("source", models.TicketSourceAgent).Error; err != nil {
+		t.Fatalf("set current source: %v", err)
+	}
+	service := &recordingVersionedTicketService{
+		TicketServiceInterface: workflow.ticketService,
+		currentVersion:         ticket.Version,
+	}
+	handler := NewTicketHandler(service)
+	router := humanTicketTestRouter(
+		agent,
+		models.ProjectRoleAgent,
+		func(router *gin.Engine) {
+			router.PUT("/tickets/:id", handler.UpdateTicket)
+		},
+	)
+	request := httptest.NewRequest(
+		http.MethodPut,
+		"/tickets/"+strconv.FormatUint(uint64(ticket.ID), 10),
+		bytes.NewBufferString(`{"title":"只修改标题"}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("If-Match", httpcontract.FormatETag(ticket.Version))
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"trusted-source metadata-only update status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+	if service.calls != 1 || service.request == nil {
+		t.Fatalf(
+			"trusted-source metadata-only update calls=%d request=%+v",
+			service.calls,
+			service.request,
+		)
+	}
+	if service.request.Source != nil || service.request.Status != nil {
+		t.Fatalf(
+			"trusted-source metadata-only update carried protected fields: %+v",
+			service.request,
+		)
+	}
+	if service.request.Title == nil || *service.request.Title != "只修改标题" {
+		t.Fatalf("trusted-source metadata-only update request=%+v", service.request)
 	}
 }
 
@@ -347,6 +575,222 @@ func TestHumanTicketCreateTrimsRequiredTextAndRejectsBlankValues(t *testing.T) {
 			assertHumanProblem(t, response, http.StatusBadRequest, "invalid_request")
 		})
 	}
+}
+
+func TestHumanTicketCreateRejectsLifecycleStateAndTrustedAgentSource(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		body     string
+		wantCode string
+	}{
+		{
+			name: "status is server assigned from workflow",
+			body: `{
+				"title":"标题",
+				"description":"描述",
+				"type":"request",
+				"priority":"normal",
+				"status":"open",
+				"source":"web",
+				"request_type_version_id":"00000000-0000-7000-8000-000000000102"
+			}`,
+			wantCode: "workflow_transition_required",
+		},
+		{
+			name: "null status is still unpublished",
+			body: `{
+				"title":"标题",
+				"description":"描述",
+				"type":"request",
+				"priority":"normal",
+				"status":null,
+				"source":"web",
+				"request_type_version_id":"00000000-0000-7000-8000-000000000102"
+			}`,
+			wantCode: "workflow_transition_required",
+		},
+		{
+			name: "agent source is machine assigned",
+			body: `{
+				"title":"标题",
+				"description":"描述",
+				"type":"request",
+				"priority":"normal",
+				"source":"agent",
+				"request_type_version_id":"00000000-0000-7000-8000-000000000102"
+			}`,
+			wantCode: "trusted_source_not_human_writable",
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			service := &recordingCreateTicketService{}
+			handler := NewTicketHandler(service)
+			user := models.User{
+				ID:           7,
+				PlatformRole: models.PlatformRolePlatformAdmin,
+			}
+			router := humanTicketTestRouter(
+				user,
+				models.ProjectRoleAdmin,
+				func(router *gin.Engine) {
+					router.POST("/tickets", handler.CreateTicket)
+				},
+			)
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/tickets",
+				bytes.NewBufferString(test.body),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+
+			router.ServeHTTP(response, request)
+
+			assertHumanProblem(
+				t,
+				response,
+				http.StatusUnprocessableEntity,
+				test.wantCode,
+			)
+			if service.request != nil {
+				t.Fatalf("forbidden create reached service: %+v", service.request)
+			}
+		})
+	}
+}
+
+func TestHumanTicketCreateRejectsNonCanonicalStatusField(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service := &recordingCreateTicketService{}
+	handler := NewTicketHandler(service)
+	user := models.User{
+		ID:           7,
+		PlatformRole: models.PlatformRolePlatformAdmin,
+	}
+	router := humanTicketTestRouter(
+		user,
+		models.ProjectRoleAdmin,
+		func(router *gin.Engine) {
+			router.POST("/tickets", handler.CreateTicket)
+		},
+	)
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/tickets",
+		bytes.NewBufferString(`{
+			"title":"标题",
+			"description":"描述",
+			"type":"request",
+			"priority":"normal",
+			"Status":"cancelled",
+			"source":"web",
+			"request_type_version_id":"00000000-0000-7000-8000-000000000102"
+		}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf(
+			"non-canonical status field=%d, want %d; body=%s",
+			response.Code,
+			http.StatusBadRequest,
+			response.Body.String(),
+		)
+	}
+	if service.request != nil {
+		t.Fatalf("non-canonical create reached service: %+v", service.request)
+	}
+}
+
+func TestHumanTicketWriteRejectsOversizedBodyBeforeService(t *testing.T) {
+	oversizedBody := strings.Repeat(
+		" ",
+		int(humanTicketRequestBodyLimit)+1,
+	)
+
+	t.Run("create with declared content length", func(t *testing.T) {
+		gin.SetMode(gin.TestMode)
+		service := &recordingCreateTicketService{}
+		handler := NewTicketHandler(service)
+		user := models.User{
+			ID:           7,
+			PlatformRole: models.PlatformRolePlatformAdmin,
+		}
+		router := humanTicketTestRouter(
+			user,
+			models.ProjectRoleAdmin,
+			func(router *gin.Engine) {
+				router.POST("/tickets", handler.CreateTicket)
+			},
+		)
+		request := httptest.NewRequest(
+			http.MethodPost,
+			"/tickets",
+			strings.NewReader(oversizedBody),
+		)
+		response := httptest.NewRecorder()
+
+		router.ServeHTTP(response, request)
+
+		if response.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf(
+				"oversized create=%d, want %d; body=%s",
+				response.Code,
+				http.StatusRequestEntityTooLarge,
+				response.Body.String(),
+			)
+		}
+		if service.request != nil {
+			t.Fatalf("oversized create reached service: %+v", service.request)
+		}
+	})
+
+	t.Run("update with streamed content length", func(t *testing.T) {
+		gin.SetMode(gin.TestMode)
+		workflow, _, agent, _, ticket, _ := setupWorkflowHandlerTest(t)
+		service := &recordingVersionedTicketService{
+			TicketServiceInterface: workflow.ticketService,
+			currentVersion:         ticket.Version,
+		}
+		handler := NewTicketHandler(service)
+		router := humanTicketTestRouter(
+			agent,
+			models.ProjectRoleAgent,
+			func(router *gin.Engine) {
+				router.PUT("/tickets/:id", handler.UpdateTicket)
+			},
+		)
+		request := httptest.NewRequest(
+			http.MethodPut,
+			"/tickets/"+strconv.FormatUint(uint64(ticket.ID), 10),
+			strings.NewReader(oversizedBody),
+		)
+		request.ContentLength = -1
+		request.Header.Set("If-Match", httpcontract.FormatETag(ticket.Version))
+		response := httptest.NewRecorder()
+
+		router.ServeHTTP(response, request)
+
+		if response.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf(
+				"oversized update=%d, want %d; body=%s",
+				response.Code,
+				http.StatusRequestEntityTooLarge,
+				response.Body.String(),
+			)
+		}
+		if service.calls != 0 {
+			t.Fatalf(
+				"oversized update reached service %d time(s)",
+				service.calls,
+			)
+		}
+	})
 }
 
 func TestHumanTicketCreateMapsDomainMembershipDenialToForbidden(t *testing.T) {

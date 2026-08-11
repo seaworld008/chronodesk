@@ -44,6 +44,16 @@ import {
 } from '@/lib/projectScope';
 import { transformTicketUpdate } from './ticketTransforms';
 import { EnterpriseReferenceAutocompleteInput } from '@/components/inputs/EnterpriseFilterInputs';
+import type { TicketSource } from '@/types';
+
+const statusChoices = [
+    { id: 'open', name: '待处理' },
+    { id: 'in_progress', name: '处理中' },
+    { id: 'pending', name: '等待中' },
+    { id: 'resolved', name: '已解决' },
+    { id: 'closed', name: '已关闭' },
+    { id: 'cancelled', name: '已取消' },
+];
 
 const priorityChoices = [
     { id: 'low', name: '低' },
@@ -60,6 +70,7 @@ const sourceChoices = [
     { id: 'chat', name: '聊天' },
     { id: 'api', name: 'API' },
     { id: 'mobile', name: '移动端' },
+    { id: 'agent', name: '智能体', disabled: true },
 ];
 
 const typeChoices = [
@@ -119,6 +130,30 @@ const TicketEditAuthorization = ({ children }: React.PropsWithChildren) => {
         );
     }
     return <>{children}</>;
+};
+
+type TicketEditRecord = TicketAccessRecord & {
+    source?: TicketSource;
+};
+
+const TicketSourceInput = () => {
+    const record = useRecordContext<TicketEditRecord>();
+    const trustedAgentSource = record?.source === 'agent';
+
+    return (
+        <SelectInput
+            source="source"
+            label="来源"
+            choices={sourceChoices}
+            required
+            disabled={trustedAgentSource}
+            helperText={
+                trustedAgentSource
+                    ? '智能体来源由受信机器入口分配，人工不能改写'
+                    : '智能体来源仅由受信机器入口分配'
+            }
+        />
+    );
 };
 
 /**
@@ -201,6 +236,19 @@ const TicketEdit: React.FC = () => {
                                         />
 
                                         <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
+                                            {!requester && (
+                                                <Box sx={{ flex: 1, minWidth: '200px' }}>
+                                                    <SelectInput
+                                                        source="status"
+                                                        label="状态"
+                                                        choices={statusChoices}
+                                                        required
+                                                        disabled
+                                                        helperText="请在工单详情页使用工作流操作变更状态"
+                                                    />
+                                                </Box>
+                                            )}
+
                                             <Box sx={{ flex: 1, minWidth: '200px' }}>
                                                 <SelectInput
                                                     source="priority"
@@ -211,12 +259,7 @@ const TicketEdit: React.FC = () => {
                                             </Box>
 
                                             <Box sx={{ flex: 1, minWidth: '200px' }}>
-                                                <SelectInput
-                                                    source="source"
-                                                    label="来源"
-                                                    choices={sourceChoices}
-                                                    required
-                                                />
+                                                <TicketSourceInput />
                                             </Box>
 
                                             <Box sx={{ flex: 1, minWidth: '200px' }}>
