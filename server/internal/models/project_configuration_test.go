@@ -47,44 +47,136 @@ func TestWorkflowVersionRequiresLockedLifecycleCategories(t *testing.T) {
 	}
 }
 
-func TestWorkflowVersionRejectsDuplicateLifecycleCategories(t *testing.T) {
+func TestWorkflowVersionAcceptsRepeatedLifecycleCategories(t *testing.T) {
 	states := defaultConfigurationTestStates()
-	states = append(states, WorkflowStateDefinition{
-		Key:               "triage",
-		Name:              "Triage",
-		LifecycleCategory: LifecycleCategoryNew,
-	})
+	states = append(
+		states,
+		WorkflowStateDefinition{
+			Key:               "triage",
+			Name:              "Triage",
+			LifecycleCategory: LifecycleCategoryNew,
+		},
+		WorkflowStateDefinition{
+			Key:               "investigating",
+			Name:              "Investigating",
+			LifecycleCategory: LifecycleCategoryActive,
+		},
+	)
 	workflow := WorkflowVersion{
 		OrganizationID: 1,
 		ProjectID:      2,
-		Key:            "duplicate-category",
+		Key:            "repeated-category",
 		Version:        1,
 		Status:         ConfigurationStatusDraft,
-		Name:           "Duplicate category",
+		Name:           "Repeated category",
 		CreatedByType:  ActorTypeHuman,
 		CreatedByID:    HumanActor(1).ID,
 	}
-	encodedStates, err := json.Marshal(states)
-	if err != nil {
-		t.Fatal(err)
-	}
-	encodedTransitions, err := json.Marshal(defaultConfigurationTestTransitions())
-	if err != nil {
-		t.Fatal(err)
-	}
-	workflow.States = encodedStates
-	workflow.Transitions = encodedTransitions
 
-	err = workflow.Validate()
-	const want = `duplicate workflow lifecycle category "new" in states "open" and "triage"`
-	if err == nil || err.Error() != want {
-		t.Fatalf("WorkflowVersion.Validate() error = %v, want %q", err, want)
-	}
 	if err := workflow.SetDefinitions(
 		states,
 		defaultConfigurationTestTransitions(),
-	); err == nil || err.Error() != want {
-		t.Fatalf("WorkflowVersion.SetDefinitions() error = %v, want %q", err, want)
+	); err != nil {
+		t.Fatalf("WorkflowVersion.SetDefinitions() rejected repeated categories: %v", err)
+	}
+	if err := workflow.Validate(); err != nil {
+		t.Fatalf("WorkflowVersion.Validate() rejected repeated categories: %v", err)
+	}
+	if err := workflow.RefreshContentHash(); err != nil {
+		t.Fatalf("WorkflowVersion.RefreshContentHash() rejected repeated categories: %v", err)
+	}
+	if len(workflow.ContentHash) != 64 {
+		t.Fatalf("WorkflowVersion.ContentHash = %q, want SHA-256 hex digest", workflow.ContentHash)
+	}
+}
+
+func TestWorkflowVersionRepeatedCategoriesPreserveDefinitionInvariants(t *testing.T) {
+	validStates := append(
+		defaultConfigurationTestStates(),
+		WorkflowStateDefinition{
+			Key:               "triage",
+			Name:              "Triage",
+			LifecycleCategory: LifecycleCategoryNew,
+		},
+	)
+	validTransitions := defaultConfigurationTestTransitions()
+
+	tests := []struct {
+		name        string
+		mutate      func([]WorkflowStateDefinition, []WorkflowTransitionDefinition)
+		wantMessage string
+	}{
+		{
+			name: "duplicate state key",
+			mutate: func(states []WorkflowStateDefinition, _ []WorkflowTransitionDefinition) {
+				states[len(states)-1].Key = "open"
+			},
+			wantMessage: `duplicate workflow state "open"`,
+		},
+		{
+			name: "invalid category",
+			mutate: func(states []WorkflowStateDefinition, _ []WorkflowTransitionDefinition) {
+				states[len(states)-1].LifecycleCategory = "processing"
+			},
+			wantMessage: `invalid lifecycle category "processing"`,
+		},
+		{
+			name: "duplicate transition key",
+			mutate: func(_ []WorkflowStateDefinition, transitions []WorkflowTransitionDefinition) {
+				transitions[1].Key = transitions[0].Key
+			},
+			wantMessage: `duplicate workflow transition "start"`,
+		},
+		{
+			name: "unknown transition source",
+			mutate: func(_ []WorkflowStateDefinition, transitions []WorkflowTransitionDefinition) {
+				transitions[0].From = "missing"
+			},
+			wantMessage: `references unknown source state "missing"`,
+		},
+		{
+			name: "unknown transition target",
+			mutate: func(_ []WorkflowStateDefinition, transitions []WorkflowTransitionDefinition) {
+				transitions[0].To = "missing"
+			},
+			wantMessage: `references unknown target state "missing"`,
+		},
+		{
+			name: "invalid transition role",
+			mutate: func(_ []WorkflowStateDefinition, transitions []WorkflowTransitionDefinition) {
+				transitions[0].Roles = []ProjectRole{"workflow_owner"}
+			},
+			wantMessage: `has invalid role "workflow_owner"`,
+		},
+		{
+			name: "repeated transition role",
+			mutate: func(_ []WorkflowStateDefinition, transitions []WorkflowTransitionDefinition) {
+				transitions[0].Roles = []ProjectRole{
+					ProjectRoleAgent,
+					ProjectRoleAgent,
+				}
+			},
+			wantMessage: `repeats role "agent"`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			states := append([]WorkflowStateDefinition(nil), validStates...)
+			transitions := append(
+				[]WorkflowTransitionDefinition(nil),
+				validTransitions...,
+			)
+			test.mutate(states, transitions)
+			var workflow WorkflowVersion
+			err := workflow.SetDefinitions(states, transitions)
+			if err == nil || !strings.Contains(err.Error(), test.wantMessage) {
+				t.Fatalf(
+					"WorkflowVersion.SetDefinitions() error = %v, want %q",
+					err,
+					test.wantMessage,
+				)
+			}
+		})
 	}
 }
 
@@ -273,6 +365,27 @@ func TestIndustrySolutionDiffReportsBreakingCompatibilityChanges(t *testing.T) {
 	}
 	if !foundRequiredField {
 		t.Fatalf("required-field compatibility break missing: %+v", diff)
+	}
+}
+
+func TestWorkflowCompatibilityDiffTreatsSameStateCategoryChangeAsBreaking(
+	t *testing.T,
+) {
+	from := configurationTestSolutionSnapshot(false)
+	to := configurationTestSolutionSnapshot(false)
+	to.Workflows[0].States = append(
+		[]WorkflowStateDefinition(nil),
+		to.Workflows[0].States...,
+	)
+	to.Workflows[0].States[1].LifecycleCategory = LifecycleCategoryWaiting
+
+	diff, err := DiffIndustrySolutionSnapshots("1.0.0", from, "1.1.0", to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "workflow:default state in_progress changed lifecycle category"
+	if diff.Compatible || !containsConfigurationString(diff.BreakingChanges, want) {
+		t.Fatalf("same state-key category change diff = %+v, want breaking %q", diff, want)
 	}
 }
 
