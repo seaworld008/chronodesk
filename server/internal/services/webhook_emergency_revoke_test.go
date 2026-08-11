@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
 )
@@ -48,7 +49,7 @@ func TestWebhookEmergencyRevokeTransitionsOnlyRevocableDeliveries(
 		updates := map[string]any{"status": status}
 		switch status {
 		case models.OutboxDeliveryProcessing:
-			lockToken := "019fee69-720c-7023-ae63-fcaf437561b5"
+			lockToken := uuid.Must(uuid.NewV7()).String()
 			startedAt := now.Add(time.Microsecond)
 			updates["attempts"] = 1
 			updates["locked_at"] = now
@@ -84,7 +85,7 @@ func TestWebhookEmergencyRevokeTransitionsOnlyRevocableDeliveries(
 		t,
 		"processing-not-dispatched",
 	)
-	claimedToken := "019fee69-720c-7023-ae63-fcaf437561b6"
+	claimedToken := uuid.Must(uuid.NewV7()).String()
 	if err := fixture.db.Model(&models.OutboxDelivery{}).
 		Where("id = ?", claimedDelivery.ID).
 		Updates(map[string]any{
@@ -101,7 +102,7 @@ func TestWebhookEmergencyRevokeTransitionsOnlyRevocableDeliveries(
 		t,
 		"legacy-processing-unknown",
 	)
-	legacyToken := "019fee69-720c-7023-ae63-fcaf437561b7"
+	legacyToken := uuid.Must(uuid.NewV7()).String()
 	if err := fixture.db.Model(&models.OutboxDelivery{}).
 		Where("id = ?", legacyDelivery.ID).
 		Updates(map[string]any{
