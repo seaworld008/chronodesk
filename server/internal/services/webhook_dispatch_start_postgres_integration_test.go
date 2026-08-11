@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/security"
@@ -184,7 +185,7 @@ func TestWebhookDispatchStateMixedVersionPostgres(t *testing.T) {
 				"attempts":   1,
 				"locked_at":  lockedAt,
 				"locked_by":  "legacy-binary-worker",
-				"lock_token": "019fee69-720c-7023-ae63-fcaf437562af",
+				"lock_token": uuid.Must(uuid.NewV7()).String(),
 			}).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -502,7 +503,7 @@ func TestWebhookDispatchGenerationFenceRejectsUnknownAndStartedReclaimsPostgres(
 				"attempts":   1,
 				"locked_at":  lockedAt,
 				"locked_by":  "legacy-unknown-worker",
-				"lock_token": "019fee69-720c-7023-ae63-fcaf437562ac",
+				"lock_token": uuid.Must(uuid.NewV7()).String(),
 			}).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -657,7 +658,7 @@ func TestWebhookLegacyUnknownSecondGateCountsInFlightPostgres(
 			"attempts":   1,
 			"locked_at":  lockedAt,
 			"locked_by":  "legacy-pre-do-worker",
-			"lock_token": "019fee69-720c-7023-ae63-fcaf437562ae",
+			"lock_token": uuid.Must(uuid.NewV7()).String(),
 		}).Error; err != nil {
 		t.Fatal(err)
 	}
