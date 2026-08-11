@@ -565,6 +565,18 @@ func (h *TicketHandler) CreateTicket(c *gin.Context) {
 	ticket, err := h.ticketService.CreateTicket(ctx, &req, userID.(uint))
 	if err != nil {
 		switch {
+		case errors.Is(
+			err,
+			services.ErrHumanTicketStatusRequiresWorkflow,
+		):
+			writeHumanTicketWorkflowRequired(c)
+			return
+		case errors.Is(
+			err,
+			services.ErrTrustedTicketSourceNotHumanWritable,
+		):
+			writeHumanTrustedSourceNotWritable(c)
+			return
 		case errors.Is(err, services.ErrInvalidTicketTags):
 			writeHumanTicketProblem(
 				c,
@@ -736,6 +748,20 @@ func (h *TicketHandler) UpdateTicket(c *gin.Context) {
 			writeTicketVersionConflict(c)
 			return
 		}
+		if errors.Is(
+			err,
+			services.ErrHumanTicketStatusRequiresWorkflow,
+		) {
+			writeHumanTicketWorkflowRequired(c)
+			return
+		}
+		if errors.Is(
+			err,
+			services.ErrTrustedTicketSourceNotHumanWritable,
+		) {
+			writeHumanTrustedSourceNotWritable(c)
+			return
+		}
 		if errors.Is(err, services.ErrInvalidTicketTags) {
 			writeHumanTicketProblem(
 				c,
@@ -817,6 +843,11 @@ func rejectGenericHumanTicketStatus(
 	if !present {
 		return false
 	}
+	writeHumanTicketWorkflowRequired(c)
+	return true
+}
+
+func writeHumanTicketWorkflowRequired(c *gin.Context) {
 	writeHumanTicketProblem(
 		c,
 		http.StatusUnprocessableEntity,
@@ -825,7 +856,6 @@ func rejectGenericHumanTicketStatus(
 		"请通过工单状态流转接口执行已发布工作流允许的状态变更",
 		false,
 	)
-	return true
 }
 
 func rejectHumanAgentSource(
@@ -838,6 +868,11 @@ func rejectHumanAgentSource(
 			*requested != models.TicketSourceAgent) {
 		return false
 	}
+	writeHumanTrustedSourceNotWritable(c)
+	return true
+}
+
+func writeHumanTrustedSourceNotWritable(c *gin.Context) {
 	writeHumanTicketProblem(
 		c,
 		http.StatusUnprocessableEntity,
@@ -846,7 +881,6 @@ func rejectHumanAgentSource(
 		"智能体来源由受信机器入口分配，人工接口不能声明或改写该来源",
 		false,
 	)
-	return true
 }
 
 // DeleteTicket 删除工单

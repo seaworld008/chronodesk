@@ -22,6 +22,7 @@ type recordingVersionedTicketService struct {
 	currentVersion uint64
 	calls          int
 	request        *models.TicketUpdateRequest
+	err            error
 }
 
 func (s *recordingVersionedTicketService) result(
@@ -29,6 +30,9 @@ func (s *recordingVersionedTicketService) result(
 	expectedVersion uint64,
 ) (*models.Ticket, error) {
 	s.calls++
+	if s.err != nil {
+		return nil, s.err
+	}
 	if expectedVersion != s.currentVersion {
 		return nil, services.ErrVersionConflict
 	}
@@ -821,6 +825,102 @@ func TestHumanTicketCreateMapsDomainMembershipDenialToForbidden(t *testing.T) {
 		http.StatusForbidden,
 		"ticket_create_access_denied",
 	)
+}
+
+func TestHumanTicketHandlersMapDomainWriteBoundariesToProblems(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		err      error
+		wantCode string
+	}{
+		{
+			name:     "workflow status",
+			err:      services.ErrHumanTicketStatusRequiresWorkflow,
+			wantCode: "workflow_transition_required",
+		},
+		{
+			name:     "trusted source",
+			err:      services.ErrTrustedTicketSourceNotHumanWritable,
+			wantCode: "trusted_source_not_human_writable",
+		},
+	} {
+		t.Run("create/"+test.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			service := &recordingCreateTicketService{err: test.err}
+			handler := NewTicketHandler(service)
+			user := models.User{
+				ID:           7,
+				PlatformRole: models.PlatformRolePlatformAdmin,
+			}
+			router := humanTicketTestRouter(
+				user,
+				models.ProjectRoleAdmin,
+				func(router *gin.Engine) {
+					router.POST("/tickets", handler.CreateTicket)
+				},
+			)
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/tickets",
+				bytes.NewBufferString(
+					`{"title":"标题","description":"描述","type":"request","priority":"normal","source":"web","request_type_version_id":"00000000-0000-7000-8000-000000000102"}`,
+				),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+
+			router.ServeHTTP(response, request)
+
+			assertHumanProblem(
+				t,
+				response,
+				http.StatusUnprocessableEntity,
+				test.wantCode,
+			)
+		})
+
+		t.Run("update/"+test.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			workflow, _, agent, _, ticket, _ :=
+				setupWorkflowHandlerTest(t)
+			service := &recordingVersionedTicketService{
+				TicketServiceInterface: workflow.ticketService,
+				currentVersion:         ticket.Version,
+				err:                    test.err,
+			}
+			handler := NewTicketHandler(service)
+			router := humanTicketTestRouter(
+				agent,
+				models.ProjectRoleAgent,
+				func(router *gin.Engine) {
+					router.PUT("/tickets/:id", handler.UpdateTicket)
+				},
+			)
+			request := httptest.NewRequest(
+				http.MethodPut,
+				"/tickets/"+strconv.FormatUint(
+					uint64(ticket.ID),
+					10,
+				),
+				bytes.NewBufferString(`{"title":"安全字段更新"}`),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set(
+				"If-Match",
+				httpcontract.FormatETag(ticket.Version),
+			)
+			response := httptest.NewRecorder()
+
+			router.ServeHTTP(response, request)
+
+			assertHumanProblem(
+				t,
+				response,
+				http.StatusUnprocessableEntity,
+				test.wantCode,
+			)
+		})
+	}
 }
 
 func TestCustomerHistoryRedactsInternalAndAssignmentRecords(t *testing.T) {

@@ -368,14 +368,15 @@ func (s *AgentNativeService) TransitionTicket(
 			"status":    command.Status,
 			"reason":    strings.TrimSpace(command.Reason),
 		},
-		TraceID:                  command.TraceID,
-		CorrelationID:            command.CorrelationID,
-		CausationID:              command.CausationID,
-		IsRisky:                  true,
-		IdempotencyRecordID:      command.IdempotencyRecordID,
-		IdempotencyCompletionTTL: command.IdempotencyCompletionTTL,
-		OutboxTargets:            command.OutboxTargets,
-		historyRecords:           command.historyRecords,
+		TraceID:                   command.TraceID,
+		CorrelationID:             command.CorrelationID,
+		CausationID:               command.CausationID,
+		IsRisky:                   true,
+		IdempotencyRecordID:       command.IdempotencyRecordID,
+		IdempotencyCompletionTTL:  command.IdempotencyCompletionTTL,
+		OutboxTargets:             command.OutboxTargets,
+		workflowTransitionCommand: true,
+		historyRecords:            command.historyRecords,
 	})
 }
 

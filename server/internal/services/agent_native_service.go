@@ -5862,6 +5862,10 @@ func (s *AgentNativeService) CreateNativeTicket(
 			ErrInvalidActor,
 		)
 	}
+	if input.Actor.Type == models.ActorTypeHuman &&
+		input.Request.Status != nil {
+		return nil, ErrHumanTicketStatusRequiresWorkflow
+	}
 	if strings.TrimSpace(input.Request.Title) == "" || strings.TrimSpace(input.Request.Description) == "" {
 		return nil, fmt.Errorf("ticket title and description are required")
 	}
@@ -5869,16 +5873,24 @@ func (s *AgentNativeService) CreateNativeTicket(
 		return nil, fmt.Errorf("invalid ticket type or priority")
 	}
 	if input.Request.Source == "" {
-		input.Request.Source = models.TicketSourceAgent
+		if input.Actor.Type == models.ActorTypeHuman {
+			input.Request.Source = models.TicketSourceWeb
+		} else {
+			input.Request.Source = models.TicketSourceAgent
+		}
 	} else if !input.Request.Source.IsValid() {
 		return nil, fmt.Errorf("invalid ticket source %q", input.Request.Source)
 	}
-	status := models.TicketStatusOpen
-	if input.Request.Status != nil {
-		status = *input.Request.Status
+	if input.Actor.Type == models.ActorTypeHuman &&
+		input.Request.Source == models.TicketSourceAgent {
+		return nil, ErrTrustedTicketSourceNotHumanWritable
 	}
-	if !status.IsValid() {
-		return nil, fmt.Errorf("invalid ticket status %q", status)
+	if input.Request.Status != nil &&
+		!input.Request.Status.IsValid() {
+		return nil, fmt.Errorf(
+			"invalid ticket status %q",
+			*input.Request.Status,
+		)
 	}
 	normalizedTags, err := normalizeTicketTags(input.Request.Tags)
 	if err != nil {
@@ -5905,7 +5917,7 @@ func (s *AgentNativeService) CreateNativeTicket(
 		return nil, fmt.Errorf("%w: assigned actor conflicts with assigned_to_id", ErrInvalidAssignee)
 	}
 	if input.Actor.Type == models.ActorTypeServicePrincipal {
-		if status != models.TicketStatusOpen ||
+		if input.Request.Status != nil ||
 			assignedActor != nil ||
 			input.Request.AssignedToID != nil {
 			return nil, fmt.Errorf(
@@ -5981,7 +5993,6 @@ func (s *AgentNativeService) CreateNativeTicket(
 		Description:          input.Request.Description,
 		Type:                 input.Request.Type,
 		Priority:             input.Request.Priority,
-		Status:               status,
 		Source:               input.Request.Source,
 		Version:              1,
 		TrustLevel:           input.TrustLevel,
@@ -6004,7 +6015,6 @@ func (s *AgentNativeService) CreateNativeTicket(
 	}
 	setTicketActorFields(ticket, input.Actor, nil)
 	applyAssignmentChangesToTicket(ticket, assignmentChanges)
-	applyTicketStatusTimestamps(ticket, status, now)
 
 	var event *models.DomainEvent
 	result := &NativeTicketCreateResult{Ticket: ticket}
@@ -6066,13 +6076,16 @@ func (s *AgentNativeService) CreateNativeTicket(
 				configurationErr,
 			)
 		}
-		if ticket.Status != initialStatus {
+		if input.Request.Status != nil &&
+			*input.Request.Status != initialStatus {
 			return fmt.Errorf(
 				"ticket initial status %q does not match workflow lifecycle %q",
-				ticket.Status,
+				*input.Request.Status,
 				initialStatus,
 			)
 		}
+		ticket.Status = initialStatus
+		applyTicketStatusTimestamps(ticket, initialStatus, now)
 		ticket.RequestTypeVersionID = configuration.RequestType.ID
 		ticket.WorkflowVersionID = configuration.Workflow.ID
 		projection, _, projectionErr := s.projectTicketSLAOnDB(ctx, tx, ticket, now)
@@ -6195,6 +6208,7 @@ type VersionedTicketUpdateInput struct {
 	OutboxTargets            []OutboxTarget
 
 	assignmentResolved            bool
+	workflowTransitionCommand     bool
 	authorizationContractOverride bool
 	historyRecords                []ticketHistorySpec
 	slaProjectionAlreadyResolved  bool
@@ -6210,10 +6224,11 @@ func (s *AgentNativeService) UpdateTicketVersion(
 	ctx context.Context,
 	input VersionedTicketUpdateInput,
 ) (*VersionedTicketUpdateResult, error) {
-	projectScope, err := commandProjectScope(ctx)
+	operation, err := commandOperationContext(ctx, input.Actor)
 	if err != nil {
 		return nil, err
 	}
+	projectScope := operation.Scope
 	if err := input.Actor.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidActor, err)
 	}
@@ -6226,6 +6241,17 @@ func (s *AgentNativeService) UpdateTicketVersion(
 	changes, fields, err := sanitizeTicketChanges(input.Changes)
 	if err != nil {
 		return nil, err
+	}
+	if input.Actor.Type == models.ActorTypeHuman &&
+		fieldsContain(fields, "status") &&
+		!input.workflowTransitionCommand {
+		return nil, ErrHumanTicketStatusRequiresWorkflow
+	}
+	if input.Actor.Type == models.ActorTypeHuman &&
+		fieldsContain(fields, "source") &&
+		models.TicketSource(fmt.Sprint(changes["source"])) ==
+			models.TicketSourceAgent {
+		return nil, ErrTrustedTicketSourceNotHumanWritable
 	}
 	if input.Actor.Type == models.ActorTypeServicePrincipal &&
 		(fieldsContain(fields, "source") || fieldsContain(fields, "trust_level")) {
@@ -8371,6 +8397,11 @@ func validateTicketChangeSemantics(
 		source := models.TicketSource(fmt.Sprint(value))
 		if !source.IsValid() {
 			return fmt.Errorf("invalid ticket source %q", value)
+		}
+		if actor.Type == models.ActorTypeHuman &&
+			(ticket.Source == models.TicketSourceAgent ||
+				source == models.TicketSourceAgent) {
+			return ErrTrustedTicketSourceNotHumanWritable
 		}
 	}
 	if value, ok := changes["trust_level"]; ok {
