@@ -719,6 +719,13 @@ func (s *AgentNativeService) processWebhookOutboxCleanupCandidate(
 					); err != nil {
 						return err
 					}
+					if _, err := lockWebhookConfigForSnapshot(
+						tx,
+						project.Scope,
+						candidate.snapshotID,
+					); err != nil {
+						return err
+					}
 					switch candidate.kind {
 					case webhookOutboxCleanupCandidateExpire:
 						changed, err := expireWebhookOutboxCandidate(

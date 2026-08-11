@@ -1494,6 +1494,24 @@ func seedAdminDueWebhookReplay(
 	now := time.Now().UTC()
 	deadline := now.Add(-time.Minute)
 	publishedAt := now.Add(-30 * time.Second)
+	if err := fixture.db.Unscoped().Create(&models.WebhookConfig{
+		ID:        1,
+		CreatedAt: now.Add(-time.Hour),
+		UpdatedAt: now.Add(-time.Hour),
+		DeletedAt: gorm.DeletedAt{
+			Time:  now.Add(-30 * time.Minute),
+			Valid: true,
+		},
+		OrganizationID: fixture.scope.OrganizationID,
+		ProjectID:      fixture.scope.ProjectID,
+		Name:           "Soft-deleted replay lock anchor",
+		Provider:       models.WebhookProviderCustom,
+		WebhookURL:     "https://expired.invalid.example/events",
+		Status:         models.WebhookStatusDisabled,
+		CreatedBy:      fixture.admin.ID,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 	event := models.DomainEvent{
 		ID:              "00000000-0000-7000-8000-000000009101",
 		OrganizationID:  fixture.scope.OrganizationID,

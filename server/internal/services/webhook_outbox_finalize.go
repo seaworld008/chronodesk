@@ -205,6 +205,26 @@ func (s *AgentNativeService) FinalizeOutboxAttempt(
 					); err != nil {
 						return err
 					}
+					anchor, err := loadOutboxDeliveryLockAnchor(
+						tx,
+						operation.Scope,
+						claim.DeliveryID,
+					)
+					if errors.Is(err, gorm.ErrRecordNotFound) {
+						return ErrOutboxLockLost
+					}
+					if err != nil {
+						return err
+					}
+					if anchor.DestinationType == "webhook" {
+						if _, err := lockWebhookConfigForDestination(
+							tx,
+							operation.Scope,
+							anchor.DestinationID,
+						); err != nil {
+							return err
+						}
+					}
 					delivery, err := lockClaimedOutboxDelivery(
 						tx,
 						operation.Scope,

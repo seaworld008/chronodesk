@@ -718,6 +718,10 @@ func (h *AdminHandler) RegisterRoutes(group *gin.RouterGroup) {
 	group.GET("/events", h.ListDomainEventsPage)
 	group.GET("/outbox", h.ListOutboxPage)
 	group.POST("/outbox/:id/replay", h.ReplayOutbox)
+	group.POST(
+		"/webhooks/:webhookID/emergency-revoke",
+		h.EmergencyRevokeWebhook,
+	)
 	group.GET("/policy-decisions", h.ListPolicyDecisionsPage)
 }
 
@@ -1369,6 +1373,67 @@ func (h *AdminHandler) ReplayOutbox(c *gin.Context) {
 				Scope:         scope,
 				ChangedFields: []string{"status", "attempts", "next_attempt_at", "locked_at", "last_error", "delivered_at"},
 				PublicValues:  gin.H{"status": models.OutboxDeliveryPending},
+			}, nil
+		},
+	)
+}
+
+func (h *AdminHandler) EmergencyRevokeWebhook(c *gin.Context) {
+	webhookID, err := strconv.ParseUint(
+		strings.TrimSpace(c.Param("webhookID")),
+		10,
+		32,
+	)
+	if err != nil || webhookID == 0 {
+		WriteProblem(
+			c,
+			http.StatusBadRequest,
+			ProblemInvalidRequest,
+			"Webhook ID must be a positive integer",
+			false,
+		)
+		return
+	}
+	configID := uint(webhookID)
+	subject := services.WebhookAdminSubject(configID)
+	h.executeAdminMutation(
+		c,
+		adminMutationOptions{
+			Status:              http.StatusOK,
+			PreconditionSubject: subject,
+			Request: gin.H{
+				"webhook_id": configID,
+			},
+		},
+		func(
+			txCtx context.Context,
+			_ *gorm.DB,
+		) (adminMutationResult, error) {
+			revoke, err := h.native.EmergencyRevokeWebhook(
+				txCtx,
+				configID,
+			)
+			if err != nil {
+				return adminMutationResult{}, err
+			}
+			return adminMutationResult{
+				Data:       revoke,
+				EventName:  "webhook.emergency_revoked",
+				Subject:    subject,
+				ResourceID: strconv.FormatUint(webhookID, 10),
+				ChangedFields: []string{
+					"status",
+					"delivery_status",
+					"snapshot_credentials",
+				},
+				PublicValues: gin.H{
+					"config_id":               revoke.ConfigID,
+					"status":                  revoke.Status,
+					"expired_deliveries":      revoke.ExpiredDeliveries,
+					"in_flight_deliveries":    revoke.InFlightDeliveries,
+					"shredded_snapshots":      revoke.ShreddedSnapshots,
+					"credential_shred_reason": revoke.CredentialShredReason,
+				},
 			}, nil
 		},
 	)
@@ -2270,6 +2335,7 @@ func adminNativeProblem(
 	switch {
 	case errors.Is(err, services.ErrPrincipalNotFound),
 		errors.Is(err, services.ErrProjectNotFound),
+		errors.Is(err, services.ErrWebhookConfigNotFound),
 		errors.Is(err, gorm.ErrRecordNotFound):
 		status, code = http.StatusNotFound, ProblemNotFound
 	case errors.Is(err, services.ErrProjectAccessDenied):

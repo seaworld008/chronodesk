@@ -109,6 +109,13 @@ func (ns *NotificationService) validateWebhookOutboxAttemptGate(
 					); err != nil {
 						return err
 					}
+					if _, err := lockWebhookConfigForDestination(
+						tx,
+						claim.Scope,
+						claim.SnapshotDestination,
+					); err != nil {
+						return err
+					}
 					delivery, err := lockClaimedOutboxDelivery(
 						tx,
 						claim.Scope,

@@ -3474,6 +3474,27 @@ func (s *AgentNativeService) claimPendingOutbox(
 						classStart,
 						limit,
 					)
+					if err := lockWebhookConfigsForDeliveryCandidates(
+						tx,
+						operation.Scope,
+						candidates,
+					); err != nil {
+						return err
+					}
+					if err := lockWebhookDeliveryCandidateRows(
+						tx,
+						operation.Scope,
+						candidates,
+					); err != nil {
+						return err
+					}
+					if err := lockWebhookSnapshotCandidateRows(
+						tx,
+						operation.Scope,
+						candidates,
+					); err != nil {
+						return err
+					}
 					for index := range candidates {
 						candidate := &candidates[index]
 						claimNow := s.now().UTC()
@@ -3556,6 +3577,14 @@ func (s *AgentNativeService) claimPendingOutbox(
 							return errors.New(
 								"outbox delivery event project scope mismatch",
 							)
+						}
+						if delivery.DestinationType == "webhook" {
+							if _, err := lockWebhookSnapshotForDelivery(
+								tx,
+								&delivery,
+							); err != nil {
+								return err
+							}
 						}
 						if _, err := OutboxClaimRefFromDelivery(
 							&delivery,
@@ -3761,6 +3790,31 @@ func (s *AgentNativeService) ReplayOutboxCommand(
 	err = s.InTransaction(ctx, func(txCtx context.Context, tx *gorm.DB) error {
 		if err := lockWebhookLifecycleProject(tx, projectScope); err != nil {
 			return err
+		}
+		anchor, err := loadOutboxDeliveryLockAnchor(
+			tx,
+			projectScope,
+			deliveryID,
+		)
+		if err != nil {
+			return err
+		}
+		if anchor.DestinationType == "webhook" {
+			if _, err := lockWebhookConfigForDestination(
+				tx,
+				projectScope,
+				anchor.DestinationID,
+			); err != nil {
+				if errors.Is(
+					err,
+					ErrWebhookOutboxLifecycleInvariant,
+				) {
+					commandResult.Disposition =
+						OutboxReplayExpired
+					return nil
+				}
+				return err
+			}
 		}
 		var delivery models.OutboxDelivery
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(

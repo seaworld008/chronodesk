@@ -24,6 +24,55 @@ import (
 func TestWebhookOutboxLifecyclePostgresConcurrencyMatrix(t *testing.T) {
 	fixture := newWebhookOutboxLifecyclePostgresFixture(t)
 
+	t.Run("active and soft-deleted config lock anchors", func(t *testing.T) {
+		ctx := fixture.workerContext(
+			t,
+			context.Background(),
+			fixture.projectA,
+		)
+		var active, deleted *models.WebhookConfig
+		if err := scopeddb.WithProjectScopeContextTransaction(
+			ctx,
+			fixture.runtimeA,
+			fixture.projectA.Scope(),
+			func(scopedContext context.Context) error {
+				return transactionForContext(
+					scopedContext,
+					fixture.runtimeA,
+					func(tx *gorm.DB) error {
+						var err error
+						active, err = lockWebhookConfigByID(
+							tx,
+							fixture.projectA.Scope(),
+							postgresLifecycleConfigAActiveID,
+							"SHARE",
+						)
+						if err != nil {
+							return err
+						}
+						deleted, err = lockWebhookConfigByID(
+							tx,
+							fixture.projectA.Scope(),
+							postgresLifecycleConfigADeletedID,
+							"SHARE",
+						)
+						return err
+					},
+				)
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if active == nil || active.DeletedAt.Valid ||
+			deleted == nil || !deleted.DeletedAt.Valid {
+			t.Fatalf(
+				"config lock anchors active=%+v deleted=%+v",
+				active,
+				deleted,
+			)
+		}
+	})
+
 	t.Run("claim versus cleanup", func(t *testing.T) {
 		fixture.clearRows(t)
 		deadline := fixture.now.Add(time.Minute)
@@ -1063,6 +1112,12 @@ type postgresLifecyclePair struct {
 	snapshot models.WebhookDeliverySnapshot
 }
 
+const (
+	postgresLifecycleConfigAActiveID  uint = 1
+	postgresLifecycleConfigADeletedID uint = 2
+	postgresLifecycleConfigBActiveID  uint = 3
+)
+
 type postgresLifecyclePrivilege struct {
 	TableName     string `gorm:"column:table_name"`
 	ColumnName    string `gorm:"column:column_name"`
@@ -1273,6 +1328,7 @@ func newWebhookOutboxLifecyclePostgresFixture(
 	tableOnly.Config.IgnoreRelationshipsWhenMigrating = true
 	if err := tableOnly.AutoMigrate(
 		&models.Project{},
+		&models.WebhookConfig{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
 		&models.WebhookDeliverySnapshot{},
@@ -1326,7 +1382,53 @@ func newWebhookOutboxLifecyclePostgresFixture(
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
+	configs := []models.WebhookConfig{
+		{
+			ID:             postgresLifecycleConfigAActiveID,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+			OrganizationID: projectA.OrganizationID,
+			ProjectID:      projectA.ID,
+			Name:           "Lifecycle A active",
+			Provider:       models.WebhookProviderCustom,
+			WebhookURL:     "https://lifecycle.invalid.example/active",
+			Status:         models.WebhookStatusActive,
+			CreatedBy:      1,
+		},
+		{
+			ID:        postgresLifecycleConfigADeletedID,
+			CreatedAt: now,
+			UpdatedAt: now,
+			DeletedAt: gorm.DeletedAt{
+				Time:  now,
+				Valid: true,
+			},
+			OrganizationID: projectA.OrganizationID,
+			ProjectID:      projectA.ID,
+			Name:           "Lifecycle A soft deleted",
+			Provider:       models.WebhookProviderCustom,
+			WebhookURL:     "https://lifecycle.invalid.example/deleted",
+			Status:         models.WebhookStatusDisabled,
+			CreatedBy:      1,
+		},
+		{
+			ID:             postgresLifecycleConfigBActiveID,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+			OrganizationID: projectB.OrganizationID,
+			ProjectID:      projectB.ID,
+			Name:           "Lifecycle B active",
+			Provider:       models.WebhookProviderCustom,
+			WebhookURL:     "https://lifecycle.invalid.example/project-b",
+			Status:         models.WebhookStatusActive,
+			CreatedBy:      1,
+		},
+	}
+	if err := adminScoped.Unscoped().Create(&configs).Error; err != nil {
+		t.Fatal(err)
+	}
 	for _, table := range []string{
+		"webhook_configs",
 		"domain_events",
 		"outbox_deliveries",
 		"webhook_delivery_snapshots",
@@ -1375,9 +1477,10 @@ func newWebhookOutboxLifecyclePostgresFixture(
 	roleCreated = true
 	for _, statement := range []string{
 		"GRANT USAGE ON SCHEMA " + quotedSchema + " TO " + quotedRole,
-		"GRANT SELECT ON projects, domain_events, outbox_deliveries, " +
+		"GRANT SELECT ON projects, webhook_configs, domain_events, outbox_deliveries, " +
 			"webhook_delivery_snapshots TO " + quotedRole,
 		"GRANT UPDATE (id) ON projects TO " + quotedRole,
+		"GRANT UPDATE (id) ON webhook_configs TO " + quotedRole,
 		"GRANT UPDATE (published_at) ON domain_events TO " + quotedRole,
 		"GRANT UPDATE (status, attempts, next_attempt_at, locked_at, " +
 			"locked_by, lock_token, last_error, delivered_at, expired_at, " +
@@ -1467,6 +1570,7 @@ func assertLifecyclePostgresRuntimeRole(
 		JOIN pg_class AS table_state
 		  ON table_state.relname IN (
 			'projects',
+			'webhook_configs',
 			'domain_events',
 			'outbox_deliveries',
 			'webhook_delivery_snapshots'
@@ -1483,7 +1587,7 @@ func assertLifecyclePostgresRuntimeRole(
 	if state.CurrentUser != roleName ||
 		state.Superuser ||
 		state.BypassRLS ||
-		state.TableCount != 4 ||
+		state.TableCount != 5 ||
 		!state.NonOwner ||
 		!state.RLSEnabled ||
 		!state.RLSForced {
@@ -1509,6 +1613,7 @@ func validateLifecyclePostgresRuntimeACL(
 		  AND table_schema = current_schema()
 		  AND table_name IN (
 			'projects',
+			'webhook_configs',
 			'domain_events',
 			'outbox_deliveries',
 			'webhook_delivery_snapshots'
@@ -1519,6 +1624,7 @@ func validateLifecyclePostgresRuntimeACL(
 	}
 	wantTablePrivileges := map[string]struct{}{
 		"projects/SELECT":                   {},
+		"webhook_configs/SELECT":            {},
 		"domain_events/SELECT":              {},
 		"outbox_deliveries/SELECT":          {},
 		"webhook_delivery_snapshots/SELECT": {},
@@ -1539,6 +1645,7 @@ func validateLifecyclePostgresRuntimeACL(
 		  AND table_schema = current_schema()
 		  AND table_name IN (
 			'projects',
+			'webhook_configs',
 			'domain_events',
 			'outbox_deliveries',
 			'webhook_delivery_snapshots'
@@ -1550,6 +1657,7 @@ func validateLifecyclePostgresRuntimeACL(
 	}
 	wantColumnPrivileges := map[string]struct{}{
 		"projects/id/UPDATE":                                           {},
+		"webhook_configs/id/UPDATE":                                    {},
 		"domain_events/published_at/UPDATE":                            {},
 		"outbox_deliveries/status/UPDATE":                              {},
 		"outbox_deliveries/attempts/UPDATE":                            {},
@@ -1736,7 +1844,7 @@ func (fixture *webhookOutboxLifecyclePostgresFixture) seedSiblingPair(
 		lockedAt,
 		attempts,
 	)
-	pair.snapshot.ConfigID = 2
+	pair.snapshot.ConfigID = postgresLifecycleConfigADeletedID
 	if err := fixture.adminScoped.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&pair.delivery).Error; err != nil {
 			return err
@@ -1797,7 +1905,7 @@ func (fixture *webhookOutboxLifecyclePostgresFixture) buildPairForEvent(
 		ID:                  snapshotUUID.String(),
 		OrganizationID:      project.OrganizationID,
 		ProjectID:           project.ID,
-		ConfigID:            1,
+		ConfigID:            fixture.configIDForProject(project),
 		EventID:             event.ID,
 		ConfigUpdatedAt:     fixture.now,
 		Provider:            models.WebhookProviderCustom,
@@ -1827,6 +1935,15 @@ func (fixture *webhookOutboxLifecyclePostgresFixture) clearRows(t *testing.T) {
 	).Error; err != nil {
 		t.Fatal(err)
 	}
+}
+
+func (fixture *webhookOutboxLifecyclePostgresFixture) configIDForProject(
+	project models.Project,
+) uint {
+	if project.ID == fixture.projectB.ID {
+		return postgresLifecycleConfigBActiveID
+	}
+	return postgresLifecycleConfigAActiveID
 }
 
 func (fixture *webhookOutboxLifecyclePostgresFixture) blockSnapshot(
