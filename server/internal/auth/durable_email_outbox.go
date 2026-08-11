@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -382,6 +383,7 @@ func validateRegistrationSession(
 	history := session.LoginHistory
 	attempt := session.SuccessfulAttempt
 	if refresh.ID != 0 ||
+		!isZeroRegistrationUserAssociation(refresh.User) ||
 		refresh.Token != session.RefreshToken ||
 		refresh.SessionID != session.SessionID ||
 		refresh.Revoked ||
@@ -392,7 +394,7 @@ func validateRegistrationSession(
 		return ErrInvalidToken
 	}
 	if history.ID != 0 ||
-		history.User.ID != 0 ||
+		!isZeroRegistrationUserAssociation(history.User) ||
 		history.Username != user.Username ||
 		history.Email != user.Email ||
 		history.IPAddress != refresh.IPAddress ||
@@ -420,6 +422,10 @@ func validateRegistrationSession(
 		return ErrInvalidToken
 	}
 	return nil
+}
+
+func isZeroRegistrationUserAssociation(user models.User) bool {
+	return reflect.ValueOf(user).IsZero()
 }
 
 func (r *GormAuthEmailOutboxRepository) QueueEmailVerification(

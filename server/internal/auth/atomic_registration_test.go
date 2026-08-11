@@ -907,9 +907,25 @@ func TestAtomicRegistrationRejectsNonPasswordOrInactiveSessionMutations(
 			},
 		},
 		{
+			name: "refresh carries zero-ID user association data",
+			mutate: func(session *RegistrationSession) {
+				session.RefreshAuthority.User = models.User{
+					Username: "unexpected",
+				}
+			},
+		},
+		{
 			name: "history carries preallocated ID",
 			mutate: func(session *RegistrationSession) {
 				session.LoginHistory.ID = 99
+			},
+		},
+		{
+			name: "history carries zero-ID user association data",
+			mutate: func(session *RegistrationSession) {
+				session.LoginHistory.User = models.User{
+					Username: "unexpected",
+				}
 			},
 		},
 		{
