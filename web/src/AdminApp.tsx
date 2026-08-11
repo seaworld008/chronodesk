@@ -69,25 +69,13 @@ import {
 } from './lib/projectScopeEvents'
 
 import {
-    AdminPanelSettings as AdminIcon,
     AutoFixHigh as AutomationIcon,
     ConfirmationNumber as TicketIcon,
-    DashboardCustomize as WorkbenchIcon,
-    FactCheck as AuditIcon,
-    GroupAdd as MembershipIcon,
-    Handshake as CollaborationIcon,
     History as HistoryIcon,
-    MenuBook as KnowledgeIcon,
     Notifications as NotificationIcon,
     People as UsersIcon,
-    AccountTree as PlatformProjectsIcon,
     ExpandLess,
     ExpandMore,
-    Home as HomeIcon,
-    Hub as IntegrationRuntimeIcon,
-    Security as SecurityIcon,
-    SmartToy as AgentIcon,
-    Webhook as WebhookIcon,
 } from '@mui/icons-material'
 
 import { CustomLayout as Layout } from './layout/CustomLayout'
@@ -97,15 +85,16 @@ import LoginPage from './components/auth/LoginPage'
 import { AppNotification } from './components/layout/AppNotification'
 import { i18nProvider, muiZhCN } from './i18n'
 import {
+    directNavigationEntry,
     navigationRegistry,
     resourceViewNavigationNode,
     visibleNavigationNodes,
     type AdminResourceName,
     type AdminResourceView,
     type CustomNavigationComponent,
-    type NavigationIcon,
     type NavigationLeafNode,
 } from './navigation/navigationRegistry'
+import { NavigationIconGlyph } from './navigation/navigationIcons'
 import {
     expandActiveNavigationGroup,
     findActiveNavigationGroupID,
@@ -722,26 +711,6 @@ const HomeDashboard = () => {
     return <NoAuthorizedProjects />
 }
 
-const navigationIcons: Record<NavigationIcon, React.ReactElement> = {
-    home: <HomeIcon />,
-    workbench: <WorkbenchIcon />,
-    tickets: <TicketIcon />,
-    notifications: <NotificationIcon />,
-    automation: <AutomationIcon />,
-    agents: <AgentIcon />,
-    collaboration: <CollaborationIcon />,
-    knowledge: <KnowledgeIcon />,
-    webhook: <WebhookIcon />,
-    integrationRuntime: <IntegrationRuntimeIcon />,
-    memberships: <MembershipIcon />,
-    users: <UsersIcon />,
-    projects: <PlatformProjectsIcon />,
-    settings: <AdminIcon />,
-    audit: <AuditIcon />,
-    security: <SecurityIcon />,
-    loginHistory: <HistoryIcon />,
-}
-
 const customNavigationComponents: Record<
     CustomNavigationComponent,
     React.ComponentType
@@ -902,14 +871,21 @@ const CustomMenu: React.FC = () => {
     return (
         <Menu aria-label="主导航">
             {nodes.map((node, nodeIndex) => {
-                if (node.kind === 'leaf') {
-                    const active = isNavigationItemActive(node, pathname)
+                const directEntry = directNavigationEntry(node)
+                if (directEntry) {
+                    const active = isNavigationItemActive(
+                        directEntry,
+                        pathname,
+                    )
                     return (
                         <Menu.Item
                             key={node.id}
-                            to={node.path}
-                            primaryText={node.label}
-                            leftIcon={navigationIcons[node.icon]}
+                            to={directEntry.path}
+                            primaryText={directEntry.label}
+                            leftIcon={
+                                <NavigationIconGlyph icon={directEntry.icon} />
+                            }
+                            data-navigation-id={directEntry.id}
                             aria-current={active ? 'page' : undefined}
                             sx={{
                                 py: 0.75,
@@ -920,25 +896,7 @@ const CustomMenu: React.FC = () => {
                         />
                     )
                 }
-                if (node.children.length === 1) {
-                    const child = node.children[0]
-                    const active = isNavigationItemActive(child, pathname)
-                    return (
-                        <Menu.Item
-                            key={node.id}
-                            to={child.path}
-                            primaryText={node.label}
-                            leftIcon={navigationIcons[node.icon]}
-                            aria-current={active ? 'page' : undefined}
-                            sx={{
-                                py: 0.75,
-                                bgcolor: active
-                                    ? 'action.selected'
-                                    : undefined,
-                            }}
-                        />
-                    )
-                }
+                if (node.kind !== 'group') return null
                 const contentID = `navigation-group-${node.id}-children`
                 const isExpanded = expanded[node.id] === true
                 const isActive = activeGroupID === node.id
@@ -950,6 +908,7 @@ const CustomMenu: React.FC = () => {
                             role="menuitem"
                             aria-expanded={isExpanded}
                             aria-controls={contentID}
+                            data-navigation-id={node.id}
                             data-testid={`navigation-group-${nodeIndex}-toggle`}
                             onClick={() => toggleGroup(node.id)}
                             onKeyDown={(event) => {
@@ -969,7 +928,7 @@ const CustomMenu: React.FC = () => {
                             }}
                         >
                             <ListItemIcon sx={{ minWidth: 36 }}>
-                                {navigationIcons[node.icon]}
+                                <NavigationIconGlyph icon={node.icon} />
                             </ListItemIcon>
                             <ListItemText
                                 primary={node.label}
@@ -1006,7 +965,12 @@ const CustomMenu: React.FC = () => {
                                             key={item.id}
                                             to={item.path}
                                             primaryText={item.label}
-                                            leftIcon={navigationIcons[item.icon]}
+                                            leftIcon={
+                                                <NavigationIconGlyph
+                                                    icon={item.icon}
+                                                />
+                                            }
+                                            data-navigation-id={item.id}
                                             aria-current={
                                                 active ? 'page' : undefined
                                             }

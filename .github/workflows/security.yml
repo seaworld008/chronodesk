@@ -115,6 +115,9 @@ jobs:
           npm run check:human-api
           npm run test:human-api
 
+      - name: Test navigation contracts
+        run: npm run test:navigation
+
       - name: Validate AsyncAPI 3.1 contract
         run: npx --yes @asyncapi/cli@6.0.2 validate ../server/internal/asyncapi/asyncapi.yaml
 

@@ -1,4 +1,11 @@
-import { expect, test, type Locator, type Page } from '@playwright/test'
+import {
+    expect,
+    test,
+    type Locator,
+    type Page,
+    type Route,
+} from '@playwright/test'
+import { monitorBrowserHealth } from './helpers/browserAudit'
 
 const encode = (value: unknown) =>
     Buffer.from(JSON.stringify(value)).toString('base64url')
@@ -7,15 +14,22 @@ const installSession = async (
     page: Page,
     sessionID = 'task3-session',
     displayName = '',
+    platformRole: 'member' | 'platform_admin' = 'platform_admin',
 ) => {
     const expiresAt = Math.floor(Date.now() / 1000) + 3600
     const token = `${encode({ alg: 'none', typ: 'JWT' })}.${encode({
         sub: '1',
         sid: sessionID,
-        platform_role: 'platform_admin',
+        platform_role: platformRole,
         exp: expiresAt,
     })}.signature`
-    await page.addInitScript(({ accessToken, exp, sid, fullName }) => {
+    await page.addInitScript(({
+        accessToken,
+        exp,
+        fullName,
+        role,
+        sid,
+    }) => {
         if (sessionStorage.getItem('task3-preserve-session') === 'true') {
             return
         }
@@ -26,7 +40,7 @@ const installSession = async (
             id: 1,
             username: 'task3-admin',
             email: 'task3@example.invalid',
-            platform_role: 'platform_admin',
+            platform_role: role,
             status: 'active',
             email_verified: true,
             otp_enabled: false,
@@ -49,6 +63,7 @@ const installSession = async (
         accessToken: token,
         exp: expiresAt,
         fullName: displayName,
+        role: platformRole,
         sid: sessionID,
     })
 }
@@ -68,12 +83,57 @@ const projectAccess = [{
     project_role: 'project_admin',
 }]
 
-const installLayoutMocks = async (page: Page) => {
+const expectedAdminSidebarIcons = {
+    workbench: 'workspaceHub',
+    'workbench-dashboard': 'operationsDashboard',
+    'cross-project-workbench': 'crossProjectBoard',
+    'project-operations': 'projectOperations',
+    'project-overview': 'projectOverview',
+    tickets: 'ticketManagement',
+    'knowledge-management': 'knowledgeBase',
+    notifications: 'projectNotifications',
+    'intelligent-operations': 'intelligentOperations',
+    'agent-collaboration': 'humanAgentCollaboration',
+    automation: 'automationRules',
+    agents: 'agentManagement',
+    'integration-center': 'integrationCenter',
+    webhook: 'webhookSettings',
+    'integration-runtime': 'integrationRuntime',
+    'project-configuration': 'projectSettings',
+    'project-basic-settings': 'projectInformation',
+    memberships: 'projectMembers',
+    'project-intake-settings': 'ticketIntake',
+    'project-sla-settings': 'slaPolicies',
+    'project-queue-settings': 'intakeQueues',
+    'project-ticket-templates': 'ticketTemplates',
+    'project-quick-replies': 'quickReplies',
+    'project-notification-channels': 'notificationDelivery',
+    'governance-center': 'governanceCenter',
+    'platform-home': 'platformDashboard',
+    'platform-projects': 'projectGovernance',
+    users: 'identityAccess',
+    'platform-audit': 'auditCenter',
+    'system-settings': 'systemSettings',
+    'platform-config': 'publicConfiguration',
+    'platform-email-settings': 'emailDelivery',
+} as const
+
+const installLayoutMocks = async (
+    page: Page,
+    {
+        platformRole = 'platform_admin',
+        projectRole = 'project_admin',
+    }: {
+        platformRole?: 'member' | 'platform_admin'
+        projectRole?: 'project_admin' | 'requester'
+    } = {},
+) => {
+    const unexpectedApiRequests: string[] = []
     const user = {
         id: 1,
         username: 'task3-admin',
         email: 'task3@example.invalid',
-        platform_role: 'platform_admin',
+        platform_role: platformRole,
         status: 'active',
         email_verified: true,
         otp_enabled: false,
@@ -111,13 +171,23 @@ const installLayoutMocks = async (page: Page) => {
     }
 
     await page.route('**/api/**', async (route) => {
-        const url = new URL(route.request().url())
-        let data: unknown = []
-        if (url.pathname === '/api/projects') {
-            data = projectAccess
-        } else if (url.pathname === '/api/auth/me') {
+        const request = route.request()
+        const url = new URL(request.url())
+        let data: unknown
+        if (request.method() === 'GET' && url.pathname === '/api/projects') {
+            data = projectAccess.map((access) => ({
+                ...access,
+                project_role: projectRole,
+            }))
+        } else if (
+            request.method() === 'GET'
+            && url.pathname === '/api/auth/me'
+        ) {
             data = user
-        } else if (url.pathname === '/api/platform/configs') {
+        } else if (
+            request.method() === 'GET'
+            && url.pathname === '/api/platform/configs'
+        ) {
             data = {
                 items: [],
                 total: 0,
@@ -125,11 +195,22 @@ const installLayoutMocks = async (page: Page) => {
                 page_size: 25,
                 total_pages: 0,
             }
-        } else if (url.pathname === '/api/platform/email-config') {
+        } else if (
+            request.method() === 'GET'
+            && url.pathname === '/api/platform/email-config'
+        ) {
             data = emailConfig
-        } else if (url.pathname === '/api/projects/OPS/webhooks') {
+        } else if (
+            request.method() === 'GET'
+            && url.pathname === '/api/projects/OPS/webhooks'
+        ) {
             data = { items: [], total: 0, page: 1, page_size: 100 }
-        } else if (url.pathname === '/api/user/trusted-devices') {
+        } else if (
+            request.method() === 'GET'
+            &&
+            url.pathname ===
+            '/api/projects/OPS/admin/agents/webhooks/tombstones'
+        ) {
             data = {
                 items: [],
                 total: 0,
@@ -137,10 +218,43 @@ const installLayoutMocks = async (page: Page) => {
                 page_size: 25,
                 total_pages: 0,
             }
-        } else if (url.pathname === '/api/user/login-history') {
+        } else if (
+            request.method() === 'GET'
+            && url.pathname === '/api/user/trusted-devices'
+        ) {
+            data = {
+                items: [],
+                total: 0,
+                page: 1,
+                page_size: 25,
+                total_pages: 0,
+            }
+        } else if (
+            request.method() === 'GET'
+            && url.pathname === '/api/user/login-history'
+        ) {
             data = { items: [], total: 0, page: 1, page_size: 20 }
-        } else if (url.pathname === '/api/workbench/tickets') {
+        } else if (
+            request.method() === 'GET'
+            && url.pathname === '/api/workbench/tickets'
+        ) {
             data = { items: [], total: 0, page: 1, page_size: 20, total_pages: 0 }
+        } else {
+            unexpectedApiRequests.push(`${request.method()} ${url.pathname}`)
+            await route.fulfill({
+                status: 404,
+                contentType: 'application/problem+json',
+                body: JSON.stringify({
+                    type: 'about:blank',
+                    title: 'Unexpected mocked API request',
+                    status: 404,
+                    detail: `${request.method()} ${url.pathname}`,
+                    code: 'not_found',
+                    request_id: 'task3-unexpected-api',
+                    retryable: false,
+                }),
+            })
+            return
         }
         await route.fulfill({
             status: 200,
@@ -148,6 +262,8 @@ const installLayoutMocks = async (page: Page) => {
             body: JSON.stringify({ code: 0, msg: 'ok', data }),
         })
     })
+
+    return { unexpectedApiRequests }
 }
 
 const expectReachable = async (locator: Locator, viewportWidth: number) => {
@@ -176,7 +292,119 @@ const deferred = () => {
     return { promise, resolve }
 }
 
+const rejectUnexpectedApiRequest = async (
+    route: Route,
+    requests: string[],
+) => {
+    const request = route.request()
+    const pathname = new URL(request.url()).pathname
+    const signature = `${request.method()} ${pathname}`
+    requests.push(signature)
+    await route.fulfill({
+        status: 404,
+        contentType: 'application/problem+json',
+        body: JSON.stringify({
+            type: 'about:blank',
+            title: 'Unexpected mocked API request',
+            status: 404,
+            detail: signature,
+            code: 'not_found',
+            request_id: 'task3-unexpected-api',
+            retryable: false,
+        }),
+    })
+}
+
 test.describe('Task 3 导航、账号与多选回归（mock）', () => {
+    test('侧栏为每个可见功能渲染唯一语义图标', async ({ page }) => {
+        const health = monitorBrowserHealth(page)
+        await installSession(page)
+        const backend = await installLayoutMocks(page)
+        await page.goto('/#/workbench')
+
+        const menu = page.getByRole('menu', { name: '主导航' })
+        await expect(menu).toBeVisible()
+        for (const groupID of [
+            'workbench',
+            'project-operations',
+            'intelligent-operations',
+            'integration-center',
+            'project-configuration',
+            'governance-center',
+            'system-settings',
+        ]) {
+            const toggle = menu.locator(
+                `[data-navigation-id="${groupID}"]`,
+            )
+            if (await toggle.getAttribute('aria-expanded') === 'false') {
+                await toggle.click()
+            }
+        }
+
+        for (const [navigationID, icon] of Object.entries(
+            expectedAdminSidebarIcons,
+        )) {
+            const item = menu.locator(
+                `[data-navigation-id="${navigationID}"]`,
+            )
+            await expect(item, navigationID).toHaveCount(1)
+            const glyph = item.locator(
+                `[data-navigation-icon="${icon}"]`,
+            )
+            await expect(glyph, `${navigationID} -> ${icon}`).toHaveCount(1)
+            await expect(glyph).toHaveAttribute('aria-hidden', 'true')
+            await expect(glyph.locator('svg')).toHaveCount(1)
+        }
+
+        const renderedIcons = await menu
+            .locator('[data-navigation-icon]')
+            .evaluateAll((elements) => elements.map((element) =>
+                element.getAttribute('data-navigation-icon'),
+            ))
+        expect(new Set(renderedIcons).size).toBe(renderedIcons.length)
+        expect(renderedIcons).toHaveLength(
+            Object.keys(expectedAdminSidebarIcons).length,
+        )
+        expect(backend.unexpectedApiRequests).toEqual([])
+        health.assertClean()
+    })
+
+    test('单叶分组直接呈现实际子功能标签、图标与链接', async ({ page }) => {
+        const health = monitorBrowserHealth(page)
+        await installSession(
+            page,
+            'task3-requester-session',
+            '',
+            'member',
+        )
+        const backend = await installLayoutMocks(page, {
+            platformRole: 'member',
+            projectRole: 'requester',
+        })
+        await page.goto('/#/workbench')
+
+        const menu = page.getByRole('menu', { name: '主导航' })
+        const collaboration = menu.locator(
+            '[data-navigation-id="agent-collaboration"]',
+        )
+        await expect(collaboration).toHaveCount(1)
+        await expect(collaboration).toContainText('人机协作')
+        await expect(collaboration).toHaveAttribute(
+            'href',
+            /#\/agent-collaboration$/,
+        )
+        await expect(
+            collaboration.locator(
+                '[data-navigation-icon="humanAgentCollaboration"]',
+            ),
+        ).toHaveCount(1)
+        await expect(
+            menu.locator('[data-navigation-id="intelligent-operations"]'),
+        ).toHaveCount(0)
+        expect(backend.unexpectedApiRequests).toEqual([])
+        health.assertClean()
+    })
+
     test('树契约、单叶直达、持久化、账号白名单、Webhook clear 和登录分页', async ({ page }) => {
         await installSession(page)
         const profileWrites: Array<Record<string, unknown>> = []
@@ -184,6 +412,7 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         const revokedLoginSessions: number[] = []
         const passwordWrites: Array<Record<string, unknown>> = []
         const otpVerifications: string[] = []
+        const unexpectedApiRequests: string[] = []
         const uploadedAvatarURL =
             'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
         let otpEnabled = false
@@ -217,10 +446,16 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         await page.route('**/api/**', async (route) => {
             const request = route.request()
             const url = new URL(request.url())
-            let data: unknown = []
-            if (url.pathname === '/api/projects') {
+            let data: unknown
+            if (
+                request.method() === 'GET'
+                && url.pathname === '/api/projects'
+            ) {
                 data = projectAccess
-            } else if (url.pathname === '/api/auth/me') {
+            } else if (
+                request.method() === 'GET'
+                && url.pathname === '/api/auth/me'
+            ) {
                 data = currentUser()
             } else if (
                 url.pathname === '/api/auth/profile' &&
@@ -236,7 +471,10 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             ) {
                 profile = { ...profile, avatar: uploadedAvatarURL }
                 data = { avatar_url: uploadedAvatarURL }
-            } else if (url.pathname === '/api/user/login-history') {
+            } else if (
+                request.method() === 'GET'
+                && url.pathname === '/api/user/login-history'
+            ) {
                 const requestedPage = Number(url.searchParams.get('page'))
                 loginPages.push(requestedPage)
                 data = {
@@ -289,10 +527,56 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
                     request.postDataJSON() as Record<string, unknown>,
                 )
                 data = null
-            } else if (url.pathname === '/api/projects/OPS/webhooks') {
+            } else if (
+                request.method() === 'GET'
+                && url.pathname === '/api/platform/configs'
+            ) {
+                data = {
+                    items: [],
+                    total: 0,
+                    page: 1,
+                    page_size: 25,
+                    total_pages: 0,
+                }
+            } else if (
+                request.method() === 'GET'
+                && url.pathname === '/api/projects/OPS/webhooks'
+            ) {
                 data = { items: [], total: 0, page: 1, page_size: 100 }
-            } else if (url.pathname === '/api/workbench/tickets') {
+            } else if (
+                request.method() === 'GET'
+                && url.pathname ===
+                '/api/projects/OPS/admin/agents/webhooks/tombstones'
+            ) {
+                data = {
+                    items: [],
+                    total: 0,
+                    page: 1,
+                    page_size: 25,
+                    total_pages: 0,
+                }
+            } else if (
+                request.method() === 'GET'
+                && url.pathname === '/api/user/trusted-devices'
+            ) {
+                data = {
+                    items: [],
+                    total: 0,
+                    page: 1,
+                    page_size: 25,
+                    total_pages: 0,
+                }
+            } else if (
+                request.method() === 'GET'
+                && url.pathname === '/api/workbench/tickets'
+            ) {
                 data = { items: [], total: 0, page: 1, page_size: 20, total_pages: 0 }
+            } else {
+                await rejectUnexpectedApiRequest(
+                    route,
+                    unexpectedApiRequests,
+                )
+                return
             }
             await route.fulfill({
                 status: 200,
@@ -609,11 +893,12 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             refreshToken: null,
             user: null,
         })
+        expect(unexpectedApiRequests).toEqual([])
     })
 
     test('AppBar、响应式侧栏、页面操作与头像使用真实几何矩阵', async ({ page }) => {
         await installSession(page, 'task3-layout-session')
-        await installLayoutMocks(page)
+        const backend = await installLayoutMocks(page)
 
         for (const viewport of [
             { width: 320, height: 720 },
@@ -802,6 +1087,7 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         expect(profileGeometry.form!.width).toBeLessThanOrEqual(760)
         expect(profileGeometry.avatar!.left)
             .toBeGreaterThan(profileGeometry.form!.right)
+        expect(backend.unexpectedApiRequests).toEqual([])
     })
 
     test('超长账号名、项目名与项目加载态保持 AppBar 三段几何', async ({ page }) => {
@@ -842,6 +1128,7 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         let projectGate = deferred()
         let projectRequestStarted = deferred()
         let reportedProjectRequest = false
+        const unexpectedApiRequests: string[] = []
         const armProjectLoading = () => {
             projectGate = deferred()
             projectRequestStarted = deferred()
@@ -849,18 +1136,28 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         }
 
         await page.route('**/api/**', async (route) => {
-            const url = new URL(route.request().url())
-            let data: unknown = []
-            if (url.pathname === '/api/projects') {
+            const request = route.request()
+            const url = new URL(request.url())
+            let data: unknown
+            if (
+                request.method() === 'GET'
+                && url.pathname === '/api/projects'
+            ) {
                 if (!reportedProjectRequest) {
                     reportedProjectRequest = true
                     projectRequestStarted.resolve()
                 }
                 await projectGate.promise
                 data = longProjectAccess
-            } else if (url.pathname === '/api/auth/me') {
+            } else if (
+                request.method() === 'GET'
+                && url.pathname === '/api/auth/me'
+            ) {
                 data = longUser
-            } else if (url.pathname === '/api/platform/configs') {
+            } else if (
+                request.method() === 'GET'
+                && url.pathname === '/api/platform/configs'
+            ) {
                 data = {
                     items: [],
                     total: 0,
@@ -868,8 +1165,29 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
                     page_size: 25,
                     total_pages: 0,
                 }
-            } else if (url.pathname === '/api/projects/OPS/webhooks') {
+            } else if (
+                request.method() === 'GET'
+                && url.pathname === '/api/projects/OPS/webhooks'
+            ) {
                 data = { items: [], total: 0, page: 1, page_size: 100 }
+            } else if (
+                request.method() === 'GET'
+                && url.pathname ===
+                '/api/projects/OPS/admin/agents/webhooks/tombstones'
+            ) {
+                data = {
+                    items: [],
+                    total: 0,
+                    page: 1,
+                    page_size: 25,
+                    total_pages: 0,
+                }
+            } else {
+                await rejectUnexpectedApiRequest(
+                    route,
+                    unexpectedApiRequests,
+                )
+                return
             }
             await route.fulfill({
                 status: 200,
@@ -1022,6 +1340,7 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             await expect(page.getByTestId('account-menu-account-profile'))
                 .toBeHidden()
         }
+        expect(unexpectedApiRequests).toEqual([])
     })
 
     test('个人资料和邮件设置在 loading/error 分支保留统一 PageHeader', async ({ page }) => {
@@ -1030,6 +1349,7 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         const profileStarted = deferred()
         const emailGate = deferred()
         const emailStarted = deferred()
+        const unexpectedApiRequests: string[] = []
         const user = {
             id: 1,
             username: 'task3-admin',
@@ -1050,8 +1370,12 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
         }
 
         await page.route('**/api/**', async (route) => {
-            const url = new URL(route.request().url())
-            if (url.pathname === '/api/projects') {
+            const request = route.request()
+            const url = new URL(request.url())
+            if (
+                request.method() === 'GET'
+                && url.pathname === '/api/projects'
+            ) {
                 await route.fulfill({
                     status: 200,
                     contentType: 'application/json',
@@ -1063,7 +1387,10 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
                 })
                 return
             }
-            if (url.pathname === '/api/auth/me') {
+            if (
+                request.method() === 'GET'
+                && url.pathname === '/api/auth/me'
+            ) {
                 profileStarted.resolve()
                 await profileGate.promise
                 await route.fulfill({
@@ -1073,7 +1400,10 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
                 })
                 return
             }
-            if (url.pathname === '/api/platform/email-config') {
+            if (
+                request.method() === 'GET'
+                && url.pathname === '/api/platform/email-config'
+            ) {
                 emailStarted.resolve()
                 await emailGate.promise
                 await route.fulfill({
@@ -1087,11 +1417,7 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
                 })
                 return
             }
-            await route.fulfill({
-                status: 200,
-                contentType: 'application/json',
-                body: JSON.stringify({ code: 0, msg: 'ok', data: [] }),
-            })
+            await rejectUnexpectedApiRequest(route, unexpectedApiRequests)
         })
 
         await page.goto('/#/account/profile')
@@ -1127,5 +1453,6 @@ test.describe('Task 3 导航、账号与多选回归（mock）', () => {
             name: '平台邮件设置',
             level: 1,
         })).toBeVisible()
+        expect(unexpectedApiRequests).toEqual([])
     })
 })

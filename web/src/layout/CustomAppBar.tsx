@@ -21,11 +21,6 @@ import {
   Typography,
 } from '@mui/material'
 import {
-  History as HistoryIcon,
-  Person as PersonIcon,
-  Security as SecurityIcon,
-} from '@mui/icons-material'
-import {
   activeProjectKey,
   clearActiveProjectSelection,
   getProjectRoleLabel,
@@ -41,6 +36,7 @@ import {
 } from '@/lib/projectScopeEvents'
 import { logoutAllSessions } from '@/lib/authProvider'
 import { visibleNavigationItems } from '@/navigation/navigationRegistry'
+import { NavigationIconGlyph } from '@/navigation/navigationIcons'
 import { resolveRoutePageScope } from './routePageScope'
 import { publicLoginHashTarget } from './logoutNavigation'
 
@@ -67,12 +63,6 @@ const LogoutAllMenuItem: React.FC = () => {
   )
 }
 
-const accountIcons = {
-  users: <PersonIcon fontSize="small" />,
-  security: <SecurityIcon fontSize="small" />,
-  loginHistory: <HistoryIcon fontSize="small" />,
-}
-
 const AccountNavigationItems: React.FC = () => {
   const navigate = useNavigate()
   const onClose = useUserMenu()?.onClose
@@ -88,10 +78,11 @@ const AccountNavigationItems: React.FC = () => {
         onClose?.()
         navigate(item.path)
       }}
+      data-navigation-id={item.id}
       data-testid={`account-menu-${item.id}`}
     >
       <ListItemIcon>
-        {accountIcons[item.icon as keyof typeof accountIcons]}
+        <NavigationIconGlyph icon={item.icon} />
       </ListItemIcon>
       <ListItemText>{item.label}</ListItemText>
     </MenuItem>
