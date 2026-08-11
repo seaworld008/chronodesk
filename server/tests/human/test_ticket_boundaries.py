@@ -98,7 +98,6 @@ def test_ticket_create_input_boundaries(
         {
             **valid_base,
             "title": e2e_manager.unique("customer-forbidden-fields"),
-            "status": "in_progress",
             "assigned_to_id": human_identities["agent_a"].id,
         },
     )
@@ -109,6 +108,20 @@ def test_ticket_create_input_boundaries(
         cleanup = admin.api.delete_ticket(unexpected_id)
         assert cleanup.status_code in (200, 204), cleanup.text
     assert_error_contract(forbidden_customer_fields, 403)
+
+    unpublished_status = customer.api.post_json(
+        e2e_manager.project_path("tickets"),
+        {
+            **valid_base,
+            "title": e2e_manager.unique("customer-unpublished-status"),
+            "status": "in_progress",
+        },
+    )
+    assert_error_contract(
+        unpublished_status,
+        422,
+        machine_codes={"workflow_transition_required"},
+    )
 
 
 def test_ticket_pagination_and_identifier_bounds(
