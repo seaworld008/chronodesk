@@ -2,8 +2,10 @@
 // Release builds may replace these values with -ldflags -X.
 package version
 
+const DefaultVersion = "0.2.0"
+
 var (
-	Version   = "0.1.0"
+	Version   = DefaultVersion
 	Commit    = "unknown"
 	BuildDate = "unknown"
 )

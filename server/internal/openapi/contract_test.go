@@ -1068,7 +1068,16 @@ func assertA2A10Contract(
 	if _, exists := paths["/a2a"]; exists {
 		t.Error("unversioned legacy /a2a path is still published")
 	}
-	serialized := string(Specification())
+	// Product and Human API releases may legitimately use numbers that were
+	// once A2A drafts. Keep the legacy-version search scoped to the A2A
+	// parameters, operation, and Agent Card instead of coupling the protocol
+	// gate to unrelated document metadata.
+	serialized := fmt.Sprint([]any{
+		versionHeader,
+		versionQuery,
+		post,
+		card,
+	})
 	for _, forbidden := range []string{"0.3", "0.2", "A2A-Version-Override"} {
 		if strings.Contains(serialized, forbidden) {
 			t.Errorf("OpenAPI still contains legacy A2A contract %q", forbidden)
