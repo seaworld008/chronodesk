@@ -547,6 +547,7 @@ func TestRegistrationRejectsEmailPolicyChangedBeforeFinalTransaction(
 	db, repository, _ := newAuthEmailOutboxTestRepository(t)
 	seedAuthEmailVerificationPolicy(t, db, true)
 	now := time.Now()
+	passwordChangedAt := now.Add(-time.Microsecond)
 	user := &User{
 		Username:          "stale-registration-policy",
 		Email:             "stale-registration-policy@example.test",
@@ -556,7 +557,7 @@ func TestRegistrationRejectsEmailPolicyChangedBeforeFinalTransaction(
 		EmailVerified:     true,
 		EmailVerifiedAt:   &now,
 		LastLoginAt:       &now,
-		PasswordChangedAt: &now,
+		PasswordChangedAt: &passwordChangedAt,
 	}
 	profile := &UserProfile{
 		FirstName: "策略",
@@ -567,9 +568,10 @@ func TestRegistrationRejectsEmailPolicyChangedBeforeFinalTransaction(
 	_, err := repository.CommitRegistration(
 		context.Background(),
 		&RegistrationCommit{
-			CommittedAt: now,
-			User:        user,
-			Profile:     profile,
+			CommittedAt:     now,
+			SessionIssuedAt: &now,
+			User:            user,
+			Profile:         profile,
 			ExpectedEmailPolicy: &EmailVerificationPolicySnapshot{
 				Enabled: false,
 			},
@@ -620,7 +622,11 @@ func TestRegistrationCommitsUserProfileAndEmailIntentTogether(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			db, repository, _ := newAuthEmailOutboxTestRepository(t)
-			verifiedAt := time.Now().UTC()
+			verifiedAt := time.Now().UTC().Truncate(time.Microsecond)
+			passwordChangedAt := verifiedAt
+			if !test.requireVerify {
+				passwordChangedAt = verifiedAt.Add(-time.Microsecond)
+			}
 			user := &User{
 				Username:          "registration-success",
 				Email:             "registration-success@example.test",
@@ -628,7 +634,7 @@ func TestRegistrationCommitsUserProfileAndEmailIntentTogether(t *testing.T) {
 				PlatformRole:      PlatformRoleMember,
 				Status:            StatusActive,
 				EmailVerified:     !test.requireVerify,
-				PasswordChangedAt: &verifiedAt,
+				PasswordChangedAt: &passwordChangedAt,
 			}
 			if !test.requireVerify {
 				user.EmailVerifiedAt = &verifiedAt
@@ -660,13 +666,18 @@ func TestRegistrationCommitsUserProfileAndEmailIntentTogether(t *testing.T) {
 					"registration-success-test",
 				)
 			}
+			var sessionIssuedAt *time.Time
+			if !test.requireVerify {
+				sessionIssuedAt = &verifiedAt
+			}
 			if _, err := repository.CommitRegistration(
 				context.Background(),
 				&RegistrationCommit{
-					CommittedAt:  verifiedAt,
-					User:         user,
-					Profile:      profile,
-					Verification: verification,
+					CommittedAt:     verifiedAt,
+					SessionIssuedAt: sessionIssuedAt,
+					User:            user,
+					Profile:         profile,
+					Verification:    verification,
 					ExpectedEmailPolicy: &EmailVerificationPolicySnapshot{
 						Enabled: test.requireVerify,
 					},

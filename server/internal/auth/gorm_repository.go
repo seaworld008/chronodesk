@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"gorm.io/gorm"
@@ -782,32 +781,6 @@ func validateLoginSessionRows(
 	return nil
 }
 
-func normalizeRegistrationUserInsertError(err error) error {
-	if !isRegistrationUserIdentityUniqueConflict(err) {
-		return err
-	}
-	return ErrUserExists
-}
-
-func isRegistrationUserIdentityUniqueConflict(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, gorm.ErrDuplicatedKey) {
-		return true
-	}
-	var postgresError *pgconn.PgError
-	if errors.As(err, &postgresError) && postgresError.Code == "23505" {
-		constraint := strings.ToLower(postgresError.ConstraintName)
-		return strings.Contains(constraint, "users") &&
-			(strings.Contains(constraint, "email") ||
-				strings.Contains(constraint, "username"))
-	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "unique constraint failed: users.email") ||
-		strings.Contains(message, "unique constraint failed: users.username")
-}
-
 // lockAndMatchEmailVerificationPolicyTx closes the interval between reading
 // the dynamic policy and committing authentication state. PostgreSQL's table
 // lock covers the no-row/default-policy case as well as updates to an existing
@@ -1040,7 +1013,7 @@ func (r *GormTokenRepository) RotateRefreshToken(
 	storedReplacement := *replacement
 	storedReplacement.ID = 0
 	storedReplacement.Token = bearerTokenDigest("refresh-token", replacement.Token)
-	rotatedAt = rotatedAt.UTC().Truncate(time.Second)
+	rotatedAt = rotatedAt.UTC().Truncate(time.Microsecond)
 	storedReplacement.CreatedAt = rotatedAt
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&RefreshToken{}).

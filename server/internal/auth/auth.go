@@ -435,6 +435,7 @@ type RegistrationSession struct {
 // event, and Outbox intent.
 type RegistrationCommit struct {
 	CommittedAt         time.Time
+	SessionIssuedAt     *time.Time
 	User                *User
 	Profile             *UserProfile
 	Verification        *EmailVerification
@@ -728,6 +729,12 @@ type AuthConfig struct {
 // JWTManager JWT管理器接口
 type JWTManager interface {
 	GenerateTokenPair(userID uint, platformRole PlatformRole, sessionID string) (accessToken, refreshToken string, err error)
+	GenerateTokenPairAt(
+		userID uint,
+		platformRole PlatformRole,
+		sessionID string,
+		issuedAt time.Time,
+	) (accessToken, refreshToken string, err error)
 	GenerateRefreshTokenPair(
 		userID uint,
 		platformRole PlatformRole,
@@ -746,6 +753,7 @@ type Claims struct {
 	Type         string       `json:"type"` // access, refresh
 	SessionID    string       `json:"sid"`
 	Exp          int64        `json:"exp"`
+	Nbf          int64        `json:"nbf"`
 	Iat          int64        `json:"iat"`
 	Jti          string       `json:"jti"`
 }
@@ -831,7 +839,8 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 		return nil, fmt.Errorf("failed to hash password: %w", err)
 	}
 
-	committedAt := time.Now().UTC()
+	committedAt := time.Now().UTC().Truncate(time.Microsecond)
+	passwordChangedAt := committedAt
 
 	// 创建用户
 	user := &User{
@@ -841,12 +850,17 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 		PlatformRole:      PlatformRoleMember,
 		Status:            StatusActive,
 		EmailVerified:     !emailVerificationEnabled,
-		PasswordChangedAt: timePtr(committedAt),
+		PasswordChangedAt: timePtr(passwordChangedAt),
 	}
 
+	var sessionIssuedAt *time.Time
 	if !emailVerificationEnabled {
-		user.EmailVerifiedAt = timePtr(committedAt)
-		user.LastLoginAt = timePtr(committedAt)
+		issuedAt := committedAt
+		passwordChangedAt = issuedAt.Add(-time.Microsecond)
+		user.PasswordChangedAt = timePtr(passwordChangedAt)
+		user.EmailVerifiedAt = timePtr(issuedAt)
+		user.LastLoginAt = timePtr(issuedAt)
+		sessionIssuedAt = &issuedAt
 	}
 
 	// 创建用户资料
@@ -886,13 +900,27 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 			if err != nil {
 				return nil, fmt.Errorf("generate registration session id: %w", err)
 			}
-			accessToken, refreshToken, err := s.jwtManager.GenerateTokenPair(
+			accessToken, refreshToken, err := s.jwtManager.GenerateTokenPairAt(
 				userID,
 				user.PlatformRole,
 				sessionID,
+				sessionCommittedAt,
 			)
 			if err != nil {
 				return nil, fmt.Errorf("generate registration tokens: %w", err)
+			}
+			if err := validateRegistrationTokenPair(
+				s.jwtManager,
+				accessToken,
+				refreshToken,
+				userID,
+				user.PlatformRole,
+				sessionID,
+				sessionCommittedAt,
+				s.config.AccessTokenExpire,
+				s.config.RefreshTokenExpire,
+			); err != nil {
+				return nil, err
 			}
 			refreshAuthority, err := s.newRefreshTokenRecordAt(
 				userID,
@@ -935,10 +963,11 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 	result, err := registrationRepository.CommitRegistration(
 		ctx,
 		&RegistrationCommit{
-			CommittedAt:  committedAt,
-			User:         user,
-			Profile:      profile,
-			Verification: verification,
+			CommittedAt:     committedAt,
+			SessionIssuedAt: sessionIssuedAt,
+			User:            user,
+			Profile:         profile,
+			Verification:    verification,
 			ExpectedEmailPolicy: &EmailVerificationPolicySnapshot{
 				Enabled: emailVerificationEnabled,
 			},
@@ -971,6 +1000,66 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 		ExpiresIn:    int64(s.config.AccessTokenExpire.Seconds()),
 		TokenType:    "Bearer",
 	}, nil
+}
+
+func validateRegistrationTokenPair(
+	manager JWTManager,
+	accessToken string,
+	refreshToken string,
+	userID uint,
+	platformRole PlatformRole,
+	sessionID string,
+	issuedAt time.Time,
+	accessExpire time.Duration,
+	refreshExpire time.Duration,
+) error {
+	if manager == nil ||
+		strings.TrimSpace(accessToken) == "" ||
+		strings.TrimSpace(refreshToken) == "" ||
+		accessToken == refreshToken ||
+		issuedAt.IsZero() ||
+		accessExpire <= 0 ||
+		refreshExpire <= 0 {
+		return ErrInvalidToken
+	}
+	accessClaims, err := manager.VerifyAccessToken(accessToken)
+	if err != nil {
+		return ErrInvalidToken
+	}
+	refreshClaims, err := manager.VerifyRefreshToken(refreshToken)
+	if err != nil {
+		return ErrInvalidToken
+	}
+	expectedIssuedAt := issuedAt.Unix()
+	for _, token := range []struct {
+		claims    *Claims
+		tokenType string
+		expiresAt int64
+	}{
+		{
+			claims:    accessClaims,
+			tokenType: "access",
+			expiresAt: issuedAt.Add(accessExpire).Unix(),
+		},
+		{
+			claims:    refreshClaims,
+			tokenType: "refresh",
+			expiresAt: issuedAt.Add(refreshExpire).Unix(),
+		},
+	} {
+		if token.claims == nil ||
+			token.claims.UserID != userID ||
+			token.claims.PlatformRole != platformRole ||
+			token.claims.Type != token.tokenType ||
+			token.claims.SessionID != sessionID ||
+			token.claims.Iat != expectedIssuedAt ||
+			token.claims.Nbf != expectedIssuedAt ||
+			token.claims.Exp != token.expiresAt ||
+			strings.TrimSpace(token.claims.Jti) == "" {
+			return ErrInvalidToken
+		}
+	}
+	return nil
 }
 
 // Login 用户登录
@@ -1368,7 +1457,11 @@ func (s *AuthService) refreshToken(
 		return nil, ErrInvalidToken
 	}
 
-	issuedAt := time.Now().UTC().Truncate(time.Second)
+	// Persist the high-precision rotation time so a session created in the
+	// same second as the initial password credential remains strictly newer.
+	// GenerateRefreshTokenPair canonicalizes only the JWT/HMAC projection to
+	// seconds; refresh authority keeps this microsecond timestamp.
+	issuedAt := time.Now().UTC().Truncate(time.Microsecond)
 	if tokenRecord.Revoked {
 		if tokenRecord.RotatedAt == nil ||
 			time.Since(*tokenRecord.RotatedAt) < 0 ||

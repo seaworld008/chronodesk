@@ -1,9 +1,11 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"testing"
@@ -11,8 +13,10 @@ import (
 
 	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
+	"github.com/seaworld008/chronodesk/server/internal/scopeddb"
 	"github.com/seaworld008/chronodesk/server/internal/services"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 type staticRegistrationEmailPolicy bool
@@ -546,6 +550,561 @@ func TestAtomicRegistrationSuccessMatrix(t *testing.T) {
 	}
 }
 
+func TestRegistrationRefreshTokenWorksImmediatelyAndKeepsSessionActive(
+	t *testing.T,
+) {
+	db, repository, protector := newAuthEmailOutboxTestRepository(t)
+	seedAuthEmailVerificationPolicy(t, db, false)
+	manager := mustTestJWTManager(t, time.Hour, 24*time.Hour)
+	tokenRepository := NewGormTokenRepository(db)
+	service := NewAuthService(
+		NewGormUserRepository(db, protector),
+		NewGormProfileRepository(db),
+		tokenRepository,
+		NewGormLoginAttemptRepository(db),
+		NewGormLoginHistoryRepository(db),
+		nil,
+		nil,
+		staticRegistrationEmailPolicy(false),
+		trustedLoginOTPService{},
+		trustedLoginPasswordService{},
+		manager,
+		&AuthConfig{
+			EnableRegistration:      true,
+			AccessTokenExpire:       time.Hour,
+			RefreshTokenExpire:      24 * time.Hour,
+			EmailVerificationExpire: time.Hour,
+		},
+		WithAuthEmailOutboxRepository(repository),
+	)
+	registered, err := service.Register(
+		context.Background(),
+		&RegisterRequest{
+			Username:        "registration-immediate-refresh",
+			Email:           "registration-immediate-refresh@example.test",
+			Password:        "registration-immediate-refresh-password",
+			ConfirmPassword: "registration-immediate-refresh-password",
+		},
+		"127.0.0.1",
+		"registration immediate refresh test",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := manager.VerifyRefreshToken(registered.RefreshToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	refreshed, refreshErr := service.RefreshToken(
+		context.Background(),
+		&RefreshTokenRequest{RefreshToken: registered.RefreshToken},
+		"127.0.0.2",
+		"registration immediate refresh test",
+	)
+	active, activeErr := tokenRepository.IsSessionActive(
+		context.Background(),
+		registered.User.ID,
+		claims.SessionID,
+	)
+	if refreshErr != nil ||
+		refreshed == nil ||
+		refreshed.AccessToken == "" ||
+		refreshed.RefreshToken == "" ||
+		activeErr != nil ||
+		!active {
+		t.Fatalf(
+			"immediate refresh response/error/active/error = %+v/%v/%v/%v",
+			refreshed,
+			refreshErr,
+			active,
+			activeErr,
+		)
+	}
+	refreshedAgain, secondRefreshErr := service.RefreshToken(
+		context.Background(),
+		&RefreshTokenRequest{RefreshToken: refreshed.RefreshToken},
+		"127.0.0.3",
+		"registration second immediate refresh test",
+	)
+	active, activeErr = tokenRepository.IsSessionActive(
+		context.Background(),
+		registered.User.ID,
+		claims.SessionID,
+	)
+	if secondRefreshErr != nil ||
+		refreshedAgain == nil ||
+		refreshedAgain.AccessToken == "" ||
+		refreshedAgain.RefreshToken == "" ||
+		activeErr != nil ||
+		!active {
+		t.Fatalf(
+			"second immediate refresh response/error/active/error = %+v/%v/%v/%v",
+			refreshedAgain,
+			secondRefreshErr,
+			active,
+			activeErr,
+		)
+	}
+}
+
+func TestRegistrationSessionIssueTimeIsStrictlyAfterPasswordChangeAndMatchesJWT(
+	t *testing.T,
+) {
+	db, repository, protector := newAuthEmailOutboxTestRepository(t)
+	seedAuthEmailVerificationPolicy(t, db, false)
+	manager := mustTestJWTManager(t, time.Hour, 24*time.Hour)
+	service := NewAuthService(
+		NewGormUserRepository(db, protector),
+		NewGormProfileRepository(db),
+		NewGormTokenRepository(db),
+		NewGormLoginAttemptRepository(db),
+		NewGormLoginHistoryRepository(db),
+		nil,
+		nil,
+		staticRegistrationEmailPolicy(false),
+		trustedLoginOTPService{},
+		trustedLoginPasswordService{},
+		manager,
+		&AuthConfig{
+			EnableRegistration:      true,
+			AccessTokenExpire:       time.Hour,
+			RefreshTokenExpire:      24 * time.Hour,
+			EmailVerificationExpire: time.Hour,
+		},
+		WithAuthEmailOutboxRepository(repository),
+	)
+	response, err := service.Register(
+		context.Background(),
+		&RegisterRequest{
+			Username:        "registration-issue-time",
+			Email:           "registration-issue-time@example.test",
+			Password:        "registration-issue-time-password",
+			ConfirmPassword: "registration-issue-time-password",
+		},
+		"127.0.0.1",
+		"registration issue time test",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var user models.User
+	if err := db.First(&user, response.User.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var refresh RefreshToken
+	if err := db.First(&refresh).Error; err != nil {
+		t.Fatal(err)
+	}
+	var history models.LoginHistory
+	if err := db.First(&history).Error; err != nil {
+		t.Fatal(err)
+	}
+	var attempt LoginAttempt
+	if err := db.First(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	accessClaims, err := manager.ParseTokenClaims(response.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshClaims, err := manager.ParseTokenClaims(response.RefreshToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.PasswordResetAt == nil ||
+		!refresh.CreatedAt.After(*user.PasswordResetAt) ||
+		user.PasswordResetAt.Unix() > accessClaims.Iat ||
+		refresh.CreatedAt.Unix() != accessClaims.Iat ||
+		accessClaims.Iat != refreshClaims.Iat ||
+		!history.LoginTime.Equal(refresh.CreatedAt) ||
+		history.LastActivityAt == nil ||
+		!history.LastActivityAt.Equal(refresh.CreatedAt) ||
+		!attempt.CreatedAt.Equal(refresh.CreatedAt) {
+		t.Fatalf(
+			"password/session/JWT issue times diverged: password=%v refresh=%v history=%v attempt=%v access_iat=%d refresh_iat=%d",
+			user.PasswordResetAt,
+			refresh.CreatedAt,
+			history.LoginTime,
+			attempt.CreatedAt,
+			accessClaims.Iat,
+			refreshClaims.Iat,
+		)
+	}
+}
+
+func TestAtomicRegistrationRejectsAmbientScopedTransactionWithoutBearerOrRows(
+	t *testing.T,
+) {
+	tests := []struct {
+		name          string
+		rollbackOuter bool
+	}{
+		{name: "outer commit"},
+		{name: "outer rollback", rollbackOuter: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, repository, _ := newAuthEmailOutboxTestRepository(t)
+			seedAuthEmailVerificationPolicy(t, db, false)
+			command := atomicRegistrationTestCommand(
+				"ambient-registration-"+strings.ReplaceAll(test.name, " ", "-"),
+				"ambient-registration-"+strings.ReplaceAll(test.name, " ", "-")+"@example.test",
+				false,
+			)
+			operationContext, operationErr := services.WithOperationContext(
+				context.Background(),
+				services.OperationContext{
+					Scope:  repository.scope,
+					Actor:  models.SystemActor("ambient-registration-test"),
+					Source: services.SourceProtocolWorker,
+				},
+			)
+			if operationErr != nil {
+				t.Fatal(operationErr)
+			}
+			outerSentinel := errors.New("force outer rollback")
+			err := scopeddb.WithProjectScopeContextTransaction(
+				operationContext,
+				db,
+				repository.scope,
+				func(scopedContext context.Context) error {
+					result, commitErr := repository.CommitRegistration(
+						scopedContext,
+						command,
+					)
+					if result != nil ||
+						!errors.Is(
+							commitErr,
+							ErrAtomicRegistrationUnavailable,
+						) ||
+						command.User.ID != 0 ||
+						command.Profile.ID != 0 {
+						return fmt.Errorf(
+							"ambient registration result/error/ids = %+v/%v/%d/%d",
+							result,
+							commitErr,
+							command.User.ID,
+							command.Profile.ID,
+						)
+					}
+					if test.rollbackOuter {
+						return outerSentinel
+					}
+					return nil
+				},
+			)
+			if test.rollbackOuter {
+				if !errors.Is(err, outerSentinel) {
+					t.Fatalf("outer rollback error = %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			assertRegistrationTablesEmpty(t, db)
+		})
+	}
+}
+
+func TestAtomicRegistrationRejectsNonPasswordOrInactiveSessionMutations(
+	t *testing.T,
+) {
+	now := time.Now().UTC()
+	sessionDuration := int64(1)
+	tests := []struct {
+		name   string
+		mutate func(*RegistrationSession)
+	}{
+		{
+			name: "refresh revoked",
+			mutate: func(session *RegistrationSession) {
+				session.RefreshAuthority.Revoked = true
+			},
+		},
+		{
+			name: "refresh revoked at",
+			mutate: func(session *RegistrationSession) {
+				session.RefreshAuthority.RevokedAt = &now
+			},
+		},
+		{
+			name: "refresh rotated at",
+			mutate: func(session *RegistrationSession) {
+				session.RefreshAuthority.RotatedAt = &now
+			},
+		},
+		{
+			name: "refresh replacement digest",
+			mutate: func(session *RegistrationSession) {
+				session.RefreshAuthority.ReplacedByToken = "replacement-digest"
+			},
+		},
+		{
+			name: "history logout",
+			mutate: func(session *RegistrationSession) {
+				session.LoginHistory.LogoutTime = &now
+			},
+		},
+		{
+			name: "history failure reason",
+			mutate: func(session *RegistrationSession) {
+				session.LoginHistory.FailureReason = "unexpected"
+			},
+		},
+		{
+			name: "history session duration",
+			mutate: func(session *RegistrationSession) {
+				session.LoginHistory.SessionDuration = &sessionDuration
+			},
+		},
+		{
+			name: "history non-password method",
+			mutate: func(session *RegistrationSession) {
+				session.LoginHistory.LoginMethod = models.LoginMethodPasswordOTP
+			},
+		},
+		{
+			name: "history username differs from registration",
+			mutate: func(session *RegistrationSession) {
+				session.LoginHistory.Username = "different-registration-user"
+			},
+		},
+		{
+			name: "history email differs from registration",
+			mutate: func(session *RegistrationSession) {
+				session.LoginHistory.Email = "different-registration@example.test"
+				session.SuccessfulAttempt.Email = session.LoginHistory.Email
+			},
+		},
+		{
+			name: "history IP differs from refresh",
+			mutate: func(session *RegistrationSession) {
+				session.LoginHistory.IPAddress = "127.0.0.2"
+			},
+		},
+		{
+			name: "history user agent differs from refresh",
+			mutate: func(session *RegistrationSession) {
+				session.LoginHistory.UserAgent = "different history user agent"
+			},
+		},
+		{
+			name: "attempt IP differs from refresh",
+			mutate: func(session *RegistrationSession) {
+				session.SuccessfulAttempt.IPAddress = "127.0.0.3"
+			},
+		},
+		{
+			name: "attempt user agent differs from refresh",
+			mutate: func(session *RegistrationSession) {
+				session.SuccessfulAttempt.UserAgent = "different attempt user agent"
+			},
+		},
+		{
+			name: "refresh carries preallocated ID",
+			mutate: func(session *RegistrationSession) {
+				session.RefreshAuthority.ID = 99
+			},
+		},
+		{
+			name: "history carries preallocated ID",
+			mutate: func(session *RegistrationSession) {
+				session.LoginHistory.ID = 99
+			},
+		},
+		{
+			name: "attempt carries preallocated ID",
+			mutate: func(session *RegistrationSession) {
+				session.SuccessfulAttempt.ID = 99
+			},
+		},
+		{
+			name: "attempt carries user association",
+			mutate: func(session *RegistrationSession) {
+				session.SuccessfulAttempt.User = &models.User{ID: 99}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, repository, _ := newAuthEmailOutboxTestRepository(t)
+			seedAuthEmailVerificationPolicy(t, db, false)
+			command := atomicRegistrationTestCommand(
+				"registration-session-mutation-"+strings.ReplaceAll(test.name, " ", "-"),
+				"registration-session-mutation-"+strings.ReplaceAll(test.name, " ", "-")+"@example.test",
+				false,
+			)
+			validBuilder := command.BuildSession
+			command.BuildSession = func(
+				userID uint,
+				issuedAt time.Time,
+			) (*RegistrationSession, error) {
+				session, err := validBuilder(userID, issuedAt)
+				if err == nil {
+					test.mutate(session)
+				}
+				return session, err
+			}
+			result, err := repository.CommitRegistration(
+				context.Background(),
+				command,
+			)
+			if result != nil || !errors.Is(err, ErrInvalidToken) {
+				t.Fatalf(
+					"registration session mutation result/error = %+v/%v",
+					result,
+					err,
+				)
+			}
+			assertRegistrationTablesEmpty(t, db)
+		})
+	}
+}
+
+func TestAtomicRegistrationDuplicateIdentityDoesNotLogSecrets(t *testing.T) {
+	tests := []struct {
+		name           string
+		firstUsername  string
+		firstEmail     string
+		secondUsername string
+		secondEmail    string
+	}{
+		{
+			name:           "email",
+			firstUsername:  "duplicate-log-email-a",
+			firstEmail:     "duplicate-log-email@example.test",
+			secondUsername: "duplicate-log-email-b",
+			secondEmail:    "duplicate-log-email@example.test",
+		},
+		{
+			name:           "username",
+			firstUsername:  "duplicate-log-username",
+			firstEmail:     "duplicate-log-username-a@example.test",
+			secondUsername: "duplicate-log-username",
+			secondEmail:    "duplicate-log-username-b@example.test",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, repository, _ := newAuthEmailOutboxTestRepository(t)
+			seedAuthEmailVerificationPolicy(t, db, false)
+			var logs bytes.Buffer
+			db.Config.Logger = gormlogger.New(
+				log.New(&logs, "", 0),
+				gormlogger.Config{
+					LogLevel:             gormlogger.Error,
+					Colorful:             false,
+					ParameterizedQueries: false,
+				},
+			)
+			first := atomicRegistrationTestCommand(
+				test.firstUsername,
+				test.firstEmail,
+				false,
+			)
+			if _, err := repository.CommitRegistration(
+				context.Background(),
+				first,
+			); err != nil {
+				t.Fatal(err)
+			}
+			second := atomicRegistrationTestCommand(
+				test.secondUsername,
+				test.secondEmail,
+				false,
+			)
+			second.User.PasswordHash = "duplicate-log-password-hash-secret"
+			result, err := repository.CommitRegistration(
+				context.Background(),
+				second,
+			)
+			if result != nil || !errors.Is(err, ErrUserExists) {
+				t.Fatalf("duplicate result/error = %+v/%v", result, err)
+			}
+			logged := logs.String()
+			for _, secret := range []string{
+				test.secondEmail,
+				test.secondUsername,
+				second.User.PasswordHash,
+				"registration-refresh-bearer",
+				"registration-access-bearer",
+			} {
+				if strings.Contains(logged, secret) {
+					t.Fatalf(
+						"duplicate registration logs exposed %q: %s",
+						secret,
+						logged,
+					)
+				}
+			}
+		})
+	}
+}
+
+func TestAtomicRegistrationSoftDeletedIdentityRemainsStableConflict(
+	t *testing.T,
+) {
+	db, repository, _ := newAuthEmailOutboxTestRepository(t)
+	seedAuthEmailVerificationPolicy(t, db, false)
+	first := atomicRegistrationTestCommand(
+		"soft-deleted-registration",
+		"soft-deleted-registration@example.test",
+		false,
+	)
+	if _, err := repository.CommitRegistration(
+		context.Background(),
+		first,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Delete(&models.User{}, first.User.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	second := atomicRegistrationTestCommand(
+		"soft-deleted-registration",
+		"soft-deleted-registration@example.test",
+		false,
+	)
+	result, err := repository.CommitRegistration(
+		context.Background(),
+		second,
+	)
+	if result != nil || !errors.Is(err, ErrUserExists) {
+		t.Fatalf("soft-deleted duplicate result/error = %+v/%v", result, err)
+	}
+	var unscopedUsers, profiles, refreshes, histories, attempts, events, outbox int64
+	for model, count := range map[any]*int64{
+		&models.User{}:           &unscopedUsers,
+		&models.UserProfile{}:    &profiles,
+		&RefreshToken{}:          &refreshes,
+		&models.LoginHistory{}:   &histories,
+		&LoginAttempt{}:          &attempts,
+		&models.DomainEvent{}:    &events,
+		&models.OutboxDelivery{}: &outbox,
+	} {
+		query := db.Model(model)
+		if _, ok := model.(*models.User); ok {
+			query = query.Unscoped()
+		}
+		if err := query.Count(count).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, count := range map[string]int64{
+		"users":     unscopedUsers,
+		"profiles":  profiles,
+		"refreshes": refreshes,
+		"histories": histories,
+		"attempts":  attempts,
+		"events":    events,
+		"outbox":    outbox,
+	} {
+		if count != 1 {
+			t.Errorf("%s count after soft-deleted duplicate = %d, want 1", name, count)
+		}
+	}
+}
+
 func TestAtomicRegistrationInjectedFailureRollsBackEveryTable(t *testing.T) {
 	tests := []struct {
 		name                string
@@ -594,7 +1153,11 @@ func TestAtomicRegistrationInjectedFailureRollsBackEveryTable(t *testing.T) {
 				})
 			}
 
-			committedAt := time.Now().UTC()
+			committedAt := time.Now().UTC().Truncate(time.Microsecond)
+			passwordChangedAt := committedAt
+			if !test.verificationEnabled {
+				passwordChangedAt = committedAt.Add(-time.Microsecond)
+			}
 			user := &User{
 				Username:          "registration-failure-" + strings.ReplaceAll(test.name, " ", "-"),
 				Email:             "registration-failure-" + strings.ReplaceAll(test.name, " ", "-") + "@example.test",
@@ -602,7 +1165,7 @@ func TestAtomicRegistrationInjectedFailureRollsBackEveryTable(t *testing.T) {
 				PlatformRole:      PlatformRoleMember,
 				Status:            StatusActive,
 				EmailVerified:     !test.verificationEnabled,
-				PasswordChangedAt: &committedAt,
+				PasswordChangedAt: &passwordChangedAt,
 			}
 			profile := &UserProfile{
 				Timezone: "UTC",
@@ -631,13 +1194,18 @@ func TestAtomicRegistrationInjectedFailureRollsBackEveryTable(t *testing.T) {
 				}
 			}
 
+			var sessionIssuedAt *time.Time
+			if !test.verificationEnabled {
+				sessionIssuedAt = &committedAt
+			}
 			result, err := repository.CommitRegistration(
 				context.Background(),
 				&RegistrationCommit{
-					CommittedAt:  committedAt,
-					User:         user,
-					Profile:      profile,
-					Verification: verification,
+					CommittedAt:     committedAt,
+					SessionIssuedAt: sessionIssuedAt,
+					User:            user,
+					Profile:         profile,
+					Verification:    verification,
 					ExpectedEmailPolicy: &EmailVerificationPolicySnapshot{
 						Enabled: test.verificationEnabled,
 					},
@@ -714,7 +1282,11 @@ func atomicRegistrationTestCommand(
 	email string,
 	verificationEnabled bool,
 ) *RegistrationCommit {
-	committedAt := time.Now().UTC()
+	committedAt := time.Now().UTC().Truncate(time.Microsecond)
+	passwordChangedAt := committedAt
+	if !verificationEnabled {
+		passwordChangedAt = committedAt.Add(-time.Microsecond)
+	}
 	user := &User{
 		Username:          username,
 		Email:             email,
@@ -722,7 +1294,7 @@ func atomicRegistrationTestCommand(
 		PlatformRole:      PlatformRoleMember,
 		Status:            StatusActive,
 		EmailVerified:     !verificationEnabled,
-		PasswordChangedAt: &committedAt,
+		PasswordChangedAt: &passwordChangedAt,
 	}
 	command := &RegistrationCommit{
 		CommittedAt: committedAt,
@@ -745,6 +1317,7 @@ func atomicRegistrationTestCommand(
 	}
 	user.EmailVerifiedAt = &committedAt
 	user.LastLoginAt = &committedAt
+	command.SessionIssuedAt = &committedAt
 	command.BuildSession = registrationSessionBuilderForTest(
 		user,
 		"127.0.0.1",
@@ -883,7 +1456,8 @@ func TestAtomicRegistrationDoesNotMisreportRefreshUniqueConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	committedAt := time.Now().UTC()
+	committedAt := time.Now().UTC().Truncate(time.Microsecond)
+	passwordChangedAt := committedAt.Add(-time.Microsecond)
 	user := &User{
 		Username:          "refresh-conflict-registration",
 		Email:             "refresh-conflict-registration@example.test",
@@ -893,13 +1467,14 @@ func TestAtomicRegistrationDoesNotMisreportRefreshUniqueConflict(t *testing.T) {
 		EmailVerified:     true,
 		EmailVerifiedAt:   &committedAt,
 		LastLoginAt:       &committedAt,
-		PasswordChangedAt: &committedAt,
+		PasswordChangedAt: &passwordChangedAt,
 	}
 	result, err := repository.CommitRegistration(
 		context.Background(),
 		&RegistrationCommit{
-			CommittedAt: committedAt,
-			User:        user,
+			CommittedAt:     committedAt,
+			SessionIssuedAt: &committedAt,
+			User:            user,
 			Profile: &UserProfile{
 				Timezone: "UTC",
 				Language: DefaultProfileLanguage,

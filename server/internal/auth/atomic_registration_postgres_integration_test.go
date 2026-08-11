@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
 	"os"
@@ -173,6 +174,135 @@ func TestPostgresAtomicRegistrationConcurrentDuplicateHasOneCompleteWinner(
 	}
 }
 
+func TestPostgresAtomicRegistrationPrimaryKeyDriftIsNotIdentityConflict(
+	t *testing.T,
+) {
+	fixture := openAtomicRegistrationPostgresFixture(
+		t,
+		"primary_key_drift",
+		boolPointer(false),
+	)
+	blocker := models.User{
+		ID:           1,
+		Username:     "primary-key-blocker",
+		Email:        "primary-key-blocker@example.test",
+		PasswordHash: "primary-key-blocker-hash",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	if err := fixture.owner.Create(&blocker).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.owner.Exec(`
+		SELECT setval(
+			pg_get_serial_sequence('users', 'id'),
+			1,
+			false
+		)
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := fixture.repository.CommitRegistration(
+		context.Background(),
+		atomicRegistrationPostgresCommand(
+			"primary-key-drift-registration",
+			"primary-key-drift-registration@example.test",
+			false,
+		),
+	)
+	if result != nil || err == nil || errors.Is(err, ErrUserExists) {
+		t.Fatalf(
+			"primary-key drift result/error = %+v/%v, want nil/non-identity error",
+			result,
+			err,
+		)
+	}
+	status, _ := registrationFailureHTTPResponse(err)
+	if status == 409 {
+		t.Fatalf("primary-key drift mapped to HTTP 409: %v", err)
+	}
+	for table, want := range map[string]int64{
+		"users":               1,
+		"user_profiles":       0,
+		"email_verifications": 0,
+		"refresh_tokens":      0,
+		"login_histories":     0,
+		"login_attempts":      0,
+		"domain_events":       0,
+		"outbox_deliveries":   0,
+	} {
+		var count int64
+		query := "SELECT COUNT(*) FROM " + fixture.quotedSchema + "." +
+			quoteAtomicRegistrationPostgresIdentifier(table)
+		if err := fixture.admin.Raw(query).Scan(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if count != want {
+			t.Errorf("%s count = %d, want %d", table, count, want)
+		}
+	}
+}
+
+func TestPostgresAtomicRegistrationDuplicateIdentityDoesNotLogSecrets(
+	t *testing.T,
+) {
+	fixture := openAtomicRegistrationPostgresFixture(
+		t,
+		"duplicate_log_safety",
+		boolPointer(false),
+	)
+	var logs bytes.Buffer
+	fixture.runtime.Config.Logger = logger.New(
+		log.New(&logs, "", 0),
+		logger.Config{
+			LogLevel:             logger.Error,
+			Colorful:             false,
+			ParameterizedQueries: false,
+		},
+	)
+	first := atomicRegistrationPostgresCommand(
+		"postgres-duplicate-log-a",
+		"postgres-duplicate-log@example.test",
+		false,
+	)
+	if _, err := fixture.repository.CommitRegistration(
+		context.Background(),
+		first,
+	); err != nil {
+		t.Fatal(err)
+	}
+	second := atomicRegistrationPostgresCommand(
+		"postgres-duplicate-log-b",
+		"postgres-duplicate-log@example.test",
+		false,
+	)
+	second.User.PasswordHash = "postgres-duplicate-password-hash-secret"
+	result, err := fixture.repository.CommitRegistration(
+		context.Background(),
+		second,
+	)
+	if result != nil || !errors.Is(err, ErrUserExists) {
+		t.Fatalf("PostgreSQL duplicate result/error = %+v/%v", result, err)
+	}
+	logged := logs.String()
+	for _, secret := range []string{
+		second.User.Email,
+		second.User.Username,
+		second.User.PasswordHash,
+		"registration-refresh-bearer",
+		"registration-access-bearer",
+	} {
+		if strings.Contains(logged, secret) {
+			t.Fatalf(
+				"PostgreSQL duplicate logs exposed %q: %s",
+				secret,
+				logged,
+			)
+		}
+	}
+}
+
 func TestPostgresAtomicRegistrationPolicyTransitionsSerializeBothOrderings(
 	t *testing.T,
 ) {
@@ -324,7 +454,11 @@ func atomicRegistrationPostgresCommand(
 	email string,
 	verificationEnabled bool,
 ) *RegistrationCommit {
-	committedAt := time.Now().UTC()
+	committedAt := time.Now().UTC().Truncate(time.Microsecond)
+	passwordChangedAt := committedAt
+	if !verificationEnabled {
+		passwordChangedAt = committedAt.Add(-time.Microsecond)
+	}
 	user := &User{
 		Username:          username,
 		Email:             email,
@@ -332,7 +466,7 @@ func atomicRegistrationPostgresCommand(
 		PlatformRole:      PlatformRoleMember,
 		Status:            StatusActive,
 		EmailVerified:     !verificationEnabled,
-		PasswordChangedAt: &committedAt,
+		PasswordChangedAt: &passwordChangedAt,
 	}
 	command := &RegistrationCommit{
 		CommittedAt: committedAt,
@@ -355,6 +489,7 @@ func atomicRegistrationPostgresCommand(
 	}
 	user.EmailVerifiedAt = &committedAt
 	user.LastLoginAt = &committedAt
+	command.SessionIssuedAt = &committedAt
 	command.BuildSession = registrationSessionBuilderForTest(
 		user,
 		"127.0.0.1",
