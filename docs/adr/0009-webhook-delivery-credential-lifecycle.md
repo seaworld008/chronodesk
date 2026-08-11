@@ -15,7 +15,9 @@ leave frozen credentials usable.
 
 Delivery snapshots therefore need a finite lifetime, a monotonic terminal
 state, and a serialization point shared by claim, replay, HTTP gates, cleanup,
-finalize, and emergency revoke.
+finalize, and emergency revoke. A durable dispatch marker must also distinguish
+a claim that is still safe to revoke from one whose external side effect is
+already uncertain.
 
 ## Decision
 
@@ -24,7 +26,9 @@ Each Webhook Outbox delivery uses an immutable
 plus seven days and can never be extended. Ordinary edit, disable, and
 soft-delete affect only future fan-out. Existing snapshots remain deliverable
 until their original deadline. A soft-deleted `WebhookConfig` remains an
-unscoped, project-predicated lifecycle lock anchor.
+unscoped, project-predicated lifecycle lock anchor. Human `PUT` and `DELETE`
+both require a strong `If-Match` value and compare-and-swap the durable admin
+resource version in the same transaction as the mutation.
 
 Emergency revoke is a separate Human command:
 
@@ -34,7 +38,13 @@ It requires an active, exact `project_admin` Membership, `If-Match` against the
 preflight `resource_version`, and `Idempotency-Key`. Platform role never grants
 project authority. The durable version anchor advances in the same transaction
 as every ordinary configuration update or soft-delete, so an ETag read before
-either mutation cannot authorize a later emergency revoke.
+either mutation cannot authorize a later emergency revoke. Exact-admin
+preflight remains available for a live or soft-deleted tombstone and returns
+only `config_id`, status, deletion state and time, emergency-revoked state, and
+`resource_version`. This projection contains no URL or credential and does not
+execute the command; the operator must make a separate irreversible
+confirmation before the POST. A durable emergency-revoked marker is terminal,
+so no later ordinary edit can resurrect the configuration.
 
 The command runs in one project-scoped transaction with this stable lock order:
 
@@ -43,15 +53,38 @@ The command runs in one project-scoped transaction with this stable lock order:
 3. `OutboxDelivery`, ordered by stable ID;
 4. `WebhookDeliverySnapshot`, ordered by stable ID.
 
-The transaction disables the mutable config, changes `pending`, `failed`, and
-`dead` deliveries to `expired`, leaves `succeeded` and already `expired` rows
-unchanged, and reports `processing` rows as in flight because an HTTP request
-that has left the process cannot be recalled. Every snapshot credential that
-has not already been shredded is cleared with reason `revoked`.
+The transaction disables the mutable config and clears all four mutable
+credential fields: `secret`, `previous_secret`,
+`previous_secret_expires_at`, and `access_token`. It changes `pending`,
+`failed`, and `dead` deliveries to `expired`, leaves `succeeded` and already
+`expired` rows unchanged, and shreds every remaining snapshot credential with
+reason `revoked`.
+
+Webhook `processing` rows use `dispatch_started_at` as a three-state protocol:
+
+- `NULL` means legacy or unknown. It is conservatively in flight and cannot be
+  reclaimed automatically.
+- Unix epoch (`1970-01-01T00:00:00Z`) means prepared. A new claim writes this
+  marker; the row can still be revoked or reclaimed when stale.
+- A real timestamp means dispatch authorization committed. The request may be
+  external or in flight, but the marker does not prove that it left the
+  process.
+
+Immediately before calling the HTTP client's `Do`, a short transaction takes
+the config lifecycle lock and compare-and-swaps prepared to a real timestamp.
+That config lock is the linearization barrier between dispatch start and
+emergency revoke. If revoke commits first, the prepared delivery is expired
+and no HTTP call starts. If dispatch start commits first, revoke reports the
+row as in flight and makes no zero-HTTP claim. A worker crash that leaves a
+real timestamp without a terminal transport result is not automatically
+reclaimed or resent; only deadline cleanup closes it. Mixed-version workers
+may leave `NULL`, which retains the same conservative in-flight treatment
+until completion or deadline.
 
 An expiration transition never publishes its parent Domain Event. It also
-never clears an existing `PublishedAt`: another destination may already have
-published the same event, and that immutable history is preserved.
+never sets, clears, or otherwise changes the parent Domain Event's
+`PublishedAt`: another destination may already have published the same event,
+and that immutable history is preserved.
 
 Claim, replay, both HTTP gates, finalize, and cleanup acquire the same
 project/config barrier before delivery and snapshot locks. A revoked snapshot
@@ -66,22 +99,28 @@ URL, credential, envelope, request body, or response body.
 - Emergency revoke is visible, irreversible, and separately authorized.
 - Replay is finite; terminal rows cannot be resurrected and credential
   deadlines cannot move forward.
-- An incident may still have an in-flight request. Operators must use the
-  reported count and the third-party provider's own controls when available.
+- An incident may still have a real or legacy/unknown in-flight request.
+  Operators must use the reported count and the third-party provider's own
+  controls when available; the count is not proof that the request left the
+  process.
 - Logical crypto-shredding prevents future application use but does not
   instantly erase old ciphertext from WAL, replicas, snapshots, backups, or
   storage media. Backup retention and key lifecycle remain separate controls.
-- A rolling deployment must not expose emergency revoke while any old worker
-  lacks the shared config barrier and both HTTP gates.
+- The nullable dispatch marker supports a compatible rolling deployment.
+  Old-worker `NULL` rows remain conservatively in flight and must drain or
+  reach deadline; they must never be backfilled to the prepared epoch. A
+  worker that lacks the shared config barrier and HTTP gates is not compatible
+  with an exposed emergency-revoke endpoint.
 
 ## Verification
 
 Service and PostgreSQL tests cover the status matrix, exact-project
 authorization, cross-project non-disclosure, stable lock ordering, rollback,
-idempotent repeat, claim/replay races, in-flight reporting, and preservation of
+idempotent repeat, the three dispatch-marker states, claim/replay races,
+revoke-first zero HTTP, start-first in-flight reporting, and preservation of
 both nil and pre-existing `PublishedAt`. Handler and Human OpenAPI tests cover
-preflight version, `If-Match`, idempotency, closed responses, and secret-free
-events. Adapter tests use injectable or loopback clients and prove zero HTTP
-after revoke. Web tests cover the exact-admin UI, irreversible confirmation,
-CAS headers, result counts, terminal Chinese projection, and hidden replay for
-expired rows.
+strong `If-Match`, same-transaction CAS, tombstone preflight, idempotency,
+closed responses, and secret-free events. Adapter tests use injectable or
+loopback clients. Web tests cover the exact-admin UI, independent irreversible
+confirmation, CAS headers, result counts, terminal Chinese projection, and
+hidden replay for expired rows.
