@@ -9,6 +9,7 @@ import (
 	"log"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 )
@@ -315,6 +316,15 @@ func TestConfigServiceProtectedConfigsRejectGenericWriteBypasses(
 			Category:    CategorySecurity,
 			Group:       "agent",
 		},
+		{
+			Key:         adminResourceVersionKeyPrefix + "test-anchor",
+			Value:       "webhook/731",
+			ValueType:   "string",
+			Description: "administrator CAS anchor",
+			Category:    CategorySecurity,
+			Group:       "agent-resource-version",
+			Version:     7,
+		},
 	}
 	if err := db.Create(&protected).Error; err != nil {
 		t.Fatalf("seed protected controls: %v", err)
@@ -346,6 +356,7 @@ func TestConfigServiceProtectedConfigsRejectGenericWriteBypasses(
 			KeySystemVersion,
 			KeyAgentGlobalReadOnly,
 			KeyAgentEmergencyStop,
+			adminResourceVersionKeyPrefix + "test-anchor",
 		} {
 			var persisted models.SystemConfig
 			if err := db.Where("key = ?", key).First(&persisted).Error; err != nil {
@@ -357,8 +368,14 @@ func TestConfigServiceProtectedConfigsRejectGenericWriteBypasses(
 				wantValue = "0.2.0"
 				wantValueType = "string"
 			}
+			if key == adminResourceVersionKeyPrefix+"test-anchor" {
+				wantValue = "webhook/731"
+				wantValueType = "string"
+			}
 			if persisted.Value != wantValue ||
-				persisted.ValueType != wantValueType {
+				persisted.ValueType != wantValueType ||
+				(key == adminResourceVersionKeyPrefix+"test-anchor" &&
+					persisted.Version != 7) {
 				t.Fatalf(
 					"protected config %q changed: %+v",
 					key,
@@ -372,6 +389,7 @@ func TestConfigServiceProtectedConfigsRejectGenericWriteBypasses(
 		KeySystemVersion,
 		KeyAgentGlobalReadOnly,
 		KeyAgentEmergencyStop,
+		adminResourceVersionKeyPrefix + "test-anchor",
 	} {
 		t.Run("single-key/"+key, func(t *testing.T) {
 			assertProtected(t, service.ValidateConfig(key, "changed", "string"))
@@ -486,6 +504,21 @@ func TestConfigServiceGenericListAndExportHideProtectedConfigs(t *testing.T) {
 			Category:  CategorySecurity,
 			Group:     "agent",
 		},
+		{
+			Key:       adminResourceVersionKeyPrefix + "list-anchor",
+			Value:     "webhook/731",
+			ValueType: "string",
+			Category:  CategorySecurity,
+			Group:     "agent-resource-version",
+			Version:   9,
+		},
+		{
+			Key:       "agent.resourceXversion.visible",
+			Value:     "ordinary",
+			ValueType: "string",
+			Category:  CategorySecurity,
+			Group:     "visible",
+		},
 	}
 	if err := db.Create(&configs).Error; err != nil {
 		t.Fatalf("seed configs: %v", err)
@@ -505,8 +538,9 @@ func TestConfigServiceGenericListAndExportHideProtectedConfigs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list generic configs: %v", err)
 	}
-	if page.Total != 1 || len(page.Items) != 1 ||
-		page.Items[0].Key != "security.visible" {
+	if page.Total != 2 || len(page.Items) != 2 ||
+		page.Items[0].Key != "agent.resourceXversion.visible" ||
+		page.Items[1].Key != "security.visible" {
 		t.Fatalf("generic list exposed protected controls: %+v", page)
 	}
 
@@ -518,7 +552,9 @@ func TestConfigServiceGenericListAndExportHideProtectedConfigs(t *testing.T) {
 	if err := json.Unmarshal(data, &exported); err != nil {
 		t.Fatalf("decode export: %v", err)
 	}
-	if len(exported) != 1 || exported[0].Key != "security.visible" {
+	if len(exported) != 2 ||
+		exported[0].Key != "agent.resourceXversion.visible" ||
+		exported[1].Key != "security.visible" {
 		t.Fatalf("generic export exposed protected controls: %+v", exported)
 	}
 
@@ -531,6 +567,221 @@ func TestConfigServiceGenericListAndExportHideProtectedConfigs(t *testing.T) {
 	}
 	if len(exported) != 0 {
 		t.Fatalf("system export exposed build identity: %+v", exported)
+	}
+}
+
+func TestConfigServiceGenericGetHidesAdministratorVersionAnchor(
+	t *testing.T,
+) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	const suffix = "generic-get"
+	key := adminResourceVersionKeyPrefix + suffix
+	if err := db.Create(&models.SystemConfig{
+		Key:       key,
+		Value:     "webhook/731",
+		ValueType: "string",
+		Category:  CategorySecurity,
+		Version:   4,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if value, err := NewConfigService(db).GetConfig(key); !errors.Is(err, ErrProtectedSystemConfigKey) || value != "" {
+		t.Fatalf(
+			"generic GET exposed administrator anchor value=%q err=%v",
+			value,
+			err,
+		)
+	}
+}
+
+func TestConfigImportIgnoresClientIdentityAndCannotOverwriteProtectedRows(
+	t *testing.T,
+) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	protected := []models.SystemConfig{
+		{
+			Key:       KeySystemVersion,
+			Value:     "0.2.0",
+			ValueType: "string",
+			Category:  CategorySystem,
+			Version:   11,
+		},
+		{
+			Key:       adminResourceVersionKeyPrefix + "import-anchor",
+			Value:     "webhook/731",
+			ValueType: "string",
+			Category:  CategorySecurity,
+			Version:   12,
+		},
+	}
+	if err := db.Create(&protected).Error; err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal([]models.SystemConfig{
+		{
+			ID:          protected[0].ID,
+			Key:         "system.safe-import-one",
+			Value:       "one",
+			ValueType:   "string",
+			Description: "safe imported config",
+			Category:    CategorySystem,
+			Group:       "import",
+			Version:     999,
+		},
+		{
+			ID:          protected[1].ID,
+			Key:         "system.safe-import-two",
+			Value:       "two",
+			ValueType:   "string",
+			Description: "safe imported config",
+			Category:    CategorySystem,
+			Group:       "import",
+			Version:     999,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewConfigService(db)
+	service.auditLogger = log.New(&bytes.Buffer{}, "", 0)
+	if err := service.ImportConfigs(payload); err != nil {
+		t.Fatalf("import ordinary keys with hostile identities: %v", err)
+	}
+	for index := range protected {
+		var persisted models.SystemConfig
+		if err := db.First(&persisted, protected[index].ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if persisted.Key != protected[index].Key ||
+			persisted.Value != protected[index].Value ||
+			persisted.Version != protected[index].Version {
+			t.Fatalf(
+				"protected row %d changed through import identity: %+v",
+				protected[index].ID,
+				persisted,
+			)
+		}
+	}
+	for _, key := range []string{
+		"system.safe-import-one",
+		"system.safe-import-two",
+	} {
+		var imported models.SystemConfig
+		if err := db.Where("key = ?", key).First(&imported).Error; err != nil {
+			t.Fatalf("load imported key %q: %v", key, err)
+		}
+		if imported.ID == protected[0].ID ||
+			imported.ID == protected[1].ID ||
+			imported.Version == 999 {
+			t.Fatalf(
+				"import trusted client persistence identity for %q: %+v",
+				key,
+				imported,
+			)
+		}
+	}
+}
+
+func TestConfigExportImportRoundTripUpdatesOnlyMutableFields(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.AutoMigrate(&models.SystemConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(
+		2026,
+		time.August,
+		1,
+		8,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	updatedAt := createdAt.Add(time.Hour)
+	owner := uint(71)
+	minValue := 1
+	maxValue := 9
+	config := models.SystemConfig{
+		Key:          "system.roundtrip-safe",
+		Value:        "canonical",
+		ValueType:    "string",
+		Description:  "canonical description",
+		Category:     CategorySystem,
+		Group:        "roundtrip",
+		IsRequired:   true,
+		IsActive:     true,
+		DefaultValue: "default",
+		MinValue:     &minValue,
+		MaxValue:     &maxValue,
+		ValidValues:  `["canonical","default"]`,
+		CreatedAt:    createdAt,
+		UpdatedAt:    updatedAt,
+		UpdatedBy:    &owner,
+		Version:      7,
+	}
+	if err := db.Create(&config).Error; err != nil {
+		t.Fatal(err)
+	}
+	service := NewConfigService(db)
+	service.auditLogger = log.New(&bytes.Buffer{}, "", 0)
+	exported, err := service.ExportConfigs(CategorySystem)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	managedBy := uint(72)
+	serverUpdatedAt := updatedAt.Add(2 * time.Hour)
+	if err := db.Model(&models.SystemConfig{}).
+		Where("id = ?", config.ID).
+		Updates(map[string]any{
+			"value":       "server-drift",
+			"description": "server drift",
+			"version":     42,
+			"updated_by":  managedBy,
+			"updated_at":  serverUpdatedAt,
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ImportConfigs(exported); err != nil {
+		t.Fatalf("round-trip import: %v", err)
+	}
+
+	var restored models.SystemConfig
+	if err := db.First(&restored, config.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if restored.ID != config.ID ||
+		restored.Key != config.Key ||
+		restored.Value != config.Value ||
+		restored.ValueType != config.ValueType ||
+		restored.Description != config.Description ||
+		restored.Category != config.Category ||
+		restored.Group != config.Group ||
+		restored.IsRequired != config.IsRequired ||
+		restored.IsActive != config.IsActive ||
+		restored.DefaultValue != config.DefaultValue ||
+		restored.MinValue == nil ||
+		*restored.MinValue != minValue ||
+		restored.MaxValue == nil ||
+		*restored.MaxValue != maxValue ||
+		restored.ValidValues != config.ValidValues {
+		t.Fatalf("round-trip mutable fields drifted: %+v", restored)
+	}
+	if restored.Version != 42 ||
+		restored.UpdatedBy == nil ||
+		*restored.UpdatedBy != managedBy ||
+		!restored.CreatedAt.Equal(createdAt) ||
+		restored.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf(
+			"round-trip import trusted client persistence identity: %+v",
+			restored,
+		)
 	}
 }
 
@@ -657,6 +908,16 @@ func TestBatchConfigAuditLogsOnlyCommittedChanges(t *testing.T) {
 	var output bytes.Buffer
 	service := NewConfigService(db)
 	service.auditLogger = log.New(&output, "", 0)
+	if err := db.Exec(`
+		CREATE TRIGGER reject_batch_config_conflict
+		BEFORE INSERT ON system_configs
+		WHEN NEW.key = 'system.test.batch-conflict'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected batch conflict');
+		END
+	`).Error; err != nil {
+		t.Fatalf("install batch rollback trigger: %v", err)
+	}
 
 	err := service.BatchUpdateConfigs([]models.SystemConfig{
 		{
@@ -666,7 +927,6 @@ func TestBatchConfigAuditLogsOnlyCommittedChanges(t *testing.T) {
 			Category:  CategorySystem,
 		},
 		{
-			ID:        1,
 			Key:       "system.test.batch-conflict",
 			Value:     "second",
 			ValueType: "string",

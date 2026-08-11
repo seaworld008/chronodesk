@@ -78,6 +78,8 @@ type NotificationService struct {
 	webhookAttemptAuditCancel  context.CancelFunc
 	webhookAttemptAuditWriters chan struct{}
 	webhookAttemptAuditDrops   atomic.Uint64
+	beforeWebhookDispatchStart func(context.Context, WebhookOutboxAttemptClaim)
+	afterWebhookDispatchStart  func(context.Context, WebhookOutboxAttemptClaim)
 }
 
 func withNotificationProjectOperation[T any](
@@ -634,6 +636,21 @@ func (ns *NotificationService) SendWebhookSnapshotOutboxAttemptResult(
 			)
 			return err
 		},
+		func(dispatchContext context.Context) error {
+			if hook := ns.beforeWebhookDispatchStart; hook != nil {
+				hook(dispatchContext, attemptClaim)
+			}
+			if err := ns.beginWebhookOutboxDispatch(
+				dispatchContext,
+				attemptClaim,
+			); err != nil {
+				return err
+			}
+			if hook := ns.afterWebhookDispatchStart; hook != nil {
+				hook(dispatchContext, attemptClaim)
+			}
+			return nil
+		},
 	)
 	return result.withEffectiveDeadline(attemptDeadline)
 }
@@ -739,6 +756,7 @@ func (ns *NotificationService) sendWebhookAttempt(
 		event,
 		true,
 		nil,
+		nil,
 	).Err
 }
 
@@ -753,6 +771,7 @@ func (ns *NotificationService) sendWebhookAttemptResult(
 		event,
 		false,
 		nil,
+		nil,
 	)
 }
 
@@ -762,6 +781,7 @@ func (ns *NotificationService) sendWebhookAttemptResultWithAudit(
 	event *NotificationEvent,
 	waitForAudit bool,
 	beforeDo func(context.Context) error,
+	startDo func(context.Context) error,
 ) OutboxAttemptResult {
 	if config == nil {
 		return OutboxKnownFailure(errors.New("webhook配置不能为空"))
@@ -1026,6 +1046,22 @@ func (ns *NotificationService) sendWebhookAttemptResultWithAudit(
 			nil,
 			waitForAudit,
 		)
+	}
+	if startDo != nil {
+		if err := startDo(ctx); err != nil {
+			log.Status = "failed"
+			log.ErrorMessage = "webhook投递门禁拒绝"
+			return ns.finishWebhookAttempt(
+				ctx,
+				config,
+				log,
+				OutboxKnownFailure(ErrWebhookOutboxAttemptRejected),
+				false,
+				false,
+				nil,
+				waitForAudit,
+			)
+		}
 	}
 
 	// 发送请求

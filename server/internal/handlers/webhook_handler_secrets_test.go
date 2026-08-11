@@ -87,6 +87,12 @@ func TestWebhookHandlerEncryptsCredentialsAtRest(t *testing.T) {
 		strings.Contains(recorder.Body.String(), "external-access-token") {
 		t.Fatal("webhook response leaked credentials")
 	}
+	var createdPayload struct {
+		Data WebhookConfigResponse `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &createdPayload); err != nil {
+		t.Fatal(err)
+	}
 	var stored models.WebhookConfig
 	if err := db.First(&stored).Error; err != nil {
 		t.Fatal(err)
@@ -120,6 +126,13 @@ func TestWebhookHandlerEncryptsCredentialsAtRest(t *testing.T) {
 		}`),
 	)
 	rotationRequest.Header.Set("Content-Type", "application/json")
+	rotationRequest.Header.Set(
+		"If-Match",
+		`"v`+strconv.FormatUint(
+			createdPayload.Data.ResourceVersion,
+			10,
+		)+`"`,
+	)
 	rotationResponse := httptest.NewRecorder()
 	router.ServeHTTP(rotationResponse, rotationRequest)
 	if rotationResponse.Code != http.StatusOK {
@@ -315,7 +328,12 @@ func TestWebhookHandlerEnforcesCanonicalEventsAndTransitionPredicates(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&models.User{}, &models.WebhookConfig{}); err != nil {
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.WebhookConfig{},
+		&models.DomainEvent{},
+		&models.SystemConfig{},
+	); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Create(&models.User{
@@ -381,6 +399,12 @@ func TestWebhookHandlerEnforcesCanonicalEventsAndTransitionPredicates(t *testing
 			createResponse.Body.String(),
 		)
 	}
+	var createdPayload struct {
+		Data WebhookConfigResponse `json:"data"`
+	}
+	if err := json.Unmarshal(createResponse.Body.Bytes(), &createdPayload); err != nil {
+		t.Fatal(err)
+	}
 
 	var stored models.WebhookConfig
 	if err := db.First(&stored).Error; err != nil {
@@ -404,6 +428,13 @@ func TestWebhookHandlerEnforcesCanonicalEventsAndTransitionPredicates(t *testing
 		}`),
 	)
 	removeTransition.Header.Set("Content-Type", "application/json")
+	removeTransition.Header.Set(
+		"If-Match",
+		`"v`+strconv.FormatUint(
+			createdPayload.Data.ResourceVersion,
+			10,
+		)+`"`,
+	)
 	removeResponse := httptest.NewRecorder()
 	router.ServeHTTP(removeResponse, removeTransition)
 	if removeResponse.Code != http.StatusBadRequest {

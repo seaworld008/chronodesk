@@ -199,9 +199,9 @@ func TestWebhookEmergencyRevokeBlocksBothHTTPGates(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if revoke.InFlightDeliveries != 1 ||
+	if revoke.InFlightDeliveries != 0 ||
 		revoke.ShreddedSnapshots != 1 ||
-		revoke.ExpiredDeliveries != 0 {
+		revoke.ExpiredDeliveries != 1 {
 		t.Fatalf("emergency revoke result = %+v", revoke)
 	}
 
@@ -675,7 +675,10 @@ func TestWebhookOutboxConfiguredDeadlineRejectsLateCleanEOF(
 	if finalizeErr != nil {
 		t.Fatalf("finalize late EOF: %v", finalizeErr)
 	}
-	attemptDeadline := <-requestDeadline
+	attemptDeadline := awaitHTTPSecondGateRequestDeadline(
+		t,
+		requestDeadline,
+	)
 	if result.Kind == services.OutboxAttemptKnownSuccess {
 		t.Fatalf(
 			"late EOF at %s returned known success: %+v",
@@ -728,7 +731,10 @@ func TestWebhookOutboxTimelyEOFSucceedsAfterLateFinalize(
 	})
 	workerDeadline := time.Now().Add(time.Minute)
 	result := fixture.deliverAttempt(t, deliverer, workerDeadline)
-	attemptDeadline := <-requestDeadline
+	attemptDeadline := awaitHTTPSecondGateRequestDeadline(
+		t,
+		requestDeadline,
+	)
 	if result.Kind != services.OutboxAttemptKnownSuccess ||
 		result.CompletedAt.IsZero() ||
 		result.CompletedAt.After(attemptDeadline) {
@@ -1071,6 +1077,20 @@ func httpSecondGateNoContentResponse() *http.Response {
 	}
 }
 
+func awaitHTTPSecondGateRequestDeadline(
+	t *testing.T,
+	deadlines <-chan time.Time,
+) time.Time {
+	t.Helper()
+	select {
+	case deadline := <-deadlines:
+		return deadline
+	case <-time.After(time.Second):
+		t.Fatal("HTTP transport did not report its request deadline")
+		return time.Time{}
+	}
+}
+
 func newHTTPSecondGateFixture(
 	t *testing.T,
 	credentialDeadline time.Time,
@@ -1196,12 +1216,13 @@ func newHTTPSecondGateFixture(
 	if err := db.Model(&models.OutboxDelivery{}).
 		Where("id = ?", delivery.ID).
 		Updates(map[string]any{
-			"status":     models.OutboxDeliveryProcessing,
-			"attempts":   1,
-			"locked_at":  lockedAt,
-			"locked_by":  "http-second-gate-worker",
-			"lock_token": lockToken,
-			"expires_at": credentialDeadline,
+			"status":              models.OutboxDeliveryProcessing,
+			"attempts":            1,
+			"locked_at":           lockedAt,
+			"locked_by":           "http-second-gate-worker",
+			"lock_token":          lockToken,
+			"dispatch_started_at": lockedAt,
+			"expires_at":          credentialDeadline,
 		}).Error; err != nil {
 		t.Fatal(err)
 	}

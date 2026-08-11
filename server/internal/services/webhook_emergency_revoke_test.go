@@ -49,10 +49,12 @@ func TestWebhookEmergencyRevokeTransitionsOnlyRevocableDeliveries(
 		switch status {
 		case models.OutboxDeliveryProcessing:
 			lockToken := "019fee69-720c-7023-ae63-fcaf437561b5"
+			startedAt := now.Add(time.Microsecond)
 			updates["attempts"] = 1
 			updates["locked_at"] = now
 			updates["locked_by"] = "already-sending"
 			updates["lock_token"] = lockToken
+			updates["dispatch_started_at"] = startedAt
 		case models.OutboxDeliverySucceeded:
 			deliveredAt := now.Add(-time.Minute)
 			updates["delivered_at"] = deliveredAt
@@ -78,6 +80,39 @@ func TestWebhookEmergencyRevokeTransitionsOnlyRevocableDeliveries(
 			event:    event,
 		}
 	}
+	claimedDelivery, claimedSnapshot, _ := fixture.createIntent(
+		t,
+		"processing-not-dispatched",
+	)
+	claimedToken := "019fee69-720c-7023-ae63-fcaf437561b6"
+	if err := fixture.db.Model(&models.OutboxDelivery{}).
+		Where("id = ?", claimedDelivery.ID).
+		Updates(map[string]any{
+			"status":              models.OutboxDeliveryProcessing,
+			"attempts":            1,
+			"locked_at":           now,
+			"locked_by":           "claimed-not-sending",
+			"lock_token":          claimedToken,
+			"dispatch_started_at": now,
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
+	legacyDelivery, legacySnapshot, _ := fixture.createIntent(
+		t,
+		"legacy-processing-unknown",
+	)
+	legacyToken := "019fee69-720c-7023-ae63-fcaf437561b7"
+	if err := fixture.db.Model(&models.OutboxDelivery{}).
+		Where("id = ?", legacyDelivery.ID).
+		Updates(map[string]any{
+			"status":     models.OutboxDeliveryProcessing,
+			"attempts":   1,
+			"locked_at":  now,
+			"locked_by":  "legacy-worker",
+			"lock_token": legacyToken,
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	// A revoke transition must never rewrite the parent publication history.
 	publishedAt := now.Add(-2 * time.Hour)
@@ -96,9 +131,9 @@ func TestWebhookEmergencyRevokeTransitionsOnlyRevocableDeliveries(
 	}
 	if result.ConfigID != fixture.config.ID ||
 		result.Status != models.WebhookStatusDisabled ||
-		result.ExpiredDeliveries != 3 ||
-		result.InFlightDeliveries != 1 ||
-		result.ShreddedSnapshots != len(rows) {
+		result.ExpiredDeliveries != 4 ||
+		result.InFlightDeliveries != 2 ||
+		result.ShreddedSnapshots != len(rows)+2 {
 		t.Fatalf("emergency revoke result = %+v", result)
 	}
 
@@ -111,7 +146,11 @@ func TestWebhookEmergencyRevokeTransitionsOnlyRevocableDeliveries(
 	}
 	if config.Status != models.WebhookStatusDisabled ||
 		config.UpdatedBy == nil ||
-		*config.UpdatedBy != fixture.config.CreatedBy {
+		*config.UpdatedBy != fixture.config.CreatedBy ||
+		config.Secret != "" ||
+		config.PreviousSecret != "" ||
+		config.PreviousSecretExpiresAt != nil ||
+		config.AccessToken != "" {
 		t.Fatalf("webhook config was not disabled by the Human actor: %+v", config)
 	}
 
@@ -144,7 +183,8 @@ func TestWebhookEmergencyRevokeTransitionsOnlyRevocableDeliveries(
 		case models.OutboxDeliveryProcessing:
 			if delivery.LockedAt == nil ||
 				delivery.LockedBy != "already-sending" ||
-				delivery.LockToken == nil {
+				delivery.LockToken == nil ||
+				delivery.DispatchStartedAt == nil {
 				t.Fatalf("in-flight delivery was recalled: %+v", delivery)
 			}
 		}
@@ -171,6 +211,66 @@ func TestWebhookEmergencyRevokeTransitionsOnlyRevocableDeliveries(
 			models.WebhookCredentialShredReasonRevoked,
 		)
 	}
+	var recalled models.OutboxDelivery
+	if err := fixture.db.First(
+		&recalled,
+		"id = ?",
+		claimedDelivery.ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if recalled.Status != models.OutboxDeliveryExpired ||
+		recalled.LockedAt != nil ||
+		recalled.LockedBy != "" ||
+		recalled.LockToken != nil ||
+		recalled.DispatchStartedAt != nil {
+		t.Fatalf(
+			"processing delivery without dispatch start was not recalled: %+v",
+			recalled,
+		)
+	}
+	var claimedEnvelope models.WebhookDeliverySnapshot
+	if err := fixture.db.First(
+		&claimedEnvelope,
+		"id = ?",
+		claimedSnapshot.ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	assertSnapshotShredded(
+		t,
+		claimedEnvelope,
+		models.WebhookCredentialShredReasonRevoked,
+	)
+	var legacyUnknown models.OutboxDelivery
+	if err := fixture.db.First(
+		&legacyUnknown,
+		"id = ?",
+		legacyDelivery.ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if legacyUnknown.Status != models.OutboxDeliveryProcessing ||
+		legacyUnknown.DispatchStartedAt != nil ||
+		legacyUnknown.LockedBy != "legacy-worker" {
+		t.Fatalf(
+			"legacy/unknown processing delivery was recalled: %+v",
+			legacyUnknown,
+		)
+	}
+	var legacyEnvelope models.WebhookDeliverySnapshot
+	if err := fixture.db.First(
+		&legacyEnvelope,
+		"id = ?",
+		legacySnapshot.ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	assertSnapshotShredded(
+		t,
+		legacyEnvelope,
+		models.WebhookCredentialShredReasonRevoked,
+	)
 
 	var unpublished models.DomainEvent
 	if err := fixture.db.First(
@@ -212,7 +312,7 @@ func TestWebhookEmergencyRevokeTransitionsOnlyRevocableDeliveries(
 	if repeated.ConfigID != fixture.config.ID ||
 		repeated.Status != models.WebhookStatusDisabled ||
 		repeated.ExpiredDeliveries != 0 ||
-		repeated.InFlightDeliveries != 1 ||
+		repeated.InFlightDeliveries != 2 ||
 		repeated.ShreddedSnapshots != 0 {
 		t.Fatalf("repeated emergency revoke = %+v", repeated)
 	}
@@ -366,6 +466,14 @@ func TestWebhookEmergencyRevokeRollsBackEveryMutation(
 		t.Fatal(err)
 	}
 	if config.Status != models.WebhookStatusActive ||
+		config.Secret != fixture.config.Secret ||
+		config.PreviousSecret != fixture.config.PreviousSecret ||
+		config.AccessToken != fixture.config.AccessToken ||
+		config.PreviousSecretExpiresAt == nil ||
+		fixture.config.PreviousSecretExpiresAt == nil ||
+		!config.PreviousSecretExpiresAt.Equal(
+			fixture.config.PreviousSecretExpiresAt.UTC(),
+		) ||
 		delivery.Status != models.OutboxDeliveryPending ||
 		delivery.ExpiredAt != nil ||
 		snapshot.CredentialShreddedAt != nil ||
@@ -377,6 +485,111 @@ func TestWebhookEmergencyRevokeRollsBackEveryMutation(
 			config,
 			delivery,
 			snapshot,
+		)
+	}
+}
+
+func TestEnsureWebhookConfigMutableTxRejectsInvalidInputsWithoutMutation(
+	t *testing.T,
+) {
+	now := time.Date(2026, time.August, 11, 11, 30, 0, 0, time.UTC)
+	fixture := newWebhookOutboxLifecycleFixture(t, now)
+	testCases := []struct {
+		name     string
+		ctx      context.Context
+		tx       *gorm.DB
+		scope    models.ProjectScope
+		configID uint
+		want     error
+	}{
+		{
+			name:     "nil context",
+			tx:       fixture.db,
+			scope:    fixture.scope,
+			configID: fixture.config.ID,
+			want:     ErrInvalidScope,
+		},
+		{
+			name:     "nil transaction",
+			ctx:      context.Background(),
+			scope:    fixture.scope,
+			configID: fixture.config.ID,
+			want:     ErrInvalidScope,
+		},
+		{
+			name:     "missing organization scope",
+			ctx:      context.Background(),
+			tx:       fixture.db,
+			scope:    models.ProjectScope{ProjectID: fixture.scope.ProjectID},
+			configID: fixture.config.ID,
+			want:     ErrInvalidScope,
+		},
+		{
+			name: "missing project scope",
+			ctx:  context.Background(),
+			tx:   fixture.db,
+			scope: models.ProjectScope{
+				OrganizationID: fixture.scope.OrganizationID,
+			},
+			configID: fixture.config.ID,
+			want:     ErrInvalidScope,
+		},
+		{
+			name:     "missing configuration",
+			ctx:      context.Background(),
+			tx:       fixture.db,
+			scope:    fixture.scope,
+			configID: 0,
+			want:     ErrWebhookConfigNotFound,
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := EnsureWebhookConfigMutableTx(
+				testCase.ctx,
+				testCase.tx,
+				testCase.scope,
+				testCase.configID,
+			)
+			if !errors.Is(err, testCase.want) {
+				t.Fatalf(
+					"EnsureWebhookConfigMutableTx() error = %v, want %v",
+					err,
+					testCase.want,
+				)
+			}
+		})
+	}
+
+	var config models.WebhookConfig
+	if err := fixture.db.First(&config, fixture.config.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var terminalEvents int64
+	if err := fixture.db.Model(&models.DomainEvent{}).
+		Where(
+			"organization_id = ? AND project_id = ? AND subject = ? AND type = ?",
+			fixture.scope.OrganizationID,
+			fixture.scope.ProjectID,
+			WebhookAdminSubject(fixture.config.ID),
+			WebhookEmergencyRevokedAdminEventType,
+		).
+		Count(&terminalEvents).Error; err != nil {
+		t.Fatal(err)
+	}
+	if terminalEvents != 0 ||
+		config.Status != fixture.config.Status ||
+		config.Secret != fixture.config.Secret ||
+		config.PreviousSecret != fixture.config.PreviousSecret ||
+		config.PreviousSecretExpiresAt == nil ||
+		!config.PreviousSecretExpiresAt.Equal(
+			fixture.config.PreviousSecretExpiresAt.UTC(),
+		) ||
+		config.AccessToken != fixture.config.AccessToken {
+		t.Fatalf(
+			"invalid terminal guard input mutated config=%+v events=%d",
+			config,
+			terminalEvents,
 		)
 	}
 }

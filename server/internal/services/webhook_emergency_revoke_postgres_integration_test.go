@@ -160,20 +160,22 @@ func TestWebhookEmergencyRevokeSerializesClaimPostgres(t *testing.T) {
 		Role:      models.ProjectRoleAdmin,
 		IsActive:  true,
 	}
+	overlapExpiry := now.Add(time.Hour)
 	webhook := models.WebhookConfig{
-		ID:             2901,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-		OrganizationID: project.OrganizationID,
-		ProjectID:      project.ID,
-		Name:           "PostgreSQL emergency revoke",
-		Provider:       models.WebhookProviderCustom,
-		WebhookURL:     "https://loopback-only.invalid/events",
-		Status:         models.WebhookStatusActive,
-		Secret:         "sealed-current-secret",
-		PreviousSecret: "sealed-previous-secret",
-		AccessToken:    "sealed-access-token",
-		CreatedBy:      user.ID,
+		ID:                      2901,
+		CreatedAt:               now,
+		UpdatedAt:               now,
+		OrganizationID:          project.OrganizationID,
+		ProjectID:               project.ID,
+		Name:                    "PostgreSQL emergency revoke",
+		Provider:                models.WebhookProviderCustom,
+		WebhookURL:              "https://loopback-only.invalid/events",
+		Status:                  models.WebhookStatusActive,
+		Secret:                  "sealed-current-secret",
+		PreviousSecret:          "sealed-previous-secret",
+		PreviousSecretExpiresAt: &overlapExpiry,
+		AccessToken:             "sealed-access-token",
+		CreatedBy:               user.ID,
 	}
 	event := models.DomainEvent{
 		ID:              uuid.NewString(),
@@ -218,26 +220,27 @@ func TestWebhookEmergencyRevokeSerializesClaimPostgres(t *testing.T) {
 		ExpiresAt:       &expiresAt,
 	}
 	snapshot := models.WebhookDeliverySnapshot{
-		ID:                  snapshotUUID.String(),
-		CreatedAt:           now,
-		OrganizationID:      project.OrganizationID,
-		ProjectID:           project.ID,
-		ConfigID:            webhook.ID,
-		EventID:             event.ID,
-		ConfigUpdatedAt:     webhook.UpdatedAt,
-		Provider:            webhook.Provider,
-		WebhookURL:          webhook.WebhookURL,
-		Secret:              webhook.Secret,
-		PreviousSecret:      webhook.PreviousSecret,
-		AccessToken:         webhook.AccessToken,
-		CredentialExpiresAt: expiresAt,
-		EnabledEvents:       `["io.chronodesk.system.alert.v1"]`,
-		MessageFormat:       "markdown",
-		RetryCount:          3,
-		RetryInterval:       60,
-		TimeoutSeconds:      30,
-		RateLimit:           60,
-		RateLimitWindow:     60,
+		ID:                      snapshotUUID.String(),
+		CreatedAt:               now,
+		OrganizationID:          project.OrganizationID,
+		ProjectID:               project.ID,
+		ConfigID:                webhook.ID,
+		EventID:                 event.ID,
+		ConfigUpdatedAt:         webhook.UpdatedAt,
+		Provider:                webhook.Provider,
+		WebhookURL:              webhook.WebhookURL,
+		Secret:                  webhook.Secret,
+		PreviousSecret:          webhook.PreviousSecret,
+		PreviousSecretExpiresAt: webhook.PreviousSecretExpiresAt,
+		AccessToken:             webhook.AccessToken,
+		CredentialExpiresAt:     expiresAt,
+		EnabledEvents:           `["io.chronodesk.system.alert.v1"]`,
+		MessageFormat:           "markdown",
+		RetryCount:              3,
+		RetryInterval:           60,
+		TimeoutSeconds:          30,
+		RateLimit:               60,
+		RateLimitWindow:         60,
 	}
 	if err := setupDB.Transaction(func(tx *gorm.DB) error {
 		for _, row := range []any{
@@ -416,8 +419,8 @@ func TestWebhookEmergencyRevokeSerializesClaimPostgres(t *testing.T) {
 		)
 	}
 	if revokeResult.err != nil ||
-		revokeResult.result.ExpiredDeliveries != 0 ||
-		revokeResult.result.InFlightDeliveries != 1 ||
+		revokeResult.result.ExpiredDeliveries != 1 ||
+		revokeResult.result.InFlightDeliveries != 0 ||
 		revokeResult.result.ShreddedSnapshots != 1 {
 		t.Fatalf(
 			"PostgreSQL revoke result=%+v err=%v",
@@ -455,13 +458,22 @@ func TestWebhookEmergencyRevokeSerializesClaimPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	if currentWebhook.Status != models.WebhookStatusDisabled ||
-		currentDelivery.Status != models.OutboxDeliveryProcessing ||
+		currentWebhook.Secret != "" ||
+		currentWebhook.PreviousSecret != "" ||
+		currentWebhook.PreviousSecretExpiresAt != nil ||
+		currentWebhook.AccessToken != "" ||
+		currentDelivery.Status != models.OutboxDeliveryExpired ||
+		currentDelivery.LockedAt != nil ||
+		currentDelivery.LockedBy != "" ||
+		currentDelivery.LockToken != nil ||
+		currentDelivery.DispatchStartedAt != nil ||
 		currentSnapshot.CredentialShreddedAt == nil ||
 		currentSnapshot.CredentialShredReason == nil ||
 		*currentSnapshot.CredentialShredReason !=
 			models.WebhookCredentialShredReasonRevoked ||
 		currentSnapshot.Secret != "" ||
 		currentSnapshot.PreviousSecret != "" ||
+		currentSnapshot.PreviousSecretExpiresAt != nil ||
 		currentSnapshot.AccessToken != "" ||
 		currentEvent.PublishedAt == nil ||
 		!currentEvent.PublishedAt.Equal(publishedAt) {
@@ -487,7 +499,8 @@ func TestWebhookEmergencyRevokeSerializesClaimPostgres(t *testing.T) {
 			return nil, errors.New("HTTP client creation is forbidden after revoke")
 		}),
 	)
-	claimRef, err := OutboxClaimRefFromDelivery(&currentDelivery)
+	claimedDelivery := claimResult.rows[0]
+	claimRef, err := OutboxClaimRefFromDelivery(claimedDelivery)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,14 +508,14 @@ func TestWebhookEmergencyRevokeSerializesClaimPostgres(t *testing.T) {
 	httpResult := notifications.SendWebhookSnapshotOutboxAttemptResult(
 		workerCtx,
 		WebhookOutboxAttemptClaim{
-			DeliveryID:          currentDelivery.ID,
-			EventID:             currentDelivery.EventID,
+			DeliveryID:          claimedDelivery.ID,
+			EventID:             claimedDelivery.EventID,
 			Scope:               project.Scope(),
 			WorkerID:            claimRef.WorkerID,
 			LockToken:           claimRef.LockToken,
 			LockedAt:            claimRef.LockedAt,
 			AttemptGeneration:   claimRef.Attempts,
-			SnapshotDestination: currentDelivery.DestinationID,
+			SnapshotDestination: claimedDelivery.DestinationID,
 			EffectiveDeadline:   now.Add(time.Minute),
 			CredentialExpiresAt: expiresAt,
 		},

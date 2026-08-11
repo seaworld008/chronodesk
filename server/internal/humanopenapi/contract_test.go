@@ -294,6 +294,240 @@ func TestWebhookEmergencyRevokeContractIsExactAdminCASAndSecretFree(
 	}
 }
 
+func TestWebhookEmergencyPreflightTombstoneAndOrdinaryCASContracts(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	emergencyPath := objectAt(
+		t,
+		paths,
+		"/projects/{projectKey}/admin/agents/webhooks/{webhookID}/emergency-revoke",
+	)
+	preflight := objectAt(t, emergencyPath, "get")
+	if preflight["operationId"] !=
+		"getProjectWebhookEmergencyRevokePreflight" {
+		t.Fatalf("preflight operationId = %v", preflight["operationId"])
+	}
+	assertExactStringArray(
+		t,
+		preflight["x-chronodesk-project-roles"],
+		[]string{"project_admin"},
+	)
+	preflightResponses := objectAt(t, preflight, "responses")
+	preflightOK := objectAt(t, preflightResponses, "200")
+	preflightHeaders := objectAt(t, preflightOK, "headers")
+	if objectAt(t, preflightHeaders, "ETag")["$ref"] !=
+		"#/components/headers/ETag" ||
+		objectAt(
+			t,
+			objectAt(t, preflightHeaders, "Cache-Control"),
+			"schema",
+		)["const"] != "no-store" {
+		t.Fatalf("preflight headers = %+v", preflightHeaders)
+	}
+	preflightSchema := objectAt(
+		t,
+		objectAt(
+			t,
+			objectAt(t, preflightOK, "content"),
+			"application/json",
+		),
+		"schema",
+	)
+	if preflightSchema["$ref"] !=
+		"#/components/schemas/WebhookEmergencyRevokePreflightEnvelope" {
+		t.Fatalf("preflight response schema = %+v", preflightSchema)
+	}
+
+	tombstones := objectAt(
+		t,
+		objectAt(
+			t,
+			paths,
+			"/projects/{projectKey}/admin/agents/webhooks/tombstones",
+		),
+		"get",
+	)
+	if tombstones["operationId"] !=
+		"listProjectWebhookEmergencyTombstones" {
+		t.Fatalf("tombstone operationId = %v", tombstones["operationId"])
+	}
+	assertExactStringArray(
+		t,
+		tombstones["x-chronodesk-project-roles"],
+		[]string{"project_admin"},
+	)
+	if !reflect.DeepEqual(
+		tombstones["x-stable-sort"],
+		[]any{"deleted_at DESC", "id DESC"},
+	) {
+		t.Fatalf("tombstone stable sort = %v", tombstones["x-stable-sort"])
+	}
+	parameters := tombstones["parameters"].([]any)
+	bounds := map[string]map[string]any{}
+	for _, raw := range parameters {
+		parameter := raw.(map[string]any)
+		name, _ := parameter["name"].(string)
+		if name != "" {
+			bounds[name] = objectAt(t, parameter, "schema")
+		}
+	}
+	if bounds["page"]["minimum"] != float64(1) ||
+		bounds["page"]["default"] != float64(1) ||
+		bounds["page_size"]["minimum"] != float64(1) ||
+		bounds["page_size"]["maximum"] != float64(100) ||
+		bounds["page_size"]["default"] != float64(25) {
+		t.Fatalf("tombstone page bounds = %+v", bounds)
+	}
+	tombstoneOK := objectAt(
+		t,
+		objectAt(t, tombstones, "responses"),
+		"200",
+	)
+	tombstoneSchema := objectAt(
+		t,
+		objectAt(
+			t,
+			objectAt(t, tombstoneOK, "content"),
+			"application/json",
+		),
+		"schema",
+	)
+	if tombstoneSchema["$ref"] !=
+		"#/components/schemas/WebhookEmergencyTombstonePageEnvelope" {
+		t.Fatalf("tombstone response schema = %+v", tombstoneSchema)
+	}
+	if objectAt(
+		t,
+		objectAt(
+			t,
+			objectAt(t, tombstoneOK, "headers"),
+			"Cache-Control",
+		),
+		"schema",
+	)["const"] != "no-store" {
+		t.Fatal("tombstone response omits Cache-Control: no-store")
+	}
+
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+	preflightProjection := objectAt(
+		t,
+		schemas,
+		"WebhookEmergencyRevokePreflight",
+	)
+	if preflightProjection["additionalProperties"] != false {
+		t.Fatal("Webhook emergency preflight is not closed")
+	}
+	assertExactObjectKeys(
+		t,
+		objectAt(t, preflightProjection, "properties"),
+		[]string{
+			"config_id",
+			"status",
+			"deleted",
+			"emergency_revoked",
+			"resource_version",
+		},
+	)
+	tombstonePage := objectAt(
+		t,
+		schemas,
+		"WebhookEmergencyTombstonePage",
+	)
+	assertExactObjectKeys(
+		t,
+		objectAt(t, tombstonePage, "properties"),
+		[]string{"items", "total", "page", "page_size", "total_pages"},
+	)
+	items := objectAt(
+		t,
+		objectAt(t, tombstonePage, "properties"),
+		"items",
+	)
+	if items["maxItems"] != float64(100) ||
+		objectAt(t, items, "items")["$ref"] !=
+			"#/components/schemas/WebhookEmergencyRevokePreflight" {
+		t.Fatalf("tombstone items = %+v", items)
+	}
+
+	definition := objectAt(
+		t,
+		paths,
+		"/projects/{projectKey}/webhooks/{webhookID}",
+	)
+	for _, method := range []string{"put", "delete"} {
+		operation := objectAt(t, definition, method)
+		hasIfMatch := false
+		for _, raw := range operation["parameters"].([]any) {
+			parameter := raw.(map[string]any)
+			if parameter["$ref"] ==
+				"#/components/parameters/IfMatch" {
+				hasIfMatch = true
+			}
+		}
+		if !hasIfMatch {
+			t.Errorf("%s Webhook omits If-Match", method)
+		}
+		responses := objectAt(t, operation, "responses")
+		for _, status := range []string{"409", "428"} {
+			if _, ok := responses[status]; !ok {
+				t.Errorf("%s Webhook response %s is missing", method, status)
+			}
+		}
+		successHeaders := objectAt(
+			t,
+			objectAt(t, responses, "200"),
+			"headers",
+		)
+		if objectAt(t, successHeaders, "ETag")["$ref"] !=
+			"#/components/headers/ETag" {
+			t.Errorf("%s Webhook success omits ETag", method)
+		}
+	}
+	problemCode := objectAt(
+		t,
+		objectAt(t, objectAt(t, schemas, "Problem"), "properties"),
+		"code",
+	)
+	codes := problemCode["enum"].([]any)
+	if !slices.Contains(codes, any("webhook_emergency_revoked")) {
+		t.Fatal("Problem.code omits webhook_emergency_revoked")
+	}
+	conflict := objectAt(
+		t,
+		objectAt(
+			t,
+			objectAt(t, document, "components"),
+			"responses",
+		),
+		"AgentAdminAdminConflict",
+	)
+	examples := objectAt(
+		t,
+		objectAt(
+			t,
+			objectAt(t, conflict, "content"),
+			"application/problem+json",
+		),
+		"examples",
+	)
+	terminal := objectAt(
+		t,
+		objectAt(t, examples, "webhook_terminal"),
+		"value",
+	)
+	if terminal["code"] != "webhook_emergency_revoked" ||
+		terminal["status"] != float64(http.StatusConflict) ||
+		terminal["retryable"] != false {
+		t.Fatalf("Webhook terminal conflict example = %+v", terminal)
+	}
+}
+
 func TestBackupCodeRegenerationContractMatchesRuntimeSecurityBoundary(
 	t *testing.T,
 ) {
@@ -2435,6 +2669,14 @@ func TestP1RuntimeDTOFieldsMatchPublishedSchemas(t *testing.T) {
 		{
 			"WebhookEmergencyRevokeResult",
 			services.WebhookEmergencyRevokeResult{},
+		},
+		{
+			"WebhookEmergencyRevokePreflight",
+			services.WebhookEmergencyRevokePreflight{},
+		},
+		{
+			"WebhookEmergencyTombstonePage",
+			services.WebhookEmergencyTombstonePage{},
 		},
 	} {
 		t.Run(test.schemaName, func(t *testing.T) {

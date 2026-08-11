@@ -66,7 +66,8 @@ func applyOutboxClaimEligibility(
 				"AND TRIM(locked_by) <> '' "+
 				"AND TRIM(lock_token) <> '' AND locked_at < ? "+
 				"AND (destination_type <> 'webhook' "+
-				"OR attempts < max_attempts)))",
+				"OR (attempts < max_attempts "+
+				"AND dispatch_started_at = locked_at))))",
 			[]models.OutboxDeliveryStatus{
 				models.OutboxDeliveryPending,
 				models.OutboxDeliveryFailed,
@@ -203,6 +204,7 @@ func buildOutboxWebhookStaleClaimCandidateQuery(
 		"organization_id = ? AND project_id = ? "+
 			"AND destination_type = 'webhook' "+
 			"AND status = 'processing' AND locked_at IS NOT NULL "+
+			"AND dispatch_started_at = locked_at "+
 			"AND expires_at IS NOT NULL "+
 			"AND locked_at < ?",
 		scope.OrganizationID,
@@ -329,6 +331,7 @@ func buildOutboxWebhookStaleEligiblePageQuery(
 			"AND status = 'processing' "+
 			"AND expires_at IS NOT NULL "+
 			"AND locked_at IS NOT NULL "+
+			"AND dispatch_started_at = locked_at "+
 			"AND TRIM(locked_by) <> '' "+
 			"AND TRIM(lock_token) <> '' "+
 			"AND locked_at < ?",
@@ -416,6 +419,14 @@ func applyExactOutboxCandidate(
 	} else {
 		query = query.Where("locked_at = ?", *candidate.LockedAt)
 	}
+	if candidate.DispatchStartedAt == nil {
+		query = query.Where("dispatch_started_at IS NULL")
+	} else {
+		query = query.Where(
+			"dispatch_started_at = ?",
+			candidate.DispatchStartedAt.UTC(),
+		)
+	}
 	if candidate.ExpiresAt == nil {
 		return query.Where("expires_at IS NULL")
 	}
@@ -433,6 +444,10 @@ func transitionExhaustedStaleWebhookCandidate(
 	if candidate == nil ||
 		candidate.DestinationType != "webhook" ||
 		candidate.Status != models.OutboxDeliveryProcessing ||
+		!isWebhookDispatchPrepared(
+			candidate.DispatchStartedAt,
+			candidate.LockedAt,
+		) ||
 		candidate.MaxAttempts <= 0 ||
 		candidate.Attempts < candidate.MaxAttempts ||
 		candidate.ExpiresAt == nil ||
@@ -457,18 +472,20 @@ func transitionExhaustedStaleWebhookCandidate(
 				"AND locked_at IS NOT NULL "+
 				"AND TRIM(locked_by) <> '' "+
 				"AND TRIM(lock_token) <> '' "+
+				"AND dispatch_started_at = locked_at "+
 				"AND locked_at < ?",
 			now,
 			lockCutoff,
 		).
 		Updates(map[string]any{
-			"status":       models.OutboxDeliveryDead,
-			"delivered_at": nil,
-			"locked_at":    nil,
-			"locked_by":    "",
-			"lock_token":   nil,
-			"last_error":   "webhook delivery attempts exhausted",
-			"updated_at":   now,
+			"status":              models.OutboxDeliveryDead,
+			"delivered_at":        nil,
+			"locked_at":           nil,
+			"locked_by":           "",
+			"lock_token":          nil,
+			"dispatch_started_at": nil,
+			"last_error":          "webhook delivery attempts exhausted",
+			"updated_at":          now,
 		})
 	if result.Error != nil {
 		return false, result.Error

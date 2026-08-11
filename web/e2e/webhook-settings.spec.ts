@@ -7,7 +7,14 @@ import {
     installMockSession,
     projectA,
 } from './helpers/mockHumanSession';
-import type { ProjectRole } from '../src/lib/generated/human-api';
+import type {
+    ProjectRole,
+    WebhookConfig,
+    WebhookEmergencyRevokeEnvelope,
+    WebhookEmergencyRevokePreflight,
+    WebhookEmergencyRevokePreflightEnvelope,
+    WebhookEmergencyTombstonePageEnvelope,
+} from '../src/lib/generated/human-api';
 import {
     authenticatePage,
     cleanupE2EData,
@@ -52,16 +59,23 @@ const setOptionSelectionByRenderedText = async (
     }
 };
 
-const mockWebhook = {
+const mockWebhook: WebhookConfig = {
     id: 731,
+    created_at: '2026-07-31T07:30:00Z',
+    updated_at: '2026-07-31T08:00:00Z',
+    organization_id: projectA.organization_id,
+    project_id: projectA.id,
     name: '异步测试 Webhook',
     description: '仅验证浏览器异步入队契约',
     provider: 'custom',
     webhook_url_masked: 'https://webhook.example.test/…',
     has_webhook_url: true,
     status: 'active',
+    enabled_events: '["io.chronodesk.system.alert.v1"]',
     enabled_events_list: ['io.chronodesk.system.alert.v1'],
+    message_template: '',
     filter_rules_obj: { transition_statuses: [] },
+    filter_rules: '{"transition_statuses":[]}',
     message_format: 'markdown',
     retry_count: 0,
     retry_interval: 60,
@@ -69,13 +83,11 @@ const mockWebhook = {
     is_async: true,
     rate_limit: 60,
     rate_limit_window: 60,
-    last_triggered_at: null,
-    last_success_at: null,
-    last_error_at: null,
     last_error: '',
     total_sent: 0,
     total_success: 0,
     total_failed: 0,
+    created_by: 41,
     resource_version: 1,
 };
 
@@ -95,7 +107,13 @@ const installWebhookAsyncMockBackend = async (
     const webhooksPath = `/api/projects/${projectA.key}/webhooks`;
     const emergencyRevokePath =
         `/api/projects/${projectA.key}/admin/agents/webhooks/${mockWebhook.id}/emergency-revoke`;
+    const tombstonesPath =
+        `/api/projects/${projectA.key}/admin/agents/webhooks/tombstones`;
     let testCalls = 0;
+    let deleted = false;
+    let deleteHeaders: Record<string, string> = {};
+    let tombstoneListCalls = 0;
+    let tombstonePreflightCalls = 0;
     let emergencyRevokeCalls = 0;
     let emergencyRevokeHeaders: Record<string, string> = {};
     let deliveryCalls = 0;
@@ -118,13 +136,96 @@ const installWebhookAsyncMockBackend = async (
             await fulfillJSON(route, {
                 code: 0,
                 data: {
-                    items: [mockWebhook],
-                    total: 1,
+                    items: deleted ? [] : [mockWebhook],
+                    total: deleted ? 0 : 1,
                     page: 1,
                     page_size: 25,
                     total_pages: 1,
                 },
             });
+            return;
+        }
+        if (
+            pathname === `${webhooksPath}/${mockWebhook.id}`
+            && request.method() === 'DELETE'
+        ) {
+            deleted = true;
+            deleteHeaders = request.headers();
+            await fulfillJSON(route, {
+                code: 0,
+                msg: '删除成功',
+                data: null,
+            });
+            return;
+        }
+        if (
+            pathname === tombstonesPath
+            && request.method() === 'GET'
+        ) {
+            tombstoneListCalls += 1;
+            const tombstone = {
+                config_id: mockWebhook.id,
+                status: mockWebhook.status,
+                deleted: true,
+                emergency_revoked: emergencyRevokeCalls > 0,
+                resource_version: emergencyRevokeCalls > 0 ? 3 : 2,
+            } satisfies WebhookEmergencyRevokePreflight;
+            const response = {
+                data: {
+                    items: deleted ? [tombstone] : [],
+                    total: deleted ? 1 : 0,
+                    page: 1,
+                    page_size: 25,
+                    total_pages: deleted ? 1 : 0,
+                },
+                meta: {
+                    request_id: 'e2e-webhook-tombstones',
+                },
+            } satisfies WebhookEmergencyTombstonePageEnvelope;
+            expect(Object.keys(tombstone).sort()).toEqual([
+                'config_id',
+                'deleted',
+                'emergency_revoked',
+                'resource_version',
+                'status',
+            ]);
+            expect(JSON.stringify(response)).not.toMatch(
+                /(?:access_token|name|secret|webhook_url)/u,
+            );
+            await fulfillJSON(route, response);
+            return;
+        }
+        if (
+            pathname === emergencyRevokePath
+            && request.method() === 'GET'
+        ) {
+            tombstonePreflightCalls += 1;
+            const preflight = {
+                config_id: mockWebhook.id,
+                status: mockWebhook.status,
+                deleted,
+                emergency_revoked: emergencyRevokeCalls > 0,
+                resource_version: emergencyRevokeCalls > 0
+                    ? 3
+                    : deleted ? 2 : 1,
+            } satisfies WebhookEmergencyRevokePreflight;
+            const response = {
+                data: preflight,
+                meta: {
+                    request_id: 'e2e-webhook-preflight',
+                },
+            } satisfies WebhookEmergencyRevokePreflightEnvelope;
+            expect(Object.keys(preflight).sort()).toEqual([
+                'config_id',
+                'deleted',
+                'emergency_revoked',
+                'resource_version',
+                'status',
+            ]);
+            expect(JSON.stringify(response)).not.toMatch(
+                /(?:access_token|name|secret|webhook_url)/u,
+            );
+            await fulfillJSON(route, response);
             return;
         }
         if (
@@ -232,8 +333,7 @@ const installWebhookAsyncMockBackend = async (
         ) {
             emergencyRevokeCalls += 1;
             emergencyRevokeHeaders = request.headers();
-            await fulfillJSON(route, {
-                code: 0,
+            const response = {
                 data: {
                     config_id: mockWebhook.id,
                     status: 'disabled',
@@ -242,14 +342,23 @@ const installWebhookAsyncMockBackend = async (
                     shredded_snapshots: 4,
                     credential_shred_reason: 'revoked',
                 },
-                receipt: {
-                    event_id: '019fb64a-38ac-7a01-8000-000000000011',
-                    resource_type: 'webhook',
-                    resource_id: String(mockWebhook.id),
-                    resource_version: 2,
-                    occurred_at: '2026-08-11T08:00:00Z',
+                meta: {
+                    request_id: 'e2e-webhook-emergency-revoke',
                 },
-            });
+                receipt: {
+                    operation_id:
+                        '019fb64a-38ac-7a01-8000-000000000010',
+                    event_id: '019fb64a-38ac-7a01-8000-000000000011',
+                    resource_id: String(mockWebhook.id),
+                    resource_version: deleted ? 3 : 2,
+                    changed_fields: [
+                        'status',
+                        'delivery_status',
+                        'snapshot_credentials',
+                    ],
+                },
+            } satisfies WebhookEmergencyRevokeEnvelope;
+            await fulfillJSON(route, response);
             return;
         }
         await fulfillJSON(route, { code: 0, data: [] });
@@ -258,6 +367,10 @@ const installWebhookAsyncMockBackend = async (
     return {
         webhooksPath,
         emergencyRevokePath,
+        tombstonesPath,
+        deleteHeaders: () => deleteHeaders,
+        tombstoneListCalls: () => tombstoneListCalls,
+        tombstonePreflightCalls: () => tombstonePreflightCalls,
         testCalls: () => testCalls,
         emergencyRevokeCalls: () => emergencyRevokeCalls,
         emergencyRevokeHeaders: () => emergencyRevokeHeaders,
@@ -269,6 +382,80 @@ const installWebhookAsyncMockBackend = async (
 };
 
 test.describe('Webhook 测试异步入队浏览器契约（mock）', () => {
+    test('普通删除保留可发现 tombstone，独立确认后才紧急撤销', async ({
+        page,
+    }) => {
+        await installMockSession(
+            page,
+            {
+                ...defaultMockIdentity,
+                sessionID: 'e2e-webhook-tombstone-revoke',
+            },
+            projectA,
+        );
+        const backend = await installWebhookAsyncMockBackend(page, {
+            projectRole: 'project_admin',
+        });
+        await page.goto('/#/webhook-settings');
+
+        const row = page.getByRole('row', { name: /异步测试 Webhook/u });
+        await expect(row).toBeVisible();
+        await row.getByRole('button', {
+            name: '删除 Webhook：异步测试 Webhook',
+        }).click();
+        const deleteDialog = page.getByRole('dialog', {
+            name: '删除 Webhook',
+            exact: true,
+        });
+        await expect(deleteDialog).toContainText(
+            '已经冻结的投递仍会按原凭据继续到期完成',
+        );
+        await deleteDialog.getByRole('button', {
+            name: '确认删除',
+            exact: true,
+        }).click();
+        await expect(row).toHaveCount(0);
+        expect(backend.deleteHeaders()['if-match']).toBe('"v1"');
+        expect(backend.emergencyRevokeCalls()).toBe(0);
+
+        await page
+            .getByTestId('page-header-action')
+            .getByRole('button', { name: '刷新' })
+            .click();
+        const tombstoneRegion = page.getByRole('region', {
+            name: '已删除 Webhook',
+        });
+        await expect(tombstoneRegion).toContainText('Webhook #731');
+        await expect(tombstoneRegion).not.toContainText('异步测试 Webhook');
+        expect(backend.tombstoneListCalls()).toBeGreaterThan(0);
+        await tombstoneRegion.getByRole('button', {
+            name: '紧急撤销已删除 Webhook：#731',
+        }).click();
+        expect(backend.tombstonePreflightCalls()).toBe(1);
+        expect(backend.emergencyRevokeCalls()).toBe(0);
+
+        const confirmation = page.getByRole('dialog', {
+            name: '紧急撤销 Webhook',
+            exact: true,
+        });
+        await expect(confirmation).toContainText('不可逆');
+        await confirmation.getByRole('button', {
+            name: '确认紧急撤销',
+            exact: true,
+        }).click();
+        await expect(
+            page.getByText(
+                '紧急撤销完成：3 条投递已过期，4 份凭据已粉碎；仍有 1 条投递正在执行，无法召回',
+            ),
+        ).toBeVisible();
+        expect(backend.emergencyRevokeCalls()).toBe(1);
+        expect(backend.emergencyRevokeHeaders()['if-match']).toBe('"v2"');
+        await expect(tombstoneRegion).toContainText('已紧急撤销');
+        await expect(tombstoneRegion.getByRole('button', {
+            name: '紧急撤销已删除 Webhook：#731',
+        })).toHaveCount(0);
+    });
+
     test('紧急撤销仅限项目管理员并发送 CAS 与幂等前置条件', async ({
         page,
     }) => {
@@ -290,6 +477,8 @@ test.describe('Webhook 测试异步入队浏览器契约（mock）', () => {
         await row.getByRole('button', {
             name: '紧急撤销 Webhook：异步测试 Webhook',
         }).click();
+        expect(backend.tombstonePreflightCalls()).toBe(1);
+        expect(backend.emergencyRevokeCalls()).toBe(0);
 
         const confirmation = page.getByRole('dialog', {
             name: '紧急撤销 Webhook',
@@ -299,13 +488,16 @@ test.describe('Webhook 测试异步入队浏览器契约（mock）', () => {
             '普通停用或删除不会撤回已经冻结的投递',
         );
         await expect(confirmation).toContainText(
-            '待处理、失败和终止的投递会立即过期',
+            '待处理、失败、死信以及可确定尚未开始的投递立即过期',
         );
         await expect(confirmation).toContainText(
-            '投递中的请求无法召回',
+            '已提交发送授权的投递',
         );
         await expect(confirmation).toContainText(
-            '凭据将被不可逆粉碎',
+            '无法确认是否已开始的投递',
+        );
+        await expect(confirmation).toContainText(
+            '不可逆粉碎所有尚未终止的快照凭据',
         );
 
         const responsePromise = page.waitForResponse(
@@ -344,7 +536,7 @@ test.describe('Webhook 测试异步入队浏览器契约（mock）', () => {
             },
             projectA,
         );
-        await installWebhookAsyncMockBackend(page, {
+        const backend = await installWebhookAsyncMockBackend(page, {
             projectRole: 'manager',
         });
         await page.goto('/#/webhook-settings');
@@ -353,6 +545,9 @@ test.describe('Webhook 测试异步入队浏览器契约（mock）', () => {
         await expect(row.getByRole('button', {
             name: '紧急撤销 Webhook：异步测试 Webhook',
         })).toHaveCount(0);
+        expect(backend.tombstoneListCalls()).toBe(0);
+        expect(backend.tombstonePreflightCalls()).toBe(0);
+        expect(backend.emergencyRevokeCalls()).toBe(0);
     });
 
     test('HTTP 202 queued receipt 只提示已入队并等待投递结果', async ({

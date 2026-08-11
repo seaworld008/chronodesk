@@ -17,6 +17,479 @@ import (
 	"gorm.io/datatypes"
 )
 
+func TestWebhookOrdinaryMutationsRequireCurrentIfMatch(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		method string
+		body   string
+	}{
+		{
+			name:   "update",
+			method: http.MethodPut,
+			body:   `{"description":"must not bypass CAS"}`,
+		},
+		{
+			name:   "delete",
+			method: http.MethodDelete,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newAdminContractFixture(t)
+			config := seedAdminWebhookCASConfig(
+				t,
+				fixture,
+				"missing-if-match-"+test.name,
+			)
+			router := newAdminWebhookEmergencyCASRouter(t, fixture)
+			response := performAdminWebhookCASRequest(
+				router,
+				test.method,
+				"/api/projects/TEST/webhooks/"+uintString(config.ID),
+				test.body,
+				"webhook-cas-missing-if-match-"+test.name,
+			)
+			if response.Code != http.StatusPreconditionRequired ||
+				!strings.Contains(
+					response.Body.String(),
+					"precondition_required",
+				) {
+				t.Fatalf(
+					"%s without If-Match status=%d body=%s",
+					test.method,
+					response.Code,
+					response.Body.String(),
+				)
+			}
+		})
+	}
+}
+
+func TestWebhookEmergencyRevokeTombstonePreflightAfterDelete(
+	t *testing.T,
+) {
+	fixture := newAdminContractFixture(t)
+	config := seedAdminWebhookCASConfig(t, fixture, "tombstone-preflight")
+	router := newAdminWebhookEmergencyCASRouter(t, fixture)
+	definitionPath := "/api/projects/TEST/webhooks/" + uintString(config.ID)
+	initial := getAdminWebhookResourceVersion(t, router, definitionPath)
+
+	deleted := performAdminWebhookCASRequestWithIfMatch(
+		router,
+		http.MethodDelete,
+		definitionPath,
+		"",
+		"webhook-tombstone-delete",
+		httpcontract.FormatETag(initial),
+	)
+	if deleted.Code != http.StatusOK {
+		t.Fatalf(
+			"ordinary delete status=%d body=%s",
+			deleted.Code,
+			deleted.Body.String(),
+		)
+	}
+
+	preflightPath := "/api/projects/TEST/admin/agents/webhooks/" +
+		uintString(config.ID) + "/emergency-revoke"
+	preflight := performAdminWebhookCASRequest(
+		router,
+		http.MethodGet,
+		preflightPath,
+		"",
+		"webhook-tombstone-preflight",
+	)
+	if preflight.Code != http.StatusOK ||
+		preflight.Header().Get("ETag") !=
+			httpcontract.FormatETag(initial+1) ||
+		preflight.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf(
+			"tombstone preflight status=%d ETag=%q cache=%q body=%s",
+			preflight.Code,
+			preflight.Header().Get("ETag"),
+			preflight.Header().Get("Cache-Control"),
+			preflight.Body.String(),
+		)
+	}
+	var envelope struct {
+		Data struct {
+			ConfigID         uint   `json:"config_id"`
+			Status           string `json:"status"`
+			Deleted          bool   `json:"deleted"`
+			EmergencyRevoked bool   `json:"emergency_revoked"`
+			ResourceVersion  uint64 `json:"resource_version"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(preflight.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Data.ConfigID != config.ID ||
+		envelope.Data.Status != string(models.WebhookStatusActive) ||
+		!envelope.Data.Deleted ||
+		envelope.Data.EmergencyRevoked ||
+		envelope.Data.ResourceVersion != initial+1 {
+		t.Fatalf("unexpected tombstone preflight: %+v", envelope.Data)
+	}
+	assertAdminWebhookEmergencyOutputSafe(
+		t,
+		preflight.Body.String()+preflight.Header().Get("ETag"),
+	)
+	if strings.Contains(
+		preflight.Body.String(),
+		"cas.invalid.example",
+	) {
+		t.Fatalf("tombstone preflight leaked URL: %s", preflight.Body.String())
+	}
+	listPath := "/api/projects/TEST/admin/agents/webhooks/tombstones" +
+		"?page=1&page_size=25"
+	listed := performAdminWebhookCASRequest(
+		router,
+		http.MethodGet,
+		listPath,
+		"",
+		"webhook-tombstone-list",
+	)
+	if listed.Code != http.StatusOK ||
+		listed.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf(
+			"tombstone list status=%d cache=%q body=%s",
+			listed.Code,
+			listed.Header().Get("Cache-Control"),
+			listed.Body.String(),
+		)
+	}
+	var tombstones struct {
+		Data services.WebhookEmergencyTombstonePage `json:"data"`
+	}
+	if err := json.Unmarshal(listed.Body.Bytes(), &tombstones); err != nil {
+		t.Fatal(err)
+	}
+	if tombstones.Data.Total != 1 ||
+		len(tombstones.Data.Items) != 1 ||
+		tombstones.Data.Items[0].ConfigID != config.ID ||
+		!tombstones.Data.Items[0].Deleted ||
+		tombstones.Data.Items[0].EmergencyRevoked ||
+		tombstones.Data.Items[0].ResourceVersion != initial+1 {
+		t.Fatalf("unexpected tombstone list: %+v", tombstones.Data)
+	}
+	assertAdminWebhookEmergencyOutputSafe(t, listed.Body.String())
+
+	revoked := performAdminContractRequest(
+		router,
+		http.MethodPost,
+		preflightPath,
+		"",
+		"webhook-tombstone-revoke",
+		preflight.Header().Get("ETag"),
+		"webhook-tombstone-revoke",
+	)
+	if revoked.Code != http.StatusOK ||
+		revoked.Header().Get("ETag") !=
+			httpcontract.FormatETag(initial+2) {
+		t.Fatalf(
+			"tombstone revoke status=%d ETag=%q body=%s",
+			revoked.Code,
+			revoked.Header().Get("ETag"),
+			revoked.Body.String(),
+		)
+	}
+	terminal := performAdminWebhookCASRequest(
+		router,
+		http.MethodGet,
+		listPath,
+		"",
+		"webhook-tombstone-list-terminal",
+	)
+	if terminal.Code != http.StatusOK {
+		t.Fatalf(
+			"terminal tombstone list status=%d body=%s",
+			terminal.Code,
+			terminal.Body.String(),
+		)
+	}
+	if err := json.Unmarshal(terminal.Body.Bytes(), &tombstones); err != nil {
+		t.Fatal(err)
+	}
+	if len(tombstones.Data.Items) != 1 ||
+		!tombstones.Data.Items[0].EmergencyRevoked ||
+		tombstones.Data.Items[0].ResourceVersion != initial+2 {
+		t.Fatalf("terminal tombstone list = %+v", tombstones.Data)
+	}
+}
+
+func TestWebhookEmergencyTombstonesAreBoundedScopedAndExact(
+	t *testing.T,
+) {
+	fixture := newAdminContractFixture(t)
+	router := newAdminWebhookEmergencyCASRouter(t, fixture)
+	base := time.Date(
+		2026,
+		time.August,
+		11,
+		15,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	ids := make([]uint, 0, 3)
+	for index := 0; index < 3; index++ {
+		config := seedAdminWebhookCASConfig(
+			t,
+			fixture,
+			"directory-"+strconv.Itoa(index),
+		)
+		deletedAt := base.Add(time.Duration(index) * time.Minute)
+		if err := fixture.db.Model(&models.WebhookConfig{}).
+			Where("id = ?", config.ID).
+			Update("deleted_at", deletedAt).Error; err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, config.ID)
+	}
+
+	otherProject := fixture.project
+	otherProject.ID = 0
+	otherProject.PublicID = ""
+	otherProject.Key = models.ProjectKey("OTHER")
+	otherProject.Name = "Other project"
+	if err := fixture.db.Create(&otherProject).Error; err != nil {
+		t.Fatal(err)
+	}
+	crossProject := models.WebhookConfig{
+		OrganizationID: fixture.scope.OrganizationID,
+		ProjectID:      otherProject.ID,
+		Name:           "must never appear",
+		Provider:       models.WebhookProviderCustom,
+		WebhookURL:     "https://cross-project.invalid.example/secret",
+		Secret:         "cross-project-secret",
+		Status:         models.WebhookStatusActive,
+		CreatedBy:      fixture.admin.ID,
+	}
+	if err := fixture.db.Create(&crossProject).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.db.Delete(&crossProject).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	type pageEnvelope struct {
+		Data struct {
+			Items      []map[string]any `json:"items"`
+			Total      int64            `json:"total"`
+			Page       int              `json:"page"`
+			PageSize   int              `json:"page_size"`
+			TotalPages int              `json:"total_pages"`
+		} `json:"data"`
+	}
+	load := func(page int) pageEnvelope {
+		t.Helper()
+		response := performAdminWebhookCASRequest(
+			router,
+			http.MethodGet,
+			"/api/projects/TEST/admin/agents/webhooks/tombstones"+
+				"?page="+strconv.Itoa(page)+"&page_size=2",
+			"",
+			"webhook-tombstone-page-"+strconv.Itoa(page),
+		)
+		if response.Code != http.StatusOK ||
+			response.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf(
+				"page %d status=%d cache=%q body=%s",
+				page,
+				response.Code,
+				response.Header().Get("Cache-Control"),
+				response.Body.String(),
+			)
+		}
+		assertAdminWebhookEmergencyOutputSafe(t, response.Body.String())
+		var envelope pageEnvelope
+		if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range envelope.Data.Items {
+			wantKeys := map[string]struct{}{
+				"config_id":         {},
+				"status":            {},
+				"deleted":           {},
+				"emergency_revoked": {},
+				"resource_version":  {},
+			}
+			if len(item) != len(wantKeys) {
+				t.Fatalf("tombstone keys = %v", item)
+			}
+			for key := range item {
+				if _, ok := wantKeys[key]; !ok {
+					t.Fatalf("unexpected tombstone field %q: %v", key, item)
+				}
+			}
+		}
+		return envelope
+	}
+	first := load(1)
+	second := load(2)
+	if first.Data.Total != 3 ||
+		first.Data.Page != 1 ||
+		first.Data.PageSize != 2 ||
+		first.Data.TotalPages != 2 ||
+		len(first.Data.Items) != 2 ||
+		uint(first.Data.Items[0]["config_id"].(float64)) != ids[2] ||
+		uint(first.Data.Items[1]["config_id"].(float64)) != ids[1] {
+		t.Fatalf("first tombstone page = %+v", first.Data)
+	}
+	if second.Data.Total != 3 ||
+		second.Data.Page != 2 ||
+		second.Data.PageSize != 2 ||
+		second.Data.TotalPages != 2 ||
+		len(second.Data.Items) != 1 ||
+		uint(second.Data.Items[0]["config_id"].(float64)) != ids[0] {
+		t.Fatalf("second tombstone page = %+v", second.Data)
+	}
+	for _, rawQuery := range []string{
+		"page=1&page_size=101",
+		"page=1&page_size=2&unknown=true",
+	} {
+		response := performAdminWebhookCASRequest(
+			router,
+			http.MethodGet,
+			"/api/projects/TEST/admin/agents/webhooks/tombstones?"+
+				rawQuery,
+			"",
+			"webhook-tombstone-invalid",
+		)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf(
+				"invalid query %q status=%d body=%s",
+				rawQuery,
+				response.Code,
+				response.Body.String(),
+			)
+		}
+	}
+
+	if err := fixture.db.Model(&models.ProjectMembership{}).
+		Where(
+			"project_id = ? AND user_id = ?",
+			fixture.project.ID,
+			fixture.admin.ID,
+		).
+		Update("role", models.ProjectRoleManager).Error; err != nil {
+		t.Fatal(err)
+	}
+	forbidden := performAdminWebhookCASRequest(
+		router,
+		http.MethodGet,
+		"/api/projects/TEST/admin/agents/webhooks/tombstones",
+		"",
+		"webhook-tombstone-manager",
+	)
+	if forbidden.Code != http.StatusForbidden {
+		t.Fatalf(
+			"manager tombstones status=%d body=%s",
+			forbidden.Code,
+			forbidden.Body.String(),
+		)
+	}
+}
+
+func TestWebhookManagerCannotReactivateEmergencyRevokedConfig(
+	t *testing.T,
+) {
+	fixture := newAdminContractFixture(t)
+	config := seedAdminWebhookCASConfig(t, fixture, "terminal-revoke")
+	router := newAdminWebhookEmergencyCASRouter(t, fixture)
+	definitionPath := "/api/projects/TEST/webhooks/" + uintString(config.ID)
+	initial := getAdminWebhookResourceVersion(t, router, definitionPath)
+	revokePath := "/api/projects/TEST/admin/agents/webhooks/" +
+		uintString(config.ID) + "/emergency-revoke"
+	revoked := performAdminContractRequest(
+		router,
+		http.MethodPost,
+		revokePath,
+		"",
+		"webhook-terminal-revoke",
+		httpcontract.FormatETag(initial),
+		"webhook-terminal-revoke",
+	)
+	if revoked.Code != http.StatusOK {
+		t.Fatalf("emergency revoke status=%d body=%s", revoked.Code, revoked.Body.String())
+	}
+	if err := fixture.db.Model(&models.ProjectMembership{}).
+		Where(
+			"project_id = ? AND user_id = ?",
+			fixture.project.ID,
+			fixture.admin.ID,
+		).
+		Update("role", models.ProjectRoleManager).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Rebuild every service/router object so the terminal decision must come
+	// from the durable emergency event rather than process-local state.
+	router = newAdminWebhookEmergencyCASRouter(t, fixture)
+	current := getAdminWebhookResourceVersion(t, router, definitionPath)
+	if current != initial+1 {
+		t.Fatalf(
+			"resource version after restart = %d, want %d",
+			current,
+			initial+1,
+		)
+	}
+
+	update := performAdminWebhookCASRequestWithIfMatch(
+		router,
+		http.MethodPut,
+		definitionPath,
+		`{"status":"active"}`,
+		"webhook-terminal-manager-reactivate",
+		httpcontract.FormatETag(current),
+	)
+	if update.Code != http.StatusConflict ||
+		!strings.Contains(
+			update.Body.String(),
+			"webhook_emergency_revoked",
+		) ||
+		strings.Contains(update.Body.String(), `"retryable":true`) {
+		t.Fatalf(
+			"manager reactivation status=%d body=%s",
+			update.Code,
+			update.Body.String(),
+		)
+	}
+	var stored models.WebhookConfig
+	if err := fixture.db.Unscoped().First(&stored, config.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != models.WebhookStatusDisabled {
+		t.Fatalf("manager counteracted emergency revoke: %+v", stored)
+	}
+	if stored.Secret != "" ||
+		stored.PreviousSecret != "" ||
+		stored.PreviousSecretExpiresAt != nil ||
+		stored.AccessToken != "" {
+		t.Fatalf("terminal update restored credential material: %+v", stored)
+	}
+	after := getAdminWebhookResourceVersion(t, router, definitionPath)
+	if after != current {
+		t.Fatalf(
+			"terminal update advanced version from %d to %d",
+			current,
+			after,
+		)
+	}
+	var eventCount int64
+	if err := fixture.db.Model(&models.DomainEvent{}).
+		Where(
+			"subject = ? AND type = ?",
+			services.WebhookAdminSubject(config.ID),
+			services.WebhookEmergencyRevokedAdminEventType,
+		).
+		Count(&eventCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 1 {
+		t.Fatalf("terminal update changed emergency event count = %d", eventCount)
+	}
+}
+
 func TestWebhookEmergencyRevokeRejectsVersionBeforeOrdinaryUpdate(
 	t *testing.T,
 ) {
@@ -25,15 +498,20 @@ func TestWebhookEmergencyRevokeRejectsVersionBeforeOrdinaryUpdate(
 	router := newAdminWebhookEmergencyCASRouter(t, fixture)
 	path := "/api/projects/TEST/webhooks/" + uintString(config.ID)
 	initial := getAdminWebhookResourceVersion(t, router, path)
-	update := performAdminWebhookCASRequest(
+	update := performAdminWebhookCASRequestWithIfMatch(
 		router,
 		http.MethodPut,
 		path,
 		`{"description":"ordinary update advanced the version"}`,
 		"webhook-cas-put",
+		httpcontract.FormatETag(initial),
 	)
 	if update.Code != http.StatusOK {
 		t.Fatalf("ordinary update status=%d body=%s", update.Code, update.Body.String())
+	}
+	if update.Header().Get("ETag") !=
+		httpcontract.FormatETag(initial+1) {
+		t.Fatalf("ordinary update ETag = %q", update.Header().Get("ETag"))
 	}
 
 	stale := performAdminContractRequest(
@@ -66,12 +544,13 @@ func TestWebhookEmergencyRevokeRejectsVersionBeforeOrdinaryDelete(
 	router := newAdminWebhookEmergencyCASRouter(t, fixture)
 	path := "/api/projects/TEST/webhooks/" + uintString(config.ID)
 	initial := getAdminWebhookResourceVersion(t, router, path)
-	deleted := performAdminWebhookCASRequest(
+	deleted := performAdminWebhookCASRequestWithIfMatch(
 		router,
 		http.MethodDelete,
 		path,
 		"",
 		"webhook-cas-delete",
+		httpcontract.FormatETag(initial),
 	)
 	if deleted.Code != http.StatusOK {
 		t.Fatalf(
@@ -79,6 +558,10 @@ func TestWebhookEmergencyRevokeRejectsVersionBeforeOrdinaryDelete(
 			deleted.Code,
 			deleted.Body.String(),
 		)
+	}
+	if deleted.Header().Get("ETag") !=
+		httpcontract.FormatETag(initial+1) {
+		t.Fatalf("ordinary delete ETag = %q", deleted.Header().Get("ETag"))
 	}
 
 	stale := performAdminContractRequest(
@@ -103,6 +586,110 @@ func TestWebhookEmergencyRevokeRejectsVersionBeforeOrdinaryDelete(
 	}
 }
 
+func TestWebhookOrdinaryMutationsRejectStaleIfMatchWithoutWrites(
+	t *testing.T,
+) {
+	for _, losingMethod := range []string{
+		http.MethodPut,
+		http.MethodDelete,
+	} {
+		t.Run(losingMethod, func(t *testing.T) {
+			fixture := newAdminContractFixture(t)
+			config := seedAdminWebhookCASConfig(
+				t,
+				fixture,
+				"ordinary-stale-"+strings.ToLower(losingMethod),
+			)
+			router := newAdminWebhookEmergencyCASRouter(t, fixture)
+			path := "/api/projects/TEST/webhooks/" +
+				uintString(config.ID)
+			initial := getAdminWebhookResourceVersion(t, router, path)
+			winner := performAdminWebhookCASRequestWithIfMatch(
+				router,
+				http.MethodPut,
+				path,
+				`{"description":"winning generation"}`,
+				"webhook-ordinary-cas-winner",
+				httpcontract.FormatETag(initial),
+			)
+			if winner.Code != http.StatusOK ||
+				winner.Header().Get("ETag") !=
+					httpcontract.FormatETag(initial+1) {
+				t.Fatalf(
+					"winner status=%d ETag=%q body=%s",
+					winner.Code,
+					winner.Header().Get("ETag"),
+					winner.Body.String(),
+				)
+			}
+			body := ""
+			if losingMethod == http.MethodPut {
+				body = `{"description":"must not commit"}`
+			}
+			stale := performAdminWebhookCASRequestWithIfMatch(
+				router,
+				losingMethod,
+				path,
+				body,
+				"webhook-ordinary-cas-stale",
+				httpcontract.FormatETag(initial),
+			)
+			if stale.Code != http.StatusConflict ||
+				stale.Header().Get("ETag") !=
+					httpcontract.FormatETag(initial+1) ||
+				!strings.Contains(
+					stale.Body.String(),
+					ProblemVersionConflict,
+				) {
+				t.Fatalf(
+					"stale %s status=%d ETag=%q body=%s",
+					losingMethod,
+					stale.Code,
+					stale.Header().Get("ETag"),
+					stale.Body.String(),
+				)
+			}
+			var stored models.WebhookConfig
+			if err := fixture.db.Unscoped().First(
+				&stored,
+				config.ID,
+			).Error; err != nil {
+				t.Fatal(err)
+			}
+			if stored.DeletedAt.Valid ||
+				stored.Description != "winning generation" {
+				t.Fatalf("stale mutation changed config: %+v", stored)
+			}
+			if current := getAdminWebhookResourceVersion(
+				t,
+				router,
+				path,
+			); current != initial+1 {
+				t.Fatalf(
+					"stale mutation advanced version to %d",
+					current,
+				)
+			}
+			var emergencyEvents int64
+			if err := fixture.db.Model(&models.DomainEvent{}).
+				Where(
+					"subject = ? AND type = ?",
+					services.WebhookAdminSubject(config.ID),
+					services.WebhookEmergencyRevokedAdminEventType,
+				).
+				Count(&emergencyEvents).Error; err != nil {
+				t.Fatal(err)
+			}
+			if emergencyEvents != 0 {
+				t.Fatalf(
+					"stale ordinary mutation created %d emergency events",
+					emergencyEvents,
+				)
+			}
+		})
+	}
+}
+
 func TestWebhookEmergencyRevokeUsesCurrentConfigVersionAndExactReplay(
 	t *testing.T,
 ) {
@@ -111,12 +698,13 @@ func TestWebhookEmergencyRevokeUsesCurrentConfigVersionAndExactReplay(
 	router := newAdminWebhookEmergencyCASRouter(t, fixture)
 	path := "/api/projects/TEST/webhooks/" + uintString(config.ID)
 	initial := getAdminWebhookResourceVersion(t, router, path)
-	update := performAdminWebhookCASRequest(
+	update := performAdminWebhookCASRequestWithIfMatch(
 		router,
 		http.MethodPut,
 		path,
 		`{"description":"advance before legal revoke"}`,
 		"webhook-cas-current-put",
+		httpcontract.FormatETag(initial),
 	)
 	if update.Code != http.StatusOK {
 		t.Fatalf("ordinary update status=%d body=%s", update.Code, update.Body.String())
@@ -448,6 +1036,23 @@ func performAdminWebhookCASRequest(
 	request := httptest.NewRequest(method, path, strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Request-ID", requestID)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	return response
+}
+
+func performAdminWebhookCASRequestWithIfMatch(
+	router *gin.Engine,
+	method string,
+	path string,
+	body string,
+	requestID string,
+	ifMatch string,
+) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Request-ID", requestID)
+	request.Header.Set("If-Match", ifMatch)
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
 	return response

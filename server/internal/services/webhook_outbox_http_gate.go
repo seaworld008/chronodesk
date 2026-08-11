@@ -76,6 +76,22 @@ func (ns *NotificationService) validateWebhookOutboxAttemptGate(
 	ctx context.Context,
 	claim WebhookOutboxAttemptClaim,
 ) (webhookOutboxGateState, error) {
+	return ns.webhookOutboxAttemptGate(ctx, claim, false)
+}
+
+func (ns *NotificationService) beginWebhookOutboxDispatch(
+	ctx context.Context,
+	claim WebhookOutboxAttemptClaim,
+) error {
+	_, err := ns.webhookOutboxAttemptGate(ctx, claim, true)
+	return err
+}
+
+func (ns *NotificationService) webhookOutboxAttemptGate(
+	ctx context.Context,
+	claim WebhookOutboxAttemptClaim,
+	startDispatch bool,
+) (webhookOutboxGateState, error) {
 	if ns == nil || ns.db == nil || ctx == nil {
 		return webhookOutboxGateState{},
 			ErrWebhookOutboxAttemptRejected
@@ -131,6 +147,10 @@ func (ns *NotificationService) validateWebhookOutboxAttemptGate(
 						delivery.ExpiresAt == nil ||
 						!delivery.ExpiresAt.UTC().Equal(
 							claim.CredentialExpiresAt.UTC(),
+						) ||
+						!isWebhookDispatchPrepared(
+							delivery.DispatchStartedAt,
+							delivery.LockedAt,
 						) {
 						return ErrWebhookOutboxLifecycleInvariant
 					}
@@ -163,6 +183,46 @@ func (ns *NotificationService) validateWebhookOutboxAttemptGate(
 						return ErrWebhookOutboxLifecycleInvariant
 					}
 					validated.snapshot = *snapshot
+					if startDispatch {
+						startedAt := webhookDispatchStartedAt(
+							time.Now().UTC(),
+							claim.LockedAt,
+						)
+						if !startedAt.Before(
+							claim.EffectiveDeadline.UTC(),
+						) ||
+							!startedAt.Before(
+								snapshot.CredentialExpiresAt.UTC(),
+							) {
+							return ErrWebhookOutboxLifecycleInvariant
+						}
+						update := tx.Model(&models.OutboxDelivery{}).
+							Where(
+								"id = ? AND organization_id = ? AND project_id = ? "+
+									"AND status = ? AND locked_by = ? "+
+									"AND lock_token = ? AND locked_at = ? "+
+									"AND attempts = ? AND dispatch_started_at = ?",
+								claim.DeliveryID,
+								claim.Scope.OrganizationID,
+								claim.Scope.ProjectID,
+								models.OutboxDeliveryProcessing,
+								claim.WorkerID,
+								claim.LockToken,
+								claim.LockedAt,
+								claim.AttemptGeneration,
+								claim.LockedAt,
+							).
+							Update(
+								"dispatch_started_at",
+								startedAt,
+							)
+						if update.Error != nil {
+							return update.Error
+						}
+						if update.RowsAffected != 1 {
+							return ErrWebhookOutboxLifecycleInvariant
+						}
+					}
 					return nil
 				},
 			)

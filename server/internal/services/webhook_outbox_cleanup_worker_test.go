@@ -374,7 +374,8 @@ func TestWebhookOutboxLegacyCanonicalShredWithMalformedDestinationIsReported(
 ) {
 	now := time.Date(2026, time.August, 10, 9, 0, 0, 0, time.UTC)
 	fixture := newWebhookOutboxLifecycleFixture(t, now)
-	_, claim := fixture.claim(t, "legacy-prefix-success-worker")
+	claimed, claim := fixture.claim(t, "legacy-prefix-success-worker")
+	fixture.startDispatch(t, claimed.ID)
 	claim.EffectiveDeadline = claim.LockedAt.Add(time.Minute)
 	if _, err := fixture.service.FinalizeOutboxAttempt(
 		fixture.worker,

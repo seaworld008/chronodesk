@@ -2831,6 +2831,11 @@
         "responses": {
           "200": {
             "description": "Successful Human Web operation",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -5936,6 +5941,11 @@
         "responses": {
           "200": {
             "description": "Successful Human Web operation",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -5969,7 +5979,7 @@
         "operationId": "updateProjectWebhook",
         "x-list-strategy": "bounded",
         "summary": "Update one Webhook configuration",
-        "description": "Updates validated Webhook fields, including lifecycle status, only within the configuration's authorized Project.",
+        "description": "Requires the current strong `If-Match` validator and atomically advances the same durable configuration generation used by emergency revoke before changing validated fields. A configuration with a committed emergency-revoked event is terminal and returns non-retryable `webhook_emergency_revoked`.",
         "tags": [
           "Webhooks"
         ],
@@ -5984,11 +5994,19 @@
           },
           {
             "$ref": "#/components/parameters/WebhookID"
+          },
+          {
+            "$ref": "#/components/parameters/IfMatch"
           }
         ],
         "responses": {
           "200": {
             "description": "Successful Human Web operation",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -6008,6 +6026,12 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/AgentAdminAdminConflict"
+          },
+          "428": {
+            "$ref": "#/components/responses/AgentAdminPreconditionRequired"
           },
           "500": {
             "$ref": "#/components/responses/InternalServerError"
@@ -6031,7 +6055,7 @@
       "delete": {
         "operationId": "deleteProjectWebhook",
         "summary": "Delete one Webhook configuration",
-        "description": "Deletes one Webhook configuration only within its authorized Project.",
+        "description": "Requires the current strong `If-Match` validator and soft-deletes one Webhook configuration. Already committed immutable delivery snapshots remain eligible through their original deadline; this operation never performs an emergency revoke.",
         "tags": [
           "Webhooks"
         ],
@@ -6046,11 +6070,19 @@
           },
           {
             "$ref": "#/components/parameters/WebhookID"
+          },
+          {
+            "$ref": "#/components/parameters/IfMatch"
           }
         ],
         "responses": {
           "200": {
             "description": "Successful Human Web operation",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -6070,6 +6102,12 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/AgentAdminAdminConflict"
+          },
+          "428": {
+            "$ref": "#/components/responses/AgentAdminPreconditionRequired"
           },
           "500": {
             "$ref": "#/components/responses/InternalServerError"
@@ -7694,6 +7732,98 @@
         }
       }
     },
+    "/projects/{projectKey}/admin/agents/webhooks/tombstones": {
+      "servers": [
+        {
+          "url": "/api"
+        }
+      ],
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ProjectKey"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Agent administration"
+        ],
+        "operationId": "listProjectWebhookEmergencyTombstones",
+        "x-list-strategy": "page",
+        "x-stable-sort": [
+          "deleted_at DESC",
+          "id DESC"
+        ],
+        "summary": "List soft-deleted Webhooks eligible for independent emergency revoke",
+        "description": "Returns a bounded, secret-free Project page so an exact `project_admin` can rediscover soft-deleted Webhooks after refresh. Ordinary delete does not invoke emergency revoke. A terminal item with `emergency_revoked=true` exposes no further revoke action.",
+        "x-chronodesk-project-roles": [
+          "project_admin"
+        ],
+        "security": [
+          {
+            "humanBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 25
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Secret-free Webhook tombstone page.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Tombstone security state must not be cached.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookEmergencyTombstonePageEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/AgentAdminBadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/AgentAdminUnauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/AgentAdminForbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/AgentAdminInternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/AgentAdminServiceUnavailable"
+          }
+        }
+      }
+    },
     "/projects/{projectKey}/admin/agents/webhooks/{webhookID}/emergency-revoke": {
       "servers": [
         {
@@ -7705,6 +7835,70 @@
           "$ref": "#/components/parameters/ProjectKey"
         }
       ],
+      "get": {
+        "tags": [
+          "Agent administration"
+        ],
+        "operationId": "getProjectWebhookEmergencyRevokePreflight",
+        "x-list-strategy": "bounded",
+        "summary": "Read the current secret-free emergency-revoke preflight",
+        "description": "Revalidates the exact `project_admin` membership in the Project transaction and returns the current durable Webhook configuration generation for active or soft-deleted configurations. The response contains no name, URL, credential, snapshot, or delivery identifier.",
+        "x-chronodesk-project-roles": [
+          "project_admin"
+        ],
+        "security": [
+          {
+            "humanBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/WebhookID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current secret-free Webhook emergency-revoke preflight.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "description": "Emergency preflight state must not be cached.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookEmergencyRevokePreflightEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/AgentAdminBadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/AgentAdminUnauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/AgentAdminForbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/AgentAdminNotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/AgentAdminInternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/AgentAdminServiceUnavailable"
+          }
+        }
+      },
       "post": {
         "tags": [
           "Agent administration"
@@ -7712,7 +7906,7 @@
         "operationId": "emergencyRevokeProjectWebhook",
         "x-list-strategy": "bounded",
         "summary": "Emergency-revoke pending deliveries for one Project Webhook",
-        "description": "Use the Webhook configuration's `resource_version` as `If-Match` and supply an `Idempotency-Key`. The command is restricted to the exact `project_admin` role. In one Project transaction it disables the mutable configuration, expires pending, failed, and dead deliveries, shreds every unterminated immutable snapshot credential with reason `revoked`, and reports already processing attempts that cannot be recalled. The response, receipt, audit event, and Domain Event contain no destination URL or credential material. Ordinary edit, disable, and delete continue to preserve committed immutable deliveries through their original deadline.",
+        "description": "Use the preflight `resource_version` as `If-Match` and supply an `Idempotency-Key`. The command is restricted to the exact `project_admin` role. In one Project transaction it disables and crypto-shreds the mutable configuration, expires pending, failed, dead, and new prepared-but-not-started deliveries, and shreds every unterminated immutable snapshot credential with reason `revoked`. `in_flight_deliveries` counts real dispatch-start authorizations plus legacy/unknown processing claims that cannot be safely recalled. The response, receipt, audit event, and Domain Event contain no destination URL or credential material. Ordinary edit, disable, and delete continue to preserve committed immutable deliveries through their original deadline.",
         "x-chronodesk-project-roles": [
           "project_admin"
         ],
@@ -13432,6 +13626,17 @@
                   "status": 409,
                   "detail": "Administrator resource version does not match.",
                   "code": "version_conflict",
+                  "request_id": "req_01JZ8VA6MHJZ23VC2M6N4PAPJ4",
+                  "retryable": false
+                }
+              },
+              "webhook_terminal": {
+                "value": {
+                  "type": "https://chronodesk.local/problems/webhook_emergency_revoked",
+                  "title": "webhook emergency revoked",
+                  "status": 409,
+                  "detail": "The emergency-revoked Webhook configuration is terminal.",
+                  "code": "webhook_emergency_revoked",
                   "request_id": "req_01JZ8VA6MHJZ23VC2M6N4PAPJ4",
                   "retryable": false
                 }
@@ -20747,6 +20952,102 @@
           }
         }
       },
+      "WebhookEmergencyRevokePreflight": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "config_id",
+          "status",
+          "deleted",
+          "emergency_revoked",
+          "resource_version"
+        ],
+        "properties": {
+          "config_id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "status": {
+            "$ref": "#/components/schemas/WebhookStatus"
+          },
+          "deleted": {
+            "type": "boolean"
+          },
+          "emergency_revoked": {
+            "type": "boolean"
+          },
+          "resource_version": {
+            "$ref": "#/components/schemas/ResourceVersion"
+          }
+        }
+      },
+      "WebhookEmergencyRevokePreflightEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Envelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/WebhookEmergencyRevokePreflight"
+              }
+            }
+          }
+        ]
+      },
+      "WebhookEmergencyTombstonePage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/WebhookEmergencyRevokePreflight"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "total_pages": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "WebhookEmergencyTombstonePageEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Envelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/WebhookEmergencyTombstonePage"
+              }
+            }
+          }
+        ]
+      },
       "WebhookEmergencyRevokeEnvelope": {
         "allOf": [
           {
@@ -22042,6 +22343,7 @@
               "automation_loop",
               "not_found",
               "version_conflict",
+              "webhook_emergency_revoked",
               "lease_conflict",
               "lease_expired",
               "lease_not_owned",

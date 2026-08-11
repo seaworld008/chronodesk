@@ -14,8 +14,9 @@ import (
 )
 
 // WebhookEmergencyRevokeResult is the secret-free durable outcome projected
-// by the Human administrator API. In-flight requests are reported because an
-// HTTP request that already left the process cannot be recalled.
+// by the Human administrator API. In-flight includes deliveries whose durable
+// dispatch authorization committed (and may already be external) plus
+// legacy/unknown processing claims that cannot be safely recalled.
 type WebhookEmergencyRevokeResult struct {
 	ConfigID              uint                 `json:"config_id"`
 	Status                models.WebhookStatus `json:"status"`
@@ -25,10 +26,17 @@ type WebhookEmergencyRevokeResult struct {
 	CredentialShredReason string               `json:"credential_shred_reason"`
 }
 
+const WebhookEmergencyRevokedAdminEventType = "io.chronodesk.admin.webhook.emergency_revoked.v1"
+
+var ErrWebhookEmergencyRevokedTerminal = errors.New(
+	"emergency-revoked webhook configuration is terminal",
+)
+
 // EmergencyRevokeWebhook disables one mutable Webhook configuration and
-// terminalizes all work that has not already started. It is deliberately a
-// domain command rather than an HTTP-handler rule so every Human adapter uses
-// the same authorization, scope, locking and lifecycle semantics.
+// terminalizes all work that is durably known not to have started. It is
+// deliberately a domain command rather than an HTTP-handler rule so every
+// Human adapter uses the same authorization, scope, locking and lifecycle
+// semantics.
 func (s *AgentNativeService) EmergencyRevokeWebhook(
 	ctx context.Context,
 	configID uint,
@@ -130,9 +138,13 @@ func (s *AgentNativeService) EmergencyRevokeWebhook(
 							operation.Scope.ProjectID,
 						).
 						Updates(map[string]any{
-							"status":     models.WebhookStatusDisabled,
-							"updated_at": now,
-							"updated_by": userID,
+							"status":                     models.WebhookStatusDisabled,
+							"secret":                     "",
+							"previous_secret":            "",
+							"previous_secret_expires_at": nil,
+							"access_token":               "",
+							"updated_at":                 now,
+							"updated_by":                 userID,
 						})
 					if configUpdate.Error != nil {
 						return fmt.Errorf(
@@ -149,7 +161,17 @@ func (s *AgentNativeService) EmergencyRevokeWebhook(
 						switch delivery.Status {
 						case models.OutboxDeliveryPending,
 							models.OutboxDeliveryFailed,
-							models.OutboxDeliveryDead:
+							models.OutboxDeliveryDead,
+							models.OutboxDeliveryProcessing:
+							if delivery.Status ==
+								models.OutboxDeliveryProcessing &&
+								!isWebhookDispatchPrepared(
+									delivery.DispatchStartedAt,
+									delivery.LockedAt,
+								) {
+								result.InFlightDeliveries++
+								continue
+							}
 							update := tx.WithContext(projectCtx).
 								Model(&models.OutboxDelivery{}).
 								Where(
@@ -160,12 +182,13 @@ func (s *AgentNativeService) EmergencyRevokeWebhook(
 									delivery.Status,
 								).
 								Updates(map[string]any{
-									"status":       models.OutboxDeliveryExpired,
-									"expired_at":   now,
-									"delivered_at": nil,
-									"locked_at":    nil,
-									"locked_by":    "",
-									"lock_token":   nil,
+									"status":              models.OutboxDeliveryExpired,
+									"expired_at":          now,
+									"delivered_at":        nil,
+									"locked_at":           nil,
+									"locked_by":           "",
+									"lock_token":          nil,
+									"dispatch_started_at": nil,
 									"last_error": "webhook delivery " +
 										"credentials revoked",
 									"updated_at": now,
@@ -180,8 +203,6 @@ func (s *AgentNativeService) EmergencyRevokeWebhook(
 								return ErrWebhookOutboxLifecycleInvariant
 							}
 							result.ExpiredDeliveries++
-						case models.OutboxDeliveryProcessing:
-							result.InFlightDeliveries++
 						case models.OutboxDeliverySucceeded,
 							models.OutboxDeliveryExpired:
 							// Terminal delivery history is immutable.

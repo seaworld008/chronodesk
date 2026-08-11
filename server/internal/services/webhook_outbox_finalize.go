@@ -260,6 +260,19 @@ func (s *AgentNativeService) FinalizeOutboxAttempt(
 						result.Status = status
 						return err
 					}
+					dispatchPrepared := isWebhookDispatchPrepared(
+						delivery.DispatchStartedAt,
+						delivery.LockedAt,
+					)
+					if isWebhookDispatchUnknown(
+						delivery.DispatchStartedAt,
+						delivery.LockedAt,
+					) ||
+						(dispatchPrepared &&
+							attempt.Kind !=
+								OutboxAttemptKnownFailure) {
+						return ErrWebhookOutboxLifecycleInvariant
+					}
 					snapshot, err := lockWebhookSnapshotForDelivery(
 						tx,
 						delivery,
@@ -317,19 +330,27 @@ func releaseUnstartedOutboxClaim(
 	if delivery == nil {
 		return "", ErrWebhookOutboxLifecycleInvariant
 	}
+	if delivery.DestinationType == "webhook" &&
+		!isWebhookDispatchPrepared(
+			delivery.DispatchStartedAt,
+			delivery.LockedAt,
+		) {
+		return "", ErrWebhookOutboxLifecycleInvariant
+	}
 	if err := updateClaimedOutboxDelivery(
 		tx,
 		scope,
 		claim,
 		map[string]any{
-			"status":          models.OutboxDeliveryFailed,
-			"attempts":        gorm.Expr("attempts - 1"),
-			"next_attempt_at": now,
-			"locked_at":       nil,
-			"locked_by":       "",
-			"lock_token":      nil,
-			"last_error":      "outbox delivery attempt did not start",
-			"updated_at":      now,
+			"status":              models.OutboxDeliveryFailed,
+			"attempts":            gorm.Expr("attempts - 1"),
+			"next_attempt_at":     now,
+			"locked_at":           nil,
+			"locked_by":           "",
+			"lock_token":          nil,
+			"dispatch_started_at": nil,
+			"last_error":          "outbox delivery attempt did not start",
+			"updated_at":          now,
 		},
 	); err != nil {
 		return "", err
@@ -516,12 +537,13 @@ func finalizeWebhookOutboxAttempt(
 			scope,
 			claim,
 			map[string]any{
-				"status":     models.OutboxDeliveryDead,
-				"locked_at":  nil,
-				"locked_by":  "",
-				"lock_token": nil,
-				"last_error": scrubOutboxFailure(attempt.Err),
-				"updated_at": now,
+				"status":              models.OutboxDeliveryDead,
+				"locked_at":           nil,
+				"locked_by":           "",
+				"lock_token":          nil,
+				"dispatch_started_at": nil,
+				"last_error":          scrubOutboxFailure(attempt.Err),
+				"updated_at":          now,
 			},
 		); err != nil {
 			return "", err
@@ -538,13 +560,14 @@ func finalizeWebhookOutboxAttempt(
 				scope,
 				claim,
 				map[string]any{
-					"status":          models.OutboxDeliveryFailed,
-					"next_attempt_at": now.Add(backoff),
-					"locked_at":       nil,
-					"locked_by":       "",
-					"lock_token":      nil,
-					"last_error":      scrubOutboxFailure(attempt.Err),
-					"updated_at":      now,
+					"status":              models.OutboxDeliveryFailed,
+					"next_attempt_at":     now.Add(backoff),
+					"locked_at":           nil,
+					"locked_by":           "",
+					"lock_token":          nil,
+					"dispatch_started_at": nil,
+					"last_error":          scrubOutboxFailure(attempt.Err),
+					"updated_at":          now,
 				},
 			); err != nil {
 				return "", err

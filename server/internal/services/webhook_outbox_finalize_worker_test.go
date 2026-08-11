@@ -88,7 +88,7 @@ func TestWebhookOutboxWorkerPreservesSuccessAtDeadlineHandoff(
 ) {
 	now := time.Now().UTC()
 	fixture := newWebhookOutboxLifecycleFixture(t, now)
-	deadline := now.Add(50 * time.Millisecond)
+	deadline := now.Add(time.Second)
 	if err := fixture.db.Exec(
 		"UPDATE outbox_deliveries SET expires_at = ? WHERE id = ?",
 		deadline,
@@ -433,11 +433,12 @@ func TestWebhookOutboxExhaustedStaleClaimBecomesDeadWithoutAdapter(
 	if err := fixture.db.Model(&models.OutboxDelivery{}).
 		Where("id = ?", fixture.delivery.ID).
 		Updates(map[string]any{
-			"status":     models.OutboxDeliveryProcessing,
-			"attempts":   fixture.delivery.MaxAttempts,
-			"locked_at":  staleAt,
-			"locked_by":  "exhausted-stale-worker",
-			"lock_token": staleToken,
+			"status":              models.OutboxDeliveryProcessing,
+			"attempts":            fixture.delivery.MaxAttempts,
+			"locked_at":           staleAt,
+			"locked_by":           "exhausted-stale-worker",
+			"lock_token":          staleToken,
+			"dispatch_started_at": staleAt,
 		}).Error; err != nil {
 		t.Fatal(err)
 	}
