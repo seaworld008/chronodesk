@@ -55,7 +55,7 @@ OpenAPI `3.2.0` 和 CloudEvents `1.0`。不保留旧版兼容分支。
 | Human Web | `/human-openapi.json`、类型化 P1 操作与工作台边界 | 未列入 P1 的遗留路由不可据此宣称稳定公共契约 |
 | Agent 与协议 | Agent REST、MCP、A2A 的共享领域入口和版本门禁 | Proposal 执行 Adapter、关系 API 对外契约、SDK 同步与主动 A2A 委派 |
 | 集成 | Connection、Mapping、Inbox、Receipt、ExternalLink、Outbox 基础模型 | 邮件双向同步、CSV、Kafka/AMQP、内网 Relay 与额外语言 SDK 的生产化 |
-| Webhook / Outbox | 七天绝对凭据期限、终态粉碎、过期 cleanup、三态 dispatch marker、双 HTTP gate、有限 replay、安全 tombstone/preflight 投影、live snapshot DEK validate/rewrap、project-scoped 紧急撤销与运维规程 | 真实备份/PITR 恢复演练与当次发布门禁 |
+| Webhook / Outbox | 七天绝对凭据期限、终态粉碎、过期 cleanup、generation-bound 三态 dispatch marker、PG/SQLite tuple fence、双 HTTP gate、有限 replay、安全 tombstone/preflight 投影、live snapshot DEK validate/rewrap、project-scoped 紧急撤销与运维规程 | 真实备份/PITR 恢复演练与当次发布门禁 |
 | 知识与检索 | 项目知识版本、ACL、摄取状态、OpenSearch 混合检索、引用反馈与模型策略 | 生产对象存储、扫描/解析/摄取 Worker、模型网关运行基线与完整 Copilot 闭环 |
 | AI 协作 | Run、Proposal、Approval、Handoff、Lease 与审计模型 | 内置 Copilot、完整执行工作台、对象存储/扫描/解析 Worker 的生产闭环 |
 | 运行可靠性 | RLS、审计哈希链、凭据维护、迁移 checkpoint | WORM、保留归档、备份恢复自动化、容量基准与故障演练 |
@@ -76,14 +76,19 @@ OpenAPI `3.2.0` 和 CloudEvents `1.0`。不保留旧版兼容分支。
   Ticket 的角色投影。
 - Webhook snapshot 与 Outbox 共享不可延长的七天绝对 deadline；成功、过期和
   cleanup 路径单调清空 credential envelopes，并保留审计 metadata。
-- Webhook claim 将 `dispatch_started_at` 写为 Unix epoch prepared；紧接 HTTP
-  client `Do` 前的短事务取得 config 锁，并以 CAS 把 prepared 改为真实时间戳。
-  `NULL` 表示 legacy/unknown，真实时间戳只表示 dispatch authorization 已提交；
+- Webhook claim 将 `dispatch_started_at` 与 `locked_at` 写为同一个 claim 时间，
+  表示 generation-bound prepared；紧接 HTTP client `Do` 前的短事务取得 config
+  锁，并以 CAS 把 marker 改为严格晚于 `locked_at` 的时间戳。`NULL` 表示
+  legacy/unknown，strictly-later marker 只表示 dispatch authorization 已提交；
   两者都保守计为 in-flight，不据此声称请求已离开进程。
 - claim、HTTP client 创建、`Do` 前 dispatch-start gate、finalize、cleanup 和
-  replay 均复核 scope、event、snapshot、deadline 与 claim generation。prepared
-  stale claim 可 reclaim；`NULL` 不 reclaim，真实时间戳后的不确定崩溃不自动
-  重发，只由原 deadline cleanup 关闭。
+  replay 均复核 scope、event、snapshot、deadline 与 claim generation。
+  PostgreSQL/SQLite tuple fence 仅允许满足 `attempts + 1`、`locked_at` 前进、
+  非空 worker、新 UUIDv7 token 和 marker 重绑的 prepared → 新 prepared；
+  它阻断旧 Worker stale-reclaim `NULL`/dispatch-authorized generation 及 marker
+  降级。旧 Worker 首次 claim 留下的 `NULL` 可以完成，崩溃后不再领取；
+  dispatch-authorized marker 后的不确定崩溃也不自动重发，两者只由原 deadline
+  cleanup 关闭。
 - `expired` 投递的 Agent/Human 安全投影、稳定
   `outbox_replay_expired` 409、两处管理 UI 的中文终态与 replay 隐藏。
 - database-secret startup/maintenance 对每个 live snapshot 的三类 envelope
@@ -93,16 +98,16 @@ OpenAPI `3.2.0` 和 CloudEvents `1.0`。不保留旧版兼容分支。
   强制 preflight version、`If-Match` 与幂等 key，在同一 Project transaction
   禁用配置、清空 `secret`、`previous_secret`、
   `previous_secret_expires_at`、`access_token`，终止 prepared 投递、粉碎
-  snapshot 凭据并报告 `NULL`/真实时间戳 in-flight。
+  snapshot 凭据并报告 `NULL`/dispatch-authorized generation in-flight。
 - 普通 Webhook `PUT`/`DELETE` 使用强 `If-Match`，并在变更配置的同一事务 CAS
   durable admin resource version。soft-delete 不撤销已冻结 snapshot；紧急撤销
   是不可复活的终态。revoke-first 在 dispatch-start barrier 前关闭投递并保持
   零 HTTP；start-first 只报告 in-flight。
 - Webhook Settings 提供中文不可逆确认与安全计数；Agent Control 对 `expired`
   显示封闭中文终态并隐藏 replay。ADR-0009 与运维 runbook 已记录普通删除、
-  mixed-version `NULL` 保守处理、禁止 prepared 回填、key rotation、发布/回滚及
-  backup/WAL/PITR 边界。撤销和过期不会设置、清空或改写父 Domain Event 的
-  `PublishedAt`。
+  mixed-version `NULL` 保守处理、generation tuple fence、禁止 prepared 回填或
+  marker 降级、key rotation、发布/回滚及 backup/WAL/PITR 边界。撤销和过期不会
+  设置、清空或改写父 Domain Event 的 `PublishedAt`。
 
 ### 明确未验证或未完成
 

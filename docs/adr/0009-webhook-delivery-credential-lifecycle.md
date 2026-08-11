@@ -63,23 +63,34 @@ reason `revoked`.
 Webhook `processing` rows use `dispatch_started_at` as a three-state protocol:
 
 - `NULL` means legacy or unknown. It is conservatively in flight and cannot be
-  reclaimed automatically.
-- Unix epoch (`1970-01-01T00:00:00Z`) means prepared. A new claim writes this
-  marker; the row can still be revoked or reclaimed when stale.
-- A real timestamp means dispatch authorization committed. The request may be
-  external or in flight, but the marker does not prove that it left the
-  process.
+  reclaimed automatically. An older worker may leave `NULL` on its first claim
+  and may complete that claim, but a crash leaves the row for deadline cleanup.
+- `dispatch_started_at == locked_at` means prepared for that exact claim
+  generation. A new worker writes both timestamps together; the row can still
+  be revoked or, when stale, reclaimed into a new prepared generation.
+- `dispatch_started_at > locked_at` means dispatch authorization committed.
+  The request may be external or in flight, but the marker does not prove that
+  it left the process.
 
 Immediately before calling the HTTP client's `Do`, a short transaction takes
-the config lifecycle lock and compare-and-swaps prepared to a real timestamp.
-That config lock is the linearization barrier between dispatch start and
-emergency revoke. If revoke commits first, the prepared delivery is expired
-and no HTTP call starts. If dispatch start commits first, revoke reports the
-row as in flight and makes no zero-HTTP claim. A worker crash that leaves a
-real timestamp without a terminal transport result is not automatically
-reclaimed or resent; only deadline cleanup closes it. Mixed-version workers
-may leave `NULL`, which retains the same conservative in-flight treatment
-until completion or deadline.
+the config lifecycle lock and compare-and-swaps the equality-bound prepared
+marker to a timestamp strictly later than `locked_at`. That config lock is the
+linearization barrier between dispatch start and emergency revoke. If revoke
+commits first, the prepared delivery is expired and no HTTP call starts. If
+dispatch start commits first, revoke reports the row as in flight and makes no
+zero-HTTP claim. A worker crash that leaves a later marker without a terminal
+transport result is not automatically reclaimed or resent; only deadline
+cleanup closes it.
+
+PostgreSQL and SQLite enforce the claim generation tuple at the database
+boundary. A `processing → processing` ownership change is allowed only from
+one prepared generation to another: `attempts` advances by exactly one,
+`locked_at` moves forward, `locked_by` is non-empty, `lock_token` is a new
+UUIDv7, and `dispatch_started_at` is rebound to the new `locked_at`. This
+blocks an older binary from stale-reclaiming a `NULL` or dispatch-authorized
+row, or from retaining or downgrading a marker across generations. An older
+worker may still make a first claim from `pending` or `failed`, leave `NULL`,
+and finish it; after a crash no worker may reclaim that unknown attempt.
 
 An expiration transition never publishes its parent Domain Event. It also
 never sets, clears, or otherwise changes the parent Domain Event's
@@ -106,21 +117,24 @@ URL, credential, envelope, request body, or response body.
 - Logical crypto-shredding prevents future application use but does not
   instantly erase old ciphertext from WAL, replicas, snapshots, backups, or
   storage media. Backup retention and key lifecycle remain separate controls.
-- The nullable dispatch marker supports a compatible rolling deployment.
-  Old-worker `NULL` rows remain conservatively in flight and must drain or
-  reach deadline; they must never be backfilled to the prepared epoch. A
-  worker that lacks the shared config barrier and HTTP gates is not compatible
-  with an exposed emergency-revoke endpoint.
+- The nullable dispatch marker and database generation fence support a
+  compatible rolling deployment. Old-worker `NULL` rows remain conservatively
+  in flight and must finish or reach deadline; they must never be backfilled
+  or rebound as prepared. The database rejects stale reclaim of `NULL` and
+  dispatch-authorized rows even when an older application query would select
+  them. A worker that lacks the shared config barrier and HTTP gates is not
+  compatible with an exposed emergency-revoke endpoint.
 
 ## Verification
 
 Service and PostgreSQL tests cover the status matrix, exact-project
 authorization, cross-project non-disclosure, stable lock ordering, rollback,
 idempotent repeat, the three dispatch-marker states, claim/replay races,
-revoke-first zero HTTP, start-first in-flight reporting, and preservation of
-both nil and pre-existing `PublishedAt`. Handler and Human OpenAPI tests cover
-strong `If-Match`, same-transaction CAS, tombstone preflight, idempotency,
-closed responses, and secret-free events. Adapter tests use injectable or
-loopback clients. Web tests cover the exact-admin UI, independent irreversible
+PostgreSQL/SQLite generation-fence drift and mutation cases, revoke-first zero
+HTTP, start-first in-flight reporting, and preservation of both nil and
+pre-existing `PublishedAt`. Handler and Human OpenAPI tests cover strong
+`If-Match`, same-transaction CAS, tombstone preflight, idempotency, closed
+responses, and secret-free events. Adapter tests use injectable or loopback
+clients. Web tests cover the exact-admin UI, independent irreversible
 confirmation, CAS headers, result counts, terminal Chinese projection, and
 hidden replay for expired rows.

@@ -97,27 +97,34 @@ soft-delete 只影响未来 fan-out，已经冻结的投递继续使用原 snaps
 deadline；普通 soft-delete 不是凭据撤销。普通 `PUT`/`DELETE` 都要求强
 `If-Match`，并在配置变更的同一事务 CAS durable admin resource version。
 
-Webhook claim 把 `dispatch_started_at` 写为 Unix epoch
-`1970-01-01T00:00:00Z`，表示 prepared。紧接 HTTP client `Do` 前的短事务取得
-config 生命周期锁，再以 CAS 写入真实时间戳：
+Webhook claim 把 `dispatch_started_at` 与 `locked_at` 写为同一个 claim 时间，
+表示绑定当前 generation 的 prepared。紧接 HTTP client `Do` 前的短事务取得
+config 生命周期锁，再以 CAS 把 marker 写为严格晚于 `locked_at` 的时间戳：
 
-- `NULL` 表示 legacy/unknown，保守计为 in-flight，不能自动 reclaim；
-- Unix epoch 表示 prepared，可被紧急撤销或 stale reclaim；
-- 真实时间戳表示 dispatch authorization 已提交，可能已经外部可见或仍在进程内，
-  但不证明请求已经离开进程。
+- `NULL` 表示 legacy/unknown，保守计为 in-flight；首次 claim 可以完成，崩溃后
+  不能自动 reclaim；
+- `dispatch_started_at == locked_at` 表示 prepared，可被紧急撤销或 stale
+  reclaim 到新的 prepared generation；
+- `dispatch_started_at > locked_at` 表示 dispatch authorization 已提交，可能
+  已经外部可见或仍在进程内，但不证明请求已经离开进程。
 
 config 锁是 dispatch start 与紧急撤销的线性化边界。revoke-first 会终止
-prepared 投递且产生零 HTTP；start-first 会被报告为 in-flight。真实时间戳后的
-不确定崩溃不自动重发，只在原 deadline 到达后 cleanup。滚动发布期间旧 Worker
-留下的 `NULL` 必须保守等待自然完成或 deadline，绝不能批量回填为 prepared。
+prepared 投递且产生零 HTTP；start-first 会被报告为 in-flight。
+dispatch-authorized marker 后的不确定崩溃不自动重发，只在原 deadline 到达后
+cleanup。
+PostgreSQL/SQLite tuple fence 只允许 prepared → 新 prepared 的 claim generation
+变化，并强制 `attempts + 1`、`locked_at` 前进、非空 worker、新 UUIDv7 token 和
+marker 重绑。它阻断旧 Worker stale-reclaim `NULL`/dispatch-authorized 行及
+marker 降级。旧 Worker 首次 claim 留下的 `NULL` 可以完成；崩溃后必须等待
+deadline，且绝不能批量回填或重绑为 prepared。
 
 紧急撤销是独立的 exact `project_admin` 命令。live/tombstone preflight 只返回
 配置 ID、状态、删除标记、撤销状态和版本等无秘密最小投影，并要求操作员另行完成
 不可逆确认。命令以强 `If-Match` 进入同一 Project transaction，禁用配置并清空
 `secret`、`previous_secret`、`previous_secret_expires_at`、`access_token`，
 把 `pending/failed/dead` 以及 prepared 投递变为 `expired`，报告无法安全召回的
-`NULL`/真实时间戳 `processing`，并把所有尚未粉碎的 snapshot 凭据以 `revoked`
-清空。紧急撤销是不可复活的终态。
+`NULL`/dispatch-authorized `processing`，并把所有尚未粉碎的 snapshot 凭据以
+`revoked` 清空。紧急撤销是不可复活的终态。
 
 claim、replay、cleanup、finalize 和双 HTTP gate 使用相同的
 Project/config/delivery/snapshot 锁序，因此撤销事务先提交时不能开始新的外部

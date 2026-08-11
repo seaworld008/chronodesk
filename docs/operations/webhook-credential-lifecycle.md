@@ -23,21 +23,38 @@ Webhook `processing` 投递必须按以下三态判读：
 
 | 值 | 含义 | 撤销与恢复规则 |
 | --- | --- | --- |
-| `NULL` | 旧版本或未知状态 | 保守计为 in-flight，不自动 reclaim；等待自然完成或 deadline cleanup |
-| Unix epoch `1970-01-01T00:00:00Z` | prepared，已 claim 但尚未提交 dispatch authorization | 紧急撤销可终止；stale claim 可安全 reclaim |
-| 真实时间戳 | dispatch authorization 已提交 | 可能已经外部可见或仍在进程内；不能自动重发，只在 deadline cleanup 时关闭 |
+| `NULL` | 旧版本或未知状态 | 保守计为 in-flight；首次 claim 可完成，崩溃后不能 reclaim，只能等待 deadline cleanup |
+| `dispatch_started_at == locked_at` | prepared，绑定当前 claim generation，尚未提交 dispatch authorization | 紧急撤销可终止；stale claim 可安全进入新的 prepared generation |
+| `dispatch_started_at > locked_at` | dispatch authorization 已提交 | 可能已经外部可见或仍在进程内；不能自动重发，只在 deadline cleanup 时关闭 |
 
-新 Worker 在 claim 时写入 prepared。紧接 HTTP client `Do` 之前，它在一个短事务
-内取得 config 生命周期锁，并以 CAS 把 prepared 改为真实时间戳。该 config 锁是
-dispatch start 与紧急撤销的线性化边界：
+新 Worker 在 claim 时把 `dispatch_started_at` 与 `locked_at` 写为同一个 claim
+时间，形成 generation-bound prepared。紧接 HTTP client `Do` 之前，它在一个短
+事务内取得 config 生命周期锁，并以 CAS 把 marker 改为严格晚于 `locked_at` 的
+时间戳。该 config 锁是 dispatch start 与紧急撤销的线性化边界：
 
 - 撤销先提交：prepared 投递转为 `expired`，后续 start CAS 失败，HTTP 调用数为零；
 - start 先提交：撤销把该行报告为 in-flight，不承诺零 HTTP；
-- 真实时间戳只证明授权提交，不证明请求已经离开进程。
+- 严格晚于 `locked_at` 的 marker 只证明授权提交，不证明请求已经离开进程。
 
-若 Worker 在写入真实时间戳后、持久化明确传输结果前崩溃，系统不会自动 reclaim
-或重发该次投递，以免产生不确定的重复外部副作用；它只会在原七天 deadline 到达
-后由 cleanup 关闭。混合版本期间的 `NULL` 也不得猜测或改写为 prepared。
+若 Worker 在写入 dispatch-authorized marker 后、持久化明确传输结果前崩溃，
+系统不会自动 reclaim 或重发该次投递，以免产生不确定的重复外部副作用；它只会在
+原七天 deadline 到达后由 cleanup 关闭。混合版本期间的 `NULL` 也不得猜测或改写
+为 prepared。若发现 `dispatch_started_at < locked_at`，应按数据库边界漂移
+fail closed，不得把它解释为可安全 reclaim。
+
+PostgreSQL 和 SQLite 的数据库 tuple fence 约束
+`processing → processing` claim generation 变化。唯一允许的 stale reclaim 是
+prepared → 新 prepared，并且必须同时满足：
+
+- `attempts` 恰好增加一；
+- `locked_at` 严格向前；
+- `locked_by` 非空；
+- `lock_token` 是不同于旧 token 的新 UUIDv7；
+- `dispatch_started_at` 同步重绑为新的 `locked_at`。
+
+该 fence 阻断旧 Worker stale-reclaim `NULL` 或 dispatch-authorized 行，也阻断
+marker 保留、降级或跨 generation 复用。旧 Worker 仍可从 `pending/failed` 首次
+claim 并留下 `NULL`，当前尝试可以完成；若它崩溃，该未知尝试不能再被领取。
 
 ## 权限与前置检查
 
@@ -51,7 +68,8 @@ dispatch start 与紧急撤销的线性化边界：
    `If-Match` 必须失败，操作员应重新确认当前状态。
 3. 检查投递列表中 `pending`、`failed`、`dead` 和 `processing` 的数量，并记录
    事件 ID/投递 ID 等非敏感标识。`processing` 的 in-flight 计数包含
-   legacy/unknown `NULL` 和真实时间戳；它表示不能安全召回，不证明请求已经发出。
+   legacy/unknown `NULL` 和严格晚于 `locked_at` 的 marker；它表示不能安全召回，
+   不证明请求已经发出。
 4. 为一次操作生成新的随机 `Idempotency-Key`。网络超时后重试同一意图时必须复用
    同一个 key 和原请求；不要用新 key 猜测重试。
 
@@ -97,8 +115,9 @@ receipt。
   `revoked` 粉碎。已经粉碎或过期的行跳过解密和 rewrap。
 - `expired` 不会设置父 Domain Event 的 `PublishedAt`；若同一事件已因其他
   destination 成功而存在 `PublishedAt`，也不得清空或改写，必须原样保留。
-- stale reclaim 只适用于 prepared epoch。`NULL` 保守等待，真实时间戳崩溃态不
-  自动重发；两者只在原 deadline 到达后由 cleanup 关闭。
+- stale reclaim 只适用于 marker 等于当前 `locked_at` 的 prepared generation。
+  `NULL` 保守等待，dispatch-authorized marker 崩溃态不自动重发；两者只在原
+  deadline 到达后由 cleanup 关闭。
 - cleanup、claim、replay、finalize 和 HTTP gate 都遵循
   `Project/auth → WebhookConfig → OutboxDelivery → Snapshot` 锁序。
 
@@ -120,24 +139,29 @@ Webhook URL 或秘密。
 ## 发布、迁移与回滚顺序
 
 紧急撤销与 Worker 共享数据库锁协议。`dispatch_started_at` 是兼容的 nullable
-列；滚动发布必须按以下顺序：
+列，数据库 tuple fence 是跨版本安全边界；滚动发布必须按以下顺序：
 
 1. 先完成可信备份及隔离恢复演练，运行结构迁移和 startup schema/RLS 门禁。
-2. 先增加 nullable 列并保持 `NULL`，不得设置 epoch 默认值，也不得把存量
-   `NULL` 批量回填为 prepared。回填会把未知或已开始的旧投递误报为可安全撤销。
-3. 逐步部署写 prepared、在 `Do` 前提交真实时间戳的新 Worker。与其共存的兼容旧
-   Worker 仍会留下 `processing/NULL`；撤销必须把这些行保守计为 in-flight，stale
-   reclaim 必须跳过它们。
+2. 先增加 nullable 列并保持 `NULL`，安装并验证 PostgreSQL/SQLite tuple fence。
+   不得设置默认值，也不得把存量 `NULL` 批量回填或重绑为 prepared；否则会把未知
+   或已开始的旧投递误报为可安全撤销。
+3. 逐步部署写 generation-bound prepared、在 `Do` 前提交 strictly-later marker
+   的新 Worker。与其共存的旧 Worker 仍可首次 claim `pending/failed` 并留下
+   `processing/NULL`；当前尝试可完成，但数据库必须阻断其 stale reclaim
+   `NULL`、prepared 或 dispatch-authorized generation。
 4. 观察旧 `NULL` 投递自然完成或等到原 deadline cleanup，确认处理队列排空。
-   期间不得通过改 marker 伪造排空，也不得把真实时间戳降级为 prepared。
+   期间不得通过改 marker 伪造排空，也不得把 dispatch-authorized marker 降级为
+   prepared。
 5. 使用 loopback/injectable 演练 revoke-first 零 HTTP、start-first in-flight、
-   mixed-version `NULL` 保守处理，再启用或继续开放 Human admin endpoint、
-   OpenAPI 和 Web UI。任何共存版本都必须遵守 config barrier 和 HTTP gate；
-   不遵守者不能与已开放的紧急撤销入口共存。
+   mixed-version `NULL` 保守处理、旧 claim tuple 拒绝和新 prepared reclaim，
+   再启用或继续开放 Human admin endpoint、OpenAPI 和 Web UI。任何共存版本都
+   必须遵守 config barrier 和 HTTP gate；不遵守者不能与已开放的紧急撤销入口
+   共存。
 
-应用层 endpoint/UI 可以回滚，数据库兼容列必须保留。回滚到仍遵守 config barrier
-和 HTTP gate 的旧 Worker 会重新产生 `NULL`，这些行必须继续保守等待完成或
-deadline。不得删除列、回填 prepared、恢复凭据、把真实时间戳降级，或把
+应用层 endpoint/UI 可以回滚，数据库兼容列和 tuple fence 必须保留。回滚到仍
+遵守 config barrier 和 HTTP gate 的旧 Worker 会在首次 claim 时重新产生 `NULL`；
+当前尝试可以完成，崩溃后必须保守等待 deadline，不能 stale reclaim。不得删除列
+或 fence、回填 prepared、恢复凭据、降级 dispatch-authorized marker，或把
 `expired` 改回可投递状态。若回滚版本不遵守共同锁协议，先关闭 Webhook egress
 和 claim，保持数据库不变并采用前向修复。
 
@@ -175,9 +199,11 @@ DEK 删除是独立的高风险动作。只有 live 配置与 snapshot 已在 ne
 - transaction 中途失败后配置、投递、snapshot 全部回滚；
 - revoke 与 claim/replay 竞态无死锁、无复活；
 - revoke-first 后 client factory 与 HTTP 计数为零；start-first 稳定报告
-  in-flight，不把真实 marker 当作已离开进程的证明；
+  in-flight，不把 dispatch-authorized marker 当作已离开进程的证明；
 - mixed-version `processing/NULL` 不 reclaim、不改写，等待自然完成或 deadline；
-- 真实 marker 后崩溃不自动重发，仅由 deadline cleanup 关闭；
+- PostgreSQL/SQLite 拒绝旧 Worker 对 `NULL`/dispatch-authorized generation 的
+  stale claim tuple，且只允许满足完整 tuple 的 prepared → 新 prepared；
+- dispatch-authorized marker 后崩溃不自动重发，仅由 deadline cleanup 关闭；
 - response、receipt、event、audit、日志和演练报告不含 URL 或秘密。
 
 把命令、环境类型、非敏感计数和结论写入发布证据；不要收集请求正文、响应正文、
