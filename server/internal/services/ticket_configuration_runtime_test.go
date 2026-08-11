@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/seaworld008/chronodesk/server/internal/eventcontract"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
@@ -527,6 +529,116 @@ func TestTicketWorkflowRuntimeUnionsRolesAcrossRepeatedCategoryEdges(
 				t.Fatalf("role %q transition error = %v", test.role, err)
 			}
 		})
+	}
+}
+
+func TestTicketWorkflowRuntimeRejectsSameCanonicalStatusWithoutStateKey(
+	t *testing.T,
+) {
+	db, _, ctx, user, ticket := newWorkflowRuntimeTicket(
+		t,
+		models.ProjectRoleAgent,
+	)
+	err := transactionForContext(ctx, db, func(tx *gorm.DB) error {
+		var persisted models.Ticket
+		if err := tx.First(&persisted, ticket.ID).Error; err != nil {
+			return err
+		}
+		return validateTicketWorkflowTransitionTx(
+			ctx,
+			tx,
+			models.ProjectScope{
+				OrganizationID: persisted.OrganizationID,
+				ProjectID:      persisted.ProjectID,
+			},
+			&persisted,
+			persisted.Status,
+			models.HumanActor(user.ID),
+		)
+	})
+	if !errors.Is(err, ErrInvalidTicketTransition) {
+		t.Fatalf(
+			"same canonical status workflow validation error = %v, want ErrInvalidTicketTransition",
+			err,
+		)
+	}
+}
+
+func TestHumanTicketServiceSameStatusRemainsNoOp(t *testing.T) {
+	db, ticketService, ctx, user, ticket := newWorkflowRuntimeTicket(
+		t,
+		models.ProjectRoleAgent,
+	)
+	before := *ticket
+	var beforeHistory, beforeEvents, beforeOutbox int64
+	if err := db.Model(&models.TicketHistory{}).
+		Where("ticket_id = ?", ticket.ID).
+		Count(&beforeHistory).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.DomainEvent{}).
+		Where(
+			"type = ? AND subject = ?",
+			eventcontract.TicketTransitionedEventType,
+			fmt.Sprintf("ticket/%d", ticket.ID),
+		).
+		Count(&beforeEvents).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.OutboxDelivery{}).
+		Count(&beforeOutbox).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	unchanged, err := ticketService.UpdateTicketStatusExpectedVersion(
+		ctx,
+		ticket.ID,
+		string(ticket.Status),
+		user.ID,
+		"",
+		"",
+		ticket.Version,
+	)
+	if err != nil {
+		t.Fatalf("Human same-status no-op: %v", err)
+	}
+	if unchanged.Version != before.Version ||
+		unchanged.Status != before.Status ||
+		!unchanged.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("Human same-status no-op changed Ticket: before=%+v after=%+v", before, unchanged)
+	}
+
+	var afterHistory, afterEvents, afterOutbox int64
+	if err := db.Model(&models.TicketHistory{}).
+		Where("ticket_id = ?", ticket.ID).
+		Count(&afterHistory).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.DomainEvent{}).
+		Where(
+			"type = ? AND subject = ?",
+			eventcontract.TicketTransitionedEventType,
+			fmt.Sprintf("ticket/%d", ticket.ID),
+		).
+		Count(&afterEvents).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.OutboxDelivery{}).
+		Count(&afterOutbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	if afterHistory != beforeHistory ||
+		afterEvents != beforeEvents ||
+		afterOutbox != beforeOutbox {
+		t.Fatalf(
+			"Human same-status no-op side effects history/events/outbox = %d/%d/%d, want %d/%d/%d",
+			afterHistory,
+			afterEvents,
+			afterOutbox,
+			beforeHistory,
+			beforeEvents,
+			beforeOutbox,
+		)
 	}
 }
 

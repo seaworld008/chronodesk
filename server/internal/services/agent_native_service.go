@@ -112,6 +112,8 @@ func AgentNativeErrorCode(err error) string {
 		errors.Is(err, ErrTicketCategoryScope),
 		errors.Is(err, ErrInvalidTicketCategorySelection):
 		return "invalid_request"
+	case errors.Is(err, ErrInvalidTicketTransition):
+		return "invalid_ticket_transition"
 	case errors.Is(err, ErrInvalidAssignee):
 		return "invalid_assignee"
 	case errors.Is(err, ErrAssigneeNotFound):
