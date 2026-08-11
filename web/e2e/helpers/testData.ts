@@ -1182,14 +1182,33 @@ const deleteNotifications = async (request: APIRequestContext, token: string) =>
 const deleteWebhooks = async (request: APIRequestContext, token: string) => {
     const projectKey = await resolveE2EProjectKey(request, token);
     for (const id of trackedIDs('webhooks')) {
+        const webhookPath = projectAPIPath(
+            projectKey,
+            `webhooks/${encodeURIComponent(id)}`,
+        );
+        const detailResponse = await apiRequest<Record<string, unknown>>(
+            request,
+            token,
+            webhookPath,
+        );
+        const resourceVersion = extractData<Record<string, unknown>>(
+            detailResponse,
+        ).resource_version;
+        if (!positiveVersion(resourceVersion)) {
+            throw new Error(
+                `Webhook ${id} 清理响应缺少合法 resource_version`,
+            );
+        }
         await apiRequest(
             request,
             token,
-            projectAPIPath(
-                projectKey,
-                `webhooks/${encodeURIComponent(id)}`,
-            ),
-            { method: 'DELETE' },
+            webhookPath,
+            {
+                method: 'DELETE',
+                headers: {
+                    'If-Match': `"v${resourceVersion}"`,
+                },
+            },
         );
         untrackE2EResource('webhooks', id);
     }
