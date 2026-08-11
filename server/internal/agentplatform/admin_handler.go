@@ -38,7 +38,6 @@ const (
 
 	adminIdempotencyRetention  = 24 * time.Hour
 	adminReplaySchema          = "chronodesk.admin-replay.v1"
-	adminVersionKeyPrefix      = "agent.resource_version."
 	adminRequestBodyContextKey = "chronodesk.admin.canonical_request_body"
 	adminMaximumRequestBytes   = 1 << 20
 )
@@ -2101,13 +2100,7 @@ func adminResourceVersionKey(
 	scope models.ProjectScope,
 	subject string,
 ) string {
-	scopeSubject := strconv.FormatUint(uint64(scope.OrganizationID), 10) +
-		"/" +
-		strconv.FormatUint(uint64(scope.ProjectID), 10) +
-		"/" +
-		strings.TrimSpace(subject)
-	sum := sha256.Sum256([]byte(scopeSubject))
-	return adminVersionKeyPrefix + base64.RawURLEncoding.EncodeToString(sum[:])
+	return services.AdminResourceVersionKey(scope, subject)
 }
 
 func (h *AdminHandler) currentAdminResourceVersion(

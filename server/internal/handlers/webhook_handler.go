@@ -294,6 +294,8 @@ func (h *WebhookHandler) webhookResourceVersions(
 	versions := make(map[uint]uint64, len(webhooks))
 	subjectToID := make(map[string]uint, len(webhooks))
 	subjects := make([]string, 0, len(webhooks))
+	keyToID := make(map[string]uint, len(webhooks))
+	keys := make([]string, 0, len(webhooks))
 	for index := range webhooks {
 		if webhooks[index].ID == 0 {
 			continue
@@ -302,9 +304,32 @@ func (h *WebhookHandler) webhookResourceVersions(
 		subject := services.WebhookAdminSubject(webhooks[index].ID)
 		subjectToID[subject] = webhooks[index].ID
 		subjects = append(subjects, subject)
+		key := services.AdminResourceVersionKey(scope, subject)
+		keyToID[key] = webhooks[index].ID
+		keys = append(keys, key)
 	}
 	if len(subjects) == 0 {
 		return versions, nil
+	}
+	var anchors []struct {
+		Key     string
+		Version int
+	}
+	if err := h.db.WithContext(ctx).
+		Model(&models.SystemConfig{}).
+		Select("key, version").
+		Where("key IN ?", keys).
+		Scan(&anchors).Error; err != nil {
+		return nil, fmt.Errorf(
+			"load Webhook administrator version anchors: %w",
+			err,
+		)
+	}
+	for index := range anchors {
+		configID := keyToID[anchors[index].Key]
+		if configID != 0 && anchors[index].Version > 0 {
+			versions[configID] = uint64(anchors[index].Version)
+		}
 	}
 	var rows []struct {
 		Subject string
@@ -329,7 +354,9 @@ func (h *WebhookHandler) webhookResourceVersions(
 	}
 	for index := range rows {
 		configID := subjectToID[rows[index].Subject]
-		if configID != 0 && rows[index].Version > 0 {
+		if configID != 0 &&
+			versions[configID] == 1 &&
+			rows[index].Version > 0 {
 			versions[configID] = rows[index].Version
 		}
 	}
@@ -909,17 +936,53 @@ func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 		updates["status"] = *req.Status
 	}
 
-	// 执行更新
-	if err := h.db.WithContext(c.Request.Context()).
-		Model(&models.WebhookConfig{}).
-		Where(
-			"id = ? AND organization_id = ? AND project_id = ?",
-			webhook.ID,
-			operation.Scope.OrganizationID,
-			operation.Scope.ProjectID,
-		).
-		Updates(updates).Error; err != nil {
+	// Webhook configuration and the administrator preflight version advance
+	// atomically. This makes emergency-revoke If-Match observe every ordinary
+	// configuration edit rather than only prior administrator events.
+	var resourceVersion uint64
+	if err := scopeddb.TransactionForContext(
+		c.Request.Context(),
+		h.db,
+		func(tx *gorm.DB) error {
+			nextVersion, err :=
+				services.AdvanceWebhookAdminResourceVersionTx(
+					c.Request.Context(),
+					tx,
+					operation.Scope,
+					webhook.ID,
+					userID,
+				)
+			if err != nil {
+				return err
+			}
+			result := tx.WithContext(c.Request.Context()).
+				Model(&models.WebhookConfig{}).
+				Where(
+					"id = ? AND organization_id = ? AND project_id = ?",
+					webhook.ID,
+					operation.Scope.OrganizationID,
+					operation.Scope.ProjectID,
+				).
+				Updates(updates)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return gorm.ErrRecordNotFound
+			}
+			resourceVersion = nextVersion
+			return nil
+		},
+	); err != nil {
 		logHandlerFailure(c, "webhook.update", err)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{
+				"code": 1,
+				"msg":  "webhook不存在",
+				"data": nil,
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code": 1,
 			"msg":  "更新webhook失败",
@@ -940,30 +1003,12 @@ func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 		logHandlerFailure(c, "webhook.reload_after_update", err)
 	}
 
-	versions, versionErr := h.webhookResourceVersions(
-		c.Request.Context(),
-		operation.Scope,
-		[]models.WebhookConfig{webhook},
-	)
-	if versionErr != nil {
-		logHandlerFailure(
-			c,
-			"webhook.update_resource_version",
-			versionErr,
-		)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"code": 1,
-			"msg":  "更新webhook失败",
-			"data": nil,
-		})
-		return
-	}
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"msg":  "更新成功",
 		"data": newWebhookConfigResponse(
 			webhook,
-			versions[webhook.ID],
+			resourceVersion,
 		),
 	})
 }
@@ -1037,14 +1082,46 @@ func (h *WebhookHandler) DeleteWebhook(c *gin.Context) {
 		return
 	}
 
-	// 软删除
-	if err := h.db.WithContext(c.Request.Context()).Where(
-		"id = ? AND organization_id = ? AND project_id = ?",
-		webhook.ID,
-		operation.Scope.OrganizationID,
-		operation.Scope.ProjectID,
-	).Delete(&models.WebhookConfig{}).Error; err != nil {
+	// Soft deletion advances the same durable preflight version in the same
+	// transaction, while immutable delivery snapshots remain routable.
+	if err := scopeddb.TransactionForContext(
+		c.Request.Context(),
+		h.db,
+		func(tx *gorm.DB) error {
+			if _, err :=
+				services.AdvanceWebhookAdminResourceVersionTx(
+					c.Request.Context(),
+					tx,
+					operation.Scope,
+					webhook.ID,
+					c.GetUint("user_id"),
+				); err != nil {
+				return err
+			}
+			result := tx.WithContext(c.Request.Context()).Where(
+				"id = ? AND organization_id = ? AND project_id = ?",
+				webhook.ID,
+				operation.Scope.OrganizationID,
+				operation.Scope.ProjectID,
+			).Delete(&models.WebhookConfig{})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return gorm.ErrRecordNotFound
+			}
+			return nil
+		},
+	); err != nil {
 		logHandlerFailure(c, "webhook.delete", err)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{
+				"code": 1,
+				"msg":  "webhook不存在",
+				"data": nil,
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code": 1,
 			"msg":  "删除webhook失败",

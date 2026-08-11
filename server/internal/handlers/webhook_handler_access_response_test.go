@@ -258,7 +258,10 @@ func TestWebhookResourceVersionPreflightUsesScopedAdminEvents(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&models.DomainEvent{}); err != nil {
+	if err := db.AutoMigrate(
+		&models.DomainEvent{},
+		&models.SystemConfig{},
+	); err != nil {
 		t.Fatal(err)
 	}
 	scope := models.ProjectScope{OrganizationID: 7, ProjectID: 11}

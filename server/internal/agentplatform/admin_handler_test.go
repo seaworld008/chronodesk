@@ -1647,10 +1647,13 @@ func assertAdminDueReplayCommitted(
 	).Error; err != nil {
 		t.Fatal(err)
 	}
-	if currentEvent.PublishedAt != nil {
+	if due.event.PublishedAt == nil ||
+		currentEvent.PublishedAt == nil ||
+		!currentEvent.PublishedAt.Equal(*due.event.PublishedAt) {
 		t.Fatalf(
-			"expired replay retained PublishedAt=%v",
+			"expired replay publication history=%v, want %v",
 			currentEvent.PublishedAt,
+			due.event.PublishedAt,
 		)
 	}
 }

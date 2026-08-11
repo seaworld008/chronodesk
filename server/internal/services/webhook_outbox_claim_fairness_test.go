@@ -863,7 +863,8 @@ func TestProcessOutboxBatchRepeatsStrictBatchCutoffInCandidateAndCAS(
 	var (
 		mu                   sync.Mutex
 		rawHasCutoff         bool
-		secondaryHasCutoff   bool
+		snapshotLockQueries  int
+		snapshotLockMissing  int
 		claimUpdateHasCutoff bool
 	)
 	const (
@@ -880,8 +881,10 @@ func TestProcessOutboxBatchRepeatsStrictBatchCutoffInCandidateAndCAS(
 			}
 			if strings.Contains(sql, "id in (") &&
 				strings.Contains(sql, "webhook_delivery_snapshots") {
-				secondaryHasCutoff =
-					strings.Contains(sql, "created_at < ?")
+				snapshotLockQueries++
+				if !strings.Contains(sql, "created_at < ?") {
+					snapshotLockMissing++
+				}
 			}
 		}); err != nil {
 		t.Fatal(err)
@@ -922,12 +925,14 @@ func TestProcessOutboxBatchRepeatsStrictBatchCutoffInCandidateAndCAS(
 	mu.Lock()
 	defer mu.Unlock()
 	if !rawHasCutoff ||
-		!secondaryHasCutoff ||
+		snapshotLockQueries == 0 ||
+		snapshotLockMissing != 0 ||
 		!claimUpdateHasCutoff {
 		t.Fatalf(
-			"strict cutoff raw=%t secondary=%t CAS=%t",
+			"strict cutoff raw=%t snapshot_locks=%d missing=%d CAS=%t",
 			rawHasCutoff,
-			secondaryHasCutoff,
+			snapshotLockQueries,
+			snapshotLockMissing,
 			claimUpdateHasCutoff,
 		)
 	}

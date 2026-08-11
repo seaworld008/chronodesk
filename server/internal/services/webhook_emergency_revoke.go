@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
@@ -425,6 +426,7 @@ func lockWebhookSnapshotCandidateRows(
 	tx *gorm.DB,
 	scope models.ProjectScope,
 	deliveries []models.OutboxDelivery,
+	batchCreatedBefore time.Time,
 ) error {
 	snapshotSet := make(map[string]struct{}, len(deliveries))
 	for index := range deliveries {
@@ -451,7 +453,11 @@ func lockWebhookSnapshotCandidateRows(
 	var locked []struct {
 		ID string
 	}
-	err := tx.Model(&models.WebhookDeliverySnapshot{}).
+	query := applyOutboxBatchCreatedBefore(
+		tx.Model(&models.WebhookDeliverySnapshot{}),
+		batchCreatedBefore,
+	)
+	err := query.
 		Select("id").
 		Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where(

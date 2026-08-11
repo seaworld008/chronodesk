@@ -30,6 +30,7 @@ func TestWebhookHandlerEncryptsCredentialsAtRest(t *testing.T) {
 		&models.WebhookConfig{},
 		&models.WebhookLog{},
 		&models.DomainEvent{},
+		&models.SystemConfig{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -427,6 +428,7 @@ func TestWebhookHandlerDoesNotExposeAnotherProject(t *testing.T) {
 		&models.User{},
 		&models.WebhookConfig{},
 		&models.DomainEvent{},
+		&models.SystemConfig{},
 	); err != nil {
 		t.Fatal(err)
 	}

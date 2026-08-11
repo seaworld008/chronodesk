@@ -23,7 +23,8 @@
    项目经理或应急平台角色都不能代替项目管理员。
 2. 在 Webhook Settings 刷新列表，取得目标配置当前 `resource_version`。确认
    Project、配置名称和非敏感配置 ID；不要复制或记录 URL、secret、access token
-   或密文 envelope。
+   或密文 envelope。普通配置更新和软删除会在同一事务递增此版本；若刷新后发生
+   任一变更，旧 `If-Match` 必须失败，操作员应重新确认当前状态。
 3. 检查投递列表中 `pending`、`failed`、`dead` 和 `processing` 的数量，并记录
    事件 ID/投递 ID 等非敏感标识。`processing` 可能已经发出，无法召回。
 4. 为一次操作生成新的随机 `Idempotency-Key`。网络超时后重试同一意图时必须复用

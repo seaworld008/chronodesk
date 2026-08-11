@@ -587,7 +587,7 @@ func finalizeWebhookOutboxAttempt(
 			return "", err
 		}
 	}
-	if err := clearOutboxEventPublication(
+	if err := preserveOutboxEventPublication(
 		tx,
 		scope,
 		delivery.EventID,
@@ -794,6 +794,18 @@ func clearOutboxEventPublication(
 		return ErrWebhookOutboxLifecycleInvariant
 	}
 	return nil
+}
+
+// preserveOutboxEventPublication serializes an expiration transition with
+// publication without rewriting immutable event history. An expiration never
+// publishes an event, and a destination that published it earlier remains a
+// durable historical fact.
+func preserveOutboxEventPublication(
+	tx *gorm.DB,
+	scope models.ProjectScope,
+	eventID string,
+) error {
+	return lockOutboxLifecycleEvent(tx, scope, eventID)
 }
 
 func lockOutboxLifecycleEvent(

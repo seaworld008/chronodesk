@@ -32,7 +32,9 @@ Emergency revoke is a separate Human command:
 
 It requires an active, exact `project_admin` Membership, `If-Match` against the
 preflight `resource_version`, and `Idempotency-Key`. Platform role never grants
-project authority.
+project authority. The durable version anchor advances in the same transaction
+as every ordinary configuration update or soft-delete, so an ETag read before
+either mutation cannot authorize a later emergency revoke.
 
 The command runs in one project-scoped transaction with this stable lock order:
 

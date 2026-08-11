@@ -24,6 +24,200 @@ import (
 func TestWebhookOutboxLifecyclePostgresConcurrencyMatrix(t *testing.T) {
 	fixture := newWebhookOutboxLifecyclePostgresFixture(t)
 
+	t.Run(
+		"emergency command revalidates Human membership under runtime RLS and ACL",
+		func(t *testing.T) {
+			fixture.clearRows(t)
+			deadline := fixture.now.Add(time.Hour)
+			active := fixture.seedPair(
+				t,
+				fixture.projectA,
+				models.OutboxDeliveryPending,
+				deadline,
+				"",
+				nil,
+				0,
+			)
+			deleted := fixture.seedSiblingPair(
+				t,
+				fixture.projectA,
+				active.event,
+				models.OutboxDeliveryPending,
+				deadline,
+				"",
+				nil,
+				0,
+			)
+			publishedAt := fixture.now.Add(-time.Hour)
+			if err := fixture.adminScoped.Model(&models.DomainEvent{}).
+				Where("id = ?", active.event.ID).
+				Update("published_at", publishedAt).Error; err != nil {
+				t.Fatal(err)
+			}
+			humanContext, err := WithOperationContext(
+				context.Background(),
+				OperationContext{
+					Scope: fixture.projectA.Scope(),
+					Actor: models.HumanActor(
+						postgresLifecycleEmergencyUserID,
+					),
+					Source: SourceProtocolHumanREST,
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			service := fixture.service(
+				fixture.runtimeA,
+				fixture.now.Add(time.Second),
+			)
+
+			membership := fixture.adminScoped.Model(
+				&models.ProjectMembership{},
+			).Where(
+				"project_id = ? AND user_id = ?",
+				fixture.projectA.ID,
+				postgresLifecycleEmergencyUserID,
+			)
+			if err := membership.Update("is_active", false).Error; err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.EmergencyRevokeWebhook(
+				humanContext,
+				postgresLifecycleConfigAActiveID,
+			); !errors.Is(err, ErrProjectAccessDenied) {
+				t.Fatalf(
+					"inactive membership emergency revoke error = %v",
+					err,
+				)
+			}
+			if current := fixture.loadDelivery(
+				t,
+				active.delivery.ID,
+			); current.Status != models.OutboxDeliveryPending {
+				t.Fatalf(
+					"denied Human revalidation changed delivery: %+v",
+					current,
+				)
+			}
+			if err := fixture.adminScoped.Model(
+				&models.ProjectMembership{},
+			).Where(
+				"project_id = ? AND user_id = ?",
+				fixture.projectA.ID,
+				postgresLifecycleEmergencyUserID,
+			).Update("is_active", true).Error; err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := service.EmergencyRevokeWebhook(
+				humanContext,
+				postgresLifecycleConfigBActiveID,
+			); !errors.Is(err, ErrWebhookConfigNotFound) {
+				t.Fatalf("cross-project emergency revoke error = %v", err)
+			}
+			var foreign models.WebhookConfig
+			if err := fixture.adminScoped.Unscoped().First(
+				&foreign,
+				postgresLifecycleConfigBActiveID,
+			).Error; err != nil {
+				t.Fatal(err)
+			}
+			if foreign.Status != models.WebhookStatusActive {
+				t.Fatalf(
+					"cross-project revoke changed foreign config: %+v",
+					foreign,
+				)
+			}
+
+			activeResult, err := service.EmergencyRevokeWebhook(
+				humanContext,
+				postgresLifecycleConfigAActiveID,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if activeResult.ExpiredDeliveries != 1 ||
+				activeResult.ShreddedSnapshots != 1 ||
+				activeResult.InFlightDeliveries != 0 {
+				t.Fatalf("active runtime revoke = %+v", activeResult)
+			}
+			deletedResult, err := service.EmergencyRevokeWebhook(
+				humanContext,
+				postgresLifecycleConfigADeletedID,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if deletedResult.ExpiredDeliveries != 1 ||
+				deletedResult.ShreddedSnapshots != 1 ||
+				deletedResult.InFlightDeliveries != 0 {
+				t.Fatalf(
+					"soft-deleted runtime revoke = %+v",
+					deletedResult,
+				)
+			}
+			for _, pair := range []postgresLifecyclePair{
+				active,
+				deleted,
+			} {
+				delivery := fixture.loadDelivery(t, pair.delivery.ID)
+				snapshot := fixture.loadSnapshot(t, pair.snapshot.ID)
+				if delivery.Status != models.OutboxDeliveryExpired ||
+					snapshot.CredentialShreddedAt == nil ||
+					snapshot.CredentialShredReason == nil ||
+					*snapshot.CredentialShredReason !=
+						models.WebhookCredentialShredReasonRevoked ||
+					snapshot.Secret != "" ||
+					snapshot.PreviousSecret != "" ||
+					snapshot.PreviousSecretExpiresAt != nil ||
+					snapshot.AccessToken != "" {
+					t.Fatalf(
+						"runtime emergency envelope delivery=%+v snapshot=%+v",
+						delivery,
+						snapshot,
+					)
+				}
+			}
+			var activeConfig, deletedConfig models.WebhookConfig
+			if err := fixture.adminScoped.Unscoped().First(
+				&activeConfig,
+				postgresLifecycleConfigAActiveID,
+			).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.adminScoped.Unscoped().First(
+				&deletedConfig,
+				postgresLifecycleConfigADeletedID,
+			).Error; err != nil {
+				t.Fatal(err)
+			}
+			if activeConfig.Status != models.WebhookStatusDisabled ||
+				activeConfig.UpdatedBy == nil ||
+				*activeConfig.UpdatedBy !=
+					postgresLifecycleEmergencyUserID ||
+				!deletedConfig.DeletedAt.Valid ||
+				deletedConfig.Status != models.WebhookStatusDisabled ||
+				deletedConfig.UpdatedBy == nil ||
+				*deletedConfig.UpdatedBy !=
+					postgresLifecycleEmergencyUserID {
+				t.Fatalf(
+					"runtime config state active=%+v deleted=%+v",
+					activeConfig,
+					deletedConfig,
+				)
+			}
+			event := fixture.loadEvent(t, active.event.ID)
+			if event.PublishedAt == nil ||
+				!event.PublishedAt.Equal(publishedAt) {
+				t.Fatalf(
+					"runtime emergency rewrote publication history: %v",
+					event.PublishedAt,
+				)
+			}
+		},
+	)
+
 	t.Run("active and soft-deleted config lock anchors", func(t *testing.T) {
 		ctx := fixture.workerContext(
 			t,
@@ -876,7 +1070,7 @@ func TestWebhookOutboxLifecyclePostgresConcurrencyMatrix(t *testing.T) {
 		)
 	})
 
-	t.Run("event clear failure rolls back cleanup envelope", func(t *testing.T) {
+	t.Run("cleanup never updates prior event publication history", func(t *testing.T) {
 		fixture.clearRows(t)
 		deadline := fixture.now.Add(-time.Second)
 		pair := fixture.seedPair(
@@ -902,29 +1096,32 @@ func TestWebhookOutboxLifecyclePostgresConcurrencyMatrix(t *testing.T) {
 			context.Background(),
 			1,
 		)
-		if err == nil {
-			t.Fatal("injected event publication clear failure was ignored")
+		if err != nil {
+			t.Fatal(err)
 		}
 		if result.Attempted != 1 ||
-			result.Expired != 0 ||
-			result.Malformed != 1 {
-			t.Fatalf("event clear rollback result = %+v", result)
+			result.Expired != 1 ||
+			result.Malformed != 0 {
+			t.Fatalf("publication-preserving cleanup result = %+v", result)
 		}
 		delivery := fixture.loadDelivery(t, pair.delivery.ID)
 		snapshot := fixture.loadSnapshot(t, pair.snapshot.ID)
 		event := fixture.loadEvent(t, pair.event.ID)
-		if delivery.Status != models.OutboxDeliveryPending ||
-			delivery.ExpiredAt != nil ||
+		if delivery.Status != models.OutboxDeliveryExpired ||
+			delivery.ExpiredAt == nil ||
 			delivery.LockedAt != nil ||
 			delivery.LockToken != nil ||
-			snapshot.CredentialShreddedAt != nil ||
-			snapshot.Secret != pair.snapshot.Secret ||
-			snapshot.PreviousSecret != pair.snapshot.PreviousSecret ||
-			snapshot.AccessToken != pair.snapshot.AccessToken ||
+			snapshot.CredentialShreddedAt == nil ||
+			snapshot.CredentialShredReason == nil ||
+			*snapshot.CredentialShredReason !=
+				models.WebhookCredentialShredReasonExpired ||
+			snapshot.Secret != "" ||
+			snapshot.PreviousSecret != "" ||
+			snapshot.AccessToken != "" ||
 			event.PublishedAt == nil ||
 			!event.PublishedAt.Equal(publishedAt) {
 			t.Fatalf(
-				"event clear failure partially committed delivery=%+v snapshot=%+v event=%+v",
+				"cleanup publication history drifted delivery=%+v snapshot=%+v event=%+v",
 				delivery,
 				snapshot,
 				event,
@@ -1116,6 +1313,7 @@ const (
 	postgresLifecycleConfigAActiveID  uint = 1
 	postgresLifecycleConfigADeletedID uint = 2
 	postgresLifecycleConfigBActiveID  uint = 3
+	postgresLifecycleEmergencyUserID  uint = 701
 )
 
 type postgresLifecyclePrivilege struct {
@@ -1328,6 +1526,8 @@ func newWebhookOutboxLifecyclePostgresFixture(
 	tableOnly.Config.IgnoreRelationshipsWhenMigrating = true
 	if err := tableOnly.AutoMigrate(
 		&models.Project{},
+		&models.User{},
+		&models.ProjectMembership{},
 		&models.WebhookConfig{},
 		&models.DomainEvent{},
 		&models.OutboxDelivery{},
@@ -1380,6 +1580,32 @@ func newWebhookOutboxLifecyclePostgresFixture(
 		projectA,
 		projectB,
 	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	emergencyUser := models.User{
+		ID:           postgresLifecycleEmergencyUserID,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+		Username:     "lifecycle-emergency-admin",
+		Email:        "lifecycle-emergency-admin@example.test",
+		PasswordHash: "test-only-password-hash",
+		PlatformRole: models.PlatformRoleMember,
+		Status:       models.UserStatusActive,
+	}
+	emergencyMembership := models.ProjectMembership{
+		ID:        7101,
+		CreatedAt: now,
+		UpdatedAt: now,
+		Version:   1,
+		ProjectID: projectA.ID,
+		UserID:    emergencyUser.ID,
+		Role:      models.ProjectRoleAdmin,
+		IsActive:  true,
+	}
+	if err := adminScoped.Create(&emergencyUser).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := adminScoped.Create(&emergencyMembership).Error; err != nil {
 		t.Fatal(err)
 	}
 	configs := []models.WebhookConfig{
@@ -1477,10 +1703,14 @@ func newWebhookOutboxLifecyclePostgresFixture(
 	roleCreated = true
 	for _, statement := range []string{
 		"GRANT USAGE ON SCHEMA " + quotedSchema + " TO " + quotedRole,
-		"GRANT SELECT ON projects, webhook_configs, domain_events, outbox_deliveries, " +
+		"GRANT SELECT ON projects, users, project_memberships, " +
+			"webhook_configs, domain_events, outbox_deliveries, " +
 			"webhook_delivery_snapshots TO " + quotedRole,
 		"GRANT UPDATE (id) ON projects TO " + quotedRole,
-		"GRANT UPDATE (id) ON webhook_configs TO " + quotedRole,
+		"GRANT UPDATE (id) ON users TO " + quotedRole,
+		"GRANT UPDATE (id) ON project_memberships TO " + quotedRole,
+		"GRANT UPDATE (id, status, updated_at, updated_by) " +
+			"ON webhook_configs TO " + quotedRole,
 		"GRANT UPDATE (published_at) ON domain_events TO " + quotedRole,
 		"GRANT UPDATE (status, attempts, next_attempt_at, locked_at, " +
 			"locked_by, lock_token, last_error, delivered_at, expired_at, " +
@@ -1613,6 +1843,8 @@ func validateLifecyclePostgresRuntimeACL(
 		  AND table_schema = current_schema()
 		  AND table_name IN (
 			'projects',
+			'users',
+			'project_memberships',
 			'webhook_configs',
 			'domain_events',
 			'outbox_deliveries',
@@ -1624,6 +1856,8 @@ func validateLifecyclePostgresRuntimeACL(
 	}
 	wantTablePrivileges := map[string]struct{}{
 		"projects/SELECT":                   {},
+		"users/SELECT":                      {},
+		"project_memberships/SELECT":        {},
 		"webhook_configs/SELECT":            {},
 		"domain_events/SELECT":              {},
 		"outbox_deliveries/SELECT":          {},
@@ -1645,6 +1879,8 @@ func validateLifecyclePostgresRuntimeACL(
 		  AND table_schema = current_schema()
 		  AND table_name IN (
 			'projects',
+			'users',
+			'project_memberships',
 			'webhook_configs',
 			'domain_events',
 			'outbox_deliveries',
@@ -1657,7 +1893,12 @@ func validateLifecyclePostgresRuntimeACL(
 	}
 	wantColumnPrivileges := map[string]struct{}{
 		"projects/id/UPDATE":                                           {},
+		"users/id/UPDATE":                                              {},
+		"project_memberships/id/UPDATE":                                {},
 		"webhook_configs/id/UPDATE":                                    {},
+		"webhook_configs/status/UPDATE":                                {},
+		"webhook_configs/updated_at/UPDATE":                            {},
+		"webhook_configs/updated_by/UPDATE":                            {},
 		"domain_events/published_at/UPDATE":                            {},
 		"outbox_deliveries/status/UPDATE":                              {},
 		"outbox_deliveries/attempts/UPDATE":                            {},

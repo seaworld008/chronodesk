@@ -222,6 +222,198 @@ func assertSnapshotShredded(
 	}
 }
 
+func setWebhookLifecyclePublicationHistory(
+	t *testing.T,
+	fixture *webhookOutboxLifecycleFixture,
+	publishedAt *time.Time,
+) {
+	t.Helper()
+	if publishedAt != nil {
+		deliveredAt := publishedAt.UTC()
+		mixed := models.OutboxDelivery{
+			ID: "00000000-0000-7000-8001-" +
+				fixture.event.ID[len(fixture.event.ID)-12:],
+			OrganizationID:  fixture.scope.OrganizationID,
+			ProjectID:       fixture.scope.ProjectID,
+			EventID:         fixture.event.ID,
+			DestinationType: "event_stream",
+			DestinationID:   "immutable-publication-history",
+			Status:          models.OutboxDeliverySucceeded,
+			MaxAttempts:     1,
+			NextAttemptAt:   deliveredAt,
+			DeliveredAt:     &deliveredAt,
+		}
+		if err := fixture.db.Create(&mixed).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fixture.db.Model(&models.DomainEvent{}).
+		Where("id = ?", fixture.event.ID).
+		Update("published_at", publishedAt).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertWebhookLifecyclePublicationHistory(
+	t *testing.T,
+	fixture *webhookOutboxLifecycleFixture,
+	want *time.Time,
+) {
+	t.Helper()
+	var event models.DomainEvent
+	if err := fixture.db.First(
+		&event,
+		"id = ?",
+		fixture.event.ID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if want == nil {
+		if event.PublishedAt != nil {
+			t.Fatalf("unpublished event gained published_at %v", event.PublishedAt)
+		}
+		return
+	}
+	if event.PublishedAt == nil || !event.PublishedAt.Equal(want.UTC()) {
+		t.Fatalf(
+			"published event history = %v, want %v",
+			event.PublishedAt,
+			want.UTC(),
+		)
+	}
+}
+
+func TestPostRevokeProcessingFinalizePreservesDomainEventPublicationHistory(
+	t *testing.T,
+) {
+	for _, published := range []bool{false, true} {
+		t.Run(fmt.Sprintf("published_%t", published), func(t *testing.T) {
+			now := time.Date(2026, time.August, 11, 12, 0, 0, 0, time.UTC)
+			fixture := newWebhookOutboxLifecycleFixture(t, now)
+			_, claim := fixture.claim(t, "post-revoke-finalize")
+			var publishedAt *time.Time
+			if published {
+				value := now.Add(-time.Hour)
+				publishedAt = &value
+			}
+			setWebhookLifecyclePublicationHistory(t, fixture, publishedAt)
+			if _, err := fixture.service.EmergencyRevokeWebhook(
+				webhookEmergencyAdminContext(
+					t,
+					fixture,
+					models.ProjectRoleAdmin,
+				),
+				fixture.config.ID,
+			); err != nil {
+				t.Fatal(err)
+			}
+			result, err := fixture.service.FinalizeOutboxAttempt(
+				fixture.worker,
+				claim,
+				OutboxKnownFailure(errors.New("safe post-revoke failure")),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != models.OutboxDeliveryExpired {
+				t.Fatalf("post-revoke finalize status = %s", result.Status)
+			}
+			assertWebhookLifecyclePublicationHistory(
+				t,
+				fixture,
+				publishedAt,
+			)
+		})
+	}
+}
+
+func TestPostRevokeProcessingCleanupPreservesDomainEventPublicationHistory(
+	t *testing.T,
+) {
+	for _, published := range []bool{false, true} {
+		t.Run(fmt.Sprintf("published_%t", published), func(t *testing.T) {
+			now := time.Date(2026, time.August, 11, 13, 0, 0, 0, time.UTC)
+			fixture := newWebhookOutboxLifecycleFixture(t, now)
+			fixture.claim(t, "post-revoke-cleanup")
+			var publishedAt *time.Time
+			if published {
+				value := now.Add(-time.Hour)
+				publishedAt = &value
+			}
+			setWebhookLifecyclePublicationHistory(t, fixture, publishedAt)
+			if _, err := fixture.service.EmergencyRevokeWebhook(
+				webhookEmergencyAdminContext(
+					t,
+					fixture,
+					models.ProjectRoleAdmin,
+				),
+				fixture.config.ID,
+			); err != nil {
+				t.Fatal(err)
+			}
+			fixture.setNow(fixture.snapshot.CredentialExpiresAt.Add(time.Second))
+			result, err := fixture.service.ExpireWebhookDeliveriesBatch(
+				context.Background(),
+				10,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Expired != 1 {
+				t.Fatalf("post-revoke cleanup = %+v, want one expiry", result)
+			}
+			assertWebhookLifecyclePublicationHistory(
+				t,
+				fixture,
+				publishedAt,
+			)
+		})
+	}
+}
+
+func TestWebhookReplayExpirationPreservesDomainEventPublicationHistory(
+	t *testing.T,
+) {
+	for _, published := range []bool{false, true} {
+		t.Run(fmt.Sprintf("published_%t", published), func(t *testing.T) {
+			now := time.Date(2026, time.August, 11, 14, 0, 0, 0, time.UTC)
+			fixture := newWebhookOutboxLifecycleFixture(t, now)
+			if err := fixture.db.Model(&models.OutboxDelivery{}).
+				Where("id = ?", fixture.delivery.ID).
+				Update("status", models.OutboxDeliveryFailed).Error; err != nil {
+				t.Fatal(err)
+			}
+			var publishedAt *time.Time
+			if published {
+				value := now.Add(-time.Hour)
+				publishedAt = &value
+			}
+			setWebhookLifecyclePublicationHistory(t, fixture, publishedAt)
+			fixture.setNow(fixture.snapshot.CredentialExpiresAt.Add(time.Second))
+			result, err := fixture.service.ReplayOutboxCommand(
+				webhookEmergencyAdminContext(
+					t,
+					fixture,
+					models.ProjectRoleAdmin,
+				),
+				fixture.delivery.ID,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Disposition != OutboxReplayExpired ||
+				!result.Materialized {
+				t.Fatalf("expired replay result = %+v", result)
+			}
+			assertWebhookLifecyclePublicationHistory(
+				t,
+				fixture,
+				publishedAt,
+			)
+		})
+	}
+}
+
 func TestWebhookOutboxClaimRejectsExpiredCandidateAndCAS(t *testing.T) {
 	now := time.Date(2026, time.August, 10, 8, 0, 0, 0, time.UTC)
 	fixture := newWebhookOutboxLifecycleFixture(t, now)

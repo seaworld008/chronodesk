@@ -852,7 +852,7 @@ func expireWebhookOutboxCandidate(
 			return false, err
 		}
 	}
-	if err := clearOutboxEventPublication(
+	if err := preserveOutboxEventPublication(
 		tx,
 		scope,
 		delivery.EventID,

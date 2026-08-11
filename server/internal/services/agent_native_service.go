@@ -3492,6 +3492,7 @@ func (s *AgentNativeService) claimPendingOutbox(
 						tx,
 						operation.Scope,
 						candidates,
+						batchCreatedBefore,
 					); err != nil {
 						return err
 					}
@@ -3959,7 +3960,7 @@ func replayWebhookOutboxTx(
 		); err != nil {
 			return OutboxReplayResult{}, err
 		}
-		if err := clearOutboxEventPublication(
+		if err := preserveOutboxEventPublication(
 			tx,
 			scope,
 			delivery.EventID,
