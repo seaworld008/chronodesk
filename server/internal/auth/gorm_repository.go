@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"github.com/seaworld008/chronodesk/server/internal/security"
 	"gorm.io/gorm"
@@ -514,6 +515,74 @@ func loginOTPStorageHash(storedSecret string) string {
 	return bearerTokenDigest("login-otp-storage", storedSecret)
 }
 
+type preparedLoginSessionRows struct {
+	refresh RefreshToken
+	history models.LoginHistory
+	attempt LoginAttempt
+}
+
+func prepareLoginSessionRows(
+	userID uint,
+	committedAt time.Time,
+	refresh *RefreshToken,
+	history *models.LoginHistory,
+	attempt *LoginAttempt,
+) (*preparedLoginSessionRows, error) {
+	if err := validateLoginSessionRows(
+		userID,
+		committedAt,
+		refresh,
+		history,
+		attempt,
+	); err != nil {
+		return nil, err
+	}
+	prepared := &preparedLoginSessionRows{
+		refresh: *refresh,
+		history: *history,
+		attempt: *attempt,
+	}
+	prepared.refresh.ID = 0
+	prepared.refresh.Token = bearerTokenDigest(
+		"refresh-token",
+		refresh.Token,
+	)
+	prepared.history.ID = 0
+	prepared.attempt.ID = 0
+	prepared.attempt.User = nil
+	return prepared, nil
+}
+
+func createLoginSessionRowsTx(
+	tx *gorm.DB,
+	prepared *preparedLoginSessionRows,
+) error {
+	if tx == nil || prepared == nil {
+		return ErrAtomicLoginSessionUnavailable
+	}
+	if err := tx.Create(&prepared.refresh).Error; err != nil {
+		return err
+	}
+	if err := tx.Create(&prepared.history).Error; err != nil {
+		return err
+	}
+	return tx.Create(&prepared.attempt).Error
+}
+
+func copyPreparedLoginSessionRowIDs(
+	refresh *RefreshToken,
+	history *models.LoginHistory,
+	attempt *LoginAttempt,
+	prepared *preparedLoginSessionRows,
+) {
+	if refresh == nil || history == nil || attempt == nil || prepared == nil {
+		return
+	}
+	refresh.ID = prepared.refresh.ID
+	history.ID = prepared.history.ID
+	attempt.ID = prepared.attempt.ID
+}
+
 // CreateRefreshToken 创建刷新令牌
 func (r *GormTokenRepository) CreateRefreshToken(ctx context.Context, token *RefreshToken) error {
 	if token == nil || strings.TrimSpace(token.Token) == "" {
@@ -542,17 +611,16 @@ func (r *GormTokenRepository) CommitLoginSession(
 		return err
 	}
 
-	storedRefresh := *command.RefreshToken
-	storedRefresh.ID = 0
-	storedRefresh.Token = bearerTokenDigest(
-		"refresh-token",
-		command.RefreshToken.Token,
+	preparedSession, err := prepareLoginSessionRows(
+		command.UserID,
+		command.CommittedAt,
+		command.RefreshToken,
+		command.LoginHistory,
+		command.SuccessfulAttempt,
 	)
-	storedHistory := *command.LoginHistory
-	storedHistory.ID = 0
-	storedAttempt := *command.SuccessfulAttempt
-	storedAttempt.ID = 0
-	storedAttempt.User = nil
+	if err != nil {
+		return err
+	}
 	var storedNewDevice *models.OTPTrustedDevice
 	if command.NewTrustedDevice != nil {
 		copied := *command.NewTrustedDevice
@@ -560,7 +628,7 @@ func (r *GormTokenRepository) CommitLoginSession(
 		storedNewDevice = &copied
 	}
 
-	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		lockedUser, err := lockAuthUserForUpdate(tx, command.UserID)
 		if err != nil {
 			return err
@@ -610,20 +678,17 @@ func (r *GormTokenRepository) CommitLoginSession(
 				return err
 			}
 		}
-		if err := tx.Create(&storedRefresh).Error; err != nil {
-			return err
-		}
-		if err := tx.Create(&storedHistory).Error; err != nil {
-			return err
-		}
-		return tx.Create(&storedAttempt).Error
+		return createLoginSessionRowsTx(tx, preparedSession)
 	})
 	if err != nil {
 		return err
 	}
-	command.RefreshToken.ID = storedRefresh.ID
-	command.LoginHistory.ID = storedHistory.ID
-	command.SuccessfulAttempt.ID = storedAttempt.ID
+	copyPreparedLoginSessionRowIDs(
+		command.RefreshToken,
+		command.LoginHistory,
+		command.SuccessfulAttempt,
+		preparedSession,
+	)
 	if command.NewTrustedDevice != nil && storedNewDevice != nil {
 		command.NewTrustedDevice.ID = storedNewDevice.ID
 	}
@@ -632,30 +697,18 @@ func (r *GormTokenRepository) CommitLoginSession(
 
 func validateLoginSessionCommit(command *LoginSessionCommit) error {
 	if command == nil ||
-		command.UserID == 0 ||
-		command.CommittedAt.IsZero() ||
-		command.RefreshToken == nil ||
-		command.LoginHistory == nil ||
-		command.SuccessfulAttempt == nil ||
 		command.ExpectedPrincipal == nil ||
-		command.ExpectedEmailPolicy == nil ||
-		command.RefreshToken.UserID != command.UserID ||
-		command.LoginHistory.UserID != command.UserID ||
-		strings.TrimSpace(command.RefreshToken.Token) == "" ||
-		strings.TrimSpace(command.RefreshToken.SessionID) == "" ||
-		command.RefreshToken.SessionID != command.LoginHistory.SessionID ||
-		!command.RefreshToken.ExpiresAt.After(command.CommittedAt) ||
-		!command.LoginHistory.IsActive ||
-		command.LoginHistory.LoginStatus != models.LoginStatusSuccess ||
-		!command.LoginHistory.LoginMethod.IsValid() {
+		command.ExpectedEmailPolicy == nil {
 		return ErrInvalidToken
 	}
-	if command.SuccessfulAttempt.UserID == nil ||
-		*command.SuccessfulAttempt.UserID != command.UserID ||
-		strings.TrimSpace(command.SuccessfulAttempt.Email) == "" ||
-		!command.SuccessfulAttempt.Success ||
-		strings.TrimSpace(command.SuccessfulAttempt.FailReason) != "" {
-		return ErrInvalidToken
+	if err := validateLoginSessionRows(
+		command.UserID,
+		command.CommittedAt,
+		command.RefreshToken,
+		command.LoginHistory,
+		command.SuccessfulAttempt,
+	); err != nil {
+		return err
 	}
 	principal := command.ExpectedPrincipal
 	if strings.TrimSpace(principal.Email) == "" ||
@@ -687,6 +740,72 @@ func validateLoginSessionCommit(command *LoginSessionCommit) error {
 		return ErrTrustedDeviceInvalid
 	}
 	return nil
+}
+
+func validateLoginSessionRows(
+	userID uint,
+	committedAt time.Time,
+	refresh *RefreshToken,
+	history *models.LoginHistory,
+	attempt *LoginAttempt,
+) error {
+	if userID == 0 ||
+		committedAt.IsZero() ||
+		refresh == nil ||
+		history == nil ||
+		attempt == nil ||
+		refresh.UserID != userID ||
+		history.UserID != userID ||
+		strings.TrimSpace(refresh.Token) == "" ||
+		strings.TrimSpace(refresh.SessionID) == "" ||
+		len(strings.TrimSpace(refresh.SessionID)) > 128 ||
+		refresh.SessionID != history.SessionID ||
+		!refresh.ExpiresAt.After(committedAt) ||
+		!refresh.CreatedAt.Equal(committedAt) ||
+		!history.LoginTime.Equal(committedAt) ||
+		history.LastActivityAt == nil ||
+		!history.LastActivityAt.Equal(committedAt) ||
+		!history.IsActive ||
+		history.LoginStatus != models.LoginStatusSuccess ||
+		!history.LoginMethod.IsValid() {
+		return ErrInvalidToken
+	}
+	if attempt.UserID == nil ||
+		*attempt.UserID != userID ||
+		strings.TrimSpace(attempt.Email) == "" ||
+		attempt.Email != history.Email ||
+		!attempt.Success ||
+		strings.TrimSpace(attempt.FailReason) != "" ||
+		!attempt.CreatedAt.Equal(committedAt) {
+		return ErrInvalidToken
+	}
+	return nil
+}
+
+func normalizeRegistrationUserInsertError(err error) error {
+	if !isRegistrationUserIdentityUniqueConflict(err) {
+		return err
+	}
+	return ErrUserExists
+}
+
+func isRegistrationUserIdentityUniqueConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, gorm.ErrDuplicatedKey) {
+		return true
+	}
+	var postgresError *pgconn.PgError
+	if errors.As(err, &postgresError) && postgresError.Code == "23505" {
+		constraint := strings.ToLower(postgresError.ConstraintName)
+		return strings.Contains(constraint, "users") &&
+			(strings.Contains(constraint, "email") ||
+				strings.Contains(constraint, "username"))
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "unique constraint failed: users.email") ||
+		strings.Contains(message, "unique constraint failed: users.username")
 }
 
 // lockAndMatchEmailVerificationPolicyTx closes the interval between reading

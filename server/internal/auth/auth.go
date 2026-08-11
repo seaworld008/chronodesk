@@ -33,6 +33,9 @@ var (
 	ErrAtomicLoginSessionUnavailable = errors.New(
 		"atomic login session repository is unavailable",
 	)
+	ErrAtomicRegistrationUnavailable = errors.New(
+		"atomic registration repository is unavailable",
+	)
 	ErrEmailVerificationPolicyUnavailable = errors.New(
 		"email verification policy is unavailable",
 	)
@@ -405,6 +408,44 @@ type LoginSessionCommit struct {
 	NewTrustedDevice       *models.OTPTrustedDevice
 }
 
+// RegistrationSessionBuilder constructs one registration session only after
+// the transaction has allocated the User ID. Implementations must be pure CPU
+// work: no database, network, filesystem, or other externally observable I/O.
+type RegistrationSessionBuilder func(
+	userID uint,
+	committedAt time.Time,
+) (*RegistrationSession, error)
+
+// RegistrationSession contains both the bearer response and the durable rows
+// that authorize it. The repository holds this value until the surrounding
+// registration transaction commits, so a failed or unknown commit never
+// exposes bearer credentials to the caller.
+type RegistrationSession struct {
+	AccessToken       string
+	RefreshToken      string
+	SessionID         string
+	RefreshAuthority  *RefreshToken
+	LoginHistory      *models.LoginHistory
+	SuccessfulAttempt *LoginAttempt
+}
+
+// RegistrationCommit is the complete persistence unit for registration. An
+// enabled policy requires Verification and no session builder. A disabled
+// policy requires a builder and commits the optional session with the account,
+// event, and Outbox intent.
+type RegistrationCommit struct {
+	CommittedAt         time.Time
+	User                *User
+	Profile             *UserProfile
+	Verification        *EmailVerification
+	ExpectedEmailPolicy *EmailVerificationPolicySnapshot
+	BuildSession        RegistrationSessionBuilder
+}
+
+type RegistrationCommitResult struct {
+	Session *RegistrationSession
+}
+
 // LoginPrincipalSnapshot binds the final session commit to the exact
 // authentication state that was verified before tokens were minted. The OTP
 // storage hash is an opaque digest of the encrypted-at-rest value, never the
@@ -431,6 +472,16 @@ type EmailVerificationPolicySnapshot struct {
 // writes would reopen logout-all and trusted-device TOCTOU windows.
 type AtomicLoginSessionRepository interface {
 	CommitLoginSession(context.Context, *LoginSessionCommit) error
+}
+
+// AtomicRegistrationRepository is a required capability of the durable
+// authentication Outbox repository. Registration must fail closed when this
+// capability is absent; there is no legacy split-write fallback.
+type AtomicRegistrationRepository interface {
+	CommitRegistration(
+		context.Context,
+		*RegistrationCommit,
+	) (*RegistrationCommitResult, error)
 }
 
 // UserInfo 用户信息
@@ -754,13 +805,18 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 		return nil, err
 	}
 
-	// 检查用户是否已存在
+	// 预检查仅用于快速反馈；唯一索引仍是并发注册的最终裁决者。数据库
+	// 错误必须 fail closed，不能被误当成“用户不存在”。
 	if _, err := s.userRepo.GetByEmail(ctx, req.Email); err == nil {
 		return nil, ErrUserExists
+	} else if !errors.Is(err, ErrUserNotFound) {
+		return nil, fmt.Errorf("check registration email: %w", err)
 	}
 
 	if _, err := s.userRepo.GetByUsername(ctx, req.Username); err == nil {
 		return nil, ErrUserExists
+	} else if !errors.Is(err, ErrUserNotFound) {
+		return nil, fmt.Errorf("check registration username: %w", err)
 	}
 
 	// 检查邮箱验证是否启用
@@ -775,6 +831,8 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 		return nil, fmt.Errorf("failed to hash password: %w", err)
 	}
 
+	committedAt := time.Now().UTC()
+
 	// 创建用户
 	user := &User{
 		Username:          req.Username,
@@ -783,11 +841,12 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 		PlatformRole:      PlatformRoleMember,
 		Status:            StatusActive,
 		EmailVerified:     !emailVerificationEnabled,
-		PasswordChangedAt: timePtr(time.Now()),
+		PasswordChangedAt: timePtr(committedAt),
 	}
 
 	if !emailVerificationEnabled {
-		user.EmailVerifiedAt = timePtr(time.Now())
+		user.EmailVerifiedAt = timePtr(committedAt)
+		user.LastLoginAt = timePtr(committedAt)
 	}
 
 	// 创建用户资料
@@ -810,21 +869,83 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 		verification = &EmailVerification{
 			Email:     user.Email,
 			Token:     token,
-			ExpiresAt: time.Now().Add(s.config.EmailVerificationExpire),
+			ExpiresAt: committedAt.Add(s.config.EmailVerificationExpire),
 		}
 	}
-	if s.emailOutboxRepo == nil {
-		return nil, errors.New("durable authentication email Outbox is unavailable")
+	registrationRepository, ok := s.emailOutboxRepo.(AtomicRegistrationRepository)
+	if !ok || registrationRepository == nil {
+		return nil, ErrAtomicRegistrationUnavailable
 	}
-	if err := s.emailOutboxRepo.Register(
+	var buildSession RegistrationSessionBuilder
+	if !emailVerificationEnabled {
+		buildSession = func(
+			userID uint,
+			sessionCommittedAt time.Time,
+		) (*RegistrationSession, error) {
+			sessionID, err := GenerateSecureToken(16)
+			if err != nil {
+				return nil, fmt.Errorf("generate registration session id: %w", err)
+			}
+			accessToken, refreshToken, err := s.jwtManager.GenerateTokenPair(
+				userID,
+				user.PlatformRole,
+				sessionID,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("generate registration tokens: %w", err)
+			}
+			refreshAuthority, err := s.newRefreshTokenRecordAt(
+				userID,
+				refreshToken,
+				sessionID,
+				ipAddress,
+				userAgent,
+				sessionCommittedAt,
+			)
+			if err != nil {
+				return nil, err
+			}
+			sessionUser := *user
+			sessionUser.ID = userID
+			sessionUser.LastLoginAt = timePtr(sessionCommittedAt)
+			return &RegistrationSession{
+				AccessToken:      accessToken,
+				RefreshToken:     refreshToken,
+				SessionID:        sessionID,
+				RefreshAuthority: refreshAuthority,
+				LoginHistory: newLoginHistorySuccess(
+					&sessionUser,
+					ipAddress,
+					userAgent,
+					sessionID,
+					sessionCommittedAt,
+					models.LoginMethodPassword,
+				),
+				SuccessfulAttempt: &LoginAttempt{
+					UserID:    &userID,
+					Email:     user.Email,
+					IPAddress: ipAddress,
+					UserAgent: userAgent,
+					Success:   true,
+					CreatedAt: sessionCommittedAt,
+				},
+			}, nil
+		}
+	}
+	result, err := registrationRepository.CommitRegistration(
 		ctx,
-		user,
-		profile,
-		verification,
-		&EmailVerificationPolicySnapshot{
-			Enabled: emailVerificationEnabled,
+		&RegistrationCommit{
+			CommittedAt:  committedAt,
+			User:         user,
+			Profile:      profile,
+			Verification: verification,
+			ExpectedEmailPolicy: &EmailVerificationPolicySnapshot{
+				Enabled: emailVerificationEnabled,
+			},
+			BuildSession: buildSession,
 		},
-	); err != nil {
+	)
+	if err != nil {
 		return nil, fmt.Errorf("failed to register user: %w", err)
 	}
 
@@ -835,44 +956,18 @@ func (s *AuthService) Register(ctx context.Context, req *RegisterRequest, ipAddr
 		}, nil
 	}
 
-	sessionID, err := GenerateSecureToken(16)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate session id: %w", err)
-	}
-	// 访问令牌与刷新令牌必须绑定同一个持久化会话。先生成会话 ID，
-	// 再签发令牌，旧的不含 sid 的令牌会按最新安全契约失效。
-	accessToken, refreshToken, err := s.jwtManager.GenerateTokenPair(
-		user.ID,
-		user.PlatformRole,
-		sessionID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate tokens: %w", err)
-	}
-	loginTime := time.Now()
-
-	// 保存刷新令牌
-	if err := s.saveRefreshToken(ctx, user.ID, refreshToken, sessionID, ipAddress, userAgent); err != nil {
-		return nil, fmt.Errorf("failed to save refresh token: %w", err)
-	}
-
-	if err := s.recordLoginHistorySuccess(
-		ctx,
-		user,
-		ipAddress,
-		userAgent,
-		sessionID,
-		loginTime,
-		determineLoginMethod(user, nil, false, false),
-	); err != nil {
-		_ = s.tokenRepo.RevokeSession(ctx, user.ID, sessionID)
-		return nil, fmt.Errorf("failed to persist login session: %w", err)
+	if result == nil ||
+		result.Session == nil ||
+		strings.TrimSpace(result.Session.AccessToken) == "" ||
+		strings.TrimSpace(result.Session.RefreshToken) == "" ||
+		strings.TrimSpace(result.Session.SessionID) == "" {
+		return nil, ErrAtomicRegistrationUnavailable
 	}
 
 	return &AuthResponse{
 		User:         s.buildUserInfo(user, profile),
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
+		AccessToken:  result.Session.AccessToken,
+		RefreshToken: result.Session.RefreshToken,
 		ExpiresIn:    int64(s.config.AccessTokenExpire.Seconds()),
 		TokenType:    "Bearer",
 	}, nil
@@ -2002,34 +2097,6 @@ func (s *AuthService) recordLoginAttempt(
 	return s.loginAttemptRepo.Create(ctx, attempt)
 }
 
-func (s *AuthService) saveRefreshToken(ctx context.Context, userID uint, token, sessionID, ipAddress, userAgent string) error {
-	refreshToken, err := s.newRefreshTokenRecord(
-		userID,
-		token,
-		sessionID,
-		ipAddress,
-		userAgent,
-	)
-	if err != nil {
-		return err
-	}
-	return s.tokenRepo.CreateRefreshToken(ctx, refreshToken)
-}
-
-func (s *AuthService) newRefreshTokenRecord(
-	userID uint,
-	token, sessionID, ipAddress, userAgent string,
-) (*RefreshToken, error) {
-	return s.newRefreshTokenRecordAt(
-		userID,
-		token,
-		sessionID,
-		ipAddress,
-		userAgent,
-		time.Now(),
-	)
-}
-
 func (s *AuthService) newRefreshTokenRecordAt(
 	userID uint,
 	token, sessionID, ipAddress, userAgent string,
@@ -2048,29 +2115,6 @@ func (s *AuthService) newRefreshTokenRecordAt(
 		UserAgent: userAgent,
 		CreatedAt: issuedAt,
 	}, nil
-}
-
-func (s *AuthService) recordLoginHistorySuccess(
-	ctx context.Context,
-	user *User,
-	ipAddress, userAgent, sessionID string,
-	loginTime time.Time,
-	method models.LoginMethod,
-) error {
-	if s.loginHistoryRepo == nil || user == nil {
-		return errors.New("login session repository is unavailable")
-	}
-	return s.loginHistoryRepo.Create(
-		ctx,
-		newLoginHistorySuccess(
-			user,
-			ipAddress,
-			userAgent,
-			sessionID,
-			loginTime,
-			method,
-		),
-	)
 }
 
 func newLoginHistorySuccess(

@@ -38,6 +38,9 @@ func newAuthEmailOutboxTestRepository(
 		&models.EmailConfig{},
 		&EmailVerification{},
 		&PasswordReset{},
+		&RefreshToken{},
+		&models.LoginHistory{},
+		&LoginAttempt{},
 		&models.Organization{},
 		&models.BusinessUnit{},
 		&models.Project{},
@@ -475,13 +478,15 @@ func TestRegistrationRollsBackUserProfileCredentialEventAndOutbox(t *testing.T) 
 				_ = db.Callback().Create().Remove(callbackName)
 			})
 
+			committedAt := time.Now().UTC()
 			user := &User{
-				Username:      "registration-rollback",
-				Email:         "registration-rollback@example.test",
-				PasswordHash:  "test-password-hash",
-				PlatformRole:  PlatformRoleMember,
-				Status:        StatusActive,
-				EmailVerified: false,
+				Username:          "registration-rollback",
+				Email:             "registration-rollback@example.test",
+				PasswordHash:      "test-password-hash",
+				PlatformRole:      PlatformRoleMember,
+				Status:            StatusActive,
+				EmailVerified:     false,
+				PasswordChangedAt: &committedAt,
 			}
 			profile := &UserProfile{
 				FirstName: "事务",
@@ -490,16 +495,21 @@ func TestRegistrationRollsBackUserProfileCredentialEventAndOutbox(t *testing.T) 
 				Language:  "zh-CN",
 			}
 			seedAuthEmailVerificationPolicy(t, db, true)
-			err := repository.Register(
+			_, err := repository.CommitRegistration(
 				context.Background(),
-				user,
-				profile,
-				&EmailVerification{
-					Email:     user.Email,
-					Token:     "registration-verification-secret",
-					ExpiresAt: time.Now().Add(time.Hour),
+				&RegistrationCommit{
+					CommittedAt: committedAt,
+					User:        user,
+					Profile:     profile,
+					Verification: &EmailVerification{
+						Email:     user.Email,
+						Token:     "registration-verification-secret",
+						ExpiresAt: committedAt.Add(time.Hour),
+					},
+					ExpectedEmailPolicy: &EmailVerificationPolicySnapshot{
+						Enabled: true,
+					},
 				},
-				&EmailVerificationPolicySnapshot{Enabled: true},
 			)
 			if err == nil {
 				t.Fatal("expected injected registration failure")
@@ -545,6 +555,7 @@ func TestRegistrationRejectsEmailPolicyChangedBeforeFinalTransaction(
 		Status:            StatusActive,
 		EmailVerified:     true,
 		EmailVerifiedAt:   &now,
+		LastLoginAt:       &now,
 		PasswordChangedAt: &now,
 	}
 	profile := &UserProfile{
@@ -553,12 +564,21 @@ func TestRegistrationRejectsEmailPolicyChangedBeforeFinalTransaction(
 		Timezone:  "UTC",
 		Language:  "zh-CN",
 	}
-	err := repository.Register(
+	_, err := repository.CommitRegistration(
 		context.Background(),
-		user,
-		profile,
-		nil,
-		&EmailVerificationPolicySnapshot{Enabled: false},
+		&RegistrationCommit{
+			CommittedAt: now,
+			User:        user,
+			Profile:     profile,
+			ExpectedEmailPolicy: &EmailVerificationPolicySnapshot{
+				Enabled: false,
+			},
+			BuildSession: registrationSessionBuilderForTest(
+				user,
+				"127.0.0.1",
+				"policy-change-test",
+			),
+		},
 	)
 	if !errors.Is(err, ErrEmailVerificationPolicyChanged) {
 		t.Fatalf("stale registration policy error = %v", err)
@@ -600,7 +620,7 @@ func TestRegistrationCommitsUserProfileAndEmailIntentTogether(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			db, repository, _ := newAuthEmailOutboxTestRepository(t)
-			verifiedAt := time.Now()
+			verifiedAt := time.Now().UTC()
 			user := &User{
 				Username:          "registration-success",
 				Email:             "registration-success@example.test",
@@ -612,6 +632,7 @@ func TestRegistrationCommitsUserProfileAndEmailIntentTogether(t *testing.T) {
 			}
 			if !test.requireVerify {
 				user.EmailVerifiedAt = &verifiedAt
+				user.LastLoginAt = &verifiedAt
 			}
 			profile := &UserProfile{
 				FirstName:   "持久",
@@ -631,13 +652,25 @@ func TestRegistrationCommitsUserProfileAndEmailIntentTogether(t *testing.T) {
 				}
 			}
 			seedAuthEmailVerificationPolicy(t, db, test.requireVerify)
-			if err := repository.Register(
+			var buildSession RegistrationSessionBuilder
+			if !test.requireVerify {
+				buildSession = registrationSessionBuilderForTest(
+					user,
+					"127.0.0.1",
+					"registration-success-test",
+				)
+			}
+			if _, err := repository.CommitRegistration(
 				context.Background(),
-				user,
-				profile,
-				verification,
-				&EmailVerificationPolicySnapshot{
-					Enabled: test.requireVerify,
+				&RegistrationCommit{
+					CommittedAt:  verifiedAt,
+					User:         user,
+					Profile:      profile,
+					Verification: verification,
+					ExpectedEmailPolicy: &EmailVerificationPolicySnapshot{
+						Enabled: test.requireVerify,
+					},
+					BuildSession: buildSession,
 				},
 			); err != nil {
 				t.Fatal(err)
