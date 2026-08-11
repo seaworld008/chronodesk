@@ -40,7 +40,7 @@ project authority. The durable version anchor advances in the same transaction
 as every ordinary configuration update or soft-delete, so an ETag read before
 either mutation cannot authorize a later emergency revoke. Exact-admin
 preflight remains available for a live or soft-deleted tombstone and returns
-only `config_id`, status, deletion state and time, emergency-revoked state, and
+only `config_id`, status, deletion state, emergency-revoked state, and
 `resource_version`. This projection contains no URL or credential and does not
 execute the command; the operator must make a separate irreversible
 confirmation before the POST. A durable emergency-revoked marker is terminal,

@@ -112,7 +112,7 @@ prepared 投递且产生零 HTTP；start-first 会被报告为 in-flight。真�
 留下的 `NULL` 必须保守等待自然完成或 deadline，绝不能批量回填为 prepared。
 
 紧急撤销是独立的 exact `project_admin` 命令。live/tombstone preflight 只返回
-配置 ID、状态、删除信息、撤销状态和版本等无秘密最小投影，并要求操作员另行完成
+配置 ID、状态、删除标记、撤销状态和版本等无秘密最小投影，并要求操作员另行完成
 不可逆确认。命令以强 `If-Match` 进入同一 Project transaction，禁用配置并清空
 `secret`、`previous_secret`、`previous_secret_expires_at`、`access_token`，
 把 `pending/failed/dead` 以及 prepared 投递变为 `expired`，报告无法安全召回的

@@ -45,7 +45,7 @@ dispatch start 与紧急撤销的线性化边界：
    项目经理或应急平台角色都不能代替项目管理员。
 2. 在 Webhook Settings 刷新 exact-admin preflight，取得目标配置当前
    `resource_version`。soft-delete 后只允许通过 tombstone preflight 选择目标。
-   该投影仅包含配置 ID、状态、删除标记/时间、紧急撤销标记和版本，不包含 URL、
+   该投影仅包含配置 ID、状态、删除标记、紧急撤销标记和版本，不包含 URL、
    secret、access token 或密文 envelope。普通 `PUT` 与 `DELETE` 都要求强
    `If-Match`，并在配置变更的同一事务 CAS 此版本；若刷新后发生任一变更，旧
    `If-Match` 必须失败，操作员应重新确认当前状态。
