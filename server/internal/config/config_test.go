@@ -63,6 +63,82 @@ func TestLoadUsesBuildVersionAndRejectsRuntimeVersionDrift(t *testing.T) {
 	})
 }
 
+func TestLoadRejectsInvalidBuildIdentityBeforeAPPVersionComparison(
+	t *testing.T,
+) {
+	originalVersion := buildversion.Version
+	t.Cleanup(func() {
+		buildversion.Version = originalVersion
+	})
+	t.Setenv("AUTO_MIGRATE", "false")
+
+	tests := []struct {
+		name       string
+		build      string
+		appVersion string
+	}{
+		{
+			name:  "empty build with absent APP_VERSION",
+			build: "",
+		},
+		{
+			name:       "empty build with matching APP_VERSION",
+			build:      "",
+			appVersion: "",
+		},
+		{
+			name:       "leading whitespace with matching APP_VERSION",
+			build:      " 0.2.0",
+			appVersion: " 0.2.0",
+		},
+		{
+			name:       "trailing whitespace with matching APP_VERSION",
+			build:      "0.2.0 ",
+			appVersion: "0.2.0 ",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			buildversion.Version = test.build
+			t.Setenv("APP_VERSION", test.appVersion)
+
+			_, err := Load()
+			if err == nil ||
+				!strings.Contains(err.Error(), "build version") ||
+				!strings.Contains(err.Error(), "invalid") {
+				t.Fatalf(
+					"Load() error = %v, want invalid build identity before APP_VERSION comparison",
+					err,
+				)
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsTrimmedDevelopmentBuildIdentities(t *testing.T) {
+	originalVersion := buildversion.Version
+	t.Cleanup(func() {
+		buildversion.Version = originalVersion
+	})
+
+	for _, build := range []string{
+		"0.2.0-rc.1+build.42",
+		"development",
+	} {
+		t.Run(build, func(t *testing.T) {
+			buildversion.Version = build
+			t.Setenv("APP_VERSION", build)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.App.Version != build {
+				t.Fatalf("App.Version = %q, want %q", cfg.App.Version, build)
+			}
+		})
+	}
+}
+
 func TestCORSConfigFromEnv(t *testing.T) {
 	t.Setenv("CORS_ALLOWED_ORIGINS", "https://a.com,https://b.com")
 

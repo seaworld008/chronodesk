@@ -267,6 +267,9 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	appVersion := version.Version
+	if appVersion == "" || strings.TrimSpace(appVersion) != appVersion {
+		return nil, errors.New("build version is invalid")
+	}
 	if configuredVersion := os.Getenv("APP_VERSION"); configuredVersion != "" &&
 		configuredVersion != appVersion {
 		return nil, fmt.Errorf(

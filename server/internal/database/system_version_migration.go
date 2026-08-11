@@ -7,6 +7,7 @@ import (
 
 	"github.com/seaworld008/chronodesk/server/internal/models"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // migrateSystemVersion reconciles the persisted informational version with the
@@ -22,7 +23,11 @@ func migrateSystemVersion(db *gorm.DB, buildVersion string) error {
 
 	canonical := models.DefaultSystemVersionConfig(buildVersion)
 	var persisted models.SystemConfig
-	err := db.Where(
+	read := db
+	if db.Dialector.Name() == "postgres" {
+		read = read.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	err := read.Where(
 		"key = ?",
 		models.SystemConfigKeySystemVersion,
 	).First(&persisted).Error
@@ -51,25 +56,44 @@ func migrateSystemVersion(db *gorm.DB, buildVersion string) error {
 		persisted.IsRequired != canonical.IsRequired ||
 		persisted.IsActive != canonical.IsActive ||
 		persisted.DefaultValue != canonical.DefaultValue ||
+		persisted.MinValue != nil ||
+		persisted.MaxValue != nil ||
+		persisted.ValidValues != canonical.ValidValues ||
 		persisted.UpdatedBy != nil ||
 		persisted.Version != nextVersion
 	if !identityChanged && !metadataChanged {
 		return nil
 	}
 
-	if err := db.Model(&persisted).Updates(map[string]any{
-		"value":         canonical.Value,
-		"value_type":    canonical.ValueType,
-		"description":   canonical.Description,
-		"category":      canonical.Category,
-		"group":         canonical.Group,
-		"is_required":   canonical.IsRequired,
-		"is_active":     canonical.IsActive,
-		"default_value": canonical.DefaultValue,
-		"updated_by":    nil,
-		"version":       nextVersion,
-	}).Error; err != nil {
-		return fmt.Errorf("update system.version: %w", err)
+	result := db.Model(&models.SystemConfig{}).
+		Where(
+			"id = ? AND key = ?",
+			persisted.ID,
+			models.SystemConfigKeySystemVersion,
+		).
+		Updates(map[string]any{
+			"value":         canonical.Value,
+			"value_type":    canonical.ValueType,
+			"description":   canonical.Description,
+			"category":      canonical.Category,
+			"group":         canonical.Group,
+			"is_required":   canonical.IsRequired,
+			"is_active":     canonical.IsActive,
+			"default_value": canonical.DefaultValue,
+			"min_value":     nil,
+			"max_value":     nil,
+			"valid_values":  canonical.ValidValues,
+			"updated_by":    nil,
+			"version":       nextVersion,
+		})
+	if result.Error != nil {
+		return fmt.Errorf("update system.version: %w", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf(
+			"update system.version affected %d rows, want 1",
+			result.RowsAffected,
+		)
 	}
 	return nil
 }
