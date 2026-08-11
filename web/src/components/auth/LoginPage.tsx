@@ -28,6 +28,18 @@ type NavigatorWithUAData = Navigator & {
     }
 }
 
+const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u
+
+const validateEmail = (email: string): string | null => {
+    if (email.length === 0) {
+        return '请输入邮箱'
+    }
+    if (!emailPattern.test(email)) {
+        return '请输入有效的邮箱地址'
+    }
+    return null
+}
+
 const getDefaultDeviceName = (): string => {
     if (typeof navigator !== 'undefined') {
         const enhancedNavigator = navigator as NavigatorWithUAData
@@ -83,18 +95,30 @@ const LoginPage = () => {
     const [deviceName, setDeviceName] = useState(getDefaultDeviceName())
     const [submitting, setSubmitting] = useState(false)
     const [error, setError] = useState<string | null>(null)
+    const [emailError, setEmailError] = useState<string | null>(null)
+    const [passwordError, setPasswordError] = useState<string | null>(null)
 
     const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault()
-        setSubmitting(true)
         setError(null)
 
+        const normalizedEmail = email.trim()
+        const nextEmailError = validateEmail(normalizedEmail)
+        const nextPasswordError = password.length === 0 ? '请输入密码' : null
+        setEmail(normalizedEmail)
+        setEmailError(nextEmailError)
+        setPasswordError(nextPasswordError)
+        if (nextEmailError || nextPasswordError) {
+            return
+        }
+
+        setSubmitting(true)
         try {
             if (!authProvider) {
                 throw new Error('认证服务尚未就绪，请稍后重试')
             }
             await authProvider.login({
-                username: email,
+                username: normalizedEmail,
                 password,
                 remember: rememberDevice,
                 rememberDevice,
@@ -201,7 +225,12 @@ const LoginPage = () => {
                                 label="邮箱"
                                 type="email"
                                 value={email}
-                                onChange={(event) => setEmail(event.target.value)}
+                                onChange={(event) => {
+                                    setEmail(event.target.value)
+                                    setEmailError(null)
+                                }}
+                                error={emailError !== null}
+                                helperText={emailError}
                                 required
                                 fullWidth
                                 autoComplete="email"
@@ -218,7 +247,12 @@ const LoginPage = () => {
                                 label="密码"
                                 type="password"
                                 value={password}
-                                onChange={(event) => setPassword(event.target.value)}
+                                onChange={(event) => {
+                                    setPassword(event.target.value)
+                                    setPasswordError(null)
+                                }}
+                                error={passwordError !== null}
+                                helperText={passwordError}
                                 required
                                 fullWidth
                                 autoComplete="current-password"
