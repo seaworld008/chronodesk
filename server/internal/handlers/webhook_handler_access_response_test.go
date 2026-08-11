@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -223,6 +224,7 @@ func TestWebhookConfigResponseUsesExactFieldAllowlist(t *testing.T) {
 		"total_failed",
 		"created_by",
 		"updated_by",
+		"resource_version",
 	})
 	payload, err := json.Marshal(response)
 	if err != nil {
@@ -238,8 +240,77 @@ func TestWebhookConfigResponseUsesExactFieldAllowlist(t *testing.T) {
 		}
 	}
 	if response.WebhookURLMasked != "https://example.invalid/…" ||
-		!response.HasWebhookURL {
+		!response.HasWebhookURL ||
+		response.ResourceVersion != 1 {
 		t.Fatalf("unexpected masked Webhook URL: %+v", response)
+	}
+}
+
+func TestWebhookResourceVersionPreflightUsesScopedAdminEvents(
+	t *testing.T,
+) {
+	db, err := gorm.Open(
+		sqlite.Open(
+			"file:webhook-resource-version?mode=memory&cache=shared",
+		),
+		&gorm.Config{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&models.DomainEvent{}); err != nil {
+		t.Fatal(err)
+	}
+	scope := models.ProjectScope{OrganizationID: 7, ProjectID: 11}
+	events := []models.DomainEvent{
+		{
+			ID:              "00000000-0000-7000-8000-000000009301",
+			OrganizationID:  scope.OrganizationID,
+			ProjectID:       scope.ProjectID,
+			SpecVersion:     "1.0",
+			Source:          "urn:chronodesk:test",
+			Type:            "io.chronodesk.admin.webhook.emergency_revoked.v1",
+			Subject:         services.WebhookAdminSubject(41),
+			Time:            time.Now().UTC(),
+			DataContentType: "application/json",
+			Data:            []byte(`{"safe":true}`),
+			ActorType:       models.ActorTypeHuman,
+			ActorID:         "9",
+			ResourceVersion: 4,
+		},
+		{
+			ID:              "00000000-0000-7000-8000-000000009302",
+			OrganizationID:  scope.OrganizationID,
+			ProjectID:       scope.ProjectID + 1,
+			SpecVersion:     "1.0",
+			Source:          "urn:chronodesk:test",
+			Type:            "io.chronodesk.admin.webhook.emergency_revoked.v1",
+			Subject:         services.WebhookAdminSubject(42),
+			Time:            time.Now().UTC(),
+			DataContentType: "application/json",
+			Data:            []byte(`{"safe":true}`),
+			ActorType:       models.ActorTypeHuman,
+			ActorID:         "9",
+			ResourceVersion: 99,
+		},
+	}
+	if err := db.Create(&events).Error; err != nil {
+		t.Fatal(err)
+	}
+	handler := NewWebhookHandlerWithProtector(db, nil)
+	versions, err := handler.webhookResourceVersions(
+		context.Background(),
+		scope,
+		[]models.WebhookConfig{
+			{ID: 41},
+			{ID: 42},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if versions[41] != 4 || versions[42] != 1 {
+		t.Fatalf("preflight resource versions = %+v", versions)
 	}
 }
 

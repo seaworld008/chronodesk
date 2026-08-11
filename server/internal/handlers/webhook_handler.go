@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -139,6 +140,7 @@ type WebhookConfigResponse struct {
 	TotalFailed             int64                      `json:"total_failed"`
 	CreatedBy               uint                       `json:"created_by"`
 	UpdatedBy               *uint                      `json:"updated_by,omitempty"`
+	ResourceVersion         uint64                     `json:"resource_version"`
 }
 
 // ListWebhooksResponse 列表响应结构
@@ -228,7 +230,12 @@ type WebhookStatsResponse struct {
 
 func newWebhookConfigResponse(
 	webhook models.WebhookConfig,
+	resourceVersions ...uint64,
 ) WebhookConfigResponse {
+	resourceVersion := uint64(1)
+	if len(resourceVersions) > 0 && resourceVersions[0] > 0 {
+		resourceVersion = resourceVersions[0]
+	}
 	var filterRules *models.WebhookFilterRules
 	if webhook.FilterRulesObj != nil {
 		copied := *webhook.FilterRulesObj
@@ -275,7 +282,58 @@ func newWebhookConfigResponse(
 		TotalFailed:       webhook.TotalFailed,
 		CreatedBy:         webhook.CreatedBy,
 		UpdatedBy:         webhook.UpdatedBy,
+		ResourceVersion:   resourceVersion,
 	}
+}
+
+func (h *WebhookHandler) webhookResourceVersions(
+	ctx context.Context,
+	scope models.ProjectScope,
+	webhooks []models.WebhookConfig,
+) (map[uint]uint64, error) {
+	versions := make(map[uint]uint64, len(webhooks))
+	subjectToID := make(map[string]uint, len(webhooks))
+	subjects := make([]string, 0, len(webhooks))
+	for index := range webhooks {
+		if webhooks[index].ID == 0 {
+			continue
+		}
+		versions[webhooks[index].ID] = 1
+		subject := services.WebhookAdminSubject(webhooks[index].ID)
+		subjectToID[subject] = webhooks[index].ID
+		subjects = append(subjects, subject)
+	}
+	if len(subjects) == 0 {
+		return versions, nil
+	}
+	var rows []struct {
+		Subject string
+		Version uint64
+	}
+	if err := h.db.WithContext(ctx).
+		Model(&models.DomainEvent{}).
+		Select("subject, MAX(resource_version) AS version").
+		Where(
+			"organization_id = ? AND project_id = ? AND subject IN ? AND type LIKE ?",
+			scope.OrganizationID,
+			scope.ProjectID,
+			subjects,
+			"io.chronodesk.admin.webhook.%",
+		).
+		Group("subject").
+		Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf(
+			"load Webhook administrator resource versions: %w",
+			err,
+		)
+	}
+	for index := range rows {
+		configID := subjectToID[rows[index].Subject]
+		if configID != 0 && rows[index].Version > 0 {
+			versions[configID] = rows[index].Version
+		}
+	}
+	return versions, nil
 }
 
 func maskWebhookURL(value string) string {
@@ -482,7 +540,7 @@ func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
 // @Router /api/projects/{projectKey}/webhooks [get]
 // @Security BearerAuth
 func (h *WebhookHandler) ListWebhooks(c *gin.Context) {
-	_, ok := requireWebhookManagerAccess(c)
+	operation, ok := requireWebhookManagerAccess(c)
 	if !ok {
 		return
 	}
@@ -506,8 +564,28 @@ func (h *WebhookHandler) ListWebhooks(c *gin.Context) {
 	}
 
 	items := make([]WebhookConfigResponse, 0, len(page.Items))
+	versions, err := h.webhookResourceVersions(
+		c.Request.Context(),
+		operation.Scope,
+		page.Items,
+	)
+	if err != nil {
+		logHandlerFailure(c, "webhook.list_resource_versions", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"code": 1,
+			"msg":  "获取webhook列表失败",
+			"data": nil,
+		})
+		return
+	}
 	for _, webhook := range page.Items {
-		items = append(items, newWebhookConfigResponse(webhook))
+		items = append(
+			items,
+			newWebhookConfigResponse(
+				webhook,
+				versions[webhook.ID],
+			),
+		)
 	}
 	response := ListWebhooksResponse{
 		Items:      items,
@@ -578,10 +656,27 @@ func (h *WebhookHandler) GetWebhook(c *gin.Context) {
 		return
 	}
 
+	versions, err := h.webhookResourceVersions(
+		c.Request.Context(),
+		operation.Scope,
+		[]models.WebhookConfig{webhook},
+	)
+	if err != nil {
+		logHandlerFailure(c, "webhook.get_resource_version", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"code": 1,
+			"msg":  "获取webhook失败",
+			"data": nil,
+		})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"msg":  "获取成功",
-		"data": newWebhookConfigResponse(webhook),
+		"data": newWebhookConfigResponse(
+			webhook,
+			versions[webhook.ID],
+		),
 	})
 }
 
@@ -845,10 +940,31 @@ func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 		logHandlerFailure(c, "webhook.reload_after_update", err)
 	}
 
+	versions, versionErr := h.webhookResourceVersions(
+		c.Request.Context(),
+		operation.Scope,
+		[]models.WebhookConfig{webhook},
+	)
+	if versionErr != nil {
+		logHandlerFailure(
+			c,
+			"webhook.update_resource_version",
+			versionErr,
+		)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"code": 1,
+			"msg":  "更新webhook失败",
+			"data": nil,
+		})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
 		"msg":  "更新成功",
-		"data": newWebhookConfigResponse(webhook),
+		"data": newWebhookConfigResponse(
+			webhook,
+			versions[webhook.ID],
+		),
 	})
 }
 

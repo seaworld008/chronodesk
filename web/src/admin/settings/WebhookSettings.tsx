@@ -41,19 +41,25 @@ import {
 } from '@mui/material'
 import {
   Add as AddIcon,
+  Block as RevokeIcon,
   Delete as DeleteIcon,
   Edit as EditIcon,
   Science as TestIcon,
   Refresh as RefreshIcon,
   ReceiptLong as DeliveryIcon,
 } from '@mui/icons-material'
-import { useNotify } from 'react-admin'
+import { useNotify, usePermissions } from 'react-admin'
 import { apiFetch, localizedUnknownErrorMessage } from '@/lib/apiClient'
-import { resolveActiveProjectKey } from '@/lib/projectScope'
+import {
+  parseProjectRole,
+  resolveActiveProjectKey,
+} from '@/lib/projectScope'
 import { projectScopeChangedEvent } from '@/lib/projectScopeEvents'
+import type { AccessPermissions } from '@/lib/accessControl'
 import {
   humanApiRoutes,
   type WebhookConfig,
+  type WebhookEmergencyRevokeResult,
   type WebhookEventType,
   type WebhookLog,
   type WebhookLogPage,
@@ -78,7 +84,7 @@ const webhookColumns: ResizableColumn[] = [
   { key: 'events', defaultWidth: 360, minWidth: 200, maxWidth: 640 },
   { key: 'delivery', defaultWidth: 180, minWidth: 140, maxWidth: 280 },
   { key: 'last-success', defaultWidth: 188, minWidth: 150, maxWidth: 280 },
-  { key: 'actions', defaultWidth: 200, minWidth: 184, maxWidth: 280, sticky: 'right' },
+  { key: 'actions', defaultWidth: 240, minWidth: 220, maxWidth: 320, sticky: 'right' },
 ]
 
 const isQueuedWebhookTestReceipt = (
@@ -260,6 +266,10 @@ type PendingWebhookAction = {
   id: number
   name: string
 }
+type WebhookEmergencyRevokeIntent = {
+  webhook: WebhookConfig
+  idempotencyKey: string
+}
 
 const maxWebhookDeliveryCursorPages = 100
 
@@ -267,8 +277,39 @@ const isAbortedRequest = (error: unknown, signal: AbortSignal) =>
   signal.aborted
   || (error instanceof DOMException && error.name === 'AbortError')
 
+const formatResourceVersion = (version: number) => `"v${version}"`
+
+const newIdempotencyKey = () => {
+  if (
+    typeof crypto !== 'undefined'
+    && typeof crypto.randomUUID === 'function'
+  ) return crypto.randomUUID()
+  return `webhook-emergency-revoke-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+const isWebhookEmergencyRevokeResult = (
+  value: unknown,
+  configID: number,
+): value is WebhookEmergencyRevokeResult => {
+  if (typeof value !== 'object' || value === null) return false
+  const result = value as Record<string, unknown>
+  return (
+    result.config_id === configID
+    && result.status === 'disabled'
+    && result.credential_shred_reason === 'revoked'
+    && [
+      result.expired_deliveries,
+      result.in_flight_deliveries,
+      result.shredded_snapshots,
+    ].every((count) => Number.isSafeInteger(count) && Number(count) >= 0)
+  )
+}
+
 const WebhookSettings: React.FC = () => {
   const notify = useNotify()
+  const { permissions } = usePermissions<AccessPermissions>()
+  const canEmergencyRevoke =
+    parseProjectRole(permissions?.project_role) === 'project_admin'
   const [loading, setLoading] = useState(false)
   const [items, setItems] = useState<WebhookConfig[]>([])
   const [total, setTotal] = useState(0)
@@ -282,6 +323,10 @@ const WebhookSettings: React.FC = () => {
   const [testId, setTestId] = useState<number | null>(null)
   const [saving, setSaving] = useState(false)
   const [pendingAction, setPendingAction] = useState<PendingWebhookAction | null>(null)
+  const [emergencyRevokeIntent, setEmergencyRevokeIntent] =
+    useState<WebhookEmergencyRevokeIntent | null>(null)
+  const [emergencyRevokingID, setEmergencyRevokingID] =
+    useState<number | null>(null)
   const [deliveryWebhook, setDeliveryWebhook] = useState<WebhookConfig | null>(null)
   const [deliveries, setDeliveries] = useState<WebhookLog[]>([])
   const [deliveryLoading, setDeliveryLoading] = useState(false)
@@ -496,6 +541,8 @@ const WebhookSettings: React.FC = () => {
       definitionController.current?.abort()
       definitionSequence.current += 1
       closeDeliveries()
+      setEmergencyRevokeIntent(null)
+      setEmergencyRevokingID(null)
       setItems([])
       setTotal(0)
       setPage(0)
@@ -724,6 +771,52 @@ const WebhookSettings: React.FC = () => {
     }
   }
 
+  const executeEmergencyRevoke = async () => {
+    const intent = emergencyRevokeIntent
+    if (!intent || !canEmergencyRevoke) return
+    const { webhook, idempotencyKey } = intent
+    setEmergencyRevokingID(webhook.id)
+    try {
+      const projectKey = await resolveActiveProjectKey()
+      const path = humanApiRoutes.emergencyRevokeProjectWebhook({
+        projectKey,
+        webhookID: webhook.id,
+      })
+      const result = await apiFetch<WebhookEmergencyRevokeResult>(path, {
+        method: 'POST',
+        headers: {
+          'Idempotency-Key': idempotencyKey,
+          'If-Match': formatResourceVersion(webhook.resource_version),
+        },
+      })
+      if (!isWebhookEmergencyRevokeResult(result, webhook.id)) {
+        throw new Error('Webhook 紧急撤销响应无效，请刷新后核对投递状态')
+      }
+      const inFlightWarning = result.in_flight_deliveries > 0
+        ? `；仍有 ${result.in_flight_deliveries} 条投递正在执行，无法召回`
+        : ''
+      notify(
+        `紧急撤销完成：${result.expired_deliveries} 条投递已过期，`
+          + `${result.shredded_snapshots} 份凭据已粉碎${inFlightWarning}`,
+        { type: result.in_flight_deliveries > 0 ? 'warning' : 'success' },
+      )
+      setEmergencyRevokeIntent(null)
+      if (deliveryWebhook?.id === webhook.id) {
+        setDeliveries([])
+        setDeliveryPageIndex(0)
+        setDeliveryCursorHistory([''])
+        void fetchDeliveries(deliveryWebhook, '', 0)
+      }
+      void fetchWebhooks()
+    } catch (error: unknown) {
+      notify(extractErrorMessage(error, 'Webhook 紧急撤销失败'), {
+        type: 'error',
+      })
+    } finally {
+      setEmergencyRevokingID(null)
+    }
+  }
+
   const confirmPendingAction = async () => {
     const action = pendingAction
     if (!action) return
@@ -889,6 +982,23 @@ const WebhookSettings: React.FC = () => {
                     >
                       <DeleteIcon fontSize="small" />
                     </IconButton>
+                    {canEmergencyRevoke && (
+                      <IconButton
+                        size="small"
+                        color="error"
+                        aria-label={`紧急撤销 Webhook：${item.name}`}
+                        title="紧急终止未完成投递并不可逆粉碎凭据"
+                        onClick={() => setEmergencyRevokeIntent({
+                          webhook: item,
+                          idempotencyKey: newIdempotencyKey(),
+                        })}
+                        disabled={emergencyRevokingID === item.id}
+                      >
+                        {emergencyRevokingID === item.id
+                          ? <CircularProgress size={16} color="inherit" />
+                          : <RevokeIcon fontSize="small" />}
+                      </IconButton>
+                    )}
                   </Stack>
                 </TableCell>
               </TableRow>
@@ -1460,7 +1570,7 @@ const WebhookSettings: React.FC = () => {
         </DialogTitle>
         <DialogContent>
           {pendingAction?.kind === 'delete'
-            ? `确定删除“${pendingAction.name}”吗？删除后将停止对应事件投递。`
+            ? `确定删除“${pendingAction.name}”吗？删除后不再为新事件创建投递；已经冻结的投递仍会按原凭据继续到期完成。如需立即终止，请使用紧急撤销。`
             : `测试会将一条真实请求加入“${pendingAction?.name || ''}”的投递队列。入队不代表发送成功，请随后查看投递日志，确定继续吗？`}
         </DialogContent>
         <DialogActions>
@@ -1471,6 +1581,47 @@ const WebhookSettings: React.FC = () => {
             onClick={() => void confirmPendingAction()}
           >
             {pendingAction?.kind === 'delete' ? '确认删除' : '确认入队'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        open={Boolean(emergencyRevokeIntent)}
+        onClose={() => {
+          if (emergencyRevokingID === null) setEmergencyRevokeIntent(null)
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>紧急撤销 Webhook</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2}>
+            <Alert severity="error">
+              这是不可逆安全操作。凭据粉碎后不能恢复，也不能重新投递已终止的请求。
+            </Alert>
+            <Typography>
+              普通停用或删除不会撤回已经冻结的投递；紧急撤销会禁用
+              “{emergencyRevokeIntent?.webhook.name || ''}”，使待处理、失败和终止的投递会立即过期，
+              所有尚未终止的快照凭据将被不可逆粉碎。
+            </Typography>
+            <Typography color="text.secondary">
+              已经进入投递中的请求无法召回，操作完成后会单独报告仍在执行的数量。
+            </Typography>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={() => setEmergencyRevokeIntent(null)}
+            disabled={emergencyRevokingID !== null}
+          >
+            取消
+          </Button>
+          <Button
+            color="error"
+            variant="contained"
+            onClick={() => void executeEmergencyRevoke()}
+            disabled={emergencyRevokingID !== null}
+          >
+            {emergencyRevokingID !== null ? '撤销中…' : '确认紧急撤销'}
           </Button>
         </DialogActions>
       </Dialog>

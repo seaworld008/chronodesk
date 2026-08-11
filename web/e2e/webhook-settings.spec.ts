@@ -7,6 +7,7 @@ import {
     installMockSession,
     projectA,
 } from './helpers/mockHumanSession';
+import type { ProjectRole } from '../src/lib/generated/human-api';
 import {
     authenticatePage,
     cleanupE2EData,
@@ -75,6 +76,7 @@ const mockWebhook = {
     total_sent: 0,
     total_success: 0,
     total_failed: 0,
+    resource_version: 1,
 };
 
 const installWebhookAsyncMockBackend = async (
@@ -83,11 +85,19 @@ const installWebhookAsyncMockBackend = async (
         failFirstDelivery?: boolean;
         emptyDeliveries?: boolean;
         holdContinuation?: boolean;
+        projectRole?: ProjectRole;
     } = {},
 ) => {
-    const access = authorizedProjectAccess(projectA, 'manager');
+    const access = authorizedProjectAccess(
+        projectA,
+        options.projectRole ?? 'manager',
+    );
     const webhooksPath = `/api/projects/${projectA.key}/webhooks`;
+    const emergencyRevokePath =
+        `/api/projects/${projectA.key}/admin/agents/webhooks/${mockWebhook.id}/emergency-revoke`;
     let testCalls = 0;
+    let emergencyRevokeCalls = 0;
+    let emergencyRevokeHeaders: Record<string, string> = {};
     let deliveryCalls = 0;
     const listQueries: string[] = [];
     const deliveryQueries: string[] = [];
@@ -216,12 +226,41 @@ const installWebhookAsyncMockBackend = async (
             );
             return;
         }
+        if (
+            pathname === emergencyRevokePath
+            && request.method() === 'POST'
+        ) {
+            emergencyRevokeCalls += 1;
+            emergencyRevokeHeaders = request.headers();
+            await fulfillJSON(route, {
+                code: 0,
+                data: {
+                    config_id: mockWebhook.id,
+                    status: 'disabled',
+                    expired_deliveries: 3,
+                    in_flight_deliveries: 1,
+                    shredded_snapshots: 4,
+                    credential_shred_reason: 'revoked',
+                },
+                receipt: {
+                    event_id: '019fb64a-38ac-7a01-8000-000000000011',
+                    resource_type: 'webhook',
+                    resource_id: String(mockWebhook.id),
+                    resource_version: 2,
+                    occurred_at: '2026-08-11T08:00:00Z',
+                },
+            });
+            return;
+        }
         await fulfillJSON(route, { code: 0, data: [] });
     });
 
     return {
         webhooksPath,
+        emergencyRevokePath,
         testCalls: () => testCalls,
+        emergencyRevokeCalls: () => emergencyRevokeCalls,
+        emergencyRevokeHeaders: () => emergencyRevokeHeaders,
         deliveryCalls: () => deliveryCalls,
         listQueries,
         deliveryQueries,
@@ -230,6 +269,92 @@ const installWebhookAsyncMockBackend = async (
 };
 
 test.describe('Webhook 测试异步入队浏览器契约（mock）', () => {
+    test('紧急撤销仅限项目管理员并发送 CAS 与幂等前置条件', async ({
+        page,
+    }) => {
+        await installMockSession(
+            page,
+            {
+                ...defaultMockIdentity,
+                sessionID: 'e2e-webhook-emergency-revoke',
+            },
+            projectA,
+        );
+        const backend = await installWebhookAsyncMockBackend(page, {
+            projectRole: 'project_admin',
+        });
+        await page.goto('/#/webhook-settings');
+
+        const row = page.getByRole('row', { name: /异步测试 Webhook/u });
+        await expect(row).toBeVisible();
+        await row.getByRole('button', {
+            name: '紧急撤销 Webhook：异步测试 Webhook',
+        }).click();
+
+        const confirmation = page.getByRole('dialog', {
+            name: '紧急撤销 Webhook',
+            exact: true,
+        });
+        await expect(confirmation).toContainText(
+            '普通停用或删除不会撤回已经冻结的投递',
+        );
+        await expect(confirmation).toContainText(
+            '待处理、失败和终止的投递会立即过期',
+        );
+        await expect(confirmation).toContainText(
+            '投递中的请求无法召回',
+        );
+        await expect(confirmation).toContainText(
+            '凭据将被不可逆粉碎',
+        );
+
+        const responsePromise = page.waitForResponse(
+            (response) =>
+                response.request().method() === 'POST'
+                && new URL(response.url()).pathname
+                    === backend.emergencyRevokePath,
+        );
+        await confirmation.getByRole('button', {
+            name: '确认紧急撤销',
+            exact: true,
+        }).click();
+        expect((await responsePromise).status()).toBe(200);
+
+        expect(backend.emergencyRevokeCalls()).toBe(1);
+        expect(backend.emergencyRevokeHeaders()['if-match']).toBe('"v1"');
+        expect(
+            backend.emergencyRevokeHeaders()['idempotency-key'],
+        ).toEqual(expect.any(String));
+        expect(
+            backend.emergencyRevokeHeaders()['idempotency-key'].length,
+        ).toBeGreaterThan(0);
+        await expect(
+            page.getByText(
+                '紧急撤销完成：3 条投递已过期，4 份凭据已粉碎；仍有 1 条投递正在执行，无法召回',
+            ),
+        ).toBeVisible();
+    });
+
+    test('项目经理看不到紧急撤销入口', async ({ page }) => {
+        await installMockSession(
+            page,
+            {
+                ...defaultMockIdentity,
+                sessionID: 'e2e-webhook-emergency-revoke-manager',
+            },
+            projectA,
+        );
+        await installWebhookAsyncMockBackend(page, {
+            projectRole: 'manager',
+        });
+        await page.goto('/#/webhook-settings');
+        const row = page.getByRole('row', { name: /异步测试 Webhook/u });
+        await expect(row).toBeVisible();
+        await expect(row.getByRole('button', {
+            name: '紧急撤销 Webhook：异步测试 Webhook',
+        })).toHaveCount(0);
+    });
+
     test('HTTP 202 queued receipt 只提示已入队并等待投递结果', async ({
         page,
     }) => {

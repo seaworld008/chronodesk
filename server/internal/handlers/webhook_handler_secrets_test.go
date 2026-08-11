@@ -25,7 +25,12 @@ func TestWebhookHandlerEncryptsCredentialsAtRest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&models.User{}, &models.WebhookConfig{}, &models.WebhookLog{}); err != nil {
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.WebhookConfig{},
+		&models.WebhookLog{},
+		&models.DomainEvent{},
+	); err != nil {
 		t.Fatal(err)
 	}
 	user := models.User{
@@ -205,7 +210,11 @@ func TestWebhookHandlerFailsClosedWithoutKeyring(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&models.User{}, &models.WebhookConfig{}); err != nil {
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.WebhookConfig{},
+		&models.DomainEvent{},
+	); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Create(&models.User{
@@ -252,7 +261,11 @@ func TestWebhookHandlerRejectsSSRFTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&models.User{}, &models.WebhookConfig{}); err != nil {
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.WebhookConfig{},
+		&models.DomainEvent{},
+	); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Create(&models.User{
@@ -410,7 +423,11 @@ func TestWebhookHandlerDoesNotExposeAnotherProject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&models.User{}, &models.WebhookConfig{}); err != nil {
+	if err := db.AutoMigrate(
+		&models.User{},
+		&models.WebhookConfig{},
+		&models.DomainEvent{},
+	); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Create(&models.User{

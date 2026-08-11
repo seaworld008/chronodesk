@@ -2362,8 +2362,13 @@ assert.match(automationLogs, /type AutomationLogPage,/)
 assert.doesNotMatch(automationLogs, /type AutomationLogItem\b/)
 assert.doesNotMatch(automationLogs, /new URLSearchParams/)
 assert.match(webhookSettings, /type WebhookConfig,/)
+assert.match(webhookSettings, /type WebhookEmergencyRevokeResult,/)
 assert.match(webhookSettings, /type WebhookLogPage,/)
 assert.match(webhookSettings, /humanApiRoutes\.queueProjectWebhookTest/)
+assert.match(
+    webhookSettings,
+    /humanApiRoutes\.emergencyRevokeProjectWebhook/,
+)
 assert.doesNotMatch(webhookSettings, /interface WebhookConfig\b/)
 assert.doesNotMatch(webhookSettings, /type WebhookDefinition\b/)
 assert.doesNotMatch(webhookSettings, /type WebhookDelivery\b/)
@@ -2685,6 +2690,7 @@ assert.deepEqual(
         'is_async',
         'rate_limit',
         'rate_limit_window',
+        'resource_version',
         'last_triggered_at',
         'last_success_at',
         'last_error_at',
@@ -2710,6 +2716,44 @@ for (const forbidden of [
         false,
     )
 }
+const webhookEmergencyRevokePath =
+    '/projects/{projectKey}/admin/agents/webhooks/{webhookID}/emergency-revoke'
+const webhookEmergencyRevoke =
+    contract.paths[webhookEmergencyRevokePath].post
+assert.equal(
+    webhookEmergencyRevoke.operationId,
+    'emergencyRevokeProjectWebhook',
+)
+assert.deepEqual(
+    webhookEmergencyRevoke['x-chronodesk-project-roles'],
+    ['project_admin'],
+)
+assert.equal(
+    humanApiRoutes.emergencyRevokeProjectWebhook({
+        projectKey: 'OPS',
+        webhookID: 731,
+    }),
+    '/projects/OPS/admin/agents/webhooks/731/emergency-revoke',
+)
+const webhookEmergencyResult =
+    contract.components.schemas.WebhookEmergencyRevokeResult
+assert.equal(webhookEmergencyResult.additionalProperties, false)
+assert.deepEqual(
+    Object.keys(webhookEmergencyResult.properties).sort(),
+    [
+        'config_id',
+        'status',
+        'expired_deliveries',
+        'in_flight_deliveries',
+        'shredded_snapshots',
+        'credential_shred_reason',
+    ].sort(),
+)
+assert.equal(webhookEmergencyResult.properties.status.const, 'disabled')
+assert.equal(
+    webhookEmergencyResult.properties.credential_shred_reason.const,
+    'revoked',
+)
 const webhookLogResponse =
     contract.paths['/projects/{projectKey}/webhooks/{webhookID}/logs'].get
         .responses['200'].content['application/json'].schema

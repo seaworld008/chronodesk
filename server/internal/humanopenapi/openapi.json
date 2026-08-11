@@ -7670,6 +7670,90 @@
         }
       }
     },
+    "/projects/{projectKey}/admin/agents/webhooks/{webhookID}/emergency-revoke": {
+      "servers": [
+        {
+          "url": "/api"
+        }
+      ],
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ProjectKey"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Agent administration"
+        ],
+        "operationId": "emergencyRevokeProjectWebhook",
+        "x-list-strategy": "bounded",
+        "summary": "Emergency-revoke pending deliveries for one Project Webhook",
+        "description": "Use the Webhook configuration's `resource_version` as `If-Match` and supply an `Idempotency-Key`. The command is restricted to the exact `project_admin` role. In one Project transaction it disables the mutable configuration, expires pending, failed, and dead deliveries, shreds every unterminated immutable snapshot credential with reason `revoked`, and reports already processing attempts that cannot be recalled. The response, receipt, audit event, and Domain Event contain no destination URL or credential material. Ordinary edit, disable, and delete continue to preserve committed immutable deliveries through their original deadline.",
+        "x-chronodesk-project-roles": [
+          "project_admin"
+        ],
+        "security": [
+          {
+            "humanBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/WebhookID"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Webhook emergency revoke committed with a stable receipt.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookEmergencyRevokeEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/AgentAdminBadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/AgentAdminUnauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/AgentAdminForbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/AgentAdminNotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/AgentAdminAdminConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/AgentAdminPayloadTooLarge"
+          },
+          "428": {
+            "$ref": "#/components/responses/AgentAdminPreconditionRequired"
+          },
+          "500": {
+            "$ref": "#/components/responses/AgentAdminInternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/AgentAdminServiceUnavailable"
+          }
+        }
+      }
+    },
     "/projects/{projectKey}/admin/agents/events": {
       "servers": [
         {
@@ -20460,7 +20544,8 @@
           "total_sent",
           "total_success",
           "total_failed",
-          "created_by"
+          "created_by",
+          "resource_version"
         ],
         "properties": {
           "name": {
@@ -20594,8 +20679,70 @@
           "updated_by": {
             "type": "integer",
             "minimum": 1
+          },
+          "resource_version": {
+            "$ref": "#/components/schemas/ResourceVersion"
           }
         }
+      },
+      "WebhookEmergencyRevokeResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "config_id",
+          "status",
+          "expired_deliveries",
+          "in_flight_deliveries",
+          "shredded_snapshots",
+          "credential_shred_reason"
+        ],
+        "properties": {
+          "config_id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "status": {
+            "type": "string",
+            "const": "disabled"
+          },
+          "expired_deliveries": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "in_flight_deliveries": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "shredded_snapshots": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "credential_shred_reason": {
+            "type": "string",
+            "const": "revoked"
+          }
+        }
+      },
+      "WebhookEmergencyRevokeEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Envelope"
+          },
+          {
+            "type": "object",
+            "required": [
+              "receipt"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/WebhookEmergencyRevokeResult"
+              },
+              "receipt": {
+                "$ref": "#/components/schemas/Receipt"
+              }
+            }
+          }
+        ]
       },
       "WebhookPage": {
         "type": "object",

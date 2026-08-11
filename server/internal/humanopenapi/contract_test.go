@@ -133,6 +133,124 @@ func TestHumanOutboxContractsPublishOnlySafeFiniteReplayState(
 	}
 }
 
+func TestWebhookEmergencyRevokeContractIsExactAdminCASAndSecretFree(
+	t *testing.T,
+) {
+	document := decodeDocument(t)
+	paths := objectAt(t, document, "paths")
+	operation := objectAt(
+		t,
+		objectAt(
+			t,
+			paths,
+			"/projects/{projectKey}/admin/agents/webhooks/{webhookID}/emergency-revoke",
+		),
+		"post",
+	)
+	if operation["operationId"] != "emergencyRevokeProjectWebhook" {
+		t.Fatalf("operationId = %v", operation["operationId"])
+	}
+	assertExactStringArray(
+		t,
+		operation["x-chronodesk-project-roles"],
+		[]string{"project_admin"},
+	)
+	parameters, ok := operation["parameters"].([]any)
+	if !ok {
+		t.Fatalf("parameters = %T", operation["parameters"])
+	}
+	refs := make(map[string]bool, len(parameters))
+	for _, raw := range parameters {
+		parameter, ok := raw.(map[string]any)
+		if ok {
+			if ref, ok := parameter["$ref"].(string); ok {
+				refs[ref] = true
+			}
+		}
+	}
+	for _, required := range []string{
+		"#/components/parameters/WebhookID",
+		"#/components/parameters/IdempotencyKey",
+		"#/components/parameters/IfMatch",
+	} {
+		if !refs[required] {
+			t.Errorf("emergency revoke omits %s", required)
+		}
+	}
+	responses := objectAt(t, operation, "responses")
+	success := objectAt(t, responses, "200")
+	if objectAt(t, objectAt(t, success, "headers"), "ETag")["$ref"] !=
+		"#/components/headers/ETag" {
+		t.Error("emergency revoke success omits ETag")
+	}
+	schema := objectAt(
+		t,
+		objectAt(
+			t,
+			objectAt(t, success, "content"),
+			"application/json",
+		),
+		"schema",
+	)
+	if schema["$ref"] !=
+		"#/components/schemas/WebhookEmergencyRevokeEnvelope" {
+		t.Fatalf("success schema = %v", schema)
+	}
+	for _, status := range []string{
+		"400", "401", "403", "404", "409", "413", "428", "500", "503",
+	} {
+		if _, ok := responses[status]; !ok {
+			t.Errorf("emergency revoke response %s is missing", status)
+		}
+	}
+
+	schemas := objectAt(
+		t,
+		objectAt(t, document, "components"),
+		"schemas",
+	)
+	result := objectAt(t, schemas, "WebhookEmergencyRevokeResult")
+	if result["additionalProperties"] != false {
+		t.Fatal("WebhookEmergencyRevokeResult is not closed")
+	}
+	properties := objectAt(t, result, "properties")
+	for _, required := range []string{
+		"config_id",
+		"status",
+		"expired_deliveries",
+		"in_flight_deliveries",
+		"shredded_snapshots",
+		"credential_shred_reason",
+	} {
+		if _, ok := properties[required]; !ok {
+			t.Errorf("WebhookEmergencyRevokeResult.%s is missing", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"url",
+		"webhook_url",
+		"secret",
+		"access_token",
+		"snapshot_id",
+		"delivery_id",
+	} {
+		if _, ok := properties[forbidden]; ok {
+			t.Errorf(
+				"WebhookEmergencyRevokeResult exposes %s",
+				forbidden,
+			)
+		}
+	}
+	webhook := objectAt(t, schemas, "WebhookConfig")
+	if _, ok := objectAt(t, webhook, "properties")["resource_version"]; !ok {
+		t.Fatal("WebhookConfig omits preflight resource_version")
+	}
+	requiredFields, ok := webhook["required"].([]any)
+	if !ok || !slices.Contains(requiredFields, any("resource_version")) {
+		t.Fatal("WebhookConfig.resource_version is not required")
+	}
+}
+
 func TestBackupCodeRegenerationContractMatchesRuntimeSecurityBoundary(
 	t *testing.T,
 ) {
@@ -2057,6 +2175,7 @@ func TestP1HumanWebOperationsAreTypedAndMachineAddressable(t *testing.T) {
 		{"/projects/{projectKey}/admin/agents/leases/{leaseId}/force-release", "post"},
 		{"/projects/{projectKey}/admin/agents/attachments/{attachmentId}/scan", "post"},
 		{"/projects/{projectKey}/admin/agents/outbox/{deliveryId}/replay", "post"},
+		{"/projects/{projectKey}/admin/agents/webhooks/{webhookID}/emergency-revoke", "post"},
 	}
 	for _, expected := range required {
 		pathItem := objectAt(t, paths, expected.path)
@@ -2270,6 +2389,10 @@ func TestP1RuntimeDTOFieldsMatchPublishedSchemas(t *testing.T) {
 			services.WorkbenchDashboard{},
 		},
 		{"WebhookTestReceipt", services.WebhookTestReceipt{}},
+		{
+			"WebhookEmergencyRevokeResult",
+			services.WebhookEmergencyRevokeResult{},
+		},
 	} {
 		t.Run(test.schemaName, func(t *testing.T) {
 			schema := objectAt(t, schemas, test.schemaName)
@@ -2585,6 +2708,7 @@ func TestAutomationLogAndWebhookSchemasAreClosedRuntimeDTOs(t *testing.T) {
 			"total_failed",
 			"created_by",
 			"updated_by",
+			"resource_version",
 		},
 	)
 	for _, forbidden := range []string{

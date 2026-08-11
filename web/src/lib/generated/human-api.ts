@@ -1,7 +1,7 @@
 /**
  * Generated from server/internal/humanopenapi/openapi.json.
  * Generator: chronodesk-human-openapi-types@2.1.0.
- * Contract SHA-256: 340d0cf947642aec27b46eaf826f2af3ecd3aeb3de4ccb2bf1bbb5d888d645a4.
+ * Contract SHA-256: 94826991b94b21aae33b6e812c750a26fcc65014d44cdf09a4adea1942dfc61a.
  * Do not edit by hand; run `npm run generate:human-api`.
  */
 
@@ -1555,6 +1555,21 @@ export type WebhookConfig = {
     total_failed: number
     created_by: number
     updated_by?: number
+    resource_version: ResourceVersion
+}
+
+export type WebhookEmergencyRevokeResult = {
+    config_id: number
+    status: "disabled"
+    expired_deliveries: number
+    in_flight_deliveries: number
+    shredded_snapshots: number
+    credential_shred_reason: "revoked"
+}
+
+export type WebhookEmergencyRevokeEnvelope = Envelope & {
+    data?: WebhookEmergencyRevokeResult
+    receipt: Receipt
 }
 
 export type WebhookPage = {
@@ -4299,6 +4314,14 @@ export type ReplayOutboxDeliveryV2OperationQuery = Record<string, never>
 export type ReplayOutboxDeliveryV2OperationRequest = never
 export type ReplayOutboxDeliveryV2OperationResponse = ReplayEnvelope
 
+export type EmergencyRevokeProjectWebhookOperationPathParameters = {
+    projectKey: string
+    webhookID: number
+}
+export type EmergencyRevokeProjectWebhookOperationQuery = Record<string, never>
+export type EmergencyRevokeProjectWebhookOperationRequest = never
+export type EmergencyRevokeProjectWebhookOperationResponse = WebhookEmergencyRevokeEnvelope
+
 export type ListAgentDomainEventsOperationPathParameters = {
     projectKey: string
 }
@@ -5686,6 +5709,13 @@ export const humanApiOperations = {
         requestBody: "none",
         listStrategy: "bounded",
     },
+    emergencyRevokeProjectWebhook: {
+        method: "POST",
+        path: "/projects/{projectKey}/admin/agents/webhooks/{webhookID}/emergency-revoke",
+        successStatus: 200,
+        requestBody: "none",
+        listStrategy: "bounded",
+    },
     listAgentDomainEvents: {
         method: "GET",
         path: "/projects/{projectKey}/admin/agents/events",
@@ -6761,6 +6791,12 @@ export interface HumanApiOperationTypes {
         request: ReplayOutboxDeliveryV2OperationRequest
         response: ReplayOutboxDeliveryV2OperationResponse
     }
+    emergencyRevokeProjectWebhook: {
+        pathParameters: EmergencyRevokeProjectWebhookOperationPathParameters
+        query: EmergencyRevokeProjectWebhookOperationQuery
+        request: EmergencyRevokeProjectWebhookOperationRequest
+        response: EmergencyRevokeProjectWebhookOperationResponse
+    }
     listAgentDomainEvents: {
         pathParameters: ListAgentDomainEventsOperationPathParameters
         query: ListAgentDomainEventsOperationQuery
@@ -7430,6 +7466,8 @@ export const humanApiRoutes = {
         humanApiRoute("listAgentOutboxDeliveries", pathParameters, query),
     replayOutboxDeliveryV2: (pathParameters: ReplayOutboxDeliveryV2OperationPathParameters, query: ReplayOutboxDeliveryV2OperationQuery = {}) =>
         humanApiRoute("replayOutboxDeliveryV2", pathParameters, query),
+    emergencyRevokeProjectWebhook: (pathParameters: EmergencyRevokeProjectWebhookOperationPathParameters, query: EmergencyRevokeProjectWebhookOperationQuery = {}) =>
+        humanApiRoute("emergencyRevokeProjectWebhook", pathParameters, query),
     listAgentDomainEvents: (pathParameters: ListAgentDomainEventsOperationPathParameters, query: ListAgentDomainEventsOperationQuery = {}) =>
         humanApiRoute("listAgentDomainEvents", pathParameters, query),
     listAgentPolicyDecisions: (pathParameters: ListAgentPolicyDecisionsOperationPathParameters, query: ListAgentPolicyDecisionsOperationQuery = {}) =>
