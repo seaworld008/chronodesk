@@ -311,21 +311,35 @@ func TestWebhookOutboxWorkerKeepsTimelySuccessAcrossSlowPostResponseAudit(
 			}, nil
 		},
 	)
+	auditEntered := make(chan struct{}, 1)
+	auditRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAudit := func() {
+		releaseOnce.Do(func() {
+			close(auditRelease)
+		})
+	}
 	const callbackName = "test:webhook_attempt_worker_slow_audit"
 	if err := service.db.Callback().Create().Before("gorm:create").
 		Register(callbackName, func(tx *gorm.DB) {
 			if tx.Statement.Table == "webhook_logs" {
-				time.Sleep(time.Second)
+				select {
+				case auditEntered <- struct{}{}:
+				default:
+				}
+				<-auditRelease
 			}
 		}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
+		releaseAudit()
 		service.waitForWebhookAttemptAudits()
 		_ = service.db.Callback().Create().Remove(callbackName)
 	})
 
-	deadline := now.Add(750 * time.Millisecond)
+	const operationTimeout = 10 * time.Second
+	deadline := time.Now().UTC().Add(operationTimeout)
 	if err := fixture.db.Exec(
 		"UPDATE outbox_deliveries SET expires_at = ? WHERE id = ?",
 		deadline,
@@ -342,18 +356,45 @@ func TestWebhookOutboxWorkerKeepsTimelySuccessAcrossSlowPostResponseAudit(
 		t.Fatal(err)
 	}
 
-	batch, err := fixture.service.ProcessOutboxBatch(
+	ctx, cancel := context.WithTimeout(
 		context.Background(),
-		"timely-success-slow-audit-worker",
-		1,
-		notificationRichAttemptDeliverer{
-			service: service,
-			config:  &config,
-			event:   event,
-		},
+		operationTimeout,
 	)
-	if err != nil {
-		t.Fatal(err)
+	defer cancel()
+	type processResult struct {
+		batch OutboxBatchResult
+		err   error
+	}
+	processDone := make(chan processResult, 1)
+	go func() {
+		batch, err := fixture.service.ProcessOutboxBatch(
+			ctx,
+			"timely-success-slow-audit-worker",
+			1,
+			notificationRichAttemptDeliverer{
+				service: service,
+				config:  &config,
+				event:   event,
+			},
+		)
+		processDone <- processResult{batch: batch, err: err}
+	}()
+	select {
+	case <-auditEntered:
+	case <-ctx.Done():
+		t.Fatalf("post-response audit did not start: %v", ctx.Err())
+	}
+	var processed processResult
+	select {
+	case processed = <-processDone:
+	case <-ctx.Done():
+		t.Fatalf(
+			"outbox batch waited for blocked post-response audit: %v",
+			ctx.Err(),
+		)
+	}
+	if processed.err != nil {
+		t.Fatal(processed.err)
 	}
 	var delivery models.OutboxDelivery
 	if err := fixture.db.First(
@@ -363,14 +404,14 @@ func TestWebhookOutboxWorkerKeepsTimelySuccessAcrossSlowPostResponseAudit(
 	).Error; err != nil {
 		t.Fatal(err)
 	}
-	if batch.Delivered != 1 ||
-		batch.Expired != 0 ||
+	if processed.batch.Delivered != 1 ||
+		processed.batch.Expired != 0 ||
 		delivery.Status != models.OutboxDeliverySucceeded ||
 		delivery.DeliveredAt == nil ||
 		delivery.DeliveredAt.After(deadline) {
 		t.Fatalf(
 			"slow audit changed timely result: batch=%+v delivery=%+v deadline=%s",
-			batch,
+			processed.batch,
 			delivery,
 			deadline,
 		)
