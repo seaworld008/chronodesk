@@ -20,6 +20,7 @@ maintainers and coding agents should not repeatedly re-litigate.
 - [ADR-0006: Immutable project configuration and proposal-based AI actions](0006-versioned-configuration-and-ai-actions.md)
 - [ADR-0007: Inbox, immutable mapping, and explicit external identity](0007-inbox-mapping-and-external-identity.md)
 - [ADR-0008: Separate platform and Project roles](0008-separate-platform-and-project-roles.md)
+- [ADR-0009: Finite Webhook delivery credentials and explicit emergency revoke](0009-webhook-delivery-credential-lifecycle.md)
 
 New ADRs use the next four-digit number and include Context, Decision,
 Consequences, and Verification sections.

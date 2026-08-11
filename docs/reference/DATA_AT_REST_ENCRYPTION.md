@@ -91,3 +91,19 @@ IP，并禁止代理和重定向，从而避免 DNS rebinding 与 SSRF。
 Webhook 审计日志只记录严格白名单内的非敏感请求/响应头；Authorization、签名、
 Cookie、回调响应正文、URL path/query 均不落盘。已知 secret/access token 还会在
 保存前执行二次脱敏。
+
+Webhook snapshot 凭据具有不可延长的七天绝对 deadline。普通编辑、停用或
+soft-delete 只影响未来 fan-out，已经冻结的投递继续使用原 snapshot 至成功或原
+deadline。紧急撤销是独立的 exact `project_admin` 命令：它禁用配置，把
+`pending/failed/dead` 投递变为 `expired`，报告无法召回的 `processing`，并把所有
+尚未粉碎的 snapshot 凭据以 `revoked` 清空。claim、replay、cleanup、finalize 和
+双 HTTP gate 使用相同的 Project/config/delivery/snapshot 锁序，因此撤销提交后
+不能创建新的外部请求。
+
+应用层 credential shred 是逻辑 crypto-shred，不等于从 PostgreSQL WAL、replica、
+PITR 增量、云快照或离线备份中即时物理擦除旧密文。恢复到撤销前时间点必须先在
+Webhook egress 关闭的隔离环境重放撤销记录，再运行 new-only keyring 验证和零
+HTTP 演练。具体发布、回滚、备份和恢复步骤见
+[Webhook 凭据生命周期与紧急撤销运行手册](../operations/webhook-credential-lifecycle.md)，
+架构约束见
+[ADR-0009](../adr/0009-webhook-delivery-credential-lifecycle.md)。
